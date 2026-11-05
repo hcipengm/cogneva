@@ -18,6 +18,10 @@ use crate::{
 /// token spend cannot be attributed to any component.
 const INTENT_ASSESS_ACTOR: &str = "intent_assess";
 
+/// 一件派给名册上任意员工的活。谁接都行——这件活由材料、做法与验收
+/// 判据说了算，不由接活的人的角色说了算。
+pub const PLATFORM_AGENT_TASK: &str = "platform_agent_task";
+
 /// 可执行性判据的稳定半段：角色、四条判定的定义、答案的形状。
 ///
 /// 它与被判的那条外部意图无关，所以必须逐字节相同地待在整个请求的最前面。
@@ -93,6 +97,11 @@ pub struct CollaborationExecutor {
     /// 仍旧照跑——只是这一次没有任何一条项目原则被递进来，与「这个仓库没有
     /// 原则管着这些文件」不是一回事，所以缺它要留一条具名日志。
     principle_ledger: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
+    /// 派活时的轮转游标。
+    ///
+    /// 顺序轮流而不是把活都给第一个人：名册上的人都能干同一类活，全都堆在
+    /// 一个名下，其余的人就只是名单上的一行，而队列长度会全记在那个人的账上。
+    next_worker: std::sync::atomic::AtomicUsize,
 }
 
 /// What the producer said about itself, at the two stages the record keeps.
@@ -132,6 +141,7 @@ impl CollaborationExecutor {
             local_repair_max: None,
             stage_store: None,
             principle_ledger: None,
+            next_worker: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -343,6 +353,9 @@ impl CollaborationExecutor {
             if kind == "platform_intent_assess" {
                 return self.execute_intent_assess(task).await;
             }
+            if kind == PLATFORM_AGENT_TASK {
+                return self.execute_agent_task(task).await;
+            }
         }
         // is_executable == false means this is an original overall task
         // (placeholder injected by ActionPlanner) that needs decomposition.
@@ -377,6 +390,89 @@ impl CollaborationExecutor {
                 "could not release the agents of a task that finished executing: {e}"
             ),
         }
+    }
+
+    /// Hand a work item to an employee on the roster and return its answer.
+    ///
+    /// Nothing about the work is decided here. The input document carries the
+    /// material, what to do with it and how the answer will be judged — a
+    /// `prompt_contract` on it renders as the run's instructions — while the
+    /// employee brings the loop and the tools. That is what separates this
+    /// branch from `platform_intent_assess`: a branch that knows how to judge
+    /// one kind of material is an executor with a name, whereas a branch that
+    /// forwards a work item is dispatch, and dispatch belongs to whoever is on
+    /// the roster rather than to a role this crate would have to spell out.
+    async fn execute_agent_task(&self, task: &Task) -> SFResult<TaskResult> {
+        let Some(manager) = self.agent_manager.as_ref() else {
+            return Err(SFError::Agent(
+                "platform_agent_task requires an agent manager".into(),
+            ));
+        };
+
+        let (agent_id, agent) = self.employee_for(manager.as_ref(), task).await?;
+        let answer = agent.prompt_for_task(&task.id, task.input.clone()).await?;
+        info!(
+            task_id = %task.id,
+            agent_id = %agent_id,
+            employee = %cog_core::display_name_for(&agent_id),
+            "platform_agent_task answered"
+        );
+        Ok(TaskResult {
+            success: true,
+            output: answer,
+            // The executor of this task is a person on the roster, not the
+            // branch that routed it: a result that says `platform_agent_task`
+            // names the desk and loses who was sitting at it.
+            metadata: TaskResultMetadata::new(format!("agent:{agent_id}")),
+        })
+    }
+
+    /// The employee that takes this work item.
+    ///
+    /// The task's own `agent_id` names one, then `input.agent_id`; without
+    /// either the work goes to the next employee in rotation, because an item
+    /// that only one employee ever picks up is that employee's queue under
+    /// another name.
+    async fn employee_for(
+        &self,
+        manager: &dyn cog_core::AgentManager,
+        task: &Task,
+    ) -> SFResult<(String, Arc<dyn cog_core::Agent>)> {
+        let named = task
+            .agent_id
+            .as_deref()
+            .or_else(|| task.input.get("agent_id").and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(id) = named {
+            let agent = manager.get_agent(id).await?.ok_or_else(|| {
+                SFError::Agent(format!(
+                    "the work names employee {id}, who is not on the roster"
+                ))
+            })?;
+            return Ok((id.to_string(), agent));
+        }
+
+        let roster = manager.list_workers().await?;
+        if roster.is_empty() {
+            return Err(SFError::Agent(
+                "no employee is on the roster to take the work item".into(),
+            ));
+        }
+        let start = self
+            .next_worker
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for step in 0..roster.len() {
+            let pick = &roster[(start + step) % roster.len()];
+            // 名册上的一行不等于一个能接活的活对象：退役随时发生，轮到的那个人
+            // 可能刚好在这之前走了。跳过它，不要因此丢掉这件活。
+            if let Some(agent) = manager.get_agent(&pick.agent_id).await? {
+                return Ok((pick.agent_id.clone(), agent));
+            }
+        }
+        Err(SFError::Agent(
+            "every employee on the roster had retired before one could take the work".into(),
+        ))
     }
 
     /// Lightweight single-agent multimodal actionability verdict for an external
@@ -3174,5 +3270,298 @@ mod carried_tests {
         let (kept, more) = carried((0..12).collect(), 12);
         assert_eq!(kept.len(), 12);
         assert!(!more, "恰好装下，却报成了截断");
+    }
+}
+
+#[cfg(test)]
+mod employee_dispatch_tests {
+    use super::*;
+
+    /// 只答 `prompt` 的员工：`prompt_for_task` 的默认实现会转到这里，
+    /// 所以「活有没有到这个人手上」与「他读到的是什么」都能在这里读到。
+    struct RecordingEmployee {
+        answer: String,
+        seen: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl RecordingEmployee {
+        fn new(answer: &str) -> Self {
+            Self {
+                answer: answer.to_string(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<serde_json::Value> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::Agent for RecordingEmployee {
+        async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(input);
+            Ok(serde_json::json!({ "answer": self.answer }))
+        }
+
+        async fn start(&self) {}
+
+        async fn snapshot(
+            &self,
+            _task_id: String,
+        ) -> cog_core::SFResult<cog_core::AgentCheckpoint> {
+            unimplemented!("这段测试不读检查点")
+        }
+
+        async fn restore(&self, _snapshot: &cog_core::AgentCheckpoint) -> cog_core::SFResult<()> {
+            unimplemented!("这段测试不恢复检查点")
+        }
+
+        async fn continue_(
+            &self,
+            _input: serde_json::Value,
+        ) -> cog_core::SFResult<serde_json::Value> {
+            unimplemented!("这段测试只走一次性接活")
+        }
+
+        async fn steer(&self, _instruction: String) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+
+        async fn abort(&self) -> cog_core::SFResult<()> {
+            unreachable!()
+        }
+
+        async fn reset(&self) -> cog_core::SFResult<()> {
+            unreachable!()
+        }
+
+        async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
+            Ok(cog_core::AgentState::Idle)
+        }
+
+        async fn wait_for_idle(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn restore_from_id(&self, _checkpoint_id: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            rx
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("接活的员工走自己的运行循环，不在这里回话")
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn read_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+        ) -> cog_core::SFResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn write_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn receive_message(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 一张写死的名册。`create_agent` 交给第一个员工——这两条测试要的是
+    /// 「派给谁」与「派活本身」，不是建员工。
+    struct RosterManager {
+        roster: Vec<(String, std::sync::Arc<dyn cog_core::Agent>)>,
+    }
+
+    impl RosterManager {
+        fn new(roster: Vec<(String, std::sync::Arc<dyn cog_core::Agent>)>) -> Self {
+            Self { roster }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::AgentManager for RosterManager {
+        async fn create_agent(
+            &self,
+            _agent_id: &str,
+            _role: &str,
+            _llm: std::sync::Arc<dyn cog_core::LlmClient>,
+            _task_id: Option<&str>,
+        ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
+            self.roster
+                .first()
+                .map(|(_, agent)| agent.clone())
+                .ok_or_else(|| cog_core::SFError::Agent("empty roster".into()))
+        }
+
+        async fn retire_task_agents(&self, _task_id: &str) -> cog_core::SFResult<usize> {
+            Ok(0)
+        }
+
+        async fn dispatch(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn list_workers(&self) -> cog_core::SFResult<Vec<cog_core::WorkerInfo>> {
+            Ok(self
+                .roster
+                .iter()
+                .map(|(id, _)| cog_core::WorkerInfo {
+                    agent_id: id.clone(),
+                    role: "employee".into(),
+                    capabilities: vec!["employee".into()],
+                })
+                .collect())
+        }
+
+        async fn shutdown(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn get_agent(
+            &self,
+            agent_id: &str,
+        ) -> cog_core::SFResult<Option<std::sync::Arc<dyn cog_core::Agent>>> {
+            Ok(self
+                .roster
+                .iter()
+                .find(|(id, _)| id == agent_id)
+                .map(|(_, agent)| agent.clone()))
+        }
+    }
+
+    fn work_item(id: &str, input: serde_json::Value) -> cog_core::Task {
+        cog_core::Task::new(
+            id,
+            cog_core::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
+            input,
+        )
+    }
+
+    /// 指名交给某个员工：活到的是他，别人手上没有，结果里记的也是他。
+    ///
+    /// 结果是**这个人**而不是分支名：写回任务行时「谁干的」就靠这一个字段，
+    /// 写成 `platform_agent_task` 就只剩桌子、没了坐在桌前的人。
+    #[tokio::test]
+    async fn a_work_item_reaches_the_employee_it_names() {
+        let luna = std::sync::Arc::new(RecordingEmployee::new("read it"));
+        let max = std::sync::Arc::new(RecordingEmployee::new("grader"));
+        let manager = std::sync::Arc::new(RosterManager::new(vec![
+            ("squad:luna".to_string(), luna.clone()),
+            ("squad:max".to_string(), max.clone()),
+        ]));
+        let executor = CollaborationExecutor::new().with_agent_manager(manager);
+
+        let result = executor
+            .execute_agent_task(&work_item(
+                "work-1",
+                serde_json::json!({"agent_id": "squad:max", "material": "a conversation"}),
+            ))
+            .await
+            .expect("指名的人在名册上，这件活就要有人接");
+
+        assert_eq!(result.metadata.executor_id, "agent:squad:max");
+        assert_eq!(result.output["answer"], "grader");
+        assert!(result.success);
+        let seen = max.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0]["material"], "a conversation",
+            "员工要读到这件活的材料，不是一件空活"
+        );
+        assert!(luna.seen().is_empty(), "点名的是 max，luna 不该接到");
+    }
+
+    /// 不指名时轮流派，而不是全给名册第一名。
+    ///
+    /// 只断言「有人接了」的话，把活永远派给第一个人的实现同样绿——而那是
+    /// 一个人的队列挂了整张名册的招牌。
+    #[tokio::test]
+    async fn work_without_a_name_rotates_across_the_roster() {
+        let luna = std::sync::Arc::new(RecordingEmployee::new("luna"));
+        let max = std::sync::Arc::new(RecordingEmployee::new("max"));
+        let manager = std::sync::Arc::new(RosterManager::new(vec![
+            ("squad:luna".to_string(), luna.clone()),
+            ("squad:max".to_string(), max.clone()),
+        ]));
+        let executor = CollaborationExecutor::new().with_agent_manager(manager);
+
+        for n in 0..4 {
+            executor
+                .execute_agent_task(&work_item(
+                    &format!("work-{n}"),
+                    serde_json::json!({"material": n}),
+                ))
+                .await
+                .expect("名册上有人，这件活就该有人接");
+        }
+
+        assert_eq!(luna.seen().len(), 2, "两轮下来 luna 该接两件");
+        assert_eq!(max.seen().len(), 2, "两轮下来 max 该接两件");
+    }
+
+    /// 名册空的时候不假装干完了。
+    ///
+    /// 这条是给「工作台上一张空名册」准备的读数：活没被接走就要报错，
+    /// 返回一个成功而空的答复会让场景侧以为写回已经发生。
+    #[tokio::test]
+    async fn an_empty_roster_is_an_error_rather_than_a_silent_empty_answer() {
+        let executor = CollaborationExecutor::new()
+            .with_agent_manager(std::sync::Arc::new(RosterManager::new(Vec::new())));
+
+        let err = executor
+            .execute_agent_task(&work_item("work-1", serde_json::json!({})))
+            .await
+            .expect_err("名册上一个人都没有，这件活接不了");
+        assert!(err.to_string().contains("roster"), "{err}");
+    }
+
+    /// 点名的人不在名册上时不要悄悄换人。
+    ///
+    /// 换人会把一件本该落到某人手上的活交给别人，而调用方从结果里看不出来：
+    /// 任务栏上写着成功，某个人却没读到这件活。
+    #[tokio::test]
+    async fn work_naming_an_absent_employee_is_refused_not_handed_to_someone_else() {
+        let luna = std::sync::Arc::new(RecordingEmployee::new("luna"));
+        let executor = CollaborationExecutor::new().with_agent_manager(std::sync::Arc::new(
+            RosterManager::new(vec![("squad:luna".to_string(), luna.clone())]),
+        ));
+
+        let err = executor
+            .execute_agent_task(&work_item(
+                "work-1",
+                serde_json::json!({"agent_id": "squad:nobody"}),
+            ))
+            .await
+            .expect_err("点名的人不在名册上");
+        assert!(err.to_string().contains("squad:nobody"), "{err}");
+        assert!(luna.seen().is_empty(), "点名的是别人，luna 不该接到");
     }
 }
