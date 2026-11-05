@@ -194,13 +194,19 @@ const METADATA_TIMEOUT_SECS: u64 = 120;
 
 /// CI 那一族门禁整段活的墙钟界。
 ///
-/// 工作流里那 52 个 `check-*.sh` 在一个密封沙箱里逐个跑，实测合计 70.7 秒
-/// （含读源码树、读渲染产物、起 python3）；最慢的一个 12.4 秒。这条与它不同量级
-/// 是故意的：宿主同时跑着多分钟的释放构建，安静时的读数只是下界。这个界是
+/// 工作流里那 63 条判据在一个密封沙箱里逐个跑，实测合计 159 秒（含读源码树、
+/// 读渲染产物、起 python3 与 rustup）；最慢的一条 60 秒。这条与它不同量级是
+/// 故意的：宿主同时跑着多分钟的释放构建，安静时的读数只是下界。这个界是
 /// 「挂住了」的那条线，不是预算——一条门禁卡在这个数上时，判成没跑完比等它更
 /// 接近正确的判断。
+///
+/// 300 秒曾经够用，那时清单只认得 `bash deploy/scripts/check-` 一种写法，读出来
+/// 52 条、合计 70.7 秒；认全之后多出 python 判据、`.github/scripts/` 下的判据和
+/// 两条 `--check` 只判不写的脚本，安静时的读数就到了 159 秒。界只留 1.9 倍余量
+/// 时，忙起来的宿主会把尾巴上那几条门跳掉，而跳掉只是「没问过」——正是这一段
+/// 要消灭的那种沉默。
 // cap: bound — 整段门禁卡住时宁可判成没跑完
-const REPO_GATE_STAGE_WALL_SECS: u64 = 300;
+const REPO_GATE_STAGE_WALL_SECS: u64 = 600;
 
 /// 一条变更跑几段门禁：判定那一段，以及红了之后读基线的那一段。
 // cap: bound — 判定一段 + 门禁失败后读基线一段
@@ -209,9 +215,20 @@ const REPO_GATE_RUNS_PER_CHANGE: u64 = 2;
 /// CI 工作流文件，门禁清单的唯一来源。
 const CI_WORKFLOW_FILE: &str = ".github/workflows/ci.yml";
 
-/// 工作流里一条门禁命令的写法：启动器在前，脚本路径紧跟在后。
-const CI_GATE_LAUNCHER: &str = "bash ";
-const CI_GATE_MARKER: &str = "bash deploy/scripts/check-";
+/// 工作流里一条门禁命令的启动器。壳脚本、python 判据、node 判据都算：门是什么
+/// 语言写的一句都不是，它判的是不是整棵树才是一句。
+const CI_GATE_LAUNCHERS: &[&str] = &["bash", "sh", "python3", "python", "node"];
+
+/// 判据脚本的路径标记：名字以 `check-` 开头、住在某个 `scripts/` 目录下的脚本。
+///
+/// 不写死 `deploy/scripts/`：判据住在 `deploy/scripts/` 和 `.github/scripts/` 两处，
+/// 只认前者时后者那几条永远只在 CI 里开口——而它们判的同样是整棵树（私有标识、
+/// 厂商名平等、README 的 trait 成员）。
+const CI_GATE_SCRIPT_MARKER: &str = "scripts/check-";
+
+/// 「只判不写」的调用旗标。`render-deploy.sh --check` 这类脚本名里没有 `check-`，
+/// 可它跑起来做的正是同一件事：把树渲染一遍，与提交的那份比。
+const CI_GATE_JUDGE_FLAG: &str = "--check";
 
 /// 一条变更上不受节拍约束的那几段活的墙钟上界——一个心跳到下一个心跳之间最长
 /// 的一段。加的是三段：
@@ -335,11 +352,20 @@ impl VerificationScopes {
 
 /// 工作流里的一条门禁命令。
 struct RepoGateCommand {
-    /// 相对仓库根的脚本路径，与工作流里写的一样。
-    script: String,
-    /// 工作流在这条命令后面还带了参数（提交区间一类）。带参数的门在待判的这棵
-    /// 树上前提不成立，不跑，但要在读数里说出来。
+    /// 与工作流里写的一样的一条命令：启动器、脚本，加上只由旗标构成的参数。
+    /// 启动器要留着，因为判据不全是用 `bash` 跑的——`python3 deploy/scripts/
+    /// check-*.py` 拿 `bash` 去启动，退出码 127，读起来正好是一条红了的门。
+    argv: Vec<String>,
+    /// 这条命令带着工作流现场才有的东西（`${range}` 一类）。带这种参数的门在
+    /// 待判的这棵树上前提不成立，不跑，但要在读数里说出来。
     takes_arguments: bool,
+}
+
+impl RepoGateCommand {
+    /// 读数里写的那条命令：证据的读者要认得出它对着的是工作流里的哪一行。
+    fn line(&self) -> String {
+        self.argv.join(" ")
+    }
 }
 
 /// 一次门禁判定跑下来的结果。
@@ -386,6 +412,55 @@ impl RepoGateRun {
         }
         line
     }
+}
+
+/// 一行工作流里写着的那条门禁命令，或者没有。
+///
+/// 认两种写法：名字以 `check-` 开头、住在 `scripts/` 下的脚本（壳的、python 的都
+/// 算），以及任何带 `--check` 的脚本调用——后一种脚本名里没有 `check-`，可它做的
+/// 正是同一件事：把树判一遍、不写。
+///
+/// 启动器跟着命令一起留下。判据不全是用 `bash` 跑的：拿 `bash` 去启动一条
+/// `.py` 判据，退出码是 127，读起来正好是一条红了的门。
+fn gate_in_line(line: &str) -> Option<RepoGateCommand> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for (at, token) in tokens.iter().enumerate() {
+        let script = token.trim_matches(|c| c == '"' || c == '\'');
+        let is_script = script.ends_with(".sh") || script.ends_with(".py");
+        if !is_script || !script.contains("scripts/") {
+            continue;
+        }
+        let launched = at > 0 && CI_GATE_LAUNCHERS.contains(&tokens[at - 1]);
+        // 这一行的命令到壳的分隔符为止；后面接的是工作流的下一条命令。
+        let args_end = tokens[at + 1..]
+            .iter()
+            .position(|t| matches!(*t, "&&" | "||" | ";" | "|" | ">" | ">>") || t.starts_with('#'))
+            .map(|n| at + 1 + n)
+            .unwrap_or(tokens.len());
+        let args: Vec<&str> = tokens[at + 1..args_end]
+            .iter()
+            .map(|arg| arg.trim_matches(|c| c == '"' || c == '\''))
+            .collect();
+        let named_like_a_gate = script.contains(CI_GATE_SCRIPT_MARKER);
+        let judged_by_flag = args.contains(&CI_GATE_JUDGE_FLAG);
+        if !named_like_a_gate && !judged_by_flag {
+            continue;
+        }
+        let mut argv: Vec<String> = Vec::new();
+        if launched {
+            argv.push(tokens[at - 1].to_string());
+        }
+        argv.push(script.to_string());
+        argv.extend(args.iter().map(|arg| (*arg).to_string()));
+        // 旗标是判据的一部分（`--check` 就是「只判不写」），别的参数是工作流现场
+        // 才有的东西（`${range}` 一类），这棵待判的树上给不出来。
+        let takes_arguments = args.iter().any(|arg| !arg.starts_with('-'));
+        return Some(RepoGateCommand {
+            argv,
+            takes_arguments,
+        });
+    }
+    None
 }
 
 /// 输出的最后一行非空文本，用于说清一个门为什么说自己跑不了。
@@ -3369,9 +3444,12 @@ impl ChangePipeline {
     /// 工作流在这一次提交上会跑的门，逐个从工作流文件里读出来。
     ///
     /// 不在这里另抄一份清单：抄一份就是两处各自维护，工作流加了门而这里没加，
-    /// 那个门就永远只在落地二十分钟后、在别人头上红一次。读出来的命令带参数时
-    /// （`${range}` 一类）标成「要参数」——那些要的是提交区间，而待判的这棵树
-    /// 上此刻没有提交，硬跑等于拿空串去问一个必然为假的问题。
+    /// 那个门就永远只在落地二十分钟后、在别人头上红一次。读出来的命令带着工作流
+    /// 现场才有的参数时（`${range}` 一类）标成「要参数」——那些要的是提交区间，
+    /// 而待判的这棵树上此刻没有提交，硬跑等于拿空串去问一个必然为假的问题。
+    ///
+    /// 读的是所有行，不是只看 `run:` 开头的行：工作流里多行命令写成 `run: |`，
+    /// 命令本身在下面几行，只认 `run:` 那一行会把它们整段漏掉。
     fn ci_gate_commands(workdir: &Path) -> SFResult<Vec<RepoGateCommand>> {
         let path = workdir.join(CI_WORKFLOW_FILE);
         let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -3382,25 +3460,13 @@ impl ChangePipeline {
         })?;
         let mut out: Vec<RepoGateCommand> = Vec::new();
         for line in text.lines() {
-            let Some(at) = line.find(CI_GATE_MARKER) else {
+            let Some(command) = gate_in_line(line) else {
                 continue;
             };
-            // 跳过 `bash `：留下来的是相对仓库根的脚本路径，与工作流里写的一样。
-            let rest = line[at..]
-                .strip_prefix(CI_GATE_LAUNCHER)
-                .unwrap_or(&line[at..]);
-            let Some(end) = rest.find(".sh") else {
-                continue;
-            };
-            let script = rest[..end + ".sh".len()].trim().to_string();
-            if out.iter().any(|known| known.script == script) {
+            if out.iter().any(|known| known.argv == command.argv) {
                 continue;
             }
-            let tail = rest[end + ".sh".len()..].trim();
-            out.push(RepoGateCommand {
-                script,
-                takes_arguments: !tail.is_empty(),
-            });
+            out.push(command);
         }
         Ok(out)
     }
@@ -3427,14 +3493,15 @@ impl ChangePipeline {
         };
         let deadline = Instant::now() + Duration::from_secs(REPO_GATE_STAGE_WALL_SECS);
         for gate in commands {
+            let line = gate.line();
             if let Some(only) = only {
-                if !only.iter().any(|name| name == &gate.script) {
+                if !only.iter().any(|name| name == &line) {
                     continue;
                 }
             }
             if gate.takes_arguments {
                 run.not_asked
-                    .push((gate.script, "the workflow passes it an argument".into()));
+                    .push((line, "the workflow passes it an argument".into()));
                 continue;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3442,21 +3509,19 @@ impl ChangePipeline {
                 run.interrupted = true;
                 break;
             }
-            let mut cmd = tokio::process::Command::new("bash");
-            cmd.arg(&gate.script)
+            let mut cmd = tokio::process::Command::new(&gate.argv[0]);
+            cmd.args(&gate.argv[1..])
                 .current_dir(workdir)
                 .kill_on_drop(true);
             let output = match tokio::time::timeout(remaining, cmd.output()).await {
                 Ok(Ok(output)) => output,
-                Ok(Err(e)) => {
-                    return Err(SFError::IO(format!("could not run {}: {e}", gate.script)))
-                }
+                Ok(Err(e)) => return Err(SFError::IO(format!("could not run {line}: {e}"))),
                 Err(_) => {
                     run.interrupted = true;
                     break;
                 }
             };
-            run.asked.push(gate.script.clone());
+            run.asked.push(line.clone());
             let text = format!(
                 "{}{}",
                 String::from_utf8_lossy(&output.stdout),
@@ -3464,10 +3529,8 @@ impl ChangePipeline {
             );
             match output.status.code() {
                 Some(0) => run.passed += 1,
-                Some(2) => run
-                    .not_asked
-                    .push((gate.script, last_line_of(&text).to_string())),
-                _ => run.failed.push((gate.script, tail_of(&text))),
+                Some(2) => run.not_asked.push((line, last_line_of(&text).to_string())),
+                _ => run.failed.push((line, tail_of(&text))),
             }
         }
         Ok(run)
@@ -6454,6 +6517,11 @@ index 1111111..2222222 100644
     /// 抄一份的失败不响：工作流加了门、这里没加，那个门就只在落地二十分钟后、
     /// 在别人头上红一次。所以判的是「读得出来吗、读全了吗、带参数的那条认不认得
     /// 出来」。
+    ///
+    /// 夹具里那六条命令是工作流真实出现的几种写法，不是为解析器编的：壳脚本、
+    /// python 判据、`.github/scripts/` 下的判据、`--check` 只判不写的脚本、带
+    /// 提交区间的、以及一条根本不判树的测试脚本。少了前四种里的任何一种，那一族
+    /// 门就只在 CI 里开口；把最后一种读成门，就是每一条变更都白跑一遍别人的测试。
     #[test]
     fn the_gates_are_the_ones_the_workflow_names() {
         let temp = tempfile::tempdir().unwrap();
@@ -6465,28 +6533,45 @@ index 1111111..2222222 100644
                 "      - name: one\n",
                 "        run: bash deploy/scripts/check-one.sh\n",
                 "      - name: two\n",
-                "        run: bash deploy/scripts/check-two.sh\n",
+                "        run: python3 deploy/scripts/check-two.py\n",
                 "      - name: same one again\n",
                 "        run: bash deploy/scripts/check-one.sh\n",
+                "      - name: a gate that lives outside deploy\n",
+                "        run: bash .github/scripts/check-three.sh\n",
+                "      - name: judge the rendered manifests\n",
+                "        run: bash deploy/scripts/render-deploy.sh --check\n",
                 "      - name: with an argument\n",
-                "        run: bash deploy/scripts/check-three.sh \"${range}\"\n",
+                "        run: bash deploy/scripts/check-four.sh \"${range}\"\n",
+                "      - name: a test, not a judgement\n",
+                "        run: bash deploy/scripts/tests/foo.test.sh\n",
+                "      - name: install a dependency\n",
+                "        run: sudo apt-get update\n",
             ),
         )
         .unwrap();
 
         let gates = ChangePipeline::ci_gate_commands(temp.path()).unwrap();
-        let names: Vec<(&str, bool)> = gates
+        let names: Vec<(String, bool)> = gates
             .iter()
-            .map(|gate| (gate.script.as_str(), gate.takes_arguments))
+            .map(|gate| (gate.line(), gate.takes_arguments))
             .collect();
         assert_eq!(
             names,
             vec![
-                ("deploy/scripts/check-one.sh", false),
-                ("deploy/scripts/check-two.sh", false),
-                ("deploy/scripts/check-three.sh", true),
+                ("bash deploy/scripts/check-one.sh".to_string(), false),
+                ("python3 deploy/scripts/check-two.py".to_string(), false),
+                ("bash .github/scripts/check-three.sh".to_string(), false),
+                (
+                    "bash deploy/scripts/render-deploy.sh --check".to_string(),
+                    false
+                ),
+                (
+                    "bash deploy/scripts/check-four.sh ${range}".to_string(),
+                    true
+                ),
             ],
-            "同一个脚本工作流里跑两遍也只判一次；带参数的那条要认出来——它在待判的这棵树上没有提交区间可给"
+            "启动器要跟着命令一起留下（拿 bash 启 .py 是 127）；同一个脚本跑两遍只判一次；\
+             带提交区间的那条要认出来——它在待判的这棵树上没有区间可给"
         );
     }
 
@@ -6506,12 +6591,17 @@ index 1111111..2222222 100644
             workflows.join("ci.yml"),
             concat!(
                 "        run: bash deploy/scripts/check-ok.sh\n",
+                "        run: python3 deploy/scripts/check-python.py\n",
                 "        run: bash deploy/scripts/check-red.sh\n",
                 "        run: bash deploy/scripts/check-silent.sh\n",
             ),
         )
         .unwrap();
         std::fs::write(scripts.join("check-ok.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        // 判据不全是用 bash 跑的。这条门把启动器和工作流写法一起判：丢掉启动器、
+        // 拿 `bash` 去启一个 .py，退出码不是 0，读起来正好是一条红了的门——而它
+        // 其实一直是过的。
+        std::fs::write(scripts.join("check-python.py"), "raise SystemExit(0)\n").unwrap();
         std::fs::write(
             scripts.join("check-red.sh"),
             "#!/bin/sh\necho 'this tree breaks the rule'\nexit 1\n",
@@ -6526,7 +6616,11 @@ index 1111111..2222222 100644
         let run = ChangePipeline::run_repo_gates(temp.path(), None)
             .await
             .unwrap();
-        assert_eq!(run.passed, 1, "退出 0 的那条是过的");
+        assert_eq!(
+            run.passed, 2,
+            "退出 0 的壳门与 python 门都是过的：{:?}",
+            run.asked
+        );
         assert_eq!(
             run.failed.len(),
             1,
