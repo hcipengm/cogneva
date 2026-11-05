@@ -2206,13 +2206,26 @@ pub fn discovery_probe_acceptance(probe: &crate::types::DiscoveryTask) -> String
 /// `match …` 与汇总日志之间，断言 `Ok` 臂 < 退场调用 < `Err` 臂），而那扇门**锚在这段
 /// 代码自己的文本上**：抽成函数之后提交点换了名字，它当场 panic——绿树上的红。形状能
 /// 拦住的坏法取决于「字面量顺序」与「行为」的巧合，它拦不住的坏法也就无从测起。
+/// 这一轮拿到的三样东西：拿什么去生成、宽多少、上一批还欠着几条。
+///
+/// 捆成一个结构不是为了少写字，是因为这三样**必须一起读**：宽度由工具面定，
+/// 而「要不要生成」由宽度与欠账一起定。分成三个参数时，谁在调用点上少传一个
+/// （比如把欠账写成 0）编译器不说话，而那一支的表现是「池子满了照样再交一批」
+/// ——正是这三样捆在一起要拦的那件事。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiscoveryRoundInputs<'a> {
+    pub tool_names: &'a [String],
+    pub skill_ids: &'a [String],
+    /// 这一轮最多交出去几条：工具面自身的大小。
+    pub max_tasks: usize,
+    /// 上一批交出去、判词还没回来的探针条数。
+    pub waiting: usize,
+}
+
 async fn run_discovery_round<F, Fut>(
     engine: &crate::DiscoveryEngine,
     submit: F,
-    tool_names: &[String],
-    skill_ids: &[String],
-    max_tasks: usize,
-    waiting: usize,
+    inputs: DiscoveryRoundInputs<'_>,
     beat: &cog_core::loop_health::Beat,
     deadline: std::time::Instant,
 ) -> DiscoveryRound
@@ -2220,6 +2233,12 @@ where
     F: Fn(String, cog_core::Task) -> Fut + Send,
     Fut: std::future::Future<Output = cog_core::SFResult<Vec<String>>> + Send,
 {
+    let DiscoveryRoundInputs {
+        tool_names,
+        skill_ids,
+        max_tasks,
+        waiting,
+    } = inputs;
     // 上一批探针还有一轮那么宽没收回判词时，这一轮一条也不再生成。
     //
     // 门槛不是另钉一个数，而是这一轮本来会交出去的宽度（`max_tasks`）：等于说，
@@ -2797,12 +2816,15 @@ fn spawn_discovery_loop(
                             let orchestrator = orchestrator.clone();
                             async move { orchestrator.submit_goal_auto(&goal, vec![task]).await }
                         },
-                        &tool_names,
-                        &skill_ids,
-                        max_tasks,
-                        // 结算之后册子上还剩多少条：这是「上一批消化了没有」的读数，
-                        // 取结算前的 `waiting_before` 会把刚收完的那一批又算一遍。
-                        pending.len(),
+                        DiscoveryRoundInputs {
+                            tool_names: &tool_names,
+                            skill_ids: &skill_ids,
+                            max_tasks,
+                            // 结算之后册子上还剩多少条：这是「上一批消化了没有」的
+                            // 读数，取结算前的 `waiting_before` 会把刚收完的那一批
+                            // 又算一遍。
+                            waiting: pending.len(),
+                        },
                         &beat,
                         std::time::Instant::now() + discovery_round_wall(period),
                     )
@@ -5527,11 +5549,13 @@ mod tests {
                     }
                 }
             },
-            &tools,
-            &[],
-            64,
-            // 册子是空的：上一批探针都收完了，这一轮该照常交接。
-            0,
+            DiscoveryRoundInputs {
+                tool_names: &tools,
+                skill_ids: &[],
+                max_tasks: 64,
+                // 册子是空的：上一批探针都收完了，这一轮该照常交接。
+                waiting: 0,
+            },
             &cog_core::loop_health::registry().register(
                 "discovery_round_probe",
                 cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
@@ -5597,10 +5621,12 @@ mod tests {
         let round = run_discovery_round(
             &engine,
             |_goal, task| async move { Ok(vec![task.id.clone()]) },
-            &tools,
-            &[],
-            64,
-            0,
+            DiscoveryRoundInputs {
+                tool_names: &tools,
+                skill_ids: &[],
+                max_tasks: 64,
+                waiting: 0,
+            },
             &cog_core::loop_health::registry().register(
                 "discovery_deferred_probe",
                 cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
@@ -5654,10 +5680,12 @@ mod tests {
         let below = run_discovery_round(
             &engine,
             |_goal, task| async move { Ok(vec![task.id.clone()]) },
-            &tools,
-            &[],
-            width,
-            width - 1,
+            DiscoveryRoundInputs {
+                tool_names: &tools,
+                skill_ids: &[],
+                max_tasks: width,
+                waiting: width - 1,
+            },
             &cog_core::loop_health::registry().register(
                 "discovery_held_back_below",
                 cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
@@ -5677,10 +5705,12 @@ mod tests {
             |_goal, _task| async move {
                 panic!("上一批还没走完，这一轮不该再往图里交探针")
             },
-            &tools,
-            &[],
-            width,
-            width,
+            DiscoveryRoundInputs {
+                tool_names: &tools,
+                skill_ids: &[],
+                max_tasks: width,
+                waiting: width,
+            },
             &cog_core::loop_health::registry().register(
                 "discovery_held_back_at",
                 cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
