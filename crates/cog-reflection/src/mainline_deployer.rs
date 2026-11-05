@@ -5732,6 +5732,9 @@ impl MainlineDeployer {
         since_unix: i64,
     ) -> (CiHoldOwner, Vec<String>) {
         let (rev, finding_rev) = revisions;
+        // 座位先让出来再开新单：反过来做，这一轮开出的行会排在那些再也用不上的
+        // 行后面，而停线车道上一次只跑一条。见 `retire_ci_holds_for_other_revs`。
+        self.retire_ci_holds_for_other_revs(orchestrator, rev).await;
         let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
         let id = Self::live_ci_hold_fix_id(orchestrator, finding_rev, &day, since_unix).await;
         // 证据照原样放进来：接手的人先要读的就是那几条检查自己写下的失败点，而它们
@@ -5847,6 +5850,72 @@ impl MainlineDeployer {
                 ),
             }
         }
+    }
+
+    /// 收掉**针对别的版本**还活着的停线单，把唯一的座位让给这一版。
+    ///
+    /// 与 [`Self::retire_ci_hold_rows`] 收的不是同一批行，判据也不是同一条。
+    /// 那一条收的是「扣住结束了、这行还没动过」，所以不碰在跑的；这一条收的是
+    /// 「这行追的版本已经被 main 走过去了」，在跑的一样收。
+    ///
+    /// 在跑的那行为什么不值得留：CI 是按 push 判的。它把那一版改绿，不会让当前
+    /// 这一版过任何一条检查——交上来的改动只会被同一句「这一版已经是当前 head 的
+    /// 祖先」退回去。2026-11-05 那 24 小时里 27 行有 12 行就是这么结束的，而最先
+    /// 那几行各自在里面花掉了几十分钟。
+    ///
+    /// 必须在这里收，不能等它自己走到终态：停线车道一次只放一条，读循环在等这个
+    /// 座位时连 ack 都不做。2026-11-05 18:2x 实测，一行针对六小时前那一版的修复
+    /// 在跑，消费组 `idle` 五十四分钟、`pending` 十条，当前 head 的红连队列都没进。
+    ///
+    /// 一个都收不到是常态，不打日志：部署器每一轮扣住都会走到这里。
+    async fn retire_ci_holds_for_other_revs(
+        &self,
+        orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
+        live_rev: &str,
+    ) -> usize {
+        let mut retired = 0;
+        for task in orchestrator.get_all_tasks().await {
+            let cog_core::TaskType::Custom(kind) = &task.task_type else {
+                continue;
+            };
+            if kind != CI_HOLD_FIX_KIND || task.status.is_terminal() {
+                continue;
+            }
+            let Some(rev) = task.input.get("rev").and_then(|r| r.as_str()) else {
+                // 没有版本可比的不是这一族：不拿「读不到」当「过期」。
+                continue;
+            };
+            if rev == live_rev {
+                continue;
+            }
+            let reason = format!(
+                "main has moved past {}: CI is judged per push, so making that revision green \
+                 no longer unblocks anything, and the stop-the-line lane has one seat — the \
+                 row for {} needs it",
+                rev12(rev),
+                rev12(live_rev)
+            );
+            match orchestrator.cancel_task_with_reason(&task.id, reason).await {
+                Ok(cascaded) => {
+                    retired += 1;
+                    info!(
+                        task_id = %task.id,
+                        rev = %rev12(rev),
+                        live_rev = %rev12(live_rev),
+                        status = ?task.status,
+                        cascaded = cascaded.len(),
+                        "retired a CI hold aimed at a revision main has already gone past"
+                    );
+                }
+                Err(e) => warn!(
+                    task_id = %task.id,
+                    rev = %rev12(rev),
+                    error = %e,
+                    "a stale CI hold could not be retired; it still holds the lane's seat"
+                ),
+            }
+        }
+        retired
     }
 
     /// 被扣住了多久：这条读数自己就是那条界的观测值。
@@ -17722,7 +17791,12 @@ exec {real} "$@"
             unimplemented!("the hold submits through submit_goal_auto")
         }
         async fn get_all_tasks(&self) -> Vec<cog_core::Task> {
-            unimplemented!("the hold submits through submit_goal_auto")
+            // 收掉别的版本上那几行要先把图读一遍：只问 id 的 `get_task` 答不了
+            // 「图上还有哪些行在追别的版本」。
+            let mut all: Vec<cog_core::Task> =
+                self.graph.lock().unwrap().values().cloned().collect();
+            all.sort_by(|a, b| a.id.cmp(&b.id));
+            all
         }
         async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
             unimplemented!("the hold submits through submit_goal_auto")
@@ -18492,6 +18566,71 @@ exec {real} "$@"
             planner.status(&second_fix),
             Some(cog_core::TaskStatus::Pending),
             "读数说有主，图里就得有一行活的单子：{second_rows:?}"
+        );
+    }
+
+    /// main 往前走了一版，上一版那张单还活着的时候，座位要让它先让出来。
+    ///
+    /// 停线车道一次只放一条，而读循环在等这个座位时连 ack 都不做。2026-11-05
+    /// 18:2x 实测：一行追着六小时前那一版在跑，消费组 `idle` 五十四分钟、`pending`
+    /// 十条，当前 head 的红连队列都没进。那一版改绿不解决当前这一版——CI 按 push
+    /// 判，它交上来的改动只会被判「已经是当前 head 的祖先」。
+    ///
+    /// 特意先 `mark_running`：不收在跑的那一行，就正好放过唯一真正占着座位的那一条。
+    #[tokio::test]
+    async fn a_hold_on_a_newer_revision_retires_the_row_still_chasing_the_old_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        planner
+            .refuse_decomposition
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
+        let checks = vec!["github:Test".to_string()];
+        let old_fix = ci_hold_fix_task_id("aaa111", &day, 100);
+
+        let (owner, rows) = deployer
+            .dispatch_ci_remediation("aaa111", "aaa111", &checks, 100, &[])
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+        assert!(rows.contains(&old_fix), "{rows:?}");
+        assert_eq!(
+            planner.status(&old_fix),
+            Some(cog_core::TaskStatus::Pending)
+        );
+
+        planner.mark_running(&old_fix);
+
+        let new_fix = ci_hold_fix_task_id("bbb222", &day, 200);
+        let (owner, rows) = deployer
+            .dispatch_ci_remediation("bbb222", "bbb222", &checks, 200, &[])
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+        assert!(rows.contains(&new_fix), "{rows:?}");
+
+        assert_eq!(
+            planner.status(&old_fix),
+            Some(cog_core::TaskStatus::Cancelled),
+            "追着已经被走过的那一版的行不该继续占着唯一的座位"
+        );
+        assert_eq!(
+            planner.status(&new_fix),
+            Some(cog_core::TaskStatus::Pending),
+            "让座是为了这一版：新开的那一行得还在"
+        );
+        let (_, reason) = planner
+            .cancels()
+            .into_iter()
+            .find(|(id, _)| id == &old_fix)
+            .expect("旧那一行要留下一条取消记录");
+        assert!(
+            reason.contains("aaa111") && reason.contains("bbb222"),
+            "理由要点名新旧两版，否则读的人只知道它被取消了：{reason}"
         );
     }
 
