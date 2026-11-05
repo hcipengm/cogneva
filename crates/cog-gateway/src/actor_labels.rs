@@ -26,14 +26,11 @@
 pub const ACTOR_LABELS: &[&str] = &[
     "eval",
     "evolution",
-    "intent_gateway",
     "memory",
     "ralph",
     "sandbox-document-organizer",
     "self_review",
     "skill_extractor",
-    "web_chat",
-    "wiki",
 ];
 
 /// Actors that carry a configured role name after the colon.

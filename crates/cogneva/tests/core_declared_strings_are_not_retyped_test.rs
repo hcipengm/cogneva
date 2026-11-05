@@ -139,11 +139,6 @@ const EXEMPT: &[Exempt] = &[
         why: "解析调用方送进来的时间戳，是接受两种外部写法，不是我们自己写出去的名字",
     },
     Exempt {
-        file: "crates/cog-wiki/src/llm_maintainer.rs",
-        value: "%Y-%m-%d",
-        why: "给人看的页面日期，读它的是人不是解析器：改格式不产生「找不到」",
-    },
-    Exempt {
         file: "crates/cog-gateway/src/backup_admin.rs",
         value: "cogneva-backup-",
         why: "导出 Job 的对象名（`cogneva-backup-export-<毫秒>`），不是包文件名；\

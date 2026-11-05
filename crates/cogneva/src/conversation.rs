@@ -29,14 +29,6 @@ use cog_core::{
 };
 use cog_gateway::chat::{ConversationRequest, ConversationTurn};
 
-/// 这段对话的角色名。它出现在运行清点与日志里；真正落到账上的 actor 是
-/// [`WEB_CHAT_ACTOR`]——按角色名记账会把界面花的钱混进 agent 池那一族，而那正是
-/// 要分开看的两件事。
-const CHAT_ROLE: &str = WEB_CHAT_ACTOR;
-
-/// 界面上那次对话在账上的角色。取自网关声明的闭集，不在这里另写一个值。
-const WEB_CHAT_ACTOR: &str = "web_chat";
-
 /// 这一段对话在名册里属于哪个分组。
 ///
 /// 分组只参与名字的哈希材料，把界面上这些员工与 worker 池、进化池的同号槽位
@@ -212,7 +204,10 @@ impl ConversationTurn for PlatformConversation {
             let employee = employee_for(&request.session_id);
             let config = RuntimeConfig {
                 agent_id: employee.id.clone(),
-                role: CHAT_ROLE.to_string(),
+                // 没有角色：这一段对话就是这位员工本人。role 取它的 id，内核因此
+                // 按 `agent:<id>` 落账、按 id 取预算与停滞窗口——账上、名册上、
+                // 日志里读到的是同一个名字，而不是「界面上那一类」。
+                role: employee.id.clone(),
                 // 没有轮数上限：这一轮什么时候结束，由**模型自己不再要工具**来定，
                 // 就像人说话——问一句「你查完了没有」不该由一份常量代答。这里曾经
                 // 写着一个比平台默认还小的数，界面上这位于是比任何同事都早被要求
@@ -256,7 +251,6 @@ impl ConversationTurn for PlatformConversation {
             }
             let mut runtime = cog_agent::AgentRuntime::new(config, events)
                 .with_tools(tools)
-                .with_actor_label(WEB_CHAT_ACTOR)
                 // 没有身份的连接不声明人：编一个名字会读成真有人花过这笔钱。
                 .with_call_identity(
                     request.owner.clone(),
@@ -339,9 +333,9 @@ impl EmployeeLease {
             employee.id.clone(),
             cog_agent::identity::agent_instance(),
             "127.0.0.1",
-            CHAT_ROLE.to_string(),
+            employee.id.clone(),
             "default",
-            vec![CHAT_ROLE.to_string()],
+            vec![employee.id.clone()],
             cog_core::ResourceInfo::default(),
         );
         if let Err(e) = roster.register(&registration).await {
@@ -1147,7 +1141,7 @@ async fn record_refusal(
             "-",
             "quota.dispatch_rejected",
             serde_json::json!({
-                "surface": "web_chat",
+                "surface": "conversation",
                 // 人和员工是两个名字：这一次是谁（员工）替谁（owner）派的。
                 // 只记 owner 时，同一个人开两个会话的两笔拒绝在账上分不开。
                 "owner": owner,
@@ -1348,10 +1342,12 @@ mod tests {
         }
     }
 
-    /// 界面上那笔账的 actor 必须在网关声明的闭集里。
+    /// 界面上那笔账的 actor 是这位员工自己，且必须在网关声明的闭集里。
     #[test]
-    fn the_chat_is_recorded_under_an_actor_the_ledger_declares() {
-        assert!(cog_gateway::actor_labels::declared(WEB_CHAT_ACTOR));
+    fn the_chat_is_recorded_under_its_own_name() {
+        let employee = employee_for("session-abc");
+        let actor = format!("agent:{}", employee.id);
+        assert!(cog_gateway::actor_labels::declared(&actor), "{actor}");
     }
 
     /// 会话是生命周期：同一段对话跨轮、跨重启都是同一个员工。

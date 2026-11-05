@@ -143,9 +143,9 @@ impl WikiBackend for MeilisearchWikiBackend {
 
     /// Updating is storing again under the same id.
     ///
-    /// The trait declares this and the wiki's own maintainer calls it on every
-    /// page it rewrites; left to the default it returned `NotImplemented`, so a
-    /// wiki served by this backend could not have a page changed at all.
+    /// The trait declares it and any writer that rewrites a page goes through
+    /// it; left to the default it returned `NotImplemented`, so a wiki served by
+    /// this backend could not have a page changed at all.
     async fn update_document(&self, relative_path: &str, content: &str) -> SFResult<()> {
         self.ingest_document(relative_path, content).await
     }

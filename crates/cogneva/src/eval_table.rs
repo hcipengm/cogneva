@@ -2417,12 +2417,12 @@ mod tests {
         );
 
         let named = ChatOptions::default()
-            .with_actor("web_chat")
+            .with_actor("memory")
             .with_origin(LlmOrigin::Sandbox.as_str());
         let stamped = EvalIdentity::stamped(&named);
         assert_eq!(
             stamped.headers.get(LLM_ACTOR_HEADER).map(String::as_str),
-            Some("web_chat")
+            Some("memory")
         );
         assert_eq!(
             stamped.headers.get(LLM_ORIGIN_HEADER).map(String::as_str),

@@ -42,7 +42,6 @@ fixture() {
 pub const ACTOR_LABELS: &[&str] = &[
     "eval",
     "memory",
-    "web_chat",
 ];
 
 pub const ACTOR_LABEL_PREFIXES: &[&str] = &["agent:", "self_review:"];
@@ -91,7 +90,6 @@ const WINDOWS = [{ hours: 6, label: '6 小时' }];
 const ACTOR_MEANINGS: Record<string, string> = {
   eval: '评测跑批',
   memory: '记忆读写',
-  web_chat: 'WebUI 对话',
   unknown: '没声明自己是谁',
 };
 export const AGENT_ROLES = ['planner', 'generator'];
@@ -257,7 +255,7 @@ const W = {
 };
 
 function registeredActorNames(): string[] {
-  return ['eval', 'memory', 'web_chat'];
+  return ['eval', 'memory'];
 }
 
 export function ActorTable({ actors }: { actors: any[] }) {
@@ -566,7 +564,7 @@ expect_red "没有时区定义" "没有地方定义 localZoneLabel()"
 # 14. 闭集添了一个执行者、这一屏没有它的读法：那个名字会显示成「不在网关登记的
 #     闭集里，可能是新调用方或写错了名字」——一次正常的扩词被报成一次事故。
 fixture
-sed -i 's/    "web_chat",/    "web_chat",\n    "wiki",/' "${work}/crates/cog-gateway/src/actor_labels.rs"
+sed -i 's/    "memory",/    "memory",\n    "wiki",/' "${work}/crates/cog-gateway/src/actor_labels.rs"
 confirm "${work}/crates/cog-gateway/src/actor_labels.rs" '"wiki"'
 expect_red "闭集多一个名字" "这一屏没有它的读法"
 

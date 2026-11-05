@@ -70,7 +70,7 @@ make_root() {
   cat >"${root}/crates/cog-gateway/src/chat.rs" <<'RS'
 fn opts() -> ChatOptions {
     ChatOptions::default()
-        .with_actor("web_chat")
+        .with_actor("memory")
         .with_origin(LlmOrigin::Interactive.as_str())
 }
 

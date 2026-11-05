@@ -84,14 +84,20 @@ fn the_control_plane_tools_ride_on_the_system_s_own_loop() {
         );
     }
 
-    // 身份与归属：按人记账，并且记在界面那一格上，而不是混进 agent 池。
+    // 身份与归属：按人记账，而且这个人就是这位员工本人。
     assert!(
         text.contains("with_call_identity"),
         "这一轮没有声明调用身份：界面花的钱会落在没有人的那一格"
     );
     assert!(
-        text.contains("with_actor_label"),
-        "这一轮没有钉 actor：按角色名记会把界面花的钱混进 agent 池那一族"
+        text.contains("role: employee.id.clone()"),
+        "这一轮的角色不是这位员工自己：账上会读到一个共同的名字，\
+         同一个人开两个会话的两笔钱在账上就分不开"
+    );
+    assert!(
+        !text.contains("with_actor_label"),
+        "循环上另外钉了一个 actor：它会盖掉这位员工的名字，账上、名册上、\
+         日志里读到的就不是同一个名字了"
     );
 }
 

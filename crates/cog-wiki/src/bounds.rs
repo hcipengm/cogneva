@@ -10,13 +10,14 @@
 
 /// Characters of a single wiki page that may be handed to a model.
 ///
-/// A page has no size bound of its own (it is written from whatever a maintainer
-/// was given), so a retrieval that returns several of them hands a model an
-/// amount of text that grows with the wiki rather than with the question. This
-/// is the per-page ceiling that keeps that from being the case.
+/// A page has no size bound of its own (it is whatever whoever wrote it put
+/// there), so a retrieval that returns several of them hands a model an amount
+/// of text that grows with the wiki rather than with the question. This is the
+/// per-page ceiling that keeps that from being the case.
 ///
-/// The number is the one the maintainer's own query path already used, moved
-/// here rather than chosen again: it is the size of one page's worth of context
-/// for a model, which is the same quantity in both places.
+/// The number is the size of one page's worth of context for a model. The pass
+/// that used to write pages held the same number; it is gone, and the quantity
+/// it bounded is not, so the ceiling stays where it was rather than being
+/// chosen again.
 // cap: bound — 一页交给模型的字符上限：页本身没有大小界，读回来几页就得在这里截
 pub const WIKI_PAGE_PROMPT_CHARS: usize = 2_000;

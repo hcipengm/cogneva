@@ -261,18 +261,6 @@ pub const UNREGISTERED_SITES: &[UnregisteredSite] = &[
         why: "a CLI experiment run, launched by hand: idle in every window no one runs it, and no reading says when one is due",
     },
     UnregisteredSite {
-        actor: "intent_gateway",
-        why: "answers an operator's chat message; absence is the absence of a message",
-    },
-    UnregisteredSite {
-        actor: "web_chat",
-        why: "answers an operator's chat message; same as `intent_gateway`",
-    },
-    UnregisteredSite {
-        actor: "wiki",
-        why: "maintenance pass over the wiki, launched on demand; no reading says when one is due",
-    },
-    UnregisteredSite {
         actor: "skill_extractor",
         why: "runs when a reflection produces a candidate skill; its silence and the reflection chain's idle state are the same reading",
     },

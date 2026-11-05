@@ -71,14 +71,12 @@ const PRODUCERS: &[(&str, &[&str])] = &[
     ),
     // 界面上那段对话跑在系统那条循环上，是装配层把脸名装上去的：网关里没有
     // 循环，也就没有写 actor 的调用点。
-    ("crates/cogneva/src/conversation.rs", &["web_chat"]),
     ("crates/cog-memory/src/extractor.rs", &["memory"]),
     ("crates/cog-reflection/src/evolution.rs", &["evolution"]),
     (
         "crates/cog-reflection/src/extractor.rs",
         &["skill_extractor"],
     ),
-    ("crates/cog-wiki/src/llm_maintainer.rs", &["wiki"]),
     ("crates/cogneva/src/eval_table.rs", &["eval"]),
     (
         "crates/cogneva/tests/collaboration_self_review_test.rs",
@@ -122,12 +120,7 @@ const EXCLUDED: &[(&str, &str)] = &[
 /// call site now that the review loop stamps its own actor header. The table
 /// stays because the next value a caller stops naming needs a place to say so
 /// with a reason.
-const NOT_WRITTEN_AT_A_CALL_SITE: &[(&str, &str)] = &[(
-    "intent_gateway",
-    "the gateway's own /llm/intent endpoint names it as a value it carries into \
-     `call_one_upstream` and `record_llm_call`, not through `with_actor`; the census \
-     reads call sites, and this one is a variable threaded into the ledger writer",
-)];
+const NOT_WRITTEN_AT_A_CALL_SITE: &[(&str, &str)] = &[];
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Site {
@@ -457,10 +450,6 @@ const TASK_KEYING: &[(&str, TaskKeying)] = &[
         TaskKeying::KeyedBy("沙盒里的那份文档"),
     ),
     (
-        "crates/cogneva/src/conversation.rs",
-        TaskKeying::KeyedBy("一段对话，不是任务"),
-    ),
-    (
         "crates/cog-memory/src/extractor.rs",
         TaskKeying::KeyedBy("被抽取的那份原始材料"),
     ),
@@ -471,10 +460,6 @@ const TASK_KEYING: &[(&str, TaskKeying)] = &[
     (
         "crates/cog-reflection/src/extractor.rs",
         TaskKeying::KeyedBy("一个行为模式"),
-    ),
-    (
-        "crates/cog-wiki/src/llm_maintainer.rs",
-        TaskKeying::KeyedBy("一个 wiki 页面"),
     ),
     (
         "crates/cogneva/src/eval_table.rs",
@@ -651,8 +636,8 @@ const CALL_SITES: &[(&str, ActorSource)] = &[
         ActorSource::Forwards,
     ),
     ("crates/cog-eval/src/scaffolds/mod.rs", ActorSource::Stamps),
-    // 界面的这一轮不再自己叫模型：它把对话交给内核那条循环，身份由
-    // `crates/cogneva/src/conversation.rs` 在构造循环时盖下（那一条在 PRODUCERS 里）。
+    // 界面的这一轮不再自己叫模型：它把对话交给内核那条循环，身份由内核按
+    // `agent:<这位员工>` 盖下（`crates/cog-agent/src/agent_kernel/runtime.rs` 那一条）。
     // 这一格删掉而不是改成 `Forwards`——网关手里已经没有请求可递。
     ("crates/cog-llm/src/hot_swap.rs", ActorSource::Forwards),
     ("crates/cog-llm/src/observed.rs", ActorSource::Forwards),
@@ -687,7 +672,6 @@ const CALL_SITES: &[(&str, ActorSource)] = &[
         "crates/cog-reflection/src/extractor.rs",
         ActorSource::Stamps,
     ),
-    ("crates/cog-wiki/src/llm_maintainer.rs", ActorSource::Stamps),
 ];
 
 /// 生产代码里出现了对模型的调用（`chat` / `chat_stream`）的那些文件。

@@ -10,8 +10,6 @@
 
 pub mod bounds;
 pub mod indexer;
-pub mod llm_maintainer;
-pub mod maintainer;
 pub mod manager;
 pub mod meilisearch;
 pub mod page;
@@ -21,11 +19,6 @@ pub mod vector_index;
 
 pub use bounds::WIKI_PAGE_PROMPT_CHARS;
 pub use indexer::{WikiIndexEntry, WikiIndexer};
-pub use llm_maintainer::LlmWikiMaintainer;
-pub use maintainer::{
-    ContradictionReport, ContradictionSeverity, DataGap, IngestReport, LintReport, MissingCrossRef,
-    OutdatedPage, QueryResult, WikiMaintainer,
-};
 pub use manager::WikiManager;
 pub use page::{WikiPage, WikiPageType};
 pub use search::{ThreeTierSearch, WikiSearchResult};

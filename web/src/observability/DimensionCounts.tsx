@@ -213,24 +213,33 @@ const ORIGIN_LABELS: Record<string, string> = {
 const ACTOR_MEANINGS: Record<string, string> = {
   eval: '评测跑批这个程序自己的调用（三个读成「评测」的名字里最外面的一个：`agent:evaluator` 是被评的那个角色，`self_review:evaluator` 是它审自己）',
   evolution: '自进化循环',
-  intent_assess: '意图评估阶段',
-  intent_gateway: '意图网关（交互入口的意图路由）',
   memory: '记忆读写',
   ralph: 'ralph 循环',
   self_review: '自检（没有指明被评对象的一侧）',
   skill_extractor: '技能抽取',
   'sandbox-document-organizer': '沙盒里的文档整理',
-  web_chat: 'WebUI 对话',
-  wiki: '知识库',
   unknown: '没有身份的调用——不是某个角色，是一次缺陷。网关在付钱之前就拒收没带 `x-cogneva-actor` 的调用（400，零花销），所以这一格的花销只该有 2026-11-03 之前的历史；此后它再涨，涨的是被拒的次数，说明有调用方没报身份，要按缺陷查',
+};
+
+/**
+ * 已退役的执行者名：闭集里没有了，历史窗口里还有行。
+ *
+ * 它们不进 `registry`（那是今天的闭集，列出来会变成一行「本窗口没有调用」的假
+ * 名字），只用于读旧行的来历——否则历史窗口会把一次制度变更显示成「写错了名字」。
+ */
+const RETIRED_ACTOR_MEANINGS: Record<string, string> = {
+  web_chat: '历史（2026-11-05 之前）：界面对话统一记在这一格；此后每位员工按自己的 `agent:<id>` 落账',
+  intent_gateway: '历史（2026-11-05 之前）：网关自己的 `/v1/intent` 意图分类；该入口已删除，意图由对话员工自己判',
+  wiki: '历史（2026-11-05 之前）：知识库维护者；该维护者从未被装配，已删除',
+  intent_assess: '历史（2026-11-05 之前）：协作执行器里那条专门的意图判定分支；此后判定作为一件 `platform_agent_task` 交给常驻员工做',
 };
 
 /**
  * 两族里的角色名：平台会为它建 agent 的那些名字。
  *
- * 闭集不止上面那 11 个固定名——`agent:<角色>` / `self_review:<角色>` 是两族前缀，
- * 族员是配置里的角色名。族员不写出来，「闭集共 11 个」这句话就读成全集，而表里
- * 实际会出现 20 来行；读者数不出「2 族到底几个」，也没法和表对上。
+ * 闭集不止上面那几个固定名——`agent:<角色>` / `self_review:<角色>` 是两族前缀，
+ * 族员是配置里的角色名。族员不写出来，上面那几行就会被当成全集，而表里实际
+ * 还会多出两族各一列；读者数不出「2 族到底几个」，也没法和表对上。
  *
  * 正本是 `cog_core::roles::ALL`。这里抄的是**会以 agent 身份调用模型的角色**：
  * `external-worker` 不在其中——它是靠心跳占位的登记角色，从不跑 agent，永远不会有
@@ -395,16 +404,26 @@ const ORIGIN: Dimension = {
  */
 export function actorHint(value: string): string {
   if (value.startsWith('agent:')) {
-    const role = value.slice('agent:'.length);
-    return role === 'evaluator'
+    const who = value.slice('agent:'.length);
+    // 闭集里还有一族 `agent:<角色>`（planner…merger），族外的是某一位员工自己的
+    // id：界面上那段对话、一个常驻员工都以它落账。两句话分开，读者才分得清
+    // 「一个角色」与「一个人」。
+    if (!AGENT_ROLES.includes(who)) {
+      return `员工 ${who} 自己的调用（账上按 id 认人，不按角色）`;
+    }
+    return who === 'evaluator'
       ? '多智能体里的 evaluator 角色在给别人的产物打分（与 `eval`、`self_review:evaluator` 是三件事）'
-      : `多智能体里的 ${role} 角色`;
+      : `多智能体里的 ${who} 角色`;
   }
   if (value.startsWith('self_review:')) {
     const role = value.slice('self_review:'.length);
     return `${role} 在审它自己刚写的那份输出（同一个执行者的第二件事，不是另一个执行者）`;
   }
-  return ACTOR_MEANINGS[value] ?? '不在网关登记的执行者闭集里，可能是新调用方或写错了名字';
+  return (
+    ACTOR_MEANINGS[value] ??
+    RETIRED_ACTOR_MEANINGS[value] ??
+    '不在网关登记的执行者闭集里，可能是新调用方或写错了名字'
+  );
 }
 
 /** 这一维真正算数的成员：占位符照样列出，但不计入「有几个」。 */

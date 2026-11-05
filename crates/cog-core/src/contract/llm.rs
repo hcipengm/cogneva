@@ -52,7 +52,8 @@ pub const LLM_TASK_HEADER: &str = "x-cogneva-task";
 /// The three axes already on this request answer which component, which
 /// environment and which job; none of them answers "whose budget is this".
 /// A person's daily ceiling can only be enforced against the last one, and a
-/// caller's own actor name is not it: every WebUI conversation is `web_chat`.
+/// caller's own actor name is not it: every WebUI conversation is its own
+/// employee, and one person can open several of them.
 ///
 /// The value has to be an identity this platform authenticated, not a name the
 /// caller chose. A ceiling a caller can rename itself out of is not a ceiling,
