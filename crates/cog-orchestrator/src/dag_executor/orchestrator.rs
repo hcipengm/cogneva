@@ -1822,8 +1822,11 @@ impl DagExecutor {
     async fn check_timeouts_store(&self) -> Vec<(String, bool, Vec<String>, bool)> {
         let be = self.fg().expect("store mode");
         let now = chrono::Utc::now();
+        // 回收判据只对还在跑的行成立（终态的行不再持有租约，也不会超时），所以
+        // 这一趟只读还能影响派发的行。整表读的代价在控制面上是按秒计的，而这一
+        // 趟在超时扫描里循环调用。
         let all = be
-            .dag_get_all_tasks(&self.workspace_id)
+            .dag_get_live_tasks(&self.workspace_id)
             .await
             .unwrap_or_default();
         let reclaimable: Vec<(Task, ReclaimCause)> = all
@@ -3546,7 +3549,11 @@ impl DagExecutor {
         let owner = self.run_id.clone();
 
         if let Some(be) = self.fg() {
-            let all = be.dag_get_all_tasks(&self.workspace_id).await?;
+            // 续期只对还在跑的行有用，所以读的也只是还能影响派发的行：这一句在
+            // 心跳里，一个跑了一周的库里绝大多数行已经是历史。实测 2026-11-05：
+            // 一次整表读 9,990 行、2-5 秒，而库本身被限流到 76% 的周期，控制面
+            // 的每一条读都在给同一台机器的 CPU 加价。
+            let all = be.dag_get_live_tasks(&self.workspace_id).await?;
             let mut renewed = 0usize;
             for mut task in all {
                 if !task.renew_lease(&owner, lease, now) {
@@ -3620,8 +3627,10 @@ impl DagExecutor {
             task.status == TaskStatus::Running && task.lease_owner.as_deref() == Some(owner)
         };
         if let Some(be) = self.fg() {
+            // 判据只要还在跑的行；终态的行既不可能属于「本进程正在跑」，也不该
+            // 出现在这一趟检查点里。读表的范围跟着判据走。
             return be
-                .dag_get_all_tasks(&self.workspace_id)
+                .dag_get_live_tasks(&self.workspace_id)
                 .await
                 .map(|all| {
                     all.iter()
@@ -4802,6 +4811,123 @@ mod tests {
         }
         async fn load_dag_state(&self, workspace_id: &str) -> SFResult<Option<serde_json::Value>> {
             Ok(self.snapshots.lock().await.get(workspace_id).cloned())
+        }
+    }
+
+    /// A store that answers both listers and records which one was asked.
+    ///
+    /// The two read the same rows and differ only in the query they cost, so an
+    /// assertion on the answer cannot tell them apart. The counters are the
+    /// reading: a periodic pass that asks for every row in the workspace is the
+    /// difference between a control plane that fits in the database's budget and
+    /// one that does not.
+    #[derive(Default)]
+    struct CountingTaskStore {
+        tasks: tokio::sync::Mutex<Vec<Task>>,
+        wide_reads: std::sync::atomic::AtomicUsize,
+        narrow_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingTaskStore {
+        fn wide_reads(&self) -> usize {
+            self.wide_reads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn narrow_reads(&self) -> usize {
+            self.narrow_reads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateBackend for CountingTaskStore {
+        fn dag_supports_fine_grained(&self) -> bool {
+            true
+        }
+        async fn get_agent_state(&self, _agent_id: &str) -> SFResult<Option<AgentState>> {
+            Ok(None)
+        }
+        async fn set_agent_state(&self, _agent_id: &str, _state: &AgentState) -> SFResult<()> {
+            Ok(())
+        }
+        async fn cas_agent_state(
+            &self,
+            _agent_id: &str,
+            _expected: &AgentState,
+            _new: &AgentState,
+        ) -> SFResult<bool> {
+            Ok(true)
+        }
+        async fn get_checkpoint(&self, _task_id: &str) -> SFResult<Option<TaskCheckpoint>> {
+            Ok(None)
+        }
+        async fn save_checkpoint(&self, _checkpoint: &TaskCheckpoint) -> SFResult<()> {
+            Ok(())
+        }
+        async fn append_event(&self, _task_id: &str, _event: &Event) -> SFResult<u64> {
+            Ok(0)
+        }
+        async fn get_events(
+            &self,
+            _task_id: &str,
+            _offset: u64,
+            _limit: usize,
+        ) -> SFResult<Vec<Event>> {
+            Ok(Vec::new())
+        }
+        async fn get_board(&self, _task_id: &str) -> SFResult<Option<ContextBoard>> {
+            Ok(None)
+        }
+        async fn set_board_field(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+        async fn delete_checkpoint(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn delete_board(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn remove_board_field(&self, _task_id: &str, _field: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn save_dag_state(
+            &self,
+            _workspace_id: &str,
+            _state: &serde_json::Value,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+        async fn load_dag_state(&self, _workspace_id: &str) -> SFResult<Option<serde_json::Value>> {
+            Ok(None)
+        }
+        async fn dag_get_all_tasks(&self, _workspace_id: &str) -> SFResult<Vec<Task>> {
+            self.wide_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.tasks.lock().await.clone())
+        }
+        async fn dag_get_live_tasks(&self, _workspace_id: &str) -> SFResult<Vec<Task>> {
+            self.narrow_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .filter(|t| t.status.affects_dispatch())
+                .cloned()
+                .collect())
+        }
+        async fn dag_transition_task(
+            &self,
+            _workspace_id: &str,
+            _task_id: &str,
+            _expected: &[TaskStatus],
+            _updated: &Task,
+        ) -> SFResult<()> {
+            Ok(())
         }
     }
 
@@ -6267,6 +6393,41 @@ mod tests {
         assert!(
             expires <= chrono::Utc::now() + chrono::Duration::seconds(61),
             "到期时刻不能超过租约时长: {expires}"
+        );
+    }
+
+    /// 心跳读的是「还能影响派发的行」，不是整张表。
+    ///
+    /// 两者给同一个答案，差别只在库那边付多少：实测 2026-11-05，一个跑了一周
+    /// 的工作区整表 9,990 行、一次读 2-5 秒，而库被限流到 76% 的 CFS 周期。这条
+    /// 测试钉的是读的范围，因为答案正确不区分这两种读法——只有请求的字节数区分。
+    #[tokio::test]
+    async fn the_lease_heartbeat_reads_only_rows_that_can_still_run() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-live-heartbeat".into())
+            .with_task_lease_secs(60)
+            .with_state_backend(backend.clone());
+
+        let mut running = Task::new("t-running", TaskType::DagNode, serde_json::json!({}));
+        running.begin_run(
+            dag.run_id(),
+            chrono::Duration::seconds(60),
+            chrono::Utc::now(),
+        );
+        let mut done = Task::new("t-done", TaskType::DagNode, serde_json::json!({}));
+        done.status = TaskStatus::Completed;
+        backend.tasks.lock().await.extend([running, done]);
+
+        assert_eq!(dag.renew_leases().await.unwrap(), 1);
+        assert_eq!(
+            backend.narrow_reads(),
+            1,
+            "续期该读的是还能影响派发的那些行"
+        );
+        assert_eq!(
+            backend.wide_reads(),
+            0,
+            "整表读在这个库里是秒级开销，心跳每拍都付一次，付的是一整个控制面的响应"
         );
     }
 
