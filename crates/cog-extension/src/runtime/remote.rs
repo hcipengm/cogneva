@@ -9,6 +9,47 @@ use async_trait::async_trait;
 /// 快速失败，而不是卡在 SYN 重传里。
 // cap: bound — 连沙盒执行器的墙
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 执行器换一次版要多久没有后端：这副部署只有一副副本，且
+/// `maxSurge: 0` / `maxUnavailable: 1`——单节点上第二副没有地方调度，所以换版是
+/// 先删后建，中间有一段服务没有就绪后端（取舍写在
+/// `deploy/k3s/sandbox-executor-deployment.yaml`）。
+///
+/// 实测 2026-11-06：新 Pod 的 init 在 06:09:37 起来，主容器 06:12:03 才开始跑，
+/// 两分半里连 `echo alive` 都拿不到连接。而在飞的那一轮 Agent 正是靠这个执行器
+/// 跑 `cargo clippy`、读文件、产出 diff：它重试十几次都落在窗口里，最后交了白卷，
+/// 一条停线单连交三轮零改动、预算耗尽记 `failed`。窗口比一条命令长，客户端就得
+/// 比窗口更长——这不是"执行器坏了"，是"执行器正在被换掉"。
+// cap: bound — 跨一次执行器换版的等待上界
+const REPLACEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(200);
+
+/// 端口被明确拒绝与包被丢掉是两件事。前者说「服务现在没有就绪后端」，也就是
+/// 一次换版的窗口，自己会好；后者多是网络策略挡住，等多久都不会好，等它只是把
+/// 失败推后。所以只认前者。
+///
+/// 也只在**连接没建起来**时重试：这条错误链上出现 `ConnectionRefused` 意味着请求
+/// 根本没送到对端，重发是安全的；一旦连通过，`run_command` 与 `write_file` 都不
+/// 幂等，重发就可能执行两次。
+fn the_port_refused(e: &(dyn std::error::Error + 'static)) -> bool {
+    let refused = |candidate: &(dyn std::error::Error + 'static)| {
+        candidate
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+    };
+    // 链头也要看：调用方直接递进来的就是一个 `io::Error` 时，它自己就是答案，
+    // 往它的 `source()` 里找只会找到 `None`。
+    if refused(e) {
+        return true;
+    }
+    let mut source = e.source();
+    while let Some(current) = source {
+        if refused(current) {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
 use cog_core::{
     CommandEvent, CommandEventStream, SFResult, SandboxBackend, SandboxPayload, SandboxRequest,
     SandboxResult,
@@ -19,12 +60,25 @@ use futures::StreamExt;
 pub struct RemoteExecutor {
     base_url: String,
     http: reqwest::Client,
+    /// 端口被拒之后还等多久。见 [`REPLACEMENT_WINDOW`]。
+    replacement_window: std::time::Duration,
 }
 
 impl RemoteExecutor {
     pub fn new(base_url: impl Into<String>) -> SFResult<Self> {
+        Self::with_replacement_window(base_url, REPLACEMENT_WINDOW)
+    }
+
+    /// 同一个客户端，换一段等待上界。生产的窗口是
+    /// [`REPLACEMENT_WINDOW`]；这里开一个口子是为了让"窗口内会重试""窗口过了
+    /// 要说出等了多久"这两条判据能在测试里按秒验证，而不是按两分半验证。
+    pub fn with_replacement_window(
+        base_url: impl Into<String>,
+        replacement_window: std::time::Duration,
+    ) -> SFResult<Self> {
         Ok(Self {
             base_url: base_url.into(),
+            replacement_window,
             // No total timeout: long-running commands are bounded by the
             // server-side timeout, the client must not cut the stream early.
             // The connect phase is bounded separately: if the executor pod is
@@ -59,20 +113,48 @@ impl SandboxBackend for RemoteExecutor {
             ));
         }
         let url = format!("{}/execute", self.base_url.trim_end_matches('/'));
-        let response = self
-            .http
-            .post(&url)
-            .json(&serde_json::json!({
-                "payload": req.payload,
-                "timeout_ms": req.timeout.as_millis(),
-                "task_id": req.task_id,
-                "agent_id": req.agent_id,
-            }))
-            .send()
-            .await
-            .map_err(|e| {
-                cog_core::SFError::Agent(format!("sandbox executor unreachable: {}", e))
-            })?;
+        let body = serde_json::json!({
+            "payload": req.payload,
+            "timeout_ms": req.timeout.as_millis(),
+            "task_id": req.task_id,
+            "agent_id": req.agent_id,
+        });
+        // 换版窗口里的调用要等，窗口外的失败要当场报。「等」与「报」的分界是
+        // 端口有没有明确拒绝：拒绝＝服务暂时没有后端，会自己好；其余（连不通、
+        // 被丢掉）等下去也不会好。见 [`the_port_refused`]。
+        let started = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(250);
+        let response = loop {
+            match self.http.post(&url).json(&body).send().await {
+                Ok(response) => break response,
+                Err(e) if the_port_refused(&e) && started.elapsed() < self.replacement_window => {
+                    tracing::warn!(
+                        waited_secs = started.elapsed().as_secs(),
+                        retry_in_ms = pause.as_millis() as u64,
+                        "the sandbox executor has no ready backend; a rollout replaces this \
+                         pod, so the call waits inside the replacement window"
+                    );
+                    tokio::time::sleep(pause).await;
+                    pause = (pause * 2).min(std::time::Duration::from_secs(5));
+                }
+                Err(e) => {
+                    let note = if the_port_refused(&e) {
+                        format!(
+                            " (the port refused for {}s, past the {}-second replacement window: \
+                             the executor's rollout is either still going or stuck, so waiting \
+                             longer from here would just postpone the failure)",
+                            started.elapsed().as_secs(),
+                            self.replacement_window.as_secs()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    return Err(cog_core::SFError::Agent(format!(
+                        "sandbox executor unreachable: {e}{note}"
+                    )));
+                }
+            }
+        };
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -187,6 +269,82 @@ mod tests {
         let executor = RemoteExecutor::new(format!("http://{}", addr)).unwrap();
         let err = executor.execute(&cmd_req("echo hi")).await.unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    /// 一个刚被释放的端口：连上去操作系统会明确拒绝，这正是执行器换版时
+    /// 「服务没有就绪后端」的样子。
+    async fn a_port_nothing_listens_on() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    /// 等待期间起来的执行器必须被等到：换版窗口是两分半，一条命令的失败不该
+    /// 记在 Agent 头上。断言的是"重试跨过了窗口里的那一段"，不是"重试存在"。
+    #[tokio::test]
+    async fn a_replaced_executor_is_waited_for_instead_of_reported_unreachable() {
+        let addr = a_port_nothing_listens_on().await;
+        let executor = RemoteExecutor::with_replacement_window(
+            format!("http://{addr}"),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = format!(
+                "{}\n",
+                serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let result = executor.execute(&cmd_req("echo alive")).await;
+        assert!(
+            result.is_ok(),
+            "the executor came back inside the window, so the call must succeed: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+    }
+
+    /// 窗口过了还连不上，报错要说清等过多久、为什么不再等——否则下一轮 Agent
+    /// 会把一段换版读成"平台坏了"，再交一次白卷。
+    #[tokio::test]
+    async fn a_port_that_never_comes_back_names_the_window_it_waited() {
+        let addr = a_port_nothing_listens_on().await;
+        let executor = RemoteExecutor::with_replacement_window(
+            format!("http://{addr}"),
+            std::time::Duration::from_millis(600),
+        )
+        .unwrap();
+        let err = executor.execute(&cmd_req("echo hi")).await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("replacement window"),
+            "the message must say the wait was bounded by a replacement window: {text}"
+        );
+        assert!(
+            text.contains("sandbox executor unreachable"),
+            "the message must still name what was unreachable: {text}"
+        );
+    }
+
+    /// 拒绝与丢包分属两条路：前者会自己好，后者等多久都不会。
+    #[test]
+    fn a_refused_port_is_told_apart_from_a_packet_the_network_dropped() {
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let dropped = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        assert!(the_port_refused(&refused));
+        assert!(!the_port_refused(&dropped));
     }
 
     #[tokio::test]
