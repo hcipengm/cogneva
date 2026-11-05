@@ -2212,6 +2212,7 @@ async fn run_discovery_round<F, Fut>(
     tool_names: &[String],
     skill_ids: &[String],
     max_tasks: usize,
+    waiting: usize,
     beat: &cog_core::loop_health::Beat,
     deadline: std::time::Instant,
 ) -> DiscoveryRound
@@ -2219,6 +2220,29 @@ where
     F: Fn(String, cog_core::Task) -> Fut + Send,
     Fut: std::future::Future<Output = cog_core::SFResult<Vec<String>>> + Send,
 {
+    // 上一批探针还有一轮那么宽没收回判词时，这一轮一条也不再生成。
+    //
+    // 门槛不是另钉一个数，而是这一轮本来会交出去的宽度（`max_tasks`）：等于说，
+    // 只有等着的探针比这一拍能交的还少，才值得再交一批。判据落在「池子有没有被
+    // 消化」上，不落在「生成了几条」上，因为后者恒为正——生成器每轮都肯生成，
+    // 而消化速度由执行槽决定。2026-11-05 一天交出去 1902 条、收回判词 131 条，
+    // 剩下的 1766 条在池子里排队，那一小时八成花费都在这批交出去就没下文的探针
+    // 身上。
+    //
+    // 不会僵住：`pending` 里每条都有 `outcome_deadline`，到期由
+    // `settle_discovery_outcomes` 记成 `expired` 并移出册子（那里 `kept` 只收
+    // 还在路上且没过期的），所以等着的条数只会减不会只增。
+    if waiting >= max_tasks {
+        return DiscoveryRound {
+            generated: 0,
+            submitted: 0,
+            refused: 0,
+            deferred: 0,
+            held_back: waiting,
+            handed_over: Vec::new(),
+        };
+    }
+
     let tasks = engine
         .generate_tasks(tool_names, skill_ids, max_tasks)
         .await;
@@ -2281,6 +2305,7 @@ where
         submitted,
         refused,
         deferred,
+        held_back: 0,
         handed_over,
     }
 }
@@ -2296,6 +2321,11 @@ pub(crate) struct DiscoveryRound {
     pub refused: usize,
     /// 这一轮的墙到了还没轮到的条数：它们没退场，下一轮会原样再生成。
     pub deferred: usize,
+    /// 本拍一条也没生成的理由：上几批交出去的探针还有这么多条没收回判词。
+    /// 非零时 `generated` 必然是 0，而两者必须分开印——「没有人想出新组合」
+    /// 与「新组合有，但上一批还没走完」是相反的两件事，后者的下一步是等，前者
+    /// 的下一步是别等了。
+    pub held_back: usize,
     /// 每条是（编排器给的任务 id，探针本体，这条任务声明的执行契约秒数）。
     pub handed_over: Vec<(String, crate::types::DiscoveryTask, u64)>,
 }
@@ -2770,6 +2800,9 @@ fn spawn_discovery_loop(
                         &tool_names,
                         &skill_ids,
                         max_tasks,
+                        // 结算之后册子上还剩多少条：这是「上一批消化了没有」的读数，
+                        // 取结算前的 `waiting_before` 会把刚收完的那一批又算一遍。
+                        pending.len(),
                         &beat,
                         std::time::Instant::now() + discovery_round_wall(period),
                     )
@@ -2783,6 +2816,18 @@ fn spawn_discovery_loop(
                             probe,
                             deadline: outcome_deadline(timeout_secs, period),
                         });
+                    }
+                    if round.held_back > 0 {
+                        // 与下一句分开：这一拍**有**新组合可提，只是上一批还没走完。
+                        // 合成一句「没有新组合」会让「池子消化不动」读成「搜索空间
+                        // 穷尽」，而两者下一拍该做的事相反。
+                        info!(
+                            role = SELF_DISCOVERY_ROLE,
+                            waiting = round.held_back,
+                            round_width = max_tasks,
+                            "discovery round deferred: earlier probes are still unanswered"
+                        );
+                        continue;
                     }
                     if round.generated == 0 {
                         debug!(
@@ -5485,6 +5530,8 @@ mod tests {
             &tools,
             &[],
             64,
+            // 册子是空的：上一批探针都收完了，这一轮该照常交接。
+            0,
             &cog_core::loop_health::registry().register(
                 "discovery_round_probe",
                 cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
@@ -5553,6 +5600,7 @@ mod tests {
             &tools,
             &[],
             64,
+            0,
             &cog_core::loop_health::registry().register(
                 "discovery_deferred_probe",
                 cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
@@ -5581,6 +5629,73 @@ mod tests {
         assert_eq!(
             after, before,
             "没交出去的组合要原样留在池子里：这一次没时间不是试过一次"
+        );
+    }
+
+    /// 上一批探针还没收回判词时，这一轮一条也不交接；收到了就照常交接。
+    ///
+    /// 钉的是一个在生产里量到的结局：生成速度不受限，消化速度由执行槽决定，于是
+    /// 池子只增不减，而每一条压着的探针每一拍都还会被派发一次。2026-11-05 一天
+    /// 交出去 1902 条、收回判词 131 条；那一小时八成花费在这批「交出去就没下文」
+    /// 的探针身上。门槛取这一轮的宽度，所以两侧都要试：等着的比宽度少一格时要照
+    /// 常交（否则这条环在池子刚空出一点时也停了），等于宽度时一条都不交。
+    #[tokio::test]
+    async fn unanswered_probes_hold_the_next_round_back() {
+        let tools: Vec<String> = ["read_file", "run_command", "write_file"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let width = tools.len();
+        let engine = crate::DiscoveryEngine::new(std::sync::Arc::new(
+            crate::recorder::InMemoryRecorder::new(),
+        ));
+
+        // 一格的余量：照常交接。
+        let below = run_discovery_round(
+            &engine,
+            |_goal, task| async move { Ok(vec![task.id.clone()]) },
+            &tools,
+            &[],
+            width,
+            width - 1,
+            &cog_core::loop_health::registry().register(
+                "discovery_held_back_below",
+                cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
+        assert!(
+            below.submitted > 0,
+            "等着的比这一轮的宽度还少，这一轮就该照常交接：{below:?}"
+        );
+        assert_eq!(below.held_back, 0);
+
+        // 攒满一轮的宽度：这一拍一条也不交，而且**生成都没发生**。
+        let held = run_discovery_round(
+            &engine,
+            |_goal, _task| async move {
+                panic!("上一批还没走完，这一轮不该再往图里交探针")
+            },
+            &tools,
+            &[],
+            width,
+            width,
+            &cog_core::loop_health::registry().register(
+                "discovery_held_back_at",
+                cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
+        assert_eq!(
+            (held.generated, held.submitted, held.refused),
+            (0, 0, 0),
+            "本该等着的一拍不该生成或交出任何探针"
+        );
+        assert_eq!(
+            held.held_back, width,
+            "这一拍要说出它在等多少条：`generated == 0` 的另一半是「没人想出组合」，两者不能同形"
         );
     }
 
