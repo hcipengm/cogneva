@@ -356,6 +356,13 @@ pub const TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC: &str = "cogneva_task_router_cla
 /// bound is not something the work itself can explain. Published as a wall
 /// rather than a constant so the rule that reads it moves with the task
 /// timeouts instead of going stale when one of them changes.
+///
+/// The figure is the bound of the **budget**, and it is published on every
+/// stream that draws from that budget. The permits are one per process, so a
+/// stream reading 0 here is not "nothing to compare against" — it is a stream
+/// that is holding none, precisely because another stream on the same budget
+/// is holding them all. Comparing that stream's own wait against its own empty
+/// set makes `wait > 0` true of any ordinary backpressure.
 pub const TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC: &str =
     "cogneva_task_router_claim_hold_bound_seconds";
 /// The deployed rule that reads the pair above.
@@ -408,13 +415,35 @@ impl ClaimStreamState {
             .saturating_sub(self.semaphore.available_permits())
     }
 
-    /// The longest timeout among the holds that have one. A hold with no parsed
-    /// task yet contributes nothing: its payload may be a poison one that never
-    /// reaches execution, and inventing a bound for it would let a wall be
-    /// compared against a number nothing stated.
+    /// The longest timeout among *this stream's* holds that have one. A hold
+    /// with no parsed task yet contributes nothing: its payload may be a poison
+    /// one that never reaches execution, and inventing a bound for it would let
+    /// a wall be compared against a number nothing stated.
+    ///
+    /// This is the per-stream half of the answer; what gets published is the
+    /// budget's, see [`budget_bound_seconds`].
     fn hold_bound_seconds(&self) -> u64 {
         self.held.values().copied().max().unwrap_or(0)
     }
+}
+
+/// The longest timeout stated by any hold drawing from the same budget.
+///
+/// Two streams that share one semaphore are one budget: a stream waiting on it
+/// is waiting for work another stream is running, so the only wall its wait can
+/// be compared against is that work's. Keyed on the semaphore rather than on
+/// "every stream this process has", so a deployment that later gives a stream
+/// its own budget keeps two answers instead of one blended one.
+fn budget_bound_seconds(
+    streams: &HashMap<String, ClaimStreamState>,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) -> u64 {
+    streams
+        .values()
+        .filter(|state| Arc::ptr_eq(&state.semaphore, semaphore))
+        .map(ClaimStreamState::hold_bound_seconds)
+        .max()
+        .unwrap_or(0)
 }
 
 /// The permits, and what is holding them, as this process sees them.
@@ -535,7 +564,7 @@ impl Observable for ClaimSlotsObservable {
                 ),
                 (
                     TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
-                    state.hold_bound_seconds() as f64,
+                    budget_bound_seconds(&streams, &state.semaphore) as f64,
                 ),
             ] {
                 out.push(
@@ -1077,6 +1106,19 @@ mod tests {
         metrics.iter().find(|m| m.name == name)
     }
 
+    /// 同一族里按流取那一格：一条进程读几条流时，只按名字取到的是「碰巧排在第
+    /// 一的那条」，用它去判另一条流等于是拿别人的数答自己的问题。
+    fn metric_of(metrics: &[RawMetric], name: &str, stream: &str) -> f64 {
+        metrics
+            .iter()
+            .find(|m| {
+                m.name == name
+                    && m.labels.get(crate::LABEL_STREAM).map(String::as_str) == Some(stream)
+            })
+            .unwrap_or_else(|| panic!("{name} for stream {stream} missing"))
+            .value
+    }
+
     async fn measured(reply: Reply) -> Vec<RawMetric> {
         let observer = StreamPendingObservable::new();
         let backend = StubBackend(reply);
@@ -1444,6 +1486,65 @@ mod tests {
                 .value,
             0.0
         );
+    }
+
+    /// A stream waiting on the shared budget must state the bound of the work
+    /// that is holding it, not the bound of its own empty set.
+    ///
+    /// 2026-11-06 实测：`:local` 上两条 3600 秒的任务占满 6/6，`default` 一条
+    /// 都没持有却在等 1171 秒；上界按流算出来是 0，于是 `wait > 0` 恒成立，
+    /// `task_router_claim_stall` 在一条正常背压的预算上天天亮，亮出来的单再各
+    /// 占一格，把同一条误判做得更响。
+    ///
+    /// 另一份预算留在旁边：按预算算不能退化成「按进程算」，否则一条自己不
+    /// 紧张的流会被另一条毫无关系的流的时限替它说话。
+    #[tokio::test]
+    async fn a_stream_waiting_on_a_budget_states_the_bound_of_the_work_holding_it() {
+        let observer = Arc::new(ClaimSlotsObservable::new());
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let elsewhere = Arc::new(tokio::sync::Semaphore::new(1));
+        observer.register(STREAM, budget.clone(), 1);
+        observer.register("waiting-on-the-same-budget", budget.clone(), 1);
+        observer.register("another-budget", elsewhere.clone(), 1);
+
+        let permit = budget.clone().acquire_owned().await.unwrap();
+        let running = observer.permit_taken(STREAM);
+        running.note_timeout(3600);
+        let other_permit = elsewhere.clone().acquire_owned().await.unwrap();
+        let other = observer.permit_taken("another-budget");
+        other.note_timeout(60);
+        observer.wait_started("waiting-on-the-same-budget");
+
+        let read = observer.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            metric_of(
+                &read,
+                TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
+                "waiting-on-the-same-budget"
+            ),
+            3600.0,
+            "the stream that holds nothing is waiting for the work that holds the budget"
+        );
+        assert_eq!(
+            metric_of(&read, TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC, "another-budget"),
+            1.0,
+            "each budget counts its own occupancy"
+        );
+        assert_eq!(
+            metric_of(
+                &read,
+                TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
+                "another-budget"
+            ),
+            60.0,
+            "another budget's holds are not this one's wall"
+        );
+
+        drop(running);
+        drop(permit);
+        drop(other);
+        drop(other_permit);
+        observer.wait_ended("waiting-on-the-same-budget");
     }
 
     /// A stream nobody registered publishes nothing at all: an absent series is
