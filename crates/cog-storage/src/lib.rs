@@ -80,8 +80,8 @@ pub use postgres::{
     PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,
     PostgresPgeStageStore, PostgresPrincipleLedgerStore, PostgresRawLogIndexStore,
     PostgresResourceEventStore, PostgresSnapshotStore, PostgresStateBackend,
-    PostgresTasteIntentStore, PostgresUserStore, SendOutcome, EVENTS_PAGE_SQL, LOG_LINES_PER_TASK,
-    ROWS_KEPT_PER_PEER, ROWS_KEPT_PER_SESSION,
+    PostgresTasteIntentStore, PostgresUserStore, SendOutcome, DAG_LOCK_WORKSPACE_SQL,
+    EVENTS_PAGE_SQL, LOG_LINES_PER_TASK, ROWS_KEPT_PER_PEER, ROWS_KEPT_PER_SESSION,
 };
 
 #[cfg(feature = "redis")]

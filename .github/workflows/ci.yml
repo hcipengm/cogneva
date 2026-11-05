@@ -178,6 +178,17 @@ jobs:
         run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # 完成 / 失败 / 取消一条任务前那条把整个 workspace 锁住的语句，2026-11-05 一天
+      # 在生产上死锁了 13 次：等待链两头都是同一条 `SELECT ... WHERE workspace_id = $1
+      # FOR UPDATE`，而它没规定取行的顺序，两个进程可以各握着对方要的那一行等下去。
+      # 被杀掉的那个事务是一次已经算完、结果没落库的完成，下一位持锁者只看得到租约
+      # 过期，于是把整条任务重新派发、重新花一遍钱。这条用例同一个 workspace 上并发
+      # 完成 8 条任务、并让两个会话故意走不同计划去抢第一行；去掉全序它们就红。
+      - name: Live-DB workspace lock order
+        if: ${{ !cancelled() }}
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test workspace_lock_takes_rows_in_one_order -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The claim is a count of commits per burst, and a stand-in has no commit
       # to count: the reading is whatever the server's own log says. An ignored
       # test whose file says how to run it still ran nowhere until a step named

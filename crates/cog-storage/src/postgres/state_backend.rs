@@ -30,6 +30,20 @@ pub const EVENTS_PAGE_SQL: &str = r#"
     LIMIT $3
 "#;
 
+/// 完成 / 失败 / 取消一条任务前，先锁住它所在 workspace 的全部任务行。
+///
+/// 这条语句同时被多个执行进程跑（同一个 workspace 下不止一个执行器在结算任务），
+/// 而它锁的是一个集合：不带 `ORDER BY` 时两个事务可以按相反的顺序取到同一批元组，
+/// 各自握着一行、等对方那一行，Postgres 检测到环就杀掉其中一个。被杀掉的那个事务
+/// 正是一次**已经算完但结果没落库**的完成——下一位持锁者只看得到「租约过期」，
+/// 于是把整条任务重新派发、重新花一遍钱。2026-11-05 一天在生产日志里抓到 13 次，
+/// 上下文全是这条语句。
+///
+/// `ORDER BY task_id` 给这批行一个全序，两个事务就只能是「同一顺序排队」而不是
+/// 「互相等」。
+pub const DAG_LOCK_WORKSPACE_SQL: &str =
+    "SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 ORDER BY task_id FOR UPDATE";
+
 /// This store's schema, and the one a restore replays.
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS cog_agent_states (
@@ -1148,13 +1162,11 @@ impl StateBackend for PostgresStateBackend {
             .map_err(|e| SFError::Database(e.to_string()))?;
 
         // 锁住本 workspace 全部任务行，整批读到一致快照后再算就绪翻转
-        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-            "SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 FOR UPDATE",
-        )
-        .bind(workspace_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(DAG_LOCK_WORKSPACE_SQL)
+            .bind(workspace_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
 
         let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
             .into_iter()
@@ -1242,13 +1254,11 @@ impl StateBackend for PostgresStateBackend {
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;
 
-        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-            "SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 FOR UPDATE",
-        )
-        .bind(workspace_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(DAG_LOCK_WORKSPACE_SQL)
+            .bind(workspace_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
 
         let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
             .into_iter()
@@ -1345,13 +1355,11 @@ impl StateBackend for PostgresStateBackend {
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;
 
-        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-            "SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 FOR UPDATE",
-        )
-        .bind(workspace_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(DAG_LOCK_WORKSPACE_SQL)
+            .bind(workspace_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
 
         let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
             .into_iter()
