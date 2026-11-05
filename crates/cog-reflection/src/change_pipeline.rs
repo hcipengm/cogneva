@@ -5211,6 +5211,178 @@ index 1111111..2222222 100644
         );
     }
 
+    /// 一条变更让 CI 会跑的门变红时，它在落地之前就被退回去。
+    ///
+    /// 用真的壳脚本、真的工作流文件、真的 git 树：这里要成立的是「工作流点名的
+    /// 那条门在这个工作目录里被跑起来、它的退出码进了判词」。给夹具喂一份门的
+    /// 转录，只能证明读转录的那段代码认得自己写的东西。
+    #[tokio::test]
+    async fn a_change_that_breaks_a_gate_is_refused_for_it() {
+        let root = tempfile::tempdir().unwrap();
+        seed_a_probe_crate(&root).await;
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn answer() -> i32 {\n    42\n}\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
+        )
+        .await
+        .unwrap();
+        // 门：`src/lib.rs` 里不许出现 `banana`。种子树是干净的，所以这条门在改动
+        // 之前是过的——判的是「这条变更让它红了」，不是「这棵树本来就红」。
+        tokio::fs::create_dir_all(root.path().join(".github/workflows"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join(".github/workflows/ci.yml"),
+            "      - name: banana\n        run: bash deploy/scripts/check-no-banana.sh\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("deploy/scripts"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("deploy/scripts/check-no-banana.sh"),
+            "#!/bin/sh\ngrep -q banana src/lib.rs && { echo 'the tree carries a banana'; exit 1; }\nexit 0\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "banana-1".into(),
+            description: "加一个取水果名的函数".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -6,3 +6,7 @@\n\
+                      \x20fn answer_is_42() {\n\
+                      \x20    assert_eq!(answer(), 42);\n\
+                      \x20}\n\
+                      +pub fn fruit() -> &'static str {\n\
+                      +    \"banana\"\n\
+                      +}\n\
+                      +\n"
+            .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed),
+            "门红了而这条变更被放行了：{}",
+            result.test_output
+        );
+        assert!(
+            result.test_output.contains("check-no-banana.sh"),
+            "证据里没有点出是哪条门红的：{}",
+            result.test_output
+        );
+        assert!(
+            result.test_output.contains("the tree carries a banana"),
+            "证据里没有那条门自己说的那句话：{}",
+            result.test_output
+        );
+    }
+
+    /// 这棵树本来就红的门，不记在那条变更头上。
+    ///
+    /// 与套件那条基线同一个道理：主干红着的时候，若把已有的红算成每一条变更的
+    /// 罪，连修它的那一条都过不去，链就停在那里。
+    #[tokio::test]
+    async fn a_gate_the_tree_already_fails_does_not_refuse_a_change() {
+        let root = tempfile::tempdir().unwrap();
+        seed_a_probe_crate(&root).await;
+        // 种子里就带着 `banana`：这条门在改动之前已经是红的。
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn fruit() -> &'static str {\n    \"banana\"\n}\n\n#[test]\nfn fruit_is_a_word() {\n    assert_eq!(fruit(), \"banana\");\n}\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join(".github/workflows"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join(".github/workflows/ci.yml"),
+            "      - name: banana\n        run: bash deploy/scripts/check-no-banana.sh\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("deploy/scripts"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("deploy/scripts/check-no-banana.sh"),
+            "#!/bin/sh\ngrep -q banana src/lib.rs && { echo 'the tree carries a banana'; exit 1; }\nexit 0\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "unrelated-1".into(),
+            description: "加一行注释".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,3 +1,4 @@\n\
+                      +// 这一行与那条门无关。\n\
+                      \x20pub fn fruit() -> &'static str {\n\
+                      \x20    \"banana\"\n\
+                      \x20}\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Passed,
+            "这棵树本来就红的门被算到了这条变更头上：{}",
+            result.test_output
+        );
+        assert!(
+            result.test_output.contains("check-no-banana.sh"),
+            "放行的那一份证据里也要说出哪条门本来就不成立：{}",
+            result.test_output
+        );
+    }
+
+    /// 一个最小的真 crate：够 suite 跑绿，也够门有一个工作目录。
+    async fn seed_a_probe_crate(root: &tempfile::TempDir) {
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+    }
+
     /// A change that writes a line the linter reports on is refused for it, and
     /// the refusal names the line.
     ///
