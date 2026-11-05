@@ -514,6 +514,17 @@ impl AgentObservable {
     ///
     /// Both terms are observed, so the ceiling follows the workload instead of
     /// needing to be retuned by hand whenever the workload changes.
+    ///
+    /// An unstated ceiling (`u32::MAX`, "no ceiling stated here") is not a
+    /// decision to be unbounded — it is the caller having no number. Leaving it
+    /// as the answer silences the calibration in exactly the deployment that
+    /// needs it most: the one that never states a ceiling. Measured on
+    /// 2026-11-06, where nothing states one: a single generator run on one
+    /// change reached 149 turns, and 98 runs of a million tokens or more were
+    /// 60% of the agent bill, while every change that has ever completed did so
+    /// on its first ralph iteration (60 of 60 over 14 days). The spend was
+    /// going to retries that never turned into deliveries, and the only number
+    /// anyone had measured was never consulted.
     pub fn iteration_budget_for(&self, role: &str, seed: u32) -> u32 {
         let calibrations = self
             .role_calibrations
@@ -532,7 +543,14 @@ impl AgentObservable {
             .expect("sample is not empty");
         let sum: u32 = calibration.delivered_iterations.iter().sum();
         let typical = sum.div_ceil(calibration.delivered_iterations.len() as u32);
-        seed.max(longest.saturating_add(typical))
+        let calibrated = longest.saturating_add(typical);
+        // `u32::MAX` is this field's spelling of "nobody stated a ceiling", not a
+        // ceiling of four billion turns. Taking the max against it discards the
+        // only measured number, so the calibration answers instead.
+        if seed == u32::MAX {
+            return calibrated;
+        }
+        seed.max(calibrated)
     }
 }
 
@@ -1098,6 +1116,37 @@ mod tests {
         // 只有被截断的运行也不是"跑完过"的证据：它没交卷，也就没说需要多少轮。
         o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
         assert_eq!(o.iteration_budget_for("generator", 10), 10);
+    }
+
+    /// 调用方没写上限时（`u32::MAX` 就是"这里没写天花板"的拼法），标定不能被它
+    /// 顶掉：那一刻唯一测到过的数就是这一份标定，拿一个"没人写过"的数去比大小，
+    /// 等于把标定整个关掉——而那正好发生在一个从没写过上限的部署里。
+    #[test]
+    fn an_unstated_ceiling_takes_the_calibration_instead_of_discarding_it() {
+        let o = AgentObservable::new();
+        for _ in 0..4 {
+            o.record_run("generator", RunOutcome::Delivered, 12, 21, 12);
+        }
+        // 最长 12 + 均值 12。
+        assert_eq!(
+            o.iteration_budget_for("generator", u32::MAX),
+            24,
+            "没写上限不等于不要上限：测到的那一份就是上限"
+        );
+        // 写死的种子照旧压过标定，操作者的决定不由标定推翻。
+        assert_eq!(o.iteration_budget_for("generator", 40), 40);
+        // 比标定小的种子仍是「已知形状放不下」，标定把它抬起来。
+        assert_eq!(o.iteration_budget_for("generator", 3), 24);
+    }
+
+    /// 一次都没交付过的时候，没写上限就仍然是没有上限：这时没有测到任何数，
+    /// 凭空给一个，只是把猜数换个地方猜。
+    #[test]
+    fn an_unstated_ceiling_stays_unstated_until_something_is_measured() {
+        let o = AgentObservable::new();
+        assert_eq!(o.iteration_budget_for("generator", u32::MAX), u32::MAX);
+        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        assert_eq!(o.iteration_budget_for("generator", u32::MAX), u32::MAX);
     }
 
     /// 上限必须容得下这个角色**已经交付过**的轮数，否则它不是安全线而是缺陷：
