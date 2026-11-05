@@ -28,7 +28,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use cog_core::{AgentRegistration, AgentRegistry, SFResult};
+use cog_core::{AgentRegistration, AgentRegistry, MessageBackend, SFResult};
 use cog_gateway::{create_router, GatewayState};
 use cog_storage::{AgentMessage, AgentMessageStore, NewAgentMessage, SendOutcome};
 
@@ -73,7 +73,7 @@ struct RecordingTranscript {
 
 #[async_trait::async_trait]
 impl AgentMessageStore for RecordingTranscript {
-    async fn record(&self, message: &NewAgentMessage<'_>) -> SFResult<()> {
+    async fn record(&self, message: &NewAgentMessage<'_>) -> SFResult<i64> {
         let mut lines = self
             .lines
             .lock()
@@ -90,7 +90,24 @@ impl AgentMessageStore for RecordingTranscript {
             outcome_detail: message.outcome_detail.map(str::to_string),
             created_at: chrono::Utc::now(),
         });
-        Ok(())
+        Ok(id)
+    }
+
+    async fn answer(&self, id: i64, reply: &str) -> SFResult<bool> {
+        let mut lines = self
+            .lines
+            .lock()
+            .expect("the transcript lock is not poisoned");
+        let Some(line) = lines.iter_mut().find(|line| line.id == id) else {
+            return Ok(false);
+        };
+        if !matches!(line.outcome, SendOutcome::Queued | SendOutcome::TimedOut) {
+            return Ok(false);
+        }
+        line.outcome = SendOutcome::Replied;
+        line.reply = Some(reply.to_string());
+        line.outcome_detail = None;
+        Ok(true)
     }
 
     async fn conversation(&self, peer: &str, limit: usize) -> SFResult<Vec<AgentMessage>> {
@@ -214,6 +231,146 @@ async fn a_command_that_was_never_answered_is_recorded_as_timed_out() {
     assert!(
         lines[0].outcome_detail.is_some(),
         "the reader has to know why there is no answer: {lines:?}"
+    );
+}
+
+/// A wait longer than the deployment's per-request budget is refused at the
+/// door, not cut off mid-flight.
+///
+/// Every route here sits under one request budget. A wait that outlives it is
+/// cut off by that budget before the conversation line is written, and what the
+/// caller gets is a bare 408: the words delivered, nothing recorded, and no way
+/// to tell that from the agent's silence. The refusal names the bound so a
+/// caller can see what this deployment can hold.
+#[tokio::test]
+async fn a_wait_longer_than_the_request_budget_is_refused_at_the_door() {
+    let transcript = Arc::new(RecordingTranscript::default());
+    let state = state(transcript.clone());
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "transcript-budget-probe").await;
+
+    // This state answers a request within 30s and keeps 5s of that for writing
+    // the line down, so the longest honest wait is 25s.
+    let (status, body) = call(
+        &app,
+        "POST",
+        &token,
+        &format!("{ROUTE}?wait_secs=60"),
+        Some(r#"{"type":"prompt","goal":{"objective":"wait far too long"}}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a wait the deployment cannot hold is refused, not left to be cut off: {body}"
+    );
+    assert!(
+        body.contains("above 25"),
+        "the refusal has to name the bound this deployment can hold: {body}"
+    );
+
+    let lines = transcript.lines.lock().expect("lock").clone();
+    assert_eq!(
+        lines.len(),
+        1,
+        "a refused wait is still a send that was turned away, and it is written down: {lines:?}"
+    );
+    assert_eq!(lines[0].outcome, SendOutcome::Refused);
+}
+
+/// An answer that arrives after the request has been answered lands on the line
+/// that request wrote.
+///
+/// The request is not the conversation: an agent's turn outlives the caller's
+/// patience, and the platform's own request budget is shorter than many turns.
+/// What keeps a late answer is that the reply stream stays open under a
+/// collector, and that the line the send wrote is still waiting to be settled.
+#[tokio::test]
+async fn an_answer_that_arrives_later_settles_the_line_its_send_wrote() {
+    let transcript = Arc::new(RecordingTranscript::default());
+    let backend: Arc<dyn MessageBackend> = Arc::new(cog_stream::MemoryMessageBackend::new());
+    let state = router_state::with_messaging_and_transcript(
+        backend.clone(),
+        Arc::new(OneAgent),
+        transcript.clone(),
+    );
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "transcript-late-probe").await;
+
+    // The test plays the worker: stand on the inbox before anything is sent, so
+    // the command is read rather than missed behind the reader's position.
+    let inbox = cog_core::agent_inbox_stream(AGENT);
+    backend
+        .create_consumer_group(&inbox, "probe-worker")
+        .await
+        .expect("the worker opens its inbox");
+    let mut reader = backend
+        .subscribe(&inbox, "probe-worker")
+        .await
+        .expect("the worker reads its inbox");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &token,
+        ROUTE,
+        Some(r#"{"type":"prompt","goal":{"objective":"answer me later"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    use futures::StreamExt;
+    let (_, bytes) = tokio::time::timeout(std::time::Duration::from_secs(10), reader.next())
+        .await
+        .expect("the command reaches the worker")
+        .expect("the inbox stream yields one frame")
+        .expect("the frame reads back");
+    let command: cog_core::InboxMessage =
+        serde_json::from_slice(&bytes).expect("the command is an inbox message");
+    let reply_stream = match &command {
+        cog_core::InboxMessage::Prompt {
+            reply_stream: Some(stream),
+            ..
+        } => stream.clone(),
+        other => panic!("a prompt must carry the reply stream the route opened: {other:?}"),
+    };
+
+    let answer = serde_json::json!("I read you, a little late");
+    let payload = serde_json::to_vec(&answer).expect("the answer serialises");
+    backend
+        .publish(&reply_stream, &payload)
+        .await
+        .expect("the answer goes onto the stream the route opened");
+
+    // The collector is a background task, so the line settles a moment later.
+    let mut settled = Vec::new();
+    for _ in 0..100 {
+        settled = transcript.lines.lock().expect("lock").clone();
+        if settled
+            .iter()
+            .any(|line| line.outcome == SendOutcome::Replied)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        settled.len(),
+        1,
+        "the answer belongs to the line the send wrote, not to a new one: {settled:?}"
+    );
+    assert_eq!(
+        settled[0].outcome,
+        SendOutcome::Replied,
+        "a late answer is still an answer: {settled:?}"
+    );
+    assert_eq!(
+        settled[0].reply.as_deref(),
+        Some("I read you, a little late")
+    );
+    assert!(
+        settled[0].outcome_detail.is_none(),
+        "an answered line carries no failure detail: {settled:?}"
     );
 }
 

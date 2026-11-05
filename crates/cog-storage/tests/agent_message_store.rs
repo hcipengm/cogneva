@@ -169,3 +169,65 @@ async fn the_bound_applies_per_receiving_peer() {
         .expect("delete the noise");
     cleanup(&probe).await;
 }
+
+/// An answer that arrives after its row was written settles that row, and only
+/// while the row is still unanswered.
+///
+/// The row is written when the send is dispatched, and the agent's turn can
+/// finish long after: `record` hands back the row for exactly this, so the
+/// answer lands on the question instead of beside it. What must not happen is a
+/// second answer overwriting the first — a row with two answers has two truths
+/// about one exchange.
+#[tokio::test]
+#[ignore]
+async fn an_answer_settles_its_own_row_once() {
+    let probe = probe().await;
+    let row = probe
+        .store
+        .record(&NewAgentMessage {
+            from_unit: &probe.left,
+            to_unit: &probe.right,
+            kind: "prompt",
+            body: "answer me later",
+            outcome: SendOutcome::Queued,
+            reply: None,
+            outcome_detail: None,
+        })
+        .await
+        .expect("record the send");
+
+    assert!(
+        probe
+            .store
+            .answer(row, "here, a little late")
+            .await
+            .expect("settle the row"),
+        "a queued row is still waiting for its answer"
+    );
+    let after = probe
+        .store
+        .conversation(&probe.right, 10)
+        .await
+        .expect("read it back");
+    assert_eq!(after.len(), 1, "the answer did not add a line: {after:?}");
+    assert_eq!(after[0].outcome, SendOutcome::Replied);
+    assert_eq!(after[0].reply.as_deref(), Some("here, a little late"));
+    assert_eq!(after[0].outcome_detail, None, "{after:?}");
+
+    assert!(
+        !probe
+            .store
+            .answer(row, "a second answer")
+            .await
+            .expect("a second answer is judged, not written"),
+        "a row that already says the agent answered is not settled again"
+    );
+    let after = probe
+        .store
+        .conversation(&probe.right, 10)
+        .await
+        .expect("read it back again");
+    assert_eq!(after[0].reply.as_deref(), Some("here, a little late"));
+
+    cleanup(&probe).await;
+}

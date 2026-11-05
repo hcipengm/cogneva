@@ -235,7 +235,7 @@ pub struct NewAgentMessage<'a> {
     pub outcome_detail: Option<&'a str>,
 }
 
-/// The conversation's two operations.
+/// The conversation's three operations.
 ///
 /// A trait rather than the concrete store because the gateway must keep
 /// delivering when no database is reachable: the send goes through, the
@@ -243,8 +243,22 @@ pub struct NewAgentMessage<'a> {
 /// a server.
 #[async_trait]
 pub trait AgentMessageStore: Send + Sync {
-    /// Record one send whose outcome is already settled.
-    async fn record(&self, message: &NewAgentMessage<'_>) -> SFResult<()>;
+    /// Record one send, and return the row it was written to.
+    ///
+    /// The row is returned because the outcome can settle after this call: an
+    /// agent that answers a minute later still answers the question this row
+    /// holds, and a transcript that cannot name the row it is about to settle
+    /// has to either duplicate the question or drop the answer.
+    async fn record(&self, message: &NewAgentMessage<'_>) -> SFResult<i64>;
+
+    /// Put an answer on a row that was recorded before the answer existed.
+    ///
+    /// Only a row still reading `queued` or `timed_out` is moved: a row that
+    /// already says the agent answered carries a different answer, and one
+    /// overwritten by a late arrival would have two truths about one exchange.
+    /// Returns whether a row moved — a transcript that has already trimmed it
+    /// says so rather than pretending the answer was written.
+    async fn answer(&self, id: i64, reply: &str) -> SFResult<bool>;
 
     /// The last `limit` lines of a peer's conversation, oldest first.
     ///

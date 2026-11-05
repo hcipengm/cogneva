@@ -82,7 +82,7 @@ export function PeopleView() {
     send,
     refreshAgents,
     refreshConversation,
-  } = useAgentConversation(true, 60);
+  } = useAgentConversation(true);
   // 名单与这一屏的会话一起交给「执行者这一面变了」的帧：有人上岗、换态、走了，
   // 或者有人往某个员工的收件箱里写过一句，立刻重读，不等下一拍 15 秒。两份读数
   // 同一次触发一起读——分两次读，左栏已经多了一个人、右栏还对着旧的那份会话。
@@ -215,11 +215,12 @@ export function PeopleView() {
                 className="flex-1 resize-none border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[12px] outline-none focus:border-[var(--brass)] disabled:opacity-50"
               />
               <Button onClick={submit} disabled={!selected || sending || !draft.trim()} tone="accent">
-                {sending ? '等待回答…' : '发送'}
+                {sending ? '发送中…' : '发送'}
               </Button>
             </div>
             <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
-              发送会等它回话（最多一分钟）；超过窗口它可能仍在跑，那一行会写成「没在等待窗口内回答」，不是失败。
+              发出去就答「已送达」，不占着这一次请求等它：它回话可能比一条请求的寿命长。回答到了会自己补进这一行，
+              不用刷新——这一面读的是会话，不是一次请求的结果。
             </p>
           </section>
         </div>

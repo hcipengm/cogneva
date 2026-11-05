@@ -16,8 +16,14 @@ import {
  *
  * 读取失败不吞掉：名单读不到与「没有 agent 在岗」长得一样，会话读不到与「没说过
  * 话」长得一样，两者都必须各自说出来。
+ *
+ * 发送**不带等待窗口**（`waitSecs = 0`，请求里就没有这个参数）：一条请求活不过
+ * 部署自己的每请求预算，而员工的一个回合常常比它长。把回答绑在一次连接的寿命上，
+ * 结果是回答晚到时既不在这一次响应里、也留不到下一次——两头都看不到。带回话流的
+ * 是平台自己：话说出去就答 202，回答到了由服务端补进这一行会话，再落一帧让这一面
+ * 重读。于是「等」不再是界面的职责，界面只是读。
  */
-export function useAgentConversation(enabled: boolean, waitSecs = 60) {
+export function useAgentConversation(enabled: boolean, waitSecs = 0) {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [agentsError, setAgentsError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);

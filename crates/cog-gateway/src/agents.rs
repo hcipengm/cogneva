@@ -209,6 +209,7 @@ pub const ROSTER_KEEPER_LOOP: &str = "gateway_roster_keeper";
 ///
 /// 一分钟一次：要盯的事只有「池里少了名册上的人」，那只有进程重启或员工被收走
 /// 时才会发生；比这更密只是对同一条 hash 做无谓的读。
+// cap: bound — 名册维护的节拍；它盯的变化只在进程重启或员工被收走时发生，不是量出来的
 pub const ROSTER_KEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 名册上的一行。
@@ -604,7 +605,15 @@ pub async fn send_message_handler(
             .into_response();
     }
 
-    let wait = match ask_window(&msg, query.wait_secs) {
+    // The wait this route can hold is not the caller's to set alone: the whole
+    // route sits under the deployment's per-request budget, and a wait that
+    // outlives it is cut off by that budget with a bare 408 — the caller's
+    // words delivered, the record never written, and nothing said about why.
+    // The budget is read here, per request, because it is reloadable.
+    let budget_secs = state
+        .request_timeout_secs
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let wait = match ask_window(&msg, query.wait_secs, budget_secs) {
         Ok(wait) => wait,
         Err(e) => {
             record_send(&state, &sent, SendOutcome::Refused, None, Some(&e)).await;
@@ -621,12 +630,31 @@ pub async fn send_message_handler(
     // published between the publish and the subscribe would sit behind the
     // reader and the wait would run to its deadline with the answer already
     // on the wire.
-    let ask = match wait {
-        Some(window) => {
+    //
+    // Every prompt gets a stream, not only the ones this request waits for.
+    // The answer is what the agent produced, and an agent that answers after
+    // the request returned has still answered this question: without a stream
+    // the sentence has nowhere to land and is dropped on the floor. Commands
+    // that carry no answer (abort, reset, steering, continue) open nothing.
+    let ask = if matches!(msg, cog_core::InboxMessage::Prompt { .. }) {
+        match state.message_backend.clone() {
+            Some(backend) => match Ask::open(backend, &mut msg, wait).await {
+                Ok(ask) => Some(ask),
+                Err(e) => {
+                    record_send(&state, &sent, SendOutcome::Refused, None, Some(&e)).await;
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e, "agent_id": agent_id})),
+                    )
+                        .into_response();
+                }
+            },
             // The answer is read off the queue, so a deployment with no queue
-            // cannot serve this one request even when the agent is in this
-            // process: the reply has nowhere to land.
-            let Some(backend) = state.message_backend.clone() else {
+            // cannot serve a waiting request even when the agent is in this
+            // process. A request that asked for no answer still goes out: the
+            // in-process path can deliver it, only the answer has nowhere to
+            // land, and that is the shape this deployment already had.
+            None if wait.is_some() => {
                 record_send(
                     &state,
                     &sent,
@@ -644,20 +672,11 @@ pub async fn send_message_handler(
                     })),
                 )
                     .into_response();
-            };
-            match Ask::open(backend, &mut msg, window).await {
-                Ok(ask) => Some(ask),
-                Err(e) => {
-                    record_send(&state, &sent, SendOutcome::Refused, None, Some(&e)).await;
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e, "agent_id": agent_id})),
-                    )
-                        .into_response();
-                }
             }
+            None => None,
         }
-        None => None,
+    } else {
+        None
     };
 
     // A dropped `ask` on any of the returns below ends its stream, so a
@@ -687,9 +706,39 @@ pub async fn send_message_handler(
             )
                 .into_response()
         }
-        Some(ask) => {
-            let answer = answer_with_reply(agent_id.clone(), delivered, ask).await;
-            record_send(
+        // A request that asked for no answer is answered now and its answer is
+        // collected after it: that is what "queued" means, and the record is
+        // the row a late answer settles.
+        Some(ask) if ask.window().is_none() => {
+            let row = record_send(&state, &sent, SendOutcome::Queued, None, None).await;
+            spawn_late_collector(state.clone(), ask, row, agent_id.clone(), delivered);
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "queued": true,
+                    "agent_id": agent_id,
+                    "via": delivered.label(),
+                })),
+            )
+                .into_response()
+        }
+        Some(mut ask) => {
+            let window = ask.window().unwrap_or_default();
+            let started = std::time::Instant::now();
+            let outcome = ask.next_answer(window).await;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            // One line per ask, beside the queue: the queue keeps no record of
+            // who asked, so this is the only place the two ends meet.
+            tracing::info!(
+                to = %agent_id,
+                via = delivered.label(),
+                outcome = outcome.label(),
+                elapsed_ms,
+                "asked an agent and waited for its answer"
+            );
+            let waited_out = matches!(outcome, AskOutcome::TimedOut { .. });
+            let answer = answer_for(agent_id.clone(), delivered, outcome);
+            let row = record_send(
                 &state,
                 &sent,
                 answer.outcome,
@@ -697,6 +746,14 @@ pub async fn send_message_handler(
                 answer.detail.as_deref(),
             )
             .await;
+            if waited_out {
+                // The request is over; the agent is not. The stream stays open
+                // under a collector so a later answer lands on this same row
+                // instead of being dropped because the caller stopped waiting.
+                spawn_late_collector(state.clone(), ask, row, agent_id.clone(), delivered);
+            } else {
+                ask.close().await;
+            }
             answer.response
         }
     }
@@ -811,6 +868,22 @@ impl From<&cog_core::AgentMessage> for MessageView {
 // cap: bound — 一次等待的上限；等到这个数仍没结果就按这个界报出去，不沉默
 pub const MAX_WAIT_SECS: u64 = 120;
 
+/// 请求自己的预算里，留给「等完之后还要做的事」的那一截。
+///
+/// 等待结束之后这条请求还要写一行会话、把这句回答序列化回去；这些都在同一个
+/// 预算之下。等满 `budget - margin` 就把剩下的时间交给它们，否则回话写不进
+/// 去，调用方看到的会是一条空体 408——话送到了、记录没写、也没说为什么。
+// cap: bound — 预算里留给收尾的那一截
+pub const ASK_BUDGET_MARGIN_SECS: u64 = 5;
+
+/// 请求已经答完之后，那句迟到的回答还值得等多久。
+///
+/// 会话不是一次请求的附属品：员工跑一个回合要几十秒到几分钟，属主关掉页面
+/// 也不该让这句话消失。这个界只是让每条开着的回话流有一个尽头，不是让等不到
+/// 的回答变成失败——到点仍然沉默的行保持「没等到」不变。
+// cap: bound — 迟到的回答最多再收这么久；到点这条流就结束
+pub const LATE_ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// The consumer group the route reads its answers with.
 ///
 /// One name for every ask because each ask owns its own stream: the group is
@@ -844,6 +917,7 @@ const CONVERSATION_DEFAULT_LIMIT: usize = 100;
 fn ask_window(
     msg: &cog_core::InboxMessage,
     wait_secs: Option<u64>,
+    budget_secs: u64,
 ) -> Result<Option<std::time::Duration>, String> {
     let Some(secs) = wait_secs else {
         return Ok(None);
@@ -864,6 +938,19 @@ fn ask_window(
             "wait_secs above {MAX_WAIT_SECS} is refused rather than clamped: a caller \
              that asked for {secs}s and was given less would read the timeout as the \
              agent's silence"
+        ));
+    }
+    // 这条路由活在整个部署的每请求预算之下。等得比预算还久，切掉它的是那个预算，
+    // 而且切得最难读：话已经送到，记录还没写，回给调用方的是一条空体 408。所以
+    // 超预算的等待在这里就被拒掉，拒绝里点名这个部署能等多久——不是悄悄折短。
+    let holdable = budget_secs.saturating_sub(ASK_BUDGET_MARGIN_SECS);
+    if secs > holdable {
+        return Err(format!(
+            "wait_secs above {holdable} is refused on this deployment: a request is \
+             answered within {budget_secs}s (gateway.request_timeout_secs), and a wait \
+             that outlives it is cut off before the conversation line is written. Ask \
+             for no wait at all to get 202 now -- the answer is written to the \
+             conversation when it arrives, whichever way this request ends"
         ));
     }
     Ok(Some(std::time::Duration::from_secs(secs)))
@@ -912,16 +999,18 @@ struct Sent<'a> {
 /// A store that fails does not change the answer the caller is about to get:
 /// the command was delivered or refused already, and a lost transcript line is
 /// not a reason to report the delivery as failed.
+///
+/// The row comes back because the outcome can still move after this call: an
+/// agent that answers later answers this same send, and settling that row is
+/// how the answer reaches the transcript instead of being dropped.
 async fn record_send(
     state: &GatewayState,
     sent: &Sent<'_>,
     outcome: SendOutcome,
     reply: Option<&str>,
     detail: Option<&str>,
-) {
-    let Some(store) = state.agent_messages.as_ref() else {
-        return;
-    };
+) -> Option<i64> {
+    let store = state.agent_messages.as_ref()?;
     let message = NewAgentMessage {
         from_unit: sent.from,
         to_unit: sent.to,
@@ -931,13 +1020,93 @@ async fn record_send(
         reply,
         outcome_detail: detail,
     };
-    if let Err(e) = store.record(&message).await {
-        tracing::warn!(
-            to = %sent.to,
-            outcome = outcome.as_str(),
-            error = %e,
-            "could not record a message sent to an agent"
+    match store.record(&message).await {
+        Ok(row) => Some(row),
+        Err(e) => {
+            tracing::warn!(
+                to = %sent.to,
+                outcome = outcome.as_str(),
+                error = %e,
+                "could not record a message sent to an agent"
+            );
+            None
+        }
+    }
+}
+
+/// Keep reading one ask's reply stream after the request that asked has been
+/// answered, and settle the conversation line with whatever arrives.
+///
+/// This is what makes the conversation independent of the request that carried
+/// the question: an agent's turn outlives the caller's patience, the caller's
+/// connection, and the deployment's per-request budget. Without this, "did it
+/// answer" has exactly one moment it can be true.
+///
+/// The frame at the end is how a reader learns about it: the workbench holds no
+/// timer for this and cannot poll a stream it does not own, so the write itself
+/// says the roster's conversations changed.
+fn spawn_late_collector(
+    state: Arc<GatewayState>,
+    ask: Ask,
+    row: Option<i64>,
+    agent_id: String,
+    delivered: Delivered,
+) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let outcome = ask.await_late().await;
+        tracing::info!(
+            to = %agent_id,
+            via = delivered.label(),
+            outcome = outcome.label(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "an answer to an already-answered request finished arriving"
         );
+        let AskOutcome::Replied(reply) = outcome else {
+            return;
+        };
+        // A string answer is what the agent said; any other shape is kept as
+        // its JSON text so the transcript never drops an answer it does not
+        // recognise.
+        let text = match &reply {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        settle_late_answer(&state, row, &agent_id, &text).await;
+    });
+}
+
+/// Put a late answer on the row its send wrote, and say the conversation moved.
+async fn settle_late_answer(state: &GatewayState, row: Option<i64>, agent_id: &str, text: &str) {
+    let (Some(store), Some(id)) = (state.agent_messages.as_ref(), row) else {
+        return;
+    };
+    match store.answer(id, text).await {
+        Ok(true) => {
+            if state
+                .event_tx
+                .send(cog_core::AgentEvent::ResourceChanged {
+                    domain: "agents".to_string(),
+                    timestamp: chrono::Utc::now(),
+                })
+                .is_err()
+            {
+                // 没有接收者不是错误：这一帧的读者是打开着的那一面，一个都没有
+                // 的时候它本来就无处可去。写下去的那一行仍然在库里。
+            }
+        }
+        Ok(false) => tracing::warn!(
+            row = id,
+            to = %agent_id,
+            "a late answer found no unanswered row to settle: the conversation had \
+             already moved on or trimmed it"
+        ),
+        Err(e) => tracing::warn!(
+            row = id,
+            to = %agent_id,
+            error = %e,
+            "could not write a late answer into the transcript"
+        ),
     }
 }
 
@@ -1058,20 +1227,8 @@ struct Answer {
     detail: Option<String>,
 }
 
-/// Wait for the answer to a delivered prompt and turn it into the response.
-async fn answer_with_reply(agent_id: String, delivered: Delivered, ask: Ask) -> Answer {
-    let started = std::time::Instant::now();
-    let outcome = ask.await_reply().await;
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    // One line per ask, beside the queue: the queue keeps no record of who
-    // asked, so this is the only place the two ends meet.
-    tracing::info!(
-        to = %agent_id,
-        via = delivered.label(),
-        outcome = outcome.label(),
-        elapsed_ms,
-        "asked an agent and waited for its answer"
-    );
+/// Turn one ask's outcome into the response to return and the row to write.
+fn answer_for(agent_id: String, delivered: Delivered, outcome: AskOutcome) -> Answer {
     match outcome {
         AskOutcome::Replied(reply) => {
             // The answer arrives as parsed JSON; a string answer is what the
@@ -1106,13 +1263,18 @@ async fn answer_with_reply(agent_id: String, delivered: Delivered, ask: Ask) -> 
                     "via": delivered.label(),
                     "waited_secs": waited_secs,
                     "error": "the agent did not answer within the wait this request \
-                              asked for; the run itself was not cancelled",
+                              asked for; the run itself was not cancelled, and an \
+                              answer that arrives later is written to this \
+                              conversation",
                 })),
             )
                 .into_response(),
             outcome: SendOutcome::TimedOut,
             reply: None,
-            detail: Some(format!("no answer arrived within {waited_secs}s")),
+            detail: Some(format!(
+                "no answer arrived within {waited_secs}s; an answer that arrives later \
+                 is written to this conversation"
+            )),
         },
         AskOutcome::Unreadable { error } => Answer {
             response: (
@@ -1160,7 +1322,10 @@ struct Ask {
     backend: Arc<dyn cog_core::MessageBackend>,
     stream: String,
     reader: cog_core::MessageStream,
-    window: std::time::Duration,
+    /// How long this request will hold the connection for. `None` means the
+    /// caller asked for no answer: the stream is still opened, and the answer
+    /// is collected after the request has been answered.
+    window: Option<std::time::Duration>,
     armed: bool,
 }
 
@@ -1174,7 +1339,7 @@ impl Ask {
     async fn open(
         backend: Arc<dyn cog_core::MessageBackend>,
         msg: &mut cog_core::InboxMessage,
-        window: std::time::Duration,
+        window: Option<std::time::Duration>,
     ) -> Result<Self, String> {
         let stream = ask_stream();
         if let cog_core::InboxMessage::Prompt { reply_stream, .. } = msg {
@@ -1224,10 +1389,19 @@ impl Ask {
         self.armed = false;
     }
 
-    async fn await_reply(mut self) -> AskOutcome {
-        let window = self.window;
+    /// The window this request holds the connection for, if it holds one.
+    fn window(&self) -> Option<std::time::Duration> {
+        self.window
+    }
+
+    /// Read at most one answer, waiting at most `window`.
+    ///
+    /// The stream is left open: a timeout is the caller's cue to hand the ask
+    /// to the collector rather than a reason to end the stream, and the answer
+    /// may still be on its way.
+    async fn next_answer(&mut self, window: std::time::Duration) -> AskOutcome {
         let waited = tokio::time::timeout(window, futures::StreamExt::next(&mut self.reader)).await;
-        let outcome = match waited {
+        match waited {
             Ok(Some(Ok((id, bytes)))) => {
                 if let Err(e) = self
                     .backend
@@ -1251,7 +1425,13 @@ impl Ask {
             Err(_) => AskOutcome::TimedOut {
                 waited_secs: window.as_secs(),
             },
-        };
+        }
+    }
+
+    /// Keep reading for an answer after the request that asked has been
+    /// answered, then end the stream whichever way this ends.
+    async fn await_late(mut self) -> AskOutcome {
+        let outcome = self.next_answer(LATE_ANSWER_WINDOW).await;
         self.close().await;
         outcome
     }

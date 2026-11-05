@@ -37,7 +37,19 @@ impl PostgresAgentMessageStore {
 const INSERT_SQL: &str = "\
 INSERT INTO agent_messages \
     (from_unit, to_unit, kind, body, outcome, reply, outcome_detail) \
-VALUES ($1, $2, $3, $4, $5, $6, $7)";
+VALUES ($1, $2, $3, $4, $5, $6, $7) \
+RETURNING id";
+
+/// Settle a row whose answer arrived after its row was written.
+///
+/// The `outcome IN (...)` is the whole guard: a row that already reads
+/// `replied` is not a row this answer belongs to, and a `refused` or `failed`
+/// row was settled by a fact this answer does not change. Only an unanswered
+/// row is still waiting for one.
+const ANSWER_SQL: &str = "\
+UPDATE agent_messages \
+SET outcome = 'replied', reply = $2, outcome_detail = NULL \
+WHERE id = $1 AND outcome IN ('queued', 'timed_out')";
 
 /// Drop what fell out of this peer's window. Bounded per receiver rather than
 /// globally: one chatty sender must not push another conversation out.
@@ -64,7 +76,7 @@ ORDER BY id";
 
 #[async_trait]
 impl AgentMessageStore for PostgresAgentMessageStore {
-    async fn record(&self, message: &NewAgentMessage<'_>) -> SFResult<()> {
+    async fn record(&self, message: &NewAgentMessage<'_>) -> SFResult<i64> {
         let from_unit = message.from_unit.trim();
         let to_unit = message.to_unit.trim();
         if from_unit.is_empty() || to_unit.is_empty() {
@@ -102,7 +114,7 @@ impl AgentMessageStore for PostgresAgentMessageStore {
         let mut tx = self.pool.begin().await.map_err(|e| {
             SFError::Database(format!("start the agent message's transaction: {e}"))
         })?;
-        sqlx::query(INSERT_SQL)
+        let id: i64 = sqlx::query(INSERT_SQL)
             .bind(from_unit)
             .bind(to_unit)
             .bind(message.kind)
@@ -110,9 +122,11 @@ impl AgentMessageStore for PostgresAgentMessageStore {
             .bind(message.outcome.as_str())
             .bind(message.reply)
             .bind(message.outcome_detail)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
-            .map_err(|e| SFError::Database(format!("record an agent message: {e}")))?;
+            .map_err(|e| SFError::Database(format!("record an agent message: {e}")))?
+            .try_get("id")
+            .map_err(|e| SFError::Database(format!("read back a recorded agent message: {e}")))?;
         // Same transaction as the insert: a trim on its own could delete a row
         // another writer had just appended, and a crash between the two would
         // leave the bound unenforced.
@@ -125,7 +139,20 @@ impl AgentMessageStore for PostgresAgentMessageStore {
         tx.commit()
             .await
             .map_err(|e| SFError::Database(format!("commit the agent message: {e}")))?;
-        Ok(())
+        Ok(id)
+    }
+
+    async fn answer(&self, id: i64, reply: &str) -> SFResult<bool> {
+        let updated = sqlx::query(ANSWER_SQL)
+            .bind(id)
+            .bind(reply)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                SFError::Database(format!("settle an agent message with its answer: {e}"))
+            })?
+            .rows_affected();
+        Ok(updated > 0)
     }
 
     async fn conversation(&self, peer: &str, limit: usize) -> SFResult<Vec<AgentMessage>> {

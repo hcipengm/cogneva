@@ -121,6 +121,23 @@ const SERVER_WORDS: &[ServerWord] = &[
         server_file: "crates/cog-core/src/types/task.rs",
         server_needle: "TaskStatus::Failed => \"failed\"",
     },
+    // 场地那一栏报的是「最近一条到过终态的任务走到了哪」，它的 `outcome` 写的就是
+    // 任务状态自己的那个词。同一个词在两个字段上出现，是因为它是同一个拼写：
+    // 客户端按 outcome 分支所认的，仍然是同一个闭集。
+    ServerWord {
+        field: "outcome",
+        word: "completed",
+        client_file: "web/src/views/VenuesView.tsx",
+        server_file: "crates/cog-gateway/src/venues.rs",
+        server_needle: "outcome: task.status.as_str().to_string(),",
+    },
+    ServerWord {
+        field: "outcome",
+        word: "failed",
+        client_file: "web/src/views/VenuesView.tsx",
+        server_file: "crates/cog-gateway/src/venues.rs",
+        server_needle: "outcome: task.status.as_str().to_string(),",
+    },
     ServerWord {
         field: "status",
         word: "hook_event",
