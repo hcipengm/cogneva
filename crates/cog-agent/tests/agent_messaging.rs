@@ -262,6 +262,33 @@ async fn an_id_the_directory_lists_is_an_id_the_send_tool_delivers_to() {
     );
 }
 
+/// Every row the directory shows carries the name the workbench shows.
+///
+/// The name is a pure function of the id, and the same function answers the
+/// board, so an agent reading the directory names a colleague exactly as a
+/// person reading the roster does. Without the column an agent asked who it is
+/// can only answer with its routing id — which is a key, not a name.
+#[tokio::test]
+async fn every_row_in_the_directory_carries_the_name_the_board_shows() {
+    let roster = Arc::new(Roster::with_roles(&[
+        ("squad:task-1-reviewer", "reviewer", &[]),
+        ("employee:0e2ba053", "employee", &[]),
+    ]));
+    let listed = call_list(roster, serde_json::json!({}))
+        .await
+        .expect("listed");
+
+    for row in listed["agents"].as_array().expect("agents is a list") {
+        let id = row["agent_id"].as_str().expect("agent_id");
+        let expected = cog_core::display_name_for(id);
+        assert_eq!(
+            row["display_name"].as_str(),
+            Some(expected.as_str()),
+            "the directory and the roster must answer with one name per id: {row}"
+        );
+    }
+}
+
 /// Narrowing the search is a filter over the same list, not a second source.
 #[tokio::test]
 async fn the_directory_can_be_narrowed_by_role_and_capability() {

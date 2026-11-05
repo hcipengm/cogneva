@@ -2080,9 +2080,12 @@ pub mod builtins {
             description: "List the live agents this platform has registered, optionally \
                           filtered by role or capability. Use it to find the exact \
                           agent_id to pass to send_to_agent. Only live agents appear: a \
-                          registration that has expired is not listed. When the run \
-                          established an identity, your own entry carries `is_me: true` \
-                          and the result repeats your id as `caller`."
+                          registration that has expired is not listed. Every entry \
+                          carries the agent's `display_name` -- the name the workbench \
+                          shows, derived from the id -- so a colleague is addressed by \
+                          the same name a person sees. When the run established an \
+                          identity, your own entry carries `is_me: true` and the result \
+                          repeats your id as `caller`."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -2117,8 +2120,16 @@ pub mod builtins {
                         })
                         .map(|r| {
                             let is_me = me.as_deref() == Some(r.agent_id.as_str());
+                            // The name is derived from the id by the same pure
+                            // function the workbench's roster uses, so the
+                            // directory and the board read the same person as
+                            // the same name. Without it an agent reading the
+                            // directory can only report its id, and "who am I"
+                            // answers with a routing key rather than a name.
+                            let display_name = cog_core::display_name_for(&r.agent_id);
                             serde_json::json!({
                                 "agent_id": r.agent_id,
+                                "display_name": display_name,
                                 "role": r.role,
                                 "workspace_id": r.workspace_id,
                                 "capabilities": r.capabilities,
