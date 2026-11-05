@@ -2252,6 +2252,89 @@ mod tests {
         assert!(!is_registered_metric("cogneva_no_such_series"));
     }
 
+    /// A name carries one quantity, and says it once.
+    ///
+    /// The unit at the end of a series name is what a reader takes the number to
+    /// be measured in, and the quantifier before it is what the number counts. A
+    /// name holding two units (`..._bytes_seconds`) or two quantifiers
+    /// (`..._total_total`, `..._count_total`) leaves the reader unable to say
+    /// which of the two the value is, so a panel or a rule built on it answers a
+    /// question nobody asked -- and answers it silently, because both halves name
+    /// series this build really does publish. One series, one quantity.
+    ///
+    /// The unit vocabulary is the one the registry's own names spell (`_bytes`,
+    /// `_seconds`, `_secs`, `_ms`, `_unix`) plus the sizes and spans a series
+    /// could be measured in next (`millis`, `micros`, `nanos`, `minutes`,
+    /// `hours`, `days`, `us`, `ns`), so a name added tomorrow is read the way the
+    /// names here are. A word counts only as a whole `_`-separated segment:
+    /// `_seconds_to_expiry` holds one unit, and a substring match would find it
+    /// twice in a name that says one thing. A bare `s` is deliberately not a unit
+    /// -- as a segment it is a letter, not a measurement.
+    ///
+    /// Nothing is exempt and nothing is listed beside the check: it reads [`ALL`],
+    /// the closed set, so a name outside the rule cannot exist. It is green on the
+    /// registry as it stands, which is what makes it a gate for the name added
+    /// next rather than a finding about today's.
+    ///
+    /// principle: feedback_one_series_name_one_quantity
+    #[test]
+    fn one_series_name_carries_one_quantity() {
+        // The reading itself, shown on a name that carries both faults: a
+        // splitter that stopped finding the separators would leave every count
+        // below at zero, and every name in the registry would pass by having been
+        // read as nothing.
+        let (units, quantifiers) =
+            units_and_quantifiers_in("cogneva_probe_bytes_seconds_total_total");
+        assert_eq!(units, ["bytes", "seconds"]);
+        assert_eq!(quantifiers, ["total", "total"]);
+
+        for name in ALL {
+            let (units, quantifiers) = units_and_quantifiers_in(name.as_str());
+            assert!(
+                units.len() <= 1,
+                "{name} names the units {} -- one series name carries one quantity, and a \
+                 reader cannot say which of them the number is measured in; split it so each \
+                 name measures one thing",
+                units.join(" and ")
+            );
+            assert!(
+                quantifiers.len() <= 1,
+                "{name} carries the quantifiers {} -- the second turns the name into the total \
+                 of the totals, and which of the two the value counts is unreadable; one name \
+                 carries one quantity",
+                quantifiers.join(" and ")
+            );
+        }
+    }
+
+    /// The units and the quantifiers a series name carries, each read as a whole
+    /// `_`-separated segment after the registry's own prefix.
+    ///
+    /// Taken out of the test so the reading can be shown on a name that breaks
+    /// the rule: a check that walks a closed set and counts nothing passes every
+    /// name it is given, and telling that apart from a clean tree is the whole
+    /// difference between a gate and a comment.
+    fn units_and_quantifiers_in(name: &str) -> (Vec<&str>, Vec<&str>) {
+        const UNIT_WORDS: &[&str] = &[
+            "bytes", "seconds", "secs", "millis", "micros", "nanos", "minutes", "hours", "days",
+            "ms", "us", "ns", "unix",
+        ];
+        const QUANTIFIER_WORDS: &[&str] = &["total", "count", "sum"];
+
+        let bare = name.strip_prefix("cogneva_").unwrap_or(name);
+        let mut units = Vec::new();
+        let mut quantifiers = Vec::new();
+        for segment in bare.split('_') {
+            if UNIT_WORDS.contains(&segment) {
+                units.push(segment);
+            }
+            if QUANTIFIER_WORDS.contains(&segment) {
+                quantifiers.push(segment);
+            }
+        }
+        (units, quantifiers)
+    }
+
     #[test]
     fn no_name_is_both_published_and_retired() {
         for name in ALL {
