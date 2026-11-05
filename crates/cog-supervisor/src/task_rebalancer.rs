@@ -138,11 +138,21 @@ impl TaskRebalancer {
         plan.available_agents = available.len();
 
         // 2. Snapshot ready tasks from the orchestrator.
+        //
+        // `Scheduled` is not ready for this pass even though the reader lists it
+        // beside `Pending`: the word means the task has already been offered to
+        // the shared ready queue, and binding it to an agent now would be a
+        // promise that queue cannot keep -- the assignment is refused by the
+        // graph, every pass, for every such row. Measured 2026-11-05 on this
+        // deployment: 2,997 rows sat in `Scheduled` and each pass tried to bind
+        // its share of them, so the rebalance log was nothing but refusals and
+        // each one cost a read of a row that could not change.
         let ready: Vec<String> = self
             .orchestrator
             .get_ready_tasks()
             .await
             .into_iter()
+            .filter(|t| t.status != TaskStatus::Scheduled)
             .map(|t| t.id.clone())
             .collect();
         plan.ready_tasks = ready.len();

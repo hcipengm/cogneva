@@ -198,3 +198,50 @@ async fn recovery_plan_includes_relevant_checkpoints() {
     assert!(ids.contains(&"t-1"));
     assert!(ids.contains(&"t-2"));
 }
+
+/// 已经交给共享就绪队列的任务不是再平衡的活。
+///
+/// `Scheduled` 在就绪读取里和 `Pending` 并排列出，但它说的是「已经交给队列」——
+/// 这时再给它绑一个 agent，图在每一趟都会拒绝（`Cannot assign task in Scheduled
+/// state`）。不过滤的代价在部署上量过：2,997 行停在 `Scheduled`，每一趟都试着
+/// 绑自己那一份，日志里全是拒绝，每一条还各自付了一次读行。
+#[tokio::test]
+async fn a_task_already_offered_to_the_queue_is_not_rebalanced_again() {
+    let reg = Arc::new(AgentRegistry::new());
+    reg.register_agent(make_agent("agent-1"));
+
+    let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
+    backend
+        .set_agent_state("agent-1", &AgentState::Idle)
+        .await
+        .unwrap();
+
+    let orch = control("ws");
+    let mut tasks = Vec::new();
+    for i in 0..3 {
+        tasks.push(Task::new(
+            format!("t-{i}"),
+            TaskType::Planner,
+            serde_json::json!({}),
+        ));
+    }
+    orch.submit_goal("g", tasks).await.unwrap();
+    // t-1 已经进入共享就绪队列。
+    orch.schedule_task("t-1").await.unwrap();
+
+    let rebalancer = TaskRebalancer::new(reg, backend, orch, TaskRebalancerConfig::default());
+    let plan = rebalancer.plan().await.unwrap();
+
+    assert_eq!(plan.ready_tasks, 2, "Scheduled 不是可绑定的活");
+    let assigned: Vec<&str> = plan
+        .assignments
+        .iter()
+        .map(|(_, task_id)| task_id.as_str())
+        .collect();
+    assert!(
+        !assigned.contains(&"t-1"),
+        "已经交给队列的任务不该再被绑：{assigned:?}"
+    );
+    assert!(assigned.contains(&"t-0"), "{assigned:?}");
+    assert!(assigned.contains(&"t-2"), "{assigned:?}");
+}
