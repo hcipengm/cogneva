@@ -681,6 +681,7 @@ struct TaskGraphSnapshot {
 /// window removes is exactly the duplicate reads arriving inside it. The
 /// staleness rule reads the stamp of the last successful read against a 900 s
 /// bound, so it does not see this at all.
+// cap: derived — half the interval the monitoring stack scrapes at, so no collector on that interval is ever handed a read older than one it would have taken itself.
 pub const TASK_GRAPH_MEASURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The live shape of the task graph.
