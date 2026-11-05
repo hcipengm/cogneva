@@ -69,6 +69,8 @@ mod a_pg_integration_test_owns_its_schema_test;
 mod a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test;
 #[path = "a_process_installs_one_global_subscriber_or_none_test.rs"]
 mod a_process_installs_one_global_subscriber_or_none_test;
+#[path = "a_ready_message_starts_the_row_it_names.rs"]
+mod a_ready_message_starts_the_row_it_names;
 #[path = "a_relation_reading_is_one_query_test.rs"]
 mod a_relation_reading_is_one_query_test;
 #[path = "a_retention_knob_says_what_zero_means_test.rs"]

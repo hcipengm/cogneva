@@ -15,18 +15,15 @@
 //! So admission is decided once more where it is used: a `Pending` row is
 //! scheduled again and then started. Terminal rows still refuse — that is what
 //! keeps a second copy of a finished task from running.
+//!
+//! The control comes from `common::orchestrator` rather than being built here:
+//! a fixture that constructs its own describes a different object the moment
+//! the shared one gains a piece, and both stay green while they disagree.
 
-use std::sync::Arc;
+use crate::common;
 
-use cog_core::{OrchestratorControl, Task, TaskStatus, TaskType};
-use cog_orchestrator::{DagExecutor, OrchestratorControlImpl};
-
-fn control(workspace: &str) -> OrchestratorControlImpl {
-    let dag = Arc::new(DagExecutor::new(workspace.into()));
-    // 这台机器上的 env 可能给别的用例配过列上限；这条判据只问准入，不问上限。
-    dag.set_board_wip_limits(cog_core::BoardWipLimits::default());
-    OrchestratorControlImpl::new(dag)
-}
+use cog_core::{Task, TaskStatus, TaskType};
+use common::orchestrator::control;
 
 #[tokio::test]
 async fn admitting_a_row_the_sweep_handed_back_to_pending() {
