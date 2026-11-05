@@ -10,11 +10,14 @@
 //! messages: a handler that fails leaves its message pending rather than acked,
 //! and a transport that brokers a persistent queue hands it back. Both halves of
 //! that sentence are the loop's own work: it reclaims what a previous
-//! incarnation was handed and never acked when it starts, and it keeps running
-//! across a handler error rather than treating one failed command as the end of
-//! the inbox.
+//! incarnation was handed and never acked -- when it starts, and again on a
+//! backstop cadence for the one that was still too young to reclaim at start --
+//! and it keeps running across a handler error rather than treating one failed
+//! command as the end of the inbox.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cog_core::SFResult;
 use futures::StreamExt;
@@ -34,6 +37,17 @@ const INBOX_RECLAIM_MIN_IDLE_MS: u64 = 60_000;
 /// How many pending messages one reclaim call asks for.
 // cap: bound — 一次回收调用要多少条待处理消息
 const INBOX_RECLAIM_BATCH: usize = 64;
+
+/// How often a running consumer looks back at its own pending list.
+///
+/// A reclaim pass performed only at start misses precisely the message it
+/// exists for: one written seconds before the previous incarnation died. At the
+/// moment the new incarnation starts that message is younger than
+/// [`INBOX_RECLAIM_MIN_IDLE_MS`], so the one pass skips it -- and nothing ever
+/// asks again, because a pending entry is not lag and no reading shows it. A
+/// backstop pass turns "never" into "one interval later".
+// cap: bound — 与回收空闲阈值同量级；更小是白问一遍，更大只让那条消息多等一会儿
+const INBOX_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Generic agent consumer backed by any [`cog_core::MessageBackend`] implementation.
 /// This type was originally in `cog-core` but has been moved to `cog-agent`
@@ -68,7 +82,25 @@ impl AgentConsumer {
 
     /// Run the consumer loop: create consumer group, subscribe to the inbox
     /// stream, and yield each [`cog_core::InboxMessage`] to the provided handler.
-    pub async fn run<F, Fut>(self, mut handler: F) -> SFResult<()>
+    pub async fn run<F, Fut>(self, handler: F) -> SFResult<()>
+    where
+        F: FnMut(cog_core::InboxMessage) -> Fut,
+        Fut: std::future::Future<Output = SFResult<()>>,
+    {
+        self.run_with_reclaim_interval(handler, INBOX_RECLAIM_INTERVAL)
+            .await
+    }
+
+    /// [`Self::run`] with the backstop cadence passed in.
+    ///
+    /// The cadence decides how long a message that became reclaimable after
+    /// start waits; it is a parameter so a test can watch the backstop pass
+    /// happen without waiting a minute for it.
+    pub async fn run_with_reclaim_interval<F, Fut>(
+        self,
+        mut handler: F,
+        reclaim_interval: Duration,
+    ) -> SFResult<()>
     where
         F: FnMut(cog_core::InboxMessage) -> Fut,
         Fut: std::future::Future<Output = SFResult<()>>,
@@ -79,6 +111,15 @@ impl AgentConsumer {
             .create_consumer_group(&self.inbox_stream, &group_name)
             .await?;
 
+        // Commands this incarnation has already handed to the handler. A
+        // message that ran and failed stays pending on purpose, and the
+        // backstop pass would otherwise hand it over again every interval for
+        // as long as the process lives -- retrying a command whose side effects
+        // already happened, at full token cost, more often than a restart would.
+        // It is retried when this consumer next starts, which is the same
+        // guarantee as before.
+        let mut handled: HashSet<String> = HashSet::new();
+
         // Take back what a previous incarnation of this consumer was handed and
         // never acked, before reading anything new. The read below asks only
         // for messages never delivered (`>`), so without this a command that
@@ -86,32 +127,9 @@ impl AgentConsumer {
         // long as the group exists: accepted by the producer, executed by
         // nobody, and absent from every lag reading, because a pending entry is
         // not lag.
-        let mut reclaimed = 0usize;
-        loop {
-            let Some(batch) = self
-                .backend
-                .claim_pending(
-                    &self.inbox_stream,
-                    &group_name,
-                    INBOX_RECLAIM_MIN_IDLE_MS,
-                    INBOX_RECLAIM_BATCH,
-                )
-                .await?
-            else {
-                // Backend has no reclaim path; its delivery guarantees are its
-                // own to state.
-                break;
-            };
-            let full = batch.len() == INBOX_RECLAIM_BATCH;
-            for (msg_id, bytes) in batch {
-                self.deliver(&msg_id, &bytes, &group_name, &mut handler)
-                    .await;
-                reclaimed += 1;
-            }
-            if !full {
-                break;
-            }
-        }
+        let reclaimed = self
+            .reclaim_pending(&group_name, &mut handler, &mut handled)
+            .await?;
         if reclaimed > 0 {
             tracing::warn!(
                 agent_id = %self.agent_id,
@@ -125,13 +143,101 @@ impl AgentConsumer {
             .subscribe(&self.inbox_stream, &group_name)
             .await?;
 
-        while let Some(result) = stream.next().await {
-            let (msg_id, bytes) = result?;
-            self.deliver(&msg_id, &bytes, &group_name, &mut handler)
-                .await;
+        // The first tick is a full period out: the starting pass above already
+        // asked once, and asking again immediately would only repeat it.
+        let mut backstop = tokio::time::interval_at(
+            tokio::time::Instant::now() + reclaim_interval,
+            reclaim_interval,
+        );
+        loop {
+            tokio::select! {
+                next = stream.next() => {
+                    let Some(result) = next else {
+                        break;
+                    };
+                    let (msg_id, bytes) = result?;
+                    self.deliver(&msg_id, &bytes, &group_name, &mut handler)
+                        .await;
+                    handled.insert(msg_id);
+                }
+                _ = backstop.tick() => {
+                    match self
+                        .reclaim_pending(&group_name, &mut handler, &mut handled)
+                        .await
+                    {
+                        Ok(0) => {}
+                        Ok(messages) => {
+                            tracing::warn!(
+                                agent_id = %self.agent_id,
+                                messages,
+                                "Took back inbox messages that became reclaimable after start"
+                            );
+                        }
+                        Err(e) => {
+                            // A failed backstop pass is not the end of the
+                            // loop: the next tick asks again, and the messages
+                            // it would have found are still pending.
+                            tracing::warn!(
+                                agent_id = %self.agent_id,
+                                error = %e,
+                                "Backstop reclaim failed; trying again next interval"
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// Hand every reclaimable pending message to the handler, skipping the ones
+    /// this incarnation has already handed over.
+    ///
+    /// Returns how many messages the handler ran. A backend without a reclaim
+    /// path yields zero: its delivery guarantees are its own to state.
+    async fn reclaim_pending<F, Fut>(
+        &self,
+        group_name: &str,
+        handler: &mut F,
+        handled: &mut HashSet<String>,
+    ) -> SFResult<usize>
+    where
+        F: FnMut(cog_core::InboxMessage) -> Fut,
+        Fut: std::future::Future<Output = SFResult<()>>,
+    {
+        let mut reclaimed = 0usize;
+        loop {
+            let Some(batch) = self
+                .backend
+                .claim_pending(
+                    &self.inbox_stream,
+                    group_name,
+                    INBOX_RECLAIM_MIN_IDLE_MS,
+                    INBOX_RECLAIM_BATCH,
+                )
+                .await?
+            else {
+                break;
+            };
+            let full = batch.len() == INBOX_RECLAIM_BATCH;
+            let mut fresh = 0usize;
+            for (msg_id, bytes) in batch {
+                if !handled.insert(msg_id.clone()) {
+                    continue;
+                }
+                fresh += 1;
+                self.deliver(&msg_id, &bytes, group_name, handler).await;
+                reclaimed += 1;
+            }
+            // A full batch of commands this incarnation already ran would
+            // otherwise be asked for again forever: the skip above claims
+            // nothing, so the batch never shrinks.
+            if !full || fresh == 0 {
+                break;
+            }
+        }
+        Ok(reclaimed)
     }
 
     /// Hand one message to the handler and ack it, or leave it pending.
@@ -141,7 +247,8 @@ impl AgentConsumer {
     /// registered and kept beating while the group it owned read nothing, so a
     /// dead inbox looked exactly like a quiet one. A failed command now costs
     /// its own delivery and no more -- it stays pending, is reported, and is
-    /// retried when this consumer next starts.
+    /// retried when this consumer next starts, not by the backstop pass of the
+    /// incarnation that already ran it.
     async fn deliver<F, Fut>(&self, msg_id: &str, bytes: &[u8], group_name: &str, handler: &mut F)
     where
         F: FnMut(cog_core::InboxMessage) -> Fut,
