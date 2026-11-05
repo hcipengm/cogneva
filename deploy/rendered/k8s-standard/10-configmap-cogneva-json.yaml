@@ -3906,8 +3906,8 @@ data:
       },
       "agent_pool": {
         "enabled": true,
-        "_comment_worker_count": "并发上限，操作者自己写下的数，0 = 不声明。实际并发由容器内存读数与单任务实测开销每三十秒算一次，这里写下的数只在比实测更紧时才生效。",
-        "worker_count": 0,
+        "_comment_worker_count": "并发上限，操作者自己写下的数，0 = 不声明。实际并发由容器内存读数与单任务实测开销每三十秒算一次，比它更紧时以它为准；量不到单任务开销时（本平台的活跑在沙箱 Pod 里，这个进程的内存读数不随它变）这个数是唯一的界，不写就永远停在 1。",
+        "worker_count": 3,
         "worker_role": "planner"
       },
       "self_evolution": {

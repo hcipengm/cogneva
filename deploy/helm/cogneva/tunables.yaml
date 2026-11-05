@@ -870,15 +870,18 @@ rows:
       concurrent spenders of the token window, and the only global bound on
       parallelism: the board's column limits are per goal, so a `running=1`
       there holds each goal to one and says nothing about eight goals running
-      eight tasks. It is pinned by the owner's decision to run work serially
-      rather than in parallel, and the reading that would replace it does not
-      exist yet: `cogneva_task_router_claim_slots` publishes the number in
-      force and `_in_flight` publishes how many are held, but nothing turns the
-      pool's allowance into a count of parallel tasks. Measured 2026-11-01
-      before this was a knob: both processes held four (eight tasks running
-      across eight goals) and spent 1,105,275 of the k3 five-hour window's
-      1,670,569 tokens in the first ten minutes of the window, none of the
-      eight changes finishing.
+      eight tasks. Measured 2026-11-01 before this was a knob: both processes
+      held four (eight tasks running across eight goals) and spent 1,105,275 of
+      the k3 five-hour window's 1,670,569 tokens in the first ten minutes of
+      the window, none of the eight changes finishing. Measured again
+      2026-11-05, the premise was gone: zero refusals in `gateway_llm_usage`
+      all day with `refusal_kind` empty, a peak of 73 million input tokens in
+      one hour against 4-15 million in the hours pinned at one, and 31 changes
+      landed against a target of 120 -- two processes running one 14.4-minute
+      task each is 8 tasks an hour, and the recorded readings say the limit was
+      never the token window. The companion bound is `agent_pool.worker_count`
+      in `cogneva.json`: nothing here is claimed until that pool has a turn, so
+      the two numbers have to move together.
 
   # --- probe budgets ----------------------------------------------------------
   - key: healthProbes.liveness.periodSeconds

@@ -191,7 +191,29 @@ pub fn next_slots(
         (Some((used, limit)), Some(per_task)) => used.saturating_add(per_task) < limit,
         _ => false,
     };
-    if matches!(memory, Some((_, limit)) if limit > 0) && !one_more_fits {
+    // What silence from this container means depends on whether anyone wrote a
+    // ceiling down. With none, an unmeasured cost still holds the pool at the
+    // floor: there is no number anywhere to grow into.
+    //
+    // With one, silence is not a refusal. This workload's tasks run in sandbox
+    // pods, so the measurement this rule needs may never arrive at all --
+    // measured on 2026-11-05, the agent pod's `memory.current` moved by 15 MB
+    // over a minute with a change task in flight, and twenty sizing periods
+    // produced no per-task cost. Reading that as "one more does not fit" pinned
+    // every executing process at one slot for its whole life, which is what the
+    // deployment was doing: two processes, two tasks at a time, against a
+    // target of five landings an hour. The declared count is the one number
+    // here that was typed on purpose, and `worker_count`'s own contract says it
+    // is a ceiling the measured value only tightens -- so when the measurement
+    // is absent it is the bound, not a decoration.
+    let unmeasured = cost.per_task_bytes.is_none();
+    if unmeasured {
+        if let Some(bound) = bound {
+            if next < bound {
+                next += 1;
+            }
+        }
+    } else if matches!(memory, Some((_, limit)) if limit > 0) && !one_more_fits {
         next = (next / 2).max(1);
     } else if one_more_fits && bound.is_none_or(|bound| next < bound) {
         next += 1;
@@ -407,6 +429,23 @@ mod tests {
         assert_eq!(plan.slots, 1);
         assert_eq!(plan.movement, SlotMove::Hold);
         assert_eq!(plan.capacity, None);
+    }
+
+    #[test]
+    fn a_declared_cap_is_the_bound_while_the_cost_is_unmeasured() {
+        // The workload runs its tasks in other pods, so this container's own
+        // reading may never say what one costs it (`SlotCost::default()` is
+        // twenty sizing periods of that silence). With a ceiling written down
+        // that silence is not a refusal: the operator's number is the only
+        // bound left, and the pool has to be able to reach it -- otherwise
+        // every process runs one task at a time for the deployment's life.
+        let plan = next_slots(1, Some(3), calm(), SlotCost::default());
+        assert_eq!(plan.slots, 2, "没量到单任务开销时，写下的上限就是界");
+        assert_eq!(plan.movement, SlotMove::Grow);
+        // And it stops at the ceiling rather than walking past it.
+        let at_cap = next_slots(3, Some(3), calm(), SlotCost::default());
+        assert_eq!(at_cap.slots, 3);
+        assert_eq!(at_cap.movement, SlotMove::Hold);
     }
 
     #[test]

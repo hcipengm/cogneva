@@ -63,7 +63,7 @@ data:
   # 配 1 是属主 2026-11-01 的口径「串行一个个来解决」：k3 5 小时窗 1,670,569
   # token，最贵的一道变更量到 1,002,927 输入 token，8 条在途时开窗 10 分钟就
   # 花掉 66%。
-  COGNEVA_TASK_CLAIM_CONCURRENCY: "1"
+  COGNEVA_TASK_CLAIM_CONCURRENCY: "3"
 
   # Gateway
   COGNEVA_HTTP_PORT: "8080"
