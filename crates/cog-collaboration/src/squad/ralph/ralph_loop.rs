@@ -15,6 +15,13 @@ use crate::squad::pge::types::{EvaluationResult, PlannerOutput, RoundOutcome, Ve
 use cog_core::{Task, TaskType};
 use std::sync::Arc;
 
+/// 分解被同一句判词连续拒了两次时的终止原因。
+///
+/// 与「停滞」分开命名，因为它们的知识不同：停滞说的是这一窗都没买到进展，
+/// 这一条说的是**上一轮的判词原样回来了**——生产者这一轮没有被告知任何新的
+/// 东西，所以下一轮不可能写出不同的计划。改名等于改读数的身份，读面按它取行。
+pub const REPLAYED_REFUSAL: &str = "replayed_refusal";
+
 /// 失败分类的稳定半段：角色、分类学、答案的形状。
 ///
 /// 它与被分类的失败无关，所以它必须逐字节相同地待在整个请求的最前面——
@@ -625,6 +632,9 @@ impl RalphLoop {
             let feedback = evaluation.feedback.clone();
             let progress = Some(ProgressSignals::from_evaluation(&evaluation));
 
+            // 这一轮到底交没交东西：空交付物与"交了却没照判词改"是两种失败，
+            // 只有后者的重试是已知的原地打转。
+            let produced_any = !plan.sub_tasks.is_empty();
             let run = crate::squad::plan::PlanRunResult { plan, evaluation };
             let snapshot = match serde_json::to_value(&run) {
                 Ok(snapshot) => snapshot,
@@ -660,6 +670,33 @@ impl RalphLoop {
 
             if self.is_stagnated() {
                 return self.stagnated_verdict();
+            }
+
+            // 交了一份计划，被判词逐条点名之后又交了**同一份**：这一轮什么都没
+            // 买到。分解的重试只有一种价值——上一轮的判词让下一轮有理由写得
+            // 不一样；判词一字未变说明生产者要么没照它改、要么它已经改不动了，
+            // 再问一遍拿回的仍是同一份。窗口停滞判据要等满五轮才停，而这里第五
+            // 轮与第二轮已知同形，中间那几轮是付了钱的重放。
+            //
+            // 空交付物不走这条：那里没有"被告知却没照做"可谈，一次空响应更常见
+            // 的原因是这一趟没答出来，原样重问正是它该得到的处置。
+            if let Some(previous) = self.history.iter().rev().nth(1) {
+                if produced_any && previous.feedback == feedback {
+                    let rounds = self.history.len() as u32;
+                    crate::observable::global_observable()
+                        .record_ralph_termination(REPLAYED_REFUSAL);
+                    return RalphVerdict::Unrecoverable {
+                        reason: format!(
+                            "{REPLAYED_REFUSAL}: rounds {previous_round} and {round} were refused \
+                             for the same thing, so the round after them had nothing new to act \
+                             on: {feedback}",
+                            previous_round = rounds - 1,
+                            round = rounds,
+                        ),
+                        iterations: rounds,
+                        history: self.history.clone(),
+                    };
+                }
             }
         }
 
@@ -1775,6 +1812,48 @@ mod tests {
                 .contains(crate::squad::plan::PLAN_NO_ACCEPTANCE),
             "the first round cannot have been told about a defect that did not exist yet"
         );
+    }
+
+    /// 同一句判词第二次回来就收摊，不等五轮窗口。
+    ///
+    /// 判词一样＝这一轮没有告诉生产者任何新东西，下一轮不可能写出不同的计划。
+    /// 窗口停滞判据要等满五轮才停，而第五轮与第二轮已知同形：中间那几轮是付了
+    /// 钱的逐字重放。这条用例量的是"它几轮停"。
+    #[tokio::test]
+    async fn a_refusal_that_comes_back_word_for_word_stops_at_the_second_round() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 10,
+            stagnation_window: 5,
+        });
+        let blind = serde_json::json!({
+            "summary": "same attempt",
+            "plan": {"specification": "s", "design": "d"},
+            "sub_tasks": [{"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": []}],
+        });
+        let planner = PlannerActor::new(Arc::new(ScriptedPlanner::new(vec![
+            blind.clone(),
+            blind.clone(),
+            blind.clone(),
+            blind,
+        ])));
+
+        let verdict = ralph
+            .run_plan("decompose the goal", serde_json::json!({}), &planner)
+            .await;
+
+        match verdict {
+            RalphVerdict::Unrecoverable {
+                reason, iterations, ..
+            } => {
+                assert_eq!(iterations, 2, "two rounds are enough to know: {reason}");
+                assert!(reason.contains(REPLAYED_REFUSAL), "{reason}");
+                assert!(
+                    reason.contains(crate::squad::plan::PLAN_NO_ACCEPTANCE),
+                    "{reason}"
+                );
+            }
+            other => panic!("Expected Unrecoverable, got {:?}", other),
+        }
     }
 
     /// 空分解不是终止性失败：没有任何观测到的证据排除下一轮成功，第一轮就收摊
