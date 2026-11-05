@@ -1,6 +1,13 @@
 //! Multi-Agent collaboration layer — actors, squads, and orchestration.
 //! Built on top of `sf-agent` (Agent kernel).  Consumers that only need a
 //! single Agent loop should depend on `sf-agent` directly.
+//!
+//! 一个产物只买一个判官：调用方自己会用程序判据判的东西，产它的 actor 不再向
+//! 模型买一次改写式的自审。分解循环就是这一条（`judge_plan` 逐条读计划，判词
+//! 回到下一轮），省下的调用记在 `observable::SELF_REVIEW_SKIP_PROGRAM_JUDGED`
+//! 这一格上，于是「省了」与「根本没接上」在读数上不同形。反过来，没有哪个调用
+//! 方可以因为「下游还有一道门」就省掉自己该判的那一步：这一条说的是同一个产物
+//! 上的重复判断，不是把判断推给别人。
 
 pub mod actors;
 pub mod collaboration_executor;

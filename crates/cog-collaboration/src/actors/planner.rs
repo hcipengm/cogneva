@@ -28,6 +28,19 @@ fn rework_named_files(task: &Task) -> Option<Vec<String>> {
     Some(files)
 }
 
+/// 上一轮尝试的记录，Planner 在重试时照原样读回。
+///
+/// 这四格一起出现、一起去（重试要么带着上一轮的判词与分数，要么什么都不带），
+/// 所以它们是一项输入而不是四项：分开传时每加一格都要再动一次签名，而签名宽到
+/// 某一步以后，读的人已经看不出哪些参数是一起的。这里的名字与
+/// `cog_core::TaskContextInput` 的字段一一对应，摆在一起就是它被填进去的样子。
+struct PreviousAttempt<'a> {
+    feedback: Option<&'a str>,
+    score: Option<u32>,
+    generation: Option<&'a serde_json::Value>,
+    context_board: Option<&'a serde_json::Value>,
+}
+
 /// Planner Actor — semantic wrapper around a `dyn Agent` created via
 /// [`AgentManager`](cog_core::AgentManager).
 ///
@@ -103,10 +116,12 @@ impl PlannerActor {
         self.plan_inner(
             task,
             attempt,
-            previous_feedback,
-            previous_score,
-            previous_generation,
-            context_board,
+            PreviousAttempt {
+                feedback: previous_feedback,
+                score: previous_score,
+                generation: previous_generation,
+                context_board,
+            },
             false,
         )
         .await
@@ -135,10 +150,12 @@ impl PlannerActor {
         self.plan_inner(
             task,
             attempt,
-            previous_feedback,
-            previous_score,
-            previous_generation,
-            context_board,
+            PreviousAttempt {
+                feedback: previous_feedback,
+                score: previous_score,
+                generation: previous_generation,
+                context_board,
+            },
             true,
         )
         .await
@@ -152,10 +169,7 @@ impl PlannerActor {
         &self,
         task: &Task,
         attempt: u32,
-        previous_feedback: Option<&str>,
-        previous_score: Option<u32>,
-        previous_generation: Option<&serde_json::Value>,
-        context_board: Option<&serde_json::Value>,
+        previous: PreviousAttempt<'_>,
         program_judged: bool,
     ) -> PlannerOutput {
         let goal = task
@@ -178,10 +192,10 @@ impl PlannerActor {
             &cog_core::TaskContextInput {
                 task: Some(task),
                 attempt,
-                generation: previous_generation,
-                previous_feedback,
-                previous_score,
-                context_board,
+                generation: previous.generation,
+                previous_feedback: previous.feedback,
+                previous_score: previous.score,
+                context_board: previous.context_board,
                 ..Default::default()
             },
         );
