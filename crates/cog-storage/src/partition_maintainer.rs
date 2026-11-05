@@ -36,30 +36,34 @@ pub enum KeyKind {
 }
 
 impl KeyKind {
-    /// The SQL literal for the first instant of the boundary day.
+    /// The expression the database composes a boundary from.
     ///
-    /// The zone is not named here, and that is the point: the day is handed to
-    /// the database as a bare date and resolved by the session's own timezone,
-    /// which is the cluster's one reference projected into the database. A
-    /// literal that carried an offset chosen by this process would be a second
-    /// reference — it would keep the layout where that offset was written while
-    /// the rest of the cluster moved.
-    pub fn bound_literal(self, day: NaiveDate) -> String {
-        format!("'{}'", day.format("%Y-%m-%d"))
+    /// Nothing here is a date the server has to parse back, and nothing names a
+    /// zone: the year, month and day go over as the numbers this process
+    /// computed, and the database turns them into its own instant — the
+    /// cluster's one time reference, projected into the session that runs the
+    /// statement. `make_timestamptz` spells out that a wall-clock midnight is
+    /// meant; a literal like `'2026-11-01'` would mean the same thing but read
+    /// as if the day itself were the fact.
+    pub fn bound(self, day: NaiveDate) -> String {
+        match self {
+            KeyKind::Date => format!("make_date({}, {}, {})", day.year(), day.month(), day.day()),
+            KeyKind::Timestamptz => format!(
+                "make_timestamptz({}, {}, {}, 0, 0, 0)",
+                day.year(),
+                day.month(),
+                day.day()
+            ),
+        }
     }
 
-    /// The predicate a row's key is tested with against two boundary literals.
+    /// The predicate a row's key is tested with between two boundaries.
     ///
-    /// The cast follows the column's own type: a day key is compared with
-    /// dates, an instant key with instants resolved by the same session zone
-    /// that cut the boundaries, so the two sides of the comparison can never
-    /// disagree about what a day is.
+    /// Both sides use the same expression the bounds were cut with, so the
+    /// comparison can never disagree with the attach about where a month
+    /// begins.
     pub fn range(self, key: &str, start: &str, end: &str) -> String {
-        let cast = match self {
-            KeyKind::Date => "::date",
-            KeyKind::Timestamptz => "::timestamptz",
-        };
-        format!("{key} >= {start}{cast} AND {key} < {end}{cast}")
+        format!("{key} >= {start} AND {key} < {end}")
     }
 }
 
@@ -88,10 +92,7 @@ impl PartitionedTable {
 
     /// The two boundary literals that fence the half-open range `[start, end)`.
     fn bounds(&self, start: NaiveDate, end: NaiveDate) -> (String, String) {
-        (
-            self.key_kind.bound_literal(start),
-            self.key_kind.bound_literal(end),
-        )
+        (self.key_kind.bound(start), self.key_kind.bound(end))
     }
 
     /// The predicate that keeps this table's key inside `[start, end)`.
@@ -566,59 +567,51 @@ mod tests {
         assert_eq!(end, date(2027, 1, 1));
     }
 
-    /// The boundary is a bare day; the database decides which instant that is.
+    /// The boundary carries numbers, not a date, and not a zone.
     ///
-    /// A literal that carried an offset picked here would freeze the layout at
-    /// whatever zone the process happened to run in: the months already cut
-    /// would stay there when the cluster's reference moved, and the new month
-    /// would land on top of its neighbour. Handing over a bare day leaves the
-    /// decision with the one reference the database already projects.
+    /// The year, month and day are what this process computed; turning them
+    /// into an instant is the database's job, in the session zone that is the
+    /// cluster's one time reference projected into the database. A literal
+    /// carrying an offset picked here would be a second reference, and one
+    /// carrying nothing but a date reads as though the day were the fact rather
+    /// than a wall clock the reference has to place.
     #[test]
-    fn a_boundary_is_a_bare_day_for_the_database_to_resolve() {
+    fn a_boundary_hands_over_numbers_for_the_database_to_place() {
         let day = date(2026, 11, 1);
+        assert_eq!(
+            KeyKind::Timestamptz.bound(day),
+            "make_timestamptz(2026, 11, 1, 0, 0, 0)"
+        );
+        assert_eq!(KeyKind::Date.bound(day), "make_date(2026, 11, 1)");
+        // Neither form names a zone, so neither can go stale when the cluster's
+        // reference moves.
         for kind in [KeyKind::Date, KeyKind::Timestamptz] {
-            let literal = kind.bound_literal(day);
-            assert_eq!(literal, "'2026-11-01'");
+            let bound = kind.bound(day);
             assert!(
-                !literal.contains('+') && !literal.contains('Z'),
-                "{kind:?} boundary carries a zone of its own: {literal}"
+                !bound.contains('+') && !bound.contains('Z') && !bound.contains('\''),
+                "{kind:?} boundary carries a zone or a date literal: {bound}"
             );
         }
     }
 
-    /// A `date` key names a day, and a day has no zone to name.
+    /// The range predicate and the partition bounds are built from the same
+    /// expression, so the attach and the relocation of DEFAULT rows can never
+    /// disagree about where a month begins.
     #[test]
-    fn a_date_boundary_names_a_day_and_no_instant() {
-        assert_eq!(
-            KeyKind::Date.bound_literal(date(2026, 11, 1)),
-            "'2026-11-01'"
-        );
-    }
-
-    /// The range predicate and the partition bounds resolve a day the same way.
-    ///
-    /// Both hand the database a bare day and let its session zone decide which
-    /// instant that is — the attach and the relocation then agree by
-    /// construction. A predicate that pinned its own cast while the bounds were
-    /// left to the session would move rows into, or leave rows out of, the very
-    /// partition being created, at the edge of the month.
-    #[test]
-    fn the_range_predicate_resolves_the_day_the_way_the_bounds_do() {
+    fn the_range_predicate_is_built_from_the_same_boundaries() {
         let table = PartitionedTable::new("probe", "ts", "probe_part", KeyKind::Timestamptz);
         let (start, end) = table.bounds(date(2026, 11, 1), date(2026, 12, 1));
-        let within = table.within(&start, &end);
         assert_eq!(
-            within,
-            format!("\"ts\" >= {start}::timestamptz AND \"ts\" < {end}::timestamptz")
+            table.within(&start, &end),
+            "\"ts\" >= make_timestamptz(2026, 11, 1, 0, 0, 0) \
+             AND \"ts\" < make_timestamptz(2026, 12, 1, 0, 0, 0)"
         );
-        assert!(!within.contains("AT TIME ZONE"));
-        assert!(!within.contains("$1"));
 
         let by_day = PartitionedTable::new("probe", "log_date", "probe_part", KeyKind::Date);
         let (start, end) = by_day.bounds(date(2026, 11, 1), date(2026, 12, 1));
         assert_eq!(
             by_day.within(&start, &end),
-            "\"log_date\" >= '2026-11-01'::date AND \"log_date\" < '2026-12-01'::date"
+            "\"log_date\" >= make_date(2026, 11, 1) AND \"log_date\" < make_date(2026, 12, 1)"
         );
     }
 
