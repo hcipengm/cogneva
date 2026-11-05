@@ -2538,11 +2538,12 @@ struct CiHoldEnd {
     rev: String,
     since_unix: i64,
     ended_unix: i64,
-    /// 闭集：`pass` / `no_evidence` / `rev_no_longer_tracked`。
+    /// 闭集：`pass` / `no_evidence` / `rev_no_longer_tracked` / `superseded`。
     ///
     /// 前两支是同一版在结束那一轮拿到的判词；第三支是上游已经换版、被扣的那一版
-    /// 再也没被问过——它既不是"判过了"，也不是"问过没结论"，混进任何一支都会
-    /// 让"扣住的这一版后来怎样了"读出一个假的答案。
+    /// 再也没被问过；第四支是后来的一版被上游明确判绿、并且它是被扣那一版的子孙
+    /// ——红的那组检查已经有答案了，只是答案不在被扣的那一版上。四支互不重叠：
+    /// 混进任何一支都会让"扣住的这一版后来怎样了"读出一个假的答案。
     outcome: String,
     /// 同一版结束时的逐上游原因，形如 `<platform>:<reason>`；上游已换版时为空
     /// （那一次问的不是这一版，不能把别人的原因记到它头上）。
@@ -3477,6 +3478,29 @@ impl MainlineDeployer {
             newest_red,
             head_verdict,
         })
+    }
+
+    /// 这一轮判绿的那一版，是不是把被扣住的那一版**取代**掉了。
+    ///
+    /// 被扣住的那一版不会自己变绿：它的红已经写进历史，能回答它的只有后来的一版。
+    /// 所以「头上这一版换掉了它」与「后来的一版过了同一组检查」是两件不同的事——
+    /// 前者是没人再问过，后者是问到了答案。只有后者能结束这一次扣住：前者结束它，
+    /// 时长那一格会带着一段没有答案的等待停在库里，修复行会被退掉，而那组检查其实
+    /// 还红着；不结束它，修复行会一直被派下去，去修一版永远不会变绿的代码。
+    ///
+    /// 判据要三样同时成立：挑中的那一版是判过绿的（`target_verified`）、它确实不是
+    /// 被扣住的那一版、并且被扣住的那一版是它的祖先。祖先关系读不出来（git 失败）
+    /// 时按「不是」处理：读不清就不改结局，让它在下一拍重问。
+    async fn hold_superseded_by_verified_descendant(
+        &self,
+        held_rev: &str,
+        green_rev: &str,
+        target_verified: bool,
+    ) -> bool {
+        if !target_verified || rev12(held_rev) == rev12(green_rev) {
+            return false;
+        }
+        self.is_ancestor_checked(held_rev, green_rev).await == Some(true)
     }
 
     /// 记下这一拍看到的 main head，并数出上一拍之后「从没被任何一拍当过目标」的 rev。
@@ -7979,6 +8003,15 @@ impl MainlineDeployer {
             self.renew_advance_reservation(&mut state)?;
             return Ok(());
         };
+        // 挑中的这一版验过没有——这一个布尔只用来判「扣住是被谁回答的」。
+        // 从头上往回退到的那一版只有判绿才会被挑中（没判词的那一版记作兜底，而
+        // 兜底取的是往回数到的第一个，也就是头本身），所以「目标不是头」本身就
+        // 是「验过」；目标就是头时，判词就在这一轮手里。
+        let target_verified = if rev12(&target) != rev12(&bare) {
+            true
+        } else {
+            pick.head_verdict == Some(true)
+        };
         if rev12(&target) != rev12(&bare) {
             info!(
                 head = %rev12(&bare),
@@ -7997,12 +8030,31 @@ impl MainlineDeployer {
             // 结局要在 take 的同时落下来：状态里的 `ci_hold` 一清，这一次扣住就只剩
             // 这一行日志——而日志随滚动消失。问法是上面那一步刚更新过的判词，所以
             // 这里读到的是"结束这一轮问出的东西"，不是扣住开始时的那一份。
+            let now_unix = chrono::Utc::now().timestamp();
+            // 被扣住的那一版不会自己变绿：红已经写进历史，能回答它的只有后来的一版。
+            // 这一轮挑中的、上游明确判绿的那一版若是它的子孙，那组红的检查就已经有
+            // 答案了，只是答案不在被扣的那一版上。按 `rev_no_longer_tracked` 收尾会把
+            // 这件事记成「没人再问过」：时长那一格一直亮着、修复行一直留在队列里，
+            // 而它要修的那一版早已被取代——行被派下去就是拿去修一版永远不会变绿的代码。
+            let superseded = self
+                .hold_superseded_by_verified_descendant(&held.rev, &bare, target_verified)
+                .await;
             let ended = ci_hold_end(
                 &held,
                 &bare,
                 state.last_ci_verdict.as_ref(),
-                chrono::Utc::now().timestamp(),
+                now_unix,
+                superseded,
             );
+            if superseded {
+                info!(
+                    rev = %rev12(&ended.rev),
+                    verified_green = %rev12(&bare),
+                    failed_checks = %ended.failed_checks.join(","),
+                    "the revision this hold named was superseded by one upstream CI verified green; \
+                     the checks that judged it red have an answer, and that answer is not on the held revision"
+                );
+            }
             info!(
                 event = CI_HOLD_ENDED_EVENT,
                 rev = %rev12(&ended.rev),
@@ -10210,13 +10262,22 @@ fn upstream_note_with(note: &str, unreachable: &[&'static str]) -> String {
 /// `rev_no_longer_tracked`——把别人那一版的原因记到它头上会读出一个假的答案。
 /// 判词读不到（旧状态文件、写入失败）按 `no_evidence` 放：那是"没有证据"，
 /// 不是"判过通过"。
+///
+/// `verified_descendant` 是调用方在这一轮里读出来的另一件事：这一轮挑中并判绿的
+/// 那一版是被扣那一版的子孙。被扣的那一版不会自己变绿——红已经写进历史，能回答
+/// 它的只有后来的一版。所以这不是"换版了所以不再问"，是"问过了，答案落在后来的
+/// 那一版上"。两者在读数面上必须分得开：前者时长还在、修复行还得留着，后者的那
+/// 件事已经办完。
 fn ci_hold_end(
     held: &CiHold,
     bare: &str,
     verdict: Option<&CiVerdictRecord>,
     now_unix: i64,
+    verified_descendant: bool,
 ) -> CiHoldEnd {
-    let (outcome, reasons) = if held.rev != bare {
+    let (outcome, reasons) = if verified_descendant && held.rev != bare {
+        ("superseded", Vec::new())
+    } else if held.rev != bare {
         ("rev_no_longer_tracked", Vec::new())
     } else {
         match verdict {
@@ -13864,11 +13925,13 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         );
     }
 
-    /// 扣住的结局是三格的闭集：同一版判过、同一版没证据、上游已经换版。
-    /// 三者在"扣住已结束、`ci_hold` 已清"这一刻的读数面上必须分得开——把
-    /// "上游换了版才放的"记成 `pass`，等于给这一版发一张它没拿到的通行证。
+    /// 扣住的结局是四格的闭集：同一版判过、同一版没证据、上游已经换版、换过去的那一版
+    /// 已经被判绿的子孙取代。四者在"扣住已结束、`ci_hold` 已清"这一刻的读数面上必须
+    /// 分得开——把"上游换了版才放的"记成 `pass`，等于给这一版发一张它没拿到的通行证；
+    /// 把"被绿版取代"记成"没人再问过"，时长那一格会一直亮着、修复行会留着去修一版
+    /// 永远不会变绿的代码。
     #[test]
-    fn a_ci_hold_ends_in_one_of_three_outcomes() {
+    fn a_ci_hold_ends_in_one_of_four_outcomes() {
         let held = CiHold {
             rev: "aaaa1111bbbb".into(),
             since_unix: 100,
@@ -13886,7 +13949,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             decided_unix: 190,
         };
 
-        let passed = ci_hold_end(&held, "aaaa1111bbbb", Some(&verdict("pass")), 200);
+        let passed = ci_hold_end(&held, "aaaa1111bbbb", Some(&verdict("pass")), 200, false);
         assert_eq!(passed.outcome, "pass");
         assert_eq!(passed.ended_unix - passed.since_unix, 100);
         assert_eq!(passed.reasons, vec!["github:pending".to_string()]);
@@ -13897,12 +13960,18 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             vec!["github:Deploy Parity".to_string()]
         );
 
-        let none = ci_hold_end(&held, "aaaa1111bbbb", Some(&verdict("no_evidence")), 200);
+        let none = ci_hold_end(
+            &held,
+            "aaaa1111bbbb",
+            Some(&verdict("no_evidence")),
+            200,
+            false,
+        );
         assert_eq!(none.outcome, "no_evidence");
         assert_eq!(none.reasons, vec!["github:pending".to_string()]);
 
         // 上游已经换版：结束的那一轮问的不是这一版，别人的原因不能记到它头上。
-        let moved = ci_hold_end(&held, "cccc2222dddd", Some(&verdict("pass")), 200);
+        let moved = ci_hold_end(&held, "cccc2222dddd", Some(&verdict("pass")), 200, false);
         assert_eq!(moved.outcome, "rev_no_longer_tracked");
         assert!(moved.reasons.is_empty(), "{:?}", moved.reasons);
         assert_eq!(moved.rev, "aaaa1111bbbb");
@@ -13913,8 +13982,28 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             vec!["github:Deploy Parity".to_string()]
         );
 
+        // 换过去的那一版被判绿了，而且它是被扣那一版的子孙：那组红的检查已经有答案，
+        // 只是答案不在被扣的那一版上。这一支与上一支的区别不是措辞，是收尾动作——
+        // 上一支留着时长与修复行，这一支两样都收（见 `poll_once` 里的收尾）。
+        let superseded = ci_hold_end(&held, "cccc2222dddd", Some(&verdict("pass")), 200, true);
+        assert_eq!(superseded.outcome, "superseded");
+        assert_eq!(superseded.rev, "aaaa1111bbbb");
+        assert!(superseded.reasons.is_empty(), "{:?}", superseded.reasons);
+        assert_eq!(
+            superseded.failed_checks,
+            vec!["github:Deploy Parity".to_string()],
+            "红在哪，还是这一版自己记下的那几项"
+        );
+        // 「子孙判绿」说不出口时不能冒充它：同一版自己判绿仍然是 `pass`，换成别的
+        // 一版而那一版不是子孙，仍然是 `rev_no_longer_tracked`。
+        let same_rev = ci_hold_end(&held, "aaaa1111bbbb", Some(&verdict("pass")), 200, true);
+        assert_eq!(
+            same_rev.outcome, "pass",
+            "被扣的那一版自己判绿时，「有子孙判绿」不是这次结束的原因"
+        );
+
         // 判词读不到不是"判过通过"。
-        let unread = ci_hold_end(&held, "aaaa1111bbbb", None, 200);
+        let unread = ci_hold_end(&held, "aaaa1111bbbb", None, 200, false);
         assert_eq!(unread.outcome, "no_evidence");
         assert_eq!(
             unread.failed_checks,
@@ -16629,6 +16718,87 @@ exit 0
         assert!(
             deployer.load_state().ci_hold.is_none(),
             "扣住已经结束，状态里不该再留着它"
+        );
+        settle(handle).await;
+    }
+
+    /// 被扣住的那一版已经被判绿的子孙取代：这一拍结束扣住，而不是记成「没人再问过」。
+    ///
+    /// 走完整的 `poll_once`，因为要量的是接线：`superseded` 与 `rev_no_longer_tracked`
+    /// 在 `ci_hold_end` 里只差一个布尔，而那个布尔是这一拍才读得出来的祖先关系。接错
+    /// 了，扣住会一直以「没人再问过」收尾——时长那一格永远亮着、修复行被留着去修一版
+    /// 永远不会变绿的代码，而它们在日志里与真的「上游还没答」逐字同形。
+    #[tokio::test]
+    async fn a_tick_ends_a_hold_whose_revision_a_green_descendant_superseded() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, _rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_a);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let green = || http_200(r#"{"check_runs":[{"name":"Test","conclusion":"success"}]}"#);
+        let (endpoint, handle) = fake_registry(vec![green(), green(), green(), green()]).await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.upstreams = vec![crate::config::UpstreamTrackConfig {
+            platform: crate::config::CodePlatform::Github,
+            repo: "owner/repo".into(),
+            api_base: Some(format!("http://{endpoint}/github")),
+        }];
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare))
+            .with_orchestrator(planner.clone());
+
+        let row = cog_core::Task::goal_row("ci-red-abc456-2026-11-04", "make CI green");
+        planner
+            .graph
+            .lock()
+            .unwrap()
+            .insert(row.id.clone(), row.clone());
+        let now = Utc::now().timestamp();
+        let mut state = deployer.load_state();
+        // 扣住停在 A（旧的那一版），头已经是 B 而且 B 判绿：A 的红写进了历史，
+        // 能回答它的只有 B。
+        state.ci_hold = Some(CiHold {
+            rev: rev_a.clone(),
+            since_unix: now - 600,
+            opened_rev: rev_a.clone(),
+            opened_unix: now - 600,
+            failed_checks: vec!["github:Test".into()],
+            rows: vec![row.id.clone()],
+        });
+        state.ci_hold_run_since_unix = Some(now - 600);
+        deployer.save_state(&state).unwrap();
+
+        let _ = deployer.poll_once().await;
+
+        let after = deployer.load_state();
+        assert!(after.ci_hold.is_none(), "扣住已经结束");
+        let ended = after.ci_hold_ends.last().expect("结束的那一拍要留下结局");
+        assert_eq!(
+            ended.outcome, "superseded",
+            "换过去的那一版判绿了，而且它是被扣那一版的子孙：结局是「被取代」，不是「没人再问过」"
+        );
+        assert_eq!(ended.rev, rev_a, "被取代的是扣住点名的那一版");
+        assert!(
+            after.ci_hold_run_since_unix.is_none(),
+            "答案已经有了，时长那一格不能继续亮着：`rev_no_longer_tracked` 正是靠留着它来表示「还没答案」"
+        );
+        let cancels = planner.cancels();
+        assert_eq!(
+            cancels
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec![row.id.as_str()],
+            "这一次扣住开出去、还一行没跑的行要跟着收：{cancels:?}"
+        );
+        assert!(
+            cancels[0].1.contains("superseded") && cancels[0].1.contains(&rev12(&rev_a)),
+            "退行的理由要点名哪一种结局、哪一版：{}",
+            cancels[0].1
         );
         settle(handle).await;
     }
