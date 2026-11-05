@@ -38,6 +38,16 @@ impl cog_core::SystemPlugin for WikiPlugin {
         if let Some(ref backend) = wiki_adapter {
             ctx.publish_service(backend.clone());
             info!("WikiPlugin wiki backend published");
+
+            // 把来源读成页面这一步交给名册上的员工。这里交出去的只是「怎么把活
+            // 递给名册」，不是「谁来干」：名册上任何一位都能接，账记在接活的人
+            // 名下。编排器在这一刻还没解析，所以它是首次使用时才解析的句柄。
+            let distiller = crate::WorkItemDistiller::new(
+                backend.clone(),
+                std::sync::Arc::new(crate::OrchestratorHandoff::new(ctx.clone())),
+            );
+            ctx.publish_service::<dyn cog_core::WikiDistiller>(std::sync::Arc::new(distiller));
+            info!("WikiPlugin wiki distiller published");
         } else {
             info!("WikiPlugin no wiki backend configured");
         }

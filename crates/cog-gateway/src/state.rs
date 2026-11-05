@@ -29,6 +29,8 @@ pub struct RuntimeState {
     pub action_plan_store: crate::action_plan::ActionPlanStore,
     pub collaboration_graph: Option<Arc<crate::collaboration::CollaborationGraph>>,
     pub wiki_adapter: Option<Arc<dyn cog_core::WikiBackend>>,
+    /// 把投进 wiki 的来源读成页面。缺席时文档照存，只是没有页面替它把内容讲清楚。
+    pub wiki_distiller: Option<Arc<dyn cog_core::WikiDistiller>>,
     pub connection_manager: Option<Arc<crate::websocket_protocol::ConnectionManager>>,
 }
 

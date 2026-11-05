@@ -121,6 +121,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let agent_registry = ctx.require_service::<dyn cog_core::AgentRegistry>()?;
         let observability_gateway = ctx.consume_service::<dyn cog_core::ObservabilityGateway>();
         let wiki_adapter = ctx.consume_service::<dyn cog_core::WikiBackend>();
+        let wiki_distiller = ctx.consume_service::<dyn cog_core::WikiDistiller>();
         let supervisor: Arc<dyn cog_core::Supervisor> =
             ctx.require_service::<dyn cog_core::Supervisor>()?.clone();
         let alert_store: Arc<dyn cog_core::AlertStore> =
@@ -262,6 +263,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &agent_registry,
             &observability_gateway,
             &wiki_adapter,
+            &wiki_distiller,
             &knowledge_backend,
             &supervisor,
             &alert_store,

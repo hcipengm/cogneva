@@ -177,6 +177,7 @@ fn state_with(
         observability_gateway: Some(Arc::new(MemoryObservabilityGateway::new(state_backend))),
         connection_manager: None,
         wiki_adapter: None,
+        wiki_distiller: None,
         knowledge_backend: None,
         user_store: None,
         platform_identities: None,

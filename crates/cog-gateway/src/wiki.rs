@@ -26,6 +26,16 @@ fn claims_ref(claims: &Option<axum::Extension<cog_core::Claims>>) -> Option<&cog
     claims.as_ref().map(|axum::Extension(c)| c)
 }
 
+/// 蒸馏器写出来的页面落在 `pages/` 段下（工作区来源在其前缀之后）。这既是不
+/// 再把它读一遍的判据，也是「这一份已经是页面」的唯一标识。
+fn is_distilled_page(path: &str) -> bool {
+    path.split('/').any(|segment| segment == "pages")
+}
+
+/// 同时在读的来源上限：这里界的是活着的轮询，不是接到的请求。
+static DISTILL_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(8)));
+
 fn prefixed_path(prefix: &Option<String>, path: &str) -> String {
     match prefix {
         Some(p) => format!("{p}{path}"),
@@ -159,11 +169,50 @@ pub async fn create_handler(
 
     let full_path = prefixed_path(&prefix, &req.path);
     match adapter.ingest_document(&full_path, &req.content).await {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(json!({"path": req.path, "status": "created"})),
-        )
-            .into_response(),
+        Ok(()) => {
+            // 存下来的只是字节：这页讲什么、该叫什么、留哪几条，是判断，交给名册
+            // 上的员工。这里只把活递出去、不等它——一次投递不该把一个 HTTP 请求
+            // 挂在模型的墙钟上。蒸馏失败也不回滚这份文档：字节已经存进去了，
+            // 回滚会把「没读懂」变成「没收到」。
+            let distillation = match state.wiki_distiller.as_ref() {
+                // `pages/` 是蒸馏器自己的落点，再把它读一遍就是套娃。
+                Some(distiller) if !is_distilled_page(&full_path) => {
+                    let distiller = distiller.clone();
+                    let source = full_path.clone();
+                    let content = req.content.clone();
+                    tokio::spawn(async move {
+                        // 同时在读的来源有界：一件活最长等它自己的预算那么多秒，
+                        // 而投递端点对任何人开放——不设界的话一次批量导入就能让
+                        // 进程里堆满每半秒轮询一次的活。排队的那些不轮询，只是
+                        // 等一个空位，所以界的是活着的轮询，不是收到的请求。
+                        let _slot = DISTILL_SLOTS.clone().acquire_owned().await;
+                        match distiller.distill_source(&source, &content).await {
+                            Ok(page) => tracing::info!(
+                                source = %source,
+                                page = %page,
+                                "posted source distilled into a wiki page"
+                            ),
+                            Err(e) => tracing::warn!(
+                                source = %source,
+                                error = %e,
+                                "posted source was stored but not distilled"
+                            ),
+                        }
+                    });
+                    "queued"
+                }
+                _ => "not configured",
+            };
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "path": req.path,
+                    "status": "created",
+                    "distillation": distillation,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("create failed: {}", e)})),
@@ -294,6 +343,16 @@ mod tests {
             created_at: None,
             updated_at: None,
         }
+    }
+
+    /// 页面在任何命名空间下都认得出：工作区的页面在 `{workspace}/pages/`，全局
+    /// 的在 `pages/`。只认前一种会让工作区的页面被再读一遍。
+    #[test]
+    fn a_distilled_page_is_recognised_in_any_namespace() {
+        assert!(is_distilled_page("pages/auth-1a2b3c4d.md"));
+        assert!(is_distilled_page("ws-alpha/pages/auth-1a2b3c4d.md"));
+        assert!(!is_distilled_page("notes/auth.md"));
+        assert!(!is_distilled_page("ws-alpha/notes/pages-of-history.md"));
     }
 
     #[test]

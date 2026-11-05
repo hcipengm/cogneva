@@ -243,6 +243,10 @@ pub struct GatewayState {
     pub hook_engine: Option<Arc<dyn cog_core::HookEngine>>,
     pub connection_manager: Option<Arc<websocket_protocol::ConnectionManager>>,
     pub wiki_adapter: Option<Arc<dyn cog_core::WikiBackend>>,
+    /// Turns a source posted into the wiki into a page an employee wrote.
+    /// `None` when no distiller was published; a document posted then is still
+    /// stored, it just does not get a page that says what it is about.
+    pub wiki_distiller: Option<Arc<dyn cog_core::WikiDistiller>>,
     /// The assembled knowledge layer (memory + wiki, hybrid retrieval and
     /// reranking included), published by the wiki plugin. Separate from
     /// [`Self::memory_backend`] and [`Self::wiki_adapter`] beside it: those are
@@ -450,6 +454,7 @@ impl GatewayState {
             action_plan_store: self.action_plan_store.clone(),
             collaboration_graph: self.collaboration_graph.clone(),
             wiki_adapter: self.wiki_adapter.clone(),
+            wiki_distiller: self.wiki_distiller.clone(),
             connection_manager: self.connection_manager.clone(),
         }
     }

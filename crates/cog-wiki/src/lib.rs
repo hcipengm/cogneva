@@ -9,6 +9,7 @@
 //! document is still on disk.
 
 pub mod bounds;
+pub mod distiller;
 pub mod indexer;
 pub mod manager;
 pub mod meilisearch;
@@ -18,6 +19,7 @@ pub mod unified_knowledge_backend;
 pub mod vector_index;
 
 pub use bounds::WIKI_PAGE_PROMPT_CHARS;
+pub use distiller::{OrchestratorHandoff, WorkItemDistiller, WorkItemHandoff};
 pub use indexer::{WikiIndexEntry, WikiIndexer};
 pub use manager::WikiManager;
 pub use page::{WikiPage, WikiPageType};

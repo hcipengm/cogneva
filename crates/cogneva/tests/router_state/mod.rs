@@ -277,6 +277,7 @@ fn build(
         observability_gateway: None,
         connection_manager: None,
         wiki_adapter: None,
+        wiki_distiller: None,
         knowledge_backend: None,
         user_store: None,
         platform_identities: None,

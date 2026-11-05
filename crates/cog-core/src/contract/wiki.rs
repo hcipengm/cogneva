@@ -131,3 +131,37 @@ pub trait WikiBackend: Send + Sync {
         Err(crate::SFError::NotImplemented("list_documents".into()))
     }
 }
+
+/// One source distilled into a page the wiki can serve.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DistilledPage {
+    /// What the page is called. This is what a reader sees in the index and in
+    /// search results, so it is the source's subject rather than its file name.
+    pub title: String,
+    /// The page itself, in markdown.
+    pub body: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Turns a raw source into a wiki page.
+///
+/// What a source is *about*, what is worth keeping from it and what to call the
+/// page is a judgment, so it is handed to an employee rather than computed here
+/// -- the same shape as any other work item on this platform, and the reason
+/// this trait has no prompt, no model handle and no actor of its own. The
+/// implementation carries the material and the answer's schema; the employee
+/// brings the reading. What comes back is stored by the implementation, which is
+/// the only place the page format lives.
+///
+/// [`WikiBackend::ingest_document`] is the neighbouring name and a different
+/// thing: that one stores bytes, this one reads them first and costs a model
+/// call for that reason.
+#[async_trait]
+pub trait WikiDistiller: Send + Sync {
+    /// Distill the source at `source_path` and store the resulting page.
+    ///
+    /// Returns the wiki path the page landed on, so a caller can say where the
+    /// answer went without listing the wiki to find out.
+    async fn distill_source(&self, source_path: &str, content: &str) -> crate::SFResult<String>;
+}
