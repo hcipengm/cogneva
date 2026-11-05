@@ -31814,17 +31814,40 @@ exit 0
         let old = BTreeMap::from([("limits.cpu".to_string(), 4.0)]);
         // 4 -> 4.5 核：18.5 + 0.5 = 19 <= 23，放行。
         let fits = BTreeMap::from([("limits.cpu".to_string(), 4.5)]);
-        assert!(admission_shortfall("resourcequota/q", &usage, &old, &fits, false).is_none());
+        assert!(admission_shortfall(
+            "resourcequota/q",
+            &usage,
+            &old,
+            &fits,
+            false,
+            &BTreeMap::new()
+        )
+        .is_none());
         // 4 -> 6 核：18.5 + 2 = 20.5 <= 23，仍放行。
         let raised = BTreeMap::from([("limits.cpu".to_string(), 6.0)]);
-        assert!(admission_shortfall("resourcequota/q", &usage, &old, &raised, false).is_none());
+        assert!(admission_shortfall(
+            "resourcequota/q",
+            &usage,
+            &old,
+            &raised,
+            false,
+            &BTreeMap::new()
+        )
+        .is_none());
         // 用量已经贴顶时再抬：18.5 -> 22.5，+2 到 24.5 > 23，扣住。
         let near = crate::governance_drift::QuotaUsage {
             hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
             used: BTreeMap::from([("limits.cpu".to_string(), "22.5".to_string())]),
             annotations: BTreeMap::new(),
         };
-        let hold = admission_shortfall("resourcequota/q", &near, &old, &raised, false);
+        let hold = admission_shortfall(
+            "resourcequota/q",
+            &near,
+            &old,
+            &raised,
+            false,
+            &BTreeMap::new(),
+        );
         let hold = hold.expect("22.5 + 2 应当越过 23");
         assert!(hold.text.contains("limits.cpu"));
         assert_eq!(
@@ -31851,10 +31874,25 @@ exit 0
         // 镜像换了、资源一个字没动。
         let same = BTreeMap::from([("limits.memory".to_string(), pod)]);
         assert!(
-            admission_shortfall("resourcequota/q", &usage, &old, &same, false).is_none(),
+            admission_shortfall(
+                "resourcequota/q",
+                &usage,
+                &old,
+                &same,
+                false,
+                &BTreeMap::new()
+            )
+            .is_none(),
             "旧 Pod 先走：54Gi - 4Gi + 4Gi 仍是 54Gi，装得下"
         );
-        let hold = admission_shortfall("resourcequota/q", &usage, &old, &same, true);
+        let hold = admission_shortfall(
+            "resourcequota/q",
+            &usage,
+            &old,
+            &same,
+            true,
+            &BTreeMap::new(),
+        );
         let hold = hold.expect("两个 4Gi 的 Pod 同时在 57Gi 的天花板下装不下");
         assert!(
             hold.text.contains("surges"),
@@ -31862,6 +31900,78 @@ exit 0
             hold.text
         );
         assert_eq!(hold.dimension, "memory", "这一维是内存，不是别的");
+    }
+
+    /// 上一轮 apply 已经把这一版的 Pod 建出来了，它的额度就在 usage 里；再按
+    /// surge 加一遍，就是把同一台 Pod 记成两台。
+    ///
+    /// 2026-11-06 实测，主应用就是这样被判"装不下"的：用量里已经含它自己那一份，
+    /// 预检又加了整整一台，于是越过天花板，而那一刻真正要发生的准入是"什么都不变"。
+    #[test]
+    fn a_pod_of_the_same_shape_already_in_place_is_not_charged_twice() {
+        let usage = crate::governance_drift::QuotaUsage {
+            hard: BTreeMap::from([("limits.memory".to_string(), "73Gi".to_string())]),
+            used: BTreeMap::from([("limits.memory".to_string(), "68Gi".to_string())]),
+            annotations: BTreeMap::new(),
+        };
+        let gib = 1024.0 * 1024.0 * 1024.0;
+        let old = BTreeMap::from([("limits.memory".to_string(), 4.0 * gib)]);
+        let new = BTreeMap::from([("limits.memory".to_string(), 12.0 * gib)]);
+        let hold = admission_shortfall(
+            "resourcequota/q",
+            &usage,
+            &old,
+            &new,
+            true,
+            &BTreeMap::new(),
+        );
+        assert!(
+            hold.is_some(),
+            "还没建出来时，68Gi + 12Gi 越过 73Gi，应当扣住"
+        );
+        assert!(
+            admission_shortfall("resourcequota/q", &usage, &old, &new, true, &new).is_none(),
+            "已经在场的那一台不再记第二次：68Gi 里已经含它那份，装得下"
+        );
+    }
+
+    /// 认"已经在场"要认到 Pod 本身：标签命中、没有删除时间戳、限额与模板逐字段
+    /// 相等，三条都对上才算。正在退出的那台不算——它退出后控制器还要再建一台，
+    /// 把它当成"已经在了"会让预检漏掉那一次准入。
+    #[test]
+    fn a_pod_already_counts_only_when_it_is_standing_and_has_the_same_shape() {
+        use crate::mainline_rollout::pod_already_admitted;
+        let limits =
+            BTreeMap::from([("limits.memory".to_string(), 12.0 * 1024.0 * 1024.0 * 1024.0)]);
+        let pod = |deletion: &str, memory: &str| {
+            format!(
+                r#"{{"items":[{{"metadata":{{"name":"cogneva-abc","labels":{{"app.kubernetes.io/name":"cogneva","app.kubernetes.io/component":"app"}}{deletion}}},"spec":{{"containers":[{{"resources":{{"limits":{{"memory":"{memory}"}}}}}}]}}}}]}}"#
+            )
+        };
+        let standing = pod("", "12Gi");
+        assert_eq!(
+            pod_already_admitted(&standing, "cogneva", "app", &limits),
+            limits,
+            "站着、标签对上、限额一致：这一份已经在 usage 里"
+        );
+        let terminating = pod(r#","deletionTimestamp":"2026-11-06T07:20:00Z""#, "12Gi");
+        assert!(
+            pod_already_admitted(&terminating, "cogneva", "app", &limits).is_empty(),
+            "正在退出的那台还记在 used 里，但它走了还要再建一台，不能当成已经在了"
+        );
+        let other_shape = pod("", "8Gi");
+        assert!(
+            pod_already_admitted(&other_shape, "cogneva", "app", &limits).is_empty(),
+            "限额不同就是另一台 Pod，不能拿它抵这次准入"
+        );
+        assert!(
+            pod_already_admitted(&standing, "other", "app", &limits).is_empty(),
+            "标签不命中就不是这个目标的 Pod"
+        );
+        assert!(
+            pod_already_admitted("not json", "cogneva", "app", &limits).is_empty(),
+            "读不懂就当没读到，与这个判据的其余部分同一个方向"
+        );
     }
 
     /// 扣住的维度按**资源本身**归一，不按它记在哪一栏：`limits.cpu` 与
@@ -31986,7 +32096,15 @@ exit 0
             used: BTreeMap::from([("limits.cpu".to_string(), "5".to_string())]),
             annotations: BTreeMap::new(),
         };
-        assert!(admission_shortfall("resourcequota/q", &low, &old, &unchanged, false).is_none());
+        assert!(admission_shortfall(
+            "resourcequota/q",
+            &low,
+            &old,
+            &unchanged,
+            false,
+            &BTreeMap::new()
+        )
+        .is_none());
         // 用量读不出来：不判，放行。
         let unreadable = crate::governance_drift::QuotaUsage {
             hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
@@ -31994,9 +32112,15 @@ exit 0
             annotations: BTreeMap::new(),
         };
         let raised = BTreeMap::from([("limits.cpu".to_string(), 9.0)]);
-        assert!(
-            admission_shortfall("resourcequota/q", &unreadable, &old, &raised, false).is_none()
-        );
+        assert!(admission_shortfall(
+            "resourcequota/q",
+            &unreadable,
+            &old,
+            &raised,
+            false,
+            &BTreeMap::new()
+        )
+        .is_none());
     }
 
     /// 进程起来时 main 已经部署过 ⇒ 它没组过包，声明侧必须自己从被跟踪 rev 的

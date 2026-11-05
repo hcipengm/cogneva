@@ -2020,9 +2020,9 @@ pub(crate) fn pod_template_limits(doc: &serde_yaml::Value) -> Option<BTreeMap<St
     Some(sums)
 }
 
-/// The first resource for which rolling this target's new pod onto the namespace
-/// would pass an enforced ceiling, if any, named with the numbers that decided
-/// it.
+/// The first enforced ceiling any of these quotas would have this target's new
+/// pod pass, if any -- the same walk [`admission_shortfall`] does, kept apart so
+/// the reading can be taken twice without the loop being written twice.
 ///
 /// How much the new pod is charged depends on whether the old one is still
 /// there when it is admitted, and that is what `surges` says:
@@ -2041,21 +2041,111 @@ pub(crate) fn pod_template_limits(doc: &serde_yaml::Value) -> Option<BTreeMap<St
 /// not be read": an unreadable figure is not a figure that fits, but it is also
 /// not grounds to hold a rollout, and holding a good rollout is the failure this
 /// must not introduce.
-/// The first enforced ceiling any of these quotas would have this target's new
-/// pod pass, if any -- the same walk [`admission_shortfall`] does, kept apart so
-/// the reading can be taken twice without the loop being written twice.
 fn first_admission_shortfall(
     quotas: &std::collections::BTreeMap<String, crate::governance_drift::QuotaUsage>,
     old_limits: &BTreeMap<String, f64>,
     new_limits: &BTreeMap<String, f64>,
     surges: bool,
+    already: &BTreeMap<String, f64>,
 ) -> Option<AdmissionShortfall> {
     for (object, usage) in quotas {
-        if let Some(reason) = admission_shortfall(object, usage, old_limits, new_limits, surges) {
+        if let Some(reason) =
+            admission_shortfall(object, usage, old_limits, new_limits, surges, already)
+        {
             return Some(reason);
         }
     }
     None
+}
+
+/// 新模板的 Pod 已经建出来、已经在 `used` 里的那一份额度。
+///
+/// 预检问的是"再准入这一台 Pod 还装得下吗"。上一轮 apply 过后它可能已经建出来
+/// 了，这时按 surge 把整台 Pod 再记一次，等于把同一台 Pod 记成两台：2026-11-06
+/// 实测，主应用就是这样被判了一次"装不下"——用量里已经含它自己那一份，
+/// 预检又加了整整一台，于是越过天花板，而那一刻真正要发生的准入只是
+/// "什么都不变"。
+///
+/// 认得出的条件：标签选择器命中、没有删除时间戳（还在退出的那台仍被记账，但不能
+/// 当成"已经在了"——它退出之后控制器还要再建一台）、各容器限额与模板逐字段相等。
+/// 读不懂就返回空，与这个判据的其余部分同一个方向：读不出的数字不放行，也不挡。
+pub(crate) fn pod_already_admitted(
+    pods_json: &str,
+    name: &str,
+    component: &str,
+    new_limits: &BTreeMap<String, f64>,
+) -> BTreeMap<String, f64> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(pods_json) else {
+        return BTreeMap::new();
+    };
+    let Some(items) = v.get("items").and_then(|i| i.as_array()) else {
+        return BTreeMap::new();
+    };
+    for pod in items {
+        let label = |key: &str| {
+            pod.pointer("/metadata/labels")
+                .and_then(|l| l.get(key))
+                .and_then(|x| x.as_str())
+        };
+        if label("app.kubernetes.io/name") != Some(name)
+            || label("app.kubernetes.io/component") != Some(component)
+        {
+            continue;
+        }
+        if pod
+            .pointer("/metadata/deletionTimestamp")
+            .is_some_and(|d| !d.is_null())
+        {
+            continue;
+        }
+        // 与 [`pod_template_limits`] 同一口径：普通容器加 init 容器一起求和，
+        // 少算一边就会与模板对不上、退回"没读到"，而那正是这次要修的那种假扣。
+        // Pod 的 spec 里 init 容器一直在，跑完之后只是不再出现在 status。
+        let mut sums: BTreeMap<String, f64> = BTreeMap::new();
+        let mut readable = true;
+        let mut saw_containers = false;
+        for list_key in ["containers", "initContainers"] {
+            let Some(containers) = pod
+                .pointer(&format!("/spec/{list_key}"))
+                .and_then(|c| c.as_array())
+            else {
+                continue;
+            };
+            saw_containers = true;
+            for container in containers {
+                let Some(limits) = container
+                    .pointer("/resources/limits")
+                    .and_then(|l| l.as_object())
+                else {
+                    continue;
+                };
+                for (key, value) in limits {
+                    let Some(text) = value.as_str() else {
+                        readable = false;
+                        break;
+                    };
+                    let Some(bytes) = cog_core::claim_footprint::quantity_bytes(text) else {
+                        readable = false;
+                        break;
+                    };
+                    *sums.entry(format!("limits.{key}")).or_insert(0.0) += bytes;
+                }
+                if !readable {
+                    break;
+                }
+            }
+            if !readable {
+                break;
+            }
+        }
+        if !saw_containers {
+            continue;
+        }
+        if readable && sums == *new_limits {
+            return new_limits.clone();
+        }
+    }
+    BTreeMap::new()
 }
 
 /// Names of the pods that are still being charged while they shut down.
@@ -2139,13 +2229,16 @@ pub(crate) fn admission_shortfall(
     old_limits: &BTreeMap<String, f64>,
     new_limits: &BTreeMap<String, f64>,
     surges: bool,
+    already: &BTreeMap<String, f64>,
 ) -> Option<AdmissionShortfall> {
     let mut resources: Vec<&String> = new_limits.keys().collect();
     resources.sort();
     for resource in resources {
         let old = old_limits.get(resource).copied().unwrap_or(0.0);
         let charged = if surges {
-            new_limits[resource]
+            // 已经建出来、已经记进 `used` 的那一份不再重复记账：这笔预检问的是
+            // "再放一台装得下吗"，不是"现在装得下吗"。见 [`pod_already_admitted`]。
+            new_limits[resource] - already.get(resource).copied().unwrap_or(0.0)
         } else {
             new_limits[resource] - old
         };
@@ -3101,7 +3194,28 @@ impl RolloutExecutor {
             .await
             .ok()?;
         let quotas = crate::governance_drift::live_quota_usage(&quota_text).ok()?;
-        let verdict = first_admission_shortfall(&quotas, &old_limits, &new_limits, surges);
+        // 这一版自己的 Pod 可能已经在场：上一轮 apply 把它建出来了，它的额度就在
+        // 这份 usage 里。再按 surge 记一次，就是拿同一台 Pod 当两台去比天花板。
+        let pods_text = self
+            .run_kubectl(
+                &[
+                    "get",
+                    "pods",
+                    "-l",
+                    &format!(
+                        "app.kubernetes.io/name={},app.kubernetes.io/component={}",
+                        t.name, t.component
+                    ),
+                    "-o",
+                    "json",
+                ],
+                KUBECTL_TIMEOUT_SECS,
+            )
+            .await
+            .unwrap_or_default();
+        let already = pod_already_admitted(&pods_text, &t.name, &t.component, &new_limits);
+        let verdict =
+            first_admission_shortfall(&quotas, &old_limits, &new_limits, surges, &already);
         verdict.as_ref()?;
         // A refusal is only news if the usage behind it is the usage that will
         // still be there when the new pod is admitted. Earlier targets in this
@@ -3128,7 +3242,9 @@ impl RolloutExecutor {
         let Ok(quotas) = crate::governance_drift::live_quota_usage(&quota_text) else {
             return verdict;
         };
-        first_admission_shortfall(&quotas, &old_limits, &new_limits, surges)
+        // `already` 仍然算数：刚才等走的是旧版本那批带删除时间戳的 Pod，这一版
+        // 自己那台不带删除时间戳，还在 `used` 里。
+        first_admission_shortfall(&quotas, &old_limits, &new_limits, surges, &already)
     }
 
     /// Wait, up to a couple of minutes, for pods that are already shutting down
