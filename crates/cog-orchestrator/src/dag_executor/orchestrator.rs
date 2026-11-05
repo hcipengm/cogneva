@@ -6906,6 +6906,51 @@ mod tests {
         assert_eq!(fresh.retry_count, 0);
     }
 
+    /// 回队的判词只说到下一次运行开始为止。
+    ///
+    /// 「在 Scheduled 停了 600 秒、从没启动过」说的是**等待**：行一旦跑起来，
+    /// 它就不再说明任何事。不清掉的代价在读数面上——2026-11-05 实测 6 小时内
+    /// 41 条 completed 里 37 条带着这句回队词，按「有 error 就是坏了」取的读者
+    /// 会把跑成的活读成失败。
+    #[tokio::test]
+    async fn the_rearm_note_does_not_outlive_the_run_that_follows_it() {
+        let dag = DagExecutor::new("ws-stalled-note".into());
+        dag.add_task(Task::new(
+            "stalled",
+            TaskType::LlmCall,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        dag.schedule_task("stalled").await.unwrap();
+        {
+            let mut inner = dag.inner.write().await;
+            inner.tasks.get_mut("stalled").unwrap().updated_at =
+                chrono::Utc::now() - chrono::Duration::minutes(30);
+        }
+        assert_eq!(sweep(&dag, 600, &served("ws-stalled-note", true)).await, 1);
+        assert!(dag
+            .get_task("stalled")
+            .await
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("never started"));
+
+        // 回队之后它又被派发、真的开始跑了：这一行现在说的是「在跑」，不是
+        // 「没启动过」。
+        dag.schedule_task("stalled").await.unwrap();
+        dag.start_task("stalled").await.unwrap();
+        let running = dag.get_task("stalled").await.unwrap();
+        assert_eq!(running.status, TaskStatus::Running);
+        assert!(
+            running.error.is_none(),
+            "跑起来的行不该还带着上一轮的回队词：{:?}",
+            running.error
+        );
+    }
+
     /// 本部署不读的那条队列上，停在 `Scheduled` 不是坏消息，是任务在等执行器。
     ///
     /// 2026-10-18 现场：执行器角色被关掉后，进程本地队列只剩发布器，没有消费者；

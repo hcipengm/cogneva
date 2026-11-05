@@ -878,11 +878,26 @@ impl Task {
     /// 两者必须同时写，因为回收判据读的是租约而状态机给的是 Running，任何一处
     /// 只设状态不设租约的写法都会造出一行「看起来有人持有、其实谁也接不走」的
     /// 任务。收在一个方法里，这个不变式就有了唯一的写点。
+    ///
+    /// 上一轮留下的判词也在这里清掉：`error` 说的是**这一行为什么停在现在这个
+    /// 状态**，而一次新运行开始时它已经不再说明任何事。回队的那一条尤其要说清
+    /// ——「在 Scheduled 停了 600 秒、从没启动过，于是放回队里」是一句关于**等
+    /// 待**的话，行一旦真的跑起来，这句话就是假的；留着它，一个跑成了的任务会
+    /// 带着「failed 似的」字样停在 completed 上（2026-11-05 实测 6 小时内 41 条
+    /// completed 里有 37 条带着这句回队词），任何按「有 error 就是坏了」取的读
+    /// 者都会把它读成一次失败。
+    ///
+    /// 判词在派发时先读、后清：[`Self::error`] 只在下一次失败时被覆盖，所以
+    /// 「上一次是不是被时限截断的、下一轮该给多少时间」这一问必须在清掉之前问。
+    /// 清在这里而不是每个调用点各写一遍，是因为「一次运行从哪一刻开始」只有
+    /// 这一个入口，漏写一处就会留下一行说自己失败过的成功任务。
     pub fn begin_run(&mut self, owner: &str, lease: chrono::Duration, now: DateTime<Utc>) {
         self.status = TaskStatus::Running;
         self.started_at = Some(now);
         self.lease_owner = Some(owner.to_string());
         self.lease_expires_at = Some(now + lease);
+        self.error = None;
+        self.error_cause = None;
     }
 
     /// 结束一次运行，与 [`Self::begin_run`] 对称：开始时刻与租约一起清掉，回到
@@ -1032,6 +1047,29 @@ mod tests {
         // 解不开——被依赖的那一行读不回来，后继每一轮都判成阻塞。
         assert!(TaskStatus::Completed.is_terminal());
         assert!(TaskStatus::Completed.affects_dispatch());
+    }
+
+    /// 一次新的运行开始，上一轮留在行上的判词就不作数了。
+    ///
+    /// 回队那一句（「在 Scheduled 停了 N 秒、从没启动过，于是放回队里」）说的是
+    /// 等待，不是失败：行一旦跑起来，它就成了假话。留着它的代价在读数面上——
+    /// 2026-11-05 实测 6 小时内 41 条 completed 里有 37 条带着这句，按「有 error
+    /// 就是坏了」取的读者会把跑成的活读成失败。
+    #[test]
+    fn a_run_that_begins_carries_no_verdict_from_the_run_before_it() {
+        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        task.error = Some(
+            "never started: the task sat in Scheduled for more than 600s without ever being \
+             started, so it was put back in line without charging an attempt"
+                .into(),
+        );
+        task.error_cause = Some(UpstreamFailure::QuotaExhausted);
+
+        task.begin_run("unit-a", chrono::Duration::seconds(300), Utc::now());
+
+        assert_eq!(task.status, TaskStatus::Running);
+        assert!(task.error.is_none(), "开始跑了，上一轮的判词不再说明任何事");
+        assert!(task.error_cause.is_none(), "类型通道同理");
     }
 
     /// 两个通道各自都能判死一次重试：类型通道（`error_cause` 为配额/鉴权这类
