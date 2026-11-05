@@ -2553,6 +2553,15 @@ const CI_HOLD_ENDED_EVENT: &str = "ci_hold_ended";
 // cap: bound — 一个环足够回答「最近几版都怎么被放的」，又不让状态文件随历史线性长大
 const CI_HOLD_END_KEEP: usize = 16;
 
+/// 头上的修订被判红时，往回数几版去找一版可以滚的。
+///
+/// 数的是**修订**不是时间，因为「回去多远还算这一条主线」在这里没有时间口径：
+/// 一次构建加一次 rollout 是十几分钟，期间落地的版数才是真正在变的东西。十二
+/// 版按 2026-11-05 实测的落地节奏（约每六分钟一版）是一小时出头，而在头上连续
+/// 被扣住的那几版里，回头的第一版往往就已经是没被判红的。
+// cap: bound — 往回的深度决定一次红头最多追问几次上游，取到「几个小时的路地量」为止
+const CI_RED_HEAD_LOOKBACK: usize = 12;
+
 /// 出现在这个仓库的检查里、却**不判这棵树**的那些工作流。
 ///
 /// GitHub 会为 Pages 生成一条工作流：它不在仓库的 `.github/workflows/` 里
@@ -3248,6 +3257,75 @@ impl MainlineDeployer {
             .await
             .ok()?;
         out.trim().parse().ok()
+    }
+
+    /// `tip` 往回数，最近的一版**上游 CI 没有判红**的修订；连它自己也算进去。
+    ///
+    /// 走第一父链：合并进来的侧枝从不是 main 的头，把侧枝上的提交当成「回去一版」
+    /// 会滚一个从来没打算上线的形状。
+    ///
+    /// 判据与 [`MainlineDeployer::hold_if_ci_reports_failure`] 是同一条——只有
+    /// **明确判红**才排除，`None`（检查还在跑、上游没答话、没配这个上游）照旧算
+    /// 可滚。用另一条更严的判据（例如「必须明确判绿」）会让这个函数去等一件与头
+    /// 上那一版一样追不上的事：头被扣住时，回头的几版往往也都还跑着 CI，那样找到
+    /// 的永远是「没有」，这一条分支就等于不存在。
+    ///
+    /// 拿不到修订列表时返回 `None`（按「没有可滚的版本」处理，也就是停一轮）：
+    /// 读不出历史就没有依据说哪一版能用。
+    ///
+    /// `floor` 是集群上已经跑着的那一版：往回的候选必须**在它前面**，否则滚它
+    /// 就是回滚。第一父链是线性的，一旦走到 `floor` 或它更早的地方，后面的候选
+    /// 不可能再满足这一条，所以到那里就收工，不去问 CI。
+    async fn newest_revision_ci_accepts(
+        &self,
+        tip: &str,
+        floor: Option<&str>,
+        limit: usize,
+    ) -> Option<String> {
+        if limit == 0 || tip.len() < 7 || !tip.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let out = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "rev-list",
+                    "--first-parent",
+                    "-n",
+                    &limit.to_string(),
+                    tip,
+                ],
+                None,
+                30,
+            )
+            .await
+            .ok()?;
+        for rev in out.lines().map(str::trim).filter(|r| !r.is_empty()) {
+            // 头自己刚才已经问过了，答案是不通过——不必再问一次。
+            if rev == tip {
+                continue;
+            }
+            if let Some(floor) = floor {
+                // 走到已经上线的那一版就停：它就是集群上正跑着的，往前没有更旧的
+                // 候选值得再往回翻——那是回滚，不是追上去。
+                if rev == floor {
+                    return None;
+                }
+                // 判不出祖先关系（读 git 失败）时按「不能滚」处理：宁可这一轮
+                // 停着，也不把一个来历不明的版本送进集群。
+                match self.is_ancestor_checked(floor, rev).await {
+                    Some(true) => {}
+                    _ => return None,
+                }
+            }
+            let (verdict, _, _, _, _) = self.ci_verdict_with_failures(rev, CiAsk::RoundHead).await;
+            if verdict != Some(false) {
+                return Some(rev.to_string());
+            }
+        }
+        None
     }
 
     /// 记下这一拍看到的 main head，并数出上一拍之后「从没被任何一拍当过目标」的 rev。
@@ -7382,11 +7460,19 @@ impl MainlineDeployer {
                 // 上来，滚上来就是「主线被扣住、推不动」的反证。不清的话，起点会跟着
                 // 后面那些「上游还在跑」的轮一次次按新的时间戳重发，四小时那条规则
                 // 就会在一条正在往前滚的主线上亮——而它写的正是「主线停住了」。
-                if state.ci_hold_run_since_unix.take().is_some() {
-                    self.record_ci_hold_reading(0).await;
+                //
+                // 但「滚上去的是回头的某一版」不是这个反证：那一版本来就没被判红，
+                // 头上的红原封不动地还在。`ci_hold` 仍是 `Some(头)` 正是这种落地的
+                // 记号——正常放行的那条路在上面已经把这一次扣住 take 掉了，收工时它
+                // 是 `None`。此时把读数清零，等于给一条头一直在红、只是绕着走的
+                // 主线发一张「已经恢复」的通行证，而四小时那条规则就此永久沉默。
+                if state.ci_hold.is_none() {
+                    if state.ci_hold_run_since_unix.take().is_some() {
+                        self.record_ci_hold_reading(0).await;
+                    }
+                    // 这一版滚上去了，也就没有扣住可言：两条时长读数一起收回。
+                    self.record_ci_hold_active(false).await;
                 }
-                // 这一版滚上去了，也就没有扣住可言：两条时长读数一起收回。
-                self.record_ci_hold_active(false).await;
                 self.save_state(&state)?;
                 return Ok(());
             }
@@ -7628,15 +7714,55 @@ impl MainlineDeployer {
         // 追上来，这条路径自己恢复。这里问的是第一次；第二次在拿构建槽之前
         // （构建跑完才发现红，白跑的是十六分钟的槽），第三次在真要派 Job 之前
         // （见 `roll_out`），每两次之间隔着的那段正是它要补上的窗口。
+        let mut rolling_around_a_red_head = false;
         if self
             .hold_if_ci_reports_failure(&mut state, &bare, CiAsk::RoundHead)
             .await?
         {
-            // 被 CI 扣住的轮同样「还在等构建场」，只是走不到下面的被拒分支。
-            self.renew_advance_reservation(&mut state)?;
-            return Ok(());
+            // 头被判定为红，不等于这一轮不滚：往回数到最近一版上游**没有判红**
+            // 的修订，滚那一版。
+            //
+            // 这条分支是「主线被扣住」与「主线停住」之间的区别。头上的修订被判红
+            // 只是说「最新那一版不能用」，而二十分钟的 CI 与几分钟一版的落地节奏
+            // 让这几乎总是同时成立几版：被扣住的那一版往往在下一拍就不再是头了。
+            // 实测 2026-11-05：一次部署落地之后，从 07:20 到 15:11 没有第二次，
+            // 其间十七次扣住**全部**以「被扣的那一版已经不是头」收场——等一个追
+            // 不上的东西，就是停在那里。往回数则主线一直在往前，红的头由它自己
+            // 的修复行去追。
+            //
+            // 找不到可滚的版本（往回那几版也全是红的，或者读不出它们的判词）才
+            // 停：那时停下来是对的，因为确实没有一版是可以送进集群的。
+            match self
+                .newest_revision_ci_accepts(
+                    &bare,
+                    state.last_good_rev.as_deref(),
+                    CI_RED_HEAD_LOOKBACK,
+                )
+                .await
+            {
+                Some(behind) => {
+                    info!(
+                        held_rev = %rev12(&bare),
+                        rev = %rev12(&behind),
+                        "the head is red upstream; rolling the newest revision behind it that CI did \
+                         not fail, instead of standing still"
+                    );
+                    bare = behind;
+                    rolling_around_a_red_head = true;
+                }
+                None => {
+                    // 被 CI 扣住的轮同样「还在等构建场」，只是走不到下面的被拒分支。
+                    self.renew_advance_reservation(&mut state)?;
+                    return Ok(());
+                }
+            }
         }
-        if let Some(held) = state.ci_hold.take() {
+        // 绕开红头的那一轮没有「扣住结束」可收：扣住说的还是头上那一版，它没有
+        // 变绿，只是这一轮不从它推。走了下面这一段就会把这一次扣住记成
+        // `rev_no_longer_tracked`，连带把头那条修复行退掉——而它正被需要。
+        if rolling_around_a_red_head {
+            self.save_state(&state)?;
+        } else if let Some(held) = state.ci_hold.take() {
             // 结局要在 take 的同时落下来：状态里的 `ci_hold` 一清，这一次扣住就只剩
             // 这一行日志——而日志随滚动消失。问法是上面那一步刚更新过的判词，所以
             // 这里读到的是"结束这一轮问出的东西"，不是扣住开始时的那一份。
@@ -16263,6 +16389,58 @@ exit 0
             .await
             .unwrap();
         assert!(counters.is_empty(), "同一段区间数第二遍：{counters:?}");
+    }
+
+    /// 头上的修订被判红时往回数一版；数到集群上正跑着的那一版就停，绝不回滚。
+    ///
+    /// 这一对断言是「部署有自己的节奏」的全部：往回数让主线在头被判红时继续往
+    /// 前（头跑得比 CI 快，被扣住的往往已经不是头了）；停在已在跑的那一版让
+    /// 「往回数」永远不会退化成回滚——旧版本上集群不是追上，是倒退。
+    #[tokio::test]
+    async fn a_red_head_falls_back_to_the_revision_behind_it_and_never_below_the_one_running() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_a);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+
+        // 裸仓库 A→B→C，集群上跑着 A。
+        real_git(&work, &["fetch", "local", "main"]).await;
+        real_git(&work, &["reset", "--hard", "FETCH_HEAD"]).await;
+        std::fs::write(work.join("lib.rs"), "fn c() {}\n").unwrap();
+        real_git(&work, &["add", "."]).await;
+        real_git(&work, &["commit", "-m", "c"]).await;
+        real_git(&work, &["push", "local", "HEAD:main"]).await;
+        let rev_c = real_git_stdout(&work, &["rev-parse", "HEAD"]).await;
+
+        // 夹具里没有配上游，`ci_verdict_with_failures` 对每一版都答「没有判词」，
+        // 而这条路径与 `hold_if_ci_reports_failure` 用的是同一条判据：没有判词
+        // 不等于判红，可滚。于是这里量的是「往回数到哪一版」，不是「哪一版是绿的」。
+        assert_eq!(
+            deployer
+                .newest_revision_ci_accepts(&rev_c, Some(&rev_a), 12)
+                .await,
+            Some(rev_b.clone()),
+            "头被判红时往回数一版，而不是停住"
+        );
+        assert_eq!(
+            deployer
+                .newest_revision_ci_accepts(&rev_c, Some(&rev_b), 12)
+                .await,
+            None,
+            "再往回就是集群上正跑着的那一版：那是回滚，不是追上去"
+        );
+        assert_eq!(
+            deployer.newest_revision_ci_accepts(&rev_c, None, 0).await,
+            None,
+            "深度为零的搜索没有候选，不能当成「找到了一版」"
+        );
     }
 
     /// 读不出区间的那一拍什么都不许动：基线留在上一拍，下一拍重试同一段。
