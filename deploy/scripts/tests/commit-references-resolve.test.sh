@@ -193,7 +193,53 @@ git add crates
 nested="$(commit 'declare a module under a directory of its own name')"
 out="$("${checker}" --base "${relocated}" --head "${nested}" 2>&1)" || fail "a nested mod was read as missing"$'\n'"${out}"
 
-# 9. An unasked question is never green.
+# 9. Green: the added lines sit inside a literal or a comment that opened on a
+#    line this push did not touch. Judged alone they read as code; read in the
+#    file they were written in, they are prose. This is the shape a census that
+#    strips only the added lines cannot tell apart -- it blocked a real push on
+#    2026-11-05 whose only sin was renaming a name inside a raw-string fixture.
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod ghost;
+#[path = "elsewhere/relocated.rs"]
+pub mod relocated;
+pub mod nested;
+pub fn f() {
+    crate::alpha::g();
+    crate::ghost::g();
+}
+pub const SAMPLE: &str = r#"
+"#;
+pub const NOTE: &str = "x";
+RS
+git add crates
+opened="$(commit 'open a literal and a comment')"
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod ghost;
+#[path = "elsewhere/relocated.rs"]
+pub mod relocated;
+pub mod nested;
+pub fn f() {
+    crate::alpha::g();
+    crate::ghost::g();
+}
+pub const SAMPLE: &str = r#"
+    crate::epsilon::g()
+    crate::zeta::g()
+"#;
+/*
+    crate::eta::g()
+*/
+pub const NOTE: &str = "x";
+RS
+git add crates
+quoted="$(commit 'quote modules on lines added inside an open literal and comment')"
+out="$("${checker}" --base "${opened}" --head "${quoted}" 2>&1)" || fail "a line inside an open literal or comment was read as a reference"$'\n'"${out}"
+
+# 10. An unasked question is never green.
 if "${checker}" --base does-not-exist --head "${nested}" >/dev/null 2>&1; then
   fail "an unresolvable base exited 0"
 fi

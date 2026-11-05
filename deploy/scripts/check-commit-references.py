@@ -86,6 +86,9 @@ def run(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True, check=False)
 
 
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
 def git(*args):
     return run(*args).stdout
 
@@ -116,11 +119,14 @@ def strip_non_code(text):
                     i += 1
         elif c == "r" and re.match(r'r#*"', text[i:]):
             m = re.match(r'r(#*)"', text[i:])
-            hashes, i = m.group(1), i + len(m.group(0))
+            hashes, start = m.group(1), i
             close = '"' + hashes
-            j = text.find(close, i)
+            j = text.find(close, start + len(m.group(0)))
             i = n if j < 0 else j + len(close)
-            out.append(" ")
+            # Keep the line structure: a literal that spans lines is still the
+            # same number of lines once stripped, so a caller can look up the
+            # added lines by number instead of re-reading a fragment.
+            out.append("\n" * text.count("\n", start, i))
         elif c == '"':
             i += 1
             while i < n:
@@ -243,22 +249,42 @@ def main():
         print(f"UNJUDGED  取不到 {args.base}..{args.head} 的差异：{diff.stderr.strip()}", file=sys.stderr)
         return 2
 
+    # Line numbers, not lines: a line added inside a literal or a comment that
+    # opened on an unchanged line cannot be told from code by reading it alone.
+    # Reading the tip's whole file and taking these numbers puts the added lines
+    # back in the context they were written in.
     added = {}
     current = None
+    new_no = 0
     for line in diff.stdout.splitlines():
         if line.startswith("+++ b/"):
             current = line[6:]
-        elif line.startswith("+") and current and current.endswith(".rs"):
-            added.setdefault(current, []).append(line[1:])
+        elif line.startswith("+++ /dev/null"):
+            current = None
+        elif line.startswith("@@"):
+            hunk = HUNK.match(line)
+            new_no = int(hunk.group(1)) if hunk else 0
+        elif current and current.endswith(".rs"):
+            if line.startswith("+"):
+                added.setdefault(current, []).append(new_no)
+                new_no += 1
+            elif line.startswith(" "):
+                new_no += 1
 
     references = {}
     declarations = {}
-    for path, lines in added.items():
+    for path, numbers in added.items():
         m = CRATE_PATH.match(path)
         if not m:
             continue
         crate = m.group(1)
-        code = strip_non_code("\n".join(lines))
+        whole = tip.file(path)
+        if not whole:
+            continue
+        stripped = strip_non_code(whole).split("\n")
+        code = "\n".join(
+            stripped[n - 1] for n in numbers if 0 < n <= len(stripped)
+        )
         for token in TOKEN.findall(code):
             references.setdefault((crate, token), set()).add(path)
         for name in {m.group(1) for m in map(MOD_DECL.match, code.splitlines()) if m}:
