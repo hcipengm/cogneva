@@ -1688,8 +1688,34 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 不碰共享上游也不碰共享库表，所以不需要按部署指定属主——每个进程
         // 调的本来就是自己那套参数。配置解析失败要响亮失败，所以先读配置。
         let pe_config = crate::PolicyEvolutionConfig::load()?;
+        // 启动自报：本进程执行 squad / 持有策略库 / 跑驱动，三格都在这里算成布尔量，
+        // 任一为真而配套不全就逐条 WARN。三格都取自已经在作用域里的值，没有新造判据：
+        //
+        // * `runs_squad`＝`!self.executor_role`。执行器 Pod（这个位为真）跑的是变更，
+        //   不是 squad；真正跑 agent、真正记结局的是另一侧（app）。用的就是本文件
+        //   已有的那个角色位——`spawn_skill_effectiveness_loop` 的第三参、signal
+        //   watcher 的 `owns_self_discovery` 同源，不另开第二个判据。
+        // * `holds_policy_store`＝`self.artifact_evolution.is_some()`。策略库由它持有，
+        //   写侧唯一入口是它的 `evolve`/`store()`。
+        // * `runs_driver`：与紧跟着的武装分支用**同一个**表达式——先算成布尔量再判
+        //   那两支，所以下面说 this process runs the driver 时它确实 spawn 了，
+        //   不会出现自报在跑、实际没起。
+        let runs_squad = !self.executor_role;
+        let holds_policy_store = self.artifact_evolution.is_some();
+        let runs_driver = pe_config.enabled && self.meta_learning.is_some() && holds_policy_store;
+        info!(
+            runs_squad,
+            holds_policy_store,
+            runs_driver,
+            "startup self-report: which of the three roles this process plays"
+        );
+        for gap in role_gaps(runs_squad, holds_policy_store, runs_driver) {
+            warn!(gap, "startup self-report: a role without its complement");
+        }
         if !pe_config.enabled {
             info!("artifact-level evolution driver disabled by config");
+        } else if !runs_driver {
+            info!("artifact-level evolution driver: no meta-learning engine; skipping");
         } else if let (Some(engine), Some(evolution)) =
             (self.meta_learning.clone(), self.artifact_evolution.clone())
         {
@@ -1718,8 +1744,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 ),
                 shutdown,
             ));
-        } else {
-            info!("artifact-level evolution driver: no meta-learning engine; skipping");
         }
 
         // 学习语料的定期复审。在此之前这份进程里没有任何驱动去调晋级器：
@@ -2079,6 +2103,42 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         info!("ReflectionPlugin shutdown");
         Ok(())
     }
+}
+
+/// 启动自报里缺的那几样配套：空表示三格齐全。
+///
+/// 三格各自成立时都要有另一半，缺一半就是一个半环——驱动在跑却没有策略库
+/// （赢了参数也无处写成新版本）、策略库没人推进（写侧只剩 admin 端点）、
+/// 驱动跑在「不执行 squad」的进程上（它自己那本决策账几乎永远样本不足，
+/// 而证据在跑 squad 的那一侧）、squad 那一侧没有驱动（账越记越厚，策略
+/// 版本不动）。每条只说自己缺的那一样，逐条 WARN 由调用点做。
+fn role_gaps(runs_squad: bool, holds_policy_store: bool, runs_driver: bool) -> Vec<&'static str> {
+    let mut gaps = Vec::new();
+    if runs_driver && !holds_policy_store {
+        gaps.push(
+            "runs the driver but holds no policy store: a winning parameter set has nowhere \
+             to become a new version",
+        );
+    }
+    if holds_policy_store && !runs_driver {
+        gaps.push(
+            "holds the policy store but runs no driver: nothing turns a recorded decision \
+             into a new version, so the write side is the admin endpoint alone",
+        );
+    }
+    if runs_driver && !runs_squad {
+        gaps.push(
+            "runs the driver but not the squad: its own decision ledger stays short of \
+             evidence, and the evidence is on the side that runs the squad",
+        );
+    }
+    if runs_squad && !runs_driver {
+        gaps.push(
+            "runs the squad but no driver: decisions keep being recorded and the policy \
+             version never moves",
+        );
+    }
+    gaps
 }
 
 /// 当前运行版本号：部署注入的 COGNEVA_VERSION 优先（进化 Pod 种子即按它
