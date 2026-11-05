@@ -575,6 +575,45 @@ fn render_varying_half_after_request(payload: &serde_json::Value) -> Option<Stri
     (!members.is_empty()).then(|| format!("{{{}}}", members.join(",")))
 }
 
+/// Take the attachments out of the document and hand them back as media blocks.
+///
+/// An attachment left in the document reaches the model as base64 prose: bytes
+/// it cannot read as a picture, charged for by the token. So the key is lifted
+/// out before the rest is rendered — the model sees the picture and the text,
+/// not a picture's worth of text.
+///
+/// The shape is the one producers write: an array of `{"data_base64": …,
+/// "mime_type": …}`. Entries without data are dropped rather than turned into
+/// empty media blocks, and a missing MIME type reads as opaque bytes instead of
+/// guessing a format the bytes may not be.
+fn take_media(mut payload: serde_json::Value) -> (Vec<cog_core::ContentBlock>, serde_json::Value) {
+    let taken = payload
+        .as_object_mut()
+        .and_then(|doc| doc.remove(cog_core::contract::prompt::MEDIA_KEY));
+    let entries = match taken {
+        None | Some(serde_json::Value::Null) => return (Vec::new(), payload),
+        Some(serde_json::Value::Array(items)) => items,
+        Some(one) => vec![one],
+    };
+    let blocks: Vec<cog_core::ContentBlock> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let data = entry.get("data_base64")?.as_str()?.trim();
+            if data.is_empty() {
+                return None;
+            }
+            let mime_type = entry
+                .get("mime_type")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|mime| !mime.is_empty())
+                .unwrap_or("application/octet-stream");
+            Some(cog_core::ContentBlock::media(data, mime_type))
+        })
+        .collect();
+    (blocks, payload)
+}
+
 /// The text of an assistant turn, as the loop reads it.
 /// Text blocks win; reasoning-only models (e.g. kimi-k2.6) put the answer in
 /// thinking/reasoning blocks instead, so those are the fallback rather than a
@@ -650,12 +689,8 @@ impl AgentRuntime {
     }
 
     pub fn new(mut config: RuntimeConfig, event_tx: mpsc::Sender<AgentEvent>) -> Self {
-        // 技能面写下的界只是这个角色的起点；没写就没有界。写成「没写就取 10」
-        // 会让每一个角色都被同一个没人量过的数字裁着，而它裁的恰恰是「这一轮还
-        // 要不要接着干」——2026-11-05 实测 generator 在第十轮带着一个没跑完的
-        // 工具调用被砍，下一轮从头再来，同一条 CI 红修了六版。
-        if let Some(iterations) = config.skill_config.as_ref().and_then(|s| s.max_iterations) {
-            config.max_iterations = iterations;
+        if let Some(ref skill) = config.skill_config {
+            config.max_iterations = skill.max_iterations;
         }
         // 预算由这个角色自己跑出来的读数推：种子（配置面或技能面）只在还没有
         // 观测时生效。写死一个数在这里就是把它交给一个永远不知道工作量的常量，
@@ -1621,11 +1656,23 @@ impl AgentRuntime {
                 .iter()
                 .any(|m| m.content().contains(&sent))
         });
+        // 附件先取出来，渲染的文档里就不能再有它们：留在文档里，同一段字节会
+        // 作为 base64 文本再进一次提示词，模型读不懂它，钱还是照付。
+        let (media, payload) = take_media(payload);
         let rendered = repeated_request
             .then(|| render_varying_half_after_request(&payload))
             .flatten()
             .unwrap_or_else(|| cog_core::contract::prompt::render_varying_half(&payload));
-        self.context.add_message(Message::user(rendered));
+        if media.is_empty() {
+            self.context.add_message(Message::user(rendered));
+        } else {
+            // 截图与录屏要作为媒体块交给模型，它才看得见——这是通用循环的
+            // 能力，不该只有某一条专用判定路径有。
+            let mut blocks = Vec::with_capacity(media.len() + 1);
+            blocks.push(cog_core::ContentBlock::text(rendered));
+            blocks.extend(media);
+            self.context.add_message(Message::user_blocks(blocks));
+        }
 
         self.run_loop(llm, run_task_id).await
     }
@@ -3100,7 +3147,7 @@ mod tests {
             name: "Custom Planner".into(),
             system_prompt: "You are a custom planning expert.".into(),
             tools: vec!["md".into()],
-            max_iterations: Some(42),
+            max_iterations: 42,
             role_type: "planner".into(),
         };
 
@@ -3133,7 +3180,7 @@ mod tests {
             name: "Fast Evaluator".into(),
             system_prompt: "Evaluate quickly.".into(),
             tools: vec![],
-            max_iterations: Some(3),
+            max_iterations: 3,
             role_type: "evaluator".into(),
         };
 
@@ -3217,7 +3264,7 @@ mod tests {
             name: role.into(),
             system_prompt: String::new(),
             tools: tools.iter().map(|t| (*t).into()).collect(),
-            max_iterations: Some(5),
+            max_iterations: 5,
             role_type: role.into(),
         }
     }
@@ -4792,6 +4839,71 @@ mod tests {
         );
     }
 
+    /// 材料里带的截图要作为媒体块递到模型面前，而不是当作 base64 文本。
+    ///
+    /// 判据看的是模型这一侧真正收到了什么：一个 `Media` 块带着原样的字节与
+    /// MIME，而用户消息的文字里既没有那段 base64、也没有 `media` 这个键。
+    /// 只断言「跑通了」的话，把附件塞回文档里照样绿——而那正是被删掉的那种做法。
+    #[tokio::test]
+    async fn an_attachment_reaches_the_model_as_a_media_block() {
+        let llm = RecordingLlm::default();
+        let mut runtime = census_runtime("media-blocks");
+        runtime
+            .run(
+                serde_json::json!({
+                    "task": {"id": "t1"},
+                    "media": [
+                        {"data_base64": "iVBORw0KGgo=", "mime_type": "image/png"},
+                        {"data_base64": "", "mime_type": "image/png"},
+                    ],
+                }),
+                &llm,
+            )
+            .await
+            .expect("the run delivers");
+
+        let calls = llm.calls();
+        let user = calls[0]
+            .iter()
+            .rev()
+            .find(|m| matches!(m, Message::User { .. }))
+            .expect("a user message");
+        let Message::User {
+            content: blocks, ..
+        } = user
+        else {
+            unreachable!("the message was matched as a user message")
+        };
+        let media: Vec<_> = blocks.iter().filter(|b| b.is_media()).collect();
+        assert_eq!(
+            media.len(),
+            1,
+            "one attachment, and the empty one is not a block"
+        );
+        let cog_core::ContentBlock::Media { data, mime_type } = media[0] else {
+            unreachable!()
+        };
+        assert_eq!(data, "iVBORw0KGgo=");
+        assert_eq!(mime_type, "image/png");
+        assert!(
+            !user.content().contains("iVBORw0KGgo="),
+            "字节只能以媒体块的形式出现一次，不能同时作为文本再付一次钱"
+        );
+    }
+
+    /// 没有附件时文档原样渲染：一条纯文本用户消息，不多一个块。
+    #[test]
+    fn a_document_without_attachments_renders_as_text_alone() {
+        let (media, payload) = take_media(serde_json::json!({"task": {"id": "t1"}}));
+        assert!(media.is_empty());
+        assert_eq!(payload, serde_json::json!({"task": {"id": "t1"}}));
+
+        // 空数组也算没有附件，但键本身仍然要被取走。
+        let (media, payload) = take_media(serde_json::json!({"task": 1, "media": []}));
+        assert!(media.is_empty());
+        assert!(payload.get("media").is_none());
+    }
+
     /// 请求块的两种渲染必须与契约自己那一份逐字节对得上。
     ///
     /// 这里拿 `request_members` 的串去比对对话里已经有的内容，再决定还发不发
@@ -6005,7 +6117,7 @@ mod tests {
             name: "Skill Outcome Test".into(),
             system_prompt: String::new(),
             tools: Vec::new(),
-            max_iterations: Some(1),
+            max_iterations: 1,
             role_type: "skill-outcome-role".into(),
         };
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);

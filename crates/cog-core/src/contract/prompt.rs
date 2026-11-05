@@ -39,6 +39,14 @@ use crate::PromptProvider;
 /// The key that carries the stable half of an input document.
 pub const PROMPT_CONTRACT_KEY: &str = "contract";
 
+/// 材料里附带的图片 / 音视频，形如 `[{"data_base64": …, "mime_type": …}]`。
+///
+/// 它必须作为**真正的媒体块**递到模型面前。留在文档里让人序列化，模型读到的
+/// 是一段 base64 文本，而不是那张截图——同一批字节按文本付一次钱，还看不见。
+/// 键名在生产者（场景把附件放进材料）与消费者（运行时把它拆成内容块）两边各
+/// 拼一次，所以它只在这里拼。
+pub const MEDIA_KEY: &str = "media";
+
 /// The store declared prompt templates are read from.
 ///
 /// [`PromptProvider`] is the one-answer face -- get a key, render a key -- and is
