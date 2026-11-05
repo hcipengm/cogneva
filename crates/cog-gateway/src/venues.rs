@@ -106,7 +106,7 @@ pub fn read_venues(tasks: &[cog_core::Task], now: DateTime<Utc>) -> Vec<VenueRea
                 let newer = row
                     .latest
                     .as_ref()
-                    .map_or(true, |held| task.updated_at > held.at);
+                    .is_none_or(|held| task.updated_at > held.at);
                 if newer {
                     row.latest = Some(VenueVerdict {
                         task_id: task.id.clone(),
