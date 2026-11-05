@@ -1589,10 +1589,15 @@ impl CiHoldOwner {
 /// 读不出来的那一半，而它正是接手的人要做的第一件事。空着时这段不提，也不能凭空补
 /// 一句「原因未知」——没问到时，这一层对原因确实是零信息，说成"已知的未知"会让下面
 /// 的人以为有人看过。
+///
+/// `attempted` 是这一版上已经办完的几轮（见 [`ci_hold_attempts_note`]）。第一轮它是
+/// 空的，题面与没有这一段时逐字相同；有它时多出一段「前面几轮各交了什么」。没有这
+/// 一段，第二轮收到的是与第一轮逐字相同的题面，而同一份题面在第几轮都只有一个回答。
 pub(crate) fn ci_hold_goal_text(
     rev: &str,
     failed_checks: &[String],
     evidence: &[CheckEvidence],
+    attempted: &[CiHoldAttempt],
 ) -> String {
     let checks = if failed_checks.is_empty() {
         "上游没有给出具体的检查名（结论来自提交状态接口），请到那一版的 Actions 页读出失败的是哪几条"
@@ -1618,16 +1623,113 @@ pub(crate) fn ci_hold_goal_text(
         );
         said
     };
+    // 单独成段：它说的是「前面几轮」，与上面那段「这一版为什么红」不是同一件事，
+    // 接在同一行里读起来会像是这一次的失败原因之一。
+    let tried = ci_hold_attempts_note(attempted)
+        .map(|note| format!("\n\n{note}"))
+        .unwrap_or_default();
+    // 可落地的范围与贡献门是同一句措辞（见 [`cog_core::CONTRIBUTABLE_SURFACES`]）。
+    // 写在这里，是因为「修 CI」最直接的读法就是改 CI 自己的文件，而那条路走不通：
+    // 2026-11-05 实测一条修法把 `fetch-depth: 0` 加进 `.github/workflows/ci.yml`，
+    // 读明白得没错，可那一版在沙箱跑起来之前就被贡献门收口——变更退休，主线还是
+    // 红的，下一轮又提了同样的改动。
+    let reachable = format!(
+        "\n改动必须落在贡献门接受的范围内：{}。\
+         改 CI 工作流（`.github/workflows/**`）或这些范围以外的路会在沙箱跑起来之前就被拒掉，\
+         这一轮就白跑了；CI 判红的修法只能落在代码里。",
+        cog_core::CONTRIBUTABLE_SURFACES
+    );
     format!(
         "Make upstream CI green again for mainline {}\n\n\
-         主线提交 {} 在上游 CI 上被判为失败，部署器已扣住这一版不发版。失败的检查：{}。{}\
+         主线提交 {} 在上游 CI 上被判为失败，部署器已扣住这一版不发版。失败的检查：{}。{}{}{}\
          判据是新的 main 提交在同一组检查上全绿，且这一版被它取代；只有那时部署器才会放开滚动。",
         rev12(rev),
         rev,
         checks,
         next,
+        reachable,
+        tried,
     )
 }
+
+/// 同一版上已经办完的一轮修法，从那一行自己身上读回来。
+///
+/// 「这一版还是红的」这一句部署器本来就有；它答不出的三件事在这里：那一轮**交没
+/// 交东西**、行是怎么办完的、它自己说卡在哪。三件事分开记，因为下一轮该怎么开
+/// 完全不同——交了不对要接着改，什么也没交要换做法，行跑挂了要看它挂在哪儿。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CiHoldAttempt {
+    /// 这一版上的第几次修法，从 1 起。
+    pub round: usize,
+    /// 那一行结束时的状态，按任务状态自己那个拼写。
+    pub ended: String,
+    /// 它交给平台的改动条数。0 读作「什么也没有交」。
+    pub changes: usize,
+    /// 行上记下的错误文本。
+    pub said: Option<String>,
+}
+
+/// 从一行读回它这一次尝试。
+///
+/// 改动条数读结果里的 `change_ids`：执行器在自演化任务跑完之后写这一格，即使为空
+/// 也照样写，为的就是让后来的人分得出「这次没有可交的」与「交了却没有落地」。读
+/// 不到这一格与读到空数组在这一层同记 0——这一层能交给下一轮的那半句是一样的：
+/// 这条路上没有东西落地。
+pub(crate) fn ci_hold_attempt(task: &cog_core::Task, round: usize) -> CiHoldAttempt {
+    let changes = task
+        .result
+        .as_ref()
+        .and_then(|read| read.get("change_ids"))
+        .and_then(|ids| ids.as_array())
+        .map(|ids| ids.len())
+        .unwrap_or(0);
+    CiHoldAttempt {
+        round,
+        ended: task.status.as_str().to_string(),
+        changes,
+        said: task.error.clone(),
+    }
+}
+
+/// 前几轮的结果，写成下一轮必须先从这儿读起的那一段。空切片返回 `None`。
+///
+/// 这段话存在的理由是实测出来的：同一版还红着、上一轮已经办完，这两句合起来只
+/// 说一件事——上一轮没让这一版变绿。而 `-r2`、`-r3` 这些 id 只在版号没变时才出现
+/// （id 由版号、扣住起点与日期推出），每加一轮都在确认上一轮白跑。2026-11-05 实测
+/// `-fix` 与 `-fix-r2` 收到的是逐字相同的题面，第二轮的回话也是同一句「这一轮也
+/// 没有交出改动」——同一份题面原样再问一次，模型没有理由给出不同的答案。
+pub(crate) fn ci_hold_attempts_note(attempted: &[CiHoldAttempt]) -> Option<String> {
+    if attempted.is_empty() {
+        return None;
+    }
+    let mut said = String::from("这一版上已经办完的几轮都在这里，它们都没有把这一版变绿：\n");
+    for attempt in attempted {
+        said.push_str(&format!(
+            "- 第 {} 轮（{}）：交上来的改动 {} 条。",
+            attempt.round, attempt.ended, attempt.changes
+        ));
+        if let Some(reason) = attempt.said.as_deref().map(str::trim) {
+            if !reason.is_empty() {
+                let kept: String = reason.chars().take(CI_HOLD_ATTEMPT_SAID_MAX).collect();
+                said.push_str(&format!("那一行自己的结论：{kept}"));
+            }
+        }
+        said.push('\n');
+    }
+    said.push_str(
+        "同一份题面原样再问一次不会有不同的答案。这一轮换一种做法：先在本地把那几条测试跑红、\
+         读出它们到底断言什么，再决定改哪里；交能落地的改动，不交分析。真的做不到，就在结论里\
+         写清卡在哪一条命令、它输出了什么——那几句话是下一轮唯一能用的东西。\n",
+    );
+    Some(said)
+}
+
+/// 一轮的结论带进下一轮时的长度上限。这段是提示不是日志，读到卡在哪一步就够。
+const CI_HOLD_ATTEMPT_SAID_MAX: usize = 200;
+
+/// 最多回顾最近几轮。每一条都要问一次图，而扣住可以跨几个小时，行数没有上界；
+/// 答的问题也只是「刚刚那几次为什么没成」，不是全量审计。
+const CI_HOLD_ATTEMPTS_SHOWN: usize = 4;
 
 /// 这次失败是不是已经见过的那一处坏。证据取不到（`None`）时不做区分：读不出
 /// 落点的失败恰是"判不准"，它不排除"和上次同因"，按同因记——判不准就往停下的一
@@ -5138,8 +5240,16 @@ impl MainlineDeployer {
             .as_ref()
             .map(|held| held.since_unix)
             .unwrap_or(now);
+        // 这一版上前几轮开出去的行：它们全都办完了还是回到这里，本身就是「那些
+        // 修法没有把它变绿」的唯一证据。取在派发之前——派发这一轮开出去的行还在
+        // 后面才落进 `rows`，混进来就是拿这一轮自己当上一轮。
+        let prior_rows = state
+            .ci_hold
+            .as_ref()
+            .map(|held| held.rows.clone())
+            .unwrap_or_default();
         let (owner, rows) = self
-            .dispatch_ci_remediation(rev, &failed_checks, since_unix)
+            .dispatch_ci_remediation(rev, &failed_checks, since_unix, &prior_rows)
             .await;
         // 开了哪几行也落盘：扣住结束的那一刻，只有这里还知道它们叫什么（见
         // [`CiHold::rows`]）。同一行每轮都会重开一次，所以只收没记过的。
@@ -5189,6 +5299,7 @@ impl MainlineDeployer {
         rev: &str,
         failed_checks: &[String],
         since_unix: i64,
+        prior_rows: &[String],
     ) -> (CiHoldOwner, Vec<String>) {
         let Some(orchestrator) = self.orchestrator.as_ref() else {
             // 这一支此前一句话都不说：告警的判词写着「两种没人管分得开，靠的是当轮
@@ -5207,7 +5318,18 @@ impl MainlineDeployer {
             since_unix,
         );
         let evidence = self.ci_failure_evidence(&id, rev, failed_checks).await;
-        let goal = ci_hold_goal_text(rev, failed_checks, &evidence);
+        let attempted = self.ci_hold_attempts(orchestrator, prior_rows).await;
+        if !attempted.is_empty() {
+            info!(
+                rev = %rev12(rev),
+                rounds = attempted.len(),
+                // 「上一轮交了什么」是这一轮改做法的依据，而它从这一刻起在题面里，
+                // 不再只在某个已经滚掉的日志行里。
+                previous_changes = attempted.iter().map(|a| a.changes as u64).sum::<u64>(),
+                "carrying the earlier repair rounds into this round's goal"
+            );
+        }
+        let goal = ci_hold_goal_text(rev, failed_checks, &evidence, &attempted);
         let mut row = cog_core::Task::goal_row(id.clone(), &goal);
         // The row is the goal's identity marker and is never executed: the
         // planner decomposes it and the children carry the work. It is not
@@ -5362,6 +5484,31 @@ impl MainlineDeployer {
             }
         }
         false
+    }
+
+    /// 这一版上前几轮各自怎么结束的，取最近 [`CI_HOLD_ATTEMPTS_SHOWN`] 条。
+    ///
+    /// 只读办完的：还在跑的那一轮不是「试过了没成」，把它写进题面会让下一轮以为
+    /// 自己可以换个做法，而手上那一份其实还在飞。序号按它们被开出去的位置算，
+    /// 所以下一轮读到的「第几轮」与图上那一行的来历对得上。
+    async fn ci_hold_attempts(
+        &self,
+        orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
+        prior_rows: &[String],
+    ) -> Vec<CiHoldAttempt> {
+        let start = prior_rows.len().saturating_sub(CI_HOLD_ATTEMPTS_SHOWN);
+        let mut out = Vec::new();
+        for (offset, id) in prior_rows[start..].iter().enumerate() {
+            let Some(task) = orchestrator.get_task(id).await else {
+                continue;
+            };
+            // 目标锚点也在这份名单里，而它不是一次尝试：它不执行，永远停在原处。
+            // 把它算进轮次会让「第几轮」与实际派发次数对不上。
+            if task.is_executable && task.status.is_terminal() {
+                out.push(ci_hold_attempt(&task, start + offset + 1));
+            }
+        }
+        out
     }
 
     /// 这一次扣住该落在哪一行上。
@@ -14216,6 +14363,66 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
     }
 
     #[test]
+    fn a_repair_round_that_delivered_nothing_is_told_to_the_next_one() {
+        let mut finished = cog_core::Task::new(
+            "ci-red-aaaa-fix".to_string(),
+            cog_core::TaskType::Custom("ci_hold_fix".into()),
+            serde_json::json!({}),
+        );
+        finished.status = cog_core::TaskStatus::Completed;
+        // 执行器把这一格写进结果，空数组也写：这就是「跑了、但什么也没交」的
+        // 唯一可读形状，也是下一轮该换做法的依据。
+        finished.result = Some(serde_json::json!({ "change_ids": [] }));
+        let empty_round = ci_hold_attempt(&finished, 1);
+        assert_eq!(empty_round.changes, 0);
+        assert_eq!(empty_round.ended, "completed");
+
+        let mut landed = cog_core::Task::new(
+            "ci-red-aaaa-fix-r2".to_string(),
+            cog_core::TaskType::Custom("ci_hold_fix".into()),
+            serde_json::json!({}),
+        );
+        landed.status = cog_core::TaskStatus::Completed;
+        landed.result = Some(serde_json::json!({ "change_ids": ["ci-red-aaaa-fix-r2-9f3c1a"] }));
+        landed.error = Some("  ".into());
+        let landed_round = ci_hold_attempt(&landed, 2);
+        assert_eq!(landed_round.changes, 1);
+        // 只有空白的原因不是原因：写进去会让下一轮以为那一行说了什么。
+        let note = ci_hold_attempts_note(&[empty_round.clone(), landed_round.clone()])
+            .expect("two rounds is a note");
+        assert!(
+            note.contains("第 1 轮（completed）：交上来的改动 0 条"),
+            "{note}"
+        );
+        assert!(
+            note.contains("第 2 轮（completed）：交上来的改动 1 条"),
+            "{note}"
+        );
+        assert!(!note.contains("那一行自己的结论"), "{note}");
+
+        // 第一轮的题面里不该有这一段：两轮收到逐字相同的题面，正是 2026-11-05
+        // 实测的那件事——第二轮的回答也是同一句「这一轮也没有交出改动」。
+        let first = ci_hold_goal_text("aaaa", &["Test".into()], &[], &[]);
+        let second = ci_hold_goal_text(
+            "aaaa",
+            &["Test".into()],
+            &[],
+            std::slice::from_ref(&empty_round),
+        );
+        assert!(!first.contains("第 1 轮"));
+        // 第一轮就要知道哪些路走得通：贡献门拒掉的范围与它读的同一句话是同一个
+        // 常量，所以这条断言在两侧任一侧改了措辞时都会亮。
+        assert!(first.contains(cog_core::CONTRIBUTABLE_SURFACES), "{first}");
+        assert!(
+            first.contains(".github/workflows/**"),
+            "修 CI 最直接的读法是改 CI 自己的文件，题面必须先把这条堵死：{first}"
+        );
+        assert!(second.contains("第 1 轮"), "{second}");
+        assert_ne!(first, second);
+        assert_eq!(ci_hold_attempts_note(&[]), None);
+    }
+
+    #[test]
     fn failure_signatures_round_trip_through_the_termination_message() {
         let sig = failure_signature(
             FailureClass::Version,
@@ -17504,7 +17711,7 @@ exec {real} "$@"
         let first_fix = ci_hold_fix_task_id("abc123", &day, 100);
 
         let (owner, first_rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100)
+            .dispatch_ci_remediation("abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         assert!(first_rows.contains(&first_fix), "{first_rows:?}");
@@ -17531,7 +17738,7 @@ exec {real} "$@"
 
         // 同一天、同一版，又一次扣住。
         let (owner, second_rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 300)
+            .dispatch_ci_remediation("abc123", &checks, 300, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         let second_fix = ci_hold_fix_task_id("abc123", &day, 300);
@@ -17565,7 +17772,7 @@ exec {real} "$@"
 
         let checks = vec!["github:Test".to_string()];
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100)
+            .dispatch_ci_remediation("abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
 
@@ -17610,7 +17817,7 @@ exec {real} "$@"
 
         let checks = vec!["github:Code Coverage".to_string()];
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100)
+            .dispatch_ci_remediation("abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
 
@@ -17700,7 +17907,7 @@ exec {real} "$@"
         let first = ci_hold_fix_task_id("abc123", &day, 100);
 
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100)
+            .dispatch_ci_remediation("abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         assert!(rows.contains(&first), "{rows:?}");
@@ -17709,7 +17916,7 @@ exec {real} "$@"
         // 这一行办完了，而扣住还站着：CI 仍然红。
         planner.mark_completed(&first);
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100)
+            .dispatch_ci_remediation("abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         let second = format!("{first}-r2");
@@ -17753,7 +17960,7 @@ exec {real} "$@"
 
         let checks = vec!["github:Test".to_string()];
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100)
+            .dispatch_ci_remediation("abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         assert!(

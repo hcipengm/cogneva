@@ -2177,10 +2177,9 @@ pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
         Ok(())
     } else {
         Err(CogGitHubError::PrivacyRejected(format!(
-            "change touches non-contributable paths: {} \
-             (whitelist: crates/<workspace member>/{{src,tests}}/**/*.rs, \
-             prompts/**, deploy/**, root README/CHANGELOG)",
-            denied.join(", ")
+            "change touches non-contributable paths: {} (whitelist: {})",
+            denied.join(", "),
+            cog_core::CONTRIBUTABLE_SURFACES
         )))
     }
 }

@@ -172,6 +172,20 @@ pub struct GeneratedChange {
 /// This is the criterion, not the outcome. Whether a refused change is retired
 /// or retried, and whether the refusal is terminal, are separate questions the
 /// caller answers; the cause is what the caller dispatches on when it decides.
+/// The surfaces a generated change may touch, in the words both readers use.
+///
+/// Two readers, one wording: the gate that refuses a diff reaching outside
+/// this set, and the goal a generator is given when it is asked to repair a red
+/// check. Two copies drift, and the drift costs a whole round — on 2026-11-05 a
+/// CI repair read the failure correctly and edited `.github/workflows/ci.yml`
+/// to fix it, which is outside every surface the platform may write; the
+/// privacy gate retired the change after the sandbox had already applied and
+/// built it, and the next round was given the same goal and made the same
+/// edit. Naming the set up front is what lets the generator aim at a repair
+/// that can land.
+pub const CONTRIBUTABLE_SURFACES: &str =
+    "crates/<workspace member>/{src,tests}/**/*.rs, prompts/**, deploy/**, root README/CHANGELOG";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectionCause {
