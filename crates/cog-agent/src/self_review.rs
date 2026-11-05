@@ -551,18 +551,40 @@ impl SelfReviewLoop {
         // 一条都没判出来时，分数没有分母。这不是 0 分也不是满分，是一次没有结论
         // 的评审：调用方保留自己的正文，读数记在这次失败上。
         if judged == 0 {
+            // 同样的道理：整张表都是 `undetermined` 时，判词要说得出它在躲什么。
+            // 第一行连同它的引文一起印出来，读者才知道「判不了」是正文真的没写，
+            // 还是模型根本没去读。
+            let first = table.rows.first();
             return Err(SFError::Validation(format!(
-                "no requirement could be judged from the text: {} undetermined",
-                undetermined.len()
+                "no requirement could be judged from the text: {} undetermined (first row: {:?})",
+                undetermined.len(),
+                first.map(|row| {
+                    format!(
+                        "{} | quoted back: {:?}",
+                        row.requirement.chars().take(120).collect::<String>(),
+                        row.spec_quote.chars().take(120).collect::<String>(),
+                    )
+                }),
             )));
         }
 
         // 一行都指不到规格里时，这次评审没有判过任何规格说过的事。它与空表同一
         // 类：不是通过，也不是没满足，是一次没做成的评审。
+        //
+        // 判词带上第一行的引文与规格的长度：这一句只有两种读法——模型改写过了
+        // （它以为自己在引用），或者规格与它手里的那份不是同一段文字——而两种
+        // 读法要改的地方完全不同。只写「没有一句引得到」时，看日志的人分不出是
+        // 哪一种，只能把同一个问题再量一遍。引文截断在字符边界上，避免一条判词
+        // 因为一段长文本把日志撑爆。
         if unfounded.len() == table.rows.len() {
-            return Err(SFError::Validation(
-                "no requirement the review stated is quoted from the specification".into(),
-            ));
+            let first = unfounded[0];
+            return Err(SFError::Validation(format!(
+                "no requirement the review stated is quoted from the specification \
+                 ({} rows, spec {} chars; first row quoted back: {:?})",
+                unfounded.len(),
+                spec.chars().count(),
+                first.spec_quote.chars().take(200).collect::<String>(),
+            )));
         }
 
         let score = met as f32 / judged as f32;
@@ -1534,9 +1556,20 @@ mod tests {
         let outcome = judge_only
             .review("t1: read the file, then t2: deploy", &llm)
             .await;
+        let err = match outcome {
+            Ok(other) => panic!("引文全都不在规格里，这次评审没有判过规格说过的事：{other:?}"),
+            Err(e) => e.to_string(),
+        };
+        // 判词要把模型交回来的那句引文带上。没有它，看日志的人分不出是模型改写
+        // 过了、还是它手里的规格与这次判的不是同一段文字——两种读法要改的地方
+        // 完全不同，而这两种现场在只有一句「没有一句引得到」时长得一模一样。
         assert!(
-            outcome.is_err(),
-            "引文全都不在规格里，这次评审没有判过规格说过的事：{outcome:?}"
+            err.contains("write a haiku about the sea"),
+            "判词要说得出模型引了什么：{err}"
+        );
+        assert!(
+            err.contains("spec 22 chars"),
+            "判词要带上规格的长度，读的人才知道它手里的规格是不是空的：{err}"
         );
     }
 
