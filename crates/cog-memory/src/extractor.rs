@@ -254,6 +254,13 @@ use cog_core::{execute_structured, ChatOptions, LlmClient, SFError};
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct ExtractedEntity {
     pub(crate) name: String,
+    /// Free-form label for what sort of thing this is. Nothing downstream
+    /// reads it: a row is built from the name, the properties and the
+    /// importance. A caller handing in its own judgment therefore does not
+    /// have to invent one, and refusing the whole judgment because it left
+    /// this out would throw away the judgment to enforce a field no reader
+    /// ever looks at.
+    #[serde(default)]
     pub(crate) kind: String,
     /// Free-form attributes, kept in whatever shape the model wrote them.
     ///
