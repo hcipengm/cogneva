@@ -92,6 +92,20 @@ const SAME_VALUE_DIFFERENT_THING: &[(&str, &str, &str)] = &[
         "独立评审没被问、主持人没被问：两条路径各自的结局，落在同一格上",
     ),
     (
+        "cog-collaboration",
+        "model",
+        "`SELF_REVIEW_DECIDED_BY_MODEL` 是「谁判的」这一格的取值，\
+         `CHANGE_DIFF_SOURCE_MODEL` 是「这份 diff 从哪来」这一格的取值：两个标签键\
+         各自的取值表，落在同一个词上，谁也不读对方的",
+    ),
+    (
+        "cog-collaboration",
+        "not_judged",
+        "`SELF_REVIEW_VERDICT_NOT_JUDGED` 独立评审的判决没判、\
+         `CONSENSUS_FLOOR_NOT_JUDGED` 圆桌的共识地板没判：两条路径各自的结局，\
+         落在同一格上，谁也不读对方的",
+    ),
+    (
         "cog-core",
         "cogneva",
         "二进制名、默认命名空间、主容器名、主 Deployment 名与工作负载名是五个\
