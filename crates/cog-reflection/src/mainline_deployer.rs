@@ -16796,7 +16796,7 @@ exit 0
             "这一次扣住开出去、还一行没跑的行要跟着收：{cancels:?}"
         );
         assert!(
-            cancels[0].1.contains("superseded") && cancels[0].1.contains(&rev12(&rev_a)),
+            cancels[0].1.contains("superseded") && cancels[0].1.contains(rev12(&rev_a)),
             "退行的理由要点名哪一种结局、哪一版：{}",
             cancels[0].1
         );
