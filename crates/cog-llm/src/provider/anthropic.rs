@@ -105,10 +105,29 @@ impl AnthropicProvider {
     }
 
     fn build_request_body(&self, messages: &[Message], options: &ChatOptions) -> serde_json::Value {
-        let system = messages.iter().find_map(|m| match m {
-            Message::System { content, .. } => Some(content.clone()),
-            _ => None,
-        });
+        // Every system message goes into the one `system` field, in order.
+        //
+        // This protocol carries a single system prompt, so a list of them has to
+        // be joined; taking the first and dropping the rest is the one option
+        // that cannot be noticed from here — the request is well formed, the
+        // model simply never reads the other instructions. Two producers can put
+        // a system message in front of a call (the answer schema and the run's
+        // own instructions), and which one is first depends on the caller.
+        let system = {
+            let parts: Vec<&str> = messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::System { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .filter(|content| !content.trim().is_empty())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        };
 
         let msgs: Vec<serde_json::Value> = messages
             .iter()
@@ -1011,6 +1030,28 @@ mod tests {
             .as_array()
             .expect("a default request must mark the system prefix, or this face never caches");
         assert!(system.last().unwrap()["cache_control"].is_object());
+    }
+
+    /// 两条 system 都要送到模型面前，不是只送第一条。
+    ///
+    /// 这个协议只有一个 `system` 字段，所以多条必须合成一条；取第一条、丢掉
+    /// 其余的那一种写法在这里看不出任何异常——请求是合法的，模型只是从来没读过
+    /// 另一段指示。答案格式与这一轮的指示可以由两个不同的调用方分别放进
+    /// system，谁在前取决于调用点，所以丢哪一条都不对。
+    #[test]
+    fn every_system_message_reaches_the_single_system_field() {
+        let mut messages = conversation();
+        messages.push(Message::system("And answer in Chinese."));
+        let body = body_with(CacheRetention::None, &messages);
+        let system = body["system"].as_str().expect("system 是字符串形状");
+        assert!(
+            system.contains("You are the planner."),
+            "第一条 system 丢了"
+        );
+        assert!(
+            system.contains("And answer in Chinese."),
+            "第二条 system 被静默丢掉了：这条协议只有一个 system 字段，多条必须合并"
+        );
     }
 
     /// 不要求缓存时，请求体与改动之前逐字节一致：这一支是**回归**的判据。

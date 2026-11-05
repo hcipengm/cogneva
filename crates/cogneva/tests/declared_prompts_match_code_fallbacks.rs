@@ -8,9 +8,10 @@
 //! 读，不是用例自己写一份），兜底由 `cog-reflection` 声明。两侧都在这里看得见，而被测
 //! 的两侧不必因此认识对方——那正是这条守卫放在这里的原因。
 //!
-//! 不是每个 key 都有兜底。`chat:employee` 只有声明这一份，代码里没有副本，所以它
-//! 的判据反过来：那一句在生产源码里一次都不许出现。有副本的 key 判「两份是同一句」，
-//! 没副本的 key 判「只有一份」——两个方向都是「改了声明就改到了行为」这条的读数。
+//! 不是每个 key 都有兜底。`agent:default`——平台上每个智能体开头读到的那一段——
+//! 只有声明这一份，代码里没有副本，所以它的判据反过来：那一句在生产源码里一次都
+//! 不许出现。有副本的 key 判「两份是同一句」，没副本的 key 判「只有一份」，两个
+//! 方向都是「改了声明就改到了行为」这条的读数。
 
 use crate::common::rust_production::production_sources;
 use cog_core::contract::prompt::PromptManager as PromptManagerContract;
@@ -23,9 +24,8 @@ use std::sync::Arc;
 /// `prompts/` actually declares in both directions, so a declaration added
 /// or removed without touching this guard fails here rather than dropping
 /// out of coverage.
-const COMPARED: [&str; 6] = [
+const COMPARED: [&str; 5] = [
     "agent:default",
-    "chat:employee",
     "reflection:evolution_refinement",
     "reflection:evolution_refinement_system",
     "reflection:evolution_tool",
@@ -97,29 +97,24 @@ async fn every_declared_prompt_is_the_text_the_code_falls_back_to() {
     // prompt call site against `prompts/` reads the key off the call, and a
     // call it cannot read is a call it cannot check.
     for key in COMPARED {
-        // Bootstrap entry owned by cog-prompt; this crate never asks for it
-        // and so has no fallback to compare against.
+        // `agent:default` 没有代码里的兜底可对：平台上每个智能体开头读到的这段
+        // 话，只该有 `prompts/default.yaml` 里的这一份。只改这一份才算改到了它；
+        // 代码里再写一遍，就成了第二份——改声明的人改不动的那一份。整棵生产源码
+        // 里找不到它的第一句，是「只有一份」这条的唯一读数。
         if key == "agent:default" {
-            continue;
-        }
-        // 这一条没有代码里的兜底可对：Live 面板上那位员工怎么说话，只该有
-        // `prompts/` 里的这一份。只改这一份才算改到了它；代码里再写一遍，
-        // 就成了第二份——改声明的人改不动的那一份。整棵生产源码里找不到它的
-        // 第一句，是「只有一份」这条的唯一读数。
-        if key == "chat:employee" {
-            let declared = pm.get("chat:employee").expect("declared");
+            let declared = pm.get("agent:default").expect("declared");
             let opening = declared
                 .lines()
                 .map(str::trim)
                 .find(|line| !line.is_empty())
-                .expect("chat:employee declares no instruction");
+                .expect("agent:default declares no instruction");
             let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
             for path in production_sources(root) {
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
                 assert!(
                     !text.contains(opening),
-                    "{} carries a second copy of the chat employee's instruction; \
-                     the declaration in prompts/system_prompts.yaml is the only one",
+                    "{} carries a second copy of the agent base instruction; \
+                     the declaration in prompts/default.yaml is the only one",
                     path.display()
                 );
             }

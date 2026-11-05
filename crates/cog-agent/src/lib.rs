@@ -56,6 +56,9 @@ pub use event_bus_sink::EventBusSink;
 // Re-export the canonical AgentState from cog-core so consumers see a single type.
 pub use agent_kernel::{AgentHooks, AgentRuntime, ReActLoop, ReActStep, RuntimeState, RuntimeStep};
 
+/// 把进程的提示词本子交给运行时：每次运行开头那段通用指示从它这里取。
+pub use agent_kernel::base_instruction::install as install_prompt_provider;
+
 /// Open agent-role identifier (not an enum) so new roles can be added
 /// without recompiling `cog-core`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]

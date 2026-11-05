@@ -60,6 +60,48 @@ impl ContextWindow {
         self.trim_if_needed();
     }
 
+    /// 把一段指示并进开头那条 system；对话开头没有 system 就新开一条。
+    ///
+    /// 一段对话只保留一条 system。上游是按条取第一条的（Anthropic 取第一条、
+    /// 其余静默丢掉），两段指示分成两条时，模型收到哪一条取决于上游的实现，
+    /// 而不取决于这里写了什么——那是「静默少告诉模型一件事」，比少一段话更坏。
+    /// 所以合并发生在进入上下文这一步，一处；不在每家上游各写一遍。
+    ///
+    /// 已经有这段就什么都不做：同一个智能体跨轮复用，重复并进去等于同一条
+    /// 指示按轮数计费。
+    pub fn merge_head_system(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let Some(Message::System { content, .. }) = self.messages.first() else {
+            self.prepend_message(Message::system(text));
+            return;
+        };
+        if content.contains(text) {
+            return;
+        }
+        let old = content.clone();
+        let merged = if old.trim().is_empty() {
+            text.to_string()
+        } else {
+            format!("{text}\n\n{old}")
+        };
+        if let Some(Message::System { content, .. }) = self.messages.first_mut() {
+            *content = merged.clone();
+        }
+        // 历史开头与实际开头是同一条：模型读过的那份与系统留的那份要一致。
+        if let Some(Message::System { content, .. }) = self.history.first_mut() {
+            if content == &old {
+                *content = merged.clone();
+            }
+        }
+        self.current_tokens = self
+            .current_tokens
+            .saturating_add(estimate_tokens(&merged))
+            .saturating_sub(estimate_tokens(&old));
+    }
+
     /// Whether the context begins with exactly this system message.
     ///
     /// One agent is reused by the same role across turns (one turn per attempt),
@@ -391,6 +433,62 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    /// 一段指示并进开头那条 system，而不是另开一条。
+    ///
+    /// 上游只认一条 system：分成两条时，模型读到哪一条取决于上游实现。这条判的是
+    /// 形状本身——上下文里从头到尾只有一条 system，两段话都在里面，顺序是「平台
+    /// 那段在前、这一轮自己的在后」。
+    #[test]
+    fn a_second_instruction_is_merged_into_the_head_not_appended() {
+        let mut ctx = ContextWindow::new(10_000);
+        ctx.add_message(Message::system("run's own instruction"));
+        ctx.add_message(Message::user("do the thing"));
+        ctx.merge_head_system("platform base");
+
+        let systems: Vec<&str> = ctx
+            .messages()
+            .iter()
+            .filter_map(|m| match m {
+                Message::System { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(systems.len(), 1, "上下文里只该有一条 system：{systems:?}");
+        assert!(systems[0].starts_with("platform base"), "{systems:?}");
+        assert!(systems[0].ends_with("run's own instruction"), "{systems:?}");
+    }
+
+    /// 已经并过的那段不再并一次。
+    ///
+    /// 同一个智能体跨轮复用：每轮都无条件并进去，同一段指示就按轮数计费，而且
+    /// 每轮的头都在变，上游的前缀缓存一次也命中不了。
+    #[test]
+    fn merging_the_same_instruction_twice_changes_nothing() {
+        let mut ctx = ContextWindow::new(10_000);
+        ctx.add_message(Message::system("run's own instruction"));
+        ctx.merge_head_system("platform base");
+        let once = ctx.messages().to_vec();
+        let tokens = ctx.token_count();
+
+        ctx.merge_head_system("platform base");
+        assert_eq!(ctx.messages(), once.as_slice(), "第二遍合并不该留下痕迹");
+        assert_eq!(ctx.token_count(), tokens, "token 数也不该涨");
+    }
+
+    /// 开头没有 system 时新开一条，而且不碰历史里那条被预算裁掉的内容。
+    #[test]
+    fn a_context_without_a_system_head_gets_one() {
+        let mut ctx = ContextWindow::new(10_000);
+        ctx.add_message(Message::user("hello"));
+        ctx.merge_head_system("platform base");
+
+        assert!(
+            matches!(ctx.messages().first(), Some(Message::System { .. })),
+            "平台那段必须落在最前面"
+        );
+        assert_eq!(ctx.messages().len(), 2, "别的消息不该被丢掉");
+    }
 
     /// 采集面会收到的那些字段，按值取出来——断言「打过日志」是空的，
     /// 一个有字段名写错的读数照样会让它绿。

@@ -1261,7 +1261,18 @@ impl AgentRuntime {
         for message in messages {
             self.context.add_message(message);
         }
+        self.absorb_base_instruction();
         self.run_loop(llm, None).await
+    }
+
+    /// 每个运行开头那段同一的话，来自部署的声明而不是代码里的常量。
+    ///
+    /// 两条入口都要它：一次任务尝试与一轮对话在内核里是同一条循环，只有输入
+    /// 从哪儿来不同；一段话只给其中一条，就等于平台上又有了两类智能体。
+    fn absorb_base_instruction(&mut self) {
+        if let Some(text) = crate::agent_kernel::base_instruction::text() {
+            self.context.merge_head_system(&text);
+        }
     }
 
     /// The prologue every run shares, whichever way its input arrives.
@@ -1640,10 +1651,11 @@ impl AgentRuntime {
             // attempt). A contract already in this position is not inserted a
             // second time: the same text appearing mid-conversation is paid for
             // twice and pushes the stable prefix off the head.
-            if !self.context.starts_with_system(&contract) {
-                self.context.prepend_message(Message::system(contract));
-            }
+            self.context.merge_head_system(&contract);
         }
+        // 平台对每个智能体说的同一段话排在具体指示前面：先是谁都不变的那些
+        // （这是什么地方、事实从哪来），再是这件活自己的要求。
+        self.absorb_base_instruction();
         // The varying half is rendered request-first, so the attempt counter
         // that used to open it does not sit in front of the one block every
         // attempt of a task shares. See `render_varying_half`.

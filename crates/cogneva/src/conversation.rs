@@ -169,13 +169,6 @@ pub struct PlatformConversation {
     /// 三本只读账。读它们回答的是「这件事现在到哪一步了」——答案来自账，不是
     /// 来自印象，也不是从某面墙上抄下来的一段话。
     ledgers: Ledgers,
-    /// 这个进程声明的提示词。这位员工说话的方式是部署的声明，不是编译进二进制
-    /// 的一段常量：声明在 `prompts/` 里，随 ConfigMap 进进程，改了下一轮就生效；
-    /// 写进代码的那一份只能随发版改，而且每个部署说的是同一句话。
-    ///
-    /// 缺席也是如实的：进程没装配提示词插件时，这位员工没有额外指示，而不会
-    /// 退回一段写在兜底里的预设——那会让「改声明」看起来生效、实际没有。
-    prompts: Option<Arc<dyn cog_core::PromptProvider>>,
 }
 
 impl PlatformConversation {
@@ -187,7 +180,6 @@ impl PlatformConversation {
         roster: Option<Arc<dyn cog_core::AgentRegistry>>,
         inbox: Option<Arc<dyn cog_core::MessageBackend>>,
         ledgers: Ledgers,
-        prompts: Option<Arc<dyn cog_core::PromptProvider>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -197,7 +189,6 @@ impl PlatformConversation {
             roster,
             inbox,
             ledgers,
-            prompts,
         }
     }
 }
@@ -284,16 +275,6 @@ impl ConversationTurn for PlatformConversation {
                         history.push(cog_core::Message::user(format!("[同事发来的消息]\n{text}")));
                     }
                 }
-            }
-            // 这一轮读什么指示由声明决定：每轮取一次，ConfigMap 改了下一轮就是
-            // 新的一句，不用重启。取不到就不放这段，也不拿代码里的副本顶上。
-            let persona = self
-                .prompts
-                .as_ref()
-                .and_then(|pm| pm.get("chat:employee"))
-                .filter(|text| !text.trim().is_empty());
-            if let Some(text) = persona {
-                history.insert(0, cog_core::Message::system(text));
             }
             history.extend(request.messages);
 
