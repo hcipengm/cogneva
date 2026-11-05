@@ -2905,7 +2905,11 @@ impl BuildGate {
     /// second claim does not add to it: it only takes the turn from the work that
     /// asked first, whose next ask then comes round on a field someone else is
     /// holding, so its claim never survives to the ask it was made for. A holder
-    /// refreshing its own claim is what keeps a work that keeps losing its place.
+    /// refreshing its own claim keeps its place in the queue, and the claim it
+    /// rewrites keeps the date of the ask that is still unanswered: a renewal
+    /// that moved the date would make the claim fresh forever, and a work that
+    /// asks without ever being let in would wall the field off as long as it
+    /// kept asking.
     /// Returns whether the next build is now this work's to take.
     ///
     /// A false is an answer, not a failure: the turn may belong to another work
@@ -2918,9 +2922,22 @@ impl BuildGate {
         if !self.installed {
             return false;
         }
-        let since = unix_now();
+        let now = unix_now();
         let path = self.dir.join(RESERVE_FILE);
         let previous = self.reservation();
+        // A renewal is not a new claim: rewriting the line keeps the instant of
+        // the ask it answers, so the freshness window counts from the ask that
+        // went unanswered. Restarting the clock on every rewrite is how a work
+        // that never gets the field holds it off for as long as it keeps
+        // asking -- the claim stays fresh by being rewritten, and every build
+        // that would have taken the slot is turned away instead. On 2026-11-05
+        // the build-cache sweep renewed this way every 260s for forty minutes
+        // while the mainline stood down on every round and the host rolled
+        // nothing.
+        let since = match previous.as_ref() {
+            Some((holder, since)) if holder == what => *since,
+            _ => now,
+        };
         // A claim that is already here and fresh belongs to the work that asked
         // first, and it is left to it. Arrivals stand down on the claim itself
         // rather than on who left it, so this ask has nothing to gain by writing
@@ -2980,7 +2997,7 @@ impl BuildGate {
         if let Some((previous_holder, previous_since)) = previous {
             if previous_holder == what {
                 self.renew_gap_seconds[asker_index(what)]
-                    .store(since.saturating_sub(previous_since), Ordering::Relaxed);
+                    .store(now.saturating_sub(previous_since), Ordering::Relaxed);
             }
         }
         true
@@ -4979,6 +4996,61 @@ mod tests {
             gate.reservation().map(|(holder, _)| holder),
             Some("host build".to_string()),
             "the claim still names the work that asked first"
+        );
+    }
+
+    /// A renewal keeps the claim's age, so the freshness window is dated from
+    /// the ask that went unanswered rather than from the last rewrite.
+    ///
+    /// The window is the only thing that lets a build past a claim nobody takes
+    /// -- everything else honours it, and a holder that rewrites the line while
+    /// being refused keeps it fresh forever. On 2026-11-05 the build-cache
+    /// sweep did exactly that: eleven walks in a row found a build running,
+    /// each wrote its claim again 260s after the last, and the mainline stood
+    /// down on every round from 10:24 while the host rolled nothing.
+    #[tokio::test]
+    async fn a_renewed_claim_keeps_the_age_of_the_ask_it_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(BuildGate::new(&BuildGateConfig {
+            enabled: true,
+            max_concurrent: 1,
+            wait_secs: 0,
+            reserve_fresh_secs: 60,
+            lock_dir: dir.path().to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
+        }));
+        // A claim that has stood for most of its window, written by the work
+        // that now renews it. Half the window leaves room for the renewal to
+        // still be honoured while making the date it carries unmistakable.
+        let aged = unix_now() - 30;
+        std::fs::write(
+            dir.path().join(RESERVE_FILE),
+            format!("build-cache-reclaim\t{aged}\n"),
+        )
+        .unwrap();
+
+        assert!(
+            gate.reserve_build_field("build-cache-reclaim"),
+            "a holder renewing its own claim keeps its place in the queue"
+        );
+        assert_eq!(
+            gate.reservation().map(|(_, since)| since),
+            Some(aged),
+            "the renewal restarted the window, so a work that never gets in can hold the \
+             field off for as long as it keeps asking"
+        );
+
+        // The other half, on the same reading: a claim that has stood past the
+        // window is no claim at all, which is what the date above is for.
+        std::fs::write(
+            dir.path().join(RESERVE_FILE),
+            format!("build-cache-reclaim\t{}\n", unix_now() - 61),
+        )
+        .unwrap();
+        assert_eq!(
+            gate.reservation(),
+            None,
+            "a claim past the freshness window still held the next build"
         );
     }
 
