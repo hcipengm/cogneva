@@ -82,6 +82,7 @@ pub use postgres::{
     PostgresResourceEventStore, PostgresSnapshotStore, PostgresStateBackend,
     PostgresTasteIntentStore, PostgresUserStore, SendOutcome, DAG_LOCK_WORKSPACE_SQL,
     EVENTS_PAGE_SQL, LOG_LINES_PER_TASK, ROWS_KEPT_PER_PEER, ROWS_KEPT_PER_SESSION,
+    VENUE_TASKS_SQL,
 };
 
 #[cfg(feature = "redis")]

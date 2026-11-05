@@ -30,6 +30,25 @@ pub const EVENTS_PAGE_SQL: &str = r#"
     LIMIT $3
 "#;
 
+/// The rows the venue board folds, read in one statement.
+///
+/// Named because the statement is the thing that has to hold for the board's
+/// read to be a lookup: the expression index `idx_cog_dag_tasks_venue` answers
+/// this exact text and nothing else, and a copy of it written inline is a
+/// statement nobody measures. A test explains this constant against a table
+/// shaped like the live one and goes red when the plan stops being an index
+/// scan.
+///
+/// The `btrim` clause is a filter after the index, not part of it -- an empty
+/// label and a label of spaces are the same thing (`btrim` of either is empty),
+/// and neither is a venue.
+pub const VENUE_TASKS_SQL: &str = r#"
+    SELECT task FROM cog_dag_tasks
+    WHERE workspace_id = $1
+      AND task->>'venue' IS NOT NULL
+      AND btrim(task->>'venue') <> ''
+"#;
+
 /// 完成 / 失败 / 取消一条任务前，先锁住它所在 workspace 的全部任务行。
 ///
 /// 这条语句同时被多个执行进程跑（同一个 workspace 下不止一个执行器在结算任务），
@@ -158,6 +177,19 @@ CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_face
 ;
 CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_owner_unit
             ON cog_dag_tasks(workspace_id, owner_unit, status)
+;
+-- The venue board's lookup, declared here as well as in the migration that
+-- upgrades existing databases -- because migrations run before this schema
+-- creates the table, so on a fresh install the migration finds nothing to
+-- index and says so. One of the two paths always applies it.
+--
+-- Not partial: an expression's statistics are gathered from the rows its index
+-- covers, so a partial index reports a null fraction of zero and the planner
+-- concludes that nearly every row carries a label (9,891 of 9,991 when it was
+-- tried) -- and then prefers scanning the table to an index scan with that
+-- estimate.
+CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_venue
+            ON cog_dag_tasks(workspace_id, (task->>'venue'))
 ;
 -- 按任务 id 单点找「最近的那一行」，不走工作区。
 --
@@ -809,27 +841,22 @@ impl StateBackend for PostgresStateBackend {
 
     /// 只有带场地标签的那些行；没有标签的整行不进结果。
     ///
-    /// 这一列本来就没有索引——标签在 JSON 里，查询按 `task->>'venue'` 判，
-    /// 走的是顺序扫描；顺序扫的是整块 TOAST 过的正文。一次读回来是这些数
-    /// （实测 2026-11-06）：9,991 行里 9,987 行没有标签，正文合计 42 MB，
-    /// 扫一次 0.9 秒，换回来 4 行。
-    /// 迁移里那个部分索引把这次扫描变成按标签的定位：索引只收带标签的行，
-    /// 所以它的大小跟着场地上的活走，不跟着任务图长。
+    /// 标签在 JSON 里，按 `task->>'venue'` 判，而整张图绝大多数行没有标签
+    /// （实测 2026-11-06：9,991 行里 9,987 行没有，正文合计 42 MB，顺序扫
+    /// 一次 0.9 秒换回 4 行）。这条语句与迁移建的表达式索引同形，所以那次扫描
+    /// 是按标签的定位。索引**不能**是部分索引——部分索引的统计只采它覆盖的
+    /// 那些行，`task->>'venue'` 的非空比例就恒为 1，规划器会以为几乎每行都
+    /// 有标签而放弃索引（实测：同一张表上带谓词的索引一次都没被选中）。
     ///
     /// 终态行必须留下：看板的「最近一条判据」和「写回量」两列读的就是已经
     /// 做完的行，排掉它们会让两列变空，而空的读数和「今天没交活」长得一样。
     async fn dag_get_venue_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
         let rows: Vec<(serde_json::Value,)> = self
             .retry(|| async {
-                sqlx::query_as(
-                    "SELECT task FROM cog_dag_tasks \
-                     WHERE workspace_id = $1 \
-                       AND task->>'venue' IS NOT NULL \
-                       AND btrim(task->>'venue') <> ''",
-                )
-                .bind(workspace_id)
-                .fetch_all(&self.pool)
-                .await
+                sqlx::query_as(VENUE_TASKS_SQL)
+                    .bind(workspace_id)
+                    .fetch_all(&self.pool)
+                    .await
             })
             .await?;
         rows.into_iter()

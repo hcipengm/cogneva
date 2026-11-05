@@ -9,18 +9,37 @@
 -- the scan that found the other four took 0.9 s -- on a board the workbench
 -- polls every 20 seconds.
 --
--- Partial, because the predicate is part of the rule: the board only ever asks
--- for labeled rows, so rows without a label earn no entry. The index
--- therefore grows with the venues' work, not with the task graph -- the graph
--- accumulates history forever, the four rows it hid behind did not.
+-- Not partial, and that is a measurement rather than a preference. The obvious
+-- shape -- index only the labeled rows, so the index grows with the venues'
+-- work instead of with the task graph -- was tried first and the planner never
+-- chose it: `ANALYZE` gathers an expression's statistics from the rows the
+-- index covers, so a partial index's null fraction is zero, the planner reads
+-- that as "effectively every row has a label" (its estimate was 9,891 of
+-- 9,991), and a scan of the whole table beats an index scan that would visit
+-- that many rows. With the predicate dropped the sample spans the table, the
+-- null fraction is real (49 rows), and the same statement plans as an index
+-- scan returning four rows in 0.13 ms instead of 106 ms.
 --
--- The expression and the predicate are spelled exactly as `dag_get_venue_tasks`
--- spells them in its WHERE clause. A functional index is used only when the
--- query's expression matches it, so a reader that trims differently (or that
--- drops the empty-label clause) gets a correct answer and a sequential scan --
--- slower, never wrong. `btrim` of the empty string is the empty string, which
--- is why the same `<> ''` excludes both an empty label and a whitespace one.
+-- The expression is spelled exactly as `dag_get_venue_tasks` spells it, because
+-- a functional index is used only when the query's expression matches it; a
+-- reader that trims differently gets a correct answer and a sequential scan --
+-- slower, never wrong.
+--
+-- Guarded on the table's existence because this store creates `cog_dag_tasks`
+-- in its own schema, which runs *after* the migrations on a fresh install. An
+-- unguarded CREATE INDEX would fail there, and a failed migration is not
+-- skipped and retried later: the runner stops at it, so every migration after
+-- this one would be blocked too. The same index is declared beside that CREATE
+-- so a fresh install still gets it; on an existing database this statement is
+-- what adds it.
 
-CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_venue
-    ON cog_dag_tasks (workspace_id, (task ->> 'venue'))
-    WHERE task ->> 'venue' IS NOT NULL AND btrim(task ->> 'venue') <> '';
+DO $$
+BEGIN
+    IF to_regclass('cog_dag_tasks') IS NULL THEN
+        RAISE NOTICE 'cog_dag_tasks does not exist yet; its schema declares the venue index';
+        RETURN;
+    END IF;
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_venue
+                 ON cog_dag_tasks (workspace_id, (task ->> ''venue''))';
+END
+$$;

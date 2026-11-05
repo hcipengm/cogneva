@@ -57,6 +57,8 @@ pub use project_audit_log::{AuditEntry, AuditRow, PgProjectAuditLog, ProjectAudi
 pub use raw_log_index_store::PostgresRawLogIndexStore;
 pub use resource_event_store::PostgresResourceEventStore;
 pub use snapshot_store::PostgresSnapshotStore;
-pub use state_backend::{PostgresStateBackend, DAG_LOCK_WORKSPACE_SQL, EVENTS_PAGE_SQL};
+pub use state_backend::{
+    PostgresStateBackend, DAG_LOCK_WORKSPACE_SQL, EVENTS_PAGE_SQL, VENUE_TASKS_SQL,
+};
 pub use taste_intent_store::PostgresTasteIntentStore;
 pub use user_store::PostgresUserStore;
