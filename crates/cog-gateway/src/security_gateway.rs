@@ -3562,6 +3562,20 @@ struct UsageReading {
     outcome: UsageOutcome,
 }
 
+/// 一次调用上游自报的那几个计数，按 [`UsageReading::from_usage`] 要的顺序排：
+/// 输入、输出、缓存读、缓存写、思考。取不到的那一格是 `None`，与「报了 0」不同。
+///
+/// 写成一个名字而不是把五个 `Option<u64>` 在取数处和用法处各摊一遍：摊开的元组
+/// 读起来像一串没有含义的数，而 `extract_usage` 与 `from_usage` 之间那一列顺序
+/// 一旦写反，编译器不会说话。
+type ReportedUsage = (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+);
+
 impl UsageReading {
     /// For a body that was read to the end in one piece: an upstream that named
     /// neither count said nothing about usage, which is not a reading of zero.
@@ -3571,13 +3585,7 @@ impl UsageReading {
     /// `NotAsked`; only a call that did ask leaves the silence on the upstream's
     /// side, which is `Absent`.
     fn from_usage(
-        (input, output, cached, cache_created, reasoning): (
-            Option<u64>,
-            Option<u64>,
-            Option<u64>,
-            Option<u64>,
-            Option<u64>,
-        ),
+        (input, output, cached, cache_created, reasoning): ReportedUsage,
         asked: bool,
     ) -> Self {
         Self {
@@ -4232,15 +4240,7 @@ async fn record_exchange(
 /// Anthropic 面不把思考单列，所以那两条臂返回 `None`；OpenAI 形状的上游在不思考时
 /// 干脆不带这个键，于是 `None` 同时是「这次没想」与「这家不报」——在会报的那家身上
 /// 两者同义，在不会报的那家身上也读不出错数。
-fn extract_usage(
-    json: &serde_json::Value,
-) -> (
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
-) {
+fn extract_usage(json: &serde_json::Value) -> ReportedUsage {
     let as_u64 = |v: &serde_json::Value| v.as_u64();
     // 两个协议面对这门读数的写法不同，取法归一，账上就只有一列。
     let reasoning_of = |usage: &serde_json::Value| {
