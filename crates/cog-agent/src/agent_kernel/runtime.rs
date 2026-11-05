@@ -689,8 +689,12 @@ impl AgentRuntime {
     }
 
     pub fn new(mut config: RuntimeConfig, event_tx: mpsc::Sender<AgentEvent>) -> Self {
-        if let Some(ref skill) = config.skill_config {
-            config.max_iterations = skill.max_iterations;
+        // 技能面写下的界只是这个角色的起点；没写就没有界。写成「没写就取 10」
+        // 会让每一个角色都被同一个没人量过的数字裁着，而它裁的恰恰是「这一轮还
+        // 要不要接着干」——2026-11-05 实测 generator 在第十轮带着一个没跑完的
+        // 工具调用被砍，下一轮从头再来，同一条 CI 红修了六版。
+        if let Some(iterations) = config.skill_config.as_ref().and_then(|s| s.max_iterations) {
+            config.max_iterations = iterations;
         }
         // 预算由这个角色自己跑出来的读数推：种子（配置面或技能面）只在还没有
         // 观测时生效。写死一个数在这里就是把它交给一个永远不知道工作量的常量，
@@ -3147,7 +3151,7 @@ mod tests {
             name: "Custom Planner".into(),
             system_prompt: "You are a custom planning expert.".into(),
             tools: vec!["md".into()],
-            max_iterations: 42,
+            max_iterations: Some(42),
             role_type: "planner".into(),
         };
 
@@ -3180,7 +3184,7 @@ mod tests {
             name: "Fast Evaluator".into(),
             system_prompt: "Evaluate quickly.".into(),
             tools: vec![],
-            max_iterations: 3,
+            max_iterations: Some(3),
             role_type: "evaluator".into(),
         };
 
@@ -3264,7 +3268,7 @@ mod tests {
             name: role.into(),
             system_prompt: String::new(),
             tools: tools.iter().map(|t| (*t).into()).collect(),
-            max_iterations: 5,
+            max_iterations: Some(5),
             role_type: role.into(),
         }
     }
@@ -6117,7 +6121,7 @@ mod tests {
             name: "Skill Outcome Test".into(),
             system_prompt: String::new(),
             tools: Vec::new(),
-            max_iterations: 1,
+            max_iterations: Some(1),
             role_type: "skill-outcome-role".into(),
         };
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
