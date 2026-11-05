@@ -4,22 +4,22 @@
 //! output-quality* reflection in `cog-agent` (`SelfReviewLoop`).
 //! ## Architecture
 //! ```text
-//! detector ──→ recorder ──→ matcher ──→ promoter ──→ extractor
-//!    ↑                                              │
-//!    │  (SelfReview / AgentEvent / conversation)     │
-//!    └──────────────────────────────────────────────┘
+//! detector ──→ recorder ──→ matcher ──→ promoter
+//!    ↑                                     │
+//!    │  (SelfReview / AgentEvent / conversation)
+//!    └─────────────────────────────────────┘
 //!                          (feedback loop to SkillRegistry / AgentConfig)
 //! ```
+//!
 //! ## Phase Roadmap
 //! | Phase | Modules | Description |
 //! |-------|---------|-------------|
 //! | **1** | `types`, `detector`, `recorder` | Core data model, keyword-based detection, in-memory persistence |
 //! | **2** | `matcher`, `promoter` | Pattern matching, vector similarity, auto-promotion to SkillRegistry |
-//! | **3** | `reviewer`, `extractor` | Periodic review scheduling, LLM-based skill extraction |
+//! | **3** | `reviewer` | Periodic review scheduling |
 //! ## Integration Points
 //! - **`cog-agent`** — `HookEngine` triggers `detector` on `AgentEvent::SelfReview` and `AgentEvent::TaskStatusChange`.
 //! - **`cog-memory`** — `MemoryBackendRecorder` archives learnings into the three-layer memory system.
-//! - **`cog-llm`** — `SkillExtractor` uses an `LLMProvider` to generate `SkillConfig` from mature patterns.
 //! - **`cog-core`** — `SkillRegistry` receives promoted `SkillConfig` entries.
 
 /// 反思条目在记忆后端里的命名空间。写入与补齐扫的是同一份归档，两处各写一个
@@ -71,7 +71,6 @@ pub mod evolution_build_readings;
 pub mod evolution_deployer;
 pub mod evolution_flight_readings;
 pub mod evolution_queue_readings;
-pub mod extractor;
 pub mod fault_classifier;
 pub mod firecracker;
 pub mod flywheel;
@@ -137,7 +136,6 @@ pub use eval_harness::{
 pub use evolution::EvolutionEngine;
 pub use evolution_admin::EvolutionAdminService;
 pub use evolution_deployer::{BuildArtifact, EvolutionDeployer};
-pub use extractor::SkillExtractor;
 /// Deterministic keyword-rule classifier, re-exported so the change executor
 /// can classify environment failures without a second implementation.
 pub use fault_classifier::RuleBasedFaultClassifier;
@@ -400,7 +398,6 @@ pub struct ReflectionEngine {
     pub matcher: Arc<dyn LearningMatcher>,
     pub promoter: Arc<dyn LearningPromoter>,
     pub reviewer: Option<Arc<PeriodicReviewer>>,
-    pub extractor: Option<Arc<SkillExtractor>>,
     /// Deep self-evolution: skill effectiveness tracking.
     pub effectiveness_tracker: Option<Arc<SkillEffectivenessTracker>>,
     /// Deep self-evolution: meta-learning mode selector.
@@ -448,7 +445,6 @@ impl std::fmt::Debug for ReflectionEngine {
             .field("matcher", &"<dyn LearningMatcher>")
             .field("promoter", &"<dyn LearningPromoter>")
             .field("reviewer", &self.reviewer.is_some())
-            .field("extractor", &self.extractor.is_some())
             .field(
                 "effectiveness_tracker",
                 &self.effectiveness_tracker.is_some(),
@@ -512,7 +508,6 @@ impl ReflectionEngine {
             matcher,
             promoter,
             reviewer: None,
-            extractor: None,
             effectiveness_tracker: None,
             meta_learning: None,
             evolution: None,
@@ -582,11 +577,6 @@ impl ReflectionEngine {
             promoter.clone(),
             review_interval,
         ));
-        let extractor = Arc::new(SkillExtractor::new(
-            llm.clone(),
-            skill_registry.clone(),
-            prompt_manager.clone(),
-        ));
         let effectiveness_tracker = Arc::new(SkillEffectivenessTracker::new(recorder.clone()));
         let mut evolution =
             EvolutionEngine::new(llm.clone(), skill_registry.clone(), prompt_manager.clone())
@@ -610,7 +600,6 @@ impl ReflectionEngine {
             matcher,
             promoter,
             reviewer: Some(reviewer),
-            extractor: Some(extractor),
             effectiveness_tracker: Some(effectiveness_tracker),
             meta_learning: None,
             evolution: Some(evolution),
@@ -633,10 +622,8 @@ impl ReflectionEngine {
     /// through the three-layer memory pipeline (raw → schema → summary).
     pub fn new_production(
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
-        llm: Arc<dyn cog_core::LlmClient>,
         review_interval: std::time::Duration,
         memory_backend: Arc<dyn cog_core::MemoryBackend>,
-        prompt_manager: Option<Arc<dyn cog_core::PromptProvider>>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
             memory_backend,
@@ -653,15 +640,12 @@ impl ReflectionEngine {
             promoter.clone(),
             review_interval,
         ));
-        let extractor = Arc::new(SkillExtractor::new(llm, skill_registry, prompt_manager));
-
         Self {
             detector,
             recorder,
             matcher,
             promoter,
             reviewer: Some(reviewer),
-            extractor: Some(extractor),
             effectiveness_tracker: None,
             meta_learning: None,
             evolution: None,
@@ -688,9 +672,7 @@ impl ReflectionEngine {
     pub fn new_with_recorder(
         recorder: Arc<dyn LearningRecorder>,
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
-        llm: Arc<dyn cog_core::LlmClient>,
         review_interval: std::time::Duration,
-        prompt_manager: Option<Arc<dyn cog_core::PromptProvider>>,
     ) -> Self {
         let detector: Arc<dyn LearningDetector> = Arc::new(DefaultLearningDetector::new());
         let matcher: Arc<dyn LearningMatcher> =
@@ -703,15 +685,12 @@ impl ReflectionEngine {
             promoter.clone(),
             review_interval,
         ));
-        let extractor = Arc::new(SkillExtractor::new(llm, skill_registry, prompt_manager));
-
         Self {
             detector,
             recorder,
             matcher,
             promoter,
             reviewer: Some(reviewer),
-            extractor: Some(extractor),
             effectiveness_tracker: None,
             meta_learning: None,
             evolution: None,
@@ -1079,19 +1058,6 @@ impl ReflectionEngine {
         Ok(())
     }
 
-    /// Trigger skill extraction from a mature pattern (called after
-    /// SelfReview indicates NEED_REVISION).
-    pub async fn extract_from_pattern(
-        &self,
-        pattern: &cog_core::Pattern,
-    ) -> cog_core::SFResult<Option<String>> {
-        if let Some(ref extractor) = self.extractor {
-            extractor.extract_and_insert(pattern).await
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Start the background periodic reviewer if configured.
     pub fn start_reviewer(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.reviewer.as_ref().map(|r| {
@@ -1446,13 +1412,6 @@ impl cog_core::ReflectionEngine for ReflectionEngine {
 
     async fn process_event(&self, event: &cog_core::AgentEvent) -> cog_core::SFResult<()> {
         Self::process_event(self, event).await
-    }
-
-    async fn extract_and_insert(
-        &self,
-        pattern: &cog_core::Pattern,
-    ) -> cog_core::SFResult<Option<String>> {
-        Self::extract_from_pattern(self, pattern).await
     }
 
     async fn process_skill_outcome(

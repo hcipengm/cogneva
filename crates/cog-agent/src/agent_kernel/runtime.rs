@@ -6072,13 +6072,6 @@ mod tests {
             Ok(())
         }
 
-        async fn extract_and_insert(
-            &self,
-            _pattern: &cog_core::Pattern,
-        ) -> cog_core::SFResult<Option<String>> {
-            Ok(None)
-        }
-
         fn start_reviewer(&self) -> Option<tokio::task::JoinHandle<()>> {
             None
         }

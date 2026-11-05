@@ -216,7 +216,6 @@ const ACTOR_MEANINGS: Record<string, string> = {
   memory: '记忆读写',
   ralph: 'ralph 循环',
   self_review: '自检（没有指明被评对象的一侧）',
-  skill_extractor: '技能抽取',
   'sandbox-document-organizer': '沙盒里的文档整理',
   unknown: '没有身份的调用——不是某个角色，是一次缺陷。网关在付钱之前就拒收没带 `x-cogneva-actor` 的调用（400，零花销），所以这一格的花销只该有 2026-11-03 之前的历史；此后它再涨，涨的是被拒的次数，说明有调用方没报身份，要按缺陷查',
 };
@@ -232,6 +231,7 @@ const RETIRED_ACTOR_MEANINGS: Record<string, string> = {
   intent_gateway: '历史（2026-11-05 之前）：网关自己的 `/v1/intent` 意图分类；该入口已删除，意图由对话员工自己判',
   wiki: '历史（2026-11-05 之前）：知识库维护者；该维护者从未被装配，已删除',
   intent_assess: '历史（2026-11-05 之前）：协作执行器里那条专门的意图判定分支；此后判定作为一件 `platform_agent_task` 交给常驻员工做',
+  skill_extractor: '历史（2026-11-05 之前）：从成熟模式抽取技能配置；这条路径没有任何生产调用方，已删除',
 };
 
 /**

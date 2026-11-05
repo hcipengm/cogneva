@@ -837,7 +837,7 @@ impl EvolutionEngine {
         }
     }
     // ========================================================================
-    // Quality Gate (mirrors SkillExtractor)
+    // Quality Gate
     // ========================================================================
 
     async fn quality_gate(&self, skill: &SkillConfig) -> SFResult<bool> {

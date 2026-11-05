@@ -73,10 +73,6 @@ const PRODUCERS: &[(&str, &[&str])] = &[
     // 循环，也就没有写 actor 的调用点。
     ("crates/cog-memory/src/extractor.rs", &["memory"]),
     ("crates/cog-reflection/src/evolution.rs", &["evolution"]),
-    (
-        "crates/cog-reflection/src/extractor.rs",
-        &["skill_extractor"],
-    ),
     ("crates/cogneva/src/eval_table.rs", &["eval"]),
     (
         "crates/cogneva/tests/collaboration_self_review_test.rs",
@@ -458,10 +454,6 @@ const TASK_KEYING: &[(&str, TaskKeying)] = &[
         TaskKeying::KeyedBy("一个技能 / 钩子 / 工具变体"),
     ),
     (
-        "crates/cog-reflection/src/extractor.rs",
-        TaskKeying::KeyedBy("一个行为模式"),
-    ),
-    (
         "crates/cogneva/src/eval_table.rs",
         TaskKeying::KeyedBy("评测表里的一行"),
     ),
@@ -666,10 +658,6 @@ const CALL_SITES: &[(&str, ActorSource)] = &[
     ("crates/cogneva/src/eval_table.rs", ActorSource::Stamps),
     (
         "crates/cog-reflection/src/evolution.rs",
-        ActorSource::Stamps,
-    ),
-    (
-        "crates/cog-reflection/src/extractor.rs",
         ActorSource::Stamps,
     ),
 ];

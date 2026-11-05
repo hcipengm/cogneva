@@ -30,7 +30,6 @@ pub const ACTOR_LABELS: &[&str] = &[
     "ralph",
     "sandbox-document-organizer",
     "self_review",
-    "skill_extractor",
 ];
 
 /// Actors that carry a configured role name after the colon.

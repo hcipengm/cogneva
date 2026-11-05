@@ -18,13 +18,12 @@ use std::sync::Arc;
 /// `prompts/` actually declares in both directions, so a declaration added
 /// or removed without touching this guard fails here rather than dropping
 /// out of coverage.
-const COMPARED: [&str; 6] = [
+const COMPARED: [&str; 5] = [
     "agent:default",
     "reflection:evolution_refinement",
     "reflection:evolution_refinement_system",
     "reflection:evolution_tool",
     "reflection:evolution_tool_system",
-    "reflection:skill_extractor",
 ];
 
 /// Load `prompts/` the way a process does: from the directory as shipped,
@@ -98,10 +97,6 @@ async fn every_declared_prompt_is_the_text_the_code_falls_back_to() {
             continue;
         }
         let pairs: Vec<(String, String)> = match key {
-            "reflection:skill_extractor" => vec![(
-                pm.get("reflection:skill_extractor").expect("declared"),
-                cog_reflection::extractor::SKILL_EXTRACTOR_SYSTEM.to_string(),
-            )],
             "reflection:evolution_refinement" => {
                 let (vars, json, id) = refinement_vars();
                 vec![(

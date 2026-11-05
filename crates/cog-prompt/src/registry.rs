@@ -1,7 +1,6 @@
 //! Prompt 注册中心 — 按 `domain:purpose` 索引所有 prompt。
 //! 支持按 `task_type:action` 命名空间查询，例如：
 //! - `self_review:critique` — SelfReview 的 critique prompt
-//! - `skill_extractor:extraction` — SkillExtractor 的提取 prompt
 //! - `evaluator:system` — EvaluatorAgent 的 system prompt
 
 use crate::version::{PromptVersion, VersionHistory};

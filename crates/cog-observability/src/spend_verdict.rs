@@ -261,10 +261,6 @@ pub const UNREGISTERED_SITES: &[UnregisteredSite] = &[
         why: "a CLI experiment run, launched by hand: idle in every window no one runs it, and no reading says when one is due",
     },
     UnregisteredSite {
-        actor: "skill_extractor",
-        why: "runs when a reflection produces a candidate skill; its silence and the reflection chain's idle state are the same reading",
-    },
-    UnregisteredSite {
         actor: "sandbox-document-organizer",
         why: "reached from the sandbox documenter, which runs when a run produces documents rather than on a cadence",
     },

@@ -51,9 +51,6 @@ pub trait ReflectionEngine: Send + Sync + std::fmt::Debug {
     /// Process an agent event through the learning pipeline.
     async fn process_event(&self, event: &crate::AgentEvent) -> crate::SFResult<()>;
 
-    /// Trigger skill extraction from a mature pattern.
-    async fn extract_and_insert(&self, pattern: &Pattern) -> crate::SFResult<Option<String>>;
-
     /// Feed a skill usage outcome into the effectiveness tracker.
     async fn process_skill_outcome(&self, outcome: SkillOutcome) -> crate::SFResult<()>;
 

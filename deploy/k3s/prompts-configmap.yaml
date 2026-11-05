@@ -21,21 +21,13 @@ data:
     # registry 是覆盖写，重名就是其中一份声明被静默顶掉。
     #
     # 无 prompt 管理器时（进程里没装配 prompt 插件）调用方会退回代码里的兜底文本，
-    # 兜底写在 `crates/cog-reflection/src/{evolution,extractor}.rs`。同一个 key 的
+    # 兜底写在 `crates/cog-reflection/src/evolution.rs`。同一个 key 的
     # 两处正文必须说同一件事：只改一侧就是被读到的那一侧说了算、另一侧悄悄变旧。
 
     prompts:
       # ==========================================================================
       # cog-reflection
       # ==========================================================================
-      reflection:skill_extractor:
-        content: |
-          You are a skill extraction assistant. Respond with valid JSON only.
-        version: "1.0.0"
-        description: "SkillExtractor system prompt"
-        tags: ["reflection", "extraction"]
-        active: true
-
       reflection:evolution_refinement:
         content: |
           You are evolving an existing agent skill based on production feedback.
