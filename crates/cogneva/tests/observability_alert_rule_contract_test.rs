@@ -7142,4 +7142,11 @@ const UNRESOLVED_DRAFT_WRITERS: &[(&str, &str)] = &[
         "row.rule",
     ),
     ("crates/cog-orchestrator/src/dag_executor/mod.rs", "rule"),
+    // 价目那两行：名字由调用点传进来，而调用点传的是同一文件里的两个常量
+    // （`llm_price_book_drift` / `llm_price_page_unreadable`），恢复那一半用同一个
+    // 名字关它——静态读不到，不是第二个写者。
+    (
+        "crates/cog-gateway/src/security_gateway.rs",
+        "rule.to_string()",
+    ),
 ];

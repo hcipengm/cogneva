@@ -1725,10 +1725,12 @@ pub(crate) fn ci_hold_attempts_note(attempted: &[CiHoldAttempt]) -> Option<Strin
 }
 
 /// 一轮的结论带进下一轮时的长度上限。这段是提示不是日志，读到卡在哪一步就够。
+// cap: bound — 结论只要留到能读出它停在哪条命令，再长就从题面里挤掉下一轮真正要看的东西
 const CI_HOLD_ATTEMPT_SAID_MAX: usize = 200;
 
 /// 最多回顾最近几轮。每一条都要问一次图，而扣住可以跨几个小时，行数没有上界；
 /// 答的问题也只是「刚刚那几次为什么没成」，不是全量审计。
+// cap: bound — 只用来认出「这几轮在重复同一个做法」，看得更早只是多问几次图
 const CI_HOLD_ATTEMPTS_SHOWN: usize = 4;
 
 /// 这次失败是不是已经见过的那一处坏。证据取不到（`None`）时不做区分：读不出
@@ -1831,6 +1833,7 @@ pub(crate) fn ci_failed_test_names(text: &str) -> Vec<String> {
 ///
 /// 交下去的是「该去跑哪几条」，不是失败全表：一百条红的时候，前几个名字足以
 /// 让人找到那一族测试，而把一百个名字塞进上下文只会挤掉真正的原因。
+// cap: bound — 前几个名字够找到那一族测试，失败全表进上下文只会挤掉真正的原因
 const CI_FAILED_TEST_NAMES_MAX: usize = 8;
 
 /// 去掉终端着色序列。

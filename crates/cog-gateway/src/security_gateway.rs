@@ -8032,6 +8032,7 @@ pub const PRICE_WATCH_LOOP: &str = "gateway_llm_price_watch";
 const PRICE_WATCH_PERIOD: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// 抓一次价目页的墙。页面很小，10 秒足够；超时读作「读不到」，与解析失败分开报。
+// cap: bound — 一页很小的正文，10 秒是「读不到」与「慢」的分界，不是吞吐旋钮
 const PRICE_PAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 配置价目与官方页对不上时开的那一行。
