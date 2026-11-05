@@ -1021,25 +1021,36 @@ impl ActionPlanOrchestrator {
             );
         }
 
-        // 这条目标已经在图里了：提交方给的行 id 本身就是它的身份（按天的面补救目标、
-        // 按 issue 的项目目标），第一次提交就把那一行连同分解出的子任务一起放了进去。
+        // 这条目标已经处理过了：提交方给的行 id 本身就是它的身份（按天的面补救目标、
+        // 按 issue 的项目目标），而图里那一行带着 `verified` 戳，说明上一遍提交已经
+        // 把这一行连同分解出的子任务一起放进去了。
         // 那之后再分解一遍不只是白花一次模型调用：这一批入图时会被整体拒掉——图里
-        // 那一行已经被第一次提交改写成不可执行的目标行，同一个 id 带着两份不同的内容，
+        // 那一行已经被上一遍改写成不可执行的目标行，同一个 id 带着两份不同的内容，
         // 于是「早就排上了」在日志里读成一次失败，而这条失败按面漂移的节拍每两分钟
         // 重来一次。实测 2026-11-05：`face-gap-CI~2f~…` 三小时内被拒了一百多次，
         // 每次都在前面先付了一次完整分解。
+        //
+        // 判据是那一行自己的戳，不是「这个 id 存不存在」：一行先于本次提交就存在的
+        // 工作（变更账派下来的活）还没被任何一遍处理过，它正等着被分解。
         //
         // 已经排上的答复是 `Ok(空)`，与「这一批都已经被别的行持有」同一条口径：
         // 调用方问的是「这次提交排上了什么」，答案是一条也没有。
         if let (Some(dag), Some(first)) = (self.dag_executor.as_deref(), tasks.first()) {
             if let Some(held) = dag.get_task(&first.id).await {
-                tracing::info!(
-                    goal = %goal,
-                    task_id = %first.id,
-                    status = ?held.status,
-                    "the goal row is already in the graph; not decomposing it again"
-                );
-                return Ok(Vec::new());
+                let already_planned = held
+                    .action_planner_meta
+                    .as_ref()
+                    .map(|meta| meta.verified)
+                    .unwrap_or(false);
+                if already_planned {
+                    tracing::info!(
+                        goal = %goal,
+                        task_id = %first.id,
+                        status = ?held.status,
+                        "this goal's row is already planned and in the graph; not decomposing it again"
+                    );
+                    return Ok(Vec::new());
+                }
             }
         }
 
