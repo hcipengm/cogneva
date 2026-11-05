@@ -245,6 +245,14 @@ pub struct Declarations {
     /// Slugs two files both claim, with the file the map kept and the one it
     /// overwrote.
     duplicates: Vec<DeclaredTwice>,
+    /// The documents that declare a readable slug, one entry per document and
+    /// principle, sorted by slug and then by path.
+    ///
+    /// Kept beside the map rather than folded into it, because the two answer
+    /// different questions and only one of them can key on the slug: the map
+    /// says where the gate is, and this says how many documents the claim rests
+    /// on. Two documents declaring one slug is one carrier and two demands.
+    demands: Vec<Demand>,
 }
 
 /// One slug claimed by two files.
@@ -263,6 +271,27 @@ pub struct DeclaredTwice {
     pub dropped: String,
 }
 
+/// One document demanding that a principle be enforced.
+///
+/// The account equates two identities by `(kind, literal)` only when the literal
+/// is the demand itself. A declaration line is not: it names a slug the registry
+/// is searched for, which is a pattern the tree is matched against, and the same
+/// pattern written in two documents is two documents that each claim to enforce
+/// the principle. Counting it once would be an account that answers "one gate"
+/// for a claim resting on two files -- and the two are not interchangeable, since
+/// a change that removes one leaves the other standing.
+///
+/// So the pair is kept as its own entry rather than collapsed into the carrier
+/// map, which has to answer with exactly one path per slug.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Demand {
+    /// The principle the document names. A slug, not the demand itself: the
+    /// identity key, which is what makes two demands look like one.
+    pub slug: String,
+    /// The document that declares it.
+    pub source: String,
+}
+
 impl Declarations {
     /// The declarations in a set of matched lines, as `(path, text)` pairs.
     ///
@@ -276,6 +305,7 @@ impl Declarations {
         let mut gates = BTreeMap::new();
         let mut unreadable = Vec::new();
         let mut duplicates = Vec::new();
+        let mut demands = Vec::new();
         for (path, text) in lines {
             let trimmed = text.trim_start();
             let Some(rest) = PLATFORM_DECLARATION_PREFIXES
@@ -318,14 +348,30 @@ impl Declarations {
                         dropped: path.clone(),
                     }),
                 }
+                // Recorded whatever the map did with it: one entry per document,
+                // which is the answer the map cannot give. A document that
+                // writes the same declaration on two lines is still one document,
+                // so the pair is deduplicated -- what is counted is the claim,
+                // not the number of times it was typed.
+                demands.push(Demand {
+                    slug: slug.to_string(),
+                    source: path.clone(),
+                });
             } else {
                 unreadable.push((path.clone(), text.trim().to_string()));
             }
         }
+        // Sorted and deduplicated as a set of `(slug, document)` pairs: the
+        // lines arrive in git's walk order, and a list of demands that moved with
+        // the listing would make the account's answer about the tree depend on
+        // how the tree happened to be read.
+        demands.sort();
+        demands.dedup();
         Self {
             gates,
             unreadable,
             duplicates,
+            demands,
         }
     }
 
@@ -362,6 +408,44 @@ impl Declarations {
     /// delete one of them.
     pub fn duplicate_count(&self) -> usize {
         self.duplicates.len()
+    }
+
+    /// The demands the registry holds, one entry per document and principle, in
+    /// slug order and then path order.
+    ///
+    /// The other half of the reading. [`Declarations::gate_for`] answers with one
+    /// file because a gate is one place a run goes red; this answers with every
+    /// document that claims to enforce the principle, because a claim written in
+    /// two places survives the loss of either one and so is two demands on
+    /// whoever changes it.
+    pub fn demands(&self) -> &[Demand] {
+        &self.demands
+    }
+
+    /// How many documents declare a readable slug.
+    ///
+    /// Larger than the number of declared slugs as soon as two documents write
+    /// one declaration, and the difference is the reading: the surplus is claims
+    /// the carrier map cannot carry, since it keeps exactly one path per slug.
+    pub fn demand_count(&self) -> usize {
+        self.demands.len()
+    }
+
+    /// The documents demanding a gate for one principle, by path, sorted.
+    ///
+    /// Named rather than counted for the same reason the duplicates are: a count
+    /// of two says a second document exists without saying which one, and which
+    /// one is the whole of what a reader has to look at.
+    ///
+    /// A list rather than an iterator over `&self`: the returned paths borrow the
+    /// registry, not the slug they were asked about, and an `impl Iterator` would
+    /// have to name that difference in its bounds to be the same signature.
+    pub fn demands_for(&self, slug: &str) -> Vec<&str> {
+        self.demands
+            .iter()
+            .filter(|demand| demand.slug == slug)
+            .map(|demand| demand.source.as_str())
+            .collect()
     }
 
     /// Whether the registry held anything it could not read.
@@ -1046,6 +1130,64 @@ mod tests {
         assert_eq!(
             judge(&row("feedback_x", Some("-")), &Declarations::default()).state(),
             Some(cog_core::PrincipleState::Unenforced)
+        );
+    }
+
+    /// Two documents writing one declaration are two demands, not one demand seen
+    /// twice. The account equates two identities by `(kind, literal)` only when
+    /// the literal is the demand itself, and a declaration line is not: it names
+    /// a slug the registry is searched for, so two files carrying it are two
+    /// files that each claim to enforce the principle. Reading the carrier map as
+    /// the count of demands loses one of them, and the one it loses is exactly
+    /// the file a reader would have to change.
+    ///
+    /// The map keeps its own answer -- one path per slug -- while the demand list
+    /// names both, and neither moves with the order git walked the files in.
+    ///
+    /// principle: feedback_a_literal_declared_by_two_documents_is_two_demands_not_one
+    #[test]
+    fn two_documents_declaring_one_literal_are_two_demands() {
+        let first = ("crates/x/tests/a.rs", "/// principle: feedback_x");
+        let second = ("crates/x/tests/b.rs", "/// principle: feedback_x");
+        let forward = declarations(&[first, second]);
+        let backward = declarations(&[second, first]);
+
+        assert_eq!(forward.demand_count(), 2, "one demand per document");
+        assert_eq!(
+            forward.demands_for("feedback_x"),
+            vec!["crates/x/tests/a.rs", "crates/x/tests/b.rs"],
+            "both documents are named, not just the one the map kept"
+        );
+        // The carrier map still answers with one file: that is a different
+        // question, and the smaller path is still the answer to it.
+        assert_eq!(forward.gate_for("feedback_x"), Some("crates/x/tests/a.rs"));
+        assert_eq!(forward.slugs().count(), 1);
+
+        // Arrival order is git's walk, so neither the demand set nor the recorded
+        // carrier may move with it.
+        assert_eq!(forward.demands(), backward.demands());
+        assert_eq!(
+            backward.demands_for("feedback_x"),
+            vec!["crates/x/tests/a.rs", "crates/x/tests/b.rs"]
+        );
+        assert_eq!(
+            forward.gate_for("feedback_x"),
+            backward.gate_for("feedback_x")
+        );
+
+        // One document is one demand, and a declaration typed twice in one file
+        // is still one document: the claim is counted, not the lines carrying it.
+        let one = declarations(&[first]);
+        assert_eq!(one.demand_count(), 1);
+        assert_eq!(one.demands_for("feedback_x"), vec!["crates/x/tests/a.rs"]);
+        let repeated = declarations(&[first, first]);
+        assert_eq!(repeated.demand_count(), 1);
+        assert_eq!(
+            repeated.demands(),
+            &[Demand {
+                slug: "feedback_x".to_string(),
+                source: "crates/x/tests/a.rs".to_string(),
+            }]
         );
     }
 }
