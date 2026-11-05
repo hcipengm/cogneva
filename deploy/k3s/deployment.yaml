@@ -338,13 +338,18 @@ spec:
               value: "true"
             - name: COGNEVA_MEMORY_LOAD_RERANKER_MODEL
               value: "true"
+          # 冷启动的预算，按实测留：2026-11-06 本机实测，新镜像第一次起来要 323 秒
+          # （模型装载、建表和等锁、Qdrant 集合各占一段），六十个五秒的探针只差
+          # 几秒就把它判死，容器重启一次之后才起来——而那一次恰好在换镜像，回滚
+          # 与「再等一会儿」之间它选了回滚。放到一百二十个五秒给冷启动一倍余量；
+          # 代价是真坏了的镜像晚几分钟才被判死，比每次换镜像都可能被判死便宜。
           startupProbe:
             httpGet:
               path: /health/live
               port: http
             periodSeconds: 5
             timeoutSeconds: 5
-            failureThreshold: 60
+            failureThreshold: 120
           livenessProbe:
             httpGet:
               path: /health/live
