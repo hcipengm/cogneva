@@ -868,3 +868,59 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// How many refusal events are queued and not yet folded.
     async fn pending_refusals(&self) -> SFResult<u64>;
 }
+
+/// The distinction this rule is about, held at the end that still has it.
+///
+/// Whether a path is one the registry reads, and whether a line's remainder is a
+/// slug, are both decided on the bytes as written. `a.rs.bak` and `a.rs` are one
+/// normalisation apart, and so are `/// principle:feedback_x` and
+/// `/// principle: feedback_x`; a reader that decided after collapsing either
+/// pair would report a file the tree does not hold, or a declaration nothing can
+/// key on, as if it had. Both questions are asked here, where both sides are
+/// still two strings.
+#[cfg(test)]
+mod the_distinction_survives_to_the_input {
+    use super::*;
+
+    /// principle: feedback_verdict_where_the_distinction_survives
+    #[test]
+    fn a_path_and_a_declaration_are_read_as_written() {
+        // The pathspecs' two shapes, read the way the registry walk asks them.
+        for covered in [
+            "crates/cog-core/src/contract/principle_ledger.rs",
+            "a.rs",
+            "deploy/scripts/tests/render-freshness.test.sh",
+            ".github/scripts/tests/render-freshness.test.sh",
+        ] {
+            assert!(is_a_registry_source(covered), "{covered:?}");
+        }
+        for merely_similar in [
+            "a.rs.bak",
+            "a.rs/",
+            "crates/a.rsx",
+            "deploy/scripts/x.test.sh",
+            "deploy/scripts/tests/x.test.sh.bak",
+            ".github/scripts/tests/x.test.sh/",
+        ] {
+            assert!(!is_a_registry_source(merely_similar), "{merely_similar:?}");
+        }
+        // The declaration's remainder is the slug and nothing normalised into
+        // it: padding and quoting leave different remainders, so a look that
+        // compares them is comparing the line the tree holds.
+        let slug = "feedback_x";
+        for &prefix in PLATFORM_DECLARATION_PREFIXES {
+            assert_eq!(format!("{prefix}{slug}").strip_prefix(prefix), Some(slug));
+            assert_ne!(format!("{prefix}  {slug}").strip_prefix(prefix), Some(slug));
+            assert_ne!(format!("{prefix}'{slug}'").strip_prefix(prefix), Some(slug));
+            // And which syntax a line carries is decided on the line: no prefix
+            // of the closed set is the start of another, so the order the
+            // readers walk them in cannot decide what a line declares.
+            for &other in PLATFORM_DECLARATION_PREFIXES {
+                assert!(
+                    other == prefix || !other.starts_with(prefix),
+                    "{prefix:?} is the start of {other:?}"
+                );
+            }
+        }
+    }
+}
