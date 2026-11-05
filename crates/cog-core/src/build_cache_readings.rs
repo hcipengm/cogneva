@@ -52,7 +52,9 @@
 //!   stayed after a pass ran. Not the same reading: the first says the cache is
 //!   over its cap, this one says removing what may be removed did not fix it,
 //!   and they call for different actions (wait for the next pass; or change the
-//!   cap or the permissions).
+//!   cap or the permissions). A walk that later finds the cache under its cap
+//!   zeroes it, so the number is always about the state the cache is in now;
+//!   absent still means that no pass has run yet.
 //! - `cogneva_build_target_over_cap_total{outcome}` -- walks that found the cache
 //!   over its cap, by what happened next: `reclaimed` (a pass brought it under),
 //!   `unmet` (a pass ran and could not), `busy` (a build held the slot, so no
@@ -178,7 +180,12 @@ struct ReclaimState {
     /// Bytes above the cap as of the last walk; `None` before one has been made
     /// with a cap configured.
     over_limit: Option<u64>,
-    /// Bytes above the cap after the last pass that ran; `None` before one has.
+    /// Bytes above the cap after the last pass that ran, and 0 once a walk has
+    /// found the cache under its cap again; `None` before a pass has run.
+    ///
+    /// Zeroed by that walk rather than carried from the pass that set it: a
+    /// reader must not alarm on a cache that is under its cap, and the two
+    /// gauges may not disagree about a cache that is under.
     unmet: Option<u64>,
     /// When the run of walks that found the cache over its cap began; `None`
     /// when the last walk found it under, and before a first walk that did not.
@@ -573,6 +580,14 @@ impl BuildCacheReadings {
             // bytes and stayed over has not ended anything a reader asked about.
             if excess == 0 {
                 state.over_since = None;
+                // The last pass's answer is voided here as well: a cache inside
+                // its cap has nothing over it, and `unmet` would otherwise go on
+                // publishing the number the last over-cap pass left. Zeroed
+                // rather than cleared, because absent still has to mean that no
+                // pass has run.
+                if state.unmet.is_some() {
+                    state.unmet = Some(0);
+                }
             } else if state.over_since.is_none() {
                 state.over_since = Some(unix_now());
             }
@@ -1695,5 +1710,47 @@ mod tests {
                 "{value} missing from {outcomes:?}"
             );
         }
+    }
+
+    /// A walk that finds the cache under its cap again voids the last pass's
+    /// answer: `unmet_bytes` says what is over the cap now, and a cache inside
+    /// its cap has nothing over it -- a stale number would have the cache above
+    /// its cap and under it at once.
+    #[tokio::test]
+    async fn a_walk_under_the_cap_voids_the_last_passes_unmet_reading() {
+        let (root, files) = cache(&[("release/incremental/one", 1000)]);
+        let readings = BuildCacheReadings::new(root.path()).with_cap(1, 300);
+
+        readings.enforce_cap(&files, Some(&gate(true))).await;
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_UNMET_METRIC, None).await,
+            Some(999.0),
+            "the floor keeps the only file, so the pass cannot reach the cap"
+        );
+
+        // The walk that finds nothing in the cache finds it under its cap.
+        readings.enforce_cap(&[], None).await;
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_OVER_LIMIT_METRIC, None).await,
+            Some(0.0)
+        );
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_UNMET_METRIC, None).await,
+            Some(0.0),
+            "under its cap is nothing unmet, not the last pass's number"
+        );
+        assert_eq!(on_disk(root.path()), 1000, "the floor's file stayed");
+
+        // Absent still means that no pass has run: a walk that found the cache
+        // over its cap with nothing in force to remove anything leaves the
+        // series unpublished rather than reading zero.
+        let (other_root, other_files) = cache(&[("release/incremental/one", 1000)]);
+        let other = BuildCacheReadings::new(other_root.path()).with_cap(1, 300);
+        other.enforce_cap(&other_files, None).await;
+        assert_eq!(
+            reading(&other, BUILD_TARGET_UNMET_METRIC, None).await,
+            None,
+            "no pass ran, so there is no result to report"
+        );
     }
 }
