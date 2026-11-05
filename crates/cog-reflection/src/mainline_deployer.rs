@@ -5867,23 +5867,59 @@ impl MainlineDeployer {
     /// 座位时连 ack 都不做。2026-11-05 18:2x 实测，一行针对六小时前那一版的修复
     /// 在跑，消费组 `idle` 五十四分钟、`pending` 十条，当前 head 的红连队列都没进。
     ///
-    /// 两个调用点，缺任何一个都会留下没人收的行：
+    /// 三个调用点，缺任何一个都会留下没人收的行：
     ///
     /// - 开新单之前（[`Self::file_ci_hold_fix`]），让座位给这一版；
     /// - 一次扣住**结束**的那一刻（见 `poll_once` 里 `ci_hold` 的收尾），让座位给
-    ///   下一件还没来的事。
+    ///   下一件还没来的事；
+    /// - 每一拍轮首（[`Self::retire_ci_holds_that_lag_the_round`]）。
     ///
-    /// 后一个不是可选的：只在开单时收，等于「上游一直不红，旧行就一直不收」。
+    /// 前两个不是可选的：只在开单时收，等于「上游一直不红，旧行就一直不收」。
     /// 2026-11-06 05:1x 实测，上游已经判绿两个多小时，停线车道上还压着四条追着更早
     /// 版本的行（一条在跑，正给一版早已进不了主线的树改代码），它们谁也等不到下一次
     /// 开单——那不红的那一天就一直没有。收它们靠的是同一句判词：CI 按 push 判，那一
     /// 版红了也不再拦得住任何人。
     ///
-    /// 一个都收不到是常态，不打日志：这两处都不常有行可收。
+    /// 第三个补的是反过来那一半：前两个都要求「有新单要开」或「有一段扣住要收」，
+    /// 而扣住一直不结束、也没有新单要开的那些拍，两个都不发生。2026-11-06 05:3x
+    /// 实测正是这样：扣住还指着 52fe919e，车道上四条里有三条追的版本比它早几小时。
+    ///
+    /// 一个都收不到是常态，不打日志：这三处都不常有行可收。
     async fn retire_ci_holds_for_other_revs(
         &self,
         orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
         live_rev: &str,
+    ) -> usize {
+        self.retire_ci_holds_except(orchestrator, &[live_rev]).await
+    }
+
+    /// 每一拍轮首收一次：只留追着**这一拍还在办的那几版**的行。
+    ///
+    /// 留两版而不是一版，是因为这一拍接下来要做的事正好落在这两版上：扣住会把
+    /// 被指的那一版换成这一轮问到的最新红（旧行跟着改 `input.rev`，行 id 不变），
+    /// 而挑版本从头上往回走。先收再开，会让同一个 id 先被取消、又被同一个 id 开
+    /// 回来——那是一行被两个状态来回写。
+    ///
+    /// 代价是每拍一次全图读（实测 9,867 行 / 42 MB / 约 7 秒，节拍 600 秒）。这一
+    /// 读本来就有更好的形状——按 `task_type` 在 SQL 里筛，像 `dag_get_live_tasks`
+    /// 与 `dag_get_venue_tasks` 那样——等它真的挡住别的读者再做。
+    async fn retire_ci_holds_that_lag_the_round(&self, state: &MainlineState, head: &str) {
+        let Some(orchestrator) = self.orchestrator.as_ref() else {
+            return;
+        };
+        let mut keep: Vec<&str> = vec![head];
+        if let Some(held) = state.ci_hold.as_ref() {
+            keep.push(held.rev.as_str());
+        }
+        self.retire_ci_holds_except(orchestrator, &keep).await;
+    }
+
+    /// 收掉追着 `keep` 之外任何一版还活着的停线单。见
+    /// [`Self::retire_ci_holds_for_other_revs`]。
+    async fn retire_ci_holds_except(
+        &self,
+        orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
+        keep: &[&str],
     ) -> usize {
         let mut retired = 0;
         for task in orchestrator.get_all_tasks().await {
@@ -5897,15 +5933,16 @@ impl MainlineDeployer {
                 // 没有版本可比的不是这一族：不拿「读不到」当「过期」。
                 continue;
             };
-            if rev == live_rev {
+            if keep.contains(&rev) {
                 continue;
             }
+            let still_live = keep.iter().map(|r| rev12(r)).collect::<Vec<_>>().join("/");
             let reason = format!(
                 "main has moved past {}: CI is judged per push, so making that revision green \
                  no longer unblocks anything, and the stop-the-line lane has one seat — the \
                  row for {} needs it",
                 rev12(rev),
-                rev12(live_rev)
+                still_live
             );
             match orchestrator.cancel_task_with_reason(&task.id, reason).await {
                 Ok(cascaded) => {
@@ -5913,7 +5950,7 @@ impl MainlineDeployer {
                     info!(
                         task_id = %task.id,
                         rev = %rev12(rev),
-                        live_rev = %rev12(live_rev),
+                        still_live = %still_live,
                         status = ?task.status,
                         cascaded = cascaded.len(),
                         "retired a CI hold aimed at a revision main has already gone past"
@@ -7628,6 +7665,11 @@ impl MainlineDeployer {
         // 与这一拍推不推进无关；而长期不推进的部署器恰恰是最该有人看见「又有 rev
         // 被跳过」的那一个。挪到早退之后，被 hold 很久的部署器会把这段区间读成安静。
         self.record_skipped_revs(&mut state, &bare).await;
+        // 停线车道上追着旧版本的行也每拍收一次，理由与上面那一格同形：它答的是
+        // 「这一拍之前留下了什么」，与这一拍推不推进无关，而下面任何一条早退都会
+        // 让这一拍不推进——扣着、在飞、撞撤回钉的那些拍恰恰是行最容易积起来的拍。
+        // 放在 `bare` 刚推进过之后：比的是这一拍真正看见的头。
+        self.retire_ci_holds_that_lag_the_round(&state, &bare).await;
         // The version contract is judged every round rather than tied to "did
         // this round advance main": a judgement that only runs on an advance
         // stays silent while main stands still, which is exactly when whether the
@@ -8172,6 +8214,14 @@ impl MainlineDeployer {
             // 不在这一轮不知道，而那一行是唯一会去修它的东西。按「扣住名义上结束
             // 了」把它退掉，就是让每一个红的提交在头往下走之后自动被放弃——队列
             // 里那几十行 `ci-red-*` 一直没跑完、而 CI 一直是红的，正是这么来的。
+            //
+            // 例外只留这一拍：下一个轮首由
+            // [`Self::retire_ci_holds_that_lag_the_round`] 按「这一拍还在办的是哪
+            // 几版」统一判一次。两边不矛盾，因为退掉一行不等于放弃那个缺陷：CI 按
+            // push 判，红还在的话下一版会被同一组检查再判红一次，部署器会为那一版
+            // 重开一行——同一件事，换一个还在主线上、能拿这份失败去修的底座。留着的
+            // 代价是停线车道只有一个座位（2026-11-05 18:2x 实测：一行追六小时前那
+            // 一版，消费组 `idle` 五十四分钟，当前 head 的红连队列都没进）。
             if ended.outcome != "rev_no_longer_tracked" {
                 self.retire_ci_hold_rows(&held.rows, &ended).await;
                 // 这一次收的只是**它自己**开出去的那几行（`held.rows`）。更早几次
@@ -16979,6 +17029,99 @@ exit 0
              只收 `held.rows` 里那一条，另一条就一直占着车道唯一的座位"
         );
         settle(handle).await;
+    }
+
+    /// 扣住一直不结束的那些拍，也要收掉追着更早版本的行。
+    ///
+    /// 上一条靠的是「扣住结束」那一刻，而扣住不结束（上游一直红着）时那一刻根本
+    /// 不发生：追着更早版本的行照样占着停线车道唯一的座位。2026-11-06 05:3x 实测，
+    /// 扣住还指着 52fe919e，车道上四条里有三条追的版本比它早几个小时，其中一条
+    /// 已经在跑。
+    ///
+    /// 判据是「这一拍还在办的那几版」——头，以及扣住指着的那一版。两版都留：这一拍
+    /// 接下来要把扣住换成这一轮问到的最新红，行跟着改 `input.rev`（id 不变），先收
+    /// 再开就是同一个 id 取消完又开一次。
+    #[tokio::test]
+    async fn a_tick_retires_holds_that_lag_while_the_hold_goes_on() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        // 已经滚在头上：这一拍是 `SameRev`，它连挑版本那一步都不会走到，更不会开
+        // 新单——这正是线上那几拍的样子，陈旧的行就靠轮首这一处收。
+        let deployed = main_image("localhost:30500", &rev_b);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let (endpoint, _seen) = fake_ci_by_rev(|_line| {
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#)
+        })
+        .await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.upstreams = vec![crate::config::UpstreamTrackConfig {
+            platform: crate::config::CodePlatform::Github,
+            repo: "owner/repo".into(),
+            api_base: Some(format!("http://{endpoint}/github")),
+        }];
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare))
+            .with_orchestrator(planner.clone());
+
+        // 这一拍还在办的那一行（追着头），以及更早一次扣住开的、追着已经被走过去的
+        // 那一版的那一行。
+        let live = cog_core::Task::new(
+            "ci-red-live-2026-11-06-fix",
+            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.into()),
+            serde_json::json!({ "goal": "make CI green", "rev": rev_b }),
+        );
+        let lagging = cog_core::Task::new(
+            "ci-red-lagging-2026-11-05-fix",
+            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.into()),
+            serde_json::json!({ "goal": "make CI green", "rev": rev_a }),
+        );
+        for row in [&live, &lagging] {
+            planner
+                .graph
+                .lock()
+                .unwrap()
+                .insert(row.id.clone(), row.clone());
+        }
+        let now = Utc::now().timestamp();
+        let mut state = deployer.load_state();
+        state.ci_hold = Some(CiHold {
+            rev: rev_b.clone(),
+            since_unix: now - 600,
+            opened_rev: rev_b.clone(),
+            opened_unix: now - 600,
+            failed_checks: vec!["github:Test".into()],
+            rows: vec![live.id.clone()],
+        });
+        state.ci_hold_run_since_unix = Some(now - 600);
+        deployer.save_state(&state).unwrap();
+
+        let _ = deployer.poll_once().await;
+
+        let after = deployer.load_state();
+        assert!(
+            after.ci_hold.is_some(),
+            "上游这一版还是红的：这一段扣住没有结束，收行就不能挂在它结束那一刻"
+        );
+        let cancelled: Vec<String> = planner.cancels().iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            cancelled,
+            vec![lagging.id.clone()],
+            "追着 rev_a 的那一行要收掉，追着这一版的那一行要留着：{cancelled:?}"
+        );
+        assert!(
+            planner
+                .graph
+                .lock()
+                .unwrap()
+                .get(&live.id)
+                .is_some_and(|t| !t.status.is_terminal()),
+            "这一拍还在办的那一行不许被收"
+        );
     }
 
     /// 两拍之间落了两个 rev、而部署器每拍只追当时的头：中间那个从没被任何一拍
