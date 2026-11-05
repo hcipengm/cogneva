@@ -672,6 +672,30 @@ enum FailureAttribution {
 /// exists to prevent. Empty means the whole workspace.
 type BaselineFailures = Option<(String, Vec<String>, BTreeSet<String>)>;
 
+/// How a change's diff meets the tree it is about to be applied to.
+///
+/// A patch keeps the branch it was generated against in its context lines; the
+/// branch does not wait for it. Which of the two applies is a fact about the
+/// generator's aim, not about whether the change is right, so it is recorded
+/// rather than flattened into "applied".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyMode {
+    /// Every hunk's context still matches: plain `git apply`.
+    Direct,
+    /// Some context line has moved, but the patch still merges cleanly against
+    /// the blobs it was generated from: `git apply --3way`.
+    ThreeWay,
+}
+
+impl ApplyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::ThreeWay => "three_way",
+        }
+    }
+}
+
 /// What this deployment's formatting stage read for a tree.
 #[derive(Debug)]
 enum FormatVerdict {
@@ -1468,9 +1492,27 @@ impl ChangePipeline {
         let applies = self.git_apply_check(workdir, &change.content).await;
         // 读数在判词之后、早退之前：这一步的 oracle 与下面这道门是同一个
         // `git apply --check`，所以读数说的是「这份 diff 与目标树有多契合」，
-        // 而不是另一套判定。
-        self.report_fidelity(workdir, &change.content, applies.is_ok())
-            .await;
+        // 而不是另一套判定。只有整份 diff 直接贴合目标树才算「整份通过」：
+        // 要靠三方合并才落得下去的那一份，逐块还是要分开量——它落下去靠的是
+        // 原来的 blob，不是现在这几行。
+        self.report_fidelity(
+            workdir,
+            &change.content,
+            matches!(applies, Ok(ApplyMode::Direct)),
+        )
+        .await;
+        if let Ok(mode) = applies {
+            if mode == ApplyMode::ThreeWay {
+                // 这一行是「分支在变更等着的这段时间里动了」的唯一读数：它不
+                // 判负，但它是那条从生成到落地之间的延迟在多长、要不要去缩
+                // 它，唯一看得到的地方。
+                info!(
+                    change_id = %change.artifact_id,
+                    mode = mode.as_str(),
+                    "change applied as a three-way merge"
+                );
+            }
+        }
         if let Err(e) = applies {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
@@ -2215,9 +2257,15 @@ impl ChangePipeline {
         Ok(())
     }
 
-    /// Run `git apply --check` on change content without modifying the tree.
-    async fn git_apply_check(&self, workdir: &Path, change_content: &str) -> SFResult<()> {
-        self.run_git_apply(workdir, change_content, true).await
+    /// Run `git apply --check` on change content without modifying the tree,
+    /// and say how the patch meets this tree.
+    ///
+    /// Returns the mode rather than `()` so the reading published next to the
+    /// verdict can tell a direct hit from a merge: a change that only lands
+    /// because the base moved under it is a different fact about the generator
+    /// than one that still fits, and the two are only distinguishable here.
+    async fn git_apply_check(&self, workdir: &Path, change_content: &str) -> SFResult<ApplyMode> {
+        self.probe_apply_mode(workdir, change_content).await
     }
 
     /// 逐文件/逐块读出这份 diff 有多少真的在目标树里找到上下文，并上报。
@@ -2392,24 +2440,113 @@ impl ChangePipeline {
         }
     }
 
-    /// Apply change content to the working tree with `git apply`.
+    /// Apply change content to the working tree with `git apply`, in whichever
+    /// mode [`Self::probe_apply_mode`] found a fit.
     async fn git_apply(&self, workdir: &Path, change_content: &str) -> SFResult<()> {
-        self.run_git_apply(workdir, change_content, false).await
+        match self.probe_apply_mode(workdir, change_content).await? {
+            ApplyMode::Direct => self.run_git_apply_args(workdir, change_content, &[]).await,
+            ApplyMode::ThreeWay => {
+                // `--3way` writes the merge into the tree before it decides
+                // whether the merge is clean, so a refusal here has already
+                // put conflict markers in the files it names. Leaving them
+                // would hand the next gate a file nobody wrote.
+                let applied = self
+                    .run_git_apply_args(workdir, change_content, &["--3way"])
+                    .await;
+                if applied.is_err() {
+                    let _ = self.git_reset_hard(workdir, change_content).await;
+                }
+                applied
+            }
+        }
     }
 
-    /// Shared implementation for `git apply [--check]`.
-    async fn run_git_apply(
+    /// How this patch meets the tree it is about to be applied to.
+    ///
+    /// A change is generated against the branch as it stood, and lands later:
+    /// while it waits, every other landing moves the lines around it. Plain
+    /// `git apply` refuses as soon as a context line no longer matches, so the
+    /// work behind that diff -- a whole generation cycle -- is thrown away for
+    /// a reason that has nothing to do with the change being wrong. Measured
+    /// on 2026-11-05: 67 of 220 landing records were retired this way, the
+    /// largest single class after the promotion gate's own gap.
+    ///
+    /// So the question is asked in two steps, and both the pre-check and the
+    /// apply go through this one answer: a patch that still fits is applied
+    /// as before; a patch that no longer fits but merges cleanly against the
+    /// blobs it was generated from is applied as a three-way merge. Nothing is
+    /// loosened -- a merge that conflicts is still a refusal, and every gate
+    /// downstream reads the merged tree rather than the diff.
+    async fn probe_apply_mode(&self, workdir: &Path, change_content: &str) -> SFResult<ApplyMode> {
+        match self
+            .run_git_apply_args(workdir, change_content, &["--check"])
+            .await
+        {
+            Ok(()) => Ok(ApplyMode::Direct),
+            // The direct error is the one reported when the merge does not
+            // work either: it names the line the patch was searching for and
+            // that is what a reader can act on, while the three-way failure
+            // would only say the merge was refused.
+            Err(direct) => match self.three_way_merges_cleanly(workdir, change_content).await {
+                true => Ok(ApplyMode::ThreeWay),
+                false => Err(direct),
+            },
+        }
+    }
+
+    /// Whether `git apply --3way` merges this patch into `HEAD` without
+    /// leaving conflicts.
+    ///
+    /// The probe runs against a throwaway index (`GIT_INDEX_FILE`) and
+    /// `--cached`, so it writes nothing to the worktree: pointed at the real
+    /// index, asking the question would answer it by doing it. Git's exit
+    /// status is the whole answer here -- `--3way` against a patch that does
+    /// not merge exits non-zero, which is why this does not re-read the index
+    /// for conflict stages afterwards. A patch with no `index` line carries no
+    /// blob to merge against, and git refuses that too; the refusal is the
+    /// `false` this returns, not a distinguishing case.
+    async fn three_way_merges_cleanly(&self, workdir: &Path, change_content: &str) -> bool {
+        let index = std::env::temp_dir().join(format!(
+            "cogneva-3way-{}-{}.idx",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let merged = self
+            .three_way_probe_with_index(workdir, change_content, &index)
+            .await
+            .unwrap_or(false);
+        let _ = tokio::fs::remove_file(&index).await;
+        merged
+    }
+
+    async fn three_way_probe_with_index(
         &self,
         workdir: &Path,
         change_content: &str,
-        check_only: bool,
-    ) -> SFResult<()> {
-        self.run_git_apply_args(
-            workdir,
-            change_content,
-            if check_only { &["--check"] } else { &[] },
-        )
-        .await
+        index: &Path,
+    ) -> SFResult<bool> {
+        // The merge needs an index that starts where `HEAD` is, not one
+        // carrying whatever the worktree had staged when the question was
+        // asked; `read-tree` builds exactly that in the throwaway file.
+        let read_tree = tokio::process::Command::new("git")
+            .args(["read-tree", "HEAD"])
+            .env("GIT_INDEX_FILE", index)
+            .current_dir(workdir)
+            .output()
+            .await
+            .map_err(|e| SFError::IO(format!("Failed to run git read-tree: {}", e)))?;
+        if !read_tree.status.success() {
+            return Ok(false);
+        }
+        Ok(self
+            .run_git_apply_with_index(
+                workdir,
+                change_content,
+                &["--cached", "--3way"],
+                Some(index),
+            )
+            .await
+            .is_ok())
     }
 
     /// `git apply` with the caller's flags, patch on stdin.
@@ -2423,9 +2560,25 @@ impl ChangePipeline {
         change_content: &str,
         flags: &[&str],
     ) -> SFResult<()> {
+        self.run_git_apply_with_index(workdir, change_content, flags, None)
+            .await
+    }
+
+    /// [`Self::run_git_apply_args`] against a named index, for the probe that
+    /// must not touch the worktree's own.
+    async fn run_git_apply_with_index(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+        flags: &[&str],
+        index: Option<&Path>,
+    ) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg("apply").arg("-v").current_dir(workdir);
         cmd.args(flags);
+        if let Some(index) = index {
+            cmd.env("GIT_INDEX_FILE", index);
+        }
 
         let mut child = cmd
             .stdin(std::process::Stdio::piped())
@@ -3851,6 +4004,10 @@ mod tests {
 
     use crate::checkout::repo_root;
 
+    /// Ten numbered lines, so a hunk's context window and the line it edits
+    /// are different lines and can be moved independently.
+    const TEN_LINES: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+
     /// [`one_change_wall_secs`] 加的是哪几段活、`FMT_SEGMENT_WALL_SECS` 那个数
     /// 乘的是哪几趟命令，都是数着源码里的调用点写下来的。加一条 gated 命令、
     /// 或让 `run_cargo_fmt` 多跑一趟，界就少算一段——而界少了的症状是停摆告警
@@ -4767,6 +4924,208 @@ index 1111111..2222222 100644
 
     /// A change that adds a file can be taken off and put back on.
     ///
+    /// A change whose base moved while it waited still lands.
+    ///
+    /// A generated diff is aimed at the branch as it stood when the change was
+    /// written, and it is applied later — after other landings have moved the
+    /// lines around it. Plain `git apply` refuses the moment one context line
+    /// no longer matches, which throws away a whole generation cycle for a
+    /// reason that has nothing to do with the change being wrong. Measured on
+    /// 2026-11-05: 67 of the 220 landing records held in the pod were retired
+    /// this way, and after the promotion gate's path-family gap was closed it
+    /// was the largest remaining class. The patch still merges against the
+    /// blobs it was generated from, so it is applied as a three-way merge and
+    /// the tree carries both edits.
+    #[tokio::test]
+    async fn a_change_whose_base_moved_still_lands_as_a_three_way_merge() {
+        use tokio::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .await
+                .expect("git plumbing failed");
+        }
+
+        let src = root.join("src").join("lib.rs");
+        tokio::fs::create_dir_all(src.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&src, TEN_LINES).await.unwrap();
+        Command::new("git")
+            .args(["add", "--", "src/lib.rs"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+
+        // The change, captured the way the generator leaves it behind.
+        tokio::fs::write(&src, TEN_LINES.replace("five", "five-changed"))
+            .await
+            .unwrap();
+        let diff = Command::new("git")
+            .args(["diff"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+        let diff = String::from_utf8(diff.stdout).unwrap();
+        assert!(
+            diff.contains("\nindex "),
+            "a generated diff carries the blobs it was written against, which is what the merge needs"
+        );
+        Command::new("git")
+            .args(["checkout", "--", "src/lib.rs"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+
+        // The branch moves under it: line three is a context line of the hunk.
+        tokio::fs::write(&src, TEN_LINES.replace("three", "three-moved"))
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "--", "src/lib.rs"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "advance"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+
+        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
+        assert_eq!(
+            pipeline.git_apply_check(root, &diff).await.unwrap(),
+            ApplyMode::ThreeWay,
+            "a patch whose context moved is a merge, not a refusal"
+        );
+        pipeline.git_apply(root, &diff).await.unwrap();
+
+        let content = tokio::fs::read_to_string(&src).await.unwrap();
+        assert!(
+            content.contains("three-moved"),
+            "the branch's own edit has to survive the merge"
+        );
+        assert!(
+            content.contains("five-changed"),
+            "the change has to land on top of the moved branch"
+        );
+    }
+
+    /// A merge that conflicts is still a refusal, and leaves no markers behind.
+    ///
+    /// `git apply --3way` reports a conflicted merge through the index and not
+    /// through its exit status alone; more importantly, asking it to *check*
+    /// answers zero for a patch it would leave conflicted. So the probe runs
+    /// against a throwaway index: the real worktree is never written by a
+    /// question, and a change that cannot merge is refused with the direct
+    /// error rather than applied half-way.
+    #[tokio::test]
+    async fn a_change_that_conflicts_with_the_moved_base_is_refused_untouched() {
+        use tokio::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .await
+                .expect("git plumbing failed");
+        }
+
+        let src = root.join("src").join("lib.rs");
+        tokio::fs::create_dir_all(src.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&src, TEN_LINES).await.unwrap();
+        Command::new("git")
+            .args(["add", "--", "src/lib.rs"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+
+        tokio::fs::write(&src, TEN_LINES.replace("five", "five-changed"))
+            .await
+            .unwrap();
+        let diff = Command::new("git")
+            .args(["diff"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+        let diff = String::from_utf8(diff.stdout).unwrap();
+        Command::new("git")
+            .args(["checkout", "--", "src/lib.rs"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+
+        // The branch rewrites the same line the change rewrites.
+        tokio::fs::write(&src, TEN_LINES.replace("five", "five-other"))
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "--", "src/lib.rs"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "advance"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+
+        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
+        assert!(
+            pipeline.git_apply_check(root, &diff).await.is_err(),
+            "a patch that conflicts with the moved branch must be refused"
+        );
+        let content = tokio::fs::read_to_string(&src).await.unwrap();
+        assert!(
+            !content.contains("<<<<<<<"),
+            "the check must not leave conflict markers in the tree it was asked about"
+        );
+        assert!(
+            content.contains("five-other"),
+            "the probe must not write the tree"
+        );
+    }
+
     /// `git reset --hard` restores tracked files only, so the file the change
     /// created stays behind as untracked and the second apply of that same
     /// change fails on it ("already exists"). A change whose suite failed is
