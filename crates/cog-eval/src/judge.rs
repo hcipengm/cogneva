@@ -22,12 +22,20 @@ pub struct LlmJudge {
     options: ChatOptions,
 }
 
+/// 判分器自己的账名。
+///
+/// 评测一次有两半在叫模型：被评测的骨架在解题，判分器在给解题打分。两半此前
+/// 都记成 `eval`，于是「这次评测花了多少」只有一个数，而它是两种工钱的和——判分
+/// 器的上游将来与骨架不是同一个模型、不是同一份配额时，这个数就再也分不开了。
+/// 骨架保留 `eval`（历史读数里绝大部分是它），判分这一半分出去。
+pub const JUDGE_ACTOR: &str = "eval-judge";
+
 impl LlmJudge {
     pub fn new(provider: Arc<dyn LlmClient>, prompt_template: String) -> Self {
         Self {
             provider,
             prompt_template,
-            options: ChatOptions::default().with_actor("eval"),
+            options: ChatOptions::default().with_actor(JUDGE_ACTOR),
         }
     }
 
@@ -305,6 +313,34 @@ mod tests {
         }
         async fn health_check(&self) -> bool {
             true
+        }
+    }
+
+    /// 判分与解题的工钱要在账上分得开：判分器的每一次调用都带自己的名字，而不是
+    /// 与骨架共用 `eval`。读的是构造出来的 options，也就是真正发出去的那一份。
+    #[test]
+    fn every_preset_judge_stamps_its_own_actor() {
+        let provider: Arc<dyn LlmClient> = Arc::new(NeverAsked);
+        let judges = [
+            goal_judge(provider.clone()),
+            plan_judge(provider.clone()),
+            plan_adherence_judge(provider.clone()),
+            logic_judge(provider.clone()),
+            tool_selection_judge(provider.clone()),
+            tool_calling_judge(provider.clone()),
+            safety_judge(provider.clone()),
+        ];
+        for judge in judges {
+            assert_eq!(
+                judge.options.headers.get(cog_core::LLM_ACTOR_HEADER),
+                Some(&JUDGE_ACTOR.to_string()),
+                "a judge call would be billed under the scaffold's name"
+            );
+            assert_ne!(
+                judge.options.headers.get(cog_core::LLM_ACTOR_HEADER),
+                Some(&"eval".to_string()),
+                "the judge and the model it grades must not share a label"
+            );
         }
     }
 

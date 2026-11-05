@@ -254,6 +254,10 @@ pub const UNREGISTERED_SITES: &[UnregisteredSite] = &[
         why: "a CLI experiment run, launched by hand: idle in every window no one runs it, and no reading says when one is due",
     },
     UnregisteredSite {
+        actor: "eval-judge",
+        why: "the grading half of the same hand-launched run: it calls once per graded case, so its windows follow the run's, not a cadence of its own",
+    },
+    UnregisteredSite {
         actor: "sandbox-document-organizer",
         why: "reached from the sandbox documenter, which runs when a run produces documents rather than on a cadence",
     },

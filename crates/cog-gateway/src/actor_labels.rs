@@ -23,7 +23,18 @@
 //! configured role cannot introduce arbitrary text into the label.
 
 /// Actors whose whole value is fixed.
-pub const ACTOR_LABELS: &[&str] = &["eval", "ralph", "sandbox-document-organizer", "self_review"];
+/// `eval` is the evaluation harness's own loops — the scaffold that solves a
+/// case; `eval-judge` is the half that grades what was solved. They are two
+/// values rather than one because the two halves may later call different
+/// upstreams under different quotas, and a single label would make the two
+/// bills unseparable after the fact.
+pub const ACTOR_LABELS: &[&str] = &[
+    "eval",
+    "eval-judge",
+    "ralph",
+    "sandbox-document-organizer",
+    "self_review",
+];
 
 /// Actors that carry a configured role name after the colon.
 pub const ACTOR_LABEL_PREFIXES: &[&str] = &["agent:", "self_review:"];

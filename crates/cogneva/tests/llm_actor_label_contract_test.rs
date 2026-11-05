@@ -60,7 +60,10 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         &["ralph"],
     ),
     ("crates/cog-eval/src/adapters/hle.rs", &["eval"]),
-    ("crates/cog-eval/src/judge.rs", &["eval"]),
+    // The grading half of an evaluation run, kept apart from the scaffold that
+    // solves the case: the two may later call different upstreams, and one
+    // label would make their bills unseparable after the fact.
+    ("crates/cog-eval/src/judge.rs", &["eval-judge"]),
     // The scaffolds are the harness's own loops (plan / step / GEPA judge). They
     // went without an actor until 2026-11-03, which is where the 28.1M tokens
     // the ledger holds under `unknown` on 10-18/10-19 came from.
