@@ -283,6 +283,8 @@ mod memory_backend_test;
 mod memory_composite_test;
 #[path = "memory_core_backend_test.rs"]
 mod memory_core_backend_test;
+#[path = "memory_extraction_follows_its_readers_test.rs"]
+mod memory_extraction_follows_its_readers_test;
 #[path = "memory_importance_ranking_test.rs"]
 mod memory_importance_ranking_test;
 #[path = "memory_metrics_backend_test.rs"]

@@ -280,6 +280,23 @@ const NS_FAILURE: &str = "failure_pattern";
 const NS_EXECUTION: &str = "task_execution";
 const NS_KNOWLEDGE: &str = "knowledge";
 
+/// Every namespace this backend searches, in one place.
+///
+/// The extractor is told to skip a namespace no one here reads, and it is told
+/// by copying this list; the copy is pinned equal by a contract test in the
+/// assembly crate. That is why the list is written here rather than where the
+/// extractor lives: the answer to "who reads this" is the set of searches
+/// below, and a second list somewhere else would be a second answer.
+///
+/// `reflection` is deliberately absent: its rows are read by the reflection
+/// loop's own reader, not by the knowledge retrieval above.
+pub const READ_NAMESPACES: [&str; 4] = [
+    NS_DECOMPOSITION,
+    NS_IMPLEMENTATION,
+    NS_FAILURE,
+    NS_EXECUTION,
+];
+
 /// Which memory layer a retrieved row came from, as it appears in the row's
 /// `source`. The two layers are two tables, so the retrieval reading has to be
 /// written back to the one the row belongs to; the assembly point is the only

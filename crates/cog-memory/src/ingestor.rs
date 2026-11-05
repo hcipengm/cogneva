@@ -38,7 +38,29 @@ pub const MEMORY_BUS_CONSUME_LOOP: &str = "memory_ingest_bus_consume";
 /// `memory_operations_total` 上「这次没抽，因为同一份 raw 已有人在办」的
 /// operation 取值。放在这里而不是指标名常量里：它不是一条新的操作，是抽取
 /// 这条路上的一次具名跳过。
+/// The namespaces something searches, and therefore the only ones extraction
+/// runs in.
+///
+/// A copy of `cog_wiki::unified_knowledge_backend::READ_NAMESPACES`, which lives
+/// beside the searches that use it. The copy exists because the crate that pays
+/// for extraction must not depend on the crate that reads it; a contract test in
+/// `cogneva` holds the two equal, so a reader added on one side without the
+/// other turns red there instead of re-opening a spend that buys nothing.
+///
+/// `default` is deliberately absent: it is where extraction used to write, and
+/// no production search asks for it.
+const READ_NAMESPACES: [&str; 4] = [
+    "task_decomposition",
+    "implementation",
+    "failure_pattern",
+    "task_execution",
+];
+
 const SKIP_IN_FLIGHT_OPERATION: &str = "extract_skipped_in_flight";
+
+/// `memory_operations_total` 上「这份 raw 的命名空间没有读者，所以没抽」的
+/// operation 取值。带上命名空间标签，读数才能点名是哪一层没有读者。
+const SKIP_UNREAD_NAMESPACE_OPERATION: &str = "extract_skipped_unread_namespace";
 
 /// `memory_operations_total` 上「同一份抽取又被发了一遍」的 operation 取值。
 ///
@@ -290,6 +312,20 @@ pub struct MemoryIngestorConfig {
     /// 积压深度告警起点：深度首次达到该值及之后每翻倍一次打一条 WARN，
     /// 让吞不下的事件洪峰在日志里可见而不是静默排队。
     pub backlog_warn_at: usize,
+    /// 读侧声明它搜哪几个命名空间；抽取只在这些里进行。
+    ///
+    /// 抽取是这条链路上唯一一次买模型调用，而它写出去的那一层必须有人搜。
+    /// 没有读者的层照抽，等于按天买一份没有人借的书：花的是别人付的钱，长
+    /// 的是没人还的本。表里没有的命名空间不抽，跳过记
+    /// `memory_operations_total{operation="extract_skipped_unread_namespace"}`。
+    ///
+    /// 这张表由 [`From<&IngestConfig>`] 填，值取自 [`READ_NAMESPACES`]——不从
+    /// YAML 读：它是读侧的声明，读侧在代码里，让运维在配置里改等于让花掉的钱
+    /// 和读的人脱钩，而两边都会各自以为是对方在管。空表 = 不设闸，只有
+    /// [`MemoryIngestorConfig::default`] 会给出空表：它只出现在单测里，而那些
+    /// 单测问的是抽取怎么写，不是闸开不开。生产装配一定走 `From`，两者相等由
+    /// `cogneva` 的契约测试钉住。
+    pub read_namespaces: Vec<String>,
     /// 总线消费组名（durable consumer / consumer group）。同组多副本共同
     /// 分担事件，组名即断点续传的身份。
     pub bus_group: String,
@@ -326,6 +362,9 @@ impl Default for MemoryIngestorConfig {
             pool_check_secs: 30,
             pull_resume_observation_secs: 300,
             backlog_warn_at: 64,
+            // 兜底构造不设闸：它只出现在单测里（测的是抽取本身），
+            // 装配路径一律走 `From<&IngestConfig>` 并把读侧声明带上。
+            read_namespaces: Vec::new(),
             bus_group: "memory-ingestor".into(),
             bus_claim_interval_secs: 30,
             bus_claim_min_idle_ms: 900_000,
@@ -353,6 +392,7 @@ impl From<&IngestConfig> for MemoryIngestorConfig {
             pool_check_secs: c.pool_check_secs,
             pull_resume_observation_secs: c.pull_resume_observation_secs,
             backlog_warn_at: c.backlog_warn_at,
+            read_namespaces: READ_NAMESPACES.iter().map(|n| n.to_string()).collect(),
             bus_group: c.bus_group.clone(),
             bus_claim_interval_secs: c.bus_claim_interval_secs,
             bus_claim_min_idle_ms: c.bus_claim_min_idle_ms,
@@ -1445,6 +1485,21 @@ impl MemoryIngestor {
     /// `false`，投递方据此决定要不要 ack——不算完成就不该回执，否则这份 raw
     /// 只剩对账一条路可走。
     async fn ingest_missing(&self, raw: &RawSource) -> SFResult<bool> {
+        // 没有读者就不花钱。抽取是这条链路上唯一一次买模型调用，而它写出去
+        // 的那一层必须有人搜；没人搜的时候，「抽了」与「没抽」在功能上完全
+        // 一样，只在账本上不一样。跳过不是删除：raw 照旧归档，两层的存在性
+        // 检查让读侧一出现、对账那一拍就把欠账补回来。
+        if !self.config.read_namespaces.is_empty()
+            && !self
+                .config
+                .read_namespaces
+                .iter()
+                .any(|namespace| namespace == &raw.namespace)
+        {
+            self.record_skipped_unread_namespace(&raw.namespace).await;
+            return Ok(true);
+        }
+
         let Some(_claim) = self.in_flight.try_claim(&raw.id) else {
             self.record_skipped_in_flight().await;
             debug!(
@@ -1514,6 +1569,28 @@ impl MemoryIngestor {
             .await
         {
             warn!("Failed to record in-flight extraction skip: {}", e);
+        }
+    }
+
+    /// 记一次「这份 raw 所在的命名空间没有读者，因此没有抽取」。
+    ///
+    /// 跳过的理由带上命名空间：这一格要回答的是「钱停在哪一层」，不是「停了
+    /// 多少」。与在办跳过复用同一个名字族，理由同上。
+    async fn record_skipped_unread_namespace(&self, namespace: &str) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert(
+            crate::observable::HOLDER_LABEL.to_string(),
+            SKIP_UNREAD_NAMESPACE_OPERATION.to_string(),
+        );
+        labels.insert("namespace".to_string(), namespace.to_string());
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 1.0, labels)
+            .await
+        {
+            warn!("Failed to record unread-namespace extraction skip: {}", e);
         }
     }
 
@@ -2721,6 +2798,69 @@ mod tests {
             let summary = self.inner.generate_summary(source).await?;
             Ok((schema, summary))
         }
+    }
+
+    /// 没有读者的命名空间不花钱：抽取是这条链路上唯一一次买模型调用，而它
+    /// 写出去的那一层必须有人搜。这条钉的是「跳过」，不是「失败」——返回
+    /// `true` 让投递方照常 ack，raw 已归档、两层都缺，读侧一出现，对账那一拍
+    /// 就把欠账补回来。
+    #[tokio::test]
+    async fn a_namespace_no_one_reads_is_never_extracted() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let extractor = Arc::new(CountingExtractor::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend, extractor.clone())
+            .with_metrics(metrics.clone())
+            .with_config(MemoryIngestorConfig {
+                read_namespaces: vec!["task_execution".into()],
+                ..MemoryIngestorConfig::default()
+            });
+
+        let raw = entity_raw("nobody-reads-this");
+        assert_eq!(raw.namespace, "default");
+
+        let done = ingestor.ingest_missing(&raw).await.unwrap();
+
+        assert!(
+            done,
+            "a skip still settles the delivery; it is not a failure"
+        );
+        assert_eq!(
+            extractor.calls(),
+            (0, 0, 0),
+            "no call may be bought for a namespace no reader queries"
+        );
+        assert_eq!(
+            metrics.counter_total(
+                "memory_operations_total",
+                "extract_skipped_unread_namespace"
+            ),
+            Some(1.0),
+            "the skip must be readable; otherwise it is only an absence"
+        );
+    }
+
+    /// 读者在表里就照常抽：闸只挡没人搜的那一层。
+    #[tokio::test]
+    async fn a_namespace_a_reader_queries_is_still_extracted() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let extractor = Arc::new(CountingExtractor::default());
+        let ingestor =
+            MemoryIngestor::new(backend, extractor.clone()).with_config(MemoryIngestorConfig {
+                read_namespaces: vec!["default".into()],
+                ..MemoryIngestorConfig::default()
+            });
+
+        ingestor
+            .ingest_missing(&entity_raw("someone-reads-this"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            extractor.calls(),
+            (1, 0, 0),
+            "a namespace a reader queries must still be extracted on the merged path"
+        );
     }
 
     /// 正常路径两层都缺：只许发生一次合并抽取。分层调用会把同一段 payload
