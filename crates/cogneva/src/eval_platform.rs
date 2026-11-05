@@ -109,22 +109,23 @@ impl PlatformRunner for NoPlatform {
 //
 // 三处对应关系都写在这个文件里，别处不再有一份。
 //
-// 还有一条前提，它不在这个文件里、也不由这个文件决定：**平台必须把投进去的那道题当一道
-// 题跑，并且说清楚答案落在哪一行上**。平台受理的是「意图」，默认会让规划器把意图拆成一堆
-// 子任务，投进去的那个 id 变成一个不可执行的父占位符。所以平台侧有两条约定，缺一不可：
+// 还有一条前提，它不在这个文件里、但由这个文件的提交形态决定：**投进去的那一行必须
+// 就是干活的那一行**。平台受理的是「意图」，默认会让规划器把它拆成一堆子任务、投进去
+// 的那个 id 变成一个不可执行的父占位符，答案落在别处。所以这里按「一件已经决定好的活」
+// 提交（`intent_kind: task` ＋ 自报 `verified`），平台直接把它交给一位员工。
 //
-//   1. 占位行上带一条声明（`sink_task_id`），指出这道目标的答案落在分解出的哪一条上；
-//   2. 那条走到终态时，占位行的终态跟着它走——否则这里轮询的那一行永远停在 Pending。
-//
-// 分解若没有给出恰好一条收口任务，平台整份判退（占位行落 Failed 并带上原因），这里就把
-// 平台的失败原因报出去：不挑一条顶上，也不把某一片的中间产物算成这一格的答案。对上一个
-// 既不声明也不推导的平台，这里同样不猜——轮询到时限，报出平台自己的状态。
+// 老平台/网关仍可能拆解，那时答案靠占位行上的声明（`sink_task_id`）找回：读路径保留，
+// 免得一次版本错位把这一行读成「complete 了却没存结果」。
 
-/// 投给平台的一题在平台侧叫什么种类。
+/// 一题进平台时用的种类：**一件交给名册上任意员工的活**。
 ///
-/// 未知种类在平台里就是普通原子任务，走它自己的 DAG 与执行器——这一行量的是「题目
-/// 进平台之后平台跑成什么样」，所以外壳不替平台挑执行路径，只把题交出去。
-const PLATFORM_TASK_KIND: &str = "benchmark_case";
+/// 不是平台不认识的 `benchmark_case`。那个名字落进平台之后走的是分解：题目被规划器
+/// 拆成子任务，投进去的那一行变成不可执行的占位，答案得靠它在子任务上写下的声明
+/// 找回——一道基准题被拆成几步去答，量的就不是「一个通用智能体答这道题」了。用
+/// [`cog_core::contract::work_item::PLATFORM_AGENT_TASK`] 则直接落在接活分支：题面、
+/// 做法、判据都在活里，谁接谁干，答案就是那一位员工的答复，账记在它自己的
+/// `agent:<id>` 上。
+const PLATFORM_TASK_KIND: &str = cog_core::contract::work_item::PLATFORM_AGENT_TASK;
 /// 平台 API 的基址，例如 `http://127.0.0.1:8080`。未设置＝这个部署没有可投递的平台。
 pub const PLATFORM_BASE_ENV: &str = "COG_EVAL_PLATFORM_BASE";
 /// 平台 API 的 bearer token。平台的运营路由按角色判，多数部署要带一枚；未设置时
@@ -132,6 +133,27 @@ pub const PLATFORM_BASE_ENV: &str = "COG_EVAL_PLATFORM_BASE";
 pub const PLATFORM_TOKEN_ENV: &str = "COG_EVAL_PLATFORM_TOKEN";
 /// 一题在平台侧最多等多久（秒）。
 pub const PLATFORM_DEADLINE_ENV: &str = "COG_EVAL_PLATFORM_DEADLINE_SECS";
+/// 行上的预算比桥的等待短多少秒。
+///
+/// 这一段的用途只有一个：让平台成为先判超时的那一方。反过来（桥先放弃）时，表里那一格
+/// 只剩「平台没跑完」，平台本来会写下的原因就没人读得到了。
+// cap: bound — 一次轮询到下一轮的余量；比 POLL_INTERVAL 大，才能在放弃前读到平台写的终态
+const PLATFORM_BUDGET_MARGIN_SECS: u64 = 30;
+
+/// 接活的人读到的做法：这道题要交回什么。
+///
+/// 判分器读的是答复正文，所以「答案放正文里」必须写在活里，不能指望接活的人从题面猜：
+/// 把推理过程、markdown 围栏或一句「我查到了……」交回去，分数掉下去而原因不在题上。
+const CASE_CONTRACT: &str = "You are answering one benchmark question. The question is in \
+    `task`; answer it. The text of your reply is what gets scored, so put the answer itself \
+    there -- not a description of how you would find it, and no markdown fence around it.";
+
+/// 一件基准活的验收判据。
+///
+/// 平台只派发自报 `verified` 却没有判据的行是**不派发**的（图里挂着，没人开工），
+/// 而提交方读到的只是 202。所以这一条是这道桥能跑起来的一部分，不是装饰。
+const CASE_ACCEPTANCE: &str =
+    "The reply answers the question in `task`, in the form that question asks for.";
 // cap: bound — a platform case's wall budget; a case that cannot finish must not be scored
 const DEFAULT_DEADLINE_SECS: u64 = 3600;
 // cap: bound — polling period for a submitted platform case; the wall budget is DEFAULT_DEADLINE_SECS
@@ -214,7 +236,14 @@ fn project(
     let result = facts.result.as_ref().ok_or_else(|| {
         anyhow::anyhow!("the platform completed task {case_id} and stored no result at all")
     })?;
+    // 接活的人交回的是 `{"result": …}` 这个信封（工具调用与步骤已经在轨迹里了）。
+    // 拆开它，判分器才读得到答案本身：把信封原样交回去，被评的是一段 JSON 包装，
+    // 而分数掉下来时读表的人只会以为这一格答错了。
     let final_answer = match result {
+        serde_json::Value::Object(map) => match map.get("result") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => result.to_string(),
+        },
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     };
@@ -419,23 +448,40 @@ impl PlatformApiRunner {
     /// 投一题。题面、种子与预算一起放进任务的 `input`：种子必须真的到达平台，
     /// 否则同一格的三个种子在平台侧是同一道题，那三个数就是一份拷贝。
     ///
-    /// `input.goal` 是题面本身而不是一句说明：平台执行一条原子任务时，取的是任务
-    /// `input` 里的 `goal` 作为要达成的东西，顶层那个 `goal` 只在平台决定怎么拆解时
-    /// 被读。写成说明句，平台拿到的是「去解 eval-table 那个 case」，不是那道题。
+    /// 提交形态是**一件已经决定好的活**（`intent_kind: task`）并自报 `verified`：
+    /// 少了这两项，平台会把这道题当意图去分解，题面读的是顶层 `goal` 那句说明，
+    /// 投进去的这一行变成占位符。带着这两项，这一行直接进图、由名册上的一位员工接走，
+    /// 题面在 `input.task` 上（活的做法在 `input.contract`，判据在 `input.acceptance`）。
+    ///
+    /// 行上的 `timeout_seconds` 比桥自己的等待短一段：平台先判超预算，这里才能把平台
+    /// 报的原因写进表；反过来这里是先超时的那一方，一格「平台没说话」会把平台自己
+    /// 说过的原因盖掉。
     async fn submit(&self, case_id: &str, request: &PlatformRequest) -> anyhow::Result<()> {
+        // 键名从契约里取，不在这里各拼一遍：做法那一栏的键名由渲染它的运行时定，
+        // 请求那一栏同理——两边各写一个字符串，改了一边另一边就把它读成普通材料。
+        let mut input = serde_json::json!({
+            "seed": request.seed,
+            "max_steps": request.budget.max_steps,
+            "max_context_tokens": request.budget.max_context_tokens,
+            "temperature": request.budget.temperature,
+            "acceptance": [CASE_ACCEPTANCE],
+        });
+        input[cog_core::contract::prompt::PROMPT_CONTRACT_KEY] =
+            serde_json::Value::String(CASE_CONTRACT.into());
+        input[cog_core::contract::prompt::REQUEST_KEYS[0]] =
+            serde_json::Value::String(request.task.clone());
         let body = serde_json::json!({
             "goal": request.task,
             "workspace_id": "",
+            "intent_kind": "task",
             "tasks": [{
                 "id": case_id,
                 "task_type": PLATFORM_TASK_KIND,
-                "input": {
-                    "goal": request.task,
-                    "seed": request.seed,
-                    "max_steps": request.budget.max_steps,
-                    "max_context_tokens": request.budget.max_context_tokens,
-                    "temperature": request.budget.temperature,
-                },
+                "input": input,
+                "planner": { "verified": true, "source": "user_provided" },
+                "timeout_seconds": self.settings.deadline_secs.saturating_sub(
+                    PLATFORM_BUDGET_MARGIN_SECS
+                ).max(1),
                 "blocked_by": [],
                 "priority": 0,
             }],
@@ -984,13 +1030,56 @@ mod tests {
         let sent = submitted.first().expect("the case was submitted").clone();
         assert_eq!(sent["tasks"][0]["id"], id_for_view);
         assert_eq!(sent["tasks"][0]["task_type"], PLATFORM_TASK_KIND);
-        // 题面要落在 `input.goal` 上，也落在顶层 `goal` 上：平台执行一条原子任务读
-        // 前者，决定怎么拆解读后者。种子与预算必须一起到。
-        assert_eq!(sent["tasks"][0]["input"]["goal"], "2 + 2?");
+        // 这是一件已经决定好的活：不带这两项，平台会把它当意图去拆解，投进去的这一行
+        // 变成占位符，答案落在别处——量到的就不是「一个员工答这道题」了。
+        assert_eq!(sent["intent_kind"], "task");
+        assert_eq!(sent["tasks"][0]["planner"]["verified"], true);
+        // 题面在活里的 `task` 上（`contract` 之外的那一半），也在顶层 `goal` 上：
+        // 前者是接活的人读到的请求，后者是平台自己的那一路。种子与预算必须一起到。
+        assert_eq!(sent["tasks"][0]["input"]["task"], "2 + 2?");
         assert_eq!(sent["goal"], "2 + 2?");
+        // 自报 verified 的行没有判据就不派发，而提交方只看到 202。
+        assert!(
+            sent["tasks"][0]["input"]["acceptance"][0]
+                .as_str()
+                .is_some_and(|a| !a.trim().is_empty()),
+            "a verified row must state what its answer has to look like"
+        );
+        assert!(sent["tasks"][0]["timeout_seconds"]
+            .as_u64()
+            .is_some_and(|s| s > 0));
+        // 做法随活一起走：接活的人不知道这是评测，只有这一句告诉他答案要放在正文里。
+        assert!(sent["tasks"][0]["input"]["contract"]
+            .as_str()
+            .is_some_and(|c| c.contains("benchmark question")));
         assert_eq!(sent["tasks"][0]["input"]["seed"], 3);
         assert_eq!(sent["tasks"][0]["input"]["max_steps"], 7);
         assert_eq!(sent["tasks"][0]["input"]["max_context_tokens"], 2048);
+    }
+
+    /// 接活的人交回的是 `{"result": …}` 信封：表里那一格要判的是信封里的正文。
+    ///
+    /// 把信封原样交回去，判分器评的是一段 JSON 包装，而分数掉下来时读表的人只会以为
+    /// 这一格答错了。
+    #[tokio::test]
+    async fn an_employee_answer_envelope_is_read_through() {
+        let id = case_task_id(&request("what is 2 + 2?", 5));
+        let fake = FakePlatform::new(
+            task_view(
+                &id,
+                cog_core::TaskStatus::Completed,
+                Some(serde_json::json!({ "result": "4" })),
+                None,
+            ),
+            trace_for(&id),
+        );
+        let served = Served::start(fake).await;
+        let reply = served
+            .runner(60)
+            .run(request("what is 2 + 2?", 5))
+            .await
+            .expect("a completing platform answers");
+        assert_eq!(reply.output.final_answer, "4");
     }
 
     /// 平台把投进去的题拆了：自报终态的那一行是不可执行的占位，答案落在它点出的那条上。
