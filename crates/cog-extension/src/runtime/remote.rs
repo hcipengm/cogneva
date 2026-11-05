@@ -23,6 +23,20 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 // cap: bound — 跨一次执行器换版的等待上界
 const REPLACEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(200);
 
+/// 换版窗口里第一次重试之前等多久。
+///
+/// 比它更短的等法没有意义：端口拒绝是「还没有就绪后端」，而下一次尝试要跨过的是
+/// 一次容器启动，不是一次调度；等得比这更短只是把同一条失败的连接多打几遍。
+// cap: bound — 重试退避的起点，短于一次容器启动就没有可等的东西
+const RETRY_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// 退避翻倍到这个数就不再涨。
+///
+/// 窗口有两百秒，而退避只负责「不要空转」：五秒已经很粗，再长就只是在窗口里少试
+/// 几次，把本来已经就绪的后端多等一轮。
+// cap: bound — 退避的粗粒度上界，再长就少试几次而已
+const RETRY_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 端口被明确拒绝与包被丢掉是两件事。前者说「服务现在没有就绪后端」，也就是
 /// 一次换版的窗口，自己会好；后者多是网络策略挡住，等多久都不会好，等它只是把
 /// 失败推后。所以只认前者。
@@ -123,7 +137,7 @@ impl SandboxBackend for RemoteExecutor {
         // 端口有没有明确拒绝：拒绝＝服务暂时没有后端，会自己好；其余（连不通、
         // 被丢掉）等下去也不会好。见 [`the_port_refused`]。
         let started = std::time::Instant::now();
-        let mut pause = std::time::Duration::from_millis(250);
+        let mut pause = RETRY_FIRST_PAUSE;
         let response = loop {
             match self.http.post(&url).json(&body).send().await {
                 Ok(response) => break response,
@@ -135,7 +149,7 @@ impl SandboxBackend for RemoteExecutor {
                          pod, so the call waits inside the replacement window"
                     );
                     tokio::time::sleep(pause).await;
-                    pause = (pause * 2).min(std::time::Duration::from_secs(5));
+                    pause = (pause * 2).min(RETRY_MAX_PAUSE);
                 }
                 Err(e) => {
                     let note = if the_port_refused(&e) {
