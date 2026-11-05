@@ -13,61 +13,12 @@ use crate::{
     squad::{SquadConfig, SquadExecutor, SquadResult},
 };
 
-/// Identity carried on the actionability verdict's outbound request. Without it
-/// the gateway records the call against its `unknown` default and the verdict's
-/// token spend cannot be attributed to any component.
-const INTENT_ASSESS_ACTOR: &str = "intent_assess";
-
 /// 一件派给名册上任意员工的活。谁接都行——这件活由材料、做法与验收
 /// 判据说了算，不由接活的人的角色说了算。
 ///
 /// 种类名在 `cog_core::contract::work_item`：交活的一方（场景，如 cog-github）
 /// 与接活的一方（这里）是两个 crate，两边各拼一次就会有一边改了另一边不认。
 pub use cog_core::contract::work_item::PLATFORM_AGENT_TASK;
-
-/// 可执行性判据的稳定半段：角色、四条判定的定义、答案的形状。
-///
-/// 它与被判的那条外部意图无关，所以必须逐字节相同地待在整个请求的最前面。
-/// 此前它接在**同一条用户消息的末尾**——正文与整段评论线程之后，于是每个意图
-/// 的请求从第一个字节起就与别个不同，这段常量被逐个意图重买一遍。留在用户
-/// 消息里的是真正会变的东西：这是哪条意图、它的正文、它的媒体。
-const INTENT_ASSESS_SYSTEM: &str = "\
-You are a careful actionability judge for an autonomous software-engineering \
-agent. You output exactly one JSON verdict and nothing else.\n\
-\n\
-Attached media (screenshots/recordings) are provided as separate content blocks; \
-inspect them — a screenshot may contain the exact error and reproduction steps.\n\
-\n\
-Decide actionability from the WHOLE content of the intent below:\n\
-- fix: the intent is clear enough to act on now (a reproducible bug, or a concrete \
-request the agent can realize). Code-level security vulnerabilities belong HERE: the \
-fix pipeline runs in a sandbox and its output passes self-review and CI gates before \
-merge, so a security defect in the code is exactly what the agent can and should fix. \
-Do NOT ask again once enough information is present.\n\
-- clarify: essential information is still missing (expected vs actual behavior, \
-reproduction steps, or version). Put the single most useful question in `question`.\n\
-- skip: not worth acting on (out of scope, not a bug, a duplicate, etc.).\n\
-- escalate: ONLY when writing code cannot resolve it — it needs human credentials or \
-identity, legal/compliance judgment, physical or billing actions, or the request \
-itself is malicious (adding backdoors, exfiltrating secrets). Never escalate merely \
-because a defect is sensitive or security-related.\n\
-\n\
-Reply with ONE JSON object only, no prose, no code fence:\n\
-{\"decision\": \"fix|clarify|skip|escalate\", \"question\": \"\", \"priority\": 1-5, \"reason\": \"\"}\n\
-priority is 1 (highest) to 5 (lowest). When decision is not `clarify`, leave question empty. \
-Write the question in the same language the reporter used.";
-
-/// Chat options for the actionability verdict. Split out from the call site so
-/// the attribution is pinned by a test rather than by reading the line.
-///
-/// 两格都要：`actor` 答「哪个组件在花」，`task_id` 答「哪件活花的」。这一问
-/// 是平台为某个外来意图付的钱，意图本身就是一件活——不带任务 id 时，这一族
-/// 在按任务读成本的那一面（2026-11-02 实测 6 次成功调用）全是空 id。
-fn intent_assess_options(task_id: &str) -> cog_core::ChatOptions {
-    cog_core::ChatOptions::default()
-        .with_actor(INTENT_ASSESS_ACTOR)
-        .with_task(task_id)
-}
 
 /// [`cog_core::TaskExecutor`] implementation that routes tasks through
 /// `SquadExecutor` + `ModeSelectorActor` for Agent-based collaboration.
@@ -295,7 +246,7 @@ impl cog_core::TaskExecutor for CollaborationExecutor {
     async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
         // 这一笔任务名下的 agent 只服务这一次执行：结果交出去之后，没有任何
         // 一条路会再回来读它们。回收因此必须落在这个入口上，而不是等调用方
-        // 各自的任务终态钩子——分解、原子执行、意图判定三条路都从这个入口出，
+        // 各自的任务终态钩子——分解、原子执行、员工分派三条路都从这个入口出，
         // 但只有 DAG 那一条有终态钩子；另两条（例如分解任务，它连任务表都不进）
         // 永远等不到那一声，每跑一轮就在进程里留下几个只会阻塞在 inbox 上的
         // 消费者，而管理器对它们持有强引用。实测 2026-10-18：进化进程启动五十
@@ -341,11 +292,10 @@ impl CollaborationExecutor {
     }
 
     async fn run_the_task(&self, task: &Task) -> SFResult<TaskResult> {
-        // External-intent actionability assessment is a lightweight single-agent
-        // multimodal call, not the Squad→PGE→SelfReview codegen pipeline. It must
-        // be intercepted before the squad paths (the task carries no
-        // evolution_mode marker, but routing it through a squad would waste a full
-        // planner/generator/evaluator run on a one-shot JSON verdict).
+        // A work item goes to an employee on the roster, not through the
+        // Squad→PGE→SelfReview codegen pipeline: the item says what to do with
+        // its material, and routing it through a squad would spend a full
+        // planner/generator/evaluator run on one answer.
         //
         // This kind, and the ones like it (`self_evolution`,
         // `baseline_port_rework`), are platform-internal entry points: they are
@@ -353,9 +303,6 @@ impl CollaborationExecutor {
         // and they are not rows of it. A row says which kind of hand runs a
         // sub-task; these say which of the platform's own flows produced a task.
         if let TaskType::Custom(kind) = &task.task_type {
-            if kind == "platform_intent_assess" {
-                return self.execute_intent_assess(task).await;
-            }
             if kind == PLATFORM_AGENT_TASK {
                 return self.execute_agent_task(task).await;
             }
@@ -400,11 +347,10 @@ impl CollaborationExecutor {
     /// Nothing about the work is decided here. The input document carries the
     /// material, what to do with it and how the answer will be judged — a
     /// `contract` on it renders as the run's instructions — while the
-    /// employee brings the loop and the tools. That is what separates this
-    /// branch from `platform_intent_assess`: a branch that knows how to judge
-    /// one kind of material is an executor with a name, whereas a branch that
-    /// forwards a work item is dispatch, and dispatch belongs to whoever is on
-    /// the roster rather than to a role this crate would have to spell out.
+    /// employee brings the loop and the tools. A branch that knows how to judge
+    /// one kind of material is an executor with a name; a branch that forwards
+    /// a work item is dispatch, and dispatch belongs to whoever is on the
+    /// roster rather than to a role this crate would have to spell out.
     async fn execute_agent_task(&self, task: &Task) -> SFResult<TaskResult> {
         let Some(manager) = self.agent_manager.as_ref() else {
             return Err(SFError::Agent(
@@ -489,205 +435,6 @@ impl CollaborationExecutor {
         Err(SFError::Agent(
             "every employee on the roster had retired before one could take the work".into(),
         ))
-    }
-
-    /// Lightweight single-agent multimodal actionability verdict for an external
-    /// intent (a GitHub/Gitee issue or pull request).
-    ///
-    /// One multimodal agent reads the intent body, the follow-up comment thread,
-    /// and any attached screenshots/recordings (fed as real media content blocks
-    /// so a vision/audio-capable model actually sees them), and returns a single
-    /// JSON object: `{decision, question, priority, reason}` with
-    /// `decision ∈ fix|clarify|skip|escalate`. The verdict rides back on the task
-    /// result; cog-github acts on it (submit the heavy PGE fix task / ask exactly
-    /// one clarification / skip / escalate). This task produces no change and never
-    /// enters the self-evolution pipeline.
-    async fn execute_intent_assess(&self, task: &Task) -> SFResult<TaskResult> {
-        let (Some(ref manager), Some(ref llm)) = (&self.agent_manager, &self.llm_provider) else {
-            // No agent/LLM wired: fail loudly so the router DLQs the task and the
-            // sensor side degrades to its local model-free heuristic instead of
-            // silently guessing.
-            return Err(SFError::Agent(
-                "platform_intent_assess requires an agent manager and an LLM provider".into(),
-            ));
-        };
-        let agent = manager
-            .create_agent(
-                &format!("intent-assessor-{}", task.id),
-                "intent_assessor",
-                llm.clone(),
-                Some(&task.id),
-            )
-            .await?;
-
-        let input = &task.input;
-        let kind = input
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("issue");
-        let number = input.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
-        let title = input.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let body = input.get("body").and_then(|v| v.as_str()).unwrap_or("");
-        let labels = input
-            .get("labels")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|l| l.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        let thread = input
-            .get("reply_thread")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let mut prompt = String::new();
-        prompt.push_str(&format!(
-            "You are judging whether an external {kind} on a code platform is actionable for an autonomous coding agent.\n\n"
-        ));
-        prompt.push_str(&format!("#{number} {title}\n"));
-        if !labels.is_empty() {
-            prompt.push_str(&format!("Labels: {labels}\n"));
-        }
-        prompt.push_str("\n## Body\n");
-        prompt.push_str(if body.trim().is_empty() {
-            "(empty)"
-        } else {
-            body
-        });
-        prompt.push_str("\n\n## Follow-up conversation\n");
-        prompt.push_str(if thread.trim().is_empty() {
-            "(no comments)"
-        } else {
-            thread
-        });
-
-        let mut blocks = vec![cog_core::ContentBlock::text(prompt)];
-        if let Some(media) = input.get("media").and_then(|v| v.as_array()) {
-            for m in media {
-                let data = m.get("data_base64").and_then(|v| v.as_str()).unwrap_or("");
-                let mime = m
-                    .get("mime_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/octet-stream");
-                if !data.is_empty() {
-                    blocks.push(cog_core::ContentBlock::media(data, mime));
-                }
-            }
-        }
-
-        let messages = vec![
-            cog_core::Message::system(INTENT_ASSESS_SYSTEM),
-            cog_core::Message::user_blocks(blocks),
-        ];
-
-        let stream = agent
-            .chat_stream(&messages, &intent_assess_options(&task.id))
-            .await?;
-        use futures::StreamExt;
-        let mut stream = stream;
-        let mut text = String::new();
-        let mut stream_error: Option<String> = None;
-        while let Some(event) = stream.next().await {
-            match event {
-                cog_core::AssistantMessageEvent::TextDelta { delta, .. } => {
-                    text.push_str(&delta);
-                }
-                cog_core::AssistantMessageEvent::Done { message, .. } => {
-                    let final_text = message.content();
-                    if !final_text.trim().is_empty() {
-                        text = final_text;
-                    }
-                }
-                cog_core::AssistantMessageEvent::Error { error, .. } => {
-                    // The reply is over, but keep reading rather than returning
-                    // from this arm. The event carries only the wording of the
-                    // failure; the *type* of it — which refusal the upstream
-                    // gave, and how long it said to wait — is on the stream's
-                    // final response. Returning here throws that away, and every
-                    // consumer above can then only read the sentence to guess
-                    // whether re-running could ever succeed. Reading to the end
-                    // is also what drains the producer, so `result()` resolves.
-                    stream_error = Some(error.content());
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(error) = stream_error {
-            let response = stream.result().await;
-            // A provider that classified the refusal (HTTP status -> a typed
-            // refusal, plus the wait the upstream stated in its headers) already
-            // said what this failure is. Re-stating it as a sentence here is how
-            // a quota outage is retried every poll as if it were a transient
-            // blip, so the type is carried out the way it arrived.
-            return Err(match response.upstream_failure {
-                Some(cause) => SFError::upstream_refused_after(
-                    cause,
-                    format!("intent assess stream error: {error}"),
-                    response.retry_after_secs,
-                ),
-                None => SFError::Agent(format!("intent assess stream error: {error}")),
-            });
-        }
-
-        let verdict = Self::parse_intent_verdict(&text)?;
-        info!(
-            task_id = %task.id,
-            decision = %verdict.get("decision").and_then(|v| v.as_str()).unwrap_or("?"),
-            "platform_intent_assess verdict"
-        );
-        Ok(TaskResult {
-            success: true,
-            output: verdict,
-            metadata: TaskResultMetadata::new("intent_assess"),
-        })
-    }
-
-    /// Parse the model's JSON verdict, tolerating a trailing/leading code fence
-    /// and surrounding prose. Normalizes `decision` to lowercase and fills safe
-    /// defaults for the optional fields.
-    fn parse_intent_verdict(text: &str) -> SFResult<serde_json::Value> {
-        let trimmed = text.trim();
-        let json_str = if let Some(start) = trimmed.find('{') {
-            let end = trimmed.rfind('}').ok_or_else(|| {
-                SFError::Agent(format!("intent verdict has no closing brace: {trimmed}"))
-            })?;
-            trimmed[start..=end].trim()
-        } else {
-            return Err(SFError::Agent(format!(
-                "intent verdict is not JSON: {trimmed}"
-            )));
-        };
-        let mut v: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| SFError::Agent(format!("invalid intent verdict JSON: {e}: {json_str}")))?;
-
-        let decision = v
-            .get("decision")
-            .and_then(|d| d.as_str())
-            .map(|s| s.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        let decision = match decision.as_str() {
-            "fix" | "clarify" | "skip" | "escalate" => decision,
-            other => {
-                return Err(SFError::Agent(format!(
-                    "intent verdict has unknown decision: {other:?}"
-                )));
-            }
-        };
-        v["decision"] = serde_json::json!(decision);
-        if v.get("question").and_then(|q| q.as_str()).is_none() {
-            v["question"] = serde_json::json!("");
-        }
-        if v.get("priority").and_then(|p| p.as_u64()).is_none() {
-            v["priority"] = serde_json::json!(3);
-        }
-        if v.get("reason").and_then(|r| r.as_str()).is_none() {
-            v["reason"] = serde_json::json!("");
-        }
-        Ok(v)
     }
 
     /// Decomposition path: run the Planner and take its atomic task list as the
@@ -1762,7 +1509,7 @@ fn collect_strings(value: &serde_json::Value, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CollaborationExecutor, ProducerClass};
+    use super::{CollaborationExecutor, ProducerClass, PLATFORM_AGENT_TASK};
     use crate::checkout::repo_root;
     use cog_core::{Observable, Task, TaskType};
 
@@ -1954,31 +1701,6 @@ mod tests {
     }
 
     #[test]
-    fn the_actionability_verdict_carries_both_its_identities() {
-        // The gateway falls back to "unknown" when the header is absent, which
-        // is indistinguishable from a component genuinely named unknown. The
-        // verdict path must therefore never send default options.
-        //
-        // 任务那一格同样要带：账本按两格取行，只带角色时这次判词的花销在
-        // 按任务读成本的那一面读不到，那件意图的成本里就少了它自己。
-        let options = super::intent_assess_options("platform_intent_assess-42");
-        assert_eq!(
-            options
-                .headers
-                .get(cog_core::LLM_ACTOR_HEADER)
-                .map(String::as_str),
-            Some(super::INTENT_ASSESS_ACTOR)
-        );
-        assert_eq!(
-            options
-                .headers
-                .get(cog_core::LLM_TASK_HEADER)
-                .map(String::as_str),
-            Some("platform_intent_assess-42")
-        );
-    }
-
-    #[test]
     fn distinct_content_from_distinct_tasks_gets_distinct_ids() {
         let a = CollaborationExecutor::change_id_for("github-pr-58", "diff A");
         let b = CollaborationExecutor::change_id_for("github-pr-59", "diff B");
@@ -2045,256 +1767,29 @@ mod tests {
         );
     }
 
-    /// An agent standing in for the assess call, in both of the ways it can end.
+    /// 名册上有一个常驻员工，外加一本按任务回收的账。
     ///
-    /// With `reply` set it answers with that verdict; without it, it ends the way
-    /// a real refused call does — an error event carrying the wording, and a
-    /// final response carrying the classified refusal the provider built out of
-    /// the HTTP status. Either way it keeps the message list it was handed, so a
-    /// test can read what the judge actually sent instead of what it was meant to
-    /// send.
-    struct ScriptedAssessAgent {
-        reply: Option<String>,
-        error_text: String,
-        cause: Option<cog_core::UpstreamFailure>,
-        wait: Option<u64>,
-        seen: std::sync::Mutex<Vec<Vec<cog_core::Message>>>,
-    }
-
-    impl ScriptedAssessAgent {
-        /// An assess call that is refused upstream.
-        fn refusing(
-            error_text: &str,
-            cause: Option<cog_core::UpstreamFailure>,
-            wait: Option<u64>,
-        ) -> Self {
-            Self {
-                reply: None,
-                error_text: error_text.to_string(),
-                cause,
-                wait,
-                seen: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
-        /// An assess call that answers with a verdict.
-        fn answering(verdict: &str) -> std::sync::Arc<Self> {
-            std::sync::Arc::new(Self {
-                reply: Some(verdict.to_string()),
-                error_text: String::new(),
-                cause: None,
-                wait: None,
-                seen: std::sync::Mutex::new(Vec::new()),
-            })
-        }
-
-        fn calls(&self) -> Vec<Vec<cog_core::Message>> {
-            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl cog_core::Agent for ScriptedAssessAgent {
-        async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
-            Ok(serde_json::Value::Null)
-        }
-
-        async fn start(&self) {}
-
-        async fn snapshot(
-            &self,
-            _task_id: String,
-        ) -> cog_core::SFResult<cog_core::AgentCheckpoint> {
-            Ok(cog_core::AgentCheckpoint {
-                checkpoint_id: String::new(),
-                task_id: String::new(),
-                agent_state: serde_json::Value::Null,
-                context_window: Vec::new(),
-                event_offset: 0,
-                timestamp: chrono::Utc::now(),
-            })
-        }
-
-        async fn restore(&self, _snapshot: &cog_core::AgentCheckpoint) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        async fn continue_(
-            &self,
-            _input: serde_json::Value,
-        ) -> cog_core::SFResult<serde_json::Value> {
-            Ok(serde_json::Value::Null)
-        }
-
-        async fn steer(&self, _instruction: String) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        async fn abort(&self) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        async fn reset(&self) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
-            Ok(cog_core::AgentState::Idle)
-        }
-
-        async fn wait_for_idle(&self) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        async fn restore_from_id(&self, _checkpoint_id: &str) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
-            let (_tx, rx) = tokio::sync::broadcast::channel(1);
-            rx
-        }
-
-        async fn chat_stream(
-            &self,
-            messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            self.seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(messages.to_vec());
-            let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(8);
-            let _ = producer
-                .push(cog_core::AssistantMessageEvent::Start {
-                    timestamp: chrono::Utc::now(),
-                })
-                .await;
-            if let Some(ref reply) = self.reply {
-                let _ = producer
-                    .push(cog_core::AssistantMessageEvent::Done {
-                        reason: cog_core::StopReason::Stop,
-                        message: cog_core::Message::assistant_text(reply.clone()),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .await;
-                producer.end(cog_core::ChatResponse {
-                    content: vec![cog_core::ContentBlock::Text {
-                        text: reply.clone(),
-                        text_signature: None,
-                    }],
-                    ..cog_core::ChatResponse::default()
-                });
-                return Ok(stream);
-            }
-            let _ = producer
-                .push(cog_core::AssistantMessageEvent::Error {
-                    reason: cog_core::StopReason::Error,
-                    error: cog_core::Message::assistant_text(self.error_text.clone()),
-                    timestamp: chrono::Utc::now(),
-                })
-                .await;
-            // The typed refusal rides the final response, exactly as the
-            // providers leave it: the event above has the wording only.
-            producer.end(cog_core::ChatResponse {
-                error_message: Some(self.error_text.clone()),
-                stop_reason: cog_core::StopReason::Error,
-                upstream_failure: self.cause,
-                retry_after_secs: self.wait,
-                ..cog_core::ChatResponse::default()
-            });
-            Ok(stream)
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            self.chat_stream(&[], &cog_core::ChatOptions::default())
-                .await
-        }
-
-        async fn read_board(
-            &self,
-            _task_id: &str,
-            _field: &str,
-        ) -> cog_core::SFResult<Option<String>> {
-            Ok(None)
-        }
-
-        async fn write_board(
-            &self,
-            _task_id: &str,
-            _field: &str,
-            _value: &str,
-        ) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        async fn receive_message(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-    }
-
-    struct OneAgentManager {
-        agent: std::sync::Arc<dyn cog_core::Agent>,
-    }
-
-    #[async_trait::async_trait]
-    impl cog_core::AgentManager for OneAgentManager {
-        async fn create_agent(
-            &self,
-            _agent_id: &str,
-            _role: &str,
-            _llm: std::sync::Arc<dyn cog_core::LlmClient>,
-            _task_id: Option<&str>,
-        ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
-            Ok(std::sync::Arc::clone(&self.agent))
-        }
-
-        async fn retire_task_agents(&self, _task_id: &str) -> cog_core::SFResult<usize> {
-            // 这个替身每次调用交回的都是同一个对象，没有按任务收的名册，
-            // 也就没有可回收的东西。
-            Ok(0)
-        }
-
-        async fn dispatch(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        async fn list_workers(&self) -> cog_core::SFResult<Vec<cog_core::WorkerInfo>> {
-            Ok(Vec::new())
-        }
-
-        async fn shutdown(&self) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-
-        async fn get_agent(
-            &self,
-            _agent_id: &str,
-        ) -> cog_core::SFResult<Option<std::sync::Arc<dyn cog_core::Agent>>> {
-            Ok(None)
-        }
-    }
-
-    /// [`OneAgentManager`] 加上一本按任务回收的账。
+    /// 这两条测的是**入口**上的回收：从 `TaskExecutor::execute` 出去的任何一条
+    /// 路，结束时都要按任务名放掉名下对象。员工分派这条路自己不起新对象，所以
+    /// 名册写死，账本只记回收。
     struct RetirementRecorder {
-        inner: OneAgentManager,
+        inner: super::employee_dispatch_tests::RosterManager,
         retired: std::sync::Mutex<Vec<String>>,
     }
 
     impl RetirementRecorder {
-        fn new(agent: std::sync::Arc<dyn cog_core::Agent>) -> Self {
+        fn new(inner: super::employee_dispatch_tests::RosterManager) -> Self {
             Self {
-                inner: OneAgentManager { agent },
+                inner,
                 retired: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn retired(&self) -> Vec<String> {
-            self.retired.lock().unwrap().clone()
+            self.retired
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
     }
 
@@ -2311,7 +1806,10 @@ mod tests {
         }
 
         async fn retire_task_agents(&self, task_id: &str) -> cog_core::SFResult<usize> {
-            self.retired.lock().unwrap().push(task_id.to_string());
+            self.retired
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(task_id.to_string());
             Ok(1)
         }
 
@@ -2335,244 +1833,39 @@ mod tests {
         }
     }
 
-    struct UnusedLlm;
-
-    #[async_trait::async_trait]
-    impl cog_core::LlmClient for UnusedLlm {
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(1);
-            producer.end(cog_core::ChatResponse::default());
-            Ok(stream)
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            self.chat_stream(&[], &cog_core::ChatOptions::default())
-                .await
-        }
-
-        async fn chat(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            Ok(cog_core::ChatResponse::default())
-        }
-
-        async fn health_check(&self) -> bool {
-            true
-        }
-    }
-
-    fn assess_task() -> cog_core::Task {
+    fn work_item() -> cog_core::Task {
         cog_core::Task::new(
             "github-issue-56",
-            cog_core::TaskType::Custom("platform_intent_assess".into()),
-            serde_json::json!({
-                "kind": "issue",
-                "number": 56,
-                "title": "something is off",
-                "body": "details",
-            }),
+            cog_core::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({ "task": { "kind": "issue", "number": 56 } }),
         )
     }
 
-    /// 判据的稳定半段逐字节待在请求最前面，且不许有第二个持有者。
+    /// 一次执行结束（无论成败）就把这次执行名下的对象放掉。
     ///
-    /// 判据是「每轮都要重发的内容必须逐字节相同地待在请求最前面」。可执行性
-    /// 判据的规则、答案 schema 与语言要求与具体哪条意图无关，但此前它们接在
-    /// **同一条用户消息的末尾**，前面是正文和整段评论线程——于是每条意图的请求
-    /// 从第一个字节起就与别个不同，这段常量被逐个意图重买一遍（判据是一次
-    /// 调用一条意图，所以省钱的地方在跨请求的前缀复用上）。
-    ///
-    /// 两条意图读**同一份**系统消息，才分得开「常量在最前」与「常量这次恰好
-    /// 写对了」；只看一次调用的话，一条把本次正文也塞进系统消息的实现在这条
-    /// 断言下同样绿。
-    #[tokio::test]
-    async fn the_actionability_judge_keeps_its_stable_half_ahead_of_the_intent() {
-        let agent = ScriptedAssessAgent::answering(
-            r#"{"decision":"fix","question":"","priority":2,"reason":"clear repro"}"#,
-        );
-        let executor = CollaborationExecutor::new()
-            .with_llm_provider(std::sync::Arc::new(UnusedLlm))
-            .with_agent_manager(std::sync::Arc::new(OneAgentManager {
-                agent: agent.clone(),
-            }));
-
-        for (number, title, body) in [
-            (1u64, "first intent", "the first body"),
-            (2, "second intent", "the second body"),
-        ] {
-            let task = cog_core::Task::new(
-                format!("github-issue-{number}"),
-                cog_core::TaskType::Custom("platform_intent_assess".into()),
-                serde_json::json!({
-                    "kind": "issue",
-                    "number": number,
-                    "title": title,
-                    "body": body,
-                }),
-            );
-            executor
-                .execute_intent_assess(&task)
-                .await
-                .expect("一条答复了判词的流要读出判词");
-        }
-
-        let calls = agent.calls();
-        assert_eq!(calls.len(), 2, "两条意图要读两次");
-        for (i, msgs) in calls.iter().enumerate() {
-            assert_eq!(
-                msgs.len(),
-                2,
-                "判据请求只该有系统消息与用户消息两条（第 {i} 条）"
-            );
-            assert_eq!(
-                msgs[0].role(),
-                "system",
-                "稳定半段必须待在整个请求的最前面（第 {i} 条）"
-            );
-            assert_eq!(msgs[1].role(), "user", "易变半段在用户消息里（第 {i} 条）");
-        }
-
-        let stable = calls[0][0].content();
-        assert_eq!(
-            stable,
-            calls[1][0].content(),
-            "两条意图的系统消息不同，说明它带了本条意图，缓存不了"
-        );
-        for word in [
-            "- fix:",
-            "- clarify:",
-            "- skip:",
-            "- escalate:",
-            "\"decision\": \"fix|clarify|skip|escalate\"",
-            "priority is 1 (highest) to 5 (lowest)",
-        ] {
-            assert!(
-                stable.contains(word),
-                "系统消息漏了 {word:?}，模型只能猜；系统消息是：{stable}"
-            );
-        }
-
-        for (i, msgs) in calls.iter().enumerate() {
-            let varying = msgs[1].content();
-            for word in [
-                "Decide actionability from the WHOLE content above",
-                "Reply with ONE JSON object only",
-                "priority is 1 (highest) to 5 (lowest)",
-            ] {
-                assert!(
-                    !varying.contains(word),
-                    "稳定半段在用户消息里还有第二个持有者（{word:?}，第 {i} 条）：{varying}"
-                );
-            }
-            assert!(
-                varying.contains("## Body"),
-                "用户消息要把这条意图本身带进去（第 {i} 条）"
-            );
-        }
-
-        assert!(calls[0][1].content().contains("first intent"));
-        assert!(calls[0][1].content().contains("the first body"));
-        assert!(calls[1][1].content().contains("second intent"));
-        assert_ne!(
-            calls[0][1].content(),
-            calls[1][1].content(),
-            "两条的易变半段一样，这条测试什么也没证明"
-        );
-    }
-
-    async fn assessed(
-        error_text: &str,
-        cause: Option<cog_core::UpstreamFailure>,
-        wait: Option<u64>,
-    ) -> cog_core::SFError {
-        let agent = std::sync::Arc::new(ScriptedAssessAgent::refusing(error_text, cause, wait));
-        let executor = CollaborationExecutor::new()
-            .with_llm_provider(std::sync::Arc::new(UnusedLlm))
-            .with_agent_manager(std::sync::Arc::new(OneAgentManager { agent }));
-        executor
-            .execute_intent_assess(&assess_task())
-            .await
-            .expect_err("a stream that ends in an error must not yield a verdict")
-    }
-
-    /// The refusal's type reaches the caller instead of being flattened into a
-    /// sentence. Provenance: assess tasks were failing against a refused
-    /// upstream with no typed cause recorded and were re-bought on every poll,
-    /// because the consumer could only read the wording.
-    #[tokio::test]
-    async fn an_assess_refusal_carries_its_type_and_the_stated_wait() {
-        let error = assessed(
-            "API error (HTTP 503): upstreams unavailable",
-            Some(cog_core::UpstreamFailure::QuotaExhausted),
-            Some(5578),
-        )
-        .await;
-
-        assert_eq!(
-            error.upstream_failure(),
-            Some(cog_core::UpstreamFailure::QuotaExhausted)
-        );
-        assert_eq!(error.retry_after_secs(), Some(5578));
-        assert!(
-            error.to_string().contains("intent assess stream error"),
-            "the wording still has to reach the log: {error}"
-        );
-        assert!(
-            error.is_terminal_upstream_failure(),
-            "an exhausted quota cannot clear by re-running on the next poll: {error}"
-        );
-    }
-
-    /// The other side: a stream error the provider did not classify stays what
-    /// it was. Inventing a type for it would make every unclassified stream
-    /// failure look terminal.
-    #[tokio::test]
-    async fn an_unclassified_stream_error_stays_untyped() {
-        let error = assessed("stream ended without a reply", None, None).await;
-
-        assert_eq!(error.upstream_failure(), None);
-        assert_eq!(error.retry_after_secs(), None);
-        assert!(
-            error.to_string().contains("stream ended without a reply"),
-            "the wording is the only evidence there is: {error}"
-        );
-    }
-
-    /// 一次执行结束（无论成败）就把这次执行建出来的 agent 放掉。
-    ///
-    /// 判的是**入口**，不是某一条路：分解、原子执行、意图判定都从
+    /// 判的是**入口**，不是某一条路：分解、原子执行、员工分派都从
     /// `TaskExecutor::execute` 出，而此前只有 DAG 的任务终态钩子会回收，
     /// 分解链与自信号链根本不进任务表，它们的 agent 于是永远留在名册里。
-    /// 这条测试走的是最便宜的一条路（意图判定），红了说明回收不在入口上；
+    /// 这条测试走的是最便宜的一条路（员工分派），红了说明回收不在入口上；
     /// 它不区分「回收写在哪条路内部」——那正是要避免的形状。
     #[tokio::test]
     async fn a_run_that_finished_releases_the_task_agents_that_served_it() {
-        let agent = ScriptedAssessAgent::answering(
-            r#"{"decision":"fix","question":"","priority":2,"reason":"clear repro"}"#,
-        );
-        let manager = std::sync::Arc::new(RetirementRecorder::new(agent));
-        let executor = CollaborationExecutor::new()
-            .with_llm_provider(std::sync::Arc::new(UnusedLlm))
-            .with_agent_manager(manager.clone());
+        let employee = std::sync::Arc::new(super::employee_dispatch_tests::RecordingEmployee::new(
+            "fix",
+        ));
+        let manager = std::sync::Arc::new(RetirementRecorder::new(
+            super::employee_dispatch_tests::RosterManager::new(vec![("worker-0".into(), employee)]),
+        ));
+        let executor = CollaborationExecutor::new().with_agent_manager(manager.clone());
 
-        cog_core::TaskExecutor::execute(&executor, &assess_task())
+        cog_core::TaskExecutor::execute(&executor, &work_item())
             .await
-            .expect("一条答复了判词的流要读出判词");
+            .expect("名册上有人，一件活要有答复");
 
         assert_eq!(
             manager.retired(),
             vec!["github-issue-56".to_string()],
-            "执行结束了，这次执行名下的 agent 必须按这个任务的名字被放掉"
+            "执行结束了，这次执行名下的对象必须按这个任务的名字被放掉"
         );
     }
 
@@ -2580,19 +1873,14 @@ mod tests {
     /// 让重跑接到一个停在半截的旧对象上，而重跑本该从续跑点恢复。
     #[tokio::test]
     async fn a_run_that_failed_releases_the_task_agents_that_served_it() {
-        let agent = std::sync::Arc::new(ScriptedAssessAgent::refusing(
-            "upstream said no",
-            None,
-            None,
+        let manager = std::sync::Arc::new(RetirementRecorder::new(
+            super::employee_dispatch_tests::RosterManager::new(Vec::new()),
         ));
-        let manager = std::sync::Arc::new(RetirementRecorder::new(agent));
-        let executor = CollaborationExecutor::new()
-            .with_llm_provider(std::sync::Arc::new(UnusedLlm))
-            .with_agent_manager(manager.clone());
+        let executor = CollaborationExecutor::new().with_agent_manager(manager.clone());
 
-        cog_core::TaskExecutor::execute(&executor, &assess_task())
+        cog_core::TaskExecutor::execute(&executor, &work_item())
             .await
-            .expect_err("一次被上游拒掉的判定不该产出判词");
+            .expect_err("名册是空的，没有员工能接这件活");
 
         assert_eq!(
             manager.retired(),
@@ -3295,7 +2583,7 @@ mod employee_dispatch_tests {
 
     /// 只答 `prompt` 的员工：`prompt_for_task` 的默认实现会转到这里，
     /// 所以「活有没有到这个人手上」与「他读到的是什么」都能在这里读到。
-    struct RecordingEmployee {
+    pub(super) struct RecordingEmployee {
         answer: String,
         seen: std::sync::Mutex<Vec<serde_json::Value>>,
         /// 每次接活前被要求清空对话的次数，按发生顺序与前缀记。
@@ -3303,7 +2591,7 @@ mod employee_dispatch_tests {
     }
 
     impl RecordingEmployee {
-        fn new(answer: &str) -> Self {
+        pub(super) fn new(answer: &str) -> Self {
             Self {
                 answer: answer.to_string(),
                 seen: std::sync::Mutex::new(Vec::new()),
@@ -3421,14 +2709,14 @@ mod employee_dispatch_tests {
 
     /// 一张写死的名册。`create_agent` 交给第一个员工——这两条测试要的是
     /// 「派给谁」与「派活本身」，不是建员工。
-    struct RosterManager {
+    pub(super) struct RosterManager {
         roster: Vec<(String, std::sync::Arc<dyn cog_core::Agent>)>,
         /// 名册上为正某件任务现起的对象：id → 它正在做的那件任务。
         owned: Vec<(String, String)>,
     }
 
     impl RosterManager {
-        fn new(roster: Vec<(String, std::sync::Arc<dyn cog_core::Agent>)>) -> Self {
+        pub(super) fn new(roster: Vec<(String, std::sync::Arc<dyn cog_core::Agent>)>) -> Self {
             Self {
                 roster,
                 owned: Vec::new(),

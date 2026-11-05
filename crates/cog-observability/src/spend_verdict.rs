@@ -249,10 +249,6 @@ pub const UNREGISTERED_SITES: &[UnregisteredSite] = &[
         why: "driven by writes to the knowledge base rather than by the run loop: over the 30 days ending 2026-10-16 it spent in 50 hours but 2 of its stops followed a window it had spent in, so its silence is a quiet input rather than a stopped call site. Worth registering once the trigger it waits on has a reading of its own — today it does not, and inventing one would be a second opinion about when extraction is due",
     },
     UnregisteredSite {
-        actor: "intent_assess",
-        why: "one call per submitted intent, not one per pass: 7 of its 12 spending hours were followed by a silent one, which is its normal shape rather than a stop",
-    },
-    UnregisteredSite {
         actor: "evolution",
         why: "driven by the change pipeline rather than by the run loop; its silence and the pipeline's idle state are the same reading today",
     },

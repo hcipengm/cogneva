@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::config::GitHubIntegrationConfig;
+use cog_core::contract::work_item::PLATFORM_AGENT_TASK;
 use cog_core::{
     ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, SFError, Task, TaskStatus,
     TaskType,
@@ -43,7 +44,41 @@ const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 /// judge prompt/logic changes, or after a bulk queue reset, to force one
 /// fresh judgement round; identical content under the same epoch reuses the
 /// existing task (and its verdict) instead of paying for a duplicate.
-const ASSESS_JUDGE_EPOCH: &str = "v3";
+const ASSESS_JUDGE_EPOCH: &str = "v4";
+
+/// 可执行性判据的稳定半段：角色、四条判定的定义、答案的形状。
+///
+/// 它随工作件走，不留在接活的一侧：一件活由交活的人说清「拿什么材料、怎么
+/// 做、做完算什么」，接活的人只提供循环与工具。它经
+/// `cog_core::contract::prompt::PROMPT_CONTRACT_KEY` 渲染在请求最前面，所以
+/// 每条意图的请求共享同一段前缀，而不是各自重买一遍。
+const INTENT_ASSESS_CONTRACT: &str = "\
+You are a careful actionability judge for an autonomous software-engineering \
+agent. You output exactly one JSON verdict and nothing else.\n\
+\n\
+The document carries the intent under \"task\": its kind, number, title, body, \
+labels, author and the follow-up comment thread. Attached media \
+(screenshots/recordings) arrive as separate content blocks; inspect them — a \
+screenshot may contain the exact error and reproduction steps.\n\
+\n\
+Decide actionability from the WHOLE content of the intent:\n\
+- fix: the intent is clear enough to act on now (a reproducible bug, or a concrete \
+request the agent can realize). Code-level security vulnerabilities belong HERE: the \
+fix pipeline runs in a sandbox and its output passes self-review and CI gates before \
+merge, so a security defect in the code is exactly what the agent can and should fix. \
+Do NOT ask again once enough information is present.\n\
+- clarify: essential information is still missing (expected vs actual behavior, \
+reproduction steps, or version). Put the single most useful question in `question`.\n\
+- skip: not worth acting on (out of scope, not a bug, a duplicate, etc.).\n\
+- escalate: ONLY when writing code cannot resolve it — it needs human credentials or \
+identity, legal/compliance judgment, physical or billing actions, or the request \
+itself is malicious (adding backdoors, exfiltrating secrets). Never escalate merely \
+because a defect is sensitive or security-related.\n\
+\n\
+Reply with ONE JSON object only, no prose, no code fence:\n\
+{\"decision\": \"fix|clarify|skip|escalate\", \"question\": \"\", \"priority\": 1-5, \"reason\": \"\"}\n\
+priority is 1 (highest) to 5 (lowest). When decision is not `clarify`, leave question empty. \
+Write the question in the same language the reporter used.";
 /// Maximum cross-validation tasks running concurrently for this instance.
 // cap: bound — 这个实例同时能跑几条交叉验证
 const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
@@ -1666,7 +1701,7 @@ impl GitHubDiscoveryLoop {
     }
 
     /// Decide actionability for one external intent. With an orchestrator wired,
-    /// a lightweight multimodal `platform_intent_assess` task reads the body,
+    /// a lightweight multimodal work item (`platform_agent_task`) reads the body,
     /// the whole comment thread, and any fetched media blocks and returns a
     /// semantic verdict (fix / clarify / skip / escalate). Without an
     /// orchestrator, or after a transient assess failure, this degrades to the
@@ -1774,11 +1809,10 @@ impl GitHubDiscoveryLoop {
         blocks
     }
 
-    /// Submit the one-shot multimodal assess task and block (poll the DAG) until
-    /// its JSON verdict rides back on `task.result`, then map it to a
+    /// Submit the multimodal assess work item and block (poll the DAG) until its
+    /// JSON verdict rides back on `task.result`, then map it to a
     /// [`TriageDecision`]. The task is injected `verified` so it bypasses
-    /// ActionPlanner decomposition and routes straight to the single-agent
-    /// assessor.
+    /// ActionPlanner decomposition and goes straight to a standing employee.
     async fn run_assess_task(
         &self,
         orchestrator: &Arc<dyn OrchestratorControl>,
@@ -1825,24 +1859,27 @@ impl GitHubDiscoveryLoop {
             intent.title
         );
         let input = serde_json::json!({
-            "kind": kind.as_str(),
-            "number": number,
-            "title": intent.title,
-            "body": intent.body,
-            "labels": intent.labels,
-            "author": intent.author,
-            "reply_thread": reply_thread,
+            "contract": INTENT_ASSESS_CONTRACT,
+            "task": {
+                "kind": kind.as_str(),
+                "number": number,
+                "title": intent.title,
+                "body": intent.body,
+                "labels": intent.labels,
+                "author": intent.author,
+                "reply_thread": reply_thread,
+            },
             "media": media,
         });
         let mut task = Task::new(
             task_id.clone(),
-            TaskType::Custom("platform_intent_assess".into()),
+            TaskType::Custom(PLATFORM_AGENT_TASK.into()),
             input,
         );
         task.action_planner_meta = Some(ActionPlannerMeta {
             verified: true,
             version: Some("1.0.0".into()),
-            note: Some("Multimodal actionability verdict; route to single-agent assessor".into()),
+            note: Some("Multimodal actionability verdict; route to a standing employee".into()),
             source: Some(ActionPlannerSource::UserProvided),
             confidence: None,
             timestamp: Some(chrono::Utc::now()),
@@ -1910,6 +1947,8 @@ impl GitHubDiscoveryLoop {
     /// onto the internal triage decision. Unknown/absent decisions degrade to
     /// Skip so a malformed verdict never forces an unwanted fix.
     fn verdict_to_decision(v: &serde_json::Value) -> TriageDecision {
+        let unwrapped = Self::verdict_body(v);
+        let v = unwrapped.as_ref();
         let reason = v
             .get("reason")
             .and_then(|r| r.as_str())
@@ -1921,7 +1960,13 @@ impl GitHubDiscoveryLoop {
             .unwrap_or("")
             .to_string();
         let priority = v.get("priority").and_then(|p| p.as_u64()).unwrap_or(3) as u8;
-        match v.get("decision").and_then(|d| d.as_str()).unwrap_or("") {
+        match v
+            .get("decision")
+            .and_then(|d| d.as_str())
+            .map(|d| d.trim().to_ascii_lowercase())
+            .as_deref()
+            .unwrap_or("")
+        {
             "fix" => TriageDecision::Fix {
                 priority,
                 rationale: reason,
@@ -1942,6 +1987,32 @@ impl GitHubDiscoveryLoop {
                     reason
                 },
             },
+        }
+    }
+
+    /// The verdict object inside a work item's answer.
+    ///
+    /// The employee's run hands back the JSON object when the model wrote one
+    /// and wraps the reply as `{"result": "…"}` when it did not — the answer is
+    /// the reply either way. Reading it out here keeps the two shapes from
+    /// reaching every reader of a verdict: a wrapped answer would otherwise
+    /// fall through to "skip", and a skipped intent is a real decision to do
+    /// nothing rather than a failure anyone notices.
+    fn verdict_body(v: &serde_json::Value) -> std::borrow::Cow<'_, serde_json::Value> {
+        use std::borrow::Cow;
+        if v.get("decision").is_some() {
+            return Cow::Borrowed(v);
+        }
+        let Some(text) = v.get("result").and_then(|r| r.as_str()) else {
+            return Cow::Borrowed(v);
+        };
+        let trimmed = text.trim();
+        let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) else {
+            return Cow::Borrowed(v);
+        };
+        match serde_json::from_str(&trimmed[start..=end]) {
+            Ok(parsed) => Cow::Owned(parsed),
+            Err(_) => Cow::Borrowed(v),
         }
     }
 
@@ -2555,6 +2626,8 @@ pub(crate) fn criterion_for_row(platform: &str, row: &Task) -> Option<String> {
             .get("issue_number")
             .and_then(|number| number.as_u64())
             .map(|number| issue_fix_acceptance(platform, number)),
+        // 旧行仍按旧种类名回填：新交的判定行自带判据，这一臂只服务改名前
+        // 那些 id 已经落在图里的行。
         "platform_intent_assess" => Some(assess_acceptance(&row.id)),
         _ => None,
     }
@@ -3384,7 +3457,7 @@ pub(crate) mod tests {
         rows: Mutex<Vec<Task>>,
         /// 按原因结掉的行，连同那句话——结案的理由只有行上有。
         cancelled: Mutex<Vec<(String, String)>>,
-        /// Verdict returned for a `platform_intent_assess` task. `None` reports
+        /// Verdict returned for one assess work item. `None` reports
         /// the task as Failed so the fallback path can be exercised without
         /// waiting out the real poll timeout.
         assess_verdict: Mutex<Option<serde_json::Value>>,
@@ -3640,7 +3713,7 @@ pub(crate) mod tests {
             let verdict = self.assess_verdict.lock().unwrap().clone();
             let mut task = Task::new(
                 id,
-                TaskType::Custom("platform_intent_assess".into()),
+                TaskType::Custom(PLATFORM_AGENT_TASK.into()),
                 serde_json::json!({}),
             );
             match verdict {
@@ -3735,7 +3808,7 @@ pub(crate) mod tests {
         // task; a `fix` verdict then submits the real platform_issue_fix task.
         let types = orchestrator.task_types.lock().unwrap();
         assert!(
-            types.iter().any(|t| t == "platform_intent_assess"),
+            types.iter().any(|t| t == PLATFORM_AGENT_TASK),
             "assess task should be submitted before acting; got {types:?}"
         );
         assert!(
@@ -3789,7 +3862,7 @@ pub(crate) mod tests {
         drop(comments);
 
         let types = orchestrator.task_types.lock().unwrap();
-        assert!(types.iter().any(|t| t == "platform_intent_assess"));
+        assert!(types.iter().any(|t| t == PLATFORM_AGENT_TASK));
         assert!(
             !types.iter().any(|t| t == "platform_issue_fix"),
             "a clarify verdict must not submit a fix task; got {types:?}"
@@ -3847,7 +3920,7 @@ pub(crate) mod tests {
 
         let types = orchestrator.task_types.lock().unwrap();
         assert!(
-            types.iter().any(|t| t == "platform_intent_assess"),
+            types.iter().any(|t| t == PLATFORM_AGENT_TASK),
             "due backoff issue should be re-fetched and judged again; got {types:?}"
         );
         drop(types);
@@ -3928,7 +4001,7 @@ pub(crate) mod tests {
         // 纪元比开窗时刻旧：没有新证据，窗照压。
         let (submitted, held) = mk(opened as i64 - 60).await;
         assert!(
-            !submitted.iter().any(|t| t == "platform_intent_assess"),
+            !submitted.iter().any(|t| t == PLATFORM_AGENT_TASK),
             "没有更晚的成功实证时不该提前重试；got {submitted:?}"
         );
         assert!(held, "窗未到期又没有被推翻，条目该留着");
@@ -3936,7 +4009,7 @@ pub(crate) mod tests {
         // 纪元比开窗时刻新：上游在窗开之后真的应答过，现在重试。
         let (submitted, held) = mk(opened as i64 + 60).await;
         assert!(
-            submitted.iter().any(|t| t == "platform_intent_assess"),
+            submitted.iter().any(|t| t == PLATFORM_AGENT_TASK),
             "池已实证应答就该立刻重判；got {submitted:?}"
         );
         assert!(!held, "重试成功后该清掉条目");
@@ -3975,7 +4048,7 @@ pub(crate) mod tests {
         loop_.run_once().await.unwrap();
 
         let types = orchestrator.task_types.lock().unwrap();
-        assert!(types.iter().any(|t| t == "platform_intent_assess"));
+        assert!(types.iter().any(|t| t == PLATFORM_AGENT_TASK));
         assert!(
             types.iter().any(|t| t == "platform_issue_fix"),
             "heuristic fallback should still submit a fix for a clear issue; got {types:?}"
@@ -4026,7 +4099,7 @@ pub(crate) mod tests {
 
         let types = orchestrator.task_types.lock().unwrap();
         assert!(
-            types.iter().any(|t| t == "platform_intent_assess"),
+            types.iter().any(|t| t == PLATFORM_AGENT_TASK),
             "the assess task must have been attempted: {types:?}"
         );
         assert!(
@@ -4759,7 +4832,7 @@ pub(crate) mod tests {
         }
         let assess = filed
             .iter()
-            .find(|(kind, _)| kind == "platform_intent_assess")
+            .find(|(kind, _)| kind == PLATFORM_AGENT_TASK)
             .expect("判定行要先交");
         assert!(
             assess.1[0].contains("判决"),

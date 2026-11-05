@@ -447,8 +447,8 @@ impl cog_core::SystemPlugin for GitHubPlugin {
             );
         }
         // 本 crate 是传感器/执行器，绝不直连 LLM。语义可行动性判定以
-        // platform_intent_assess 任务经 orchestrator 派给 cog-collaboration 的
-        // 单 agent 多模态分支；无 orchestrator 时 triage 退回本地规则启发式。
+        // platform_agent_task 工作件经 orchestrator 派给 cog-collaboration 名册上
+        // 的常驻员工；无 orchestrator 时 triage 退回本地规则启发式。
         if orchestrator.is_none() {
             info!("GitHubPlugin: no orchestrator; intent assessment falls back to local rules heuristic");
         }

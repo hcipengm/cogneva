@@ -3,7 +3,7 @@
 //! This crate is a sensor/actuator: it never calls an LLM directly. The
 //! semantic actionability judgment ("can we act on this issue/PR yet?") is
 //! dispatched to `cog-collaboration` through the orchestrator as a
-//! `platform_intent_assess` task, where a single multimodal agent reads the
+//! `platform_agent_task` work item, where an employee from the roster reads the
 //! issue body plus follow-up replies (including screenshots/recordings) and
 //! returns a `{decision, question, priority}` JSON verdict.
 //!

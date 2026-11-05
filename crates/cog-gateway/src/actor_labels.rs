@@ -26,7 +26,6 @@
 pub const ACTOR_LABELS: &[&str] = &[
     "eval",
     "evolution",
-    "intent_assess",
     "intent_gateway",
     "memory",
     "ralph",

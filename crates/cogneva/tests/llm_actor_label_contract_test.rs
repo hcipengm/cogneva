@@ -56,10 +56,6 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         &["self_review", "self_review:{role}"],
     ),
     (
-        "crates/cog-collaboration/src/collaboration_executor.rs",
-        &["intent_assess"],
-    ),
-    (
         "crates/cog-collaboration/src/squad/ralph/ralph_loop.rs",
         &["ralph"],
     ),
@@ -441,10 +437,6 @@ const TASK_KEYING: &[(&str, TaskKeying)] = &[
         TaskKeying::Task,
     ),
     (
-        "crates/cog-collaboration/src/collaboration_executor.rs",
-        TaskKeying::Task,
-    ),
-    (
         "crates/cog-collaboration/src/squad/ralph/ralph_loop.rs",
         TaskKeying::Task,
     ),
@@ -645,10 +637,6 @@ const CALL_SITES: &[(&str, ActorSource)] = &[
         ActorSource::Stamps,
     ),
     ("crates/cog-agent/src/self_review.rs", ActorSource::Stamps),
-    (
-        "crates/cog-collaboration/src/collaboration_executor.rs",
-        ActorSource::Stamps,
-    ),
     (
         "crates/cog-collaboration/src/squad/ralph/ralph_loop.rs",
         ActorSource::Stamps,
