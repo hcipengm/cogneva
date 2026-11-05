@@ -36,6 +36,15 @@ const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 // cap: bound — the cap that keeps a peer's silence from becoming an unbounded wait
 const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 
+/// How long a filed work item may stay open when its submitter names no budget.
+///
+/// The row default is sized for one dispatched round; a work item is carried by
+/// an employee whose turn includes thinking, tool calls and possibly a peer's
+/// answer, and the over-budget sweep fails the row by age rather than by
+/// liveness. A caller that knows better states its own number.
+// cap: bound — 一件活能挂多久；不设的话接活的人活得比行久，行会先被判死
+const DEFAULT_WORK_ITEM_TIMEOUT_SECS: u64 = 3600;
+
 /// Default wall for one WASM tool call. The guest is somebody else's code: a
 /// module that never returns has to come back to the caller as a failure, so
 /// the bound is short — a compute-shaped tool that legitimately needs longer
@@ -2039,6 +2048,20 @@ pub mod builtins {
             }
             None => tracing::warn!("no agent registry; the list_agents built-in is not registered"),
         }
+        // Filing work needs the same two halves the memory reads need -- a
+        // client and an API base -- and the roster only to check a named
+        // assignee. Registered whether or not they are present, so a caller
+        // gets "this process cannot file work" rather than "there is no such
+        // tool"; a missing roster still files, it just cannot check the name
+        // first, and says so by not being able to promise delivery to it.
+        cog_core::ToolRegistry::register(
+            registry,
+            start_task(
+                inputs.http_client.clone(),
+                inputs.memory_api_base.clone(),
+                inputs.agent_registry.clone(),
+            ),
+        );
     }
 
     /// Names the live agents, so a caller has something to address.
@@ -2362,6 +2385,303 @@ pub mod builtins {
                 })
             })),
         }
+    }
+
+    /// Put a piece of work on the shared graph, and name who carries it.
+    ///
+    /// This is how an agent starts something the platform owns rather than
+    /// something its own turn owns. The row is a work item — the same kind the
+    /// scenes file — so the answer is produced by an employee on the roster,
+    /// judged against the row's acceptance criteria, and read back from the
+    /// task's result by whoever asked for it. Two agents coordinating over the
+    /// inbox reach each other, but nothing they say survives the turn; a row
+    /// does, and it is what the workbench shows.
+    ///
+    /// The filing goes through the platform's own submission door rather than
+    /// an in-process graph handle, because the door is where the rules live:
+    /// credential-shaped input is refused, a verified row without acceptance
+    /// criteria is refused, the workspace's quota is evaluated, and the venue
+    /// is recorded on the row. A second write path here would be a second
+    /// answer to all four, and the deployment's business processes hold no
+    /// credentials precisely so they reach this face instead.
+    ///
+    /// A name nobody holds is refused before anything is filed: the row would
+    /// otherwise be handed to the rotation, and the caller would read a queued
+    /// submission as "my colleague is on it".
+    pub fn start_task(
+        client: Option<Arc<dyn HttpClient>>,
+        api_base: Option<String>,
+        registry: Option<Arc<dyn cog_core::AgentRegistry>>,
+    ) -> Tool {
+        Tool {
+            name: "start_task".into(),
+            description: "File a piece of work on the shared task graph, optionally naming the \
+                          person who should carry it. The row appears on the workbench under the \
+                          venue you give it, and its acceptance criteria are what the answer is \
+                          judged by. Use it when the work outlives this turn, needs someone \
+                          else, or should be on the board where the owner can see it. The call \
+                          returns as soon as the row is queued; the answer comes back in the \
+                          task's result, not in this turn. Call it again with the returned \
+                          goal_id to add more items to the same goal — that is how a squad is \
+                          formed around one goal."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "What to do, stated so whoever picks it up can act on it. \
+                                        The first line reads as the title."
+                    },
+                    "acceptance": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "What done means: one falsifiable sentence each. A filing \
+                                        without one is refused, because nothing downstream \
+                                        invents a criterion and the row would sit on the board \
+                                        reading like work in progress."
+                    },
+                    "venue": {
+                        "type": "string",
+                        "description": "Which column of the board this work belongs in — memory, \
+                                        wiki, eval … Omit for work that belongs to no venue."
+                    },
+                    "assign_to": {
+                        "type": "string",
+                        "description": "Agent id of the person who should carry it, as it appears \
+                                        in list_agents. Omit to leave it to rotation over the \
+                                        standing employees."
+                    },
+                    "goal_id": {
+                        "type": "string",
+                        "description": "Returned by an earlier call: add this item to that goal \
+                                        instead of starting a new one."
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "How long the row may stay open before the graph fails it \
+                                        (default 3600)."
+                    }
+                },
+                "required": ["goal", "acceptance"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let client = client.clone();
+                let api_base = api_base.clone();
+                let registry = registry.clone();
+                Box::pin(async move {
+                    let base = memory_base(api_base.as_deref())?;
+                    let client = memory_client(client)?;
+                    let filed = start_task_filing(&args, caller_agent_id().as_deref())?;
+
+                    // Asked before the write, for the same reason the send tool
+                    // asks: a name nobody holds would be handed to the rotation
+                    // instead, and the caller would read "queued" as "my
+                    // colleague has it".
+                    if let (Some(assignee), Some(registry)) = (filed.assignee(), registry.as_ref())
+                    {
+                        match registry.get(assignee).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                return Err(SFError::Validation(format!(
+                                    "no live agent named {assignee:?}, so the work would fall \
+                                     to rotation rather than to the person you named"
+                                )))
+                            }
+                            Err(e) => {
+                                return Err(SFError::Agent(format!(
+                                    "cannot read the agent roster, so whether {assignee:?} is \
+                                     live is unknown: {e}"
+                                )))
+                            }
+                        }
+                    }
+
+                    let url = format!("{base}/api/v1/tasks");
+                    let mut request = cog_core::HttpRequest::new("POST", &url);
+                    request.timeout_secs = Some(MEMORY_READ_TIMEOUT_SECS);
+                    request
+                        .headers
+                        .insert("content-type".into(), "application/json".into());
+                    request.body =
+                        Some(serde_json::to_vec(&filed.body).map_err(SFError::Serialization)?);
+                    let response = client.execute(request).await?;
+                    let text = String::from_utf8_lossy(&response.body).to_string();
+                    if !response.is_success() {
+                        return Err(SFError::Validation(format!(
+                            "the task door refused this filing (HTTP {}): {}",
+                            response.status,
+                            text.trim()
+                        )));
+                    }
+                    tracing::info!(
+                        caller = filed.filed_by.as_deref().unwrap_or("-"),
+                        goal_id = %filed.goal_id,
+                        task_id = %filed.task_id,
+                        assignee = filed.assignee().unwrap_or("-"),
+                        venue = filed.venue.as_deref().unwrap_or("-"),
+                        "work item filed on the shared graph"
+                    );
+                    let mut receipt = serde_json::json!({
+                        "filed": true,
+                        "task_id": filed.task_id,
+                        "goal_id": filed.goal_id,
+                        "venue": filed.venue,
+                        "assigned_to": filed.assignee(),
+                        "filed_by": filed.filed_by,
+                        "door_response": serde_json::from_str::<serde_json::Value>(&text)
+                            .unwrap_or(serde_json::Value::String(text)),
+                    });
+                    // The door answers 202: the row is queued and the graph
+                    // decomposes or dispatches it from here. Saying so keeps a
+                    // caller from reading "filed" as "done".
+                    receipt["queued"] = serde_json::json!(true);
+                    Ok(receipt)
+                })
+            })),
+        }
+    }
+
+    /// What a `start_task` call turns into, decided without an HTTP client.
+    ///
+    /// Kept apart from the tool body so the shape of a filing is assertable:
+    /// one row, its type, the acceptance copied into the input at the key the
+    /// door reads, and the venue when the caller named one. These are the
+    /// properties that decide whether the row can run at all, and they should
+    /// be testable before anything is on a wire.
+    struct StartTaskFiling {
+        body: serde_json::Value,
+        goal_id: String,
+        task_id: String,
+        venue: Option<String>,
+        filed_by: Option<String>,
+        assignee: Option<String>,
+    }
+
+    impl StartTaskFiling {
+        fn assignee(&self) -> Option<&str> {
+            self.assignee.as_deref()
+        }
+    }
+
+    /// Read one optional label off the arguments: trimmed, and a blank one is
+    /// the absence it looks like rather than a value made of spaces.
+    fn optional_label(args: &serde_json::Value, key: &str) -> Option<String> {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    fn start_task_filing(
+        args: &serde_json::Value,
+        caller: Option<&str>,
+    ) -> SFResult<StartTaskFiling> {
+        let goal = args
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty())
+            .ok_or_else(|| {
+                SFError::Validation(
+                    "start_task needs a `goal`: whoever takes the row reads it as the work".into(),
+                )
+            })?;
+        let acceptance: Vec<String> = args
+            .get("acceptance")
+            .and_then(|v| v.as_array())
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| line.as_str())
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Refused here as well as at the door, and with the reason a submitter
+        // can act on: the row is filed as already decided, so no planner ever
+        // runs on it to state what done means. The door would refuse it too;
+        // catching it here means the caller does not have to read a refusal
+        // out of an HTTP body to learn why.
+        if acceptance.is_empty() {
+            return Err(SFError::Validation(
+                "start_task needs at least one `acceptance` line: the row is filed as already \
+                 decided, so nothing downstream will state what done means, and the door \
+                 refuses a filing without one"
+                    .into(),
+            ));
+        }
+        let venue = optional_label(args, "venue");
+        let assignee = optional_label(args, "assign_to");
+        // A goal id is either the one the caller is continuing or a fresh one.
+        // Continuing is how several rows become one goal -- a squad formed
+        // around work, not around a role.
+        let goal_id = optional_label(args, "goal_id")
+            .unwrap_or_else(|| format!("agent-goal-{}", uuid::Uuid::new_v4()));
+        // Zero is refused rather than read as "no limit": the over-budget sweep
+        // compares the row's age against this number, so a zero would fail the
+        // row before it ever ran while the caller read a success.
+        let timeout_seconds = match args.get("timeout_seconds") {
+            Some(value) => value.as_u64().filter(|secs| *secs > 0).ok_or_else(|| {
+                SFError::Validation(
+                    "`timeout_seconds` has to be a positive whole number of seconds".into(),
+                )
+            })?,
+            None => DEFAULT_WORK_ITEM_TIMEOUT_SECS,
+        };
+        // The row has to land in the workspace the platform reads, and the
+        // loops run in a process that is not told it by any config section it
+        // owns. The deployment sets nothing, which is why the fallback is the
+        // same name the memory namespace defaults to rather than an empty
+        // string: an empty workspace is a row no listing matches.
+        let workspace = std::env::var("COGNEVA_WORKSPACE_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_MEMORY_NAMESPACE.to_string());
+
+        let task_id = format!("work-{}", uuid::Uuid::new_v4());
+        let mut input = serde_json::json!({
+            "task": goal,
+            "acceptance": acceptance,
+        });
+        if let Some(assignee) = assignee.as_deref() {
+            input["agent_id"] = serde_json::json!(assignee);
+        }
+        let mut row = serde_json::json!({
+            "id": task_id,
+            "task_type": cog_core::contract::work_item::PLATFORM_AGENT_TASK,
+            "input": input,
+            // The caller is stating the work as already decided. Without this
+            // the row goes through decomposition, which would spend a planning
+            // call to restate what the caller already said.
+            "planner": { "verified": true, "source": "user_provided" },
+            "timeout_seconds": timeout_seconds,
+        });
+        if let Some(assignee) = assignee.as_deref() {
+            row["agent_id"] = serde_json::json!(assignee);
+        }
+        if let Some(venue) = venue.as_deref() {
+            row["venue"] = serde_json::json!(venue);
+        }
+        let body = serde_json::json!({
+            "goal_id": goal_id.clone(),
+            "goal": goal,
+            "workspace_id": workspace,
+            "intent_kind": "task",
+            "tasks": [row],
+        });
+        Ok(StartTaskFiling {
+            body,
+            goal_id,
+            task_id,
+            venue,
+            filed_by: caller.map(str::to_string),
+            assignee,
+        })
     }
 
     /// The consumer group a waiting ask reads its reply with.
@@ -2968,6 +3288,109 @@ pub mod builtins {
             "unknown".to_string()
         } else {
             host.to_ascii_lowercase()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn filing(args: serde_json::Value) -> SFResult<StartTaskFiling> {
+            start_task_filing(&args, Some("agent-caller"))
+        }
+
+        /// The shape the door reads: one row, filed as already decided, with the
+        /// acceptance at the key the handler copies from and the venue on the
+        /// row. Each of these is what keeps the row from being planned again,
+        /// from being held for want of a criterion, or from landing outside the
+        /// board column its submitter named.
+        #[test]
+        fn a_filing_carries_one_verified_row_with_its_acceptance_and_venue() {
+            let filed = filing(serde_json::json!({
+                "goal": "  read the last week of memory writes and rate their importance  ",
+                "acceptance": ["every item carries a 1-10 rating", "  ", "the reply is one JSON object"],
+                "venue": "  memory  ",
+                "assign_to": "agent-abc",
+            }))
+            .expect("a complete filing is accepted");
+            let body = &filed.body;
+            assert_eq!(body["intent_kind"], "task");
+            assert_eq!(
+                body["tasks"].as_array().map(Vec::len),
+                Some(1),
+                "one goal gets one row; more rows would need the goal decomposition this \
+                 submission exists to skip"
+            );
+            let row = &body["tasks"][0];
+            assert_eq!(
+                row["task_type"],
+                cog_core::contract::work_item::PLATFORM_AGENT_TASK
+            );
+            assert_eq!(
+                row["input"]["acceptance"],
+                serde_json::json!([
+                    "every item carries a 1-10 rating",
+                    "the reply is one JSON object"
+                ]),
+                "blank lines are dropped, and what remains is what the door copies onto the row"
+            );
+            assert_eq!(row["venue"], "memory", "the venue travels trimmed");
+            assert_eq!(row["agent_id"], "agent-abc");
+            assert_eq!(row["input"]["agent_id"], "agent-abc");
+            assert_eq!(row["planner"]["verified"], true);
+            assert_eq!(row["timeout_seconds"], DEFAULT_WORK_ITEM_TIMEOUT_SECS);
+            assert_eq!(body["goal_id"], filed.goal_id.as_str());
+            assert!(
+                body["workspace_id"].as_str().is_some_and(|w| !w.is_empty()),
+                "a row filed into an empty workspace is a row no listing matches"
+            );
+        }
+
+        /// The refusal happens before the write, and both the absent and the
+        /// blank-only cases are refusals: a criterion made of spaces states
+        /// nothing, and the door would refuse it after the round trip.
+        #[test]
+        fn a_filing_without_acceptance_is_refused_before_anything_is_sent() {
+            for acceptance in [serde_json::json!(null), serde_json::json!(["  ", ""])] {
+                let err = filing(serde_json::json!({
+                    "goal": "do the thing",
+                    "acceptance": acceptance,
+                }))
+                .err()
+                .expect("a filing that states no criterion is refused");
+                assert!(
+                    matches!(err, SFError::Validation(_)),
+                    "the caller has to be told this is its input, not a transport failure: {err:?}"
+                );
+            }
+        }
+
+        /// Continuing a goal is how several rows become one goal -- a squad
+        /// formed around the work rather than around a role.
+        #[test]
+        fn a_filing_continues_the_goal_it_is_given() {
+            let filed = filing(serde_json::json!({
+                "goal": "second slice",
+                "acceptance": ["the second slice is on the board under the first"],
+                "goal_id": "  7c1f0d  ",
+            }))
+            .expect("a continuation is accepted");
+            assert_eq!(filed.goal_id, "7c1f0d");
+            assert_eq!(filed.body["goal_id"], "7c1f0d");
+        }
+
+        /// Zero would fail the row before it ran, so it is refused where the
+        /// caller can still fix it rather than queued as a success.
+        #[test]
+        fn a_zero_budget_is_refused_rather_than_read_as_no_limit() {
+            let err = filing(serde_json::json!({
+                "goal": "do the thing",
+                "acceptance": ["the thing is done"],
+                "timeout_seconds": 0,
+            }))
+            .err()
+            .expect("a zero budget is refused");
+            assert!(matches!(err, SFError::Validation(_)));
         }
     }
 }

@@ -162,6 +162,19 @@ pub struct TaskItem {
     /// with a face and only when it agrees with the face's owner.
     #[serde(default)]
     pub unit_id: Option<String>,
+    /// The place this row is worked in: memory, wiki, eval …
+    ///
+    /// A label on the row, not an object: the workbench folds rows by it to
+    /// answer "where is this work done", and a venue nobody registered still
+    /// appears as long as some row carries it. Absent means the row belongs to
+    /// no venue, which is where platform-internal work and older rows live —
+    /// the reading must not fold that into a default column.
+    ///
+    /// A submitter that files work here is saying which column of the board it
+    /// belongs in; nothing downstream can infer that from the task type, and a
+    /// row filed without one is visible only in the unfiltered task list.
+    #[serde(default)]
+    pub venue: Option<String>,
     /// How long this row may stay open before the graph fails it.
     ///
     /// The default on a task is sized for one dispatched round. A row a worker
@@ -747,6 +760,16 @@ fn submitted_tasks(
                     task.agent_id = item.agent_id.clone();
                     task.face_id = item.face_id.clone();
                     task.owner_unit = item.unit_id.clone();
+                    // Blank is absent rather than a venue whose name is the
+                    // empty string: the board would draw a nameless column
+                    // for it, and every reading that groups by venue would
+                    // carry one group no reader can name.
+                    task.venue = item
+                        .venue
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|venue| !venue.is_empty())
+                        .map(str::to_string);
                     // 提交人从令牌来，不从请求体来：这一格决定谁的当日额度，一个
                     // 能自己填它的调用方等于能把自己的花销记到别人头上。
                     task.submitted_by = submitted_by.map(str::to_string);
@@ -2348,6 +2371,7 @@ mod tests {
                 agent_id: None,
                 face_id: None,
                 unit_id: None,
+                venue: None,
                 timeout_seconds: None,
             }]),
             workspace_id: "ws".into(),
@@ -2358,6 +2382,44 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "case-1");
         assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-9"));
+    }
+
+    /// 提交人点名的场地要落到行上：工作台按这一列把活分开看，而这个标签没有
+    /// 任何下游能重新推出来——丢了它，这条活就只出现在不带场地的总表里。
+    #[test]
+    fn a_row_keeps_the_venue_its_submitter_named() {
+        let mut item = task_item("v-1", Some(true));
+        item.venue = Some("  memory  ".into());
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "fold these entries".into(),
+            tasks: Some(vec![item]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let tasks = submitted_tasks(&req, "g", None);
+        assert_eq!(
+            tasks[0].venue.as_deref(),
+            Some("memory"),
+            "the label travels trimmed; a padded copy would open a second column"
+        );
+
+        let mut blank = task_item("v-2", Some(true));
+        blank.venue = Some("   ".into());
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "fold these entries".into(),
+            tasks: Some(vec![blank]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let tasks = submitted_tasks(&req, "g", None);
+        assert_eq!(
+            tasks[0].venue, None,
+            "a blank label is no label, not a venue whose name nobody can read"
+        );
     }
 
     /// 显式空数组 `tasks: []` 与字段缺省是同一件事：没有可执行行 ⇒ 裸 goal，
@@ -2393,6 +2455,7 @@ mod tests {
             agent_id: None,
             face_id: None,
             unit_id: None,
+            venue: None,
             timeout_seconds: None,
         }
     }
