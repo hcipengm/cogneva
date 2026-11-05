@@ -45,6 +45,72 @@ pub const DEFAULT_MAX_PATTERN_DB_SIZE: usize = 256;
 // cap: bound — 单条模式的最长寿命：过期的模式是没人再验证过的经验，认它等于让一个旧结论一直生效
 pub const DEFAULT_MAX_PATTERN_AGE_DAYS: i64 = 30;
 
+/// 同一道目标的分解答案复用多久（秒）。
+// cap: bound — 复用窗口。比实测的重投节拍（约 120 秒）宽出数倍，否则省不下来；
+// 又不能长到「计划该重做了还拿旧答案」，所以它是一个有限窗口而不是永久缓存。
+pub const DEFAULT_ANSWER_REUSE_TTL_SECS: u64 = 600;
+
+/// 同一道目标在窗口内只问一次模型。
+///
+/// 重投是常态，而每一次重投过去都要完整问一遍模型。`decompose-75304847f8e9e3a5`
+/// 这一条目标 90 分钟内被分解 54 次，单次 45 KB prompt、17K token —— 实测
+/// 2026-11-05 网关账，不是规格；每次回来都是一份非空计划，两份之间只差
+/// 模型自己的措辞。目标身份本来就是稳定的
+/// （[`ActionPlanOrchestrator::decompose_task_id`]），所以两次重投问的是同一个问题；
+/// 上一份非空答案只要还在窗口内，就直接用它。
+///
+/// 并发的同一身份也只放一个进去问，后到者等前者：重投与真实并发叠在一起时，
+/// 两个 worker 会在同一秒里问同一件事。
+#[derive(Debug)]
+struct AnswerReuse {
+    ttl: std::time::Duration,
+    /// 身份 → （产出时刻，答案）。
+    answers:
+        tokio::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, ActionPlan)>>,
+    /// 身份 → 提问权。只有准备去问的一方持有这个 `Arc` 之外的那把锁；
+    /// 表里留着它只为让同时到的第二方拿到同一把锁。
+    in_flight: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AnswerReuse {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            ttl: std::time::Duration::from_secs(ttl_secs),
+            answers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            in_flight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 窗口内的答案。过期的在这里顺手清掉：缓存只在这条路径上被读写，
+    /// 另起一个清扫任务反而要多一条没人看的循环。
+    async fn get(&self, key: &str) -> Option<ActionPlan> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let mut answers = self.answers.lock().await;
+        answers.retain(|_, (at, _)| at.elapsed() < self.ttl);
+        answers.get(key).map(|(_, plan)| plan.clone())
+    }
+
+    async fn put(&self, key: &str, plan: &ActionPlan) {
+        self.answers
+            .lock()
+            .await
+            .insert(key.to_string(), (std::time::Instant::now(), plan.clone()));
+    }
+
+    /// 这个身份的提问权。表里没人持有（只剩表自己那一份引用）时顺手删掉，
+    /// 否则目标 id 一天一个地攒下去，这张表只增不减。
+    async fn gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut in_flight = self.in_flight.lock().await;
+        in_flight.retain(|_, gate| Arc::strong_count(gate) > 1);
+        in_flight
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
 /// ActionPlanOrchestrator implements Stage 1 decomposition logic:
 /// semantic goal decomposition, boundary detection, dependency inference,
 /// DAG validation, and a feedback loop with pattern DB self-enhancement.
@@ -77,6 +143,8 @@ pub struct ActionPlanOrchestrator {
     /// 不可能成功；判据与准入读同一个快照，不另立一套「还能不能花」的算法。
     /// 迟挂（插件之间 init 顺序不定），所以挂在 `OnceCell` 上而不是构造参数。
     pool_source: tokio::sync::OnceCell<Arc<dyn cog_core::LlmPoolStatusSource>>,
+    /// 同一道目标的重投在窗口内复用上一份非空分解答案，见 [`AnswerReuse`]。
+    answers: AnswerReuse,
 }
 
 impl std::fmt::Debug for ActionPlanOrchestrator {
@@ -126,7 +194,14 @@ impl ActionPlanOrchestrator {
             state_backend: None,
             workspace_id: "default".into(),
             pool_source: tokio::sync::OnceCell::new(),
+            answers: AnswerReuse::new(DEFAULT_ANSWER_REUSE_TTL_SECS),
         }
+    }
+
+    /// 改分解答案的复用窗口（秒）。0 不复用。
+    pub fn with_answer_reuse_ttl_secs(mut self, secs: u64) -> Self {
+        self.answers = AnswerReuse::new(secs);
+        self
     }
 
     /// Attach the pool's own verdict after construction.
@@ -980,27 +1055,59 @@ impl ActionPlanOrchestrator {
         }
 
         let attempts = self.decomposition_max_attempts.max(1);
-        let mut plan = None;
         let mut attempts_used = attempts;
-        for attempt in 1..=attempts {
-            let candidate = if hint_tasks.is_empty() {
-                self.decompose_goal(goal, skill_registry, None).await?
+
+        // 同一道目标的重投不为同一件事再花一次模型调用：身份由
+        // `decompose_task_id` 给出（有提示任务时是调用方自己的稳定 id），
+        // 命中窗口内的上一份非空答案就直接用它。计划里的任务 id 对同一身份
+        // 是同一批，重投照样走幂等入图，不会因为复用而多排一遍工。
+        let reuse_key = Self::decompose_task_id(
+            goal,
+            if hint_tasks.is_empty() {
+                None
             } else {
-                self.decompose_goal(goal, skill_registry, Some(&hint_tasks))
-                    .await?
-            };
-            if candidate.tasks.is_empty() {
-                tracing::warn!(
-                    goal = %goal,
-                    attempt,
-                    max_attempts = attempts,
-                    "decomposition returned zero atomic tasks"
-                );
-                continue;
+                Some(&hint_tasks)
+            },
+        );
+        let mut plan = self.answers.get(&reuse_key).await;
+        if plan.is_some() {
+            attempts_used = 1;
+            tracing::info!(
+                goal = %goal,
+                identity = %reuse_key,
+                "reusing the decomposition this window already answered"
+            );
+        } else {
+            // 同时到的第二方在这里排队：前一个拿到答案后写进缓存，后一个醒来
+            // 直接命中。没有这层，重投撞上真实并发时两个 worker 会同时问一遍。
+            let gate = self.answers.gate(&reuse_key).await;
+            let _asking = gate.lock().await;
+            plan = self.answers.get(&reuse_key).await;
+            if plan.is_some() {
+                attempts_used = 1;
+            } else {
+                for attempt in 1..=attempts {
+                    let candidate = if hint_tasks.is_empty() {
+                        self.decompose_goal(goal, skill_registry, None).await?
+                    } else {
+                        self.decompose_goal(goal, skill_registry, Some(&hint_tasks))
+                            .await?
+                    };
+                    if candidate.tasks.is_empty() {
+                        tracing::warn!(
+                            goal = %goal,
+                            attempt,
+                            max_attempts = attempts,
+                            "decomposition returned zero atomic tasks"
+                        );
+                        continue;
+                    }
+                    self.answers.put(&reuse_key, &candidate).await;
+                    plan = Some(candidate);
+                    attempts_used = attempt;
+                    break;
+                }
             }
-            plan = Some(candidate);
-            attempts_used = attempt;
-            break;
         }
 
         if self.dag_executor.is_none() {
@@ -2681,6 +2788,31 @@ mod tests {
         }
     }
 
+    /// 数次数、并回一份**非空**计划的执行器。
+    ///
+    /// [`CountingExecutor`] 回的是空列表，而空分解不进复用缓存（那是要重试的失败，
+    /// 不是答案），所以问「同一个问题问了几遍」必须用一份能过结构门的计划。
+    #[derive(Default)]
+    struct CountingPlanExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for CountingPlanExecutor {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+
+        async fn execute(&self, _task: &Task) -> SFResult<TaskResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({ "atomic_tasks": vec![atomic_task("t1")] }),
+                metadata: TaskResultMetadata::new("counting-plan").with_score(0.9),
+            })
+        }
+    }
+
     struct FixedPoolStatus(Option<cog_core::LlmPoolStatus>);
 
     #[async_trait::async_trait]
@@ -2759,6 +2891,76 @@ mod tests {
             executor.calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a healthy pool must not stop the decomposition"
+        );
+    }
+
+    /// 同一道目标的重投不重复问模型：窗口内第二遍直接用上一份非空计划。
+    ///
+    /// `decompose-75304847f8e9e3a5` 这条目标在 90 分钟里被分解了 54 次（实测 2026-11-05），
+    /// 每一次都成功返回同一件事。
+    /// 重投问的是同一个问题，答案照抄上一份就够了。
+    #[tokio::test]
+    async fn a_redelivered_goal_reuses_the_decomposition_this_window_already_answered() {
+        let executor = Arc::new(CountingPlanExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+        let asked = || executor.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        for round in 1..=2 {
+            planner
+                .process_goal_impl(
+                    "work the change backlog",
+                    vec![hint_task("change-ledger-807967ed073dbd9b")],
+                    &registry,
+                )
+                .await
+                .expect("a decomposition with a non-empty plan must get through");
+            assert_eq!(
+                asked(),
+                1,
+                "round {round} of the same goal must not ask the model again"
+            );
+        }
+
+        // 换一道目标就是另一个问题：缓存不能把别人的答案借给它。
+        planner
+            .process_goal_impl(
+                "work the other backlog",
+                vec![hint_task("change-ledger-8a8ab887fefa3933")],
+                &registry,
+            )
+            .await
+            .expect("a different goal must decompose on its own answer");
+        assert_eq!(asked(), 2, "a different goal must be asked separately");
+    }
+
+    /// 复用窗口设成 0 就是不复用：关掉之后每一次都真的去问。
+    #[tokio::test]
+    async fn a_zero_window_means_every_delivery_asks_again() {
+        let executor = Arc::new(CountingPlanExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_decomposition_max_attempts(1)
+            .with_answer_reuse_ttl_secs(0);
+        let registry = SkillRegistry::new();
+
+        for _ in 0..2 {
+            planner
+                .process_goal_impl(
+                    "work the change backlog",
+                    vec![hint_task("change-ledger-1")],
+                    &registry,
+                )
+                .await
+                .expect("a decomposition with a non-empty plan must get through");
+        }
+
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "with the window closed each delivery has to ask again"
         );
     }
 
