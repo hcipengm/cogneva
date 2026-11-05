@@ -121,7 +121,7 @@ tests:
         values: '60x60'
       - series: 'cogneva_stream_pending_measure_failures_total{stream="tasks"}'
         values: '0x50 3x10'
-      - series: 'cogneva_stream_read_silent_seconds{stream="tasks"}'
+      - series: 'cogneva_stream_read_silent_seconds{stream="tasks",consumer_group="dag-executor-default"}'
         values: '600x60'
       - series: 'cogneva_stream_read_block_seconds{stream="tasks"}'
         values: '2x60'
@@ -174,6 +174,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: critical
+              consumer_group: dag-executor-default
               stream: tasks
 
   # 同样的沉默，两种原因：读循环把消息拿在手里、排在自己的并发预算后面时，它当然
@@ -196,9 +197,16 @@ tests:
         exp_alerts: []
 
   # 差一格：这条循环本来还能再读一次，它没有 —— 沉默是它自己的，规则必须照响。
+  #
+  # 这一格同时钉住「一行一件事」：同一条流由两个进程各报自己的沉默（主进程与
+  # 进化进程读同一批 ready 流，抓取的 job/service/pod 各不相同），而这一行说的是
+  # 「这个消费者组对着这条流没有声音」。按 reporter 分组就会在造出两条行的那一天
+  # 把一次故障读成两次，所以这里给两个 reporter 断言恰好一条。
   - interval: 1m
     input_series:
-      - series: 'cogneva_stream_read_silent_seconds{stream="tasks"}'
+      - series: 'cogneva_stream_read_silent_seconds{stream="tasks",consumer_group="dag-executor-default",job="cogneva",service="cogneva",container="cogneva",pod="cogneva-1",instance="10.0.0.1:8080",namespace="cogneva"}'
+        values: '600x60'
+      - series: 'cogneva_stream_read_silent_seconds{stream="tasks",consumer_group="dag-executor-default",job="cogneva-evolution",service="cogneva-evolution",container="cogneva",pod="cogneva-evolution-1",instance="10.0.0.2:8080",namespace="cogneva"}'
         values: '600x60'
       - series: 'cogneva_stream_read_block_seconds{stream="tasks"}'
         values: '2x60'
@@ -212,6 +220,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: critical
+              consumer_group: dag-executor-default
               stream: tasks
 
   # 重启的涨幅还在窗口里（一小时窗口留得住四十分钟前那次），但这条读数四十分钟前停了：
