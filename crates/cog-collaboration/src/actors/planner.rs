@@ -100,6 +100,60 @@ impl PlannerActor {
         previous_generation: Option<&serde_json::Value>,
         context_board: Option<&serde_json::Value>,
     ) -> PlannerOutput {
+        self.plan_inner(
+            task,
+            attempt,
+            previous_feedback,
+            previous_score,
+            previous_generation,
+            context_board,
+            false,
+        )
+        .await
+    }
+
+    /// Run the Planner phase for a caller that will judge the plan with a
+    /// program criterion and hand the verdict back to the next round.
+    ///
+    /// The decomposition loop reads the plan it just parsed against
+    /// `crate::squad::plan::judge_plan` — a structural gate over
+    /// the same bytes the self-review would be asked to read — and its refusal
+    /// is the next round's prompt. Buying an LLM review there is a second judge
+    /// for one artifact, and its rewritten text would be re-judged by the
+    /// program gate anyway. The skip is counted under its own reason rather
+    /// than `disabled`: nothing was turned off, a gate that already exists took
+    /// the judgement over.
+    pub async fn plan_judged_downstream(
+        &self,
+        task: &Task,
+        attempt: u32,
+        previous_feedback: Option<&str>,
+        previous_score: Option<u32>,
+        previous_generation: Option<&serde_json::Value>,
+        context_board: Option<&serde_json::Value>,
+    ) -> PlannerOutput {
+        self.plan_inner(
+            task,
+            attempt,
+            previous_feedback,
+            previous_score,
+            previous_generation,
+            context_board,
+            true,
+        )
+        .await
+    }
+
+    async fn plan_inner(
+        &self,
+        task: &Task,
+        attempt: u32,
+        previous_feedback: Option<&str>,
+        previous_score: Option<u32>,
+        previous_generation: Option<&serde_json::Value>,
+        context_board: Option<&serde_json::Value>,
+        program_judged: bool,
+    ) -> PlannerOutput {
         let goal = task
             .input
             .get("goal")
@@ -307,12 +361,17 @@ impl PlannerActor {
         // 形状，plan 在到这里之前已经解析过，而只会说人话的模型会让改写的自审
         // 跑到超时才返回——买到的是一段改不动解析结果的散文，代价是一整个超时。
         // 跳过用同一个具名理由，省下的调用因此是读数而不是缺席。
+        //
+        // 第三种：调用方自己会用程序判据判这份计划（分解循环就是这样，判词还会
+        // 回到下一轮）。那时自审是给同一个产物买第二个判官，理由同样具名。
         let review_basis = if output.is_terminal_env_failure() {
             crate::actors::ReviewBasis::Skipped(
                 crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
             )
         } else if is_self_evolution {
             crate::actors::ReviewBasis::Skipped(crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION)
+        } else if program_judged {
+            crate::actors::ReviewBasis::Skipped(crate::observable::SELF_REVIEW_SKIP_PROGRAM_JUDGED)
         } else {
             crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[]))
         };

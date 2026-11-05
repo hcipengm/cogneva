@@ -41,6 +41,10 @@ pub const SELF_REVIEW_CRITERIA_ABSENT: &str = "absent";
 pub const SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
 pub const SELF_REVIEW_SKIP_DISABLED: &str = "disabled";
 pub const SELF_REVIEW_SKIP_SELF_EVOLUTION: &str = "self_evolution";
+/// `program_judged`：这份产物在它被交给的那条循环里已经由程序判据逐条判过，
+/// 判词还会回到下一轮。同一个产物用第二个模型再判一遍，买到的是同一份判断，
+/// 而判据与产物的种类已经对上了（结构判据判结构产物）。
+pub const SELF_REVIEW_SKIP_PROGRAM_JUDGED: &str = "program_judged";
 
 /// The two ends of a revision step inside a self-review that did run. Both
 /// cells answer a question the verdict cannot: a review that ended in

@@ -593,7 +593,7 @@ impl RalphLoop {
             // 丢掉它等于把同一轮原样重放一次。
             let previous_feedback = self.history.last().map(|h| h.feedback.clone());
             let plan = planner
-                .plan(
+                .plan_judged_downstream(
                     &task,
                     iteration,
                     previous_feedback.as_deref(),
@@ -1642,6 +1642,9 @@ mod tests {
     struct ScriptedPlanner {
         responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
         seen: std::sync::Mutex<Vec<serde_json::Value>>,
+        /// 自审被买了几次。计划循环自己判这份计划，所以这一格该是零；没有它，
+        /// 「没买」与「买了但没人记」在替身上完全同形。
+        reviews: std::sync::atomic::AtomicUsize,
     }
 
     impl ScriptedPlanner {
@@ -1649,11 +1652,16 @@ mod tests {
             Self {
                 responses: std::sync::Mutex::new(responses.into_iter().collect()),
                 seen: std::sync::Mutex::new(Vec::new()),
+                reviews: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn seen(&self) -> Vec<serde_json::Value> {
             self.seen.lock().unwrap().clone()
+        }
+
+        fn reviews(&self) -> usize {
+            self.reviews.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1663,6 +1671,24 @@ mod tests {
             self.seen.lock().unwrap().push(input);
             Ok(self.responses.lock().unwrap().pop_front().unwrap_or_else(
                 || serde_json::json!({"summary": "n/a", "plan": {}, "sub_tasks": []}),
+            ))
+        }
+
+        /// 一次真的自审要付的账：记一笔，然后把原文原样交回。
+        async fn review_and_revise_for_task(
+            &self,
+            output: &str,
+            _config: &cog_core::SelfReviewConfig,
+            _task_id: &str,
+        ) -> cog_core::SFResult<(String, cog_core::SelfReviewResult)> {
+            self.reviews
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((
+                output.to_string(),
+                cog_core::SelfReviewResult::Pass {
+                    score: 1.0,
+                    summary: "scripted".into(),
+                },
             ))
         }
 
@@ -1812,6 +1838,78 @@ mod tests {
                 .contains(crate::squad::plan::PLAN_NO_ACCEPTANCE),
             "the first round cannot have been told about a defect that did not exist yet"
         );
+    }
+
+    /// 计划在这条循环里已经由程序判据逐条判过，就不再买第二个判官。
+    ///
+    /// `judge_plan` 读的是 PlannerOutput，判词逐条回到下一轮——它与自审读的是
+    /// 同一份字节，而自审改写出来的文本又要再过一次这道程序门。同一份产物判两次，
+    /// 买到的是第二份判断，不是第二道门。跳过必须记在具名理由上：没有这一格，
+    /// 「省下的调用」与「调用根本没接上」在读数上同形。
+    #[tokio::test]
+    async fn the_plan_loop_does_not_buy_a_second_judge_for_the_plan_it_judges_itself() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 4,
+            stagnation_window: 0,
+        });
+        let scripted = Arc::new(ScriptedPlanner::new(vec![
+            serde_json::json!({
+                "summary": "first attempt",
+                "plan": {"specification": "s", "design": "d"},
+                "sub_tasks": [{"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": []}],
+            }),
+            serde_json::json!({
+                "summary": "second attempt",
+                "plan": {"specification": "s", "design": "d"},
+                "sub_tasks": [{"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": [],
+                               "acceptance": ["the answer names the file it changed"]}],
+            }),
+        ]));
+        let planner = PlannerActor::new(scripted.clone())
+            .with_self_review(cog_core::SelfReviewConfig::default());
+
+        let before = planner_review_skips().await;
+
+        let verdict = ralph
+            .run_plan("decompose the goal", serde_json::json!({}), &planner)
+            .await;
+
+        match verdict {
+            RalphVerdict::Passed { iterations, .. } => assert_eq!(
+                iterations, 2,
+                "the program gate still has to run and still has to reach the next round"
+            ),
+            other => panic!("Expected Passed on the second round, got {:?}", other),
+        }
+        assert_eq!(
+            scripted.reviews(),
+            0,
+            "a review was bought for a plan the loop already judges"
+        );
+        assert!(
+            planner_review_skips().await >= before + 2.0,
+            "the two skipped reviews have to be counted under their own reason"
+        );
+    }
+
+    /// 本进程里 planner 的「由程序判据判过」跳过数。读的是差值，所以同一进程
+    /// 里别的用例写这一格不影响结论。
+    async fn planner_review_skips() -> f64 {
+        use cog_core::observability::Observable;
+        crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap()
+            .iter()
+            .find(|m| {
+                m.name == "self_review_skipped_total"
+                    && m.labels.get(crate::LABEL_STAGE).map(String::as_str)
+                        == Some(cog_core::roles::PLANNER)
+                    && m.labels.get("reason").map(String::as_str)
+                        == Some(crate::observable::SELF_REVIEW_SKIP_PROGRAM_JUDGED)
+            })
+            .map(|m| m.value)
+            .unwrap_or(0.0)
     }
 
     /// 同一句判词第二次回来就收摊，不等五轮窗口。
