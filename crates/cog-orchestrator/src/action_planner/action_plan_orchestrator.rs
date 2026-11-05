@@ -843,12 +843,35 @@ impl ActionPlanOrchestrator {
         out
     }
 
-    /// High-level entry point: process a goal with optional pre-existing tasks.
-    /// 1. If all `tasks` have `action_planner_meta.verified == true`, inject them
-    ///    directly into the attached [`cog_core::DagExecutor`] (skip decomposition).
-    /// 2. If `tasks` is empty, decompose the goal via collaboration (`TaskExecutor`).
-    /// 3. If `tasks` exist but lack the verified marker, evaluate them and either
-    ///    mark+inject or re-decompose.
+    /// 这一行是不是一句话就说清了「跑什么、怎样算完」。
+    ///
+    /// 两个判据都读提交方自己写下的字段，不读目标文本、不做措辞判断：同一种行
+    /// 换一套说法不该换一条路，而措辞是唯一会让它换路的东西。
+    ///
+    /// `task_kind` 是提交方给这个执行器起的名字。有它，说明这道活的种类是**被
+    /// 声明过的**，不需要模型再从目标文本里猜一遍。
+    ///
+    /// `acceptance` 是提交方自己写的「怎样算完」。缺了它直通也跑不起来：派发器只
+    /// 开工「说了怎样算完」的行，放行一条没有判据的行等于把它吊在原地，比分解更糟。
+    fn states_its_own_work(task: &Task) -> bool {
+        task.is_executable
+            && !task.acceptance.is_empty()
+            && task
+                .input
+                .get(cog_core::INPUT_TASK_KIND)
+                .and_then(|v| v.as_str())
+                .is_some_and(|kind| !kind.trim().is_empty())
+    }
+
+    /// High-level entry point: process a goal with optional pre-existing tasks,
+    /// in this order:
+    ///
+    /// 1. All self-evolution rows — straight into the [`cog_core::DagExecutor`].
+    /// 2. Every executable row states its own work (`task_kind` + `acceptance`) —
+    ///    the fixed-program branch passes them through, zero tokens.
+    /// 3. All rows carry `action_planner_meta.verified` — straight in.
+    /// 4. Otherwise decompose via collaboration (`TaskExecutor`), which covers
+    ///    both an empty submission and rows that only state an intent.
     ///
     /// 无论走哪条路，被处理的那一组行里都要有一条**承载这道目标**的行（`Task::goal_row`）：
     /// 调用方带了就用它自己的，一条都没带时在这里补一条。分解出的子任务靠它拿 `goal_id`
@@ -947,6 +970,57 @@ impl ActionPlanOrchestrator {
                 tracing::warn!("self_evolution tasks present but no DagExecutor attached");
             }
             return Ok(queued);
+        }
+
+        // 一句话就说清了「跑什么、怎样算完」的行，不再花一次模型调用去分解。
+        //
+        // planner 是必经的一层，但它的实现分两支：一行说得清的，这一支就是固定
+        // 程序——照原样放行，零 token；说不清的才落到模型那一支。这一支不是绕过
+        // planner，它就是 planner 在这个形状上的实现。
+        //
+        // 实测 2026-11-05 15:10–15:36：这段时间里 planner 的调用**全部**是
+        // `capability_discovery` 探针——一行 `Combining A and B may yield a new
+        // composite capability`，自身已带齐 tools / strategy / prompt_variants /
+        // evaluation_criteria。每一条都被模型拆成「给单个工具做能力画像 ×2 ＋
+        // 综合」三条三四千字的 prompt，而这一族 359 条探针至今完成 0 条。原因不在
+        // 模型拆得不好，在结局没处落：发现环收结局读的是**探针自己那一行**
+        // （`settle_discovery_outcomes` 按提交时拿到的 id 读），而分解把这一行改写
+        // 成不可执行的目标行、把活挂到子任务上，于是那一行永远不会有结果，那条探针
+        // 永远读作 `row_missing`。直通之后一条探针就是一次生成，结局回得到发现账上，
+        // 那个组合才真的退场。
+        if let Some(dag) = self.dag_executor.as_deref() {
+            let executable: Vec<&Task> = tasks.iter().filter(|t| t.is_executable).collect();
+            if !executable.is_empty() && executable.iter().all(|t| Self::states_its_own_work(t)) {
+                let now = Utc::now();
+                let requested: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+                let mut batch = Vec::with_capacity(tasks.len());
+                for mut task in tasks {
+                    task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
+                        verified: true,
+                        version: Some("1.0.0".into()),
+                        note: Some("Program branch: the row states its own work".into()),
+                        source: Some(cog_core::ActionPlannerSource::UserProvided),
+                        confidence: None,
+                        timestamp: Some(now),
+                    });
+                    batch.push(task);
+                }
+                tracing::info!(
+                    goal = %goal,
+                    task_count = %batch.len(),
+                    "the submission states its own work; passed through without decomposition"
+                );
+                let queued = dag.add_tasks_batch(batch).await?;
+                for held in requested.iter().filter(|id| !queued.contains(id)) {
+                    let status = dag.get_task(held).await.map(|t| t.status);
+                    tracing::warn!(
+                        task_id = %held,
+                        ?status,
+                        "stated-work submission held by an existing task; nothing was queued"
+                    );
+                }
+                return Ok(queued);
+            }
         }
 
         // 一条行都不给的提交（接口层与聊天入口都能这么提交）在这里补出承载这道目标的
@@ -4379,6 +4453,104 @@ mod tests {
         assert!(stored_leaf.is_executable);
         assert_eq!(stored_leaf.timeout_seconds, 3600);
         assert_eq!(stored_leaf.goal_id.as_deref(), Some("signal:alert/r"));
+    }
+
+    /// 一行就说清了「跑什么、怎样算完」的活，planner 的固定程序那一支直接放行。
+    ///
+    /// 这道测试钉的是一个结局，不是一个形状：发现环收探针的结局时按**提交时拿到
+    /// 的那个 id** 去读任务行（`settle_discovery_outcomes`），分解会把这一行改写成
+    /// 不可执行的目标行、把活挂到子任务上，于是那一行永远不会有结果，探针永远读作
+    /// `row_missing`——库里 359 条探针至今 0 条完成就是这个形状。放行之后探针自己
+    /// 就是那条会跑的行，结局才有落点。
+    ///
+    /// 计数执行器让这一支可见：分解会记一次调用，而这条测试要求零次。
+    #[tokio::test]
+    async fn a_row_that_states_its_own_work_is_not_decomposed() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-stated-work".to_string()));
+        let executor = Arc::new(CountingExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag.clone());
+        let registry = SkillRegistry::new();
+
+        let mut probe = Task::new(
+            "DSC-20261105-AAAA/t0",
+            TaskType::Custom("capability_discovery".into()),
+            serde_json::json!({
+                "goal": "Combining read_file and write_file may yield a new composite capability.",
+                "task_kind": "capability_discovery",
+                "explored_key": "tool:read_file+write_file",
+                "tools": ["read_file", "write_file"],
+            }),
+        );
+        probe
+            .acceptance
+            .push("探针 `tool:read_file+write_file` 跑完并带回一条可判的结局".to_string());
+
+        let ids = planner
+            .process_goal_impl(
+                "Combining read_file and write_file may yield a new composite capability.",
+                vec![probe],
+                &registry,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ids,
+            vec!["DSC-20261105-AAAA/t0".to_string()],
+            "the probe itself reaches the graph — that is the id its outcome is read back by"
+        );
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a row that states its own work must not cost a decomposition"
+        );
+        let stored = dag.get_task("DSC-20261105-AAAA/t0").await.unwrap();
+        assert!(
+            stored.is_executable,
+            "the row has to be runnable: an outcome can only be read off a row that ran"
+        );
+        assert!(stored.action_planner_meta.as_ref().unwrap().verified);
+    }
+
+    /// 判据缺一项就不放行：只声明 `task_kind`、没写「怎样算完」的行，放行之后派发器
+    /// 也不开工，直通等于把它吊在原地。这一支落到模型，由模型给出判据再入图。
+    #[tokio::test]
+    async fn a_row_without_acceptance_still_goes_to_the_model() {
+        let dag: Arc<dyn cog_core::DagExecutor> = Arc::new(crate::DagExecutor::new(
+            "ws-stated-work-no-acceptance".to_string(),
+        ));
+        let executor = Arc::new(CountingExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+
+        let bare = Task::new(
+            "DSC-20261105-BBBB/t0",
+            TaskType::Custom("capability_discovery".into()),
+            serde_json::json!({
+                "goal": "Combining read_file and write_file may yield a new composite capability.",
+                "task_kind": "capability_discovery",
+            }),
+        );
+
+        let _ = planner
+            .process_goal_impl(
+                "Combining read_file and write_file may yield a new composite capability.",
+                vec![bare],
+                &registry,
+            )
+            .await;
+
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "without an acceptance criterion the row is not stated work; it is decomposed"
+        );
     }
 
     #[tokio::test]
