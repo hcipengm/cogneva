@@ -128,7 +128,7 @@ impl MemoryExtractor for RuleBasedExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    namespace,
+                    &source.namespace,
                     SchemaKind::Entity,
                     name,
                     key,
@@ -142,7 +142,7 @@ impl MemoryExtractor for RuleBasedExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    namespace,
+                    &source.namespace,
                     SchemaKind::Relation,
                     format!("{} -> {}", from, to),
                     key,
@@ -160,7 +160,7 @@ impl MemoryExtractor for RuleBasedExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    namespace,
+                    &source.namespace,
                     SchemaKind::Event,
                     name,
                     key,
@@ -648,91 +648,9 @@ impl LlmMemoryExtractor {
         )
     }
 
-    /// Turn a schema extraction into store entries. The schema-only call and
-    /// the combined call both land here, so a merged call cannot produce
-    /// different ids or importance for the same model output.
-    ///
-    /// The namespace and the source reference are the caller's, not derived
-    /// here: a judgment that arrives through [`crate::JudgedEntryWriter`] comes
-    /// from a different judge and must say so in the rows it produces.
-    pub(crate) fn schema_entries(
-        namespace: &str,
-        source_ref: SourceRef,
-        extraction: SchemaExtraction,
-    ) -> Vec<SchemaEntry> {
-        let mut entries = Vec::new();
-
-        for entity in extraction.entities {
-            let key = entity.name.to_lowercase().replace(' ', "_");
-            let importance = cog_core::importance_from_rating(entity.importance);
-            record(
-                &mut entries,
-                SchemaEntry::identified(
-                    namespace,
-                    SchemaKind::Entity,
-                    entity.name,
-                    key,
-                    source_ref.clone(),
-                )
-                .with_properties(serde_json::to_value(entity.properties).unwrap_or_default())
-                .with_importance(importance),
-            );
-        }
-
-        for relation in extraction.relations {
-            let key = format!(
-                "{}_to_{}",
-                relation.source.to_lowercase().replace(' ', "_"),
-                relation.target.to_lowercase().replace(' ', "_")
-            );
-            let importance = cog_core::importance_from_rating(relation.importance);
-            record(
-                &mut entries,
-                SchemaEntry::identified(
-                    namespace,
-                    SchemaKind::Relation,
-                    format!("{} -> {}", relation.source, relation.target),
-                    key,
-                    source_ref.clone(),
-                )
-                .with_properties(serde_json::json!({
-                    "relation_type": relation.relation_type,
-                    "from": relation.source,
-                    "to": relation.target,
-                }))
-                .with_importance(importance),
-            );
-        }
-
-        for event in extraction.events {
-            let key = event.name.to_lowercase().replace(' ', "_");
-            let mut props = serde_json::json!({
-                "participants": event.participants,
-            });
-            if let Some(ts) = event.timestamp {
-                props["timestamp"] = serde_json::Value::String(ts);
-            }
-            let importance = cog_core::importance_from_rating(event.importance);
-            record(
-                &mut entries,
-                SchemaEntry::identified(
-                    namespace,
-                    SchemaKind::Event,
-                    event.name,
-                    key,
-                    source_ref.clone(),
-                )
-                .with_properties(props)
-                .with_importance(importance),
-            );
-        }
-
-        entries
-    }
-
     /// Turn a summary extraction into the store entry, embedding the text when
     /// this host has an embedder. Shared by the summary-only call and the
-    /// combined call for the same reason as [`Self::schema_entries`].
+    /// combined call for the same reason as [`schema_entries`].
     async fn summary_entry(
         &self,
         source: &RawSource,
@@ -747,6 +665,88 @@ impl LlmMemoryExtractor {
         )
         .await
     }
+}
+
+/// Turn a schema extraction into store entries. The schema-only call and
+/// the combined call both land here, so a merged call cannot produce
+/// different ids or importance for the same model output.
+///
+/// The namespace and the source reference are the caller's, not derived
+/// here: a judgment that arrives through [`crate::JudgedEntryWriter`] comes
+/// from a different judge and must say so in the rows it produces.
+pub(crate) fn schema_entries(
+    namespace: &str,
+    source_ref: SourceRef,
+    extraction: SchemaExtraction,
+) -> Vec<SchemaEntry> {
+    let mut entries = Vec::new();
+
+    for entity in extraction.entities {
+        let key = entity.name.to_lowercase().replace(' ', "_");
+        let importance = cog_core::importance_from_rating(entity.importance);
+        record(
+            &mut entries,
+            SchemaEntry::identified(
+                namespace,
+                SchemaKind::Entity,
+                entity.name,
+                key,
+                source_ref.clone(),
+            )
+            .with_properties(serde_json::to_value(entity.properties).unwrap_or_default())
+            .with_importance(importance),
+        );
+    }
+
+    for relation in extraction.relations {
+        let key = format!(
+            "{}_to_{}",
+            relation.source.to_lowercase().replace(' ', "_"),
+            relation.target.to_lowercase().replace(' ', "_")
+        );
+        let importance = cog_core::importance_from_rating(relation.importance);
+        record(
+            &mut entries,
+            SchemaEntry::identified(
+                namespace,
+                SchemaKind::Relation,
+                format!("{} -> {}", relation.source, relation.target),
+                key,
+                source_ref.clone(),
+            )
+            .with_properties(serde_json::json!({
+                "relation_type": relation.relation_type,
+                "from": relation.source,
+                "to": relation.target,
+            }))
+            .with_importance(importance),
+        );
+    }
+
+    for event in extraction.events {
+        let key = event.name.to_lowercase().replace(' ', "_");
+        let mut props = serde_json::json!({
+            "participants": event.participants,
+        });
+        if let Some(ts) = event.timestamp {
+            props["timestamp"] = serde_json::Value::String(ts);
+        }
+        let importance = cog_core::importance_from_rating(event.importance);
+        record(
+            &mut entries,
+            SchemaEntry::identified(
+                namespace,
+                SchemaKind::Event,
+                event.name,
+                key,
+                source_ref.clone(),
+            )
+            .with_properties(props)
+            .with_importance(importance),
+        );
+    }
+
+    entries
 }
 
 /// Build the store entry for a summary extraction.
@@ -804,7 +804,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
         note_payload_outcome(outcome);
         let extraction: SchemaExtraction = self.structured_cached("schema", &prompt).await?;
 
-        Ok(Self::schema_entries(
+        Ok(schema_entries(
             &source.namespace,
             SourceRef::new(format!("memory://{}", source.id), "llm/v1"),
             extraction,
@@ -829,7 +829,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
         let extraction: CombinedExtraction = self.structured_cached("combined", &prompt).await?;
 
         let (schema, summary) = extraction.split();
-        let entries = Self::schema_entries(
+        let entries = schema_entries(
             &source.namespace,
             SourceRef::new(format!("memory://{}", source.id), "llm/v1"),
             schema,
