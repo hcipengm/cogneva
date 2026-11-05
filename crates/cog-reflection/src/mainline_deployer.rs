@@ -5355,32 +5355,6 @@ impl MainlineDeployer {
         .await
     }
 
-    /// 这一笔进图的行里，有没有至少一条是**还能跑**的。
-    ///
-    /// 判据读的是行自己的 `is_executable`，不是它所在的种类：一条 `Pending` 的
-    /// 锚点行与一条 `Pending` 的工作行在状态上完全相同，只有这一格分得开「有人
-    /// 会去修」与「只有一行身份标记」。读不到的行按不能跑算——多开一张单是无害的
-    /// （id 由 rev、当天与扣住起点推出，图按幂等跳过），少开一张就是一条没人接住
-    /// 的扣住。
-    ///
-    /// 终结的行也不算能跑：`is_executable` 说的是这一行**能不能**被执行，不是它
-    /// **还**有没有人要执行。2026-11-05 实测，`ci-red-4262e261f755-…-fix` 已经
-    /// `completed` 而 CI 仍然红着，这一格把那条走完的单子读成「有人在办」，读数
-    /// `cogneva_ci_hold_unowned` 一直是 0，整条扣住就此停在一张没人会再跑的单子上。
-    async fn any_row_can_run(
-        &self,
-        orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
-        rows: &[String],
-    ) -> bool {
-        for id in rows {
-            match orchestrator.get_task(id).await {
-                Some(task) if task.is_executable && !task.status.is_terminal() => return true,
-                _ => continue,
-            }
-        }
-        false
-    }
-
     /// 这一版上前几轮各自怎么结束的，取最近 [`CI_HOLD_ATTEMPTS_SHOWN`] 条。
     ///
     /// 只读办完的：还在跑的那一轮不是「试过了没成」，把它写进题面会让下一轮以为
@@ -5410,7 +5384,7 @@ impl MainlineDeployer {
     ///
     /// 基础 id 由 rev、扣住起点与日期推出，扣住还在的每一轮读到的都是它；可这一行
     /// 在图上只活到终结为止——办完之后同一个 id 再提交就是幂等空操作，扣住会一直
-    /// 等一条没有人会再跑的单子（见 [`Self::any_row_can_run`] 的现场）。所以轮次从
+    /// 等一条没有人会再跑的单子。所以轮次从
     /// 图里读：第一个还没终结的那一行就是这一轮该办的那一行，全都终结了就顺着往后
     /// 开一行新的。轮次不另存一份计数，图自己就是那本账——两个副本在同一轮里问同
     /// 一张图，读到的也是同一个答案。
@@ -17730,47 +17704,6 @@ exec {real} "$@"
                 .get(cog_core::INPUT_READY_LANE)
                 .and_then(|lane| lane.as_str()),
             Some(cog_core::READY_LANE_STOP_THE_LINE)
-        );
-    }
-
-    /// 办完的修复单不再算「有人在办」。
-    ///
-    /// `is_executable` 答的是「这一行**能**被执行」，不是「**还**有人要执行它」。
-    /// 2026-11-05 的现场：`ci-red-4262e261f755-…-fix` 已经 `completed` 而 CI 仍
-    /// 红着，这一格把走完的单子读成有人接着干，`cogneva_ci_hold_unowned` 一直是 0。
-    #[tokio::test]
-    async fn a_completed_row_is_not_someone_working_on_the_hold() {
-        use cog_core::OrchestratorControl as _;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let cfg = upstream_config(root, Path::new("/nonexistent"));
-        let planner = std::sync::Arc::new(RecordingPlanner::default());
-        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
-        let orchestrator: std::sync::Arc<dyn cog_core::OrchestratorControl> = planner.clone();
-
-        let mut row = cog_core::Task::new(
-            "done-row".to_string(),
-            cog_core::TaskType::Custom("ci_hold_fix".into()),
-            serde_json::json!({}),
-        );
-        row.is_executable = true;
-        planner
-            .submit_goal_auto("hold", vec![row])
-            .await
-            .expect("the stand-in takes the row");
-        assert!(
-            deployer
-                .any_row_can_run(&orchestrator, &["done-row".to_string()])
-                .await,
-            "一步都没走的行是有人能接的"
-        );
-
-        planner.mark_completed("done-row");
-        assert!(
-            !deployer
-                .any_row_can_run(&orchestrator, &["done-row".to_string()])
-                .await,
-            "办完的行占着 id，但没有人会再跑它；读成有人办就是让整条扣住停在这张死单上"
         );
     }
 
