@@ -26,11 +26,25 @@ const DECOMPOSITION_ALERT_PREFIX: &str = "decomposition_";
 // cap: bound — 样本不够就不排程；两三个样本排出来的计划会让一条任务在计划上「早就该完了」，那是凭空造出来的落后
 pub const MIN_ESTIMATE_SAMPLES: u64 = 5;
 
-/// 估算基线版本串的开头，两种写法共有的那一段：「这一行是估算器按历史写的」。
+/// 基线版本串里表示「这个数是估的、没有人批过」的那一段。
 ///
-/// 分解算出来的、人排的基线写的是别的（有的直接是时刻），它们不是估算，
-/// 估算器不重算也不覆盖。
+/// 它同时是两类行共有的写法：估算器按历史中位数写的（`estimate/work-time-v1/…`），
+/// 和分解给出预估后按它的输入大小写的（[`DECOMPOSITION_BASELINE_REV`]）。两者
+/// 都不是谁批准的额度，所以两件读这件事的地方按同一段判：重算那一趟只碰带尺子
+/// 的那一种，`planned_budgets` 两种都不收。
 pub(crate) const ESTIMATE_REV_PREFIX_ANY: &str = "estimate/";
+
+/// 分解写下的基线：`estimate/decomposition/<时刻>`。
+///
+/// 它的 `budget_tokens` 是 `estimate_tokens` 按这一片输入的字符数猜的，不是谁
+/// 批过的额度，所以它必须带上 [`ESTIMATE_REV_PREFIX_ANY`] 那一段——否则读者
+/// 会把它当批准的预算，而它平均只有 3 426 个 token，一条生成子任务跑一遍就
+/// 越过它。越过的后果不是停下，是把这条活永久挂在就绪队列外（重规划已下线，
+/// 没有人再给它一个新的数）。
+///
+/// 与 `estimate/work-time-v1/…` 的区别是它没有「哪把尺子」这一段：它是按这一次
+/// 的输入大小算的，换个任务就换个数，没有可重算的历史中位数。
+pub(crate) const DECOMPOSITION_BASELINE_REV: &str = "estimate/decomposition/";
 
 /// 估算基线版本串的开头，连同量出这条工期的尺子：`estimate/work-time-v1/…`。
 ///
@@ -856,6 +870,14 @@ impl DagExecutorRuntime {
     /// 一次读整张表而不是逐条 `task_plan`：这一拍要判的是全部就绪任务的预算，
     /// 逐条问是每条一次往返，而基线的行数比任务少一个量级。读不到（进程内后端
     /// 没有这个面、或者库这一下不可用）返回 `None`：不设界，但也不假装设了界。
+    ///
+    /// 只收**谁批过的**预算：`baseline_rev` 以 [`ESTIMATE_REV_PREFIX_ANY`] 开头的
+    /// 行是估算器按历史写下的中位数——它回答「这类活一般花多少」，不是「这条活可以
+    /// 花到哪」。中位数是分布的中间，拿它当硬停等于让一半的活必然停在半路；而停下
+    /// 来的那条没有任何出口：行留在 `Pending`，重规划已下线，于是每一拍重判一次。
+    /// 实测 2026-11-05：545 条 `Pending` 带基线，其中 95 条因此永久停在队列里，
+    /// `budget_spent` 每秒拦 9 条、拦了好几天。估算行照样留在表里给甘特读，
+    /// 这里只是不让它当闸门。
     /// 给还没有计划基线的就绪任务排一次期，并把按旧尺子写过期的基线重算一遍。
     ///
     /// 排期用的数是**量出来的**：同一种类已经跑完的任务里，token 清点的中位数
@@ -920,6 +942,12 @@ impl DagExecutorRuntime {
             .filter(|plan| plan.baseline_rev.starts_with(ESTIMATE_REV_PREFIX_ANY))
         {
             if plan.baseline_rev.starts_with(ESTIMATE_REV_PREFIX) {
+                continue;
+            }
+            // 分解写的那一种带的是 `estimate/` 但不带尺子：它按这一次的输入
+            // 大小算，没有可重算的中位数，重算它等于拿历史把一个当次的估计
+            // 覆盖掉。它只是**不能当闸门**，不是一把过期的尺子。
+            if plan.baseline_rev.starts_with(DECOMPOSITION_BASELINE_REV) {
                 continue;
             }
             let Some(kind) = estimate_rev_kind(&plan.baseline_rev) else {
@@ -1025,6 +1053,7 @@ impl DagExecutorRuntime {
             Ok(rows) => Some(
                 rows.into_iter()
                     .filter(|plan| plan.budget_tokens > 0)
+                    .filter(|plan| !plan.baseline_rev.starts_with(ESTIMATE_REV_PREFIX_ANY))
                     .map(|plan| (plan.task_id, plan.budget_tokens))
                     .collect(),
             ),
@@ -3930,6 +3959,57 @@ mod consumer_ack_tests {
         assert_eq!(
             held[0].2.get(crate::LABEL_STREAM).map(String::as_str),
             Some("shared")
+        );
+    }
+
+    /// 估算器写下的那份预算拦不得：它是「这类活一般花多少」的中位数，不是谁批过
+    /// 的数。中位数是分布的中间，拿它当硬停等于让一半的活必然停在半路，而停下来的
+    /// 那条没有出口——重规划下线以后，行留在 `Pending` 里每一拍重判一次。
+    ///
+    /// 区分在这条上：若估算行也当闸门，`estimated-spent` 会留在 `Pending`，这条就红。
+    #[tokio::test]
+    async fn a_budget_estimated_from_history_does_not_stop_the_task() {
+        let mut estimated = plan("estimated-spent", 100);
+        estimated.baseline_rev = format!("{ESTIMATE_REV_PREFIX}cargo-test/n9/2026-11-05T00:00:00Z");
+        let runtime = budget_runtime(
+            Census::with(&[("estimated-spent", 150), ("intended-spent", 150)]),
+            vec![estimated, plan("intended-spent", 100)],
+        );
+
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-budget",
+                vec![
+                    ran_before(ready_task("estimated-spent", serde_json::json!({}))),
+                    ran_before(ready_task("intended-spent", serde_json::json!({}))),
+                ],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let orchestrator = runtime.orchestrator().clone();
+        let status = |id: &str| {
+            let orchestrator = orchestrator.clone();
+            let id = id.to_string();
+            async move {
+                orchestrator
+                    .get_task(&id)
+                    .await
+                    .unwrap_or_else(|| panic!("{id} present"))
+                    .status
+            }
+        };
+        assert_eq!(
+            status("estimated-spent").await,
+            cog_core::TaskStatus::Scheduled,
+            "估算出来的中位数不是批准的额度，它不该当闸门：停在它上面的是队列的一半"
+        );
+        assert_eq!(
+            status("intended-spent").await,
+            cog_core::TaskStatus::Pending,
+            "排期时写下的预算照拦——那才是有人批过的数"
         );
     }
 

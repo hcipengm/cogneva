@@ -1,3 +1,4 @@
+use crate::dag_executor::DECOMPOSITION_BASELINE_REV;
 use chrono::{DateTime, Utc};
 use cog_core::{
     infer_dependencies, validate_dag, ActionPlan, AtomicTask, DagError, DecompositionPattern,
@@ -1362,7 +1363,8 @@ impl ActionPlanOrchestrator {
                     .filter(|at| child_ids.contains(&at.id) && queued.contains(&at.id))
                     .collect();
                 if !placed.is_empty() {
-                    let baseline_rev = now.to_rfc3339();
+                    let baseline_rev =
+                        format!("{}{}", DECOMPOSITION_BASELINE_REV, now.to_rfc3339());
                     let plans = Self::plan_baselines(
                         &self.workspace_id,
                         &placed.iter().map(|at| (*at).clone()).collect::<Vec<_>>(),
@@ -3666,6 +3668,18 @@ mod tests {
             by_id(&scoped("goal-row", "child-1")).baseline_rev,
             by_id(&scoped("goal-row", "child-2")).baseline_rev,
             "一次分解是一版基线"
+        );
+        // 这一行写的是一个**估的数**，不是谁批过的额度：`budget_tokens` 是
+        // 按这一片输入的字符数猜的（现网 968 行，平均 3 426 个 token），
+        // 一条生成子任务跑一遍就越过它。版本串不带这一段，就绪闸门就会拿它
+        // 当硬停，越过的活从此停在队列之外——重规划已下线，没有谁再给它
+        // 一个新的数。
+        assert!(
+            by_id(&scoped("goal-row", "child-1"))
+                .baseline_rev
+                .starts_with(DECOMPOSITION_BASELINE_REV),
+            "分解写下的基线必须带上「这是估的」那一段：{:?}",
+            by_id(&scoped("goal-row", "child-1")).baseline_rev
         );
         // 依赖决定先后：等别人的那一片不能在别人结束之前开始。
         assert!(
