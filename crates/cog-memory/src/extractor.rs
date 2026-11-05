@@ -128,7 +128,7 @@ impl MemoryExtractor for RuleBasedExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    &source.namespace,
+                    namespace,
                     SchemaKind::Entity,
                     name,
                     key,
@@ -142,7 +142,7 @@ impl MemoryExtractor for RuleBasedExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    &source.namespace,
+                    namespace,
                     SchemaKind::Relation,
                     format!("{} -> {}", from, to),
                     key,
@@ -160,7 +160,7 @@ impl MemoryExtractor for RuleBasedExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    &source.namespace,
+                    namespace,
                     SchemaKind::Event,
                     name,
                     key,
@@ -252,9 +252,9 @@ impl cog_core::MemoryIngestor for IngestionPipeline<RuleBasedExtractor> {
 use cog_core::{execute_structured, ChatOptions, LlmClient, SFError};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-struct ExtractedEntity {
-    name: String,
-    kind: String,
+pub(crate) struct ExtractedEntity {
+    pub(crate) name: String,
+    pub(crate) kind: String,
     /// Free-form attributes, kept in whatever shape the model wrote them.
     ///
     /// 这一格收的是模型自己编的键值，值的形状不由我们决定：参与者是一张
@@ -267,59 +267,59 @@ struct ExtractedEntity {
     /// 几千个 token 的抽取结果重新付费。形状放开不损失任何东西——落库的
     /// `SchemaEntry::properties` 本来就是 `serde_json::Value`。
     #[serde(default)]
-    properties: HashMap<String, serde_json::Value>,
+    pub(crate) properties: HashMap<String, serde_json::Value>,
     #[serde(default)]
-    importance: u8, // 1-10
+    pub(crate) importance: u8, // 1-10
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-struct ExtractedRelation {
-    source: String,
-    target: String,
-    relation_type: String,
+pub(crate) struct ExtractedRelation {
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) relation_type: String,
     #[serde(default)]
-    importance: u8, // 1-10
+    pub(crate) importance: u8, // 1-10
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-struct ExtractedEvent {
-    name: String,
-    timestamp: Option<String>,
+pub(crate) struct ExtractedEvent {
+    pub(crate) name: String,
+    pub(crate) timestamp: Option<String>,
     #[serde(default)]
-    participants: Vec<String>,
+    pub(crate) participants: Vec<String>,
     #[serde(default)]
-    importance: u8, // 1-10
+    pub(crate) importance: u8, // 1-10
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-struct SchemaExtraction {
+pub(crate) struct SchemaExtraction {
     #[serde(default)]
-    entities: Vec<ExtractedEntity>,
+    pub(crate) entities: Vec<ExtractedEntity>,
     #[serde(default)]
-    relations: Vec<ExtractedRelation>,
+    pub(crate) relations: Vec<ExtractedRelation>,
     #[serde(default)]
-    events: Vec<ExtractedEvent>,
+    pub(crate) events: Vec<ExtractedEvent>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-struct SummaryExtraction {
-    text: String,
+pub(crate) struct SummaryExtraction {
+    pub(crate) text: String,
     #[serde(default)]
-    importance: u8, // 1-10
+    pub(crate) importance: u8, // 1-10
 }
 
 /// The shape one call answers both layers in. The schema half is the same three
 /// lists [`SchemaExtraction`] declares, so [`Self::split`] hands each half to
 /// the same builder the single-layer paths use.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-struct CombinedExtraction {
+pub(crate) struct CombinedExtraction {
     #[serde(default)]
-    entities: Vec<ExtractedEntity>,
+    pub(crate) entities: Vec<ExtractedEntity>,
     #[serde(default)]
-    relations: Vec<ExtractedRelation>,
+    pub(crate) relations: Vec<ExtractedRelation>,
     #[serde(default)]
-    events: Vec<ExtractedEvent>,
-    summary: SummaryExtraction,
+    pub(crate) events: Vec<ExtractedEvent>,
+    pub(crate) summary: SummaryExtraction,
 }
 
 impl CombinedExtraction {
@@ -651,9 +651,15 @@ impl LlmMemoryExtractor {
     /// Turn a schema extraction into store entries. The schema-only call and
     /// the combined call both land here, so a merged call cannot produce
     /// different ids or importance for the same model output.
-    fn schema_entries(source: &RawSource, extraction: SchemaExtraction) -> Vec<SchemaEntry> {
-        let source_ref = SourceRef::new(format!("memory://{}", source.id), "llm/v1");
-
+    ///
+    /// The namespace and the source reference are the caller's, not derived
+    /// here: a judgment that arrives through [`crate::JudgedEntryWriter`] comes
+    /// from a different judge and must say so in the rows it produces.
+    pub(crate) fn schema_entries(
+        namespace: &str,
+        source_ref: SourceRef,
+        extraction: SchemaExtraction,
+    ) -> Vec<SchemaEntry> {
         let mut entries = Vec::new();
 
         for entity in extraction.entities {
@@ -662,7 +668,7 @@ impl LlmMemoryExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    &source.namespace,
+                    namespace,
                     SchemaKind::Entity,
                     entity.name,
                     key,
@@ -683,7 +689,7 @@ impl LlmMemoryExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    &source.namespace,
+                    namespace,
                     SchemaKind::Relation,
                     format!("{} -> {}", relation.source, relation.target),
                     key,
@@ -710,7 +716,7 @@ impl LlmMemoryExtractor {
             record(
                 &mut entries,
                 SchemaEntry::identified(
-                    &source.namespace,
+                    namespace,
                     SchemaKind::Event,
                     event.name,
                     key,
@@ -732,39 +738,63 @@ impl LlmMemoryExtractor {
         source: &RawSource,
         extraction: SummaryExtraction,
     ) -> SFResult<SummaryEntry> {
-        // An embedder that answers with nothing is a fault, not an absence: only
-        // a missing embedder means "this host has no vector layer". Collapsing
-        // the two would hide a broken embedder behind the same silent state.
-        let embedding = match self.embedder.as_ref() {
-            Some(embedder) => embedder
-                .embed(vec![extraction.text.clone()])
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    cog_core::SFError::Validation("embedder returned no vector".into())
-                })?,
-            None => Vec::new(),
-        };
-        let embedding_model = if embedding.is_empty() {
-            NO_EMBEDDING_MODEL
-        } else {
-            "llm/v1"
-        };
-
         let source_ref = SourceRef::new(format!("memory://{}", source.id), "llm/v1");
-
-        let importance = cog_core::importance_from_rating(extraction.importance);
-        Ok(SummaryEntry::new(
-            format!("summary-{}", source.id),
+        summary_entry(
+            self.embedder.as_ref(),
             &source.namespace,
-            extraction.text,
-            embedding,
-            embedding_model,
             source_ref,
+            extraction,
         )
-        .with_importance(importance))
+        .await
     }
+}
+
+/// Build the store entry for a summary extraction.
+///
+/// The embedder, namespace and source reference are the caller's: an entry
+/// written by a judge that is not this extractor has to be attributed to that
+/// judge, and a host without a vector layer stores the text without one rather
+/// than refusing the write.
+pub(crate) async fn summary_entry(
+    embedder: Option<&Arc<dyn cog_core::EmbeddingProvider>>,
+    namespace: &str,
+    source_ref: SourceRef,
+    extraction: SummaryExtraction,
+) -> SFResult<SummaryEntry> {
+    // An embedder that answers with nothing is a fault, not an absence: only
+    // a missing embedder means "this host has no vector layer". Collapsing
+    // the two would hide a broken embedder behind the same silent state.
+    let embedding = match embedder {
+        Some(embedder) => embedder
+            .embed(vec![extraction.text.clone()])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| cog_core::SFError::Validation("embedder returned no vector".into()))?,
+        None => Vec::new(),
+    };
+    let embedding_model = if embedding.is_empty() {
+        NO_EMBEDDING_MODEL
+    } else {
+        "llm/v1"
+    };
+    let id = source_ref
+        .raw_uri
+        .rsplit('/')
+        .next()
+        .unwrap_or("judged")
+        .to_string();
+
+    let importance = cog_core::importance_from_rating(extraction.importance);
+    Ok(SummaryEntry::new(
+        format!("summary-{id}"),
+        namespace,
+        extraction.text,
+        embedding,
+        embedding_model,
+        source_ref,
+    )
+    .with_importance(importance))
 }
 
 #[async_trait]
@@ -774,7 +804,11 @@ impl MemoryExtractor for LlmMemoryExtractor {
         note_payload_outcome(outcome);
         let extraction: SchemaExtraction = self.structured_cached("schema", &prompt).await?;
 
-        Ok(Self::schema_entries(source, extraction))
+        Ok(Self::schema_entries(
+            &source.namespace,
+            SourceRef::new(format!("memory://{}", source.id), "llm/v1"),
+            extraction,
+        ))
     }
 
     async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
@@ -795,7 +829,11 @@ impl MemoryExtractor for LlmMemoryExtractor {
         let extraction: CombinedExtraction = self.structured_cached("combined", &prompt).await?;
 
         let (schema, summary) = extraction.split();
-        let entries = Self::schema_entries(source, schema);
+        let entries = Self::schema_entries(
+            &source.namespace,
+            SourceRef::new(format!("memory://{}", source.id), "llm/v1"),
+            schema,
+        );
         let summary = self.summary_entry(source, summary).await?;
         Ok((entries, summary))
     }

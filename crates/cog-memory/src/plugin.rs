@@ -404,6 +404,18 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             "MemoryPlugin default ingestor published; benchmark exclusion surface: {}",
             benchmark_isolation.describe()
         );
+        // 判完写回的入口。它与上面那条抽取管道是两条路：那条把一段原文交给
+        // 抽取器（曾经是写死提示词的一次模型调用），这条接受别人已经判好的
+        // 条目，只补机械部分（id、来源、嵌入）。任何智能体都能走这条写记忆，
+        // 不需要一个专属执行者。
+        if let Some(ref b) = memory_backend {
+            let mut writer = crate::JudgedEntryWriter::new(b.clone());
+            if let Some(ref p) = embed_provider {
+                writer = writer.with_embedder(p.clone());
+            }
+            ctx.publish_service::<dyn cog_core::MemoryEntryWriter>(Arc::new(writer));
+            info!("MemoryPlugin judged-entry writer published");
+        }
         ctx.publish_service(metrics_backend);
         info!("MemoryPlugin metrics backend published");
         if let Some(ref p) = embed_provider {

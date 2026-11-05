@@ -1041,6 +1041,38 @@ pub trait MemoryIngestor: Send + Sync {
     async fn ingest(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)>;
 }
 
+/// Writes entries a caller has already judged.
+///
+/// The split of work is the point. Deciding *what* is worth remembering is a
+/// judgment, and it belongs to whoever holds the material and the tools to
+/// examine it — today that is an agent, not a fixed extraction prompt. Turning
+/// that judgment into rows is mechanics: ids, source attribution, embeddings,
+/// duplicate folding. Keeping the two apart is what lets any agent write memory
+/// with the tools it already has, instead of a dedicated extractor identity.
+#[async_trait]
+pub trait MemoryEntryWriter: Send + Sync {
+    /// Store the entries described by `judged` under `namespace`.
+    ///
+    /// `judged` carries the judgment, not the mechanics. Its shape is the one
+    /// the extraction prompt asks a model for — `entities`, `relations`,
+    /// `events`, and `summary` (`text` plus a rating) — with two additions:
+    /// `raw_id` names the material the judgment is about (so the rows can be
+    /// attributed and later forgotten with it), and `judged_by` names who made
+    /// the judgment, which is recorded as the rows' extractor version.
+    async fn write_judged(
+        &self,
+        namespace: &str,
+        judged: &serde_json::Value,
+    ) -> SFResult<JudgedWriteReport>;
+}
+
+/// What a [`MemoryEntryWriter::write_judged`] call actually stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JudgedWriteReport {
+    pub schema_written: usize,
+    pub summary_written: bool,
+}
+
 /// Trait for extracting structured schema and summary from raw sources.
 /// This is the lower-level trait used by `MemoryIngestor` implementations.
 /// The gateway consumes this via `PluginContext`
