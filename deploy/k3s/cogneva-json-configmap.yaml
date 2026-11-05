@@ -349,7 +349,8 @@ data:
             "enabled": true,
             "backend_type": "composite",
             "embedding_dimension": 1024,
-            "auto_ingest": true,
+            "_comment_auto_ingest": "Off: the pipeline pays a model call for every agent session's transcript and writes the result into the `default` namespace, while every in-process reader queries `knowledge`, `task_decomposition`, `implementation` or `failure_pattern` -- four namespaces that held 11 rows in total when this was measured on 2026-11-05, against 124k extracted rows whose retrieval_count was 0 and last_retrieved_at NULL across the whole table. The cost was CNY 83 a day, the largest single line of LLM spend, and most of the transcripts it read were the platform's own decompose and replan chatter. Manual ingest and browsing what has already been extracted are unaffected; turn this back on when a reader queries `default` or the extractor writes where a reader looks.",
+            "auto_ingest": false,
             "load_embedding_model": false,
             "load_reranker_model": false,
             "ingest": {
