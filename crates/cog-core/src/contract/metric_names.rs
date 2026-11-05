@@ -960,15 +960,16 @@ metric_names! {
     // other than the upstream's verdict.
     //
     // The `ask` label says which of the round's questions heard it: `round_head`
-    // (decides whether the round starts), `before_build` (decides whether to
-    // spend a cold build on the host's only slot), `pre_dispatch` (decides
-    // whether the built image enters the cluster) and `job_termination` (the
-    // job re-asked and carried its answer back in the termination message).
-    // Same criterion, different price: a `fail` heard at the round head costs
-    // nothing, the same `fail` heard before the build saves a build, and one
-    // heard only at dispatch has already paid for it. Without the label those
-    // three are one row, so the counter cannot say whether adding the middle
-    // question is saving anything.
+    // (the revision the tree stands at), `pick_target` (an older revision the
+    // round walked past while looking for the newest green one), `before_build`
+    // (decides whether to spend a cold build on the host's only slot),
+    // `pre_dispatch` (decides whether the built image enters the cluster) and
+    // `job_termination` (the job re-asked and carried its answer back in the
+    // termination message). Same criterion, different price: a `fail` heard at
+    // the round head costs nothing, the same `fail` heard before the build saves
+    // a build, and one heard only at dispatch has already paid for it. Without
+    // the label those three are one row, so the counter cannot say whether
+    // adding the middle question is saving anything.
     MAINLINE_CI_VERDICT_TOTAL => "cogneva_mainline_ci_verdict_total",
     // Why the round above got no verdict, by reason, one count per silent
     // upstream: `pending` (upstream still working on it), `no_runs` (asked and
