@@ -144,6 +144,10 @@ impl PlannerActor {
         .await
     }
 
+    // The seven are one round's inputs, and they line up positionally with the
+    // public entry points that forward them; a struct here would split the same
+    // set into a type whose only job is to be taken apart again one line later.
+    #[allow(clippy::too_many_arguments)]
     async fn plan_inner(
         &self,
         task: &Task,
