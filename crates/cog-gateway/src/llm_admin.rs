@@ -51,6 +51,12 @@ pub struct LlmUpstreamRequest {
     pub api_key: String,
     /// 协议面首猜（openai/anthropic）：探测按此顺序优先，失败自动换另一种。
     pub api_style: Option<String>,
+    /// 这台上游自己的价目（币种、单位、分时档、出处、抄自哪一天）。
+    ///
+    /// 价目**跟着条目走**，不跟着厂商名走：同一家不同型号不同价，挂在厂商上
+    /// 迟早把 A 型号的价算到 B 型号头上。缺省 = 这台不算钱，账本里
+    /// `cost_micros` 保持 NULL（NULL 是「没算」，不是「免费」）。
+    pub pricing: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +72,8 @@ pub struct LlmConfigRequest {
     pub skip_verify: Option<bool>,
     /// 追加的故障转移上游：主上游 429/402 时按声明顺序顶上。
     pub extra_upstreams: Option<Vec<LlmUpstreamRequest>>,
+    /// 主上游的价目，形状同 [`LlmUpstreamRequest::pricing`]。
+    pub pricing: Option<serde_json::Value>,
     /// 声明的冗余下限：池里至少要有几家上游能承接请求，低于它就按"池不可用"
     /// 判（告警 + 暂停 LLM 依赖型派活）。缺省 = 不声明，判定回落到"一家都不供
     /// 才算不可用"。
@@ -408,6 +416,7 @@ pub async fn llm_config_handler(
         model: req.model.clone(),
         api_key: req.api_key.clone(),
         api_style: req.api_style.clone(),
+        pricing: req.pricing.clone(),
     };
     let mut requests = vec![primary];
     requests.extend(req.extra_upstreams.unwrap_or_default());
@@ -690,6 +699,29 @@ async fn resolve_upstream(
         ));
     }
 
+    // 价目在落库之前整份校验：网关读取时遇到坏价目只是把它当"没有价目"
+    // 降级（拿记账换故障转移候选，不划算），但这里运营者就在跟前，能改。
+    // 让它带着坏价目安静落库，结局是账本上整月上千万行 `cost_micros` 全
+    // NULL，而读数与"这台本来就不算钱"一模一样。
+    let pricing = match item.pricing.as_ref() {
+        Some(raw) => match crate::pricing::PriceBook::parse(raw) {
+            Ok(_) => Some(raw.clone()),
+            Err(why) => {
+                return Err(Box::new(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "invalid_pricing",
+                            "message": format!("{}|{} 的价目不合法：{why}", base_url, model),
+                        })),
+                    )
+                        .into_response(),
+                ));
+            }
+        },
+        None => None,
+    };
+
     // 双协议实证探测：按首猜顺序先试，失败自动换另一种协议面，
     // 胜出者即为写入网关的 api_style（Kimi 这类 base_url 看不出协议的
     // 端点也能当场测出来）。skip_verify 时采信首猜，缺省 openai。
@@ -741,6 +773,9 @@ async fn resolve_upstream(
         "model": model,
         "api_key": api_key,
     });
+    if let Some(pricing) = pricing {
+        entry["pricing"] = pricing;
+    }
     if cog_core::is_openai_family(api_style) && !skip_verify {
         match detect_tool_call_support(base_url, model, api_key).await {
             Some(supported) => {
@@ -1488,7 +1523,8 @@ mod tests {
     use super::{
         api_base_from, apiserver_denies_ownership, classify_probe, classify_temperature_probe,
         classify_usage_probe, detect_api_style, merge_pool, pool_change_detail, pool_member_name,
-        protocol_probe_url, union_size, ApiStyleProbe, ProbeOutcome,
+        protocol_probe_url, resolve_upstream, union_size, ApiStyleProbe, LlmUpstreamRequest,
+        ProbeOutcome,
     };
 
     /// apiserver 的地址来自这个 Pod 拿到的两个变量，而不是一个写死的服务名。
@@ -1939,5 +1975,60 @@ mod tests {
             pool_member_name(&entry).as_deref(),
             Some("https://api.deepseek.com|deepseek-flash")
         );
+    }
+
+    /// 价目跟着条目落库：写进去的那份，读出来的还是那份。
+    ///
+    /// 这条盯的是「配置入口认不认 pricing」——不认，新加的 `cost_micros` 列上线
+    /// 之后永远是 NULL，而 NULL 与「这台本来就不算钱」在读数上同形，看起来像
+    /// 功能正常只是没产生费用。
+    #[tokio::test]
+    async fn an_upstream_carries_the_price_book_that_was_written_with_it() {
+        let item = LlmUpstreamRequest {
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-flash".into(),
+            api_key: "sk-test".into(),
+            api_style: Some("openai".into()),
+            pricing: Some(serde_json::json!({
+                "currency": "CNY",
+                "unit_tokens": 1_000_000,
+                "checked_at": "2026-11-05",
+                "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing",
+                "tiers": [{
+                    "name": "off_peak",
+                    "cache_miss_micros": 1_000_000,
+                    "cache_hit_micros": 20_000,
+                    "output_micros": 4_000_000
+                }]
+            })),
+        };
+        let (entry, _) = resolve_upstream(&item, true)
+            .await
+            .expect("skip_verify 下不该需要网络");
+        assert_eq!(entry["pricing"]["currency"], "CNY");
+        assert_eq!(entry["pricing"]["tiers"][0]["output_micros"], 4_000_000);
+        assert_eq!(entry["pricing"]["checked_at"], "2026-11-05");
+    }
+
+    /// 坏价目在写入时拒单，不留到读取时才降级成「没有价目」。
+    ///
+    /// 读取侧为了保住故障转移候选会把坏价目悄悄置空——那是对的，运行中不能
+    /// 因为价目少算钱就丢掉上台能力。但保存时运营者就在跟前，这时候安静落库
+    /// 等于让整月的花费读作「没算过」。
+    #[tokio::test]
+    async fn a_broken_price_book_is_refused_at_write_time() {
+        let item = LlmUpstreamRequest {
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-flash".into(),
+            api_key: "sk-test".into(),
+            api_style: Some("openai".into()),
+            pricing: Some(serde_json::json!({
+                "currency": "CNY",
+                "unit_tokens": 1_000_000,
+                "tiers": []
+            })),
+        };
+        let resp = resolve_upstream(&item, true).await.expect_err("空价目要拒");
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }

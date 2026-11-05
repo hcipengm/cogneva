@@ -61,6 +61,8 @@ pub mod observability;
 pub mod observable;
 pub mod pace_reservations;
 pub mod plugin;
+pub mod pricing;
+pub mod pricing_watch;
 pub mod process_reports;
 pub mod processes;
 pub mod progress;

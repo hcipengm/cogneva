@@ -313,6 +313,24 @@ pub struct LlmUsageRecord {
     /// attempts and pooled refusals). Absent is not zero here: a row priced at
     /// zero would read as an empty prompt, and the two have opposite repairs.
     pub estimated_input: Option<u64>,
+    /// 这一行按上游价目折算出的花费，单位是 [`Self::price_book`] 那个币种的
+    /// 百万分之一。
+    ///
+    /// 账本记 token，这一格记钱，两个都留是因为它们回答不同的问题：token 是上游
+    /// 的口径，跨厂商可比；钱是本方的口径，能进预算与账单。只有 token 时，「这次
+    /// 改动省了多少」得拿一个从别处抄来的单价现算，而那个单价没有出处、没有版本，
+    /// 过期那天没有任何读数会喊。
+    ///
+    /// `None` 是「没算」，不是「算出来是零」：没配价目、时刻落在价目没声明的窗口
+    /// 里、上游根本没报 token——这三种都不许写成 0。0 会让一段没定价的时间在账单
+    /// 上读作免费，而免费与没算的补救方向相反。
+    pub cost_micros: Option<i64>,
+    /// 折算用的是哪一版价目，形如 `CNY@2026-11-05`。
+    ///
+    /// 与 [`Self::cost_micros`] 同生同灭：有价没有版本时，价格改一次，历史行就
+    /// 会被新价目重新解释，而它们当时是按旧价扣的。这一格让「这一行凭什么值这个
+    /// 数」在事后还答得出来。
+    pub price_book: Option<String>,
     /// Why the upstream refused, as the gateway classified the refusal body:
     /// `quota_cycle`, `entitlement`, or `unclassified`.
     ///

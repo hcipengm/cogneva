@@ -42,6 +42,8 @@ fn row(actor: &str, result: &str, outcome: Option<MeteringOutcome>) -> LlmUsageR
         tokens_cache_created: None,
         usage_outcome: outcome,
         estimated_input: None,
+        cost_micros: None,
+        price_book: None,
         refusal_kind: None,
         retry_after_secs: None,
         task: None,

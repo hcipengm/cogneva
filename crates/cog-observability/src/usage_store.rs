@@ -364,6 +364,18 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFA
 -- grouping by the gap between the two rulers has to handle the absence rather
 -- than silently pair it with the truth.
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS estimated_input BIGINT;
+-- 这一行的钱，以及折算它用的那一版价目。账本记 token 是上游的口径，这两列是
+-- 本方的口径，两者都要有：只有 token 时，「这次省了多少」得拿一个从别处抄来的
+-- 单价现算，而那个单价没有出处、没有版本，过期那天没有任何读数会喊。
+--
+-- 两列都可空且无默认值，理由与 `estimated_input` 相同：没配价目、时刻落在价目
+-- 没声明的窗口里、上游根本没报 token，这三种都是「没算」。写 0 会让它们读作
+-- 免费，而免费与没算要修的地方相反。
+--
+-- `price_book` 与 `cost_micros` 同生同灭：有价没有版本时，价目改一次，历史行就会
+-- 被新价目重新解释，而它们当时是按旧价扣的。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS cost_micros BIGINT;
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS price_book TEXT;
 -- The per-job dimension. Nullable because "no job identity" is a state of its
 -- own: rows landed by paths that cannot name a job (an upstream failure
 -- recorded before routing, the gateway's own judgement calls) must not be
@@ -615,9 +627,9 @@ impl LlmUsageStore {
                  estimated_input, task_id, latency_ms, refusal_kind, retry_after_secs,
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
                  pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
-                 usage_outcome, owner_id, refused_scope)
+                 usage_outcome, owner_id, refused_scope, cost_micros, price_book)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -645,6 +657,8 @@ impl LlmUsageStore {
         .bind(r.usage_outcome.map(|o| o.as_str()))
         .bind(r.owner.as_deref())
         .bind(r.refused_scope.as_deref())
+        .bind(r.cost_micros)
+        .bind(r.price_book.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
