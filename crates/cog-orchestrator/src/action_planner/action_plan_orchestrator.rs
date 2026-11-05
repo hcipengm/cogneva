@@ -1021,6 +1021,28 @@ impl ActionPlanOrchestrator {
             );
         }
 
+        // 这条目标已经在图里了：提交方给的行 id 本身就是它的身份（按天的面补救目标、
+        // 按 issue 的项目目标），第一次提交就把那一行连同分解出的子任务一起放了进去。
+        // 那之后再分解一遍不只是白花一次模型调用：这一批入图时会被整体拒掉——图里
+        // 那一行已经被第一次提交改写成不可执行的目标行，同一个 id 带着两份不同的内容，
+        // 于是「早就排上了」在日志里读成一次失败，而这条失败按面漂移的节拍每两分钟
+        // 重来一次。实测 2026-11-05：`face-gap-CI~2f~…` 三小时内被拒了一百多次，
+        // 每次都在前面先付了一次完整分解。
+        //
+        // 已经排上的答复是 `Ok(空)`，与「这一批都已经被别的行持有」同一条口径：
+        // 调用方问的是「这次提交排上了什么」，答案是一条也没有。
+        if let (Some(dag), Some(first)) = (self.dag_executor.as_deref(), tasks.first()) {
+            if let Some(held) = dag.get_task(&first.id).await {
+                tracing::info!(
+                    goal = %goal,
+                    task_id = %first.id,
+                    status = ?held.status,
+                    "the goal row is already in the graph; not decomposing it again"
+                );
+                return Ok(Vec::new());
+            }
+        }
+
         // An empty atomic-task result must never be treated as success:
         // persisting the originals as non-executable placeholders with zero
         // children would strand them Pending forever (they are invisible to
@@ -2961,6 +2983,52 @@ mod tests {
             executor.calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "with the window closed each delivery has to ask again"
+        );
+    }
+
+    /// 已经在图里的目标不再分解：行 id 就是它的身份，第一次提交就把那一行连同
+    /// 分解出的子任务放进去了。
+    ///
+    /// 面漂移每两分钟把同一条补救目标再交一次。第二次起这条提交在入图时被整体
+    /// 拒掉——同一个 id 带着两份不同的内容，图里那份已经被第一次提交改写成不可
+    /// 执行的目标行——而拒绝之前先付了一次完整分解。2026-11-05 实测：这条路径
+    /// 一天在一个面上就花了上百次分解，一次也没排上新活。
+    #[tokio::test]
+    async fn a_goal_whose_row_is_already_in_the_graph_is_not_decomposed_again() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-held-goal".to_string()));
+        let executor = Arc::new(CountingPlanExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+        let asked = || executor.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let goal = "face-gap: CI/构建/部署 drifted_binding";
+
+        let first = planner
+            .process_goal_impl(goal, vec![hint_task("face-gap-CI-1")], &registry)
+            .await
+            .expect("the first submission decomposes and lands");
+        assert!(!first.is_empty(), "the first submission must queue work");
+        assert_eq!(asked(), 1);
+
+        let second = planner
+            .process_goal_impl(goal, vec![hint_task("face-gap-CI-1")], &registry)
+            .await
+            .expect("a goal already in the graph is a no-op, not a refusal");
+        assert!(
+            second.is_empty(),
+            "nothing new is queued when the goal is already held"
+        );
+        assert_eq!(
+            asked(),
+            1,
+            "the graph already holds this goal; do not ask the model again"
+        );
+        assert!(
+            dag.get_task("face-gap-CI-1").await.is_some(),
+            "the held row stays the row the first submission wrote"
         );
     }
 
