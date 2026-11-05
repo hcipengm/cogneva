@@ -2575,7 +2575,11 @@ const CI_RED_HEAD_LOOKBACK: usize = 12;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CiPick {
     /// 这一轮要滚的那一版（最新的 CI 明确判绿，或兜底的最新一版没判红）。
-    target: String,
+    ///
+    /// `None` 表示这一轮**没有一版能滚**：路上见过红、且那一整段再没有判绿的。
+    /// 它仍然是 `Some(CiPick)` 而不是 `None`，因为那次往回走还带回来一个红——
+    /// 那一版要扣住、要挂修复行，这条线索不能跟着「没有目标」一起丢掉。
+    target: Option<String>,
     /// 往回这一路上**最新**的一版被上游明确判红的修订；没有红的就是 `None`。
     ///
     /// 把红带出去，是因为「绕开它」与「没人修它」是两件不同的事：部署器可以绕过
@@ -3293,15 +3297,19 @@ impl MainlineDeployer {
     /// 总是「还在跑」——把「没有判红」当作可滚，送进集群的就是一版还没人验过的
     /// 代码；只有明确判绿才算数，部署才真的跟在「验过」后面。
     ///
-    /// 一条兜底：整段往回都没有明确判绿的（CI 没上报、上游没配、检查全被取消），
-    /// 退回最新一版**没有判红**的。没有这条，一个不上报检查的仓库会让部署永远
-    /// 停在原地——那与「等一版绿的」是两件事，前者是坏掉，后者是还没轮到。
+    /// 一条兜底：整段往回都没有明确判绿的、**也没有一版判红**（CI 没上报、上游
+    /// 没配、检查全被取消），退回最新一版**没有判红**的。没有这条，一个不上报
+    /// 检查的仓库会让部署永远停在原地——那与「等一版绿的」是两件事，前者是坏掉，
+    /// 后者是还没轮到。见过红就不兜底：那时上游在判、判得出来，没有绿的就说明
+    /// 确实没有验过的代码可以进集群。
     ///
     /// 走第一父链：合并进来的侧枝从不是 main 的头，把侧枝上的提交当成「回去一版」
     /// 会滚一个从来没打算上线的形状。
     ///
-    /// 拿不到修订列表时返回 `None`（按「没有可滚的版本」处理，也就是停一轮）：
-    /// 读不出历史就没有依据说哪一版能用。
+    /// 两种「没有目标」要分开：[`CiPick::target`] 为 `None` 是**走完了**这一路、
+    /// 结论是没有一版能滚（见的红在 `newest_red` 里，要扣住、要挂修复行）；返回
+    /// `None` 是**没读成**（修订列表都拿不到），那一拍必须原样停着、下一拍重问，
+    /// 不能当成「没有可滚的」把一次读失败掩盖过去。
     ///
     /// `floor` 是集群上已经跑着的那一版：候选必须**在它前面**，否则滚它就是回滚。
     /// 第一父链是线性的，一旦走到 `floor`，后面的候选不可能再满足这一条，所以到
@@ -3349,16 +3357,11 @@ impl MainlineDeployer {
                     break;
                 }
                 // 判不出祖先关系（读 git 失败）时按「不能滚」处理：宁可这一轮
-                // 停着，也不把一个来历不明的版本送进集群。
+                // 停着，也不把一个来历不明的版本送进集群。停在这一版上，前面
+                // 数出来的结论照旧交出去。
                 match self.is_ancestor_checked(floor, rev).await {
                     Some(true) => {}
-                    _ => {
-                        return fallback.map(|target| CiPick {
-                            target,
-                            newest_red,
-                            head_verdict,
-                        })
-                    }
+                    _ => break,
                 }
             }
             candidates += 1;
@@ -3378,7 +3381,7 @@ impl MainlineDeployer {
                 // 最新的绿树就是它，往回不必再问。
                 Some(true) => {
                     return Some(CiPick {
-                        target: rev.to_string(),
+                        target: Some(rev.to_string()),
                         newest_red,
                         head_verdict,
                     })
@@ -3401,13 +3404,24 @@ impl MainlineDeployer {
             // （清单被打回浮动签后重 pin、Job 被清掉后重派），而那是
             // `evaluate_advance` 按集群现状判的事，不是版选择的事。目标就是头自己。
             return Some(CiPick {
-                target: tip.to_string(),
+                target: Some(tip.to_string()),
                 newest_red,
                 head_verdict,
             });
         }
-        fallback.map(|target| CiPick {
-            target,
+        // 这一路上见过红，就不退到「没验过」的那一版：这条兜底是给「上游根本不
+        // 上报检查」的仓库留的，而见过红说明上游在判、判得出来——那几版都还没判
+        // 绿，就说明确实没有一版验过的代码可以进集群，等着是对的，拿一版没人看过
+        // 的顶上就是把这套判据让掉了。红照旧交出去：这一轮不滚，但那一版要有人修。
+        if newest_red.is_some() {
+            return Some(CiPick {
+                target: None,
+                newest_red,
+                head_verdict,
+            });
+        }
+        Some(CiPick {
+            target: fallback,
             newest_red,
             head_verdict,
         })
@@ -7859,19 +7873,32 @@ impl MainlineDeployer {
             }
         }
         let Some(pick) = pick else {
-            // 头是红的、往回这一整段也没有一版能滚：这一轮停着是对的，因为确实
-            // 没有一版可以送进集群。红的头由它自己的修复行去追。
+            // 连历史都没读出来（裸仓库读不动、头不是一个 sha）：这一拍什么都别动，
+            // 下一拍重问同一段。把它当成「没有可滚的」会掩盖一次读失败。
             self.renew_advance_reservation(&mut state)?;
             return Ok(());
         };
-        if rev12(&pick.target) != rev12(&bare) {
+        let Some(target) = pick.target.clone() else {
+            // 往回这一整段没有一版验过的能进集群：这一轮停着是对的。见到的红
+            // 上面已经扣住、挂了修复行——它修好之前绕不过去，绕过它也只是把同一
+            // 个红的检查往更旧的一版上传。停着也要说一声：没有这一行，「这一轮
+            // 在等」与「这一轮什么都没做」在日志上同形。
             info!(
                 head = %rev12(&bare),
-                rev = %rev12(&pick.target),
+                red = pick.newest_red.as_deref().map(rev12).unwrap_or("none"),
+                "no revision in the lookback window is verified green; holding the rollout"
+            );
+            self.renew_advance_reservation(&mut state)?;
+            return Ok(());
+        };
+        if rev12(&target) != rev12(&bare) {
+            info!(
+                head = %rev12(&bare),
+                rev = %rev12(&target),
                 red = pick.newest_red.as_deref().map(rev12).unwrap_or("none"),
                 "rolling the newest revision upstream CI reports green, which is behind the head"
             );
-            bare = pick.target;
+            bare = target;
         }
         // 绕开红的那一轮没有「扣住结束」可收：扣住说的还是那一版红的，它没有
         // 变绿，只是这一轮不从它推。走了下面这一段就会把这一次扣住记成
@@ -16651,7 +16678,7 @@ exit 0
                 .newest_ci_green_revision(&rev_c, Some(&rev_a), 12)
                 .await,
             Some(CiPick {
-                target: rev_b.clone(),
+                target: Some(rev_b.clone()),
                 newest_red: None,
                 head_verdict: None,
             }),
@@ -16664,7 +16691,7 @@ exit 0
                 .newest_ci_green_revision(&rev_c, Some(&rev_b), 12)
                 .await,
             Some(CiPick {
-                target: rev_c.clone(),
+                target: Some(rev_c.clone()),
                 newest_red: None,
                 head_verdict: None,
             }),
@@ -16678,7 +16705,7 @@ exit 0
                 .newest_ci_green_revision(&rev_c, Some(&rev_c), 12)
                 .await,
             Some(CiPick {
-                target: rev_c.clone(),
+                target: Some(rev_c.clone()),
                 newest_red: None,
                 head_verdict: None,
             }),
@@ -16743,19 +16770,84 @@ exit 0
                 .newest_ci_green_revision(&rev_c, Some(&rev_a), 12)
                 .await,
             Some(CiPick {
-                target: rev_b.clone(),
+                target: Some(rev_b.clone()),
                 newest_red: Some(rev_c.clone()),
                 head_verdict: Some(false),
             }),
             "滚 B，但要把 C 红着这件事一起带出去"
         );
-        // 走到集群上正跑着的那一版就收工，带出去的红照旧在。
+        // 走到集群上正跑着的那一版就收工：这一轮没有可滚的，但红照旧带出去。
         assert_eq!(
             deployer
                 .newest_ci_green_revision(&rev_c, Some(&rev_b), 12)
                 .await,
-            None,
-            "B 就是集群上正跑着的那一版：没有可滚的"
+            Some(CiPick {
+                target: None,
+                newest_red: Some(rev_c.clone()),
+                head_verdict: Some(false),
+            }),
+            "B 就是集群上正跑着的那一版：没有可滚的，但 C 红着要带出去"
+        );
+    }
+
+    /// 窗口里见过红就不退到「没验过」的那一版：那时上游在判，没有绿的就是没有。
+    ///
+    /// 兜底那条路是给「上游根本不上报检查」的仓库留的。见过红说明判据是活的，
+    /// 此时拿一版没人看过的代码顶上，等于把刚刚用上的判据让掉——而这一轮的意
+    /// 义就是只滚验过的那一版。
+    #[tokio::test]
+    async fn a_red_in_the_window_stops_the_round_instead_of_rolling_an_unverified_head() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_a);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+
+        real_git(&work, &["fetch", "local", "main"]).await;
+        real_git(&work, &["reset", "--hard", "FETCH_HEAD"]).await;
+        std::fs::write(work.join("lib.rs"), "fn c() {}\n").unwrap();
+        real_git(&work, &["add", "."]).await;
+        real_git(&work, &["commit", "-m", "c"]).await;
+        real_git(&work, &["push", "local", "HEAD:main"]).await;
+        let rev_c = real_git_stdout(&work, &["rev-parse", "HEAD"]).await;
+
+        // 头 C 还在跑，B 红，A 是集群上跑着的那一版。
+        let red = rev_b.clone();
+        let ci = move |path: &str| -> String {
+            if path.contains(&red) {
+                if path.contains("/status ") {
+                    return HTTP_404.to_string();
+                }
+                return http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#);
+            }
+            if path.contains("/status ") {
+                return HTTP_404.to_string();
+            }
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":null}]}"#)
+        };
+        let (endpoint, _seen) = fake_ci_by_rev(ci).await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.upstreams = vec![crate::config::UpstreamTrackConfig {
+            platform: crate::config::CodePlatform::Github,
+            repo: "owner/repo".into(),
+            api_base: Some(format!("http://{endpoint}/github")),
+        }];
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+
+        assert_eq!(
+            deployer
+                .newest_ci_green_revision(&rev_c, Some(&rev_a), 12)
+                .await,
+            Some(CiPick {
+                target: None,
+                newest_red: Some(rev_b.clone()),
+                head_verdict: None,
+            }),
+            "窗口里有红、没有绿：这一轮没有一版能滚，不能拿没验过的头去顶"
         );
     }
 
@@ -22273,6 +22365,72 @@ exit 0
             "判定者还在跑，这一版仍在飞"
         );
         assert_eq!(state.last_good_rev, None, "判完之前没有 last_good");
+    }
+
+    /// 一版正在滚，树往前走了：这一轮**不追树**，等它自己那一版判完。
+    ///
+    /// 三段各走各的节奏，这一条是它落在「正在滚」那一刻的样子：派出去的 Job 已经
+    /// 在改集群，此刻改主意去追一个更新的头，等于把一次没走完的滚动换成一版既没
+    /// 判完、也没人要求的代码——而它上一版留下的 Deployment 还在改，混着两版的
+    /// 集群谁都不认得。树往前走是树自己的事；手上有活，就先把手上的活干完。
+    ///
+    /// 判据用「5 秒内没返回，而她等的时候一步都没往后走」：追树的那一版一进场就会
+    /// 去编新的头（假 buildah 立刻留痕）并 apply 一个新的 Job 名。
+    #[tokio::test]
+    async fn a_rollout_in_flight_does_not_chase_the_tree_that_moved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        // 镜像已经落到 rev_b 上，判定者还在跑（soak 里）。
+        let deployed = main_image("localhost:30500", &rev_b);
+        let kubectl = fake_kubectl_with_judge(&bin_dir, &deployed, "||1", "");
+
+        // 树的头在滚动期间前进了一版。
+        real_git(&work, &["fetch", "local", "main"]).await;
+        real_git(&work, &["reset", "--hard", "FETCH_HEAD"]).await;
+        std::fs::write(work.join("lib.rs"), "fn c() {}\n").unwrap();
+        real_git(&work, &["add", "."]).await;
+        real_git(&work, &["commit", "-m", "c"]).await;
+        real_git(&work, &["push", "local", "HEAD:main"]).await;
+        let rev_c = real_git_stdout(&work, &["rev-parse", "HEAD"]).await;
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                in_flight: Some(InFlight {
+                    rev: rev_b.clone(),
+                    phase: Phase::Dispatched,
+                }),
+                ..Default::default()
+            },
+        );
+
+        let round = tokio::time::timeout(std::time::Duration::from_secs(5), deployer.poll_once());
+        assert!(round.await.is_err(), "在滚的那一版还没判完，这一轮不该返回");
+
+        let buildah_calls =
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+        assert!(
+            !buildah_calls.contains(rev12(&rev_c)),
+            "手上有活在滚，不要去编树的新头：{buildah_calls}"
+        );
+        let kubectl_calls =
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        assert!(
+            !kubectl_calls.contains(&job_name(&rev_c)),
+            "手上有活在滚，不要派一版新的 Job：{kubectl_calls}"
+        );
+        let state = read_state(&state_path);
+        assert_eq!(
+            state.in_flight.map(|f| f.rev),
+            Some(rev_b),
+            "在飞的那一版还是它自己"
+        );
     }
 
     /// 判定者在镜像到位之后才判失败（soak 的健康走查抓到问题），这一版仍然是失败的：
