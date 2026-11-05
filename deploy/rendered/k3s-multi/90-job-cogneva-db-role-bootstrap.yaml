@@ -39,6 +39,8 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["sh", "/bootstrap/db-role-bootstrap.sh"]
           env:
+            - name: TZ
+              value: "Asia/Shanghai"
             - name: PGHOST
               value: postgres.cogneva.svc.cluster.local
             - name: PGPORT

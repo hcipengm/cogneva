@@ -68,6 +68,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["sh", "/bootstrap/db-role-bootstrap.sh"]
           env:
+            {{- include "cogneva.timeEnv" . | nindent 12 }}
             - name: PGHOST
               value: postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local
             - name: PGPORT

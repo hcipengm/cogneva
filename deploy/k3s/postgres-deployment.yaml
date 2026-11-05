@@ -39,6 +39,19 @@ spec:
                   key: pg-password
             - name: POSTGRES_DB
               value: "cogneva"
+            - name: TZ
+              value: "Asia/Shanghai"
+          # The server's own clock, not just the container's. `initdb` writes an
+          # explicit `timezone` into postgresql.conf, so the environment alone
+          # leaves an existing data directory on whatever zone it was created
+          # with; a command-line setting overrides the file and is re-applied on
+          # every start, which is what makes the database a projection of the
+          # cluster's one time reference rather than a copy of it taken once.
+          args:
+            - -c
+            - timezone=Asia/Shanghai
+            - -c
+            - log_timezone=Asia/Shanghai
           startupProbe:
             exec:
               command:
