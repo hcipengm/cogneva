@@ -13584,6 +13584,40 @@ COPY ["prompts", "/opt/cogneva/prompts"]
         assert!(pod_waiting_states("\n\n").is_empty());
     }
 
+    /// 容器一次都没起来时，说清死因的那句话只在 `state.waiting.message` 里：
+    /// terminated 是空的。两个来源合成一条，缺键的名字必须到得了判词。
+    #[test]
+    fn a_config_error_names_the_key_the_container_could_not_find() {
+        let states = pod_waiting_states(
+            "CreateContainerConfigError|W|couldn't find key test-password in Secret cogneva/cogneva-secrets\n\
+             CreateContainerConfigError|T|\n",
+        );
+        assert_eq!(
+            states,
+            vec![waiting_state(
+                "CreateContainerConfigError",
+                "couldn't find key test-password in Secret cogneva/cogneva-secrets"
+            )]
+        );
+    }
+
+    /// 反过来，崩溃的那一类真死因在 terminated 里，waiting 那一句只是「正在退避」：
+    /// 两条都在时 terminated 优先。
+    #[test]
+    fn a_crash_loop_reports_the_message_the_container_died_with() {
+        let states = pod_waiting_states(
+            "CrashLoopBackOff|W|back-off 5m0s restarting failed container\n\
+             CrashLoopBackOff|T|panic: assertion failed at startup\n",
+        );
+        assert_eq!(
+            states,
+            vec![waiting_state(
+                "CrashLoopBackOff",
+                "panic: assertion failed at startup"
+            )]
+        );
+    }
+
     /// 判死那一条必须把**容器自己写下的那句话**带出来。另一个会读死因的判死
     /// （`rollout_pods_fatal`）只挂在"已收敛"分支里，而致命等待态的容器一律未就绪、
     /// 那条分支恒假；崩溃的滚动只能走这一条，容器留下的最后一句话就只剩这一个落点。
@@ -13621,11 +13655,63 @@ exit 0
             msg.contains("cogneva startup failed: redis: connection refused"),
             "the container's own last words must reach the failing verdict: {msg}"
         );
+
         // 死因在分隔符之后：它进判词、不进判据，集群里的自由文本不许改分类。
         assert_eq!(
             primary_message(&msg),
             "Agent execution error: pod of deployment/cogneva in fatal waiting state \
              CrashLoopBackOff"
+        );
+    }
+
+    /// 那条查询必须真的去读 `state.waiting.message`：配置错误的死因只写在那里
+    /// （2026-11-06 实测，缺 `test-password` 的滚动只报出原因词，缺的是哪个键
+    /// 一个字都没有）。这台假 kubectl 只在参数里问到这一格时才交出那句话，
+    /// 查询丢掉它，判词里就只剩原因词，这条测试红。
+    #[tokio::test]
+    async fn the_fatal_waiting_state_query_asks_for_the_waiting_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let script = r#"#!/bin/sh
+case "$*" in
+  *"get pods"*)
+    case "$*" in
+      *"state.waiting.message"*)
+        printf 'CreateContainerConfigError|W|couldn'"'"'t find key test-password in Secret cogneva/cogneva-secrets\nCreateContainerConfigError|T|\n' ;;
+      *)
+        printf 'CreateContainerConfigError|T|\n' ;;
+    esac ;;
+  *) echo ok ;;
+esac
+exit 0
+"#;
+        write_fake_bin(&bin_dir, "fake-kubectl", script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            1,
+            1,
+        );
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "cogneva".into(),
+            name: "cogneva".into(),
+        };
+
+        let err = executor.fatal_pod_state(&target).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("test-password"),
+            "the missing key has to reach the verdict: {msg}"
+        );
+        // 死因在分隔符之后：它进判词、不进判据，集群里的自由文本不许改分类。
+        assert_eq!(
+            primary_message(&msg),
+            "Agent execution error: pod of deployment/cogneva in fatal waiting state \
+             CreateContainerConfigError"
         );
     }
 

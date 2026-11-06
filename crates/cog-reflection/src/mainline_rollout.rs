@@ -428,23 +428,53 @@ pub(crate) fn rollout_pods_fatal(samples: &[PodSample]) -> Option<String> {
         })
 }
 
+/// 等待态死因的两个来源，写在第一个 `|` 之后、第二个 `|` 之前。
+///
+/// 两条都要读，因为它们各自有一半现场是空的：容器**一次都没起来**时
+/// （`CreateContainerConfigError`、`InvalidImageName`）原因只在
+/// `state.waiting.message` 里（缺哪个键、引用哪个 Secret），`lastState.terminated`
+/// 是空的；反过来 `CrashLoopBackOff` 真正的死因在 terminated 里，
+/// waiting.message 只是「正在退避」。只读一条就会在另一类上读到空串——2026-11-06
+/// 的滚动因此只报出 `CreateContainerConfigError` 这个原因词，缺的是哪个键一个字
+/// 都没有，排查从日志里也拿不回那句话。
+pub(crate) const WAITING_MESSAGE_MARKER: &str = "W";
+pub(crate) const TERMINATED_MESSAGE_MARKER: &str = "T";
+
 /// 解析 `原因|死因` 这样的逐行读数。原因取自闭集、永不含 `|`，所以按**第一个**
 /// `|` 切分即可；死因是自由文本，里面出现 `|` 不影响切分。死因自带换行时多出来的
 /// 那些行没有原因字段，对闭集的匹配自然落空（两个判据都是整词比较）。
+///
+/// 同一个原因出现两行时（上面那两个来源各一行）合成一条：terminated 的那一句
+/// 优先，没有才用 waiting 的。没有标记的老形状整段当死因，行为不变。
 pub(crate) fn pod_waiting_states(out: &str) -> Vec<WaitingState> {
-    out.lines()
-        .filter_map(|line| {
-            let (reason, cause) = line.split_once('|').unwrap_or((line, ""));
-            let reason = reason.trim();
-            if reason.is_empty() {
-                return None;
+    let mut states: Vec<WaitingState> = Vec::new();
+    for line in out.lines() {
+        let (reason, rest) = line.split_once('|').unwrap_or((line, ""));
+        let reason = reason.trim();
+        if reason.is_empty() {
+            continue;
+        }
+        let (from_terminated, cause) = match rest.split_once('|') {
+            Some((TERMINATED_MESSAGE_MARKER, cause)) => (true, cause.trim()),
+            Some((WAITING_MESSAGE_MARKER, cause)) => (false, cause.trim()),
+            _ => (false, rest.trim()),
+        };
+        match states.iter_mut().find(|s| s.reason == reason) {
+            Some(existing) => {
+                if cause.is_empty() {
+                    continue;
+                }
+                if existing.cause.is_empty() || from_terminated {
+                    existing.cause = cause.to_string();
+                }
             }
-            Some(WaitingState {
+            None => states.push(WaitingState {
                 reason: reason.to_string(),
-                cause: cause.trim().to_string(),
-            })
-        })
-        .collect()
+                cause: cause.to_string(),
+            }),
+        }
+    }
+    states
 }
 
 /// 这批等待态里有没有「拉取失败」。init 容器与主容器一起看：init 拉不到镜像时
@@ -4453,7 +4483,12 @@ impl RolloutExecutor {
                     "-l",
                     &selector,
                     "-o",
-                    "jsonpath={range .items[*]}{range .status.initContainerStatuses[*]}{.state.waiting.reason}|{.lastState.terminated.message}{\"\\n\"}{end}{.status.containerStatuses[0].state.waiting.reason}|{.status.containerStatuses[0].lastState.terminated.message}{\"\\n\"}{end}",
+                    "jsonpath={range .items[*]}\
+                     {range .status.initContainerStatuses[*]}\
+                     {.state.waiting.reason}|W|{.state.waiting.message}{\"\\n\"}\
+                     {.state.waiting.reason}|T|{.lastState.terminated.message}{\"\\n\"}{end}\
+                     {.status.containerStatuses[0].state.waiting.reason}|W|{.status.containerStatuses[0].state.waiting.message}{\"\\n\"}\
+                     {.status.containerStatuses[0].state.waiting.reason}|T|{.status.containerStatuses[0].lastState.terminated.message}{\"\\n\"}{end}",
                 ],
                 30,
             )
