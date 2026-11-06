@@ -271,10 +271,16 @@ pub fn main_image(registry: &str, rev: &str) -> String {
     )
 }
 
+/// 浮动签的 tag 名。它只在某一版收敛之后才前移（[`promote_local_tag`]），
+/// 所以任何时刻它指的都是「在本集群上已经证明过自己」的那一版——这正是
+/// 持久化的工作负载换二进制时该拿的那一版：它们不该为一次换版重启，也不该
+/// 拿到一张还没滚过的新镜像。
+pub(crate) const LOCAL_TAG: &str = "local";
+
 /// 浮动签镜像引用：`<registry>/cogneva:local`。
 pub fn local_image(registry: &str) -> String {
     format!(
-        "{}/{}:local",
+        "{}/{}:{LOCAL_TAG}",
         registry.trim_end_matches('/'),
         IMAGE_REPOSITORY
     )
@@ -11634,6 +11640,27 @@ fn serves_the_delivered_images(doc: &serde_yaml::Value) -> bool {
         == Some(CLUSTER_REGISTRY_COMPONENT)
 }
 
+/// 这份文档是不是一个「自己持有持久状态、重启一次要付出运行时代价」的工作负载。
+///
+/// 判据是结构而不是名字：`kind: StatefulSet` 且声明了 `volumeClaimTemplates`。
+/// 列表里写 `redis` / `postgres` 的名字会在有人给那份清单改名或换一种载体时
+/// 静默失效，而失效的样子是「某一版起每个滚动都重建一次消息队列」——队列本身
+/// 照样起得来，只有正在跟它说话的那些轮次断在半句上。声明式判据跟着清单走。
+///
+/// 为什么这一条和 [`serves_the_delivered_images`] 并列而不是合成一条：那边的
+/// 豁免理由是「重启会换掉正在供镜像的那张牌」，这边的理由是「重启会带走它正在
+/// 服务的整个运行时」，两条都指向「把它钉到本轮的 tag 上」，而只要其中一个理由
+/// 成立就该豁免。合成一条时，任一侧的判据一放宽，另一侧就跟着一起失去保护。
+fn keeps_durable_state(doc: &serde_yaml::Value) -> bool {
+    if doc.get("kind").and_then(|k| k.as_str()) != Some("StatefulSet") {
+        return false;
+    }
+    doc.get("spec")
+        .and_then(|s| s.get("volumeClaimTemplates"))
+        .and_then(|v| v.as_sequence())
+        .is_some_and(|claims| !claims.is_empty())
+}
+
 /// Rewrite every reference to *this* repository in a document — a container
 /// image, or a value that is nothing but the reference — to the image this
 /// rollout delivers, and report how many actually moved — a reference already
@@ -12110,21 +12137,51 @@ pub fn build_rollout_bundle(
                 // that owns it may never restart at all. The one workload this
                 // must not be done to is the one serving those images — see
                 // [`serves_the_delivered_images`].
+                //
+                // There is a second one, and it is why this pass stopped being
+                // uniform: a pod that owns durable state pays for that
+                // convergence with its whole runtime. Redis is the specimen —
+                // its pod template carries the `aof-repair` init container, so
+                // pinning that one reference moves the StatefulSet's generation
+                // and Kubernetes replaces the pod. The queue is then gone for
+                // the length of a restart, which is exactly the window a
+                // rollout occupies, and every evolution round that was talking
+                // to it dies mid-sentence. Measured 2026-11-06: the image on
+                // that init container was the only difference between two
+                // controller revisions of the redis StatefulSet, redis-0 was
+                // rebuilt inside the rollout of `5dad1f95`, and the round that
+                // was running at that minute logged 251 name-resolution
+                // failures and never finished. A support binary's consumer is
+                // a start, not a rollout — so a durable store keeps the
+                // floating tag: it still names a build that converged here,
+                // and the pod picks the binary up the next time it starts on
+                // its own.
                 let mut pinned = 0usize;
                 let mut left_alone = 0usize;
+                let mut floats = 0usize;
                 for d in docs.iter_mut() {
                     if serves_the_delivered_images(d) {
                         left_alone += 1;
                         continue;
                     }
+                    if keeps_durable_state(d) {
+                        // `:local` only advances after a revision converges
+                        // (`promote_local_tag`), so this names a build that
+                        // already proved itself here — never the one being
+                        // rolled right now.
+                        let floating = format!("{}:{}", repo, LOCAL_TAG);
+                        floats += pin_app_image_refs(d, repo, &floating);
+                        continue;
+                    }
                     pinned += pin_app_image_refs(d, repo, image);
                 }
-                if pinned > 0 || left_alone > 0 {
+                if pinned > 0 || left_alone > 0 || floats > 0 {
                     info!(
                         origin = %res,
                         pinned,
                         left_alone,
-                        "support manifest: pinned every reference to this build, except in the workload that serves it"
+                        floats,
+                        "support manifest: pinned every reference to this build, except in the workload that serves it and in the ones a restart would cost their runtime"
                     );
                 }
                 support_docs.extend(docs);
@@ -29712,10 +29769,10 @@ spec:
             deployment_yaml("cogneva-evolution", "cogneva"),
         );
         files.insert(
-            "redis-deployment.yaml".to_string(),
-            "kind: StatefulSet\nmetadata:\n  name: redis\nspec:\n  template:\n    spec:\n      \
-             initContainers:\n        - name: aof-repair\n          image: reg/cogneva:local\n      \
-             containers:\n        - name: redis\n          image: redis:7-alpine\n"
+            "backup-job.yaml".to_string(),
+            "kind: CronJob\nmetadata:\n  name: cogneva-backup\nspec:\n  jobTemplate:\n    spec:\n      \
+             template:\n        spec:\n          containers:\n            - name: backup\n              \
+             image: reg/cogneva:local\n"
                 .to_string(),
         );
         let set = ReleaseSet::from_flat_dir(files);
@@ -29728,7 +29785,103 @@ spec:
             "support face kept the floating tag: {}",
             bundle.support_yaml
         );
-        assert!(bundle.support_yaml.contains("image: redis:7-alpine"));
+    }
+
+    /// 持久状态的载体不跟着换版重启：它那条引用留在浮动签上。
+    ///
+    /// 这是 redis 的形状——`aof-repair` init 容器跑本仓库镜像，而它住在 redis 的
+    /// pod 模板里。把那条引用钉到本轮的 tag，StatefulSet 的代数就变了，Kubernetes
+    /// 于是在这次滚动里重建 redis-0：消息队列在滚动窗口里消失，正在跟它说话的
+    /// 每一轮都断在半句上（2026-11-06 实测：`5dad1f95` 的滚动里 redis-0 被重建，
+    /// 当时在飞的那一轮记下 251 条名字解析失败、再没交回结局）。
+    ///
+    /// 两侧都要判：只断言「浮动签还在」的话，把这一支写成「什么都不钉」也会绿；
+    /// 只断言「备份 CronJob 仍是本轮 tag」的话，这一条本身就没有被量到。
+    #[test]
+    fn build_rollout_bundle_keeps_a_durable_store_on_the_floating_tag() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        files.insert("redis-deployment.yaml".to_string(), durable_redis_yaml());
+        files.insert(
+            "backup-job.yaml".to_string(),
+            "kind: CronJob\nmetadata:\n  name: cogneva-backup\nspec:\n  jobTemplate:\n    spec:\n      \
+             template:\n        spec:\n          containers:\n            - name: backup\n              \
+             image: reg/cogneva:local\n"
+                .to_string(),
+        );
+        let set = ReleaseSet::from_flat_dir(files);
+        let bundle = build_rollout_bundle(&set, &bundle_targets(), "reg/cogneva:main-x").unwrap();
+        let docs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(&bundle.support_yaml)
+            .map(|d| serde_yaml::Value::deserialize(d).expect("support document parses"))
+            .collect();
+        let image_of = |doc: &serde_yaml::Value, path: &[&str], i: usize| -> Option<String> {
+            let mut at = doc;
+            for key in path {
+                at = at.get(*key)?;
+            }
+            at.as_sequence()?
+                .get(i)?
+                .get("image")?
+                .as_str()
+                .map(str::to_string)
+        };
+        let redis = docs
+            .iter()
+            .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("StatefulSet"))
+            .expect("the durable store is in the support bundle");
+        assert_eq!(
+            image_of(redis, &["spec", "template", "spec", "initContainers"], 0).as_deref(),
+            Some("reg/cogneva:local"),
+            "the durable store's support reference was pinned to this rollout, which rebuilds the \
+             queue: {}",
+            bundle.support_yaml
+        );
+        // 另一侧：同一份包里跑的备份 CronJob 仍然钉到本轮——这一支若被写成
+        // 「整个支撑面都不钉了」，备份就会拿着浮动签里那一版旧二进制去读新版写下的
+        // 数据，而没有任何读数会说这件事。
+        let backup = docs
+            .iter()
+            .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("CronJob"))
+            .expect("the backup CronJob is in the support bundle");
+        assert_eq!(
+            image_of(
+                backup,
+                &[
+                    "spec",
+                    "jobTemplate",
+                    "spec",
+                    "template",
+                    "spec",
+                    "containers"
+                ],
+                0
+            )
+            .as_deref(),
+            Some("reg/cogneva:main-x"),
+            "the support pin stopped pinning everything, not just the durable one: {}",
+            bundle.support_yaml
+        );
+    }
+
+    /// 真实的 redis 形状：`kind: StatefulSet` 加一个数据卷声明模板。
+    ///
+    /// 与预渲染清单同形（`deploy/rendered/*/42-statefulset-redis.yaml`），差别只在
+    /// 镜像地址与卷的具体参数——判据读的是结构，不是这些取值。
+    fn durable_redis_yaml() -> String {
+        "kind: StatefulSet\nmetadata:\n  name: redis\n  labels:\n    app.kubernetes.io/name: redis\n\
+         spec:\n  serviceName: redis\n  volumeClaimTemplates:\n    - metadata:\n        name: data\n      \
+         spec:\n        accessModes:\n          - ReadWriteOnce\n        resources:\n          requests:\n            \
+         storage: 1Gi\n  template:\n    spec:\n      initContainers:\n        - name: aof-repair\n          \
+         image: reg/cogneva:local\n          imagePullPolicy: Always\n      containers:\n        - name: redis\n          \
+         image: redis:7-alpine\n"
+            .to_string()
     }
 
     /// The workload that serves the delivered images keeps its references on
@@ -29754,11 +29907,14 @@ spec:
              - name: volume-walker\n          image: reg/cogneva:local\n"
                 .to_string(),
         );
+        files.insert("redis-deployment.yaml".to_string(), durable_redis_yaml());
+        // 第三份：一个既不供镜像、也不持有持久状态的支撑面负载——它必须照样被钉到
+        // 本轮，否则「支撑面还钉着」这句话就没有任何东西在量。
         files.insert(
-            "redis-deployment.yaml".to_string(),
-            "kind: StatefulSet\nmetadata:\n  name: redis\nspec:\n  template:\n    spec:\n      \
-             initContainers:\n        - name: aof-repair\n          image: reg/cogneva:local\n      \
-             containers:\n        - name: redis\n          image: redis:7-alpine\n"
+            "backup-job.yaml".to_string(),
+            "kind: CronJob\nmetadata:\n  name: cogneva-backup\nspec:\n  jobTemplate:\n    spec:\n      \
+             template:\n        spec:\n          containers:\n            - name: backup\n              \
+             image: reg/cogneva:local\n"
                 .to_string(),
         );
         let set = ReleaseSet::from_flat_dir(files);
