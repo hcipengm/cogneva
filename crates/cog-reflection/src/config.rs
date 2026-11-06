@@ -440,23 +440,18 @@ impl ChangeJobConfig {
 ///
 /// 生成侧越早知道上限，越能在写盘前让生成器缩小范围；把判据只写进 prompt 靠模型
 /// 自觉是不够的，模型数不准行数。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GenerationLimits {
     /// `None` is "no ceiling": a deployment that wants one sets the same key
     /// the landing channel reads.
+    ///
+    /// 落地侧 `LandingPolicy::max_changed_lines` 的默认值。这是**默认**不是
+    /// 第二份定义：配置文件里有那一节时以它为准，两边读的是同一个键。
+    /// `crates/cogneva` 的测试钉住这两个默认值相等，任一侧单独改动会红。
+    /// 也正是因为它现在是 `None`（派生默认就是它），这里不再手写 `Default`：
+    /// 手写一个与派生一模一样的实现会被 clippy 的 `derivable_impls` 判红。
     pub max_changed_lines: Option<usize>,
-}
-
-impl Default for GenerationLimits {
-    fn default() -> Self {
-        // 落地侧 `LandingPolicy::max_changed_lines` 的默认值。这是**默认**不是
-        // 第二份定义：配置文件里有那一节时以它为准，两边读的是同一个键。
-        // `crates/cogneva` 的测试钉住这两个默认值相等，任一侧单独改动会红。
-        Self {
-            max_changed_lines: None,
-        }
-    }
 }
 
 impl GenerationLimits {
