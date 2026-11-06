@@ -91,6 +91,57 @@ pub fn caller_agent_id() -> Option<String> {
     CALLER_AGENT_ID.try_with(|id| id.clone()).ok()
 }
 
+/// The sandbox task id for a tool call: the scoped task when there is one, and
+/// otherwise one workspace per caller.
+///
+/// A call with no task scope used to get a fresh random id every time, and the
+/// executor routes a task id to a worktree — so every call in a conversation
+/// was handed a different checkout. Measured on the deployed chat path
+/// (2026-11-06): `pwd` answered
+/// `/opt/cogneva/sandbox/workspaces/unscoped-shell-f294ca21-…`, and the next
+/// call in the same conversation would have named a different directory. That
+/// makes a conversation unable to finish any job that takes two calls —
+/// `write_file` then `run_command` tests nothing, because the file was written
+/// into a tree the next call never sees — which is exactly the "one call at a
+/// time" ceiling the tools were meant to lift.
+///
+/// The run loop already announces who is calling, and that identity is stable
+/// for a conversation, so it is the workspace's name. A caller nobody announced
+/// still gets the random id: two unknown callers sharing one directory would be
+/// worse than the churn.
+fn sandbox_task_id(scope: Option<&ToolScope>) -> String {
+    if let Some(scope) = scope {
+        return scope.task_id.clone();
+    }
+    match caller_agent_id() {
+        // The executor accepts `[A-Za-z0-9_.-]` and nothing else in a task id
+        // (see `validate_task_id`); agent ids carry other bytes -- squads are
+        // spelled `squad:<task>` -- so the name is folded before it is used.
+        Some(caller) => format!("unscoped-shell-{}", workspace_name(&caller)),
+        None => format!("unscoped-shell-{}", uuid::Uuid::new_v4()),
+    }
+}
+
+/// Fold an agent id into something the worktree router accepts as a directory
+/// name, keeping it recognizable.
+fn workspace_name(agent_id: &str) -> String {
+    let folded: String = agent_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // A leading dot is refused by the router (it would name a hidden directory),
+    // and an over-long id is refused too; both are the router's rules, so both
+    // are applied here rather than discovered as a failed call.
+    let folded = folded.trim_start_matches('.').to_string();
+    folded.chars().take(96).collect()
+}
+
 /// `read_file` 在调用方没说要看多少行时给出的一页。
 ///
 /// 一页按行数计，不按字节：行数读起来能对上编辑器，也能直接当 `offset`
@@ -537,9 +588,7 @@ impl ToolRegistry {
                     if let Some(paths) = batch_paths(&arguments).map_err(ToolRunError::Failed)? {
                         let offset = arguments.get("offset").and_then(|v| v.as_u64());
                         let limit = arguments.get("limit").and_then(|v| v.as_u64());
-                        let task_id = scope
-                            .map(|s| s.task_id.clone())
-                            .unwrap_or_else(|| format!("unscoped-shell-{}", uuid::Uuid::new_v4()));
+                        let task_id = sandbox_task_id(scope);
                         let agent_id = scope
                             .map(|s| s.agent_id.clone())
                             .unwrap_or_else(|| format!("unscoped-tool-{}", name));
@@ -693,9 +742,7 @@ impl ToolRegistry {
                     }
                 };
                 let req = SandboxRequest {
-                    task_id: scope
-                        .map(|s| s.task_id.clone())
-                        .unwrap_or_else(|| format!("unscoped-shell-{}", uuid::Uuid::new_v4())),
+                    task_id: sandbox_task_id(scope),
                     agent_id: scope
                         .map(|s| s.agent_id.clone())
                         .unwrap_or_else(|| format!("unscoped-tool-{}", name)),
@@ -2444,6 +2491,82 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert!(seen[0].0.starts_with("unscoped-shell-"));
         assert_eq!(seen[0].1, "unscoped-tool-run_command");
+    }
+
+    /// Every call an announced agent makes lands in one workspace.
+    ///
+    /// A conversation has no DAG task, so its calls reach the executor
+    /// unscoped — and each one used to carry a fresh random id, which the
+    /// executor routes to a separate checkout. Measured on the deployed chat
+    /// path (2026-11-06): `pwd` answered
+    /// `/opt/cogneva/sandbox/workspaces/unscoped-shell-f294ca21-…`, and the
+    /// next call in the same conversation would have been given another
+    /// directory. So a write and a read two calls apart could never see the
+    /// same file, and the only work a conversation could finish was work that
+    /// fits in one call. The caller's id is stable for the whole conversation,
+    /// which is what makes it the workspace's name.
+    ///
+    /// Without an announced caller the random id stays: two unknown callers
+    /// sharing one directory would be a worse failure than the churn.
+    #[tokio::test]
+    async fn calls_from_one_announced_agent_share_one_workspace() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry =
+            ToolRegistry::new().with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::write_file());
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        CALLER_AGENT_ID
+            .scope("ralph-3be244e0".to_string(), async {
+                registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({"path": "a.txt", "content": "x"}),
+                    )
+                    .await
+                    .unwrap();
+                registry
+                    .execute("run_command", serde_json::json!({"command": "cat a.txt"}))
+                    .await
+                    .unwrap();
+                registry
+                    .execute("run_command", serde_json::json!({"command": "ls"}))
+                    .await
+                    .unwrap();
+            })
+            .await;
+
+        let seen = backend.seen.lock().await.clone();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(
+            seen[0].0, "unscoped-shell-ralph-3be244e0",
+            "an unscoped call is named after the agent making it: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|call| call.0 == seen[0].0),
+            "every call one agent makes has to land in one workspace, or a write \
+             is invisible to the read after it: {seen:?}"
+        );
+    }
+
+    /// An agent id the executor would refuse is folded into one it accepts.
+    ///
+    /// The worktree router takes `[A-Za-z0-9_.-]` and refuses everything else,
+    /// while agent ids carry other bytes — a squad is spelled
+    /// `squad:<task id>`. Unfolded, every call from such an agent would fail
+    /// with "invalid task id for workspace routing" instead of running.
+    #[test]
+    fn an_agent_id_is_folded_into_a_workspace_name() {
+        assert_eq!(
+            workspace_name("squad:DSC-1A2B-generator"),
+            "squad-DSC-1A2B-generator"
+        );
+        assert_eq!(
+            workspace_name(".hidden"),
+            "hidden",
+            "a leading dot would name a hidden directory, which the router refuses"
+        );
+        assert_eq!(workspace_name(&"x".repeat(200)).len(), 96);
     }
 
     #[tokio::test]
