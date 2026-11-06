@@ -1670,7 +1670,21 @@ fn dispatch_task(rows: &[ChangeLedgerRow], generation: u32) -> Task {
     task.parent_task_id = Some(dispatch_project_root_id(&dispatch_project_key(anchor)));
     // What closes this row: see [`DISPATCH_ACCEPTANCE`]. Hung under the anchor
     // it is a leaf, which is exactly the shape that has to say so.
-    task.acceptance.push(DISPATCH_ACCEPTANCE.to_string());
+    //
+    // A batch says "every one of them": the single-change sentence would tell a
+    // reader that the first change settling is the whole job, which is the one
+    // thing a batch must not be read as -- the sweep closes the task only when
+    // all of them have settled, and the acceptance is where that is written for
+    // whoever reads the task rather than the account.
+    task.acceptance.push(if rows.len() > 1 {
+        format!(
+            "这批承载的 {} 条变更每一条在变更账上都不再 outstanding：各自同一身份的账行落到 \
+             landed 或 retired，判据取账上那一行",
+            rows.len()
+        )
+    } else {
+        DISPATCH_ACCEPTANCE.to_string()
+    });
     task
 }
 
@@ -11801,6 +11815,15 @@ mod tests {
                 "目标里没写「{title}」，生成侧就只会做它看见的那一项：{goal}"
             );
         }
+        // The acceptance is what a reader takes as "done". A batch that said
+        // "this change" would read as done once the first of the three settled,
+        // while the sweep it describes closes the task only when all of them
+        // have.
+        let acceptance = task.acceptance.join("\n");
+        assert!(
+            acceptance.contains("3") && acceptance.contains("每一条"),
+            "一批的验收标准没有说清是三条都算：{acceptance}"
+        );
     }
 
     /// A hand-over of one row says exactly what it always said.
