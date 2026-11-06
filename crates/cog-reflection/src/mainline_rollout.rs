@@ -2087,8 +2087,8 @@ pub(crate) fn pod_already_admitted(
                 .and_then(|l| l.get(key))
                 .and_then(|x| x.as_str())
         };
-        if label("app.kubernetes.io/name") != Some(name)
-            || label("app.kubernetes.io/component") != Some(component)
+        if label(cog_core::topology::LABEL_NAME) != Some(name)
+            || label(cog_core::topology::LABEL_COMPONENT) != Some(component)
         {
             continue;
         }
@@ -3203,8 +3203,11 @@ impl RolloutExecutor {
                     "pods",
                     "-l",
                     &format!(
-                        "app.kubernetes.io/name={},app.kubernetes.io/component={}",
-                        t.name, t.component
+                        "{}={},{}={}",
+                        cog_core::topology::LABEL_NAME,
+                        t.name,
+                        cog_core::topology::LABEL_COMPONENT,
+                        t.component
                     ),
                     "-o",
                     "json",
