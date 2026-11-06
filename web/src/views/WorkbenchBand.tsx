@@ -7,11 +7,19 @@
  *
  * 每一格只读「有多少」和「头几个叫什么」，点一下就走到那一面看全文。三份读数
  * 各自带读失败与没读到过，不把失败画成空名单——空名单读起来是「一个人都没有」。
+ *
+ * 画面：这条带子本身就是画面——三格并排，每格一个数加一行名字，读者一眼看到
+ * 平台的规模，点进去才看明细；它不再另画一张分布图。
+ *
+ * 三份读数都订帧：有人上岗、有任务动了，这一条立刻重读，而不是等 15 秒的兜底
+ * 定时器。只留定时器的话，把间隔调成十分钟，帧到了屏幕上也不动。
  */
 import { getTaskSummary, getVenues, listAgents } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { Icon, type IconName } from '@/shell/icons';
 import { useShell, type ActivityId } from '@/shell/store';
+import { Note } from '@/ui/Note';
 import { resourceKey } from '@/store/frameTick';
 
 /** 名单里最多念几个名字。再多也读不完，剩下的交给「员工」那一面。 */
@@ -54,20 +62,21 @@ function Cell({
           打开 ›
         </span>
       </span>
-      <span className="w-full truncate text-[11px] text-[var(--paper-dim)]" title={line}>
+      <Note className="w-full truncate text-[11px] text-[var(--paper-dim)]" text={line}>
         {line}
-      </span>
+      </Note>
     </button>
   );
 }
 
 export function WorkbenchBand() {
-  const agents = useResource('在岗名单', listAgents, 15_000, true, [
-    'agents',
-    resourceKey('agents'),
-  ]);
-  const venues = useResource('场地读数', getVenues, 30_000, true, ['tasks', resourceKey('tasks')]);
-  const tasks = useResource('任务总览', getTaskSummary, 15_000, true, ['tasks', resourceKey('tasks')]);
+  const agents = useResource('在岗名单', listAgents, 15_000);
+  const venues = useResource('场地读数', getVenues, 30_000);
+  const tasks = useResource('任务总览', getTaskSummary, 15_000);
+  // 订的键就是这一条盯的那几件事：有人上岗（`agents`）、有任务动（`tasks`）。
+  // 场地那两条读数跟着任务走——一场活挂到哪个场地，就写在任务的读数里。
+  useKindTickedRefresh(['agents', resourceKey('agents')], agents.refresh);
+  useKindTickedRefresh(['tasks', resourceKey('tasks')], [venues.refresh, tasks.refresh]);
 
   /** 一份读数的第二行：失败说失败，没读到过说在读，读到了才说内容。 */
   const secondLine = (r: { data: unknown; error: string | null }, ready: string) =>
