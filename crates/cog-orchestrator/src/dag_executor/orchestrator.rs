@@ -208,6 +208,20 @@ pub(crate) const DEADLINE_CUT_PREFIX: &str = "Task execution timed out after ";
 // cap: bound — 一小时是平台给一份 LLM 密集工作声明的量级（自进化任务用这个数），两小时是最后一次翻倍；再往上截断的，缺的不是时间
 const MAX_ATTEMPT_BUDGET_SECS: u64 = 7200;
 
+/// 一条活被「不记账地交回来」几次之后，等待开始随次数翻倍。
+///
+/// 六轮、每轮按上游自己给的 2488s 算，是四个多小时的耐心：一段真会过去的
+/// 限流、一次真的窗口滚动，都在这个尺度以内。再往后还回来的，量出来的形状
+/// 是「窗口根本还没回来」，那时该做的是少来几次，不是继续每分钟试探。
+const UNCHARGED_TURNS_BEFORE_SLOWING: u32 = 6;
+
+/// 拉长等待的上界：12 小时。
+///
+/// 平台量出来的额度窗口是一周（`quota_window_secs: 604800`），12 小时是它的
+/// 一个零头——窗口回来的当天，这些活半天之内都会重新被看到，而又不会在窗口
+/// 还没回来时把额度一片一片吃掉。
+const UNCHARGED_REQUEUE_WAIT_CAP_SECS: u64 = 12 * 3600;
+
 /// 上一次尝试是不是被它自己的时限截断的，截断时声明的是多少秒。
 ///
 /// 按形状读，不按裸子串读：要的是「<开头><数字> seconds」这一整句。错误文本在
@@ -2057,12 +2071,35 @@ impl DagExecutor {
         if !expected.contains(&cur.status) {
             return Ok(false);
         }
+        // 这条活已经被交回来过几次：重试史的条数，含刚落下的这一条。读不到
+        // 就是零——没有读数不设界，与池子、预算那几道闸同一条规矩，它会退回
+        // 上游自己给的那个等待。
+        let turns = match be.dag_get_retry_history(&self.workspace_id, task_id).await {
+            Ok(history) => u32::try_from(history.len()).unwrap_or(u32::MAX),
+            Err(e) => {
+                tracing::debug!(
+                    task_id = %task_id,
+                    error = %e,
+                    "no retry history for this task; it waits the upstream's own hint"
+                );
+                0
+            }
+        };
         let delay = Self::environment_delay(
             &self.retry_matrix,
             &cur.task_type,
             cur.retry_count,
+            turns,
             retry_after_secs,
         );
+        if turns >= UNCHARGED_TURNS_BEFORE_SLOWING {
+            tracing::info!(
+                task_id = %task_id,
+                turns,
+                wait_secs = delay.as_secs(),
+                "the upstream has paid for this task's failures many times over; waiting longer before the next turn so it stops taking a slice of a window it cannot finish in"
+            );
+        }
         let next = Self::requeued_without_charge(&cur, error, cause, delay);
         let next = match plant {
             Some(refusal) => match Self::with_the_refusal_planted(next, refusal) {
@@ -3059,17 +3096,43 @@ impl DagExecutor {
     /// 没有数字时档位取策略**最后一档**而不是 `retry_count`：环境付账的那几轮
     /// 不动预算，拿冻结的 `retry_count` 当档位等于每一轮都退到同一格，退了个
     /// 寂寞。这一档是策略本来就有的数（同一张 `RetryMatrix`），不是这里另发明的。
+    ///
+    /// `turns` 是这条活**已经被交回来过几次**（重试史的长度，含这一轮），与它
+    /// 自己的预算无关。等待从第 [`UNCHARGED_TURNS_BEFORE_SLOWING`] 轮起每轮翻
+    /// 一倍，封顶 [`UNCHARGED_REQUEUE_WAIT_CAP_SECS`]。
+    ///
+    /// 为什么要长这一条：上游给的等待是**一次**拒绝的时长，不是这一族活还能
+    /// 等多久。2026-11-06 实测，`change-ledger-9134363df9eb8704` 这类行被上游
+    /// 拒了 49 次——每一次都恰好等 2488s（上游自己给的那个数）再来一次，而它
+    /// 从来跑不完，因为额度窗口是一周（`quota_window_secs: 604800`），一周里
+    /// 每隔 41 分钟分走一小片额度，每一片都不够一件活跑到底。这样的行有 74 条，
+    /// 一天花掉 ¥40（占当日账单 23%），产出为零。它们缺的不是判死，是**少来
+    /// 几次**：等得越久，越不会在窗口还没回来时把下一片额度吃掉。
+    ///
+    /// 翻倍的上界取 12 小时，是这一周窗口量出来的一个零头：一天两次，窗口真
+    /// 回来时这些活半天之内都会重新被看到，而不再与能跑完的活抢同一个窗口。
     fn environment_delay(
         matrix: &RetryMatrix,
         task_type: &TaskType,
         retry_count: u32,
+        turns: u32,
         retry_after_secs: Option<u64>,
     ) -> std::time::Duration {
         let tier = match retry_after_secs {
             Some(_) => retry_count,
             None => matrix.max_retries(task_type),
         };
-        matrix.delay_with_hint(task_type, tier, retry_after_secs)
+        let base = matrix.delay_with_hint(task_type, tier, retry_after_secs);
+        if turns < UNCHARGED_TURNS_BEFORE_SLOWING {
+            return base;
+        }
+        let doublings = turns - UNCHARGED_TURNS_BEFORE_SLOWING;
+        let factor = 1u64.checked_shl(doublings).unwrap_or(u64::MAX);
+        let grown = base
+            .as_secs()
+            .saturating_mul(factor)
+            .min(UNCHARGED_REQUEUE_WAIT_CAP_SECS);
+        std::time::Duration::from_secs(grown)
     }
 
     /// Fail a task with the given error.
@@ -3189,11 +3252,16 @@ impl DagExecutor {
 
         // 环境付账的失败不进任务的预算账：回队列等上游回来，`retry_count`
         // 原样不动。等多久的说明见 [`Self::environment_delay`]。
+        //
+        // 这一支拿不到重试史（它按文档在内存里跑，史只在表上），所以 `turns`
+        // 传 0：等待退回上游自己给的那个数，也就是这条路径原来的行为。生产
+        // 走的是上面那条存储路径，增长在那里成立。
         if Self::the_environment_pays(&error, cause) {
             let delay = Self::environment_delay(
                 &self.retry_matrix,
                 &task_type,
                 retry_count,
+                0,
                 retry_after_secs,
             );
             let now = chrono::Utc::now();
@@ -7810,6 +7878,91 @@ mod tests {
         assert_eq!(
             produced, seeded,
             "播种的 kind 串与 event_kind 的 match 漂开了：差额的那一个会永远缺席"
+        );
+    }
+
+    /// 上游每拒一次都原样等它给的那个数，是这一族活把额度窗口吃干的原因：
+    /// 现网那条被拒 49 次的行，每一次都恰好等 2488s 再来。头几轮照旧（短等
+    /// 让偶发的 429 很快接上），过了门槛就每轮翻倍。
+    #[test]
+    fn a_task_the_upstream_keeps_refusing_waits_longer_each_time_it_comes_back() {
+        let matrix = RetryMatrix::defaults();
+        let hint = Some(2488);
+
+        for turns in 0..UNCHARGED_TURNS_BEFORE_SLOWING {
+            assert_eq!(
+                DagExecutor::environment_delay(&matrix, &TaskType::LlmCall, 0, turns, hint)
+                    .as_secs(),
+                2488,
+                "第 {turns} 轮还没到门槛，等的应当就是上游给的那个数"
+            );
+        }
+        assert_eq!(
+            DagExecutor::environment_delay(
+                &matrix,
+                &TaskType::LlmCall,
+                0,
+                UNCHARGED_TURNS_BEFORE_SLOWING,
+                hint
+            )
+            .as_secs(),
+            2488,
+            "到门槛这一轮是翻倍的起点而不是翻倍后的第二格"
+        );
+        assert_eq!(
+            DagExecutor::environment_delay(&matrix, &TaskType::LlmCall, 0, 7, hint).as_secs(),
+            4976
+        );
+        assert_eq!(
+            DagExecutor::environment_delay(&matrix, &TaskType::LlmCall, 0, 8, hint).as_secs(),
+            9952
+        );
+    }
+
+    /// 翻倍得有个头：一条活被拒上千次时，等的时间不能长到它再也回不来，
+    /// 也不能靠 `as_secs()` 的乘法溢出去兜底。
+    #[test]
+    fn the_grown_wait_stops_at_the_cap_instead_of_running_away() {
+        let matrix = RetryMatrix::defaults();
+        let hint = Some(2488);
+        assert_eq!(
+            DagExecutor::environment_delay(&matrix, &TaskType::LlmCall, 0, 10, hint).as_secs(),
+            39808,
+            "还没到上界时按倍数长"
+        );
+        assert_eq!(
+            DagExecutor::environment_delay(&matrix, &TaskType::LlmCall, 0, 11, hint).as_secs(),
+            UNCHARGED_REQUEUE_WAIT_CAP_SECS,
+            "翻到上界以上就停在上界"
+        );
+        assert_eq!(
+            DagExecutor::environment_delay(&matrix, &TaskType::LlmCall, 0, 64, hint).as_secs(),
+            UNCHARGED_REQUEUE_WAIT_CAP_SECS,
+            "轮次足够大时翻倍因子会溢出，那一路必须落到同一个上界而不是恐慌"
+        );
+    }
+
+    /// 上游不给数字时，档位取策略最后一档——环境付账的那几轮不动预算，
+    /// 冻住的 `retry_count` 当档位等于每轮退到同一格。这条与翻倍无关，
+    /// 翻倍是乘在它上面的。
+    #[test]
+    fn a_refusal_without_a_hint_waits_the_last_tier_and_grows_from_there() {
+        let matrix = RetryMatrix::defaults();
+        let last_tier = matrix.delay_with_hint(
+            &TaskType::LlmCall,
+            matrix.max_retries(&TaskType::LlmCall),
+            None,
+        );
+        assert_eq!(last_tier.as_secs(), 8, "默认 LlmCall 的最后一档是 8s");
+        assert_eq!(
+            DagExecutor::environment_delay(&matrix, &TaskType::LlmCall, 0, 0, None),
+            last_tier,
+            "没到门槛时与策略原样一致"
+        );
+        assert_eq!(
+            DagExecutor::environment_delay(&matrix, &TaskType::LlmCall, 0, 7, None).as_secs(),
+            16,
+            "翻倍乘在最后一档上"
         );
     }
 }
