@@ -270,6 +270,10 @@ pub enum RunOutcome {
     /// 同一份请求。与 [`Self::BudgetExhausted`] 分开计：那一个说「再给几轮就行」，
     /// 这一个说「给多少轮都一样」——要改的是任务输入的大小或窗口预算。
     Unreadable,
+    /// 这一轮把一段时间花在了只读调用上：被提醒过两次「工作树没动」，仍然没有
+    /// 写下去。与 [`Self::BudgetExhausted`] 分开计：那一个说轮数不够，这一个说
+    /// 轮数够了、动作没有——再给轮数只会换来同一批读。
+    NoProgress,
     /// A guardrail rule refused a tool call and the run's refusal allowance was
     /// spent, so the run stopped without an answer.
     ///

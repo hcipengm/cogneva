@@ -86,6 +86,9 @@ fn names_a_deterministic_cause(text: &str) -> bool {
         // 窗口装不下任务输入时，模型每一轮收到的都是同一份请求：那一轮的产出
         // 与「预算花光」一样不是交付物，而它连原因都不会自己写出来。
         || t.contains(CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS)
+        // 一直在读、被提醒过两次仍然不写：这一轮的产出同样不是交付物，而它
+        // 连「我什么也没写」这句都不会自己说出来。
+        || t.contains(cog_core::contract::outcome::NO_CHECKOUT_PROGRESS_STATUS)
 }
 
 /// The wire declaration an in-band cause is published under.
@@ -115,6 +118,14 @@ fn declaration_for_cause(text: &str) -> &'static str {
     if text
         .to_ascii_lowercase()
         .contains(CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS)
+    {
+        return TERMINAL_ENV_FAILURE_PREFIX;
+    }
+    // 同一条运行、同一批只读调用，重来一次只会把同样的读再跑一遍；它终止的
+    // 理由是「这一轮没有动手」，不是「上游不可用」，所以也不并入 503 那一档。
+    if text
+        .to_ascii_lowercase()
+        .contains(cog_core::contract::outcome::NO_CHECKOUT_PROGRESS_STATUS)
     {
         return TERMINAL_ENV_FAILURE_PREFIX;
     }
@@ -192,6 +203,30 @@ pub fn context_floor_reason(value: &serde_json::Value) -> Option<String> {
          occupies an estimated {estimated} tokens against a {budget}-token context window, so every \
          tool result is evicted the moment it arrives and every turn re-sends the identical request; \
          this attempt read nothing and wrote nothing"
+    ))
+}
+
+/// 一条运行半小时没动工作树、被提醒过两次时的结局，渲染成链上读的那句原因。
+/// `None` 是正常结果。
+///
+/// 与「预算花光」分开写：那一个说的是「这一轮还需要更多轮」，处置是抬预算；
+/// 这一个说的是「它有时间，只是没用在工作树上」，更多的轮数与更多的时间只会
+/// 换来同一批只读调用。合成一句话就是让读的人再也分不出这两种。
+pub fn no_checkout_progress_reason(value: &serde_json::Value) -> Option<String> {
+    if value.get("status").and_then(|v| v.as_str())
+        != Some(cog_core::contract::outcome::NO_CHECKOUT_PROGRESS_STATUS)
+    {
+        return None;
+    }
+    let calls = value
+        .get("calls_since_change")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Some(format!(
+        "{TERMINAL_ENV_FAILURE_PREFIX}: {}: the run spent {calls} tool calls without changing the \
+         checkout, was told twice that nothing had moved, and half an hour passed since its last \
+         write; ending it here names the fact instead of leaving it to the task's whole wall clock",
+        cog_core::contract::outcome::NO_CHECKOUT_PROGRESS_STATUS
     ))
 }
 
@@ -1346,10 +1381,48 @@ mod tests {
 
         let plan = crate::squad::pge::roundtable::parse_planner_output(&sentinel, "修好它");
         assert!(
+            plan.plan.as_str().is_some_and(|text| text.contains("context_floor")),
+            "计划这一侧也一样：空计划是合法计划，不说原因就读成「看过、没什么可做」: {}",
+            plan.plan
+        );
+    }
+
+    /// 一条跑了半小时只读、被提醒过两次仍然没写东西的运行，也不是「这个角色
+    /// 看过目标、觉得没什么可做」。
+    ///
+    /// 与「窗口装不下」「预算花光」都分开判：那两种缺的是窗口或轮数，这一种缺的
+    /// 是动手——抬预算、抬轮数都不会让它写下一个字节。
+    #[test]
+    fn a_run_that_never_touched_the_checkout_names_that_and_not_a_spent_budget() {
+        let sentinel = serde_json::json!({
+            "status": cog_core::contract::outcome::NO_CHECKOUT_PROGRESS_STATUS,
+            "calls_since_change": 118,
+            "iterations": 41
+        });
+        let output = crate::squad::pge::roundtable::parse_generator_output(&sentinel);
+        let reason = output
+            .terminal_env_failure_reason()
+            .expect("同一批只读调用重来一次也只会再读一遍: not retryable");
+        assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
+        assert!(
+            reason.contains("118"),
+            "the reason must carry the reading that stopped it, got: {reason}"
+        );
+        assert!(
+            !reason.contains(cog_core::contract::outcome::ITERATION_BUDGET_EXHAUSTED_MARKER),
+            "没有动手不是「还需要更多轮」: {reason}"
+        );
+        assert!(
+            !reason.contains(CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS),
+            "窗口装得下，缺的不是窗口: {reason}"
+        );
+
+        let plan = crate::squad::pge::roundtable::parse_planner_output(&sentinel, "修好它");
+        assert!(
             plan.plan
                 .as_str()
-                .is_some_and(|text| text.contains("context_floor")),
-            "计划这一侧也一样：空计划是合法计划，不说原因就读成「看过、没什么可做」: {}",
+                .is_some_and(|text| text.contains("no_checkout_progress")),
+            "计划这一侧也一样：不说原因就读成「看过、没什么可做」: {}",
             plan.plan
         );
     }

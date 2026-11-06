@@ -153,6 +153,19 @@ pub const ITERATION_BUDGET_EXHAUSTED_MARKER: &str = "iteration_budget_exhausted"
 /// 和其它线标一起放在这里，免得两边各拼一份、改一处之后静默不匹配。
 pub const CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS: &str = "context_floor_exceeds_window";
 
+/// 一条运行长时间不改工作树，结局字串。
+///
+/// 与 [`CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS`] 和 [`ITERATION_BUDGET_EXHAUSTED_MARKER`]
+/// 都分开，因为处置第三种：那两个缺的是窗口或轮数，这一个缺的是「动手」——
+/// 它读、它搜、它打印，被提醒过两次仍然不动，多给的时间和轮数只会换来同样的
+/// 一批只读调用。集群库实测（2026-11-06）：完成的变更任务从开跑到收尾中位数
+/// 11.5 分钟、九成在 43 分钟内结束；失败的 26 条中位数 42.9 分钟、九成撞满
+/// 60 分钟的墙，而它们一小时里一次都没改过工作树。
+///
+/// 生产者（agent 的循环）与读者（协作侧的解析）是不同的 crate，所以与其它
+/// 线标一起放在这里。
+pub const NO_CHECKOUT_PROGRESS_STATUS: &str = "no_checkout_progress";
+
 /// Prefix marking a run whose cause is an upstream refusal the environment can
 /// clear on its own — a rate limit, a server error, a broken transport.
 ///

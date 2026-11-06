@@ -35,6 +35,28 @@ const CALLS_WITHOUT_CHANGE: u32 = 40;
 // cap: bound — 一条提示本身也要付一次回合，且落地会作废它之后的缓存前缀；两次之后不再打断
 const NOTHING_CHANGED_NOTES: u32 = 2;
 
+/// 这条角色写不写工作树。
+///
+/// 规划、评审、主持都是只读的：「工作树没动」对它们不构成任何证据——它们本来
+/// 就不该动它。所以「半小时没动就收住」只对生成侧成立，别的角色跑多久都不该
+/// 因为这一条被收。
+fn writes_the_checkout(role: &str) -> bool {
+    role == cog_core::roles::GENERATOR
+}
+
+/// 一条运行在不改工作树的情况下，被提醒过两次之后还能再走多久。
+///
+/// 量自集群（2026-11-06，近三天）：完成的变更任务从开跑到收尾中位数 11.5 分钟、
+/// 九成在 43 分钟内结束；失败的 26 条中位数 42.9 分钟、九成撞满 60 分钟的墙，
+/// 而撞墙的那一个小时里一次都没改过工作树。
+///
+/// 所以这半小时不是猜的：已经动的活在四十分钟内就动过了，而在被提醒两次之后
+/// 又空转半小时的运行，剩下的那半小时只会再交出一批只读调用。收住它省下的不是
+/// 这一条的模型钱——是那条只有两个的槽位（`taskRouter.claimConcurrency`）被
+/// 一件没有进展的活占着的那半小时。
+// cap: bound — 半小时对应「九成的已完成运行已经结束」那一刻之后还留出的余量；再长就回到原来的一小时墙
+const NO_PROGRESS_WALL: Duration = Duration::from_secs(30 * 60);
+
 /// What the model is told when the checkout has not moved for a long stretch.
 ///
 /// It says what the reading is and what the two ways out are, without asking
@@ -772,19 +794,55 @@ const CONVERSATION_REPLY_STATUS: &str = "completed";
 /// So the reading kept here is of effect, not of effort: how many calls
 /// have passed since the checkout changed. The note it produces is a
 /// correction to that silence, not a ceiling on the run.
-#[derive(Default)]
 struct CheckoutProgress {
     calls_without_change: u32,
+    /// 距上一次真的改动工作树过了多少次调用。
+    ///
+    /// 与 [`Self::calls_without_change`] 分开：那一个每说一次提醒就清零（它量的是
+    /// 「这一声该不该响」），这一个只在真的改动时才清零。收住的时候要报的是后者
+    /// ——一条半小时只打了三个慢调用的运行，「三次」是对的，「零次」是刚清过零。
+    calls_since_change: u32,
     notes_given: u32,
+    /// 上一次真的改到工作树的时刻；一条还没写过的运行从它开始跑的那一刻算起。
+    last_change: std::time::Instant,
+}
+
+impl Default for CheckoutProgress {
+    fn default() -> Self {
+        Self {
+            calls_without_change: 0,
+            calls_since_change: 0,
+            notes_given: 0,
+            last_change: std::time::Instant::now(),
+        }
+    }
 }
 
 impl CheckoutProgress {
     fn note_call(&mut self, tool: &str, arguments: &serde_json::Value) {
         if changes_the_checkout(tool, arguments) {
             self.calls_without_change = 0;
+            self.calls_since_change = 0;
+            self.last_change = std::time::Instant::now();
         } else {
             self.calls_without_change = self.calls_without_change.saturating_add(1);
+            self.calls_since_change = self.calls_since_change.saturating_add(1);
         }
+    }
+
+    /// 这条运行是不是已经绕圈绕到该收住了。
+    ///
+    /// 与 [`Self::take_note`] 分工：提醒是给模型的，收住是给运行的。提醒之后它
+    /// 仍然能自己走出来，所以收住多要一段时间——被提醒过两次**并且**距上一次真的
+    /// 改动工作树已经过了 [`NO_PROGRESS_WALL`]，两条一起成立才算。
+    ///
+    /// 只有次数不够：四十次只读在一分钟内就能凑齐（模型一次能并发发好几条），
+    /// 那样的运行不是迷路，是刚开始读。只有时间也不够：一次长编译可以在不改工作
+    /// 树的情况下占满这半小时，而它显然是在干活。次数管住「真的在动」，时间管住
+    /// 「动了多久」，缺一个都会误伤正常的长活。
+    fn circling(&self, now: std::time::Instant) -> bool {
+        self.notes_given >= NOTHING_CHANGED_NOTES
+            && now.saturating_duration_since(self.last_change) >= NO_PROGRESS_WALL
     }
 
     /// The note to put in front of the model, once the count has run past
@@ -819,7 +877,7 @@ impl CheckoutProgress {
 /// errs towards calling too much of the shell a write.
 fn changes_the_checkout(tool: &str, arguments: &serde_json::Value) -> bool {
     if tool != "run_command" {
-        return tool == "write_file" || tool == "edit_file";
+        return tool == "write_file";
     }
     let command = arguments
         .get("command")
@@ -2407,7 +2465,10 @@ impl AgentRuntime {
                      every result is evicted the moment it arrives, so the run ends here \
                      instead of re-sending an identical request until the budget is spent"
                 );
-                self.note_run_ending(crate::observable::RunOutcome::Unreadable, iteration + 1);
+                self.note_run_ending(
+                    crate::observable::RunOutcome::Unreadable,
+                    iteration + 1,
+                );
                 self.emit_event(AgentEvent::AgentEnd {
                     agent_id: self.config.agent_id.clone(),
                     messages: self.published_messages(),
@@ -2420,6 +2481,42 @@ impl AgentRuntime {
                     "status": cog_core::contract::outcome::CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS,
                     "budget": self.config.context_window_size,
                     "estimated": self.context.token_count(),
+                    "iterations": iteration + 1,
+                }));
+            }
+
+            // 一直在读、一直在搜、被提醒过两次仍然不写：这条运行不是在探索，是在
+            // 绕圈。它此前唯一的出口是任务级的那面 3600 秒的墙——一个小时之后由
+            // 回收器替它收场，读数是「跑满预算没有产出」，而真正的事实是「这段
+            // 时间里一次都没动过工作树」。在这里收住，名字说的是事实，而且省下的
+            // 是那个只有两个的槽位。
+            if writes_the_checkout(self.config.role.as_str())
+                && progress.circling(std::time::Instant::now())
+            {
+                self.state = RuntimeState::Complete;
+                tracing::warn!(
+                    agent_id = %self.config.agent_id,
+                    calls_since_change = progress.calls_since_change,
+                    notes_given = progress.notes_given,
+                    "the checkout has not moved for half an hour and the run has already \
+                     been told twice; ending it here instead of spending the rest of the \
+                     task's wall clock on more reads"
+                );
+                self.note_run_ending(
+                    crate::observable::RunOutcome::NoProgress,
+                    iteration + 1,
+                );
+                self.emit_event(AgentEvent::AgentEnd {
+                    agent_id: self.config.agent_id.clone(),
+                    messages: self.published_messages(),
+                    crew_id: None,
+                    squad_id: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await?;
+                return Ok(serde_json::json!({
+                    "status": cog_core::contract::outcome::NO_CHECKOUT_PROGRESS_STATUS,
+                    "calls_since_change": progress.calls_since_change,
                     "iterations": iteration + 1,
                 }));
             }
@@ -6704,6 +6801,65 @@ mod tests {
         serde_json::json!({ "command": "sed -i 's/a/b/' crates/x.rs" })
     }
 
+    /// 「工作树没动」只对写工作树的角色是证据：规划与评审本来就不该动它，
+    /// 拿这一条去收它们，等于把「它做了本职工作」读成「它没有进展」。
+    #[test]
+    fn only_a_role_that_writes_the_checkout_can_be_stopped_for_not_writing_it() {
+        assert!(writes_the_checkout(cog_core::roles::GENERATOR));
+        for read_only in [
+            cog_core::roles::PLANNER,
+            cog_core::roles::EVALUATOR,
+            cog_core::roles::MODERATOR,
+            cog_core::roles::MERGER,
+        ] {
+            assert!(
+                !writes_the_checkout(read_only),
+                "{read_only} 是只读角色，不该因为工作树没动被收住"
+            );
+        }
+    }
+
+    /// 收住要多要一条时间证据：只读次数凑够了、时间还没到，那是在读；时间过了、
+    /// 中间写过一次，那是在干活。两条一起成立才是绕圈。
+    #[test]
+    fn circling_needs_both_the_two_notes_and_the_wall() {
+        let mut progress = CheckoutProgress::default();
+        let start = progress.last_change;
+
+        // 只读，但已经走满那段时间——却只被提醒过一次：还不到收的时候。
+        for _ in 0..CALLS_WITHOUT_CHANGE {
+            progress.note_call("run_command", &read_call());
+        }
+        assert!(progress.take_note().is_some(), "第一次提醒必须响");
+        assert_eq!(progress.notes_given, 1);
+        assert!(
+            !progress.circling(start + NO_PROGRESS_WALL),
+            "只提醒过一次、次数还没到，不算绕圈：收住得先把话说两遍"
+        );
+
+        // 第二次提醒之后，两条都成立。
+        for _ in 0..CALLS_WITHOUT_CHANGE {
+            progress.note_call("run_command", &read_call());
+        }
+        assert!(progress.take_note().is_some(), "第二次提醒必须响");
+        assert!(
+            !progress.circling(start + NO_PROGRESS_WALL - Duration::from_secs(1)),
+            "提醒过两次，但那半小时还差一秒：不收"
+        );
+        assert!(
+            progress.circling(start + NO_PROGRESS_WALL),
+            "提醒过两次、而且半小时没动过工作树：必须收住"
+        );
+
+        // 写过一次就重新计时：绕圈的那半小时从这一次改动算起。
+        progress.note_call("run_command", &write_call());
+        let after_write = progress.last_change;
+        assert!(
+            !progress.circling(after_write + NO_PROGRESS_WALL - Duration::from_secs(1)),
+            "一次真的改动之后，那半小时要重新算"
+        );
+    }
+
     /// The reading this exists for: a run that searches and never writes is
     /// told so, twice at most, and a run that writes in between never hears it.
     #[test]
@@ -6754,11 +6910,6 @@ mod tests {
     fn the_calls_that_change_the_checkout_are_read_off_the_call() {
         let cases: &[(&str, serde_json::Value, bool)] = &[
             ("write_file", serde_json::json!({ "path": "a.rs" }), true),
-            (
-                "edit_file",
-                serde_json::json!({ "path": "a.rs", "old_string": "a", "new_string": "b" }),
-                true,
-            ),
             ("read_file", serde_json::json!({ "path": "a.rs" }), false),
             (
                 "run_command",

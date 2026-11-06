@@ -1226,6 +1226,7 @@ pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOut
     // that looked at the goal and found nothing to do.
     if let Some(reason) = crate::squad::pge::types::iteration_budget_exhausted_reason(value)
         .or_else(|| crate::squad::pge::types::context_floor_reason(value))
+        .or_else(|| crate::squad::pge::types::no_checkout_progress_reason(value))
     {
         return PlannerOutput {
             summary: format!("Plan for: {goal}"),
@@ -1255,6 +1256,7 @@ fn parse_generator_output_as_written(value: &serde_json::Value) -> GeneratorOutp
     // every later branch would read it as a generator that returned nothing.
     if let Some(reason) = crate::squad::pge::types::iteration_budget_exhausted_reason(value)
         .or_else(|| crate::squad::pge::types::context_floor_reason(value))
+        .or_else(|| crate::squad::pge::types::no_checkout_progress_reason(value))
     {
         return GeneratorOutput {
             content: serde_json::Value::String(reason),
