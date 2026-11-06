@@ -506,13 +506,6 @@ pub const SOURCES_METRIC: &str = "cogneva_outward_sources_configured";
 
 const LABEL_SOURCE: &str = "source";
 
-/// 抓到了却没读成条目这一格的 `result` 值。
-///
-/// 它被写两次：`declare_source` 先把这条源的每一格落到 0，抓取那一拍再把这个数
-/// 加上去。两处各写一份字面量时，改了一处、漏了另一处的情形读起来正是这条源
-/// 「一条也没读成」——先落的 0 谁也加不上，读者看到的仍是 0。声明一次，两处都读它。
-const UNUSABLE_ITEMS_CELL: &str = "unusable";
-
 fn bump(map: &mut BTreeMap<String, BTreeMap<String, u64>>, source: &str, cell: &str, by: u64) {
     *map.entry(source.to_string())
         .or_default()
@@ -542,7 +535,7 @@ impl OutwardCensus {
             Handover::Handed.cell(),
             Handover::AlreadyHeld.cell(),
             Handover::Failed.cell(),
-            UNUSABLE_ITEMS_CELL,
+            "unusable",
         ] {
             bump(&mut state.items, source, cell, 0);
         }
@@ -809,7 +802,7 @@ pub fn spawn_outward_loop(
                             )
                             .await;
                         census
-                            .record_items(&source.name, UNUSABLE_ITEMS_CELL, tick.unusable as u64)
+                            .record_items(&source.name, "unusable", tick.unusable as u64)
                             .await;
                         for item in &tick.items {
                             let outcome = hand_over(&orchestrator, source, item).await;
