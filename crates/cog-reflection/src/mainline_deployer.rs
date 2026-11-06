@@ -6065,26 +6065,17 @@ impl MainlineDeployer {
             if keep.contains(&rev) {
                 continue;
             }
-            // 已经开跑的那一轮不在这里收。
+            // 在跑的也收，这是刻意的。
             //
-            // 收掉过期的行本身是对的，但它该收的是**还没开始**的排队行：退掉一行排队
-            // 是免费的，下一拍按新的 head 重开一张就是。已经开跑的那一行带着一次已经
-            // 付掉的代价。2026-11-06 20:34 实测：`-fix-r2` 的 planner/generator/
-            // evaluator 跑了十三分钟，主线上推进了一版，这一拍把它连同四个 agent 一起
-            // 收掉，交回来的结局是「没人答」——而它要修的那份红在新的 head 上原样还在
-            // （新 head 是同一批改动的下一版，不是修好它的那一版）。收掉之后下一轮从零
-            // 开始，同一份红重付一次十三分钟；而留下的代价是有界的：这一轮自己的墙钟界
-            // 就是它的尽头，到了那一刻它照样让出座位。
-            //
-            // 只放行 `Running`。`Scheduled` 还没进过任何一个专家的手，退掉没有任何损失。
-            if task.status == cog_core::TaskStatus::Running {
-                debug!(
-                    task_id = %task.id,
-                    rev = %rev12(rev),
-                    "left a running CI hold alone: it was already paying for this revision's red"
-                );
-                continue;
-            }
+            // 2026-11-06 20:34 的现场看起来正相反：`-fix-r2` 的四个专家跑了十三分钟，
+            // 这一拍把它连 agent 一起收掉，交回来的结局是「没人答」，下一轮从零开始。
+            // 但那一轮的代价不是这一句造成的，也不是这一句能救的——同一版连开十七轮、
+            // 每轮都死在同一句「没人答」上，根因在产出侧（agent 的 run 把手被错误路径
+            // 吃掉，见 `note_unanswered`），不在这里。反过来放过在跑的那一行会直接
+            // 撞上这一族的另一条实测：2026-11-05 18:2x，一行追着六小时前那一版在跑，
+            // 停线车道只有一个座位，当前 head 的红连队列都没进，消费组 idle 五十四
+            // 分钟。座位是唯一的，让给一行追着旧版本的不等于让它多跑一会儿，等于让
+            // 当前这一版的修复永远排不上。
             let still_live = keep.iter().map(|r| rev12(r)).collect::<Vec<_>>().join("/");
             let reason = format!(
                 "main has moved past {}: CI is judged per push, so making that revision green \
@@ -8371,11 +8362,6 @@ impl MainlineDeployer {
             // 重开一行——同一件事，换一个还在主线上、能拿这份失败去修的底座。留着的
             // 代价是停线车道只有一个座位（2026-11-05 18:2x 实测：一行追六小时前那
             // 一版，消费组 `idle` 五十四分钟，当前 head 的红连队列都没进）。
-            //
-            // 2026-11-06 20:34 起这条判据只管**还没开始**的行：已经在跑的那一轮不
-            // 退（见 [`Self::retire_ci_holds_except`]）。上面那次实测是一行排队行占着
-            // 座位，退掉它确实立刻腾出了位置；而收掉一个已经跑了十几分钟的行，是拿
-            // 一次可能的修复换一次确定的重来。
             if ended.outcome != "rev_no_longer_tracked" {
                 self.retire_ci_hold_rows(&held.rows, &ended).await;
                 // 这一次收的只是**它自己**开出去的那几行（`held.rows`）。更早几次
@@ -17454,100 +17440,6 @@ exit 0
                 .get(&live.id)
                 .is_some_and(|t| !t.status.is_terminal()),
             "这一拍还在办的那一行不许被收"
-        );
-    }
-
-    /// 追着过时版本、但**已经在跑**的那一行不退。
-    ///
-    /// 上一条说的是「退掉排队行是免费的」，这一条说的是它的反面：一行已经开跑，
-    /// 退掉它换来的不是座位，而是把一次可能的修复换成一次确定的重来。2026-11-06
-    /// 20:34 实测：`-fix-r2` 的四个专家跑了十三分钟，主线上推进了一版（同一批改动
-    /// 的下一版，不是修好它的那一版），这一拍把它连同 agent 一起收掉，交回来的结局
-    /// 是「没人答」，下一轮从零开始，同一份红重付一次十三分钟。
-    ///
-    /// 留下的代价是有界的：这一轮自己的墙钟界就是它的尽头，到那一刻它照样让座。
-    /// 排队行在同一拍里照收——它没进过任何一个专家的手，退掉是纯收益。
-    #[tokio::test]
-    async fn a_tick_leaves_a_running_hold_alone_while_it_retires_a_queued_one() {
-        let _env = ENV_LOCK.lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
-        let bin_dir = root.join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let buildah = fake_buildah(&bin_dir, "");
-        let deployed = main_image("localhost:30500", &rev_b);
-        let kubectl = fake_kubectl(&bin_dir, &deployed);
-        let (endpoint, _seen) = fake_ci_by_rev(|_line| {
-            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#)
-        })
-        .await;
-        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
-        cfg.upstreams = vec![crate::config::UpstreamTrackConfig {
-            platform: crate::config::CodePlatform::Github,
-            repo: "owner/repo".into(),
-            api_base: Some(format!("http://{endpoint}/github")),
-        }];
-        let planner = std::sync::Arc::new(RecordingPlanner::default());
-        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare))
-            .with_orchestrator(planner.clone());
-
-        let live = cog_core::Task::new(
-            "ci-red-live-2026-11-06-fix",
-            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.into()),
-            serde_json::json!({ "goal": "make CI green", "rev": rev_b }),
-        );
-        let mut working = cog_core::Task::new(
-            "ci-red-working-2026-11-06-fix-r2",
-            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.into()),
-            serde_json::json!({ "goal": "make CI green", "rev": rev_a }),
-        );
-        working.begin_run(
-            "unit-1",
-            chrono::Duration::seconds(600),
-            Utc::now() - chrono::Duration::minutes(13),
-        );
-        let queued = cog_core::Task::new(
-            "ci-red-queued-2026-11-05-fix",
-            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.into()),
-            serde_json::json!({ "goal": "make CI green", "rev": rev_a }),
-        );
-        for row in [&live, &working, &queued] {
-            planner
-                .graph
-                .lock()
-                .unwrap()
-                .insert(row.id.clone(), row.clone());
-        }
-        let now = Utc::now().timestamp();
-        let mut state = deployer.load_state();
-        state.ci_hold = Some(CiHold {
-            rev: rev_b.clone(),
-            since_unix: now - 600,
-            opened_rev: rev_b.clone(),
-            opened_unix: now - 600,
-            failed_checks: vec!["github:Test".into()],
-            rows: vec![live.id.clone()],
-        });
-        state.ci_hold_run_since_unix = Some(now - 600);
-        deployer.save_state(&state).unwrap();
-
-        let _ = deployer.poll_once().await;
-
-        let cancelled: Vec<String> = planner.cancels().iter().map(|(id, _)| id.clone()).collect();
-        assert_eq!(
-            cancelled,
-            vec![queued.id.clone()],
-            "排队的那一行要收，已经在跑的那一行要留：{cancelled:?}"
-        );
-        assert!(
-            planner
-                .graph
-                .lock()
-                .unwrap()
-                .get(&working.id)
-                .is_some_and(|t| !t.status.is_terminal()),
-            "跑了十三分钟的那一轮被这一拍收掉了——下一轮从零开始，同一份红重付一次"
         );
     }
 
@@ -30849,8 +30741,19 @@ exit 0
             // the two sides cannot drift into "nothing is pinned and nobody
             // noticed".
             let needle = format!("{repo}:");
+            // The builder leaves two kinds of document off the pin, so this walk
+            // has to take the same two off — under the same two predicates, not
+            // under a second copy of their meaning. 2026-11-06: the durable-state
+            // exemption landed in `build_rollout_bundle` and this check kept
+            // walking redis, so every rev from that commit on was red on Test and
+            // Code Coverage and the deployer held at the last rev before it. The
+            // gate was right about what it asserted and wrong about what the
+            // builder does; two files reading one rule is exactly how that
+            // happens.
+            let floating = format!("{repo}:{LOCAL_TAG}");
             let mut delivered: Vec<(String, String)> = Vec::new();
             let mut left_floating = 0usize;
+            let mut left_on_local = 0usize;
             for doc in serde_yaml::Deserializer::from_str(&bundle.support_yaml) {
                 let Ok(v) = serde_yaml::Value::deserialize(doc) else {
                     continue;
@@ -30860,6 +30763,28 @@ exit 0
                 };
                 if serves_the_delivered_images(&v) {
                     left_floating += text.matches(&needle).count();
+                    continue;
+                }
+                // The durable store this rollout restarts would lose its runtime,
+                // so the builder keeps it on `:local` — a build that already
+                // converged here rather than the one being rolled. That is a
+                // pin of a different kind, not a drifted reference, so what this
+                // side asserts about it is that it is exactly that tag: any other
+                // reference left on this workload would still never move.
+                if keeps_durable_state(&v) {
+                    for (i, _) in text.match_indices(&needle) {
+                        assert!(
+                            text[i..].starts_with(&floating),
+                            "{profile}: {dir}/support.yaml — the workload that owns durable \
+                             state carries a reference that is neither this rollout's image \
+                             nor the floating tag the builder leaves it on: {}",
+                            text[i..]
+                                .chars()
+                                .take(needle.len() + 24)
+                                .collect::<String>()
+                        );
+                    }
+                    left_on_local += text.matches(&floating).count();
                     continue;
                 }
                 delivered.push(("support.yaml".to_string(), text));
@@ -30896,6 +30821,14 @@ exit 0
                 "{profile}: {dir} — the workload serving the delivered images carries no \
                  reference this rollout would pin, so the exemption is reading the wrong \
                  workload and the walk above is checking the wrong one"
+            );
+            // Same shape for the second exemption: if the durable-state workload
+            // stopped carrying a floating reference, this walk would be skipping a
+            // document it should have checked, and would go on passing.
+            assert!(
+                left_on_local > 0,
+                "{profile}: {dir} — no workload owning durable state kept the floating tag, \
+                 so this check is exempting a document the builder pins, or reading none"
             );
             checked.push((profile, dir));
         }
