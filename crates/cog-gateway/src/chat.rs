@@ -99,9 +99,32 @@ async fn pump_events(
     // 接起来——猜「是不是 dispatch_goal」只能看返回里有没有 goal_id，而别的工具也
     // 可以回一个目标号，那时界面会多出一条它并不负责的目标帧。
     let mut in_flight: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // 这一轮是谁在说，说过没有。名字从事件自己身上取：网关不重算一遍，两份
+    // 名字算法迟早会有一个字母不一样，而那时界面按名字认人，认不出来也不报错。
+    let mut told: Option<String> = None;
     while let Some(event) = events.recv().await {
         // 没有订阅者时 send 会失败，这不是错：连接先走了，帧没有人要。
         let _ = bus.send(event.clone());
+        // 界面靠这一帧把执行者的工具调用归到这段对话下面：工具帧只带 `agent_id`，
+        // 没有这一帧，这段对话自己的执行过程一条也接不回来，屏幕上就只剩一问一答。
+        let speaker = match &event {
+            AgentEvent::MessageUpdate { agent_id, .. }
+            | AgentEvent::ToolExecutionStart { agent_id, .. }
+            | AgentEvent::ToolExecutionEnd { agent_id, .. } => Some(agent_id.as_str()),
+            _ => None,
+        };
+        if let Some(agent_id) = speaker {
+            if told.as_deref() != Some(agent_id) {
+                told = Some(agent_id.to_string());
+                emit(
+                    &out,
+                    &session_id,
+                    "agent.identity",
+                    serde_json::json!({ "message_id": message_id, "agent_id": agent_id }),
+                )
+                .await;
+            }
+        }
         match event {
             AgentEvent::MessageUpdate {
                 assistant_event, ..
@@ -614,10 +637,66 @@ mod tests {
             lines.push(line);
         }
         let joined = lines.join("\n");
-        assert_eq!(lines.len(), 3, "三段文字就是三帧：{joined}");
-        assert!(lines[0].contains("先说一句"), "{joined}");
-        assert!(lines[1].contains("\\n\\n"), "两轮之间没有隔行：{joined}");
-        assert!(lines[2].contains("再说一句"), "{joined}");
+        // 三段文字是三帧，前面还有一帧说明这一轮是谁在说。
+        assert_eq!(lines.len(), 4, "一段话三帧，加上身份那一帧：{joined}");
+        assert!(lines[0].contains("agent.identity"), "{joined}");
+        assert!(lines[1].contains("先说一句"), "{joined}");
+        assert!(lines[2].contains("\\n\\n"), "两轮之间没有隔行：{joined}");
+        assert!(lines[3].contains("再说一句"), "{joined}");
+    }
+
+    /// 这一轮是谁，要单独走一帧，而且一轮只说一次。
+    ///
+    /// 工具帧只带 `agent_id`，界面拿它去归到哪段对话下面，靠的就是这一帧。少了
+    /// 它，这段对话自己的执行过程一条也接不回来，屏幕上只剩一问一答——2026-11-06
+    /// 属主对着员工界面提的就是这件事。名字从事件身上取，网关不另算一遍。
+    #[tokio::test]
+    async fn a_turn_says_who_is_speaking_in_one_frame_of_its_own() {
+        use cog_core::{AgentEvent, AssistantMessageEvent};
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(32);
+        let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
+        let pump = tokio::spawn(pump_events(
+            events_rx,
+            out_tx,
+            bus,
+            "s1".into(),
+            "m-1".into(),
+        ));
+
+        for _ in 0..2 {
+            events_tx
+                .send(AgentEvent::MessageUpdate {
+                    agent_id: "kai-a9ab11fc".into(),
+                    assistant_event: AssistantMessageEvent::Start {
+                        timestamp: chrono::Utc::now(),
+                    },
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(events_tx);
+        let _ = pump.await;
+
+        let mut identity = Vec::new();
+        while let Some(line) = out_rx.recv().await {
+            let value: serde_json::Value = serde_json::from_str(&line).expect("frame is JSON");
+            if value["payload"]["type"] == "agent.identity" {
+                identity.push(value);
+            }
+        }
+        assert_eq!(
+            identity.len(),
+            1,
+            "同一个人一轮里只报一次，重复报就是重复的条目"
+        );
+        assert_eq!(
+            identity[0]["payload"]["payload"]["agent_id"],
+            "kai-a9ab11fc"
+        );
+        assert_eq!(identity[0]["payload"]["payload"]["message_id"], "m-1");
+        assert_eq!(identity[0]["session_id"], "s1");
     }
 
     /// 同一帧也落在界面的总线上。
@@ -731,9 +810,11 @@ mod tests {
         while let Some(line) = out_rx.recv().await {
             frames.push(line);
         }
-        assert_eq!(frames.len(), 2, "{frames:?}");
-        assert!(frames[0].contains("message.goal") && frames[0].contains("goal-1"));
-        assert!(frames[1].contains("goal-2"));
+        // 身份那一帧 + 两个不同的目标各一帧（goal-1 重复，不报第二遍）。
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert!(frames[0].contains("agent.identity"), "{frames:?}");
+        assert!(frames[1].contains("message.goal") && frames[1].contains("goal-1"));
+        assert!(frames[2].contains("goal-2"));
     }
 
     /// 历史从记录里来，不从这个进程的内存里来。

@@ -166,6 +166,9 @@ pub struct PlatformConversation {
     /// 收件箱。与名册是两半：只有名册没有收件箱，消息投进一个没人读的流；只有
     /// 收件箱没有名册，同事根本发现不了这个地址。缺哪一半都由进程如实缺席。
     inbox: Option<Arc<dyn cog_core::MessageBackend>>,
+    /// 「说过话的人」名册。注册表在他闭嘴几十秒后就把他摘掉，而人要找的是
+    /// 「那个跟我聊过的人还在不在」——这条记录不过期，所以它和心跳不是一件事。
+    people: Option<Arc<dyn cog_core::KeyValueStore>>,
     /// 三本只读账。读它们回答的是「这件事现在到哪一步了」——答案来自账，不是
     /// 来自印象，也不是从某面墙上抄下来的一段话。
     ledgers: Ledgers,
@@ -179,6 +182,7 @@ impl PlatformConversation {
         tools: Option<Arc<cog_agent::ToolRegistry>>,
         roster: Option<Arc<dyn cog_core::AgentRegistry>>,
         inbox: Option<Arc<dyn cog_core::MessageBackend>>,
+        people: Option<Arc<dyn cog_core::KeyValueStore>>,
         ledgers: Ledgers,
     ) -> Self {
         Self {
@@ -188,9 +192,42 @@ impl PlatformConversation {
             tools,
             roster,
             inbox,
+            people,
             ledgers,
         }
     }
+}
+
+/// 把这一位说过话的员工记进名册。
+///
+/// 第一次写下 `first_seen`，之后每一轮只推进 `last_seen`：把第一次见过的时刻
+/// 每轮重写成现在，「这个人来了多久」就永远读成「刚刚」。先读再写是有意的——
+/// 这一格只在人第一次说话时写一次，丢一次并发只会让两个时间都落在同一轮附近，
+/// 而读失败时退回「现在」不会让谁少一行。
+pub(crate) async fn note_person(
+    kv: &dyn cog_core::KeyValueStore,
+    employee: &cog_agent::identity::AgentName,
+    session_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> cog_core::SFResult<()> {
+    let first_seen = match kv
+        .hget(cog_gateway::agents::PEOPLE_KEY, &employee.id)
+        .await?
+    {
+        Some(text) => serde_json::from_str::<cog_gateway::agents::PersonRow>(&text)
+            .map(|row| row.first_seen)
+            .unwrap_or(now),
+        None => now,
+    };
+    let row = cog_gateway::agents::PersonRow {
+        session_id: session_id.to_string(),
+        display_name: employee.handle.clone(),
+        first_seen,
+        last_seen: now,
+    };
+    let text = serde_json::to_string(&row)?;
+    kv.hset(cog_gateway::agents::PEOPLE_KEY, &employee.id, &text)
+        .await
 }
 
 impl ConversationTurn for PlatformConversation {
@@ -202,6 +239,21 @@ impl ConversationTurn for PlatformConversation {
         Box::pin(async move {
             // 这一段对话是谁：名字由会话推出，跨轮不变。派活与记账都按这个名字。
             let employee = employee_for(&request.session_id);
+            // 先把他记进「说过话的人」名册：注册表上的心跳在他闭嘴几十秒后就
+            // 过期，而人要找的是「那个跟我聊过的人」。写不进去不是这一轮的
+            // 失败——他照样能说话，只是名单上从此少一个人；这一句是那个差别的
+            // 唯一读数。
+            if let Some(kv) = self.people.as_ref() {
+                if let Err(e) =
+                    note_person(&**kv, &employee, &request.session_id, chrono::Utc::now()).await
+                {
+                    tracing::warn!(
+                        agent_id = %employee.id,
+                        error = %e,
+                        "这位员工没有记进名册：他在名单上不会出现"
+                    );
+                }
+            }
             let config = RuntimeConfig {
                 agent_id: employee.id.clone(),
                 // 没有角色：这一段对话就是这位员工本人。role 取它的 id，内核因此
@@ -1743,5 +1795,114 @@ mod tests {
         assert!(admission_refusal(None, "someone", "把首页的颜色改一下")
             .await
             .is_none());
+    }
+
+    /// 只用到 hash 的键值面：这条路径问别的，就落到 `unreachable!` 上。
+    #[derive(Default)]
+    struct FakePeople {
+        fields: std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
+    }
+
+    impl FakePeople {
+        fn stored(&self, field: &str) -> String {
+            self.fields
+                .lock()
+                .unwrap()
+                .get(&(
+                    cog_gateway::agents::PEOPLE_KEY.to_string(),
+                    field.to_string(),
+                ))
+                .cloned()
+                .expect("这一位没有写进名册")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::KeyValueStore for FakePeople {
+        async fn get(&self, _k: &str) -> SFResult<Option<String>> {
+            unreachable!("名册是一张 hash")
+        }
+        async fn set(&self, _k: &str, _v: &str) -> SFResult<()> {
+            unreachable!("名册是一张 hash")
+        }
+        async fn set_ex(&self, _k: &str, _v: &str, _t: u64) -> SFResult<()> {
+            unreachable!("名册不过期")
+        }
+        async fn del(&self, _k: &str) -> SFResult<()> {
+            unreachable!("这条路径不删名册")
+        }
+        async fn expire(&self, _k: &str, _t: i64) -> SFResult<()> {
+            unreachable!("名册不过期")
+        }
+        async fn ttl(&self, _k: &str) -> SFResult<i64> {
+            unreachable!("名册不过期")
+        }
+        async fn incr(&self, _k: &str, _b: i64) -> SFResult<i64> {
+            unreachable!("名册不计数")
+        }
+        async fn decr(&self, _k: &str, _b: i64) -> SFResult<i64> {
+            unreachable!("名册不计数")
+        }
+        async fn incr_ex(&self, _k: &str, _b: i64, _t: u64) -> SFResult<i64> {
+            unreachable!("名册不计数")
+        }
+        async fn sadd(&self, _k: &str, _m: &str) -> SFResult<()> {
+            unreachable!("名册是一张 hash")
+        }
+        async fn srem(&self, _k: &str, _m: &str) -> SFResult<()> {
+            unreachable!("名册是一张 hash")
+        }
+        async fn smembers(&self, _k: &str) -> SFResult<Vec<String>> {
+            unreachable!("名册是一张 hash")
+        }
+        async fn hset(&self, key: &str, field: &str, value: &str) -> SFResult<()> {
+            self.fields
+                .lock()
+                .unwrap()
+                .insert((key.to_string(), field.to_string()), value.to_string());
+            Ok(())
+        }
+        async fn hget(&self, key: &str, field: &str) -> SFResult<Option<String>> {
+            Ok(self
+                .fields
+                .lock()
+                .unwrap()
+                .get(&(key.to_string(), field.to_string()))
+                .cloned())
+        }
+        async fn hdel(&self, _k: &str, _f: &str) -> SFResult<()> {
+            unreachable!("这条路径不删名册")
+        }
+        async fn hvals(&self, _k: &str) -> SFResult<Vec<String>> {
+            unreachable!("名册按字段读")
+        }
+        async fn hgetall(&self, _k: &str) -> SFResult<Vec<(String, String)>> {
+            unreachable!("名册按字段读")
+        }
+        async fn hlen(&self, _k: &str) -> SFResult<u64> {
+            unreachable!("名册按字段读")
+        }
+    }
+
+    /// 说过话的人要留在名册上，而且「第一次见」不能被后面的每一轮改写成现在。
+    ///
+    /// 每一轮都写 `first_seen = now`，这个名字下的「他来了多久」就永远读成刚刚；
+    /// 只写第一次而不推进 `last_seen`，名单上的人就永远排在最后。
+    #[tokio::test]
+    async fn a_turn_records_the_person_without_moving_his_first_sighting() {
+        let kv = FakePeople::default();
+        let employee = employee_named(Some("inst-7f3a"), "conv-1");
+        let first = chrono::Utc::now() - chrono::TimeDelta::hours(2);
+
+        note_person(&kv, &employee, "conv-1", first).await.unwrap();
+        let later = first + chrono::TimeDelta::minutes(5);
+        note_person(&kv, &employee, "conv-1", later).await.unwrap();
+
+        let row: cog_gateway::agents::PersonRow =
+            serde_json::from_str(&kv.stored(&employee.id)).expect("名册那一行要读得回来");
+        assert_eq!(row.first_seen, first);
+        assert_eq!(row.last_seen, later);
+        assert_eq!(row.session_id, "conv-1");
+        assert_eq!(row.display_name, employee.handle);
     }
 }

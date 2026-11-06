@@ -111,6 +111,10 @@ export function AgentsView() {
     () => rosterWithFrames(agents, liveRows),
     [agents, liveRows]
   );
+  // 名单现在装两种人：心跳上活着的，和说过话、名字在名册上但此刻不在线的。
+  // 合成一个「在岗」数，读者分不出「没人干活」和「人都下线了」。
+  const liveCount = agents.filter((agent) => agent.live !== false).length;
+  const restCount = agents.length - liveCount;
   const roles = new Map<string, number>();
   for (const agent of agents) {
     roles.set(agent.role, (roles.get(agent.role) ?? 0) + 1);
@@ -138,7 +142,7 @@ export function AgentsView() {
   return (
     <ViewFrame
       title="智能体"
-      meta={`${agents.length} 个在岗 · ${roles.size} 种角色 · ${fromFrame} 条有比这次轮询更新的帧 · 快照按 15 秒重读`}
+      meta={`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''} · ${roles.size} 种角色 · ${fromFrame} 条有比这次轮询更新的帧 · 快照按 15 秒重读`}
       actions={<Button onClick={refresh}>重读</Button>}
     >
       {error ? (
@@ -146,10 +150,10 @@ export function AgentsView() {
       ) : !data && loading ? (
         <Loading what="在岗名单" />
       ) : agents.length === 0 ? (
-        <Empty>当前没有在岗的智能体。心跳过期的注册不会出现在这里。</Empty>
+        <Empty>当前没有在岗的智能体，也没有说过话的人。可对话的员工在说完话几十秒后会离开心跳，但仍留在名册上。</Empty>
       ) : (
         <>
-          <Readings from={resources} source="GET /api/v1/agents 按角色数这一页" caveat="数的是这次读回来的名单，心跳过期的注册不在里面。状态一列不是这份快照给的，是总线上的帧折出来的。">
+          <Readings from={resources} source="GET /api/v1/agents 按角色数这一页" caveat="数的是这次读回来的名单：在岗的是心跳，休息中的是说过话、名字在名册上但此刻不在线的人。状态一列不是这份快照给的，是总线上的帧折出来的。">
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
             <Reading label="在岗" value={agents.length} />
             <Reading label="角色" value={roles.size} />

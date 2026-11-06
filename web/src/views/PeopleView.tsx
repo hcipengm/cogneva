@@ -1,8 +1,15 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useAgentConversation } from '@/hooks/useAgentConversation';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
-import { hireEmployee, type AgentConversationLine } from '@/api/client';
+import {
+  getSessionMessages,
+  hireEmployee,
+  type AgentConversationLine,
+  type ChatTranscriptLine,
+} from '@/api/client';
+import { useChatStore } from '@/store/chatStore';
+import { useShell } from '@/shell/store';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { useStreamStore, type Message as StreamedMessage, type ToolCallRecord } from '@/store/streamStore';
 import { Button, Empty, Loading, ReadError, ViewFrame } from '@/ui/primitives';
@@ -156,6 +163,88 @@ function Line({ line, showReply }: { line: AgentConversationLine; showReply: boo
   );
 }
 
+/**
+ * 一位「说过话的人」：他的名字属于一段对话，不是一段收件箱往来。
+ *
+ * 这样的人没有常驻进程——他只在有人说话的那一段时间里活着。要接着跟他聊，
+ * 唯一的路是把那段会话放回工作台：名字由会话 id 算出来，换个 id 就是换一个人，
+ * 而他之前说过的每一句都记在那个 id 下面。
+ *
+ * 这一格读的是会话历史（`chat_turns`），不是收件箱：往收件箱投一句话给一个
+ * 不读收件箱的人，看不出任何回音。
+ */
+function ChatPersonPane({ sessionId, name }: { sessionId: string; name: string }) {
+  const [lines, setLines] = useState<ChatTranscriptLine[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [tick, setTick] = useState(0);
+  const openSession = useChatStore((s) => s.openSession);
+  const setActivity = useShell((s) => s.setActivity);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    getSessionMessages(sessionId)
+      .then((items) => {
+        if (!alive) return;
+        setLines(items);
+        setError(null);
+      })
+      .catch((e) => {
+        if (alive) setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [sessionId, tick]);
+
+  return (
+    <section className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
+        <span>
+          {`与 ${name} 的对话（会话 ${sessionId}）`}
+          {loading && ' · 读取中…'}
+        </span>
+        <Button
+          tone="accent"
+          onClick={() => {
+            openSession(sessionId);
+            setActivity('workspace');
+          }}
+        >
+          在工作台接着聊
+        </Button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+        {error && <ReadError what="这段对话" error={error} onRetry={() => setTick((n) => n + 1)} />}
+        {!error && !loading && lines.length === 0 && (
+          <Empty>这段对话还没有说过话。</Empty>
+        )}
+        {lines.map((line) => (
+          <div key={line.id} className="mb-2 border-b border-[var(--line)]/40 pb-2">
+            <div className="mb-1 flex items-baseline gap-2 text-[10px] text-[var(--muted)]">
+              <span>{line.role === 'user' ? '我' : name}</span>
+              <span>{stamp(line.created_at)}</span>
+            </div>
+            <div className="whitespace-pre-wrap text-[12px] text-[var(--paper)]">{line.content}</div>
+            {line.failure && (
+              <div className="mt-1 text-[11px]" style={{ color: 'var(--warn)' }}>
+                {line.failure}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
+        这个人只在说话的那一段时间里活着，名下没有常驻进程；能接着跟他聊，是因为名字由会话 id 算出来。
+      </p>
+    </section>
+  );
+}
+
 export function PeopleView() {
   const {
     agents,
@@ -241,6 +330,11 @@ export function PeopleView() {
   }, [lines, calls, said]);
 
   const chosen = agents.find((a) => a.agent_id === selected) ?? null;
+  // 「在岗」是心跳那一刻，不是名字存不存在：说过话的人闭嘴几十秒后仍然在名单
+  // 上，但读成「在岗」会让下一步（我能不能马上叫到他）答错。老服务端不带这一
+  // 位，那时按在岗算——名单上原本就只有心跳。
+  const liveCount = agents.filter((agent) => agent.live !== false).length;
+  const restCount = agents.length - liveCount;
 
   const submit = async () => {
     const text = draft;
@@ -264,7 +358,7 @@ export function PeopleView() {
   return (
     <ViewFrame
       title="员工"
-      meta={`${agents.length} 个在岗 · 每人一个对话框 · 名单按 15 秒重读`}
+      meta={`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''} · 每人一个对话框 · 名单按 15 秒重读`}
       actions={
         <>
           <Button onClick={hire} disabled={hiring} tone="accent">
@@ -310,7 +404,14 @@ export function PeopleView() {
                 >
                   <div className="flex items-baseline justify-between gap-2">
                     <span className="text-[12px]">{agent.display_name}</span>
-                    {live?.state ? (
+                    {agent.live === false ? (
+                      <Note
+                        className="text-[10px]"
+                        text="这个人只在说话的那一段时间里活着；不在岗时名册上仍然有他，接着聊会回到同一段会话"
+                      >
+                        休息中
+                      </Note>
+                    ) : live?.state ? (
                       <Note
                         className="mono text-[10px]"
                         text={`这一格来自 ${live.stateFrame} 帧（${live.stateAt}），不是这次轮询`}
@@ -328,6 +429,9 @@ export function PeopleView() {
             })}
           </aside>
 
+          {chosen?.session_id ? (
+            <ChatPersonPane sessionId={chosen.session_id} name={chosen.display_name} />
+          ) : (
           <section className="flex min-h-0 flex-1 flex-col">
             <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
               <span>
@@ -374,6 +478,7 @@ export function PeopleView() {
               不用刷新——这一面读的是会话，不是一次请求的结果。
             </p>
           </section>
+          )}
         </div>
       )}
     </ViewFrame>

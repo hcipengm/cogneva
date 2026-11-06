@@ -291,13 +291,28 @@ export function ConversationPane({
   const tools = useMemo(() => {
     const goals = session?.goals ?? [];
     const collected: ToolCallRecord[] = [];
+    // 这一段自己的员工做的事，先接回来。
+    //
+    // 下面那一支认的是「这道活派给过谁」，只覆盖交出去以后由执行者接着干的部分。
+    // 而一段对话在自己手里的时候（还没交出任何目标，或者这一问本来就是一句话的
+    // 活）它是自己在调工具的——那些帧带着它的 `agent_id` 落在同一条总线上，却
+    // 一条都没有进过这一面：屏幕上只有一问一答，看起来像它一个工具都没用。
+    // 身份由服务端的 `agent.identity` 帧带进来，前端算不出这个 id（名字里带进程
+    // 指纹），所以没有那一帧时这里什么也接不回来，而不是接错。
+    const own = session?.agentId;
+    if (own) {
+      for (const call of toolCalls) {
+        if (call.agent !== own) continue;
+        if (!collected.some((seen) => seen.id === call.id)) collected.push(call);
+      }
+    }
     for (const goal of goals) {
       for (const call of callsForGoal(toolCalls, goalLive?.[goal.id], goal.at)) {
         if (!collected.some((seen) => seen.id === call.id)) collected.push(call);
       }
     }
     return collected.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
-  }, [goalLive, session?.goals, toolCalls]);
+  }, [goalLive, session?.agentId, session?.goals, toolCalls]);
   /**
    * 这道目标名下的执行者自己说的话。
    *
@@ -412,6 +427,19 @@ export function ConversationPane({
         <span className="mono shrink-0 text-[12px] font-medium" style={{ color: 'var(--brass)' }}>
           {name}
         </span>
+        {/*
+          「Ada」是这一面的叫法，员工名册上那个人叫的是另一个名字（由会话 id 折
+          出来）。两个名字之间没有一行字连起来，读的人会以为是两个人——把总线上的
+          那个名字写在这里，名册上按它找得到同一段对话。
+        */}
+        {session.agentId && (
+          <Note
+            className="mono max-w-[42%] shrink-0 truncate text-[10px] text-[var(--muted)]"
+            text={`这一段对话在总线上叫 ${session.agentId}；员工名册上按这个名字找得到同一个人`}
+          >
+            {session.agentId}
+          </Note>
+        )}
         <Note as="h2" className="truncate text-[12px] text-[var(--paper-dim)]" text={session.id}>
           {session.title}
         </Note>

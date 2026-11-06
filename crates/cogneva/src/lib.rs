@@ -240,6 +240,9 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 缺哪一半都由进程如实缺席，这里不替它编一个内存实现。
             let roster = ctx.consume_service::<dyn cog_core::AgentRegistry>();
             let inbox = ctx.consume_service::<dyn cog_core::MessageBackend>();
+            // 说过话的人另外记一份：注册表是心跳，人下线几十秒就被摘掉，而
+            // 「我跟谁说过话」要活得比心跳久。同一份键值面，另一个键。
+            let people = ctx.consume_service::<dyn cog_core::KeyValueStore>();
             // 三本只读账。它们由各自的插件发布，缺哪一本都由进程如实缺席——这里
             // 不拿一份内存账顶上：进程自己的账读起来像平台的账，而它只记得这个
             // 进程见过的那几条。
@@ -263,6 +266,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     tools,
                     roster,
                     inbox,
+                    people,
                     ledgers,
                 )))
                 .is_err()

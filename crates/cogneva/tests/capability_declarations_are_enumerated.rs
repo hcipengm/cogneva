@@ -66,6 +66,17 @@ const KNOWN: &[(&str, usize, &str)] = &[
          it describes, not to the server returning it",
     ),
     (
+        "crates/cog-gateway/src/agents.rs",
+        1,
+        "a roster entry, not an advertisement, and for the same reason the \
+         `list_agents` echo above is one: the row is built for a person who \
+         only exists while talking, and the registry never held a capability \
+         list for him -- there is nothing to echo, so the field is the empty \
+         list the interface reads as 'claimed nothing'. Building it from a \
+         serving table would invent a claim about a process that does not \
+         exist. What the entries are, not what this tree can be asked to do",
+    ),
+    (
         "crates/cog-gateway/src/a2a.rs",
         2,
         "two server replies, one per version served (the 0.3 card and the 1.0 \

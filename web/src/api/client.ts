@@ -1077,6 +1077,16 @@ export interface AgentSummary {
   pod_ip: string;
   capabilities: string[];
   last_heartbeat: string;
+  /**
+   * 此刻在心跳上。`false` 是「说过话、现在不在岗」——界面上的对话员工闭嘴
+   * 几十秒后就是这样，人还在名册上，只是不在线。
+   */
+  live?: boolean;
+  /**
+   * 这个人那段对话的会话 id。只有「说过话的人」有；接着聊要按它投回同一个人，
+   * 没有它这个人就只剩一个点进去什么也没有的名字。
+   */
+  session_id?: string | null;
 }
 
 export async function listAgents(): Promise<AgentSummary[]> {

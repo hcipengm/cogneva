@@ -212,6 +212,53 @@ pub const ROSTER_KEEPER_LOOP: &str = "gateway_roster_keeper";
 // cap: bound — 名册维护的节拍；它盯的变化只在进程重启或员工被收走时发生，不是量出来的
 pub const ROSTER_KEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 「说过话的人」名册：名下没有常驻进程、只在说话那一小段时间里活着的员工。
+///
+/// 界面上的每一段对话就是这样一个人：名字由会话推出来，说话的那几分钟它挂在
+/// 注册表上，说完就注销。注册表回答的是「此刻叫得到谁」，而人要看的是「我跟
+/// 谁说过话、以后还找不找得到他」——这两个问题不一样，注册表上的 TTL 一过，
+/// 后者就读成「这个人从来没存在过」。
+///
+/// 所以另记一份不过期的名册。用一张 hash：读面一次读出全部，键空间没有遍历。
+pub const PEOPLE_KEY: &str = "cogneva:people";
+
+/// 说过话的一位员工。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonRow {
+    /// 这段对话的会话 id。名字由它算出来，接着聊也要按它投回同一个人；
+    /// 丢了这一格，名单上这个人就只剩一个念不回去的名字。
+    pub session_id: String,
+    /// 名册给这个人算出的名字（`Kai#a9ab11fc`）。写入时算一次：读面不该再
+    /// 持有一份名字算法，两份算法迟早会有一个字母不一样。
+    pub display_name: String,
+    pub first_seen: chrono::DateTime<chrono::Utc>,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+}
+
+/// 一次读「说过话的人」的结果。解析不了的行跳过并计数，不按位置猜它是谁。
+pub async fn read_people(kv: &Arc<dyn cog_core::KeyValueStore>) -> Vec<(String, PersonRow)> {
+    let pairs = match kv.hgetall(PEOPLE_KEY).await {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            tracing::warn!(error = %e, "the people roster could not be read");
+            return Vec::new();
+        }
+    };
+    let mut rows = Vec::new();
+    for (agent_id, text) in pairs {
+        match serde_json::from_str::<PersonRow>(&text) {
+            Ok(row) => rows.push((agent_id, row)),
+            Err(e) => tracing::warn!(
+                agent_id = %agent_id,
+                error = %e,
+                "a people row does not parse; skipping it rather than guessing who it was"
+            ),
+        }
+    }
+    rows.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+    rows
+}
+
 /// 名册上的一行。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RosterRow {
@@ -1565,6 +1612,73 @@ fn roster_split(regs: &[cog_core::AgentRegistration]) -> (usize, usize) {
     (regs.len() - squads, squads)
 }
 
+/// 名单：心跳上此刻活着的人，加上说过话但已经下线的人。
+///
+/// 同一个人两处都有时只印一行——注册表那一行回答「此刻在不在」，名册那一行
+/// 回答「这个人存不存在」。印成两行会让读的人以为撞了名，而其中一个点进去
+/// 什么也没有。
+///
+/// `live` 是这次合并唯一的判断位：有它是此刻叫得到，没有是这个人说过话、现在
+/// 不在岗。界面据此决定这一格是「在岗」还是「休息中」，以及能不能用对话那条路
+/// 接着聊（只有说过话的人带着 `session_id`）。
+fn roster_with_people(
+    regs: &[cog_core::AgentRegistration],
+    people: Vec<(String, PersonRow)>,
+) -> Vec<serde_json::Value> {
+    let mut views: Vec<serde_json::Value> = regs
+        .iter()
+        .map(|reg| {
+            let mut view = agent_view(reg);
+            if let Some(obj) = view.as_object_mut() {
+                obj.insert("live".to_string(), serde_json::json!(true));
+            }
+            view
+        })
+        .collect();
+    let by_id: std::collections::HashMap<String, PersonRow> = people.into_iter().collect();
+    // 在岗的人也要带上他的会话 id：此刻他正说着话，界面要给的是「接着这一段
+    // 聊」，而不是等他一闭嘴才给。反过来，注册表里的名字更接近此刻，保留它。
+    for view in views.iter_mut() {
+        let Some(agent_id) = view
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(row) = by_id.get(&agent_id) else {
+            continue;
+        };
+        if let Some(obj) = view.as_object_mut() {
+            obj.insert("session_id".to_string(), serde_json::json!(row.session_id));
+        }
+    }
+    let live_ids: std::collections::HashSet<&str> =
+        regs.iter().map(|reg| reg.agent_id.as_str()).collect();
+    // 最近说过话的排在前面：名单是一次扫读，先出现的人该是此刻最可能要找的。
+    let mut idle: Vec<(String, PersonRow)> = by_id
+        .into_iter()
+        .filter(|(agent_id, _)| !live_ids.contains(agent_id.as_str()))
+        .collect();
+    idle.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+    for (agent_id, row) in idle {
+        views.push(serde_json::json!({
+            "agent_id": agent_id,
+            "display_name": row.display_name,
+            "role": "chat",
+            "workspace_id": "default",
+            "capabilities": Vec::<String>::new(),
+            "hostname": String::new(),
+            "pod_ip": String::new(),
+            "registered_at": row.first_seen,
+            "last_heartbeat": row.last_seen,
+            "live": false,
+            "session_id": row.session_id,
+        }));
+    }
+    views
+}
+
 pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
     let Some(registry) = state.agent_registry.as_ref() else {
         return (
@@ -1575,15 +1689,25 @@ pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
     };
     match registry.list().await {
         Ok(regs) => {
-            let agents: Vec<serde_json::Value> = regs.iter().map(agent_view).collect();
+            let people = match state.key_value.as_ref() {
+                Some(kv) => read_people(kv).await,
+                None => Vec::new(),
+            };
+            let people_count = people
+                .iter()
+                .filter(|(id, _)| !regs.iter().any(|reg| &reg.agent_id == id))
+                .count();
+            let agents = roster_with_people(&regs, people);
+            let count = agents.len();
             let (workers, squads) = roster_split(&regs);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "agents": agents,
-                    "count": regs.len(),
+                    "count": count,
                     "worker_agents": workers,
                     "squad_agents": squads,
+                    "people_agents": people_count,
                 })),
             )
                 .into_response()
@@ -1745,8 +1869,9 @@ pub async fn checkpoint_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_view, caller_named_reply_stream, enroll, read_roster, restore_roster_from,
-        roster_split, RosterRow, Summon, SummonFn, ROSTER_KEY,
+        agent_view, caller_named_reply_stream, enroll, read_people, read_roster,
+        restore_roster_from, roster_split, roster_with_people, PersonRow, RosterRow, Summon,
+        SummonFn, PEOPLE_KEY, ROSTER_KEY,
     };
     use cog_core::InboxMessage;
     use std::collections::HashMap;
@@ -2047,6 +2172,89 @@ mod tests {
         let name = view["display_name"].as_str().expect("display_name present");
         assert!(name.contains('#'), "name {name} is not a handle");
         assert_eq!(name, cog_core::display_name_for(&reg.agent_id));
+    }
+
+    /// 说过一句话的人，闭嘴之后还在名单上。
+    ///
+    /// 注册表那一行是心跳，说完几十秒就被摘掉；名单要回答的是「我跟谁说过话、
+    /// 以后还找不找得到他」。所以这位员工下线之后仍然印出来，只是不再是
+    /// `live`，并且带着他那段会话的 id——没有这一格，名单上这个人就只剩一个
+    /// 点进去什么也没有的名字。
+    #[tokio::test]
+    async fn a_person_who_only_speaks_is_still_on_the_roster() {
+        let store = Arc::new(FakeRosterStore::default());
+        let at = chrono::Utc::now();
+        let row = PersonRow {
+            session_id: "conv-1".into(),
+            display_name: "Kai#a9ab11fc".into(),
+            first_seen: at,
+            last_seen: at,
+        };
+        store
+            .hashes
+            .lock()
+            .unwrap()
+            .entry(PEOPLE_KEY.to_string())
+            .or_default()
+            .insert(
+                "kai-a9ab11fc".to_string(),
+                serde_json::to_string(&row).unwrap(),
+            );
+        let store: Arc<dyn cog_core::KeyValueStore> = store;
+
+        let views = roster_with_people(&[], read_people(&store).await);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0]["agent_id"], "kai-a9ab11fc");
+        assert_eq!(views[0]["display_name"], "Kai#a9ab11fc");
+        assert_eq!(views[0]["live"], false);
+        assert_eq!(views[0]["session_id"], "conv-1");
+    }
+
+    /// 同一个人两处都有时只印一行，并且那一行是「在岗」的。
+    ///
+    /// 印成两行，读的人会以为撞了名；只印名册那一行，一个正在说话的人会被读成
+    /// 休息中。会话 id 从他那一行并到在岗的这条上：正在说话的人也要能接着聊。
+    #[tokio::test]
+    async fn a_person_on_both_rosters_is_printed_once_as_live() {
+        let at = chrono::Utc::now();
+        let reg = cog_core::AgentRegistration::new(
+            "kai-a9ab11fc",
+            "cog-agent",
+            "127.0.0.1",
+            "kai-a9ab11fc",
+            "default",
+            vec![],
+            cog_core::ResourceInfo::default(),
+        );
+        let row = PersonRow {
+            session_id: "conv-1".into(),
+            display_name: "Kai#a9ab11fc".into(),
+            first_seen: at,
+            last_seen: at,
+        };
+
+        let views = roster_with_people(&[reg], vec![("kai-a9ab11fc".to_string(), row)]);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0]["live"], true);
+        assert_eq!(views[0]["session_id"], "conv-1");
+    }
+
+    /// 解析不了的那一行跳过：按位置猜它是谁，会把一个陌生人印成员工。
+    #[tokio::test]
+    async fn a_people_row_that_does_not_parse_is_skipped() {
+        let store = Arc::new(FakeRosterStore::default());
+        store
+            .hashes
+            .lock()
+            .unwrap()
+            .entry(PEOPLE_KEY.to_string())
+            .or_default()
+            .insert("broken".to_string(), "{not json".to_string());
+        let store: Arc<dyn cog_core::KeyValueStore> = store;
+
+        assert!(read_people(&store).await.is_empty());
     }
 
     /// A reply stream the caller names is taken out of the body rather than
