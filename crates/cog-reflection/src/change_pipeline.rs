@@ -194,25 +194,13 @@ const METADATA_TIMEOUT_SECS: u64 = 120;
 
 /// CI 那一族门禁整段活的墙钟界。
 ///
-/// 工作流里那几十条判据在一个密封沙箱里逐个跑，其中一条是
-/// `deploy/scripts/check-live-services.sh`——需要真 PostgreSQL 与真 Redis 的那 64 条
-/// 检查。它是这一段的长尾：2026-11-06 实测 648 秒（热）／728 秒（冷），其余几条合计
-/// 159 秒（读源码树、读渲染产物、起 python3 与 rustup）。整段就是这两部分之和。
-///
-/// 这个界是「挂住了」的那条线，不是预算——一段门禁卡在这个数上时，判成没跑完比等它
-/// 更接近正确的判断。1800 秒按实测那一段（约 890 秒）的两倍取，与下面那次抬界同一个
-/// 倍数：量级变了，界跟着量级走。
-///
-/// 它抬过两次，两次都是同一件事：清单里多了跑得更久的东西。300 秒曾经够用，那时清单
-/// 只认得 `bash deploy/scripts/check-` 一种写法，读出来 52 条、合计 70.7 秒；认全之后
-/// 多出 python 判据、`.github/scripts/` 下的判据和两条 `--check` 只判不写的脚本，
-/// 安静时的读数到了 159 秒，界抬到 600。再抬到 1800 是因为那 64 条从工作流里挪成了
-/// 一条门禁：它们原先在 CI 里是 test job 的 64 个 step，本地一条都没跑过（命令带着包名
-/// 与测试名，被记成「这棵树给不出来」而跳过），挪过来之后本地与上游判的是同一批命令。
-/// 界只留一点几倍余量时，忙起来的宿主会把尾巴上那几条门跳掉，而跳掉只是「没问过」
-/// ——正是这一段要消灭的那种沉默。
+/// 工作流里那 52 个 `check-*.sh` 在一个密封沙箱里逐个跑，实测合计 70.7 秒
+/// （含读源码树、读渲染产物、起 python3）；最慢的一个 12.4 秒。这条与它不同量级
+/// 是故意的：宿主同时跑着多分钟的释放构建，安静时的读数只是下界。这个界是
+/// 「挂住了」的那条线，不是预算——一条门禁卡在这个数上时，判成没跑完比等它更
+/// 接近正确的判断。
 // cap: bound — 整段门禁卡住时宁可判成没跑完
-const REPO_GATE_STAGE_WALL_SECS: u64 = 1800;
+const REPO_GATE_STAGE_WALL_SECS: u64 = 300;
 
 /// 一条变更跑几段门禁：判定那一段，以及红了之后读基线的那一段。
 // cap: bound — 判定一段 + 门禁失败后读基线一段
@@ -221,20 +209,9 @@ const REPO_GATE_RUNS_PER_CHANGE: u64 = 2;
 /// CI 工作流文件，门禁清单的唯一来源。
 const CI_WORKFLOW_FILE: &str = ".github/workflows/ci.yml";
 
-/// 工作流里一条门禁命令的启动器。壳脚本、python 判据、node 判据都算：门是什么
-/// 语言写的一句都不是，它判的是不是整棵树才是一句。
-const CI_GATE_LAUNCHERS: &[&str] = &["bash", "sh", "python3", "python", "node"];
-
-/// 判据脚本的路径标记：名字以 `check-` 开头、住在某个 `scripts/` 目录下的脚本。
-///
-/// 不写死 `deploy/scripts/`：判据住在 `deploy/scripts/` 和 `.github/scripts/` 两处，
-/// 只认前者时后者那几条永远只在 CI 里开口——而它们判的同样是整棵树（私有标识、
-/// 厂商名平等、README 的 trait 成员）。
-const CI_GATE_SCRIPT_MARKER: &str = "scripts/check-";
-
-/// 「只判不写」的调用旗标。`render-deploy.sh --check` 这类脚本名里没有 `check-`，
-/// 可它跑起来做的正是同一件事：把树渲染一遍，与提交的那份比。
-const CI_GATE_JUDGE_FLAG: &str = "--check";
+/// 工作流里一条门禁命令的写法：启动器在前，脚本路径紧跟在后。
+const CI_GATE_LAUNCHER: &str = "bash ";
+const CI_GATE_MARKER: &str = "bash deploy/scripts/check-";
 
 /// 一条变更上不受节拍约束的那几段活的墙钟上界——一个心跳到下一个心跳之间最长
 /// 的一段。加的是三段：
@@ -356,55 +333,13 @@ impl VerificationScopes {
     }
 }
 
-/// 这条变更欠不欠一次「先把红跑出来」。
-///
-/// 普通变更的判据只是「改完是绿的」：它不声称自己修的是某条特定的红，绿就是全部。
-/// 而一条修上游 CI 红的变更带着一个额外的断言——「红的这一条我能在这台机器上先
-/// 跑出来，改完再用同一条命令跑绿它」。这个断言今天只在题面里写着，没有任何东西
-/// 验它；于是六个修订上可以是同一条红，每一个都交出了本地没跑过的版本。
-///
-/// 欠复现时，套件按**这条管线配置的那条命令的完整范围**跑，不按改动的包收窄：上游
-/// CI 跑的是整棵树，收窄到这里就等于把「红在别的包里」这半读丢，而那正是本地绿、
-/// 上游红的来路。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RedReproduction {
-    /// 不欠：判据是改完绿。
-    NotRequired,
-    /// 欠：判据是去掉改动红、加上改动绿，同一条命令。
-    Required,
-}
-
-impl RedReproduction {
-    /// 哪个入口欠这一次复现。
-    ///
-    /// 按入口判，不按变更自己声明：一条会写「我不要这一条」的声明只能证明它希望
-    /// 被怎么判，而这条门要的正是它管不了的那个读数。修上游 CI 红是唯一一个入口，
-    /// 它的活就是从一条点名了的红出发——不欠它的那些入口本来就只说得出「改完是
-    /// 绿的」，对它们要这一对读数就是把判据换成另一件事。
-    pub fn for_intent(intent: Option<cog_core::EvolutionIntent>) -> Self {
-        match intent {
-            Some(cog_core::EvolutionIntent::CiFix) => Self::Required,
-            _ => Self::NotRequired,
-        }
-    }
-}
-
 /// 工作流里的一条门禁命令。
 struct RepoGateCommand {
-    /// 与工作流里写的一样的一条命令：启动器、脚本，加上只由旗标构成的参数。
-    /// 启动器要留着，因为判据不全是用 `bash` 跑的——`python3 deploy/scripts/
-    /// check-*.py` 拿 `bash` 去启动，退出码 127，读起来正好是一条红了的门。
-    argv: Vec<String>,
-    /// 这条命令带着工作流现场才有的东西（`${range}` 一类）。带这种参数的门在
-    /// 待判的这棵树上前提不成立，不跑，但要在读数里说出来。
+    /// 相对仓库根的脚本路径，与工作流里写的一样。
+    script: String,
+    /// 工作流在这条命令后面还带了参数（提交区间一类）。带参数的门在待判的这棵
+    /// 树上前提不成立，不跑，但要在读数里说出来。
     takes_arguments: bool,
-}
-
-impl RepoGateCommand {
-    /// 读数里写的那条命令：证据的读者要认得出它对着的是工作流里的哪一行。
-    fn line(&self) -> String {
-        self.argv.join(" ")
-    }
 }
 
 /// 一次门禁判定跑下来的结果。
@@ -453,55 +388,6 @@ impl RepoGateRun {
     }
 }
 
-/// 一行工作流里写着的那条门禁命令，或者没有。
-///
-/// 认两种写法：名字以 `check-` 开头、住在 `scripts/` 下的脚本（壳的、python 的都
-/// 算），以及任何带 `--check` 的脚本调用——后一种脚本名里没有 `check-`，可它做的
-/// 正是同一件事：把树判一遍、不写。
-///
-/// 启动器跟着命令一起留下。判据不全是用 `bash` 跑的：拿 `bash` 去启动一条
-/// `.py` 判据，退出码是 127，读起来正好是一条红了的门。
-fn gate_in_line(line: &str) -> Option<RepoGateCommand> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    for (at, token) in tokens.iter().enumerate() {
-        let script = token.trim_matches(|c| c == '"' || c == '\'');
-        let is_script = script.ends_with(".sh") || script.ends_with(".py");
-        if !is_script || !script.contains("scripts/") {
-            continue;
-        }
-        let launched = at > 0 && CI_GATE_LAUNCHERS.contains(&tokens[at - 1]);
-        // 这一行的命令到壳的分隔符为止；后面接的是工作流的下一条命令。
-        let args_end = tokens[at + 1..]
-            .iter()
-            .position(|t| matches!(*t, "&&" | "||" | ";" | "|" | ">" | ">>") || t.starts_with('#'))
-            .map(|n| at + 1 + n)
-            .unwrap_or(tokens.len());
-        let args: Vec<&str> = tokens[at + 1..args_end]
-            .iter()
-            .map(|arg| arg.trim_matches(|c| c == '"' || c == '\''))
-            .collect();
-        let named_like_a_gate = script.contains(CI_GATE_SCRIPT_MARKER);
-        let judged_by_flag = args.contains(&CI_GATE_JUDGE_FLAG);
-        if !named_like_a_gate && !judged_by_flag {
-            continue;
-        }
-        let mut argv: Vec<String> = Vec::new();
-        if launched {
-            argv.push(tokens[at - 1].to_string());
-        }
-        argv.push(script.to_string());
-        argv.extend(args.iter().map(|arg| (*arg).to_string()));
-        // 旗标是判据的一部分（`--check` 就是「只判不写」），别的参数是工作流现场
-        // 才有的东西（`${range}` 一类），这棵待判的树上给不出来。
-        let takes_arguments = args.iter().any(|arg| !arg.starts_with('-'));
-        return Some(RepoGateCommand {
-            argv,
-            takes_arguments,
-        });
-    }
-    None
-}
-
 /// 输出的最后一行非空文本，用于说清一个门为什么说自己跑不了。
 fn last_line_of(text: &str) -> &str {
     text.lines()
@@ -513,8 +399,6 @@ fn last_line_of(text: &str) -> &str {
 
 /// 输出的尾巴：门禁的报告是给人读的，前面大半是它读过的清单，红的那句在末尾。
 fn tail_of(text: &str) -> String {
-    // cap: bound — 够装下几组失败各自的收尾行（每组通常一两行），又不至于把整份
-    // 日志倒进提示词；没有测量能定这个数，它只决定「交回去的是结尾还是全文」。
     const KEPT: usize = 40;
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(KEPT);
@@ -710,30 +594,6 @@ enum FailureAttribution {
 /// one this change introduced — the exact false conviction the comparison
 /// exists to prevent. Empty means the whole workspace.
 type BaselineFailures = Option<(String, Vec<String>, BTreeSet<String>)>;
-
-/// How a change's diff meets the tree it is about to be applied to.
-///
-/// A patch keeps the branch it was generated against in its context lines; the
-/// branch does not wait for it. Which of the two applies is a fact about the
-/// generator's aim, not about whether the change is right, so it is recorded
-/// rather than flattened into "applied".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApplyMode {
-    /// Every hunk's context still matches: plain `git apply`.
-    Direct,
-    /// Some context line has moved, but the patch still merges cleanly against
-    /// the blobs it was generated from: `git apply --3way`.
-    ThreeWay,
-}
-
-impl ApplyMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Direct => "direct",
-            Self::ThreeWay => "three_way",
-        }
-    }
-}
 
 /// What this deployment's formatting stage read for a tree.
 #[derive(Debug)]
@@ -1383,22 +1243,6 @@ impl ChangePipeline {
         change: &EvolutionResult,
         workdir: &Path,
     ) -> SFResult<ApplyResult> {
-        self.apply_and_test_requiring(change, workdir, RedReproduction::NotRequired)
-            .await
-    }
-
-    /// 在指定工作树里应用并测试变更，并按 [`RedReproduction`] 决定要不要先在这棵树
-    /// 上把那条红跑出来。
-    ///
-    /// 判据的形状是「同一条命令、同一棵树，去掉改动是红的，加上改动是绿的」。绿本身
-    /// 从来不是问题所在——一条改在别处的变更也能让整棵树变绿——所以只有这一对读数
-    /// 才能把「这条红被修好了」与「这条红没人再提」分开。
-    pub async fn apply_and_test_requiring(
-        &self,
-        change: &EvolutionResult,
-        workdir: &Path,
-        reproduce: RedReproduction,
-    ) -> SFResult<ApplyResult> {
         info!(change_id = %change.artifact_id, "Applying evolution change");
 
         // 判定类失败一律走 `Ok(ApplyResult { verdict: Refused(..), .. })`，`Err` 只留给
@@ -1547,27 +1391,9 @@ impl ChangePipeline {
         let applies = self.git_apply_check(workdir, &change.content).await;
         // 读数在判词之后、早退之前：这一步的 oracle 与下面这道门是同一个
         // `git apply --check`，所以读数说的是「这份 diff 与目标树有多契合」，
-        // 而不是另一套判定。只有整份 diff 直接贴合目标树才算「整份通过」：
-        // 要靠三方合并才落得下去的那一份，逐块还是要分开量——它落下去靠的是
-        // 原来的 blob，不是现在这几行。
-        self.report_fidelity(
-            workdir,
-            &change.content,
-            matches!(applies, Ok(ApplyMode::Direct)),
-        )
-        .await;
-        if let Ok(mode) = applies {
-            if mode == ApplyMode::ThreeWay {
-                // 这一行是「分支在变更等着的这段时间里动了」的唯一读数：它不
-                // 判负，但它是那条从生成到落地之间的延迟在多长、要不要去缩
-                // 它，唯一看得到的地方。
-                info!(
-                    change_id = %change.artifact_id,
-                    mode = mode.as_str(),
-                    "change applied as a three-way merge"
-                );
-            }
-        }
+        // 而不是另一套判定。
+        self.report_fidelity(workdir, &change.content, applies.is_ok())
+            .await;
         if let Err(e) = applies {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
@@ -1749,20 +1575,7 @@ impl ChangePipeline {
         // `None` is the whole workspace, which is what every change was judged
         // by before this scope existed and what a change touching anything
         // outside `crates/<member>/` still is.
-        // 欠复现的变更只收窄 linter，不收窄套件：它要证明的那条红可能就在没被改动
-        // 的包里，而按改动收窄正好把这个包排除在外——本地因此是绿的，上游仍是红的。
-        let scopes = match reproduce {
-            RedReproduction::Required => VerificationScopes {
-                lint: self
-                    .verification_scopes(workdir, &change.content)
-                    .await
-                    .lint,
-                suite: None,
-            },
-            RedReproduction::NotRequired => {
-                self.verification_scopes(workdir, &change.content).await
-            }
-        };
+        let scopes = self.verification_scopes(workdir, &change.content).await;
         match (&scopes.lint, &scopes.suite) {
             (Some(linted), Some(suite)) => info!(
                 change_id = %change.artifact_id,
@@ -2018,107 +1831,15 @@ impl ChangePipeline {
             }
         }
 
-        // 复现门：一条声称修红的变更，必须在这台机器上先见过那条红，再用同一条
-        // 命令见过它绿。两半都缺一个就退回——退回不是判这棵树坏，是判「这一次
-        // 没有证据」，而证据只可能来自同一棵树上的一对读数。
-        //
-        // 这一对读数的后半是上面那一次跑：它与基线跑用的是同一条命令、同一个范围
-        // （见本函数开头对 `scopes.suite` 的处理），所以绿的那一次就是「红掉了」
-        // 的那一次，不需要再跑一遍去确认。前半在这里补：把改动摘掉，同一条命令
-        // 再跑一次。
-        //
-        // 顺序上放在套件判定之后、门禁之前：套件红了这条变更已经退回，不必再花
-        // 一次全量；门禁可能会把 `test_passed` 改成 false，而那之后同样没有「绿」
-        // 这一半可证。
-        if reproduce == RedReproduction::Required && test_passed {
-            // 改动之前就绿着的那些失败不是这条变更要修的红：它们是这棵树自己的
-            // 病，改完仍然红，于是「红→绿」这一对里绿的一半根本没发生。
-            if pre_existing_failures > 0 {
-                warn!(
-                    change_id = %change.artifact_id,
-                    count = pre_existing_failures,
-                    "The change leaves the red it claims to fix still red; rolling back"
-                );
-                let _ = self.git_reset_hard(workdir, &change.content).await;
-                return Ok(ApplyResult {
-                    change_id: change.artifact_id.clone(),
-                    files_changed,
-                    reformatted,
-                    pre_existing_failures,
-                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::NotReproduced),
-                    test_output: format!(
-                        "这条变更声称修的是红的检查，可它跑完之后这些测试仍然红——红没有变成绿：\n  {test_output}"
-                    ),
-                    new_status: EvolutionStatus::ValidationFailed,
-                    tiering: Some(tiering.clone()),
-                });
-            }
-            match self
-                .baseline_failing_tests(workdir, &change.content, scopes.suite.as_deref())
-                .await
-            {
-                Ok(red) if red.is_empty() => {
-                    warn!(
-                        change_id = %change.artifact_id,
-                        command = %self.test_command_line(),
-                        "The red this change claims to fix is green on this tree without it"
-                    );
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
-                    return Ok(ApplyResult {
-                        change_id: change.artifact_id.clone(),
-                        files_changed,
-                        reformatted,
-                        pre_existing_failures: 0,
-                        verdict: ChangeVerdict::Refused(cog_core::RejectionCause::NotReproduced),
-                        test_output: format!(
-                            "这条变更没有一个可以在本地复现成红的检查：去掉改动，`{}` 在这棵树上是绿的。\
-                             上游那条红出在这台机器读不到的地方，改它就是猜——先在本机把它跑出来，再改。",
-                            self.test_command_line()
-                        ),
-                        new_status: EvolutionStatus::ValidationFailed,
-                        tiering: Some(tiering.clone()),
-                    });
-                }
-                Ok(red) => {
-                    info!(
-                        change_id = %change.artifact_id,
-                        count = red.len(),
-                        command = %self.test_command_line(),
-                        "The change turns a red this tree showed without it green"
-                    );
-                    // 接在前面而不是替掉：这一段是这条变更清掉的那条红，后面那一
-                    // 段是判它的各道判据自己说的话——换成一条，另一条就没处读了。
-                    test_output = format!(
-                        "去掉这条变更，`{}` 在这棵树上是红的：{}。加上它，同一条命令是绿的。\n\n{test_output}",
-                        self.test_command_line(),
-                        red.into_iter().collect::<Vec<_>>().join("、")
-                    );
-                }
-                // 读不出基线就说不出这一对读数，于是这条变更没有被判定过。留着重试，
-                // 不退回：退回要一条判据说它不行，而这里是一条判据没跑起来。
-                Err(e) => {
-                    warn!(
-                        change_id = %change.artifact_id,
-                        error = %e,
-                        "Could not read the red this tree shows without the change; reaching no verdict"
-                    );
-                    let _ = self.git_reset_hard(workdir, &change.content).await;
-                    return Err(e);
-                }
-            }
-        }
-
         // CI 那一族门判的是整棵树，而它们住在壳脚本里，不进任何 crate 的测试
         // 目标——按包收窄的验证一条都执行不到。它们第一次开口就在落地二十分钟
         // 之后，那时主干已经往前走了几版，红的账记在别人头上。所以在这里把它们
-        // 跑一遍，代价是几十秒的壳脚本加一段跑在共享目标目录上的用例，换的是
-        // 「这一版红了」在落地前就知道。
+        // 跑一遍，代价是几十秒的壳脚本，换的是「这一版红了」在落地前就知道。
         //
         // 只在这一刻还绿着的时候跑：套件已经判红时，这条变更的去留不由门禁决定，
         // 跑它们只是把同一份时间再花一遍。
         if test_passed {
-            let gates = match Self::run_repo_gates(workdir, None, self.target_dir.as_deref()).await
-            {
+            let gates = match Self::run_repo_gates(workdir, None).await {
                 Ok(run) => run,
                 // 读不出工作流就等于说不出这一版被谁判过。这不退变更：退掉一条
                 // 变更要一条判据说它不行，而这里是一条判据根本没跑起来。
@@ -2417,15 +2138,9 @@ impl ChangePipeline {
         Ok(())
     }
 
-    /// Run `git apply --check` on change content without modifying the tree,
-    /// and say how the patch meets this tree.
-    ///
-    /// Returns the mode rather than `()` so the reading published next to the
-    /// verdict can tell a direct hit from a merge: a change that only lands
-    /// because the base moved under it is a different fact about the generator
-    /// than one that still fits, and the two are only distinguishable here.
-    async fn git_apply_check(&self, workdir: &Path, change_content: &str) -> SFResult<ApplyMode> {
-        self.probe_apply_mode(workdir, change_content).await
+    /// Run `git apply --check` on change content without modifying the tree.
+    async fn git_apply_check(&self, workdir: &Path, change_content: &str) -> SFResult<()> {
+        self.run_git_apply(workdir, change_content, true).await
     }
 
     /// 逐文件/逐块读出这份 diff 有多少真的在目标树里找到上下文，并上报。
@@ -2600,113 +2315,25 @@ impl ChangePipeline {
         }
     }
 
-    /// Apply change content to the working tree with `git apply`, in whichever
-    /// mode [`Self::probe_apply_mode`] found a fit.
+    /// Apply change content to the working tree with `git apply`.
     async fn git_apply(&self, workdir: &Path, change_content: &str) -> SFResult<()> {
-        match self.probe_apply_mode(workdir, change_content).await? {
-            ApplyMode::Direct => self.run_git_apply_args(workdir, change_content, &[]).await,
-            ApplyMode::ThreeWay => {
-                // `--3way` writes the merge into the tree before it decides
-                // whether the merge is clean, so a refusal here has already
-                // put conflict markers in the files it names. Leaving them
-                // would hand the next gate a file nobody wrote.
-                let applied = self
-                    .run_git_apply_args(workdir, change_content, &["--3way"])
-                    .await;
-                if applied.is_err() {
-                    let _ = self.git_reset_hard(workdir, change_content).await;
-                }
-                applied
-            }
-        }
+        self.run_git_apply(workdir, change_content, false).await
     }
 
-    /// How this patch meets the tree it is about to be applied to.
-    ///
-    /// A change is generated against the branch as it stood, and lands later:
-    /// while it waits, every other landing moves the lines around it. Plain
-    /// `git apply` refuses as soon as a context line no longer matches, so the
-    /// work behind that diff -- a whole generation cycle -- is thrown away for
-    /// a reason that has nothing to do with the change being wrong. Measured
-    /// on 2026-11-05: 67 of 220 landing records were retired this way, the
-    /// largest single class after the promotion gate's own gap.
-    ///
-    /// So the question is asked in two steps, and both the pre-check and the
-    /// apply go through this one answer: a patch that still fits is applied
-    /// as before; a patch that no longer fits but merges cleanly against the
-    /// blobs it was generated from is applied as a three-way merge. Nothing is
-    /// loosened -- a merge that conflicts is still a refusal, and every gate
-    /// downstream reads the merged tree rather than the diff.
-    async fn probe_apply_mode(&self, workdir: &Path, change_content: &str) -> SFResult<ApplyMode> {
-        match self
-            .run_git_apply_args(workdir, change_content, &["--check"])
-            .await
-        {
-            Ok(()) => Ok(ApplyMode::Direct),
-            // The direct error is the one reported when the merge does not
-            // work either: it names the line the patch was searching for and
-            // that is what a reader can act on, while the three-way failure
-            // would only say the merge was refused.
-            Err(direct) => match self.three_way_merges_cleanly(workdir, change_content).await {
-                true => Ok(ApplyMode::ThreeWay),
-                false => Err(direct),
-            },
-        }
-    }
-
-    /// Whether `git apply --3way` merges this patch into `HEAD` without
-    /// leaving conflicts.
-    ///
-    /// The probe runs against a throwaway index (`GIT_INDEX_FILE`) and
-    /// `--cached`, so it writes nothing to the worktree: pointed at the real
-    /// index, asking the question would answer it by doing it. Git's exit
-    /// status is the whole answer here -- `--3way` against a patch that does
-    /// not merge exits non-zero, which is why this does not re-read the index
-    /// for conflict stages afterwards. A patch with no `index` line carries no
-    /// blob to merge against, and git refuses that too; the refusal is the
-    /// `false` this returns, not a distinguishing case.
-    async fn three_way_merges_cleanly(&self, workdir: &Path, change_content: &str) -> bool {
-        let index = std::env::temp_dir().join(format!(
-            "cogneva-3way-{}-{}.idx",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let merged = self
-            .three_way_probe_with_index(workdir, change_content, &index)
-            .await
-            .unwrap_or(false);
-        let _ = tokio::fs::remove_file(&index).await;
-        merged
-    }
-
-    async fn three_way_probe_with_index(
+    /// Shared implementation for `git apply [--check]`.
+    async fn run_git_apply(
         &self,
         workdir: &Path,
         change_content: &str,
-        index: &Path,
-    ) -> SFResult<bool> {
-        // The merge needs an index that starts where `HEAD` is, not one
-        // carrying whatever the worktree had staged when the question was
-        // asked; `read-tree` builds exactly that in the throwaway file.
-        let read_tree = tokio::process::Command::new("git")
-            .args(["read-tree", "HEAD"])
-            .env("GIT_INDEX_FILE", index)
-            .current_dir(workdir)
-            .output()
-            .await
-            .map_err(|e| SFError::IO(format!("Failed to run git read-tree: {}", e)))?;
-        if !read_tree.status.success() {
-            return Ok(false);
-        }
-        Ok(self
-            .run_git_apply_with_index(
-                workdir,
-                change_content,
-                &["--cached", "--3way"],
-                Some(index),
-            )
-            .await
-            .is_ok())
+        check_only: bool,
+    ) -> SFResult<()> {
+        self.run_git_apply_args(
+            workdir,
+            change_content,
+            if check_only { &["--check"] } else { &[] },
+            true,
+        )
+        .await
     }
 
     /// `git apply` with the caller's flags, patch on stdin.
@@ -2714,31 +2341,99 @@ impl ChangePipeline {
     /// The reverse run goes through the same door as the forward one: a second
     /// spawn site would be free to drift from this one's environment and its
     /// error text, and the two would then disagree about what "applied" means.
+    ///
+    /// `allow_three_way` is what keeps that one door from becoming one verdict.
+    /// A change is generated against the revision its author had, and by the
+    /// time it is judged the base branch has usually moved: in the whole
+    /// account, hunks whose context no longer matches are the largest single
+    /// reason a change is retired, and they are retired as if the author had
+    /// written something wrong. Most of those are not wrong -- they touch lines
+    /// nobody else touched, and a three-way merge would put them on the tree
+    /// exactly as intended.
+    ///
+    /// So a context failure is retried once with `--3way`, which merges against
+    /// the blob the patch says it was written from. Three things keep that from
+    /// being a weaker gate:
+    ///
+    /// - A malformed patch is not retried. `corrupt patch` is the author's
+    ///   mistake, and no merge can repair a hunk header that does not add up.
+    /// - A merge that leaves conflicts is a refusal, not an apply. `git apply
+    ///   --check --3way` **exits zero** on a conflicted merge and says so only
+    ///   on stdout, so the verdict is read from the words git chose; the exit
+    ///   status alone would read a change whose hunks disagree with the tree as
+    ///   one that applies cleanly.
+    /// - The refusal a caller sees is the original one, not the merge's. When
+    ///   the fallback fails, what comes back is the plain `git apply` error, so
+    ///   the reason recorded on the change and the cause it is filed under are
+    ///   the ones this door has always produced.
+    ///
+    /// The reverse run passes `false`: a rollback is a question about the tree
+    /// this change was put on, and merging it against some other revision would
+    /// answer a different question.
     async fn run_git_apply_args(
         &self,
         workdir: &Path,
         change_content: &str,
         flags: &[&str],
+        allow_three_way: bool,
     ) -> SFResult<()> {
-        self.run_git_apply_with_index(workdir, change_content, flags, None)
+        let refusal = match self.git_apply_once(workdir, change_content, flags).await {
+            Ok(run) => {
+                return match run.merged_with_conflicts() {
+                    // 冲突标记留在树里不是「打上了」：与拒绝同一件事，只是 git
+                    // 把它说在 stdout 上、并把退出码给成 0。
+                    true => Err(SFError::Agent(format!(
+                        "git apply {}failed: {}",
+                        flag_text(flags),
+                        run.words
+                    ))),
+                    false => Ok(()),
+                };
+            }
+            Err(refusal) => refusal,
+        };
+        if !allow_three_way || refusal.to_string().contains("corrupt patch") {
+            return Err(refusal);
+        }
+        // The merge is always asked in `--check` form first, even when the
+        // caller means to apply: a 3-way merge that conflicts writes its markers
+        // into the working tree, and a refused change must leave what it was
+        // given untouched. Only a merge git calls clean is then really applied.
+        match self
+            .git_apply_once(workdir, change_content, &["--check", "--3way"])
             .await
+        {
+            Ok(probe) if !probe.merged_with_conflicts() => {
+                if flags.contains(&"--check") {
+                    return Ok(());
+                }
+            }
+            _ => return Err(refusal),
+        }
+        match self
+            .git_apply_once(workdir, change_content, &["--3way"])
+            .await
+        {
+            Ok(run) if !run.merged_with_conflicts() => Ok(()),
+            _ => Err(refusal),
+        }
     }
 
-    /// [`Self::run_git_apply_args`] against a named index, for the probe that
-    /// must not touch the worktree's own.
-    async fn run_git_apply_with_index(
+    /// One `git apply` run, with the words git printed whichever side it put
+    /// them on.
+    ///
+    /// The output is kept rather than dropped on success because one of this
+    /// command's outcomes -- a conflicted three-way merge -- is reported there
+    /// and not in the exit status.
+    async fn git_apply_once(
         &self,
         workdir: &Path,
         change_content: &str,
         flags: &[&str],
-        index: Option<&Path>,
-    ) -> SFResult<()> {
+    ) -> SFResult<GitApplyRun> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg("apply").arg("-v").current_dir(workdir);
         cmd.args(flags);
-        if let Some(index) = index {
-            cmd.env("GIT_INDEX_FILE", index);
-        }
 
         let mut child = cmd
             .stdin(std::process::Stdio::piped())
@@ -2762,16 +2457,19 @@ impl ChangePipeline {
             .await
             .map_err(|e| SFError::IO(format!("Failed to run git apply: {}", e)))?;
 
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::Agent(format!(
                 "git apply {}failed: {}",
-                flags.iter().map(|f| format!("{f} ")).collect::<String>(),
+                flag_text(flags),
                 stderr
             )));
         }
 
-        Ok(())
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        Ok(GitApplyRun {
+            words: format!("{stdout}{stderr}"),
+        })
     }
 
     /// Restore the working tree to HEAD.
@@ -3129,7 +2827,10 @@ impl ChangePipeline {
         );
 
         if !before.is_empty() {
-            if let Err(e) = self.run_git_apply_args(workdir, &before, &["-R"]).await {
+            if let Err(e) = self
+                .run_git_apply_args(workdir, &before, &["-R"], false)
+                .await
+            {
                 return Ok(Some(format!(
                     "回滚路径执行失败：逆向补丁打不回去（{e}）。这一笔改动落在树上之后没有可执行的回退。"
                 )));
@@ -3757,12 +3458,9 @@ impl ChangePipeline {
     /// 工作流在这一次提交上会跑的门，逐个从工作流文件里读出来。
     ///
     /// 不在这里另抄一份清单：抄一份就是两处各自维护，工作流加了门而这里没加，
-    /// 那个门就永远只在落地二十分钟后、在别人头上红一次。读出来的命令带着工作流
-    /// 现场才有的参数时（`${range}` 一类）标成「要参数」——那些要的是提交区间，
-    /// 而待判的这棵树上此刻没有提交，硬跑等于拿空串去问一个必然为假的问题。
-    ///
-    /// 读的是所有行，不是只看 `run:` 开头的行：工作流里多行命令写成 `run: |`，
-    /// 命令本身在下面几行，只认 `run:` 那一行会把它们整段漏掉。
+    /// 那个门就永远只在落地二十分钟后、在别人头上红一次。读出来的命令带参数时
+    /// （`${range}` 一类）标成「要参数」——那些要的是提交区间，而待判的这棵树
+    /// 上此刻没有提交，硬跑等于拿空串去问一个必然为假的问题。
     fn ci_gate_commands(workdir: &Path) -> SFResult<Vec<RepoGateCommand>> {
         let path = workdir.join(CI_WORKFLOW_FILE);
         let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -3773,13 +3471,25 @@ impl ChangePipeline {
         })?;
         let mut out: Vec<RepoGateCommand> = Vec::new();
         for line in text.lines() {
-            let Some(command) = gate_in_line(line) else {
+            let Some(at) = line.find(CI_GATE_MARKER) else {
                 continue;
             };
-            if out.iter().any(|known| known.argv == command.argv) {
+            // 跳过 `bash `：留下来的是相对仓库根的脚本路径，与工作流里写的一样。
+            let rest = line[at..]
+                .strip_prefix(CI_GATE_LAUNCHER)
+                .unwrap_or(&line[at..]);
+            let Some(end) = rest.find(".sh") else {
+                continue;
+            };
+            let script = rest[..end + ".sh".len()].trim().to_string();
+            if out.iter().any(|known| known.script == script) {
                 continue;
             }
-            out.push(command);
+            let tail = rest[end + ".sh".len()..].trim();
+            out.push(RepoGateCommand {
+                script,
+                takes_arguments: !tail.is_empty(),
+            });
         }
         Ok(out)
     }
@@ -3795,11 +3505,7 @@ impl ChangePipeline {
     /// 不成立；`2` 是门自己说的「我跑不了」——缺依赖、缺文件、用法不对（这条约定
     /// 全树在用：`command -v python3 >/dev/null || { …; exit 2; }`）。第三支不读成
     /// 通过，也不读成失败：它记在读数里，读的人知道这一条**没被问过**。
-    async fn run_repo_gates(
-        workdir: &Path,
-        only: Option<&[String]>,
-        target_dir: Option<&Path>,
-    ) -> SFResult<RepoGateRun> {
+    async fn run_repo_gates(workdir: &Path, only: Option<&[String]>) -> SFResult<RepoGateRun> {
         let commands = Self::ci_gate_commands(workdir)?;
         let mut run = RepoGateRun {
             asked: Vec::new(),
@@ -3810,15 +3516,14 @@ impl ChangePipeline {
         };
         let deadline = Instant::now() + Duration::from_secs(REPO_GATE_STAGE_WALL_SECS);
         for gate in commands {
-            let line = gate.line();
             if let Some(only) = only {
-                if !only.iter().any(|name| name == &line) {
+                if !only.iter().any(|name| name == &gate.script) {
                     continue;
                 }
             }
             if gate.takes_arguments {
                 run.not_asked
-                    .push((line, "the workflow passes it an argument".into()));
+                    .push((gate.script, "the workflow passes it an argument".into()));
                 continue;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3826,39 +3531,21 @@ impl ChangePipeline {
                 run.interrupted = true;
                 break;
             }
-            let mut cmd = tokio::process::Command::new(&gate.argv[0]);
-            cmd.args(&gate.argv[1..])
+            let mut cmd = tokio::process::Command::new("bash");
+            cmd.arg(&gate.script)
                 .current_dir(workdir)
                 .kill_on_drop(true);
-            // 门禁里现在有会编译的命令（`check-live-services.sh` 跑的是
-            // `cargo test -- --ignored`）。不给它目标目录，cargo 就在工作树里
-            // 按默认的 `target/` 从零编一遍整棵 workspace——那一段的时长从几十秒
-            // 变成十几分钟，而它编出来的东西与套件那一段刚编过的字节一模一样。
-            // 给的是同一个共享目录，指纹对得上，一条都不用重编。
-            //
-            // 只补这一条，不清空环境：门禁脚本读的是部署现场（`PATH`、套件那边的
-            // 测试库地址），而那段白名单是给**断言进程**用的——门禁判的是整棵树，
-            // 不是一条断言。
-            if let Some(dir) = target_dir {
-                cmd.env("CARGO_TARGET_DIR", dir);
-            }
             let output = match tokio::time::timeout(remaining, cmd.output()).await {
                 Ok(Ok(output)) => output,
-                // 启动不起来与门自己说「跑不了」是同一件事：这一条没被问过。差别只在
-                // 谁说的——门用退出码 2 说，操作系统用 errno 说。让一条启动不起来的
-                // 命令把整段门禁带走，这条变更就连别的门的结果都拿不到，而读数上看起来
-                // 是「这一段没跑完」，不是「这一条有问题」。
                 Ok(Err(e)) => {
-                    run.not_asked
-                        .push((line, format!("could not be launched: {e}")));
-                    continue;
+                    return Err(SFError::IO(format!("could not run {}: {e}", gate.script)))
                 }
                 Err(_) => {
                     run.interrupted = true;
                     break;
                 }
             };
-            run.asked.push(line.clone());
+            run.asked.push(gate.script.clone());
             let text = format!(
                 "{}{}",
                 String::from_utf8_lossy(&output.stdout),
@@ -3866,8 +3553,10 @@ impl ChangePipeline {
             );
             match output.status.code() {
                 Some(0) => run.passed += 1,
-                Some(2) => run.not_asked.push((line, last_line_of(&text).to_string())),
-                _ => run.failed.push((line, tail_of(&text))),
+                Some(2) => run
+                    .not_asked
+                    .push((gate.script, last_line_of(&text).to_string())),
+                _ => run.failed.push((gate.script, tail_of(&text))),
             }
         }
         Ok(run)
@@ -3885,8 +3574,7 @@ impl ChangePipeline {
     ) -> SFResult<BTreeSet<String>> {
         let names: Vec<String> = failing.iter().map(|(script, _)| script.clone()).collect();
         self.git_reset_hard(workdir, change_content).await?;
-        let baseline =
-            Self::run_repo_gates(workdir, Some(&names), self.target_dir.as_deref()).await?;
+        let baseline = Self::run_repo_gates(workdir, Some(&names)).await?;
         self.git_apply(workdir, change_content).await.map_err(|e| {
             SFError::IO(format!(
                 "could not put the change back after reading the tree's own gate failures: {e}"
@@ -4029,6 +3717,29 @@ impl ChangePipeline {
                 ))
             })
     }
+}
+
+/// 一次 `git apply` 跑完说了什么，成功与失败都留着。
+///
+/// 留着输出只为一件事：三路合并出冲突这一种结局**不在退出码里**——
+/// `git apply --check --3way` 对一份合不上的补丁退出 0，只在 stdout 上说一句
+/// 「Applied patch to 'x' with conflicts.」。只读退出码的读者会把「补丁与这棵树
+/// 对不上」读成「补丁打上了」，而真正落地的那一步是会把冲突标记写进文件的。
+struct GitApplyRun {
+    /// git 自己说的话，两条流合起来。
+    words: String,
+}
+
+impl GitApplyRun {
+    /// 三路合并跑完了，但合出来的是冲突而不是结果。
+    fn merged_with_conflicts(&self) -> bool {
+        self.words.contains("with conflicts")
+    }
+}
+
+/// `git apply` 的回绝句里点名的那串开关。
+fn flag_text(flags: &[&str]) -> String {
+    flags.iter().map(|f| format!("{f} ")).collect::<String>()
 }
 
 /// Which defect a failed `git apply --check` reported.
@@ -4180,10 +3891,6 @@ mod tests {
     use crate::rust_production::production_text;
 
     use crate::checkout::repo_root;
-
-    /// Ten numbered lines, so a hunk's context window and the line it edits
-    /// are different lines and can be moved independently.
-    const TEN_LINES: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
 
     /// [`one_change_wall_secs`] 加的是哪几段活、`FMT_SEGMENT_WALL_SECS` 那个数
     /// 乘的是哪几趟命令，都是数着源码里的调用点写下来的。加一条 gated 命令、
@@ -5101,208 +4808,6 @@ index 1111111..2222222 100644
 
     /// A change that adds a file can be taken off and put back on.
     ///
-    /// A change whose base moved while it waited still lands.
-    ///
-    /// A generated diff is aimed at the branch as it stood when the change was
-    /// written, and it is applied later — after other landings have moved the
-    /// lines around it. Plain `git apply` refuses the moment one context line
-    /// no longer matches, which throws away a whole generation cycle for a
-    /// reason that has nothing to do with the change being wrong. Measured on
-    /// 2026-11-05: 67 of the 220 landing records held in the pod were retired
-    /// this way, and after the promotion gate's path-family gap was closed it
-    /// was the largest remaining class. The patch still merges against the
-    /// blobs it was generated from, so it is applied as a three-way merge and
-    /// the tree carries both edits.
-    #[tokio::test]
-    async fn a_change_whose_base_moved_still_lands_as_a_three_way_merge() {
-        use tokio::process::Command;
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        for args in [
-            vec!["init"],
-            vec!["config", "user.email", "test@test.com"],
-            vec!["config", "user.name", "Test"],
-        ] {
-            Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .await
-                .expect("git plumbing failed");
-        }
-
-        let src = root.join("src").join("lib.rs");
-        tokio::fs::create_dir_all(src.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&src, TEN_LINES).await.unwrap();
-        Command::new("git")
-            .args(["add", "--", "src/lib.rs"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "base"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-
-        // The change, captured the way the generator leaves it behind.
-        tokio::fs::write(&src, TEN_LINES.replace("five", "five-changed"))
-            .await
-            .unwrap();
-        let diff = Command::new("git")
-            .args(["diff"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-        let diff = String::from_utf8(diff.stdout).unwrap();
-        assert!(
-            diff.contains("\nindex "),
-            "a generated diff carries the blobs it was written against, which is what the merge needs"
-        );
-        Command::new("git")
-            .args(["checkout", "--", "src/lib.rs"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-
-        // The branch moves under it: line three is a context line of the hunk.
-        tokio::fs::write(&src, TEN_LINES.replace("three", "three-moved"))
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["add", "--", "src/lib.rs"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "advance"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-
-        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
-        assert_eq!(
-            pipeline.git_apply_check(root, &diff).await.unwrap(),
-            ApplyMode::ThreeWay,
-            "a patch whose context moved is a merge, not a refusal"
-        );
-        pipeline.git_apply(root, &diff).await.unwrap();
-
-        let content = tokio::fs::read_to_string(&src).await.unwrap();
-        assert!(
-            content.contains("three-moved"),
-            "the branch's own edit has to survive the merge"
-        );
-        assert!(
-            content.contains("five-changed"),
-            "the change has to land on top of the moved branch"
-        );
-    }
-
-    /// A merge that conflicts is still a refusal, and leaves no markers behind.
-    ///
-    /// `git apply --3way` reports a conflicted merge through the index and not
-    /// through its exit status alone; more importantly, asking it to *check*
-    /// answers zero for a patch it would leave conflicted. So the probe runs
-    /// against a throwaway index: the real worktree is never written by a
-    /// question, and a change that cannot merge is refused with the direct
-    /// error rather than applied half-way.
-    #[tokio::test]
-    async fn a_change_that_conflicts_with_the_moved_base_is_refused_untouched() {
-        use tokio::process::Command;
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        for args in [
-            vec!["init"],
-            vec!["config", "user.email", "test@test.com"],
-            vec!["config", "user.name", "Test"],
-        ] {
-            Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .await
-                .expect("git plumbing failed");
-        }
-
-        let src = root.join("src").join("lib.rs");
-        tokio::fs::create_dir_all(src.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&src, TEN_LINES).await.unwrap();
-        Command::new("git")
-            .args(["add", "--", "src/lib.rs"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "base"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-
-        tokio::fs::write(&src, TEN_LINES.replace("five", "five-changed"))
-            .await
-            .unwrap();
-        let diff = Command::new("git")
-            .args(["diff"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-        let diff = String::from_utf8(diff.stdout).unwrap();
-        Command::new("git")
-            .args(["checkout", "--", "src/lib.rs"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-
-        // The branch rewrites the same line the change rewrites.
-        tokio::fs::write(&src, TEN_LINES.replace("five", "five-other"))
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["add", "--", "src/lib.rs"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "advance"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-
-        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
-        assert!(
-            pipeline.git_apply_check(root, &diff).await.is_err(),
-            "a patch that conflicts with the moved branch must be refused"
-        );
-        let content = tokio::fs::read_to_string(&src).await.unwrap();
-        assert!(
-            !content.contains("<<<<<<<"),
-            "the check must not leave conflict markers in the tree it was asked about"
-        );
-        assert!(
-            content.contains("five-other"),
-            "the probe must not write the tree"
-        );
-    }
-
     /// `git reset --hard` restores tracked files only, so the file the change
     /// created stays behind as untracked and the second apply of that same
     /// change fails on it ("already exists"). A change whose suite failed is
@@ -5428,6 +4933,42 @@ index 1111111..2222222 100644
         git_ok(&clone, &["add", "."]).await;
         git_ok(&clone, &["commit", "-m", name]).await;
         git_ok(&clone, &["push", "origin", "main"]).await;
+    }
+
+    /// 往 upstream 的 main 上写一个**已存在文件的新内容**，模拟主线在变更生成
+    /// 之后又动了同一份文件。
+    async fn rewrite_upstream_file(upstream: &std::path::Path, name: &str, body: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        git_ok(tmp.path(), &["clone", &upstream.to_string_lossy(), "clone"]).await;
+        let clone = tmp.path().join("clone");
+        git_ok(&clone, &["config", "user.email", "t@t.c"]).await;
+        git_ok(&clone, &["config", "user.name", "T"]).await;
+        tokio::fs::write(clone.join(name), body).await.unwrap();
+        git_ok(&clone, &["add", "-A"]).await;
+        git_ok(&clone, &["commit", "-m", &format!("rewrite {name}")]).await;
+        git_ok(&clone, &["push", "origin", "main"]).await;
+    }
+
+    /// 一份内容在给定仓库里的 blob id，用来把 diff 的 `index` 行写成真的。
+    ///
+    /// 三路合并只认这条线：`git apply --3way` 拿它去找「作者写这份补丁时看到的
+    /// 那一版」，找不到就合不了。写一份假的哈希，测的就不是合并，而是 git 报错。
+    async fn blob_id(dir: &std::path::Path, body: &str) -> String {
+        let mut child = tokio::process::Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(body.as_bytes()).await.unwrap();
+        }
+        let out = child.wait_with_output().await.unwrap();
+        assert!(out.status.success(), "git hash-object failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     async fn head_of(dir: &std::path::Path) -> String {
@@ -5584,6 +5125,157 @@ index 1111111..2222222 100644
             "兄弟工作树必须保持基线"
         );
         assert!(!decoy.exists(), "构造时的固定目录不应被写入");
+    }
+
+    /// 九行基线。夹具必须留出中间行：三路合并把相邻的两处改动读成同一处冲突，
+    /// 而这里要测的是「不重叠却因为上下文过期被拒」——用三行小文件测出来的是
+    /// 冲突那一侧，测不到这一侧。
+    const NINE_LINES: [&str; 9] = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ];
+
+    fn nine_lines() -> String {
+        format!("{}\n", NINE_LINES.join("\n"))
+    }
+
+    /// 基线第 `at` 行（从 1 起）换成 `to`，其余照原样。
+    fn nine_lines_with(at: usize, to: &str) -> String {
+        let mut lines: Vec<&str> = NINE_LINES.to_vec();
+        lines[at - 1] = to;
+        format!("{}\n", lines.join("\n"))
+    }
+
+    /// 一份把 `from` 行换成 `to` 的补丁，hunk 取基线第 3~9 行当上下文。
+    fn patch_swapping(from: &str, to: &str, before: &str, after: &str) -> String {
+        format!(
+            "diff --git a/a.txt b/a.txt\n\
+             index {before}..{after} 100644\n\
+             --- a/a.txt\n\
+             +++ b/a.txt\n\
+             @@ -3,7 +3,7 @@\n\
+             \x20three\n\
+             \x20four\n\
+             \x20five\n\
+             -{from}\n\
+             +{to}\n\
+             \x20seven\n\
+             \x20eight\n\
+             \x20nine\n"
+        )
+    }
+
+    /// 一份在更早的基线上写成的变更，落在已经前进的主线上：它的上下文不再逐字
+    /// 相同，但它动的行没有别人动过，所以它该打上，而不是被当成作者写错了。
+    ///
+    /// 这一条是「补丁上下文对不上」那一类拒收的判据。没有三路合并时
+    /// `git_apply_check` 在第一步就回绝——那正是现网里占最大头的退役理由。
+    #[tokio::test]
+    async fn a_change_written_against_an_older_revision_still_applies_when_nothing_overlaps() {
+        let (upstream, _work) = scaffold_upstream().await;
+        let base = nine_lines();
+        rewrite_upstream_file(upstream.path(), "a.txt", &base).await;
+        let before = blob_id(upstream.path(), &base).await;
+        let after = blob_id(upstream.path(), &nine_lines_with(6, "SIX!")).await;
+        let diff = patch_swapping("six", "SIX!", &before, &after);
+        // 主线在变更写成之后动了第八行——它是补丁的上下文行，却不是补丁改的那一行。
+        rewrite_upstream_file(upstream.path(), "a.txt", &nine_lines_with(8, "EIGHT!")).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = crate::workspace::WorkspaceManager::new(
+            upstream.path(),
+            tmp.path().join("workspaces"),
+            tmp.path().join("target"),
+        );
+        let mine = mgr
+            .acquire_ephemeral("cycle", crate::workspace::BaseRef::Branch("main".into()))
+            .await
+            .unwrap();
+        let decoy = tmp.path().join("decoy");
+        let pipeline = ChangePipeline::new(&decoy, decoy.join("changes"), true);
+        pipeline.ensure_clean_workspace(&mine.path).await.unwrap();
+
+        pipeline.git_apply_check(&mine.path, &diff).await.unwrap();
+        pipeline.git_apply(&mine.path, &diff).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(mine.path.join("a.txt"))
+                .await
+                .unwrap(),
+            "one\ntwo\nthree\nfour\nfive\nSIX!\nseven\nEIGHT!\nnine\n",
+            "主线动过的那一行要留在原地，作者改的那一行要落上去"
+        );
+    }
+
+    /// 两处改动落在同一行上时，三路合并也解不开：这一份仍然是拒收，理由仍是原来
+    /// 那一句，树也不许留下冲突标记。
+    ///
+    /// 这一条守的是那次退回**不会**顺手放松门：`git apply --check --3way` 对一份
+    /// 合不上的补丁退出 0，只在 stdout 上说「with conflicts」，只看退出码的实现
+    /// 会把它读成「打上了」，然后让带冲突标记的文件一路走到编译。
+    #[tokio::test]
+    async fn a_change_whose_hunks_disagree_with_the_tree_is_still_refused() {
+        let (upstream, _work) = scaffold_upstream().await;
+        let base = nine_lines();
+        rewrite_upstream_file(upstream.path(), "a.txt", &base).await;
+        let before = blob_id(upstream.path(), &base).await;
+        let after = blob_id(upstream.path(), &nine_lines_with(6, "SIX!")).await;
+        let diff = patch_swapping("six", "SIX!", &before, &after);
+        // 主线改的正是补丁要改的那一行。
+        rewrite_upstream_file(upstream.path(), "a.txt", &nine_lines_with(6, "SIX?")).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = crate::workspace::WorkspaceManager::new(
+            upstream.path(),
+            tmp.path().join("workspaces"),
+            tmp.path().join("target"),
+        );
+        let mine = mgr
+            .acquire_ephemeral("cycle", crate::workspace::BaseRef::Branch("main".into()))
+            .await
+            .unwrap();
+        let decoy = tmp.path().join("decoy");
+        let pipeline = ChangePipeline::new(&decoy, decoy.join("changes"), true);
+        pipeline.ensure_clean_workspace(&mine.path).await.unwrap();
+
+        let err = pipeline
+            .git_apply_check(&mine.path, &diff)
+            .await
+            .expect_err("一份与树冲突的补丁不许读成能打上");
+        assert!(
+            err.to_string().contains("patch does not apply"),
+            "拒收理由要还是原来那一句，而不是合并那一侧的措辞：{err}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(mine.path.join("a.txt"))
+                .await
+                .unwrap(),
+            nine_lines_with(6, "SIX?"),
+            "检查这一步不许把冲突标记写进树里"
+        );
+
+        // 真打的那一步同样不许留下半合的树：三路合并一冲突就会就地写标记，
+        // 所以它必须先在 --check 里问过。
+        pipeline
+            .git_apply(&mine.path, &diff)
+            .await
+            .expect_err("真打这一步也不许把冲突读成打上了");
+        assert_eq!(
+            tokio::fs::read_to_string(mine.path.join("a.txt"))
+                .await
+                .unwrap(),
+            nine_lines_with(6, "SIX?"),
+            "被拒的补丁不许在树里留下冲突标记"
+        );
+        let status = tokio::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&mine.path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "被拒的补丁不许在索引里留下未合并项：{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
     }
 
     #[tokio::test]
@@ -5818,178 +5510,6 @@ index 1111111..2222222 100644
             "the failing test is not in the evidence: {}",
             result.test_output
         );
-    }
-
-    /// 一条变更让 CI 会跑的门变红时，它在落地之前就被退回去。
-    ///
-    /// 用真的壳脚本、真的工作流文件、真的 git 树：这里要成立的是「工作流点名的
-    /// 那条门在这个工作目录里被跑起来、它的退出码进了判词」。给夹具喂一份门的
-    /// 转录，只能证明读转录的那段代码认得自己写的东西。
-    #[tokio::test]
-    async fn a_change_that_breaks_a_gate_is_refused_for_it() {
-        let root = tempfile::tempdir().unwrap();
-        seed_a_probe_crate(&root).await;
-        tokio::fs::write(
-            root.path().join("src/lib.rs"),
-            "pub fn answer() -> i32 {\n    42\n}\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
-        )
-        .await
-        .unwrap();
-        // 门：`src/lib.rs` 里不许出现 `banana`。种子树是干净的，所以这条门在改动
-        // 之前是过的——判的是「这条变更让它红了」，不是「这棵树本来就红」。
-        tokio::fs::create_dir_all(root.path().join(".github/workflows"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            root.path().join(".github/workflows/ci.yml"),
-            "      - name: banana\n        run: bash deploy/scripts/check-no-banana.sh\n",
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(root.path().join("deploy/scripts"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            root.path().join("deploy/scripts/check-no-banana.sh"),
-            "#!/bin/sh\ngrep -q banana src/lib.rs && { echo 'the tree carries a banana'; exit 1; }\nexit 0\n",
-        )
-        .await
-        .unwrap();
-        git_ok(root.path(), &["add", "."]).await;
-        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
-
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
-        let change = EvolutionResult {
-            kind: EvolutionKind::CodeChange,
-            artifact_id: "banana-1".into(),
-            description: "加一个取水果名的函数".into(),
-            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
-                      --- a/src/lib.rs\n\
-                      +++ b/src/lib.rs\n\
-                      @@ -6,3 +6,7 @@\n\
-                      \x20fn answer_is_42() {\n\
-                      \x20    assert_eq!(answer(), 42);\n\
-                      \x20}\n\
-                      +pub fn fruit() -> &'static str {\n\
-                      +    \"banana\"\n\
-                      +}\n\
-                      +\n"
-            .into(),
-            status: EvolutionStatus::CompileChecked,
-            created_at: chrono::Utc::now(),
-            eval_summary: None,
-            tiering: None,
-        };
-
-        let result = pipeline
-            .apply_and_test_in(&change, root.path())
-            .await
-            .expect("a judgement about the change is not an environment error");
-        assert_eq!(
-            result.verdict,
-            ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed),
-            "门红了而这条变更被放行了：{}",
-            result.test_output
-        );
-        assert!(
-            result.test_output.contains("check-no-banana.sh"),
-            "证据里没有点出是哪条门红的：{}",
-            result.test_output
-        );
-        assert!(
-            result.test_output.contains("the tree carries a banana"),
-            "证据里没有那条门自己说的那句话：{}",
-            result.test_output
-        );
-    }
-
-    /// 这棵树本来就红的门，不记在那条变更头上。
-    ///
-    /// 与套件那条基线同一个道理：主干红着的时候，若把已有的红算成每一条变更的
-    /// 罪，连修它的那一条都过不去，链就停在那里。
-    #[tokio::test]
-    async fn a_gate_the_tree_already_fails_does_not_refuse_a_change() {
-        let root = tempfile::tempdir().unwrap();
-        seed_a_probe_crate(&root).await;
-        // 种子里就带着 `banana`：这条门在改动之前已经是红的。
-        tokio::fs::write(
-            root.path().join("src/lib.rs"),
-            "pub fn fruit() -> &'static str {\n    \"banana\"\n}\n\n#[test]\nfn fruit_is_a_word() {\n    assert_eq!(fruit(), \"banana\");\n}\n",
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(root.path().join(".github/workflows"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            root.path().join(".github/workflows/ci.yml"),
-            "      - name: banana\n        run: bash deploy/scripts/check-no-banana.sh\n",
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(root.path().join("deploy/scripts"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            root.path().join("deploy/scripts/check-no-banana.sh"),
-            "#!/bin/sh\ngrep -q banana src/lib.rs && { echo 'the tree carries a banana'; exit 1; }\nexit 0\n",
-        )
-        .await
-        .unwrap();
-        git_ok(root.path(), &["add", "."]).await;
-        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
-
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
-        let change = EvolutionResult {
-            kind: EvolutionKind::CodeChange,
-            artifact_id: "unrelated-1".into(),
-            description: "加一行注释".into(),
-            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
-                      --- a/src/lib.rs\n\
-                      +++ b/src/lib.rs\n\
-                      @@ -1,3 +1,4 @@\n\
-                      +// 这一行与那条门无关。\n\
-                      \x20pub fn fruit() -> &'static str {\n\
-                      \x20    \"banana\"\n\
-                      \x20}\n"
-                .into(),
-            status: EvolutionStatus::CompileChecked,
-            created_at: chrono::Utc::now(),
-            eval_summary: None,
-            tiering: None,
-        };
-
-        let result = pipeline
-            .apply_and_test_in(&change, root.path())
-            .await
-            .expect("a judgement about the change is not an environment error");
-        assert_eq!(
-            result.verdict,
-            ChangeVerdict::Passed,
-            "这棵树本来就红的门被算到了这条变更头上：{}",
-            result.test_output
-        );
-        assert!(
-            result.test_output.contains("check-no-banana.sh"),
-            "放行的那一份证据里也要说出哪条门本来就不成立：{}",
-            result.test_output
-        );
-    }
-
-    /// 一个最小的真 crate：够 suite 跑绿，也够门有一个工作目录。
-    async fn seed_a_probe_crate(root: &tempfile::TempDir) {
-        git_ok(root.path(), &["init", "-q"]).await;
-        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
-        git_ok(root.path(), &["config", "user.name", "t"]).await;
-        tokio::fs::write(
-            root.path().join("Cargo.toml"),
-            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(root.path().join("src"))
-            .await
-            .unwrap();
     }
 
     /// A change that writes a line the linter reports on is refused for it, and
@@ -6241,168 +5761,6 @@ index 1111111..2222222 100644
             "the lint criterion did not run at all: {}",
             result.test_output
         );
-    }
-
-    /// A tree whose suite is red, judged by a script that prints the harness's
-    /// own failure line, so the failure can be named rather than inferred.
-    ///
-    /// `seed` is what `verdict.txt` says before any change. The script is the
-    /// deployment's configured test command, so the gate is exercised through
-    /// the same path a real project's suite takes.
-    async fn reproducing_tree(seed: &str) -> (tempfile::TempDir, ChangePipeline) {
-        let root = tempfile::tempdir().unwrap();
-        git_ok(root.path(), &["init", "-q"]).await;
-        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
-        git_ok(root.path(), &["config", "user.name", "t"]).await;
-        tokio::fs::write(root.path().join("verdict.txt"), seed)
-            .await
-            .unwrap();
-        tokio::fs::write(
-            root.path().join("judge.sh"),
-            "if grep -q BROKEN verdict.txt 2>/dev/null; then\n\
-             \x20 echo 'test suite::the_red_check ... FAILED'\n\
-             \x20 exit 1\n\
-             fi\n\
-             echo 'test suite::the_red_check ... ok'\n",
-        )
-        .await
-        .unwrap();
-        git_ok(root.path(), &["add", "."]).await;
-        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
-
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false)
-            // No formatter and no linter: this probe is about the reproduction
-            // gate, and a stage that asked cargo about a tree with no manifest
-            // would refuse before the gate was ever reached.
-            .with_fmt_check_command(Some(vec!["true".into()]))
-            .with_lint_command(Some(Vec::new()))
-            .with_test_command(vec!["sh".into(), "judge.sh".into()]);
-        (root, pipeline)
-    }
-
-    fn rewrite_verdict(from: &str, to: &str) -> String {
-        format!(
-            "diff --git a/verdict.txt b/verdict.txt\n\
-             --- a/verdict.txt\n\
-             +++ b/verdict.txt\n\
-             @@ -1,1 +1,1 @@\n\
-             -{from}\n\
-             +{to}\n"
-        )
-    }
-
-    /// The gate's whole point: a change that turns the tree green *by fixing
-    /// the named test* passes, and its evidence names the red it cleared.
-    ///
-    /// Without the reproduction half this assertion would hold for any change
-    /// that leaves the suite green — including one that never touched the
-    /// failing test — which is exactly the reading that let the same upstream
-    /// red be reworked through six revisions.
-    #[tokio::test]
-    async fn a_change_that_shows_the_red_before_it_shows_the_green_passes() {
-        let (root, pipeline) = reproducing_tree("BROKEN\n").await;
-        let change = EvolutionResult {
-            kind: EvolutionKind::CodeChange,
-            artifact_id: "reproduced-1".into(),
-            description: "让判据看到修好后的取值".into(),
-            content: rewrite_verdict("BROKEN", "FIXED"),
-            status: EvolutionStatus::CompileChecked,
-            created_at: chrono::Utc::now(),
-            eval_summary: None,
-            tiering: None,
-        };
-
-        let result = pipeline
-            .apply_and_test_requiring(&change, root.path(), RedReproduction::Required)
-            .await
-            .expect("a judgement about the change is not an environment error");
-
-        assert_eq!(result.verdict, ChangeVerdict::Passed);
-        assert!(
-            result.test_output.contains("the_red_check"),
-            "the evidence has to name the red this change cleared: {}",
-            result.test_output
-        );
-    }
-
-    /// A tree that is already green is not evidence that this change fixed
-    /// anything, and a change that claims to fix a red check is refused rather
-    /// than pushed on the strength of a green nobody had to earn.
-    #[tokio::test]
-    async fn a_change_whose_red_is_green_without_it_is_refused_as_unreproduced() {
-        let (root, pipeline) = reproducing_tree("FIXED\n").await;
-        let change = EvolutionResult {
-            kind: EvolutionKind::CodeChange,
-            artifact_id: "unreproduced-1".into(),
-            description: "调整判据读到的取值".into(),
-            content: rewrite_verdict("FIXED", "FIXED2"),
-            status: EvolutionStatus::CompileChecked,
-            created_at: chrono::Utc::now(),
-            eval_summary: None,
-            tiering: None,
-        };
-
-        let result = pipeline
-            .apply_and_test_requiring(&change, root.path(), RedReproduction::Required)
-            .await
-            .expect("a judgement about the change is not an environment error");
-
-        assert_eq!(
-            result.verdict,
-            ChangeVerdict::Refused(cog_core::RejectionCause::NotReproduced),
-            "a green that was already green is not a reproduction: {}",
-            result.test_output
-        );
-        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
-    }
-
-    /// Control: the same change and the same tree, with nothing claimed about
-    /// a red. It passes — the gate is about the obligation this change carries,
-    /// not about a tree that happens to be green.
-    #[tokio::test]
-    async fn the_same_change_is_judged_on_green_alone_when_it_owes_no_reproduction() {
-        let (root, pipeline) = reproducing_tree("FIXED\n").await;
-        let change = EvolutionResult {
-            kind: EvolutionKind::CodeChange,
-            artifact_id: "plain-1".into(),
-            description: "调整判据读到的取值".into(),
-            content: rewrite_verdict("FIXED", "FIXED2"),
-            status: EvolutionStatus::CompileChecked,
-            created_at: chrono::Utc::now(),
-            eval_summary: None,
-            tiering: None,
-        };
-
-        let result = pipeline
-            .apply_and_test_requiring(&change, root.path(), RedReproduction::NotRequired)
-            .await
-            .expect("a judgement about the change is not an environment error");
-
-        assert_eq!(result.verdict, ChangeVerdict::Passed);
-    }
-
-    /// The obligation is keyed on the entry point, and a CI fix is the only
-    /// one that carries it. Reading it off the change itself would hand the
-    /// judgement to the party being judged.
-    #[test]
-    fn only_a_change_that_fixes_a_named_red_owes_a_reproduction() {
-        assert_eq!(
-            RedReproduction::for_intent(Some(cog_core::EvolutionIntent::CiFix)),
-            RedReproduction::Required
-        );
-        for other in [
-            None,
-            Some(cog_core::EvolutionIntent::SelfAudit),
-            Some(cog_core::EvolutionIntent::SelfSignal),
-            Some(cog_core::EvolutionIntent::IssueFix),
-            Some(cog_core::EvolutionIntent::Unattributed),
-        ] {
-            assert_eq!(
-                RedReproduction::for_intent(other),
-                RedReproduction::NotRequired,
-                "{other:?} does not claim a specific red"
-            );
-        }
     }
 
     /// A baseline the formatter would rewrite is not one this criterion can
@@ -7223,11 +6581,6 @@ index 1111111..2222222 100644
     /// 抄一份的失败不响：工作流加了门、这里没加，那个门就只在落地二十分钟后、
     /// 在别人头上红一次。所以判的是「读得出来吗、读全了吗、带参数的那条认不认得
     /// 出来」。
-    ///
-    /// 夹具里那六条命令是工作流真实出现的几种写法，不是为解析器编的：壳脚本、
-    /// python 判据、`.github/scripts/` 下的判据、`--check` 只判不写的脚本、带
-    /// 提交区间的、以及一条根本不判树的测试脚本。少了前四种里的任何一种，那一族
-    /// 门就只在 CI 里开口；把最后一种读成门，就是每一条变更都白跑一遍别人的测试。
     #[test]
     fn the_gates_are_the_ones_the_workflow_names() {
         let temp = tempfile::tempdir().unwrap();
@@ -7239,45 +6592,28 @@ index 1111111..2222222 100644
                 "      - name: one\n",
                 "        run: bash deploy/scripts/check-one.sh\n",
                 "      - name: two\n",
-                "        run: python3 deploy/scripts/check-two.py\n",
+                "        run: bash deploy/scripts/check-two.sh\n",
                 "      - name: same one again\n",
                 "        run: bash deploy/scripts/check-one.sh\n",
-                "      - name: a gate that lives outside deploy\n",
-                "        run: bash .github/scripts/check-three.sh\n",
-                "      - name: judge the rendered manifests\n",
-                "        run: bash deploy/scripts/render-deploy.sh --check\n",
                 "      - name: with an argument\n",
-                "        run: bash deploy/scripts/check-four.sh \"${range}\"\n",
-                "      - name: a test, not a judgement\n",
-                "        run: bash deploy/scripts/tests/foo.test.sh\n",
-                "      - name: install a dependency\n",
-                "        run: sudo apt-get update\n",
+                "        run: bash deploy/scripts/check-three.sh \"${range}\"\n",
             ),
         )
         .unwrap();
 
         let gates = ChangePipeline::ci_gate_commands(temp.path()).unwrap();
-        let names: Vec<(String, bool)> = gates
+        let names: Vec<(&str, bool)> = gates
             .iter()
-            .map(|gate| (gate.line(), gate.takes_arguments))
+            .map(|gate| (gate.script.as_str(), gate.takes_arguments))
             .collect();
         assert_eq!(
             names,
             vec![
-                ("bash deploy/scripts/check-one.sh".to_string(), false),
-                ("python3 deploy/scripts/check-two.py".to_string(), false),
-                ("bash .github/scripts/check-three.sh".to_string(), false),
-                (
-                    "bash deploy/scripts/render-deploy.sh --check".to_string(),
-                    false
-                ),
-                (
-                    "bash deploy/scripts/check-four.sh ${range}".to_string(),
-                    true
-                ),
+                ("deploy/scripts/check-one.sh", false),
+                ("deploy/scripts/check-two.sh", false),
+                ("deploy/scripts/check-three.sh", true),
             ],
-            "启动器要跟着命令一起留下（拿 bash 启 .py 是 127）；同一个脚本跑两遍只判一次；\
-             带提交区间的那条要认出来——它在待判的这棵树上没有区间可给"
+            "同一个脚本工作流里跑两遍也只判一次；带参数的那条要认出来——它在待判的这棵树上没有提交区间可给"
         );
     }
 
@@ -7297,17 +6633,12 @@ index 1111111..2222222 100644
             workflows.join("ci.yml"),
             concat!(
                 "        run: bash deploy/scripts/check-ok.sh\n",
-                "        run: python3 deploy/scripts/check-python.py\n",
                 "        run: bash deploy/scripts/check-red.sh\n",
                 "        run: bash deploy/scripts/check-silent.sh\n",
             ),
         )
         .unwrap();
         std::fs::write(scripts.join("check-ok.sh"), "#!/bin/sh\nexit 0\n").unwrap();
-        // 判据不全是用 bash 跑的。这条门把启动器和工作流写法一起判：丢掉启动器、
-        // 拿 `bash` 去启一个 .py，退出码不是 0，读起来正好是一条红了的门——而它
-        // 其实一直是过的。
-        std::fs::write(scripts.join("check-python.py"), "raise SystemExit(0)\n").unwrap();
         std::fs::write(
             scripts.join("check-red.sh"),
             "#!/bin/sh\necho 'this tree breaks the rule'\nexit 1\n",
@@ -7319,14 +6650,10 @@ index 1111111..2222222 100644
         )
         .unwrap();
 
-        let run = ChangePipeline::run_repo_gates(temp.path(), None, None)
+        let run = ChangePipeline::run_repo_gates(temp.path(), None)
             .await
             .unwrap();
-        assert_eq!(
-            run.passed, 2,
-            "退出 0 的壳门与 python 门都是过的：{:?}",
-            run.asked
-        );
+        assert_eq!(run.passed, 1, "退出 0 的那条是过的");
         assert_eq!(
             run.failed.len(),
             1,
@@ -7343,49 +6670,6 @@ index 1111111..2222222 100644
         );
         assert!(run.not_asked[0].0.ends_with("check-silent.sh"));
         assert!(run.not_asked[0].1.contains("缺少依赖"));
-    }
-
-    /// 启动不起来的一条命令也算「没被问过」，而不是把整段门禁带走。
-    ///
-    /// 工作流里 `./deploy/scripts/check-x.sh` 这种写法靠可执行位，而可执行位是检出
-    /// 之间会丢的东西。丢掉它的那条门要是让整段门报 IO 错，这条变更就连其余六十条
-    /// 门的结果都拿不到——读数上写的是这一条没跑成，红绿两栏都是空的，看起来像这段
-    /// 活没跑完，而不是像这一条有问题。
-    #[tokio::test]
-    async fn a_gate_the_host_cannot_launch_is_not_asked_rather_than_a_dead_stage() {
-        let temp = tempfile::tempdir().unwrap();
-        let workflows = temp.path().join(".github/workflows");
-        std::fs::create_dir_all(&workflows).unwrap();
-        let scripts = temp.path().join("deploy/scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            workflows.join("ci.yml"),
-            concat!(
-                "        run: bash deploy/scripts/check-ok.sh\n",
-                "        run: ./deploy/scripts/check-no-exec.sh\n",
-            ),
-        )
-        .unwrap();
-        std::fs::write(scripts.join("check-ok.sh"), "#!/bin/sh\nexit 0\n").unwrap();
-        // 不给可执行位：这正是那条门在这台宿主上的样子。
-        std::fs::write(scripts.join("check-no-exec.sh"), "#!/bin/sh\nexit 0\n").unwrap();
-
-        let run = ChangePipeline::run_repo_gates(temp.path(), None, None)
-            .await
-            .expect("一条启动不了的门不该让整段门禁报错");
-        assert_eq!(run.passed, 1, "另一条门照样跑、照样过：{:?}", run.asked);
-        assert!(
-            run.failed.is_empty(),
-            "启动失败不是这一棵树不成立：{:?}",
-            run.failed
-        );
-        assert_eq!(run.not_asked.len(), 1, "{:?}", run.not_asked);
-        assert!(run.not_asked[0].0.ends_with("check-no-exec.sh"));
-        assert!(
-            run.not_asked[0].1.contains("could not be launched"),
-            "读数要说清是启动不了，而不是门判了红：{:?}",
-            run.not_asked[0].1
-        );
     }
 
     /// 碰到 crate 目录之外的路径，或者一个都不认识，就退回整棵 workspace。
