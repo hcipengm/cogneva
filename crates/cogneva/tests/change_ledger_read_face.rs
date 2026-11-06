@@ -438,6 +438,13 @@ impl cog_core::LlmUsageLedger for FakeUsage {
             .cloned()
             .collect())
     }
+    async fn priced_spend_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<cog_core::PricedSpend, String> {
+        unimplemented!("read-only stand-in")
+    }
     async fn spend_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
         unimplemented!("read-only stand-in")
     }

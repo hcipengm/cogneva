@@ -858,6 +858,93 @@ export async function getTokenAccount(hours?: number): Promise<TokenAccount> {
   return api.get<TokenAccount>(`/api/v1/observability/token-usage/account${query}`);
 }
 
+// ── 花了多少钱（直读逐笔账本，任意区间） ──
+
+/**
+ * 账本里共享同一版价目的一段调用。
+ *
+ * `price_book` 参与分组是这一读的关键：同一个上游调价前后是两版价目，把两版
+ * 加起来得到的钱没有任何一本价目算出来过。它同时让「没定价」在同一个列表里
+ * 读得出来——`price_book` 为 `null` 就是那一组调用没人算过价。
+ */
+export interface SpendLine {
+  actor: string;
+  origin: string;
+  upstream: string;
+  api_style: string;
+  /** 这一组按哪一版价目折算，形如 `CNY@2026-11-05`；`null` = 没算过 */
+  price_book: string | null;
+  /** 价目的币种（`CNY`／`USD`），取自 `price_book` 的前缀；与它同为 null */
+  currency: string | null;
+  calls: number;
+  failed_calls: number;
+  /** 未被缓存服务的那部分输入 */
+  tokens_input: number;
+  /** 被缓存服务的那部分输入 */
+  tokens_cached: number;
+  tokens_output: number;
+  /**
+   * 该币种的百万分之一，只覆盖 `priced_calls` 次调用。
+   * `null` 是「这一组没算过价」，不是「没花钱」——0 才是没花钱。
+   */
+  cost_micros: number | null;
+  /** `calls` 里带着价的那部分。它小于 `calls` 时，钱是一个下界。 */
+  priced_calls: number;
+}
+
+/** 一种币种的合计。两种币种是两笔钱，不是一个汇率。 */
+export interface CurrencyTotal {
+  currency: string;
+  cost_micros: number;
+  priced_calls: number;
+}
+
+export interface SpendTotals {
+  by_currency: CurrencyTotal[];
+  /** 区间里一次价也没算过的调用数。它不为零时，总额是一个下界。 */
+  unpriced_calls: number;
+}
+
+/**
+ * 一段区间花了多少钱。
+ *
+ * `requested_*` 是问的区间，`covered_*` 是账本里**实际有**的最早与最晚一行。
+ * `covered_since` 晚于 `requested_since` 是保留期把前面那段清扫掉了——这件事
+ * 必须显示，因为把它读成零就是「那段没人用模型」。
+ */
+export interface TokenSpend {
+  requested_since: string;
+  requested_until: string;
+  covered_since: string | null;
+  covered_until: string | null;
+  /** 这次读的上限由它算出来（天）：`COGNEVA_LLM_USAGE_KEEP_DAYS` */
+  retention_days: number;
+  rows: SpendLine[];
+  totals: SpendTotals;
+}
+
+/**
+ * 任意区间的花费，直读逐笔账本。
+ *
+ * `since`／`until` 必须成对、且与 `hours` 二选一：只给一半或两个都给，服务端
+ * 返回 400——猜出来的另一半会让响应答成另一个区间，而每一列都还是对的。
+ * 区间宽于保留期同样 400，错误信息里带着旋钮名。
+ */
+export async function getTokenSpend(range: {
+  since?: string;
+  until?: string;
+  hours?: number;
+}): Promise<TokenSpend> {
+  const params = new URLSearchParams();
+  if (range.hours !== undefined) params.set('hours', String(range.hours));
+  if (range.since) params.set('since', range.since);
+  if (range.until) params.set('until', range.until);
+  const query = params.toString();
+  return api.get<TokenSpend>(
+    `/api/v1/observability/token-usage/spend${query ? `?${query}` : ''}`,
+  );
+}
+
 // ── 活跃告警（内存事件 + 耐久表合并） ──
 
 /** 一条正在 firing 的告警。 */

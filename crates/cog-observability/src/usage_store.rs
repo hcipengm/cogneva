@@ -1724,6 +1724,79 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// What the calls in `[since, until)` cost, grouped by
+    /// `(actor, origin, upstream, api_style, price_book)`.
+    ///
+    /// Two sums travel together and neither can stand for the other:
+    /// `SUM(cost_micros)` is the money, and `COUNT(cost_micros)` is how many
+    /// calls it covers. The second is what keeps an unpriced range from reading
+    /// as an inexpensive one — `SUM` over a group where every row is NULL is
+    /// NULL, and `COUNT` says why. A caller that printed the first without the
+    /// second would fold "no price list applies" into "cost nothing".
+    ///
+    /// `price_book` is in the grouping, so the rows of one upstream split at a
+    /// price change instead of being summed into a number neither book
+    /// produced.
+    pub async fn priced_spend_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<cog_core::PricedSpend> {
+        let ok_word = UsageResult::Ok.as_str();
+        let covered = sqlx::query(&format!(
+            "SELECT MIN(ts) AS covered_since, MAX(ts) AS covered_until \
+             FROM {LEDGER_TABLE} WHERE ts >= $1 AND ts < $2"
+        ))
+        .bind(since)
+        .bind(until)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT actor, origin, upstream, api_style, price_book,
+                   COUNT(*) AS calls,
+                   COUNT(*) FILTER (WHERE result <> '{ok_word}') AS failed_calls,
+                   COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
+                   COALESCE(SUM(tokens_cached), 0)::BIGINT AS tokens_cached,
+                   COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output,
+                   -- 不套 COALESCE：一组全是 NULL 时 SUM 就是 NULL，而那一格
+                   -- 的意思是「这些调用没算过价」，不是「没花钱」。
+                   SUM(cost_micros)::BIGINT AS cost_micros,
+                   COUNT(cost_micros) AS priced_calls
+            FROM {LEDGER_TABLE}
+            WHERE ts >= $1 AND ts < $2
+            GROUP BY actor, origin, upstream, api_style, price_book
+            ORDER BY SUM(cost_micros) DESC NULLS LAST, calls DESC,
+                     actor, origin, upstream, api_style
+            "#
+        ))
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(cog_core::PricedSpend {
+            covered_since: covered.get::<Option<DateTime<Utc>>, _>("covered_since"),
+            covered_until: covered.get::<Option<DateTime<Utc>>, _>("covered_until"),
+            rows: rows
+                .iter()
+                .map(|r| cog_core::PricedSpendRow {
+                    actor: r.get("actor"),
+                    origin: r.get("origin"),
+                    upstream: r.get("upstream"),
+                    api_style: r.get("api_style"),
+                    price_book: r.get("price_book"),
+                    calls: r.get("calls"),
+                    failed_calls: r.get("failed_calls"),
+                    tokens_input: r.get("tokens_input"),
+                    tokens_cached: r.get("tokens_cached"),
+                    tokens_output: r.get("tokens_output"),
+                    cost_micros: r.get("cost_micros"),
+                    priced_calls: r.get("priced_calls"),
+                })
+                .collect(),
+        })
+    }
+
     /// Every `(actor, origin, upstream, api_style)` the ledger has ever recorded.
     ///
     /// This is the set a window is completed against so that "no traffic" still
@@ -2167,6 +2240,16 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
 
     async fn record_exchange(&self, record: &LlmExchangeRecord) -> Result<(), String> {
         LlmUsageStore::record_exchange(self, record)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn priced_spend_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<cog_core::PricedSpend, String> {
+        LlmUsageStore::priced_spend_between(self, since, until)
             .await
             .map_err(|e| e.to_string())
     }

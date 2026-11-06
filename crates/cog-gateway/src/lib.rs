@@ -1287,6 +1287,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/observability/token-usage/account",
             get(observability::token_account_handler),
         )
+        // 花了多少钱：直读逐笔账本，按调用时刻切任意区间。上面那几个读的是折叠
+        // 表，最新一个数是一小时前的，而且折叠里没有钱这一列。
+        .route(
+            "/api/v1/observability/token-usage/spend",
+            get(observability::token_spend_handler),
+        )
         // 按主体看当天花销：额度写入面收的是一个 id，而运维在看见「谁在花」之前
         // 不知道该给谁写上限。窗口就是额度判定的那个 UTC 日，不是「最近 N 小时」。
         .route(

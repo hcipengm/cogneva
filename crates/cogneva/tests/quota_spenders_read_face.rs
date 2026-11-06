@@ -206,6 +206,13 @@ impl LlmUsageLedger for FakeSpend {
     async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
         unimplemented!("只读替身")
     }
+    async fn priced_spend_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<cog_core::PricedSpend, String> {
+        unimplemented!("只读替身")
+    }
     async fn spend_by_task_since(
         &self,
         _: &[String],

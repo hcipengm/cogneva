@@ -60,7 +60,7 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// which task bought which tokens — and that is a promise about the ledger
 /// rather than a side effect of the table's size.
 // cap: bound — 「哪条任务买了多少 token」是关于这本账的承诺，不是表大小的副作用
-pub const DEFAULT_KEEP_DAYS: i64 = 30;
+pub const DEFAULT_KEEP_DAYS: i64 = cog_core::retention::LLM_USAGE_KEEP_DAYS_DEFAULT;
 
 /// The shortest retention this loop will accept.
 ///
@@ -68,10 +68,10 @@ pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// reads as a working retention while destroying the rows the current hour's
 /// fold is computed from — the value falls back rather than being honoured.
 // cap: bound — 更短读作一条在工作的保留期，却把当前小时那个折赖以计算的删掉；低于它的值回退
-pub const MIN_KEEP_DAYS: i64 = 1;
+pub const MIN_KEEP_DAYS: i64 = cog_core::retention::LLM_USAGE_KEEP_DAYS_MIN;
 
 /// The environment variable that carries the retention.
-pub const KEEP_DAYS_ENV: &str = "COGNEVA_LLM_USAGE_KEEP_DAYS";
+pub const KEEP_DAYS_ENV: &str = cog_core::retention::LLM_USAGE_KEEP_DAYS_ENV;
 
 /// How often the loop looks for rows past the retention.
 ///
@@ -372,7 +372,7 @@ impl UsageRetention {
 /// into one that is trivially bounded and the promise to its readers into one
 /// that was never kept.
 pub fn keep_days_from_env() -> i64 {
-    keep_days_from(std::env::var(KEEP_DAYS_ENV).ok().as_deref())
+    cog_core::retention::llm_usage_keep_days()
 }
 
 /// [`keep_days_from_env`] against an explicit value, so the fallback can be
@@ -383,7 +383,7 @@ pub fn keep_days_from_env() -> i64 {
 /// that spent nothing rather than one that stopped keeping the books. Nothing
 /// downstream can tell those apart, so `0` is treated as a misconfiguration.
 pub fn keep_days_from(raw: Option<&str>) -> i64 {
-    cog_core::retention::keep_days_or_default(raw, DEFAULT_KEEP_DAYS, MIN_KEEP_DAYS)
+    cog_core::retention::llm_usage_keep_days_from(raw)
 }
 
 /// The deployment this process runs in, for the readings below.

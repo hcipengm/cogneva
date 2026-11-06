@@ -339,24 +339,41 @@ fn default_usage_hours() -> i64 {
     24
 }
 
-/// Cap on the trailing window one request may ask for.
+/// How far back a spend read may reach, in hours, taken from the ledger's own
+/// retention rather than written down here.
 ///
-/// Bounded so a single refresh cannot ask the fold for a range wider than the
-/// ledger's own history; a request past the fold's reach is answered as an
-/// uncovered range either way, so the cap bounds the scan and not the honesty
-/// of the answer.
-// cap: bound — 用量查询最多回多少小时，界的是单次聚合的代价
-const MAX_USAGE_HOURS: i64 = 24 * 7;
+/// A constant here and a knob there are two promises, and the day they disagree
+/// nothing reports it: the sweep keeps thirty days, the read answers seven, and
+/// both look healthy — twenty-three days of rows sit in the table and no caller
+/// can reach them. Deriving the ceiling from
+/// [`cog_core::retention::llm_usage_keep_days`] makes the two statements one
+/// statement. It is evaluated per call rather than cached in a `const` so a
+/// deployment that changes the knob changes the read with it.
+fn usage_reach_hours() -> i64 {
+    cog_core::retention::llm_usage_keep_days().max(1) * 24
+}
+
+/// Cap on the *per-window* read's trailing span.
+///
+/// This one is genuinely about the response, not about the data: that read
+/// returns one row per window per `(actor, origin, upstream, protocol)`, so the
+/// range *is* the response size — the fold held 55,996 rows over its first five
+/// weeks and a chart cannot draw them. The summed reads have no such limit and
+/// derive theirs from the retention ([`usage_reach_hours`]); only this one is
+/// bounded by how much can be drawn.
+// cap: bound — 逐窗口那一读的响应大小就是区间本身，界的是画得出来多少格
+const MAX_SERIES_HOURS: i64 = 24 * 7;
 
 /// The instant a spend request asks the fold to sum from.
 ///
 /// `hours <= 0` is how a caller asks for everything the fold holds rather than
-/// for a trailing window. It is a separate answer from clamping to the cap:
-/// the cap bounds one scan, while "all of it" is the only way to read a
+/// for a trailing window. It is a separate answer from clamping to the reach:
+/// the reach bounds one scan, while "all of it" is the only way to read a
 /// cumulative total at all, and a reader that wanted the total and silently got
-/// seven days would publish a number that looks like the total and is not. The
-/// honest bound still travels: every read reports the range the fold actually
-/// covered, so the cumulative figure arrives with the day it starts on.
+/// a bounded span would publish a number that looks like the total and is not.
+/// The honest bound still travels: every read reports the range the fold
+/// actually covered, so the cumulative figure arrives with the day it starts
+/// on.
 ///
 /// The floor is the epoch rather than "now minus something large" because the
 /// fold's oldest window is not known here — asking from before any ledger row
@@ -366,7 +383,7 @@ fn usage_since(hours: i64, until: chrono::DateTime<chrono::Utc>) -> chrono::Date
     if hours <= 0 {
         return chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
     }
-    until - chrono::Duration::hours(hours.clamp(1, MAX_USAGE_HOURS))
+    until - chrono::Duration::hours(hours.clamp(1, usage_reach_hours()))
 }
 
 /// The instant a *per-window* read starts from: always a bounded trailing span.
@@ -379,12 +396,14 @@ fn usage_since(hours: i64, until: chrono::DateTime<chrono::Utc>) -> chrono::Date
 /// the cap here, and that is not a silent substitution: the answer's own
 /// `covered_since` names the first window it drew, so a reader that asked for
 /// more than seven days can see where the drawing starts. `hours <= 0` keeps the
-/// same reading as [`usage_since`] — "as wide as this read goes".
+/// same reading as [`usage_since`] — "as wide as this read goes" — and the two
+/// reach different distances on purpose: this read's limit is how much can be
+/// drawn, that one's is how much the ledger still holds.
 fn series_since(hours: i64, until: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
     if hours <= 0 {
-        return until - chrono::Duration::hours(MAX_USAGE_HOURS);
+        return until - chrono::Duration::hours(MAX_SERIES_HOURS);
     }
-    until - chrono::Duration::hours(hours.clamp(1, MAX_USAGE_HOURS))
+    until - chrono::Duration::hours(hours.clamp(1, MAX_SERIES_HOURS))
 }
 
 /// The rolled spend, with the range of windows it was summed over.
@@ -485,6 +504,251 @@ fn token_series_response(series: cog_core::UsageSeries) -> TokenSeriesResponse {
         covered_since: series.covered_since.map(|t| t.to_rfc3339()),
         covered_until: series.covered_until.map(|t| t.to_rfc3339()),
         rows: series.rows,
+    }
+}
+
+// ─── What was spent, in money, over a range the caller chooses ───
+
+/// Query parameters for [`token_spend_handler`].
+///
+/// Two forms, never mixed: `since` + `until` (RFC3339, both, exclusive end) or
+/// a trailing `hours`. Mixing them is refused rather than resolved by
+/// precedence — a caller that sent both believes something about which one wins,
+/// and guessing wrong hands them a number for a range they did not ask about
+/// while every field in the answer still looks plausible.
+#[derive(Debug, Deserialize)]
+pub struct TokenSpendQuery {
+    pub hours: Option<i64>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+/// One slice of the ledger that shares a price book.
+#[derive(Debug, Serialize)]
+pub struct SpendLine {
+    pub actor: String,
+    pub origin: String,
+    pub upstream: String,
+    pub api_style: String,
+    /// The price list these calls were priced from. `null` on the rows that are
+    /// the whole point of [`Self::priced_calls`] — money nobody computed.
+    pub price_book: Option<String>,
+    /// The book's currency code (`CNY` / `USD`), read off the book's label.
+    /// `null` exactly when `price_book` is.
+    pub currency: Option<String>,
+    pub calls: i64,
+    pub failed_calls: i64,
+    /// The uncached half of the prompt.
+    pub tokens_input: i64,
+    /// The cached half. `tokens_input + tokens_cached` is the whole prompt.
+    pub tokens_cached: i64,
+    pub tokens_output: i64,
+    /// In [`Self::currency`]'s millionths, over [`Self::priced_calls`] calls.
+    pub cost_micros: Option<i64>,
+    pub priced_calls: i64,
+}
+
+/// Money per currency, summed over the rows.
+#[derive(Debug, Serialize)]
+pub struct CurrencyTotal {
+    pub currency: String,
+    pub cost_micros: i64,
+    pub priced_calls: i64,
+}
+
+/// The two halves of a spend total that must not be added together.
+#[derive(Debug, Serialize)]
+pub struct SpendTotals {
+    /// One line per currency. Two currencies are two totals, not an exchange
+    /// rate: this platform bills in whatever each upstream's price list says,
+    /// and converting here would invent a rate nobody checked.
+    pub by_currency: Vec<CurrencyTotal>,
+    /// Calls in the range that carried no price at all. Read beside the money:
+    /// a total whose unpriced count is not zero is a floor, not a measurement.
+    pub unpriced_calls: i64,
+}
+
+/// What a range of the ledger cost, at call granularity.
+#[derive(Debug, Serialize)]
+pub struct TokenSpendResponse {
+    /// What the request asked for, echoed so the answer is self-describing.
+    pub requested_since: String,
+    pub requested_until: String,
+    /// The oldest and newest rows the ledger actually held inside that range.
+    /// `null` together when nothing was there. A `covered_since` later than
+    /// `requested_since` is the retention having swept the earlier part —
+    /// reported, because a zero would say "we spent nothing then".
+    pub covered_since: Option<String>,
+    pub covered_until: Option<String>,
+    /// The knob this read's ceiling came from, so a refused wider range can be
+    /// traced to the deployment rather than to a magic number.
+    pub retention_days: i64,
+    pub rows: Vec<SpendLine>,
+    pub totals: SpendTotals,
+}
+
+/// Resolve the requested range, or say why it cannot be answered.
+///
+/// The ceiling is the ledger's own retention
+/// ([`cog_core::retention::llm_usage_keep_days`]), not a constant: a fixed one
+/// drifts the day somebody changes the retention, and the drift is invisible —
+/// both the sweep and the read keep working, one of them over a range the other
+/// has already deleted. Asking wider than the retention is an error rather than
+/// a silent clamp, because the clamp returns the same rows a genuinely quiet
+/// month returns.
+fn spend_range(
+    q: &TokenSpendQuery,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), ApiError> {
+    let days = cog_core::retention::llm_usage_keep_days();
+    let reach = chrono::Duration::hours(days.max(1) * 24);
+    let ceiling = format!(
+        "{} 天（{}={}）",
+        days.max(1),
+        cog_core::retention::LLM_USAGE_KEEP_DAYS_ENV,
+        days
+    );
+    let parse = |name: &str, raw: &str| {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                ApiError::bad_request(format!(
+                    "{name}={raw} 不是 RFC3339 时刻（例如 2026-11-06T00:00:00+08:00）：{e}"
+                ))
+            })
+    };
+    let (since, until) = match (&q.since, &q.until) {
+        (Some(s), Some(u)) => (parse("since", s)?, parse("until", u)?),
+        (None, None) => {
+            let hours = q.hours.unwrap_or_else(default_usage_hours);
+            // `hours <= 0` keeps the reading the other spend faces give it: as
+            // far back as this read can go. Here that is the retention, because
+            // anything older has been swept and would come back empty.
+            let span = if hours <= 0 {
+                reach
+            } else {
+                chrono::Duration::hours(hours)
+            };
+            (now - span, now)
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "since 与 until 必须成对给出：只给一个时另一半只能靠猜，而猜错的那一半不会有任何一列看得出来",
+            ))
+        }
+    };
+    if q.hours.is_some() && (q.since.is_some() || q.until.is_some()) {
+        return Err(ApiError::bad_request(
+            "hours 与 since/until 只能二选一：两个都给时用哪个都要靠约定，而约定看不见",
+        ));
+    }
+    if until <= since {
+        return Err(ApiError::bad_request(format!(
+            "until 必须晚于 since：{}, {}",
+            since.to_rfc3339(),
+            until.to_rfc3339()
+        )));
+    }
+    if until - since > reach {
+        return Err(ApiError::bad_request(format!(
+            "区间 {} 超过用量账的保留期 {ceiling}；更早的行已经被清扫删掉，再往外读只会答成一个看起来像零的缺口",
+            until - since
+        )));
+    }
+    Ok((since, until))
+}
+
+/// The currency a price book's label names: the part before `@`.
+///
+/// The label is written once, by `PriceBook::label`, as `<currency>@<date>`.
+/// Reading the prefix rather than storing a second column keeps the two from
+/// disagreeing — there is one string, and the currency is derivable from it.
+fn book_currency(book: &str) -> String {
+    book.split('@').next().unwrap_or(book).to_string()
+}
+
+/// What the calls in a caller-chosen range cost, read from the per-call ledger.
+pub async fn token_spend_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<TokenSpendQuery>,
+) -> Result<Json<TokenSpendResponse>, ApiError> {
+    let ledger = state
+        .llm_usage
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("token usage ledger not configured"))?;
+    let now = chrono::Utc::now();
+    let (since, until) = spend_range(&q, now)?;
+    let spend = ledger
+        .priced_spend_between(since, until)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to read the spend ledger: {e}")))?;
+    Ok(Json(spend_response(since, until, spend)))
+}
+
+/// Project a ledger spend read onto the response face.
+fn spend_response(
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+    spend: cog_core::PricedSpend,
+) -> TokenSpendResponse {
+    // Totals are accumulated from the same rows the response carries, not from
+    // a second query: a separate `SUM` is a second answer to the same question,
+    // and the two disagree the first time one of them gains a filter.
+    let mut by_currency: Vec<CurrencyTotal> = Vec::new();
+    let mut unpriced_calls = 0i64;
+    let rows: Vec<SpendLine> = spend
+        .rows
+        .into_iter()
+        .map(|r| {
+            let currency = r.price_book.as_deref().map(book_currency);
+            // Unpriced is counted from the two numbers the ledger itself
+            // produced: the calls and the ones that carried money. A row with a
+            // book whose window did not cover these calls has `cost_micros:
+            // null` and `priced_calls: 0`, so it lands here too — which is
+            // right, because "priced from a book that does not cover this hour"
+            // is exactly as unpriced as "no book at all".
+            unpriced_calls += r.calls - r.priced_calls;
+            if let (Some(c), Some(micros)) = (&currency, r.cost_micros) {
+                match by_currency.iter_mut().find(|t| &t.currency == c) {
+                    Some(t) => {
+                        t.cost_micros += micros;
+                        t.priced_calls += r.priced_calls;
+                    }
+                    None => by_currency.push(CurrencyTotal {
+                        currency: c.clone(),
+                        cost_micros: micros,
+                        priced_calls: r.priced_calls,
+                    }),
+                }
+            }
+            SpendLine {
+                actor: r.actor,
+                origin: r.origin,
+                upstream: r.upstream,
+                api_style: r.api_style,
+                price_book: r.price_book,
+                currency,
+                calls: r.calls,
+                failed_calls: r.failed_calls,
+                tokens_input: r.tokens_input,
+                tokens_cached: r.tokens_cached,
+                tokens_output: r.tokens_output,
+                cost_micros: r.cost_micros,
+                priced_calls: r.priced_calls,
+            }
+        })
+        .collect();
+    TokenSpendResponse {
+        requested_since: since.to_rfc3339(),
+        requested_until: until.to_rfc3339(),
+        covered_since: spend.covered_since.map(|t| t.to_rfc3339()),
+        covered_until: spend.covered_until.map(|t| t.to_rfc3339()),
+        retention_days: cog_core::retention::llm_usage_keep_days(),
+        rows,
+        totals: SpendTotals {
+            by_currency,
+            unpriced_calls,
+        },
     }
 }
 
@@ -1446,14 +1710,21 @@ mod tests {
              seven-day sum under the name of a cumulative total"
         );
         assert!(
-            usage_since(-5, until) < usage_since(MAX_USAGE_HOURS, until),
+            usage_since(-5, until) < usage_since(usage_reach_hours(), until),
             "a negative window means the same thing as zero and must not fall back to a \
              trailing one"
         );
         assert_eq!(
             usage_since(10_000, until),
-            until - chrono::Duration::hours(MAX_USAGE_HOURS),
-            "a trailing window past the cap is still answered at the cap"
+            until - chrono::Duration::hours(usage_reach_hours()),
+            "a trailing window past the reach is answered at the reach — and the reach is the \
+             ledger's own retention, not a number written here"
+        );
+        // 上限必须来自保留期：账本留着多久，这一读就能问多久。写死的七日上限
+        // 在保留期被改成三十天之后仍会说七天，而两边的读数各自都正常。
+        assert_eq!(
+            usage_reach_hours(),
+            cog_core::retention::llm_usage_keep_days().max(1) * 24
         );
         assert_eq!(
             usage_since(6, until),
@@ -1473,7 +1744,7 @@ mod tests {
             .with_timezone(&chrono::Utc);
         assert_eq!(
             series_since(0, until),
-            until - chrono::Duration::hours(MAX_USAGE_HOURS),
+            until - chrono::Duration::hours(MAX_SERIES_HOURS),
             "asking for everything on the per-window read is answered at the widest span \
              the bars can be drawn for"
         );
@@ -1918,5 +2189,255 @@ mod tests {
             pace["window_start_at"].is_null(),
             "没有共同的窗就没有起点，读者不能拿它加窗长：{wire}"
         );
+    }
+
+    // ─── 花多少钱：区间与金额 ───
+
+    fn spend_query(
+        hours: Option<i64>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> TokenSpendQuery {
+        TokenSpendQuery {
+            hours,
+            since: since.map(str::to_string),
+            until: until.map(str::to_string),
+        }
+    }
+
+    /// 两种写法互斥。两个都给时没有哪一个是「显然」该赢的，而选错的那一次
+    /// 返回的是另一个区间的钱——每一列都还在、都对，只是答的不是它问的。
+    #[test]
+    fn a_range_and_a_trailing_window_are_refused_together() {
+        let now = chrono::Utc::now();
+        let err = spend_range(
+            &spend_query(
+                Some(6),
+                Some("2026-11-06T00:00:00Z"),
+                Some("2026-11-06T06:00:00Z"),
+            ),
+            now,
+        )
+        .expect_err("两种写法同时给必须被拒");
+        assert!(err.message.contains("二选一"), "{}", err.message);
+    }
+
+    /// 只给一半同样拒。另一半只能靠猜，而猜出来的区间与真区间在响应里长得一样。
+    #[test]
+    fn half_a_range_is_refused() {
+        let now = chrono::Utc::now();
+        for q in [
+            spend_query(None, Some("2026-11-06T00:00:00Z"), None),
+            spend_query(None, None, Some("2026-11-06T06:00:00Z")),
+        ] {
+            let err = spend_range(&q, now).expect_err("半个区间必须被拒");
+            assert!(err.message.contains("成对"), "{}", err.message);
+        }
+    }
+
+    /// 倒着的区间拒绝，不自动交换：交换会把一个写错的区间悄悄答成另一个正确的
+    /// 区间，而调用方永远不知道自己的输入曾经是错的。
+    #[test]
+    fn a_backwards_range_is_refused_rather_than_swapped() {
+        let now = chrono::Utc::now();
+        let err = spend_range(
+            &spend_query(
+                None,
+                Some("2026-11-06T06:00:00Z"),
+                Some("2026-11-06T00:00:00Z"),
+            ),
+            now,
+        )
+        .expect_err("倒着的区间必须被拒");
+        assert!(err.message.contains("晚于"), "{}", err.message);
+    }
+
+    /// 读得比保留期还宽时要拒，并且拒的理由里必须出现那个旋钮的名字。
+    ///
+    /// 上限不是常量：它由 `COGNEVA_LLM_USAGE_KEEP_DAYS` 算出来。写死的上限在
+    /// 保留期被改的那天就开始撒谎，而两边各自的读数都正常——账本留三十天、接口
+    /// 只覆盖七天就是这样长出来的。这条测试盯着的是「理由里有没有那个变量名」，
+    /// 所以把上限改回一个数字会让它红。
+    #[test]
+    fn asking_past_the_retention_names_the_knob_that_bounds_it() {
+        let now = chrono::Utc::now();
+        let days = cog_core::retention::llm_usage_keep_days();
+        let since = now - chrono::Duration::hours(days * 24 + 1);
+        let err = spend_range(
+            &spend_query(None, Some(&since.to_rfc3339()), Some(&now.to_rfc3339())),
+            now,
+        )
+        .expect_err("超出保留期必须被拒");
+        let text = err.message;
+        assert!(
+            text.contains(cog_core::retention::LLM_USAGE_KEEP_DAYS_ENV),
+            "拒的理由里要点出是哪个旋钮界的这个范围：{text}"
+        );
+        // 恰好等于保留期是合法的：清扫删的是更早的行，不是边界本身。
+        let edge = now - chrono::Duration::hours(days * 24);
+        assert!(
+            spend_range(
+                &spend_query(None, Some(&edge.to_rfc3339()), Some(&now.to_rfc3339())),
+                now
+            )
+            .is_ok(),
+            "恰好一个保留期宽的区间应当可读"
+        );
+    }
+
+    /// `hours <= 0` 在本进程的其他花销读法里是「能读多远读多远」。这里能读多远
+    /// 就是保留期——再往前是被清扫删掉的行，答成一零读起来像那段没人用。
+    #[test]
+    fn hours_zero_reaches_back_exactly_one_retention() {
+        let now = chrono::Utc::now();
+        let days = cog_core::retention::llm_usage_keep_days();
+        let (since, until) = spend_range(&spend_query(Some(0), None, None), now).expect("必须可读");
+        assert_eq!(until, now);
+        assert_eq!(since, now - chrono::Duration::hours(days * 24));
+    }
+
+    /// 一组里所有调用都没价时，钱那一格是 `null`，不是 0。
+    ///
+    /// 0 会被读成「这一组没花钱」，而真相是「这一组的价钱没人算过」。两种情形
+    /// 的补救方向相反：一个去看价目配没配，一个什么都不用做。
+    #[test]
+    fn a_group_with_no_price_carries_null_money_and_counts_its_unpriced_calls() {
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let until = chrono::Utc::now();
+        let response = spend_response(
+            since,
+            until,
+            cog_core::PricedSpend {
+                covered_since: Some(since),
+                covered_until: Some(until),
+                rows: vec![cog_core::PricedSpendRow {
+                    actor: "generator".into(),
+                    origin: "resident_worker".into(),
+                    upstream: "u".into(),
+                    api_style: "anthropic".into(),
+                    price_book: None,
+                    calls: 7,
+                    failed_calls: 0,
+                    tokens_input: 100,
+                    tokens_cached: 900,
+                    tokens_output: 50,
+                    cost_micros: None,
+                    priced_calls: 0,
+                }],
+            },
+        );
+        assert_eq!(response.rows[0].cost_micros, None);
+        assert_eq!(response.rows[0].currency, None);
+        assert_eq!(response.totals.unpriced_calls, 7);
+        assert!(response.totals.by_currency.is_empty());
+    }
+
+    /// 一组里只有一部分调用有价时，钱盖的是那几次，缺口必须单独数出来。
+    /// 把缺口并进总额，等于让没定价的调用按零元结算。
+    #[test]
+    fn money_covers_only_the_priced_calls_and_the_gap_is_counted() {
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let until = chrono::Utc::now();
+        let response = spend_response(
+            since,
+            until,
+            cog_core::PricedSpend {
+                covered_since: Some(since),
+                covered_until: Some(until),
+                rows: vec![
+                    cog_core::PricedSpendRow {
+                        actor: "generator".into(),
+                        origin: "resident_worker".into(),
+                        upstream: "u".into(),
+                        api_style: "openai".into(),
+                        price_book: Some("CNY@2026-11-05".into()),
+                        calls: 10,
+                        failed_calls: 1,
+                        tokens_input: 1_000,
+                        tokens_cached: 9_000,
+                        tokens_output: 500,
+                        cost_micros: Some(12_345),
+                        priced_calls: 8,
+                    },
+                    cog_core::PricedSpendRow {
+                        actor: "planner".into(),
+                        origin: "resident_worker".into(),
+                        upstream: "u".into(),
+                        api_style: "openai".into(),
+                        price_book: Some("CNY@2026-11-05".into()),
+                        calls: 2,
+                        failed_calls: 0,
+                        tokens_input: 100,
+                        tokens_cached: 0,
+                        tokens_output: 10,
+                        cost_micros: Some(755),
+                        priced_calls: 2,
+                    },
+                ],
+            },
+        );
+        assert_eq!(response.rows[0].currency.as_deref(), Some("CNY"));
+        assert_eq!(
+            response.totals.unpriced_calls, 2,
+            "10+2 次调用里只有 10 次有价"
+        );
+        assert_eq!(response.totals.by_currency.len(), 1);
+        assert_eq!(response.totals.by_currency[0].currency, "CNY");
+        assert_eq!(response.totals.by_currency[0].cost_micros, 12_345 + 755);
+        assert_eq!(response.totals.by_currency[0].priced_calls, 10);
+    }
+
+    /// 两种币种各自合计，不相加。相加要一个汇率，而汇率没有任何一处核对过；
+    /// 加起来的那一个数会被当成「总共花了多少」。
+    #[test]
+    fn two_currencies_are_two_totals() {
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let until = chrono::Utc::now();
+        let row = |book: &str, micros: i64| cog_core::PricedSpendRow {
+            actor: "a".into(),
+            origin: "o".into(),
+            upstream: "u".into(),
+            api_style: "p".into(),
+            price_book: Some(book.into()),
+            calls: 1,
+            failed_calls: 0,
+            tokens_input: 1,
+            tokens_cached: 0,
+            tokens_output: 1,
+            cost_micros: Some(micros),
+            priced_calls: 1,
+        };
+        let response = spend_response(
+            since,
+            until,
+            cog_core::PricedSpend {
+                covered_since: Some(since),
+                covered_until: Some(until),
+                rows: vec![row("CNY@2026-11-05", 100), row("USD@2026-11-01", 200)],
+            },
+        );
+        assert_eq!(response.totals.by_currency.len(), 2);
+        assert_eq!(response.totals.unpriced_calls, 0);
+    }
+
+    /// 区间里一行都没有时，覆盖区间两端一起是 `null`，不是把请求的区间回显成
+    /// 覆盖。回显会让「这段没人用」与「这段没读到」变成一个答案。
+    #[test]
+    fn an_empty_range_reports_no_coverage_rather_than_echoing_the_request() {
+        let since = chrono::Utc::now() - chrono::Duration::hours(6);
+        let until = chrono::Utc::now();
+        let response = spend_response(
+            since,
+            until,
+            cog_core::PricedSpend {
+                covered_since: None,
+                covered_until: None,
+                rows: vec![],
+            },
+        );
+        assert_eq!(response.covered_since, None);
+        assert_eq!(response.covered_until, None);
+        assert_eq!(response.requested_since, since.to_rfc3339());
+        assert_eq!(response.totals.unpriced_calls, 0);
     }
 }

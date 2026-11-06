@@ -663,6 +663,56 @@ pub struct SpendVerdictLine {
     pub tokens_output: i64,
 }
 
+/// One line of the money read: every call in a slice of the ledger that shares
+/// a price book, summed.
+///
+/// `price_book` is part of the grouping rather than a decoration. Two calls
+/// served by the same upstream at different times can have been priced from
+/// different books (a price change lands as a new `checked_at`), and a sum that
+/// mixed them would answer "what did this cost" with a number no single price
+/// list ever produced. It also makes the two states a spend face must keep
+/// apart readable in the same list: `Some("CNY@2026-11-05")` is money in yuan,
+/// `None` is calls nobody priced. The currency is the prefix before `@`.
+///
+/// `cost_micros` covers `priced_calls` calls, not all of [`Self::calls`].
+/// A row where the two differ is a range where part of the traffic had no
+/// price — read as a total, that gap silently becomes free traffic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PricedSpendRow {
+    pub actor: String,
+    pub origin: String,
+    pub upstream: String,
+    pub api_style: String,
+    /// The price list these calls were priced from, `None` when none applies.
+    pub price_book: Option<String>,
+    /// Every metered call in the slice, failed ones included.
+    pub calls: i64,
+    pub failed_calls: i64,
+    /// The uncached half of the prompt. `tokens_input + tokens_cached` is the
+    /// whole prompt, on every protocol face.
+    pub tokens_input: i64,
+    pub tokens_cached: i64,
+    pub tokens_output: i64,
+    /// The sum over the calls that carried a price, in the currency's
+    /// millionths. `None` when no call in the slice carried one — that is
+    /// "nothing was priced", which a zero would render as "free".
+    pub cost_micros: Option<i64>,
+    /// How many of [`Self::calls`] carried a price.
+    pub priced_calls: i64,
+}
+
+/// What a range of the ledger actually held, for the callers that must report
+/// coverage rather than assume it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PricedSpend {
+    /// The oldest call row inside the requested range, `None` when there was
+    /// none. A range whose requested start is older than the retention says so
+    /// by answering with a later `covered_since`, not by returning zero.
+    pub covered_since: Option<DateTime<Utc>>,
+    pub covered_until: Option<DateTime<Utc>>,
+    pub rows: Vec<PricedSpendRow>,
+}
+
 /// The writing and window-reading face of the spend ledger.
 ///
 /// Separate from the reporting face ([`crate::LlmUsageReader`]) because the two
@@ -775,6 +825,28 @@ pub trait LlmUsageLedger: Send + Sync {
     /// started and a job that cost nothing are different answers to "what has
     /// this run cost so far", and only the caller knows which one it asked.
     async fn spend_by_task(&self, task_ids: &[String]) -> Result<Vec<(String, u64)>, String>;
+
+    /// What the calls in `[since, until)` cost, per `(actor, origin, upstream,
+    /// api_style, price_book)`, with the range the ledger actually held.
+    ///
+    /// Reads the per-call ledger rather than the hourly fold, for the reason the
+    /// money question needs: the fold lands one row per closed window, so its
+    /// newest answer is an hour old by construction, and it carries no money
+    /// column at all. A spend page that reported yesterday's fold as "what we
+    /// have spent" would be wrong at every hour boundary and right in between,
+    /// which is the worst kind of wrong — nobody re-checks a number that keeps
+    /// being right.
+    ///
+    /// `covered_since` is the oldest row inside the range, not the range's own
+    /// start. The sweep loop deletes past the retention, so a request reaching
+    /// further back is answered with the rows that survived plus the range they
+    /// actually cover; returning zero for the deleted part would report "we
+    /// spent nothing then" about a stretch nobody can measure any more.
+    async fn priced_spend_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<PricedSpend, String>;
 
     /// Tokens spent since `since_unix`, per person, `(person, tokens)`.
     ///

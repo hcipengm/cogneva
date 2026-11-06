@@ -9,6 +9,7 @@ import { SpendBars } from '@/observability/SpendBars';
 import { DimensionCounts } from '@/observability/DimensionCounts';
 import { OutcomeBreakdown } from '@/observability/OutcomeBreakdown';
 import { SpendAccount } from '@/observability/SpendAccount';
+import { SpendLedger } from '@/observability/SpendLedger';
 import { ActorTable } from '@/observability/ActorTable';
 import {
   cacheBase,
@@ -107,6 +108,20 @@ export function TokenView() {
       meta={`按 60 秒重读 · 累计 5 分钟 · 页面时刻为本地 ${localZoneLabel()}`}
     >
       <AllowanceWindow />
+
+      {/* 钱这一面单独一节，且放在累计之前：上面那条额度窗答「这一窗还能摊多少」，
+          下面那一组答「过去几个整点谁在花」，而这一节答的是唯一一个问题——**花了
+          多少钱**。它必须直读逐笔账本：折叠表里没有钱这一列，且最新一个数按构造是
+          一小时前的。区间由读者自己选，上限跟着保留期走。 */}
+      <section className="border-b border-[var(--line)]">
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+          花了多少钱
+          <span className="ml-2 normal-case tracking-normal opacity-70">
+            逐笔账本 · 任意起止 · 金额在落账时按当时那版价目折算
+          </span>
+        </h2>
+        <SpendLedger />
+      </section>
 
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">

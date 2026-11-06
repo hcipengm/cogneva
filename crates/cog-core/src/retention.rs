@@ -27,6 +27,39 @@
 //! 两条共用的规矩：两头空白剥掉；读不出数字、或低于 `min_days`（负数都在内）都落
 //! 回 `default_days`。旋钮写坏了不该把一张表清空。
 
+/// 用量账的保留期旋钮：变量名与它那两个有意义的数。
+///
+/// 放在这里而不是跟着清扫循环走，是因为**读的那一侧也要它**。清扫循环在
+/// `cog-observability` 里，读口在 `cog-gateway` 里，两者互不依赖；旋钮只在清扫
+/// 那一侧声明时，读口那边只剩两条路——抄一个数字，或者抄一个上限常量。抄数字会
+/// 在旋钮被改的那天静默撒谎；抄上限常量的情形今天就在树上：账本按旋钮留三十天，
+/// 接口按一个写死的七天截止，于是二十三天一直在表里、从接口读不到，而两条读数
+/// 都看起来正常。
+///
+/// 旋钮的意思（读到 0 落回默认）由 [`llm_usage_keep_days_from`] 定，与清扫循环
+/// 用的是同一个 [`keep_days_or_default`]，所以「清扫留几天」与「读口能覆盖几天」
+/// 不是两个承诺。
+pub const LLM_USAGE_KEEP_DAYS_ENV: &str = "COGNEVA_LLM_USAGE_KEEP_DAYS";
+
+/// 用量账的保留天数：三十天，与它旁边那本提示归档的承诺一致。
+pub const LLM_USAGE_KEEP_DAYS_DEFAULT: i64 = 30;
+
+/// 用量账最短的保留期：一天。更短会在每一趟里把当前小时折赖以计算的行走删掉。
+pub const LLM_USAGE_KEEP_DAYS_MIN: i64 = 1;
+
+/// 用量账的保留天数，按 [`LLM_USAGE_KEEP_DAYS_ENV`] 读。
+///
+/// 返回值永远是一个生效的天数：读不出来、低于下限、读到 0 都落回默认。读口因此
+/// 不必处理「没有保留期」这一支，「没有保留期」在账本上本来也不是一个状态。
+pub fn llm_usage_keep_days() -> i64 {
+    llm_usage_keep_days_from(std::env::var(LLM_USAGE_KEEP_DAYS_ENV).ok().as_deref())
+}
+
+/// [`llm_usage_keep_days`] 对一个显式读数，好让这条规矩不靠进程环境就能测。
+pub fn llm_usage_keep_days_from(raw: Option<&str>) -> i64 {
+    keep_days_or_default(raw, LLM_USAGE_KEEP_DAYS_DEFAULT, LLM_USAGE_KEEP_DAYS_MIN)
+}
+
 /// 把原始读数读成一个数：剥空白，读不出来就是 `None`。
 ///
 /// 这一条是两条策略唯一的共同底座；`0` 在这里还是 `Some(0)`，怎么处置由上面那两
@@ -136,6 +169,27 @@ mod tests {
         assert_eq!(keep_days_or_default(Some("3"), DEFAULT, 3), 3);
         assert_eq!(keep_days_or_disable(Some("2"), DEFAULT, 3), Some(DEFAULT));
         assert_eq!(keep_days_or_disable(Some("3"), DEFAULT, 3), Some(3));
+    }
+
+    /// 用量账那三个数只有一个出处：清扫循环与读口都把变量名与天数指向这里。
+    /// 抄一份到读口那一侧，旋钮被改的那天就只有一边跟着动——账本留三十天、接口
+    /// 覆盖七天，而两边各自的读数都对。
+    #[test]
+    fn the_usage_ledger_knob_is_declared_once() {
+        assert_eq!(LLM_USAGE_KEEP_DAYS_ENV, "COGNEVA_LLM_USAGE_KEEP_DAYS");
+        assert_eq!(LLM_USAGE_KEEP_DAYS_DEFAULT, 30);
+        assert_eq!(LLM_USAGE_KEEP_DAYS_MIN, 1);
+        // 读口要拿它当上限用，所以它必须永远是一个生效的天数。
+        assert_eq!(llm_usage_keep_days_from(Some("7")), 7);
+        assert_eq!(
+            llm_usage_keep_days_from(Some("0")),
+            LLM_USAGE_KEEP_DAYS_DEFAULT
+        );
+        assert_eq!(llm_usage_keep_days_from(None), LLM_USAGE_KEEP_DAYS_DEFAULT);
+        assert_eq!(
+            llm_usage_keep_days_from(Some("-3")),
+            LLM_USAGE_KEEP_DAYS_DEFAULT
+        );
     }
 
     /// 零不是「下限恰好是 0 时的合法天数」：一个允许极小保留期的旋钮传
