@@ -3444,7 +3444,7 @@ struct CycleDeps<'a> {
 async fn merge_verification_inputs(
     queued: Vec<crate::types::EvolutionResult>,
     landing: Option<&dyn cog_core::ChangeLanding>,
-    max_changed_lines: usize,
+    max_changed_lines: Option<usize>,
 ) -> (
     Vec<crate::types::EvolutionResult>,
     std::collections::HashMap<String, cog_core::GeneratedChange>,
@@ -3507,10 +3507,12 @@ async fn merge_verification_inputs(
         // 判据与落地侧同一个数（`cog_core::count_diff_lines` 与同一个配置键）：
         // 两处各数一遍，就是同一条变更在两个地方各有各的行数。
         let changed_lines = cog_core::count_diff_lines(diff);
-        let refusal = if changed_lines > max_changed_lines {
+        let refusal = if let Some(cap) =
+            max_changed_lines.filter(|cap| changed_lines > *cap)
+        {
             Some((
                 format!(
-                    "the change is {changed_lines} changed lines, over the {max_changed_lines} line budget the landing policy holds it to"
+                    "the change is {changed_lines} changed lines, over the {cap} line budget the landing policy holds it to"
                 ),
                 cog_core::RejectionCause::PromotionGateRefused,
             ))
@@ -4916,7 +4918,7 @@ mod tests {
 
     /// 落地侧那条行数预算的默认值：这些用例里的 diff 都是一两行，判据只要不
     /// 比它更松就够；要验界线的那条自己把这个数写成 1。
-    fn budget() -> usize {
+    fn budget() -> Option<usize> {
         crate::GenerationLimits::default().max_changed_lines
     }
 
@@ -5063,7 +5065,7 @@ mod tests {
         };
 
         let (changes, recorded, refused) =
-            merge_verification_inputs(Vec::new(), Some(&landing), 3).await;
+            merge_verification_inputs(Vec::new(), Some(&landing), Some(3)).await;
 
         assert_eq!(
             changes
@@ -5102,7 +5104,7 @@ mod tests {
         change.content = diff_of(9);
 
         let (changes, recorded, refused) =
-            merge_verification_inputs(vec![change], Some(&landing), 8).await;
+            merge_verification_inputs(vec![change], Some(&landing), Some(8)).await;
 
         assert!(changes.is_empty(), "队列里的超预算变更也不许进这一轮");
         assert!(recorded.is_empty());

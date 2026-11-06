@@ -318,8 +318,25 @@ impl GitHubIntegrationConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LandingPolicy {
-    /// Maximum number of changed lines a change may touch.
-    pub max_changed_lines: usize,
+    /// Maximum number of changed lines a change may touch, or `None` for no
+    /// ceiling.
+    ///
+    /// This began as a fixed 200 and was the reason a demand got split into
+    /// one task per item: a batch large enough to be worth doing was over the
+    /// line budget, so it could not land, so it was cut into pieces that could.
+    /// The pieces are what cost — every attempt pays a plan and a generation
+    /// and a validation run no matter how small it is, so 1,600 one-item tasks
+    /// spend 1,600 fixed costs to carry the same lines one merged change could
+    /// carry once.
+    ///
+    /// The ceiling is not a quality gate. Quality is settled in the sandbox
+    /// (apply, test, release build) before this channel is ever called, and a
+    /// change that fails there costs a build slot rather than a landing. What
+    /// the number did buy was a bound on one change's blast radius; the owner's
+    /// call on 2026-11-06 is that the split costs more than the bound is worth,
+    /// so the default is no ceiling and a deployment that wants one configures
+    /// it.
+    pub max_changed_lines: Option<usize>,
     /// Path prefixes that forbid landing when touched.
     pub forbidden_paths: Vec<String>,
     /// Push a revert commit when the CI run for a landed commit fails, so the
@@ -355,7 +372,7 @@ pub struct LandingPolicy {
 impl Default for LandingPolicy {
     fn default() -> Self {
         Self {
-            max_changed_lines: 200,
+            max_changed_lines: None,
             forbidden_paths: vec![
                 ".github/workflows".into(),
                 "deploy/".into(),

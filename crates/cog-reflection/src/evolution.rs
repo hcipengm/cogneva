@@ -132,7 +132,7 @@ pub struct EvolutionEngine {
     /// 一份变更最多允许多少有效改动行。判据来自落地侧读的同一个配置键
     /// （[`crate::GenerationLimits`]），在这里先在写盘前用一次：超限的变更不该
     /// 走完构建与沙盒验证、到落地时才被拦下，那时每一次重跑都是白跑的。
-    max_changed_lines: usize,
+    max_changed_lines: Option<usize>,
 }
 
 /// Move a produced result into the shape the resident index stores.
@@ -266,7 +266,7 @@ impl EvolutionEngine {
     }
 
     /// 设置生成侧的行数上限，取落地侧读的同一个配置键所载的值。
-    pub fn with_max_changed_lines(mut self, max_changed_lines: usize) -> Self {
+    pub fn with_max_changed_lines(mut self, max_changed_lines: Option<usize>) -> Self {
         self.max_changed_lines = max_changed_lines;
         self
     }
@@ -1037,10 +1037,9 @@ impl EvolutionEngine {
         // 计数用 `cog_core::count_diff_lines`：生成侧、晋级门、落地侧必须是同一个
         // 读数，第二份解析器会让同一份 diff 对不同读者给出不同的行数。
         let diff_lines = cog_core::count_diff_lines(&content);
-        if diff_lines > self.max_changed_lines {
+        if let Some(cap) = self.max_changed_lines.filter(|cap| diff_lines > *cap) {
             return Err(cog_core::SFError::Validation(format!(
-                "generated change is {diff_lines} changed lines, over the {} line budget shared with the landing policy; narrow the scope and regenerate rather than submitting an over-budget diff",
-                self.max_changed_lines
+                "generated change is {diff_lines} changed lines, over the {cap} line budget shared with the landing policy; narrow the scope and regenerate rather than submitting an over-budget diff"
             )));
         }
 
@@ -1558,7 +1557,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let engine = engine_on(&change_dir).with_max_changed_lines(2);
+        let engine = engine_on(&change_dir).with_max_changed_lines(Some(2));
 
         let diff = |added: usize| {
             let mut s = String::from(

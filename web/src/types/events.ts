@@ -149,8 +149,7 @@ export type ChatFrameKind =
   | 'thinking_start'
   | 'thinking_delta'
   | 'thinking_end'
-  | 'goal'
-  | 'identity';
+  | 'goal';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -162,10 +161,6 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   'message.thinking_end': 'thinking_end',
   // 这一轮被受理成了一道目标：后面由任务与监督接管，不再是「一句话的问答」。
   'message.goal': 'goal',
-  // 说这句话的是谁：这一轮在总线上的名字。名字由服务端按会话折出（带进程指纹），
-  // 前端算不出同一个，所以它跟着帧来。没有它，这位员工自己调的工具就归不到这段
-  // 对话下面——帧上只有 `agent_id`，而这里不知道它等于谁。
-  'agent.identity': 'identity',
 };
 
 /**
@@ -196,8 +191,6 @@ export interface ChatFrame {
   delta: string | null;
   /** 只有 `goal` 帧带着：这句话被受理成的那道目标。 */
   goalId: string | null;
-  /** 只有 `identity` 帧带着：这一轮在总线上叫什么（`employee:<指纹>` 形式）。 */
-  agentId: string | null;
   timestamp: string;
 }
 
@@ -231,7 +224,6 @@ export function normalizeChatFrame(
     role: role === 'user' || role === 'assistant' ? role : null,
     delta: typeof inner.delta === 'string' ? inner.delta : null,
     goalId: typeof inner.goal_id === 'string' ? inner.goal_id : null,
-    agentId: typeof inner.agent_id === 'string' ? inner.agent_id : null,
     timestamp:
       (payload.timestamp as string | undefined) ?? new Date().toISOString(),
   };

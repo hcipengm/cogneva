@@ -448,10 +448,10 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
         }
     }
 
-    if diff_lines > policy.max_diff_lines {
+    if let Some(cap) = policy.max_diff_lines.filter(|cap| diff_lines > *cap) {
         return GateVerdict::RequireApproval {
             kind: PromotionGateKind::ApprovalDiffOverLimit,
-            reason: format!("diff {diff_lines} 行超过上限 {} 行", policy.max_diff_lines),
+            reason: format!("diff {diff_lines} 行超过上限 {cap} 行"),
         };
     }
 
@@ -833,9 +833,12 @@ mod tests {
         }
     }
 
+    /// 有上限时，超限的 diff 仍转人工——这一格没有随默认值一起消失。
     #[test]
-    fn oversized_diff_requires_approval() {
-        let v = classify(&files(&["docs/big.md"]), 501, &policy());
+    fn a_configured_ceiling_still_requires_approval() {
+        let mut policy = policy();
+        policy.max_diff_lines = Some(500);
+        let v = classify(&files(&["docs/big.md"]), 501, &policy);
         match v {
             GateVerdict::RequireApproval { kind, reason } => {
                 assert!(reason.contains("501"));
@@ -889,8 +892,22 @@ mod tests {
 
     #[test]
     fn config_path_exceeding_diff_limit_requires_approval() {
-        let v = classify(&files(&["prompts/default.yaml"]), 9999, &policy());
+        let mut policy = policy();
+        policy.max_diff_lines = Some(500);
+        let v = classify(&files(&["prompts/default.yaml"]), 9999, &policy);
         assert!(matches!(v, GateVerdict::RequireApproval { .. }), "{v:?}");
+    }
+
+    /// principle: feedback_a_bound_that_only_exists_to_split_work_pays_for_the_split
+    ///
+    /// 默认不设 diff 上限：合并待办省下的是**每一笔的固定开销**（一次计划、一次
+    /// 生成、一整套验证），而界的结局是把合并后的变更转进一条没有人会来批的路，
+    /// 等于把省下来的又还回去。这里钉住的是默认行为本身——不写这一格，默认值
+    /// 悄悄回到某个数时，这个大变更会重新落进转人工那一档而无人发现。
+    #[test]
+    fn an_unbounded_policy_admits_a_change_larger_than_the_old_default() {
+        let v = classify(&files(&["crates/cog-agent/src/tools.rs"]), 100_000, &policy());
+        assert_eq!(v, GateVerdict::AutoRollout);
     }
 
     #[test]

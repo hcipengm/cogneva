@@ -51,8 +51,13 @@ pub struct PromotionGateConfig {
     /// 这句话是规格不是解释：`apply_and_test_rejects_forbidden_files_at_gate`
     /// 正是在 `enabled = false` 下要求拒收照旧生效的。
     pub enabled: bool,
-    /// diff 超过该行数强制转人工审批。
-    pub max_diff_lines: usize,
+    /// diff 超过该行数强制转人工审批；`None` 是不设上限。
+    ///
+    /// 与落地侧的行数预算同一天改成可无上限：它原先与大变更互锁——合并后的
+    /// 变更超过这一格就转人工，而人工那一档没有下一个动作，等于把「能落的大变更」
+    /// 实现成「排进一条永远没人走的路」。合并省下的是每一笔的固定开销，界留在这里
+    /// 就把省下的又还回去了。
+    pub max_diff_lines: Option<usize>,
     /// 每 24 小时自动晋级配额，超出排队。
     pub quota_per_day: u32,
     /// 连续晋级后回滚次数达到该值触发熔断（转人工模式）。
@@ -104,7 +109,7 @@ impl Default for PromotionGateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_diff_lines: 500,
+            max_diff_lines: None,
             quota_per_day: 3,
             rollback_breaker_threshold: 2,
             failure_breaker_threshold: 3,
@@ -198,7 +203,7 @@ impl PromotionGateConfig {
             self.enabled = v;
         }
         if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_PROMOTION_MAX_DIFF_LINES", &get)? {
-            self.max_diff_lines = v;
+            self.max_diff_lines = Some(v);
         }
         if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_PROMOTION_QUOTA_PER_DAY", &get)? {
             self.quota_per_day = v;
@@ -438,7 +443,9 @@ impl ChangeJobConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GenerationLimits {
-    pub max_changed_lines: usize,
+    /// `None` is "no ceiling": a deployment that wants one sets the same key
+    /// the landing channel reads.
+    pub max_changed_lines: Option<usize>,
 }
 
 impl Default for GenerationLimits {
@@ -447,7 +454,7 @@ impl Default for GenerationLimits {
         // 第二份定义：配置文件里有那一节时以它为准，两边读的是同一个键。
         // `crates/cogneva` 的测试钉住这两个默认值相等，任一侧单独改动会红。
         Self {
-            max_changed_lines: 200,
+            max_changed_lines: None,
         }
     }
 }
@@ -467,13 +474,14 @@ impl GenerationLimits {
                 let root: serde_json::Value = serde_json::from_str(&text)
                     .map_err(|e| SFError::Config(format!("{}: {e}", path.display())))?;
                 match root.pointer("/github_integration/landing_policy/max_changed_lines") {
+                    Some(v) if v.is_null() => Self::default(),
                     Some(v) => Self {
-                        max_changed_lines: v.as_u64().ok_or_else(|| {
+                        max_changed_lines: Some(v.as_u64().ok_or_else(|| {
                             SFError::Config(format!(
-                                "{} github_integration.landing_policy.max_changed_lines: 要非负整数，读到 {v}",
+                                "{} github_integration.landing_policy.max_changed_lines: 要非负整数或 null，读到 {v}",
                                 path.display()
                             ))
-                        })? as usize,
+                        })? as usize),
                     },
                     None => Self::default(),
                 }
@@ -488,7 +496,7 @@ impl GenerationLimits {
     /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
     pub fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
         if let Some(v) = knob("COGNEVA_GENERATION_MAX_CHANGED_LINES", &get)? {
-            self.max_changed_lines = v;
+            self.max_changed_lines = Some(v);
         }
         Ok(())
     }
@@ -1690,7 +1698,7 @@ mod tests {
             GenerationLimits::load_from(&path)
                 .unwrap()
                 .max_changed_lines,
-            137
+            Some(137)
         );
         // 段缺失：落到落地侧的默认值。
         std::fs::write(&path, r#"{"self_evolution": {"enabled": true}}"#).unwrap();
@@ -1698,7 +1706,7 @@ mod tests {
             GenerationLimits::load_from(&path)
                 .unwrap()
                 .max_changed_lines,
-            200
+            None
         );
         // 类型不对：响亮失败，不静默取默认。
         std::fs::write(
@@ -1717,7 +1725,7 @@ mod tests {
             (k == "COGNEVA_GENERATION_MAX_CHANGED_LINES").then(|| "80".to_string())
         })
         .unwrap();
-        assert_eq!(cfg.max_changed_lines, 80);
+        assert_eq!(cfg.max_changed_lines, Some(80));
 
         let mut cfg = GenerationLimits::default();
         assert!(cfg

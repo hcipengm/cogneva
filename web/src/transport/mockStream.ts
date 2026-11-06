@@ -57,7 +57,7 @@ export class MockEventStreamClient {
 
   /** 一帧聊天。名字带点，与 `crates/cog-gateway/src/chat.rs` 发的一致。 */
   private chat(
-    kind: 'start' | 'text_delta' | 'end' | 'identity',
+    kind: 'start' | 'text_delta' | 'end',
     messageId: string,
     fields: Record<string, unknown> = {}
   ): void {
@@ -70,7 +70,6 @@ export class MockEventStreamClient {
       role: (fields.role as 'user' | 'assistant' | null) ?? null,
       delta: (fields.delta as string | null) ?? null,
       goalId: (fields.goalId as string | null) ?? null,
-      agentId: (fields.agentId as string | null) ?? null,
       timestamp: new Date().toISOString(),
     });
   }
@@ -99,9 +98,6 @@ export class MockEventStreamClient {
     this.emit('agent_start', {});
     this.emit('state_change', { from: 'idle', to: 'thinking' });
     const replyMid = `assistant-${Math.random().toString(36).slice(2, 10)}`;
-    // 与服务端同形：先报「这一轮是谁」，再流正文。没有这一帧，下面那次工具调用
-    // 就归不到这段对话下面，演示流里也是「只有一问一答」。
-    this.chat('identity', replyMid, { agentId: MockEventStreamClient.AGENT });
     this.chat('start', replyMid, { role: 'assistant' });
 
     let index = 0;

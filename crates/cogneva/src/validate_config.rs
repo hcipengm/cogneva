@@ -184,7 +184,7 @@ mod tests {
         let landing = cog_github::config::LandingPolicy::default().max_changed_lines;
         assert_eq!(
             generation, landing,
-            "生成侧与落地侧的默认行数上限分叉了：一侧 200／另一侧另一份数时，同一份 diff 会对两个读者给出相反的判词"
+            "生成侧与落地侧的默认行数上限分叉了：一侧不设上限／另一侧有数时，同一份 diff 会对两个读者给出相反的判词"
         );
     }
 }

@@ -56,14 +56,6 @@ export interface ChatSession {
    * 下面，除了「谁」还得知道「从什么时候起」。
    */
   goals: GoalRef[];
-  /**
-   * 这一段的员工在总线上叫什么。由服务端在第一帧之前的 `agent.identity` 帧带进来。
-   *
-   * 它是「这一面画的是谁」的钥匙：工具调用帧只有 `agent_id`，没有它，这段对话
-   * 自己的执行过程（调了哪个工具、跑了几次）一条也接不回来，屏幕上就只剩下一问
-   * 一答。空表示还不知道——这一轮还没开始，或者服务端比这一页老。
-   */
-  agentId: string | null;
 }
 
 export interface GoalRef {
@@ -134,7 +126,6 @@ function emptySession(id: string): ChatSession {
     hydrateError: null,
     streaming: null,
     goals: [],
-    agentId: null,
   };
 }
 
@@ -339,12 +330,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         case 'thinking_end':
           break;
-
-        case 'identity': {
-          if (!frame.agentId || frame.agentId === session.agentId) break;
-          session = { ...session, agentId: frame.agentId };
-          break;
-        }
 
         case 'goal': {
           if (!frame.goalId) break;

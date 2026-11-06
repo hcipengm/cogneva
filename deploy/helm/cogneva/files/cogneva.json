@@ -4015,7 +4015,8 @@
     "auto_submit_fixes": true,
     "landing_policy": {
       "_comment": "Bounds what a landed change may touch, and what happens when CI on a landed commit fails. Quality is settled by the sandbox (pre-check, apply, test, release build) before the channel is called, so there is no score gate here; whether changes go upstream at all is the contribution policy's decision (auto/ask/local), so there is no on/off switch either.",
-      "max_changed_lines": 200,
+      "max_changed_lines": null,
+      "_comment_max_changed_lines": "null = no ceiling. A ceiling here is what made a batched demand unlandable and therefore split into one task per item, and the split is what costs: every attempt pays a plan, a generation and a validation run whatever its size. Set a number only if you want a bound on one change's blast radius more than you want the merged form.",
       "forbidden_paths": [
         ".github/workflows",
         "deploy/",

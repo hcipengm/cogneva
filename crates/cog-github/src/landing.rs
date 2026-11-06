@@ -859,12 +859,12 @@ impl MainChannel {
 
         if !owner_approved {
             let changed_lines = count_changed_lines(&change.content);
-            if changed_lines > policy.max_changed_lines {
+            if let Some(cap) = policy.max_changed_lines.filter(|cap| changed_lines > *cap) {
                 return Err(LandingError::of(
                     LandingCategory::Oversized,
                     CogGitHubError::PrivacyRejected(format!(
-                        "change {} touches {changed_lines} lines, over the {}-line cap",
-                        change.change_id, policy.max_changed_lines
+                        "change {} touches {changed_lines} lines, over the {cap}-line cap",
+                        change.change_id
                     )),
                 ));
             }
@@ -1466,8 +1466,12 @@ impl cog_core::ChangeSink for MainChannel {
         // 侧拿到的话是"落地被拒"，收窄不了任何东西。被拒的这一份不写记录，所以它
         // 也不会在下一轮原样回来。
         let changed_lines = count_changed_lines(&change.content);
-        let cap = self.config.landing_policy.max_changed_lines;
-        if changed_lines > cap {
+        if let Some(cap) = self
+            .config
+            .landing_policy
+            .max_changed_lines
+            .filter(|cap| changed_lines > *cap)
+        {
             return Err(cog_core::SFError::Validation(format!(
                 "change {} touches {changed_lines} lines, over the {cap}-line cap; narrow the scope and resubmit",
                 change.change_id
@@ -2897,7 +2901,7 @@ mod tests {
     #[tokio::test]
     async fn the_early_verdict_leaves_the_owners_limits_to_the_landing() {
         let chan = channel(crate::config::LandingPolicy {
-            max_changed_lines: 1,
+            max_changed_lines: Some(1),
             ..Default::default()
         });
         let big = change(
@@ -2987,7 +2991,7 @@ mod tests {
     #[tokio::test]
     async fn policy_holds_back_an_oversized_change() {
         let policy = crate::config::LandingPolicy {
-            max_changed_lines: 1,
+            max_changed_lines: Some(1),
             ..Default::default()
         };
         let ch = change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"]));
@@ -3400,7 +3404,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_change_is_counted_under_its_own_category() {
         let policy = crate::config::LandingPolicy {
-            max_changed_lines: 1,
+            max_changed_lines: Some(1),
             ..Default::default()
         };
         let (chan, metrics) = measured_channel(policy);
@@ -3461,7 +3465,7 @@ mod tests {
     #[tokio::test]
     async fn a_landing_without_a_backend_fails_the_same_way() {
         let policy = crate::config::LandingPolicy {
-            max_changed_lines: 1,
+            max_changed_lines: Some(1),
             ..Default::default()
         };
         let ch = change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"]));
@@ -4074,7 +4078,7 @@ mod tests {
         std::env::set_var("COGNEVA_DATA_DIR", dir.path());
 
         let chan = channel(crate::config::LandingPolicy {
-            max_changed_lines: 1,
+            max_changed_lines: Some(1),
             ..Default::default()
         });
 

@@ -99,17 +99,7 @@ async fn pump_events(
     // 接起来——猜「是不是 dispatch_goal」只能看返回里有没有 goal_id，而别的工具也
     // 可以回一个目标号，那时界面会多出一条它并不负责的目标帧。
     let mut in_flight: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    // 这一轮是谁在说。第一帧到了才知道：内核按这一轮的名字给每个事件署名。
-    // 界面要把「这位员工自己调的工具」接回这段对话，就得先知道它叫什么——
-    // 名字是服务端折出来的（`employee_for` 带进程指纹），前端算不出同一个。
-    let mut named = false;
     while let Some(event) = events.recv().await {
-        if !named {
-            if let Some(agent_id) = event_agent_id(&event) {
-                emit_identity(&out, &session_id, &message_id, &agent_id).await;
-                named = true;
-            }
-        }
         // 没有订阅者时 send 会失败，这不是错：连接先走了，帧没有人要。
         let _ = bus.send(event.clone());
         match event {
@@ -202,38 +192,6 @@ async fn emit(
 ) {
     // Receiver only disappears when the socket loop ended — nothing to do then.
     let _ = out.send(envelope(session_id, event_type, inner)).await;
-}
-
-/// 这一轮是谁：一个事件里读它在给谁署名。
-///
-/// 内核的每一族事件都带 `agent_id`，但没有一个统一的取值方法；这一处只需要知道
-/// 「叫什么」，按序列化后的字段取一次就够了——它在一轮里只问一次，不在热路上。
-fn event_agent_id(event: &cog_core::AgentEvent) -> Option<String> {
-    serde_json::to_value(event)
-        .ok()?
-        .get("agent_id")?
-        .as_str()
-        .map(str::to_string)
-}
-
-/// 告诉这段对话：说这句话的是谁。
-///
-/// 不带这一帧，界面只知道「这条连接上有一轮在跑」，不知道这一轮在总线上叫什么；
-/// 于是它自己的工具调用（那些帧带 `agent_id`）一条也归不到这段对话下面，屏幕
-/// 上就还是一问一答。
-async fn emit_identity(
-    out: &mpsc::Sender<String>,
-    session_id: &str,
-    message_id: &str,
-    agent_id: &str,
-) {
-    emit(
-        out,
-        session_id,
-        "agent.identity",
-        serde_json::json!({ "message_id": message_id, "agent_id": agent_id }),
-    )
-    .await;
 }
 
 async fn emit_message_start(
@@ -656,12 +614,6 @@ mod tests {
             lines.push(line);
         }
         let joined = lines.join("\n");
-        // 第一帧是身份，第二帧起才是这一段说的话——这一轮是谁，先于它说什么。
-        assert!(
-            lines[0].contains("agent.identity"),
-            "第一帧应当是身份：{joined}"
-        );
-        let lines = &lines[1..];
         assert_eq!(lines.len(), 3, "三段文字就是三帧：{joined}");
         assert!(lines[0].contains("先说一句"), "{joined}");
         assert!(lines[1].contains("\\n\\n"), "两轮之间没有隔行：{joined}");
@@ -715,50 +667,6 @@ mod tests {
             }
             other => panic!("总线收到的不是工具帧：{other:?}"),
         }
-    }
-
-    /// 这条连接得先知道说话的是谁，才接得回它自己调的工具。
-    ///
-    /// 工具帧上只有 `agent_id`，而这一面要按「这段对话的员工叫什么」去总线帧里
-    /// 认领：名字由服务端折出来（带进程指纹），前端算不出同一个。名字不发下去，
-    /// 这段对话的执行过程就一条也画不出来——2026-11-06 屏幕上那一问一答就是
-    /// 这么来的。
-    #[tokio::test]
-    async fn the_connection_learns_which_employee_is_speaking() {
-        use cog_core::AgentEvent;
-        let (events_tx, events_rx) = mpsc::channel(8);
-        let (out_tx, mut out_rx) = mpsc::channel(32);
-        let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
-        let pump = tokio::spawn(pump_events(
-            events_rx,
-            out_tx,
-            bus,
-            "s1".into(),
-            "m-1".into(),
-        ));
-
-        events_tx
-            .send(AgentEvent::ToolExecutionStart {
-                agent_id: "mira-5ff6bdd2".into(),
-                tool_call_id: "call-1".into(),
-                tool_name: "run_command".into(),
-                args: serde_json::json!({ "command": "ls" }),
-                timestamp: chrono::Utc::now(),
-            })
-            .await
-            .unwrap();
-        drop(events_tx);
-        let _ = pump.await;
-
-        let first = out_rx.recv().await.expect("连接上一帧都没有");
-        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
-        assert_eq!(v["payload"]["type"], "agent.identity", "{first}");
-        assert_eq!(
-            v["payload"]["payload"]["agent_id"], "mira-5ff6bdd2",
-            "{first}"
-        );
-        assert_eq!(v["payload"]["payload"]["message_id"], "m-1", "{first}");
-        assert_eq!(v["session_id"], "s1", "{first}");
     }
 
     /// 派出去的每个目标都要有自己的那一帧，重复的不发第二遍。
@@ -823,12 +731,6 @@ mod tests {
         while let Some(line) = out_rx.recv().await {
             frames.push(line);
         }
-        // 身份那一帧先到，目标帧跟在它后面。
-        assert!(
-            frames[0].contains("agent.identity"),
-            "第一帧应当是身份：{frames:?}"
-        );
-        let frames = &frames[1..];
         assert_eq!(frames.len(), 2, "{frames:?}");
         assert!(frames[0].contains("message.goal") && frames[0].contains("goal-1"));
         assert!(frames[1].contains("goal-2"));
