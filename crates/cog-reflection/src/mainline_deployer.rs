@@ -1654,6 +1654,7 @@ pub(crate) fn ci_hold_goal_text(
     failed_checks: &[String],
     evidence: &[CheckEvidence],
     attempted: &[CiHoldAttempt],
+    stopped: usize,
 ) -> String {
     let checks = if failed_checks.is_empty() {
         "上游没有给出具体的检查名（结论来自提交状态接口），请到那一版的 Actions 页读出失败的是哪几条"
@@ -1687,7 +1688,7 @@ pub(crate) fn ci_hold_goal_text(
     };
     // 单独成段：它说的是「前面几轮」，与上面那段「这一版为什么红」不是同一件事，
     // 接在同一行里读起来会像是这一次的失败原因之一。
-    let tried = ci_hold_attempts_note(attempted)
+    let tried = ci_hold_attempts_note(attempted, stopped)
         .map(|note| format!("\n\n{note}"))
         .unwrap_or_default();
     // 可落地的范围与贡献门是同一句措辞（见 [`cog_core::CONTRIBUTABLE_SURFACES`]）。
@@ -1760,11 +1761,26 @@ pub(crate) fn ci_hold_attempt(task: &cog_core::Task, round: usize) -> CiHoldAtte
 /// （id 由版号、扣住起点与日期推出），每加一轮都在确认上一轮白跑。2026-11-05 实测
 /// `-fix` 与 `-fix-r2` 收到的是逐字相同的题面，第二轮的回话也是同一句「这一轮也
 /// 没有交出改动」——同一份题面原样再问一次，模型没有理由给出不同的答案。
-pub(crate) fn ci_hold_attempts_note(attempted: &[CiHoldAttempt]) -> Option<String> {
-    if attempted.is_empty() {
+///
+/// `stopped` 是被停掉、因而没有交出任何结论的轮数（见 [`ci_hold_attempts`]）。它
+/// 与 `attempted` 分开说：一轮被停掉的修法与一轮办完没修好，下一轮该做的事完全不同
+/// ——前者不需要「换一种做法」，它压根没试过。只有被停掉的轮次时，这段话仍然要出现：
+/// 否则下一轮读到的是「第一次动手」，而实际上已经有几轮被开出去又收了回来。
+pub(crate) fn ci_hold_attempts_note(attempted: &[CiHoldAttempt], stopped: usize) -> Option<String> {
+    if attempted.is_empty() && stopped == 0 {
         return None;
     }
-    let mut said = String::from("这一版上已经办完的几轮都在这里，它们都没有把这一版变绿：\n");
+    let mut said = String::new();
+    if stopped > 0 {
+        said.push_str(&format!(
+            "这一版上另有 {stopped} 轮修法被停掉（部署器按「这一版已经被后一版走过」收回了它们），\
+             它们没有对 CI 说过任何话，也不是这一版变绿或不变绿的原因。\n"
+        ));
+    }
+    if attempted.is_empty() {
+        return Some(said);
+    }
+    said.push_str("这一版上已经办完的几轮都在这里，它们都没有把这一版变绿：\n");
     for attempt in attempted {
         said.push_str(&format!(
             "- 第 {} 轮（{}）：交上来的改动 {} 条。",
@@ -5689,7 +5705,7 @@ impl MainlineDeployer {
             since_unix,
         );
         let evidence = self.ci_failure_evidence(&id, rev, failed_checks).await;
-        let attempted = self.ci_hold_attempts(orchestrator, prior_rows).await;
+        let (attempted, stopped) = self.ci_hold_attempts(orchestrator, prior_rows).await;
         if !attempted.is_empty() {
             info!(
                 rev = %rev12(rev),
@@ -5700,7 +5716,17 @@ impl MainlineDeployer {
                 "carrying the earlier repair rounds into this round's goal"
             );
         }
-        let goal = ci_hold_goal_text(rev, failed_checks, &evidence, &attempted);
+        // 被停掉的轮数单独记：它读作「这一版被开过几次、又被收回来几次」，与上面那
+        // 条「有几轮交了什么」不是一回事。两者混在一起时，收回来那一半会被当成
+        // 「试过没成」——2026-11-06 那 13 轮就是这么变成假证据的。
+        if stopped > 0 {
+            info!(
+                rev = %rev12(rev),
+                stopped,
+                "rounds that were called off before they could answer are not counted as attempts"
+            );
+        }
+        let goal = ci_hold_goal_text(rev, failed_checks, &evidence, &attempted, stopped);
         // 停线单不交给规划器拆。
         //
         // CI 红是**一件事**：让这棵树过上游那几条检查。规划器把它拆成
@@ -5723,29 +5749,44 @@ impl MainlineDeployer {
         .await
     }
 
-    /// 这一版上前几轮各自怎么结束的，取最近 [`CI_HOLD_ATTEMPTS_SHOWN`] 条。
+    /// 这一版上前几轮各自怎么结束的，取最近 [`CI_HOLD_ATTEMPTS_SHOWN`] 条；第二个
+    /// 返回值是被停掉的轮数。
     ///
     /// 只读办完的：还在跑的那一轮不是「试过了没成」，把它写进题面会让下一轮以为
     /// 自己可以换个做法，而手上那一份其实还在飞。序号按它们被开出去的位置算，
     /// 所以下一轮读到的「第几轮」与图上那一行的来历对得上。
+    ///
+    /// **被停掉的那一轮同样不进尝试账。** 取消是部署器按「这一版已经被后一版走过」
+    /// 做出的决定，那一行从来没有对 CI 说过任何话——它的 `error` 是取消的理由，
+    /// 不是它自己的结论。2026-11-06 实测：13 轮 `ci-red-*-fix` 全被这样停掉，记账
+    /// 时又全被当成「试过了没成」写进下一轮的题面，于是每一轮收到的都是别人替它
+    /// 编的经历（连「没留下 handle」这种执行侧的话都成了「那一行自己的结论」）。
+    /// 数出来交给 [`ci_hold_attempts_note`]：该说的是「有几轮被停掉」，不是「它们
+    /// 试过什么」。
     async fn ci_hold_attempts(
         &self,
         orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
         prior_rows: &[String],
-    ) -> Vec<CiHoldAttempt> {
+    ) -> (Vec<CiHoldAttempt>, usize) {
         let start = prior_rows.len().saturating_sub(CI_HOLD_ATTEMPTS_SHOWN);
         let mut out = Vec::new();
+        let mut stopped = 0usize;
         for (offset, id) in prior_rows[start..].iter().enumerate() {
             let Some(task) = orchestrator.get_task(id).await else {
                 continue;
             };
             // 目标锚点也在这份名单里，而它不是一次尝试：它不执行，永远停在原处。
             // 把它算进轮次会让「第几轮」与实际派发次数对不上。
-            if task.is_executable && task.status.is_terminal() {
-                out.push(ci_hold_attempt(&task, start + offset + 1));
+            if !task.is_executable || !task.status.is_terminal() {
+                continue;
             }
+            if task.status == cog_core::TaskStatus::Cancelled {
+                stopped += 1;
+                continue;
+            }
+            out.push(ci_hold_attempt(&task, start + offset + 1));
         }
-        out
+        (out, stopped)
     }
 
     /// 这一次扣住该落在哪一行上。
@@ -15030,7 +15071,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let landed_round = ci_hold_attempt(&landed, 2);
         assert_eq!(landed_round.changes, 1);
         // 只有空白的原因不是原因：写进去会让下一轮以为那一行说了什么。
-        let note = ci_hold_attempts_note(&[empty_round.clone(), landed_round.clone()])
+        let note = ci_hold_attempts_note(&[empty_round.clone(), landed_round.clone()], 0)
             .expect("two rounds is a note");
         assert!(
             note.contains("第 1 轮（completed）：交上来的改动 0 条"),
@@ -15044,12 +15085,13 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
 
         // 第一轮的题面里不该有这一段：两轮收到逐字相同的题面，正是 2026-11-05
         // 实测的那件事——第二轮的回答也是同一句「这一轮也没有交出改动」。
-        let first = ci_hold_goal_text("aaaa", &["Test".into()], &[], &[]);
+        let first = ci_hold_goal_text("aaaa", &["Test".into()], &[], &[], 0);
         let second = ci_hold_goal_text(
             "aaaa",
             &["Test".into()],
             &[],
             std::slice::from_ref(&empty_round),
+            0,
         );
         assert!(!first.contains("第 1 轮"));
         // 第一轮就要知道哪些路走得通：贡献门拒掉的范围与它读的同一句话是同一个
@@ -15061,7 +15103,42 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         );
         assert!(second.contains("第 1 轮"), "{second}");
         assert_ne!(first, second);
-        assert_eq!(ci_hold_attempts_note(&[]), None);
+        assert_eq!(ci_hold_attempts_note(&[], 0), None);
+    }
+
+    /// 被停掉的轮次既不进「交了什么」那张账，也不能让下一轮以为没人动过手。
+    ///
+    /// 2026-11-06：13 轮 `ci-red-*-fix` 全被部署器按「这一版已经被后一版走过」
+    /// 停掉，记账时却全被写进题面当「试过了没成」——连执行侧那句「没留下 handle」
+    /// 都成了「那一行自己的结论」。停掉的轮次该说的是「有几轮被收回来」，不该替
+    /// 它们编一个交了什么。
+    #[test]
+    fn a_round_that_was_called_off_is_counted_as_stopped_not_as_an_attempt() {
+        let note = ci_hold_attempts_note(&[], 13).expect("停掉的轮次仍然要说");
+        assert!(note.contains("13 轮修法被停掉"), "{note}");
+        assert!(
+            !note.contains("交上来的改动"),
+            "被停掉的轮次从来没有交出过东西，不能给它记一笔改动：{note}"
+        );
+
+        // 只有被停掉的轮次时，题面也必须与真正的第一轮不同——否则下一轮读到的是
+        // 「第一次动手」，而这一版已经被开出去又收回来好几次了。
+        let first = ci_hold_goal_text("aaaa", &["Test".into()], &[], &[], 0);
+        let after_stopped = ci_hold_goal_text("aaaa", &["Test".into()], &[], &[], 13);
+        assert_ne!(first, after_stopped);
+        assert!(after_stopped.contains("13 轮修法被停掉"), "{after_stopped}");
+
+        // 两种轮次都有时，两句话都在，而且是分开的两句。
+        let mut round = cog_core::Task::new(
+            "ci-red-aaaa-fix".to_string(),
+            cog_core::TaskType::Custom("ci_hold_fix".into()),
+            serde_json::json!({}),
+        );
+        round.status = cog_core::TaskStatus::Completed;
+        round.result = Some(serde_json::json!({ "change_ids": [] }));
+        let both = ci_hold_attempts_note(&[ci_hold_attempt(&round, 2)], 12).expect("两句话");
+        assert!(both.contains("12 轮修法被停掉"), "{both}");
+        assert!(both.contains("第 2 轮（completed）"), "{both}");
     }
 
     #[test]
