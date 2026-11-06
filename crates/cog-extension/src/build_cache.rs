@@ -31,10 +31,15 @@
 //! deployment: 5 GiB less the co-tenants leaves 3 GiB for the cache
 //! ([`DEFAULT_MAX_BYTES`]), which keeps the cache below the volume's claim and
 //! answers a full disk before it becomes a build that fails for a reason that
-//! says nothing about the cache. While under the cap the pass only publishes
-//! the size; an explicit `0` keeps the old measure-only behaviour; and the
-//! environment overrides this number, so the reasoning for a different value
-//! stays where that value is configured.
+//! says nothing about the cache. **That budget is a declaration, and on
+//! 2026-11-07 the volume had outgrown it**: 实测 that claim still declared 5 GiB while its mount held 29 GiB, so the ceiling subtracted to
+//! zero and the derived cap bottomed out at one byte -- a cap the cache could
+//! never be brought under, which turned every walk into a reclaim. A
+//! declaration the volume itself contradicts is now refused (see
+//! [`BuildCacheConfig::ceiling_bytes`]). While under the cap the pass only
+//! publishes the size; an explicit `0` keeps the old measure-only behaviour;
+//! and the environment overrides this number, so the reasoning for a different
+//! value stays where that value is configured.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -154,8 +159,35 @@ impl BuildCacheConfig {
     /// volume the deployment did not declare. A cap derived from half a fact is
     /// a cap nobody can trace back to a reading.
     pub fn ceiling_bytes(&self, volume_used: Option<u64>, cache_used: Option<u64>) -> Option<u64> {
-        let (_, declared) = self.volume_claim.as_ref()?;
+        let (claim, declared) = self.volume_claim.as_ref()?;
         let (volume_used, cache_used) = (volume_used?, cache_used?);
+        // The declaration is an input only while it is true. A volume that
+        // already holds more than its claim declares cannot be bounded by that
+        // declaration: the subtraction saturates at zero, downstream reads zero
+        // as "the co-tenants hold all of it", and the derived cap drops to its
+        // one-byte floor -- a cap no cache can be brought under, so the reclaim
+        // pass then gives up everything it is allowed to on every walk and the
+        // incremental state builds depend on never survives. 实测 2026-11-07: that claim declared 5 GiB while its mount held 29 GiB, and the
+        // filesystem under it had hundreds of GiB free; the sandbox
+        // cache's published cap was one byte
+        // (`cogneva_build_target_bytes_cap{source="derived"}`, dir
+        // `64512:8257622`), and its reclaim counter had been climbing for as
+        // long as it had been running, while the evolution cache beside it --
+        // a claim whose declaration still holds -- reclaimed none. What is
+        // authoritative there is the walk's own free-space answer, which
+        // [`crate::build_cache_readings`] already applies; the declaration is
+        // not, and the contradiction is named here rather than silently
+        // dropped.
+        if volume_used > *declared {
+            warn!(
+                claim = %claim,
+                declared_bytes = declared,
+                volume_used_bytes = volume_used,
+                "this claim holds more than it declares, so the declaration no longer bounds the \
+                 cache on it; the cap follows the volume's free space until the claim is corrected"
+            );
+            return None;
+        }
         Some(declared.saturating_sub(volume_used.saturating_sub(cache_used)))
     }
 
@@ -322,6 +354,18 @@ mod tests {
         assert_eq!(
             config.measured_ceiling(Some(&footprint), &cache),
             Some(3 * (1 << 30))
+        );
+
+        // The mount now holds far more than the claim declares -- what a
+        // directory-backed claim looks like once its size stopped tracking the
+        // directory. The declaration cannot bound anything there, and the
+        // subtraction would answer 0, which downstream is the one-byte floor:
+        // a cap no cache can meet, so every walk reclaims what it may.
+        footprint.set_used_bytes(29 * (1 << 30));
+        assert_eq!(
+            config.measured_ceiling(Some(&footprint), &cache),
+            None,
+            "a claim smaller than what its volume holds must not clamp the cap to zero"
         );
 
         // A walker measuring another volume answers for room this cache cannot
