@@ -271,6 +271,11 @@ live_check db 'Live-DB venue index' cargo test -p cog-storage --test venue_query
 # reads the stored JSON directly. Both halves are the server's; a fixture
 # without a database can see neither.
 live_check db 'Live-DB task rows know their workspace' cargo test -p cog-storage --test a_task_read_back_knows_its_workspace -- --ignored
+# 取消之后交回来的失败不能改写那一行。判据在 `dag_fail_task` 里，而它读的是**库里
+# 那一行的当前状态**，不是调用方手里的快照——没有真库这一格判不了。这一条来自
+# 2026-11-06 的现场：13 轮 `ci-red-*-fix` 全部被部署器主动取消，又被执行侧交回的
+# 「没人答」改写成环境故障，修复回路于是自己指着假证据干活。
+live_check db 'Live-DB a cancelled row stays cancelled' cargo test -p cog-storage --test a_cancelled_task_is_not_judged_again -- --ignored
 # The claim is a count of commits per burst, and a stand-in has no commit
 # to count: the reading is whatever the server's own log says. An ignored
 # test whose file says how to run it still ran nowhere until a step named
