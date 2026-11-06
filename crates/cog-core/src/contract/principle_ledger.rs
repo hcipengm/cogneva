@@ -924,3 +924,191 @@ mod the_distinction_survives_to_the_input {
         }
     }
 }
+
+/// One front line, two 正本面: the host's reading and the platform's measurement.
+///
+/// 一条战线常有两个正本面，两面的「今天跑没跑」可以相反——所以一个 bool 不是读数.
+/// `host_gate` is written by a reading -- the shape of the check the host's own
+/// registry runs -- and `platform_gate` by a measurement, written beside the
+/// verdict by the look that read the platform's own tree. Two acts, two trees,
+/// and they can read oppositely: the host can report today's run while the
+/// platform's contract test has stopped firing. So neither column is derived
+/// from the other, a face that said nothing is an absent key rather than
+/// `false`, and `state: None` is nobody having looked rather than a third value.
+#[cfg(test)]
+mod one_front_line_has_two_ledger_faces {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// The host's own check, as its registry names it.
+    const HOST_GATE: &str = "deploy/scripts/tests/x.test.sh";
+
+    /// The platform's own gate, as its tree declares it.
+    const PLATFORM_GATE: &str = "crates/cog-core/tests/x.rs";
+
+    /// The columns a row cannot be without, and nothing else: every other column
+    /// is optional and is absent from the document of a row that says nothing
+    /// about it.
+    fn row_document(slug: &str) -> Value {
+        json!({
+            "slug": slug,
+            "priority": "unstated",
+            "refusals": 0,
+            "first_seen_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    fn a_row_with(
+        slug: &str,
+        host_gate: Option<&str>,
+        platform_gate: Option<&str>,
+    ) -> PrincipleRow {
+        let mut document = row_document(slug);
+        if let Some(host_gate) = host_gate {
+            document["host_gate"] = json!(host_gate);
+        }
+        if let Some(platform_gate) = platform_gate {
+            document["platform_gate"] = json!(platform_gate);
+        }
+        serde_json::from_value(document).expect("one gate column filled is a row the account holds")
+    }
+
+    /// A row with a verdict on it, read back off the document the store writes.
+    fn a_row_with_state(slug: &str, host_gate: Option<&str>, state: &str) -> PrincipleRow {
+        let mut document = row_document(slug);
+        if let Some(host_gate) = host_gate {
+            document["host_gate"] = json!(host_gate);
+        }
+        document["state"] = json!(state);
+        serde_json::from_value(document).expect("a row with a verdict is a row the account holds")
+    }
+
+    /// 一条战线常有两个正本面——说没说的那一面是缺一个键，不是 false。
+    ///
+    /// A face that said nothing has to be absent rather than `false`, because a
+    /// bool has no room for the third thing that can happen: neither face has
+    /// said anything yet.
+    #[test]
+    fn a_silent_face_is_an_absent_column_not_a_false_one() {
+        let host_only = a_row_with("feedback_x", Some(HOST_GATE), None);
+        assert_eq!(host_only.host_gate.as_deref(), Some(HOST_GATE));
+        assert_eq!(host_only.platform_gate, None);
+
+        let platform_only = a_row_with("feedback_x", None, Some(PLATFORM_GATE));
+        assert_eq!(platform_only.platform_gate.as_deref(), Some(PLATFORM_GATE));
+        assert_eq!(platform_only.host_gate, None);
+
+        // The filled face is written; the silent one is not written at all --
+        // not as `false`, not as `null`, not as the empty string.
+        let host_only_back = serde_json::to_value(&host_only).expect("a row is serialisable");
+        assert_eq!(host_only_back["host_gate"], json!(HOST_GATE));
+        assert!(host_only_back.get("platform_gate").is_none());
+
+        let platform_only_back =
+            serde_json::to_value(&platform_only).expect("a row is serialisable");
+        assert_eq!(platform_only_back["platform_gate"], json!(PLATFORM_GATE));
+        assert!(platform_only_back.get("host_gate").is_none());
+    }
+
+    /// 两面各写各的：折成一个 flag，两个相反的处境会印出同一个答案。
+    ///
+    /// The two rows differ only in which column is filled, and both are the same
+    /// principle. Each round-trips as itself, so a reader that folded the two
+    /// faces into one flag would print the same answer for two opposite
+    /// situations.
+    #[test]
+    fn neither_face_is_derived_from_the_other() {
+        let host_only = a_row_with("feedback_x", Some(HOST_GATE), None);
+        let platform_only = a_row_with("feedback_x", None, Some(PLATFORM_GATE));
+
+        assert_eq!(host_only.slug, platform_only.slug);
+        assert!(host_only.host_gate.is_some() && host_only.platform_gate.is_none());
+        assert!(platform_only.platform_gate.is_some() && platform_only.host_gate.is_none());
+
+        for row in [host_only, platform_only] {
+            let back: PrincipleRow =
+                serde_json::from_value(serde_json::to_value(&row).expect("a row is serialisable"))
+                    .expect("a serialised row is a row");
+            assert_eq!(back, row);
+        }
+    }
+
+    /// principle: feedback_a_front_line_may_have_two_ledger_faces_so_a_bool_is_not_a_reading
+    ///
+    /// 一条战线常有两个正本面，两面的「今天跑没跑」可以相反——所以一个 bool 不是读数.
+    ///
+    /// The opposite reading is reachable in one row: the host ran its check and
+    /// the platform's look settled that no gate exists here. Both survive the
+    /// round trip, because neither act wrote the other's face.
+    #[test]
+    fn one_front_line_can_read_oppositely_on_its_two_faces() {
+        let row = a_row_with_state("feedback_x", Some(HOST_GATE), "unenforced");
+        assert_eq!(row.host_gate.as_deref(), Some(HOST_GATE));
+        assert_eq!(row.state, Some(PrincipleState::Unenforced));
+
+        let back: PrincipleRow =
+            serde_json::from_value(serde_json::to_value(&row).expect("a row is serialisable"))
+                .expect("a serialised row is a row");
+        assert_eq!(back, row);
+    }
+
+    /// 读数不带判决：两个面是两个动作写下的，谁也不是谁的摘要。
+    ///
+    /// A reading carries one face and no verdict, so there is nothing between the
+    /// two faces that could be a bool; the measurement writes the other face
+    /// beside the state it drew it from.
+    #[test]
+    fn a_reading_carries_one_face_and_no_verdict() {
+        let reading = PrincipleReading {
+            slug: "feedback_x".to_string(),
+            source: "list-principles.sh".to_string(),
+            lead: None,
+            carrier_path: None,
+            carrier_sha256: None,
+            host_gate: Some(HOST_GATE.to_string()),
+            where_red: None,
+            check_kind: None,
+            priority: None,
+        };
+        let reading_value = serde_json::to_value(&reading).expect("a reading is serialisable");
+        assert_eq!(reading_value["host_gate"], json!(HOST_GATE));
+        // No `state` key at all: a reading says the host runs this, never that
+        // anything enforces the principle.
+        assert!(reading_value.get("state").is_none());
+        assert!(reading_value.get("platform_gate").is_none());
+
+        let measurement = PrincipleMeasurement {
+            platform_gate: Some(PLATFORM_GATE.to_string()),
+            ..PrincipleMeasurement::new("feedback_x", PrincipleState::Enforced)
+        };
+        let measurement_value =
+            serde_json::to_value(&measurement).expect("a measurement is serialisable");
+        assert_eq!(measurement_value["state"], json!("enforced"));
+        assert_eq!(measurement_value["platform_gate"], json!(PLATFORM_GATE));
+        // The measurement's own act writes the platform's face beside its verdict
+        // and says nothing about the host's.
+        assert!(measurement_value.get("host_gate").is_none());
+    }
+
+    /// 三个答案，不是一个 bool：没人看过，和看过而两边都没门，是两个读数。
+    ///
+    /// The unlooked row's state column is empty -- nobody looked -- while the
+    /// settled one says `unenforced`. A two-valued reading would report the
+    /// unlooked row as ungated, which is the debt it is not.
+    #[test]
+    fn an_unlooked_state_and_an_unenforced_one_read_apart() {
+        let unlooked = a_row_with("feedback_x", None, None);
+        let settled = a_row_with_state("feedback_x", None, "unenforced");
+        assert_eq!(unlooked.state, None);
+        assert_eq!(settled.state, Some(PrincipleState::Unenforced));
+
+        let unlooked_value = serde_json::to_value(&unlooked).expect("a row is serialisable");
+        let settled_value = serde_json::to_value(&settled).expect("a row is serialisable");
+        // An empty column is an empty column, not the word for "no gate here".
+        assert_eq!(unlooked_value["state"], Value::Null);
+        assert_eq!(settled_value["state"], json!("unenforced"));
+        // And neither row has invented a gate out of the absence of a look.
+        assert!(unlooked_value.get("host_gate").is_none());
+        assert!(unlooked_value.get("platform_gate").is_none());
+    }
+}
