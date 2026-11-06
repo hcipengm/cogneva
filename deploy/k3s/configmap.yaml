@@ -77,9 +77,11 @@ data:
   #
   # 2026-11-07 06:0x 的六小时读数：这条车道 `avg_over_time(claim_in_flight[6h]) = 1.000`
   # （每个承载它的 Pod 从生到死都是 1/1），`claim_wait_seconds` 836 s，账上 1,954 条
-  # 欠账；同期构建闸门占用 68%、平均等待 1.65 分钟。排队点在车道，不在构建，故定 2；
-  # 判据与退回条件写在 chart 的 `taskRouter.localClaimConcurrency` 上。
-  COGNEVA_LOCAL_CLAIM_CONCURRENCY: "2"
+  # 欠账；同期构建闸门占用 68%、平均等待 1.65 分钟——排队点在车道，不在构建。
+  # 但同一个 Pod 六小时内存峰值 15.96 GiB / 上限 16 GiB、平均 8.27 GiB（实测 2026-11-07），余量为零，
+  # 第二个许可换来的会是 OOM 不是产能，故仍是 1；抬它的前置条件与判据写在 chart 的
+  # `taskRouter.localClaimConcurrency` 上。
+  COGNEVA_LOCAL_CLAIM_CONCURRENCY: "1"
 
   # 变更账一拍把一个项目的几条欠账并成一道任务派出去。价格的大头是任务的固定部分
   # （一次规划、一轮上下文、一轮沙箱验证），它不随任务承载几条增长，所以并得越多、

@@ -102,15 +102,22 @@ pub const LOCAL_CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_LOCAL_CLAIM_CONCURRENCY";
 /// and the number that separates them is how much of the last six hours each
 /// was actually holding, which is 68% against 100%.
 ///
-/// Two further costs sit on this
-/// number and neither is in this crate. Measured on the evolution pod on
-/// 2026-11-07: one change task held 10.8 GiB of the 16 GiB its container was
-/// given, the largest single consumers being one rustc and six linkers, so the
-/// pod's ceiling and the namespace `LimitRange` above it move in the same round
-/// and the extra permit arrives as an OOM kill if they do not. The knob exists
-/// so that a deployment which has widened the build bound can widen this one
-/// without a rebuild -- not so that raising it alone can be mistaken for
-/// raising output.
+/// The wall behind that reading is memory, not the gate, and it was measured
+/// the same hour the second permit was written into the chart and taken back
+/// out of it. Measured on this host 2026-11-07 over the same six hours, the
+/// evolution pod's `max_over_time(container_memory_working_set_bytes)` hit a
+/// peak of 15.96 GiB (on this host) against its 16 GiB ceiling, with a mean of
+/// 8.27 GiB (on this host): one change task already fills the ceiling, so a
+/// second permit would not queue behind the build, it would be killed with the
+/// first one still in flight. The namespace quota cannot hand this pod more --
+/// measured the same day, 78Gi of `limits.memory` against 59.6Gi in use, with
+/// 12Gi of replacement overlap required for a roll (on this host).
+///
+/// So the precondition for raising this number is a reading, not a judgement:
+/// the pod's 24-hour peak has to come down to 12 GiB (on this host) and stay
+/// there before a second permit goes in. The knob exists so that whoever does
+/// that can widen the lane without a rebuild -- not so that raising it alone
+/// can be mistaken for raising output.
 // cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活
 pub const DEFAULT_LOCAL_CLAIM_CONCURRENCY: usize = 1;
 

@@ -1633,12 +1633,23 @@ taskRouter:
   # （68%）、调用方合计只等了 31 分钟（平均 1.65 分钟，平均一次占 12.8 分钟），
   # 满占用折合约 112 次/天，而现在只跑到约 76 次。
   #
-  # 判据（落地后照着读，不照感觉）：抬到 2 之后 24 小时，change-ledger 任务 completed
-  # 从 31 条/天升到 47 条/天以上，且构建闸门平均等待仍 < 5 分钟。两条都不满足——或
-  # Pod 因 OOM 重启（16 GiB 上限下，一道变更构建峰值实测 10.8 GiB，两个构建靠闸门
-  # 串行不会同时到峰值，这是假设不是结论）——退回 1。若闸门等待先撞线，下一个杠杆
-  # 是「每完成一道变更摊到几次构建」（当时约 2.4 次），不是再加许可。
-  localClaimConcurrency: 2
+  # **2026-11-07 06:2x 定回 1：这道门的墙不是闸门，是这个 Pod 的内存。** 上一条判据
+  # 的前提是「两个构建靠闸门串行，不会同时到峰值」，实测把这条前提否掉了：进化 Pod
+  # 六小时 `max_over_time(container_memory_working_set_bytes)` 峰值 15.96 GiB（实测
+  # 2026-11-07），容器上限 16 GiB，平均 8.27 GiB（实测 2026-11-07）——一道任务就把
+  # 上限顶满，余量为零。第二个许可接上去不是排队，是 OOM：Pod 一重启，两条在跑的都得
+  # 从头再来，比不抬更贵。
+  #
+  # 抬不动的原因在配额一侧，实测 2026-11-07：namespace `cogneva-quota` 的
+  # 本机 2026-11-07 实测：`limits.memory` 78Gi、已用 59.6Gi，再留一份滚动替换重叠
+  # 之后就没有余量了。
+  #
+  # **抬这一格的触发条件与判据**：先把这个 Pod 的峰值压到 12 GiB 以下（实测口径见上）
+  # 并连续保持一天，读 `max_over_time(container_memory_working_set_bytes{pod=~"cogneva-evolution-.*"}[24h])`；
+  # 那时再抬到 2，判据是 change-ledger completed 从 31 条/天升到 47 条/天以上、
+  # 构建闸门平均等待仍 < 5 分钟、且期间 `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}`
+  # 增量为 0。峰值没下来之前抬，读到的是 OOM，不是产能。
+  localClaimConcurrency: 1
 
 changeLedger:
   # 变更账一拍里，一道任务承载几条欠账。
