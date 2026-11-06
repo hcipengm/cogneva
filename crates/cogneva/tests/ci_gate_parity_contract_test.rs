@@ -57,9 +57,6 @@ const ENFORCED: &[(&str, &str)] = &[
     // The formatter runs on the tree before the verdict is reached, and a tree
     // the formatter can settle is conformed rather than refused.
     ("fmt", "cargo fmt --all -- --check"),
-    // The main suite, with `--no-fail-fast` so the refusal names every failure
-    // rather than the first crate to give up.
-    ("test", "cargo test --workspace --no-fail-fast"),
     // The live-service checks are one script on both sides: the job runs this
     // line, and the sandbox's verification runs the same script as its own gate
     // (the `check-` prefix is what makes it one). The command is the same bytes
@@ -71,6 +68,78 @@ const ENFORCED: &[(&str, &str)] = &[
     ("live", "bash deploy/scripts/check-live-services.sh"),
 ];
 
+/// Gating jobs the verification stage enforces in part: what it runs, and what
+/// it does not.
+///
+/// The binary split above was the whole model until the stage started reading
+/// the workflow's own `run:` lines: back then a job was either one of the three
+/// cargo commands the stage ran or a surface it never touched, and "not
+/// enforced" was the honest answer for anything else. Now the stage runs every
+/// single-line gate the workflow names, so several jobs are neither: most of
+/// what they judge runs before the commit, and a named residue does not.
+///
+/// Keeping those in `NOT_ENFORCED` would say a change that trips them passes
+/// verification -- false for `deploy-parity`, whose parity and render checks
+/// are the stage's own gates. Moving them to `ENFORCED` would say the residue
+/// is covered -- also false. So the row carries both, and the residue is the
+/// part a reader has to know about, because it is the part that still fails
+/// after the change has landed.
+const PARTLY_ENFORCED: &[(&str, &str, &str)] = &[
+    (
+        "test",
+        "The job's command with its scope word swapped: `--workspace` becomes \
+         one `-p` per package the change touches, and every other argument -- \
+         `--no-fail-fast`, the message format -- is left alone. A change that \
+         only edits files inside workspace members is judged by those packages' \
+         suites before the commit.",
+        "The packages the change did not touch are not compiled or run. A change \
+         to a crate other packages depend on is judged by its own suite, not by \
+         its dependents', and the dependents are judged after it lands -- which \
+         is the one shape where the stage can be green and the job red. A change \
+         to a file outside every member (the root manifest, `deploy/`, a root \
+         document) has no package whose suite would cover it, so that case falls \
+         back to the whole workspace.",
+    ),
+    (
+        "entry-scripts",
+        "`bash deploy/scripts/check-entry-scripts.sh` is the job's own command \
+         and the stage's: the three blocks of body it used to be (shellcheck \
+         over every tracked `*.sh`, the script tests, the PowerShell parse) are \
+         one script now, called from this workflow and from the stage by the \
+         same line. The shellcheck section needs nothing but git and \
+         shellcheck, so it runs wherever the stage runs.",
+        "The other two sections need tools the build image does not carry: \
+         `promtool` for the alert-rule tests and `pwsh` for `bootstrap.ps1`. \
+         The script exits 2 -- \"I cannot run this\" -- and names them rather \
+         than reporting a green it did not reach, which is why the residue is \
+         visible instead of silent. A change that breaks a script test still \
+         passes verification.",
+    ),
+    (
+        "repo-conventions",
+        "The job's twenty-seven single-line readings -- comment citations, \
+         capacity figures, shared-database counting, the live-step `if:`, \
+         README paths, the image build context -- are `run: bash \
+         deploy/scripts/check-*.sh` lines, which is the shape the stage reads \
+         out of this workflow. They run before every commit.",
+        "`check-commit-attribution.sh` reads the commits a push adds, from the \
+         workflow's `BASE_SHA` and `HEAD_SHA`. The stage runs before there is a \
+         push, so there is nothing for it to judge; the reading can refuse a \
+         push but cannot undo an attribution already written into history.",
+    ),
+    (
+        "deploy-parity",
+        "`check-deploy-parity.sh`, `render-deploy.sh --check`, \
+         `sync-static-manifests.sh --check` and the rest of the job's \
+         twenty-two single-line readings are the stage's gates by the same \
+         rule: a path under `scripts/check-`, or an argument that is exactly \
+         `--check`.",
+        "`test-acceptance-census-alert-rules.sh` is the one judgement in this \
+         job written as a multi-line body, and it needs promtool. A change that \
+         breaks an alert rule passes verification and dies here.",
+    ),
+];
+
 /// Gating jobs the verification stage does not enforce, and why.
 ///
 /// Every entry here is a change that passed verification and could still be
@@ -80,9 +149,13 @@ const ENFORCED: &[(&str, &str)] = &[
 const NOT_ENFORCED: &[(&str, &str)] = &[
     (
         "check",
-        "cargo check --workspace is a strictly narrower criterion than the \
-         `test` job's compile, which the stage already runs: anything check \
-         rejects, the test compile rejects too, and it is the same compile.",
+        "The stage compiles the packages the change touches, with the same \
+         compiler and the same flags the `test` job uses; `cargo check \
+         --workspace` is the same compile over a wider set. What is not covered \
+         is the wider set, and that is the gap that matters: a change to a \
+         crate's public surface is compiled here, but the packages that depend \
+         on it are not -- so a call site the change broke is found by this job \
+         and not by the stage.",
     ),
     (
         "clippy",
@@ -110,37 +183,6 @@ const NOT_ENFORCED: &[(&str, &str)] = &[
          line coverage, not the change's, and needs its own instrumented \
          rebuild. Same shape as clippy: a tree-level criterion that would need \
          a baseline before it could judge a change.",
-    ),
-    (
-        "entry-scripts",
-        "shellcheck over every tracked *.sh, the deploy script tests, and the \
-         PowerShell bootstrap's syntax. Deterministic, and reachable from the \
-         stage — but it is a different toolchain on a different surface, so it \
-         is not covered by any compile the stage already runs. A change that \
-         touches a script passes verification and dies here.",
-    ),
-    (
-        "repo-conventions",
-        "Two whole-tree readings that compile nothing: \
-         check-comment-doc-references.sh scans the tracked Rust sources for a \
-         comment that cites a document, and check-commit-attribution.sh scans \
-         the commits a push adds for AI attribution. No toolchain beyond git, \
-         bash and coreutils, so the stage could run both for the cost of a shell \
-         step. They are not wired because the stage's pre-land checks are the \
-         three cargo commands, and a fourth surface is a change to the pipeline \
-         rather than a line here. The cost of the gap is a comment rewritten in \
-         place for the first, and an amended message for the second -- neither \
-         is a revert of code, which is why the attribution reading judges only \
-         the commits the push adds: an attribution already in the history can be \
-         refused, not undone.",
-    ),
-    (
-        "deploy-parity",
-        "check-deploy-parity.sh, render-deploy.sh --check, the git identity \
-         wiring check and the alert-subject check all read deploy/ and the \
-         chart. Reachable from the stage for the same cost as any other shell \
-         step, and nothing in the Cargo workspace covers it. A change that \
-         touches deploy/ passes verification and dies here.",
     ),
     (
         "bootstrap-cross-platform",
@@ -257,12 +299,15 @@ fn every_gating_job_is_answered_before_the_commit() {
     let declared = gating_jobs(&workflow);
 
     let enforced: BTreeSet<&str> = ENFORCED.iter().map(|(job, _)| *job).collect();
+    let partly: BTreeSet<&str> = PARTLY_ENFORCED.iter().map(|(job, _, _)| *job).collect();
     let not_enforced: BTreeSet<&str> = NOT_ENFORCED.iter().map(|(job, _)| *job).collect();
 
     let unanswered: Vec<&str> = declared
         .iter()
         .map(String::as_str)
-        .filter(|job| !enforced.contains(job) && !not_enforced.contains(job))
+        .filter(|job| {
+            !enforced.contains(job) && !partly.contains(job) && !not_enforced.contains(job)
+        })
         .collect();
     assert!(
         unanswered.is_empty(),
@@ -275,7 +320,14 @@ fn every_gating_job_is_answered_before_the_commit() {
     );
 
     for job in declared.iter().map(String::as_str) {
-        if let Some((_, reason)) = ENFORCED.iter().find(|(j, _)| *j == job) {
+        if let Some((_, runs, not_run)) = PARTLY_ENFORCED.iter().find(|(j, _, _)| *j == job) {
+            assert!(
+                !runs.trim().is_empty() && !not_run.trim().is_empty(),
+                "`{job}` is listed as partly enforced but one of its two halves \
+                 is empty: a row that says neither what runs nor what does not \
+                 is not a partial answer, it is a missing one"
+            );
+        } else if let Some((_, reason)) = ENFORCED.iter().find(|(j, _)| *j == job) {
             assert!(
                 !reason.trim().is_empty(),
                 "`{job}` is listed as enforced in {WORKFLOW} but its entry names \
@@ -324,14 +376,27 @@ fn the_gating_set_does_not_shrink_with_a_change() {
 /// it, and whichever one the reader consults first decides the answer.
 #[test]
 fn no_gating_job_is_answered_twice() {
-    let enforced: BTreeSet<&str> = ENFORCED.iter().map(|(job, _)| *job).collect();
-    let not_enforced: BTreeSet<&str> = NOT_ENFORCED.iter().map(|(job, _)| *job).collect();
-    let both: Vec<&&str> = enforced.intersection(&not_enforced).collect();
-    assert!(
-        both.is_empty(),
-        "{both:?} appear in both ENFORCED and NOT_ENFORCED; the two tables have \
-         to agree about what the verification stage does"
-    );
+    let tables: [(&str, BTreeSet<&str>); 3] = [
+        ("ENFORCED", ENFORCED.iter().map(|(job, _)| *job).collect()),
+        (
+            "PARTLY_ENFORCED",
+            PARTLY_ENFORCED.iter().map(|(job, _, _)| *job).collect(),
+        ),
+        (
+            "NOT_ENFORCED",
+            NOT_ENFORCED.iter().map(|(job, _)| *job).collect(),
+        ),
+    ];
+    for (i, (left_name, left)) in tables.iter().enumerate() {
+        for (right_name, right) in tables.iter().skip(i + 1) {
+            let both: Vec<&&str> = left.intersection(right).collect();
+            assert!(
+                both.is_empty(),
+                "{both:?} appear in both {left_name} and {right_name}; the tables \
+                 have to agree about what the verification stage does"
+            );
+        }
+    }
 }
 
 /// The job a table entry names has to exist in the workflow at all — otherwise
@@ -343,8 +408,9 @@ fn no_answer_names_a_job_that_no_longer_gates() {
     let declared = gating_jobs(&workflow);
     let stale: Vec<&str> = ENFORCED
         .iter()
-        .chain(NOT_ENFORCED.iter())
         .map(|(job, _)| *job)
+        .chain(PARTLY_ENFORCED.iter().map(|(job, _, _)| *job))
+        .chain(NOT_ENFORCED.iter().map(|(job, _)| *job))
         .filter(|job| !declared.contains(*job))
         .collect();
     assert!(
