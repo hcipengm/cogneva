@@ -1926,13 +1926,30 @@ impl DagExecutor {
     async fn check_timeouts_store(&self) -> Vec<(String, bool, Vec<String>, bool)> {
         let be = self.fg().expect("store mode");
         let now = chrono::Utc::now();
-        // 回收判据只对还在跑的行成立（终态的行不再持有租约，也不会超时），所以
-        // 这一趟只读还能影响派发的行。整表读的代价在控制面上是按秒计的，而这一
-        // 趟在超时扫描里循环调用。
-        let all = be
-            .dag_get_live_tasks(&self.workspace_id)
+        // 回收判据只对还在跑的行成立：`reclaim_cause` 的第一句就是「不是 Running
+        // 一律 None」。所以这一趟要读的就是 `Running` 那一列，而读还能影响派发的
+        // 整份 live 集是把判据的条件放宽到别的状态上去——答案一样，价钱不一样：
+        // 本机这台 cogneva 库（2026-11-07 实测）live 集 2,697 行 / 12 MB，`running`
+        // 只有 2 行，而这一趟在每个网关进程里每十几秒走一次。
+        //
+        // 读不成时明说，不再 `unwrap_or_default()`：空集与读失败在判据上恰好是
+        // 同一个答案——「这一趟没有要回收的」——于是回收会在一次读失败之后永远
+        // 沉默，而沉默的表现与对象本身是同一个数：Running 那几行一动不动。留下
+        // 具名的一行日志，读失败才与「确实没有过期任务」分得开。
+        let all = match be
+            .dag_get_tasks_in_status(&self.workspace_id, TaskStatus::Running)
             .await
-            .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    workspace_id = %self.workspace_id,
+                    error = %e,
+                    "cannot read the running column; this reclaim pass judges nothing because it could not see, and this line is the only thing that says so"
+                );
+                Vec::new()
+            }
+        };
         let reclaimable: Vec<(Task, ReclaimCause)> = all
             .into_iter()
             .filter_map(|t| reclaim_cause(&t, self.task_lease, now).map(|c| (t, c)))
@@ -1971,21 +1988,32 @@ impl DagExecutor {
             }
             // 回收是编排层观测到的事实，不是传输层给的信号：没有状态码可依，
             // 类型留空，让下游知道这次失败只有文本。
-            if let Ok((retried, cancelled, dlq_pushed)) =
-                self.fail_task(&t.id, cause.error(), None).await
-            {
-                if retried {
-                    let _ = self
-                        .store_transition(
-                            &t.id,
-                            &[TaskStatus::Pending],
-                            "Cannot transition task in {} state",
-                            |task| task.clear_run(),
-                            None,
-                        )
-                        .await;
+            //
+            // 写不成要说出来：这一条已经是判过期的，落不下去就是「它还占着那个
+            // 执行位置」——而它的表现与「没有过期任务」在读数上是同一个：没有任何
+            // 状态变化。`if let Ok` 把这条错吞掉，下一次判据仍然是同一条，于是每
+            // 一拍都判过期、每一拍都写不成，谁也不说。
+            match self.fail_task(&t.id, cause.error(), None).await {
+                Ok((retried, cancelled, dlq_pushed)) => {
+                    if retried {
+                        let _ = self
+                            .store_transition(
+                                &t.id,
+                                &[TaskStatus::Pending],
+                                "Cannot transition task in {} state",
+                                |task| task.clear_run(),
+                                None,
+                            )
+                            .await;
+                    }
+                    results.push((t.id.clone(), retried, cancelled, dlq_pushed));
                 }
-                results.push((t.id.clone(), retried, cancelled, dlq_pushed));
+                Err(e) => tracing::warn!(
+                    task_id = %t.id,
+                    error = %e,
+                    cause = %cause.error(),
+                    "cannot reclaim a task that is already past its own bound; it keeps holding its execution slot until this write lands"
+                ),
             }
         }
         results
@@ -5033,6 +5061,9 @@ mod tests {
         tasks: tokio::sync::Mutex<Vec<Task>>,
         wide_reads: std::sync::atomic::AtomicUsize,
         narrow_reads: std::sync::atomic::AtomicUsize,
+        /// 问过整份 live 集几次。`wide_reads` 数的是整张表，这一格数的是判据只要
+        /// 一个状态、却按「所有还能影响派发的行」去读的那一问。
+        live_reads: std::sync::atomic::AtomicUsize,
     }
 
     impl CountingTaskStore {
@@ -5041,6 +5072,9 @@ mod tests {
         }
         fn narrow_reads(&self) -> usize {
             self.narrow_reads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn live_reads(&self) -> usize {
+            self.live_reads.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -5125,6 +5159,8 @@ mod tests {
             Ok(self.tasks.lock().await.clone())
         }
         async fn dag_get_live_tasks(&self, _workspace_id: &str) -> SFResult<Vec<Task>> {
+            self.live_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.narrow_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self
@@ -5158,6 +5194,14 @@ mod tests {
             _task_id: &str,
             _expected: &[TaskStatus],
             _updated: &Task,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+        async fn dag_append_retry(
+            &self,
+            _workspace_id: &str,
+            _task_id: &str,
+            _attempt: &cog_core::RetryAttempt,
         ) -> SFResult<()> {
             Ok(())
         }
@@ -6704,6 +6748,55 @@ mod tests {
         assert!(
             expires <= chrono::Utc::now() + chrono::Duration::seconds(61),
             "到期时刻不能超过租约时长: {expires}"
+        );
+    }
+
+    /// 超时回收只读 `Running` 那一列，不读整份 live 集。
+    ///
+    /// 判据的第一句就是「不是 `Running` 一律 None」（见 `reclaim_cause`），所以
+    /// 两种读法的答案一样，只有请求的字节数不一样：本机这台 cogneva 库上
+    /// （2026-11-07 实测）live 集 2,697 行 / 12 MB，`running` 只有 2 行，而这一趟
+    /// 在每个网关进程里每十几秒走一次。这条测试钉的是读的范围——答案正确区分
+    /// 不了这两种读法。
+    #[tokio::test]
+    async fn the_timeout_reclaim_reads_only_the_running_column() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-reclaim-read".into())
+            .with_task_lease_secs(600)
+            .with_state_backend(backend.clone());
+
+        // 租约已经过期：判据只有 Running 才成立，而这一条两条证据都满足。
+        let mut over = Task::new("t-over-budget", TaskType::DagNode, serde_json::json!({}));
+        over.status = TaskStatus::Running;
+        over.timeout_seconds = 600;
+        over.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1200));
+        over.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        let waiting = Task::new("t-waiting", TaskType::DagNode, serde_json::json!({}));
+        assert!(
+            reclaim_cause(&over, dag.task_lease, chrono::Utc::now()).is_some(),
+            "判据本身必须认定这一条过期：started_at 早于预算 {over:?}"
+        );
+        backend.tasks.lock().await.extend([over, waiting]);
+
+        let reclaimed = dag.check_timeouts().await;
+        assert!(
+            backend.narrow_reads() >= 1,
+            "这一趟根本没读到库（live={} narrow={}）: {reclaimed:?}",
+            backend.live_reads(),
+            backend.narrow_reads()
+        );
+        assert!(
+            reclaimed.iter().any(|(id, ..)| id == "t-over-budget"),
+            "用光了预算的那一条必须被回收，否则它连同它占着的执行位置一起停在那里: {reclaimed:?}"
+        );
+        assert_eq!(
+            backend.live_reads(),
+            0,
+            "判据只要 Running，读整份 live 集是把条件放宽到别的状态上去，价钱却按行数算"
+        );
+        assert!(
+            backend.narrow_reads() >= 1,
+            "这一问至少要读一次 Running 那些行，否则答案是从别处猜的"
         );
     }
 
