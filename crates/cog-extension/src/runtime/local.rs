@@ -78,6 +78,72 @@ fn signal_death_note(sig: i32, facts: &super::cgroup::CgroupFacts, oom: bool) ->
     }
 }
 
+/// Programs whose invocation compiles the tree they run in.
+const BUILD_PROGRAMS: &[&str] = &[
+    "cargo",
+    "cargo-clippy",
+    "cargo-nextest",
+    "rustc",
+    "clippy-driver",
+    "rustdoc",
+];
+
+/// Whether this shell command compiles the tree it runs in.
+///
+/// Every command the executor runs is pointed at the same `CARGO_TARGET_DIR`,
+/// and cargo serialises the writers to one target directory on a lock that no
+/// caller's wall covers. Commands started together therefore each spend their
+/// whole budget waiting for a lock, time out having compiled nothing, and leave
+/// the host reading as saturated -- which narrows the build gate the same host
+/// publishes to a single slot, so the verification pipeline queues behind work
+/// that produced no artifact. The bound this decides is what keeps them from
+/// being started together in the first place.
+///
+/// Read at the position a program can occupy, not anywhere in the string: a
+/// command that searches for `cargo` is not a build, and charging it a build
+/// slot would hold that slot for every search. A segment is cut at the shell's
+/// separators, and its first word that is not a wrapper or an argument to one
+/// is the program that will run.
+pub(crate) fn builds_the_tree(command: &str) -> bool {
+    command
+        .split([';', '&', '|', '(', ')', '\n'])
+        .any(|segment| program_of(segment).is_some_and(|name| BUILD_PROGRAMS.contains(&name)))
+}
+
+/// The program a shell segment runs, once its wrappers are stepped over.
+///
+/// `timeout 580 cargo test` runs cargo, `env A=B cargo build` runs cargo, and
+/// `grep cargo` runs grep. The wrappers are recognised by name and their
+/// arguments by shape, so what is left is the word the shell would resolve.
+fn program_of(segment: &str) -> Option<&str> {
+    for word in segment.split_whitespace() {
+        let name = Path::new(word)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(word);
+        if matches!(
+            name,
+            "timeout" | "nice" | "sudo" | "nohup" | "exec" | "command" | "env" | "stdbuf"
+        ) {
+            continue;
+        }
+        // A wrapper's own arguments: an option, a duration, a signal name, or
+        // an assignment. None of them is the program the segment runs.
+        if word.starts_with('-') || word.contains('=') || looks_like_duration(word) {
+            continue;
+        }
+        return Some(name);
+    }
+    None
+}
+
+/// A wrapper argument that is a bare duration, such as `timeout`'s `580` or
+/// `timeout`'s `10s`.
+fn looks_like_duration(word: &str) -> bool {
+    let digits = word.trim_end_matches(['s', 'm', 'h', 'd']);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Spawn `sh -c <command>` and drive stdout/stderr/exit into an event channel.
 /// Shared by the local backend and the executor server; kills the child on
 /// timeout.
@@ -93,12 +159,18 @@ fn signal_death_note(sig: i32, facts: &super::cgroup::CgroupFacts, oom: bool) ->
 /// and its place in the command slot the cache pass reads -- have to last that
 /// long, or the tree could be reclaimed underneath the command and the cache
 /// emptied while it builds.
+///
+/// `build_slot` is the same kind of fact one level out: the place this command
+/// holds among the builds allowed to compile into the shared target directory.
+/// It is released when the child is gone, not when the request is answered, so
+/// the next build starts against a directory nobody is writing.
 pub(crate) fn spawn_command(
     command: &str,
     timeout: std::time::Duration,
     workdir: Option<&Path>,
     cargo_target: Option<&Path>,
     hold: Option<crate::workdir::CommandHold>,
+    build_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> SFResult<tokio::sync::mpsc::Receiver<CommandEvent>> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
@@ -125,6 +197,7 @@ pub(crate) fn spawn_command(
     tokio::spawn(async move {
         // Dropped when this task ends, i.e. after the child was waited for.
         let _hold = hold;
+        let _build_slot = build_slot;
         use tokio::io::AsyncReadExt;
         let tx_out = tx.clone();
         let tx_err = tx.clone();
@@ -262,7 +335,10 @@ impl SandboxBackend for LocalExecutor {
         match &req.payload {
             SandboxPayload::Command { command } => {
                 tracing::warn!(command = %command, "local command execution (no remote executor configured)");
-                let rx = spawn_command(command, req.timeout, None, None, None)?;
+                // Embedded use has no shared target directory to serialise:
+                // the command runs in whatever tree the caller's cwd names, so
+                // there is no slot to take here.
+                let rx = spawn_command(command, req.timeout, None, None, None, None)?;
                 Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|event| (event, rx))
                 })))
@@ -299,6 +375,30 @@ mod tests {
         req(SandboxPayload::Command {
             command: command.into(),
         })
+    }
+
+    /// The commands this bound exists for are read at the position a program
+    /// occupies: what matters is the program the shell will run, not whether
+    /// the word appears somewhere in the string.
+    #[test]
+    fn a_build_is_read_where_a_program_runs_and_nowhere_else() {
+        assert!(builds_the_tree("cargo test -p cog-agent --lib"));
+        assert!(builds_the_tree(
+            "cd /tmp/w && cargo clippy --all-targets -- -D warnings"
+        ));
+        assert!(builds_the_tree("timeout 580 cargo test -p cogneva --lib"));
+        assert!(builds_the_tree("env CARGO_TARGET_DIR=/tmp/t cargo build"));
+        assert!(builds_the_tree("cargo test --workspace 2>&1 | tail -30"));
+        assert!(builds_the_tree(
+            "/usr/local/rustup/toolchains/x/bin/rustc --version"
+        ));
+
+        // A search, a read, and a listing mention the word without compiling.
+        assert!(!builds_the_tree("grep -rn cargo crates/ | head"));
+        assert!(!builds_the_tree("cat Cargo.toml"));
+        assert!(!builds_the_tree("ls -la target/debug"));
+        assert!(!builds_the_tree("echo 'cargo test' >> notes.txt"));
+        assert!(!builds_the_tree(""));
     }
 
     #[tokio::test]

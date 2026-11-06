@@ -34,6 +34,31 @@ struct AppState {
     /// keeps the capability off by default rather than one bad path away from
     /// a writable root.
     hostdocs: Option<Arc<HostDocs>>,
+    /// How many commands may compile into the shared target directory at once.
+    /// See [`crate::runtime::local::builds_the_tree`] for what this bounds and
+    /// why a bound is owed at all.
+    build_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// How many commands may compile at once when the deployment names none.
+///
+/// Two rather than one: the agents that ask for these commands each have their
+/// own wall clock, and a queue of one makes every build wait for the slowest
+/// one in front of it -- measured on this host, twelve commands were started
+/// together and each timed out after 560 s without compiling anything, because
+/// cargo serialises writers to one target directory and none of them was the
+/// writer. Two lets one build proceed while another waits without doubling the
+/// pressure on the device every one of them reads.
+// cap: policy — 并发上限，不是容量读数；容量由宿主的装载决定，这个数只决定排队
+const DEFAULT_BUILD_CONCURRENCY: usize = 2;
+
+/// The concurrency in force, from `COGNEVA_SANDBOX_BUILD_CONCURRENCY`.
+fn build_concurrency() -> usize {
+    std::env::var("COGNEVA_SANDBOX_BUILD_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_BUILD_CONCURRENCY)
 }
 
 /// Hard ceiling on command duration regardless of what the client asks for.
@@ -195,12 +220,29 @@ async fn execute_handler(
                 command = %command,
                 "sandbox executor running command"
             );
+            // A command that compiles waits its turn here, before its child
+            // exists. The wall handed to the child starts when the child does,
+            // so time spent queued is not time spent compiling: without this,
+            // every extra build started beside it shortened the wall the others
+            // had left, and each of them timed out having read nothing.
+            let build_slot = match build_slot_for(&state, command).await {
+                Ok(slot) => slot,
+                // The semaphore is never closed in this process; a caller that
+                // lands here is told so rather than run unbounded.
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("build slot unavailable: {e}"),
+                    )
+                }
+            };
             match crate::runtime::local::spawn_command(
                 command,
                 timeout,
                 workdir.as_deref(),
                 cargo_target.as_deref(),
                 worktree_claim,
+                build_slot,
             ) {
                 Ok(rx) => stream_response(rx),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -273,10 +315,28 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
 }
 
 /// Router without per-task worktrees (tests and any no-volume deployment).
+/// The place this command holds among the builds allowed to compile at once.
+///
+/// `Ok(None)` is a command that compiles nothing: it takes no slot, because
+/// holding one for a search would put every search behind a build.
+async fn build_slot_for(
+    state: &AppState,
+    command: &str,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, tokio::sync::AcquireError> {
+    if !crate::runtime::local::builds_the_tree(command) {
+        return Ok(None);
+    }
+    Arc::clone(&state.build_slots)
+        .acquire_owned()
+        .await
+        .map(Some)
+}
+
 pub fn router() -> Router {
     app_router(AppState {
         workdir: None,
         hostdocs: None,
+        build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
     })
 }
 
@@ -285,6 +345,7 @@ pub fn app_router_with_workdir(workdir: Arc<WorkdirRouter>) -> Router {
     app_router(AppState {
         workdir: Some(workdir),
         hostdocs: None,
+        build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
     })
 }
 
@@ -296,6 +357,7 @@ pub fn app_router_with_hostdocs(
     app_router(AppState {
         workdir,
         hostdocs: Some(hostdocs),
+        build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
     })
 }
 
@@ -633,7 +695,11 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let app = app_router(AppState { workdir, hostdocs });
+    let app = app_router(AppState {
+        workdir,
+        hostdocs,
+        build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
+    });
 
     tracing::info!(addr = %addr, "sandbox executor listening");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
@@ -647,6 +713,56 @@ mod tests {
     /// Serializes the tests that mutate `SANDBOX_EXECUTOR_PORT`: the variable
     /// is process-global while the harness runs tests on parallel threads.
     static PORT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn state_with_build_slots(n: usize) -> AppState {
+        AppState {
+            workdir: None,
+            hostdocs: None,
+            build_slots: Arc::new(tokio::sync::Semaphore::new(n)),
+        }
+    }
+
+    /// The bound this exists for: a second build does not start while the
+    /// first one holds the last slot, and a command that compiles nothing is
+    /// never made to wait for one.
+    #[tokio::test]
+    async fn a_build_waits_its_turn_and_a_search_does_not() {
+        let state = state_with_build_slots(1);
+        let held = build_slot_for(&state, "cargo test -p cogneva --lib")
+            .await
+            .expect("the semaphore is open")
+            .expect("a build takes a slot");
+
+        let queued = tokio::time::timeout(std::time::Duration::from_millis(80), async {
+            build_slot_for(&state, "cargo clippy --all-targets").await
+        })
+        .await;
+        assert!(
+            queued.is_err(),
+            "a second build must wait while the only slot is held"
+        );
+
+        // A search names the same program without running it, and must not
+        // queue behind a build to do so.
+        let search = tokio::time::timeout(
+            std::time::Duration::from_millis(80),
+            build_slot_for(&state, "grep -rn cargo crates/"),
+        )
+        .await
+        .expect("a search never queues")
+        .expect("the semaphore is open");
+        assert!(search.is_none(), "a search holds no build slot");
+
+        drop(held);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            build_slot_for(&state, "cargo clippy --all-targets"),
+        )
+        .await
+        .expect("the released slot admits the waiting build")
+        .expect("the semaphore is open");
+        assert!(next.is_some(), "the queued build gets the slot back");
+    }
 
     #[test]
     fn executor_port_defaults_when_unset_and_overrides_when_set() {
