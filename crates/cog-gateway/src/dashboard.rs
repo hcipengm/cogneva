@@ -70,7 +70,7 @@ fn index_path() -> PathBuf {
 pub async fn dashboard_handler() -> Response {
     let path = index_path();
     match tokio::fs::read_to_string(&path).await {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => index_response(html),
         Err(e) => {
             tracing::error!("failed to read dashboard from {}: {}", path.display(), e);
             (
@@ -79,5 +79,39 @@ pub async fn dashboard_handler() -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+/// 入口页那一份回应。
+///
+/// 这一页是入口，不是内容：它点名的是一份带内容哈希的资源包，而换镜像时那个
+/// 哈希会变。浏览器拿着上一版的 HTML 就等于一直打开上一版的界面——后台已经换
+/// 好了，读者看到的还是旧的那一屏，而「怎么没变」在两边都读不出原因。所以这一
+/// 页每次都要回来问一句：没变就 304，换了就拿新的。
+fn index_response(html: String) -> Response {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-cache")],
+        Html(html),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 换镜像之后读者必须拿得到新的那一屏：入口页能被缓存成旧的那一份时，
+    /// 服务端的一切改动都与屏幕无关。
+    #[test]
+    fn the_entry_page_never_comes_from_a_cache_without_asking() {
+        let response = index_response("<html></html>".to_string());
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "入口页没有要求浏览器回问一句：换镜像之后它可能一直开着上一版的界面"
+        );
     }
 }
