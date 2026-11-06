@@ -238,3 +238,43 @@ fn the_node_version_is_the_same_in_every_carrier() {
          它装的东西"
     );
 }
+
+/// 发货镜像里装着判前端的那套工具链。
+///
+/// 沙盒执行器判 `web/src/**` 的变更时跑的是 `deploy/scripts/web-build.sh`，而这个
+/// 脚本在没有 node/npm 时**退出 2**——「我跑不了」，不是「我判过了」。于是运行段少
+/// 了那几行 COPY 时，前端这一族的准入条件在沙盒里一次都执行不了，而每一条 web 变更
+/// 都会按「声明过条件、条件跑不起来」被拒；拒收的理由看起来像变更的问题，没有一个
+/// 字提到镜像。这与 shellcheck 那一格同形：判据需要一个工具，工具不在镜像里时，
+/// 缺工具被读成了判词。
+///
+/// 只判**运行段**（最后一个 `FROM` 之后）：`webbuilder` 阶段本来就有 node，它有没有
+/// 并不说明发出去的镜像有没有。
+#[test]
+fn the_shipping_image_carries_the_frontend_toolchain() {
+    let root = repo_root();
+    let dockerfile = text_of(&root, "Dockerfile");
+    let runtime = dockerfile
+        .rsplit_once("\nFROM ")
+        .map(|(_, tail)| tail)
+        .expect("Dockerfile 里找不到运行段（最后一个 FROM）");
+
+    for needed in [
+        "COPY --from=webbuilder /usr/local/bin/node",
+        "COPY --from=webbuilder /usr/local/lib/node_modules",
+        "npm-cli.js",
+    ] {
+        assert!(
+            runtime.contains(needed),
+            "运行段里没有 `{needed}`：沙盒里的 web-build 会恒为退出码 2，前端这一族\
+             一条变更都判不了，而拒收的理由会说成是变更的问题"
+        );
+    }
+    assert!(
+        runtime
+            .lines()
+            .any(|line| line.contains("node --version") && line.contains("npm --version")),
+        "运行段没有在那几行 COPY 之后跑一次 `node --version && npm --version`：拷进来的\
+         东西能不能用，只有构建时问一句才知道"
+    );
+}
