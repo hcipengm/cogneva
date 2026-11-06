@@ -94,11 +94,23 @@ const CONNECTION_BUILDERS: &[&str] = &[
 /// reconnect.
 const SUBSCRIBER_FILE: &str = "crates/cog-stream/src/redis.rs";
 const SUBSCRIBER_DEADLINE: &str = concat!("with_response_", "timeout_ms");
-const SUBSCRIBER_BLOCK_BASE: &str = concat!("read_block_ms.max(self.", "resume_block_ms)");
+/// The product the deadline has to be built from: the larger of the two block
+/// periods the loop reads and resumes with.
+///
+/// It was spelled `self.read_block_ms.max(self.resume_block_ms)` while the
+/// connection was built inline at the loop. Once those two periods became
+/// parameters of the function that builds it, the receiver went away and the
+/// product stayed the same, so a detector that insisted on `self.` reported a
+/// widened deadline as missing. The rule is about the relationship, not about
+/// the receiver.
+const SUBSCRIBER_BLOCK_BASE: &str = concat!("read_block_", "ms.max(");
+const SUBSCRIBER_BLOCK_PEER: &str = concat!("resume_", "block_ms");
 
 /// The rule, as a pure function of one file's text.
 fn read_deadline_clears_the_block(source: &str) -> bool {
-    source.contains(SUBSCRIBER_DEADLINE) && source.contains(SUBSCRIBER_BLOCK_BASE)
+    source.contains(SUBSCRIBER_DEADLINE)
+        && source.contains(SUBSCRIBER_BLOCK_BASE)
+        && source.contains(SUBSCRIBER_BLOCK_PEER)
 }
 
 /// The bare-type rule, as a pure function of one source file's text.

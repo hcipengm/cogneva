@@ -18,14 +18,16 @@
 //! of the connections already open without closing them, then asserts a message
 //! published after the silence is delivered anyway.
 
-use std::net::{IpAddr, SocketAddr};
+mod common;
+
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cog_core::MessageBackend;
 use cog_stream::{ReadHealth, RedisMessageBackend};
-use cog_test_support::redis_url;
+use common::{publish_until_ok, upstream_addr};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -138,50 +140,6 @@ async fn proxy_pair(mut downstream: TcpStream, mut upstream: TcpStream, dark: Da
         _ = to_server => {}
         _ = to_client => {}
     }
-}
-
-/// Address of the redis the tests may use, or None when there is none — the
-/// same skip-rather-than-fail contract the other live-redis tests follow.
-/// Only the address is ever printed: the URL may carry a password.
-async fn upstream_addr() -> Option<SocketAddr> {
-    let url = redis_url();
-    let client = redis::Client::open(url.as_str()).ok()?;
-    let addr = match client.get_connection_info().addr.clone() {
-        redis::ConnectionAddr::Tcp(host, port) => {
-            SocketAddr::new(host.parse::<IpAddr>().ok()?, port)
-        }
-        other => {
-            eprintln!("SKIP: redis url is not a plain TCP address: {other:?}");
-            return None;
-        }
-    };
-    match TcpStream::connect(addr).await {
-        Ok(_) => Some(addr),
-        Err(_) => {
-            eprintln!("SKIP: no redis at {addr}");
-            None
-        }
-    }
-}
-
-async fn publish_until_ok(
-    backend: &RedisMessageBackend,
-    subject: &str,
-    payload: &[u8],
-    within: Duration,
-) -> Result<(), String> {
-    let deadline = Instant::now() + within;
-    let mut last = String::from("no attempt was made");
-    while Instant::now() < deadline {
-        match backend.publish(subject, payload).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last = e.to_string();
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
-    Err(last)
 }
 
 #[tokio::test]
