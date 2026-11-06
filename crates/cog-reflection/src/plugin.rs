@@ -3519,9 +3519,7 @@ async fn merge_verification_inputs(
         // 判据与落地侧同一个数（`cog_core::count_diff_lines` 与同一个配置键）：
         // 两处各数一遍，就是同一条变更在两个地方各有各的行数。
         let changed_lines = cog_core::count_diff_lines(diff);
-        let refusal = if let Some(cap) =
-            max_changed_lines.filter(|cap| changed_lines > *cap)
-        {
+        let refusal = if let Some(cap) = max_changed_lines.filter(|cap| changed_lines > *cap) {
             Some((
                 format!(
                     "the change is {changed_lines} changed lines, over the {cap} line budget the landing policy holds it to"

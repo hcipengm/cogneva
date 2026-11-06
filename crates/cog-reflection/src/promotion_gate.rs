@@ -1031,7 +1031,11 @@ mod tests {
     /// 悄悄回到某个数时，这个大变更会重新落进转人工那一档而无人发现。
     #[test]
     fn an_unbounded_policy_admits_a_change_larger_than_the_old_default() {
-        let v = classify(&files(&["crates/cog-agent/src/tools.rs"]), 100_000, &policy());
+        let v = classify(
+            &files(&["crates/cog-agent/src/tools.rs"]),
+            100_000,
+            &policy(),
+        );
         assert_eq!(v, GateVerdict::AutoRollout);
     }
 
