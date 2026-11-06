@@ -83,6 +83,13 @@ const WARM_DIR_NAME: &str = ".warm";
 
 const META_DIR_NAME: &str = ".meta";
 
+/// The entry a bare repository writes into every worktree it owns, and the one
+/// thing that tells a real tree apart from a directory that merely has the
+/// right name. Named once because two readers ask the same question -- the
+/// pool deciding whether a slot can be handed out, and the health check
+/// deciding whether a task's tree is still the one git registered.
+const WORKTREE_LINK: &str = ".git";
+
 /// Maximum task id length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
 /// `<owner-task>-ralph-roundtable-i12-<8 hex>`.
@@ -982,7 +989,7 @@ impl WorkdirRouter {
         };
         while let Ok(Some(entry)) = rd.next_entry().await {
             let path = entry.path();
-            if !tokio::fs::try_exists(path.join(".git"))
+            if !tokio::fs::try_exists(path.join(WORKTREE_LINK))
                 .await
                 .unwrap_or(false)
             {
@@ -1222,7 +1229,7 @@ impl WorkdirRouter {
     /// manages. Authoritative registration reconciliation happens at boot and
     /// GC via `git worktree list`.
     async fn is_healthy(&self, path: &Path) -> bool {
-        tokio::fs::try_exists(path.join(".git"))
+        tokio::fs::try_exists(path.join(WORKTREE_LINK))
             .await
             .unwrap_or(false)
             && self.read_meta_of(path).is_some()
@@ -2990,7 +2997,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            slot.join(".git").exists(),
+            slot.join(WORKTREE_LINK).exists(),
             "the precondition is a slot that still carries its git link"
         );
         assert!(
@@ -3472,7 +3479,7 @@ pub(crate) mod tests {
         let (path, _in_use) = r.route("busy").await.unwrap();
 
         // The tree stops looking like a worktree while a command runs in it.
-        std::fs::remove_file(path.join(".git")).unwrap();
+        std::fs::remove_file(path.join(WORKTREE_LINK)).unwrap();
 
         let err = match r.route("busy").await {
             Ok(_) => panic!("rebuilding a tree in use must be refused"),
