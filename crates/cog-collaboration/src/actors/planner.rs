@@ -4,15 +4,15 @@ use cog_core::{Agent, KnowledgeBackend, Task};
 
 use crate::squad::pge::types::PlannerOutput;
 
-/// The files a refusing gate named, when this task is a hand-back of a refused
-/// change rather than a fresh request.
+/// The files a refusing gate named, and which way the next attempt has to read
+/// them.
 ///
 /// Read from the task payload, where the hand-off writes it, and read here
 /// because this is the actor that turns a request into the paths the change is
 /// held to. An empty list and an absent field are the same case — a gate that
 /// named nothing has not told the planner anything it did not already know, and
 /// a `required_targets` of zero entries would ask the model to name nothing.
-fn rework_named_files(task: &Task) -> Option<Vec<String>> {
+fn refused_files(task: &Task) -> Option<RefusedFiles> {
     let files: Vec<String> = task
         .input
         .get("named_files")?
@@ -25,7 +25,31 @@ fn rework_named_files(task: &Task) -> Option<Vec<String>> {
     if files.is_empty() {
         return None;
     }
-    Some(files)
+    Some(
+        match task.input.get("rejection_cause").and_then(|c| c.as_str()) {
+            Some(cause) if cause == cog_core::RejectionCause::ForbiddenPath.as_str() => {
+                RefusedFiles::OutOfReach(files)
+            }
+            _ => RefusedFiles::Targets(files),
+        },
+    )
+}
+
+/// What the refusing gate's file list is to the plan that follows.
+///
+/// Almost every refusal names where the defect is, and the plan is held to
+/// those files. A path refusal is the one that inverts: it names the files
+/// *because this instance may not write to them*, so a plan that touches any of
+/// them is refused again before it is ever compiled. The hand-off that builds
+/// this task already words its goal that way; without this split the planner
+/// undid that wording one step later, telling the generator that every refused
+/// path had to appear in its targets — which is how a rework of a path refusal
+/// spends its whole budget re-deriving a verdict that was already in hand.
+enum RefusedFiles {
+    /// The defect is in these files, so the change has to touch them.
+    Targets(Vec<String>),
+    /// These are the files this instance may not contribute to at all.
+    OutOfReach(Vec<String>),
 }
 
 /// 上一轮尝试的记录，Planner 在重试时照原样读回。
@@ -294,18 +318,39 @@ impl PlannerActor {
         // targets 就是那张表——生成侧的契约已经写着「你点名的路径而 diff 没碰，判退」，
         // 所以这一条不需要新判据，只是把已有的那一条接上。
         //
+        // 路径判退要反过来读：它点名的正是这一实例碰不得的路径（见 [`RefusedFiles`]）。
+        // 那里的清单不进 `required_targets`，而是写成一段禁令——照着原样交给 plan，
+        // 等于要求一次注定被同一道门拒掉的尝试。
+        //
         // 这份清单整条任务不变，所以它进稳定半边，与其余答案契约一起被缓存；
         // 没有这个字段的任务（每一个不是回流的自进化任务）字节不变。
-        if let Some(files) = rework_named_files(task) {
-            contract["required_targets"] = serde_json::json!(files);
-            if let Some(instructions) = contract["instructions"].as_str() {
-                contract["instructions"] = serde_json::json!(format!(
-                    "{instructions} required_targets names the repository-relative paths the check \
-                     that refused the previous attempt objected to. Every one of them must appear \
-                     in your targets: the defect is in those files, so the change has to touch \
-                     them. Do not re-derive the list by searching the checkout -- it is given."
-                ));
+        match refused_files(task) {
+            Some(RefusedFiles::Targets(files)) => {
+                contract["required_targets"] = serde_json::json!(files);
+                if let Some(instructions) = contract["instructions"].as_str() {
+                    contract["instructions"] = serde_json::json!(format!(
+                        "{instructions} required_targets names the repository-relative paths the \
+                         check that refused the previous attempt objected to. Every one of them \
+                         must appear in your targets: the defect is in those files, so the change \
+                         has to touch them. Do not re-derive the list by searching the checkout -- \
+                         it is given."
+                    ));
+                }
             }
+            Some(RefusedFiles::OutOfReach(files)) => {
+                if let Some(instructions) = contract["instructions"].as_str() {
+                    contract["instructions"] = serde_json::json!(format!(
+                        "{instructions} The check that refused the previous attempt named {named}. \
+                         Those paths are outside the surface this instance may contribute to at \
+                         all ({surfaces}), so a change that touches any of them is refused before \
+                         it is compiled. Meet the goal from inside that surface, and leave those \
+                         paths out of your targets entirely.",
+                        named = files.join(", "),
+                        surfaces = cog_core::CONTRIBUTABLE_SURFACES,
+                    ));
+                }
+            }
+            None => {}
         }
 
         // Inject historical decomposition patterns if knowledge backend is wired.

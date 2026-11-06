@@ -514,6 +514,67 @@ async fn a_handed_back_change_carries_the_files_the_gate_named() {
     );
 }
 
+/// A task a path refusal comes back as: the same hand-back, with the cause that
+/// says its file list is what the change must stay out of.
+fn path_refused_task() -> cog_core::Task {
+    cog_core::Task::new(
+        "rework-change-2",
+        cog_core::TaskType::Custom("change_rework".into()),
+        serde_json::json!({
+            "goal": "Rework the change with the goal itself, staying out of the paths that \
+                     check refused: crates/change_ledger/tests/principle_ledger.rs",
+            "evolution_mode": "generate_change",
+            "task_kind": "change_rework",
+            "rejection_cause": "forbidden_path",
+            "failure_digest": "change touches non-contributable paths: \
+                               crates/change_ledger/tests/principle_ledger.rs",
+            "named_files": ["crates/change_ledger/tests/principle_ledger.rs"],
+        }),
+    )
+}
+
+/// A path refusal names the files the change may not touch, so the plan must not
+/// be held to them.
+///
+/// The hand-back words its goal the way this test checks the contract is worded
+/// — "staying out of the paths that check refused" — and the planner undid that
+/// one step later: every hand-back's `named_files` became `required_targets`,
+/// with an instruction that said the defect is in those files and the change has
+/// to touch them. For a path refusal both halves are false, and a rework aimed
+/// there is refused by the same gate again, which is what the retry count on
+/// those tasks has been recording since the day they were queued.
+///
+/// Paired with the lint-refusal case above, which is the same payload with a
+/// different cause and must keep its targets: the split is on the cause, not on
+/// the presence of the field.
+#[tokio::test]
+async fn a_path_refusal_hands_the_planner_paths_to_stay_out_of() {
+    let agent = Recorder::new(serde_json::json!({"summary": "s", "sub_tasks": []}));
+    PlannerActor::new(agent.clone())
+        .plan(&path_refused_task(), 1, None, None, None, None)
+        .await;
+    let contract = stable_half(agent.inputs()[0].clone());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&contract).expect("the stable half of a planner prompt is JSON");
+    assert!(
+        parsed.get("required_targets").is_none(),
+        "a path the change may not touch was handed over as a required target: {contract}"
+    );
+    let instructions = parsed["instructions"].as_str().unwrap_or_default();
+    assert!(
+        !instructions.contains("must appear in your targets"),
+        "the refused path arrived with the rule that says to touch it: {contract}"
+    );
+    assert!(
+        instructions.contains("crates/change_ledger/tests/principle_ledger.rs"),
+        "the plan was not told which paths the previous attempt was refused on: {contract}"
+    );
+    assert!(
+        instructions.contains(cog_core::CONTRIBUTABLE_SURFACES),
+        "the plan was told to stay out without being told where it may work: {contract}"
+    );
+}
+
 /// Two rounds of one loop are one request, so the upstream cache has to be able
 /// to hold it.
 ///
