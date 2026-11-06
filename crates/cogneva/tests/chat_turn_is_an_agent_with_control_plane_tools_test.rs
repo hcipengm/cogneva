@@ -199,8 +199,16 @@ fn the_one_tool_that_changes_the_system_is_dispatch() {
 fn the_turn_carries_the_process_tool_table_instead_of_a_short_one() {
     let assembly = source(ASSEMBLY);
     assert!(
-        assembly.contains("shared.list()"),
+        assembly.contains("shared.fork()"),
         "工具表没有从进程那一份复制过来：界面上这位与同事拿的不是同一套工具"
+    );
+    // 复制的是注册表，不是清单：只搬 `list()` 会丢掉沙箱后端、护栏与超时，
+    // 搬过去的表报得出 `run_command`，每一次调用却回「这个进程没有沙箱」。
+    // 实测 2026-11-06：界面对话里的员工四次工具调用全落在这句上。
+    assert!(
+        !assembly.contains("for tool in shared.list()"),
+        "工具是从共用表里逐只抄进一个空注册表的：抄得走名单，抄不走跑它们的能力\
+         （沙箱后端、护栏、插件源、超时）——员工的 shell 一调就说没有后端"
     );
     assert!(
         !assembly.contains("restricted_to"),
@@ -268,6 +276,18 @@ fn the_employee_is_on_the_roster_and_listens_before_it_speaks() {
     assert!(
         text.contains("EmployeeLease::take"),
         "说话的时候没有把自己登记进名册：这一轮里它不可达"
+    );
+    // 名册上的「它能做什么」= 这一轮手上真有的工具。这里曾经填的是
+    // `vec![employee.id.clone()]`：能力字段里装着自己的 id，读出来是
+    // 「mira 的能力是 mira」，按能力找人的那一步什么也筛不出来——而员工
+    // 本来就没有预设，它有的只是这个进程给它的工具。
+    assert!(
+        text.contains("let capabilities = tools.names();"),
+        "名册上的能力不是这一轮的工具集：那一位在名单上又退回成一个共同标签"
+    );
+    assert!(
+        !text.contains("vec![employee.id.clone()]"),
+        "能力字段里装着自己的 id：这不是能力声明，是一个名字占了两格"
     );
     assert!(
         text.contains("lease.release()"),

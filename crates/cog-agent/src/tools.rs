@@ -283,6 +283,31 @@ impl ToolRegistry {
         self.plugin_registry = Some(registry);
     }
 
+    /// 同一套跑工具的能力，另起一张工具表。
+    ///
+    /// 注册表装的是两样东西：哪些工具存在，和一只工具**怎么跑**——沙箱后端、
+    /// 护栏、插件源、两个超时、是否需要身份。把 `list()` 复制进一个空的
+    /// `ToolRegistry::new()` 只搬走了前一样，后一样留在原处；搬过去的是一张
+    /// 装得上却跑不动的名单：它报得出 `run_command`，每次调用却回
+    /// `SandboxBackend not configured for shell tool`——智能体读到「这个进程有
+    /// shell」，运行时说它没有。界面上的员工曾经就是这样：同一份工具表，
+    /// 一只也执行不了。
+    ///
+    /// 工具表本身是复制的而不是共用的：调用方要往自己这张表上装只属于这一轮
+    /// 的工具，那些工具不该跟着出现在每一条别的运行里。
+    pub fn fork(&self) -> Self {
+        let tools = self.tools.read().unwrap().clone();
+        Self {
+            tools: Arc::new(std::sync::RwLock::new(tools)),
+            sandbox_backend: self.sandbox_backend.clone(),
+            guardrail: self.guardrail.clone(),
+            plugin_registry: self.plugin_registry.clone(),
+            wasm_timeout: self.wasm_timeout,
+            shell_timeout: self.shell_timeout,
+            require_identity: self.require_identity,
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<Tool> {
         self.tools.read().unwrap().get(name).cloned()
     }
@@ -1556,6 +1581,34 @@ mod tests {
         async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
             Err(cog_core::SFError::Agent("unsupported".into()))
         }
+    }
+
+    /// 复制一张工具表，搬过去的是能跑的工具，不只是名单。
+    ///
+    /// 判据是「调用真的执行了」：`fork()` 之后 `run_command` 回的是命令的读数，
+    /// 不是 `SandboxBackend not configured`。只比名单不会红——那份名单本来就
+    /// 一样，差别全在跑不跑得动。界面上的员工曾经就是拿着这样一张名单：它看得见
+    /// shell，一调就被告知这个进程没有沙箱。
+    #[tokio::test]
+    async fn a_forked_registry_carries_the_ability_to_run_its_tools() {
+        let shared = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&shared, builtins::run_command());
+
+        let mine = shared.fork();
+        assert_eq!(mine.names(), shared.names(), "复制表时工具本身要跟着过去");
+        let out = mine
+            .execute("run_command", serde_json::json!({"command": "echo forked"}))
+            .await
+            .expect("复制出来的表要跑得动它自己报出来的工具");
+        assert_eq!(out["code"], 0);
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "forked");
+
+        // 另一张表：装进去的工具只属于这一张。
+        cog_core::ToolRegistry::register(&mine, builtins::read_file());
+        assert!(
+            !shared.names().iter().any(|name| name == "read_file"),
+            "装在这张表上的工具漏进了共用的那张：一条运行的工具会变成每个 agent 的工具"
+        );
     }
 
     #[tokio::test]

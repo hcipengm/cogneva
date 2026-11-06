@@ -220,14 +220,19 @@ impl ConversationTurn for PlatformConversation {
             };
             // 工具面 = 这个进程装配好的那一份 ＋ 控制面五只。
             //
-            // 整份复制而不是共用同一个注册表：控制面这五只只属于这一段对话，
-            // 注册进共用表里会变成每个 agent 都能派活。
-            let tools = cog_agent::ToolRegistry::new();
-            if let Some(shared) = self.tools.as_ref() {
-                for tool in shared.list() {
-                    tools.register(tool);
-                }
-            }
+            // 复制的是**整张注册表**（`fork`），不是工具清单：哪些工具存在只是
+            // 一半，另一半是它们怎么跑——沙箱后端、护栏、插件源、两个超时，
+            // 全都挂在注册表上。把 `list()` 装进一个空的注册表，搬过去的是一张
+            // 看得见却跑不动的名单：`run_command` 每次调用都回
+            // `SandboxBackend not configured for shell tool`，屏幕上就是「这位员工
+            // 从不调用工具」。实测 2026-11-06 界面对话里的员工四次调用全落在这句上。
+            //
+            // 表本身仍是这一轮私有的：控制面五只只属于这一段对话，注册进共用表里
+            // 会变成每个 agent 都能派活。
+            let tools = match self.tools.as_ref() {
+                Some(shared) => shared.fork(),
+                None => cog_agent::ToolRegistry::new(),
+            };
             // 三本只读账与控制面五只同一处装：它们读的也是这个进程里已发布的
             // 服务，缺的那本由进程如实缺席，而工具会把它说出来。
             for tool in ledger_tools(&self.ledgers) {
@@ -249,6 +254,12 @@ impl ConversationTurn for PlatformConversation {
             ) {
                 tools.register(tool);
             }
+            // 名册上「它能做什么」就是这一轮手上真有的工具，不是一段标签。
+            // 这里曾经填的是它自己的 id：能力字段里装着一个名字，读名册的人
+            // 看到的是「mira 的能力是 mira」，按能力找人的那一步什么也筛不出来。
+            // 员工是通用智能体：它没有预设，有的只是这个进程给它的工具；具体
+            // 做哪件活，由拿到的那句话决定。
+            let capabilities = tools.names();
             let mut runtime = cog_agent::AgentRuntime::new(config, events)
                 .with_tools(tools)
                 // 没有身份的连接不声明人：编一个名字会读成真有人花过这笔钱。
@@ -281,7 +292,9 @@ impl ConversationTurn for PlatformConversation {
             // 说话的这一段时间它在名册上活着：续约间隔比名册的过期短，否则一轮
             // 长对话会在自己还在说的时候从名册上消失。
             let lease = match self.roster.as_ref() {
-                Some(roster) => Some(EmployeeLease::take(roster.clone(), &employee).await),
+                Some(roster) => {
+                    Some(EmployeeLease::take(roster.clone(), &employee, capabilities).await)
+                }
                 None => None,
             };
 
@@ -328,6 +341,7 @@ impl EmployeeLease {
     async fn take(
         roster: Arc<dyn cog_core::AgentRegistry>,
         employee: &cog_agent::identity::AgentName,
+        capabilities: Vec<String>,
     ) -> Self {
         let registration = cog_core::AgentRegistration::new(
             employee.id.clone(),
@@ -335,7 +349,7 @@ impl EmployeeLease {
             "127.0.0.1",
             employee.id.clone(),
             "default",
-            vec![employee.id.clone()],
+            capabilities,
             cog_core::ResourceInfo::default(),
         );
         if let Err(e) = roster.register(&registration).await {
