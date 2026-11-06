@@ -49,13 +49,18 @@ fn the_chart_delivers_the_batch_size_from_values() {
 /// 引用的那个 values 键必须真的存在，否则渲染成空串而不报错。
 #[test]
 fn the_values_key_exists_and_reads_as_a_batch_size() {
-    let value = common::yaml::values_entry(VALUES_YAML, VALUES_BLOCK, VALUES_KEY)
-        .unwrap_or_else(|| {
-            panic!("values.yaml 的 {VALUES_BLOCK} 段里没有 {VALUES_KEY}：引用不存在的键会渲染成空串")
+    let value =
+        common::yaml::values_entry(VALUES_YAML, VALUES_BLOCK, VALUES_KEY).unwrap_or_else(|| {
+            panic!(
+                "values.yaml 的 {VALUES_BLOCK} 段里没有 {VALUES_KEY}：引用不存在的键会渲染成空串"
+            )
         });
     let parsed = cog_orchestrator::change_ledger::parse_rows_per_handover(&value)
         .unwrap_or_else(|problem| panic!("values.yaml 里的 {VALUES_KEY} 进程读不动：{problem}"));
-    assert!(parsed > 0, "解析成功却得到 0 行一批：一拍会一直攒、一条也派不出去");
+    assert!(
+        parsed > 0,
+        "解析成功却得到 0 行一批：一拍会一直攒、一条也派不出去"
+    );
 }
 
 /// 静态清单那条路径也要有这个名字：k3s 投递不经 helm，少了它就是两种投递两个行为。
