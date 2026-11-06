@@ -5021,6 +5021,22 @@ impl MainlineDeployer {
         if let Ok(status) =
             Self::platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/status")).await
         {
+            // 这条脸是不是真的有话要说。`state` 是**状态集的汇总**，集为空时它是
+            // 空集的默认值而不是任何人的回答：GitHub 对从未上报过 legacy status 的
+            // 提交（本仓每一版都是——2026-11-07 实测 `{"state":"pending","statuses":[],
+            // "total_count":0}`）恒答 `pending`。只看 `state` 就会把一个「这条脸什么
+            // 都没写」读成「读不懂的回答」，落进 `status_unreadable` 那一格，让
+            // `mainline_ci_verdict_unreadable` 规则每小时亮一次，而它报的是正常状态。
+            let statuses_empty = match status
+                .get("total_count")
+                .and_then(serde_json::Value::as_u64)
+            {
+                Some(n) => n == 0,
+                None => status
+                    .get("statuses")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|a| a.is_empty()),
+            };
             match status.get("state").and_then(|s| s.as_str()) {
                 Some("success") => {
                     return (
@@ -5041,6 +5057,16 @@ impl MainlineDeployer {
                         cancelled_checks,
                         infrastructure_checks,
                     );
+                }
+                // 状态集为空：这条脸没有说任何话，`state` 那个值不属于它。原样保留
+                // check-runs 那边的结论（通常是 `no_runs`——一个没有东西可判的平台，
+                // 是正常状态而非故障）。
+                _ if statuses_empty => {}
+                // 有状态、汇总说还在跑：这是等下一轮，不是读不懂。
+                Some("pending") => {
+                    if reason == CiNoVerdictReason::NoRuns {
+                        reason = CiNoVerdictReason::Pending;
+                    }
                 }
                 // 接口答了、状态字段却不可判。只有 check-runs 那边本来就什么也没说时才
                 // 换成这一格：两边都没给出可判的东西，这一格比 `no_runs` 更贴近实情。
@@ -21938,6 +21964,87 @@ exec {real} "$@"
             "这一组每一轮都全部沉默，所以每轮贡献「沉默的上游数」条原因；有上游答了的那几轮 \
              也照记，只是不再等于 no_evidence 的倍数: {rows:?}"
         );
+    }
+
+    /// 空的 legacy 状态集是**沉默**，不是一句读不懂的回答。
+    ///
+    /// `state` 是状态集的汇总：集为空时它是空集的默认值，不属于任何上报者。GitHub
+    /// 对从未上报过 legacy status 的提交恒答 `{"state":"pending","statuses":[],
+    /// "total_count":0}`——本仓每一版都是（2026-11-07 实测）。只看 `state` 就会把
+    /// 「这条脸什么也没写」读成「读不懂」，落进 `status_unreadable`，让
+    /// `mainline_ci_verdict_unreadable` 每小时亮一次，而它报的是正常状态：告警的
+    /// 主人被指向一个不存在的故障，真正的故障再来时也就没人信这条告警了。
+    #[tokio::test]
+    async fn an_empty_legacy_status_set_is_silence_not_an_unreadable_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let reasons_of = |base: String| async move {
+            let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+            cfg.upstreams.truncate(1);
+            cfg.upstreams[0].api_base = Some(base);
+            let deployer =
+                MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+            let (_verdict, _failed, reasons, _excluded, _cancelled) = deployer
+                .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+                .await;
+            reasons
+        };
+
+        // 实测形状，逐字取自本仓提交的 `/status`：两处都没说话，落点是 `no_runs`
+        // ——一个没有东西可判的平台，是正常状态。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[]}"#),
+            http_200(
+                r#"{"state":"pending","statuses":[],"total_count":0,"sha":"abc123","repository":{"full_name":"o/r"}}"#,
+            ),
+        ])
+        .await;
+        assert_eq!(
+            reasons_of(format!("http://{endpoint}/github")).await,
+            vec!["github:no_runs".to_string()]
+        );
+        handle.await.unwrap();
+
+        // 只有 `total_count` 也说得出「空」：`statuses` 缺席时按它判。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[]}"#),
+            http_200(r#"{"state":"pending","total_count":0}"#),
+        ])
+        .await;
+        assert_eq!(
+            reasons_of(format!("http://{endpoint}/github")).await,
+            vec!["github:no_runs".to_string()]
+        );
+        handle.await.unwrap();
+
+        // 状态集非空、汇总说还在跑：这是等下一轮，不是读不懂，也不是「没有东西」。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[]}"#),
+            http_200(
+                r#"{"state":"pending","statuses":[{"context":"ci","state":"pending"}],"total_count":1}"#,
+            ),
+        ])
+        .await;
+        assert_eq!(
+            reasons_of(format!("http://{endpoint}/github")).await,
+            vec!["github:pending".to_string()]
+        );
+        handle.await.unwrap();
+
+        // 有状态、汇总却不可判：这一格留着。新判据只让「空的」那一支绕开它，
+        // 不许把既有测试钉住的主人一起吃掉。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[]}"#),
+            http_200(
+                r#"{"state":"unknown","statuses":[{"context":"ci","state":"unknown"}],"total_count":1}"#,
+            ),
+        ])
+        .await;
+        assert_eq!(
+            reasons_of(format!("http://{endpoint}/github")).await,
+            vec!["github:status_unreadable".to_string()]
+        );
+        handle.await.unwrap();
     }
 
     /// 原因读数要说出是**哪一问**没被答。
