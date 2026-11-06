@@ -1061,15 +1061,23 @@ impl WorkdirRouter {
         // Oldest arrival to now, so the span covers exactly the trees being
         // counted. Without a second tree there is no arrival interval to read,
         // and the configured TTL stands.
+        //
+        // Measured over the task lane only, because that is the lane the TTL
+        // governs: a standing shell is never reaped for idleness and is held
+        // for as long as its agent exists, so counting it would stretch the
+        // span by however old that conversation is and report a hold time
+        // derived from a tree the rule does not apply to.
+        let task_trees = trees.iter().filter(|(id, _)| !is_standing_lane(id)).count();
         let oldest = trees
             .iter()
+            .filter(|(id, _)| !is_standing_lane(id))
             .filter_map(|(id, _)| self.read_meta(id))
             .map(|meta| meta.created_at_unix)
             .min();
         let derived = oldest.and_then(|first| {
             ttl_from(
                 capacity,
-                trees.len(),
+                task_trees,
                 now.saturating_sub(first).max(0) as u64,
             )
         });
@@ -2824,6 +2832,56 @@ pub(crate) mod tests {
         );
         assert!(!round.exists(), "a finished round's tree is still reaped");
         assert_eq!(r.list_task_trees().await.len(), 1);
+    }
+
+    /// The idle rule reaps task trees, so the hold time it derives has to come
+    /// from their arrivals. A conversation that has been open for a week would
+    /// otherwise stretch the span by that week and publish a hold time the rule
+    /// never applied — a number that reads as "idle rounds are kept for weeks".
+    #[tokio::test]
+    async fn the_derived_ttl_is_measured_over_the_task_lane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        r.route("unscoped-shell-vera-82191e4a").await.unwrap();
+        for id in ["round-a", "round-b", "round-c", "round-d"] {
+            r.route(id).await.unwrap();
+        }
+        let week_ago = unix_now() - 7 * 86_400;
+        let hour_ago = unix_now() - 3_600;
+        for id in [
+            "unscoped-shell-vera-82191e4a",
+            "round-a",
+            "round-b",
+            "round-c",
+            "round-d",
+        ] {
+            let mut meta = r.read_meta(id).expect("a routed tree has a sidecar");
+            meta.created_at_unix = if is_standing(id) { week_ago } else { hour_ago };
+            meta.last_used_unix = meta.created_at_unix;
+            r.write_meta(&meta).await.unwrap();
+        }
+        r.gc_once().await.unwrap();
+
+        // Four rounds arriving within an hour into a pool of eight: half a
+        // pool of arrivals is 8 * (3600 / 4) / 2 = 3600 s. Counting the week-old
+        // conversation among them would derive 15 days instead.
+        let published = r.metrics.ttl_seconds.seconds.get();
+        assert!(
+            published < 2.0 * 86_400.0,
+            "the hold time must come from the rounds, not the conversation: {published}"
+        );
+        assert!(
+            r.list_task_trees()
+                .await
+                .iter()
+                .all(|(id, _)| is_standing(id)),
+            "an hour of idleness is past a hold time derived from hourly arrivals"
+        );
+
+        fn is_standing(id: &str) -> bool {
+            id.starts_with("unscoped-shell-")
+        }
     }
 
     /// A registration a killed add left locked is invisible to both halves of
