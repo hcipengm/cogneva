@@ -60,6 +60,27 @@ const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
 // cap: bound — policy ceiling when the deployment names none; the disk measurement can still lower it
 const DEFAULT_MAX_WORKSPACES: usize = 8;
 
+/// Trees kept cut and ready under `workspaces/.warm`, so a new task's first
+/// command does not pay for a checkout.
+///
+/// Measured in this pod on 2026-11-07: `git worktree add --detach main` took
+/// 3403 ms (measured) for a 49 MB tree, and that cost lands on the first tool
+/// call of every new conversation -- a `printf` that took 6.7 s end to end
+/// (measured) spent 6.5 s of it waiting for its tree. Claude Code pays nothing
+/// there because its tools run in a directory that already exists; this is the
+/// platform's equivalent of that, and the number is small because a warm tree
+/// is only worth holding
+/// until the next arrival: arrivals measured ~1.1 a minute on this host, and
+/// the refill runs off the request path.
+// cap: bound — seed; a deployment that names none gets two, the pool never holds more than half the task ceiling
+const DEFAULT_WARM_TREES: usize = 2;
+
+/// Where warm trees wait between arrivals. Dot-prefixed because every listing
+/// of task trees in this file filters on a non-dot name, and a pool tree that
+/// started counting against the task ceiling would evict the task it is meant
+/// to spare.
+const WARM_DIR_NAME: &str = ".warm";
+
 const META_DIR_NAME: &str = ".meta";
 
 /// Maximum task id length, keeps the on-disk directory name clear of
@@ -348,6 +369,11 @@ pub struct WorkdirConfig {
     pub gc_interval: Duration,
     pub fetch_interval: Duration,
     pub max_workspaces: usize,
+    /// How many trees to keep cut and ready under [`WARM_DIR_NAME`]. Never
+    /// more than half the task ceiling: the pool exists to make arrivals
+    /// cheap, and spending the ceiling on trees no task has asked for would
+    /// make the tasks themselves wait.
+    pub warm_trees: usize,
     /// Claim-backed volumes this process measures the footprint of. Which claim
     /// backs which directory is a fact only the deployment knows, so it comes
     /// from there; what lies below a mount is not declared, because this process
@@ -385,6 +411,11 @@ impl WorkdirConfig {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_WORKSPACES)
             .max(1);
+        let warm = std::env::var("SANDBOX_WARM_TREES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_WARM_TREES)
+            .min(max / 2);
         let (data_volumes, data_volume_declaration_error) =
             match std::env::var(cog_core::claim_footprint::MOUNTS_ENV) {
                 Ok(raw) => match cog_core::claim_footprint::parse_claim_paths(&raw) {
@@ -446,6 +477,7 @@ impl WorkdirConfig {
                 30,
             ),
             max_workspaces: max,
+            warm_trees: warm,
             data_volumes,
             data_volume_declaration_error,
             data_volume_interval: secs(
@@ -702,6 +734,11 @@ pub struct WorkdirRouter {
     /// never run `worktree add` / `worktree remove` against the same state.
     /// The hot path for an existing tree takes no lock.
     create_lock: Mutex<()>,
+    /// Keeps the warm pool's own refill out of [`Self::create_lock`]. A refill
+    /// is a checkout, and an arrival that had to queue behind one would be
+    /// waiting for a tree meant for somebody who has not arrived yet -- the
+    /// cost the pool exists to remove, reintroduced for the second caller.
+    warm_lock: Mutex<()>,
     /// Task ids with a command running in their tree right now, and how many.
     /// Read by the reclamation rules, which must not delete a tree in use; see
     /// [`WorktreeUse`] for why this is process state rather than a sidecar.
@@ -773,6 +810,7 @@ impl WorkdirRouter {
             cfg,
             meta_dir,
             create_lock: Mutex::new(()),
+            warm_lock: Mutex::new(()),
             in_use: std::sync::Mutex::new(std::collections::HashMap::new()),
             metrics,
             footprints,
@@ -904,23 +942,216 @@ impl WorkdirRouter {
     pub async fn route(self: &Arc<Self>, task_id: &str) -> SFResult<(PathBuf, WorktreeUse)> {
         validate_task_id(task_id)?;
         let use_guard = self.claim(task_id);
-        let path = self.route_validated(task_id, true).await?;
+        let (path, took_warm) = self.route_validated(task_id, true).await?;
+        // Refill after the answer, never before it: the caller is waiting for
+        // a directory to run in, and the tree that replaces the one just taken
+        // is for a task that has not arrived yet.
+        if took_warm {
+            let router = Arc::clone(self);
+            tokio::spawn(async move { router.warm_pool_once().await });
+        }
         Ok((path, use_guard))
+    }
+
+    /// The pool directory. Sits inside the workspaces root so it lands on the
+    /// same volume as the trees it holds -- a pool on another filesystem is a
+    /// pool whose hand-out is the copy it was meant to avoid.
+    fn warm_root(&self) -> PathBuf {
+        self.cfg.workspaces_root.join(WARM_DIR_NAME)
+    }
+
+    /// The file that says a slot finished being cut. `git worktree add` writes
+    /// the `.git` link before it checks anything out, so a slot caught halfway
+    /// through looks exactly like a finished one -- and being handed a
+    /// half-checked-out tree reads as a repository whose files are missing,
+    /// which is the kind of failure that gets blamed on the task.
+    fn ready_marker(slot: &Path) -> PathBuf {
+        let mut name = slot.file_name().unwrap_or_default().to_os_string();
+        name.push(".ready");
+        slot.with_file_name(name)
+    }
+
+    /// The trees waiting in the pool right now, oldest name first. A directory
+    /// without the `.git` link a healthy worktree carries is skipped: `git
+    /// worktree move` would refuse it, and a slot that cannot be handed out
+    /// reads as a pool that is full.
+    async fn warm_slots(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(mut rd) = tokio::fs::read_dir(self.warm_root()).await else {
+            return out;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if !tokio::fs::try_exists(path.join(".git"))
+                .await
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !tokio::fs::try_exists(Self::ready_marker(&path))
+                .await
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            out.push(path);
+        }
+        out.sort();
+        out
+    }
+
+    /// Move a waiting tree onto `path` instead of cutting a new one there.
+    /// Returns whether one was taken; a pool that is empty, disabled, or whose
+    /// move failed falls through to the ordinary checkout.
+    async fn take_warm(&self, task_id: &str, path: &Path) -> bool {
+        if self.cfg.warm_trees == 0 {
+            return false;
+        }
+        let slots = self.warm_slots().await;
+        let Some(slot) = slots.into_iter().next() else {
+            return false;
+        };
+        // Sidecar before the tree, same as `add_worktree`: a crash between the
+        // two leaves a reclaimable record rather than an untracked tree.
+        let now = unix_now();
+        let meta = TaskMeta {
+            task_id: task_id.to_string(),
+            created_at_unix: now,
+            last_used_unix: now,
+        };
+        if let Err(e) = self.write_meta(&meta).await {
+            warn!(task_id = %task_id, error = %e, "warm tree not taken: could not write its sidecar");
+            return false;
+        }
+        if let Err(e) = self
+            .git_bare(&[
+                "worktree",
+                "move",
+                slot.to_str().unwrap_or(""),
+                path.to_str().unwrap_or(""),
+            ])
+            .await
+        {
+            self.remove_meta(task_id);
+            warn!(
+                task_id = %task_id,
+                from = %slot.display(),
+                error = %e,
+                "warm tree not taken: moving it onto the task path failed"
+            );
+            return false;
+        }
+        let _ = tokio::fs::remove_file(Self::ready_marker(&slot)).await;
+        self.register_safe_directory(path).await;
+        // The pool is filled ahead of demand, so the tree may have been cut
+        // before `main` moved. Re-pointing it is what keeps a warm tree from
+        // being a stale one: a task that gets a tree three commits behind would
+        // read the platform's own source wrong, and nothing on the surface
+        // would say why.
+        self.reset_to_main(path).await;
+        info!(
+            task_id = %task_id,
+            from = %slot.display(),
+            "handed a warm worktree to a new task instead of cutting one"
+        );
+        true
+    }
+
+    /// Point a task tree at `main`, and drop anything the previous user left in
+    /// it. Best effort: the tree is usable either way, and a failure here is
+    /// the next command's own to report.
+    async fn reset_to_main(&self, path: &Path) {
+        let Ok(head) = self.run_git(&["rev-parse", "HEAD"], Some(path)).await else {
+            return;
+        };
+        let Ok(main) = self.git_bare(&["rev-parse", "main"]).await else {
+            return;
+        };
+        if head.trim() == main.trim() {
+            // Nothing to move and nothing to drop: the tree was cut from the
+            // commit it is about to be handed out at.
+            return;
+        }
+        let _ = self.run_git(&["reset", "--hard", "main"], Some(path)).await;
+    }
+
+    /// Cut trees until the pool holds as many as the deployment asked for.
+    ///
+    /// Best effort and never blocking an arrival: the lock is taken only if it
+    /// is free, because a pool refill that queues behind a task's own creation
+    /// makes the pool the reason the task waited.
+    async fn warm_pool_once(&self) {
+        let want = self.cfg.warm_trees;
+        if want == 0 {
+            return;
+        }
+        let Ok(_g) = self.warm_lock.try_lock() else {
+            return;
+        };
+        let mut held = self.warm_slots().await.len();
+        if held >= want {
+            return;
+        }
+        // The pool does not compete with the tasks it serves: when the ceiling
+        // is already spoken for, cutting another tree for a task that has not
+        // arrived is a checkout paid against the task that has.
+        let trees = self.list_task_trees().await;
+        if trees.len() + want > self.cap_for(&trees).await {
+            return;
+        }
+        if let Err(e) = tokio::fs::create_dir_all(self.warm_root()).await {
+            warn!(error = %e, "warm worktree pool: cannot create its directory");
+            return;
+        }
+        // Slots are named, not counted: the trees taken out are not necessarily
+        // the highest-numbered ones, so walking `held..want` would ask for a
+        // name that is still occupied and leave the pool short by that many.
+        let mut name = 0usize;
+        while held < want && name < want * 4 {
+            let slot = self.warm_root().join(format!("slot-{name}"));
+            name += 1;
+            if tokio::fs::try_exists(&slot).await.unwrap_or(false) {
+                // A directory without its ready marker is a cut that was
+                // interrupted (this process died between the checkout and the
+                // marker). It holds the name and no task can use it, so left
+                // alone it is a pool that reads full and is not.
+                if !tokio::fs::try_exists(Self::ready_marker(&slot))
+                    .await
+                    .unwrap_or(false)
+                {
+                    self.force_remove(&slot).await;
+                } else {
+                    continue;
+                }
+            }
+            if let Err(e) = self.cut_worktree(&slot).await {
+                warn!(error = %e, slot = %slot.display(), "warm worktree pool: cutting a tree failed");
+                return;
+            }
+            self.register_safe_directory(&slot).await;
+            if let Err(e) = tokio::fs::write(Self::ready_marker(&slot), b"").await {
+                warn!(error = %e, slot = %slot.display(), "warm worktree pool: recording a cut tree as ready failed; the slot will be cut again");
+                let _ = self.force_remove(&slot).await;
+                return;
+            }
+            held += 1;
+        }
+        info!(want, held, "warm worktree pool refilled");
     }
 
     /// The tree on its own, without a claim: a caller that will run something in
     /// it must go through [`Self::route`], which is the only thing that keeps a
     /// reclamation pass from deleting it while the command runs.
-    async fn route_validated(&self, task_id: &str, own_claim: bool) -> SFResult<PathBuf> {
+    async fn route_validated(&self, task_id: &str, own_claim: bool) -> SFResult<(PathBuf, bool)> {
         let path = self.cfg.workspaces_root.join(task_id);
         if self.is_healthy(&path).await {
             self.touch(task_id).await;
-            return Ok(path);
+            return Ok((path, false));
         }
         let _g = self.create_lock.lock().await;
         if self.is_healthy(&path).await {
             self.touch(task_id).await;
-            return Ok(path);
+            return Ok((path, false));
         }
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             if self.commands_running(task_id, own_claim) > 0 {
@@ -936,23 +1167,19 @@ impl WorkdirRouter {
             self.force_remove(&path).await;
         }
         self.enforce_cap(1).await;
+        if self.take_warm(task_id, &path).await {
+            self.refresh_count_metric().await;
+            return Ok((path, true));
+        }
         if let Err(e) = self.add_worktree(task_id, &path).await {
             self.metrics.inc_error("worktree_add");
             return Err(e);
         }
         self.refresh_count_metric().await;
-        Ok(path)
+        Ok((path, false))
     }
 
     async fn add_worktree(&self, task_id: &str, path: &Path) -> SFResult<()> {
-        tokio::fs::create_dir_all(&self.cfg.workspaces_root)
-            .await
-            .map_err(|e| {
-                SFError::IO(format!(
-                    "create workspaces root {}: {e}",
-                    self.cfg.workspaces_root.display()
-                ))
-            })?;
         let now = unix_now();
         let meta = TaskMeta {
             task_id: task_id.to_string(),
@@ -962,22 +1189,33 @@ impl WorkdirRouter {
         // Sidecar lands before the tree: a crash between the two leaves a
         // reclaimable record; the reverse order leaves an untracked tree.
         self.write_meta(&meta).await?;
-        if let Err(e) = self
-            .git_bare(&[
-                "worktree",
-                "add",
-                "--detach",
-                path.to_str().unwrap_or(""),
-                "main",
-            ])
-            .await
-        {
+        if let Err(e) = self.cut_worktree(path).await {
             self.remove_meta(task_id);
             return Err(e);
         }
         info!(task_id = %task_id, path = %path.display(), "created per-task worktree");
         self.register_safe_directory(path).await;
         Ok(())
+    }
+
+    /// Check out `main` into `path` as a detached worktree of the bare repo.
+    /// Shared by the task path and the warm pool, which want the same tree and
+    /// differ only in what they record about it.
+    async fn cut_worktree(&self, path: &Path) -> SFResult<()> {
+        if let Some(root) = path.parent() {
+            tokio::fs::create_dir_all(root).await.map_err(|e| {
+                SFError::IO(format!("create worktree root {}: {e}", root.display()))
+            })?;
+        }
+        self.git_bare(&[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().unwrap_or(""),
+            "main",
+        ])
+        .await
+        .map(|_| ())
     }
 
     /// Healthy = worktree dir present with the `.git` link the bare repo
@@ -1036,6 +1274,10 @@ impl WorkdirRouter {
         }
         self.prune_orphan_metas(&trees).await;
         self.refresh_count_metric().await;
+        // A pool that only refilled on demand would be empty on the first
+        // arrival after every restart, which is exactly when the checkout it
+        // saves is most visible.
+        self.warm_pool_once().await;
         Ok(())
     }
 
@@ -1050,6 +1292,9 @@ impl WorkdirRouter {
         self.gc_pass_millis
             .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         self.last_gc_unix.store(unix_now(), Ordering::Relaxed);
+        // After the pass, not inside it: the pass holds the creation lock, and
+        // the refill takes it only when nothing else wants it.
+        self.warm_pool_once().await;
         reaped
     }
 
@@ -2197,6 +2442,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            warm_trees: 0,
             data_volumes: vec![ClaimMount {
                 claim: claim.to_string(),
                 path: dir.display().to_string(),
@@ -2289,6 +2535,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            warm_trees: 0,
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
             data_volume_interval: Duration::from_secs(30),
@@ -2347,6 +2594,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            warm_trees: 0,
             data_volumes: vec![
                 ClaimMount {
                     claim: "vol-a-pvc".into(),
@@ -2551,6 +2799,33 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: max,
+            warm_trees: 0,
+            data_volumes: Vec::new(),
+            data_volume_declaration_error: None,
+            data_volume_interval: Duration::from_secs(30),
+            build_cache: BuildCacheConfig::default(),
+        };
+        WorkdirRouter::new(cfg).unwrap()
+    }
+
+    /// Same router, with a warm pool of `warm` trees.
+    fn router_with_warm(
+        root: &Path,
+        bare: &Path,
+        max: usize,
+        ttl: Duration,
+        warm: usize,
+    ) -> Arc<WorkdirRouter> {
+        let cfg = WorkdirConfig {
+            workspaces_root: root.join("workspaces"),
+            bare_repo: bare.to_path_buf(),
+            target_dir: root.join("src").join("target"),
+            seed_urls: Vec::new(),
+            ttl,
+            gc_interval: Duration::from_secs(600),
+            fetch_interval: Duration::from_secs(300),
+            max_workspaces: max,
+            warm_trees: warm,
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
             data_volume_interval: Duration::from_secs(30),
@@ -2634,6 +2909,101 @@ pub(crate) mod tests {
         let (again, _) = r.route("task-1").await.unwrap();
         assert_eq!(again, path);
         assert_eq!(r.list_task_trees().await.len(), 1);
+    }
+
+    /// A new task takes a tree that was cut before it arrived. Without the
+    /// pool this is a checkout of the whole repository on the first tool call
+    /// of every conversation -- measured at 3.4 s for 49 MB in the executor.
+    #[tokio::test]
+    async fn a_new_task_is_handed_a_warm_tree_instead_of_cutting_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 2);
+
+        r.warm_pool_once().await;
+        let slots = r.warm_slots().await;
+        assert_eq!(slots.len(), 2, "the pool fills ahead of demand");
+        let taken = slots[0].clone();
+
+        let (path, _) = r.route("warm-task").await.unwrap();
+        assert!(
+            path.join("README").exists(),
+            "the handed tree is a real checkout"
+        );
+        assert_eq!(
+            r.warm_slots().await.len(),
+            1,
+            "the tree came out of the pool instead of being cut beside it"
+        );
+        assert!(
+            !taken.exists(),
+            "the pool slot moved to the task path; a copy left behind is a checkout, not a hand-out"
+        );
+        assert!(
+            r.list_task_trees()
+                .await
+                .iter()
+                .any(|(id, p)| id == "warm-task" && p == &path),
+            "the tree the task got is registered as its worktree"
+        );
+    }
+
+    /// A tree that waited in the pool while `main` moved is re-pointed at
+    /// hand-out: a task given a tree three commits behind would read the
+    /// platform's own source wrong, and nothing on the surface would say why.
+    #[tokio::test]
+    async fn a_warm_tree_cut_before_main_moved_is_repointed_when_handed_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 1);
+
+        r.warm_pool_once().await;
+        assert_eq!(r.warm_slots().await.len(), 1);
+        let moved_to = advance_bare(&bare, &tmp.path().join("advance-work"));
+
+        let (path, _) = r.route("late-task").await.unwrap();
+        assert_eq!(
+            git_out(&path, &["rev-parse", "HEAD"]),
+            moved_to,
+            "the warm tree must be pointed at the main it is handed out under"
+        );
+        assert!(
+            path.join("ADVANCE").exists(),
+            "the commit main moved to is checked out, not just recorded as HEAD"
+        );
+    }
+
+    /// A slot caught halfway through its checkout must not be handed out.
+    /// `git worktree add` links `.git` before it checks anything out, so a
+    /// tree with a `.git` and no checkout is the one shape that looks ready
+    /// and is not: a task given it reads a repository whose files are all
+    /// missing, and that reads as a broken platform rather than a race.
+    #[tokio::test]
+    async fn a_warm_slot_still_being_cut_is_not_handed_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 1);
+
+        r.warm_pool_once().await;
+        let slot = r.warm_slots().await.pop().expect("the pool filled");
+        tokio::fs::remove_file(WorkdirRouter::ready_marker(&slot))
+            .await
+            .unwrap();
+        assert!(
+            slot.join(".git").exists(),
+            "the precondition is a slot that still carries its git link"
+        );
+        assert!(
+            r.warm_slots().await.is_empty(),
+            "a slot with no finished checkout is not a tree to hand out"
+        );
+
+        let (path, _) = r.route("racing-task").await.unwrap();
+        assert!(path.join("README").exists(), "the task got a whole tree");
+        assert!(
+            slot.exists(),
+            "the unfinished slot was left where it was, not moved onto the task"
+        );
     }
 
     /// 测试里的默认 TTL：从生产那个数算出来，别再写一遍——写两遍的六小时会漂。

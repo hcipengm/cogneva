@@ -1423,6 +1423,20 @@ rows:
       force -- the tightness the paragraph above describes is a claim on which
       this deployment cannot currently collect.
 
+  - key: sandboxExecutor.warmTrees
+    source: override
+    why: >-
+      How many trees are kept cut and waiting so an arriving task does not pay
+      for a checkout. What it buys is one number: a conversation's first tool
+      call measured 6.69 s end to end, 6.5 s of it `git worktree add` (3403 ms
+      measured on its own for this 49 MB repository), against 0.128 s for the
+      same command five minutes later in a tree that already existed. A value
+      of 2 covers the measured arrival rate -- about 1.1 tasks a minute against
+      a 3.4 s refill -- and the pool is bounded twice more without this number:
+      it never exceeds half the task ceiling, and it only refills while the
+      ceiling still has room, so a tree for a task that has not arrived can
+      never displace one for a task that has.
+
   - key: sandboxExecutor.repoFetchIntervalSecs
     source: derived
     why: >-
