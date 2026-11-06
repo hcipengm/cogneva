@@ -3444,10 +3444,16 @@ struct CycleDeps<'a> {
 async fn merge_verification_inputs(
     queued: Vec<crate::types::EvolutionResult>,
     landing: Option<&dyn cog_core::ChangeLanding>,
+    max_changed_lines: usize,
 ) -> (
     Vec<crate::types::EvolutionResult>,
     std::collections::HashMap<String, cog_core::GeneratedChange>,
-    Vec<(String, String, Vec<std::path::PathBuf>)>,
+    Vec<(
+        String,
+        String,
+        Vec<std::path::PathBuf>,
+        cog_core::RejectionCause,
+    )>,
 ) {
     let mut recorded: std::collections::HashMap<String, cog_core::GeneratedChange> =
         std::collections::HashMap::new();
@@ -3495,9 +3501,28 @@ async fn merge_verification_inputs(
             .get(&change.artifact_id)
             .map(|c| c.content.as_str())
             .unwrap_or(change.content.as_str());
-        match landing.check_contribution_allowed(diff) {
-            Ok(()) => kept.push(change),
-            Err(e) => {
+        // 走不完的那条路先判：这条变更无论验证得多好，落地时都会按下限被拒，而现在
+        // 拒它只花掉一个读数，放进流水线要花掉 fmt、clippy、整棵树的套件与一次
+        // release 构建——那一次构建占的是唯一那把槽，部署器推进同一时间也在等它。
+        // 判据与落地侧同一个数（`cog_core::count_diff_lines` 与同一个配置键）：
+        // 两处各数一遍，就是同一条变更在两个地方各有各的行数。
+        let changed_lines = cog_core::count_diff_lines(diff);
+        let refusal = if changed_lines > max_changed_lines {
+            Some((
+                format!(
+                    "the change is {changed_lines} changed lines, over the {max_changed_lines} line budget the landing policy holds it to"
+                ),
+                cog_core::RejectionCause::PromotionGateRefused,
+            ))
+        } else {
+            match landing.check_contribution_allowed(diff) {
+                Ok(()) => None,
+                Err(e) => Some((e.to_string(), cog_core::RejectionCause::ForbiddenPath)),
+            }
+        };
+        match refusal {
+            None => kept.push(change),
+            Some((reason, cause)) => {
                 // 被拒的文件从**同一条规则**里取，而不是把这句英文再解析一遍：
                 // 拒绝要按判据与文件归档，而重新读一遍同一条规则正是这两者与
                 // 判词开始各说各话的方式。连路径都读不出来的 diff 保留拒绝本身，
@@ -3506,7 +3531,7 @@ async fn merge_verification_inputs(
                 // 记录不留给这一轮的落地：这条变更不会落地。真正的收口（两份载体
                 // 一起退休）由调用方做，见 `run_evolution_cycle_in`。
                 recorded.remove(&change.artifact_id);
-                refused.push((change.artifact_id.clone(), e.to_string(), files));
+                refused.push((change.artifact_id.clone(), reason, files, cause));
             }
         }
     }
@@ -4180,18 +4205,23 @@ async fn run_evolution_cycle_in(
     align_engine_baseline(workspaces, workdir).await;
 
     let queued = pipeline.pending_changes(Some(evo_engine)).await?;
+    // 行数预算读落地侧那个键（同一份 `GenerationLimits`，不是第二份定义）。
+    // 生成侧在写盘前已经判过一次，但变更还有别的入口——直接写进落地记录的
+    // 那条不经写盘那道门。判据必须在两个入口处是同一个数，否则同一条变更在
+    // 一条路上被拒、另一条路上走完全程才在落地时被拒。
+    let max_changed_lines = crate::GenerationLimits::load()?.max_changed_lines;
     let (changes, recorded, refused) =
-        merge_verification_inputs(queued, landing.map(|l| l.as_ref())).await;
+        merge_verification_inputs(queued, landing.map(|l| l.as_ref()), max_changed_lines).await;
 
-    // 贡献面之外的变更在沙箱跑起来之前就收口：两份载体一起退休，并留下一条读数。
-    // 判据是变更自身与这份部署的规则，重跑同一个变更只会得到同一个结论，所以两条
-    // 路都只走一次——而"被拒"与"从没生成过"在记录里必须分得开，否则同一个缺口会
-    // 一遍遍被重新发现。
-    for (change_id, reason, files) in refused {
+    // 在沙箱跑起来之前就能定的拒绝，都在这里收口：两份载体一起退休，并留下一条
+    // 读数。判据是变更自身与这份部署的规则，重跑同一个变更只会得到同一个结论，
+    // 所以两条路都只走一次——而"被拒"与"从没生成过"在记录里必须分得开，否则
+    // 同一个缺口会一遍遍被重新发现。
+    for (change_id, reason, files, cause) in refused {
         warn!(
             change_id = %change_id,
             reason = %reason,
-            "Change is outside the contributable surface; refused before the sandbox runs"
+            "Change is refused before the sandbox runs"
         );
         // 这一笔从前记成一条**没有判据**的 outcome，而 outcome 那条路有意不调
         // 触发器——两者合起来，一次贡献面拒绝既不进判据轴，也从不回到主流程，
@@ -4200,9 +4230,9 @@ async fn run_evolution_cycle_in(
         let _ = engine
             .record_change_refusal(
                 &change_id,
-                cog_core::RejectionCause::ForbiddenPath,
+                cause,
                 &files,
-                &format!("Refused by the contribution rules: {reason}"),
+                &format!("Refused before the sandbox ran: {reason}"),
             )
             .await;
         if let Some(m) = evolution_metrics {
@@ -4214,7 +4244,7 @@ async fn run_evolution_cycle_in(
             engine.evolution.as_ref(),
             landing.map(|l| l.as_ref()),
             &change_id,
-            &format!("the contribution rules refuse the change itself: {reason}"),
+            &format!("refused before the sandbox ran: {reason}"),
         )
         .await;
     }
@@ -4884,6 +4914,21 @@ mod tests {
         }
     }
 
+    /// 落地侧那条行数预算的默认值：这些用例里的 diff 都是一两行，判据只要不
+    /// 比它更松就够；要验界线的那条自己把这个数写成 1。
+    fn budget() -> usize {
+        crate::GenerationLimits::default().max_changed_lines
+    }
+
+    /// 一条 diff，按要写多少行造出来。
+    fn diff_of(lines: usize) -> String {
+        let mut body = String::from("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n");
+        for n in 0..lines {
+            body.push_str(&format!("+line {n}\n"));
+        }
+        body
+    }
+
     /// 契约承诺 unverified 的变更"等某条主线后来验证它"才落地。这条支线要真的
     /// 存在，验证循环就必须把记录当成一份输入——只有本地队列时，一条只留在记录里
     /// 的变更永远进不了验证，那句承诺就是空的。
@@ -4896,7 +4941,7 @@ mod tests {
         };
 
         let (changes, recorded, refused) =
-            merge_verification_inputs(Vec::new(), Some(&landing)).await;
+            merge_verification_inputs(Vec::new(), Some(&landing), budget()).await;
 
         assert_eq!(changes.len(), 1, "记录必须成为本轮要验证的变更");
         assert_eq!(changes[0].artifact_id, "github-issue-4-abc");
@@ -4928,9 +4973,12 @@ mod tests {
             contributable: true,
         };
 
-        let (changes, recorded, refused) =
-            merge_verification_inputs(vec![queued("chg-1", "goal from the queue")], Some(&landing))
-                .await;
+        let (changes, recorded, refused) = merge_verification_inputs(
+            vec![queued("chg-1", "goal from the queue")],
+            Some(&landing),
+            budget(),
+        )
+        .await;
 
         assert_eq!(changes.len(), 1, "同一份变更只能被验一次");
         assert_eq!(
@@ -4970,9 +5018,12 @@ mod tests {
             "记录必须在供货，否则下面的空集什么都证明不了"
         );
 
-        let (changes, recorded, refused) =
-            merge_verification_inputs(vec![queued("chg-1", "goal from the queue")], Some(&landing))
-                .await;
+        let (changes, recorded, refused) = merge_verification_inputs(
+            vec![queued("chg-1", "goal from the queue")],
+            Some(&landing),
+            budget(),
+        )
+        .await;
 
         assert_eq!(changes.len(), 0, "贡献不出去的变更不许进这一轮");
         assert!(recorded.is_empty(), "它的记录也不留给落地");
@@ -4992,6 +5043,74 @@ mod tests {
         );
     }
 
+    /// 走不完的那条路先判：落地侧会按行数预算拒掉的变更，不该先花掉 fmt、clippy、
+    /// 整棵树的套件与一次 release 构建。2026-11-06 实测一条 733 行的变更 12:35:32
+    /// 提交、release 构建 269 秒、12:40:35 才被落地按 200 行的上限拒掉——那 269 秒
+    /// 占的是部署器推进也要的那把唯一构建槽。
+    ///
+    /// 两条界线各验一边：超过预算的被拒并交回调用方收口，正好用满的进这一轮。
+    /// 少验一边，「判据写成 >=」与「一律拒」都会绿。
+    #[tokio::test]
+    async fn a_change_over_the_landing_line_budget_is_refused_before_the_round() {
+        let mut over = generated("chg-over", "goal over the budget");
+        over.content = diff_of(4);
+        let mut exact = generated("chg-exact", "goal exactly at the budget");
+        exact.content = diff_of(3);
+        let landing = FakeLanding {
+            unverified: vec![over, exact],
+            readable: true,
+            contributable: true,
+        };
+
+        let (changes, recorded, refused) =
+            merge_verification_inputs(Vec::new(), Some(&landing), 3).await;
+
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| c.artifact_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chg-exact"],
+            "正好用满预算的进这一轮，超出的不进"
+        );
+        assert!(!recorded.contains_key("chg-over"), "超预算的记录不留给落地");
+        assert!(recorded.contains_key("chg-exact"));
+        assert_eq!(refused.len(), 1, "被拒的要交回调用方收口，不能静默丢掉");
+        assert_eq!(refused[0].0, "chg-over");
+        assert_eq!(
+            refused[0].3,
+            cog_core::RejectionCause::PromotionGateRefused,
+            "归档的判据要与落地侧那条一致，而不是另起一种拒绝"
+        );
+        assert!(
+            refused[0].1.contains('4') && refused[0].1.contains('3'),
+            "理由要把两个数都说出来，读者才判得出差多少：{}",
+            refused[0].1
+        );
+    }
+
+    /// 预算对两条输入通道是同一条：只在本地队列里的超预算变更也不许进这一轮。
+    /// 只验记录那一侧，队列这条入口就仍会把超预算的活送进沙箱。
+    #[tokio::test]
+    async fn an_over_budget_change_from_the_local_queue_is_refused_too() {
+        let landing = FakeLanding {
+            unverified: Vec::new(),
+            readable: true,
+            contributable: true,
+        };
+        let mut change = queued("chg-1", "goal");
+        change.content = diff_of(9);
+
+        let (changes, recorded, refused) =
+            merge_verification_inputs(vec![change], Some(&landing), 8).await;
+
+        assert!(changes.is_empty(), "队列里的超预算变更也不许进这一轮");
+        assert!(recorded.is_empty());
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, "chg-1");
+        assert_eq!(refused[0].3, cog_core::RejectionCause::PromotionGateRefused);
+    }
+
     /// 读不到记录不是"没有记录"：读失败时本轮只验本地队列，但不能连本地队列也
     /// 丢掉，否则一次读抖动就让待验证的变更集体消失。
     #[tokio::test]
@@ -5003,7 +5122,8 @@ mod tests {
         };
 
         let (changes, recorded, refused) =
-            merge_verification_inputs(vec![queued("chg-1", "goal")], Some(&landing)).await;
+            merge_verification_inputs(vec![queued("chg-1", "goal")], Some(&landing), budget())
+                .await;
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].artifact_id, "chg-1");
@@ -5018,7 +5138,7 @@ mod tests {
     #[tokio::test]
     async fn without_a_landing_channel_the_local_queue_is_unchanged() {
         let (changes, recorded, refused) =
-            merge_verification_inputs(vec![queued("chg-1", "goal")], None).await;
+            merge_verification_inputs(vec![queued("chg-1", "goal")], None, budget()).await;
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].artifact_id, "chg-1");
@@ -5194,6 +5314,7 @@ mod tests {
         let (again, _, refused) = merge_verification_inputs(
             pipeline.pending_changes(None).await.unwrap(),
             Some(&landing),
+            budget(),
         )
         .await;
         assert!(again.is_empty(), "下一轮不该在两份载体里再找到它");
@@ -5221,6 +5342,7 @@ mod tests {
         let (again, _, refused) = merge_verification_inputs(
             pipeline.pending_changes(None).await.unwrap(),
             Some(&landing),
+            budget(),
         )
         .await;
         assert_eq!(again.len(), 1, "记录还在供货，所以这条变更根本没有被退休");
