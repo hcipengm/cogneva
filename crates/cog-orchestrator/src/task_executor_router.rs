@@ -57,6 +57,20 @@ pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
 // cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活；不是量出来的，是「例外不该翻倍」定的
 pub const STOP_THE_LINE_CLAIM_CONCURRENCY: usize = 1;
 
+/// How many process-local tasks one process runs at once.
+///
+/// Same argument as [`STOP_THE_LINE_CLAIM_CONCURRENCY`], for the other lane that
+/// only the executor deployment reads: its messages carry an artifact written
+/// into this process's change directory, so a deployment that does not own the
+/// executor role cannot run them at all and there is no second reader to pick
+/// up the slack. Sharing the ordinary allowance made this lane stop reading
+/// whenever ordinary work held every permit -- measured 2026-11-06 20:5x at
+/// 1,771 s of waiting against 2 permits, with `entries-read` frozen a day
+/// behind and 1,374 entries queued, while the publish side refused to add more
+/// to a queue nobody was reading.
+// cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活
+pub const LOCAL_CLAIM_CONCURRENCY: usize = 1;
+
 /// 读一条在途执行上限。
 ///
 /// `0` 被拒而不是被当成「不限」：两者在配置里是同一个字符，而误读成停摆
@@ -193,12 +207,29 @@ impl TaskExecutorRouter {
             slots: Arc::new(tokio::sync::Semaphore::new(STOP_THE_LINE_CLAIM_CONCURRENCY)),
             limit: STOP_THE_LINE_CLAIM_CONCURRENCY,
         };
+        // 进程本地那条通道同理，而且这一条是被实测逼出来的：它和普通通道共用一份
+        // 许可时，普通活只要占满那一份，这条通道的读循环就停在 `acquire_owned` 上，
+        // 一条消息都不再读。2026-11-06 20:5x 实测：许可证 2 个，`default` 与
+        // `default:local` 各等了 1,674 与 1,771 秒（同一次抓取），`local` 的
+        // `entries-read` 停在一天前、`lag` 涨到 1,374；发布侧按「这条队列还有没被读走
+        // 的条目」把新任务挡在外面，于是自演化那一路在队列两端一起停住——读的一侧
+        // 等许可，写的一侧等读。代号里的优先级（停线 > 自演化 > 普通活）此前只写在
+        // 发布序上，认领这一侧没有它，所以那条优先序在满负荷时是一句话。
+        //
+        // 它自己的一份是这条例外的代价上界：同时最多一条自演化任务在跑。
+        let local = crate::ready_queue::process_local_ready_stream(workspace_id);
+        let own = ClaimBudget {
+            slots: Arc::new(tokio::sync::Semaphore::new(LOCAL_CLAIM_CONCURRENCY)),
+            limit: LOCAL_CLAIM_CONCURRENCY,
+        };
 
         let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
             .into_iter()
             .map(|ready_stream| {
                 let budget = if ready_stream == stop_the_line {
                     preempting.clone()
+                } else if ready_stream == local {
+                    own.clone()
                 } else {
                     claim.clone()
                 };
@@ -2077,6 +2108,79 @@ mod ready_queue_placement_tests {
             subscribed.contains(&crate::ready_queue::process_local_ready_stream("ws")),
             "subscribed: {subscribed:?}"
         );
+        shutdown.trigger();
+    }
+
+    /// 普通活占满许可时，进程本地那条通道照样要读。
+    ///
+    /// 两条通道共用一份许可，而许可只在任务跑完时归还；于是普通活只要同时占满
+    /// 那一份，本地通道的订阅循环就停在 `acquire_owned` 上，一条消息都不再读。
+    /// 2026-11-06 20:5x 线上就是这个样子：许可证 2 个，`default` 与
+    /// `default:local` 各等了 1,674 与 1,771 秒，`local` 的 `entries-read` 停在
+    /// 一天前、`lag` 涨到 1,374，发布侧按「这条队列还有没被读走的条目」把新任务
+    /// 挡在外面——自演化那一路在队列两端一起停住。
+    ///
+    /// 这条用例把普通通道塞满（每一项都不返回），再看本地那一条有没有把消息读完。
+    /// 本地通道没有自己的一份许可时，这里永远等不到 ack。
+    struct Blocker;
+
+    #[async_trait]
+    impl TaskExecutor for Blocker {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+        async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
+            // 普通活永不返回：占住许可，模拟一条跑了很久的活。自演化那一条照常
+            // 答完——这一条用例判的是「本地通道还能不能读到消息」，不是它跑多久。
+            if task.task_type.kind_key() == "unit_of_work" {
+                std::future::pending::<()>().await;
+            }
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({"done": true}),
+                metadata: TaskResultMetadata::new("accept"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_ordinary_pool_still_lets_the_process_local_lane_read() {
+        let shared = crate::ready_queue::ready_stream("ws");
+        let local = crate::ready_queue::process_local_ready_stream("ws");
+        let backend = Arc::new(PerStreamBackend::default());
+        // 比共享许可多塞几条，保证那一份被占满、订阅循环停在许可上。
+        for i in 0..(DEFAULT_CLAIM_CONCURRENCY + 2) {
+            backend
+                .queue(&shared, &format!("m-ordinary-{i}"), ordinary_task())
+                .await;
+        }
+        backend.queue(&local, "m-generate", generation_task()).await;
+
+        let router = Arc::new(
+            TaskExecutorRouter::new()
+                .with_executor(Arc::new(Blocker))
+                .await,
+        );
+        let shutdown = ShutdownSignal::new();
+        let runner = {
+            let router = router.clone();
+            let backend = backend.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                router
+                    .run_consumer(backend.clone(), backend, "ws", true, shutdown)
+                    .await
+            })
+        };
+
+        settle(&backend, 1).await;
+        assert_eq!(
+            backend.acks.lock().await.clone(),
+            vec!["m-generate".to_string()],
+            "普通许可占满时本地通道没能读到自己的消息——它和普通活共用一份许可，\
+             而那一份永远不会在普通活跑完之前归还"
+        );
+        drop(runner);
         shutdown.trigger();
     }
 }
