@@ -109,4 +109,66 @@ case "${out}" in
 esac
 echo "OK: 没有名字的步骤印出兜底说法，而不是空括号"
 
+# Test 腿：改动落在哪个包，那个包自己的测试先在本机跑一次，并且**总是**带上装配件
+# `cogneva`——读全树源码的普查门住在它的测试里，按改动包收窄正好把它们排除掉。
+#
+# 这一格挡的是 2026-11-06 的事故：一笔直接推到 main 的改动只碰了一个包（滚动构建器），
+# 而同一文件里那道门当场就会红，跑起来是秒级；推送之前没人跑它，此后每一版 Test 与
+# Code Coverage 都是红的，部署器停在 5dad1f95 上整整九版，前面落地的修复一条都没生效。
+#
+# 反证：去掉这一条腿，下面这一次调用里既没有 `-p fake` 也没有 `-p cogneva`，这一格
+# 会红在「这次要推的提交动过 1 个 crate」那一句上。
+leg="${work}/test-leg"
+mkdir -p "${leg}/deploy/scripts" "${leg}/.github/workflows" "${leg}/crates/fake/src" "${leg}/bin"
+cp "${gate}" "${leg}/deploy/scripts/check-before-push.sh"
+cat >"${leg}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: nothing to replay here
+        run: |
+          echo one
+  deploy-parity:
+    steps:
+      - name: nothing here either
+        run: |
+          echo two
+YAML
+printf '[package]\nname = "fake"\nversion = "0.0.0"\n' >"${leg}/crates/fake/Cargo.toml"
+printf 'pub fn a() {}\n' >"${leg}/crates/fake/src/lib.rs"
+# 假的 cargo 只做一件事：把每次调用原样记下来，然后退 0。这一格要看见的是「它被这样
+# 调用了吗」，不是这次测试的结果——把结果也演一遍会让红的原因说不清是哪一半。
+cat >"${leg}/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${CARGO_LOG}"
+exit 0
+SH
+chmod +x "${leg}/bin/cargo"
+(
+    cd "${leg}" || exit 1
+    git init -q .
+    git -c user.email=t@t.invalid -c user.name=t add -A
+    git -c user.email=t@t.invalid -c user.name=t commit -qm base
+    git update-ref refs/remotes/origin/main HEAD
+    printf 'pub fn b() {}\n' >>crates/fake/src/lib.rs
+    git -c user.email=t@t.invalid -c user.name=t add -A
+    git -c user.email=t@t.invalid -c user.name=t commit -qm change
+) >/dev/null 2>&1 || fail "造不出这一格的 git 夹具（init / origin/main / 一次改动）"
+
+cargo_log="${work}/cargo-test-leg.log"
+: >"${cargo_log}"
+rc=0
+out="$(cd "${leg}" && CARGO_LOG="${cargo_log}" PATH="${leg}/bin:${PATH}" \
+    bash deploy/scripts/check-before-push.sh 2>&1)" || rc=$?
+
+case "${out}" in
+  *"== Test：这次要推的提交动过 1 个 crate"*) ;;
+  *) fail "改动落在 crates/fake 上，Test 腿没有跑起来 —— ${out}" ;;
+esac
+grep -qE '^test .*-p fake.* -p cogneva|^test .*-p cogneva.* -p fake' "${cargo_log}" ||
+    fail "Test 腿没有把改动包与装配件一起交给 cargo：$(cat "${cargo_log}")"
+echo "OK: 改动落在哪个包，Test 腿就判那个包加装配件"
+echo "OK: Test 腿真的调用了 cargo test -p fake -p cogneva（rc=${rc}）"
+
 echo "before-push.test: all checks passed"

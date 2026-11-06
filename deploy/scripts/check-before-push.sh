@@ -27,14 +27,15 @@
 # 命令是从 `.github/workflows/ci.yml` 里**取**的，不是在这里抄一份：抄一份的门会在
 # 有人加作业时静默变窄，而这条门唯一不能犯的错就是「它绿了，CI 却红了」。
 #
-# 不覆盖：Check / Test / Code Coverage / Format / Version Contract /
+# 不覆盖：Check / Code Coverage / Format / Version Contract /
 # Web Build / Bootstrap Cross-Platform —— 它们要编译或要 Node，本机跑一遍可能比 CI
 # 还慢。末尾会把这份清单印出来：**这条门绿不等于 CI 绿**，它只保证那几类「改动碰了
 # 别的面的读者」的判据不是推上去才发现的。
 #
-# Test 里有一个例外：容量登记表那条测试（`rust_capacity_constants_registry_test.rs`）
-# 在本机是秒级的纯文本扫描，所以它单独在这里跑（见下面那段为什么走 `rustc`）。Test 作业
-# 整体仍然不覆盖——这一格补的是「加常量不补登记表」这一个具体的红，不是那个作业。
+# Test 是个折中：整棵工作区在本机是十几分钟起，所以只判**这次动过的包加装配件**。
+# 2026-11-06 20:26 那笔直接推到 main 的改动正是死在「改了包却没跑包自己的测试」上，
+# 那一笔之后部署器停了九版。容量登记表那条秒级的纯文本扫描（`rust_capacity_constants_registry_test.rs`）
+# 仍然单独在这里跑，理由是它可以不编译就判。
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -362,6 +363,67 @@ else
     echo "SKIP  Clippy：本机没有可用的 cargo 或 python3（CI 的 Clippy 会整份跑）"
 fi
 
+# Test：CI 的 Test 作业跑 `cargo test --workspace --no-fail-fast`。整棵在本机是十几
+# 分钟起，而这一步要站在每一次推送前面，所以收窄到**这次要推的提交动过的包，加上
+# 装配件 `cogneva`**。
+#
+# 装配件不是「多跑一点更保险」：读全树源码的普查门住在它的测试里，按改动包收窄
+# 正好把它们排除在外，而它们恰恰最容易在落地之后才第一次被执行。
+#
+# 为什么必须有这一条：2026-11-06 20:26 有一笔改动直接推到了 main——在滚动构建器里
+# 给持久状态的工作负载加了一条豁免，没有同步改同一文件里的那道门。那道门就在它改
+# 的那个包里、跑起来是秒级，可推之前没人跑它；此后每一版 Test 与 Code Coverage 都
+# 是红的，部署器停在 5dad1f95 上整整九版，前面已经落地的修复一条都没生效。这一条
+# 腿判的就是这一类：改动落在哪个包，那个包自己的测试先在本机绿一次。
+#
+# 它不等于 CI 的 Test：没被改动、也不被它们依赖的 crate 仍然只有 CI 会跑。末尾的
+# 清单会说出来，因为「跑过的绿」与「没跑的绿」在读数上同形。
+if [ -n "${cargo_bin}" ]; then
+    if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
+        echo "SKIP  Test：本机没有 origin/main，推的范围判不出来（CI 的 Test 会整棵跑）"
+    else
+        mapfile -t test_crates < <(
+            git diff --name-only 'origin/main...HEAD' -- 'crates/*.rs' |
+                awk -F/ '$1 == "crates" && NF >= 3 { print $2 }' | sort -u
+        )
+        test_args=(-p cogneva)
+        test_count=0
+        for crate_dir in ${test_crates[@]+"${test_crates[@]}"}; do
+            package="$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' "crates/${crate_dir}/Cargo.toml" 2>/dev/null | head -1)"
+            if [ -n "${package}" ] && [ "${package}" != "cogneva" ]; then
+                test_args+=(-p "${package}")
+                test_count=$((test_count + 1))
+            elif [ -z "${package}" ]; then
+                # 有 `.rs` 却读不到包名：那个目录不是工作区成员。另一条门
+                # （`crate_source_membership_contract_test`）判这件事，这里只说没判到。
+                echo "SKIP  Test：crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Test 会整棵跑）"
+            fi
+        done
+        if [ "${test_count}" -gt 0 ]; then
+            repo_toplevel="$(git rev-parse --show-toplevel)"
+            test_tree="$(mktemp -d "${TMPDIR:-/tmp}/cogneva-push-test.XXXXXX")"
+            git worktree prune 2>/dev/null
+            if git worktree add --detach --quiet "${test_tree}" HEAD 2>/dev/null; then
+                echo "== Test：这次要推的提交动过 ${test_count} 个 crate 的源码，判的是 HEAD 展开出来的那棵树，外加装配件 cogneva"
+                judge_head_tests() {
+                    ( cd "${test_tree}" &&
+                        CARGO_TARGET_DIR="${repo_toplevel}/target" \
+                            "${cargo_bin}" test "${test_args[@]}" --no-fail-fast )
+                }
+                run_step "cargo test ${test_args[*]} --no-fail-fast" judge_head_tests
+                git worktree remove --force "${test_tree}" >/dev/null 2>&1 || rm -rf "${test_tree}"
+            else
+                rm -rf "${test_tree}"
+                echo "SKIP  Test：展开不出 HEAD 的临时工作树（${test_tree}），这一份没判（CI 的 Test 会整棵跑）"
+            fi
+        else
+            echo "== Test：这次要推的提交没动 crates/ 下的 .rs，跳过（CI 的 Test 会整棵跑）"
+        fi
+    fi
+else
+    echo "SKIP  Test：本机没有可用的 cargo（CI 的 Test 会整棵跑）"
+fi
+
 # Check 作业本机跑不动（要编译整个工作区，比 CI 还慢），可它红得最多的一种形状本机
 # 几秒钟就能判：**推上去的这几笔，新增了对一个这棵树里不存在的模块的引用**。
 # 2026-10-29 实测过一次代价：一笔带 `use crate::test_support::scrape;` 而定义它的文件
@@ -405,7 +467,8 @@ if [ "${failures}" -ne 0 ]; then
     echo "PRE-PUSH: ${failures} 步红，推上去 CI 也会红。"
     exit 1
 fi
-echo "PRE-PUSH: 上列的 shell 面判据全绿。"
+echo "PRE-PUSH: 上列的判据全绿。"
 echo "Clippy 只判这次要推的提交动过的 crate；其余 crate 的 lint 仍由 CI 整份跑。"
-echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Test / Code Coverage /"
+echo "Test 只判这次动过的包加装配件 cogneva；其余 crate 的测试仍由 CI 整棵跑。"
+echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Code Coverage /"
 echo "Format / Version Contract / Web Build / Bootstrap Cross-Platform。"
