@@ -1684,13 +1684,36 @@ pub(crate) fn ci_hold_goal_text(
              改到它变绿、再跑一遍这批检查覆盖的测试确认没有连带弄坏别的，然后才提交。\
              没在本地见过它变绿的提交，等于把上游 CI 当成调试器。\
              这一对读数现在由执行侧的门来判（not_reproduced）：去掉改动还是绿的、\
-             或者改完同一条命令仍然红的提交，会在落地之前就被退回，不会花掉一次上游 CI。\
-             需要真服务的那些检查（上游那一格叫 Live services）与本地是同一份清单：\
-             在本地跑 `bash deploy/scripts/check-live-services.sh` 就是上游那一格跑的\
-             同一批命令；它退出 2 说的是「这台机器没配测试库或 Redis」，那是环境缺\
-             东西，不是这条改动的判据。",
+             或者改完同一条命令仍然红的提交，会在落地之前就被退回，不会花掉一次上游 CI。",
         );
         said
+    };
+    // 上游那一格跑的命令，逐格写成字面。只写「在本地复现一下」是不够的：2026-11-07
+    // 实测一轮修法在本地跑的是 `cargo clippy -p cog-orchestrator --all-targets`，少了
+    // `-- -D warnings`——同一个引擎、同一次判决，本地那一次绿了，上游照样红，于是这一轮
+    // 花掉的是上游的一次排队而不是本地的一次等待。
+    let mut local = String::new();
+    for check in failed_checks {
+        if let Some(command) = local_reproduction_command(check) {
+            local.push_str(&format!("- {check} 在本地跑 `{command}`\n"));
+        }
+    }
+    let local = if local.is_empty() {
+        String::new()
+    } else {
+        let live = if failed_checks
+            .iter()
+            .any(|c| check_job_name(c) == "Live services")
+        {
+            "Live services 退出 2 说的是「这台机器没配测试库或 Redis」，那是环境缺东西，\
+             不是这条改动的判据。"
+        } else {
+            ""
+        };
+        format!(
+            "\n\n上游这几格在本地跑的是同一条命令（与工作流里那一格的 `run:` 逐字相同，\
+             参数少一个本地绿了也不算数）：\n{local}{live}"
+        )
     };
     // 单独成段：它说的是「前面几轮」，与上面那段「这一版为什么红」不是同一件事，
     // 接在同一行里读起来会像是这一次的失败原因之一。
@@ -1710,15 +1733,36 @@ pub(crate) fn ci_hold_goal_text(
     );
     format!(
         "Make upstream CI green again for mainline {}\n\n\
-         主线提交 {} 在上游 CI 上被判为失败，部署器已扣住这一版不发版。失败的检查：{}。{}{}{}\
+         主线提交 {} 在上游 CI 上被判为失败，部署器已扣住这一版不发版。失败的检查：{}。{}{}{}{}\
          判据是新的 main 提交在同一组检查上全绿，且这一版被它取代；只有那时部署器才会放开滚动。",
         rev12(rev),
         rev,
         checks,
         next,
+        local,
         reachable,
         tried,
     )
+}
+
+/// 上游某一格的检查名去掉平台前缀：`github:Clippy` → `Clippy`。
+fn check_job_name(check: &str) -> &str {
+    check.rsplit(':').next().unwrap_or(check)
+}
+
+/// 上游那一格判红时，本地的同一条命令。
+///
+/// 这些字串与 `.github/workflows/ci.yml` 里那一格的 `run:` 逐字相同，判据钉在
+/// [`the_local_reproduction_commands_are_the_ones_ci_runs`] 里：抄错一个参数，本地
+/// 跑的就不是上游判的那条命令，「本地绿了」退化成一次猜测。
+fn local_reproduction_command(check: &str) -> Option<&'static str> {
+    match check_job_name(check) {
+        "Clippy" => Some("cargo clippy --keep-going --workspace --all-targets -- -D warnings"),
+        "Test" => Some("cargo test --workspace --no-fail-fast"),
+        "fmt" => Some("cargo fmt --all -- --check"),
+        "Live services" => Some("bash deploy/scripts/check-live-services.sh"),
+        _ => None,
+    }
 }
 
 /// 同一版上已经办完的一轮修法，从那一行自己身上读回来。
@@ -15277,6 +15321,37 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(second.contains("第 1 轮"), "{second}");
         assert_ne!(first, second);
         assert_eq!(ci_hold_attempts_note(&[], 0), None);
+    }
+
+    /// 题面里那几条「本地同一条命令」必须就是工作流里那一格跑的命令。
+    ///
+    /// 这条判据存在的理由是一次实测：2026-11-07 的一轮修法在本地跑的是
+    /// `cargo clippy -p cog-orchestrator --all-targets`，少了 `-- -D warnings`。
+    /// 同一个引擎、同一份代码，本地绿了，上游照样红——少一个参数，本地那一次
+    /// 就不是上游在判的那件事。
+    #[test]
+    fn the_local_reproduction_commands_are_the_ones_ci_runs() {
+        // 根从那一份算法取，不在这里另算一遍：`CARGO_MANIFEST_DIR` 往上走一步的
+        // 写法只许长在 `tests/common/root.rs` 里（`the_repo_root_is_computed_in_one_place_test`
+        // 盯着这件事）。这一句本来就是我第一版写错的地方。
+        let root = crate::checkout::repo_root();
+        let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+            .expect("the workflow whose commands the goal text quotes");
+        for check in [
+            "github:Clippy",
+            "github:Test",
+            "github:fmt",
+            "github:Live services",
+        ] {
+            let command = local_reproduction_command(check).expect("a mapped job");
+            assert!(
+                workflow.contains(command),
+                "{check} 的本地命令已经与工作流对不上：{command}"
+            );
+        }
+        // 没映射的检查不能凭空编一条命令：题面里多一条错的命令，比没有更坏。
+        assert_eq!(local_reproduction_command("github:Deploy Parity"), None);
+        assert_eq!(check_job_name("github:Code Coverage"), "Code Coverage");
     }
 
     /// 被停掉的轮次既不进「交了什么」那张账，也不能让下一轮以为没人动过手。
