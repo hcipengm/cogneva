@@ -264,3 +264,82 @@ impl RestartPolicy {
             .min(self.backoff_max)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wall a stall rule compares a loop's age against is the loop's period
+    /// **plus** the work bound the loop declared, and never a number read off the
+    /// observer's own tick.
+    ///
+    /// The period bounds only the wait for the next tick. A cycle that runs a
+    /// build, a test or a queue wait does its work between two beats, so its
+    /// beat-to-beat gap is the wait plus the work: a budget taken from the tick
+    /// alone announces every healthy cycle of such a loop as stalled, and the
+    /// reading that would say the loop is dead is the one nobody believes any
+    /// more.
+    ///
+    /// principle: feedback_stall_budget_must_cover_the_iteration_not_the_poll
+    #[test]
+    fn the_stall_wall_covers_the_work_the_loop_declared_not_the_poll_tick() {
+        let cadence = Cadence::PeriodicWithWork {
+            period: Duration::from_secs(30),
+            work: Duration::from_secs(600),
+        };
+        let period = cadence.period_secs();
+        let work = cadence.work_budget_secs();
+        let wall = period + work;
+
+        assert_eq!(
+            (period, work),
+            (30, 600),
+            "the declaration is not read back as the loop wrote it"
+        );
+        // Strictly longer than the poll tick, which is what the principle asks
+        // for; equality would mean the work never reached the wall.
+        assert!(
+            wall > period,
+            "a wall of {wall}s is the {period}s tick, which bounds only the wait"
+        );
+        // And it is the sum rather than the larger half: reporting the work alone
+        // would drop the wait, and `max` is the shape that does it by accident.
+        assert!(
+            wall > work,
+            "a wall of {wall}s is the work alone; the wait for the next tick is missing"
+        );
+    }
+
+    /// A loop whose period covers its whole cycle keeps the wall it always had:
+    /// its work budget is zero rather than absent, so summing it onto the period
+    /// is the period and the published series does not silently change a loop
+    /// that never needed the distinction.
+    #[test]
+    fn a_loop_whose_period_covers_its_cycle_declares_no_work_budget() {
+        let periodic = Cadence::Periodic(Duration::from_secs(45));
+        assert_eq!(periodic.work_budget_secs(), 0);
+        assert_eq!(periodic.period_secs() + periodic.work_budget_secs(), 45);
+
+        // An event-driven loop has no period to widen, and its age is a reading
+        // rather than a judgement: a work budget here would be a wall nothing
+        // is allowed to compare an age against.
+        let event_driven = Cadence::EventDriven;
+        assert_eq!(event_driven.period_secs(), 0);
+        assert_eq!(event_driven.work_budget_secs(), 0);
+    }
+
+    /// The work budget reaches the rule at whole-second resolution, so the wall
+    /// never rounds the loop's own iteration down to a smaller number than the
+    /// one the loop declared.
+    #[test]
+    fn the_work_budget_reaches_the_rule_at_whole_second_resolution() {
+        for secs in [1u64, 2, 59, 60, 3_600] {
+            let cadence = Cadence::PeriodicWithWork {
+                period: Duration::from_secs(5),
+                work: Duration::from_secs(secs),
+            };
+            assert_eq!(cadence.work_budget_secs(), secs);
+            assert_eq!(cadence.period_secs() + cadence.work_budget_secs(), 5 + secs);
+        }
+    }
+}
