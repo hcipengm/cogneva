@@ -1717,6 +1717,12 @@ impl AgentRuntime {
     /// answered with a pointer instead of the payload, so the tool_use /
     /// tool_result pairing the provider requires is kept and the bytes are paid
     /// for once.
+    ///
+    /// Every argument is an independent coordinate of the one call being
+    /// answered (which task, which turn and frame of it, which call id and tool,
+    /// what it returned, and what this run has already handed over); bundling
+    /// them into a carrier would move the same count behind a name.
+    #[allow(clippy::too_many_arguments)]
     async fn tool_result_message(
         &self,
         task_id: Option<&str>,
@@ -6440,8 +6446,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         // 小窗口：几轮之后第一份结果必然被裁出投影。
-        let mut config = RuntimeConfig::default();
-        config.context_window_size = 600;
+        let config = RuntimeConfig {
+            context_window_size: 600,
+            ..RuntimeConfig::default()
+        };
         let mut runtime = AgentRuntime::new(config, tx);
         let mut delivered = DeliveredResults::default();
 
@@ -6514,8 +6522,10 @@ mod tests {
     async fn an_oversized_result_is_still_recognised_when_it_comes_back() {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let mut config = RuntimeConfig::default();
-        config.context_window_size = 600;
+        let config = RuntimeConfig {
+            context_window_size: 600,
+            ..RuntimeConfig::default()
+        };
         let mut runtime = AgentRuntime::new(config, tx);
         let mut delivered = DeliveredResults::default();
 
