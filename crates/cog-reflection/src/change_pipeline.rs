@@ -301,14 +301,28 @@ fn verification_env(
     env
 }
 
+/// The workspace as cargo resolved it: `(package name, directory relative to
+/// the worktree root)` for every member, which member is the assembly, and
+/// `(dependent, dependency)` for every dependency edge between two members.
+struct WorkspaceLayout {
+    members: Vec<(String, String)>,
+    assembly: Option<String>,
+    /// Every kind of dependency, not just the normal ones: a dev-dependency
+    /// links two members for `cargo test` exactly as a normal one links them
+    /// for `cargo check`, and a change to the package on the left of the arrow
+    /// is a change the package on the right is compiled against.
+    edges: Vec<(String, String)>,
+}
+
 /// The packages a change's verification is confined to, or `None` for the whole
 /// workspace.
 ///
 /// The question this answers is the one every out-of-band change answers the
-/// same way: a change that edits one crate is judged by that crate's suite, and
-/// the tree it did not touch is judged after it lands. A pipeline that runs the
-/// whole workspace for each of them makes the tree's size, not the change's
-/// size, the cost of every change — and the tree only grows.
+/// same way: a change that edits one crate is judged by that crate and by the
+/// crates that depend on it, and the tree neither of those reaches is judged
+/// after it lands. A pipeline that runs the whole workspace for each of them
+/// makes the tree's size, not the change's size, the cost of every change — and
+/// the tree only grows.
 ///
 /// `members` is the workspace as cargo resolved it: `(package name, directory
 /// relative to the worktree root)`. Every affected path has to belong to one of
@@ -317,6 +331,9 @@ fn verification_env(
 /// of the whole tree rather than by one package's suite, and a scoped run would
 /// not judge them at all. `None` is always the safe answer: it is exactly what
 /// ran before there was a scope.
+///
+/// This is the direct owners only; [`with_dependents`] is what makes the scope
+/// the one that catches a broken call site.
 fn verification_packages(affected: &[String], members: &[(String, String)]) -> Option<Vec<String>> {
     if affected.is_empty() || members.is_empty() {
         return None;
@@ -346,17 +363,74 @@ fn verification_packages(affected: &[String], members: &[(String, String)]) -> O
     Some(packages)
 }
 
+/// Which workspace member a declared dependency points at, if any.
+///
+/// The path is what cargo resolved, so a renamed dependency (`cog-x = { package
+/// = "cog-y" }`) still lands on the package it names. The name is the fallback
+/// for the case where the worktree this run reads is reached through a symlink
+/// cargo already followed, and both names are compared with `-` and `_` folded
+/// together because cargo accepts either spelling. A dependency outside the
+/// workspace — a crate from the registry, a path dependency in another tree —
+/// is not a member and yields `None`: it is not a package this scope can ask
+/// `-p` for.
+fn dependency_target(
+    dependency: &serde_json::Value,
+    root: &Path,
+    members: &[(String, String)],
+) -> Option<String> {
+    if let Some(path) = dependency.get("path").and_then(serde_json::Value::as_str) {
+        if let Ok(relative) = Path::new(path).strip_prefix(root) {
+            let dir = relative.to_string_lossy().replace('\\', "/");
+            if let Some((name, _)) = members.iter().find(|(_, member)| *member == dir) {
+                return Some(name.clone());
+            }
+        }
+    }
+    let name = dependency.get("name")?.as_str()?;
+    members
+        .iter()
+        .find(|(member, _)| member.replace('_', "-") == name.replace('_', "-"))
+        .map(|(member, _)| member.clone())
+}
+
+/// Widen `packages` to everything that depends on them, transitively.
+///
+/// This is the half a scope of "the packages the change edits" cannot answer:
+/// a change to a public signature breaks its dependents' *compilation*, and
+/// nothing in the edited package's own suite compiles them. The tree-wide CI
+/// comes back red on a call site the change never opened, and the change has
+/// already landed by then. Walking the edges forward is what makes the local
+/// judgement the same judgement.
+///
+/// The closure is over all dependency kinds (see [`WorkspaceLayout::edges`]).
+/// Order is stable: the direct owners first, in the order the change names
+/// them, then dependents in the order cargo lists them.
+fn with_dependents(packages: &mut Vec<String>, edges: &[(String, String)]) {
+    let mut frontier = packages.clone();
+    while let Some(dependency) = frontier.pop() {
+        for (dependent, target) in edges {
+            if *target != dependency || packages.iter().any(|known| known == dependent) {
+                continue;
+            }
+            packages.push(dependent.clone());
+            frontier.push(dependent.clone());
+        }
+    }
+}
+
 /// 一条变更的两组判据口径，按阶段分开。
 ///
-/// 分成两组是因为两个阶段问的不是同一个问题。`lint` 判「这个变更自己写的代码
-/// 合不合规」——别的包里的 lint 不是它写的，收窄成立，省下的是一整棵树的编译。
-/// `suite` 还要判「整棵树还自洽吗」：源码树上的普查（一个值不许有两个名字、
-/// 一个容量数字要写出来源、一个角色名只许拼在一个地方）不住在被改的那个 crate
-/// 里，住在装配件的测试套件里，按路径去读整个 `crates/`。它与被改的 crate
-/// 之间没有任何依赖边可走，所以按「改动包」收窄时这些人一条都不会执行；要等
-/// 落地之后由 CI 判，而那时主干已经往前走了好几个版本，红的账记在别人头上。
+/// 两组都是「改动落在的包 + 依赖了它们的包（传递闭包）」，这一批是所有问
+/// 「这棵树还能不能编译、还能不能跑」的判据的最窄面：改一个函数的签名，红的是
+/// 调用点，而调用点在依赖它的那些包里，被改的包自己的套件一条都不编译它们。
+///
+/// 两组仍然分开，因为测试面还要加装配件：源码树上的普查（一个值不许有两个名字、
+/// 一个容量数字要写出来源、一个角色名只许拼在一个地方）住在装配件的测试套件里，
+/// 按路径去读整个 `crates/`。它与被改的 crate 之间没有依赖边可走，走不到依赖方
+/// 那一批里；不加它，这些人一条都不会执行，要等落地之后由 CI 判，而那时主干
+/// 已经往前走了好几个版本，红的账记在别人头上。
 struct VerificationScopes {
-    /// 改动落在哪几个包上。`None` 是整棵 workspace。
+    /// 改动落在哪几个包上，加上依赖它们的包。`None` 是整棵 workspace。
     lint: Option<Vec<String>>,
     /// 同一批包，加上装配件。`None` 是整棵 workspace。
     suite: Option<Vec<String>>,
@@ -561,14 +635,24 @@ fn suite_scope(packages: &Option<Vec<String>>, assembly: Option<&str>) -> Option
 
 /// The two scopes a change runs under, from what it edits and what the
 /// workspace is.
-fn scopes_for(
-    affected: &[String],
-    members: &[(String, String)],
-    assembly: Option<&str>,
-) -> VerificationScopes {
-    let lint = verification_packages(affected, members);
-    let suite = suite_scope(&lint, assembly);
-    VerificationScopes { lint, suite }
+///
+/// The dependents are added before the cap is applied, so a change to a crate
+/// most of the workspace depends on widens past [`MAX_SCOPED_PACKAGES`] and
+/// falls back to the whole workspace — which is the right answer for it, and
+/// the one the cap exists to reach cheaply.
+fn scopes_for(affected: &[String], layout: &WorkspaceLayout) -> VerificationScopes {
+    let Some(mut lint) = verification_packages(affected, &layout.members) else {
+        return VerificationScopes::whole_workspace();
+    };
+    with_dependents(&mut lint, &layout.edges);
+    if lint.len() > MAX_SCOPED_PACKAGES {
+        return VerificationScopes::whole_workspace();
+    }
+    let suite = suite_scope(&Some(lint.clone()), layout.assembly.as_deref());
+    VerificationScopes {
+        lint: Some(lint),
+        suite,
+    }
 }
 
 /// Whether this `cargo metadata` package is the one that builds the binary the
@@ -3624,15 +3708,14 @@ impl ChangePipeline {
         else {
             return VerificationScopes::whole_workspace();
         };
-        let Some((members, assembly)) = self.workspace_packages(workdir).await else {
+        let Some(layout) = self.workspace_packages(workdir).await else {
             return VerificationScopes::whole_workspace();
         };
-        scopes_for(&affected, &members, assembly.as_deref())
+        scopes_for(&affected, &layout)
     }
 
-    /// The workspace's members as `(package name, directory relative to the
-    /// worktree root)`, plus which member is the assembly, or `None` when this
-    /// run cannot read them.
+    /// The workspace as cargo resolved it — members, the assembly, and which
+    /// member depends on which — or `None` when this run cannot read it.
     ///
     /// The assembly is the member that builds the binary the deployment runs —
     /// named by the one constant that names it, not by a crate name written
@@ -3641,10 +3724,7 @@ impl ChangePipeline {
     /// there can read any crate's sources, and no dependency edge runs the
     /// other way. A workspace with no such target yields `None` and keeps the
     /// suite scope exactly as it was.
-    async fn workspace_packages(
-        &self,
-        workdir: &Path,
-    ) -> Option<(Vec<(String, String)>, Option<String>)> {
+    async fn workspace_packages(&self, workdir: &Path) -> Option<WorkspaceLayout> {
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args([
             "metadata",
@@ -3676,7 +3756,23 @@ impl ChangePipeline {
             }
             members.push((name, dir.to_string_lossy().replace('\\', "/")));
         }
-        Some((members, assembly))
+        let mut edges = Vec::new();
+        for package in doc.get("packages")?.as_array()? {
+            let dependent = package.get("name")?.as_str()?.to_string();
+            for dependency in package.get("dependencies")?.as_array()? {
+                let Some(target) = dependency_target(dependency, &root, &members) else {
+                    continue;
+                };
+                if target != dependent {
+                    edges.push((dependent.clone(), target));
+                }
+            }
+        }
+        Some(WorkspaceLayout {
+            members,
+            assembly,
+            edges,
+        })
     }
 
     /// Run the configured test command and return (success, combined_output).
@@ -7371,6 +7467,21 @@ index 1111111..2222222 100644
         ]
     }
 
+    fn layout(
+        members: Vec<(String, String)>,
+        assembly: Option<&str>,
+        edges: &[(&str, &str)],
+    ) -> WorkspaceLayout {
+        WorkspaceLayout {
+            members,
+            assembly: assembly.map(str::to_string),
+            edges: edges
+                .iter()
+                .map(|(dependent, target)| (dependent.to_string(), target.to_string()))
+                .collect(),
+        }
+    }
+
     /// 一条只落在 crate 目录里的变更，验证收窄到它改的那几个包。
     ///
     /// 这是这条管线与带外改动同构的地方：改一个 crate 就判那个 crate，整棵树
@@ -7405,6 +7516,104 @@ index 1111111..2222222 100644
         );
     }
 
+    /// 改一个包的公开面，依赖它的包必须在落地前被判。
+    ///
+    /// 这是本地绿、上游红最典型的一条来路：改 `cog-github` 里一个函数的签名，
+    /// 它自己的套件是绿的，红在调用它的装配件里；收窄到「改动的包」就没有一条
+    /// 命令会去编译那些调用点，红的账要等 CI 记回来。依赖边是传递的：装配件
+    /// 依赖 `cog-github`、`cog-github` 依赖 `cog-core`，所以改 `cog-core` 时
+    /// 装配件也在这一批里。
+    #[test]
+    fn a_change_is_judged_with_every_package_that_depends_on_what_it_edits() {
+        let tree = layout(
+            members(),
+            Some("cogneva"),
+            &[
+                ("cog-github", "cog-core"),
+                ("cogneva-bootstrap", "cog-core"),
+                ("cogneva", "cog-github"),
+            ],
+        );
+        let scopes = scopes_for(&["crates/cog-github/src/landing.rs".to_string()], &tree);
+        assert_eq!(
+            scopes.lint,
+            Some(vec!["cog-github".to_string(), "cogneva".to_string()]),
+            "依赖方（装配件）必须进 lint 面：它的调用点才是签名改坏之后红的地方"
+        );
+        let scopes = scopes_for(&["crates/cog-core/src/lib.rs".to_string()], &tree);
+        let mut judged = scopes.lint.expect("依赖方没超过上限，口径就该是收窄的");
+        judged.sort();
+        assert_eq!(
+            judged,
+            vec![
+                "cog-core".to_string(),
+                "cog-github".to_string(),
+                "cogneva".to_string(),
+                "cogneva-bootstrap".to_string(),
+            ],
+            "依赖是传递的：cog-core 的改动要连 cog-github 的依赖方（装配件）一起判"
+        );
+    }
+
+    /// 依赖方多到接近整棵树时，退回整棵 workspace。
+    ///
+    /// 判据与「改动落在几个包上」那个上限是同一条：收窄省下的编译不再抵得上
+    /// 「哪些包被算进来了」这层读数时，整棵是更简单的答案。这里的形状是现实里
+    /// 的那一个——`cog-core` 被二十六个成员依赖。
+    #[test]
+    fn a_change_the_whole_workspace_depends_on_is_judged_as_the_whole_workspace() {
+        let mut wide = members();
+        let mut edges: Vec<(String, String)> = Vec::new();
+        for index in 0..MAX_SCOPED_PACKAGES {
+            let name = format!("cog-dependent-{index}");
+            wide.push((name.clone(), format!("crates/dependent-{index}")));
+            edges.push((name, "cog-core".to_string()));
+        }
+        let tree = WorkspaceLayout {
+            assembly: Some("cogneva".to_string()),
+            edges,
+            members: wide,
+        };
+        let scopes = scopes_for(&["crates/cog-core/src/lib.rs".to_string()], &tree);
+        assert_eq!(
+            scopes.lint, None,
+            "依赖方加进来超过上限时必须是整棵，不是截断到上限那一批"
+        );
+        assert_eq!(scopes.suite, None, "整棵的测试面还是整棵");
+    }
+
+    /// 依赖边按 cargo 说的认：路径优先（改过名的依赖也认得出），名字兜底
+    /// （`-` 与 `_` 两种写法等价），工作区之外的依赖不认。
+    #[test]
+    fn a_dependency_edge_is_read_from_what_cargo_resolved() {
+        let root = Path::new("/work/tree");
+        let members = vec![
+            ("cog-core".to_string(), "crates/cog-core".to_string()),
+            ("cog-github".to_string(), "crates/cog-github".to_string()),
+        ];
+        let by_path: serde_json::Value = serde_json::json!({
+            "name": "renamed-core",
+            "path": "/work/tree/crates/cog-core",
+        });
+        assert_eq!(
+            dependency_target(&by_path, root, &members),
+            Some("cog-core".to_string()),
+            "改过名的路径依赖按路径认，不按名字"
+        );
+        let by_name: serde_json::Value = serde_json::json!({ "name": "cog_github" });
+        assert_eq!(
+            dependency_target(&by_name, root, &members),
+            Some("cog-github".to_string()),
+            "没有路径时按名字认，`-` 与 `_` 折叠"
+        );
+        let outside: serde_json::Value = serde_json::json!({ "name": "serde" });
+        assert_eq!(
+            dependency_target(&outside, root, &members),
+            None,
+            "工作区之外的依赖不是成员，收进 `-p` 会让整条命令跑不起来"
+        );
+    }
+
     /// 判整棵树的那批契约跟着每一条变更跑，lint 面不跟着。
     ///
     /// 这类普查住在装配件的测试套件里，按路径去读别的 crate 的源码；它们与被
@@ -7417,11 +7626,11 @@ index 1111111..2222222 100644
     #[test]
     fn the_tree_is_judged_by_the_assembly_whatever_the_change_edits() {
         let affected = vec!["crates/cog-github/src/landing.rs".to_string()];
-        let scopes = scopes_for(&affected, &members(), Some("cogneva"));
+        let scopes = scopes_for(&affected, &layout(members(), Some("cogneva"), &[]));
         assert_eq!(
             scopes.lint,
             Some(vec!["cog-github".to_string()]),
-            "lint 仍只判改动落在的那个包：别的 crate 里的 lint 不是这个变更写的"
+            "没有依赖边时 lint 只判改动落在的那个包：别的 crate 里的 lint 不是这个变更写的"
         );
         assert_eq!(
             scopes.suite,

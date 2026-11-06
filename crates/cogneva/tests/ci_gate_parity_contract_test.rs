@@ -88,17 +88,37 @@ const PARTLY_ENFORCED: &[(&str, &str, &str)] = &[
     (
         "test",
         "The job's command with its scope word swapped: `--workspace` becomes \
-         one `-p` per package the change touches, and every other argument -- \
-         `--no-fail-fast`, the message format -- is left alone. A change that \
-         only edits files inside workspace members is judged by those packages' \
-         suites before the commit.",
-        "The packages the change did not touch are not compiled or run. A change \
-         to a crate other packages depend on is judged by its own suite, not by \
-         its dependents', and the dependents are judged after it lands -- which \
-         is the one shape where the stage can be green and the job red. A change \
-         to a file outside every member (the root manifest, `deploy/`, a root \
-         document) has no package whose suite would cover it, so that case falls \
-         back to the whole workspace.",
+         one `-p` per package the change touches and per package that depends \
+         on them, transitively -- every dependency kind, dev-dependencies \
+         included, because a dev-dependency links two members for `cargo test` \
+         exactly as a normal edge links them for `cargo check`. Every other \
+         argument -- `--no-fail-fast`, the message format -- is left alone. A \
+         change that only edits files inside workspace members is judged by \
+         those packages' suites, and by the suites of everything they would \
+         break, before the commit.",
+        "What the dependency graph does not carry. A test in a package that \
+         neither was edited nor depends on an edited one does not run -- the \
+         assembly is always added (the tree-wide censuses live there), so what \
+         is left of that is a test that fails on state the graph cannot see: a \
+         database schema, a fixture, a rendered manifest. A change to a file \
+         outside every member (the root manifest, `deploy/`, a root document) \
+         has no package whose suite would cover it, so that case falls back to \
+         the whole workspace. A change wide enough to reach more than six \
+         packages also falls back to the whole workspace, which errs wide \
+         rather than narrow.",
+    ),
+    (
+        "check",
+        "`cargo clippy --workspace --all-targets` over the same package set and \
+         the same targets, and clippy is the compiler with more lints: every \
+         error `cargo check` would report on that set is an error here first.",
+        "The verdict, not the compile. A diagnostic whose span is not a line the \
+         change writes is not attributed to it, so a call site the change broke \
+         compiles red at this stage and is refused by the suite that runs next \
+         rather than by the lint verdict -- the refusal exists, the attribution \
+         does not. Packages with no dependency path from the change are not \
+         compiled, which is the safe direction: nothing the change edits is \
+         reachable from them.",
     ),
     (
         "entry-scripts",
@@ -147,16 +167,6 @@ const PARTLY_ENFORCED: &[(&str, &str, &str)] = &[
 /// that the list reads as a decision, and so that closing one is a one-line
 /// edit rather than an archaeology.
 const NOT_ENFORCED: &[(&str, &str)] = &[
-    (
-        "check",
-        "The stage compiles the packages the change touches, with the same \
-         compiler and the same flags the `test` job uses; `cargo check \
-         --workspace` is the same compile over a wider set. What is not covered \
-         is the wider set, and that is the gap that matters: a change to a \
-         crate's public surface is compiled here, but the packages that depend \
-         on it are not -- so a call site the change broke is found by this job \
-         and not by the stage.",
-    ),
     (
         "clippy",
         "The observed failure of 2026-09-28, answered narrowly rather than \
