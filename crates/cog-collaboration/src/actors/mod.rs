@@ -33,6 +33,7 @@ pub(crate) fn actor_input(
 ) -> serde_json::Value {
     let mut request = request_half(task);
     drop_repeated_goal(&mut request, &context);
+    let context = drop_repeated_input(&request, context);
     with_contract(
         serde_json::json!({
             "task": request,
@@ -40,6 +41,55 @@ pub(crate) fn actor_input(
         }),
         contract,
     )
+}
+
+/// 同一段字在一份请求里出现两次时，只留那份没人能删掉的。
+///
+/// 上下文构建器把整份 `task.input` 抄进了 `context.input`，而它同时又把这些
+/// 字段提到 `context` 顶层：2026-11-06 实测一件自进化任务的生成请求体 152,559
+/// 字节，其中 32,551 字节的 `goal` 与 32,045 字节的 `failure_log` 各出现两次
+/// ——**43% 的请求体是同一段字的第二份**。这不只是多付 token：这份任务输入的
+/// 估算占用 66,368 token，超过了 64,000 的窗口，于是窗口的地板（system 与首条
+/// user）自己就放不下，之后每一条工具结果加进来都被立刻裁掉，模型每一轮收到的
+/// 是同一份请求、看不到自己上一步的任何结果，直到把预算跑光（同一天实测同一个
+/// 请求体被原样发了 1,563 次，一小时零产出）。
+///
+/// 删的是 `context.input` 里那一份，因为另一份在 `context` 顶层或 `task.input`
+/// 里——读的人照旧读得到，模型看到的文字不多不少。只在逐字节相同时删：值不同
+/// 就是两个字段，不是一个字段的两份。
+fn drop_repeated_input(request: &serde_json::Value, mut context: serde_json::Value) -> serde_json::Value {
+    let Some(inner) = context.get("input").and_then(|i| i.as_object()) else {
+        return context;
+    };
+    let mut repeated: Vec<String> = Vec::new();
+    for (key, value) in inner {
+        let elsewhere_in_context = context
+            .get(key)
+            .is_some_and(|top| top == value);
+        let in_request = request
+            .get("input")
+            .and_then(|i| i.get(key))
+            .is_some_and(|top| top == value);
+        if elsewhere_in_context || in_request {
+            repeated.push(key.clone());
+        }
+    }
+    if repeated.is_empty() {
+        return context;
+    }
+    if let Some(inner) = context.get_mut("input").and_then(|i| i.as_object_mut()) {
+        for key in &repeated {
+            inner.remove(key);
+        }
+        // 一条都不剩就不再留一个空壳：`context.input` 在这里是一个值的副本，
+        // 副本被删光了，留个 `{}` 只会让读者以为任务输入本来就是空的。
+        if inner.is_empty() {
+            if let Some(fields) = context.as_object_mut() {
+                fields.remove("input");
+            }
+        }
+    }
+    context
 }
 
 /// 请求半边与上下文半边都写着同一个 goal 时，只留上下文那一份。
@@ -477,6 +527,79 @@ mod tests {
         assert_eq!(
             input["context"]["goal"],
             serde_json::json!("the context's goal")
+        );
+    }
+
+    /// 整份任务输入被抄进上下文时，已经在别处的字段不再抄第二遍。
+    ///
+    /// 判据是「这段字在这份请求里出现几次」，不是「这个字段叫什么」：字段名
+    /// 会随任务的形状变，重复的字节不会。这条用例的题目就是那一件实测任务的
+    /// 形状——`goal` 与 `failure_log` 各 32 KB，两份就是整个请求的 43%。
+    #[test]
+    fn a_context_input_copy_does_not_send_what_the_request_already_sends() {
+        let goal = "修好 EVENT_BUS 指标没有播种的那条用例";
+        let failure_log = "## Test (job 126812962037)\n".repeat(200);
+        let mut task = task_with_goal(goal);
+        task.input["failure_log"] = serde_json::json!(failure_log);
+        task.input["change_id"] = serde_json::json!("change-ledger-1");
+
+        let input = actor_input(
+            &task,
+            serde_json::json!({}),
+            serde_json::json!({
+                "goal": goal,
+                "input": {
+                    "goal": goal,
+                    "failure_log": failure_log,
+                    "change_id": "change-ledger-1",
+                    "only_in_the_context_input": "keep-me",
+                },
+            }),
+        );
+
+        let rendered = input.to_string();
+        assert_eq!(
+            rendered.matches(goal).count(),
+            1,
+            "goal 在请求里出现了不止一次"
+        );
+        assert_eq!(
+            rendered.matches("## Test (job 126812962037)").count(),
+            200,
+            "failure_log 的第二份没有被删掉: {} 份",
+            rendered.matches("## Test (job 126812962037)").count() / 200
+        );
+        // 别处没有的那一份必须原样留着，否则这条规则会删掉模型唯一能读到的值。
+        assert_eq!(
+            input["context"]["input"]["only_in_the_context_input"],
+            serde_json::json!("keep-me"),
+            "上下文输入里唯一的那一份被删了: {}",
+            input["context"]["input"]
+        );
+    }
+
+    /// 两份值不同时不是重复：删任何一份都会改变这次请求的意思。
+    #[test]
+    fn a_context_input_field_that_says_something_else_survives() {
+        let mut task = task_with_goal("请求里的目标");
+        task.input["failure_log"] = serde_json::json!("请求里的日志");
+
+        let input = actor_input(
+            &task,
+            serde_json::json!({}),
+            serde_json::json!({
+                "goal": "请求里的目标",
+                "input": { "failure_log": "上下文里另写的日志" },
+            }),
+        );
+
+        assert_eq!(
+            input["context"]["input"]["failure_log"],
+            serde_json::json!("上下文里另写的日志")
+        );
+        assert_eq!(
+            input["task"]["input"]["failure_log"],
+            serde_json::json!("请求里的日志")
         );
     }
 

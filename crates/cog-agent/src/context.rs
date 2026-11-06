@@ -164,6 +164,17 @@ impl ContextWindow {
         self.current_tokens
     }
 
+    /// 只剩地板（system 与首条 user）却仍然超预算。
+    ///
+    /// 这个状态一旦成立，之后每一条消息加进来都会在同一拍被裁掉：模型每一轮
+    /// 收到的都是同一份请求，工具结果一次也到不了它眼前。它不是「窗口有点紧」，
+    /// 是「这一轮没有记忆」——继续跑只能把预算花在同一道题的同一个答案上。
+    /// 2026-11-06 实测：一件自进化任务的窗口占用 66,368 token、窗口 64,000，
+    /// 同一个 179,595 字节的请求体被原样发了 1,563 次，一小时零产出。
+    pub fn floor_exceeds_budget(&self) -> bool {
+        self.messages.len() <= 2 && self.current_tokens > self.max_tokens
+    }
+
     /// The character budget one tool result may occupy in this window.
     ///
     /// The tool-return path uses it to decide whether a result is oversized
@@ -700,6 +711,35 @@ mod tests {
         assert!(
             over_budget.is_empty(),
             "裁得下来的窗口报了超额：{over_budget:?}"
+        );
+    }
+
+    /// 「这一轮没有记忆」这个状态只有一种成立方式：地板自己就超预算。
+    ///
+    /// 两个方向都要判：地板装得下时**不许**报（否则每一轮都会被当成没记忆
+    /// 而收场），地板放不下时**必须**报（那是唯一能提前收住的地方）。
+    #[test]
+    fn only_a_floor_that_cannot_fit_is_reported_as_unreadable() {
+        let mut fits = ContextWindow::new(200);
+        fits.add_message(Message::system("sys"));
+        fits.add_message(Message::user("任务输入"));
+        fits.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"command": "ls"}),
+        )]));
+        fits.add_message(Message::tool_result_text("c1", "run_command", "ok"));
+        assert!(
+            !fits.floor_exceeds_budget(),
+            "装得下的窗口被报成「没有记忆」：每一轮都会在第一条结果之后收场"
+        );
+
+        let mut blind = ContextWindow::new(10);
+        blind.add_message(Message::system("系统提示词 很长 ".repeat(4)));
+        blind.add_message(Message::user("任务输入 很长 ".repeat(4)));
+        assert!(
+            blind.floor_exceeds_budget(),
+            "地板都放不下的窗口没有报出来，这一轮会一直发同一份请求到预算用光"
         );
     }
 

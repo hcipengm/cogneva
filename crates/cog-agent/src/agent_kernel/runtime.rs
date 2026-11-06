@@ -2389,6 +2389,43 @@ impl AgentRuntime {
                 timestamp: chrono::Utc::now(),
             })
             .await?;
+
+            // 窗口连地板都装不下时，这一轮已经没有记忆可用了：刚跑完的那几条
+            // 结果在同一拍就被裁掉，下一轮模型收到的请求与这一轮逐字节相同，
+            // 它会照着同一份输入再做一次同样的调用。这不是「模型还需要多几轮」
+            // ——多给多少轮都是同一道题、同一个答案。所以在这里收住，用一个
+            // 有名有姓的结局报出去，而不是让它把预算花在一份不会变的请求上。
+            // 2026-11-06 实测：一件自进化任务这样发了 1,563 次同样的请求体、
+            // 跑满一小时、零产出，而它每一次的结局都被读成「预算用完了」。
+            if self.context.floor_exceeds_budget() {
+                self.state = RuntimeState::Complete;
+                tracing::warn!(
+                    agent_id = %self.config.agent_id,
+                    budget = self.config.context_window_size,
+                    estimated = self.context.token_count(),
+                    "the context window cannot hold the task input and one result at once; \
+                     every result is evicted the moment it arrives, so the run ends here \
+                     instead of re-sending an identical request until the budget is spent"
+                );
+                self.note_run_ending(
+                    crate::observable::RunOutcome::Unreadable,
+                    iteration + 1,
+                );
+                self.emit_event(AgentEvent::AgentEnd {
+                    agent_id: self.config.agent_id.clone(),
+                    messages: self.published_messages(),
+                    crew_id: None,
+                    squad_id: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await?;
+                return Ok(serde_json::json!({
+                    "status": cog_core::contract::outcome::CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS,
+                    "budget": self.config.context_window_size,
+                    "estimated": self.context.token_count(),
+                    "iterations": iteration + 1,
+                }));
+            }
         }
 
         // Max iterations reached
@@ -5656,6 +5693,58 @@ mod tests {
             ran.load(std::sync::atomic::Ordering::SeqCst),
             llm.calls.load(std::sync::atomic::Ordering::SeqCst),
         )
+    }
+
+    /// 窗口连地板都装不下时，这一轮必须在第一条结果之后收住。
+    ///
+    /// 这个状态下每条消息进来都在同一拍被裁掉：第二轮发出去的请求与第一轮
+    /// 逐字节相同，模型只会照着同一份输入再做一次同样的调用，而它每一轮都被
+    /// 读成「预算用完了」。实测（2026-11-06，`redrive-change-ledger-f98ddb93…`）
+    /// 同一个 179,595 字节的请求体被原样发了 1,563 次、跑满一小时、零产出。
+    #[tokio::test]
+    async fn a_run_whose_window_cannot_show_it_its_own_results_ends_after_one_turn() {
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(
+            &registry,
+            cog_core::Tool {
+                name: "noop".into(),
+                description: "returns a line of output".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                implementation: cog_core::ToolImplementation::Native(Arc::new(|_args| {
+                    Box::pin(async move { Ok(serde_json::json!({ "stdout": "ok" })) })
+                })),
+            },
+        );
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "floor".into(),
+            role: "floor-exceeds-window-test".into(),
+            max_iterations: 10,
+            // 窗口比任务输入还小：地板自己就放不下。
+            context_window_size: 40,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        let llm = RepeatingCallLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let result = runtime
+            .run(serde_json::json!({ "task": "x".repeat(400) }), &llm)
+            .await
+            .expect("窗口装不下是这一轮自己的结局，不是一次工具失败");
+
+        assert_eq!(
+            result["status"],
+            cog_core::contract::outcome::CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS,
+            "结局必须自报是窗口装不下，而不是笼统的「预算用完了」: {result}"
+        );
+        assert_eq!(
+            llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "第二轮请求与第一轮逐字节相同，再发一次只会买回同一个答案"
+        );
     }
 
     /// The zero-token policy, kept for roles where any refusal is fatal: the

@@ -1,7 +1,8 @@
 use cog_core::contract::llm::UpstreamFailure;
 use cog_core::contract::outcome::{
-    a_refusal_clears_on_its_own, EMPTY_GENERATION_PREFIX, ITERATION_BUDGET_EXHAUSTED_MARKER,
-    MAX_ITERATIONS_STATUS, TERMINAL_ENV_FAILURE_PREFIX, UPSTREAM_UNAVAILABLE_PREFIX,
+    a_refusal_clears_on_its_own, CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS, EMPTY_GENERATION_PREFIX,
+    ITERATION_BUDGET_EXHAUSTED_MARKER, MAX_ITERATIONS_STATUS, TERMINAL_ENV_FAILURE_PREFIX,
+    UPSTREAM_UNAVAILABLE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +83,9 @@ fn names_a_deterministic_cause(text: &str) -> bool {
     // 不报错，判据就一直返回「没写原因」——与「这一跑没有原因」同形。
     t.contains(cog_core::contract::outcome::ENVIRONMENT_ERROR_PREFIX)
         || t.contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
+        // 窗口装不下任务输入时，模型每一轮收到的都是同一份请求：那一轮的产出
+        // 与「预算花光」一样不是交付物，而它连原因都不会自己写出来。
+        || t.contains(CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS)
 }
 
 /// The wire declaration an in-band cause is published under.
@@ -103,6 +107,14 @@ fn declaration_for_cause(text: &str) -> &'static str {
     if text
         .to_ascii_lowercase()
         .contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
+    {
+        return TERMINAL_ENV_FAILURE_PREFIX;
+    }
+    // 同一个输入、同一个窗口，重来一次只会把同一份请求再发一遍，所以它和
+    // 「预算花光」一样是终止性的——但它终止的理由不是「还需要更多轮」。
+    if text
+        .to_ascii_lowercase()
+        .contains(CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS)
     {
         return TERMINAL_ENV_FAILURE_PREFIX;
     }
@@ -161,6 +173,25 @@ pub fn iteration_budget_exhausted_reason(value: &serde_json::Value) -> Option<St
         "{ITERATION_BUDGET_EXHAUSTED_MARKER}: the agent loop used its whole iteration budget \
          while tool calls were still pending (max_iterations={iterations}, \
          pending_tool_calls={pending}); {asked}; it stopped mid-exploration and wrote no deliverable"
+    ))
+}
+
+/// 窗口连地板都装不下时这一轮的结局，渲染成链上读的那句原因。`None` 是正常结果。
+///
+/// 与「预算花光」分开写：那一个说的是「这一轮还需要更多轮」，处置是抬预算；
+/// 这一个说的是「这个输入在这个窗口里读不出任何结果」，处置是改输入的大小
+/// 或改窗口，抬多少轮都不会变。合成一句话就是让读的人再也分不出这两种。
+pub fn context_floor_reason(value: &serde_json::Value) -> Option<String> {
+    if value.get("status").and_then(|v| v.as_str()) != Some(CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS) {
+        return None;
+    }
+    let budget = value.get("budget").and_then(|v| v.as_u64()).unwrap_or(0);
+    let estimated = value.get("estimated").and_then(|v| v.as_u64()).unwrap_or(0);
+    Some(format!(
+        "{TERMINAL_ENV_FAILURE_PREFIX}: {CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS}: the task input alone \
+         occupies an estimated {estimated} tokens against a {budget}-token context window, so every \
+         tool result is evicted the moment it arrives and every turn re-sends the identical request; \
+         this attempt read nothing and wrote nothing"
     ))
 }
 
@@ -1283,6 +1314,41 @@ mod tests {
             reason,
             empty_envelope_reason(),
             "a budget exhaustion is not a generator that chose to produce nothing"
+        );
+    }
+
+    /// 窗口装不下任务输入时那一轮读不到任何东西，它也不该被读成「这个角色
+    /// 看过目标、觉得没什么可做」。
+    ///
+    /// 与上一条分开判：两者的处置相反。预算花光要抬预算，窗口装不下要改输入
+    /// 或改窗口——把后者也写成「预算花光」，读的人会去抬一个抬多少都没用的数。
+    #[test]
+    fn a_window_that_cannot_hold_the_input_names_the_window_not_the_budget() {
+        let sentinel = serde_json::json!({
+            "status": CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS,
+            "budget": 64000,
+            "estimated": 66368,
+            "iterations": 1
+        });
+        let output = crate::squad::pge::roundtable::parse_generator_output(&sentinel);
+        let reason = output
+            .terminal_env_failure_reason()
+            .expect("同一个输入配同一个窗口，重来一次是同一条死路: not retryable");
+        assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
+        assert!(
+            reason.contains("66368") && reason.contains("64000"),
+            "the reason must carry the observed numbers, got: {reason}"
+        );
+        assert!(
+            !reason.contains(ITERATION_BUDGET_EXHAUSTED_MARKER),
+            "窗口装不下不是「还需要更多轮」: {reason}"
+        );
+
+        let plan = crate::squad::pge::roundtable::parse_planner_output(&sentinel, "修好它");
+        assert!(
+            plan.plan.as_str().is_some_and(|text| text.contains("context_floor")),
+            "计划这一侧也一样：空计划是合法计划，不说原因就读成「看过、没什么可做」: {}",
+            plan.plan
         );
     }
 

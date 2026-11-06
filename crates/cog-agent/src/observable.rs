@@ -265,6 +265,11 @@ pub enum RunOutcome {
     DeliveredAfterExhaustion,
     /// The iteration budget ran out before an answer was written.
     BudgetExhausted,
+    /// 这一轮的窗口连自己上一步的结果都装不下：地板（system 与首条 user）
+    /// 本身就超预算，于是每条结果进来都在同一拍被裁掉，模型每一轮收到的是
+    /// 同一份请求。与 [`Self::BudgetExhausted`] 分开计：那一个说「再给几轮就行」，
+    /// 这一个说「给多少轮都一样」——要改的是任务输入的大小或窗口预算。
+    Unreadable,
     /// A guardrail rule refused a tool call and the run's refusal allowance was
     /// spent, so the run stopped without an answer.
     ///

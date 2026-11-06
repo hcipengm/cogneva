@@ -144,6 +144,15 @@ pub fn environment_error_content(err: impl std::fmt::Display) -> String {
 /// compiling after a wording change and silently stop matching.
 pub const ITERATION_BUDGET_EXHAUSTED_MARKER: &str = "iteration_budget_exhausted";
 
+/// 那一轮的上下文窗口连地板（system 与首条 user）都装不下时的结局字串。
+///
+/// 与 [`ITERATION_BUDGET_EXHAUSTED_MARKER`] 分开：那一个说「再给几轮就行」，
+/// 这一个说「给多少轮都一样」——每条结果进来都在同一拍被裁掉，下一轮发出去的
+/// 请求与这一轮逐字节相同。处置也相反：前者抬预算，后者改输入的大小或改窗口。
+/// 生产者（agent 的循环）与读者（协作侧的解析）是不同的 crate，所以这个字串
+/// 和其它线标一起放在这里，免得两边各拼一份、改一处之后静默不匹配。
+pub const CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS: &str = "context_floor_exceeds_window";
+
 /// Prefix marking a run whose cause is an upstream refusal the environment can
 /// clear on its own — a rate limit, a server error, a broken transport.
 ///
