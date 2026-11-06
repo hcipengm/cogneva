@@ -1389,6 +1389,25 @@ impl StateBackend for PostgresStateBackend {
             task_id: task_id.into(),
             reason: "Task not found".into(),
         })?;
+
+        // 已经被取消的一行不再判一次：取消是别人（部署器 / 上游级联）对这一行做出的
+        // 决定，而这次失败只是那之后执行侧交回来的结局。
+        //
+        // 2026-11-06 实测：13 轮 `ci-red-*-fix` 全部以 `terminal_env_failure: … no
+        // handle …` 结束，而它们其实是被部署器按「版本已经走过」主动取消的——取消先
+        // 写 Cancelled 与理由，执行侧随后用「没留下 handle」把状态和理由一起覆盖掉。
+        // 于是每一次「有意取消」都被记成一次环境故障，还被抄进下一轮的题面当证据。
+        // 结局不能改写别人的决定：先取消的赢。
+        if task.status == cog_core::TaskStatus::Cancelled {
+            tracing::info!(
+                task_id = %task_id,
+                reported = %error,
+                kept = ?task.error,
+                "a failure arrived for a cancelled task; keeping the cancellation"
+            );
+            return Ok((false, Vec::new()));
+        }
+
         task.error = Some(error.clone());
         task.error_cause = cause;
         task.updated_at = Utc::now();

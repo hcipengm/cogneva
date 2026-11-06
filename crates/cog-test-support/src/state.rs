@@ -475,6 +475,14 @@ impl StateBackend for MemoryStateBackend {
             task_id: task_id.into(),
             reason: "Task not found".into(),
         })?;
+
+        // 已经被取消的一行不再判一次。这一份是 `cog-storage` 里两份
+        // `dag_fail_task` 的夹具副本，必须与它们同一条规矩——否则编排层的用例在
+        // 夹具上绿、在真后端上红，而红的那一侧正是生产走的那条路。
+        if task.status == cog_core::TaskStatus::Cancelled {
+            return Ok((false, Vec::new()));
+        }
+
         task.error = Some(error.clone());
         task.error_cause = cause;
         task.updated_at = chrono::Utc::now();

@@ -1754,6 +1754,18 @@ impl DagExecutor {
     ) -> SFResult<(bool, Vec<String>, bool)> {
         let be = self.fg().expect("store mode");
         let task = self.store_task(task_id).await?;
+
+        // 已经取消的一行不再判一次，连账都不记：重试历史与熔断计数是给一条还在
+        // 进行中的单子记的，而这一行已经被人有意停掉了。2026-11-06 实测，被部署器
+        // 取消的修复行每一轮都往这两本账上记一笔「失败」，熔断器读到的是一次次
+        // 环境故障，修复回路读到的是一次次「试过了没成」。
+        //
+        // 真正拦得住的那一道在 `dag_fail_task` 里（原子、在 workspace 锁下）：这里的
+        // 读与写入之间状态还会变，所以它只是先把这两笔账省下来，不是判据本身。
+        if task.status == TaskStatus::Cancelled {
+            return Ok((false, Vec::new(), false));
+        }
+
         if let Some(ref reg) = self.circuit_registry {
             reg.record_failure(&task.task_type)?;
         }
@@ -3100,6 +3112,18 @@ impl DagExecutor {
         }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
+
+        // 已经被取消的一行不再判一次。取消是别人（部署器 / 上游级联）对这一行做出
+        // 的决定，执行侧随后交回来的结局不能把它覆盖成「环境故障」——这份守卫与
+        // `cog-storage` 里两份 `dag_fail_task` 同源，理由见那里的注释。
+        if inner
+            .tasks
+            .get(task_id)
+            .is_some_and(|t| t.status == TaskStatus::Cancelled)
+        {
+            return Ok((false, Vec::new(), false));
+        }
+
         let (task_type, retry_count) = {
             let task =
                 inner
@@ -6187,6 +6211,85 @@ mod tests {
             dag.get_task(&other_id).await.unwrap().status,
             TaskStatus::Failed
         );
+    }
+
+    /// 取消是别人对这一行做出的决定，执行侧随后交回来的结局不能把它改写回去。
+    ///
+    /// 2026-11-06 实测：部署器按「这一版已经被后一版走过」把修复行主动取消，执行
+    /// 侧紧接着交回「没留下 handle，说不清为什么结束」——取消的状态与理由被一起
+    /// 覆盖成一次环境故障，于是 13 轮修复全都以「环境故障」收尾，还进了下一轮的
+    /// 题面当证据。这里判的是两条路径上的同一件事：先取消的赢。
+    #[tokio::test]
+    async fn a_failure_arriving_after_a_cancellation_keeps_the_cancellation() {
+        const REASON: &str = "the revision this fix was for has been walked past; the fix is stale";
+
+        for stored in [false, true] {
+            let backend: Arc<dyn StateBackend> =
+                Arc::new(cog_test_support::MemoryStateBackend::new());
+            let workspace = format!("ws-cancel-{stored}");
+            let dag = if stored {
+                DagExecutor::new(workspace.clone()).with_state_backend(backend.clone())
+            } else {
+                DagExecutor::new(workspace.clone())
+            };
+            let task = Task::new("t-cancel", TaskType::DagNode, serde_json::json!({}));
+            let task_id = task.id.clone();
+            dag.add_task(task).await.unwrap();
+            dag.schedule_task(&task_id).await.unwrap();
+            dag.cancel_task_with_reason(&task_id, REASON.into())
+                .await
+                .unwrap();
+
+            let (retried, cancelled, _) = dag
+                .fail_task_after(
+                    &task_id,
+                    "Task ended without answering, and no handle was left to say why".into(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                !retried,
+                "取消掉的一行被记成了「会重试」的下一次（stored={stored}）"
+            );
+            assert!(
+                cancelled.is_empty(),
+                "取消掉的一行被判死后又级联取消了下游（stored={stored}）: {cancelled:?}"
+            );
+            let after = dag.get_task(&task_id).await.unwrap();
+            assert_eq!(
+                after.status,
+                TaskStatus::Cancelled,
+                "取消被执行交回来的结局改写成了 {:?}（stored={stored}）",
+                after.status
+            );
+            assert_eq!(
+                after.error.as_deref(),
+                Some(REASON),
+                "取消的理由被执行的结局覆盖了（stored={stored}）"
+            );
+
+            // 编排层这一道是「先省下两笔账」，真正的判据在后面那道后端调用里：调用
+            // 方拿到的快照可能已经过期，状态是在 workspace 锁下读的。所以直接问一次
+            // 后端，判它自己也守着同一条规矩。
+            if stored {
+                let (retried, cancelled) = backend
+                    .dag_fail_task(
+                        &workspace,
+                        &task_id,
+                        "Task ended without answering, and no handle was left to say why".into(),
+                        None,
+                        3,
+                        std::time::Duration::ZERO,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!retried, "后端自己把一条已取消的行打回了重试");
+                assert!(cancelled.is_empty());
+            }
+        }
     }
 
     /// 上游说了要等多久时，重试时刻由它说了算——只要它说的比策略更久。
