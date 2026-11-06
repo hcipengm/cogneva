@@ -1140,10 +1140,16 @@ impl WorkdirRouter {
         if trees.len() + incoming <= max {
             return;
         }
+        // Two lanes, and the eviction order is per lane: a task tree pays
+        // before a standing shell does. See [`is_standing_lane`] for why the
+        // LRU premise does not hold for the second one.
         trees.sort_by_key(|(id, _)| {
-            self.read_meta(id.as_str())
-                .map(|m| m.last_used_unix)
-                .unwrap_or(i64::MIN)
+            (
+                is_standing_lane(id),
+                self.read_meta(id.as_str())
+                    .map(|m| m.last_used_unix)
+                    .unwrap_or(i64::MIN),
+            )
         });
         let mut remaining = trees.len() + incoming;
         let mut deferred = 0u64;
@@ -1995,6 +2001,29 @@ pub(crate) fn validate_task_id(id: &str) -> SFResult<()> {
     }
 }
 
+/// The prefix `cog-agent` gives the task id of a call that carries no task
+/// scope: one workspace per calling agent, named after that agent. Kept in
+/// step with `sandbox_task_id` in `crates/cog-agent/src/tools.rs`; the two
+/// crates do not depend on each other, so the spelling is shared by this
+/// comment rather than by an import.
+const STANDING_SHELL_PREFIX: &str = "unscoped-shell-";
+
+/// Whether a task id names a standing agent's shell rather than one round of
+/// task work.
+///
+/// The cap evicts by least-recently-used, and that rule rests on an assumption:
+/// a tree nobody touched recently is a tree nobody will ask for again. It holds
+/// for a task tree, whose id is spent by the round that created it, and it
+/// fails for a conversation shell, whose id is the calling agent's own name and
+/// is handed back verbatim on the next turn. Measured on the deployed chat lane
+/// (2026-11-06): a squad pipeline creating a tree roughly every minute churned
+/// an eight-slot pool, `unscoped-shell-vera-82191e4a` was reclaimed 144 s after
+/// the turn that used it, and the files written in that turn went with it --
+/// the next turn was routed to a fresh checkout and could not see its own work.
+fn is_standing_lane(task_id: &str) -> bool {
+    task_id.starts_with(STANDING_SHELL_PREFIX)
+}
+
 fn unix_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -2707,6 +2736,53 @@ pub(crate) mod tests {
             1.0,
             "a finished command leaves nothing to defer"
         );
+    }
+
+    /// A conversation shell is named after the agent and comes back on the next
+    /// turn; a task tree is named after one round and never comes back. Under a
+    /// plain LRU the older shell loses every time a pipeline round needs a
+    /// slot, and the user's files lose with it.
+    #[tokio::test]
+    async fn a_standing_shell_outlives_the_task_trees_that_share_its_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK);
+        // The shell is the oldest tree on the volume, so plain LRU takes it.
+        r.route("unscoped-shell-vera-82191e4a").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        r.route("round-a").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        r.route("round-b").await.unwrap();
+
+        let ids: Vec<String> = r
+            .list_task_trees()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            ids.contains(&"unscoped-shell-vera-82191e4a".to_string()),
+            "a conversation must keep the tree its files are in: {ids:?}"
+        );
+        assert!(ids.contains(&"round-b".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"round-a".to_string()), "{ids:?}");
+
+        // The standing lane is a priority, not an exemption: with nothing else
+        // left to reclaim, the cap still holds.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let bare2 = seed_bare(tmp2.path());
+        let r = router(tmp2.path(), &bare2, 1, DEFAULT_TTL_SECS_FALLBACK);
+        r.route("unscoped-shell-old").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        r.route("unscoped-shell-new").await.unwrap();
+        let ids: Vec<String> = r
+            .list_task_trees()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec!["unscoped-shell-new".to_string()]);
+        assert_eq!(r.metrics.cap_deferred.get(), 0.0);
     }
 
     /// A registration a killed add left locked is invisible to both halves of
