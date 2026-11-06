@@ -1460,6 +1460,19 @@ impl cog_core::ChangeSink for MainChannel {
             );
             return Ok(format!("staged:{}", path.display()));
         }
+        // 收进来的这一份，落地时会按 `check_policy` 拒掉的话，就在这里拒：记录
+        // 一旦写下，验证循环会把它整棵验一遍、提交、release 构建，到落地才按同一
+        // 个数拒掉——一次 733 行的变更就这样占掉了那把唯一的构建槽 269 秒，而生成
+        // 侧拿到的话是"落地被拒"，收窄不了任何东西。被拒的这一份不写记录，所以它
+        // 也不会在下一轮原样回来。
+        let changed_lines = count_changed_lines(&change.content);
+        let cap = self.config.landing_policy.max_changed_lines;
+        if changed_lines > cap {
+            return Err(cog_core::SFError::Validation(format!(
+                "change {} touches {changed_lines} lines, over the {cap}-line cap; narrow the scope and resubmit",
+                change.change_id
+            )));
+        }
         cog_core::ChangeLanding::record_unverified(self, &change).await?;
         Ok(format!("unverified:{}", change.change_id))
     }
@@ -4042,6 +4055,55 @@ mod tests {
 
         remove_record("chg-1").await;
         assert!(load_records().await.is_empty());
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 落地会按上限拒掉的那一份，不许先进记录。
+    ///
+    /// 记录一写下，验证循环就把它整棵验一遍、提交、release 构建，到落地才按
+    /// 同一个上限拒掉——2026-11-06 一条 733 行的变更就是这样占掉那把唯一的构建槽
+    /// 269 秒，而生成侧读到的是"落地被拒"，收窄不了任何东西。
+    ///
+    /// 两条界线各验一边：超上限的被拒且不写记录，正好用满的照写。少验一边，
+    /// 判据写成 `>=` 或写成"一律拒"都会绿。
+    #[tokio::test]
+    async fn a_change_over_the_landing_cap_is_refused_before_a_record_is_written() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let chan = channel(crate::config::LandingPolicy {
+            max_changed_lines: 1,
+            ..Default::default()
+        });
+
+        let over = change(
+            "chg-over",
+            &diff_touching(&["crates/cog-github/src/lib.rs"]),
+        );
+        assert_eq!(
+            count_changed_lines(&over.content),
+            2,
+            "样本要真的超过上限，否则下面拒的理由什么都证明不了"
+        );
+        let said = cog_core::ChangeSink::submit_change(&chan, over)
+            .await
+            .expect_err("超上限的变更不许进记录")
+            .to_string();
+        assert!(
+            said.contains('2') && said.contains('1'),
+            "理由要把两个数都说出来，生成侧才知道差多少：{said}"
+        );
+
+        let exact = change("chg-exact", "--- a/x\n+++ b/x\n@@ -1 +1 @@\n+one line\n");
+        cog_core::ChangeSink::submit_change(&chan, exact)
+            .await
+            .expect("正好用满上限的变更照收");
+
+        let records = load_records().await;
+        assert_eq!(records.len(), 1, "只有用满上限的那一份进了记录");
+        assert_eq!(records[0].change.change_id, "chg-exact");
 
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
