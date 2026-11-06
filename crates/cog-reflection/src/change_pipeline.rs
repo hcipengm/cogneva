@@ -3403,7 +3403,11 @@ impl ChangePipeline {
         if !gates.failed.is_empty() {
             // Same baseline reading as the full path: a gate that is red on this
             // revision without the change is the tree's, not this change's.
-            let red: Vec<String> = gates.failed.iter().map(|(script, _)| script.clone()).collect();
+            let red: Vec<String> = gates
+                .failed
+                .iter()
+                .map(|(script, _)| script.clone())
+                .collect();
             let already = self
                 .gates_beyond_baseline(workdir, &change.content, &gates.failed)
                 .await?;
@@ -9012,10 +9016,7 @@ index 1111111..2222222 100644\n\
         ]));
         assert_eq!(
             family,
-            vec![
-                "web/src/App.tsx",
-                "web/src/observability/SpendLedger.tsx"
-            ],
+            vec!["web/src/App.tsx", "web/src/observability/SpendLedger.tsx"],
             "只有真正落在 web/src/ 下的路径属于这一族"
         );
     }
@@ -9032,7 +9033,10 @@ index 1111111..2222222 100644\n\
             .unwrap()
             .expect("a family with no executable condition has to be refused");
 
-        assert!(reason.contains("web/src/App.tsx"), "拒收要点名是哪一族：{reason}");
+        assert!(
+            reason.contains("web/src/App.tsx"),
+            "拒收要点名是哪一族：{reason}"
+        );
         assert!(
             reason.contains("web_admission"),
             "拒收要说清楚下一个动作是改哪份声明：{reason}"
@@ -9072,16 +9076,18 @@ index 1111111..2222222 100644\n\
             .await
             .unwrap()
             .expect("a failing command is a refusal");
-        assert!(reason.contains("false"), "拒收要点名是哪条命令没过：{reason}");
+        assert!(
+            reason.contains("false"),
+            "拒收要点名是哪条命令没过：{reason}"
+        );
     }
 
     /// 一条空 argv 的声明不是条件：它会让每一笔变更都「声明过条件」地过闸。
     #[tokio::test]
     async fn an_empty_web_declaration_is_not_a_condition() {
         let root = tempfile::tempdir().unwrap();
-        let pipeline = ChangePipeline::new(root.path(), root.path(), false).with_web_admission(
-            Some(cog_core::WebAdmissionConfig { commands: vec![] }),
-        );
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false)
+            .with_web_admission(Some(cog_core::WebAdmissionConfig { commands: vec![] }));
         assert!(
             pipeline
                 .web_admission_reason(root.path(), &["web/src/App.tsx".to_string()])
@@ -9107,12 +9113,9 @@ index 1111111..2222222 100644\n\
         tokio::fs::create_dir_all(root.path().join("web/src"))
             .await
             .unwrap();
-        tokio::fs::write(
-            root.path().join("web/src/App.tsx"),
-            "export const a = 1;\n",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(root.path().join("web/src/App.tsx"), "export const a = 1;\n")
+            .await
+            .unwrap();
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
@@ -9159,7 +9162,10 @@ index 1111111..2222222 100644\n\
         let root = tempfile::tempdir().unwrap();
         let pipeline = ChangePipeline::new(root.path(), root.path(), false);
         assert_eq!(
-            pipeline.web_admission_reason(root.path(), &[]).await.unwrap(),
+            pipeline
+                .web_admission_reason(root.path(), &[])
+                .await
+                .unwrap(),
             None
         );
         assert!(ChangePipeline::web_targets(&targets(&["crates/x/src/lib.rs"])).is_empty());

@@ -1050,14 +1050,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             .with_switch(promotion_switch.clone())
                             // 与流水线、执行世界读同一份声明：晋级器判的族必须
                             // 是沙盒真能跑出条件的那几族。
-                            .with_verifiable_families(
-                                crate::promotion_gate::VerifiableFamilies {
-                                    web: self_evolution
-                                        .web_admission
-                                        .as_ref()
-                                        .is_some_and(|c| c.is_executable()),
-                                },
-                            )
+                            .with_verifiable_families(crate::promotion_gate::VerifiableFamilies {
+                                web: self_evolution
+                                    .web_admission
+                                    .as_ref()
+                                    .is_some_and(|c| c.is_executable()),
+                            })
                             .with_eval_slot(self.promotion_eval_slot.clone()),
                         )
                     });

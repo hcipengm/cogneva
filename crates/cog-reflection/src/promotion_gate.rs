@@ -590,11 +590,7 @@ mod tests {
     /// deployment can run, so they judge a deployment whose every family is
     /// verifiable. The tests that *are* about a missing condition call
     /// `super::classify` with the narrower [`VerifiableFamilies`] directly.
-    fn classify(
-        files: &[String],
-        diff_lines: usize,
-        policy: &PromotionGateConfig,
-    ) -> GateVerdict {
+    fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfig) -> GateVerdict {
         super::classify(files, diff_lines, policy, &VerifiableFamilies { web: true })
     }
 
@@ -858,7 +854,11 @@ mod tests {
     /// 「前端构建能过」判得了的东西。
     #[test]
     fn a_web_build_manifest_is_not_the_web_family() {
-        for path in ["web/package.json", "web/package-lock.json", "web/vite.config.ts"] {
+        for path in [
+            "web/package.json",
+            "web/package-lock.json",
+            "web/vite.config.ts",
+        ] {
             let v = classify(&files(&[path]), 10, &policy());
             assert!(matches!(v, GateVerdict::Reject { .. }), "{path}: {v:?}");
         }
@@ -868,11 +868,7 @@ mod tests {
     /// 那一档处理，而不是让 web 那一格顺手把它带过去。
     #[test]
     fn web_src_beside_another_family_is_not_the_web_family() {
-        let v = classify(
-            &files(&["web/src/App.tsx", "docs/note.md"]),
-            100,
-            &policy(),
-        );
+        let v = classify(&files(&["web/src/App.tsx", "docs/note.md"]), 100, &policy());
         assert!(matches!(v, GateVerdict::Reject { .. }), "{v:?}");
     }
 
