@@ -174,10 +174,18 @@ impl ContentFilter {
             // when they name the thing being described.
             r"(?i)\b(?:(?:explicit|graphic|nsfw)\s+(?:content|material|images?|scenes?|language|violence)|mature content|adult material)\b".into(),
             r"(?i)\b(nudity|intercourse|genital|erotic|obscene)\b".into(),
-            // Violence
-            r"(?i)\b(kill|murder|suicide|bomb|terrorist|attack|assassinate)\b".into(),
+            // Violence — 判「动词加什么宾语」，不判「出现过哪个动词」。
+            // `kill` 是这棵树里结束进程的说法（`kill -9`、`kill the process
+            // group`、`SIGKILL`），`attack` 是安全工程的名词（`attack surface`、
+            // `replay attack`）：当裸词拦，每一段讲后台任务、超时、网关的文字都
+            // 会被判成暴力（实测 2026-11-07 05:01–05:06：三条讲 `read_file` 配
+            // `run_command_background` 的能力发现任务判死于 `Violence content
+            // detected`，它们的回执里没有一个字在讲人）。所以这几个动词只在宾语
+            // 是人的时候算证据；不带宾语就足够有害的那几个词（自杀、恐怖、暗杀、
+            // 人群枪击、安放爆炸物）单独成一支，形状自己就说明了对象。
+            r"(?i)(?:\b(?:kill|murder|assassinate|attack|strangle|shoot|stab)(?:s|ed|ing)?\s+(?:the\s+|a\s+|an\s+|my\s+|his\s+|her\s+|their\s+)?(?:me|you|him|her|them|us|people|someone|somebody|everybody|everyone|anybody|children|civilians?|crowd|women|men|family)\b|\b(?:suicide|terrorist|terrorism|assassination|mass\s+shooting)\b|\b(?:plant|detonate|set\s+off)\w*\s+(?:a\s+|the\s+)?(?:bomb|explosive)\b)".into(),
             r"(?i)\b(torture|maim|slaughter|massacre|genocide|lynch)\b".into(),
-            r"(?i)\b(shoot|stab|strangle|drown|burn alive)\b".into(),
+            r"(?i)\b(drown|burn alive)\b".into(),
             // Hate speech
             r"(?i)\b(racist|nazi|supremacist|slur|hate|xenophobic|antisemitic)\b".into(),
             r"(?i)\b(holocaust denial|race war|ethnic cleansing|inferior race)\b".into(),
