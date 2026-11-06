@@ -232,4 +232,74 @@ pub(crate) mod tests {
         assert_ne!(worker_name(0).id, name.id);
         clear_env();
     }
+
+    /// principle: feedback_id_may_be_a_content_fingerprint
+    ///
+    /// `AgentName::id` 尾巴上那 8 位 hex 是 (seed, group, slot) 的哈希，是内容的
+    /// 纯函数：它只能回答"内容有没有变"，不能回答"是不是同一个东西"。把 Pod 名
+    /// 折进哈希材料，是用内容哈希去回答实例问题；实例层面的判断属于 `stable`
+    /// 与 `agent_instance()`，不属于这串 hex。
+    #[test]
+    fn the_hex_tail_is_a_content_fingerprint_not_an_instance_id() {
+        let _guard = env_lock();
+        clear_env();
+        std::env::set_var(
+            ENV_FINGERPRINT,
+            "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
+        );
+        std::env::set_var(ENV_GROUP, "main");
+
+        // 题目在场：指纹真在这串 id 的尾巴上，纯函数才有东西可判。
+        let one = worker_name(0);
+        assert!(one.id.ends_with(&format!("-{}", one.short)));
+        assert_eq!(one.short.len(), 8);
+        assert!(one
+            .short
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // 内容没变，指纹就没变：同三项两次调用得到同一个名字。
+        assert_eq!(name_for("seed-a", "main", 0), name_for("seed-a", "main", 0));
+
+        // 内容变了，指纹跟着变：三项里任一项动了，id 就不同。
+        assert_ne!(
+            name_for("seed-a", "main", 0).id,
+            name_for("seed-b", "main", 0).id
+        );
+        assert_ne!(
+            name_for("seed-a", "main", 0).id,
+            name_for("seed-a", "evolution", 0).id
+        );
+        assert_ne!(
+            name_for("seed-a", "main", 0).id,
+            name_for("seed-a", "main", 1).id
+        );
+
+        // 是不是同一个东西，哈希回答不了：滚动换 Pod 是换进程，不是换员工。
+        std::env::set_var(cog_core::env::POD_NAME, "cogneva-worker-aaa-0");
+        let before = worker_name(0);
+        std::env::set_var(cog_core::env::POD_NAME, "cogneva-worker-bbb-0");
+        let after = worker_name(0);
+
+        assert_eq!(before.id, after.id);
+        assert_eq!(agent_instance(), "cogneva-worker-bbb-0");
+
+        // 另一半：没有指纹时 id 随 Pod 变而 stable 为 false —— 同一串 hex 在两个
+        // Pod 下既是同一个名字又是两个名字，区别只由 stable 与 agent_instance()
+        // 说出。
+        clear_env();
+        std::env::set_var(cog_core::env::POD_NAME, "cogneva-worker-ccc-0");
+        let ephemeral_a = worker_name(0);
+        let instance_a = agent_instance();
+        std::env::set_var(cog_core::env::POD_NAME, "cogneva-worker-ddd-0");
+        let ephemeral_b = worker_name(0);
+        let instance_b = agent_instance();
+
+        assert!(!ephemeral_a.stable);
+        assert!(!ephemeral_b.stable);
+        assert_ne!(ephemeral_a.id, ephemeral_b.id);
+        assert_ne!(instance_a, instance_b);
+
+        clear_env();
+    }
 }
