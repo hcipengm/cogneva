@@ -38,6 +38,30 @@ struct BuildReport {
     peak_rss_bytes: Option<u64>,
 }
 
+/// The environment this deployer's `cargo build --release` runs under.
+///
+/// Apart rather from the command because the two share one `CARGO_TARGET_DIR`
+/// and the shell they inherit is not the same: `CARGO_HOME` decides which copy
+/// of a registry crate a build sees, and cargo keys a registry package by the
+/// directory it was read from, so the same crate out of two cargo homes is two
+/// packages and neither build can reuse what the other wrote into the shared
+/// target. Measured on this host: the mainline deployer built from
+/// `/opt/cogneva/sandbox/cargo-home` while this one built from the image's
+/// `/usr/local/cargo`, so every switch between them recompiled registry crates
+/// that had already been compiled. Kept as data so a test can read it without
+/// starting a build.
+fn release_build_env(target_dir: Option<&Path>) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut env: Vec<(&'static str, std::ffi::OsString)> = Vec::new();
+    if let Some(target) = target_dir {
+        env.push(("CARGO_TARGET_DIR", target.as_os_str().to_owned()));
+    }
+    env.push((
+        "CARGO_HOME",
+        std::ffi::OsString::from(crate::mainline_deployer::CARGO_HOME_PVC),
+    ));
+    env
+}
+
 /// Deployer that turns tested source changes into a staged release binary.
 #[derive(Debug, Clone)]
 pub struct EvolutionDeployer {
@@ -361,8 +385,10 @@ impl EvolutionDeployer {
         cmd.args(["build", "--release", "--bin", &self.binary_name])
             .current_dir(workdir)
             .kill_on_drop(true);
-        if let Some(target) = &self.target_dir {
-            cmd.env("CARGO_TARGET_DIR", target);
+        // 谁先跑，谁负责把镜像里的 sparse 镜像配置带进这个 cargo home。
+        crate::mainline_deployer::ensure_cargo_home_mirror_config().await;
+        for (name, value) in release_build_env(self.target_dir.as_deref()) {
+            cmd.env(name, value);
         }
         let started = Instant::now();
         let budget_secs = self.build_budget_secs();
@@ -652,6 +678,33 @@ mod tests {
             named,
             vec!["change-ledger-367c97da26b1a416-3f9a2b1c"],
             "the change ledger finds a delivery only through this trailer: {message}"
+        );
+    }
+
+    /// 两个写同一个 `CARGO_TARGET_DIR` 的构建器必须用同一个 `CARGO_HOME`。
+    ///
+    /// cargo 按来源目录给注册表包编身份：同一个 crate 从两个 cargo home 取来就是
+    /// 两个包，谁也不认谁在共享 target 里的产物。实测两条路分别是
+    /// `/opt/cogneva/sandbox/cargo-home` 与镜像里的 `/usr/local/cargo`，于是每次
+    /// 轮到进化这一侧，aws-lc-sys、cranelift_codegen 这些早就编过的 crate 又重编
+    /// 一遍——共享 target 名存实亡，而那一次构建占的是唯一那把构建槽。
+    #[test]
+    fn the_release_build_uses_the_cargo_home_the_mainline_builder_uses() {
+        let env = release_build_env(Some(Path::new("/shared/target")));
+        let home = env
+            .iter()
+            .find(|(name, _)| *name == "CARGO_HOME")
+            .map(|(_, value)| value.clone())
+            .expect("release 构建必须钉住 CARGO_HOME，否则它继承的是镜像那个");
+        assert_eq!(
+            home,
+            std::ffi::OsString::from(crate::mainline_deployer::CARGO_HOME_PVC),
+            "两个构建器各用一个 cargo home，共享 target 里就各有一份同一个 crate"
+        );
+        assert!(
+            env.iter().any(|(name, value)| *name == "CARGO_TARGET_DIR"
+                && value == std::ffi::OsStr::new("/shared/target")),
+            "共享 target 仍然要传：钉 CARGO_HOME 不是把这一项换掉"
         );
     }
 

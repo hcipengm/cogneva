@@ -82,7 +82,34 @@ fn buildah_runroot() -> String {
 /// cargo registry 缓存同样落 PVC：镜像里的 /usr/local/cargo 是容器可写层，
 /// Pod 一重建（主线滚动最后一个目标就是 evolution 自己）索引与 crate 缓存
 /// 全丢，每次构建都要在家庭网络上重拉整个 crates.io 索引。
-const CARGO_HOME_PVC: &str = cog_core::app_path_literal!("sandbox", "cargo-home");
+///
+/// 两个写同一个 `CARGO_TARGET_DIR` 的构建器都用它，理由不止是持久：cargo 按
+/// crate 的来源目录给注册表包编身份，同一个 crate 从两个 cargo home 取来就是
+/// 两个包，谁也复用不了谁在共享 target 里的产物。实测两边一个用
+/// `/opt/cogneva/sandbox/cargo-home`、一个用镜像里的 `/usr/local/cargo`，于是
+/// 每次轮到进化这一侧构建，aws-lc-sys、cranelift_codegen 这些早就编过的注册表
+/// crate 又要重编一遍——共享 target 名存实亡。
+pub(crate) const CARGO_HOME_PVC: &str = cog_core::app_path_literal!("sandbox", "cargo-home");
+
+/// 把镜像里的 sparse 镜像配置带到 PVC 的 cargo home。
+///
+/// 换到 PVC 后，镜像 `/usr/local/cargo/config.toml` 里的镜像配置不会自动继承；
+/// 缺失会直连 crates.io，家庭网络上索引拉取极慢。每个用这个 cargo home 的构建器
+/// 都要能在自己是第一个跑的时候把这份配置带过去，否则「谁先跑」决定网络走哪条路。
+pub(crate) async fn ensure_cargo_home_mirror_config() {
+    let pvc_config = std::path::Path::new(CARGO_HOME_PVC).join("config.toml");
+    if tokio::fs::try_exists(&pvc_config).await.unwrap_or(false) {
+        return;
+    }
+    let img_config = std::path::Path::new("/usr/local/cargo/config.toml");
+    if !tokio::fs::try_exists(img_config).await.unwrap_or(false) {
+        return;
+    }
+    if let Ok(body) = tokio::fs::read(img_config).await {
+        let _ = tokio::fs::create_dir_all(CARGO_HOME_PVC).await;
+        let _ = tokio::fs::write(&pvc_config, body).await;
+    }
+}
 
 /// 镜像里那个二进制的落点。overlay 单独替换它，与资产表不同源：
 /// 它来自构建产物目录，不是 rev 检出里的文件。
@@ -8872,16 +8899,7 @@ impl MainlineDeployer {
         // CARGO_HOME 换 PVC 后，镜像 /usr/local/cargo/config.toml 里的 sparse
         // 镜像配置（受限网络构建注入）不会自动继承；缺失会直连 crates.io，
         // 家庭网络上索引拉取极慢。一次性把镜像内配置带到 PVC。
-        let pvc_config = std::path::Path::new(CARGO_HOME_PVC).join("config.toml");
-        if !tokio::fs::try_exists(&pvc_config).await.unwrap_or(false) {
-            let img_config = std::path::Path::new("/usr/local/cargo/config.toml");
-            if tokio::fs::try_exists(img_config).await.unwrap_or(false) {
-                if let Ok(body) = tokio::fs::read(img_config).await {
-                    let _ = tokio::fs::create_dir_all(CARGO_HOME_PVC).await;
-                    let _ = tokio::fs::write(&pvc_config, body).await;
-                }
-            }
-        }
+        ensure_cargo_home_mirror_config().await;
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args([
             "build",
