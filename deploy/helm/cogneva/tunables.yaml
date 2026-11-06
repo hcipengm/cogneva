@@ -939,6 +939,29 @@ rows:
       60 attempts at 5 seconds is the five-minute startup budget. The number is
       the slowest legitimate start written down, not a derived bound.
 
+  - key: healthProbes.appStartup.periodSeconds
+    source: fixed
+    why: >-
+      The probe contract's own period, kept equal to every other startup budget:
+      the app's budget differs in how many attempts it allows, not in how often
+      it is asked.
+
+  - key: healthProbes.appStartup.timeoutSeconds
+    source: fixed
+    why: >-
+      The startup half of the probe contract, for the main app's own budget.
+
+  - key: healthProbes.appStartup.failureThreshold
+    source: override
+    why: >-
+      120 attempts at 5 seconds is the ten-minute budget, against a first start
+      measured at 323 s on this host on 2026-11-06 (model load, the schema batch
+      queued behind other readers' locks, a collection create retrying through
+      its own timeout) and a second start at 205 s once the image's pages were
+      cached. Every rollout starts cold, so the budget is the slow-case
+      measurement doubled by hand; no loop re-measures start durations back into
+      it, and the deployer's own 900 s still bounds the whole rollout.
+
   - key: healthProbes.claimStoreStartup.periodSeconds
     source: fixed
     why: >-
