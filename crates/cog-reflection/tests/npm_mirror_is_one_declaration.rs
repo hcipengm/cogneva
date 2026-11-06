@@ -282,10 +282,11 @@ fn the_shipping_image_carries_the_frontend_toolchain() {
 /// 判格式化之前刷新工具链这一趟，读的镜像源在运行期要真的存在。
 ///
 /// 两头都在的时候什么都不会响，缺一头才是病：少了运行段那两行 ENV，构建期那句
-/// `export` 出不了 RUN，运行期的 `rustup update stable` 去打官方源——CN 侧那一次
-/// 就是几十秒起步、撞上格式化的墙钟界，退化成「没刷成」，于是 `BUILTIN_FMT_REFRESH`
-/// 那条环原样关回去；少了白名单里那两个键，子进程 `env_clear()` 之后也读不到它们，
-/// 效果一模一样，而日志上只说「刷不成」，没有一个字提到是环境没递进去。
+/// `export` 出不了 RUN，运行期的刷新（`rustup check` 与按版本号那一趟装）去打官方源
+/// ——CN 侧那一次就是几十秒起步、撞上墙钟界，退化成「没刷成」，于是
+/// `BUILTIN_TOOLCHAIN_CHECK` 那条环原样关回去；少了白名单里那两个键，子进程
+/// `env_clear()` 之后也读不到它们，效果一模一样，而日志上只说「刷不成」，没有一个字
+/// 提到是环境没递进去。
 ///
 /// 运行段之后的判据与 [`the_shipping_image_carries_the_frontend_toolchain`] 同口径：
 /// `webbuilder` 阶段有没有这些变量，不说明发出去的镜像有没有。
@@ -307,9 +308,13 @@ fn the_formatter_refresh_can_read_its_toolchain_source_at_runtime() {
 
     let pipeline = text_of(&root, "crates/cog-reflection/src/change_pipeline.rs");
     assert!(
-        pipeline.contains(r#"["rustup", "update", "stable"]"#),
-        "判据里没有「把工具链刷到最新 stable」那一趟：镜像只在有变更落地时才重建，\
-         判据落后就形成环——判据旧 ⇒ 每笔红 ⇒ 没有落地 ⇒ 没有重建"
+        pipeline.contains(r#"["rustup", "check"]"#)
+            && pipeline.contains("\"toolchain\",")
+            && pipeline.contains("\"install\","),
+        "判据里没有「问出当前 stable 是哪一版、按那个版本号装一份」这两趟：\
+         镜像只在有变更落地时才重建，判据落后就形成环——判据旧 ⇒ 每笔红 ⇒ \
+         没有落地 ⇒ 没有重建。就地更新那条路走不通（镜像的下层 rename 是 EXDEV），\
+         所以这里认的必须是新起一份工具链目录的那条路"
     );
     for key in ["\"RUSTUP_DIST_SERVER\",", "\"RUSTUP_UPDATE_ROOT\","] {
         assert!(

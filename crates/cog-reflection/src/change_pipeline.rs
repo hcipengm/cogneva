@@ -54,9 +54,9 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
-    // 工具链从哪里取：刷新那趟（`rustup update stable`）要用它们。不传的话镜像
-    // 从镜像源装的工具链，判的时候却去打官方源——CN 侧那一次就是几十秒起、超时
-    // 就退化成"没刷成"。它们说的是工具链来源，不是这次验证要判的东西。
+    // 工具链从哪里取：刷新那两趟（`rustup check` 与按版本号装那一趟）要用它们。
+    // 不传的话镜像从镜像源装的工具链，判的时候却去打官方源——CN 侧那一次就是
+    // 几十秒起、超时就退化成"没刷成"。它们说的是工具链来源，不是这次验证要判的东西。
     "RUSTUP_DIST_SERVER",
     "RUSTUP_UPDATE_ROOT",
     "RUSTFLAGS",
@@ -155,10 +155,10 @@ const NO_LINTER_NOTE: &str =
 /// the promotion that turns a finding into a refusal.
 const BUILTIN_LINT_LINE: &str = "cargo clippy --workspace --all-targets";
 
-/// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：刷新工具链、探针、判、改写、复判。
+/// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：探针、判、改写、复判。
 /// 判干净就提前返回，所以这是上界不是次数。
-// cap: bound — 刷新工具链、探针、判、改写、复判五趟；判干净就提前返回，所以是上界不是次数
-const FMT_CMDS_PER_RUN_FMT: u64 = 5;
+// cap: bound — 探针、判、改写、复判四趟；判干净就提前返回，所以是上界不是次数
+const FMT_CMDS_PER_RUN_FMT: u64 = 4;
 
 /// 判这笔改动的格式化之前，先把这一侧的工具链对到 stable 的最新一次发布。
 ///
@@ -167,12 +167,46 @@ const FMT_CMDS_PER_RUN_FMT: u64 = 5;
 /// 新的判它红，于是没有变更落得住，没有落地就没有重建，判据一直旧下去。2026-11-06 实测
 /// 卡在这条环上：镜像里 rustfmt 1.9.0、CI 判的是 1.10.0，Format 每一笔都红，红的原因
 /// 与提交内容无关。刷一趟把环打开：改写这笔改动的那把 rustfmt 与 CI 那把是同一次发布。
-const BUILTIN_FMT_REFRESH: &[&str] = &["rustup", "update", "stable"];
+///
+/// 刷新**不能**用 `rustup update stable`。stable 那份工具链在镜像的只读下层，update 的
+/// rollback 要把一个个下层**目录** rename 到别处，overlay 给 `EXDEV`：实测
+/// `could not rename 'component' file …: Invalid cross-device link (os error 18)`。
+/// 于是这条刷新自上线起一次都没成功过——它判的是「命令跑完了没有」，而命令每次都
+/// 以一句 rollback 错误结束，那句错误被写进证据、然后被当成「这一侧环境不行」放行。
+/// 判据因此一直停在镜像那一版 1.98.1（2026-09-01），而 CI（`dtolnay/rust-toolchain@stable`）
+/// 判 1.99.1：rustfmt 与 clippy 各差一次发布。症状不是「格式偶尔判错」，是**每一笔
+/// 改动都可能在上游被判红**，红的原因与提交内容无关，红了就回退——revert 率就是这么来的。
+///
+/// 所以改成按版本号装一份**新的**工具链：目录是新建的（不在下层），没有 rename；
+/// 判的时候用 `RUSTUP_TOOLCHAIN` 指到它。版本号不钉死——每次判之前从 `rustup check`
+/// 读当前 stable 是哪一版，CI 拿到哪一版，这一侧就是哪一版。
+const BUILTIN_TOOLCHAIN_CHECK: &[&str] = &["rustup", "check"];
 
-/// `run_cargo_fmt` 之外直接跑的那趟基线检查（apply 之前，读这棵树本来就
-/// 是不是格式化过的样子）。
-// cap: bound — 直接跑的那趟基线检查只有一次
-const FMT_BASELINE_CHECKS_PER_CHANGE: u64 = 1;
+/// 装一份工具链要多久：按分钟算，不是按秒。
+///
+/// 它只在某个 stable 发布之后第一次判变更时跑一趟——装好之后目录就在 `RUSTUP_HOME`
+/// 里，同一个 Pod 里后续的判据直接用，不再装。所以它有自己的一份界，不挤进 60 秒的
+/// 格式化界里：把安装塞进那份额度里，额度一到安装被砍，判据又回到旧那一把上，而
+/// 症状会读成「刷新老是失败」，看起来像网络问题。
+///
+/// 这个数是量出来的下限再翻一倍：实测一份 minimal + rustfmt + clippy 的工具链（250 MB
+/// 上下，2026-11-06 那台同时跑着两份下载的机器）装上用了十几分钟。给得紧的坏处
+/// 是「装不上 ⇒ 判据仍是旧那一把 ⇒ 整条链又回到这条要修的病上」，给得松的坏处只是
+/// 停摆告警晚半小时——两边不对称，所以往松的一边取。
+// cap: bound — 一次 stable 发布装一份；装好后同一次部署里不再装
+const TOOLCHAIN_PROVISION_TIMEOUT_SECS: u64 = 1800;
+
+/// `run_cargo_fmt` 之外直接跑的格式化命令有几趟。
+///
+/// 两趟，都在它之前：apply 之前读一次「这棵树本来就是格式化过的样子吗」，以及更早
+/// 那一趟定工具链的刷新（[`ChangePipeline::refresh_builtin_toolchain`]）。
+///
+/// 刷新必须排在基线检查之前，不只是「也在前面」：基线读的是一个比较——
+/// `cargo fmt --all -- --check` 在这棵树上是绿还是红——而比较的两边得是同一把
+/// rustfmt。用镜像那一把读基线、用装好的那一把改写，改写过的每一行都会出现在
+/// diff 里，于是 linter 落在这些行上的报告会被记成这条变更写的。
+// cap: bound — 基线检查一趟，定工具链的刷新一趟
+const FMT_CMDS_OUTSIDE_RUN_FMT: u64 = 2;
 
 /// `run_cargo_fmt` 在一条变更里最多被调用几次：apply 之后那趟，加上测试失败后
 /// 读基线失败集合的那趟，门禁失败后读基线的那趟，再加 linter 红了读基线的那趟。
@@ -189,8 +223,12 @@ const FMT_RUNS_PER_CHANGE: u64 = 4;
 /// 封顶。验证循环把它加进自己声明的工期界里，所以它必须是数出来的：
 /// `the_one_change_wall_counts_every_call_site_it_names` 数着源码里的调用点守着
 /// 上面那三个数，免得加了新调用点而界还停在旧值上。
+///
+/// 工具链那一段（[`TOOLCHAIN_PROVISION_TIMEOUT_SECS`]）单独加在末尾：它不是格式
+/// 化命令，按命令条数乘出来的那份界装不下它（装一份要几分钟，一趟 `cargo fmt` 要几秒）。
 pub(crate) const FMT_SEGMENT_WALL_SECS: u64 = DEFAULT_FMT_TIMEOUT_SECS
-    * (FMT_BASELINE_CHECKS_PER_CHANGE + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT);
+    * (FMT_CMDS_OUTSIDE_RUN_FMT + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT)
+    + TOOLCHAIN_PROVISION_TIMEOUT_SECS;
 
 /// 一条变更要跑几条吃**测试**预算的命令：`run_cargo_clippy` 一条，
 /// `run_test_command` 两条（套件一条，测试失败后读基线失败集合再一条），
@@ -296,6 +334,100 @@ pub(crate) fn one_change_wall_secs(
         + WEB_ADMISSION_TIMEOUT_SECS
         + REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS
         + FMT_SEGMENT_WALL_SECS
+}
+
+/// `rustup check` 对 stable 那一行的回答。
+#[derive(Debug, PartialEq, Eq)]
+enum StableRelease {
+    /// 本机那份 stable 就是最新发布，判据与 CI 已经是同一把。
+    Current,
+    /// 最新发布是这一版，而它不在本机的 `stable` 里——要按这个版本号装一份新的。
+    Install(String),
+}
+
+/// `rustup check` 说 stable 现在是哪一版。
+///
+/// 读的是 stable 那一行，不是整个输出：同一份输出里还有 beta 与 nightly 两行，把
+/// 它们里的版本号当成 stable 就会装错版本，而装错版本的判据与 CI 仍然不是同一把。
+///
+/// 两种形状都要认，因为它们的答案不同：`Up to date : 1.99.1` 说的是「不用装」，
+/// `Update available : 1.98.1 -> 1.99.1` 说的是「装箭头**后面**那个」。取错一边
+/// 会把已经装着的旧版本再装一遍，然后拿它当判据——正是这条要修的那个病。
+///
+/// 认不出就回 `None`：「读不到」不是「已经是最新」，它要说成一句话进证据。
+fn stable_release_from_check(output: &str) -> Option<StableRelease> {
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("stable") else {
+            continue;
+        };
+        // `stable-x86_64-…` 与 `stable -` 两种写法都算这一行；`stablefoo` 不算。
+        if !rest.starts_with('-') && !rest.starts_with(' ') {
+            continue;
+        }
+        // 大小写照用的那两次实测都对：rustup 打的是小写 `update available:` /
+        // `up to date :`，而人们的转述常写成大写。按小写比一次，两种都认。
+        let lowered = line.to_lowercase();
+        if lowered.contains("up to date") {
+            return Some(StableRelease::Current);
+        }
+        if let Some((_, after)) = line.split_once("->") {
+            return version_token(after).map(StableRelease::Install);
+        }
+        return None;
+    }
+    None
+}
+
+/// 一段文字里第一个形如 `1.99.1` 的词。
+fn version_token(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.')))
+        .find(|word| {
+            let mut parts = word.split('.');
+            parts.clone().count() == 3
+                && parts.all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(str::to_string)
+}
+
+/// 本机的 `RUSTUP_HOME` 里有没有这个发布的那份工具链，且**带着判据要用的那两个组件**。
+///
+/// 有就不再装：这条路径上一次下载是几百兆，而同一个 Pod 里判的每一笔变更都会走到这里。
+/// 目录名带着目标三元组（`1.99.1-x86_64-unknown-linux-gnu`），所以按「以版本号加
+/// 一个横杠开头」认，不按全名认。
+///
+/// 光有目录不算数。`rustup toolchain install` 默认只给 `cargo` 与 `rustc`，rustfmt 与
+/// clippy 是要点名装的组件；一个残缺的目录在这里被读成「已经装好了」，指过去之后每一条
+/// 格式化命令都起不来，而判据会把「这一侧没有 rustfmt」判成「这笔改动的格式不对」。
+/// 装的那一趟本来就是幂等的（缺什么补什么），所以缺组件就让它再跑一趟。
+fn provisioned_toolchain(release: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))?;
+    provisioned_toolchain_in(&home, release)
+}
+
+/// [`provisioned_toolchain`] 的本体，`RUSTUP_HOME` 由调用者给。
+///
+/// 分成两层是为了让「装好了」这件事可以被数：往一个临时目录里摆一份工具链目录，
+/// 就能问出这个函数认的是什么——不必去动进程的环境变量（那条路会让并行的测试互相
+/// 踩，而且踩出来的失败与这条判据无关）。
+fn provisioned_toolchain_in(home: &Path, release: &str) -> Option<PathBuf> {
+    let prefix = format!("{release}-");
+    std::fs::read_dir(home.join("toolchains"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            let named = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix));
+            named
+                && path.join("bin").join("rustfmt").exists()
+                && path.join("bin").join("cargo-clippy").exists()
+        })
 }
 
 /// Resolve the environment for the verification test process: the passthrough
@@ -857,10 +989,13 @@ impl ApplyMode {
 enum FormatVerdict {
     /// The tree is what the formatter produces. `rewritten` says whether the
     /// stage had to conform it — only the built-in formatter can. `note` is
-    /// what the change's own record carries about the stage: empty for the
-    /// built-in formatter, whose evidence is reported when it refuses, and a
-    /// sentence for a deployment that declares its own or none, because a
-    /// change verified without a formatter has to be readable as that.
+    /// what the change's own record carries about the stage: a sentence for a
+    /// deployment that declares its own formatter or none, because a change
+    /// verified without a formatter has to be readable as that, and a sentence
+    /// for the built-in one when the toolchain it comes from could not be
+    /// brought to the release CI judges with — a green read from a stale
+    /// judge is exactly the record someone needs when CI then calls the same
+    /// tree red.
     Conformed { rewritten: bool, note: String },
     /// The tree is not what the formatter produces. The change is refused, and
     /// this is the evidence the refusal carries.
@@ -952,6 +1087,24 @@ pub struct ChangePipeline {
     /// one per change. Losing it to a restart costs time and nothing else —
     /// it is recomputed from the same tree.
     baseline_failures: Arc<tokio::sync::Mutex<BaselineFailures>>,
+    /// 判据这一侧的工具链指向哪个发布，`None` 是「就用镜像里那一版」。
+    ///
+    /// 由 [`Self::refresh_builtin_toolchain`] 填：它先问 `rustup check` 当前 stable
+    /// 是哪一版，再确保那一版装在一个新建的工具链目录里，然后把版本号记在这里。
+    /// 之后这一条变更的每一条验证命令都带上 `RUSTUP_TOOLCHAIN=<版本>`——刷新的意义
+    /// 只在它真的被判据用到时才成立，刷新的结果没人用等于没刷。
+    judge_toolchain: Arc<std::sync::Mutex<Option<String>>>,
+    /// 这一条变更的工具链是否已经问过（成功、失败都算问过）。
+    ///
+    /// 与 `judge_toolchain` 分开：「用镜像那一把」也是一种决定，它没有版本号可记，
+    /// 而只按 `judge_toolchain` 是否为空判断会让每一趟格式化都把安装重试一遍。
+    toolchain_decided: Arc<std::sync::atomic::AtomicBool>,
+    /// 问完之后写进证据的那句话（`None` 是问成了）。
+    ///
+    /// 记住它是因为问的时机与写的时机不在一处：问在第一条判据之前，写在那几趟
+    /// 格式化攒出来的证据里。只记「问过没问过」而不记「问出什么」，结果就是刷新的
+    /// 失败在那唯一一次记录里消失。
+    toolchain_note: Arc<std::sync::Mutex<Option<String>>>,
     /// 变更忠实度读数的去处。判定与读数同源：这个 oracle 就是这里的
     /// `git apply --check`，所以读数放在这里而不是生成侧——生成侧那份是同一
     /// 事实的第二份判据。缺席时读数只进日志，丢聚合不该让 apply 失败。
@@ -1122,6 +1275,9 @@ impl ChangePipeline {
             target_dir: None,
             budget: None,
             baseline_failures: Arc::new(tokio::sync::Mutex::new(None)),
+            judge_toolchain: Arc::new(std::sync::Mutex::new(None)),
+            toolchain_decided: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            toolchain_note: Arc::new(std::sync::Mutex::new(None)),
             metrics: None,
             tier_cells_seeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             project_kind_cells_seeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1746,6 +1902,20 @@ impl ChangePipeline {
         // Only the built-in formatter rewrites anything: a deployment that
         // declares a check, or no formatter at all, leaves this tree with one
         // writer by construction, and there is nothing to ask.
+        // 判据这一侧的工具链先定下来，在**任何**判据之前。
+        //
+        // 下一句读的是「这棵树本来就是格式化过的样子吗」，而那是一个比较：比的两边
+        // 必须是同一把 rustfmt。用镜像那一把读基线、再用装好的那一把改写，改写过的
+        // 每一行都会出现在 worktree diff 里，于是 linter 落在这些行上的报告会被记成
+        // 这条变更写的。刷新是幂等的——它问一趟 `rustup check`，发现那一版已经装好
+        // 就直接用，所以 `run_cargo_fmt` 里那一趟留着不碍事。
+        //
+        // 声明了自己的格式化命令的部署不问这一句：那一把不是 cargo，`RUSTUP_TOOLCHAIN`
+        // 对它没有意义。
+        if self.fmt_check_command.is_none() {
+            let _ = self.refresh_builtin_toolchain(workdir).await;
+        }
+
         let baseline_is_conformed = match self.fmt_check_command {
             Some(_) => true,
             None => match self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_CHECK).await {
@@ -3268,6 +3438,18 @@ impl ChangePipeline {
         {
             cmd.env(key, value);
         }
+        // 刷新那一趟定下的工具链要真的被用上：只装不指等于没刷，而「用的是哪一把
+        // 编译器」正是这条判据与 CI 会不会各说一套的全部内容。写在这里而不是写进
+        // [`verification_env`]，因为后者是「部署的配置进不了判据」那条规则的载体，
+        // 而这个版本号不是部署的配置——它是这次判据自己量出来的。
+        if let Some(release) = self
+            .judge_toolchain
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        {
+            cmd.env("RUSTUP_TOOLCHAIN", release);
+        }
     }
 
     /// The targets that belong to the deployment topology family.
@@ -3683,39 +3865,146 @@ impl ChangePipeline {
 
     /// 把判据这一侧的工具链对到 stable 的最新发布，失败不拦下这笔改动。
     ///
-    /// 不拦的理由：刷不成（问不到网、镜像里没有 rustup、装不进只读的 RUSTUP_HOME）
+    /// 不拦的理由：刷不成（问不到网、镜像里没有 rustup、装不进 RUSTUP_HOME）
     /// 说的都是这一侧的环境，不是这笔改动本身；按"环境不对"把这笔改动判红，等于把
-    /// 整条落地链停在一个与提交内容无关的原因上——正是 [`BUILTIN_FMT_REFRESH`] 要解
-    /// 的那条环。所以失败只回一句话：它接着判，但那句话写进判据的证据里，读那条
+    /// 整条落地链停在一个与提交内容无关的原因上——正是 [`BUILTIN_TOOLCHAIN_CHECK`]
+    /// 要解的那条环。所以失败只回一句话：它接着判，但那句话写进判据的证据里，读那条
     /// 拒绝记录的人能看见"这一版判据用的不是最新 stable"。
+    ///
+    /// 两趟而不是一趟。先问 `rustup check` 当前 stable 是哪一版，再按那个版本号装
+    /// 一份**新的**工具链——不能就地更新 `stable` 那一份：它在镜像的只读下层，更新时
+    /// rollback 要对下层目录做 rename，overlay 给 `EXDEV`，那条路永远走不通（见
+    /// [`BUILTIN_TOOLCHAIN_CHECK`] 的注释）。装好的目录在 `RUSTUP_HOME` 里留着，
+    /// 同一台机器之后的变更直接用它，只有新的一次 stable 发布才会再装一份。
+    ///
+    /// 刷新的结果记在 `judge_toolchain` 上：只装不用等于没刷，而"用的是哪一把编译器"
+    /// 正是这条判据与 CI 会不会各说一套的全部内容。
     async fn refresh_builtin_toolchain(&self, workdir: &Path) -> Option<String> {
-        match self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_REFRESH).await {
+        // 一条变更只定一次。这一趟会走网络、可能要装几百兆，而一次验证里格式化那
+        // 一段最多跑四趟——每趟重来一次的代价不是多几次往返，是「网络不通时同一份
+        // 安装被重试四遍」，每一遍都能吃掉一整份安装界。
+        if self
+            .toolchain_decided
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // 定过之后照样把那句话还回去：它在第一条判据之前就问完了，而写进证据的是
+            // 后面那几趟格式化——「问过了，没问出结果」必须在后面那几趟里读得到。
+            return self
+                .toolchain_note
+                .lock()
+                .ok()
+                .and_then(|note| note.clone());
+        }
+        let note = self.provision_judge_toolchain(workdir).await;
+        if let Ok(mut slot) = self.toolchain_note.lock() {
+            *slot = note.clone();
+        }
+        note
+    }
+
+    /// [`Self::refresh_builtin_toolchain`] 的真身：问一次、装一次、记下来。
+    async fn provision_judge_toolchain(&self, workdir: &Path) -> Option<String> {
+        // 退出码在这里不是判据：`rustup check` 发现「有新的 stable」时退的是 **100**，
+        // 而 100 正是这条刷新最想听到的那句话。判的是它印了什么——印出 stable 那一行
+        // 就照着做，印不出来（没网、没装 rustup、被超时砍掉）才是读不到。
+        let release = match self
+            .run_cargo_fmt_cmd(workdir, BUILTIN_TOOLCHAIN_CHECK)
+            .await
+        {
+            Ok((_, output)) => stable_release_from_check(&output),
+            Err(e) => {
+                warn!(error = %e, "Could not read which stable release is current; judging with the toolchain this image carries");
+                return Some(format!(
+                    "判这一版用的不是 CI 那一把编译器：`rustup check` 没有跑成（{e}）"
+                ));
+            }
+        };
+        let Some(release) = release else {
+            warn!("`rustup check` did not name a stable release; judging with the toolchain this image carries");
+            return Some(
+                "判这一版用的不是 CI 那一把编译器：`rustup check` 的输出里读不出 stable 是哪一版"
+                    .to_string(),
+            );
+        };
+        let release = match release {
+            // 镜像里那份 stable 就是最新发布：判据已经与 CI 是同一把，不用装也不用
+            // 指——`RUSTUP_TOOLCHAIN=1.99.1` 找不到名为 `stable-…` 的目录，指了反而
+            // 让每一条命令都起不来。
+            StableRelease::Current => {
+                info!("The toolchain that judges this change is the current stable");
+                return None;
+            }
+            StableRelease::Install(release) => release,
+        };
+        // 装过的就不要再装：这条路径上的一次下载是几百兆，而同一个 Pod 里判的每一笔
+        // 变更都要经过这里。
+        if let Some(dir) = provisioned_toolchain(release.as_str()) {
+            info!(
+                release = %release,
+                toolchain = %dir.display(),
+                "The toolchain that judges this change is the current stable"
+            );
+            self.remember_judge_toolchain(&release);
+            return None;
+        }
+        let argv: Vec<String> = [
+            "rustup",
+            "toolchain",
+            "install",
+            release.as_str(),
+            "--profile",
+            "minimal",
+            "--component",
+            "rustfmt",
+            "--component",
+            "clippy",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+        match self
+            .run_verification_command(workdir, &argv, TOOLCHAIN_PROVISION_TIMEOUT_SECS)
+            .await
+        {
             Ok((true, output)) => {
                 info!(
+                    release = %release,
                     output = output.trim(),
-                    "The formatter that judges this change comes from the latest stable"
+                    "The toolchain that judges this change comes from the latest stable"
                 );
+                self.remember_judge_toolchain(&release);
                 None
             }
             Ok((false, output)) => {
                 warn!(
+                    release = %release,
                     output = output.trim(),
-                    "Could not refresh the toolchain the formatter comes from; judging with the one this image carries"
+                    "Could not install the release CI judges with; judging with the toolchain this image carries"
                 );
                 Some(format!(
-                    "The toolchain was not refreshed before judging: {}",
+                    "判这一版用的不是 CI 那一把编译器：在 RUSTUP_HOME 里装不上 {release}（{}）",
                     output.trim()
                 ))
             }
             Err(e) => {
-                warn!(
-                    error = %e,
-                    "Could not refresh the toolchain the formatter comes from; judging with the one this image carries"
-                );
+                warn!(release = %release, error = %e, "Could not install the release CI judges with; judging with the toolchain this image carries");
                 Some(format!(
-                    "The toolchain was not refreshed before judging: {e}"
+                    "判这一版用的不是 CI 那一把编译器：在 RUSTUP_HOME 里装不上 {release}（{e}）"
                 ))
             }
+        }
+    }
+
+    /// 记下这一条变更余下的验证命令该用哪个工具链发布。
+    fn remember_judge_toolchain(&self, release: &str) {
+        match self.judge_toolchain.lock() {
+            Ok(mut slot) => *slot = Some(release.to_string()),
+            // 锁中毒是这个进程里别处崩过，不是这笔改动的问题：读不到就退回镜像那一版，
+            // 与「刷新没成」是同一条退化路径，证据里那句话照写。
+            Err(_) => warn!(
+                release = %release,
+                "could not remember the toolchain release; the rest of this change is judged by the image's"
+            ),
         }
     }
 
@@ -3798,10 +4087,11 @@ impl ChangePipeline {
     async fn judge_format(&self, workdir: &Path) -> SFResult<FormatVerdict> {
         match self.fmt_check_command.as_deref() {
             None => match self.run_cargo_fmt(workdir).await? {
-                (true, rewritten, _) => Ok(FormatVerdict::Conformed {
-                    rewritten,
-                    note: String::new(),
-                }),
+                // 判成的那条路也要带上那句话：工具链没刷成时这一版是用镜像那一把
+                // 判的，而它和 CI 那把不一定是同一次发布。今天这句被丢在这里，于是
+                // 「这一笔的判据不是最新 stable」只出现在红了的记录上——绿的、落了地
+                // 然后再被 CI 判红的那一笔，正是最需要读到它的时候。
+                (true, rewritten, note) => Ok(FormatVerdict::Conformed { rewritten, note }),
                 (false, _, evidence) => Ok(FormatVerdict::Differs(format!(
                     "The formatter could not make this tree what it produces:\n{evidence}"
                 ))),
@@ -4792,7 +5082,8 @@ mod tests {
             "构建槽排队次数与它该覆盖的命令条数对不上了"
         );
 
-        // 格式化那一段：run_cargo_fmt 里几趟命令，加外面那趟基线检查。
+        // 格式化那一段：run_cargo_fmt 里几趟命令，加外面那两趟（基线检查、
+        // 定工具链的刷新）。
         assert_eq!(
             FMT_RUNS_PER_CHANGE as usize,
             pipeline.matches("self.run_cargo_fmt(").count(),
@@ -4800,8 +5091,8 @@ mod tests {
         );
         assert_eq!(
             pipeline.matches(".run_cargo_fmt_cmd(").count() as u64,
-            FMT_BASELINE_CHECKS_PER_CHANGE + FMT_CMDS_PER_RUN_FMT,
-            "格式化命令的调用点数变了：run_cargo_fmt 里那几处加外面那趟基线检查"
+            FMT_CMDS_OUTSIDE_RUN_FMT + FMT_CMDS_PER_RUN_FMT,
+            "格式化命令的调用点数变了：run_cargo_fmt 里那几处加外面那两趟"
         );
 
         // 门禁那一段：判定一趟、红了之后读基线一趟，各占一份自己的墙钟界。
@@ -7688,6 +7979,105 @@ index 1111111..2222222 100644
             "产品命名空间的变量不得进入判据进程，实测进了：{keys:?}"
         );
         assert!(!keys.contains(&"PG_PASSWORD"), "部署侧凭证不得进入判据进程");
+    }
+
+    /// `rustup check` 的两行形状各答一件事，取错一边就是这条要修的病本身。
+    ///
+    /// `Update available : 1.98.1 (…) -> 1.99.1 (…)` 里有两个版本号，只有箭头后面
+    /// 那个是最新发布。取前面那个会把本机已经装着的旧版再装一遍，然后拿它当判据——
+    /// 刷新「成功」了，判据却还是旧的，而 CI 仍然判 1.99.1。
+    #[test]
+    fn the_release_to_judge_with_is_the_one_rustup_check_points_at() {
+        // 这两行是 rustup 1.29.3 的原样输出（2026-11-06 在进化 Pod 里抄的）：小写，
+        // 两个版本号之间是 `->`。造一个「好看的」大写样本会让解析器只认得自己的样本。
+        assert_eq!(
+            stable_release_from_check(
+                "stable-x86_64-unknown-linux-gnu - update available: 1.98.1 (48a229cea 2026-09-01) -> 1.99.1 (58cf8f9c3 2026-10-13)"
+            ),
+            Some(StableRelease::Install("1.99.1".to_string())),
+            "箭头后面那个才是最新发布；取前面那个等于把旧版再装一遍"
+        );
+        assert_eq!(
+            stable_release_from_check(
+                "stable-x86_64-unknown-linux-gnu - up to date : 1.99.1 (58cf8f9c3 2026-10-13)"
+            ),
+            Some(StableRelease::Current),
+            "本机就是最新发布时不装也不指：指向一个不存在的 `1.99.1-…` 目录会让每条命令起不来"
+        );
+        assert_eq!(
+            stable_release_from_check(
+                "beta-x86_64-unknown-linux-gnu - update available: 1.99.1 (58cf8f9c3) -> 1.100.0 (111111111)"
+            ),
+            None,
+            "只读到 beta 那一行时这一条什么都没证明：stable 是哪一版仍然不知道，不能读成「已经是最新」"
+        );
+        assert_eq!(
+            stable_release_from_check("error: could not download file from https://example"),
+            None,
+            "读不到不是绿：它要变成一句写进证据的话"
+        );
+    }
+
+    /// 刷新的结果要真的递到判据那几条命令手上。
+    ///
+    /// 只装不指等于没刷：工具链在 `RUSTUP_HOME` 里躺着，而 `cargo fmt` / `cargo clippy`
+    /// 照旧用 `stable` 那一把——于是这条刷新「跑成了」，判据与 CI 仍然不是同一把编译器。
+    /// 这条测试守着 `apply_verification_env` 那行注入，删掉它这里立刻红。
+    #[test]
+    fn the_refreshed_toolchain_reaches_the_commands_that_judge() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true);
+        pipeline.remember_judge_toolchain("1.99.1");
+        let mut cmd = tokio::process::Command::new("true");
+        pipeline.apply_verification_env(&mut cmd);
+        let toolchain = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("RUSTUP_TOOLCHAIN"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().to_string());
+        assert_eq!(
+            toolchain.as_deref(),
+            Some("1.99.1"),
+            "刷新定下的发布必须跟着这条变更的每一条验证命令走"
+        );
+    }
+
+    /// 一个只有 `cargo` 的目录不算「装好了」。
+    ///
+    /// `rustup toolchain install 1.99.1`（不带 `--component`）装出来的就是这种目录。
+    /// 认了它，判据就会把 `RUSTUP_TOOLCHAIN` 指过去，而后面的每一条格式化命令都因为
+    /// 找不到 rustfmt 起不来——那句话在证据里读作「这笔改动格式不对」。
+    ///
+    /// 两个方向都钉：缺件的目录不认，补齐了才认。只钉第一个方向的话，一个「永远不认」
+    /// 的实现也能过，而那会让每一条变更都重装几百兆。
+    #[test]
+    fn a_toolchain_directory_without_its_components_is_not_provisioned() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join("toolchains")
+            .join("1.99.1-x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin").join("cargo"), "").unwrap();
+        assert_eq!(
+            provisioned_toolchain_in(home.path(), "1.99.1"),
+            None,
+            "只有 cargo 的目录被当成装好了：判据会指过去，然后每一条格式化命令都起不来"
+        );
+
+        std::fs::write(dir.join("bin").join("rustfmt"), "").unwrap();
+        std::fs::write(dir.join("bin").join("cargo-clippy"), "").unwrap();
+        assert_eq!(
+            provisioned_toolchain_in(home.path(), "1.99.1"),
+            Some(dir),
+            "两个组件都在了还认不出来：同一笔变更会守着 RUSTUP_HOME 重装几百兆"
+        );
+        assert_eq!(
+            provisioned_toolchain_in(home.path(), "1.98.1"),
+            None,
+            "按 1.98.1 问，答的却是 1.99.1 的目录——那样装的那一趟永远被跳过，判据停在旧那一把"
+        );
     }
 
     /// 编译器包装器不得进入判据进程，两个方向都钉死：白名单里现在没有，将来加回来
