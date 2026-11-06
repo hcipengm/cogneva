@@ -93,6 +93,11 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: backup-password
+            - name: TEST_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: test-password
           resources:
 {{ toYaml .Values.dbRoleBootstrap.resources | indent 12 }}
           volumeMounts:

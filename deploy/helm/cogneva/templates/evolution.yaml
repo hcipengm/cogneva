@@ -403,6 +403,24 @@ spec:
                   key: redis-password
             - name: COGNEVA_DATABASE_URL
               value: {{ printf "postgres://cog_app:$(APP_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
+            # 测试库那一条连的是另一个角色（cog_test），不是 cog_app：清单里
+            # `backup_pg` 那几条用例要现建库、现建一个受限角色再删掉，那要 CREATEDB
+            # 与 CREATEROLE，而业务角色的整条设计就是不给这两项。
+            - name: TEST_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: test-password
+            # 需要真服务的检查（`deploy/scripts/check-live-services.sh`，变更验证会
+            # 跑它）连这一个库，不连上面那个。分开是硬要求：清单里有几条一上来就
+            # `DELETE FROM cog_dag_tasks` 整张清空，指向业务库就是拿线上数据当
+            # playground。库本身由 `db-role-bootstrap` 建。指错了也不会静默写坏业务库：
+            # 脚本先判库名里有没有 `test`，没有就 exit 2，一条都不跑。
+            - name: COGNEVA_TEST_DATABASE_URL
+              value: {{ printf "postgres://cog_test:$(TEST_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva_test" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
+            # Redis 同理，分的是 db index：业务的 key 在 0，这里在 15。
+            - name: COGNEVA_TEST_REDIS_URL
+              value: {{ printf "redis://:$(REDIS_PASSWORD)@redis-0.redis.%s.svc.cluster.local:%d/15" (include "cogneva.namespace" .) (int .Values.backends.redis.port) | quote }}
             - name: COGNEVA_GITHUB_API_BASE
               value: {{ printf "http://cogneva-security-gateway:%d/github" (int .Values.securityGateway.llmProxyPort) | quote }}
             - name: COGNEVA_GITEE_API_BASE

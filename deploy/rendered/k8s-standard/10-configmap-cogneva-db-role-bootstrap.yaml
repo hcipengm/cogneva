@@ -18,12 +18,18 @@ data:
     #!/bin/sh
     # 业务连库的角色不是实例的超级用户。
     #
-    # 这一步把两个受限角色做实：
+    # 这一步把三个受限角色做实：
     #   cog_app    —— 业务 Pod 连库用的那个。建角色、设口令、把 cogneva 库里现有对象的
     #                 所有权从超级用户挪到它名下、给它 public 上的 CREATE。
     #   cog_backup —— 备份演练连源库用的那个。它要在同一台服务器上建一个一次性库，
     #                 所以带 CREATEDB；要逐表比对行数，所以要能读全部表；要回写自己
     #                 那一行结果，所以要对 backup_drills 有写权。
+    #   cog_test   —— 树的变更验证连测试库用的那个（见文件末尾的 cogneva_test）。它要
+    #                 CREATEDB 与 CREATEROLE，因为 `backup_pg` 那几条用例的题目就是
+    #                 「没有超权位的角色能不能把包恢复回一台新库」：它们自己建库、自己
+    #                 建一个受限角色再删掉。CI 里这些用例连的是一次性容器里的超级用户，
+    #                 沙箱里没有那个位置，所以给它的是这两项而不是超权位——它能动的
+    #                 只有自己建的库与角色，读不到 cogneva 里任何一行。
     #
     # 超权位收不掉，这一条要写明白：`cog_user` 是 initdb 建出来的那个角色
     # （`POSTGRES_USER`），PostgreSQL 16 起**不许任何人**把它降成 NOSUPERUSER——
@@ -46,6 +52,7 @@ data:
     
     : "${APP_PASSWORD:?app-password must be injected}"
     : "${BACKUP_PASSWORD:?backup-password must be injected}"
+    : "${TEST_PASSWORD:?test-password must be injected}"
     : "${PGHOST:?}"
     
     attempt=0
@@ -73,6 +80,7 @@ data:
     done
     
     psql -v ON_ERROR_STOP=1 -v app_password="$APP_PASSWORD" -v backup_password="$BACKUP_PASSWORD" \
+      -v test_password="$TEST_PASSWORD" \
       -f /dev/stdin <<'SQL'
     -- 改属主要拿每张表的 ACCESS EXCLUSIVE 锁。业务进程此刻还在写这些表，等一把
     -- 长事务就等于整个 Job 无声地挂着；宁可超时失败让 Job 重试——它幂等，重跑会接着
@@ -124,6 +132,24 @@ data:
     GRANT pg_read_all_data TO cog_backup;
     
     GRANT INSERT ON public.backup_drills TO cog_backup;
+    
+    -- 测试库的那个角色。两项特权都是被用例的题目逼出来的，不是顺手给的：
+    --   CREATEDB    —— `backup_pg` 把包恢复进一台现建的库；
+    --   CREATEROLE  —— 同一条用例要先造一个**没有超权位**的角色、恢复完再删掉；删角色
+    --                  要 CREATEROLE 加上对目标的 ADMIN，而它建的角色的 ADMIN 天然在它
+    --                  手里。给不了这两项，这一条用例在沙箱里就只能红——那是环境缺东西，
+    --                  不是这棵树判出了什么，而一条永远红的门禁很快就没人看了。
+    -- 它读不到业务库：cogneva 不归它，也没人给它 GRANT。
+    DO $do$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cog_test') THEN
+        CREATE ROLE cog_test LOGIN NOSUPERUSER CREATEDB CREATEROLE NOREPLICATION;
+      END IF;
+    END
+    $do$;
+    
+    ALTER ROLE cog_test WITH LOGIN NOSUPERUSER CREATEDB CREATEROLE NOREPLICATION
+      PASSWORD :'test_password';
     
     -- 迁移第一条就 `CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`，而迁移是**业务角色**
     -- 在启动时跑的。装扩展要的是「当前库的 CREATE」——不是 schema 上的 CREATE，也不是
@@ -200,6 +226,22 @@ data:
     END
     $do$;
     SQL
+    
+    # 测试专用库：需要真服务的检查（`deploy/scripts/check-live-services.sh`，变更验证
+    # 会跑它）连这一个，不连业务库。分开是硬要求——清单里有几条一上来就清空整张任务表，
+    # 指向业务库就是拿线上数据当 playground。属主给 cog_test：那些用例自己建表自己拆，
+    # 有几条还要建库建角色（见上面那个 DO 块）。
+    #
+    # 幂等：只有不存在时才建，然后无条件把属主对齐——第一版建出来时属主是 cog_app，
+    # 而 `ALTER DATABASE ... OWNER` 在属主已经对的时候是空操作，所以这一句既收拾旧库，
+    # 也不给新装带来第二件事。
+    #
+    # `CREATE DATABASE` 不能在事务块里跑，所以是独立的两条 psql，不塞进上面那个 DO 块。
+    echo "db role bootstrap: creating the test database if it is missing"
+    psql -tAq -c "select 'present' from pg_database where datname = 'cogneva_test'" \
+      | grep -q present \
+      || psql -v ON_ERROR_STOP=1 -c 'CREATE DATABASE cogneva_test OWNER cog_test'
+    psql -v ON_ERROR_STOP=1 -c 'ALTER DATABASE cogneva_test OWNER TO cog_test'
     
     echo "db role bootstrap: cog_app is ready and owns the cogneva schema objects"
     echo "db role bootstrap: cog_backup can create the drill database, read every table, and record its verdict"

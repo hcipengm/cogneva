@@ -1299,6 +1299,10 @@ secrets:
   # 备份演练连源库的角色（cog_backup）口令：只带 CREATEDB，能读全部表、能写
   # backup_drills。留空则随机生成。
   backupPassword: ""
+  # 变更验证连测试库的角色（cog_test）口令：带 CREATEDB 与 CREATEROLE，因为
+  # `backup_pg` 那几条用例要现建库、现建一个受限角色再删掉。它读不到 cogneva。
+  # 留空则随机生成。
+  testPassword: ""
   redisPassword: ""
   webhookInternal: ""
   jwtSecret: ""
