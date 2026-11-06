@@ -638,10 +638,7 @@ impl Agent {
                 result
             }
             Err(_) => {
-                let handle = { self.inner.lock().await.task_handle.take() };
-                let cause = unanswered_run(handle).await;
-                let mut inner = self.inner.lock().await;
-                inner.state = AgentState::Dead;
+                let cause = self.note_unanswered().await;
                 if let Some(ref lifecycle) = self.lifecycle {
                     let _ = lifecycle
                         .transition(&self.config.agent_id, AgentState::Dead)
@@ -698,10 +695,7 @@ impl Agent {
                 result
             }
             Err(_) => {
-                let handle = { self.inner.lock().await.task_handle.take() };
-                let cause = unanswered_run(handle).await;
-                let mut inner = self.inner.lock().await;
-                inner.state = AgentState::Dead;
+                let cause = self.note_unanswered().await;
                 if let Some(ref lifecycle) = self.lifecycle {
                     let _ = lifecycle
                         .transition(&self.config.agent_id, AgentState::Dead)
@@ -710,6 +704,34 @@ impl Agent {
                 Err(cause)
             }
         }
+    }
+
+    /// 一次没人回答之后，把这个对象恢复成「下一条命令还能接着跑」的样子，并把原因交回去。
+    ///
+    /// 把手（`task_handle`）与命令通道（`cmd_tx`）此前是一起被当成一次性的：错误路径
+    /// 把把手取走，于是这个对象之后每一次失败都只能写「没有人留下把手说为什么」——
+    /// 真正的原因（一次 panic 的 payload）从第一次之后就再也读不到了。
+    ///
+    /// 反过来，循环已经退出的那一档留着 `cmd_tx` 更糟：`start()` 只看 `cmd_tx` 在不在，
+    /// 于是它直接返回，此后每一次派发都在一个没有循环的对象上瞬间失败，一次模型调用
+    /// 都不会发生。集群库实测（2026-11-06）一条 CI 修复单正是这样连着办完八轮：
+    /// `-fix` 到 `-fix-r8`，两小时四十分、每一轮都是同一句「Task ended without
+    /// answering」，而根因两个字都没留下。
+    ///
+    /// 所以这里按「循环还在不在」分开处置：还在跑的最多只是这一条没答，把手放回去，
+    /// 下一次失败仍能说出是谁没答；已经退出的清掉 `cmd_tx`，让下一次 `start()` 重新
+    /// 拉起一个循环——死掉的循环不该被当成活的对象继续派活。
+    async fn note_unanswered(&self) -> SFError {
+        let mut handle = { self.inner.lock().await.task_handle.take() };
+        let cause = unanswered_run(&mut handle).await;
+        let mut inner = self.inner.lock().await;
+        if loop_is_gone(handle.as_ref()) {
+            inner.cmd_tx = None;
+        } else {
+            inner.task_handle = handle;
+        }
+        inner.state = AgentState::Dead;
+        cause
     }
 
     /// Send a steering instruction (injected as a system message).
@@ -1878,22 +1900,40 @@ const RUN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// its payload, a cancelled task says it was cancelled. A loop that is still
 /// running when the channel closes is reported as exactly that instead of
 /// being guessed at either way.
-async fn unanswered_run(handle: Option<tokio::task::JoinHandle<()>>) -> SFError {
-    let Some(handle) = handle else {
-        return SFError::Agent(
-            "Task ended without answering, and no handle was left to say why".into(),
-        );
+async fn unanswered_run(handle: &mut Option<tokio::task::JoinHandle<()>>) -> SFError {
+    let waited = match handle.as_mut() {
+        None => {
+            return SFError::Agent(
+                "Task ended without answering, and no handle was left to say why".into(),
+            )
+        }
+        // `&mut JoinHandle` 也是一个 future：等得到结果，但把手仍归调用方。
+        // 等到结果就把把手清掉（这一步已经结束了，再等它一次没有意义）；等不到
+        // 就原样留着——循环还在跑，下一次失败还要靠它说出是谁没答。
+        Some(running) => tokio::time::timeout(RUN_END_GRACE, &mut *running).await,
     };
-    match tokio::time::timeout(RUN_END_GRACE, handle).await {
-        Err(_) => SFError::Agent("Task ended without answering and is still running".into()),
-        Ok(Ok(())) => SFError::Agent("Task ended without answering".into()),
-        Ok(Err(e)) => match e.try_into_panic() {
+    let Ok(ended) = waited else {
+        return SFError::Agent("Task ended without answering and is still running".into());
+    };
+    *handle = None;
+    match ended {
+        Ok(()) => SFError::Agent("Task ended without answering".into()),
+        Err(e) => match e.try_into_panic() {
             Ok(payload) => {
                 SFError::Agent(format!("Task panicked: {}", panic_text(payload.as_ref())))
             }
             Err(_) => SFError::Agent("Task was aborted before it answered".into()),
         },
     }
+}
+
+/// 一次没人回答之后，这个对象还剩下一个能执行命令的循环吗。
+///
+/// 「循环还在」与「还留着 `cmd_tx`」是两件事，而 `start()` 只看后者：于是一个循环
+/// 已经退出的对象在它眼里仍然活着，之后每一次派发都在空壳上瞬间失败、一次模型调用
+/// 都不发生。判据取的是「那把把手结束了没有」，不是「通道还在不在」。
+fn loop_is_gone(handle: Option<&tokio::task::JoinHandle<()>>) -> bool {
+    handle.map_or(true, |h| h.is_finished())
 }
 
 /// A panic's payload as text, since the payload is what names the defect.
@@ -1918,7 +1958,8 @@ mod run_end_tests {
         let handle = tokio::spawn(async {
             panic!("the checkout was never read");
         });
-        let err = unanswered_run(Some(handle)).await;
+        let mut handle = Some(handle);
+        let err = unanswered_run(&mut handle).await;
         let text = err.to_string();
         assert!(
             text.contains("panicked") && text.contains("the checkout was never read"),
@@ -1938,7 +1979,8 @@ mod run_end_tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         handle.abort();
-        let err = unanswered_run(Some(handle)).await;
+        let mut handle = Some(handle);
+        let err = unanswered_run(&mut handle).await;
         let text = err.to_string();
         assert!(
             text.contains("aborted") && !text.contains("panicked"),
@@ -1950,11 +1992,67 @@ mod run_end_tests {
     /// saying so is the only report that does not invent a cause.
     #[tokio::test]
     async fn a_run_that_ended_quietly_reads_as_neither_panic_nor_abort() {
-        let err = unanswered_run(Some(tokio::spawn(async {}))).await;
+        let mut handle = Some(tokio::spawn(async {}));
+        let err = unanswered_run(&mut handle).await;
         let text = err.to_string();
         assert!(
             text.contains("ended without answering") && !text.contains("panicked"),
             "a quiet exit has no cause to name: {text}"
+        );
+    }
+
+    /// 读原因是「问一句为什么」，不是「把这句为什么用掉」。
+    ///
+    /// 循环还在跑的时候读不出原因（它只是没答），此前那一档把把手一起消耗了：
+    /// 于是同一个对象此后每一次失败都只剩「没有人留下把手说为什么」，一次 panic
+    /// 的 payload 从第一次之后就再也读不到。集群库实测（2026-11-06）一条 CI 修复单
+    /// 连着办完八轮、两小时四十分，八轮说的都是同一句读不出根因的话。
+    #[tokio::test]
+    async fn a_live_loop_keeps_its_handle_so_the_next_failure_can_name_its_cause() {
+        let mut handle = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }));
+        let first = unanswered_run(&mut handle).await.to_string();
+        assert!(
+            first.contains("still running"),
+            "a loop that outlived the grace has to be reported as running: {first}"
+        );
+        assert!(
+            handle.is_some(),
+            "reading the cause must not consume a handle that could not answer"
+        );
+
+        // 循环这次真的撞了：同一个把手仍然读得出是什么把它带走的。
+        handle.as_ref().unwrap().abort();
+        let second = unanswered_run(&mut handle).await.to_string();
+        assert!(
+            second.contains("aborted"),
+            "the second failure still has a cause to name: {second}"
+        );
+    }
+
+    /// 循环已经退出时，这个对象不能再执行命令：留着 `cmd_tx` 会让 `start()` 直接
+    /// 返回，此后每一次派发都在一个空壳上瞬间失败，一次模型调用都不会发生。
+    #[tokio::test]
+    async fn a_loop_that_ended_is_not_left_looking_started() {
+        let live = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        assert!(
+            !loop_is_gone(Some(&live)),
+            "a loop still inside its work is not gone: the object can serve again"
+        );
+        live.abort();
+
+        let ended = tokio::spawn(async {});
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            loop_is_gone(Some(&ended)),
+            "a loop that has ended must be reported as gone, so the next dispatch restarts one"
+        );
+        assert!(
+            loop_is_gone(None),
+            "an object with no handle at all has no loop to serve a command with"
         );
     }
 }
