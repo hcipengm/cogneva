@@ -49,7 +49,7 @@ struct AppState {
 /// cargo serialises writers to one target directory and none of them was the
 /// writer. Two lets one build proceed while another waits without doubling the
 /// pressure on the device every one of them reads.
-// cap: policy — 并发上限，不是容量读数；容量由宿主的装载决定，这个数只决定排队
+// cap: bound — 排队策略不是容量读数：容量由宿主的装载决定，这个数只决定几条一起等
 const DEFAULT_BUILD_CONCURRENCY: usize = 2;
 
 /// The concurrency in force, from `COGNEVA_SANDBOX_BUILD_CONCURRENCY`.
