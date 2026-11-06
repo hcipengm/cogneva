@@ -72,6 +72,7 @@ const WRITTEN_BY_CODE: &[(&str, &str)] = &[
     ("cause", "crates/cog-observability/src/observable.rs"),
     ("clause", "crates/cog-reflection/src/mainline_deployer.rs"),
     ("consumer", "crates/cog-supervisor/src/consumer_lag.rs"),
+    ("consumer_group", "crates/cog-stream/src/observable.rs"),
     ("data_dir", "crates/cog-reflection/src/store_readouts.rs"),
     ("dir", "crates/cog-reflection/src/build_gate/mod.rs"),
     ("face", "crates/cog-orchestrator/src/face_drift.rs"),
