@@ -147,12 +147,21 @@ const READY_TASKS_PER_PASS: u64 = 200;
 /// 一天：短到能跟住队列今天的形状，长到装得下这个平台一天落一百来条账行的
 /// 量（2026-11-06 实测 24 小时 100 条）。半个小时的窗口在这个速率下只有两三条
 /// 样本，而两条样本算出来的占比是噪声，会让一整类活的座位跟着一次偶然走。
+// cap: derived — 窗口要装下一天的落地量；实测的日落地量变了，这个数跟着变
 const GATE_SHARE_WINDOW_HOURS: i64 = 24;
+
+/// 门类占比的缓存：量它的时刻，与那次量到的答案。
+///
+/// 两层 `Option` 各答一句：外层「量过没有」，内层「量到的答案是占比，
+/// 还是账读不到 / 这段窗口什么都没落地」。
+type GateShareCache =
+    std::sync::Mutex<Option<(std::time::Instant, Option<crate::ready_queue::GateShare>)>>;
 
 /// 门类占比多久重问一次账。
 ///
 /// 发布者的节拍是秒级，而落地数在十分钟里不会变出第二种答案：每拍问一次就是
 /// 拿一整类活的节拍去换一个十位数，而库已经在为别的读超时。
+// cap: bound — 只挡重复读；把账问得更勤换不到更早的答案，只会让库多一次超时
 const GATE_SHARE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the goal consumer holds before pulling the next goal when the
@@ -274,8 +283,7 @@ pub struct DagExecutorRuntime {
     /// 缓存而不是每拍问一次库：发布者的节拍是秒级，而落地数在十分钟里不会
     /// 变出第二种答案。存的是 `Option`——「量过、读不到」也要缓存，否则账一
     /// 不可用它就变成每拍一次超时。
-    gate_share:
-        Arc<std::sync::Mutex<Option<(std::time::Instant, Option<crate::ready_queue::GateShare>)>>>,
+    gate_share: Arc<GateShareCache>,
     /// 这个部署上一次把门类任务放上队列的时刻。
     ///
     /// 插队的判据量的是这个，不是任务自己的年龄（见
@@ -413,9 +421,7 @@ impl DagExecutorRuntime {
                 return share;
             }
         }
-        let Some(store) = self.change_ledger.get() else {
-            return None;
-        };
+        let store = self.change_ledger.get()?;
         let since = chrono::Utc::now() - chrono::Duration::hours(GATE_SHARE_WINDOW_HOURS);
         let share = match store
             .landed_tally_since(since, crate::ready_queue::PRINCIPLE_LEDGER_PREFIX)
