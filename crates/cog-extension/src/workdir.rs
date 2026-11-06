@@ -1001,6 +1001,24 @@ impl WorkdirRouter {
             })?;
         tokio::fs::create_dir_all(&self.cfg.target_dir).await.ok();
         let _ = self.git_bare(&["worktree", "prune"]).await;
+        // `prune` leaves locked registrations alone, so one whose tree is
+        // already gone survives every boot: the cap counts it, the volume does
+        // not hold it, and no reclaim can ever clear it. Unlock the ones the
+        // volume cannot produce and prune again, so the count this process
+        // starts with is the count of trees that exist.
+        let mut dropped = false;
+        for (id, path) in self.list_task_trees().await {
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                continue;
+            }
+            if self.clear_admin_lock(&path).await {
+                warn!(task_id = %id, "dropping a locked registration whose tree is gone");
+                dropped = true;
+            }
+        }
+        if dropped {
+            let _ = self.git_bare(&["worktree", "prune"]).await;
+        }
 
         let trees = self.list_task_trees().await;
         for (id, path) in &trees {
@@ -1692,6 +1710,16 @@ impl WorkdirRouter {
     }
 
     async fn force_remove(&self, path: &Path) {
+        // An admin lock makes the tree invisible to both halves below:
+        // `worktree remove --force` refuses a locked tree, so the directory is
+        // taken by `remove_dir_all` while the registration stays, and
+        // `worktree prune` skips locked entries. What is left is a tree that
+        // is gone from the volume and still counted by the cap — on
+        // 2026-11-06 the live volume carried 21 such registrations against 7
+        // real trees, so the cap of 8 could never be met: every creation paid
+        // a reclaim pass, that pass logged the same unreachable ids as
+        // reclaimed, and it evicted the tree a conversation had just used.
+        self.clear_admin_lock(path).await;
         let _ = self
             .git_bare(&["worktree", "remove", "--force", path.to_str().unwrap_or("")])
             .await;
@@ -1700,6 +1728,51 @@ impl WorkdirRouter {
         }
         self.forget_safe_directory(path).await;
         let _ = self.git_bare(&["worktree", "prune"]).await;
+    }
+
+    /// Drop the `locked` marker a killed `worktree add` left on the tree at
+    /// `path`. Returns whether one was found.
+    ///
+    /// `git worktree unlock` names the tree by path and so cannot reach one
+    /// whose directory is already gone — which is the shape this leak takes —
+    /// so the registration is located by the `gitdir` file git writes for it.
+    /// Nothing in this process locks a tree, so a lock met on the way to a
+    /// removal is a corpse: deleting the marker is the only way back to an
+    /// entry `worktree remove` and `worktree prune` will both act on.
+    async fn clear_admin_lock(&self, path: &Path) -> bool {
+        let Ok(mut entries) = tokio::fs::read_dir(self.cfg.bare_repo.join("worktrees")).await
+        else {
+            return false;
+        };
+        let mut cleared = false;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(target) = tokio::fs::read_to_string(entry.path().join("gitdir")).await else {
+                continue;
+            };
+            if Path::new(target.trim()).parent() != Some(path) {
+                continue;
+            }
+            let locked = entry.path().join("locked");
+            if !tokio::fs::try_exists(&locked).await.unwrap_or(false) {
+                continue;
+            }
+            match tokio::fs::remove_file(&locked).await {
+                Ok(()) => {
+                    let id = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    warn!(
+                        task_id = %id,
+                        "cleared a worktree admin lock left by a killed process"
+                    );
+                    cleared = true;
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    path = %locked.display(),
+                    "could not clear a worktree admin lock"
+                ),
+            }
+        }
+        cleared
     }
 
     /// Mark a tree safe for git, once.
@@ -2633,6 +2706,92 @@ pub(crate) mod tests {
             r.metrics.cap_deferred.get(),
             1.0,
             "a finished command leaves nothing to defer"
+        );
+    }
+
+    /// A registration a killed add left locked is invisible to both halves of
+    /// removal: `worktree remove --force` refuses it, so the directory goes by
+    /// `remove_dir_all` while the registration stays, and `worktree prune`
+    /// skips it. The cap goes on counting a tree that is not on the volume, so
+    /// it can never be met — the live volume on 2026-11-06 held 21 of these
+    /// against 7 trees, and the pass that could not converge is what evicted
+    /// the tree a conversation had just used.
+    #[tokio::test]
+    async fn the_cap_removes_a_locked_tree_instead_of_counting_it_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 1, DEFAULT_TTL_SECS_FALLBACK);
+        let (old, claim) = r.route("locked-old").await.unwrap();
+        drop(claim);
+        git(
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "initializing",
+                old.to_str().unwrap(),
+            ],
+            &bare,
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        r.route("newest").await.unwrap();
+
+        assert!(!old.exists(), "the cap was asked to make room for one tree");
+        let ids: Vec<String> = r
+            .list_task_trees()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            !ids.contains(&"locked-old".to_string()),
+            "a removed tree must leave the count with it: {ids:?}"
+        );
+        assert_eq!(r.metrics.cap_deferred.get(), 0.0, "{ids:?}");
+    }
+
+    /// The shape the leak actually takes: the process that created the tree
+    /// died after the directory was deleted and before the registration went,
+    /// so `git worktree unlock` — which names the tree by path — cannot reach
+    /// it any more. Boot has to drop it, or every later pass counts it.
+    #[tokio::test]
+    async fn boot_drops_a_locked_registration_whose_tree_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let (path, claim) = r.route("killed-add").await.unwrap();
+        drop(claim);
+        git(
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "initializing",
+                path.to_str().unwrap(),
+            ],
+            &bare,
+        );
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(
+            r.list_task_trees()
+                .await
+                .iter()
+                .any(|(id, _)| id == "killed-add"),
+            "the registration is what the leak leaves behind"
+        );
+
+        r.recover().await.unwrap();
+
+        let ids: Vec<String> = r
+            .list_task_trees()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            !ids.contains(&"killed-add".to_string()),
+            "a tree the volume does not hold must not count against the cap: {ids:?}"
         );
     }
 
