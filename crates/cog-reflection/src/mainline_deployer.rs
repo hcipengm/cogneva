@@ -126,11 +126,29 @@ const OVERLAY_ASSET_LIST_PATH: &str = "deploy/overlay-assets.json";
 /// 门禁读 Dockerfile 最终阶段的 COPY 行，凡不在资产表里、又不在
 /// [`OVERLAY_BINARY_DEST`] 上的落点，必须在这里留下理由，否则测试红。
 ///
-/// 现在是空的：曾经唯一的一条是 `/opt/cogneva/web`（"overlay 内没有 node
-/// 工具链"）。那一条的代价是前端从此只在**全量构建**时更新，而主线只做叠层，
-/// 于是 2026-09-23 之后合进去的四个前端提交在生产上一直看不见——包括一个
-/// 告警面板。刷新的办法见 [`OVERLAY_BUILT_ASSETS`]。
-const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[];
+/// 曾经唯一的一条是 `/opt/cogneva/web`（"overlay 内没有 node 工具链"）。那一条的
+/// 代价是前端从此只在**全量构建**时更新，而主线只做叠层，于是 2026-09-23 之后合
+/// 进去的四个前端提交在生产上一直看不见——包括一个告警面板。刷新的办法见
+/// [`OVERLAY_BUILT_ASSETS`]。
+///
+/// 现在两条，都是同一个东西的两半：运行镜像里那份 node 与 npm。它不是检出编出来
+/// 的产物，是 `node:22-slim` 基础镜像带来的工具链，overlay 没有任何一步会去构建
+/// 它——而它存在只为一件事：沙盒执行器要跑部署声明的 WebUI 准入（装依赖、类型
+/// 检查、打包）。overlay 刷新前端产物走的是另一条路（[`OVERLAY_BUILT_ASSETS`]：
+/// 在那支 node 构建容器里从**这一版**的源码编出 dist），所以这里不刷新不会让产物
+/// 与源码失配；版本上两边也都是 node 22（这里的基础镜像与
+/// [`WEB_BUILDER_TAG`] 同一条）。代价是一版全量构建之后 node 的小版本会冻住，
+/// 直到下一次全量构建——要改这一条，得先让 overlay 也有一步把它拷进镜像。
+const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[
+    (
+        "/usr/local/bin/node",
+        "来自 node:22-slim 基础镜像，不是检出里的产物；overlay 刷新前端产物走的是 node 构建容器（见 OVERLAY_BUILT_ASSETS），运行镜像里这份 node 只给沙盒的 WebUI 准入用",
+    ),
+    (
+        "/usr/local/lib/node_modules",
+        "同上：npm 随基础镜像而来，overlay 不从检出构建它",
+    ),
+];
 
 /// 最终镜像烤了、由 overlay **构建**（而不是从检出原样拷贝）之后刷新的资产落点。
 ///

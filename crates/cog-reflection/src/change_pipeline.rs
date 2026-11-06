@@ -96,6 +96,17 @@ const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
 // cap: bound — 超了就是挂住了，而挂住的命令会把执行器唯一的在飞槽占死
 const DEPLOY_ADMISSION_TIMEOUT_SECS: u64 = 300;
 
+/// Wall-clock bound on one WebUI admission command.
+///
+/// The command that runs here installs the frontend dependencies and builds the
+/// bundle. A warm dependency cache makes it tens of seconds; a cold one is a
+/// registry round trip over a home connection, which is minutes. The bound sits
+/// above the cold path rather than at the warm reading: a bound that a cold
+/// cache outlives would refuse a sound change for the network it happened to
+/// run on, and the refusal reads exactly like a change that does not build.
+// cap: bound — 冷依赖缓存那趟是分钟级的下载；超了这个数说明命令挂住了
+const WEB_ADMISSION_TIMEOUT_SECS: u64 = 900;
+
 /// The linter this workspace's deployments ran while the stage was hardcoded.
 /// `--message-format=json` is what makes its findings comparable against the
 /// lines a change wrote, and it changes what the run says, not what it finds.
@@ -246,6 +257,10 @@ const CI_GATE_JUDGE_FLAG: &str = "--check";
 /// - 门禁那一段，见 [`REPO_GATE_STAGE_WALL_SECS`]；它不排构建槽（跑的是壳脚本，
 ///   不是编译器），所以只加时长、不加排队。
 /// - 格式化那一段，见 [`FMT_SEGMENT_WALL_SECS`]。
+/// - WebUI 准入那一段，见 [`WEB_ADMISSION_TIMEOUT_SECS`]。它只跑在碰
+///   `web/src/**` 的变更上，而那种变更**不跑**上面那两段 Rust 的活——两边是互斥
+///   的两条路。这里仍然加上它，因为界要覆盖的是任一种形状的最长一段，而一笔同时
+///   碰 Rust 与 WebUI 的变更在晋级门关掉时两条路都走。
 ///
 /// 谁在读它：`reflection_change_verification` 把它声明成
 /// [`cog_core::loop_health::Cadence::PeriodicWithWork`] 的工期界。**声明节拍的人
@@ -261,6 +276,7 @@ pub(crate) fn one_change_wall_secs(
     gate_waits * gate_wait_secs
         + TEST_BUDGET_RUNS_PER_CHANGE * test_budget_secs
         + BUILD_BUDGET_RUNS_PER_CHANGE * build_budget_secs
+        + WEB_ADMISSION_TIMEOUT_SECS
         + REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS
         + FMT_SEGMENT_WALL_SECS
 }
@@ -807,6 +823,10 @@ pub struct ChangePipeline {
     /// `None` means this deployment declared none, and such a change is
     /// refused by name rather than sent to a person.
     deploy_admission: Option<cog_core::DeployAdmissionConfig>,
+    /// The executable admission conditions for changes that touch `web/src/**`.
+    /// `None` means this deployment declared none, and such a change is refused
+    /// by name rather than sent to a person.
+    web_admission: Option<cog_core::WebAdmissionConfig>,
     /// Wall-clock bound on the format check. Short on purpose: the check does
     /// not compile anything, so a run this side of the bound is a hung process
     /// rather than a slow one — and a hung process would hold the executor's
@@ -995,6 +1015,7 @@ impl ChangePipeline {
             fmt_check_command: None,
             lint_command: None,
             deploy_admission: None,
+            web_admission: None,
             fmt_timeout_secs: DEFAULT_FMT_TIMEOUT_SECS,
             promotion_policy: None,
             target_dir: None,
@@ -1095,6 +1116,30 @@ impl ChangePipeline {
     ) -> Self {
         self.deploy_admission = config;
         self
+    }
+
+    /// The executable conditions a change touching `web/src/**` has to clear.
+    /// `None` means the deployment declared none, which is a refusal with a
+    /// reason, not a fallback to a person.
+    pub fn with_web_admission(mut self, config: Option<cog_core::WebAdmissionConfig>) -> Self {
+        self.web_admission = config;
+        self
+    }
+
+    /// Which families this deployment can judge, read off the declarations this
+    /// pipeline will actually execute.
+    ///
+    /// Single-sourced on purpose: the promotion gate refuses a family it cannot
+    /// judge, and this is where "cannot" is answered — from the same field the
+    /// stage below runs. A second reading from configuration would let the gate
+    /// admit a change the stage then has no command for.
+    fn verifiable_families(&self) -> crate::promotion_gate::VerifiableFamilies {
+        crate::promotion_gate::VerifiableFamilies {
+            web: self
+                .web_admission
+                .as_ref()
+                .is_some_and(|c| c.is_executable()),
+        }
     }
 
     pub fn with_auto_apply(mut self, auto_apply: bool) -> Self {
@@ -1437,9 +1482,12 @@ impl ChangePipeline {
         if let Some(policy) = &self.promotion_policy {
             let files: Vec<String> = targets.iter().map(|t| t.path.replace('\\', "/")).collect();
             let diff_lines = crate::promotion_gate::count_diff_lines(&change.content);
-            if let crate::GateVerdict::Reject { reason, .. } =
-                crate::promotion_gate::classify(&files, diff_lines, policy)
-            {
+            if let crate::GateVerdict::Reject { reason, .. } = crate::promotion_gate::classify(
+                &files,
+                diff_lines,
+                policy,
+                &self.verifiable_families(),
+            ) {
                 warn!(change_id = %change.artifact_id, reason = %reason, "Change rejected by promotion gate");
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
@@ -1648,6 +1696,36 @@ impl ChangePipeline {
                 new_status: EvolutionStatus::ValidationFailed,
                 tiering: Some(tiering.clone()),
             });
+        }
+
+        // WebUI 源码这一族的准入条件是前端构建，跑在**改过的**这棵树上是它唯一
+        // 说得出答案的地方。位置与部署那一族相同、理由也相同；不同的是它下面接着
+        // 的分支：只碰 `web/src/**` 的变更，Rust 那三段判的是它没写过的东西。
+        let web_touched = Self::web_targets(&targets);
+        if !web_touched.is_empty() {
+            if let Some(reason) = self.web_admission_reason(workdir, &web_touched).await? {
+                warn!(
+                    change_id = %change.artifact_id,
+                    reason = %reason,
+                    "Change refused by the WebUI admission conditions"
+                );
+                let _ = self.git_reset_hard(workdir, &change.content).await;
+                return Ok(ApplyResult {
+                    change_id: change.artifact_id.clone(),
+                    files_changed,
+                    reformatted: false,
+                    pre_existing_failures: 0,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::WebAdmissionFailed),
+                    test_output: reason,
+                    new_status: EvolutionStatus::ValidationFailed,
+                    tiering: Some(tiering.clone()),
+                });
+            }
+            if web_touched.len() == targets.len() {
+                return self
+                    .finish_web_only(change, workdir, files_changed, tiering)
+                    .await;
+            }
         }
 
         // A change whose only effect is a default no deployment reads is refused
@@ -3025,6 +3103,183 @@ impl ChangePipeline {
             .collect()
     }
 
+    /// The targets that belong to the WebUI source family.
+    ///
+    /// Same normalisation as [`Self::deploy_targets`], and the same boundary the
+    /// landing gate uses: `web/src/` and nothing beside it.
+    fn web_targets(targets: &[cog_core::DiffTarget]) -> Vec<String> {
+        targets
+            .iter()
+            .map(|t| t.path.replace('\\', "/"))
+            .filter(|p| crate::promotion_gate::is_web_src(p))
+            .collect()
+    }
+
+    /// Whether the executable admission conditions for a WebUI change hold.
+    ///
+    /// `Some(reason)` refuses the change and names the condition that failed;
+    /// `None` means the family was not touched, or every declared condition
+    /// passed. A deployment that declared no condition does not fall back to a
+    /// person: the family's most severe executable tier is refusal, and the
+    /// reason says which declaration is missing.
+    ///
+    /// The commands run against the applied tree, because a frontend change has
+    /// an executable answer only there: whether the type checker and the
+    /// bundler accept it depends on the sources the diff rewrote, not on their
+    /// names.
+    async fn web_admission_reason(
+        &self,
+        workdir: &Path,
+        touched: &[String],
+    ) -> SFResult<Option<String>> {
+        if touched.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(config) = self.web_admission.as_ref().filter(|c| c.is_executable()) else {
+            return Ok(Some(format!(
+                "触及 WebUI 源码（{}），而这一族没有声明可执行的准入条件。\
+                 在 self_evolution.web_admission 里声明前端构建（装依赖、类型检查、打包）；\
+                 这一档不转人工——没有条件的族按最严的可执行档处理。",
+                touched.join(", ")
+            )));
+        };
+
+        for command in &config.commands {
+            let (ok, output) = self
+                .run_verification_command(workdir, command, WEB_ADMISSION_TIMEOUT_SECS)
+                .await?;
+            if !ok {
+                return Ok(Some(format!(
+                    "WebUI 准入条件未通过：`{}` 退出非零。{}",
+                    command.join(" "),
+                    output.trim()
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// The gates a WebUI-only change is judged by: the ones whose command line
+    /// names `web`.
+    ///
+    /// The workflow holds both the gates that read the Rust tree and the ones
+    /// that read `web/src`. A change that writes only frontend sources cannot
+    /// have moved the Rust ones — nothing they read is in the diff — while the
+    /// web gates read exactly the files it rewrote. Running the whole list here
+    /// would price every frontend change as a whole-tree Rust run, which is the
+    /// cost this branch exists to avoid rather than to pay.
+    async fn web_gate_names(workdir: &Path) -> SFResult<Vec<String>> {
+        Ok(Self::ci_gate_commands(workdir)?
+            .iter()
+            .map(RepoGateCommand::line)
+            .filter(|line| line.contains("web"))
+            .collect())
+    }
+
+    /// Finish a change that touches nothing but `web/src/**`.
+    ///
+    /// The format, lint and suite stages judge Rust, and this change wrote no
+    /// Rust: running them would make the size of the Rust tree the price of
+    /// every frontend edit. What does judge it — the frontend build — has
+    /// already run by the time this is called, so what is left is the handful
+    /// of repo gates that read the frontend sources.
+    async fn finish_web_only(
+        &self,
+        change: &EvolutionResult,
+        workdir: &Path,
+        files_changed: Vec<PathBuf>,
+        tiering: crate::criteria_face::Tiering,
+    ) -> SFResult<ApplyResult> {
+        // 读不出工作流时按「一条也没被问过」记，不退回跑全部门禁：那会把整棵树的
+        // 门禁加到一条前端变更上，而这正是这条分支要避免的价钱。与整条路径上那一
+        // 处同一处置——判据没跑起来不等于变更不行。
+        let gates = match Self::web_gate_names(workdir).await {
+            Ok(names) => {
+                Self::run_repo_gates(workdir, Some(&names), self.target_dir.as_deref()).await?
+            }
+            Err(e) => {
+                warn!(
+                    change_id = %change.artifact_id,
+                    error = %e,
+                    "the gates CI runs could not be read; this change is judged without them"
+                );
+                RepoGateRun {
+                    asked: Vec::new(),
+                    passed: 0,
+                    failed: Vec::new(),
+                    not_asked: vec![(
+                        "the workflow's web gates".into(),
+                        format!("could not be read: {e}"),
+                    )],
+                    interrupted: false,
+                }
+            }
+        };
+        let mut test_output = format!(
+            "这条变更只碰 web/src/**：Rust 的格式化、linter 与套件判的是它没有写的东西，\
+             所以没跑；判它的是前端构建与读 web/src 的那几道门。"
+        );
+        let note = gates.note();
+        if !note.is_empty() {
+            test_output.push_str(&format!("\n{note}"));
+        }
+        let mut passed = gates.failed.is_empty();
+        if !gates.failed.is_empty() {
+            // Same baseline reading as the full path: a gate that is red on this
+            // revision without the change is the tree's, not this change's.
+            let red: Vec<String> = gates.failed.iter().map(|(script, _)| script.clone()).collect();
+            let already = self
+                .gates_beyond_baseline(workdir, &change.content, &gates.failed)
+                .await?;
+            let introduced: Vec<&String> =
+                red.iter().filter(|name| !already.contains(*name)).collect();
+            if introduced.is_empty() {
+                test_output.push_str(&format!(
+                    "\n说这几条门在这棵树上本来就不成立，这一条变更没有让它们更红：{}",
+                    red.join("、")
+                ));
+            } else {
+                test_output.push_str(&format!(
+                    "\n这条变更让 CI 会跑的门红了，而它们在改动之前是过的：\n  {}",
+                    introduced
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n  ")
+                ));
+                passed = false;
+            }
+        }
+
+        let (new_status, verdict) = if passed {
+            if self.auto_apply {
+                (EvolutionStatus::Active, ChangeVerdict::Passed)
+            } else {
+                let _ = self.git_reset_hard(workdir, &change.content).await;
+                (EvolutionStatus::AwaitingReview, ChangeVerdict::Passed)
+            }
+        } else {
+            let _ = self.git_reset_hard(workdir, &change.content).await;
+            (
+                EvolutionStatus::ValidationFailed,
+                ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed),
+            )
+        };
+
+        Ok(ApplyResult {
+            change_id: change.artifact_id.clone(),
+            files_changed,
+            verdict,
+            test_output,
+            new_status,
+            reformatted: false,
+            pre_existing_failures: 0,
+            tiering: Some(tiering),
+        })
+    }
+
     /// Whether the executable admission conditions for a topology change hold.
     ///
     /// `Some(reason)` refuses the change and names the condition that failed;
@@ -4245,13 +4500,13 @@ mod tests {
         let gate_segment = REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS;
         assert_eq!(
             one_change_wall_secs(0, 0, 0),
-            FMT_SEGMENT_WALL_SECS + gate_segment,
-            "闸门与预算都是 0 时剩下的是门禁那一段与格式化那一段"
+            FMT_SEGMENT_WALL_SECS + gate_segment + WEB_ADMISSION_TIMEOUT_SECS,
+            "闸门与预算都是 0 时剩下的是门禁、格式化与 WebUI 准入那三段"
         );
         assert_eq!(
             one_change_wall_secs(1, 10, 100),
-            4 + 30 + 100 + gate_segment + FMT_SEGMENT_WALL_SECS,
-            "每条 gated 命令一份等待，测试预算三条、构建预算一条，再加门禁与格式化"
+            4 + 30 + 100 + gate_segment + FMT_SEGMENT_WALL_SECS + WEB_ADMISSION_TIMEOUT_SECS,
+            "每条 gated 命令一份等待，测试预算三条、构建预算一条，再加门禁、格式化与 WebUI 准入"
         );
     }
 
@@ -8307,5 +8562,174 @@ index 1111111..2222222 100644\n\
                 .unwrap(),
             None
         );
+    }
+
+    /// 只有 `web/src/**` 属于 WebUI 源码这一族：依赖清单与构建配置不在里面，
+    /// 与落地那一侧的边界逐字相同。
+    #[test]
+    fn the_web_family_is_the_source_directory_and_nothing_beside_it() {
+        let family = ChangePipeline::web_targets(&targets(&[
+            "web/src/App.tsx",
+            "web/src/observability/SpendLedger.tsx",
+            "web/package.json",
+            "web/index.html",
+            "web/vite.config.ts",
+            "web/src",
+            "docs/web/src/App.tsx",
+            "web2/src/App.tsx",
+        ]));
+        assert_eq!(
+            family,
+            vec![
+                "web/src/App.tsx",
+                "web/src/observability/SpendLedger.tsx"
+            ],
+            "只有真正落在 web/src/ 下的路径属于这一族"
+        );
+    }
+
+    /// 与部署那一族同一条规矩：没有声明条件的族不转人工，拒收并点名缺的是哪份
+    /// 声明。
+    #[tokio::test]
+    async fn a_web_change_without_a_declared_condition_is_refused_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false);
+        let reason = pipeline
+            .web_admission_reason(root.path(), &["web/src/App.tsx".to_string()])
+            .await
+            .unwrap()
+            .expect("a family with no executable condition has to be refused");
+
+        assert!(reason.contains("web/src/App.tsx"), "拒收要点名是哪一族：{reason}");
+        assert!(
+            reason.contains("web_admission"),
+            "拒收要说清楚下一个动作是改哪份声明：{reason}"
+        );
+        assert!(
+            reason.contains("不转人工"),
+            "这一档不是「等人批」的另一种写法：{reason}"
+        );
+    }
+
+    /// 声明了就照跑：全过即准入，一条不过即拒收，理由里带着那条命令。
+    #[tokio::test]
+    async fn a_declared_web_condition_decides_the_family_by_its_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let touched = ["web/src/App.tsx".to_string()];
+
+        let passing = ChangePipeline::new(root.path(), root.path(), false).with_web_admission(
+            Some(cog_core::WebAdmissionConfig {
+                commands: vec![vec!["true".into()]],
+            }),
+        );
+        assert_eq!(
+            passing
+                .web_admission_reason(root.path(), &touched)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let failing = ChangePipeline::new(root.path(), root.path(), false).with_web_admission(
+            Some(cog_core::WebAdmissionConfig {
+                commands: vec![vec!["false".into()]],
+            }),
+        );
+        let reason = failing
+            .web_admission_reason(root.path(), &touched)
+            .await
+            .unwrap()
+            .expect("a failing command is a refusal");
+        assert!(reason.contains("false"), "拒收要点名是哪条命令没过：{reason}");
+    }
+
+    /// 一条空 argv 的声明不是条件：它会让每一笔变更都「声明过条件」地过闸。
+    #[tokio::test]
+    async fn an_empty_web_declaration_is_not_a_condition() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false).with_web_admission(
+            Some(cog_core::WebAdmissionConfig { commands: vec![] }),
+        );
+        assert!(
+            pipeline
+                .web_admission_reason(root.path(), &["web/src/App.tsx".to_string()])
+                .await
+                .unwrap()
+                .is_some(),
+            "空声明读成「有条件」就等于没有门"
+        );
+    }
+
+    /// 一条只碰 `web/src/**` 的变更由前端构建判，不付 Rust 那三段的账。
+    ///
+    /// 判据是那个反例：套件命令写成 `false`——它要是跑了，这条变更必定被拒。
+    /// 变更却过了，所以那一段没跑。这正是一条前端改动的价钱所在：让整棵 Rust 树
+    /// 过一遍，等于按树的大小给每一次前端编辑定价。
+    #[tokio::test]
+    async fn a_webui_only_change_is_judged_by_the_build_and_not_by_the_rust_stages() {
+        let root = tempfile::tempdir().unwrap();
+        seed_a_probe_crate(&root).await;
+        tokio::fs::write(root.path().join("src/lib.rs"), "pub fn a() -> i32 { 1 }\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.path().join("web/src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("web/src/App.tsx"),
+            "export const a = 1;\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), true)
+            .with_web_admission(Some(cog_core::WebAdmissionConfig {
+                commands: vec![vec!["true".into()]],
+            }))
+            .with_test_command(vec!["false".into()]);
+
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "web-only-1".into(),
+            description: "让这个取值变成 2".into(),
+            content: "diff --git a/web/src/App.tsx b/web/src/App.tsx\n\
+                      --- a/web/src/App.tsx\n\
+                      +++ b/web/src/App.tsx\n\
+                      @@ -1 +1 @@\n\
+                      -export const a = 1;\n\
+                      +export const a = 2;\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Passed,
+            "只碰 web/src 的变更不该被 Rust 套件判：{}",
+            result.test_output
+        );
+        assert_eq!(result.new_status, EvolutionStatus::Active);
+    }
+
+    /// 别的族不该被这条闸碰到。
+    #[tokio::test]
+    async fn a_non_web_change_is_not_judged_by_the_web_conditions() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false);
+        assert_eq!(
+            pipeline.web_admission_reason(root.path(), &[]).await.unwrap(),
+            None
+        );
+        assert!(ChangePipeline::web_targets(&targets(&["crates/x/src/lib.rs"])).is_empty());
     }
 }

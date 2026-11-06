@@ -3924,6 +3924,15 @@
         ]
       ]
     },
+    "web_admission": {
+      "_comment": "触及 web/src/** 的变更按可执行条件准入，不转人工：判它的是前端构建——按 lockfile 装依赖、类型检查、打包（deploy/scripts/web-build.sh），跑在应用之后的树上，退出码非零即拒收并点名。与 CI 的 Web Build 作业是同一个脚本、同一棵树：两处各写一份 npm ci && npm run build，抄的那一份迟早与另一份漂开，而漂开的形态是「作业绿、沙盒拒收」或者反过来，两种都要花一整轮才看得出来。判它的容器里必须有 node/npm（运行时镜像从构建 WebUI 的那一段拷来的同一份），没有时这一族按最严的可执行档处理：整族拒收，不退回「等人批」。边界只到 web/src/：web/ 下的 package.json / package-lock.json / vite 配置不在这一族里——加一个依赖是供应链决定，不是一次改动评审担得起的。",
+      "commands": [
+        [
+          "bash",
+          "deploy/scripts/web-build.sh"
+        ]
+      ]
+    },
     "build_timeout_secs": 3600,
     "poll_interval_secs": 60,
     "schema_repair_interval_secs": 600,

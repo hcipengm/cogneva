@@ -107,6 +107,10 @@ pub struct AutoPromoter {
     switch: Option<Arc<crate::PromotionSwitch>>,
     /// 台账 cluster 字段标识；推送端固定为 "publisher"。
     cluster: String,
+    /// 这个部署能判哪几族路径的准入条件，与沙盒里真正会执行的那份声明同源。
+    ///
+    /// 缺省全 false：判不出来的族按最严档处理，放进沙盒再拒是一整轮验证的钱。
+    families: crate::promotion_gate::VerifiableFamilies,
     /// eval A/B 门的求值器槽位。
     ///
     /// 求值器要一个 `OrchestratorControl`，而编排器只在插件 `start` 阶段可得
@@ -130,8 +134,19 @@ impl AutoPromoter {
             engine,
             switch: None,
             cluster: "publisher".into(),
+            families: crate::promotion_gate::VerifiableFamilies::default(),
             eval_slot: None,
         }
+    }
+
+    /// 告诉晋级器这个部署能判哪几族路径的准入条件。与 `ChangePipeline` 读同一份
+    /// 声明；不接线时按「一族的条件都跑不了」处理，判在最贵的动作之前。
+    pub fn with_verifiable_families(
+        mut self,
+        families: crate::promotion_gate::VerifiableFamilies,
+    ) -> Self {
+        self.families = families;
+        self
     }
 
     /// 接线运行时一键暂停开关（admin API 侧共享同一实例）。
@@ -202,7 +217,7 @@ impl AutoPromoter {
             .map(|t| t.path.replace('\\', "/"))
             .collect();
         let diff_lines = count_diff_lines(&change.content);
-        let verdict = classify(&files, diff_lines, &self.policy);
+        let verdict = classify(&files, diff_lines, &self.policy, &self.families);
 
         // 幂等：同一 change 已有终态/进行中的晋级记录则跳过。
         //

@@ -368,6 +368,34 @@ fn is_member_under(path: &str, leaf: &str) -> bool {
             .is_some_and(|file| file.len() > 3 && file.ends_with(".rs"))
 }
 
+/// The path families this deployment can actually judge with an executable
+/// condition, as the promotion gate has to read them.
+///
+/// A family is admitted only when something can run its condition. Admitting a
+/// change into a family whose condition this deployment cannot execute would
+/// hand it to the sandbox, pay for the apply and the whole verification, and
+/// then refuse it at the far end for a reason the gate could read before any of
+/// it started — which is the round this type exists to save.
+///
+/// Derived, never transcribed: [`crate::change_pipeline::ChangePipeline`] builds
+/// it from the same declarations it executes, so the gate and the stage that
+/// runs the commands cannot disagree about whether a family is covered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerifiableFamilies {
+    /// `web/src/**` — declared in `self_evolution.web_admission`.
+    pub web: bool,
+}
+
+/// `web/src/...`：WebUI 的源码这一族。
+///
+/// 边界停在 `src/`：`web/` 下还有构建清单（`package.json` /
+/// `package-lock.json` / `vite.config.ts`），而加一个依赖是供应链决定，不是这一族
+/// 的准入条件判得了的东西。落地那一侧（`is_allowed_path`）用的是同一条边界。
+pub(crate) fn is_web_src(path: &str) -> bool {
+    path.strip_prefix("web/src/")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
 /// `deploy/...`：部署拓扑这一族。
 ///
 /// 按**分量**判，与流水线里那条准入条件的族边界逐字相同（`deploy/` 下不允许
@@ -412,9 +440,20 @@ fn forbidden_dir_segments<'a>(
 /// 6. 任一文件命中 L2 核心路径 → RequireApproval（准入条件里缺的那一条写进理由）；
 /// 7. 全部文件是成员 crate 的 `src/` 或 `tests/` → AutoRollout（编译 + 测试已在
 ///    沙盒跑过；源码与它的用例是同一族的两种形状，混在一笔里也不改变这件事）；
-/// 8. 全部文件落在 L1 白名单 → AutoRollout；
-/// 9. 其余 → Reject（这条路径族没有准入条件）。
-pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfig) -> GateVerdict {
+/// 8. 全部文件是 `web/src/**` → 这个部署声明了可执行的前端构建条件则
+///    AutoRollout，否则 Reject 并点名缺的那一条；
+/// 9. 全部文件落在 L1 白名单 → AutoRollout；
+/// 10. 其余 → Reject（这条路径族没有准入条件）。
+///
+/// `families` 是「这个部署真的能跑哪几族的条件」的读数，由调用方从它**将要去执行**
+/// 的那份声明里算出来（见 [`VerifiableFamilies`]）。判据面与执行面读同一份声明，
+/// 所以「门说能过」与「沙盒里跑得起来」不会是两句话。
+pub fn classify(
+    files: &[String],
+    diff_lines: usize,
+    policy: &PromotionGateConfig,
+    families: &VerifiableFamilies,
+) -> GateVerdict {
     if files.is_empty() {
         return GateVerdict::Reject {
             kind: PromotionGateKind::RejectUnmeasured,
@@ -496,6 +535,25 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
         return GateVerdict::AutoRollout;
     }
 
+    // WebUI 源码这一族的准入条件是前端构建（装依赖 + 类型检查 + 打包），它跑在沙盒
+    // 里、跑在被改过的那棵树上。这个部署能不能跑它是一件**可读的事**，所以在进沙盒
+    // 之前就读：跑不了的时候放进去，只是把同一句话拖到一整轮验证之后再说，而那一轮
+    // 的钱已经花了。
+    if files.iter().all(|f| is_web_src(f)) {
+        if families.web {
+            return GateVerdict::AutoRollout;
+        }
+        return GateVerdict::Reject {
+            kind: PromotionGateKind::RejectUnclassified,
+            reason: format!(
+                "触及 WebUI 源码（{}），而这个部署没有可执行的前端构建条件：\
+                 self_evolution.web_admission 没有声明任何命令（判它的容器里通常没有 \
+                 node/npm）。这一族不转人工——不是等人批，是判它的那条命令还没被声明",
+                files.first().map(String::as_str).unwrap_or_default()
+            ),
+        };
+    }
+
     if files
         .iter()
         .all(|f| matches_any(f, &policy.whitelist_prefixes))
@@ -526,6 +584,18 @@ mod tests {
 
     fn files(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Most cases below are about what the path is, not about what this
+    /// deployment can run, so they judge a deployment whose every family is
+    /// verifiable. The tests that *are* about a missing condition call
+    /// `super::classify` with the narrower [`VerifiableFamilies`] directly.
+    fn classify(
+        files: &[String],
+        diff_lines: usize,
+        policy: &PromotionGateConfig,
+    ) -> GateVerdict {
+        super::classify(files, diff_lines, policy, &VerifiableFamilies { web: true })
     }
 
     #[test]
@@ -749,13 +819,68 @@ mod tests {
         assert!(matches!(v, GateVerdict::RequireApproval { .. }), "{v:?}");
     }
 
+    /// WebUI 源码这一族的准入条件是前端构建。这个部署跑得了它，这一族就走自动
+    /// 晋级——判据在沙盒里跑过、跑的是被改过的那棵树，与 `deploy/**` 同一档。
     #[test]
-    fn whitelist_web_and_docs_is_auto_rollout() {
+    fn web_src_is_admitted_by_a_deployment_that_can_build_it() {
+        let v = super::classify(
+            &files(&["web/src/App.tsx"]),
+            100,
+            &policy(),
+            &VerifiableFamilies { web: true },
+        );
+        assert_eq!(v, GateVerdict::AutoRollout);
+    }
+
+    /// 一条会读这一族、却跑不了它的构建的路径：准入条件在这个部署里不存在。
+    /// 放进沙盒只是把同一句拒收拖到一整轮验证之后再说，而那一轮的钱已经花了。
+    #[test]
+    fn web_src_is_refused_when_this_deployment_cannot_build_it() {
+        let v = super::classify(
+            &files(&["web/src/App.tsx"]),
+            100,
+            &policy(),
+            &VerifiableFamilies { web: false },
+        );
+        match v {
+            GateVerdict::Reject { kind, reason } => {
+                assert_eq!(kind, PromotionGateKind::RejectUnclassified);
+                assert!(
+                    reason.contains("web_admission"),
+                    "拒收要说出缺的是哪一条声明，而不是只说「没有准入条件」：{reason}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 边界停在 `src/`：`web/` 下还有依赖清单，而加一个依赖是供应链决定，不是
+    /// 「前端构建能过」判得了的东西。
+    #[test]
+    fn a_web_build_manifest_is_not_the_web_family() {
+        for path in ["web/package.json", "web/package-lock.json", "web/vite.config.ts"] {
+            let v = classify(&files(&[path]), 10, &policy());
+            assert!(matches!(v, GateVerdict::Reject { .. }), "{path}: {v:?}");
+        }
+    }
+
+    /// 前端源码与另一族混在一笔里时，没有任何一族的条件整笔覆盖它——按最严的
+    /// 那一档处理，而不是让 web 那一格顺手把它带过去。
+    #[test]
+    fn web_src_beside_another_family_is_not_the_web_family() {
         let v = classify(
-            &files(&["web/apps/ui/src/App.tsx", "docs/note.md"]),
+            &files(&["web/src/App.tsx", "docs/note.md"]),
             100,
             &policy(),
         );
+        assert!(matches!(v, GateVerdict::Reject { .. }), "{v:?}");
+    }
+
+    /// `docs/` 仍在白名单里：它没有可执行的准入条件，也不需要一条——文档不是
+    /// 任何编译器或构建器的输入。
+    #[test]
+    fn docs_only_is_still_auto_rollout() {
+        let v = classify(&files(&["docs/note.md"]), 100, &policy());
         assert_eq!(v, GateVerdict::AutoRollout);
     }
 

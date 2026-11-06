@@ -121,11 +121,11 @@ impl Default for PromotionGateConfig {
             // （设计规格/审计/记录）存在仓库之外，永不入库也永不入本
             // 白名单——改内部规格的 change 走"模糊从严"
             // 自动落 L2，规格变更审批权归人。
-            whitelist_prefixes: vec![
-                "crates/cog-agent/src/tools".into(),
-                "web/".into(),
-                "docs/".into(),
-            ],
+            // `web/` 不在这张表里：WebUI 源码是一族**有自己的准入条件**的路径
+            // （见 `promotion_gate::is_web_src`），按前缀塞进白名单会绕开那条条件
+            // ——一笔 `web/package.json` 也在 `web/` 下，而加一个依赖不是白名单
+            // 说得过去的事。
+            whitelist_prefixes: vec!["crates/cog-agent/src/tools".into(), "docs/".into()],
             // `deploy/` 留在这张表里只是**混合变更的兜底**：纯粹的部署变更在分级
             // 里更早地判成自动晋级（那一族的准入条件在应用侧由程序判，判不过的变更
             // 到不了晋级门）。而一笔同时碰部署与别的族的变更，仍按核心路径转人工

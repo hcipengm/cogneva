@@ -290,6 +290,22 @@ COPY --from=builder /build/crates/cog-storage/migrations /opt/cogneva/crates/cog
 # WebUI 静态资源（网关同源直接服务，浏览器打开即用）
 COPY --from=webbuilder /web/dist /opt/cogneva/web
 
+# 前端工具链：沙盒执行器要判 `web/src/**` 的变更，判它的就是前端构建
+# （`deploy/scripts/web-build.sh`：装依赖、类型检查、打包）。容器里没有 node 时
+# 那条命令启动不起来——这一族因此没有可执行的准入条件，只能整族拒收，而「拒收
+# 一条本来编得过的变更」与「放行一条编不过的变更」一样贵，都是白跑一轮。
+#
+# 从**已经装着这份工具链的那一段**拷过来，而不是另装一遍：这样沙盒里判它的 node
+# 与镜像里编它的 node 是同一个版本，钉版本的地方也只有一个（上面那个 `FROM
+# node:22-slim`）。npm 同理——那一段先 `npm install -g npm@latest` 再 `npm ci`，
+# 为的是避开 slim 镜像自带 npm 的 "Exit handler never called!"，这里拷到的就是
+# 升过级的那一份。
+COPY --from=webbuilder /usr/local/bin/node /usr/local/bin/node
+COPY --from=webbuilder /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    node --version && npm --version
+
 # 执行器表的三行样例（planner/generator/evaluator）。表可以为空——空表时目标照常分解，
 # 只是 planner 点不到已登记的种类，且这几类手不再声明自己的工具边界（不声明＝拿整个注册表），
 # 所以镜像是带着样例发的，不是带着必需品。运维可以删、可以改、可以加自己的行。

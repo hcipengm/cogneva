@@ -151,6 +151,13 @@ pub struct ChangeExecutionWorld {
     /// judging side must run the conditions the building side declared.
     #[serde(default)]
     pub deploy_admission: Option<cog_core::DeployAdmissionConfig>,
+    /// The executable admission conditions for a change that touches the WebUI
+    /// source. Travels with the world for the same reason as the topology
+    /// family's: the judging side must run the conditions the building side
+    /// declared, and a world that dropped them would refuse every frontend
+    /// change for a declaration it never received.
+    #[serde(default)]
+    pub web_admission: Option<cog_core::WebAdmissionConfig>,
     pub build_timeout_secs: u64,
     pub auto_apply: bool,
     pub manual_approve: bool,
@@ -617,6 +624,7 @@ async fn run_in(
     .with_fmt_check_command(world.fmt_check_command.clone())
     .with_lint_command(world.lint_command.clone())
     .with_deploy_admission(world.deploy_admission.clone())
+    .with_web_admission(world.web_admission.clone())
     .with_target_dir(world.target_dir.as_path());
     let deployer = EvolutionDeployer::new(
         world.project_root.as_path(),
@@ -1617,6 +1625,7 @@ mod tests {
             fmt_check_command: None,
             lint_command: None,
             deploy_admission: None,
+            web_admission: None,
             build_timeout_secs: 3600,
             auto_apply: true,
             manual_approve: false,

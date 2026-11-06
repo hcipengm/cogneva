@@ -1620,6 +1620,19 @@ pub struct SelfEvolutionConfig {
     /// `server_dry_run` is the argv prefix of a cluster-side dry run, with the
     /// rendered file the change touched appended as its last argument.
     pub deploy_admission: Option<DeployAdmissionConfig>,
+    /// The executable admission conditions for a change that touches the WebUI
+    /// source (`web/src/**`), as commands this deployment declares.
+    ///
+    /// The same shape as [`Self::deploy_admission`] and for the same reason: a
+    /// frontend change has an executable answer — the type checker and the
+    /// bundler accept it or they do not — so it is judged by running them on
+    /// the applied tree rather than by waiting for a person.
+    ///
+    /// Omitted: the family has no condition here, and a change touching it is
+    /// refused by name. That is the state of a deployment whose judging
+    /// container has no JavaScript toolchain, and the refusal says so instead
+    /// of admitting a change nothing can build.
+    pub web_admission: Option<WebAdmissionConfig>,
     /// The command that lints a change's tree, as argv.
     ///
     /// Omitted: this workspace's own linter. It is the only one whose findings
@@ -1702,6 +1715,33 @@ impl DeployAdmissionConfig {
     }
 }
 
+/// The executable admission conditions for the WebUI source family.
+///
+/// A separate type from [`DeployAdmissionConfig`] rather than a reused one: the
+/// topology family's declaration carries a `server_dry_run` prefix, and a
+/// frontend has no server-side object to dry-run. Reusing the type would have
+/// left a field every reader of this one has to know is ignored, which is how a
+/// later reader comes to believe it is honoured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebAdmissionConfig {
+    /// Commands run, in order, in the applied tree. Every one must succeed; the
+    /// first failure is the refusal, with its output as the reason.
+    ///
+    /// Argv, not a shell line, on the same terms as
+    /// [`DeployAdmissionConfig::commands`].
+    pub commands: Vec<Vec<String>>,
+}
+
+impl WebAdmissionConfig {
+    /// Whether this declaration names anything that can actually run, on the
+    /// same terms as [`DeployAdmissionConfig::is_executable`].
+    pub fn is_executable(&self) -> bool {
+        !self.commands.is_empty()
+            && self.commands.iter().all(|c| !c.is_empty())
+            && self.commands.iter().all(|c| !c[0].is_empty())
+    }
+}
+
 impl SelfEvolutionConfig {
     /// The command that judges a change when the deployment names none.
     ///
@@ -1747,6 +1787,7 @@ impl Default for SelfEvolutionConfig {
             fmt_check_command: None,
             lint_command: None,
             deploy_admission: None,
+            web_admission: None,
             build_timeout_secs: 3600,
             poll_interval_secs: 60,
             schema_repair_interval_secs: 600,

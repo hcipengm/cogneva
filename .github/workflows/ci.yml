@@ -451,16 +451,12 @@ jobs:
           node-version: ${{ steps.nodever.outputs.version }}
           cache: npm
           cache-dependency-path: web/package-lock.json
-      # `npm ci` 而不是 `npm install`：按 lockfile 装，装出来的依赖树与镜像里那一份
-      # 同形。改了 package.json 而没更新 lockfile 时它会红，这正是要它红的形态。
-      - name: Install the WebUI dependencies
-        working-directory: web
-        run: npm ci
-      # package.json 的 build 就是 `tsc && vite build`：类型错在 tsc 那一半红，
-      # 打包失败在 vite 那一半红。
+      # 装依赖与打包这两步只有一份写法：`deploy/scripts/web-build.sh`。沙盒执行器
+      # 按 `self_evolution.web_admission` 跑的是同一个脚本、同一棵被改过的树——
+      # 在这里再抄一遍 `npm ci && npm run build`，抄的那一份迟早与它漂开，而漂开的
+      # 形态是「作业绿、沙盒拒收」或者反过来，两种都要花一整轮才看得出来。
       - name: Build the WebUI
-        working-directory: web
-        run: npm run build
+        run: bash deploy/scripts/web-build.sh
       # 替换的语义不是「编译过」能证的东西：从前往后拼、忽略 only 下标、大小写
       # 跟着替换文本走，三种都编得过、跑起来也「成功」，只是把文件改坏。这一步把
       # `replaceMatches` 单文件编译出来在 node 里按判据跑，放在装过依赖的作业

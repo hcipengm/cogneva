@@ -2265,6 +2265,17 @@ fn is_allowed_path(path: &str) -> bool {
         return has_plain_segments(rest);
     }
 
+    if let Some(rest) = p.strip_prefix("web/src/") {
+        // The WebUI source tree, and only it. `web/` also holds the build
+        // manifests — `package.json`, `package-lock.json`, the vite and
+        // tsc configs — and a dependency is a supply-chain decision that no
+        // reviewer on this path makes, so the family stops at the directory
+        // whose every file the frontend build reads. Like `deploy/`, the
+        // shape check here is traversal hygiene; what the change may contain
+        // is decided by the web admission gate, which builds the applied tree.
+        return has_plain_segments(rest);
+    }
+
     // Root-level README*/CHANGELOG* only (no slash => repository root).
     if !p.contains('/') {
         let name = p.to_ascii_lowercase();
@@ -2717,6 +2728,35 @@ mod tests {
                 !is_allowed_path(path),
                 "prefix match is not an escape: {path}"
             );
+        }
+    }
+
+    /// WebUI 的源码是这棵树上的一等公民，但边界停在 `src/`：`web/` 下还有依赖
+    /// 清单，而它是供应链决定，不是一次改动评审能担的。
+    ///
+    /// 与 `deploy/**` 同一个形状：这里断言的是通道存在，它该不该落由前端构建那条
+    /// 准入条件判（`self_evolution.web_admission`）。
+    #[test]
+    fn whitelist_carries_the_webui_source_and_stops_at_its_build_manifests() {
+        for path in [
+            "web/src/App.tsx",
+            "web/src/observability/SpendLedger.tsx",
+            "web/src/api/client.ts",
+            "./web/src/store/chatStore.ts",
+        ] {
+            assert!(is_allowed_path(path), "should allow {path}");
+        }
+        for path in [
+            "web/package.json",
+            "web/package-lock.json",
+            "web/vite.config.ts",
+            "web/tsconfig.json",
+            "web/index.html",
+            "web/src",
+            "web/src/../package.json",
+            "web2/src/App.tsx",
+        ] {
+            assert!(!is_allowed_path(path), "should deny {path}");
         }
     }
 

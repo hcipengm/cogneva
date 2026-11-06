@@ -180,8 +180,8 @@ pub struct GeneratedChange {
 /// built it, and the next round was given the same goal and made the same
 /// edit. Naming the set up front is what lets the generator aim at a repair
 /// that can land.
-pub const CONTRIBUTABLE_SURFACES: &str =
-    "crates/<workspace member>/{src,tests}/**/*.rs, prompts/**, deploy/**, root README/CHANGELOG";
+pub const CONTRIBUTABLE_SURFACES: &str = "crates/<workspace member>/{src,tests}/**/*.rs, \
+     web/src/**, prompts/**, deploy/**, root README/CHANGELOG";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -266,6 +266,18 @@ pub enum RejectionCause {
     /// cluster accept it or they do not. A refusal here names which check
     /// failed, so the next action is to fix the change, not to wait.
     DeployAdmissionFailed,
+    /// The change touches the WebUI source and the admission checks for that
+    /// family did not pass — or the family has none declared at all.
+    ///
+    /// This is a separate cause from [`Self::DeployAdmissionFailed`] rather
+    /// than the same bucket under a wider name: the two families fail for
+    /// different reasons and are repaired by different people. A refused
+    /// topology change names a renderer or a cluster that said no; a refused
+    /// WebUI change names a type error the frontend build reported, or a
+    /// deployment that cannot build a frontend at all. Adding them into one
+    /// counter would leave a run of refusals that cannot be acted on, which is
+    /// the defect the whole axis exists to prevent.
+    WebAdmissionFailed,
     /// A change that claims to fix a red check did not show that red on this
     /// machine, or did not clear it.
     ///
@@ -297,6 +309,7 @@ impl RejectionCause {
         Self::UnreachableDefault,
         Self::ProjectKindUnusable,
         Self::DeployAdmissionFailed,
+        Self::WebAdmissionFailed,
         Self::NotReproduced,
     ];
 
@@ -317,6 +330,7 @@ impl RejectionCause {
             Self::UnreachableDefault => "unreachable_default",
             Self::ProjectKindUnusable => "project_kind_unusable",
             Self::DeployAdmissionFailed => "deploy_admission_failed",
+            Self::WebAdmissionFailed => "web_admission_failed",
             Self::NotReproduced => "not_reproduced",
         }
     }
@@ -2738,6 +2752,7 @@ mod tests {
                 RejectionCause::UnreachableDefault => "unreachable_default",
                 RejectionCause::ProjectKindUnusable => "project_kind_unusable",
                 RejectionCause::DeployAdmissionFailed => "deploy_admission_failed",
+                RejectionCause::WebAdmissionFailed => "web_admission_failed",
                 RejectionCause::NotReproduced => "not_reproduced",
             };
             assert_eq!(cause.as_str(), spelling, "{cause:?} spells two ways");
@@ -2749,7 +2764,7 @@ mod tests {
             assert!(!seen.contains(&spelling), "{spelling} is in the list twice");
             seen.push(spelling);
         }
-        assert_eq!(seen.len(), 15, "ALL is missing a cause: {seen:?}");
+        assert_eq!(seen.len(), 16, "ALL is missing a cause: {seen:?}");
         for (index, cause) in RejectionCause::ALL.iter().enumerate() {
             assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
         }
