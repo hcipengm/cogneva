@@ -61,15 +61,26 @@ fn build_concurrency() -> usize {
         .unwrap_or(DEFAULT_BUILD_CONCURRENCY)
 }
 
-/// Hard ceiling on command duration regardless of what the client asks for.
-// cap: bound — 命令时长的硬顶，与客户端要多少无关
-const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Wall for a command whose caller named none. Long enough for an interactive
 /// command to finish, short enough that a caller which stopped listening does not
-/// hold the executor; a caller that needs longer asks for it, up to the ceiling
-/// above.
+/// hold the executor; a caller that needs longer asks for it.
 // cap: bound — 调用方没给时的一堵墙：交互命令够跑完，调用方不听了也不至于吊住
 const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The wall one command runs under: the caller's, or the default when it named
+/// none.
+///
+/// There used to be a second, hardcoded ceiling here (600 s) that clamped every
+/// larger request. It was a second source of truth for one number, and it lost
+/// silently: an operator who raised `system.shell_timeout_secs` to an hour got
+/// ten minutes and a "timed out after 600s" line that named a number appearing
+/// nowhere in their configuration. The client's value comes from that one knob,
+/// so it is honored as given here.
+fn effective_timeout(timeout_ms: Option<u64>) -> std::time::Duration {
+    timeout_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_TIMEOUT)
+}
 
 /// Port the executor listens on when `SANDBOX_EXECUTOR_PORT` names none.
 ///
@@ -198,11 +209,7 @@ async fn execute_handler(
     State(state): State<AppState>,
     Json(req): Json<ExecuteRequest>,
 ) -> Response {
-    let timeout = req
-        .timeout_ms
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(DEFAULT_TIMEOUT)
-        .min(MAX_TIMEOUT);
+    let timeout = effective_timeout(req.timeout_ms);
     let (workdir, cargo_target, worktree_claim) =
         match resolve_workdir(&state, req.task_id.as_deref()).await {
             Ok(resolved) => resolved,
@@ -713,6 +720,32 @@ mod tests {
     /// Serializes the tests that mutate `SANDBOX_EXECUTOR_PORT`: the variable
     /// is process-global while the harness runs tests on parallel threads.
     static PORT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 调用方要多久就是多久：这一层不再有自己的硬顶。
+    ///
+    /// 600 秒那道旧硬顶是同一个数的第二个来源，而且它悄悄生效——把
+    /// `system.shell_timeout_secs` 抬到一小时的人，拿到的是十分钟和一句
+    /// "timed out after 600s"，那个数在他的配置里根本不存在。这条判据钉的是
+    /// 抬上去的那一格真的到了执行器。
+    #[test]
+    fn a_longer_wall_than_six_hundred_seconds_is_honored() {
+        assert_eq!(
+            effective_timeout(Some(3_600_000)),
+            std::time::Duration::from_secs(3600),
+            "执行器把调用方要的一小时截回了旧的上限"
+        );
+        assert_eq!(
+            effective_timeout(Some(200_000)),
+            std::time::Duration::from_secs(200)
+        );
+    }
+
+    /// 没写就是那堵 30 秒的墙：调用方不听了，命令不该把执行器吊住。
+    #[test]
+    fn a_caller_that_names_no_wall_gets_the_short_one() {
+        assert_eq!(effective_timeout(None), DEFAULT_TIMEOUT);
+        assert_eq!(DEFAULT_TIMEOUT, std::time::Duration::from_secs(30));
+    }
 
     fn state_with_build_slots(n: usize) -> AppState {
         AppState {

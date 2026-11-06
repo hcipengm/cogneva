@@ -520,6 +520,33 @@ impl ToolRegistry {
                 // 而读回结果时还要用它切出调用方要的那一段。
                 let read_offset = arguments.get("offset").and_then(|v| v.as_u64());
                 let read_limit = arguments.get("limit").and_then(|v| v.as_u64());
+                // 单条命令可以自己定一堵墙；不写就用配置那一格。要的比配置大时当场
+                // 拒绝并说出上限：静默改小，调用方会以为它拿到的是自己定的那个数，
+                // 而它拿到的是一次在它没料到的时刻发生的超时。
+                let timeout = match arguments.get("timeout_seconds") {
+                    None => self.shell_timeout,
+                    Some(value) => {
+                        let secs = value.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                            cog_core::SFError::Validation(
+                                "`timeout_seconds` has to be a positive whole number of seconds"
+                                    .into(),
+                            )
+                        })?;
+                        let asked = std::time::Duration::from_secs(secs);
+                        if asked > self.shell_timeout {
+                            return Err(ToolRunError::Failed(cog_core::SFError::Validation(
+                                format!(
+                                    "timeout_seconds {secs} is longer than the {}s wall this \
+                                     process allows (system.shell_timeout_secs); raise that \
+                                     setting for a longer run -- the value is not shortened \
+                                     silently",
+                                    self.shell_timeout.as_secs()
+                                ),
+                            )));
+                        }
+                        asked
+                    }
+                };
                 let req = SandboxRequest {
                     task_id: scope
                         .map(|s| s.task_id.clone())
@@ -529,7 +556,7 @@ impl ToolRegistry {
                         .unwrap_or_else(|| format!("unscoped-tool-{}", name)),
                     payload,
                     input: arguments,
-                    timeout: self.shell_timeout,
+                    timeout,
                     limits: Default::default(),
                 };
                 let mut stream = backend.execute_stream(&req).await?;
@@ -1740,6 +1767,55 @@ mod tests {
         );
     }
 
+    /// 一条命令可以自己把墙立短一点：调用方写多少，沙箱就收到多少。
+    #[tokio::test]
+    async fn a_command_can_name_its_own_shorter_wall() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry = ToolRegistry::new()
+            .with_shell_timeout(600)
+            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        registry
+            .execute(
+                "run_command",
+                serde_json::json!({"command": "echo hi", "timeout_seconds": 45}),
+            )
+            .await
+            .unwrap();
+
+        let seen = backend.seen.lock().await;
+        assert_eq!(seen[0].2, Duration::from_secs(45), "沙箱收到的是 45 秒");
+    }
+
+    /// 比配置那一格更大时当场拒绝，并把它自己报出来。
+    ///
+    /// 静默截成配置值，调用方会以为它按自己的数在跑，然后在它没料到的时刻看到
+    /// 超时——两个数里真正生效的那个必须出现在它读得到的地方。
+    #[tokio::test]
+    async fn a_command_that_asks_for_longer_than_the_ceiling_is_refused_by_name() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry = ToolRegistry::new()
+            .with_shell_timeout(300)
+            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        let err = registry
+            .execute(
+                "run_command",
+                serde_json::json!({"command": "cargo build", "timeout_seconds": 900}),
+            )
+            .await
+            .expect_err("900 秒超过 300 秒的上限，应当拒绝");
+        let text = err.to_string();
+        assert!(text.contains("900"), "要说出调用方要的那个数：{text}");
+        assert!(text.contains("300"), "要说出真正生效的上限：{text}");
+        assert!(
+            backend.seen.lock().await.is_empty(),
+            "拒绝的命令不该已经交给沙箱"
+        );
+    }
+
     #[tokio::test]
     async fn shell_commands_get_their_own_budget_not_the_wasm_one() {
         let backend = Arc::new(RecordingBackend::default());
@@ -1963,7 +2039,16 @@ pub mod builtins {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Command to run" }
+                    "command": { "type": "string", "description": "Command to run" },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "How long this one command may run, in seconds. \
+                                        Leave it out for the configured wall \
+                                        (`system.shell_timeout_secs`). A value above that \
+                                        wall is refused with the limit named, never \
+                                        silently shortened, so build and test runs that \
+                                        need longer say so in the call"
+                    }
                 },
                 "required": ["command"]
             }),
