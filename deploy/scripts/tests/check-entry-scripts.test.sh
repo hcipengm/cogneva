@@ -49,10 +49,20 @@ exit 0
 EOF
 chmod +x "${WORK}/bin/git" "${WORK}/bin/shellcheck"
 
-# 1 与 2：缺工具、缺库。PATH 里只有假工具台和系统基础目录，/usr/local/bin 不在其中
-# （helm 与 kubectl 装在那里），promtool 与 pwsh 这台机器上本来就没有。
+# 1 与 2：缺工具、缺库。
+#
+# 「缺哪些工具」必须是这条路**自己造出来**的，不能靠跑它的机器上恰好没有：CI 的
+# runner 用 apt 装了 promtool，也自带 /usr/bin/pwsh，于是 `PATH=…:/usr/bin:/bin`
+# 这一句在那里仍然找得到它们；脚本如实地不点名，测试却在断言「必须点名」。2026-11-06
+# 实测：这一条在上游 Entry Scripts Lint 上一直是 3 条不满足，而本机（两样都没有）
+# 一直是绿的——读数跟着机器变，红的原因与提交内容无关，整整一天没有一版滚上去。
+# 所以这里给一个只有 bash 与那两个假工具的 PATH：缺的那几样是构造出来的，不是捡来的。
+mkdir -p "${WORK}/only"
+for kept in bash dirname; do
+  ln -s "$(command -v "${kept}")" "${WORK}/only/${kept}"
+done
 env -u COGNEVA_TEST_DATABASE_URL \
-  PATH="${WORK}/bin:/usr/bin:/bin" \
+  PATH="${WORK}/bin:${WORK}/only" \
   bash "${SCRIPT}" >"${WORK}/out" 2>"${WORK}/err"
 status=$?
 if [ "${status}" -ne 2 ]; then
@@ -69,6 +79,12 @@ grep -q '跑了且绿：shellcheck' "${WORK}/err" ||
   fail "缺工具时没有说明已经跑成了哪一段：$(cat "${WORK}/err")"
 if grep -q '^== script tests' "${WORK}/out"; then
   fail "缺工具时仍然起了脚本测试；那些测试会把「缺 promtool」报成一条红，而红与缺工具是两种要分别处置的事"
+fi
+# 造出来的 PATH 要够这条脚本**自己**跑起来（`dirname` 这种不算「被测的工具」）。
+# 不够时它带着半截正文跑完，而上面几条断言只看「点了谁的名」——半截的 Gate 与完整
+# 的 Gate 在那些断言上长得一模一样，于是这条测试会绿在一段根本没走完的正文上。
+if grep -q 'command not found' "${WORK}/err"; then
+  fail "缺工具那一跑里有命令找不到：造的 PATH 不够脚本自己跑起来——$(cat "${WORK}/err")"
 fi
 
 # 3：清单是数出来的，不是抄的。
