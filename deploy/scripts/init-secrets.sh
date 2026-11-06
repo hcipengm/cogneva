@@ -405,6 +405,9 @@ ensure_random app-password
 # 备份演练连源库的角色（cog_backup）口令：只带 CREATEDB，能读全部表、能写自己那一行
 # 结论。与 pg-password 分开之后，没有任何工作负载再连那个超级用户角色。
 ensure_random backup-password
+# 变更验证连测试库的角色（cog_test）口令：CREATEDB + CREATEROLE，因为 `backup_pg`
+# 那几条的题目就是「没有超权位的角色能不能把包恢复回一台新库」。它读不到 cogneva。
+ensure_random test-password
 ensure_random redis-password
 ensure_random webhook-internal
 ensure_random jwt-secret
