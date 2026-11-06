@@ -135,18 +135,69 @@ impl RedisMessageBackend {
     /// Its own manager means its own socket and its own reconnect as well: one
     /// consumer's dead connection cannot stall the rest.
     async fn subscribe_connection(&self) -> SFResult<ConnectionManager> {
-        // A read loop's command is the one command here that legitimately holds
-        // the wire open, so its reply deadline has to clear the block period the
-        // loop asked for — otherwise every idle read would read as a refusal.
-        // Clear it by a wide margin: the margin costs nothing when the peer is
-        // healthy, and when it is not, it is the difference between a loop that
-        // counts a lost read and one that waits out the kernel's TCP timeout
-        // (measured on 2026-10-22: ten minutes of silence, zero refusals
-        // counted, every group of the process stalled at once).
-        let block_ms = self.read_block_ms.max(self.resume_block_ms) as u64;
-        let budget = RedisConnectBudget::from_env()
-            .with_response_timeout_ms(block_ms.saturating_add(READ_RESPONSE_GRACE_MS));
-        connect_with(&self.client, budget).await
+        open_read_connection(&self.client, self.read_block_ms, self.resume_block_ms).await
+    }
+}
+
+/// Open one read loop's own connection.
+///
+/// A read loop's command is the one command here that legitimately holds the
+/// wire open, so its reply deadline has to clear the block period the loop asked
+/// for — otherwise every idle read would read as a refusal. Clear it by a wide
+/// margin: the margin costs nothing when the peer is healthy, and when it is
+/// not, it is the difference between a loop that counts a lost read and one that
+/// waits out the kernel's TCP timeout (measured on 2026-10-22: ten minutes of
+/// silence, zero refusals counted, every group of the process stalled at once).
+///
+/// Free rather than a method because the read loop has to open a replacement
+/// from inside its own body, where `self` is no longer reachable: the body is a
+/// `'static` stream, so it holds a cloned client rather than the backend.
+async fn open_read_connection(
+    client: &redis::Client,
+    read_block_ms: usize,
+    resume_block_ms: usize,
+) -> SFResult<ConnectionManager> {
+    let block_ms = read_block_ms.max(resume_block_ms) as u64;
+    let budget = RedisConnectBudget::from_env()
+        .with_response_timeout_ms(block_ms.saturating_add(READ_RESPONSE_GRACE_MS));
+    connect_with(client, budget).await
+}
+
+/// How long one read may hold the loop before it counts as unanswered.
+///
+/// The block period plus the same grace the connection's own reply deadline
+/// carries: a read that is merely blocked is answered by the server when its
+/// block expires, so anything past that margin is a socket that will not answer
+/// rather than a stream that has nothing to say.
+fn read_deadline(block_ms: usize) -> std::time::Duration {
+    std::time::Duration::from_millis((block_ms as u64).saturating_add(READ_RESPONSE_GRACE_MS))
+}
+
+/// The connection the next read should use after one failed or went unanswered.
+///
+/// Opens a replacement rather than handing the same socket back. A failed read
+/// leaves a request-reply connection with a reply nobody collected, and every
+/// later command on it waits behind that one — retrying on it is what turned a
+/// single lost reply into a consumer that never read again. When the replacement
+/// cannot be opened the old one is returned: a loop that keeps trying on a
+/// possibly-bad socket is better than one that stops, and the next failed read
+/// asks again.
+async fn reopen_after_failed_read(
+    client: &redis::Client,
+    read_block_ms: usize,
+    resume_block_ms: usize,
+    current: ConnectionManager,
+    subject: &str,
+) -> ConnectionManager {
+    match open_read_connection(client, read_block_ms, resume_block_ms).await {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            tracing::warn!(
+                stream = %subject,
+                "could not reopen a read connection; keeping the one that failed: {e}"
+            );
+            current
+        }
     }
 }
 
@@ -355,11 +406,19 @@ impl MessageBackend for RedisMessageBackend {
         let guard = ReadHealth::track(&health, &subject, &group);
         let block_ms = self.read_block_ms;
         let stop = self.register_stop(&subject, &group);
+        // What a replacement connection is opened from. The body below is a
+        // `'static` stream, so the backend is out of reach by then and these
+        // three are the whole of what `subscribe_connection` needs.
+        let reopen_client = self.client.clone();
+        let reopen_read_block_ms = self.read_block_ms;
+        let reopen_resume_block_ms = self.resume_block_ms;
+        let read_deadline = read_deadline(block_ms);
         let stream = futures::stream::try_unfold(
             (conn, 0u64, guard, stop),
             move |(mut conn, mut backoff, guard, stop)| {
                 let subject = subject.clone();
                 let group = group.clone();
+                let reopen_client = reopen_client.clone();
                 async move {
                     loop {
                         // Asked between reads, not raced against one: the read
@@ -374,25 +433,82 @@ impl MessageBackend for RedisMessageBackend {
                             );
                             return Ok(None);
                         }
-                        match group_read(&mut conn, &subject, &group, ">", block_ms).await {
-                            Ok(Some(item)) => {
+                        let read = tokio::time::timeout(
+                            read_deadline,
+                            group_read(&mut conn, &subject, &group, ">", block_ms),
+                        )
+                        .await;
+                        // A read that outlives its own block period was not
+                        // answered, and a request-reply socket that stopped
+                        // answering does not start again: every later command
+                        // queues behind the one still on the wire, so retrying on
+                        // this connection turns one lost reply into a consumer
+                        // that is silent for as long as the process lives. It
+                        // shows as nothing at all — no error to count, no lag
+                        // moving — which is why this is a deadline here and not
+                        // only the driver's own timeout (measured 2026-11-06:
+                        // the process-local ready stream delivered nothing for
+                        // nineteen hours with 1,369 entries queued behind it,
+                        // while a group created on the same key read the head of
+                        // the stream immediately).
+                        //
+                        // A read dropped at the deadline may have been answered
+                        // after all, and its entry would then be pending and
+                        // unacked rather than lost: the claim path that already
+                        // re-runs idle pending entries is what recovers it. That
+                        // is the cheaper of the two mistakes — the other one is
+                        // a consumer that never reads again.
+                        match read {
+                            Ok(Ok(Some(item))) => {
                                 guard.note_ok();
                                 return Ok(Some((item, (conn, 0, guard, stop))));
                             }
-                            Ok(None) => {
+                            Ok(Ok(None)) => {
                                 guard.note_ok();
                                 backoff = 0;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 let refusal = read_refusal(&e);
                                 guard.note_failure(refusal);
                                 tracing::warn!(
                                     stream = %subject,
-                                    "XREADGROUP failed, retrying with backoff: {e}"
+                                    "XREADGROUP failed, reopening the read connection: {e}"
                                 );
+                                // Replaced first, repaired second: the repair
+                                // is another command on this socket, and a
+                                // socket that just failed is the one least
+                                // likely to answer it. Doing it in this order
+                                // also means the group is created through the
+                                // connection the retry will actually use.
+                                conn = reopen_after_failed_read(
+                                    &reopen_client,
+                                    reopen_read_block_ms,
+                                    reopen_resume_block_ms,
+                                    conn,
+                                    &subject,
+                                )
+                                .await;
                                 recover_refused_read(refusal, || {
                                     ensure_stream_group(&mut conn, &subject, &group)
                                 })
+                                .await;
+                                backoff = sleep_backoff(backoff).await;
+                            }
+                            Err(_elapsed) => {
+                                guard.note_failure(ReadRefusal::Other);
+                                tracing::warn!(
+                                    stream = %subject,
+                                    block_ms,
+                                    "XREADGROUP was not answered within its block period, \
+                                     reopening the read connection"
+                                );
+                                conn = reopen_after_failed_read(
+                                    &reopen_client,
+                                    reopen_read_block_ms,
+                                    reopen_resume_block_ms,
+                                    conn,
+                                    &subject,
+                                )
                                 .await;
                                 backoff = sleep_backoff(backoff).await;
                             }
@@ -458,39 +574,76 @@ impl MessageBackend for RedisMessageBackend {
         let guard = ReadHealth::track(&health, &subject, &group);
         let read_block_ms = self.read_block_ms;
         let resume_block_ms = self.resume_block_ms;
+        let reopen_client = self.client.clone();
         let stream = futures::stream::try_unfold(
             (conn, Some(start_id), 0u64, guard),
             move |(mut conn, mut first_id, mut backoff, guard)| {
                 let subject = subject.clone();
                 let group = group.clone();
+                let reopen_client = reopen_client.clone();
                 async move {
                     loop {
-                        let id = first_id.as_deref().unwrap_or(">");
+                        let id = first_id.clone().unwrap_or_else(|| ">".to_string());
                         let block_ms = if first_id.is_some() {
                             resume_block_ms
                         } else {
                             read_block_ms
                         };
-                        match group_read(&mut conn, &subject, &group, id, block_ms).await {
-                            Ok(Some(item)) => {
+                        // Same deadline as `subscribe`: a read that outlives its
+                        // own block period is a socket that will not answer, not
+                        // a stream with nothing to say, and retrying on that
+                        // socket is what makes the silence permanent.
+                        let read = tokio::time::timeout(
+                            read_deadline(block_ms),
+                            group_read(&mut conn, &subject, &group, &id, block_ms),
+                        )
+                        .await;
+                        match read {
+                            Ok(Ok(Some(item))) => {
                                 guard.note_ok();
                                 return Ok(Some((item, (conn, None, 0, guard))));
                             }
-                            Ok(None) => {
+                            Ok(Ok(None)) => {
                                 guard.note_ok();
                                 first_id = None;
                                 backoff = 0;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 let refusal = read_refusal(&e);
                                 guard.note_failure(refusal);
                                 tracing::warn!(
                                     stream = %subject,
-                                    "XREADGROUP failed, retrying with backoff: {e}"
+                                    "XREADGROUP failed, reopening the read connection: {e}"
                                 );
+                                conn = reopen_after_failed_read(
+                                    &reopen_client,
+                                    read_block_ms,
+                                    resume_block_ms,
+                                    conn,
+                                    &subject,
+                                )
+                                .await;
                                 recover_refused_read(refusal, || {
                                     ensure_stream_group(&mut conn, &subject, &group)
                                 })
+                                .await;
+                                backoff = sleep_backoff(backoff).await;
+                            }
+                            Err(_elapsed) => {
+                                guard.note_failure(ReadRefusal::Other);
+                                tracing::warn!(
+                                    stream = %subject,
+                                    block_ms,
+                                    "XREADGROUP was not answered within its block period, \
+                                     reopening the read connection"
+                                );
+                                conn = reopen_after_failed_read(
+                                    &reopen_client,
+                                    read_block_ms,
+                                    resume_block_ms,
+                                    conn,
+                                    &subject,
+                                )
                                 .await;
                                 backoff = sleep_backoff(backoff).await;
                             }
