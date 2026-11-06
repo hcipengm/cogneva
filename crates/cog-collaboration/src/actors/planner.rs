@@ -258,7 +258,8 @@ impl PlannerActor {
                  Emit ONLY a single JSON object matching the output_schema. No markdown, no XML, no code fences, no change content. \
                  Do not output artifact tags or unified diffs; the change itself is produced in a later step. \
                  Also produce targets: the repository-relative paths the change must touch. Read the checkout before you name them \
-                 (you have read_file) — the change's diff is judged against this list, and a change that never touches a path you \
+                 (read_file takes several paths at once, up to eight, so read the files you need in one call instead of one \
+                 call per file) — the change's diff is judged against this list, and a change that never touches a path you \
                  named is refused. Name the files the work actually needs, not every file you looked at: an entry you name and the \
                  change does not touch is a failure, while the change touching files beyond your list is allowed. If the intent names \
                  an existing file, that file belongs in targets."

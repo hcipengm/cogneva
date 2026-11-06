@@ -108,6 +108,53 @@ const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
 // cap: bound — 两道界取更紧的那道；被它停下的页面照样带 has_more 与 next_offset，翻页不漏行
 const READ_FILE_PAGE_MAX_CHARS: usize = 32 * 1024;
 
+/// `read_file` 一次批量读最多带几个文件。
+///
+/// 批量读省的是往返次数，不是正文：读进来的字节与逐个读一样多。但一次带回
+/// 几十个文件就是把这几十页一起钉进上下文，之后每一轮都要重发，省下的往返
+/// 又按轮数赔回去。八份是一屏常见的「这一次改动要碰的文件」，再多的调用方
+/// 应当先缩小范围再读。
+// cap: bound — 一次带回几十份会把它们一起钉进上下文，之后每轮重发，省下的往返按轮数赔回去
+const READ_FILE_MAX_BATCH: usize = 8;
+
+/// `read_file` 调用方给的是哪几个文件。
+///
+/// `paths` 与 `path` 都认：前者一次读多份，后者是原有的一次一份。两个一起给
+/// 是调用方没说清要读什么，报错比猜一个更能省一轮——猜错的那一轮要付整份
+/// 上下文的重发钱。`paths` 为空同样报错：空批量回一个空数组，读的人会把它
+/// 当成「这些文件都不存在」。
+fn batch_paths(arguments: &serde_json::Value) -> Result<Option<Vec<String>>, cog_core::SFError> {
+    let Some(raw) = arguments.get("paths") else {
+        return Ok(None);
+    };
+    if arguments.get("path").is_some() {
+        return Err(cog_core::SFError::Validation(
+            "give either path (one file) or paths (several), not both".into(),
+        ));
+    }
+    let list = raw
+        .as_array()
+        .ok_or_else(|| cog_core::SFError::Validation("paths must be an array of strings".into()))?;
+    if list.is_empty() {
+        return Err(cog_core::SFError::Validation("paths is empty".into()));
+    }
+    if list.len() > READ_FILE_MAX_BATCH {
+        return Err(cog_core::SFError::Validation(format!(
+            "paths has {} entries; at most {} files per call, read the rest in another call",
+            list.len(),
+            READ_FILE_MAX_BATCH
+        )));
+    }
+    list.iter()
+        .map(|p| {
+            p.as_str().map(str::to_string).ok_or_else(|| {
+                cog_core::SFError::Validation("paths must be an array of strings".into())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 /// 按行切出 `read_file` 调用方要的那一段。
 ///
 /// 整份读回来再整份塞进 tool_result 的代价不在磁盘上：这份正文进了上下文，
@@ -474,6 +521,78 @@ impl ToolRegistry {
                 let backend = self.sandbox_backend.as_ref().ok_or_else(|| {
                     cog_core::SFError::Agent("SandboxBackend not configured for shell tool".into())
                 })?;
+                // 一次调用读多个文件。
+                //
+                // 规划器每份计划要读近二十个文件，而每一次 `read_file` 是一整轮
+                // 往返：集群实测（2026-11-06，24 小时）里规划器的 5,765 次往返
+                // 有 4,721 次的工具调用就是 `read_file`，`run_command` 一次也没
+                // 出现过——模型不会自己把多次读塞进一条 shell，它照着工具表一个
+                // 文件一个文件地读。每多一轮，之前读到的全部正文都要重发一遍，
+                // 这份代价不在磁盘上，在上下文的重发次数上。
+                //
+                // 批量读减少的是往返，不是正文：每份文件仍然只给一页，读进来的
+                // 字节与逐个读一样多，只是被重发的次数从「每份一次」变成「每批
+                // 一次」。单个文件读失败不拖垮整批——只写进它自己那一项。
+                if matches!(op, cog_core::ShellOp::ReadFile) {
+                    if let Some(paths) = batch_paths(&arguments).map_err(ToolRunError::Failed)? {
+                        let offset = arguments.get("offset").and_then(|v| v.as_u64());
+                        let limit = arguments.get("limit").and_then(|v| v.as_u64());
+                        let task_id = scope
+                            .map(|s| s.task_id.clone())
+                            .unwrap_or_else(|| format!("unscoped-shell-{}", uuid::Uuid::new_v4()));
+                        let agent_id = scope
+                            .map(|s| s.agent_id.clone())
+                            .unwrap_or_else(|| format!("unscoped-tool-{}", name));
+                        let mut files = Vec::with_capacity(paths.len());
+                        for path in &paths {
+                            let req = SandboxRequest {
+                                task_id: task_id.clone(),
+                                agent_id: agent_id.clone(),
+                                payload: SandboxPayload::ReadFile { path: path.clone() },
+                                input: serde_json::json!({ "path": path }),
+                                timeout: self.shell_timeout,
+                                limits: Default::default(),
+                            };
+                            let mut stream = match backend.execute_stream(&req).await {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    files.push(serde_json::json!({
+                                        "path": path,
+                                        "error": e.to_string(),
+                                    }));
+                                    continue;
+                                }
+                            };
+                            let mut stdout = String::new();
+                            let mut stderr = String::new();
+                            let mut code = 0;
+                            while let Some(event) = stream.next().await {
+                                match event {
+                                    CommandEvent::Stdout { data } => stdout.push_str(&data),
+                                    CommandEvent::Stderr { data } => stderr.push_str(&data),
+                                    CommandEvent::Exit { code: c } => code = c,
+                                }
+                            }
+                            if code == 0 {
+                                let window = read_window(&stdout, offset, limit);
+                                let mut entry = serde_json::Map::new();
+                                entry.insert("path".into(), serde_json::json!(path));
+                                if let Some(fields) = window.as_object() {
+                                    for (k, v) in fields {
+                                        entry.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                files.push(serde_json::Value::Object(entry));
+                            } else {
+                                files.push(serde_json::json!({
+                                    "path": path,
+                                    "error": stderr,
+                                }));
+                            }
+                        }
+                        return Ok(serde_json::json!({ "files": files }));
+                    }
+                }
                 let payload =
                     match op {
                         cog_core::ShellOp::Command | cog_core::ShellOp::CommandBackground => {
@@ -1436,6 +1555,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 一次调用读多个文件。
+    ///
+    /// 迁移前每个文件一次往返：集群实测（2026-11-06，24 小时）规划器 5,765
+    /// 次往返里 4,721 次就是逐个 `read_file`，而每次往返都要把之前读到的全部
+    /// 正文重发一遍。批量读必须按调用方给的顺序回，否则调用方要自己按 path
+    /// 去对，等于把省下的那几轮又花回去找。
+    #[tokio::test]
+    async fn read_file_reads_several_paths_in_one_call_and_keeps_their_order() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = dir.join("b.txt");
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "alpha").unwrap();
+        std::fs::write(&b, "beta").unwrap();
+        let missing = dir.join("missing.txt");
+        let (a, b, missing) = (
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            missing.to_str().unwrap(),
+        );
+
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+
+        let out = registry
+            .execute("read_file", serde_json::json!({"paths": [b, a, missing]}))
+            .await
+            .unwrap();
+        let files = out["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0]["path"], b);
+        assert_eq!(files[0]["content"], "beta");
+        assert_eq!(files[1]["path"], a);
+        assert_eq!(files[1]["content"], "alpha");
+        assert_eq!(files[2]["path"], missing);
+        assert!(
+            files[2]["error"].is_string(),
+            "one unreadable path must be reported on its own entry, not sink the batch: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 批量的两道界都报错而不是猜：`path` 与 `paths` 同时给是没说清要读什么，
+    /// 超过八份则是一次把太多页钉进上下文，之后每轮都要重发。猜一个都能省
+    /// 一轮往返，但猜错了那一轮要付整份上下文的重发钱。
+    #[tokio::test]
+    async fn read_file_refuses_an_ambiguous_or_oversized_batch() {
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+
+        let both = registry
+            .execute(
+                "read_file",
+                serde_json::json!({"path": "a.txt", "paths": ["b.txt"]}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(both.contains("not both"), "unexpected message: {both}");
+
+        let too_many: Vec<String> = (0..READ_FILE_MAX_BATCH + 1)
+            .map(|i| format!("f{i}.txt"))
+            .collect();
+        let over = registry
+            .execute("read_file", serde_json::json!({ "paths": too_many }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            over.contains(&READ_FILE_MAX_BATCH.to_string()) && over.contains("at most"),
+            "unexpected message: {over}"
+        );
+    }
+
     /// 带行范围读时只回那一段，但必须同时说清文件有多长、后面还有没有：
     /// 只回切片，读到的人会以为文件到那里就结束了；不回这一段，整份正文就
     /// 要进上下文，并且之后每一轮都跟着重发。
@@ -2385,12 +2578,20 @@ pub mod builtins {
                           when a checkout is provisioned. Pass offset and/or limit \
                           to read one line range of a long file instead of the whole \
                           thing; the result then also reports the file's total line \
-                          count and whether more remains."
+                          count and whether more remains. To read several files, \
+                          pass paths instead of path: one call returns them all, \
+                          which costs far less than one call per file."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path" },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": READ_FILE_MAX_BATCH,
+                        "description": "Several file paths to read in this one call; the result is an array of entries in the same order, each with path and either content or error. Give either path or paths, not both. At most 8 files per call"
+                    },
                     "offset": {
                         "type": "integer",
                         "minimum": 1,
@@ -2402,7 +2603,7 @@ pub mod builtins {
                         "description": "How many lines to return; omit to read one page (600 lines) or the rest of the file if shorter. The reply carries total_lines, has_more and next_offset, so a long file is read page by page instead of in one piece"
                     }
                 },
-                "required": ["path"]
+                "anyOf": [{ "required": ["path"] }, { "required": ["paths"] }]
             }),
             implementation: ToolImplementation::Shell(cog_core::ShellOp::ReadFile),
         }
