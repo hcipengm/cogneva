@@ -1089,8 +1089,15 @@ impl WorkdirRouter {
             if self.commands_running(id, false) > 0 {
                 continue;
             }
+            // An idle hour is not evidence that a standing shell is done with:
+            // its id comes back on the next turn, so the TTL would delete the
+            // user's files between two conversations rather than after one.
+            // The cap still reclaims it when a slot is needed -- see
+            // [`is_standing_lane`].
             let reap = match self.read_meta(id) {
-                Some(meta) => now.saturating_sub(meta.last_used_unix) >= ttl,
+                Some(meta) => {
+                    !is_standing_lane(id) && now.saturating_sub(meta.last_used_unix) >= ttl
+                }
                 None => {
                     // Registered tree without sidecar: adopt rather than reap,
                     // a restart may have raced its first write.
@@ -2783,6 +2790,40 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(ids, vec!["unscoped-shell-new".to_string()]);
         assert_eq!(r.metrics.cap_deferred.get(), 0.0);
+    }
+
+    /// The idle TTL is a rule about finished work: a task tree's id is spent by
+    /// its round, so an idle one is a tree nobody will ask for. A standing shell
+    /// comes back by name, so the same idle hour says nothing — reaping it would
+    /// delete the user's files between two conversations rather than after one.
+    #[tokio::test]
+    async fn the_idle_ttl_leaves_a_standing_shell_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, Duration::ZERO);
+        let (shell, _) = r.route("unscoped-shell-vera-82191e4a").await.unwrap();
+        let (round, _) = r.route("round-a").await.unwrap();
+        // Stamped together so the arrival span is zero and the configured TTL
+        // stands; the derived one is floored at an hour and would hide the rule.
+        let together = unix_now();
+        for id in ["unscoped-shell-vera-82191e4a", "round-a"] {
+            let mut meta = r.read_meta(id).expect("a routed tree has a sidecar");
+            meta.created_at_unix = together;
+            meta.last_used_unix = together;
+            r.write_meta(&meta).await.unwrap();
+        }
+
+        assert_eq!(
+            r.gc_once().await.unwrap(),
+            1,
+            "only the spent round is idle work"
+        );
+        assert!(
+            shell.exists(),
+            "a conversation keeps the files it wrote last time"
+        );
+        assert!(!round.exists(), "a finished round's tree is still reaped");
+        assert_eq!(r.list_task_trees().await.len(), 1);
     }
 
     /// A registration a killed add left locked is invisible to both halves of
