@@ -1,5 +1,6 @@
 //! principle: feedback_a_word_boundary_only_applies_where_both_ends_are_word_characters
 //! principle: feedback_the_pending_split_reads_only_two_kinds_so_the_absence_rows_are_never_measured
+//! principle: feedback_an_undecided_bucket_is_an_extraction_defect_pile_until_proven_otherwise
 //! Measuring a change's own check against the project's tree.
 //!
 //! A ledger row names an artifact as a kind, a scope and a literal, and the state
@@ -1382,6 +1383,102 @@ mod tests {
     #[test]
     fn a_check_that_ran_and_missed_moves_the_row_to_pending() {
         assert_eq!(CheckOutcome::Absent.state(), Some(ChangeState::Pending));
+    }
+
+    /// The `undecided` bucket is the extraction defects, and nothing else.
+    ///
+    /// A row reads as `undecided` when the row itself cannot be measured -- no
+    /// evaluator for its kind, a predicate that is a whole finding, a scope this
+    /// tree structurally cannot hold. It is not a queue waiting for a person: a
+    /// bucket that also collected the looks that can simply be re-run would turn
+    /// "we could not look" into a decision nobody is coming to make.
+    ///
+    /// Pinned as a set over [`UnsettledReason::ALL`], in both directions, so a
+    /// reason added later is classified here instead of joining or leaving the
+    /// pile by omission. Each of the three is then reached through
+    /// [`CheckTree::judge`] -- the path a pass actually runs -- and the exit
+    /// clause is asserted beside them: a criterion the judge can settle leaves
+    /// the bucket by producing a reading, which is the only way out of it that is
+    /// not a person.
+    #[tokio::test]
+    async fn the_undecided_bucket_is_the_extraction_defects_and_nothing_else() {
+        // Both directions in one loop: promoting a re-runnable reason into the
+        // bucket and demoting a row-level one out of it each fail here.
+        for reason in UnsettledReason::ALL {
+            assert_eq!(
+                CheckOutcome::unsettled(reason, "whatever").state(),
+                reason.is_about_the_row().then_some(ChangeState::Undecided),
+                "{reason:?} is classified against the bucket in the wrong direction"
+            );
+        }
+
+        // Membership by name, so a seventh reason is put in or out on purpose
+        // rather than by omission.
+        let mut bucket: Vec<UnsettledReason> = Vec::new();
+        for reason in UnsettledReason::ALL {
+            if reason.is_about_the_row() {
+                bucket.push(reason);
+            }
+        }
+        assert_eq!(
+            bucket,
+            [
+                UnsettledReason::KindWithoutPredicate,
+                UnsettledReason::PredicateIsARendering,
+                UnsettledReason::ScopeOutsideTree,
+            ]
+        );
+
+        // The three through the judge a pass runs, not only through the enum:
+        // every one of these names nothing this tree can measure.
+        let tree = CheckTree::new("/nonexistent", "main");
+        let snapshot = snapshot();
+        let defects = [
+            identity("resembles", "crates/x", "y"),
+            identity(GREP_KIND, "crates/x", ""),
+            identity(GREP_KIND, "crates/x/src/lib.rs", "crates/x :: fn thing"),
+            identity("exists", "specs/protocol-constants.md", ""),
+            identity(GREP_KIND, "specs/protocol-constants.md", "x"),
+        ];
+        for case in defects {
+            let outcome = tree.judge(&snapshot, &case).await;
+            assert_eq!(
+                outcome.state(),
+                Some(ChangeState::Undecided),
+                "an unmeasurable criterion must read as one: {outcome:?}"
+            );
+            assert!(
+                outcome.reason().is_some_and(|r| r.is_about_the_row()),
+                "the bucket must hold a defect: {outcome:?}"
+            );
+        }
+
+        // The complement: a reason about the look retracts nothing, because a
+        // re-run may answer differently. `crates/gone` sits under a top-level
+        // entry this fixture has and is not in it.
+        let dir = repo(&[("crates/other/src/lib.rs", "pub fn x() {}\n")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = fixture_snapshot(&tree).await;
+        let absent = tree
+            .judge(
+                &snapshot,
+                &identity(DEPENDENCY_EDGE_KIND, "crates/gone/Cargo.toml", "cog-llm ="),
+            )
+            .await;
+        assert_eq!(
+            absent.reason(),
+            Some(UnsettledReason::ScopeAbsentInRevision),
+            "{absent:?}"
+        );
+        assert_eq!(absent.state(), None, "a re-runnable scope must move no row");
+
+        // The exit clause: a criterion the judge can settle leaves the bucket by
+        // producing a verdict about the tree, which is the only way out of it
+        // that is not a person.
+        assert_eq!(CheckOutcome::Landed.state(), Some(ChangeState::Landed));
+        assert_eq!(CheckOutcome::Absent.state(), Some(ChangeState::Pending));
+        assert_eq!(CheckOutcome::Landed.reason(), None);
+        assert_eq!(CheckOutcome::Absent.reason(), None);
     }
 
     /// The reason travels with the outcome that has one, and only with it.
