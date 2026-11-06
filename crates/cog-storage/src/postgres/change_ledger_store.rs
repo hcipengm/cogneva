@@ -12,13 +12,14 @@
 //!two would drift, and the one that wins is whichever ran last.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use cog_core::{
     BlockCensus, BlockedReason, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity,
     ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
-    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState, PoolWait,
-    RemeasureBacklog, RetireReason, SFError, SFResult, WriteWindow,
+    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState,
+    LandedTally, PoolWait, RemeasureBacklog, RetireReason, SFError, SFResult, WriteWindow,
 };
 
 /// Resolve the state and reason words a query template names.
@@ -2062,6 +2063,40 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             });
         }
         Ok(Some(windows))
+    }
+
+    async fn landed_tally_since(
+        &self,
+        since: DateTime<Utc>,
+        prefix: &str,
+    ) -> SFResult<LandedTally> {
+        // 两条都在同一批行上数：分母是这段时间里落到 `landed` 的全部行，
+        // 分子是其中字面量以 `prefix` 开头的那些。用 `starts_with` 而不是
+        // `LIKE prefix || '%'`，因为前缀来自调用方、里面可能有 LIKE 的通配符
+        // ——那会让「以 principle: 开头」变成「以 principl 开头再加一个字符」，
+        // 分母不变而分子悄悄变大，而这两条读数正是除法的上下两个数。
+        //
+        // 按 `landed_at` 取窗口，不按 `measured_at`：问题问的是「这段时间落下
+        // 了什么」，而重检会把 `measured_at` 推到现在——按它取窗口等于让一条
+        // 天天被重检的老落地每拍都算新落地。
+        let row = sqlx::query(
+            "SELECT count(*) FILTER (WHERE starts_with(literal, $2)) AS matching, \
+                    count(*) AS total \
+               FROM change_ledger \
+              WHERE landed_at >= $1",
+        )
+        .bind(since)
+        .bind(prefix)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read landed tally: {e}")))?;
+        let field_error = |e: sqlx::Error| SFError::Database(format!("read landed tally: {e}"));
+        let matching: i64 = row.try_get("matching").map_err(field_error)?;
+        let total: i64 = row.try_get("total").map_err(field_error)?;
+        Ok(LandedTally {
+            matching: matching.max(0) as u64,
+            total: total.max(0) as u64,
+        })
     }
 }
 

@@ -142,6 +142,19 @@ impl Default for DagExecutorConfig {
 // cap: bound — 落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调
 const READY_TASKS_PER_PASS: u64 = 200;
 
+/// 门类占比量的是最近多少小时的落地。
+///
+/// 一天：短到能跟住队列今天的形状，长到装得下这个平台一天落一百来条账行的
+/// 量（2026-11-06 实测 24 小时 100 条）。半个小时的窗口在这个速率下只有两三条
+/// 样本，而两条样本算出来的占比是噪声，会让一整类活的座位跟着一次偶然走。
+const GATE_SHARE_WINDOW_HOURS: i64 = 24;
+
+/// 门类占比多久重问一次账。
+///
+/// 发布者的节拍是秒级，而落地数在十分钟里不会变出第二种答案：每拍问一次就是
+/// 拿一整类活的节拍去换一个十位数，而库已经在为别的读超时。
+const GATE_SHARE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// How long the goal consumer holds before pulling the next goal when the
 /// planner named a wait.
 ///
@@ -249,6 +262,26 @@ pub struct DagExecutorRuntime {
     /// 所以挂在这一格上、由 `start` 填。空表示没有这个读面（进程内后端），
     /// 那时计划预算不设界——读不到一个花销不等于花销是零。
     observability: Arc<tokio::sync::OnceCell<Arc<dyn cog_core::ObservabilityGateway>>>,
+    /// 变更账，只为了一件事：量门类在最近落地里占多少。
+    ///
+    /// 与上面两格同一个形状（`start` 里挂、空表示没有这个读面）：没有它的时候
+    /// 门类与别的活按同一个先来后到排队，也就是这道闸门不存在。这不是"闸门
+    /// 坏了"——一个没有共享库的部署本来就没有账可读，编一个占比会把一整类活
+    /// 按一个没人量过的数排队。
+    change_ledger: Arc<tokio::sync::OnceCell<Arc<dyn cog_core::ChangeLedgerStore>>>,
+    /// 最近一次量到的门类占比，与量它的时刻。
+    ///
+    /// 缓存而不是每拍问一次库：发布者的节拍是秒级，而落地数在十分钟里不会
+    /// 变出第二种答案。存的是 `Option`——「量过、读不到」也要缓存，否则账一
+    /// 不可用它就变成每拍一次超时。
+    gate_share:
+        Arc<std::sync::Mutex<Option<(std::time::Instant, Option<crate::ready_queue::GateShare>)>>>,
+    /// 这个部署上一次把门类任务放上队列的时刻。
+    ///
+    /// 插队的判据量的是这个，不是任务自己的年龄（见
+    /// [`crate::ready_queue::GATE_WAIT_BOUND_SECS`]）。进程内而不是落在行上：
+    /// 重启之后没有人欠过任何一类座位。
+    gate_last_admitted_unix: Arc<std::sync::atomic::AtomicI64>,
     /// 看板每一列的在制品上限，构造时从环境读一次。
     ///
     /// 读一次而不是每轮读：限制是配置，不是读数；每轮读环境会让同一份配置在
@@ -286,6 +319,11 @@ impl DagExecutorRuntime {
             skill_registry: None,
             pool_source: Arc::new(tokio::sync::OnceCell::new()),
             observability: Arc::new(tokio::sync::OnceCell::new()),
+            change_ledger: Arc::new(tokio::sync::OnceCell::new()),
+            gate_share: Arc::new(std::sync::Mutex::new(None)),
+            gate_last_admitted_unix: Arc::new(std::sync::atomic::AtomicI64::new(
+                chrono::Utc::now().timestamp(),
+            )),
             board_wip_limits: load_board_wip_limits(),
         }
     }
@@ -303,6 +341,11 @@ impl DagExecutorRuntime {
             skill_registry: None,
             pool_source: Arc::new(tokio::sync::OnceCell::new()),
             observability: Arc::new(tokio::sync::OnceCell::new()),
+            change_ledger: Arc::new(tokio::sync::OnceCell::new()),
+            gate_share: Arc::new(std::sync::Mutex::new(None)),
+            gate_last_admitted_unix: Arc::new(std::sync::atomic::AtomicI64::new(
+                chrono::Utc::now().timestamp(),
+            )),
             board_wip_limits: load_board_wip_limits(),
         }
     }
@@ -340,6 +383,60 @@ impl DagExecutorRuntime {
         if self.observability.set(gateway).is_err() {
             tracing::warn!("token census already attached; keeping the first one");
         }
+    }
+
+    /// 挂上变更账：这是门类占比唯一的读数来源。
+    ///
+    /// 没有它的时候这道闸门不生效（门类与别的活按同一个先来后到走），而不是
+    /// 拦下全部——读不到一个占比不等于门类该停，正如读不到池子不等于窗口关着。
+    pub fn attach_change_ledger(&self, store: Arc<dyn cog_core::ChangeLedgerStore>) {
+        if self.change_ledger.set(store).is_err() {
+            tracing::warn!("change ledger already attached; keeping the first one");
+        }
+    }
+
+    /// 门类最近落地占多少，十分钟内复用上一次的答案。
+    ///
+    /// 量的是账上最近 [`GATE_SHARE_WINDOW_HOURS`] 小时落到 `landed` 的行：
+    /// 分子是字面量以 `principle:` 开头的那些。两条读数（分子与总数）一起交
+    /// 给 [`crate::ready_queue::GateShare`]，样本不够时那边回答 `None`，这里
+    /// 原样传下去——这一层不替它编一个占比。
+    ///
+    /// 读失败与「账上这段时间什么都没落地」都返回 `None`，且都缓存十分钟：
+    /// 两者在闸门那里是同一句话（不设界），而在读数上它们的区别由
+    /// [`crate::ready_queue::GateShare`] 的两个数分开——总数小于样本下限就是
+    /// 后者。
+    async fn gate_share(&self) -> Option<crate::ready_queue::GateShare> {
+        let cached = self.gate_share.lock().ok().and_then(|cached| *cached);
+        if let Some((measured_at, share)) = cached {
+            if measured_at.elapsed() < GATE_SHARE_CACHE_TTL {
+                return share;
+            }
+        }
+        let Some(store) = self.change_ledger.get() else {
+            return None;
+        };
+        let since = chrono::Utc::now() - chrono::Duration::hours(GATE_SHARE_WINDOW_HOURS);
+        let share = match store
+            .landed_tally_since(since, crate::ready_queue::PRINCIPLE_LEDGER_PREFIX)
+            .await
+        {
+            Ok(tally) => Some(crate::ready_queue::GateShare {
+                gate: tally.matching,
+                total: tally.total,
+            }),
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "cannot read how much of what landed was the principle gate's; the ready queue is not classed by that share this pass"
+                );
+                None
+            }
+        };
+        if let Ok(mut slot) = self.gate_share.lock() {
+            *slot = Some((std::time::Instant::now(), share));
+        }
+        share
     }
 
     pub fn with_orchestrator(mut self, orchestrator: Arc<DagExecutor>) -> Self {
@@ -591,9 +688,13 @@ impl DagExecutorRuntime {
             .await;
         }
 
+        // 门类实测占了最近落地里的多少。读不到（没有账、账不可用、这段时间什么都
+        // 没落地）时是 `None`，这一拍不按类分先后——读不到一个占比不等于门类该停。
+        let gate_share = self.gate_share().await;
         let mut first_error: Option<SFError> = None;
         let mut column_holds: HashMap<(String, &'static str), u64> = HashMap::new();
         let mut unread_holds: HashMap<&'static str, u64> = HashMap::new();
+        let mut gate_holds: HashMap<&'static str, u64> = HashMap::new();
         for (stream, mut entries) in by_stream {
             // Held, not dropped: the rows stay `Pending` and this pass offers
             // them again, which is the same state a row waiting on a dependency
@@ -610,6 +711,50 @@ impl DagExecutorRuntime {
                      consumer has not been handed, and a copy added now would arrive after them"
                 );
                 continue;
+            }
+            // 类与类之间的先后：先别人、后门类，门类按它实测的落地占比拿座位。
+            //
+            // 排在额度那一刀之前，因为两刀判的不是一件事：额度判「这一拍能出几
+            // 条」，这一刀判「出的那几条里谁先走」。反过来的那天，额度先切出来
+            // 的前缀里已经排满了门类，再分先后就只是在门类内部排队。
+            //
+            // 这一刀拦下的和额度拦下的是同一种状态：行留在 `Pending`，下一拍
+            // 再被扫到，没有消息、没有座位、也没有额度被花掉。
+            let jobs = admitted_by_stream
+                .get(&stream)
+                .map(|admitted| admitted.jobs)
+                .unwrap_or(0);
+            let now_unix = chrono::Utc::now().timestamp();
+            let last_gate = self
+                .gate_last_admitted_unix
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let (classed, seats, held) = crate::ready_queue::class_the_batch(
+                entries,
+                |(task, _)| crate::ready_queue::is_principle_ledger(task),
+                jobs,
+                gate_share,
+                now_unix.saturating_sub(last_gate) >= crate::ready_queue::GATE_WAIT_BOUND_SECS,
+            );
+            entries = classed;
+            if seats > 0 {
+                self.gate_last_admitted_unix
+                    .store(now_unix, std::sync::atomic::Ordering::Relaxed);
+            }
+            if held > 0 {
+                let kind = crate::ready_queue::stream_kind(&stream, &self.config.workspace_id);
+                *gate_holds.entry(kind).or_insert(0) += held;
+                // 拦下的条数与给它算的座位一起留下：只有「拦了几条」的读数分不清
+                // 「闸门压得紧」和「这一拍本来就只有这么多」，而这两件事的修法相反。
+                tracing::debug!(
+                    stream = %stream,
+                    gate_seats = seats,
+                    held,
+                    share_permille = ?gate_share.and_then(|share| share.permille()),
+                    share_gate = ?gate_share.map(|share| share.gate),
+                    share_total = ?gate_share.map(|share| share.total),
+                    "holding principle-gate changes back this pass: the class takes at most the \
+                     share of the queue it measured as its share of what lands"
+                );
             }
             if let Some(admitted) = admitted_by_stream.get(&stream).copied() {
                 if (entries.len() as u64) > admitted.jobs {
@@ -844,6 +989,35 @@ impl DagExecutorRuntime {
                     labels.insert(
                         crate::LABEL_REASON.to_string(),
                         crate::ready_queue::QUEUE_STILL_UNREAD_REASON.to_string(),
+                    );
+                    drop(
+                        metrics
+                            .record_counter(
+                                cog_core::metric_names::READY_ADMISSION_HELD_TOTAL,
+                                held as f64,
+                                labels,
+                            )
+                            .await,
+                    );
+                }
+            }
+        }
+        // 这一拍因为门类的实测占比而没投出去的活。同一个计数器、同一个 `reason`
+        // 轴，但两个标签分开写：`kind` 说**谁**被拦（哪一类活），`reason` 说
+        // **为什么**（这个闸门）。只写原因不写被拦的那一类，读数只能回答「有人
+        // 被拦」而不能回答「谁被饿着」——而这道闸门存在的全部理由就是那一问。
+        if !gate_holds.is_empty() {
+            if let Some(metrics) = self.orchestrator.metrics_backend() {
+                for (kind, held) in gate_holds {
+                    let mut labels = HashMap::new();
+                    labels.insert(crate::LABEL_STREAM.to_string(), kind.to_string());
+                    labels.insert(
+                        crate::LABEL_KIND.to_string(),
+                        crate::ready_queue::PRINCIPLE_LEDGER_SOURCE.to_string(),
+                    );
+                    labels.insert(
+                        crate::LABEL_REASON.to_string(),
+                        crate::ready_queue::GATE_SHARE_REASON.to_string(),
                     );
                     drop(
                         metrics

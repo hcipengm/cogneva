@@ -1541,6 +1541,49 @@ pub trait ChangeLedgerStore: Send + Sync {
     async fn write_windows(&self) -> SFResult<Option<Vec<WriteWindow>>> {
         Ok(None)
     }
+
+    /// How many rows landed since `since`, and how many of those name an
+    /// identity whose literal starts with `prefix`.
+    ///
+    /// A prefix and two counts rather than a method named after any one class:
+    /// the account knows the identities it holds, not who reads it. The
+    /// caller answers "what fraction of what lands is this class" from the
+    /// pair, and the pair is also what makes the answer checkable -- a share
+    /// alone cannot separate "this class lands little" from "little landed at
+    /// all".
+    ///
+    /// Measured on landings rather than on task completions, because they are
+    /// not the same claim: a task completing says a run finished, and a row
+    /// landing says its check holds on the tree. 2026-11-06, same 24 hours:
+    /// principle-gate tasks were 81% of completed change tasks, and
+    /// principle-gate rows were 5% of the rows that landed (5/100; 50/630 over
+    /// seven days). The first number is how much of the run volume a class
+    /// took; the second is how much of the output it produced.
+    ///
+    /// `total == 0` is "nothing landed in the window", which is not a share of
+    /// zero -- the caller decides what a window too small to measure means, and
+    /// this read does not pretend to a fraction it cannot take.
+    async fn landed_tally_since(
+        &self,
+        since: DateTime<Utc>,
+        prefix: &str,
+    ) -> SFResult<LandedTally> {
+        let _ = (since, prefix);
+        Err(crate::SFError::NotImplemented("landed_tally_since".into()))
+    }
+}
+
+/// The answer to [`ChangeLedgerStore::landed_tally_since`].
+///
+/// `matching` is a subset of `total`, never a separate numerator: the two are
+/// counted on the same rows in the same pass, so a reader cannot be handed a
+/// numerator and a denominator taken over different sets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LandedTally {
+    /// Rows landed in the window whose literal starts with the prefix.
+    pub matching: u64,
+    /// Every row landed in the window.
+    pub total: u64,
 }
 
 /// The line a landed commit carries, followed by the id of the change it landed.

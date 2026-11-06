@@ -321,6 +321,208 @@ pub const BUDGET_SPENT_REASON: &str = "budget_spent";
 /// 队列以约 86 条/分钟增长，而消费者同一时间在跑 2 条。
 pub const QUEUE_STILL_UNREAD_REASON: &str = "queue_still_unread";
 
+/// 门类变更在任务行上的身份：台账里由原则账（principle ledger）产出的那一路。
+///
+/// 认的是 `change_sources` 这个**结构字段**，不是目标文本里的某个词：同一批
+/// 门类任务的句式会变（有的带标题、有的只有规则本身），而写进这个数组的来源
+/// 是产出它们的那个 intake 自己的签名，改它等于改那一侧的合同。
+pub const PRINCIPLE_LEDGER_SOURCE: &str = "principle_ledger";
+
+/// 门类在账上那条身份的字面前缀。
+///
+/// 原则账写进账行的身份是 `principle: <规则名>`，而任务行上的
+/// [`PRINCIPLE_LEDGER_SOURCE`] 是同一个 intake 写下的另一处签名。两处都要认，
+/// 因为两个问题是在两个地方问的：任务行回答「这一条活是不是门类」，账行回答
+/// 「这一类落下过多少」——后者没有任务行可读，门类的活跑完之后任务行已经不
+/// 说明它落没落地。
+pub const PRINCIPLE_LEDGER_PREFIX: &str = "principle:";
+
+/// 这一类之间的先后在读数里用的原因值。
+///
+/// 与 [`hold_reason`] 的三个值、[`BUDGET_SPENT_REASON`]
+/// 和 [`QUEUE_STILL_UNREAD_REASON`] 同一个 `reason` 轴：拦下这几条的既不是
+/// 池子、也不是这一拍的切片、更不是任务自己的预算，而是**这一类在队列里的
+/// 占比**。把它记进前几个里的任何一个，读它的人会去调额度，而额度不是这里的
+/// 约束。它必须和 `queue_still_unread` 分开记：那个的修法是等消费者，这个的
+/// 修法是让另一类先走。
+pub const GATE_SHARE_REASON: &str = "gate_share";
+
+/// This row is a change the principle ledger asked for.
+///
+/// 由 `change_sources` 判，理由见 [`PRINCIPLE_LEDGER_SOURCE`]：这是那个 intake
+/// 写进任务行的签名，不是目标文本里的一句措辞。读不到这个字段的任务不是门类
+/// 任务——一个没有数组的输入既不是「空来源」也不是「不属于任何一类」的证据，
+/// 而把它算进门类会让每一个别的任务在读数里消失一个座位。
+pub fn is_principle_ledger(task: &Task) -> bool {
+    task.input
+        .get("change_sources")
+        .and_then(|sources| sources.as_array())
+        .is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| source.as_str() == Some(PRINCIPLE_LEDGER_SOURCE))
+        })
+}
+
+/// 门类在最近一次落地窗口里占了多少，量出来的那一对数。
+///
+/// 两个数一起走是因为占比的两个成分都要看得见：一条只有百分比的读数分不清
+/// 「门类落地少」和「一共就没落下几笔」。`total` 是同一段时间里落到 `landed`
+/// 的账行数，`gate` 是其中字面量以 `principle:` 开头的那几条。
+///
+/// 用账行的落地数，而不是任务的完成数，因为这两把尺子量的不是一件事：一条
+/// 变更任务完成，等于它那一趟跑完了（可能是 retire、可能是被判定无需改动），
+/// 而账行落到 `landed`，等于**它的检查在树上真的成立了**。队列里排的活值不
+/// 值得让路，问的是后一件。2026-11-06 实测两者的回答差一个量级：
+/// 同一个 24 小时里完成的门类变更任务占 81%，而落地的账行里门类只占 5%
+/// （5/100；最近七天 50/630）。按完成数算这道闸门几乎不会生效，按落地数算
+/// 它说的正是队列的形状：86% 的排队量（1,675/1,955）换来 5% 的落地。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GateShare {
+    pub gate: u64,
+    pub total: u64,
+}
+
+/// 少于这么多条落地样本时不给占比。
+///
+/// 这一道闸门判的是整整一类活的先后，几条样本算出来的占比是噪声；而噪声在
+/// 这里不是中性值——它会把一类活按一个当天的偶然数排队。样本不够就是没有
+/// 读数，没有读数不设界，与池子、预算两道闸门同一条规矩。
+pub const MIN_GATE_SHARE_SAMPLES: u64 = 20;
+
+impl GateShare {
+    /// 千分比，样本不够时 `None`。
+    ///
+    /// 取整向下、后面按座位向上取整：先在这一步把「一点点」抹成零，再在座位
+    /// 那一步把它抬成一个座位，等于让这道闸门在一类占比很小时也只是排得靠后
+    /// 而不是不许走。
+    pub fn permille(&self) -> Option<u64> {
+        (self.total >= MIN_GATE_SHARE_SAMPLES).then(|| self.gate.saturating_mul(1000) / self.total)
+    }
+}
+
+/// 这一拍最多让几条门类变更进队列。
+///
+/// 四条规矩，每一条都对应一种读错它的方式：
+///
+/// - **上限量出来的，不写死。** `share_permille` 是 [`GateShare::permille`] 的
+///   回答，不是这里编的比例。写死一个 20% 的问题不在于它是多少，而在于它不
+///   跟任何读数走：门类真的开始多落地时，写死的数会把座位继续扣着；它一落千
+///   丈时，同一个数又放过它。`None`（样本不够、读不到账）一律不设界。
+/// - **别人不要的座位门类可以全拿。** 这一刀判的是「谁先坐」，不是「谁不能
+///   坐」：产品活少于座位时，让空位陪着门类一起等，是把省钱读成了停摆。
+/// - **一个座位从来不降到零。** 占比小到取整为零时仍然放一条：门类每一拍都
+///   在往前走一步，所以它是「排在后面」而不是「永久让路」——只会让给先问者
+///   的仲裁会把永远被推迟的那一支饿死，而这一支是被判词拦下的活，不是摆设。
+/// - **等过界插一次队。** `starving` 由调用方按「这一类多久没拿到过座位」判，
+///   真到了那一步就多给一个，越过这道闸门一次。
+pub fn gate_seats(
+    jobs: u64,
+    share_permille: Option<u64>,
+    gate_ready: u64,
+    other_ready: u64,
+    starving: bool,
+) -> u64 {
+    let Some(permille) = share_permille else {
+        return gate_ready;
+    };
+    // 这一拍一条都不许出时，门类也一条都不出：下面那个「至少一个座位」的
+    // 地板说的是「别人占满时门类也要往前走一步」，不是「额度和队列都说了
+    // 零时也要硬塞一条出去」——那一条会在截断那一步被丢掉，读数上却像是
+    // 门类拿到了座位。
+    if jobs == 0 {
+        return 0;
+    }
+    let by_share = jobs.saturating_mul(permille).saturating_add(999) / 1000;
+    let spare = jobs.saturating_sub(other_ready);
+    let mut seats = by_share.max(spare);
+    if starving {
+        seats = seats.saturating_add(1);
+    }
+    if gate_ready > 0 {
+        seats = seats.max(1);
+    }
+    seats.min(gate_ready)
+}
+
+/// 门类多久没拿到过座位就算「等过界」，下一拍插一次队。
+///
+/// 它量的是**这一类从何时起没被放行过**，不是一条任务从何时起在排队：
+/// 2026-11-06 排队最久的那几条门类任务已经等了十几天，用它们的年龄当这一
+/// 个判据，插队会从第一拍起就永远开着——那等于没有闸门。这个数由调用方
+/// 拿一个进程内的时刻算，进程一滚就从此刻重新开始：那是「这个部署有多久
+/// 没给过这一类座位」，重启之后没有人欠过任何一类。
+pub const GATE_WAIT_BOUND_SECS: i64 = 30 * 60;
+
+/// 把这一拍的批次排成「先别人、后门类」，并保证门类在 `jobs` 条里坐满 `seats` 个。
+///
+/// 门类的座位必须落在这一拍的额度**里面**：只顾着把它们排到后面，产品活一多，
+/// 截断那一刀就会把门类整个切掉，座位形同虚设。所以别人的那一段只留
+/// `jobs - seats` 条，门类坐在这一段之后——消费者按顺序读，于是产品活先走，
+/// 门类跟在后面，而那几条**确实**在这一批里。
+///
+/// 超出门类座位、以及超出产品活那一段的条目都不进这一批：它们留在
+/// `Pending`，下一拍再被扫到，和被额度拦下的活是同一种状态，也不需要任何人
+/// 记住它们被拦过。
+///
+/// 两类各自保序：批里的顺序是就绪扫描给出的优先序（`priority` 降序），在类
+/// 内部打乱它等于让同一类里等得最久的那条排到最后。
+pub fn order_by_class<T>(
+    entries: Vec<T>,
+    is_gate: impl Fn(&T) -> bool,
+    seats: u64,
+    jobs: u64,
+) -> Vec<T> {
+    let mut gates = Vec::new();
+    let mut others = Vec::new();
+    for entry in entries {
+        if is_gate(&entry) {
+            gates.push(entry);
+        } else {
+            others.push(entry);
+        }
+    }
+    gates.truncate(usize::try_from(seats).unwrap_or(usize::MAX));
+    let room_for_others = jobs.saturating_sub(seats);
+    others.truncate(usize::try_from(room_for_others).unwrap_or(usize::MAX));
+    others.extend(gates);
+    others
+}
+
+/// 这一拍怎么排：按类分先后，并回答门类拿到了几个座位、被拦下几条。
+///
+/// 座位数只说**这一刀分出去的**：没有读数时是零，哪怕这一批里躺着门类任务。
+///
+/// 把「数一数两类各有几条」「按占比算座位」「重排」这三步绑在一个函数里，是
+/// 因为它们共用一个数——门口那几条既是被计数的集合，也是被重排的集合。分成
+/// 三步由调用方串起来，调用方就有机会用这一批的条数配上一批的座位，而那两批
+/// 之间只差一次就绪扫描。
+pub fn class_the_batch<T>(
+    entries: Vec<T>,
+    is_gate: impl Fn(&T) -> bool,
+    jobs: u64,
+    share: Option<GateShare>,
+    starving: bool,
+) -> (Vec<T>, u64, u64) {
+    let gate_ready = entries.iter().filter(|entry| is_gate(entry)).count() as u64;
+    if gate_ready == 0 {
+        return (entries, 0, 0);
+    }
+    // 没有读数时这一拍什么都不重排：把门类排到后面而手上没有它的占比，就等于
+    // 让这两类按「谁先问」排队——那正是这道闸门要修的病，只是换了个方向。
+    //
+    // 报出去的座位是零，不是这一批里门类的条数：这一刀一个座位也没分，那几条
+    // 排在哪里、能不能落进这一拍，是后面按优先序截断那一刀说了算。报成「全都
+    // 坐下了」会让调用方误以为门类刚被放过一次，于是拿它去重置插队的时钟。
+    let Some(permille) = share.and_then(|share| share.permille()) else {
+        return (entries, 0, 0);
+    };
+    let other_ready = entries.len() as u64 - gate_ready;
+    let seats = gate_seats(jobs, Some(permille), gate_ready, other_ready, starving);
+    let held = gate_ready.saturating_sub(seats);
+    (order_by_class(entries, is_gate, seats, jobs), seats, held)
+}
+
 /// 这条任务是否已经花掉了计划基线给它的 token。
 ///
 /// 判据是「到线即停」，不是「明显超了再停」：预算是一个承诺过的数，多花一个
@@ -1094,6 +1296,207 @@ mod tests {
         assert_eq!(
             jobs_the_window_can_pay_for(&pace(1, 5_000_000, 0, 500_000), 0),
             Some(10)
+        );
+    }
+
+    /// 门类是按那个 intake 自己的签名认的，不是按目标文本里的措辞。
+    #[test]
+    fn a_gate_is_the_row_the_principle_ledger_wrote() {
+        let gate = task(
+            "g",
+            TaskType::Custom("change_ledger".into()),
+            serde_json::json!({"goal": "Give the principle X the gate it is owed", "change_sources": ["principle_ledger"]}),
+        );
+        assert!(is_principle_ledger(&gate));
+
+        let product = task(
+            "p",
+            TaskType::Custom("change_ledger".into()),
+            serde_json::json!({"goal": "Give the principle X the gate it is owed", "change_sources": ["2026-09-03_deploy.md"]}),
+        );
+        assert!(
+            !is_principle_ledger(&product),
+            "同样一句话的目标，来源不同就不是门类：认的是签名不是措辞"
+        );
+
+        // 没有这个字段的行不是门类任务：读不到来源不等于它来自原则账。
+        let plain = task(
+            "x",
+            TaskType::Custom("change_ledger".into()),
+            serde_json::json!({"goal": "ship it"}),
+        );
+        assert!(!is_principle_ledger(&plain));
+    }
+
+    /// 占比是量出来的，样本不够就没有占比。
+    #[test]
+    fn a_share_needs_a_landing_sample_to_be_a_reading() {
+        assert_eq!(
+            GateShare {
+                gate: 5,
+                total: 100
+            }
+            .permille(),
+            Some(50),
+            "5/100 的落地占比是 5%"
+        );
+        assert_eq!(
+            GateShare {
+                gate: 5,
+                total: MIN_GATE_SHARE_SAMPLES - 1
+            }
+            .permille(),
+            None,
+            "几条样本算出来的占比是噪声，不是读数"
+        );
+        assert_eq!(GateShare { gate: 0, total: 0 }.permille(), None);
+    }
+
+    /// 座位跟着实测占比走：86% 的排队量、5% 的落地占比，座位按后者算。
+    ///
+    /// 这条测的就是 2026-11-06 的现场：1,675 条门类排在一共 1,955 条里，
+    /// 而落地的账行里门类只占 5%。
+    #[test]
+    fn gate_seats_follow_the_measured_share_not_the_queue_depth() {
+        let share = GateShare {
+            gate: 5,
+            total: 100,
+        }
+        .permille();
+        assert_eq!(
+            gate_seats(200, share, 1_675, 280, false),
+            10,
+            "200 个座位 × 5% = 10 个"
+        );
+        // 占比小到乘出来不足一个座位时仍然给一个：门类每一拍都要往前走一步，
+        // 否则「排在后面」就成了「永久让路」。
+        let tiny = GateShare {
+            gate: 1,
+            total: 1_000,
+        }
+        .permille();
+        assert_eq!(tiny, Some(1));
+        assert_eq!(gate_seats(10, tiny, 1_675, 280, false), 1);
+        // 没有读数就不设界（样本不够、账读不到）。
+        assert_eq!(gate_seats(200, None, 1_675, 280, false), 1_675);
+    }
+
+    /// 别人不要的座位门类可以全拿：这一刀判先后，不判能不能走。
+    #[test]
+    fn spare_seats_are_not_kept_empty_to_hold_a_class_back() {
+        let share = GateShare {
+            gate: 5,
+            total: 100,
+        }
+        .permille();
+        // 产品活只有 3 条，座位 200 个：门类可以坐满剩下的。
+        assert_eq!(gate_seats(200, share, 1_675, 3, false), 197);
+        // 产品活比座位还多时，门类只剩它那一份。
+        assert_eq!(gate_seats(200, share, 1_675, 900, false), 10);
+        // 产品活和座位一样多时，门类的那一份是抢出来的，不是让出来的。
+        assert_eq!(gate_seats(200, share, 1_675, 200, false), 10);
+    }
+
+    /// 等过界的一次插队要多给一个座位，而不是把闸门整个拆掉。
+    #[test]
+    fn starving_gate_class_jumps_the_queue_by_one_seat() {
+        let share = GateShare {
+            gate: 5,
+            total: 100,
+        }
+        .permille();
+        assert_eq!(
+            gate_seats(200, share, 1_675, 900, true),
+            11,
+            "多一个座位，不是全放"
+        );
+        // 门类本来就没有就绪的活时，插队也变不出活来。
+        assert_eq!(gate_seats(200, share, 0, 900, true), 0);
+        // 这一拍一条都不许出时，门类也不硬塞：那一条会在截断那一步丢掉。
+        assert_eq!(gate_seats(0, share, 1_675, 900, true), 0);
+    }
+
+    /// 重排之后先别人、后门类；超过座位的那几条这一拍不出去。
+    #[test]
+    fn the_batch_goes_out_others_first_and_gates_up_to_their_seats() {
+        let batch = vec![
+            ("g1", true),
+            ("p1", false),
+            ("g2", true),
+            ("p2", false),
+            ("g3", true),
+        ];
+        let ordered = order_by_class(batch, |(_, gate)| *gate, 2, 4);
+        assert_eq!(
+            ordered,
+            vec![("p1", false), ("p2", false), ("g1", true), ("g2", true)],
+            "产品活先走，门类按座位数给，超出的留在 Pending"
+        );
+
+        // 座位为零（没有门类就绪）时整批原样保留。
+        let batch = vec![("p1", false), ("p2", false)];
+        assert_eq!(order_by_class(batch, |(_, gate)| *gate, 0, 5).len(), 2);
+    }
+
+    /// 整条规则合成一处时，读数里能同时看见「给了几个座位」和「拦了几条」。
+    #[test]
+    fn classing_a_batch_reports_the_seats_it_gave_and_what_it_held() {
+        let batch = vec!["g1", "p1", "g2", "p2", "g3", "g4"];
+        let share = Some(GateShare {
+            gate: 5,
+            total: 100,
+        });
+        let (ordered, seats, held) =
+            class_the_batch(batch, |entry| entry.starts_with('g'), 6, share, false);
+        assert_eq!(seats, 4, "别人只占两条，剩下的座位门类全拿");
+        assert_eq!(held, 0, "座位够时一条都不拦");
+        assert_eq!(ordered.len(), 6);
+        assert_eq!(
+            &ordered[..2],
+            &["p1", "p2"],
+            "产品活先走，门类排在后面——但排在后面不等于让出这一批"
+        );
+
+        // 产品活占满座位时，门类只拿它那一份，多出来的这一拍不出去。
+        let mut batch: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
+        batch.extend(["g1", "g2", "g3"].map(String::from));
+        let (ordered, seats, held) =
+            class_the_batch(batch, |entry| entry.starts_with('g'), 10, share, false);
+        assert_eq!((seats, held), (1, 2), "10 个座位 × 5% = 1 个给门类");
+        assert_eq!(ordered.len(), 10, "这一拍就是十个座位，不多投");
+        assert_eq!(
+            ordered
+                .iter()
+                .filter(|entry| entry.starts_with('g'))
+                .count(),
+            1,
+            "座位里那一条门类在后面，被拦住的两条留在 Pending"
+        );
+        assert_eq!(ordered[0], "p0", "产品活排在门类前面");
+        assert_eq!(ordered[9], "g1", "门类坐的是这一批的最后一个座位");
+
+        // 没有读数时这一拍不重排：只把门类排到后面而没有占比，等于让它们
+        // 永久让路。
+        let batch = vec!["g1", "p1", "g2"];
+        let (ordered, seats, held) =
+            class_the_batch(batch, |entry| entry.starts_with('g'), 10, None, false);
+        assert_eq!(
+            (seats, held),
+            (0, 0),
+            "没有读数时这一刀一个座位都没分：门类落不落进这一拍由后面按优先序截断那一刀说了算"
+        );
+        assert_eq!(ordered, vec!["g1", "p1", "g2"], "顺序原样保留");
+    }
+
+    /// 两类各自保序：类内部打乱会让同一类里等得最久的那条排到最后。
+    #[test]
+    fn ordering_keeps_each_class_in_its_own_priority_order() {
+        let batch = vec![("g1", true), ("g2", true), ("p1", false), ("p2", false)];
+        let ordered = order_by_class(batch, |(_, gate)| *gate, 1, 3);
+        assert_eq!(
+            ordered,
+            vec![("p1", false), ("p2", false), ("g1", true)],
+            "门类里先来的那条先走"
         );
     }
 }

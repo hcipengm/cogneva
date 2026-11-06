@@ -499,6 +499,15 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     "OrchestratorPlugin: no observability gateway; the plan budget does not gate dispatch"
                 ),
             }
+            // 门类与产品活之间那道先后，读的是变更账上最近落地的构成。取不到
+            // 就是没有账可读（进程内后端、或者没跑迁移的部署）：这一拍不按类
+            // 分先后，而不是把门类整类拦下——读不到一个占比不等于门类该停。
+            match ctx.consume_service::<dyn cog_core::ChangeLedgerStore>() {
+                Some(store) => runtime_holder.attach_change_ledger(store),
+                None => info!(
+                    "OrchestratorPlugin: no change ledger store; the principle gate's share of the ready queue is not read, so no class is ordered ahead of another"
+                ),
+            }
             if let Some(ref exec_loop) = self.exec_loop {
                 if let Some(backend) = ctx.consume_service::<dyn cog_core::MessageBackend>() {
                     if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {

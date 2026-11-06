@@ -782,6 +782,274 @@ async fn a_hold_publishes_the_instant_the_upstream_named_apart_from_our_own_retr
     );
 }
 
+/// 只回答「最近落地里门类占多少」的账。
+///
+/// 其余的门一个都不实现：发布者只问这一个问题，而一个把别的答案也编出来的夹具
+/// 会让测试在它从未走过的路上给出一个看起来像读数的结果。
+struct ScriptedLandedShare {
+    gate: u64,
+    total: u64,
+}
+
+#[async_trait::async_trait]
+impl cog_core::ChangeLedgerStore for ScriptedLandedShare {
+    async fn landed_tally_since(
+        &self,
+        _since: chrono::DateTime<chrono::Utc>,
+        _prefix: &str,
+    ) -> cog_core::SFResult<cog_core::LandedTally> {
+        Ok(cog_core::LandedTally {
+            matching: self.gate,
+            total: self.total,
+        })
+    }
+
+    async fn record_readings(
+        &self,
+        _readings: &[cog_core::ChangeReading],
+        _first_seen_rev: Option<&str>,
+    ) -> cog_core::SFResult<usize> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn declare(&self, _readings: &[cog_core::ChangeReading]) -> cog_core::SFResult<usize> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn fold_declarations(
+        &self,
+        _limit: usize,
+        _first_seen_rev: Option<&str>,
+    ) -> cog_core::SFResult<usize> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn fold_retirements(&self, _limit: usize) -> cog_core::SFResult<usize> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn pending_declarations(&self) -> cog_core::SFResult<u64> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn pending_retirements(&self) -> cog_core::SFResult<u64> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn claimed_revisions(
+        &self,
+        _revisions: &[String],
+    ) -> cog_core::SFResult<std::collections::HashSet<String>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn apply_measurement(
+        &self,
+        _measurement: &cog_core::ChangeMeasurement,
+    ) -> cog_core::SFResult<()> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn outstanding(
+        &self,
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::ChangeLedgerRow>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn events(
+        &self,
+        _identity: &cog_core::ChangeIdentity,
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::ChangeLedgerEvent>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn owed_by_band(&self) -> cog_core::SFResult<Vec<(cog_core::ChangePriority, usize)>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn landed_due(
+        &self,
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::ChangeLedgerRow>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn landed_at_revision(
+        &self,
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<(cog_core::ChangeIdentity, Option<String>)>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn landed_touching(
+        &self,
+        _paths: &[String],
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::ChangeLedgerRow>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn landed_awaiting_parent_observation(
+        &self,
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<(cog_core::ChangeIdentity, String)>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn record_parent_observation(
+        &self,
+        _identity: &cog_core::ChangeIdentity,
+        _observation: &str,
+    ) -> cog_core::SFResult<bool> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn record_reopen(&self, _reopen: &cog_core::ChangeReopen) -> cog_core::SFResult<()> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn retired_surface_moved(
+        &self,
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::ChangeLedgerRow>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn retired_answered_elsewhere(
+        &self,
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::ChangeLedgerRow>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn request_remeasurement(
+        &self,
+        _identity: &cog_core::ChangeIdentity,
+        _source: &str,
+    ) -> cog_core::SFResult<()> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn pending_remeasurements(
+        &self,
+        _limit: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::ChangeIdentity>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn mark_remeasured(
+        &self,
+        _identity: &cog_core::ChangeIdentity,
+    ) -> cog_core::SFResult<()> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn remeasurement_backlog(&self) -> cog_core::SFResult<cog_core::RemeasureBacklog> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn record_delivery(
+        &self,
+        _identity: &cog_core::ChangeIdentity,
+        _rev: &str,
+    ) -> cog_core::SFResult<()> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn stamp_pool_block(&self, _unblock_condition: &str) -> cog_core::SFResult<u64> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn clear_pool_block(&self) -> cog_core::SFResult<u64> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn pool_wait(&self) -> cog_core::SFResult<cog_core::PoolWait> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn get(
+        &self,
+        _identity: &cog_core::ChangeIdentity,
+    ) -> cog_core::SFResult<Option<cog_core::ChangeLedgerRow>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn census(&self) -> cog_core::SFResult<Vec<(cog_core::ChangeState, u64)>> {
+        unimplemented!("准入只问落地占比")
+    }
+    async fn record_dispatch_state(
+        &self,
+        _state: &cog_core::DispatchState,
+    ) -> cog_core::SFResult<()> {
+        unimplemented!("准入只问落地占比")
+    }
+}
+
+/// 门类与产品活抢同一批座位时，产品活先走，门类按它实测的落地占比拿座位。
+///
+/// 现场取自 2026-11-06：门类占了就绪队列的 86%（1,636/1,978 条），而落到
+/// `landed` 的账行里门类只占 5%（5/100）。没有这一刀时，批里的前 10 条原样
+/// 进队列，门类那 3 条排在产品活前面；有了它，产品活先占满这 10 个座位，
+/// 门类只拿到 ceil(10 × 5%) = 1 个。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_principle_gate_queues_behind_product_work() {
+    struct TenJobWindow;
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for TenJobWindow {
+        async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+            Some(cog_core::LlmPoolStatus {
+                pace: cog_core::LlmWindowPace {
+                    measured_upstreams: 1,
+                    allowance_tokens: 5_000_000,
+                    spent_tokens: 0,
+                    reserve_tokens: 500_000,
+                    reserve_population: 5,
+                    window_secs: 604_800,
+                    window_start_unix: 0,
+                },
+                pool_size: 1,
+                ..Default::default()
+            })
+        }
+    }
+
+    let backend = MemoryMessageBackend::new();
+    let runtime = DagExecutorRuntime::new_with_backend(
+        DagExecutorConfig {
+            redis_url: "redis://localhost".into(),
+            workspace_id: "ws-gate".into(),
+            consumer_group: "cg-gate".into(),
+            max_retries: 3,
+            ..DagExecutorConfig::default()
+        },
+        backend.clone(),
+    );
+    runtime.attach_pool_status_source(Arc::new(TenJobWindow));
+    runtime.attach_change_ledger(Arc::new(ScriptedLandedShare {
+        gate: 5,
+        total: 100,
+    }));
+
+    // 门类排在最前：就绪表接着提交顺序走，所以不重排的话，截出来的前缀
+    // 里全是门类，而这份测试要看的正是那之后谁先走。
+    let mut tasks = Vec::new();
+    for i in 0..3 {
+        let mut task = make_test_task(&format!("gate-{i}"));
+        task.input = serde_json::json!({
+            "goal": "Give the principle X the gate it is owed",
+            "change_sources": ["principle_ledger"],
+        });
+        tasks.push(task);
+    }
+    for i in 0..20 {
+        tasks.push(make_test_task(&format!("product-{i}")));
+    }
+    runtime.submit_goal("gate-goal", tasks).await.unwrap();
+
+    runtime.publish_ready_tasks().await.unwrap();
+
+    let scheduled: Vec<String> = runtime
+        .orchestrator()
+        .get_all_tasks()
+        .await
+        .into_iter()
+        .filter(|task| task.status == TaskStatus::Scheduled)
+        .map(|task| task.id)
+        .collect();
+    assert_eq!(scheduled.len(), 10, "窗口只付得起十件");
+    let gates = scheduled
+        .iter()
+        .filter(|id| id.starts_with("gate-"))
+        .count();
+    assert_eq!(
+        gates, 1,
+        "门类按实测的 5% 拿座位：10 × 5% = 1；没有这一刀时是 3 条（它们排在最前）"
+    );
+    assert_eq!(
+        scheduled
+            .iter()
+            .filter(|id| id.starts_with("product-"))
+            .count(),
+        9,
+        "其余九个座位留给产品活：门类不是被切掉，而是只坐它那一份"
+    );
+}
+
 async fn count_status(runtime: &DagExecutorRuntime, status: TaskStatus) -> usize {
     runtime
         .orchestrator()
