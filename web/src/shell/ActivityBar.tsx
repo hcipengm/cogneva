@@ -58,7 +58,7 @@ export function ActivityBar() {
   return (
     <nav
       aria-label="活动栏"
-      className="flex h-full w-12 shrink-0 flex-col items-center border-r border-[var(--line)] bg-[var(--ink-800)] py-1"
+      className="flex h-full w-[104px] shrink-0 flex-col overflow-y-auto border-r border-[var(--line)] bg-[var(--ink-800)] py-1"
     >
       {ITEMS.map((item) => {
         const active = activity === item.id;
@@ -71,7 +71,7 @@ export function ActivityBar() {
             onClick={() => setActivity(item.id)}
             text={item.label}
             aria-current={active ? 'page' : undefined}
-            className="relative flex h-11 w-12 items-center justify-center transition-colors"
+            className="relative flex h-9 w-full shrink-0 items-center gap-2 pl-3 pr-2 text-left transition-colors"
             style={{ color: active ? 'var(--paper)' : 'var(--muted)' }}
           >
             {active && (
@@ -80,10 +80,13 @@ export function ActivityBar() {
                 style={{ background: 'var(--brass)' }}
               />
             )}
-            <Icon name={item.icon} size={19} />
+            <Icon name={item.icon} size={16} />
+            {/* 名字写出来，不藏在悬停提示里：图标只有形状，新读者认不出哪一格是
+                「员工」、哪一格是「场地」，认不出就等于这一面不存在。 */}
+            <span className="min-w-0 flex-1 truncate text-[11px]">{item.label}</span>
             {mark && (
               <span
-                className="mono absolute right-1 top-1 min-w-[15px] px-[3px] text-center text-[9px] leading-[14px]"
+                className="mono min-w-[15px] shrink-0 px-[3px] text-center text-[9px] leading-[14px]"
                 style={{
                   background: mark === '?' ? 'var(--warn)' : 'var(--danger)',
                   color: 'var(--ink-1000)',
@@ -96,29 +99,31 @@ export function ActivityBar() {
         );
       })}
 
-      <div className="mt-auto flex flex-col items-center">
+      <div className="mt-auto flex flex-col">
         <Note
           as="button"
           type="button"
           onClick={() => setActivity('settings')}
           text="设置"
           aria-current={activity === 'settings' ? 'page' : undefined}
-          className="relative flex h-11 w-12 items-center justify-center transition-colors"
+          className="relative flex h-9 w-full items-center gap-2 pl-3 pr-2 text-left transition-colors"
           style={{ color: activity === 'settings' ? 'var(--paper)' : 'var(--muted)' }}
         >
           {activity === 'settings' && (
             <span className="absolute inset-y-1.5 left-0 w-[2px]" style={{ background: 'var(--brass)' }} />
           )}
-          <Icon name="settings" size={19} />
+          <Icon name="settings" size={16} />
+          <span className="min-w-0 flex-1 truncate text-[11px]">设置</span>
         </Note>
         <Note
           as="button"
           type="button"
           onClick={signOut}
           text={username ? `退出（${username}）` : '退出登录'}
-          className="flex h-11 w-12 items-center justify-center text-[var(--muted)] transition-colors hover:text-[var(--danger)]"
+          className="flex h-9 w-full items-center gap-2 pl-3 pr-2 text-left text-[var(--muted)] transition-colors hover:text-[var(--danger)]"
         >
-          <Icon name="signout" size={18} />
+          <Icon name="signout" size={16} />
+          <span className="min-w-0 flex-1 truncate text-[11px]">退出</span>
         </Note>
       </div>
     </nav>

@@ -22,6 +22,7 @@ import { Button } from '@/ui/primitives';
 import { USE_MOCK } from '@/runtime';
 
 import { Note } from '@/ui/Note';
+import { WorkbenchBand } from '@/views/WorkbenchBand';
 /**
  * 一段对话最小要多少像素才读得成句子，以及一格最少要多高才看得见一轮问答。
  * 这两个数是「排几列几行」的尺子，不是硬下限：窗口小到放不下时，格子会一起
@@ -189,6 +190,10 @@ export function WorkspaceView() {
           </Button>
         </div>
       </header>
+
+      {/* 人、场、任务三条读数钉在正文之上：工作台回答「正在说什么」，这一条回答
+          「平台此刻长什么样」。两者不该分居两个入口。 */}
+      <WorkbenchBand />
 
       <div className="relative min-h-0 flex-1">
         <CanvasStage />

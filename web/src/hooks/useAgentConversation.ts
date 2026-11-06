@@ -26,6 +26,14 @@ import {
 export function useAgentConversation(enabled: boolean, waitSecs = 0) {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [agentsError, setAgentsError] = useState<string | null>(null);
+  /**
+   * 名单读回来过没有。
+   *
+   * 空名单与「还没读到」在界面上现在长得一样（都只剩一个转圈），而它们说的是两件
+   * 事：前者是平台此刻真的没有在岗的人（心跳 30 秒不来就会被摘掉），后者是这一面
+   * 还没开口。没有这一位，读者看着一个永远转的圈，会以为界面坏了。
+   */
+  const [agentsLoaded, setAgentsLoaded] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [lines, setLines] = useState<AgentConversationLine[]>([]);
   const [loading, setLoading] = useState(false);
@@ -40,6 +48,7 @@ export function useAgentConversation(enabled: boolean, waitSecs = 0) {
       const roster = await listAgents();
       setAgents(roster);
       setAgentsError(null);
+      setAgentsLoaded(true);
       // 选中的那个下线了就把选中让给名单里的第一个：留着一个已不在岗的名字，
       // 面板会一直对一个不会回话的地址说。
       setSelected((current) => {
@@ -93,6 +102,18 @@ export function useAgentConversation(enabled: boolean, waitSecs = 0) {
     if (enabled) refreshAgents();
   }, [enabled, refreshAgents]);
 
+  // 名单按 15 秒重读一次：帧是主路（有人上岗、换态、走了都会落一帧），这一拍是
+  // 兜底——帧丢了、连接断了，名单仍然追得上来。少了它，第一次读到空名单的那一
+  // 面会一直空着，而「在岗」本身就是按心跳记的（30 秒不来就摘掉），空不空是随时
+  // 会变的事，不是一次读定的。
+  useEffect(() => {
+    if (!enabled) return;
+    const timer = window.setInterval(() => {
+      void refreshAgents();
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [enabled, refreshAgents]);
+
   useEffect(() => {
     if (enabled) refreshConversation(selected);
   }, [enabled, selected, refreshConversation]);
@@ -100,6 +121,7 @@ export function useAgentConversation(enabled: boolean, waitSecs = 0) {
   return {
     agents,
     agentsError,
+    agentsLoaded,
     selected,
     select: setSelected,
     lines,

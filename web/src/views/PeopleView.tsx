@@ -33,6 +33,29 @@ const OUTCOME_LABEL: Record<AgentConversationLine['outcome'], { text: string; co
   failed: { text: '发送或回收答的通道断了', color: 'var(--danger)' },
 };
 
+/**
+ * 员工回话的形状不总是纯文本。
+ *
+ * 平台这一族员工把回答包在一个对象里（`{"role":"employee","thought":"…"}`），
+ * 原样贴出来读者看到的是一串花括号，而那句话就在里面——「不会说话」与「话说在
+ * 一个壳里」在屏幕上是同一种样子。认得出这几种壳就把里面的句子取出来；认不出
+ * 就原样贴，宁可露出一个不认识的形状，也不替它编一句。
+ */
+function spoken(reply: string): string {
+  const trimmed = reply.trim();
+  if (!trimmed.startsWith('{')) return reply;
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    for (const field of ['text', 'content', 'message', 'answer', 'thought']) {
+      const value = parsed[field];
+      if (typeof value === 'string' && value.trim()) return value;
+    }
+  } catch {
+    // 不是 JSON：那它本来就是一句人话。
+  }
+  return reply;
+}
+
 function stamp(iso: string): string {
   return new Date(iso).toLocaleString('zh-CN', {
     month: '2-digit',
@@ -56,7 +79,7 @@ function Line({ line }: { line: AgentConversationLine }) {
       <div className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--paper)]">{line.body}</div>
       {line.reply && (
         <div className="mt-1 whitespace-pre-wrap border-l-2 border-[var(--ok)]/40 pl-2 text-[12px] text-[var(--paper-dim)]">
-          {line.reply}
+          {spoken(line.reply)}
         </div>
       )}
       {line.outcome_detail && (
@@ -72,6 +95,7 @@ export function PeopleView() {
   const {
     agents,
     agentsError,
+    agentsLoaded,
     selected,
     select,
     lines,
@@ -137,7 +161,15 @@ export function PeopleView() {
       {agentsError ? (
         <ReadError what="在岗名单" error={agentsError} onRetry={refreshAgents} />
       ) : agents.length === 0 ? (
-        <Loading what="在岗名单" />
+        // 读回来是空的，就是真的没人：名单是心跳，30 秒不来就会被摘掉。这与
+        // 「还没开口」是两件事，画成同一个转圈会让空名单读成界面坏了。
+        agentsLoaded ? (
+          <Empty>
+            此刻没有在岗的员工。名单来自心跳（30 秒不来就会被摘掉），平台正在运行的员工会在几十秒内出现；下面的「重读名单」可以立刻再问一次。
+          </Empty>
+        ) : (
+          <Loading what="在岗名单" />
+        )
       ) : (
         <div className="flex h-full min-h-0">
           <aside className="w-72 shrink-0 overflow-y-auto border-r border-[var(--line)] p-2">

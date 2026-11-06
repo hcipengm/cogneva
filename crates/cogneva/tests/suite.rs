@@ -481,6 +481,8 @@ mod web_storage_keys_are_declared_once_test;
 mod web_websocket_channels_are_published_test;
 #[path = "web_websocket_envelope_vocabulary_test.rs"]
 mod web_websocket_envelope_vocabulary_test;
+#[path = "web_workbench_shows_people_venues_tasks_test.rs"]
+mod web_workbench_shows_people_venues_tasks_test;
 #[path = "wiki_indexer_test.rs"]
 mod wiki_indexer_test;
 #[path = "wiki_integration_test.rs"]
