@@ -1416,6 +1416,7 @@ pub async fn read_handover_products(
 /// it looks like. A failure for a reason that is the change's own is the
 /// opposite: the graph is the one retry authority, so a task that died on what
 /// the change asked for is a row this loop must not file again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handover {
     /// A task is queued, scheduled or running: the change is being worked now.
     InFlight,
@@ -1531,27 +1532,125 @@ fn dispatch_priority(row: &ChangeLedgerRow) -> i32 {
     DISPATCH_TASK_PRIORITY.saturating_add(i32::from(row.priority().rank().max(blocking)))
 }
 
-fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
-    let mut task = Task::new(
-        dispatch_task_id(&row.identity, generation),
-        TaskType::Custom(DISPATCH_TASK_KIND.into()),
-        serde_json::json!({
-            "goal": dispatch_goal(row),
-            (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
-            (cog_core::INPUT_TASK_KIND): DISPATCH_TASK_KIND,
-            (cog_core::INPUT_CHANGE_IDENTITY): {
+/// The knob a deployment raises the batch with.
+pub const ROWS_PER_HANDOVER_ENV: &str = "COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER";
+
+/// How many rows one hand-over carries when the deployment states no number.
+///
+/// Not the landing cap, and not the pass's slice: the slice
+/// ([`HANDOVERS_PER_PASS`]) is how many rows a pass may *start*, and this is how
+/// many of them one change can carry. The two differ because the price of a
+/// hand-over is mostly its fixed part -- a plan, a run's context, a sandbox
+/// round that validates the whole tree -- and that part is paid once per task
+/// whatever the task carries. So the rows are gathered until a batch is worth
+/// paying it for.
+///
+/// Why there is a number at all rather than "as many as the project owes": the
+/// limit is the generator's, not this loop's. A batch is written as one change,
+/// so a batch past what one generation can write comes back truncated, fails
+/// the suite and costs the whole batch -- the opposite of the saving. Five is
+/// the starting point, not a boundary this code believes in: the dominant shape
+/// of the queue is one gate per row (a test, a header and a check), a few of
+/// those fit one generation with room for the reasoning that writes them, and
+/// a deployment whose model writes more raises the knob. The reading that says
+/// whether to raise it is the pass line's own `submitted` against
+/// `tasks_submitted`: batches that land whole argue for a bigger one, and a
+/// batch that keeps coming back refused argues for a smaller one.
+// cap: bound — 一批太大时生成会被截断、整批报废；这个数按一次生成装得下几条修复定，部署可抬
+const DEFAULT_ROWS_PER_HANDOVER: usize = 5;
+
+/// How many rows a batch carries this pass, from the deployment.
+///
+/// `0` is refused rather than read as "no limit": a batch of zero rows is a pass
+/// that gathers forever and hands nothing over, and "unlimited" is the one value
+/// that would put the whole pending set into a single generation. A value that
+/// cannot be read falls back to the default and says so, by name -- an operator
+/// whose number was silently replaced would read the same pass line either way
+/// and conclude the knob does nothing.
+fn rows_per_handover() -> usize {
+    match std::env::var(ROWS_PER_HANDOVER_ENV) {
+        Err(_) => DEFAULT_ROWS_PER_HANDOVER,
+        Ok(raw) => match parse_rows_per_handover(&raw) {
+            Ok(n) => n,
+            Err(problem) => {
+                warn!(
+                    variable = ROWS_PER_HANDOVER_ENV,
+                    problem = %problem,
+                    using = DEFAULT_ROWS_PER_HANDOVER,
+                    "change ledger: the batch size could not be read; using the default"
+                );
+                DEFAULT_ROWS_PER_HANDOVER
+            }
+        },
+    }
+}
+
+/// The batch size a value names, or what is wrong with it.
+///
+/// Pure so the refusal of zero and of an unreadable number can be stated without
+/// the process environment: both are answers an operator needs, and a test that
+/// had to write the variable would race every other test in the binary.
+pub fn parse_rows_per_handover(raw: &str) -> Result<usize, String> {
+    match raw.trim().parse::<usize>() {
+        Ok(0) => Err(
+            "0 would gather forever and hand nothing over; leave it unset for the default".into(),
+        ),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("`{}` is not a count of rows", raw.trim())),
+    }
+}
+
+/// The task this loop hands owed changes over as.
+///
+/// One task, up to [`ROWS_PER_HANDOVER`] rows. The id is derived from the
+/// batch's first row -- the pass's own priority order puts the most urgent
+/// there -- so the id scheme, and with it every reader that recomputes a
+/// change's task id from its identity, is exactly what it was for a handover of
+/// one. The rest of the batch is carried in the payload, which is what a reader
+/// that has to settle them reads: a task that named only its first row would
+/// leave the others looking un-handed-over and they would be filed again.
+///
+/// The goal names every row: the generator is asked to settle them in one
+/// change, and a goal that described only the first would produce a change that
+/// settles only the first -- the batch would cost five rows' worth of plan and
+/// land one.
+///
+/// Separate from the pass so the row it produces can be read on its own: the id,
+/// the kind the change-generation path is looked up by, and the rank the
+/// submitter declares are all decided here, and a test can state them without
+/// running a whole ledger pass.
+fn dispatch_task(rows: &[ChangeLedgerRow], generation: u32) -> Task {
+    let anchor = &rows[0];
+    let identities: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
                 "kind": row.identity.kind,
                 "scope": row.identity.scope,
                 "literal": row.identity.literal,
-            },
-            "change_sources": row
-                .sources
+            })
+        })
+        .collect();
+    let mut task = Task::new(
+        dispatch_task_id(&anchor.identity, generation),
+        TaskType::Custom(DISPATCH_TASK_KIND.into()),
+        serde_json::json!({
+            "goal": dispatch_goal_for(rows),
+            (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
+            (cog_core::INPUT_TASK_KIND): DISPATCH_TASK_KIND,
+            (cog_core::INPUT_CHANGE_IDENTITY): identities[0].clone(),
+            (cog_core::INPUT_CHANGE_IDENTITIES): identities,
+            "change_sources": rows
                 .iter()
-                .map(|source| source.doc.as_str())
+                .flat_map(|row| row.sources.iter().map(|source| source.doc.as_str()))
                 .collect::<Vec<_>>(),
         }),
     );
-    task.priority = dispatch_priority(row);
+    task.priority = rows
+        .iter()
+        .map(dispatch_priority)
+        .max()
+        .unwrap_or(DISPATCH_TASK_PRIORITY);
     // Hand the row over inside a project rather than on its own. The goal path
     // mints one fresh id per submission when the task carries none, and this
     // loop submits one task per call -- so without this line every dispatched
@@ -1560,7 +1659,7 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
     // where the largest entry was one row. Everything built on the grouping --
     // the board's column limits, the rollup, earned value, the WBS the project
     // face reports -- reads a tree with no parents and no sums.
-    task.goal_id = Some(dispatch_project_key(row));
+    task.goal_id = Some(dispatch_project_key(anchor));
     // Hang the change under the project's anchor rather than leaving it a root
     // of its own. A project is the group of rows under one `goal_id` whose root
     // is the row with no parent, and that root is what replanning hangs new
@@ -1568,7 +1667,7 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
     // of them is a guess. Measured on 2026-10-29: 223 dispatched rows across 35
     // projects, every one of them a root, six projects already holding two or
     // more.
-    task.parent_task_id = Some(dispatch_project_root_id(&dispatch_project_key(row)));
+    task.parent_task_id = Some(dispatch_project_root_id(&dispatch_project_key(anchor)));
     // What closes this row: see [`DISPATCH_ACCEPTANCE`]. Hung under the anchor
     // it is a leaf, which is exactly the shape that has to say so.
     task.acceptance.push(DISPATCH_ACCEPTANCE.to_string());
@@ -1581,6 +1680,12 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
 /// holds, so the row costs a write on the first change of a project and nothing
 /// after that, and a pass never has to read the project back to learn whether
 /// its anchor exists.
+///
+/// A batch submits the anchor of the project it belongs to, through
+/// [`dispatch_project_root_for`], so there is no per-row wrapper: two call sites
+/// that both had to remember to derive the project first is one more place for
+/// the anchor and the change to disagree about which project they are in.
+#[cfg(test)]
 fn dispatch_project_root(row: &ChangeLedgerRow) -> Task {
     dispatch_project_root_for(&dispatch_project_key(row))
 }
@@ -1634,6 +1739,43 @@ fn dispatched_identity(task: &Task) -> Option<ChangeIdentity> {
         identity.get("scope")?.as_str()?,
         identity.get("literal")?.as_str()?,
     ))
+}
+
+/// Every change a hand-over carries.
+///
+/// Read from the batch list, and falling back to the single identity for the
+/// rows written before batches existed -- those tasks are on the graph for as
+/// long as it remembers them, and a reader that only knew the new key would take
+/// every one of them for a row that owes nothing. The single word is kept on
+/// every hand-over this loop writes, so the fallback is only ever about history.
+///
+/// The list, not the first entry: what settles a hand-over is *every* change it
+/// carried, and a reader that took the first would close the task while the
+/// rest of the batch was still owed.
+fn dispatched_identities(task: &Task) -> Vec<ChangeIdentity> {
+    let read = |value: &serde_json::Value| -> Option<ChangeIdentity> {
+        Some(ChangeIdentity::new(
+            value.get("kind")?.as_str()?,
+            value.get("scope")?.as_str()?,
+            value.get("literal")?.as_str()?,
+        ))
+    };
+    let mut identities: Vec<ChangeIdentity> = task
+        .input
+        .get(cog_core::INPUT_CHANGE_IDENTITIES)
+        .and_then(|list| list.as_array())
+        .map(|list| list.iter().filter_map(read).collect())
+        .unwrap_or_default();
+    if identities.is_empty() {
+        if let Some(identity) = task
+            .input
+            .get(cog_core::INPUT_CHANGE_IDENTITY)
+            .and_then(read)
+        {
+            identities.push(identity);
+        }
+    }
+    identities
 }
 
 /// Set to `true` on a row that has work to do and owes no change, by the code
@@ -1866,6 +2008,7 @@ async fn close_descendants(
 /// change, and the pass below is where it is handed over.
 async fn close_settled_dispatch_rows(
     orchestrator: &Arc<dyn OrchestratorControl>,
+    tasks: &[Task],
     store: &dyn ChangeLedgerStore,
     owed: &HashSet<ChangeIdentity>,
 ) -> SettledClosures {
@@ -1874,7 +2017,7 @@ async fn close_settled_dispatch_rows(
     // Every open row by the row it hangs under, so a closed hand-over takes its
     // own decomposition with it in the same pass.
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    for task in orchestrator.get_all_tasks().await {
+    for task in tasks {
         // Only rows that nothing is running. A settled account is not a reason
         // to interrupt a run: see [`SettledClosures`].
         if !matches!(task.status, TaskStatus::Pending | TaskStatus::Scheduled) {
@@ -1886,19 +2029,24 @@ async fn close_settled_dispatch_rows(
                 .or_default()
                 .push(task.id.clone());
         }
-        if unanswered_under_handover_project(&task) {
+        if unanswered_under_handover_project(task) {
             closed.unanswered += 1;
         }
         if !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_TASK_KIND) {
             continue;
         }
-        let Some(identity) = dispatched_identity(&task) else {
+        let identities = dispatched_identities(task);
+        let Some(anchor) = identities.first() else {
             continue;
         };
-        if owed.contains(&identity) {
+        // A batch closes when **every** change it carried is settled. One row
+        // left outstanding means the change that landed did not do that part of
+        // what the task was handed, and the task's own answer -- the account's
+        // row for it -- is still "owed".
+        if identities.iter().any(|identity| owed.contains(identity)) {
             continue;
         }
-        candidates.push((task.id.clone(), identity));
+        candidates.push((task.id.clone(), anchor.clone()));
     }
     closed.remaining = candidates.len();
 
@@ -2183,6 +2331,30 @@ fn dispatch_goal(row: &ChangeLedgerRow) -> String {
     } else {
         text
     }
+}
+
+/// What a hand-over carrying one or more rows asks for, in the words the
+/// generator will read.
+///
+/// One row is its own sentence, exactly as before batching existed -- a batch of
+/// one must produce the same goal a hand-over of one always did, or every
+/// measurement of what a goal is worth would have moved for a reason that has
+/// nothing to do with the goal. More than one is numbered, says how many, and
+/// says that one change is expected to settle all of them: a list without that
+/// sentence reads as a menu, and a menu produces a change that settles the one
+/// item the model liked.
+fn dispatch_goal_for(rows: &[ChangeLedgerRow]) -> String {
+    if let [only] = rows {
+        return dispatch_goal(only);
+    }
+    let mut goal = format!(
+        "一笔改完下面 {} 项，每一行都是变更账上单独欠着的一条，落地时要全部成立：\n",
+        rows.len()
+    );
+    for (index, row) in rows.iter().enumerate() {
+        goal.push_str(&format!("{}. {}\n", index + 1, dispatch_goal(row)));
+    }
+    goal
 }
 
 /// Start the loop. Not started when there is no ledger store (see the module
@@ -4937,8 +5109,17 @@ async fn dispatch_pass(
     // Every row the account still holds as outstanding is excluded by identity
     // before anything is looked up, so the per-row reads grow with the number of
     // changes that settled, not with the size of the queue.
+    //
+    // The graph is read once and both readers below take that reading: the
+    // sweep that closes settled rows and the index the hand-over decision
+    // consults. They were two full reads of the same table, and the second one
+    // is new -- the hand-over used to ask the graph per row and per generation
+    // instead, which is one lookup for every slot a change could have been filed
+    // under, on every pass, over the whole queue.
     let owed: HashSet<ChangeIdentity> = rows.iter().map(|row| row.identity.clone()).collect();
-    let closed = close_settled_dispatch_rows(orchestrator, store, &owed).await;
+    let graph_tasks = orchestrator.get_all_tasks().await;
+    let closed = close_settled_dispatch_rows(orchestrator, &graph_tasks, store, &owed).await;
+    let handovers = HandoverIndex::read(&graph_tasks);
     if closed.moved_anything() {
         info!("change ledger: {}", closed.line());
     }
@@ -5119,6 +5300,10 @@ async fn dispatch_pass(
         ..TickCounts::default()
     };
     let mut readback = HandoverCensus::default();
+    // One task per project, holding the rows this pass would otherwise have
+    // filed one at a time. Filled by the loop below, submitted after it.
+    let mut batches: Vec<HandoverBatch> = Vec::new();
+    let rows_per_batch = rows_per_handover();
     for row in &pending {
         // What the change's handovers left behind, read before anything is
         // decided about the row: this is a reading of the event stream, and it
@@ -5140,7 +5325,19 @@ async fn dispatch_pass(
                 }
             }
         }
-        match owed_row(orchestrator, row, rearm_limit).await {
+        // The reading the index already holds answers the question for every
+        // row something is working on, which is most of the queue most of the
+        // time. Only the rows that need the generation walk -- nothing holds
+        // them, or what holds them died -- ask the graph again.
+        let held = match handovers.held(&row.identity) {
+            Some(handover @ (Handover::InFlight | Handover::Completed)) => Some(handover),
+            _ => None,
+        };
+        let owed = match held {
+            Some(handover) => Owed::Held(handover),
+            None => owed_row(orchestrator, row, rearm_limit).await,
+        };
+        match owed {
             Owed::Held(Handover::DeadEnvironment) => counts.dead_environment += 1,
             Owed::Held(_) => counts.already += 1,
             Owed::NoTask { generation } => {
@@ -5152,37 +5349,59 @@ async fn dispatch_pass(
                     counts.held_back += 1;
                     continue;
                 }
-                if counts.submitted >= handover_budget {
-                    // Owed, handable, and left for a later pass because this one
-                    // has handed over its slice. Counted with the rows a paused
-                    // pass withholds, because the fact about the row is the same
-                    // in both -- owed, no task holds it, and this pass did not
-                    // hand it over -- while what differs is the pass's reason,
-                    // which is the verdict's to say and not the count's.
-                    //
-                    // Left, not skipped over: the loop runs to the end so the
-                    // census of what the handovers left behind stays a reading of
-                    // the whole set on every pass, which is what it says it is.
-                    counts.held_back += 1;
-                    continue;
-                }
-                if generation > 0 {
-                    counts.rearmed += 1;
-                }
-                let goal = dispatch_goal(row);
-                let task = dispatch_task(row, generation);
-                let root = dispatch_project_root(row);
-                match orchestrator.submit_goal_auto(&goal, vec![root, task]).await {
-                    Ok(_) => counts.submitted += 1,
-                    Err(e) => {
-                        counts.failed += 1;
-                        warn!(
-                            change = %row.identity,
-                            error = %e,
-                            "change ledger: a change still owed could not be handed over"
-                        );
+                // Gathered, not submitted: the rows of one project go out as one
+                // task. The batch is assembled here and flushed after the loop,
+                // because the slice's bound is on rows and a batch's size is
+                // only known once the rows are in it.
+                //
+                // Left, not skipped over when the slice is spent: the loop runs
+                // to the end so the census of what the handovers left behind
+                // stays a reading of the whole set on every pass, which is what
+                // it says it is.
+                let mut placed = false;
+                for batch in batches.iter_mut() {
+                    if batch.offer(row, generation, rows_per_batch) {
+                        placed = true;
+                        break;
                     }
                 }
+                if !placed {
+                    batches.push(HandoverBatch::new(row, generation));
+                }
+            }
+        }
+    }
+
+    let mut tasks_submitted = 0usize;
+    for batch in batches {
+        let rows = batch.rows;
+        // The slice is measured in rows, because that is what the pool bound
+        // says: how many changes one pass may start. A batch that does not fit
+        // what is left of it waits for the next pass rather than being cut --
+        // cutting it would hand over a change nobody wrote the goal for.
+        if counts.submitted + rows.len() > handover_budget {
+            counts.held_back += rows.len();
+            continue;
+        }
+        if batch.generation > 0 {
+            counts.rearmed += rows.len();
+        }
+        let goal = dispatch_goal_for(&rows);
+        let task = dispatch_task(&rows, batch.generation);
+        let root = dispatch_project_root_for(&batch.project);
+        match orchestrator.submit_goal_auto(&goal, vec![root, task]).await {
+            Ok(_) => {
+                counts.submitted += rows.len();
+                tasks_submitted += 1;
+            }
+            Err(e) => {
+                counts.failed += rows.len();
+                warn!(
+                    changes = rows.len(),
+                    project = %batch.project,
+                    error = %e,
+                    "change ledger: changes still owed could not be handed over"
+                );
             }
         }
     }
@@ -5212,7 +5431,13 @@ async fn dispatch_pass(
     } else {
         info!(
             pending = pending.len(),
+            // Rows handed over, and the tasks that carry them: an annotation
+            // rather than a second outcome, because the pass's arithmetic is
+            // over rows and one task can carry several. A reader that saw only
+            // the row count would read a batch as the same price as a batch of
+            // one, which is the thing this pass changed.
             submitted = counts.submitted,
+            tasks_submitted,
             held_back = counts.held_back,
             rearmed = counts.rearmed,
             already_handed_over = counts.already,
@@ -5278,6 +5503,94 @@ async fn dispatch_pass(
     // forward would be the posture of a pass that knew nothing, which is the
     // thing being fixed.
     (verdict.reading != PoolReading::Absent).then_some(verdict)
+}
+
+/// The owed rows one project hands over as one task.
+///
+/// Assembled in the pass's own order -- the priority order the queue is read in
+/// -- so the batch's first row is the most urgent one it holds, which is the row
+/// whose change gives the task its id. A batch stops at [`ROWS_PER_HANDOVER`]:
+/// past that the change one generation has to write gets longer than a
+/// generation can write, and the whole batch comes back refused.
+#[derive(Debug)]
+struct HandoverBatch {
+    project: String,
+    rows: Vec<ChangeLedgerRow>,
+    /// The highest generation among the rows it carries. A batch that re-arms
+    /// goes out under the furthest slot any of its rows had spent, because the
+    /// generation is what keeps a re-made handover from colliding with the task
+    /// the previous attempt left on the graph.
+    generation: u32,
+}
+
+impl HandoverBatch {
+    fn new(row: &ChangeLedgerRow, generation: u32) -> Self {
+        Self {
+            project: dispatch_project_key(row),
+            rows: vec![row.clone()],
+            generation,
+        }
+    }
+
+    /// Whether this row fits the batch, and if so put it in.
+    ///
+    /// `false` for a different project or a full batch: the caller opens the
+    /// next one. Stated as one predicate so the two refusals cannot drift into
+    /// "a batch of two projects", which would file work under the wrong
+    /// project's anchor.
+    fn offer(&mut self, row: &ChangeLedgerRow, generation: u32, cap: usize) -> bool {
+        if self.project != dispatch_project_key(row) || self.rows.len() >= cap {
+            return false;
+        }
+        self.push(row, generation);
+        true
+    }
+
+    fn push(&mut self, row: &ChangeLedgerRow, generation: u32) {
+        self.rows.push(row.clone());
+        self.generation = self.generation.max(generation);
+    }
+}
+
+/// Which change the graph is already working on, read once per pass.
+///
+/// The hand-over decision used to ask the graph per row, once for every
+/// generation a change could have been filed under: on a queue of two thousand
+/// rows that is thousands of lookups a pass to answer a question the pass had
+/// already read the answer to. This holds that reading instead, keyed by the
+/// change it is about rather than by the task id, because a batch's id is
+/// derived from its first row and a lookup by identity is the only one that
+/// finds the other rows of a batch.
+struct HandoverIndex {
+    held: HashMap<ChangeIdentity, Handover>,
+}
+
+impl HandoverIndex {
+    fn read(tasks: &[Task]) -> Self {
+        let mut held: HashMap<ChangeIdentity, Handover> = HashMap::new();
+        for task in tasks {
+            if !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_TASK_KIND) {
+                continue;
+            }
+            let handover = classify_handover(task);
+            for identity in dispatched_identities(task) {
+                // A live task outranks a dead one: a change that was handed over
+                // again after an environment refusal has both on the graph, and
+                // the dead one must not read as the answer.
+                if !matches!(
+                    held.get(&identity),
+                    Some(Handover::InFlight | Handover::Completed)
+                ) {
+                    held.insert(identity, handover);
+                }
+            }
+        }
+        Self { held }
+    }
+
+    fn held(&self, identity: &ChangeIdentity) -> Option<Handover> {
+        self.held.get(identity).copied()
+    }
 }
 
 /// What one owed row's graph row says about it.
@@ -6951,6 +7264,17 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use cog_core::{ChangeIdentity, ChangeLedgerEvent, LiveRevisionGap, SFError, SFResult};
 
+    /// The hand-over of exactly one row.
+    ///
+    /// Most of what is worth stating about a hand-over -- its id, its rank, the
+    /// project it hangs under -- is a property of a batch of one, and a batch of
+    /// one is what those cases were written against. Naming the shape here keeps
+    /// them reading as the statements they are instead of as calls that have to
+    /// spell out a slice every time.
+    fn dispatch_one(row: &ChangeLedgerRow, generation: u32) -> Task {
+        dispatch_task(std::slice::from_ref(row), generation)
+    }
+
     fn row(state: ChangeState, measured_at: Option<i64>) -> ChangeLedgerRow {
         ChangeLedgerRow {
             identity: ChangeIdentity::new("grep", "crates/x", "fn thing"),
@@ -6979,7 +7303,7 @@ mod tests {
     /// change would be chased as a missing binding forever.
     #[test]
     fn a_row_that_never_answered_which_change_it_owes_is_not_one_that_owes_none() {
-        let handed_over = dispatch_task(&row(ChangeState::Pending, None), 0);
+        let handed_over = dispatch_one(&row(ChangeState::Pending, None), 0);
         match owed_change(&handed_over) {
             OwedChange::HandedOver(identity) => {
                 assert_eq!(Some(identity), dispatched_identity(&handed_over))
@@ -7064,7 +7388,7 @@ mod tests {
             "明说自己不欠账的活是回答过的"
         );
 
-        let handed_over = dispatch_task(&row(ChangeState::Pending, None), 0);
+        let handed_over = dispatch_one(&row(ChangeState::Pending, None), 0);
         assert_eq!(
             handed_over.goal_id.as_deref(),
             Some(project.as_str()),
@@ -7360,7 +7684,7 @@ mod tests {
         let with_scope = |scope: &str| {
             let mut handed = row(ChangeState::Pending, Some(1_760_000_000));
             handed.identity = ChangeIdentity::new("grep", scope, "fn thing");
-            dispatch_task(&handed, 0).goal_id
+            dispatch_one(&handed, 0).goal_id
         };
         let crates = with_scope("crates");
         // First the claim every line below rests on: the task leaves the loop
@@ -7408,7 +7732,7 @@ mod tests {
     #[test]
     fn a_dispatched_change_hangs_under_its_projects_anchor() {
         let handed = row(ChangeState::Pending, Some(1_760_000_000));
-        let task = dispatch_task(&handed, 0);
+        let task = dispatch_one(&handed, 0);
         let root = dispatch_project_root(&handed);
 
         let project = task.goal_id.clone().expect("the change names its project");
@@ -7453,8 +7777,8 @@ mod tests {
             "one part of the tree is one project, so it names one anchor"
         );
         assert_eq!(
-            dispatch_task(&first, 0).parent_task_id,
-            dispatch_task(&second, 0).parent_task_id
+            dispatch_one(&first, 0).parent_task_id,
+            dispatch_one(&second, 0).parent_task_id
         );
         assert_ne!(
             dispatch_project_root(&first).id,
@@ -7611,7 +7935,7 @@ mod tests {
     /// the change-generation path is routed on.
     #[test]
     fn a_dispatched_change_declares_a_rank_below_the_default() {
-        let task = dispatch_task(&row(ChangeState::Pending, Some(1_760_000_000)), 0);
+        let task = dispatch_one(&row(ChangeState::Pending, Some(1_760_000_000)), 0);
         let default_rank =
             Task::new("t", TaskType::Custom("x".into()), serde_json::json!({})).priority;
         assert!(
@@ -7642,7 +7966,7 @@ mod tests {
             Some(DISPATCH_FACE),
             "锚点没有面，这条目标判退时就只能读成 no_face"
         );
-        let task = dispatch_task(&row, 0);
+        let task = dispatch_one(&row, 0);
         assert_eq!(task.goal_id, anchor.goal_id);
         assert_eq!(
             task.face_id, None,
@@ -7657,7 +7981,7 @@ mod tests {
     /// 这类话，就没有任何一条读数能把它清掉。
     #[test]
     fn a_dispatched_change_states_what_done_means_in_the_account_s_own_terms() {
-        let task = dispatch_task(&row(ChangeState::Pending, Some(1_760_000_000)), 0);
+        let task = dispatch_one(&row(ChangeState::Pending, Some(1_760_000_000)), 0);
         assert_eq!(task.acceptance, vec![DISPATCH_ACCEPTANCE.to_string()]);
         for terminal in ["landed", "retired"] {
             assert!(
@@ -7690,7 +8014,7 @@ mod tests {
                 priority: band,
                 block: ChangeBlock::NONE,
             }];
-            dispatch_task(&handed, 0).priority
+            dispatch_one(&handed, 0).priority
         };
         let ladder: Vec<i32> = [
             ChangePriority::Unstated,
@@ -7732,10 +8056,10 @@ mod tests {
             priority: ChangePriority::Unstated,
             block: ChangeBlock::NONE,
         }];
-        let quiet = dispatch_task(&owed, 0).priority;
+        let quiet = dispatch_one(&owed, 0).priority;
 
         owed.delivered_rev = Some("abc1234".into());
-        let holding = dispatch_task(&owed, 0).priority;
+        let holding = dispatch_one(&owed, 0).priority;
 
         assert_eq!(
             holding,
@@ -7751,7 +8075,7 @@ mod tests {
         // rank: the account adds no sixth level for a consumer to learn.
         owed.state = ChangeState::Landed;
         owed.delivered_rev = Some("abc1234".into());
-        let landed = dispatch_task(&owed, 0).priority;
+        let landed = dispatch_one(&owed, 0).priority;
         assert_eq!(landed, quiet, "a landed change holds nothing");
     }
 
@@ -9484,6 +9808,10 @@ mod tests {
         tasks: std::sync::Mutex<HashMap<String, Task>>,
         refuse_submissions: bool,
         submitted: std::sync::Mutex<Vec<String>>,
+        /// The tasks themselves, not just their ids: what a hand-over carried
+        /// cannot be reconstructed from the id the goal path answered with, and
+        /// the id it answered with is the graph's to choose, not the task's.
+        handed: std::sync::Mutex<Vec<Task>>,
         /// Every cancellation the code under test asked for, with the reason it
         /// gave. Kept apart from the row so a test can read *why* a row was
         /// closed without parsing the sentence back out of its error column.
@@ -9523,7 +9851,7 @@ mod tests {
         /// the reason comes from the sweep's own writer, so a reader that
         /// stopped recognising it would fail here rather than in production.
         fn holding_closed_as_settled(self, row: &ChangeLedgerRow) -> Self {
-            let mut task = dispatch_task(row, 0);
+            let mut task = dispatch_one(row, 0);
             task.status = TaskStatus::Cancelled;
             task.error = Some(settled_row_reason(row));
             self.tasks.lock().unwrap().insert(task.id.clone(), task);
@@ -9584,7 +9912,15 @@ mod tests {
         /// in `status`: the payload carries the change's identity, which is what
         /// the sweep reads a row back by.
         fn holding_handover(self, row: &ChangeLedgerRow, status: TaskStatus) -> Self {
-            let mut task = dispatch_task(row, 0);
+            let mut task = dispatch_one(row, 0);
+            task.status = status;
+            self.tasks.lock().unwrap().insert(task.id.clone(), task);
+            self
+        }
+
+        /// A hand-over carrying several rows, the way a pass files them now.
+        fn holding_batch(self, rows: &[ChangeLedgerRow], status: TaskStatus) -> Self {
+            let mut task = dispatch_task(rows, 0);
             task.status = status;
             self.tasks.lock().unwrap().insert(task.id.clone(), task);
             self
@@ -9622,6 +9958,11 @@ mod tests {
         fn submitted(&self) -> Vec<String> {
             self.submitted.lock().unwrap().clone()
         }
+
+        /// Every task the goal path took, whole.
+        fn handed(&self) -> Vec<Task> {
+            self.handed.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -9635,6 +9976,7 @@ mod tests {
             }
             let ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
             self.submitted.lock().unwrap().extend(ids.clone());
+            self.handed.lock().unwrap().extend(tasks);
             Ok(ids)
         }
         async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
@@ -11147,7 +11489,8 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let closed = close_settled_dispatch_rows(&control, &store, &HashSet::new()).await;
+        let tasks = control.get_all_tasks().await;
+        let closed = close_settled_dispatch_rows(&control, &tasks, &store, &HashSet::new()).await;
 
         assert_eq!(
             closed.unanswered,
@@ -11196,7 +11539,8 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        let closed = close_settled_dispatch_rows(&control, &store, &HashSet::new()).await;
+        let tasks = control.get_all_tasks().await;
+        let closed = close_settled_dispatch_rows(&control, &tasks, &store, &HashSet::new()).await;
 
         assert_eq!(
             graph
@@ -11341,7 +11685,7 @@ mod tests {
         // a change that named no parent would be a root of its own project.
         let mut expected = vec![at(&store.rows[1], 1), at(&store.rows[2], 0)];
         for row in [&store.rows[1], &store.rows[2]] {
-            let project = dispatch_task(row, 0)
+            let project = dispatch_one(row, 0)
                 .goal_id
                 .expect("a dispatched change names its project");
             expected.push(dispatch_project_root_id(&project));
@@ -11405,6 +11749,246 @@ mod tests {
         // pending set it closes on.
         assert_eq!(graph.submitted().len(), HANDOVERS_PER_PASS * 2);
         assert_the_counts_add_up(&state);
+    }
+
+    /// One hand-over carries every row it was given, and its goal names them
+    /// all.
+    ///
+    /// The two halves fail differently, which is why both are pinned. A payload
+    /// that named only the first row leaves the rest looking un-handed-over, and
+    /// the next pass files them again -- the batch would cost one task and be
+    /// paid for as many. A goal that described only the first row produces a
+    /// change that settles only the first: the batch lands one row of five and
+    /// the other four come back on the next pass, so every pass pays the whole
+    /// batch's price for a fifth of its work.
+    #[test]
+    fn a_handover_carries_every_row_it_was_given() {
+        let named = |literal: &str, title: &str| ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", literal),
+            title: Some(title.to_string()),
+            ..row(ChangeState::Pending, None)
+        };
+        let first = named("fn a", "第一项：给 a 配门");
+        let second = named("fn b", "第二项：给 b 配门");
+        let third = named("fn c", "第三项：给 c 配门");
+        let batch = vec![first.clone(), second.clone(), third.clone()];
+
+        let task = dispatch_task(&batch, 0);
+
+        assert_eq!(
+            task.id,
+            dispatch_task_id(&first.identity, 0),
+            "这批的 id 还是按第一行算的：读者要靠它从身份反推任务"
+        );
+        assert_eq!(
+            dispatched_identities(&task),
+            vec![
+                first.identity.clone(),
+                second.identity.clone(),
+                third.identity.clone()
+            ],
+            "承载的那几项一个都不能少，否则下一拍会把它们当成没派过再派一次"
+        );
+        assert_eq!(
+            dispatched_identity(&task),
+            Some(first.identity.clone()),
+            "单数那个词仍然是第一个身份：阶段归档只读它"
+        );
+        let goal = task.input["goal"].as_str().unwrap_or_default();
+        for title in ["第一项", "第二项", "第三项"] {
+            assert!(
+                goal.contains(title),
+                "目标里没写「{title}」，生成侧就只会做它看见的那一项：{goal}"
+            );
+        }
+    }
+
+    /// A hand-over of one row says exactly what it always said.
+    ///
+    /// Batching must not change the price of a single row's goal: every reading
+    /// of what a goal is worth was taken against that sentence, and a batch of
+    /// one that reworded it would move all of them for a reason that has nothing
+    /// to do with the goal.
+    #[test]
+    fn a_batch_of_one_asks_for_what_a_single_handover_always_did() {
+        let only = row(ChangeState::Pending, Some(1_760_000_000));
+        let batched = dispatch_task(std::slice::from_ref(&only), 0);
+        assert_eq!(
+            batched.input["goal"],
+            serde_json::Value::String(dispatch_goal(&only))
+        );
+        assert_eq!(dispatched_identities(&batched), vec![only.identity.clone()]);
+    }
+
+    /// A batch takes rows of one project up to the cap the deployment states,
+    /// and refuses a row of another project whatever room is left.
+    ///
+    /// Both refusals are the difference between one task and two wrong ones: a
+    /// batch past the cap comes back truncated and loses everything in it, and a
+    /// batch holding two projects files one project's work under another's
+    /// anchor. The cap is a parameter here rather than the constant, because
+    /// what a deployment states is exactly what has to be honoured.
+    #[test]
+    fn a_batch_takes_rows_of_one_project_up_to_the_cap_the_deployment_states() {
+        let in_scope = |literal: &str| ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", literal),
+            ..row(ChangeState::Pending, None)
+        };
+        let a = in_scope("fn a");
+        let b = in_scope("fn b");
+        let c = in_scope("fn c");
+        let other = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/y", "fn d"),
+            ..row(ChangeState::Pending, None)
+        };
+
+        let mut batch = HandoverBatch::new(&a, 0);
+        assert!(batch.offer(&b, 0, 2), "同项目、还在上限内，就该进这一批");
+        assert!(
+            !batch.offer(&c, 0, 2),
+            "上限是部署说的那个数，不是「差不多就行」"
+        );
+        assert_eq!(batch.rows.len(), 2);
+
+        let mut wide = HandoverBatch::new(&a, 0);
+        assert!(
+            !wide.offer(&other, 0, 10),
+            "另一个项目的行是另一个任务：混在一起会把一个项目的工作挂到另一个项目的锚点下"
+        );
+        assert_eq!(wide.rows.len(), 1);
+    }
+
+    /// The batch size a deployment states is read, and a value that cannot mean
+    /// a batch is refused with a reason rather than quietly replaced.
+    #[test]
+    fn a_batch_size_that_cannot_mean_a_batch_is_refused() {
+        assert_eq!(parse_rows_per_handover("12"), Ok(12));
+        assert_eq!(parse_rows_per_handover(" 12 "), Ok(12));
+        assert!(
+            parse_rows_per_handover("0").is_err(),
+            "0 读成「不限」或「停摆」都会把额度花光的形状藏起来"
+        );
+        assert!(parse_rows_per_handover("five").is_err());
+    }
+
+    /// A batch the account has not fully settled stays open.
+    ///
+    /// This is the whole of the batching contract: what closes a hand-over is
+    /// every change it carried. A sweep that closed the task on its first row
+    /// would retire the queue's record of four changes that nobody settled --
+    /// exactly the state the sweep exists to prevent, arrived at from the other
+    /// side.
+    #[tokio::test]
+    async fn a_batch_stays_open_while_any_change_it_carried_is_still_owed() {
+        let settled = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", "fn settled"),
+            ..row(ChangeState::Landed, Some(1_760_000_100))
+        };
+        let owed_row = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/x", "fn owed"),
+            ..row(ChangeState::Pending, None)
+        };
+        let store = FakeLedger {
+            rows: vec![settled.clone(), owed_row.clone()],
+            ..Default::default()
+        };
+        let batch = vec![settled.clone(), owed_row.clone()];
+        let graph = Arc::new(FakeGraph::default().holding_batch(&batch, TaskStatus::Pending));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        let id = dispatch_task_id(&settled.identity, 0);
+
+        let still_owed: HashSet<ChangeIdentity> = [owed_row.identity.clone()].into_iter().collect();
+        let tasks = control.get_all_tasks().await;
+        let closed = close_settled_dispatch_rows(&control, &tasks, &store, &still_owed).await;
+        assert_eq!(
+            closed.landed + closed.retired,
+            0,
+            "其中一项还欠着，这一笔就不能算结清：{}",
+            closed.line()
+        );
+        assert_eq!(
+            graph.held(&id).map(|task| task.status),
+            Some(TaskStatus::Pending),
+            "半个批次结清不等于这一笔结清"
+        );
+
+        let tasks = control.get_all_tasks().await;
+        let closed = close_settled_dispatch_rows(&control, &tasks, &store, &HashSet::new()).await;
+        assert_eq!(closed.landed, 1, "{}", closed.line());
+        assert_eq!(
+            graph.held(&id).map(|task| task.status),
+            Some(TaskStatus::Cancelled),
+            "整批都结清了，这一笔才是关掉的"
+        );
+    }
+
+    /// One pass files one task for a project, however many rows it owes there.
+    ///
+    /// The price of a hand-over is its fixed part -- a plan, a run's context, a
+    /// sandbox round -- and that part does not grow with the rows the change
+    /// carries. Measured on 2026-11-06: 87 hand-overs in a day carried one row
+    /// each, and the queue held 1,957 rows, so the same work was priced 1,957
+    /// times. What the counts keep saying is the row: `submitted` is still rows
+    /// handed over, so the pass's arithmetic closes on the set it read.
+    #[tokio::test]
+    async fn a_pass_files_one_task_for_a_project_however_many_rows_it_owes() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(
+            state.submitted, 3,
+            "读数按行算：派出去的是三条账，不是一个任务"
+        );
+        assert_the_counts_add_up(&state);
+        assert_eq!(
+            graph.submitted().len(),
+            2,
+            "一个批次只写锚点和它自己这两行：{}",
+            graph.submitted().join(", ")
+        );
+        let task = graph
+            .handed()
+            .into_iter()
+            .find(|task| task.input.get(cog_core::INPUT_CHANGE_IDENTITIES).is_some())
+            .expect("承载变更的那一笔必须在派出去的两行里");
+        let carried = dispatched_identities(&task);
+        assert_eq!(
+            carried.len(),
+            3,
+            "一个项目这一拍欠的三条都挂在同一个任务上：{carried:?}"
+        );
+        assert_eq!(
+            task.id,
+            dispatch_task_id(&carried[0], 0),
+            "任务的 id 按它承载的第一行算：读者要靠它从身份反推任务"
+        );
     }
 
     /// A change a commit names is recorded against its row, and stays owed.

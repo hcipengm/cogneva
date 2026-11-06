@@ -145,6 +145,8 @@ mod builtin_tools_have_one_list;
 mod capability_declarations_are_enumerated;
 #[path = "change_kind_vocabulary_test.rs"]
 mod change_kind_vocabulary_test;
+#[path = "change_ledger_batch_size_wiring_test.rs"]
+mod change_ledger_batch_size_wiring_test;
 #[path = "change_ledger_read_face.rs"]
 mod change_ledger_read_face;
 #[path = "chart_declared_ports_reach_the_process_test.rs"]

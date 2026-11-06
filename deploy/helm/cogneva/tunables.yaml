@@ -883,6 +883,23 @@ rows:
       in `cogneva.json`: nothing here is claimed until that pool has a turn, so
       the two numbers have to move together.
 
+  - key: changeLedger.rowsPerHandover
+    source: override
+    why: >-
+      How many owed changes one hand-over carries. The price of a task is mostly
+      its fixed part -- a plan, a run's context, a sandbox round over the whole
+      tree -- and that part does not grow with what the task carries, so handing
+      the queue over one row per task paid it once per row: measured
+      2026-11-06, 1,957 pending rows of which 1,694 were the same shape ("give
+      principle X the gate it is owed"), against about 102 LLM calls and about
+      one yuan per task attempt. What bounds the batch is the generator, not this
+      loop: a batch becomes one change, and a batch past what one generation can
+      write comes back truncated and loses everything in it. So the number
+      belongs to what a generation can contain, and it is a deployment's to
+      state rather than a loop's to measure -- no reading moves it, because the
+      reading that would (`submitted / tasks_submitted` against the batch's
+      landing rate) comes from the loop's own pass line and a person reads it.
+
   # --- probe budgets ----------------------------------------------------------
   - key: healthProbes.liveness.periodSeconds
     source: fixed

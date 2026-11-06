@@ -60,6 +60,13 @@ data:
   # `cogneva_task_router_claim_slots` 报出去，所以配置与生效在读数面是同一个值。
   COGNEVA_TASK_CLAIM_CONCURRENCY: "2"
 
+  # 变更账一拍把一个项目的几条欠账并成一道任务派出去。价格的大头是任务的固定部分
+  # （一次规划、一轮上下文、一轮沙箱验证），它不随任务承载几条增长，所以并得越多、
+  # 每条欠账摊到的钱越少。上限在生成侧而不在这一格：一批写成一份变更，超过一次
+  # 生成写得完的量就会截断、整批报废，所以它是「一次生成装得下几条修复」，不是
+  # 拍板定的界——要抬就直接改这一格，代码里那个默认值只是没配时的起点。
+  COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER: "5"
+
   # 进程被告知的三个端口，与容器实际监听的那三个同源（values 的 gateway.*Port，
   # 也与 files/cogneva.json 里的 gateway.*_port 同源）：env 层覆盖 JSON，两处
   # 各写一个数时，覆盖生效的那次会悄悄把进程挪到另一个端口，而 Service 没动。

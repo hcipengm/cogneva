@@ -36,6 +36,18 @@ use crate::SFResult;
 /// find no identity on every row the ledger dispatched.
 pub const INPUT_CHANGE_IDENTITY: &str = "change_identity";
 
+/// Where a dispatched task carries **every** change it was handed over for, in
+/// its input.
+///
+/// A handover that carries one change writes one identity and this list of one,
+/// so a reader never has to ask which of the two shapes it is looking at: the
+/// single word above is the one the stage archive copies and the one the
+/// account's first row is known by, and this list is what a reader that has to
+/// settle *all* of them reads. A task that carried only the first identity
+/// would leave the other changes it landed looking unhanded-over, and the next
+/// pass would hand them over a second time.
+pub const INPUT_CHANGE_IDENTITIES: &str = "change_identities";
+
 /// How far a generation got.
 ///
 /// Ordered: a later stage means the generation reached further, and a reader
