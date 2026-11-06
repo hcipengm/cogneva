@@ -313,7 +313,6 @@ impl TaskExecutorRouter {
 
         {
             let sweeper = self.clone();
-            let sweep_task_backend = task_backend.clone();
             let sweep_shutdown = shutdown.clone();
             let sweep_pipe = pipe.clone();
             let sweep_slots = claim_slots.clone();
@@ -327,7 +326,6 @@ impl TaskExecutorRouter {
                 // Rebuilt per attempt, so everything the body consumes is cloned here.
                 move |beat| {
                     let sweeper = sweeper.clone();
-                    let sweep_task_backend = Arc::clone(&sweep_task_backend);
                     let sweep_shutdown = sweep_shutdown.clone();
                     let sweep_pipe = Arc::clone(&sweep_pipe);
                     let sweep_slots = Arc::clone(&sweep_slots);
@@ -339,55 +337,14 @@ impl TaskExecutorRouter {
                                 biased;
                                 _ = sweep_shutdown.wait() => break,
                                 _ = ticker.tick() => {
-                                    match sweep_task_backend
-                                        .claim_pending(
-                                            &sweep_pipe.ready_stream,
-                                            &sweep_pipe.group,
-                                            PENDING_IDLE_MS,
+                                    sweeper
+                                        .sweep_stalled_ready(
+                                            &sweep_pipe,
+                                            &sweep_slots,
+                                            &sweep_shutdown,
                                             CLAIM_BATCH,
                                         )
-                                        .await
-                                    {
-                                        Ok(Some(claimed)) if !claimed.is_empty() => {
-                                            tracing::warn!(
-                                                stream = %sweep_pipe.ready_stream,
-                                                count = claimed.len(),
-                                                "Claimed idle pending ready messages for re-execution"
-                                            );
-                                            for (msg_id, bytes) in claimed {
-                                                // 先拿许可再派发：限制重执行并发，shutdown
-                                                // 时也不再起新执行；许可在处理任务内持有到
-                                                // 执行结束。
-                                                let permit = tokio::select! {
-                                                    _ = sweep_shutdown.wait() => break,
-                                                    acquired = sweep_slots.clone().acquire_owned() => match acquired {
-                                                        Ok(permit) => permit,
-                                                        Err(_) => break,
-                                                    },
-                                                };
-                                                // 清扫器与订阅循环共用同一份许可，所以
-                                                // 它拿到的每一条都计入在途数与持有上界：
-                                                // 只报订阅循环那几条，会让「在途打满」
-                                                // 恰好在许可靠清扫器维持时读不出来。
-                                                let hold = crate::observable::claim_slots_observable()
-                                                    .permit_taken(&sweep_pipe.ready_stream);
-                                                sweeper.spawn_ready_processing(
-                                                    sweep_pipe.clone(),
-                                                    msg_id,
-                                                    bytes,
-                                                    permit,
-                                                    hold,
-                                                );
-                                            }
-                                        }
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                stream = %sweep_pipe.ready_stream,
-                                                "Pending claim sweep failed: {e}"
-                                            );
-                                        }
-                                    }
+                                        .await;
                                 }
                             }
                         }
@@ -595,6 +552,68 @@ impl TaskExecutorRouter {
             "dropped a ready message whose task can no longer run, without taking an execution permit"
         );
         true
+    }
+
+    /// 清扫的一拍：重新认领停滞的 pending 消息并投递。
+    ///
+    /// 认领到的每一条都先问一句「这条还跑不跑」，跑不成的就地 ack、**不排进
+    /// 执行许可的队列**。这条判据主订阅循环早就有（见
+    /// [`Self::drop_if_its_task_cannot_run`]），这里却是另一条路：清扫器是唯一
+    /// 一条成批认领、并且只在认领**之后**才去拿许可的路，于是 16 条里只要有 1
+    /// 个空位，剩下 15 条就一个字都不做地排在许可后面——而它们绝大多数正是上
+    /// 一次跑完没 ack 留下的残留（集群实测 2026-11-07：`orchestrator:ready:default`
+    /// 上 lag=0、pending=245，也就是全部投递过、245 条没 ack）。执行许可是「同时
+    /// 在跑的活有几条」的界，不是「一条消息要走多快」的界；拿它去排队处理一件
+    /// 不执行的事，付的是所有真活多等一轮。
+    async fn sweep_stalled_ready(
+        &self,
+        pipe: &Arc<ReadyPipeline>,
+        slots: &Arc<tokio::sync::Semaphore>,
+        shutdown: &ShutdownSignal,
+        batch: usize,
+    ) {
+        let claimed = match pipe
+            .task_backend
+            .claim_pending(&pipe.ready_stream, &pipe.group, PENDING_IDLE_MS, batch)
+            .await
+        {
+            Ok(Some(claimed)) if !claimed.is_empty() => claimed,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(
+                    stream = %pipe.ready_stream,
+                    "Pending claim sweep failed: {e}"
+                );
+                return;
+            }
+        };
+        tracing::warn!(
+            stream = %pipe.ready_stream,
+            count = claimed.len(),
+            "Claimed idle pending ready messages for re-execution"
+        );
+        for (msg_id, bytes) in claimed {
+            if self
+                .drop_if_its_task_cannot_run(pipe, &msg_id, &bytes)
+                .await
+            {
+                continue;
+            }
+            // 先拿许可再派发：限制重执行并发，shutdown 时也不再起新执行；许可在
+            // 处理任务内持有到执行结束。
+            let permit = tokio::select! {
+                _ = shutdown.wait() => break,
+                acquired = slots.clone().acquire_owned() => match acquired {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
+            // 清扫器与订阅循环共用同一份许可，所以它拿到的每一条都计入在途数与
+            // 持有上界：只报订阅循环那几条，会让「在途打满」恰好在许可靠清扫器
+            // 维持时读不出来。
+            let hold = crate::observable::claim_slots_observable().permit_taken(&pipe.ready_stream);
+            self.spawn_ready_processing(pipe.clone(), msg_id, bytes, permit, hold);
+        }
     }
 
     /// 执行一条 ready 消息的全管线：反序列化 → start_task → execute →
@@ -1605,8 +1624,12 @@ mod ready_permit_fast_lane_tests {
     use std::time::Instant;
 
     /// 一条就绪流上放着预置的几条消息，读完之后保持打开。记下被 ack 的 id。
+    ///
+    /// `stalled` 是清扫器那条路（`claim_pending`）看到的停滞消息：它一次只发
+    /// 一次，发完就空——重复发会让「谁把它处理掉了」读不出来。
     struct OneShotBackend {
         messages: tokio::sync::Mutex<Vec<(String, Vec<u8>)>>,
+        stalled: tokio::sync::Mutex<Vec<(String, Vec<u8>)>>,
         acks: tokio::sync::Mutex<Vec<String>>,
     }
 
@@ -1614,8 +1637,15 @@ mod ready_permit_fast_lane_tests {
         fn new(messages: Vec<(String, Vec<u8>)>) -> Self {
             Self {
                 messages: tokio::sync::Mutex::new(messages),
+                stalled: tokio::sync::Mutex::new(Vec::new()),
                 acks: tokio::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// 让清扫器在下一拍认领到这几条停滞消息。
+        fn with_stalled(mut self, stalled: Vec<(String, Vec<u8>)>) -> Self {
+            self.stalled = tokio::sync::Mutex::new(stalled);
+            self
         }
     }
 
@@ -1656,7 +1686,8 @@ mod ready_permit_fast_lane_tests {
             _min_idle_ms: u64,
             _count: usize,
         ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
-            Ok(Some(Vec::new()))
+            let stalled: Vec<(String, Vec<u8>)> = self.stalled.lock().await.drain(..).collect();
+            Ok(Some(stalled))
         }
         async fn pending_stats(
             &self,
@@ -1868,6 +1899,70 @@ mod ready_permit_fast_lane_tests {
         assert!(
             backend.acks.lock().await.is_empty(),
             "a runnable task's message was discarded while the permit was merely busy"
+        );
+
+        shutdown.trigger();
+        runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_message_whose_task_is_already_terminal_leaves_without_a_permit() {
+        // 清扫器是唯一一条成批认领、并且只在认领之后才去拿许可的路。停滞的
+        // 消息里多数是上一次跑完没 ack 的残留，它们的任务往往早就终态了；让
+        // 这些消息排在执行许可后面，付的是所有真活多等一轮。许可为零（一个
+        // 空位都没有）时它们仍然必须被 ack 掉，这就是判据。
+        let payload = serde_json::to_vec(&task_in("cancelled")).unwrap();
+        let backend = Arc::new(
+            OneShotBackend::new(Vec::new()).with_stalled(vec![("m-stalled-dead".into(), payload)]),
+        );
+        let router = TaskExecutorRouter::new().with_orchestrator(Arc::new(OneRowGraph {
+            task: task_in("cancelled"),
+        }));
+
+        let shutdown = ShutdownSignal::new();
+        let runner = run_with_no_permit(router, backend.clone(), shutdown.clone());
+
+        let started = Instant::now();
+        loop {
+            if backend
+                .acks
+                .lock()
+                .await
+                .iter()
+                .any(|id| id == "m-stalled-dead")
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "清扫器把一条已终态任务的消息排在执行许可后面，而它永远不会被执行"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        shutdown.trigger();
+        runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_message_whose_task_can_still_run_waits_for_the_permit() {
+        // 反面对照：这条判据只管「跑不成」的消息。任务还排得上时，清扫器不
+        // 许先 ack 再等——那等于把活丢了。
+        let payload = serde_json::to_vec(&task_in("scheduled")).unwrap();
+        let backend = Arc::new(
+            OneShotBackend::new(Vec::new()).with_stalled(vec![("m-stalled-live".into(), payload)]),
+        );
+        let router = TaskExecutorRouter::new().with_orchestrator(Arc::new(OneRowGraph {
+            task: task_in("scheduled"),
+        }));
+
+        let shutdown = ShutdownSignal::new();
+        let runner = run_with_no_permit(router, backend.clone(), shutdown.clone());
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            backend.acks.lock().await.is_empty(),
+            "清扫器把一条还跑得成的任务的消息在许可忙的时候丢掉了"
         );
 
         shutdown.trigger();
