@@ -266,6 +266,17 @@ pub enum RejectionCause {
     /// cluster accept it or they do not. A refusal here names which check
     /// failed, so the next action is to fix the change, not to wait.
     DeployAdmissionFailed,
+    /// A change that claims to fix a red check did not show that red on this
+    /// machine, or did not clear it.
+    ///
+    /// A green suite is not the same fact as the red being gone: a change can
+    /// turn the tree green by touching something else entirely while the check
+    /// that named the failure is still red upstream. The one reading that
+    /// tells the two apart is the same command run twice — on the tree without
+    /// the change and then with it, red then green. A change that was never
+    /// seen to make that transition locally is a guess, and the upstream run
+    /// it costs is a debugging round rather than a verification.
+    NotReproduced,
 }
 
 impl RejectionCause {
@@ -286,6 +297,7 @@ impl RejectionCause {
         Self::UnreachableDefault,
         Self::ProjectKindUnusable,
         Self::DeployAdmissionFailed,
+        Self::NotReproduced,
     ];
 
     /// The wire form, for label values and records.
@@ -305,6 +317,7 @@ impl RejectionCause {
             Self::UnreachableDefault => "unreachable_default",
             Self::ProjectKindUnusable => "project_kind_unusable",
             Self::DeployAdmissionFailed => "deploy_admission_failed",
+            Self::NotReproduced => "not_reproduced",
         }
     }
 
@@ -2725,6 +2738,7 @@ mod tests {
                 RejectionCause::UnreachableDefault => "unreachable_default",
                 RejectionCause::ProjectKindUnusable => "project_kind_unusable",
                 RejectionCause::DeployAdmissionFailed => "deploy_admission_failed",
+                RejectionCause::NotReproduced => "not_reproduced",
             };
             assert_eq!(cause.as_str(), spelling, "{cause:?} spells two ways");
             assert_eq!(
@@ -2735,7 +2749,7 @@ mod tests {
             assert!(!seen.contains(&spelling), "{spelling} is in the list twice");
             seen.push(spelling);
         }
-        assert_eq!(seen.len(), 14, "ALL is missing a cause: {seen:?}");
+        assert_eq!(seen.len(), 15, "ALL is missing a cause: {seen:?}");
         for (index, cause) in RejectionCause::ALL.iter().enumerate() {
             assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
         }

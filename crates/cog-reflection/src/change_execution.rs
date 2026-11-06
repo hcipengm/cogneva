@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
-use crate::change_pipeline::{ChangePipeline, ChangeVerdict};
+use crate::change_pipeline::{ChangePipeline, ChangeVerdict, RedReproduction};
 use crate::config::{ChangeJobConfig, PromotionGateConfig};
 use crate::evolution_deployer::EvolutionDeployer;
 use crate::types::{EvolutionResult, EvolutionStatus};
@@ -626,7 +626,16 @@ async fn run_in(
     .with_verification_budget(budget.clone())
     .with_target_dir(world.target_dir.as_path());
 
-    let verdict = pipeline.apply_and_test_in(&request.change, workdir).await;
+    // 修上游 CI 红的变更欠一次本地复现：它声称的是一条特定的红，而「这棵树现在是
+    // 绿的」不等于「那条红没了」。这一条判据按入口定，不由变更自己声明——自报的
+    // 声明只能证明它希望被怎么判。
+    let verdict = pipeline
+        .apply_and_test_requiring(
+            &request.change,
+            workdir,
+            RedReproduction::for_intent(request.intent),
+        )
+        .await;
     // 读数在下一步动它之前取走：构建会写同一份预算的另一个 kind，而验证这一格的
     // 读数只有这一刻在同一个进程里读得到。
     outcome.test = RunReading::of(&budget, KIND_TEST);

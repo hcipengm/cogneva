@@ -350,6 +350,39 @@ impl VerificationScopes {
     }
 }
 
+/// 这条变更欠不欠一次「先把红跑出来」。
+///
+/// 普通变更的判据只是「改完是绿的」：它不声称自己修的是某条特定的红，绿就是全部。
+/// 而一条修上游 CI 红的变更带着一个额外的断言——「红的这一条我能在这台机器上先
+/// 跑出来，改完再用同一条命令跑绿它」。这个断言今天只在题面里写着，没有任何东西
+/// 验它；于是六个修订上可以是同一条红，每一个都交出了本地没跑过的版本。
+///
+/// 欠复现时，套件按**这条管线配置的那条命令的完整范围**跑，不按改动的包收窄：上游
+/// CI 跑的是整棵树，收窄到这里就等于把「红在别的包里」这半读丢，而那正是本地绿、
+/// 上游红的来路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedReproduction {
+    /// 不欠：判据是改完绿。
+    NotRequired,
+    /// 欠：判据是去掉改动红、加上改动绿，同一条命令。
+    Required,
+}
+
+impl RedReproduction {
+    /// 哪个入口欠这一次复现。
+    ///
+    /// 按入口判，不按变更自己声明：一条会写「我不要这一条」的声明只能证明它希望
+    /// 被怎么判，而这条门要的正是它管不了的那个读数。修上游 CI 红是唯一一个入口，
+    /// 它的活就是从一条点名了的红出发——不欠它的那些入口本来就只说得出「改完是
+    /// 绿的」，对它们要这一对读数就是把判据换成另一件事。
+    pub fn for_intent(intent: Option<cog_core::EvolutionIntent>) -> Self {
+        match intent {
+            Some(cog_core::EvolutionIntent::CiFix) => Self::Required,
+            _ => Self::NotRequired,
+        }
+    }
+}
+
 /// 工作流里的一条门禁命令。
 struct RepoGateCommand {
     /// 与工作流里写的一样的一条命令：启动器、脚本，加上只由旗标构成的参数。
@@ -1344,6 +1377,22 @@ impl ChangePipeline {
         change: &EvolutionResult,
         workdir: &Path,
     ) -> SFResult<ApplyResult> {
+        self.apply_and_test_requiring(change, workdir, RedReproduction::NotRequired)
+            .await
+    }
+
+    /// 在指定工作树里应用并测试变更，并按 [`RedReproduction`] 决定要不要先在这棵树
+    /// 上把那条红跑出来。
+    ///
+    /// 判据的形状是「同一条命令、同一棵树，去掉改动是红的，加上改动是绿的」。绿本身
+    /// 从来不是问题所在——一条改在别处的变更也能让整棵树变绿——所以只有这一对读数
+    /// 才能把「这条红被修好了」与「这条红没人再提」分开。
+    pub async fn apply_and_test_requiring(
+        &self,
+        change: &EvolutionResult,
+        workdir: &Path,
+        reproduce: RedReproduction,
+    ) -> SFResult<ApplyResult> {
         info!(change_id = %change.artifact_id, "Applying evolution change");
 
         // 判定类失败一律走 `Ok(ApplyResult { verdict: Refused(..), .. })`，`Err` 只留给
@@ -1694,7 +1743,20 @@ impl ChangePipeline {
         // `None` is the whole workspace, which is what every change was judged
         // by before this scope existed and what a change touching anything
         // outside `crates/<member>/` still is.
-        let scopes = self.verification_scopes(workdir, &change.content).await;
+        // 欠复现的变更只收窄 linter，不收窄套件：它要证明的那条红可能就在没被改动
+        // 的包里，而按改动收窄正好把这个包排除在外——本地因此是绿的，上游仍是红的。
+        let scopes = match reproduce {
+            RedReproduction::Required => VerificationScopes {
+                lint: self
+                    .verification_scopes(workdir, &change.content)
+                    .await
+                    .lint,
+                suite: None,
+            },
+            RedReproduction::NotRequired => {
+                self.verification_scopes(workdir, &change.content).await
+            }
+        };
         match (&scopes.lint, &scopes.suite) {
             (Some(linted), Some(suite)) => info!(
                 change_id = %change.artifact_id,
@@ -1943,6 +2005,96 @@ impl ChangePipeline {
                         change_id = %change.artifact_id,
                         error = %e,
                         "Could not read the tests this revision fails on its own; reaching no verdict"
+                    );
+                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // 复现门：一条声称修红的变更，必须在这台机器上先见过那条红，再用同一条
+        // 命令见过它绿。两半都缺一个就退回——退回不是判这棵树坏，是判「这一次
+        // 没有证据」，而证据只可能来自同一棵树上的一对读数。
+        //
+        // 这一对读数的后半是上面那一次跑：它与基线跑用的是同一条命令、同一个范围
+        // （见本函数开头对 `scopes.suite` 的处理），所以绿的那一次就是「红掉了」
+        // 的那一次，不需要再跑一遍去确认。前半在这里补：把改动摘掉，同一条命令
+        // 再跑一次。
+        //
+        // 顺序上放在套件判定之后、门禁之前：套件红了这条变更已经退回，不必再花
+        // 一次全量；门禁可能会把 `test_passed` 改成 false，而那之后同样没有「绿」
+        // 这一半可证。
+        if reproduce == RedReproduction::Required && test_passed {
+            // 改动之前就绿着的那些失败不是这条变更要修的红：它们是这棵树自己的
+            // 病，改完仍然红，于是「红→绿」这一对里绿的一半根本没发生。
+            if pre_existing_failures > 0 {
+                warn!(
+                    change_id = %change.artifact_id,
+                    count = pre_existing_failures,
+                    "The change leaves the red it claims to fix still red; rolling back"
+                );
+                let _ = self.git_reset_hard(workdir, &change.content).await;
+                return Ok(ApplyResult {
+                    change_id: change.artifact_id.clone(),
+                    files_changed,
+                    reformatted,
+                    pre_existing_failures,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::NotReproduced),
+                    test_output: format!(
+                        "这条变更声称修的是红的检查，可它跑完之后这些测试仍然红——红没有变成绿：\n  {test_output}"
+                    ),
+                    new_status: EvolutionStatus::ValidationFailed,
+                    tiering: Some(tiering.clone()),
+                });
+            }
+            match self
+                .baseline_failing_tests(workdir, &change.content, scopes.suite.as_deref())
+                .await
+            {
+                Ok(red) if red.is_empty() => {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        command = %self.test_command_line(),
+                        "The red this change claims to fix is green on this tree without it"
+                    );
+                    let _ = self.git_reset_hard(workdir, &change.content).await;
+                    return Ok(ApplyResult {
+                        change_id: change.artifact_id.clone(),
+                        files_changed,
+                        reformatted,
+                        pre_existing_failures: 0,
+                        verdict: ChangeVerdict::Refused(cog_core::RejectionCause::NotReproduced),
+                        test_output: format!(
+                            "这条变更没有一个可以在本地复现成红的检查：去掉改动，`{}` 在这棵树上是绿的。\
+                             上游那条红出在这台机器读不到的地方，改它就是猜——先在本机把它跑出来，再改。",
+                            self.test_command_line()
+                        ),
+                        new_status: EvolutionStatus::ValidationFailed,
+                        tiering: Some(tiering.clone()),
+                    });
+                }
+                Ok(red) => {
+                    info!(
+                        change_id = %change.artifact_id,
+                        count = red.len(),
+                        command = %self.test_command_line(),
+                        "The change turns a red this tree showed without it green"
+                    );
+                    // 接在前面而不是替掉：这一段是这条变更清掉的那条红，后面那一
+                    // 段是判它的各道判据自己说的话——换成一条，另一条就没处读了。
+                    test_output = format!(
+                        "去掉这条变更，`{}` 在这棵树上是红的：{}。加上它，同一条命令是绿的。\n\n{test_output}",
+                        self.test_command_line(),
+                        red.into_iter().collect::<Vec<_>>().join("、")
+                    );
+                }
+                // 读不出基线就说不出这一对读数，于是这条变更没有被判定过。留着重试，
+                // 不退回：退回要一条判据说它不行，而这里是一条判据没跑起来。
+                Err(e) => {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        error = %e,
+                        "Could not read the red this tree shows without the change; reaching no verdict"
                     );
                     let _ = self.git_reset_hard(workdir, &change.content).await;
                     return Err(e);
@@ -6064,6 +6216,168 @@ index 1111111..2222222 100644
             "the lint criterion did not run at all: {}",
             result.test_output
         );
+    }
+
+    /// A tree whose suite is red, judged by a script that prints the harness's
+    /// own failure line, so the failure can be named rather than inferred.
+    ///
+    /// `seed` is what `verdict.txt` says before any change. The script is the
+    /// deployment's configured test command, so the gate is exercised through
+    /// the same path a real project's suite takes.
+    async fn reproducing_tree(seed: &str) -> (tempfile::TempDir, ChangePipeline) {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(root.path().join("verdict.txt"), seed)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("judge.sh"),
+            "if grep -q BROKEN verdict.txt 2>/dev/null; then\n\
+             \x20 echo 'test suite::the_red_check ... FAILED'\n\
+             \x20 exit 1\n\
+             fi\n\
+             echo 'test suite::the_red_check ... ok'\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false)
+            // No formatter and no linter: this probe is about the reproduction
+            // gate, and a stage that asked cargo about a tree with no manifest
+            // would refuse before the gate was ever reached.
+            .with_fmt_check_command(Some(vec!["true".into()]))
+            .with_lint_command(Some(Vec::new()))
+            .with_test_command(vec!["sh".into(), "judge.sh".into()]);
+        (root, pipeline)
+    }
+
+    fn rewrite_verdict(from: &str, to: &str) -> String {
+        format!(
+            "diff --git a/verdict.txt b/verdict.txt\n\
+             --- a/verdict.txt\n\
+             +++ b/verdict.txt\n\
+             @@ -1,1 +1,1 @@\n\
+             -{from}\n\
+             +{to}\n"
+        )
+    }
+
+    /// The gate's whole point: a change that turns the tree green *by fixing
+    /// the named test* passes, and its evidence names the red it cleared.
+    ///
+    /// Without the reproduction half this assertion would hold for any change
+    /// that leaves the suite green — including one that never touched the
+    /// failing test — which is exactly the reading that let the same upstream
+    /// red be reworked through six revisions.
+    #[tokio::test]
+    async fn a_change_that_shows_the_red_before_it_shows_the_green_passes() {
+        let (root, pipeline) = reproducing_tree("BROKEN\n").await;
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "reproduced-1".into(),
+            description: "让判据看到修好后的取值".into(),
+            content: rewrite_verdict("BROKEN", "FIXED"),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_requiring(&change, root.path(), RedReproduction::Required)
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(result.verdict, ChangeVerdict::Passed);
+        assert!(
+            result.test_output.contains("the_red_check"),
+            "the evidence has to name the red this change cleared: {}",
+            result.test_output
+        );
+    }
+
+    /// A tree that is already green is not evidence that this change fixed
+    /// anything, and a change that claims to fix a red check is refused rather
+    /// than pushed on the strength of a green nobody had to earn.
+    #[tokio::test]
+    async fn a_change_whose_red_is_green_without_it_is_refused_as_unreproduced() {
+        let (root, pipeline) = reproducing_tree("FIXED\n").await;
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "unreproduced-1".into(),
+            description: "调整判据读到的取值".into(),
+            content: rewrite_verdict("FIXED", "FIXED2"),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_requiring(&change, root.path(), RedReproduction::Required)
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::NotReproduced),
+            "a green that was already green is not a reproduction: {}",
+            result.test_output
+        );
+        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+    }
+
+    /// Control: the same change and the same tree, with nothing claimed about
+    /// a red. It passes — the gate is about the obligation this change carries,
+    /// not about a tree that happens to be green.
+    #[tokio::test]
+    async fn the_same_change_is_judged_on_green_alone_when_it_owes_no_reproduction() {
+        let (root, pipeline) = reproducing_tree("FIXED\n").await;
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "plain-1".into(),
+            description: "调整判据读到的取值".into(),
+            content: rewrite_verdict("FIXED", "FIXED2"),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_requiring(&change, root.path(), RedReproduction::NotRequired)
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(result.verdict, ChangeVerdict::Passed);
+    }
+
+    /// The obligation is keyed on the entry point, and a CI fix is the only
+    /// one that carries it. Reading it off the change itself would hand the
+    /// judgement to the party being judged.
+    #[test]
+    fn only_a_change_that_fixes_a_named_red_owes_a_reproduction() {
+        assert_eq!(
+            RedReproduction::for_intent(Some(cog_core::EvolutionIntent::CiFix)),
+            RedReproduction::Required
+        );
+        for other in [
+            None,
+            Some(cog_core::EvolutionIntent::SelfAudit),
+            Some(cog_core::EvolutionIntent::SelfSignal),
+            Some(cog_core::EvolutionIntent::IssueFix),
+            Some(cog_core::EvolutionIntent::Unattributed),
+        ] {
+            assert_eq!(
+                RedReproduction::for_intent(other),
+                RedReproduction::NotRequired,
+                "{other:?} does not claim a specific red"
+            );
+        }
     }
 
     /// A baseline the formatter would rewrite is not one this criterion can

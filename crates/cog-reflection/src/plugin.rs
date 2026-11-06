@@ -3951,7 +3951,11 @@ impl<'a> ChangeExecutor<'a> {
         // every path -- a refusal, an error, a panic -- so the only way it can
         // read as still in flight is for the process to be inside it.
         let result = match flight
-            .cover(pipeline.apply_and_test_in(&change, self.workdir))
+            .cover(pipeline.apply_and_test_requiring(
+                &change,
+                self.workdir,
+                crate::change_pipeline::RedReproduction::for_intent(intent),
+            ))
             .await
         {
             Ok(r) => r,
