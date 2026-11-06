@@ -155,6 +155,72 @@ impl UnsettledReason {
             UnsettledReason::DeclarationUnparsable => "declaration_unparsable",
         }
     }
+
+    /// Whose it is to change this cause, as a total table.
+    ///
+    /// Total and not `Option`: a cause with no owner is exactly the lumped
+    /// 「could not read」 this split exists to undo, so the compiler is the first
+    /// reader of the partition -- a sixth reason cannot be added without saying
+    /// whose it is. The table is written here and nowhere else, so a caller asks
+    /// the reason rather than matching it a second time.
+    pub fn owner(self) -> UnsettledOwner {
+        match self {
+            UnsettledReason::RegistryUnreadable => UnsettledOwner::PlatformRegistry,
+            UnsettledReason::RevisionUnreadable => UnsettledOwner::Revision,
+            UnsettledReason::HostColumnAbsent => UnsettledOwner::HostGenerator,
+            UnsettledReason::CarrierNotInTree => UnsettledOwner::HostTree,
+            UnsettledReason::DeclarationUnparsable => UnsettledOwner::DeclarationAuthor,
+        }
+    }
+}
+
+/// Who can change an unsettled answer: the party each cause belongs to.
+///
+/// The reason says what could not be read; this says whose it is to fix, and the
+/// two are different questions. Three of the five causes are not the platform's
+/// to act on at all -- a column that never arrived, a carrier the host's tree no
+/// longer holds, a declaration its author gave a slug nothing can key on -- so one
+/// 「could not read」 bucket puts work on whoever reads the platform's side for
+/// answers that side cannot change.
+///
+/// Closed for the same reason [`UnsettledReason`] is: every one of them is counted
+/// on every pass, and a count keyed by free text makes each distinct wording its
+/// own series. The party is taken off a verdict as
+/// `verdict.reason().map(UnsettledReason::owner)` rather than by matching the
+/// reason here -- one table, so the split cannot be read two ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UnsettledOwner {
+    /// The platform's own registry, which is this tree.
+    PlatformRegistry,
+    /// Whoever resolves the revision the pass judges against.
+    Revision,
+    /// The host's generator, which writes the host column.
+    HostGenerator,
+    /// The host's own tree, which holds the carrier a row names.
+    HostTree,
+    /// Whoever wrote the declaration whose slug cannot be read.
+    DeclarationAuthor,
+}
+
+impl UnsettledOwner {
+    /// Every owner, for a reader that has to enumerate them.
+    pub const ALL: [UnsettledOwner; 5] = [
+        UnsettledOwner::PlatformRegistry,
+        UnsettledOwner::Revision,
+        UnsettledOwner::HostGenerator,
+        UnsettledOwner::HostTree,
+        UnsettledOwner::DeclarationAuthor,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnsettledOwner::PlatformRegistry => "platform_registry",
+            UnsettledOwner::Revision => "revision",
+            UnsettledOwner::HostGenerator => "host_generator",
+            UnsettledOwner::HostTree => "host_tree",
+            UnsettledOwner::DeclarationAuthor => "declaration_author",
+        }
+    }
 }
 
 /// Which registry a gate was found in.
@@ -999,6 +1065,102 @@ mod tests {
                 "carrier_not_in_tree",
                 "declaration_unparsable",
             ]
+        );
+    }
+
+    /// Every way a look can fail to settle a row names the party that can change
+    /// it, and no two of them name the same party. A count of the reasons that
+    /// merges two causes onto one owner is one number covering two different
+    /// fixes, which is the lumped 「could not read」 this split exists to undo --
+    /// and the causes the platform cannot act on are what it holds down hardest:
+    /// a column that never arrived, a carrier the host's tree lost and a
+    /// declaration whose author misspelt the slug are all reported to a reader of
+    /// the platform's side, and none of them is that reader's to fix.
+    ///
+    /// The parties are read off verdicts `judge` really returns, through the one
+    /// entry point the table is documented with, so this cannot stay green while
+    /// the judge produces an answer the table has never seen.
+    ///
+    /// principle: feedback_no_reading_split_by_who_can_change_it
+    #[test]
+    fn every_unsettled_cause_is_split_by_who_can_change_it() {
+        let owners: std::collections::BTreeSet<UnsettledOwner> = UnsettledReason::ALL
+            .map(UnsettledReason::owner)
+            .into_iter()
+            .collect();
+        let enumerated: std::collections::BTreeSet<UnsettledOwner> =
+            UnsettledOwner::ALL.into_iter().collect();
+        assert_eq!(
+            owners, enumerated,
+            "a cause with no party to change it, or a party no cause produces"
+        );
+        assert_eq!(
+            owners.len(),
+            UnsettledReason::ALL.len(),
+            "two causes share one owner: one count would cover two different fixes"
+        );
+        assert_eq!(
+            UnsettledOwner::ALL.map(UnsettledOwner::as_str),
+            [
+                "platform_registry",
+                "revision",
+                "host_generator",
+                "host_tree",
+                "declaration_author",
+            ],
+            "the party is the key a reader groups by, so a rename is a series that starts over"
+        );
+
+        // The one cause in the set that is the platform's own to fix, and the
+        // three it cannot act on at all.
+        assert_eq!(
+            UnsettledReason::RegistryUnreadable.owner(),
+            UnsettledOwner::PlatformRegistry
+        );
+        for reason in [
+            UnsettledReason::HostColumnAbsent,
+            UnsettledReason::CarrierNotInTree,
+            UnsettledReason::DeclarationUnparsable,
+        ] {
+            assert_ne!(
+                reason.owner(),
+                UnsettledOwner::PlatformRegistry,
+                "{reason:?} is not the platform's to change, so it must not be reported as its to fix"
+            );
+        }
+
+        // Read back off the verdicts `judge` returns, not off reasons built by
+        // hand: a column that never arrived belongs to the host's generator, a
+        // judgement whose memory left the tree to the host's own tree, and a
+        // declaration nothing can key on to whoever wrote it.
+        for host in [None, Some("")] {
+            let verdict = judge(&row("feedback_x", host), &Declarations::default());
+            assert_eq!(
+                verdict.reason().map(UnsettledReason::owner),
+                Some(UnsettledOwner::HostGenerator),
+                "{host:?}"
+            );
+        }
+        let stale = judge(
+            &row("feedback_x", Some("stale:gone")),
+            &Declarations::default(),
+        );
+        assert_eq!(
+            stale.reason().map(UnsettledReason::owner),
+            Some(UnsettledOwner::HostTree)
+        );
+        let misspelt = declarations(&[("crates/x/tests/a.rs", "//! principle: Feedback-X")]);
+        let unparsable = judge(&row("feedback_x", Some("-")), &misspelt);
+        assert_eq!(
+            unparsable.reason().map(UnsettledReason::owner),
+            Some(UnsettledOwner::DeclarationAuthor)
+        );
+        // A verdict that settles names nobody: there is nothing to change.
+        assert_eq!(
+            judge(&row("feedback_x", Some("-")), &Declarations::default())
+                .reason()
+                .map(UnsettledReason::owner),
+            None
         );
     }
 
