@@ -57,7 +57,14 @@ pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
 // cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活；不是量出来的，是「例外不该翻倍」定的
 pub const STOP_THE_LINE_CLAIM_CONCURRENCY: usize = 1;
 
-/// How many process-local tasks one process runs at once.
+/// 进程本地车道的在途执行上限，从环境读。
+///
+/// 它是这一条车道自己的预算，与 [`claim_concurrency()`] 分开：只有带 executor
+/// 角色的部署读这条队列（消息里的产物写进**本进程**的变更目录，别的部署读了
+/// 也交不出去），所以「几条一起跑」只能由这个值定，别的部署配多少与它无关。
+pub const LOCAL_CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_LOCAL_CLAIM_CONCURRENCY";
+
+/// How many process-local tasks one process runs at once when nothing is configured.
 ///
 /// Same argument as [`STOP_THE_LINE_CLAIM_CONCURRENCY`], for the other lane that
 /// only the executor deployment reads: its messages carry an artifact written
@@ -68,8 +75,30 @@ pub const STOP_THE_LINE_CLAIM_CONCURRENCY: usize = 1;
 /// 1,771 s of waiting against 2 permits, with `entries-read` frozen a day
 /// behind and 1,374 entries queued, while the publish side refused to add more
 /// to a queue nobody was reading.
+///
+/// The default stays at one, and it is a knob rather than a second measurement
+/// for a reason worth writing down before anyone turns it up. This lane is the
+/// one every change-generation task goes to, so the number here is how many
+/// changes can be worked on at once; measured on 2026-11-07 05:2x it was one,
+/// with 1,904 tasks queued behind `claim_in_flight = 1`, `claim_wait_seconds`
+/// pinned at 1,793 s, and 43 finished tasks a day -- 44 days to drain.
+///
+/// Turning it up does not raise the throughput that number is short of. The
+/// step after this lane is the build gate, whose bound in force on the same
+/// host at the same minute was 1 (`cogneva-build-gate.sh --who`), held by a
+/// `change verification` for 1,637 s; one verification per slot is therefore
+/// about 53 changes a day whatever this lane admits, and the extra permits
+/// would queue in front of the same single build. Two further costs sit on this
+/// number and neither is in this crate. Measured on the evolution pod on
+/// 2026-11-07: one change task held 10.8 GiB of the 16 GiB its container was
+/// given, the largest single consumers being one rustc and six linkers, so the
+/// pod's ceiling and the namespace `LimitRange` above it move in the same round
+/// and the extra permit arrives as an OOM kill if they do not. The knob exists
+/// so that a deployment which has widened the build bound can widen this one
+/// without a rebuild -- not so that raising it alone can be mistaken for
+/// raising output.
 // cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活
-pub const LOCAL_CLAIM_CONCURRENCY: usize = 1;
+pub const DEFAULT_LOCAL_CLAIM_CONCURRENCY: usize = 1;
 
 /// 读一条在途执行上限。
 ///
@@ -104,6 +133,28 @@ pub fn claim_concurrency() -> usize {
                     "task claim concurrency entry ignored"
                 );
                 DEFAULT_CLAIM_CONCURRENCY
+            }
+        },
+    }
+}
+
+/// 本进程本地车道的在途执行上限，从环境读。
+///
+/// 与 [`claim_concurrency()`] 同一套读法（不配取默认、`0` 被拒并报告一行），
+/// 只有变量和默认值不同：两条车道的许可各自独立，读法不该也长出两套。
+pub fn local_claim_concurrency() -> usize {
+    match std::env::var(LOCAL_CLAIM_CONCURRENCY_ENV) {
+        Err(_) => DEFAULT_LOCAL_CLAIM_CONCURRENCY,
+        Ok(raw) => match parse_claim_concurrency(&raw) {
+            Ok(n) => n,
+            Err(problem) => {
+                tracing::warn!(
+                    variable = LOCAL_CLAIM_CONCURRENCY_ENV,
+                    problem = %problem,
+                    using = DEFAULT_LOCAL_CLAIM_CONCURRENCY,
+                    "local task claim concurrency entry ignored"
+                );
+                DEFAULT_LOCAL_CLAIM_CONCURRENCY
             }
         },
     }
@@ -216,11 +267,14 @@ impl TaskExecutorRouter {
         // 等许可，写的一侧等读。代号里的优先级（停线 > 自演化 > 普通活）此前只写在
         // 发布序上，认领这一侧没有它，所以那条优先序在满负荷时是一句话。
         //
-        // 它自己的一份是这条例外的代价上界：同时最多一条自演化任务在跑。
+        // 它自己的一份是这条例外的代价上界。这个数是配置项而不是常量：它是整
+        // 个平台的变更吞吐（每一条变更生成任务都只走这条道），而抬它的另一半
+        // 代价在 pod 的内存上限上，那一半只能由部署来配。
+        let local_claim_concurrency = local_claim_concurrency();
         let local = crate::ready_queue::process_local_ready_stream(workspace_id);
         let own = ClaimBudget {
-            slots: Arc::new(tokio::sync::Semaphore::new(LOCAL_CLAIM_CONCURRENCY)),
-            limit: LOCAL_CLAIM_CONCURRENCY,
+            slots: Arc::new(tokio::sync::Semaphore::new(local_claim_concurrency)),
+            limit: local_claim_concurrency,
         };
 
         let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
@@ -2320,6 +2374,56 @@ mod claim_concurrency_tests {
         const {
             assert!(DEFAULT_CLAIM_CONCURRENCY > 0);
             assert!(DEFAULT_CLAIM_CONCURRENCY < CLAIM_BATCH);
+            assert!(DEFAULT_LOCAL_CLAIM_CONCURRENCY > 0);
+            assert!(DEFAULT_LOCAL_CLAIM_CONCURRENCY < CLAIM_BATCH);
         }
+    }
+
+    /// 本地车道的预算来自它自己的变量，不是普通活那一格。
+    ///
+    /// 两条车道必须是两个数：本地车道是每一条变更生成任务的必经之路，它的许可数
+    /// 就是整个平台的变更吞吐；普通活那一格调大时如果连带把本地车道也调大，运维
+    /// 以为自己在调「同时跑几件普通活」，实际动了吞吐与 pod 内存两件事。2026-11-07
+    /// 05:2x 实测本地车道 1 个许可后面压着 1,904 条任务、`claim_wait_seconds` 卡在
+    /// 1,793 秒，就是这个数在起作用。
+    #[test]
+    fn the_local_lane_budget_is_its_own_number() {
+        // This variable is read by `local_claim_concurrency()` alone and no other
+        // test in this binary touches either variable, so the process-wide
+        // environment is not shared state here.
+        std::env::set_var(LOCAL_CLAIM_CONCURRENCY_ENV, "3");
+        std::env::set_var(CLAIM_CONCURRENCY_ENV, "7");
+        assert_eq!(
+            local_claim_concurrency(),
+            3,
+            "the local lane reads its own variable, not the ordinary one"
+        );
+        assert_eq!(
+            claim_concurrency(),
+            7,
+            "and the ordinary lane is not moved by the local one"
+        );
+
+        std::env::remove_var(LOCAL_CLAIM_CONCURRENCY_ENV);
+        assert_eq!(
+            local_claim_concurrency(),
+            DEFAULT_LOCAL_CLAIM_CONCURRENCY,
+            "unset is the default, so a deployment that never heard of this knob keeps today's change throughput"
+        );
+
+        std::env::remove_var(CLAIM_CONCURRENCY_ENV);
+    }
+
+    /// `0` 在本地车道上也被拒：它把「同时跑几条变更」写成「一条也不跑」，而那
+    /// 正是这条车道上 1,904 条欠账最不该遇到的一种「配置生效了」。
+    #[test]
+    fn a_zero_local_budget_falls_back_to_the_default_rather_than_stopping() {
+        std::env::set_var(LOCAL_CLAIM_CONCURRENCY_ENV, "0");
+        assert_eq!(
+            local_claim_concurrency(),
+            DEFAULT_LOCAL_CLAIM_CONCURRENCY,
+            "a refused entry must not become a stop"
+        );
+        std::env::remove_var(LOCAL_CLAIM_CONCURRENCY_ENV);
     }
 }
