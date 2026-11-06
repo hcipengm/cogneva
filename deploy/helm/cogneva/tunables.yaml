@@ -1435,7 +1435,14 @@ rows:
       a 3.4 s refill -- and the pool is bounded twice more without this number:
       it never exceeds half the task ceiling, and it only refills while the
       ceiling still has room, so a tree for a task that has not arrived can
-      never displace one for a task that has.
+      never displace one for a task that has. Measured after it shipped (30
+      minutes on 2026-11-07): 11 hand-outs against 3 fresh cuts and 2 LRU
+      reclaims, where the same lane had been 17 cuts and 17 reclaims in 40
+      minutes -- so two is enough for the arrival rate, and what a third
+      simultaneous arrival costs is one cut. That fallback got cheap on the same
+      day: with the pod at 4 cores a cut measures 0.6-0.8 s, so a burst of three
+      new conversations measured 1.1-4.1 s per first tool call rather than 6.5 s
+      each. Raising this number buys that burst case and nothing else.
 
   - key: sandboxExecutor.repoFetchIntervalSecs
     source: derived
