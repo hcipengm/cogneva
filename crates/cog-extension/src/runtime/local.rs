@@ -78,6 +78,15 @@ fn signal_death_note(sig: i32, facts: &super::cgroup::CgroupFacts, oom: bool) ->
     }
 }
 
+/// How long the wall's kill waits for its shell to be reaped.
+///
+/// The signal is not negotiable and the shell was already the one process this
+/// side started, so what is left here is collecting it (a zombie for the life of
+/// the executor otherwise). A wait longer than this buys nothing: a leader that
+/// has not died to SIGKILL after it is not going to.
+// cap: bound — SIGKILL 之后只剩回收：等更久换不到更早的回，只会吊住执行器
+const REAP_AFTER_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Programs whose invocation compiles the tree they run in.
 const BUILD_PROGRAMS: &[&str] = &[
     "cargo",
@@ -177,6 +186,14 @@ pub(crate) fn spawn_command(
         .arg(command)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Own process group, so the timeout below can reach what the command
+    // actually started. `sh -c "cargo build"` is two processes deep: killing
+    // the shell leaves cargo running, and a cargo that outlives its caller
+    // keeps the shared build directory locked -- measured on the cluster, a
+    // clippy whose `sh` had been killed at its wall went on holding the lock
+    // for the next rounds, each of which then died at its own wall having
+    // compiled nothing.
+    cmd.process_group(0);
     if let Some(dir) = workdir {
         cmd.current_dir(dir);
     }
@@ -189,6 +206,8 @@ pub(crate) fn spawn_command(
     let mut child = cmd
         .spawn()
         .map_err(|e| cog_core::SFError::IO(format!("spawn sh: {}", e)))?;
+    // The group id is the leader's pid once the child has run `process_group(0)`.
+    let group = child.id();
 
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
@@ -264,7 +283,17 @@ pub(crate) fn spawn_command(
             },
             Ok(Err(_)) => -1,
             Err(_) => {
-                let _ = child.kill().await;
+                // Not `child.kill()`: that reaches the shell and leaves every
+                // process the command started -- cargo, rustc, the grandchild
+                // that holds the shared target directory -- alive and holding
+                // it. The whole group goes, leader included.
+                if let Some(pid) = group {
+                    kill_group(pid);
+                }
+                // Reap the leader so the pid is not left as a zombie for the
+                // life of the executor. Bounded: a group that ignores SIGKILL
+                // is not something this path should wait on.
+                let _ = tokio::time::timeout(REAP_AFTER_KILL_WAIT, child.wait()).await;
                 let _ = tx
                     .send(CommandEvent::Stderr {
                         data: format!("command timed out after {}s", timeout.as_secs()),
@@ -277,6 +306,18 @@ pub(crate) fn spawn_command(
     });
 
     Ok(rx)
+}
+
+/// SIGKILL a whole process group. `pid` is the leader, which is the group id
+/// because the command was started with `process_group(0)`.
+///
+/// A missing group is the normal race between "the wall came up" and "the
+/// command had already exited", and is not an error worth reporting.
+fn kill_group(pid: u32) {
+    // SAFETY: one pid and one signal constant; no pointers, no ownership.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
 }
 
 /// A file operation as a two-event stream: content (or error) then exit.
@@ -444,6 +485,52 @@ mod tests {
         let result = backend.execute(&req).await.unwrap();
         assert_eq!(result.exit_code, -1);
         assert!(result.stderr.contains("timed out"));
+    }
+
+    /// Whether the pid is still doing work: present in `/proc` and not already
+    /// a zombie. A killed process that its own parent has not reaped yet is
+    /// dead, and counting it as alive would make this reading depend on the
+    /// reaping habits of whatever pid 1 is.
+    fn still_running(pid: u32) -> bool {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        // The state field follows the parenthesised command name, which may
+        // itself contain spaces and parentheses.
+        let after_name = match stat.rfind(')') {
+            Some(i) => &stat[i + 1..],
+            None => return true,
+        };
+        after_name.split_whitespace().next() != Some("Z")
+    }
+
+    /// The wall has to end what the command started, not only the shell this
+    /// executor spawns. `sh -c "cargo build"` is two processes deep, and a
+    /// cargo left behind by a timed-out command keeps the shared build
+    /// directory locked: measured on the cluster, a build whose `sh` had been
+    /// killed at its wall went on holding the lock, and every round queued
+    /// behind it died at its own wall having compiled nothing.
+    #[tokio::test]
+    async fn a_timeout_kills_what_the_command_started_not_only_the_shell() {
+        let backend = LocalExecutor::new();
+        let mut req = cmd("sleep 300 & echo $!; wait");
+        req.timeout = std::time::Duration::from_secs(1);
+        let result = backend.execute(&req).await.unwrap();
+        assert_eq!(result.exit_code, -1);
+        let pid: u32 = result
+            .stdout
+            .trim()
+            .parse()
+            .expect("the command echoes the pid it started");
+
+        for _ in 0..40 {
+            if !still_running(pid) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("pid {pid} outlived the timeout: the wall reached the shell only");
     }
 
     /// A signal death must not look like a timeout or like any other failure:

@@ -37,6 +37,10 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 # File walking for local discovery
 walkdir = "2"
 
+# Signalling a command's whole process group on timeout: `Child::kill()` only
+# reaches the `sh` wrapper, and cargo keeps the build directory locked.
+libc = "0.2"
+
 # YAML parsing for manifests
 serde_yaml = "0.9"
 

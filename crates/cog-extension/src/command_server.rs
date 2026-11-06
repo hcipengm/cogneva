@@ -42,15 +42,23 @@ struct AppState {
 
 /// How many commands may compile at once when the deployment names none.
 ///
-/// Two rather than one: the agents that ask for these commands each have their
-/// own wall clock, and a queue of one makes every build wait for the slowest
-/// one in front of it -- measured on this host, twelve commands were started
-/// together and each timed out after 560 s without compiling anything, because
-/// cargo serialises writers to one target directory and none of them was the
-/// writer. Two lets one build proceed while another waits without doubling the
-/// pressure on the device every one of them reads.
+/// One, because there is one target directory. Cargo takes an exclusive lock on
+/// it, so a second slot does not buy a second compiler: it buys a command that
+/// is started, is given its wall clock, and then blocks inside cargo's own
+/// lockfile wait -- `locks_lock_inode_wait`, no CPU, wall running down --
+/// until it is killed having compiled nothing. Measured on the cluster: a
+/// clippy parked this way reached its entire 600 s wall while the build in
+/// front of it did all the work, and every round queued behind it repeated the
+/// same death.
+///
+/// One slot moves that wait to this semaphore, which is the one place it is
+/// free: the wall handed to a command starts when its child starts, and a
+/// command waiting for a slot has no child. The commands this bounds all take
+/// the same lock, so a single slot costs nothing in throughput -- the twelve
+/// commands that once timed out together did so because none of them held a
+/// slot at all, not because there was only one slot to hold.
 // cap: bound — 排队策略不是容量读数：容量由宿主的装载决定，这个数只决定几条一起等
-const DEFAULT_BUILD_CONCURRENCY: usize = 2;
+const DEFAULT_BUILD_CONCURRENCY: usize = 1;
 
 /// The concurrency in force, from `COGNEVA_SANDBOX_BUILD_CONCURRENCY`.
 fn build_concurrency() -> usize {
@@ -60,6 +68,13 @@ fn build_concurrency() -> usize {
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_BUILD_CONCURRENCY)
 }
+
+/// A build that waited at least this long for its turn is worth a line.
+///
+/// Below it are hand-offs between builds that were going to compile anyway;
+/// above it is a round that may well have spent its wall waiting.
+// cap: bound — 记一笔的阈值，不是容量：它只决定哪些等待值得读，不决定谁等多久
+const BUILD_QUEUE_NOTEWORTHY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Wall for a command whose caller named none. Long enough for an interactive
 /// command to finish, short enough that a caller which stopped listening does not
@@ -349,10 +364,22 @@ async fn build_slot_for(
     if !crate::runtime::local::builds_the_tree(command) {
         return Ok(None);
     }
-    Arc::clone(&state.build_slots)
-        .acquire_owned()
-        .await
-        .map(Some)
+    let queued_at = std::time::Instant::now();
+    let slot = Arc::clone(&state.build_slots).acquire_owned().await?;
+    // The wait is free here and was not free where it used to happen -- inside
+    // cargo's own lockfile wait, with the command's wall already running. It is
+    // still a wait somebody pays for, so it is said out loud: without this line
+    // a round that spent its whole wall queued looks exactly like a round that
+    // compiled slowly, and the two want different fixes.
+    let waited = queued_at.elapsed();
+    if waited >= BUILD_QUEUE_NOTEWORTHY {
+        tracing::info!(
+            command = %command,
+            waited_secs = waited.as_secs(),
+            "a build waited its turn for the shared target directory"
+        );
+    }
+    Ok(Some(slot))
 }
 
 pub fn router() -> Router {
@@ -736,6 +763,10 @@ mod tests {
     /// Serializes the tests that mutate `SANDBOX_EXECUTOR_PORT`: the variable
     /// is process-global while the harness runs tests on parallel threads.
     static PORT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The build-concurrency variable is process-wide state and tests run in
+    /// threads of one process; a test that reads the default has to be the only
+    /// one touching it while it does.
+    static BUILD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// 调用方要多久就是多久：这一层不再有自己的硬顶。
     ///
@@ -761,6 +792,22 @@ mod tests {
     fn a_caller_that_names_no_wall_gets_the_short_one() {
         assert_eq!(effective_timeout(None), DEFAULT_TIMEOUT);
         assert_eq!(DEFAULT_TIMEOUT, std::time::Duration::from_secs(30));
+    }
+
+    /// The default has to be the number of writers the target directory admits,
+    /// and that number is one: cargo takes an exclusive lock on it. A second
+    /// slot does not start a second compiler -- it starts a command whose wall
+    /// clock runs while it waits inside cargo for a lock it cannot get, and
+    /// that command is killed at its wall having compiled nothing.
+    #[test]
+    fn the_default_leaves_one_writer_for_the_one_target_directory() {
+        let _guard = BUILD_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COGNEVA_SANDBOX_BUILD_CONCURRENCY");
+        assert_eq!(
+            build_concurrency(),
+            1,
+            "a second slot is a command started only to be killed"
+        );
     }
 
     fn state_with_build_slots(n: usize) -> AppState {
