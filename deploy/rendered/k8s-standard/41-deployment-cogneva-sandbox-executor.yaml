@@ -174,7 +174,7 @@ spec:
             - name: SANDBOX_REPO_FETCH_INTERVAL_SECS
               value: "300"
             - name: SANDBOX_MAX_TASK_WORKSPACES
-              value: "8"
+              value: "32"
             # 上面那条 `CARGO_TARGET_DIR` 的上限由进程自己算，这里不给数：这块卷
             # 的声明量减去同住者实测占用，就是缓存能拿的那份，每轮复测一次。**必须
             # 与进化侧那份分开声明**——同一串路径在两个 Pod 里落在两块不同的卷上，

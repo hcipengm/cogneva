@@ -1410,6 +1410,18 @@ rows:
       `the_worktree_cap_follows_the_volume_and_the_measured_tree_size` shows
       the reading following both inputs; the executor logs `declared` beside
       `measured` whenever the volume is the tighter of the two.
+      2026-11-07: the ceiling was 8 while 14 distinct tasks were active inside
+      half an hour, so the executor built 17 trees and reclaimed 18 in that
+      window -- one task's tree was reclaimed and rebuilt four times in five
+      minutes, and each rebuild costs 9 seconds here (measured) and restores
+      only committed content, so an agent's uncommitted files go with the tree.
+      Raised to 32: about one hour of arrivals at the measured rate, and about
+      1.6 GiB of trees.
+      On a directory-backed volume (local-path) the `df` reading on the
+      workspaces root describes the node's filesystem, not the claim, so the
+      measured side cannot bind here and this ceiling is the only cap in
+      force -- the tightness the paragraph above describes is a claim on which
+      this deployment cannot currently collect.
 
   - key: sandboxExecutor.repoFetchIntervalSecs
     source: derived

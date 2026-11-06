@@ -687,7 +687,19 @@ sandboxExecutor:
   # 余量给写入中的 git 命令）。树随仓库变大、卷被同住者占满时，实测那头会自己降下来
   # ——写成固定值就等于把某一天的树大小封进配置，之后它不再跟着变。还没有任何树时
   # 测不出单树大小，只剩这个策略值。
-  maxTaskWorkspaces: 8
+  #
+  # **2026-11-07：8 低于同时在干活的任务数，于是这条上限自己在制造它要避免的代价。**
+  # 实测 30 分钟内执行器见到 14 个不同的任务 id、建了 17 棵、回收了 18 棵——同一个任务
+  # 的工作树在 5 分钟里被回收再建 4 次（`reclaiming task worktree (LRU cap)` 与紧跟的
+  # `created per-task worktree` 同 id 成对出现）。每次重建在本机实测要 9 秒
+  # （`git worktree add --detach main`，本机实测 49 MB/棵），且重建出来的是**已提交的内容**：
+  # 任务写在树里还没提交的文件随回收一起没了——智能体下一步拿到的是一棵空树，
+  # 它于是重做一遍刚才的工作，「慢」有一半是这么来的。判据是同一任务两次
+  # `created per-task worktree` 的间隔：短于 TTL（`workspaceTtlSecs`）就说明
+  # 它是被上限挤掉的，不是空闲到期。
+  # 取值 32：实测到达率约 28 棵/小时，32 覆盖一整小时的活跃任务；32 棵 ≈ 1.6 GiB，
+  # 而这条卷所在的文件系统实测还有 329 GiB 可用。
+  maxTaskWorkspaces: 32
   # 本 Pod 自己那块构建缓存（`CARGO_TARGET_DIR`）的上限与复测周期。**它与进化侧
   # 的 `evolution.workspaces.targetMaxBytes` 是两个对象，不是同一个旋钮的两种写法**：
   # 那份认的是路径，而同一串路径在进化 Pod 里落在 `evolution-source-pvc` 上、在这里

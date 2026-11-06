@@ -173,8 +173,10 @@ spec:
               value: "600"
             - name: SANDBOX_REPO_FETCH_INTERVAL_SECS
               value: "300"
+            # 取值理由在 chart values 的 `sandboxExecutor.maxTaskWorkspaces`（单一源在那里）：
+            # 实测 30 分钟内 14 个任务、17 建 18 收，重建一棵本机实测 9 秒且丢未提交文件。
             - name: SANDBOX_MAX_TASK_WORKSPACES
-              value: "8"
+              value: "32"
             # 上面那条 `CARGO_TARGET_DIR` 的上限由进程自己算，这里不给数：这块卷
             # 的声明量减去同住者实测占用，就是缓存能拿的那份，每轮复测一次。**必须
             # 与进化侧那份分开声明**——同一串路径在两个 Pod 里落在两块不同的卷上，
