@@ -70,7 +70,7 @@ data:
   # 2026-11-06 抬到 6：3 生效后一小时里变更任务才第一次并行开工，而一道变更仍要
   # 33~50 分钟，3 槽折合约 86 笔/天，低于 120 的目标；队列不是瓶颈（885 条 scheduled
   # 分属 885 个 goal）。拿不到构建槽的变更不判负、只重试，所以多出来的槽位在等构建。
-  COGNEVA_TASK_CLAIM_CONCURRENCY: "6"
+  COGNEVA_TASK_CLAIM_CONCURRENCY: "2"
 
   # Gateway
   COGNEVA_HTTP_PORT: "8080"

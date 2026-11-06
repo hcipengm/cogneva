@@ -58,7 +58,7 @@ data:
   # 读的每条就绪队列共用这一份许可。它是「全局一次跑几道」的那个数——看板的列
   # 上限按 goal 分区，管不到跨 goal 的并行。进程读它一次，并把它作为
   # `cogneva_task_router_claim_slots` 报出去，所以配置与生效在读数面是同一个值。
-  COGNEVA_TASK_CLAIM_CONCURRENCY: "6"
+  COGNEVA_TASK_CLAIM_CONCURRENCY: "2"
 
   # 进程被告知的三个端口，与容器实际监听的那三个同源（values 的 gateway.*Port，
   # 也与 files/cogneva.json 里的 gateway.*_port 同源）：env 层覆盖 JSON，两处

@@ -1567,11 +1567,19 @@ taskRouter:
   # 所以多出来的槽位是在等构建，不是在丢变更。留出的一格给非变更任务：generator、
   # intent-assess 也吃这同一份许可，否则它们照样能把变更挤出去。
   #
+  # **2026-11-06 13:40 落回 2：上面那段只算了「会不会丢变更」，没算「每条在飞的要付多少钱」。**
+  # 一笔变更尝试是 102 次 LLM 调用、约 ¥1，付钱与它落不落地无关；槽位越多，单位时间付出的
+  # 尝试越多，而落地不由槽位决定。当天读数对照：11-05 全天 13 次 change-ledger 尝试、¥12.30、
+  # Luna 落地 30 笔；11-06 到 13:40 已是 72 次尝试、¥71.76，落地只有 9 笔，平台全天花费
+  # ¥48 → ¥123。多出来的 59 次尝试买到的是零笔落地。2 是把这条线压回 11-05 的量级（约
+  # ¥24/天），代价是排队更长——账上 1,600 余条待办本来也不是这几天能过完的，排队等
+  # 比排队烧钱好。要抬之前先看「每笔落地花了多少钱」，不要只看在飞条数。
+  #
   # 不同步抬 `agent_pool.worker_count`：上面那段说的「池子按内存自算」只对投递到
   # agent inbox 的活成立。squad 的 planner／generator／evaluator／moderator 是
   # `AgentManager::create_agent` 直接建的，不经过 `pool_worker_handler` 里那道
   # `gate.acquire()`，所以池子不是变更产能的上限，这一笔只动这一格。
-  claimConcurrency: 6
+  claimConcurrency: 2
 
 webSearch:
   enabled: true
