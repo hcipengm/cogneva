@@ -400,22 +400,17 @@ if [ -n "${cargo_bin}" ]; then
             fi
         done
         if [ "${test_count}" -gt 0 ]; then
-            repo_toplevel="$(git rev-parse --show-toplevel)"
-            test_tree="$(mktemp -d "${TMPDIR:-/tmp}/cogneva-push-test.XXXXXX")"
-            git worktree prune 2>/dev/null
-            if git worktree add --detach --quiet "${test_tree}" HEAD 2>/dev/null; then
-                echo "== Test：这次要推的提交动过 ${test_count} 个 crate 的源码，判的是 HEAD 展开出来的那棵树，外加装配件 cogneva"
-                judge_head_tests() {
-                    ( cd "${test_tree}" &&
-                        CARGO_TARGET_DIR="${repo_toplevel}/target" \
-                            "${cargo_bin}" test "${test_args[@]}" --no-fail-fast )
-                }
-                run_step "cargo test ${test_args[*]} --no-fail-fast" judge_head_tests
-                git worktree remove --force "${test_tree}" >/dev/null 2>&1 || rm -rf "${test_tree}"
-            else
-                rm -rf "${test_tree}"
-                echo "SKIP  Test：展开不出 HEAD 的临时工作树（${test_tree}），这一份没判（CI 的 Test 会整棵跑）"
-            fi
+            # 就地判，不展开 HEAD 的临时工作树：临时树里每个包根都是新路径，而 cargo
+            # 的指纹按包根算，于是整棵工作区要重编一遍——实测在一个临时树里
+            # `cargo build -p cog-core` 用了 55 秒，同一个包在本树里是命中缓存。
+            # 这条腿要站在每一次推送前面，代价必须留在分钟级（本机实测整条 Test 腿
+            # 4m41s，其中测试本身 133s）。判的因而是**工作树**：树上有未提交改动时，
+            # 它测的比这一推多。多测不会假绿，只是可能替别人的改动红一次。
+            echo "== Test：这次要推的提交动过 ${test_count} 个 crate 的源码，判的是工作树，外加装配件 cogneva"
+            judge_head_tests() {
+                "${cargo_bin}" test "${test_args[@]}" --no-fail-fast
+            }
+            run_step "cargo test ${test_args[*]} --no-fail-fast" judge_head_tests
         else
             echo "== Test：这次要推的提交没动 crates/ 下的 .rs，跳过（CI 的 Test 会整棵跑）"
         fi
