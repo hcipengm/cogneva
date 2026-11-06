@@ -2716,11 +2716,22 @@ struct CiPick {
     /// 一版红的继续往前，但那一版留在历史里，它后面每一版都继承同一个红的检查，
     /// 绕路会变成一直往回走。修它的那一行必须有人挂出来。
     newest_red: Option<String>,
-    /// 头上那一版的判词（`None` = 没有判词）。
+    /// 往回这一路上**最新**的一版，红的**全是「取消」**且这次扣住已经等满了窗口。
+    ///
+    /// 单独一格而不是塞进 `target`：它比 `target` 弱（上游没验过它），比 `fallback`
+    /// 强（除了那几条取消，别的检查都答了通过）。放进 `newest_red` 更不行——「取消」
+    /// 不是对这棵树的判决（见 [`MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up`]），
+    /// 把它记成红就等于让一次没人跑完的检查永远占着这条线。
+    waived: Option<String>,
+    /// 头上那一版的判词（`None` = 没有判词）。**放行之后**的那一个：红的全是取消
+    /// 且等满窗口时这里是 `None`，与 [`Self::head_waived_reasons`] 一起交给状态文件，
+    /// 否则一次按「没有证据」放行的滚动会在 `ci_hold_end` 里读成「还红着」。
     ///
     /// 挑版本时已经把这一问问过了，带出来给状态文件那一格用：`ci_hold_end` 判
     /// 「这次扣住是按哪种结局结束的」要读它，没有这一问它就永远是空的。
     head_verdict: Option<bool>,
+    /// 头上那一版被放行的那几条取消，原因格（`platform:cancelled_waived`）原样带出。
+    head_waived_reasons: Vec<String>,
 }
 
 /// 出现在这个仓库的检查里、却**不判这棵树**的那些工作流。
@@ -3449,11 +3460,22 @@ impl MainlineDeployer {
     /// 回**这一路上遇见的最新一版红**也要带出去（[`CiPick::newest_red`]）：绕开
     /// 它去滚更旧的一版不等于它不存在，不修它，它后面每一版都过不了，部署器就只能
     /// 一版比一版旧地往后退。
+    /// `hold_since_unix` 是**这一段扣住从哪一刻开始**（跨版本连续，见
+    /// [`MainlineState::ci_hold_run_since_unix`]），交给取消的豁免按它计时。
+    ///
+    /// 为什么是这一格而不是被问那一版自己的 `decided_unix`：树一直往前动，红着的
+    /// 那一版就跟着换，而换版会把按版计时的窗口重新拨回零——只要落版比窗口快，
+    /// 「等满一个窗口」就永远等不到。2026-11-06 实测：macOS 的
+    /// `Bootstrap Cross-Platform Check` 要在队列里排十几分钟，而主线每十分钟左右
+    /// 一版，于是它每一版都被下一次推送取消；每一版都「刚被取消」，这条线从 22:59
+    /// 一直停到 00:40 没有滚过任何一版。窗口买的是「给一次重跑留出时间」，而重跑
+    /// 的机会属于**这段扣住**，不属于被指着的那一版。
     async fn newest_ci_green_revision(
         &self,
         tip: &str,
         floor: Option<&str>,
         limit: usize,
+        hold_since_unix: Option<i64>,
     ) -> Option<CiPick> {
         if limit == 0 || tip.len() < 7 || !tip.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
@@ -3476,9 +3498,12 @@ impl MainlineDeployer {
             .await
             .ok()?;
         let mut fallback: Option<String> = None;
+        let mut waived: Option<String> = None;
         let mut newest_red: Option<String> = None;
         let mut head_verdict: Option<bool> = None;
+        let mut head_waived_reasons: Vec<String> = Vec::new();
         let mut candidates = 0usize;
+        let now_unix = chrono::Utc::now().timestamp();
         for rev in out.lines().map(str::trim).filter(|r| !r.is_empty()) {
             if let Some(floor) = floor {
                 // 走到已经上线的那一版就停：它就是集群上正跑着的，再往回是回滚，
@@ -3503,17 +3528,41 @@ impl MainlineDeployer {
             } else {
                 CiAsk::PickTarget
             };
-            let (verdict, _, _, _, _) = self.ci_verdict_with_failures(rev, ask).await;
+            let (verdict, failed_checks, reasons, _, cancelled_checks) =
+                self.ci_verdict_with_failures(rev, ask).await;
+            let held_verdict = verdict;
+            // 红的**全是取消**、而这段扣住已经等满窗口：上游没有给出结论，这一版
+            // 不算红。判词与「扣住」那一侧走同一个函数、同一个时钟，两处不能各判各的
+            // ——一边放行了、另一边还把同一版当红挡着，主线就永远停在这里。
+            let (verdict, waived_reasons) = Self::waive_a_hold_that_only_cancellations_hold_up(
+                verdict,
+                reasons,
+                &failed_checks,
+                &cancelled_checks,
+                hold_since_unix,
+                now_unix,
+            );
+            // 只有真放行了才有「被放行的取消」。没放行时那个函数把原因原样还回来，
+            // 原样带出去会被读成「这一版有取消被放行」——一次「检查还在跑」就记成了
+            // 一次豁免。
+            let waived_reasons = if held_verdict == Some(false) && verdict.is_none() {
+                waived_reasons
+            } else {
+                Vec::new()
+            };
             if rev == tip {
                 head_verdict = verdict;
+                head_waived_reasons = waived_reasons;
             }
             match verdict {
                 // 最新的绿树就是它，往回不必再问。
                 Some(true) => {
                     return Some(CiPick {
                         target: Some(rev.to_string()),
+                        waived,
                         newest_red,
                         head_verdict,
+                        head_waived_reasons,
                     })
                 }
                 // 红的记下来，继续往回找绿的那一版。
@@ -3522,10 +3571,21 @@ impl MainlineDeployer {
                         newest_red = Some(rev.to_string());
                     }
                 }
-                // 没有判词：它算兜底候选（最新的一版「还没被判红」），但继续往回
-                // 找那一版明确绿的——绿的比「没验过」值得滚。
-                None if fallback.is_none() => fallback = Some(rev.to_string()),
-                None => {}
+                // 没有判词、也没有取消：它算兜底候选（最新的一版「还没被判红」），
+                // 但继续往回找那一版明确绿的——绿的比「没验过」值得滚。
+                None if cancelled_checks.is_empty() => {
+                    if fallback.is_none() {
+                        fallback = Some(rev.to_string());
+                    }
+                }
+                // 没有判词、红的全是取消且已豁免：这一版**可以滚**，只是上游没验过
+                // 它。它压过「还没判」的兜底（那几版的检查可能还在跑），压不过任何
+                // 一版明确判绿的（上面那一支已经先返回了）。
+                None => {
+                    if waived.is_none() {
+                        waived = Some(rev.to_string());
+                    }
+                }
             }
         }
         if candidates == 0 {
@@ -3535,25 +3595,32 @@ impl MainlineDeployer {
             // `evaluate_advance` 按集群现状判的事，不是版选择的事。目标就是头自己。
             return Some(CiPick {
                 target: Some(tip.to_string()),
+                waived,
                 newest_red,
                 head_verdict,
+                head_waived_reasons,
             });
         }
         // 这一路上见过红，就不退到「没验过」的那一版：这条兜底是给「上游根本不
         // 上报检查」的仓库留的，而见过红说明上游在判、判得出来——那几版都还没判
         // 绿，就说明确实没有一版验过的代码可以进集群，等着是对的，拿一版没人看过
         // 的顶上就是把这套判据让掉了。红照旧交出去：这一轮不滚，但那一版要有人修。
+        // 「取消」被豁免的那一版不算这条路上见过的红，它由 `waived` 那一格另算。
         if newest_red.is_some() {
             return Some(CiPick {
                 target: None,
+                waived: None,
                 newest_red,
                 head_verdict,
+                head_waived_reasons,
             });
         }
         Some(CiPick {
             target: fallback,
+            waived,
             newest_red,
             head_verdict,
+            head_waived_reasons,
         })
     }
 
@@ -5378,9 +5445,9 @@ impl MainlineDeployer {
     /// `cancelled_waived` 一格——放行不等于没发生过，读数面必须能指着它说「这一版是
     /// 带着一次取消滚上去的」。
     ///
-    /// 时限的参照是**这一笔第一次被判 `fail` 的时刻**（`decided_unix`；重复判出同一个
-    /// 结论时它不被刷新，所以它是窗口的起点而不是最后一次提问的时刻）。宿主实测一段冷
-    /// 构建约 8 分钟，窗口给到 30 分钟，足够让一次重跑跑完还留出排队的余量。
+    /// 时限的参照是**这一段扣住的起点**（`ci_hold_run_since_unix`，跨版本连续；还没进
+    /// 过扣住的第一拍退回那一版的 `decided_unix`）。宿主实测一段冷构建约 8 分钟，窗口
+    /// 给到 30 分钟，足够让一次重跑跑完还留出排队的余量。
     // cap: bound — 冷构建约 8 分钟，窗口给 30 分钟，够一次重跑跑完还留排队的余量
     pub(crate) const CANCELLED_WAIVER_WINDOW_SECS: i64 = 30 * 60;
 
@@ -5475,16 +5542,26 @@ impl MainlineDeployer {
         // 「取消」在一层之下与「不通过」同形（都是 `Some(false)`），但它的意思是
         // **这一问没有结论**。扣满一个窗口仍没有结论，就按没有证据放行，并把原因写成
         // 具名的一格；窗口之内照旧扣着，给它一次跑完的机会。
+        //
+        // 窗口按**这一段扣住**计时（`ci_hold_run_since_unix`，跨版本连续），不是按被
+        // 问那一版自己的 `decided_unix`：树一动，红着的就换一版，按版计时等于每换一
+        // 版把窗口拨回零——只要落版比窗口快，「等满窗口」就永远等不到。2026-11-06
+        // 实测正是这样：macOS 那条检查排十几分钟的队、每次都被下一版推送取消，每一版
+        // 都「刚被取消」，主线从 22:59 停到 00:40 一版没滚。按版计时只在还没进过扣住
+        // 的第一拍用一次（那时连续段还没落盘）。
+        let held_since = state.ci_hold_run_since_unix.or_else(|| {
+            state
+                .last_ci_verdict
+                .as_ref()
+                .filter(|r| r.rev == rev && r.verdict == "fail")
+                .map(|r| r.decided_unix)
+        });
         let (verdict, reasons) = Self::waive_a_hold_that_only_cancellations_hold_up(
             verdict,
             reasons,
             &failed_checks,
             &cancelled_checks,
-            state
-                .last_ci_verdict
-                .as_ref()
-                .filter(|r| r.rev == rev && r.verdict == "fail")
-                .map(|r| r.decided_unix),
+            held_since,
             chrono::Utc::now().timestamp(),
         );
         self.record_ci_verdict_in_state(
@@ -8215,7 +8292,12 @@ impl MainlineDeployer {
         // [`Self::newest_ci_green_revision`]）：一个根本不上报检查的仓库不能因此
         // 永远不部署。
         let pick = self
-            .newest_ci_green_revision(&bare, state.last_good_rev.as_deref(), CI_RED_HEAD_LOOKBACK)
+            .newest_ci_green_revision(
+                &bare,
+                state.last_good_rev.as_deref(),
+                CI_RED_HEAD_LOOKBACK,
+                state.ci_hold_run_since_unix,
+            )
             .await;
         // 路上遇见的最新一版红（可以是头，也可以比头旧）照样要扣住、要挂修复行：
         // 这一轮绕开它去滚更旧的一版，不等于它不存在——它留在历史里，它后面每一版
@@ -8236,11 +8318,13 @@ impl MainlineDeployer {
                 // 就是这一格。挑版本时已经问过了，这里只是把它记下来，不再问一遍。
                 if let Some(pick) = pick.as_ref() {
                     let rev = bare.clone();
+                    // 原因格一起写下去：头上那一版的红是「取消」而被放行时，这里是
+                    // 那一次放行的唯一记录，`ci_hold_end` 读的就是它。
                     self.record_ci_verdict_in_state(
                         &mut state,
                         &rev,
                         pick.head_verdict,
-                        Vec::new(),
+                        pick.head_waived_reasons.clone(),
                         Vec::new(),
                         Vec::new(),
                     )?;
@@ -8253,7 +8337,11 @@ impl MainlineDeployer {
             self.renew_advance_reservation(&mut state)?;
             return Ok(());
         };
-        let Some(target) = pick.target.clone() else {
+        // 没有明确判绿的那一版时，退到「红的全是取消、且这段扣住已等满窗口」的那一
+        // 版：上游没验过它，但它也不是红。它压过兜底的「还没判」那几版（那几版的检查
+        // 可能还在跑），压不过任何一版明确判绿的（`target` 有值就先走 `target`）。
+        let picked_waived = pick.target.is_none() && pick.waived.is_some();
+        let Some(target) = pick.target.clone().or_else(|| pick.waived.clone()) else {
             // 往回这一整段没有一版验过的能进集群：这一轮停着是对的。见到的红
             // 上面已经扣住、挂了修复行——它修好之前绕不过去，绕过它也只是把同一
             // 个红的检查往更旧的一版上传。停着也要说一声：没有这一行，「这一轮
@@ -8266,22 +8354,39 @@ impl MainlineDeployer {
             self.renew_advance_reservation(&mut state)?;
             return Ok(());
         };
+        if picked_waived {
+            // 这一版**没有**被上游验过：红的那几条全是取消，等满了窗口，没有一次
+            // 运行会给它们结论。单独一行，是因为「带着一次没有结论的检查滚上去」
+            // 与「上游判绿」在结果上同形，事后只能靠这一行分开。
+            info!(
+                rev = %rev12(&target),
+                head = %rev12(&bare),
+                "rolling a revision whose only failing checks were cancelled: the hold outlived \
+                 its window and no run is going to produce a verdict for them"
+            );
+        }
         // 挑中的这一版验过没有——这一个布尔只用来判「扣住是被谁回答的」。
         // 从头上往回退到的那一版只有判绿才会被挑中（没判词的那一版记作兜底，而
         // 兜底取的是往回数到的第一个，也就是头本身），所以「目标不是头」本身就
-        // 是「验过」；目标就是头时，判词就在这一轮手里。
-        let target_verified = if rev12(&target) != rev12(&bare) {
+        // 是「验过」；目标就是头时，判词就在这一轮手里。豁免放行的那一版例外：
+        // 它明明没被验过，按「不是头就是验过」去记，一次取消就会被写成「被一版
+        // 判绿的取代了」。
+        let target_verified = if picked_waived {
+            false
+        } else if rev12(&target) != rev12(&bare) {
             true
         } else {
             pick.head_verdict == Some(true)
         };
         if rev12(&target) != rev12(&bare) {
-            info!(
-                head = %rev12(&bare),
-                rev = %rev12(&target),
-                red = pick.newest_red.as_deref().map(rev12).unwrap_or("none"),
-                "rolling the newest revision upstream CI reports green, which is behind the head"
-            );
+            if !picked_waived {
+                info!(
+                    head = %rev12(&bare),
+                    rev = %rev12(&target),
+                    red = pick.newest_red.as_deref().map(rev12).unwrap_or("none"),
+                    "rolling the newest revision upstream CI reports green, which is behind the head"
+                );
+            }
             bare = target;
         }
         // 绕开红的那一轮没有「扣住结束」可收：扣住说的还是那一版红的，它没有
@@ -17579,9 +17684,11 @@ exit 0
 
         assert_eq!(
             deployer
-                .newest_ci_green_revision(&rev_c, Some(&rev_a), 12)
+                .newest_ci_green_revision(&rev_c, Some(&rev_a), 12, None)
                 .await,
             Some(CiPick {
+                waived: None,
+                head_waived_reasons: Vec::new(),
                 target: Some(rev_b.clone()),
                 newest_red: None,
                 head_verdict: None,
@@ -17592,9 +17699,11 @@ exit 0
         // 的那一版（C），而不是停在原地——这是「等绿」与「永远等不到」的分界。
         assert_eq!(
             deployer
-                .newest_ci_green_revision(&rev_c, Some(&rev_b), 12)
+                .newest_ci_green_revision(&rev_c, Some(&rev_b), 12, None)
                 .await,
             Some(CiPick {
+                waived: None,
+                head_waived_reasons: Vec::new(),
                 target: Some(rev_c.clone()),
                 newest_red: None,
                 head_verdict: None,
@@ -17606,9 +17715,11 @@ exit 0
         // 为一件已经落地的事再问一遍 CI。
         assert_eq!(
             deployer
-                .newest_ci_green_revision(&rev_c, Some(&rev_c), 12)
+                .newest_ci_green_revision(&rev_c, Some(&rev_c), 12, None)
                 .await,
             Some(CiPick {
+                waived: None,
+                head_waived_reasons: Vec::new(),
                 target: Some(rev_c.clone()),
                 newest_red: None,
                 head_verdict: None,
@@ -17616,9 +17727,90 @@ exit 0
             "头就是集群上跑着的那一版：目标是它自己，不是「没有可滚的」"
         );
         assert_eq!(
-            deployer.newest_ci_green_revision(&rev_c, None, 0).await,
+            deployer
+                .newest_ci_green_revision(&rev_c, None, 0, None)
+                .await,
             None,
             "深度为零的搜索没有候选，不能当成「找到了一版」"
+        );
+    }
+
+    /// 红的**全是取消**、这段扣住又等满了窗口的那一版是可以滚的。
+    ///
+    /// 只放行不挑版本等于什么都没做：`hold_if_ci_reports_failure` 那边已经把这件
+    /// 事答成「没有证据」，而挑版本这边若仍把它记成红，`newest_red` 一非空就
+    /// 返回「没有可滚的」——同一次取消在两道门里判出两个结果，主线永远停着。
+    /// 2026-11-06 实测正是这个形状：部署器每拍都在放行与「等一版验证过的」之间
+    /// 打转，而集群上跑着的还是几小时前的那一版。
+    #[tokio::test]
+    async fn a_cancelled_only_head_past_the_window_is_a_rollout_target() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_a);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+
+        // 裸仓库 A→B，集群在 A，B 就是头。
+        let head_rev = rev_b.clone();
+
+        // 头上这一版：除了 macos 那条被取消，别的都通过。
+        let head = head_rev.clone();
+        let ci = move |path: &str| -> String {
+            if path.contains(&head) {
+                if path.contains("/status") {
+                    return HTTP_404.to_string();
+                }
+                if path.contains("/annotations") {
+                    return http_200("{}");
+                }
+                return http_200(
+                    r#"{"check_runs":[{"id":7,"name":"Bootstrap Cross-Platform Check (macos-latest)","conclusion":"cancelled","started_at":"2026-11-06T05:00:00Z","completed_at":"2026-11-06T05:15:00Z"}]}"#,
+                );
+            }
+            if path.contains("/status") {
+                return HTTP_404.to_string();
+            }
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"success"}]}"#)
+        };
+        let (endpoint, _seen) = fake_ci_by_rev(ci).await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.upstreams = vec![crate::config::UpstreamTrackConfig {
+            platform: crate::config::CodePlatform::Github,
+            repo: "owner/repo".into(),
+            api_base: Some(format!("http://{endpoint}/github")),
+        }];
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+
+        let now = chrono::Utc::now().timestamp();
+        let pick = deployer
+            .newest_ci_green_revision(&head_rev, Some(&rev_a), 12, Some(now - 3_600))
+            .await
+            .expect("这一段区间里有候选");
+        assert_eq!(pick.target, None, "上游没验过它：它不能走「判绿」那一格");
+        assert_eq!(
+            pick.newest_red, None,
+            "取消不是对这棵树的判决，它不该占着「最新一版红」那一格"
+        );
+        assert_eq!(
+            pick.waived,
+            Some(head_rev.clone()),
+            "等满窗口的取消要交出一版能滚的，否则放行之后仍然没有目标"
+        );
+
+        // 对照：同一份取消，这段扣住才刚开始——照旧记成红，这一轮不滚。
+        let pick = deployer
+            .newest_ci_green_revision(&head_rev, Some(&rev_a), 12, Some(now - 60))
+            .await
+            .expect("这一段区间里有候选");
+        assert_eq!(pick.waived, None);
+        assert_eq!(
+            pick.newest_red,
+            Some(head_rev.clone()),
+            "窗口没到的取消仍然扣住这一版"
         );
     }
 
@@ -17671,9 +17863,11 @@ exit 0
 
         assert_eq!(
             deployer
-                .newest_ci_green_revision(&rev_c, Some(&rev_a), 12)
+                .newest_ci_green_revision(&rev_c, Some(&rev_a), 12, None)
                 .await,
             Some(CiPick {
+                waived: None,
+                head_waived_reasons: Vec::new(),
                 target: Some(rev_b.clone()),
                 newest_red: Some(rev_c.clone()),
                 head_verdict: Some(false),
@@ -17683,9 +17877,11 @@ exit 0
         // 走到集群上正跑着的那一版就收工：这一轮没有可滚的，但红照旧带出去。
         assert_eq!(
             deployer
-                .newest_ci_green_revision(&rev_c, Some(&rev_b), 12)
+                .newest_ci_green_revision(&rev_c, Some(&rev_b), 12, None)
                 .await,
             Some(CiPick {
+                waived: None,
+                head_waived_reasons: Vec::new(),
                 target: None,
                 newest_red: Some(rev_c.clone()),
                 head_verdict: Some(false),
@@ -17744,9 +17940,11 @@ exit 0
 
         assert_eq!(
             deployer
-                .newest_ci_green_revision(&rev_c, Some(&rev_a), 12)
+                .newest_ci_green_revision(&rev_c, Some(&rev_a), 12, None)
                 .await,
             Some(CiPick {
+                waived: None,
+                head_waived_reasons: Vec::new(),
                 target: None,
                 newest_red: Some(rev_b.clone()),
                 head_verdict: None,
@@ -20488,6 +20686,100 @@ exec {real} "$@"
                 "github:cancelled_waived".to_string(),
                 "gitee:cancelled_waived".to_string()
             ]
+        );
+    }
+
+    /// 窗口按**这一段扣住**计时，不按被指着的那一版计时。
+    ///
+    /// 树一直往前动，红着的那一版就跟着换；只要落版比窗口快，「按版计时」就等于
+    /// 把窗口每换一版拨回零——满窗永远等不到。2026-11-06 实测：macOS 那条检查在
+    /// 队列里排十几分钟、每次都被下一版推送取消，从 22:59 到 00:40 一版都没滚上去，
+    /// 而每一版自己的判词都是「刚刚判红」。
+    #[tokio::test]
+    async fn the_cancellation_window_runs_on_the_hold_not_on_the_revision_it_points_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, _seen) = fake_ci_by_rev(|line| {
+            if line.contains("/annotations") {
+                http_200("{}")
+            } else {
+                http_200(
+                    r#"{"check_runs":[{"id":7,"name":"Bootstrap Cross-Platform Check (macos-latest)","conclusion":"cancelled","started_at":"2026-11-06T05:00:00Z","completed_at":"2026-11-06T05:15:00Z"}]}"#,
+                )
+            }
+        })
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let now = chrono::Utc::now().timestamp();
+        let mut state = MainlineState {
+            // 这一段扣住一小时前就开始了。
+            ci_hold_run_since_unix: Some(now - 3_600),
+            // 而被指着的那一版是刚换上的，它自己那一格判词的时刻就在此刻——按版
+            // 计时会从这里重新数起。
+            last_ci_verdict: Some(CiVerdictRecord {
+                rev: "abc123".to_string(),
+                verdict: "fail".to_string(),
+                reasons: Vec::new(),
+                failed_checks: vec![
+                    "github:Bootstrap Cross-Platform Check (macos-latest)".to_string()
+                ],
+                excluded_checks: Vec::new(),
+                decided_unix: now,
+            }),
+            ..MainlineState::default()
+        };
+        assert!(
+            !deployer
+                .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::PickTarget)
+                .await
+                .unwrap(),
+            "这一段已经等了一小时：取消不是判词，按版计时会让它永远等不到放行"
+        );
+        let record = state.last_ci_verdict.as_ref().unwrap();
+        assert_eq!(record.verdict, "no_evidence");
+        assert!(
+            record
+                .reasons
+                .iter()
+                .any(|r| r.ends_with("cancelled_waived")),
+            "放行要在读数面上留下具名的一格：{record:?}"
+        );
+    }
+
+    /// 对照：同一份取消，这一段扣住才刚开始——照旧扣着。
+    #[tokio::test]
+    async fn a_cancellation_inside_the_hold_window_still_holds_the_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, _seen) = fake_ci_by_rev(|line| {
+            if line.contains("/annotations") {
+                http_200("{}")
+            } else {
+                http_200(
+                    r#"{"check_runs":[{"id":7,"name":"Bootstrap Cross-Platform Check (macos-latest)","conclusion":"cancelled","started_at":"2026-11-06T05:00:00Z","completed_at":"2026-11-06T05:15:00Z"}]}"#,
+                )
+            }
+        })
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = MainlineState {
+            ci_hold_run_since_unix: Some(chrono::Utc::now().timestamp() - 60),
+            ..MainlineState::default()
+        };
+        assert!(
+            deployer
+                .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::PickTarget)
+                .await
+                .unwrap(),
+            "窗口还没到：重跑可能就在这几分钟里"
         );
     }
 
