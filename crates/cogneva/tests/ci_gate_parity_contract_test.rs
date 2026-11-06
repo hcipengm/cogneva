@@ -65,6 +65,9 @@ const ENFORCED: &[(&str, &str)] = &[
     // (the `check-` prefix is what makes it one). The command is the same bytes
     // on both sides rather than a transcription, which is the whole reason the
     // sixty-four steps became a list.
+    // What is still not the same is the server: CI's is a throwaway container,
+    // the sandbox's is the cluster's own PostgreSQL -- which is why the script
+    // builds a database of its own before it judges anything.
     ("live", "bash deploy/scripts/check-live-services.sh"),
 ];
 
