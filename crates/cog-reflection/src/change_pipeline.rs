@@ -424,9 +424,10 @@ fn provisioned_toolchain_in(home: &Path, release: &str) -> Option<PathBuf> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(&prefix));
-            named
-                && path.join("bin").join("rustfmt").exists()
-                && path.join("bin").join("cargo-clippy").exists()
+            // 组件只写一遍：两处各写一份时，改一边而漏掉另一边，这里就会读成
+            // 「装好了」或「没装」——两边都是对同一棵树的两个说法。
+            let bin = path.join("bin");
+            named && bin.join("rustfmt").exists() && bin.join("cargo-clippy").exists()
         })
 }
 
