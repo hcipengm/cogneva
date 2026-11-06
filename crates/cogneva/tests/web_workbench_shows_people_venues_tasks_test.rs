@@ -183,3 +183,46 @@ fn the_conversation_pane_draws_the_frame_stream_not_only_the_transcript() {
          说过什么，不该说完就换成快照里的那一份"
     );
 }
+
+/// 对话那一面接得回它自己这位员工做的事。
+///
+/// 工具帧上只有 `agent_id`，而这一段对话要先知道「我这位员工在总线上叫什么」，
+/// 才认领得到它的调用。名字是服务端按会话折出来的（带进程指纹），前端算不出同
+/// 一个，所以它得跟着帧下来。这条判据钉的是整条链的四段都在：网关发身份帧、
+/// 前端认这个帧名、会话记住它、面板按它筛工具调用。少任何一段，屏幕上就还是
+/// 一问一答——2026-11-06 属主看到的正是这个。
+#[test]
+fn the_conversation_pane_claims_its_own_employees_tool_calls() {
+    let server = source(&root(), "crates/cog-gateway/src/chat.rs");
+    assert!(
+        server.contains("agent.identity"),
+        "网关不再把这一轮的身份发到连接上：面板无从知道这些工具帧是谁的，\
+         屏幕上一问一答之外什么也画不出来"
+    );
+
+    let kinds = source(&root(), "web/src/types/events.ts");
+    assert!(
+        kinds.contains("'agent.identity': 'identity'"),
+        "前端不认 `agent.identity` 这一帧：服务端发了，这边当它是别的帧丢掉"
+    );
+    assert!(
+        kinds.contains("inner.agent_id"),
+        "帧解析没有把 `agent_id` 取出来：认了帧名也知道不了是谁"
+    );
+
+    let store = source(&root(), "web/src/store/chatStore.ts");
+    assert!(
+        store.contains("case 'identity'"),
+        "会话没有收下身份帧：面板手里的 `agentId` 永远是空的"
+    );
+
+    let pane = source(&root(), "web/src/conversation/ConversationPane.tsx");
+    assert!(
+        pane.contains("session?.agentId"),
+        "面板没有按这一段的员工身份去筛工具调用：它自己调的工具一条也接不回来"
+    );
+    assert!(
+        pane.contains("call.agent !== own"),
+        "面板收工具调用时没有比对 `agent`：别的员工的动作会画进这段对话里"
+    );
+}
