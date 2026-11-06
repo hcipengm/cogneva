@@ -515,6 +515,32 @@ impl ToolRegistry {
                                 content: content.to_string(),
                             }
                         }
+                        cog_core::ShellOp::EditFile => {
+                            let path = arguments.get("path").and_then(|v| v.as_str()).ok_or_else(
+                                || cog_core::SFError::Validation("path required".into()),
+                            )?;
+                            let old_string = arguments
+                                .get("old_string")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                cog_core::SFError::Validation("old_string required".into())
+                            })?;
+                            let new_string = arguments
+                                .get("new_string")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                cog_core::SFError::Validation("new_string required".into())
+                            })?;
+                            SandboxPayload::EditFile {
+                                path: path.to_string(),
+                                old_string: old_string.to_string(),
+                                new_string: new_string.to_string(),
+                                replace_all: arguments
+                                    .get("replace_all")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                            }
+                        }
                     };
                 // 行范围在参数被交给沙箱之前取出来：`input` 会把整份参数搬走，
                 // 而读回结果时还要用它切出调用方要的那一段。
@@ -586,6 +612,17 @@ impl ToolRegistry {
                     cog_core::ShellOp::WriteFile => {
                         if code == 0 {
                             Ok(serde_json::json!({ "success": true }))
+                        } else {
+                            Err(cog_core::SFError::IO(stderr).into())
+                        }
+                    }
+                    // The executor's sentence -- how many sites moved and at
+                    // which lines -- is the whole result; repeating it in a
+                    // field of our own would only give the model two spellings
+                    // of the same fact to choose between.
+                    cog_core::ShellOp::EditFile => {
+                        if code == 0 {
+                            Ok(serde_json::json!({ "success": true, "report": stdout }))
                         } else {
                             Err(cog_core::SFError::IO(stderr).into())
                         }
@@ -1598,6 +1635,14 @@ mod tests {
                         },
                     }
                 }
+                // Editing happens where the file is; this double has no story
+                // for it, and says so rather than answering as if it worked.
+                // The replacement itself is covered by `cog_extension::edit`.
+                SandboxPayload::EditFile { .. } => {
+                    return Err(cog_core::SFError::Agent(
+                        "LocalShellBackend does not edit files".into(),
+                    ));
+                }
                 SandboxPayload::Wasm { .. } => {
                     return Err(cog_core::SFError::Agent("unsupported payload".into()));
                 }
@@ -1816,6 +1861,157 @@ mod tests {
         );
     }
 
+    /// Records the payload an edit hands the executor and answers with what the
+    /// test scripted. What the agent side has to get right is the shape it
+    /// sends and how it carries the answer back; the replacement itself runs
+    /// next to the file and is covered by `cog_extension::edit`.
+    #[derive(Default)]
+    struct EditBackend {
+        seen: tokio::sync::Mutex<Vec<SandboxPayload>>,
+        /// exit code, stdout, stderr.
+        reply: std::sync::Mutex<(i32, String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for EditBackend {
+        async fn execute(&self, req: &SandboxRequest) -> SFResult<cog_core::SandboxResult> {
+            self.seen.lock().await.push(req.payload.clone());
+            let (exit_code, stdout, stderr) = self.reply.lock().unwrap().clone();
+            Ok(cog_core::SandboxResult {
+                stdout,
+                stderr,
+                exit_code,
+                ..Default::default()
+            })
+        }
+
+        async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
+            Err(cog_core::SFError::Agent("unsupported".into()))
+        }
+    }
+
+    fn edit_registry(backend: Arc<EditBackend>) -> ToolRegistry {
+        let registry = ToolRegistry::new().with_sandbox_backend(backend as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::edit_file());
+        registry
+    }
+
+    /// 一次编辑只送两段文本：要换掉的、换成的。整份文件不在这条路上走。
+    #[tokio::test]
+    async fn an_edit_names_the_text_to_replace_and_where_it_is() {
+        let backend = Arc::new(EditBackend::default());
+        *backend.reply.lock().unwrap() = (
+            0,
+            "edited src/lib.rs: 1 replacement at line 12".into(),
+            String::new(),
+        );
+        let registry = edit_registry(backend.clone());
+
+        let out = registry
+            .execute(
+                "edit_file",
+                serde_json::json!({
+                    "path": "src/lib.rs",
+                    "old_string": "let a = 1;",
+                    "new_string": "let a = 2;",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out["success"], true);
+        assert_eq!(out["report"], "edited src/lib.rs: 1 replacement at line 12");
+        let seen = backend.seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        match &seen[0] {
+            SandboxPayload::EditFile {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+            } => {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(old_string, "let a = 1;");
+                assert_eq!(new_string, "let a = 2;");
+                assert!(!*replace_all, "没写 replace_all 就是只改一处");
+            }
+            other => panic!("edit_file 应当发 EditFile 载荷，实际是 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_can_ask_to_change_every_site() {
+        let backend = Arc::new(EditBackend::default());
+        let registry = edit_registry(backend.clone());
+
+        registry
+            .execute(
+                "edit_file",
+                serde_json::json!({
+                    "path": "f.rs",
+                    "old_string": "x = 1;",
+                    "new_string": "x = 2;",
+                    "replace_all": true,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let seen = backend.seen.lock().await;
+        match &seen[0] {
+            SandboxPayload::EditFile { replace_all, .. } => assert!(*replace_all),
+            other => panic!("应当发 EditFile 载荷，实际是 {other:?}"),
+        }
+    }
+
+    /// 执行器为什么拒绝，原话要原样到调用方手上：它要拿这句话里的行号决定补多少下文。
+    #[tokio::test]
+    async fn an_edit_the_executor_refuses_reaches_the_caller_with_its_reason() {
+        let backend = Arc::new(EditBackend::default());
+        *backend.reply.lock().unwrap() = (
+            1,
+            String::new(),
+            "`old_string` appears 2 times in f.rs (at lines 2, 4)".into(),
+        );
+        let registry = edit_registry(backend.clone());
+
+        let err = registry
+            .execute(
+                "edit_file",
+                serde_json::json!({
+                    "path": "f.rs",
+                    "old_string": "x = 1;",
+                    "new_string": "x = 2;",
+                }),
+            )
+            .await
+            .expect_err("执行器返回非零退出码时工具应当是失败，不是空成功");
+        let text = err.to_string();
+        assert!(text.contains("appears 2 times"), "{text}");
+        assert!(text.contains("at lines 2, 4"), "{text}");
+    }
+
+    /// 缺了要换的那段文本，在交给执行器之前就该拒绝：跑一趟只知道文件没变，
+    /// 而调用方会以为是锚点没对上。
+    #[tokio::test]
+    async fn an_edit_without_the_text_to_replace_is_refused_before_the_executor_sees_it() {
+        let backend = Arc::new(EditBackend::default());
+        let registry = edit_registry(backend.clone());
+
+        let err = registry
+            .execute(
+                "edit_file",
+                serde_json::json!({ "path": "f.rs", "new_string": "y" }),
+            )
+            .await
+            .expect_err("缺 old_string 应当拒绝");
+        assert!(err.to_string().contains("old_string"), "{err}");
+        assert!(
+            backend.seen.lock().await.is_empty(),
+            "被拒绝的调用不该已经交给执行器"
+        );
+    }
+
     #[tokio::test]
     async fn shell_commands_get_their_own_budget_not_the_wasm_one() {
         let backend = Arc::new(RecordingBackend::default());
@@ -2012,8 +2208,10 @@ pub mod builtins {
     pub fn write_file() -> Tool {
         Tool {
             name: "write_file".into(),
-            description: "Write content to a file. Relative paths resolve against the \
-                          task's working directory."
+            description: "Write content to a file, replacing whatever it held. Relative paths \
+                          resolve against the task's working directory. To change part of an \
+                          existing file, use edit_file: rewriting the whole thing to change a \
+                          line carries every other line again."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -2024,6 +2222,42 @@ pub mod builtins {
                 "required": ["path", "content"]
             }),
             implementation: ToolImplementation::Shell(cog_core::ShellOp::WriteFile),
+        }
+    }
+
+    pub fn edit_file() -> Tool {
+        Tool {
+            name: "edit_file".into(),
+            description: "Replace an exact string in a file with new text, without rewriting \
+                          the whole file. `old_string` is the text to find, copied exactly \
+                          from the file including indentation; `new_string` replaces it. When \
+                          the text appears more than once the call is refused and the \
+                          occurrences' line numbers are named, so include enough surrounding \
+                          text to pick one site -- or set `replace_all` to change all of \
+                          them. The reply says how many replacements were made and at which \
+                          lines. Read the file first: an anchor that does not match the bytes \
+                          on disk is refused, never guessed at."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path" },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to replace, copied from the file"
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The text to put in its place"
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence instead of insisting on exactly one; defaults to false"
+                    }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+            implementation: ToolImplementation::Shell(cog_core::ShellOp::EditFile),
         }
     }
 
@@ -2109,6 +2343,7 @@ pub mod builtins {
     pub fn register_builtins(registry: &dyn cog_core::ToolRegistry, inputs: BuiltinInputs) {
         cog_core::ToolRegistry::register(registry, read_file());
         cog_core::ToolRegistry::register(registry, write_file());
+        cog_core::ToolRegistry::register(registry, edit_file());
         cog_core::ToolRegistry::register(registry, run_command());
         match inputs.http_client.clone() {
             Some(client) => cog_core::ToolRegistry::register(

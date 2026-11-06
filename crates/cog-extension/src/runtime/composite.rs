@@ -23,7 +23,8 @@ impl CompositeSandbox {
             SandboxPayload::Wasm { .. } => &self.wasm,
             SandboxPayload::Command { .. }
             | SandboxPayload::ReadFile { .. }
-            | SandboxPayload::WriteFile { .. } => &self.executor,
+            | SandboxPayload::WriteFile { .. }
+            | SandboxPayload::EditFile { .. } => &self.executor,
         }
     }
 }

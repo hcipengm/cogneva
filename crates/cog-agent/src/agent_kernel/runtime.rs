@@ -819,7 +819,7 @@ impl CheckoutProgress {
 /// errs towards calling too much of the shell a write.
 fn changes_the_checkout(tool: &str, arguments: &serde_json::Value) -> bool {
     if tool != "run_command" {
-        return tool == "write_file";
+        return tool == "write_file" || tool == "edit_file";
     }
     let command = arguments
         .get("command")
@@ -6754,6 +6754,11 @@ mod tests {
     fn the_calls_that_change_the_checkout_are_read_off_the_call() {
         let cases: &[(&str, serde_json::Value, bool)] = &[
             ("write_file", serde_json::json!({ "path": "a.rs" }), true),
+            (
+                "edit_file",
+                serde_json::json!({ "path": "a.rs", "old_string": "a", "new_string": "b" }),
+                true,
+            ),
             ("read_file", serde_json::json!({ "path": "a.rs" }), false),
             (
                 "run_command",

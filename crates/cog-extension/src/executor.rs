@@ -29,7 +29,8 @@ impl ExtensionExecutor {
             }
             SandboxPayload::Command { .. }
             | SandboxPayload::ReadFile { .. }
-            | SandboxPayload::WriteFile { .. } => Err(cog_core::SFError::Agent(
+            | SandboxPayload::WriteFile { .. }
+            | SandboxPayload::EditFile { .. } => Err(cog_core::SFError::Agent(
                 "ExtensionExecutor only dispatches WASM payloads".into(),
             )),
         }

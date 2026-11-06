@@ -63,6 +63,7 @@ async fn the_binary_lists_its_tools_and_reads_a_file_on_request() {
     assert_eq!(
         names,
         vec![
+            "edit_file",
             "http_request",
             "raw_fetch",
             "raw_list",

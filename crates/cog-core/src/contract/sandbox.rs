@@ -48,6 +48,22 @@ pub enum SandboxPayload {
         path: String,
         content: String,
     },
+    /// Replace one exact string in a file, where the file lives.
+    ///
+    /// A whole-file write is the only other way to change a line, and it costs
+    /// the caller everything the file contains to say something about one line
+    /// of it -- in the request, and again in whatever the model had to read
+    /// first to reproduce the rest faithfully. The executor already has the
+    /// bytes; it does the read, the count and the write, and answers with how
+    /// many replacements it made and where.
+    EditFile {
+        path: String,
+        old_string: String,
+        new_string: String,
+        /// Replace every occurrence instead of insisting on exactly one.
+        #[serde(default)]
+        replace_all: bool,
+    },
 }
 
 /// One chunk of streaming command output. Also serves as the wire format

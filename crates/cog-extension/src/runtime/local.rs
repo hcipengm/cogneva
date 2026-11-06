@@ -349,6 +349,23 @@ impl SandboxBackend for LocalExecutor {
             SandboxPayload::WriteFile { path, content } => Ok(file_stream(
                 tokio::fs::write(path, content).await.map(|_| String::new()),
             )),
+            SandboxPayload::EditFile {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+            } => {
+                let result = crate::edit::apply(
+                    std::path::Path::new(path),
+                    old_string,
+                    new_string,
+                    *replace_all,
+                )
+                .await
+                .map(|report| report.describe(path))
+                .map_err(std::io::Error::other);
+                Ok(file_stream(result))
+            }
             SandboxPayload::Wasm { .. } => Err(cog_core::SFError::Agent(
                 "LocalExecutor only executes environment payloads".into(),
             )),

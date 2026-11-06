@@ -9,6 +9,7 @@
 
 pub mod build_cache;
 pub mod command_server;
+pub mod edit;
 pub mod executor;
 pub mod hostdocs;
 pub mod hostdocs_assist;

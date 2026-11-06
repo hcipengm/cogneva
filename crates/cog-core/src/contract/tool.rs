@@ -52,6 +52,10 @@ pub enum ShellOp {
     ReadFile,
     /// Arguments: `path`, `content` (strings).
     WriteFile,
+    /// Arguments: `path`, `old_string`, `new_string` (strings), `replace_all`
+    /// (bool, optional). The replacement happens on the executor, next to the
+    /// file, so a one-line change does not have to carry the whole file.
+    EditFile,
 }
 
 /// Tool definition.

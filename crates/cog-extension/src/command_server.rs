@@ -277,6 +277,22 @@ async fn execute_handler(
                 .map(|_| String::new());
             stream_response(single_shot(result))
         }
+        SandboxPayload::EditFile {
+            ref path,
+            ref old_string,
+            ref new_string,
+            replace_all,
+        } => {
+            let anchored = workdir::anchor_path(workdir.as_deref(), path);
+            // The reply names the path the caller gave, not the anchored one:
+            // an agent that asked for `src/main.rs` should not have to strip a
+            // worktree prefix off its own answer to recognise it.
+            let result = crate::edit::apply(&anchored, old_string, new_string, replace_all)
+                .await
+                .map(|report| report.describe(path))
+                .map_err(std::io::Error::other);
+            stream_response(single_shot(result))
+        }
         SandboxPayload::Wasm { .. } => error_response(
             StatusCode::BAD_REQUEST,
             "executor does not run WASM payloads".into(),
@@ -1005,6 +1021,73 @@ mod tests {
             })
             .collect();
         assert_eq!(content, "via-server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 编辑走的是和读写同一条服务：文件在哪个树上，就在哪里改。
+    ///
+    /// 两种结局都在这里读：对上了就改一处并说出行号；对上多处就当场拒绝，
+    /// 文件一个字节不动——静默挑一处改掉，调用方要到下一次读才发现改错了地方。
+    #[tokio::test]
+    async fn server_edits_a_file_in_place() {
+        let addr = spawn_server().await;
+        let dir = std::env::temp_dir().join(format!("cog-exec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let shown = path.to_string_lossy().into_owned();
+
+        let events = events_of(
+            post(
+                addr,
+                serde_json::json!({"payload": {"type": "edit_file", "path": shown,
+                                               "old_string": "two", "new_string": "TWO"}}),
+            )
+            .await,
+        )
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(CommandEvent::Exit { code: 0 })
+        ));
+        let report: String = events
+            .iter()
+            .filter_map(|e| match e {
+                CommandEvent::Stdout { data } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(report.contains("1 replacement at line 2"), "{report}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\nTWO\n");
+
+        std::fs::write(&path, "x\nx\n").unwrap();
+        let events = events_of(
+            post(
+                addr,
+                serde_json::json!({"payload": {"type": "edit_file", "path": shown,
+                                               "old_string": "x", "new_string": "y"}}),
+            )
+            .await,
+        )
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(CommandEvent::Exit { code: 1 })
+        ));
+        let reason: String = events
+            .iter()
+            .filter_map(|e| match e {
+                CommandEvent::Stderr { data } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(reason.contains("appears 2 times"), "{reason}");
+        assert!(reason.contains("lines 1, 2"), "{reason}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "x\nx\n",
+            "被拒绝的编辑不能留下半次写入"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -31,10 +31,11 @@ use root::repo_root;
 ///
 /// The shell operations are the only tools that reach the executor's
 /// filesystem, and which of them writes is an enum: `Command` runs what the
-/// caller wrote and `WriteFile` writes the file it is given, while `ReadFile`
-/// only reads. That covers the case a name list cannot -- a tool added later
-/// whose mutation nobody declared is not in the list, and a boundary that reads
-/// "not in the list" as "safe" hands it to the planner without a word.
+/// caller wrote, `WriteFile` writes the file it is given, and `EditFile`
+/// rewrites a span inside one, while `ReadFile` only reads. That covers the
+/// case a name list cannot -- a tool added later whose mutation nobody declared
+/// is not in the list, and a boundary that reads "not in the list" as "safe"
+/// hands it to the planner without a word.
 ///
 /// `None` is that uncovered case and not a soft `false`: a native handler runs
 /// in the process that holds the registry, so it cannot reach the checkout at
@@ -45,7 +46,9 @@ use root::repo_root;
 fn changes_the_workspace(tool: &cog_core::Tool) -> Option<bool> {
     use cog_core::{ShellOp, ToolImplementation};
     match &tool.implementation {
-        ToolImplementation::Shell(ShellOp::Command | ShellOp::WriteFile) => Some(true),
+        ToolImplementation::Shell(ShellOp::Command | ShellOp::WriteFile | ShellOp::EditFile) => {
+            Some(true)
+        }
         ToolImplementation::Shell(ShellOp::ReadFile) => Some(false),
         ToolImplementation::Native(_) | ToolImplementation::Wasm { .. } => NATIVE_EFFECTS
             .iter()
