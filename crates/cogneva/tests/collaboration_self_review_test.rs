@@ -665,12 +665,10 @@ async fn test_full_review_max_iterations_exceeded() {
 
 #[tokio::test]
 async fn test_agent_loop_runs_correctly() {
-    let provider = DummyProvider::new(vec![
-        // AgentRuntime think_stream → Done with "hello"
-        "hello".into(),
-        // build_result chat → JSON result
-        r#"{"status":"ok"}"#.into(),
-    ]);
+    // 只有一次模型调用：想里没有 JSON 时，那句想就是交付物。这里曾经还排着第二
+    // 条回应——「把上面那段想法改写成 JSON」——那条路已经去掉，见
+    // `a_thought_that_is_not_json_is_delivered_without_a_second_call`。
+    let provider = DummyProvider::new(vec!["hello".into()]);
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
     let config = RuntimeConfig {
@@ -694,7 +692,15 @@ async fn test_agent_loop_runs_correctly() {
         .run(serde_json::json!({"test": true}), &provider)
         .await;
 
-    assert!(result.is_ok());
-    let val = result.unwrap();
-    assert_eq!(val.get("status"), Some(&serde_json::json!("ok")));
+    let val = result.expect("一次没有结构的回答也是一次正常的运行");
+    assert_eq!(
+        val.get("result"),
+        Some(&serde_json::json!("hello")),
+        "交付物就是模型说的那句；再问一次模型改写换不到任何字段"
+    );
+    assert_eq!(
+        provider.actors().len(),
+        1,
+        "一次运行只买一次模型调用：改写那一次不产生结构，只产生一回合的等待"
+    );
 }

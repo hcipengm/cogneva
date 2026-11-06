@@ -579,6 +579,36 @@ fn deliverable_in(text: &str) -> Option<serde_json::Value> {
         .filter(|v| !v.is_null() && *v != serde_json::Value::Object(Default::default()))
 }
 
+/// 这一句答案外面有没有壳，有就还它里面那句话。
+///
+/// 有的模型把整句回答包成一个对象发过来（实测 `{"answer":"…"}`、
+/// `{"role":"employee","thought":"…"}`）。这一面交付的是说给人听的那一句，壳不是
+/// 它的一部分：原样交出去，屏幕上读到的是花括号和转义，而收信的同事读到的还是
+/// 第二层——`{"status":"completed","reply":"{\"answer\":…}"}`。
+///
+/// 只拆「整段就是一个对象、只有一个键、键名是已知的答案字段」的那种壳。别的
+/// 一律原样交：一段真的以 JSON 为内容的回答不该被截掉一半，一个多键的对象也
+/// 不该只留下其中一个键。
+fn plain_answer(draft: &str) -> String {
+    const ANSWER_FIELDS: [&str; 7] = [
+        "answer", "reply", "text", "content", "message", "thought", "result",
+    ];
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(draft.trim()) else {
+        return draft.to_string();
+    };
+    let Some((key, value)) = fields.iter().next() else {
+        return draft.to_string();
+    };
+    match value {
+        serde_json::Value::String(text)
+            if fields.len() == 1 && ANSWER_FIELDS.contains(&key.as_str()) =>
+        {
+            text.clone()
+        }
+        _ => draft.to_string(),
+    }
+}
+
 /// The request block exactly as `cog_core::contract::prompt::render_varying_half`
 /// writes it, if the payload carries one.
 ///
@@ -717,12 +747,6 @@ const REPLY_REFUSED_INSTRUCTION: &str = "The reply you just wrote cannot be deli
 /// wedged rather than worked.
 // cap: bound — 要容得下渲染一件大产出；花掉这么久的运行是卡住了而不是在干活
 const RESULT_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Wall for the one extra model call that reshapes a thought into the JSON the
-/// squad protocol reads. It is a single short completion, so it is held to a
-/// fraction of a turn: a slow upstream should cost this fallback, not the run.
-// cap: bound — 它是一次短补全，所以按一回合的一个零头来限：上游慢只该赔掉这个兜底，不该赔掉整轮
-const REFORMAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The status a conversation turn's result carries when it ends on an answer.
 ///
@@ -2497,13 +2521,17 @@ impl AgentRuntime {
         let result = if self.reply_is_the_result {
             // The reply is the answer. It was already through the output gate
             // above; nothing downstream reads a field out of it, and the reader
-            // is the person in front of the screen.
+            // is the person in front of the screen. The shell some models wrap
+            // it in is not part of the sentence they said, so it comes off
+            // here, once, rather than in every reader.
             serde_json::json!({
                 "status": CONVERSATION_REPLY_STATUS,
-                "reply": draft.clone(),
+                "reply": plain_answer(&draft),
             })
         } else {
-            match tokio::time::timeout(RESULT_BUILD_TIMEOUT, self.build_result(&draft, llm)).await {
+            match tokio::time::timeout(RESULT_BUILD_TIMEOUT, async { self.build_result(&draft) })
+                .await
+            {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
@@ -2854,17 +2882,12 @@ impl AgentRuntime {
         );
     }
 
-    async fn build_result(
-        &mut self,
-        thought: &str,
-        llm: &dyn cog_core::LlmClient,
-    ) -> SFResult<serde_json::Value> {
-        let role_name = if let Some(ref skill) = self.config.skill_config {
-            skill.name.clone()
-        } else {
-            self.config.role.to_string()
-        };
-
+    /// 这一趟最后交付什么。
+    ///
+    /// 只有两种出口：想里带着 JSON 交付物，就用它；没有，那句想本身就是交付物。
+    /// 这里的形状曾经还有一个出口——再问一次模型把想改写成 JSON——那条路买不到
+    /// 结构，只买到一个回合的等待和一句话的转述，已经去掉。
+    fn build_result(&mut self, thought: &str) -> SFResult<serde_json::Value> {
         // Many reasoning-first models (e.g. kimi-k2.6) already emit the answer
         // as JSON inside the thinking stream. Re-use it directly to avoid a
         // second `response_format: json_object` call that can stall or hang.
@@ -2882,73 +2905,24 @@ impl AgentRuntime {
             return Ok(parsed);
         }
 
+        // 想里没有可交付的 JSON：那句想就是答案，不再为它买第二次模型调用。
+        //
+        // 这里原先会再问一次模型「把上面这段想法改写成 JSON」。那一次调用买不到
+        // 任何结构——它没有 schema，返回的键由模型自己起，线上实测回来的是
+        // `{"role":"employee","thought":"…"}`，也就是同一句话换了个壳——代价却是
+        // 又等一个回合、又记一次账。与人对一句话，读者看见的还因此不是它说的
+        // 那句，而是模型对自己那句话的转述。
+        //
+        // 没有结构的答案下游本来就会读：`{ "result": thought }` 正是那次调用失败
+        // 或超时时一直在用的形状（`try_extract_change_artifact` 就按它取产出），
+        // 所以去掉这一次调用不新增一种结局，只是把最常见的那条路走成它一直在用的
+        // 兜底。
         tracing::info!(
             agent_id = %self.config.agent_id,
-            "AgentRuntime build_result could not extract JSON; falling back to LLM reformat"
+            thought_len = %thought.len(),
+            "AgentRuntime build_result has no JSON deliverable; the thought is the result"
         );
-
-        // Fallback: ask the model to reformat the thought as JSON. Use plain
-        // text mode with a tight timeout so a stuck provider cannot block the
-        // whole squad execution.
-        let user_msg = Message::user(format!(
-            "Convert the following thought into a compact JSON object.\n\nRole: {}\nThought: {}\n\nReturn only a JSON object.",
-            role_name, thought
-        ));
-
-        let options = cog_core::ChatOptions {
-            response_format: cog_core::ResponseFormat::Text,
-            max_tokens: Some(1024),
-            temperature: Some(0.1),
-            ..Default::default()
-        }
-        .with_actor(&self.actor_label());
-        let options = self.stamp_task(options);
-
-        match tokio::time::timeout(REFORMAT_TIMEOUT, llm.chat(&[user_msg], &options)).await {
-            Ok(Ok(response)) => {
-                // The reformat is a billed call like any other turn; leaving it
-                // out would understate the runs that needed it, which are the
-                // ones whose answer came out of a fallback.
-                self.run_usage.add(&response.usage);
-                self.note_context_overrun(response.usage.input).await;
-                let text: String = response
-                    .content
-                    .iter()
-                    .filter_map(|b| b.as_text())
-                    .collect::<Vec<_>>()
-                    .join("");
-                let text = if !text.is_empty() {
-                    text
-                } else {
-                    response
-                        .content
-                        .iter()
-                        .filter_map(|b| b.as_thinking())
-                        .collect::<Vec<_>>()
-                        .join("")
-                };
-                if let Some(parsed) = deliverable_in(&text) {
-                    return Ok(parsed);
-                }
-                Ok(serde_json::json!({ "result": text }))
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    agent_id = %self.config.agent_id,
-                    error = %e,
-                    "AgentRuntime build_result LLM reformat failed; falling back to raw thought"
-                );
-                Ok(serde_json::json!({ "result": thought }))
-            }
-            Err(_) => {
-                tracing::warn!(
-                    agent_id = %self.config.agent_id,
-                    "AgentRuntime build_result LLM reformat timed out after {}s; falling back to raw thought",
-                    REFORMAT_TIMEOUT.as_secs()
-                );
-                Ok(serde_json::json!({ "result": thought }))
-            }
-        }
+        Ok(serde_json::json!({ "result": thought }))
     }
 
     /// 报一次「这一问的 prompt 比配置的上下文窗口还大」。
@@ -4497,12 +4471,11 @@ mod tests {
     async fn a_finished_run_reports_its_token_census_against_its_task() {
         let spy = Arc::new(CensusSpy::default());
         let llm = CensusLlm {
-            // Not JSON: the draft goes through the deliverable-reformat call,
-            // so a second billed call lands in the same row.
             text: "the answer, in prose",
-            stream_usage: usage(300, 200, 500),
-            // No total reported, as some OpenAI-compatible upstreams do.
-            chat_usage: usage(100, 50, 0),
+            // No total reported, as some OpenAI-compatible upstreams do: the
+            // halves still have to make it into the row.
+            stream_usage: usage(300, 200, 0),
+            chat_usage: usage(0, 0, 0),
             error: false,
         };
         let mut runtime = census_runtime("census-ok").with_observability(spy.clone());
@@ -4516,16 +4489,16 @@ mod tests {
         assert_eq!(rows.len(), 1, "exactly one row for one task");
         let row = &rows[0];
         assert_eq!(row.task_id, "task-1");
-        assert_eq!(row.prompt_tokens, 400);
-        assert_eq!(row.completion_tokens, 250);
+        assert_eq!(row.prompt_tokens, 300);
+        assert_eq!(row.completion_tokens, 200);
         assert_eq!(
-            row.total_tokens, 650,
+            row.total_tokens, 500,
             "a call that reports only its halves still contributes its spend"
         );
         assert_eq!(row.iterations, 1);
         assert_eq!(
-            runtime.run_usage.llm_calls, 2,
-            "the reformat fallback is a billed call and must be counted"
+            runtime.run_usage.llm_calls, 1,
+            "一句没有结构的回答只值一次调用：再问一次只为把它包进花括号的那次已经没有了"
         );
     }
 
@@ -6013,6 +5986,88 @@ mod tests {
             result.to_string().contains("recorded its own verdict"),
             "the rewrite is the deliverable: {result}"
         );
+    }
+
+    /// 想里没有 JSON 的时候，那句想就是答案：不再为它买第二次模型调用。
+    ///
+    /// 这里曾经会再问一次模型「把上面这段想法改写成 JSON」。那一次调用没有
+    /// schema，回来的键由模型自己起——线上看到的就是同一句话换了个壳
+    /// （`{"role":"employee","thought":"…"}`）——代价却是一整个回合的等待和一次
+    /// 计费，而读者看见的还不是它说的那句。
+    ///
+    /// 判的是两次读数：模型只被调用一次；交付物就是它说的那句。
+    #[tokio::test]
+    async fn a_thought_that_is_not_json_is_delivered_without_a_second_call() {
+        let said = "变更账上没有未了结的那一条，我读过三本账。";
+        let llm = ScriptedReplyLlm::new(&[said]);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut runtime = AgentRuntime::new(
+            RuntimeConfig {
+                agent_id: "plain-answer".into(),
+                role: "employee".into(),
+                ..Default::default()
+            },
+            tx,
+        );
+        let result = runtime
+            .run(serde_json::json!({ "task": "answer" }), &llm)
+            .await
+            .expect("一句没有结构的回答也是一句回答");
+        assert_eq!(
+            llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "没有结构的回答不该再买一次改写：第二次调用换不到任何字段，只换到一回合的等待"
+        );
+        assert_eq!(
+            result,
+            serde_json::json!({ "result": said }),
+            "交付物就是它说的那句，不是模型对自己那句话的转述"
+        );
+    }
+
+    /// 界面上那一轮交付的是说给人听的那一句，不是包着它的壳。
+    ///
+    /// 实测 2026-11-06：一位员工这样回答 `{"answer":"…"}`，屏幕上读到的是花括号，
+    /// 从回信地址收到它的同事读到的是第二层转义（`reply` 里又是一段 JSON）。
+    /// 壳只在交付那一刻拆一次，所有读者读到的就是同一句话。
+    #[tokio::test]
+    async fn a_conversation_delivers_the_sentence_out_of_its_json_shell() {
+        let said = "告警亮着一条，是 orion 的心跳。";
+        let shelled = format!(r#"{{"answer":"{said}"}}"#);
+        let llm = ScriptedReplyLlm::new(&[shelled.as_str()]);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut runtime = AgentRuntime::new(
+            RuntimeConfig {
+                agent_id: "shelled-answer".into(),
+                role: "employee".into(),
+                ..Default::default()
+            },
+            tx,
+        );
+        let result = runtime
+            .run_conversation(vec![Message::user("现在有告警吗")], &llm)
+            .await
+            .expect("一轮对话");
+        assert_eq!(
+            result["reply"],
+            serde_json::json!(said),
+            "交付出去的还是那个壳：屏幕上读到花括号，同事收到的是转义的 JSON"
+        );
+    }
+
+    /// 一段真的以 JSON 为内容的回答不会被当成壳拆掉。
+    #[test]
+    fn a_deliverable_is_not_mistaken_for_a_shell() {
+        let deliverable = r#"{"version":2,"enabled":true}"#;
+        assert_eq!(plain_answer(deliverable), deliverable, "两个键的对象不是壳");
+        let two_fields = r#"{"role":"employee","thought":"一句话"}"#;
+        assert_eq!(
+            plain_answer(two_fields),
+            two_fields,
+            "多键的对象不拆：拆了只剩其中一个键"
+        );
+        assert_eq!(plain_answer(r#"{"reply":"一句话"}"#), "一句话");
+        assert_eq!(plain_answer("就是一句话"), "就是一句话");
     }
 
     /// The rewrite is one attempt, not a loop. A model that answers with the
