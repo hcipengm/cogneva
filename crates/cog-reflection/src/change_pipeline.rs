@@ -3391,10 +3391,10 @@ impl ChangePipeline {
                 }
             }
         };
-        let mut test_output = format!(
+        let mut test_output =
             "这条变更只碰 web/src/**：Rust 的格式化、linter 与套件判的是它没有写的东西，\
              所以没跑；判它的是前端构建与读 web/src 的那几道门。"
-        );
+                .to_string();
         let note = gates.note();
         if !note.is_empty() {
             test_output.push_str(&format!("\n{note}"));
