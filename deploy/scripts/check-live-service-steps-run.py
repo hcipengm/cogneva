@@ -42,9 +42,20 @@ framing question is different -- they may legitimately depend on a build that
 has not broken -- and a gate that demanded `!cancelled()` of every step would
 turn one compile error into a hundred red steps and be switched off.
 
+2026-11-06: the sixty-four live checks moved out of sixty-four steps into one
+step that runs `deploy/scripts/check-live-services.sh`, so the shape being
+judged changed places. A single step cannot be skipped part-way: either the
+script runs and every check in it runs, or the step is skipped and all sixty-four
+are skipped at once -- which the `if:` below still forbids. What replaces the
+per-step count is that the script itself does not stop at the first red: it has
+no `set -e`, and the population it carries is counted here from the file, so a
+list that quietly shrinks to three checks is still refused. The count moved with
+the population; it did not disappear.
+
 The population is every workflow under `.github/workflows`, every job, every
 step, read through a YAML parser rather than by matching lines: the shape being
-judged is a property of a step, and a step is not a line.
+judged is a property of a step, and a step is not a line. The live checks that
+are no longer steps are read from `LIVE_CHECKS`, which the workflow must call.
 """
 
 import sys
@@ -62,11 +73,18 @@ LIVE_MARKERS = ("COGNEVA_TEST_DATABASE_URL", "COGNEVA_TEST_REDIS_URL")
 # The conditions under which GitHub runs a step whose predecessors failed.
 SURVIVES_A_FAILURE = ("!cancelled()", "always()")
 
+# The scripts that carry the live checks now that they are not steps. The
+# workflow must call the first one; the second is the wrapper each entry runs
+# through, whose annotations the job summary reads.
+LIVE_CHECKS = Path("deploy/scripts/check-live-services.sh")
+LIVE_ENTRY = "live_check "
+
 # The floor is not the count -- that moves every time a test is added. It is
 # that the walk found a workflow at all: a reader that stops matching reports
 # an empty population as agreement.
 MIN_STEPS = 100
 MIN_LIVE_STEPS = 30
+MIN_LIVE_CHECKS = 30
 
 
 def env_text(env):
@@ -90,10 +108,52 @@ def step_text(step, inherited):
     return "\n".join(parts)
 
 
+def live_checks():
+    """Every check in the list, and the reasons the list itself is refused.
+
+    The list is a script rather than sixty-four steps so that one file feeds
+    both the CI job and the sandbox's own gates. Two things about it are read
+    here rather than trusted: that it is what the workflow calls, and that it
+    does not stop at the first failure -- a `set -e` at the top would turn the
+    reddest run into the one that reported the least, which is the same defect
+    the per-step `if:` was added to stop, one level down.
+    """
+    if not LIVE_CHECKS.is_file():
+        return 0, [f"refusing: {LIVE_CHECKS} does not exist -- the live checks moved nowhere this gate can see"]
+
+    text = LIVE_CHECKS.read_text(encoding="utf-8")
+    count = sum(1 for line in text.splitlines() if line.startswith(LIVE_ENTRY))
+    problems = []
+    if count < MIN_LIVE_CHECKS:
+        problems.append(
+            f"refusing: {LIVE_CHECKS} carries {count} live checks, fewer than the {MIN_LIVE_CHECKS} "
+            "this gate found the day the list was written -- a list that shrank reports agreement "
+            "for the checks it no longer has"
+        )
+    for line in text.splitlines():
+        options = [token for token in line.split() if token.startswith("-")] if line.startswith("set ") else []
+        if any("e" in option for option in options):
+            problems.append(
+                f"{LIVE_CHECKS}: `{line}` stops the script at the first red, so one failure hides "
+                "every check after it -- the shape this gate exists to forbid"
+            )
+    return count, problems
+
+
+def live_list_is_called(examined_steps):
+    """Whether some step runs the list, so the checks are reachable at all."""
+    for step in examined_steps:
+        if LIVE_CHECKS.name in str(step.get("run") or ""):
+            return True
+    return False
+
+
 def main():
     if not WORKFLOWS.is_dir():
         sys.exit(f"refusing: {WORKFLOWS} is not a directory")
 
+    checked, list_problems = live_checks()
+    steps = []
     examined = 0
     live = 0
     offenders = []
@@ -109,6 +169,7 @@ def main():
                 if not isinstance(step, dict):
                     continue
                 examined += 1
+                steps.append(step)
                 own = step_text(step, [])
                 text = "\n".join([own, *inherited])
                 if not any(marker in text for marker in LIVE_MARKERS):
@@ -139,14 +200,21 @@ def main():
             "this gate found the day it was written -- the walk has stopped finding them "
             "rather than the workflows having shrunk"
         )
-    if live < MIN_LIVE_STEPS:
+    if live < MIN_LIVE_STEPS and not live_list_is_called(steps):
         sys.exit(
-            f"refusing: found {live} live-service steps, fewer than the {MIN_LIVE_STEPS} this "
-            "gate found the day it was written -- a marker that stops matching lets every step "
-            "through while reporting agreement"
+            f"refusing: found {live} live-service steps and no step that runs {LIVE_CHECKS.name}, "
+            f"fewer than the {MIN_LIVE_STEPS} this gate found the day it was written -- either a "
+            "marker has stopped matching or the list has become unreachable, and both report "
+            "agreement for checks that never ran"
         )
+    # The steps are allowed to be few now -- one step runs the whole list -- so
+    # the floor is met by the list and the step count is reported beside it
+    # rather than folded into it.
 
-    if offenders:
+    if list_problems:
+        print("\n".join(list_problems))
+
+    if offenders or list_problems:
         print(
             "these steps open a connection to a live service and run only when every earlier "
             "step succeeded, so an unrelated failure skips them and the job summary cannot "
@@ -164,7 +232,10 @@ def main():
         )
         return 1
 
-    print(f"{live} live-service steps of {examined} run even when an earlier step failed")
+    print(
+        f"{live} live-service steps and {checked} listed checks, out of {examined} steps and "
+        "one list, run even when an earlier one failed"
+    )
     return 0
 
 

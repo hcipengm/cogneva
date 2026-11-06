@@ -194,19 +194,25 @@ const METADATA_TIMEOUT_SECS: u64 = 120;
 
 /// CI 那一族门禁整段活的墙钟界。
 ///
-/// 工作流里那 63 条判据在一个密封沙箱里逐个跑，实测合计 159 秒（含读源码树、
-/// 读渲染产物、起 python3 与 rustup）；最慢的一条 60 秒。这条与它不同量级是
-/// 故意的：宿主同时跑着多分钟的释放构建，安静时的读数只是下界。这个界是
-/// 「挂住了」的那条线，不是预算——一条门禁卡在这个数上时，判成没跑完比等它更
-/// 接近正确的判断。
+/// 工作流里那几十条判据在一个密封沙箱里逐个跑，其中一条是
+/// `deploy/scripts/check-live-services.sh`——需要真 PostgreSQL 与真 Redis 的那 64 条
+/// 检查。它是这一段的长尾：2026-11-06 实测 648 秒（热）／728 秒（冷），其余几条合计
+/// 159 秒（读源码树、读渲染产物、起 python3 与 rustup）。整段就是这两部分之和。
 ///
-/// 300 秒曾经够用，那时清单只认得 `bash deploy/scripts/check-` 一种写法，读出来
-/// 52 条、合计 70.7 秒；认全之后多出 python 判据、`.github/scripts/` 下的判据和
-/// 两条 `--check` 只判不写的脚本，安静时的读数就到了 159 秒。界只留 1.9 倍余量
-/// 时，忙起来的宿主会把尾巴上那几条门跳掉，而跳掉只是「没问过」——正是这一段
-/// 要消灭的那种沉默。
+/// 这个界是「挂住了」的那条线，不是预算——一段门禁卡在这个数上时，判成没跑完比等它
+/// 更接近正确的判断。1800 秒按实测那一段（约 890 秒）的两倍取，与下面那次抬界同一个
+/// 倍数：量级变了，界跟着量级走。
+///
+/// 它抬过两次，两次都是同一件事：清单里多了跑得更久的东西。300 秒曾经够用，那时清单
+/// 只认得 `bash deploy/scripts/check-` 一种写法，读出来 52 条、合计 70.7 秒；认全之后
+/// 多出 python 判据、`.github/scripts/` 下的判据和两条 `--check` 只判不写的脚本，
+/// 安静时的读数到了 159 秒，界抬到 600。再抬到 1800 是因为那 64 条从工作流里挪成了
+/// 一条门禁：它们原先在 CI 里是 test job 的 64 个 step，本地一条都没跑过（命令带着包名
+/// 与测试名，被记成「这棵树给不出来」而跳过），挪过来之后本地与上游判的是同一批命令。
+/// 界只留一点几倍余量时，忙起来的宿主会把尾巴上那几条门跳掉，而跳掉只是「没问过」
+/// ——正是这一段要消灭的那种沉默。
 // cap: bound — 整段门禁卡住时宁可判成没跑完
-const REPO_GATE_STAGE_WALL_SECS: u64 = 600;
+const REPO_GATE_STAGE_WALL_SECS: u64 = 1800;
 
 /// 一条变更跑几段门禁：判定那一段，以及红了之后读基线的那一段。
 // cap: bound — 判定一段 + 门禁失败后读基线一段
@@ -2105,12 +2111,14 @@ impl ChangePipeline {
         // CI 那一族门判的是整棵树，而它们住在壳脚本里，不进任何 crate 的测试
         // 目标——按包收窄的验证一条都执行不到。它们第一次开口就在落地二十分钟
         // 之后，那时主干已经往前走了几版，红的账记在别人头上。所以在这里把它们
-        // 跑一遍，代价是几十秒的壳脚本，换的是「这一版红了」在落地前就知道。
+        // 跑一遍，代价是几十秒的壳脚本加一段跑在共享目标目录上的用例，换的是
+        // 「这一版红了」在落地前就知道。
         //
         // 只在这一刻还绿着的时候跑：套件已经判红时，这条变更的去留不由门禁决定，
         // 跑它们只是把同一份时间再花一遍。
         if test_passed {
-            let gates = match Self::run_repo_gates(workdir, None).await {
+            let gates = match Self::run_repo_gates(workdir, None, self.target_dir.as_deref()).await
+            {
                 Ok(run) => run,
                 // 读不出工作流就等于说不出这一版被谁判过。这不退变更：退掉一条
                 // 变更要一条判据说它不行，而这里是一条判据根本没跑起来。
@@ -3787,7 +3795,11 @@ impl ChangePipeline {
     /// 不成立；`2` 是门自己说的「我跑不了」——缺依赖、缺文件、用法不对（这条约定
     /// 全树在用：`command -v python3 >/dev/null || { …; exit 2; }`）。第三支不读成
     /// 通过，也不读成失败：它记在读数里，读的人知道这一条**没被问过**。
-    async fn run_repo_gates(workdir: &Path, only: Option<&[String]>) -> SFResult<RepoGateRun> {
+    async fn run_repo_gates(
+        workdir: &Path,
+        only: Option<&[String]>,
+        target_dir: Option<&Path>,
+    ) -> SFResult<RepoGateRun> {
         let commands = Self::ci_gate_commands(workdir)?;
         let mut run = RepoGateRun {
             asked: Vec::new(),
@@ -3818,6 +3830,18 @@ impl ChangePipeline {
             cmd.args(&gate.argv[1..])
                 .current_dir(workdir)
                 .kill_on_drop(true);
+            // 门禁里现在有会编译的命令（`check-live-services.sh` 跑的是
+            // `cargo test -- --ignored`）。不给它目标目录，cargo 就在工作树里
+            // 按默认的 `target/` 从零编一遍整棵 workspace——那一段的时长从几十秒
+            // 变成十几分钟，而它编出来的东西与套件那一段刚编过的字节一模一样。
+            // 给的是同一个共享目录，指纹对得上，一条都不用重编。
+            //
+            // 只补这一条，不清空环境：门禁脚本读的是部署现场（`PATH`、套件那边的
+            // 测试库地址），而那段白名单是给**断言进程**用的——门禁判的是整棵树，
+            // 不是一条断言。
+            if let Some(dir) = target_dir {
+                cmd.env("CARGO_TARGET_DIR", dir);
+            }
             let output = match tokio::time::timeout(remaining, cmd.output()).await {
                 Ok(Ok(output)) => output,
                 // 启动不起来与门自己说「跑不了」是同一件事：这一条没被问过。差别只在
@@ -3861,7 +3885,8 @@ impl ChangePipeline {
     ) -> SFResult<BTreeSet<String>> {
         let names: Vec<String> = failing.iter().map(|(script, _)| script.clone()).collect();
         self.git_reset_hard(workdir, change_content).await?;
-        let baseline = Self::run_repo_gates(workdir, Some(&names)).await?;
+        let baseline =
+            Self::run_repo_gates(workdir, Some(&names), self.target_dir.as_deref()).await?;
         self.git_apply(workdir, change_content).await.map_err(|e| {
             SFError::IO(format!(
                 "could not put the change back after reading the tree's own gate failures: {e}"
@@ -7294,7 +7319,7 @@ index 1111111..2222222 100644
         )
         .unwrap();
 
-        let run = ChangePipeline::run_repo_gates(temp.path(), None)
+        let run = ChangePipeline::run_repo_gates(temp.path(), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -7345,7 +7370,7 @@ index 1111111..2222222 100644
         // 不给可执行位：这正是那条门在这台宿主上的样子。
         std::fs::write(scripts.join("check-no-exec.sh"), "#!/bin/sh\nexit 0\n").unwrap();
 
-        let run = ChangePipeline::run_repo_gates(temp.path(), None)
+        let run = ChangePipeline::run_repo_gates(temp.path(), None, None)
             .await
             .expect("一条启动不了的门不该让整段门禁报错");
         assert_eq!(run.passed, 1, "另一条门照样跑、照样过：{:?}", run.asked);

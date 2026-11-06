@@ -1,13 +1,19 @@
 //! principle: feedback_a_consumer_that_reads_literal_shape_needs_the_text_kept_in_that_shape_not_an_exception
-//! The workflow's `--ignored` steps and the workspace's ignore-marked tests
-//! have to name each other.
+//! The `--ignored` commands (in the workflow and in the live-check list) and
+//! the workspace's ignore-marked tests have to name each other.
 //!
 //! A test that needs something the default run does not have -- most often a
 //! server -- is marked so that `cargo test` skips it, and the only thing that
-//! ever runs it is a step in `.github/workflows/ci.yml` naming its binary. The
-//! local verification stage runs no `--ignored` step at all, so for the whole
-//! corpus the workflow is the only reader there is. Both directions of that
-//! pairing fail silently, and both have failed here:
+//! ever runs it is a command naming its binary. Those commands are written in
+//! two places and this contract reads both: a `run:` line in
+//! `.github/workflows/ci.yml`, and a `live_check` line in
+//! `deploy/scripts/check-live-services.sh`, which is where the live-service
+//! checks moved on 2026-11-06 so that the workflow job and the sandbox's own
+//! verification run the same list. Reading one of the two would report the
+//! other's tests as unread, and then be repaired by adding excuses rather than
+//! by restoring the read.
+//!
+//! Both directions of that pairing fail silently, and both have failed here:
 //!
 //! - The step outlives its tests. `--test <name>` fails when the file is
 //!   renamed or deleted, but not when the tests inside it are deleted, renamed,
@@ -24,7 +30,7 @@
 //! whose subject cannot be reached without a server, which is where the defects
 //! that no fixture catches live. So the check is written down here instead of
 //! being redone by hand: the ignore-marked set is read from the tree, the
-//! naming set is read from the workflow, and a site that is in neither a step
+//! naming set is read from both sources, and a site that is in neither a command
 //! nor the excused list below fails.
 //!
 //! The excused list is the place a decision goes, one line per site with its
@@ -39,8 +45,12 @@ use common::routes::{read_repo, repo_root, walk_files};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The workflow whose `--ignored` steps name the corpus.
+/// The workflow whose `run:` lines name part of the corpus.
 const WORKFLOW: &str = ".github/workflows/ci.yml";
+
+/// The list that names the rest: every live-service check, one line each,
+/// called by the workflow's `live` job and by the sandbox's own gates.
+const LIVE_CHECKS: &str = "deploy/scripts/check-live-services.sh";
 
 /// The wrapper a step hands its command to, so a red one says which test broke.
 ///
@@ -159,11 +169,11 @@ enum Target {
     Every,
 }
 
-/// One `cargo test ... -- --ignored` step in the workflow.
+/// One `cargo test ... -- --ignored` command in one of the two sources.
 #[derive(Debug)]
 struct Step {
-    /// 1-based line in the workflow, so a failure can point at it.
-    line: usize,
+    /// `file:line`, so a failure points at the command rather than at a name.
+    at: String,
     krate: String,
     target: Target,
 }
@@ -185,26 +195,64 @@ enum Site {
     Library,
 }
 
-/// The steps that ask for ignored tests, read from the workflow.
+/// Every command that asks for ignored tests, with where it is written.
 ///
-/// Every such step is understood or the read fails: a step this function
-/// skipped would be a step whose tests nothing checks, which is the hole.
-fn ignored_steps(workflow: &str) -> Vec<Step> {
-    let mut steps = Vec::new();
-    for (index, line) in workflow.lines().enumerate() {
-        let Some(command) = line.trim().strip_prefix("run:") else {
-            continue;
-        };
-        let command = command.trim();
-        let command = command.strip_prefix(STEP_WRAPPER).unwrap_or(command).trim();
-        if !command.split_whitespace().any(|word| word == "--ignored") {
-            continue;
+/// Two sources, two shapes. The workflow writes `run:` lines; the live-check
+/// list writes `live_check <service> '<name>' <command>` lines, because the
+/// name is what a reader of a red job summary needs and the service is what
+/// decides which of the two variables the script must find before it runs. The
+/// command is the same command either way -- the list does not add flags, it
+/// only moves the text.
+fn ignored_commands() -> Vec<(String, String)> {
+    let mut commands = Vec::new();
+    for (file, text) in [
+        (WORKFLOW, workflow()),
+        (LIVE_CHECKS, read_repo(LIVE_CHECKS)),
+    ] {
+        for (index, line) in text.lines().enumerate() {
+            let at = format!("{file}:{}", index + 1);
+            let command = if file == WORKFLOW {
+                let Some(command) = line.trim().strip_prefix("run:") else {
+                    continue;
+                };
+                let command = command.trim();
+                command
+                    .strip_prefix(STEP_WRAPPER)
+                    .unwrap_or(command)
+                    .trim()
+                    .to_string()
+            } else {
+                let Some(rest) = line.strip_prefix("live_check ") else {
+                    continue;
+                };
+                let Some((_, after)) = rest.split_once('\'') else {
+                    panic!("{at} is a `live_check` line with no quoted name, so this contract cannot find the command in it")
+                };
+                let Some((_, command)) = after.split_once("' ") else {
+                    panic!("{at} is a `live_check` line whose quoted name is not followed by a command")
+                };
+                command.trim().to_string()
+            };
+            if !command.split_whitespace().any(|word| word == "--ignored") {
+                continue;
+            }
+            commands.push((at, command));
         }
-        let lineno = index + 1;
+    }
+    commands
+}
 
+/// The steps that ask for ignored tests, read from both sources.
+///
+/// Every such command is understood or the read fails: a command this function
+/// skipped would be one whose tests nothing checks, which is the hole.
+fn ignored_steps() -> Vec<Step> {
+    let mut steps = Vec::new();
+    for (at, command) in ignored_commands() {
+        let command = command.as_str();
         let (selector, flags) = command.split_once(" -- ").unwrap_or_else(|| {
             panic!(
-                "{WORKFLOW}:{lineno} runs `{command}`, which asks for ignored tests without \
+                "{at} runs `{command}`, which asks for ignored tests without \
                  ever separating them from the selector with ` -- `. This contract reads that \
                  boundary, so a step spelled some other way has to be answered here rather \
                  than skipped: skipping it is how its tests leave the census."
@@ -218,7 +266,7 @@ fn ignored_steps(workflow: &str) -> Vec<Step> {
         // quiet without anyone editing it.
         if let Some(filter) = flags.iter().find(|word| !word.starts_with('-')) {
             panic!(
-                "{WORKFLOW}:{lineno} runs `{command}`, whose arguments after ` -- ` include the \
+                "{at} runs `{command}`, whose arguments after ` -- ` include the \
                  positional `{filter}`. cargo reads that as a test-name filter and exits 0 when \
                  it matches nothing, so renaming the test this step exists for would turn the \
                  step into one that passes having run nothing. Name the whole binary (`--test \
@@ -229,7 +277,7 @@ fn ignored_steps(workflow: &str) -> Vec<Step> {
         let words: Vec<&str> = selector.split_whitespace().collect();
         if words.len() < 3 || words[0] != "cargo" || words[1] != "test" {
             panic!(
-                "{WORKFLOW}:{lineno} runs `{command}`; this contract understands `cargo test` \
+                "{at} runs `{command}`; this contract understands `cargo test` \
                  invocations, and it has to understand every step that asks for ignored tests \
                  or the ones it does not are its blind spot."
             );
@@ -242,13 +290,13 @@ fn ignored_steps(workflow: &str) -> Vec<Step> {
                 "-p" | "--package" => krate = rest.next().copied(),
                 "--test" => {
                     let name = rest.next().copied().unwrap_or_else(|| {
-                        panic!("{WORKFLOW}:{lineno} runs `{command}` with `--test` and no name")
+                        panic!("{at} runs `{command}` with `--test` and no name")
                     });
                     target = Target::Binary(name.to_string());
                 }
                 "--lib" => target = Target::Library,
                 other => panic!(
-                    "{WORKFLOW}:{lineno} runs `{command}`, and this contract does not know what \
+                    "{at} runs `{command}`, and this contract does not know what \
                      `{other}` selects. It judges which tests a step runs, so an argument it \
                      cannot read is one it would quietly ignore -- teach it this shape rather \
                      than let the step be counted while nothing checks it."
@@ -258,16 +306,12 @@ fn ignored_steps(workflow: &str) -> Vec<Step> {
         let krate = krate
             .unwrap_or_else(|| {
                 panic!(
-                    "{WORKFLOW}:{lineno} runs `{command}` with no `-p <crate>`, so this contract \
+                    "{at} runs `{command}` with no `-p <crate>`, so this contract \
                      cannot tell which crate's tests the step names"
                 )
             })
             .to_string();
-        steps.push(Step {
-            line: lineno,
-            krate,
-            target,
-        });
+        steps.push(Step { at, krate, target });
     }
     steps
 }
@@ -495,13 +539,13 @@ fn the_marker_counts_only_in_attribute_position() {
 #[test]
 fn every_ignored_step_runs_something_that_is_still_ignored() {
     let root = repo_root();
-    let steps = ignored_steps(&workflow());
+    let steps = ignored_steps();
     assert!(
         !steps.is_empty(),
-        "read no `--ignored` step out of {WORKFLOW}. Either the workflow stopped asking for the \
-         ignored corpus -- in which case the tests it used to run are all unread now -- or this \
-         contract lost the shape it reads, and judging an empty set of steps would pass while \
-         covering nothing"
+        "read no `--ignored` command out of {WORKFLOW} or {LIVE_CHECKS}. Either both sources \
+         stopped asking for the ignored corpus -- in which case the tests they used to run are \
+         all unread now -- or this contract lost the shape it reads, and judging an empty set of \
+         steps would pass while covering nothing"
     );
 
     for step in &steps {
@@ -516,20 +560,20 @@ fn every_ignored_step_runs_something_that_is_still_ignored() {
             let file = dir.join("tests").join(format!("{name}.rs"));
             assert!(
                 file.is_file(),
-                "{WORKFLOW}:{} runs `cargo test -p {} {spelled} -- --ignored`, and {} does not \
+                "{} runs `cargo test -p {} {spelled} -- --ignored`, and {} does not \
                  exist. (cargo itself fails on this, so the step is not quiet -- but the \
                  message here names the pairing rather than a missing target.)",
-                step.line,
+                step.at,
                 step.krate,
                 file.display()
             );
             assert!(
                 contains_marker(&file),
-                "{WORKFLOW}:{} runs `cargo test -p {} {spelled} -- --ignored`, and {} holds no \
+                "{} runs `cargo test -p {} {spelled} -- --ignored`, and {} holds no \
                  test with the ignore marker. The step still exits 0: `--test <name> -- \
                  --ignored` with nothing to select is a pass that ran no test at all, which is \
                  the same as the step not being there, except that it looks like coverage.",
-                step.line,
+                step.at,
                 step.krate,
                 file.display()
             );
@@ -549,9 +593,9 @@ fn every_ignored_step_runs_something_that_is_still_ignored() {
             .collect();
         assert!(
             !held.is_empty(),
-            "{WORKFLOW}:{} runs `cargo test -p {} {spelled} -- --ignored`, and {} holds no test \
+            "{} runs `cargo test -p {} {spelled} -- --ignored`, and {} holds no test \
              with the ignore marker. The step passes having run nothing.",
-            step.line,
+            step.at,
             step.krate,
             scope.display()
         );
@@ -568,7 +612,7 @@ fn every_ignored_test_is_named_by_a_step_or_excused() {
          this tree. A census that reads nothing reports no gaps"
     );
 
-    let named = Named::from(&ignored_steps(&workflow()));
+    let named = Named::from(&ignored_steps());
     let unnamed: Vec<&str> = sites
         .iter()
         .filter(|site| !named.names(site))
@@ -577,7 +621,7 @@ fn every_ignored_test_is_named_by_a_step_or_excused() {
         .collect();
     assert!(
         unnamed.is_empty(),
-        "{unnamed:?} hold an ignored test and no step in {WORKFLOW} names them, so nothing runs \
+        "{unnamed:?} hold an ignored test and no command in {WORKFLOW} or {LIVE_CHECKS} names \
          them -- not the local stage, which runs no `--ignored` step, and not CI. Marked-ignored \
          reads in every output as a deliberate choice, which is why this is invisible from both \
          ends. Add the step that runs each one (see the live-DB steps for the shape), or add it \
@@ -590,7 +634,7 @@ fn every_ignored_test_is_named_by_a_step_or_excused() {
 #[test]
 fn an_excuse_survives_only_while_its_site_is_unnamed_and_still_ignored() {
     let sites = ignored_sites();
-    let named = Named::from(&ignored_steps(&workflow()));
+    let named = Named::from(&ignored_steps());
     for (path, reason) in UNNAMED {
         assert!(
             !reason.trim().is_empty(),
@@ -609,7 +653,8 @@ fn an_excuse_survives_only_while_its_site_is_unnamed_and_still_ignored() {
             });
         assert!(
             !named.names(site),
-            "{path} is excused here as one no step names, and a step in {WORKFLOW} names it now. \
+            "{path} is excused here as one no command names, and one in {WORKFLOW} or \
+             {LIVE_CHECKS} names it now. \
              The excuse is no longer true, and an excuse that is no longer true is where the \
              next unnamed test will hide: drop the entry."
         );
