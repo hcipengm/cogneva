@@ -224,6 +224,10 @@ RUN if [ -n "$APT_MIRROR_HOST" ]; then \
 # crun：buildah run 在沙盒内执行叠层校验命令（如 --version）所需的 OCI
 # 运行时；--no-install-recommends 不会随 buildah 装它，build/copy/push
 # 不需要运行时所以缺它一直没暴露，到 buildah run 才报 "exec: no command"。
+# shellcheck：变更验证里的「入口脚本」一格（deploy/scripts/check-entry-scripts.sh）
+# 就是全树 *.sh 的 shellcheck，而门禁判的是「跑不了」还是「跑了且红」——没有它，
+# 这一格在沙箱里恒为 exit 2，一段脚本都没扫过。CI 那侧由 ubuntu-latest 的 apt
+# 装同一个版本（24.04 上是 0.9.0），两边手上有的是同一把尺子。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
@@ -239,6 +243,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-yaml \
     buildah \
+    shellcheck \
     && rm -rf /var/lib/apt/lists/*
 
 # Install rustup/stable toolchain. 这一把与上面钉住的 RUST_TOOLCHAIN 无关、有意不同：

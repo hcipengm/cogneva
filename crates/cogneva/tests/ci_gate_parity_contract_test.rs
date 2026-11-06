@@ -126,14 +126,19 @@ const PARTLY_ENFORCED: &[(&str, &str, &str)] = &[
          and the stage's: the three blocks of body it used to be (shellcheck \
          over every tracked `*.sh`, the script tests, the PowerShell parse) are \
          one script now, called from this workflow and from the stage by the \
-         same line. The shellcheck section needs nothing but git and \
-         shellcheck, so it runs wherever the stage runs.",
-        "The other two sections need tools the build image does not carry: \
-         `promtool` for the alert-rule tests and `pwsh` for `bootstrap.ps1`. \
-         The script exits 2 -- \"I cannot run this\" -- and names them rather \
-         than reporting a green it did not reach, which is why the residue is \
-         visible instead of silent. A change that breaks a script test still \
-         passes verification.",
+         same line. Its shellcheck section needs git and shellcheck, and the \
+         image carries shellcheck for exactly this gate -- the first version of \
+         this row said the section ran wherever the stage runs while the image \
+         had no shellcheck in it, so the stage ran nothing at all for this job \
+         and recorded it as answered.",
+        "The other two sections need helm, kubectl, promtool, psql and pwsh, and \
+         the image carries none of them. psql and promtool have apt packages; \
+         helm, kubectl and pwsh do not, so there is no path to them that is not \
+         a download the cluster network does not reach. The script exits 2 -- \
+         \"I cannot run this\" -- and names every one, rather than reporting a \
+         green it did not reach, which is why the residue is visible instead of \
+         silent. Until the image carries the rest, a change that breaks one of \
+         the script tests still passes verification.",
     ),
     (
         "repo-conventions",

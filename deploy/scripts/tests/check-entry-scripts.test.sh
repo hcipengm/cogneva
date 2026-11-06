@@ -15,6 +15,9 @@
 #      不是手抄的名单。
 #   4. 工作流里不许再出现那三段正文，而且必须调这条脚本。两份正文会漂，漂了之后
 #      本地绿、上游红的差就回来了——那正是这次改动的起因。
+#   5. 镜像里装着 shellcheck。这一条是这一格的「有东西可判」：没有它，脚本在沙箱里
+#      恒为 exit 2，一段脚本都没扫过，而契约那一栏读起来像「跑了」——这正是这次
+#      改动要消灭的那种读数，所以钉在镜像的 Dockerfile 上。
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,8 +89,14 @@ if grep -q 'PSParser' "${WORKFLOW}"; then
   fail "工作流里还留着一份 bootstrap.ps1 解析正文"
 fi
 
+# 5：镜像里装着 shellcheck，这一格在沙箱里才有东西判。
+# 判的是运行段 apt 清单里的那一行；少一个字母就是恒 exit 2。
+if ! grep -qE '^[[:space:]]+shellcheck[[:space:]]*\\?$' "${ROOT}/Dockerfile"; then
+  fail "Dockerfile 的运行段没装 shellcheck：沙箱里的变更验证会在这一格恒为 exit 2，一段脚本都没扫过"
+fi
+
 if [ "${failures}" -gt 0 ]; then
   printf '%d 条不满足\n' "${failures}" >&2
   exit 1
 fi
-echo "ok: check-entry-scripts 是一份正文、两处调用，缺工具时点名并退 2"
+echo "ok: check-entry-scripts 是一份正文、两处调用，缺失点名退 2，镜像里有 shellcheck"
