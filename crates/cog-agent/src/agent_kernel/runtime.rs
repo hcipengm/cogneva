@@ -876,8 +876,11 @@ impl CheckoutProgress {
 /// circling, which is the failure the note exists to catch, so the list
 /// errs towards calling too much of the shell a write.
 fn changes_the_checkout(tool: &str, arguments: &serde_json::Value) -> bool {
-    if tool != "run_command" {
-        return tool == "write_file";
+    // A background command runs the same shell; it only answers sooner. Its
+    // command is read the same way, because what it does to the checkout is
+    // that command's business and not the handle's.
+    if tool != "run_command" && tool != "run_command_background" {
+        return tool == "write_file" || tool == "edit_file";
     }
     let command = arguments
         .get("command")
@@ -2465,10 +2468,7 @@ impl AgentRuntime {
                      every result is evicted the moment it arrives, so the run ends here \
                      instead of re-sending an identical request until the budget is spent"
                 );
-                self.note_run_ending(
-                    crate::observable::RunOutcome::Unreadable,
-                    iteration + 1,
-                );
+                self.note_run_ending(crate::observable::RunOutcome::Unreadable, iteration + 1);
                 self.emit_event(AgentEvent::AgentEnd {
                     agent_id: self.config.agent_id.clone(),
                     messages: self.published_messages(),
@@ -2502,10 +2502,7 @@ impl AgentRuntime {
                      been told twice; ending it here instead of spending the rest of the \
                      task's wall clock on more reads"
                 );
-                self.note_run_ending(
-                    crate::observable::RunOutcome::NoProgress,
-                    iteration + 1,
-                );
+                self.note_run_ending(crate::observable::RunOutcome::NoProgress, iteration + 1);
                 self.emit_event(AgentEvent::AgentEnd {
                     agent_id: self.config.agent_id.clone(),
                     messages: self.published_messages(),
@@ -6910,6 +6907,23 @@ mod tests {
     fn the_calls_that_change_the_checkout_are_read_off_the_call() {
         let cases: &[(&str, serde_json::Value, bool)] = &[
             ("write_file", serde_json::json!({ "path": "a.rs" }), true),
+            (
+                "edit_file",
+                serde_json::json!({ "path": "a.rs", "old_string": "a", "new_string": "b" }),
+                true,
+            ),
+            // 背景命令跑的是同一套 shell，改不改工作树取决于它跑的是什么——
+            // 与 `run_command` 同一把尺，而不是按工具名一律算写。
+            (
+                "run_command_background",
+                serde_json::json!({ "command": "grep -rn foo ." }),
+                false,
+            ),
+            (
+                "run_command_background",
+                serde_json::json!({ "command": "cargo fmt --edition 2021 a.rs" }),
+                true,
+            ),
             ("read_file", serde_json::json!({ "path": "a.rs" }), false),
             (
                 "run_command",

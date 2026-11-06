@@ -46,9 +46,9 @@ use root::repo_root;
 fn changes_the_workspace(tool: &cog_core::Tool) -> Option<bool> {
     use cog_core::{ShellOp, ToolImplementation};
     match &tool.implementation {
-        ToolImplementation::Shell(ShellOp::Command | ShellOp::WriteFile | ShellOp::EditFile) => {
-            Some(true)
-        }
+        ToolImplementation::Shell(
+            ShellOp::Command | ShellOp::CommandBackground | ShellOp::WriteFile | ShellOp::EditFile,
+        ) => Some(true),
         ToolImplementation::Shell(ShellOp::ReadFile) => Some(false),
         ToolImplementation::Native(_) | ToolImplementation::Wasm { .. } => NATIVE_EFFECTS
             .iter()

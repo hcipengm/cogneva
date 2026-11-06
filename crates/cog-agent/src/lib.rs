@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod agent_kernel;
 pub mod archive;
+pub mod background;
 pub mod config;
 pub mod consumer;
 pub mod context;

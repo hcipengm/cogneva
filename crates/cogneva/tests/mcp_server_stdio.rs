@@ -63,6 +63,7 @@ async fn the_binary_lists_its_tools_and_reads_a_file_on_request() {
     assert_eq!(
         names,
         vec![
+            "command_output",
             "edit_file",
             "http_request",
             "raw_fetch",
@@ -70,6 +71,7 @@ async fn the_binary_lists_its_tools_and_reads_a_file_on_request() {
             "read_file",
             "read_task_ledger",
             "run_command",
+            "run_command_background",
             "start_task",
             "web_fetch",
             "web_search",

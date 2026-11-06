@@ -47,7 +47,8 @@ use cog_storage::MemoryAgentRegistry;
 use cog_stream::MemoryMessageBackend;
 
 /// The names the whole built-in set answers to. Written out, not derived.
-const WHOLE_SET: [&str; 13] = [
+const WHOLE_SET: [&str; 15] = [
+    "command_output",
     "edit_file",
     "http_request",
     "list_agents",
@@ -56,6 +57,7 @@ const WHOLE_SET: [&str; 13] = [
     "read_file",
     "read_task_ledger",
     "run_command",
+    "run_command_background",
     "send_to_agent",
     "start_task",
     "web_fetch",
@@ -121,7 +123,7 @@ fn the_whole_builtin_set_is_registered_by_one_constructor() {
     let expected: Vec<String> = WHOLE_SET.iter().map(|n| (*n).to_string()).collect();
     assert_eq!(
         names, expected,
-        "the built-in set is the thirteen named tools; a tool added or dropped here is a \
+        "the built-in set is the fifteen named tools; a tool added or dropped here is a \
          change to what every caller of this process is offered"
     );
 }
@@ -183,11 +185,13 @@ fn a_missing_roster_removes_the_two_addressing_tools() {
 #[test]
 fn neither_serving_path_lays_out_its_own_tool_list() {
     let factories = [
+        "command_output",
         "edit_file",
         "read_file",
         "write_file",
         "read_task_ledger",
         "run_command",
+        "run_command_background",
         "raw_list",
         "raw_fetch",
         "http_request",

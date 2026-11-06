@@ -46,8 +46,14 @@ pub enum ToolImplementation {
 /// out of the agent's reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellOp {
-    /// Arguments: `command` (string).
+    /// Arguments: `command` (string), `timeout_seconds` (integer, optional).
     Command,
+    /// Arguments: `command` (string), `timeout_seconds` (integer, optional).
+    ///
+    /// The same request as [`ShellOp::Command`]; the difference is on the
+    /// caller's side: the tool answers with a handle instead of the output, and
+    /// the command is read later through the agent's own book of handles.
+    CommandBackground,
     /// Arguments: `path` (string).
     ReadFile,
     /// Arguments: `path`, `content` (strings).

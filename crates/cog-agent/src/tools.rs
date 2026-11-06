@@ -476,7 +476,7 @@ impl ToolRegistry {
                 })?;
                 let payload =
                     match op {
-                        cog_core::ShellOp::Command => {
+                        cog_core::ShellOp::Command | cog_core::ShellOp::CommandBackground => {
                             let command = arguments
                                 .get("command")
                                 .and_then(|v| v.as_str())
@@ -585,6 +585,42 @@ impl ToolRegistry {
                     timeout,
                     limits: Default::default(),
                 };
+                // 背景命令：把句柄先交出去，再把流接进那本账里。这一刻起读得到
+                // 的只有「已开、还没输出」——这正是对的，读者要能知道命令已经
+                // 发出去了，而不是等它说完第一句话才看见它存在。
+                if matches!(op, cog_core::ShellOp::CommandBackground) {
+                    let backend = backend.clone();
+                    let command = crate::background::open();
+                    let handle = command.handle().to_string();
+                    tokio::spawn(async move {
+                        match backend.execute_stream(&req).await {
+                            Ok(mut stream) => {
+                                let mut code = None;
+                                while let Some(event) = stream.next().await {
+                                    if let Some(status) = command.push(event) {
+                                        code = Some(status);
+                                    }
+                                }
+                                command.finish(match code {
+                                    Some(code) => crate::background::Ending::Exited(code),
+                                    // A stream that ends without a status says
+                                    // nothing about how the command ended, and
+                                    // reporting it as success would hide that.
+                                    None => crate::background::Ending::Failed(
+                                        "the executor's stream ended without an exit status".into(),
+                                    ),
+                                });
+                            }
+                            Err(e) => {
+                                command.finish(crate::background::Ending::Failed(e.to_string()))
+                            }
+                        }
+                    });
+                    return Ok(serde_json::json!({
+                        "handle": handle,
+                        "state": "running",
+                    }));
+                }
                 let mut stream = backend.execute_stream(&req).await?;
                 let mut stdout = String::new();
                 let mut stderr = String::new();
@@ -627,6 +663,15 @@ impl ToolRegistry {
                             Err(cog_core::SFError::IO(stderr).into())
                         }
                     }
+                    // Answered with a handle before this point; if that ever
+                    // stops being true, the caller must hear that the tool is
+                    // miswired rather than get an empty-looking success.
+                    cog_core::ShellOp::CommandBackground => Err(cog_core::SFError::Agent(
+                        "a background command is answered with a handle, not by waiting for its \
+                         output"
+                            .into(),
+                    )
+                    .into()),
                 }
             }
         }
@@ -2012,6 +2057,164 @@ mod tests {
         );
     }
 
+    /// A backend whose stream stays open until the test closes it.
+    ///
+    /// The point of the background path is what the caller gets while the
+    /// command is still running, and a stream that ends immediately cannot
+    /// show that: the answer and the end arrive together in either case.
+    struct OpenStream {
+        seen: tokio::sync::Mutex<Vec<SandboxPayload>>,
+        rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CommandEvent>>>,
+    }
+
+    impl OpenStream {
+        fn pair() -> (Arc<Self>, tokio::sync::mpsc::UnboundedSender<CommandEvent>) {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    seen: tokio::sync::Mutex::new(Vec::new()),
+                    rx: tokio::sync::Mutex::new(Some(rx)),
+                }),
+                tx,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for OpenStream {
+        async fn execute(&self, _req: &SandboxRequest) -> SFResult<cog_core::SandboxResult> {
+            Err(SFError::Agent(
+                "this backend answers as a stream; buffering it would hide the difference \
+                 the background path is about"
+                    .into(),
+            ))
+        }
+
+        async fn execute_stream(
+            &self,
+            req: &SandboxRequest,
+        ) -> SFResult<cog_core::CommandEventStream> {
+            self.seen.lock().await.push(req.payload.clone());
+            let rx = self.rx.lock().await.take().expect("one stream per backend");
+            Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })))
+        }
+
+        async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
+            Err(SFError::Agent("unsupported".into()))
+        }
+    }
+
+    fn background_registry() -> (
+        ToolRegistry,
+        Arc<OpenStream>,
+        tokio::sync::mpsc::UnboundedSender<CommandEvent>,
+    ) {
+        let (backend, tx) = OpenStream::pair();
+        let registry =
+            ToolRegistry::new().with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command_background());
+        cog_core::ToolRegistry::register(&registry, builtins::command_output());
+        (registry, backend, tx)
+    }
+
+    /// 发出去的长命令当场回句柄，然后边跑边读得到。
+    #[tokio::test]
+    async fn a_background_command_answers_with_a_handle_while_the_stream_is_still_open() {
+        let (registry, backend, tx) = background_registry();
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.execute(
+                "run_command_background",
+                serde_json::json!({"command": "cargo test --all"}),
+            ),
+        )
+        .await
+        .expect("流还开着时这次调用也必须已经回来：它要交的是句柄，不是输出")
+        .unwrap();
+
+        let handle = out["handle"].as_str().expect("回答里要带句柄").to_string();
+        assert_eq!(out["state"], "running");
+
+        // 命令还在跑，已经写出来的那一截读得到。
+        tx.send(CommandEvent::Stdout {
+            data: "compiling crate A\n".into(),
+        })
+        .unwrap();
+        let command = crate::background::get(&handle).expect("句柄一交出去就在账上");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while command.snapshot(0)["stdout"] == "" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("执行器写出来的东西要接进账里");
+
+        // 句柄先交出去，命令随后才真的送到执行器：账上有字的时候那条载荷
+        // 一定已经发过了。所以这条断言放在这里而不是上面。
+        {
+            let seen = backend.seen.lock().await;
+            assert!(
+                matches!(seen[0], SandboxPayload::Command { .. }),
+                "背景命令发的仍是 Command 载荷，差别只在调用方这侧"
+            );
+        }
+
+        let mid = registry
+            .execute("command_output", serde_json::json!({ "handle": handle }))
+            .await
+            .unwrap();
+        assert_eq!(mid["state"], "running");
+        assert_eq!(mid["stdout"], "compiling crate A\n");
+
+        // 结束之后取回退出码，游标之后没有新东西。
+        tx.send(CommandEvent::Stderr {
+            data: "warning: unused import\n".into(),
+        })
+        .unwrap();
+        tx.send(CommandEvent::Exit { code: 3 }).unwrap();
+        drop(tx);
+
+        let done = registry
+            .execute(
+                "command_output",
+                serde_json::json!({ "handle": handle, "wait_seconds": 5 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done["state"], "exited");
+        assert_eq!(done["exit_code"], 3);
+        assert_eq!(done["stderr"], "warning: unused import\n");
+
+        let cursor = done["next_offset"].as_u64().unwrap();
+        let again = registry
+            .execute(
+                "command_output",
+                serde_json::json!({ "handle": handle, "offset": cursor }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["stdout"], "", "游标之后没有新输出");
+    }
+
+    /// 没人开过的句柄按名字拒绝：空输出读起来像「命令什么都没说」。
+    #[tokio::test]
+    async fn a_read_of_a_handle_nobody_opened_is_refused_by_name() {
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(&registry, builtins::command_output());
+
+        let err = registry
+            .execute(
+                "command_output",
+                serde_json::json!({ "handle": "cmd-doesnotexist" }),
+            )
+            .await
+            .expect_err("没有这条命令，读它应当是失败而不是空输出");
+        assert!(err.to_string().contains("cmd-doesnotexist"), "{err}");
+    }
+
     #[tokio::test]
     async fn shell_commands_get_their_own_budget_not_the_wasm_one() {
         let backend = Arc::new(RecordingBackend::default());
@@ -2268,7 +2471,10 @@ pub mod builtins {
                           variable expansion, and scripts written via write_file are all \
                           supported. The command runs in the task's working directory; when \
                           a repository checkout is provisioned it is already rooted there, \
-                          so work on the repo in place instead of cloning it again."
+                          so work on the repo in place instead of cloning it again. For a \
+                          build or a test suite that takes minutes, use \
+                          run_command_background instead: it answers with a handle at once \
+                          and the turn goes on while the command runs."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -2287,6 +2493,85 @@ pub mod builtins {
                 "required": ["command"]
             }),
             implementation: ToolImplementation::Shell(cog_core::ShellOp::Command),
+        }
+    }
+
+    pub fn run_command_background() -> Tool {
+        Tool {
+            name: "run_command_background".into(),
+            description: "Start a shell command and answer at once with a handle, instead of \
+                          waiting for it to finish. Use it for builds and test suites that take \
+                          minutes: a foreground run holds the whole turn until it ends, while \
+                          this one keeps running in the task's working directory and the turn \
+                          goes on. Read its output and exit status with command_output."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Command to run" },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "How long this command may run in total, in seconds. \
+                                        Leave it out for the configured wall; a value above \
+                                        the wall is refused with the limit named"
+                    }
+                },
+                "required": ["command"]
+            }),
+            implementation: ToolImplementation::Shell(cog_core::ShellOp::CommandBackground),
+        }
+    }
+
+    pub fn command_output() -> Tool {
+        Tool {
+            name: "command_output".into(),
+            description: "Read what a background command started by run_command_background has \
+                          written, and how it ended. Leave `offset` out on the first read; after \
+                          that pass back the `next_offset` from the previous answer and you get \
+                          only what is new. `wait_seconds` waits that long for the command to \
+                          finish before answering -- without it the call answers immediately."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string",
+                        "description": "The handle run_command_background returned"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Byte cursor from a previous answer's next_offset; omit to read from the start"
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "How long to wait for the command to finish before answering; omit or 0 to answer now"
+                    }
+                },
+                "required": ["handle"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(|args| {
+                Box::pin(async move {
+                    let handle = args
+                        .get("handle")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| cog_core::SFError::Validation("handle required".into()))?;
+                    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let wait = args
+                        .get("wait_seconds")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let command = crate::background::get(handle).ok_or_else(|| {
+                        cog_core::SFError::Validation(format!(
+                            "no background command named {handle}: it was never started, or it \
+                             finished long enough ago that its output was let go"
+                        ))
+                    })?;
+                    command.wait(wait).await;
+                    Ok(command.snapshot(offset))
+                })
+            })),
         }
     }
 
@@ -2345,6 +2630,8 @@ pub mod builtins {
         cog_core::ToolRegistry::register(registry, write_file());
         cog_core::ToolRegistry::register(registry, edit_file());
         cog_core::ToolRegistry::register(registry, run_command());
+        cog_core::ToolRegistry::register(registry, run_command_background());
+        cog_core::ToolRegistry::register(registry, command_output());
         match inputs.http_client.clone() {
             Some(client) => cog_core::ToolRegistry::register(
                 registry,
