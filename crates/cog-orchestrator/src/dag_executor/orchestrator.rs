@@ -2387,10 +2387,36 @@ impl DagExecutor {
 
     /// Scan the DAG for tasks stalled in `Scheduled` since before
     /// `stall_before`.
+    ///
+    /// 存储权威模式下只读 `Scheduled` 那一列。判据只取决于同状态的行，读的范围
+    /// 就跟着判据走：2026-11-07 实测这道清扫在积压里每拍读回 2,707 行、每行一整
+    /// 份 JSONB，一次 1.15 秒，而它要找的是 `Scheduled` 里的 19 行。这笔开销不是
+    /// 一次性的——队列越深读得越多、读得越久，而清扫的节拍不变。
+    ///
+    /// 读不出那一列时退回整张图：少一个查询不会让判据错，只会让它贵，而贵不是
+    /// 「这一拍不清扫」的理由。
     pub async fn find_stalled_scheduled_tasks(
         &self,
         stall_before: chrono::DateTime<chrono::Utc>,
     ) -> Vec<Task> {
+        if let Some(be) = self.fg() {
+            match be
+                .dag_get_tasks_in_status(&self.workspace_id, TaskStatus::Scheduled)
+                .await
+            {
+                Ok(tasks) => {
+                    let ids: std::collections::HashSet<String> =
+                        Self::stalled_scheduled(&tasks, stall_before)
+                            .into_iter()
+                            .collect();
+                    return tasks.into_iter().filter(|t| ids.contains(&t.id)).collect();
+                }
+                Err(e) => tracing::debug!(
+                    error = %e,
+                    "cannot read the Scheduled column on its own; reading the whole graph to sweep it"
+                ),
+            }
+        }
         let tasks = self.all_tasks_unified().await;
         let ids: std::collections::HashSet<String> = Self::stalled_scheduled(&tasks, stall_before)
             .into_iter()
@@ -6684,6 +6710,40 @@ mod tests {
     /// 两者给同一个答案，差别只在库那边付多少：实测 2026-11-05，一个跑了一周
     /// 的工作区整表 9,990 行、一次读 2-5 秒，而库被限流到 76% 的 CFS 周期。这条
     /// 测试钉的是读的范围，因为答案正确不区分这两种读法——只有请求的字节数区分。
+    /// 停滞清扫读的是 `Scheduled` 那一列，不是整张图。
+    ///
+    /// 判据只取决于同状态的行：找的是「进了 `Scheduled` 又没人领」的那些，而
+    /// `Pending` 的两千多行连判据的第一个条件都不满足。实测 2026-11-07，积压里
+    /// 这一读是 2,707 行、一次 1.15 秒，而 `Scheduled` 只有 19 行；清扫的节拍不变，
+    /// 队列越深这一笔越贵。答案两种读法一样，钉的是读的范围。
+    #[tokio::test]
+    async fn the_stall_sweep_reads_only_the_scheduled_column() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-stall-read".into()).with_state_backend(backend.clone());
+
+        let mut stalled = Task::new("t-stalled", TaskType::DagNode, serde_json::json!({}));
+        stalled.status = TaskStatus::Scheduled;
+        stalled.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        let mut waiting = Task::new("t-waiting", TaskType::DagNode, serde_json::json!({}));
+        waiting.status = TaskStatus::Pending;
+        backend.tasks.lock().await.extend([stalled, waiting]);
+
+        let found = dag
+            .find_stalled_scheduled_tasks(chrono::Utc::now() - chrono::Duration::minutes(10))
+            .await;
+        assert_eq!(found.len(), 1, "只有那一条进了 Scheduled 又过了窗");
+        assert_eq!(found[0].id, "t-stalled");
+        assert_eq!(
+            backend.wide_reads(),
+            0,
+            "积压里整表读一次一秒多，清扫每拍都付一次，付的是一整个控制面的响应"
+        );
+        assert!(
+            backend.narrow_reads() >= 1,
+            "这一问至少要读一次 Scheduled 那些行"
+        );
+    }
+
     #[tokio::test]
     async fn the_lease_heartbeat_reads_only_rows_that_can_still_run() {
         let backend = Arc::new(CountingTaskStore::default());
