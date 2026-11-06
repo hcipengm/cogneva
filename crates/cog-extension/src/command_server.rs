@@ -7,7 +7,9 @@
 //! commands may use full shell syntax by design.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -19,6 +21,7 @@ use axum::{
 };
 use cog_core::{CommandEvent, SFError, SandboxPayload};
 use futures::StreamExt;
+use prometheus::{Encoder, HistogramOpts, HistogramVec, IntGaugeVec, Opts, Registry, TextEncoder};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -38,6 +41,11 @@ struct AppState {
     /// See [`crate::runtime::local::builds_the_tree`] for what this bounds and
     /// why a bound is owed at all.
     build_slots: Arc<tokio::sync::Semaphore>,
+    /// What each request cost the executor. Owned by the state rather than by
+    /// the workdir router, because a deployment without one still runs file
+    /// operations, and a latency reading that existed only on some deployments
+    /// would be quoted as if it covered all of them.
+    commands: Arc<CommandMetrics>,
 }
 
 /// How many commands may compile at once when the deployment names none.
@@ -139,9 +147,217 @@ fn error_response(status: StatusCode, message: String) -> Response {
         .expect("static response")
 }
 
+/// The executor's own timing of what it was asked to do.
+///
+/// Nothing else times this side of a tool call. A caller can span one from its
+/// first frame to its last, but that span also carries the queue in front of
+/// the request, the hop to this pod and the agent's own bookkeeping, so a slow
+/// tool and a slow path to the tool read the same. Taken at this boundary --
+/// request accepted to the last frame the caller received, or to the moment a
+/// file operation's answer is ready, since that work happens before its stream
+/// exists -- the number answers the question a latency report starts with, and
+/// answers it with the side that owns the wait.
+///
+/// Two labels rather than one. `tool` is which payload came in, named the way
+/// the agent names the tool that sends it -- so this joins to the bus's own
+/// tool readings without a translation table, and the request a background
+/// command keeps open for minutes is counted under the same name its caller
+/// used. `outcome` is there because a histogram of durations alone mixes a
+/// command that ran for nine minutes with a request that was refused in a
+/// microsecond and a stream the caller walked away from; the three mean
+/// opposite things about the sandbox and averaging them tells
+/// nobody which one happened.
+pub struct CommandMetrics {
+    registry: Registry,
+    seconds: HistogramVec,
+    in_flight: IntGaugeVec,
+}
+
+/// Buckets spanning a file write to a build that runs to its wall.
+///
+/// Placed where the answers divide rather than on round decades: under a
+/// second is file IO, a few seconds is a search or a checkout, tens of seconds
+/// is a compile, and the last edge is past the longest wall a caller can ask
+/// for, so a command that runs long lands in a bucket instead of leaving every
+/// long request to be counted in `+Inf` with the timeouts.
+const COMMAND_LATENCY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0,
+];
+
+/// How a request ended, as the `outcome` label spells it.
+///
+/// Four states, each one a different claim about the executor. `failed` is a
+/// command that ran and returned non-zero: the sandbox did its job. `refused`
+/// is a request that never reached a command -- an empty body, a build slot
+/// that could not be taken, a task worktree that would not resolve. `abandoned`
+/// is a caller that stopped reading: the command may still have run, and the
+/// duration is how long the caller waited, not how long the work took. Folding
+/// any of them into "not ok" would let a broken caller read as a broken sandbox.
+#[derive(Clone, Copy)]
+enum Outcome {
+    Ok = 1,
+    Failed = 2,
+    Refused = 3,
+    Abandoned = 4,
+}
+
+impl Outcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Ok => "ok",
+            Outcome::Failed => "failed",
+            Outcome::Refused => "refused",
+            Outcome::Abandoned => "abandoned",
+        }
+    }
+}
+
+impl CommandMetrics {
+    fn new() -> Self {
+        let registry = Registry::new();
+        // Names and labels are literals here, so a construction failure is a
+        // programming error rather than a deployment's condition; there is no
+        // configuration that could make it recoverable.
+        let seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "sandbox_command_seconds",
+                "Wall time from accepting a request to delivering its last frame, by payload kind",
+            )
+            .buckets(COMMAND_LATENCY_BUCKETS.to_vec()),
+            &["tool", "outcome"],
+        )
+        .expect("static metric name and labels");
+        let in_flight = IntGaugeVec::new(
+            Opts::new(
+                "sandbox_commands_in_flight",
+                "Requests the executor has accepted and not finished answering, by payload kind",
+            ),
+            &["tool"],
+        )
+        .expect("static metric name and labels");
+        registry
+            .register(Box::new(seconds.clone()))
+            .expect("metric registered once");
+        registry
+            .register(Box::new(in_flight.clone()))
+            .expect("metric registered once");
+        Self {
+            registry,
+            seconds,
+            in_flight,
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut buf = Vec::new();
+        if TextEncoder::new()
+            .encode(&self.registry.gather(), &mut buf)
+            .is_ok()
+        {
+            String::from_utf8_lossy(&buf).into_owned()
+        } else {
+            String::new()
+        }
+    }
+
+    fn observe(&self, tool: &str, outcome: Outcome, seconds: f64) {
+        self.seconds
+            .with_label_values(&[tool, outcome.as_str()])
+            .observe(seconds);
+    }
+}
+
+/// One request's reading, recorded when it is dropped.
+///
+/// Drop rather than an explicit end call because the two hard cases are the
+/// ones where no end call would run: a response stream the caller disconnects
+/// from, and a handler that returns early on an error. Both drop this, and both
+/// are exactly the requests whose absence from a latency reading would be
+/// mistaken for having been fast.
+struct CommandWatch {
+    metrics: Arc<CommandMetrics>,
+    tool: &'static str,
+    started: Instant,
+    /// Set once the request has a verdict; zero until then means the stream
+    /// ended without one, which is a caller that left.
+    outcome: Arc<AtomicU8>,
+}
+
+impl CommandWatch {
+    fn start(metrics: Arc<CommandMetrics>, tool: &'static str) -> Self {
+        metrics.in_flight.with_label_values(&[tool]).inc();
+        Self {
+            metrics,
+            tool,
+            started: Instant::now(),
+            outcome: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    fn mark(&self, outcome: Outcome) {
+        // Relaxed: this byte orders nothing else. The drop that reads it needs
+        // the value, not a fence -- the response body it arrives with was
+        // handed over before the write, and no other memory travels with it.
+        self.outcome.store(outcome as u8, Ordering::Relaxed);
+    }
+
+    /// Record the request as ended now, with a response that does not stream.
+    fn end(self, response: Response, outcome: Outcome) -> Response {
+        self.mark(outcome);
+        drop(self);
+        response
+    }
+}
+
+impl Drop for CommandWatch {
+    fn drop(&mut self) {
+        let outcome = match self.outcome.load(Ordering::Relaxed) {
+            1 => Outcome::Ok,
+            2 => Outcome::Failed,
+            3 => Outcome::Refused,
+            _ => Outcome::Abandoned,
+        };
+        self.metrics.in_flight.with_label_values(&[self.tool]).dec();
+        self.metrics
+            .observe(self.tool, outcome, self.started.elapsed().as_secs_f64());
+    }
+}
+
+/// The tool label for a payload: the agent's own name for what it asked for.
+fn tool_label(payload: &SandboxPayload) -> &'static str {
+    match payload {
+        SandboxPayload::Command { .. } => "run_command",
+        SandboxPayload::ReadFile { .. } => "read_file",
+        SandboxPayload::WriteFile { .. } => "write_file",
+        SandboxPayload::EditFile { .. } => "edit_file",
+        SandboxPayload::Wasm { .. } => "wasm",
+    }
+}
+
 fn stream_response(rx: tokio::sync::mpsc::Receiver<CommandEvent>) -> Response {
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|event| (event, rx))
+    ndjson_response(rx, None)
+}
+
+/// Serialize a command's events as NDJSON for the caller.
+///
+/// A watch handed in travels inside the stream's own state, so the span ends
+/// where the caller stops waiting: at the final event, or at the moment the
+/// connection closes with the command still writing. Neither is visible from
+/// the handler, which returns before the first frame is read.
+fn ndjson_response(
+    rx: tokio::sync::mpsc::Receiver<CommandEvent>,
+    watch: Option<CommandWatch>,
+) -> Response {
+    let stream = futures::stream::unfold((rx, watch), |(mut rx, watch)| async move {
+        let event = rx.recv().await?;
+        if let (Some(w), CommandEvent::Exit { code }) = (watch.as_ref(), &event) {
+            w.mark(if *code == 0 {
+                Outcome::Ok
+            } else {
+                Outcome::Failed
+            });
+        }
+        Some((event, (rx, watch)))
     })
     .map(|event| {
         let mut line = serde_json::to_string(&event).expect("CommandEvent serializes");
@@ -224,16 +440,23 @@ async fn execute_handler(
     State(state): State<AppState>,
     Json(req): Json<ExecuteRequest>,
 ) -> Response {
+    // The watch starts before routing, not after: resolving a worktree is the
+    // step that once cost six seconds of a first tool call, and a reading that
+    // began after it would have reported that call as fast.
+    let watch = CommandWatch::start(Arc::clone(&state.commands), tool_label(&req.payload));
     let timeout = effective_timeout(req.timeout_ms);
     let (workdir, cargo_target, worktree_claim) =
         match resolve_workdir(&state, req.task_id.as_deref()).await {
             Ok(resolved) => resolved,
-            Err(resp) => return *resp,
+            Err(resp) => return watch.end(*resp, Outcome::Refused),
         };
     match req.payload {
         SandboxPayload::Command { ref command } => {
             if command.trim().is_empty() {
-                return error_response(StatusCode::BAD_REQUEST, "empty command".into());
+                return watch.end(
+                    error_response(StatusCode::BAD_REQUEST, "empty command".into()),
+                    Outcome::Refused,
+                );
             }
             tracing::info!(
                 task_id = req.task_id.as_deref().unwrap_or(""),
@@ -252,9 +475,12 @@ async fn execute_handler(
                 // The semaphore is never closed in this process; a caller that
                 // lands here is told so rather than run unbounded.
                 Err(e) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("build slot unavailable: {e}"),
+                    return watch.end(
+                        error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("build slot unavailable: {e}"),
+                        ),
+                        Outcome::Refused,
                     )
                 }
             };
@@ -266,14 +492,22 @@ async fn execute_handler(
                 worktree_claim,
                 build_slot,
             ) {
-                Ok(rx) => stream_response(rx),
-                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                // The command's outcome is its own exit code, which arrives as
+                // the last event; the watch reads it there.
+                Ok(rx) => ndjson_response(rx, Some(watch)),
+                Err(e) => watch.end(
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    Outcome::Refused,
+                ),
             }
         }
         SandboxPayload::ReadFile { ref path } => {
             let anchored = workdir::anchor_path(workdir.as_deref(), path);
             let result = tokio::fs::read_to_string(&anchored).await;
-            stream_response(single_shot(result))
+            // A file operation's own result is already known here, so the
+            // watch is closed now rather than through the buffered stream.
+            let outcome = outcome_of(&result);
+            watch.end(stream_response(single_shot(result)), outcome)
         }
         SandboxPayload::WriteFile {
             ref path,
@@ -283,14 +517,15 @@ async fn execute_handler(
             if let Some(parent) = anchored.parent() {
                 if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                        return stream_response(single_shot(Err(e)));
+                        return watch.end(stream_response(single_shot(Err(e))), Outcome::Failed);
                     }
                 }
             }
             let result = tokio::fs::write(&anchored, content)
                 .await
                 .map(|_| String::new());
-            stream_response(single_shot(result))
+            let outcome = outcome_of(&result);
+            watch.end(stream_response(single_shot(result)), outcome)
         }
         SandboxPayload::EditFile {
             ref path,
@@ -306,12 +541,25 @@ async fn execute_handler(
                 .await
                 .map(|report| report.describe(path))
                 .map_err(std::io::Error::other);
-            stream_response(single_shot(result))
+            let outcome = outcome_of(&result);
+            watch.end(stream_response(single_shot(result)), outcome)
         }
-        SandboxPayload::Wasm { .. } => error_response(
-            StatusCode::BAD_REQUEST,
-            "executor does not run WASM payloads".into(),
+        SandboxPayload::Wasm { .. } => watch.end(
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "executor does not run WASM payloads".into(),
+            ),
+            Outcome::Refused,
         ),
+    }
+}
+
+/// The outcome label for a file operation's result, before it is buffered into
+/// the event stream the caller sees.
+fn outcome_of<T>(result: &std::io::Result<T>) -> Outcome {
+    match result {
+        Ok(_) => Outcome::Ok,
+        Err(_) => Outcome::Failed,
     }
 }
 
@@ -332,6 +580,11 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
         body.push_str(&crate::build_cache::render(router.build_cache()).await);
     }
     body.push_str(&crate::runtime::cgroup::render());
+    // What each payload cost, at the boundary that owns the wait. Rendered
+    // unconditionally: a deployment without a workdir router still runs file
+    // operations, and a latency reading that only existed on some deployments
+    // would be quoted as if it covered all of them.
+    body.push_str(&state.commands.render());
     // Document access is off unless a scope is configured, so its counters are
     // only worth rendering where something can move them.
     if let Some(hostdocs) = state.hostdocs.as_ref() {
@@ -387,6 +640,7 @@ pub fn router() -> Router {
         workdir: None,
         hostdocs: None,
         build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
+        commands: Arc::new(CommandMetrics::new()),
     })
 }
 
@@ -396,6 +650,7 @@ pub fn app_router_with_workdir(workdir: Arc<WorkdirRouter>) -> Router {
         workdir: Some(workdir),
         hostdocs: None,
         build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
+        commands: Arc::new(CommandMetrics::new()),
     })
 }
 
@@ -408,6 +663,7 @@ pub fn app_router_with_hostdocs(
         workdir,
         hostdocs: Some(hostdocs),
         build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
+        commands: Arc::new(CommandMetrics::new()),
     })
 }
 
@@ -749,6 +1005,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         workdir,
         hostdocs,
         build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
+        commands: Arc::new(CommandMetrics::new()),
     });
 
     tracing::info!(addr = %addr, "sandbox executor listening");
@@ -815,6 +1072,7 @@ mod tests {
             workdir: None,
             hostdocs: None,
             build_slots: Arc::new(tokio::sync::Semaphore::new(n)),
+            commands: Arc::new(CommandMetrics::new()),
         }
     }
 
@@ -1512,6 +1770,158 @@ mod tests {
                 "cogneva_loop_period_seconds{{loop=\"{probe}\"}} 30\n"
             )),
             "the loop period is missing from the scrape: {body}"
+        );
+    }
+
+    /// The reading a latency report starts with, taken at the only boundary
+    /// that can attribute the wait to the sandbox.
+    ///
+    /// One unlabeled histogram over every request would answer "the executor
+    /// averages forty seconds" by mixing a compile, a file read and a stream a
+    /// caller walked away from -- a number that moves when the traffic mix
+    /// moves and says nothing about any one request. So each kind below asserts
+    /// its own label pair, and the outcomes are asserted apart: a command that
+    /// ran and failed is not a request the executor refused, and neither is a
+    /// caller that stopped reading.
+    #[tokio::test]
+    async fn command_latency_is_recorded_per_tool_and_per_outcome() {
+        let addr = spawn_server().await;
+        let payload = |p: serde_json::Value| serde_json::json!({ "payload": p });
+
+        // Ran and succeeded.
+        events_of(
+            post(
+                addr,
+                payload(serde_json::json!({"type": "command", "command": "true"})),
+            )
+            .await,
+        )
+        .await;
+        // Ran and returned non-zero: the sandbox did its job.
+        events_of(
+            post(
+                addr,
+                payload(serde_json::json!({"type": "command", "command": "exit 7"})),
+            )
+            .await,
+        )
+        .await;
+        // A file operation that failed, which never enters a command stream.
+        events_of(
+            post(
+                addr,
+                payload(serde_json::json!({
+                    "type": "read_file",
+                    "path": "/nonexistent/cogneva-command-latency-probe",
+                })),
+            )
+            .await,
+        )
+        .await;
+        // Refused before anything ran: an empty command, and a payload this
+        // executor does not execute at all. A refusal is a plain body rather
+        // than a stream, so it is read as text.
+        post(
+            addr,
+            payload(serde_json::json!({"type": "command", "command": "   "})),
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+        post(
+            addr,
+            payload(serde_json::json!({"type": "wasm", "bytes": [], "entry": "main"})),
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+
+        let expected = [
+            "sandbox_command_seconds_count{outcome=\"ok\",tool=\"run_command\"} 1\n",
+            "sandbox_command_seconds_count{outcome=\"failed\",tool=\"run_command\"} 1\n",
+            "sandbox_command_seconds_count{outcome=\"failed\",tool=\"read_file\"} 1\n",
+            "sandbox_command_seconds_count{outcome=\"refused\",tool=\"run_command\"} 1\n",
+            "sandbox_command_seconds_count{outcome=\"refused\",tool=\"wasm\"} 1\n",
+            // The gauge has to come back down on its own: it is moved by the
+            // same drop that records the duration, and a request whose stream
+            // ended without that drop would leave a pod reading as permanently
+            // busy.
+            "sandbox_commands_in_flight{tool=\"run_command\"} 0\n",
+            "sandbox_commands_in_flight{tool=\"read_file\"} 0\n",
+        ];
+        // Polled rather than read once: the two streaming requests end with
+        // the caller's body, which the server drops just after the last frame
+        // reaches it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let body = loop {
+            let body = reqwest::Client::new()
+                .get(format!("http://{}/metrics", addr))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            if expected.iter().all(|line| body.contains(line))
+                || std::time::Instant::now() > deadline
+            {
+                break body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        for line in expected {
+            assert!(
+                body.contains(line),
+                "the scrape is missing `{line}`; it carried:\n{body}"
+            );
+        }
+    }
+
+    /// The label is a join key: a name only this file knows would leave the
+    /// reading impossible to line up with the agent's own tool call. The
+    /// spellings below are the registered tool names (`register_builtins`),
+    /// not this module's invention.
+    #[test]
+    fn tool_labels_are_the_names_the_agent_registers() {
+        let label = |p: SandboxPayload| tool_label(&p).to_string();
+        assert_eq!(
+            label(SandboxPayload::Command {
+                command: String::new()
+            }),
+            "run_command"
+        );
+        assert_eq!(
+            label(SandboxPayload::ReadFile {
+                path: String::new()
+            }),
+            "read_file"
+        );
+        assert_eq!(
+            label(SandboxPayload::WriteFile {
+                path: String::new(),
+                content: String::new()
+            }),
+            "write_file"
+        );
+        assert_eq!(
+            label(SandboxPayload::EditFile {
+                path: String::new(),
+                old_string: String::new(),
+                new_string: String::new(),
+                replace_all: false,
+            }),
+            "edit_file"
+        );
+        // Not a registered tool, and deliberately still labeled: the executor
+        // refuses these, and a refusal is a request that happened.
+        assert_eq!(
+            label(SandboxPayload::Wasm {
+                bytes: Vec::new(),
+                entry: String::new()
+            }),
+            "wasm"
         );
     }
 }
