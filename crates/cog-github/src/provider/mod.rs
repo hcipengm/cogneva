@@ -11,6 +11,15 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
+/// What one commit's own checks have said so far.
+#[derive(Debug, Clone, Default)]
+pub struct CiCheckReadings {
+    /// `(check name, conclusion)` for every check that had concluded.
+    pub concluded: Vec<(String, String)>,
+    /// Whether any check had not concluded when this was read.
+    pub pending: bool,
+}
+
 /// A client that never sends anything, for tests that only build a provider.
 ///
 /// A provider stores the client and does not touch it until a call is made, so
@@ -235,6 +244,21 @@ pub trait CodePlatformProvider: Send + Sync {
     ///
     /// Default: unsupported — providers return `None`.
     async fn ci_failed_checks_for_sha(&self, _sha: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+
+    /// The same reading as [`Self::ci_failed_checks_for_sha`], keeping what
+    /// that one throws away: each check's conclusion, and whether any had not
+    /// concluded when this was read.
+    ///
+    /// The names alone cannot tell a check that failed from a job that was
+    /// cancelled, and cannot say whether the other side of a comparison has
+    /// finished — both of which are the difference between a change that broke
+    /// the tree and one that was standing on a broken tree.
+    ///
+    /// Default: unsupported — providers return `None`, and the caller falls
+    /// back to the names-only reading.
+    async fn ci_check_readings_for_sha(&self, _sha: &str) -> Result<Option<CiCheckReadings>> {
         Ok(None)
     }
 

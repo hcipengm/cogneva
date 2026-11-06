@@ -22,6 +22,7 @@ use tracing::warn;
 
 use cog_core::{GeneratedChange, LandedSource, SFError, SFResult};
 
+use crate::ci_attribution::{attribute, Attribution};
 use crate::config::{BotIdentityConfig, GitHubIntegrationConfig, GiteeIntegrationConfig};
 use crate::contribution::ContributionController;
 use crate::error::{CogGitHubError, Result};
@@ -308,8 +309,9 @@ pub struct LandingRecord {
     /// simply old does not re-announce itself every pass.
     #[serde(default)]
     pub unlanded_reported: bool,
-    /// Whether this landing's red CI has already been traced to the commit it
-    /// was replayed onto. A latch for the same reason as `unlanded_reported`:
+    /// Whether it has already been said why this landing's red CI was not
+    /// answered with a revert — the red was the tree's, or the reading did not
+    /// say whose it was. A latch for the same reason as `unlanded_reported`:
     /// the record stays watched for as long as the window lasts, and the
     /// reading counts landings, not passes over one.
     #[serde(default)]
@@ -1320,38 +1322,68 @@ impl MainChannel {
     /// workspace gate already applies to tests, at the one place a conviction
     /// still costs a landed commit.
     ///
-    /// `false` whenever either side cannot be named: an unreadable attribution
-    /// is not an exoneration, so a change with no baseline keeps answering for
+    /// `Own` whenever either side cannot be named: an unreadable attribution is
+    /// not an exoneration, so a change with no baseline keeps answering for
     /// what it inherited. That is what the caller did before this existed, and
-    /// it stays the fallback.
+    /// it stays the fallback. The same name-based reading is what a provider
+    /// that cannot say *how* a check ended falls back to.
     ///
     /// Two reds on the same check name is not a claim that the change broke
     /// nothing inside it — a change can add a failure to a check that was
     /// already failing. The record keeps watching for exactly that case: once
     /// the tip is repaired, the same check failing again is a failure this
     /// change owns, and the next pass answers for it.
-    async fn ci_failure_is_inherited(&self, record: &LandingRecord) -> bool {
+    ///
+    /// The answer is three-valued rather than a boolean: see
+    /// [`crate::ci_attribution`] for the two readings that are not a verdict on
+    /// the change at all and used to convict it anyway.
+    async fn attribute_ci_failure(&self, record: &LandingRecord) -> Attribution {
+        if let Ok(Some(child)) = self
+            .provider
+            .ci_check_readings_for_sha(&record.landed_rev)
+            .await
+        {
+            let parent = match self.landed_parent_rev(&record.landed_rev).await {
+                Some(parent) => self
+                    .provider
+                    .ci_check_readings_for_sha(&parent)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            return attribute(&child, parent.as_ref());
+        }
+        // A provider that cannot say what a check concluded answers with the
+        // names alone: all it can be asked is whether each failing name was
+        // failing before, and it has nothing to say about either side having
+        // finished.
         let Ok(Some(failed_here)) = self
             .provider
             .ci_failed_checks_for_sha(&record.landed_rev)
             .await
         else {
-            return false;
+            return Attribution::Own;
         };
         if failed_here.is_empty() {
             // Nothing named failed, so there is nothing to attribute: the red
             // verdict came from a face that cannot name its checks.
-            return false;
+            return Attribution::Own;
         }
         let Some(parent) = self.landed_parent_rev(&record.landed_rev).await else {
-            return false;
+            return Attribution::Own;
         };
         let Ok(Some(failed_before)) = self.provider.ci_failed_checks_for_sha(&parent).await else {
-            return false;
+            return Attribution::Own;
         };
-        failed_here
+        if failed_here
             .iter()
             .all(|check| failed_before.contains(check))
+        {
+            Attribution::Inherited
+        } else {
+            Attribution::Own
+        }
     }
 
     async fn revert(&self, record: &LandingRecord) -> Result<String> {
@@ -1677,30 +1709,59 @@ pub async fn watch_landed(
                 // the change and returns nothing. Recording the outcome and
                 // re-driving generation from it cost more than nothing — both
                 // point the next round at a change that did not do this.
-                if channel.ci_failure_is_inherited(&record).await {
-                    if !record.inherited_ci_reported {
-                        tracing::warn!(
-                            change_id = %record.change.change_id,
-                            rev = %record.landed_rev,
-                            "landed change is red only on checks that were already failing on the \
-                             commit it was replayed onto; keeping the change and watching, since \
-                             reverting it would restore the tree that fails"
-                        );
-                        record.inherited_ci_reported = true;
-                        // `updated_at` is left alone: it is the clock the watch
-                        // window is measured from, and this is not a change to
-                        // what is being watched.
-                        if let Err(e) = save_record(&record).await {
+                match channel.attribute_ci_failure(&record).await {
+                    Attribution::Inherited => {
+                        if !record.inherited_ci_reported {
                             tracing::warn!(
                                 change_id = %record.change.change_id,
-                                error = %e,
-                                "could not latch the inherited-failure report; it will repeat \
-                                 next pass"
+                                rev = %record.landed_rev,
+                                "landed change is red only on checks that were already failing on \
+                                 the commit it was replayed onto; keeping the change and watching, \
+                                 since reverting it would restore the tree that fails"
                             );
+                            record.inherited_ci_reported = true;
+                            // `updated_at` is left alone: it is the clock the watch
+                            // window is measured from, and this is not a change to
+                            // what is being watched.
+                            if let Err(e) = save_record(&record).await {
+                                tracing::warn!(
+                                    change_id = %record.change.change_id,
+                                    error = %e,
+                                    "could not latch the inherited-failure report; it will repeat \
+                                     next pass"
+                                );
+                            }
+                            channel.note_inherited_ci_failure().await;
                         }
-                        channel.note_inherited_ci_failure().await;
+                        continue;
                     }
-                    continue;
+                    Attribution::Unanswerable => {
+                        // Nothing here names a failure of this change, or the
+                        // tree it landed on is still being read. Reverting on
+                        // either would delete work that did nothing wrong, so
+                        // the record stays watched and the watch window bounds
+                        // how long it can sit in this state.
+                        if !record.inherited_ci_reported {
+                            tracing::warn!(
+                                change_id = %record.change.change_id,
+                                rev = %record.landed_rev,
+                                "landed change is red, but the reading does not say the change \
+                                 did it — a check that never concluded, or a tree still being \
+                                 read; keeping the change and watching"
+                            );
+                            record.inherited_ci_reported = true;
+                            if let Err(e) = save_record(&record).await {
+                                tracing::warn!(
+                                    change_id = %record.change.change_id,
+                                    error = %e,
+                                    "could not latch the unattributable-failure report; it will \
+                                     repeat next pass"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    Attribution::Own => {}
                 }
 
                 // A fetch that failed is not an empty log. Collapsing the two
@@ -4541,13 +4602,27 @@ mod tests {
     /// the watch loop's own answer to an inherited failure depends on.
     struct NamedChecks {
         failed: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+        /// Revisions this provider can also say *how* each check ended for. A
+        /// revision absent here is one it can only name, which is the reading
+        /// every test written before this existed uses.
+        readings:
+            std::sync::Mutex<std::collections::HashMap<String, crate::provider::CiCheckReadings>>,
     }
 
     impl NamedChecks {
         fn new(failed: impl IntoIterator<Item = (String, Vec<String>)>) -> Self {
             Self {
                 failed: std::sync::Mutex::new(failed.into_iter().collect()),
+                readings: Default::default(),
             }
+        }
+
+        fn with_readings(
+            mut self,
+            readings: impl IntoIterator<Item = (String, crate::provider::CiCheckReadings)>,
+        ) -> Self {
+            self.readings = std::sync::Mutex::new(readings.into_iter().collect());
+            self
         }
     }
 
@@ -4579,6 +4654,12 @@ mod tests {
         }
         async fn ci_failed_checks_for_sha(&self, sha: &str) -> Result<Option<Vec<String>>> {
             Ok(self.failed.lock().unwrap().get(sha).cloned())
+        }
+        async fn ci_check_readings_for_sha(
+            &self,
+            sha: &str,
+        ) -> Result<Option<crate::provider::CiCheckReadings>> {
+            Ok(self.readings.lock().unwrap().get(sha).cloned())
         }
     }
 
@@ -4703,6 +4784,109 @@ mod tests {
             "a check the tip was passing and this revision fails is the change's to answer for"
         );
         assert_eq!(inherited_count(&metrics).await, 0.0);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 一个从未得出结论的检查不算改动自己的失败：取消的作业对代码没有判词。
+    ///
+    /// 2026-11-06 实测：一条只有 macOS 引导作业被 `cancelled` 的落地，树其它检查
+    /// 全绿，十六分钟后被 revert 了。
+    #[tokio::test]
+    async fn a_red_built_from_a_cancelled_job_is_not_charged_to_the_change() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let (repo, base, landed) = repo_with_parent().await;
+        let provider = Arc::new(
+            NamedChecks::new([
+                (landed.clone(), vec!["Bootstrap (macos)".to_string()]),
+                (base.clone(), Vec::new()),
+            ])
+            .with_readings([
+                (
+                    landed.clone(),
+                    crate::provider::CiCheckReadings {
+                        concluded: vec![
+                            ("Test".into(), "success".into()),
+                            ("Bootstrap (macos)".into(), "cancelled".into()),
+                        ],
+                        pending: false,
+                    },
+                ),
+                (
+                    base.clone(),
+                    crate::provider::CiCheckReadings {
+                        concluded: vec![
+                            ("Test".into(), "success".into()),
+                            ("Bootstrap (macos)".into(), "success".into()),
+                        ],
+                        pending: false,
+                    },
+                ),
+            ]),
+        );
+        let (chan, _metrics) = watching_at(repo.path(), provider);
+        save_landing_of("chg-cancelled", &landed).await;
+
+        watch_landed(&chan, None, None).await;
+
+        assert!(
+            load_record("chg-cancelled").await.is_some(),
+            "a job that never concluded says nothing about the code, so reverting on it \
+             deletes a change that did nothing wrong"
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 判词与被判的那棵树都还在跑时不许定罪：先红的可能是那条红本来就在那里。
+    #[tokio::test]
+    async fn a_red_compared_against_a_tree_still_being_read_waits() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let (repo, base, landed) = repo_with_parent().await;
+        let provider = Arc::new(
+            NamedChecks::new([
+                (
+                    landed.clone(),
+                    vec!["Test".to_string(), "Entry Scripts Lint".to_string()],
+                ),
+                (base.clone(), vec!["Test".to_string()]),
+            ])
+            .with_readings([
+                (
+                    landed.clone(),
+                    crate::provider::CiCheckReadings {
+                        concluded: vec![
+                            ("Test".into(), "failure".into()),
+                            ("Entry Scripts Lint".into(), "failure".into()),
+                        ],
+                        pending: false,
+                    },
+                ),
+                (
+                    base.clone(),
+                    crate::provider::CiCheckReadings {
+                        concluded: vec![("Test".into(), "failure".into())],
+                        pending: true,
+                    },
+                ),
+            ]),
+        );
+        let (chan, _metrics) = watching_at(repo.path(), provider);
+        save_landing_of("chg-pending-tree", &landed).await;
+
+        watch_landed(&chan, None, None).await;
+
+        assert!(
+            load_record("chg-pending-tree").await.is_some(),
+            "the tree it landed on had not finished being read; the same check may yet fail \
+             there, which would make the red the tree's"
+        );
 
         std::env::remove_var("COGNEVA_DATA_DIR");
     }

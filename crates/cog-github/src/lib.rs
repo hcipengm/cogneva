@@ -29,6 +29,7 @@ pub const LABEL_STAGE: &str = "stage";
 pub const LABEL_REASON: &str = "reason";
 
 pub mod change_funnel;
+pub mod ci_attribution;
 pub mod ci_refusals;
 pub mod config;
 pub mod contribution;

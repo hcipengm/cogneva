@@ -14,9 +14,9 @@ use crate::config::GitHubAccount;
 
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
-    gateway_attach_root, http_fetch_attachment, AttachmentData, CiFailureEvent, CiJobLog,
-    CiRunSummary, CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue,
-    PlatformPullRequest, PullRequestDetail,
+    gateway_attach_root, http_fetch_attachment, AttachmentData, CiCheckReadings, CiFailureEvent,
+    CiJobLog, CiRunSummary, CodePlatformProvider, CreatePullRequest, PlatformComment,
+    PlatformIssue, PlatformPullRequest, PullRequestDetail,
 };
 
 /// Max failed jobs whose logs are fetched per run.
@@ -576,6 +576,20 @@ impl CodePlatformProvider for GitHubProvider {
                 .map(|(name, _)| name)
                 .collect(),
         ))
+    }
+
+    async fn ci_check_readings_for_sha(&self, sha: &str) -> Result<Option<CiCheckReadings>> {
+        let signals = self.check_run_signals(&self.owner, &self.repo, sha).await;
+        if !signals.saw_signal {
+            // No check runs at all: this repository reports CI through commit
+            // statuses, or the query failed. Neither can say what a check
+            // concluded.
+            return Ok(None);
+        }
+        Ok(Some(CiCheckReadings {
+            concluded: signals.completed,
+            pending: signals.pending,
+        }))
     }
 
     async fn ci_failure_log_for_sha(&self, sha: &str) -> Result<String> {
