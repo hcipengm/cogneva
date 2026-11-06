@@ -57,15 +57,16 @@ pub(crate) fn actor_input(
 /// 删的是 `context.input` 里那一份，因为另一份在 `context` 顶层或 `task.input`
 /// 里——读的人照旧读得到，模型看到的文字不多不少。只在逐字节相同时删：值不同
 /// 就是两个字段，不是一个字段的两份。
-fn drop_repeated_input(request: &serde_json::Value, mut context: serde_json::Value) -> serde_json::Value {
+fn drop_repeated_input(
+    request: &serde_json::Value,
+    mut context: serde_json::Value,
+) -> serde_json::Value {
     let Some(inner) = context.get("input").and_then(|i| i.as_object()) else {
         return context;
     };
     let mut repeated: Vec<String> = Vec::new();
     for (key, value) in inner {
-        let elsewhere_in_context = context
-            .get(key)
-            .is_some_and(|top| top == value);
+        let elsewhere_in_context = context.get(key).is_some_and(|top| top == value);
         let in_request = request
             .get("input")
             .and_then(|i| i.get(key))
@@ -534,7 +535,7 @@ mod tests {
     ///
     /// 判据是「这段字在这份请求里出现几次」，不是「这个字段叫什么」：字段名
     /// 会随任务的形状变，重复的字节不会。这条用例的题目就是那一件实测任务的
-    /// 形状——`goal` 与 `failure_log` 各 32 KB，两份就是整个请求的 43%。
+    /// 形状——`goal` 与 `failure_log` 实测各 32 KB，两份就是整个请求的 43%。
     #[test]
     fn a_context_input_copy_does_not_send_what_the_request_already_sends() {
         let goal = "修好 EVENT_BUS 指标没有播种的那条用例";

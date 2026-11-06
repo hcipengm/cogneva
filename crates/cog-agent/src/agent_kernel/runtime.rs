@@ -2407,10 +2407,7 @@ impl AgentRuntime {
                      every result is evicted the moment it arrives, so the run ends here \
                      instead of re-sending an identical request until the budget is spent"
                 );
-                self.note_run_ending(
-                    crate::observable::RunOutcome::Unreadable,
-                    iteration + 1,
-                );
+                self.note_run_ending(crate::observable::RunOutcome::Unreadable, iteration + 1);
                 self.emit_event(AgentEvent::AgentEnd {
                     agent_id: self.config.agent_id.clone(),
                     messages: self.published_messages(),
