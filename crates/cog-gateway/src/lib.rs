@@ -4874,6 +4874,7 @@ mod active_alert_merge_tests {
             exp: 0,
             iat: 0,
             jti: "test".to_string(),
+            token_use: cog_core::TokenUse::Access,
             preferred_username: username.to_string(),
             user_type: cog_core::UserType::Standard,
             workspace_ids: Vec::new(),

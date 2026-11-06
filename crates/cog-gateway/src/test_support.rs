@@ -17,6 +17,7 @@ pub(crate) fn claims(workspaces: &[&str]) -> cog_core::Claims {
         exp: 0,
         iat: 0,
         jti: "j".into(),
+        token_use: cog_core::TokenUse::Access,
         preferred_username: "tester".into(),
         user_type: cog_core::UserType::Standard,
         workspace_ids: workspaces.iter().map(|w| w.to_string()).collect(),

@@ -3,7 +3,7 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use uuid::Uuid;
 
 use crate::error::{AuthError, AuthResult};
-use cog_core::{Claims, Permission, Role, User, UserType};
+use cog_core::{Claims, Permission, Role, TokenUse, User, UserType};
 
 /// JWT configuration.
 #[derive(Debug, Clone)]
@@ -137,6 +137,7 @@ impl JwtManager {
             exp: access_exp.timestamp(),
             iat: now.timestamp(),
             jti: Uuid::new_v4().to_string(),
+            token_use: TokenUse::Access,
             preferred_username: user.username.clone(),
             user_type: user.user_type,
             workspace_ids: workspace_ids.clone(),
@@ -151,6 +152,7 @@ impl JwtManager {
             exp: refresh_exp.timestamp(),
             iat: now.timestamp(),
             jti: Uuid::new_v4().to_string(),
+            token_use: TokenUse::Refresh,
             preferred_username: user.username.clone(),
             user_type: user.user_type,
             workspace_ids,
@@ -185,8 +187,21 @@ impl JwtManager {
 
     /// Refresh an access token using a valid refresh token.
     /// Returns a new access token string.
+    ///
+    /// The token's kind is checked, not just its signature and expiry: an
+    /// access token presented here is refused, because the two kinds are
+    /// otherwise interchangeable.
     pub fn refresh_access_token(&self, refresh_token: &str) -> AuthResult<String> {
         let claims = self.verify_token(refresh_token)?;
+
+        // A valid access token is still the wrong kind of token here. Refusing
+        // it fails closed for tokens issued before `token_use` existed too:
+        // they decode as `TokenUse::Access` and never reach the exchange below.
+        if claims.token_use != TokenUse::Refresh {
+            return Err(AuthError::InvalidToken(
+                "expected a refresh token, got an access token".into(),
+            ));
+        }
 
         let now = Utc::now();
         let exp = now + Duration::minutes(self.config.access_token_ttl_minutes);
@@ -198,6 +213,7 @@ impl JwtManager {
             exp: exp.timestamp(),
             iat: now.timestamp(),
             jti: Uuid::new_v4().to_string(),
+            token_use: TokenUse::Access,
             preferred_username: claims.preferred_username,
             user_type: claims.user_type,
             workspace_ids: claims.workspace_ids,
@@ -310,12 +326,63 @@ mod tests {
         let user = test_user();
         let (access, refresh) = mgr.generate_token(&user, vec![], vec![]).unwrap();
 
+        assert_eq!(
+            mgr.verify_token(&refresh).unwrap().token_use,
+            TokenUse::Refresh
+        );
+
         let new_access = mgr.refresh_access_token(&refresh).unwrap();
         assert!(!new_access.is_empty());
         assert_ne!(new_access, access);
 
         let claims = mgr.verify_token(&new_access).unwrap();
         assert_eq!(claims.sub, user.id.to_string());
+        assert_eq!(claims.token_use, TokenUse::Access);
+    }
+
+    #[test]
+    fn refresh_with_access_token_is_refused() {
+        // The reproduction from gitee issue #34295240: a signed, unexpired
+        // access token handed to the refresh path must not buy a new one.
+        let mgr = JwtManager::new(test_config());
+        let user = test_user();
+        let (access, _) = mgr.generate_token(&user, vec![], vec![]).unwrap();
+
+        let err = mgr.refresh_access_token(&access).unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidToken(_)),
+            "access token must not be redeemable as a refresh token, got: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_token_without_token_use_is_an_access_token() {
+        let config = JwtConfig {
+            secret: "legacy-claims-test-secret".into(),
+            ..test_config()
+        };
+        let mgr = JwtManager::new(config.clone());
+        let user = test_user();
+        let (access, _) = mgr.generate_token(&user, vec![], vec![]).unwrap();
+
+        // Re-encode the same claims with the `token_use` claim stripped, which
+        // is the shape of a token issued before the field existed.
+        let claims = mgr.verify_token(&access).unwrap();
+        let mut value = serde_json::to_value(&claims).unwrap();
+        value.as_object_mut().unwrap().remove("token_use").unwrap();
+        let legacy = encode(
+            &Header::new(Algorithm::HS256),
+            &value,
+            &EncodingKey::from_secret(config.secret.as_bytes()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mgr.verify_token(&legacy).unwrap().token_use,
+            TokenUse::Access
+        );
+        let err = mgr.refresh_access_token(&legacy).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
     }
 
     #[test]
@@ -385,12 +452,37 @@ mod tests {
         let user = test_user();
         let (access, refresh) = mgr.generate_token(&user, vec![], vec![]).unwrap();
 
+        assert_eq!(
+            mgr.verify_token(&refresh).unwrap().token_use,
+            TokenUse::Refresh
+        );
+
         let new_access = mgr.refresh_access_token(&refresh).unwrap();
         assert!(!new_access.is_empty());
         assert_ne!(new_access, access);
 
         let claims = mgr.verify_token(&new_access).unwrap();
         assert_eq!(claims.sub, user.id.to_string());
+        assert_eq!(claims.token_use, TokenUse::Access);
+    }
+
+    #[test]
+    fn rs256_refresh_with_access_token_is_refused() {
+        let (private_pem, public_pem) = generate_test_rsa_keypair();
+        let config = JwtConfig {
+            private_key_pem: Some(private_pem),
+            public_key_pem: Some(public_pem),
+            ..test_config()
+        };
+        let mgr = JwtManager::new(config);
+        let user = test_user();
+        let (access, refresh) = mgr.generate_token(&user, vec![], vec![]).unwrap();
+
+        let err = mgr.refresh_access_token(&access).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+
+        // The genuine refresh token is still accepted.
+        assert!(!mgr.refresh_access_token(&refresh).unwrap().is_empty());
     }
 
     #[test]

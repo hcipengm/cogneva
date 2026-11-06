@@ -860,7 +860,14 @@ pub async fn refresh_handler(
         .await
     {
         Ok(t) => t,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        // `refresh_access_token` checks the token's kind, not just its
+        // signature and expiry, so an access token offered here is refused.
+        // Keep the existing 400 contract, but leave a trace: that refusal is
+        // worth seeing, and it otherwise looks like an ordinary expired session.
+        Err(e) => {
+            warn!("refresh token rejected: {e}");
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
     };
 
     (

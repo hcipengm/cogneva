@@ -158,6 +158,22 @@ impl RoleRequirement {
     }
 }
 
+/// What a token may be used for. Access and refresh tokens are signed the same
+/// way and carry the same claims, so without this discriminator a valid access
+/// token would also be redeemable at the refresh endpoint.
+///
+/// The serde default is `Access` on purpose: a token issued before this claim
+/// existed decodes as an access token and is therefore refused at the refresh
+/// endpoint. Defaulting to `Refresh` would keep legacy access tokens spendable
+/// there, which is the vulnerability itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenUse {
+    #[default]
+    Access,
+    Refresh,
+}
+
 /// JWT claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -167,6 +183,10 @@ pub struct Claims {
     pub exp: i64,
     pub iat: i64,
     pub jti: String,
+    /// Kind of token this is; absent in tokens issued before the claim existed,
+    /// which then read as [`TokenUse::Access`].
+    #[serde(default)]
+    pub token_use: TokenUse,
     pub preferred_username: String,
     pub user_type: UserType,
     pub workspace_ids: Vec<String>,
