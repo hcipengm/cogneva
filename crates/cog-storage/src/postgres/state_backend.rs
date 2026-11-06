@@ -49,6 +49,29 @@ pub const VENUE_TASKS_SQL: &str = r#"
       AND btrim(task->>'venue') <> ''
 "#;
 
+/// 一行任务从正文里读回来时，补上它被存进去时挂的那个工作区。
+///
+/// 工作区在列上，而正文里那一格在早期写进来的行上是空的（实测 2026-11-06：
+/// 一个工作区 9,920 行，其中 9,878 行这一格为空）。读的那一侧按**正文**那一格
+/// 判「这个读者能不能看这一行」：声明了自己工作区的读者看到 42 件，没声明的
+/// 看到 9,920 件，两个数都自称是「任务总数」。存哪一列是库的事，读者只该拿到
+/// 一个答案。
+fn row_task(value: serde_json::Value, workspace_id: &str) -> SFResult<cog_core::Task> {
+    let task: cog_core::Task = serde_json::from_value(value).map_err(SFError::Serialization)?;
+    Ok(stamp_workspace(&task, workspace_id))
+}
+
+/// 给一份任务补上它挂的工作区（那一格空着才补，写好的不覆盖）。
+///
+/// 写和读两头都走它：写的时候让正文与列一致，读的时候兜住早期写进来的行。
+fn stamp_workspace(task: &cog_core::Task, workspace_id: &str) -> cog_core::Task {
+    let mut out = task.clone();
+    if out.workspace_id.is_none() {
+        out.workspace_id = Some(workspace_id.to_string());
+    }
+    out
+}
+
 /// 完成 / 失败 / 取消一条任务前，先锁住它所在 workspace 的全部任务行。
 ///
 /// 这条语句同时被多个执行进程跑（同一个 workspace 下不止一个执行器在结算任务），
@@ -653,8 +676,7 @@ impl StateBackend for PostgresStateBackend {
                 .await
             })
             .await?;
-        row.map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
-            .transpose()
+        row.map(|(v,)| row_task(v, workspace_id)).transpose()
     }
 
     async fn dag_set_task(
@@ -663,7 +685,8 @@ impl StateBackend for PostgresStateBackend {
         task_id: &str,
         task: &cog_core::Task,
     ) -> SFResult<()> {
-        let value = serde_json::to_value(task)?;
+        // 正文里那一格与列是同一件事的两处写法：只写列，读的人按正文判就少看见行。
+        let value = serde_json::to_value(stamp_workspace(task, workspace_id))?;
         let status = status_str(&task.status);
         self.retry(|| async {
             sqlx::query(
@@ -694,7 +717,7 @@ impl StateBackend for PostgresStateBackend {
         expected: &[cog_core::TaskStatus],
         updated: &cog_core::Task,
     ) -> SFResult<()> {
-        let value = serde_json::to_value(updated)?;
+        let value = serde_json::to_value(stamp_workspace(updated, workspace_id))?;
         let new_status = status_str(&updated.status);
         let expected: Vec<&str> = expected.iter().map(status_str).collect();
 
@@ -742,7 +765,7 @@ impl StateBackend for PostgresStateBackend {
         updated: &cog_core::Task,
         owner: &str,
     ) -> SFResult<()> {
-        let value = serde_json::to_value(updated)?;
+        let value = serde_json::to_value(stamp_workspace(updated, workspace_id))?;
         let new_status = status_str(&updated.status);
         let expected: Vec<&str> = expected.iter().map(status_str).collect();
 
@@ -835,7 +858,7 @@ impl StateBackend for PostgresStateBackend {
             })
             .await?;
         rows.into_iter()
-            .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .map(|(v,)| row_task(v, workspace_id))
             .collect()
     }
 
@@ -860,7 +883,7 @@ impl StateBackend for PostgresStateBackend {
             })
             .await?;
         rows.into_iter()
-            .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .map(|(v,)| row_task(v, workspace_id))
             .collect()
     }
 
@@ -888,7 +911,7 @@ impl StateBackend for PostgresStateBackend {
             })
             .await?;
         rows.into_iter()
-            .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .map(|(v,)| row_task(v, workspace_id))
             .collect()
     }
 
@@ -916,7 +939,7 @@ impl StateBackend for PostgresStateBackend {
             })
             .await?;
         rows.into_iter()
-            .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .map(|(v,)| row_task(v, workspace_id))
             .collect()
     }
 
@@ -1255,9 +1278,8 @@ impl StateBackend for PostgresStateBackend {
 
         let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
             .into_iter()
-            .map(|(id, v)| serde_json::from_value(v).map(|t: cog_core::Task| (id, t)))
-            .collect::<Result<_, _>>()
-            .map_err(SFError::Serialization)?;
+            .map(|(id, v)| row_task(v, workspace_id).map(|t| (id, t)))
+            .collect::<Result<_, _>>()?;
 
         let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
             task_id: task_id.into(),
@@ -1311,7 +1333,7 @@ impl StateBackend for PostgresStateBackend {
             )
             .bind(workspace_id)
             .bind(task_id)
-            .bind(serde_json::to_value(t)?)
+            .bind(serde_json::to_value(stamp_workspace(t, workspace_id))?)
             .bind(status_str(&t.status))
             .execute(&mut *tx)
             .await
@@ -1347,9 +1369,8 @@ impl StateBackend for PostgresStateBackend {
 
         let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
             .into_iter()
-            .map(|(id, v)| serde_json::from_value(v).map(|t: cog_core::Task| (id, t)))
-            .collect::<Result<_, _>>()
-            .map_err(SFError::Serialization)?;
+            .map(|(id, v)| row_task(v, workspace_id).map(|t| (id, t)))
+            .collect::<Result<_, _>>()?;
 
         let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
             task_id: task_id.into(),
@@ -1415,7 +1436,7 @@ impl StateBackend for PostgresStateBackend {
             )
             .bind(workspace_id)
             .bind(id)
-            .bind(serde_json::to_value(t)?)
+            .bind(serde_json::to_value(stamp_workspace(t, workspace_id))?)
             .bind(status_str(&t.status))
             .execute(&mut *tx)
             .await
@@ -1448,9 +1469,8 @@ impl StateBackend for PostgresStateBackend {
 
         let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
             .into_iter()
-            .map(|(id, v)| serde_json::from_value(v).map(|t: cog_core::Task| (id, t)))
-            .collect::<Result<_, _>>()
-            .map_err(SFError::Serialization)?;
+            .map(|(id, v)| row_task(v, workspace_id).map(|t| (id, t)))
+            .collect::<Result<_, _>>()?;
 
         let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
             task_id: task_id.into(),
@@ -1515,7 +1535,7 @@ impl StateBackend for PostgresStateBackend {
             )
             .bind(workspace_id)
             .bind(id)
-            .bind(serde_json::to_value(t)?)
+            .bind(serde_json::to_value(stamp_workspace(t, workspace_id))?)
             .bind(status_str(&t.status))
             .execute(&mut *tx)
             .await
@@ -1779,6 +1799,31 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         .map_err(|e| SFError::Database(e.to_string()))?;
 
         Ok(rows.into_iter().map(promotion_record).collect())
+    }
+}
+
+#[cfg(test)]
+mod workspace_stamp_tests {
+    use super::stamp_workspace;
+    use cog_core::{Task, TaskType};
+
+    /// 空着就补，写好的不动。两半都要，因为补法反过来（覆盖）会把一行悄悄
+    /// 搬到另一个工作区去，而读面上那两个工作区都还在。
+    #[test]
+    fn the_stamp_fills_an_empty_field_and_leaves_a_written_one_alone() {
+        let unset = Task::new("t", TaskType::DagNode, serde_json::json!({}));
+        assert_eq!(unset.workspace_id, None);
+        assert_eq!(
+            stamp_workspace(&unset, "ws-row").workspace_id.as_deref(),
+            Some("ws-row")
+        );
+
+        let mut declared = unset.clone();
+        declared.workspace_id = Some("ws-own".to_string());
+        assert_eq!(
+            stamp_workspace(&declared, "ws-row").workspace_id.as_deref(),
+            Some("ws-own")
+        );
     }
 }
 

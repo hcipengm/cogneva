@@ -260,6 +260,17 @@ live_check db 'Live-DB workspace lock order' cargo test -p cog-storage --test wo
 # nothing has finished. A DB-free test can see neither half.
 live_check db 'Live-DB venue rows' cargo test -p cog-storage --test venue_tasks_are_the_only_rows_read -- --ignored
 live_check db 'Live-DB venue index' cargo test -p cog-storage --test venue_query_is_an_index_scan -- --ignored
+# A row names its workspace twice -- a column and a field in the payload -- and
+# rows written before the field was filled carry only the column. The gateway's
+# visibility check reads the field, so on 2026-11-06 a workspace of 9,920 rows
+# was reported to an authenticated reader as 42 tasks while the same query
+# without a declared workspace returned 9,920; both numbers called themselves
+# the total. Half of the fix is a read that fills the field from the column,
+# the other half a write that fills it, and the second half cannot be checked
+# through the backend's own reader once the first half exists -- so this case
+# reads the stored JSON directly. Both halves are the server's; a fixture
+# without a database can see neither.
+live_check db 'Live-DB task rows know their workspace' cargo test -p cog-storage --test a_task_read_back_knows_its_workspace -- --ignored
 # The claim is a count of commits per burst, and a stand-in has no commit
 # to count: the reading is whatever the server's own log says. An ignored
 # test whose file says how to run it still ran nowhere until a step named
