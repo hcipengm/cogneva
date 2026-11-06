@@ -1,3 +1,4 @@
+//! principle: feedback_a_queued_commit_rereads_its_bytes_each_attempt_but_keeps_the_pool_it_was_cut_in
 //! 已经放行、还没在账上落地的任务占着的额度。
 //!
 //! 配速的判据读的是账上已经花掉多少，而账只在一发调用**结束**之后才多一行。
@@ -111,6 +112,10 @@ impl PaceReservations {
 mod tests {
     use super::*;
 
+    /// 这条判据答的那条规则，逐字写在模块头上。
+    const PRINCIPLE: &str =
+        "feedback_a_queued_commit_rereads_its_bytes_each_attempt_but_keeps_the_pool_it_was_cut_in";
+
     fn started(names: &[&str]) -> std::collections::HashSet<String> {
         names.iter().map(|n| (*n).to_string()).collect()
     }
@@ -155,6 +160,107 @@ mod tests {
             held.held_tokens("a|m"),
             400,
             "only the job that has not landed yet is still holding room"
+        );
+    }
+
+    /// 排队中的提交每一轮重拍字节，但池的类别在放行那一刻就冻住了。
+    ///
+    /// 一件任务在账上落第一行之前会再来好几次，每一次都带着当下读到的那份预留
+    /// 量从这里走一遍：占位只留一个，取两者中较大的那份，所以「每一轮重拍字节」
+    /// 这一半是成立的——重来的那一轮改小了，占位不缩。
+    ///
+    /// 但池的类别（`upstream`，即 `base_url|model` 那把尺子）属于第一次放行：
+    /// 找到同名占位就只抬额度，不改 `upstream`、不改放行时刻。所以进程里那个
+    /// source 分类器事后改好，救不回已经入队的票；它冻住的是**票**，改好之后
+    /// 才排上队的票才按新的类别算。
+    ///
+    /// 丢了这个冻结，第二次放行到 `b|m` 会让 `held_tokens("a|m")` 掉到 0 而
+    /// `held_tokens("b|m")` 涨到 900——额度当场地从一家的窗口搬到另一家。
+    #[test]
+    fn a_queued_commit_rereads_its_bytes_each_attempt_but_keeps_the_pool_it_was_cut_in() {
+        let mut held = PaceReservations::default();
+        held.admit("t1", "a|m", 400, 1_000);
+        // 同一张票再来一轮，报的是当下读到的那份预留量。
+        held.admit("t1", "a|m", 900, 1_030);
+        // 再来一轮，这一次分类器已经改好，报的是 b|m。
+        held.admit("t1", "b|m", 900, 1_060);
+        assert_eq!(
+            held.held_tokens("a|m"),
+            900,
+            "字节重拍了，票的类别没重拍：这一轮仍然记在放行那一次冻住的 a|m 上"
+        );
+        assert_eq!(
+            held.held_tokens("b|m"),
+            0,
+            "一张已经入队的票不许被后一次分类搬到 b|m：那等于拿一家的额度关另一家的窗"
+        );
+        assert_eq!(
+            held.held
+                .iter()
+                .map(|h| h.upstream.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a|m"],
+            "占位只有一个，它的 upstream 出自放行那一次的实参，不是从任务当下的分类里重算的"
+        );
+
+        // 冻结属于票，不属于表：改好分类器之后才排上队的票，拿到的就是新类别。
+        held.admit("t2", "b|m", 500, 1_060);
+        assert_eq!(
+            held.held_tokens("b|m"),
+            500,
+            "一张冻住的票不该把后来入队的票也按旧类别算：冻结是每张票各自那一刻的分类"
+        );
+
+        // 冻住的额度也只按这张表本来就有的两条路离开：过了岁数，或者落了账。
+        held.retire(&started(&[]), 1_000 + MAX_HOLD_SECS - 1);
+        assert_eq!(
+            held.held_tokens("a|m"),
+            900,
+            "还没到岁数时，冻住的那家仍然替它将发生的花销占着位置"
+        );
+        held.retire(&started(&["t1"]), 1_100);
+        assert_eq!(held.tasks(), vec!["t2".to_string()]);
+        assert_eq!(
+            held.held_tokens("a|m"),
+            0,
+            "落了账的票不再占额度，冻住的类别不会让它多占一拍"
+        );
+        held.retire(&started(&[]), 1_060 + MAX_HOLD_SECS);
+        assert_eq!(held.held_tokens("b|m"), 0, "过了岁数的票不再占额度");
+
+        // 判据读的是自己这一份源码：它答的是这个 revision 的树，不是别处的抄本。
+        // 载体换了文件、头上那行声明挪了、Held 不再留着 upstream、或者 admit
+        // 去重那一支开始改 upstream，这里当场红。
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pace_reservations.rs");
+        let source = std::fs::read_to_string(&path).expect("读得到承载这条判据的源码");
+        // 切掉测试模块：替身里的形状证明不了生产路径怎么记。
+        let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap_or("");
+        let declaration = format!("//! principle: {PRINCIPLE}");
+        assert!(
+            production
+                .lines()
+                .any(|line| line.trim_end() == declaration),
+            "模块头上没有 `{declaration}`：判据是照着这一行认领它答的规则的"
+        );
+        let squeezed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains("pubupstream:String,"),
+            "Held 得留着 upstream：池的类别是这条规则的一半，字段没了就无处可冻"
+        );
+        assert!(
+            squeezed.contains("upstream:upstream.to_string(),"),
+            "占位的 upstream 出自放行那一次的实参——别处算来的类别就是另一次的冻结"
+        );
+        let admit = production
+            .split("pub(crate) fn admit(")
+            .nth(1)
+            .expect("admit 还在这一份源码里");
+        let body = admit.split_once('{').map_or("", |(_, body)| body);
+        let dedupe = body.split("self.held.push(").next().unwrap_or("");
+        assert!(
+            !dedupe.contains("upstream"),
+            "去重那一支只抬额度，不许碰 upstream：碰了它，后一次分类就会把已经入队的票搬到另一家"
         );
     }
 
