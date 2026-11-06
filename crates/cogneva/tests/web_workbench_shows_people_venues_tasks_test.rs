@@ -128,9 +128,10 @@ fn an_empty_roster_says_so_instead_of_spinning_forever() {
 
 /// 回答里的壳要拆开再显示。
 ///
-/// 这一族员工的回答是一个对象（`{"role":"employee","thought":"…"}`），把
-/// `line.reply` 原样贴出来，读者看到的是一串花括号——那句话就在里面，却读不
-/// 成一个回答。「它不回话」与「它的话在一个壳里」，在屏幕上长得一样。
+/// 这一族员工的回答是一个对象（`{"role":"employee","thought":"…"}`，没有结构的
+/// 回答是 `{"result":"…"}`），把 `line.reply` 原样贴出来，读者看到的是一串花
+/// 括号——那句话就在里面，却读不成一个回答。「它不回话」与「它的话在一个壳里」，
+/// 在屏幕上长得一样。
 #[test]
 fn a_reply_wrapped_in_json_is_read_out_instead_of_pasted() {
     let text = source(&root(), "web/src/views/PeopleView.tsx");
@@ -138,5 +139,47 @@ fn a_reply_wrapped_in_json_is_read_out_instead_of_pasted() {
         text.contains("{spoken(line.reply)}"),
         "会话把 `line.reply` 原样贴出来：回答包在 {{\"role\":…,\"thought\":…}} 里时，\
          读者看到的是花括号，而不是那句话"
+    );
+    // 没有结构的回答由内核收成 `{"result": …}`（`build_result` 不再问模型改写），
+    // 拆壳的那张字段表要认得它，否则最常见的那条路反而漏在壳里。
+    for field in ["'thought'", "'result'"] {
+        assert!(
+            text.contains(field),
+            "`spoken` 认不出 {field} 这个字段：这一种回答会在屏幕上留成花括号，\
+             而它正是最常见的那一种"
+        );
+    }
+}
+
+/// 这一面画的是帧流，不是快照。
+///
+/// 网上一直在说的那件事，屏幕上曾经一次也看不到：池里的执行者每次工具调用都发了
+/// `tool_execution_start` / `tool_execution_end`，说话有 `message_start` /
+/// `message_update` / `message_end`，网关按 `agent:<id>` 转到浏览器，而这一面只读
+/// REST 会话行（一问一答）。一次跑了半分钟的活在屏幕上是空白，直到最后一句落库——
+/// 「它在干活」与「它卡住了」在这块画布上同形。
+///
+/// 判据读源码：视图必须从帧流那一份 store 取数，把工具调用与它正在说的那句画出来，
+/// 而且说过的话在收尾之后不许被丢回快照。
+#[test]
+fn the_conversation_pane_draws_the_frame_stream_not_only_the_transcript() {
+    let text = source(&root(), "web/src/views/PeopleView.tsx");
+    for needed in [
+        "useStreamStore",
+        "s.toolCalls",
+        "s.messages",
+        "ToolLine",
+        "SaidLine",
+    ] {
+        assert!(
+            text.contains(needed),
+            "会话那一面没有从帧流取 `{needed}`：它调了什么、说到哪一句又只能等快照，\
+             而一次运行里这两样在总线上本来都有"
+        );
+    }
+    assert!(
+        !text.contains("status !== 'done'"),
+        "帧流里已经说完的那一句被丢掉了：它正是这一趟的回答，这一面画的就是总线上\
+         说过什么，不该说完就换成快照里的那一份"
     );
 }

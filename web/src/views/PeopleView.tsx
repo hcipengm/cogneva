@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { useAgentConversation } from '@/hooks/useAgentConversation';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { hireEmployee, type AgentConversationLine } from '@/api/client';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
+import { useStreamStore, type Message as StreamedMessage, type ToolCallRecord } from '@/store/streamStore';
 import { Button, Empty, Loading, ReadError, ViewFrame } from '@/ui/primitives';
 import { Note } from '@/ui/Note';
 
@@ -20,8 +21,14 @@ import { Note } from '@/ui/Note';
  * 说话走 `POST /api/v1/agents/{id}/messages`：话进它的收件箱，回答从同一条路
  * 回来。属主与员工是平的——这条路由在操作者权限组，不在管理员组。
  *
- * 画面：这一面本身就是画面——左边是一排人，右边是和他们一来一往的对话正文。
- * 每一行话的形状（谁说的、送达没有、回答是什么）就在版式里，不另画一张分布图。
+ * 这一面画的是**总线上发生了什么**。它说的话、调的工具、跑到哪一步，全部来自
+ * 帧流（`agent:*`）；会话那一份 REST 只补两样帧上不带的：页面打开之前的历史，
+ * 和一次投递的结局（送达没有）。两边都画同一句话就是同一句话说两遍，所以窗口里
+ * 已经有帧流回答的那一行，不再贴它自己那份 `reply`。
+ *
+ * 画面：这一面本身就是画面——左边是一排人，右边是和他们一来一往的对话正文，
+ * 中间夹着它这一趟真正做过的事。每一行话的形状（谁说的、送达没有、回答是什么）
+ * 就在版式里，不另画一张分布图。
  */
 
 /** 每种结局一句话，键取自端点类型本身：没配话的结局会把英文原词贴在灰字里。 */
@@ -46,7 +53,7 @@ function spoken(reply: string): string {
   if (!trimmed.startsWith('{')) return reply;
   try {
     const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    for (const field of ['text', 'content', 'message', 'answer', 'thought']) {
+    for (const field of ['text', 'content', 'message', 'answer', 'reply', 'thought', 'result']) {
       const value = parsed[field];
       if (typeof value === 'string' && value.trim()) return value;
     }
@@ -54,6 +61,64 @@ function spoken(reply: string): string {
     // 不是 JSON：那它本来就是一句人话。
   }
   return reply;
+}
+
+/** 一行参数或返回留多长。一行放不下整份文件，截断处明写它被截了。 */
+const TOOL_PREVIEW = 400;
+
+function clip(text: string): string {
+  return text.length > TOOL_PREVIEW ? `${text.slice(0, TOOL_PREVIEW)}…` : text;
+}
+
+/**
+ * 它调过的一次工具，按 Claude Code 那种一行一次的样子画。
+ *
+ * 「在跑」「跑完了」「失败了」三种状态分开画：正在跑的那一行是读者唯一的进度，
+ * 把它画成结束会让一次还没回来的调用看着像空转。
+ */
+function ToolLine({ call }: { call: ToolCallRecord }) {
+  const state =
+    call.status === 'running'
+      ? { text: '在跑', color: 'var(--brass)' }
+      : call.status === 'error'
+        ? { text: '失败', color: 'var(--danger)' }
+        : { text: '返回', color: 'var(--ok)' };
+  return (
+    <div className="border-t border-[var(--line)] py-2">
+      <div className="flex flex-wrap items-baseline gap-2 text-[11px]">
+        <span className="mono" style={{ color: 'var(--brass)' }}>
+          {call.name}
+        </span>
+        <span style={{ color: state.color }}>{state.text}</span>
+        <span className="text-[var(--muted)]">{stamp(call.startedAt)}</span>
+      </div>
+      {call.args && (
+        <div className="mono mt-1 whitespace-pre-wrap break-all text-[11px] text-[var(--paper-dim)]">
+          {clip(call.args)}
+        </div>
+      )}
+      {(call.result || call.progress) && (
+        <div className="mono mt-1 whitespace-pre-wrap break-all border-l-2 border-[var(--line)] pl-2 text-[11px] text-[var(--muted)]">
+          {clip(call.result || call.progress)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 它正在说的那句：流到一半也在画，否则整趟运行在屏幕上只有一个转圈。 */
+function SaidLine({ message }: { message: StreamedMessage }) {
+  return (
+    <div className="border-t border-[var(--line)] py-2">
+      <div className="flex flex-wrap items-baseline gap-2 text-[11px]">
+        <span className="text-[var(--paper-dim)]">{message.agent ?? '执行者'}</span>
+        <span className="text-[var(--muted)]">
+          {message.status === 'streaming' ? '正在说…' : message.status === 'error' ? '说到一半断了' : '说的'}
+        </span>
+      </div>
+      <div className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--paper-dim)]">{message.text}</div>
+    </div>
+  );
 }
 
 function stamp(iso: string): string {
@@ -65,7 +130,7 @@ function stamp(iso: string): string {
   });
 }
 
-function Line({ line }: { line: AgentConversationLine }) {
+function Line({ line, showReply }: { line: AgentConversationLine; showReply: boolean }) {
   const outcome = OUTCOME_LABEL[line.outcome];
   return (
     <div className="border-t border-[var(--line)] py-2 first:border-t-0">
@@ -77,7 +142,7 @@ function Line({ line }: { line: AgentConversationLine }) {
         <span style={{ color: outcome.color }}>{outcome.text}</span>
       </div>
       <div className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--paper)]">{line.body}</div>
-      {line.reply && (
+      {showReply && line.reply && (
         <div className="mt-1 whitespace-pre-wrap border-l-2 border-[var(--ok)]/40 pl-2 text-[12px] text-[var(--paper-dim)]">
           {spoken(line.reply)}
         </div>
@@ -118,6 +183,62 @@ export function PeopleView() {
   const [hiring, setHiring] = useState(false);
   const [hireError, setHireError] = useState<string | null>(null);
   const liveRows = useLiveAgentStore((s) => s.rows);
+  // 它这一趟到底做了什么：工具调用从总线帧流来，按帧里的 `agent_id` 认领。
+  // 会话那一面只有「问了一句、答了一句」，中间的每一步都在这里。
+  const toolCalls = useStreamStore((s) => s.toolCalls);
+  const streamed = useStreamStore((s) => s.messages);
+  const calls = useMemo(
+    () => toolCalls.filter((call) => call.agent === selected),
+    [toolCalls, selected]
+  );
+  // 它说的每一句都从帧流来，包括已经说完的那一句：这一面画的就是「总线上说了
+  // 什么」，不是「十五秒前快照里存了什么」。会话行只为两件事存在——没赶上这一趟
+  // 的历史（页面打开之前说过的话），以及一次投递的结局（送达没有，帧上不带）。
+  const said = useMemo(
+    () => streamed.filter((message) => message.agent === selected && message.text.trim()),
+    [streamed, selected]
+  );
+  // 说与做并成一条时间线：先问的那一句，然后它调了什么、边说边做了什么，按各自的
+  // 时刻排。只画问与答的话，一次跑了半分钟的活看起来像一次卡住。
+  const timeline = useMemo(() => {
+    const at = (iso: string) => {
+      const parsed = Date.parse(iso);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    // 流式消息的 id 形如 `<agent>:<iso 时刻>`：那一刻是这句开始流的时候。
+    // 按 agent 前缀切而不是按冒号切：agent id 自己可能带冒号（`employee:xxxx`），
+    // 从第一个冒号切出来的是半截 id，`Date.parse` 会把它读成 0，于是每一句都被
+    // 排到时间线的最前面。
+    const saidAt = said.map((message) => {
+      const prefix = message.agent ? `${message.agent}:` : '';
+      const when = prefix && message.id.startsWith(prefix)
+        ? message.id.slice(prefix.length)
+        : message.id;
+      return at(when);
+    });
+    const sorted = [...lines].sort((a, b) => at(a.created_at) - at(b.created_at));
+    // 一行问话的「回答窗口」是它自己的时刻到下一行的时刻：落在窗口里的帧流就是
+    // 这一行的回答。窗口里有话，说明这句回答已经在屏幕上以流的方式出现过，会话行
+    // 再贴一次就是同一句话出现两遍；窗口里没有（历史行、或者这一趟它一个字都没说
+    // 只调了工具），那一行的 `reply` 才是屏幕上唯一的回答，必须画。
+    const answeredByFrames = sorted.map((line, i) => {
+      const start = at(line.created_at);
+      const end = i + 1 < sorted.length ? at(sorted[i + 1].created_at) : Number.POSITIVE_INFINITY;
+      return saidAt.some((t) => t >= start && t < end);
+    });
+    const items: { sort: number; node: ReactNode }[] = [
+      ...sorted.map((line, i) => ({
+        sort: at(line.created_at),
+        node: <Line key={line.id} line={line} showReply={!answeredByFrames[i]} />,
+      })),
+      ...calls.map((call) => ({ sort: at(call.startedAt), node: <ToolLine key={call.id} call={call} /> })),
+      ...said.map((message, i) => ({
+        sort: saidAt[i],
+        node: <SaidLine key={message.id} message={message} />,
+      })),
+    ];
+    return items.sort((a, b) => a.sort - b.sort);
+  }, [lines, calls, said]);
 
   const chosen = agents.find((a) => a.agent_id === selected) ?? null;
 
@@ -218,12 +339,10 @@ export function PeopleView() {
 
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
               {error && <ReadError what="这段会话" error={error} onRetry={refreshConversation} />}
-              {!error && selected && lines.length === 0 && !loading && (
+              {!error && selected && lines.length === 0 && calls.length === 0 && said.length === 0 && !loading && (
                 <Empty>还没有说过话。下面写一句，就是和它的第一句。</Empty>
               )}
-              {lines.map((line) => (
-                <Line key={line.id} line={line} />
-              ))}
+              {timeline.map((entry) => entry.node)}
             </div>
 
             {sendError && (
