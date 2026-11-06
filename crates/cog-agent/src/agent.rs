@@ -638,6 +638,8 @@ impl Agent {
                 result
             }
             Err(_) => {
+                let handle = { self.inner.lock().await.task_handle.take() };
+                let cause = unanswered_run(handle).await;
                 let mut inner = self.inner.lock().await;
                 inner.state = AgentState::Dead;
                 if let Some(ref lifecycle) = self.lifecycle {
@@ -645,7 +647,7 @@ impl Agent {
                         .transition(&self.config.agent_id, AgentState::Dead)
                         .await;
                 }
-                Err(SFError::Agent("Task aborted or panicked".into()))
+                Err(cause)
             }
         }
     }
@@ -696,6 +698,8 @@ impl Agent {
                 result
             }
             Err(_) => {
+                let handle = { self.inner.lock().await.task_handle.take() };
+                let cause = unanswered_run(handle).await;
                 let mut inner = self.inner.lock().await;
                 inner.state = AgentState::Dead;
                 if let Some(ref lifecycle) = self.lifecycle {
@@ -703,7 +707,7 @@ impl Agent {
                         .transition(&self.config.agent_id, AgentState::Dead)
                         .await;
                 }
-                Err(SFError::Agent("Task aborted or panicked".into()))
+                Err(cause)
             }
         }
     }
@@ -1849,6 +1853,110 @@ fn workspace_change_from(result: &cog_core::SandboxResult) -> Option<String> {
         return None;
     }
     Some(format!("{diff}\n"))
+}
+
+/// How long to wait for a loop that owes an answer to say how it ended.
+///
+/// The channel closing already answers the caller's question ("no answer is
+/// coming"); this wait is only to learn why, so it is short enough that a loop
+/// still inside a tool call does not hold the caller for longer than the
+/// failure it is reporting.
+// cap: bound — 等的是"为什么没答"这句话，不是答案；短到不把一个卡住的调用变成调用方的新等待
+const RUN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why a run ended without answering.
+///
+/// The sending half of the answer channel belongs to the command loop, so a
+/// closed channel says only that nothing is coming. From here an abort and a
+/// panic are the same closed channel, and the difference is the whole reading:
+/// an abort is something this process did on purpose (a retire, a restore, a
+/// shutdown) and a panic is a defect. Reported as one word for the two, a
+/// panic arrives at every caller as an environment failure and is retried
+/// rather than looked at, which is how a defect stays in the tree.
+///
+/// The handle outlives the channel, so it answers the question: a panic keeps
+/// its payload, a cancelled task says it was cancelled. A loop that is still
+/// running when the channel closes is reported as exactly that instead of
+/// being guessed at either way.
+async fn unanswered_run(handle: Option<tokio::task::JoinHandle<()>>) -> SFError {
+    let Some(handle) = handle else {
+        return SFError::Agent(
+            "Task ended without answering, and no handle was left to say why".into(),
+        );
+    };
+    match tokio::time::timeout(RUN_END_GRACE, handle).await {
+        Err(_) => SFError::Agent("Task ended without answering and is still running".into()),
+        Ok(Ok(())) => SFError::Agent("Task ended without answering".into()),
+        Ok(Err(e)) => match e.try_into_panic() {
+            Ok(payload) => {
+                SFError::Agent(format!("Task panicked: {}", panic_text(payload.as_ref())))
+            }
+            Err(_) => SFError::Agent("Task was aborted before it answered".into()),
+        },
+    }
+}
+
+/// A panic's payload as text, since the payload is what names the defect.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "the payload was not text".to_string())
+}
+
+#[cfg(test)]
+mod run_end_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A panicking run is a defect and has to arrive as one, with the payload
+    /// that names it: "aborted or panicked" reads as an environment failure at
+    /// every caller, and an environment failure is retried instead of fixed.
+    #[tokio::test]
+    async fn a_panic_keeps_its_payload_instead_of_reading_as_a_cancellation() {
+        let handle = tokio::spawn(async {
+            panic!("the checkout was never read");
+        });
+        let err = unanswered_run(Some(handle)).await;
+        let text = err.to_string();
+        assert!(
+            text.contains("panicked") && text.contains("the checkout was never read"),
+            "a panic has to be named as a panic and carry what it said: {text}"
+        );
+        assert!(
+            !text.contains("aborted"),
+            "a panic must not be reported as a cancellation either: {text}"
+        );
+    }
+
+    /// A task this process cancelled is not a defect, and calling it a panic
+    /// would send whoever reads it looking for a defect that is not there.
+    #[tokio::test]
+    async fn a_cancelled_run_reads_as_an_abort_and_not_as_a_panic() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        handle.abort();
+        let err = unanswered_run(Some(handle)).await;
+        let text = err.to_string();
+        assert!(
+            text.contains("aborted") && !text.contains("panicked"),
+            "a cancelled task has to read as a cancellation: {text}"
+        );
+    }
+
+    /// A loop that finished normally but never sent an answer is neither:
+    /// saying so is the only report that does not invent a cause.
+    #[tokio::test]
+    async fn a_run_that_ended_quietly_reads_as_neither_panic_nor_abort() {
+        let err = unanswered_run(Some(tokio::spawn(async {}))).await;
+        let text = err.to_string();
+        assert!(
+            text.contains("ended without answering") && !text.contains("panicked"),
+            "a quiet exit has no cause to name: {text}"
+        );
+    }
 }
 
 #[cfg(test)]
