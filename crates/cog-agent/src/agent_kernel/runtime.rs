@@ -819,6 +819,84 @@ fn changes_the_checkout(tool: &str, arguments: &serde_json::Value) -> bool {
     })
 }
 
+/// 「这一次运行已经交出去的那份输出」的指纹：内容哈希与字节数。
+///
+/// 只认内容不认调用：同一个 `read_file` 换个区间就是另一份输出，不该被当成
+/// 重复；反过来两条不同形状的命令打出同一份字节，那两份字节也确实只值付一次。
+type OutputFingerprint = ([u8; 16], usize);
+
+fn output_fingerprint(text: &str) -> OutputFingerprint {
+    let digest = Sha256::digest(text.as_bytes());
+    let mut head = [0u8; 16];
+    head.copy_from_slice(&digest[..16]);
+    (head, text.len())
+}
+
+/// 一趟运行已经交给模型的每一份工具输出。
+///
+/// 这份记录必须挂在运行上，不能从上下文窗口里读。窗口满了就从最前面丢轮次，
+/// 而「窗口满」正是重复请求开始出现的那一刻——记录存在窗口里，等于在最需要
+/// 记得「这一份已经给过」的时候把它忘掉，于是每填满一次窗口就要重新读一遍
+/// 同样的字节，读完又填满。
+///
+/// 实测（2026-11-06，`change-ledger-0ea2e24e8f45341e`）：360 次工具调用里
+/// 119 次是逐字重复已经交过的输出，其中一个 1,567 行的测试文件被读了 219
+/// 次、其中 26 种区间被反复要；那一轮 286 次模型调用平均每次只产出 108 个
+/// token——容量几乎全花在把刚被裁掉的上下文重新取回来上。
+///
+/// 指纹取自**原始输出**，不是进入窗口之后那一份。超预算的结果会被裁，裁出来
+/// 的标记里带着轮次号，于是同一份原始输出每次被裁成的样子都不一样——按窗口里
+/// 那份比对的门，对最大的那些结果永远不会响，而它们正是最贵的那一类。
+#[derive(Default)]
+struct DeliveredResults {
+    by_output: std::collections::HashMap<OutputFingerprint, Delivered>,
+}
+
+struct Delivered {
+    /// 第一次交出去的那一轮。
+    turn: u32,
+    /// 走到今天一共被要了几次，含第一次。
+    asked: u32,
+}
+
+impl DeliveredResults {
+    /// 这一份输出换来的那段话；没交过就记下并返回 `None`。
+    ///
+    /// 只对够长的输出说话：一条「0 errors」被问第二遍时，指针和原文一样短，
+    /// 换过去只会让模型多跳一次。
+    fn repeat_note(&mut self, tool: &str, text: &str, turn: u32) -> Option<String> {
+        if text.chars().count() < REPEATED_TOOL_RESULT_MIN_CHARS {
+            return None;
+        }
+        let key = output_fingerprint(text);
+        let delivered = match self.by_output.get_mut(&key) {
+            None => {
+                self.by_output.insert(key, Delivered { turn, asked: 1 });
+                return None;
+            }
+            Some(delivered) => {
+                delivered.asked = delivered.asked.saturating_add(1);
+                delivered
+            }
+        };
+        let note = serde_json::json!({
+            "deduplicated": true,
+            "bytes": text.len(),
+            "first_returned_at_turn": delivered.turn,
+            "times_asked": delivered.asked,
+            "note": format!(
+                "This run already returned exactly these bytes of `{tool}` at turn {} (ask {}). \
+                 They are not sent again: re-inserting bytes you already have evicts turns you \
+                 have not read yet, and that is how a run re-reads the same file until it runs \
+                 out. Read them above if they are still there; if the window dropped them, ask \
+                 for the narrower slice you need.",
+                delivered.turn, delivered.asked
+            ),
+        });
+        Some(note.to_string())
+    }
+}
+
 impl AgentRuntime {
     /// Access the loop configuration.
     pub fn config(&self) -> &RuntimeConfig {
@@ -1626,40 +1704,6 @@ impl AgentRuntime {
         }
     }
 
-    /// The stub that stands in for a tool result this run already carried.
-    ///
-    /// The model re-asks for a file it has already read, and each answer puts
-    /// the same bytes into the transcript again. Measured over 2026-10-31 to
-    /// 2026-11-02 (1,018 successful calls): 3% of all tool output was a repeat
-    /// of output the same request already carried, and one generator request
-    /// was 64% duplicated because it read one file three times in a row.
-    /// Those bytes are already in the conversation above, so the repeat is
-    /// replaced by a pointer that says so — the payload is left out, and the
-    /// tool_use / tool_result pairing the provider requires is kept.
-    ///
-    /// Only results that are byte-identical and large enough to be worth it.
-    /// A short repeat ("0 errors", an empty listing) is the tool answering a
-    /// different question with the same words, and the stub would not be
-    /// smaller than what it replaced.
-    fn repeated_tool_result(&self, text: &str) -> Option<String> {
-        if text.chars().count() < REPEATED_TOOL_RESULT_MIN_CHARS {
-            return None;
-        }
-        let repeated = self.context.messages().iter().any(|message| {
-            matches!(message, Message::ToolResult { .. }) && message.content() == text
-        });
-        repeated.then(|| {
-            serde_json::json!({
-                "deduplicated": true,
-                "bytes": text.len(),
-                "note": "This is the same output an earlier call in this run already returned, \
-                         and it is still in the conversation above. Read it there instead of \
-                         asking again.",
-            })
-            .to_string()
-        })
-    }
-
     /// The tool-result message for one call, archiving the output when it will
     /// not fit the window.
     ///
@@ -1668,6 +1712,11 @@ impl AgentRuntime {
     /// still save the part the model will not see. A run with no archive surface
     /// (embedded use, tests) still cuts the output — it just cannot offer a
     /// reference to the tail, and the marker says only that bytes were dropped.
+    ///
+    /// `delivered` carries what this run has already handed over; a repeat is
+    /// answered with a pointer instead of the payload, so the tool_use /
+    /// tool_result pairing the provider requires is kept and the bytes are paid
+    /// for once.
     async fn tool_result_message(
         &self,
         task_id: Option<&str>,
@@ -1676,8 +1725,9 @@ impl AgentRuntime {
         tool_call_id: &str,
         tool_name: &str,
         text: &str,
+        delivered: &mut DeliveredResults,
     ) -> Message {
-        if let Some(stub) = self.repeated_tool_result(text) {
+        if let Some(stub) = delivered.repeat_note(tool_name, text, turn) {
             return Message::tool_result_text(tool_call_id, tool_name, &stub);
         }
         let budget = self.context.tool_result_budget_chars();
@@ -1859,6 +1909,11 @@ impl AgentRuntime {
         // reads for ten more, and writes again is working, and the note is for
         // the run that has stopped writing altogether.
         let mut progress = CheckoutProgress::default();
+        // What this run has already handed the model. Kept here rather than read
+        // out of the context window, because the window drops its oldest turns
+        // when it fills and that is exactly when a repeat starts looking like a
+        // good idea. See `DeliveredResults`.
+        let mut delivered = DeliveredResults::default();
 
         for iteration in 0..self.config.max_iterations {
             tracing::info!(agent_id = %self.config.agent_id, iteration, "AgentRuntime::run iteration start");
@@ -2186,6 +2241,7 @@ impl AgentRuntime {
                         &tc.id,
                         &tc.name,
                         &observation.to_string(),
+                        &mut delivered,
                     )
                     .await,
                 );
@@ -6336,15 +6392,16 @@ mod tests {
             "{{\"content\":\"{}\"}}",
             "x".repeat(REPEATED_TOOL_RESULT_MIN_CHARS)
         );
+        let mut delivered = DeliveredResults::default();
         let first = runtime
-            .tool_result_message(None, 0, 0, "call-1", "read_file", &big)
+            .tool_result_message(None, 0, 0, "call-1", "read_file", &big, &mut delivered)
             .await;
         assert_eq!(first.content(), big, "第一次读到的东西要原样交给模型");
         runtime.context.add_message(asks_for("call-1"));
         runtime.context.add_message(first);
 
         let second = runtime
-            .tool_result_message(None, 0, 1, "call-2", "read_file", &big)
+            .tool_result_message(None, 0, 1, "call-2", "read_file", &big, &mut delivered)
             .await;
         assert_ne!(
             second.content(),
@@ -6356,8 +6413,8 @@ mod tests {
             serde_json::from_str(&second.content()).expect("指针仍然是一份工具结果");
         assert_eq!(stub["deduplicated"], serde_json::json!(true));
         assert!(
-            second.content().len() < 400,
-            "指针要是指得比原文还长，就等于没省"
+            second.content().len() * 2 < big.len(),
+            "指针要是指得比它替代的那份的一半还长，就等于没省"
         );
 
         // 反向对照：换一份内容，它照原样发出去。
@@ -6366,9 +6423,126 @@ mod tests {
             "y".repeat(REPEATED_TOOL_RESULT_MIN_CHARS)
         );
         let third = runtime
-            .tool_result_message(None, 0, 2, "call-3", "read_file", &other)
+            .tool_result_message(None, 0, 2, "call-3", "read_file", &other, &mut delivered)
             .await;
         assert_eq!(third.content(), other, "没重复的输出不许被当成重复");
+    }
+
+    /// 记录挂在运行上，不挂在窗口上：窗口把它裁掉之后，重问一次仍然是重复。
+    ///
+    /// 这是那条门真正会失效的地方。裁剪按轮次组从最前面丢，丢掉的正是模型
+    /// 刚读回来的东西；窗口越满、越需要记得「这份已经给过」，而把记录从窗口
+    /// 里读，恰好在那时什么都读不到。实测一轮生成（2026-11-06，
+    /// `change-ledger-0ea2e24e8f45341e`）：360 次工具调用里 119 次是逐字重复，
+    /// 286 次模型调用平均产出 108 个 token。
+    #[tokio::test]
+    async fn a_repeat_is_still_a_repeat_after_the_window_has_dropped_the_first_copy() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        // 小窗口：几轮之后第一份结果必然被裁出投影。
+        let mut config = RuntimeConfig::default();
+        config.context_window_size = 600;
+        let mut runtime = AgentRuntime::new(config, tx);
+        let mut delivered = DeliveredResults::default();
+
+        let read = format!(
+            "{{\"content\":\"{}\"}}",
+            "x".repeat(REPEATED_TOOL_RESULT_MIN_CHARS)
+        );
+        let first = runtime
+            .tool_result_message(None, 0, 0, "call-1", "read_file", &read, &mut delivered)
+            .await;
+        runtime.context.add_message(asks_for("call-1"));
+        runtime.context.add_message(first);
+
+        // 把它挤出投影：再灌几轮别的大结果，直到原文已经不在窗口里。
+        for round in 1..40u32 {
+            let filler = format!("{{\"content\":\"{}-{round}\"}}", "z".repeat(3_000));
+            let msg = runtime
+                .tool_result_message(
+                    None,
+                    round,
+                    0,
+                    &format!("filler-{round}"),
+                    "run_command",
+                    &filler,
+                    &mut delivered,
+                )
+                .await;
+            runtime
+                .context
+                .add_message(asks_for(&format!("filler-{round}")));
+            runtime.context.add_message(msg);
+            let still_there = runtime.context.messages().iter().any(|m| {
+                matches!(m, Message::ToolResult { .. })
+                    && m.content().starts_with("{\"content\":\"xxx")
+            });
+            if !still_there {
+                break;
+            }
+        }
+        assert!(
+            !runtime
+                .context
+                .messages()
+                .iter()
+                .any(|m| matches!(m, Message::ToolResult { .. })
+                    && m.content().starts_with("{\"content\":\"xxx")),
+            "这一条要测的是「原文已经不在窗口里」之后的重复，否则它和上一条测的是同一件事"
+        );
+
+        let again = runtime
+            .tool_result_message(None, 40, 0, "call-2", "read_file", &read, &mut delivered)
+            .await;
+        let stub: serde_json::Value =
+            serde_json::from_str(&again.content()).expect("指针仍然是一份工具结果");
+        assert_eq!(
+            stub["deduplicated"],
+            serde_json::json!(true),
+            "原文被裁掉之后重问同一份输出，仍然是重复"
+        );
+        assert_eq!(stub["first_returned_at_turn"], serde_json::json!(0));
+        assert_eq!(stub["times_asked"], serde_json::json!(2));
+    }
+
+    /// 超预算的结果也一样认得出来。
+    ///
+    /// 进入窗口的那一份会被裁，裁出来的标记里带着轮次号，所以同一份原始输出
+    /// 每次被裁成的样子都不同。按窗口里那份比对，最大的结果永远比不上——
+    /// 而它们正是每轮都要重发、最该被挡住的那一类。
+    #[tokio::test]
+    async fn an_oversized_result_is_still_recognised_when_it_comes_back() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut config = RuntimeConfig::default();
+        config.context_window_size = 600;
+        let mut runtime = AgentRuntime::new(config, tx);
+        let mut delivered = DeliveredResults::default();
+
+        let huge = format!(
+            "{{\"content\":\"{}\"}}",
+            "q".repeat(REPEATED_TOOL_RESULT_MIN_CHARS * 4)
+        );
+        let first = runtime
+            .tool_result_message(None, 0, 0, "call-1", "run_command", &huge, &mut delivered)
+            .await;
+        assert!(
+            first.content().len() < huge.len(),
+            "这一条要的是「原文被裁过」这个前提，没裁就测不到它"
+        );
+        runtime.context.add_message(asks_for("call-1"));
+        runtime.context.add_message(first);
+
+        let second = runtime
+            .tool_result_message(None, 1, 0, "call-2", "run_command", &huge, &mut delivered)
+            .await;
+        let stub: serde_json::Value =
+            serde_json::from_str(&second.content()).expect("指针仍然是一份工具结果");
+        assert_eq!(
+            stub["deduplicated"],
+            serde_json::json!(true),
+            "被裁过的结果换了轮次号，也仍然是同一份输出"
+        );
     }
 
     fn read_call() -> serde_json::Value {
