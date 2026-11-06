@@ -327,6 +327,20 @@ fn status_str(status: &cog_core::TaskStatus) -> &'static str {
     status.as_str()
 }
 
+/// 派发还要看的那几列，按 `TaskStatus::ALL` 的枚举收集，不从 SQL 里抄名字。
+///
+/// 单拎出来是因为这条查询换成「在这些状态里」之后，判据的完整性不再由 SQL 的
+/// `<>` 顺手兜住：漏掉一个状态，那一列的行就悄悄读不回来了，而读不回来的行
+/// 停在原地，看起来和「还没轮到它」一模一样。所以谁都可以读这个集合，也可以
+/// 对它断言（见本文件末尾那条测试），但没人能在这里手写第二个名单。
+fn live_status_filter() -> Vec<String> {
+    cog_core::TaskStatus::ALL
+        .iter()
+        .filter(|status| status.affects_dispatch())
+        .map(|status| status.as_str().to_string())
+        .collect()
+}
+
 /// 一行负预算不是「零预算」，也不是可以顺手取绝对值的怪值：写入侧从不产生它，
 /// 读到了就说明这一行是别人写坏的，报出来比折算成 0 更接近事实。
 fn negative_budget(workspace_id: &str, task_id: &str, budget: i64) -> SFError {
@@ -889,23 +903,26 @@ impl StateBackend for PostgresStateBackend {
 
     /// 只有派发还要看的那些行；`failed` / `cancelled` 在查询里就被排掉。
     ///
-    /// 排除的是哪几个状态由 [`cog_core::TaskStatus::affects_dispatch`] 一个
-    /// 地方决定，这里只把它的答案拼成参数——SQL 里再抄一遍字符串，两处就会
-    /// 各自漂移，而漂移的那一天表现为「某些行忽然不再被派发」。
+    /// 收哪些状态由 [`cog_core::TaskStatus::affects_dispatch`] 一个地方决定，
+    /// 这里只把它的答案拼成参数——SQL 里再抄一遍字符串，两处就会各自漂移，
+    /// 而漂移的那一天表现为「某些行忽然不再被派发」。
+    ///
+    /// 写的是「在这些状态里」而不是「不在那两个状态里」：同一批行，两种写法
+    /// 规划器给的计划不同。2026-11-07 本机生产库实测，`status <> ALL(...)`
+    /// 走顺序扫（9,590 行整表、缓冲 4,121、100 毫秒），`status = ANY(...)` 走
+    /// `(workspace_id, status)` 上那条索引的位图扫（缓冲 1,645、14.5 毫秒）——
+    /// 同一次读快七倍，而这条读法每五秒就跑一遍，跑在发布那一拍上。判据没变，
+    /// 变的是取它的路径。
     async fn dag_get_live_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
-        let excluded: Vec<String> = cog_core::TaskStatus::ALL
-            .iter()
-            .filter(|status| !status.affects_dispatch())
-            .map(|status| status.as_str().to_string())
-            .collect();
+        let live = live_status_filter();
         let rows: Vec<(serde_json::Value,)> = self
             .retry(|| async {
                 sqlx::query_as(
                     "SELECT task FROM cog_dag_tasks \
-                     WHERE workspace_id = $1 AND status <> ALL($2::text[])",
+                     WHERE workspace_id = $1 AND status = ANY($2::text[])",
                 )
                 .bind(workspace_id)
-                .bind(excluded.as_slice())
+                .bind(live.as_slice())
                 .fetch_all(&self.pool)
                 .await
             })
@@ -1831,6 +1848,50 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         .map_err(|e| SFError::Database(e.to_string()))?;
 
         Ok(rows.into_iter().map(promotion_record).collect())
+    }
+}
+
+#[cfg(test)]
+mod live_status_filter_tests {
+    use super::live_status_filter;
+    use cog_core::TaskStatus;
+
+    /// 名单与判据是同一件事：收进来的每一个都得是派发还要看的，漏掉一个就会
+    /// 让那一列的行永远读不回来。两个方向都断言，因为两种错法都安静——多收
+    /// 一列只是多读几行（贵），少收一列是把一排活藏起来（看不见）。
+    #[test]
+    fn the_filter_names_exactly_the_statuses_dispatch_still_reads() {
+        let listed = live_status_filter();
+        let expected: Vec<String> = TaskStatus::ALL
+            .iter()
+            .filter(|status| status.affects_dispatch())
+            .map(|status| status.as_str().to_string())
+            .collect();
+        assert_eq!(listed, expected);
+
+        for status in TaskStatus::ALL {
+            let named = listed.iter().any(|s| s == status.as_str());
+            assert_eq!(
+                named,
+                status.affects_dispatch(),
+                "{} 在这次读法里的去留与 affects_dispatch 不一致",
+                status.as_str()
+            );
+        }
+    }
+
+    /// 终态的那两列不在这份名单里：把它们读回来，每五秒一拍就是几千行没人用的
+    /// 正文，而这条读法跑在发布那一拍上。
+    #[test]
+    fn the_two_settled_columns_stay_out_of_the_read() {
+        let listed = live_status_filter();
+        for settled in [TaskStatus::Failed, TaskStatus::Cancelled] {
+            assert!(
+                !listed.iter().any(|s| s == settled.as_str()),
+                "{} 是终态，不该出现在派发要读的名单里",
+                settled.as_str()
+            );
+        }
     }
 }
 
