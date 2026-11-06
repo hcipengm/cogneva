@@ -41,6 +41,20 @@ const APP_ROLE: &str = "cog_app";
 /// 备份演练连源库用的受限角色：建一次性演练库、读全部表比对、写自己那一行结论。
 const BACKUP_ROLE: &str = "cog_backup";
 
+/// 测试库（`cogneva_test`）的属主，变更验证跑实库用例时连它。
+///
+/// 它不是业务角色，也不是超级用户：要 CREATEDB 与 CREATEROLE 是因为包里那几条
+/// 用例自己建库、自己建一个受限角色再删掉，而它读不到业务库里任何一行。
+const TEST_ROLE: &str = "cog_test";
+
+/// 这条连接是不是那条测试库连接。
+///
+/// 判据是它挂在哪条声明下，不是 URL 里的库名：库名能被改成别的，而声明名就是
+/// 「这条连接是给谁用的」那一句话。
+fn is_test_database(declared: Option<&str>) -> bool {
+    declared.is_some_and(|name| name.eq_ignore_ascii_case("COGNEVA_TEST_DATABASE_URL"))
+}
+
 /// 实例的 bootstrap 超级用户（initdb 按 `POSTGRES_USER` 建出来的那个）。
 ///
 /// 它的超权位收不掉——PostgreSQL 16 起不许任何人把它改成 NOSUPERUSER，因为同一个人
@@ -48,25 +62,40 @@ const BACKUP_ROLE: &str = "cog_backup";
 /// 工作负载的 DSN 都不许是它。
 const SUPERUSER_ROLE: &str = "cog_user";
 
-/// 一份清单里每一条 `postgres://<role>:` 的角色名，按出现顺序。
-fn dsn_roles(text: &str) -> Vec<String> {
-    let mut roles = Vec::new();
-    let mut rest = text;
-    while let Some(at) = rest.find("postgres://") {
-        rest = &rest[at + "postgres://".len()..];
-        let end = rest
-            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        if let Some(after) = rest[end..].strip_prefix(':') {
-            assert!(
-                after.starts_with('$') || after.starts_with("${"),
-                "角色后面要跟口令占位，读到的是 {:?}",
-                &rest[..(end + 1).min(rest.len())]
-            );
-            roles.push(rest[..end].to_string());
+/// 一份清单里每一条 `postgres://<role>:` 的角色名，连同它落在那条声明的名下。
+///
+/// 名下是要紧的：`COGNEVA_TEST_DATABASE_URL` 是**另一条连接**，不是业务库那一条。
+/// 变更验证在自己 Pod 里跑的那批实库用例连的是测试库，那个角色生来就是
+/// [`TEST_ROLE`]（它要 CREATEDB/CREATEROLE，业务角色整条设计就是不给这两项）。按
+/// 角色一刀切会把这条正当写成 `cog_test` 的行读成「业务 Pod 用了别的角色」，
+/// 而被指的那条连接从来没连过业务库。
+fn dsn_roles(text: &str) -> Vec<(Option<String>, String)> {
+    let mut found = Vec::new();
+    let mut declared: Option<String> = None;
+    for line in text.lines() {
+        // 声明的名字在 URL 的上一行：YAML 是 `- name: X`，JSON 是同一个键。
+        if let Some(rest) = line.trim().strip_prefix("- name: ") {
+            declared = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.trim().strip_prefix("name: ") {
+            declared = Some(rest.trim().to_string());
+        }
+        let mut rest = line;
+        while let Some(at) = rest.find("postgres://") {
+            rest = &rest[at + "postgres://".len()..];
+            let end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if let Some(after) = rest[end..].strip_prefix(':') {
+                assert!(
+                    after.starts_with('$') || after.starts_with("${"),
+                    "角色后面要跟口令占位，读到的是 {:?}",
+                    &rest[..(end + 1).min(rest.len())]
+                );
+                found.push((declared.clone(), rest[..end].to_string()));
+            }
         }
     }
-    roles
+    found
 }
 
 fn yaml_files(dir: &Path) -> Vec<PathBuf> {
@@ -113,8 +142,8 @@ fn documents(text: &str) -> Vec<String> {
     docs
 }
 
-/// 部署面上每一份带着连接串的文档：(文件, 文档序号, 角色)。
-fn deployed_dsn_roles(root: &Path) -> Vec<(String, usize, String)> {
+/// 部署面上每一份带着连接串的文档：(文件, 文档序号, 声明名, 角色)。
+fn deployed_dsn_roles(root: &Path) -> Vec<(String, usize, Option<String>, String)> {
     let mut found = Vec::new();
 
     let mut sources: Vec<PathBuf> = yaml_files(&root.join("deploy/helm/cogneva/templates"));
@@ -130,8 +159,8 @@ fn deployed_dsn_roles(root: &Path) -> Vec<(String, usize, String)> {
             .trim_start_matches("deploy/")
             .to_string();
         for (index, doc) in documents(&read(&path)).into_iter().enumerate() {
-            for role in dsn_roles(&doc) {
-                found.push((label.clone(), index, role));
+            for (declared, role) in dsn_roles(&doc) {
+                found.push((label.clone(), index, declared, role));
             }
         }
     }
@@ -148,7 +177,21 @@ fn every_business_workload_connects_as_the_restricted_role() {
     let mut offenders = Vec::new();
     let mut drill_documents = 0;
     let mut superuser_documents = Vec::new();
-    for (file, index, role) in &seen {
+    let mut test_documents = Vec::new();
+    for (file, index, declared, role) in &seen {
+        // 测试库那条连接不是业务连接：它的角色就是 `cog_test`，正当。反过来也要钉住
+        // ——写成业务角色就成了「拿 cog_app 跑那些自己建库删库的用例」，而它没有
+        // CREATEDB。
+        if is_test_database(declared.as_deref()) {
+            test_documents.push(format!("{file} 第 {index} 份"));
+            assert_eq!(
+                role, TEST_ROLE,
+                "{file} 第 {index} 份文档的测试库连接串连的是 `{role}`：它不是业务库那条\
+                 连接，连的必须是 `{TEST_ROLE}`（它要 CREATEDB/CREATEROLE，而业务角色\
+                 整条设计就是不给这两项）"
+            );
+            continue;
+        }
         // 演练走的是自己的角色，不是「又一个业务角色」，也不是超级用户。判据是
         // **这份文档自己叫什么**：chart 的 `backup.yaml` 同时装着导出与演练两个
         // CronJob，按文件比会把「导出在 cog_app 上」这件事一起抹掉。
@@ -193,6 +236,15 @@ fn every_business_workload_connects_as_the_restricted_role() {
         drill_documents >= 2,
         "演练文档只钉到 {drill_documents} 份（chart 与静态各一份）：例外没有落到纸上，\
          下一次有人把它也改掉时这一条判不出来"
+    );
+
+    // 测试库那条连接也一样要钉住。它若从清单里消失，本门对 `cog_test` 的判断就变成
+    // 一句没有题目的话——而它恰恰是唯一允许不是 `cog_app` 的那条业务之外的连接。
+    assert!(
+        test_documents.len() >= 2,
+        "测试库连接串只读到 {} 份（chart 与静态各一份）：变更验证那些实库用例靠它连\
+         测试库，它不在清单里时那些用例要么连业务库、要么一条都不跑",
+        test_documents.len()
     );
 }
 
@@ -363,7 +415,7 @@ fn the_scan_covers_every_workload_that_takes_a_database_url() {
     let root = repo_root();
     let seen = deployed_dsn_roles(&root);
 
-    let files: Vec<&str> = seen.iter().map(|(f, _, _)| f.as_str()).collect();
+    let files: Vec<&str> = seen.iter().map(|(f, _, _, _)| f.as_str()).collect();
     let chart = files
         .iter()
         .filter(|f| f.starts_with("helm/cogneva/"))

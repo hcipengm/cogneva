@@ -602,6 +602,12 @@ live_check db 'Live-DB notification store' cargo test -p cog-storage --test noti
 # migration that rewrites the rows it lands beside, leaves every DB-free
 # test green.
 live_check db 'Live-DB LLM usage ledger' cargo test -p cog-observability --test usage_store_ledger -- --ignored
+# The money read is a statement, and the projection above it is tested
+# against a stand-in: a `GROUP BY` that forgets `price_book` returns a
+# plausible total no price list produced, and a `SUM` wrapped in
+# `COALESCE` reports an unpriced range as free. Both read correctly on a
+# page and as a type. Only a server parses the statement.
+live_check db 'Live-DB LLM usage spend by price book' cargo test -p cog-observability --test usage_store_spend -- --ignored
 # The window fold's three claims are all decisions the server makes: that
 # a window's totals are the ledger's sum over it, that rerunning a window
 # lands the same rows with the same values (idempotence rests on the

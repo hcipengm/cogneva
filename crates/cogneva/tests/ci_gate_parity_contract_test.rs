@@ -60,6 +60,12 @@ const ENFORCED: &[(&str, &str)] = &[
     // The main suite, with `--no-fail-fast` so the refusal names every failure
     // rather than the first crate to give up.
     ("test", "cargo test --workspace --no-fail-fast"),
+    // The live-service checks are one script on both sides: the job runs this
+    // line, and the sandbox's verification runs the same script as its own gate
+    // (the `check-` prefix is what makes it one). The command is the same bytes
+    // on both sides rather than a transcription, which is the whole reason the
+    // sixty-four steps became a list.
+    ("live", "bash deploy/scripts/check-live-services.sh"),
 ];
 
 /// Gating jobs the verification stage does not enforce, and why.
@@ -167,8 +173,17 @@ fn gating_jobs(workflow: &str) -> BTreeSet<String> {
          this test would judge an empty set and pass while covering nothing"
     );
 
+    // 注释不是清单结束的标志。2026-11-06 在 `needs:` 中间插了一行注释（说明那一格
+    // 为什么必须一起判），而按「第一行不是 `- ` 就停」读，读到的是前两项：八条登记
+    // 当场变成「答的是一个不再门禁的作业」，真实的那一格反倒从没进过读数。注释与
+    // 空行跳过去，遇到别的形状才停。
     let jobs: BTreeSet<String> = lines
-        .take_while(|l| l.trim_start().starts_with("- "))
+        .take_while(|l| {
+            let t = l.trim();
+            // 先按「继续读」的理由筛，最后才判结束。
+            t.is_empty() || t.starts_with('#') || t.starts_with("- ")
+        })
+        .filter(|l| l.trim().starts_with("- "))
         .map(|l| l.trim().trim_start_matches("- ").to_string())
         .collect();
 

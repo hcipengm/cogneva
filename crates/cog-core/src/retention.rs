@@ -42,9 +42,11 @@
 pub const LLM_USAGE_KEEP_DAYS_ENV: &str = "COGNEVA_LLM_USAGE_KEEP_DAYS";
 
 /// 用量账的保留天数：三十天，与它旁边那本提示归档的承诺一致。
+// cap: bound — 与旁边那本提示归档同一个承诺，不是从某次读数推出来的
 pub const LLM_USAGE_KEEP_DAYS_DEFAULT: i64 = 30;
 
 /// 用量账最短的保留期：一天。更短会在每一趟里把当前小时折赖以计算的行走删掉。
+// cap: bound — 再短就会删掉当前小时那次折赖以计算的行走；没有测量能把它调小
 pub const LLM_USAGE_KEEP_DAYS_MIN: i64 = 1;
 
 /// 用量账的保留天数，按 [`LLM_USAGE_KEEP_DAYS_ENV`] 读。

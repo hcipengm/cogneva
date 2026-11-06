@@ -36,6 +36,18 @@ const DECLARED_IN: &str = "crates/cog-core/src/retention.rs";
 const FALL_BACK: &str = "keep_days_or_default";
 const DISABLE: &str = "keep_days_or_disable";
 
+/// 声明处的具名包装：把一个旋钮的「0 算什么意思」封进一个函数，调用包装的文件等于
+/// 选了那一边，尽管它一个字都不写那两个读法。
+///
+/// 用量账的旋钮就是这么共享给两处的——清扫循环在 `cog-observability`、读口在
+/// `cog-gateway`，两边读同一个承诺，所以两边都要登记。包装本身站哪一边由
+/// `cog-core` 自己的单元测试钉住（`the_usage_ledger_knob_is_declared_once` 断言
+/// `0` 落回默认）；这张表说的是「哪个名字算哪一边」。改包装的处置，那边当场红。
+const WRAPPERS: &[(&str, &str)] = &[
+    ("llm_usage_keep_days_from", FALL_BACK),
+    ("llm_usage_keep_days", FALL_BACK),
+];
+
 /// 登记在案的保留天数旋钮：文件、读到 0 时的处置、为什么是这一边。
 ///
 /// 一个文件要是有两个只增不减的旋钮，就登记两行。
@@ -58,6 +70,12 @@ const KNOBS: &[(&str, &str, &str)] = &[
         "零天清扫把用量账清空，读数于是从「这个部署停止了记账」变成「这个部署什么也没花」，\
          而两者在面板上不可区分",
     ),
+    (
+        "crates/cog-gateway/src/observability.rs",
+        FALL_BACK,
+        "读口按账本的保留期算自己能覆盖多旧的数据；抄一个自己的截止日，账本留三十天、\
+         接口只看得见七天，两边的读数还都正常",
+    ),
 ];
 
 /// 这个文件里用到了哪几种读法。
@@ -69,6 +87,13 @@ fn policies_in(text: &str) -> BTreeSet<&'static str> {
         }
         if line.contains(DISABLE) {
             found.insert(DISABLE);
+        }
+        for (name, policy) in WRAPPERS {
+            // 名字后面跟左括号才算调用：注释已经被 `production_lines` 剥掉了，剩下的
+            // 是代码，而裸名字出现在别处（字符串、类型名）不是选了那一边。
+            if line.contains(&format!("{name}(")) {
+                found.insert(*policy);
+            }
         }
     }
     found
@@ -153,6 +178,15 @@ fn the_census_reads_a_call_site_through_comments_and_counts_both_readings() {
     );
     assert_eq!(
         policies_in("use cog_core::retention::keep_days_or_default;\n"),
+        BTreeSet::from([FALL_BACK])
+    );
+    // 具名包装算它封的那一边：调用包装的文件不写这两个词，但它确实选了那一边。
+    assert_eq!(
+        policies_in("let days = cog_core::retention::llm_usage_keep_days_from(raw);\n"),
+        BTreeSet::from([FALL_BACK])
+    );
+    assert_eq!(
+        policies_in("let days = cog_core::retention::llm_usage_keep_days();\n"),
         BTreeSet::from([FALL_BACK])
     );
     // 一个文件里两边都用，本门要看得见两种。

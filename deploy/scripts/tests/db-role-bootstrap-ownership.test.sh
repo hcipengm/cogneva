@@ -211,6 +211,7 @@ make_fixture
 
 PGHOST="${PGHOST}" PGPORT="${PGPORT}" PGUSER=cog_user PGPASSWORD="${probe_pw}" \
     PGDATABASE="${probe_db}" APP_PASSWORD=probe-password BACKUP_PASSWORD=probe-backup-password \
+    TEST_PASSWORD=probe-test-password \
     bash "${sql_file}" >/dev/null 2>"${work}/bootstrap.err" \
     || fail "引导脚本在真库上失败：$(tail -3 "${work}/bootstrap.err")"
 
