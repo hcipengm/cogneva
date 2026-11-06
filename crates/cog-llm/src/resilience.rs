@@ -52,8 +52,8 @@ impl RetryPolicy {
         };
         let capped = raw.min(self.max_delay_ms);
         let jittered = if self.jitter {
-            let frac = (capped as f64 * 0.75) as u64;
-            capped - ((capped - frac) / 2)
+            let half = capped / 2;
+            half + rand::thread_rng().gen_range(0..=half)
         } else {
             capped
         };
@@ -279,5 +279,29 @@ mod tests {
         };
         assert_eq!(policy.delay(0).as_millis(), 250);
         assert_eq!(policy.delay(5).as_millis(), 250);
+    }
+
+    #[test]
+    fn test_retry_policy_jitter_within_range() {
+        let policy = RetryPolicy {
+            strategy: BackoffStrategy::Exponential,
+            base_delay_ms: 100,
+            max_delay_ms: 10000,
+            jitter: true,
+            ..Default::default()
+        };
+        for attempt in 0..5 {
+            let raw = policy.base_delay_ms * 2u64.pow(attempt);
+            let capped = raw.min(policy.max_delay_ms);
+            let half = capped / 2;
+            for _ in 0..100 {
+                let delay = policy.delay(attempt).as_millis() as u64;
+                assert!(
+                    (half..=capped).contains(&delay),
+                    "jitter delay {} out of range [{}, {}]",
+                    delay, half, capped,
+                );
+            }
+        }
     }
 }
