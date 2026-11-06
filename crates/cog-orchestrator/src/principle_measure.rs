@@ -1190,4 +1190,103 @@ mod tests {
             }]
         );
     }
+
+    /// A gate is one claim read from two directions, and this test asks both of
+    /// the same line: the end that searches the tree for a declaration, and the
+    /// end that judges the row it names.
+    ///
+    /// A verification made at the end that writes the fix is not a verification.
+    /// Two ends read a declaration here -- a walk that searches each source with
+    /// an anchored prefix, and a parse-and-judge pair that turns the line it
+    /// found into a state on the row. A prefix added to the closed set with no
+    /// source walking for it leaves a shape the parser accepts from a line
+    /// nothing ever finds; a source searched with a prefix the parser cannot
+    /// strip leaves `gate_for` empty and the verdict unsettled. Each is a fix
+    /// that passed where it was written and did nothing where it is judged.
+    ///
+    /// So every `(pathspec, prefix)` pair is walked, one concrete path is
+    /// derived from the pathspec, and the same declaration is written at each of
+    /// the three indentations the tree actually uses -- the anchor holds only
+    /// whitespace, so the indentation is not what separates a declaration from
+    /// prose. `gate_for` has to name that path, and the judge, given a host
+    /// column that arrived and found no gate, has to record the row as enforced
+    /// by the platform's registry.
+    ///
+    /// The negative reads the other direction, where the two ends are not the
+    /// same question: a line whose remainder is not exactly one slug is kept as
+    /// unreadable, and the row it might have named is settled by nothing. It is
+    /// not booked as "there is no gate" -- that would record a debt against a
+    /// principle whose gate is one misspelling away from being found.
+    ///
+    /// principle: feedback_a_fix_must_be_checked_against_the_end_that_judges_it
+    #[test]
+    fn a_declaration_the_search_finds_is_the_one_the_judge_moves_the_row_on() {
+        for &(pathspec, prefix) in PLATFORM_REGISTRY_SOURCES {
+            // The search end first: a pathspec no walk visits, or a pair that
+            // drifted from the prefix its parser strips, is a gate counted at
+            // one end and invisible at the other.
+            let path = pathspec.replace('*', "x");
+            assert!(
+                cog_core::is_a_registry_source(&path),
+                "{pathspec:?} derives {path:?}, which no registry walk visits"
+            );
+            for indent in ["", "    ", "\t"] {
+                let line = format!("{indent}{prefix} feedback_x");
+                assert!(
+                    line.trim_start().starts_with(prefix),
+                    "{line:?} is not the shape {prefix:?} is searched for"
+                );
+                let registry = declarations(&[(path.as_str(), line.as_str())]);
+                assert_eq!(
+                    registry.gate_for("feedback_x"),
+                    Some(path.as_str()),
+                    "{line:?} in {path:?} was searched for and read as another file"
+                );
+                // The end that judges it. The host column is `-`: a reading
+                // arrived and found no gate there, so this verdict rests on the
+                // platform side alone.
+                let verdict = judge(
+                    &row("feedback_x", Some(HOST_REGISTRY_READ_NO_GATE)),
+                    &registry,
+                );
+                assert_eq!(
+                    verdict,
+                    Verdict::Enforced(GateSide::Platform),
+                    "{line:?} in {path:?} is declared and does not move the row"
+                );
+                assert_eq!(
+                    verdict.state(),
+                    Some(cog_core::PrincipleState::Enforced),
+                    "{line:?} in {path:?} leaves the row where it was"
+                );
+            }
+        }
+        // A line the prefix search does find and the parser cannot key: the
+        // account holds it as unreadable, and the row is unsettled rather than
+        // booked as a principle with no gate.
+        let prose = "the convention is written //! principle: <slug> here";
+        assert!(
+            !PLATFORM_DECLARATION_PREFIXES
+                .iter()
+                .any(|prefix| prose.trim_start().starts_with(prefix)),
+            "the anchored search does not find prose, so this is not a declaration"
+        );
+        let unkeyable = declarations(&[("crates/x/src/lib.rs", prose)]);
+        assert_eq!(unkeyable.gate_for("feedback_x"), None);
+        assert!(unkeyable.unreadable_count() >= 1);
+        let unsettled = judge(
+            &row("feedback_x", Some(HOST_REGISTRY_READ_NO_GATE)),
+            &unkeyable,
+        );
+        assert_eq!(
+            unsettled.reason(),
+            Some(UnsettledReason::DeclarationUnparsable)
+        );
+        assert_eq!(
+            unsettled.state(),
+            None,
+            "a line nothing can key moved the row"
+        );
+        assert_ne!(unsettled, Verdict::Unenforced);
+    }
 }
