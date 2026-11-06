@@ -54,6 +54,11 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
+    // 工具链从哪里取：刷新那趟（`rustup update stable`）要用它们。不传的话镜像
+    // 从镜像源装的工具链，判的时候却去打官方源——CN 侧那一次就是几十秒起、超时
+    // 就退化成"没刷成"。它们说的是工具链来源，不是这次验证要判的东西。
+    "RUSTUP_DIST_SERVER",
+    "RUSTUP_UPDATE_ROOT",
     "RUSTFLAGS",
     "SCCACHE_DIR",
     "SSL_CERT_FILE",
@@ -150,10 +155,19 @@ const NO_LINTER_NOTE: &str =
 /// the promotion that turns a finding into a refusal.
 const BUILTIN_LINT_LINE: &str = "cargo clippy --workspace --all-targets";
 
-/// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：探针、判、改写、复判。
+/// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：刷新工具链、探针、判、改写、复判。
 /// 判干净就提前返回，所以这是上界不是次数。
-// cap: bound — 探针、判、改写、复判四趟；判干净就提前返回，所以是上界不是次数
-const FMT_CMDS_PER_RUN_FMT: u64 = 4;
+// cap: bound — 刷新工具链、探针、判、改写、复判五趟；判干净就提前返回，所以是上界不是次数
+const FMT_CMDS_PER_RUN_FMT: u64 = 5;
+
+/// 判这笔改动的格式化之前，先把这一侧的工具链对到 stable 的最新一次发布。
+///
+/// 为什么刷新的必须是**判据这一侧**：这个镜像自己就是上一版 stable 编出来的，而它只在
+/// 「有变更落地」时才重建。stable 一发布，判据就落后了——旧的 rustfmt 改写出来的形状
+/// 新的判它红，于是没有变更落得住，没有落地就没有重建，判据一直旧下去。2026-11-06 实测
+/// 卡在这条环上：镜像里 rustfmt 1.9.0、CI 判的是 1.10.0，Format 每一笔都红，红的原因
+/// 与提交内容无关。刷一趟把环打开：改写这笔改动的那把 rustfmt 与 CI 那把是同一次发布。
+const BUILTIN_FMT_REFRESH: &[&str] = &["rustup", "update", "stable"];
 
 /// `run_cargo_fmt` 之外直接跑的那趟基线检查（apply 之前，读这棵树本来就
 /// 是不是格式化过的样子）。
@@ -3667,6 +3681,44 @@ impl ChangePipeline {
             .await
     }
 
+    /// 把判据这一侧的工具链对到 stable 的最新发布，失败不拦下这笔改动。
+    ///
+    /// 不拦的理由：刷不成（问不到网、镜像里没有 rustup、装不进只读的 RUSTUP_HOME）
+    /// 说的都是这一侧的环境，不是这笔改动本身；按"环境不对"把这笔改动判红，等于把
+    /// 整条落地链停在一个与提交内容无关的原因上——正是 [`BUILTIN_FMT_REFRESH`] 要解
+    /// 的那条环。所以失败只回一句话：它接着判，但那句话写进判据的证据里，读那条
+    /// 拒绝记录的人能看见"这一版判据用的不是最新 stable"。
+    async fn refresh_builtin_toolchain(&self, workdir: &Path) -> Option<String> {
+        match self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_REFRESH).await {
+            Ok((true, output)) => {
+                info!(
+                    output = output.trim(),
+                    "The formatter that judges this change comes from the latest stable"
+                );
+                None
+            }
+            Ok((false, output)) => {
+                warn!(
+                    output = output.trim(),
+                    "Could not refresh the toolchain the formatter comes from; judging with the one this image carries"
+                );
+                Some(format!(
+                    "The toolchain was not refreshed before judging: {}",
+                    output.trim()
+                ))
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Could not refresh the toolchain the formatter comes from; judging with the one this image carries"
+                );
+                Some(format!(
+                    "The toolchain was not refreshed before judging: {e}"
+                ))
+            }
+        }
+    }
+
     /// Judge this tree's formatting, conforming it when the formatter would
     /// rewrite it: returns (judgeable, rewritten, combined_output).
     ///
@@ -3695,7 +3747,11 @@ impl ChangePipeline {
     /// wrong. So the probe goes first and settles whether there is a formatter
     /// to ask at all; only after that does a nonzero exit mean the tree is what
     /// the formatter rewrites.
+    ///
+    /// 工具链先刷新一趟（[`Self::refresh_builtin_toolchain`]）：判这笔改动的
+    /// rustfmt 得是 CI 判它的那一把，否则下面的"改写"改的是另一种形状。
     async fn run_cargo_fmt(&self, workdir: &Path) -> SFResult<(bool, bool, String)> {
+        let stale = self.refresh_builtin_toolchain(workdir).await;
         let (available, why) = self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_PROBE).await?;
         if !available {
             return Err(SFError::IO(format!(
@@ -3704,6 +3760,12 @@ impl ChangePipeline {
         }
         info!("Running cargo fmt --all -- --check");
         let (clean, checked) = self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_CHECK).await?;
+        // 工具链没刷成的那句话跟着判据走：这句在"这笔改动为什么被判红"的证据里，
+        // 与只存在于某一刻日志里不同——落在变更记录上才有人读得到。
+        let checked = match stale {
+            Some(note) => format!("{note}\n{checked}"),
+            None => checked,
+        };
         if clean {
             return Ok((true, false, checked));
         }

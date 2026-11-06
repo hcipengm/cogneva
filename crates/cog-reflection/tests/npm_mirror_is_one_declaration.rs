@@ -278,3 +278,44 @@ fn the_shipping_image_carries_the_frontend_toolchain() {
          东西能不能用，只有构建时问一句才知道"
     );
 }
+
+/// 判格式化之前刷新工具链这一趟，读的镜像源在运行期要真的存在。
+///
+/// 两头都在的时候什么都不会响，缺一头才是病：少了运行段那两行 ENV，构建期那句
+/// `export` 出不了 RUN，运行期的 `rustup update stable` 去打官方源——CN 侧那一次
+/// 就是几十秒起步、撞上格式化的墙钟界，退化成「没刷成」，于是 `BUILTIN_FMT_REFRESH`
+/// 那条环原样关回去；少了白名单里那两个键，子进程 `env_clear()` 之后也读不到它们，
+/// 效果一模一样，而日志上只说「刷不成」，没有一个字提到是环境没递进去。
+///
+/// 运行段之后的判据与 [`the_shipping_image_carries_the_frontend_toolchain`] 同口径：
+/// `webbuilder` 阶段有没有这些变量，不说明发出去的镜像有没有。
+#[test]
+fn the_formatter_refresh_can_read_its_toolchain_source_at_runtime() {
+    let root = repo_root();
+    let dockerfile = text_of(&root, "Dockerfile");
+    let runtime = dockerfile
+        .rsplit_once("\nFROM ")
+        .map(|(_, tail)| tail)
+        .expect("Dockerfile 里找不到运行段（最后一个 FROM）");
+    for needed in ["RUSTUP_DIST_SERVER=", "RUSTUP_UPDATE_ROOT="] {
+        assert!(
+            runtime.contains(needed),
+            "运行段没有 `{needed}`：刷新那一趟会去打官方源，撞上墙钟界之后退化成\
+             「没刷成」，而判据仍旧是镜像里那一版 rustfmt"
+        );
+    }
+
+    let pipeline = text_of(&root, "crates/cog-reflection/src/change_pipeline.rs");
+    assert!(
+        pipeline.contains(r#"["rustup", "update", "stable"]"#),
+        "判据里没有「把工具链刷到最新 stable」那一趟：镜像只在有变更落地时才重建，\
+         判据落后就形成环——判据旧 ⇒ 每笔红 ⇒ 没有落地 ⇒ 没有重建"
+    );
+    for key in ["\"RUSTUP_DIST_SERVER\",", "\"RUSTUP_UPDATE_ROOT\","] {
+        assert!(
+            pipeline.contains(key),
+            "验证进程的白名单里没有 {key}：子进程 `env_clear()` 之后读不到镜像源，\
+             刷新在 CN 侧恒为失败"
+        );
+    }
+}

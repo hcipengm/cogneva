@@ -270,6 +270,15 @@ RUN if [ -n "$RUSTUP_DIST_SERVER" ]; then \
     fi && \
     /usr/local/cargo/bin/rustup component add rustfmt clippy
 
+# 工具链来源在**运行期**也要读得到：变更验证在判格式化之前跑一趟
+# `rustup update stable`（`change_pipeline` 的 `BUILTIN_FMT_REFRESH`），为的是让改写
+# 这笔改动的那把 rustfmt 与 CI 判它的那把是同一次发布——镜像只在有变更落地时才重建，
+# stable 一发布，镜像里的判据就落后，而形成那条环：判据旧 ⇒ 每笔红 ⇒ 没有落地 ⇒
+# 没有重建。构建期那一把 `export` 出不了 RUN，所以这里写进 ENV；没给镜像源时回落到
+# 官方源，空串会让 rustup 拼出一个空 URL。
+ENV RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://static.rust-lang.org} \
+    RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://static.rust-lang.org/rustup}
+
 # 受限网络：运行时镜像里的自进化/主线跟踪构建也要走 sparse 镜像。
 # builder 阶段写的 /usr/local/cargo/config.toml 不跨阶段，这里必须重写一份，
 # 否则沙盒内 cargo 直连 crates.io，家庭网络上索引拉取慢到构建超时。
