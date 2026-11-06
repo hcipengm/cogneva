@@ -86,6 +86,9 @@ struct TurnJournal {
 async fn pump_events(
     mut events: mpsc::Receiver<cog_core::AgentEvent>,
     out: mpsc::Sender<String>,
+    // 同一帧也落在这条总线上。界面（员工那一面、活动流）读的是总线上的
+    // `agent:<id>`，不是这一条连接：只在连接里发，页面上什么都不会动。
+    bus: tokio::sync::broadcast::Sender<cog_core::AgentEvent>,
     session_id: String,
     message_id: String,
 ) -> TurnJournal {
@@ -97,6 +100,8 @@ async fn pump_events(
     // 可以回一个目标号，那时界面会多出一条它并不负责的目标帧。
     let mut in_flight: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     while let Some(event) = events.recv().await {
+        // 没有订阅者时 send 会失败，这不是错：连接先走了，帧没有人要。
+        let _ = bus.send(event.clone());
         match event {
             AgentEvent::MessageUpdate {
                 assistant_event, ..
@@ -436,6 +441,7 @@ pub async fn run_chat_turn(
     let pump = tokio::spawn(pump_events(
         events_rx,
         out.clone(),
+        state.event_tx.clone(),
         session_id.clone(),
         assistant_mid.clone(),
     ));
@@ -567,7 +573,14 @@ mod tests {
         use cog_core::{AgentEvent, AssistantMessageEvent};
         let (events_tx, events_rx) = mpsc::channel(8);
         let (out_tx, mut out_rx) = mpsc::channel(32);
-        let pump = tokio::spawn(pump_events(events_rx, out_tx, "s1".into(), "m-1".into()));
+        let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
+        let pump = tokio::spawn(pump_events(
+            events_rx,
+            out_tx,
+            bus,
+            "s1".into(),
+            "m-1".into(),
+        ));
 
         let update = |event| AgentEvent::MessageUpdate {
             agent_id: "a".into(),
@@ -607,6 +620,55 @@ mod tests {
         assert!(lines[2].contains("再说一句"), "{joined}");
     }
 
+    /// 同一帧也落在界面的总线上。
+    ///
+    /// 员工那一面与活动流读的是网关的 `agent:<id>` 广播，不是这一条聊天连接：
+    /// 只在连接里发帧，屏幕上一次工具调用也看不见——2026-11-06 实测，对话里
+    /// 跑完六次工具调用，员工那一面一行都没有。这条判据钉的是同一帧两处都在。
+    #[tokio::test]
+    async fn the_same_frames_land_on_the_bus_the_interface_reads() {
+        use cog_core::AgentEvent;
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (out_tx, _out_rx) = mpsc::channel(32);
+        let (bus, mut bus_rx) = tokio::sync::broadcast::channel(8);
+        let pump = tokio::spawn(pump_events(
+            events_rx,
+            out_tx,
+            bus,
+            "s1".into(),
+            "m-1".into(),
+        ));
+
+        events_tx
+            .send(AgentEvent::ToolExecutionStart {
+                agent_id: "mira-5ff6bdd2".into(),
+                tool_call_id: "call-1".into(),
+                tool_name: "run_command".into(),
+                args: serde_json::json!({ "command": "ls" }),
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        drop(events_tx);
+        let _ = pump.await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), bus_rx.recv())
+            .await
+            .expect("这一帧没有落到总线：界面上看不到它")
+            .expect("总线这一头应该收到一帧");
+        match event {
+            AgentEvent::ToolExecutionStart {
+                agent_id,
+                tool_name,
+                ..
+            } => {
+                assert_eq!(agent_id, "mira-5ff6bdd2");
+                assert_eq!(tool_name, "run_command");
+            }
+            other => panic!("总线收到的不是工具帧：{other:?}"),
+        }
+    }
+
     /// 派出去的每个目标都要有自己的那一帧，重复的不发第二遍。
     ///
     /// 界面靠这一帧把目标号接到执行者视图上；同一个目标发两帧，界面那边就会看到
@@ -616,7 +678,14 @@ mod tests {
         use cog_core::AgentEvent;
         let (events_tx, events_rx) = mpsc::channel(8);
         let (out_tx, mut out_rx) = mpsc::channel(32);
-        let pump = tokio::spawn(pump_events(events_rx, out_tx, "s1".into(), "m-1".into()));
+        let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
+        let pump = tokio::spawn(pump_events(
+            events_rx,
+            out_tx,
+            bus,
+            "s1".into(),
+            "m-1".into(),
+        ));
 
         // 真事件流是「开始 → 结局」成对的：结局只带调用号，名字在开始那一帧上。
         let started = |id: &str, tool: &str| AgentEvent::ToolExecutionStart {
