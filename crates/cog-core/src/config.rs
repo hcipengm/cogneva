@@ -296,10 +296,14 @@ pub struct DagExecutorConfig {
     #[serde(default = "default_result_claim_batch")]
     pub result_claim_batch: usize,
     /// How long a self-evolution task may run before the timeout checker
-    /// reclaims it (seconds). These tasks drive multi-agent LLM collaboration,
-    /// which outlasts an ordinary atomic task by a wide margin — but every
-    /// second here is also how long a task orphaned by a restart stays
-    /// invisible, so the value belongs to the deployment rather than to the
+    /// reclaims it (seconds), for a class that has no measured duration yet.
+    ///
+    /// This is a seed, not the wall. Once a class has finished enough runs,
+    /// its wall is read from those runs' own durations, because one number
+    /// covering every class is wrong in both directions: too short cuts a long
+    /// run off before its result exists, too long lets a stuck run sit on the
+    /// slot forever. The same number still bounds how long a task orphaned by a
+    /// restart stays held, so it belongs to the deployment rather than to the
     /// code that creates the task.
     #[serde(default = "default_self_evolution_timeout_secs")]
     pub self_evolution_timeout_secs: u64,

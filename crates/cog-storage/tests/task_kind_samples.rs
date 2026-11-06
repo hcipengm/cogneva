@@ -132,6 +132,10 @@ async fn the_duration_a_baseline_inherits_is_the_time_the_task_worked() {
         "工期要从开工量起；按创建量会得到一周（{} 秒），那是排队时间",
         7 * 24 * 3600
     );
+    assert_eq!(
+        waited.p99_duration_secs, 600,
+        "五条都是十分钟，长尾也是十分钟——量不出长尾时，九成九退化成这些样本本身"
+    );
     assert_eq!(waited.samples, 5, "五条量过工时的样本");
 
     assert!(

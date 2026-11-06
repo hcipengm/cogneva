@@ -5,7 +5,7 @@ use cog_core::{
     EmbeddingProvider, ObjectBackend, SFError, SFResult, Skill, SkillRegistry, Task, TaskExecutor,
     TaskType, VectorBackend,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -112,6 +112,51 @@ impl AnswerReuse {
     }
 }
 
+/// 一批自我进化任务各自的墙，以及每堵墙是从哪一层读来的。
+///
+/// 三层，越往上越硬：这一类自己量出来的长尾、整个平台量出来的最长一类、部署
+/// 声明的起手值。分层不是为了好看，是因为这三层的证据强度不一样，而读的人要
+/// 能看出手上这个秒数有多硬——日志里跟着墙一起印的就是这一层。
+#[derive(Default)]
+struct DurationWalls {
+    by_kind: HashMap<String, u64>,
+    /// 每种墙背后有多少条跑完的样本。
+    sample_sizes: HashMap<String, u64>,
+    /// 已量出的种类里最长的那一个：这一类还没量过时先用它。
+    platform: Option<u64>,
+}
+
+impl DurationWalls {
+    fn from_records(records: Vec<cog_core::TaskKindRecord>) -> Self {
+        let mut walls = Self::default();
+        for record in records {
+            if record.p99_duration_secs == 0 {
+                continue;
+            }
+            walls.platform = Some(walls.platform.map_or(record.p99_duration_secs, |longest| {
+                longest.max(record.p99_duration_secs)
+            }));
+            walls
+                .sample_sizes
+                .insert(record.kind.clone(), record.samples);
+            walls.by_kind.insert(record.kind, record.p99_duration_secs);
+        }
+        walls
+    }
+
+    /// 这一类活的墙，以及它是哪一层给的。
+    fn wall_for(&self, kind: &str, seed: u64) -> (u64, &'static str, u64) {
+        if let Some(wall) = self.by_kind.get(kind).copied() {
+            let samples = self.sample_sizes.get(kind).copied().unwrap_or(0);
+            return (wall, "this class", samples);
+        }
+        if let Some(wall) = self.platform {
+            return (wall, "longest measured class", 0);
+        }
+        (seed, "seed: nothing finished has a measured duration", 0)
+    }
+}
+
 /// ActionPlanOrchestrator implements Stage 1 decomposition logic:
 /// semantic goal decomposition, boundary detection, dependency inference,
 /// DAG validation, and a feedback loop with pattern DB self-enhancement.
@@ -130,7 +175,12 @@ pub struct ActionPlanOrchestrator {
     /// Decomposition attempts per goal delivery before an empty result is
     /// treated as a hard failure (clamped to >= 1).
     decomposition_max_attempts: u32,
-    /// DAG timeout granted to a directly-injected self-evolution task.
+    /// 直接注入的自我进化任务还没量出自己那一类的时长时，先按这个数给墙。
+    ///
+    /// 只是个起手值，不是墙本身：一旦这一类有够数的跑完样本，墙改由
+    /// [`Self::kind_duration_walls`] 从实测分布里量。写死一个秒数当墙，短的
+    /// 会让长程活必然停在半路，长的会让卡死的活永远占着槽——两头都是这个平台
+    /// 付过一次的账。
     self_evolution_timeout_secs: u64,
     /// Optional persistent alert port for decomposition failures. Attached
     /// after plugin init (the store is published by another plugin).
@@ -307,9 +357,10 @@ impl ActionPlanOrchestrator {
         self
     }
 
-    /// DAG timeout for a directly-injected self-evolution task. Deployment
-    /// policy: the same value decides how long a task orphaned by a restart
-    /// stays held before the timeout checker reclaims it.
+    /// 还没量出时长的那一类活，起手用的墙（秒）。
+    ///
+    /// 部署侧设的是起手值，不是墙的上限或下限：有实测样本的种类不用它。同一个
+    /// 数也是重启后没人拾取的任务在超时触发器上挂多久，所以它不能是 0。
     pub fn with_self_evolution_timeout_secs(mut self, secs: u64) -> Self {
         self.self_evolution_timeout_secs = secs.max(1);
         self
@@ -323,6 +374,49 @@ impl ActionPlanOrchestrator {
 
     async fn alert_sink(&self) -> Option<Arc<dyn cog_core::PersistentAlertSink>> {
         self.alert_sink.read().await.clone()
+    }
+
+    /// 每一类跑完的活自己量出来的墙：这一类跑完时最多用了多久，墙就是多久。
+    ///
+    /// 墙在这里量而不是写死一个秒数，因为一条活该跑多久只有它自己那一类知道：
+    /// 平台上的任务从几秒的巡检到跨小时的重构都有，拿一个数盖住全部，短了把
+    /// 长程活砍在成果出来之前（跑满、被回收、重排、再跑满一遍），长了让卡死的
+    /// 活一直占着槽——2026-11-06 现网 1591 条 pending 重试了 63～71 次，占的是
+    /// 后者的便宜。
+    ///
+    /// 取九成九而不是中位数：中位数是分布的中段，拿它当硬停等于让一半已知能跑完
+    /// 的活停在半路。样本不够的种类不进表——「这一类还没量过」与「量出来是零秒」
+    /// 在调用方读起来必须不一样，所以零秒不当作墙。
+    ///
+    /// 这一类还没有样本时不用起手值，先用全平台量出来的最长一类：那一个数虽然
+    /// 不是这一类自己的，但它是实测的，而这一类只会在跑完第一件之后立刻换掉它。
+    /// 整张表一条时长都没量过（新装、空库）时才有起手值可用——那时没有任何证据，
+    /// 而 0 秒在这条判据里读作「立刻超时」，所以不能拿 0 当「不设」。
+    ///
+    /// 读不到（后端没接、查询失败）只让整批退回起手值，不让提交失败：一次读失败
+    /// 把整批自我进化任务拒掉，比给它们一个没量过的墙更坏。
+    async fn kind_duration_walls(&self) -> DurationWalls {
+        let Some(backend) = self.state_backend.as_ref() else {
+            return DurationWalls::default();
+        };
+        match backend
+            .task_kind_records(
+                &self.workspace_id,
+                crate::dag_executor::MIN_ESTIMATE_SAMPLES,
+            )
+            .await
+        {
+            Ok(records) => DurationWalls::from_records(records),
+            Err(error) => {
+                tracing::warn!(
+                    workspace_id = %self.workspace_id,
+                    %error,
+                    "could not read the measured durations; self-evolution tasks fall back to \
+                     the seed wall instead of their kind's own"
+                );
+                DurationWalls::default()
+            }
+        }
     }
 
     /// Read-only access to the pattern DB (used in tests and for diagnostics).
@@ -926,6 +1020,9 @@ impl ActionPlanOrchestrator {
             let mut requested = Vec::new();
             let mut queued = Vec::new();
             if let Some(ref dag) = self.dag_executor {
+                // 墙按种类量一次，整批共用：同一批里的活分类往往不同（一次提交
+                // 里既有巡检也有重构），一条活的墙不该被另一条活的时长决定。
+                let walls = self.kind_duration_walls().await;
                 let mut batch = Vec::with_capacity(tasks.len());
                 for mut task in tasks {
                     task.goal_id = Some(goal_id.clone());
@@ -934,7 +1031,20 @@ impl ActionPlanOrchestrator {
                     // parent pointer its siblings hang from, and nothing about
                     // the branch's own work makes that row runnable.
                     task.is_executable = task.is_executable || task.is_self_evolution();
-                    task.timeout_seconds = self.self_evolution_timeout_secs;
+                    // 墙按这一类自己量，每一条都记下它从哪一层来：没有这条读数，
+                    // 「墙是不是跟着实测在动」在日志里看不见，闭环就只是说法。
+                    let kind = task.task_type.kind_key();
+                    let (wall, wall_source, wall_samples) =
+                        walls.wall_for(&kind, self.self_evolution_timeout_secs);
+                    task.timeout_seconds = wall;
+                    tracing::info!(
+                        task_id = %task.id,
+                        kind = %kind,
+                        wall_secs = wall,
+                        wall_source,
+                        wall_samples,
+                        "self-evolution deadline taken for this task"
+                    );
                     task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
                         verified: true,
                         version: Some("1.0.0".into()),
@@ -2886,6 +2996,8 @@ mod tests {
     struct PlanRecorder {
         plans: std::sync::Mutex<Vec<cog_core::TaskPlan>>,
         fail_writes: bool,
+        /// 这一类活跑完时最多用了多久（空表示后端还没量出样本）。
+        kind_records: Vec<cog_core::TaskKindRecord>,
     }
 
     /// 只数「分解有没有真的发出这一次调用」的执行器。
@@ -3161,6 +3273,13 @@ mod tests {
         }
         async fn task_plans(&self, _workspace_id: &str) -> SFResult<Vec<cog_core::TaskPlan>> {
             Ok(self.plans.lock().unwrap().clone())
+        }
+        async fn task_kind_records(
+            &self,
+            _workspace_id: &str,
+            _min_samples: u64,
+        ) -> SFResult<Vec<cog_core::TaskKindRecord>> {
+            Ok(self.kind_records.clone())
         }
         async fn get_checkpoint(
             &self,
@@ -3831,6 +3950,7 @@ mod tests {
         let recorder = Arc::new(PlanRecorder {
             plans: std::sync::Mutex::new(Vec::new()),
             fail_writes: true,
+            kind_records: Vec::new(),
         });
 
         let planner = ActionPlanOrchestrator::new()
@@ -4346,6 +4466,79 @@ mod tests {
         assert_eq!(
             stored.input["evolution_mode"],
             serde_json::json!("generate_change")
+        );
+    }
+
+    /// 墙按这一类活自己量出来的时长定，不是一个写死的秒数。
+    ///
+    /// 平台上的自我进化活从几分钟的巡检到跨小时的重构都有，一个数盖住全部时
+    /// 两头都错：短了把长程活砍在成果出来之前（跑满、被回收、重排、再跑满），
+    /// 长了让卡死的活一直占着槽。这里钉住三层里的两层：量过样本的那一类拿它
+    /// 自己的长尾当墙，没量过的那一类拿全平台量出来的最长一类，都不是起手值。
+    #[tokio::test]
+    async fn the_self_evolution_wall_is_the_class_own_measured_duration() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-evolution-wall".to_string()));
+        let record = |kind: &str, samples: u64, median: u64, p99: u64| cog_core::TaskKindRecord {
+            kind: kind.into(),
+            samples,
+            median_tokens: 0,
+            median_duration_secs: median,
+            p99_duration_secs: p99,
+        };
+        let recorder = Arc::new(PlanRecorder {
+            plans: std::sync::Mutex::new(Vec::new()),
+            fail_writes: false,
+            kind_records: vec![
+                record("platform_issue_fix", 12, 900, 3_600),
+                record("long_refactor", 40, 1_800, 9_000),
+            ],
+        });
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-should-not-exist")]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_plan_store(recorder, "ws-evolution-wall")
+            .with_self_evolution_timeout_secs(600);
+
+        let registry = SkillRegistry::new();
+        let marked = |id: &str, kind: &str| {
+            Task::new(
+                id,
+                TaskType::Custom(kind.into()),
+                serde_json::json!({"goal": "fix it", "evolution_mode": "generate_change"}),
+            )
+        };
+        let measured = planner
+            .process_goal_impl(
+                "量过的那一类",
+                vec![marked("issue-12", "platform_issue_fix")],
+                &registry,
+            )
+            .await
+            .unwrap();
+        assert_eq!(measured, vec!["issue-12".to_string()]);
+        let stored = dag.get_task("issue-12").await.unwrap();
+        assert_eq!(
+            stored.timeout_seconds, 3_600,
+            "墙是这一类自己量出来的长尾（一小时），不是全平台最长的一类（两个半小时），\
+             也不是中位数（十五分钟）"
+        );
+
+        let unmeasured = planner
+            .process_goal_impl(
+                "还没量过的那一类",
+                vec![marked("issue-13", "nightly_scan")],
+                &registry,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unmeasured, vec!["issue-13".to_string()]);
+        let stored = dag.get_task("issue-13").await.unwrap();
+        assert_eq!(
+            stored.timeout_seconds, 9_000,
+            "这一类还没有样本，先用全平台量出来的最长一类；起手值只在一条时长都没量过时用"
         );
     }
 

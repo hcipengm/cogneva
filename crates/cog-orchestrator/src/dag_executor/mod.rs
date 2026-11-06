@@ -4115,6 +4115,7 @@ mod consumer_ack_tests {
             samples,
             median_tokens: tokens,
             median_duration_secs: secs,
+            p99_duration_secs: secs,
         }
     }
 

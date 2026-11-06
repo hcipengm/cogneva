@@ -1119,7 +1119,7 @@ impl StateBackend for PostgresStateBackend {
         // 仍然是从任务行自己量出来的——那足以排一条甘特条。把「有没有花销样本」
         // 也塞进 HAVING，会让整行连同工时一起消失，于是账本按运行 id 记的那些
         // 天里，一件活也排不上期。
-        let rows: Vec<(String, i64, i64, f64)> = self
+        let rows: Vec<(String, i64, i64, f64, f64)> = self
             .retry(|| async {
                 sqlx::query_as(
                     r#"
@@ -1152,6 +1152,17 @@ impl StateBackend for PostgresStateBackend {
                                COUNT(DISTINCT task_id) FILTER (WHERE costed)::BIGINT AS cost_samples
                           FROM joined
                          GROUP BY kind
+                    ),
+                    -- 时长分位从 `done` 取，不从 `joined` 取：一件活有几行清点账，
+                    -- 在 `joined` 里就有几行，按它算分位等于让调用次数多的活把
+                    -- 分位拉向自己——那是「谁问得多」，不是「同类活跑多久」。
+                    durations AS (
+                        SELECT kind,
+                               percentile_cont(0.5) WITHIN GROUP (ORDER BY dur) AS med_secs,
+                               percentile_cont(0.99) WITHIN GROUP (ORDER BY dur) AS p99_secs
+                          FROM done
+                         WHERE dur IS NOT NULL
+                         GROUP BY kind
                     )
                     SELECT t.kind,
                            t.samples,
@@ -1159,11 +1170,12 @@ impl StateBackend for PostgresStateBackend {
                                          ORDER BY j.total_tokens)
                                      FILTER (WHERE j.costed AND t.cost_samples >= $2))::BIGINT, 0)
                                AS med_tokens,
-                           COALESCE(percentile_cont(0.5) WITHIN GROUP (
-                                        ORDER BY j.dur), 0) AS med_secs
+                           COALESCE(d.med_secs, 0) AS med_secs,
+                           COALESCE(d.p99_secs, 0) AS p99_secs
                       FROM tally t
                       JOIN joined j ON j.kind = t.kind
-                     GROUP BY t.kind, t.samples, t.cost_samples
+                      JOIN durations d ON d.kind = t.kind
+                     GROUP BY t.kind, t.samples, t.cost_samples, d.med_secs, d.p99_secs
                     HAVING t.samples >= $2
                     "#,
                 )
@@ -1179,11 +1191,12 @@ impl StateBackend for PostgresStateBackend {
         Ok(rows
             .into_iter()
             .map(
-                |(kind, samples, med_tokens, med_secs)| cog_core::TaskKindRecord {
+                |(kind, samples, med_tokens, med_secs, p99_secs)| cog_core::TaskKindRecord {
                     kind,
                     samples: samples.max(0) as u64,
                     median_tokens: med_tokens.max(0) as u64,
                     median_duration_secs: med_secs.max(0.0).round() as u64,
+                    p99_duration_secs: p99_secs.max(0.0).round() as u64,
                 },
             )
             .collect())
