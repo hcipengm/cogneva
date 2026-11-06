@@ -1933,7 +1933,7 @@ async fn unanswered_run(handle: &mut Option<tokio::task::JoinHandle<()>>) -> SFE
 /// 已经退出的对象在它眼里仍然活着，之后每一次派发都在空壳上瞬间失败、一次模型调用
 /// 都不发生。判据取的是「那把把手结束了没有」，不是「通道还在不在」。
 fn loop_is_gone(handle: Option<&tokio::task::JoinHandle<()>>) -> bool {
-    handle.map_or(true, |h| h.is_finished())
+    handle.is_none_or(|h| h.is_finished())
 }
 
 /// A panic's payload as text, since the payload is what names the defect.

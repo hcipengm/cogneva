@@ -255,7 +255,7 @@ pub async fn read_people(kv: &Arc<dyn cog_core::KeyValueStore>) -> Vec<(String, 
             ),
         }
     }
-    rows.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1.last_seen));
     rows
 }
 
@@ -1660,7 +1660,7 @@ fn roster_with_people(
         .into_iter()
         .filter(|(agent_id, _)| !live_ids.contains(agent_id.as_str()))
         .collect();
-    idle.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+    idle.sort_by_key(|row| std::cmp::Reverse(row.1.last_seen));
     for (agent_id, row) in idle {
         views.push(serde_json::json!({
             "agent_id": agent_id,

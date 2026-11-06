@@ -175,6 +175,11 @@ pub struct PlatformConversation {
 }
 
 impl PlatformConversation {
+    // 八个入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
+    // 「这个部署里装了哪些」，把其中几个打包只会让调用方多记一个类型名，
+    // 而少掉的参数个数并不能让这行更好读。构造完就各归各位，没有第二处
+    // 地方再按这个分组使用它们。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         orchestrator: Arc<dyn OrchestratorControl>,
         admission: Option<Arc<dyn HierarchyManager>>,

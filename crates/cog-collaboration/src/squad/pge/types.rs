@@ -1381,7 +1381,9 @@ mod tests {
 
         let plan = crate::squad::pge::roundtable::parse_planner_output(&sentinel, "修好它");
         assert!(
-            plan.plan.as_str().is_some_and(|text| text.contains("context_floor")),
+            plan.plan
+                .as_str()
+                .is_some_and(|text| text.contains("context_floor")),
             "计划这一侧也一样：空计划是合法计划，不说原因就读成「看过、没什么可做」: {}",
             plan.plan
         );
