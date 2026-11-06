@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use cog_core::{
     infer_dependencies, validate_dag, ActionPlan, AtomicTask, DagError, DecompositionPattern,
     EmbeddingProvider, ObjectBackend, SFError, SFResult, Skill, SkillRegistry, Task, TaskExecutor,
-    TaskType, VectorBackend,
+    TaskStatus, TaskType, VectorBackend,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -2044,6 +2044,46 @@ impl ActionPlanOrchestrator {
             .collect()
     }
 
+    /// 占位行的终态什么时候能写下：同一 parent 的子任务全部走到终态那一刻。
+    ///
+    /// 占位行自己不执行，谁也不会按它跑出一个结果来，所以它的终态只能从子任务那边
+    /// 推出来。认领关系只看声明：子任务是 `parent_task_id` 指向本行的那几条——分解
+    /// 一次性写下这个指针，读面据此才有一棵树；按「谁等着谁」全局重算会把这个指针
+    /// 要替掉的那种算法请回来，别的目标的行、单独提交的行都会被算成本行的子任务。
+    ///
+    /// 三件不写的情形，各有各的理由：本行已落终态（写下的判词不被覆盖，级联取消正是
+    /// 从这条走的）；`rows` 里没有一条认领本行（没有子任务的占位行归孤儿对账器，这里
+    /// 不下结论）；还有子任务没走完（占位行跟着等）。
+    ///
+    /// 全走完时，只有全部 `Completed` 才算答案交出来了。一条 `Failed` 或 `Cancelled`
+    /// 就是 `Failed`：被取消的子任务同样没有交出答案，不因为没人失败就把目标记成成功。
+    pub fn goal_outcome_after_child(parent: &Task, rows: &[Task]) -> Option<TaskStatus> {
+        if parent.status.is_terminal() {
+            return None;
+        }
+        let mut any_child = false;
+        let mut all_completed = true;
+        for row in rows
+            .iter()
+            .filter(|row| row.id != parent.id)
+            .filter(|row| row.parent_task_id.as_deref() == Some(parent.id.as_str()))
+        {
+            any_child = true;
+            if !row.status.is_terminal() {
+                return None;
+            }
+            all_completed &= row.status == TaskStatus::Completed;
+        }
+        if !any_child {
+            return None;
+        }
+        Some(if all_completed {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        })
+    }
+
     /// Append a new pattern to the DB and apply expiration/eviction.
     /// Async because real-world implementations may persist the pattern to a
     /// vector store, embedding service, or external DB. The current in-memory
@@ -3787,6 +3827,128 @@ mod tests {
         let mut ring_a = atomic_task("a");
         ring_a.blocked_by = vec!["b".into()];
         assert!(ActionPlanOrchestrator::sinks_of(&[ring_a, second]).is_empty());
+    }
+
+    /// 占位行名下的一行：判据只读两个字段——父指针与状态。
+    fn child_row(parent: &str, id: &str, status: TaskStatus) -> Task {
+        let mut row = hint_task(id);
+        row.parent_task_id = Some(parent.to_string());
+        row.status = status;
+        row
+    }
+
+    /// 有一条子任务还没走完：占位行留在原地，这一刻什么都不写。
+    ///
+    /// 写成提前判 Completed 的形状，就是把「等它跑完」读成「它跑完了」——占位行会在
+    /// 子任务还排着队的时候宣布答案已经交出来。
+    #[test]
+    fn pending_child_keeps_the_placeholder_open() {
+        let parent = hint_task("goal-row");
+        let rows = vec![
+            child_row("goal-row", "a", TaskStatus::Completed),
+            child_row("goal-row", "b", TaskStatus::Pending),
+            child_row("goal-row", "c", TaskStatus::Completed),
+        ];
+        assert_eq!(
+            ActionPlanOrchestrator::goal_outcome_after_child(&parent, &rows),
+            None
+        );
+    }
+
+    /// 全部走完且全部跑成：答案交出来了。
+    #[test]
+    fn all_children_completed_completes_the_placeholder() {
+        let parent = hint_task("goal-row");
+        let rows = vec![
+            child_row("goal-row", "a", TaskStatus::Completed),
+            child_row("goal-row", "b", TaskStatus::Completed),
+        ];
+        assert_eq!(
+            ActionPlanOrchestrator::goal_outcome_after_child(&parent, &rows),
+            Some(TaskStatus::Completed)
+        );
+    }
+
+    /// 有一条判死：目标没有答案可抄，推成 Failed。
+    #[test]
+    fn one_failed_child_fails_the_placeholder() {
+        let parent = hint_task("goal-row");
+        let rows = vec![
+            child_row("goal-row", "a", TaskStatus::Completed),
+            child_row("goal-row", "b", TaskStatus::Failed),
+            child_row("goal-row", "c", TaskStatus::Completed),
+        ];
+        assert_eq!(
+            ActionPlanOrchestrator::goal_outcome_after_child(&parent, &rows),
+            Some(TaskStatus::Failed)
+        );
+    }
+
+    /// 被取消的子任务同样没有交出答案：没人失败不等于目标做成了。
+    #[test]
+    fn a_cancelled_child_counts_as_not_delivered() {
+        let parent = hint_task("goal-row");
+        let rows = vec![
+            child_row("goal-row", "a", TaskStatus::Cancelled),
+            child_row("goal-row", "b", TaskStatus::Completed),
+        ];
+        assert_eq!(
+            ActionPlanOrchestrator::goal_outcome_after_child(&parent, &rows),
+            Some(TaskStatus::Failed)
+        );
+    }
+
+    /// 别的 parent 的行还没走完，不该把这一行的答案扣在这里。
+    #[test]
+    fn children_of_another_parent_are_ignored() {
+        let parent = hint_task("goal-row");
+        let rows = vec![
+            child_row("goal-row", "a", TaskStatus::Completed),
+            child_row("goal-row", "b", TaskStatus::Completed),
+            child_row("other-goal", "c", TaskStatus::Pending),
+        ];
+        assert_eq!(
+            ActionPlanOrchestrator::goal_outcome_after_child(&parent, &rows),
+            Some(TaskStatus::Completed)
+        );
+    }
+
+    /// 没有子任务的占位行归孤儿对账器，这里不下结论——空组不是「全做完了」。
+    #[test]
+    fn a_placeholder_with_no_children_is_not_decided() {
+        let parent = hint_task("goal-row");
+        assert_eq!(
+            ActionPlanOrchestrator::goal_outcome_after_child(&parent, &[]),
+            None
+        );
+        // `rows` 里有它自己那一行、也有与它无关的行，仍然没有一条认领它做 parent。
+        let rows = vec![hint_task("goal-row"), hint_task("somewhere-else")];
+        assert_eq!(
+            ActionPlanOrchestrator::goal_outcome_after_child(&parent, &rows),
+            None
+        );
+    }
+
+    /// 已经写下的判词不被覆盖：级联取消落在这一条上，子任务事后跑成什么样都不再改写它。
+    #[test]
+    fn an_already_terminal_placeholder_is_not_overwritten() {
+        let rows = vec![
+            child_row("goal-row", "a", TaskStatus::Completed),
+            child_row("goal-row", "b", TaskStatus::Completed),
+        ];
+        for written in [
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+            TaskStatus::Completed,
+        ] {
+            let mut parent = hint_task("goal-row");
+            parent.status = written;
+            assert_eq!(
+                ActionPlanOrchestrator::goal_outcome_after_child(&parent, &rows),
+                None,
+                "占位行已经写着 {written:?}，不重写"
+            );
+        }
     }
 
     /// 分解给出的唯一收口任务要写在目标行上：读面（网关视图、评测桥）据这条声明取答案。
