@@ -121,6 +121,28 @@ const PARTLY_ENFORCED: &[(&str, &str, &str)] = &[
          reachable from them.",
     ),
     (
+        "clippy",
+        "The stage runs the job's command before the suite — the argv itself, \
+         held equal to this job's `run:` line by `cog-reflection`'s \
+         `the_stages_linter_is_the_ci_jobs_linter`, which reads the line out of \
+         this workflow rather than restating it, so the two cannot drift apart \
+         one flag at a time — over the packages the change touches and \
+         everything that depends on them. A finding is the change's if its \
+         primary span lands on a line the change writes; a finding anywhere \
+         else is the change's if the same command, run over the same packages \
+         with the change taken off, did not report it. That second reading is \
+         what answers the 2026-09-28 shape: deleting the only caller of a \
+         function leaves `dead_code` on the function's own line, in a file the \
+         diff never opened.",
+        "The packages with no dependency path from the change are not compiled. \
+         `-D warnings` is the job's and not the stage's, which costs nothing \
+         here: the stage reads warnings and errors alike, so the level is not \
+         what separates the two. The baseline compile is a second compile of the \
+         same packages, paid only when the linter reports something — and not at \
+         all on a baseline the formatter would rewrite, where no line can be \
+         told from the rewrite's and nothing is attributed to the change.",
+    ),
+    (
         "entry-scripts",
         "`bash deploy/scripts/check-entry-scripts.sh` is the job's own command \
          and the stage's: the three blocks of body it used to be (shellcheck \
@@ -172,26 +194,6 @@ const PARTLY_ENFORCED: &[(&str, &str, &str)] = &[
 /// that the list reads as a decision, and so that closing one is a one-line
 /// edit rather than an archaeology.
 const NOT_ENFORCED: &[(&str, &str)] = &[
-    (
-        "clippy",
-        "The observed failure of 2026-09-28, answered narrowly rather than \
-         fully. The stage runs this job's command before the suite — the argv \
-         itself, held equal to this job's `run:` line by \
-         `cog-reflection`'s `the_stages_linter_is_the_ci_jobs_linter`, which \
-         reads the line out of this workflow rather than restating it, so the \
-         two cannot drift apart one flag at a time — and refuses a change only \
-         on diagnostics whose primary span lands on a line that change writes — \
-         the worktree diff against the tree the linter read, and nothing at all \
-         on a baseline the formatter would rewrite, since that rewrite would be \
-         in the same diff. What is left narrower than the job is the verdict, \
-         not the command: a lint whose span stays on a line the change never \
-         wrote passes here and dies in the job, as deleting the only caller of \
-         an unmodified function leaves `dead_code` on that function's line. \
-         Reading the tree's own lint set per revision would close that half and \
-         was declined for its cost — a second whole-tree compile per change, \
-         against a build slot that is the ceiling on how many changes the stage \
-         can retire.",
-    ),
     (
         "coverage",
         "cargo llvm-cov --fail-under-lines 40 judges the whole workspace's \

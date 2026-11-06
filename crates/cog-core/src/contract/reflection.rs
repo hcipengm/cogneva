@@ -1212,6 +1212,103 @@ pub fn introduced_lints(
     attribution
 }
 
+/// One lint finding, keyed without the line it sits on so that two runs of the
+/// same tree at different revisions can be compared.
+///
+/// The line is left out on purpose: reverting a change moves every line after
+/// the hunk, so a finding that is the same finding in both runs would compare
+/// unequal by line alone, and every baseline comparison would read the whole
+/// tree as new. What identifies a finding across two runs is what it says and
+/// where in the file it says it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LintFinding {
+    pub code: String,
+    pub file: String,
+    pub message: String,
+}
+
+/// The findings one transcript carries, with how many times each was reported.
+///
+/// Only lint diagnostics are counted — the same three exclusions
+/// [`introduced_lints`] makes, for the same reason: a compilation error is the
+/// compile's to answer for, and a summary line is a tally of records already
+/// read.
+pub fn lint_findings(transcript: &str) -> BTreeMap<LintFinding, usize> {
+    let mut counts: BTreeMap<LintFinding, usize> = BTreeMap::new();
+    for line in transcript.lines() {
+        let Some(record) = compiler_message_record(line) else {
+            continue;
+        };
+        let Some(message) = record.get("message") else {
+            continue;
+        };
+        let level = message
+            .get("level")
+            .and_then(|l| l.as_str())
+            .unwrap_or_default();
+        if level != "error" && level != "warning" {
+            continue;
+        }
+        let Some(code) = message
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(|c| c.as_str())
+        else {
+            continue;
+        };
+        if is_compiler_error_code(code) {
+            continue;
+        }
+        let Some(file) = message
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .and_then(|spans| {
+                spans
+                    .iter()
+                    .find(|span| span.get("is_primary").and_then(|p| p.as_bool()) == Some(true))
+            })
+            .and_then(|span| span.get("file_name"))
+            .and_then(|f| f.as_str())
+        else {
+            continue;
+        };
+        *counts
+            .entry(LintFinding {
+                code: code.to_string(),
+                file: file.trim_start_matches("./").to_string(),
+                message: message
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .or_default() += 1;
+    }
+    counts
+}
+
+/// The findings this run has and the baseline run does not.
+///
+/// The question this answers is the one a line-based attribution cannot: a
+/// change that deletes the only caller of a function leaves `dead_code` on the
+/// function's own line, in a file the diff never touches. Answering "not this
+/// change's" leaves the finding to the tree-wide job, which is where it costs a
+/// revert after the change has landed.
+///
+/// Counted rather than set-compared: a change that adds a second occurrence of
+/// a finding the tree already had one of has added a finding, and a set
+/// difference would read the pair as the tree's own.
+pub fn lints_beyond_baseline(now: &str, baseline: &str) -> Vec<(LintFinding, usize)> {
+    let before = lint_findings(baseline);
+    lint_findings(now)
+        .into_iter()
+        .filter_map(|(finding, count)| {
+            let had = before.get(&finding).copied().unwrap_or(0);
+            (count > had).then_some((finding, count - had))
+        })
+        .collect()
+}
+
 /// One record of a linter's machine-readable transcript, if the line is one.
 ///
 /// A `--message-format=json` transcript is one JSON object per line, and the
@@ -3489,6 +3586,122 @@ impl Default for MetricsConfig {
         // tree is what answers for a tree that does not compile, and naming a
         // lint here would send the producer after the wrong defect.
         assert_eq!(attribution, LintAttribution::default());
+    }
+
+    /// A finding the compiler words itself, for the baseline comparison.
+    fn finding(code: &str, file: &str, line: u64, message: &str) -> String {
+        serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "warning",
+                "code": { "code": code },
+                "message": message,
+                "spans": [{
+                    "file_name": file,
+                    "line_start": line,
+                    "line_end": line,
+                    "is_primary": true,
+                }],
+            }
+        })
+        .to_string()
+    }
+
+    /// 改动删掉唯一调用者，`dead_code` 落在函数自己的那一行——那一行不是这次
+    /// 改动写的，可这条告警确实是它带来的。按行归属读成「树的」；按「这次跑有、
+    /// 基线跑没有」读，它就是这条变更的。
+    #[test]
+    fn a_finding_the_baseline_did_not_carry_is_the_changes_whatever_line_it_sits_on() {
+        let now = [
+            finding("dead_code", "crates/cog-core/src/lib.rs", 42, "never used"),
+            finding(
+                "dead_code",
+                "crates/cog-core/src/lib.rs",
+                77,
+                "already there",
+            ),
+        ]
+        .join("\n");
+        let baseline = finding(
+            "dead_code",
+            "crates/cog-core/src/lib.rs",
+            71,
+            "already there",
+        );
+        let introduced = lints_beyond_baseline(&now, &baseline);
+        assert_eq!(
+            introduced,
+            vec![(
+                LintFinding {
+                    code: "dead_code".into(),
+                    file: "crates/cog-core/src/lib.rs".into(),
+                    message: "never used".into(),
+                },
+                1,
+            )]
+        );
+    }
+
+    /// 同一个告警多出一处，是多出来的一条。集合相减会把这一对读成树自带的，
+    /// 而那一刻正是「删掉一个调用者」最常见的形状：两处同名的死代码，删掉其中
+    /// 一个的调用者。
+    #[test]
+    fn one_more_copy_of_a_finding_the_tree_already_had_is_still_new() {
+        let now = [
+            finding(
+                "unused_imports",
+                "crates/cog-core/src/lib.rs",
+                5,
+                "unused import",
+            ),
+            finding(
+                "unused_imports",
+                "crates/cog-core/src/lib.rs",
+                9,
+                "unused import",
+            ),
+        ]
+        .join("\n");
+        let baseline = finding(
+            "unused_imports",
+            "crates/cog-core/src/lib.rs",
+            3,
+            "unused import",
+        );
+        let introduced = lints_beyond_baseline(&now, &baseline);
+        assert_eq!(introduced.len(), 1);
+        assert_eq!(introduced[0].1, 1, "多出来的一处要单独算一条");
+    }
+
+    /// 行号动了不算新：改动把整个文件往下推了十行，基线跑与这一次跑说的是同一
+    /// 条告警。按行比较会把整棵树读成新的，然后每一条变更都被它退掉。
+    #[test]
+    fn a_finding_that_only_moved_is_not_new() {
+        let now = finding(
+            "clippy::ptr_arg",
+            "crates/cog-core/src/lib.rs",
+            30,
+            "writing",
+        );
+        let baseline = finding(
+            "clippy::ptr_arg",
+            "crates/cog-core/src/lib.rs",
+            20,
+            "writing",
+        );
+        assert!(lints_beyond_baseline(&now, &baseline).is_empty());
+    }
+
+    /// 编译错误不进这张表：那是「跑一次编译」的判据的事，在这里再算一条就是把
+    /// 同一个缺陷记两次、并且让产出方去修一个不是它写坏的东西。
+    #[test]
+    fn a_compilation_error_is_not_a_finding_but_a_bare_message_is_none_either() {
+        let now = [
+            compiler_message("error", Some("E0308"), "crates/cog-core/src/lib.rs", 12, 12),
+            compiler_message("error", None, "crates/cog-core/src/lib.rs", 13, 13),
+        ]
+        .join("\n");
+        assert!(lints_beyond_baseline(&now, "").is_empty());
     }
 
     #[test]

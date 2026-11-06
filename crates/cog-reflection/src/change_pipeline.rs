@@ -161,12 +161,13 @@ const FMT_CMDS_PER_RUN_FMT: u64 = 4;
 const FMT_BASELINE_CHECKS_PER_CHANGE: u64 = 1;
 
 /// `run_cargo_fmt` 在一条变更里最多被调用几次：apply 之后那趟，加上测试失败后
-/// 读基线失败集合的那趟，再加门禁失败后读基线的那趟。
+/// 读基线失败集合的那趟，门禁失败后读基线的那趟，再加 linter 红了读基线的那趟。
 ///
-/// 三段基线各跑各的：测试红了要读一次，门禁红了也要读一次，而两次不一定在同一条
-/// 变更上发生。数的是上界，所以按加起来算。
-// cap: bound — apply 之后那趟，加测试与门禁两处读基线各一趟
-const FMT_RUNS_PER_CHANGE: u64 = 3;
+/// 四段基线各跑各的：测试红了要读一次，门禁红了要读一次，linter 报了东西也要读
+/// 一次（摘掉改动之后同一棵树要能重新编译），而这三次不一定在同一条变更上发生。
+/// 数的是上界，所以按加起来算。
+// cap: bound — apply 之后那趟，加测试、门禁、linter 三处读基线各一趟
+const FMT_RUNS_PER_CHANGE: u64 = 4;
 
 /// 一条变更在格式化这一段上最长的墙钟时间。
 ///
@@ -178,9 +179,11 @@ pub(crate) const FMT_SEGMENT_WALL_SECS: u64 = DEFAULT_FMT_TIMEOUT_SECS
     * (FMT_BASELINE_CHECKS_PER_CHANGE + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT);
 
 /// 一条变更要跑几条吃**测试**预算的命令：`run_cargo_clippy` 一条，
-/// `run_test_command` 两条（套件一条，测试失败后读基线失败集合再一条）。
-// cap: bound — clippy 一条加测试命令两条
-const TEST_BUDGET_RUNS_PER_CHANGE: u64 = 3;
+/// `run_test_command` 两条（套件一条，测试失败后读基线失败集合再一条），
+/// 加上 linter 报了东西之后要读的那趟基线（把改动摘掉、同一条命令再跑一遍）。
+/// 最后这一条只在红的路上付，界按上界算，所以也算进来。
+// cap: bound — clippy 一条加测试命令两条，加读 linter 基线那一条
+const TEST_BUDGET_RUNS_PER_CHANGE: u64 = 4;
 
 /// 吃**构建**预算的那一条：发布构建，它的 acquire 在 `evolution_deployer` 里。
 // cap: bound — 吃构建预算的只有发布构建那一条
@@ -252,8 +255,8 @@ const CI_GATE_JUDGE_FLAG: &str = "--check";
 ///
 /// - 每条 gated 命令各排一次宿主构建槽。闸门每次排队给的界是 `gate_wait_secs`；
 ///   闸门关着（或并发上限为 0）时调用方传 0，那时 acquire 不排队。
-/// - 每条命令各吃一份自己的超时预算：`run_cargo_clippy` 与两条
-///   `run_test_command` 吃测试预算，发布构建吃构建预算。
+/// - 每条命令各吃一份自己的超时预算：`run_cargo_clippy`（判的那一趟与红了之后
+///   读基线的那一趟）与两条 `run_test_command` 吃测试预算，发布构建吃构建预算。
 /// - 门禁那一段，见 [`REPO_GATE_STAGE_WALL_SECS`]；它不排构建槽（跑的是壳脚本，
 ///   不是编译器），所以只加时长、不加排队。
 /// - 格式化那一段，见 [`FMT_SEGMENT_WALL_SECS`]。
@@ -2040,16 +2043,103 @@ impl ChangePipeline {
                         "{line}: {} diagnostic(s) on this tree, which differs from its baseline by more than this change (the baseline is not what the formatter produces), so none is read as this change's",
                         attribution.diagnostics
                     )
+                } else if attribution.diagnostics > 0 {
+                    // None of them is on a line the change wrote -- which is not
+                    // the same as none of them being the change's. Deleting the
+                    // only caller of a function leaves `dead_code` on the
+                    // function's own line, in a file the diff never opened; the
+                    // line-based reading above files it under "the tree's
+                    // lints", and the tree-wide job finds it after the change
+                    // has landed, been built in release, and been reverted.
+                    //
+                    // So ask the tree itself: take the change off, run the same
+                    // linter, and keep the findings this run has that the
+                    // baseline does not. The compile is the price of a refusal
+                    // that is right, and it is paid only on the red path.
+                    match self
+                        .lints_beyond_baseline(
+                            workdir,
+                            &change.content,
+                            scopes.lint.as_deref(),
+                            &output,
+                        )
+                        .await
+                    {
+                        Ok(introduced) if !introduced.is_empty() => {
+                            let evidence = introduced
+                                .iter()
+                                .map(|(finding, count)| {
+                                    format!(
+                                        "{} {} — {} ({}×)",
+                                        finding.file, finding.code, finding.message, count
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n  ");
+                            warn!(
+                                change_id = %change.artifact_id,
+                                count = introduced.len(),
+                                "Change leaves findings this tree did not have"
+                            );
+                            let _ = self.git_reset_hard(workdir, &change.content).await;
+                            return Ok(ApplyResult {
+                                change_id: change.artifact_id.clone(),
+                                files_changed,
+                                reformatted,
+                                pre_existing_failures: 0,
+                                verdict: ChangeVerdict::Refused(
+                                    cog_core::RejectionCause::LintIntroduced,
+                                ),
+                                test_output: format!(
+                                    "The change leaves the linter reporting findings this tree \
+                                     does not have without it:\n  {evidence}\n\n{output}"
+                                ),
+                                new_status: EvolutionStatus::ValidationFailed,
+                                tiering: Some(tiering.clone()),
+                            });
+                        }
+                        Ok(_) => {
+                            info!(
+                                change_id = %change.artifact_id,
+                                diagnostics = attribution.diagnostics,
+                                "The linter reports this tree's lints, and this tree reports every one of them without the change"
+                            );
+                            format!(
+                                "{line}: {} diagnostic(s) on this tree, none of them on a line this \
+                                 change wrote and none of them absent from this tree without it",
+                                attribution.diagnostics
+                            )
+                        }
+                        // No slot for the baseline compile is the same fact as no
+                        // slot for the verdict's: nothing was judged, so the
+                        // change is kept for an attempt that can compile it.
+                        Err(e) if e.is_build_slot_refused() => {
+                            warn!(
+                                change_id = %change.artifact_id,
+                                error = %e,
+                                "the linter's baseline got no build slot"
+                            );
+                            let _ = self.git_reset_hard(workdir, &change.content).await;
+                            return Err(e);
+                        }
+                        // A baseline this run could not read convicts nobody: the
+                        // findings stay the tree's until something shows they are
+                        // not, and the note says which reading this is.
+                        Err(e) => {
+                            warn!(
+                                change_id = %change.artifact_id,
+                                error = %e,
+                                "Could not read the tree's own lints; the findings stay unattributed"
+                            );
+                            format!(
+                                "{line}: {} diagnostic(s) on this tree, none of them on a line this \
+                                 change wrote, and the tree's own reading could not be taken ({e})",
+                                attribution.diagnostics
+                            )
+                        }
+                    }
                 } else {
-                    info!(
-                        change_id = %change.artifact_id,
-                        diagnostics = attribution.diagnostics,
-                        "The linter reports this tree's lints; none of them is on a line this change wrote"
-                    );
-                    format!(
-                        "{line}: {} diagnostic(s) on this tree, none of them on a line this change wrote",
-                        attribution.diagnostics
-                    )
+                    format!("{line}: no diagnostics on this tree")
                 }
             }
             Err(e) if e.is_build_slot_refused() => {
@@ -4369,6 +4459,66 @@ impl ChangePipeline {
         Ok(tests)
     }
 
+    /// What the same linter reports on this revision with the change taken off.
+    ///
+    /// Called only when the linter reported something and none of it was on a
+    /// line the change wrote — the shape where the finding is real, the change
+    /// put it there, and the line it sits on belongs to someone else. The
+    /// change comes off, the same command runs over the same packages, and the
+    /// change goes back on with the same care as the test baseline: a tree left
+    /// reverted would be judged as a change it is not.
+    ///
+    /// The same command, not one like it: a deployment that declared its linter
+    /// had that command run unscoped for the verdict above, so the baseline run
+    /// is that command and not the built-in one scoped to the change.
+    ///
+    /// It takes the build slot like the verdict's run does: it is a compile of
+    /// the same packages, and a stage that runs it beside the host's other
+    /// builds would be spending the one budget this gate exists to respect. The
+    /// asker's name is the same because the work is the same work.
+    async fn lints_beyond_baseline(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+        packages: Option<&[String]>,
+        now: &str,
+    ) -> SFResult<Vec<(cog_core::contract::reflection::LintFinding, usize)>> {
+        let _slot = crate::build_gate::acquire("change lint verification").await?;
+        self.git_reset_hard(workdir, change_content).await?;
+        let baseline = match self.lint_command.as_deref() {
+            Some(argv) if !argv.is_empty() => {
+                self.run_verification_command(workdir, argv, self.test_budget_secs())
+                    .await?
+                    .1
+            }
+            _ => self.run_cargo_clippy(workdir, packages).await?.1,
+        };
+        self.git_apply(workdir, change_content).await.map_err(|e| {
+            SFError::IO(format!(
+                "could not put the change back after reading the tree's own lints: {e}"
+            ))
+        })?;
+        if self.fmt_check_command.is_none() {
+            match self.run_cargo_fmt(workdir).await {
+                Ok((true, _, _)) => {}
+                Ok((false, _, output)) => {
+                    return Err(SFError::IO(format!(
+                        "could not conform the change to the formatter after reading the tree's \
+                         own lints:\n{output}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(SFError::IO(format!(
+                        "could not run the formatter after reading the tree's own lints: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(cog_core::contract::reflection::lints_beyond_baseline(
+            now, &baseline,
+        ))
+    }
+
     /// The revision of the workspace being verified.
     async fn workspace_rev(&self, workdir: &Path) -> SFResult<String> {
         self.git_try(workdir, &["rev-parse", "HEAD"])
@@ -4550,23 +4700,23 @@ mod tests {
         let pipeline = production_text(PIPELINE);
         let deployer = production_text(DEPLOYER);
 
-        // 每条 gated 命令**函数**里恰好一次 acquire：测试与 clippy 两条在流水线里，
-        // 发布构建一条在部署器里。
+        // 每条 gated 命令**函数**里恰好一次 acquire：测试、clippy 判一趟、clippy
+        // 读基线一趟三条在流水线里，发布构建一条在部署器里。
         let acquire_sites = pipeline.matches("build_gate::acquire(").count()
             + deployer.matches("build_gate::acquire(").count();
-        assert_eq!(acquire_sites, 3, "gated 命令的函数个数变了");
+        assert_eq!(acquire_sites, 4, "gated 命令的函数个数变了");
 
-        // 吃测试预算的：clippy 一条，套件与读基线失败集合各一次。
+        // 吃测试预算的：clippy 判一趟、读基线一趟，套件与读基线失败集合各一次。
         let test_runs = pipeline.matches("self.run_test_command(").count();
         assert_eq!(
             pipeline.matches("self.run_cargo_clippy(").count(),
-            1,
-            "run_cargo_clippy 的调用点数变了"
+            2,
+            "run_cargo_clippy 的调用点数变了：判一趟、红了之后读基线一趟"
         );
         assert_eq!(
-            test_runs as u64 + 1,
+            test_runs as u64 + 2,
             TEST_BUDGET_RUNS_PER_CHANGE,
-            "吃测试预算的命令 = clippy 一条 + run_test_command 那几条"
+            "吃测试预算的命令 = clippy 两条 + run_test_command 那几条"
         );
 
         // 排队次数 = acquire 点 + run_test_command 多走的那一次。
@@ -4601,14 +4751,14 @@ mod tests {
         );
         assert_eq!(
             one_change_wall_secs(1, 10, 100),
-            4 + 30 + 100 + gate_segment + FMT_SEGMENT_WALL_SECS + WEB_ADMISSION_TIMEOUT_SECS,
-            "每条 gated 命令一份等待，测试预算三条、构建预算一条，再加门禁、格式化与 WebUI 准入"
+            5 + 40 + 100 + gate_segment + FMT_SEGMENT_WALL_SECS + WEB_ADMISSION_TIMEOUT_SECS,
+            "每条 gated 命令一份等待，测试预算四条、构建预算一条，再加门禁、格式化与 WebUI 准入"
         );
     }
 
     /// 上面那条数的是「一次变更里有几条 gated 命令」，而它读的是**两份
     /// `include_str!`**。这个形状的失败不响：别处新增一处 `build_gate::acquire(`，
-    /// 上面那个 3 一位都不会动——它数的是两份文件，不是这棵 crate。
+    /// 上面那个 4 一位都不会动——它数的是两份文件，不是这棵 crate。
     ///
     /// 所以这里从 `src/` 现数一遍，把「谁在拿构建槽」钉成一份从树里读出来的名单。
     /// 名单一变，改的人就得当场回答问题：这一处属于一次变更（上面的计数跟着动），
@@ -6590,6 +6740,79 @@ index 1111111..2222222 100644
         assert!(
             !result.test_output.contains("not evaluated"),
             "the lint criterion did not run at all: {}",
+            result.test_output
+        );
+    }
+
+    /// 改动删掉唯一调用者，`dead_code` 落在函数自己的那一行——那一行不是这次
+    /// 改动写的，可这条告警确实是它带来的。
+    ///
+    /// 这是 2026-09-28 那条红的形状：上游 CI 的 clippy 报 `start_failure_is_stale
+    /// is never used`，本地这一格按「落在改动写的那几行上的诊断」判，一条都不认得
+    /// 它，于是变更通过、落地、十一分钟后被回滚。现在它问的是树本身：把改动摘掉
+    /// 再跑同一条命令，这一次有、那一次没有的，就是这条变更带来的。
+    #[tokio::test]
+    async fn a_change_that_makes_the_tree_report_a_new_lint_is_refused_even_off_the_written_lines()
+    {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        // `helper` 在种子里被调用，所以这棵树是干净的。改动只动第 2 行。
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn answer() -> i32 {\n    helper()\n}\n\
+             fn helper() -> i32 {\n    42\n}\n\n\
+             #[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "orphan-1".into(),
+            description: "把取值函数的间接层去掉".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,3 +1,3 @@\n\
+                      \x20pub fn answer() -> i32 {\n\
+                      -    helper()\n\
+                      +    42\n\
+                      \x20}\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::LintIntroduced),
+            "让 helper 变成死代码的是这条变更，哪怕告警落在它没动的那一行：{}",
+            result.test_output
+        );
+        assert!(
+            result.test_output.contains("helper"),
+            "拒词要点名那条告警：{}",
             result.test_output
         );
     }
