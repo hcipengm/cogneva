@@ -740,13 +740,34 @@ sandboxExecutor:
   # 唯一分得开的就是不可回收那一列。阈值 0.75 是在**旧分子**上量的频带（被杀掉的观测后端
   # 0.74–0.93），换分子后**没有**在它上面重新导出过，所以它是沿用值而不是这一版量出来的界。
   # 判这一档够不够，仍然只读结局 `sandbox_oom_kills_total`。
+  #
+  # **2026-11-07：3 GiB 这一档也到期了，而上面指定的那条判据看不见它到期。**
+  # 实测这台容器在 00:01:46 被内核按 cgroup 上限杀掉（`exitCode 137`、`reason OOMKilled`）：
+  # 内核日志点名两个 `rust-lld` 链接步（实测各 1.09 GiB anon）与一个 `rustc`
+  # （实测 0.94 GiB）同时在跑——两个并发 build 撞在一起，上面"rust 的并行度本来就是 1"
+  # 的前提不再成立：现在同时有好几个智能体各起一个 `cargo`。重启 4 分钟后**实测**
+  # `memory.current` 又到上限的 99.2%，同一 24h 窗内实测 RSS 峰值 2.71 GiB＝0.90 of limit
+  # （`check-container-headroom.sh` 判据 1 红），这一代 Pod 已在 24h 内被杀过两次。
+  # **而 `sandbox_oom_kills_total` 那一刻读出来是 0**：它是进程内的计数器，只在
+  # **子命令**被信号杀掉且 cgroup 的 `oom_kill` 涨了时自增（`runtime/local.rs` 的
+  # 信号分支）；容器被整个杀掉时进程随它一起没了，来不及写，重启后计数器从 0 起。
+  # 也就是说：它恰好在自己要判的那种死亡里归零，永远报不出这一档到没到期。
+  # 能看见这件事的是**容器级结局**——kube-state-metrics 的
+  # `last_terminated_reason=OOMKilled` 与重启计数，`check-container-headroom.sh`
+  # 的判据 2 读的就是它，当天为红。自这一档起，判据一律以它为准。
+  # 取值：8 GiB（实测峰值 2.71 GiB 的约 3 倍）、CPU 4 核。CPU 一并抬是因为同一窗口
+  # 实测 cgroup 的 `cpu.stat`：2099 个周期里 805 个被限流（38%）、限流 16.3 秒，而这条
+  # 1 核的上限在同一份注释里被写成"不是这套 OOM 的病因"——它确实不是病因，但它是
+  # 墙钟上的独立一害：被限流的容器连健康探针都应答不了，探针超时同样会重启这个 Pod。
+  # 本机节点 24 核 / 62 GiB；命名空间配额实测 limits.cpu 39 核、limits.memory 73 GiB，
+  # 抬完声明之和实测约 31 核 / 61 GiB，仍在配额内。
   resources:
     requests:
       cpu: 100m
       memory: 512Mi
     limits:
-      cpu: 1000m
-      memory: 3Gi
+      cpu: 4000m
+      memory: 8Gi
 
 # 宿主机文档整理：把文档所在的目录**窄挂载**进沙箱执行器，让平台代文档属主
 # 整理这些文档。边界是挂载范围而不是白名单代码——只把属主自己的目录挂进来，

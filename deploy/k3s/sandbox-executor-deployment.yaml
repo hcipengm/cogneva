@@ -213,17 +213,21 @@ spec:
             timeoutSeconds: 10
             failureThreshold: 6
           # 取值理由在 chart values 的 `sandboxExecutor.resources`（单一源在那里），
-          # 这里只跟着它走：1Gi 装不下一个 build，实测单个 cargo+rustc 就到上限的 99.6%
-          # 并被 OOM 杀掉；2Gi 之后 OOM 计数连续 24h 为 0，但 12h 内 5 个 Pod 的
-          # **不可回收内存（anon）**峰值已到上限的 68–84%，余量不足以应对工作负载增长，
-          # 故抬到 3Gi。
+          # 这里只跟着它走。实测过的 1Gi→2Gi→3Gi 三档，量法与失效现场都写在那边；
+          # 2026-11-07 这一档：3Gi 时容器被内核按 cgroup 上限杀掉（实测两个并发
+          # build 的链接步各 1.09 GiB anon），4 分钟后**实测**又到上限的 99.2%，
+          # 而当时被指定为判据的 `sandbox_oom_kills_total` 读 0——它是进程内计数器，
+          # 容器级 OOM 把它连进程一起带走，它来不及写。改判容器级结局
+          # （`check-container-headroom.sh`），本机内存抬到 8Gi；CPU 同时从 1 抬到 4：
+          # 同一窗口**实测** cgroup 的 2099 个周期有 805 个被限流（38%），被限流的
+          # 容器连自己的健康探针都应答不了。
           resources:
             requests:
               cpu: 100m
               memory: 512Mi
             limits:
-              cpu: "1"
-              memory: 3Gi
+              cpu: "4"
+              memory: 8Gi
           volumeMounts:
             - name: sandbox-data
               mountPath: /opt/cogneva/sandbox

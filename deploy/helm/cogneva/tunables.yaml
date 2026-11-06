@@ -1462,6 +1462,12 @@ rows:
       sandbox_cpu_throttle_events and sandbox_cpu_throttled_seconds from its own
       cpu.stat; a derived limit would be set from those, and nothing does, so
       this stays a stated policy ceiling with a reading that can falsify it.
+      2026-11-07 that reading falsified it: 805 of 2099 periods throttled (38%)
+      within the first minutes of a boot, 16.3 seconds throttled, while two
+      agent-issued builds ran. It was still not the OOM's cause -- but a
+      throttled container cannot answer its own health probes in time either,
+      and that restarts the pod just as effectively. Raised to 4 cores on a
+      24-core node; the namespace limits.cpu quota (39) leaves room for it.
 
   - key: sandboxExecutor.resources.limits.memory
     source: override
@@ -1471,7 +1477,16 @@ rows:
       sandbox_oom_kills_total staying at zero, which a human judges against a
       window. sandbox_memory_peak_bytes is published beside it, so a peak that
       walks up to the limit is visible before the kills start. That is a
-      decision procedure, not a loop that sets the value.
+      decision procedure, not a loop that sets the value. 2026-11-07: the
+      container was OOMKilled at 00:01:46 and sandbox_oom_kills_total read 0 --
+      it is an in-process counter, incremented only when a child is killed by
+      signal, and a container-level kill takes the process with it before it can
+      write. The counter is zero on the far side of exactly the event it was
+      named to detect, so it is retired as this limit's falsifier. The one that
+      can see the event is the container outcome that
+      check-container-headroom.sh already reads (kube-state-metrics
+      last_terminated_reason / restart count); it was red. Raised to 8 GiB --
+      about three times the 2.71 GiB peak RSS that window recorded.
 
   - key: sandboxExecutor.storage
     source: override
