@@ -125,6 +125,13 @@ async fn restricted_role_database(role: &str, db: &str) -> (PgPool, PgPool, Stri
         format!(
             "CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'probe-only'"
         ),
+        // PG 16 起，`CREATEROLE` 建出来的角色只把 **ADMIN OPTION** 给创建者，不再
+        // 顺带把 SET 也给出来，而 `CREATE DATABASE … OWNER {role}` 要的正是「能 SET
+        // ROLE 到它」。2026-11-06 实测：连着的是一条只带 CREATEROLE 的测试角色时，
+        // 这一句报 `must be able to SET ROLE`；CI 里从来不报，因为那边的管理连接是
+        // 超级用户，超权位不看这一关。库的属主确实该是那个受限角色（它后面要做的
+        // 正是不带超权位的恢复），所以补的是 membership，不是把库挂到别人名下。
+        format!("GRANT {role} TO current_user"),
         format!("CREATE DATABASE {db} OWNER {role}"),
     ] {
         sqlx::query(&stmt).execute(&admin).await.unwrap();

@@ -208,11 +208,17 @@ async fn a_term_that_stops_being_renewed_is_taken_over() {
 
     // Short enough that the wait below outlasts it, long enough that the two
     // asks before the wait cannot.
-    let ttl = Duration::from_secs(1);
+    //
+    // 一秒太窄了：底下那两条语句之间隔着的不是一个固定的间隙，而是「b 拿到租约
+    // 到 a 再问一次」这段真实开销。2026-11-06 在一台同时跑着八条 cargo 构建的
+    // 宿主上实测，这段超过了一秒，于是 b 的租约在 a 发问之前就过期了——a 拿到
+    // 租约是**对的**，红的是这条用例自己的余量。五秒把余量放到同一量的十倍，
+    // 代价是这一条多睡四秒。
+    let ttl = Duration::from_secs(5);
     assert!(a.lease(&role, ttl).try_hold().await.unwrap());
     assert!(!b.lease(&role, ttl).try_hold().await.unwrap());
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(5500)).await;
 
     assert!(
         b.lease(&role, ttl).try_hold().await.unwrap(),

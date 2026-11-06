@@ -48,9 +48,29 @@ fn record(session: &str, seq: u64) -> WalRecord {
     }
 }
 
+/// Remove what a probe left behind.
+///
+/// The scan walks every `wal:*` key, so a leftover is not inert: it reads as an
+/// orphan on the next run, and the session names here are constants rather than
+/// uuids, so it lands under the very key a later run appends to.
+async fn clear(session: &str) {
+    let mut conn = common::raw_conn().await;
+    let _: () = redis::cmd("DEL")
+        .arg(format!("wal:{session}"))
+        .query_async(&mut conn)
+        .await
+        .expect("clear the probe log");
+}
+
 /// Write `count` records the way the appender does, so the length the scan
 /// reports is a length the real store would have.
+///
+/// It clears the key first. The lengths asserted below are about this run's
+/// records; a CI container supplies that by starting empty, and the local test
+/// Redis -- which persists from one run to the next -- did not, so a plant that
+/// appended to whatever was already there answered 6 where the run had planted 3.
 async fn plant(session: &str, count: usize) {
+    clear(session).await;
     let mut conn = common::raw_conn().await;
     let key = format!("wal:{session}");
     for seq in 0..count as u64 {
@@ -108,6 +128,8 @@ async fn a_log_whose_session_lost_its_registration_is_an_orphan() {
         Some(3),
         "a log with no live session is an orphan, and the scan reports how long it is"
     );
+
+    clear(&session).await;
 }
 
 #[tokio::test]
@@ -131,6 +153,7 @@ async fn a_log_whose_session_is_registered_is_not_an_orphan() {
         .deregister(&session)
         .await
         .expect("deregister");
+    clear(&session).await;
 }
 
 /// The scan and the delete are two round trips. A task re-dispatched to the
@@ -177,6 +200,7 @@ async fn a_log_whose_session_registered_after_the_scan_survives_the_delete() {
         .deregister(&session)
         .await
         .expect("deregister");
+    clear(&session).await;
 }
 
 #[tokio::test]
