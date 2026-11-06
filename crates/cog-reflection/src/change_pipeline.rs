@@ -69,6 +69,13 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
     "http_proxy",
     "https_proxy",
     "no_proxy",
+    // 编译宽度。它不是「部署的配置进判据」那条规则的例外对象——它不改变判什么，
+    // 只改变判的时候同时开几个 rustc。要传它是因为它是这台机器上唯一能把一次验证的
+    // 内存峰值压下来的旋钮：实测 2026-11-07，进化 Pod 六小时工作集峰值 15.96 GiB 顶着
+    // 16 GiB 的容器上限（实测 2026-11-07），构建占去了大半个窗口（闸门被持有时占
+    // 78%），于是第二个变更任务接上去就是 OOM 而不是排队。收窄宽度会让验证变慢，
+    // 而慢只是占闸门久一点，闸门余量 32% 还够；顶到内存上限则是两条在跑的一起死。
+    "CARGO_BUILD_JOBS",
 ];
 
 /// Default wall-clock bound on the format check. Formatted-or-not is settled by
@@ -7980,6 +7987,42 @@ index 1111111..2222222 100644
             "产品命名空间的变量不得进入判据进程，实测进了：{keys:?}"
         );
         assert!(!keys.contains(&"PG_PASSWORD"), "部署侧凭证不得进入判据进程");
+    }
+
+    /// 验证进程的编译宽度要跟着部署走。
+    ///
+    /// 这条门在 2026-11-07 之前不存在，代价是可读的：进化 Pod 的工作集在六小时里
+    /// 顶到 15.96 GiB 的峰值，而上限是 16 GiB（实测 2026-11-07）——构建宽度由进程
+    /// 继承，而进程继承的是容器看到的核数，不是这台机器愿意同时开的 rustc 数。
+    /// 白名单漏掉这个变量时，部署里写 `CARGO_BUILD_JOBS=3` 对验证这一趟一点作用
+    /// 也没有，峰值留在原地。
+    ///
+    /// 断的是「传不传」而不是某个具体值：判据进程读到的必须就是部署写下的那个数，
+    /// 写别的数（或没写）由部署自己负责。
+    #[test]
+    fn the_verification_build_width_comes_from_the_deployment() {
+        let parent = |key: &str| match key {
+            "PATH" => Some("/usr/bin".to_string()),
+            "CARGO_BUILD_JOBS" => Some("3".to_string()),
+            _ => None,
+        };
+        let env = verification_env(parent, None);
+        let width = env
+            .iter()
+            .find(|(k, _)| k.as_str() == "CARGO_BUILD_JOBS")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            width,
+            Some("3"),
+            "部署写的编译宽度必须到达验证进程，否则压内存的那一格是空的"
+        );
+
+        // 部署没写时不能凭空造一个：判据进程该看到「没配」，不是一个默认值。
+        let bare = verification_env(|key| (key == "PATH").then(|| "/usr/bin".to_string()), None);
+        assert!(
+            !bare.iter().any(|(k, _)| k.as_str() == "CARGO_BUILD_JOBS"),
+            "父进程没有这个变量时，验证进程也不该有"
+        );
     }
 
     /// `rustup check` 的两行形状各答一件事，取错一边就是这条要修的病本身。

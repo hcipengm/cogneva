@@ -205,6 +205,9 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: {{ .Values.mainlineDeployer.soakSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: {{ .Values.mainlineDeployer.failureCooldownSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: {{ .Values.mainlineDeployer.cargoBuildJobs | int | quote }}
+  # 变更验证那一趟的编译宽度。白名单会把它带进判据进程（`CARGO_BUILD_JOBS`）；不进
+  # 主线部署器的构建——那条路自己显式设这个变量。
+  CARGO_BUILD_JOBS: {{ .Values.changeVerification.cargoBuildJobs | int | quote }}
   # 集群内 registry 那张卷的容量回收。声明量只有一个来源（PVC 自己的 spec），所以
   # 这里不配"卷有多大"；这里配的是判据与保留策略，占用读数取自 registry Pod 里只读
   # 走查那张卷的边车（Service 的 http 端点，端口与 registry 清单同源）。

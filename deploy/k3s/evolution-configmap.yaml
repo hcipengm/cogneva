@@ -105,6 +105,11 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: "120"
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: "3600"
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: "6"
+  # 变更验证那一趟的编译宽度（实测 2026-11-07：构建期内存平均 9.81 GiB、峰值 15.6 GiB，
+  # 容器上限 16 GiB）。压窄它换的是峰值下降（均为实测 2026-11-07），代价只是验证
+  # 慢一点，闸门有 32% 余量。
+  # 不进主线部署器的构建——那条路自己显式设 CARGO_BUILD_JOBS。
+  CARGO_BUILD_JOBS: "3"
   # 集群内 registry 那张卷的容量回收。声明量只有一个来源（PVC 自己的 spec），所以
   # 这里不配"卷有多大"；这里配的是判据与保留策略，占用读数取自 registry Pod 里只读
   # 走查那张卷的边车（Service 的 http 端点，端口与 cluster-registry.yaml 同源）。

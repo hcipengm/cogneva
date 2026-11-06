@@ -1766,6 +1766,23 @@ networkPolicy:
 # 主线跟踪自动部署器：进化 Pod 周期检测 bare 仓库公版 main 前进 → 沙盒构建 →
 # buildah 推集群内 registry → 派独立 Job 门禁滚动四部署，失败自动回滚。
 # 依赖 RBAC / NetworkPolicy(apiserver) / kubectl 二进制 / 集群内 registry 就位。
+changeVerification:
+  # 变更验证那一趟的编译宽度（`CARGO_BUILD_JOBS`）。它是这台 Pod 上唯一能直接压住
+  # 验证内存峰值的旋钮：验证跑的是整个工作区的测试构建，链接器按进程数并行，实测
+  # 2026-11-07 进化 Pod 在构建占用的那 78% 时间里平均 9.81 GiB、峰值 15.6 GiB，而
+  # 容器上限 16 GiB、不构建时只有 3.02 GiB（同一组实测）。撞上限的代价不是慢，是 OOM：
+  # 两条在跑的
+  # 任务一起从头再来。
+  #
+  # 收窄的代价只是慢——闸门余量在那儿（同一窗口平均等待 1.65 分钟）。这个数按「压到
+  # 多少」定，不按「多快」定：3 是让峰值落到容器上限之下的起点，落地后读
+  # `max_over_time(container_memory_working_set_bytes{pod=~"cogneva-evolution-.*"}[24h])`
+  # 判它够不够，够了再谈把本地车道抬到 2。
+  #
+  # 它不进主线部署器的构建：那条路自己显式设 `CARGO_BUILD_JOBS`
+  # （`COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS`），不受这里影响。
+  cargoBuildJobs: 3
+
 mainlineDeployer:
   enabled: true
   pollIntervalSecs: 600
