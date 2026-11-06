@@ -83,12 +83,26 @@ pub const LOCAL_CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_LOCAL_CLAIM_CONCURRENCY";
 /// with 1,904 tasks queued behind `claim_in_flight = 1`, `claim_wait_seconds`
 /// pinned at 1,793 s, and 43 finished tasks a day -- 44 days to drain.
 ///
-/// Turning it up does not raise the throughput that number is short of. The
-/// step after this lane is the build gate, whose bound in force on the same
-/// host at the same minute was 1 (`cogneva-build-gate.sh --who`), held by a
-/// `change verification` for 1,637 s; one verification per slot is therefore
-/// about 53 changes a day whatever this lane admits, and the extra permits
-/// would queue in front of the same single build. Two further costs sit on this
+/// Turning it up is worth doing only if the step after this lane has room, and
+/// that step was measured rather than inferred. On the same host on 2026-11-07
+/// 06:0x the build gate's bound in force was 1 (`cogneva-build-gate.sh --who`,
+/// dimension `io`). Over the six hours before that reading it made 19
+/// acquisitions and held a slot for 244 of those 360 minutes -- 68% -- while
+/// callers waited 31 minutes in total, a mean wait of 1.65 minutes against a
+/// mean service of 12.8 minutes. One verification per slot is therefore about
+/// 112 a day at full occupancy against the ~76 already running, so the gate has
+/// room for roughly half again before its own queue is the one that grows. The
+/// lane, by contrast, read `claim_in_flight = 1` for 100% of that same window
+/// on every pod that carried it, and `claim_wait_seconds` stood at 836 s with
+/// 1,954 rows still owed: the saturated step is this one, not the build.
+///
+/// That reading replaced an earlier one in this comment which claimed the gate
+/// could pass about 53 changes a day whatever this lane admitted. It cannot be
+/// settled by reading either bound -- both are 1, so both look like the wall --
+/// and the number that separates them is how much of the last six hours each
+/// was actually holding, which is 68% against 100%.
+///
+/// Two further costs sit on this
 /// number and neither is in this crate. Measured on the evolution pod on
 /// 2026-11-07: one change task held 10.8 GiB of the 16 GiB its container was
 /// given, the largest single consumers being one rustc and six linkers, so the

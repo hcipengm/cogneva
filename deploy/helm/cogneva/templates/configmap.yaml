@@ -54,6 +54,10 @@ data:
   # `cogneva_task_router_claim_slots` 报出去，所以配置与生效在读数面是同一个值。
   COGNEVA_TASK_CLAIM_CONCURRENCY: {{ .Values.taskRouter.claimConcurrency | int | quote }}
 
+  # 本地车道（`:local`）自己的在途上限。只有带 executor 角色的部署读这条流，变更
+  # 任务全在它上面跑；与上面那格分开，因为一个进程读得到的别的流并不受这个数影响。
+  COGNEVA_LOCAL_CLAIM_CONCURRENCY: {{ .Values.taskRouter.localClaimConcurrency | int | quote }}
+
   # 变更账一拍把一个项目的几条欠账并成一道任务派出去。价格的大头是任务的固定部分
   # （一次规划、一轮上下文、一轮沙箱验证），它不随任务承载几条增长，所以并得越多、
   # 每条欠账摊到的钱越少。上限在生成侧而不在这一格：一批写成一份变更，超过一次
