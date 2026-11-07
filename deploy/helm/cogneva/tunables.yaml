@@ -1461,9 +1461,17 @@ rows:
       same command five minutes later in a tree that already existed. A value
       of 2 covers the measured arrival rate -- about 1.1 tasks a minute against
       a 3.4 s refill -- and the pool is bounded twice more without this number:
-      it never exceeds half the task ceiling, and it only refills while the
-      ceiling still has room, so a tree for a task that has not arrived can
-      never displace one for a task that has. Measured after it shipped (30
+      it never exceeds half the task ceiling, and its slots count against that
+      same ceiling rather than beside it, so a refill at a full ceiling
+      reclaims the least recently used task tree instead of standing down.
+      2026-11-07, the second bound was the other way round: a refill stood down
+      whenever the ceiling was full, and with the ceiling at 32 and the volume
+      holding 32 the pool was drained by two hand-outs at 09:04 and 09:13 and
+      never refilled again -- every arrival after that paid the checkout the
+      pool exists to remove, while the log read healthy, because the one refill
+      that happened and the hand-outs were each recorded and the standing down
+      was not. What a slot costs now is the directory of one task tree the next
+      arrival would have reclaimed anyway. Measured after it first shipped (30
       minutes on 2026-11-07): 11 hand-outs against 3 fresh cuts and 2 LRU
       reclaims, where the same lane had been 17 cuts and 17 reclaims in 40
       minutes -- so two is enough for the arrival rate, and what a third

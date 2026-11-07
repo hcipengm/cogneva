@@ -1084,9 +1084,20 @@ impl WorkdirRouter {
 
     /// Cut trees until the pool holds as many as the deployment asked for.
     ///
-    /// Best effort and never blocking an arrival: the lock is taken only if it
-    /// is free, because a pool refill that queues behind a task's own creation
-    /// makes the pool the reason the task waited.
+    /// Best effort and never blocking an arrival: both locks are taken only if
+    /// they are free, because a pool refill that queues behind a task's own
+    /// creation makes the pool the reason the task waited.
+    ///
+    /// The pool lives *inside* the ceiling rather than on top of it: its slots
+    /// are counted with the task trees (see [`Self::enforce_cap`]), so a refill
+    /// at a full ceiling reclaims the least recently used task tree instead of
+    /// standing down. Standing down was the older rule, and it made the pool
+    /// useless exactly when it was needed -- measured on 2026-11-07, with the
+    /// ceiling at 32 and the volume holding 32, the pool was drained by two
+    /// warm hand-outs and never refilled, so every arrival after that paid the
+    /// checkout the pool exists to remove. It looked healthy in the log, which
+    /// recorded the one refill and the two hand-outs and said nothing about the
+    /// pool that stayed empty.
     async fn warm_pool_once(&self) {
         let want = self.cfg.warm_trees;
         if want == 0 {
@@ -1099,17 +1110,21 @@ impl WorkdirRouter {
         if held >= want {
             return;
         }
-        // The pool does not compete with the tasks it serves: when the ceiling
-        // is already spoken for, cutting another tree for a task that has not
-        // arrived is a checkout paid against the task that has.
-        let trees = self.list_task_trees().await;
-        if trees.len() + want > self.cap_for(&trees).await {
+        // Cutting a tree is `worktree add` against the same state a creation
+        // evicts from, so the two cannot run against it at once. Free is the
+        // common case -- the refill is spawned after the arrival it serves has
+        // its directory -- and a creation in flight means this pass is skipped
+        // rather than queued; the next hand-out or GC pass comes back.
+        let Ok(_c) = self.create_lock.try_lock() else {
             return;
-        }
+        };
         if let Err(e) = tokio::fs::create_dir_all(self.warm_root()).await {
             warn!(error = %e, "warm worktree pool: cannot create its directory");
             return;
         }
+        // Room is made once for the whole refill, before the first cut: the
+        // ceiling counts the slots this pass is about to add.
+        self.enforce_cap(want - held).await;
         // Slots are named, not counted: the trees taken out are not necessarily
         // the highest-numbered ones, so walking `held..want` would ask for a
         // name that is still occupied and leave the pool short by that many.
@@ -1173,11 +1188,14 @@ impl WorkdirRouter {
                 "task path exists but is not a healthy worktree; rebuilding");
             self.force_remove(&path).await;
         }
-        self.enforce_cap(1).await;
+        // The hand-out first, and the cap after it: a task that takes a warm
+        // tree adds nothing to the volume, so asking the cap to make room for
+        // it would reclaim a tree nobody needed to lose.
         if self.take_warm(task_id, &path).await {
             self.refresh_count_metric().await;
             return Ok((path, true));
         }
+        self.enforce_cap(1).await;
         if let Err(e) = self.add_worktree(task_id, &path).await {
             self.metrics.inc_error("worktree_add");
             return Err(e);
@@ -1391,9 +1409,18 @@ impl WorkdirRouter {
     /// remain. Trees with a command running in them are left alone, so the cap
     /// is a target this pass may not reach; what it could not reach is counted
     /// rather than silently dropped. Caller must hold [`Self::create_lock`]
-    /// semantics (route and gc_once take it; this fn assumes exclusion).
+    /// semantics (route, gc_once and the warm refill take it; this fn assumes
+    /// exclusion).
+    ///
+    /// The trees waiting in the warm pool are counted here, because they are
+    /// trees on the same volume and the ceiling is about the volume: a pool
+    /// slot held outside the count is room the cap thinks it still has, and
+    /// the next arrivals would spend it twice. That is also what gives the pool
+    /// its reservation -- a task creation at the ceiling reclaims enough to
+    /// leave the pool's slots standing.
     async fn enforce_cap(&self, incoming: usize) {
         let mut trees = self.list_task_trees().await;
+        let warm = self.warm_slots().await.len();
         // Two different numbers, and the lower one wins: the configured value is
         // a policy ceiling (how many trees this executor is meant to serve at
         // once), while the measured one is what the volume can actually hold at
@@ -1404,7 +1431,7 @@ impl WorkdirRouter {
         // the tighter of the two, because a cap that quietly stopped being the
         // configured one reads exactly like a cap that was never reached.
         let max = self.cap_for(&trees).await;
-        if trees.len() + incoming <= max {
+        if trees.len() + warm + incoming <= max {
             return;
         }
         // Two lanes, and the eviction order is per lane: a task tree pays
@@ -1418,7 +1445,10 @@ impl WorkdirRouter {
                     .unwrap_or(i64::MIN),
             )
         });
-        let mut remaining = trees.len() + incoming;
+        // The pool's slots are part of what has to end up under `max`, and they
+        // are not in `trees`, so they enter the count here and never leave it
+        // through the loop below: a pool tree is never the one reclaimed.
+        let mut remaining = trees.len() + warm + incoming;
         let mut deferred = 0u64;
         for (id, path) in trees {
             if remaining <= max {
@@ -2952,6 +2982,81 @@ pub(crate) mod tests {
                 .iter()
                 .any(|(id, p)| id == "warm-task" && p == &path),
             "the tree the task got is registered as its worktree"
+        );
+    }
+
+    /// The ceiling is the volume's, not the task lane's: when the task trees
+    /// fill it and the pool is empty, the refill reclaims one instead of
+    /// standing down.
+    ///
+    /// Standing down left the pool permanently empty under load -- measured in
+    /// production on 2026-11-07 with the ceiling at 32 and the volume holding
+    /// 32: the pool was drained by two hand-outs at 09:04 and 09:13 and never
+    /// refilled, so every arrival after that paid the checkout the pool exists
+    /// to remove. The log looked healthy, because the refill that did happen and
+    /// the hand-outs were each recorded and the standing down was not.
+    #[tokio::test]
+    async fn a_pool_drained_at_a_full_ceiling_refills_by_reclaiming_a_task_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK, 1);
+
+        // Two tasks and an empty pool, so the ceiling is full with task trees
+        // and no claim is holding either of them.
+        for id in ["first", "second"] {
+            let (_path, guard) = r.route(id).await.unwrap();
+            drop(guard);
+        }
+        assert_eq!(
+            r.list_task_trees().await.len(),
+            2,
+            "the task trees fill the ceiling"
+        );
+        assert!(r.warm_slots().await.is_empty());
+
+        r.warm_pool_once().await;
+
+        assert_eq!(
+            r.warm_slots().await.len(),
+            1,
+            "the pool refills at a full ceiling"
+        );
+        assert_eq!(
+            r.list_task_trees().await.len(),
+            1,
+            "the slot came out of the ceiling, so one task tree was reclaimed for it"
+        );
+    }
+
+    /// The other half of counting the pool: its slots are trees on the volume,
+    /// so a task tree that would be the third on a volume that holds two makes
+    /// room for them -- and the pool's own tree is never the one that goes.
+    #[tokio::test]
+    async fn the_ceiling_counts_the_pool_s_trees_against_a_new_task_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK, 1);
+
+        // The task first, while the pool is still empty, so this tree is cut
+        // rather than handed out and no refill is queued behind it.
+        let (_path, guard) = r.route("a").await.unwrap();
+        drop(guard);
+        r.warm_pool_once().await;
+        assert_eq!(r.warm_slots().await.len(), 1);
+        assert_eq!(r.list_task_trees().await.len(), 1);
+
+        // A third tree would not fit. Room is made by the task lane, because
+        // the pool slot is part of what has to fit.
+        r.enforce_cap(1).await;
+
+        assert!(
+            r.list_task_trees().await.is_empty(),
+            "the pool's slot was counted, so the task tree made room for it"
+        );
+        assert_eq!(
+            r.warm_slots().await.len(),
+            1,
+            "the pool's own tree is never the one reclaimed"
         );
     }
 
