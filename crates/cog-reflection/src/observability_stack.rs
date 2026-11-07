@@ -361,6 +361,16 @@ pub fn classify_obstacle(stderr: &str, namespace: &str) -> Option<Obstacle> {
     Some(Obstacle::Unusable(first_error_line(text)))
 }
 
+/// 一次读不出来的比较记成哪一种成因。
+///
+/// [`classify_obstacle`] 认不出任何形状时（退出码说失败，`stderr` 里却一行能认
+/// 的都没有），成因取读数自己的那句正文，而不是留空：留空的代价是这一份不进
+/// `obstacles`，而「一份也没漂」那条结论只看 `obstacles`——一整轮每份都没被比过
+/// 会因此被读成「一致」，告警随之解除。
+fn obstacle_for_failed_comparison(stderr: &str, namespace: &str, detail: &str) -> Obstacle {
+    classify_obstacle(stderr, namespace).unwrap_or_else(|| Obstacle::Unusable(detail.to_string()))
+}
+
 /// 一轮里既有交付成功的、也有被拒的时候，结论仍是「没收敛」，但要把两边都说出来。
 ///
 /// 只报第一条成因会让人以为整轮白跑；只报修好的份数会把一次没收敛说成收敛。
@@ -714,15 +724,17 @@ impl StackConvergence {
                 Err(e) => return ConvergenceVerdict::NoEvidence(format!("{file} 的 diff: {e}")),
             };
             let outcome = classify_diff(code, &stderr);
-            if let DiffOutcome::Failed(_) = &outcome {
-                if let Some(obstacle) = classify_obstacle(&stderr, &self.cfg.namespace) {
-                    warn!(
-                        file = %file,
-                        reason = %obstacle.detail(),
-                        "observability stack: this file cannot be compared this round; the rest are still compared and delivered"
-                    );
-                    obstacles.push((file.clone(), obstacle));
-                }
+            if let DiffOutcome::Failed(detail) = &outcome {
+                // 成因判不出来也要记一格。这一份不进 `obstacles` 的话，下面
+                // 「一份也没漂」那条路只看 `obstacles`：一整轮每份都没被比过会走到
+                // `Converged`，告警随之被解除，而事实是一次比较都没做成。
+                let obstacle = obstacle_for_failed_comparison(&stderr, &self.cfg.namespace, detail);
+                warn!(
+                    file = %file,
+                    reason = %obstacle.detail(),
+                    "observability stack: this file cannot be compared this round; the rest are still compared and delivered"
+                );
+                obstacles.push((file.clone(), obstacle));
             }
             if !diff.trim().is_empty() {
                 info!(file = %file, diff = %clip(&diff, DIFF_LOG_CHARS), "observability stack: live state differs from the declared manifest");
@@ -994,6 +1006,24 @@ mod tests {
             message.contains("04-servicemonitor-cogneva.yaml"),
             "点名只点到第一份：{message}"
         );
+    }
+
+    /// 一次读不出来的比较必须留下一个成因——`stderr` 里一行能认的形状都没有时也一样。
+    ///
+    /// 实测的入口是退出码拿不到的那次：`kubectl diff` 被信号杀掉时退出码是 -1，
+    /// `stderr` 空着，而这一份从来没被比过。留下空的成因，这份就不进 `obstacles`，
+    /// 于是「一份也没漂」那条结论会把它读成「现场与声明一致」并解除告警。
+    #[test]
+    fn a_failed_comparison_that_names_no_shape_still_yields_an_obstacle() {
+        let outcome = classify_diff(-1, "");
+        let DiffOutcome::Failed(detail) = &outcome else {
+            panic!("拿不到退出码必须读成读不出来，实际是 {outcome:?}");
+        };
+        let obstacle = obstacle_for_failed_comparison("", "monitoring", detail);
+        assert!(matches!(obstacle, Obstacle::Unusable(_)));
+        assert!(!obstacle.detail().is_empty(), "成因正文不能空");
+        let verdict = obstructed_after_partial(&[("01-namespace.yaml".to_string(), obstacle)], 0);
+        assert!(verdict.is_firing(), "一份没比过的文件不能被读成一致");
     }
 
     /// 严重度取最重的那条：命名空间整个不在时其余每份都会陪报一次，
