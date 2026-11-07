@@ -42,8 +42,55 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "${here}/../.." && pwd)"
 cd "${root}" || exit 1
 
+# ---- 验过没有：按字节记的戳 ----
+#
+# 推之前那次判定是分钟级到小时级的（整棵 `cargo test` 加全部脚本测试），把它挂在一次
+# 推送前面，推的人只能干等；等的时候远端还会往前走，一被拒这一段就白等了。所以判定
+# 与推送拆成两步：整条跑绿时按**工作树的字节**记一笔，推送那一腿只问「这份字节验过没有」
+# （`--status`），一问是一次 sha256。
+#
+# 判词必须与「现在替我验一遍」分得开，否则读的人会把「没验过」当成「验过了」。
+#
+# 键是「这份字节」指的是**要推上去的那一版**：HEAD 加这次推的范围的底（`origin/main`，
+# 它决定骨架那一格的触发判据）。工作树上的未提交改动**不进键**，因为它们不随这一推走；
+# 反过来，判据读的是工作树，所以只有干净的工作树上「判了工作树」才等于「判了 HEAD」——
+# 因此**脏的树上跑完不记账**，并在结尾说明为什么。共享工作树上别的会话在飞的那半成品
+# 因此不会让一笔已经验过的提交反复失效，也不会被当成验过。
+stamp_dir="$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/check-before-push"
+case "${stamp_dir}" in /*) ;; *) stamp_dir="${root}/${stamp_dir}" ;; esac
+
+tree_key() {
+    {
+        git rev-parse HEAD 2>/dev/null
+        git rev-parse --verify --quiet 'origin/main^{commit}' 2>/dev/null
+    } | sha256sum | cut -d' ' -f1
+}
+
+case "${1:-}" in
+--key)
+    tree_key
+    exit 0
+    ;;
+--status)
+    key="$(tree_key)"
+    if [ -f "${stamp_dir}/${key}" ]; then
+        echo "这份字节验过：$(head -n 1 "${stamp_dir}/${key}")"
+        exit 0
+    fi
+    echo "这份字节没验过（$(git rev-parse --short HEAD 2>/dev/null)，键 ${key:0:12}）；"
+    echo "先跑 \`bash deploy/scripts/check-before-push.sh\`，它跑绿了自己记账，之后这一推秒过。"
+    exit 1
+    ;;
+esac
+
 ci=".github/workflows/ci.yml"
 [ -f "${ci}" ] || { echo "找不到 ${ci}（要从仓库根跑）"; exit 1; }
+
+# 记账记的是**开跑那一刻**的提交：跑的过程中别人又提交了，那一笔没有被这一跑判过。
+run_key="$(tree_key)"
+# 判据读的是工作树；只有干净的树上「判了工作树」才等于「判了 HEAD」。脏树不记账，
+# 但整条判定照常跑、照常出读数——它仍然回答了「现在这棵树绿不绿」。
+run_dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 
 failures=0
 run_suite_file() { # run_suite_file <说明> <模块名>
@@ -479,3 +526,16 @@ echo "Clippy 只判这次要推的提交动过的 crate；其余 crate 的 lint 
 echo "Test 只判这次动过的包加装配件 cogneva；其余 crate 的测试仍由 CI 整棵跑。"
 echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Code Coverage /"
 echo "Format / Version Contract / Web Build / Bootstrap Cross-Platform。"
+
+# 绿了才记账。红的那一跑什么也不写：一份没验过的字节不能因为「上次跑过」就推得出去。
+# 脏树上也不记：这一跑判的是工作树，而推上去的是 HEAD，两者在这时候不是同一份字节。
+if [ "${run_dirty}" -ne 0 ]; then
+    echo "记账：工作树上有 ${run_dirty} 处未提交改动，这一跑判的不是 HEAD 的字节，不记账；"
+    echo "      提交之后再跑一遍，那一跑就能记账，之后同一笔提交的推送秒过。"
+elif mkdir -p "${stamp_dir}" 2>/dev/null &&
+   printf '%s %s\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
+       > "${stamp_dir}/${run_key}" 2>/dev/null; then
+    echo "记账：${run_key:0:12} 这份字节在推之前不用再判一遍，钩子会读到这一笔。"
+else
+    echo "记账：写不进 ${stamp_dir}，这一跑照常算数，只是下一推还得再判一遍。" >&2
+fi
