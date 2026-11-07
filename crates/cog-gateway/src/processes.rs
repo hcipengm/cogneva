@@ -32,7 +32,33 @@ pub struct GoalGroup {
     pub running: usize,
     pub pending: usize,
     pub progress_pct: f32,
+    /// 目标行的终答，DAG 写过才有。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_answer: Option<String>,
+    /// 目标行是否已收口。不是 `completed == total`：目标可以收在失败上。
+    pub finished: bool,
     pub tasks: Vec<ProcessTask>,
+}
+
+/// 目标行的终答与收口状态，按任务 id 取。
+///
+/// 行不存在、或收口了没写答案，都读作没有：按任务条数推出来的「做完」会比
+/// DAG 写下的多。
+fn goal_row_answer(
+    goal_id: &str,
+    rows_by_id: &HashMap<&str, &cog_core::Task>,
+) -> (Option<String>, bool) {
+    match rows_by_id.get(goal_id) {
+        Some(row) => (
+            row.result
+                .as_ref()
+                .and_then(|result| result.get("final_answer"))
+                .and_then(|answer| answer.as_str())
+                .map(str::to_string),
+            row.status.is_terminal(),
+        ),
+        None => (None, false),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +111,10 @@ pub async fn process_overview_handler(
     let tasks = state.orchestrator.get_all_tasks().await;
     let task_status: HashMap<&str, &cog_core::TaskStatus> =
         tasks.iter().map(|t| (t.id.as_str(), &t.status)).collect();
+    // 原始行按 id 索引：`ProcessTask` 是给线上看的投影，丢掉了 `result`，
+    // 答案只能从这一层读；按 id 而不是按行的 `goal_id` 找，因为后者可能没填。
+    let rows_by_id: HashMap<&str, &cog_core::Task> =
+        tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
     // ── DAG state: group tasks by goal ──
     let mut goals: HashMap<String, Vec<ProcessTask>> = HashMap::new();
@@ -118,6 +148,7 @@ pub async fn process_overview_handler(
             } else {
                 0.0
             };
+            let (final_answer, finished) = goal_row_answer(&goal_id, &rows_by_id);
             GoalGroup {
                 goal_id,
                 total,
@@ -126,6 +157,8 @@ pub async fn process_overview_handler(
                 running,
                 pending,
                 progress_pct,
+                final_answer,
+                finished,
                 tasks,
             }
         })
@@ -257,4 +290,46 @@ pub async fn process_overview_handler(
         health,
         dlq_len,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index(tasks: &[cog_core::Task]) -> HashMap<&str, &cog_core::Task> {
+        tasks.iter().map(|t| (t.id.as_str(), t)).collect()
+    }
+
+    #[test]
+    fn a_settled_goal_row_hands_through_the_answer_it_wrote() {
+        let mut goal = cog_core::Task::goal_row("goal-a", "ship it");
+        goal.status = cog_core::TaskStatus::Completed;
+        goal.result = Some(serde_json::json!({ "final_answer": "shipped" }));
+        let tasks = vec![goal];
+        assert_eq!(
+            goal_row_answer("goal-a", &index(&tasks)),
+            (Some("shipped".to_string()), true)
+        );
+    }
+
+    #[test]
+    fn a_goal_row_settled_without_an_answer_is_finished_but_says_nothing() {
+        let mut goal = cog_core::Task::goal_row("goal-b", "ship it");
+        goal.status = cog_core::TaskStatus::Failed;
+        goal.error = Some("分解失败".into());
+        let tasks = vec![goal];
+        assert_eq!(goal_row_answer("goal-b", &index(&tasks)), (None, true));
+    }
+
+    #[test]
+    fn a_group_whose_goal_row_is_absent_reads_open_and_unanswered() {
+        let mut child = cog_core::Task::new(
+            "child-1",
+            cog_core::TaskType::Custom("change_ledger".into()),
+            serde_json::json!({ "goal": "ship it" }),
+        );
+        child.goal_id = Some("goal-c".into());
+        let tasks = vec![child];
+        assert_eq!(goal_row_answer("goal-c", &index(&tasks)), (None, false));
+    }
 }
