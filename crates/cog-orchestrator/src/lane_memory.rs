@@ -6,7 +6,12 @@
 //!
 //! 所以这里的产物不是个数，是一条控制律：每窗重读 `memory.max` 与 `memory.current`，
 //! 由两个读数算出这一窗的上界，再从在用的界一步走去那儿。下降立即（安全方向），
-//! 上升每窗一步（一条被一次性抬到顶的界，第二次读数错了也收不回来）。
+//! 上升要两条凭据：算术说还有余量，且**当前这个界被真的跑满过一拍**——半分钟一拍，
+//! 只按算术爬，从 1 到 6 只要两分半，而一次构建的峰值可以在这两分半里任何一刻到来。
+//!
+//! 读数从哪里来这件事本身就是这条律的一半：Pod 里 `/sys/fs/cgroup` 是宿主的整个
+//! 层级，容器的上限写在 `/proc/self/cgroup` 指的那一格下面（实测 2026-11-07）。
+//! 只读挂载点的版本读到的永远是「没有上限」，律一格也不会动。
 //!
 //! 控制律的形状与 [`cog_reflection::build_gate`] 的 `next_bound` 同一条：那里是宿主级
 //! 构建槽，这里是进程内车道许可，两者都是「一台机器能同时承受几件事」，所以不该
@@ -37,24 +42,95 @@ pub const MEMORY_CURRENT_FILE: &str = "memory.current";
 // cap: bound — 半分钟一采，一条任务里二十来个样本；更密只是重复读同一个数
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// 内核告诉进程「你在哪一格」的那份文件。
+pub const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
+
 /// 一次读数的位置：先按 v2 的布局找，找不到再按 v1 的目录名找。
+///
+/// 参数是**一格 cgroup 的目录**，不是挂载点本身：v2 的一格里，`memory.max` 与
+/// `memory.current` 就在目录下；v1 的那格里，它们在 `memory/` 子目录里。
 ///
 /// 返回的顺序就是尝试的顺序。空列表＝这个进程不在任何有上限的 cgroup 里，
 /// 调用方据此**不动**界（不是把界抬到无限），因为「量不到」与「没有上限」
 /// 在这里是两件事：前者该保持原样，后者才该由别的维度决定。
-pub fn memory_files(root: &Path) -> Vec<(PathBuf, PathBuf)> {
+pub fn memory_files(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     vec![
-        (root.join(MEMORY_MAX_FILE), root.join(MEMORY_CURRENT_FILE)),
+        (dir.join(MEMORY_MAX_FILE), dir.join(MEMORY_CURRENT_FILE)),
         (
-            root.join("memory").join("memory.limit_in_bytes"),
-            root.join("memory").join("memory.usage_in_bytes"),
+            dir.join("memory").join("memory.limit_in_bytes"),
+            dir.join("memory").join("memory.usage_in_bytes"),
         ),
     ]
 }
 
+/// `/proc/self/cgroup` 正文里 v2 统一层那一行的路径（如 `/kubepods.slice/...`）。
+///
+/// 只认 `0::` 这一行：v2 把全部控制器放在同一层，行首的 `0` 后面没有控制器名单。
+/// v1 的每一行都带一个控制器名，取哪一行都只是那一类控制器的那一格——内存那一格
+/// 由 [`own_cgroup_dir`] 的 v1 兜底去读，不在这里猜。
+pub fn unified_cgroup_path(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| path.trim().to_string())
+        .filter(|path| path.starts_with('/'))
+}
+
+/// 本进程所在的那一格 cgroup 的目录（绝对路径）。
+///
+/// 为什么必须解析这一格：`/sys/fs/cgroup` 在 Pod 里通常**不是**容器的根，而是宿主
+/// 的整个层级。2026-11-07 实测进化 Pod 的容器里 `/sys/fs/cgroup/memory.max` 根本
+/// 不存在（宿主根没有上限），而 `/proc/self/cgroup` 指向的那一格写着实测 16 GiB。
+/// 把挂载点当成容器根去读，读到的永远是「没有上限」，控制律于是一格也没动过——
+/// 这正是「配了导出、量到的却是量不到」的那种坏法。
+pub fn own_cgroup_dir(root: &Path, proc_file: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(proc_file).ok()?;
+    let rel = unified_cgroup_path(&raw)?;
+    Some(root.join(rel.trim_start_matches('/')))
+}
+
+/// 读这一族读数时可以依次尝试的目录。
+///
+/// 挂载点本身排第一：容器自己的 cgroup 被名字空间化时（`/sys/fs/cgroup` 就是
+/// 容器根），那才是对的一格，而它会先被找到。挂载点读不到，再退到本进程那一格。
+/// 两处都没有就是真的量不到。
+pub fn memory_dirs(root: &Path, proc_file: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![root.to_path_buf()];
+    if let Some(own) = own_cgroup_dir(root, proc_file) {
+        if own != root {
+            dirs.push(own);
+        }
+    }
+    dirs
+}
+
+/// 这一格有没有内存读数可读：v2 的上限文件或 v1 的上限文件，任意一个有就算。
+fn has_memory_files(dir: &Path) -> bool {
+    memory_files(dir)
+        .iter()
+        .any(|(max, _)| std::fs::metadata(max).is_ok())
+}
+
+/// 这一次读数该在哪一格：第一个带内存文件的候选目录。
+///
+/// 上限与占用必须从**同一格**读：两个读者各自找第一个读得到的文件，会在候选之间
+/// 拼出一个上限来自宿主根、占用来自容器格的读数——两个不相干的数算出来的比值，
+/// 比量不到更坏，因为它看起来像一个数。
+pub fn memory_dir_for(root: &Path, proc_file: &Path) -> Option<PathBuf> {
+    memory_dirs(root, proc_file)
+        .into_iter()
+        .find(|dir| has_memory_files(dir))
+}
+
 /// 读容器内存上限（字节）。`max` 或不认识的内容都读成 `None`。
 pub fn read_memory_max(root: &Path) -> Option<u64> {
-    for (max, _) in memory_files(root) {
+    read_memory_max_from(root, Path::new(PROC_SELF_CGROUP))
+}
+
+/// 同 [`read_memory_max`]，但由调用方指定 `/proc/self/cgroup` 的位置。
+pub fn read_memory_max_from(root: &Path, proc_file: &Path) -> Option<u64> {
+    let dir = memory_dir_for(root, proc_file)?;
+    for (max, _) in memory_files(&dir) {
         if let Ok(raw) = std::fs::read_to_string(&max) {
             return raw.trim().parse::<u64>().ok().filter(|bytes| *bytes > 0);
         }
@@ -64,7 +140,13 @@ pub fn read_memory_max(root: &Path) -> Option<u64> {
 
 /// 读容器当前占用（字节）。
 pub fn read_memory_current(root: &Path) -> Option<u64> {
-    for (_, current) in memory_files(root) {
+    read_memory_current_from(root, Path::new(PROC_SELF_CGROUP))
+}
+
+/// 同 [`read_memory_current`]，但由调用方指定 `/proc/self/cgroup` 的位置。
+pub fn read_memory_current_from(root: &Path, proc_file: &Path) -> Option<u64> {
+    let dir = memory_dir_for(root, proc_file)?;
+    for (_, current) in memory_files(&dir) {
         if let Ok(raw) = std::fs::read_to_string(&current) {
             return raw.trim().parse::<u64>().ok().filter(|bytes| *bytes > 0);
         }
@@ -151,11 +233,26 @@ pub fn derive_ceiling(limit: u64, footprint: Footprint) -> usize {
     ((headroom / per_task) as usize).max(1)
 }
 
+/// 这一拍该不该往上爬一格。
+///
+/// 只有一条证据算数：**这个界被真的用满过，而且用满的那一拍仍在容器上限之下**。
+/// 算术上还有位置不等于试过还有位置——`memory.current` 在界为 1 时只看得到一条
+/// 任务的价格，那时候算出来的「还装得下五条」是把没发生过的并发外推出来的数。
+///
+/// 用排除法的代价量过：本循环半分钟一拍，按「有空位就爬」写法从 1 爬到 6 只需
+/// 两分半，而一次构建的峰值（实测 15.6 GiB / 16 GiB）完全可以在那两分半里的任何
+/// 一刻到来。按「用满过才爬」写法，从 1 到 2 要等一条任务真的在跑完一整拍，
+/// 从 2 到 3 要等两条同时跑满一整拍——每一步都有一拍变满的代价垫着，
+/// 而收缩仍然是立即的。
+pub fn should_grow(bound: usize, ceiling: usize, ran_full: bool) -> bool {
+    ceiling > bound && ran_full
+}
+
 /// 下一拍用哪个界。
 ///
-/// 下降立即，上升每窗一步：这一窗的算术说还有位置时爬一格，说没有就原地，
-/// 说比现在少就当场降到它。与 `build_gate` 的 `next_bound` 同形（那里
-/// `calm` 是「宿主安静」，这里是「这一窗的余量装得下下一条」）。
+/// 下降立即，上升要有凭据：这一窗的算术说还有位置、且这个界被用满过时爬一格，
+/// 否则原地；算术说比现在少就当场降到它。与 `build_gate` 的 `next_bound` 同形
+/// （那里 `calm` 是「宿主安静」，这里是「用满的那一拍仍然装得下」）。
 pub fn next_bound(bound: usize, ceiling: usize, room_to_grow: bool) -> usize {
     if room_to_grow {
         bound.saturating_add(1).min(ceiling)
@@ -215,6 +312,9 @@ pub fn spawn_lane_memory_bound(
             // 两者在缩界时可以不相等：在跑的许可要等它们自己释放才收得回来。
             let mut capacity = bound;
             let mut footprint = Footprint::default();
+            // 这个界有没有被真的用满过。爬一格的前提（见 [`should_grow`]），
+            // 每爬一格清一次：新界要重新挣一次「用满还在上限之下」。
+            let mut ran_full = false;
             async move {
                 let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -237,10 +337,16 @@ pub fn spawn_lane_memory_bound(
                         .saturating_sub(slots.available_permits())
                         .min(capacity);
                     footprint.observe(current, in_flight);
+                    if in_flight >= capacity {
+                        ran_full = true;
+                    }
                     let ceiling = derive_ceiling(limit, footprint);
-                    let room_to_grow = ceiling > capacity;
-                    let want = next_bound(capacity, ceiling, room_to_grow);
+                    let want =
+                        next_bound(capacity, ceiling, should_grow(capacity, ceiling, ran_full));
                     let applied = apply_bound(&slots, capacity, want);
+                    if applied > capacity {
+                        ran_full = false;
+                    }
                     if applied != capacity {
                         debug!(
                             stream = %stream,
@@ -313,6 +419,24 @@ mod tests {
     fn an_unlimited_container_reads_as_no_limit() {
         let dir = fixture(&[(MEMORY_MAX_FILE, "max\n")]);
         assert_eq!(read_memory_max(dir.path()), None);
+    }
+
+    /// 算术上有空位而没跑满过，不爬。
+    ///
+    /// 这就是「半分钟一拍从 1 爬到 6 只要两分半」那道口子的判据：界为 1 且只有一条
+    /// 任务的价格时，`derive_ceiling` 外推出来的「还装得下几条」是没发生过的并发；
+    /// 在它被真的跑满一拍之前，那个数只能当上限，不能当理由。
+    #[test]
+    fn a_bound_that_never_ran_full_does_not_climb_on_arithmetic_alone() {
+        assert!(!should_grow(1, 6, false));
+        assert_eq!(next_bound(1, 6, should_grow(1, 6, false)), 1);
+        // 用满过一拍，才爬一格；而且只爬一格，不直接跳到 6。
+        assert!(should_grow(1, 6, true));
+        assert_eq!(next_bound(1, 6, should_grow(1, 6, true)), 2);
+        // 没有空位时，跑满过也不爬。
+        assert_eq!(next_bound(3, 3, should_grow(3, 3, true)), 3);
+        // 收缩不看凭据：算术说装不下就当场降。
+        assert_eq!(next_bound(6, 2, should_grow(6, 2, false)), 2);
     }
 
     /// 还没量到一条任务的价格之前，界是 1，不是「无限」。
@@ -397,5 +521,70 @@ mod tests {
         .expect("usage");
         assert_eq!(read_memory_max(dir.path()), Some(8 * GIB));
         assert_eq!(read_memory_current(dir.path()), Some(GIB));
+    }
+
+    const OWN: &str =
+        "/kubepods.slice/kubepods-burstable.slice/pod-1.slice/cri-containerd-abc.scope";
+
+    /// Pod 里 `/sys/fs/cgroup` 是宿主的整个层级，本进程那一格在它下面；上限写在那里。
+    ///
+    /// 这就是 2026-11-07 在进化 Pod 里实测到的形状：挂载点下没有 `memory.max`，
+    /// 而 `/proc/self/cgroup` 指的那一格写着实测 16 GiB。只读挂载点的版本读到的
+    /// 永远是「没有上限」，控制律于是从来没动过界——导出在跑，读数却没量到。
+    #[test]
+    fn the_processes_own_cgroup_is_read_when_the_mount_point_carries_no_limit() {
+        let root = tempfile::tempdir().expect("root");
+        let own = root.path().join(OWN.trim_start_matches('/'));
+        std::fs::create_dir_all(&own).expect("own dir");
+        std::fs::write(own.join(MEMORY_MAX_FILE), "17179869184\n").expect("max");
+        std::fs::write(own.join(MEMORY_CURRENT_FILE), "1309966336\n").expect("current");
+        let proc_file = root.path().join("proc-self-cgroup");
+        std::fs::write(&proc_file, format!("0::{OWN}\n")).expect("proc");
+
+        assert_eq!(
+            read_memory_max_from(root.path(), &proc_file),
+            Some(16 * GIB)
+        );
+        assert_eq!(
+            read_memory_current_from(root.path(), &proc_file),
+            Some(1309966336)
+        );
+    }
+
+    /// 挂载点本身就被名字空间化成容器根时，直接读它——不必去解析 `/proc`。
+    #[test]
+    fn the_mount_point_wins_when_it_is_already_the_container_root() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join(MEMORY_MAX_FILE), "8589934592\n").expect("max");
+        let own = root.path().join(OWN.trim_start_matches('/'));
+        std::fs::create_dir_all(&own).expect("own dir");
+        std::fs::write(own.join(MEMORY_MAX_FILE), "17179869184\n").expect("own max");
+        let proc_file = root.path().join("proc-self-cgroup");
+        std::fs::write(&proc_file, format!("0::{OWN}\n")).expect("proc");
+
+        assert_eq!(read_memory_max_from(root.path(), &proc_file), Some(8 * GIB));
+    }
+
+    /// `/proc/self/cgroup` 里没有 `0::` 那一行＝这不是 v2 的统一层。
+    ///
+    /// 读成「本进程那一格未知」而不是「路径是空串」：空串拼出的目录就是挂载点
+    /// 本身，那会把「解析失败」变成一次对宿主根的重读，而宿主根的上限与容器的
+    /// 上限不是同一件事。
+    #[test]
+    fn a_proc_file_with_no_unified_line_names_no_directory() {
+        assert_eq!(unified_cgroup_path("/\n"), None);
+        assert_eq!(
+            unified_cgroup_path("12:memory:/docker/abc\n11:cpu:/docker/abc\n"),
+            None
+        );
+        assert_eq!(
+            unified_cgroup_path("0::/kubepods.slice/pod-1\n"),
+            Some("/kubepods.slice/pod-1".to_string())
+        );
+
+        let root = tempfile::tempdir().expect("root");
+        let proc_file = root.path().join("proc-self-cgroup");
+        std::fs::write(&proc_file, "12:memory:/docker/abc\n").expect("proc");
+        assert_eq!(read_memory_max_from(root.path(), &proc_file), None);
     }
 }
