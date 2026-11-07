@@ -3,6 +3,7 @@
 //! principle: feedback_two_builders_of_one_sentence_are_routed_to_readers_by_the_merge_criterion
 //! principle: feedback_two_renderers_of_one_verdict_must_name_the_same_derived_quantity
 //! principle: feedback_a_cap_on_our_own_work_belongs_at_task_admission_not_in_the_mid_task_call_path
+//! principle: feedback_a_refusal_recovered_only_at_the_day_boundary_must_not_wear_the_status_that_means_fail_over
 //! 独立安全网关。
 //! 代持全部敏感凭证，沙盒零凭证。两个通道：
 //! - 外网代理（默认 8080）：`POST /proxy` 转发沙盒出站请求，域名白/黑名单 + 凭证脱敏审查；

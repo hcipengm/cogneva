@@ -1,3 +1,5 @@
+//! principle: feedback_a_bound_enforced_on_write_leaves_every_object_nobody_writes_anymore_over_it
+//! principle: feedback_a_bound_reading_is_not_the_population_it_governs
 //! Bounds the metrics sample log by how much it holds, not by how old it is.
 //!
 //! `cog_metrics_samples` is append-only — one row per observation — and for a
