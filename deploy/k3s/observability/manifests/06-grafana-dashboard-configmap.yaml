@@ -3424,6 +3424,76 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 80,
+          "title": "Sandbox Command Latency by Tool",
+          "description": "How long the executor held a tool call, measured from accepting the request to delivering its last frame -- so a client that stops reading ends the measurement where the wait really ended, rather than when the command finally exited. Split by outcome because the four classes are not one population: a refusal costs microseconds, a build costs minutes, and an average over them says nothing about either. Only completed calls are drawn here; refusals and abandoned streams are counted on the next panel and never enter these quantiles. The tail is the command's own runtime, not the executor's overhead -- a tool call whose p95 sits in the seconds is one where the thing it ran took that long, and reading it as sandbox slowness sends the next person to the wrong process.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 376
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.5, sum by (le, tool, outcome) (rate(sandbox_command_seconds_bucket{outcome=~\"ok|failed\"}[5m])))",
+              "legendFormat": "{{tool}} {{outcome}} p50",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le, tool, outcome) (rate(sandbox_command_seconds_bucket{outcome=~\"ok|failed\"}[5m])))",
+              "legendFormat": "{{tool}} {{outcome}} p95",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 81,
+          "title": "Sandbox Commands In Flight by Tool",
+          "description": "How many tool calls the executor is holding right now, by payload kind. The count is per process and is decremented when the response stream ends, including when the caller disconnects -- a stream dropped mid-command leaves this series by the same door a completed one does. Read together with the latency panel: a line that sits at the executor's concurrency while latency climbs is a queue, and a line that never leaves zero is a deployment whose agents are not calling tools at all. Neither reading alone separates those two.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 376
+          },
+          "targets": [
+            {
+              "expr": "sum by (tool) (sandbox_commands_in_flight)",
+              "legendFormat": "{{tool}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

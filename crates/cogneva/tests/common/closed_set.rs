@@ -49,6 +49,35 @@
 /// ever records has a companion no scrape renders, and this reading cannot tell
 /// that apart from one that is being written — deciding it needs the store,
 /// which is a different question asked elsewhere.
+/// Whether a produced table licenses this name, directly or through a
+/// derivation of a name it carries.
+///
+/// The registry answers for the store: a name in it is one a backend can be
+/// handed, and it is what a stored series' liveness is judged against. A
+/// produced table answers for the scrape: the name is rendered by a process,
+/// pinned to the file that renders it, and never reaches a store — the sandbox
+/// executor's own histogram is the reading that put this question on the table.
+/// Asking the registry about it would be asking the wrong set, and filing the
+/// name in the registry to make a panel pass would claim rows that never exist.
+///
+/// The derivation rule is the one above, applied to the other base: a `_bucket`
+/// is licensed exactly when the name it derives from is, and the table has
+/// already held that name against its producer file.
+pub fn a_produced_table_licenses(name: &str, produced: &std::collections::BTreeSet<&str>) -> bool {
+    let licensed = |base: &str| produced.contains(base);
+
+    if licensed(name) {
+        return true;
+    }
+    if let Some(base) = cog_core::observability_text::observed_timestamp_base(name) {
+        return licensed(base);
+    }
+    ["_bucket", "_sum", "_count"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .is_some_and(licensed)
+}
+
 pub fn a_series_this_build_publishes(name: &str) -> bool {
     let base_published = |base: &str| {
         cog_core::metric_names::ALL
@@ -133,6 +162,45 @@ mod tests {
             assert!(
                 a_series_this_build_publishes(&format!("{recorded}{suffix}")),
                 "{recorded}{suffix} is rendered from {recorded}"
+            );
+        }
+    }
+
+    /// A produced table licenses its own names and the derivations of them. The
+    /// table is the scrape's answer where the registry is the store's: a process
+    /// that renders a histogram never hands its name to a backend, so the
+    /// registry cannot license it and the table is the only claim there is.
+    #[test]
+    fn a_produced_table_licenses_its_names_and_their_derivations() {
+        let table: std::collections::BTreeSet<&str> = ["sandbox_command_seconds"].into();
+        for name in [
+            "sandbox_command_seconds",
+            "sandbox_command_seconds_bucket",
+            "sandbox_command_seconds_sum",
+            "sandbox_command_seconds_count",
+            "sandbox_command_seconds_observed_timestamp_seconds",
+        ] {
+            assert!(
+                a_produced_table_licenses(name, &table),
+                "{name} is rendered from a name the table carries"
+            );
+        }
+    }
+
+    /// The same ceiling the registry path has: the suffix means nothing over a
+    /// base no table carries, and a table entry licenses only its own family.
+    #[test]
+    fn a_derived_name_over_a_base_no_table_carries_is_still_unknown() {
+        let table: std::collections::BTreeSet<&str> = ["sandbox_command_seconds"].into();
+        for name in [
+            "sandbox_commands_in_flight_bucket",
+            "up_bucket",
+            "sandbox_command_seconds_extra",
+            "_bucket",
+        ] {
+            assert!(
+                !a_produced_table_licenses(name, &table),
+                "{name} has no base on the table"
             );
         }
     }

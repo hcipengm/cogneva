@@ -994,6 +994,24 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["source", "result"],
         "crates/cog-orchestrator/src/outward.rs",
     ),
+    // The executor's own two readings. Every agent tool call passes through
+    // this pod, and until this pair was recorded "is the sandbox slow" could be
+    // answered only by someone who knew to ask its `/metrics` by hand.
+    //
+    // Both are scrape-only: the process renders them on its own `/metrics` and
+    // never hands them to a store, so neither belongs in
+    // `cog_core::metric_names::ALL` -- that list is the store's, and a name in
+    // it claims rows that will never exist.
+    (
+        "sandbox_command_seconds",
+        &["tool", "outcome"],
+        "crates/cog-extension/src/command_server.rs",
+    ),
+    (
+        "sandbox_commands_in_flight",
+        &["tool"],
+        "crates/cog-extension/src/command_server.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the
@@ -1178,8 +1196,7 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
     let mut unknown: BTreeSet<String> = BTreeSet::new();
     for panel in metric_exprs(&text) {
         for name in metric_names_in(&panel.expr) {
-            if produced.contains(name.as_str())
-                || foreign.contains(name.as_str())
+            if foreign.contains(name.as_str())
                 // A classic histogram is exposed as three series derived from the
                 // one name the producer records: `_bucket`, `_sum`, `_count`, and
                 // the store renders an `_observed_timestamp_seconds` companion
@@ -1187,6 +1204,15 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
                 // decided once, in the module both readers share, rather than
                 // here -- spelling it in each reader is what let a `_bucket` be
                 // accepted in a panel and rejected in a rule.
+                //
+                // Two bases can license a derivation and either one will do: a
+                // recorded name, for a series the store holds, and a produced
+                // table row, for a series a process renders and no store ever
+                // sees. The executor's histogram is the second kind, and asking
+                // only the registry about it would have made its `_bucket` the
+                // one panel this contract refuses while every panel here is
+                // green.
+                || closed_set::a_produced_table_licenses(&name, &produced)
                 || closed_set::a_series_this_build_publishes(&name)
             {
                 continue;
