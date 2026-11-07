@@ -197,6 +197,13 @@ const EXEMPT: &[Exempt] = &[
               与任务输入键 `cog_core::contract::pge_stage::INPUT_CHANGE_IDENTITY` 同形\
               却不同物：列名改了要迁表，输入键改了只改派发那一侧，改名时两处不必同步",
     },
+    Exempt {
+        file: "crates/cog-collaboration/src/squad/ralph/ralph_loop.rs",
+        value: "ralph_iteration",
+        why: "喂给模型的上下文键名，不是那个事件类型：读它的是提示模板，占位符在模板\
+              那一侧，改事件名时跟着改只会让模板安静地取不到值——模板不报错，它把占位符\
+              当成空串渲染，循环照旧跑完",
+    },
 ];
 
 /// A value worth holding to one spelling: long enough and shaped like a path,

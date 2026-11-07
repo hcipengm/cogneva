@@ -20,7 +20,7 @@ use cog_core::{
     ChangeIdentity, ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
     ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure,
     DispatchState, LandedTally, PoolWait, RemeasureBacklog, RetireReason, SFError, SFResult,
-    WriteWindow,
+    UsageResult, WriteWindow,
 };
 
 /// Resolve the state and reason words a query template names.
@@ -1826,10 +1826,11 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                     sum(tokens_input + tokens_output)::bigint AS tokens \
                FROM gateway_llm_usage \
               WHERE ts >= $1 \
-                AND result = 'ok' \
+                AND result = $2 \
               GROUP BY 1",
         )
         .bind(since)
+        .bind(UsageResult::Ok.as_str())
         .fetch_all(&self.pool)
         .await
         {

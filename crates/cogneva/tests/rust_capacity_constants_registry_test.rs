@@ -806,11 +806,23 @@ fn code_only(line: &str, raw: &mut Option<usize>) -> String {
         // Raw and byte strings open with `r#*"` (`br#*"`); the hash count has to
         // survive across lines, because a shell script in a fixture is very
         // likely to hold an unbalanced brace.
+        // The `r` (or the `b` before it) has to start a token. This reader is
+        // line-oriented, so a string continued with a trailing `\` is not
+        // tracked and its tail is read as code -- a line ending `... accounted
+        // for"` then spells `r"`, which opened a raw string that never closed
+        // and put every closing brace after it out of the scan's sight.
+        // Measured 2026-11-08: one such line ended `mod tests` in
+        // change_ledger.rs 446 lines early, and a test-only
+        // `Duration::from_secs(60)` inside it counted as production.
+        let continues_an_identifier = i > 0
+            && chars
+                .get(i - 1)
+                .is_some_and(|prev| prev.is_alphanumeric() || *prev == '_');
         let mut j = i;
         if c == 'b' {
             j += 1;
         }
-        if chars.get(j) == Some(&'r') {
+        if !continues_an_identifier && chars.get(j) == Some(&'r') {
             let mut hashes = 0;
             let mut k = j + 1;
             while chars.get(k) == Some(&'#') {
@@ -1050,6 +1062,15 @@ fn call(ctl: &Ctl) {
         KUBECTL_READ_TIMEOUT_SECS,
     ).await;
     ctl.kubectl(&["delete", "job", "x", "--ignore-not-found"], 1).await;
+}
+
+/// A message continued with a trailing backslash, whose second line ends in
+/// `r"`. The scan reads one line at a time, so that tail is code to it, and a
+/// lexer that opens a raw string on any `r` goes blind from here to the end of
+/// the file -- everything below would then be either counted twice or missed.
+fn a_message() -> &'static str {
+    "a batch's commit names one task, so every row behind \
+     the anchor was accounted for"
 }
 
 #[cfg(test)]

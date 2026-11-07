@@ -477,7 +477,15 @@ const DISPATCH_PROJECT_ROOT_KIND: &str = "change_ledger_project";
 /// Derived from the project key, so the same project always names the same
 /// anchor: the batch that carries it is idempotent, and a second pass finds the
 /// row it already wrote instead of opening a second root.
-const DISPATCH_PROJECT_ROOT_PREFIX: &str = "change-ledger-project:";
+///
+/// Built from the declared task prefix rather than spelled again: an anchor is
+/// a task id in the same namespace, so a rename of that prefix has to move the
+/// anchors with it. A second literal agrees only until it does not, and the
+/// disagreement reads as "no anchor exists" for every project at once -- which
+/// is the shape a pass sees when nothing is wrong with the queue.
+fn dispatch_project_root_prefix() -> String {
+    format!("{}project:", DISPATCH_TASK_PREFIX)
+}
 
 /// What "done" means for one dispatched change.
 ///
@@ -1782,7 +1790,7 @@ fn dispatch_project_root_id(project: &str) -> String {
     let scope = project
         .strip_prefix(DISPATCH_PROJECT_PREFIX)
         .unwrap_or(project);
-    format!("{DISPATCH_PROJECT_ROOT_PREFIX}{scope}")
+    format!("{}{scope}", dispatch_project_root_prefix())
 }
 
 /// How many hand-over rows one pass is allowed to close.
