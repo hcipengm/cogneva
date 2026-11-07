@@ -65,6 +65,17 @@ async fn send_connected_event(
     send_server_message(socket, &msg).await
 }
 
+/// 握手时客户端自报的「我在哪儿」。
+///
+/// 两格回答的是同一个问题，所以一起走：分行传只是把参数个数加一。它们不是身份
+/// ——身份是认证主体；这两格只回答「这一行是谁开出来的会话」，让名单上分得出
+/// 人和探针。
+#[derive(Debug, Clone, Copy, Default)]
+struct ClientOrigin<'a> {
+    platform: Option<&'a str>,
+    device_id: Option<&'a str>,
+}
+
 async fn handle_type_message(
     socket: &mut WebSocket,
     state: &Arc<GatewayState>,
@@ -76,10 +87,8 @@ async fn handle_type_message(
     user_id: &str,
     text: &str,
     out_tx: &tokio::sync::mpsc::Sender<String>,
-    // 握手时自报的平台与设备。转发进这一轮，落到「说过话的人」那一行上——
-    // 名字是哈希出来的，名单上要分得出人和探针只有这一格。
-    platform: Option<&str>,
-    device_id: Option<&str>,
+    // 转发进这一轮，落到「说过话的人」那一行上。
+    origin: ClientOrigin<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -131,8 +140,8 @@ async fn handle_type_message(
             let out = out_tx.clone();
             let session = session_id.unwrap_or_else(|| "default".into());
             let owner = user_id.to_string();
-            let platform = platform.map(str::to_string);
-            let device_id = device_id.map(str::to_string);
+            let platform = origin.platform.map(str::to_string);
+            let device_id = origin.device_id.map(str::to_string);
             tokio::spawn(async move {
                 crate::chat::run_chat_turn(
                     state, out, session, content, owner, platform, device_id,
@@ -339,8 +348,10 @@ pub async fn handle_socket(
                                 &user_id,
                                 &text,
                                 &out_tx,
-                                platform.as_deref(),
-                                device_id.as_deref(),
+                                ClientOrigin {
+                                    platform: platform.as_deref(),
+                                    device_id: device_id.as_deref(),
+                                },
                             )
                             .await
                         {
