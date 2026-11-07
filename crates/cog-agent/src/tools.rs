@@ -1836,6 +1836,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 被字符界截断的一页不能读成「文件到这儿就完了」。
+    ///
+    /// 一条读接上 `head` 之后再从里面数行，数出来的是这一页，不是文件：截断处
+    /// 之后的那些，与「本来就不存在」在盘面上同形。所以被字符界停下的那一页
+    /// 必须自己说清它停在哪——`total_lines` 是整份文件的行数，`has_more` 与
+    /// `next_offset` 让读的人走到最后一行，而不许把余下的部分当成不存在就此收
+    /// 尾。这里顺着 `next_offset` 一直翻到 `has_more: false`，把每一页的正文按
+    /// 序接起来，要求它一字不差地还原整份文件：少一行、重一行、或者把某一页
+    /// 的余下部分截掉，都会在这里对不上。
+    ///
+    /// principle: feedback_a_read_cut_with_head_reads_as_if_the_rest_were_absent
+    #[tokio::test]
+    async fn read_file_pages_cut_by_the_character_bound_walk_to_the_end() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-cut-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.txt");
+        let path = path.to_str().unwrap();
+        // 六行，每行都比一页的字符预算还长：一页装不下一行，翻页只能靠「至少给
+        // 一行」这条兜底往前走——走不动是死循环，走快了是漏行。
+        const LINES: usize = 6;
+        let body: String = (1..=LINES)
+            .map(|i| {
+                format!(
+                    "line {i} {} {i}\n",
+                    "x".repeat(READ_FILE_PAGE_MAX_CHARS + 1024)
+                )
+            })
+            .collect();
+        let expected: Vec<String> = body.lines().map(str::to_string).collect();
+        assert_eq!(expected.len(), LINES);
+
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+        cog_core::ToolRegistry::register(&registry, builtins::write_file());
+        registry
+            .execute(
+                "write_file",
+                serde_json::json!({ "path": path, "content": body }),
+            )
+            .await
+            .unwrap();
+
+        let mut offset: Option<u64> = None;
+        let mut collected: Vec<String> = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let arguments = match offset {
+                Some(from) => serde_json::json!({ "path": path, "offset": from }),
+                None => serde_json::json!({ "path": path }),
+            };
+            let page = registry.execute("read_file", arguments).await.unwrap();
+            pages += 1;
+            assert!(
+                pages <= LINES,
+                "翻了 {pages} 页还没读到末尾，offset 停在 {offset:?}：这一页没有往前走"
+            );
+            assert_eq!(
+                page["total_lines"], LINES as u64,
+                "第 {pages} 页只说自己这一页有多长，读的人会把截断处当成文件末尾: {page}"
+            );
+            let content = page["content"].as_str().expect("content 是一段字符串");
+            assert!(
+                !content.is_empty(),
+                "第 {pages} 页是空的：翻页停在了文件中间"
+            );
+            collected.extend(content.lines().map(str::to_string));
+            assert_eq!(
+                page["has_more"].as_bool(),
+                Some(page["next_offset"].is_u64()),
+                "has_more 与 next_offset 必须说的是同一件事: {page}"
+            );
+            match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert_eq!(
+                        next as usize,
+                        collected.len() + 1,
+                        "next_offset 不是上一页之后的第一行: {page}"
+                    );
+                    offset = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert!(pages > 1, "六行超长行必须分页读，一页读完说明字符界没生效");
+        assert_eq!(
+            collected, expected,
+            "把所有页接起来必须还原整份文件：少一行、重一行，或者把一页的余下部分当成不存在，都会对不上"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The tool list a request carries must come out in name order, whatever
     /// order the definitions were registered in.
     ///
