@@ -1739,6 +1739,15 @@ fn dispatch_project_root_id(project: &str) -> String {
 // cap: bound — 关一行要把整个工作区的任务表读进一个事务，界的是突发；没轮到的下一拍接着关
 const CLOSE_SETTLED_PER_PASS: usize = 200;
 
+/// Written into a hand-over's reason when the loop let it go so that a batch
+/// could carry its row instead. See [`foldable_handovers`].
+///
+/// It has to be declared on the row rather than left as an ordinary
+/// cancellation: the row is still owed, and a cancellation nobody can read back
+/// as "this was not an attempt" would stop the row from ever being handed over
+/// again -- which is the exact opposite of what the fold is for.
+const FOLDED_HANDOVER_PREFIX: &str = "folded_into_batch";
+
 /// The change a hand-over row was submitted for.
 ///
 /// Read back from the row's own payload rather than recomputed from its id: the
@@ -1790,6 +1799,122 @@ fn dispatched_identities(task: &Task) -> Vec<ChangeIdentity> {
         }
     }
     identities
+}
+
+/// Whether this hand-over was let go so its change could be carried by a batch.
+fn folded_for_batching(task: &Task) -> bool {
+    task.status == TaskStatus::Cancelled
+        && task
+            .error
+            .as_deref()
+            .is_some_and(|reason| declares(reason, FOLDED_HANDOVER_PREFIX))
+}
+
+/// The hand-overs this pass may let go so that a batch can carry their rows,
+/// keyed by the change each of them is holding.
+///
+/// One row, one task is the shape the queue is in whenever batching is new: a
+/// hand-over filed before the pass could carry more than one change is still a
+/// whole task, and a task is a planning round, a context and a sandbox -- the
+/// same fixed price whether it carries one row or five. Measured on 2026-11-07:
+/// 1954 owed rows held by 1911 never-started one-row hand-overs, 1714 of them in
+/// one project, and the pass handed over nothing (`submitted: 0`) because every
+/// row it could have batched was already spoken for by a task that had never
+/// moved. The queue was not short of work; it was full of one-row tasks the
+/// pass was too polite to take the rows back from.
+///
+/// Waiting for those tasks is the wrong answer -- one that has not started has
+/// nothing to lose: letting it go costs one cancellation, and its row goes out
+/// again in the batch this pass is already building. What must not be let go is
+/// a task that has run: it has an attempt on record and its own retry account,
+/// and cancelling it throws away work rather than a queue slot. Nor a task that
+/// already carries several rows: that one *is* the batch this rule exists to
+/// produce.
+fn foldable_handovers(tasks: &[Task]) -> HashMap<ChangeIdentity, String> {
+    let mut foldable = HashMap::new();
+    for task in tasks {
+        if task.status != TaskStatus::Pending || task.started_at.is_some() {
+            continue;
+        }
+        if !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_TASK_KIND) {
+            continue;
+        }
+        let identities = dispatched_identities(task);
+        if identities.len() != 1 {
+            continue;
+        }
+        for identity in identities {
+            foldable.insert(identity, task.id.clone());
+        }
+    }
+    foldable
+}
+
+/// How many rows a batch could still take in each project this pass, which is
+/// what decides whether letting a hand-over go buys anything.
+///
+/// A fold pays for itself only if the row it releases has neighbours to be
+/// batched with: releasing the only row of a project just re-files it as
+/// another one-row task, at one more write. So the count includes the rows no
+/// task holds and the rows the foldable hand-overs hold, and nothing else --
+/// a row a live or finished task holds is not this pass's, and a row whose
+/// hand-over died is counted here even though the walk below may read it as
+/// already answered. That over-count can cost a fold that buys nothing; it can
+/// never cost a row.
+fn rows_a_batch_could_take(
+    pending: &[ChangeLedgerRow],
+    handovers: &HandoverIndex,
+    foldable: &HashMap<ChangeIdentity, String>,
+) -> HashMap<String, usize> {
+    let mut available: HashMap<String, usize> = HashMap::new();
+    for row in pending {
+        let spoken_for = match handovers.held(&row.identity) {
+            Some(Handover::InFlight) => !foldable.contains_key(&row.identity),
+            Some(Handover::Completed) => true,
+            _ => false,
+        };
+        if spoken_for {
+            continue;
+        }
+        *available.entry(dispatch_project_key(row)).or_default() += 1;
+    }
+    available
+}
+
+/// Let one never-started hand-over go, so its row can be batched.
+///
+/// The row is read once more before it is cancelled, because the snapshot this
+/// pass decided on is older than the write: a task that started in between has
+/// work on record, and the whole point of the fold is that only untouched ones
+/// are safe to take the row back from. The store would cancel a running task
+/// without complaint; this is the check that keeps it from being asked.
+async fn fold_handover(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    task_id: &str,
+    identity: &ChangeIdentity,
+) -> bool {
+    match orchestrator.get_task(task_id).await {
+        Some(task) if task.status == TaskStatus::Pending && task.started_at.is_none() => {}
+        Some(_) => return false,
+        None => return false,
+    }
+    let reason = format!(
+        "{FOLDED_HANDOVER_PREFIX}: 这条交接从没开始过、只占着 {identity} 一行，\
+         放回去让它跟同一项目的欠账一起成批走"
+    );
+    match orchestrator.cancel_task_with_reason(task_id, reason).await {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(
+                change = %identity,
+                task = task_id,
+                error = %e,
+                "change ledger: an untouched hand-over could not be let go, so its row \
+                 stays where it is"
+            );
+            false
+        }
+    }
 }
 
 /// Set to `true` on a row that has work to do and owes no change, by the code
@@ -5133,7 +5258,7 @@ async fn dispatch_pass(
     let owed: HashSet<ChangeIdentity> = rows.iter().map(|row| row.identity.clone()).collect();
     let graph_tasks = orchestrator.get_all_tasks().await;
     let closed = close_settled_dispatch_rows(orchestrator, &graph_tasks, store, &owed).await;
-    let handovers = HandoverIndex::read(&graph_tasks);
+    let mut handovers = HandoverIndex::read(&graph_tasks);
     if closed.moved_anything() {
         info!("change ledger: {}", closed.line());
     }
@@ -5318,6 +5443,19 @@ async fn dispatch_pass(
     // filed one at a time. Filled by the loop below, submitted after it.
     let mut batches: Vec<HandoverBatch> = Vec::new();
     let rows_per_batch = rows_per_handover();
+    // Hand-overs this pass may take back so their rows can be batched, and how
+    // many rows each project could still put in a batch -- both read off the
+    // snapshot the pass already took, so neither costs a lookup.
+    //
+    // How many may be taken back is the pass's own hand-over bound divided by
+    // the rows a batch holds: a pass that may start forty tasks has no use for
+    // more than forty tasks' worth of released rows, and every release is a
+    // write. The bound follows the pool, so a paused or shrunk pass takes back
+    // less rather than filling the queue at a rate nothing is draining.
+    let foldable = foldable_handovers(&graph_tasks);
+    let rows_free = rows_a_batch_could_take(&pending, &handovers, &foldable);
+    let fold_budget = (handover_budget / rows_per_batch.max(1)).max(1);
+    let mut folded = 0usize;
     for row in &pending {
         // What the change's handovers left behind, read before anything is
         // decided about the row: this is a reading of the event stream, and it
@@ -5346,6 +5484,33 @@ async fn dispatch_pass(
         let held = match handovers.held(&row.identity) {
             Some(handover @ (Handover::InFlight | Handover::Completed)) => Some(handover),
             _ => None,
+        };
+        // A row a task has spoken for is not this pass's to hand over -- unless
+        // that task has never started and carries nothing but this row. Taking
+        // the row back costs one cancellation and buys a batch; leaving it alone
+        // buys nothing and keeps the one-row task the queue is already full of.
+        // See [`foldable_handovers`].
+        let held = match held {
+            Some(Handover::InFlight)
+                if !pausing
+                    && folded < fold_budget
+                    && foldable.contains_key(&row.identity)
+                    && rows_free
+                        .get(&dispatch_project_key(row))
+                        .copied()
+                        .unwrap_or(0)
+                        > 1 =>
+            {
+                let task_id = foldable[&row.identity].clone();
+                if fold_handover(orchestrator, &task_id, &row.identity).await {
+                    handovers.released(&row.identity);
+                    folded += 1;
+                    None
+                } else {
+                    Some(Handover::InFlight)
+                }
+            }
+            other => other,
         };
         let owed = match held {
             Some(handover) => Owed::Held(handover),
@@ -5454,6 +5619,10 @@ async fn dispatch_pass(
             tasks_submitted,
             held_back = counts.held_back,
             rearmed = counts.rearmed,
+            // Hand-overs taken back this pass because they had never started and
+            // held one row each: the queue's shape, not an outcome. Rows that
+            // went out because of it are in `submitted` and `rearmed`.
+            folded,
             already_handed_over = counts.already,
             already_dead_environment = counts.dead_environment,
             delivered = counts.delivered,
@@ -5605,6 +5774,19 @@ impl HandoverIndex {
     fn held(&self, identity: &ChangeIdentity) -> Option<Handover> {
         self.held.get(identity).copied()
     }
+
+    /// Drop what a task in flight was holding, once that task has been let go.
+    ///
+    /// Only the in-flight answer is dropped. A finished answer is one the index
+    /// only ever holds in place of an in-flight one (`read` refuses to overwrite
+    /// either with the other), and taking that one away would hand over work
+    /// that has already been done. What is left after the drop is answered by
+    /// [`owed_row`], which walks the generations on the graph itself.
+    fn released(&mut self, identity: &ChangeIdentity) {
+        if matches!(self.held.get(identity), Some(Handover::InFlight)) {
+            self.held.remove(identity);
+        }
+    }
 }
 
 /// What one owed row's graph row says about it.
@@ -5654,7 +5836,16 @@ async fn owed_row(
             // change's answer would leave the reopened row reading as "already
             // handed over" for the rest of the account's life. The next
             // generation is where it goes, like an environment refusal.
-            Handover::DeadWork if generation < rearm_limit && closed_as_settled(&task) => {
+            // A hand-over the loop let go to batch its row never ran either, so
+            // it is not an answer about the change: the next generation is
+            // where the row goes, and the pass that folded it files it there in
+            // the same breath. Reading it as the change's answer would put the
+            // row down as "already handed over" forever, which is the shape
+            // this whole exception exists to avoid.
+            Handover::DeadWork
+                if generation < rearm_limit
+                    && (closed_as_settled(&task) || folded_for_batching(&task)) =>
+            {
                 generation += 1
             }
             verdict => return Owed::Held(verdict),
@@ -9932,6 +10123,13 @@ mod tests {
             self
         }
 
+        /// A task put on the graph as it stands, for the rows a test needs to
+        /// set up beyond a status: a hand-over that already started, say.
+        fn holding_task(self, task: Task) -> Self {
+            self.tasks.lock().unwrap().insert(task.id.clone(), task);
+            self
+        }
+
         /// A hand-over carrying several rows, the way a pass files them now.
         fn holding_batch(self, rows: &[ChangeLedgerRow], status: TaskStatus) -> Self {
             let mut task = dispatch_task(rows, 0);
@@ -11261,6 +11459,226 @@ mod tests {
             Some(100),
             "the oldest real one is the answer, and the future stamp is dropped"
         );
+    }
+
+    /// A hand-over that never started and holds one row is taken back, so its
+    /// row goes out in the batch this pass is already building.
+    ///
+    /// This is the queue's measured shape on 2026-11-07: 1954 owed rows held by
+    /// 1911 never-started one-row hand-overs, 1714 of them in one project, and
+    /// every pass handing over nothing -- `submitted: 0` -- because the rows a
+    /// batch could have carried were each spoken for by a task that had not
+    /// moved. One row per task is a planning round, a context and a sandbox for
+    /// every row, which is the whole cost this batching exists to divide.
+    ///
+    /// Taken back is not thrown away: the row is handed over again in the same
+    /// pass, one generation on, and the hand-over that let it go says on its own
+    /// row that it never ran -- a cancellation nobody can read back that way
+    /// would leave the row looking answered for the rest of the account's life.
+    #[tokio::test]
+    async fn a_one_row_handover_that_never_started_is_taken_back_for_its_batch() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let mut graph = FakeGraph::default();
+        for row in &rows {
+            graph = graph.holding_handover(row, TaskStatus::Pending);
+        }
+        let graph = Arc::new(graph);
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        for row in &rows {
+            let id = dispatch_task_id(&row.identity, 0);
+            let task = graph.held(&id).expect("放回去的那条交接还在图上");
+            assert_eq!(task.status, TaskStatus::Cancelled, "没开始的交接该被放回去");
+            assert!(
+                declares(
+                    task.error.as_deref().unwrap_or_default(),
+                    FOLDED_HANDOVER_PREFIX
+                ),
+                "放回去的理由没有声明「这条没跑过」，下一拍会把它读成这个变更的答案：{:?}",
+                task.error
+            );
+        }
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.submitted, 3, "三条欠账该在这一拍全部出去");
+        assert_the_counts_add_up(&state);
+
+        let batch = graph
+            .handed()
+            .into_iter()
+            .find(|task| task.input.get(cog_core::INPUT_CHANGE_IDENTITIES).is_some())
+            .expect("三条欠账该由一笔交接承载");
+        let carried = dispatched_identities(&batch);
+        assert_eq!(carried.len(), 3, "三条挂在同一个任务上：{carried:?}");
+        assert_eq!(
+            batch.id,
+            dispatch_task_id(&carried[0], 1),
+            "放回去的行落在下一代号上，不跟被放回去的那条抢同一个 id"
+        );
+    }
+
+    /// A hand-over that already ran is left to its own attempt.
+    ///
+    /// The distinction the fold turns on: one that never started has nothing to
+    /// lose, and one that did has an attempt on record and a retry account the
+    /// executor already settled. Letting the second go would throw away work to
+    /// buy a queue slot.
+    #[tokio::test]
+    async fn a_handover_that_started_is_left_to_its_own_attempt() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b", "fn c"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let mut started = dispatch_one(&rows[0], 0);
+        started.started_at = Some(Utc::now());
+        let graph = FakeGraph::default().holding_task(started);
+        let graph = Arc::new(rows[1..].iter().fold(graph, |graph, row| {
+            graph.holding_handover(row, TaskStatus::Pending)
+        }));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let kept = graph
+            .held(&dispatch_task_id(&rows[0].identity, 0))
+            .expect("跑过的那条还在图上");
+        assert_eq!(
+            kept.status,
+            TaskStatus::Pending,
+            "跑过的那条被放回去了：它记着自己这一次尝试，放回去就是丢掉这一次"
+        );
+        assert!(graph
+            .cancelled()
+            .iter()
+            .all(|(id, _)| id != &dispatch_task_id(&rows[0].identity, 0)));
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.submitted, 2, "另外两条该成批出去");
+        assert_eq!(state.already, 1, "跑过的那条读作已经派出去了");
+    }
+
+    /// A project with nothing to batch keeps its one-row hand-over.
+    ///
+    /// Folding a lone row buys nothing: it goes straight back out as another
+    /// one-row task, at one more write. The guard is a cost guard -- releasing
+    /// that row costs a cancellation and saves nothing -- so it has to be the
+    /// count of *other* rows that decide, not the number of foldable ones.
+    #[tokio::test]
+    async fn a_lone_row_is_not_taken_back() {
+        let only = pending_row("crates/x");
+        let store = FakeLedger {
+            rows: vec![only.clone()],
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default().holding_handover(&only, TaskStatus::Pending));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let held = graph
+            .held(&dispatch_task_id(&only.identity, 0))
+            .expect("这一行还该在图里");
+        assert_eq!(held.status, TaskStatus::Pending, "独一份的行也被放回去了");
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.submitted, 0);
+        assert_eq!(state.already, 1);
+    }
+
+    /// A hand-over that already carries several rows stays where it is: it is
+    /// the batch this rule exists to produce, not a queue slot to buy back.
+    #[tokio::test]
+    async fn a_batch_is_never_taken_back() {
+        let rows: Vec<ChangeLedgerRow> = ["fn a", "fn b"]
+            .iter()
+            .map(|literal| ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "crates/x", *literal),
+                ..row(ChangeState::Pending, None)
+            })
+            .collect();
+        let store = FakeLedger {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default().holding_batch(&rows, TaskStatus::Pending));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let batch_id = dispatch_task_id(&rows[0].identity, 0);
+        let held = graph.held(&batch_id).expect("这一批还该在图里");
+        assert_eq!(held.status, TaskStatus::Pending, "一条多行的交接被拆回去了");
+        assert!(graph.cancelled().is_empty(), "{:?}", graph.cancelled());
     }
 
     /// Every way this reading can fail to be taken leaves the set exactly as it
