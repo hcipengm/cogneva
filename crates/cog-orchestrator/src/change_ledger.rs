@@ -16,22 +16,20 @@
 //! a process whose storage holds no shared database never reaches this point, so
 //! it never becomes a candidate.
 //!
-//! Five things happen here, and the measuring is the only one that moves a row.
+//! Four things happen here, and the measuring is the only one that moves a row.
 //! The loop folds the intake into the account -- declarations queued by other
 //! parties become readings, through the same reading path a direct write would
-//! use -- it reads the tree's own debt registries into the account the same way,
-//! it reads what the platform's own principle account says about the rules it
-//! holds the same way again, it reads the outstanding set back out, saying
-//! plainly when a read failed, and it measures that set against the tree, through
-//! the one call that may move a state. Every intake is mechanical: it carries
-//! what a document, a registry or another account asked for and adds nothing of
-//! its own, so this loop cannot make a change look done by reading anything into
-//! it.
+//! use -- it reads what the platform's own principle account says about the rules
+//! it holds the same way, it reads the outstanding set back out, saying plainly
+//! when a read failed, and it measures that set against the tree, through the one
+//! call that may move a state. Every intake is mechanical: it carries what a
+//! document or another account asked for and adds nothing of its own, so this
+//! loop cannot make a change look done by reading anything into it.
 //!
-//! The fourth thing is what makes the ledger a driver rather than a record: the
-//! rows a measurement found `pending` are handed to the goal path, one task
-//! each, so "the ledger says this is still owed" is where a change gets worked
-//! on from. Handing over is not finishing. A dispatched change keeps its state
+//! The third thing is what makes the ledger a driver rather than a record: the
+//! rows a measurement found `pending` are handed to the goal path, one task each,
+//! so "the ledger says this is still owed" is where a change gets worked on
+//! from. Handing over is not finishing. A dispatched change keeps its state
 //! and only a later measurement -- of the tree, after someone has changed it --
 //! can move the row, so a task that reported success changes nothing by itself.
 //!
@@ -46,20 +44,27 @@
 //! tree structurally cannot hold -- is retracted to `undecided` instead of being
 //! re-asked forever, because re-asking measures the same nothing every time.
 //!
-//! The second reading source is the project's own debt registries: files in the
-//! tree listing dependencies that are owed removal, core modules that are owed a
-//! move, and `.rs` files that no `mod` declaration reaches. They are readings and
-//! not a second account -- every row they name
-//! enters through the same call a declaration does, and only a measurement of the
-//! tree can move it. What makes them a source rather than a table is where the
-//! news comes from and how a row is retired: nothing queues these, the loop reads
-//! them out of the tree it is already measuring against, and a row stops being
-//! owed when the tree stops carrying what it asked for -- not when the registry
-//! stops listing it. A registry nobody edited would otherwise be able to close an
-//! account by deleting its own line, which is the self-reported completion this
-//! whole loop is built to refuse.
+//! What used to be the second reading source -- files in the tree listing
+//! dependencies owed removal, core modules owed a move, and `.rs` files no `mod`
+//! declaration reaches -- is not one any more, and this note is here so the next
+//! reader does not go looking for it. The registries left with the tree, the debt
+//! they carried is declared in the platform's own account under the same
+//! identities, and the driving leg is this one: those rows enter this account and
+//! `dispatch_pass` hands them out from here. A frozen plan that had the same debt
+//! driven from the principle ledger's own side, and a separate `principle_debt`
+//! reading family minted for it, are void with the registries: a debt row is a row
+//! of this account, counted by the pass's own line, and a name nothing publishes
+//! from is what the closed metric-name set refuses.
 //!
-//! The third is the platform's own principle account, and that it is an account
+//! What survives of them is the rule they were held to, which is the rule for
+//! anything read out of the tree: a reading and not a second account, entering
+//! through the same call a declaration does, and retired when the tree stops
+//! carrying what it asked for rather than when a file stops listing it -- because
+//! a file nobody edited would otherwise be able to close an account by deleting
+//! its own line, which is the self-reported completion this whole loop is built
+//! to refuse.
+//!
+//! The second is the platform's own principle account, and that it is an account
 //! rather than a file is the whole of the difference. What is wrong with a rule
 //! is read there, and there are two things it knows: the rules nothing has found
 //! a gate for, and the rules a gate has had to refuse work for. They are one
