@@ -63,6 +63,8 @@ mod a_day_is_named_by_one_clock_test;
 mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 #[path = "a_label_name_is_the_same_wherever_it_is_declared_test.rs"]
 mod a_label_name_is_the_same_wherever_it_is_declared_test;
+#[path = "a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test.rs"]
+mod a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test;
 #[path = "a_node_capacity_probe_is_written_once_test.rs"]
 mod a_node_capacity_probe_is_written_once_test;
 #[path = "a_pg_integration_test_owns_its_schema_test.rs"]
