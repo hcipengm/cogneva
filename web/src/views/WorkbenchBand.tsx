@@ -83,6 +83,9 @@ export function WorkbenchBand() {
     r.error ? `读不到：${r.error}` : r.data === null ? '读取中…' : ready;
 
   const roster = agents.data ?? [];
+  // 名册回答「存不存在」，这一格问的是「此刻在不在岗」：休息中的人也在
+  // `/api/v1/agents` 上（名册不能漏人），把它们计进在岗数就是错的读数。
+  const onDuty = roster.filter((a) => a.live !== false);
   const venueRows = venues.data?.venues ?? [];
   const taskCounts = tasks.data;
   /** 还没读到过时写一个破折号：0 是一个读数，「不知道」不是。 */
@@ -96,14 +99,14 @@ export function WorkbenchBand() {
     >
       <Cell
         title="人"
-        count={count(agents.data !== null, roster.length)}
+        count={count(agents.data !== null, onDuty.length)}
         unit="位在岗"
         icon="agents"
         to="people"
         line={
-          roster.length === 0
+          onDuty.length === 0
             ? secondLine(agents, '此刻没有在岗的员工——名单是心跳，30 秒不来就会被摘掉')
-            : secondLine(agents, joined(roster.map((a) => `${a.display_name}（${a.role}）`)))
+            : secondLine(agents, joined(onDuty.map((a) => `${a.display_name}（${a.role}）`)))
         }
       />
       <Cell

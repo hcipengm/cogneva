@@ -1707,9 +1707,15 @@ fn roster_split(regs: &[cog_core::AgentRegistration]) -> (usize, usize) {
 /// `live` 是这次合并唯一的判断位：有它是此刻叫得到，没有是这个人说过话、现在
 /// 不在岗。界面据此决定这一格是「在岗」还是「休息中」，以及能不能用对话那条路
 /// 接着聊（只有说过话的人带着 `session_id`）。
+///
+/// 第三份来源是雇佣名册（[`ROSTER_KEY`]）。池是内存的，读面又只读注册表时，
+/// 招进来的人在维护环把他建回来之前会整个消失——名单上少一个人，读的人分不出
+/// 「没这个人」和「这个人这一刻不在池里」。所以名册上的人即使池里没有，也印一
+/// 行（`live: false`）：在不在岗是在岗位那一格的问题，存不存在是名册的问题。
 fn roster_with_people(
     regs: &[cog_core::AgentRegistration],
     people: Vec<(String, PersonRow)>,
+    hired: Vec<(String, RosterRow)>,
 ) -> Vec<serde_json::Value> {
     let mut views: Vec<serde_json::Value> = regs
         .iter()
@@ -1772,6 +1778,31 @@ fn roster_with_people(
             "device_id": row.device_id,
         }));
     }
+    // 名册上有、另外两份都没有的人：招进来过，这一刻池里没有他。名字用 id 充当
+    // 显示名——雇佣行不存名字，编一个等于假装量过；用途标签来自名册那一行。
+    let printed: std::collections::HashSet<String> = views
+        .iter()
+        .filter_map(|view| view.get("agent_id").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+    for (agent_id, row) in hired {
+        if printed.contains(agent_id.as_str()) {
+            continue;
+        }
+        views.push(serde_json::json!({
+            "agent_id": agent_id,
+            "display_name": agent_id,
+            "role": row.role,
+            "workspace_id": "default",
+            "capabilities": Vec::<String>::new(),
+            "hostname": String::new(),
+            "pod_ip": String::new(),
+            "registered_at": row.hired_at,
+            "last_heartbeat": row.hired_at,
+            "live": false,
+            "hired_by": row.hired_by,
+        }));
+    }
     views
 }
 
@@ -1789,11 +1820,17 @@ pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
                 Some(kv) => read_people(kv).await,
                 None => Vec::new(),
             };
+            // 雇佣名册读不出来时按空处理：这一份缺了，名单漏掉的是「今天招过谁」，
+            // 不是「谁在说话」，不能因此让整条读面变成 503。
+            let hired = match state.key_value.as_ref() {
+                Some(kv) => read_roster(kv).await.rows,
+                None => Vec::new(),
+            };
             let people_count = people
                 .iter()
                 .filter(|(id, _)| !regs.iter().any(|reg| &reg.agent_id == id))
                 .count();
-            let agents = roster_with_people(&regs, people);
+            let agents = roster_with_people(&regs, people, hired);
             let count = agents.len();
             let (workers, squads) = roster_split(&regs);
             (
@@ -2300,7 +2337,7 @@ mod tests {
             );
         let store: Arc<dyn cog_core::KeyValueStore> = store;
 
-        let views = roster_with_people(&[], read_people(&store).await);
+        let views = roster_with_people(&[], read_people(&store).await, Vec::new());
 
         assert_eq!(views.len(), 1);
         assert_eq!(views[0]["agent_id"], "kai-a9ab11fc");
@@ -2363,11 +2400,47 @@ mod tests {
             device_id: None,
         };
 
-        let views = roster_with_people(&[reg], vec![("kai-a9ab11fc".to_string(), row)]);
+        let views = roster_with_people(&[reg], vec![("kai-a9ab11fc".to_string(), row)], Vec::new());
 
         assert_eq!(views.len(), 1);
         assert_eq!(views[0]["live"], true);
         assert_eq!(views[0]["session_id"], "conv-1");
+    }
+
+    /// 招进来的人即使池里这一刻没有他，也还在名单上；池里有时只印一行。
+    ///
+    /// 池是内存的。Pod 重启到维护环把人建回来之间，读面若只读注册表，这位就
+    /// 从名单上消失了——读的人分不出「没这个人」和「这个人这一刻不在池里」，
+    /// 而后者正是重启后的常态。反过来，两处都有时印两行，读的人会以为撞了名。
+    #[tokio::test]
+    async fn a_hired_employee_outlives_the_pool() {
+        let at = chrono::Utc::now();
+        let row = RosterRow {
+            role: "evaluator".into(),
+            hired_by: "owner".into(),
+            hired_at: at,
+        };
+        let hired = vec![("employee:abc123".to_string(), row.clone())];
+
+        let views = roster_with_people(&[], Vec::new(), hired.clone());
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0]["agent_id"], "employee:abc123");
+        assert_eq!(views[0]["role"], "evaluator");
+        assert_eq!(views[0]["live"], false);
+        assert_eq!(views[0]["hired_by"], "owner");
+
+        let reg = cog_core::AgentRegistration::new(
+            "employee:abc123",
+            "cog-agent",
+            "127.0.0.1",
+            "employee:abc123",
+            "default",
+            vec![],
+            cog_core::ResourceInfo::default(),
+        );
+        let views = roster_with_people(&[reg], Vec::new(), hired);
+        assert_eq!(views.len(), 1, "同一个人印两行，读的人会以为撞了名");
+        assert_eq!(views[0]["live"], true);
     }
 
     /// 解析不了的那一行跳过：按位置猜它是谁，会把一个陌生人印成员工。
