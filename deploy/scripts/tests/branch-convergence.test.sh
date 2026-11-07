@@ -20,6 +20,13 @@
 #   8. 远端：有一个头不是祖先、对象在本地 ⇒ 1；
 #   9. 远端：头指向本地没有的对象 ⇒ 3（判不了 ≠ 合格）。
 set -uo pipefail
+# 夹具里的 git 只该动夹具的仓。外层递下来的 `GIT_DIR` / `GIT_WORK_TREE` /
+# `GIT_INDEX_FILE`（提交落地器、提交钩子、快照都这么递）会让 `git -C <夹具>`
+# 仍然写调用方的仓——`-C` 换的是工作树起点，不是仓。2026-11-07 实测：带上绝对
+# `GIT_DIR` 跑这一份，`newrepo` 的 `config user.name t` 与 `config core.hooksPath
+# /dev/null` 写进了调用方的仓（那正是共享 config 被改名、钩子被关掉的来源），
+# 而 16 格判的也不是夹具。文件级清一次，下一格新加的调用同样受保护。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 
 # 下面要 `git init` 好几个夹具仓库。手动在 pre-push 钩子里跑本脚本时，钩子的 git
 # 会把 `GIT_DIR` 指向调用方那棵树，`git init --bare` 就落在那棵树上、把它翻成裸库。

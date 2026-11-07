@@ -23,6 +23,15 @@
 # that cannot be resolved, and the absence of a range, are refusals rather than
 # passes — a gate that reads nothing agrees with everything.
 set -euo pipefail
+# A fixture repository is written through `git -C <dir>` or a subshell `cd`,
+# and neither changes the repository: an absolute `GIT_DIR` / `GIT_WORK_TREE` /
+# `GIT_INDEX_FILE` handed down by the commit lander, a commit hook or a snapshot
+# makes every call below write into the caller's repository instead. Measured
+# 2026-11-07: with an absolute GIT_DIR exported, a fixture's `config user.name`
+# and `config core.hooksPath` landed in the caller's config -- the same shape
+# that renamed everyone's commits `t` and switched the shared hooks off. Clear
+# it once, at file scope, so the next case is covered too.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
