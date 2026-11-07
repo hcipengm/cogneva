@@ -666,6 +666,20 @@ rows:
       Room for one full walk of the store. The walk's peak is not published.
 
   # --- evolution worker -------------------------------------------------------
+  - key: changeVerification.cargoBuildJobs
+    source: override
+    why: >-
+      The width the verification build fans its linkers out at, and the one knob
+      on this pod that presses directly on the memory peak: verification builds
+      the whole workspace's tests, and the evolution pod's working set measured
+      9.81 GiB while the build gate was held and 3.02 GiB while it was free,
+      peaking at 15.6 GiB under a 16 GiB ceiling on 2026-11-07. Three is the
+      width that puts the peak under that ceiling, not a throughput choice; the
+      reading that says whether it was enough is
+      `max_over_time(container_memory_working_set_bytes{pod=~"cogneva-evolution-.*"}[24h])`.
+      It does not reach the mainline deployer's build, which sets
+      CARGO_BUILD_JOBS itself.
+
   - key: evolution.replicas
     source: fixed
     why: >-
@@ -862,6 +876,20 @@ rows:
       sessions share one weight file) plus reranker and activation headroom, for
       three sessions. The measurement exists; it was turned into a number by a
       human, and no loop re-measures it.
+
+  - key: taskRouter.localClaimConcurrency
+    source: override
+    why: >-
+      How many tasks one process runs on the local lane. Held at one because the
+      evolution pod's six-hour working set peaks at 15.96 GiB against its 16 GiB
+      limit (mean 8.27 GiB), so a second task is not queued behind the build
+      there -- it is OOM-killed alongside the first. The namespace quota cannot
+      raise that ceiling either: 78Gi of limits.memory with 59.6Gi in use, plus
+      a roll's replacement overlap on top. The raise is written as a reading
+      rather than a date: go to two once the pod's 24-hour peak is below 12 GiB,
+      and keep it only while change-ledger completions pass 47 a day, the build
+      gate's mean wait stays under five minutes, and no OOMKilled restart
+      appears in the window.
 
   - key: taskRouter.claimConcurrency
     source: override
