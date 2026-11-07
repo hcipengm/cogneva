@@ -284,7 +284,7 @@ fn body_of(code: &str, signature: &str) -> String {
     let mut body = Vec::new();
     let mut depth = 0i32;
     let mut opened = false;
-    for index in start..lines.len() {
+    for (index, line) in lines.iter().enumerate().skip(start) {
         let shape = shapes.get(index).copied().unwrap_or_default();
         depth += shape.delta;
         if shape.opens {
@@ -300,7 +300,7 @@ fn body_of(code: &str, signature: &str) -> String {
         if depth <= 0 {
             break;
         }
-        body.push(lines[index]);
+        body.push(*line);
     }
     body.join("\n")
 }

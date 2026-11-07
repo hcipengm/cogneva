@@ -109,15 +109,11 @@ fn layer_word_in(name: &str) -> Option<&'static str> {
         .split(['-', '_'])
         .filter(|segment| !segment.is_empty())
         .collect();
-    for word in LAYER_WORDS {
-        if segments
+    LAYER_WORDS.into_iter().find(|&word| {
+        segments
             .iter()
             .any(|segment| segment.eq_ignore_ascii_case(word))
-        {
-            return Some(word);
-        }
-    }
-    None
+    })
 }
 
 /// Whether a member's production surface declares anything of its own.

@@ -5184,7 +5184,7 @@ async fn stamp_deliveries(
         if row.delivered_rev.is_some() {
             continue;
         }
-        let Some(rev) = delivered_revision(&row.identity, deliveries, &carried_by_batch) else {
+        let Some(rev) = delivered_revision(&row.identity, deliveries, carried_by_batch) else {
             continue;
         };
         match store.record_delivery(&row.identity, rev).await {
