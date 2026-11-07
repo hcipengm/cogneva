@@ -1165,11 +1165,21 @@ struct QdrantHttp {
 }
 
 impl QdrantHttp {
-    fn new(base: &str) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    /// 出站设置读一次 `http_client` 段：代理、连接池、user-agent、连接超时都在那里，
+    /// 不再从这里自己造一份的设置里来。
+    ///
+    /// 走流式那条而不是 `build_client`：整卷快照的上传与下载是一段可能跑几分钟的传输，
+    /// `timeout_secs` 那条总截止期会在半路上切断一份大集合的快照，而
+    /// `build_streaming_client` 恰好只丢这一个、别的设置都在。
+    fn new(base: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = cog_net::HttpClientConfig::load().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "http_client 段读不到，Qdrant 快照用内置默认");
+            cog_net::HttpClientConfig::default()
+        });
+        Ok(Self {
+            client: cog_net::build_streaming_client(&config)?,
             base: base.trim_end_matches('/').to_string(),
-        }
+        })
     }
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -1971,7 +1981,7 @@ async fn run_backup_into(
     let postgres = backup_postgres(&pool, &staging.join(PACKAGE_PG_DIR)).await?;
     segments.push(segment_stamp("postgres"));
 
-    let qdrant = QdrantHttp::new(&cfg.qdrant_http_url);
+    let qdrant = QdrantHttp::new(&cfg.qdrant_http_url)?;
     let qdrant_dir = staging.join(QDRANT_DIR);
     std::fs::create_dir_all(&qdrant_dir)?;
     let mut collections = Vec::new();
@@ -3192,7 +3202,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if qdrant_dir.exists() {
         let qdrant_http_url = std::env::var(QDRANT_HTTP_URL_ENV)
             .map_err(|_| "package has qdrant snapshots but COGNEVA_QDRANT_HTTP_URL is unset")?;
-        let qdrant = QdrantHttp::new(&qdrant_http_url);
+        let qdrant = QdrantHttp::new(&qdrant_http_url)?;
         for entry in std::fs::read_dir(&qdrant_dir)? {
             let path = entry?.path();
             if let Some(name) = path

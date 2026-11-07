@@ -69,6 +69,8 @@ mod a_node_capacity_probe_is_written_once_test;
 mod a_pg_integration_test_owns_its_schema_test;
 #[path = "a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test.rs"]
 mod a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test;
+#[path = "a_process_has_one_outbound_client_test.rs"]
+mod a_process_has_one_outbound_client_test;
 #[path = "a_process_installs_one_global_subscriber_or_none_test.rs"]
 mod a_process_installs_one_global_subscriber_or_none_test;
 #[path = "a_ready_message_starts_the_row_it_names.rs"]

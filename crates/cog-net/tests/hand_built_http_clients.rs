@@ -45,12 +45,15 @@ const EXEMPT: &[(&str, &str)] = &[(
 
 /// 读数：文件 → 手工构造的客户端个数。口径与文件头一致。
 ///
-/// 这几条为什么还在（每一条都是待办，不是结论）：
-/// - `cogneva/src/backup.rs`：Qdrant 快照的创建与搬运。共享的那份超时是给短请求的
-///   （默认 30s），而快照创建要阻塞到落盘、下载是批量传输，套上它会把大集合的备份
-///   切死。要有来源地给它一条**按请求**的超时，才谈得上接进工厂。
-/// - 其余各条多为按用途各带一套设置（流式响应、探测的短超时）；它们是不是该并回
-///   同一份，需要逐条判，未经判定的不计入「已知可并」。
+/// 这几条为什么还在（每一条都是待办，不是结论）：各条多为按用途各带一套设置（流式
+/// 响应、探测的短超时）；它们是不是该并回同一份，需要逐条判，未经判定的不计入
+/// 「已知可并」。
+///
+/// 已经离开这张表的那一条：`cogneva/src/backup.rs` 的 Qdrant 快照客户端。它过去是
+/// `Client::new()`——连一个超时都没有；现在从 `cog_net::build_streaming_client` 出，
+/// 快照那一趟要阻塞到落盘、下载是批量传输，所以丢的是总截止期，连接超时、连接池、
+/// 代理、user-agent 都跟着工厂走。读数因此少了一个：这是变小，不是漏扫。（本文件末尾那条
+/// 「遍历扫到了已知有位点的文件」的判据跟着换成 `llm_admin.rs`。）
 const COUNTED: &[(&str, usize)] = &[
     ("crates/bootstrap/src/apt.rs", 1),
     ("crates/bootstrap/src/download.rs", 1),
@@ -62,7 +65,6 @@ const COUNTED: &[(&str, usize)] = &[
     ("crates/cog-gateway/src/llm_admin.rs", 5),
     ("crates/cog-gateway/src/security_gateway.rs", 3),
     ("crates/cog-observability/src/probes.rs", 1),
-    ("crates/cogneva/src/backup.rs", 1),
 ];
 
 /// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
@@ -105,7 +107,7 @@ fn hand_built_http_clients_do_not_grow() {
     // 一定找得到文件，且表里那个已知有位的文件必须在其中。少一条，下面那次比较
     // 就可能在「什么都没扫到」上变绿。
     assert!(
-        got.contains_key("crates/cogneva/src/backup.rs"),
+        got.contains_key("crates/cog-gateway/src/llm_admin.rs"),
         "遍历没扫到已知有位点的文件，这条门的读数不可信：{got:?}"
     );
 
