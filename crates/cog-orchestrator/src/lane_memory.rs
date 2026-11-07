@@ -49,6 +49,9 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 /// 内核告诉进程「你在哪一格」的那份文件。
 pub const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 
+/// v1 布局里内存控制器的目录名：v1 按控制器分目录，内存那一格的文件在它下面。
+pub const V1_MEMORY_CONTROLLER: &str = "memory";
+
 /// 一次读数的位置：先按 v2 的布局找，找不到再按 v1 的目录名找。
 ///
 /// 参数是**一格 cgroup 的目录**，不是挂载点本身：v2 的一格里，`memory.max` 与
@@ -61,8 +64,8 @@ pub fn memory_files(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     vec![
         (dir.join(MEMORY_MAX_FILE), dir.join(MEMORY_CURRENT_FILE)),
         (
-            dir.join("memory").join("memory.limit_in_bytes"),
-            dir.join("memory").join("memory.usage_in_bytes"),
+            dir.join(V1_MEMORY_CONTROLLER).join("memory.limit_in_bytes"),
+            dir.join(V1_MEMORY_CONTROLLER).join("memory.usage_in_bytes"),
         ),
     ]
 }
@@ -591,14 +594,18 @@ mod tests {
     #[test]
     fn the_v1_layout_is_read_when_v2_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("memory")).expect("v1 dir");
+        std::fs::create_dir_all(dir.path().join(V1_MEMORY_CONTROLLER)).expect("v1 dir");
         std::fs::write(
-            dir.path().join("memory/memory.limit_in_bytes"),
+            dir.path()
+                .join(V1_MEMORY_CONTROLLER)
+                .join("memory.limit_in_bytes"),
             "8589934592\n",
         )
         .expect("limit");
         std::fs::write(
-            dir.path().join("memory/memory.usage_in_bytes"),
+            dir.path()
+                .join(V1_MEMORY_CONTROLLER)
+                .join("memory.usage_in_bytes"),
             "1073741824\n",
         )
         .expect("usage");

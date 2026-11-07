@@ -504,7 +504,7 @@ pub const ITEMS_METRIC: &str = "cogneva_outward_items_total";
 pub const CONFIG_METRIC: &str = "cogneva_outward_config";
 pub const SOURCES_METRIC: &str = "cogneva_outward_sources_configured";
 
-const LABEL_SOURCE: &str = "source";
+pub(crate) const LABEL_SOURCE: &str = "source";
 
 fn bump(map: &mut BTreeMap<String, BTreeMap<String, u64>>, source: &str, cell: &str, by: u64) {
     *map.entry(source.to_string())
