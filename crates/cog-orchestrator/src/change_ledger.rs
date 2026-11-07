@@ -5452,14 +5452,13 @@ async fn dispatch_pass(
     // many rows each project could still put in a batch -- both read off the
     // snapshot the pass already took, so neither costs a lookup.
     //
-    // How many may be taken back is the pass's own hand-over bound divided by
-    // the rows a batch holds: a pass that may start forty tasks has no use for
-    // more than forty tasks' worth of released rows, and every release is a
-    // write. The bound follows the pool, so a paused or shrunk pass takes back
-    // less rather than filling the queue at a rate nothing is draining.
+    // How many rows may be taken back is the pass's own hand-over bound: a row
+    // released is a row this pass may carry, and one it may not carry is a
+    // write that buys nothing until a later pass. The bound follows the pool, so
+    // a paused pass takes back nothing and a shrunk one takes back less. Zero
+    // budget means zero folds -- there is no batch waiting for a released row.
     let foldable = foldable_handovers(&graph_tasks);
     let rows_free = rows_a_batch_could_take(&pending, &handovers, &foldable);
-    let fold_budget = (handover_budget / rows_per_batch.max(1)).max(1);
     let mut folded = 0usize;
     for row in &pending {
         // What the change's handovers left behind, read before anything is
@@ -5498,7 +5497,7 @@ async fn dispatch_pass(
         let held = match held {
             Some(Handover::InFlight)
                 if !pausing
-                    && folded < fold_budget
+                    && folded < handover_budget
                     && foldable.contains_key(&row.identity)
                     && rows_free
                         .get(&dispatch_project_key(row))
