@@ -877,20 +877,6 @@ rows:
       three sessions. The measurement exists; it was turned into a number by a
       human, and no loop re-measures it.
 
-  - key: taskRouter.localClaimConcurrency
-    source: override
-    why: >-
-      How many tasks one process runs on the local lane. Held at one because the
-      evolution pod's six-hour working set peaks at 15.96 GiB against its 16 GiB
-      limit (mean 8.27 GiB), so a second task is not queued behind the build
-      there -- it is OOM-killed alongside the first. The namespace quota cannot
-      raise that ceiling either: 78Gi of limits.memory with 59.6Gi in use, plus
-      a roll's replacement overlap on top. The raise is written as a reading
-      rather than a date: go to two once the pod's 24-hour peak is below 12 GiB,
-      and keep it only while change-ledger completions pass 47 a day, the build
-      gate's mean wait stays under five minutes, and no OOMKilled restart
-      appears in the window.
-
   - key: taskRouter.claimConcurrency
     source: override
     why: >-
@@ -910,6 +896,34 @@ rows:
       never the token window. The companion bound is `agent_pool.worker_count`
       in `cogneva.json`: nothing here is claimed until that pool has a turn, so
       the two numbers have to move together.
+
+  - key: taskRouter.localClaimConcurrency
+    source: derived
+    why: >-
+      How many change tasks the process-local lane runs at once -- the lane every
+      change-generation task travels, so this number is the platform's change
+      throughput. The chart ships 0, which asks for the bound to be derived:
+      every window `crates/cog-orchestrator/src/lane_memory.rs` reads the
+      container's `memory.max` and this process's `memory.current`, keeps the
+      idle baseline and the peak seen while a task was in flight, and divides the
+      headroom by that per-task price; the bound falls at once and climbs one
+      step per window. A positive number is the override seat and pins it. The
+      two inputs are the reason it cannot be a constant: the 2026-11-07 reading
+      that pinned it at 1 (peak 15.96 GiB of a 16 GiB ceiling, mean 8.27 GiB) is
+      a fact about the container as it was sized that day, and a number typed
+      into the chart cannot see the container grow. What the loop cannot do is
+      raise the ceiling itself: the namespace quota measured the same day holds
+      78Gi of limits.memory with 59.6Gi in use plus a roll's replacement overlap,
+      so the derived bound stays at one until somebody raises the container and
+      the loop reads the new `memory.max`.
+    published:
+      owner: crates/cog-orchestrator/src/lane_memory.rs
+      file: crates/cog-orchestrator/src/observable.rs
+      metric: TASK_ROUTER_CLAIM_SLOTS_METRIC
+      label: source
+    proof:
+      file: crates/cog-orchestrator/src/lane_memory.rs
+      test: the_bound_follows_the_container_limit
 
   - key: changeLedger.rowsPerHandover
     source: override

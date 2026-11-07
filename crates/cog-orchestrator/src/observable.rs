@@ -334,6 +334,18 @@ impl Observable for StreamPendingObservable {
 /// allowance of concurrent work. The series is per stream because the loops are,
 /// but it is the same number on each of them.
 pub const TASK_ROUTER_CLAIM_SLOTS_METRIC: &str = "cogneva_task_router_claim_slots";
+
+/// `cogneva_task_router_claim_slots` 上那个 `source` 标签的两个取值。
+///
+/// 同一个数有两种来路：一条读数每窗算出来的界，和部署钉死的一个数。没有这个
+/// 标签时两者在抓取面上完全同形——而「界不再跟着内存走了」这件事，正是它被钉死
+/// 之后唯一看得见的样子。注册表的 `derived` 行要求发布方自己说出这一格（见
+/// `deploy/helm/cogneva/tunables.yaml` 与 `tunable_registry_contract_test.rs`）。
+pub const CLAIM_SLOTS_SOURCE_LABEL: &str = "source";
+/// 界由读数导出（`lane_memory` 每窗重算）。
+pub const SOURCE_DERIVED: &str = "derived";
+/// 界由部署钉死（环境变量给了正数）。
+pub const SOURCE_OVERRIDE: &str = "override";
 /// Permits held right now, as a gauge — task work this process is running and
 /// has not finished. Read from the semaphore itself, so a permit taken by the
 /// reclaim sweeper is counted exactly as one taken by the read loop.
@@ -405,6 +417,9 @@ impl Drop for ClaimHold {
 struct ClaimStreamState {
     semaphore: Arc<tokio::sync::Semaphore>,
     slots: usize,
+    /// 这个界是从读数导出的，还是部署钉死的；见 [`SOURCE_DERIVED`] /
+    /// [`SOURCE_OVERRIDE`]。两个数在读数上是同一个数，只有这个标签把它们分开。
+    source: &'static str,
     waiting_since: Option<std::time::Instant>,
     held: HashMap<u64, u64>,
 }
@@ -482,15 +497,30 @@ impl ClaimSlotsObservable {
         stream: &str,
         semaphore: Arc<tokio::sync::Semaphore>,
         slots: usize,
+        source: &'static str,
     ) {
         self.streams()
             .entry(stream.to_string())
             .or_insert_with(|| ClaimStreamState {
                 semaphore,
                 slots,
+                source,
                 waiting_since: None,
                 held: HashMap::new(),
             });
+    }
+
+    /// The budget moved at runtime.
+    ///
+    /// A bound that is derived is a measurement, so it moves without a restart.
+    /// The reading surface has to move with it, or `claim_slots` would keep
+    /// reporting the number the process started with while the semaphore admits
+    /// another -- the same split between "configured" and "in effect" that a
+    /// hardcoded number hides.
+    pub fn set_slots(&self, stream: &str, slots: usize) {
+        if let Some(state) = self.streams().get_mut(stream) {
+            state.slots = slots;
+        }
     }
 
     /// The read loop has asked for a permit and cannot have one yet.
@@ -552,8 +582,15 @@ impl Observable for ClaimSlotsObservable {
         for (stream, state) in streams.iter() {
             // Only the streams that registered exist here, so a stream this
             // process does not read publishes nothing rather than a zero.
+            // 只有 `slots` 带 `source`：另外三个是行为读数（在跑几条、等了多久），
+            // 它们不随界怎么来而变化；把同一个标签摊到四个序列上，只会让「界是不是
+            // 导出的」这件事在三条无关的读数上重复三遍。
+            out.push(
+                RawMetric::new(TASK_ROUTER_CLAIM_SLOTS_METRIC, state.slots as f64)
+                    .with_label(crate::LABEL_STREAM, stream.as_str())
+                    .with_label(CLAIM_SLOTS_SOURCE_LABEL, state.source),
+            );
             for (name, value) in [
-                (TASK_ROUTER_CLAIM_SLOTS_METRIC, state.slots as f64),
                 (TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC, state.in_flight() as f64),
                 (
                     TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC,
@@ -1347,7 +1384,7 @@ mod tests {
     async fn claim_gauges_are_published_per_registered_stream() {
         let observer = Arc::new(ClaimSlotsObservable::new());
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
-        observer.register(STREAM, semaphore.clone(), 4);
+        observer.register(STREAM, semaphore.clone(), 4, SOURCE_DERIVED);
 
         let metrics = observer.collect_metrics("D8").await.unwrap();
         for name in [
@@ -1367,6 +1404,17 @@ mod tests {
                 .unwrap()
                 .value,
             4.0
+        );
+        // 界是导出的还是钉死的，必须由读数自己说出来：注册表里那条 `derived`
+        // 行指的正是这个标签（`tunable_registry_contract_test.rs` 会来查）。
+        assert_eq!(
+            metric(&metrics, TASK_ROUTER_CLAIM_SLOTS_METRIC)
+                .unwrap()
+                .labels
+                .get(CLAIM_SLOTS_SOURCE_LABEL)
+                .map(String::as_str),
+            Some(SOURCE_DERIVED),
+            "claim_slots 没带 source 标签，读者分不出这个界是量出来的还是配的"
         );
         assert_eq!(
             metric(&metrics, TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC)
@@ -1434,7 +1482,7 @@ mod tests {
     async fn an_exhausted_budget_and_a_waiting_loop_are_readable() {
         let observer = Arc::new(ClaimSlotsObservable::new());
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        observer.register(STREAM, semaphore.clone(), 1);
+        observer.register(STREAM, semaphore.clone(), 1, SOURCE_OVERRIDE);
 
         // The one permit is running a task; the next message arrives and the
         // loop blocks on the semaphore.
@@ -1504,9 +1552,14 @@ mod tests {
         let observer = Arc::new(ClaimSlotsObservable::new());
         let budget = Arc::new(tokio::sync::Semaphore::new(1));
         let elsewhere = Arc::new(tokio::sync::Semaphore::new(1));
-        observer.register(STREAM, budget.clone(), 1);
-        observer.register("waiting-on-the-same-budget", budget.clone(), 1);
-        observer.register("another-budget", elsewhere.clone(), 1);
+        observer.register(STREAM, budget.clone(), 1, SOURCE_OVERRIDE);
+        observer.register(
+            "waiting-on-the-same-budget",
+            budget.clone(),
+            1,
+            SOURCE_OVERRIDE,
+        );
+        observer.register("another-budget", elsewhere.clone(), 1, SOURCE_OVERRIDE);
 
         let permit = budget.clone().acquire_owned().await.unwrap();
         let running = observer.permit_taken(STREAM);

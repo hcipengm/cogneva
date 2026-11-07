@@ -104,11 +104,16 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_NAMESPACE: "cogneva"
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: "120"
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: "3600"
+  # 不能导出：导出要的是「每多一个并行 rustc 多吃多少内存」，这个读数现在不存在——
+  # 手上只有整条验证任务的峰值（15.6 GiB / 上限 16 GiB，实测 2026-11-07），它是
+  # 宽度的乘积而不是分母。量的办法是在一次验证里按宽度采样，那是下一笔。
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: "6"
   # 变更验证那一趟的编译宽度（实测 2026-11-07：构建期内存平均 9.81 GiB、峰值 15.6 GiB，
   # 容器上限 16 GiB）。压窄它换的是峰值下降（均为实测 2026-11-07），代价只是验证
   # 慢一点，闸门有 32% 余量。
   # 不进主线部署器的构建——那条路自己显式设 CARGO_BUILD_JOBS。
+  # 不能导出：同上——分母是「每多一个并行 rustc 多吃多少内存」，现在量不出来；
+  # 3 是手算的（峰值 15.6 GiB 对上限 16 GiB，实测 2026-11-07），不是导出的。
   CARGO_BUILD_JOBS: "3"
   # 集群内 registry 那张卷的容量回收。声明量只有一个来源（PVC 自己的 spec），所以
   # 这里不配"卷有多大"；这里配的是判据与保留策略，占用读数取自 registry Pod 里只读

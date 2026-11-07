@@ -118,6 +118,9 @@ pub const LOCAL_CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_LOCAL_CLAIM_CONCURRENCY";
 /// there before a second permit goes in. The knob exists so that whoever does
 /// that can widen the lane without a rebuild -- not so that raising it alone
 /// can be mistaken for raising output.
+///
+/// 它现在是两件事的共同起点：导出模式的起始值与下限（还没量到一条任务的价格
+/// 时用它），以及这个导出的界在任何一次读失败之后退回的那一格。
 // cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活
 pub const DEFAULT_LOCAL_CLAIM_CONCURRENCY: usize = 1;
 
@@ -126,6 +129,10 @@ pub const DEFAULT_LOCAL_CLAIM_CONCURRENCY: usize = 1;
 /// `0` 被拒而不是被当成「不限」：两者在配置里是同一个字符，而误读成停摆
 /// （或误读成不限）都会把额度花光的形状藏起来。拒绝时用默认值，并把这一行
 /// 报告出去——悄悄换成默认值等于运维以为自己改的那个数生效了。
+///
+/// 本地车道那一格不到这里：它在调用之前就把 `0` 读成「按读数导出」
+/// （见 [`local_claim_concurrency`]），所以同一条命令行在两条车道上含义不同，
+/// 而这是有意的——那条车道的界真的可以量出来。
 pub fn parse_claim_concurrency(raw: &str) -> Result<usize, String> {
     match raw.trim().parse::<usize>() {
         Ok(0) => Err(
@@ -159,23 +166,30 @@ pub fn claim_concurrency() -> usize {
     }
 }
 
-/// 本进程本地车道的在途执行上限，从环境读。
+/// 本进程本地车道的在途执行上限，从环境读；`None` = 由读数导出。
 ///
-/// 与 [`claim_concurrency()`] 同一套读法（不配取默认、`0` 被拒并报告一行），
-/// 只有变量和默认值不同：两条车道的许可各自独立，读法不该也长出两套。
-pub fn local_claim_concurrency() -> usize {
+/// 与 [`claim_concurrency()`] 差一处，而这一处是故意的：不配**不是**取默认值，
+/// 是取导出。这条车道的界取决于容器那一刻能拿多少内存和一条任务实际吃多少
+/// （见 [`crate::lane_memory`]），两者都不在配置里，所以「没配」读成「去量」，
+/// 而不是「按写下这一行的人那天看到的数跑」。
+///
+/// `0` 在这里不是被拒的输入，与平台其余几个界同一个口径
+/// （`COGNEVA_BUILD_GATE_MAX_CONCURRENT: "0"`、目标容量 `"auto"`）：0 = 按读数导出，
+/// 正数 = 钉死它的覆盖位。
+pub fn local_claim_concurrency() -> Option<usize> {
     match std::env::var(LOCAL_CLAIM_CONCURRENCY_ENV) {
-        Err(_) => DEFAULT_LOCAL_CLAIM_CONCURRENCY,
+        Err(_) => None,
+        Ok(raw) if raw.trim() == "0" || raw.trim().is_empty() => None,
         Ok(raw) => match parse_claim_concurrency(&raw) {
-            Ok(n) => n,
+            Ok(n) => Some(n),
             Err(problem) => {
                 tracing::warn!(
                     variable = LOCAL_CLAIM_CONCURRENCY_ENV,
                     problem = %problem,
-                    using = DEFAULT_LOCAL_CLAIM_CONCURRENCY,
+                    using = "the derived bound",
                     "local task claim concurrency entry ignored"
                 );
-                DEFAULT_LOCAL_CLAIM_CONCURRENCY
+                None
             }
         },
     }
@@ -190,6 +204,9 @@ pub fn local_claim_concurrency() -> usize {
 struct ClaimBudget {
     slots: Arc<tokio::sync::Semaphore>,
     limit: usize,
+    /// 这个界是量出来的还是钉死的，随预算一起走：读数面要照着它打
+    /// `source` 标签（见 [`crate::observable::CLAIM_SLOTS_SOURCE_LABEL`]）。
+    source: &'static str,
 }
 
 /// Dispatcher that routes ready tasks to the first [`TaskExecutor`] whose
@@ -269,6 +286,9 @@ impl TaskExecutorRouter {
         let claim = ClaimBudget {
             slots: claim_slots,
             limit: claim_concurrency,
+            // 普通活那一格是部署钉的：它的界在 token 预算维度上，进程里没有
+            // 那个读数可导（见 `deploy/helm/cogneva/tunables.yaml` 的同名行）。
+            source: crate::observable::SOURCE_OVERRIDE,
         };
         // 停线那条通道的许可不来自上面那一份：它的整条理由就是「别的活占满
         // 所有许可时它仍然要跑」。共用一份时，优先级最高的那条变更也只是排在
@@ -278,6 +298,7 @@ impl TaskExecutorRouter {
         let preempting = ClaimBudget {
             slots: Arc::new(tokio::sync::Semaphore::new(STOP_THE_LINE_CLAIM_CONCURRENCY)),
             limit: STOP_THE_LINE_CLAIM_CONCURRENCY,
+            source: crate::observable::SOURCE_OVERRIDE,
         };
         // 进程本地那条通道同理，而且这一条是被实测逼出来的：它和普通通道共用一份
         // 许可时，普通活只要占满那一份，这条通道的读循环就停在 `acquire_owned` 上，
@@ -288,15 +309,38 @@ impl TaskExecutorRouter {
         // 等许可，写的一侧等读。代号里的优先级（停线 > 自演化 > 普通活）此前只写在
         // 发布序上，认领这一侧没有它，所以那条优先序在满负荷时是一句话。
         //
-        // 它自己的一份是这条例外的代价上界。这个数是配置项而不是常量：它是整
-        // 个平台的变更吞吐（每一条变更生成任务都只走这条道），而抬它的另一半
-        // 代价在 pod 的内存上限上，那一半只能由部署来配。
-        let local_claim_concurrency = local_claim_concurrency();
+        // 它自己的一份是这条例外的代价上界。这个数是整个平台的变更吞吐（每一条
+        // 变更生成任务都只走这条道），而它的另一半代价在 pod 的内存上限上。
+        //
+        // 所以这个数不写死：配了就是那个数（覆盖位），没配或配成 0 则由容器内存与
+        // 本进程的实测足迹导出，并每窗重算一次——界是量出来的，写死只能反映写下
+        // 它那天的容器。上限那一半仍然只能由部署来给（namespace 配额），导出只
+        // 负责把已有的上限用满。
+        let local_bound = local_claim_concurrency();
+        let local_slots = Arc::new(tokio::sync::Semaphore::new(
+            local_bound.unwrap_or(DEFAULT_LOCAL_CLAIM_CONCURRENCY),
+        ));
         let local = crate::ready_queue::process_local_ready_stream(workspace_id);
         let own = ClaimBudget {
-            slots: Arc::new(tokio::sync::Semaphore::new(local_claim_concurrency)),
-            limit: local_claim_concurrency,
+            slots: local_slots.clone(),
+            limit: local_bound.unwrap_or(DEFAULT_LOCAL_CLAIM_CONCURRENCY),
+            source: if local_bound.is_none() {
+                crate::observable::SOURCE_DERIVED
+            } else {
+                crate::observable::SOURCE_OVERRIDE
+            },
         };
+        // 只有真读这条车道的部署才起导出循环：控制面那份 Pod 不读 `:local`，
+        // 在那里每 30 秒量一次内存再改一个没人用的信号量，只是一条空转的循环。
+        if local_bound.is_none() && owns_executor_role {
+            crate::lane_memory::spawn_lane_memory_bound(
+                local.clone(),
+                local_slots,
+                DEFAULT_LOCAL_CLAIM_CONCURRENCY,
+                shutdown.clone(),
+                std::path::PathBuf::from(crate::lane_memory::CGROUP_ROOT),
+            );
+        }
 
         let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
             .into_iter()
@@ -340,6 +384,7 @@ impl TaskExecutorRouter {
         // 没人看得见的原因。
         let claim_slots = claim.slots;
         let claim_concurrency = claim.limit;
+        let claim_source = claim.source;
         // Use a stable group name per workspace so that pod restacks do not
         // leak an unbounded number of consumer groups and so messages are not
         // lost when a new pod takes over. The group name intentionally omits
@@ -371,6 +416,7 @@ impl TaskExecutorRouter {
             &ready_stream,
             claim_slots.clone(),
             claim_concurrency,
+            claim_source,
         );
 
         // 观测面单独成任务，不搭清扫器的节拍：清扫卡在认领上时指标序列会跟着
@@ -1915,6 +1961,7 @@ mod ready_permit_fast_lane_tests {
             let claim = ClaimBudget {
                 slots: Arc::new(tokio::sync::Semaphore::new(0)),
                 limit: 0,
+                source: crate::observable::SOURCE_OVERRIDE,
             };
             router
                 .run_one_ready_stream(
@@ -2416,7 +2463,7 @@ mod claim_concurrency_tests {
         std::env::set_var(CLAIM_CONCURRENCY_ENV, "7");
         assert_eq!(
             local_claim_concurrency(),
-            3,
+            Some(3),
             "the local lane reads its own variable, not the ordinary one"
         );
         assert_eq!(
@@ -2428,22 +2475,25 @@ mod claim_concurrency_tests {
         std::env::remove_var(LOCAL_CLAIM_CONCURRENCY_ENV);
         assert_eq!(
             local_claim_concurrency(),
-            DEFAULT_LOCAL_CLAIM_CONCURRENCY,
-            "unset is the default, so a deployment that never heard of this knob keeps today's change throughput"
+            None,
+            "unset means derive it from the readings, not freeze the number seen on the day it was written"
         );
 
         std::env::remove_var(CLAIM_CONCURRENCY_ENV);
     }
 
-    /// `0` 在本地车道上也被拒：它把「同时跑几条变更」写成「一条也不跑」，而那
-    /// 正是这条车道上 1,904 条欠账最不该遇到的一种「配置生效了」。
+    /// `0` 不是「一条也不跑」，与平台其余几个界同一个口径：0 = 按读数导出。
+    ///
+    /// 这条判据改自 2026-11-07：那一天之前 0 被当成非法值退回默认，理由是
+    /// 「它会把吞吐写成零」。现在 0 有第三个含义，而它仍然是「不停摆」——
+    /// 导出量不出价格时给的是 1（见 `lane_memory::derive_ceiling`），不是 0。
     #[test]
-    fn a_zero_local_budget_falls_back_to_the_default_rather_than_stopping() {
+    fn a_zero_local_budget_asks_for_the_derived_bound_rather_than_stopping() {
         std::env::set_var(LOCAL_CLAIM_CONCURRENCY_ENV, "0");
         assert_eq!(
             local_claim_concurrency(),
-            DEFAULT_LOCAL_CLAIM_CONCURRENCY,
-            "a refused entry must not become a stop"
+            None,
+            "0 asks for the derived bound; a stop would be the one reading it must never have"
         );
         std::env::remove_var(LOCAL_CLAIM_CONCURRENCY_ENV);
     }

@@ -1644,12 +1644,18 @@ taskRouter:
   # 本机 2026-11-07 实测：`limits.memory` 78Gi、已用 59.6Gi，再留一份滚动替换重叠
   # 之后就没有余量了。
   #
-  # **抬这一格的触发条件与判据**：先把这个 Pod 的峰值压到 12 GiB 以下（实测口径见上）
-  # 并连续保持一天，读 `max_over_time(container_memory_working_set_bytes{pod=~"cogneva-evolution-.*"}[24h])`；
-  # 那时再抬到 2，判据是 change-ledger completed 从 31 条/天升到 47 条/天以上、
-  # 构建闸门平均等待仍 < 5 分钟、且期间 `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}`
+  # 抬不抬由读数定，不再由人定（判据仍可照读）：`max_over_time(container_memory_working_set_bytes{pod=~"cogneva-evolution-.*"}[24h])`
+  # 实测 2026-11-07 压到 12 GiB 以下并保持一天，看的是 change-ledger completed 能否从 31 条/天上去、
+  # 构建闸门平均等待是否仍 < 5 分钟、`kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}`
   # 增量为 0。峰值没下来之前抬，读到的是 OOM，不是产能。
-  localClaimConcurrency: 1
+  #
+  # **0 = 按读数导出**（与 `buildGate.maxConcurrent: 0` 同一个口径；实现在
+  # `crates/cog-orchestrator/src/lane_memory.rs`）：每 30 秒读一次容器 `memory.max`
+  # 与本进程 `memory.current`，用空闲基线与一条任务的价格算出这一窗装得下几条，
+  # 下降立即、上升每窗一格。上面那条判据因此不再需要有人手动抬——峰值下来之后，
+  # 导出值自己会往上走；容器被抬到更大的上限时也一样。正数才是覆盖位：
+  # 钉死它时，读数面上的 `claim_slots` 就是这里写的那个数。
+  localClaimConcurrency: 0
 
 changeLedger:
   # 变更账一拍里，一道任务承载几条欠账。
