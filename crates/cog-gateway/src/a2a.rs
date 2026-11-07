@@ -2535,4 +2535,151 @@ mod tests {
             .expect_err("an id that reads back as nothing is the never-existing case again");
         assert!(refused.contains("read back"), "{refused}");
     }
+
+    /// principle: feedback_adapter_reshapes_spelling_not_meaning
+    ///
+    /// 协议适配层只许改字段的拼写与去留，不许改对话的含义。
+    ///
+    /// 两版线上形状差得不小，而这些差别**都允许**：0.3 带 `kind` 判别、状态是小写
+    /// 短横线、文件嵌在 `file` 对象里、role 是小写的两个词；1.0 没有判别字段、状态
+    /// 是 `TASK_STATE_*`、文件字段摊平（`raw`/`filename`/`mediaType`）、role 是
+    /// proto 枚举名。适配层改的就是这些，改对了谁也读不出问题。
+    ///
+    /// 不许改的是这一行任务在说的事。所以判据是「同一个 `A2aTask` 走两版渲染、再
+    /// 各自读回来，两次读数描述同一场对话」：id、上下文、状态、状态说明、每件产物
+    /// 的身份与内容、part 的顺序、文本字节、文件名/类型/字节、以及历史里是谁说的
+    /// （1.0 的 `ROLE_USER` 读回来必须是内部的 `user`，线名不许漏进模型）。红的是
+    /// 「两份渲染不再说同一场对话」：某一版渲染时改写了文本、丢了一件产物、把
+    /// part 换了序，或者 `from_wire` 把某一版的字段读没了。
+    ///
+    /// 另一半也判：拼法该换的地方必须换了。两版渲染出**一模一样**的 JSON，上面几条
+    /// 会照样通过——一个根本没在适配的适配层不该靠「两边都不改」来过关。
+    #[test]
+    fn two_renderings_of_one_task_read_back_as_the_same_conversation() {
+        /// 两行任务里属于「对话」的那部分，逐项相同。
+        fn assert_same_conversation(left: &A2aTask, right: &A2aTask, side: &str) {
+            assert_eq!(left.id, right.id, "{side}: the task's id");
+            assert_eq!(left.context_id, right.context_id, "{side}: the context");
+            assert_eq!(left.status, right.status, "{side}: the state");
+            assert_eq!(
+                left.status_message, right.status_message,
+                "{side}: the status message"
+            );
+            assert_eq!(
+                left.artifacts.len(),
+                right.artifacts.len(),
+                "{side}: how many artifacts the task carries"
+            );
+            for (a, b) in left.artifacts.iter().zip(&right.artifacts) {
+                assert_eq!(a.artifact_id, b.artifact_id, "{side}: an artifact's id");
+                assert_eq!(a.name, b.name, "{side}: an artifact's name");
+                assert_eq!(
+                    a.description, b.description,
+                    "{side}: an artifact's description"
+                );
+                assert_eq!(
+                    a.parts, b.parts,
+                    "{side}: an artifact's parts, in their order and their content"
+                );
+            }
+            assert_eq!(
+                left.history.len(),
+                right.history.len(),
+                "{side}: how many messages the history holds"
+            );
+            for (a, b) in left.history.iter().zip(&right.history) {
+                assert_eq!(a.message_id, b.message_id, "{side}: a message's id");
+                assert_eq!(
+                    a.role, b.role,
+                    "{side}: who spoke, in the one internal spelling"
+                );
+                assert_eq!(a.parts, b.parts, "{side}: a message's parts");
+            }
+        }
+
+        let original = A2aTask {
+            id: "g-1".into(),
+            context_id: "ctx-1".into(),
+            status: A2aTaskStatus::Completed,
+            status_message: Some("took three steps".into()),
+            updated_at: chrono::Utc::now(),
+            artifacts: vec![
+                TaskArtifact {
+                    artifact_id: "a-1".into(),
+                    name: Some("summary".into()),
+                    description: Some("what the run produced".into()),
+                    parts: vec![MessagePart::Text {
+                        text: "the answer is 42".into(),
+                    }],
+                },
+                TaskArtifact {
+                    artifact_id: "a-2".into(),
+                    name: Some("bundle".into()),
+                    description: None,
+                    parts: vec![
+                        MessagePart::Text {
+                            text: "see attached".into(),
+                        },
+                        MessagePart::File {
+                            name: "report.bin".into(),
+                            mime_type: "application/octet-stream".into(),
+                            bytes: "AAECAw==".into(),
+                        },
+                    ],
+                },
+            ],
+            history: vec![TaskMessage {
+                message_id: "m-1".into(),
+                role: "user".into(),
+                parts: vec![MessagePart::Text {
+                    text: "请把这次迁移分成三步".into(),
+                }],
+            }],
+        };
+
+        let v03 = original.to_wire(A2aVersion::V03);
+        let v10 = original.to_wire(A2aVersion::V10);
+        let read_v03 = A2aTask::from_wire(&v03).expect("the 0.3 rendering reads back");
+        let read_v10 = A2aTask::from_wire(&v10).expect("the 1.0 rendering reads back");
+
+        // 两份读数说的是同一场对话，而且说的就是那一个任务。
+        assert_same_conversation(&read_v03, &read_v10, "0.3 against 1.0");
+        assert_same_conversation(&read_v03, &original, "0.3 read back");
+        assert_same_conversation(&read_v10, &original, "1.0 read back");
+        assert_eq!(
+            read_v10.history[0].role, "user",
+            "`ROLE_USER` is a wire spelling: the model holds `user`"
+        );
+        assert_eq!(
+            read_v03.history[0].role, "user",
+            "both versions read back to the same role"
+        );
+
+        // 拼法该换的地方换了：不然一个两版渲染同一个形状的适配层会靠「都不改」过关。
+        assert_eq!(v03["kind"], json!("task"), "{v03}");
+        assert!(
+            v10.get("kind").is_none(),
+            "1.0 is judged by the member name, not a `kind` field: {v10}"
+        );
+        assert_eq!(v03["status"]["state"], json!("completed"));
+        assert_eq!(v10["status"]["state"], json!("TASK_STATE_COMPLETED"));
+        assert_eq!(v03["history"][0]["role"], json!("user"));
+        assert_eq!(v10["history"][0]["role"], json!("ROLE_USER"));
+        // 同一份字节、同一个文件名，两种拼法：嵌在 `file` 里，与摊平在 part 上。
+        assert_eq!(
+            v03["artifacts"][1]["parts"][1]["file"]["fileWithBytes"],
+            json!("AAECAw==")
+        );
+        assert_eq!(v03["artifacts"][1]["parts"][1]["kind"], json!("file"));
+        assert_eq!(v10["artifacts"][1]["parts"][1]["raw"], json!("AAECAw=="));
+        assert_eq!(
+            v10["artifacts"][1]["parts"][1]["filename"],
+            json!("report.bin")
+        );
+        assert!(
+            v10["artifacts"][1]["parts"][1].get("kind").is_none(),
+            "1.0's parts are flattened, with no discriminator: {}",
+            v10["artifacts"][1]["parts"][1]
+        );
+    }
 }
