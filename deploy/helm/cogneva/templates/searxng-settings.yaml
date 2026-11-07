@@ -15,36 +15,47 @@ metadata:
     app.kubernetes.io/component: search
 data:
   settings.yml: |
-    # 只留这台主机真的连得上的引擎。镜像默认开着的那一群（brave、duckduckgo、
-    # google cse、startpage、wikidata、wikipedia）在境内一律不可达：它们各自超时，
-    # 于是每次查询都等满超时、拿回零条结果，而 HTTP 仍是 200——调用方看到的像
-    # 「网上没有这条」，实际是一个都没问出去。
+    # 引擎表是按实测选的，不是按镜像默认值。三条读数（2026-11-07 在本部署的
+    # 出口上量）：
     #
-    # 只留 bing。它是唯一一条在这台主机上稳定出货的读数：每次 9~10 条、约 1 秒。
+    # 1. bing 对多词查询只答第一个词。整句查询确实送到了——返回页的标题和搜索
+    #    框里是整句——结果却是首词的：`黑神话悟空 混铁棍 怎么获得` 返回「黑
+    #    （汉语文字）_百度百科」，`black myth wukong mixed iron staff` 返回
+    #    BLACK 的英文词典；更坏的是它偶尔回一批完全无关的页面（同一分钟里拿到
+    #    过汇率和一部电影的条目）。单词查询它是好的，但「大部分查询会拿到错误
+    #    答案」这件事比「少一个快引擎」贵得多，所以它不在这张表里。
     #
-    # sogou 曾在这个表里，现在不能留：它每次查询都崩在 `sogou.py` 的
-    # `resp.next_request` 上（本镜像的响应对象没有这个属性），故障进
-    # `unresponsive_engines`、零条结果。一个人人都崩的引擎不是备用通道，是每条
-    # 查询都带一条假警报——`web_search` 把这个字段原样交给调用方，于是模型每次
-    # 搜索都读到「有一个引擎坏了」，而它其实每次都是坏的，读它学不到任何东西。
-    # baidu（出口 IP 被判 CAPTCHA）、360search（零条且不报错）同理不在表里。
+    #    把它放回来的前提是包装层先有判据：`crates/cog-agent/src/web.rs` 里的
+    #    `DEGRADED_ENGINES` 会在「命中全部来自它、且查询不止一个词」时改问后备
+    #    出口。那条判据随镜像生效，不随这份清单生效——清单先加引擎，就会先有
+    #    一天的错误答案。
+    # 2. 360search 与 sogou 从这台主机出去是被按 IP 限流的：so.com 直接回「访问
+    #    异常页面」，sogou 302 到 antispider 后崩在 `sogou.py` 的
+    #    `resp.next_request`（本镜像的响应对象没有这个属性），故障记进
+    #    `unresponsive_engines`、零条结果。它们留在表里，是因为没被限流时出的是
+    #    整批正确的命中；限流时它们只是沉默，沉默会走「自建沉默 → 后备」那条路。
+    # 3. 镜像默认开着的那一群（brave、duckduckgo、google cse、startpage、baidu）
+    #    在境内一律不可达：各自超时或「Network is unreachable」，HTTP 仍是 200，
+    #    读起来像「网上没有」。
     #
-    # 判据：表里的每个引擎都必须在 `unresponsive_engines` 里长期不出现；一旦某家
-    # 变成每次都崩，就从表里删掉，而不是留着当噪音。
+    # 判据：表里每个引擎的沉默都必须是**可归因**的——要么限流、要么不可达，写在
+    # 上面；一旦某家每次都崩且不再偶尔答对，就从表里删掉，而不是留着当噪音。
     use_default_settings:
       engines:
         keep_only:
-          - bing
+          - 360search
+          - sogou
     engines:
       # keep_only 只是留下条目，它们默认仍是关的，必须逐个打开。
-      - name: bing
+      - name: 360search
         disabled: false
-        # 200 之外还有一次 302：`www.bing.com` 在境内把请求转给 `cn.bing.com`，
-        # 而这一层的客户端不跟这一步，只拿回 302 的空壳——零结果且不报错。直接
-        # 问 `cn.bing.com` 就绕开了这次跳转。
-        base_url: https://cn.bing.com
-        # 开了 HTTP/3 时同样的地址拿不回可用响应；这一家走 HTTP/2 才稳定。
-        enable_http3: false
+        weight: 2
+      # sogou 每次 302 都崩在 `sogou.py` 的 `resp.next_request`，故障进
+      # `unresponsive_engines`、零条结果。它仍然开着：没被限流时它出的是整批
+      # 正确的命中，而那一条假警报的代价小于它答对一次。
+      - name: sogou
+        disabled: false
+        weight: 2
     general:
       instance_name: "cogneva"
     server:
