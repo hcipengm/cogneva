@@ -9,6 +9,9 @@
 //! 上升要两条凭据：算术说还有余量，且**当前这个界被真的跑满过一拍**——半分钟一拍，
 //! 只按算术爬，从 1 到 6 只要两分半，而一次构建的峰值可以在这两分半里任何一刻到来。
 //!
+//! 价格本身也有保鲜期：只用最近一小时的样本算。价格不衰减的版本在第一次大构建之后
+//! 就跟写死一个数没有区别，只是那个数要等到进程重启才会被重新量一次。
+//!
 //! 读数从哪里来这件事本身就是这条律的一半：Pod 里 `/sys/fs/cgroup` 是宿主的整个
 //! 层级，容器的上限写在 `/proc/self/cgroup` 指的那一格下面（实测 2026-11-07）。
 //! 只读挂载点的版本读到的永远是「没有上限」，律一格也不会动。
@@ -18,9 +21,10 @@
 //! 有两套不同的算术。跨 crate 复用得先把那条控制律搬进契约层，这一笔没做；先让两边
 //! 逐字同形，搬的时候是替换而不是重写。
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
@@ -154,70 +158,97 @@ pub fn read_memory_current_from(root: &Path, proc_file: &Path) -> Option<u64> {
     None
 }
 
-/// 本进程的足迹：空闲时多低，干活时多高。
+/// 价格的保鲜窗：一条任务的价格只在这么新的样本上算。
 ///
-/// 两个数分开记，是因为决定「还能再塞几条」的是差值。只看峰值会把进程自己的
-/// 常驻开销当成一条任务的价格，界就永远是一；只看均值会把峰值那一窗抹平，
-/// 而撑爆容器的正是峰值那一窗。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// 一条变更任务的寿命是十分钟量级（实测 2026-11-07 变更验证的服务时长均值
+/// 12.8 分钟），一小时里约五条：窗比这更短，经常一条忙碌样本都没有，价格退回
+/// 「没量到」、界掉回 1 又爬回来，来回抖；比这更长，窗里压着一条早已过去的大
+/// 构建，界被一个当下不会再发生的事件钉死，直到进程重启才松——那与写死一个数
+/// 只差一个重启周期。
+// cap: bound — 实测一条变更任务 12.8 分钟，一小时约五条
+pub const PRICE_WINDOW: Duration = Duration::from_secs(3600);
+
+/// 一个样本：那一刻容器占了多少，同时有几条任务在跑。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sample {
+    at: Instant,
+    current: u64,
+    in_flight: usize,
+}
+
+/// 本进程最近这一窗的足迹。
+///
+/// 存样本而不是存几个累计量，是因为价格要按「那一刻几条在跑」摊：两条并发时
+/// 多出来的那一份，是一条任务的证据，不是一条两倍大的任务的证据。按后者算，
+/// 界在 N 条时把 N 条的总加量当成一条的价格，`ceiling ≈ 容器能装几条 / N`，
+/// 抬到平方根就停住（能装 6 条却稳在 2），而且停得看起来像内存真的不够。
+#[derive(Clone, Debug, Default)]
 pub struct Footprint {
-    /// 没有在途任务时见到的最小值。第一次见到之前是 0（未知）。
-    pub idle: u64,
-    /// 不论有没有在途任务，见到的最小值。
-    ///
-    /// 它是空载基线的兜底：这条车道被实测连续六小时满载 1/1，那种窗口里一个空闲
-    /// 样本都采不到，只有空闲基线会让界永远停在 1——而那时它停住的理由不是
-    /// 「容器装不下第二条」，是「没量到」。最小值是保守的那一侧（把常驻开销估低，
-    /// 一条任务的价格就估高，界只会偏小）。
-    pub floor: u64,
-    /// 有在途任务时见过的最大值，进程生命周期内不衰减。
-    ///
-    /// 不按窗归零，是这条控制律的安全方向：价格按「见过的最贵一条」算，只会估高
-    /// 不会估低，于是界只会偏小。按窗归零的版本在没构建的那一窗算出「价格未知」，
-    /// 界掉回 1、下一窗又爬回来，而爬回来的那一刻正是第二条任务被放进去、随后被
-    /// 一次重构建顶爆容器的时刻。重启会清掉这个最大值，那也是一次重新测量。
-    pub peak: u64,
+    window: VecDeque<Sample>,
 }
 
 impl Footprint {
-    /// 收一个样本。`in_flight` 是这个样本落下时有几条任务在跑。
+    /// 收一个样本，并把比 [`PRICE_WINDOW`](PRICE_WINDOW) 更老的样本丢掉。
+    pub fn observe(&mut self, current: u64, in_flight: usize, at: Instant) {
+        self.window.push_back(Sample {
+            at,
+            current,
+            in_flight,
+        });
+        self.forget_before(at);
+    }
+
+    /// 丢掉 `at - PRICE_WINDOW` 之前的样本。时间倒着走（同一拍的样本时间相同）
+    /// 时什么都不丢：这一窗的读数比丢样本更值钱。
+    pub fn forget_before(&mut self, at: Instant) {
+        while let Some(front) = self.window.front() {
+            match at.checked_duration_since(front.at) {
+                Some(age) if age > PRICE_WINDOW => {
+                    self.window.pop_front();
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// 窗里有几个样本。
+    pub fn samples(&self) -> usize {
+        self.window.len()
+    }
+
+    /// 空载基线：窗里见过的最低占用。
     ///
-    /// 空闲基线只由空闲样本决定，否则第一个任务的峰值会被记成基线，
-    /// 之后再高的峰值都算不出价格来。
-    pub fn observe(&mut self, current: u64, in_flight: usize) {
-        self.floor = if self.floor == 0 {
-            current
-        } else {
-            self.floor.min(current)
-        };
-        if in_flight == 0 {
-            self.idle = if self.idle == 0 {
-                current
-            } else {
-                self.idle.min(current)
-            };
-        } else {
-            self.peak = self.peak.max(current);
-        }
-    }
-
-    /// 算价格用的空载基线：采到过空闲样本就用它，没有就用见过的全局最小值。
+    /// 取全窗最小值而不是只取空闲样本，是因为这条车道被实测连续六小时跑满 1/1，
+    /// 那种窗口里一个空闲样本都采不到，只有空闲基线会让界永远停在 1——而停住的
+    /// 理由不是「容器装不下第二条」，是「没量到」。最小值是保守的那一侧：基线
+    /// 估低，价格就估高，界只会偏小。
     pub fn baseline(&self) -> u64 {
-        if self.idle > 0 {
-            self.idle
-        } else {
-            self.floor
-        }
+        self.window
+            .iter()
+            .map(|sample| sample.current)
+            .min()
+            .unwrap_or(0)
     }
 
-    /// 一条任务的价格。没量到过「有任务时比空载高多少」时返回 `None`——
-    /// 那不是零，是还没量。
+    /// 一条任务的价格：窗里每条忙碌样本的增量除以那一刻在跑几条，取最大。
+    ///
+    /// 没有忙碌样本时返回 `None`——那不是零，是这一窗没量到。
     pub fn per_task_bytes(&self) -> Option<u64> {
         let baseline = self.baseline();
-        if baseline == 0 || self.peak == 0 || self.peak <= baseline {
+        if baseline == 0 {
             return None;
         }
-        Some(self.peak - baseline)
+        self.window
+            .iter()
+            .filter(|sample| sample.in_flight > 0)
+            .map(|sample| {
+                let extra = sample.current.saturating_sub(baseline);
+                let lanes = sample.in_flight as u64;
+                // 向上取整：少算一条任务的价钱就是多放进一条任务。
+                extra.div_ceil(lanes)
+            })
+            .filter(|per_task| *per_task > 0)
+            .max()
     }
 }
 
@@ -225,7 +256,7 @@ impl Footprint {
 ///
 /// 还没量到价格时返回 1：不是保守取整，是因为「不知道一条任务多贵」时
 /// 唯一能确定的数就是「至少一条能跑」——这条车道不能因为一次读失败就停摆。
-pub fn derive_ceiling(limit: u64, footprint: Footprint) -> usize {
+pub fn derive_ceiling(limit: u64, footprint: &Footprint) -> usize {
     let Some(per_task) = footprint.per_task_bytes() else {
         return 1;
     };
@@ -336,11 +367,11 @@ pub fn spawn_lane_memory_bound(
                     let in_flight = capacity
                         .saturating_sub(slots.available_permits())
                         .min(capacity);
-                    footprint.observe(current, in_flight);
+                    footprint.observe(current, in_flight, std::time::Instant::now());
                     if in_flight >= capacity {
                         ran_full = true;
                     }
-                    let ceiling = derive_ceiling(limit, footprint);
+                    let ceiling = derive_ceiling(limit, &footprint);
                     let want =
                         next_bound(capacity, ceiling, should_grow(capacity, ceiling, ran_full));
                     let applied = apply_bound(&slots, capacity, want);
@@ -356,7 +387,7 @@ pub fn spawn_lane_memory_bound(
                             limit,
                             current,
                             baseline = footprint.baseline(),
-                            peak = footprint.peak,
+                            per_task = footprint.per_task_bytes(),
                             "lane bound moved with the container's memory"
                         );
                         crate::observable::claim_slots_observable().set_slots(&stream, applied);
@@ -385,6 +416,15 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    /// 例如「空载 3 GiB、一条任务 12 GiB」的足迹，采样时刻都落在同一个窗口里。
+    fn footprint(idle: u64, busy: u64, in_flight: usize) -> Footprint {
+        let at = Instant::now();
+        let mut footprint = Footprint::default();
+        footprint.observe(idle, 0, at);
+        footprint.observe(busy, in_flight, at + Duration::from_secs(30));
+        footprint
+    }
+
     /// 界必须跟着容器上限走：同一个足迹下把 `memory.max` 抬上去，导出值要跟着抬。
     ///
     /// 这就是那条原则的判据——改动前界是配置里的一个数，`memory.max` 怎么改它都不动。
@@ -395,22 +435,64 @@ mod tests {
         let dir = fixture(&[(MEMORY_MAX_FILE, "17179869184\n")]);
         assert_eq!(read_memory_max(dir.path()), Some(16 * GIB));
 
-        let footprint = Footprint {
-            idle: 3 * GIB,
-            floor: 3 * GIB,
-            peak: 15 * GIB,
-        };
-        assert_eq!(derive_ceiling(16 * GIB, footprint), 1);
-        assert_eq!(derive_ceiling(32 * GIB, footprint), 2);
-        assert_eq!(derive_ceiling(48 * GIB, footprint), 3);
+        let footprint = footprint(3 * GIB, 15 * GIB, 1);
+        assert_eq!(derive_ceiling(16 * GIB, &footprint), 1);
+        assert_eq!(derive_ceiling(32 * GIB, &footprint), 2);
+        assert_eq!(derive_ceiling(48 * GIB, &footprint), 3);
 
         // 同一份夹具，把上限抬上去之后再读一次，导出的界必须跟着抬。
         std::fs::write(dir.path().join(MEMORY_MAX_FILE), "34359738368\n").expect("raise limit");
         let raised = read_memory_max(dir.path()).expect("limit");
         assert!(
-            derive_ceiling(raised, footprint) > derive_ceiling(16 * GIB, footprint),
+            derive_ceiling(raised, &footprint) > derive_ceiling(16 * GIB, &footprint),
             "抬了容器的 memory.max，导出的界却没跟着抬"
         );
+    }
+
+    /// 两条并发时多出来的量是两条任务的价格，不是一条的。
+    ///
+    /// 不摊的版本把「两条一起多出来的那一份」记成每条任务的价格，`ceiling` 于是被
+    /// 自己的界除了一次：容器装得下三条时算出装得下 1.5 条，界稳在 1 而不是 3。
+    /// 这一条红的形状是「lane 明显还有余量，界却一直不涨」。
+    #[test]
+    fn a_price_measured_at_two_lanes_is_the_increment_of_one() {
+        let two_at_once = footprint(2 * GIB, 14 * GIB, 2);
+        assert_eq!(two_at_once.per_task_bytes(), Some(6 * GIB));
+        // 例如上限 20 GiB、基线 2 GiB ⇒ 余量 18 GiB 装得下三条 6 GiB。
+        assert_eq!(derive_ceiling(20 * GIB, &two_at_once), 3);
+    }
+
+    /// 价格只用窗里的样本算：一条大构建过去一小时后，不再压着界。
+    ///
+    /// 峰值不衰减的版本会让第一次大构建把这个进程终生钉在 1，直到重启才重测——
+    /// 那与写死一个数只差一个重启周期。
+    #[test]
+    fn a_burst_that_ages_out_stops_pricing_the_lane() {
+        let start = Instant::now();
+        let mut footprint = Footprint::default();
+        footprint.observe(3 * GIB, 0, start);
+        footprint.observe(15 * GIB, 1, start + Duration::from_secs(30));
+        assert_eq!(footprint.per_task_bytes(), Some(12 * GIB));
+        assert_eq!(derive_ceiling(16 * GIB, &footprint), 1);
+
+        // 一小时后：大构建的样本出了窗，窗里只剩便宜的样本。
+        let later = start + PRICE_WINDOW + Duration::from_secs(60);
+        footprint.observe(3 * GIB, 0, later);
+        footprint.observe(6 * GIB, 1, later + Duration::from_secs(30));
+        assert_eq!(footprint.samples(), 2, "旧样本必须真的被丢掉");
+        assert_eq!(footprint.per_task_bytes(), Some(3 * GIB));
+        assert!(derive_ceiling(16 * GIB, &footprint) > 1);
+    }
+
+    /// 整窗一条忙碌样本都没有＝这一窗没量到价格，而不是「价格为零」。
+    #[test]
+    fn a_window_with_no_busy_sample_carries_no_price() {
+        let at = Instant::now();
+        let mut footprint = Footprint::default();
+        footprint.observe(3 * GIB, 0, at);
+        footprint.observe(4 * GIB, 0, at + Duration::from_secs(30));
+        assert_eq!(footprint.per_task_bytes(), None);
+        assert_eq!(derive_ceiling(64 * GIB, &footprint), 1);
     }
 
     /// 不设上限（`max`）不等同于「量到了 0 字节上限」。前者没有比例可算，
@@ -444,32 +526,33 @@ mod tests {
     fn an_unmeasured_task_keeps_the_bound_at_one() {
         let footprint = Footprint::default();
         assert_eq!(footprint.per_task_bytes(), None);
-        assert_eq!(derive_ceiling(64 * GIB, footprint), 1);
+        assert_eq!(derive_ceiling(64 * GIB, &footprint), 1);
     }
 
     /// 连续满载、采不到空闲样本时，用见过的全局最小值兜底：
     /// 否则这条车道会永远停在 1，而停住的理由不是容器装不下两条。
     #[test]
     fn a_lane_that_never_sits_idle_still_measures_its_floor() {
+        let at = Instant::now();
         let mut footprint = Footprint::default();
-        footprint.observe(15 * GIB, 1);
-        footprint.observe(5 * GIB, 1);
-        footprint.observe(15 * GIB, 1);
-        assert_eq!(footprint.idle, 0, "一个空闲样本都没有");
+        footprint.observe(15 * GIB, 1, at);
+        footprint.observe(5 * GIB, 1, at + Duration::from_secs(30));
+        footprint.observe(15 * GIB, 1, at + Duration::from_secs(60));
         assert_eq!(footprint.baseline(), 5 * GIB);
         assert_eq!(footprint.per_task_bytes(), Some(10 * GIB));
-        assert_eq!(derive_ceiling(32 * GIB, footprint), 2);
+        assert_eq!(derive_ceiling(32 * GIB, &footprint), 2);
     }
 
-    /// 空闲基线只由空闲样本决定：第一个任务的峰值不能被记成基线。
+    /// 基线是全窗最小值：第一个任务的峰值不能被记成基线，空闲样本一落下就接过来。
     #[test]
-    fn the_idle_baseline_is_learned_only_while_idle() {
+    fn the_baseline_is_the_lowest_reading_in_the_window() {
+        let at = Instant::now();
         let mut footprint = Footprint::default();
-        footprint.observe(12 * GIB, 1);
-        assert_eq!(footprint.idle, 0);
-        footprint.observe(3 * GIB, 0);
-        footprint.observe(2 * GIB, 0);
-        assert_eq!(footprint.idle, 2 * GIB);
+        footprint.observe(12 * GIB, 1, at);
+        assert_eq!(footprint.baseline(), 12 * GIB, "还没有更低的读数");
+        footprint.observe(3 * GIB, 0, at + Duration::from_secs(30));
+        footprint.observe(2 * GIB, 0, at + Duration::from_secs(60));
+        assert_eq!(footprint.baseline(), 2 * GIB);
         assert_eq!(footprint.per_task_bytes(), Some(10 * GIB));
     }
 

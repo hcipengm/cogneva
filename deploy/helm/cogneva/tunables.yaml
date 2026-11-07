@@ -904,10 +904,12 @@ rows:
       change-generation task travels, so this number is the platform's change
       throughput. The chart ships 0, which asks for the bound to be derived:
       every window `crates/cog-orchestrator/src/lane_memory.rs` reads the
-      container's `memory.max` and this process's `memory.current`, keeps the
-      idle baseline and the peak seen while a task was in flight, and divides the
-      headroom by that per-task price; the bound falls at once and climbs one
-      step per window. A positive number is the override seat and pins it. The
+      container's `memory.max` and this process's `memory.current`, prices one
+      task as the highest increment per task in flight over the last hour's
+      samples (measured task life 12.8 minutes, so about five tasks), and divides
+      the headroom by that price; the bound falls at once and climbs one step
+      only after the current bound was actually run full. A positive number is
+      the override seat and pins it. The
       two inputs are the reason it cannot be a constant: the 2026-11-07 reading
       that pinned it at 1 (peak 15.96 GiB of a 16 GiB ceiling, mean 8.27 GiB) is
       a fact about the container as it was sized that day, and a number typed
