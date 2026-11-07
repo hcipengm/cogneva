@@ -1231,16 +1231,64 @@ fn landing_trailers(log: &str) -> HashMap<String, String> {
 /// appends its generation to the id (`-r1`), and a change landed under any
 /// generation was delivered. The prefix is the identity's hash, so no other
 /// change's id begins with it.
+///
+/// That edge only exists for a hand-over of one. A batch is a single task for
+/// up to [`rows_per_handover`] rows and its id is derived from the *first* row,
+/// so for every other row in it the id it was carried under is not its own
+/// identity's hash and no prefix search will find it. The commit names one id,
+/// because the landing process writes the task it worked under -- so without
+/// [`carried_handovers`] an entire batch would report one delivered change and
+/// the rest as never delivered, which is a reading that understates shipping by
+/// exactly the batch factor.
+///
+/// Both edges are asked and the highest id wins, so the answer does not depend
+/// on which of them a given hand-over happens to have.
 fn delivered_revision<'a>(
     identity: &ChangeIdentity,
     deliveries: &'a HashMap<String, String>,
+    carried: &HashMap<ChangeIdentity, Vec<String>>,
 ) -> Option<&'a str> {
     let prefix = handover_task_prefix(identity);
-    deliveries
+    let by_own_id = deliveries
         .iter()
         .filter(|(id, _)| id.starts_with(&prefix))
+        .map(|(id, rev)| (id.as_str(), rev.as_str()));
+    let by_the_batch = carried
+        .get(identity)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| deliveries.get_key_value(id))
+        .map(|(id, rev)| (id.as_str(), rev.as_str()));
+    by_own_id
+        .chain(by_the_batch)
         .max_by(|a, b| a.0.cmp(b.0))
-        .map(|(_, rev)| rev.as_str())
+        .map(|(_, rev)| rev)
+}
+
+/// Which hand-over carried each change, for the changes carried by a batch.
+///
+/// Read off the graph because the edge is not derivable: a batch's id is the
+/// first row's, and the rows behind it have no id of their own anywhere -- the
+/// commit names the task, and the task names the rows. A hand-over of one is
+/// left out on purpose: its id is its identity's hash, which
+/// [`delivered_revision`] reaches without this map, and putting every
+/// dispatched row in here would make the map as large as the graph to say what
+/// the identity already says.
+fn carried_handovers(tasks: &[Task]) -> HashMap<ChangeIdentity, Vec<String>> {
+    let mut carried: HashMap<ChangeIdentity, Vec<String>> = HashMap::new();
+    for task in tasks {
+        let identities = dispatched_identities(task);
+        if identities.len() < 2 {
+            continue;
+        }
+        for identity in identities {
+            let ids = carried.entry(identity).or_default();
+            if !ids.contains(&task.id) {
+                ids.push(task.id.clone());
+            }
+        }
+    }
+    carried
 }
 
 /// The name a run's deliverable carries.
@@ -2824,7 +2872,25 @@ pub fn spawn_change_ledger_loop(
                         }
                     };
                     if let Some(ref deliveries) = deliveries {
-                        stamp_deliveries(&*store, deliveries).await;
+                        // A batch's id is its first row's, so the rows behind
+                        // it are reachable only through the graph. Read here
+                        // rather than inside the stamp because the hand-over
+                        // below asks the same question, and because a pass
+                        // whose commit log could not be read must not pay for
+                        // a graph it has nothing to ask of.
+                        //
+                        // One more read of the task table per pass than before
+                        // batching existed. The alternative was to stamp the
+                        // batches' rows after the measurement, which is exactly
+                        // the ordering the comment above says records the rows
+                        // that did not land and misses the ones that did.
+                        // No graph is no hand-over, so no batch: the empty map
+                        // is the right answer here rather than a degraded one.
+                        let carried_by_batch = match orchestrator.as_ref() {
+                            Some(o) => carried_handovers(&o.get_all_tasks().await),
+                            None => HashMap::new(),
+                        };
+                        stamp_deliveries(&*store, deliveries, &carried_by_batch).await;
                     }
                     measure_pass(&*store, &tree, &mut unsettled, &changed, metrics.as_ref()).await;
                     // The second face of "is it done", read after the
@@ -5084,6 +5150,7 @@ fn dispatchable(
 async fn stamp_deliveries(
     store: &dyn ChangeLedgerStore,
     deliveries: &HashMap<String, String>,
+    carried_by_batch: &HashMap<ChangeIdentity, Vec<String>>,
 ) -> usize {
     let outstanding_total = match store.census().await {
         Ok(census) => census
@@ -5114,7 +5181,7 @@ async fn stamp_deliveries(
         if row.delivered_rev.is_some() {
             continue;
         }
-        let Some(rev) = delivered_revision(&row.identity, deliveries) else {
+        let Some(rev) = delivered_revision(&row.identity, deliveries, &carried_by_batch) else {
             continue;
         };
         match store.record_delivery(&row.identity, rev).await {
@@ -5197,6 +5264,14 @@ async fn dispatch_pass(
         }
     };
 
+    // Read before the delivery stamp below rather than beside the sweep: the
+    // stamp is the first reader that needs it, and the graph it comes from is
+    // the same one the hand-over later takes.
+    let graph_tasks = orchestrator.get_all_tasks().await;
+    // Taken off that one reading, for the same reason the index is: what a
+    // batch carries is on the tasks this pass already holds.
+    let carried_by_batch = carried_handovers(&graph_tasks);
+
     // Delivery is written before anything is counted, so a change a commit
     // landed since the last pass is in this pass's reading rather than the
     // next one's. Only rows that have never been delivered are written: the
@@ -5208,7 +5283,7 @@ async fn dispatch_pass(
             if row.delivered_rev.is_some() {
                 continue;
             }
-            let Some(rev) = delivered_revision(&row.identity, deliveries) else {
+            let Some(rev) = delivered_revision(&row.identity, deliveries, &carried_by_batch) else {
                 continue;
             };
             match store.record_delivery(&row.identity, rev).await {
@@ -5261,7 +5336,6 @@ async fn dispatch_pass(
     // instead, which is one lookup for every slot a change could have been filed
     // under, on every pass, over the whole queue.
     let owed: HashSet<ChangeIdentity> = rows.iter().map(|row| row.identity.clone()).collect();
-    let graph_tasks = orchestrator.get_all_tasks().await;
     let closed = close_settled_dispatch_rows(orchestrator, &graph_tasks, store, &owed).await;
     let mut handovers = HandoverIndex::read(&graph_tasks);
     if closed.moved_anything() {
@@ -13350,7 +13424,7 @@ mod tests {
         );
 
         // The pass's own order: stamp, then measure.
-        stamp_deliveries(&fake, &deliveries).await;
+        stamp_deliveries(&fake, &deliveries, &HashMap::new()).await;
         let mut unsettled = HashMap::new();
         measure_pass(&fake, &tree, &mut unsettled, &[], None).await;
 
@@ -14644,7 +14718,7 @@ diff --git a/x.rs b/x.rs
         let mut deliveries = HashMap::new();
         deliveries.insert(dispatch_task_id(&identity, 1), "ccccc".to_string());
         assert_eq!(
-            delivered_revision(&identity, &deliveries),
+            delivered_revision(&identity, &deliveries, &HashMap::new()),
             Some("ccccc"),
             "the generation is appended to the id, so equality would miss every re-armed \
              handover and read a delivered change as undelivered"
@@ -14657,7 +14731,42 @@ diff --git a/x.rs b/x.rs
         let other = ChangeIdentity::new("grep", "crates/x", "fn other");
         let mut deliveries = HashMap::new();
         deliveries.insert(dispatch_task_id(&other, 0), "ddddd".to_string());
-        assert_eq!(delivered_revision(&identity, &deliveries), None);
+        assert_eq!(
+            delivered_revision(&identity, &deliveries, &HashMap::new()),
+            None
+        );
+    }
+
+    /// A batch's commit names the batch, and a batch's id is the *first* row's.
+    /// Every other row in it was carried under that id, so its own identity
+    /// says nothing about it and the prefix rule alone cannot find it.
+    ///
+    /// Left as it was, this is not a small miss: a batch of five would report
+    /// one delivered change and four that never were, and the ladder would
+    /// understate shipping by exactly the batch factor -- which is the number
+    /// the whole reading exists to give.
+    #[test]
+    fn a_row_carried_by_a_batch_reads_as_delivered_by_the_batchs_commit() {
+        let anchor = row(ChangeState::Pending, None);
+        let mut behind = row(ChangeState::Pending, None);
+        behind.identity = ChangeIdentity::new("grep", "crates/x", "fn other");
+        let batch = dispatch_task(&[anchor, behind.clone()], 0);
+        let carried = carried_handovers(std::slice::from_ref(&batch));
+        let mut deliveries = HashMap::new();
+        deliveries.insert(batch.id.clone(), "eeeee".to_string());
+
+        assert_eq!(
+            delivered_revision(&behind.identity, &deliveries, &carried),
+            Some("eeeee"),
+            "the commit names the task the batch was dispatched under, and the row behind \
+             the anchor was carried by that same task"
+        );
+        assert_eq!(
+            delivered_revision(&behind.identity, &deliveries, &HashMap::new()),
+            None,
+            "without the batch map the row behind the anchor is invisible -- this is what \
+             the reader did before batches were accounted for"
+        );
     }
 
     /// A window row built from the fields the reading cares about, with the
