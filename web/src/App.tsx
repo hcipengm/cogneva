@@ -26,7 +26,7 @@ export default function App() {
     ? `${
         import.meta.env.VITE_WS_URL ??
         `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
-      }/ws?token=${auth.token}`
+      }/ws?token=${auth.token}&platform=web`
     : '';
 
   // 通知中心先于事件流建：推送到达时要直接落进它的列表，顺序反过来只能缓存

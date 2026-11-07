@@ -61,6 +61,13 @@ pub struct ConversationRequest {
     pub owner: String,
     pub messages: Vec<cog_core::Message>,
     pub llm: Arc<dyn cog_core::LlmClient>,
+    /// 这条连接握手时自报的平台（界面发 `web`），没有就是没声明。
+    ///
+    /// 它不是身份：身份是 `owner`。它回答的是名单上另一件事——这一行是谁开出
+    /// 来的会话。名字由会话哈希而来，人跟探针在名字上看不出区别，来源在行上。
+    pub platform: Option<String>,
+    /// 同一台设备的同一个客户端，同样来自握手。
+    pub device_id: Option<String>,
 }
 
 /// 循环往网关送事件的管道有多深。
@@ -416,6 +423,9 @@ pub async fn run_chat_turn(
     // 这次对话属于谁。空串是「这条连接没有身份」——那时调用方不声明人，账落在
     // 没有人的那一格，与「声明了某个人」分开。
     owner: String,
+    // 这条连接握手时自报的平台与设备，原样带进这一轮。见 [`ConversationRequest`]。
+    platform: Option<String>,
+    device_id: Option<String>,
 ) {
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).
@@ -475,6 +485,8 @@ pub async fn run_chat_turn(
                 owner,
                 messages,
                 llm,
+                platform,
+                device_id,
             },
             events_tx,
         )

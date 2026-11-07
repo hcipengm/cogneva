@@ -1087,6 +1087,16 @@ export interface AgentSummary {
    * 没有它这个人就只剩一个点进去什么也没有的名字。
    */
   session_id?: string | null;
+  /**
+   * 这个人哪来的：界面握手时自报 `web`，没声明的客户端（探针、脚本）没有这一格。
+   *
+   * 名字是哈希出来的，读的人从名字上分不出人和探针——2026-11-06 名单上那 29 行
+   * 全是「开一个会话、说一句、再没回来」，`first_seen` 与 `last_seen` 在同一秒里。
+   * 来源写在行上，读面才有得筛。
+   */
+  platform?: string | null;
+  /** 同一台设备的同一个客户端，同样来自握手。 */
+  device_id?: string | null;
 }
 
 export async function listAgents(): Promise<AgentSummary[]> {

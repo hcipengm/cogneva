@@ -423,6 +423,11 @@ export function PeopleView() {
                   <div className="mono text-[10px] text-[var(--muted)]">agent:{agent.agent_id}</div>
                   <div className="text-[10px] text-[var(--muted)]">
                     {agent.role} · {agent.workspace_id}
+                    {agent.platform
+                      ? ` · 来自 ${agent.platform}`
+                      : // 没有来源的是没声明平台的客户端：探针、脚本、老版本界面。
+                        // 说出来比留白好——留白读成「不知道这个人哪来的」。
+                        ' · 来源未声明'}
                   </div>
                 </button>
               );

@@ -233,6 +233,92 @@ pub struct PersonRow {
     pub display_name: String,
     pub first_seen: chrono::DateTime<chrono::Utc>,
     pub last_seen: chrono::DateTime<chrono::Utc>,
+    /// 这位是从哪儿来的：界面发 `web`，别的客户端自己声明。
+    ///
+    /// 名字由会话哈希出来，读的人从名字上分不出「有人坐在这儿聊」和「一个探针
+    /// 开了一个会话、说了一句、再也没回来」——2026-11-06 名册上那 29 行全是后者，
+    /// `first_seen` 与 `last_seen` 落在同一秒里。来源写在行上，名单才有得筛。
+    ///
+    /// 没有这位的旧行按 `None` 读：那时候还没人记来源，编一个等于假装量过。
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// 同一台设备的同一个客户端。重开一次会话还是这一格，换台机器就不是。
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+/// 一个会话落在哪位员工身上：一张不过期的表，键是会话 id。
+///
+/// 名字本来是「实例指纹 ＋ 会话」算出来的，于是滚一次 Pod 换一个指纹，同一个
+/// 会话就变成一个从没见过的员工——界面上两处读的是同一份名册，看到的却是两个
+/// 人。会话绑一次人，之后无论哪个实例接手都按这一行认人。
+pub const SESSION_EMPLOYEE_KEY: &str = "cogneva:session_employee";
+
+/// 绑在会话上的那一位。
+///
+/// 与 [`PersonRow`] 分开记：那一行是「说过话的人」，这一行是「这段对话是谁」。
+/// 一个人可以在好几段对话里说话，那时名册上有好几行，绑定的方向是会话 → 人。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEmployee {
+    pub agent_id: String,
+    pub persona: String,
+    pub short: String,
+    pub handle: String,
+    /// 这一位跨重启还是不是同一个人。绑定的意义就是把它变成「是」，所以读面
+    /// 可以拿这一位判断这行是不是绑出来的。
+    #[serde(default)]
+    pub stable: bool,
+}
+
+/// 读一段会话绑定的人。没有绑定、或那一行读不懂时回 `None`，让调用方去分配。
+pub async fn read_bound_session(
+    kv: &dyn cog_core::KeyValueStore,
+    session_id: &str,
+) -> Option<SessionEmployee> {
+    let text = match kv.hget(SESSION_EMPLOYEE_KEY, session_id).await {
+        Ok(text) => text?,
+        Err(e) => {
+            tracing::warn!(error = %e, session_id, "a session binding could not be read");
+            return None;
+        }
+    };
+    match serde_json::from_str::<SessionEmployee>(&text) {
+        Ok(row) => Some(row),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                session_id,
+                "a session binding does not parse; the next turn re-mints it"
+            );
+            None
+        }
+    }
+}
+
+/// 把一段会话绑到一位员工身上。后写覆盖先写是有意的：调用方只在表里没有这一
+/// 行时才写，两个实例同时首轮撞上时谁先写谁定，之后读到的都是同一行。
+pub async fn write_bound_session(
+    kv: &dyn cog_core::KeyValueStore,
+    session_id: &str,
+    row: &SessionEmployee,
+) -> cog_core::SFResult<()> {
+    let text = serde_json::to_string(row)?;
+    kv.hset(SESSION_EMPLOYEE_KEY, session_id, &text).await
+}
+
+/// 这段会话在「说过话的人」名册上的那一行。
+///
+/// 绑定的表是后加的：在这之前说过话的会话没有绑定，而它们的名册行就是它们的
+/// 人。新表的第一轮先认这一行，认不出来才新发一个名字——不然同一个会话会在名
+/// 单上变成两个人，而那正是要修的那个病。
+pub async fn person_for_session(
+    kv: &Arc<dyn cog_core::KeyValueStore>,
+    session_id: &str,
+) -> Option<(String, PersonRow)> {
+    read_people(kv)
+        .await
+        .into_iter()
+        .find(|(_, row)| row.session_id == session_id)
 }
 
 /// 一次读「说过话的人」的结果。解析不了的行跳过并计数，不按位置猜它是谁。
@@ -1651,6 +1737,14 @@ fn roster_with_people(
         };
         if let Some(obj) = view.as_object_mut() {
             obj.insert("session_id".to_string(), serde_json::json!(row.session_id));
+            // 来源跟着人走，不跟着这次心跳走：此刻在不在岗由注册表回答，这位
+            // 从哪儿来由名册回答，两处读到的是同一行。
+            if let Some(platform) = row.platform.as_deref() {
+                obj.insert("platform".to_string(), serde_json::json!(platform));
+            }
+            if let Some(device_id) = row.device_id.as_deref() {
+                obj.insert("device_id".to_string(), serde_json::json!(device_id));
+            }
         }
     }
     let live_ids: std::collections::HashSet<&str> =
@@ -1674,6 +1768,8 @@ fn roster_with_people(
             "last_heartbeat": row.last_seen,
             "live": false,
             "session_id": row.session_id,
+            "platform": row.platform,
+            "device_id": row.device_id,
         }));
     }
     views
@@ -2189,6 +2285,8 @@ mod tests {
             display_name: "Kai#a9ab11fc".into(),
             first_seen: at,
             last_seen: at,
+            platform: None,
+            device_id: None,
         };
         store
             .hashes
@@ -2209,6 +2307,35 @@ mod tests {
         assert_eq!(views[0]["display_name"], "Kai#a9ab11fc");
         assert_eq!(views[0]["live"], false);
         assert_eq!(views[0]["session_id"], "conv-1");
+    }
+
+    /// 记来源之前写下的行仍然读得回来。
+    ///
+    /// 生产上那 29 行是升级前写的，没有 `platform` / `device_id`。这两个新列若
+    /// 是必填，整张名册会在升级的那一刻被读成空的——名单上的人一个都不剩，而
+    /// 读面只会显示「没有员工」。
+    #[tokio::test]
+    async fn a_people_row_written_before_provenance_still_parses() {
+        let store = Arc::new(FakeRosterStore::default());
+        store
+            .hashes
+            .lock()
+            .unwrap()
+            .entry(PEOPLE_KEY.to_string())
+            .or_default()
+            .insert(
+                "kai-a9ab11fc".to_string(),
+                r#"{"session_id":"conv-1","display_name":"Kai#a9ab11fc",
+                    "first_seen":"2026-11-06T09:00:00Z","last_seen":"2026-11-06T09:00:01Z"}"#
+                    .to_string(),
+            );
+        let store: Arc<dyn cog_core::KeyValueStore> = store;
+
+        let people = read_people(&store).await;
+
+        assert_eq!(people.len(), 1, "旧行读不回来，整张名册就空了");
+        assert_eq!(people[0].1.platform, None);
+        assert_eq!(people[0].1.device_id, None);
     }
 
     /// 同一个人两处都有时只印一行，并且那一行是「在岗」的。
@@ -2232,6 +2359,8 @@ mod tests {
             display_name: "Kai#a9ab11fc".into(),
             first_seen: at,
             last_seen: at,
+            platform: None,
+            device_id: None,
         };
 
         let views = roster_with_people(&[reg], vec![("kai-a9ab11fc".to_string(), row)]);

@@ -112,11 +112,73 @@ const ACTIVE_ALERTS_LIMIT: usize = 20;
 /// 指纹缺失时退回进程自身的装配标识：名字仍然唯一，但它只稳定到下一次滚动，
 /// 于是 `stable` 如实置 false——这是"滚一次会不会换名"的那一位，不能糊。
 pub fn employee_for(session_id: &str) -> cog_agent::identity::AgentName {
-    let fingerprint = std::env::var(cog_core::env::INSTANCE_FINGERPRINT)
+    employee_named(fingerprint().as_deref(), session_id)
+}
+
+/// 这个进程的实例指纹。缺了就是缺了——调用方据此把名字标成不跨重启。
+fn fingerprint() -> Option<String> {
+    std::env::var(cog_core::env::INSTANCE_FINGERPRINT)
         .ok()
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    employee_named(fingerprint.as_deref(), session_id)
+        .filter(|v| !v.is_empty())
+}
+
+/// 这一段对话的人：先读绑定，没有再分配一个并写回去。
+///
+/// 名字的算法把实例指纹拌进种子里，所以同一段会话在滚过一次 Pod 之后会算出一个
+/// 新名字。绑定把「第一次见面时的那个人」钉在会话上：之后无论哪个实例接手，名册
+/// 上、账上、消息上读到的都是这一行。
+///
+/// 绑定表是后加的，老会话没有。这时先认它在「说过话的人」名册上的那一行——
+/// 那一行就是它的人；认不出来才新发一个。不认这一步，升级之后同一个会话会在
+/// 名单上变成两个人，而那正是要修的病。
+async fn bound_employee(
+    kv: &Arc<dyn cog_core::KeyValueStore>,
+    fingerprint: Option<&str>,
+    session_id: &str,
+) -> cog_agent::identity::AgentName {
+    if let Some(row) = cog_gateway::agents::read_bound_session(&**kv, session_id).await {
+        return cog_agent::identity::AgentName {
+            persona: row.persona,
+            short: row.short,
+            handle: row.handle,
+            id: row.agent_id,
+            stable: row.stable,
+        };
+    }
+    // 老会话：名册行上的 id 与名字就是它的人，按那一行认，不再重算。
+    let existing = cog_gateway::agents::person_for_session(kv, session_id).await;
+    let employee = match existing.as_ref().and_then(|(id, row)| {
+        let (persona, short) = row.display_name.split_once('#')?;
+        (id == &format!("{}-{}", persona.to_lowercase(), short)).then(|| {
+            cog_agent::identity::AgentName {
+                persona: persona.to_string(),
+                short: short.to_string(),
+                handle: row.display_name.clone(),
+                id: id.clone(),
+                stable: true,
+            }
+        })
+    }) {
+        Some(employee) => employee,
+        None => employee_named(fingerprint, session_id),
+    };
+    let binding = cog_gateway::agents::SessionEmployee {
+        agent_id: employee.id.clone(),
+        persona: employee.persona.clone(),
+        short: employee.short.clone(),
+        handle: employee.handle.clone(),
+        stable: true,
+    };
+    if let Err(e) = cog_gateway::agents::write_bound_session(&**kv, session_id, &binding).await {
+        tracing::warn!(
+            agent_id = %employee.id,
+            session_id,
+            error = %e,
+            "会话没有绑定到人：下一位接手的实例会重算这个名字"
+        );
+    }
+    employee
 }
 
 /// 名字的算法本体：种子是「实例指纹 ＋ 会话」，两样都变才换人。
@@ -203,6 +265,16 @@ impl PlatformConversation {
     }
 }
 
+/// 这一轮那句话是从哪儿来的。
+///
+/// 名字是哈希出来的，读的人从名字上分不出人跟探针。来源是在握手时客户端自报的，
+/// 它不是身份——真正的身份是认证主体；它回答的是「这一行是谁开出来的会话」。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PersonOrigin {
+    pub platform: Option<String>,
+    pub device_id: Option<String>,
+}
+
 /// 把这一位说过话的员工记进名册。
 ///
 /// 第一次写下 `first_seen`，之后每一轮只推进 `last_seen`：把第一次见过的时刻
@@ -213,22 +285,33 @@ pub(crate) async fn note_person(
     kv: &dyn cog_core::KeyValueStore,
     employee: &cog_agent::identity::AgentName,
     session_id: &str,
+    origin: &PersonOrigin,
     now: chrono::DateTime<chrono::Utc>,
 ) -> cog_core::SFResult<()> {
-    let first_seen = match kv
+    let previous = match kv
         .hget(cog_gateway::agents::PEOPLE_KEY, &employee.id)
         .await?
     {
-        Some(text) => serde_json::from_str::<cog_gateway::agents::PersonRow>(&text)
-            .map(|row| row.first_seen)
-            .unwrap_or(now),
-        None => now,
+        Some(text) => serde_json::from_str::<cog_gateway::agents::PersonRow>(&text).ok(),
+        None => None,
     };
+    let first_seen = previous.as_ref().map(|row| row.first_seen).unwrap_or(now);
     let row = cog_gateway::agents::PersonRow {
         session_id: session_id.to_string(),
         display_name: employee.handle.clone(),
         first_seen,
         last_seen: now,
+        // 来源只在新的一轮说得出口时覆盖：这一轮的客户端声明了它是谁，就用它；
+        // 没声明就留着上一轮记下的那一格。没有这一层，一个老客户端接上来的
+        // 第一句话就会把「web」擦成「不知道」。
+        platform: origin
+            .platform
+            .clone()
+            .or_else(|| previous.as_ref().and_then(|row| row.platform.clone())),
+        device_id: origin
+            .device_id
+            .clone()
+            .or_else(|| previous.as_ref().and_then(|row| row.device_id.clone())),
     };
     let text = serde_json::to_string(&row)?;
     kv.hset(cog_gateway::agents::PEOPLE_KEY, &employee.id, &text)
@@ -242,15 +325,29 @@ impl ConversationTurn for PlatformConversation {
         events: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = SFResult<serde_json::Value>> + Send + 'a>> {
         Box::pin(async move {
-            // 这一段对话是谁：名字由会话推出，跨轮不变。派活与记账都按这个名字。
-            let employee = employee_for(&request.session_id);
+            // 这一段对话是谁：绑在会话上的人，跨轮、跨实例不变。派活与记账都按
+            // 这个名字。没有绑定表（进程没装 KV）时退回按会话算出来的那个名字。
+            let employee = match self.people.as_ref() {
+                Some(kv) => bound_employee(kv, fingerprint().as_deref(), &request.session_id).await,
+                None => employee_for(&request.session_id),
+            };
             // 先把他记进「说过话的人」名册：注册表上的心跳在他闭嘴几十秒后就
             // 过期，而人要找的是「那个跟我聊过的人」。写不进去不是这一轮的
             // 失败——他照样能说话，只是名单上从此少一个人；这一句是那个差别的
             // 唯一读数。
             if let Some(kv) = self.people.as_ref() {
-                if let Err(e) =
-                    note_person(&**kv, &employee, &request.session_id, chrono::Utc::now()).await
+                let origin = PersonOrigin {
+                    platform: request.platform.clone(),
+                    device_id: request.device_id.clone(),
+                };
+                if let Err(e) = note_person(
+                    &**kv,
+                    &employee,
+                    &request.session_id,
+                    &origin,
+                    chrono::Utc::now(),
+                )
+                .await
                 {
                     tracing::warn!(
                         agent_id = %employee.id,
@@ -1881,11 +1978,25 @@ mod tests {
         async fn hvals(&self, _k: &str) -> SFResult<Vec<String>> {
             unreachable!("名册按字段读")
         }
-        async fn hgetall(&self, _k: &str) -> SFResult<Vec<(String, String)>> {
-            unreachable!("名册按字段读")
+        async fn hgetall(&self, key: &str) -> SFResult<Vec<(String, String)>> {
+            // 绑定的第一步要按会话反查名册那一行，所以这张 hash 得读得回来。
+            Ok(self
+                .fields
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((k, _), _)| k == key)
+                .map(|((_, f), v)| (f.clone(), v.clone()))
+                .collect())
         }
-        async fn hlen(&self, _k: &str) -> SFResult<u64> {
-            unreachable!("名册按字段读")
+        async fn hlen(&self, key: &str) -> SFResult<u64> {
+            Ok(self
+                .fields
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(k, _)| k == key)
+                .count() as u64)
         }
     }
 
@@ -1899,9 +2010,14 @@ mod tests {
         let employee = employee_named(Some("inst-7f3a"), "conv-1");
         let first = chrono::Utc::now() - chrono::TimeDelta::hours(2);
 
-        note_person(&kv, &employee, "conv-1", first).await.unwrap();
+        let origin = PersonOrigin::default();
+        note_person(&kv, &employee, "conv-1", &origin, first)
+            .await
+            .unwrap();
         let later = first + chrono::TimeDelta::minutes(5);
-        note_person(&kv, &employee, "conv-1", later).await.unwrap();
+        note_person(&kv, &employee, "conv-1", &origin, later)
+            .await
+            .unwrap();
 
         let row: cog_gateway::agents::PersonRow =
             serde_json::from_str(&kv.stored(&employee.id)).expect("名册那一行要读得回来");
@@ -1909,5 +2025,90 @@ mod tests {
         assert_eq!(row.last_seen, later);
         assert_eq!(row.session_id, "conv-1");
         assert_eq!(row.display_name, employee.handle);
+    }
+
+    /// 滚一次 Pod 不换人。
+    ///
+    /// 名字是「实例指纹 ＋ 会话」算出来的，指纹随每次滚动变化，于是同一个会话
+    /// 换一个实例接手就变成一个从没见过的员工——2026-11-07 界面上「工作台」与
+    /// 「员工」两处读同一份名册却看到不同的人，一半原因在这里。绑定把第一次见面
+    /// 的那个人钉在会话上。
+    #[tokio::test]
+    async fn a_session_keeps_its_person_after_the_instance_fingerprint_changes() {
+        let store = Arc::new(FakePeople::default());
+        let kv: Arc<dyn cog_core::KeyValueStore> = store;
+
+        let first = bound_employee(&kv, Some("inst-7f3a"), "conv-1").await;
+        // 同一个会话，另一个实例接手：指纹不同，按会话重算会算出另一个人。
+        let unbound_after_roll = employee_named(Some("inst-9c02"), "conv-1");
+        assert_ne!(
+            unbound_after_roll.id, first.id,
+            "这条判据的前提是重算会换名；指纹已经不参与名字了，得换个前提"
+        );
+
+        let after_roll = bound_employee(&kv, Some("inst-9c02"), "conv-1").await;
+
+        assert_eq!(after_roll.id, first.id);
+        assert_eq!(after_roll.handle, first.handle);
+    }
+
+    /// 升级之前说过话的会话，第一轮认它原来的那一行，不新发一个人。
+    ///
+    /// 绑定表是后加的：老会话没有这一行，而它的名册行就是它的人。认不出这一步，
+    /// 升级之后同一个会话会在名单上变成两个名字。
+    #[tokio::test]
+    async fn a_session_that_spoke_before_binding_existed_keeps_its_roster_person() {
+        let store = Arc::new(FakePeople::default());
+        let kv: Arc<dyn cog_core::KeyValueStore> = store;
+        let older = employee_named(Some("inst-aaaa"), "conv-1");
+        note_person(
+            &*kv,
+            &older,
+            "conv-1",
+            &PersonOrigin::default(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        // 升级之后接手的是另一个实例：按会话重算会得到另一个人。
+        let employee = bound_employee(&kv, Some("inst-bbbb"), "conv-1").await;
+
+        assert_eq!(employee.id, older.id);
+        assert_eq!(employee.handle, older.handle);
+    }
+
+    /// 名册那一行记着这个人从哪儿来，且不会被一轮没声明来源的话擦掉。
+    ///
+    /// 名字是哈希出来的，读的人从名字上分不出「有人坐在这儿聊」和「一个探针开了
+    /// 一个会话、说了一句、再也没回来」。来源只在新的一轮说得出口时覆盖，否则
+    /// 一个老客户端接上来的第一句话就把「web」擦成「不知道」。
+    #[tokio::test]
+    async fn a_people_row_keeps_the_origin_it_was_first_seen_from() {
+        let kv = FakePeople::default();
+        let employee = employee_named(Some("inst-7f3a"), "conv-1");
+        let at = chrono::Utc::now();
+        let web = PersonOrigin {
+            platform: Some("web".into()),
+            device_id: Some("device-1".into()),
+        };
+
+        note_person(&kv, &employee, "conv-1", &web, at)
+            .await
+            .unwrap();
+        note_person(
+            &kv,
+            &employee,
+            "conv-1",
+            &PersonOrigin::default(),
+            at + chrono::TimeDelta::minutes(5),
+        )
+        .await
+        .unwrap();
+
+        let row: cog_gateway::agents::PersonRow =
+            serde_json::from_str(&kv.stored(&employee.id)).expect("名册那一行要读得回来");
+        assert_eq!(row.platform.as_deref(), Some("web"));
+        assert_eq!(row.device_id.as_deref(), Some("device-1"));
     }
 }

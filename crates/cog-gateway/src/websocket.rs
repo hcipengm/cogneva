@@ -76,6 +76,10 @@ async fn handle_type_message(
     user_id: &str,
     text: &str,
     out_tx: &tokio::sync::mpsc::Sender<String>,
+    // 握手时自报的平台与设备。转发进这一轮，落到「说过话的人」那一行上——
+    // 名字是哈希出来的，名单上要分得出人和探针只有这一格。
+    platform: Option<&str>,
+    device_id: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -127,8 +131,13 @@ async fn handle_type_message(
             let out = out_tx.clone();
             let session = session_id.unwrap_or_else(|| "default".into());
             let owner = user_id.to_string();
+            let platform = platform.map(str::to_string);
+            let device_id = device_id.map(str::to_string);
             tokio::spawn(async move {
-                crate::chat::run_chat_turn(state, out, session, content, owner).await;
+                crate::chat::run_chat_turn(
+                    state, out, session, content, owner, platform, device_id,
+                )
+                .await;
             });
         }
     }
@@ -211,8 +220,8 @@ pub async fn handle_socket(
         mgr.register(
             connection_id.clone(),
             user_id.clone(),
-            device_id,
-            platform,
+            device_id.clone(),
+            platform.clone(),
             app_version,
         )
         .await;
@@ -330,6 +339,8 @@ pub async fn handle_socket(
                                 &user_id,
                                 &text,
                                 &out_tx,
+                                platform.as_deref(),
+                                device_id.as_deref(),
                             )
                             .await
                         {
