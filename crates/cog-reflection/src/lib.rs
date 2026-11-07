@@ -2466,6 +2466,54 @@ mod tests {
             }));
         (engine, submissions, goals, tasks)
     }
+
+    /// principle: feedback_gate_asked_before_its_answer_exists
+    ///
+    /// 门禁在上游结论存在之前求值 ⇒ 它挡的那笔代价照付。
+    ///
+    /// The gate is armed in `init` and its orchestrator slot — the upstream
+    /// conclusion it waits on — is only filled in `start`. A refusal that
+    /// arrives inside that window is answered `NoExecutor`, and the answer is
+    /// taken before the conclusion exists. What it blocked is still a cost:
+    /// the requirement had no way out, and an answer that left no trace would
+    /// be the silent drop this branch is most likely to have. So the empty
+    /// slot is counted, not skipped — the gate answers early, and the price of
+    /// what it stopped is paid into the reading all the same.
+    #[tokio::test]
+    async fn a_gate_asked_before_its_conclusion_still_pays_what_it_blocked() {
+        let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
+        let engine = ReflectionEngine::new_in_memory(registry);
+        // Armed to own submission, and deliberately never given an
+        // orchestrator: the gate is asked while its conclusion is still absent.
+        engine.rework.arm();
+
+        let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
+        engine
+            .record_change_refusal(
+                "c-early",
+                cog_core::RejectionCause::TestsFailed,
+                &files,
+                "boom",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .rework
+                .count(crate::change_rework::ChangeReworkOutcome::NoExecutor),
+            1,
+            "the gate answered before its conclusion existed, and the requirement it \
+             stopped is a counted cost rather than a silent drop"
+        );
+        assert_eq!(
+            engine
+                .rework
+                .count(crate::change_rework::ChangeReworkOutcome::Submitted),
+            0,
+            "nothing can have been submitted: the executor did not exist yet"
+        );
+    }
 }
 
 /// 这棵树的根：一份算法，全仓共用。
