@@ -555,7 +555,11 @@ impl CacheSlot for Exclusion {
     }
 
     async fn take(&self) -> Option<Box<dyn Send + Sync>> {
-        match self.0.try_acquire_exclusive("build-cache-reclaim").await {
+        match self
+            .0
+            .try_acquire_exclusive(BUILD_CACHE_RECLAIM_ASKER)
+            .await
+        {
             Ok(permit) => Some(Box::new(permit)),
             Err(_) => None,
         }
@@ -575,7 +579,11 @@ impl ProcessGate for RegisteredGate {
     /// and a pass excludes itself from all of them rather than from one,
     /// because the files it deletes are ones any build could be reading.
     async fn take_for_reclaim(&self) -> Option<Box<dyn Send + Sync>> {
-        match self.0.try_acquire_exclusive("build-cache-reclaim").await {
+        match self
+            .0
+            .try_acquire_exclusive(BUILD_CACHE_RECLAIM_ASKER)
+            .await
+        {
             Ok(permit) => Some(Box::new(permit)),
             Err(_) => None,
         }
@@ -2000,6 +2008,14 @@ impl RefusedBy {
 /// cell, which is what it is. The table is the whole of the vocabulary, so a
 /// caller that starts asking under new words is a reader's problem and not a
 /// silent one: the unnamed cell moves.
+/// The words a cache sweep asks under.
+///
+/// Named here because two places have to agree on them: the exclusive slot the
+/// sweep takes (it excludes itself from every build) and this gate's rule that a
+/// sweep claims no turn on the next build. Two literals meant to be one name is
+/// how the second rule silently stops applying to the sweep it was written for.
+pub const BUILD_CACHE_RECLAIM_ASKER: &str = "build-cache-reclaim";
+
 pub const BUILD_GATE_ASKERS: [(&str, &str); 10] = [
     ("evolution build", "evolution_build"),
     ("baseline evaluation", "baseline_evaluation"),
@@ -2009,7 +2025,7 @@ pub const BUILD_GATE_ASKERS: [(&str, &str); 10] = [
     ("registry gc reissue", "registry_gc_reissue"),
     ("registry maintenance", "registry_maintenance"),
     ("buildah store reclaim", "buildah_store_reclaim"),
-    ("build-cache-reclaim", "build_cache_reclaim"),
+    (BUILD_CACHE_RECLAIM_ASKER, "build_cache_reclaim"),
     // The host's own builder asks through the same files from outside this
     // process tree; its refusals are counted here like any other work's, and
     // without this row they were the one refusal in the reading that named no
@@ -3404,7 +3420,20 @@ impl BuildGate {
                 // without anything to reclaim for. A shared lock is how the two
                 // are told apart: it is compatible with the shared locks builds
                 // hold and refused by the exclusive lock an exclusion holds.
-                if lock_claim_shared(&self.dir).is_some() {
+                //
+                // A cache sweep claims no turn either. Its work is deferrable —
+                // a cache a while over its cap loses no build, and the alert for
+                // a run that never ends is read by a person — while the work it
+                // would stand in front of is the one that produces the artifact.
+                // 实测 2026-11-07: the sweep took the next build every walk for
+                // eighty minutes while `build-cache-reclaim` held it, and the
+                // mainline advance stood down on eight rounds (six `waited_out`,
+                // two `queue_ahead`) with mainline CI green and nothing rolled;
+                // 本机实测 2026-11-07：the sweep had already reclaimed 26 GB. A sweep
+                // that finds the field taken comes back on its next walk, and
+                // `WALK_YIELD_LIMIT` still lets it take the field over a build's
+                // reservation after two yields, so it is not starving either.
+                if lock_claim_shared(&self.dir).is_some() && what != BUILD_CACHE_RECLAIM_ASKER {
                     self.reserve_build_field(what);
                 }
                 tracing::warn!(
@@ -5477,6 +5506,47 @@ mod tests {
                 .is_ok(),
             "once the build is out, the field is the sweep's"
         );
+    }
+
+    /// A cache sweep that cannot take the field claims no turn on the next one.
+    ///
+    /// A sweep's work is deferrable: a cache a while over its cap loses no
+    /// build. The work it would stand in front of produces the artifact. 实测
+    /// 2026-11-07 on this host: the sweep claimed the next build on every walk
+    /// for eighty minutes, the mainline advance stood down on eight rounds (six
+    /// `waited_out`, two `queue_ahead`) with mainline CI green, and nothing
+    /// rolled -- while 本机实测 2026-11-07：the sweep had already reclaimed 26 GB. The
+    /// other half is the same reading: a build-side asker refused while a build
+    /// runs does claim that turn, because the claim is what keeps back-to-back
+    /// builds from starving it -- and `WALK_YIELD_LIMIT` still lets the sweep
+    /// take the field over such a claim after two yields.
+    #[tokio::test]
+    async fn a_refused_sweep_claims_no_turn_on_the_next_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let running = gate.try_acquire("a build that is running").await.unwrap();
+
+        let refused = gate.try_acquire_exclusive(BUILD_CACHE_RECLAIM_ASKER).await;
+        assert!(refused.is_err(), "a build holds the field");
+        assert_eq!(
+            gate.reservation().map(|(holder, _)| holder),
+            None,
+            "a refused sweep claimed the next build; the work it stands in front of is the \
+             one that produces the artifact, and the sweep comes back on its own walk"
+        );
+        drop(running);
+
+        // The build-side half: the same refusal does claim the turn there.
+        let running = gate.try_acquire("a build that is running").await.unwrap();
+        let refused = gate.try_acquire_exclusive("mainline advance").await;
+        assert!(refused.is_err(), "a build holds the field");
+        assert_eq!(
+            gate.reservation().map(|(holder, _)| holder),
+            Some("mainline advance".to_string()),
+            "a build-side asker refused while a build runs has to claim the next build, or \
+             back-to-back builds starve it"
+        );
+        drop(running);
     }
 
     /// The exclusion is a promise about *builds*, and it has to hold at every
