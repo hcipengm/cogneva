@@ -1977,6 +1977,14 @@ impl RefusedBy {
     }
 }
 
+/// The words a cache sweep asks under.
+///
+/// Named here because two places have to agree on them: the exclusive slot the
+/// sweep takes (it excludes itself from every build) and this gate's rule that a
+/// sweep claims no turn on the next build. Two literals meant to be one name is
+/// how the second rule silently stops applying to the sweep it was written for.
+pub const BUILD_CACHE_RECLAIM_ASKER: &str = "build-cache-reclaim";
+
 /// The works that ask this gate for a slot, and the value each is counted
 /// under.
 ///
@@ -2008,14 +2016,6 @@ impl RefusedBy {
 /// cell, which is what it is. The table is the whole of the vocabulary, so a
 /// caller that starts asking under new words is a reader's problem and not a
 /// silent one: the unnamed cell moves.
-/// The words a cache sweep asks under.
-///
-/// Named here because two places have to agree on them: the exclusive slot the
-/// sweep takes (it excludes itself from every build) and this gate's rule that a
-/// sweep claims no turn on the next build. Two literals meant to be one name is
-/// how the second rule silently stops applying to the sweep it was written for.
-pub const BUILD_CACHE_RECLAIM_ASKER: &str = "build-cache-reclaim";
-
 pub const BUILD_GATE_ASKERS: [(&str, &str); 10] = [
     ("evolution build", "evolution_build"),
     ("baseline evaluation", "baseline_evaluation"),
