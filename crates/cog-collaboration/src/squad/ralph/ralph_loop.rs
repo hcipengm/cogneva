@@ -58,6 +58,21 @@ pub enum RalphVerdict {
         iterations: u32,
         history: Vec<RalphIteration>,
     },
+    /// 上游池停供，这一轮**没有开始**。
+    ///
+    /// 与 `Unrecoverable` 分开是为了不把断供记成对这份工作的判决：同一个断言
+    /// 每一轮都会得到同一个结果，而断供是环境的事，闸抬起来就该从下一轮接着
+    /// 跑。合成一类，判词面就只能看到"这件活不行了"，而下一次重驱仍会撞同一
+    /// 堵墙——2026-11-07 实测：池判定 15:04 落下、15:50 抬起，中间 46 分钟里
+    /// 仍有约 660 轮打在同一个不通的面上，一半当场失败并各写一条事件。
+    ///
+    /// `iterations` 是这一任已经跑完的轮数，`history` 原样带回：调用方据此知道
+    /// 工作停在哪里，而不是从零再来。
+    Paused {
+        reason: String,
+        iterations: u32,
+        history: Vec<RalphIteration>,
+    },
 }
 
 /// Ralph Loop 单次迭代记录。
@@ -167,7 +182,10 @@ const RALPH_HISTORY_FIELD: &str = "ralph_history";
 /// archive. The board holds the tail because that is all a restart consumes;
 /// this channel is append-only and keeps the whole sequence, which is what
 /// post-hoc root-cause analysis of a non-converging run needs.
-pub const RALPH_ITERATION_EVENT: &str = "ralph_iteration";
+/// Re-exported from the contract: the same word is read by the reading that
+/// joins these rounds to the changes they belong to, and two spellings of one
+/// event type disagree silently by finding no rows.
+pub use cog_core::contract::change_ledger::RALPH_ITERATION_EVENT;
 
 /// Read back a task's archived iterations, oldest first. `limit` bounds one
 /// call because the event store has no streaming read, and a re-driven task
@@ -239,6 +257,13 @@ pub struct RalphLoop {
     /// 名字分目录，同一个任务在另一个进程里重新开跑时必须落到另一个目录里，
     /// 否则一个人半路死掉的检出就成了另一个人的起点。
     run_nonce: String,
+    /// 上游池的暂停开关。
+    ///
+    /// 这条循环此前不看任何闸：上游断供时它照样一轮一轮地重装弹，每一轮都撞
+    /// 同一个面、写一条失败。而闸本来就在（调度器按 `TaskClass::LlmDependent`
+    /// 发的那一个），只是没人问它。没有闸对象时不改变任何行为——一个不认识
+    /// 这道闸的进程，与从前一模一样。
+    pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 }
 
 impl Default for RalphLoop {
@@ -250,6 +275,7 @@ impl Default for RalphLoop {
             task_id: None,
             state_backend: None,
             run_nonce: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
+            pause_gate: None,
         }
     }
 }
@@ -269,6 +295,23 @@ impl RalphLoop {
     pub fn with_llm_provider(mut self, llm: Arc<dyn cog_core::LlmClient>) -> Self {
         self.llm_provider = Some(llm);
         self
+    }
+
+    /// 让这条循环认识上游池的暂停开关。
+    ///
+    /// 问的是 `TaskClass::LlmDependent` 这一格，不是全局那一格：这条循环的每一
+    /// 轮都要调模型，所以池停供就是它的全部依赖停供；而构建、部署、读数这些
+    /// 不受池影响的活由全局闸那一侧管，不从这里过。
+    pub fn with_pause_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
+        self.pause_gate = Some(gate);
+        self
+    }
+
+    /// 这一轮能不能开工。没有闸对象的进程与从前一样，永远能开工。
+    fn paused_reason(&self) -> Option<&'static str> {
+        let gate = self.pause_gate.as_ref()?;
+        gate.is_paused_kind(cog_core::TaskClass::LlmDependent)
+            .then_some("llm_pool_paused: 上游池当前没有可用成员，这一轮没有开始")
     }
 
     /// Name the task this loop works on behalf of, so what it spends on the
@@ -571,6 +614,16 @@ impl RalphLoop {
 
         // 与 Pipeline/Roundtable 同构：预算属于本次执行，历史只提供反馈与停滞证据。
         for iteration in 1..=self.config.max_iterations {
+            // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
+            // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
+            // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
+            if let Some(reason) = self.paused_reason() {
+                return RalphVerdict::Paused {
+                    reason: reason.to_string(),
+                    iterations: iteration - 1,
+                    history: self.history.clone(),
+                };
+            }
             crate::observable::global_observable().record_round();
             if iteration > 1 {
                 context["ralph_iteration"] = serde_json::json!(iteration);
@@ -771,6 +824,16 @@ impl RalphLoop {
         // 起算点跟着历史走曾让预算变成目标的终身配额——攒满之后每次重驱
         // 都瞬间"耗尽"且一轮都不跑，连已经能通过的目标也被永久判死。
         for iteration in 1..=self.config.max_iterations {
+            // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
+            // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
+            // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
+            if let Some(reason) = self.paused_reason() {
+                return RalphVerdict::Paused {
+                    reason: reason.to_string(),
+                    iterations: iteration - 1,
+                    history: self.history.clone(),
+                };
+            }
             crate::observable::global_observable().record_round();
             if iteration > 1 {
                 context["ralph_iteration"] = serde_json::json!(iteration);
@@ -894,6 +957,16 @@ impl RalphLoop {
 
         // 与 Pipeline 同构：预算属于本次执行，历史只提供反馈与停滞证据。
         for iteration in 1..=self.config.max_iterations {
+            // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
+            // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
+            // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
+            if let Some(reason) = self.paused_reason() {
+                return RalphVerdict::Paused {
+                    reason: reason.to_string(),
+                    iterations: iteration - 1,
+                    history: self.history.clone(),
+                };
+            }
             crate::observable::global_observable().record_round();
             if iteration > 1 {
                 context["ralph_iteration"] = serde_json::json!(iteration);
@@ -1592,6 +1665,89 @@ mod tests {
     fn pass_evaluator() -> MockAgent {
         MockAgent {
             response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
+        }
+    }
+
+    /// 只认得"上游池停供"这一格的闸，把两个方向都记下来。
+    ///
+    /// 真实那道闸在调度侧，这里只需要它答得对一件事：问的是
+    /// `TaskClass::LlmDependent`，答出来的是不是"停着"。
+    struct PoolSwitch(std::sync::atomic::AtomicBool);
+
+    impl cog_core::SchedulerGate for PoolSwitch {
+        fn is_paused(&self) -> bool {
+            false
+        }
+        fn pause(&self) -> bool {
+            false
+        }
+        fn resume(&self) -> bool {
+            false
+        }
+        fn is_paused_kind(&self, _class: cog_core::TaskClass) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn pause_kind(&self, _class: cog_core::TaskClass) -> bool {
+            self.0.swap(true, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn resume_kind(&self, _class: cog_core::TaskClass) -> bool {
+            self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// 闸落下时一轮都不开。
+    ///
+    /// 没有这道闸时，这条循环在上游停供的 46 分钟里照样一轮一轮地重装弹：
+    /// 2026-11-07 实测每 10 分钟 100～174 轮，一半当场失败并各写一条事件。
+    /// 断言的是"一轮都没跑"，不是"最后一轮判词是什么"——后者在循环照跑时
+    /// 也可能碰巧是同一个字符串。
+    #[tokio::test]
+    async fn a_paused_pool_keeps_the_loop_from_starting_a_round() {
+        let gate = Arc::new(PoolSwitch(std::sync::atomic::AtomicBool::new(true)));
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 10,
+            ..Default::default()
+        })
+        .with_pause_gate(gate.clone());
+        let planner = PlannerActor::new(Arc::new(pass_planner()));
+
+        let verdict = ralph
+            .run_plan("decompose the goal", serde_json::json!({}), &planner)
+            .await;
+
+        match verdict {
+            RalphVerdict::Paused { iterations, .. } => assert_eq!(
+                iterations, 0,
+                "闸落下时一轮都不该跑：跑过的轮数会被记成轮次事件"
+            ),
+            other => panic!("停供不该被读成对这份工作的判决，实际是 {:?}", other),
+        }
+    }
+
+    /// 闸抬起来之后同一条循环照常开工——暂停不是终局判定。
+    #[tokio::test]
+    async fn the_same_loop_runs_again_once_the_pool_comes_back() {
+        let gate = Arc::new(PoolSwitch(std::sync::atomic::AtomicBool::new(true)));
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 10,
+            ..Default::default()
+        })
+        .with_pause_gate(gate.clone());
+        let planner = PlannerActor::new(Arc::new(pass_planner()));
+
+        let paused = ralph
+            .run_plan("decompose the goal", serde_json::json!({}), &planner)
+            .await;
+        assert!(matches!(paused, RalphVerdict::Paused { .. }));
+
+        // 抬闸走 trait 方法，而这一层只用全限定名实现过 trait，名字不在作用域里。
+        cog_core::SchedulerGate::resume_kind(gate.as_ref(), cog_core::TaskClass::LlmDependent);
+        let resumed = ralph
+            .run_plan("decompose the goal", serde_json::json!({}), &planner)
+            .await;
+        match resumed {
+            RalphVerdict::Passed { iterations, .. } => assert_eq!(iterations, 1),
+            other => panic!("闸抬起后该照常通过，实际是 {:?}", other),
         }
     }
 

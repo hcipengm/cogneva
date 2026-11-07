@@ -2495,6 +2495,44 @@ export async function getGovernanceChanges(): Promise<ChangesPage> {
   return api.get<ChangesPage>('/api/v1/governance/changes');
 }
 
+/**
+ * 一天里「尝试 → 落地」这一条漏斗。
+ *
+ * 两个来源拼在同一天上：`attempted`/`rounds`/`passed` 数的是智能体自己的尝试
+ * 事件，`landed` 数的是账上真的落了地的那一头。同一个数不能两边都算——
+ * 所以 `attempted` 是去重过的变更条数，不是叠上去的总数。
+ */
+export interface ChangeFunnelDay {
+  /** UTC 日，`YYYY-MM-DD`。 */
+  day: string;
+  /** 这一天动过的变更条数（去重）。 */
+  attempted: number;
+  /** 这一天跑掉的轮数（同一条变更反复尝试会叠）。 */
+  rounds: number;
+  /** 这些轮里判定通过的数量。 */
+  passed: number;
+  /** 这一天真的变成变更的条数。 */
+  landed: number;
+  /** 落地里带交付 rev 的条数——有 rev 才算真上线，不是只记了一笔。 */
+  landed_with_rev: number;
+  /**
+   * 这一天网关服务出去的模型调用数，**所有调用方**都算（反思、评估、发现也在内）。
+   * 交付比的分子就是它。`null` 表示这一天没读到用量表——不是 0 次调用。
+   */
+  llm_calls: number | null;
+  /** 这一天买的 token 数（输入＋输出）。`null` 的含义同上。 */
+  tokens: number | null;
+}
+
+export interface ChangeFunnel {
+  /** 旧的在前，与账本自己的顺序一致；页面要新的在前时自己翻。 */
+  days: ChangeFunnelDay[];
+}
+
+export async function getChangeFunnel(days = 14): Promise<ChangeFunnel> {
+  return api.get<ChangeFunnel>(`/api/v1/governance/changes/funnel?days=${days}`);
+}
+
 // ── 三本账的一拍进度 ──
 
 /** 一个 unit 还答不答话。三档：`unreadable` 是「这一拍没问出答案」，不是「不在」。 */

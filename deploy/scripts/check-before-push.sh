@@ -175,9 +175,21 @@ if [ "${ran}" -eq 0 ]; then
 fi
 
 # 脚本测试：CI 用同一个 glob 跑，这里照抄它的形状而不是列名字。
+#
+# 跑它们之前先把 **git 的定位变量**从环境里摘掉。这条门本身由 pre-push 钩子拉起，
+# 钩子里的 git 会把 `GIT_DIR`/`GIT_WORK_TREE` 指向**调用方那棵树**；而下面这些测试
+# 各自 `git init` 一个夹具仓库，定位变量在手上时 `git init --bare <夹具>` 落的是
+# 那棵共享树——它被重新初始化成裸库，`core.bare` 翻成 true，之后每一个工作树里的
+# git 命令都报 "must be run in a work tree"，钩子返回时提交写不进去。
+# 2026-11-07 实测：这笔提交卡在钩子里两次，真凶是 `branch-convergence.test.sh`
+# 的 `git init --bare`。夹具测试要的是**自己的**仓库，摘掉定位变量就是它们本来的
+# 意思；CI 里没有这两个变量，摘掉等于不摘。
+git_locators=(-u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY
+              -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE
+              -u GIT_PREFIX)
 mapfile -t script_tests < <(printf '%s\n' deploy/scripts/tests/*.test.sh .github/scripts/tests/*.test.sh)
 for t in "${script_tests[@]}"; do
-    run_step "${t}" bash "${t}"
+    run_step "${t}" env "${git_locators[@]}" bash "${t}"
 done
 
 # 容量登记表：`crates/cogneva/tests/rust_capacity_constants_registry_test.rs` 是**唯一**

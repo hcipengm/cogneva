@@ -952,6 +952,9 @@ impl cog_core::ChangeLedgerStore for ScriptedLandedShare {
     async fn census(&self) -> cog_core::SFResult<Vec<(cog_core::ChangeState, u64)>> {
         unimplemented!("准入只问落地占比")
     }
+    async fn funnel(&self, _days: u32) -> cog_core::SFResult<Vec<cog_core::ChangeFunnelDay>> {
+        unimplemented!("准入只问落地占比")
+    }
     async fn record_dispatch_state(
         &self,
         _state: &cog_core::DispatchState,

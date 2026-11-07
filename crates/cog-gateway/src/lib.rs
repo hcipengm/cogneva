@@ -1104,6 +1104,13 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/governance/changes",
             get(governance::changes_handler),
         )
+        // 尝试到落地这一条梯子：账本里「有多少条」是累计的，答不了「今天试了
+        // 多少、落了多少」。累计计数里没落地的那些条不留痕迹，所以那一天的
+        // 产出只能从事件流里逐日读回来。
+        .route(
+            "/api/v1/governance/changes/funnel",
+            get(governance::changes_funnel_handler),
+        )
         .route(
             "/api/v1/governance/changes/events",
             get(governance::change_timeline_handler),

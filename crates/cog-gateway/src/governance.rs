@@ -519,6 +519,73 @@ pub async fn changes_handler(
     }))
 }
 
+/// What `GET /api/v1/governance/changes/funnel` takes.
+#[derive(Debug, Deserialize)]
+pub struct ChangeFunnelQuery {
+    /// How many UTC days back to read. The store answers with the days it has
+    /// and never pads a missing one with zeroes, so a caller that asks for more
+    /// than the account has lived gets a shorter series rather than a series
+    /// whose first half claims nothing happened.
+    #[serde(default = "default_funnel_days")]
+    pub days: u32,
+}
+
+/// A fortnight: long enough to see a week's shape twice, short enough that the
+/// query stays inside the event table's hot window.
+fn default_funnel_days() -> u32 {
+    14
+}
+
+/// The attempt-to-landing ladder, one row per UTC day.
+///
+/// Separate from `changes_handler` because the two answer questions that must
+/// not be confused: that one says what the account *holds*, this one says what
+/// it *did*. A cumulative census cannot yield the second -- a day on which
+/// nothing landed and a day on which a thousand did leave the same mark on it.
+#[derive(Debug, Serialize)]
+pub struct ChangeFunnelResponse {
+    pub days: Vec<FunnelDayView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FunnelDayView {
+    pub day: String,
+    pub attempted: u64,
+    pub rounds: u64,
+    pub passed: u64,
+    pub landed: u64,
+    pub landed_with_rev: u64,
+    /// `null` when the usage table could not be read -- not `0`.
+    pub llm_calls: Option<u64>,
+    /// `null` when the usage table could not be read -- not `0`.
+    pub tokens: Option<u64>,
+}
+
+pub async fn changes_funnel_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<ChangeFunnelQuery>,
+) -> Result<Json<ChangeFunnelResponse>, ApiError> {
+    // Absent store is a failure, not an empty series: an empty series would be
+    // the claim that no day had any activity.
+    let ledger = changes(&state)?;
+    let days = ledger.funnel(q.days).await?;
+    Ok(Json(ChangeFunnelResponse {
+        days: days
+            .into_iter()
+            .map(|d| FunnelDayView {
+                day: d.day,
+                attempted: d.attempted,
+                rounds: d.rounds,
+                passed: d.passed,
+                landed: d.landed,
+                landed_with_rev: d.landed_with_rev,
+                llm_calls: d.llm_calls,
+                tokens: d.tokens,
+            })
+            .collect(),
+    }))
+}
+
 /// What `GET /api/v1/governance/changes/events` takes.
 ///
 /// The identity arrives in its three parts, never as the rendered key: the key

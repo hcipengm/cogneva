@@ -132,6 +132,8 @@ pub struct SquadExecutor {
     local_repair_max: Option<u32>,
     /// 阶段产物的持久化存储。None = 只留在内存里，运行一断就没了。
     stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
+    /// 上游池的暂停开关。None = 这个进程不认识那道闸，行为与从前一样。
+    pub(crate) pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 }
 
 /// Optional service dependencies shared by squad execution stages.
@@ -152,6 +154,8 @@ pub(crate) struct SquadDeps {
     pub local_repair_max: Option<u32>,
     /// 阶段产物的持久化存储。None = 只留在内存里。
     pub stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
+    /// 上游池的暂停开关，原样交给每一条 Ralph 循环。
+    pub pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 }
 
 /// 给流水线挂上阶段产物的记录位置。
@@ -272,6 +276,12 @@ impl SquadExecutor {
         self
     }
 
+    /// 让这个执行器认识上游池的暂停开关：池停供时循环不再开新轮。
+    pub fn with_pause_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
+        self.pause_gate = Some(gate);
+        self
+    }
+
     /// 直接执行一个 Squad，返回执行结果。
     pub async fn execute_squad(&self, task_id: String, config: SquadConfig) -> SquadResult {
         let squad_id = cog_core::squad_id_for(&task_id);
@@ -329,6 +339,7 @@ impl SquadExecutor {
             ralph: self.ralph,
             local_repair_max: self.local_repair_max,
             stage_store: self.stage_store.clone(),
+            pause_gate: self.pause_gate.clone(),
         };
         let result = Self::run_squad_with_retries(squad, deps).await;
         let squad_latency_ms = squad_start.elapsed().as_millis() as u64;
@@ -833,6 +844,9 @@ impl SquadExecutor {
         if let Some(ref backend) = deps.state_backend {
             ralph = ralph.with_history_store(squad.task_id.clone(), backend.clone());
         }
+        if let Some(ref gate) = deps.pause_gate {
+            ralph = ralph.with_pause_gate(gate.clone());
+        }
 
         // 若 Squad 已携带快照，先从后端恢复
         if let (Some(ref backend), Some(ref snap_id)) = (&object_backend, &squad.snapshot_id) {
@@ -856,6 +870,23 @@ impl SquadExecutor {
         // === 尝试 1：初始 PGE 模式 ===
         squad.status = SquadStatus::Running;
         let verdict = Self::run_squad_once(&squad, &mut ralph, &deps).await;
+
+        // 闸落在这一层，不落到升级策略上：池停供时升到 Roundtable 只是换一个
+        // 同样要调模型的拓扑，再撞一次同一堵墙。暂停不是失败，所以这里不发
+        // `OnRalphUnrecoverable`、不写失败条目——那是给"这份活做不成"用的。
+        if let RalphVerdict::Paused { ref reason, .. } = verdict {
+            squad.status = SquadStatus::Failed;
+            let reflection = run_squad_reflection(squad_reflection, &verdict, &squad).await;
+            return SquadResult {
+                squad_id: squad.id,
+                success: false,
+                result: None,
+                retry_count: 0,
+                error: Some(reason.clone()),
+                pge_mode: squad.config.pge_mode,
+                reflection,
+            };
+        }
 
         if let RalphVerdict::Passed { ref result, .. } = verdict {
             squad.status = SquadStatus::Complete;
@@ -1050,6 +1081,21 @@ impl SquadExecutor {
                     reflection: reflection2,
                 }
             }
+            // 升级后的这一趟也可能在开轮之前撞上闸（池在这一次执行中间停供）。
+            // 与上面那一处同义：不写不可修复、不发 hook，原因是环境的事。
+            RalphVerdict::Paused { ref reason, .. } => {
+                squad.status = SquadStatus::Failed;
+                let reflection2 = run_squad_reflection(squad_reflection, &verdict2, &squad).await;
+                SquadResult {
+                    squad_id: squad.id,
+                    success: false,
+                    result: None,
+                    retry_count: 1,
+                    error: Some(reason.clone()),
+                    pge_mode: squad.config.pge_mode,
+                    reflection: reflection2,
+                }
+            }
         }
     }
 }
@@ -1064,6 +1110,11 @@ fn build_contributions_from_verdict(
     verdict: &RalphVerdict,
     squad_id: &str,
 ) -> Vec<cog_core::AgentSquadContribution> {
+    // 暂停的循环没有任何贡献可交：这一轮没有开始，历史里那份快照是上一轮的。
+    // 照它写学习就是拿旧结论冒充新观察——断供期间每一轮都会这么冒充一次。
+    if matches!(verdict, RalphVerdict::Paused { .. }) {
+        return Vec::new();
+    }
     let (snapshot, unrecoverable_reason) = match verdict {
         RalphVerdict::Passed { result, .. } => (result.clone(), None),
         RalphVerdict::Unrecoverable {
@@ -1074,6 +1125,16 @@ fn build_contributions_from_verdict(
                 .map(|h| h.snapshot.clone())
                 .unwrap_or(serde_json::Value::Null),
             Some(reason.clone()),
+        ),
+        // 暂停不带判词：这一轮根本没跑过，历史里那一份是**上一轮**的产物，
+        // 拿它当"这一轮的结果"会把断供期间的停滞记成这份活的退步。学习层因此
+        // 什么都不收——断供不是对工作的判决。
+        RalphVerdict::Paused { history, .. } => (
+            history
+                .last()
+                .map(|h| h.snapshot.clone())
+                .unwrap_or(serde_json::Value::Null),
+            None,
         ),
     };
 
@@ -1291,6 +1352,11 @@ async fn run_squad_reflection(
     squad: &Squad,
 ) -> Option<cog_core::SquadReflectionResult> {
     let reflection = squad_reflection.as_ref()?;
+    // 暂停的循环没有可反思的东西：这一轮没有开始，贡献表是空的，而反思本身
+    // 多半又是一次模型调用——断供期间发出去只会再撞一次同一堵墙。
+    if matches!(verdict, RalphVerdict::Paused { .. }) {
+        return None;
+    }
     let contributions = build_contributions_from_verdict(verdict, &squad.id);
     match reflection
         .reflect(&squad.id, &squad.task_id, &contributions, squad.retry_count)

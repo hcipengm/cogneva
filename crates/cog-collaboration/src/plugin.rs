@@ -146,6 +146,12 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             if let Some(ref backend) = state_backend {
                 collab = collab.with_state_backend(backend.clone());
             }
+            // 池停供时这条执行器手里的 Ralph 循环不再开新轮。闸由 supervisor
+            // 发布，而它不是本插件的 `requires`——两者落在同一层、并发 init，
+            // 现在读它读到的是运气。句柄延后到第一次被问时才解析，那时所有
+            // init 都已结束；没有 supervisor 的部署取不到闸，行为与从前一样。
+            collab =
+                collab.with_pause_gate(Arc::new(crate::pause_gate::LateGate::new(ctx.clone())));
 
             ctx.publish_service::<dyn cog_core::TaskExecutor>(Arc::new(collab));
             info!("CollaborationPlugin CollaborationExecutor published");

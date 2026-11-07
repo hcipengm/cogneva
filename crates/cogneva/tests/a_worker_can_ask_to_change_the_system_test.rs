@@ -198,6 +198,10 @@ impl ChangeLedgerStore for DeclarationLog {
         unimplemented!("the proposer does not total the account")
     }
 
+    async fn funnel(&self, _days: u32) -> SFResult<Vec<cog_core::ChangeFunnelDay>> {
+        unimplemented!("the proposer does not read the ladder")
+    }
+
     async fn record_dispatch_state(&self, _state: &cog_core::DispatchState) -> SFResult<()> {
         unimplemented!("the proposer does not dispatch")
     }

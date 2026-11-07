@@ -47,6 +47,9 @@ pub struct CollaborationExecutor {
     /// 阶段产物的持久化存储；每个任务现建的 SquadExecutor 都要拿到它，
     /// 否则一次运行断在两条调用之间，已经付过费的计划和 diff 就跟着进程没了。
     stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
+    /// 上游池的暂停开关；每个任务现建的 SquadExecutor 都要拿到它，否则那条
+    /// 循环在上游停供期间照样一轮一轮地开新轮。
+    pause_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
     /// 原则账；生成端事前要看的那几条原则从这里按路径取。没有它时生成端
     /// 仍旧照跑——只是这一次没有任何一条项目原则被递进来，与「这个仓库没有
     /// 原则管着这些文件」不是一回事，所以缺它要留一条具名日志。
@@ -94,6 +97,7 @@ impl CollaborationExecutor {
             ralph: None,
             local_repair_max: None,
             stage_store: None,
+            pause_gate: None,
             principle_ledger: None,
             next_worker: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -218,6 +222,12 @@ impl CollaborationExecutor {
     /// 每个阶段产物在下一通调用之前记下来的位置。
     pub fn with_stage_store(mut self, store: Arc<dyn cog_core::PgeStageStore>) -> Self {
         self.stage_store = Some(store);
+        self
+    }
+
+    /// 让每条 Ralph 循环认识上游池的暂停开关。
+    pub fn with_pause_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
+        self.pause_gate = Some(gate);
         self
     }
 
@@ -511,6 +521,9 @@ impl CollaborationExecutor {
         if let Some(ref store) = self.stage_store {
             squad_executor = squad_executor.with_stage_store(store.clone());
         }
+        if let Some(ref gate) = self.pause_gate {
+            squad_executor = squad_executor.with_pause_gate(gate.clone());
+        }
 
         let result = squad_executor
             .execute_squad(
@@ -641,6 +654,9 @@ impl CollaborationExecutor {
         }
         if let Some(ref store) = self.stage_store {
             squad_executor = squad_executor.with_stage_store(store.clone());
+        }
+        if let Some(ref gate) = self.pause_gate {
+            squad_executor = squad_executor.with_pause_gate(gate.clone());
         }
 
         let mut context = Self::goal_context(task);

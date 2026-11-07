@@ -16,6 +16,7 @@ pub mod hierarchy;
 pub mod ipc;
 pub mod meta_features;
 pub mod observable;
+pub mod pause_gate;
 pub mod profile;
 pub mod resume;
 pub mod squad;

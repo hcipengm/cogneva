@@ -948,6 +948,72 @@ pub struct PoolWait {
     pub oldest_seconds: Option<u64>,
 }
 
+/// The id every change's hand-over is filed under, before the generation
+/// suffix a re-arm appends.
+///
+/// Shared vocabulary rather than a private detail of the dispatcher: the
+/// events a hand-over's rounds are filed under carry this same prefix, so any
+/// reading that wants to join rounds to changes reads it here instead of
+/// retyping it. Two copies of a wire prefix cannot disagree loudly -- they
+/// disagree silently, by finding nothing.
+pub const CHANGE_LEDGER_TASK_PREFIX: &str = "change-ledger-";
+
+/// The event a ralph loop files once per round it runs.
+///
+/// It is the only durable record of an attempt: a round that failed leaves no
+/// row anywhere else, so a reading that wants to count attempts, and to say
+/// why they failed, has nothing to read without it.
+pub const RALPH_ITERATION_EVENT: &str = "ralph_iteration";
+
+/// One UTC day of the attempt-to-landing ladder.
+///
+/// Five numbers, not a rate: a rate computed here would be a number nobody can
+/// take apart, and the whole reason this reading exists is that a low landing
+/// rate has more than one cause. `attempted` counts the *changes* that got at
+/// least one round, `rounds` counts the rounds themselves (a change retried
+/// three times is one attempt and three rounds), and `passed` counts the rounds
+/// whose own verdict said the work held up.
+///
+/// The last two are the closing side, and they are **not** the same event.
+/// `landed` counts every row the ledger closed as landed -- the overwhelming
+/// majority of which were asks the corpus already satisfied, so closing them
+/// shipped nothing. `landed_with_rev` counts the ones carrying the revision a
+/// delivery left behind, which is the only form of closing that is production.
+/// Adding the two, or reading the first as output, turns a five-a-day
+/// delivery rate into a hundred-a-day one.
+///
+/// `day` is the UTC date (`YYYY-MM-DD`), not the server's local day: the row is
+/// meant to be joined against windows written in UTC, and a reader that assumes
+/// local time would see a day boundary that moves twice a year.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangeFunnelDay {
+    pub day: String,
+    /// Distinct changes that got at least one round.
+    pub attempted: u64,
+    /// Rounds across those changes.
+    pub rounds: u64,
+    /// Rounds whose own verdict said the work held up.
+    pub passed: u64,
+    /// Rows the ledger closed as landed that day. Most of these are asks the
+    /// tree already satisfied, so this column counts closures, not output.
+    pub landed: u64,
+    /// Closures that carry a delivered revision -- the only ones that shipped
+    /// a commit, and the only honest denominator for cost per change.
+    pub landed_with_rev: u64,
+    /// LLM calls the gateway served that day, across **every** caller, not only
+    /// the rounds above. This is the numerator of cost per delivered change, and
+    /// it is deliberately the whole deployment's traffic: a delivery paid for by
+    /// reflection, evaluation and discovery costs what all of them cost.
+    ///
+    /// `None` means the usage table could not be read that pass. A zero would
+    /// read as "measured, nothing was spent", which is the one thing this column
+    /// must not say when it does not know.
+    pub llm_calls: Option<u64>,
+    /// Tokens bought that day (input plus output), same scope and same
+    /// not-measured meaning as [`Self::llm_calls`].
+    pub tokens: Option<u64>,
+}
+
 /// Durable storage for the change ledger.
 ///
 /// The only way to move a row's state is [`Self::apply_measurement`]. Rows enter
@@ -1453,6 +1519,24 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// comparing two censuses needs to see a state that emptied, which is
     /// exactly the reading an absent key would hide.
     async fn census(&self) -> SFResult<Vec<(ChangeState, u64)>>;
+
+    /// The attempt-to-landing ladder, one row per UTC day, oldest first.
+    ///
+    /// A cumulative census answers "how many have landed ever"; the question
+    /// this reading exists for is "how many landed *today*, out of how many
+    /// tried". Those differ by orders of magnitude whenever the pipeline is
+    /// stuck, and no run of censuses recovers the daily one: rows that never
+    /// landed leave no trace in a census at all.
+    ///
+    /// Days with no activity produce no row rather than a row of zeroes -- the
+    /// caller asks for a window and draws what came back, and a fabricated
+    /// zero would read as a day on which every attempt failed rather than as a
+    /// day before the account existed.
+    ///
+    /// `days` bounds the window from today backwards; a caller that asks for
+    /// more than the store will serve gets fewer rows, and the days it got are
+    /// the ones it asked for most recently.
+    async fn funnel(&self, days: u32) -> SFResult<Vec<ChangeFunnelDay>>;
 
     /// Record what one dispatch pass decided, and why it decided that much.
     ///

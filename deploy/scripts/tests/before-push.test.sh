@@ -171,4 +171,62 @@ grep -qE '^test .*-p fake.* -p cogneva|^test .*-p cogneva.* -p fake' "${cargo_lo
 echo "OK: 改动落在哪个包，Test 腿就判那个包加装配件"
 echo "OK: Test 腿真的调用了 cargo test -p fake -p cogneva（rc=${rc}）"
 
+# ---- 脚本测试继承到 git 定位变量时，不许把调用方那棵树翻成裸库 ----
+# 这条门由 pre-push 钩子拉起时，钩子的 git 会把 `GIT_DIR` / `GIT_WORK_TREE` 指向
+# **调用方那棵树**。`deploy/scripts/tests/*.test.sh` 各自 `git init` 夹具仓库，定位
+# 变量还在手上时，`git init --bare <夹具>` 落的就是调用方那棵树——它被重新初始化成
+# 裸库，`core.bare` 翻成 true，之后那棵树里每条 git 命令都报 "must be run in a work
+# tree"，钩子返回时提交写不进去。
+#
+# 2026-11-07 实测：一笔提交在钩子里连卡两次，第二次真凶暴露——`branch-convergence.test.sh`
+# 的三处 `git init --bare`。所以判据落在那棵**调用方树**上，不落在门印了哪句话：给它
+# 一个真的工作树、让夹具脚本照原样 `git init --bare`，跑完它还得是工作树。
+# 少了这一格，这处修复在门自己的读数上不可见——它只会在下一个人的提交上炸。
+loc="${work}/locators"
+mkdir -p "${loc}/caller" "${loc}/tree/deploy/scripts/tests" "${loc}/tree/.github/workflows"
+cp "${gate}" "${loc}/tree/deploy/scripts/check-before-push.sh"
+git -C "${loc}/caller" init -q -b main ||
+    fail "造不出这一格的调用方工作树"
+cat >"${loc}/tree/deploy/scripts/tests/fixture.test.sh" <<'SH'
+#!/usr/bin/env bash
+# 夹具脚本要的是**自己的**仓库，所以先把手上有没有调用方的定位变量记下来。
+set -euo pipefail
+[ -z "${LOCATORS_MARKER:-}" ] ||
+    printf 'GIT_DIR=%s\nGIT_WORK_TREE=%s\n' \
+        "${GIT_DIR-<unset>}" "${GIT_WORK_TREE-<unset>}" >"${LOCATORS_MARKER}"
+d="$(mktemp -d)"
+git init -q --bare "${d}/origin.git"
+rm -rf "${d}"
+SH
+cat >"${loc}/tree/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: A step this gate can replay
+        run: bash -n deploy/scripts/check-before-push.sh
+YAML
+marker="${loc}/ran"
+rc=0
+(
+    cd "${loc}/tree" || exit 1
+    LOCATORS_MARKER="${marker}" GIT_DIR="${loc}/caller/.git" GIT_WORK_TREE="${loc}/caller" \
+        HOME="${work}/nohome" bash deploy/scripts/check-before-push.sh
+) >"${loc}/out" 2>&1 || rc=$?
+# 先证明这一格真的跑到了：夹具脚本一次都没被执行时，下面那句「它手里没有定位变量」
+# 是在证明一件没发生的事，与没写这一格同形。
+[ -f "${marker}" ] ||
+    fail "夹具脚本没被这条门拉到，这一格什么都没验证：$(tail -5 "${loc}/out")"
+# 判据是夹具**手里拿到的东西**，不是门印了哪句话：定位变量在手上时，夹具的
+# `git init --bare` 落的是调用方那棵树。
+if grep -qv '=<unset>$' "${marker}"; then
+    fail "脚本测试继承了调用方的 git 定位变量，夹具的 git init 会落在那一棵树上：$(cat "${marker}")"
+fi
+# 再加一道到底的判据：跑完之后调用方那棵树还得是工作树。这一句是那场事故的原话
+# ——core.bare 翻成 true 之后，那棵树里每条 git 命令都报 "must be run in a work tree"。
+bare="$(git -C "${loc}/caller" rev-parse --is-bare-repository 2>/dev/null || echo unknown)"
+[ "${bare}" = "false" ] ||
+    fail "调用方那棵树被跑成了裸库（is-bare=${bare}），之后它里面每条 git 命令都会失败：$(tail -5 "${loc}/out")"
+echo "OK: 脚本测试手里的 git init --bare 落在自己的夹具上，调用方那棵树仍是工作树（rc=${rc}）"
+
 echo "before-push.test: all checks passed"

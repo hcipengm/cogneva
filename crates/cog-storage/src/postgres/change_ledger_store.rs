@@ -16,10 +16,11 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    BlockCensus, BlockedReason, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity,
-    ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
-    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState,
-    LandedTally, PoolWait, RemeasureBacklog, RetireReason, SFError, SFResult, WriteWindow,
+    BlockCensus, BlockedReason, BlockingHolder, BlockingSurface, ChangeBlock, ChangeFunnelDay,
+    ChangeIdentity, ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
+    ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure,
+    DispatchState, LandedTally, PoolWait, RemeasureBacklog, RetireReason, SFError, SFResult,
+    WriteWindow,
 };
 
 /// Resolve the state and reason words a query template names.
@@ -1769,6 +1770,136 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 (state, n)
             })
             .collect())
+    }
+
+    async fn funnel(&self, days: u32) -> SFResult<Vec<ChangeFunnelDay>> {
+        // One window, two tables, one row per UTC day. The rounds are read from
+        // the event stream because a round that failed is recorded nowhere
+        // else -- the ledger only ever learns that a change has not landed.
+        let since = Utc::now() - chrono::Duration::days(i64::from(days.max(1)));
+        let prefix = format!(
+            "{}%",
+            cog_core::contract::change_ledger::CHANGE_LEDGER_TASK_PREFIX
+        );
+        let rounds = sqlx::query(
+            "SELECT to_char((created_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
+                    count(DISTINCT payload->>'task_id') AS attempted, \
+                    count(*) AS rounds, \
+                    count(*) FILTER (WHERE payload->'payload'->>'pge_passed' = 'true') AS passed \
+               FROM cog_events \
+              WHERE event_type = $1 \
+                AND created_at >= $2 \
+                AND payload->>'task_id' LIKE $3 \
+              GROUP BY 1",
+        )
+        .bind(cog_core::contract::change_ledger::RALPH_ITERATION_EVENT)
+        .bind(since)
+        .bind(&prefix)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("funnel rounds: {e}")))?;
+        let landings = sqlx::query(
+            "SELECT to_char((landed_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
+                    count(*) AS landed, \
+                    count(*) FILTER (WHERE delivered_rev IS NOT NULL) AS landed_with_rev \
+               FROM change_ledger \
+              WHERE landed_at >= $1 \
+              GROUP BY 1",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("funnel landings: {e}")))?;
+        // What the day cost. Read from the gateway's own usage rows rather than
+        // counted here: the gateway is the only place that knows a call was made,
+        // and the ladder's deliverable ratio is meaningless without it -- six
+        // deliveries and one hundred calls is a different problem from six
+        // deliveries and forty thousand.
+        //
+        // A failure to read it does not fail the ladder: the rounds and the
+        // landings are still true. It leaves both columns `None`, because a zero
+        // there would claim a day of zero spend, which is a measurement, not an
+        // absence.
+        let usage: Option<Vec<sqlx::postgres::PgRow>> = match sqlx::query(
+            "SELECT to_char((ts AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
+                    count(*) AS calls, \
+                    sum(tokens_input + tokens_output)::bigint AS tokens \
+               FROM gateway_llm_usage \
+              WHERE ts >= $1 \
+                AND result = 'ok' \
+              GROUP BY 1",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "funnel: gateway_llm_usage could not be read; the cost columns will say not-measured"
+                );
+                None
+            }
+        };
+
+        let mut by_day: std::collections::BTreeMap<String, ChangeFunnelDay> =
+            std::collections::BTreeMap::new();
+        let count = |row: &sqlx::postgres::PgRow, column: &str| -> SFResult<u64> {
+            let n: i64 = row
+                .try_get(column)
+                .map_err(|e| SFError::Database(e.to_string()))?;
+            Ok(n.max(0) as u64)
+        };
+        for row in &rounds {
+            let day: String = row
+                .try_get("day")
+                .map_err(|e| SFError::Database(e.to_string()))?;
+            let cell = by_day.entry(day.clone()).or_insert(ChangeFunnelDay {
+                day,
+                ..Default::default()
+            });
+            cell.attempted = count(row, "attempted")?;
+            cell.rounds = count(row, "rounds")?;
+            cell.passed = count(row, "passed")?;
+        }
+        for row in &landings {
+            let day: String = row
+                .try_get("day")
+                .map_err(|e| SFError::Database(e.to_string()))?;
+            let cell = by_day.entry(day.clone()).or_insert(ChangeFunnelDay {
+                day,
+                ..Default::default()
+            });
+            cell.landed = count(row, "landed")?;
+            cell.landed_with_rev = count(row, "landed_with_rev")?;
+        }
+        if let Some(usage) = &usage {
+            // The read succeeded, so every day it could have covered is measured:
+            // a day with no usage row is a measured zero, not an unread column.
+            for cell in by_day.values_mut() {
+                cell.llm_calls = Some(0);
+                cell.tokens = Some(0);
+            }
+            for row in usage {
+                let day: String = row
+                    .try_get("day")
+                    .map_err(|e| SFError::Database(e.to_string()))?;
+                // Only days the ladder already has a row for: a day with spend
+                // but no rounds and no landings is a day this account did not
+                // act on, and inventing a row for it would widen the ladder
+                // into a spend report.
+                let Some(cell) = by_day.get_mut(&day) else {
+                    continue;
+                };
+                cell.llm_calls = Some(count(row, "calls")?);
+                cell.tokens = Some(count(row, "tokens")?);
+            }
+        }
+        // BTreeMap keeps the days in order, which is what a time axis needs and
+        // what `ORDER BY` in either query alone could not guarantee once the two
+        // halves are merged.
+        Ok(by_day.into_values().collect())
     }
 
     async fn demand_closure(&self) -> SFResult<Option<DemandClosure>> {

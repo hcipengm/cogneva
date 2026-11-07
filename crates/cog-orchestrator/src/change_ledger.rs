@@ -408,7 +408,10 @@ struct UnsettledCheck {
 
 /// The prefix a dispatched task's id carries, so a task sitting in the graph
 /// says which loop put it there.
-const DISPATCH_TASK_PREFIX: &str = "change-ledger-";
+///
+/// The same prefix is read by the funnel that counts these hand-overs' rounds,
+/// so it is declared in the contract rather than here.
+const DISPATCH_TASK_PREFIX: &str = cog_core::contract::change_ledger::CHANGE_LEDGER_TASK_PREFIX;
 
 /// The queue rank this loop declares for work whose documents stated no band:
 /// one below the default every other task lands on.
@@ -10072,6 +10075,9 @@ mod tests {
                 *by_state.entry(row.state).or_default() += 1;
             }
             Ok(by_state.into_iter().collect())
+        }
+        async fn funnel(&self, _days: u32) -> SFResult<Vec<cog_core::ChangeFunnelDay>> {
+            unimplemented!("the dispatch cases do not read the ladder")
         }
         async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()> {
             self.written.lock().unwrap().push(state.clone());

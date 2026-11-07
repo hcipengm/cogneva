@@ -39,6 +39,12 @@ struct FakeLedger {
     rows: Vec<ChangeLedgerRow>,
     pending_declarations: u64,
     pending_retirements: u64,
+    funnel: Vec<cog_core::ChangeFunnelDay>,
+    /// The window the last funnel read asked for. Recorded because "how far
+    /// back" is the half of that read the route decides, and a stand-in that
+    /// ignores it cannot tell a route that forwards the caller's window from
+    /// one that always asks for its own default.
+    funnel_days_asked: std::sync::Mutex<Option<u32>>,
 }
 
 impl FakeLedger {
@@ -51,6 +57,8 @@ impl FakeLedger {
             rows,
             pending_declarations,
             pending_retirements,
+            funnel: Vec::new(),
+            funnel_days_asked: std::sync::Mutex::new(None),
         }
     }
 }
@@ -270,6 +278,14 @@ impl ChangeLedgerStore for FakeLedger {
                 (state, rows)
             })
             .collect())
+    }
+
+    async fn funnel(&self, days: u32) -> SFResult<Vec<cog_core::ChangeFunnelDay>> {
+        *self
+            .funnel_days_asked
+            .lock()
+            .expect("the stand-in's own lock") = Some(days);
+        Ok(self.funnel.clone())
     }
 
     async fn record_dispatch_state(&self, _state: &cog_core::DispatchState) -> SFResult<()> {
@@ -1081,5 +1097,130 @@ async fn without_a_ledger_the_route_says_so() {
         status,
         StatusCode::SERVICE_UNAVAILABLE,
         "no ledger is not zero rows: {body}"
+    );
+}
+
+/// The attempt-to-landing ladder is a route, not a query somebody runs by hand.
+///
+/// The numbers behind it were readable only from the deployment's database: how
+/// many changes were attempted on a day, how many rounds that took, how many
+/// passes it bought, and how many of them actually became a change. That is the
+/// one reading that separates "nothing was produced" from "a great deal was
+/// attempted and none of it landed", and the two want opposite work. A reading
+/// that needs a person to connect by hand is missing exactly on the days
+/// nobody asks, so it lives behind a route the account's own page polls.
+#[tokio::test]
+async fn the_attempt_to_landing_ladder_is_readable_on_its_own_route() {
+    let mut ledger = FakeLedger::new(Vec::new(), 0, 0);
+    ledger.funnel = vec![
+        cog_core::ChangeFunnelDay {
+            day: "2026-11-06".into(),
+            attempted: 384,
+            rounds: 821,
+            passed: 0,
+            landed: 2,
+            landed_with_rev: 1,
+            llm_calls: Some(4100),
+            tokens: Some(9_800_000),
+        },
+        cog_core::ChangeFunnelDay {
+            day: "2026-11-07".into(),
+            attempted: 13,
+            rounds: 15,
+            passed: 10,
+            landed: 6,
+            landed_with_rev: 4,
+            // Not measured: the usage read failed for this day. The route must
+            // carry that as null, not as a zero-call day.
+            llm_calls: None,
+            tokens: None,
+        },
+    ];
+    let ledger = Arc::new(ledger);
+    let state = state(Some(ledger.clone()));
+    let token = bearer(&state).await;
+
+    let (status, body) = get(state, "/api/v1/governance/changes/funnel", Some(&token)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let days = body["days"].as_array().expect("days are a list");
+    assert_eq!(days.len(), 2, "{body}");
+    assert_eq!(days[0]["day"], "2026-11-06", "{body}");
+    assert_eq!(days[0]["attempted"], 384, "{body}");
+    assert_eq!(days[0]["rounds"], 821, "{body}");
+    assert_eq!(days[0]["passed"], 0, "{body}");
+    assert_eq!(days[0]["landed"], 2, "{body}");
+    assert_eq!(
+        days[0]["landed_with_rev"], 1,
+        "a landing without a delivered revision is not the same row as one that shipped: {body}"
+    );
+    assert_eq!(
+        days[0]["llm_calls"], 4100,
+        "what the day cost has to reach the page that asks how much a change costs: {body}"
+    );
+    assert_eq!(days[0]["tokens"], 9_800_000, "{body}");
+    // 「没读到」与「量到是 0」在这一面上必须是两个值。合成一个 0，页面就会在
+    // 用量表读不到的那天印一个看起来健康的「0 次调用」。
+    assert!(
+        days[1]["llm_calls"].is_null(),
+        "an unread usage table must travel as null, not as zero: {body}"
+    );
+    assert!(days[1]["tokens"].is_null(), "{body}");
+}
+
+/// The window is the caller's, and its absence has a named default.
+///
+/// Two callers want different reach: the overview asks for a fortnight, an
+/// investigation asks for the day it is looking at. A route that pins one
+/// number answers the second caller with a longer window than it can price,
+/// and a route that reads no default at all answers the first with nothing.
+#[tokio::test]
+async fn the_ladder_reads_the_window_the_caller_asked_for() {
+    let ledger = Arc::new(FakeLedger::new(Vec::new(), 0, 0));
+    let state = state(Some(ledger.clone()));
+    let token = bearer(&state).await;
+
+    let (status, _) = get(
+        state.clone(),
+        "/api/v1/governance/changes/funnel?days=1",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        *ledger
+            .funnel_days_asked
+            .lock()
+            .expect("the stand-in's own lock"),
+        Some(1),
+        "the caller's window reaches the account"
+    );
+
+    let (status, _) = get(state, "/api/v1/governance/changes/funnel", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        *ledger
+            .funnel_days_asked
+            .lock()
+            .expect("the stand-in's own lock"),
+        Some(14),
+        "no window is a fortnight, not zero days"
+    );
+}
+
+/// No account is not an empty ladder. An empty series here is the claim that no
+/// day had any attempt and no day had any landing, which reads as a quiet
+/// system rather than as a route that cannot see.
+#[tokio::test]
+async fn without_a_ledger_the_ladder_says_so() {
+    let state = state(None);
+    let token = bearer(&state).await;
+
+    let (status, body) = get(state, "/api/v1/governance/changes/funnel", Some(&token)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no ledger is not an empty ladder: {body}"
     );
 }

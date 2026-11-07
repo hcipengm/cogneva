@@ -21,6 +21,12 @@
 #   9. 远端：头指向本地没有的对象 ⇒ 3（判不了 ≠ 合格）。
 set -uo pipefail
 
+# 下面要 `git init` 好几个夹具仓库。手动在 pre-push 钩子里跑本脚本时，钩子的 git
+# 会把 `GIT_DIR` 指向调用方那棵树，`git init --bare` 就落在那棵树上、把它翻成裸库。
+# 夹具要的是自己的仓库，所以先摘掉这些定位变量——正常运行时它们本来也不该在。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 gate="${repo}/deploy/scripts/check-branch-convergence.sh"
