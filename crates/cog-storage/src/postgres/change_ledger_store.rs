@@ -2250,6 +2250,14 @@ mod templates {
         ("POOL_WAIT", POOL_WAIT_SQL_TEMPLATE),
     ];
 
+    /// Every statement the account reads or writes a retirement with, so one
+    /// added later falls inside the gate below rather than beside it.
+    const RETIREMENT_STATEMENTS: &[(&str, &str)] = &[
+        ("FOLD_RETIRE_SELECT", FOLD_RETIRE_SELECT_SQL),
+        ("FOLD_RETIRE_MARK", FOLD_RETIRE_MARK_SQL),
+        ("PENDING_RETIRE", PENDING_RETIRE_SQL),
+    ];
+
     /// A slot nobody fills is not a missing word, it is a statement the database
     /// refuses to parse -- at the moment the ledger is written, not before.
     #[test]
@@ -2333,5 +2341,93 @@ mod templates {
             "the clear stopped selecting on the reason: {clear}"
         );
         assert!(clear.contains("blocked_reason = NULL"));
+    }
+
+    /// A retirement's reason is written once, by the side that decided it, and
+    /// the account can only ever read the one already there.
+    ///
+    /// `change_ledger_retired` is keyed by the identity alone and its writer
+    /// inserts `DO NOTHING`, so a second classification of a row is the same
+    /// retirement and cannot hang a second reason beside the first. What that
+    /// makes the reason column is not a one-off argument passed at fold time: it
+    /// is the only copy of the judgement that exists, and it cannot be revised
+    /// afterwards. Hence the order the fold owes it -- read the row, take the
+    /// reason off it, and stamp the row as folded -- because a fold that wrote a
+    /// reason of its own would be a second decision about a row it merely
+    /// carries out, and the first one would be unrecoverable.
+    ///
+    /// The premise is read from the schema rather than taken from this comment:
+    /// one row per identity is what makes the reason single, and a non-null
+    /// reason is what makes it a statement rather than a blank. The statement
+    /// side is read rendered, and every word comes from `RetireReason::ALL`, so
+    /// a reason added to the vocabulary moves this with it instead of leaving a
+    /// check on a spelling the tree no longer writes.
+    ///
+    /// principle: feedback_a_retirement_reason_cannot_be_rewritten_so_read_the_row_first
+    #[test]
+    fn the_retirement_reason_is_read_off_the_row_and_never_written_back() {
+        // The premise, squashed so it is the columns that are compared rather
+        // than the migration's alignment.
+        let intake =
+            include_str!("../../migrations/postgres/041_change_ledger_retired_intake.up.sql");
+        let intake = intake.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            intake.contains("PRIMARY KEY (kind, scope, literal)"),
+            "the intake stopped keying a row by its identity alone, so two classifiers can now \
+             hang two reasons on one row and the fold has to pick one of them: {intake}"
+        );
+        assert!(
+            intake.contains("reason VARCHAR(32) NOT NULL"),
+            "the intake accepts a retirement with no reason, which is a judgement that can be \
+             blanked after it is written: {intake}"
+        );
+
+        let fold = FOLD_RETIRE_SELECT_SQL;
+        assert!(
+            fold.contains("literal, reason"),
+            "the fold takes the row without the reason it carries, so applying it means deciding \
+             a verdict the classified row already holds: {fold}"
+        );
+        assert!(
+            fold.contains("WHERE folded_at IS NULL"),
+            "the fold stopped selecting what is still unfolded: {fold}"
+        );
+
+        let mark = FOLD_RETIRE_MARK_SQL;
+        assert!(
+            mark.starts_with("UPDATE change_ledger_retired SET folded_at = now()"),
+            "the fold's write stopped being a stamp on the row it read: {mark}"
+        );
+        assert!(
+            mark.contains("WHERE folded_at IS NULL"),
+            "the stamp lost the guard that keeps a re-run from moving a time an earlier fold \
+             set: {mark}"
+        );
+
+        for (name, statement) in RETIREMENT_STATEMENTS {
+            assert!(
+                !statement.contains("reason ="),
+                "{name} assigns the retirement's reason: the judgement is written once by the \
+                 side that decided it, and a statement that writes it here is a second decision \
+                 about a row this side only folds: {statement}"
+            );
+        }
+
+        // The applied measurement carries the reason it was handed and no word of
+        // its own: a reason spelled in this statement would file a row under a
+        // verdict nothing classified it as.
+        let applied = fill_vocabulary(APPLY_MEASUREMENT_SQL_TEMPLATE);
+        assert!(
+            applied.contains("retire_reason = EXCLUDED.retire_reason"),
+            "the account stopped carrying the folded measurement's reason onto the row: {applied}"
+        );
+        for reason in RetireReason::ALL {
+            let word = reason.as_str();
+            assert!(
+                !applied.contains(word),
+                "the statement that folds a retirement spells the reason `{word}` itself, so a \
+                 row nothing classified that way reads as if something had: {applied}"
+            );
+        }
     }
 }
