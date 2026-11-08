@@ -12,6 +12,7 @@ import {
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
+import { money } from '@/topology/format';
 import { Note } from '@/ui/Note';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 import { Strip } from '@/ui/plots';
@@ -152,6 +153,38 @@ function FunnelPanel() {
     calls !== null && totals.landed_with_rev > 0
       ? `${Math.round(calls / totals.landed_with_rev)}`
       : null;
+  // 钱这一列比调用数多两条规矩。一是币种：价目表自己带着币种，页面不能替它选一个
+  // 符号——把日元印成美元，读者看不出差了几倍。二是下界：有调用没计价的那些天，
+  // 合计数只盖住了其余部分，所以它不是「花了多少」，是「至少花了多少」，这个
+  // 「至少」必须印在数前面，否则下界会被读成省钱。
+  const costRead = days.length > 0 && days.every((d) => d.unpriced_calls !== null);
+  const unpricedCalls = days.reduce((n, d) => n + (d.unpriced_calls ?? 0), 0);
+  const currencies = new Set(
+    days.map((d) => d.cost_currency).filter((c): c is string => c !== null)
+  );
+  // 有价却印不出来的天（跨币种）：这种天混进合计会让合计沉默地少一块。
+  const unpricedOut = days.filter(
+    (d) => d.cost_micros === null && (d.unpriced_calls ?? 0) === 0
+  );
+  const micros =
+    costRead && currencies.size === 1 && unpricedOut.length === 0
+      ? days.reduce((n, d) => n + (d.cost_micros ?? 0), 0)
+      : null;
+  const costGap =
+    micros !== null
+      ? null
+      : !costRead
+        ? '未读到'
+        : currencies.size > 1
+          ? '多币种'
+          : '未记价';
+  const perDeliveryCost =
+    micros !== null && currencies.size === 1 && totals.landed_with_rev > 0
+      ? `${unpricedCalls > 0 ? '≥ ' : ''}${money(
+          Math.round(micros / totals.landed_with_rev),
+          [...currencies][0]
+        )}`
+      : null;
 
   return (
     <section className="border-b border-[var(--line)]">
@@ -167,7 +200,7 @@ function FunnelPanel() {
           <Readings
             from={funnel}
             source="GET /api/v1/governance/changes/funnel?days=14，近 14 天求和"
-            caveat="尝试数的是智能体自己的轮次事件，交付数的是账上带着交付版本的那一头——「结为成立」里绝大多数是本来就成立、什么都没交付的条，两者相加会把每天五六笔的交付读成上百笔。合计是把每天的尝试数加起来，跨天重复尝试的变更会被数两次。调用数取自网关自己的用量表，含所有调用方（反思、评估、发现都算），所以「调用/交付」是整个部署的代价，不只是这条账上尝试的代价；那两列印「未读到」时是没读到用量表，不是零调用。"
+            caveat="尝试数的是智能体自己的轮次事件，交付数的是账上带着交付版本的那一头——「结为成立」里绝大多数是本来就成立、什么都没交付的条，两者相加会把每天五六笔的交付读成上百笔。合计是把每天的尝试数加起来，跨天重复尝试的变更会被数两次。调用数与成本取自网关自己的用量表，含所有调用方（反思、评估、发现都算），所以这两个比值是整个部署的代价，不只是这条账上尝试的代价；调用数印「未读到」时是没读到用量表，不是零调用。成本按价目表自己的币种印（符号来自那本价目），页上不替它选汇率；数字前面带「≥」的天是那天还有调用没有记价——那是下界，不是花销总额，读成省钱会正好读反。"
           >
             <div className="flex flex-wrap py-2">
               <Reading label="尝试变更" value={totals.attempted} />
@@ -196,6 +229,17 @@ function FunnelPanel() {
                   calls === null ? '未读到' : perDelivery === null ? '无交付' : perDelivery
                 }
                 tone={calls === null || perDelivery === null ? 'danger' : 'plain'}
+              />
+              <Reading
+                label="每笔交付成本"
+                value={
+                  micros === null
+                    ? costGap
+                    : perDeliveryCost === null
+                      ? '无交付'
+                      : perDeliveryCost
+                }
+                tone={micros === null || perDeliveryCost === null ? 'danger' : 'plain'}
               />
             </div>
           </Readings>
@@ -235,6 +279,25 @@ function FunnelPanel() {
                     : d.landed_with_rev > 0
                       ? Math.round(d.llm_calls / d.landed_with_rev)
                       : '无交付'}
+                </span>
+              ) },
+              { key: 'cost', title: '成本', width: '110px', render: (d: ChangeFunnelDay) => (
+                <span
+                  className={
+                    d.cost_micros === null ? 'text-[var(--muted)]' : 'mono text-[11px]'
+                  }
+                  title={
+                    (d.unpriced_calls ?? 0) > 0
+                      ? `这一天还有 ${d.unpriced_calls} 次调用没有记价，印出来的只是下界`
+                      : undefined
+                  }
+                >
+                  {d.cost_micros === null || d.cost_currency === null
+                    ? '未记价'
+                    : `${(d.unpriced_calls ?? 0) > 0 ? '≥ ' : ''}${money(
+                        d.cost_micros,
+                        d.cost_currency
+                      )}`}
                 </span>
               ) },
             ]}

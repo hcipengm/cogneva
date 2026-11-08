@@ -1012,6 +1012,35 @@ pub struct ChangeFunnelDay {
     /// Tokens bought that day (input plus output), same scope and same
     /// not-measured meaning as [`Self::llm_calls`].
     pub tokens: Option<u64>,
+    /// What the day's priced calls cost, in [`Self::cost_currency`]'s millionths,
+    /// over the same calls as [`Self::llm_calls`].
+    ///
+    /// Calls and tokens say how much traffic a delivery took; only this says what
+    /// the traffic was bought for. The two can point opposite ways -- a cheaper
+    /// model reached by more calls is a saving here and a regression on
+    /// [`Self::tokens`] -- so a reading that reports one and not the other cannot
+    /// answer whether a change made the deployment cheaper or only smaller.
+    ///
+    /// `None` is not zero. It means the day's money cannot be stated: the usage
+    /// table could not be read, or no call that day carried a price, or the day
+    /// was priced in more than one currency (a sum over two currencies is not a
+    /// sum). [`Self::unpriced_calls`] is what tells the first two apart from a
+    /// day that genuinely cost nothing -- no arithmetic over the sum can.
+    pub cost_micros: Option<i64>,
+    /// The currency [`Self::cost_micros`] is in, as the price book's label names
+    /// it. `None` when the day has no priced call (nothing to name) or mixed
+    /// currencies (nothing single to name).
+    ///
+    /// Carried rather than assumed: a page that prints a currency symbol of its
+    /// own turns a yen total into a dollar one, and the reader has no way to see
+    /// the factor.
+    pub cost_currency: Option<String>,
+    /// Calls that day the gateway served without recording a price.
+    ///
+    /// Any of these makes [`Self::cost_micros`] a floor rather than a total: the
+    /// missing ones are not free, they are simply unpriced, and a floor printed
+    /// as a total is the one error that reads as a saving.
+    pub unpriced_calls: Option<u64>,
 }
 
 /// Durable storage for the change ledger.

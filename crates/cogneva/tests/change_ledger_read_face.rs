@@ -1122,6 +1122,9 @@ async fn the_attempt_to_landing_ladder_is_readable_on_its_own_route() {
             landed_with_rev: 1,
             llm_calls: Some(4100),
             tokens: Some(9_800_000),
+            cost_micros: Some(270_000),
+            cost_currency: Some("CNY".into()),
+            unpriced_calls: Some(9),
         },
         cog_core::ChangeFunnelDay {
             day: "2026-11-07".into(),
@@ -1134,6 +1137,9 @@ async fn the_attempt_to_landing_ladder_is_readable_on_its_own_route() {
             // carry that as null, not as a zero-call day.
             llm_calls: None,
             tokens: None,
+            cost_micros: None,
+            cost_currency: None,
+            unpriced_calls: None,
         },
     ];
     let ledger = Arc::new(ledger);
@@ -1159,6 +1165,19 @@ async fn the_attempt_to_landing_ladder_is_readable_on_its_own_route() {
         "what the day cost has to reach the page that asks how much a change costs: {body}"
     );
     assert_eq!(days[0]["tokens"], 9_800_000, "{body}");
+    assert_eq!(
+        days[0]["cost_micros"], 270_000,
+        "the money a delivery cost has to reach the page that shows the ratio: {body}"
+    );
+    assert_eq!(
+        days[0]["cost_currency"], "CNY",
+        "the page prints a symbol, so the currency has to travel with the amount: {body}"
+    );
+    assert_eq!(
+        days[0]["unpriced_calls"], 9,
+        "a day whose total covers only priced calls has to say how many it left out, \
+         or the floor prints as the total: {body}"
+    );
     // 「没读到」与「量到是 0」在这一面上必须是两个值。合成一个 0，页面就会在
     // 用量表读不到的那天印一个看起来健康的「0 次调用」。
     assert!(
@@ -1166,6 +1185,14 @@ async fn the_attempt_to_landing_ladder_is_readable_on_its_own_route() {
         "an unread usage table must travel as null, not as zero: {body}"
     );
     assert!(days[1]["tokens"].is_null(), "{body}");
+    assert!(
+        days[1]["cost_micros"].is_null(),
+        "an unpriced day is not a day that cost nothing: {body}"
+    );
+    assert!(
+        days[1]["cost_currency"].is_null() && days[1]["unpriced_calls"].is_null(),
+        "a day the usage table could not be read has no coverage count either: {body}"
+    );
 }
 
 /// The window is the caller's, and its absence has a named default.

@@ -559,6 +559,19 @@ pub struct FunnelDayView {
     pub llm_calls: Option<u64>,
     /// `null` when the usage table could not be read -- not `0`.
     pub tokens: Option<u64>,
+    /// What the day's priced calls cost, in `cost_currency`'s millionths. `null`
+    /// when the day's money cannot be stated: the usage table could not be read,
+    /// nothing that day was priced, or the day was priced in more than one
+    /// currency.
+    pub cost_micros: Option<i64>,
+    /// The currency `cost_micros` is in, taken from the price book's label. `null`
+    /// when the day has no priced call or no single currency -- the page must not
+    /// pick a symbol of its own.
+    pub cost_currency: Option<String>,
+    /// Calls that day served with no price recorded. Any of them makes
+    /// `cost_micros` a floor; the page has to say so rather than print it as the
+    /// total.
+    pub unpriced_calls: Option<u64>,
 }
 
 pub async fn changes_funnel_handler(
@@ -581,6 +594,9 @@ pub async fn changes_funnel_handler(
                 landed_with_rev: d.landed_with_rev,
                 llm_calls: d.llm_calls,
                 tokens: d.tokens,
+                cost_micros: d.cost_micros,
+                cost_currency: d.cost_currency,
+                unpriced_calls: d.unpriced_calls,
             })
             .collect(),
     }))

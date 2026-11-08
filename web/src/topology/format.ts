@@ -44,6 +44,22 @@ export function percentOf(part: number, whole: number): string {
 }
 
 /**
+ * 一笔钱，从账本的计价单位（百万分之一）写成带币种符号的数。
+ *
+ * 小额保留四位：一次调用常常是几分钱甚至几厘，两位小数会把它们全印成 ¥0.00，
+ * 而那一列正是「这条路径贵不贵」的读数。
+ *
+ * 币种符号只认三种，其余把币种码原样印出来——网关的计价单位是它自己说了算的，
+ * 猜一个符号比印出 `EUR ` 更容易让人读错。
+ */
+export function money(micros: number, currency: string): string {
+  const symbol = currency === 'CNY' ? '¥' : currency === 'USD' ? '$' : `${currency} `;
+  const value = micros / 1_000_000;
+  const text = Math.abs(value) >= 1 ? value.toFixed(2) : value.toFixed(4);
+  return `${symbol}${text}`;
+}
+
+/**
  * 本机时区的名字，写成 `UTC+8` 这种能直接对时差的形式。
  *
  * 页面上所有时刻都是用浏览器本地时区渲染的（`toLocaleString` 的默认行为），

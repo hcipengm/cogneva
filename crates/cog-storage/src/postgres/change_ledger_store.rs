@@ -1823,7 +1823,13 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         let usage: Option<Vec<sqlx::postgres::PgRow>> = match sqlx::query(
             "SELECT to_char((ts AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
                     count(*) AS calls, \
-                    sum(tokens_input + tokens_output)::bigint AS tokens \
+                    sum(tokens_input + tokens_output)::bigint AS tokens, \
+                    count(cost_micros) AS priced_calls, \
+                    coalesce(sum(cost_micros), 0)::bigint AS cost_micros, \
+                    count(DISTINCT split_part(price_book, '@', 1)) \
+                        FILTER (WHERE cost_micros IS NOT NULL) AS currencies, \
+                    min(split_part(price_book, '@', 1)) \
+                        FILTER (WHERE cost_micros IS NOT NULL) AS currency \
                FROM gateway_llm_usage \
               WHERE ts >= $1 \
                 AND result = $2 \
@@ -1881,6 +1887,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             for cell in by_day.values_mut() {
                 cell.llm_calls = Some(0);
                 cell.tokens = Some(0);
+                cell.cost_micros = Some(0);
+                cell.unpriced_calls = Some(0);
             }
             for row in usage {
                 let day: String = row
@@ -1893,8 +1901,26 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 let Some(cell) = by_day.get_mut(&day) else {
                     continue;
                 };
-                cell.llm_calls = Some(count(row, "calls")?);
+                let calls = count(row, "calls")?;
+                cell.llm_calls = Some(calls);
                 cell.tokens = Some(count(row, "tokens")?);
+                let priced = count(row, "priced_calls")?;
+                // The gap between the two is the day's floor: those calls were
+                // served and nothing priced them, so whatever they cost is not
+                // in the sum below. It travels next to the sum because no
+                // arithmetic over the sum can recover it.
+                cell.unpriced_calls = Some(calls.saturating_sub(priced));
+                let micros: i64 = row
+                    .try_get("cost_micros")
+                    .map_err(|e| SFError::Database(e.to_string()))?;
+                let currencies: i64 = row
+                    .try_get("currencies")
+                    .map_err(|e| SFError::Database(e.to_string()))?;
+                let currency: Option<String> = row
+                    .try_get("currency")
+                    .map_err(|e| SFError::Database(e.to_string()))?;
+                cell.cost_micros = day_cost(priced, micros, currencies, &currency);
+                cell.cost_currency = (currencies == 1).then_some(currency).flatten();
             }
         }
         // BTreeMap keeps the days in order, which is what a time axis needs and
@@ -2232,6 +2258,25 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
     }
 }
 
+/// What one day's priced calls add up to, or `None` when the column cannot say.
+///
+/// Two ways a sum of prices is not a price: it covers no call at all (the day has
+/// traffic but nothing priced it, or no traffic), or it adds up more than one
+/// currency. Both are answered with `None` rather than with the number, because
+/// the number would be printed as the day's cost and read as one. A day priced in
+/// one currency is the sum, including a sum of zero -- a measured day of no spend
+/// is a measurement.
+///
+/// The uncovered calls are not part of this decision: they travel in
+/// `unpriced_calls`, which is what lets the reader print the sum as the floor it
+/// is instead of hiding it.
+fn day_cost(priced: u64, micros: i64, currencies: i64, currency: &Option<String>) -> Option<i64> {
+    if priced == 0 || currencies != 1 || currency.is_none() {
+        return None;
+    }
+    Some(micros)
+}
+
 #[cfg(test)]
 mod templates {
     use super::*;
@@ -2257,6 +2302,42 @@ mod templates {
         ("FOLD_RETIRE_MARK", FOLD_RETIRE_MARK_SQL),
         ("PENDING_RETIRE", PENDING_RETIRE_SQL),
     ];
+
+    /// A day priced in one currency is its sum, zero included. A day with no
+    /// priced call, or with prices from two price books in different currencies,
+    /// is `None` -- both directions, because a function that only ever returned
+    /// `None` would pass the second half and silently delete the column.
+    #[test]
+    fn a_day_has_a_cost_only_when_one_currency_prices_at_least_one_call() {
+        let cny = Some("CNY".to_string());
+        assert_eq!(day_cost(3, 2_700, 1, &cny), Some(2_700));
+        assert_eq!(
+            day_cost(0, 0, 0, &None),
+            None,
+            "no priced call is no money to state, not zero spent"
+        );
+        assert_eq!(
+            day_cost(0, 0, 1, &cny),
+            None,
+            "a priced-count of zero with a currency is a row that cannot be trusted"
+        );
+        // A day of calls that all priced at zero is a measurement of zero.
+        assert_eq!(
+            day_cost(2, 0, 1, &cny),
+            Some(0),
+            "a measured day of no spend is a measurement, not an absence"
+        );
+        assert_eq!(
+            day_cost(4, 9_000, 2, &Some("CNY".to_string())),
+            None,
+            "a sum over two currencies is not a sum"
+        );
+        assert_eq!(
+            day_cost(4, 9_000, 1, &None),
+            None,
+            "a priced day with no currency named cannot be printed at all"
+        );
+    }
 
     /// A slot nobody fills is not a missing word, it is a statement the database
     /// refuses to parse -- at the moment the ledger is written, not before.

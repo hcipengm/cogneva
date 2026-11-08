@@ -2522,6 +2522,21 @@ export interface ChangeFunnelDay {
   llm_calls: number | null;
   /** 这一天买的 token 数（输入＋输出）。`null` 的含义同上。 */
   tokens: number | null;
+  /**
+   * 这一天有价的调用花了多少钱，单位是 `cost_currency` 的百万分之一。
+   * 调用数与 token 数说的是「花了多少流量」，只有这一列说的是「流量花了多少钱」。
+   *
+   * `null` 不是 0，而是「这一天的钱说不出来」：用量表没读到、那天没有一次调用
+   * 有价、或者那天用了不止一种币种（跨币种的和不是和）。
+   */
+  cost_micros: number | null;
+  /** `cost_micros` 的币种，取自价目表的标签。`null` = 那天没有有价调用，或者币种不止一种。 */
+  cost_currency: string | null;
+  /**
+   * 这一天有几个调用被服务了却没有记价。只要有一个，`cost_micros` 就是个下界：
+   * 那些调用不是免费的，只是没定价，而把下界印成总数正好读成省钱。
+   */
+  unpriced_calls: number | null;
 }
 
 export interface ChangeFunnel {

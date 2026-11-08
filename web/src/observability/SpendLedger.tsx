@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { getTokenSpend, type SpendLine, type TokenSpend } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { compact } from '@/observability/usageRows';
+import { money } from '@/topology/format';
 import { Loading, ReadError, Readings } from '@/ui/primitives';
 
 /**
@@ -268,19 +269,6 @@ function hitRate(row: SpendLine): string {
   const prompt = row.tokens_input + row.tokens_cached;
   if (prompt <= 0) return '—';
   return `${((row.tokens_cached / prompt) * 100).toFixed(1)}%`;
-}
-
-/**
- * 百万分之一元说成人话。
- *
- * 小额保留四位：一次调用常常是几分钱甚至几厘，两位小数会把它们全印成 ¥0.00，
- * 而那一列正是「这条路径贵不贵」的读数。
- */
-function money(micros: number, currency: string): string {
-  const symbol = currency === 'CNY' ? '¥' : currency === 'USD' ? '$' : `${currency} `;
-  const value = micros / 1_000_000;
-  const text = Math.abs(value) >= 1 ? value.toFixed(2) : value.toFixed(4);
-  return `${symbol}${text}`;
 }
 
 function stamp(iso: string): string {
