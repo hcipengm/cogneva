@@ -206,5 +206,185 @@ PY
   esac
 fi
 
+# 9~13) 起 Pod 之前先把检查点腾空。
+#
+#    2026-11-08 的形状：值守 11:10Z 被手工停掉，它那一轮的 Pod 活到 17:24Z，一直握着检查点
+#    的 flock；此后每一轮都在 60–230 秒内以 checkpoint-locked 失败，一共 10 轮、零判例，
+#    而判词写的是「另一个驱动」——真正的持有者是上一轮自己的 Pod（它一直在判例，89 → 169，
+#    只是没有任何一行日志属于它）。所以判据是三面：留下的 Pod 要删；另一个**还活着**的驱动
+#    要让它、不许删它的 Pod；删完之后检查点还锁着，就说明持有者不是这一族，这一轮不许起。
+fake="$TMP/fake-kubectl"
+cat >"$fake" <<'SH'
+#!/usr/bin/env bash
+# 假 kubectl：只为 --reclaim 与「停这一跑」这两段判据。状态是 $FAKE_STATE 里的
+# `<名字> <起它的 pid>` 每行一条；每次 delete 记进 $FAKE_DELETES。
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--namespace) shift 2 ;;
+    get)
+      case "${2:-}" in
+        pods)
+          # `<名字> <pid> <checkpoint 标签>`，与线上 jsonpath 的三格同形。
+          while read -r n p c; do [ -n "$n" ] && printf '%s %s %s\n' "$n" "${p:--}" "${c:--}"; done <"${FAKE_STATE:-/dev/null}"
+          ;;
+        deployment) printf 'localhost:30500/cogneva:test\n' ;;
+      esac
+      exit 0 ;;
+    delete)
+      shift
+      [ "${1:-}" = pod ] && shift
+      if [ -n "${1:-}" ]; then
+        if [ -n "${FAKE_STATE:-}" ] && [ -f "$FAKE_STATE" ]; then
+          grep -v "^$1 " "$FAKE_STATE" >"$FAKE_STATE.new" || :
+          mv "$FAKE_STATE.new" "$FAKE_STATE"
+        fi
+        printf '%s\n' "$1" >>"${FAKE_DELETES:-/dev/null}"
+      fi
+      exit 0 ;;
+    apply)
+      # 清单从 stdin 来：把这一轮起的 Pod 名字记进状态，好让 delete 找得到它。
+      if [ -n "${FAKE_STATE:-}" ]; then
+        name=$(sed -n 's/^  name: \(.*\)$/\1/p' | head -1)
+        [ -n "$name" ] && printf '%s 0\n' "$name" >>"$FAKE_STATE"
+      fi
+      exit 0 ;;
+    exec|auth|logs) exit 0 ;;
+    *) shift ;;
+  esac
+done
+exit 0
+SH
+chmod +x "$fake"
+
+reclaim_case() { # reclaim_case <dir> -> 印出判词；日志与状态都在 <dir> 里
+  CKPT="$1/judge.md.cases.jsonl" LOG="$1/rerun.log" \
+    FAKE_STATE="$1/state" FAKE_DELETES="$1/deletes" KUBECTL="$fake" \
+    bash "$SCRIPT" --reclaim 2>&1
+}
+
+# 9. 驱动已经不在的 Pod（带 pid 的旧版、没有 pid 的史料）在下一轮起之前都要删掉。
+fa="$TMP/reclaim-a"; mkdir -p "$fa"; : >"$fa/state"; : >"$fa/deletes"
+printf 'eval-rerun-orphan 999999\n' >>"$fa/state"
+printf 'eval-rerun-unlabelled \n' >>"$fa/state"
+out=$(reclaim_case "$fa"); rc=$?
+verdict=$(printf '%s\n' "$out" | tail -1)
+if [ "$rc" -eq 0 ]; then ok "留下的 Pod 收完之后判词是 clean"; else bad "reclaim：期望 rc=0，实得 $rc（$out）"; fi
+case "$verdict" in
+  reclaim=clean*) ;;
+  *) bad "reclaim：期望判词 reclaim=clean，实得「$out」" ;;
+esac
+if grep -qx 'eval-rerun-orphan' "$fa/deletes" && grep -qx 'eval-rerun-unlabelled' "$fa/deletes"; then
+  ok "两个没有驱动的 Pod 都被删了"
+else
+  bad "留下的 Pod 没删干净：$(tr '\n' ' ' <"$fa/deletes")"
+fi
+
+# 10. 另一个驱动还活着：判让，而且不许删它的 Pod（删了就是杀掉别人正在花token的一轮）。
+fb="$TMP/reclaim-b"; mkdir -p "$fb"; : >"$fb/state"; : >"$fb/deletes"
+# `bash -c 'sleep 60'` 会被 bash 优化成 exec sleep，cmdline 里就只剩 sleep；多一条命令
+# 才留得住这个 shell，而 live 的判据读的正是 cmdline。
+bash -c 'sleep 60; :' eval-registered-rerun-probe "$SCRIPT" &
+live=$!
+printf 'eval-rerun-live %s\n' "$live" >>"$fb/state"
+out=$(reclaim_case "$fb"); rc=$?
+verdict=$(printf '%s\n' "$out" | tail -1)
+if [ "$rc" -eq 1 ]; then ok "另一个驱动活着时这一轮不起（rc=1）"; else bad "活着的驱动：期望 rc=1，实得 $rc（$out）"; fi
+case "$verdict" in
+  reclaim=refused*) ;;
+  *) bad "活着的驱动：期望判词 reclaim=refused，实得「$verdict」" ;;
+esac
+if grep -qx 'eval-rerun-live' "$fb/deletes"; then
+  bad "另一个驱动的 Pod 被删了：这一轮会把别人正在跑的判例打断"
+else
+  ok "另一个驱动的 Pod 没有被碰"
+fi
+kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+
+# 11. 没有 Pod 了、检查点却还锁着：持有者不是这一族。不许起一轮去撞那 60 秒的失败。
+fc="$TMP/reclaim-c"; mkdir -p "$fc"; : >"$fc/state"; : >"$fc/deletes"
+: >"$fc/judge.md.cases.jsonl"
+flock "$fc/judge.md.cases.jsonl" sleep 30 &
+holder=$!
+for _ in $(seq 1 50); do flock -n "$fc/judge.md.cases.jsonl" true || break; sleep 0.1; done
+out=$(reclaim_case "$fc"); rc=$?
+verdict=$(printf '%s\n' "$out" | tail -1)
+if [ "$rc" -eq 1 ]; then ok "检查点被一个不属于这一族的进程握着时这一轮不起（rc=1）"; else bad "锁着的检查点：期望 rc=1，实得 $rc（$out）"; fi
+case "$verdict" in
+  reclaim=refused*) ;;
+  *) bad "锁着的检查点：期望判词 reclaim=refused，实得「$verdict」" ;;
+esac
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+
+# 11b. 另一份记录的 Pod 不许碰：`checkpoint` 标签是这一版才有的，选择器故意宽一格去够
+#     上一版的残余，那就必须逐个看标签，否则两条腿会互相拆 Pod。
+ff="$TMP/reclaim-f"; mkdir -p "$ff"; : >"$ff/state"; : >"$ff/deletes"
+printf 'eval-rerun-other 999999 somebody-elses-record\n' >>"$ff/state"
+out=$(reclaim_case "$ff"); rc=$?
+verdict=$(printf '%s\n' "$out" | tail -1)
+if [ "$rc" -eq 0 ]; then ok "另一份记录的 Pod 不挡这一轮"; else bad "另一份记录：期望 rc=0，实得 $rc（$out）"; fi
+case "$verdict" in
+  reclaim=clean*) ;;
+  *) bad "另一份记录：期望判词 reclaim=clean，实得「$verdict」" ;;
+esac
+if grep -qx 'eval-rerun-other' "$ff/deletes"; then
+  bad "另一份记录的 Pod 被删了：两条腿会互相拆"
+else
+  ok "另一份记录的 Pod 没有被碰"
+fi
+case "$out" in
+  *'judges another checkpoint'*) ok "不碰的那一行说清了为什么" ;;
+  *) bad "不碰的那一行没说清是另一份记录：$out" ;;
+esac
+
+# 12. 问不出来是 2，不是「干净」，也不是「拒绝」。
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/kubectl-broken"
+chmod +x "$TMP/kubectl-broken"
+fd="$TMP/reclaim-d"; mkdir -p "$fd"; : >"$fd/state"; : >"$fd/deletes"
+out=$(CKPT="$fd/judge.md.cases.jsonl" LOG="$fd/rerun.log" FAKE_STATE="$fd/state" \
+      FAKE_DELETES="$fd/deletes" KUBECTL="$TMP/kubectl-broken" bash "$SCRIPT" --reclaim 2>&1); rc=$?
+verdict=$(printf '%s\n' "$out" | tail -1)
+if [ "$rc" -eq 2 ]; then ok "列不出 Pod 时判词是问不出来（rc=2）"; else bad "kubectl 读不到：期望 rc=2，实得 $rc（$out）"; fi
+case "$verdict" in
+  reclaim=unreadable*) ;;
+  *) bad "kubectl 读不到：期望判词 reclaim=unreadable，实得「$verdict」" ;;
+esac
+
+# 13. 停这一跑时（TERM），它那一轮的 Pod 跟着走——宿主进程死掉不会通知 Pod。
+#
+#    这里真把脚本跑起来（假 kubectl 让一轮建得成），在它等第一拍采样时把整个进程组 TERM
+#    掉，判两件事：退出码是 143，且 Pod 被删了。用 setsid 让脚本自成一组，否则 TERM 只
+#    够得着外层 shell，`sleep` 还在睡，trap 要等它睡完才跑。
+fe="$TMP/reclaim-e"; mkdir -p "$fe"; : >"$fe/state"; : >"$fe/deletes"
+cat >"$fe/wrapper.sh" <<WRAP
+#!/usr/bin/env bash
+echo \$\$ >"$fe/runner.pid"
+exec bash "$SCRIPT" --horizon 60
+WRAP
+chmod +x "$fe/wrapper.sh"
+setsid env CKPT="$fe/judge.md.cases.jsonl" LOG="$fe/rerun.log" \
+  FAKE_STATE="$fe/state" FAKE_DELETES="$fe/deletes" KUBECTL="$fake" \
+  bash "$fe/wrapper.sh" >"$fe/out" 2>&1 &
+for _ in $(seq 1 100); do [ -s "$fe/state" ] && break; sleep 0.1; done
+if [ -s "$fe/state" ]; then
+  ok "夹具把一轮跑起来了（Pod 已建）"
+  # 判「删的是这一轮的 Pod」，不是「有东西被删过」：旧的脚本在起 Pod 之前也会对**将要**
+  # 起的名字发一次 delete（那时它还不存在），拿「delete 记录非空」当判据会被那一次骗过。
+  running=$(awk 'NR==1{print $1}' "$fe/state")
+  kill -TERM -"$(cat "$fe/runner.pid")" 2>/dev/null
+  wait 2>/dev/null
+  if grep -qx "$running" "$fe/deletes" && [ ! -s "$fe/state" ]; then
+    ok "驱动被 TERM 时它那一轮的 Pod $running 被删了"
+  else
+    bad "驱动被 TERM 之后 Pod $running 还留着（deletes: $(tr '\n' ' ' <"$fe/deletes")）：下一轮会撞上自己的锁（日志：$(tail -2 "$fe/out" | tr '\n' ' ')）"
+  fi
+  if grep -q 'deleted this round' "$fe/rerun.log" 2>/dev/null; then
+    ok "删除这件事在日志里有一行，读者不用猜 Pod 是为什么没的"
+  else
+    bad "日志里没有删除那一行"
+  fi
+else
+  bad "夹具没能把一轮跑起来：$(tail -3 "$fe/out" | tr '\n' ' ')"
+fi
+
 printf '%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

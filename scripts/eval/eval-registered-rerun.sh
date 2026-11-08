@@ -112,6 +112,12 @@ DRY_RUN=${DRY_RUN:-}
 # 两边不一致时准入按另一份数算，滚动的重叠额度就会被这台 Pod 借走。测试拿这个开关
 # 比对两边，见 `eval-registered-rerun.test.sh`。
 PRINT_POD=${PRINT_POD:-}
+# 只做「把这一族留下的 Pod 收干净」并印判词，然后退出。给测试一个不建 Pod、不连评估
+# 循环的入口；线上每一轮起 Pod 之前走的是同一段（见 reclaim）。
+RECLAIM_ONLY=${RECLAIM_ONLY:-}
+# 等一个正在终止的 Pod 消失的界。Pod 的终止宽限默认 30 秒，kubelet 杀掉之后还要回收；
+# 留四倍宽限够它走完，又不至于把「持有者不是我们的」拖成一小时的空等。
+RECLAIM_WAIT=${RECLAIM_WAIT:-120}
 
 usage() {
   sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -136,6 +142,8 @@ Usage: eval-registered-rerun.sh [options]
                      prints the verdict and builds nothing
   --print-pod        print the pod manifest this run would create and exit; builds
                      nothing (the quota's runtime-pod budget is declared from it)
+  --reclaim          delete the pods this run left behind, wait until the checkpoint is
+                     free, print the verdict and exit; creates nothing
 EOF
 }
 
@@ -153,6 +161,7 @@ while [ $# -gt 0 ]; do
     --log) LOG=$2; shift 2;;
     --dry-run) DRY_RUN=$2; shift 2;;
     --print-pod) PRINT_POD=1; shift;;
+    --reclaim) RECLAIM_ONLY=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2;;
   esac
@@ -160,11 +169,114 @@ done
 
 CKPT=${CKPT:-$RUNS_DIR/$(basename "$OUT").cases.jsonl}
 KUBECTL=${KUBECTL:-sudo -n kubectl}
+# 这一跑的 Pod 只认自己这一份检查点。两个不同的 OUT（两份记录）可以同时跑，一个人把
+# 另一个人的 Pod 当残余删掉，就是拿一把锁去管两件不相干的事。
+RUN_ID=$(basename "$CKPT" | tr -c 'a-zA-Z0-9._-' '-' | sed 's/-*$//' | cut -c1-63)
+# 选择器故意比这一族宽一格：`checkpoint` 标签是这一版才有的，上一版留下的 Pod 没有它，
+# 而那一版的残余恰恰是最需要收的（它就是让下一版每一轮都 checkpoint-locked 的那个）。
+# 逐个再看一眼它的 `checkpoint`：有标签又不是我们的，那是另一份记录的 Pod，不碰。
+POD_SELECTOR="app=eval-table,run=registered-rerun"
 
 log() {
   mkdir -p "$(dirname "$LOG")"
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"
 }
+
+# 这一族 Pod 的 `<名字> <起它的宿主进程 pid>`。pid 用来分辨「上一轮的残余」与「另一个
+# 还在跑的驱动」——在 Pod 列表上这两件事同形。
+family_pods() {
+  $KUBECTL -n "$NAMESPACE" get pods -l "$POD_SELECTOR" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.annotations.cogneva\.dev/runner-pid}{" "}{.metadata.labels.checkpoint}{"\n"}{end}'
+}
+
+# 这一族里属于**这一份记录**的：我们的，或上一版没有 `checkpoint` 标签的残余。
+# 另一份记录的 Pod 有标签、标签不是我们——它归另一条腿管，这里连数都不数。
+our_pods() {
+  local raw
+  raw=$(family_pods) || return 1
+  printf '%s\n' "$raw" | while read -r name pid ckpt; do
+    [ -n "$name" ] || continue
+    if [ -n "${ckpt:-}" ] && [ "${ckpt:--}" != "-" ] && [ "$ckpt" != "$RUN_ID" ]; then continue; fi
+    printf '%s %s %s\n' "$name" "${pid:--}" "${ckpt:--}"
+  done
+}
+
+# 那个 pid 现在还在跑这一份脚本吗。pid 复用（同名同参）几乎不可能，真撞上也只是让这一
+# 轮退让一次、留一行判词；比杀掉别人的一轮便宜。
+runner_live() {
+  local pid=$1
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$pid" = "$$" ] && return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'eval-registered-rerun'
+}
+
+# 检查点此刻有没有写者。Pod 里那个驱动拿的是 flock，进程一死内核就放开；所以「还锁着」
+# 意味着还有一个活着的写者——要么是我们的 Pod 没删干净，要么根本不属于这一族。
+checkpoint_held() {
+  [ -f "$CKPT" ] || return 1
+  ! flock -n "$CKPT" true 2>/dev/null
+}
+
+# 把这一族留下的 Pod 收干净，再确认检查点空着。返回 0 可以起下一轮；1 有别的写者
+# （不许第二个写者）；2 问不出来。
+#
+# 为什么每一轮起 Pod 前都要做：Pod 是这一轮的孩子，孩子不该比父母活得久。2026-11-08
+# 实测它活得比父母久了——值守 11:10Z 被手工停掉，它那一轮的 Pod 活到 17:24Z；在这 3.5
+# 小时里每一轮都在 60–230 秒内以 checkpoint-locked 失败，一共 10 轮、零判例，而判词写的
+# 是「另一个驱动」，读的人会去找一个根本不存在的第二个会话。真正的持有者是上一轮自己
+# 的 Pod：它一直在判例（89 → 169），只是没有任何一行日志属于它。
+reclaim() {
+  local listing left name pid ckpt deadline live=()
+  listing=$(family_pods) || { log "cannot list the pods of this run ($POD_SELECTOR)"; return 2; }
+  while read -r name pid ckpt; do
+    [ -n "$name" ] || continue
+    if [ -n "${ckpt:-}" ] && [ "${ckpt:--}" != "-" ] && [ "$ckpt" != "$RUN_ID" ]; then
+      log "leaving $name alone: it judges another checkpoint ($ckpt), not $RUN_ID"
+      continue
+    fi
+    if runner_live "$pid"; then
+      live+=("$name(pid=$pid)")
+      continue
+    fi
+    log "reclaiming leftover pod $name: its driver pid=${pid:-unknown} is gone, and a pod that outlives its driver holds the checkpoint"
+    $KUBECTL -n "$NAMESPACE" delete pod "$name" --ignore-not-found --wait=false >/dev/null 2>&1
+  done <<<"$listing"
+  if [ "${#live[@]}" -gt 0 ]; then
+    log "another driver is live: ${live[*]}; refusing to become a second writer of $CKPT"
+    return 1
+  fi
+  deadline=$(( $(date +%s) + RECLAIM_WAIT ))
+  while :; do
+    left=$(our_pods) || { log "cannot list the pods of this run ($POD_SELECTOR)"; return 2; }
+    [ -z "$left" ] && break
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "the leftover pods did not go away within ${RECLAIM_WAIT}s: $(printf '%s' "$left" | tr '\n' ' ')"
+      return 1
+    fi
+    sleep 5
+  done
+  if checkpoint_held; then
+    log "the checkpoint $CKPT is still held and no pod of this run is left: the writer is not one of ours"
+    return 1
+  fi
+  return 0
+}
+
+# 这一轮起出来的 Pod。停这一跑时它必须跟着走：宿主上的进程死掉不会通知 Pod，而它握着
+# 检查点的独占权，下一轮就会在 60 秒内以 checkpoint-locked 失败。SIGKILL / 宿主重启时
+# 这个 trap 跑不到，那种残余由下一轮的 reclaim 收。
+CURRENT_POD=
+stop_round() {
+  local pod=${CURRENT_POD:-}
+  [ -n "$pod" ] || return 0
+  CURRENT_POD=
+  $KUBECTL -n "$NAMESPACE" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1
+  log "deleted this round's pod $pod: the driver is stopping, and a pod that outlives it holds the checkpoint"
+}
+trap stop_round EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # 线上正在跑的那个 rev，只为了在每一轮的第一行旁边站一个对照。
 #
@@ -312,7 +424,11 @@ kind: Pod
 metadata:
   name: $1
   namespace: $NAMESPACE
-  labels: {app: eval-table, run: registered-rerun}
+  labels: {app: eval-table, run: registered-rerun, checkpoint: "$RUN_ID"}
+  annotations:
+    # 这一轮由哪个宿主进程起的。下一轮起 Pod 前靠它分辨「上一轮的残余」与「另一个还在
+    # 跑的驱动」：前者该删，后者该让。
+    cogneva.dev/runner-pid: "$$"
 spec:
   restartPolicy: Never
   nodeName: $NODE_NAME
@@ -352,6 +468,17 @@ EOF
 # 打印就到此为止：下面每一行都会连集群。
 if [ -n "$PRINT_POD" ]; then manifest "${PRINT_POD_NAME:-eval-registered-rerun-shape}"; exit 0; fi
 
+# 只收残余：不读镜像、不问能不能建 Pod、不起任何东西。判词是机器可读的一行。
+if [ -n "$RECLAIM_ONLY" ]; then
+  reclaim; rc=$?
+  case "$rc" in
+    0) echo "reclaim=clean checkpoint=$CKPT" ;;
+    1) echo "reclaim=refused checkpoint=$CKPT" ;;
+    *) echo "reclaim=unreadable checkpoint=$CKPT" ;;
+  esac
+  exit "$rc"
+fi
+
 # 前置条件问不出来就判 3，别让它跑成一串「0 例」。
 # 这一段排在 `--print-pod` **之后**：打印清单是纯渲染，不连集群，也不读检查点。
 # 排在前面时，任何一台没有集群的机器（CI、刚克隆下来读形状的人）拿到的都是 3，
@@ -389,11 +516,19 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   if [ "$before" -ge "$TARGET" ]; then log "reached target: judged=$before"; exit 0; fi
   resolve_image
   name="eval-rerun-$(date -u +%m%d%H%M)"
+  # 起新 Pod 之前，先让检查点真的空下来：上一轮的 Pod 可能还在终止，或某个驱动已经死了
+  # 而它的 Pod 还活着。两者都会让这一轮在 60 秒内以 checkpoint-locked 失败，而判词读起来
+  # 像是「有第二个会话在跑」。
+  if ! reclaim; then
+    log "not starting a round: the checkpoint is not free ($CKPT)"
+    exit 3
+  fi
   $KUBECTL -n "$NAMESPACE" delete pod "$name" --ignore-not-found --wait=false >/dev/null 2>&1
   if ! manifest "$name" | $KUBECTL apply -f - >/dev/null 2>&1; then
     log "the pod could not be created ($name); retrying"
     sleep "$PAUSE"; continue
   fi
+  CURRENT_POD=$name
   started=$(date +%s)
   last_change=$started
   last_row=$started
@@ -423,6 +558,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # 要么连字节都没动过（stall）——前者抓的是自旋，后者抓的是真死。
   log "run $name phase=$phase dur=$(( $(date +%s) - started ))s judged=$before->$after scaffolds=$(by_scaffold) last=${last:-<no output>}"
   $KUBECTL -n "$NAMESPACE" delete pod "$name" --ignore-not-found --wait=false >/dev/null 2>&1
+  CURRENT_POD=
   if [ "$after" -gt "$before" ]; then sleep "$PAUSE_AFTER_GAIN"; else sleep "$PAUSE"; fi
 done
 
