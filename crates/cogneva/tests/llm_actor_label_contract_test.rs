@@ -98,6 +98,12 @@ const THREADED: &[(&str, &str)] = &[
         "crates/cog-agent/src/self_review.rs",
         "each step takes the actor the loop was built with",
     ),
+    (
+        "crates/cog-eval/src/adapters/hle.rs",
+        "the grading call names `JUDGE_ACTOR`, declared in the evaluator's own \
+         module: the value is a declared constant rather than a literal at this \
+         call site, and the census reads consts inside one file",
+    ),
 ];
 
 /// Files the census does not read, and why.
