@@ -297,7 +297,11 @@ impl EvaluatorActor {
                 (Verdict::Fail, 10, SELF_EVOLUTION_VERDICT_UNPARSEABLE)
             }
         } else if declared.is_empty() {
-            (Verdict::Pass, 85, SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED)
+            (
+                Verdict::Pass,
+                85,
+                SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED,
+            )
         } else if uncovered.is_empty() {
             (Verdict::Pass, 85, SELF_EVOLUTION_VERDICT_WELL_FORMED)
         } else {
@@ -575,8 +579,11 @@ mod tests {
         let cells = [
             judged_with_cell(&create_diff("crates/cogneva/src/elsewhere.rs"), &plan).1,
             judged_with_cell(&modify_diff("README.md"), &plan).1,
-            judged_with_cell(&create_diff("crates/cogneva/src/elsewhere.rs"), &serde_json::json!({}))
-                .1,
+            judged_with_cell(
+                &create_diff("crates/cogneva/src/elsewhere.rs"),
+                &serde_json::json!({}),
+            )
+            .1,
             judged_with_cell("not a diff at all\n", &plan).1,
         ];
         // 没有产物那一格走不到 diff 上：给它一份 artifacts 空表。

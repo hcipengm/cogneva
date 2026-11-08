@@ -623,7 +623,11 @@ mod tests {
             seen: seen.clone(),
         })));
         judge
-            .judge(&case("hle-actor", "exactMatch", "q", "42"), &env, &output("42"))
+            .judge(
+                &case("hle-actor", "exactMatch", "q", "42"),
+                &env,
+                &output("42"),
+            )
             .await
             .unwrap();
 

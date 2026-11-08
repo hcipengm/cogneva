@@ -522,28 +522,27 @@ async fn execute_handler(
             // so time spent queued is not time spent compiling: without this,
             // every extra build started beside it shortened the wall the others
             // had left, and each of them timed out having read nothing.
-            let build_slot = match build_slot_for(&state, tool_label(&req.payload), command, timeout)
-                .await
-            {
-                Ok(slot) => slot,
-                // A lane that stays full past the command's own budget is a
-                // refusal, not a failure of the executor: 503 says try again,
-                // 500 would say this request was broken.
-                Err(refusal @ LaneRefusal::Full { .. }) => {
-                    return watch.end(
-                        error_response(StatusCode::SERVICE_UNAVAILABLE, refusal.to_string()),
-                        Outcome::Refused,
-                    )
-                }
-                // The semaphore is never closed in this process; a caller that
-                // lands here is told so rather than run unbounded.
-                Err(refusal @ LaneRefusal::Closed(_)) => {
-                    return watch.end(
-                        error_response(StatusCode::INTERNAL_SERVER_ERROR, refusal.to_string()),
-                        Outcome::Refused,
-                    )
-                }
-            };
+            let build_slot =
+                match build_slot_for(&state, tool_label(&req.payload), command, timeout).await {
+                    Ok(slot) => slot,
+                    // A lane that stays full past the command's own budget is a
+                    // refusal, not a failure of the executor: 503 says try again,
+                    // 500 would say this request was broken.
+                    Err(refusal @ LaneRefusal::Full { .. }) => {
+                        return watch.end(
+                            error_response(StatusCode::SERVICE_UNAVAILABLE, refusal.to_string()),
+                            Outcome::Refused,
+                        )
+                    }
+                    // The semaphore is never closed in this process; a caller that
+                    // lands here is told so rather than run unbounded.
+                    Err(refusal @ LaneRefusal::Closed(_)) => {
+                        return watch.end(
+                            error_response(StatusCode::INTERNAL_SERVER_ERROR, refusal.to_string()),
+                            Outcome::Refused,
+                        )
+                    }
+                };
             match crate::runtime::local::spawn_command(
                 command,
                 timeout,
@@ -1198,13 +1197,24 @@ mod tests {
     async fn a_build_waits_its_turn_and_a_search_does_not() {
         let state = state_with_build_slots(1);
         let patience = std::time::Duration::from_secs(60);
-        let held = build_slot_for(&state, "run_command", "cargo test -p cogneva --lib", patience)
-            .await
-            .expect("the semaphore is open")
-            .expect("a build takes a slot");
+        let held = build_slot_for(
+            &state,
+            "run_command",
+            "cargo test -p cogneva --lib",
+            patience,
+        )
+        .await
+        .expect("the semaphore is open")
+        .expect("a build takes a slot");
 
         let queued = tokio::time::timeout(std::time::Duration::from_millis(80), async {
-            build_slot_for(&state, "run_command", "cargo clippy --all-targets", patience).await
+            build_slot_for(
+                &state,
+                "run_command",
+                "cargo clippy --all-targets",
+                patience,
+            )
+            .await
         })
         .await;
         assert!(
@@ -1227,7 +1237,12 @@ mod tests {
         // asked to do something that writes nothing into the target directory.
         let formatting = tokio::time::timeout(
             std::time::Duration::from_millis(80),
-            build_slot_for(&state, "run_command", "cargo fmt --all -- --check", patience),
+            build_slot_for(
+                &state,
+                "run_command",
+                "cargo fmt --all -- --check",
+                patience,
+            ),
         )
         .await
         .expect("formatting never queues")
@@ -1260,7 +1275,12 @@ mod tests {
         drop(held);
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            build_slot_for(&state, "run_command", "cargo clippy --all-targets", patience),
+            build_slot_for(
+                &state,
+                "run_command",
+                "cargo clippy --all-targets",
+                patience,
+            ),
         )
         .await
         .expect("the released slot admits the waiting build")

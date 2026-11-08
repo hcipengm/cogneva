@@ -539,7 +539,9 @@ mod tests {
         assert!(builds_the_tree("timeout 580 cargo test -p cogneva --lib"));
         assert!(builds_the_tree("env CARGO_TARGET_DIR=/tmp/t cargo build"));
         assert!(builds_the_tree("cargo test --workspace 2>&1 | tail -30"));
-        assert!(builds_the_tree("/usr/local/rustup/toolchains/x/bin/rustc -o /tmp/x /tmp/x.rs"));
+        assert!(builds_the_tree(
+            "/usr/local/rustup/toolchains/x/bin/rustc -o /tmp/x /tmp/x.rs"
+        ));
         assert!(builds_the_tree("cargo +nightly test -p cog-core"));
         assert!(builds_the_tree("cargo nextest run --profile ci"));
         // `clean` compiles nothing and deletes the directory the others write.
@@ -567,7 +569,9 @@ mod tests {
             "cargo metadata --format-version 1 --no-deps"
         ));
         assert!(!builds_the_tree("cargo tree -p cog-core --depth 1"));
-        assert!(!builds_the_tree("cargo locate-project --message-format plain"));
+        assert!(!builds_the_tree(
+            "cargo locate-project --message-format plain"
+        ));
         assert!(!builds_the_tree("cargo fetch --locked"));
     }
 
