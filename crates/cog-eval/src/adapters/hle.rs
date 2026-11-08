@@ -330,7 +330,11 @@ impl CaseJudge for HleJudge {
             .replace("{correct_answer}", correct_answer)
             .replace("{response}", &output.final_answer);
 
-        let options = ChatOptions::default().with_actor("eval");
+        // 判分那一半用自己的账名。HLE 一次评测有两个模型在花钱：骨架在解题，这个
+        // 裁判在给解题打分。两半此前共用 `eval`，于是「这一列花了多少」只有一个数，
+        // 而它是两种工钱的和——换裁判上游、换骨架模型都拆不开它。账名就是这一层唯一
+        // 能留下的分野，所以它必须来自那一个定义处，不在调用点上再写一遍字面量。
+        let options = ChatOptions::default().with_actor(crate::judge::JUDGE_ACTOR);
         let judged: HleJudgeVerdict =
             execute_structured(&**judge, &[Message::user(prompt)], &options).await?;
 
@@ -562,6 +566,78 @@ mod tests {
 
     fn envelope(json: &str) -> Arc<dyn LlmClient> {
         Arc::new(ScriptedJudge(json.into()))
+    }
+
+    /// 一个把**真正发出去的那一份**调用参数记下来的裁判上游。
+    ///
+    /// 账名是在调用点拼进 `options` 的，构造函数里根本没有它；测试若去读构造函数，
+    /// 读到的就是另一件事，那条断言在调用点改坏时照样绿。
+    struct ActorRecordingJudge {
+        reply: String,
+        seen: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ActorRecordingJudge {
+        async fn chat_stream(
+            &self,
+            _m: &[Message],
+            _o: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unreachable!("the HLE judge never streams")
+        }
+        async fn complete_stream(
+            &self,
+            _p: &str,
+            _o: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unreachable!("the HLE judge never streams")
+        }
+        async fn chat(&self, _m: &[Message], o: &ChatOptions) -> SFResult<ChatResponse> {
+            *self.seen.lock().unwrap_or_else(|p| p.into_inner()) =
+                o.headers.get(cog_core::LLM_ACTOR_HEADER).cloned();
+            Ok(ChatResponse {
+                content: vec![ContentBlock::text(self.reply.clone())],
+                ..Default::default()
+            })
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// 判分那一半在账上必须与解题分得开。
+    ///
+    /// 这一格此前一直是绿的，而账上从来没有过一行 `eval-judge`：那条守卫走的是七个
+    /// 预设判分器，HLE 适配器在另一个文件里绕过了它。所以标本必须是 **HLE 自己的
+    /// 判分器**，判据必须是**它真正发出去的 options**——两者差一个，这一格就又会绿着
+    /// 而账上分不开。
+    #[tokio::test]
+    async fn the_judge_half_is_billed_under_its_own_actor() {
+        let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
+        let seen: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let judge = HleJudge::new(Some(Arc::new(ActorRecordingJudge {
+            reply:
+                r#"{"extracted_final_answer":"42","reasoning":"same","correct":"yes","confidence":90}"#
+                    .into(),
+            seen: seen.clone(),
+        })));
+        judge
+            .judge(&case("hle-actor", "exactMatch", "q", "42"), &env, &output("42"))
+            .await
+            .unwrap();
+
+        let actor = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            actor.as_deref(),
+            Some(crate::judge::JUDGE_ACTOR),
+            "the judge call must carry its own actor name, got {actor:?}"
+        );
+        assert_ne!(
+            actor.as_deref(),
+            Some("eval"),
+            "the judge and the scaffold it grades must not share a label"
+        );
     }
 
     #[tokio::test]
