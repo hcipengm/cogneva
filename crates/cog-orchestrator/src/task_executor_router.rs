@@ -223,7 +223,7 @@ fn stall_poll_interval() -> Duration {
 }
 
 /// 守护空转的下限。
-// cap: override — 这是 CPU 代价的下限不是判据：没有窗口时每拍只醒一次判据，
+// cap: bound — 这是 CPU 代价的下限不是判据：没有窗口时每拍只醒一次判据，
 // 而判据那时恒为 `None`；再密也只是把一次 `select!` 换成两次。窗口有了之后
 // 拍子由窗口导出，这个数就不再是主力。
 const STALL_POLL_FLOOR: Duration = Duration::from_secs(1);
@@ -2533,9 +2533,9 @@ mod claim_concurrency_tests {
     /// 1,793 秒，就是这个数在起作用。
     #[test]
     fn the_local_lane_budget_is_its_own_number() {
-        // This variable is read by `local_claim_concurrency()` alone and no other
-        // test in this binary touches either variable, so the process-wide
-        // environment is not shared state here.
+        // 这两个变量是进程级的，下面那条用例也写它们：并行跑时一条的 "0"
+        // 会落进另一条的窗口里，把 `None` 读成 `Some(3)`。锁住整段。
+        let _serial = lane_env_lock();
         std::env::set_var(LOCAL_CLAIM_CONCURRENCY_ENV, "3");
         std::env::set_var(CLAIM_CONCURRENCY_ENV, "7");
         assert_eq!(
@@ -2566,6 +2566,7 @@ mod claim_concurrency_tests {
     /// 导出量不出价格时给的是 1（见 `lane_memory::derive_ceiling`），不是 0。
     #[test]
     fn a_zero_local_budget_asks_for_the_derived_bound_rather_than_stopping() {
+        let _serial = lane_env_lock();
         std::env::set_var(LOCAL_CLAIM_CONCURRENCY_ENV, "0");
         assert_eq!(
             local_claim_concurrency(),
@@ -2573,5 +2574,16 @@ mod claim_concurrency_tests {
             "0 asks for the derived bound; a stop would be the one reading it must never have"
         );
         std::env::remove_var(LOCAL_CLAIM_CONCURRENCY_ENV);
+    }
+
+    /// 写同一对进程级环境变量的用例之间的一把锁。
+    ///
+    /// 不是「记得同步跑」：`cargo test` 默认并行，两条用例各把变量设一次再删掉，
+    /// 删掉的那一下会落进另一条的窗口，读出来的 `None` 变成对方设的 `Some(3)`。
+    fn lane_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
