@@ -229,6 +229,31 @@ print_cost_table() { # [段日志]
     printf '  合计 %s 秒\n' "$(awk -F'\t' '{s += $1} END {printf "%d", s}' "${log}")"
 }
 
+# ---- 工具来源：一条门只有一个 ----
+#
+# 这件事必须发生在子命令分派**之前**。三把键里的 `gate_inputs` 记着工具的版本，而它问的
+# 是 `command -v`；整条判定跑起来之后才按 `~/.cargo/bin` 兜底找 cargo。两处不是一个来源，
+# 同一份树字节能算出两个键：钩子那边（PATH 里没有 cargo）算出 `cargo=absent`，跑绿的那一
+# 跑（兜底找到了 cargo）算出版本号，于是刚验过的这份字节在提交前仍然报「没验过」，整条
+# 记账的链在接缝处断掉。2026-11-09 实测到的就是这个形状。
+#
+# 所以先解析一次，再把解析到的目录交给孩子：本机的 cargo 只在 `~/.cargo/bin`，PATH 里没
+# 有；父进程用兜底找到了它，孩子（`check-format.sh` 的 `command -v cargo`、各条夹具自己的
+# 自检）却按 PATH 找、找不到，于是同一台机器上「这一格判得了」而「这一格里那条用例说这
+# 机器没有 cargo」。找到的那一份交给孩子，两处就只有一个来源。
+gate_rustc="$(command -v rustc || true)"
+[ -n "${gate_rustc}" ] || [ ! -x "${HOME}/.cargo/bin/rustc" ] || gate_rustc="${HOME}/.cargo/bin/rustc"
+gate_cargo="$(command -v cargo || true)"
+[ -n "${gate_cargo}" ] || [ ! -x "${HOME}/.cargo/bin/cargo" ] || gate_cargo="${HOME}/.cargo/bin/cargo"
+for gate_tool in "${gate_rustc}" "${gate_cargo}"; do
+    [ -n "${gate_tool}" ] || continue
+    gate_tool_dir="$(dirname "${gate_tool}")"
+    case ":${PATH}:" in
+    *":${gate_tool_dir}:"*) ;;
+    *) PATH="${gate_tool_dir}:${PATH}"; export PATH ;;
+    esac
+done
+
 case "${1:-}" in
 --cost-table)
     [ -n "${2:-}" ] || { echo "--cost-table 要一段段日志的路径" >&2; exit 2; }
@@ -505,23 +530,19 @@ done
 # `cargo test` 跑**同一个文件**：判据仍只有一份，代价是多花一分钟，比让这一格从此
 # 永远红着、把真正的红淹掉便宜。
 capreg_src="crates/cogneva/tests/rust_capacity_constants_registry_test.rs"
-capreg_rustc="$(command -v rustc || true)"
-[ -n "${capreg_rustc}" ] || [ ! -x "${HOME}/.cargo/bin/rustc" ] || capreg_rustc="${HOME}/.cargo/bin/rustc"
-capreg_cargo="$(command -v cargo || true)"
-[ -n "${capreg_cargo}" ] || [ ! -x "${HOME}/.cargo/bin/cargo" ] || capreg_cargo="${HOME}/.cargo/bin/cargo"
 capreg_bin="${TMPDIR:-/tmp}/cogneva-capreg.$$"
 capreg_compiled=no
-if [ -n "${capreg_rustc}" ] && CARGO_MANIFEST_DIR="${root}/crates/cogneva" \
-        "${capreg_rustc}" --test --edition 2021 -o "${capreg_bin}" "${capreg_src}"; then
+if [ -n "${gate_rustc}" ] && CARGO_MANIFEST_DIR="${root}/crates/cogneva" \
+        "${gate_rustc}" --test --edition 2021 -o "${capreg_bin}" "${capreg_src}"; then
     capreg_compiled=yes
 fi
 if [ "${capreg_compiled}" = yes ]; then
     run_step "容量登记表（${capreg_src}，经 rustc 直接编）" "${capreg_bin}"
     rm -f "${capreg_bin}"
-elif [ -n "${capreg_cargo}" ]; then
+elif [ -n "${gate_cargo}" ]; then
     run_step "容量登记表（${capreg_src}，经 cargo test：这份测试带 tests/common 的依赖，rustc 直接编找不到）" \
         run_suite_file "容量登记表（经 cargo test）" rust_capacity_constants_registry_test \
-        "${capreg_cargo}" test -p cogneva --test suite
+        "${gate_cargo}" test -p cogneva --test suite
 else
     # 与 pwsh 那一格同一条规矩：跑不了要说出来，不能安静跳过。
     echo "SKIP  容量登记表：本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
@@ -558,20 +579,7 @@ fi
 # 上去的是提交**。共享工作树里别的会话飞到一半的改动也在这一份读数里，所以它红的时候先
 # `git status` 看一眼红的是谁的文件——别人的半成品不进你的提交，这一格红了也说明不了你要
 # 推的那一笔红了。反过来也别把它当噪声：那一格绿的时候它确实判过了你树上的东西。
-cargo_bin="${capreg_cargo}"
-
-# 孩子进程也从同一条路找工具：本机的 cargo 只在 `~/.cargo/bin`，PATH 里没有。父进程用
-# 兜底找到了它，孩子（`check-format.sh` 的 `command -v cargo`、各条夹具自己的自检）却
-# 按 PATH 找、找不到，于是同一台机器上「这一格判得了」而「这一格里那条用例说这机器没有
-# cargo」。2026-11-09 实测红的就是这一格：Format 那一步在 `[ -n "${cargo_bin}" ]` 之后
-# 才跑，孩子却退 2。一条门只该有一个工具来源，把找到的那一份交给孩子就只有一个。
-if [ -n "${cargo_bin}" ]; then
-    cargo_dir="$(dirname "${cargo_bin}")"
-    case ":${PATH}:" in
-    *":${cargo_dir}:"*) ;;
-    *) PATH="${cargo_dir}:${PATH}"; export PATH ;;
-    esac
-fi
+cargo_bin="${gate_cargo}"
 
 if [ -n "${cargo_bin}" ]; then
     # 合并成一个测试二进制之后，选「一份文件」靠的是模块名当 filter：过滤词是模块路径的
