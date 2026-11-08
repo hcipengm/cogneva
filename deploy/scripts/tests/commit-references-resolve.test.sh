@@ -248,7 +248,99 @@ git add crates
 quoted="$(commit 'quote modules on lines added inside an open literal and comment')"
 out="$("${checker}" --base "${opened}" --head "${quoted}" 2>&1)" || fail "a line inside an open literal or comment was read as a reference"$'\n'"${out}"
 
-# 10. An unasked question is never green.
+# 10. Green: a root item written with the qualifiers Rust allows before the
+#     item kind. `pub(crate) async fn` is a root item like any other; a resolver
+#     that only knew the bare kinds called the root it defines unanswerable
+#     (measured 2026-11-09 on `crate::read_active_alerts`).
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod ghost;
+#[path = "elsewhere/relocated.rs"]
+pub mod relocated;
+pub mod nested;
+pub fn f() {
+    crate::alpha::g();
+    crate::ghost::g();
+}
+pub(crate) async fn read_active_alerts() -> u32 {
+    0
+}
+pub async fn reader() -> u32 {
+    crate::read_active_alerts().await
+}
+RS
+git add crates
+qualified="$(commit 'define a pub(crate) async root item and call it')"
+out="$("${checker}" --base "${quoted}" --head "${qualified}" 2>&1)" ||
+    fail "a qualified root item was read as unanswerable"$'\n'"${out}"
+
+# 11. Green: a name reached through a chain of glob re-exports. `crate::foo`
+#     resolves at the root however many `pub use x::*;` hops put it there, so a
+#     resolver that stopped at the `*` called a name the crate does answer
+#     unanswerable (measured 2026-11-09 on `crate::employee_label`).
+mkdir -p crates/demo/src/types
+cat >crates/demo/src/types/agent_state.rs <<'RS'
+pub fn employee_label(number: u32) -> String {
+    format!("E{number:04}")
+}
+RS
+cat >crates/demo/src/types/mod.rs <<'RS'
+pub mod agent_state;
+pub use agent_state::*;
+RS
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod ghost;
+#[path = "elsewhere/relocated.rs"]
+pub mod relocated;
+pub mod nested;
+pub mod types;
+pub use types::*;
+pub fn f() {
+    crate::alpha::g();
+    crate::ghost::g();
+}
+pub fn label() -> String {
+    crate::employee_label(7)
+}
+RS
+git add crates
+globbed="$(commit 'reach a name through two glob re-exports')"
+out="$("${checker}" --base "${qualified}" --head "${globbed}" 2>&1)" ||
+    fail "a name reached through a glob re-export stayed red"$'\n'"${out}"
+
+# 12. Red: the same glob, a name it does not carry. Following the chain must not
+#     become a free pass -- if any `pub use x::*;` answered every name, the gate
+#     would stay green on the very break it exists to catch.
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod ghost;
+#[path = "elsewhere/relocated.rs"]
+pub mod relocated;
+pub mod nested;
+pub mod types;
+pub use types::*;
+pub fn f() {
+    crate::alpha::g();
+    crate::ghost::g();
+}
+pub fn label() -> String {
+    crate::employee_label(7)
+}
+pub fn unknown() -> String {
+    crate::unregistered_label("e1")
+}
+RS
+git add crates
+missed="$(commit 'reach a name no re-export in this tree carries')"
+out="$("${checker}" --base "${globbed}" --head "${missed}" 2>&1)" && status=0 || status=$?
+[ "${status}" -eq 1 ] || fail "a name behind a glob re-export that does not carry it exited ${status}, wanted 1"$'\n'"${out}"
+grep -q 'crate::unregistered_label' <<<"${out}" || fail "the red did not name crate::unregistered_label"$'\n'"${out}"
+
+# 13. An unasked question is never green.
 if "${checker}" --base does-not-exist --head "${nested}" >/dev/null 2>&1; then
   fail "an unresolvable base exited 0"
 fi
