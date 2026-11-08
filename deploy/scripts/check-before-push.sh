@@ -27,7 +27,7 @@
 # 命令是从 `.github/workflows/ci.yml` 里**取**的，不是在这里抄一份：抄一份的门会在
 # 有人加作业时静默变窄，而这条门唯一不能犯的错就是「它绿了，CI 却红了」。
 #
-# 不覆盖：Check / Code Coverage / Format / Version Contract /
+# 不覆盖：Check / Code Coverage / Version Contract /
 # Web Build / Bootstrap Cross-Platform —— 它们要编译或要 Node，本机跑一遍可能比 CI
 # 还慢。末尾会把这份清单印出来：**这条门绿不等于 CI 绿**，它只保证那几类「改动碰了
 # 别的面的读者」的判据不是推上去才发现的。
@@ -611,6 +611,19 @@ else
     echo "SKIP  crate 骨架：本机没有可用的 cargo（CI 的 Test 会跑这两步）"
 fi
 
+# Format 那一格在 CI 里是 `cargo fmt --all -- --check`：整棵树、十秒、一次编译都不用，
+# 而它是 main 上的必过检查之一，本地此前一个调用点都没有。代价不对称得厉害——一笔没排过
+# 格式的改动推上去，二十分钟后红的是空格，而 CI 红期间主线部署器读到 verdict=fail 就把
+# 整班滚动扣住，部署停在那里等这一笔重推。
+#
+# 判的是**工作树**：这条门最常被问的一刻是「我正要提交」，那一笔的字节还在工作树里、没进
+# HEAD。共享树里别人的在飞改动会让这一格替它红一次——那是多判，不是假绿（与 Test 同一取舍）。
+if [ -n "${cargo_bin}" ] && "${cargo_bin}" fmt --version >/dev/null 2>&1; then
+    run_step "cargo fmt --all -- --check（CI 的 Format 作业同一条）" bash "${here}/check-format.sh"
+else
+    echo "SKIP  Format：本机 cargo 没有 rustfmt 组件（CI 的 Format 会整份跑）"
+fi
+
 # Clippy 那一格在 CI 里是整份 workspace 的 `--all-targets -- -D warnings`，红一格就判整轮
 # 四十分钟为红。它的红只值一行：2026-10-30 一次 `let mut` 的 `unused_mut` 就这样烧掉了一轮，
 # 而本机此前一条读数都看不见它——脚本末尾那句「未覆盖」里写着 Clippy。
@@ -777,7 +790,7 @@ echo "PRE-PUSH: 上列的判据全绿。"
 echo "Clippy 只判这次要推的提交动过的 crate；其余 crate 的 lint 仍由 CI 整份跑。"
 echo "Test 只判这次动过的包加装配件 cogneva；其余 crate 的测试仍由 CI 整棵跑。"
 echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Code Coverage /"
-echo "Format / Version Contract / Web Build / Bootstrap Cross-Platform。"
+echo "Version Contract / Web Build / Bootstrap Cross-Platform。"
 
 # 绿了才记账。红的那一跑什么也不写：一份没验过的字节不能因为「上次跑过」就推得出去。
 #
