@@ -559,6 +559,20 @@ fi
 # `git status` 看一眼红的是谁的文件——别人的半成品不进你的提交，这一格红了也说明不了你要
 # 推的那一笔红了。反过来也别把它当噪声：那一格绿的时候它确实判过了你树上的东西。
 cargo_bin="${capreg_cargo}"
+
+# 孩子进程也从同一条路找工具：本机的 cargo 只在 `~/.cargo/bin`，PATH 里没有。父进程用
+# 兜底找到了它，孩子（`check-format.sh` 的 `command -v cargo`、各条夹具自己的自检）却
+# 按 PATH 找、找不到，于是同一台机器上「这一格判得了」而「这一格里那条用例说这机器没有
+# cargo」。2026-11-09 实测红的就是这一格：Format 那一步在 `[ -n "${cargo_bin}" ]` 之后
+# 才跑，孩子却退 2。一条门只该有一个工具来源，把找到的那一份交给孩子就只有一个。
+if [ -n "${cargo_bin}" ]; then
+    cargo_dir="$(dirname "${cargo_bin}")"
+    case ":${PATH}:" in
+    *":${cargo_dir}:"*) ;;
+    *) PATH="${cargo_dir}:${PATH}"; export PATH ;;
+    esac
+fi
+
 if [ -n "${cargo_bin}" ]; then
     # 合并成一个测试二进制之后，选「一份文件」靠的是模块名当 filter：过滤词是模块路径的
     # 前缀，整份文件的所有用例都在它下面，挑一条用例仍然要再写一层名字——判据还是整份文件
