@@ -17,6 +17,11 @@
 # 那整条分钟级的判定：记账的键由 `--key` 印出来，这里自己落一笔，判的是读账那一侧。
 set -euo pipefail
 
+# 这份夹具在临时树里跑 `git init`。被钩子拉起来时，git 把 GIT_DIR / GIT_WORK_TREE /
+# GIT_INDEX_FILE 指向**调用方那棵树**，夹具里的 init 就会落到别人的仓库上。文件级清掉；
+# 第 10 例要的是「带着这些变量被拉起来」那个形状，它在命令行上自己按需再给一次。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 gate="${repo}/deploy/scripts/check-before-push.sh"

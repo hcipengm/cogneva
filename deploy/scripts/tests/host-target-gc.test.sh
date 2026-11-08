@@ -33,6 +33,12 @@
 # to test the refusal at all.
 set -euo pipefail
 
+# The fixture below runs `git init`. Called from a git hook, git hands us the
+# caller's GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE, and an init under them lands in
+# that tree instead of the fixture. Clear them at file scope; anything that has
+# to carry them on purpose sets them on the command line.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 gc="${repo}/deploy/scripts/host-target-gc.sh"
