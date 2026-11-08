@@ -1,6 +1,7 @@
-import { useEffect } from 'react';
+import { useCallback, useEffect, type PointerEvent as ReactPointerEvent } from 'react';
 import { closeExplain, useExplainSubject } from '@/ui/explain';
 import { Icon } from '@/shell/icons';
+import { DRAWER_DEFAULT_WIDTH, useShell } from '@/shell/store';
 import { Note } from '@/ui/Note';
 
 function moment(iso: string | null): string {
@@ -26,6 +27,38 @@ function moment(iso: string | null): string {
  */
 export function ExplainDrawer() {
   const subject = useExplainSubject();
+  const width = useShell((s) => s.drawerWidth);
+  const setWidth = useShell((s) => s.setDrawerWidth);
+
+  /**
+   * 拖左沿改宽。抽屉贴着右边，所以往左拖是变宽：位移取反。
+   *
+   * 指针移出抽屉之后事件还在 window 上——拖拽一旦开始就该跟着指针走完，而不是
+   * 在边界处断掉。与左栏那条抓带同一套写法，读者在两边学到的是同一个动作。
+   */
+  const startDrag = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const fromX = event.clientX;
+      const fromWidth = width;
+      const previousCursor = document.body.style.cursor;
+      const previousSelect = document.body.style.userSelect;
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+
+      const move = (e: PointerEvent) => setWidth(fromWidth - (e.clientX - fromX));
+      const stop = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', stop);
+        document.body.style.cursor = previousCursor;
+        document.body.style.userSelect = previousSelect;
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', stop);
+    },
+    [setWidth, width]
+  );
 
   useEffect(() => {
     if (!subject) return;
@@ -40,9 +73,22 @@ export function ExplainDrawer() {
 
   return (
     <aside
-      className="absolute right-0 top-0 z-40 flex h-full w-[340px] flex-col border-l border-[var(--line-strong)] bg-[var(--ink-900)] shadow-xl"
+      className="absolute right-0 top-0 z-40 flex h-full flex-col border-l border-[var(--line-strong)] bg-[var(--ink-900)] shadow-xl"
+      style={{ width }}
       aria-label="这个数的来路"
     >
+      {/* 抓的是这条 6px 的窄带而不是一像素的边框：边框太细，按不中就等于没有。
+          常显一条淡线，读者才知道这里可以拖。 */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="拖拽调整抽屉宽度"
+        onPointerDown={startDrag}
+        onDoubleClick={() => setWidth(DRAWER_DEFAULT_WIDTH)}
+        title="拖拽调整宽度，双击回到默认"
+        className="absolute -left-[3px] top-0 h-full w-[6px] cursor-col-resize bg-transparent transition-colors hover:bg-[var(--line-strong)]"
+        data-drawer-resizer="true"
+      />
       <header className="flex h-9 shrink-0 items-center gap-2 border-b border-[var(--line)] px-3">
         <span className="text-[11px] uppercase tracking-[0.12em] text-[var(--muted)]">来路</span>
         <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--paper)]">{subject.label}</span>

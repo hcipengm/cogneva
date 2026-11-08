@@ -316,9 +316,10 @@ pub struct ToolRegistry {
     /// Budget for shell commands. Kept apart from `wasm_timeout`: a snippet is
     /// bounded work, a command may be a compiler run.
     shell_timeout: Duration,
-    /// When true, shell-class tools reject calls without a [`ToolScope`].
-    /// Evolution pods turn this on so no command can reach the executor under
-    /// a synthetic identity; default off keeps embedded/main-app behavior.
+    /// When true, shell-class tools reject calls that carry no identity at all
+    /// -- neither a [`ToolScope`] nor an announced caller. Evolution pods turn
+    /// this on so no command can reach the executor under a synthetic identity;
+    /// default off keeps embedded/main-app behavior.
     require_identity: bool,
 }
 
@@ -452,10 +453,13 @@ impl ToolRegistry {
         self.execute_scoped(name, arguments, None).await
     }
 
-    /// Execute a tool with the real run identity. `None` scope means the
-    /// caller never established task identity (legacy/embedded path); the
-    /// synthetic id gets an `unscoped-` prefix so logs can tell the two apart,
-    /// and when `require_identity` is on shell tools are rejected outright.
+    /// Execute a tool with the real run identity. `None` scope means the caller
+    /// never established task identity (legacy/embedded path); the synthetic id
+    /// gets an `unscoped-` prefix so logs can tell the two apart. With
+    /// `require_identity` on, shell tools are rejected when there is neither a
+    /// task scope nor an announced caller ([`CALLER_AGENT_ID`]): a task-less
+    /// run of a named employee or squad member has the second, and refusing it
+    /// would be refusing an identity it has.
     pub async fn execute_scoped(
         &self,
         name: &str,
@@ -563,7 +567,12 @@ impl ToolRegistry {
                 Ok(result.into_json())
             }
             ToolImplementation::Shell(op) => {
-                if scope.is_none() && self.require_identity {
+                // 「这个调用是谁发的」有两个来源，不是一个：任务作用域，和派发器
+                // 在调用前公布的本轮执行者（`CALLER_AGENT_ID`）。名册上的员工与
+                // 小队成员跑的是没有任务的 prompt，它只有后者——只认前者会把它们
+                // 的每一条 shell 都拒掉，而它们的身份并不缺。缺的是两者都没有：
+                // 那种调用才无名可归，`sandbox_task_id` 也只会给它一个一次性目录。
+                if scope.is_none() && self.require_identity && caller_agent_id().is_none() {
                     return Err(ToolRunError::Failed(cog_core::SFError::Agent(format!(
                         "tool '{name}' requires task identity (require_tool_identity=true); \
                          call through prompt_for_task"
@@ -591,6 +600,7 @@ impl ToolRegistry {
                         let task_id = sandbox_task_id(scope);
                         let agent_id = scope
                             .map(|s| s.agent_id.clone())
+                            .or_else(caller_agent_id)
                             .unwrap_or_else(|| format!("unscoped-tool-{}", name));
                         let mut files = Vec::with_capacity(paths.len());
                         for path in &paths {
@@ -743,8 +753,13 @@ impl ToolRegistry {
                 };
                 let req = SandboxRequest {
                     task_id: sandbox_task_id(scope),
+                    // 没有任务作用域时，执行者就是派发器公布的那一个：沙箱里的
+                    // 归属应当写谁发的这条命令，而 `unscoped-tool-<工具名>` 写的
+                    // 是工具本身——同一台机器上两个人的 `run_command` 会共用这
+                    // 个名字。
                     agent_id: scope
                         .map(|s| s.agent_id.clone())
+                        .or_else(caller_agent_id)
                         .unwrap_or_else(|| format!("unscoped-tool-{}", name)),
                     payload,
                     input: arguments,
@@ -2695,6 +2710,53 @@ mod tests {
         );
     }
 
+    /// An announced caller is an identity, and it is the only one a task-less
+    /// run has.
+    ///
+    /// The roster's employees and squad members run prompts with no task; the
+    /// dispatcher announces who they are through [`CALLER_AGENT_ID`]. Judging
+    /// "has a task scope" as "has an identity" refused every shell call they
+    /// made as `requires task identity` even though the answer was right there
+    /// -- measured 2026-11-07 on the deployed chat path. The second half is the
+    /// other reason the caller matters: the workspace a task-less call lands in
+    /// is keyed by the caller, so two calls from one agent share it, and two
+    /// agents do not.
+    #[tokio::test]
+    async fn require_identity_accepts_an_announced_caller_and_keeps_one_workspace() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry = ToolRegistry::new()
+            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>)
+            .with_require_identity(true);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        for _ in 0..2 {
+            CALLER_AGENT_ID
+                .scope("squad:DSC-1A2B-generator".to_string(), async {
+                    registry
+                        .execute("run_command", serde_json::json!({"command": "pwd"}))
+                        .await
+                        .unwrap();
+                })
+                .await;
+        }
+
+        let seen = backend.seen.lock().await.clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "an announced caller is not refused: {seen:?}"
+        );
+        assert_eq!(seen[0].0, "unscoped-shell-squad-DSC-1A2B-generator");
+        assert_eq!(
+            seen[1].0, seen[0].0,
+            "the second call landed in another workspace: {seen:?}"
+        );
+        assert_eq!(
+            seen[0].1, "squad:DSC-1A2B-generator",
+            "the sandbox records the tool's name as the agent, not the caller: {seen:?}"
+        );
+    }
+
     #[tokio::test]
     async fn scope_does_not_leak_between_runs() {
         let backend = Arc::new(RecordingBackend::default());
@@ -3195,6 +3257,24 @@ pub mod builtins {
                     // of several peers you are.
                     let me = caller_agent_id();
                     let live = registry.list().await?;
+                    // 名字来自名册行（工号＋姓名）。读不到名册时留下的是一句
+                    // 「待编」而不是退回机器码：目录里出现一串十六进制，读的
+                    // 人只会把它当成名字，于是没人去补那一次编号。
+                    let roster: std::collections::HashMap<String, cog_core::EmployeeRecord> =
+                        match registry.employees().await {
+                            Ok(rows) => rows
+                                .into_iter()
+                                .map(|row| (row.agent_id.clone(), row))
+                                .collect(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "the employee roster could not be read; the directory \
+                                     lists ids without names this pass"
+                                );
+                                std::collections::HashMap::new()
+                            }
+                        };
                     let agents: Vec<serde_json::Value> = live
                         .into_iter()
                         .filter(|r| role.is_none_or(|role| r.role == role))
@@ -3203,16 +3283,20 @@ pub mod builtins {
                         })
                         .map(|r| {
                             let is_me = me.as_deref() == Some(r.agent_id.as_str());
-                            // The name is derived from the id by the same pure
-                            // function the workbench's roster uses, so the
-                            // directory and the board read the same person as
-                            // the same name. Without it an agent reading the
-                            // directory can only report its id, and "who am I"
-                            // answers with a routing key rather than a name.
-                            let display_name = cog_core::display_name_for(&r.agent_id);
+                            // 与员工页同一个来源：名册行。目录和名单读到的是
+                            // 同一个名字，没有第二条拼法。
+                            let entry = roster.get(&r.agent_id);
+                            let display_name = match entry {
+                                Some(row) => row.label(),
+                                None => cog_core::unregistered_label(&r.agent_id),
+                            };
+                            let number = entry
+                                .and_then(|row| row.number)
+                                .map(|n| format!("{}{n:04}", cog_core::EMPLOYEE_NUMBER_PREFIX));
                             serde_json::json!({
                                 "agent_id": r.agent_id,
                                 "display_name": display_name,
+                                "number": number,
                                 "role": r.role,
                                 "workspace_id": r.workspace_id,
                                 "capabilities": r.capabilities,

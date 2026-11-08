@@ -1,4 +1,3 @@
-import { AgentsView } from '@/views/AgentsView';
 import { AlertsView } from '@/views/AlertsView';
 import { AuditView } from '@/views/AuditView';
 import { ChangesView } from '@/views/ChangesView';
@@ -22,7 +21,7 @@ import { TasksView } from '@/views/TasksView';
 import { TimelineView } from '@/views/TimelineView';
 import { VenuesView } from '@/views/VenuesView';
 import { TokenView } from '@/views/TokenView';
-import { WorkspaceView } from '@/views/WorkspaceView';
+import { WorkbenchView } from '@/views/WorkbenchView';
 import { Empty } from '@/ui/primitives';
 
 /**
@@ -37,7 +36,9 @@ import { Empty } from '@/ui/primitives';
 export function ViewFor({ view }: { view: string }) {
   switch (view) {
     case 'workspace':
-      return <WorkspaceView />;
+      // 工作台是四格与一条状态灯（投入 产出 能力 项目）。会话不在这一面：它的家
+      // 是员工页——一段对话与一个智能体的上下文是一对一的，落在「谁」那一面上。
+      return <WorkbenchView />;
     case 'people':
       return <PeopleView />;
     case 'venues':
@@ -61,7 +62,9 @@ export function ViewFor({ view }: { view: string }) {
     case 'comms':
       return <CommsView />;
     case 'agents':
-      return <AgentsView />;
+      // 智能体与员工合并成一面：读的是同一份名单，分开只会让同一批人两处各认
+      // 一次。旧链接（收藏、侧栏交叉链接、状态栏）仍能打开，落到同一个页面。
+      return <PeopleView />;
     case 'progress':
       return <ProgressView />;
     case 'changes':

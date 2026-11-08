@@ -1066,11 +1066,18 @@ export async function markAllNotificationsRead(): Promise<void> {
 export interface AgentSummary {
   agent_id: string;
   /**
-   * 名册给这个人写的名字，由 id 确定性地算出来（同一个人每次读都一样）。
+   * 名册给这个人写的名字：`E0412 林清和`，工号在前、姓名在后。
    * 服务端一直返回它；类型里漏了的话，界面就只能拿 id 当名字，读的人分不出
    * 「这个名字是平台给的」还是「这串十六进制就是它」。
    */
   display_name: string;
+  /** 工号，与 display_name 前半截同一个值。还没入册的人是 null。 */
+  number?: string | null;
+  /** 姓名，与 display_name 后半截同一个值。还没入册的人是 null。 */
+  person_name?: string | null;
+  /** 在职 / 离职。缺省是在职。 */
+  retired?: boolean;
+  retired_at?: string | null;
   role: string;
   workspace_id: string;
   hostname: string;
@@ -2074,6 +2081,7 @@ export async function getBuildRuns(): Promise<BuildRunsView> {
   return api.get<BuildRunsView>('/api/v1/evolution/builds');
 }
 
+
 export interface EvalDatasetInfo {
   name: string;
   path: string;
@@ -2613,6 +2621,95 @@ export interface ProgressPage {
 
 export async function getProgress(): Promise<ProgressPage> {
   return api.get<ProgressPage>('/api/v1/governance/progress');
+}
+
+// ── 工作台 ──
+
+/**
+ * 一份读数量到了没有。
+ *
+ * `not_wired` 是「这条读数还没接上」——缺的是哪一层写在 `because` 里；`unread`
+ * 是接了但这一拍读失败。两者都不带值，所以界面上印破折号而不是 0：0 是一个
+ * 读数，会把「不知道」说成「量出来是零」。
+ */
+export type WorkbenchReadingState = 'measured' | 'not_wired' | 'unread';
+
+/** 一个数的单位。数的意义由后端说，前端只按它选词与位数。 */
+export type WorkbenchUnit = 'count' | 'hours' | 'calls';
+
+/** 一份读数的值：钱按币种分笔，数带自己的单位。 */
+export type WorkbenchValue =
+  | { kind: 'money'; totals: SpendTotals }
+  | { kind: 'number'; n: number; unit: WorkbenchUnit };
+
+export interface WorkbenchReading {
+  state: WorkbenchReadingState;
+  /** `measured` 时才有；另外两态由 `because` 说原因。 */
+  value?: WorkbenchValue;
+  /**
+   * `not_wired` 时说缺哪一层；`unread` 时说哪一步读失败了。
+   *
+   * `measured` 时也可能有：那是这个值的限定语（例如「只数了进程内」），不是
+   * 替掉值的理由。
+   */
+  because?: string;
+}
+
+/** 一格在 12 列网格里横跨几列，宽中窄三档各说一次。 */
+export interface WorkbenchSpan {
+  wide: number;
+  mid: number;
+  narrow: number;
+}
+
+/** 格子里的一行：一个分项读数。 */
+export interface WorkbenchRow {
+  label: string;
+  reading: WorkbenchReading;
+  /** 这个数是不是「该处理了」。只影响配色，不改变数的意义。 */
+  warn: boolean;
+}
+
+/** 工作台上的一格是谁。 */
+export type WorkbenchCellId = 'invest' | 'output' | 'capability' | 'project';
+
+/** 工作台上的一格。 */
+export interface WorkbenchCell {
+  id: WorkbenchCellId;
+  title: string;
+  /** 越小越靠前。顺序是数据说的，不是前端数组下标说的。 */
+  priority: number;
+  span: WorkbenchSpan;
+  /** 点进去的那一面，是前端 store 里的面 id。 */
+  href: string;
+  main: WorkbenchReading;
+  rows: WorkbenchRow[];
+}
+
+/** 状态灯的一段：读的是「该处理了没有」，不是规模。 */
+export interface WorkbenchLamp {
+  id: string;
+  label: string;
+  reading: WorkbenchReading;
+  href: string;
+}
+
+/**
+ * 工作台的四格与一条状态灯，在同一个时刻读出。
+ *
+ * 版式意图在这个响应里（`priority` 与 `span`），不在界面里：前端只做「格 → 网格
+ * 位置」的确定性映射。
+ */
+export interface WorkbenchPage {
+  generated_at: string;
+  /** 投入与产出对账的那个窗口（小时）。上一窗是同样长的前一段。 */
+  window_hours: number;
+  cells: WorkbenchCell[];
+  lamps: WorkbenchLamp[];
+}
+
+export async function getWorkbench(): Promise<WorkbenchPage> {
+  return api.get<WorkbenchPage>('/api/v1/workbench');
 }
 
 // ── 变更队列 ──

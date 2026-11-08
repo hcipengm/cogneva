@@ -116,3 +116,10 @@ canvas {
   background: var(--brass);
   box-shadow: 0 0 8px color-mix(in srgb, var(--brass) 45%, transparent);
 }
+
+/*
+ * 工作台的 Bento 网格不需要这里的样式：每格横跨几列由后端在数据里声明
+ * （`span.narrow` / `mid` / `wide`），断点由 `hooks/useBreakpoint.ts` 回答，
+ * 两者在行内样式里合成一个 `grid-column`。写进 CSS 自定义属性会把布局数字
+ * 混进配色令牌那一组，而配色的规则是每套主题都必须填满。
+ */

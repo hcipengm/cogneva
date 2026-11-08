@@ -20,7 +20,7 @@ set -euo pipefail
 # 这份夹具在临时树里跑 `git init`。被钩子拉起来时，git 把 GIT_DIR / GIT_WORK_TREE /
 # GIT_INDEX_FILE 指向**调用方那棵树**，夹具里的 init 就会落到别人的仓库上。文件级清掉；
 # 第 10 例要的是「带着这些变量被拉起来」那个形状，它在命令行上自己按需再给一次。
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
@@ -209,4 +209,35 @@ rc=0
     >"${work}/out" 2>&1 || rc=$?
 [ "${rc}" -eq 2 ] || fail "没有改动时 --status-patch 应退 2（问不了），实得 ${rc}：$(cat "${work}/out")"
 
-echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效"
+# 15) 工具来源只有一个：键不该取决于调用方的 PATH 里有没有 cargo。钩子里 PATH 里没有它，
+#     跑绿的那一跑靠 `~/.cargo/bin` 兜底找到了它；工具解析若发生在子命令分派**之后**，
+#     分派时问出的键里写的是 `cargo=absent`，跑绿时写的是版本号——同一份树的两个键，
+#     刚验过的字节在提交前永远报没验过，整条记账的链断在接缝上。
+#     这里用一份自己的 HOME 造出「只有兜底那条路找得到」的形状，两条发现路径必须同键。
+fakehome="${work}/fakehome"
+mkdir -p "${fakehome}/.cargo/bin"
+cat >"${fakehome}/.cargo/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo 'cargo 9.9.9 (fixture)'
+EOF
+chmod +x "${fakehome}/.cargo/bin/cargo"
+IFS=':' read -r -a path_dirs <<<"${PATH:-}"
+stripped=()
+for d in "${path_dirs[@]}"; do
+    [ -n "$d" ] || continue
+    # 只摘掉「只装着 cargo」的那些目录；系统目录不摘，门自己要的 git/sha256sum 在那儿。
+    if [ -x "$d/cargo" ] && [ "$d" != /usr/bin ] && [ "$d" != /bin ]; then continue; fi
+    stripped+=("$d")
+done
+stripped_path="$(IFS=:; printf '%s' "${stripped[*]}")"
+bare_key="$(HOME="${fakehome}" PATH="${stripped_path}" \
+    bash deploy/scripts/check-before-push.sh --key-content)" ||
+    fail "--key-content 在 PATH 里没有 cargo 时退非零"
+found_key="$(HOME="${fakehome}" PATH="${fakehome}/.cargo/bin:${stripped_path}" \
+    bash deploy/scripts/check-before-push.sh --key-content)" ||
+    fail "--key-content 在 PATH 里带着 cargo 时退非零"
+[ -n "${bare_key}" ] || fail "PATH 里没有 cargo 时 --key-content 什么都没印"
+[ "${bare_key}" = "${found_key}" ] ||
+    fail "同一个工具、两条发现路径算出了两个键（兜底 ${bare_key:0:12}，PATH ${found_key:0:12}）：工具解析必须在子命令分派之前"
+
+echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效；键不取决于调用方的 PATH 里有没有 cargo"

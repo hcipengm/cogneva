@@ -13,33 +13,57 @@ metadata:
     app.kubernetes.io/component: search
 data:
   settings.yml: |
-    # 只留这台主机连得上的引擎：镜像默认开着的 brave / duckduckgo / google cse /
-    # startpage / wikidata / wikipedia 在境内都不可达，每次查询各自等满超时后返回
-    # 零条，HTTP 也是 200——那看起来像「网上没有」，其实一条都没问出去。
+    # 引擎表是按实测选的，不是按镜像默认值。三条读数（2026-11-07 在本部署的
+    # 出口上量）：
     #
-    # 只留 bing：这台主机上唯一稳定出货的一家（每次 9~10 条、约 1 秒）。sogou
-    # 每次查询都崩在 `sogou.py` 的 `resp.next_request`（本镜像的响应对象没有该
-    # 属性），崩溃落进 `unresponsive_engines`、零条结果——一个每次都坏的引擎只会
-    # 让每条查询多一条假警报，而 `web_search` 把这个字段原样交给调用方。baidu
-    # （出口 IP 被判 CAPTCHA）、360search（零条且不报错）同理不在表里。
+    # 1. bing 对多词查询只答第一个词。整句查询确实送到了——返回页的标题和搜索
+    #    框里是整句——结果却是首词的：`黑神话悟空 混铁棍 怎么获得` 返回「黑
+    #    （汉语文字）_百度百科」，`black myth wukong mixed iron staff` 返回
+    #    BLACK 的英文词典；更坏的是它偶尔回一批完全无关的页面（同一分钟里拿到
+    #    过汇率和一部电影的条目）。单词查询它是好的，但「大部分查询会拿到错误
+    #    答案」这件事比「少一个快引擎」贵得多，所以它不在这张表里。
+    #
+    #    把它放回来的前提是包装层先有判据：`crates/cog-agent/src/web.rs` 里的
+    #    `DEGRADED_ENGINES` 会在「命中全部来自它、且查询不止一个词」时改问后备
+    #    出口。那条判据随镜像生效，不随这份清单生效——清单先加引擎，就会先有
+    #    一天的错误答案。
+    # 2. 360search 与 sogou 从这台主机出去是被按 IP 限流的：so.com 直接回「访问
+    #    异常页面」，sogou 302 到 antispider 后崩在 `sogou.py` 的
+    #    `resp.next_request`（本镜像的响应对象没有这个属性），故障记进
+    #    `unresponsive_engines`、零条结果。它们留在表里，是因为没被限流时出的是
+    #    整批正确的命中；限流时它们只是沉默，沉默会走「自建沉默 → 后备」那条路。
+    # 3. 镜像默认开着的那一群（brave、duckduckgo、google cse、startpage、baidu）
+    #    在境内一律不可达：各自超时或「Network is unreachable」，HTTP 仍是 200，
+    #    读起来像「网上没有」。
+    #
+    # 判据：表里每个引擎的沉默都必须是**可归因**的——要么限流、要么不可达，写在
+    # 上面；一旦某家每次都崩且不再偶尔答对，就从表里删掉，而不是留着当噪音。
     use_default_settings:
       engines:
         keep_only:
-          - bing
+          - 360search
+          - sogou
     engines:
-      - name: bing
+      # keep_only 只是留下条目，它们默认仍是关的，必须逐个打开。
+      - name: 360search
         disabled: false
-        # `www.bing.com` 在境内 302 到 `cn.bing.com`，而这一层不跟这一步，只拿回
-        # 302 的空壳（零结果且不报错）；直接问 cn 就绕开了这次跳转。
-        base_url: https://cn.bing.com
-        # 同一地址走 HTTP/3 拿不回可用响应，切回 HTTP/2。
-        enable_http3: false
+      # sogou 每次 302 都崩在 `sogou.py` 的 `resp.next_request`，故障进
+      # `unresponsive_engines`、零条结果。它仍然开着：没被限流时它出的是整批
+      # 正确的命中，而那一条假警报的代价小于它答对一次。
+      - name: sogou
+        disabled: false
     general:
       instance_name: "cogneva"
     server:
+      # 限流与图片代理都不开：本实例只服务集群内一个零凭证的工具调用方，没有对外
+      # 的匿名入口要限；图片代理会把外部图片拉过本 Pod，这里没有 UI 需要它。
       limiter: false
       image_proxy: false
+      # SearXNG 拒绝在没有这个值时启动。它签的是限流与图片代理两件事的令牌，而这两件
+      # 都已关闭，所以它不是凭证：没有任何外部方认它，换掉它只影响本 Pod 自己的内存。
       secret_key: "cogneva-cluster-internal-searxng"
+      # JSON 默认不开。`web_search` 读的就是这一面——少了这行，工具每次拿回 403，
+      # 错误里会点名这一项。
     search:
       safe_search: 0
       formats:
@@ -65,7 +89,7 @@ spec:
       annotations:
         # searxng-settings 的指纹：只改配置的那次升级也必须换 Pod，否则进程仍按
         # 启动时读到的 settings.yml 跑（文件由 kubelet 就地更新，进程不会重读）。
-        checksum/config: 15d3d5159e5b0219bbc5f6eb61b6f7065a1519317edf5b9381792da84eca8f90
+        checksum/config: c7199d948378f29bd252537515cfa56905d6860e1053ab4576ffe789f38d3ede
       labels:
         app.kubernetes.io/name: searxng
         app.kubernetes.io/component: search

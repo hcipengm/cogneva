@@ -119,6 +119,9 @@ windows-service = "0.7"
 
 [dev-dependencies]
 cog-test-support = { path = "../cog-test-support" }
+# `start_paused` 只在这个 crate 自己的测试里用：一句没人回答的话要等满生产上那个
+# 回话窗口才会落成结局，把窗口改短去迁就测试，判的就不再是部署真会等的那个界。
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"
 async-trait = "0.1"

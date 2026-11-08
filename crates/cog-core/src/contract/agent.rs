@@ -398,6 +398,57 @@ impl AgentRegistration {
     }
 }
 
+/// 一个员工在名册上待了多久、现在还是不是在职。
+///
+/// 与 [`AgentRegistration`] 不是同一件事：注册记录只说明「此刻有进程在替这个
+/// 名字心跳」，键一过期就什么都没有了；名册行说的是「这个人存在过」，退役之后
+/// 仍然留一行。两者分开，离职与「从来没有过这个人」才在读数上分得开。
+///
+/// 名册行由注册表的写点顺带写出（`register` 建行、`deregister` 盖墓碑），所以
+/// 任何会调模型的智能体——常驻员工、按任务现起的成员、对话员工、外部工作单元
+/// ——只要走同一条注册路径，就不可能漏在名册外面。名册漏人是这个字段存在之前
+/// 的常态：探针与按任务起的成员从来不进任何名单。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmployeeRecord {
+    pub agent_id: String,
+    /// 工号。建行时从全局计数器上取一个，此后不改、不回收——退役的人留着它，
+    /// 正如离职员工保留工号。缺省是 `None`：这一格是后加的，早于它的名册行
+    /// 里没有工号，读到 `None` 的人要说「还没编号」，不能拿 0 冒充。
+    #[serde(default)]
+    pub number: Option<u32>,
+    /// 建行时注册表上写的用途标签。它随注册更新，因为它描述的是「此刻这个人
+    /// 在做什么」，不是一段写死的性格。
+    pub role: String,
+    /// 第一次出现的时间。只在建行时写一次，退役后重建这个人也保留原来那一格
+    /// ——否则「在职多久」会跟着每一次重启重新计时。
+    pub first_seen: DateTime<Utc>,
+    /// 最后一次被看到的时间。
+    pub last_seen: DateTime<Utc>,
+    /// 退役的时间。`None` 是在职。缺省即为 `None`：名册行是另一套写入方
+    /// （Redis 里的那段脚本擦掉这一格而不是写 null）写出来的，两侧都得读得回
+    /// 同一个形状。
+    #[serde(default)]
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
+impl EmployeeRecord {
+    /// 这个人现在还算不算在职。
+    pub fn is_active(&self) -> bool {
+        self.retired_at.is_none()
+    }
+
+    /// 名册、对话、日志里显示的那一行：`E0412 林清和`。
+    ///
+    /// 展示名只有这一个来源。调用方不要再各自拼一遍「人名#短码」——那样拼
+    /// 出来的名字与名册上那一行对不上，读的人会以为是两个人。
+    pub fn label(&self) -> String {
+        match self.number {
+            Some(number) => crate::employee_label(number),
+            None => crate::unregistered_label(&self.agent_id),
+        }
+    }
+}
+
 /// Registry abstraction so callers can plug Redis (production) or in-memory (tests).
 #[async_trait]
 pub trait AgentRegistry: Send + Sync {
@@ -410,6 +461,22 @@ pub trait AgentRegistry: Send + Sync {
     async fn list_by_role(&self, role: &str) -> SFResult<Vec<AgentRegistration>>;
     /// List agents that have all the given capabilities.
     async fn list_by_capability(&self, capability: &str) -> SFResult<Vec<AgentRegistration>>;
+    /// 名册上的全部行，在岗的与退役的都在里面。
+    ///
+    /// 默认实现返回空：没有名册的实现（测试替身、嵌入式装配）不该被迫编一份
+    /// 出来，而「读不到名册」与「名册上没有人」在调用方那一侧是不同的两句话，
+    /// 这个默认值把前者留给它自己去说。
+    async fn employees(&self) -> SFResult<Vec<EmployeeRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// 名册上一个人的那一行；不在册返回 `None`。
+    ///
+    /// 与 [`AgentRegistry::employees`] 分开，是因为读一个人的工号不该把整张
+    /// 名册搬过来：入职接口、对话页的称呼都在调用最频繁的那条路上。
+    async fn employee(&self, _agent_id: &str) -> SFResult<Option<EmployeeRecord>> {
+        Ok(None)
+    }
 }
 
 // ─── Agent Manager ─────────────────────────────────────────────────────────
@@ -484,6 +551,21 @@ pub trait AgentManager: Send + Sync {
         &self,
         agent_id: &str,
     ) -> crate::SFResult<Option<std::sync::Arc<dyn crate::Agent>>>;
+
+    /// Let go of the worker named `agent_id`, returning whether one left.
+    ///
+    /// The rostered employees are not created by a task, so no task completing
+    /// ever retires them: a process that stops being the one that serves a name
+    /// has no other way to give it up. Stopping its inbox matters as much as
+    /// leaving the roster -- a retired consumer keeps reading the group and
+    /// answering with a loop nobody asked to run.
+    ///
+    /// A manager that cannot retire by name answers `false` rather than
+    /// guessing; `true` is the claim that the name is now free here.
+    async fn retire_agent(&self, agent_id: &str) -> crate::SFResult<bool> {
+        let _ = agent_id;
+        Ok(false)
+    }
 }
 
 /// Generate a deterministic agent_id from the four input dimensions.

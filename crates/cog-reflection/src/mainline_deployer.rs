@@ -363,7 +363,23 @@ const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
     ("check-version", 120),
     ("label-revision", 60),
     ("commit-image", 600),
-    ("push-image", 900),
+    // 覆盖（不是导出）：2026-11-08 那一次，registry 第一个 blob 的 HEAD 落在 16:21:28，
+    // 16:36:29 收到 `client disconnected during blob PATCH … copied=123352539`——901 秒，
+    // 正好是这一跳的墙把它砍掉，而那时传输还没停。被砍一次这一整轮就白费：下一轮从建镜像
+    // 重来（`cogneva_mainline_build_seconds{outcome="ok"}` 实测 738 秒），再排一次推。而且
+    // 被砍时已经推上去的那些层留在 registry 的盘上，没有任何 manifest 引用它们，要等 registry
+    // 下一次重启跑 GC 才收得走——**推失败连着几次，填的就是 registry 自己的卷**。
+    //
+    // 为什么它本来就要这么久、而不是"少传一点"：相邻两个 rev 的 manifest 逐层比过，只差一层，
+    // registry 里其余那些层的 HEAD 全是 200，可这一推仍然逐层重传了 554 秒（16:22:26→16:31:40，
+    // 约 30 次 blob 上传）还没传完。**这一跳的时长与那一层的增量无关，只与整幅镜像的层数和
+    // 那条链路的带宽有关**——所以它该由「这一跳自己的时长读数」导出，
+    // 不该是凭感觉的数（`cogneva_mainline_build_seconds` 就是这么做的：实测值当读数发布）。
+    // 在那条读数落地之前它是覆盖：钉死 1800，并写明为什么是它。
+    //
+    // 取 1800 还有一个后果要留意：`round_work_secs` 取的是表里最长的那一步，而 1800 已经
+    // 是 `base-from`/`web-build` 的值，所以这一改**不动**这一轮声明出去的工期界。
+    ("push-image", 1800),
     ("list-store", 300),
     ("remove-images", 900),
 ];

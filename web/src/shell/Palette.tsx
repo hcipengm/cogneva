@@ -66,13 +66,17 @@ export function Palette() {
   }, [query]);
 
   const commands = useMemo<Command[]>(() => {
-    const views = (Object.keys(VIEW_TITLES) as ActivityId[]).map((id) => ({
-      id: `view:${id}`,
-      group: '前往' as const,
-      title: VIEW_TITLES[id],
-      hint: id,
-      run: () => setActivity(id),
-    }));
+    // `agents` 是 `people` 的旧名，两面画的是同一页。列两行同名去处在面板里
+    // 只是让读者二选一，所以只留今天的名字。
+    const views = (Object.keys(VIEW_TITLES) as ActivityId[])
+      .filter((id) => id !== 'agents')
+      .map((id) => ({
+        id: `view:${id}`,
+        group: '前往' as const,
+        title: VIEW_TITLES[id],
+        hint: id,
+        run: () => setActivity(id),
+      }));
 
     const actions: Command[] = [
       {
@@ -214,7 +218,7 @@ export function Palette() {
         run: openCredentials,
       },
       go('observability', '集群现在什么状态？机器、负载、资源', VIEW_TITLES.observability),
-      go('agents', '谁在替我干活？在岗的智能体与它们的上下文', VIEW_TITLES.agents),
+      go('people', '谁在替我干活？员工名册、在岗状态与对话', VIEW_TITLES.people),
       go('tasks', '这件事排到哪一步了？', VIEW_TITLES.tasks),
       go('comms', '谁把活交给了谁？断在哪一环？', VIEW_TITLES.comms),
       go('changes', '我提的改动是怎么进到集群里的？', VIEW_TITLES.changes),

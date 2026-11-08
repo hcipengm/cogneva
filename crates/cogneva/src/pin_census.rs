@@ -573,6 +573,108 @@ mod tests {
     }
 
     /// A read the same plugin registered twice is one member, and the size is
+    /// Two types whose paths differ and whose trailing name does not: the audit
+    /// pairs the two families on that trailing name alone, so a fixture built
+    /// from these two is one derived pair rather than a family of its own.
+    mod concrete {
+        pub struct Registry;
+    }
+
+    mod abstraction {
+        pub struct Registry;
+    }
+
+    /// The rule the audit pairs the two published families by, whose own copy
+    /// is private: the trailing path segment of a type name.
+    fn trailing(name: &str) -> &str {
+        name.rsplit("::").next().unwrap_or(name)
+    }
+
+    /// The fifth list the audit carries is derived, and this makes that a
+    /// reading rather than a sentence in a doc comment.
+    ///
+    /// `identity_mismatches` pairs an unsatisfied read with an unconsumed
+    /// publish that share a trailing type name, and the trailing name is all
+    /// the two sides share: two different types can end the same way, which is
+    /// why a pair is a suspicion rather than a third family. As a series it
+    /// would sit on the exposition looking like a family of its own while being
+    /// a product of the other two. So no series carries it -- and what a reader
+    /// can do instead is what the audit did, pair the two published families by
+    /// that rule. Asserting the second half is what makes the first affordable:
+    /// the list stays reachable while it stops being a series.
+    #[tokio::test]
+    async fn the_identity_pair_is_derived_from_two_families_and_is_not_one() {
+        // Never read -- the census names types -- but a type nothing constructs
+        // is a dead type, and saying so beats annotating it away.
+        let _pinned = (concrete::Registry, abstraction::Registry);
+
+        let audit = PinAudit::evaluate(
+            &[
+                // Read under one full name, never published.
+                PinWiring {
+                    pin: Pin::of::<abstraction::Registry>(),
+                    publishers: Vec::new(),
+                    consumers: vec![reader("cog-reader")],
+                },
+                // Published under another full name, never read.
+                PinWiring {
+                    pin: Pin::of::<concrete::Registry>(),
+                    publishers: vec![Some("cog-publisher")],
+                    consumers: Vec::new(),
+                },
+            ],
+            &[],
+        );
+        assert_eq!(audit.identity_mismatches.len(), 1, "one break, one pair");
+        let mut expected: Vec<(&str, &str)> = audit
+            .identity_mismatches
+            .iter()
+            .map(|m| (m.read.name(), m.published.name()))
+            .collect();
+        expected.sort_unstable();
+
+        let observable = PinCensusObservable::new();
+        observable.record(audit).await;
+        let metrics = observable.collect_metrics("").await.unwrap();
+
+        let published_families = [
+            PIN_CENSUS_UNSATISFIED_COUNT_METRIC,
+            PIN_CENSUS_UNSATISFIED_METRIC,
+            PIN_CENSUS_UNCONSUMED_COUNT_METRIC,
+            PIN_CENSUS_UNCONSUMED_METRIC,
+            PIN_CENSUS_MULTI_PUBLISHED_COUNT_METRIC,
+            PIN_CENSUS_MULTI_PUBLISHED_METRIC,
+            PIN_CENSUS_UNORDERED_INIT_READ_COUNT_METRIC,
+            PIN_CENSUS_UNORDERED_INIT_READ_METRIC,
+            PIN_CENSUS_PUBLISHES_COUNT_METRIC,
+            PIN_CENSUS_PUBLISHES_METRIC,
+        ];
+        for metric in &metrics {
+            let name = metric.name.as_str();
+            let known = published_families.contains(&name);
+            assert!(known, "{} is not one of the published families", name);
+        }
+
+        let reads = members(&metrics, PIN_CENSUS_UNSATISFIED_METRIC);
+        let publishes = members(&metrics, PIN_CENSUS_UNCONSUMED_METRIC);
+        let mut derived: Vec<(&str, &str)> = Vec::new();
+        for read in &reads {
+            let read_name = label_of(read, PIN_LABEL);
+            for published in &publishes {
+                let published_name = label_of(published, PIN_LABEL);
+                if trailing(read_name) == trailing(published_name) {
+                    derived.push((read_name, published_name));
+                }
+            }
+        }
+        derived.sort_unstable();
+        assert_eq!(derived, expected, "the pairing a reader can redo matches");
+        let read_pin = label_of(reads[0], PIN_LABEL);
+        let published_pin = label_of(publishes[0], PIN_LABEL);
+        assert_ne!(read_pin, published_pin, "the two keep their full names");
+        assert_eq!(trailing(read_pin), trailing(published_pin), "same tail");
+    }
+
     /// the number of members.
     ///
     /// The demand list holds read calls, not pins: a plugin that reads one pin

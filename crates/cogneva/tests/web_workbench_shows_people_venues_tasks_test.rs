@@ -67,37 +67,78 @@ fn the_activity_bar_writes_the_name_out_instead_of_hiding_it_in_a_tooltip() {
     );
 }
 
-/// 工作台顶上那条带子：三份读数都在，三格各自通得过去。
+/// 工作台是四格，四格来自**一次**读数，而不是这一层自己拼几份。
 ///
-/// 读的是带子自己那一份源码，不是工作台：把三份读数拆到三个面里也行，但那样
-/// 工作台顶上那一行就又回到了「什么都没有」。同时钉住工作台确实把它挂了出来——
-/// 写好的带子没人渲染，读者一样看不见。
+/// 四格（投入 产出 能力 项目）在 `/api/v1/workbench` 上同一个时刻读出，版式意图
+/// （`priority` 与三档 `span`）也随数据下来。这一层只做「格 → 网格位置」的确定性
+/// 映射；它一旦自己 fetch 几份读数再拼，四格就有了四个时刻，拼出来的那份东西不
+/// 属于任何一瞬间，也没人说得清它读的是哪一刻。
+///
+/// 员工与场地不在工作台上：员工的家是员工页，场地是任务的切法，两者都不是这四问
+/// 之一。这条判据同时钉住「别把 `listAgents` / `getVenues` 加回来」。
 #[test]
-fn the_workbench_carries_one_band_that_reads_people_venues_and_tasks() {
+fn the_workbench_is_four_cells_read_in_one_snapshot() {
     let root = root();
-    let view = source(&root, "web/src/views/WorkspaceView.tsx");
+    let view = source(&root, "web/src/views/WorkbenchView.tsx");
     assert!(
-        view.contains("<WorkbenchBand"),
-        "工作台没有挂上「人 · 场 · 任务」那条带子：三样读数回到各自的面里，\
-         第一眼还是只剩对话"
+        view.contains("getWorkbench"),
+        "工作台没有读 `/api/v1/workbench`：四格回到各自去取数，四份响应各有各的时刻"
     );
-    let band = source(&root, "web/src/views/WorkbenchBand.tsx");
-    for (call, what) in [
-        ("listAgents", "在岗名单"),
-        ("getVenues", "场地读数"),
-        ("getTaskSummary", "任务总览"),
-    ] {
+    for stale in ["listAgents", "getVenues", "getTaskSummary"] {
         assert!(
-            band.contains(call),
-            "带子里没有读{what}（`{call}`）：那一格只能靠切面去猜"
+            !view.contains(stale),
+            "工作台还在自己读 `{stale}`：四格是同一个时刻的一次读数，不是几次请求拼起来的"
         );
     }
-    for to in ["people", "venues", "tasks"] {
+    // 版式意图在数据里：顺序读 `priority`，跨度按当前断点取数据给的那一档。
+    assert!(
+        view.contains("priority"),
+        "工作台按数组下标排版：后端说哪一格该在前，界面不认"
+    );
+    assert!(
+        view.contains("span[tier]") && view.contains("gridColumn"),
+        "工作台没有按断点把三档 `span` 接到网格上：版式由这一层反推，后端声明的那一档放不大"
+    );
+    let hook = source(&root, "web/src/hooks/useBreakpoint.ts");
+    for tier in ["'narrow'", "'mid'", "'wide'"] {
         assert!(
-            band.contains(&format!("to=\"{to}\"")),
-            "带子里没有通向「{to}」这一面的格子：看见了也走不过去"
+            hook.contains(&format!("return {tier};")),
+            "断点没有 `{tier}` 这一档：三档跨度里有一档在任何窗口里都取不到"
         );
     }
+    // 没量到的读数印破折号，不印 0——0 是一个读数，会把「不知道」说成「量出来是零」。
+    assert!(
+        view.contains("'—'"),
+        "没量到的读数没有印成破折号：读者会把「这一条还没接上」读成「量出来是零」"
+    );
+    let registry = source(&root, "web/src/views/registry.tsx");
+    assert!(
+        registry.contains("<WorkbenchView"),
+        "注册表里没有工作台这一页：写好的四格没人渲染"
+    );
+}
+
+/// 对话在员工页上，不在工作台上。
+///
+/// 一段对话与一个人的上下文是一对一的：它属于「谁」那一面。工作台回答的是「平台
+/// 此刻怎样」，会话占满那里的时候，四格就只剩顶上一条边。
+#[test]
+fn the_conversation_lives_on_the_people_page() {
+    let root = root();
+    let people = source(&root, "web/src/views/PeopleView.tsx");
+    assert!(
+        people.contains("<ConversationPane"),
+        "员工页没有画对话面：这一面只剩只读的历史，说不出话"
+    );
+    assert!(
+        !people.contains("setActivity('workspace')"),
+        "员工页还在把读者送去工作台接着聊：会话的家已经搬到员工页上了"
+    );
+    let view = source(&root, "web/src/views/WorkbenchView.tsx");
+    assert!(
+        !view.contains("ConversationPane"),
+        "工作台上还画着会话：四格与一条状态灯被挤到边上"
+    );
 }
 
 /// 空名单不许画成转圈。

@@ -21,9 +21,13 @@ is not a reference:
     integration test's `crate::` is the test binary's root -- or a `mod <name>`
     declaration anywhere under `src/` or `tests/` (this covers `#[path = "..."]`
     and modules declared in a submodule), or a root item (`struct`/`enum`/
-    `trait`/`type`/`fn`/`const`/`static`/`union`/`macro_rules!`) named `<name>`,
-    or a root `use` whose path or alias ends in `<name>` -- how a re-exported
-    module from another crate is reached.
+    `trait`/`type`/`fn`/`const`/`static`/`union`/`macro_rules!`, with the
+    qualifiers Rust allows before the kind: `pub(crate) async fn` is a root item
+    like any other) named `<name>`, or a root `use` whose path or alias ends in
+    `<name>` -- how a re-exported module from another crate is reached -- or a
+    name a `pub use x::*;` re-exports, followed through further globs and
+    resolved the way edition 2018 uniform paths resolve them (against the
+    declaring module first, then the crate root).
 
   * a `mod <name>;` declaration, `pub` or not. A declaration is a promise that
     the file exists, and taking it as proof of itself is the hole the first
@@ -73,8 +77,11 @@ import sys
 
 TOKEN = re.compile(r"crate::([a-z_][a-z0-9_]*)")
 CRATE_PATH = re.compile(r"(crates/[^/]+)/")
+# The item kinds can be preceded by more than `pub`: `pub(crate) async fn` is a
+# root item too, and a resolver that only knew the bare kinds called the root it
+# defines unanswerable (measured 2026-11-09 on `crate::read_active_alerts`).
 ROOT_ITEM = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
+    r"^\s*(?:(?:pub(?:\([^)]*\))?|async|const|unsafe|default|auto)\s+)*"
     r"(?:struct|enum|trait|type|fn|const|static|union|mod|macro_rules!)\s+(\w+)",
     re.M,
 )
@@ -190,16 +197,66 @@ class Tip:
         )
         if declared.strip():
             return True
-        for root in ("lib.rs", "main.rs"):
-            text = self.file(f"{crate}/src/{root}")
+        return token in self.module_names(crate, ())
+
+    def module_file(self, crate, path):
+        """Where a module of this crate lives, or None if the tree has no such file.
+
+        An empty path is the crate root. Both roots are kept: a crate may have a
+        library and a binary, and either can answer a `crate::` path.
+        """
+        if not path:
+            return [f"{crate}/src/{root}" for root in ("lib.rs", "main.rs")
+                    if self.exists(f"{crate}/src/{root}")]
+        base = f"{crate}/src/{'/'.join(path)}"
+        return [p for p in (f"{base}.rs", f"{base}/mod.rs") if self.exists(p)]
+
+    @staticmethod
+    def use_targets(path, segments):
+        """The module paths a `use` may be pointing at, nearest first.
+
+        Edition 2018 uniform paths resolve a leading name against the current
+        module before the crate root, and `types/mod.rs`'s `pub use
+        agent_state::*;` means `types/agent_state.rs` -- resolving it against
+        the root would look for `src/agent_state.rs` and find nothing.
+        """
+        if segments and segments[0] == "crate":
+            return (segments[1:],)
+        if segments and segments[0] == "self":
+            return (path + segments[1:],)
+        if segments and segments[0] == "super":
+            return (path[:-1] + segments[1:],)
+        return (path + segments, segments)
+
+    def module_names(self, crate, path, seen=frozenset()):
+        """The names a module puts in scope, followed through its own `use`s.
+
+        A glob re-export is how a module *re-exported from another crate* is
+        reached (`pub use types::*;`), and the chain can be more than one step
+        deep -- `types` re-exporting `agent_state::*` -- so a resolver that
+        stopped at the `*` called a name the crate really does answer
+        unanswerable (measured 2026-11-09 on `crate::employee_label`). A glob
+        whose module is not a file in this crate (`pub use other_crate::*;`)
+        adds nothing: this gate answers for this tree only.
+        """
+        if path in seen:
+            return set()
+        seen = seen | {path}
+        names = set()
+        for f in self.module_file(crate, path):
+            text = self.file(f)
             if not text:
                 continue
-            if token in {m.group(1) for m in ROOT_ITEM.finditer(text)}:
-                return True
+            names |= {m.group(1) for m in ROOT_ITEM.finditer(text)}
             for m in ROOT_USE.finditer(text):
-                if token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", m.group(1)):
-                    return True
-        return False
+                spec = m.group(1)
+                if spec.rstrip().endswith("::*"):
+                    segments = tuple(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", spec))
+                    for target in self.use_targets(path, segments):
+                        names |= self.module_names(crate, target, seen)
+                else:
+                    names |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", spec))
+        return names
 
     def declaration_target(self, path, name):
         """Where a `mod <name>;` in `path` says its file is, or None if anywhere.

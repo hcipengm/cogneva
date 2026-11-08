@@ -104,8 +104,10 @@ pub struct ProjectRow {
     pub blocked: usize,
     pub first_created_at: Option<String>,
     pub last_updated_at: Option<String>,
-    /// 有没有计划基线。基线表还没落地，所以今天是恒 false——这不是「没有项目
-    /// 需要排期」，是「排期这一件还读不到」，两者在界面上必须分开写。
+    /// 这个项目里有没有任务排过期：基线里至少命中一条就是 `true`。
+    ///
+    /// `false` 有两种处境——确实没人排期，或者这个部署读不到基线（响应头会
+    /// 说）。两者在界面上必须分开写：前者的处置是去排期，后者是去看接线。
     pub planned: bool,
 }
 

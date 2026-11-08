@@ -9,6 +9,10 @@
 //!
 //! 指纹取短码（8 位 hex）当尾巴，是为了让两个同名的实例仍然可以分辨：人名池
 //! 只有十几个名字，撞名是常态，尾巴把"重名"和"同名"分开。
+//!
+//! **这一套现在只给 id 用，不再给人看。** 展示名是名册行上的「工号 姓名」
+//! （`cog_core::employee_label`），由名册在注册时发号。`handle` 只留在日志与
+//! 调试里；界面上再出现 `Luna#1822ab0e` 这种拼法就是漏改了一处。
 
 use sha2::{Digest, Sha256};
 
@@ -27,10 +31,6 @@ pub const ENV_FINGERPRINT: &str = cog_core::env::INSTANCE_FINGERPRINT;
 /// 相同；分组名进名字的哈希材料，两个池才不会同名。分组名是清单里的字面量，
 /// 所以它稳定。
 pub const ENV_GROUP: &str = "COGNEVA_AGENT_GROUP";
-
-/// 名字的兜底分组：清单没给分组名时用进程自身的装配标识，保证唯一但会随
-/// 滚动变化（`stable` 随之为 false）。
-const FALLBACK_GROUP: &str = "local";
 
 /// 一个数字员工的名字。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,12 +116,12 @@ pub fn worker_name(slot: usize) -> AgentName {
 
 /// 本进程的装配标识：Pod 名优先，其次主机名。它描述"在哪一个进程里"，不再
 /// 参与名字的稳定性——把 Pod 名写进名字正是滚动就换名的根源。
+///
+/// 解析只有一处（`cog_core::env::process_identity`），因为注册表里的这一格
+/// 还有第二个读者：名册对账要拿它判"这个名字是不是已经由别的进程在服务"。
+/// 两边各写一遍，某天一边改了回退顺序，另一边的判断就会永远对不上。
 pub fn agent_instance() -> String {
-    std::env::var(cog_core::env::POD_NAME)
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| FALLBACK_GROUP.to_string())
+    cog_core::env::process_identity(|name| std::env::var(name).ok())
 }
 
 #[cfg(test)]

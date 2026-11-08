@@ -243,6 +243,10 @@ live_check redis 'Live-Redis agent log retirement' cargo test -p cog-storage --t
 # against -- so the record that lost its expiry is planted here, on the
 # server, and the registry is asked what it makes of it.
 live_check redis 'Live-Redis agent registry liveness' cargo test -p cog-storage --test agent_registry_liveness -- --ignored
+# 工号发在 Lua 脚本里，而内存实现根本没有脚本：两套实现各写一遍时，最贵的错法
+# 是「测试里工号能回收、线上不能」——两边都绿，线上在换人。这条用例在真 Redis 上
+# 注册、重复注册、退役，逐条问号是不是同一个。
+live_check redis 'Live-Redis employee roster' cargo test -p cog-storage --test employee_roster -- --ignored
 live_check db 'Live-DB partition tests' cargo test -p cog-storage --test partition_maintainer -- --ignored
 # 完成 / 失败 / 取消一条任务前那条把整个 workspace 锁住的语句，2026-11-05 一天
 # 在生产上死锁了 13 次：等待链两头都是同一条 `SELECT ... WHERE workspace_id = $1

@@ -2,16 +2,14 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useAgentConversation } from '@/hooks/useAgentConversation';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
-import {
-  getSessionMessages,
-  hireEmployee,
-  type AgentConversationLine,
-  type ChatTranscriptLine,
-} from '@/api/client';
+import { hireEmployee, type AgentConversationLine } from '@/api/client';
+import { ConversationPane } from '@/conversation/ConversationPane';
 import { useChatStore } from '@/store/chatStore';
-import { useShell } from '@/shell/store';
+import { useServices } from '@/shell/context';
+import { USE_MOCK } from '@/runtime';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { useStreamStore, type Message as StreamedMessage, type ToolCallRecord } from '@/store/streamStore';
+import { EmployeeRoster } from '@/views/AgentsView';
 import { Button, Empty, Loading, ReadError, ViewFrame } from '@/ui/primitives';
 import { Note } from '@/ui/Note';
 
@@ -166,78 +164,39 @@ function Line({ line, showReply }: { line: AgentConversationLine; showReply: boo
 /**
  * 一位「说过话的人」：他的名字属于一段对话，不是一段收件箱往来。
  *
- * 这样的人没有常驻进程——他只在有人说话的那一段时间里活着。要接着跟他聊，
- * 唯一的路是把那段会话放回工作台：名字由会话 id 算出来，换个 id 就是换一个人，
- * 而他之前说过的每一句都记在那个 id 下面。
+ * 这样的人没有常驻进程——他只在有人说话的那一段时间里活着。对话就在这一格里
+ * 接着聊，不需要把会话搬去别处：一段对话与一个人的上下文是一对一的，离开「谁」
+ * 这一面反而要读者自己记住两边的对应。名字由会话 id 算出来，换个 id 就是换一个
+ * 人，而他之前说过的每一句都记在那个 id 下面。
  *
- * 这一格读的是会话历史（`chat_turns`），不是收件箱：往收件箱投一句话给一个
- * 不读收件箱的人，看不出任何回音。
+ * 这一格画的是实时对话面（`ConversationPane`），不是只读的历史列表：往收件箱投
+ * 一句话给一个不读收件箱的人看不出任何回音，而一个只能看不能说的窗格也不叫对话框。
  */
 function ChatPersonPane({ sessionId, name }: { sessionId: string; name: string }) {
-  const [lines, setLines] = useState<ChatTranscriptLine[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [tick, setTick] = useState(0);
+  const { clientRef } = useServices();
   const openSession = useChatStore((s) => s.openSession);
-  const setActivity = useShell((s) => s.setActivity);
 
+  // 会话先入账再画：`hydrate` 只认已经在 store 里的那一段，不在的话它会一声不响地
+  // 返回，于是这一格永远是空的——看起来像「这段对话没有历史」。
   useEffect(() => {
-    let alive = true;
-    setLoading(true);
-    getSessionMessages(sessionId)
-      .then((items) => {
-        if (!alive) return;
-        setLines(items);
-        setError(null);
-      })
-      .catch((e) => {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [sessionId, tick]);
+    openSession(sessionId);
+  }, [openSession, sessionId]);
 
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
-        <span>
-          {`与 ${name} 的对话（会话 ${sessionId}）`}
-          {loading && ' · 读取中…'}
-        </span>
-        <Button
-          tone="accent"
-          onClick={() => {
-            openSession(sessionId);
-            setActivity('workspace');
-          }}
-        >
-          在工作台接着聊
-        </Button>
+        <span>{`与 ${name} 的对话（会话 ${sessionId}）`}</span>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-        {error && <ReadError what="这段对话" error={error} onRetry={() => setTick((n) => n + 1)} />}
-        {!error && !loading && lines.length === 0 && (
-          <Empty>这段对话还没有说过话。</Empty>
-        )}
-        {lines.map((line) => (
-          <div key={line.id} className="mb-2 border-b border-[var(--line)]/40 pb-2">
-            <div className="mb-1 flex items-baseline gap-2 text-[10px] text-[var(--muted)]">
-              <span>{line.role === 'user' ? '我' : name}</span>
-              <span>{stamp(line.created_at)}</span>
-            </div>
-            <div className="whitespace-pre-wrap text-[12px] text-[var(--paper)]">{line.content}</div>
-            {line.failure && (
-              <div className="mt-1 text-[11px]" style={{ color: 'var(--warn)' }}>
-                {line.failure}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
+      <ConversationPane
+        sessionId={sessionId}
+        name={name}
+        active
+        onFocus={() => {}}
+        onClose={() => {}}
+        closable={false}
+        historyEnabled={!USE_MOCK}
+        clientRef={clientRef}
+      />
       <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
         这个人只在说话的那一段时间里活着，名下没有常驻进程；能接着跟他聊，是因为名字由会话 id 算出来。
       </p>
@@ -271,6 +230,9 @@ export function PeopleView() {
   const [draft, setDraft] = useState('');
   const [hiring, setHiring] = useState(false);
   const [hireError, setHireError] = useState<string | null>(null);
+  // 两个切法：名册看这一拨人的构成，对话看某一个人的话。默认落在名册上——
+  // 进员工页的第一件事通常是「现在都有谁」，而不是接着上一次的某段对话。
+  const [tab, setTab] = useState<'roster' | 'talk'>('roster');
   const liveRows = useLiveAgentStore((s) => s.rows);
   // 它这一趟到底做了什么：工具调用从总线帧流来，按帧里的 `agent_id` 认领。
   // 会话那一面只有「问了一句、答了一句」，中间的每一步都在这里。
@@ -373,7 +335,40 @@ export function PeopleView() {
           没招成：{hireError}
         </div>
       )}
-      {agentsError ? (
+      {/*
+       * 名册与对话是同一个页面的两个切法，不是两页：员工与「智能体」读的是同一份
+       * 名单，从前分成两面，同一批人要在两处各认一次，两边还可能停在不同的快照上。
+       * 名册回答「这一拨人怎么构成」，对话回答「和某个人说了什么」，点一行就换过来。
+       */}
+      <div className="flex shrink-0 items-center gap-1 border-b border-[var(--line)] px-3 py-1">
+        {(
+          [
+            { id: 'roster', label: '名册' },
+            { id: 'talk', label: '对话' },
+          ] as const
+        ).map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => setTab(item.id)}
+            className={`px-2 py-0.5 text-[11px] transition-colors ${
+              tab === item.id
+                ? 'border-b-2 border-[var(--brass)] text-[var(--paper)]'
+                : 'text-[var(--muted)] hover:text-[var(--paper)]'
+            }`}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      {tab === 'roster' ? (
+        <EmployeeRoster
+          onPick={(agentId) => {
+            select(agentId);
+            setTab('talk');
+          }}
+        />
+      ) : agentsError ? (
         <ReadError what="在岗名单" error={agentsError} onRetry={refreshAgents} />
       ) : agents.length === 0 ? (
         // 读回来是空的，就是真的没人：名单是心跳，30 秒不来就会被摘掉。这与
@@ -404,7 +399,14 @@ export function PeopleView() {
                 >
                   <div className="flex items-baseline justify-between gap-2">
                     <span className="text-[12px]">{agent.display_name}</span>
-                    {agent.live === false ? (
+                    {agent.retired ? (
+                      <Note
+                        className="text-[10px]"
+                        text="这个人已经结束了一段生命周期；名册上保留这一行，工号不回收，历史里两条不相干的事不会顶着同一个号"
+                      >
+                        离职
+                      </Note>
+                    ) : agent.live === false ? (
                       <Note
                         className="text-[10px]"
                         text="这个人只在说话的那一段时间里活着；不在岗时名册上仍然有他，接着聊会回到同一段会话"
@@ -420,7 +422,6 @@ export function PeopleView() {
                       </Note>
                     ) : null}
                   </div>
-                  <div className="mono text-[10px] text-[var(--muted)]">agent:{agent.agent_id}</div>
                   <div className="text-[10px] text-[var(--muted)]">
                     {agent.role} · {agent.workspace_id}
                     {/* 来源只对「说过话的人」有意义：池里的 worker 没有会话，
@@ -440,7 +441,7 @@ export function PeopleView() {
           <section className="flex min-h-0 flex-1 flex-col">
             <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
               <span>
-                {chosen ? `与 ${chosen.display_name} 的会话（agent:${chosen.agent_id}）` : '先选一个员工'}
+                {chosen ? `与 ${chosen.display_name} 的会话` : '先选一个员工'}
                 {loading && ' · 读取中…'}
               </span>
               <Button onClick={refreshConversation}>刷新会话</Button>

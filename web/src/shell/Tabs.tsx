@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Icon } from '@/shell/icons';
 import { useShell } from '@/shell/store';
 
@@ -7,13 +8,18 @@ import { Note } from '@/ui/Note';
  *
  * 同一面只开一页：页的身份是面的键，不是每次点开的动作。开两份「任务」会让
  * 两份读数各自轮询、各自过滤，最后谁也不是权威。
+ *
+ * 页签可以拖拽换序：开着的几页怎么排，是读者当下读的顺序。先后记在 store 里，
+ * 换一次序不重开任何一页。
  */
 export function Tabs() {
   const tabs = useShell((s) => s.tabs);
   const activeTabId = useShell((s) => s.activeTabId);
   const activateTab = useShell((s) => s.activateTab);
   const closeTab = useShell((s) => s.closeTab);
+  const moveTab = useShell((s) => s.moveTab);
   const setPalette = useShell((s) => s.setPalette);
+  const [dragging, setDragging] = useState<string | null>(null);
 
   return (
     <div className="flex h-9 shrink-0 items-stretch border-b border-[var(--line)] bg-[var(--ink-800)]">
@@ -23,7 +29,24 @@ export function Tabs() {
           return (
             <div
               key={tab.id}
-              className="group relative flex min-w-0 max-w-[220px] items-center border-r border-[var(--line)]"
+              draggable
+              onDragStart={(event) => {
+                setDragging(tab.id);
+                (event as unknown as DragEvent).dataTransfer?.setData('text/plain', tab.id);
+              }}
+              onDragOver={(event) => {
+                if (!dragging || dragging === tab.id) return;
+                event.preventDefault();
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                if (dragging && dragging !== tab.id) moveTab(dragging, tab.id);
+                setDragging(null);
+              }}
+              onDragEnd={() => setDragging(null)}
+              className={`group relative flex min-w-0 max-w-[220px] items-center border-r border-[var(--line)] ${
+                dragging === tab.id ? 'opacity-40' : ''
+              }`}
               style={{ background: active ? 'var(--ink-900)' : 'transparent' }}
             >
               {active && (

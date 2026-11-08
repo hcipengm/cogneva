@@ -386,7 +386,14 @@ impl PgeMode {
         match self {
             // 分解路径没有做过选择，别记成一次试验。
             PgeMode::PlanOnly => None,
-            _ => Some(self.as_str()),
+            // 另外三种都是一次真实的选择，所以各有自己的样本：捷径不是按分数比
+            // 出来的，但 `select_mode` 确实在它和 Roundtable 之间挑过一次（依据
+            // 请求自己声明的量），那一次取舍值得记账。这里逐个写而不是继承
+            // `as_str`，否则新增一个变体会静默拿到一个名字，学习台账上多出一条
+            // 没人选过的模式。
+            PgeMode::Pipeline => Some("pipeline"),
+            PgeMode::Roundtable => Some("roundtable"),
+            PgeMode::Direct => Some("direct"),
         }
     }
 
@@ -624,12 +631,13 @@ mod tests {
         // 变体名不是名字：这一套曾经同时出现在两条面上。
         assert!(serde_json::from_str::<PgeMode>("\"Pipeline\"").is_err());
         // 学习面不记分解路径，另外三个记的就是同一个名字。
+        //
+        // 这里按字面量断言，而不是与 `as_str()` 自比：自比在两张面一起漂移时
+        // 仍然通过，而那时学习台账上的名字与路由面上的已经不是一个了。
         assert_eq!(PgeMode::PlanOnly.as_learnt_mode(), None);
-        for mode in PgeMode::ALL {
-            if mode != PgeMode::PlanOnly {
-                assert_eq!(mode.as_learnt_mode(), Some(mode.as_str()));
-            }
-        }
+        assert_eq!(PgeMode::Pipeline.as_learnt_mode(), Some("pipeline"));
+        assert_eq!(PgeMode::Roundtable.as_learnt_mode(), Some("roundtable"));
+        assert_eq!(PgeMode::Direct.as_learnt_mode(), Some("direct"));
     }
 
     /// 每种声明输入在指标面上有自己的标签，且都在 `ALL` 上。

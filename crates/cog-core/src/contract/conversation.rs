@@ -260,6 +260,24 @@ pub trait AgentMessageStore: Send + Sync {
     /// says so rather than pretending the answer was written.
     async fn answer(&self, id: i64, reply: &str) -> SFResult<bool>;
 
+    /// Put down why a row that was still waiting for an answer never got one.
+    ///
+    /// The counterpart of [`Self::answer`]: that one writes what the agent
+    /// said, this one writes why nothing did. Only a row still reading
+    /// `queued` moves -- a `replied` row carries an answer already, and a row
+    /// a `refuse` or a broken delivery settled has a fact this call does not
+    /// change.
+    ///
+    /// The outcome is `timed_out` or `failed`: those are the two ways a send
+    /// ends without an answer, and asking for another one is a caller that has
+    /// confused this call with [`Self::record`]. The detail is required for the
+    /// same reason: a row settled by silence that does not say why reads back
+    /// as a silence the platform cannot explain.
+    ///
+    /// Returns whether a row moved, for the same reason `answer` does: a row
+    /// the transcript has already trimmed is not a row this call wrote to.
+    async fn no_answer(&self, id: i64, outcome: SendOutcome, detail: &str) -> SFResult<bool>;
+
     /// The last `limit` lines of a peer's conversation, oldest first.
     ///
     /// Both directions: an exchange belongs to the history of both parties.

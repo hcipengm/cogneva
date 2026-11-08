@@ -102,6 +102,7 @@ pub mod websocket;
 pub mod websocket_protocol;
 pub mod wiki;
 pub mod window_pace;
+pub mod workbench;
 pub mod workspaces;
 
 pub use approval_gate::{
@@ -1096,6 +1097,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/governance/progress",
             get(progress::progress_handler),
         )
+        .route("/api/v1/workbench", get(workbench::workbench_handler))
         .route(
             "/api/v1/governance/principles",
             get(governance::principles_handler),
@@ -3352,13 +3354,17 @@ fn names_its_subject(a: &alert_store::AlertEntry) -> bool {
     a.agent_id.is_some() || a.task_id.is_some() || a.crew_id.is_some()
 }
 
-async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Response {
+/// 此刻正在 firing 的告警：进程内事件与耐久行合并，外加耐久那一半读没读到。
+///
+/// 两处读它：告警列表端点与工作台的状态灯。灯如果自己再数一遍，灯的条数与点进
+/// 去看到的列表条数会在两条腿各自演化时分家——而两条腿报的是同一件事。
+///
+/// `None` 是这个部署一个告警源都没有：那不是「零条告警」，是这个问题答不了。
+pub(crate) async fn read_active_alerts(
+    state: &GatewayState,
+) -> Option<(Vec<alert_store::AlertEntry>, Option<bool>)> {
     if state.alert_store.is_none() && state.active_alert_source.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "alert store not configured"})),
-        )
-            .into_response();
+        return None;
     }
 
     let mut alerts: Vec<alert_store::AlertEntry> = state
@@ -3418,6 +3424,17 @@ async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Respon
         None => None,
     };
 
+    Some((alerts, durable_alerts_read))
+}
+
+async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Response {
+    let Some((alerts, durable_alerts_read)) = read_active_alerts(&state).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "alert store not configured"})),
+        )
+            .into_response();
+    };
     (
         StatusCode::OK,
         Json(json!({

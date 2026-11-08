@@ -647,6 +647,34 @@ pub fn web_search_with_fallback(
                 // the fact it needs, so the silent one is an error that names
                 // the engines instead of a result set.
                 let names: Vec<String> = answer.broken.iter().map(|e| e.to_string()).collect();
+                // An engine that answered is not the same as a query that was
+                // put to the web. Every hit here came from one of the engines
+                // measured to match only the first token -- so this result set
+                // is about the query's first word, not about the query, and
+                // passing it on is what sends a run into twenty more searches
+                // that all come back the same way. The second backend is asked
+                // even though the first one spoke; if it has nothing, the hits
+                // below are still returned rather than replaced by an error,
+                // because a bad reading beats no reading only when the caller
+                // can tell which it got -- `source` says so either way.
+                if hits_only_from_degraded_engines(&answer.results, &query) {
+                    if let Some(fallback) = fallback_base.as_deref() {
+                        if let Ok(hits) = fallback_search(&*client, fallback, &query, limit).await {
+                            if !hits.is_empty() {
+                                return Ok(serde_json::json!({
+                                    "query": query,
+                                    "limit": limit,
+                                    "count": hits.len(),
+                                    "results": hits,
+                                    "source": "fallback",
+                                    "fallback_because": "every hit came from an engine \
+                                                         measured to answer only the first \
+                                                         token of the query",
+                                }));
+                            }
+                        }
+                    }
+                }
                 // The one thing a second backend is for: the self-hosted layer
                 // handed nothing back. A query it answered itself never leaves
                 // the deployment (that property is why the self-hosted half
@@ -883,6 +911,54 @@ fn search_answer(resp: &cog_core::HttpResponse, base: &str, limit: u64) -> SFRes
         broken,
         extras,
     })
+}
+
+/// Engines measured to answer a multi-term query with results for its first
+/// token only.
+///
+/// An engine on this list still answers with HTTP 200, still fills the result
+/// list, and still echoes the whole query in the page title -- so nothing about
+/// the response says it was not used. What it does instead is match the first
+/// word: measured 2026-11-07 from this deployment's network, `cn.bing.com` put
+/// 黑神话悟空 混铁棍 怎么获得 to its search box in full and returned pages
+/// about 黑 (the character); `black myth wukong mixed iron staff` came back as
+/// dictionary entries for BLACK. A hit set that came only from such an engine
+/// is not a reading of the query, and handing it to a caller as one is what
+/// makes a run try twenty more searches.
+///
+/// The list is a measurement with a date, not a verdict about the vendor: when
+/// one of these engines stops doing this, delete it here, and when another
+/// starts, add it. The gate is the three tests in `mod tests` that put a
+/// first-token set, a one-term query and a broken second backend through the
+/// same decision this constant feeds.
+const DEGRADED_ENGINES: &[&str] = &["bing"];
+
+/// Whether this hit set is a reading of the query, or of its first word.
+///
+/// Two conditions, because the degradation has two:
+///
+/// - every hit came from an engine on [`DEGRADED_ENGINES`]; a set with even one
+///   hit from an engine that reads the whole query is a reading of the query;
+/// - the query has more than one term. The same engine answers a single-term
+///   query correctly -- measured 2026-11-07, `混铁棍` on `cn.bing.com` came
+///   back with the right wiki page and the right guides -- and sending those to
+///   the second backend would trade a 0.2s answer for a multi-second one to
+///   fix a defect they do not have.
+///
+/// Empty is not "yes": nothing to distrust is not the same as a hit set we
+/// distrust, and the empty case already has its own path.
+fn hits_only_from_degraded_engines(results: &[serde_json::Value], query: &str) -> bool {
+    !results.is_empty()
+        && query.split_whitespace().count() > 1
+        && results.iter().all(|hit| {
+            hit.get("engine")
+                .and_then(|e| e.as_str())
+                .is_some_and(|name| {
+                    DEGRADED_ENGINES
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(name))
+                })
+        })
 }
 
 /// The rendering backend, or `None` when this deployment reads pages in process.
@@ -1548,7 +1624,7 @@ mod tests {
             200,
             cog_core::CONTENT_TYPE_JSON,
             r#"{"results":[{"title":"Rust","url":"https://rust-lang.org/","content":"fast",
-                 "engine":"bing"}],"unresponsive_engines":[]}"#,
+                 "engine":"360search"}],"unresponsive_engines":[]}"#,
         );
         let tool = web_search_with_fallback(
             client_of(&scripted),
@@ -1569,6 +1645,119 @@ mod tests {
             asked[0].method, "GET",
             "the fallback speaks POST; a GET here would mean the self-hosted path \
              went somewhere else"
+        );
+    }
+
+    /// 命中全部来自「只回答查询第一个词」的引擎，不算回答了这个查询。
+    ///
+    /// 这条路径和「全沉默」不同：引擎答了 200，结果列表是满的，页面标题里也
+    /// 是整句查询——只有结果本身不是问的那件事。实测 2026-11-07：查询
+    /// `黑神话悟空 混铁棍 怎么获得` 被完整送进 bing 的搜索框，返回的是
+    /// 「黑（汉语文字）_百度百科」。把它当读数交给调用方，就是那一轮连发三十次
+    /// 搜索的起点。
+    #[tokio::test]
+    async fn hits_from_a_measured_degraded_engine_are_not_an_answer_to_the_query() {
+        let scripted = Scripted::answering_in_order(vec![
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[{"title":"黑（汉语文字）_百度百科","url":"https://baike.baidu.com/item/黑",
+                     "content":"黑为汉语一级通用规范汉字","engine":"bing"}],
+                    "unresponsive_engines":[]}"#
+                    .to_string(),
+            ),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[{"title":"混铁棍怎么获得","url":"https://example.com/a",
+                     "content":"二周目火焰山"}]}"#
+                    .to_string(),
+            ),
+        ]);
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let out = call(
+            &tool,
+            serde_json::json!({"query":"黑神话悟空 混铁棍 怎么获得"}),
+        )
+        .await
+        .expect("the fallback answered");
+        assert_eq!(out["source"], "fallback", "{out}");
+        assert_eq!(out["count"], 1, "{out}");
+        assert_eq!(out["results"][0]["url"], "https://example.com/a", "{out}");
+        assert_eq!(
+            scripted.asked().len(),
+            2,
+            "the self-hosted answer, then the fallback: {out}"
+        );
+    }
+
+    /// 后备没答上来时，自建层那批命中仍然是「有一条读数」，不是错误。
+    ///
+    /// 把一份坏读数换成一条错误是另一种谎：调用方会以为网上什么都没有，而实际上
+    /// 它手上有一份答案。`source` 说的是这份答案从哪条路来，调用方据此知道它有多
+    /// 弱。
+    #[tokio::test]
+    async fn a_degraded_hit_set_survives_a_fallback_that_cannot_answer() {
+        let scripted = Scripted::answering_in_order(vec![
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[{"title":"黑（汉语文字）_百度百科","url":"https://baike.baidu.com/item/黑",
+                     "content":"黑为汉语一级通用规范汉字","engine":"bing"}],
+                    "unresponsive_engines":[]}"#
+                    .to_string(),
+            ),
+            (500, cog_core::CONTENT_TYPE_JSON, "{}".to_string()),
+        ]);
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let out = call(
+            &tool,
+            serde_json::json!({"query":"黑神话悟空 混铁棍 怎么获得"}),
+        )
+        .await
+        .expect("a bad reading is still a reading");
+        assert_eq!(out["source"], "self_hosted", "{out}");
+        assert_eq!(out["count"], 1, "{out}");
+    }
+
+    /// 同一个引擎答一个词是对的，那一份命中就是答案，不该再花钱问第二遍。
+    ///
+    /// 退化是有条件的：整句查询它只看第一个词，可「第一个词」就是整句的时候，
+    /// 它看的正是问题本身。实测 2026-11-07，`混铁棍` 在 cn.bing.com 上回来的
+    /// 第一条就是哔哩哔哩的黑神话 wiki。把这一份也送出去，换来的是每次单词查询
+    /// 多等几秒，而没有修掉任何东西——所以这一格必须绿。
+    #[tokio::test]
+    async fn a_single_term_query_is_answered_by_the_same_engine() {
+        let scripted = Scripted::answering_in_order(vec![(
+            200,
+            cog_core::CONTENT_TYPE_JSON,
+            r#"{"results":[{"title":"混铁棍 - 黑神话：悟空Wiki","url":"https://wiki.biligame.com/wukong/混铁棍",
+                 "content":"混铁棍的获得方式","engine":"bing"}],
+                "unresponsive_engines":[]}"#
+                .to_string(),
+        )]);
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let out = call(&tool, serde_json::json!({"query":"混铁棍"}))
+            .await
+            .expect("the self-hosted engine answered");
+        assert_eq!(out["source"], "self_hosted", "{out}");
+        assert_eq!(out["count"], 1, "{out}");
+        assert_eq!(
+            scripted.asked().len(),
+            1,
+            "a one-term query is not sent to the second backend: {out}"
         );
     }
 

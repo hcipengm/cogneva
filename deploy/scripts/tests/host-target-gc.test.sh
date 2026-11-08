@@ -37,7 +37,7 @@ set -euo pipefail
 # caller's GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE, and an init under them lands in
 # that tree instead of the fixture. Clear them at file scope; anything that has
 # to carry them on purpose sets them on the command line.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
@@ -340,21 +340,41 @@ fi
 # writing over a file that is being executed is ETXTBSY.
 mkdir -p "${work}/zombie"
 fake_cargo "${work}/zombie/cargo"
-python3 - "${work}/zombie/cargo" <<'PY' &
+python3 - "${work}/zombie/cargo" "${work}/zombie/pid" <<'PY' &
 import subprocess, sys, time
-subprocess.Popen([sys.argv[1], "-c", "exit 0"])  # exits at once, and is never waited for
-time.sleep(60)
+child = subprocess.Popen([sys.argv[1], "-c", "exit 0"])  # exits at once, and is never waited for
+with open(sys.argv[2], "w") as f:
+    f.write("%d\n" % child.pid)
+time.sleep(600)  # holds it far longer than the poll below is allowed to take
 PY
 fake_pids+=("$!")
+# Read the child's own pid instead of taking a snapshot of the process table.
+# `ps -eo stat=,comm=` is a fork plus a walk of every process, and on a host
+# running several gates at once that walk is what ran out of time: the zombie
+# was there the whole time, the check just never looked early enough (2026-11-09,
+# this case red inside a whole-gate run and green on its own). Two opens answer
+# the same two questions the snapshot did -- is it stopped (`State: Z`) and is it
+# called cargo (`comm`) -- and the name half still has to be read, or a fixture
+# whose stand-in lost its name would pass here while asserting nothing below.
+#
+# The deadline is bounded by the holder rather than picked: the parent keeps the
+# child for 600 s, so a poll giving up at 120 s is one the holder cannot outlive,
+# and the failure it reports says how long it waited.
 held=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if [ -n "$(ps -eo stat=,comm= | awk '$1 ~ /^Z/ && $2 == "cargo"')" ]; then
-    held=1
-    break
+deadline=$((SECONDS + 120))
+while [ "${SECONDS}" -lt "${deadline}" ]; do
+  if [ -s "${work}/zombie/pid" ]; then
+    zombie_pid="$(head -n 1 "${work}/zombie/pid")"
+    if [ "$(cat "/proc/${zombie_pid}/comm" 2>/dev/null)" = "cargo" ] &&
+      grep -q '^State:[[:space:]]*Z' "/proc/${zombie_pid}/status" 2>/dev/null; then
+      held=1
+      break
+    fi
   fi
-  sleep 0.5
+  sleep 0.2
 done
-[ "${held}" = 1 ] || fail "自检失败：没造出停在 Z 的 cargo，下面这条断言会永远通过"
+[ "${held}" = 1 ] ||
+  fail "自检失败：120 秒内没造出停在 Z 的 cargo（父进程本该把它按住 600 秒），下面这条断言会永远通过"
 out="$(run_gc COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=1 COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
 if grep -q 'a process of ours is unreadable' <<<"${out}"; then
   fail "已经结束、还没被回收的进程被当成了读不到的写者，整轮被中止：${out}"

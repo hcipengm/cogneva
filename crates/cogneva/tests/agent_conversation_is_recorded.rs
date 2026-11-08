@@ -110,6 +110,22 @@ impl AgentMessageStore for RecordingTranscript {
         Ok(true)
     }
 
+    async fn no_answer(&self, id: i64, outcome: SendOutcome, detail: &str) -> SFResult<bool> {
+        let mut lines = self
+            .lines
+            .lock()
+            .expect("the transcript lock is not poisoned");
+        let Some(line) = lines.iter_mut().find(|line| line.id == id) else {
+            return Ok(false);
+        };
+        if line.outcome != SendOutcome::Queued {
+            return Ok(false);
+        }
+        line.outcome = outcome;
+        line.outcome_detail = Some(detail.to_string());
+        Ok(true)
+    }
+
     async fn conversation(&self, peer: &str, limit: usize) -> SFResult<Vec<AgentMessage>> {
         let lines = self
             .lines
@@ -231,6 +247,71 @@ async fn a_command_that_was_never_answered_is_recorded_as_timed_out() {
     assert!(
         lines[0].outcome_detail.is_some(),
         "the reader has to know why there is no answer: {lines:?}"
+    );
+}
+
+/// A prompt nobody answers cannot spend the rest of its life saying it will be
+/// answered.
+///
+/// `queued` is written for a prompt sent without a wait, and the panel reads it
+/// as "delivered, it answers on its own". When the employee is running another
+/// task, that sentence queues behind the whole run; the stream the answer would
+/// arrive on closes at the end of the late window, and from then on no answer
+/// can reach that row. Left as it is, the record promises an answer nothing will
+/// deliver -- on 2026-11-07 a person asked a squad member a question, was told
+/// the words were delivered, and heard nothing for ten minutes while the row
+/// kept reading "waiting for it to answer".
+///
+/// The clock is paused and advanced over the window rather than the window
+/// shortened for the test: what is judged is the bound the deployment actually
+/// waits, not a number invented here.
+#[tokio::test(start_paused = true)]
+async fn a_prompt_nobody_answers_does_not_stay_queued_forever() {
+    let transcript = Arc::new(RecordingTranscript::default());
+    let state = state(transcript.clone());
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "transcript-silence-probe").await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &token,
+        ROUTE,
+        Some(r#"{"type":"prompt","goal":{"objective":"nobody listens"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // The window is held by the collector task the route spawns, and a task
+    // starts holding it on its first poll -- not at spawn. Advancing the clock
+    // before that poll would leave the timer registering 600s into the future
+    // of the new "now", so the row would still read queued and the test would
+    // be judging the scheduler rather than the route.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(
+        cog_gateway::agents::LATE_ANSWER_WINDOW + std::time::Duration::from_secs(1),
+    )
+    .await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+
+    let lines = transcript.lines.lock().expect("lock").clone();
+    assert_eq!(lines.len(), 1, "the send is recorded once: {lines:?}");
+    assert_eq!(
+        lines[0].outcome,
+        SendOutcome::TimedOut,
+        "a send nobody answered has to say so instead of waiting forever: {lines:?}"
+    );
+    assert!(
+        lines[0].reply.is_none(),
+        "an answer that never came must not be recorded as one: {lines:?}"
+    );
+    assert!(
+        lines[0].outcome_detail.is_some(),
+        "the reader has to be told it went unanswered, not left reading a promise: {lines:?}"
     );
 }
 

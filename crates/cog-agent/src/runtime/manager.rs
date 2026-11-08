@@ -750,6 +750,10 @@ impl cog_core::AgentManager for GlobalAgentManager {
         }
         Ok(None)
     }
+
+    async fn retire_agent(&self, agent_id: &str) -> cog_core::SFResult<bool> {
+        Ok(self.retire_agent(agent_id).await)
+    }
 }
 
 #[cfg(test)]

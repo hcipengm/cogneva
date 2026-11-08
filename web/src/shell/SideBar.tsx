@@ -59,7 +59,7 @@ export function SideBar() {
 
   return (
     <aside
-      className="relative flex h-full shrink-0 flex-col border-r border-[var(--line)] bg-[var(--ink-800)]"
+      className="group/resizer relative flex h-full shrink-0 flex-col border-r border-[var(--line)] bg-[var(--ink-800)]"
       style={{ width }}
     >
       <header className="flex h-9 shrink-0 items-center border-b border-[var(--line)] px-3">
@@ -89,7 +89,7 @@ export function SideBar() {
         onPointerDown={startDrag}
         onDoubleClick={() => setWidth(SIDEBAR_DEFAULT_WIDTH)}
         text="拖拽调整宽度，双击回到默认"
-        className="absolute right-0 top-0 z-10 h-full w-[6px] cursor-col-resize transition-colors hover:bg-[var(--line-strong)]"
+        className="absolute right-0 top-0 z-10 h-full w-[6px] cursor-col-resize transition-colors hover:bg-[var(--line-strong)] group-hover/resizer:bg-[var(--line)]"
         data-sidebar-resizer="true"
       />
     </aside>
@@ -222,7 +222,6 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
           </Note>
           <CrossLinks
             links={[
-              { id: 'agents', label: '智能体', note: '生命周期与心跳' },
               { id: 'tasks', label: '任务', note: '谁在做哪件活' },
             ]}
           />
@@ -277,7 +276,7 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
               onClick={() => setActivity('alerts')}
             />
             <Row label="任务队列" icon="tasks" onClick={() => setActivity('tasks')} />
-            <Row label="在岗智能体" icon="agents" onClick={() => setActivity('agents')} />
+            <Row label="员工名册" icon="agents" onClick={() => setActivity('people')} />
           </Section>
           <Section title="键盘">
             <Row label="命令面板" note="⌘K" />
@@ -427,13 +426,15 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
           </Section>
           <CrossLinks
             links={[
-              { id: 'agents', label: '在岗智能体', note: '谁在领任务' },
+              { id: 'people', label: '员工名册', note: '谁在领任务' },
               { id: 'changes', label: '变更队列', note: '任务产出了什么' },
             ]}
           />
         </>
       );
 
+    // 「智能体」已经不是独立的一面：它与员工读同一份名单，合并进员工页的
+    // 「名册」标签。旧链接落在这里时给的是员工面那份说明。
     case 'agents':
       return (
         <>
@@ -446,8 +447,8 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
           </Section>
           <CrossLinks
             links={[
+              { id: 'people', label: '员工名册', note: '同一批人，含离职' },
               { id: 'tasks', label: '任务', note: '谁在干什么' },
-              { id: 'governance', label: '治理', note: '这些角色谁在守' },
             ]}
           />
         </>
@@ -504,7 +505,7 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
           <CrossLinks
             links={[
               { id: 'tasks', label: '任务', note: '依赖与归属的细节' },
-              { id: 'agents', label: '智能体', note: '执行者自己的读数' },
+              { id: 'people', label: '员工名册', note: '执行者自己的读数' },
             ]}
           />
         </>
@@ -633,7 +634,7 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
           </Section>
           <CrossLinks
             links={[
-              { id: 'agents', label: '智能体', note: '现在谁在跑' },
+              { id: 'people', label: '员工名册', note: '现在谁在跑' },
               { id: 'tasks', label: '任务', note: '这件事的结局' },
             ]}
           />

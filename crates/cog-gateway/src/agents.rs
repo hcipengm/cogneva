@@ -96,8 +96,8 @@ pub async fn register_handler(
 /// 它也能接平台上的活。它不带角色、不带提示词——角色是注册表上的一列标签，不是
 /// 一段写死的性格；能力来自它和别的员工同一套工具与同一条基础指令。
 ///
-/// 名字由名册按 id 算出来（`display_name_for`），与每一个别的人同一个规则：一个
-/// id 永远对应同一个名字，重读不会改名。
+/// 名字来自名册行：注册那一刻发一个工号，姓名由工号算出来（`employee_label`），
+/// 于是「工号 姓名」永不重复，重读也不会改名。
 pub async fn create_handler(
     State(state): State<Arc<GatewayState>>,
     caller: Option<Extension<Claims>>,
@@ -159,11 +159,23 @@ pub async fn create_handler(
                 persisted = persistence.is_none(),
                 "an employee joined the roster"
             );
+            // 展示名取自名册那一行：工号是这个人唯一的编号来源。读不到就印
+            // 「待编」——不退回机器码，那串十六进制看着像名字，于是没人去补号。
+            let label = match state.agent_registry.as_ref() {
+                Some(registry) => registry
+                    .employee(&agent_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|row| row.label()),
+                None => None,
+            }
+            .unwrap_or_else(|| cog_core::unregistered_label(&agent_id));
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
                     "agent_id": agent_id,
-                    "display_name": cog_core::display_name_for(&agent_id),
+                    "display_name": label,
                     "hired_by": words,
                     "persisted": persistence.is_none(),
                     "persistence_error": persistence,
@@ -426,6 +438,8 @@ pub enum Summon {
     Held,
     /// 池里没有，这一次建回来了。
     Built,
+    /// 另有一个活着的进程在服务这个人，这一趟什么都不该建。
+    Elsewhere,
 }
 
 pub type SummonFn = Box<
@@ -443,6 +457,8 @@ pub struct RosterPass {
     pub restored: usize,
     /// 名册读不出、行解析不了或人建不回来的总数。
     pub failed: usize,
+    /// 由另一个活着的进程服务、这一趟交给对方的人。
+    pub elsewhere: usize,
 }
 
 /// 按名册逐人对账一次。
@@ -477,6 +493,9 @@ pub async fn restore_roster_from(
                     "an employee named by the roster is back on the pool"
                 );
             }
+            // 不是「池里有」，也不是「建回来了」：这个进程没有这个人，也不该有。
+            // 计成 present 会让「在岗人数」把别人的进程算成自己的。
+            Ok(Summon::Elsewhere) => pass.elsewhere += 1,
             Err(e) => {
                 pass.failed += 1;
                 tracing::warn!(
@@ -490,15 +509,65 @@ pub async fn restore_roster_from(
     pass
 }
 
+/// 这个名字该不该由本进程服务。
+///
+/// 名册是每个进程都会读的，所以「把名册上的人建回来」这句话在每个进程里都成立
+/// ——同一个员工于是被两个进程各建了一份，订阅同一个 inbox、注册同一个键、
+/// 心跳互相覆盖。后果不是多花一点内存：一条消息只会投给其中一个进程，而
+/// 挂起列表上记的是同一个消费者名，谁也说不清那一条归谁；一个进程重启，另一个
+/// 进程手里的活也没有人能接。
+///
+/// 判据只能读注册表：注册记录里写着「这个进程」。两个进程同时认领时，必须有一
+/// 方让出去，而让位规则得是两边读数一样、结果也一样的全序——进程名是唯一同时
+/// 满足这两条的值。名字小的那个留下。
+pub fn this_process_hosts(record: Option<&cog_core::AgentRegistration>, mine: &str) -> bool {
+    match record {
+        // 没有任何活着的进程认领这个名字：谁先看到谁建，是今天的行为。
+        None => true,
+        Some(record) if record.hostname == mine => true,
+        Some(record) => mine < record.hostname.as_str(),
+    }
+}
+
 /// 生产环境的 summon：池里有人就交回，没有就建一个进程生命周期的人。
+///
+/// 建之前先问注册表：这个名字已经被另一个活着的进程服务时，本进程不但不建，
+/// 手里原有的那一份也要交出去——否则两边会一直各留一份，让位规则永远没有终点。
 pub fn pool_summoner(
     pool: Arc<dyn cog_core::AgentManager>,
     llm: Arc<dyn cog_core::LlmClient>,
+    registry: Option<Arc<dyn cog_core::AgentRegistry>>,
+    mine: String,
 ) -> SummonFn {
     Box::new(move |agent_id, role| {
         let pool = pool.clone();
         let llm = llm.clone();
+        let registry = registry.clone();
+        let mine = mine.clone();
         Box::pin(async move {
+            if let Some(registry) = registry.as_ref() {
+                let record = registry.get(&agent_id).await.map_err(|e| e.to_string())?;
+                if !this_process_hosts(record.as_ref(), &mine) {
+                    // 交出去之后不再建：这一趟的名册行到此为止。注册记录还在对方
+                    // 手里，下一趟读到的仍是对方，所以不会来回抢。
+                    if pool
+                        .get_agent(&agent_id)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                    {
+                        pool.retire_agent(&agent_id)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        tracing::info!(
+                            agent_id = %agent_id,
+                            host = %record.map(|r| r.hostname).unwrap_or_default(),
+                            "another live process serves this employee; this one let go of it"
+                        );
+                    }
+                    return Ok(Summon::Elsewhere);
+                }
+            }
             match pool.get_agent(&agent_id).await {
                 Ok(Some(_)) => Ok(Summon::Held),
                 Ok(None) => pool
@@ -526,7 +595,12 @@ pub async fn restore_roster(state: &GatewayState) -> RosterPass {
     let Some(llm) = llm else {
         return RosterPass::default();
     };
-    let mut summon = pool_summoner(pool.clone(), llm);
+    let mut summon = pool_summoner(
+        pool.clone(),
+        llm,
+        state.agent_registry.clone(),
+        cog_core::env::process_identity(|name| std::env::var(name).ok()),
+    );
     restore_roster_from(kv, &mut summon).await
 }
 
@@ -558,6 +632,7 @@ pub fn spawn_roster_keeper(
                             named = pass.named,
                             present = pass.present,
                             restored = pass.restored,
+                            elsewhere = pass.elsewhere,
                             failed = pass.failed,
                             "roster pass"
                         );
@@ -1195,15 +1270,19 @@ fn spawn_late_collector(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "an answer to an already-answered request finished arriving"
         );
-        let AskOutcome::Replied(reply) = outcome else {
-            return;
-        };
-        // A string answer is what the agent said; any other shape is kept as
-        // its JSON text so the transcript never drops an answer it does not
-        // recognise.
-        let text = match &reply {
-            serde_json::Value::String(text) => text.clone(),
-            other => other.to_string(),
+        let text = match outcome {
+            // A string answer is what the agent said; any other shape is kept
+            // as its JSON text so the transcript never drops an answer it does
+            // not recognise.
+            AskOutcome::Replied(reply) => match &reply {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            },
+            // Silence of every other kind has an outcome too, and the row has
+            // to carry it: the window this collector just waited out is also
+            // the life of the stream the answer would have arrived on, so from
+            // here on no answer can reach this row.
+            other => return settle_no_answer(&state, row, &agent_id, other).await,
         };
         settle_late_answer(&state, row, &agent_id, &text).await;
     });
@@ -1215,19 +1294,7 @@ async fn settle_late_answer(state: &GatewayState, row: Option<i64>, agent_id: &s
         return;
     };
     match store.answer(id, text).await {
-        Ok(true) => {
-            if state
-                .event_tx
-                .send(cog_core::AgentEvent::ResourceChanged {
-                    domain: "agents".to_string(),
-                    timestamp: chrono::Utc::now(),
-                })
-                .is_err()
-            {
-                // 没有接收者不是错误：这一帧的读者是打开着的那一面，一个都没有
-                // 的时候它本来就无处可去。写下去的那一行仍然在库里。
-            }
-        }
+        Ok(true) => say_the_conversation_moved(state),
         Ok(false) => tracing::warn!(
             row = id,
             to = %agent_id,
@@ -1241,6 +1308,89 @@ async fn settle_late_answer(state: &GatewayState, row: Option<i64>, agent_id: &s
             "could not write a late answer into the transcript"
         ),
     }
+}
+
+/// Put down that no answer came, on the row its send wrote.
+///
+/// The row was written `queued`: delivered, no answer waited for. A reader sees
+/// that as "it will answer on its own", and for as long as the row stands it
+/// keeps saying so -- even after the stream the answer would have arrived on is
+/// gone. What this closes is that gap. A person talking to an employee that is
+/// running another task has their sentence queued behind the whole run; if the
+/// run outlasts the wait, the sentence is never answered, and until now nothing
+/// said so: the delivery was recorded as a promise nobody would keep.
+///
+/// Which outcome it settles as is the reason the answer is not here. Waiting
+/// the window out is `timed_out` -- nobody answered. A reply stream that broke,
+/// or an answer that could not be read, is `failed` -- those two are different
+/// things to a reader, and folding them together would send someone looking for
+/// a busy employee when the connection is what went away.
+async fn settle_no_answer(
+    state: &GatewayState,
+    row: Option<i64>,
+    agent_id: &str,
+    outcome: AskOutcome,
+) {
+    let (Some(store), Some(id)) = (state.agent_messages.as_ref(), row) else {
+        return;
+    };
+    let (settled, detail) = match outcome {
+        AskOutcome::TimedOut { waited_secs } => (
+            SendOutcome::TimedOut,
+            format!(
+                "delivered, but no answer arrived within {waited_secs}s: the employee may \
+                 be running another task, so this sentence is queued behind it, and the \
+                 reply stream closed when the wait ran out"
+            ),
+        ),
+        AskOutcome::StreamError { error } => (
+            SendOutcome::Failed,
+            format!("delivered, but the reply stream broke before an answer: {error}"),
+        ),
+        AskOutcome::Unreadable { error } => (
+            SendOutcome::Failed,
+            format!("delivered, but the answer could not be read: {error}"),
+        ),
+        // The one outcome that has an answer is `settle_late_answer`'s.
+        AskOutcome::Replied(_) => return,
+    };
+    match store.no_answer(id, settled, &detail).await {
+        Ok(true) => {
+            tracing::info!(
+                to = %agent_id,
+                row = id,
+                outcome = settled.as_str(),
+                "a send nobody answered was settled as such"
+            );
+            say_the_conversation_moved(state);
+        }
+        Ok(false) => tracing::warn!(
+            row = id,
+            to = %agent_id,
+            "a send settled by silence found no waiting row: the conversation had \
+             already moved on, was trimmed, or was settled by its answer"
+        ),
+        Err(e) => tracing::warn!(
+            row = id,
+            to = %agent_id,
+            error = %e,
+            "could not write a send that never got its answer into the transcript"
+        ),
+    }
+}
+
+/// Say the roster's conversations moved.
+///
+/// The frame is how a reader learns about a settled row: the workbench holds no
+/// timer for this and cannot poll a stream it does not own, so the write itself
+/// says the conversations changed.
+fn say_the_conversation_moved(state: &GatewayState) {
+    // 没有接收者不是错误：这一帧的读者是打开着的那一面，一个都没有的时候它
+    // 本来就无处可去。写下去的那一行仍然在库里。
+    let _ = state.event_tx.send(cog_core::AgentEvent::ResourceChanged {
+        domain: "agents".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
 }
 
 /// Which of the two delivery paths took the command.
@@ -1667,20 +1817,11 @@ fn caller_named_reply_stream(msg: &cog_core::InboxMessage) -> Option<&str> {
 
 /// One registry record as the roster prints it.
 ///
-/// The routing id stays exactly as registered — it is derived from (task, role)
-/// at both ends and cannot carry a name — and the readable name is derived from
-/// that id here, at the one surface a person reads. Storing the name instead
-/// would let the two drift: a record whose id was rewritten would keep a name
-/// that no longer resolves to it.
+/// 这里只搬注册表那一行，**不印名字**：名字来自名册行（工号＋姓名），由
+/// [`identity_of`] 在后面合并进来。两个地方各印一次时，同一张名单上会出现
+/// 两种拼法，而读的人只会以为是两个人。
 fn agent_view(reg: &cog_core::AgentRegistration) -> serde_json::Value {
-    let mut view = serde_json::to_value(reg).unwrap_or(serde_json::Value::Null);
-    if let Some(obj) = view.as_object_mut() {
-        obj.insert(
-            "display_name".to_string(),
-            serde_json::json!(cog_core::display_name_for(&reg.agent_id)),
-        );
-    }
-    view
+    serde_json::to_value(reg).unwrap_or(serde_json::Value::Null)
 }
 
 /// Split the roster into the two populations it actually holds.
@@ -1698,6 +1839,42 @@ fn roster_split(regs: &[cog_core::AgentRegistration]) -> (usize, usize) {
     (regs.len() - squads, squads)
 }
 
+/// 把名册那一行摊成身份字段。
+///
+/// 展示名只有这一个来源：有工号的人印 `E0412 林清和`，没工号的人印「待编
+/// 某某」。读面不再各自拼一遍——三处各拼一次时，同一个人在员工页与对话页
+/// 会顶着两个名字，而读的人只会以为是两个人。
+fn identity_of(
+    agent_id: &str,
+    roster: &std::collections::HashMap<String, cog_core::EmployeeRecord>,
+) -> serde_json::Value {
+    match roster.get(agent_id) {
+        Some(row) => serde_json::json!({
+            "display_name": row.label(),
+            "number": row
+                .number
+                .map(|n| format!("{}{n:04}", cog_core::EMPLOYEE_NUMBER_PREFIX)),
+            "person_name": row.number.map(cog_core::employee_name),
+            "retired": !row.is_active(),
+            "retired_at": row.retired_at,
+        }),
+        None => serde_json::json!({
+            "display_name": cog_core::unregistered_label(agent_id),
+            "number": serde_json::Value::Null,
+            "person_name": serde_json::Value::Null,
+            "retired": false,
+        }),
+    }
+}
+
+fn merge_fields(view: &mut serde_json::Value, extra: serde_json::Value) {
+    if let (Some(obj), Some(extra)) = (view.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 /// 名单：心跳上此刻活着的人，加上说过话但已经下线的人。
 ///
 /// 同一个人两处都有时只印一行——注册表那一行回答「此刻在不在」，名册那一行
@@ -1712,11 +1889,20 @@ fn roster_split(regs: &[cog_core::AgentRegistration]) -> (usize, usize) {
 /// 招进来的人在维护环把他建回来之前会整个消失——名单上少一个人，读的人分不出
 /// 「没这个人」和「这个人这一刻不在池里」。所以名册上的人即使池里没有，也印一
 /// 行（`live: false`）：在不在岗是在岗位那一格的问题，存不存在是名册的问题。
+///
+/// 第四份来源是持久名册（`cog_storage::EMPLOYEES_KEY` 那张 hash）：注册表会
+/// 过期，people 与 roster 只覆盖走过对话与招人这两条路的人，按任务现起的成员
+/// （探针、小队角色）三条路都不经过。名册行还回答「在职还是离职」。
 fn roster_with_people(
     regs: &[cog_core::AgentRegistration],
     people: Vec<(String, PersonRow)>,
     hired: Vec<(String, RosterRow)>,
+    employees: Vec<cog_core::EmployeeRecord>,
 ) -> Vec<serde_json::Value> {
+    let roster: std::collections::HashMap<String, cog_core::EmployeeRecord> = employees
+        .iter()
+        .map(|row| (row.agent_id.clone(), row.clone()))
+        .collect();
     let mut views: Vec<serde_json::Value> = regs
         .iter()
         .map(|reg| {
@@ -1724,6 +1910,7 @@ fn roster_with_people(
             if let Some(obj) = view.as_object_mut() {
                 obj.insert("live".to_string(), serde_json::json!(true));
             }
+            merge_fields(&mut view, identity_of(&reg.agent_id, &roster));
             view
         })
         .collect();
@@ -1762,8 +1949,8 @@ fn roster_with_people(
         .collect();
     idle.sort_by_key(|row| std::cmp::Reverse(row.1.last_seen));
     for (agent_id, row) in idle {
-        views.push(serde_json::json!({
-            "agent_id": agent_id,
+        let mut view = serde_json::json!({
+            "agent_id": agent_id.clone(),
             "display_name": row.display_name,
             "role": "chat",
             "workspace_id": "default",
@@ -1776,10 +1963,15 @@ fn roster_with_people(
             "session_id": row.session_id,
             "platform": row.platform,
             "device_id": row.device_id,
-        }));
+        });
+        if roster.contains_key(&agent_id) {
+            merge_fields(&mut view, identity_of(&agent_id, &roster));
+        }
+        views.push(view);
     }
-    // 名册上有、另外两份都没有的人：招进来过，这一刻池里没有他。名字用 id 充当
-    // 显示名——雇佣行不存名字，编一个等于假装量过；用途标签来自名册那一行。
+    // 名册上有、另外两份都没有的人：招进来过，这一刻池里没有他。雇佣行不存
+    // 名字，所以显示名取自持久名册那一行；连名册都还没有的人印「待编」，而不是
+    // 把 id 本身当名字——那串十六进制看着像名字，于是没人去补这一次编号。
     let printed: std::collections::HashSet<String> = views
         .iter()
         .filter_map(|view| view.get("agent_id").and_then(|v| v.as_str()))
@@ -1789,9 +1981,9 @@ fn roster_with_people(
         if printed.contains(agent_id.as_str()) {
             continue;
         }
-        views.push(serde_json::json!({
-            "agent_id": agent_id,
-            "display_name": agent_id,
+        let mut view = serde_json::json!({
+            "agent_id": agent_id.clone(),
+            "display_name": cog_core::unregistered_label(&agent_id),
             "role": row.role,
             "workspace_id": "default",
             "capabilities": Vec::<String>::new(),
@@ -1801,6 +1993,43 @@ fn roster_with_people(
             "last_heartbeat": row.hired_at,
             "live": false,
             "hired_by": row.hired_by,
+        });
+        merge_fields(&mut view, identity_of(&agent_id, &roster));
+        views.push(view);
+    }
+    // 第四份来源：持久名册。前三份都是「此刻还在某处留下过痕迹的人」——注册表
+    // 会过期、people 与 roster 只覆盖走过对话与招人这两条路的人。按任务现起的
+    // 成员（探针、小队的那几个角色）三条路都不经过，于是名册上根本没有它们；
+    // 反过来，退役的人注册表一删键就无处可查。名册行两件事都记得，所以这里按
+    // 它补齐，并且把「在职/离职」作为一个显式字段印出来，而不是让读的人从
+    // 「在不在注册表里」去猜。
+    let printed: std::collections::HashSet<String> = views
+        .iter()
+        .filter_map(|view| view.get("agent_id").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+    for row in employees {
+        if printed.contains(row.agent_id.as_str()) {
+            continue;
+        }
+        let retired = !row.is_active();
+        views.push(serde_json::json!({
+            "agent_id": row.agent_id.clone(),
+            "display_name": row.label(),
+            "number": row
+                .number
+                .map(|n| format!("{}{n:04}", cog_core::EMPLOYEE_NUMBER_PREFIX)),
+            "person_name": row.number.map(cog_core::employee_name),
+            "role": row.role,
+            "workspace_id": "default",
+            "capabilities": Vec::<String>::new(),
+            "hostname": String::new(),
+            "pod_ip": String::new(),
+            "registered_at": row.first_seen,
+            "last_heartbeat": row.last_seen,
+            "live": false,
+            "retired": retired,
+            "retired_at": row.retired_at,
         }));
     }
     views
@@ -1830,7 +2059,22 @@ pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
                 .iter()
                 .filter(|(id, _)| !regs.iter().any(|reg| &reg.agent_id == id))
                 .count();
-            let agents = roster_with_people(&regs, people, hired);
+            // 名册读不出来按空处理，理由与雇佣名册那一份相同：它缺了，漏掉的是
+            // 「存在过谁」，而注册表那份仍然会把此刻在岗的人一个不少地交出来。
+            // 整条读面因此不该变成 503——但也不能装作读过：日志要说得出来这次
+            // 名册是空的还是没读到。
+            let employees = match registry.employees().await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "the employee roster could not be read; this pass lists only what the live \
+                         registry and the two key-value rosters know about"
+                    );
+                    Vec::new()
+                }
+            };
+            let agents = roster_with_people(&regs, people, hired, employees);
             let count = agents.len();
             let (workers, squads) = roster_split(&regs);
             (
@@ -2302,9 +2546,68 @@ mod tests {
         );
         let view = agent_view(&reg);
         assert_eq!(view["agent_id"], reg.agent_id);
-        let name = view["display_name"].as_str().expect("display_name present");
-        assert!(name.contains('#'), "name {name} is not a handle");
-        assert_eq!(name, cog_core::display_name_for(&reg.agent_id));
+        // 名字不再由 id 算出来：它来自名册行（工号＋姓名），由 `identity_of`
+        // 合并。这一行要是自己又印一个名字，两种拼法就会同时出现在名单上。
+        assert!(
+            view.get("display_name").is_none(),
+            "agent_view must not print a name of its own"
+        );
+    }
+
+    /// 名册上的一个人在名单上印成「工号 姓名」，而不是一串机器码。
+    #[test]
+    fn a_roster_row_prints_its_employee_number_and_name() {
+        let reg = cog_core::AgentRegistration::new(
+            cog_core::agent_id_for("task-1", "planner"),
+            "cog-agent",
+            "127.0.0.1",
+            "planner",
+            "default",
+            vec!["planner".into()],
+            cog_core::ResourceInfo::default(),
+        );
+        let now = chrono::Utc::now();
+        let row = cog_core::EmployeeRecord {
+            agent_id: reg.agent_id.clone(),
+            number: Some(7),
+            role: "planner".into(),
+            first_seen: now,
+            last_seen: now,
+            retired_at: None,
+        };
+        let views = roster_with_people(
+            std::slice::from_ref(&reg),
+            Vec::new(),
+            Vec::new(),
+            vec![row],
+        );
+        assert_eq!(views.len(), 1, "一个人只印一行");
+        let name = views[0]["display_name"].as_str().expect("display_name");
+        assert_eq!(name, cog_core::employee_label(7));
+        assert!(name.starts_with("E0007 "), "name {name} carries no 工号");
+        assert!(
+            !name.contains('#'),
+            "name {name} still reads as a machine code"
+        );
+        assert_eq!(views[0]["number"], "E0007");
+    }
+
+    /// 退役的人在名单上留一行，标成离职；工号不因退役而变。
+    #[test]
+    fn a_retired_employee_keeps_its_row_and_its_number() {
+        let now = chrono::Utc::now();
+        let row = cog_core::EmployeeRecord {
+            agent_id: "squad:gone-1-2026-11-07-planner".into(),
+            number: Some(41),
+            role: "planner".into(),
+            first_seen: now,
+            last_seen: now,
+            retired_at: Some(now),
+        };
+        let views = roster_with_people(&[], Vec::new(), Vec::new(), vec![row]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0]["retired"], true);
+        assert_eq!(views[0]["display_name"], cog_core::employee_label(41));
     }
 
     /// 说过一句话的人，闭嘴之后还在名单上。
@@ -2337,7 +2640,7 @@ mod tests {
             );
         let store: Arc<dyn cog_core::KeyValueStore> = store;
 
-        let views = roster_with_people(&[], read_people(&store).await, Vec::new());
+        let views = roster_with_people(&[], read_people(&store).await, Vec::new(), Vec::new());
 
         assert_eq!(views.len(), 1);
         assert_eq!(views[0]["agent_id"], "kai-a9ab11fc");
@@ -2400,7 +2703,12 @@ mod tests {
             device_id: None,
         };
 
-        let views = roster_with_people(&[reg], vec![("kai-a9ab11fc".to_string(), row)], Vec::new());
+        let views = roster_with_people(
+            &[reg],
+            vec![("kai-a9ab11fc".to_string(), row)],
+            Vec::new(),
+            Vec::new(),
+        );
 
         assert_eq!(views.len(), 1);
         assert_eq!(views[0]["live"], true);
@@ -2422,7 +2730,7 @@ mod tests {
         };
         let hired = vec![("employee:abc123".to_string(), row.clone())];
 
-        let views = roster_with_people(&[], Vec::new(), hired.clone());
+        let views = roster_with_people(&[], Vec::new(), hired.clone(), Vec::new());
         assert_eq!(views.len(), 1);
         assert_eq!(views[0]["agent_id"], "employee:abc123");
         assert_eq!(views[0]["role"], "evaluator");
@@ -2438,7 +2746,7 @@ mod tests {
             vec![],
             cog_core::ResourceInfo::default(),
         );
-        let views = roster_with_people(&[reg], Vec::new(), hired);
+        let views = roster_with_people(&[reg], Vec::new(), hired, Vec::new());
         assert_eq!(views.len(), 1, "同一个人印两行，读的人会以为撞了名");
         assert_eq!(views[0]["live"], true);
     }
