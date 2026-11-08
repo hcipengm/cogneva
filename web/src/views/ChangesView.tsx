@@ -282,14 +282,14 @@ function FunnelPanel() {
                 </span>
               ) },
               { key: 'cost', title: '成本', width: '110px', render: (d: ChangeFunnelDay) => (
-                <span
+                <Note
                   className={
                     d.cost_micros === null ? 'text-[var(--muted)]' : 'mono text-[11px]'
                   }
-                  title={
+                  text={
                     (d.unpriced_calls ?? 0) > 0
                       ? `这一天还有 ${d.unpriced_calls} 次调用没有记价，印出来的只是下界`
-                      : undefined
+                      : ''
                   }
                 >
                   {d.cost_micros === null || d.cost_currency === null
@@ -298,7 +298,7 @@ function FunnelPanel() {
                         d.cost_micros,
                         d.cost_currency
                       )}`}
-                </span>
+                </Note>
               ) },
             ]}
             rows={[...days].reverse()}
