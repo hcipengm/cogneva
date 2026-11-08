@@ -454,7 +454,12 @@ impl ClaimStreamState {
     /// This is the per-stream half of the answer; what gets published is the
     /// budget's, see [`budget_bound_seconds`].
     fn hold_bound_seconds(&self) -> Option<u64> {
-        self.held.values().copied().max()
+        // `permit_taken` 先写下 0，意思是「这个许可还没说出自己的上界」，不是
+        // 一堵零秒的墙。把它算进来，没量到窗口时发布面就会给出一个 0——而 0 是
+        // 一个合法窗口（任何静默都超过它），读者会立刻点火。「量不到」与「量到
+        // 就是这个值」必须是两个形状，所以哨兵在这里被滤掉。真正的窗口在调用点
+        // 已经 `.max(1)`，撞不上这个哨兵。
+        self.held.values().copied().filter(|bound| *bound > 0).max()
     }
 }
 
@@ -594,6 +599,20 @@ impl Observable for ClaimSlotsObservable {
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
         let streams = self.streams();
         let mut out = Vec::new();
+        // 停摆判据的两条证据先发，且**不发在流下面**：窗口与样本数都是这个进程
+        // 的量（`cog_core::progress` 一份环形缓冲），挂在每条流下面时同一份读数
+        // 会被数成几份判据——一个读 `count by (stream)` 的人会以为有三条判据在
+        // 跑。挂在循环里只是当时顺手，标签轴是假的。
+        out.push(RawMetric::new(
+            STALL_GAP_SAMPLES_METRIC,
+            cog_core::progress::gap_sample_count() as f64,
+        ));
+        if let Some(window) = cog_core::progress::silence_window() {
+            out.push(RawMetric::new(
+                STALL_WINDOW_SECONDS_METRIC,
+                window.as_secs_f64(),
+            ));
+        }
         for (stream, state) in streams.iter() {
             // Only the streams that registered exist here, so a stream this
             // process does not read publishes nothing rather than a zero.
@@ -605,19 +624,6 @@ impl Observable for ClaimSlotsObservable {
                     .with_label(crate::LABEL_STREAM, stream.as_str())
                     .with_label(CLAIM_SLOTS_SOURCE_LABEL, state.source),
             );
-            out.push(
-                RawMetric::new(
-                    STALL_GAP_SAMPLES_METRIC,
-                    cog_core::progress::gap_sample_count() as f64,
-                )
-                .with_label(crate::LABEL_STREAM, stream.as_str()),
-            );
-            if let Some(window) = cog_core::progress::silence_window() {
-                out.push(
-                    RawMetric::new(STALL_WINDOW_SECONDS_METRIC, window.as_secs_f64())
-                        .with_label(crate::LABEL_STREAM, stream.as_str()),
-                );
-            }
             for (name, value) in [
                 (TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC, state.in_flight() as f64),
                 (
@@ -1420,11 +1426,14 @@ mod tests {
         observer.register(STREAM, semaphore.clone(), 4, SOURCE_DERIVED);
 
         let metrics = observer.collect_metrics("D8").await.unwrap();
+        // Not the hold bound: it is a reading of the budget, and until a stall
+        // window has been measured the series is absent on purpose (the
+        // assertions further down spell that out). Listing it here would ask
+        // for a zero the rule would trip on.
         for name in [
             TASK_ROUTER_CLAIM_SLOTS_METRIC,
             TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC,
             TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC,
-            TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
         ] {
             let m = metric(&metrics, name).unwrap_or_else(|| panic!("{name} missing"));
             assert_eq!(
@@ -1493,11 +1502,11 @@ mod tests {
                 .value,
             0.0
         );
-        assert_eq!(
-            metric(&released, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC)
-                .unwrap()
-                .value,
-            0.0
+        // 上界随许可一起走：没有许可在跑，就没有谁在说自己的超时，序列回到
+        // 「没有读数」，而不是 0——0 会被读成一堵零秒的墙。
+        assert!(
+            metric(&released, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC).is_none(),
+            "许可放回之后不许留下一个 0 的上界"
         );
     }
 
@@ -1637,8 +1646,17 @@ mod tests {
     /// would claim it reads it and is never blocked.
     #[tokio::test]
     async fn an_unregistered_stream_publishes_nothing() {
+        // 判的是「没有这个流就没有这个流的序列」，不是「这个 Observable 一条
+        // 也不发」：停摆判据的两条证据是进程的读数，与读了哪条流无关，空闲时
+        // 也该有——它们的缺席在读数面上读作「判据没接上」。
         let observer = ClaimSlotsObservable::new();
-        assert!(observer.collect_metrics("D8").await.unwrap().is_empty());
+        let metrics = observer.collect_metrics("D8").await.unwrap();
+        assert!(
+            metrics
+                .iter()
+                .all(|m| !m.labels.contains_key(crate::LABEL_STREAM)),
+            "没有登记过的流不该发出任何带 stream 标签的序列: {metrics:?}"
+        );
     }
 
     /// The orchestrator's published set is pinned to the outcomes it itself

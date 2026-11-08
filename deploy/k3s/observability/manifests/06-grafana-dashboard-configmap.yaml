@@ -3494,6 +3494,68 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 82,
+          "title": "Stall Criterion: Window in Force",
+          "description": "The silence window the stall criterion compares against, per publishing process. It is a quantile of the step gaps this process has actually observed, so it is a measurement rather than a declared time budget: the number moves when the work moves. The series is absent until the process has seen the sample floor -- an unmeasured window is published as nothing, not as zero, because zero seconds is a legal window that every silence would exceed and a rule reading it would fire on every quiet minute. Read together with the samples panel beside it: samples climbing toward the floor with no line here is a criterion arming, and it is the only reading that separates a young deployment from one where the executor's step heartbeat never reaches the ledger -- both are silent on this panel, and only the count tells them apart. One line per process, with no stream label: the window is a reading of the process that the stall criterion runs in, not of any one stream that process reads.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 384
+          },
+          "targets": [
+            {
+              "expr": "cogneva_stall_window_seconds",
+              "legendFormat": "window in force",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 83,
+          "title": "Stall Criterion: Samples Behind the Window",
+          "description": "How many step gaps this process has recorded, against the floor the window is estimated from. This panel exists because the window's own absence is ambiguous: it is blank both while the floor is still being reached and forever if the step heartbeat is not wired into the ledger, and the two have opposite answers -- wait, or fix the wiring. The count is per process and is published on every collection from zero, so it is the one reading that moves while the window cannot. It does not say whether the criterion is armed; that is the panel beside it, and it does not say whether a task is stalled -- the criterion answers that per attempt, and this is only evidence that the scale it judges by is real.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 384
+          },
+          "targets": [
+            {
+              "expr": "cogneva_stall_gap_samples",
+              "legendFormat": "gaps recorded",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

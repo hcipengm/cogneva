@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 ///
 /// It is also what the sample floor is derived from (see [`SAMPLE_FLOOR`]), so
 /// moving this one number moves both, and neither can drift from the other.
+// cap: bound — 误判预算是拍定的：窗口取在这里，随手停摆回收约千分之一次仍在干活的尝试，这就是选它的全部理由；没有一条测量能把它调到别处
 const SILENCE_QUANTILE: f64 = 0.999;
 
 /// How many gap samples a window needs before it is a reading at all.
@@ -46,6 +47,7 @@ const SILENCE_QUANTILE: f64 = 0.999;
 /// Derived from [`SILENCE_QUANTILE`] rather than picked, so the two cannot
 /// disagree — a floor that stayed at 100 while the quantile moved to 0.9999
 /// would report a window from a sample that cannot support it.
+// cap: derived — 1 / (1 - SILENCE_QUANTILE)：估 0.999 分位要至少有一个落在它之外的点
 pub const SAMPLE_FLOOR: usize = 1000;
 
 fn beacons() -> &'static Mutex<HashMap<String, Instant>> {
@@ -191,10 +193,7 @@ pub fn stall(task_id: &str) -> Option<(Duration, Duration)> {
 /// How many gap samples have been observed, for a reader that has to say whether
 /// the window is a measurement yet.
 pub fn gap_sample_count() -> usize {
-    gaps().lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ring
-        .len()
+    gaps().lock().unwrap_or_else(|p| p.into_inner()).ring.len()
 }
 
 /// Test hook: plant `count` gaps of a known length, so a test can fix the
@@ -234,10 +233,7 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// not have.
 #[doc(hidden)]
 pub fn reset_for_tests() {
-    beacons()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
+    beacons().lock().unwrap_or_else(|p| p.into_inner()).clear();
     *gaps().lock().unwrap_or_else(|p| p.into_inner()) = GapSamples::default();
 }
 

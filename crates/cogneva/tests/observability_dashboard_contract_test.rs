@@ -132,6 +132,23 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["status"],
         "crates/cog-orchestrator/src/observable.rs",
     ),
+    // The two readings the stall criterion is built on, drawn as a pair because
+    // neither answers alone: the window is the scale a silence is judged
+    // against and is absent until it has been measured, and the sample count is
+    // what tells an arming criterion from one whose step heartbeat never
+    // reaches the ledger. Both are facts about the process, so they carry no
+    // labels at all -- a stream label would turn one criterion into one per
+    // stream on any `count by` over it.
+    (
+        "cogneva_stall_window_seconds",
+        &[],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
+        "cogneva_stall_gap_samples",
+        &[],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
     (
         "cogneva_tasks_current",
         &["status"],
