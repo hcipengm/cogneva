@@ -4,7 +4,8 @@
 # 沉默、轮询全失败。
 #
 # 这一族里有一半是「反事实」形状——**该有的那一半没发生**才响：
-#   - `mainline_rollout_never_lands`：有尝试、窗口里没有完成。
+#   - `mainline_rollout_never_lands`：有尝试（一个轮询周期之前结束的那半小时里）、
+#     窗口里没有完成。
 #   - `mainline_poll_cycles_all_failed`：有失败、窗口里没有成功。
 #   - `mainline_supersession_question_stopped`：有尝试、没有换代问句。
 #   - `mainline_progress_verdict_mute`：四小时里判过、最近两小时没有一次正判词。
@@ -131,6 +132,42 @@ tests:
       - eval_time: 60m
         alertname: mainline_poll_cycles_all_failed
         exp_alerts: []
+
+  # 一轮还在飞：部署器空了八十分钟，第五十三分钟决定要滚，第五十八分钟才落地。求值那
+  # 一刻（54 分）窗口里有尝试、没有完成——这正是 2026-11-08 22:54 的现场：22:53:51 记下
+  # 尝试，十六秒后这条规则响，22:59 镜像才换。健康的轮次被报成停摆五分钟。
+  #
+  # 判的是「一轮在飞」与「一轮被拒」分得开：尝试那一半的窗口挪到「一个轮询周期之前结束」
+  # 之后这一格静；改回两边都问最近一小时，这一格立刻红。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_rollout_attempts_total'
+        values: '0x53 1x7'
+      - series: 'cogneva_mainline_rollout_completed_total'
+        values: '0x58 1x2'
+    alert_rule_test:
+      - eval_time: 54m
+        alertname: mainline_rollout_never_lands
+        exp_alerts: []
+
+  # 被拒的轮次仍然要响，只是晚一个轮询周期：第一轮在第五分钟决定、第十分钟落地；第二轮
+  # 在第五十分钟决定，之后一直没有落地。第八十五分钟（决定后三十五分钟）这一条必须亮。
+  # 这一格是上一格的另一半——把窗口挪回去如果挪过了头（连被拒的轮次也不响了），红的是这里。
+  #
+  # 第二轮的决定刻意不落在窗口边界上（第五十五分钟正好是求值时刻减一个周期）：边界上
+  # 那个采样算不算进窗口取决于取值区间开闭与时间戳舍入，判据不该建在那上面。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_rollout_attempts_total'
+        values: '0x5 1x45 2x35'
+      - series: 'cogneva_mainline_rollout_completed_total'
+        values: '0x10 1x75'
+    alert_rule_test:
+      - eval_time: 85m
+        alertname: mainline_rollout_never_lands
+        exp_alerts:
+          - exp_labels:
+              severity: warning
 
   # 一次卡住的主干：CI 判 fail、有六小时里读不出的判词（`pending` 按设计不算）、
   # 尝试在长而换代问句没长、预检与 kubectl 被拒、发布因 not_ready 被拒、尝试长了而
