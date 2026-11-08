@@ -51,6 +51,17 @@ UPDATE agent_messages \
 SET outcome = 'replied', reply = $2, outcome_detail = NULL \
 WHERE id = $1 AND outcome IN ('queued', 'timed_out')";
 
+/// Settle a row whose answer never came.
+///
+/// The `outcome = 'queued'` is the whole guard, the mirror of `ANSWER_SQL`: a
+/// row already answered has its own account, and a row a delivery refusal or a
+/// broken send settled was settled by a fact silence does not change. Only a
+/// row that is still waiting is a row this call is about.
+const NO_ANSWER_SQL: &str = "\
+UPDATE agent_messages \
+SET outcome = $2, outcome_detail = $3 \
+WHERE id = $1 AND outcome = 'queued'";
+
 /// Drop what fell out of this peer's window. Bounded per receiver rather than
 /// globally: one chatty sender must not push another conversation out.
 const TRIM_SQL: &str = "\
@@ -155,6 +166,41 @@ impl AgentMessageStore for PostgresAgentMessageStore {
         Ok(updated > 0)
     }
 
+    async fn no_answer(&self, id: i64, outcome: SendOutcome, detail: &str) -> SFResult<bool> {
+        // Checked before the statement for the same reason `record` checks its
+        // shapes there: an outcome this call cannot mean is a caller's fault,
+        // and a database round trip that fails on a constraint reports it as
+        // this deployment's.
+        match outcome {
+            SendOutcome::TimedOut | SendOutcome::Failed => {}
+            other => {
+                return Err(SFError::Validation(format!(
+                    "a send settled without an answer reads timed_out or failed, not {}: \
+                     the other outcomes say something happened that this call is not recording",
+                    other.as_str()
+                )))
+            }
+        }
+        if detail.trim().is_empty() {
+            return Err(SFError::Validation(
+                "a send settled without an answer has to say why: an empty reason reads \
+                 back as a silence nobody can explain"
+                    .into(),
+            ));
+        }
+        let updated = sqlx::query(NO_ANSWER_SQL)
+            .bind(id)
+            .bind(outcome.as_str())
+            .bind(detail)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                SFError::Database(format!("settle an agent message that got no answer: {e}"))
+            })?
+            .rows_affected();
+        Ok(updated > 0)
+    }
+
     async fn conversation(&self, peer: &str, limit: usize) -> SFResult<Vec<AgentMessage>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -253,6 +299,41 @@ mod tests {
         let mut m = message(SendOutcome::Replied, Some("done"));
         m.outcome_detail = Some("the stream broke");
         let e = store.record(&m).await.expect_err("one row, one account");
+        assert!(matches!(e, SFError::Validation(_)), "got {e:?}");
+    }
+
+    /// A row settled by silence has to be settled by silence: an outcome that
+    /// says the agent answered, or that the send never left, is not something
+    /// this call can write without inventing a fact.
+    #[tokio::test]
+    async fn only_a_send_without_an_answer_settles_without_one() {
+        let store = unconnected();
+        for outcome in [
+            SendOutcome::Replied,
+            SendOutcome::Queued,
+            SendOutcome::Refused,
+        ] {
+            let e = store
+                .no_answer(1, outcome, "nobody answered")
+                .await
+                .expect_err("only timed_out and failed are settlements by silence");
+            assert!(
+                matches!(e, SFError::Validation(_)),
+                "{}: got {e:?}",
+                outcome.as_str()
+            );
+        }
+    }
+
+    /// And it has to say why: a row that reads "no answer" with an empty reason
+    /// is a silence the reader has to explain to itself.
+    #[tokio::test]
+    async fn a_settlement_by_silence_carries_its_reason() {
+        let store = unconnected();
+        let e = store
+            .no_answer(1, SendOutcome::TimedOut, "   ")
+            .await
+            .expect_err("a settlement without a reason is not a record");
         assert!(matches!(e, SFError::Validation(_)), "got {e:?}");
     }
 

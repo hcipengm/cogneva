@@ -1,13 +1,16 @@
+import { useMemo, useState, type DragEvent as ReactDragEvent } from 'react';
 import { useServices } from '@/shell/context';
 import { Icon, type IconName } from '@/shell/icons';
-import { useShell, type ActivityId } from '@/shell/store';
+import { mergeActivityOrder, moveActivity, useShell, type ActivityId } from '@/shell/store';
 import { Note } from '@/ui/Note';
 
 /**
  * 最左侧的一条：每一格是一面。
  *
- * 顺序按「出事时先看谁」排，不按字母也不按重要度：工作台是常态，收件箱与
- * 告警是有人找你，任务与变更是流水线在跑，治理与观测是回头看。
+ * 这里声明的顺序是**默认顺序**，按「出事时先看谁」排，不按字母也不按重要度：
+ * 工作台是常态，收件箱与告警是有人找你，任务与变更是流水线在跑，治理与观测是
+ * 回头看。读者拖过之后，他自己的先后存在 store 里，叠在这份名单上——名单是全集
+ * （决定谁存在），拖出来的先后只决定谁在前。
  */
 const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'workspace', label: '工作台', icon: 'workspace' },
@@ -21,7 +24,6 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'projects', label: '项目', icon: 'projects' },
   { id: 'flow', label: '流程', icon: 'flow' },
   { id: 'comms', label: '通信', icon: 'comms' },
-  { id: 'agents', label: '智能体', icon: 'agents' },
   { id: 'progress', label: '进度', icon: 'platform' },
   { id: 'changes', label: '变更', icon: 'changes' },
   { id: 'governance', label: '治理', icon: 'governance' },
@@ -38,7 +40,23 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
 export function ActivityBar() {
   const activity = useShell((s) => s.activity);
   const setActivity = useShell((s) => s.setActivity);
+  const savedOrder = useShell((s) => s.activityOrder);
+  const setActivityOrder = useShell((s) => s.setActivityOrder);
   const { alerts, notifications, signOut, username } = useServices();
+  const [dragging, setDragging] = useState<ActivityId | null>(null);
+
+  // 拖出来的先后叠在声明名单上：名单里新加的一面会出现在末尾，删掉的那一格不会
+  // 因为读者三周前拖过一次就留在屏幕上。
+  const items = useMemo(() => {
+    const order = mergeActivityOrder(
+      savedOrder,
+      ITEMS.map((item) => item.id)
+    );
+    const byId = new Map(ITEMS.map((item) => [item.id, item]));
+    return order.map((id) => byId.get(id)).filter((item): item is (typeof ITEMS)[number] =>
+      Boolean(item)
+    );
+  }, [savedOrder]);
 
   const firing = alerts.alerts?.count ?? 0;
   const unread = notifications.unreadCount;
@@ -60,7 +78,7 @@ export function ActivityBar() {
       aria-label="活动栏"
       className="flex h-full w-[104px] shrink-0 flex-col overflow-y-auto border-r border-[var(--line)] bg-[var(--ink-800)] py-1"
     >
-      {ITEMS.map((item) => {
+      {items.map((item) => {
         const active = activity === item.id;
         const mark = badge(item.id);
         return (
@@ -71,7 +89,33 @@ export function ActivityBar() {
             onClick={() => setActivity(item.id)}
             text={item.label}
             aria-current={active ? 'page' : undefined}
-            className="relative flex h-9 w-full shrink-0 items-center gap-2 pl-3 pr-2 text-left transition-colors"
+            // 拖拽换序：按下哪一格、落在哪一格前面，就是这一格新的位置。用原生
+            // 拖拽而不是自己接指针：它自带「正在拖什么」的指针样式与取消语义。
+            draggable
+            onDragStart={(event: ReactDragEvent) => {
+              setDragging(item.id);
+              event.dataTransfer?.setData('text/plain', item.id);
+            }}
+            onDragOver={(event: ReactDragEvent) => {
+              // 不 preventDefault 就没有「可以放」的信号，drop 也不会来。
+              if (!dragging || dragging === item.id) return;
+              event.preventDefault();
+            }}
+            onDrop={(event: ReactDragEvent) => {
+              event.preventDefault();
+              if (dragging && dragging !== item.id) {
+                const order = mergeActivityOrder(
+                  savedOrder,
+                  ITEMS.map((entry) => entry.id)
+                );
+                setActivityOrder(moveActivity(order, dragging, item.id));
+              }
+              setDragging(null);
+            }}
+            onDragEnd={() => setDragging(null)}
+            className={`relative flex h-9 w-full shrink-0 items-center gap-2 pl-3 pr-2 text-left transition-colors ${
+              dragging === item.id ? 'opacity-40' : ''
+            }`}
             style={{ color: active ? 'var(--paper)' : 'var(--muted)' }}
           >
             {active && (

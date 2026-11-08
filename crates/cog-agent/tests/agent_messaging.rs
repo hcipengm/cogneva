@@ -32,8 +32,8 @@ use async_trait::async_trait;
 
 use cog_agent::tools::builtins::{list_agents, send_to_agent};
 use cog_core::{
-    AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, MessageStream, Observable,
-    PendingStats, ResourceInfo, SFResult, ToolImplementation,
+    AgentRegistration, AgentRegistry, EmployeeRecord, InboxMessage, MessageBackend, MessageStream,
+    Observable, PendingStats, ResourceInfo, SFResult, ToolImplementation,
 };
 
 /// A queue that keeps what it was given.
@@ -182,6 +182,24 @@ impl AgentRegistry for Roster {
             .map(|(id, role, caps)| registration(id, role, caps))
             .collect())
     }
+
+    /// 名册行：目录里的名字从这里来，不是从 id 算出来的。
+    async fn employees(&self) -> SFResult<Vec<EmployeeRecord>> {
+        let now = chrono::Utc::now();
+        Ok(self
+            .live
+            .iter()
+            .enumerate()
+            .map(|(slot, (id, role, _))| EmployeeRecord {
+                agent_id: (*id).to_string(),
+                number: Some(slot as u32 + 1),
+                role: (*role).to_string(),
+                first_seen: now,
+                last_seen: now,
+                retired_at: None,
+            })
+            .collect())
+    }
 }
 
 fn registration(agent_id: &str, role: &str, capabilities: &[&str]) -> AgentRegistration {
@@ -264,10 +282,9 @@ async fn an_id_the_directory_lists_is_an_id_the_send_tool_delivers_to() {
 
 /// Every row the directory shows carries the name the workbench shows.
 ///
-/// The name is a pure function of the id, and the same function answers the
-/// board, so an agent reading the directory names a colleague exactly as a
-/// person reading the roster does. Without the column an agent asked who it is
-/// can only answer with its routing id — which is a key, not a name.
+/// 名字来自名册行（工号＋姓名），与员工页同一份：一个 agent 读目录时叫同事
+/// 的方式，必须和人读名单时看到的方式一模一样。没有这一列，agent 问「我是谁」
+/// 只能答自己的路由键——那是 key，不是名字。
 #[tokio::test]
 async fn every_row_in_the_directory_carries_the_name_the_board_shows() {
     let roster = Arc::new(Roster::with_roles(&[
@@ -279,12 +296,19 @@ async fn every_row_in_the_directory_carries_the_name_the_board_shows() {
         .expect("listed");
 
     for row in listed["agents"].as_array().expect("agents is a list") {
-        let id = row["agent_id"].as_str().expect("agent_id");
-        let expected = cog_core::display_name_for(id);
+        let name = row["display_name"].as_str().expect("display_name");
+        assert!(
+            name.starts_with('E'),
+            "目录里这一行没有工号，读的人分不出是谁: {row}"
+        );
+        assert!(
+            !name.contains('#'),
+            "目录里这一行还是机器码: {name} —— 名字应当来自名册行"
+        );
         assert_eq!(
-            row["display_name"].as_str(),
-            Some(expected.as_str()),
-            "the directory and the roster must answer with one name per id: {row}"
+            row["number"].as_str(),
+            name.split(' ').next(),
+            "工号那一列与名字前半截必须是同一个意思: {row}"
         );
     }
 }

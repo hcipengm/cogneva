@@ -497,11 +497,15 @@ impl EmployeeLease {
         employee: &cog_agent::identity::AgentName,
         capabilities: Vec<String>,
     ) -> Self {
+        // 第四个参数是用途标签，不是身份：写 `employee.id` 会让名册上这一列读音
+        // 成 `kai-a9ab11fc`——一串机器码占着「这个人在做什么」的位置，而下线之后
+        // 同一个人又被别处标成 `chat`，两次读数对不上。对话员工做的就是说，就叫
+        // `chat`。
         let registration = cog_core::AgentRegistration::new(
             employee.id.clone(),
             cog_agent::identity::agent_instance(),
             "127.0.0.1",
-            employee.id.clone(),
+            "chat",
             "default",
             capabilities,
             cog_core::ResourceInfo::default(),

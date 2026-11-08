@@ -174,7 +174,7 @@ pub async fn build_runs_handler(State(state): State<Arc<crate::GatewayState>>) -
 /// 这一面一次要多少行。窗口本身比较浅，这个数比窗口大，意思是「把整个窗口都给我」，
 /// 而不是「只要最新的这么多」。
 // cap: bound — 一次问多少行构建记录；界的是单次响应的体积，不是「只要最新的这么多」
-const BUILD_RUN_ROWS_ASKED: usize = 200;
+pub(crate) const BUILD_RUN_ROWS_ASKED: usize = 200;
 
 /// 演进事件流的保活间隔：15s。
 ///

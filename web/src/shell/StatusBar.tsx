@@ -68,8 +68,8 @@ export function StatusBar() {
         集群 {overview.error ? '读不到' : (o?.cluster_health ?? '—')}
       </Cell>
 
-      <Cell onClick={() => setActivity('agents')} title="在岗 / 全部智能体">
-        智能体 {o ? `${o.active_agents ?? '—'}/${o.total_agents ?? '—'}` : '—'}
+      <Cell onClick={() => setActivity('people')} title="在岗 / 全部员工（含离职）">
+        员工 {o ? `${o.active_agents ?? '—'}/${o.total_agents ?? '—'}` : '—'}
       </Cell>
 
       <Cell onClick={() => setActivity('tasks')} title="运行中 / 就绪 / 失败">

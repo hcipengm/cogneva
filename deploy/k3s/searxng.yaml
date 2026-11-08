@@ -47,13 +47,11 @@ data:
       # keep_only 只是留下条目，它们默认仍是关的，必须逐个打开。
       - name: 360search
         disabled: false
-        weight: 2
       # sogou 每次 302 都崩在 `sogou.py` 的 `resp.next_request`，故障进
       # `unresponsive_engines`、零条结果。它仍然开着：没被限流时它出的是整批
       # 正确的命中，而那一条假警报的代价小于它答对一次。
       - name: sogou
         disabled: false
-        weight: 2
     general:
       instance_name: "cogneva"
     server:
@@ -91,7 +89,7 @@ spec:
       annotations:
         # searxng-settings 的指纹：只改配置的那次升级也必须换 Pod，否则进程仍按
         # 启动时读到的 settings.yml 跑（文件由 kubelet 就地更新，进程不会重读）。
-        checksum/config: a26ca9158029de8c89c51030c174e1041ebfca17f327606f0fa264f94f7f9a8b
+        checksum/config: c7199d948378f29bd252537515cfa56905d6860e1053ab4576ffe789f38d3ede
       labels:
         app.kubernetes.io/name: searxng
         app.kubernetes.io/component: search

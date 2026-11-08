@@ -26,6 +26,72 @@ pub const DATABASE_URL: &str = "COGNEVA_DATABASE_URL";
 /// both need it to answer "am I the pod that was asked".
 pub const POD_NAME: &str = "COGNEVA_POD_NAME";
 
+/// What this process calls itself in the records other processes read.
+///
+/// Two crates have to agree on this or the agreement is worthless: the agent
+/// runtime writes it into every registration, and the roster keeper reads it
+/// back to answer "does somebody else already serve this name". A pod name
+/// first -- a rollout replaces pods, so that is the value that changes when the
+/// process does -- and the host name for a process the cluster does not name.
+///
+/// An empty value counts as absent. The chart leaves `COGNEVA_POD_NAME` in
+/// place, empty, on a workload that has no pod identity; read as a value it
+/// makes every such process claim the same name, which is the collision this
+/// exists to tell apart.
+///
+/// The lookups are the caller's, not this function's: both names are already
+/// read by crates outside the base for their own reasons (`COGNEVA_POD_NAME` by
+/// change execution, `HOSTNAME` by the alert store and the process census), and
+/// `core_boundary_contract_test` fails when one variable has an owner on both
+/// sides of the boundary. What has to agree between the two callers is the order
+/// and the fallback; the reading stays where the policy lives, which is the same
+/// shape `Config::from_lookup` takes.
+pub fn process_identity(lookup: impl Fn(&str) -> Option<String>) -> String {
+    let non_empty = |name: &str| lookup(name).filter(|value| !value.is_empty());
+    non_empty(POD_NAME)
+        .or_else(|| non_empty("HOSTNAME"))
+        .unwrap_or_else(|| "local".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two callers agree on this value; the order and the fallback are what
+    /// they are agreeing on, so each branch is judged rather than the happy path
+    /// alone. An empty pod name is the case the chart actually produces -- a
+    /// workload with no pod identity gets the variable, empty -- and read as a
+    /// value it would name every such process the same.
+    #[test]
+    fn the_identity_prefers_the_pod_and_treats_empty_as_absent() {
+        let from = |pod: Option<&str>, host: Option<&str>| {
+            let pod = pod.map(str::to_string);
+            let host = host.map(str::to_string);
+            process_identity(|name| match name {
+                v if v == POD_NAME => pod.clone(),
+                "HOSTNAME" => host.clone(),
+                other => panic!("read a name that is not part of the agreement: {other}"),
+            })
+        };
+
+        assert_eq!(
+            from(Some("cogneva-worker-aaa-0"), Some("node-a")),
+            "cogneva-worker-aaa-0",
+            "a pod name names this process and the host names the machine"
+        );
+        assert_eq!(
+            from(Some(""), Some("node-a")),
+            "node-a",
+            "an empty pod name is absent, not a name"
+        );
+        assert_eq!(
+            from(None, Some("")),
+            "local",
+            "no name at all still names one process rather than an empty string"
+        );
+    }
+}
+
 /// The node this process runs on.
 ///
 /// Injected by the chart into every workload. The host readings and the process

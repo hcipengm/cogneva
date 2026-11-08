@@ -67,16 +67,18 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/cog-gateway/src/agents.rs",
-        2,
-        "two roster entries, not advertisements, and for the same reason the \
+        3,
+        "three roster entries, not advertisements, and for the same reason the \
          `list_agents` echo above is one: the idle branch builds a row for a \
-         person who only exists while talking, and the hired branch builds one \
-         for a name the roster holds with no live process behind it. The \
-         registry never held a capability list for either -- there is nothing to \
-         echo, so the field is the empty list the interface reads as 'claimed \
-         nothing'. Building it from a serving table would invent a claim about \
-         a process that does not exist. What the entries are, not what this tree \
-         can be asked to do",
+         person who only exists while talking, the hired branch builds one for a \
+         name the roster holds with no live process behind it, and the employee \
+         branch builds one for a name that only the durable roster remembers -- \
+         a retired employee, or a task-scoped member the registry, the people \
+         store and the hire list never saw. The registry never held a capability \
+         list for any of them -- there is nothing to echo, so the field is the \
+         empty list the interface reads as 'claimed nothing'. Building it from a \
+         serving table would invent a claim about a process that does not exist. \
+         What the entries are, not what this tree can be asked to do",
     ),
     (
         "crates/cog-gateway/src/a2a.rs",

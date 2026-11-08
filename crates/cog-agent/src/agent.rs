@@ -8,8 +8,6 @@ use crate::lifecycle::LifecycleManager;
 use crate::tools::ToolRegistry;
 use cog_core::RuntimeConfig;
 
-use futures::StreamExt;
-
 /// How long a retirement waits for the consumer to end.
 ///
 /// Two things set the floor: a backend read blocks for at most one block period
@@ -1198,7 +1196,7 @@ impl Agent {
     /// Start a background consumer that listens for [`InboxMessage`]s on
     /// this agent's Redis Streams inbox.
     /// Idempotent: if a consumer is already running this returns immediately.
-    pub async fn start_consumer<F, Fut>(&self, mut handler: F) -> SFResult<()>
+    pub async fn start_consumer<F, Fut>(&self, handler: F) -> SFResult<()>
     where
         F: FnMut(InboxMessage) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = SFResult<()>> + Send,
@@ -1215,98 +1213,23 @@ impl Agent {
         let agent_id = self.config.agent_id.clone();
 
         let handle = tokio::spawn(async move {
-            let consumer = crate::consumer::AgentConsumer::new(&agent_id, backend.clone());
-            let group_name = format!("agent-{}", agent_id);
-            if let Err(e) = backend
-                .create_consumer_group(consumer.inbox_stream(), &group_name)
-                .await
-            {
-                tracing::warn!("Consumer group create failed (may exist): {}", e);
-            }
-            let mut stream = match backend
-                .subscribe(consumer.inbox_stream(), &group_name)
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Consumer subscribe failed: {}", e);
-                    return;
-                }
-            };
-
-            let inbox_stream = consumer.inbox_stream().to_string();
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok((msg_id, bytes)) => {
-                        // The kind of the command this delivery runs, recorded
-                        // only after its ack lands. A command whose ack fails
-                        // stays in the pending list and will run again, so
-                        // counting it here would book a delivery that the queue
-                        // does not agree happened.
-                        let mut acked_kind: Option<&'static str> = None;
-                        match serde_json::from_slice::<InboxMessage>(&bytes) {
-                            Ok(msg) => {
-                                let kind = crate::observable::inbox_kind(&msg);
-                                if let Err(e) = handler(msg).await {
-                                    // Leave pending: redelivery retries the handler.
-                                    // Counted for the same reason `AgentConsumer`
-                                    // counts it: the retry waits for the next start
-                                    // of this consumer, so the log line is gone long
-                                    // before anything acts on the failure.
-                                    crate::observable::global_observable()
-                                        .record_inbox_undelivered(kind);
-                                    tracing::warn!(
-                                        msg_id = %msg_id,
-                                        kind,
-                                        "Inbox handler error, message kept pending: {}",
-                                        e
-                                    );
-                                    continue;
-                                }
-                                // Counted only once the ack below lands: until then
-                                // the queue still holds the command and the next
-                                // consumer start runs it again.
-                                acked_kind = Some(kind);
-                            }
-                            Err(e) => {
-                                // Same poison path as in `consumer`: the bytes
-                                // reach the dead-letter queue before the ack that
-                                // makes them unrecoverable. A failed write is
-                                // reported and still does not hold the message
-                                // pending — this parse can never succeed.
-                                tracing::warn!(
-                                    msg_id = %msg_id,
-                                    "Failed to deserialize InboxMessage: {}",
-                                    e
-                                );
-                                if let Err(dlq_err) = backend
-                                    .dlq(
-                                        &inbox_stream,
-                                        &msg_id,
-                                        &bytes,
-                                        &format!("unparsable InboxMessage: {e}"),
-                                    )
-                                    .await
-                                {
-                                    tracing::error!(
-                                        msg_id = %msg_id,
-                                        "dead-letter write failed; this message's bytes are now lost: {dlq_err}"
-                                    );
-                                }
-                                crate::observable::global_observable().record_inbox_poisoned();
-                            }
-                        }
-                        if let Err(e) = backend
-                            .ack(&inbox_stream, &group_name, std::slice::from_ref(&msg_id))
-                            .await
-                        {
-                            tracing::warn!(msg_id = %msg_id, "Failed to ack inbox message: {}", e);
-                        } else if let Some(kind) = acked_kind {
-                            crate::observable::global_observable().record_inbox_delivered(kind);
-                        }
-                    }
-                    Err(e) => tracing::warn!("Stream error: {}", e),
-                }
+            // 收件箱的全部责任都在 `AgentConsumer` 里：建组、读新消息、交给
+            // handler、按 handler 的结果决定 ack 还是留 pending、把上一条命
+            // 留在挂起列表里的消息认领回来。这里曾经另写了一份只读的循环，
+            // 少了最后那一步——而少的那一步恰好是唯一能把「上一个进程读到、
+            // 还没 ack 就死了」的消息接过来的人。实测 2026-11-07：一条发给员工
+            // 的消息从 11-05 21:58 一直挂在挂起列表上，1.8 天里没有任何一个人
+            // 读它；它在滞后读数里也看不见，因为挂起不是滞后。
+            let consumer = crate::consumer::AgentConsumer::new(&agent_id, backend);
+            if let Err(e) = consumer.run(handler).await {
+                // 这条循环只在起步失败时返回：收件箱从此没人读，而对象仍然
+                // 在名册上、心跳照打——那正是「在线但永远不回话」的样子。
+                tracing::error!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "the inbox consumer stopped: nothing delivered to this agent \
+                 will run until the pool rebuilds it"
+                );
             }
         });
 
@@ -1669,6 +1592,7 @@ async fn publish_inbox_reply(
 #[cfg(test)]
 mod inbox_reply_tests {
     use super::*;
+    use futures::StreamExt;
 
     /// The answer lands on the stream the sender named, in the shape the
     /// sender can parse back. Before the inbox handler executed commands,

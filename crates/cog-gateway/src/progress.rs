@@ -368,6 +368,29 @@ pub async fn collect(
     })
 }
 
+/// 这个平台此刻的全部任务行：调用方手里的那一片，加上治理工作区里的面节点。
+///
+/// 一个进程读得到哪一片取决于它在哪个工作区，而「平台此刻怎样」问的是整个平台。
+/// 两个读面（三本账的进度、工作台的项目格）都从这里取，所以它们不会一个看见面
+/// 节点、另一个看不见——那会让两处报出不同总数的活，而两处都自称数的是全部。
+pub(crate) async fn merged_tasks(
+    state: &GatewayState,
+) -> Result<Vec<cog_core::Task>, cog_core::SFError> {
+    let mut merged: BTreeMap<String, cog_core::Task> = state
+        .orchestrator
+        .get_all_tasks()
+        .await
+        .into_iter()
+        .map(|task| (task.id.clone(), task))
+        .collect();
+    if let Some(store) = state.governance_store.as_deref() {
+        for task in store.face_nodes().await? {
+            merged.entry(task.id.clone()).or_insert(task);
+        }
+    }
+    Ok(merged.into_values().collect())
+}
+
 pub async fn read_progress(state: &GatewayState) -> Result<Progress, ApiError> {
     let tasks = state.orchestrator.get_all_tasks().await;
     Ok(collect(

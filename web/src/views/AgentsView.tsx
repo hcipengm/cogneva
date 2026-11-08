@@ -9,7 +9,7 @@ import {
   type LiveAgentRow,
 } from '@/store/liveAgents';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
-import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table } from '@/ui/primitives';
 import { BarList, Strip, type Tone } from '@/ui/plots';
 
 import { Note } from '@/ui/Note';
@@ -24,6 +24,10 @@ import { Note } from '@/ui/Note';
  * / `state_change` / `agent_end` / `agent_error`），心跳则推「最后一次心跳」那一格。
  * 少了这一折，一个人刚起来要等下一拍轮询才出现、换了状态要等下一拍才显示——这一面
  * 就成了每 15 秒拍一张照片。
+ *
+ * 这是员工页的「名册」标签，不是独立的一面：员工与智能体读的是同一份名单、同一批
+ * 人，分成两页只会让同一件事有两处读数。这里只画「这一拨人现在怎么构成的」，说话
+ * 那一半在同一个页面的「对话」标签里，点一行就切过去。
  */
 
 /**
@@ -98,7 +102,7 @@ function LiveState({ live }: { live: LiveAgentRow | null }) {
   );
 }
 
-export function AgentsView() {
+export function EmployeeRoster({ onPick }: { onPick?: (agentId: string) => void }) {
   const resources = useResource('在岗名单', listAgents, 15_000);
   // 名单是每 15 秒一拍读回来的快照；谁起来了、谁换态了、谁走了，都在总线上。
   // 没有这一行，把间隔一调长，这张表就停在上一次读回来的那一刻——而平台早就
@@ -140,11 +144,15 @@ export function AgentsView() {
   }
 
   return (
-    <ViewFrame
-      title="智能体"
-      meta={`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''} · ${roles.size} 种角色 · ${fromFrame} 条有比这次轮询更新的帧 · 快照按 15 秒重读`}
-      actions={<Button onClick={refresh}>重读</Button>}
-    >
+    <div className="flex h-full min-h-0 flex-col overflow-auto">
+      <div className="flex flex-wrap items-baseline gap-2 border-b border-[var(--line)] px-4 py-1.5 text-[11px] text-[var(--muted)]">
+        <span>
+          {`${liveCount} 个在岗${restCount > 0 ? ` · ${restCount} 个休息中` : ''} · ${roles.size} 种角色 · ${fromFrame} 条有比这次轮询更新的帧 · 快照按 15 秒重读`}
+        </span>
+        <span className="ml-auto">
+          <Button onClick={refresh}>重读</Button>
+        </span>
+      </div>
       {error ? (
         <ReadError what="在岗名单" error={error} onRetry={refresh} />
       ) : !data && loading ? (
@@ -199,7 +207,23 @@ export function AgentsView() {
           )}
           <Table<{ row: AgentSummary; live: LiveAgentRow | null }>
             columns={[
-              { key: 'id', title: 'agent_id', render: ({ row: a }) => <span className="mono text-[11px]">{a.agent_id}</span> },
+              // 第一列是这个人叫什么，不是它内部的 id：名册给每个上过册的人发过
+              // 「工号 姓名」，读的人要认的是那个；id 放进悬停里，排障时才需要。
+              // 还没入册的 id 由服务端写成「待编 名字」，也不在这里退回十六进制。
+              {
+                key: 'person',
+                title: '员工',
+                render: ({ row: a }) => (
+                  <span className="inline-flex items-baseline gap-1.5">
+                    <Note className="text-[12px]" text={a.agent_id}>
+                      {a.display_name || a.agent_id}
+                    </Note>
+                    {a.retired && (
+                      <span className="text-[10px] text-[var(--muted)]">离职</span>
+                    )}
+                  </span>
+                ),
+              },
               { key: 'state', title: '状态', width: '120px', render: ({ live }) => <LiveState live={live} /> },
               { key: 'role', title: '角色', width: '110px', render: ({ row: a }) => a.role },
               { key: 'cap', title: '能力', render: ({ row: a }) => (
@@ -226,12 +250,26 @@ export function AgentsView() {
                   </span>
                 );
               } },
+              // 名册与对话在同一个页面里，点一行就切到那个人的对话框：两页之间
+              // 跳转曾要重新找人，而两边读的是同一份名单。
+              ...(onPick
+                ? [
+                    {
+                      key: 'talk',
+                      title: '',
+                      width: '64px',
+                      render: ({ row: a }: { row: AgentSummary; live: LiveAgentRow | null }) => (
+                        <Button onClick={() => onPick(a.agent_id)}>对话</Button>
+                      ),
+                    },
+                  ]
+                : []),
             ]}
             rows={rows}
             rowKey={({ row }) => row.agent_id}
           />
         </>
       )}
-    </ViewFrame>
+    </div>
   );
 }

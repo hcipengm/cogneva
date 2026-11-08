@@ -339,6 +339,15 @@ fn default_usage_hours() -> i64 {
     24
 }
 
+/// 投入那一格与花销面读的必须是同一段窗口。
+///
+/// 两处各写一个数就是两个承诺：工作台说「本窗」24 小时、花销面说别的长度时，
+/// 点进去看到的总额与格上的数字对不上，而两个数各自都说得通。所以这里不给工作台
+/// 第二个常量，让它走同一条读数。
+pub(crate) fn spend_window_hours() -> i64 {
+    default_usage_hours()
+}
+
 /// How far back a spend read may reach, in hours, taken from the ledger's own
 /// retention rather than written down here.
 ///
@@ -549,7 +558,7 @@ pub struct SpendLine {
 }
 
 /// Money per currency, summed over the rows.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CurrencyTotal {
     pub currency: String,
     pub cost_micros: i64,
@@ -557,7 +566,7 @@ pub struct CurrencyTotal {
 }
 
 /// The two halves of a spend total that must not be added together.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SpendTotals {
     /// One line per currency. Two currencies are two totals, not an exchange
     /// rate: this platform bills in whatever each upstream's price list says,
@@ -685,42 +694,57 @@ pub async fn token_spend_handler(
     Ok(Json(spend_response(since, until, spend)))
 }
 
+/// Sum a spend read into money per currency, plus the calls that carried none.
+///
+/// One implementation for every surface that shows a total: the spend face and the
+/// workbench's invest cell both read this, so the cell and the page it links to
+/// cannot disagree about what the same window cost. Totals are accumulated from the
+/// same rows the response carries, not from a second query — a separate `SUM` is a
+/// second answer to the same question, and the two disagree the first time one of
+/// them gains a filter.
+pub(crate) fn spend_totals(spend: &cog_core::PricedSpend) -> SpendTotals {
+    let mut by_currency: Vec<CurrencyTotal> = Vec::new();
+    let mut unpriced_calls = 0i64;
+    for r in &spend.rows {
+        // Unpriced is counted from the two numbers the ledger itself produced: the
+        // calls and the ones that carried money. A row with a book whose window did
+        // not cover these calls has `cost_micros: null` and `priced_calls: 0`, so it
+        // lands here too — which is right, because "priced from a book that does not
+        // cover this hour" is exactly as unpriced as "no book at all".
+        unpriced_calls += r.calls - r.priced_calls;
+        let currency = r.price_book.as_deref().map(book_currency);
+        if let (Some(c), Some(micros)) = (currency, r.cost_micros) {
+            match by_currency.iter_mut().find(|t| t.currency == c) {
+                Some(t) => {
+                    t.cost_micros += micros;
+                    t.priced_calls += r.priced_calls;
+                }
+                None => by_currency.push(CurrencyTotal {
+                    currency: c,
+                    cost_micros: micros,
+                    priced_calls: r.priced_calls,
+                }),
+            }
+        }
+    }
+    SpendTotals {
+        by_currency,
+        unpriced_calls,
+    }
+}
+
 /// Project a ledger spend read onto the response face.
 fn spend_response(
     since: chrono::DateTime<chrono::Utc>,
     until: chrono::DateTime<chrono::Utc>,
     spend: cog_core::PricedSpend,
 ) -> TokenSpendResponse {
-    // Totals are accumulated from the same rows the response carries, not from
-    // a second query: a separate `SUM` is a second answer to the same question,
-    // and the two disagree the first time one of them gains a filter.
-    let mut by_currency: Vec<CurrencyTotal> = Vec::new();
-    let mut unpriced_calls = 0i64;
+    let totals = spend_totals(&spend);
     let rows: Vec<SpendLine> = spend
         .rows
         .into_iter()
         .map(|r| {
             let currency = r.price_book.as_deref().map(book_currency);
-            // Unpriced is counted from the two numbers the ledger itself
-            // produced: the calls and the ones that carried money. A row with a
-            // book whose window did not cover these calls has `cost_micros:
-            // null` and `priced_calls: 0`, so it lands here too — which is
-            // right, because "priced from a book that does not cover this hour"
-            // is exactly as unpriced as "no book at all".
-            unpriced_calls += r.calls - r.priced_calls;
-            if let (Some(c), Some(micros)) = (&currency, r.cost_micros) {
-                match by_currency.iter_mut().find(|t| &t.currency == c) {
-                    Some(t) => {
-                        t.cost_micros += micros;
-                        t.priced_calls += r.priced_calls;
-                    }
-                    None => by_currency.push(CurrencyTotal {
-                        currency: c.clone(),
-                        cost_micros: micros,
-                        priced_calls: r.priced_calls,
-                    }),
-                }
-            }
             SpendLine {
                 actor: r.actor,
                 origin: r.origin,
@@ -745,10 +769,7 @@ fn spend_response(
         covered_until: spend.covered_until.map(|t| t.to_rfc3339()),
         retention_days: cog_core::retention::llm_usage_keep_days(),
         rows,
-        totals: SpendTotals {
-            by_currency,
-            unpriced_calls,
-        },
+        totals,
     }
 }
 

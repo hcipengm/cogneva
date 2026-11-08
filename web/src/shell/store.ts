@@ -43,7 +43,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   files: '文件',
   scm: '源代码管理',
   inbox: '收件箱',
-  agents: '智能体',
+  agents: '员工',
   tasks: '任务',
   projects: '项目',
   flow: '流程',
@@ -98,23 +98,90 @@ export function clampSidebarWidth(width: number): number {
 }
 
 /**
- * 工作台的两排法。`columns` 是编辑器式并排，`tabs` 是一次全屏看一段。
+ * 左栏活动项的顺序，由读者拖出来。
  *
- * 这不是两种皮肤，是两种不同的注意力分配：并排是为了同时看两边在说什么，
- * 标签页是为了把一段放到最大。段数一多，并排会窄到读不成句子，那时候换排法
- * 比缩小字号有用。
+ * 记的是「读过的那一份」，不是「全部活动项」：默认顺序与每一项的图标、名字住在
+ * `ActivityBar` 里，这里再存一份就是两台真相——一面加了新项，另一份名单不知道。
+ * 所以这里只存改过的先后，落不到的项由 [`mergeActivityOrder`] 补在末尾。
  */
-export type WorkspaceMode = 'columns' | 'tabs';
-const WORKSPACE_MODE_STORAGE_KEY = 'cogneva.workspaceMode';
+const ACTIVITY_ORDER_STORAGE_KEY = 'cogneva.activityOrder';
 
-function bootWorkspaceMode(): WorkspaceMode {
+function bootActivityOrder(): ActivityId[] | null {
   try {
-    const raw = window.localStorage.getItem(WORKSPACE_MODE_STORAGE_KEY);
-    if (raw === 'tabs' || raw === 'columns') return raw;
+    const raw = window.localStorage.getItem(ACTIVITY_ORDER_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((id): id is string => typeof id === 'string') as ActivityId[];
   } catch {
-    // 同上：记不住只影响下一次打开用哪一种排法。
+    // 隐私模式下面 localStorage 会抛：拖拽照样能用，只是不跨刷新记住。
   }
-  return 'columns';
+  return null;
+}
+
+/**
+ * 把记下的先后叠到这一版声明的名单上。
+ *
+ * 声明的名单是全集——它决定谁存在；记下的先后只决定谁在前。记下的那些里已经不
+ * 存在的项被丢掉（那一面改名或删了），没记过的项按声明顺序补在末尾（这一版新加
+ * 的面不能因为读者三周前拖过一次就消失）。
+ */
+export function mergeActivityOrder(
+  saved: readonly ActivityId[] | null,
+  declared: readonly ActivityId[]
+): ActivityId[] {
+  const known = new Set(declared);
+  const seen = new Set<ActivityId>();
+  const out: ActivityId[] = [];
+  for (const id of saved ?? []) {
+    if (!known.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  for (const id of declared) {
+    if (seen.has(id)) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+/** 把 `moving` 挪到 `before` 的位置上。两格相邻时与原顺序一致，不是「换位」。 */
+export function moveActivity(
+  order: readonly ActivityId[],
+  moving: ActivityId,
+  before: ActivityId
+): ActivityId[] {
+  const from = order.indexOf(moving);
+  const to = order.indexOf(before);
+  if (from < 0 || to < 0 || from === to) return [...order];
+  const next = [...order];
+  next.splice(from, 1);
+  next.splice(to, 0, moving);
+  return next;
+}
+
+/**
+ * 「这个数的来路」那一条抽屉的宽度上下界。再窄一行字折成三截，再宽主区就被挤到
+ * 只剩一条缝——它说的是某个数的来路，不该占掉读那个数的地方。
+ */
+export const DRAWER_MIN_WIDTH = 260;
+export const DRAWER_MAX_WIDTH = 720;
+export const DRAWER_DEFAULT_WIDTH = 340;
+const DRAWER_STORAGE_KEY = 'cogneva.explainDrawerWidth';
+
+export function clampDrawerWidth(width: number): number {
+  return Math.min(DRAWER_MAX_WIDTH, Math.max(DRAWER_MIN_WIDTH, Math.round(width)));
+}
+
+function bootDrawerWidth(): number {
+  try {
+    const raw = window.localStorage.getItem(DRAWER_STORAGE_KEY);
+    const width = raw ? Number(raw) : NaN;
+    if (Number.isFinite(width)) return clampDrawerWidth(width);
+  } catch {
+    // 同上：记不住只影响下一次打开用默认宽度。
+  }
+  return DRAWER_DEFAULT_WIDTH;
 }
 
 interface ShellState {
@@ -122,8 +189,10 @@ interface ShellState {
   sidebarVisible: boolean;
   /** 左栏现在的宽度（像素）。读者拖过它之后就是这个数。 */
   sidebarWidth: number;
-  /** 工作台怎么排：并排分栏，还是一次一段的标签页。 */
-  workspaceMode: WorkspaceMode;
+  /** 读者拖出来的活动栏先后；`null` 是没拖过，按 `ActivityBar` 声明的顺序。 */
+  activityOrder: ActivityId[] | null;
+  /** 「来路」抽屉现在的宽度（像素）。 */
+  drawerWidth: number;
   tabs: EditorTab[];
   activeTabId: string;
   panelOpen: boolean;
@@ -151,7 +220,10 @@ interface ShellState {
   setActivity: (activity: ActivityId) => void;
   toggleSidebar: () => void;
   setSidebarWidth: (width: number) => void;
-  setWorkspaceMode: (mode: WorkspaceMode) => void;
+  setActivityOrder: (order: ActivityId[]) => void;
+  setDrawerWidth: (width: number) => void;
+  /** 把一页挪到另一页前面。相邻挪动等于不动。 */
+  moveTab: (moving: string, before: string) => void;
   openTab: (tab: EditorTab) => void;
   closeTab: (id: string) => void;
   activateTab: (id: string) => void;
@@ -173,7 +245,8 @@ export const useShell = create<ShellState>((set, get) => ({
   activity: 'workspace',
   sidebarVisible: true,
   sidebarWidth: bootSidebarWidth(),
-  workspaceMode: bootWorkspaceMode(),
+  activityOrder: bootActivityOrder(),
+  drawerWidth: bootDrawerWidth(),
   tabs: [FIRST_TAB],
   activeTabId: FIRST_TAB.id,
   panelOpen: false,
@@ -217,14 +290,35 @@ export const useShell = create<ShellState>((set, get) => ({
     }
   },
 
-  setWorkspaceMode: (workspaceMode) => {
-    set({ workspaceMode });
+  setActivityOrder: (order) => {
+    set({ activityOrder: order });
     try {
-      window.localStorage.setItem(WORKSPACE_MODE_STORAGE_KEY, workspaceMode);
+      window.localStorage.setItem(ACTIVITY_ORDER_STORAGE_KEY, JSON.stringify(order));
     } catch {
-      // 记不住只影响下一次打开用哪一种排法。
+      // 记不住不改变这一屏的顺序，只是下一次打开回到声明顺序。
     }
   },
+
+  setDrawerWidth: (width) => {
+    const clamped = clampDrawerWidth(width);
+    set({ drawerWidth: clamped });
+    try {
+      window.localStorage.setItem(DRAWER_STORAGE_KEY, String(clamped));
+    } catch {
+      // 同上：记不住只影响下一次打开用默认宽度。
+    }
+  },
+
+  moveTab: (moving, before) =>
+    set((state) => {
+      const from = state.tabs.findIndex((t) => t.id === moving);
+      const to = state.tabs.findIndex((t) => t.id === before);
+      if (from < 0 || to < 0 || from === to) return state;
+      const tabs = [...state.tabs];
+      const [tab] = tabs.splice(from, 1);
+      tabs.splice(to, 0, tab);
+      return { tabs };
+    }),
 
   openTab: (tab) =>
     set((state) => {
