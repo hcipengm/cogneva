@@ -295,25 +295,16 @@ pub struct DagExecutorConfig {
     /// Maximum result messages reclaimed per sweep.
     #[serde(default = "default_result_claim_batch")]
     pub result_claim_batch: usize,
-    /// How long a self-evolution task may run before the timeout checker
-    /// reclaims it (seconds), for a class that has no measured duration yet.
-    ///
-    /// This is a seed, not the wall. Once a class has finished enough runs,
-    /// its wall is read from those runs' own durations, because one number
-    /// covering every class is wrong in both directions: too short cuts a long
-    /// run off before its result exists, too long lets a stuck run sit on the
-    /// slot forever. The same number still bounds how long a task orphaned by a
-    /// restart stays held, so it belongs to the deployment rather than to the
-    /// code that creates the task.
-    #[serde(default = "default_self_evolution_timeout_secs")]
-    pub self_evolution_timeout_secs: u64,
     /// How long a running task's lease stays valid without a heartbeat
     /// (seconds). A process holds the lease of every task it started and
     /// pushes the expiry forward while it works; when it is replaced, the
     /// expiry stops moving and whoever observes the lapse takes the task over.
     /// This is what bounds how long work orphaned by a restart stays
-    /// invisible — the timeout above is the budget a *live* run gets, not a
-    /// restart detector. Keep it above the timeout-checker cadence
+    /// invisible. It is also the only bound on a live run's duration, and it
+    /// bounds *silence*: a run that keeps stepping renews it forever, while one
+    /// that stops stepping loses it. There is deliberately no elapsed-time
+    /// budget beside it — a run that is producing is never cut, and a run that
+    /// stopped is caught by the missing steps, not by the clock. Keep it above the timeout-checker cadence
     /// (`system.timeout_checker_interval_secs`) so a reclaim lands on the next
     /// sweep rather than on a stale read, and low enough that a task killed by
     /// a rolling replacement is picked up long before the next one.
@@ -532,7 +523,6 @@ impl Default for DagExecutorConfig {
             result_claim_idle_secs: default_result_claim_idle_secs(),
             result_claim_interval_secs: default_result_claim_interval_secs(),
             result_claim_batch: default_result_claim_batch(),
-            self_evolution_timeout_secs: default_self_evolution_timeout_secs(),
             task_lease_secs: default_task_lease_secs(),
             redis_read_block_ms: default_redis_read_block_ms(),
             redis_read_resume_block_ms: default_redis_read_resume_block_ms(),
@@ -739,9 +729,6 @@ fn default_result_claim_interval_secs() -> u64 {
 }
 fn default_result_claim_batch() -> usize {
     16
-}
-fn default_self_evolution_timeout_secs() -> u64 {
-    3600
 }
 
 /// Configuration for the Hot/Warm/Cold tier migrator.

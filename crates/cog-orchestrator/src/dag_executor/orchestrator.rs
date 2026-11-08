@@ -108,26 +108,33 @@ pub struct DagExecutor {
 
 /// 为什么一个 Running 任务需要被回收。
 ///
-/// 两个原因对下游是相反的判定：一个说「换个进程重来」，另一个说「重来也白来」。
-/// 它们所以是两种类型而不是同一句话里的两种措辞，是因为读到它们的是重试判定，
-/// 而那个判定只认类型与带内标记，不认散文。
+/// 两个原因对下游是相反的判定：一个说「换个进程重来」，另一个说「这一轮确实
+/// 停住了」。它们所以是两种类型而不是同一句话里的两种措辞，是因为读到它们的是
+/// 重试判定，而那个判定只认类型与带内标记，不认散文。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReclaimCause {
     /// 持有者的心跳停了：原进程被换掉了，这一轮没有产出。接手它是对的——环境
     /// 确实换了人，同一份输入在下一个进程里未必重蹈覆辙。所以这个原因**不**
-    /// 声明自己是终止性的。
+    /// 声明自己是终止性的，也不记在任务的重试账上。
     LeaseExpired {
         owner: Option<String>,
         expired_at: chrono::DateTime<chrono::Utc>,
     },
-    /// 持有者还在，但这一轮把声明的时限跑满了还没产出。
+    /// 持有者还在，但这个尝试已经 `silent_secs` 没有做出任何一步，而这份部署
+    /// 实测的步间隔 p99.9 是 `window_secs`。
     ///
-    /// 这条判据只证明了一件事：声明的时限比这份活实际需要的时间短。它没有证明
-    /// 「进展为零」——判据里没有任何一处读到进展。于是「同一份输入重跑买不到
-    /// 不同的结果」只在**时限不变**时成立；时限变了，下一轮就是另一个实验。
-    /// 这个区别由 [`Self::raises_the_budget`] 读：还有翻倍余地的回收回队列，
-    /// 到了封顶还在跑满的才判死。
-    OverBudget { timeout_seconds: u64 },
+    /// 判据读的是「上一次动是什么时候」，不是「已经跑了多久」。对时钟来说，一个
+    /// 流式输出了一小时的尝试与一个第一秒就卡住的尝试是同一个读数——那正是旧的
+    /// 预算墙唯一能看见的东西；对这条判据它们是两个。所以慢但一直在动的永远不
+    /// 会被判，停住的也不用一个声明的时限过期才被发现。
+    ///
+    /// 停住记在任务自己的账上：这是这一轮的事，不是环境换了人。但它**不是**终止
+    /// 性的——上游一次真会过去的停顿与一次真的卡死在这个读数上同形，所以下一轮
+    /// 照常重试，判死交给重试预算。
+    Silent {
+        silent: std::time::Duration,
+        window: std::time::Duration,
+    },
 }
 
 impl ReclaimCause {
@@ -139,13 +146,11 @@ impl ReclaimCause {
                 "run lease expired: the process that held this task ({}) stopped renewing it, so the run never produced a result",
                 owner.as_deref().unwrap_or("unknown")
             ),
-            Self::OverBudget { timeout_seconds } => format!(
-                "{}{}{}{}",
-                cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX,
-                BUDGET_EXHAUSTED_LEAD,
-                timeout_seconds,
-                BUDGET_EXHAUSTED_TAIL
-            ),
+            // 刻意不挂 `DEGENERATE_LOOP_PREFIX`：那个标记的消费者
+            // （`cog_core::contract::outcome::is_deterministic_failure`）把它读成
+            // 「同一份输入重跑必然再失败」，于是这一条会直接跳过重试。停住不满足
+            // 那个前提——它最经常的样子是一次会过去的停顿，重试正是要买的那件事。
+            Self::Silent { silent, window } => stall_reason(*silent, *window),
         }
     }
 
@@ -158,43 +163,37 @@ impl ReclaimCause {
     /// 于是每滚一次版就替任务扣一格，三次部署就能把一条刚跑起来、没出过任何错的
     /// 回炉判死。类型本来就分好了，这里只是把它读到判定里，不新加读数。
     ///
-    /// 预算跑满那档相反：它读到的是任务自己烧掉了一整轮预算，那笔账由任务
-    /// 买单，仍然走通用的失败处理。
+    /// 停住那档相反：它读到的是这个尝试自己一步都没动，那笔账由任务买单，仍然
+    /// 走通用的失败处理。
     ///
     /// 不记账的回投不是无界的：租约过期每回收一次都要有一个真实的持有者先消失，
     /// 而它要再被回收，得先有新持有者接手、再消失——这一圈里没有任务自己的动作
-    /// 在驱动，也没有时钟在驱动，是环境的节拍在驱动。预算跑满那条路另外有界：
-    /// [`Self::raises_the_budget`] 只放行封顶之前的那几次。
+    /// 在驱动，也没有时钟在驱动，是环境的节拍在驱动。
     fn charges_retry_budget(&self) -> bool {
         match self {
             Self::LeaseExpired { .. } => false,
-            Self::OverBudget { .. } => true,
+            Self::Silent { .. } => true,
         }
-    }
-
-    /// 这一次回收之后，任务该不该拿着更多的时限再跑一轮。
-    ///
-    /// 判据与 `raise_after_a_deadline_cut` 是同一条，只是入口不同：执行侧在自己
-    /// 的 future 外面挂的超时先到，判词是「timed out after N seconds」；编排侧的
-    /// 时钟先到，判词是「ran its whole Ns budget」。两条都是「声明的时限比这份活
-    /// 需要的短」，所以两条都该买到下一次更多的时间。只认前一条时，被编排侧回收
-    /// 的那批永远回到同一个时限上重跑一遍——同一个实验，同样的结果，那笔重试预算
-    /// 买到的是零。实测 2026-11-08：当天 17 条 change_ledger 任务在 3600 秒处被
-    /// 回收，每条烧掉约 59 万 token，而它们连第二次机会都没有。
-    ///
-    /// 封顶之上不再放行：到了 [`MAX_ATTEMPT_BUDGET_SECS`] 还在跑满的，缺的不是
-    /// 时间，那时才轮到「同一份输入重跑买不到不同的结果」。
-    fn raises_the_budget(&self) -> bool {
-        matches!(
-            self,
-            Self::OverBudget { timeout_seconds } if *timeout_seconds < MAX_ATTEMPT_BUDGET_SECS
-        )
     }
 }
 
+/// 一次尝试停止动作时的判词。
+///
+/// 生产它的有两处——编排侧的回收与执行路由的守护——而两处说的是同一个事实，
+/// 所以句子只有一份：两边各写一份时，改了一边的那天，同一个现象在两条日志里
+/// 会有两种写法，而排查的人是照着其中一条去 grep 的。
+pub(crate) fn stall_reason(silent: std::time::Duration, window: std::time::Duration) -> String {
+    format!(
+        "run stopped moving: no step for {}s, and this deployment's measured inter-step p99.9 is {}s",
+        silent.as_secs(),
+        window.as_secs()
+    )
+}
+
 /// 回收判据。只有 Running 的任务需要被回收，且必须有一条证据：持有者的租约过期
-/// （原进程不在了），或这一轮用光了预算。两条证据都没有就不动它——「没看到续期」
-/// 与「看到过期」是两回事，前者在租约还新的时候就是常态。
+/// （原进程不在了），或这个尝试按实测的步间隔算是停住了。两条证据都没有就不动它
+/// ——「没看到续期」与「看到过期」是两回事，前者在租约还新的时候就是常态；
+/// 「本进程没有它的信标」与「它停住了」也是两回事，前者说的是跑它的不是这个进程。
 fn reclaim_cause(
     task: &Task,
     lease: chrono::Duration,
@@ -211,28 +210,14 @@ fn reclaim_cause(
             });
         }
     }
-    let over_budget = task
-        .started_at
-        .map(|s| (now - s).num_seconds() > task.timeout_seconds as i64)
-        .unwrap_or(false);
-    if over_budget {
-        return Some(ReclaimCause::OverBudget {
-            timeout_seconds: task.timeout_seconds,
-        });
-    }
-    None
+    // 信标是进程内的，所以这活不是本进程在跑时这里读不到它——那时 `None` 说的
+    // 是「我看不见」，不是「它死了」。窗口没量出来时同样不判：`None` 是「这份
+    // 部署还没跑够步数去量」，折成一个默认秒数就是又一个没人量过的墙。两种
+    // `None` 对调用方是同一个答案，所以判据只写在一处（`progress::stall`），
+    // 执行侧那道守护读的是同一条。
+    let (silent, window) = cog_core::progress::stall(&task.id)?;
+    Some(ReclaimCause::Silent { silent, window })
 }
-
-/// 一次执行被它自己的时限截断时，错误文本里出现的那一句的开头。
-///
-/// 生产它的是执行路由（`task_executor_router`），读它的是这里：两边读同一个
-/// 常量，改一处不会让另一处静默失配——两处各写一份字面量时，改了一边的那天，
-/// 判定与生产就会分家，而分家的表现是「这条规则从某天起不再触发」，没有红。
-pub(crate) const DEADLINE_CUT_PREFIX: &str = "Task execution timed out after ";
-
-/// 一次尝试能拿到的最大时限。
-// cap: bound — 一小时是平台给一份 LLM 密集工作声明的量级（自进化任务用这个数），两小时是最后一次翻倍；再往上截断的，缺的不是时间
-const MAX_ATTEMPT_BUDGET_SECS: u64 = 7200;
 
 /// 一条活被「不记账地交回来」几次之后，等待开始随次数翻倍。
 ///
@@ -249,78 +234,6 @@ const UNCHARGED_TURNS_BEFORE_SLOWING: u32 = 6;
 /// 还没回来时把额度一片一片吃掉。
 // cap: derived — 上界钉在实测额度窗口（604800s）的零头上；窗口变了这个数跟着变
 const UNCHARGED_REQUEUE_WAIT_CAP_SECS: u64 = 12 * 3600;
-
-/// 预算跑满的判词里，数字两边的那两段。生产它的是 [`ReclaimCause::error`]，认出
-/// 它的是 [`exhausted_budget_seconds`]：两边各写一份字面量时，改了一边的那天，
-/// 「这次回收让下一轮拿到更多时间」就会静默失效，而失效的表现是同一个时限上的
-/// 无限重跑——读数上是同一行，没有红。
-const BUDGET_EXHAUSTED_LEAD: &str = ": task ran its whole ";
-const BUDGET_EXHAUSTED_TAIL: &str = "s budget without producing a result";
-
-/// 上一次尝试是不是把声明的时限跑光了，跑光时声明的是多少秒。
-///
-/// 两种判词说的是同一件事，只是生产它的人不同：执行侧在自己的 future 外面挂的
-/// 超时先到，写的是「timed out after N seconds」；编排侧的回收时钟先到，写的是
-/// 「ran its whole Ns budget」。两条路都让任务少了一整轮预算，所以两条路都得认。
-///
-/// 按形状读，不按裸子串读：要的是整句，散文里恰好提到这些词不算。错误文本在
-/// 到达这里之前可能被别的层包过（`Agent execution error: ` 之流），所以不要求
-/// 出现在开头。
-fn exhausted_budget_seconds(error: &str) -> Option<u64> {
-    if let Some(secs) = deadline_cut_seconds(error) {
-        return Some(secs);
-    }
-    let at = error.find(cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX)?
-        + cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX.len();
-    let rest = error[at..].strip_prefix(BUDGET_EXHAUSTED_LEAD)?;
-    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
-    if digits == 0 {
-        return None;
-    }
-    let secs = rest[..digits].parse::<u64>().ok()?;
-    rest[digits..]
-        .starts_with(BUDGET_EXHAUSTED_TAIL)
-        .then_some(secs)
-}
-
-/// 上一次尝试是不是被它自己的时限截断的，截断时声明的是多少秒。
-///
-/// 按形状读，不按裸子串读：要的是「<开头><数字> seconds」这一整句。错误文本在
-/// 到达这里之前可能被别的层包过（`Agent execution error: ` 之流），所以不要求
-/// 出现在开头；但只认这一句，不认散文里恰好提到这些词。
-fn deadline_cut_seconds(error: &str) -> Option<u64> {
-    let at = error.find(DEADLINE_CUT_PREFIX)? + DEADLINE_CUT_PREFIX.len();
-    let rest = &error[at..];
-    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
-    let secs = rest[..digits].parse::<u64>().ok()?;
-    rest[digits..].starts_with(" seconds").then_some(secs)
-}
-
-/// 新一次尝试的执行时限：上一次被自己的时限截断，这一次就该给更多。
-///
-/// 被截断说的是「这份活需要的时间比声明的多」，不是「这份活做不成」。同一个
-/// 时限重来一遍是同一个实验：同样的输入、同样的墙，结果必然相同——那笔重试
-/// 预算买到的是零。集群库实测（2026-11-04）的表现正是这样：一条重规划连着
-/// 三次在 300 秒处被截断，然后报「Global retry budget exhausted」。耗尽的不是
-/// 上游的能力，是这条活从来没有拿到过比第一次更多的时间。
-///
-/// 翻倍是能用证据买到的最小增量：它不猜这份活要多久，只保证这一轮比上一轮多，
-/// 多的那一份由「上一轮用光了」这件事本身证明。封顶
-/// [`MAX_ATTEMPT_BUDGET_SECS`]——过了那里还截断的，缺的不是时间。
-///
-/// 只在一次运行的开始时调用：那一刻读到的 `error` 是上一次尝试的判词，而这一
-/// 轮还没开始，改的正是这一轮要用的契约。
-fn raise_after_a_deadline_cut(task: &mut Task) {
-    let Some(spent) = task.error.as_deref().and_then(exhausted_budget_seconds) else {
-        return;
-    };
-    // 用上一次声明的那个数做基准，而不是行上现在的数：行上的数可能已经被抬过
-    // 一次（同一条错误在几次派发里都读得到），按它翻倍会一次翻两档。
-    let raised = spent.saturating_mul(2).min(MAX_ATTEMPT_BUDGET_SECS);
-    if raised > task.timeout_seconds {
-        task.timeout_seconds = raised;
-    }
-}
 
 /// One lane's share of what a stall sweep did.
 ///
@@ -1134,6 +1047,7 @@ impl DagExecutor {
             E::TaskCancelled { .. } => "task_cancelled",
             E::TaskRetried { .. } => "task_retried",
             E::TaskTimeout { .. } => "task_timeout",
+            E::TaskStalled { .. } => "task_stalled",
             E::TaskLeaseExpired { .. } => "task_lease_expired",
         }
     }
@@ -2022,11 +1936,14 @@ impl DagExecutor {
                 _ => continue,
             }
             self.emit_reclaim(&t, &cause).await;
+            // 这一次尝试结束了，它的信标不该留在进程里等下一轮：下一个尝试
+            // 如果没有先打一拍就被读到，读到的会是这一次的时刻，一个刚起来的
+            // 尝试会立刻被判成停住。
+            cog_core::progress::forget(&t.id);
             // 该不该记账由类型说了算（见 `ReclaimCause::charges_retry_budget`）：
-            // 不记账的回收不走通用的失败处理，那条路只剩预算一个判据。预算跑满
-            // 但还没到封顶的那档也走这条路：它不是终态，是「声明的时限比这份活
-            // 需要的短」，下一轮由 `requeued_without_charge` 抬着时限重跑。
-            if !cause.charges_retry_budget() || cause.raises_the_budget() {
+            // 不记账的回收不走通用的失败处理——那条路只认 `retry_count`，而租约
+            // 过期不是任务做的。停住相反：它记在任务账上，走通用失败处理。
+            if !cause.charges_retry_budget() {
                 match self
                     .requeue_without_charge_store(
                         &t.id,
@@ -2111,11 +2028,6 @@ impl DagExecutor {
         );
         next.clear_run();
         next.updated_at = now;
-        // 判词里如果是「跑满了 N 秒」，下一轮拿到的时限就该比 N 多。抬的动作放在
-        // 这里而不是调用点，是因为两条回收路径（租约过期、预算跑满）与两条后端
-        // （进程内、存储）都从这里造下一行：抬一次就够的地方写四份，迟早在某一
-        // 份上漏掉，而漏掉的那一份表现为同一个时限上的无限重跑。
-        raise_after_a_deadline_cut(&mut next);
         next
     }
 
@@ -2857,16 +2769,17 @@ impl DagExecutor {
     pub async fn start_task(&self, task_id: &str) -> SFResult<()> {
         self.refuse_when_the_running_column_is_full(task_id).await?;
         if self.fg().is_some() {
+            // 这一轮从没有信标开始。上一轮留在本进程里的那一个，在开始时读起来
+            // 就是「很久没动」——守护在一个步之间就轮询一次，第一拍还没打，它已经
+            // 把这个全新的尝试判成停住了。
+            cog_core::progress::forget(task_id);
             let (owner, lease) = (self.run_id.clone(), self.task_lease);
             return self
                 .store_transition(
                     task_id,
                     &[TaskStatus::Scheduled],
                     "Cannot start task in {} state",
-                    |t| {
-                        raise_after_a_deadline_cut(t);
-                        t.begin_run(&owner, lease, chrono::Utc::now())
-                    },
+                    |t| t.begin_run(&owner, lease, chrono::Utc::now()),
                     Some(cog_core::TaskEvent::TaskStarted {
                         task_id: task_id.into(),
                         timestamp: chrono::Utc::now(),
@@ -2891,7 +2804,8 @@ impl DagExecutor {
             });
         }
 
-        raise_after_a_deadline_cut(task);
+        // 同 `store` 那条路：新尝试从没有信标开始，不是从上一轮的信标开始。
+        cog_core::progress::forget(task_id);
         task.begin_run(&self.run_id, self.task_lease, chrono::Utc::now());
         let task_snapshot = task.clone();
         drop(inner);
@@ -3787,12 +3701,13 @@ impl DagExecutor {
             }
 
             self.emit_reclaim(&task, &cause).await;
+            // 同一个理由见存储那条路：这次尝试的信标到此为止。
+            cog_core::progress::forget(&task_id);
 
             // 该不该记账由类型说了算（见 `ReclaimCause::charges_retry_budget`）：
-            // 不记账的回收不走通用的失败处理，那条路只剩预算一个判据。预算跑满
-            // 但还没到封顶的那档也走这条路：它不是终态，是「声明的时限比这份活
-            // 需要的短」，下一轮由 `requeued_without_charge` 抬着时限重跑。
-            if !cause.charges_retry_budget() || cause.raises_the_budget() {
+            // 不记账的回收不走通用的失败处理——那条路只认 `retry_count`，而租约
+            // 过期不是任务做的。停住相反：它记在任务账上，走通用失败处理。
+            if !cause.charges_retry_budget() {
                 let mut inner = self.inner.write().await;
                 let Some(current) = inner.tasks.get_mut(&task_id) else {
                     continue;
@@ -4009,9 +3924,10 @@ impl DagExecutor {
                     timestamp: chrono::Utc::now(),
                 }
             }
-            ReclaimCause::OverBudget { timeout_seconds } => cog_core::TaskEvent::TaskTimeout {
+            ReclaimCause::Silent { silent, window } => cog_core::TaskEvent::TaskStalled {
                 task_id: task.id.clone(),
-                timeout_seconds: *timeout_seconds,
+                silent_secs: silent.as_secs(),
+                window_secs: window.as_secs(),
                 timestamp: chrono::Utc::now(),
             },
         };
@@ -4686,105 +4602,80 @@ mod tests {
         )
     }
 
-    /// 时限截断按形状认：整句「<开头><数字> seconds」才算，散文里提到这些词不算。
-    #[test]
-    fn a_deadline_cut_is_recognised_only_in_its_whole_sentence() {
-        assert_eq!(
-            deadline_cut_seconds("Task execution timed out after 300 seconds"),
-            Some(300)
-        );
-        assert_eq!(
-            deadline_cut_seconds(
-                "Agent execution error: Task execution timed out after 600 seconds"
-            ),
-            Some(600),
-            "错误在到达编排侧之前会被别的层包一层，包过之后仍然要认得出来"
-        );
-        assert_eq!(
-            deadline_cut_seconds("Task execution timed out after 300 second"),
-            None,
-            "少了那个词就不是同一句话"
-        );
-        assert_eq!(
-            deadline_cut_seconds("the run mentioned a deadline cut, 300 seconds"),
-            None,
-            "散文里恰好写到时限与秒数，不是一次截断的判词"
-        );
-        assert_eq!(deadline_cut_seconds("boom"), None);
-    }
-
-    /// 编排侧自己回收时写的判词说的是同一件事：这一轮把声明的时限跑满了。
-    /// 认不出它，被回收的那批就永远回到同一个时限上重跑一遍。
-    #[test]
-    fn a_reclaim_that_ran_out_the_budget_names_the_budget_it_ran_out_of() {
-        let reclaim = ReclaimCause::OverBudget {
-            timeout_seconds: 3600,
-        };
-        assert_eq!(exhausted_budget_seconds(&reclaim.error()), Some(3600));
-        assert_eq!(
-            exhausted_budget_seconds(&format!("Agent execution error: {}", reclaim.error())),
-            Some(3600),
-            "别层包过一层之后仍然要认得出来"
-        );
-        assert_eq!(
-            exhausted_budget_seconds("degenerate_loop: 2 consecutive attempts bought no progress"),
-            None,
-            "另一种 degenerate_loop 判词里没有预算，别把它读成一个数"
-        );
-        assert_eq!(
-            exhausted_budget_seconds("degenerate_loop: task ran its whole s budget"),
-            None,
-            "没有数字就不是同一条判词"
-        );
-    }
-
-    /// 被自己的时限截断之后，下一轮拿到的是更多的时间。
+    /// 停摆判据读的是「上一次动是什么时候」与这份部署量出来的步间隔，不是时钟。
     ///
-    /// 行上的 `error` 只在下一次失败时被覆盖，所以同一条截断在几次派发里都读得
-    /// 到；判据因此按错误里声明的那个数翻倍，而不是把行上的数越翻越大。
+    /// 四种处境各判一次，因为把它们折成一种就是这个判据要结束的那个缺陷：
+    /// 慢但在动的被判死（旧的墙），没有信标的被判死（会整批收掉一类执行器），
+    /// 窗口还没量出来的被判死（拿猜当读数）。
     #[test]
-    fn a_deadline_cut_buys_the_next_attempt_more_time() {
-        let mut cut = evolution_task("cut-once");
-        assert_eq!(cut.timeout_seconds, 300, "前提：这是造出来时的默认值");
-        cut.error = Some("Task execution timed out after 300 seconds".into());
-        raise_after_a_deadline_cut(&mut cut);
+    fn reclaim_follows_measured_silence_not_elapsed_time() {
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        let lease = chrono::Duration::seconds(600);
+        let now = chrono::Utc::now();
+        let mut task = evolution_task("judged-by-silence");
+        task.status = TaskStatus::Running;
+        // 跑了九个小时：旧的墙无论设成多少都早该收它了，这条判据一分钟都不看它。
+        task.started_at = Some(now - chrono::Duration::hours(9));
+        task.lease_expires_at = Some(now + lease);
+        task.lease_owner = Some("this-process".into());
+
+        // 窗口还没量出来：不判。`None` 说的是「这份部署还没跑够步数去量」。
+        cog_core::progress::beat(&task.id);
         assert_eq!(
-            cut.timeout_seconds, 600,
-            "同一个时限重跑一遍是同一个实验：那笔重试预算买到的是零"
+            reclaim_cause(&task, lease, now),
+            None,
+            "没有可比的窗口时判停住，等于又把一个没人量过的秒数写死进代码"
         );
 
-        // 还没开始跑就又被派发一次：同一条错误读第二遍，不该再翻一档。
-        raise_after_a_deadline_cut(&mut cut);
-        assert_eq!(cut.timeout_seconds, 600);
-
-        // 上一轮实际声明得更多，这一轮就按它翻倍，封顶在最后一次。
-        cut.error = Some("Task execution timed out after 3600 seconds".into());
-        raise_after_a_deadline_cut(&mut cut);
+        // 窗口量出来了，而这个尝试刚刚才动过：不判，哪怕已经跑了九个小时。
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::from_secs(3600), 1000);
+        cog_core::progress::beat(&task.id);
         assert_eq!(
-            cut.timeout_seconds, MAX_ATTEMPT_BUDGET_SECS,
-            "封顶在最后一次翻倍：再往上是这份活在空转，不是时限问题"
+            reclaim_cause(&task, lease, now),
+            None,
+            "慢但在动的一轮永远不该被判：那份时间正是它买到的产出"
         );
 
-        // 编排侧回收写的那一句，买到的是同一样东西。
-        let mut reclaimed = evolution_task("reclaimed");
-        reclaimed.timeout_seconds = 3463;
-        reclaimed.error = Some(
-            ReclaimCause::OverBudget {
-                timeout_seconds: 3463,
+        // 同一个窗口，这个尝试已经很久没动了：判停住，并带上是拿什么窗口比的。
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
+        cog_core::progress::beat(&task.id);
+        match reclaim_cause(&task, lease, now) {
+            Some(ReclaimCause::Silent { window, .. }) => {
+                assert_eq!(window, std::time::Duration::ZERO)
             }
-            .error(),
-        );
-        raise_after_a_deadline_cut(&mut reclaimed);
-        assert_eq!(
-            reclaimed.timeout_seconds, 6926,
-            "换了一条生产判词的路，判据不该跟着换"
-        );
+            other => panic!("停住要判成 Silent，实得 {other:?}"),
+        }
 
-        // 不是时限截断的失败，预算原样不动。
-        let mut plain = evolution_task("plain-failure");
-        plain.error = Some("upstream_unavailable: LLM upstream refused (rate_limited)".into());
-        raise_after_a_deadline_cut(&mut plain);
-        assert_eq!(plain.timeout_seconds, 300);
+        // 本进程没有它的信标：不判。跑它的不是这个进程，看不清就不猜。
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
+        assert_eq!(
+            reclaim_cause(&task, lease, now),
+            None,
+            "没有信标说的是「我看不见它」，不是「它死了」"
+        );
+        cog_core::progress::reset_for_tests();
+    }
+
+    /// 停住的判词不挂「重跑必然再失败」的标记。
+    ///
+    /// 那个标记的消费者会跳过重试。停住最经常的样子是一次会过去的停顿，重试
+    /// 正是要买的那件事；挂上它，第一批被停摆判死的活就再没有第二次机会。
+    #[test]
+    fn a_stall_is_not_declared_deterministic() {
+        let stall = ReclaimCause::Silent {
+            silent: std::time::Duration::from_secs(900),
+            window: std::time::Duration::from_secs(120),
+        };
+        let reason = stall.error();
+        assert!(
+            !cog_core::contract::outcome::is_deterministic_failure(&reason),
+            "{reason}"
+        );
+        assert!(reason.contains("900") && reason.contains("120"), "{reason}");
     }
 
     /// 被扣住的行要带名字，不能只报数。
@@ -6876,13 +6767,12 @@ mod tests {
         // 租约已经过期：判据只有 Running 才成立，而这一条两条证据都满足。
         let mut over = Task::new("t-over-budget", TaskType::DagNode, serde_json::json!({}));
         over.status = TaskStatus::Running;
-        over.timeout_seconds = 600;
         over.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1200));
         over.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
         let waiting = Task::new("t-waiting", TaskType::DagNode, serde_json::json!({}));
         assert!(
             reclaim_cause(&over, dag.task_lease, chrono::Utc::now()).is_some(),
-            "判据本身必须认定这一条过期：started_at 早于预算 {over:?}"
+            "判据本身必须认定这一条过期：租约到期时刻在过去 {over:?}"
         );
         backend.tasks.lock().await.extend([over, waiting]);
 
@@ -7209,80 +7099,98 @@ mod tests {
         assert_eq!(after.retry_count, spent, "回收不动任务的重试账");
     }
 
-    /// 持有者还活着却把整段预算跑满，证明的只是「声明的时限比这份活需要的短」。
-    /// 判据里没有一处读到进展，所以这条回收不能一上来就判死：同一个时限重跑一遍
-    /// 是同一个实验，那笔重试买到的是零。回队列，并抬着时限。
+    /// 持有者还活着，但这个尝试已经过了实测窗口没有动一步：收它，并记在任务
+    /// 自己的账上。
     ///
-    /// 实测 2026-11-08：当天 17 条 change_ledger 任务在 3600 秒处被回收，每条烧掉
-    /// 约 59 万 token、38 次工具调用，全都在第一次跑满时被判死。
+    /// 这是旧的那道预算墙唯一想做的事，只是它读错了东西——它比的是时钟，于是
+    /// 慢但在动的一轮与卡住的一轮对它同形。实测 2026-11-08：当天 17 条任务在
+    /// 3600 秒处被回收，每条烧掉约 59 万 token、38 次工具调用，全都是一次都没
+    /// 卡过的活。
     #[tokio::test]
-    async fn an_over_budget_task_gets_more_time_before_it_is_judged() {
-        let dag = DagExecutor::new("ws-budget".into()).with_task_lease_secs(60);
-        let task = Task::new("t-budget", TaskType::DagNode, serde_json::json!({}));
+    async fn a_stalled_attempt_is_reclaimed_and_charged_to_the_task() {
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        let dag = DagExecutor::new("ws-stall".into()).with_task_lease_secs(60);
+        let task = Task::new("t-stall", TaskType::DagNode, serde_json::json!({}));
         dag.add_task(task).await.unwrap();
-        dag.schedule_task("t-budget").await.unwrap();
-        dag.start_task("t-budget").await.unwrap();
+        dag.schedule_task("t-stall").await.unwrap();
+        dag.start_task("t-stall").await.unwrap();
 
         {
             let mut inner = dag.inner.write().await;
-            let t = inner.tasks.get_mut("t-budget").unwrap();
-            // 租约刚续过（持有者还活着），但 started_at 已经超出预算。
+            let t = inner.tasks.get_mut("t-stall").unwrap();
+            // 租约刚续过：持有者还在，所以这一条只能由停摆判出来。
             t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
-            t.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3601));
-            t.timeout_seconds = 3600;
+            // 跑了九个小时也一样判据无关：这条判据不看它。
+            t.started_at = Some(chrono::Utc::now() - chrono::Duration::hours(9));
         }
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
+        cog_core::progress::beat("t-stall");
 
         let results = dag.check_timeouts().await;
-        assert_eq!(results.len(), 1);
-        assert!(results[0].1, "封顶之前跑满预算不是终态，回队列");
-
-        let view = dag.get_task("t-budget").await.unwrap();
-        assert_eq!(view.status, TaskStatus::Pending);
-        assert_eq!(
-            view.timeout_seconds, 7200,
-            "下一轮的时限必须比跑满的那个多：同一个时限重跑是同一个实验"
-        );
-        let reason = view.error.expect("a failure reason");
-        assert!(
-            cog_core::contract::outcome::declares(
-                &reason,
-                cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX
-            ),
-            "{reason}"
-        );
+        assert_eq!(results.len(), 1, "过窗口没动一步就该收");
+        let view = dag.get_task("t-stall").await.unwrap();
+        let reason = view.error.clone().expect("a failure reason");
+        assert!(reason.contains("stopped moving"), "{reason}");
+        assert_eq!(view.retry_count, 1, "停住记在任务自己的账上");
+        cog_core::progress::reset_for_tests();
     }
 
-    /// 到了封顶还在跑满的，缺的不是时间。这一档才轮到「同一份输入重跑买不到
-    /// 不同的结果」——否则每一条跑不进时限的任务都会在封顶上无限重跑。
+    /// 本进程没有它的信标就不判：那些任务由别的进程驱动，这里的「看不见」不是
+    /// 「它死了」。折成停住，第一次扫描就会把整类执行器收掉。
     #[tokio::test]
-    async fn an_over_budget_task_at_the_ceiling_is_a_deterministic_failure() {
-        let dag = DagExecutor::new("ws-budget-ceiling".into()).with_task_lease_secs(60);
-        let task = Task::new("t-ceiling", TaskType::DagNode, serde_json::json!({}));
+    async fn a_task_this_process_cannot_see_is_not_reclaimed_as_stalled() {
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        let dag = DagExecutor::new("ws-unseen".into()).with_task_lease_secs(600);
+        let task = Task::new("t-unseen", TaskType::DagNode, serde_json::json!({}));
         dag.add_task(task).await.unwrap();
-        dag.schedule_task("t-ceiling").await.unwrap();
-        dag.start_task("t-ceiling").await.unwrap();
-
+        dag.schedule_task("t-unseen").await.unwrap();
+        dag.start_task("t-unseen").await.unwrap();
         {
             let mut inner = dag.inner.write().await;
-            let t = inner.tasks.get_mut("t-ceiling").unwrap();
-            t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
-            t.started_at = Some(
-                chrono::Utc::now() - chrono::Duration::seconds(MAX_ATTEMPT_BUDGET_SECS as i64 + 1),
-            );
-            t.timeout_seconds = MAX_ATTEMPT_BUDGET_SECS;
+            let t = inner.tasks.get_mut("t-unseen").unwrap();
+            t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(600));
+            t.started_at = Some(chrono::Utc::now() - chrono::Duration::hours(9));
         }
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
 
-        let results = dag.check_timeouts().await;
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].1, "封顶之上不能再回队列，否则就是无限重跑");
+        assert!(
+            dag.check_timeouts().await.is_empty(),
+            "没有信标 = 看不见 = 不猜"
+        );
+        cog_core::progress::reset_for_tests();
+    }
 
-        let view = dag.get_task("t-ceiling").await.unwrap();
-        assert_eq!(view.status, TaskStatus::Failed);
-        assert_eq!(view.retry_count, 0, "确定性失败不花预算");
-        let reason = view.error.expect("a failure reason");
-        assert!(cog_core::contract::outcome::is_deterministic_failure(
-            &reason
-        ));
+    /// 新一轮不继承上一轮的信标。
+    ///
+    /// 信标是进程内的，任务行却是跨轮次的：同一个 id 重跑时，上一轮留下的那个
+    /// 只要还在，开始时读起来就是「很久没动」，而守护的第一次轮询早于第一步的
+    /// 第一拍——这条判据会在一个全新的尝试上判出停住，并把它记在任务账上。
+    #[tokio::test]
+    async fn a_restarted_attempt_does_not_inherit_the_previous_attempts_silence() {
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        let dag = DagExecutor::new("ws-restart".into()).with_task_lease_secs(600);
+        dag.add_task(Task::new(
+            "t-restart",
+            TaskType::DagNode,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        // 上一轮动过，之后这个尝试就结束了；信标没有人清。
+        cog_core::progress::beat("t-restart");
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
+
+        dag.schedule_task("t-restart").await.unwrap();
+        dag.start_task("t-restart").await.unwrap();
+
+        assert!(
+            cog_core::progress::stall("t-restart").is_none(),
+            "新一轮的第一拍之前没有证据说它停住了，上一轮的信标不构成证据"
+        );
+        cog_core::progress::reset_for_tests();
     }
 
     /// 部署前起的任务行里没有租约字段。没有租约就没有"到期时刻"，但 started_at

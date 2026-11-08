@@ -552,19 +552,19 @@ struct Filing<'a> {
     timeout_secs: u64,
 }
 
-/// How long a filed row may stay open before the graph fails it, unless the
-/// caller says otherwise.
+/// What a filed row declares it will take, unless the caller says otherwise.
 ///
-/// The executor default is five minutes, which fits a dispatched unit of work
-/// and not this one: an out-of-band worker holds its row across many
-/// heartbeats, and the over-budget rule reads the age of the row rather than
-/// the liveness of its holder -- so the default would fail work whose owner
-/// was demonstrably alive at the time. Liveness is the lease's question, and
-/// the heartbeat answers it; this budget answers "how long may this stay
-/// open at all", and a week is longer than a unit of work is meant to take.
-// cap: bound — a week is the outer edge of "a unit of work", chosen so a live
-// holder is never failed by the default; how long real rows actually stay open
-// is the lease's reading, not this number's.
+/// Nothing enforces this: the graph no longer fails a row because it has been
+/// open too long, and the executor no longer cancels a run at a budget. What
+/// decides that a held row has stopped is whether its holder is still stepping,
+/// read from the measured inter-step window, and what decides that it has been
+/// abandoned is the lease. So this number is a declaration carried on the row
+/// for readers, not a deadline — which is why it can be generous without
+/// costing anything, and why a stricter value would not make a stuck row end
+/// any sooner.
+// cap: bound — a week is the outer edge of "a unit of work", and the number is
+// read by people and dashboards rather than enforced; how long real rows stay
+// open is the lease's reading, not this number's.
 const UNIT_WORK_BUDGET_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// How long one filing request may take. The door answers as soon as it has

@@ -545,6 +545,26 @@ pub enum TaskEvent {
         timeout_seconds: u64,
         timestamp: DateTime<Utc>,
     },
+    /// A running attempt stopped doing anything: no step for longer than this
+    /// deployment's measured inter-step window.
+    ///
+    /// Distinct from [`Self::TaskTimeout`] even though both end a run: a
+    /// timeout says the run spent a declared allowance, which is a statement
+    /// about the allowance; this says the run moved zero steps for a window
+    /// measured from what the fleet actually does, which is a statement about
+    /// the run. A reader given `TaskTimeout` for a stall would conclude the
+    /// declared budget was too small and raise it — the change that never
+    /// helped, because the budget was never what the stuck run exhausted.
+    ///
+    /// Both numbers travel: `silent_secs` alone cannot be judged without the
+    /// window it was compared against, since the same silence is normal on a
+    /// slow deployment and alarming on a fast one.
+    TaskStalled {
+        task_id: String,
+        silent_secs: u64,
+        window_secs: u64,
+        timestamp: DateTime<Utc>,
+    },
     /// A running task stopped being renewed by whoever held it. Distinct from
     /// [`Self::TaskTimeout`] because the two say opposite things to a reader:
     /// a timeout is a run that spent its whole budget, while this is a run

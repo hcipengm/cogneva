@@ -18,6 +18,7 @@ pub mod host;
 pub mod loop_health;
 pub mod observability_text;
 pub mod paths;
+pub mod progress;
 pub mod reading_cadence;
 pub mod retention;
 pub mod roles;

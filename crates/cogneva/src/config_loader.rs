@@ -157,10 +157,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "dag_executor.result_claim_batch".into(),
     );
     m.insert(
-        "COGNEVA_DAG_SELF_EVOLUTION_TIMEOUT_SECS".into(),
-        "dag_executor.self_evolution_timeout_secs".into(),
-    );
-    m.insert(
         "COGNEVA_DAG_TASK_LEASE_SECS".into(),
         "dag_executor.task_lease_secs".into(),
     );

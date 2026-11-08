@@ -232,10 +232,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             .with_task_executor(exec_loop_arc.clone())
             .with_dag_executor(shared_orchestrator.clone())
             .with_plan_store(state_backend.clone(), plan_workspace_id.clone())
-            .with_decomposition_max_attempts(decomposition_max_attempts)
-            .with_self_evolution_timeout_secs(
-                ctx.config().dag_executor.self_evolution_timeout_secs,
-            );
+            .with_decomposition_max_attempts(decomposition_max_attempts);
 
         if let Some(vb) = ctx.consume_service::<dyn cog_core::VectorBackend>() {
             info!("VectorBackend connected for pattern-db hybrid retrieval");

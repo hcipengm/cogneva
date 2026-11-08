@@ -107,8 +107,9 @@ const REVISITED: &[Revisited] = &[
         called_from: "crates/cog-gateway/src/executor.rs",
         reason: "waits for its owner to finish or to renew the lease; the sweep takes a task \
                  out of this state when its lease expired — back in line without charging an \
-                 attempt, because a replaced owner is not the task's doing — or when the task \
-                 ran its whole budget, which is judged on what the task itself spent",
+                 attempt, because a replaced owner is not the task's doing — or when the attempt \
+                 stopped moving, judged on the measured inter-step window rather than on elapsed \
+                 time, and charged to the task because a stall is this attempt's own doing",
     },
 ];
 

@@ -335,6 +335,18 @@ impl Observable for StreamPendingObservable {
 /// but it is the same number on each of them.
 pub const TASK_ROUTER_CLAIM_SLOTS_METRIC: &str = "cogneva_task_router_claim_slots";
 
+/// 停摆判据用的那个窗口，以及撑起它的样本数。
+///
+/// 两条读数缺一不可。窗口本身是判「一个尝试停住了没有」的唯一尺度；样本数是
+/// 判「这个窗口是不是一个读数」的唯一证据——没有前者那一族，停摆判据在读数面上
+/// 根本不存在；没有后者，窗口停在 `None` 时没人分得出「这份部署还没跑够步数去
+/// 量」与「判据没人接上」，而两种情况的后果一样：一条真卡死的活永远不被收。
+///
+/// 窗口在量出来之前**不发这一条**，不发 0：0 秒是一个合法的窗口（任何静默都
+/// 超过它），发出去就是一条会立刻触发告警的假读数。
+pub const STALL_WINDOW_SECONDS_METRIC: &str = "cogneva_stall_window_seconds";
+pub const STALL_GAP_SAMPLES_METRIC: &str = "cogneva_stall_gap_samples";
+
 /// `cogneva_task_router_claim_slots` 上那个 `source` 标签的两个取值。
 ///
 /// 同一个数有两种来路：一条读数每窗算出来的界，和部署钉死的一个数。没有这个
@@ -398,11 +410,15 @@ pub struct ClaimHold {
 }
 
 impl ClaimHold {
-    /// Record the execution contract of the task running on this permit. Called
-    /// once the payload parsed into a task whose timeout is known; a permit held
-    /// by a payload that never parsed carries no bound, because there is no
-    /// work it could be running.
-    pub fn note_timeout(&self, seconds: u64) {
+    /// Record how long this deployment's attempts are allowed to stay quiet
+    /// while still counting as working.
+    ///
+    /// Fed from the measured inter-beat window, not from a declared budget: the
+    /// question a waiting loop has is "is the permit stuck", and a declared
+    /// budget answered it only because the platform killed runs at that budget.
+    /// With the kill gone, the only bound left that means anything is the one
+    /// the fleet's own step cadence produces.
+    pub fn note_stall_window(&self, seconds: u64) {
         self.observable
             .set_timeout(&self.stream, self.token, seconds);
     }
@@ -437,8 +453,8 @@ impl ClaimStreamState {
     ///
     /// This is the per-stream half of the answer; what gets published is the
     /// budget's, see [`budget_bound_seconds`].
-    fn hold_bound_seconds(&self) -> u64 {
-        self.held.values().copied().max().unwrap_or(0)
+    fn hold_bound_seconds(&self) -> Option<u64> {
+        self.held.values().copied().max()
     }
 }
 
@@ -452,13 +468,12 @@ impl ClaimStreamState {
 fn budget_bound_seconds(
     streams: &HashMap<String, ClaimStreamState>,
     semaphore: &Arc<tokio::sync::Semaphore>,
-) -> u64 {
+) -> Option<u64> {
     streams
         .values()
         .filter(|state| Arc::ptr_eq(&state.semaphore, semaphore))
-        .map(ClaimStreamState::hold_bound_seconds)
+        .filter_map(ClaimStreamState::hold_bound_seconds)
         .max()
-        .unwrap_or(0)
 }
 
 /// The permits, and what is holding them, as this process sees them.
@@ -590,6 +605,19 @@ impl Observable for ClaimSlotsObservable {
                     .with_label(crate::LABEL_STREAM, stream.as_str())
                     .with_label(CLAIM_SLOTS_SOURCE_LABEL, state.source),
             );
+            out.push(
+                RawMetric::new(
+                    STALL_GAP_SAMPLES_METRIC,
+                    cog_core::progress::gap_sample_count() as f64,
+                )
+                .with_label(crate::LABEL_STREAM, stream.as_str()),
+            );
+            if let Some(window) = cog_core::progress::silence_window() {
+                out.push(
+                    RawMetric::new(STALL_WINDOW_SECONDS_METRIC, window.as_secs_f64())
+                        .with_label(crate::LABEL_STREAM, stream.as_str()),
+                );
+            }
             for (name, value) in [
                 (TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC, state.in_flight() as f64),
                 (
@@ -599,13 +627,18 @@ impl Observable for ClaimSlotsObservable {
                         .map(|since| since.elapsed().as_secs_f64())
                         .unwrap_or(0.0),
                 ),
-                (
-                    TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
-                    budget_bound_seconds(&streams, &state.semaphore) as f64,
-                ),
             ] {
                 out.push(
                     RawMetric::new(name, value).with_label(crate::LABEL_STREAM, stream.as_str()),
+                );
+            }
+            // 量不到就不发这一条，不发 0：这份部署还没跑够步数、窗口没量出来
+            // 时，判这条腿的读者该看到「没有读数」，而不是一个会立刻触发告警
+            // 的零。「量不到」与「量到就是这个值」在读数面上必须是两个形状。
+            if let Some(bound) = budget_bound_seconds(&streams, &state.semaphore) {
+                out.push(
+                    RawMetric::new(TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC, bound as f64)
+                        .with_label(crate::LABEL_STREAM, stream.as_str()),
                 );
             }
         }
@@ -1432,17 +1465,15 @@ mod tests {
                 .value,
             1.0
         );
-        // Nothing parsed into a task yet, so no execution bound is stated. Zero
-        // here is "nothing to compare against", which is what keeps the rule
-        // from reading an invented wall.
-        assert_eq!(
-            metric(&held, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC)
-                .unwrap()
-                .value,
-            0.0
+        // Nothing stated a bound yet, so the series is absent rather than zero:
+        // "not measured" and "measured at zero" must not be the same reading —
+        // a zero would trip the stall rule for every waiting loop.
+        assert!(
+            metric(&held, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC).is_none(),
+            "没有量出窗口时不许发一个 0"
         );
 
-        hold.note_timeout(300);
+        hold.note_stall_window(300);
         let bounded = observer.collect_metrics("D8").await.unwrap();
         assert_eq!(
             metric(&bounded, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC)
@@ -1488,7 +1519,7 @@ mod tests {
         // loop blocks on the semaphore.
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let hold = observer.permit_taken(STREAM);
-        hold.note_timeout(600);
+        hold.note_stall_window(600);
         observer.wait_started(STREAM);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -1563,10 +1594,10 @@ mod tests {
 
         let permit = budget.clone().acquire_owned().await.unwrap();
         let running = observer.permit_taken(STREAM);
-        running.note_timeout(3600);
+        running.note_stall_window(3600);
         let other_permit = elsewhere.clone().acquire_owned().await.unwrap();
         let other = observer.permit_taken("another-budget");
-        other.note_timeout(60);
+        other.note_stall_window(60);
         observer.wait_started("waiting-on-the-same-budget");
 
         let read = observer.collect_metrics("D8").await.unwrap();

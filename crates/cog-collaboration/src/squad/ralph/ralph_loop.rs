@@ -614,6 +614,12 @@ impl RalphLoop {
 
         // 与 Pipeline/Roundtable 同构：预算属于本次执行，历史只提供反馈与停滞证据。
         for iteration in 1..=self.config.max_iterations {
+            // 开一轮就是「还在动」的证据：轮与轮之间可能有很长一段不是 agent
+            // 在跑（归档、判词、写库），没有这个心跳，编排侧会把一段正常的长
+            // 处理判成停住。判据只管「多久没动」，不管「一共动了多久」。
+            if let Some(task_id) = self.task_id.as_deref() {
+                cog_core::progress::beat(task_id);
+            }
             // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
             // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
             // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
@@ -824,6 +830,12 @@ impl RalphLoop {
         // 起算点跟着历史走曾让预算变成目标的终身配额——攒满之后每次重驱
         // 都瞬间"耗尽"且一轮都不跑，连已经能通过的目标也被永久判死。
         for iteration in 1..=self.config.max_iterations {
+            // 开一轮就是「还在动」的证据：轮与轮之间可能有很长一段不是 agent
+            // 在跑（归档、判词、写库），没有这个心跳，编排侧会把一段正常的长
+            // 处理判成停住。判据只管「多久没动」，不管「一共动了多久」。
+            if let Some(task_id) = self.task_id.as_deref() {
+                cog_core::progress::beat(task_id);
+            }
             // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
             // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
             // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
@@ -957,6 +969,12 @@ impl RalphLoop {
 
         // 与 Pipeline 同构：预算属于本次执行，历史只提供反馈与停滞证据。
         for iteration in 1..=self.config.max_iterations {
+            // 开一轮就是「还在动」的证据：轮与轮之间可能有很长一段不是 agent
+            // 在跑（归档、判词、写库），没有这个心跳，编排侧会把一段正常的长
+            // 处理判成停住。判据只管「多久没动」，不管「一共动了多久」。
+            if let Some(task_id) = self.task_id.as_deref() {
+                cog_core::progress::beat(task_id);
+            }
             // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
             // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
             // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
@@ -1348,11 +1366,12 @@ fn pace_sleep_secs(reason: &str) -> Option<u64> {
 /// 执行的任务同形，而它其实什么都做不了。
 ///
 /// 实测（2026-10-18）：窗口额度为零，拒绝自报 `retry_after_secs=35307`（9.8 小时），
-/// 任务的 `timeout_seconds` 是 3600——这个睡眠永远等不到它要等的时刻，只把一个
-/// 执行槽按满整个时限，四条这样的任务就把 `CLAIM_CONCURRENCY=4` 全部占住，
-/// 整条 ready 流投递停摆。所以超过上限的等待交回调度面：错误文本里带着拒绝自报
-/// 的时长，`the_environment_pays` 凭它回投而不记重试，任务停在队里等那个时刻，
-/// 槽立刻还给下一条。
+/// 这个睡眠等不到它要等的时刻，只把一个执行槽按满，四条这样的任务就把
+/// `CLAIM_CONCURRENCY=4` 全部占住，整条 ready 流投递停摆。执行侧不再按时钟截断
+/// 之后这一点更要紧：以前占住槽的那一轮迟早会被一道时限收走，现在它只会一直睡
+/// 到窗口回来。所以超过上限的等待交回调度面：错误文本里带着拒绝自报的时长，
+/// `the_environment_pays` 凭它回投而不记重试，任务停在队里等那个时刻，槽立刻
+/// 还给下一条。
 ///
 /// 已知的读数代价：交回的那一轮在 ralph 面上仍记一次 `Unrecoverable` 终止
 /// （`record_ralph_termination` 带的是 `classify` 出来的 `upstream_unavailable`，
@@ -1505,7 +1524,7 @@ mod tests {
         // 边界之上交回调度面——错误文本里带着自报时长，环境付账、不记重试。
         assert!(!pace_sleeps_in_place(PACED_SLEEP_MAX_SECS + 1));
         // 真实读数：窗口额度为零时拒绝自报 35307 秒，被钳到 21600 秒，
-        // 而任务的 timeout_seconds 是 3600——就地睡永远等不到，只占槽。
+        // 就地睡永远等不到那个时刻，只占槽。
         assert!(!pace_sleeps_in_place(21_600));
     }
 

@@ -209,6 +209,25 @@ struct ClaimBudget {
     source: &'static str,
 }
 
+/// 守护多久问一次「它还在动吗」。
+///
+/// 由窗口导出，不另定一个数：窗口已经是这份部署量出来的步间隔尺度，检查的拍子
+/// 没有第二个独立理由。四分之一是让最晚发现时间落在一个窗口之内。
+///
+/// 窗口还没量出来时用 [`STALL_POLL_FLOOR`]：那时判据一律返回 `None`（没有可比的
+/// 尺度就不判），这一拍只决定空转的代价。
+fn stall_poll_interval() -> Duration {
+    cog_core::progress::silence_window()
+        .map(|w| (w / 4).max(STALL_POLL_FLOOR))
+        .unwrap_or(STALL_POLL_FLOOR)
+}
+
+/// 守护空转的下限。
+// cap: override — 这是 CPU 代价的下限不是判据：没有窗口时每拍只醒一次判据，
+// 而判据那时恒为 `None`；再密也只是把一次 `select!` 换成两次。窗口有了之后
+// 拍子由窗口导出，这个数就不再是主力。
+const STALL_POLL_FLOOR: Duration = Duration::from_secs(1);
+
 /// Dispatcher that routes ready tasks to the first [`TaskExecutor`] whose
 /// [`TaskExecutor::supports`] returns `true`.
 /// Decouples the orchestrator from concrete execution crates
@@ -245,6 +264,33 @@ impl TaskExecutorRouter {
     /// Find a matching executor and run the task.
     /// Returns [`SFError::Agent`] when no registered executor claims the task
     /// type.
+    /// Run a task, giving up only when it stops moving.
+    ///
+    /// 执行不再按时钟截断：慢但一直在动的一轮买到的是产出，砍掉它就是把那一轮
+    /// 的钱扔掉。取消 future 这一步仍然必须在这里——编排侧的回收改的是行上的
+    /// 状态，取消不了这个 future，于是唯一的旧后果仍然成立：一个卡死的 agent
+    /// 会无限期占住串行消费位置（实测 90+ 分钟不返回，后续就绪消息全部队头
+    /// 阻塞）。
+    ///
+    /// 判据与编排侧的回收是同一条读数（[`cog_core::progress::stall`]）：两份
+    /// 判据只要各写一份，就会有一天一边判停住、另一边继续等，而那正是「这条活
+    /// 到底还在不在跑」没人答得上来的状态。等待的长度只决定判据最晚多久被读到
+    /// 一次，不参与判定。
+    async fn execute_watching_for_stalls(&self, task: &Task) -> SFResult<TaskResult> {
+        let mut run = std::pin::pin!(self.execute(task));
+        loop {
+            tokio::select! {
+                result = &mut run => return result,
+                _ = tokio::time::sleep(stall_poll_interval()) => {}
+            }
+            if let Some((silent, window)) = cog_core::progress::stall(&task.id) {
+                return Err(SFError::Agent(
+                    crate::dag_executor::orchestrator::stall_reason(silent, window),
+                ));
+            }
+        }
+    }
+
     pub async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
         let executor = self
             .executors
@@ -746,7 +792,7 @@ impl TaskExecutorRouter {
         bytes: &[u8],
         hold: &crate::observable::ClaimHold,
     ) {
-        let mut task: Task = match serde_json::from_slice(bytes) {
+        let task: Task = match serde_json::from_slice(bytes) {
             Ok(t) => t,
             Err(e) => {
                 // 毒消息永远不会反序列化成功，不 ack 会被清扫器每 10 分钟
@@ -885,34 +931,14 @@ impl TaskExecutorRouter {
             }
         }
 
-        // 这一轮要用的时限以行上那一格为准：开始之前它可能刚被抬过——上一次
-        // 被自己的时限截断，行上的预算因此翻倍（判据与抬法在编排侧那一处）。
-        // 手里这份是从就绪消息里反序列化来的，落在抬高之前；照它跑就是在旧的
-        // 时限上再截断一次，而回改那一轮预算的读者是行——两边必须读同一个数。
-        if let Some(ref orch) = self.orchestrator {
-            if let Some(fresh) = orch.get_task(&task.id).await {
-                task.timeout_seconds = fresh.timeout_seconds;
-            }
+        // 许可的持有上界随之公布：等待许可的读循环要有东西可比，才分得出「在
+        // 等一份正在推进的活」与「没有人能把这个许可放出来」。这个上界是这份
+        // 部署实测的步间隔窗口，不是声明的时间预算——换成时钟就是把已经删掉的
+        // 那道墙换个地方再立一次。
+        if let Some(window) = cog_core::progress::silence_window() {
+            hold.note_stall_window(window.as_secs().max(1));
         }
-
-        // timeout_seconds 是任务自带的执行契约。编排侧的超时检查器只会把
-        // Running 任务标记失败/重试，并不取消这里的执行 future；不在此兑
-        // 现，失控的 agent 任务会无限期占住串行消费位置（实测 90+ 分钟不
-        // 返回，后续 ready 消息全部队头阻塞）。超时按执行失败处理，结果
-        // 走既有发布路径，重试/DLQ 由 DAG 侧决定。
-        let timeout = Duration::from_secs(task.timeout_seconds.max(1));
-        // 许可的持有上界随之公布：等待许可的读循环只有超过在途任务自己声明的
-        // 执行时长，才说明「没有人能把它放出来」；没有这一条，安静读循环只能
-        // 靠猜。
-        hold.note_timeout(task.timeout_seconds.max(1));
-        let result = match tokio::time::timeout(timeout, self.execute(&task)).await {
-            Ok(result) => result,
-            Err(_) => Err(SFError::Agent(format!(
-                "{}{} seconds",
-                crate::dag_executor::orchestrator::DEADLINE_CUT_PREFIX,
-                task.timeout_seconds
-            ))),
-        };
+        let result = self.execute_watching_for_stalls(&task).await;
 
         let payload = match result {
             Ok(r) => {
@@ -1255,10 +1281,57 @@ mod ready_pipeline_tests {
         })
     }
 
+    /// 慢而一直在动的执行不按时钟截断。
+    ///
+    /// 这条腿就是旧墙的反面：旧判据在声明的秒数到点的那一瞬砍掉 future，
+    /// 而当时的现场（90+ 分钟不返回）恰恰证明它不是「卡住了」，只是「很久」。
+    /// 现在没有任何判据读已经跑了多久，所以一条睡够它自己那段时长的执行必须
+    /// 正常跑完、正常发结果。
     #[tokio::test]
-    async fn execution_is_cancelled_at_task_timeout() {
-        // 回归：execute future 不受 timeout_seconds 约束，失控 agent 任务能
-        // 占住串行消费位置 90+ 分钟，后续消息全部队头阻塞。
+    async fn a_slow_run_that_is_still_working_is_not_cut() {
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(SlowExecutor {
+                sleep_secs: 2,
+                panic_instead: false,
+            }))
+            .await;
+
+        let mut task = test_task(1);
+        task.id = "t-slow-but-working".into();
+        let started = std::time::Instant::now();
+        router
+            .process_ready_message(
+                &pipe,
+                "m1".into(),
+                &serde_json::to_vec(&task).unwrap(),
+                &test_hold(),
+            )
+            .await;
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "它本来就该跑满两秒：{:?}",
+            started.elapsed()
+        );
+
+        let published = backend.published.lock().await;
+        assert_eq!(published.len(), 1);
+        match serde_json::from_slice::<DagMessage>(&published[0].1).unwrap() {
+            DagMessage::TaskComplete { .. } => {}
+            other => panic!("跑了很久但一直在动的执行必须正常收尾，实得 {other:?}"),
+        }
+    }
+
+    /// 一个真正停住的执行要被取消，判据是「过了实测窗口没有动一步」。
+    ///
+    /// 取消这一步必须在这里：编排侧的回收改的是行上的状态，取消不了这个
+    /// future，于是不在这里收，卡死的执行会一直占着串行消费位置，后续就绪
+    /// 消息全部队头阻塞——旧墙留下的唯一后果仍然成立，只是判据换了。
+    #[tokio::test]
+    async fn a_run_that_stopped_moving_is_cancelled() {
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
         let backend = Arc::new(ScriptedBackend::default());
         let pipe = test_pipe(backend.clone());
         let router = TaskExecutorRouter::new()
@@ -1268,33 +1341,37 @@ mod ready_pipeline_tests {
             }))
             .await;
 
+        let mut task = test_task(3600);
+        task.id = "t-stopped-moving".into();
+        // 窗口量成零：任何一点静默都超过它。这个执行器一次心跳都不打，所以
+        // 它从第一拍起就被判成停住。
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
+        cog_core::progress::beat(&task.id);
+
         let started = std::time::Instant::now();
         router
             .process_ready_message(
                 &pipe,
                 "m1".into(),
-                &serde_json::to_vec(&test_task(1)).unwrap(),
+                &serde_json::to_vec(&task).unwrap(),
                 &test_hold(),
             )
             .await;
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "execution was not cancelled at the declared timeout: {:?}",
+            "停住的执行没被取消：{:?}",
             started.elapsed()
         );
 
         let published = backend.published.lock().await;
-        assert_eq!(published.len(), 1, "timeout must still publish a result");
-        let msg: DagMessage = serde_json::from_slice(&published[0].1).unwrap();
-        match msg {
+        assert_eq!(published.len(), 1, "取消也要发出一条结果");
+        match serde_json::from_slice::<DagMessage>(&published[0].1).unwrap() {
             DagMessage::TaskFailed { error, .. } => {
-                assert!(error.contains("timed out after 1 seconds"), "{error}");
+                assert!(error.contains("stopped moving"), "{error}");
             }
-            other => panic!("expected TaskFailed on timeout, got {other:?}"),
+            other => panic!("expected TaskFailed on a stall, got {other:?}"),
         }
-        let acks = backend.acks.lock().await;
-        assert_eq!(acks.len(), 1);
-        assert_eq!(acks[0].2, vec!["m1".to_string()]);
+        cog_core::progress::reset_for_tests();
     }
 
     /// 上游的失败类型与它明说的等待都要过总线：算出重试时刻的是消费这条消息
@@ -1642,9 +1719,9 @@ mod ready_pipeline_tests {
     #[tokio::test]
     async fn slow_task_does_not_block_ready_stream() {
         // 回归：主订阅循环串行 await 处理，一条长任务执行期间不发
-        // XREADGROUP，后续消息全部队头阻塞（实测 timeout 1800s 的任务把
-        // 读取位占住约 30 分钟，lag 无法消化）。派发改为 spawn 后，第二条
-        // 消息必须与第一条并发执行，两者都在各自 1s timeout 后完成。
+        // XREADGROUP，后续消息全部队头阻塞（实测一条长任务把读取位占住约
+        // 30 分钟，lag 无法消化）。派发改为 spawn 后，第二条消息必须与第一条
+        // 并发执行——两条都在跑满各自那两秒之后完成，而不是被一道时限提前收走。
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mk_task = |id: &str| {
@@ -1659,7 +1736,7 @@ mod ready_pipeline_tests {
         let router = Arc::new(
             TaskExecutorRouter::new()
                 .with_executor(Arc::new(ConcurrencyExecutor {
-                    sleep_secs: 10,
+                    sleep_secs: 2,
                     active: active.clone(),
                     max_active: max_active.clone(),
                 }))

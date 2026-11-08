@@ -1592,6 +1592,14 @@ impl AgentRuntime {
         // Set before the first call and cleared at the only exit, so a run that
         // was started without an identity cannot inherit the previous one.
         self.run_task_id = run_task_id.map(str::to_string);
+        // 新的一次尝试从「刚刚动过」开始，而不是从上一轮留下的时刻开始。上一轮
+        // 的读数如果留着，重试的第一拍就会被判成停住——判据本身没错，它读到的
+        // 是另一个尝试的时刻。第一次心跳不产生间隔样本（没有前驱），所以这里
+        // 不会污染窗口。
+        let owner = self.config.owner_task_id.as_deref();
+        for task_id in [owner, run_task_id].into_iter().flatten() {
+            cog_core::progress::beat(task_id);
+        }
         std::time::Instant::now()
     }
 
@@ -2008,6 +2016,20 @@ impl AgentRuntime {
 
         for iteration in 0..self.config.max_iterations {
             tracing::info!(agent_id = %self.config.agent_id, iteration, "AgentRuntime::run iteration start");
+            // 这一步做完了就是「这一轮还在动」的证据。编排侧的回收与执行路由的
+            // 守护都读它，而且都只读它：没有任何一条判据看这次运行已经花了多久，
+            // 所以一个慢而一直在产出的轮次不会被砍，一个停住的不用等到某个声明的
+            // 时限过期。
+            //
+            // 两个 id 都打：回收查的是 DAG 行上那个 id，而账本按 `owner_task_id`
+            // 归属、运行自己按 `run_task_id` 归档，两者在替父任务干活的 agent 上
+            // 不是同一个值。只打一个时，另一个 id 下的活永远查不到心跳——判据不会
+            // 报错，只会永远判不出停住，而那与「它一直很健康」是同一个读数。
+            let owner = self.config.owner_task_id.as_deref();
+            let run = self.run_task_id.as_deref();
+            for task_id in [owner, run].into_iter().flatten() {
+                cog_core::progress::beat(task_id);
+            }
             self.run_iterations = iteration + 1;
             // --- Turn Start ---
             self.emit_event(AgentEvent::TurnStart {
