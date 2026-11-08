@@ -299,5 +299,43 @@ env PATH="$TMP/bin:$PATH" OUT_MARK="$TMP/seen" POOL_WATCH_SCRIPT="$TMP/fake-watc
 sleep 0.3
 [ ! -s "$TMP/seen" ] && ok "已有一条采样循环在跑 ⇒ 不再起第二条" || bad "重复起采样循环：seen=$(cat "$TMP/seen")"
 
+# 开关键：关着的时候一轮都不起。
+#
+# 这一格要的是**负方向**，而负方向最容易写成永远为真——一个根本没跑起来的值守也「没有
+# 起过一轮」。所以正反两跑用同一份夹具，只差标记文件在不在：正跑必须先证明这一份夹具
+# 在不关的时候真能起出一轮，否则「关着没起」这一格证明不了任何事。
+mkdir -p "$TMP/repo/scripts/eval"
+cat >"$TMP/repo/scripts/eval/eval-registered-rerun.sh" <<'EOF'
+#!/bin/bash
+echo ran >>"$LOOP_MARK"
+EOF
+printf '{"kind":"header"}\n' >"$TMP/short-ck.jsonl"
+printf '2026-11-08T00:00:00Z judged=0 llm_pool_available=1 llm_pool_next_attempt_unix=1\n' >"$TMP/switch-pool.log"
+# 「有没有循环在跑」由 pgrep 桩钉死：宿主上真有一条循环在跑时（2026-11-08 实测就有一条
+# 手工杀剩的）值守会正确地判「在跑」而不起一轮，那会把这一组断言整组判成「夹具坏了」。
+# 桩只说这一件事，别的进程表照旧读真的。
+mkdir -p "$TMP/bin-idle"
+printf '#!/bin/sh\nexit 1\n' >"$TMP/bin-idle/pgrep"; chmod +x "$TMP/bin-idle/pgrep"
+run_supervisor() { # 其余 = 环境；只跑一趟（horizon=5，超时兜住那个 sleep 60）
+  env PATH="$TMP/bin-idle:$PATH" \
+      REPO="$TMP/repo" CKPT="$TMP/short-ck.jsonl" LOG="$TMP/switch.log" OUT="$TMP/switch.out" \
+      POOL_LOG="$TMP/switch-pool.log" POOL_WATCH_SCRIPT="$TMP/fake-watch.sh" \
+      POOL_WATCH_LOG="$TMP/switch-w.log" OUT_MARK="$TMP/switch-seen" \
+      LOOP_MARK="$TMP/loop-ran" "$@" timeout 20 bash "$SCRIPT" 5 >/dev/null 2>&1
+}
+rm -f "$TMP/loop-ran" "$TMP/paused"
+run_supervisor PAUSE_FLAG="$TMP/paused"
+[ -s "$TMP/loop-ran" ] && ok "不关的时候值守真能起出一轮（负方向那一格的前提）" \
+  || bad "不关的时候也没起出一轮：整组开关断言都不成立，先查这一份夹具"
+
+rm -f "$TMP/loop-ran" "$TMP/switch.log"
+printf 'off at 2026-11-08T00:00:00Z\nreason: 各方面没有理顺\n' >"$TMP/paused"
+run_supervisor PAUSE_FLAG="$TMP/paused"
+[ ! -s "$TMP/loop-ran" ] && ok "开关关着 ⇒ 一轮都不起" \
+  || bad "开关关着还起了一轮（关闸之后仍在花钱）"
+grep -qF "the eval switch is off ($TMP/paused)" "$TMP/switch.log" 2>/dev/null \
+  && ok "关着的那一跑在日志里点名了标记文件（否则「关着」与「一次都没跑」同形）" \
+  || bad "关着的那一跑没在日志里点名标记文件：$(tail -2 "$TMP/switch.log" 2>/dev/null)"
+
 printf '%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

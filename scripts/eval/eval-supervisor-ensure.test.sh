@@ -57,8 +57,12 @@ printf '{"kind":"header"}\n{"case":"a"}\n' >"$TMP/done.jsonl"
 
 run_ensure() { # $1 = pgrep 桩目录，$2 = CKPT；其余 = 环境
   local pdir=$1 ck=$2; shift 2
+  # `PAUSE_FLAG` 必钉：不钉就落到宿主上的真开关，而那是**会变的状态**——宿主哪天关着
+  # 评测，下面每一格都会判成 paused，这套夹具就整体红在一个与它无关的事实上。夹具
+  # 要先说出自己测的那一格，再谈判词。
   env PATH="$pdir:$PATH" SUP="$TMP/fake-sup.sh" OUT="$TMP/sup.out" CKPT="$ck" MARK="$TMP/ran" \
-      LOG="$TMP/ensure.log" "$@" bash "$SCRIPT" | sed -n 's/^.* ensure: //p' 
+      LOG="$TMP/ensure.log" PAUSE_FLAG="$TMP/no-such-flag" "$@" bash "$SCRIPT" \
+    | sed -n 's/^.* ensure: //p'
 }
 
 v=$(run_ensure "$TMP/run" "$TMP/short.jsonl")
@@ -87,7 +91,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then sleep 8; fi
 EOF
 rm -f "$TMP/ran"
 env PATH="$TMP/idle:$PATH" SUP="$TMP/slow-sup.sh" OUT="$TMP/sup.out" CKPT="$TMP/short.jsonl" \
-    MARK="$TMP/ran" LOG="$TMP/ensure.log" bash "$SCRIPT" >/dev/null 2>&1
+    MARK="$TMP/ran" LOG="$TMP/ensure.log" PAUSE_FLAG="$TMP/no-such-flag" \
+    bash "$SCRIPT" >/dev/null 2>&1
 sleep 0.5
 if flock -n "$TMP/ensure.log.lock" -c true 2>/dev/null; then
   ok "拉起的值守没继承锁（否则之后每一条 ensure 都会判 locked）"
@@ -103,6 +108,40 @@ if [ "$v" = "verdict=target-reached" ] && [ ! -s "$TMP/ran" ]; then
 else
   bad "到目标：期望 verdict=target-reached 且不起，实得 $v"
 fi
+
+# 开关关着 ⇒ 不起值守。这条腿存在的理由恰恰是「没有人醒着的时候也在跑」，所以它是
+# 唯一会把关掉的评测重新拉起来的那条路：杀进程挡不住它，十分钟后它就又拉一条。
+printf 'off at 2026-11-08T00:00:00Z\nreason: the host was told to stop\n' >"$TMP/paused"
+rm -f "$TMP/ran" "$TMP/paused.seen" "$TMP/paused.logged"
+v=$(run_ensure "$TMP/idle" "$TMP/short.jsonl" PAUSE_FLAG="$TMP/paused")
+sleep 0.3
+if [ "$v" = "verdict=paused flag=$TMP/paused; no supervisor started" ] && [ ! -s "$TMP/ran" ]; then
+  ok "开关关着 ⇒ paused，且一条值守都没起"
+else
+  bad "开关关着：期望 verdict=paused 且不起，实得「$v」（标记 $( [ -s "$TMP/ran" ] && echo 有 || echo 无 )）"
+fi
+[ -e "$TMP/paused.seen" ] \
+  && ok "关着的时候也摸一次 .seen（那是「谁在看着开关」的唯一读数）" \
+  || bad "关着的时候没摸 .seen：读的人分不出「在看着、只是关着」与「这条腿已经死了」"
+
+# 同一段关闸里只写一行：每十分钟一行会把真正的事件埋掉，一行都不写又分不出死活。
+before=$(wc -l <"$TMP/ensure.log")
+v=$(run_ensure "$TMP/idle" "$TMP/short.jsonl" PAUSE_FLAG="$TMP/paused")
+after=$(wc -l <"$TMP/ensure.log")
+if [ -z "$v" ] && [ "$after" -eq "$before" ]; then
+  ok "同一段关闸里第二次来 ⇒ 不再写日志（一天 144 行会把事件埋掉）"
+else
+  bad "同一段关闸里第二次来还写了日志：新增 $((after - before)) 行，判词「$v」"
+fi
+
+# 开闸之后 `logged` 必须清掉，否则下一段关闸一行都不会写——而那一段正是要读的那一段。
+# 开闸走的是同一个路径（标记文件被删掉），不是换成另一个路径：`.logged` 与 `.seen` 都
+# 挂在标记路径上，换路径测的是另一个文件。
+rm -f "$TMP/paused"
+run_ensure "$TMP/idle" "$TMP/done.jsonl" PAUSE_FLAG="$TMP/paused" >/dev/null
+[ ! -e "$TMP/paused.logged" ] \
+  && ok "开闸后清掉 .logged，下一段关闸会重新记一行" \
+  || bad "开闸后没清 .logged：下一段关闸将静默"
 
 # 两条 ensure 撞上时只有一条能起：另一条拿不到锁，判词 `locked`，不起第二条值守。
 # `locked` 还要带持有者：同一个词盖着「另一条在跑」与「我上次拉起的值守还握着锁」两种

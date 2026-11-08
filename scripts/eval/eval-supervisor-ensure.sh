@@ -13,6 +13,10 @@
 # 到目标就不起：否则它每 10 分钟起一条、那条立刻判「到了」退出，日志里一天多 144 行。
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=eval-pause-flag.sh
+. "$HERE/eval-pause-flag.sh"
+SEEN="$PAUSE_FLAG.seen"
+LOGGED="$PAUSE_FLAG.logged"
 SUP=${SUP:-$HERE/supervise-eval-loop.sh}
 OUT=${OUT:-$HOME/eval-runs/.runner/supervise.out}
 LOG=${LOG:-$HOME/eval-runs/.runner/eval-supervisor-ensure.log}
@@ -23,6 +27,23 @@ pattern='^bash ([^ ]*/)?supervise-eval-loop[.]sh( |$)'
 # 判词既上 stdout 也落一行带时刻的文件：用户态 journal 在这台机器上不持久，只印 stdout
 # 等于「跑过但没人读得到」——这条腿存在的理由恰恰是**没有人醒着**的时候也在跑。
 say() { printf '%s ensure: %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
+
+# 开关关着就不拉。判在锁之前：关着的时候这件事没有第二条腿会来抢，占锁只是让一条
+# 什么都不做的腿在日志里留下 `locked`，而那个词本来是用来说「另一条真在干活」的。
+#
+# 日志一行都不写才是错的：这条腿每十分钟来一次，写一行就一天 144 行，把真正的事件埋了；
+# 可完全不写，读的人就分不出「它在看着开关、只是关着」与「它已经死了」。所以折中是
+# 每次摸一次 `.seen`（那是「谁在看着」的读数，`eval-switch.sh status` 读它），而往日志
+# 里只在一段关闸里写第一行。
+if eval_paused; then
+  touch "$SEEN"
+  if [ ! -e "$LOGGED" ]; then
+    : >"$LOGGED"
+    say "verdict=paused flag=$PAUSE_FLAG; no supervisor started"
+  fi
+  exit 0
+fi
+rm -f "$LOGGED"
 
 # 两条「ensure」同时进来（定时器与巡检卡撞上）会各自判「没在跑」，然后各起一条值守；
 # 值守本身不去重，两条会同时判池、同一下开两轮。锁只护这一小段，拿不到就让给另一条。

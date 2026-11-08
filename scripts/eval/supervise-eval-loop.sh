@@ -18,6 +18,9 @@
 # 路径可以带目录，脚本名之后允许参数或行尾。
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 总开关键在 eval-pause-flag.sh 里，三处入口共用那一份默认路径。
+# shellcheck source=eval-pause-flag.sh
+. "$HERE/eval-pause-flag.sh"
 REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
 CKPT=${CKPT:-$HOME/eval-runs/20261018_post-recovery.md.cases.jsonl}
 LOG=${LOG:-$HOME/eval-runs/.runner/rerun.log}
@@ -236,6 +239,13 @@ main() {
   end=$(horizon_end "${1:-28800}")
   say "start pid=$$ horizon=$(( end - $(date +%s) ))s target=$TARGET"
   while [ "$(date +%s)" -lt "$end" ]; do
+    # 开关关着就到此为止：不判池、不起采样、更不起一轮。判在 pgrep 之前是有意的——
+    # 一条已经在跑的循环由 `eval-switch.sh off` 终止，这里等的是「关着的时候不要
+    # 再起一条」，而池采样那条腿也花钱、也连集群，同样不该起来。
+    if eval_paused; then
+      say "the eval switch is off ($PAUSE_FLAG); no round started, not judging the pool"
+      return 0
+    fi
     if ! pgrep -f "$pattern" >/dev/null; then
       n=$(lines)
       if reached "$n"; then say "target reached (judged=$((n-1)) legs=$(leg_report)); stopping"; return 0; fi
