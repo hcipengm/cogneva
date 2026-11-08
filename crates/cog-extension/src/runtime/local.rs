@@ -113,23 +113,115 @@ const BUILD_PROGRAMS: &[&str] = &[
 /// slot would hold that slot for every search. A segment is cut at the shell's
 /// separators, and its first word that is not a wrapper or an argument to one
 /// is the program that will run.
+///
+/// Running the program is not the same as compiling with it. The slot is not a
+/// licence for everything cargo can be asked to do: it exists because two
+/// writers to one target directory serialise *inside* cargo's own lock, after
+/// the caller's wall has already started. Asking cargo its version, formatting
+/// the tree, or reading a manifest writes nothing there, so it is read the same
+/// way a search is -- as no build at all (see
+/// [`NON_BUILDING_CARGO_SUBCOMMANDS`]).
 pub(crate) fn builds_the_tree(command: &str) -> bool {
     command
         .split([';', '&', '|', '(', ')', '\n'])
-        .any(|segment| program_of(segment).is_some_and(|name| BUILD_PROGRAMS.contains(&name)))
+        .any(|segment| match program_of(segment) {
+            Some((program, args)) => BUILD_PROGRAMS.contains(&program) && compiles_the_tree(&args),
+            None => false,
+        })
 }
 
-/// The program a shell segment runs, once its wrappers are stepped over.
+/// Subcommands of a build program that write nothing into the shared target
+/// directory.
+///
+/// Measured on the host this runs on, 2026-11-08: the one build slot every
+/// compile on a pod queues on was held, for 190 to 1145 seconds at a stretch,
+/// by `cargo fmt --all -- --check`, `cargo --version` and `command -v cargo`
+/// while builds waited behind them and then timed out inside their own wall.
+///
+/// `clean` is deliberately absent from this list: it compiles nothing and it
+/// deletes exactly the directory the other builds write, so it needs the slot
+/// for the same reason they do.
+const NON_BUILDING_CARGO_SUBCOMMANDS: &[&str] = &[
+    "fmt",
+    "metadata",
+    "tree",
+    "locate-project",
+    "pkgid",
+    "verify-project",
+    "read-manifest",
+    "add",
+    "remove",
+    "update",
+    "fetch",
+    "search",
+    "login",
+    "logout",
+    "new",
+    "init",
+    "help",
+    "generate-lockfile",
+    "vendor",
+];
+
+/// Whether what follows a build program still compiles the tree.
+///
+/// A program with no word left after its flags prints its own help; a word that
+/// is a flag or a toolchain selector is not a subcommand; and what is left is a
+/// subcommand, which compiles unless it is one of the above. Reading the
+/// selector rather than requiring the subcommand first is what keeps
+/// `cargo +nightly test` counted as the build it is.
+fn compiles_the_tree(args: &[&str]) -> bool {
+    // Flags that ask cargo about itself rather than about the tree. Read only
+    // before `--`: everything after it belongs to the program the subcommand
+    // runs, and `cargo test -- --version` is still a test run.
+    let head = args.split(|word| *word == "--").next().unwrap_or(&[]);
+    if head.iter().any(|word| ASKS_CARGO_ITSELF.contains(word)) {
+        return false;
+    }
+    let subcommand = args.iter().copied().find(|word| {
+        !word.starts_with('-') && !word.starts_with('+') && !is_a_file_descriptor(word)
+    });
+    match subcommand {
+        Some(word) => !NON_BUILDING_CARGO_SUBCOMMANDS.contains(&word),
+        None => false,
+    }
+}
+
+/// Flags that make an invocation a question about cargo itself.
+const ASKS_CARGO_ITSELF: &[&str] = &["--version", "-V", "--help", "-h"];
+
+/// A bare number in command position is the descriptor a redirect named.
+///
+/// `cargo --version 2>&1 | head -2` is cut at `&` before this runs, so the `2`
+/// of `2>&1` arrives as a word of its own and sits exactly where a subcommand
+/// would. Read as one, it makes every redirect look like a build: the probe
+/// then asks the build lane for a turn it never needed, and that turn is the
+/// one the changes that do compile are queued for.
+fn is_a_file_descriptor(word: &str) -> bool {
+    !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The program a shell segment runs, once its wrappers are stepped over, and
+/// the words that follow it.
 ///
 /// `timeout 580 cargo test` runs cargo, `env A=B cargo build` runs cargo, and
 /// `grep cargo` runs grep. The wrappers are recognised by name and their
 /// arguments by shape, so what is left is the word the shell would resolve.
-fn program_of(segment: &str) -> Option<&str> {
-    for word in segment.split_whitespace() {
+/// The words after it are what tells `cargo test` from `cargo --version`: both
+/// run cargo, only one compiles.
+///
+/// `command -v cargo` is the exception among the wrappers: it asks the shell
+/// where a program is and runs nothing, so there is no program to charge.
+fn program_of(segment: &str) -> Option<(&str, Vec<&str>)> {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    for (i, &word) in words.iter().enumerate() {
         let name = Path::new(word)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(word);
+        if name == "command" && matches!(words.get(i + 1), Some(&"-v") | Some(&"-V")) {
+            return None;
+        }
         if matches!(
             name,
             "timeout" | "nice" | "sudo" | "nohup" | "exec" | "command" | "env" | "stdbuf"
@@ -141,7 +233,7 @@ fn program_of(segment: &str) -> Option<&str> {
         if word.starts_with('-') || word.contains('=') || looks_like_duration(word) {
             continue;
         }
-        return Some(name);
+        return Some((name, words[i + 1..].to_vec()));
     }
     None
 }
@@ -447,9 +539,11 @@ mod tests {
         assert!(builds_the_tree("timeout 580 cargo test -p cogneva --lib"));
         assert!(builds_the_tree("env CARGO_TARGET_DIR=/tmp/t cargo build"));
         assert!(builds_the_tree("cargo test --workspace 2>&1 | tail -30"));
-        assert!(builds_the_tree(
-            "/usr/local/rustup/toolchains/x/bin/rustc --version"
-        ));
+        assert!(builds_the_tree("/usr/local/rustup/toolchains/x/bin/rustc -o /tmp/x /tmp/x.rs"));
+        assert!(builds_the_tree("cargo +nightly test -p cog-core"));
+        assert!(builds_the_tree("cargo nextest run --profile ci"));
+        // `clean` compiles nothing and deletes the directory the others write.
+        assert!(builds_the_tree("cargo clean -p cog-core"));
 
         // A search, a read, and a listing mention the word without compiling.
         assert!(!builds_the_tree("grep -rn cargo crates/ | head"));
@@ -457,6 +551,24 @@ mod tests {
         assert!(!builds_the_tree("ls -la target/debug"));
         assert!(!builds_the_tree("echo 'cargo test' >> notes.txt"));
         assert!(!builds_the_tree(""));
+
+        // Running one of those programs is not compiling with it. Each of
+        // these held the pod's only build slot for minutes while real builds
+        // queued behind it and timed out inside their own wall.
+        assert!(!builds_the_tree("command -v cargo"));
+        assert!(!builds_the_tree("command -V cargo && cargo --version"));
+        assert!(!builds_the_tree("cargo --version 2>&1 | head -2"));
+        assert!(!builds_the_tree("cargo -V"));
+        assert!(!builds_the_tree("cargo fmt --all -- --check"));
+        assert!(!builds_the_tree(
+            "cd . && git apply x.patch && cargo fmt --all -- --check && echo FMT_STILL_OK"
+        ));
+        assert!(!builds_the_tree(
+            "cargo metadata --format-version 1 --no-deps"
+        ));
+        assert!(!builds_the_tree("cargo tree -p cog-core --depth 1"));
+        assert!(!builds_the_tree("cargo locate-project --message-format plain"));
+        assert!(!builds_the_tree("cargo fetch --locked"));
     }
 
     #[tokio::test]

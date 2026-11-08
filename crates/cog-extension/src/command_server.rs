@@ -171,6 +171,7 @@ pub struct CommandMetrics {
     registry: Registry,
     seconds: HistogramVec,
     in_flight: IntGaugeVec,
+    build_wait: HistogramVec,
 }
 
 /// Buckets spanning a file write to a build that runs to its wall.
@@ -235,16 +236,35 @@ impl CommandMetrics {
             &["tool"],
         )
         .expect("static metric name and labels");
+        // The wait is a reading of its own, not a part of the command's wall:
+        // a build that spent its whole budget queued and one that compiled
+        // slowly land in the same latency bucket, and they want different
+        // fixes. `outcome` separates the queue that admitted the command from
+        // the one that turned it away without starting anything.
+        let build_wait = HistogramVec::new(
+            HistogramOpts::new(
+                "sandbox_build_slot_wait_seconds",
+                "How long a compiling command waited for the shared build lane, \
+                 by payload kind and whether that lane admitted it",
+            )
+            .buckets(COMMAND_LATENCY_BUCKETS.to_vec()),
+            &["tool", "outcome"],
+        )
+        .expect("static metric name and labels");
         registry
             .register(Box::new(seconds.clone()))
             .expect("metric registered once");
         registry
             .register(Box::new(in_flight.clone()))
             .expect("metric registered once");
+        registry
+            .register(Box::new(build_wait.clone()))
+            .expect("metric registered once");
         Self {
             registry,
             seconds,
             in_flight,
+            build_wait,
         }
     }
 
@@ -264,6 +284,38 @@ impl CommandMetrics {
         self.seconds
             .with_label_values(&[tool, outcome.as_str()])
             .observe(seconds);
+    }
+
+    /// How long a compiling command waited for the lane, and what that wait
+    /// ended in. Read beside `sandbox_command_seconds`: this one says the
+    /// machine made the command queue, that one says the command was slow.
+    fn observe_build_wait(&self, tool: &str, ended: LaneWait, seconds: f64) {
+        self.build_wait
+            .with_label_values(&[tool, ended.as_str()])
+            .observe(seconds);
+    }
+}
+
+/// How a wait for the shared build lane ended, as the `outcome` label spells it.
+///
+/// Three states, because they want three different fixes: `admitted` is the
+/// lane working as designed, `full` is a caller whose command never started and
+/// who can see that it never did, and `closed` is the semaphore gone, which no
+/// amount of patience fixes.
+#[derive(Clone, Copy)]
+enum LaneWait {
+    Admitted,
+    Full,
+    Closed,
+}
+
+impl LaneWait {
+    fn as_str(self) -> &'static str {
+        match self {
+            LaneWait::Admitted => "admitted",
+            LaneWait::Full => "full",
+            LaneWait::Closed => "closed",
+        }
     }
 }
 
@@ -470,16 +522,24 @@ async fn execute_handler(
             // so time spent queued is not time spent compiling: without this,
             // every extra build started beside it shortened the wall the others
             // had left, and each of them timed out having read nothing.
-            let build_slot = match build_slot_for(&state, command).await {
+            let build_slot = match build_slot_for(&state, tool_label(&req.payload), command, timeout)
+                .await
+            {
                 Ok(slot) => slot,
+                // A lane that stays full past the command's own budget is a
+                // refusal, not a failure of the executor: 503 says try again,
+                // 500 would say this request was broken.
+                Err(refusal @ LaneRefusal::Full { .. }) => {
+                    return watch.end(
+                        error_response(StatusCode::SERVICE_UNAVAILABLE, refusal.to_string()),
+                        Outcome::Refused,
+                    )
+                }
                 // The semaphore is never closed in this process; a caller that
                 // lands here is told so rather than run unbounded.
-                Err(e) => {
+                Err(refusal @ LaneRefusal::Closed(_)) => {
                     return watch.end(
-                        error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("build slot unavailable: {e}"),
-                        ),
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, refusal.to_string()),
                         Outcome::Refused,
                     )
                 }
@@ -612,27 +672,81 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
 /// holding one for a search would put every search behind a build.
 async fn build_slot_for(
     state: &AppState,
+    tool: &str,
     command: &str,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, tokio::sync::AcquireError> {
+    budget: std::time::Duration,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, LaneRefusal> {
     if !crate::runtime::local::builds_the_tree(command) {
         return Ok(None);
     }
     let queued_at = std::time::Instant::now();
-    let slot = Arc::clone(&state.build_slots).acquire_owned().await?;
-    // The wait is free here and was not free where it used to happen -- inside
-    // cargo's own lockfile wait, with the command's wall already running. It is
-    // still a wait somebody pays for, so it is said out loud: without this line
-    // a round that spent its whole wall queued looks exactly like a round that
-    // compiled slowly, and the two want different fixes.
+    // The queue may cost the caller at most the wall this command was given.
+    // Unbounded, a wait is not a wait but a hang: measured on this host
+    // 2026-11-08, compiles queued 190 to 1145 seconds behind one held slot, and
+    // the caller learned nothing until its own tool call expired -- it could
+    // not tell a busy machine from a slow compiler, so it retried into the same
+    // queue. Refused with the number, it can see that the command never ran.
+    //
+    // The budget is the command's own wall rather than a number of its own: the
+    // caller already declared how long it is willing to spend here, and the
+    // worst case stays two walls -- one queued, one running.
+    let acquired =
+        tokio::time::timeout(budget, Arc::clone(&state.build_slots).acquire_owned()).await;
     let waited = queued_at.elapsed();
+    let ended = match &acquired {
+        Ok(Ok(_)) => LaneWait::Admitted,
+        Ok(Err(_)) => LaneWait::Closed,
+        Err(_) => LaneWait::Full,
+    };
+    state
+        .commands
+        .observe_build_wait(tool, ended, waited.as_secs_f64());
+    // It is still a wait somebody pays for, so it is said out loud as well: a
+    // round that spent its whole wall queued and one that compiled slowly read
+    // the same on the latency histogram alone.
     if waited >= BUILD_QUEUE_NOTEWORTHY {
         tracing::info!(
             command = %command,
             waited_secs = waited.as_secs(),
+            waited_ended = ended.as_str(),
             "a build waited its turn for the shared target directory"
         );
     }
-    Ok(Some(slot))
+    match acquired {
+        Ok(Ok(permit)) => Ok(Some(permit)),
+        Ok(Err(e)) => Err(LaneRefusal::Closed(e.to_string())),
+        Err(_) => Err(LaneRefusal::Full { waited, budget }),
+    }
+}
+
+/// Why a compiling command never reached its child.
+#[derive(Debug)]
+enum LaneRefusal {
+    /// The lane stayed full for the whole wall the caller allotted the command.
+    Full {
+        waited: std::time::Duration,
+        budget: std::time::Duration,
+    },
+    /// The semaphore is closed; no amount of waiting admits this command.
+    Closed(String),
+}
+
+impl std::fmt::Display for LaneRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LaneRefusal::Full { waited, budget } => write!(
+                f,
+                "build lane busy: this command never started. It waited {}s of the {}s \
+                 its own wall allows for a slot among the commands compiling into the \
+                 shared target directory, and did not get one. Nothing was compiled and \
+                 nothing was left behind; ask again later, or give the command a longer \
+                 timeout_ms so it may queue for longer than it may run.",
+                waited.as_secs(),
+                budget.as_secs()
+            ),
+            LaneRefusal::Closed(e) => write!(f, "build slot unavailable: {e}"),
+        }
+    }
 }
 
 pub fn router() -> Router {
@@ -1077,18 +1191,20 @@ mod tests {
     }
 
     /// The bound this exists for: a second build does not start while the
-    /// first one holds the last slot, and a command that compiles nothing is
-    /// never made to wait for one.
+    /// first one holds the last slot, a command that compiles nothing is never
+    /// made to wait for one, and a wait that outlasts the command's own wall is
+    /// refused by name instead of hanging until the caller gives up.
     #[tokio::test]
     async fn a_build_waits_its_turn_and_a_search_does_not() {
         let state = state_with_build_slots(1);
-        let held = build_slot_for(&state, "cargo test -p cogneva --lib")
+        let patience = std::time::Duration::from_secs(60);
+        let held = build_slot_for(&state, "run_command", "cargo test -p cogneva --lib", patience)
             .await
             .expect("the semaphore is open")
             .expect("a build takes a slot");
 
         let queued = tokio::time::timeout(std::time::Duration::from_millis(80), async {
-            build_slot_for(&state, "cargo clippy --all-targets").await
+            build_slot_for(&state, "run_command", "cargo clippy --all-targets", patience).await
         })
         .await;
         assert!(
@@ -1100,22 +1216,72 @@ mod tests {
         // queue behind a build to do so.
         let search = tokio::time::timeout(
             std::time::Duration::from_millis(80),
-            build_slot_for(&state, "grep -rn cargo crates/"),
+            build_slot_for(&state, "run_command", "grep -rn cargo crates/", patience),
         )
         .await
         .expect("a search never queues")
         .expect("the semaphore is open");
         assert!(search.is_none(), "a search holds no build slot");
 
+        // Formatting the tree is the same shape: a program that would compile,
+        // asked to do something that writes nothing into the target directory.
+        let formatting = tokio::time::timeout(
+            std::time::Duration::from_millis(80),
+            build_slot_for(&state, "run_command", "cargo fmt --all -- --check", patience),
+        )
+        .await
+        .expect("formatting never queues")
+        .expect("the semaphore is open");
+        assert!(formatting.is_none(), "formatting holds no build slot");
+
+        // A wait longer than the wall the command was given is a refusal that
+        // names both numbers, not a command started only to be killed.
+        let refused = build_slot_for(
+            &state,
+            "run_command",
+            "cargo clippy --all-targets",
+            std::time::Duration::from_millis(120),
+        )
+        .await;
+        match refused {
+            Err(LaneRefusal::Full { waited, budget }) => {
+                assert!(waited >= budget, "the wait is the whole budget and more");
+                assert!(
+                    LaneRefusal::Full { waited, budget }
+                        .to_string()
+                        .contains("never started"),
+                    "the refusal says the command did not run"
+                );
+            }
+            Ok(_) => panic!("a full lane past the budget must refuse"),
+            Err(LaneRefusal::Closed(e)) => panic!("the semaphore was closed: {e}"),
+        }
+
         drop(held);
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            build_slot_for(&state, "cargo clippy --all-targets"),
+            build_slot_for(&state, "run_command", "cargo clippy --all-targets", patience),
         )
         .await
         .expect("the released slot admits the waiting build")
         .expect("the semaphore is open");
         assert!(next.is_some(), "the queued build gets the slot back");
+
+        // The wait is published, so a round that queued and a round that
+        // compiled slowly are separable without reading the log.
+        let rendered = state.commands.render();
+        assert!(
+            rendered.contains(
+                "sandbox_build_slot_wait_seconds_count{outcome=\"admitted\",tool=\"run_command\"}"
+            ),
+            "the wait is a reading of its own: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sandbox_build_slot_wait_seconds_count{outcome=\"full\",tool=\"run_command\"}"
+            ),
+            "the reading separates the lane admitting a command from refusing one: {rendered}"
+        );
     }
 
     #[test]
