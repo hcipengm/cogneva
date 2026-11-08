@@ -7108,7 +7108,7 @@ mod tests {
     /// 卡过的活。
     #[tokio::test]
     async fn a_stalled_attempt_is_reclaimed_and_charged_to_the_task() {
-        let _serial = cog_core::progress::test_lock();
+        let _serial = cog_core::progress::async_test_lock().await;
         cog_core::progress::reset_for_tests();
         let dag = DagExecutor::new("ws-stall".into()).with_task_lease_secs(60);
         let task = Task::new("t-stall", TaskType::DagNode, serde_json::json!({}));
@@ -7140,7 +7140,7 @@ mod tests {
     /// 「它死了」。折成停住，第一次扫描就会把整类执行器收掉。
     #[tokio::test]
     async fn a_task_this_process_cannot_see_is_not_reclaimed_as_stalled() {
-        let _serial = cog_core::progress::test_lock();
+        let _serial = cog_core::progress::async_test_lock().await;
         cog_core::progress::reset_for_tests();
         let dag = DagExecutor::new("ws-unseen".into()).with_task_lease_secs(600);
         let task = Task::new("t-unseen", TaskType::DagNode, serde_json::json!({}));
@@ -7169,7 +7169,7 @@ mod tests {
     /// 第一拍——这条判据会在一个全新的尝试上判出停住，并把它记在任务账上。
     #[tokio::test]
     async fn a_restarted_attempt_does_not_inherit_the_previous_attempts_silence() {
-        let _serial = cog_core::progress::test_lock();
+        let _serial = cog_core::progress::async_test_lock().await;
         cog_core::progress::reset_for_tests();
         let dag = DagExecutor::new("ws-restart".into()).with_task_lease_secs(600);
         dag.add_task(Task::new(

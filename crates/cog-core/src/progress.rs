@@ -207,6 +207,19 @@ pub fn seed_gaps_for_tests(gap: Duration, count: usize) {
     }
 }
 
+/// The one lock the test hooks below hand out.
+///
+/// Tokio's rather than std's because some of the tests that need it are async:
+/// a `std` guard held across an `await` is a deadlock waiting for the first
+/// test that holds it while awaiting a task that wants it, and clippy refuses
+/// the shape outright (`await_holding_lock`). One mutex with two doors, not two
+/// mutexes — two would not exclude each other, and the races the lock exists to
+/// prevent would come straight back.
+fn serial() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Test hook: hold the one lock that serialises tests sharing this state.
 ///
 /// The beacons and the reservoir are one population per process, so two tests
@@ -217,12 +230,20 @@ pub fn seed_gaps_for_tests(gap: Duration, count: usize) {
 ///
 /// Tests that only *beat* need not hold it: a handful of real gaps cannot reach
 /// [`SAMPLE_FLOOR`], so they cannot move a window.
+///
+/// Blocks the thread. A test that is itself async takes it through
+/// [`async_test_lock`] instead; calling this one from inside a runtime panics
+/// by tokio's rule, which is the right failure — it names the wrong door rather
+/// than hanging.
 #[doc(hidden)]
-pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+pub fn test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    serial().blocking_lock()
+}
+
+/// Test hook: the same lock, for a test that is itself async.
+#[doc(hidden)]
+pub async fn async_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    serial().lock().await
 }
 
 /// Test hook: clear every beacon and every sample.

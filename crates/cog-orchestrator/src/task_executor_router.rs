@@ -1330,7 +1330,7 @@ mod ready_pipeline_tests {
     /// 消息全部队头阻塞——旧墙留下的唯一后果仍然成立，只是判据换了。
     #[tokio::test]
     async fn a_run_that_stopped_moving_is_cancelled() {
-        let _serial = cog_core::progress::test_lock();
+        let _serial = cog_core::progress::async_test_lock().await;
         cog_core::progress::reset_for_tests();
         let backend = Arc::new(ScriptedBackend::default());
         let pipe = test_pipe(backend.clone());
