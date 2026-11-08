@@ -12,8 +12,9 @@
 //!
 //! 两种丢弃都落在同一个计数器上、按 `cause` 分开，因为「缓冲忙了一下」与
 //! 「这条对话没了」不是同一件事，共用一个数就分不出来。装上投递口之后
-//! `AgentEnd` 只走总线、agent 侧既没接 WAL 也没接 raw 日志，所以这条计数
-//! 是丢掉的那份**唯一**耐久副本留下的读数。
+//! `AgentEnd` 只走总线，但 `wal` 是接上的：存储插件发布后端，每个 worker 按
+//! agent_id 各拿一份日志，所以丢掉的那份还能回读那条 wal 补——这条计数是漏掉
+//! 的那一份留下的读数。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,7 +31,8 @@ pub mod cause {
     /// 收不下，事件在进队前被丢。总线恢复后不再产生——容量读数，不是故障读数。
     pub const BUFFER_FULL: &str = "buffer_full";
     /// 传输层**永久拒绝**了这条载荷（字节数超过它声明的帧上限）。再等多久也
-    /// 不会变小，投递口把它当次消费掉。不可自愈——丢掉的是这条对话的唯一副本。
+    /// 不会变小，投递口把它当次消费掉。不可自愈——丢掉的那份要回读 wal 补，
+    /// 这个计数是补之前漏掉的那一份留下的读数。
     pub const PAYLOAD_REJECTED: &str = "payload_rejected";
 }
 
@@ -83,8 +85,8 @@ impl EventBusSink {
                             // 这条再发多少次也还是这么大。丢掉它、继续下一条：
                             // 留着它只是把队头占住，而它身后的每一条都在等一个
                             // 永远不会到来的成功。丢的代价是真的——装上投递口后
-                            // AgentEnd 不走 broadcast，也没有第二条耐久面——所以
-                            // 这个计数是它留下的唯一读数。
+                            // AgentEnd 不走 broadcast，这一份只能回读 wal 补——所以
+                            // 这个计数是补上之前漏掉的那一份留下的读数。
                             let n = drops.payload_rejected.fetch_add(1, Ordering::Relaxed) + 1;
                             error!(
                                 "Event bus refused this event permanently, dropping it rather than blocking the queue (total dropped: {n}): {e}"
@@ -453,5 +455,67 @@ mod tests {
             "入口溢出只该记 buffer_full，实际记了 {causes:?}"
         );
         assert_eq!(sink.payload_rejected_drops(), 0, "它不碰另一格");
+    }
+
+    /// 发布先于读者就位：`spawn` 之后、后台发布任务还没有被调度过哪怕一次，
+    /// 紧接着投递的那一条仍然必须被发布出去。
+    ///
+    /// 保住它的不是「已经有人在等」，而是 `spawn` 里那次 `mpsc::channel` 建的
+    /// 有界缓冲：从订阅那一刻起算的通道，在订阅之前写出的那条永远等不到；这里
+    /// 反过来，缓冲在投递之前就存在，发布任务什么时候被第一次 poll 都不影响已经
+    /// 进队的那条。
+    #[tokio::test]
+    async fn an_event_sent_before_the_publisher_task_is_polled_is_still_published() {
+        let spy = Arc::new(SpyPublisher {
+            published: Mutex::new(vec![]),
+            fail_times: Mutex::new(0),
+        });
+        // 当前线程的运行期：`spawn` 只把任务排进队列，下面这句 `send` 发生在它
+        // 被第一次 poll 之前——这正是「发布先于读者就位」的那个窗口。
+        let sink = EventBusSink::spawn(spy.clone(), 8, 1, None);
+        sink.send(agent_end("a-early"));
+
+        for _ in 0..100 {
+            if !spy.published.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            spy.published.lock().unwrap().join(","),
+            "a-early",
+            "发布任务还没跑过，也不该丢掉已经进队的那条"
+        );
+        assert_eq!(sink.buffer_full_drops(), 0, "缓冲没满，这不是溢出读数");
+    }
+
+    /// 背靠背投递的一批按投递顺序发出：缓冲是 FIFO、发布任务只有这一个，所以
+    /// 顺序是这里唯一能依赖的东西——重排就意味着有第二个读者，或者发布口不止
+    /// 一个。
+    #[tokio::test]
+    async fn a_back_to_back_batch_is_published_in_send_order() {
+        let spy = Arc::new(SpyPublisher {
+            published: Mutex::new(vec![]),
+            fail_times: Mutex::new(0),
+        });
+        let sink = EventBusSink::spawn(spy.clone(), 8, 1, None);
+        for id in ["a-0", "a-1", "a-2", "a-3"] {
+            sink.send(agent_end(id));
+        }
+
+        for _ in 0..100 {
+            if spy.published.lock().unwrap().len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            spy.published.lock().unwrap().join(","),
+            "a-0,a-1,a-2,a-3",
+            "投递顺序就是发布顺序"
+        );
+        assert_eq!(sink.payload_rejected_drops(), 0, "这一批没有人被永久拒绝");
     }
 }
