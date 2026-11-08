@@ -83,6 +83,8 @@ mod a_relation_reading_is_one_query_test;
 mod a_retention_knob_says_what_zero_means_test;
 #[path = "a_retired_row_carries_the_measurement_that_falsified_it_test.rs"]
 mod a_retired_row_carries_the_measurement_that_falsified_it_test;
+#[path = "a_retry_loop_that_pipes_its_command_judges_the_last_stage_test.rs"]
+mod a_retry_loop_that_pipes_its_command_judges_the_last_stage_test;
 #[path = "a_roster_entry_is_removed_by_identity_and_a_dead_one_is_never_handed_back_test.rs"]
 mod a_roster_entry_is_removed_by_identity_and_a_dead_one_is_never_handed_back_test;
 #[path = "a_shared_query_is_spelt_once_test.rs"]
