@@ -66,10 +66,79 @@ tree_key() {
     } | sha256sum | cut -d' ' -f1
 }
 
+# ---- 第二把键：这棵工作树此刻的字节 ----
+#
+# 上面那把键回答的是**推送**那一问：推上去的就是 HEAD，别人的在飞改动不跟着走。可同一些
+# 钩子在**提交之前**问的是另一句话——「我现在要把这棵树提交掉，这份字节判过没有」。那时
+# 改动还没进 HEAD，按 HEAD 记的账永远命不中；更糟的是反过来，跑过一次干净树之后，HEAD
+# 与 origin/main 都不动，戳就一直有效，此后改多少都能提交，判过的字节与提交的字节从此
+# 没关系。2026-11-08 实测：钩子按这把键问，分享这棵树的每个会话要么提交不了，要么拿一笔
+# 旧账放行新字节。
+#
+# 所以另记一笔按**工作树字节**的账：临时索引上 `read-tree HEAD` + `add -A` + `write-tree`，
+# 得到「现在就把这棵树提交掉」的那棵树的 oid。判据自己的输入也进指纹——这道门与
+# `ci.yml` 的字节、工具的版本、测试库设没设：判据变了，上一次的结论就不再作数。
+#
+# 脏树也记这一笔：判的就是这份脏，提交之后字节不变，同一份指纹照样命中。
+tool_sig() { # 名字 命令…
+    local name="$1"
+    shift
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf '%s=absent\n' "${name}"
+        return 0
+    fi
+    printf '%s=%s\n' "${name}" "$("$@" 2>/dev/null | head -n 1)"
+}
+
+work_tree_oid() {
+    local idx rc=0
+    idx="$(mktemp "${TMPDIR:-/tmp}/cogneva-prepush-index.XXXXXX")" || return 1
+    rm -f "${idx}"
+    # 定位变量要摘掉：从钩子里被拉起来时，git 会把 `GIT_DIR`/`GIT_WORK_TREE` 指到**调用方
+    # 那棵树**，而 `GIT_WORK_TREE` 一在手上，`add -A` 收的就是另一棵树的内容——指纹会指
+    # 着一棵与这道门、与这次提交都无关的树。索引逐条显式给，不靠继承。
+    #
+    # 任何一步不成都不出 oid：`add -A` 失败时索引里还剩着 read-tree 的 HEAD 树，那会给
+    # 出一棵与工作树无关的指纹，两次不同的改动就共用同一个戳。
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
+        -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="${idx}" \
+        git read-tree HEAD >/dev/null 2>&1 || rc=1
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
+        -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="${idx}" \
+        git add -A >/dev/null 2>&1 || rc=1
+    if [ "${rc}" -eq 0 ]; then
+        env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
+            -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="${idx}" \
+            git write-tree 2>/dev/null
+    fi
+    rm -f "${idx}"
+    return 0
+}
+
+content_key() {
+    local tree
+    tree="$(work_tree_oid)"
+    [ -n "${tree}" ] || return 1
+    {
+        printf 'tree=%s\n' "${tree}"
+        [ -f "${here}/check-before-push.sh" ] && sha256sum "${here}/check-before-push.sh"
+        [ -f "$root/.github/workflows/ci.yml" ] && sha256sum "$root/.github/workflows/ci.yml"
+        tool_sig cargo cargo --version
+        tool_sig rustc rustc --version
+        tool_sig shellcheck shellcheck --version
+        tool_sig node node --version
+        printf 'test-db=%s\n' "${COGNEVA_TEST_DATABASE_URL:+set}"
+    } | sha256sum | cut -d' ' -f1
+}
+
 case "${1:-}" in
 --key)
     tree_key
     exit 0
+    ;;
+--key-content)
+    content_key
+    exit $?
     ;;
 --status)
     key="$(tree_key)"
@@ -79,6 +148,21 @@ case "${1:-}" in
     fi
     echo "这份字节没验过（$(git rev-parse --short HEAD 2>/dev/null)，键 ${key:0:12}）；"
     echo "先跑 \`bash deploy/scripts/check-before-push.sh\`，它跑绿了自己记账，之后这一推秒过。"
+    exit 1
+    ;;
+--status-content)
+    # 提交之前问的是这一句：**我此刻要提交的这份字节，判过而且绿吗**。
+    ckey="$(content_key)" || { echo "这棵树读不出字节指纹，问不了（不是红）"; exit 2; }
+    if [ -z "${ckey}" ]; then
+        echo "这棵树读不出字节指纹（临时索引写不了，或还没有 HEAD），问不了（不是红）"
+        exit 2
+    fi
+    if [ -f "${stamp_dir}/content.${ckey}" ]; then
+        echo "这份字节验过：$(head -n 1 "${stamp_dir}/content.${ckey}")"
+        exit 0
+    fi
+    echo "这份字节（内容键 ${ckey:0:12}）没验过：改过、或者从没跑过验证；"
+    echo "先跑 \`bash deploy/scripts/check-before-push.sh\`，它跑绿了自己记账，之后这份字节的提交秒过。"
     exit 1
     ;;
 esac
@@ -528,10 +612,24 @@ echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Code Coverage
 echo "Format / Version Contract / Web Build / Bootstrap Cross-Platform。"
 
 # 绿了才记账。红的那一跑什么也不写：一份没验过的字节不能因为「上次跑过」就推得出去。
-# 脏树上也不记：这一跑判的是工作树，而推上去的是 HEAD，两者在这时候不是同一份字节。
+#
+# 两笔分开记，因为它们回答两个不同的问题：
+#   - 内容键（`content.<键>`）：这一跑判的就是工作树的字节，脏不脏无关——提交之后字节不变，
+#     所以提交前后同一份指纹，提交那一问（`--status-content`）命中的正是判过的那一份；
+#   - 推送键（`<HEAD+origin/main>`）：只在干净的树上成立，因为推上去的是 HEAD，而这跑判的
+#     是工作树；脏的时候两者不是同一份字节，只在结尾说明。
+mkdir -p "${stamp_dir}" 2>/dev/null
+ckey="$(content_key)"
+if [ -n "${ckey}" ] &&
+   printf '%s %s（工作树，%s 处未提交改动）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
+       "${run_dirty}" > "${stamp_dir}/content.${ckey}" 2>/dev/null; then
+    echo "记账：内容键 ${ckey:0:12} 这份字节判过，提交前后都读得到这一笔。"
+else
+    echo "记账：写不进 ${stamp_dir}，这一跑照常算数，只是下一次提交／推送还得再判一遍。" >&2
+fi
 if [ "${run_dirty}" -ne 0 ]; then
-    echo "记账：工作树上有 ${run_dirty} 处未提交改动，这一跑判的不是 HEAD 的字节，不记账；"
-    echo "      提交之后再跑一遍，那一跑就能记账，之后同一笔提交的推送秒过。"
+    echo "推进账另记：工作树上有 ${run_dirty} 处未提交改动，这一跑判的不是 HEAD 的字节，暂不记。"
+    echo "      提交之后这棵树的字节没变，内容键照样命中，提交与推送两个钩子都不用再判。"
 elif mkdir -p "${stamp_dir}" 2>/dev/null &&
    printf '%s %s\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
        > "${stamp_dir}/${run_key}" 2>/dev/null; then
