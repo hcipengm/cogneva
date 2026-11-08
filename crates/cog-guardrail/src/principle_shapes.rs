@@ -40,14 +40,24 @@ pub const DEFERRAL_SHAPES: &[&str] = &[
     // premise -- and the bare 要 branch read it as a handover. Excluding one
     // character in front is narrower than a list of negations that would keep
     // growing with the corpus; 要 keeps matching after 需, so `需要你确认` is
-    // still a deferral.
-    r"((^|[^不需])要|(^|[^不])需要|请|由|交给|交由|留给|听)[^，。；、]{0,6}(你|您)",
-    r"归(你|您|用户)",
+    // still a deferral. The guard now covers 请 and 由 too, which were bare
+    // branches: `出现不由你决定` states what the agent cannot decide, the
+    // opposite of handing the decision over, and it was refused as one.
+    r"((^|[^不需])要|(^|[^不])需要|(^|[^不])请|(^|[^不])由|交给|交由|留给|听)[^，。；、]{0,6}(你|您)",
+    // 归属不是交接. `工作树归你一个人用` says whose tree it is, not whose decision
+    // it is, and the bare branch refused a legitimate note about worktree
+    // ownership. The deferral sense always names the act -- `归你定`, `归你拍`
+    // -- so the branch requires one; the tree spells the bare form only inside
+    // quotes, where it is already exempt.
+    r"归(你|您|用户)(拍|定|决|裁)",
     // 一条记录不是一次交接. `（经用户确认）` says who decided something that is
     // already decided; on a decision record that shape is the norm rather than
     // the exception. Excluding 经 and 已 drops the record and keeps `由用户拍板`.
     r"(^|[^已经])用户(拍|定|判|决定|确认|批准)",
-    r"归.*属主",
+    // The gap stays inside one clause. `.*` reached across a full stop:
+    // `归因分析的目标` followed by `属主 2026-10-31 提出…` read as handing a
+    // decision to the owner, and that sentence is attribution, a noun.
+    r"归[^，。；、]{0,4}属主",
     // Three branches rather than one alternation, because the compounds that
     // made this match nouns differ per verb. `属主判据` and `属主判定` name the
     // mechanism -- the owner criterion, the owner determination -- and a bare
@@ -444,6 +454,26 @@ fn subjects(tool: &cog_core::ToolCall) -> Vec<String> {
     out
 }
 
+/// The path suffix of the file that defines this table.
+///
+/// A write to the definition is not a write that hands a decision over: the
+/// examples the table exists for have to appear in it, so judging the content
+/// refuses the only edit that can add or narrow a shape. The host's gate exempts
+/// this path for exactly that reason and did so first; the in-process judge had
+/// no such exemption, so the platform refused its own definition file while the
+/// host accepted it -- the asymmetry that this shared table exists to rule out.
+///
+/// A suffix rather than a whole path because the working directory differs per
+/// caller: a tool call carries whatever the model wrote, absolute or relative.
+const SELF_EDIT_PATH_SUFFIX: &str = "cog-guardrail/src/principle_shapes.rs";
+
+/// The path a write call is about, whichever field carries it.
+fn written_path(tool: &cog_core::ToolCall) -> Option<&str> {
+    ["file_path", "notebook_path"]
+        .iter()
+        .find_map(|key| tool.arguments.get(*key).and_then(|value| value.as_str()))
+}
+
 fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::String(text) => out.push(text.clone()),
@@ -645,9 +675,11 @@ impl cog_core::Guardrail for PrincipleShapeGuard {
     }
 
     async fn check_tool_call(&self, tool: &cog_core::ToolCall) -> cog_core::GuardResult {
-        let matched = subjects(tool)
-            .into_iter()
-            .find_map(|subject| first_span(&subject));
+        let judged = match written_path(tool) {
+            Some(path) if path.ends_with(SELF_EDIT_PATH_SUFFIX) => vec![path.to_string()],
+            _ => subjects(tool),
+        };
+        let matched = judged.into_iter().find_map(|subject| first_span(&subject));
         match matched {
             Some((shape, span)) => {
                 self.report(shape, &span).await;
@@ -992,6 +1024,41 @@ mod tests {
         );
     }
 
+    /// The three lines the shape table refused while their author was writing
+    /// something the principles allow. Each is kept verbatim: they came out of
+    /// the refusal ledger, so they are the corpus rather than a fixture written
+    /// to agree with the pattern.
+    ///
+    /// The last two narrow a branch that reaches too far rather than add an
+    /// exemption, because the exemption would have to name every phrase that
+    /// follows the shape without being one.
+    #[test]
+    fn a_possessive_a_negation_and_a_noun_are_not_handovers() {
+        for own in [
+            // 归 + person with no act after it says whose thing it is.
+            "工作树归你一个人用时，一次设好（只改这棵工作树，不动共享 config）：",
+            // 由 preceded by 不 says what the agent cannot decide.
+            "出现不由你决定。",
+            // 归因 (attribution) and 属主 in the next clause are two nouns.
+            "写给接手界面与归因那一半的会话。属主 2026-10-31 提出七条界面问题 ＋ 归因分析的目标；",
+        ] {
+            assert_eq!(
+                first_match(own),
+                None,
+                "this line hands nothing over: {own}"
+            );
+        }
+        // The narrowed branches still catch the act they exist for, one line
+        // each, so a pattern that stopped matching cannot pass as a narrowing.
+        for act in ["这条归你定。", "由你拍板。", "归属主定。"] {
+            assert_eq!(
+                first_match(act),
+                Some("DEFERRAL_SHAPES"),
+                "the act must stay caught: {act}"
+            );
+        }
+    }
+
     /// Both sides of the owner shape, because a pattern that only narrows is a
     /// pattern that may have stopped catching anything. The nouns on the left
     /// are the wording this repository actually writes when it names the owner
@@ -1068,6 +1135,48 @@ mod tests {
             guard.check_tool_call(&clean).await,
             cog_core::GuardResult::Pass
         );
+    }
+
+    /// A write to the definition file is judged on its path, not its text.
+    ///
+    /// The pair matters more than either half: the same text must still be
+    /// refused when the call writes anything else, or the exemption would be a
+    /// way to launder a handover into a file by naming the definition in the
+    /// path. The refusal the exemption answers is on record -- an agent writing
+    /// the comment that explains this table was stopped by this table.
+    #[tokio::test]
+    async fn a_write_to_the_definition_file_is_not_judged_on_its_text() {
+        use cog_core::Guardrail;
+        let guard = PrincipleShapeGuard::new();
+
+        let defines = cog_core::ToolCall {
+            id: "1".into(),
+            name: "Edit".into(),
+            arguments: serde_json::json!({
+                "file_path": "crates/cog-guardrail/src/principle_shapes.rs",
+                "new_string": "    // 需要你确认 is what the branch exists for.\n",
+            }),
+        };
+        assert_eq!(
+            guard.check_tool_call(&defines).await,
+            cog_core::GuardResult::Pass,
+            "the file that defines the shapes has to be able to spell them"
+        );
+
+        let elsewhere = cog_core::ToolCall {
+            id: "2".into(),
+            name: "Edit".into(),
+            arguments: serde_json::json!({
+                "file_path": "crates/cog-guardrail/src/lib.rs",
+                "new_string": "    // 需要你确认 is what the branch exists for.\n",
+            }),
+        };
+        match guard.check_tool_call(&elsewhere).await {
+            cog_core::GuardResult::Block { rule, .. } => {
+                assert_eq!(rule, "principle_shapes:DEFERRAL_SHAPES")
+            }
+            other => panic!("the same text in another file must be refused, got {other:?}"),
+        }
     }
 
     /// The finished-turn half, through the same entry the platform calls.
