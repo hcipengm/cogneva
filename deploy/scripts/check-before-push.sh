@@ -217,7 +217,24 @@ patch_key_committed() { # [共同祖先]
     } | sha256sum | cut -d' ' -f1
 }
 
+# 念一段段日志。单独一个入口是给测试用的：一整跑要两小时，而这张表本身的判据（每格都在、
+# 秒数按长的在前、红的也在表上）不该跟着两小时一起付。
+print_cost_table() { # [段日志]
+    local log="${1:-${segment_log}}"
+    [ -s "${log}" ] || return 0
+    echo "== 这一跑花在哪（秒；长的在前）"
+    sort -rn -t "$(printf '\t')" -k1,1 "${log}" | while IFS="$(printf '\t')" read -r secs outcome what; do
+        printf '%7s  %-3s  %s\n' "${secs}" "${outcome}" "${what}"
+    done
+    printf '  合计 %s 秒\n' "$(awk -F'\t' '{s += $1} END {printf "%d", s}' "${log}")"
+}
+
 case "${1:-}" in
+--cost-table)
+    [ -n "${2:-}" ] || { echo "--cost-table 要一段段日志的路径" >&2; exit 2; }
+    print_cost_table "$2"
+    exit 0
+    ;;
 --key)
     tree_key
     exit 0
@@ -264,7 +281,11 @@ case "${1:-}" in
         exit 2
     fi
     if [ -f "${stamp_dir}/patch.${pkey}" ]; then
-        echo "这批改动验过：$(head -n 1 "${stamp_dir}/patch.${pkey}")"
+        # 判词必须说清验的是什么。这一问验的是**这几笔改动本身**，不是它们落到这次推的
+        # 基底上的合并结果：干净的变基与「套得上但语义变了」的变基在 patch-id 上同形
+        # （上游改了同一个函数的签名，这几笔照样干净套上、却编不过），本地分不出，只有
+        # CI 整棵判得出。一句笼统的「已验证」会把这两件事说成一件。
+        echo "这批改动验过（验的是改动本身，不是它与基底 ${pbase:0:12} 的合并结果）：$(head -n 1 "${stamp_dir}/patch.${pkey}")"
         exit 0
     fi
     echo "这批改动（改动键 ${pkey:0:12}，基底 ${pbase:0:12}）没验过：这批改动本身改过、或从没跑过验证；"
@@ -298,6 +319,23 @@ run_key="$(tree_key)"
 run_dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 
 failures=0
+
+# ---- 这一跑花在哪 ----
+#
+# 一道两小时的门，说不清时间花在哪一步，就只能整体喊「太慢」；而整体压缩等于猜——砍掉的
+# 可能正是唯一会红的那一步，也可能砍掉的是零成本的一步，白担风险。所以每一格自己报秒数，
+# 结尾按长的在前印一遍，红的绿的都印：红的那一跑也要知道钱花在哪。
+#
+# 「等了多久、等谁」这一面**这里没有**，要说准：这些格子直接调 cargo，构建槽的排队在
+# cargo 里面，这道门看不见。别把「本格 900 秒」读成「编译了 900 秒」——它可能是 100 秒
+# 编译加 800 秒排队。要分开这两者，得给排队那一层加上自己的读数，那是下一件事。
+segment_log="$(mktemp "${TMPDIR:-/tmp}/cogneva-gate-segments.XXXXXX")" || segment_log=/dev/null
+trap 'rm -f "${segment_log}"' EXIT
+
+record_segment() { # <秒> <结局> <说明>
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"${segment_log}" 2>/dev/null
+}
+
 run_suite_file() { # run_suite_file <说明> <模块名>
     # 合并成一个测试二进制之后，「跑哪一份文件」只能靠模块名当 filter 来选，而 libtest 在
     # filter 一条都命中不了时的结局是成功：`0 passed; 0 filtered out`，退出码 0。模块改名、
@@ -306,30 +344,37 @@ run_suite_file() { # run_suite_file <说明> <模块名>
     # 退出码，还要求它真的报出至少一条通过的用例。
     local what="$1"; shift
     local filter="$1"; shift
-    local out status
+    local out status t0=${SECONDS}
     out="$("$@" "${filter}" 2>&1)"
     status=$?
     printf '%s\n' "${out}" | tail -6
     if [ "${status}" -ne 0 ]; then
         printf 'RED  %s\n' "${what}" >&2
         failures=$((failures + 1))
+        record_segment "$((SECONDS - t0))" RED "${what}"
         return 0
     fi
     if ! printf '%s\n' "${out}" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
         printf 'RED  %s：filter“%s”一条用例都没命中，这条判据没跑\n' "${what}" "${filter}" >&2
         failures=$((failures + 1))
+        record_segment "$((SECONDS - t0))" RED "${what}"
+        return 0
     fi
+    record_segment "$((SECONDS - t0))" ok "${what}"
     return 0
 }
 
 run_step() { # run_step <说明> <命令…>
     local what="$1"; shift
+    local t0=${SECONDS}
     printf '== %s\n' "${what}"
     if "$@"; then
+        record_segment "$((SECONDS - t0))" ok "${what}"
         return 0
     fi
     printf 'RED  %s\n' "${what}" >&2
     failures=$((failures + 1))
+    record_segment "$((SECONDS - t0))" RED "${what}"
     return 0
 }
 
@@ -721,6 +766,8 @@ else
     echo "SKIP  bootstrap.ps1 语法检查：本机没有 pwsh（CI 会跑这一步）"
 fi
 
+echo
+print_cost_table
 echo
 if [ "${failures}" -ne 0 ]; then
     echo "PRE-PUSH: ${failures} 步红，推上去 CI 也会红。"

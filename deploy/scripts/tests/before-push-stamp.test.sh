@@ -174,6 +174,11 @@ base2="$(git -C "${ptree}" rev-parse upstream)"
 ( cd "${ptree}" && git checkout -q main && git rebase -q upstream ) || fail "夹具的干净变基没走完"
 ( cd "${ptree}" && bash deploy/scripts/check-before-push.sh --status-patch "${base2}" ) >"${work}/out" 2>&1 ||
     fail "干净的变基之后这批改动的账失效了；实得：$(cat "${work}/out")"
+# 放行的那一句要自己说清验的是什么：改动本身，不是它与这次推的基底的合并结果。干净的
+# 变基与「套得上但语义变了」的变基在 patch-id 上同形，本地分不出，只有 CI 判得出——一句
+# 笼统的「已验证」会让读的人把这两件事当成一件。
+grep -q '不是它与基底' "${work}/out" ||
+    fail "放行的那一句没说清「验的是改动本身、不是合并结果」；实得：$(cat "${work}/out")"
 
 # 13) 解冲突改了解法 ⇒ 这批改动不再是判过的那一批，旧账不许替它说话。
 (
