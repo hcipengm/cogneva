@@ -127,6 +127,8 @@ mod agent_wal_test;
 mod agent_wrapper_test;
 #[path = "an_identifier_is_quoted_in_one_place_test.rs"]
 mod an_identifier_is_quoted_in_one_place_test;
+#[path = "an_optimization_proves_the_output_identical_test.rs"]
+mod an_optimization_proves_the_output_identical_test;
 #[path = "anonymous_requests_cannot_tell_paths_apart.rs"]
 mod anonymous_requests_cannot_tell_paths_apart;
 #[path = "app_config_substitutions_contract_test.rs"]
