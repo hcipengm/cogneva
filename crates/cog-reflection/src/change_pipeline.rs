@@ -6401,6 +6401,136 @@ index 1111111..2222222 100644
         assert!(result.test_output.contains("Promotion gate rejected"));
     }
 
+    /// principle: feedback_the_cost_of_a_refusal_is_decided_by_where_in_the_pipeline_it_fires
+    ///
+    /// 「必被拒的票浪费一格重槽」 only holds when the refusal fires after the whole
+    /// gate set. A change whose diff no longer fits the base it was generated
+    /// against is refused the instant the base alignment asks: the
+    /// `git apply --check` probe runs on the workdir before any gate command is
+    /// spawned and before the verification budget is asked for a slot, so what
+    /// that refusal costs is the seconds the alignment took and never a slot a
+    /// change that could have passed would have used.
+    ///
+    /// The reading is the deployment's own: the cause the pipeline records, the
+    /// marker a gate command would have left had it been asked, and the budget's
+    /// published series, which for a change that never reached the gates carries
+    /// no elapsed run and a timeout count of zero.
+    #[tokio::test]
+    async fn a_change_refused_at_base_alignment_never_reaches_the_gates_or_a_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tree");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        git_ok(&root, &["init", "-b", "main"]).await;
+        git_ok(&root, &["config", "user.email", "t@t.c"]).await;
+        git_ok(&root, &["config", "user.name", "T"]).await;
+        tokio::fs::write(root.join("a.txt"), "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        git_ok(&root, &["add", "."]).await;
+        git_ok(&root, &["commit", "-m", "base"]).await;
+
+        // The change under test was generated against that base.
+        tokio::fs::write(root.join("a.txt"), "one\ntwo-change\nthree\n")
+            .await
+            .unwrap();
+        let out = tokio::process::Command::new("git")
+            .args(["diff"])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+        let content = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !content.is_empty(),
+            "the change under test has to be a real diff"
+        );
+        git_ok(&root, &["checkout", "--", "a.txt"]).await;
+
+        // The base moves while the change waits: the line it rewrites is
+        // rewritten under it, so its diff no longer fits.
+        tokio::fs::write(root.join("a.txt"), "one\ntwo-other\nthree\n")
+            .await
+            .unwrap();
+        git_ok(&root, &["add", "."]).await;
+        git_ok(&root, &["commit", "-m", "advance"]).await;
+
+        // One marker shared by all three gate commands: if any of them is asked,
+        // it leaves a trace, and a change refused before them leaves none.
+        let marks = tempfile::tempdir().unwrap();
+        let gate_marker = marks.path().join("gate-ran");
+        let gate = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("touch {}", gate_marker.display()),
+        ];
+        let budget =
+            std::sync::Arc::new(crate::verification_budget::VerificationBudget::new(60, 60));
+        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true)
+            .with_fmt_check_command(Some(gate.clone()))
+            .with_lint_command(Some(gate.clone()))
+            .with_test_command(gate)
+            .with_verification_budget(budget.clone());
+
+        let change = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
+            artifact_id: "collides-with-the-moved-base-1".into(),
+            description: "align the base before asking for a slot".into(),
+            content,
+            status: crate::types::EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let started = std::time::Instant::now();
+        let result = pipeline.apply_and_test(&change).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::ContextDoesNotApply),
+            "the moved base is what refused this change, and `ContextDoesNotApply` is the \
+             cause that stage and only that stage records"
+        );
+        assert_eq!(
+            result.new_status,
+            crate::types::EvolutionStatus::ValidationFailed
+        );
+        assert!(
+            !gate_marker.exists(),
+            "no gate command may be asked for a change the base already refused"
+        );
+
+        use cog_core::observability::Observable;
+        let readings = budget.collect_metrics("").await.unwrap();
+        let cell = |name: &str| {
+            readings
+                .iter()
+                .find(|m| {
+                    m.name == name
+                        && m.labels
+                            .get(crate::verification_budget::KIND_LABEL)
+                            .map(String::as_str)
+                            == Some(crate::verification_budget::KIND_TEST)
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(
+            cell(crate::verification_budget::TIMEOUTS_TOTAL_METRIC),
+            Some(0.0),
+            "no run of this change was killed by the budget, because none was started"
+        );
+        assert_eq!(
+            cell(crate::verification_budget::LAST_RUN_SECONDS_METRIC),
+            None,
+            "the published series carries no elapsed run: no slot was ever asked for"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(REPO_GATE_STAGE_WALL_SECS),
+            "the refusal costs the alignment's seconds, not a gate stage's wall: {elapsed:?}"
+        );
+    }
+
     /// 变更必须落在传入的工作树里，兄弟工作树与构造时的固定目录都不受影响
     /// ——这是「按任务动态分配工作树」的核心隔离性质。
     #[tokio::test]
