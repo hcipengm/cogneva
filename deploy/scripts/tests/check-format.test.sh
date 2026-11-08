@@ -12,7 +12,11 @@ gate="${repo}/deploy/scripts/check-format.sh"
 fail() { echo "FAIL: $*"; exit 1; }
 
 [ -f "${gate}" ] || fail "门脚本不存在：${gate}"
-command -v cargo >/dev/null || fail "这个环境没有 cargo，用例判不了（CI 有）"
+# 与门脚本同一套找法：PATH 上没有就退到 `$HOME/.cargo/bin`。用例只要求「这台机器能问
+# rustfmt」，不要求问它的那条路径必须叫 PATH。
+cargo_bin="$(command -v cargo || true)"
+[ -n "${cargo_bin}" ] || [ ! -x "${HOME}/.cargo/bin/cargo" ] || cargo_bin="${HOME}/.cargo/bin/cargo"
+[ -n "${cargo_bin}" ] || fail "这个环境没有 cargo，用例判不了（CI 有）"
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT

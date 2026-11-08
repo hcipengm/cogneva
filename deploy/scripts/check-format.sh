@@ -17,12 +17,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ "${1:-}" = "" ] || ROOT="$1"
 cd "$ROOT"
 
-command -v cargo >/dev/null || { echo "缺少依赖：cargo" >&2; exit 2; }
-cargo fmt --version >/dev/null 2>&1 || { echo "缺少依赖：这个工具链没装 rustfmt 组件" >&2; exit 2; }
+# Cargo 的找法与 `check-before-push.sh` 同一套：PATH 上找不到就退到 `$HOME/.cargo/bin`。
+#
+# 少了这一条回退，本机会出现一种最难读的红：`cargo clippy` 那一格（用绝对路径）刚跑过，
+# 紧接着这一格印「缺少依赖：cargo」——同一台机器上一步说 cargo 在、下一步说不在，因为两种
+# 找法不同。而这一步的退出码 2 在门里记成 RED，于是「问不了」被读成「没排过格式」，推的
+# 人被指去改一份空格根本没问题的文件。PATH 不是判据的一部分。
+cargo_bin="$(command -v cargo || true)"
+[ -n "${cargo_bin}" ] || [ ! -x "${HOME}/.cargo/bin/cargo" ] || cargo_bin="${HOME}/.cargo/bin/cargo"
+[ -n "${cargo_bin}" ] || { echo "缺少依赖：cargo" >&2; exit 2; }
+"${cargo_bin}" fmt --version >/dev/null 2>&1 || { echo "缺少依赖：这个工具链没装 rustfmt 组件" >&2; exit 2; }
 
 # rustfmt 把每一处偏差打成一段 diff 印在 stdout 上，退出码 1。这里只补一句「这意味着
 # 什么」：那一行是给人看的结论，上面那些 diff 是证据。
-if ! cargo fmt --all -- --check; then
+if ! "${cargo_bin}" fmt --all -- --check; then
     echo "上面这些文件没有按 rustfmt 排过：CI 的 Format 作业会因此红。" >&2
     echo "修法是 \`cargo fmt --all\`（会改写文件）；只想看会改哪里就再跑一次这条门。" >&2
     exit 1
