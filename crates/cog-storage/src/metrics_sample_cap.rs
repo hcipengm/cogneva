@@ -673,6 +673,27 @@ mod tests {
         }
     }
 
+    /// 容量清扫的地板只对 gauge 成立，且那个 kind 字面量来自 `MetricType`。
+    ///
+    /// 计数器与直方图的日志行是历史而不是读数：它们从各自的累加表里被读，所以
+    /// 任何一行都可以按普通次序删掉，排序问题根本不该问到它们头上。这条断言是
+    /// 那份豁免的范围本身——`<>` 一旦写成 `=`，或者 kind 字面量被换成一个手写
+    /// 的词，清扫就会转去删掉每个系列的最新样本，而那正是 scrape 唯一的来源，
+    /// 且不会报错。
+    #[test]
+    fn the_floor_is_gauge_only_and_the_kind_comes_from_metric_type() {
+        let sql = delete_surplus_sql("metrics_samples");
+        let gauge = cog_core::MetricType::Gauge.as_str();
+        assert!(
+            sql.contains(&format!("c.metric_type <> '{gauge}'")),
+            "the exemption must be conditioned on the kind being a gauge: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("g.metric_type = '{gauge}'")),
+            "the newest-per-series probe must ask about gauge rows: {sql}"
+        );
+    }
+
     fn pass_ago(held: i64, secs: u64) -> Option<PreviousPass> {
         Some(PreviousPass {
             at: Instant::now() - Duration::from_secs(secs),
