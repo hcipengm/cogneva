@@ -56,7 +56,39 @@ fake_cargo() {
   cp "$(command -v bash)" "$1"
 }
 
-work="$(mktemp -d)"
+# The fixtures sit on a filesystem the host's own reclaimer does not judge.
+# The installed carrier (cogneva-host-target-gc.timer, twice an hour) enumerates
+# from the filesystem root and treats any tree carrying cargo's tag as a
+# candidate. On 2026-11-08 a run that had started at 08:43 was still enumerating
+# at 09:03 and released the stale artifact and the incremental directory of
+# these very fixtures while this suite was judging them; the verdict was "3
+# trees carry 3 stale artifacts, 0 left, expected 2" on a tree nobody had
+# changed, and the run's own journal names the /tmp trees it cleared. A
+# reclaimer only touches candidates on the filesystem its work root is on, so a
+# tmpfs puts the fixtures out of its reach through the mechanism under test
+# (fs_identity) rather than through timing: nothing is left to race.
+fixture_root=""
+for candidate in /dev/shm "/run/user/$(id -u)"; do
+  [ -d "${candidate}" ] && [ -w "${candidate}" ] || continue
+  [ "$(stat -f -c %T "${candidate}" 2>/dev/null || true)" = tmpfs ] || continue
+  case "$(findmnt -no OPTIONS --target "${candidate}" 2>/dev/null || true)" in
+  *noexec*) continue ;;
+  esac
+  fixture_root="${candidate}"
+  break
+done
+if [ -n "${fixture_root}" ]; then
+  work="$(TMPDIR="${fixture_root}" mktemp -d)"
+else
+  work="$(mktemp -d)"
+  printf 'note: no tmpfs for the fixtures; an ambient reclaimer can release these bytes mid-suite\n' >&2
+fi
+# Ways out of that reach are not the same reading as being out of it: say which
+# one this run had, so a red can be read for what it is instead of looking like
+# a property of the script under test.
+if [ "$(stat -f -c %T "${work}")" = "$(stat -f -c %T "${repo}")" ]; then
+  printf 'note: fixtures share the filesystem of the checkout the host reclaimer judges\n' >&2
+fi
 fake_pids=()
 cleanup() {
   for pid in "${fake_pids[@]+"${fake_pids[@]}"}"; do kill "${pid}" 2>/dev/null || true; done
@@ -191,7 +223,9 @@ for tree in "${signed[@]}"; do
   if [ -f "${tree}/debug/deps/libstale.rlib" ]; then remaining=$((remaining + 1)); fi
 done
 [ "${remaining}" -eq "$((${#signed[@]} - 1))" ] \
-  || fail "${#signed[@]} 棵候选树里剩 ${remaining} 份过期产物，应为 $((${#signed[@]} - 1))：够到地板后还在往下删，或者第一档一份都没删掉"
+  || fail "${#signed[@]} 棵候选树里剩 ${remaining} 份过期产物，应为 $((${#signed[@]} - 1))：够到地板后还在往下删，或者第一档一份都没删掉
+--- the run said ---
+${out}"
 for tree in "${signed[@]}"; do
   [ -f "${tree}/debug/deps/libfresh.rlib" ] \
     || fail "第一档删掉了刚写过的产物（${tree}）；这会把下一次构建变成全量重编"
