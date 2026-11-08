@@ -331,6 +331,42 @@ pub const CHANGE_DIFF_SOURCE_MODEL: &str = "model";
 /// ratio a reader takes across them would be over two different populations.
 pub const CHANGE_DIFF_SOURCES: [&str; 2] = [CHANGE_DIFF_SOURCE_TREE, CHANGE_DIFF_SOURCE_MODEL];
 
+/// The cells of a self-evolution change's verdict, and what each one says about
+/// the plan that steered it.
+///
+/// Closed set, and a partition: every judged change lands in exactly one of
+/// these five, so the five counts are the number of judgments. That is what
+/// makes the face readable as a rate rather than as five unrelated numbers.
+///
+/// The question this answers is the one nothing answered before: a plan on this
+/// path produces one thing a machine can read — the set of paths it names — and
+/// a judge with no notion of "right" can only compare that set against the diff.
+/// So "did the plan help get it right first time" is, measurably, how often a
+/// well-formed diff aimed at the declared targets, against how often it was
+/// well-formed and aimed somewhere else. Without these cells the planner's cost
+/// is a line in the ledger with no output to weigh against it, which is why the
+/// only defensible answer to "does the planner earn its call" was "unmeasured".
+///
+/// `no_targets_declared` is its own cell rather than folded into the pass: a
+/// well-formed diff under a plan that named nothing passes *vacuously*, and a
+/// reader that added it to `well_formed` would report a planner doing its job on
+/// the strength of plans that did nothing at all.
+pub const SELF_EVOLUTION_VERDICT_NO_ARTIFACT: &str = "no_artifact";
+pub const SELF_EVOLUTION_VERDICT_UNPARSEABLE: &str = "unparseable";
+pub const SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED: &str = "no_targets_declared";
+pub const SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE: &str = "aimed_elsewhere";
+pub const SELF_EVOLUTION_VERDICT_WELL_FORMED: &str = "well_formed";
+
+/// Every cell of [`SELF_EVOLUTION_VERDICT_*`], so the exposition publishes the
+/// zeros and a gate can check each one reaches a rule.
+pub const SELF_EVOLUTION_VERDICT_CAUSES: [&str; 5] = [
+    SELF_EVOLUTION_VERDICT_NO_ARTIFACT,
+    SELF_EVOLUTION_VERDICT_UNPARSEABLE,
+    SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED,
+    SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE,
+    SELF_EVOLUTION_VERDICT_WELL_FORMED,
+];
+
 /// Where a self-evolution run's yield ended, and why.
 ///
 /// Closed set: the metric labels it, and an outcome nobody named would be
@@ -640,6 +676,15 @@ pub struct CollaborationObservable {
     /// that failed. Keyed by a `&'static str` so the cells are exactly the
     /// constants above and a typo cannot open a seventh.
     failure_routes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// How each self-evolution change's verdict landed, over
+    /// [`SELF_EVOLUTION_VERDICT_CAUSES`].
+    ///
+    /// The one face on this path that can say whether the plan earned its call.
+    /// Keyed by a `&'static str` from that array so the reading cannot grow a
+    /// sixth cell, and published at zero for the same reason the failure routes
+    /// are: a cell that stops moving is a rule that stopped firing, and that is
+    /// a different fact from a cell nobody ever wrote.
+    self_evolution_verdicts: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -986,6 +1031,21 @@ impl CollaborationObservable {
         *map.entry(route).or_insert(0) += 1;
     }
 
+    /// Record how one self-evolution change's verdict landed. Takes one of
+    /// [`SELF_EVOLUTION_VERDICT_CAUSES`] by type, so the reading cannot grow a
+    /// cell that is not one of the five.
+    ///
+    /// A synchronous lock: these counts are the only evidence of what the plan
+    /// bought on this path, and a dropped count reads as a judgment that never
+    /// happened — the exact state the face exists to rule out.
+    pub fn record_self_evolution_verdict(&self, cause: &'static str) {
+        let mut map = self
+            .self_evolution_verdicts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(cause).or_insert(0) += 1;
+    }
+
     /// Record one resume outcome. A synchronous lock: this counter is the only
     /// evidence that a resumed task was resumed at all, so a dropped count
     /// would read as a chain that never ran.
@@ -1118,6 +1178,22 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("ralph_failure_route_total", count as f64)
                         .with_label(crate::LABEL_ROUTE, route),
+                );
+            }
+            // How each self-evolution verdict landed, zeros included. The five
+            // cells partition the judgments, so their sum is how many changes
+            // were judged — and `aimed_elsewhere` against `well_formed` is the
+            // measurement of whether the plan steered the change at all.
+            let verdicts = self
+                .self_evolution_verdicts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for cause in SELF_EVOLUTION_VERDICT_CAUSES {
+                let count = verdicts.get(cause).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("self_evolution_verdict_total", count as f64)
+                        .with_label(crate::LABEL_CAUSE, cause),
                 );
             }
             // Every cell of the yield, published at zero once one run has
@@ -2297,6 +2373,71 @@ mod tests {
             ),
             0.0,
             "counting one dimension twice must not move another"
+        );
+    }
+
+    /// Five verdict cells on the wire before anything is judged, and each counts
+    /// only what was recorded into it.
+    ///
+    /// The zeros are the reading: a cell that stays at zero is a verdict this
+    /// build never reaches, which is a different fact from a verdict nobody
+    /// looked for. Publishing only the cells that have counts would make a
+    /// renamed or dead branch invisible on the one face that exists to price
+    /// the plan.
+    #[tokio::test]
+    async fn every_self_evolution_verdict_cell_is_published_and_counted_apart() {
+        let obs = CollaborationObservable::new();
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let cell = |metrics: &[RawMetric], name: &str, label: &str, value: &str| {
+            metrics
+                .iter()
+                .find(|m| m.name == name && m.labels.get(label).map(String::as_str) == Some(value))
+                .map(|m| m.value)
+                .unwrap_or_else(|| {
+                    panic!("{name}{{{label}=\"{value}\"}} must be published, at 0 when nothing was recorded")
+                })
+        };
+
+        for cause in SELF_EVOLUTION_VERDICT_CAUSES {
+            assert_eq!(
+                cell(&metrics, "self_evolution_verdict_total", "cause", cause),
+                0.0,
+                "{cause} must be published even with nothing recorded into it"
+            );
+        }
+
+        obs.record_self_evolution_verdict(SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE);
+        obs.record_self_evolution_verdict(SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE);
+        obs.record_self_evolution_verdict(SELF_EVOLUTION_VERDICT_WELL_FORMED);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            cell(
+                &metrics,
+                "self_evolution_verdict_total",
+                "cause",
+                SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE
+            ),
+            2.0
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "self_evolution_verdict_total",
+                "cause",
+                SELF_EVOLUTION_VERDICT_WELL_FORMED
+            ),
+            1.0
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "self_evolution_verdict_total",
+                "cause",
+                SELF_EVOLUTION_VERDICT_NO_ARTIFACT
+            ),
+            0.0,
+            "counting one verdict twice must not move another"
         );
     }
 

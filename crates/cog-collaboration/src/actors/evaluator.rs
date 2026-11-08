@@ -114,7 +114,11 @@ impl EvaluatorActor {
         // loosening a gate.
         if is_self_evolution {
             let validation = Self::validate_change_artifacts(generation);
-            let output = Self::judge_self_evolution_change(&validation, generation, plan);
+            let (output, cause) = Self::judge_self_evolution_change(&validation, generation, plan);
+            // The verdict's cell is the only reading of what the plan bought on
+            // this path: the planner's calls are a line in the ledger either
+            // way, and without this one there is nothing to weigh them against.
+            crate::observable::global_observable().record_self_evolution_verdict(cause);
             let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
             // Self-review for self-evolution is skipped for the same reason: the
             // deterministic change validation already answers the measurable
@@ -266,7 +270,12 @@ impl EvaluatorActor {
         validation: &str,
         generation: &serde_json::Value,
         plan: &serde_json::Value,
-    ) -> EvaluationResult {
+    ) -> (EvaluationResult, &'static str) {
+        use crate::observable::{
+            SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE, SELF_EVOLUTION_VERDICT_NO_ARTIFACT,
+            SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED, SELF_EVOLUTION_VERDICT_UNPARSEABLE,
+            SELF_EVOLUTION_VERDICT_WELL_FORMED,
+        };
         use crate::squad::pge::types::{change_targets, declared_targets, uncovered_targets};
 
         let well_formed = validation.starts_with("change_validation: change artifact(s) are valid");
@@ -276,14 +285,21 @@ impl EvaluatorActor {
         } else {
             Vec::new()
         };
-        let (verdict, score) = if !well_formed {
+        // The cell is chosen here, beside the verdict and the score it belongs
+        // to, so a future branch cannot add a verdict without choosing a cell.
+        // A reader that re-derived it from the verdict would fold the vacuous
+        // pass into the earned one and report a planner at work on plans that
+        // named nothing.
+        let (verdict, score, cause) = if !well_formed {
             if validation.contains("no change artifact found") {
-                (Verdict::Fail, 0)
+                (Verdict::Fail, 0, SELF_EVOLUTION_VERDICT_NO_ARTIFACT)
             } else {
-                (Verdict::Fail, 10)
+                (Verdict::Fail, 10, SELF_EVOLUTION_VERDICT_UNPARSEABLE)
             }
+        } else if declared.is_empty() {
+            (Verdict::Pass, 85, SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED)
         } else if uncovered.is_empty() {
-            (Verdict::Pass, 85)
+            (Verdict::Pass, 85, SELF_EVOLUTION_VERDICT_WELL_FORMED)
         } else {
             // A well-formed change that never touches a path the plan named.
             // Scored above an unappliable diff (10) and below a pass: the artifact
@@ -296,7 +312,7 @@ impl EvaluatorActor {
             // allowed on purpose (the planner is told so): the plan bounds what
             // the change must cover, not what it may touch, and the apply gate
             // is what bounds the latter.
-            (Verdict::Fail, 20)
+            (Verdict::Fail, 20, SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE)
         };
 
         let mut criteria = vec![Criterion {
@@ -333,13 +349,16 @@ impl EvaluatorActor {
             )
         };
 
-        EvaluationResult {
-            verdict,
-            feedback,
-            score: Some(score),
-            criteria,
-            details: None,
-        }
+        (
+            EvaluationResult {
+                verdict,
+                feedback,
+                score: Some(score),
+                criteria,
+                details: None,
+            },
+            cause,
+        )
     }
 
     /// Validate that self-evolution artifacts contain a valid change.
@@ -441,6 +460,10 @@ mod tests {
     }
 
     fn judged(diff: &str, plan: &serde_json::Value) -> EvaluationResult {
+        judged_with_cell(diff, plan).0
+    }
+
+    fn judged_with_cell(diff: &str, plan: &serde_json::Value) -> (EvaluationResult, &'static str) {
         let generation = generation_with_diff(diff);
         let validation = EvaluatorActor::validate_change_artifacts(&generation);
         EvaluatorActor::judge_self_evolution_change(&validation, &generation, plan)
@@ -518,7 +541,8 @@ mod tests {
         let plan = plan_naming(&["README.md"]);
         let generation = generation_with_diff("not a diff at all\n");
         let validation = EvaluatorActor::validate_change_artifacts(&generation);
-        let result = EvaluatorActor::judge_self_evolution_change(&validation, &generation, &plan);
+        let (result, _) =
+            EvaluatorActor::judge_self_evolution_change(&validation, &generation, &plan);
 
         assert_eq!(result.verdict, Verdict::Fail);
         assert_eq!(result.score, Some(10));
@@ -532,6 +556,50 @@ mod tests {
             "{}",
             result.feedback
         );
+    }
+
+    /// 五格是一个划分：每一次判定恰好落进一格，五格之和就是判定次数。
+    ///
+    /// 这条读数是 planner 在这条路上唯一的产出度量——它的调用在账上一直看得见，
+    /// 买到了什么一直是空白，于是「planner 有没有提高一次做对」谁答都是猜。
+    /// 每个格子都用一具真标本走到，不是断言常量等于自己。
+    #[test]
+    fn every_judged_change_lands_in_exactly_one_cell() {
+        use crate::observable::{
+            SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE, SELF_EVOLUTION_VERDICT_CAUSES,
+            SELF_EVOLUTION_VERDICT_NO_ARTIFACT, SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED,
+            SELF_EVOLUTION_VERDICT_UNPARSEABLE, SELF_EVOLUTION_VERDICT_WELL_FORMED,
+        };
+
+        let plan = plan_naming(&["README.md"]);
+        let cells = [
+            judged_with_cell(&create_diff("crates/cogneva/src/elsewhere.rs"), &plan).1,
+            judged_with_cell(&modify_diff("README.md"), &plan).1,
+            judged_with_cell(&create_diff("crates/cogneva/src/elsewhere.rs"), &serde_json::json!({}))
+                .1,
+            judged_with_cell("not a diff at all\n", &plan).1,
+        ];
+        // 没有产物那一格走不到 diff 上：给它一份 artifacts 空表。
+        let empty = serde_json::json!({ "artifacts": [] });
+        let validation = EvaluatorActor::validate_change_artifacts(&empty);
+        let no_artifact = EvaluatorActor::judge_self_evolution_change(&validation, &empty, &plan).1;
+
+        assert_eq!(cells[0], SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE);
+        assert_eq!(cells[1], SELF_EVOLUTION_VERDICT_WELL_FORMED);
+        assert_eq!(cells[2], SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED);
+        assert_eq!(cells[3], SELF_EVOLUTION_VERDICT_UNPARSEABLE);
+        assert_eq!(no_artifact, SELF_EVOLUTION_VERDICT_NO_ARTIFACT);
+
+        // 五格是闭集：一个判定若要写第六个格子，这里先红。
+        for cause in cells.into_iter().chain([no_artifact]) {
+            assert!(
+                SELF_EVOLUTION_VERDICT_CAUSES.contains(&cause),
+                "{cause} is not one of the published cells"
+            );
+        }
+        // 「点名了目标且都碰到」与「没点名任何目标」必须是两格：并成一格时，
+        // 一个什么都没做的 planner 会被读成一直在干活。
+        assert_ne!(cells[1], cells[2]);
     }
 
     #[test]

@@ -45,6 +45,13 @@ pub const LABEL_PART: &str = "part";
 /// 读数带上「为什么是这个值」时用的标签键。
 pub const LABEL_REASON: &str = "reason";
 
+/// 读数按「这一格是怎么落到的」归属时用的标签键。
+///
+/// 与 [`LABEL_REASON`] 分开：`reason` 装的是产生端自己写下的自由文本理由，
+/// 而这个键装的是一个闭集里的成员名，读的人拿它当分母做比例。同一张表里混用
+/// 两个键，比例的分母就会把自由文本也算进去。
+pub const LABEL_CAUSE: &str = "cause";
+
 /// 读数按「走到哪一步」归属时用的标签键。
 pub const LABEL_STAGE: &str = "stage";
 
