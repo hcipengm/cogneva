@@ -119,4 +119,84 @@ there_key="$(GIT_DIR="${caller}/.git" GIT_WORK_TREE="${caller}" \
 [ "${here_key}" = "${there_key}" ] ||
     fail "继承来的 git 定位变量换了指纹（这棵树 ${here_key:0:12}，调用方那棵树 ${there_key:0:12}）"
 
-echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效"
+# 11~14) 第三把键：这批**改动**本身，而不是它踩在哪棵树上。
+#
+# 为什么要有它：2026-11-08 实测，整门跑两小时，而远端每 66～123 分钟往前走一笔。要推就得
+# 先变基，一变基这棵树里就多了别人的文件，按树记的两把键一起作废——于是每个会话都在重复
+# 这两小时，不是红，是永远差一步。这几格钉住的是 patch-id 的两面：干净的变基之后同一批
+# 改动仍是验过的，而解冲突改了解法之后它就不再是同一批。
+ptree="${work}/ptree"
+mkdir -p "${ptree}/deploy/scripts"
+cp "${gate}" "${ptree}/deploy/scripts/check-before-push.sh"
+(
+    cd "${ptree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'a\nb\nc\n' >f.txt
+    git add f.txt
+    git commit -q -m base
+) || fail "夹具仓建不起来"
+base1="$(git -C "${ptree}" rev-parse HEAD)"
+printf 'a\nB\nc\n' >"${ptree}/f.txt"
+printf 'new\n' >"${ptree}/g.txt"
+
+# 11) 判的那一头读工作树、推的那一头读 HEAD：同一批字节，两份必须是同一个键。这就是
+#     「判完 → 提交 → 变基 → 推」整条链的接口，对不上则整条链断在这里。
+wtkey="$( cd "${ptree}" && bash deploy/scripts/check-before-push.sh --key-patch-tree "${base1}" )" ||
+    fail "--key-patch-tree 退非零"
+[ -n "${wtkey}" ] || fail "--key-patch-tree 什么都没印"
+(
+    cd "${ptree}" || exit 1
+    git add -A
+    git commit -q -m delta
+) || fail "夹具的这批改动提交不掉"
+pkey="$( cd "${ptree}" && bash deploy/scripts/check-before-push.sh --key-patch "${base1}" )" ||
+    fail "--key-patch 退非零"
+[ "${wtkey}" = "${pkey}" ] ||
+    fail "同一批字节，工作树那份与提交后那份算出了两个键（${wtkey:0:12} ≠ ${pkey:0:12}）"
+pkey2="$( cd "${ptree}" && bash deploy/scripts/check-before-push.sh --key-patch "${base1}" )"
+[ "${pkey}" = "${pkey2}" ] || fail "同一个基底两次问出不同的改动键（${pkey:0:12} ≠ ${pkey2:0:12}）"
+mkdir -p "${ptree}/.git/check-before-push"
+printf 'fixture\n' >"${ptree}/.git/check-before-push/patch.${wtkey}"
+( cd "${ptree}" && bash deploy/scripts/check-before-push.sh --status-patch "${base1}" ) >"${work}/out" 2>&1 ||
+    fail "判过、提交过的这批改动仍报没验过；实得：$(cat "${work}/out")"
+
+# 12) 干净的变基（远端往前走了一笔与这批改动无关的提交）⇒ 还是同一批改动，账照样命中。
+(
+    cd "${ptree}" || exit 1
+    git checkout -q -b upstream "${base1}"
+    printf 'unrelated\n' >u.txt
+    git add u.txt
+    git commit -q -m upstream
+) || fail "夹具的远端那一笔建不起来"
+base2="$(git -C "${ptree}" rev-parse upstream)"
+( cd "${ptree}" && git checkout -q main && git rebase -q upstream ) || fail "夹具的干净变基没走完"
+( cd "${ptree}" && bash deploy/scripts/check-before-push.sh --status-patch "${base2}" ) >"${work}/out" 2>&1 ||
+    fail "干净的变基之后这批改动的账失效了；实得：$(cat "${work}/out")"
+
+# 13) 解冲突改了解法 ⇒ 这批改动不再是判过的那一批，旧账不许替它说话。
+(
+    cd "${ptree}" || exit 1
+    git checkout -q -b conflict "${base1}"
+    printf 'a\nX\nc\n' >f.txt
+    git add f.txt
+    git commit -q -m conflicting
+) || fail "夹具的冲突那一笔建不起来"
+base3="$(git -C "${ptree}" rev-parse conflict)"
+( cd "${ptree}" && git checkout -q main && GIT_EDITOR=true git rebase conflict >/dev/null 2>&1 ) &&
+    fail "夹具没造出冲突（变基自己走完了）"
+printf 'a\nBX\nc\n' >"${ptree}/f.txt"
+( cd "${ptree}" && git add f.txt && GIT_EDITOR=true git rebase --continue >/dev/null 2>&1 ) ||
+    fail "夹具的冲突变基没走完"
+if ( cd "${ptree}" && bash deploy/scripts/check-before-push.sh --status-patch "${base3}" ) >"${work}/out" 2>&1; then
+    fail "解冲突改了解法之后，旧账仍把这批改动说成验过"
+fi
+
+# 14) 没有改动可判（基底就是这棵树）：问不了 ⇒ 退 2。退 1 会把它说成「没验过」。
+rc=0
+( cd "${ptree}" && bash deploy/scripts/check-before-push.sh --status-patch "$(git -C "${ptree}" rev-parse HEAD)" ) \
+    >"${work}/out" 2>&1 || rc=$?
+[ "${rc}" -eq 2 ] || fail "没有改动时 --status-patch 应退 2（问不了），实得 ${rc}：$(cat "${work}/out")"
+
+echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效"

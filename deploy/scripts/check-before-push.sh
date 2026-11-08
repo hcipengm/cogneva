@@ -115,19 +115,105 @@ work_tree_oid() {
     return 0
 }
 
+# 判据自己的输入：门脚本的字节、`ci.yml` 的字节、工具的版本、测试库设没设。
+# 三把键都要带上它——判据变了，上一次的结论就不再作数。
+gate_inputs() {
+    [ -f "${here}/check-before-push.sh" ] && sha256sum "${here}/check-before-push.sh"
+    [ -f "$root/.github/workflows/ci.yml" ] && sha256sum "$root/.github/workflows/ci.yml"
+    tool_sig cargo cargo --version
+    tool_sig rustc rustc --version
+    tool_sig shellcheck shellcheck --version
+    tool_sig node node --version
+    printf 'test-db=%s\n' "${COGNEVA_TEST_DATABASE_URL:+set}"
+}
+
 content_key() {
     local tree
     tree="$(work_tree_oid)"
     [ -n "${tree}" ] || return 1
     {
         printf 'tree=%s\n' "${tree}"
-        [ -f "${here}/check-before-push.sh" ] && sha256sum "${here}/check-before-push.sh"
-        [ -f "$root/.github/workflows/ci.yml" ] && sha256sum "$root/.github/workflows/ci.yml"
-        tool_sig cargo cargo --version
-        tool_sig rustc rustc --version
-        tool_sig shellcheck shellcheck --version
-        tool_sig node node --version
-        printf 'test-db=%s\n' "${COGNEVA_TEST_DATABASE_URL:+set}"
+        gate_inputs
+    } | sha256sum | cut -d' ' -f1
+}
+
+# ---- 第三把键：这一批改动本身，而不是它踩在哪棵树上 ----
+#
+# 前两把键都绑在一棵具体的树上（HEAD 组成的树、或工作树字节组成的树）。一棵树只要
+# 动了一格，哪怕动的那一格与这次改动毫无关系，键就换了，验过的结论就作废。2026-11-08
+# 实测的形状：整门跑两小时，期间 cogneva 自己的进化流水线每 66～123 分钟往 origin/main
+# 落一笔；要推上去就得先变基，一变基树里就多了别人的文件，两小时白跑。谁的整门都快不
+# 过这个间隔，于是每个会话都在重复这两小时——不是红，是永远差一步。
+#
+# 所以第三把键记的是**改动本身**：从共同祖先到工作树的那一份 diff 的 patch-id，加判据
+# 自己的输入。`git patch-id --stable` 按补丁正文算——提交 id、blob id、`@@` 里的行号都
+# 不进哈希（2026-11-08 实测：只改这三样，id 一字不变），所以改动落在文件的哪一处不影响；
+# **改动前后那几行在场文字进哈希**，同一份改动换个上下文就是另一个 id。
+#
+# 这两面都实测过（同一台机器，同一天）：
+#   - 今天这两笔变基到 `845c45a5`（别人只动了另外两个文件），整批的 id 一分没变
+#     （24a757a4…），这也是这条链能成立的原因；
+#   - 基底在紧邻处改过一行、把我的改动挤进另一片上下文，id 就换了。落空是保守的方向：
+#     宁可重判一次，不把「没判过的组合」放行。
+# 解冲突改了解法的变基同样换 id，这正是要拦的那种。
+#
+# 它证明的是另一句话，必须说准：**这批改动在当时那棵树上判过**，不是**这批改动与今天这棵
+# 树合起来判过**。合起来那一问由便宜的腿答——推之前那道钩子按推上去的树解引用、对改动的
+# 脚本跑 shellcheck，CI 再整棵判一遍。本机整门的职责是「别把明显坏的东西推上去」，不是
+# 替代 CI；把这两件事混成一件，门就会长到把自己卡死。
+patch_key() { # [共同祖先] —— 工作树那一份（这一跑判的就是它）
+    local base idx p
+    base="${1:-}"
+    if [ -z "${base}" ]; then
+        base="$(git merge-base HEAD origin/main 2>/dev/null)" || return 1
+    fi
+    [ -n "${base}" ] || return 1
+    idx="$(mktemp "${TMPDIR:-/tmp}/cogneva-prepush-index.XXXXXX")" || return 1
+    rm -f "${idx}"
+    # 与 work_tree_oid 同样的定位变量摘除：钩子拉起来的 git 会把 GIT_DIR/GIT_WORK_TREE
+    # 指到调用方那棵树，索引逐条显式给，不靠继承。
+    if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
+             -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="${idx}" \
+             git read-tree "${base}" >/dev/null 2>&1 ||
+       ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
+             -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="${idx}" \
+             git add -A >/dev/null 2>&1; then
+        rm -f "${idx}"
+        return 1
+    fi
+    p="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
+             -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="${idx}" \
+             git diff --cached --no-color --no-ext-diff "${base}" 2>/dev/null |
+         git patch-id --stable 2>/dev/null | cut -d' ' -f1)"
+    rm -f "${idx}"
+    [ -n "${p}" ] || return 1
+    {
+        printf 'patch=%s\n' "${p}"
+        gate_inputs
+    } | sha256sum | cut -d' ' -f1
+}
+
+# 同一批改动，问的人不一样，读的地方也不一样：
+#   - 判的那一头（这一跑）读**工作树**：判据读的就是它，脏的那几处也在判过的字节里；
+#   - 推的那一头（钩子）读**HEAD**：推上去的只有提交里的字节，共享树上别人此刻在飞的
+#     改动不进这一推，也不该让这一推的账失效。
+# 两边算出来的是同一个数，条件是「判过的那份字节已经被提交掉」。这不是巧合，是这条链的
+# 全部：判完 → 提交（字节不变）→ 变基（diff 不变）→ 推。字节只要变过，两头就对不上，
+# 而这正是这一问要的结局。
+patch_key_committed() { # [共同祖先]
+    local base p
+    base="${1:-}"
+    if [ -z "${base}" ]; then
+        base="$(git merge-base HEAD origin/main 2>/dev/null)" || base=""
+    fi
+    [ -n "${base}" ] || return 1
+    # 树对树，不碰索引与工作树：别人的在飞改动不在这份 diff 里。
+    p="$(git diff --no-color --no-ext-diff "${base}" HEAD 2>/dev/null |
+         git patch-id --stable 2>/dev/null | cut -d' ' -f1)"
+    [ -n "${p}" ] || return 1
+    {
+        printf 'patch=%s\n' "${p}"
+        gate_inputs
     } | sha256sum | cut -d' ' -f1
 }
 
@@ -148,6 +234,41 @@ case "${1:-}" in
     fi
     echo "这份字节没验过（$(git rev-parse --short HEAD 2>/dev/null)，键 ${key:0:12}）；"
     echo "先跑 \`bash deploy/scripts/check-before-push.sh\`，它跑绿了自己记账，之后这一推秒过。"
+    exit 1
+    ;;
+--key-patch)
+    patch_key_committed "${2:-}"
+    exit $?
+    ;;
+--key-patch-tree)
+    # 绿的那一跑记的是这一把：判的是工作树，键也得按工作树算。两份在「判过的那份字节已被
+    # 提交掉」时相等，那正是这条链成立的条件。
+    patch_key "${2:-}"
+    exit $?
+    ;;
+--status-patch)
+    # 推之前问的是这一句：**我要推上去的这几笔，判过而且绿吗**。与 `--status-content`
+    # 问的不是同一件事：内容键问的是「这棵树」，这里问的是「这批改动」——树换了基底，
+    # 改动还是这批，这一问照样命中。
+    #
+    # 基底由调用方给（`merge-base <远端那个提交> <本地那个提交>`），因为这正是这次推
+    # 要补上的那一段。自己去猜 `origin/main` 会在钩子里猜错：钩子说的远端提交就是它
+    # 传入的那一个，不是本地缓存的引用。
+    pbase="${2:-}"
+    if [ -z "${pbase}" ]; then
+        pbase="$(git merge-base HEAD origin/main 2>/dev/null)" || pbase=""
+    fi
+    pkey="$(patch_key_committed "${pbase}")"
+    if [ -z "${pkey}" ]; then
+        echo "这批改动读不出指纹（没有共同祖先，或临时索引写不了），问不了（不是红）"
+        exit 2
+    fi
+    if [ -f "${stamp_dir}/patch.${pkey}" ]; then
+        echo "这批改动验过：$(head -n 1 "${stamp_dir}/patch.${pkey}")"
+        exit 0
+    fi
+    echo "这批改动（改动键 ${pkey:0:12}，基底 ${pbase:0:12}）没验过：这批改动本身改过、或从没跑过验证；"
+    echo "先跑 \`bash deploy/scripts/check-before-push.sh\`，它跑绿了自己记账，之后变基到新基底也不用重判。"
     exit 1
     ;;
 --status-content)
@@ -613,9 +734,12 @@ echo "Format / Version Contract / Web Build / Bootstrap Cross-Platform。"
 
 # 绿了才记账。红的那一跑什么也不写：一份没验过的字节不能因为「上次跑过」就推得出去。
 #
-# 两笔分开记，因为它们回答两个不同的问题：
+# 三笔分开记，因为它们回答三个不同的问题：
 #   - 内容键（`content.<键>`）：这一跑判的就是工作树的字节，脏不脏无关——提交之后字节不变，
 #     所以提交前后同一份指纹，提交那一问（`--status-content`）命中的正是判过的那一份；
+#   - 改动键（`patch.<键>`）：从共同祖先到工作树的那份 diff 的 patch-id。远端往前走了、
+#     变基到新基底上，改动还是这一批，这一笔照样命中；改动本身被改过（解冲突改了解法）
+#     才作废。推送那一问（`--status-patch`）问的是它；
 #   - 推送键（`<HEAD+origin/main>`）：只在干净的树上成立，因为推上去的是 HEAD，而这跑判的
 #     是工作树；脏的时候两者不是同一份字节，只在结尾说明。
 mkdir -p "${stamp_dir}" 2>/dev/null
@@ -626,6 +750,17 @@ if [ -n "${ckey}" ] &&
     echo "记账：内容键 ${ckey:0:12} 这份字节判过，提交前后都读得到这一笔。"
 else
     echo "记账：写不进 ${stamp_dir}，这一跑照常算数，只是下一次提交／推送还得再判一遍。" >&2
+fi
+# 第三笔：这批改动本身。它与脏不脏无关——判的是从共同祖先到「现在这棵树」的那一份 diff，
+# 提交只是把同样的字节换个名字（工作树 → 提交），patch-id 不变。所以这一笔在脏树上也记。
+pkey="$(patch_key)"
+if [ -n "${pkey}" ] &&
+   printf '%s %s（改动，基底 %s）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
+       "$(git merge-base HEAD origin/main 2>/dev/null | cut -c1-7)" \
+       > "${stamp_dir}/patch.${pkey}" 2>/dev/null; then
+    echo "记账：改动键 ${pkey:0:12} 这批改动判过；远端往前走了、变基到新基底上照样命中。"
+else
+    echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
 fi
 if [ "${run_dirty}" -ne 0 ]; then
     echo "推进账另记：工作树上有 ${run_dirty} 处未提交改动，这一跑判的不是 HEAD 的字节，暂不记。"
