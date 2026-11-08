@@ -1,4 +1,4 @@
-//! Governance rows, read and written through the task table.
+//! Governance rows, read and written through the task ledger.
 //!
 //! There is no face table. A face is a non-executable task in one reserved
 //! workspace, which is the same shape the platform already keeps for a
@@ -7,205 +7,181 @@
 //! alternative -- a second table of faces -- was rejected because two stores
 //! answering "who owns this" disagree the first time one of them is updated.
 //!
-//! The generated columns `face_id` and `owner_unit` are the task JSON read out
-//! by the database itself, so the index and the row cannot describe different
-//! bindings. They are declared in the state backend's schema, not here: that
-//! schema is what creates the table, and a migration that altered a table it
-//! had not created would fail on a fresh install.
-//!
-//! That also means a reader outside the application process cannot assume they
-//! exist -- the columns appear when the application's own startup step runs, and
-//! a host command reading the same database may be several revisions ahead of
-//! the deployment. The queries below therefore read the binding out of the task
-//! document, which is where it is written and is present on every row.
+//! Since the task graph became a ledger, the fields these rows are read by are
+//! columns: `face_id` and `owner_unit` live on the definition revision, and the
+//! state a row is in is its last transition. That is what makes the handover
+//! paths below cheap -- moving a face's unstarted work appends one revision per
+//! row instead of rewriting a document per row -- and it is also why nothing
+//! here parses a task document to find out who owns what.
 //!
 //! Every read here is over rows the task system already keeps. The only thing
 //! this store adds is the shape of the question.
 
 use async_trait::async_trait;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 
 use cog_core::{
     GovernanceStore, Handover, SFError, SFResult, Task, TaskStatus, FACE_TASK_TYPE,
     GOVERNANCE_WORKSPACE,
 };
 
+use super::task_ledger::{self, ledger_sql, LedgerRow};
+
 /// Face nodes, in one workspace, typed as faces.
 ///
-/// The type is matched through its `Custom` variant because that is how the
-/// task type is written: a variant with a payload serialises as an object, and
-/// reading it as a bare string would match nothing and look like an empty
-/// registry rather than a broken query.
-const FACE_NODES_SQL: &str = "\
-SELECT task FROM cog_dag_tasks \
-WHERE workspace_id = $1 \
-  AND task->'task_type'->>'custom' = $2 \
-ORDER BY task_id";
+/// The kind is a column now, so "typed as a face" is an equality and not a
+/// parse: a custom type is stored under its own name, which is exactly the
+/// string [`cog_core::TaskType::kind_key`] writes.
+fn face_nodes_sql() -> String {
+    format!(
+        "{} ORDER BY task_id",
+        ledger_sql("workspace_id = $1 AND kind = $2", "")
+    )
+}
 
 /// Open work that names a face.
 ///
-/// Terminal rows are excluded because a completed task cannot drift; rows
+/// Terminal states are excluded because a completed task cannot drift; rows
 /// without a face are excluded because they belong to no face's reading; face
 /// nodes themselves are excluded by workspace, since they are not work.
 ///
-/// `COALESCE(..., true)`: rows written before `is_executable` existed omit the
-/// field, and those rows are executable. Reading the missing value as false
-/// would drop every older task from the reading and make the platform look
-/// idle.
-const OPEN_FACE_BOUND_SQL_TEMPLATE: &str = "\
-SELECT task FROM cog_dag_tasks \
-WHERE status IN ('{pending}', '{scheduled}', '{running}') \
-  AND task ->> 'face_id' IS NOT NULL \
-  AND workspace_id <> $1 \
-  AND COALESCE((task->>'is_executable')::boolean, true) \
-ORDER BY workspace_id, task_id";
+/// The state filter sits outside the definition subquery on purpose: what a
+/// task's state is depends on its transitions, so filtering inside the subquery
+/// would compare a definition column against a state that is not there.
+fn open_face_bound_sql() -> String {
+    ledger_sql(
+        "workspace_id <> $1 AND face_id IS NOT NULL AND is_executable",
+        "to_state IN ('{pending}', '{scheduled}', '{running}') \
+         ORDER BY workspace_id, task_id",
+    )
+}
 
-/// Upsert one face node.
-const SAVE_FACE_NODE_SQL: &str = "\
-INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at) \
-VALUES ($1, $2, $3, $4, NOW()) \
-ON CONFLICT (workspace_id, task_id) DO UPDATE \
-    SET task = EXCLUDED.task, status = EXCLUDED.status, updated_at = NOW()";
+/// Every row of one governance task type. Handovers, decisions and votes are
+/// rows like the faces, and they are told apart by their kind.
+fn governance_nodes_sql() -> String {
+    format!(
+        "{} ORDER BY task_id",
+        ledger_sql("workspace_id = $1 AND kind = $2", "")
+    )
+}
 
-/// Write a face node only while the stored revision is still the one the
-/// caller read.
-///
-/// The revision lives inside the task payload, so the guard reads it from
-/// there. A handover that bumps it and an import that read the old value cannot
-/// both win: whichever arrives second matches nothing and is told so.
-const SAVE_FACE_NODE_IF_REVISION_SQL: &str = "\
-UPDATE cog_dag_tasks \
-   SET task = $3, status = $4, updated_at = NOW() \
- WHERE workspace_id = $1 AND task_id = $2 \
-   AND COALESCE((task->'input'->'face'->>'revision')::bigint, 1) = $5";
-
-/// Every row of one governance task type.
-///
-/// Handovers, decisions and votes are rows like the faces, so the same read
-/// that finds faces finds them: the type is read out of the document, which
-/// every row carries, rather than from a column a deployment may not have
-/// added yet.
-const GOVERNANCE_NODES_SQL: &str = "\
-SELECT task FROM cog_dag_tasks \
-WHERE workspace_id = $1 \
-  AND task->'task_type'->>'custom' = $2 \
-ORDER BY task_id";
-
-/// Write one governance row, whatever state it is in.
-const SAVE_GOVERNANCE_NODE_SQL: &str = "\
-INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at) \
-VALUES ($1, $2, $3, $4, NOW()) \
-ON CONFLICT (workspace_id, task_id) DO UPDATE \
-    SET task = EXCLUDED.task, status = EXCLUDED.status, updated_at = NOW()";
-
-/// Write a governance row only while it is still in one of the states the
-/// caller read.
-const SAVE_GOVERNANCE_NODE_IF_STATUS_SQL: &str = "\
-UPDATE cog_dag_tasks \
-   SET task = $3, status = $4, updated_at = NOW() \
- WHERE workspace_id = $1 AND task_id = $2 AND status = ANY($5)";
-
-/// Move a signed handover to its applied state, but only from `scheduled`.
-const APPLY_HANDOVER_ROW_SQL_TEMPLATE: &str = "\
-UPDATE cog_dag_tasks \
-   SET task = $3, status = $4, updated_at = NOW() \
- WHERE workspace_id = $1 AND task_id = $2 AND status = '{scheduled}'";
-
-/// Hand the outgoing unit's unstarted work for one face to the incoming unit.
+/// Give one face's unstarted work to the incoming unit.
 ///
 /// Only `pending` and `scheduled` rows move. A `running` task is executable
 /// through its holder's lease; rewriting its owner would leave the lease and
-/// the binding describing different units, so it is left to finish where it
-/// is and reads as drifted until then.
+/// the binding describing different units, so it is left to finish where it is
+/// and reads as drifted until then.
 ///
-/// `agent_id` and `lease_owner` are cleared because they name the old owner's
-/// worker. Keeping them would hand the new unit a row it cannot execute (the
-/// router checks the owner) while the row claims a worker that belongs to
-/// somebody else.
-const REBIND_FACE_TASKS_SQL_TEMPLATE: &str = "\
-UPDATE cog_dag_tasks \
-   SET task = (task - 'agent_id' - 'lease_owner') || jsonb_build_object( \
-                'owner_unit', $3::text, \
-                'input', CASE WHEN jsonb_typeof(task -> 'input') = 'object' \
-                              THEN jsonb_set(task -> 'input', '{owner_unit}', \
-                                             to_jsonb($3::text), true) \
-                              ELSE task -> 'input' END, \
-                'bound_by_handover_id', $4::text), \
-       updated_at = NOW() \
- WHERE workspace_id <> $1 \
-   AND task ->> 'face_id' = $2 \
-   AND task ->> 'owner_unit' = $5 \
-   AND status IN ('{pending}', '{scheduled}')";
+/// `agent_id` is cleared because it names the old owner's worker. Keeping it
+/// would hand the new unit a row it cannot execute (the router checks the
+/// owner) while the row claims a worker that belongs to somebody else. The
+/// lease lives in the projection rather than the definition, so it is cleared
+/// there after the revisions are appended.
+///
+/// The new revision carries the binding in both places the old document did --
+/// the column and the payload the claimer reads -- because those two copies are
+/// how the executor learns who it is working for.
+const REBIND_FACE_TASKS_SQL: &str = "\
+WITH latest AS (\
+    SELECT DISTINCT ON (task_id) * FROM task_defined \
+     WHERE workspace_id <> $1 \
+     ORDER BY task_id, rev DESC), \
+targets AS (\
+    SELECT l.* FROM latest l \
+      JOIN task_current c ON c.task_id = l.task_id \
+     WHERE l.face_id = $2 AND l.owner_unit = $5 \
+       AND c.state IN ('{pending}', '{scheduled}')) \
+INSERT INTO task_defined (\
+    task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
+    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    parent_task_id, sink_task_id, face_id, venue, owner_unit, \
+    bound_by_handover_id, submitted_by, planner_verified, planner_version, \
+    planner_note, planner_source, planner_confidence, planner_at) \
+SELECT task_id, rev + 1, workspace_id, kind, \
+       CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
+            THEN jsonb_set(input::jsonb, '{owner_unit}', to_jsonb($3::text), true)::text \
+            ELSE input END, \
+       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
+       face_id, venue, $3, $4, submitted_by, planner_verified, \
+       planner_version, planner_note, planner_source, planner_confidence, planner_at \
+  FROM targets \
+ON CONFLICT (task_id, rev) DO NOTHING \
+RETURNING task_id";
 
 /// Hand one face's unstarted work to a unit that is present.
 ///
-/// The same row surgery as a handover's rebind, without the handover: the face
-/// did not change hands on paper, the unit that held its rows is simply gone.
-/// The new owner is written into the row and into the goal payload the claimer
-/// reads, because those two copies are how the executor learns who it is
-/// working for; a row whose copies disagree tells the claimer about a unit
-/// that is not there.
+/// The same revision as a handover's rebind, without the handover: the face did
+/// not change hands on paper, the unit that held its rows is simply gone.
 ///
-/// `$3` is compared before writing, so a face whose rows already belong to the
-/// present unit matches nothing and the pass reports zero rows moved rather
-/// than rewriting rows every two minutes. The comparison is `IS DISTINCT FROM`
-/// because the rows this is for are the ones a release left behind, and those
-/// name nobody: plain `<>` answers NULL against a missing key, which is not
-/// true, so the row is silently skipped and the face keeps reading idle while
-/// the pass reports that it looked.
-const REASSIGN_FACE_WORK_SQL_TEMPLATE: &str = "\
-UPDATE cog_dag_tasks \
-   SET task = (task - 'agent_id' - 'lease_owner') || jsonb_build_object( \
-                'owner_unit', $3::text, \
-                'input', CASE WHEN jsonb_typeof(task -> 'input') = 'object' \
-                              THEN jsonb_set(task -> 'input', '{owner_unit}', \
-                                             to_jsonb($3::text), true) \
-                              ELSE task -> 'input' END), \
-       updated_at = NOW() \
- WHERE workspace_id <> $1 \
-   AND task ->> 'face_id' = $2 \
-   AND task ->> 'owner_unit' IS DISTINCT FROM $3 \
-   AND status IN ('{pending}', '{scheduled}')";
+/// The owner is compared before writing, so a face whose rows already belong to
+/// the present unit matches nothing and the pass reports zero rows moved rather
+/// than appending a revision every two minutes. The comparison is
+/// `IS DISTINCT FROM` rather than `<>`: plain `<>` answers NULL against a
+/// missing owner, which is not true, so the row would be silently skipped and
+/// the face would keep reading idle while the pass reported that it looked.
+const REASSIGN_FACE_WORK_SQL: &str = "\
+WITH latest AS (\
+    SELECT DISTINCT ON (task_id) * FROM task_defined \
+     WHERE workspace_id <> $1 \
+     ORDER BY task_id, rev DESC), \
+targets AS (\
+    SELECT l.* FROM latest l \
+      JOIN task_current c ON c.task_id = l.task_id \
+     WHERE l.face_id = $2 AND l.owner_unit IS DISTINCT FROM $3 \
+       AND c.state IN ('{pending}', '{scheduled}')) \
+INSERT INTO task_defined (\
+    task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
+    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    parent_task_id, sink_task_id, face_id, venue, owner_unit, \
+    bound_by_handover_id, submitted_by, planner_verified, planner_version, \
+    planner_note, planner_source, planner_confidence, planner_at) \
+SELECT task_id, rev + 1, workspace_id, kind, \
+       CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
+            THEN jsonb_set(input::jsonb, '{owner_unit}', to_jsonb($3::text), true)::text \
+            ELSE input END, \
+       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
+       face_id, venue, $3, bound_by_handover_id, submitted_by, planner_verified, \
+       planner_version, planner_note, planner_source, planner_confidence, planner_at \
+  FROM targets \
+ON CONFLICT (task_id, rev) DO NOTHING \
+RETURNING task_id";
 
 /// Give one face's unstarted work back to the shared queue.
 ///
 /// Both copies of the owner go, for the same reason both were written: the row
-/// and the goal payload are read by different hands, and a row whose payload
-/// still names a unit tells the executor it is working for somebody the queue
-/// never routed it from. `owner_unit` is removed rather than set to a name,
-/// which is what puts the rows back in front of every worker.
-const RELEASE_FACE_WORK_SQL_TEMPLATE: &str = "\
-UPDATE cog_dag_tasks \
-   SET task = (task - 'agent_id' - 'lease_owner' - 'owner_unit') || jsonb_build_object( \
-                'input', CASE WHEN jsonb_typeof(task -> 'input') = 'object' \
-                              THEN (task -> 'input') - 'owner_unit' \
-                              ELSE task -> 'input' END), \
-       updated_at = NOW() \
- WHERE workspace_id <> $1 \
-   AND task ->> 'face_id' = $2 \
-   AND task ->> 'owner_unit' IS NOT NULL \
-   AND status IN ('{pending}', '{scheduled}')";
-
-/// Write a face's standing duty row, replacing only a row that cannot serve.
-///
-/// The row is the face's evidence of staffing, and the two ways it stops
-/// serving are both silent: a terminal row is not open work, and a row in
-/// another shape is eaten by the dispatcher and turned terminal. Both are
-/// replaced here; a live row in the right shape bound to the same unit is
-/// left exactly as it is, which is what makes this safe to run every pass.
-///
-/// `running` is excluded from the repair branch on purpose: an old-shaped row
-/// that is already executing must not be rewritten under the lease that makes
-/// it executable. It fails on its own and is replaced on the next pass.
-const ENSURE_FACE_DUTY_SQL_TEMPLATE: &str = "\
-INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at) \
-VALUES ($1, $2, $3, $4, NOW()) \
-ON CONFLICT (workspace_id, task_id) DO UPDATE \
-   SET task = EXCLUDED.task, status = EXCLUDED.status, updated_at = NOW() \
- WHERE (cog_dag_tasks.status IN ('{completed}', '{failed}', '{cancelled}') \
-        OR cog_dag_tasks.task -> 'task_type' IS DISTINCT FROM EXCLUDED.task -> 'task_type' \
-        OR cog_dag_tasks.task ->> 'owner_unit' IS DISTINCT FROM EXCLUDED.task ->> 'owner_unit') \
-   AND cog_dag_tasks.status <> '{running}'";
+/// and the payload are read by different hands, and a row whose payload still
+/// names a unit tells the executor it is working for somebody the queue never
+/// routed it from. `owner_unit` is set to NULL rather than to a name, which is
+/// what puts the rows back in front of every worker.
+const RELEASE_FACE_WORK_SQL: &str = "\
+WITH latest AS (\
+    SELECT DISTINCT ON (task_id) * FROM task_defined \
+     WHERE workspace_id <> $1 \
+     ORDER BY task_id, rev DESC), \
+targets AS (\
+    SELECT l.* FROM latest l \
+      JOIN task_current c ON c.task_id = l.task_id \
+     WHERE l.face_id = $2 AND l.owner_unit IS NOT NULL \
+       AND c.state IN ('{pending}', '{scheduled}')) \
+INSERT INTO task_defined (\
+    task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
+    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    parent_task_id, sink_task_id, face_id, venue, owner_unit, \
+    bound_by_handover_id, submitted_by, planner_verified, planner_version, \
+    planner_note, planner_source, planner_confidence, planner_at) \
+SELECT task_id, rev + 1, workspace_id, kind, \
+       CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
+            THEN ((input::jsonb) - 'owner_unit')::text \
+            ELSE input END, \
+       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
+       face_id, venue, NULL, bound_by_handover_id, submitted_by, planner_verified, \
+       planner_version, planner_note, planner_source, planner_confidence, planner_at \
+  FROM targets \
+ON CONFLICT (task_id, rev) DO NOTHING \
+RETURNING task_id";
 
 /// The status words a template may ask for, and the variant each stands for.
 ///
@@ -247,85 +223,142 @@ impl PostgresGovernanceStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-}
 
-fn rows_to_tasks(rows: Vec<sqlx::postgres::PgRow>) -> SFResult<Vec<Task>> {
-    rows.into_iter()
-        .map(|row| {
-            let value: serde_json::Value = row
-                .try_get("task")
-                .map_err(|e| SFError::Database(format!("governance task column: {e}")))?;
-            serde_json::from_value(value).map_err(SFError::Serialization)
-        })
-        .collect()
+    /// The rows a ledger read returned, as tasks.
+    ///
+    /// A row this build cannot read is an error rather than a skipped row: a
+    /// face that silently disappears from the registry is a face nobody
+    /// staffs, and the reading would say "no faces" instead.
+    fn rows_to_tasks(rows: Vec<LedgerRow>) -> SFResult<Vec<Task>> {
+        rows.into_iter().map(LedgerRow::into_task).collect()
+    }
+
+    /// Clear the lease on rows just given a new owner.
+    ///
+    /// The lease is presence, not history, so it is not part of a definition
+    /// revision -- and a row that changed hands must not keep pointing at the
+    /// worker of the unit it left.
+    async fn clear_leases(
+        conn: &mut sqlx::PgConnection,
+        task_ids: &[String],
+    ) -> Result<(), SFError> {
+        if task_ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE task_current SET lease_owner = NULL, lease_expires_at = NULL \
+              WHERE task_id = ANY($1)",
+        )
+        .bind(task_ids)
+        .execute(conn)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Re-project the rows a bulk write touched.
+    ///
+    /// The projection carries `def_rev`, the watermark a reader compares to
+    /// know its row is current. Appending a definition revision without
+    /// re-projecting would leave that watermark pointing at the old revision --
+    /// a reading that looks fresh and is one revision behind.
+    async fn reproject(conn: &mut sqlx::PgConnection, task_ids: &[String]) -> Result<(), SFError> {
+        for task_id in task_ids {
+            task_ledger::project(conn, Some(task_id)).await?;
+        }
+        Ok(())
+    }
+
+    /// The revision number a face node's payload carries, defaulting to 1.
+    ///
+    /// The old document read this out of the row itself; here it is the same
+    /// number, read from the latest definition's payload.
+    async fn face_revision(conn: &mut sqlx::PgConnection, task_id: &str) -> Result<i64, SFError> {
+        let input: Option<String> = sqlx::query_scalar(
+            "SELECT input FROM task_defined WHERE task_id = $1 ORDER BY rev DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(conn)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        let revision = input
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| value.pointer("/face/revision").and_then(|v| v.as_i64()));
+        Ok(revision.unwrap_or(1))
+    }
 }
 
 #[async_trait]
 impl GovernanceStore for PostgresGovernanceStore {
     async fn face_nodes(&self) -> SFResult<Vec<Task>> {
-        let rows = sqlx::query(FACE_NODES_SQL)
+        let rows: Vec<LedgerRow> = sqlx::query_as(&face_nodes_sql())
             .bind(GOVERNANCE_WORKSPACE)
             .bind(FACE_TASK_TYPE)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("governance face nodes: {e}")))?;
-        rows_to_tasks(rows)
+        Self::rows_to_tasks(rows)
     }
 
     async fn open_face_bound_tasks(&self) -> SFResult<Vec<Task>> {
-        let rows = sqlx::query(&fill_statuses(OPEN_FACE_BOUND_SQL_TEMPLATE))
+        let rows: Vec<LedgerRow> = sqlx::query_as(&fill_statuses(&open_face_bound_sql()))
             .bind(GOVERNANCE_WORKSPACE)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("governance open tasks: {e}")))?;
-        rows_to_tasks(rows)
+        Self::rows_to_tasks(rows)
     }
 
     async fn save_face_node(&self, task: &Task) -> SFResult<()> {
-        let value = serde_json::to_value(task).map_err(SFError::Serialization)?;
-        sqlx::query(SAVE_FACE_NODE_SQL)
-            .bind(GOVERNANCE_WORKSPACE)
-            .bind(&task.id)
-            .bind(value)
-            .bind(task.status.as_str())
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("governance save face node: {e}")))?;
+        task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, task).await?;
+        tx.commit()
             .await
             .map_err(|e| SFError::Database(format!("governance save face node: {e}")))?;
         Ok(())
     }
 
     async fn save_face_node_if_revision(&self, task: &Task, expected: i64) -> SFResult<bool> {
-        let value = serde_json::to_value(task).map_err(SFError::Serialization)?;
-        let result = sqlx::query(SAVE_FACE_NODE_IF_REVISION_SQL)
-            .bind(GOVERNANCE_WORKSPACE)
-            .bind(&task.id)
-            .bind(value)
-            .bind(task.status.as_str())
-            .bind(expected)
-            .execute(&self.pool)
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            SFError::Database(format!("governance save face node if revision: {e}"))
+        })?;
+        // The lock comes first: the revision is read and then written, and two
+        // handovers reading the same one must not both find it current.
+        task_ledger::lock_workspace(&mut tx, GOVERNANCE_WORKSPACE).await?;
+        let current = Self::face_revision(&mut tx, &task.id).await?;
+        if current != expected {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, task).await?;
+        tx.commit()
             .await
             .map_err(|e| SFError::Database(format!("governance save face node: {e}")))?;
-        Ok(result.rows_affected() == 1)
+        Ok(true)
     }
 
     async fn governance_nodes(&self, task_type: &str) -> SFResult<Vec<Task>> {
-        let rows = sqlx::query(GOVERNANCE_NODES_SQL)
+        let rows: Vec<LedgerRow> = sqlx::query_as(&governance_nodes_sql())
             .bind(GOVERNANCE_WORKSPACE)
             .bind(task_type)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("governance {task_type} nodes: {e}")))?;
-        rows_to_tasks(rows)
+        Self::rows_to_tasks(rows)
     }
 
     async fn save_governance_node(&self, task: &Task) -> SFResult<()> {
-        let value = serde_json::to_value(task).map_err(SFError::Serialization)?;
-        sqlx::query(SAVE_GOVERNANCE_NODE_SQL)
-            .bind(GOVERNANCE_WORKSPACE)
-            .bind(&task.id)
-            .bind(value)
-            .bind(task.status.as_str())
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("governance save node: {e}")))?;
+        task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, task).await?;
+        tx.commit()
             .await
             .map_err(|e| SFError::Database(format!("governance save node: {e}")))?;
         Ok(())
@@ -336,18 +369,29 @@ impl GovernanceStore for PostgresGovernanceStore {
         task: &Task,
         expected: &[TaskStatus],
     ) -> SFResult<bool> {
-        let value = serde_json::to_value(task).map_err(SFError::Serialization)?;
-        let states: Vec<&str> = expected.iter().map(TaskStatus::as_str).collect();
-        let result = sqlx::query(SAVE_GOVERNANCE_NODE_IF_STATUS_SQL)
-            .bind(GOVERNANCE_WORKSPACE)
-            .bind(&task.id)
-            .bind(value)
-            .bind(task.status.as_str())
-            .bind(&states)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| SFError::Database(format!("governance save node: {e}")))?;
-        Ok(result.rows_affected() == 1)
+            .map_err(|e| SFError::Database(format!("governance save node if status: {e}")))?;
+        task_ledger::lock_workspace(&mut tx, GOVERNANCE_WORKSPACE).await?;
+        let state = task_ledger::current_state(&mut tx, &task.id).await?;
+        match state {
+            Some(state) if expected.contains(&state) => {
+                task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, task).await?;
+                tx.commit()
+                    .await
+                    .map_err(|e| SFError::Database(format!("governance save node: {e}")))?;
+                Ok(true)
+            }
+            _ => {
+                // No row answers the question the same way a row in another
+                // state does: the caller asked to write only from the states it
+                // read, and a missing row is not one of them.
+                tx.rollback().await.ok();
+                Ok(false)
+            }
+        }
     }
 
     async fn save_governance_node_with_event(
@@ -356,37 +400,21 @@ impl GovernanceStore for PostgresGovernanceStore {
         node: &Task,
         expected: &[TaskStatus],
     ) -> SFResult<bool> {
-        let node_value = serde_json::to_value(node).map_err(SFError::Serialization)?;
-        let event_value = serde_json::to_value(event).map_err(SFError::Serialization)?;
-        let states: Vec<&str> = expected.iter().map(TaskStatus::as_str).collect();
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| SFError::Database(format!("governance close with event: {e}")))?;
+        task_ledger::lock_workspace(&mut tx, GOVERNANCE_WORKSPACE).await?;
 
-        let moved = sqlx::query(SAVE_GOVERNANCE_NODE_IF_STATUS_SQL)
-            .bind(GOVERNANCE_WORKSPACE)
-            .bind(&node.id)
-            .bind(node_value)
-            .bind(node.status.as_str())
-            .bind(&states)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(format!("governance close with event: {e}")))?;
-        if moved.rows_affected() != 1 {
+        let state = task_ledger::current_state(&mut tx, &node.id).await?;
+        if !matches!(state, Some(state) if expected.contains(&state)) {
             tx.rollback().await.ok();
             return Ok(false);
         }
 
-        sqlx::query(SAVE_GOVERNANCE_NODE_SQL)
-            .bind(GOVERNANCE_WORKSPACE)
-            .bind(&event.id)
-            .bind(event_value)
-            .bind(event.status.as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(format!("governance close with event: {e}")))?;
+        task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, node).await?;
+        task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, event).await?;
 
         tx.commit()
             .await
@@ -403,53 +431,46 @@ impl GovernanceStore for PostgresGovernanceStore {
         let spec = Handover::from_task(handover)
             .ok_or_else(|| SFError::Validation("the handover row carries no handover".into()))?
             .spec;
-        let handover_value = serde_json::to_value(handover).map_err(SFError::Serialization)?;
-        let face_value = serde_json::to_value(face).map_err(SFError::Serialization)?;
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
+        task_ledger::lock_workspace(&mut tx, GOVERNANCE_WORKSPACE).await?;
 
-        let moved_handover = sqlx::query(&fill_statuses(APPLY_HANDOVER_ROW_SQL_TEMPLATE))
-            .bind(GOVERNANCE_WORKSPACE)
-            .bind(&handover.id)
-            .bind(handover_value)
-            .bind(handover.status.as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
-        if moved_handover.rows_affected() != 1 {
+        // The handover may only move out of `scheduled`: a signed handover that
+        // arrived twice must apply once.
+        let state = task_ledger::current_state(&mut tx, &handover.id).await?;
+        if state != Some(TaskStatus::Scheduled) {
             tx.rollback().await.ok();
             return Ok(None);
         }
+        task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, handover).await?;
 
-        let moved_face = sqlx::query(SAVE_FACE_NODE_IF_REVISION_SQL)
-            .bind(GOVERNANCE_WORKSPACE)
-            .bind(&face.id)
-            .bind(face_value)
-            .bind(face.status.as_str())
-            .bind(expected_revision)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
-        if moved_face.rows_affected() != 1 {
+        let current = Self::face_revision(&mut tx, &face.id).await?;
+        if current != expected_revision {
             tx.rollback().await.ok();
             return Ok(None);
         }
+        task_ledger::write_task(&mut tx, GOVERNANCE_WORKSPACE, face).await?;
 
         // Nothing to follow when the face was vacant: no unit held its work.
         let rebound = match spec.from_unit.as_deref() {
-            Some(from) => sqlx::query(&fill_statuses(REBIND_FACE_TASKS_SQL_TEMPLATE))
-                .bind(GOVERNANCE_WORKSPACE)
-                .bind(&spec.face_id)
-                .bind(&spec.to_unit)
-                .bind(&handover.id)
-                .bind(from)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?
-                .rows_affected() as usize,
+            Some(from) => {
+                let moved: Vec<(String,)> = sqlx::query_as(&fill_statuses(REBIND_FACE_TASKS_SQL))
+                    .bind(GOVERNANCE_WORKSPACE)
+                    .bind(&spec.face_id)
+                    .bind(&spec.to_unit)
+                    .bind(&handover.id)
+                    .bind(from)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
+                let ids: Vec<String> = moved.into_iter().map(|(id,)| id).collect();
+                Self::reproject(&mut tx, &ids).await?;
+                Self::clear_leases(&mut tx, &ids).await?;
+                ids.len()
+            }
             None => 0,
         };
 
@@ -468,26 +489,46 @@ impl GovernanceStore for PostgresGovernanceStore {
                     .into(),
             ));
         }
-        let moved = sqlx::query(&fill_statuses(REASSIGN_FACE_WORK_SQL_TEMPLATE))
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("governance reassign face work: {e}")))?;
+        let moved: Vec<(String,)> = sqlx::query_as(&fill_statuses(REASSIGN_FACE_WORK_SQL))
             .bind(GOVERNANCE_WORKSPACE)
             .bind(face_id)
             .bind(to_unit)
-            .execute(&self.pool)
+            .fetch_all(&mut *tx)
             .await
-            .map_err(|e| SFError::Database(format!("governance reassign face work: {e}")))?
-            .rows_affected() as usize;
-        Ok(moved)
+            .map_err(|e| SFError::Database(format!("governance reassign face work: {e}")))?;
+        let ids: Vec<String> = moved.into_iter().map(|(id,)| id).collect();
+        Self::reproject(&mut tx, &ids).await?;
+        Self::clear_leases(&mut tx, &ids).await?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("governance reassign face work: {e}")))?;
+        Ok(ids.len())
     }
 
     async fn release_face_work(&self, face_id: &str) -> SFResult<usize> {
-        let released = sqlx::query(&fill_statuses(RELEASE_FACE_WORK_SQL_TEMPLATE))
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("governance release face work: {e}")))?;
+        let released: Vec<(String,)> = sqlx::query_as(&fill_statuses(RELEASE_FACE_WORK_SQL))
             .bind(GOVERNANCE_WORKSPACE)
             .bind(face_id)
-            .execute(&self.pool)
+            .fetch_all(&mut *tx)
             .await
-            .map_err(|e| SFError::Database(format!("governance release face work: {e}")))?
-            .rows_affected() as usize;
-        Ok(released)
+            .map_err(|e| SFError::Database(format!("governance release face work: {e}")))?;
+        let ids: Vec<String> = released.into_iter().map(|(id,)| id).collect();
+        Self::reproject(&mut tx, &ids).await?;
+        Self::clear_leases(&mut tx, &ids).await?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("governance release face work: {e}")))?;
+        Ok(ids.len())
     }
 
     async fn ensure_face_duty(&self, row: &Task) -> SFResult<bool> {
@@ -499,18 +540,51 @@ impl GovernanceStore for PostgresGovernanceStore {
                 row.workspace_id
             )));
         }
-        let value = serde_json::to_value(row).map_err(SFError::Serialization)?;
-        let written = sqlx::query(&fill_statuses(ENSURE_FACE_DUTY_SQL_TEMPLATE))
-            .bind(workspace)
-            .bind(&row.id)
-            .bind(value)
-            .bind(row.status.as_str())
-            .execute(&self.pool)
+
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| SFError::Database(format!("governance ensure face duty: {e}")))?
-            .rows_affected()
-            > 0;
-        Ok(written)
+            .map_err(|e| SFError::Database(format!("governance ensure face duty: {e}")))?;
+        task_ledger::lock_workspace(&mut tx, workspace).await?;
+
+        // The two ways a duty row stops serving are both silent: a terminal
+        // row is not open work, and a row in another shape is eaten by the
+        // dispatcher and turned terminal. Both are replaced; a live row in the
+        // right shape bound to the same unit is left exactly as it is, which is
+        // what makes this safe to run every pass.
+        //
+        // A `running` row is never rewritten: it is executing under the lease
+        // that makes it executable, and it fails on its own to be replaced on
+        // the next pass.
+        let existing: Option<LedgerRow> =
+            sqlx::query_as(&ledger_sql("workspace_id = $1 AND task_id = $2", ""))
+                .bind(workspace)
+                .bind(&row.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| SFError::Database(format!("governance ensure face duty: {e}")))?;
+
+        let replace = match existing {
+            None => true,
+            Some(current) => {
+                let task = current.into_task()?;
+                task.status != TaskStatus::Running
+                    && (matches!(
+                        task.status,
+                        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                    ) || task.task_type != row.task_type
+                        || task.owner_unit != row.owner_unit)
+            }
+        };
+
+        if replace {
+            task_ledger::write_task(&mut tx, workspace, row).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("governance ensure face duty: {e}")))?;
+        Ok(replace)
     }
 }
 
@@ -522,15 +596,13 @@ mod status_templates {
     #[test]
     fn every_template_fills_its_state_placeholders() {
         let templates = [
-            OPEN_FACE_BOUND_SQL_TEMPLATE,
-            APPLY_HANDOVER_ROW_SQL_TEMPLATE,
-            REBIND_FACE_TASKS_SQL_TEMPLATE,
-            REASSIGN_FACE_WORK_SQL_TEMPLATE,
-            RELEASE_FACE_WORK_SQL_TEMPLATE,
-            ENSURE_FACE_DUTY_SQL_TEMPLATE,
+            open_face_bound_sql(),
+            REBIND_FACE_TASKS_SQL.to_string(),
+            REASSIGN_FACE_WORK_SQL.to_string(),
+            RELEASE_FACE_WORK_SQL.to_string(),
         ];
         let mut filled = 0;
-        for template in templates {
+        for template in &templates {
             let sql = fill_statuses(template);
             for (name, _) in STATUS_PLACEHOLDERS {
                 let slot = format!("{{{name}}}");
@@ -544,8 +616,8 @@ mod status_templates {
         // 少到这一步说明有人把模板改回了直接拼状态词，或者换了占位符的名字
         // 却没登记；两种都让下面那几条查询读一个不存在的状态。
         assert!(
-            filled >= 5,
-            "五条模板里一共只有 {filled} 个状态占位符，比应有的少"
+            filled >= 9,
+            "四条模板里一共只有 {filled} 个状态占位符，比应有的少"
         );
     }
 

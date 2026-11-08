@@ -156,6 +156,15 @@ const UNNAMED: &[(&str, &str)] = &[
          only has an answer where the pack image is running, so it is a manual \
          reading against a hand-built pod rather than a step.",
     ),
+    (
+        "crates/cog-storage/tests/the_ledger_can_be_uninstalled_and_reinstalled.rs",
+        "It runs the down migration -- which drops the four ledger tables and \
+         rebuilds the old document table from them -- and then the up migration \
+         again. That is only a reading on a database nobody depends on: as a \
+         step it would be a rollback performed by CI against the deployment's \
+         own ledger. Its header carries the one-line way to run it against a \
+         scratch database.",
+    ),
 ];
 
 /// What a step selects, as far as naming tests goes.

@@ -4,9 +4,9 @@
 //! Two things can be wrong here without any reading of the board changing, so
 //! both are checked against a live PostgreSQL.
 //!
-//! The first is the estimate. The venue label lives in the task's JSON, so the
-//! index over it is an expression index and `ANALYZE` is the only source of
-//! statistics the planner has for it. A *partial* index -- one that covers only
+//! The first is the estimate. The venue label is a column on the definition
+//! ledger, and `ANALYZE` is the only source of statistics the planner has for
+//! it. A *partial* index -- one that covers only
 //! the labeled rows, which is the natural way to keep it small -- has its
 //! statistics gathered from the rows it covers, so its null fraction is zero
 //! and the planner reads that as "nearly every row has a label". Its estimate
@@ -37,7 +37,7 @@ use serde_json::Value;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 
 use cog_core::{StateBackend, Task, TaskStatus, TaskType};
-use cog_storage::{PostgresStateBackend, VENUE_TASKS_SQL};
+use cog_storage::{venue_tasks_sql, PostgresStateBackend};
 
 use cog_test_support::database_url;
 
@@ -53,6 +53,17 @@ const UNLABELED: i64 = 1_997;
 
 const UPS: &str = include_str!("../migrations/postgres/093_cog_dag_tasks_venue_index.up.sql");
 
+/// The read as it was written against the document table, frozen here.
+///
+/// This is deliberately not [`venue_tasks_sql`]: the upgrade path under test is a
+/// database that still holds `cog_dag_tasks`, and what 093/094 have to deliver
+/// there is that *this* statement -- the one that shipped -- stops scanning the
+/// table. A statement built from today's ledger would not run against that
+/// schema at all.
+const HISTORICAL_VENUE_READ: &str = "SELECT task FROM cog_dag_tasks \
+     WHERE workspace_id = $1 AND task ->> 'venue' IS NOT NULL \
+       AND btrim(task ->> 'venue') <> ''";
+
 /// The step 093 leaves out, on purpose and in a file of its own so the upgrade
 /// path can be judged by applying both and reading the plan.
 const ANALYZE_UPS: &str =
@@ -61,8 +72,8 @@ const ANALYZE_UPS: &str =
 /// The plan of the statement the store reads venues with, on this session's
 /// search path, built from the store's own text: a copy written here would go
 /// on passing after the store's stopped being indexable.
-async fn plan_on(conn: &mut PgConnection, workspace: &str) -> Value {
-    let prepared = format!("PREPARE probe_venue(text) AS {VENUE_TASKS_SQL}");
+async fn plan_on(conn: &mut PgConnection, sql: &str, workspace: &str) -> Value {
+    let prepared = format!("PREPARE probe_venue(text) AS {sql}");
     conn.execute(prepared.as_str()).await.unwrap();
     let explained = format!("EXPLAIN (FORMAT JSON) EXECUTE probe_venue('{workspace}')");
     sqlx::query_scalar::<_, Value>(explained.as_str())
@@ -77,16 +88,16 @@ async fn plan_on(conn: &mut PgConnection, workspace: &str) -> Value {
 /// keeps the pool's connections out of this.
 async fn plan_of_the_venue_read() -> Value {
     let mut conn = PgConnection::connect(&database_url()).await.unwrap();
-    plan_on(&mut conn, PROBE_WORKSPACE).await
+    plan_on(&mut conn, &venue_tasks_sql(), PROBE_WORKSPACE).await
 }
 
 /// Whether any plan node used the venue index.
-fn uses_the_venue_index(plan: &Value) -> bool {
+fn uses_the_venue_index(plan: &Value, index: &str) -> bool {
     nodes(plan).iter().any(|n| {
         matches!(
             n.get("Node Type").and_then(Value::as_str),
             Some("Index Scan") | Some("Bitmap Index Scan")
-        ) && n.get("Index Name").and_then(Value::as_str) == Some("idx_cog_dag_tasks_venue")
+        ) && n.get("Index Name").and_then(Value::as_str) == Some(index)
     })
 }
 
@@ -113,26 +124,33 @@ async fn the_venue_read_is_a_lookup_and_returns_the_labeled_rows() {
         .expect("connect to the test database");
     let backend = PostgresStateBackend::new(pool.clone());
     backend.init_schema().await.expect("create the task schema");
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
-        .bind(PROBE_WORKSPACE)
-        .execute(&pool)
-        .await
-        .expect("clear this probe's rows");
+    clear_probe(&pool).await;
 
+    // The unlabeled rows go in as ledger rows, not through the store: this
+    // test is about what the read costs over a table the size of the live one,
+    // and two thousand store writes would measure the writer.
+    //
+    // Both tables, because a definition without a transition is not a task:
+    // its state is the last transition, so a definition nothing moved is a row
+    // the read correctly leaves out.
     sqlx::query(
-        "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status) \
-         SELECT $1, 'p' || g, \
-                jsonb_build_object('id', 'p' || g, 'task_type', 'DagNode', \
-                                   'status', 'Pending', \
-                                   'payload', jsonb_build_object('body', repeat('x', 4000))), \
-                'Pending' \
-         FROM generate_series(1, $2) g",
+        "WITH ids AS (SELECT 'p' || g AS task_id FROM generate_series(1, $2) g) \
+         INSERT INTO task_defined (task_id, rev, workspace_id, kind, input, created_at) \
+         SELECT task_id, 1, $1, 'dag_node', repeat('x', 4000), NOW() FROM ids",
     )
     .bind(PROBE_WORKSPACE)
     .bind(UNLABELED)
     .execute(&pool)
     .await
-    .expect("write the unlabeled rows");
+    .expect("write the unlabeled definitions");
+    sqlx::query(
+        "INSERT INTO task_transition (task_id, seq, to_state) \
+         SELECT 'p' || g, 1, 'pending' FROM generate_series(1, $1) g",
+    )
+    .bind(UNLABELED)
+    .execute(&pool)
+    .await
+    .expect("write the unlabeled states");
     // The labeled rows go in through the store, not as hand-built JSON: these
     // are the rows the read has to deserialize, and a field missing from a
     // literal here would be this test's bug rather than the store's.
@@ -149,7 +167,7 @@ async fn the_venue_read_is_a_lookup_and_returns_the_labeled_rows() {
             .await
             .expect("write a labeled row");
     }
-    sqlx::query("ANALYZE cog_dag_tasks")
+    sqlx::query("ANALYZE task_defined")
         .execute(&pool)
         .await
         .expect("refresh the statistics the plan is chosen from");
@@ -168,7 +186,7 @@ async fn the_venue_read_is_a_lookup_and_returns_the_labeled_rows() {
     );
     assert!(
         nodes(plan).iter().any(|n| {
-            n.get("Index Name").and_then(Value::as_str) == Some("idx_cog_dag_tasks_venue")
+            n.get("Index Name").and_then(Value::as_str) == Some("idx_task_defined_venue")
         }),
         "取行用的必须是这条语句对应的那个索引：{kinds:?}"
     );
@@ -183,11 +201,38 @@ async fn the_venue_read_is_a_lookup_and_returns_the_labeled_rows() {
     read.sort();
     assert_eq!(read, vec!["v-done", "v-failed", "v-running"]);
 
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
+    clear_probe(&pool).await;
+}
+
+/// Remove every row this binary writes, from all four ledger tables: leaving
+/// definitions behind would leave rows in the statistics the next run reads.
+async fn clear_probe(pool: &PgPool) {
+    sqlx::query(
+        "WITH ids AS (SELECT task_id FROM task_defined WHERE workspace_id = $1) \
+         DELETE FROM task_attempt WHERE task_id IN (SELECT task_id FROM ids)",
+    )
+    .bind(PROBE_WORKSPACE)
+    .execute(pool)
+    .await
+    .expect("clear the probe's attempts");
+    sqlx::query(
+        "WITH ids AS (SELECT task_id FROM task_defined WHERE workspace_id = $1) \
+         DELETE FROM task_transition WHERE task_id IN (SELECT task_id FROM ids)",
+    )
+    .bind(PROBE_WORKSPACE)
+    .execute(pool)
+    .await
+    .expect("clear the probe's transitions");
+    sqlx::query("DELETE FROM task_defined WHERE workspace_id = $1")
         .bind(PROBE_WORKSPACE)
-        .execute(&pool)
+        .execute(pool)
         .await
-        .expect("leave the database as it was found");
+        .expect("clear the probe's definitions");
+    sqlx::query("DELETE FROM task_current WHERE workspace_id = $1")
+        .bind(PROBE_WORKSPACE)
+        .execute(pool)
+        .await
+        .expect("clear the probe's live rows");
 }
 
 /// 升级路径走完之后，统计在不在。
@@ -253,10 +298,10 @@ async fn the_upgrade_path_gathers_the_statistics_the_index_is_chosen_by() {
         "升级路径走完之后表上没有 ANALYZE 的痕迹：索引建了，却没人告诉规划器它覆盖的东西长什么样"
     );
 
-    let plan = plan_on(&mut conn, "p").await;
+    let plan = plan_on(&mut conn, HISTORICAL_VENUE_READ, "p").await;
     let plan = &plan[0]["Plan"];
     assert!(
-        uses_the_venue_index(plan),
+        uses_the_venue_index(plan, "idx_cog_dag_tasks_venue"),
         "有了统计之后这条语句必须走索引，实际计划：{plan}"
     );
 

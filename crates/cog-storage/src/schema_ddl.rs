@@ -622,6 +622,15 @@ fn classify(statement: &str) -> Option<Check> {
     }
 }
 
+/// Split a schema text into statements the same way the startup runner does.
+///
+/// Exposed for the checks that compare two texts statement by statement -- a
+/// schema written twice (once as a migration, once as the startup batch) is a
+/// schema that drifts unless something compares them.
+pub fn split_statements(text: &str) -> Option<Vec<String>> {
+    statements(text)
+}
+
 /// Split a schema text into statements at the semicolons that end them.
 ///
 /// This is not a SQL parser and is not asked to be one: it tracks the four

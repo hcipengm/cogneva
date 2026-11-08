@@ -26,7 +26,7 @@
 
 use chrono::{TimeZone, Utc};
 use cog_observability::usage_store::LlmUsageStore;
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool};
 
 use cog_test_support::database_url;
 
@@ -61,23 +61,17 @@ async fn a_row_naming_a_run_is_no_more_traceable_than_a_row_naming_nothing() {
         .init_schema(&schema_runner)
         .await
         .expect("create the ledger schema");
-    // 这个方法问的正是「账上这个 id 是不是一件活」，所以图的那张表必须在，
-    // 而且只需这两列：它被当成名单读，不当成任务读。
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS cog_dag_tasks (
-             workspace_id TEXT  NOT NULL,
-             task_id      TEXT  NOT NULL,
-             task         JSONB NOT NULL DEFAULT '{}'::jsonb,
-             status       TEXT,
-             updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-             PRIMARY KEY (workspace_id, task_id))",
-    )
-    .execute(&pool)
+    // 这个方法问的正是「账上这个 id 是不是一件活」，所以任务账本必须在。建表
+    // 用 095 迁移自己那份 DDL：手抄一份列名，抄错了这里照样绿。
+    pool.execute(include_str!(
+        "../../cog-storage/migrations/postgres/095_task_ledger.up.sql"
+    ))
     .await
-    .expect("create the task graph table");
+    .expect("create the task ledger");
     sqlx::query(
-        "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-         VALUES ('ws-gap', 'traced-task', '{}'::jsonb, 'pending')
+        "INSERT INTO task_defined
+             (task_id, rev, workspace_id, kind, input, created_at)
+         VALUES ('traced-task', 1, 'ws-gap', 'dag_node', 'null', NOW())
          ON CONFLICT DO NOTHING",
     )
     .execute(&pool)
@@ -108,7 +102,7 @@ async fn a_row_naming_a_run_is_no_more_traceable_than_a_row_naming_nothing() {
         .execute(&pool)
         .await
         .expect("leave the ledger as it was found");
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE task_id = 'traced-task'")
+    sqlx::query("DELETE FROM task_defined WHERE task_id = 'traced-task'")
         .execute(&pool)
         .await
         .expect("leave the graph as it was found");

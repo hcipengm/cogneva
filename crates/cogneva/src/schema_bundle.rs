@@ -35,7 +35,7 @@ pub fn statements() -> Vec<String> {
         cog_storage::postgres::audit_recorder::DDL.to_string(),
         cog_storage::postgres::taste_intent_store::DDL.to_string(),
         cog_storage::postgres::metrics_backend::DDL.to_string(),
-        cog_storage::postgres::state_backend::DDL.to_string(),
+        cog_storage::postgres::state_backend::ddl(),
         cog_storage::postgres::observability_gateway::OBSERVABILITY_DDL.to_string(),
         cog_storage::owner_lease::DDL.to_string(),
         cog_observability::alert_store::ddl(),
@@ -200,19 +200,47 @@ mod tests {
     #[test]
     fn the_state_backends_startup_batch_is_opaque_only_where_it_must_be() {
         let opaque = cog_storage::schema_ddl::statements_the_guard_cannot_read(
-            cog_storage::postgres::state_backend::DDL,
+            &cog_storage::postgres::state_backend::ddl(),
         )
         .expect("the runner splits this text with the same splitter");
         assert_eq!(
             opaque.len(),
-            1,
+            3,
             "a start re-sends every statement the guard cannot read: {opaque:#?}"
         );
+        // The conditional rename: a no-op once the column has been renamed,
+        // and unreadable because the answer is the body, not a name.
         assert!(
-            opaque[0].trim_start().starts_with("DO $$"),
-            "the one that may stay opaque is the conditional rename, which is a \
-             no-op once the column has been renamed: {:.120}",
-            opaque[0]
+            opaque
+                .iter()
+                .any(|statement| statement.trim_start().starts_with("DO $$")),
+            "the conditional rename must stay the first kind: {opaque:#?}"
+        );
+        // The append-only guard on the task ledger. It is conditional code on
+        // purpose: `CREATE OR REPLACE FUNCTION` / `TRIGGER` run by two pods at
+        // once answer `tuple concurrently updated`, so the guard takes an
+        // advisory lock, looks, and creates only what is missing. On an
+        // installed database it is one catalog read, and it never touches
+        // either history table.
+        assert!(
+            opaque
+                .iter()
+                .any(|statement| statement.trim_start().starts_with("DO $$")
+                    && statement.contains("task_ledger_history_is_append_only")),
+            "one unreadable statement is the append-only guard: {opaque:#?}"
+        );
+        // And the advisory lock it takes first. That one is a plain `SELECT`
+        // the guard does not read -- deliberately: it exists so the guard
+        // block that follows it reads the catalog through a fresh snapshot
+        // instead of a stale one (a lock wait does not refresh a statement's
+        // snapshot, so lock-and-check in one statement recreates what the
+        // neighbour just created). It takes no table lock and is re-sent on
+        // every start; what it costs there is one uncontended lock.
+        assert!(
+            opaque.iter().any(|statement| statement
+                .trim_start()
+                .starts_with("SELECT pg_advisory_xact_lock(hashtext('cogneva:task-ledger")),
+            "the other is the advisory lock the guard waits on: {opaque:#?}"
         );
     }
 

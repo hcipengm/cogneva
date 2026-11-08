@@ -23,7 +23,7 @@
 //!   cargo test -p cog-storage --test a_cancelled_task_is_not_judged_again -- --ignored
 //! ```
 //!
-//! 它先清空任务表，跑完把库留在原样。
+//! 它先清空自己那个工作区，跑完把库留在原样。
 
 use std::time::Duration;
 
@@ -57,10 +57,9 @@ async fn a_late_failure_leaves_a_cancelled_row_cancelled() {
         .expect("connect to the test database");
     let backend = PostgresStateBackend::new(pool.clone());
     backend.init_schema().await.expect("create the task schema");
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
+    cog_test_support::clear_task_ledger_for(&pool, WORKSPACE)
         .await
-        .expect("clear the task table");
+        .expect("clear this test's workspace");
 
     backend
         .dag_set_task(WORKSPACE, TASK, &task(TASK))

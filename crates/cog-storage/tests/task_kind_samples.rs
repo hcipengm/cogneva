@@ -29,14 +29,23 @@ use cog_core::StateBackend;
 use cog_storage::{PostgresObservabilityGateway, PostgresStateBackend};
 use sqlx::PgPool;
 
-use cog_test_support::database_url;
+use cog_test_support::{clear_task_ledger_for, database_url};
 
-/// A finished row in one workspace, with the queue time and the work time kept
+/// One workspace per test: these read a grouped census over a workspace, so two
+/// tests sharing one would count each other's rows.
+const DURATION_WS: &str = "ws-samples-duration";
+const BUDGET_WS: &str = "ws-samples-budget";
+
+/// A finished task in one workspace, with the queue time and the work time kept
 /// apart: it waited `queued_days` for a worker and then ran `worked_secs`.
 ///
-/// `started` writes the start stamp. A row without one is a finished task whose
-/// work time this platform never measured -- the state every row was in before
-/// dispatch started stamping it.
+/// `started` writes the attempt's start stamp. A task without one is a finished
+/// task whose work time this platform never measured -- the state every task was
+/// in before dispatch started stamping it.
+///
+/// Three rows, because a task is three: its definition (the kind and when it was
+/// created), its last transition (the completion, which is also the end of the
+/// work), and its attempt (when a worker picked it up).
 async fn finished(
     pool: &PgPool,
     workspace: &str,
@@ -47,27 +56,42 @@ async fn finished(
     started: bool,
 ) {
     let now = Utc::now();
-    let mut task = serde_json::json!({
-        "id": id,
-        "task_type": { "custom": kind },
-        "created_at": (now - Duration::days(queued_days)).to_rfc3339(),
-        "updated_at": now.to_rfc3339(),
-    });
-    if started {
-        task["started_at"] = serde_json::json!((now - Duration::seconds(worked_secs)).to_rfc3339());
-    }
+    let created = now - Duration::days(queued_days);
     sqlx::query(
-        "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at)
-         VALUES ($1, $2, $3, 'completed', NOW())
-         ON CONFLICT (workspace_id, task_id)
-         DO UPDATE SET task = EXCLUDED.task, status = EXCLUDED.status, updated_at = NOW()",
+        "INSERT INTO task_defined (task_id, rev, workspace_id, kind, input, created_at)
+         VALUES ($1, 1, $2, $3, '{}', $4)
+         ON CONFLICT (task_id, rev) DO UPDATE SET workspace_id = EXCLUDED.workspace_id",
     )
-    .bind(workspace)
     .bind(id)
-    .bind(&task)
+    .bind(workspace)
+    .bind(kind)
+    .bind(created)
     .execute(pool)
     .await
-    .expect("write a finished row");
+    .expect("write a definition");
+    sqlx::query(
+        "INSERT INTO task_transition (task_id, seq, at, to_state)
+         VALUES ($1, 1, $2, 'completed')
+         ON CONFLICT (task_id, seq) DO UPDATE SET at = EXCLUDED.at",
+    )
+    .bind(id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("write the completion");
+    let start = started.then(|| now - Duration::seconds(worked_secs));
+    sqlx::query(
+        "INSERT INTO task_attempt (task_id, attempt_no, started_at, ended_at, outcome)
+         VALUES ($1, 1, $2, $3, 'completed')
+         ON CONFLICT (task_id, attempt_no) DO UPDATE
+            SET started_at = EXCLUDED.started_at, ended_at = EXCLUDED.ended_at",
+    )
+    .bind(id)
+    .bind(start)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("write the attempt");
 }
 
 #[tokio::test]
@@ -85,16 +109,15 @@ async fn the_duration_a_baseline_inherits_is_the_time_the_task_worked() {
         .init_schema()
         .await
         .expect("create the observability schema");
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
+    clear_task_ledger_for(&pool, DURATION_WS)
         .await
-        .expect("clear the task table");
+        .expect("clear this test's workspace");
 
     // Five rows that each waited a week and each ran ten minutes.
     for i in 0..5 {
         finished(
             &pool,
-            "ws-samples",
+            DURATION_WS,
             &format!("waited-{i}"),
             "waited",
             7,
@@ -107,7 +130,7 @@ async fn the_duration_a_baseline_inherits_is_the_time_the_task_worked() {
     for i in 0..5 {
         finished(
             &pool,
-            "ws-samples",
+            DURATION_WS,
             &format!("unmeasured-{i}"),
             "unmeasured",
             7,
@@ -118,7 +141,7 @@ async fn the_duration_a_baseline_inherits_is_the_time_the_task_worked() {
     }
 
     let records = backend
-        .task_kind_records("ws-samples", 5)
+        .task_kind_records(DURATION_WS, 5)
         .await
         .expect("read the samples");
 
@@ -143,14 +166,26 @@ async fn the_duration_a_baseline_inherits_is_the_time_the_task_worked() {
         "一条都没量过工时的种类不给记录：拿到一行时长中位 0 的读数，读者读成「量过了，是 0」"
     );
 
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
+    clear_census_for(&pool, DURATION_WS).await;
+    clear_task_ledger_for(&pool, DURATION_WS)
         .await
-        .expect("leave the task table as it was found");
-    sqlx::query("DELETE FROM cog_observability_metrics")
-        .execute(&pool)
-        .await
-        .expect("leave the census as it was found");
+        .expect("leave this workspace as it was found");
+}
+
+/// 清掉一个工作区那些任务的清点行。
+///
+/// 按任务 id 范围删，不 `DELETE FROM cog_observability_metrics`：并行跑的另一条
+/// 用例正往同一张表里写它自己的任务，整表清会把它的行删掉，而它报出来的是
+/// 「这件任务一条账都没有」。
+async fn clear_census_for(pool: &PgPool, workspace: &str) {
+    sqlx::query(
+        "DELETE FROM cog_observability_metrics WHERE task_id IN \
+         (SELECT task_id FROM task_defined WHERE workspace_id = $1)",
+    )
+    .bind(workspace)
+    .execute(pool)
+    .await
+    .expect("clear this workspace's census rows");
 }
 
 /// A per-task cumulative census row: what this task has spent so far.
@@ -190,20 +225,16 @@ async fn a_budget_needs_its_own_samples_not_the_ones_that_finished() {
         .init_schema()
         .await
         .expect("create the observability schema");
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
+    clear_census_for(&pool, BUDGET_WS).await;
+    clear_task_ledger_for(&pool, BUDGET_WS)
         .await
-        .expect("clear the task table");
-    sqlx::query("DELETE FROM cog_observability_metrics")
-        .execute(&pool)
-        .await
-        .expect("clear the census");
+        .expect("clear this test's workspace");
 
     // Five finished tasks of one kind, only one of which carries a cost.
     for i in 0..5 {
         finished(
             &pool,
-            "ws-samples",
+            BUDGET_WS,
             &format!("partly-costed-{i}"),
             "partly_costed",
             0,
@@ -217,12 +248,12 @@ async fn a_budget_needs_its_own_samples_not_the_ones_that_finished() {
     // Five finished tasks of another kind, all costed.
     for (i, tokens) in [100, 200, 300, 400, 500].into_iter().enumerate() {
         let id = format!("costed-{i}");
-        finished(&pool, "ws-samples", &id, "costed", 0, 600, true).await;
+        finished(&pool, BUDGET_WS, &id, "costed", 0, 600, true).await;
         spent(&pool, &id, tokens).await;
     }
 
     let records = backend
-        .task_kind_records("ws-samples", 5)
+        .task_kind_records(BUDGET_WS, 5)
         .await
         .expect("read the samples");
 
@@ -245,12 +276,8 @@ async fn a_budget_needs_its_own_samples_not_the_ones_that_finished() {
         "五条带账样本取中位，不是把没有账的那些折成 0 再取"
     );
 
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
+    clear_census_for(&pool, BUDGET_WS).await;
+    clear_task_ledger_for(&pool, BUDGET_WS)
         .await
-        .expect("leave the task table as it was found");
-    sqlx::query("DELETE FROM cog_observability_metrics")
-        .execute(&pool)
-        .await
-        .expect("leave the census as it was found");
+        .expect("leave this workspace as it was found");
 }

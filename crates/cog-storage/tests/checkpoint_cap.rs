@@ -387,7 +387,7 @@ async fn the_startup_schema_holds_board_values_past_a_btree_entry() {
     .await
     .expect("insert a long board value");
 
-    sqlx::raw_sql(cog_storage::postgres::state_backend::DDL)
+    sqlx::raw_sql(&cog_storage::postgres::state_backend::ddl())
         .execute(&pool)
         .await
         .expect("the startup schema must apply over rows a board already holds");

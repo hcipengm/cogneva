@@ -72,9 +72,9 @@ pub use mem::{
 
 #[cfg(feature = "postgres")]
 pub use postgres::{
-    gauge_latest_sql, sha256_of, AgentMessage, AgentMessageStore, ChatTurn, ChatTurnRecord,
-    ChatTurnRole, ChatTurnStore, DatasetCatalog, HookArchiveRow, NewAgentMessage, NewDataset,
-    PostgresAgentMessageStore, PostgresAuditRecorder, PostgresBackupRunStore,
+    gauge_latest_sql, sha256_of, venue_tasks_sql, AgentMessage, AgentMessageStore, ChatTurn,
+    ChatTurnRecord, ChatTurnRole, ChatTurnStore, DatasetCatalog, HookArchiveRow, NewAgentMessage,
+    NewDataset, PostgresAgentMessageStore, PostgresAuditRecorder, PostgresBackupRunStore,
     PostgresChangeLedgerStore, PostgresChatTurnStore, PostgresDatasetCatalog,
     PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,
     PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,
@@ -82,7 +82,6 @@ pub use postgres::{
     PostgresResourceEventStore, PostgresSnapshotStore, PostgresStateBackend,
     PostgresTasteIntentStore, PostgresUserStore, SendOutcome, DAG_LOCK_WORKSPACE_SQL,
     EVENTS_PAGE_SQL, LOG_LINES_PER_TASK, ROWS_KEPT_PER_PEER, ROWS_KEPT_PER_SESSION,
-    VENUE_TASKS_SQL,
 };
 
 #[cfg(feature = "redis")]

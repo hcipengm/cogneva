@@ -1,9 +1,9 @@
 //! 按 `task_id` 的单点查找要有一条真能用的索引。
 //!
 //! 额度判定在 LLM 代理路径上每发任务调用都要问一次「这件活是谁交的、跑在哪个
-//! 租户」。任务图的主键是 `(workspace_id, task_id)`，只带 `task_id` 的查询用不上
-//! 它；没有一条以 `task_id` 打头的索引，这次读就是**每发请求**扫一遍整张任务图，
-//! 而这张表只会随任务数增长。
+//! 租户」。定义账本的键是 `(task_id, rev)`，只问 `task_id` 的查询取的是最新那一版；
+//! 没有一条以 `task_id` 打头的索引可用，这次读就是**每发请求**扫一遍整张定义表，
+//! 而这张表只会随任务数与改版次数增长。
 //!
 //! 判据不是「索引名在不在」——名字对了、列不对的索引一样服务不了这条读，而按
 //! 名字判的用例在把列改成 `workspace_id` 之后照样绿。这里判两件事：
@@ -23,11 +23,11 @@ use sqlx::{PgPool, Row};
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
 /// 与额度判定读的是同一条查询：最近更新的那一行给出的提交人与工作区。
-const ATTRIBUTION_LOOKUP: &str = "SELECT NULLIF(task->>'submitted_by', '') AS person,
-                                         NULLIF(workspace_id, '')        AS workspace_id
-                                    FROM cog_dag_tasks
+const ATTRIBUTION_LOOKUP: &str = "SELECT NULLIF(submitted_by, '') AS person,
+                                         NULLIF(workspace_id, '')   AS workspace_id
+                                    FROM task_defined
                                    WHERE task_id = $1
-                                   ORDER BY updated_at DESC
+                                   ORDER BY rev DESC
                                    LIMIT 1";
 
 #[tokio::test]
@@ -37,13 +37,13 @@ async fn a_lookup_by_task_id_can_use_an_index_instead_of_scanning_the_graph() {
     let schema = own_schema(&url, "probe_task_attribution_index").await;
     let pool: PgPool = schema_pool_with(&url, &schema, 1).await;
 
-    sqlx::raw_sql(cog_storage::postgres::state_backend::DDL)
+    sqlx::raw_sql(&cog_storage::postgres::state_backend::ddl())
         .execute(&pool)
         .await
         .expect("apply the startup schema");
     sqlx::query(
-        "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-         VALUES ('ws-1', 't-1', '{\"submitted_by\": \"u-1\"}'::jsonb, 'pending')",
+        "INSERT INTO task_defined (workspace_id, task_id, rev, kind, input, created_at, submitted_by)
+         VALUES ('ws-1', 't-1', 1, 'dag_node', '{}', NOW(), 'u-1')",
     )
     .execute(&pool)
     .await
@@ -59,7 +59,7 @@ async fn a_lookup_by_task_id_can_use_an_index_instead_of_scanning_the_graph() {
            JOIN pg_class c ON c.oid = i.indexrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
            JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = 1
-          WHERE n.nspname = $1 AND c.relname = 'idx_cog_dag_tasks_task_updated'",
+          WHERE n.nspname = $1 AND c.relname = 'idx_task_defined_latest'",
     )
     .bind(&schema)
     .fetch_optional(&mut *conn)
@@ -69,8 +69,8 @@ async fn a_lookup_by_task_id_can_use_an_index_instead_of_scanning_the_graph() {
     assert_eq!(
         leading.as_deref(),
         Some("task_id"),
-        "按任务 id 找一行，索引的第一列必须是 task_id；以 workspace_id 打头的索引\
-         对这条读一点用都没有，而「有个索引叫这个名字」判不出这一点"
+        "按任务 id 取最新一版定义，索引的第一列必须是 task_id；以 workspace_id 打头的\
+         索引对这条读一点用都没有，而「有个索引叫这个名字」判不出这一点"
     );
 
     sqlx::query("SET enable_seqscan = off")

@@ -577,18 +577,19 @@ pub struct BehindRow {
     pub overdue_secs: i64,
 }
 
-/// 任务图的正本表名。项目面自己不带表，读的就是它。
-const TASK_TABLE: &str = "cog_dag_tasks";
+/// 任务图的正本表名。项目面自己不带表，读的就是它——任务变成账本之后，
+/// 一件任务是「定义的最新一版 + 最后一条迁移」，所以两个表名都要写出来。
+const TASK_TABLE: &str = "task_defined + task_transition";
 
 /// 实际成本的出处：逐笔 token 账。与配额、告警读的是同一张，所以三个量同一把尺子。
 const USAGE_TABLE: &str = "gateway_llm_usage";
 
 /// 挣值一次要读三张表，`source.table` 把三张都写出来。
-const EVM_TABLE: &str = "cog_dag_tasks + task_plan + gateway_llm_usage";
+const EVM_TABLE: &str = "task_defined + task_transition + task_plan + gateway_llm_usage";
 
 /// 甘特面要多读一张：计划基线。两个表名一起写进 `source`，读者才知道这一屏
 /// 是「现状 + 当初的计划」两份读数拼出来的。
-const GANTT_TABLE: &str = "cog_dag_tasks + task_plan";
+const GANTT_TABLE: &str = "task_defined + task_transition + task_plan";
 
 fn now_source(reader: &'static str) -> Source {
     Source {

@@ -7,6 +7,10 @@
 //! SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 FOR UPDATE
 //! ```
 //!
+//! 那是当时的写法，文档表后来换成了任务账本；今天锁的是投影表 `task_current`
+//! （`DAG_LOCK_WORKSPACE_SQL`），形状没变——仍旧是「按 workspace 取一批行」。
+//! 这一面判的从来不是表名，而是这条语句交给两个进程的是不是同一个顺序。
+//!
 //! 同一条语句、同一张表，两个进程却互相等对方的行——因为「哪一行先被取到」这件事
 //! 它没有规定过：`cog_dag_tasks` 上有 `(workspace_id, status)`、`(workspace_id,
 //! face_id, status)`、`(task_id, updated_at)` 几条索引，几次执行完全可以走不同
@@ -54,13 +58,13 @@ const WORKSPACE: &str = "ws-lock-order";
 ///
 /// 每一对是（task_id，status），按写入顺序给。
 const ROWS: [(&str, &str); 8] = [
-    ("t-08", "completed"),
+    ("t-08", "running"),
     ("t-07", "pending"),
     ("t-06", "running"),
-    ("t-05", "completed"),
+    ("t-05", "scheduled"),
     ("t-04", "pending"),
     ("t-03", "running"),
-    ("t-02", "completed"),
+    ("t-02", "scheduled"),
     ("t-01", "pending"),
 ];
 
@@ -68,16 +72,18 @@ async fn setup() -> (String, PgPool) {
     let url = database_url();
     let schema = own_schema(&url, "probe_workspace_lock_order").await;
     let pool = schema_pool_with(&url, &schema, 4).await;
-    sqlx::raw_sql(cog_storage::postgres::state_backend::DDL)
+    sqlx::raw_sql(&cog_storage::postgres::state_backend::ddl())
         .execute(&pool)
         .await
         .expect("apply the startup schema");
     (schema, pool)
 }
 
-/// 一行任务，`task` 那一列是可以反序列化成 [`Task`] 的完整载荷——走完整路径的那个
-/// 用例要把它读回来判断状态，一个只有 id 的载荷在那里会先炸在反序列化上。
-fn task(id: &str, status: &str) -> serde_json::Value {
+/// 一件任务，写在 [`WORKSPACE`] 里、状态就是给定的那个。
+///
+/// 全部是还能动的状态：锁住 workspace 的那条语句读的是投影表，投影里只有还动得了
+/// 的任务——一件已经完成的任务不在那张表上，也就不在那次锁的范围里。
+fn task(id: &str, status: &str) -> Task {
     let mut t = Task::new(
         id,
         TaskType::Custom("lock-order-probe".to_string()),
@@ -85,31 +91,28 @@ fn task(id: &str, status: &str) -> serde_json::Value {
     );
     t.workspace_id = Some(WORKSPACE.to_string());
     t.status = match status {
-        "completed" => TaskStatus::Completed,
         "running" => TaskStatus::Running,
+        "scheduled" => TaskStatus::Scheduled,
         _ => TaskStatus::Pending,
     };
-    serde_json::to_value(t).expect("a task serializes")
+    t
 }
 
-/// 按 [`ROWS`] 的顺序把行写进去。
+/// 按 [`ROWS`] 的顺序把任务写进去。
+///
+/// 走存储自己的写入：一件任务是账本上的好几行，手写两种写法迟早有一处漏掉——而这里
+/// 要的正是**生产上那条语句读得到的那批行**。
 async fn seed(pool: &PgPool) {
+    let backend = PostgresStateBackend::new(pool.clone());
     for (id, status) in ROWS {
-        sqlx::query(
-            "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(WORKSPACE)
-        .bind(id)
-        .bind(task(id, status))
-        .bind(status)
-        .execute(pool)
-        .await
-        .expect("write a task");
+        backend
+            .dag_set_task(WORKSPACE, id, &task(id, status))
+            .await
+            .expect("write a task");
     }
     // 计划要靠统计信息才稳：不 ANALYZE，两个会话在这么小的表上可能都挑顺序扫描，
     // 那样差别就被抹平了，用例量的是「两个计划」而不是「两行数据」。
-    sqlx::query("ANALYZE cog_dag_tasks")
+    sqlx::query("ANALYZE task_current")
         .execute(pool)
         .await
         .expect("refresh the planner statistics");
@@ -335,19 +338,13 @@ async fn concurrent_completions_in_one_workspace_all_land() {
     let url = database_url();
     seed(&pool).await;
 
-    // 每一行都是 `running`：`dag_complete_task` 只接受正在跑的任务。用独立的
-    // workspace 把这两处用例的数据分开，免得一起跑时互相数到对方的行。
+    // 每一件都推进到 `running`：`dag_complete_task` 只接受正在跑的任务。
+    let seed_backend = PostgresStateBackend::new(pool.clone());
     for (id, _) in ROWS {
-        sqlx::query(
-            "UPDATE cog_dag_tasks SET status = 'running',
-                    task = jsonb_set(task, '{status}', '\"running\"')
-              WHERE workspace_id = $1 AND task_id = $2",
-        )
-        .bind(WORKSPACE)
-        .bind(id)
-        .execute(&pool)
-        .await
-        .expect("mark the task running");
+        seed_backend
+            .dag_set_task(WORKSPACE, id, &task(id, "running"))
+            .await
+            .expect("mark the task running");
     }
 
     let backend = Arc::new(PostgresStateBackend::new(pool.clone()));
@@ -378,12 +375,13 @@ async fn concurrent_completions_in_one_workspace_all_land() {
     );
 
     let completed: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM cog_dag_tasks WHERE workspace_id = $1 AND status = 'completed'",
+        "SELECT COUNT(*) FROM (SELECT DISTINCT ON (task_id) task_id, to_state \
+                                 FROM task_transition ORDER BY task_id, seq DESC) last \
+          WHERE last.to_state = 'completed'",
     )
-    .bind(WORKSPACE)
     .fetch_one(&pool)
     .await
-    .expect("count the completed rows");
+    .expect("count the completed tasks");
     assert_eq!(
         completed,
         ROWS.len() as i64,
@@ -393,16 +391,18 @@ async fn concurrent_completions_in_one_workspace_all_land() {
 
     // 结果要真的写进了行里：只把状态翻过去的那种「完成」，读的人拿不到任何结果。
     for (id, _) in ROWS {
-        let stored: serde_json::Value = sqlx::query_scalar(
-            "SELECT task FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id = $2",
+        let stored: String = sqlx::query_scalar(
+            "SELECT result FROM task_attempt WHERE task_id = $1 \
+              ORDER BY attempt_no DESC LIMIT 1",
         )
-        .bind(WORKSPACE)
         .bind(id)
         .fetch_one(&pool)
         .await
-        .expect("read the completed row");
+        .expect("read the completed attempt");
+        let stored: serde_json::Value =
+            serde_json::from_str(&stored).expect("the stored result is JSON");
         assert_eq!(
-            stored["result"],
+            stored,
             serde_json::json!({ "done": id }),
             "{id} 的状态是 completed，结果却不是这次完成写进去的那个"
         );

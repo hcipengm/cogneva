@@ -359,6 +359,21 @@ live_check db 'Live-DB decision counters' cargo test -p cog-storage --test decis
 # refused" is a fact about the column's own constraint. Without this the
 # round trip that the reason column exists to make possible is never run.
 live_check db 'Live-DB change-ledger store' cargo test -p cog-storage --test change_ledger_store -- --ignored
+# The task graph is a ledger, and its history is append-only because a trigger
+# refuses the rewrite. That is a fact about the server -- no fixture can hold a
+# trigger. The same case reads the other direction too: an attempt closes in
+# place and a removal still deletes, because a guard that refused those would
+# block every completion the ledger makes.
+live_check db 'Live-DB task ledger is append-only' cargo test -p cog-storage --test task_ledger_is_append_only -- --ignored
+# The projection is derived from the ledger. This case deletes it, checks that
+# the state reads still answer, and rebuilds: the one thing a rebuild cannot
+# restore is the lease, and "presence is not history" is only observable on a
+# server.
+live_check db 'Live-DB task projection rebuilds from the ledger' cargo test -p cog-storage --test task_projection_rebuilds_from_the_ledger -- --ignored
+# The command a person runs at three in the morning, end to end: the binary,
+# its flags, its connection string, and the row count it prints. A library-level
+# test would leave the wiring between those parts unread.
+live_check db 'Live-DB task projection rebuild command' cargo test -p cog-storage --test the_rebuild_command_restores_the_projection -- --ignored
 # The backup account's write path is statements whose whole content is what
 # the server does with them: whether the conflict clause wrote a row decides
 # if a repeated opening moved a start instant already recorded, whether the

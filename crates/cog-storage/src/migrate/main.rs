@@ -32,6 +32,19 @@ struct Args {
     /// Print applied vs pending status without changing anything.
     #[arg(long)]
     status: bool,
+
+    /// Rebuild the live-task projection from the task ledger, then exit.
+    ///
+    /// The projection is derived: every row in `task_current` can be recomputed
+    /// from the definitions, transitions and attempts, and this is the command
+    /// that does it with the same statements the writers run. `--task-id`
+    /// narrows it to one task.
+    #[arg(long)]
+    rebuild_task_projection: bool,
+
+    /// Which task to rebuild. Omitted rebuilds every task.
+    #[arg(long, requires = "rebuild_task_projection")]
+    task_id: Option<String>,
 }
 
 #[tokio::main]
@@ -70,6 +83,16 @@ async fn main() -> anyhow::Result<()> {
         migrator.run_dry(&database_url).await?;
     } else {
         migrator.run(&database_url).await?;
+    }
+
+    if args.rebuild_task_projection {
+        let pool = sqlx::PgPool::connect(&database_url).await?;
+        let backend = cog_storage::PostgresStateBackend::new(pool);
+        let live = backend
+            .rebuild_task_projection(args.task_id.as_deref())
+            .await?;
+        println!("task_current rows after rebuild: {live}");
+        return Ok(());
     }
 
     info!("migrations complete");

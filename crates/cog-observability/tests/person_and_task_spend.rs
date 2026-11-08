@@ -24,7 +24,7 @@
 
 use chrono::{TimeZone, Utc};
 use cog_observability::usage_store::LlmUsageStore;
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool};
 
 use cog_test_support::database_url;
 
@@ -100,21 +100,51 @@ async fn prepare(url: &str) -> (PgPool, LlmUsageStore) {
         .init_schema(&schema_runner)
         .await
         .expect("create the ledger schema");
-    // 按人那一份要与图连一次，所以图的那张表必须在。只建这里用到的列：它被当成
-    // 一张「谁交的活」的名单读，不当成任务读。
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS cog_dag_tasks (
-             workspace_id TEXT  NOT NULL,
-             task_id      TEXT  NOT NULL,
-             task         JSONB NOT NULL DEFAULT '{}'::jsonb,
-             status       TEXT,
-             updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-             PRIMARY KEY (workspace_id, task_id))",
-    )
-    .execute(&pool)
-    .await
-    .expect("create the task graph table");
+    // 这几份读连的是任务账本。建表用 095 迁移自己那份 DDL，不在这里手抄一遍列：
+    // 手抄的建表与被测的查询各写一份，抄错一处这里照样绿，而线上那条会红。
+    let ledger_ddl = include_str!("../../cog-storage/migrations/postgres/095_task_ledger.up.sql");
+    pool.execute(ledger_ddl)
+        .await
+        .expect("create the task ledger");
     (pool, store)
+}
+
+/// 任务账本里的一版定义：谁交的、跑在哪个租户，都在这一行上。
+///
+/// 定义按版本追加，同一个 id 可以有多版；读的人取 `rev` 最大的那一版，所以
+/// 写第二版就是「这件活被改过」。
+async fn task_rev(
+    pool: &PgPool,
+    workspace: &str,
+    task_id: &str,
+    rev: i64,
+    submitted_by: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO task_defined
+             (task_id, rev, workspace_id, kind, input, created_at, submitted_by)
+         VALUES ($1, $2, $3, 'dag_node', 'null', NOW(), $4)
+         ON CONFLICT (task_id, rev) DO UPDATE
+            SET workspace_id = EXCLUDED.workspace_id,
+                submitted_by = EXCLUDED.submitted_by",
+    )
+    .bind(task_id)
+    .bind(rev)
+    .bind(workspace)
+    .bind(submitted_by)
+    .execute(pool)
+    .await
+    .expect("write a task definition");
+}
+
+/// 删掉这一次运行写下的每一版定义。按 run id 收，不按工作区收：别的用例可能正
+/// 读着它自己的工作区。
+async fn clear_tasks(pool: &PgPool, run: &str) {
+    sqlx::query("DELETE FROM task_defined WHERE task_id LIKE '%' || $1 || '%'")
+        .bind(run)
+        .execute(pool)
+        .await
+        .expect("leave the graph as it was found");
 }
 
 /// 按人的那份把两处证据都算进来，属主优先；两处都没有的行不进任何人的格子。
@@ -140,21 +170,7 @@ async fn a_persons_day_is_what_the_ledger_charges_them_by_either_evidence() {
         // 提交人与声明属主都不是本人的那一件：属主优先，账只记在属主头上。
         (&retitled, Some("someone-else")),
     ] {
-        let task_json = match submitted_by {
-            Some(person) => serde_json::json!({ "submitted_by": person }),
-            None => serde_json::json!({}),
-        };
-        sqlx::query(
-            "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-             VALUES ($1, $2, $3, 'pending')
-             ON CONFLICT (workspace_id, task_id) DO UPDATE SET task = EXCLUDED.task",
-        )
-        .bind(format!("ws-{run}"))
-        .bind(task_id)
-        .bind(task_json)
-        .execute(&pool)
-        .await
-        .expect("write a task");
+        task_rev(&pool, &format!("ws-{run}"), task_id, 1, submitted_by).await;
     }
 
     // 声明了属主的一行：直接算这个人的。
@@ -196,19 +212,9 @@ async fn a_persons_day_is_what_the_ledger_charges_them_by_either_evidence() {
     )
     .await;
 
-    // 同一个 task_id 在第二个工作区里还有一行——任务表的主键是
-    // `(workspace_id, task_id)`，这是它允许的形状。普通 join 会把这一行的 token
-    // 数两遍，格子里的数凭空变大，人比实际更早被拒。
-    sqlx::query(
-        "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-         VALUES ($1, $2, $3, 'pending')",
-    )
-    .bind(format!("ws-other-{run}"))
-    .bind(&task)
-    .bind(serde_json::json!({ "submitted_by": yes }))
-    .execute(&pool)
-    .await
-    .expect("write the twin task");
+    // 同一件活再写一版定义，提交人不变。定义按版本追加，普通 join 会把这一笔
+    // token 按版本数重复计，格子里的数凭空变大，人比实际更早被拒。
+    task_rev(&pool, &format!("ws-other-{run}"), &task, 2, Some(&yes)).await;
 
     let people = store
         .spend_by_person_since(since)
@@ -224,7 +230,7 @@ async fn a_persons_day_is_what_the_ledger_charges_them_by_either_evidence() {
     assert_eq!(
         of(&yes),
         Some(140),
-        "属主那一行 + 提交人是他的那件活；同一个 task_id 的两行图记录不许把 40 数成 80"
+        "属主那一行 + 提交人是他的那件活；同一个 task_id 的两版定义不许把 40 数成 80"
     );
     assert_eq!(of(&either), Some(7), "两处证据都在时属主优先");
     assert!(
@@ -238,13 +244,7 @@ async fn a_persons_day_is_what_the_ledger_charges_them_by_either_evidence() {
         .execute(&pool)
         .await
         .expect("leave the ledger as it was found");
-    for workspace in [format!("ws-{run}"), format!("ws-other-{run}")] {
-        sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
-            .bind(workspace)
-            .execute(&pool)
-            .await
-            .expect("leave the graph as it was found");
-    }
+    clear_tasks(&pool, &run.to_string()).await;
 }
 
 /// 按工作区的那份：为一件活做的调用算在它跑在的那个租户头上，谁的都不算的行
@@ -270,27 +270,12 @@ async fn a_workspaces_day_is_the_calls_made_for_the_tasks_it_runs() {
     let elsewhere = format!("ws-elsewhere-{run}");
 
     for (workspace, task_id) in [(&tenant, &first), (&tenant, &second), (&other, &elsewhere)] {
-        sqlx::query(
-            "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-             VALUES ($1, $2, '{}'::jsonb, 'pending')",
-        )
-        .bind(workspace)
-        .bind(task_id)
-        .execute(&pool)
-        .await
-        .expect("write a task");
+        task_rev(&pool, workspace, task_id, 1, None).await;
     }
-    // 同一个 task_id 在第二个工作区里还有一行，且更新——任务图允许这个形状。
-    // 普通 join 会把那一行的 token 数两遍，租户会比实际更早被拦。
-    sqlx::query(
-        "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at)
-         VALUES ($1, $2, '{}'::jsonb, 'pending', NOW() + interval '1 hour')",
-    )
-    .bind(&twin_home)
-    .bind(&second)
-    .execute(&pool)
-    .await
-    .expect("write the twin task");
+    // 第二件活后来被搬到了另一个工作区，第 2 版定义记的是新家。以最新一版写下
+    // 的为准，且只算一次：普通 join 会按版本把那一笔数两遍，租户会比实际更早
+    // 被拦。
+    task_rev(&pool, &twin_home, &second, 2, None).await;
 
     // 两件都在 tenant 里：100 + 50。
     ledger_row(
@@ -354,13 +339,7 @@ async fn a_workspaces_day_is_the_calls_made_for_the_tasks_it_runs() {
         .execute(&pool)
         .await
         .expect("leave the ledger as it was found");
-    for workspace in [&tenant, &other, &twin_home] {
-        sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
-            .bind(workspace)
-            .execute(&pool)
-            .await
-            .expect("leave the graph as it was found");
-    }
+    clear_tasks(&pool, &run.to_string()).await;
 }
 
 /// 被上限拒掉的一发算在被那条上限约束的主体头上，别的拒绝不算给任何人。
@@ -391,16 +370,7 @@ async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belon
         (&tenant_a, &task_a, &person_a),
         (&tenant_b, &task_b, &person_b),
     ] {
-        sqlx::query(
-            "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-             VALUES ($1, $2, $3, 'pending')",
-        )
-        .bind(workspace)
-        .bind(task_id)
-        .bind(serde_json::json!({ "submitted_by": submitted_by }))
-        .execute(&pool)
-        .await
-        .expect("write a task");
+        task_rev(&pool, workspace, task_id, 1, Some(submitted_by)).await;
     }
 
     // 这个人自己那一格的上限拒的，且没有任务身份：只算人，不进任何租户。
@@ -518,13 +488,7 @@ async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belon
         .execute(&pool)
         .await
         .expect("leave the ledger as it was found");
-    for workspace in [&tenant_a, &tenant_b] {
-        sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
-            .bind(workspace)
-            .execute(&pool)
-            .await
-            .expect("leave the graph as it was found");
-    }
+    clear_tasks(&pool, &run.to_string()).await;
 }
 
 /// 按任务的那份只数当天的：更早的花销不进格子，没花过的不出现。
@@ -590,20 +554,8 @@ async fn the_attribution_a_task_names_is_what_the_ledger_charges_and_the_gateway
     let absent = format!("submitter-absent-{run}");
     let person = format!("person-{run}");
 
-    for (task_id, task_json) in [
-        (&named, serde_json::json!({ "submitted_by": person })),
-        (&anonymous, serde_json::json!({})),
-    ] {
-        sqlx::query(
-            "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-             VALUES ($1, $2, $3, 'pending')",
-        )
-        .bind(format!("ws-{run}"))
-        .bind(task_id)
-        .bind(task_json)
-        .execute(&pool)
-        .await
-        .expect("write a task");
+    for (task_id, submitted_by) in [(&named, Some(person.as_str())), (&anonymous, None)] {
+        task_rev(&pool, &format!("ws-{run}"), task_id, 1, submitted_by).await;
     }
 
     let attribution = store
@@ -641,9 +593,5 @@ async fn the_attribution_a_task_names_is_what_the_ledger_charges_and_the_gateway
         "图里没有这件活：答不上来，而不是答错一个人"
     );
 
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
-        .bind(format!("ws-{run}"))
-        .execute(&pool)
-        .await
-        .expect("leave the graph as it was found");
+    clear_tasks(&pool, &run.to_string()).await;
 }

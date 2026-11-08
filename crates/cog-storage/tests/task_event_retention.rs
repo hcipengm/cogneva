@@ -123,7 +123,7 @@ async fn scratch(case: &str) -> (Scratch, PgPool) {
     // The store's own schema, not a copy of it: a hand-written pair of tables
     // would let this suite pass against an index production never declares, and
     // the sweep's candidate query is only cheap because that index exists.
-    sqlx::raw_sql(cog_storage::postgres::state_backend::DDL)
+    sqlx::raw_sql(&cog_storage::postgres::state_backend::ddl())
         .execute(&pool)
         .await
         .expect("apply the store's schema to the case's schema");

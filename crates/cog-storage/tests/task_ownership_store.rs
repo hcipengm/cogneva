@@ -88,9 +88,7 @@ async fn only_the_owner_named_by_the_row_can_move_it() {
         TaskStatus::Scheduled
     );
 
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
-        .bind(&workspace)
-        .execute(&pool)
+    cog_test_support::clear_task_ledger_for(&pool, &workspace)
         .await
         .expect("clean up");
 }
@@ -133,9 +131,7 @@ async fn a_transition_cannot_hand_the_task_to_another_owner() {
     assert_eq!(row.owner_unit.as_deref(), Some("8b"));
     assert_eq!(row.status, TaskStatus::Pending);
 
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
-        .bind(&workspace)
-        .execute(&pool)
+    cog_test_support::clear_task_ledger_for(&pool, &workspace)
         .await
         .expect("clean up");
 }
@@ -216,9 +212,7 @@ async fn a_stale_read_is_a_conflict_and_an_unowned_row_is_not_claimable() {
         "a task that is not there is not a conflict: {missing:?}"
     );
 
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
-        .bind(&workspace)
-        .execute(&pool)
+    cog_test_support::clear_task_ledger_for(&pool, &workspace)
         .await
         .expect("clean up");
 }

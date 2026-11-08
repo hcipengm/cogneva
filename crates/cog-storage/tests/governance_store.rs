@@ -66,9 +66,13 @@ const ABANDONED_AFTER: chrono::Duration = chrono::Duration::minutes(10);
 
 async fn sweep_abandoned(pool: &PgPool) {
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT task_id, workspace_id FROM cog_dag_tasks \
-          WHERE workspace_id LIKE 'governance-store-test%' \
-             OR task_id LIKE 'governance-store-test%'",
+        "SELECT task_id, workspace_id FROM (\
+             SELECT DISTINCT ON (task_id) task_id, workspace_id \
+               FROM task_defined \
+              WHERE workspace_id LIKE 'governance-store-test%' \
+                 OR task_id LIKE 'governance-store-test%' \
+              ORDER BY task_id, rev DESC) latest \
+         ORDER BY task_id",
     )
     .fetch_all(pool)
     .await
@@ -84,9 +88,7 @@ async fn sweep_abandoned(pool: &PgPool) {
                 .filter(|_| task_id.starts_with("governance-store-test:"))
         });
         if started.is_some_and(|nanos| nanos < cutoff) {
-            sqlx::query("DELETE FROM cog_dag_tasks WHERE task_id = $1")
-                .bind(&task_id)
-                .execute(pool)
+            cog_test_support::purge_task(pool, &task_id)
                 .await
                 .expect("delete an abandoned row");
         }
@@ -163,8 +165,28 @@ async fn clean(pool: &PgPool, prefix: &str) {
     // (`decision-event:<id>:<seq>`). Deleting by workspace alone leaves the
     // product-workspace fixtures behind, and every leftover row is a face the
     // resident drift pass keeps rewriting.
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id LIKE $1 OR task_id LIKE $1")
-        .bind(format!("%{prefix}%"))
+    //
+    // The ledger is four tables and the definition is the one that names the
+    // workspace; the other three are reached through its ids.
+    let pattern = format!("%{prefix}%");
+    for table in ["task_attempt", "task_transition"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE task_id IN \
+             (SELECT task_id FROM task_defined \
+               WHERE workspace_id LIKE $1 OR task_id LIKE $1)"
+        ))
+        .bind(&pattern)
+        .execute(pool)
+        .await
+        .expect("clean up");
+    }
+    sqlx::query("DELETE FROM task_current WHERE workspace_id LIKE $1 OR task_id LIKE $1")
+        .bind(&pattern)
+        .execute(pool)
+        .await
+        .expect("clean up");
+    sqlx::query("DELETE FROM task_defined WHERE workspace_id LIKE $1 OR task_id LIKE $1")
+        .bind(&pattern)
         .execute(pool)
         .await
         .expect("clean up");
@@ -236,7 +258,7 @@ async fn only_the_reserved_workspace_rows_typed_as_faces_are_faces() {
     // The look-alike was seeded into a workspace whose name has nothing to do
     // with the round, so this is the row a workspace-only cleanup misses.
     let left: Vec<(String,)> =
-        sqlx::query_as("SELECT task_id FROM cog_dag_tasks WHERE task_id LIKE $1")
+        sqlx::query_as("SELECT task_id FROM task_defined WHERE task_id LIKE $1")
             .bind(format!("%{prefix}%"))
             .fetch_all(&pool)
             .await
@@ -899,7 +921,7 @@ async fn a_round_that_died_before_its_cleanup_is_reclaimed_by_the_next_one() {
     sweep_abandoned(&pool).await;
 
     let left: Vec<(String,)> =
-        sqlx::query_as("SELECT task_id FROM cog_dag_tasks WHERE task_id = ANY($1)")
+        sqlx::query_as("SELECT task_id FROM task_defined WHERE task_id = ANY($1)")
             .bind(vec![abandoned.clone(), current.clone()])
             .fetch_all(&pool)
             .await
@@ -914,11 +936,7 @@ async fn a_round_that_died_before_its_cleanup_is_reclaimed_by_the_next_one() {
         "a fixture from this minute may belong to a round still running: {names:?}"
     );
 
-    let prefix = marker();
-    clean(&pool, &prefix).await;
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE task_id = $1")
-        .bind(&current)
-        .execute(&pool)
+    cog_test_support::purge_task(&pool, &current)
         .await
         .expect("clean up the fresh fixture");
 }

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -13,6 +13,7 @@ use super::state_reads::{
     agent_state_from_json, checkpoint_from_row, AgentStateRow, CheckpointRow, AGENT_STATE_SQL,
     CHECKPOINT_SQL,
 };
+use super::task_ledger::{self, ledger_sql, LedgerRow};
 
 /// The read of one task's event sequence from a position onward.
 ///
@@ -32,44 +33,31 @@ pub const EVENTS_PAGE_SQL: &str = r#"
 
 /// The rows the venue board folds, read in one statement.
 ///
-/// Named because the statement is the thing that has to hold for the board's
-/// read to be a lookup: the expression index `idx_cog_dag_tasks_venue` answers
-/// this exact text and nothing else, and a copy of it written inline is a
-/// statement nobody measures. A test explains this constant against a table
-/// shaped like the live one and goes red when the plan stops being an index
-/// scan.
+/// The statement is the thing that has to hold for the board's read to be a
+/// lookup: `idx_task_defined_venue` answers its predicate, and the label is few
+/// rows in a large ledger, so the read must reach them through that index
+/// rather than by folding every task's revisions. A test explains this
+/// function against a table shaped like the live one and goes red when the plan
+/// stops being an index scan.
 ///
 /// The `btrim` clause is a filter after the index, not part of it -- an empty
 /// label and a label of spaces are the same thing (`btrim` of either is empty),
 /// and neither is a venue.
-pub const VENUE_TASKS_SQL: &str = r#"
-    SELECT task FROM cog_dag_tasks
-    WHERE workspace_id = $1
-      AND task->>'venue' IS NOT NULL
-      AND btrim(task->>'venue') <> ''
-"#;
-
-/// 一行任务从正文里读回来时，补上它被存进去时挂的那个工作区。
 ///
-/// 工作区在列上，而正文里那一格在早期写进来的行上是空的（实测 2026-11-06：
-/// 一个工作区 9,920 行，其中 9,878 行这一格为空）。读的那一侧按**正文**那一格
-/// 判「这个读者能不能看这一行」：声明了自己工作区的读者看到 42 件，没声明的
-/// 看到 9,920 件，两个数都自称是「任务总数」。存哪一列是库的事，读者只该拿到
-/// 一个答案。
-fn row_task(value: serde_json::Value, workspace_id: &str) -> SFResult<cog_core::Task> {
-    let task: cog_core::Task = serde_json::from_value(value).map_err(SFError::Serialization)?;
-    Ok(stamp_workspace(&task, workspace_id))
-}
-
-/// 给一份任务补上它挂的工作区（那一格空着才补，写好的不覆盖）。
+/// The venue read, as the store runs it.
 ///
-/// 写和读两头都走它：写的时候让正文与列一致，读的时候兜住早期写进来的行。
-fn stamp_workspace(task: &cog_core::Task, workspace_id: &str) -> cog_core::Task {
-    let mut out = task.clone();
-    if out.workspace_id.is_none() {
-        out.workspace_id = Some(workspace_id.to_string());
-    }
-    out
+/// A function rather than a constant because the statement is built from the
+/// ledger's join, and a copy written out here would go on passing after the
+/// store's stopped being indexable. The test that reads its plan calls this,
+/// so it explains the same text production runs.
+pub fn venue_tasks_sql() -> String {
+    // 内层是索引能回答的那一问（任何一个修订带过标签），外层才是真正要的那一问
+    // （**最新一版**带标签）。只在最内层筛，一件任务曾经挂过标签、后来被清掉的
+    // 任务会以空标签回来；只在最外层筛，索引就用不上，读的代价跟着账本长度走。
+    ledger_sql(
+        "workspace_id = $1 AND venue IS NOT NULL AND btrim(venue) <> ''",
+        "venue IS NOT NULL AND btrim(venue) <> ''",
+    )
 }
 
 /// 完成 / 失败 / 取消一条任务前，先锁住它所在 workspace 的全部任务行。
@@ -84,10 +72,10 @@ fn stamp_workspace(task: &cog_core::Task, workspace_id: &str) -> cog_core::Task 
 /// `ORDER BY task_id` 给这批行一个全序，两个事务就只能是「同一顺序排队」而不是
 /// 「互相等」。
 pub const DAG_LOCK_WORKSPACE_SQL: &str =
-    "SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 ORDER BY task_id FOR UPDATE";
+    "SELECT task_id FROM task_current WHERE workspace_id = $1 ORDER BY task_id FOR UPDATE";
 
 /// This store's schema, and the one a restore replays.
-pub const DDL: &str = r#"
+pub const DDL_TEMPLATE: &str = r#"
 CREATE TABLE IF NOT EXISTS cog_agent_states (
                 agent_id TEXT PRIMARY KEY,
                 state TEXT NOT NULL,
@@ -164,73 +152,199 @@ CREATE TABLE IF NOT EXISTS cog_dag_state (
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
 ;
-CREATE TABLE IF NOT EXISTS cog_dag_tasks (
-                workspace_id TEXT NOT NULL,
+-- The task graph is a ledger, not a document: every state change is a row that
+-- is never updated, the definition is versioned rather than overwritten, and
+-- what the dispatcher reads is a projection holding only rows that can still
+-- move. The three failures the document shape produced -- a lost update one
+-- interleaving away, a value read once and frozen forever, and a missing key
+-- that answers NULL instead of failing -- are each a property of a mutable
+-- document, not of the code that wrote it.
+CREATE TABLE IF NOT EXISTS task_defined (
                 task_id TEXT NOT NULL,
-                task JSONB NOT NULL,
-                status TEXT NOT NULL,
-                retry_history JSONB NOT NULL DEFAULT '[]'::jsonb,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (workspace_id, task_id)
+                rev BIGINT NOT NULL,
+                at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                workspace_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                input TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 0,
+                timeout_seconds BIGINT NOT NULL DEFAULT 0,
+                is_executable BOOLEAN NOT NULL DEFAULT TRUE,
+                acceptance TEXT[] NOT NULL DEFAULT '{}',
+                blocked_by TEXT[] NOT NULL DEFAULT '{}',
+                agent_id TEXT,
+                goal_id TEXT,
+                parent_task_id TEXT,
+                sink_task_id TEXT,
+                face_id TEXT,
+                venue TEXT,
+                owner_unit TEXT,
+                bound_by_handover_id TEXT,
+                submitted_by TEXT,
+                planner_verified BOOLEAN,
+                planner_version TEXT,
+                planner_note TEXT,
+                planner_source TEXT,
+                planner_confidence DOUBLE PRECISION,
+                planner_at TIMESTAMPTZ,
+                PRIMARY KEY (task_id, rev)
             )
 ;
-CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_status
-            ON cog_dag_tasks(workspace_id, status)
+CREATE INDEX IF NOT EXISTS idx_task_defined_latest
+            ON task_defined(task_id, rev DESC)
 ;
--- The face and owner a task carries, read out of the task payload by the
--- database rather than written beside it.
+CREATE INDEX IF NOT EXISTS idx_task_defined_blocked_by
+            ON task_defined USING GIN (blocked_by)
+;
+CREATE INDEX IF NOT EXISTS idx_task_defined_workspace
+            ON task_defined(workspace_id, kind)
+;
+CREATE INDEX IF NOT EXISTS idx_task_defined_face
+            ON task_defined(workspace_id, face_id)
+;
+CREATE INDEX IF NOT EXISTS idx_task_defined_venue
+            ON task_defined(workspace_id, venue)
+;
+-- Which person's daily allowance a task's spend lands on is asked once per
+-- proxied call, so it is an index and not a scan.
+CREATE INDEX IF NOT EXISTS idx_task_defined_submitted_by
+            ON task_defined(submitted_by)
+;
+CREATE TABLE IF NOT EXISTS task_transition (
+                task_id TEXT NOT NULL,
+                seq BIGINT NOT NULL,
+                at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                from_state TEXT,
+                to_state TEXT NOT NULL,
+                actor TEXT,
+                cause TEXT,
+                detail TEXT,
+                -- A transition may say "not before then". The retry backoff is
+                -- a decision taken by the attempt that failed, so it is part of
+                -- the record rather than a field on the projection that a
+                -- rebuild would silently drop.
+                not_before TIMESTAMPTZ,
+                PRIMARY KEY (task_id, seq),
+                CONSTRAINT task_transition_to_state_named
+                    CHECK (to_state IN ('{task_status:pending}', '{task_status:scheduled}',
+                                        '{task_status:running}', '{task_status:completed}',
+                                        '{task_status:failed}', '{task_status:cancelled}'))
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_task_transition_at
+            ON task_transition(at)
+;
+CREATE INDEX IF NOT EXISTS idx_task_transition_state_at
+            ON task_transition(to_state, at)
+;
+CREATE TABLE IF NOT EXISTS task_attempt (
+                task_id TEXT NOT NULL,
+                attempt_no INTEGER NOT NULL,
+                started_at TIMESTAMPTZ,
+                ended_at TIMESTAMPTZ,
+                owner TEXT,
+                agent_id TEXT,
+                outcome TEXT,
+                error_code TEXT,
+                error_text TEXT,
+                result TEXT,
+                PRIMARY KEY (task_id, attempt_no)
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_task_attempt_open
+            ON task_attempt(task_id) WHERE ended_at IS NULL
+;
+-- The projection the dispatcher reads: one row per task that can still move.
+-- `as_of_seq` and `def_rev` are watermarks -- "is this reading current" is a
+-- comparison, not an assumption.
+CREATE TABLE IF NOT EXISTS task_current (
+                workspace_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                as_of_seq BIGINT NOT NULL,
+                def_rev BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                attempt_no INTEGER NOT NULL DEFAULT 0,
+                started_at TIMESTAMPTZ,
+                lease_owner TEXT,
+                lease_expires_at TIMESTAMPTZ,
+                retry_not_before TIMESTAMPTZ,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                error_text TEXT,
+                PRIMARY KEY (workspace_id, task_id),
+                CONSTRAINT task_current_is_live
+                    CHECK (state IN ('{task_status:pending}', '{task_status:scheduled}',
+                                     '{task_status:running}'))
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_task_current_state
+            ON task_current(workspace_id, state)
+;
+CREATE INDEX IF NOT EXISTS idx_task_current_task_id
+            ON task_current(task_id)
+;
+CREATE INDEX IF NOT EXISTS idx_task_current_lease
+            ON task_current(lease_expires_at) WHERE lease_expires_at IS NOT NULL
+;
+-- 定义修订与状态迁移是账本的**历史**，只许追加。改写它们只有一种来路：有人在
+-- 别处又存了一份可以就地改的真值，然后两头开始互相矛盾。这条不变式交给数据库
+-- 判，不交给每个写者自己记得——删（撤掉一件任务、清一个工作区）仍然是显式的
+-- 管理动作，改不是。
 --
--- A stored copy would be a second answer to "whose is this": every writer would
--- have to update the column and the JSON in step, and the one that forgot would
--- leave an index pointing at an owner the row no longer has. Generated columns
--- cannot drift from the row they are derived from.
---
--- They are declared here, next to the CREATE, rather than in a migration:
--- migrations run before this schema creates the table, so an ALTER in one would
--- fail on a fresh install. The ALTER form below is what upgrades an existing
--- database, and it is idempotent so every start may run it.
-ALTER TABLE cog_dag_tasks ADD COLUMN IF NOT EXISTS face_id TEXT
-            GENERATED ALWAYS AS (task->>'face_id') STORED
+-- 这段是 `DO` 而不是三条 `CREATE OR REPLACE`：每个 pod 启动都会跑一遍这个批，
+-- 而 `CREATE OR REPLACE FUNCTION` / `TRIGGER` 在两个会话同时执行时拿到的是
+-- `tuple concurrently updated`（实测：同一个库上并行起的用例全倒在这一句上）。
+-- 「先上锁、再查、缺才建」在并发下是同一件事，在已经建好的库上是一次目录查询。
+-- 先上锁，单独一条语句：整批是一次隐式事务，事务级的咨询锁活到批尾；而
+-- `pg_advisory_xact_lock` 等待不会刷新语句快照——锁和「查一下缺不缺」写在同一
+-- 条语句里时，等到锁的那个会话仍拿着等之前取的照片，看见的永远是「还没有」，
+-- 于是第二个会话也去建，拿到 `tuple concurrently updated`。拆成两条，锁到手之后
+-- 那条 `DO` 取的是新快照，看见前一个会话建好的东西。
+SELECT pg_advisory_xact_lock(hashtext('cogneva:task-ledger:append-only'))
 ;
-ALTER TABLE cog_dag_tasks ADD COLUMN IF NOT EXISTS owner_unit TEXT
-            GENERATED ALWAYS AS (task->>'owner_unit') STORED
-;
-CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_face
-            ON cog_dag_tasks(workspace_id, face_id, status)
-;
-CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_owner_unit
-            ON cog_dag_tasks(workspace_id, owner_unit, status)
-;
--- The venue board's lookup, declared here as well as in the migration that
--- upgrades existing databases -- because migrations run before this schema
--- creates the table, so on a fresh install the migration finds nothing to
--- index and says so. One of the two paths always applies it.
---
--- Not partial: an expression's statistics are gathered from the rows its index
--- covers, so a partial index reports a null fraction of zero and the planner
--- concludes that nearly every row carries a label (9,891 of 9,991 when it was
--- tried) -- and then prefers scanning the table to an index scan with that
--- estimate.
-CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_venue
-            ON cog_dag_tasks(workspace_id, (task->>'venue'))
-;
--- 按任务 id 单点找「最近的那一行」，不走工作区。
---
--- 主键是 `(workspace_id, task_id)`，所以只带 task_id 的查询用不上它：额度判定在
--- LLM 代理路径上每一次任务调用都要问一次「这件活是谁交的、跑在哪个租户」（一次
--- 请求一次的读），没有这条索引就是每发都全表顺序扫描，表随任务数增长而每次请求
--- 都更慢。按花销把调用折到人／工作区的两个当日汇总也走同一个形状，取的都是
--- `ORDER BY updated_at DESC LIMIT 1`，所以排序列进索引，取数不必再排序。
-CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_task_updated
-            ON cog_dag_tasks(task_id, updated_at DESC)
-;
+DO $$
+BEGIN
+    IF to_regclass('task_defined') IS NULL THEN
+        RETURN;
+    END IF;
+    IF to_regprocedure('task_ledger_history_is_append_only()') IS NULL THEN
+        EXECUTE $create$
+            CREATE FUNCTION task_ledger_history_is_append_only() RETURNS TRIGGER AS $body$
+            BEGIN
+                RAISE EXCEPTION '% is append-only: a history row may not be rewritten',
+                    TG_TABLE_NAME;
+            END
+            $body$ LANGUAGE plpgsql
+        $create$;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+                    WHERE c.relname = 'task_defined'
+                      AND t.tgname = 'task_defined_is_append_only' AND NOT t.tgisinternal)
+    THEN
+        EXECUTE $create$ CREATE TRIGGER task_defined_is_append_only
+                         BEFORE UPDATE ON task_defined
+                         FOR EACH ROW EXECUTE FUNCTION task_ledger_history_is_append_only()
+                 $create$;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+                    WHERE c.relname = 'task_transition'
+                      AND t.tgname = 'task_transition_is_append_only' AND NOT t.tgisinternal)
+    THEN
+        EXECUTE $create$ CREATE TRIGGER task_transition_is_append_only
+                         BEFORE UPDATE ON task_transition
+                         FOR EACH ROW EXECUTE FUNCTION task_ledger_history_is_append_only()
+                 $create$;
+    END IF;
+END
+$$;
 -- 一条任务的计划基线：它「打算怎么做」。
 --
--- 与 cog_dag_tasks 并排而不是加列进去：后者每次状态流转都要整行重写，
--- 基线在分解那一刻就定了、之后不改，混在一张表里会让「计划」跟着
--- 「现状」一起被覆盖，甘特面就再也画不出偏差。
+-- 与定义表并排而不是加列进去：基线在分解那一刻就定了、之后不改，
+-- 混在一张每次重新定义都要追加一行的表里，甘特面就再也画不出偏差。
 --
--- 这里**没有状态列**，这是刻意的：状态的唯一正本在上面的表里，
+-- 这里**没有状态列**，这是刻意的：状态的唯一正本在转换表里，
 -- 两边各存一份就是两份真值，迟早互相矛盾。
 CREATE TABLE IF NOT EXISTS task_plan (
                 workspace_id TEXT NOT NULL,
@@ -277,6 +391,22 @@ DO $$
             END $$;
 "#;
 
+/// The startup schema with every closed set filled from the enum that declares
+/// it.
+///
+/// The task tables' `CHECK` constraints name the same words `TaskStatus::as_str`
+/// writes. Left as literals they would be a second declaration: a renamed
+/// variant would keep being refused by the constraint, and the first write
+/// after the rename would fail on a schema that reads as current. Filled from
+/// [`TaskStatus::ALL`], the constraint cannot disagree with the writer.
+pub fn ddl() -> String {
+    let mut slots: Vec<(&str, &str)> = Vec::new();
+    for status in cog_core::TaskStatus::ALL {
+        slots.push(("task_status", status.as_str()));
+    }
+    crate::postgres::fill_slots(DDL_TEMPLATE, &slots)
+}
+
 pub struct PostgresStateBackend {
     pool: PgPool,
 }
@@ -316,15 +446,211 @@ impl PostgresStateBackend {
 
     /// Auto-create the required tables and indexes if they do not exist.
     pub async fn init_schema(&self) -> SFResult<()> {
-        crate::schema_ddl::apply(&self.pool, DDL).await
+        crate::schema_ddl::apply(&self.pool, &ddl()).await
     }
-}
 
-/// TaskStatus 的 DB 文本形式：定义在 `cog_core::TaskStatus::as_str`，这里只做
-/// 借用转换——写列与读列的字符串必须来自同一处，否则计数查询会按一套拼写
-/// 去数另一套拼写写下的行。
-fn status_str(status: &cog_core::TaskStatus) -> &'static str {
-    status.as_str()
+    /// Rebuild `task_current` from the ledger, and say how many live rows
+    /// resulted.
+    ///
+    /// This is the command the projection's claim of being rebuildable rests
+    /// on: it runs the write path's own statements, so what a rebuild produces
+    /// cannot differ from what the writers would have produced. `None`
+    /// rebuilds every task; `Some(id)` rebuilds one, which is what a reader
+    /// that suspects a stale row wants.
+    ///
+    /// What a rebuild cannot restore is the lease (`lease_owner`,
+    /// `lease_expires_at`): presence is not history, so those come back NULL,
+    /// which every reader already handles as "no evidence this is running".
+    pub async fn rebuild_task_projection(&self, task_id: Option<&str>) -> SFResult<u64> {
+        task_ledger::rebuild(&self.pool, task_id).await
+    }
+
+    /// The tasks of a workspace that can still move, read under the lock the
+    /// caller already holds.
+    ///
+    /// This is the set every bulk decision works on: a terminal task cannot be
+    /// completed, failed, cancelled or made ready, so a read that carried them
+    /// would spend its time on rows that can only be skipped.
+    async fn live_tasks(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workspace_id: &str,
+    ) -> SFResult<std::collections::HashMap<String, cog_core::Task>> {
+        let sql = ledger_sql(
+            "workspace_id = $1",
+            &crate::postgres::fill_slots(
+                "t.to_state IN ('{task_status:pending}', '{task_status:scheduled}', \
+                 '{task_status:running}')",
+                &task_ledger::live_status_slots(),
+            ),
+        );
+        let rows: Vec<LedgerRow> = sqlx::query_as(&sql)
+            .bind(workspace_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                let id = row.task_id.clone();
+                row.into_task().map(|t| (id, t))
+            })
+            .collect()
+    }
+
+    /// The state every one of `ids` is in, read from the transition that put it
+    /// there.
+    ///
+    /// A dependency that finished is not in the live projection, so readiness
+    /// cannot be answered from that table: "not in the live set" covers both
+    /// "completed" and "gone".
+    async fn states_of(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        ids: &[String],
+    ) -> SFResult<std::collections::HashMap<String, cog_core::TaskStatus>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (task_id) task_id, to_state FROM task_transition \
+             WHERE task_id = ANY($1) ORDER BY task_id, seq DESC",
+        )
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, state)| cog_core::TaskStatus::parse(&state).map(|s| (id, s)))
+            .collect())
+    }
+
+    /// Move a task from one of `expected` to the state `updated` carries.
+    ///
+    /// The compare-and-set the document shape did with `UPDATE ... WHERE
+    /// status = ANY(...)` is here a read of the last transition under the
+    /// workspace lock, so the check and the write are one decision rather than
+    /// two statements a second writer can slip between.
+    async fn transition_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        expected: &[cog_core::TaskStatus],
+        updated: &cog_core::Task,
+        owner: Option<&str>,
+    ) -> SFResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        task_ledger::lock_workspace(&mut tx, workspace_id).await?;
+
+        let current = task_ledger::current_state(&mut tx, task_id).await?;
+        let Some(current) = current else {
+            return Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: "Task not found".into(),
+            });
+        };
+
+        if let Some(owner) = owner {
+            let row: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT owner_unit FROM task_defined WHERE task_id = $1 \
+                 ORDER BY rev DESC LIMIT 1",
+            )
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+            let stored = row.and_then(|(o,)| o);
+            if stored.as_deref() != Some(owner) {
+                return Err(SFError::Conflict(format!(
+                    "task {task_id} is owned by {}, not {owner}",
+                    stored.as_deref().unwrap_or("nobody")
+                )));
+            }
+            // Moving the owner is a handover's decision, not a transition's:
+            // a payload that names somebody else would write a second answer
+            // to "whose is this" beside the one the handover wrote.
+            if updated.owner_unit.as_deref() != Some(owner) {
+                return Err(SFError::Conflict(format!(
+                    "task {task_id} cannot be moved to owner {} by a state transition",
+                    updated.owner_unit.as_deref().unwrap_or("nobody")
+                )));
+            }
+        }
+
+        if !expected.contains(&current) {
+            // 两条路对「状态不对」的回答不同，因为这个错在这个调用方那里含义不同：
+            // 带 owner 的那条是「我读到的快照过期了，重读一次」，不带 owner 的那条
+            // 是「这件任务不该被我推进」。把它报成一个，前者的重试逻辑会退化成把
+            // 一次过期读当成本次任务的失败。
+            return Err(match owner {
+                Some(_) => SFError::Conflict(format!(
+                    "task {task_id} is in {:?} state, not one of the states this transition accepts",
+                    current
+                )),
+                None => SFError::TaskFailed {
+                    task_id: task_id.into(),
+                    reason: format!("Cannot transition task in {current:?} state"),
+                },
+            });
+        }
+
+        task_ledger::save_definition(&mut tx, workspace_id, updated).await?;
+        if updated.status != current {
+            match updated.status {
+                cog_core::TaskStatus::Running => {
+                    task_ledger::open_attempt(&mut tx, task_id, updated.lease_owner.as_deref())
+                        .await?;
+                }
+                landed => {
+                    if current == cog_core::TaskStatus::Running {
+                        task_ledger::close_attempt(
+                            &mut tx,
+                            task_id,
+                            landed,
+                            None,
+                            updated.error.as_deref(),
+                            updated.result.as_ref(),
+                            updated.agent_id.as_deref(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            task_ledger::append_transition(
+                &mut tx,
+                &task_ledger::Transition {
+                    task_id,
+                    from: Some(current),
+                    to: updated.status,
+                    actor: "store",
+                    cause: "transition",
+                    detail: None,
+                    not_before: updated.retry_not_before,
+                },
+            )
+            .await?;
+        }
+
+        task_ledger::project(&mut tx, Some(task_id)).await?;
+        sqlx::query(
+            "UPDATE task_current SET lease_owner = $2, lease_expires_at = $3 WHERE task_id = $1",
+        )
+        .bind(task_id)
+        .bind(&updated.lease_owner)
+        .bind(updated.lease_expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// 派发还要看的那几列，按 `TaskStatus::ALL` 的枚举收集，不从 SQL 里抄名字。
@@ -679,48 +1005,48 @@ impl StateBackend for PostgresStateBackend {
         workspace_id: &str,
         task_id: &str,
     ) -> SFResult<Option<cog_core::Task>> {
-        let row: Option<(serde_json::Value,)> = self
+        let sql = ledger_sql("workspace_id = $1 AND task_id = $2", "");
+        let row: Option<LedgerRow> = self
             .retry(|| async {
-                sqlx::query_as(
-                    "SELECT task FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id = $2",
-                )
-                .bind(workspace_id)
-                .bind(task_id)
-                .fetch_optional(&self.pool)
-                .await
+                sqlx::query_as(&sql)
+                    .bind(workspace_id)
+                    .bind(task_id)
+                    .fetch_optional(&self.pool)
+                    .await
             })
             .await?;
-        row.map(|(v,)| row_task(v, workspace_id)).transpose()
+        row.map(LedgerRow::into_task).transpose()
     }
 
+    /// Write the task as the caller has it.
+    ///
+    /// Three different things are written here and they are kept apart on
+    /// purpose: the definition goes in as a revision (only if it moved), the
+    /// state goes in as a transition (only if it moved), and the presence --
+    /// the lease and the attempt -- goes straight into the projection, because
+    /// neither is history. A caller that writes the same task twice appends
+    /// nothing the second time.
     async fn dag_set_task(
         &self,
         workspace_id: &str,
         task_id: &str,
         task: &cog_core::Task,
     ) -> SFResult<()> {
-        // 正文里那一格与列是同一件事的两处写法：只写列，读的人按正文判就少看见行。
-        let value = serde_json::to_value(stamp_workspace(task, workspace_id))?;
-        let status = status_str(&task.status);
-        self.retry(|| async {
-            sqlx::query(
-                r#"
-                INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (workspace_id, task_id) DO UPDATE SET
-                    task = EXCLUDED.task,
-                    status = EXCLUDED.status,
-                    updated_at = NOW()
-                "#,
-            )
-            .bind(workspace_id)
-            .bind(task_id)
-            .bind(value.clone())
-            .bind(status)
-            .execute(&self.pool)
+        if task.id != task_id {
+            return Err(SFError::Validation(format!(
+                "writing task {task_id} with a body that names {}",
+                task.id
+            )));
+        }
+        let mut tx = self
+            .pool
+            .begin()
             .await
-        })
-        .await?;
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        task_ledger::write_task(&mut tx, workspace_id, task).await?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -731,44 +1057,8 @@ impl StateBackend for PostgresStateBackend {
         expected: &[cog_core::TaskStatus],
         updated: &cog_core::Task,
     ) -> SFResult<()> {
-        let value = serde_json::to_value(stamp_workspace(updated, workspace_id))?;
-        let new_status = status_str(&updated.status);
-        let expected: Vec<&str> = expected.iter().map(status_str).collect();
-
-        let result = self
-            .retry(|| async {
-                sqlx::query(
-                    r#"
-                    UPDATE cog_dag_tasks
-                    SET task = $3, status = $4, updated_at = NOW()
-                    WHERE workspace_id = $1 AND task_id = $2 AND status = ANY($5)
-                    "#,
-                )
-                .bind(workspace_id)
-                .bind(task_id)
-                .bind(value.clone())
-                .bind(new_status)
-                .bind(expected.clone())
-                .execute(&self.pool)
-                .await
-            })
-            .await?;
-
-        if result.rows_affected() == 1 {
-            return Ok(());
-        }
-        // CAS 失败：区分"不存在"与"状态不符"，报出当前状态
-        let current = self.dag_get_task(workspace_id, task_id).await?;
-        match current {
-            Some(t) => Err(SFError::TaskFailed {
-                task_id: task_id.into(),
-                reason: format!("Cannot transition task in {:?} state", t.status),
-            }),
-            None => Err(SFError::TaskFailed {
-                task_id: task_id.into(),
-                reason: "Task not found".into(),
-            }),
-        }
+        self.transition_task(workspace_id, task_id, expected, updated, None)
+            .await
     }
 
     async fn dag_transition_owned_task(
@@ -779,126 +1069,94 @@ impl StateBackend for PostgresStateBackend {
         updated: &cog_core::Task,
         owner: &str,
     ) -> SFResult<()> {
-        let value = serde_json::to_value(stamp_workspace(updated, workspace_id))?;
-        let new_status = status_str(&updated.status);
-        let expected: Vec<&str> = expected.iter().map(status_str).collect();
-
-        // Both owner clauses are load-bearing. The first compares the row on
-        // disk with the caller's unit, which is the ownership check at the
-        // instant of the write; the second refuses a payload that would move
-        // the task to another owner, since that decision belongs to the
-        // handover transaction and not to a state transition. Both read the
-        // owner out of the task document rather than through the generated
-        // column beside it: the row is already located by its primary key, so
-        // the check costs one JSON lookup on one row, and the guard stays valid
-        // on a database whose columns have not been added yet.
-        let result = self
-            .retry(|| async {
-                sqlx::query(
-                    r#"
-                    UPDATE cog_dag_tasks
-                    SET task = $3, status = $4, updated_at = NOW()
-                    WHERE workspace_id = $1 AND task_id = $2 AND status = ANY($5)
-                      AND task ->> 'owner_unit' = $6
-                      AND $3::jsonb ->> 'owner_unit' = $6
-                    "#,
-                )
-                .bind(workspace_id)
-                .bind(task_id)
-                .bind(value.clone())
-                .bind(new_status)
-                .bind(expected.clone())
-                .bind(owner)
-                .execute(&self.pool)
-                .await
-            })
-            .await?;
-
-        if result.rows_affected() == 1 {
-            return Ok(());
-        }
-        // The guard that failed decides what the caller should do: a row that
-        // moved to another owner and a row that moved to another state are
-        // both "re-read", but only the first one means this caller may no
-        // longer act on the task at all.
-        let current = self.dag_get_task(workspace_id, task_id).await?;
-        match current {
-            Some(t) if t.owner_unit.as_deref() != Some(owner) => Err(SFError::Conflict(format!(
-                "task {task_id} is owned by {}, not {owner}",
-                t.owner_unit.as_deref().unwrap_or("nobody")
-            ))),
-            Some(t) => Err(SFError::Conflict(format!(
-                "task {task_id} is in {:?} state, not one of the states this transition accepts",
-                t.status
-            ))),
-            None => Err(SFError::TaskFailed {
-                task_id: task_id.into(),
-                reason: "Task not found".into(),
-            }),
-        }
+        self.transition_task(workspace_id, task_id, expected, updated, Some(owner))
+            .await
     }
 
+    /// Remove every row a task owns.
+    ///
+    /// A purge rather than a state change: nothing about this task is history
+    /// worth keeping, which is exactly the case the append-only rule does not
+    /// cover. It still goes through one transaction so a half-removed task --
+    /// a definition with no transition, which reads as "defined and never
+    /// moved" -- cannot be observed.
     async fn dag_remove_task(&self, workspace_id: &str, task_id: &str) -> SFResult<()> {
-        self.retry(|| async {
-            sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id = $2")
-                .bind(workspace_id)
-                .bind(task_id)
-                .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        for statement in [
+            "DELETE FROM task_current WHERE task_id = $1",
+            "DELETE FROM task_attempt WHERE task_id = $1",
+            "DELETE FROM task_transition WHERE task_id = $1",
+            "DELETE FROM task_defined WHERE task_id = $1 AND workspace_id = $2",
+        ] {
+            let mut query = sqlx::query(statement).bind(task_id);
+            if statement.contains("$2") {
+                query = query.bind(workspace_id);
+            }
+            query
+                .execute(&mut *tx)
                 .await
-        })
-        .await?;
+                .map_err(|e| SFError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
         Ok(())
     }
 
     async fn dag_list_tasks(&self, workspace_id: &str) -> SFResult<Vec<String>> {
         let rows: Vec<(String,)> = self
             .retry(|| async {
-                sqlx::query_as("SELECT task_id FROM cog_dag_tasks WHERE workspace_id = $1")
-                    .bind(workspace_id)
-                    .fetch_all(&self.pool)
-                    .await
+                sqlx::query_as(
+                    "SELECT DISTINCT task_id FROM task_defined WHERE workspace_id = $1 \
+                     ORDER BY task_id",
+                )
+                .bind(workspace_id)
+                .fetch_all(&self.pool)
+                .await
             })
             .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
     async fn dag_get_all_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
-        let rows: Vec<(serde_json::Value,)> = self
+        let sql = ledger_sql("workspace_id = $1", "");
+        let rows: Vec<LedgerRow> = self
             .retry(|| async {
-                sqlx::query_as("SELECT task FROM cog_dag_tasks WHERE workspace_id = $1")
+                sqlx::query_as(&sql)
                     .bind(workspace_id)
                     .fetch_all(&self.pool)
                     .await
             })
             .await?;
-        rows.into_iter()
-            .map(|(v,)| row_task(v, workspace_id))
-            .collect()
+        rows.into_iter().map(LedgerRow::into_task).collect()
     }
 
     /// 只有带场地标签的那些行；没有标签的整行不进结果。
     ///
-    /// 标签在 JSON 里，按 `task->>'venue'` 判，而整张图绝大多数行没有标签
-    /// （实测 2026-11-06：9,991 行里 9,987 行没有，正文合计 42 MB，顺序扫
-    /// 一次 0.9 秒换回 4 行）。这条语句与迁移建的表达式索引同形，所以那次扫描
-    /// 是按标签的定位。索引**不能**是部分索引——部分索引的统计只采它覆盖的
-    /// 那些行，`task->>'venue'` 的非空比例就恒为 1，规划器会以为几乎每行都
-    /// 有标签而放弃索引（实测：同一张表上带谓词的索引一次都没被选中）。
+    /// 标签是定义表上的一列，按 `(workspace_id, venue)` 的索引定位；整张图绝
+    /// 大多数行没有标签（实测 2026-11-06：9,991 行里 9,987 行没有），所以那
+    /// 个条件把读的量级压在这几行上，而不是压在一次整表扫描之后。
     ///
     /// 终态行必须留下：看板的「最近一条判据」和「写回量」两列读的就是已经
     /// 做完的行，排掉它们会让两列变空，而空的读数和「今天没交活」长得一样。
     async fn dag_get_venue_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
-        let rows: Vec<(serde_json::Value,)> = self
+        let sql = ledger_sql(
+            "workspace_id = $1 AND venue IS NOT NULL AND btrim(venue) <> ''",
+            "",
+        );
+        let rows: Vec<LedgerRow> = self
             .retry(|| async {
-                sqlx::query_as(VENUE_TASKS_SQL)
+                sqlx::query_as(&sql)
                     .bind(workspace_id)
                     .fetch_all(&self.pool)
                     .await
             })
             .await?;
-        rows.into_iter()
-            .map(|(v,)| row_task(v, workspace_id))
-            .collect()
+        rows.into_iter().map(LedgerRow::into_task).collect()
     }
 
     /// 只有派发还要看的那些行；`failed` / `cancelled` 在查询里就被排掉。
@@ -906,58 +1164,41 @@ impl StateBackend for PostgresStateBackend {
     /// 收哪些状态由 [`cog_core::TaskStatus::affects_dispatch`] 一个地方决定，
     /// 这里只把它的答案拼成参数——SQL 里再抄一遍字符串，两处就会各自漂移，
     /// 而漂移的那一天表现为「某些行忽然不再被派发」。
-    ///
-    /// 写的是「在这些状态里」而不是「不在那两个状态里」：同一批行，两种写法
-    /// 规划器给的计划不同。2026-11-07 本机生产库实测，`status <> ALL(...)`
-    /// 走顺序扫（9,590 行整表、缓冲 4,121、100 毫秒），`status = ANY(...)` 走
-    /// `(workspace_id, status)` 上那条索引的位图扫（缓冲 1,645、14.5 毫秒）——
-    /// 同一次读快七倍，而这条读法每五秒就跑一遍，跑在发布那一拍上。判据没变，
-    /// 变的是取它的路径。
     async fn dag_get_live_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
         let live = live_status_filter();
-        let rows: Vec<(serde_json::Value,)> = self
+        let sql = ledger_sql("workspace_id = $1", "t.to_state = ANY($2::text[])");
+        let rows: Vec<LedgerRow> = self
             .retry(|| async {
-                sqlx::query_as(
-                    "SELECT task FROM cog_dag_tasks \
-                     WHERE workspace_id = $1 AND status = ANY($2::text[])",
-                )
-                .bind(workspace_id)
-                .bind(live.as_slice())
-                .fetch_all(&self.pool)
-                .await
+                sqlx::query_as(&sql)
+                    .bind(workspace_id)
+                    .bind(live.as_slice())
+                    .fetch_all(&self.pool)
+                    .await
             })
             .await?;
-        rows.into_iter()
-            .map(|(v,)| row_task(v, workspace_id))
-            .collect()
+        rows.into_iter().map(LedgerRow::into_task).collect()
     }
 
     /// 只读某一状态的行。
     ///
-    /// 走 `(workspace_id, status)` 上那条索引，换回的是这一列的那几行，而不是整张
-    /// 图。判据只取决于同状态的行，读的范围就跟着判据走：同一个库上整表读
-    /// 9,901 行 / 72 MB / 1.7–6.4 秒一次（本机实测，2026-11-06），而 `running`
-    /// 列只有 8 行。
+    /// 状态是转换表最后一行，按 `(task_id, seq)` 的索引定位；读的范围跟着判据
+    /// 走，而不是先把整张图读一遍再筛。
     async fn dag_get_tasks_in_status(
         &self,
         workspace_id: &str,
         status: cog_core::TaskStatus,
     ) -> SFResult<Vec<cog_core::Task>> {
-        let rows: Vec<(serde_json::Value,)> = self
+        let sql = ledger_sql("workspace_id = $1", "t.to_state = $2");
+        let rows: Vec<LedgerRow> = self
             .retry(|| async {
-                sqlx::query_as(
-                    "SELECT task FROM cog_dag_tasks \
-                     WHERE workspace_id = $1 AND status = $2",
-                )
-                .bind(workspace_id)
-                .bind(status.as_str())
-                .fetch_all(&self.pool)
-                .await
+                sqlx::query_as(&sql)
+                    .bind(workspace_id)
+                    .bind(status.as_str())
+                    .fetch_all(&self.pool)
+                    .await
             })
             .await?;
-        rows.into_iter()
-            .map(|(v,)| row_task(v, workspace_id))
-            .collect()
+        rows.into_iter().map(LedgerRow::into_task).collect()
     }
 
     // ─── 计划基线（task_plan）───
@@ -1107,8 +1348,9 @@ impl StateBackend for PostgresStateBackend {
         // 是同一把尺子（自定义取 `custom`，其余取变体名），分叉的那天这里读成
         // 空，表现是「没有样本」而不是报错——所以两处必须一起改。
         //
-        // 工时的两端是 `started_at` 与最近一次更新，不是创建与最新更新：创建到
-        // 开工之间的那段是**排队时间**，不是工期。这条差别不是小数点上的：现网
+        // 工时的两端是「最后一次开工」（`task_attempt.started_at`）与「完成那条
+        // 迁移」（`task_transition.at`），不是创建与最新更新：创建到开工之间的
+        // 那段是**排队时间**，不是工期。这条差别不是小数点上的：现网
         // 五条 change_ledger 样本创建于 10-18、10-25 才被拾取，按创建量是 7.7 天，
         // 按开工量是 7 分钟——前者排出来的甘特条，会让 2354 条待办每一行都画成
         // 一周长，而它们实际各跑几分钟。没有开始时刻的行不贡献时长样本（它的
@@ -1140,19 +1382,40 @@ impl StateBackend for PostgresStateBackend {
             .retry(|| async {
                 sqlx::query_as(
                     r#"
-                    WITH done AS (
-                        SELECT COALESCE(
-                                   CASE WHEN jsonb_typeof(task->'task_type') = 'object'
-                                        THEN task->'task_type'->>'custom'
-                                        ELSE task->'task_type'#>>'{}' END,
-                                   'other') AS kind,
-                               task_id,
-                               EXTRACT(EPOCH FROM ((task->>'updated_at')::timestamptz
-                                                 - NULLIF(task->>'started_at', '')::timestamptz)) AS dur
-                          FROM cog_dag_tasks
-                         WHERE workspace_id = $1
-                           AND status = $3
-                           AND updated_at > NOW() - INTERVAL '30 days'
+                    WITH latest_def AS (
+                        -- 「这件任务的定义」是最新一版修订；种类只在定义里。
+                        SELECT DISTINCT ON (task_id) task_id, workspace_id, kind
+                          FROM task_defined
+                         ORDER BY task_id, rev DESC
+                    ),
+                    done AS (
+                        -- 最近 30 天里跑完、并且完成之后再没有动过的任务。
+                        --
+                        -- 「跑完」是状态账本里的一条迁移，不是某个可被改写回
+                        -- 去的字段：拿 `to_state = $3` 去取、再排掉它后面还有
+                        -- 迁移的行，取到的就是「最后一句话是完成」。这条判断
+                        -- 用得上 `idx_task_transition_state_at`，所以这条读的
+                        -- 代价跟着最近 30 天的完成量走，不跟着账本长度走。
+                        SELECT ld.kind,
+                               t.task_id,
+                               EXTRACT(EPOCH FROM (t.at - a.started_at)) AS dur
+                          FROM task_transition t
+                          JOIN latest_def ld ON ld.task_id = t.task_id
+                          LEFT JOIN LATERAL (
+                                SELECT x.started_at
+                                  FROM task_attempt x
+                                 WHERE x.task_id = t.task_id
+                                   AND x.started_at IS NOT NULL
+                                 ORDER BY x.attempt_no DESC
+                                 LIMIT 1
+                          ) a ON TRUE
+                         WHERE ld.workspace_id = $1
+                           AND t.to_state = $3
+                           AND t.at > NOW() - INTERVAL '30 days'
+                           AND NOT EXISTS (
+                                SELECT 1 FROM task_transition n
+                                 WHERE n.task_id = t.task_id AND n.seq > t.seq
+                           )
                     ),
                     joined AS (
                         SELECT d.kind,
@@ -1228,9 +1491,20 @@ impl StateBackend for PostgresStateBackend {
     async fn task_status_counts(&self) -> SFResult<Option<cog_core::TaskStatusCounts>> {
         let rows: Vec<(String, i64)> = self
             .retry(|| async {
-                sqlx::query_as("SELECT status, COUNT(*)::bigint FROM cog_dag_tasks GROUP BY status")
-                    .fetch_all(&self.pool)
-                    .await
+                // 一件任务的状态是它最后一条迁移。分组前先把每件任务收敛到那
+                // 一条（主键 (task_id, seq) 反着扫就够），所以这里数的是任务
+                // 数，不是迁移条数——一个重试过三次的任务仍然是一件。
+                sqlx::query_as(
+                    r#"
+                    SELECT last.to_state AS status, COUNT(*)::bigint
+                      FROM (SELECT DISTINCT ON (task_id) task_id, to_state
+                              FROM task_transition
+                             ORDER BY task_id, seq DESC) last
+                     GROUP BY last.to_state
+                    "#,
+                )
+                .fetch_all(&self.pool)
+                .await
             })
             .await?;
 
@@ -1269,19 +1543,15 @@ impl StateBackend for PostgresStateBackend {
     }
 
     async fn dag_get_dependents(&self, workspace_id: &str, task_id: &str) -> SFResult<Vec<String>> {
-        // jsonb `?` 算子：task->'blocked_by' 数组包含 task_id 元素
+        // 反向读：`blocked_by` 是数组列，GIN 索引让「谁等着这件任务」是一次
+        // 索引取行，而不是把整张定义表读出来再判包含。
         let rows: Vec<(String,)> = self
             .retry(|| async {
-                sqlx::query_as(
-                    r#"
-                    SELECT task_id FROM cog_dag_tasks
-                    WHERE workspace_id = $1 AND task->'blocked_by' ? $2
-                    "#,
-                )
-                .bind(workspace_id)
-                .bind(task_id)
-                .fetch_all(&self.pool)
-                .await
+                sqlx::query_as(task_ledger::DEPENDENTS_SQL)
+                    .bind(workspace_id)
+                    .bind(task_id)
+                    .fetch_all(&self.pool)
+                    .await
             })
             .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
@@ -1298,18 +1568,23 @@ impl StateBackend for PostgresStateBackend {
             .begin()
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;
+        task_ledger::lock_workspace(&mut tx, workspace_id).await?;
 
-        // 锁住本 workspace 全部任务行，整批读到一致快照后再算就绪翻转
-        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(DAG_LOCK_WORKSPACE_SQL)
-            .bind(workspace_id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
-
-        let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
-            .into_iter()
-            .map(|(id, v)| row_task(v, workspace_id).map(|t| (id, t)))
-            .collect::<Result<_, _>>()?;
+        // Only the rows that can still move, which is what the projection is.
+        // Dependencies that already finished are not in it, so their states
+        // are read from the transition that finished them rather than assumed
+        // absent -- "not in the live set" is not "not completed".
+        let mut tasks = self.live_tasks(&mut tx, workspace_id).await?;
+        let states = self
+            .states_of(
+                &mut tx,
+                tasks
+                    .values()
+                    .flat_map(|t| t.blocked_by.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+            .await?;
 
         let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
             task_id: task_id.into(),
@@ -1341,34 +1616,46 @@ impl StateBackend for PostgresStateBackend {
                 .map(|d| {
                     d.status == cog_core::TaskStatus::Pending
                         && d.blocked_by.iter().all(|b| {
-                            tasks
-                                .get(b)
-                                .map(|t| t.status == cog_core::TaskStatus::Completed)
-                                .unwrap_or(false)
+                            if b.as_str() == task_id {
+                                true
+                            } else {
+                                states.get(b) == Some(&cog_core::TaskStatus::Completed)
+                            }
                         })
                 })
                 .unwrap_or(false);
             if all_ready {
                 // 只报告就绪，不翻转状态（Scheduled = 已发布到 ready 流，
-                // 由发布方 schedule_task 翻转），同事务锁保证判定一致
+                // 由发布方 schedule_task 翻转），同事务串行保证判定一致
                 ready.push(dep_id);
             }
         }
 
-        // 只回写根任务；就绪下游保持 Pending，等发布方 CAS 翻转
-        {
-            let t = &tasks[task_id];
-            sqlx::query(
-                "UPDATE cog_dag_tasks SET task = $3, status = $4, updated_at = NOW() WHERE workspace_id = $1 AND task_id = $2",
-            )
-            .bind(workspace_id)
-            .bind(task_id)
-            .bind(serde_json::to_value(stamp_workspace(t, workspace_id))?)
-            .bind(status_str(&t.status))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
-        }
+        let t = tasks.remove(task_id).expect("just read");
+        task_ledger::close_attempt(
+            &mut tx,
+            task_id,
+            cog_core::TaskStatus::Completed,
+            None,
+            None,
+            t.result.as_ref(),
+            t.agent_id.as_deref(),
+        )
+        .await?;
+        task_ledger::append_transition(
+            &mut tx,
+            &task_ledger::Transition {
+                task_id,
+                from: Some(cog_core::TaskStatus::Running),
+                to: cog_core::TaskStatus::Completed,
+                actor: "executor",
+                cause: "complete",
+                detail: None,
+                not_before: None,
+            },
+        )
+        .await?;
+        task_ledger::project(&mut tx, Some(task_id)).await?;
 
         tx.commit()
             .await
@@ -1390,18 +1677,26 @@ impl StateBackend for PostgresStateBackend {
             .begin()
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;
+        task_ledger::lock_workspace(&mut tx, workspace_id).await?;
 
-        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(DAG_LOCK_WORKSPACE_SQL)
-            .bind(workspace_id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
+        // 终态的任务不在投影里（投影只放还动得了的），所以「找不到」这一句必须
+        // 先分清是「没有这件任务」还是「它已经结束了」：end 之后到达的结局不是
+        // 一次新的判定，把后者报成 `Task not found` 会让一条有意取消看起来像一次
+        // 写错 id 的调用。
+        if let Some(state) = task_ledger::current_state(&mut tx, task_id).await? {
+            if state.is_terminal() {
+                tracing::info!(
+                    task_id = %task_id,
+                    state = state.as_str(),
+                    reported = %error,
+                    "a failure arrived for a finished task; keeping the outcome it already had"
+                );
+                tx.rollback().await.ok();
+                return Ok((false, Vec::new()));
+            }
+        }
 
-        let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
-            .into_iter()
-            .map(|(id, v)| row_task(v, workspace_id).map(|t| (id, t)))
-            .collect::<Result<_, _>>()?;
-
+        let mut tasks = self.live_tasks(&mut tx, workspace_id).await?;
         let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
             task_id: task_id.into(),
             reason: "Task not found".into(),
@@ -1425,22 +1720,57 @@ impl StateBackend for PostgresStateBackend {
             return Ok((false, Vec::new()));
         }
 
+        let was_running = task.status == cog_core::TaskStatus::Running;
         task.error = Some(error.clone());
         task.error_cause = cause;
         task.updated_at = Utc::now();
 
-        let mut dirty: Vec<String> = vec![task_id.to_string()];
-        let mut cancelled = Vec::new();
         let should_retry = task.retry_count < max_retries;
-        if should_retry {
+        let not_before = if should_retry {
             task.retry_count += 1;
             task.status = cog_core::TaskStatus::Pending;
             task.retry_not_before = chrono::Duration::from_std(retry_delay)
                 .ok()
                 .map(|d| Utc::now() + d);
+            task.retry_not_before
         } else {
             task.status = cog_core::TaskStatus::Failed;
             task.retry_not_before = None;
+            None
+        };
+
+        // The attempt that failed ends here either way; a retry opens a new one
+        // when the task goes back to running.
+        task_ledger::record_failed_attempt(
+            &mut tx,
+            task_id,
+            task_ledger::cause_code(cause),
+            &error,
+        )
+        .await?;
+
+        let from = if was_running {
+            cog_core::TaskStatus::Running
+        } else {
+            task.status
+        };
+        task_ledger::append_transition(
+            &mut tx,
+            &task_ledger::Transition {
+                task_id,
+                from: Some(from),
+                to: task.status,
+                actor: "executor",
+                cause: "fail",
+                detail: Some(&error),
+                not_before,
+            },
+        )
+        .await?;
+        task_ledger::project(&mut tx, Some(task_id)).await?;
+
+        let mut cancelled = Vec::new();
+        if !should_retry {
             // 递归级联取消全部非终态下游
             let mut stack = vec![task_id.to_string()];
             let mut visited = std::collections::HashSet::new();
@@ -1456,12 +1786,8 @@ impl StateBackend for PostgresStateBackend {
                         continue;
                     }
                     if let Some(t) = tasks.get_mut(&child) {
-                        if !matches!(
-                            t.status,
-                            cog_core::TaskStatus::Cancelled
-                                | cog_core::TaskStatus::Failed
-                                | cog_core::TaskStatus::Completed
-                        ) {
+                        if !t.status.is_terminal() {
+                            let previous = t.status;
                             t.status = cog_core::TaskStatus::Cancelled;
                             t.error = Some(format!(
                                 "Cascade cancelled: upstream task '{}' permanently failed with error: {}",
@@ -1469,27 +1795,38 @@ impl StateBackend for PostgresStateBackend {
                             ));
                             t.error_cause = None;
                             t.updated_at = Utc::now();
+                            if previous == cog_core::TaskStatus::Running {
+                                task_ledger::close_attempt(
+                                    &mut tx,
+                                    &child,
+                                    cog_core::TaskStatus::Cancelled,
+                                    None,
+                                    t.error.as_deref(),
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                            }
+                            task_ledger::append_transition(
+                                &mut tx,
+                                &task_ledger::Transition {
+                                    task_id: &child,
+                                    from: Some(previous),
+                                    to: cog_core::TaskStatus::Cancelled,
+                                    actor: "executor",
+                                    cause: "cascade_cancel",
+                                    detail: t.error.as_deref(),
+                                    not_before: None,
+                                },
+                            )
+                            .await?;
+                            task_ledger::project(&mut tx, Some(&child)).await?;
                             cancelled.push(child.clone());
-                            dirty.push(child.clone());
                         }
                     }
                     stack.push(child);
                 }
             }
-        }
-
-        for id in &dirty {
-            let t = &tasks[id];
-            sqlx::query(
-                "UPDATE cog_dag_tasks SET task = $3, status = $4, updated_at = NOW() WHERE workspace_id = $1 AND task_id = $2",
-            )
-            .bind(workspace_id)
-            .bind(id)
-            .bind(serde_json::to_value(stamp_workspace(t, workspace_id))?)
-            .bind(status_str(&t.status))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
         }
 
         tx.commit()
@@ -1509,39 +1846,51 @@ impl StateBackend for PostgresStateBackend {
             .begin()
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;
+        task_ledger::lock_workspace(&mut tx, workspace_id).await?;
 
-        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(DAG_LOCK_WORKSPACE_SQL)
-            .bind(workspace_id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
-
-        let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
-            .into_iter()
-            .map(|(id, v)| row_task(v, workspace_id).map(|t| (id, t)))
-            .collect::<Result<_, _>>()?;
-
+        let mut tasks = self.live_tasks(&mut tx, workspace_id).await?;
         let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
             task_id: task_id.into(),
             reason: "Task not found".into(),
         })?;
-        if matches!(
-            task.status,
-            cog_core::TaskStatus::Cancelled
-                | cog_core::TaskStatus::Failed
-                | cog_core::TaskStatus::Completed
-        ) {
+        if task.status.is_terminal() {
             return Err(SFError::TaskFailed {
                 task_id: task_id.into(),
                 reason: format!("Cannot cancel task in {:?} state", task.status),
             });
         }
+        let previous = task.status;
         task.status = cog_core::TaskStatus::Cancelled;
-        task.error = Some(reason);
+        task.error = Some(reason.clone());
         task.error_cause = None;
         task.updated_at = Utc::now();
+        if previous == cog_core::TaskStatus::Running {
+            task_ledger::close_attempt(
+                &mut tx,
+                task_id,
+                cog_core::TaskStatus::Cancelled,
+                None,
+                Some(&reason),
+                None,
+                None,
+            )
+            .await?;
+        }
+        task_ledger::append_transition(
+            &mut tx,
+            &task_ledger::Transition {
+                task_id,
+                from: Some(previous),
+                to: cog_core::TaskStatus::Cancelled,
+                actor: "executor",
+                cause: "cancel",
+                detail: Some(&reason),
+                not_before: None,
+            },
+        )
+        .await?;
+        task_ledger::project(&mut tx, Some(task_id)).await?;
 
-        let mut dirty: Vec<String> = vec![task_id.to_string()];
         let mut cancelled = Vec::new();
         let mut stack = vec![task_id.to_string()];
         let mut visited = std::collections::HashSet::new();
@@ -1557,38 +1906,45 @@ impl StateBackend for PostgresStateBackend {
                     continue;
                 }
                 if let Some(t) = tasks.get_mut(&child) {
-                    if !matches!(
-                        t.status,
-                        cog_core::TaskStatus::Cancelled
-                            | cog_core::TaskStatus::Failed
-                            | cog_core::TaskStatus::Completed
-                    ) {
+                    if !t.status.is_terminal() {
+                        let previous = t.status;
                         t.status = cog_core::TaskStatus::Cancelled;
                         t.error = Some(format!(
                             "Cascade cancelled: upstream task '{}' was cancelled",
                             task_id
                         ));
                         t.updated_at = Utc::now();
+                        if previous == cog_core::TaskStatus::Running {
+                            task_ledger::close_attempt(
+                                &mut tx,
+                                &child,
+                                cog_core::TaskStatus::Cancelled,
+                                None,
+                                t.error.as_deref(),
+                                None,
+                                None,
+                            )
+                            .await?;
+                        }
+                        task_ledger::append_transition(
+                            &mut tx,
+                            &task_ledger::Transition {
+                                task_id: &child,
+                                from: Some(previous),
+                                to: cog_core::TaskStatus::Cancelled,
+                                actor: "executor",
+                                cause: "cascade_cancel",
+                                detail: t.error.as_deref(),
+                                not_before: None,
+                            },
+                        )
+                        .await?;
+                        task_ledger::project(&mut tx, Some(&child)).await?;
                         cancelled.push(child.clone());
-                        dirty.push(child.clone());
                     }
                 }
                 stack.push(child);
             }
-        }
-
-        for id in &dirty {
-            let t = &tasks[id];
-            sqlx::query(
-                "UPDATE cog_dag_tasks SET task = $3, status = $4, updated_at = NOW() WHERE workspace_id = $1 AND task_id = $2",
-            )
-            .bind(workspace_id)
-            .bind(id)
-            .bind(serde_json::to_value(stamp_workspace(t, workspace_id))?)
-            .bind(status_str(&t.status))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
         }
 
         tx.commit()
@@ -1603,18 +1959,30 @@ impl StateBackend for PostgresStateBackend {
         task_id: &str,
         attempt: &cog_core::RetryAttempt,
     ) -> SFResult<()> {
-        let value = serde_json::to_value(attempt)?;
+        // 一次失败的重试就是一次尝试自己的结局，所以它落成一行尝试账，而不是
+        // 往某个数组末尾追加一个对象。同一个 attempt 号重写一次是幂等的：那
+        // 是同一个尝试被记了第二遍，不是第二次尝试。
+        let attempt_no = attempt.attempt as i32;
         self.retry(|| async {
             sqlx::query(
                 r#"
-                UPDATE cog_dag_tasks
-                SET retry_history = retry_history || $3::jsonb, updated_at = NOW()
-                WHERE workspace_id = $1 AND task_id = $2
+                INSERT INTO task_attempt (task_id, attempt_no, ended_at, error_text, outcome)
+                SELECT d.task_id, $2, $3, $4, 'failed'
+                  FROM (SELECT DISTINCT ON (task_id) task_id
+                          FROM task_defined
+                         WHERE task_id = $5 AND workspace_id = $1
+                         ORDER BY task_id, rev DESC) d
+                ON CONFLICT (task_id, attempt_no) DO UPDATE
+                   SET ended_at = EXCLUDED.ended_at,
+                       error_text = EXCLUDED.error_text,
+                       outcome = EXCLUDED.outcome
                 "#,
             )
             .bind(workspace_id)
+            .bind(attempt_no)
+            .bind(attempt.timestamp)
+            .bind(&attempt.error)
             .bind(task_id)
-            .bind(value.clone())
             .execute(&self.pool)
             .await
         })
@@ -1627,31 +1995,68 @@ impl StateBackend for PostgresStateBackend {
         workspace_id: &str,
         task_id: &str,
     ) -> SFResult<Vec<cog_core::RetryAttempt>> {
-        let row: Option<(serde_json::Value,)> = self
+        // 失败过的尝试就是重试史。按尝试号排，因为调用方读的是「第几次失败、
+        // 为什么」的次序，而账本的行序不是它。
+        let rows: Vec<(i32, Option<String>, Option<DateTime<Utc>>)> = self
             .retry(|| async {
                 sqlx::query_as(
-                    "SELECT retry_history FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id = $2",
+                    r#"
+                    SELECT a.attempt_no, a.error_text, a.ended_at
+                      FROM task_attempt a
+                     WHERE a.task_id = $3
+                       AND a.outcome = $2
+                       AND EXISTS (SELECT 1 FROM task_defined d
+                                    WHERE d.task_id = $3 AND d.workspace_id = $1)
+                     ORDER BY a.attempt_no
+                    "#,
                 )
                 .bind(workspace_id)
+                .bind(cog_core::TaskStatus::Failed.as_str())
                 .bind(task_id)
-                .fetch_optional(&self.pool)
+                .fetch_all(&self.pool)
                 .await
             })
             .await?;
-        match row {
-            Some((v,)) => serde_json::from_value(v).map_err(SFError::Serialization),
-            None => Ok(Vec::new()),
-        }
+        Ok(rows
+            .into_iter()
+            .map(|(attempt, error, ended_at)| cog_core::RetryAttempt {
+                attempt: attempt.max(0) as u32,
+                error: error.unwrap_or_default(),
+                timestamp: ended_at.unwrap_or_else(Utc::now),
+            })
+            .collect())
     }
 
     async fn dag_clear_workspace(&self, workspace_id: &str) -> SFResult<()> {
-        self.retry(|| async {
-            sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
+        // 清一个工作区要把账本的四面一起清，否则留下的行读起来是半个任务：
+        // 迁移还在、定义没了，下一次读这件任务会拿到一个没有种类的影子。
+        //
+        // 「这工作区的任务」按最新一版定义算，与读路径同一个口径：一件任务换过
+        // 工作区时，旧工作区的清除不该把它带走，因为最新一版说了它现在在哪。
+        const IDS: &str = r#"
+            SELECT DISTINCT ON (task_id) task_id FROM task_defined
+             WHERE workspace_id = $1 ORDER BY task_id, rev DESC
+        "#;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        for sql in [
+            format!("WITH ids AS ({IDS}) DELETE FROM task_attempt WHERE task_id IN (SELECT task_id FROM ids)"),
+            format!("WITH ids AS ({IDS}) DELETE FROM task_transition WHERE task_id IN (SELECT task_id FROM ids)"),
+            format!("WITH ids AS ({IDS}) DELETE FROM task_defined WHERE task_id IN (SELECT task_id FROM ids)"),
+            "DELETE FROM task_current WHERE workspace_id = $1".to_string(),
+        ] {
+            sqlx::query(&sql)
                 .bind(workspace_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
-        })
-        .await?;
+                .map_err(|e| SFError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
         Ok(())
     }
 }
@@ -1896,33 +2301,8 @@ mod live_status_filter_tests {
 }
 
 #[cfg(test)]
-mod workspace_stamp_tests {
-    use super::stamp_workspace;
-    use cog_core::{Task, TaskType};
-
-    /// 空着就补，写好的不动。两半都要，因为补法反过来（覆盖）会把一行悄悄
-    /// 搬到另一个工作区去，而读面上那两个工作区都还在。
-    #[test]
-    fn the_stamp_fills_an_empty_field_and_leaves_a_written_one_alone() {
-        let unset = Task::new("t", TaskType::DagNode, serde_json::json!({}));
-        assert_eq!(unset.workspace_id, None);
-        assert_eq!(
-            stamp_workspace(&unset, "ws-row").workspace_id.as_deref(),
-            Some("ws-row")
-        );
-
-        let mut declared = unset.clone();
-        declared.workspace_id = Some("ws-own".to_string());
-        assert_eq!(
-            stamp_workspace(&declared, "ws-row").workspace_id.as_deref(),
-            Some("ws-own")
-        );
-    }
-}
-
-#[cfg(test)]
 mod plan_schema_tests {
-    use super::DDL;
+    use super::ddl;
 
     /// `task_plan` 建表语句里第一层括号之间的那一截。
     fn task_plan_columns(ddl: &str) -> Vec<String> {
@@ -1957,7 +2337,7 @@ mod plan_schema_tests {
     /// 而读的人永远不知道自己看的是哪一份——所以这条必须是红的。
     #[test]
     fn the_plan_table_holds_no_status_column() {
-        let columns = task_plan_columns(DDL);
+        let columns = task_plan_columns(&ddl());
         for forbidden in ["status", "state", "task_status"] {
             assert!(
                 !columns.iter().any(|c| c == forbidden),
@@ -1971,7 +2351,7 @@ mod plan_schema_tests {
     #[test]
     fn the_plan_table_column_set_is_exactly_the_plan() {
         assert_eq!(
-            task_plan_columns(DDL),
+            task_plan_columns(&ddl()),
             vec![
                 "workspace_id",
                 "task_id",

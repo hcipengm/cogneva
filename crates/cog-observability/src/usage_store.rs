@@ -60,7 +60,11 @@ pub const ROLLUP_TABLE: &str = "cog_llm_usage_rollup";
 /// 任务图的正本表。账上写了一个身份，这个身份是不是平台认得的一件活，只有
 /// 这张表能回答——账本自己没有「哪些 id 是任务」的名单，也不该抄一份：抄来的
 /// 名单会在第一次删任务的那天开始说谎。
-const TASK_GRAPH_TABLE: &str = "cog_dag_tasks";
+///
+/// 任务变成账本之后，「这件任务是谁提交的」在定义的最新一版上，所以这里的
+/// 关联从「取一行」变成「取最新一版」：同一个 id 会有很多版修订，挑错了版本
+/// 会读到上一次的提交人。
+const TASK_GRAPH_TABLE: &str = "task_defined";
 
 /// The last measured quota window per upstream.
 ///
@@ -1112,11 +1116,11 @@ impl LlmUsageStore {
     /// 花销为零的人不出现（不是 0）：读它的是一份会覆盖额度格子的投影，给图里
     /// 每个闲着的人都写一个 0，等于每天给每个人建一个格子。
     ///
-    /// 连任务表那一支走 `LATERAL ... LIMIT 1`，不是普通 join：任务表的主键是
-    /// `(workspace_id, task_id)`，同一个 id 在两个工作区里各有一行是它允许的形状。
-    /// 一次普通 join 碰上这种重复，那一行的 token 会被数两遍——格子里的数凭空变大，
-    /// 而「这个人今天花了多少」只会表现为他比实际更早被拒。取最近更新的那一行，
-    /// 与 [`Self::task_attribution`] 用同一条规则，两处才不会各认一个提交人。
+    /// 连任务表那一支走 `LATERAL ... LIMIT 1`，不是普通 join：任务的定义是**按版
+    /// 本追加**的，同一个 id 有多版，普通 join 会把那一行的 token 按版本数重复计
+    /// ——格子里的数凭空变大，而「这个人今天花了多少」只会表现为他比实际更早被
+    /// 拒。取 `rev` 最大的那一版，与 [`Self::task_attribution`] 用同一条规则，两
+    /// 处才不会各认一个提交人。
     pub async fn spend_by_person_since(
         &self,
         since_unix: i64,
@@ -1127,10 +1131,10 @@ impl LlmUsageStore {
                         (u.tokens_input + u.tokens_output) AS tokens
                    FROM {LEDGER_TABLE} u
                    LEFT JOIN LATERAL (
-                        SELECT NULLIF(d.task->>'submitted_by', '') AS person
-                          FROM cog_dag_tasks d
+                        SELECT NULLIF(d.submitted_by, '') AS person
+                          FROM {TASK_GRAPH_TABLE} d
                          WHERE d.task_id = u.task_id
-                         ORDER BY d.updated_at DESC
+                         ORDER BY d.rev DESC
                          LIMIT 1
                    ) t ON TRUE
                   WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
@@ -1202,8 +1206,9 @@ impl LlmUsageStore {
     /// 编一个 id 给它，会让那个「工作区」凭空长出一笔谁都不认的花销。
     ///
     /// 连任务表同样走 `LATERAL ... LIMIT 1`，理由与 [`Self::spend_by_person_since`]
-    /// 相同：主键是 `(workspace_id, task_id)`，普通 join 碰上重复会把那一行的 token
-    /// 数两遍，而按租户判额度只会表现为它比实际更早被拦。
+    /// 相同：定义按版本追加，普通 join 会把同一件任务的 token 按版本数重复计，
+    /// 而按租户判额度只会表现为它比实际更早被拦。工作区取最新一版上的那一列：
+    /// 一件任务换过工作区的说法时，以最后一次写下的为准。
     pub async fn spend_by_workspace_since(
         &self,
         since_unix: i64,
@@ -1217,7 +1222,7 @@ impl LlmUsageStore {
                         SELECT d.workspace_id
                           FROM {TASK_GRAPH_TABLE} d
                          WHERE d.task_id = u.task_id
-                         ORDER BY d.updated_at DESC
+                         ORDER BY d.rev DESC
                          LIMIT 1
                    ) t ON TRUE
                   WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
@@ -1265,10 +1270,10 @@ impl LlmUsageStore {
                  SELECT COALESCE(NULLIF(u.owner_id, ''), t.person) AS person
                    FROM {LEDGER_TABLE} u
                    LEFT JOIN LATERAL (
-                        SELECT NULLIF(d.task->>'submitted_by', '') AS person
+                        SELECT NULLIF(d.submitted_by, '') AS person
                           FROM {TASK_GRAPH_TABLE} d
                          WHERE d.task_id = u.task_id
-                         ORDER BY d.updated_at DESC
+                         ORDER BY d.rev DESC
                          LIMIT 1
                    ) t ON TRUE
                   WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
@@ -1315,7 +1320,7 @@ impl LlmUsageStore {
                         SELECT d.workspace_id
                           FROM {TASK_GRAPH_TABLE} d
                          WHERE d.task_id = u.task_id
-                         ORDER BY d.updated_at DESC
+                         ORDER BY d.rev DESC
                          LIMIT 1
                    ) t ON TRUE
                   WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
@@ -1398,15 +1403,14 @@ impl LlmUsageStore {
         &self,
         task_id: &str,
     ) -> anyhow::Result<Option<cog_core::TaskAttribution>> {
-        // 取最近更新的那一行，与两个汇总读同一条规则：任务表的主键是
-        // `(workspace_id, task_id)`，同一个 id 可能有两个工作区的两行，而这几处要是
-        // 各挑一行，就会出现「按 A 记了花销、按 B 判了额度」。
+        // 取最新一版定义，与两个汇总读同一条规则：同一个 id 可能被搬过工作区，
+        // 而这几处要是各读一版，就会出现「按 A 记了花销、按 B 判了额度」。
         let row = sqlx::query(
-            "SELECT NULLIF(task->>'submitted_by', '') AS person,
+            "SELECT NULLIF(submitted_by, '') AS person,
                     NULLIF(workspace_id, '') AS workspace_id
-               FROM cog_dag_tasks
+               FROM task_defined
               WHERE task_id = $1
-              ORDER BY updated_at DESC
+              ORDER BY rev DESC
               LIMIT 1",
         )
         .bind(task_id)

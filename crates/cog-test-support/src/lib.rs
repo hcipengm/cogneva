@@ -17,11 +17,13 @@ mod backends;
 mod message;
 mod metrics;
 mod state;
+mod task_ledger;
 
 pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
 pub use message::MemoryMessageBackend;
 pub use metrics::MemoryMetricsBackend;
 pub use state::MemoryStateBackend;
+pub use task_ledger::{clear_task_ledger, clear_task_ledger_for, purge_task};
 
 /// 下面那几个入口读的名字。一条名字只在这里拼写一次。
 ///

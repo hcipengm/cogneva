@@ -104,6 +104,23 @@ pub async fn commits_on_this_database(pool: &PgPool) -> i64 {
     .expect("read xact_commit")
 }
 
+/// The task ids the live-task projection holds for `workspace`, sorted.
+///
+/// Read straight from the table rather than through a backend method: the
+/// projection is exactly its rows, and the two suites that use this one ask
+/// what is in it after losing it -- a reader that reconstructs the answer from
+/// the ledger would report the projection healthy while it was empty.
+pub async fn task_projection_ids(pool: &PgPool, workspace: &str) -> Vec<String> {
+    let mut ids: Vec<String> =
+        sqlx::query_scalar("SELECT task_id FROM task_current WHERE workspace_id = $1")
+            .bind(workspace)
+            .fetch_all(pool)
+            .await
+            .expect("read the projection");
+    ids.sort();
+    ids
+}
+
 /// Delete the ledger rows a case filed under `marker`.
 ///
 /// The marker is a slug prefix, so a case's own rows are named by the case and

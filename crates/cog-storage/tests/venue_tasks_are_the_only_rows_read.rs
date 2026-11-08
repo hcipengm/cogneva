@@ -48,10 +48,11 @@ async fn the_board_is_handed_the_labeled_rows_and_every_one_of_them() {
         .expect("connect to the test database");
     let backend = PostgresStateBackend::new(pool.clone());
     backend.init_schema().await.expect("create the task schema");
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
-        .await
-        .expect("clear the task table");
+    for workspace in ["ws-venue", "ws-other"] {
+        cog_test_support::clear_task_ledger_for(&pool, workspace)
+            .await
+            .expect("clear this test's workspaces");
+    }
 
     let seeded = [
         ("v-running", Some("memory"), TaskStatus::Running),

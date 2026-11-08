@@ -13,7 +13,7 @@
 //! speaks the vocabulary.
 //!
 //! Nothing in this module is a second ledger. Every function here reads and
-//! writes the same `cog_dag_tasks` rows the rest of the platform uses.
+//! writes the same task-ledger rows the rest of the platform uses.
 
 use std::collections::{BTreeMap, BTreeSet};
 

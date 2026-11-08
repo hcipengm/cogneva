@@ -1,11 +1,16 @@
 //! Task counting by state, against a live PostgreSQL.
 //!
 //! What this checks is what the database decides: that one grouped query over
-//! the task table returns the buckets the overview reports, across every
-//! workspace, and that a status string this build cannot name is counted in
-//! the total only instead of being filed into a bucket nobody can justify.
-//! A DB-free test cannot see any of it — the grouping and the unknowns are
-//! decisions the server makes.
+//! the state ledger returns the buckets the overview reports, across every
+//! workspace, and that the ledger refuses a state word this build cannot name.
+//!
+//! The refusal is half the reading. Before the ledger, a producer with another
+//! vocabulary could park a row in a state nothing could dispatch, and the
+//! census's only defence was to count it in the total and leave it out of every
+//! bucket. The ledger closes that at the write: `task_transition.to_state` has a
+//! check against the six states, so such a row cannot exist to be counted. A
+//! DB-free test cannot see either -- the grouping and the constraint are both
+//! the server's.
 //!
 //! It is ignored by default and needs `COGNEVA_TEST_DATABASE_URL` pointing at a
 //! throwaway database:
@@ -41,10 +46,9 @@ async fn the_census_counts_every_workspace_and_leaves_unknown_statuses_in_the_to
         .expect("connect to the test database");
     let backend = PostgresStateBackend::new(pool.clone());
     backend.init_schema().await.expect("create the task schema");
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
+    cog_test_support::clear_task_ledger(&pool)
         .await
-        .expect("clear the task table");
+        .expect("clear the task ledger");
 
     for (workspace, id, status) in [
         ("ws-1", "t-1", TaskStatus::Running),
@@ -77,29 +81,22 @@ async fn the_census_counts_every_workspace_and_leaves_unknown_statuses_in_the_to
         }
     );
 
-    // A row written by a producer whose vocabulary this build does not share:
-    // it exists, so it belongs in the total, and it must not be guessed into a
-    // bucket where it would be counted as something it never claimed to be.
-    sqlx::query(
-        "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
-         VALUES ('ws-2', 't-7', '{}'::jsonb, 'suspended')",
+    // A state word this build cannot name is refused at the ledger, so the
+    // census can never be handed one. That is the stronger guarantee: a task
+    // parked in an undispatchable state is one nothing will ever move, and the
+    // only trustworthy count of it is the one that cannot happen.
+    let refused = sqlx::query(
+        "INSERT INTO task_transition (task_id, seq, to_state) \
+         VALUES ('t-6', 2, 'suspended')",
     )
     .execute(&pool)
-    .await
-    .expect("write a row with an unknown status");
+    .await;
+    assert!(
+        refused.is_err(),
+        "账本必须拒绝它不认识的状态词，否则无人能派发的任务会停在表里"
+    );
 
-    let counts = backend
-        .task_status_counts()
+    cog_test_support::clear_task_ledger(&pool)
         .await
-        .expect("count")
-        .expect("inventory");
-    assert_eq!(counts.total, 7, "the unknown row still exists");
-    assert_eq!(counts.active, 2);
-    assert_eq!(counts.queued, 2);
-    assert_eq!(counts.failed, 1);
-
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
-        .await
-        .expect("leave the table as it was found");
+        .expect("leave the ledger as it was found");
 }
