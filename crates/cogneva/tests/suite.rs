@@ -36,6 +36,8 @@ pub mod common;
 pub mod dashboard;
 #[path = "common/derivation.rs"]
 pub mod derivation;
+#[path = "feedback_a_rollout_replaces_the_log_that_would_have_recorded_it.rs"]
+mod feedback_a_rollout_replaces_the_log_that_would_have_recorded_it;
 #[path = "mock_provider.rs"]
 pub mod mock_provider;
 #[path = "common/producer.rs"]
