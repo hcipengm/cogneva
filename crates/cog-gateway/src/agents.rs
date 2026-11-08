@@ -2575,7 +2575,12 @@ mod tests {
             last_seen: now,
             retired_at: None,
         };
-        let views = roster_with_people(&[reg.clone()], Vec::new(), Vec::new(), vec![row]);
+        let views = roster_with_people(
+            std::slice::from_ref(&reg),
+            Vec::new(),
+            Vec::new(),
+            vec![row],
+        );
         assert_eq!(views.len(), 1, "一个人只印一行");
         let name = views[0]["display_name"].as_str().expect("display_name");
         assert_eq!(name, cog_core::employee_label(7));

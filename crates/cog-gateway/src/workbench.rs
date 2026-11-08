@@ -750,7 +750,7 @@ mod tests {
         }
     }
 
-    fn cell<'a>(bench: &'a Workbench, id: CellId) -> &'a Cell {
+    fn cell(bench: &Workbench, id: CellId) -> &Cell {
         bench
             .cells
             .iter()
@@ -811,8 +811,14 @@ mod tests {
     fn a_reading_that_is_not_wired_says_what_is_missing_instead_of_reading_zero() {
         let bench = build(empty_inputs(Utc::now()));
         for id in [CellId::Invest, CellId::Output, CellId::Capability] {
-            let readings = std::iter::once(&cell(&bench, id).main)
-                .chain(cell(&bench, id).rows.iter().map(|r| &r.reading));
+            let readings = std::iter::once(&cell(&bench, id).main).chain(
+                cell(&bench, id)
+                    .rows
+                    .iter()
+                    // 窗口不在这条判据里：它是窗口期的常量，不依赖任何数据源（下面单独判它）。
+                    .filter(|r| r.label != "窗口")
+                    .map(|r| &r.reading),
+            );
             for reading in readings {
                 assert_ne!(
                     reading.state,
@@ -868,7 +874,9 @@ mod tests {
                 .find(|r| r.label == label)
                 .unwrap_or_else(|| panic!("项目格缺 {label} 这一行"))
         };
-        assert_eq!(number_of(&row("推进中").reading), Some(2.0));
+        // 只有 goal-a 还有没走完的活在推进。ungrouped 那一桶只剩一条失败的活——失败是
+        // 历史，不是还站着的活，所以它不进「推进中」，只在「失败」那一行里出现。
+        assert_eq!(number_of(&row("推进中").reading), Some(1.0));
         assert_eq!(number_of(&row("排队").reading), Some(1.0));
         assert_eq!(number_of(&row("在跑").reading), Some(1.0));
         assert_eq!(number_of(&row("失败").reading), Some(1.0));
