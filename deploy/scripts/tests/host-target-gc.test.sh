@@ -37,7 +37,7 @@ set -euo pipefail
 # caller's GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE, and an init under them lands in
 # that tree instead of the fixture. Clear them at file scope; anything that has
 # to carry them on purpose sets them on the command line.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"

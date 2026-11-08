@@ -20,7 +20,7 @@ set -euo pipefail
 # 这份夹具在临时树里跑 `git init`。被钩子拉起来时，git 把 GIT_DIR / GIT_WORK_TREE /
 # GIT_INDEX_FILE 指向**调用方那棵树**，夹具里的 init 就会落到别人的仓库上。文件级清掉；
 # 第 10 例要的是「带着这些变量被拉起来」那个形状，它在命令行上自己按需再给一次。
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
