@@ -98,8 +98,50 @@ impl AgentConsumer {
     /// happen without waiting a minute for it.
     pub async fn run_with_reclaim_interval<F, Fut>(
         self,
+        handler: F,
+        reclaim_interval: Duration,
+    ) -> SFResult<()>
+    where
+        F: FnMut(cog_core::InboxMessage) -> Fut,
+        Fut: std::future::Future<Output = SFResult<()>>,
+    {
+        self.run_with_reclaim_interval_announcing(handler, reclaim_interval, None)
+            .await
+    }
+
+    /// [`Self::run`], announcing when the inbox is live.
+    ///
+    /// Same loop and same backstop cadence as [`Self::run`]; the difference is
+    /// the signal, described on [`Self::run_announcing_ready`].
+    pub async fn run_announcing_ready<F, Fut>(
+        self,
+        handler: F,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> SFResult<()>
+    where
+        F: FnMut(cog_core::InboxMessage) -> Fut,
+        Fut: std::future::Future<Output = SFResult<()>>,
+    {
+        self.run_with_reclaim_interval_announcing(handler, INBOX_RECLAIM_INTERVAL, ready)
+            .await
+    }
+
+    /// [`Self::run_with_reclaim_interval`], announcing when the inbox is live.
+    ///
+    /// The signal fires once the group exists and the read is subscribed, and
+    /// not one line earlier. Before that instant the consumer is not reading,
+    /// and a consumer that has been spawned but not yet subscribed cannot be
+    /// told apart from one whose inbox nobody reads at all — so a caller that
+    /// returns from `start_consumer` sooner makes that ambiguity reachable: the
+    /// next message is published to an agent that looks alive and hears
+    /// nothing. Waiting for the signal instead of for a guessed interval is
+    /// what makes "the agent is up" mean the inbox is being read, on a busy
+    /// host as much as on an idle one.
+    pub async fn run_with_reclaim_interval_announcing<F, Fut>(
+        self,
         mut handler: F,
         reclaim_interval: Duration,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> SFResult<()>
     where
         F: FnMut(cog_core::InboxMessage) -> Fut,
@@ -142,6 +184,14 @@ impl AgentConsumer {
             .backend
             .subscribe(&self.inbox_stream, &group_name)
             .await?;
+
+        // Everything that could go wrong before this point has already
+        // returned; from here the inbox is being read, so this is where the
+        // world is told. A sender whose receiver was dropped needs no error:
+        // the caller stopped caring, the loop keeps reading.
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
 
         // The first tick is a full period out: the starting pass above already
         // asked once, and asking again immediately would only repeat it.

@@ -1211,6 +1211,15 @@ impl Agent {
             .clone()
             .ok_or_else(|| SFError::Agent("MessageBackend not configured".into()))?;
         let agent_id = self.config.agent_id.clone();
+        let started_id = agent_id.clone();
+
+        // Returning before the consumer reads would hand the caller an object
+        // that is on the roster, answers prompts and hears nothing — the one
+        // failure mode nobody can see from outside. So this waits for the
+        // instant the group exists and the read is subscribed, and reports a
+        // consumer that died before it got there instead of storing a handle
+        // to a loop that is already gone.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
         let handle = tokio::spawn(async move {
             // 收件箱的全部责任都在 `AgentConsumer` 里：建组、读新消息、交给
@@ -1221,7 +1230,7 @@ impl Agent {
             // 的消息从 11-05 21:58 一直挂在挂起列表上，1.8 天里没有任何一个人
             // 读它；它在滞后读数里也看不见，因为挂起不是滞后。
             let consumer = crate::consumer::AgentConsumer::new(&agent_id, backend);
-            if let Err(e) = consumer.run(handler).await {
+            if let Err(e) = consumer.run_announcing_ready(handler, Some(ready_tx)).await {
                 // 这条循环只在起步失败时返回：收件箱从此没人读，而对象仍然
                 // 在名册上、心跳照打——那正是「在线但永远不回话」的样子。
                 tracing::error!(
@@ -1234,6 +1243,16 @@ impl Agent {
         });
 
         inner.consumer_handle = Some(handle);
+        drop(inner);
+
+        if ready_rx.await.is_err() {
+            let mut inner = self.inner.lock().await;
+            inner.consumer_handle = None;
+            return Err(SFError::Agent(format!(
+                "the inbox consumer for {started_id} stopped before it began reading; \
+                 nothing published to this agent would run"
+            )));
+        }
         Ok(())
     }
 
