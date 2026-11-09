@@ -31,6 +31,8 @@ pub mod audit;
 pub mod auth;
 pub mod backend_health;
 pub mod backup_admin;
+pub mod buildgate;
+pub mod capabilities;
 pub mod chat;
 pub mod cluster;
 pub mod collaboration;
@@ -59,6 +61,7 @@ pub mod memory;
 pub mod notifications;
 pub mod observability;
 pub mod observable;
+pub mod output;
 pub mod pace_reservations;
 pub mod plugin;
 pub mod pricing;
@@ -365,6 +368,23 @@ pub struct GatewayState {
         Option<Arc<std::sync::RwLock<std::collections::HashMap<String, workspaces::Workspace>>>>,
     /// External skill registry (Markdown-based skills).
     pub external_skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
+    /// The tools compiled into this process, published by `cog-agent`.
+    ///
+    /// Held so the capability inventory can name them. `None` is a deployment
+    /// whose agent plugin did not run in this process — the inventory reports
+    /// that layer as unwired rather than as "this build has no tools", because
+    /// the two call for different work.
+    pub tool_registry: Option<Arc<dyn cog_core::ToolRegistry>>,
+    /// The role table: which roles are allowed to call which tools
+    /// (`SkillConfig::tools`), published by the skill plugin.
+    ///
+    /// Held so the capability inventory can answer "who may order this
+    /// action" from the same rows the runtime narrows a run against, instead
+    /// of from the agent roster's free-form `capabilities` list, which names
+    /// roles and never action names. `None` is a deployment without the shared
+    /// skill registry — the column then says the table could not be read, which
+    /// is not the same reading as "no role may call it".
+    pub skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
     /// Global agent pool for production multi-agent parallelism.
     pub agent_pool: Option<Arc<dyn cog_core::AgentManager>>,
     /// The queue the agent inboxes live on, held only so an agent this process
@@ -1098,6 +1118,17 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(progress::progress_handler),
         )
         .route("/api/v1/workbench", get(workbench::workbench_handler))
+        .route(
+            "/api/v1/capabilities",
+            get(capabilities::capabilities_handler),
+        )
+        .route("/api/v1/output", get(output::output_handler))
+        // 宿主构建槽的读数。它与产出面同一条读法：交付停下来时，第一件要问的事是
+        // 「构建有没有在跑」，而这件事只在槽位上答得出来。
+        .route(
+            "/api/v1/delivery/build-gate",
+            get(buildgate::build_gate_handler),
+        )
         .route(
             "/api/v1/governance/principles",
             get(governance::principles_handler),

@@ -100,4 +100,29 @@ pub trait ToolRegistry: crate::ToolExecutor + Send + Sync {
     /// so the cost of stating it is paid once; an implementor this workspace
     /// cannot see must say what it holds rather than inherit that silence.
     fn names(&self) -> Vec<String>;
+
+    /// Every tool this registry holds, definition and boundary included, in
+    /// name order.
+    ///
+    /// [`Self::names`] answers "what can be called". A capability reading also
+    /// needs "what does it take": the description a caller chooses by, and the
+    /// parameter schema that says what a call must carry. A name on its own
+    /// cannot be dialled — a row built from names alone says the action exists
+    /// and nothing about the shape of a call that reaches it.
+    ///
+    /// No default body, for the reason stated on `names`.
+    fn definitions(&self) -> Vec<Tool>;
+
+    /// How many times each tool has been called in this process, keyed by name.
+    ///
+    /// Every name the registry holds appears, with 0 for the ones nobody has
+    /// called: "this action is never used" and "this action is not in the
+    /// table" are different facts, and a map that simply omits the key leaves
+    /// the reader to guess which one they are looking at.
+    ///
+    /// No default body, deliberately. A default returning an empty map would
+    /// make "nothing counts calls" and "every count is zero" the same reading,
+    /// and the two call for opposite work: one is a missing counter, the other
+    /// is an unused platform.
+    fn calls(&self) -> std::collections::BTreeMap<String, u64>;
 }

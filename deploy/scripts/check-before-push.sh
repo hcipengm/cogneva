@@ -42,6 +42,22 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "${here}/../.." && pwd)"
 cd "${root}" || exit 1
 
+# 这一跑会开 `cargo test` 与 `cargo clippy`，也是这台机器上的一个构建方。宿主上一共有
+# 四个：集群里的构建器、宿主自己的包装器、别的 worktree 的全量门、这一跑。前两个进构建
+# 槽，后两个以前不进——于是「同时最多几条构建」这条界对它要保护的两个家伙失效，带内构建
+# 反被宿主上的门饿着。所以每一格编译命令都从槽里拿：拿不到就让这一格**说它没判**，
+# 不假装判过。
+# 缺了它这一跑判不了「有没有槽」，而那一步的失败会长成 `command not found`：读的人
+# 只会看见某一步红了，看不见红在「这份脚本没有随身带它的依赖」。夹具也一样，所以那句
+# 话要在这里说清楚，而不是留给第一条被包起来的命令。
+if [ ! -r "${here}/lib/build-slot.sh" ]; then
+    echo "RED  构建槽客户端不在 ${here}/lib/build-slot.sh：这一跑没法和宿主的构建槽对齐，不判" >&2
+    echo "     只复制 check-before-push.sh 的树要连 deploy/scripts/lib/ 一起带（deploy/scripts/tests/fixtures/stage-gate.sh）" >&2
+    exit 1
+fi
+# shellcheck source=lib/build-slot.sh
+. "${here}/lib/build-slot.sh"
+
 # ---- 验过没有：按字节记的戳 ----
 #
 # 推之前那次判定是分钟级到小时级的（整棵 `cargo test` 加全部脚本测试），把它挂在一次
@@ -343,7 +359,19 @@ run_key="$(tree_key)"
 # 但整条判定照常跑、照常出读数——它仍然回答了「现在这棵树绿不绿」。
 run_dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 
+# 一份判词只能记在**它判过的那份字节**上，而这一跑要一两小时。结尾才取指纹的话，
+# 期间树上多出来的任何一格都会被记成「验过」，而它一秒都没被判过——2026-11-09 实测：
+# 17:24 起跑的那一跑在改完文件之后才收尾，内容键记下的是 18:xx 的字节。所以开跑时先
+# 记一把，结尾对不上就不记账：这一跑仍然回答了「开跑那棵树绿不绿」，但它不是现在这份
+# 字节的判词。取不到（读不出指纹）时不参与比对，交给结尾那一处自己说。
+start_ckey="$(content_key 2>/dev/null || true)"
+start_pkey="$(patch_key 2>/dev/null || true)"
+
 failures=0
+# 「没判」与「判红」是两件事，读数上也得是两个：一格没进构建槽就跑，判词写成红是把
+# 机器的忙碌栽给这一笔改动；写成绿更糟，那是一份没人问过的字节被记成验过。所以它自己
+# 一格，挡住推送，但说的是它自己的话。
+unjudged=0
 
 # ---- 这一跑花在哪 ----
 #
@@ -373,6 +401,12 @@ run_suite_file() { # run_suite_file <说明> <模块名>
     out="$("$@" "${filter}" 2>&1)"
     status=$?
     printf '%s\n' "${out}" | tail -6
+    if [ "${status}" -eq 75 ]; then
+        printf 'UNJUDGED  %s：这一格没进构建槽，一行判据都没跑（不是红，也不是绿）。\n' "${what}" >&2
+        unjudged=$((unjudged + 1))
+        record_segment "$((SECONDS - t0))" UNJUDGED "${what}"
+        return 0
+    fi
     if [ "${status}" -ne 0 ]; then
         printf 'RED  %s\n' "${what}" >&2
         failures=$((failures + 1))
@@ -391,10 +425,18 @@ run_suite_file() { # run_suite_file <说明> <模块名>
 
 run_step() { # run_step <说明> <命令…>
     local what="$1"; shift
-    local t0=${SECONDS}
+    local t0=${SECONDS} status
     printf '== %s\n' "${what}"
-    if "$@"; then
+    "$@"
+    status=$?
+    if [ "${status}" -eq 0 ]; then
         record_segment "$((SECONDS - t0))" ok "${what}"
+        return 0
+    fi
+    if [ "${status}" -eq 75 ]; then
+        printf 'UNJUDGED  %s：这一格没进构建槽，一行判据都没跑（不是红，也不是绿）。\n' "${what}" >&2
+        unjudged=$((unjudged + 1))
+        record_segment "$((SECONDS - t0))" UNJUDGED "${what}"
         return 0
     fi
     printf 'RED  %s\n' "${what}" >&2
@@ -542,7 +584,7 @@ if [ "${capreg_compiled}" = yes ]; then
 elif [ -n "${gate_cargo}" ]; then
     run_step "容量登记表（${capreg_src}，经 cargo test：这份测试带 tests/common 的依赖，rustc 直接编找不到）" \
         run_suite_file "容量登记表（经 cargo test）" rust_capacity_constants_registry_test \
-        "${gate_cargo}" test -p cogneva --test suite
+        build_slot_run "容量登记表" "${gate_cargo}" test -p cogneva --test suite
 else
     # 与 pwsh 那一格同一条规矩：跑不了要说出来，不能安静跳过。
     echo "SKIP  容量登记表：本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
@@ -587,9 +629,9 @@ if [ -n "${cargo_bin}" ]; then
     # 的，只是它现在住在 `suite` 里。两步分开跑而不是一次给两个 filter：`run_step` 会记下
     # 失败继续走，两个 verdict 照样都印出来。
     run_suite_file "名字契约（告警规则契约）" observability_alert_rule_contract_test \
-        "${cargo_bin}" test -p cogneva --test suite
+        build_slot_run "名字契约（告警规则契约）" "${cargo_bin}" test -p cogneva --test suite
     run_suite_file "名字契约（观测面普查）" observability_scrape_census_contract_test \
-        "${cargo_bin}" test -p cogneva --test suite
+        build_slot_run "名字契约（观测面普查）" "${cargo_bin}" test -p cogneva --test suite
 else
     echo "SKIP  名字契约：本机没有可用的 cargo（CI 的 Code Coverage 会跑这两步）"
 fi
@@ -688,10 +730,13 @@ if [ -n "${cargo_bin}" ]; then
             git worktree prune 2>/dev/null
             if git worktree add --detach --quiet "${head_tree}" HEAD 2>/dev/null; then
                 echo "== Clippy：这次要推的提交动过 ${crate_count} 个 crate 的源码，判的是 HEAD 展开出来的那棵树"
-                judge_head_tree() {
+                judge_head_tree_inner() {
                     ( cd "${head_tree}" &&
                         CARGO_TARGET_DIR="${repo_toplevel}/target" \
                             "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings )
+                }
+                judge_head_tree() {
+                    build_slot_run "clippy ${clippy_args[*]}" judge_head_tree_inner
                 }
                 run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" judge_head_tree
                 git worktree remove --force "${head_tree}" >/dev/null 2>&1 || rm -rf "${head_tree}"
@@ -752,7 +797,8 @@ if [ -n "${cargo_bin}" ]; then
             # 它测的比这一推多。多测不会假绿，只是可能替别人的改动红一次。
             echo "== Test：这次要推的提交动过 ${test_count} 个 crate 的源码，判的是工作树，外加装配件 cogneva"
             judge_head_tests() {
-                "${cargo_bin}" test "${test_args[@]}" --no-fail-fast
+                build_slot_run "cargo test ${test_args[*]}" \
+                    "${cargo_bin}" test "${test_args[@]}" --no-fail-fast
             }
             run_step "cargo test ${test_args[*]} --no-fail-fast" judge_head_tests
         else
@@ -804,6 +850,10 @@ fi
 echo
 print_cost_table
 echo
+if [ "${unjudged}" -ne 0 ]; then
+    echo "PRE-PUSH: ${unjudged} 步没进构建槽、没判；${failures} 步红。没判过的字节不算验过。"
+    exit 1
+fi
 if [ "${failures}" -ne 0 ]; then
     echo "PRE-PUSH: ${failures} 步红，推上去 CI 也会红。"
     exit 1
@@ -826,8 +876,26 @@ echo "Version Contract / Web Build / Bootstrap Cross-Platform。"
 #     是工作树；脏的时候两者不是同一份字节，只在结尾说明。
 mkdir -p "${stamp_dir}" 2>/dev/null
 ckey="$(content_key)"
-if [ -n "${ckey}" ] &&
-   printf '%s %s（工作树，%s 处未提交改动）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
+pkey="$(patch_key)"
+# 开跑时那把指纹与现在这把对不上，说明中间有人动过树：现在这份字节没有被这一跑判过，
+# 两把键都不记。判词本身照常留在输出里——它说的是开跑那棵树。
+moved=0
+if [ -n "${start_ckey}" ] && [ "${ckey}" != "${start_ckey}" ]; then
+    moved=1
+    echo "记账：这棵树在跑的过程中变过（开跑 ${start_ckey:0:12}，收尾 ${ckey:0:12}），这一跑的判词不属于现在这份字节，两把键都不记。" >&2
+    ckey=""
+fi
+voided_patch=0
+if [ -n "${start_pkey}" ] && [ -n "${pkey}" ] && [ "${pkey}" != "${start_pkey}" ]; then
+    moved=1
+    voided_patch=1
+    echo "记账：这批改动在跑的过程中变过（开跑 ${start_pkey:0:12}，收尾 ${pkey:0:12}），改动键不记。" >&2
+    pkey=""
+fi
+if [ -z "${ckey}" ]; then
+    # 上面已经说过为什么不记（树变过），这里不再补一句读起来像「写盘失败」的话。
+    :
+elif printf '%s %s（工作树，%s 处未提交改动）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
        "${run_dirty}" > "${stamp_dir}/content.${ckey}" 2>/dev/null; then
     echo "记账：内容键 ${ckey:0:12} 这份字节判过，提交前后都读得到这一笔。"
 else
@@ -835,16 +903,20 @@ else
 fi
 # 第三笔：这批改动本身。它与脏不脏无关——判的是从共同祖先到「现在这棵树」的那一份 diff，
 # 提交只是把同样的字节换个名字（工作树 → 提交），patch-id 不变。所以这一笔在脏树上也记。
-pkey="$(patch_key)"
-if [ -n "${pkey}" ] &&
-   printf '%s %s（改动，基底 %s）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
+if [ "${voided_patch}" -ne 0 ]; then
+    :
+elif [ -z "${pkey}" ]; then
+    echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
+elif printf '%s %s（改动，基底 %s）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
        "$(git merge-base HEAD origin/main 2>/dev/null | cut -c1-7)" \
        > "${stamp_dir}/patch.${pkey}" 2>/dev/null; then
     echo "记账：改动键 ${pkey:0:12} 这批改动判过；远端往前走了、变基到新基底上照样命中。"
 else
     echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
 fi
-if [ "${run_dirty}" -ne 0 ]; then
+if [ "${moved}" -ne 0 ]; then
+    echo "推进账不记：这棵树在跑的过程中变过，这一跑判的不是现在这份字节。" >&2
+elif [ "${run_dirty}" -ne 0 ]; then
     echo "推进账另记：工作树上有 ${run_dirty} 处未提交改动，这一跑判的不是 HEAD 的字节，暂不记。"
     echo "      提交之后这棵树的字节没变，内容键照样命中，提交与推送两个钩子都不用再判。"
 elif mkdir -p "${stamp_dir}" 2>/dev/null &&

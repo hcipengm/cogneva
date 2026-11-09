@@ -6,7 +6,7 @@ use cog_core::{
 };
 use cog_core::{Tool, ToolImplementation};
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -321,6 +321,13 @@ pub struct ToolRegistry {
     /// this on so no command can reach the executor under a synthetic identity;
     /// default off keeps embedded/main-app behavior.
     require_identity: bool,
+    /// 每个工具在本进程里被点过几次。
+    ///
+    /// `fork()` 与 `restricted_to()` 共用同一个 `Arc`，不各拿一份：这个数答的是
+    /// 「这个平台在用这个工具吗」，那是关于进程的事实，不是关于某一轮工具表的事
+    /// 实。每一轮各记一份的话，读的人只会看到最后一轮点过什么，而一个只在启动时
+    /// 派过活的工具会读成「没人用」。
+    calls: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl ToolRegistry {
@@ -333,6 +340,7 @@ impl ToolRegistry {
             wasm_timeout: Duration::from_secs(DEFAULT_WASM_TIMEOUT_SECS),
             shell_timeout: Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
             require_identity: false,
+            calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -404,6 +412,7 @@ impl ToolRegistry {
             wasm_timeout: self.wasm_timeout,
             shell_timeout: self.shell_timeout,
             require_identity: self.require_identity,
+            calls: self.calls.clone(),
         }
     }
 
@@ -496,6 +505,19 @@ impl ToolRegistry {
             .get(name)
             .cloned()
             .ok_or_else(|| cog_core::SFError::Agent(format!("Tool not found: {}", name)))?;
+
+        // Counted here, before the guardrail and before the implementation: this
+        // funnel is the only place that sees every call, and the reading answers
+        // "does anyone dial this action", not "how often does it succeed". A
+        // tool that is called and always refused is still being used — and the
+        // refusal is then the thing to fix, which a count that only recorded
+        // successes would hide.
+        *self
+            .calls
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_insert(0) += 1;
 
         // Guardrail check before tool execution
         if let Some(ref guardrail) = self.guardrail {
@@ -914,7 +936,32 @@ impl ToolRegistry {
             wasm_timeout: self.wasm_timeout,
             shell_timeout: self.shell_timeout,
             require_identity: self.require_identity,
+            calls: self.calls.clone(),
         }
+    }
+
+    /// 每个工具在本进程里被点过几次，按名字排。
+    ///
+    /// 表里的每一个名字都在，没人点过的记 0：「这项没人用」与「这项不在这张表
+    /// 上」是两件事，缺一个键会让人去猜自己读到的是哪一件。换一张新表（`fork`）
+    /// 不会把这些数清零——见字段上的说明。
+    pub fn call_counts(&self) -> BTreeMap<String, u64> {
+        let counts = self.calls.lock().unwrap();
+        let mut out: BTreeMap<String, u64> = self
+            .tools
+            .read()
+            .unwrap()
+            .keys()
+            .map(|name| (name.clone(), 0))
+            .collect();
+        for (name, n) in counts.iter() {
+            // 只报这张表此刻有的名字：一次 fork 里装过的临时工具不算这个平台会
+            // 什么，把它列成「用过 N 次」会给出一个点不开的动作。
+            if let Some(slot) = out.get_mut(name) {
+                *slot = *n;
+            }
+        }
+        out
     }
 }
 
@@ -2835,6 +2882,18 @@ impl cog_core::ToolRegistry for ToolRegistry {
     /// the one above, but only a reader who already knows that rule can tell.
     fn names(&self) -> Vec<String> {
         ToolRegistry::names(self)
+    }
+
+    /// The same listing as the inherent `list()`, not a second one: a caller
+    /// that reads the boundary of a tool and a caller that serializes the tool
+    /// table into an LLM request must see one description, or the platform
+    /// advertises one shape and runs another.
+    fn definitions(&self) -> Vec<Tool> {
+        ToolRegistry::list(self)
+    }
+
+    fn calls(&self) -> BTreeMap<String, u64> {
+        ToolRegistry::call_counts(self)
     }
 }
 

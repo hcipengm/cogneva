@@ -1405,6 +1405,26 @@ fn next_bound(bound: usize, ceiling: usize, calm: bool) -> usize {
     .max(1)
 }
 
+/// The integer a window's ceiling is damped against.
+///
+/// `held` is what this process last enforced, and it is the right answer for every
+/// window after the first. Zero means this process has enforced nothing yet, and
+/// that is not the same as "the host had no bound": the file the host reads is
+/// still there, written by whoever ran the previous window, and it is the number
+/// the builds are running under right now. Taking the measurement undamped in that
+/// state makes every restart -- a rollout, a crash, a pod moving -- a free fall,
+/// because falling is the direction that needs no permission.
+///
+/// Absent is the other case, and it stays zero: on a host that has never published
+/// a bound there is nothing to hold against, and the first measurement is the
+/// first answer.
+fn previous_ceiling(held: usize, persisted: Option<usize>) -> usize {
+    match held {
+        0 => persisted.map(|p| p.max(1)).unwrap_or(0),
+        held => held,
+    }
+}
+
 /// Cores this host has, and its cpu time so far as `(busy, total)`.
 ///
 /// `busy` excludes idle and IO wait, since a host whose cores are idle while
@@ -2874,7 +2894,22 @@ impl BuildGate {
         load.sustained_cgroup_memory = load
             .cgroup_memory()
             .map(|answer| self.sustained_cgroup_memory(answer));
-        let previous = self.held_ceiling.load(Ordering::Relaxed) as usize;
+        // The dead band damps against the number the last window enforced, and a
+        // process that has run no window yet has not enforced one -- but the host
+        // has, and that number is in the file. Starting at zero there means the
+        // first window of every process takes its measurement with no damping at
+        // all, which is what a rollout is: on 2026-11-09 at 16:01:10 the bound
+        // went 2 -> 1 eight minutes after the pod was replaced, on a window whose
+        // io dimension answered 1.96 builds (70% budget over a 35.76% device
+        // reading taken before any build had taught the process what one costs,
+        // `per_build_io: null`). The falling side is the immediate one, so the
+        // whole drop landed on the host that same window. Seeding from the file
+        // costs nothing when the file is absent, and when it is present it makes
+        // a restart continue the host's bound instead of re-deriving it blind.
+        let previous = previous_ceiling(
+            self.held_ceiling.load(Ordering::Relaxed) as usize,
+            self.persisted_bound(),
+        );
         let (measured_ceiling, dimension) = load.ceiling();
         let (ceiling, _) = load.ceiling_held_since(previous);
         self.held_ceiling.store(ceiling as u64, Ordering::Relaxed);
@@ -5885,6 +5920,68 @@ mod tests {
             settled.last().map(|(_, bound)| *bound),
             Some(1),
             "盘只够一条构建，界就停在一条"
+        );
+    }
+
+    /// 重启不是一次自由落体。
+    ///
+    /// 这一格复的是 2026-11-09 16:01:10 那一行账：界 2 → 1，`dimension: io`，
+    /// `calm: false`，`per_build_io: null`，`io_avg60: 35.76`。新的进程刚起来，
+    /// 还没有任何一条构建跑完过，于是 io 这一维拿设备原读数去算：70 ÷ 35.76 ≈
+    /// 1.96，取整下取是 1。这是**测量**该说的话；错的是把它当成最后一句话——
+    /// 进程手里没有上一拍（`held_ceiling` 初值 0），死区就不生效，而下降是立即的
+    /// 那一侧，于是整个落差落在同一个窗口里。
+    ///
+    /// 判据是两半：文件里有界时，同一份测量被按在 2 上；文件里没有界时（这台机器
+    /// 还没人发布过界），第一拍就按测量本身来——那一半是「没有可依的数」，不是
+    /// 「按 0 阻尼」。
+    #[test]
+    fn a_fresh_process_damps_its_first_window_against_the_bound_in_force() {
+        let gib = 1024 * 1024 * 1024;
+        let tuning = shipped();
+        let incident = HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 5.03,
+                cpu_avg60: 5.03,
+                io_avg10: 35.76,
+                io_avg60: 35.76,
+                mem_avg10: 0.09,
+                mem_avg60: 0.09,
+                mem_available_bytes: 64 * gib,
+                builds_in_flight: 1,
+            },
+            busy_cores: 9.063291139240507,
+            sustained_busy_cores: Some(9.063291139240507),
+            sustained_cgroup_memory: None,
+            cores: 24,
+            budget: None,
+            disk_free_bytes: Some(1 << 40),
+            tuning,
+            // 这一刻没有任何一条构建跑完过，所以没有学到的单价。
+            per_build_io: None,
+            occupancy_avg60: 0.6321205588285577,
+        };
+        let (measured, dimension) = incident.ceiling();
+        assert_eq!(
+            (measured, dimension),
+            (1, DIM_IO),
+            "这一拍的量法就是界 1，而它是 io 说的——复现读数，不是判据"
+        );
+
+        assert_eq!(
+            incident.ceiling_held_since(previous_ceiling(0, Some(2))),
+            (2, DIM_IO),
+            "文件里写着 2，重启的第一拍不许把它砍到 1：1.96 条落在 2 − 死区以内"
+        );
+        assert_eq!(
+            incident.ceiling_held_since(previous_ceiling(0, None)),
+            (1, DIM_IO),
+            "机器上从来没有发布过界时，第一拍就是测量本身"
+        );
+        assert_eq!(
+            previous_ceiling(3, Some(2)),
+            3,
+            "跑过的进程看自己上一拍，不看文件——文件可能是别的进程写的，可能更旧"
         );
     }
 

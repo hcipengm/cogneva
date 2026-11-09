@@ -42,8 +42,8 @@ import { resourceKey } from '@/store/frameTick';
  */
 const CELL_ICONS: Record<WorkbenchCellId, IconName> = {
   invest: 'token',
-  output: 'changes',
-  capability: 'governance',
+  output: 'output',
+  capability: 'capabilities',
   project: 'projects',
 };
 

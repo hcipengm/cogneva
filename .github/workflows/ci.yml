@@ -401,6 +401,13 @@ jobs:
       - name: Check the help, model and settings entries actually lead somewhere
         run: bash deploy/scripts/check-web-shell-entries.sh
 
+      # 工作台每一格、每一盏灯点进去都得真有一页。这类坏法不出声：能力格点进去开的
+      # 是治理页、灯的 href 写成 `deploy` 而那一面叫 `delivery`，点下去是一句「没有
+      # 叫这一页」——数据照常读、格子照常画。门把网关发出的每个 `href` 拿去对三层：
+      # `ActivityId` 联合类型、活动栏名单、面到组件的对照表。
+      - name: Check every workbench cell and lamp points at a face that exists
+        run: bash deploy/scripts/check-web-workbench-links.sh
+
       # 空白机重装只认两样：公开仓库的源码、一个备份包。所以「把包从旧机器上取下来」
       # 必须是属主点得动的一件事。这一屏整块消失、或少了「不填口令就是不加密」那句话，
       # 都不会让任何东西失败——而少那句话的后果是有人把明文整库拷进云盘还以为导的是

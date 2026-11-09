@@ -92,6 +92,13 @@ spec:
                 name: cogneva-config
           env:
             {{- include "cogneva.timeEnv" . | nindent 12 }}
+            {{- if .Values.evolution.buildGate.enabled }}
+            # 槽目录只有一处设置。这个键在 cogneva-evolution-config 里，而本 Pod 的
+            # envFrom 只取 cogneva-config——不在这里给一遍，两个 Pod 就各读各的默认值，
+            # 定制过路径的部署上页面读的是一个空目录。
+            - name: COGNEVA_BUILD_GATE_LOCK_DIR
+              value: {{ .Values.evolution.buildGate.lockDir | quote }}
+            {{- end }}
             # LLM 与代码平台凭证只注入安全网关，主应用零持有、经网关代理访问。
             # 连库用的是 cog_app，不是上面那个实例超级用户：注入到任意一条 SQL 里的
             # 东西，拿到的是 cogneva 库的读写，不是整台实例。
@@ -423,6 +430,15 @@ spec:
               mountPath: {{ .Values.modelWeights.hostPath }}
               readOnly: true
             {{- end }}
+            {{- if .Values.evolution.buildGate.enabled }}
+            # 构建槽：交付停下来时第一件要问的是「构建有没有在跑、谁占着、多堵」，
+            # 而这只有槽位答得出来。这个目录是全宿主所有构建方共用的一份 flock
+            # 位子，本 Pod 只**读**——位子是否被占由内核对 flock 的回答决定，
+            # 所以读数不需要写权限；给它写权限只会让它成为第五个不受约束的构建方。
+            - name: build-gate
+              mountPath: {{ .Values.evolution.buildGate.lockDir | quote }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: data
           emptyDir: {}
@@ -462,6 +478,16 @@ spec:
           hostPath:
             path: {{ .Values.modelWeights.hostPath }}
             type: Directory
+        {{- end }}
+        {{- if .Values.evolution.buildGate.enabled }}
+        # 与进化部署同一块宿主目录，同一路径挂载：闸门的「同一块目录」在读数里
+        # 以 dev:ino 认，两侧不同名时人第一眼看到的是两个目录。type 与那里一致用
+        # DirectoryOrCreate——宿主上没有别的东西会先建它，用 Directory 会让新机器
+        # 上主 Pod 卡在 FailedMount，而这个 Pod 正是提供读页面的那一个。
+        - name: build-gate
+          hostPath:
+            path: {{ .Values.evolution.buildGate.hostPath | quote }}
+            type: DirectoryOrCreate
         {{- end }}
       securityContext:
         runAsNonRoot: true

@@ -531,6 +531,31 @@ pub fn measured_owner(open_tasks: &[Task], live: Option<&[String]>) -> Option<St
         .map(|(unit, _)| unit.to_string())
 }
 
+/// The task type the platform files its own work under when it wants whoever
+/// can pick it up to take it, rather than naming a unit.
+const FLEET_FILED_TASK_TYPE: &str = "self_signal";
+
+/// Whether a row is the platform's own filing for the shared queue.
+///
+/// The signal watcher files one row per firing alert. It stamps the face the
+/// fix belongs to and deliberately names no unit: an owned row is offered only
+/// to that unit, so naming one here would park every alert the platform raises
+/// -- measured 2026-11-09, the owner of every face had completed nothing since
+/// 2026-10-27 while its pending queue kept growing. Filed this way, the row
+/// runs from the shared queue, which is how 23 of the 24 running tasks do.
+///
+/// Reading that as "work running under somebody else" reds the face every time
+/// the platform files anything: one `self_signal` row in Running on 2026-11-09
+/// turned `token 管理` red and made the drift pass mint four remediation rows
+/// for an owner that cannot act on them. A filing that names no unit by design
+/// is not a designation somebody ignored, so it is not a misbinding.
+///
+/// Only the unowned case is exempt. A row of this type that is bound to a unit
+/// other than the face's owner is still the defect the rule names.
+fn is_fleet_filed(task: &Task) -> bool {
+    matches!(&task.task_type, crate::TaskType::Custom(kind) if kind == FLEET_FILED_TASK_TYPE)
+}
+
 /// Apply the closed rule set to one face.
 ///
 /// Order is the rule: a red finding wins over a yellow one, and a yellow one
@@ -606,7 +631,7 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
                 task.owner_unit
                     .as_deref()
                     .map(|bound| bound != owner)
-                    .unwrap_or(task.status == crate::TaskStatus::Running)
+                    .unwrap_or(task.status == crate::TaskStatus::Running && !is_fleet_filed(task))
             });
         if misbound {
             red.push(DriftState::DriftedBinding.as_str().to_string());
@@ -1563,6 +1588,90 @@ mod tests {
         });
         assert_eq!(reading.state, DriftState::DriftedBinding);
         assert!(reading.state.is_red());
+    }
+
+    /// A row the platform filed for whoever can pick it up, running without an
+    /// owner, is the normal shape of a `self_signal` task and not a misbinding.
+    ///
+    /// Measured 2026-11-09: `self-signal-alert-fddc3199626322fe` (face
+    /// `token 管理`, no owner, Running) reddened the face and made the drift
+    /// pass file four remediation rows for an owner that had completed nothing
+    /// since 2026-10-27. The row names no unit on purpose, so nobody was
+    /// designated and then ignored.
+    #[test]
+    fn a_fleet_filed_row_running_without_an_owner_does_not_block_the_face() {
+        let face = face(Some("unit-operator"));
+        let mut filed = Task::new(
+            "self-signal-alert-1",
+            crate::TaskType::Custom("self_signal".into()),
+            serde_json::json!({}),
+        );
+        filed.face_id = Some("task-management".into());
+        filed.status = TaskStatus::Running;
+        let tasks = vec![filed];
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            measured_owner: None,
+            owner_liveness: OwnerLiveness::Seen(Utc::now()),
+            now: Utc::now(),
+        });
+        assert_ne!(reading.state, DriftState::DriftedBinding);
+        assert!(
+            !reading
+                .red_rules
+                .iter()
+                .any(|rule| rule == "drifted_binding"),
+            "a platform filing carries no designation to be misbound to"
+        );
+    }
+
+    /// The exemption is that one shape and nothing wider: an unowned row of any
+    /// other type that is running is still work somebody started without being
+    /// told to, which is what the rule exists to name.
+    #[test]
+    fn an_unowned_row_that_is_not_a_platform_filing_still_blocks_the_face() {
+        let face = face(Some("unit-operator"));
+        let tasks = vec![task(None, TaskStatus::Running)];
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            measured_owner: None,
+            owner_liveness: OwnerLiveness::Seen(Utc::now()),
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::DriftedBinding);
+    }
+
+    /// A platform filing that does name a unit other than the face's owner is
+    /// still misbound: the exemption is about rows nobody was told to run, not
+    /// about the type.
+    #[test]
+    fn a_fleet_filed_row_bound_to_another_unit_still_blocks_the_face() {
+        let face = face(Some("unit-a"));
+        let mut filed = Task::new(
+            "self-signal-alert-2",
+            crate::TaskType::Custom("self_signal".into()),
+            serde_json::json!({}),
+        );
+        filed.face_id = Some("task-management".into());
+        filed.owner_unit = Some("unit-b".into());
+        filed.status = TaskStatus::Running;
+        let tasks = vec![filed];
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            measured_owner: None,
+            owner_liveness: OwnerLiveness::Seen(Utc::now()),
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::DriftedBinding);
     }
 
     #[test]

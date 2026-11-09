@@ -25,6 +25,8 @@ export type ActivityId =
   | 'progress'
   | 'changes'
   | 'governance'
+  | 'capabilities'
+  | 'output'
   | 'observability'
   | 'token'
   | 'resources'
@@ -52,6 +54,8 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   progress: '进度',
   changes: '变更',
   governance: '治理',
+  capabilities: '能力',
+  output: '产出',
   observability: '观测',
   token: 'Token',
   resources: '资源',

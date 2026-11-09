@@ -309,6 +309,8 @@ fn state_with(
         change_ledger: None,
         key_value: None,
         external_skill_registry: None,
+        tool_registry: None,
+        skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,
         agent_pool: None,
@@ -440,6 +442,119 @@ async fn a_missing_store_is_unavailable_rather_than_an_empty_roster() {
 
     let (status, _) = ask(&app, "GET", "/api/v1/governance/faces", &token, "{}").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// The capability and output faces answer through the router that ships them.
+///
+/// `capabilities::read` and `output::read` have their own unit tests, and those
+/// tests stay green on a handler nothing routes -- a handler that was written
+/// and never mounted is dead code whose only symptom is a 404. So this case
+/// goes through `create_router` and asks what a caller sees.
+///
+/// Both must answer 200 in a state where nothing is wired, and say which layer
+/// is missing: a zero would read as "this deployment can do nothing and shipped
+/// nothing", which is the one verdict a missing layer must never produce.
+#[tokio::test]
+async fn the_capability_and_output_faces_answer_and_name_their_missing_layers() {
+    let state = state(None);
+    let app = create_router(state.clone());
+    let token = bearer(&state).await;
+
+    let (status, body) = ask(&app, "GET", "/api/v1/capabilities", &token, "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the capability face answers: {body}"
+    );
+    let sources = body["sources"].as_array().expect("sources is an array");
+    assert_eq!(sources.len(), 3, "one row per layer: {body}");
+    for row in sources {
+        assert_eq!(
+            row[1]["state"], "unwired",
+            "the fixture wires none of the three layers: {body}"
+        );
+        assert!(
+            row[1]["because"].is_string(),
+            "a missing layer names itself: {body}"
+        );
+    }
+    // "Who may order this action" and "why can it not be judged" must say which
+    // of the two they are on the wire: the fixture has neither a role table nor
+    // a roster, so both are "not read", and the roster names why. An empty list
+    // here would read as "no role may call it and nobody declares it", which is
+    // a different deployment.
+    assert!(
+        body["unbounded_roles"].is_null(),
+        "no skill registry means the role table was not read, not that no role is unbounded: {body}"
+    );
+    assert!(
+        body["roster_caveat"].is_string(),
+        "a missing roster says why the column cannot be judged: {body}"
+    );
+
+    let (status, body) = ask(&app, "GET", "/api/v1/output", &token, "{}").await;
+    assert_eq!(status, StatusCode::OK, "the output face answers: {body}");
+    assert_eq!(
+        body["commits"]["state"], "unwired",
+        "no change ledger is a missing layer, not zero deliveries: {body}"
+    );
+    assert!(
+        body["commits"]["because"].is_string(),
+        "the missing layer says which one it is: {body}"
+    );
+}
+
+/// The build-slot reading reaches the router, and its verdict is one of three words.
+///
+/// The handler has its own unit tests against fixture directories; those stay
+/// green on a handler nothing routes, whose only symptom is a 404 on the page
+/// that asks. So this case goes through `create_router` and asks the caller.
+///
+/// What it can assert is the closed set, not a value: whether the slot directory
+/// exists belongs to the host running the suite, and a case that pinned
+/// `measured` would pass only on machines that build for the cluster. The closed
+/// set is the part the page keys on — an unknown word falls through every branch
+/// and prints nothing, and "nothing" on this panel reads as "no build is
+/// running". A non-`measured` verdict must also carry its own reason, because
+/// "no slot directory" and "no build running" are the same blank panel otherwise.
+#[tokio::test]
+async fn the_build_gate_reading_answers_with_one_of_its_three_words() {
+    let state = state(None);
+    let app = create_router(state.clone());
+    let token = bearer(&state).await;
+
+    let (status, body) = ask(&app, "GET", "/api/v1/delivery/build-gate", &token, "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the build-gate face answers: {body}"
+    );
+
+    let verdict = body["state"].as_str().expect("state is a string");
+    assert!(
+        matches!(verdict, "measured" | "unwired" | "unread"),
+        "state is one of the three words the panel keys on, got {verdict}: {body}"
+    );
+    if verdict != "measured" {
+        assert!(
+            body["why"].as_str().is_some_and(|why| !why.is_empty()),
+            "a {verdict} verdict says why it could not measure: {body}"
+        );
+        // A missing or unreadable directory is "not measured", never "zero builds":
+        // an absent bound is null on the wire, so the page can print "—" instead of 0.
+        assert!(
+            body["bound"].is_null(),
+            "an unmeasured gate reports no bound rather than zero: {body}"
+        );
+    }
+    assert!(
+        body["dir"].as_str().is_some_and(|dir| !dir.is_empty()),
+        "the reading names the directory it read: {body}"
+    );
+    assert!(
+        body["generated_at"].as_str().is_some(),
+        "a reading says when it was taken: {body}"
+    );
 }
 
 fn submission(face_id: &str, unit_id: Option<&str>) -> String {
