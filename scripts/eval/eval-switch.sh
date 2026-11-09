@@ -35,8 +35,22 @@ case "${1:-}" in
     for p in 'supervise-eval-loop[.]sh' 'eval-registered-rerun[.]sh' 'eval-pool-watch[.]sh'; do
       pkill -f "$p" 2>/dev/null
     done
+    # 第三条同样的理由，只是不在宿主上：那些调用来自驱动起在集群里的 pod
+    # （`app=eval-table`），`pkill` 杀不到它。实测 2026-11-08 22:51:08 关掉之后，
+    # 已在跑的那一轮继续调了 2 小时 33 分：1,422 次调用、¥14.75，全部记在「已经
+    # 关掉」的时间里。它之所以没被回收，是因为遗留 pod 的回收只在**下一轮开始时**
+    # 发生（「驱动 pid 已死」那条判据），而开关恰好挡住了下一轮。
+    #
+    # 删不掉要说出来，不能报成关好了：那正是「关着还在花钱」的同一种假绿。退出码 3
+    # 表示「标记写了、宿主上的进程叫停了，集群里那一轮停不下来」。
+    eval_ns="${COGNEVA_NS:-cogneva}"
     printf 'switch=off flag=%s\n' "$PAUSE_FLAG"
-    printf 'the three eval processes were asked to stop; the supervisor will not start another round\n'
+    if ! ${KUBECTL:-sudo -n kubectl} -n "$eval_ns" delete pods -l app=eval-table \
+            --ignore-not-found --wait=false >/dev/null 2>&1; then
+      printf 'the eval pods (app=eval-table) could not be deleted: an in-flight round may still be spending\n' >&2
+      exit 3
+    fi
+    printf 'the three eval processes were asked to stop, and the eval pods were deleted; the supervisor will not start another round\n'
     ;;
   on)
     rm -f "$PAUSE_FLAG" "$SEEN" "$LOGGED"

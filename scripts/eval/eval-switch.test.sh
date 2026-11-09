@@ -25,12 +25,23 @@ cat >"$TMP/bin/systemctl" <<'EOF'
 # `status` 会问定时器；答案本身不是这条夹具要判的，它只不许把整条命令弄失败。
 echo enabled
 EOF
-chmod +x "$TMP/bin/pkill" "$TMP/bin/systemctl"
+# 集群那一半：`off` 要删掉这一族 pod。桩只记参数，并且可以按需判失败——
+# 「删没删」与「删不掉时敢不敢说」是两条判据，缺一条就会再造出「关着还在花钱」。
+cat >"$TMP/bin/kubectl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$KUBECTL_LOG"
+[ -f "$KUBECTL_FAIL" ] && exit 1
+exit 0
+EOF
+chmod +x "$TMP/bin/pkill" "$TMP/bin/systemctl" "$TMP/bin/kubectl"
 
 FLAG="$TMP/paused"
 PKILL_LOG="$TMP/pkill.log"
-export PKILL_LOG
-run() { env PATH="$TMP/bin:$PATH" PAUSE_FLAG="$FLAG" bash "$SCRIPT" "$@" 2>&1; }
+KUBECTL_LOG="$TMP/kubectl.log"
+KUBECTL_FAIL="$TMP/kubectl.fail"
+export PKILL_LOG KUBECTL_LOG KUBECTL_FAIL
+run() { env PATH="$TMP/bin:$PATH" PAUSE_FLAG="$FLAG" KUBECTL="$TMP/bin/kubectl" \
+            bash "$SCRIPT" "$@" 2>&1; }
 
 # 1. 关：先写标记再叫停。标记里要有人写的理由——读的人下一次只会看到这个文件。
 : >"$PKILL_LOG"
@@ -48,6 +59,30 @@ for p in 'supervise-eval-loop[.]sh' 'eval-registered-rerun[.]sh' 'eval-pool-watc
   fi
 done
 case "$out" in *switch=off*) ok "off 的判词说了现在是关着的";; *) bad "off 的判词读不出 off：$out";; esac
+
+# 1b. 关的第二半：集群里那一轮。宿主上杀掉的只是驱动，花钱的调用来自它起的 pod
+# （`app=eval-table`），而那一族只在**下一轮开始时**才被回收——开关恰好挡住了下一轮。
+# 实测 2026-11-08 22:51:08 关掉之后它又跑了 2 小时 33 分、1,422 次调用、¥14.75。
+if grep -q -- '-l app=eval-table' "$KUBECTL_LOG"; then
+  ok "off 删掉了集群里的 eval pod 一族"
+else
+  bad "off 没删 eval pod：关着的时候那一轮仍然在花钱（实得：$(tr '\n' ';' <"$KUBECTL_LOG")）"
+fi
+
+# 1c. 删不掉时必须说出来，且与「关好了」退出码不同：写一个假绿比不写更贵。
+touch "$KUBECTL_FAIL"
+set +e
+out=$(run off "各方面没有理顺，先不做测评")
+rc=$?
+set -e
+rm -f "$KUBECTL_FAIL"
+[ "$rc" -eq 3 ] \
+  && ok "删除失败时 off 退 3（标记写了、宿主叫停了、集群停不下来）" \
+  || bad "删除失败时 off 退 ${rc}，不是 3：读的人会以为整条腿都停了"
+case "$out" in
+  *"may still be spending"*) ok "删除失败时判词点名了还在花钱这件事";;
+  *) bad "删除失败时没说还在花钱：$out";;
+esac
 
 # 2. 关着时 status：判词、理由、以及「ensure 看过它没有」。
 : >"$PKILL_LOG"
