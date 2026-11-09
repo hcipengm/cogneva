@@ -769,7 +769,10 @@ async fn await_row(
 /// be dropped by the injector without a word, leaving the caller believing the
 /// work was filed, and a blocker that is not in the graph never completes, so
 /// the row would wait forever while reading as queued.
-async fn preflight(
+///
+/// Public because this is the command's own answer: the case that pins it
+/// drives it against a graph rather than against a live submission door.
+pub async fn preflight(
     backend: &dyn StateBackend,
     workspace: &str,
     id: &str,
