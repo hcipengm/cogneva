@@ -58,7 +58,7 @@ const SOURCE_NOTE: Record<CapabilitySource, string> = {
 
 export function CapabilitiesView() {
   const inv = useResource('能力清单', getCapabilities, 30_000);
-  useKindTickedRefresh([resourceKey('能力清单')], inv.refresh);
+  useKindTickedRefresh([resourceKey('capabilities')], inv.refresh);
 
   const data = inv.data;
   const sources = data?.sources ?? [];
@@ -138,7 +138,7 @@ export function CapabilitiesView() {
                         : `；这一层声明了 ${reading.entries} 项，其中 ${reading.callable} 项有调用点`)
                     : reading.because
                 }
-                source={`/api/v1/capabilities · ${source}`}
+                source={`GET /api/v1/capabilities · ${source}`}
               />
             ))}
           </div>

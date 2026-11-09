@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk};
 use common::rust_production::production_sources;
 
 /// 一次普查至少该读到多少列。
@@ -197,27 +197,20 @@ fn migration_files(root: &Path) -> Vec<PathBuf> {
     for entry in entries.flatten() {
         let migrations = entry.path().join("migrations");
         if migrations.is_dir() {
-            collect_sql(&migrations, &mut out);
+            // 递归只该有一份（`common::fsio` 里那一份）。`walk` 按 `Path::extension`
+            // 收，而这里要的是 `*.up.sql`——扩展名是 `sql`，`.up` 是名字的一部分，
+            // 所以先按 `sql` 收齐再按后缀过滤，而不是把 `"up.sql"` 当扩展名传进去
+            // （那样一份也收不到，空着与「全清完了」同形）。
+            let mut sql = Vec::new();
+            walk(&migrations, &["sql"], &mut sql);
+            out.extend(sql.into_iter().filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".up.sql"))
+            }));
         }
     }
     out
-}
-
-fn collect_sql(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{}：{e}（少读一块与「那一块都合规」同形）", dir.display()));
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_sql(&path, out);
-        } else if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(".up.sql"))
-        {
-            out.push(path);
-        }
-    }
 }
 
 /// 一份 DDL 文本里的 json/jsonb 列。

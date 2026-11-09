@@ -43,7 +43,7 @@ function show<T>(layer: OutputLayer<T>, value: (v: T) => string, note: (v: T) =>
 
 export function OutputView() {
   const inv = useResource('产出', getOutputs, 30_000);
-  useKindTickedRefresh([resourceKey('产出')], inv.refresh);
+  useKindTickedRefresh([resourceKey('output')], inv.refresh);
 
   const data = inv.data;
   const work = data?.work;
@@ -117,21 +117,21 @@ export function OutputView() {
               value={workShown?.value ?? '—'}
               tone={workShown?.tone ?? 'warn'}
               note={workShown?.note ?? '这一拍没有读任务图'}
-              source="/api/v1/output · work"
+              source="GET /api/v1/output · work"
             />
             <Reading
               label="构建产物"
               value={buildsShown?.value ?? '—'}
               tone={buildsShown?.tone ?? 'warn'}
               note={buildsShown?.note ?? '这一拍没有读构建跑次'}
-              source="/api/v1/output · builds"
+              source="GET /api/v1/output · builds"
             />
             <Reading
               label="带提交落地的变更"
               value={commitsShown?.value ?? '—'}
               tone={commitsShown?.tone ?? 'warn'}
               note={commitsShown?.note ?? '这一拍没有这一层的读数'}
-              source="/api/v1/output · commits"
+              source="GET /api/v1/output · commits"
             />
           </div>
         )}

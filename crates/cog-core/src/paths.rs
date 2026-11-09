@@ -35,6 +35,12 @@ pub const TREE_REPO: &str = "/host-git";
 /// the chart's values). One lock file per host, not per pod: two builds on one
 /// machine contend for the same CPU.
 pub const BUILD_GATE_LOCK_DIR: &str = "/var/lib/cogneva-build-gate";
+/// [`BUILD_GATE_LOCK_DIR`] 的 env 覆盖项。网关与配置加载器都读这个名字：名字只能
+/// 在一个地方拼一次，否则改名时只改一处，另一处照旧读一个再也没人设置的变量，
+/// 而 `env::var` 读不到与「本来就没配」在调用点上同形。
+pub const BUILD_GATE_LOCK_DIR_ENV: &str = "COGNEVA_BUILD_GATE_LOCK_DIR";
+/// 槽的「保留声明」多久算新鲜，env 覆盖项。同样是两处读者共用的一个名字。
+pub const BUILD_GATE_RESERVE_FRESH_SECS_ENV: &str = "COGNEVA_BUILD_GATE_RESERVE_FRESH_SECS";
 /// The host directory the security gateway mirrors git repositories into.
 pub const GIT_MIRROR_ROOT: &str = "/var/lib/cogneva-git-mirror";
 

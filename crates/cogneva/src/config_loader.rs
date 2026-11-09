@@ -334,7 +334,7 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.build_gate.wait_secs".into(),
     );
     m.insert(
-        "COGNEVA_BUILD_GATE_LOCK_DIR".into(),
+        cog_core::paths::BUILD_GATE_LOCK_DIR_ENV.into(),
         "self_evolution.build_gate.lock_dir".into(),
     );
     // 闸门推导界的那十个读数：构建吃多少核与内存、宿主要留住多少、多安静
@@ -377,7 +377,7 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.build_gate.cpu_sample_gap_ms".into(),
     );
     m.insert(
-        "COGNEVA_BUILD_GATE_RESERVE_FRESH_SECS".into(),
+        cog_core::paths::BUILD_GATE_RESERVE_FRESH_SECS_ENV.into(),
         "self_evolution.build_gate.reserve_fresh_secs".into(),
     );
     // system

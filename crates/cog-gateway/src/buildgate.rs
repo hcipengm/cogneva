@@ -32,9 +32,12 @@ use axum::Json;
 use serde::Serialize;
 
 /// 槽目录。与集群里的闸门、宿主上的包装器同一个键，所以部署里只有一处设置。
-pub const GATE_DIR_ENV: &str = "COGNEVA_BUILD_GATE_LOCK_DIR";
+///
+/// 名字声明在 `cog_core::paths`，因为配置加载器也读它：这个名字只能拼一次，
+/// 两处各写一遍时改名只改一处不会报错，另一处静默失效。
+pub const GATE_DIR_ENV: &str = cog_core::paths::BUILD_GATE_LOCK_DIR_ENV;
 /// 声明的新鲜窗。默认值与 `cog_core::BuildGateConfig` 那一格同源，不另抄一个数。
-pub const RESERVE_FRESH_ENV: &str = "COGNEVA_BUILD_GATE_RESERVE_FRESH_SECS";
+pub const RESERVE_FRESH_ENV: &str = cog_core::paths::BUILD_GATE_RESERVE_FRESH_SECS_ENV;
 
 const BOUND_FILE: &str = "buildgate.bound";
 const RESERVE_FILE: &str = "builds.reserve";
@@ -144,7 +147,7 @@ fn proc_root() -> PathBuf {
 pub fn default_gate_dir() -> PathBuf {
     // 没有配置时与集群里那一份同一条默认路径：部署里网关与演进进程读的是同一个目录，
     // 两处各自算一个默认值迟早会分叉。
-    PathBuf::from("/var/lib/cogneva-build-gate")
+    PathBuf::from(cog_core::paths::BUILD_GATE_LOCK_DIR)
 }
 
 fn now_secs() -> u64 {

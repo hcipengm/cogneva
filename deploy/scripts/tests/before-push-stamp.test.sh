@@ -259,6 +259,13 @@ stage_gate "${repo}" "${mtree}"
 # 一段多行块——多行块会被跳过，那一跑就红了。
 printf '#!/usr/bin/env bash\nexit 0\n' >"${mtree}/deploy/scripts/tests/ok.test.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' >"${mtree}/.github/scripts/tests/ok.test.sh"
+# `bootstrap.ps1` 也是「它认得的那几件东西」之一，而且是最阴的一件：门那一步只在
+# 装了 pwsh 的机器上跑，没装就印 SKIP。夹具里缺这个文件时，本机（没有 pwsh）照样
+# 绿，CI（runner 自带 pwsh）上这一步去 `Get-Content bootstrap.ps1` 拿不到文件、
+# 退非零 ⇒ 整门红 ⇒ 这一格报「变树那一跑自己红了」。于是同一条测试的绿红取决于
+# 跑它的机器装了哪些可选工具——2026-11-10 实测，Entry Scripts Lint 就红在这一行，
+# 而本机四轮都是绿的。真仓库里这个文件永远在，夹具要连它一起造齐。
+printf 'Write-Host "fixture"\n' >"${mtree}/bootstrap.ps1"
 cat >"${mtree}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 case "$1" in
@@ -283,10 +290,10 @@ YAML
     git config user.email gate@example.invalid
     git config user.name gate
     printf 'one\n' >tracked.txt
-    git add tracked.txt touch-tree.sh .github/workflows/ci.yml \
+    git add tracked.txt touch-tree.sh .github/workflows/ci.yml bootstrap.ps1 \
         deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
         deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
-    git commit -q -m base -- tracked.txt touch-tree.sh .github/workflows/ci.yml \
+    git commit -q -m base -- tracked.txt touch-tree.sh .github/workflows/ci.yml bootstrap.ps1 \
         deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
         deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
 ) || fail "跑的途中变树那一格的夹具建不起来"
