@@ -1,4 +1,5 @@
 use crate::contract::llm::UpstreamFailure;
+use crate::contract::outcome::FailureCause;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -135,12 +136,22 @@ pub struct Task {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// 失败原因的类型，仅当传输层给过信号（HTTP 状态码）时才填。
+    /// 失败原因的类型：上游拒绝（来自 HTTP 状态码）或环境拒绝（池停供、进程被
+    /// 要求停下）。
     ///
     /// [`Self::error`] 是给人看的文本，它随上游措辞和语言变化；任何判定读这个
     /// 字段。为 `None` 表示这次失败只有文本可依——那时下游不得从文本里猜类型。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_cause: Option<UpstreamFailure>,
+    /// 这笔账记在谁头上：工作的，还是环境的。
+    ///
+    /// 与 [`Self::error_cause`] 分开。那一格只说「哪个上游拒了这次调用」，是
+    /// 传输层给出的事实；这一格答的是重试判决要问的问题，并且覆盖两个没有上游
+    /// 参与的原因（池停供、进程被要求停下）。分开的另一个理由是滚动部署：加在
+    /// `error_cause` 里意味着老进程读到一个不认识的原因名，那一行乃至整个工作区
+    /// 的读都会失败；新增一个可选字段，老进程直接忽略它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_payer: Option<FailureCause>,
     pub blocked_by: Vec<String>,
     pub blocks: Vec<String>,
     pub priority: i32,
@@ -771,6 +782,11 @@ pub enum DagMessage {
         /// 老版本发布者不带它，反序列化按 `None` 处理。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_cause: Option<UpstreamFailure>,
+        /// 这笔账该记在谁头上，类型化的完整原因（含没有上游参与的两种）。
+        /// 与 `error_cause` 分开传递，理由同任务行上的同名字段：老版本订阅者
+        /// 不认识这个字段，直接忽略；塞进 `error_cause` 会让它整条解析失败。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_payer: Option<FailureCause>,
         /// 上游这次拒绝时自己说的等待时长（秒）。与同一变体的 `error_cause` 并行
         /// 传递，理由相同：它是判定重试时刻的输入，而判定发生在消费这条消息的
         /// 进程里，不是产生它的进程里。老版本发布者不带它，按 `None` 处理。
@@ -863,6 +879,7 @@ impl Task {
             result: None,
             error: None,
             error_cause: None,
+            failure_payer: None,
             blocked_by: Vec::new(),
             blocks: Vec::new(),
             priority: 1,
@@ -949,6 +966,7 @@ impl Task {
         self.lease_expires_at = Some(now + lease);
         self.error = None;
         self.error_cause = None;
+        self.failure_payer = None;
     }
 
     /// 结束一次运行，与 [`Self::begin_run`] 对称：开始时刻与租约一起清掉，回到
@@ -1276,6 +1294,7 @@ mod tests {
             task_id: "t1".into(),
             error: "boom".into(),
             error_cause: Some(UpstreamFailure::Auth),
+            failure_payer: Some(FailureCause::Upstream(UpstreamFailure::Auth)),
             retry_after_secs: Some(90),
             sender: "executor-loop".into(),
             recipient: "dag-executor".into(),

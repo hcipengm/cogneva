@@ -1,5 +1,6 @@
 //! DAG 执行器编排核心：任务状态、租约、续跑与自修复都在这里汇合。
 //! principle: feedback_a_count_that_feeds_a_bound_must_not_include_rows_no_one_holds
+use cog_core::contract::outcome::FailureCause;
 use cog_core::{SFError, SFResult, Task, TaskStatus, TaskType, UpstreamFailure};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1739,6 +1740,7 @@ impl DagExecutor {
         task_id: &str,
         error: String,
         cause: Option<UpstreamFailure>,
+        payer: Option<FailureCause>,
         retry_after_secs: Option<u64>,
     ) -> SFResult<(bool, Vec<String>, bool)> {
         let be = self.fg().expect("store mode");
@@ -1781,6 +1783,7 @@ impl DagExecutor {
                         &error,
                         None,
                         None,
+                        None,
                         &[
                             TaskStatus::Pending,
                             TaskStatus::Scheduled,
@@ -1797,12 +1800,13 @@ impl DagExecutor {
         // 环境付账的失败不进任务的预算账：回队列等上游回来，`retry_count`
         // 原样不动。与内存路径同一判据、同一个回投动作（界的说明见
         // [`Self::the_environment_pays`]）。
-        if Self::the_environment_pays(&error, cause) {
+        if Self::the_environment_pays(&error, cause, payer) {
             let requeued = self
                 .requeue_without_charge_store(
                     task_id,
                     &error,
                     cause,
+                    payer,
                     retry_after_secs,
                     // 能落上的是"还欠一轮"的那几种状态：报告通常在 Running
                     // 到达，也可能晚于一次回收（那时行已经是 Pending），或者
@@ -1840,6 +1844,7 @@ impl DagExecutor {
                 task_id,
                 error.clone(),
                 cause,
+                payer,
                 max_retries,
                 retry_delay,
             )
@@ -1950,6 +1955,7 @@ impl DagExecutor {
                         &cause.error(),
                         None,
                         None,
+                        None,
                         &[TaskStatus::Running],
                         None,
                     )
@@ -2016,6 +2022,7 @@ impl DagExecutor {
         task: &Task,
         error: &str,
         cause: Option<UpstreamFailure>,
+        payer: Option<FailureCause>,
         delay: std::time::Duration,
     ) -> Task {
         let now = chrono::Utc::now();
@@ -2023,6 +2030,7 @@ impl DagExecutor {
         next.status = TaskStatus::Pending;
         next.error = Some(error.to_string());
         next.error_cause = cause;
+        next.failure_payer = payer;
         next.retry_not_before = Some(
             now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero()),
         );
@@ -2068,6 +2076,7 @@ impl DagExecutor {
         task_id: &str,
         error: &str,
         cause: Option<UpstreamFailure>,
+        payer: Option<FailureCause>,
         retry_after_secs: Option<u64>,
         expected: &[TaskStatus],
         plant: Option<&GuardrailRefusal>,
@@ -2108,7 +2117,7 @@ impl DagExecutor {
                 "the upstream has paid for this task's failures many times over; waiting longer before the next turn so it stops taking a slice of a window it cannot finish in"
             );
         }
-        let next = Self::requeued_without_charge(&cur, error, cause, delay);
+        let next = Self::requeued_without_charge(&cur, error, cause, payer, delay);
         let next = match plant {
             Some(refusal) => match Self::with_the_refusal_planted(next, refusal) {
                 Some(planted) => planted,
@@ -3088,6 +3097,12 @@ impl DagExecutor {
     /// 另一半——"这笔账记在谁头上"。两条读同一组输入（类型通道 + 带内标记），
     /// 所以这不是第二条判定链，是同一个判决点上的第二个问题。
     ///
+    /// 类型通道先答，文本只在类型缺席时才说话：`FailureCause` 里那两种没有上游
+    /// 参与的环境拒绝（池停供、进程被要求停下）在文本里也没有
+    /// `upstream_unavailable` 那句话——它们从前靠一个前缀名单兜，名单漏一种写法
+    /// 就漏一次账而且不报错。实测 2026-11-09：`llm_pool_paused` 不在名单里，
+    /// 24 小时 42 轮"根本没开始"的轮各自扣了任务自己的重试预算。
+    ///
     /// 判据是**拒绝自己承认这是环境**：`upstream_unavailable` 是产出端写下的
     /// 那句话，它说的就是"这一次不是这件活的错"，任务只是恰好在那一刻问了，
     /// 判它一份预算等于让问的人替答的人付账。`is_terminal` 的环境因（配额耗尽、
@@ -3102,8 +3117,19 @@ impl DagExecutor {
     ///
     /// 回投的等待见 [`Self::environment_delay`]：没有数字的那几轮退到策略自己
     /// 的最后一档，不发明新的数。
-    fn the_environment_pays(error: &str, cause: Option<UpstreamFailure>) -> bool {
-        Self::names_the_environment(error) && Self::is_retryable_failure(error, cause)
+    fn the_environment_pays(
+        error: &str,
+        cause: Option<UpstreamFailure>,
+        payer: Option<FailureCause>,
+    ) -> bool {
+        match payer {
+            Some(FailureCause::PoolPaused | FailureCause::ProcessStopping) => {
+                // 这两种原因本身就是"这一轮没有开始"，文本里不需要再声明一次；
+                // 但"重跑也改不了"的判词（退化循环、护栏拒绝）仍然让任务自己付账。
+                Self::is_retryable_failure(error, cause)
+            }
+            _ => Self::names_the_environment(error) && Self::is_retryable_failure(error, cause),
+        }
     }
 
     /// 正文里有没有一句"这次不是这件活的错"。
@@ -3199,9 +3225,28 @@ impl DagExecutor {
         cause: Option<UpstreamFailure>,
         retry_after_secs: Option<u64>,
     ) -> SFResult<(bool, Vec<String>, bool)> {
+        // 不知道付款人的调用点走这里：上游原因的文本通道仍然按老规矩判，
+        // 两种没有上游参与的环境拒绝则必须从有类型的入口进来。
+        self.fail_task_after_paid(task_id, error, cause, None, retry_after_secs)
+            .await
+    }
+
+    /// [`Self::fail_task_after`] for a failure whose payer the producer knows.
+    ///
+    /// `payer` 答的是「这笔账记在谁头上」，`cause` 答的是「哪个上游拒了」。
+    /// 生产侧能说出前者的地方（队伍被池停供挡住、进程被要求停下）从这里进，
+    /// 让回投判决读类型而不是认措辞。
+    pub async fn fail_task_after_paid(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+        payer: Option<FailureCause>,
+        retry_after_secs: Option<u64>,
+    ) -> SFResult<(bool, Vec<String>, bool)> {
         if self.fg().is_some() {
             let (retried, cancelled, dlq_pushed) = self
-                .fail_task_store(task_id, error, cause, retry_after_secs)
+                .fail_task_store(task_id, error, cause, payer, retry_after_secs)
                 .await?;
             // 判死才算终态：回队列的两种（记账重试、环境付账回投）都还没走到头。
             if !retried {
@@ -3272,6 +3317,7 @@ impl DagExecutor {
                 next.status = TaskStatus::Pending;
                 next.error = Some(error.clone());
                 next.error_cause = None;
+                next.failure_payer = None;
                 next.clear_run();
                 next.updated_at = now;
                 if let Some(next) = Self::with_the_refusal_planted(next, &refusal) {
@@ -3296,7 +3342,7 @@ impl DagExecutor {
         // 这一支拿不到重试史（它按文档在内存里跑，史只在表上），所以 `turns`
         // 传 0：等待退回上游自己给的那个数，也就是这条路径原来的行为。生产
         // 走的是上面那条存储路径，增长在那里成立。
-        if Self::the_environment_pays(&error, cause) {
+        if Self::the_environment_pays(&error, cause, payer) {
             let delay = Self::environment_delay(
                 &self.retry_matrix,
                 &task_type,
@@ -3309,6 +3355,7 @@ impl DagExecutor {
             task.status = TaskStatus::Pending;
             task.error = Some(error.clone());
             task.error_cause = cause;
+            task.failure_payer = payer;
             task.retry_not_before = Some(
                 now + chrono::Duration::from_std(delay)
                     .unwrap_or_else(|_| chrono::Duration::zero()),
@@ -3347,6 +3394,7 @@ impl DagExecutor {
             task.status = TaskStatus::Pending;
             task.error = Some(error.clone());
             task.error_cause = cause;
+            task.failure_payer = payer;
             task.updated_at = chrono::Utc::now();
             task.retry_not_before = Some(
                 chrono::Utc::now()
@@ -3379,6 +3427,7 @@ impl DagExecutor {
             task.status = TaskStatus::Failed;
             task.error = Some(error.clone());
             task.error_cause = cause;
+            task.failure_payer = payer;
             task.updated_at = chrono::Utc::now();
             // 终态任务若留下一个未来的时间戳，人工重投它时会先被退避挡掉——
             // 那个时间戳只在"回到 Pending 等下一次"这条路上有意义。
@@ -3722,7 +3771,8 @@ impl DagExecutor {
                 let delay = self
                     .retry_matrix
                     .delay(&current.task_type, current.retry_count);
-                *current = Self::requeued_without_charge(current, &cause.error(), None, delay);
+                *current =
+                    Self::requeued_without_charge(current, &cause.error(), None, None, delay);
                 let snapshot = current.clone();
                 drop(inner);
                 self.persist_task_fine_grained(&snapshot).await;
@@ -6424,6 +6474,7 @@ mod tests {
                         &task_id,
                         "Task ended without answering, and no handle was left to say why".into(),
                         None,
+                        None,
                         3,
                         std::time::Duration::ZERO,
                     )
@@ -6720,6 +6771,62 @@ mod tests {
         }
 
         // 新进程起来了，同一件活接着跑完。
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+        dag.complete_task(&task_id, serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            dag.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Completed
+        );
+    }
+
+    /// 池停供不许记到任务账上，且判定必须读类型、不读措辞。
+    ///
+    /// 这条用例故意把错误文本写成**不带任何声明前缀**的一句话：如果判决还在
+    /// 认文本，它就会被当成普通失败，42 轮之后这件活早就被判死了。它能继续
+    /// 留在队里、`retry_count` 一直是 0，只能是因为付款人是类型说了算的。
+    ///
+    /// 42 这个数是实测出来的：2026-11-09 的 24 小时里 `llm_pool_paused` 出现
+    /// 42 次，每一次都扣了任务自己的重试预算。
+    #[tokio::test]
+    async fn a_paused_pool_never_charges_the_task_even_when_the_text_declares_nothing() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-pool-pause".into()).with_state_backend(backend);
+        let task = Task::new("t-pool-pause", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+
+        const PAUSES: u32 = 42;
+        let error = "上游池当前没有可用成员，这一轮没有开始".to_string();
+        for i in 0..PAUSES {
+            let (retried, _, _) = dag
+                .fail_task_after_paid(
+                    &task_id,
+                    error.clone(),
+                    None,
+                    Some(FailureCause::PoolPaused),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(retried, "第 {i} 次池停供之后任务必须还在队列里");
+            let view = dag.get_task(&task_id).await.unwrap();
+            assert_eq!(view.status, TaskStatus::Pending, "第 {i} 次池停供之后");
+            assert_eq!(
+                view.retry_count, 0,
+                "池停供是环境的事，不是这件活的账（第 {i} 次）"
+            );
+            assert_eq!(
+                view.failure_payer,
+                Some(FailureCause::PoolPaused),
+                "行上要留下是谁没让它跑，否则读这一行的人只能再认一次措辞"
+            );
+        }
+
         dag.schedule_task(&task_id).await.unwrap();
         dag.start_task(&task_id).await.unwrap();
         dag.complete_task(&task_id, serde_json::json!({"ok": true}))

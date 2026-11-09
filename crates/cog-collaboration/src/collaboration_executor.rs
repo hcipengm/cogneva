@@ -974,11 +974,18 @@ impl CollaborationExecutor {
                 metadata,
             },
         );
-        SFError::Agent(if reason.is_empty() {
+        let reason = if reason.is_empty() {
             fallback.to_string()
         } else {
             reason
-        })
+        };
+        // 环境拒绝了这一轮时，类型跟着交回去：上层据此决定这笔账记在谁头上。
+        // 只交文本的话，认不认得这句措辞就成了回不扣预算的唯一条件——而
+        // `llm_pool_paused` 恰好是一句名单外的措辞。
+        match result.cause {
+            Some(cause) => SFError::environment_denied(cause, reason),
+            None => SFError::Agent(reason),
+        }
     }
 
     /// Archive one run's outcome into the KnowledgeBackend in the background,
@@ -1644,6 +1651,7 @@ mod tests {
             success: false,
             result: None,
             retry_count: 1,
+            cause: None,
             error: reason.map(str::to_string),
             pge_mode: crate::profile::PgeMode::Pipeline,
             reflection: None,
@@ -1942,6 +1950,7 @@ mod tests {
             success: true,
             result: None,
             retry_count: 0,
+            cause: None,
             error: None,
             pge_mode: crate::profile::PgeMode::PlanOnly,
             reflection: None,
@@ -2347,6 +2356,7 @@ mod tests {
             // successful debate hands back that same envelope as its result.
             result: Some(serde_json::json!({ "roundtable": roundtable })),
             retry_count: 0,
+            cause: None,
             error: None,
             pge_mode: crate::profile::PgeMode::Roundtable,
             reflection: None,

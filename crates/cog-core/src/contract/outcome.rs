@@ -35,6 +35,145 @@ pub const DEGENERATE_LOOP_PREFIX: &str = "degenerate_loop";
 /// process is exactly the thing that can finish it.
 pub const PROCESS_SHUTTING_DOWN_PREFIX: &str = "process_shutting_down";
 
+/// Prefix carried by a round that never began because the pool had no member to
+/// hand out.
+///
+/// Not a failure of the work either: the round did not run, so nothing was
+/// learned about the task. Charging it to the task's retry budget is how a
+/// single-member pool that refuses twice spends a task's whole budget on
+/// rounds that never started — measured 2026-11-09: 42 occurrences in 24 hours,
+/// each one charged.
+pub const LLM_POOL_PAUSED_PREFIX: &str = "llm_pool_paused";
+
+/// Why a failure happened, typed end to end.
+///
+/// [`UpstreamFailure`] covers one of the ways the environment denies a round —
+/// "the upstream refused this call" — and every variant of it is read off an
+/// HTTP status. Two more ways deny a round without ever producing a status: the
+/// pool is paused, so no member is handed out, and the process is asked to stop
+/// at a turn boundary. Both are "this was not the work's fault", and neither is
+/// an upstream refusal, so they live here rather than in `UpstreamFailure`,
+/// whose `from_status` is its only producer.
+///
+/// Why a union rather than a wider list of prefixes: the verdict "who pays"
+/// used to read the rendered reason against three prefixes, and a producer that
+/// wrote a fourth wording was charged to the work in silence — `llm_pool_paused`
+/// was exactly such a wording. A producer here has to name a variant to
+/// compile; a reader matches exhaustively, so a new way to be denied cannot be
+/// added on one side only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCause {
+    /// The upstream refused this call; the cause came from the transport signal.
+    Upstream(UpstreamFailure),
+    /// The pool was paused: this round never began.
+    PoolPaused,
+    /// The process was asked to stop: the run ended at its turn boundary and the
+    /// next dispatch continues from there.
+    ProcessStopping,
+}
+
+impl FailureCause {
+    /// Whether re-issuing the identical work could succeed with no external
+    /// change. Only the upstream's own terminal causes (quota, credentials) say
+    /// no; a paused pool or a stopping process both end on their own.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Self::Upstream(cause) => cause.is_terminal(),
+            Self::PoolPaused | Self::ProcessStopping => false,
+        }
+    }
+
+    /// Whether the environment failed to serve the work, as opposed to the work
+    /// being malformed. A paused pool and a stopping process never reflect on
+    /// the work.
+    pub fn is_environment_failure(self) -> bool {
+        match self {
+            Self::Upstream(cause) => cause.is_environment_failure(),
+            Self::PoolPaused | Self::ProcessStopping => true,
+        }
+    }
+
+    /// The name this cause is persisted under and [`Self::from_name`] reads back.
+    /// Upstream causes keep their own names so a stored row means the same thing
+    /// it meant before this type existed.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Upstream(cause) => cause.name(),
+            Self::PoolPaused => "pool_paused",
+            Self::ProcessStopping => "process_stopping",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        if let Some(cause) = UpstreamFailure::from_name(name) {
+            return Some(Self::Upstream(cause));
+        }
+        [Self::PoolPaused, Self::ProcessStopping]
+            .into_iter()
+            .find(|cause| cause.name() == name)
+    }
+
+    /// Every cause, in the order their names render. The two lists — this one
+    /// and [`Self::name`] — are two views of one closed set; the test below
+    /// pairs them.
+    pub const ALL: [Self; 8] = [
+        Self::Upstream(UpstreamFailure::RateLimited),
+        Self::Upstream(UpstreamFailure::QuotaExhausted),
+        Self::Upstream(UpstreamFailure::Auth),
+        Self::Upstream(UpstreamFailure::ServerError),
+        Self::Upstream(UpstreamFailure::BadRequest),
+        Self::Upstream(UpstreamFailure::Transport),
+        Self::PoolPaused,
+        Self::ProcessStopping,
+    ];
+
+    /// The prefix this cause renders its reason under.
+    ///
+    /// The in-band declaration stays — layers between the producer and the
+    /// retry decision still flatten errors to text, and a reason that carries
+    /// nothing would be re-run blind — but it is now derived from the variant
+    /// rather than picked per call site, so the two cannot drift.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Upstream(_) => UPSTREAM_UNAVAILABLE_PREFIX,
+            Self::PoolPaused => LLM_POOL_PAUSED_PREFIX,
+            Self::ProcessStopping => PROCESS_SHUTTING_DOWN_PREFIX,
+        }
+    }
+
+    /// The reason text this cause renders for `detail`.
+    pub fn render(self, detail: &str) -> String {
+        format!("{}: {detail}", self.prefix())
+    }
+}
+
+impl std::fmt::Display for FailureCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Serialised through [`FailureCause::name`] for the same reason
+/// [`UpstreamFailure`] is: the derive would spell the variant, and a stored row
+/// read back under another word reads as "nobody declared a cause".
+impl serde::Serialize for FailureCause {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FailureCause {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_name(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown failure cause {name:?}; declared names are {:?}",
+                FailureCause::ALL.map(|cause| cause.name())
+            ))
+        })
+    }
+}
+
 /// Prefix carried by a policy refusal — a guardrail rule declined the call.
 ///
 /// Not an environment failure and not a fault: the rule is still in force, so
@@ -506,5 +645,58 @@ mod tests {
                 "{cause} is settled by the refusal itself"
             );
         }
+    }
+
+    /// 每个原因都能从自己渲染出的名字读回来，存盘与读盘走同一条词表。
+    #[test]
+    fn every_failure_cause_reads_back_from_its_own_name() {
+        for cause in FailureCause::ALL {
+            assert_eq!(
+                FailureCause::from_name(cause.name()),
+                Some(cause),
+                "{cause} 的名字读不回来，存下去的那一行就成了没人认识的原因"
+            );
+        }
+    }
+
+    /// 原因渲染成错误文本时带上前缀，而每种原因的渲染里那句前缀恰好是它自己的。
+    ///
+    /// 这是类型与带内声明之间的往返：层与层之间仍然会把错误拍平成文本，判决
+    /// 虽然读类型，读日志的人和只拿到文本的那一层读到的必须是同一句话。
+    #[test]
+    fn every_cause_renders_under_the_prefix_a_text_reader_looks_for() {
+        for cause in FailureCause::ALL {
+            let rendered = cause.render("why");
+            assert!(
+                rendered.starts_with(cause.prefix()),
+                "{cause} 渲染成 {rendered:?}，没有以它自己的前缀开头"
+            );
+            assert_eq!(
+                rendered.split_once(": ").map(|(p, _)| p),
+                Some(cause.prefix()),
+                "{cause} 的前缀必须恰好是渲染里冒号前那一段"
+            );
+        }
+        // 两种没有上游参与的原因，前缀就是它们被认出来的那两句。
+        assert_eq!(
+            FailureCause::PoolPaused.prefix(),
+            LLM_POOL_PAUSED_PREFIX,
+            "池停供在文本面被认作这一句"
+        );
+        assert_eq!(
+            FailureCause::ProcessStopping.prefix(),
+            PROCESS_SHUTTING_DOWN_PREFIX,
+            "进程被要求停下在文本面被认作这一句"
+        );
+    }
+
+    /// 池停供与进程停下不是终态：环境自己会结束，重跑一次就能接着做。
+    #[test]
+    fn an_environment_pause_is_never_terminal() {
+        for cause in [FailureCause::PoolPaused, FailureCause::ProcessStopping] {
+            assert!(!cause.is_terminal(), "{cause} 会自己结束");
+            assert!(cause.is_environment_failure(), "{cause} 不是这份活的错");
+        }
+        assert!(FailureCause::Upstream(UpstreamFailure::QuotaExhausted).is_terminal());
     }
 }

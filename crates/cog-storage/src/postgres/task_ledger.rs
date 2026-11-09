@@ -207,6 +207,7 @@ impl LedgerRow {
             // `error` is prose the upstream wrote, and a machine grouping
             // failures by what it says would be reading a description.
             error_cause: cause_from_code(self.error_code.as_deref()),
+            failure_payer: None,
             blocked_by: self.blocked_by,
             blocks: self.blocks,
             priority: self.priority,

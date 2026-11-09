@@ -967,6 +967,10 @@ impl TaskExecutorRouter {
                     // 就地取出，不让下游回头去解析那句 Display。
                     error: e.to_string(),
                     error_cause: e.upstream_failure(),
+                    // 付款人走另一个字段：它比 `error_cause` 宽（含池停供、进程
+                    // 被要求停下），而老版本订阅者不认识这个字段会直接忽略；
+                    // 塞进 `error_cause` 反而会让它整条解析失败。
+                    failure_payer: e.environment_cause(),
                     // 上游明说的等待同样要过桥：算出重试时刻的是消费这条
                     // 消息的进程，明说的时长必须在消息里跟着走。
                     retry_after_secs: e.retry_after_secs(),
@@ -1119,6 +1123,7 @@ impl Default for TaskExecutorRouter {
 mod ready_pipeline_tests {
     use super::*;
     use async_trait::async_trait;
+    use cog_core::contract::outcome::FailureCause;
     use cog_core::{MessageStream, TaskResultMetadata, UpstreamFailure};
 
     #[derive(Default)]
@@ -1398,10 +1403,18 @@ mod ready_pipeline_tests {
         match serde_json::from_slice::<DagMessage>(&published[0].1).unwrap() {
             DagMessage::TaskFailed {
                 error_cause,
+                failure_payer,
                 retry_after_secs,
                 ..
             } => {
+                // 两个通道各带一半：`error_cause` 说哪个上游拒了，`failure_payer`
+                // 说这笔账记在谁头上。只测前者会让"池停供"这条没有上游参与的
+                // 拒绝在消息面上看起来什么都没说。
                 assert_eq!(error_cause, Some(UpstreamFailure::RateLimited));
+                assert_eq!(
+                    failure_payer,
+                    Some(FailureCause::Upstream(UpstreamFailure::RateLimited))
+                );
                 assert_eq!(retry_after_secs, Some(90));
             }
             other => panic!("expected TaskFailed, got {other:?}"),
@@ -1963,7 +1976,7 @@ mod ready_permit_fast_lane_tests {
             &self,
             _task_id: &str,
             _error: String,
-            _cause: Option<cog_core::contract::llm::UpstreamFailure>,
+            _cause: Option<cog_core::UpstreamFailure>,
         ) -> SFResult<(bool, Vec<String>, bool)> {
             Ok((false, Vec::new(), false))
         }
@@ -1971,7 +1984,7 @@ mod ready_permit_fast_lane_tests {
             &self,
             _task_id: &str,
             _error: String,
-            _cause: Option<cog_core::contract::llm::UpstreamFailure>,
+            _cause: Option<cog_core::UpstreamFailure>,
             _retry_after_secs: Option<u64>,
         ) -> SFResult<(bool, Vec<String>, bool)> {
             Ok((false, Vec::new(), false))

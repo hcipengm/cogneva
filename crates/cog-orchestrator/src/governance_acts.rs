@@ -895,6 +895,7 @@ fn governance_task(
         result: None,
         error: None,
         error_cause: None,
+        failure_payer: None,
         blocked_by: Vec::new(),
         blocks: Vec::new(),
         priority: 0,

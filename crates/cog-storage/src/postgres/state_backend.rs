@@ -4,6 +4,7 @@ use serde_json;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
+use cog_core::contract::outcome::FailureCause;
 use cog_core::{
     AgentState, ContextBoard, Event, SFError, SFResult, StateBackend, TaskCheckpoint,
     UpstreamFailure,
@@ -1669,6 +1670,7 @@ impl StateBackend for PostgresStateBackend {
         task_id: &str,
         error: String,
         cause: Option<UpstreamFailure>,
+        payer: Option<FailureCause>,
         max_retries: u32,
         retry_delay: std::time::Duration,
     ) -> SFResult<(bool, Vec<String>)> {
@@ -1723,6 +1725,7 @@ impl StateBackend for PostgresStateBackend {
         let was_running = task.status == cog_core::TaskStatus::Running;
         task.error = Some(error.clone());
         task.error_cause = cause;
+        task.failure_payer = payer;
         task.updated_at = Utc::now();
 
         let should_retry = task.retry_count < max_retries;

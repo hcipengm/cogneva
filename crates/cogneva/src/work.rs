@@ -500,6 +500,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
                     task_id: task.id.clone(),
                     error,
                     error_cause: None,
+                    failure_payer: None,
                     retry_after_secs: None,
                     sender: unit.to_string(),
                     recipient: "dag-executor".into(),

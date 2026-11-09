@@ -1797,6 +1797,7 @@ impl DagExecutorRuntime {
                 task_id,
                 error,
                 error_cause,
+                failure_payer,
                 retry_after_secs,
                 sender,
                 ..
@@ -1811,7 +1812,13 @@ impl DagExecutorRuntime {
                 }
                 match self
                     .orchestrator
-                    .fail_task_after(&task_id, error.clone(), error_cause, retry_after_secs)
+                    .fail_task_after_paid(
+                        &task_id,
+                        error.clone(),
+                        error_cause,
+                        failure_payer,
+                        retry_after_secs,
+                    )
                     .await
                 {
                     Ok((retried, cancelled, _dlq_pushed)) => {
@@ -2666,6 +2673,7 @@ mod consumer_ack_tests {
             result: None,
             error: None,
             error_cause: None,
+            failure_payer: None,
             blocked_by: vec![],
             blocks: vec![],
             priority: 1,
@@ -3498,6 +3506,7 @@ mod consumer_ack_tests {
             result: None,
             error: None,
             error_cause: None,
+            failure_payer: None,
             blocked_by: vec![],
             blocks: vec![],
             priority: 1,

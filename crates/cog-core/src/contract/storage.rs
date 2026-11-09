@@ -10,6 +10,7 @@
 
 use crate::contract::llm::UpstreamFailure;
 use crate::contract::metric_names::MetricName;
+use crate::contract::outcome::FailureCause;
 use crate::{SFError, SFResult};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -947,6 +948,7 @@ pub trait StateBackend: Send + Sync {
         task_id: &str,
         _error: String,
         _cause: Option<UpstreamFailure>,
+        _payer: Option<FailureCause>,
         _max_retries: u32,
         _retry_delay: std::time::Duration,
     ) -> SFResult<(bool, Vec<String>)> {

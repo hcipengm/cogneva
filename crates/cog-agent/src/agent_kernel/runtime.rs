@@ -2012,14 +2012,15 @@ impl AgentRuntime {
             "the process is shutting down; stopping at the turn boundary, the attempt stays open"
         );
         self.note_run_ending(crate::observable::RunOutcome::Preempted, iterations);
-        // 标记写在最前面：派发层把错误拍平成文本再判要不要重试，而这段文本
-        // 拿不到「进程被要求停下」这个事实。带上它，环境付账，任务的重试预算
-        // 一格不动；不带它，每滚一次就扣一次，滚几次之后一件没做错的活被判死。
-        SFError::Agent(format!(
-            "{}: the process is shutting down; the attempt is left open and the next dispatch \
+        // 事实写在类型上，前缀由它渲染出来：派发层会把错误拍平成文本再判要不要
+        // 重试，所以两种通道同时存在——类型给判决读，前缀给只拿到文本的那一层读。
+        // 带上它，环境付账，任务的重试预算一格不动；不带它，每滚一次就扣一次，
+        // 滚几次之后一件没做错的活被判死。
+        SFError::environment_denied(
+            cog_core::contract::outcome::FailureCause::ProcessStopping,
+            "the process is shutting down; the attempt is left open and the next dispatch \
              resumes from its journal",
-            cog_core::contract::outcome::PROCESS_SHUTTING_DOWN_PREFIX
-        ))
+        )
     }
 
     /// 接着上一次跑。

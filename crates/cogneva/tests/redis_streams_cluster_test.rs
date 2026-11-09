@@ -39,6 +39,7 @@ fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: 
         result: None,
         error: None,
         error_cause: None,
+        failure_payer: None,
         blocked_by,
         blocks: vec![],
         priority: 1,

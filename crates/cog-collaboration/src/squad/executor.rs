@@ -101,6 +101,14 @@ pub struct SquadResult {
     pub result: Option<serde_json::Value>,
     pub retry_count: u32,
     pub error: Option<String>,
+    /// The typed reason the environment denied this run, when it did.
+    ///
+    /// `error` stays the human sentence; this is what the retry decision reads.
+    /// The distinction matters for the pool pause: a round that never began
+    /// leaves exactly this field, and a reader that had only the sentence would
+    /// have to recognize its wording to keep from charging the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<cog_core::contract::outcome::FailureCause>,
     /// The PGE mode that was actually used for this squad's execution.
     pub pge_mode: PgeMode,
     /// Squad-level reflection output (populated when reflection is configured).
@@ -874,7 +882,10 @@ impl SquadExecutor {
         // 闸落在这一层，不落到升级策略上：池停供时升到 Roundtable 只是换一个
         // 同样要调模型的拓扑，再撞一次同一堵墙。暂停不是失败，所以这里不发
         // `OnRalphUnrecoverable`、不写失败条目——那是给"这份活做不成"用的。
-        if let RalphVerdict::Paused { ref reason, .. } = verdict {
+        if let RalphVerdict::Paused {
+            ref reason, cause, ..
+        } = verdict
+        {
             squad.status = SquadStatus::Failed;
             let reflection = run_squad_reflection(squad_reflection, &verdict, &squad).await;
             return SquadResult {
@@ -882,6 +893,7 @@ impl SquadExecutor {
                 success: false,
                 result: None,
                 retry_count: 0,
+                cause: Some(cause),
                 error: Some(reason.clone()),
                 pge_mode: squad.config.pge_mode,
                 reflection,
@@ -911,6 +923,7 @@ impl SquadExecutor {
                 success: true,
                 result: squad.result,
                 retry_count: 0,
+                cause: None,
                 error: None,
                 pge_mode: squad.config.pge_mode,
                 reflection,
@@ -969,6 +982,7 @@ impl SquadExecutor {
                 success: false,
                 result: None,
                 retry_count: 0,
+                cause: None,
                 error: match verdict {
                     RalphVerdict::Unrecoverable { reason, .. } => Some(reason),
                     _ => None,
@@ -1035,6 +1049,7 @@ impl SquadExecutor {
                     success: true,
                     result: squad.result,
                     retry_count: 1,
+                    cause: None,
                     error: None,
                     pge_mode: squad.config.pge_mode,
                     reflection: reflection2,
@@ -1076,6 +1091,7 @@ impl SquadExecutor {
                     success: false,
                     result: None,
                     retry_count: 1,
+                    cause: None,
                     error: Some(reason.clone()),
                     pge_mode: squad.config.pge_mode,
                     reflection: reflection2,
@@ -1083,7 +1099,9 @@ impl SquadExecutor {
             }
             // 升级后的这一趟也可能在开轮之前撞上闸（池在这一次执行中间停供）。
             // 与上面那一处同义：不写不可修复、不发 hook，原因是环境的事。
-            RalphVerdict::Paused { ref reason, .. } => {
+            RalphVerdict::Paused {
+                ref reason, cause, ..
+            } => {
                 squad.status = SquadStatus::Failed;
                 let reflection2 = run_squad_reflection(squad_reflection, &verdict2, &squad).await;
                 SquadResult {
@@ -1091,6 +1109,7 @@ impl SquadExecutor {
                     success: false,
                     result: None,
                     retry_count: 1,
+                    cause: Some(cause),
                     error: Some(reason.clone()),
                     pge_mode: squad.config.pge_mode,
                     reflection: reflection2,

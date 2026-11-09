@@ -1,4 +1,5 @@
 use crate::contract::llm::UpstreamFailure;
+use crate::contract::outcome::FailureCause;
 
 /// 统一错误类型。参考 pi-ai 的契约：所有错误编码在流中，不直接抛出。
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +27,19 @@ pub enum SFError {
         /// upstream said nothing, and the caller's own policy governs.
         retry_after_secs: Option<u64>,
     },
+
+    /// The environment denied a round without an upstream rejecting it: the pool
+    /// was paused before the round began, or the process was asked to stop at a
+    /// turn boundary.
+    ///
+    /// A variant of its own rather than a wider [`Self::Upstream`] cause: that
+    /// variant's rendering is a protocol statement — `LLM upstream refused
+    /// (rate_limited)` — which failover parses back out of the text, and neither
+    /// of these two is an upstream speaking. The reason still starts with
+    /// [`FailureCause::prefix`]'s rendering, because every layer between here
+    /// and the retry decision flattens the error to text.
+    #[error("{}: {reason}", .cause.prefix())]
+    Environment { cause: FailureCause, reason: String },
 
     /// A policy refused the call. This is a decision, not a failure: the rule
     /// that refused it is still in force, so the same call would be refused the
@@ -160,6 +174,8 @@ impl SFError {
             // 合法那一档不算——那是我们自己的请求写错了，归到环境里就又是一次
             // 把自身缺陷记成外部故障。
             SFError::Upstream { cause, .. } => cause.is_environment_failure(),
+            // 池停供与进程被要求停下：两者都不反映这份活的内容。
+            SFError::Environment { cause, .. } => cause.is_environment_failure(),
             _ => false,
         }
     }
@@ -203,6 +219,31 @@ impl SFError {
         match self {
             SFError::Upstream { cause, .. } => Some(*cause),
             _ => None,
+        }
+    }
+
+    /// Why the environment denied this round, in the wider spelling both
+    /// environment variants share.
+    ///
+    /// The counterpart of [`Self::upstream_failure`] for the callers whose
+    /// question is "who pays" rather than "should failover switch": that one
+    /// answers "which upstream refused", this one answers "was this the
+    /// environment at all", which includes the two causes that never reach an
+    /// upstream.
+    pub fn environment_cause(&self) -> Option<FailureCause> {
+        match self {
+            SFError::Upstream { cause, .. } => Some(FailureCause::Upstream(*cause)),
+            SFError::Environment { cause, .. } => Some(*cause),
+            _ => None,
+        }
+    }
+
+    /// The environment denied this round for a reason that is not an upstream
+    /// refusal.
+    pub fn environment_denied(cause: FailureCause, reason: impl Into<String>) -> Self {
+        Self::Environment {
+            cause,
+            reason: reason.into(),
         }
     }
 
@@ -285,6 +326,38 @@ impl From<std::io::Error> for SFError {
 mod tests {
     use super::*;
     use crate::contract::llm::UpstreamFailure;
+
+    /// 环境拒绝的文本恰好带一次自己的前缀，且类型能从错误上取回来。
+    ///
+    /// 「恰好一次」是这条用例的重点：生产侧已经把「为什么」写进了 reason，
+    /// 渲染时再加一次前缀就会得到 `llm_pool_paused: llm_pool_paused: …`——
+    /// 而认前缀的读者仍然认得，问题因此不会在门禁上出现，只会出现在日志里。
+    #[test]
+    fn an_environment_denial_renders_its_prefix_once_and_keeps_its_type() {
+        let denied = SFError::environment_denied(FailureCause::PoolPaused, "no member this round");
+        assert_eq!(
+            denied.to_string(),
+            format!(
+                "{}: no member this round",
+                crate::contract::outcome::LLM_POOL_PAUSED_PREFIX
+            )
+        );
+        assert_eq!(denied.environment_cause(), Some(FailureCause::PoolPaused));
+        assert!(denied.is_environment_failure());
+        assert_eq!(denied.upstream_failure(), None, "它不是任何上游说的话");
+
+        let stopped = SFError::environment_denied(
+            FailureCause::ProcessStopping,
+            "asked to stop at a boundary",
+        );
+        assert_eq!(
+            stopped.to_string(),
+            format!(
+                "{}: asked to stop at a boundary",
+                crate::contract::outcome::PROCESS_SHUTTING_DOWN_PREFIX
+            )
+        );
+    }
 
     /// 分类落在类型上：文本里写满 timeout / quota 也不改变它的类别，反之环境
     /// 类失败也不靠文本被认出来。

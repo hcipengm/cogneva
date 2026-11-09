@@ -131,6 +131,7 @@ use cog_core::{
 };
 
 use cog_core::contract::llm::UpstreamFailure;
+use cog_core::contract::outcome::FailureCause;
 use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
 use crate::change_measure::{CheckOutcome, CheckTree, Snapshot, UnsettledReason, GREP_KIND};
@@ -1504,14 +1505,25 @@ enum Handover {
 /// that declares `terminal_env_failure` is an environment refusal even when its
 /// typed cause was lost, and a reason that names a typed environment failure is
 /// one even when the text never wrote the word.
-fn is_environment_failure(reason: Option<&str>, cause: Option<UpstreamFailure>) -> bool {
-    if cause.is_some_and(UpstreamFailure::is_environment_failure) {
+fn is_environment_failure(
+    reason: Option<&str>,
+    cause: Option<UpstreamFailure>,
+    payer: Option<FailureCause>,
+) -> bool {
+    if payer.is_some_and(FailureCause::is_environment_failure)
+        || cause.is_some_and(UpstreamFailure::is_environment_failure)
+    {
         return true;
     }
     let Some(reason) = reason else {
         return false;
     };
     declares(reason, TERMINAL_ENV_FAILURE_PREFIX)
+        || declares(reason, cog_core::contract::outcome::LLM_POOL_PAUSED_PREFIX)
+        || declares(
+            reason,
+            cog_core::contract::outcome::PROCESS_SHUTTING_DOWN_PREFIX,
+        )
         || UpstreamFailure::named_in(reason).is_some_and(UpstreamFailure::is_environment_failure)
 }
 
@@ -1521,7 +1533,7 @@ fn classify_handover(task: &Task) -> Handover {
         TaskStatus::Pending | TaskStatus::Scheduled | TaskStatus::Running => Handover::InFlight,
         TaskStatus::Completed => Handover::Completed,
         TaskStatus::Failed | TaskStatus::Cancelled => {
-            if is_environment_failure(task.error.as_deref(), task.error_cause) {
+            if is_environment_failure(task.error.as_deref(), task.error_cause, task.failure_payer) {
                 Handover::DeadEnvironment
             } else {
                 Handover::DeadWork

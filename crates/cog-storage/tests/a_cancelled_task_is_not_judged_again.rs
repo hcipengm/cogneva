@@ -77,6 +77,7 @@ async fn a_late_failure_leaves_a_cancelled_row_cancelled() {
             TASK,
             LATE_FAILURE.to_string(),
             None,
+            None,
             3,
             Duration::ZERO,
         )

@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use cog_core::contract::outcome::FailureCause;
 use cog_core::{
     AgentState, ContextBoard, Event, SFError, SFResult, StateBackend, TaskCheckpoint,
     UpstreamFailure,
@@ -462,6 +463,7 @@ impl StateBackend for MemoryStateBackend {
         task_id: &str,
         error: String,
         cause: Option<UpstreamFailure>,
+        payer: Option<FailureCause>,
         max_retries: u32,
         retry_delay: std::time::Duration,
     ) -> SFResult<(bool, Vec<String>)> {
@@ -485,6 +487,7 @@ impl StateBackend for MemoryStateBackend {
 
         task.error = Some(error.clone());
         task.error_cause = cause;
+        task.failure_payer = payer;
         task.updated_at = chrono::Utc::now();
 
         if task.retry_count < max_retries {

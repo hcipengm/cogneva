@@ -69,6 +69,9 @@ pub enum RalphVerdict {
     /// `iterations` 是这一任已经跑完的轮数，`history` 原样带回：调用方据此知道
     /// 工作停在哪里，而不是从零再来。
     Paused {
+        /// 拒绝这件事开工的原因，类型化。调用方据此决定这笔账记在谁头上，
+        /// 而不是回头去认文本里的措辞。
+        cause: cog_core::contract::outcome::FailureCause,
         reason: String,
         iterations: u32,
         history: Vec<RalphIteration>,
@@ -308,10 +311,17 @@ impl RalphLoop {
     }
 
     /// 这一轮能不能开工。没有闸对象的进程与从前一样，永远能开工。
-    fn paused_reason(&self) -> Option<&'static str> {
+    fn paused_reason(&self) -> Option<(cog_core::contract::outcome::FailureCause, String)> {
         let gate = self.pause_gate.as_ref()?;
         gate.is_paused_kind(cog_core::TaskClass::LlmDependent)
-            .then_some("llm_pool_paused: 上游池当前没有可用成员，这一轮没有开始")
+            .then(|| {
+                // 文案只写「为什么」，前缀由原因类型在把它渲染成错误文本时加：
+                // 两边各写一次就会渲染成 `llm_pool_paused: llm_pool_paused: …`。
+                (
+                    cog_core::contract::outcome::FailureCause::PoolPaused,
+                    "上游池当前没有可用成员，这一轮没有开始".to_string(),
+                )
+            })
     }
 
     /// Name the task this loop works on behalf of, so what it spends on the
@@ -623,9 +633,10 @@ impl RalphLoop {
             // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
             // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
             // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
-            if let Some(reason) = self.paused_reason() {
+            if let Some((cause, reason)) = self.paused_reason() {
                 return RalphVerdict::Paused {
-                    reason: reason.to_string(),
+                    cause,
+                    reason,
                     iterations: iteration - 1,
                     history: self.history.clone(),
                 };
@@ -839,9 +850,10 @@ impl RalphLoop {
             // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
             // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
             // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
-            if let Some(reason) = self.paused_reason() {
+            if let Some((cause, reason)) = self.paused_reason() {
                 return RalphVerdict::Paused {
-                    reason: reason.to_string(),
+                    cause,
+                    reason,
                     iterations: iteration - 1,
                     history: self.history.clone(),
                 };
@@ -978,9 +990,10 @@ impl RalphLoop {
             // 闸落在轮次之间，不落在轮次之内：已经跑起来的那一轮让它跑完（那
             // 一份钱已经花了、已经走到一半），下一轮不再开。`record_round` 挪到
             // 闸后面，否则"没有开始的轮"会被记成跑过一轮，读数是假的。
-            if let Some(reason) = self.paused_reason() {
+            if let Some((cause, reason)) = self.paused_reason() {
                 return RalphVerdict::Paused {
-                    reason: reason.to_string(),
+                    cause,
+                    reason,
                     iterations: iteration - 1,
                     history: self.history.clone(),
                 };
