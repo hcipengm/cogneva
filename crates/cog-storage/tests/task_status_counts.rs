@@ -100,3 +100,66 @@ async fn the_census_counts_every_workspace_and_leaves_unknown_statuses_in_the_to
         .await
         .expect("leave the ledger as it was found");
 }
+
+/// 一个工作区里的两问：按状态数，与只取点名的那些状态的行。
+///
+/// 这两问是任务图读数每小时上千次的那条路，而它们能被写错的地方都只在 SQL 里：分组
+/// 少了 `WHERE workspace_id` 会把别的树的行数进来；`= ANY` 的参数类型推断不对会让
+/// 绑定在运行时失败，而不是在编译时。一条不接数据库的测试看不到这两种错。
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_workspace_census_counts_by_state_and_returns_only_the_states_asked_for() {
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+    let backend = PostgresStateBackend::new(pool.clone());
+    backend.init_schema().await.expect("create the task schema");
+    sqlx::query("DELETE FROM cog_dag_tasks")
+        .execute(&pool)
+        .await
+        .expect("clear the task table");
+
+    for (workspace, id, status) in [
+        ("ws-narrow-1", "n-1", TaskStatus::Running),
+        ("ws-narrow-1", "n-2", TaskStatus::Pending),
+        ("ws-narrow-1", "n-3", TaskStatus::Completed),
+        // 另一棵树里的行：分组少了工作区条件会把它数进 ws-narrow-1。
+        ("ws-narrow-2", "n-4", TaskStatus::Running),
+    ] {
+        backend
+            .dag_set_task(workspace, id, &task(id, status))
+            .await
+            .expect("write a task");
+    }
+
+    let mut counts = backend
+        .dag_task_status_counts("ws-narrow-1")
+        .await
+        .expect("count");
+    counts.sort();
+    assert_eq!(
+        counts,
+        vec![
+            ("completed".to_string(), 1),
+            ("pending".to_string(), 1),
+            ("running".to_string(), 1),
+        ],
+        "分组只数这一个工作区"
+    );
+
+    let mut rows = backend
+        .dag_get_tasks_in_states("ws-narrow-1", &[TaskStatus::Pending, TaskStatus::Running])
+        .await
+        .expect("read the movable states");
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(
+        rows.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        vec!["n-1", "n-2"],
+        "点名的两个状态之外一行都不该回来"
+    );
+
+    sqlx::query("DELETE FROM cog_dag_tasks")
+        .execute(&pool)
+        .await
+        .expect("leave the table as it was found");
+}

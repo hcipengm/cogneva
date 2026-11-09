@@ -57,6 +57,12 @@ pub struct ReadyWork {
     pub columns: HashMap<String, std::collections::BTreeMap<&'static str, u64>>,
 }
 
+/// 任务图一拍的两半：每个状态有几条，与还能动的那些行。
+///
+/// 两半必须来自**同一次**读——分开读会让条数与行数描述两个不同的时刻，而读数面
+/// 把它们并在一格里印出来，读者没法知道它们不是一起取的。
+pub type GraphReading = (Vec<(String, u64)>, Vec<Task>);
+
 pub struct DagExecutor {
     workspace_id: String,
     /// 本进程的运行身份，任务租约的持有者。每次构造新产生一个值，所以它随进程
@@ -1555,6 +1561,45 @@ impl DagExecutor {
             be.dag_get_all_tasks(&self.workspace_id).await
         } else {
             Ok(self.inner.read().await.tasks.values().cloned().collect())
+        }
+    }
+
+    /// 任务图读数要的两样东西：每状态的条数，与还能动的那几个状态的行。
+    ///
+    /// 与 [`Self::all_tasks_checked`] 读的是同一张图，但读的范围跟着判据走。读数对
+    /// 终态行只要一个数——它们的年龄是历史而不是停滞，`oldest_by_agent`、`unowned`
+    /// 与 `held` 三格都只对 Pending / Scheduled / Running 问问题。整表读把这些历史行
+    /// 也搬回来，而这张图只增不减：实测 2026-11-09 一个工作区 3,598 行、一次读
+    /// 1.0–1.8 秒、每小时 1,628 次。
+    ///
+    /// 失败照旧保留：读不出来与读到一个干净的图，在读数面上是两个方向相反的结论。
+    pub async fn graph_reading_checked(&self) -> SFResult<GraphReading> {
+        let movable = [
+            cog_core::TaskStatus::Pending,
+            cog_core::TaskStatus::Scheduled,
+            cog_core::TaskStatus::Running,
+        ];
+        if let Some(be) = self.fg() {
+            let counts = be.dag_task_status_counts(&self.workspace_id).await?;
+            let tasks = be
+                .dag_get_tasks_in_states(&self.workspace_id, &movable)
+                .await?;
+            Ok((counts, tasks))
+        } else {
+            let inner = self.inner.read().await;
+            let mut counts: Vec<(String, u64)> = Vec::new();
+            let mut rows = Vec::new();
+            for task in inner.tasks.values() {
+                let key = task.status.as_str().to_string();
+                match counts.iter_mut().find(|(state, _)| *state == key) {
+                    Some(cell) => cell.1 += 1,
+                    None => counts.push((key, 1)),
+                }
+                if movable.contains(&task.status) {
+                    rows.push(task.clone());
+                }
+            }
+            Ok((counts, rows))
         }
     }
 
@@ -5257,6 +5302,41 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        /// 与 postgres 那一份同形：数一条分组，不取行。这里必须覆盖，否则默认实现会
+        /// 退回 `dag_get_all_tasks`，而 `wide_reads` 正是用来抓那种退回的。
+        async fn dag_task_status_counts(
+            &self,
+            _workspace_id: &str,
+        ) -> SFResult<Vec<(String, u64)>> {
+            self.narrow_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tasks = self.tasks.lock().await;
+            let mut counts: Vec<(String, u64)> = Vec::new();
+            for task in tasks.iter() {
+                let key = task.status.as_str().to_string();
+                match counts.iter_mut().find(|(state, _)| *state == key) {
+                    Some(cell) => cell.1 += 1,
+                    None => counts.push((key, 1)),
+                }
+            }
+            Ok(counts)
+        }
+        async fn dag_get_tasks_in_states(
+            &self,
+            _workspace_id: &str,
+            states: &[TaskStatus],
+        ) -> SFResult<Vec<Task>> {
+            self.narrow_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .filter(|t| states.contains(&t.status))
+                .cloned()
+                .collect())
+        }
         async fn dag_transition_task(
             &self,
             _workspace_id: &str,
@@ -6925,6 +7005,44 @@ mod tests {
         assert!(
             expires <= chrono::Utc::now() + chrono::Duration::seconds(61),
             "到期时刻不能超过租约时长: {expires}"
+        );
+    }
+
+    /// 任务图读数按状态数，并且只取还能动的那几个状态的行。
+    ///
+    /// 两种读法给同一份答案（整表读回来再数 / 分组数 + 窄取），差别只在库那边付多少：
+    /// 实测 2026-11-09，一个工作区 3,598 行、一次整表读 1.0–1.8 秒，而这条读数每小时
+    /// 走 1,628 次。答案正确区分不了这两种读法，`wide_reads` 区分得了——所以判据
+    /// 落在它上面，落在「交回来的行里有几条」上面。
+    #[tokio::test]
+    async fn the_graph_reading_counts_by_state_and_takes_only_movable_rows() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-graph-reading".into()).with_state_backend(backend.clone());
+
+        let mut pending = Task::new("t-pending", TaskType::DagNode, serde_json::json!({}));
+        pending.status = TaskStatus::Pending;
+        let mut done = Task::new("t-done", TaskType::DagNode, serde_json::json!({}));
+        done.status = TaskStatus::Completed;
+        let mut failed = Task::new("t-failed", TaskType::DagNode, serde_json::json!({}));
+        failed.status = TaskStatus::Failed;
+        backend.tasks.lock().await.extend([pending, done, failed]);
+
+        let (counts, rows) = dag.graph_reading_checked().await.unwrap();
+        let count_of = |state: &str| counts.iter().find(|(s, _)| s == state).map(|(_, n)| *n);
+        assert_eq!(count_of("pending"), Some(1));
+        assert_eq!(count_of("completed"), Some(1), "终态行仍然要计数");
+        assert_eq!(count_of("failed"), Some(1));
+        assert_eq!(rows.len(), 1, "明细只拿还能动的那几个状态");
+        assert_eq!(rows[0].id, "t-pending");
+        assert_eq!(
+            backend.wide_reads(),
+            0,
+            "这一问一次整表读都不该发生——库那边付多少才是它与整表读的区别"
+        );
+        assert!(
+            backend.narrow_reads() >= 2,
+            "两次窄读：一次分组数数、一次取可动的行（narrow={}）",
+            backend.narrow_reads()
         );
     }
 

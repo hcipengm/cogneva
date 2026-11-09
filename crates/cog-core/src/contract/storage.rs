@@ -858,6 +858,54 @@ pub trait StateBackend: Send + Sync {
             .collect())
     }
 
+    /// Counts of a workspace's rows, by state.
+    ///
+    /// The task-graph reading publishes one cell per state on every refresh, and
+    /// it used to get them by pulling the whole graph back and counting here.
+    /// A graph only grows: measured 2026-11-09, one workspace held 3,598 rows and
+    /// that read took 1.0-1.8 s, 1,628 times an hour. Counting is a `GROUP BY`;
+    /// asking for every row in order to produce eight integers makes the cost of
+    /// the reading follow the workspace's history.
+    ///
+    /// The default counts [`Self::dag_get_all_tasks`], which is correct but reads
+    /// everything; a backend that stores the status in a column should override
+    /// this so the counting happens in the query.
+    async fn dag_task_status_counts(&self, workspace_id: &str) -> SFResult<Vec<(String, u64)>> {
+        let mut counts: Vec<(String, u64)> = Vec::new();
+        for task in self.dag_get_all_tasks(workspace_id).await? {
+            let key = task.status.as_str().to_string();
+            match counts.iter_mut().find(|(state, _)| *state == key) {
+                Some(cell) => cell.1 += 1,
+                None => counts.push((key, 1)),
+            }
+        }
+        Ok(counts)
+    }
+
+    /// The rows in a workspace that sit in any of `states`.
+    ///
+    /// The reading asks two questions of the same graph: how many rows are in
+    /// each state, and what the rows that can still move look like. The second
+    /// question is about [`crate::TaskStatus::Pending`], `Scheduled` and
+    /// `Running` only -- a finished row's age is history, not a stall -- so the
+    /// rows it reads for should be exactly those.
+    ///
+    /// The default filters [`Self::dag_get_all_tasks`]; a backend that stores the
+    /// state in a column should override this so the exclusion happens in the
+    /// query.
+    async fn dag_get_tasks_in_states(
+        &self,
+        workspace_id: &str,
+        states: &[crate::TaskStatus],
+    ) -> SFResult<Vec<crate::Task>> {
+        Ok(self
+            .dag_get_all_tasks(workspace_id)
+            .await?
+            .into_iter()
+            .filter(|task| states.contains(&task.status))
+            .collect())
+    }
+
     /// The rows in a workspace that carry a venue label.
     ///
     /// The venue board answers three numbers per venue by folding

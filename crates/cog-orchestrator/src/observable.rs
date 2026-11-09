@@ -5,6 +5,8 @@
 use async_trait::async_trait;
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::SFResult;
+
+use crate::dag_executor::orchestrator::GraphReading;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -827,7 +829,7 @@ impl TaskGraphObservable {
     /// lock is taken only after the read returns, so a slow store cannot hold
     /// up the other observables' scrapes.
     async fn refresh(&self) -> bool {
-        let read = self.source.all_tasks_checked().await;
+        let read = self.source.graph_reading_checked().await;
         self.record(read).await
     }
 
@@ -841,15 +843,37 @@ impl TaskGraphObservable {
     /// Answers whether the read succeeded, which is the one thing the caller
     /// needs to decide if the window opens: a failed read that opened it would
     /// keep the next scrape from asking again.
-    async fn record(&self, read: SFResult<Vec<cog_core::Task>>) -> bool {
+    ///
+    /// The read hands over two things because this reading asks two questions:
+    /// how many rows sit in each state (counted by the store's `GROUP BY`), and
+    /// what the rows that can still move look like. Pulling the whole graph
+    /// here is what made each refresh read every historical row it was about to
+    /// discard — and this refresh runs about 1,600 times an hour.
+    async fn record(&self, read: SFResult<GraphReading>) -> bool {
         let mut snapshot = self.snapshot.lock().await;
         match read {
-            Ok(tasks) => {
+            Ok((stored_counts, tasks)) => {
                 let now = chrono::Utc::now();
                 let mut counts: Vec<(&'static str, u64)> = cog_core::TaskStatus::ALL
                     .iter()
                     .map(|status| (status.as_str(), 0))
                     .collect();
+                // 条数是存储层数出来的，这里只把它们落到一条固定的状态序列上。这一版
+                // 认不出的状态仍然是真实存在的行，它不能悄悄消失：记一条警告，并且不
+                // 计进任何一格——「有一条我读不懂的行」与「这一格是零」由此分得开。
+                for (status, count) in &stored_counts {
+                    match counts
+                        .iter_mut()
+                        .find(|(state, _)| *state == status.as_str())
+                    {
+                        Some(cell) => cell.1 += *count,
+                        None => tracing::warn!(
+                            status = %status,
+                            count,
+                            "task row carries a status this build does not know; left out of the per-state cells"
+                        ),
+                    }
+                }
                 let mut oldest: HashMap<String, f64> = HashMap::new();
                 // The states that can still move, named once: the age below and
                 // the unowned count both ask about exactly this set, and a
@@ -863,12 +887,6 @@ impl TaskGraphObservable {
                     movable.iter().map(|s| (s.as_str(), 0)).collect();
                 let mut held: HashMap<String, u64> = HashMap::new();
                 for task in &tasks {
-                    if let Some(cell) = counts
-                        .iter_mut()
-                        .find(|(status, _)| *status == task.status.as_str())
-                    {
-                        cell.1 += 1;
-                    }
                     // Counted before the `movable` filter below and narrowed to
                     // Pending by hand, because the two are not the same set: the
                     // dispatcher only ever starts a pending row, so a scheduled
@@ -1710,6 +1728,41 @@ mod tests {
         );
         task.status = status;
         task
+    }
+
+    /// 读数只取它要用的那些行。
+    ///
+    /// 条数仍然按全状态给——终态行也是行，`tasks_current` 那一族要它们；但明细那一半
+    /// 只拿回还能动的三个状态。终态行的内容在这一问里一行都不需要，而这张图只增不减：
+    /// 整表读把每一行历史都搬过来，再在下面按 `movable` 丢掉它。
+    ///
+    /// 判据是「这一拍交回来的行里有几条」，不是「跑了多久」——耗时随机器变，而行的
+    /// 集合不变。最后一句是反证：同一张图上整表读会交回三行。
+    #[tokio::test]
+    async fn the_reading_takes_the_rows_it_uses_and_only_counts_the_rest() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-task-obs-narrow".into()));
+        for status in [
+            cog_core::TaskStatus::Pending,
+            cog_core::TaskStatus::Completed,
+            cog_core::TaskStatus::Failed,
+        ] {
+            dag.add_task(task(&format!("t-{}", status.as_str()), status))
+                .await
+                .unwrap();
+        }
+
+        let (counts, rows) = dag.graph_reading_checked().await.unwrap();
+        let count_of = |state: &str| counts.iter().find(|(s, _)| s == state).map(|(_, n)| *n);
+        assert_eq!(count_of("pending"), Some(1));
+        assert_eq!(count_of("completed"), Some(1), "终态行仍然要计数");
+        assert_eq!(count_of("failed"), Some(1));
+        assert_eq!(rows.len(), 1, "明细只拿还能动的那几个状态");
+        assert_eq!(rows[0].status, cog_core::TaskStatus::Pending);
+        assert_eq!(
+            dag.all_tasks_checked().await.unwrap().len(),
+            3,
+            "同一张图上整表读会交回三行——这一句就是这条改动的判据"
+        );
     }
 
     fn labeled<'a>(
