@@ -2081,6 +2081,59 @@ export async function getBuildRuns(): Promise<BuildRunsView> {
   return api.get<BuildRunsView>('/api/v1/evolution/builds');
 }
 
+/**
+ * 宿主构建槽的一拍。
+ *
+ * 一台机器同时跑集群和喂集群的构建，能同时跑几条是**实测导出**的界，只有放在每个构建方
+ * 都能加入的地方才管得住。这份读数就是那个地方：谁占着位子、谁排着、这台机器有多堵。
+ *
+ * `state` 的三个词缺一不可，而且处置相反：
+ * - `measured`：下面每一格是这一拍的真读数；
+ * - `unwired`：这个部署没把槽目录挂进来——不是「没有构建在跑」；
+ * - `unread`：目录在、读不动——不是「空着」。
+ */
+export interface BuildGateReport {
+  state: 'measured' | 'unwired' | 'unread';
+  /** `unwired` / `unread` 的原因；`measured` 时没有这一格。 */
+  why?: string;
+  dir: string;
+  /** 这一拍认为同时可以跑几条。读不到就不给，不是给 1。 */
+  bound?: number;
+  /** 界那份文件多久没被重算过：界是会动的读数，不是常量。 */
+  bound_written_secs_ago?: number;
+  slots: BuildGateSlot[];
+  reservation?: BuildGateReservation;
+  pressure: BuildGatePressure[];
+  load?: { load1: string; load5: string; load15: string };
+  generated_at: string;
+}
+
+export interface BuildGateSlot {
+  name: string;
+  held: boolean;
+  holder?: { what: string; pid?: number; held_secs?: number };
+  /** 位子被占着但没人留下记录：这是「旧版本的构建器」，不是「空着」。 */
+  unrecorded?: string;
+}
+
+export interface BuildGateReservation {
+  who: string;
+  renewed_secs_ago?: number;
+  fresh: boolean;
+  fresh_window_secs: number;
+}
+
+export interface BuildGatePressure {
+  resource: string;
+  avg10: string;
+  avg60: string;
+  avg300: string;
+}
+
+export async function getBuildGate(): Promise<BuildGateReport> {
+  return api.get<BuildGateReport>('/api/v1/delivery/build-gate');
+}
+
 
 export interface EvalDatasetInfo {
   name: string;
@@ -2695,6 +2748,172 @@ export interface WorkbenchPage {
 
 export async function getWorkbench(): Promise<WorkbenchPage> {
   return api.get<WorkbenchPage>('/api/v1/workbench');
+}
+
+// ── 能力 ──
+
+/** 一项动作从哪来。同名不同源是两行。 */
+export type CapabilitySource = 'builtin' | 'plugin' | 'mcp';
+
+/**
+ * 这一项此刻能不能真的被调起来。
+ *
+ * `declared_only` 不是「查了没有」，是「查了，确实没有」：名字与参数都在清单上，
+ * 而没有任何一处执行侧登记它，点了会落空。
+ */
+export type CapabilityReach = 'callable' | 'declared_only';
+
+/** 一个自报了某项能力的单位，以及它此刻在不在岗。 */
+export interface CapabilityHolder {
+  unit: string;
+  live: boolean;
+}
+
+/** 一项能力：能被点单的一个动作。 */
+/**
+ * 调这一项要带什么。`null` 是这一层没给 schema，不是「不用参数」——后者是
+ * `{ params: 0, required: [] }`。
+ */
+export interface CapabilityBoundary {
+  /** 必填参数名，按名字排。 */
+  required: string[];
+  /** schema 里声明的参数总数，含可选。 */
+  params: number;
+}
+
+/**
+ * 这一项在哪一层里跑——也就是它失败时是什么样子：进程内是一次错误返回值，WASM 沙箱
+ * 是超时或被上限掐掉，远端执行器是不再应答的对端。
+ */
+export type CapabilityRunsIn = 'native' | 'wasm' | 'shell';
+
+export interface CapabilityEntry {
+  name: string;
+  source: CapabilitySource;
+  reach: CapabilityReach;
+  description: string | null;
+  boundary: CapabilityBoundary | null;
+  /** `null` 是这一层没报实现，不是「不在任何地方跑」。 */
+  runs_in: CapabilityRunsIn | null;
+  /**
+   * 这一台进程里被点过几次。`null` 是这一层没有计数器，不是「一次没用过」——
+   * 0 只在有计数器的那几层才是读数。
+   */
+  calls: number | null;
+  /**
+   * 分工表里点名允许调它的角色。`null` 是这一拍没读到分工表，不是「没有角色被
+   * 允许」——后者是空数组；两者要采取的动作相反。
+   */
+  allowed_roles: string[] | null;
+  holders: CapabilityHolder[];
+}
+
+/**
+ * 一个来源这一拍读到了没有。
+ *
+ * 三态而不是一个数：「没接」「读失败」与「读到 0 项」要采取的动作不同，折成一个数
+ * 就分不出来了。
+ */
+export type CapabilitySourceReading =
+  | { state: 'measured'; entries: number; callable: number }
+  | { state: 'unwired'; because: string }
+  | { state: 'unread'; because: string };
+
+/** 这个平台此刻真的做得到的动作，按「项 → 源」列开。 */
+export interface CapabilityInventory {
+  generated_at: string;
+  sources: Array<[CapabilitySource, CapabilitySourceReading]>;
+  entries: CapabilityEntry[];
+  /**
+   * 自报了能力的单位数。0 而名册非空，说明这一栏没人填；`null` 是名册这一拍没读到
+   * ——那时「没有人自报」无从说起，两者要采取的动作相反。
+   */
+  declaring_units: number | null;
+  /** 名册这一拍没读到的原因；`null`/缺省是读到了（含读到但没人自报）。 */
+  roster_caveat?: string;
+  /**
+   * 没有声明 `tools` 的角色：它们拿整张注册表，所以每一项都能点。`null` 是分工表
+   * 没读到，不是「没有这种角色」——后者是空数组。
+   */
+  unbounded_roles: string[] | null;
+}
+
+export async function getCapabilities(): Promise<CapabilityInventory> {
+  return api.get<CapabilityInventory>('/api/v1/capabilities');
+}
+
+// ── 产出 ──
+
+/**
+ * 一层产出这一拍读到了没有。
+ *
+ * 与能力面同一个形状：「没接」「读失败」与「读到 0 件」要采取的动作不同，折成一个数
+ * 就分不出来了。
+ */
+export type OutputLayer<T> =
+  | { state: 'measured'; value: T }
+  | { state: 'unwired'; because: string }
+  | { state: 'unread'; because: string };
+
+/** 这一窗口结束的活。`completed` 减 `with_result` 是「记账」而不是「交付」。 */
+export interface OutputWork {
+  completed: number;
+  with_result: number;
+  failed: number;
+  note?: string;
+}
+
+/** 这一窗口构建出来的东西。 */
+export interface OutputBuilds {
+  built: number;
+  total: number;
+  note?: string;
+}
+
+/**
+ * 这一窗口带着提交落地的变更。
+ *
+ * 不是提交条数：同一个提交送了几条变更就计几次。也不是同一个漏斗里的 `landed`——
+ * 那大多是「树本来就满足」的空落定，一条提交都没送出去。
+ */
+export interface OutputCommits {
+  delivered: number;
+  /** 覆盖几个 UTC 天（漏斗按天记账，窗口按小时算时向上取整）。 */
+  days: number;
+  note?: string;
+}
+
+/** 一条完成的活。 */
+export interface OutputDelivery {
+  id: string;
+  project: string;
+  worker?: string;
+  finished_at: string;
+  carried_result: boolean;
+  result_excerpt?: string;
+}
+
+/** 一个项目这一窗口交了多少。 */
+export interface OutputProject {
+  project: string;
+  completed: number;
+  with_result: number;
+}
+
+/** 这一窗口里回来了什么。 */
+export interface OutputInventory {
+  generated_at: string;
+  window_hours: number;
+  work: OutputLayer<OutputWork>;
+  builds: OutputLayer<OutputBuilds>;
+  /** 带着提交落地的变更。没有变更账是 `unwired`，读失败是 `unread`。 */
+  commits: OutputLayer<OutputCommits>;
+  recent: OutputDelivery[];
+  by_project: OutputProject[];
+}
+
+export async function getOutputs(): Promise<OutputInventory> {
+  return api.get<OutputInventory>('/api/v1/output');
 }
 
 // ── 变更队列 ──

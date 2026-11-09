@@ -1,5 +1,6 @@
 import { AlertsView } from '@/views/AlertsView';
 import { AuditView } from '@/views/AuditView';
+import { CapabilitiesView } from '@/views/CapabilitiesView';
 import { ChangesView } from '@/views/ChangesView';
 import { CommsView } from '@/views/CommsView';
 import { DeliveryView } from '@/views/DeliveryView';
@@ -10,6 +11,7 @@ import { FlowView } from '@/views/FlowView';
 import { GovernanceView } from '@/views/GovernanceView';
 import { InboxView } from '@/views/InboxView';
 import { ObservabilityView } from '@/views/ObservabilityView';
+import { OutputView } from '@/views/OutputView';
 import { ProgressView } from '@/views/ProgressView';
 import { PeopleView } from '@/views/PeopleView';
 import { ProjectsView } from '@/views/ProjectsView';
@@ -71,6 +73,10 @@ export function ViewFor({ view }: { view: string }) {
       return <ChangesView />;
     case 'governance':
       return <GovernanceView />;
+    case 'capabilities':
+      return <CapabilitiesView />;
+    case 'output':
+      return <OutputView />;
     case 'observability':
       return <ObservabilityView />;
     case 'token':

@@ -210,6 +210,8 @@ fn state_with(
         change_ledger: None,
         key_value: key_value.map(|kv| kv as Arc<dyn cog_core::KeyValueStore>),
         external_skill_registry: None,
+        tool_registry: None,
+        skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,
         agent_pool: None,

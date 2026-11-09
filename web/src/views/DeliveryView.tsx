@@ -1,4 +1,10 @@
-import { getBuildRuns, getWorkloads, type WorkloadView } from '@/api/client';
+import {
+  getBuildGate,
+  getBuildRuns,
+  getWorkloads,
+  type BuildGateReport,
+  type WorkloadView,
+} from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
@@ -28,6 +34,10 @@ export function DeliveryView() {
   const rows = report?.workloads ?? [];
 
   const builds = useResource('构建跑次', getBuildRuns, 20_000);
+  // 槽位是宿主上的文件与内核锁，没有任何一条总线事件会在它变的时候说话：那是宿主上的
+  // 进程在拿锁，不是集群里的一次写。所以它按秒级轮询，不是「有变化才读」——一份「谁
+  // 占着」的读数晚半分钟就答不了「现在为什么不动」。
+  const gate = useResource('构建槽', getBuildGate, 5_000);
   // 两半各有各的帧：工作负载来自集群对象，一次滚动的每一步都是一次写；构建跑次
   // 来自演进进程，一次跑完就落一条。两张表在同一屏上，一次触发两半一起重读——
   // 分两次读会让上半页先变、下半页还是上一轮。
@@ -158,6 +168,15 @@ export function DeliveryView() {
         )}
       </section>
 
+      <section className="border-b border-[var(--line)]">
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">宿主构建槽</h2>
+        <BuildGatePanel
+          report={gate.data}
+          error={gate.error}
+          onRetry={gate.refresh}
+        />
+      </section>
+
       <section>
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">构建跑次</h2>
         {builds.error ? (
@@ -256,6 +275,158 @@ export function DeliveryView() {
       </section>
     </ViewFrame>
   );
+}
+
+/**
+ * 宿主构建槽：谁占着、谁排着、这台机器有多堵。
+ *
+ * 这一面存在的理由是一条具体的等待：一跑全量门、一条带内构建、另一个会话的推送同
+ * 时压在一台机器上，而「同时几条构建」这条界只有进了槽的人才受约束。此前要看这些
+ * 读数，只能在宿主上手工跑 `--who`；一份要人手动问的读数，在真正要它的时候永远不在。
+ *
+ * 三种结局分开画：`unwired` / `unread` 印服务端给的理由，绝不画成一张空表——空表
+ * 读起来是「没有构建在跑」，而这两种情形的处置是去改挂载。
+ */
+function BuildGatePanel({
+  report,
+  error,
+  onRetry,
+}: {
+  report: BuildGateReport | null;
+  error: string | null;
+  onRetry: () => void;
+}) {
+  if (error) return <ReadError what="构建槽" error={error} onRetry={onRetry} />;
+  if (!report) return <Loading what="构建槽" />;
+  if (report.state !== 'measured') {
+    return (
+      <p className="px-4 py-2 text-[11px] text-[var(--warn)]">
+        {report.why ?? `读不到构建槽（${report.dir}）`}
+      </p>
+    );
+  }
+  const held = report.slots.filter((slot) => slot.held);
+  const free = report.slots.length - held.length;
+  const reservation = report.reservation;
+  return (
+    <>
+      <Readings
+        from={{ what: '宿主构建槽', at: report.generated_at }}
+        source="GET /api/v1/delivery/build-gate"
+        caveat="位子是不是被占着由内核的锁回答，不由记录文件在不在回答：一个被复制、被遗留的文件会让空位子读成占着。压力与负载是同一瞬间从 /proc 读的，与位子同拍，否则答不了「是构建压住了这台机器，还是别的东西」。"
+      >
+        <div className="flex flex-wrap py-2">
+          <Reading
+            label="界（同时几条）"
+            value={report.bound ?? '读不到'}
+            tone={report.bound == null ? 'warn' : 'plain'}
+            note={
+              report.bound_written_secs_ago == null
+                ? '界是会动的读数，不是常量'
+                : `${formatAge(report.bound_written_secs_ago)}前重算`
+            }
+          />
+          <Reading
+            label="位子"
+            value={`${held.length} / ${report.slots.length}`}
+            tone={free === 0 ? 'warn' : 'plain'}
+            note={free === 0 ? '全占着：下一个构建要等' : `${free} 个空着`}
+          />
+          <Reading
+            label="排队的声明"
+            value={reservation ? (reservation.fresh ? reservation.who : `${reservation.who}（已过期）`) : '没人排'}
+            tone={reservation && reservation.fresh ? 'warn' : 'plain'}
+            note={
+              reservation?.renewed_secs_ago == null
+                ? `新鲜窗 ${reservation?.fresh_window_secs ?? '?'} 秒`
+                : `${formatAge(reservation.renewed_secs_ago)}前刷新 · 新鲜窗 ${reservation.fresh_window_secs} 秒`
+            }
+          />
+          <Reading label="负载" value={report.load?.load1 ?? '读不到'} note="1 分钟平均" />
+          <Reading
+            label="io 压力"
+            value={pressureValue(report, 'io')}
+            note="PSI some avg10（卡在盘上的时间占比）"
+          />
+        </div>
+      </Readings>
+      {report.slots.length === 0 ? (
+        <Empty>这个槽目录里一个位子文件都没有：不是「都空着」，是界还没发布过。</Empty>
+      ) : (
+        <Table
+          columns={[
+            {
+              key: 'name',
+              title: '位子',
+              width: '90px',
+              render: (slot) => <span className="mono text-[11px]">{slot.name}</span>,
+            },
+            {
+              key: 'held',
+              title: '状态',
+              width: '90px',
+              render: (slot) => (
+                <span style={{ color: slot.held ? 'var(--warn)' : 'var(--ok)' }}>
+                  {slot.held ? '占着' : '空着'}
+                </span>
+              ),
+            },
+            {
+              key: 'who',
+              title: '谁',
+              render: (slot) =>
+                slot.holder ? (
+                  <span className="mono text-[11px]">{slot.holder.what}</span>
+                ) : slot.unrecorded ? (
+                  <span className="text-[11px] text-[var(--muted)]">{slot.unrecorded}</span>
+                ) : (
+                  <span className="text-[11px] text-[var(--muted)]">—</span>
+                ),
+            },
+            {
+              key: 'held_for',
+              title: '占了多久',
+              width: '110px',
+              render: (slot) => (
+                <span className="mono text-[11px]">
+                  {slot.holder?.held_secs == null ? '—' : formatAge(slot.holder.held_secs)}
+                </span>
+              ),
+            },
+            {
+              key: 'pid',
+              title: 'pid',
+              width: '80px',
+              render: (slot) => (
+                <span className="mono text-[11px] text-[var(--muted)]">
+                  {slot.holder?.pid ?? '—'}
+                </span>
+              ),
+            },
+          ]}
+          rows={report.slots}
+          rowKey={(slot) => slot.name}
+        />
+      )}
+      <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+        每 5 秒重读一次：槽位是宿主上的文件与内核锁，没有总线事件会在它变的时候说话。
+        全量门与宿主上的构建都从这里拿位子；没拿到位子的那一格在门的读数里是「没判」，
+        不是「红了」。
+      </p>
+    </>
+  );
+}
+
+/** 一段秒数说成人话：读者要看的是量级，不是秒表。 */
+function formatAge(secs: number): string {
+  if (secs < 120) return `${Math.round(secs)} 秒`;
+  if (secs < 7200) return `${Math.round(secs / 60)} 分钟`;
+  return `${(secs / 3600).toFixed(1)} 小时`;
+}
+
+function pressureValue(report: BuildGateReport, resource: string): string {
+  const line = report.pressure.find((p) => p.resource === resource);
+  return line ? line.avg10 : '读不到';
 }
 
 /** 四种结局各几条。名字照抄线上的写法，图上与表里是同一串。 */

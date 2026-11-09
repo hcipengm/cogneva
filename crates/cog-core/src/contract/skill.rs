@@ -197,6 +197,24 @@ impl SkillRegistry {
 
     // ── Agent SkillConfig API ────────────────────────────────────────────────
 
+    /// Every role row in this registry, in skill id order.
+    ///
+    /// Sorted for the reason [`Self::get_all`] is: this list is turned into a
+    /// reading, and a `HashMap` hands its values back in an order that changes
+    /// with the map's history, so the same table would print in a different
+    /// order after a restart and a reader comparing two screenshots would see a
+    /// change that never happened.
+    ///
+    /// Rows, not roles: several rows may claim one role, and which of them
+    /// governs a run is [`Self::skill_for_role`]'s answer. A reader that wants
+    /// the boundary a role actually runs under resolves it through that method
+    /// rather than reading every row that names the role.
+    pub fn skill_configs(&self) -> Vec<&SkillConfig> {
+        let mut rows: Vec<&SkillConfig> = self.agent_skills.values().collect();
+        rows.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
+        rows
+    }
+
     /// Retrieve an agent skill configuration by ID.
     pub fn get_skill(&self, skill_id: &str) -> Option<&SkillConfig> {
         self.agent_skills.get(skill_id)
@@ -918,6 +936,28 @@ mod tests {
         registry.load_skills_from_dir(path).unwrap();
         assert!(registry.get_skill("planner").is_some());
         assert!(registry.get_skill("evaluator").is_some());
+    }
+
+    /// 角色行要数得全，且顺序不随哈希历史变：这一列表会被渲染成一张读数，
+    /// 同一份注册表两次读出来顺序不同，读的人会以为中间换过一批行。
+    #[test]
+    fn skill_configs_lists_every_row_in_id_order() {
+        let mut registry = SkillRegistry::new();
+        registry
+            .load_skills_from_json(
+                r#"[
+                    {"skill_id":"zeta","name":"Z","tools":[],"role_type":"generator"},
+                    {"skill_id":"alpha","name":"A","tools":["read_file"],"role_type":"planner"},
+                    {"skill_id":"mid","name":"M","tools":["run_tests"],"role_type":"evaluator"}
+                ]"#,
+            )
+            .unwrap();
+        let ids: Vec<&str> = registry
+            .skill_configs()
+            .iter()
+            .map(|row| row.skill_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["alpha", "mid", "zeta"]);
     }
 
     /// 角色 → 技能从技能数据里读，不从代码里读：清单里写死的那份会在别人

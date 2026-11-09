@@ -26,6 +26,12 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'comms', label: '通信', icon: 'comms' },
   { id: 'progress', label: '进度', icon: 'platform' },
   { id: 'changes', label: '变更', icon: 'changes' },
+  // 产出独立一面，不挂在变更上：变更记的是过程，产出记的是离开系统的结果，
+  // 一条变更可以走完全程而什么都没交出来。
+  { id: 'output', label: '产出', icon: 'output' },
+  // 能力挨着治理：工作台那格点进来就是这里，而从这一面读到的是「会什么」，
+  // 不是「谁批准」——两件事在名单上摆在一起，但不相邻的两格会被当成同一件事。
+  { id: 'capabilities', label: '能力', icon: 'capabilities' },
   { id: 'governance', label: '治理', icon: 'governance' },
   { id: 'observability', label: '观测', icon: 'observability' },
   { id: 'token', label: 'Token', icon: 'token' },

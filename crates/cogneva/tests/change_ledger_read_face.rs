@@ -610,6 +610,8 @@ fn state_with(
         change_ledger: change_ledger.map(|ledger| ledger as Arc<dyn ChangeLedgerStore>),
         key_value: None,
         external_skill_registry: None,
+        tool_registry: None,
+        skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,
         agent_pool: None,

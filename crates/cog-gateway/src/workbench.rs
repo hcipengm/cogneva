@@ -213,10 +213,13 @@ pub struct Inputs<'a> {
     /// 变更账那一段。外层 `None` 是这个部署没有变更账。
     pub changes: Option<Result<crate::progress::ChangeProgress, String>>,
     pub alerts: Option<AlertReading>,
-    /// 插件清单。外层 `None` 是没有插件注册表。
-    pub plugins: Option<Result<Vec<cog_core::PluginManifest>, String>>,
-    /// 构建跑次。外层 `None` 是没有演进管理面。
-    pub builds: Option<Result<cog_core::BuildRunsView, String>>,
+    /// 「会做什么」那一格的清单，与 `/api/v1/capabilities` 读的是同一份。
+    pub capabilities: crate::capabilities::Inventory,
+    /// 「回来了什么」那一格的读数，与 `/api/v1/output` 读的是同一份。
+    ///
+    /// 构建跑次不再单列一格原料：它已经是这份产出的一层，两处各读一次会在同一次
+    /// 请求里给出两个版本。
+    pub outputs: crate::output::Outputs,
 }
 
 // ── 投入 ────────────────────────────────────────────────────────────────────
@@ -278,26 +281,51 @@ fn invest_cell(window_hours: i64, spend: &SpendWindows) -> Cell {
 
 // ── 产出 ────────────────────────────────────────────────────────────────────
 
-fn output_cell(
-    changes: Option<&Result<crate::progress::ChangeProgress, String>>,
-    builds: Option<Result<cog_core::BuildRunsView, String>>,
-) -> Cell {
-    let main = match changes {
-        None => Reading::not_wired("这个部署没有变更账"),
-        Some(Err(e)) => Reading::unread(format!("读变更账失败：{e}")),
-        Some(Ok(p)) => Reading::number(p.settled as f64, Unit::Count),
+/// 「回来了什么」这一格：数的是这一窗口结束的活、出来的产物、带提交落地的变更。
+///
+/// 它**不**读变更账的结算数。变更账记的是过程（谁提了什么、走到哪一步），一条变更
+/// 可以走完全程而没有产出，一件产出也可以不经过变更账；把结算数当产出的主数，会把
+/// 「忙了一场」读成「交出了东西」。这一格与 `/api/v1/output` 用的是同一份读数，所以
+/// 点进去看到的数与格子上印的数不可能各说一套。
+fn output_cell(outputs: &crate::output::Outputs) -> Cell {
+    // 三态从产出面那一份读数里原样搬过来：格子与页面共用一次读，状态也就只有一份。
+    let (main, with_result, failed) = match &outputs.work {
+        crate::output::Reading::Measured { value } => (
+            Reading::number(value.completed as f64, Unit::Count),
+            Reading::number(value.with_result as f64, Unit::Count),
+            Reading::number(value.failed as f64, Unit::Count),
+        ),
+        crate::output::Reading::Unwired { because } => {
+            let one = || Reading::not_wired(because.clone());
+            (one(), one(), one())
+        }
+        crate::output::Reading::Unread { because } => {
+            let one = || Reading::unread(because.clone());
+            (one(), one(), one())
+        }
     };
 
-    let delivered = match builds {
-        None => Reading::not_wired("这个部署没有演进管理面"),
-        Some(Err(e)) => Reading::unread(format!("读构建跑次失败：{e}")),
-        Some(Ok(view)) if !view.attached => {
-            Reading::not_wired("这个进程没挂构建读数，空名单不是「没构建过」")
+    let builds = match &outputs.builds {
+        crate::output::Reading::Measured { value } => {
+            let reading = Reading::number(value.built as f64, Unit::Count);
+            match &value.note {
+                Some(note) => reading.qualified(note.clone()),
+                None => reading,
+            }
         }
-        Some(Ok(view)) => {
-            let built = view.runs.iter().filter(|r| r.outcome == "built").count();
-            Reading::number(built as f64, Unit::Count).qualified("本进程的窗口，重启清零")
+        crate::output::Reading::Unwired { because } => Reading::not_wired(because.clone()),
+        crate::output::Reading::Unread { because } => Reading::unread(because.clone()),
+    };
+
+    // 这一行不叫「提交」：它数的是带着提交落地的变更，同一个提交送了几条就计几次。
+    // 叫「提交」会让读的人以为那是提交条数，而两个数差着一次除法的量级。
+    let commits = match &outputs.commits {
+        crate::output::Reading::Measured { value } => {
+            Reading::number(value.delivered as f64, Unit::Count)
+                .qualified(format!("最近 {} 天按 UTC 天记账", value.days))
         }
+        crate::output::Reading::Unwired { because } => Reading::not_wired(because.clone()),
+        crate::output::Reading::Unread { because } => Reading::unread(because.clone()),
     };
 
     Cell {
@@ -309,19 +337,31 @@ fn output_cell(
             mid: 6,
             narrow: 12,
         },
-        href: "changes",
+        // 产出有自己的面：落在变更面上，点进去是一张讲变更怎么走的表，与格子上
+        // 「这一窗回来了多少」不是同一件事。
+        href: "output",
         main,
         rows: vec![
-            // 提交（合进主线的 commit）还没有统一读数：那是产出面自己的事，这里
-            // 写「还没接上」而不是 0。
+            // 完成不等于交付：这一行是「其中交回了东西的」。两个数合成一个，读的人
+            // 会以为每一条完成都带回了结果。
             Row {
-                label: "提交",
-                reading: Reading::not_wired("合进主线的 commit 还没有统一读数"),
+                label: "带结果",
+                reading: with_result,
                 warn: false,
             },
             Row {
-                label: "交付",
-                reading: delivered,
+                label: "失败",
+                reading: failed,
+                warn: false,
+            },
+            Row {
+                label: "构建产物",
+                reading: builds,
+                warn: false,
+            },
+            Row {
+                label: "带提交落地",
+                reading: commits,
                 warn: false,
             },
         ],
@@ -458,31 +498,54 @@ fn project_cell(
 
 // ── 能力 ────────────────────────────────────────────────────────────────────
 
-fn capability_cell(plugins: Option<&Result<Vec<cog_core::PluginManifest>, String>>) -> Cell {
-    let (main, tools) = match plugins {
-        None => (
-            Reading::not_wired("这个部署没有插件注册表"),
-            Reading::not_wired("这个部署没有插件注册表"),
-        ),
-        Some(Err(e)) => {
-            let why = format!("读插件清单失败：{e}");
-            (Reading::unread(why.clone()), Reading::unread(why))
+/// 「会做什么」这一格：数的是**动作**，不是装了几个插件。
+///
+/// 以前这里数的是插件数，主数读起来像「这个系统会这么多件事」，而一件工具都没声明
+/// 的插件也算了一件。现在它读的是能力清单本身（与 `/api/v1/capabilities` 同一份）：
+/// 主数是「能被点单的动作有几个」，分项按来源拆开——一个来源读不到时，缺的是哪一层
+/// 在分项上说，不让主数被别的来源撑住而看不出缺了一层。
+fn capability_cell(inventory: &crate::capabilities::Inventory) -> Cell {
+    use crate::capabilities::Source;
+
+    let reading_of = |source: Source| -> Reading {
+        match inventory
+            .sources
+            .iter()
+            .find(|(s, _)| *s == source)
+            .map(|(_, r)| r)
+        {
+            None => Reading::not_wired("这一层没有报读数"),
+            Some(crate::capabilities::SourceReading::Measured { entries, callable }) => {
+                // 印能调的那几个：这一格答「会做什么」。声明了没人接的名字另附一句，
+                // 否则「插件 3」会被读成三件事都能做——那正是这一格以前犯的错。
+                let reading = Reading::number(*callable as f64, Unit::Count);
+                if callable == entries {
+                    reading
+                } else {
+                    reading.qualified(format!(
+                        "这一层声明了 {entries} 项，其中 {callable} 项有调用点"
+                    ))
+                }
+            }
+            Some(crate::capabilities::SourceReading::Unwired { because }) => {
+                Reading::not_wired(because.clone())
+            }
+            Some(crate::capabilities::SourceReading::Unread { because }) => {
+                Reading::unread(because.clone())
+            }
         }
-        Some(Ok(list)) => {
-            let tools: usize = list
-                .iter()
-                .map(|p| {
-                    p.capabilities
-                        .iter()
-                        .filter(|c| matches!(c, cog_core::PluginCapability::Tool { .. }))
-                        .count()
-                })
-                .sum();
-            (
-                Reading::number(list.len() as f64, Unit::Count),
-                Reading::number(tools as f64, Unit::Count),
-            )
-        }
+    };
+
+    // 一层都没报出读数时不印 0：0 是一个读数（「查过了，一件都不会」），而这时真话
+    // 是「没量过」。主数由各层撑起来，所以它必须和各层一起说这句话。
+    let main = if inventory
+        .sources
+        .iter()
+        .any(|(_, r)| matches!(r, crate::capabilities::SourceReading::Measured { .. }))
+    {
+        Reading::number(inventory.callable_count() as f64, Unit::Count)
+    } else {
+        Reading::not_wired("三个来源都没有报出读数")
     };
 
     Cell {
@@ -494,22 +557,29 @@ fn capability_cell(plugins: Option<&Result<Vec<cog_core::PluginManifest>, String
             mid: 6,
             narrow: 12,
         },
-        href: "governance",
+        // 这一格的数来自能力清单，就该落在能力那一面；落在治理面上，点进去看到的
+        // 是一张讲责任人的表，与点它时看到的那几个数毫无关系。
+        href: "capabilities",
         main,
         rows: vec![
             Row {
-                label: "工具",
-                reading: tools,
+                label: "内建",
+                reading: reading_of(Source::Builtin),
                 warn: false,
             },
             Row {
-                label: "集成",
-                reading: Reading::not_wired("外部集成没有统一读数"),
+                label: "插件",
+                reading: reading_of(Source::Plugin),
+                warn: false,
+            },
+            Row {
+                label: "MCP",
+                reading: reading_of(Source::Mcp),
                 warn: false,
             },
             Row {
                 label: "使用次数",
-                reading: Reading::not_wired("能力还没有使用计数"),
+                reading: Reading::not_wired("能力还没有使用计数：工具跑完不写任何读数"),
                 warn: false,
             },
         ],
@@ -553,11 +623,14 @@ fn lamps(
             href: "changes",
         },
         // 「版本未滚」要读部署版本与交付版本各是哪一版，今天没有这一份读数。
+        //
+        // `href` 必须是左栏真有的那一面：写 `deploy` 时点进去是「没有叫 deploy
+        // 的这一页」——构建与部署在界面上叫 `delivery`。
         Lamp {
             id: "rollout",
             label: "版本未滚",
             reading: Reading::not_wired("版本滚动读数还没接上"),
-            href: "deploy",
+            href: "delivery",
         },
     ]
 }
@@ -572,13 +645,13 @@ pub fn build(input: Inputs<'_>) -> Workbench {
         plans,
         changes,
         alerts,
-        plugins,
-        builds,
+        capabilities,
+        outputs,
     } = input;
     let mut cells = vec![
         invest_cell(window_hours, &spend),
-        output_cell(changes.as_ref(), builds),
-        capability_cell(plugins.as_ref()),
+        output_cell(&outputs),
+        capability_cell(&capabilities),
         project_cell(tasks, plans, generated_at),
     ];
     cells.sort_by_key(|c| c.priority);
@@ -639,15 +712,9 @@ pub async fn read(state: &GatewayState) -> Workbench {
             },
         });
 
-    let plugins = match state.plugin_registry.as_ref() {
-        None => None,
-        Some(registry) => Some(
-            registry
-                .discover(&cog_core::paths::app_path_str("plugins"))
-                .await
-                .map_err(|e| e.to_string()),
-        ),
-    };
+    // 插件清单不再单独读一遍：能力清单（`crate::capabilities::read`）已经把三个
+    // 来源一起读了，两处各读一次会让同一份磁盘在同一次请求里给出两个版本。
+    let capabilities = crate::capabilities::read(state).await;
 
     let builds = match state.evolution_admin.as_ref() {
         None => None,
@@ -659,6 +726,27 @@ pub async fn read(state: &GatewayState) -> Workbench {
         ),
     };
 
+    // 漏斗与产出面读的是同一栏，天数也从同一个函数取：读的是一周、格子上标的是三天
+    // 时，两个数覆盖的范围不一样，而两边都不会报错。
+    let funnel = match state.change_ledger.as_ref() {
+        None => None,
+        Some(ledger) => Some(
+            ledger
+                .funnel(crate::output::funnel_days(window_hours))
+                .await,
+        ),
+    };
+
+    // 产出那一格与产出面共用这一次读：任务图与构建跑次各读两遍，会在同一次请求里
+    // 给出两个版本，而格子与页面就在同一屏上。
+    let outputs = crate::output::build(crate::output::Inputs {
+        now,
+        window_hours,
+        tasks: tasks.as_deref(),
+        builds: builds.as_ref(),
+        funnel: funnel.as_ref(),
+    });
+
     build(Inputs {
         generated_at: now,
         window_hours,
@@ -667,8 +755,8 @@ pub async fn read(state: &GatewayState) -> Workbench {
         plans: plans.as_ref(),
         changes,
         alerts,
-        plugins,
-        builds,
+        capabilities,
+        outputs,
     })
 }
 
@@ -745,8 +833,8 @@ mod tests {
             plans: None,
             changes: None,
             alerts: None,
-            plugins: None,
-            builds: None,
+            capabilities: Default::default(),
+            outputs: Default::default(),
         }
     }
 

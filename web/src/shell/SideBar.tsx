@@ -111,6 +111,8 @@ const TITLES: Record<ActivityId, string> = {
   alerts: '告警',
   progress: '进度',
   changes: '变更',
+  capabilities: '能力',
+  output: '产出',
   governance: '治理',
   observability: '观测',
   token: 'Token',
@@ -468,6 +470,60 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             links={[
               { id: 'governance', label: '治理', note: '面的判词' },
               { id: 'observability', label: '观测', note: '部署有没有跟上' },
+            ]}
+          />
+        </>
+      );
+
+    case 'capabilities':
+      return (
+        <>
+          <Section title="这一面怎么读">
+            <Row label="一件动作一行" note="能被点单的名字，不是装了几个插件" />
+            <Row label="同名不同源" note="内建 / 插件 / MCP 各占一行" />
+            <Row label="调用点" note="在＝按名字点单会真的跑；「只声明」点了落空" />
+            <Row
+              label="谁能点它"
+              note="分工表里点了名的角色；没有声明 tools 的角色能点每一项，不摊在这一栏"
+            />
+            <Row label="要什么参数" note="schema 里声明的必填与总数；「清单没给」不是「不要参数」" />
+            <Row label="跑在哪" note="进程内 / WASM 沙箱 / 远端执行器——它决定做砸了长什么样" />
+            <Row label="点过几次" note="只数这一台进程，重启清零；「这一层没计数」不是 0" />
+            <Row label="自报持有" note="名册里说自己会它的单位，空着就是没人这么自报" />
+            <Row label="破折号" note="这一层没接上，或者这一拍读失败了" />
+          </Section>
+          <Note>
+            来源那一层印的是条数还是破折号，决定这一屏能不能当结论读：破折号说的是缺哪一层，不是零项能力。
+          </Note>
+          <CrossLinks
+            links={[
+              { id: 'governance', label: '治理', note: '谁批准、按什么判据' },
+              { id: 'people', label: '员工', note: '自报的人此刻在不在岗' },
+            ]}
+          />
+        </>
+      );
+
+    case 'output':
+      return (
+        <>
+          <Section title="这一面怎么读">
+            <Row label="结束的活" note="这一窗走到 Completed 的任务，不是变更的结算数" />
+            <Row label="带结果" note="其中交回了 result 的；减去它是「记账」" />
+            <Row label="构建产物" note="本进程窗口里结局是 built 的跑次，重启清零" />
+            <Row
+              label="带提交落地的变更"
+              note="变更账漏斗里落定带了提交的那一栏；按 UTC 天记账，不是提交条数"
+            />
+          </Section>
+          <Note>
+            完成不等于交付：一条完成但没有 result 的行只记了一次结束，明细里单独标出来。
+            窗口按任务的 updated_at 划，边上可能多算进一条相邻窗口的活，不会漏。
+          </Note>
+          <CrossLinks
+            links={[
+              { id: 'changes', label: '变更', note: '过程：谁提了什么、走到哪一步' },
+              { id: 'delivery', label: '构建与部署', note: '滚上去的是哪一版' },
             ]}
           />
         </>

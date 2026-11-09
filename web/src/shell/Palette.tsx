@@ -222,6 +222,8 @@ export function Palette() {
       go('tasks', '这件事排到哪一步了？', VIEW_TITLES.tasks),
       go('comms', '谁把活交给了谁？断在哪一环？', VIEW_TITLES.comms),
       go('changes', '我提的改动是怎么进到集群里的？', VIEW_TITLES.changes),
+      go('capabilities', '这套系统现在会做哪些事？', VIEW_TITLES.capabilities),
+      go('output', '这一段时间交出了什么？', VIEW_TITLES.output),
       go('governance', '哪条规则把我挡下来了？', VIEW_TITLES.governance),
       go('audit', '这一屏的数字能追到源头吗？', VIEW_TITLES.audit),
       go('alerts', '现在有什么在报警？', VIEW_TITLES.alerts),

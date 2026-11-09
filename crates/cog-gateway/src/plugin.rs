@@ -179,6 +179,16 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let mcp_client: Option<Arc<dyn cog_core::McpClient>> =
             ctx.consume_service::<dyn cog_core::McpClient>();
         let external_skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
+        // The tools this process was built with, published by `cog-agent`. Held
+        // rather than rebuilt: a second list of built-ins here would answer
+        // "which tools exist" twice, and the copy that drifts is the one nobody
+        // looks at.
+        let tool_registry: Option<Arc<dyn cog_core::ToolRegistry>> =
+            ctx.consume_service::<dyn cog_core::ToolRegistry>();
+        // The role table the runtime narrows a run against. Read rather than
+        // rebuilt: a second copy of "which role may call what" would be the
+        // copy that drifts, and it is the one nobody runs under.
+        let skill_registry = ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
         let event_publisher: Option<Arc<dyn cog_core::EventPublisher>> =
             downstream_event_publisher(ctx);
         let websocket_client: Option<Arc<dyn cog_core::WebSocketClient>> =
@@ -285,6 +295,8 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             observables,
             &mcp_client,
             &external_skill_registry,
+            &tool_registry,
+            &skill_registry,
             &agent_pool,
             &message_backend,
             &event_publisher,
