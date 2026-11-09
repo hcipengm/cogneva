@@ -2212,6 +2212,29 @@ async fn adopt_owned_alerts(
     }
 }
 
+/// Whether a row is the anchor a project's work hangs from rather than a
+/// placeholder a decomposition left behind.
+///
+/// Both are non-executable and childless, so the orphan classifier cannot tell
+/// them apart by shape. What separates them is what they are for: a placeholder
+/// is the residue of a decomposition that persisted no children and nothing
+/// will ever finish it, while an anchor is re-filed under a stable id on every
+/// round and is childless only between filings. Terminating an anchor buys no
+/// runnable row -- the next filing puts the same row back and the next scan
+/// reaps it again, one reap and one alert per stall window -- and a row that is
+/// filed again never settles, which is the condition this loop retires an alert
+/// on. The row says which it is: the filer stamps the anchor kind into
+/// `task_kind`.
+fn is_project_anchor(task: &Task) -> bool {
+    // `cog_reflection::signal_watcher::SIGNAL_PROJECT_ROOT_KIND`: the kind the
+    // signal watcher writes on the row that anchors one of its projects.
+    const ANCHOR_TASK_KIND: &str = "self_signal_project";
+    task.input
+        .get(cog_core::INPUT_TASK_KIND)
+        .and_then(|value| value.as_str())
+        .is_some_and(|kind| kind == ANCHOR_TASK_KIND)
+}
+
 /// One reconciler pass. Split out as a free function so the adoption/firing
 /// bookkeeping stays testable without a running timer.
 async fn orphan_reconcile_tick(
@@ -2225,6 +2248,11 @@ async fn orphan_reconcile_tick(
     let orphans = orchestrator.find_decomposition_orphans(stall_before).await;
     let mut fired_this_tick = Vec::new();
     for orphan in orphans {
+        // An anchor is childless between filings by design and is filed again
+        // under the same id, so reaping it only buys the next round another reap.
+        if is_project_anchor(&orphan) {
+            continue;
+        }
         let goal_id = orphan.goal_id.as_deref().unwrap_or("-");
         let task_id = orphan.id.clone();
         let dedup_key = format!(
@@ -2291,6 +2319,11 @@ async fn orphan_reconcile_tick(
             continue;
         }
         let task = orchestrator.get_task(&watch.parent_id).await;
+        // An anchor is re-filed every round and never settles, so it is not a
+        // placeholder anything is waiting on: retire the row rather than leave
+        // it firing on a verdict -- "nothing will ever finish this" -- that is
+        // not true of it.
+        let anchor = matches!(task.as_ref(), Some(t) if is_project_anchor(t));
         let done = match task {
             Some(t) => matches!(
                 t.status,
@@ -2311,7 +2344,7 @@ async fn orphan_reconcile_tick(
         let stale = !done
             && key.split(':').next() == Some(cog_core::ALERT_RULE_DECOMPOSITION_WBS)
             && wbs_verdict_no_longer_holds(orchestrator, watch.goal_id.as_deref()).await;
-        if done || stale {
+        if done || anchor || stale {
             resolved.push(key.clone());
         }
     }
