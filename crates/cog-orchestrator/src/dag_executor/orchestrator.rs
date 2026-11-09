@@ -257,6 +257,17 @@ impl LaneTally {
     }
 }
 
+/// 一次「放回队列」要说的失败本身：文本、上游的类型、谁付账。
+///
+/// 这三样永远一起出现。把它们摆成三个位置参数时，每多一个失败维度签名就长一格
+/// ——`payer` 进来那次正好把它顶过了 clippy 的上限。合成一个值之后，再加维度
+/// 改的是这里和三个构造点，不是每一处调用的参数顺序。
+struct RequeueFailure<'a> {
+    error: &'a str,
+    cause: Option<UpstreamFailure>,
+    payer: Option<FailureCause>,
+}
+
 /// Flatten one sweep's per-lane tallies into the cells it writes.
 ///
 /// Kept pure and separate from the recorder so the attribution can be read
@@ -1780,9 +1791,11 @@ impl DagExecutor {
                 let requeued = self
                     .requeue_without_charge_store(
                         task_id,
-                        &error,
-                        None,
-                        None,
+                        RequeueFailure {
+                            error: &error,
+                            cause: None,
+                            payer: None,
+                        },
                         None,
                         &[
                             TaskStatus::Pending,
@@ -1804,9 +1817,11 @@ impl DagExecutor {
             let requeued = self
                 .requeue_without_charge_store(
                     task_id,
-                    &error,
-                    cause,
-                    payer,
+                    RequeueFailure {
+                        error: &error,
+                        cause,
+                        payer,
+                    },
                     retry_after_secs,
                     // 能落上的是"还欠一轮"的那几种状态：报告通常在 Running
                     // 到达，也可能晚于一次回收（那时行已经是 Pending），或者
@@ -1952,9 +1967,11 @@ impl DagExecutor {
                 match self
                     .requeue_without_charge_store(
                         &t.id,
-                        &cause.error(),
-                        None,
-                        None,
+                        RequeueFailure {
+                            error: &cause.error(),
+                            cause: None,
+                            payer: None,
+                        },
                         None,
                         &[TaskStatus::Running],
                         None,
@@ -2074,9 +2091,7 @@ impl DagExecutor {
     async fn requeue_without_charge_store(
         &self,
         task_id: &str,
-        error: &str,
-        cause: Option<UpstreamFailure>,
-        payer: Option<FailureCause>,
+        failure: RequeueFailure<'_>,
         retry_after_secs: Option<u64>,
         expected: &[TaskStatus],
         plant: Option<&GuardrailRefusal>,
@@ -2117,7 +2132,8 @@ impl DagExecutor {
                 "the upstream has paid for this task's failures many times over; waiting longer before the next turn so it stops taking a slice of a window it cannot finish in"
             );
         }
-        let next = Self::requeued_without_charge(&cur, error, cause, payer, delay);
+        let next =
+            Self::requeued_without_charge(&cur, failure.error, failure.cause, failure.payer, delay);
         let next = match plant {
             Some(refusal) => match Self::with_the_refusal_planted(next, refusal) {
                 Some(planted) => planted,
