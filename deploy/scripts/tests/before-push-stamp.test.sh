@@ -718,4 +718,63 @@ git -C "${btree}" rebase -q refs/remotes/origin/main >"${work}/brebase" 2>&1 ||
 ( cd "${btree}" && "${bt_env[@]}" bash deploy/scripts/check-before-push.sh --status-patch ) >"${work}/bout4" 2>&1 ||
     fail "变基到远端新基底之后改动键不再命中：这才是这一格要防的白跑；$(cat "${work}/bout4")"
 
-echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效，远端在跑期间追上了这一支时按新基底重记而不是作废、并且变基之后照样命中；键不取决于调用方的 PATH 里有没有 cargo"
+# 20) 第三种形状：远端在这跑期间**含了这一支自己**（远端涨到了 HEAD），工作树干净。
+#     这时从新基底（= HEAD）到工作树是一份空 diff，patch-id 本来就是空的。上一版在这一
+#     形状下先印「改动键按新基底重记（）」——括号里什么都没有——再印一句「没有共同祖先，
+#     或临时索引写不了」。读的人会照着后一句去查共同祖先、去查临时索引，而两样都不缺；
+#     真正的事实是「没有要补的那一段」。这一格钉三件事：两种话分得开、不印空的键、
+#     这一跑照常退出 0（判词照旧有效，只是没有改动键）。
+ctree="${work}/ctree"
+mkdir -p "${ctree}/deploy/scripts/tests" "${ctree}/.github/workflows" "${ctree}/.github/scripts/tests" "${ctree}/bin"
+stage_gate "${repo}" "${ctree}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/.github/scripts/tests/ok.test.sh"
+printf 'Write-Host "fixture"\n' >"${ctree}/bootstrap.ps1"
+cp "${btree}/bin/cargo" "${ctree}/bin/cargo"
+chmod +x "${ctree}/bin/cargo"
+# 远端在这一跑期间涨到 HEAD 自己：别人把这一支推上去了。只动 `.git` 里的引用，
+# 工作树与真索引一个字节都不碰。
+cat >"${ctree}/catch-up.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+git update-ref refs/remotes/origin/main HEAD
+SH
+cat >"${ctree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: a peer pushes this very branch while the gate is judging it
+        run: bash catch-up.sh
+YAML
+(
+    cd "${ctree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    git add tracked.txt catch-up.sh .github/workflows/ci.yml bootstrap.ps1 \
+        deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
+        deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh \
+        deploy/scripts/*.py bin/cargo
+    git commit -q -m base
+    # 起跑时远端在 C0、HEAD 在 C1：开跑那把改动键非空，收尾没东西可算。
+    git update-ref refs/remotes/origin/main HEAD
+    printf 'two\n' >second.txt
+    git add second.txt
+    git commit -q -m second
+)
+ct_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/ctree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/ctree.lock"
+    PATH="${ctree}/bin:${PATH}")
+( cd "${ctree}" && "${ct_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/cout" 2>&1 ||
+    fail "远端已经含了这一支的那一跑自己红了：没有改动可判不等于判过的那份字节变红了；$(cat "${work}/cout")"
+grep -q '改动键按新基底重记' "${work}/cout" &&
+    fail "远端已经含了这一支，仍按新基底重记改动键（那意味着印了个空的键）；实得：$(grep '记账' "${work}/cout")"
+grep -q '算不出改动键' "${work}/cout" &&
+    fail "空 diff 被说成「算不出改动键」：共同祖先与临时索引都在，缺的是可判的改动；实得：$(grep '记账' "${work}/cout")"
+grep -q '远端在这跑期间已经含了这一支' "${work}/cout" ||
+    fail "收尾没说「远端已经含了这一支」；实得：$(grep '记账' "${work}/cout")"
+grep -q '没有改动键可记' "${work}/cout" ||
+    fail "收尾没把「没有要推的那一段」说成一句自己的话；实得：$(grep '记账' "${work}/cout")"
+
+echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效，远端在跑期间追上了这一支时按新基底重记而不是作废、并且变基之后照样命中；远端已经含了这一支时说的是「没有改动可判」而不是「算不出」；键不取决于调用方的 PATH 里有没有 cargo"

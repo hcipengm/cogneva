@@ -1,7 +1,12 @@
-# Build output
-target/
-node_modules/
-dist/
+# Build output. No trailing slash on these three: a trailing slash matches only a
+# directory, and in a git worktree `web/node_modules` is typically a symlink to the
+# main checkout's copy -- which then reads as an untracked file, enters `git add -A`
+# and every work-tree key computed over it. Measured 2026-11-10: one such symlink
+# made the pre-push gate's patch key unforgeable by the committed bytes (7 files
+# judged, 8 in the delta), so a green run could not be claimed by the push.
+target
+node_modules
+dist
 
 # Local runtime config (template: cogneva.example.json)
 cogneva.json

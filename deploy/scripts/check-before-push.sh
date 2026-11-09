@@ -969,6 +969,28 @@ echo "Version Contract / Web Build / Bootstrap Cross-Platform。"
 mkdir -p "${stamp_dir}" 2>/dev/null
 ckey="$(content_key)"
 pkey="$(patch_key)"
+# 「算不出改动键」与「没有改动可判」是两句话，读它们的人会去查不同的东西。共同祖先涨到了
+# HEAD（远端已经含了这一支）、工作树又干净时，从基底到工作树本来就没有 diff，patch-id 是
+# 空的——这不是读不出来，是没东西可读。2026-11-10 实测：这一形状记不上改动键，印的却是
+# 「没有共同祖先，或临时索引写不了」，于是下一个人去查那把根本不缺的东西。
+# 判据是**两个树对象相等**，用的就是这一跑自己那套定位工作树的办法（`add -A` 进临时索引），
+# 不是另起一套更松的「脏不脏」：脏不脏问的是相对 HEAD，而这里问的是相对基底，两者在
+# 「远端已经含了这一支」时不是一回事。
+patch_why=""
+if [ -z "${pkey}" ]; then
+    base_probe="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+    if [ -n "${base_probe}" ]; then
+        wtree="$(work_tree_oid)"
+        btree_obj="$(git rev-parse --verify "${base_probe}^{tree}" 2>/dev/null || true)"
+        if [ -n "${wtree}" ] && [ -n "${btree_obj}" ] && [ "${wtree}" = "${btree_obj}" ]; then
+            patch_why="no-diff"
+        else
+            patch_why="unreadable"
+        fi
+    else
+        patch_why="unreadable"
+    fi
+fi
 # 开跑时那把指纹与现在这把对不上，说明中间有人动过树：现在这份字节没有被这一跑判过，
 # 两把键都不记。判词本身照常留在输出里——它说的是开跑那棵树。
 moved=0
@@ -1011,7 +1033,11 @@ elif [ "${base_moved}" -ne 0 ]; then
     # 旁支型前进（远端落了与 HEAD 无关的一笔）不会走到这里：那种情况下共同祖先一个位没动，
     # 改动键也一个位没动。这条边界值得写下来，否则下一个人会把「远端动了」当成触发器。
     moved=1
-    echo "记账：远端在这跑期间往前走了（基底 ${start_base:0:12} → ${base_now:0:12}），判过的字节没变，改动键按新基底重记（${pkey:0:12}）。" >&2
+    if [ -z "${pkey}" ] && [ "${patch_why}" = "no-diff" ]; then
+        echo "记账：远端在这跑期间已经含了这一支（基底 ${start_base:0:12} → ${base_now:0:12}），从新基底到工作树没有 diff，没有改动键可记；这一推没有要补的那一段。" >&2
+    else
+        echo "记账：远端在这跑期间往前走了（基底 ${start_base:0:12} → ${base_now:0:12}），判过的字节没变，改动键按新基底重记（${pkey:0:12}）。" >&2
+    fi
 elif [ -n "${start_pkey}" ] && [ -n "${pkey}" ] && [ "${pkey}" != "${start_pkey}" ]; then
     # 基底没动、改动键却变了：变的是这批改动本身（判过的那批不是你手上这批）。
     voided_patch=1
@@ -1032,6 +1058,8 @@ fi
 # 提交只是把同样的字节换个名字（工作树 → 提交），patch-id 不变。所以这一笔在脏树上也记。
 if [ "${voided_patch}" -ne 0 ]; then
     :
+elif [ -z "${pkey}" ] && [ "${patch_why}" = "no-diff" ]; then
+    echo "记账：没有改动键可记——远端已含这一支、工作树干净，从基底到工作树没有 diff，这批改动没有要推的那一段。"
 elif [ -z "${pkey}" ]; then
     echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
 elif printf '%s %s（改动，基底 %s）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
