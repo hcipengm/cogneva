@@ -36,6 +36,10 @@ pub fn statements() -> Vec<String> {
         cog_storage::postgres::taste_intent_store::DDL.to_string(),
         cog_storage::postgres::metrics_backend::DDL.to_string(),
         cog_storage::postgres::state_backend::ddl(),
+        // The attempt journal is what a resumed attempt reads back; a restore
+        // that rebuilt every other table but this one would leave the first
+        // COPY of that journal with nowhere to land.
+        cog_storage::postgres::attempt_journal_store::DDL.to_string(),
         cog_storage::postgres::observability_gateway::OBSERVABILITY_DDL.to_string(),
         cog_storage::owner_lease::DDL.to_string(),
         cog_observability::alert_store::ddl(),
@@ -107,6 +111,7 @@ mod tests {
         include_str!("../../cog-storage/src/postgres/taste_intent_store.rs"),
         include_str!("../../cog-storage/src/postgres/metrics_backend.rs"),
         include_str!("../../cog-storage/src/postgres/state_backend.rs"),
+        include_str!("../../cog-storage/src/postgres/attempt_journal_store.rs"),
         include_str!("../../cog-storage/src/postgres/observability_gateway.rs"),
         include_str!("../../cog-storage/src/owner_lease.rs"),
         include_str!("../../cog-observability/src/alert_store.rs"),
