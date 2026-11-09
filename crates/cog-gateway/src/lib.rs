@@ -86,6 +86,7 @@ pub mod secret_layout;
 pub mod secret_write;
 pub mod security_gateway;
 pub mod sessions;
+pub mod source_line;
 pub mod spend_reading;
 pub mod state;
 pub mod state_builder;
@@ -1129,6 +1130,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/delivery/build-gate",
             get(buildgate::build_gate_handler),
+        )
+        // 链路的另外两格：一次改动从哪条分支出发（编辑），以及主线走到了哪个字节
+        // （推送）。这两句只有共享裸仓库答得出来，而它已经挂在这个进程里了。
+        .route(
+            "/api/v1/delivery/source-line",
+            get(source_line::source_line_handler),
         )
         .route(
             "/api/v1/governance/principles",

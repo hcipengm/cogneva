@@ -323,6 +323,11 @@ pub struct ConditionView {
     pub ok: bool,
     pub reason: Option<String>,
     pub message: Option<String>,
+    /// 这条状态从什么时候起是这样的。
+    ///
+    /// 滚动卡住时「卡了多久」只有这一格答得出来：采集时刻答的是「我什么时候看它」，
+    /// 一个停了三小时的滚动与一个刚开始的滚动，在采集时刻上长得一模一样。
+    pub last_transition_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1578,6 +1583,10 @@ fn conditions_of(object: &Value) -> Vec<ConditionView> {
                             .get("message")
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        last_transition_at: condition
+                            .get("lastTransitionTime")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     })
                 })
                 .collect()
@@ -2494,6 +2503,37 @@ mod topology_tests {
                 "allocatable": { "cpu": cpu, "memory": memory, "pods": "110" }
             }
         })
+    }
+
+    /// 「这条状态从什么时候起」只有条件自己带得出来。采集时刻答不了「卡了多久」：
+    /// 一个停了三小时的滚动与一个刚开始的滚动，在采集时刻上长得一模一样。
+    #[test]
+    fn a_condition_carries_the_moment_it_became_what_it_says() {
+        let deployment = json!({
+            "metadata": { "name": "cogneva", "namespace": "cogneva" },
+            "status": {
+                "conditions": [{
+                    "type": "Available",
+                    "status": "True",
+                    "lastTransitionTime": "2026-11-09T19:12:33Z",
+                    "reason": "MinimumReplicasAvailable"
+                }]
+            }
+        });
+        let conditions = conditions_of(&deployment);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].kind, "Available");
+        assert_eq!(
+            conditions[0].last_transition_at.as_deref(),
+            Some("2026-11-09T19:12:33Z"),
+            "条件自带的那一刻要原样交出来，别换成采集时刻"
+        );
+
+        // 不带这一格的条件：缺席，不是一个造出来的时刻。
+        let without = json!({
+            "status": { "conditions": [{ "type": "Available", "status": "True" }] }
+        });
+        assert_eq!(conditions_of(&without)[0].last_transition_at, None);
     }
 
     fn pod(name: &str, on_node: Option<&str>, cpu: &str, memory: &str) -> serde_json::Value {

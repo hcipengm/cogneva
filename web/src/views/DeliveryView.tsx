@@ -1,9 +1,13 @@
 import {
   getBuildGate,
   getBuildRuns,
+  getSourceLine,
   getWorkloads,
   type BuildGateReport,
+  type BuildRunsView,
+  type SourceLineReport,
   type WorkloadView,
+  type WorkloadsReport,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
@@ -38,6 +42,9 @@ export function DeliveryView() {
   // 进程在拿锁，不是集群里的一次写。所以它按秒级轮询，不是「有变化才读」——一份「谁
   // 占着」的读数晚半分钟就答不了「现在为什么不动」。
   const gate = useResource('构建槽', getBuildGate, 5_000);
+  // 源线同样来自宿主上的文件（共享裸仓库），没有任何总线事件会在引用移动时说话。
+  // 与槽同一档的理由：一份「推上去没有」的读数晚半分钟就答不了「现在为什么不动」。
+  const line = useResource('源线', getSourceLine, 15_000);
   // 两半各有各的帧：工作负载来自集群对象，一次滚动的每一步都是一次写；构建跑次
   // 来自演进进程，一次跑完就落一条。两张表在同一屏上，一次触发两半一起重读——
   // 分两次读会让上半页先变、下半页还是上一轮。
@@ -56,11 +63,16 @@ export function DeliveryView() {
   // 「滚到位」只问那些真有目标副本的工种：CronJob 没有副本，把它算进分母会让这格
   // 永远差一个。新版本数缺席的工种（Job）只看就绪那一边，不当成零。
   const rolling = rows.filter((d) => d.desired != null);
-  const rolled = rolling.filter(
-    (d) =>
-      (d.ready ?? 0) >= (d.desired ?? 0) && (d.updated == null || d.updated >= (d.desired ?? 0))
-  );
+  const rolled = rolling.filter(isRolled);
   const stuck = rows.filter((d) => d.conditions.some(conditionIsTrouble));
+  const chain = chainNodes({
+    line: line.data,
+    lineError: line.error,
+    gate: gate.data,
+    gateError: gate.error,
+    builds: view ?? null,
+    workloads: report,
+  });
 
   return (
     <ViewFrame
@@ -71,6 +83,12 @@ export function DeliveryView() {
           : '按 15 秒重读'
       }
     >
+      <section className="border-b border-[var(--line)]">
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">链路</h2>
+        <ChainPanel nodes={chain} />
+        <BranchLineTable line={line.data} error={line.error} onRetry={line.refresh} />
+      </section>
+
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">工作负载</h2>
         {workloads.error ? (
@@ -494,6 +512,428 @@ function Replicas({ workload }: { workload: WorkloadView }) {
     <span className="mono text-[11px]" style={{ color: !ended && ready < workload.desired ? 'var(--warn)' : undefined }}>
       {ready} / {workload.desired}
     </span>
+  );
+}
+
+/**
+ * 一次改动从编辑到现网的五个环节，每格五句话：状态、结论、依据、归属、从何时起。
+ *
+ * 为什么不是七格：流程上「提交」与「推前自检」都在同一棵工作树里、由同一个人在同一段
+ * 时间里做完，它们的读数与「编辑」那一格是同一份（分支尖端 + 槽位记录），拆成三格会
+ * 让同一件事在页面上显示成三段互不相干的进度。合并的是**读数相同**的格子，不是环节
+ * 本身——依据那一列写着每格读的是哪一个接口，合并之后也还看得见。
+ *
+ * 每一格读不到的处置都写在结论里，而不是画成一个 0：这份链路的用处就是让人一眼看出
+ * 「卡在哪一环」，而一格空白与一格「读不到」在这件事上是两个完全不同的答案。
+ */
+interface ChainNode {
+  id: string;
+  stage: string;
+  state: 'ok' | 'running' | 'waiting' | 'stuck' | 'unknown';
+  verdict: string;
+  evidence: string;
+  owner?: string;
+  sinceSecs?: number;
+  /** 没有「从何时起」这个读数时，这里说明为什么没有。 */
+  sinceNote?: string;
+  /** 结论之外还要说的一句：例如「这一格不覆盖谁」。不写就会让它读成「没有」。 */
+  aside?: string;
+}
+
+function chainNodes({
+  line,
+  lineError,
+  gate,
+  gateError,
+  builds,
+  workloads,
+}: {
+  line: SourceLineReport | null;
+  lineError: string | null;
+  gate: BuildGateReport | null;
+  gateError: string | null;
+  builds: BuildRunsView | null;
+  workloads: WorkloadsReport | null;
+}): ChainNode[] {
+  return [
+    editNode(line, lineError),
+    gateNode(gate, gateError),
+    buildNode(builds),
+    pushNode(line, lineError),
+    deployNode(workloads),
+  ];
+}
+
+const SOURCE_LINE_EVIDENCE = 'GET /api/v1/delivery/source-line';
+
+function editNode(line: SourceLineReport | null, error: string | null): ChainNode {
+  const base = { id: 'edit', stage: '编辑', evidence: SOURCE_LINE_EVIDENCE };
+  if (error) {
+    return { ...base, state: 'unknown', verdict: `读不到源线：${error}`, sinceNote: '没有读数' };
+  }
+  if (!line) return { ...base, state: 'unknown', verdict: '还在读源线', sinceNote: '没有读数' };
+  if (line.state !== 'measured') {
+    return {
+      ...base,
+      state: 'unknown',
+      verdict: line.why ?? '共享裸仓库读不到',
+      sinceNote: '没有读数',
+    };
+  }
+  // 最近动过的那条分支就是此刻有人在编辑的那一条。main 自己也在这张表里，但它是
+  // 「推送」那一格的归属，拿它当「编辑」会把主线的最新一次合并读成有人正在改。
+  const tips = line.branches
+    .filter((branch) => branch.name !== 'main')
+    .sort((a, b) => (a.committed_secs_ago ?? Infinity) - (b.committed_secs_ago ?? Infinity));
+  const tip = tips[0] ?? line.branches[0];
+  if (!tip) {
+    return { ...base, state: 'unknown', verdict: '裸仓库里一条分支都没有', sinceNote: '没有读数' };
+  }
+  // 「还有几条分支最近有提交」是这一格的全部用处：属主要的不是一个名字，是
+  // 「台上现在有几棵树在动」。一条与三条在结论那一句里必须读得出来。
+  const others = tips.length > 1 ? `（另有 ${tips.length - 1} 条分支最近有提交）` : '';
+  return {
+    ...base,
+    state: 'ok',
+    verdict: `${tip.name} 的尖端：${tip.subject}${others}`,
+    owner: tip.name,
+    sinceSecs: tip.committed_secs_ago,
+  };
+}
+
+function gateNode(gate: BuildGateReport | null, error: string | null): ChainNode {
+  const base = { id: 'gate', stage: '编译与测', evidence: 'GET /api/v1/delivery/build-gate' };
+  if (error) {
+    return { ...base, state: 'unknown', verdict: `读不到构建槽：${error}`, sinceNote: '没有读数' };
+  }
+  if (!gate) return { ...base, state: 'unknown', verdict: '还在读构建槽', sinceNote: '没有读数' };
+  if (gate.state !== 'measured') {
+    return { ...base, state: 'unknown', verdict: gate.why ?? '构建槽读不到', sinceNote: '没有读数' };
+  }
+  if (gate.slots.length === 0) {
+    return { ...base, state: 'unknown', verdict: '槽目录里一个位子文件都没有：界还没发布过', sinceNote: '没有读数' };
+  }
+  // 界之外的构建方：它不在槽位里是对的，但「不在槽位里」读不出「它有自己的界」。
+  // 不写这一行，一个在 pod 里跑编译的执行器与「没人在编译」在这张表上同形。
+  const aside =
+    gate.outside_the_bound.length > 0
+      ? `界之外：${gate.outside_the_bound.map((o) => `${o.who}（${o.why}）`).join('；')}`
+      : undefined;
+  const held = gate.slots.filter((slot) => slot.held);
+  if (held.length === 0) {
+    return {
+      ...base,
+      state: 'ok',
+      verdict: `槽空着（${gate.slots.length} 个位子）：没有编译在跑`,
+      sinceNote: '空着，没有起点',
+      aside,
+    };
+  }
+  const first = held[0];
+  return {
+    ...base,
+    state: 'running',
+    verdict: `${held.length} / ${gate.slots.length} 个位子在做编译`,
+    owner: first.holder?.what ?? first.unrecorded ?? '有人占着但没留记录',
+    sinceSecs: first.holder?.held_secs,
+    sinceNote: first.holder?.held_secs == null ? '持有者没留下起始时刻' : undefined,
+    aside,
+  };
+}
+
+function buildNode(builds: BuildRunsView | null): ChainNode {
+  const base = { id: 'build', stage: '镜像构建', evidence: 'GET /api/v1/evolution/builds' };
+  if (!builds) return { ...base, state: 'unknown', verdict: '这个进程没挂构建读数', sinceNote: '没有读数' };
+  if (!builds.attached) {
+    return { ...base, state: 'unknown', verdict: '没挂构建读数：0 行不是「没构建过」，是没人报', sinceNote: '没有读数' };
+  }
+  if (builds.runs.length === 0) {
+    return { ...base, state: 'unknown', verdict: '挂了读数，但启动以来还没有构建过', sinceNote: '没有读数' };
+  }
+  // 这个窗口按结束顺序留着，取 `at` 最新的那一条——同一秒的两次尝试也要有确定答案。
+  const latest = builds.runs.reduce((newest, run) =>
+    Date.parse(run.at) >= Date.parse(newest.at) ? run : newest
+  );
+  const ageSecs = Math.max(0, (Date.now() - Date.parse(latest.at)) / 1000);
+  const seconds = latest.seconds == null ? '没跑，没有耗时' : `${latest.seconds.toFixed(1)} 秒`;
+  return {
+    ...base,
+    state: latest.outcome === 'built' ? 'ok' : 'stuck',
+    verdict: `${latest.outcome} · ${seconds}`,
+    owner: latest.change_id,
+    sinceSecs: Number.isFinite(ageSecs) ? ageSecs : undefined,
+    sinceNote: Number.isFinite(ageSecs) ? undefined : '读不出这次构建的结束时刻',
+  };
+}
+
+function pushNode(line: SourceLineReport | null, error: string | null): ChainNode {
+  const base = { id: 'push', stage: '推到 main', evidence: SOURCE_LINE_EVIDENCE };
+  if (error) {
+    return { ...base, state: 'unknown', verdict: `读不到源线：${error}`, sinceNote: '没有读数' };
+  }
+  if (!line) return { ...base, state: 'unknown', verdict: '还在读源线', sinceNote: '没有读数' };
+  if (line.state !== 'measured') {
+    return { ...base, state: 'unknown', verdict: line.why ?? '共享裸仓库读不到', sinceNote: '没有读数' };
+  }
+  if (!line.main) {
+    // 仓库读得到、主线缺席：这是一句「没有推上去过」，不是「读不动」。
+    return { ...base, state: 'waiting', verdict: line.why ?? '裸仓库里没有 main 引用', sinceNote: '没有起点' };
+  }
+  return {
+    ...base,
+    state: 'ok',
+    verdict: `main 在 ${line.main.sha.slice(0, 12)}：${line.main.subject}`,
+    owner: 'main',
+    sinceSecs: line.main.committed_secs_ago,
+  };
+}
+
+function deployNode(workloads: WorkloadsReport | null): ChainNode {
+  const base = { id: 'deploy', stage: '部署与现网', evidence: 'GET /api/v1/cluster/deployments' };
+  if (!workloads) return { ...base, state: 'unknown', verdict: '还在读工作负载', sinceNote: '没有读数' };
+  if (workloads.error) return { ...base, state: 'unknown', verdict: workloads.error, sinceNote: '没有读数' };
+  const rolling = workloads.workloads.filter((w) => w.desired != null);
+  // 判据与页面顶部「已滚到位」那一格是同一个函数：两个数字隔着半屏写不同的口径，
+  // 读的人第一眼就会去查哪一边错了。
+  const rolled = rolling.filter(isRolled);
+  if (rolling.length === 0) {
+    return { ...base, state: 'unknown', verdict: '集群里没有带副本的工作负载', sinceNote: '没有读数' };
+  }
+  const short = rolling.filter((w) => !isRolled(w));
+  const allRolled = short.length === 0;
+  const moment = chainMoment(allRolled ? rolling : short, allRolled);
+  return {
+    ...base,
+    state: allRolled ? 'ok' : 'waiting',
+    verdict: allRolled
+      ? `${rolled.length} / ${rolling.length} 已滚到位`
+      : `${rolled.length} / ${rolling.length} 已滚到位，差 ${short.length} 个`,
+    owner: allRolled
+      ? undefined
+      : short
+          .slice(0, 3)
+          .map((w) => `${w.namespace}/${w.name}`)
+          .join(' · ') + (short.length > 3 ? ` 等 ${short.length} 个` : ''),
+    sinceSecs: moment.secs,
+    sinceNote: moment.note,
+  };
+}
+
+/**
+ * 这一步从什么时候起是现在这个样子。
+ *
+ * 全都到位时取「最后一个到位的那一刻」——全体到位这句话从此刻起才成立；没到位时取
+ * 「最早那一处卡住的那一刻」——至少从那时起就已经不齐了。两处都只用工作负载自己的
+ * 条件时间，不拿采集时刻冒充：那会让一个停了三小时的滚动看起来刚开始。
+ */
+function chainMoment(
+  workloads: WorkloadView[],
+  allRolled: boolean
+): { secs?: number; note?: string } {
+  const moments = workloads
+    .map(conditionMoment)
+    .filter((at): at is number => at != null);
+  if (moments.length === 0) {
+    return { note: '这些工作负载的条件没带时间戳，滚动起点没有读数' };
+  }
+  const moment = allRolled ? Math.max(...moments) : Math.min(...moments);
+  return { secs: Math.max(0, (Date.now() - moment) / 1000) };
+}
+
+/** 一个工作负载「当前状态」的起点，按语义顺序取第一条带时间的条件。 */
+function conditionMoment(workload: WorkloadView): number | null {
+  for (const kind of ['Available', 'Progressing', 'MinimumReplicasAvailable']) {
+    const condition = workload.conditions.find((c) => c.kind === kind && c.last_transition_at);
+    if (condition?.last_transition_at) {
+      const at = Date.parse(condition.last_transition_at);
+      if (Number.isFinite(at)) return at;
+    }
+  }
+  return null;
+}
+
+/**
+ * 一个工作负载算不算「滚到位」：就绪副本身数够，且新版本也起够了。
+ *
+ * 只问就绪会漏掉一种正在滚的形态——旧副本还全在、新副本一个都没起来，`ready` 仍是
+ * 满的；那时 `updated` 小于目标才是真话。被页面顶部与链路那一格共用，是为了让同一份
+ * 集群读数在两处说出同一个数。
+ */
+function isRolled(workload: WorkloadView): boolean {
+  return (
+    (workload.ready ?? 0) >= (workload.desired ?? 0) &&
+    (workload.updated == null || workload.updated >= (workload.desired ?? 0))
+  );
+}
+
+function chainColor(state: ChainNode['state']): string {
+  if (state === 'ok') return 'var(--ok)';
+  if (state === 'running') return 'var(--warn)';
+  if (state === 'stuck') return 'var(--danger)';
+  return 'var(--muted)';
+}
+
+function chainStateWord(state: ChainNode['state']): string {
+  const words: Record<ChainNode['state'], string> = {
+    ok: '在',
+    running: '在跑',
+    waiting: '没到位',
+    stuck: '没成',
+    unknown: '读不到',
+  };
+  return words[state];
+}
+
+function ChainPanel({ nodes }: { nodes: ChainNode[] }) {
+  return (
+    <>
+      <Table
+        columns={[
+          {
+            key: 'stage',
+            title: '环节',
+            width: '100px',
+            render: (n) => <span className="text-[11px]">{n.stage}</span>,
+          },
+          {
+            key: 'state',
+            title: '状态',
+            width: '80px',
+            render: (n) => (
+              <span className="text-[11px]" style={{ color: chainColor(n.state) }}>
+                {chainStateWord(n.state)}
+              </span>
+            ),
+          },
+          {
+            key: 'verdict',
+            title: '结论',
+            render: (n) => (
+              <span className="text-[11px]">
+                {n.verdict}
+                {n.aside ? (
+                  <span className="block text-[10px] text-[var(--muted)]">{n.aside}</span>
+                ) : null}
+              </span>
+            ),
+          },
+          {
+            key: 'owner',
+            title: '归属',
+            width: '220px',
+            render: (n) => (
+              <span className="mono text-[11px] text-[var(--muted)]">{n.owner ?? '—'}</span>
+            ),
+          },
+          {
+            key: 'since',
+            title: '从何时起',
+            width: '130px',
+            render: (n) => (
+              <span className="mono text-[11px] text-[var(--muted)]">
+                {n.sinceSecs != null ? `${formatAge(n.sinceSecs)}前` : n.sinceNote ?? '没有读数'}
+              </span>
+            ),
+          },
+          {
+            key: 'evidence',
+            title: '依据',
+            width: '260px',
+            render: (n) => (
+              <span className="mono text-[10px] text-[var(--muted)]">{n.evidence}</span>
+            ),
+          },
+        ]}
+        rows={nodes}
+        rowKey={(n) => n.id}
+      />
+      <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+        这条链按「一个字节从哪来」排，不按时间排：最上面是有人在改的那条分支，最下面
+        是集群里真的在跑的副本。三处读数各自出自不同的地方，所以三处都可能读不到，而
+        「读不到」写在状态列上，不画成 0——这条链唯一的用处就是看出一件事卡在哪一环，
+        而一格空着与一格「没人报」在那件事上是两个完全不同的答案。
+      </p>
+    </>
+  );
+}
+
+/**
+ * 各条工作树分支相对主线的位置。
+ *
+ * 链路那一格只说「最近动过的是哪一条」；属主真正要看的全貌是「同时有几棵树在动、
+ * 各自离 main 多远」。这张表就是那件事，数据与链路同一份读数，不另开接口。
+ *
+ * 「要变基」不是一个判断，是 `main` 不是这条分支的祖先——那是 git 自己回答的，
+ * 页面照抄。缺席（`undefined`）读成「问不出来」，不读成「要变基」：后者会让人去做
+ * 一件不必要的事。
+ */
+function BranchLineTable({
+  line,
+  error,
+  onRetry,
+}: {
+  line: SourceLineReport | null;
+  error: string | null;
+  onRetry: () => void;
+}) {
+  if (error) return <ReadError what="源线" error={error} onRetry={onRetry} />;
+  if (!line) return null;
+  if (line.state !== 'measured') {
+    return <p className="px-4 py-2 text-[11px] text-[var(--warn)]">{line.why ?? '源线读不到'}</p>;
+  }
+  const branches = line.branches
+    .filter((branch) => branch.name !== 'main')
+    .sort((a, b) => (a.committed_secs_ago ?? Infinity) - (b.committed_secs_ago ?? Infinity));
+  if (branches.length === 0) {
+    return <Empty>裸仓库里只有 main：没有别的工作树在它上面。</Empty>;
+  }
+  return (
+    <Table
+      columns={[
+        {
+          key: 'name',
+          title: '工作树（分支）',
+          width: '170px',
+          render: (b) => <span className="mono text-[11px]">{b.name}</span>,
+        },
+        {
+          key: 'tip',
+          title: '尖端',
+          render: (b) => (
+            <span className="text-[11px]">
+              <span className="mono text-[var(--muted)]">{b.sha.slice(0, 10)}</span> {b.subject}
+            </span>
+          ),
+        },
+        {
+          key: 'ahead',
+          title: '相对 main',
+          width: '150px',
+          render: (b) =>
+            b.contains_main == null ? (
+              <span className="text-[11px] text-[var(--muted)]">问不出来</span>
+            ) : b.contains_main ? (
+              <span className="mono text-[11px] text-[var(--ok)]">
+                {b.ahead_of_main == null ? '含 main' : `+${b.ahead_of_main}`}
+              </span>
+            ) : (
+              <span className="mono text-[11px] text-[var(--warn)]">要先变基（不含 main）</span>
+            ),
+        },
+        {
+          key: 'since',
+          title: '尖端多久前落',
+          width: '120px',
+          render: (b) => (
+            <span className="mono text-[11px] text-[var(--muted)]">
+              {b.committed_secs_ago == null ? '—' : `${formatAge(b.committed_secs_ago)}前`}
+            </span>
+          ),
+        },
+      ]}
+      rows={branches}
+      rowKey={(b) => b.name}
+    />
   );
 }
 

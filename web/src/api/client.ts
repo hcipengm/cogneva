@@ -2102,6 +2102,11 @@ export interface BuildGateReport {
   /** 界那份文件多久没被重算过：界是会动的读数，不是常量。 */
   bound_written_secs_ago?: number;
   slots: BuildGateSlot[];
+  /**
+   * 这份界不覆盖谁。带内沙箱执行器在 pod 内编译，受 pod 配额约束——它不在 `slots`
+   * 里是对的，但「不在 slots 里」读不出「它有自己的界」。
+   */
+  outside_the_bound: BuildGateOutside[];
   reservation?: BuildGateReservation;
   pressure: BuildGatePressure[];
   load?: { load1: string; load5: string; load15: string };
@@ -2114,6 +2119,12 @@ export interface BuildGateSlot {
   holder?: { what: string; pid?: number; held_secs?: number };
   /** 位子被占着但没人留下记录：这是「旧版本的构建器」，不是「空着」。 */
   unrecorded?: string;
+}
+
+export interface BuildGateOutside {
+  who: string;
+  /** 它受什么约束。 */
+  why: string;
 }
 
 export interface BuildGateReservation {
@@ -2132,6 +2143,41 @@ export interface BuildGatePressure {
 
 export async function getBuildGate(): Promise<BuildGateReport> {
   return api.get<BuildGateReport>('/api/v1/delivery/build-gate');
+}
+
+/**
+ * 共享裸仓库里主线与各工作树分支走到了哪一版。
+ *
+ * 链路里「编辑」与「推送」两格的依据：分支的尖端就是这棵树最后一次被提交的样子，
+ * 而 `main` 的尖端就是部署器会跟上的那一版。读的是引用，不是工作树里的磁盘状态——
+ * 一棵改了十个文件却没提交的树，在这里读作「它的分支没有动」，那是对的。
+ */
+export interface SourceLineReport {
+  state: 'measured' | 'unwired' | 'unread';
+  why?: string;
+  repo: string;
+  /** 仓库读得到但里面没有 main 时这一格缺席——那是第四种事实，不是「读不动」。 */
+  main?: SourceLineBranch;
+  branches: SourceLineBranch[];
+  /** 被截断时还有几条没列；缺席是「全列上了」。 */
+  more_branches?: number;
+  generated_at: string;
+}
+
+export interface SourceLineBranch {
+  name: string;
+  sha: string;
+  committed_at?: string;
+  /** 尖端那笔提交是多久以前落的，服务端算好的。 */
+  committed_secs_ago?: number;
+  subject: string;
+  /** 是否已包含当前 main：成立才能快进。缺席是「问不出来」，不是 false。 */
+  contains_main?: boolean;
+  ahead_of_main?: number;
+}
+
+export async function getSourceLine(): Promise<SourceLineReport> {
+  return api.get<SourceLineReport>('/api/v1/delivery/source-line');
 }
 
 
@@ -3063,6 +3109,11 @@ export interface TopologyCondition {
   ok: boolean;
   reason: string | null;
   message: string | null;
+  /**
+   * 这条状态从什么时候起是这样的（服务端原样交出的 `lastTransitionTime`）。
+   * 滚动卡住时「卡了多久」只有这一格答得出来；采集时刻答不了那个问题。
+   */
+  last_transition_at: string | null;
 }
 
 export interface TopologyClaim {

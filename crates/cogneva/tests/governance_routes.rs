@@ -557,6 +557,66 @@ async fn the_build_gate_reading_answers_with_one_of_its_three_words() {
     );
 }
 
+/// The source-line reading reaches the router on the same terms as the build
+/// slot: its handler is unit-tested against fixture repositories, which stay
+/// green on a handler nobody routes, and the only symptom of that is a 404 on
+/// the chain panel that asks.
+///
+/// The closed set is what can be asserted from here, for the same reason as
+/// above: whether this host mounts the shared bare repository is a property of
+/// the machine running the suite, so a case that pinned `measured` would pass
+/// only where one is mounted. A `measured` verdict with no `main` is the fourth
+/// fact this face has to keep distinct -- the repository read fine, it just has
+/// no main line -- so it must say so rather than leave the panel guessing.
+#[tokio::test]
+async fn the_source_line_reading_answers_with_one_of_its_three_words() {
+    let state = state(None);
+    let app = create_router(state.clone());
+    let token = bearer(&state).await;
+
+    let (status, body) = ask(&app, "GET", "/api/v1/delivery/source-line", &token, "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the source-line face answers: {body}"
+    );
+
+    let verdict = body["state"].as_str().expect("state is a string");
+    assert!(
+        matches!(verdict, "measured" | "unwired" | "unread"),
+        "state is one of the three words the chain panel keys on, got {verdict}: {body}"
+    );
+    if verdict != "measured" {
+        assert!(
+            body["why"].as_str().is_some_and(|why| !why.is_empty()),
+            "a {verdict} verdict says why it could not measure: {body}"
+        );
+        // Nothing measured means no branches claimed either: an empty list here
+        // would read on the panel as "no worktree is active" rather than as
+        // "nobody could look".
+        assert!(
+            body["branches"]
+                .as_array()
+                .is_some_and(|rows| rows.is_empty()),
+            "an unmeasured source line lists no branches: {body}"
+        );
+    }
+    if verdict == "measured" && body["main"].is_null() {
+        assert!(
+            body["why"].as_str().is_some_and(|why| !why.is_empty()),
+            "a repository with no main line says that much: {body}"
+        );
+    }
+    assert!(
+        body["repo"].as_str().is_some_and(|repo| !repo.is_empty()),
+        "the reading names the repository it read: {body}"
+    );
+    assert!(
+        body["generated_at"].as_str().is_some(),
+        "a reading says when it was taken: {body}"
+    );
+}
+
 fn submission(face_id: &str, unit_id: Option<&str>) -> String {
     serde_json::json!({
         "goal": "bound row",
