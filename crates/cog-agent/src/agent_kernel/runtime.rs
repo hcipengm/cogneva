@@ -1528,9 +1528,9 @@ impl AgentRuntime {
         run_task_id: Option<&str>,
     ) -> SFResult<serde_json::Value> {
         // 这一次运行在飞期间，停机的那一侧会等它走到回合边界（见
-        // `cog_core::drain`）。守卫活着就算在飞，落盘在 `Drop` 里，panic 与
+        // `crate::drain`）。守卫活着就算在飞，落盘在 `Drop` 里，panic 与
         // 提前返回都算结束——否则一次失败的运行会让关停永远等不到零。
-        let _in_flight = cog_core::drain::enter_run();
+        let _in_flight = crate::drain::enter_run();
         let started = self.begin_scoped_run(run_task_id);
         let outcome = self.run_turns(input, llm, run_task_id).await;
         self.finish_scoped_run(run_task_id, started, outcome).await
@@ -1996,7 +1996,7 @@ impl AgentRuntime {
     /// 两个条件缺一不可：进程被要求停下，并且这次运行有日志可续。没有任务的
     /// 运行没有可续的地方，提前退出只是把已经做出来的东西扔掉。
     fn should_preempt(&self) -> bool {
-        self.journal_key().is_some() && cog_core::drain::requested()
+        self.journal_key().is_some() && crate::drain::requested()
     }
 
     /// 在回合边界让路。记下这个结局，把尝试留在开着的状态。
@@ -2008,7 +2008,7 @@ impl AgentRuntime {
             agent_id = %self.config.agent_id,
             task_id = self.config.owner_task_id.as_deref().unwrap_or(""),
             iterations,
-            in_flight = cog_core::drain::in_flight(),
+            in_flight = crate::drain::in_flight(),
             "the process is shutting down; stopping at the turn boundary, the attempt stays open"
         );
         self.note_run_ending(crate::observable::RunOutcome::Preempted, iterations);

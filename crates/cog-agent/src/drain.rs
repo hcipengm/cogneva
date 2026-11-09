@@ -1,7 +1,7 @@
 //! 排空闸：进程被要求停下时，让手上的运行走到**回合边界**再停，而不是从
 //! 任意一个 await 点被掐断。
 //!
-//! 与 [`crate::attempt_journal`] 是一对，各管一头：
+//! 与 [`cog_core::attempt_journal`] 是一对，各管一头：
 //!
 //! - 日志保证「被硬杀时，下一次从最后一条有结果的调用之后接着跑」——至多丢
 //!   一步，且丢的那一步可判定；
@@ -20,7 +20,13 @@
 //! 「每个动作最多发生一次，且下一次从最后一个已完成的动作之后接上」。写文件的
 //! 工具之所以能重跑，靠的是工具自己的幂等；有外部效果的工具做不到，于是它们
 //! 的策略是**不重放**。合起来的上限是「至多一次」，不是「恰好一次」。
-use crate::contract::shutdown::ShutdownSignal;
+//!
+//! 它住在 `cog-agent` 而不是 `cog-core`：这把闸只在跑 agent 回合的那个 crate 里
+//! 有意义——装信号、进闸、等归零的三处调用点全在这里，`cog-core` 的另一半是
+//! 纯数据契约。放在底座里会让一个只被一个 crate 用到的「动作」留在那一层，而
+//! 底座的规矩是**只放两个以上 crate 共享的东西**（`core_boundary_contract_test`
+//! 判的就是这条）。
+use cog_core::contract::shutdown::ShutdownSignal;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -99,35 +105,58 @@ pub async fn wait_drained(limit: Duration) -> bool {
 }
 
 /// 测试用：清掉信号与计数。
+///
+/// 只在**同一个进程里没有别的运行在飞**时调用：它把计数归零，而一个还活着的
+/// 守卫在 `Drop` 里照样会减一次，那会把已经归零的计数器减成天文数字。集成测试
+/// 在自己的进程里用它；进程内的单元测试要用 [`clear_signal_for_tests`]。
 pub fn reset_for_tests() {
-    *slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    clear_signal_for_tests();
     IN_FLIGHT.store(0, Ordering::SeqCst);
+}
+
+/// 测试用：只清信号，不动在飞计数。
+pub fn clear_signal_for_tests() {
+    *slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock as TestOnceLock;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// 两个测试共用同一个进程级计数器，串行跑才不会互相把对方的读数改成
+    /// 「别人也在飞」——同一个进程里其他测试调 `enter_run` 时，本模块的断言
+    /// 只比对**自己这一进一出**的差，不假设全局是零。
+    fn serial() -> &'static AsyncMutex<()> {
+        static SERIAL: TestOnceLock<AsyncMutex<()>> = TestOnceLock::new();
+        SERIAL.get_or_init(|| AsyncMutex::new(()))
+    }
 
     #[tokio::test]
     async fn a_run_in_flight_keeps_the_drain_waiting_until_it_ends() {
-        reset_for_tests();
+        let _serial = serial().lock().await;
+        let before = in_flight();
         let guard = enter_run();
-        assert_eq!(in_flight(), 1);
+        assert_eq!(in_flight(), before + 1, "守卫活着就是在飞的那一个");
         assert!(
             !wait_drained(Duration::from_millis(120)).await,
-            "a run still holding the gate must not read as drained"
+            "有运行没结束时，排空不能读成已完成"
         );
         drop(guard);
-        assert_eq!(in_flight(), 0);
-        assert!(
-            wait_drained(Duration::from_millis(120)).await,
-            "once the guard is gone the drain completes"
-        );
+        assert_eq!(in_flight(), before, "守卫落下，计数回到进闸之前");
+        if before == 0 {
+            assert!(
+                wait_drained(Duration::from_millis(120)).await,
+                "守卫落下之后排空完成"
+            );
+        }
     }
 
     #[tokio::test]
     async fn no_signal_installed_means_never_asked_to_stop() {
-        reset_for_tests();
+        let _serial = serial().lock().await;
+        clear_signal_for_tests();
         assert!(
             !requested(),
             "an ordinary embedded run is never told to stop"
@@ -137,6 +166,6 @@ mod tests {
         assert!(!requested());
         signal.trigger();
         assert!(requested(), "the installed signal is what the gate reads");
-        reset_for_tests();
+        clear_signal_for_tests();
     }
 }

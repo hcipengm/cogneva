@@ -652,7 +652,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // 在 `start` 而不是 `init`：停机信号是二进制根在 `init_all` 之后才发布
         // 的（它要在所有插件初始化完才有人等），`init` 里读只会读到没有。
         if let Some(signal) = ctx.consume::<cog_core::ShutdownSignal>() {
-            cog_core::drain::install((*signal).clone());
+            crate::drain::install((*signal).clone());
         }
         if let Some(ref pool) = self.pool {
             if let Some(task_runner) = ctx.consume_service::<dyn cog_core::TaskExecutionCallback>()
@@ -748,21 +748,21 @@ impl cog_core::SystemPlugin for AgentPlugin {
         //
         // 等的是「走到回合边界」，不是「整件活做完」——内核在每轮模型调用之前
         // 看排空闸，走到那里就停，工具结果已经落盘，下一次派发原样接上。
-        if cog_core::drain::requested() {
+        if crate::drain::requested() {
             let limit = std::time::Duration::from_millis(
                 self.drain_timeout_ms
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
             if limit.is_zero() {
                 warn!(
-                    in_flight = cog_core::drain::in_flight(),
+                    in_flight = crate::drain::in_flight(),
                     "no shutdown timeout was declared; in-flight runs are left to their journals"
                 );
-            } else if cog_core::drain::wait_drained(limit).await {
+            } else if crate::drain::wait_drained(limit).await {
                 info!("every in-flight run reached a turn boundary before shutdown");
             } else {
                 warn!(
-                    in_flight = cog_core::drain::in_flight(),
+                    in_flight = crate::drain::in_flight(),
                     "shutdown ran out of time with runs still in flight; they resume from their journals"
                 );
             }

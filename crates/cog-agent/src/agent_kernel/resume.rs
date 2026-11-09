@@ -183,11 +183,20 @@ mod tests {
         assert_eq!(plan.assistant_turns, 1);
         assert_eq!(plan.messages.len(), 2);
         let text = serde_json::to_string(&plan.messages).unwrap();
-        assert!(!text.contains("old ask"), "the delivered attempt must not replay: {text}");
-        assert!(!text.contains("call-old"), "the delivered call must not replay: {text}");
+        assert!(
+            !text.contains("old ask"),
+            "the delivered attempt must not replay: {text}"
+        );
+        assert!(
+            !text.contains("call-old"),
+            "the delivered call must not replay: {text}"
+        );
         assert!(text.contains("new ask"));
         assert_eq!(
-            plan.doubts.iter().map(|d| d.call_id.as_str()).collect::<Vec<_>>(),
+            plan.doubts
+                .iter()
+                .map(|d| d.call_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["call-new"]
         );
     }

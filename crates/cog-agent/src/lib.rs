@@ -112,6 +112,7 @@ pub use tools::builtins;
 pub use tools::ToolRegistry;
 pub use wal::AgentWal;
 
+pub mod drain;
 pub mod plugin;
 pub mod self_review;
 pub use self_review::SelfReviewLoop;

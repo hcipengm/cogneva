@@ -254,7 +254,7 @@ impl EvaluatorActor {
     }
 
     /// The deterministic judgement of a self-evolution change: the artifact's
-    /// own validity, and whether it went where the plan said it would.
+    /// own validity, and how much of the plan's declared target set it bought.
     ///
     /// Pure, and separate from [`Self::evaluate`], because this is the whole
     /// judgement on that path — no agent is consulted, so a test can assert the
@@ -264,60 +264,73 @@ impl EvaluatorActor {
     /// The second half exists because the acceptance criteria are not read here.
     /// On this path the criteria are free text with no judge, so "the change is
     /// about what the plan said it was about" can only come from the plan's
-    /// declared target set, compared against the diff's own targets. A plan that
-    /// declares none leaves the vectors empty and changes nothing below.
+    /// declared target set, compared against the diff's own targets. That set is
+    /// the plan's own statement of intent, so the judgement reports what the
+    /// change bought of it — the count and the ratio — rather than only whether
+    /// the change cleared the floor. A plan that declares none leaves the vectors
+    /// empty and changes nothing below.
     pub(crate) fn judge_self_evolution_change(
         validation: &str,
         generation: &serde_json::Value,
         plan: &serde_json::Value,
     ) -> (EvaluationResult, &'static str) {
-        use crate::observable::{
-            SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE, SELF_EVOLUTION_VERDICT_NO_ARTIFACT,
-            SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED, SELF_EVOLUTION_VERDICT_UNPARSEABLE,
-            SELF_EVOLUTION_VERDICT_WELL_FORMED,
-        };
+        // Both readings come out of the one cell: the judgement a caller acts on
+        // and the published name of the cell it landed in. Deriving the name
+        // here, from the same value the score came from, is what keeps the
+        // observability side of this path from being a second opinion.
+        let (output, cell) = Self::judge_with_cell(validation, generation, plan);
+        (output, cell.cause())
+    }
+
+    /// Map the measurements onto the one cell they name.
+    ///
+    /// The whole mapping lives here so that no caller can pair a verdict with
+    /// another cell's reading: `uncovered` only means anything once there is a
+    /// well-formed artifact to place, and that is the branch that reads it.
+    fn judged_cell(validation: &str, declared: &[String], uncovered: &[String]) -> JudgedCell {
+        if !validation.starts_with("change_validation: change artifact(s) are valid") {
+            return if validation.contains("no change artifact found") {
+                JudgedCell::NoArtifact
+            } else {
+                JudgedCell::Unappliable
+            };
+        }
+        if declared.is_empty() {
+            JudgedCell::NothingDeclared
+        } else if uncovered.is_empty() {
+            JudgedCell::Covered {
+                declared: declared.len(),
+            }
+        } else {
+            JudgedCell::Uncovered {
+                bought: declared.len() - uncovered.len(),
+                declared: declared.len(),
+            }
+        }
+    }
+
+    /// The judgement together with the cell it landed in.
+    ///
+    /// One reading rather than two, so a cell a test names and a score it
+    /// asserts cannot come from different places.
+    fn judge_with_cell(
+        validation: &str,
+        generation: &serde_json::Value,
+        plan: &serde_json::Value,
+    ) -> (EvaluationResult, JudgedCell) {
         use crate::squad::pge::types::{change_targets, declared_targets, uncovered_targets};
 
-        let well_formed = validation.starts_with("change_validation: change artifact(s) are valid");
         let declared = declared_targets(plan);
+        let well_formed = validation.starts_with("change_validation: change artifact(s) are valid");
         let uncovered = if well_formed {
             uncovered_targets(generation, &declared)
         } else {
+            // A broken diff is not a scope miss: there is no change to place, so
+            // coverage stays inert instead of being counted as zero bought.
             Vec::new()
         };
-        // The cell is chosen here, beside the verdict and the score it belongs
-        // to, so a future branch cannot add a verdict without choosing a cell.
-        // A reader that re-derived it from the verdict would fold the vacuous
-        // pass into the earned one and report a planner at work on plans that
-        // named nothing.
-        let (verdict, score, cause) = if !well_formed {
-            if validation.contains("no change artifact found") {
-                (Verdict::Fail, 0, SELF_EVOLUTION_VERDICT_NO_ARTIFACT)
-            } else {
-                (Verdict::Fail, 10, SELF_EVOLUTION_VERDICT_UNPARSEABLE)
-            }
-        } else if declared.is_empty() {
-            (
-                Verdict::Pass,
-                85,
-                SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED,
-            )
-        } else if uncovered.is_empty() {
-            (Verdict::Pass, 85, SELF_EVOLUTION_VERDICT_WELL_FORMED)
-        } else {
-            // A well-formed change that never touches a path the plan named.
-            // Scored above an unappliable diff (10) and below a pass: the artifact
-            // is deliverable in form, it just is not this task. The score is its
-            // own cell because a repair loop that only counted "failed" would not
-            // be able to tell "the patch is broken" from "the patch is fine and
-            // aimed at something else".
-            //
-            // This direction only. Touching paths the plan did not name is
-            // allowed on purpose (the planner is told so): the plan bounds what
-            // the change must cover, not what it may touch, and the apply gate
-            // is what bounds the latter.
-            (Verdict::Fail, 20, SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE)
-        };
+        let cell = Self::judged_cell(validation, &declared, &uncovered);
+        let (verdict, score) = cell.verdict_and_score();
 
         let mut criteria = vec![Criterion {
             name: "change_validation".into(),
@@ -336,14 +349,38 @@ impl EvaluatorActor {
                 },
             });
         }
+        // What the change bought of the plan, as its own criterion. Absent when
+        // the plan declared nothing, which keeps that path at the single
+        // `change_validation` criterion it has always had.
+        let coverage = match cell {
+            JudgedCell::Covered { declared } => Some((declared, declared)),
+            JudgedCell::Uncovered { bought, declared } => Some((bought, declared)),
+            _ => None,
+        };
+        if let Some((bought, planned)) = coverage {
+            let missed = if uncovered.is_empty() {
+                "none".to_string()
+            } else {
+                uncovered.join(", ")
+            };
+            criteria.push(Criterion {
+                name: "plan_coverage".into(),
+                score: 100 * bought as u32 / planned.max(1) as u32,
+                comment: format!(
+                    "the plan named {planned} target(s) and the change bought {bought} of them (missed: {missed})"
+                ),
+            });
+        }
 
-        let feedback = if uncovered.is_empty() {
-            validation.to_string()
-        } else {
+        let feedback = if let JudgedCell::Uncovered { bought, declared } = cell {
+            // The repair loop reads this, so the count the score grades is
+            // written out: a score of 46 does not say "2 of 3" on its own.
             let touched = change_targets(generation);
             format!(
-                "{}; the change does not touch the target(s) the plan named: {} (the diff's targets are: {})",
+                "{}; the plan named {} target(s) and the change bought {} of them, missing {} (the diff's targets are: {})",
                 validation,
+                declared,
+                bought,
                 uncovered.join(", "),
                 if touched.is_empty() {
                     "none".to_string()
@@ -351,6 +388,8 @@ impl EvaluatorActor {
                     touched.join(", ")
                 }
             )
+        } else {
+            validation.to_string()
         };
 
         (
@@ -361,7 +400,7 @@ impl EvaluatorActor {
                 criteria,
                 details: None,
             },
-            cause,
+            cell,
         )
     }
 
@@ -418,6 +457,78 @@ impl EvaluatorActor {
     }
 }
 
+/// One outcome of the deterministic self-evolution judgement.
+///
+/// Named cells rather than an if/else chain over measurements, so every verdict
+/// and score the judgement can return is decided in one place. The coverage
+/// cells carry the counts because a repair loop reading score 20 has to be able
+/// to tell buying none of a plan from buying most of it: the grade is the ratio,
+/// and the counts are what the criterion and the feedback restate in words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JudgedCell {
+    /// No change artifact was produced at all.
+    NoArtifact,
+    /// A change artifact that is not a unified diff over admissible paths.
+    Unappliable,
+    /// A valid change under a plan that declared no targets.
+    NothingDeclared,
+    /// A valid change that touches every target the plan named.
+    Covered { declared: usize },
+    /// A valid change that bought some of the plan's targets, perhaps none.
+    ///
+    /// This direction only. Touching paths the plan did not name is allowed on
+    /// purpose (the planner is told so): the plan bounds what the change must
+    /// cover, not what it may touch, and the apply gate is what bounds the
+    /// latter.
+    Uncovered { bought: usize, declared: usize },
+}
+
+impl JudgedCell {
+    /// The published name of this cell.
+    ///
+    /// The five cells and the five published names have to be one set: they are
+    /// counted on the observability side, where a verdict with no name is money
+    /// spent with nothing recorded about what it bought. `is_empty`-style
+    /// re-derivation is avoided on purpose — a reader that re-derived the cell
+    /// from the verdict would fold the vacuous pass (`NothingDeclared`) into the
+    /// earned one (`Covered`) and report a planner at work on plans that named
+    /// nothing.
+    fn cause(self) -> &'static str {
+        use crate::observable::{
+            SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE, SELF_EVOLUTION_VERDICT_NO_ARTIFACT,
+            SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED, SELF_EVOLUTION_VERDICT_UNPARSEABLE,
+            SELF_EVOLUTION_VERDICT_WELL_FORMED,
+        };
+        match self {
+            JudgedCell::NoArtifact => SELF_EVOLUTION_VERDICT_NO_ARTIFACT,
+            JudgedCell::Unappliable => SELF_EVOLUTION_VERDICT_UNPARSEABLE,
+            JudgedCell::NothingDeclared => SELF_EVOLUTION_VERDICT_NO_TARGETS_DECLARED,
+            JudgedCell::Covered { .. } => SELF_EVOLUTION_VERDICT_WELL_FORMED,
+            JudgedCell::Uncovered { .. } => SELF_EVOLUTION_VERDICT_AIMED_ELSEWHERE,
+        }
+    }
+
+    /// The verdict and the score this outcome is worth.
+    ///
+    /// Every cell that existed before the coverage grade keeps its exact score
+    /// (0 / 10 / 85), so a plan that declares no targets judges a change exactly
+    /// as it did before. A partial purchase is graded by ratio into 20..60: above
+    /// the unappliable-diff cell, because the artifact is deliverable in form,
+    /// and strictly below the evaluator's own 60 boundary, so a partial purchase
+    /// never reads as a pass. Buying none keeps exactly 20.
+    fn verdict_and_score(self) -> (Verdict, u32) {
+        match self {
+            JudgedCell::NoArtifact => (Verdict::Fail, 0),
+            JudgedCell::Unappliable => (Verdict::Fail, 10),
+            JudgedCell::NothingDeclared | JudgedCell::Covered { .. } => (Verdict::Pass, 85),
+            JudgedCell::Uncovered { bought, declared } => {
+                let graded = 40 * bought as u32 / declared.max(1) as u32;
+                (Verdict::Fail, 20 + graded)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,10 +578,12 @@ mod tests {
         judged_with_cell(diff, plan).0
     }
 
-    fn judged_with_cell(diff: &str, plan: &serde_json::Value) -> (EvaluationResult, &'static str) {
+    /// The judgement and the cell it landed in, from one reading, so a test can
+    /// assert both without the two drifting apart.
+    fn judged_with_cell(diff: &str, plan: &serde_json::Value) -> (EvaluationResult, JudgedCell) {
         let generation = generation_with_diff(diff);
         let validation = EvaluatorActor::validate_change_artifacts(&generation);
-        EvaluatorActor::judge_self_evolution_change(&validation, &generation, plan)
+        EvaluatorActor::judge_with_cell(&validation, &generation, plan)
     }
 
     fn criterion<'a>(result: &'a EvaluationResult, name: &str) -> &'a Criterion {
@@ -577,14 +690,17 @@ mod tests {
 
         let plan = plan_naming(&["README.md"]);
         let cells = [
-            judged_with_cell(&create_diff("crates/cogneva/src/elsewhere.rs"), &plan).1,
-            judged_with_cell(&modify_diff("README.md"), &plan).1,
+            judged_with_cell(&create_diff("crates/cogneva/src/elsewhere.rs"), &plan)
+                .1
+                .cause(),
+            judged_with_cell(&modify_diff("README.md"), &plan).1.cause(),
             judged_with_cell(
                 &create_diff("crates/cogneva/src/elsewhere.rs"),
                 &serde_json::json!({}),
             )
-            .1,
-            judged_with_cell("not a diff at all\n", &plan).1,
+            .1
+            .cause(),
+            judged_with_cell("not a diff at all\n", &plan).1.cause(),
         ];
         // 没有产物那一格走不到 diff 上：给它一份 artifacts 空表。
         let empty = serde_json::json!({ "artifacts": [] });
@@ -699,5 +815,116 @@ mod tests {
             verdict_for(&modify_diff("src/lib.rs"))
         );
         assert!(!all.contains("must be under src"), "{all}");
+    }
+
+    /// Buying none of the plan and buying most of it are different outcomes, and
+    /// the score has to say so: one flat cell for both leaves the repair loop
+    /// unable to tell a change aimed elsewhere from one that missed one target.
+    #[test]
+    fn buying_none_and_buying_most_of_the_plan_land_in_different_cells() {
+        let plan = plan_naming(&["README.md", "docs/a.md", "docs/b.md"]);
+        let none = judged_with_cell(&create_diff("crates/cogneva/src/elsewhere.rs"), &plan);
+        let most = judged_with_cell(
+            &format!("{}{}", modify_diff("README.md"), modify_diff("docs/a.md")),
+            &plan,
+        );
+
+        assert_eq!(
+            none.1,
+            JudgedCell::Uncovered {
+                bought: 0,
+                declared: 3
+            }
+        );
+        assert_eq!(
+            most.1,
+            JudgedCell::Uncovered {
+                bought: 2,
+                declared: 3
+            }
+        );
+        assert_eq!(none.0.verdict, Verdict::Fail);
+        assert_eq!(most.0.verdict, Verdict::Fail);
+        // Buying none keeps exactly the score this cell has always had.
+        assert_eq!(none.0.score, Some(20));
+        // Two of three lands above it, and still strictly below a pass.
+        assert_eq!(most.0.score, Some(46));
+        assert!(
+            most.0.score > none.0.score,
+            "a partial purchase must outscore buying none: {:?} vs {:?}",
+            most.0.score,
+            none.0.score
+        );
+        assert!(
+            most.0.score.unwrap() < 60,
+            "a partial purchase must not read as a pass: {:?}",
+            most.0.score
+        );
+    }
+
+    /// Full coverage is still the pass it always was, and now says so in a
+    /// criterion: `plan_coverage` carries the bought fraction, not a second
+    /// opinion on the verdict.
+    #[test]
+    fn full_coverage_is_still_a_pass_and_reads_as_the_whole_plan() {
+        let plan = plan_naming(&["README.md", "docs/a.md"]);
+        let both = format!("{}{}", modify_diff("README.md"), modify_diff("docs/a.md"));
+        let (result, cell) = judged_with_cell(&both, &plan);
+
+        assert_eq!(cell, JudgedCell::Covered { declared: 2 });
+        assert_eq!(result.verdict, Verdict::Pass);
+        assert_eq!(result.score, Some(85));
+        assert_eq!(criterion(&result, "plan_coverage").score, 100);
+    }
+
+    /// The criterion's score is the bought fraction, and its comment names the
+    /// targets that were not bought — a ratio with no names would leave the
+    /// repair loop to guess which of the plan's files it never touched.
+    #[test]
+    fn plan_coverage_carries_the_bought_fraction_and_the_missed_targets() {
+        let plan = plan_naming(&["README.md", "docs/a.md", "docs/b.md"]);
+        let (result, _) = judged_with_cell(&modify_diff("README.md"), &plan);
+
+        let coverage = criterion(&result, "plan_coverage");
+        assert_eq!(coverage.score, 33);
+        assert!(
+            coverage.comment.contains("bought 1 of them"),
+            "{}",
+            coverage.comment
+        );
+        for missed in ["docs/a.md", "docs/b.md"] {
+            assert!(
+                coverage.comment.contains(missed),
+                "{missed} is missing from: {}",
+                coverage.comment
+            );
+        }
+        // The per-target criteria stay what they were: 100 for a path the change
+        // reached, 0 for one it did not.
+        assert_eq!(criterion(&result, "plan_target: README.md").score, 100);
+        assert_eq!(criterion(&result, "plan_target: docs/a.md").score, 0);
+        // The repair loop is told the count the score grades, not left to infer it.
+        assert!(
+            result.feedback.contains("bought 1 of them"),
+            "{}",
+            result.feedback
+        );
+    }
+
+    /// A broken diff makes no coverage claim: there is no change to place, so
+    /// "bought none of the plan" would be a second, misleading cause.
+    #[test]
+    fn a_malformed_diff_makes_no_coverage_claim() {
+        let plan = plan_naming(&["README.md"]);
+        let (result, cell) = judged_with_cell("not a diff at all\n", &plan);
+
+        assert_eq!(cell, JudgedCell::Unappliable);
+        assert_eq!(result.score, Some(10));
+        assert!(
+            !result.criteria.iter().any(|c| c.name == "plan_coverage"),
+            "{:?}",
+            result.criteria
+        );
+        assert!(!result.feedback.contains("bought"), "{}", result.feedback);
     }
 }

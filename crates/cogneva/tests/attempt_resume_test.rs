@@ -468,7 +468,7 @@ async fn an_interrupted_call_with_side_effects_is_never_replayed() {
 async fn a_run_told_to_stop_ends_at_the_turn_boundary_and_picks_up_there() {
     let _guard = cog_core::progress::async_test_lock().await;
     cog_core::attempt_journal::reset_for_tests();
-    cog_core::drain::reset_for_tests();
+    cog_agent::drain::reset_for_tests();
 
     let journal = Arc::new(MemoryJournal::default());
     cog_core::attempt_journal::install(journal.clone());
@@ -512,7 +512,7 @@ async fn a_run_told_to_stop_ends_at_the_turn_boundary_and_picks_up_there() {
     // 进程被要求停下。
     let signal = cog_core::ShutdownSignal::new();
     signal.trigger();
-    cog_core::drain::install(signal);
+    cog_agent::drain::install(signal);
 
     let runs = Arc::new(AtomicUsize::new(0));
     let llm = llm_with_call(
@@ -548,7 +548,7 @@ async fn a_run_told_to_stop_ends_at_the_turn_boundary_and_picks_up_there() {
     );
 
     // 闸放开：下一次派发从那里接上，不重跑已经记过的调用。
-    cog_core::drain::reset_for_tests();
+    cog_agent::drain::reset_for_tests();
     let llm2 = llm_with_call(
         cog_core::ToolCall {
             id: "never".into(),
@@ -597,7 +597,7 @@ async fn a_run_told_to_stop_ends_at_the_turn_boundary_and_picks_up_there() {
 async fn a_journal_that_cannot_be_written_does_not_stop_the_run() {
     let _guard = cog_core::progress::async_test_lock().await;
     cog_core::attempt_journal::reset_for_tests();
-    cog_core::drain::reset_for_tests();
+    cog_agent::drain::reset_for_tests();
 
     struct Broken;
     #[async_trait]

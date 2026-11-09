@@ -27,7 +27,6 @@ use common::routes::{read, walk_all};
 
 use common::routes::repo_root;
 
-
 /// 进程读到的那份配置。
 const JSON: &str = "deploy/helm/cogneva/files/cogneva.json";
 
@@ -49,7 +48,11 @@ const STATIC_DEPLOYMENTS: &[(&str, &str)] = &[
 /// 这份名单只收**会执行模型回合**的那些 Pod。别的 Pod 拿到宽限期没有坏处，但
 /// 它们不排空，列进来只会让这份名单随时间变长、与本条契约无关。
 const WORKLOADS: &[(&str, &str, &str)] = &[
-    ("cogneva", "41-deployment-cogneva.yaml", "templates/gateway.yaml"),
+    (
+        "cogneva",
+        "41-deployment-cogneva.yaml",
+        "templates/gateway.yaml",
+    ),
     (
         "cogneva-evolution",
         "41-deployment-cogneva-evolution.yaml",
@@ -83,15 +86,12 @@ fn values_shutdown() -> serde_yaml::Value {
     let text = read(&repo_root().join(VALUES));
     let values: serde_yaml::Value =
         serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{VALUES} does not parse: {e}"));
-    values
-        .get("shutdown")
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "{VALUES} no longer has a shutdown section; the budget and the grace period \
+    values.get("shutdown").cloned().unwrap_or_else(|| {
+        panic!(
+            "{VALUES} no longer has a shutdown section; the budget and the grace period \
                  stopped being one decision"
-            )
-        })
+        )
+    })
 }
 
 fn leaf(section: &serde_yaml::Value, key: &str) -> u64 {
@@ -169,7 +169,8 @@ fn every_rendered_profile_carries_the_same_grace_period() {
                 )
             });
             assert_eq!(
-                rendered, grace,
+                rendered,
+                grace,
                 "{} renders terminationGracePeriodSeconds as {rendered}, values says {grace}: \
                  the rendered profile is stale -- re-run deploy/scripts/render-deploy.sh",
                 path.display()
@@ -203,10 +204,7 @@ fn the_static_manifests_carry_the_same_grace_period() {
                  period wider than its drain budget"
             )
         });
-        assert_eq!(
-            found, grace,
-            "{relative} says {found}, values says {grace}"
-        );
+        assert_eq!(found, grace, "{relative} says {found}, values says {grace}");
     }
 }
 
