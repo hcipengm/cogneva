@@ -14,14 +14,18 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 gate="${repo}/deploy/scripts/check-before-push.sh"
+# shellcheck source=tests/fixtures/stage-gate.sh
+. "${here}/fixtures/stage-gate.sh"
 fail() { echo "FAIL: $*"; exit 1; }
 
 [ -f "${gate}" ] || fail "门脚本不存在：${gate}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
-mkdir -p "${work}/deploy/scripts"
-cp "${gate}" "${work}/deploy/scripts/check-before-push.sh"
+# 门在开头 source 构建槽客户端；夹具里少了它，判的是一份跑不起来的门。复制整份
+# 依赖，让夹具与真树的形状一致——否则这道测试在脚本改过之后仍然绿，而真门一跑就红。
+# 这份知识只有一处：门再 source 别的文件时，改的是那个夹具助手。
+stage_gate "${repo}" "${work}"
 
 seg="${work}/segments"
 printf '900\tok\tTest（整棵工作区）\n' >"${seg}"

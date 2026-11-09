@@ -25,6 +25,8 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR C
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 gate="${repo}/deploy/scripts/check-before-push.sh"
+# shellcheck source=tests/fixtures/stage-gate.sh
+. "${here}/fixtures/stage-gate.sh"
 fail() { echo "FAIL: $*"; exit 1; }
 
 [ -f "${gate}" ] || fail "门脚本不存在：${gate}"
@@ -34,7 +36,7 @@ trap 'rm -rf "${work}"' EXIT
 
 tree="${work}/tree"
 mkdir -p "${tree}/deploy/scripts/tests" "${tree}/.github/workflows"
-cp "${gate}" "${tree}/deploy/scripts/check-before-push.sh"
+stage_gate "${repo}" "${tree}"
 cd "${tree}"
 
 git init -q -b main .
@@ -102,7 +104,7 @@ fi
 # 9) 还没有 HEAD 的树：读不出指纹 ⇒ 退 2。问不了不是红，退 1 会把它说成没验过。
 bare="${work}/bare"
 mkdir -p "${bare}/deploy/scripts"
-cp "${gate}" "${bare}/deploy/scripts/check-before-push.sh"
+stage_gate "${repo}" "${bare}"
 ( cd "${bare}" && git init -q -b main . )
 rc=0
 ( cd "${bare}" && bash deploy/scripts/check-before-push.sh --status-content ) >"${work}/out" 2>&1 || rc=$?
@@ -132,7 +134,7 @@ there_key="$(GIT_DIR="${caller}/.git" GIT_WORK_TREE="${caller}" \
 # 改动仍是验过的，而解冲突改了解法之后它就不再是同一批。
 ptree="${work}/ptree"
 mkdir -p "${ptree}/deploy/scripts"
-cp "${gate}" "${ptree}/deploy/scripts/check-before-push.sh"
+stage_gate "${repo}" "${ptree}"
 (
     cd "${ptree}" || exit 1
     git init -q -b main .
@@ -239,5 +241,69 @@ found_key="$(HOME="${fakehome}" PATH="${fakehome}/.cargo/bin:${stripped_path}" \
 [ -n "${bare_key}" ] || fail "PATH 里没有 cargo 时 --key-content 什么都没印"
 [ "${bare_key}" = "${found_key}" ] ||
     fail "同一个工具、两条发现路径算出了两个键（兜底 ${bare_key:0:12}，PATH ${found_key:0:12}）：工具解析必须在子命令分派之前"
+
+# 16) 跑的途中这棵树变过 ⇒ 这一跑的判词不属于现在这份字节，两把键都不记。
+#
+# 整门一两个小时，期间树上多出来的任何一格都没被判过。以前指纹只在收尾时取，于是跑完
+# 之后才出现的字节拿到了「验过」——2026-11-09 实测就是这一格：17:24 起跑的那一跑，在
+# 文件改完之后的 18:xx 收尾，内容键记的是新字节。这一格让一步在跑的过程中改一个跟踪
+# 文件，然后问：这一跑的账记在谁身上。
+mtree="${work}/mtree"
+mkdir -p "${mtree}/deploy/scripts/tests" "${mtree}/.github/scripts/tests" \
+    "${mtree}/.github/workflows" "${mtree}/bin"
+stage_gate "${repo}" "${mtree}"
+# 这一跑必须**绿**才走得到记账那一段，所以树上要有它认得的那几件东西：两个非空的脚本
+# 测试目录（空目录会让 shellcheck 读 stdin 退 0，门把那一格判红）、一个说得出 `--version`
+# 的 cargo（fmt / clippy 那一面故意说不认识，格式与 lint 的门就不进场）。变的那个文件由
+# CI 里的一步来改：门只回放 `run: bash …` 这一种写法，所以改树的是一个真脚本，而不是
+# 一段多行块——多行块会被跳过，那一跑就红了。
+printf '#!/usr/bin/env bash\nexit 0\n' >"${mtree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${mtree}/.github/scripts/tests/ok.test.sh"
+cat >"${mtree}/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
+  fmt|clippy) exit 1 ;;
+  *) echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
+esac
+SH
+chmod +x "${mtree}/bin/cargo"
+printf '#!/usr/bin/env bash\necho mid-run >> tracked.txt\n' >"${mtree}/touch-tree.sh"
+cat >"${mtree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: change the tree while the gate is judging it
+        run: bash touch-tree.sh
+YAML
+(
+    cd "${mtree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    git add tracked.txt touch-tree.sh .github/workflows/ci.yml \
+        deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
+        deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
+    git commit -q -m base -- tracked.txt touch-tree.sh .github/workflows/ci.yml \
+        deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
+        deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
+) || fail "跑的途中变树那一格的夹具建不起来"
+# 槽目录指到夹具里：这一跑不是这台机器上的构建方，不能站在宿主的构建后面排队。
+mt_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/mtree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/mtree.lock"
+    PATH="${mtree}/bin:${PATH}")
+mt_before="$( cd "${mtree}" && "${mt_env[@]}" bash deploy/scripts/check-before-push.sh --key-content )" ||
+    fail "--key-content 在变树那一格的夹具里退非零"
+( cd "${mtree}" && "${mt_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
+    fail "变树那一跑自己红了，这一格判不了记账：$(cat "${work}/out")"
+mt_after="$( cd "${mtree}" && "${mt_env[@]}" bash deploy/scripts/check-before-push.sh --key-content )"
+[ "${mt_before}" != "${mt_after}" ] ||
+    fail "夹具没造出「跑的过程中树变了」：开跑与收尾是同一个指纹"
+grep -q '不属于现在这份字节' "${work}/out" ||
+    fail "跑的途中变过，记账时没说这一跑的判词不属于现在这份字节；实得：$(cat "${work}/out")"
+if ( cd "${mtree}" && "${mt_env[@]}" bash deploy/scripts/check-before-push.sh --status-content ) >"${work}/out" 2>&1; then
+    fail "跑的途中变过的树仍被记成验过：那一笔一秒都没被判过；实得：$(cat "${work}/out")"
+fi
 
 echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效；键不取决于调用方的 PATH 里有没有 cargo"

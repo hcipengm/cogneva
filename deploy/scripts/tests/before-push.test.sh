@@ -24,6 +24,8 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR C
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
+# shellcheck source=tests/fixtures/stage-gate.sh
+. "${here}/fixtures/stage-gate.sh"
 gate="${repo}/deploy/scripts/check-before-push.sh"
 fail() { echo "FAIL: $*"; exit 1; }
 
@@ -32,9 +34,15 @@ fail() { echo "FAIL: $*"; exit 1; }
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
+# 夹具不是这台机器上的构建方，不能去抢宿主真正的构建槽：门现在每一格编译命令都从槽里
+# 拿，指到真槽上这一格就会站在别的会话的构建后面排队（实测 300 秒被杀），而它要判的是
+# 「cargo 被这样调用了吗」。给一个不存在的槽目录，门退到自己的锁上，形状是真的，代价是零。
+export COGNEVA_BUILD_GATE_LOCK_DIR="${work}/no-gate"
+export COGNEVA_BUILD_LOCK_FILE="${work}/build.lock"
+
 tree="${work}/tree"
 mkdir -p "${tree}/deploy/scripts/tests" "${tree}/.github/workflows"
-cp "${gate}" "${tree}/deploy/scripts/check-before-push.sh"
+stage_gate "${repo}" "${tree}"
 
 # 两个作业块都只剩多行脚本块：认得出来，但一步都跑不了。
 cat >"${tree}/.github/workflows/ci.yml" <<'YAML'
@@ -129,7 +137,7 @@ echo "OK: 没有名字的步骤印出兜底说法，而不是空括号"
 # 会红在「这次要推的提交动过 1 个 crate」那一句上。
 leg="${work}/test-leg"
 mkdir -p "${leg}/deploy/scripts" "${leg}/.github/workflows" "${leg}/crates/fake/src" "${leg}/bin"
-cp "${gate}" "${leg}/deploy/scripts/check-before-push.sh"
+stage_gate "${repo}" "${leg}"
 cat >"${leg}/.github/workflows/ci.yml" <<'YAML'
 name: ci
 jobs:
@@ -193,7 +201,7 @@ echo "OK: Test 腿真的调用了 cargo test -p fake -p cogneva（rc=${rc}）"
 # 少了这一格，这处修复在门自己的读数上不可见——它只会在下一个人的提交上炸。
 loc="${work}/locators"
 mkdir -p "${loc}/caller" "${loc}/tree/deploy/scripts/tests" "${loc}/tree/.github/workflows"
-cp "${gate}" "${loc}/tree/deploy/scripts/check-before-push.sh"
+stage_gate "${repo}" "${loc}/tree"
 git -C "${loc}/caller" init -q -b main ||
     fail "造不出这一格的调用方工作树"
 cat >"${loc}/tree/deploy/scripts/tests/fixture.test.sh" <<'SH'
