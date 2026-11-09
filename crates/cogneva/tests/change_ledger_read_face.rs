@@ -1195,6 +1195,33 @@ async fn the_attempt_to_landing_ladder_is_readable_on_its_own_route() {
         days[1]["cost_currency"].is_null() && days[1]["unpriced_calls"].is_null(),
         "a day the usage table could not be read has no coverage count either: {body}"
     );
+    // 合计在路由上，不在页面上。页面自己加的那一版把花销除以「带 rev 的落地」，
+    // 分母只有全部落地的零头，同一个花销被放大成十几倍；而两组数各自成立，缺的是
+    // 把它们联系起来的覆盖率。所以路由要同时交出两个分母下的单价，外加覆盖率。
+    let summary = &body["summary"];
+    assert_eq!(
+        summary["landed"], 8,
+        "the summary sums exactly the days the route returned: {body}"
+    );
+    assert_eq!(summary["landed_with_rev"], 5, "{body}");
+    assert_eq!(
+        summary["rev_coverage"], 0.625,
+        "the coverage is what tells the two unit costs apart: {body}"
+    );
+    assert!(
+        summary["cost_micros"].is_null() && summary["llm_calls"].is_null(),
+        "one unread day makes the window's money unknown, not smaller: {body}"
+    );
+    assert_eq!(
+        summary["cost_unstated"], "usage_unread",
+        "the absence carries its cause, so the page does not have to guess which of the \
+         three it is: {body}"
+    );
+    assert!(
+        summary["cost_per_landing_micros"].is_null()
+            && summary["cost_per_shipped_change_micros"].is_null(),
+        "a unit cost over an unknown spend is unknown too: {body}"
+    );
 }
 
 /// The window is the caller's, and its absence has a named default.

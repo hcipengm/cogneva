@@ -133,58 +133,32 @@ function FunnelPanel() {
     funnel.refresh
   );
   const days = funnel.data?.days ?? [];
-  const totals = days.reduce(
-    (acc, d) => ({
-      attempted: acc.attempted + d.attempted,
-      rounds: acc.rounds + d.rounds,
-      passed: acc.passed + d.passed,
-      landed: acc.landed + d.landed,
-      landed_with_rev: acc.landed_with_rev + d.landed_with_rev,
-    }),
-    { attempted: 0, rounds: 0, passed: 0, landed: 0, landed_with_rev: 0 }
-  );
-  // 用量那两列是 `null` 表示「这一天没读到用量表」。合计只有在**每一天都读到**时
-  // 才是一个数：有一天没读到就整列印「未读到」，否则「少算了一天」会读成「那天没花钱」。
-  const usageMeasured = days.length > 0 && days.every((d) => d.llm_calls !== null);
-  const calls = usageMeasured
-    ? days.reduce((n, d) => n + (d.llm_calls ?? 0), 0)
-    : null;
-  const perDelivery =
-    calls !== null && totals.landed_with_rev > 0
-      ? `${Math.round(calls / totals.landed_with_rev)}`
-      : null;
-  // 钱这一列比调用数多两条规矩。一是币种：价目表自己带着币种，页面不能替它选一个
-  // 符号——把日元印成美元，读者看不出差了几倍。二是下界：有调用没计价的那些天，
-  // 合计数只盖住了其余部分，所以它不是「花了多少」，是「至少花了多少」，这个
-  // 「至少」必须印在数前面，否则下界会被读成省钱。
-  const costRead = days.length > 0 && days.every((d) => d.unpriced_calls !== null);
-  const unpricedCalls = days.reduce((n, d) => n + (d.unpriced_calls ?? 0), 0);
-  const currencies = new Set(
-    days.map((d) => d.cost_currency).filter((c): c is string => c !== null)
-  );
-  // 有价却印不出来的天（跨币种）：这种天混进合计会让合计沉默地少一块。
-  const unpricedOut = days.filter(
-    (d) => d.cost_micros === null && (d.unpriced_calls ?? 0) === 0
-  );
-  const micros =
-    costRead && currencies.size === 1 && unpricedOut.length === 0
-      ? days.reduce((n, d) => n + (d.cost_micros ?? 0), 0)
-      : null;
+  // 合计是服务端算的（`FunnelSummary::of`），页面只负责印。这里刻意不留一份「自己再加
+  // 一遍」的备份算法：两份算法只要有一天不一致，页面上的数就与 API 上的数对不上，而没有
+  // 人会去比。口径——分母是「全部关掉的条」还是「带 rev 关掉的条」——与它一起在服务端测。
+  const summary = funnel.data?.summary;
+  // 钱说不出来的三种原因由服务端给（`cost_unstated`），页面只把它们翻成中文。这里不
+  // 再从 days 里推一遍：同一条判据两处实现，迟早一处改了一处没改，而页面上的字没人复核。
+  const costGapText = {
+    usage_unread: '未读到',
+    mixed_currency: '多币种',
+    nothing_priced: '未记价',
+  } as const;
   const costGap =
-    micros !== null
-      ? null
-      : !costRead
-        ? '未读到'
-        : currencies.size > 1
-          ? '多币种'
-          : '未记价';
-  const perDeliveryCost =
-    micros !== null && currencies.size === 1 && totals.landed_with_rev > 0
-      ? `${unpricedCalls > 0 ? '≥ ' : ''}${money(
-          Math.round(micros / totals.landed_with_rev),
-          [...currencies][0]
-        )}`
+    summary?.cost_micros === null && summary.cost_unstated !== null
+      ? costGapText[summary.cost_unstated]
       : null;
+  // 有调用没记价时印「≥」：那是下界，不是花销总额，读成省钱会正好读反。
+  const moneyReading = (micros: number | null | undefined): string | null =>
+    micros == null || summary?.cost_currency == null
+      ? null
+      : `${(summary.unpriced_calls ?? 0) > 0 ? '≥ ' : ''}${money(micros, summary.cost_currency)}`;
+  const perClosureCost = moneyReading(summary?.cost_per_landing_micros);
+  const perShippedCost = moneyReading(summary?.cost_per_shipped_change_micros);
+  const perShippedCalls =
+    summary?.calls_per_shipped_change == null
+      ? null
+      : `${Math.round(summary.calls_per_shipped_change)}`;
 
   return (
     <section className="border-b border-[var(--line)]">
@@ -200,46 +174,88 @@ function FunnelPanel() {
           <Readings
             from={funnel}
             source="GET /api/v1/governance/changes/funnel?days=14，近 14 天求和"
-            caveat="尝试数的是智能体自己的轮次事件，交付数的是账上带着交付版本的那一头——「结为成立」里绝大多数是本来就成立、什么都没交付的条，两者相加会把每天五六笔的交付读成上百笔。合计是把每天的尝试数加起来，跨天重复尝试的变更会被数两次。调用数与成本取自网关自己的用量表，含所有调用方（反思、评估、发现都算），所以这两个比值是整个部署的代价，不只是这条账上尝试的代价；调用数印「未读到」时是没读到用量表，不是零调用。成本按价目表自己的币种印（符号来自那本价目），页上不替它选汇率；数字前面带「≥」的天是那天还有调用没有记价——那是下界，不是花销总额，读成省钱会正好读反。"
+            caveat="尝试数的是智能体自己的轮次事件，交付数的是账上带着交付版本的那一头——「结为成立」里绝大多数是本来就成立、什么都没交付的条，两者相加会把每天五六笔的交付读成上百笔。合计是把每天的尝试数加起来，跨天重复尝试的变更会被数两次。调用数与成本取自网关自己的用量表，含所有调用方（反思、评估、发现都算），所以这些比值是整个部署的代价，不只是这条账上尝试的代价；调用数印「未读到」时是没读到用量表，不是零调用。成本按价目表自己的币种印（符号来自那本价目），页上不替它选汇率；数字前面带「≥」的是还有调用没有记价——那是下界，不是花销总额，读成省钱会正好读反。**每笔成本有两个分母，两个都对，答的是两个问题**：「每笔落地成本」除以全部关掉的条，「每笔送出变更成本」只除以带 rev 的那几条——后者才是账上 ¥ 目标所说的那个分母。两者的比就是「带 rev 覆盖率」：覆盖率不到 100% 时，前者看着低，是因为分母里混着大量本来就已经成立、什么都没送出去的条；而后者在覆盖率为 0 时不存在（印「无 rev 交付」），别把它读成一个便宜的数。"
           >
             <div className="flex flex-wrap py-2">
-              <Reading label="尝试变更" value={totals.attempted} />
-              <Reading label="轮次" value={totals.rounds} />
+              <Reading label="尝试变更" value={summary?.attempted ?? '—'} />
+              <Reading label="轮次" value={summary?.rounds ?? '—'} />
               <Reading
                 label="判定通过"
-                value={totals.passed}
-                tone={totals.attempted > 0 && totals.passed === 0 ? 'danger' : 'plain'}
+                value={summary?.passed ?? '—'}
+                tone={
+                  summary !== undefined && summary.attempted > 0 && summary.passed === 0
+                    ? 'danger'
+                    : 'plain'
+                }
               />
-              <Reading label="通过率" value={rate(totals.passed, totals.rounds)} />
-              <Reading label="账上结为成立" value={totals.landed} />
+              <Reading
+                label="通过率"
+                value={summary === undefined ? '—' : rate(summary.passed, summary.rounds)}
+              />
+              <Reading label="账上结为成立" value={summary?.landed ?? '—'} />
               <Reading
                 label="交付了 rev"
-                value={totals.landed_with_rev}
-                tone={totals.landed_with_rev > 0 ? 'ok' : 'danger'}
+                value={summary?.landed_with_rev ?? '—'}
+                tone={summary === undefined || summary.landed_with_rev === 0 ? 'danger' : 'ok'}
               />
-              <Reading label="尝试→交付" value={rate(totals.landed_with_rev, totals.attempted)} />
+              <Reading
+                label="带 rev 覆盖率"
+                value={
+                  // `null` 只在「一条都没关」时出现：分母为零，比值不存在——印 0% 会把
+                  // 「窗口里什么都没发生」读成「发生了但一条都没送出」。
+                  summary?.rev_coverage == null
+                    ? '—'
+                    : `${(summary.rev_coverage * 100).toFixed(1)}%`
+                }
+                tone={summary !== undefined && summary.rev_coverage === 0 ? 'danger' : 'plain'}
+              />
+              <Reading
+                label="尝试→交付"
+                value={
+                  summary === undefined ? '—' : rate(summary.landed_with_rev, summary.attempted)
+                }
+              />
               <Reading
                 label="模型调用"
-                value={calls === null ? '未读到' : calls}
-                tone={calls === null ? 'danger' : 'plain'}
+                value={summary == null || summary.llm_calls === null ? '未读到' : summary.llm_calls}
+                tone={summary == null || summary.llm_calls === null ? 'danger' : 'plain'}
               />
               <Reading
-                label="每笔交付调用数"
-                value={
-                  calls === null ? '未读到' : perDelivery === null ? '无交付' : perDelivery
+                label="每笔落地成本"
+                // 还没拿到合计时印「—」，不印「无落地」：后者是一个结论（窗口里一条都没关），
+                // 而这时页面只是还不知道。
+                value={summary === undefined ? '—' : (costGap ?? perClosureCost ?? '无落地')}
+                tone={
+                  summary === undefined
+                    ? 'plain'
+                    : costGap !== null || perClosureCost === null
+                      ? 'danger'
+                      : 'plain'
                 }
-                tone={calls === null || perDelivery === null ? 'danger' : 'plain'}
               />
               <Reading
-                label="每笔交付成本"
-                value={
-                  micros === null
-                    ? costGap
-                    : perDeliveryCost === null
-                      ? '无交付'
-                      : perDeliveryCost
+                label="每笔送出变更成本"
+                value={summary === undefined ? '—' : (costGap ?? perShippedCost ?? '无 rev 交付')}
+                tone={
+                  summary === undefined
+                    ? 'plain'
+                    : costGap !== null || perShippedCost === null
+                      ? 'danger'
+                      : 'plain'
                 }
-                tone={micros === null || perDeliveryCost === null ? 'danger' : 'plain'}
+              />
+              <Reading
+                label="每笔送出变更调用数"
+                value={
+                  summary == null || summary.llm_calls === null
+                    ? '未读到'
+                    : perShippedCalls ?? '无 rev 交付'
+                }
+                tone={
+                  summary == null || summary.llm_calls === null || perShippedCalls === null
+                    ? 'danger'
+                    : 'plain'
+                }
               />
             </div>
           </Readings>

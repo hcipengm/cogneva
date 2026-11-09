@@ -2646,9 +2646,63 @@ export interface ChangeFunnelDay {
   unpriced_calls: number | null;
 }
 
+/**
+ * 上面那些天加起来是多少。
+ *
+ * 服务端算，不由页面自己加。两个原因，都是读数面的老账：
+ *
+ * 1. **单位成本是一个比值，分母得点名。** 分子是整台部署的花销（所有调用方），
+ *    分母可以是「所有关掉的条」也可以是「带 rev 关掉的条」，两个都说得通，但答的是
+ *    两个问题：前者是「关掉一条东西要花多少」，后者是「送出一个变更要花多少」，而账上
+ *    的 ¥ 目标说的是后一个。两者的比正好是 `rev_coverage`——只印其中一个而不印覆盖率，
+ *    读数就是坏的：拿前一个当后一个读，差的就是这个比；拿后一个却不看覆盖率，读的人
+ *    分不出它是贵，还是几乎什么都没送出去。
+ * 2. 页面自己加，加起来的方式就没有测试管得住。
+ */
+export interface FunnelSummary {
+  attempted: number;
+  rounds: number;
+  passed: number;
+  /** 窗口里账上关掉的全部条数。不是产出。 */
+  landed: number;
+  /** 其中带交付 rev 的条数——真送出去的那些。 */
+  landed_with_rev: number;
+  /** `landed_with_rev / landed`。`null` = 窗口里一条都没关（分母为零时比值不存在，不是 0）。 */
+  rev_coverage: number | null;
+  /** 有任何一天没读到用量表时是 `null`——静默少加一天的读数会读成「那天没花钱」。 */
+  llm_calls: number | null;
+  /**
+   * 窗口里有价调用的花销。`null` = 说不出来，`cost_unstated` 说明是哪一种。
+   *
+   * 一天没调用、或那天的调用全都没记价，都**不是**「说不出来」：它们给有价合计加零，
+   * 藏起来的下界由 `unpriced_calls` 说。
+   */
+  cost_micros: number | null;
+  /** `cost_micros` 的币种，取自价目表标签。页面不自己选符号。 */
+  cost_currency: string | null;
+  /**
+   * `cost_micros` 为 `null` 的原因：`usage_unread`（有用量的天没读到）、
+   * `mixed_currency`（跨币种，这里没有汇率）、`nothing_priced`（一天有价调用都没有，
+   * 合计是零但没有币种能把它说出来）。这是服务端算的，页面不自己从 days 里再推一遍。
+   */
+  cost_unstated: 'usage_unread' | 'mixed_currency' | 'nothing_priced' | null;
+  /** 有调用没记价的数量。有一个就让上面所有钱数是下界。`null` = 有天的用量没读到。 */
+  unpriced_calls: number | null;
+  /** 关掉一条东西要买多少次调用。 */
+  calls_per_landing: number | null;
+  /** 送出一个变更要买多少次调用——这是账上的目标所依据的那个分母。 */
+  calls_per_shipped_change: number | null;
+  /** `cost_micros / landed`。 */
+  cost_per_landing_micros: number | null;
+  /** `cost_micros / landed_with_rev`。 */
+  cost_per_shipped_change_micros: number | null;
+}
+
 export interface ChangeFunnel {
   /** 旧的在前，与账本自己的顺序一致；页面要新的在前时自己翻。 */
   days: ChangeFunnelDay[];
+  /** 上面那些天的合计，服务端算的。 */
+  summary: FunnelSummary;
 }
 
 export async function getChangeFunnel(days = 14): Promise<ChangeFunnel> {

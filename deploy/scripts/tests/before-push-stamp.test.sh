@@ -629,4 +629,93 @@ grep -q '这棵树在跑的过程中变过' "${work}/out" &&
 grep -q '两把键都不记' "${work}/out" &&
     fail "收尾算不出内容键那一支说「两把键都不记」，但改动键照常落地：那句话会把一份已经判过的改动说成没判过；实得：$(cat "${work}/out")"
 
-echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效；键不取决于调用方的 PATH 里有没有 cargo"
+# 19) 远端在这一跑的期间往前走了，而这棵树一个字节都没动。改动键的基底跟着变了，
+#     于是开跑那把与收尾那把对不上——上一版把这当成「这批改动在跑的过程中变过」，
+#     改动键直接作废：判过的明明是同一份字节，只因为远端追上了一笔就要重判两小时。
+#     2026-11-10 实测：两边同时在门下跑，谁先推谁就把对方这一跑白烧掉。
+#     这一格要的是：收尾按**新基底**重算改动键并记下来，而且这一笔在提交之后、以及
+#     变基到新基底之后都仍然命中（推前钩子问的正是那个基底）。
+#     边界：共同祖先只会因为「远端涨到了这个 HEAD 的后代」而变深。旁支型前进（远端落了
+#     与 HEAD 无关的一笔）不会让共同祖先动，改动键本来就不变，也就轮不到这里。
+btree="${work}/btree"
+mkdir -p "${btree}/deploy/scripts/tests" "${btree}/.github/workflows" "${btree}/.github/scripts/tests" "${btree}/bin"
+stage_gate "${repo}" "${btree}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${btree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${btree}/.github/scripts/tests/ok.test.sh"
+printf 'Write-Host "fixture"\n' >"${btree}/bootstrap.ps1"
+cat >"${btree}/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
+  fmt|clippy) exit 1 ;;
+  *) echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
+esac
+SH
+chmod +x "${btree}/bin/cargo"
+# 这一步只动 `.git` 里的那个引用：造一个 C1 的后代提交（内容多一个 peer.txt），
+# 把 refs/remotes/origin/main 指过去。工作树与真索引都不碰——碰了就成了第 16 格
+# 那种「树变过」，两件事就分不开了。
+cat >"${btree}/advance-origin.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+idx="$(mktemp)"
+rm -f "${idx}"
+GIT_INDEX_FILE="${idx}" git read-tree HEAD
+printf 'peer\n' >peer.txt
+GIT_INDEX_FILE="${idx}" git add peer.txt
+tree="$(GIT_INDEX_FILE="${idx}" git write-tree)"
+rm -f peer.txt "${idx}"
+commit="$(printf 'peer advance\n' | git commit-tree "${tree}" -p HEAD)"
+git update-ref refs/remotes/origin/main "${commit}"
+SH
+cat >"${btree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: a peer pushes main while the gate is judging this tree
+        run: bash advance-origin.sh
+YAML
+(
+    cd "${btree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    git add tracked.txt advance-origin.sh .github/workflows/ci.yml bootstrap.ps1 \
+        deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
+        deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh \
+        deploy/scripts/*.py
+    git commit -q -m base
+    # 起跑时远端在 C0、HEAD 在 C1：改动键里含 C1 这一笔。
+    git update-ref refs/remotes/origin/main HEAD
+    printf 'two\n' >second.txt
+    git add second.txt
+    git commit -q -m second
+    # 未提交的那一份：这一跑判的是它，提交之后它就该命中推前钩子问的那个键。
+    printf 'dirty\n' >>tracked.txt
+) || fail "远端前进那一格的夹具建不起来"
+bt_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/btree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/btree.lock"
+    PATH="${btree}/bin:${PATH}")
+( cd "${btree}" && "${bt_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/bout" 2>&1 ||
+    fail "远端前进那一跑自己红了，这一格判不了记账：$(cat "${work}/bout")"
+grep -q '这批改动在跑的过程中变过' "${work}/bout" &&
+    fail "远端往前走被当成「这批改动变过」：判过的字节一个位没动，改动键不该作废；实得：$(grep '记账' "${work}/bout")"
+grep -q '远端在这跑期间往前走了' "${work}/bout" ||
+    fail "远端在跑期间往前走了，记账时没说；实得：$(grep '记账' "${work}/bout")"
+# 提交的是**这一跑判过的那份字节**，所以用 `add -A`：夹具里未跟踪的东西（假 cargo 之类）
+# 也在判过的那份里，只提交 touched 的那个文件会让两边对不上，而那种对不上是夹具的错，
+# 不是门的错。真实流程里也一样——你判完把自己那份提交掉。
+git -C "${btree}" add -A
+git -C "${btree}" commit -q -m 'the change the gate judged'
+( cd "${btree}" && "${bt_env[@]}" bash deploy/scripts/check-before-push.sh --status-patch ) >"${work}/bout3" 2>&1 ||
+    fail "提交之后改动键不再命中：这一笔本可以不再重判，现在要重跑；$(cat "${work}/bout3")"
+# 真正的结局在这里：推之前必须先把远端那笔合进来（快进不了就被拒），而合进来之后
+# 从新基底到 HEAD 的 diff 正是这批改动本身——钩子问的是这一把。只有开跑那把会命中；
+# 照新基底重算的那把（diff 里反着算进 peer.txt）在这里必然对不上。
+git -C "${btree}" rebase -q refs/remotes/origin/main >"${work}/brebase" 2>&1 ||
+    fail "夹具的变基做不成，这一格判不了：$(cat "${work}/brebase")"
+( cd "${btree}" && "${bt_env[@]}" bash deploy/scripts/check-before-push.sh --status-patch ) >"${work}/bout4" 2>&1 ||
+    fail "变基到远端新基底之后改动键不再命中：这才是这一格要防的白跑；$(cat "${work}/bout4")"
+
+echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效，远端在跑期间追上了这一支时按新基底重记而不是作废、并且变基之后照样命中；键不取决于调用方的 PATH 里有没有 cargo"

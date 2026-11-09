@@ -365,6 +365,11 @@ run_dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 # 记一把，结尾对不上就不记账：这一跑仍然回答了「开跑那棵树绿不绿」，但它不是现在这份
 # 字节的判词。取不到（读不出指纹）时不参与比对，交给结尾那一处自己说。
 start_ckey="$(content_key 2>/dev/null || true)"
+# 改动键的基底也记一把：远端在这一跑的期间往前走了，收尾那把键就会变，而这**不是**
+# 这批改动被改过——判过的字节一个位没动，变的只是「从哪儿算起」这个标签。两种漂移
+# 要分得开（2026-11-10 实测：同事在我这跑期间推进了 main，我这一跑判的字节没变，
+# 改动键却按「改动变过」作废，两小时白跑）。
+start_base="$(git merge-base HEAD origin/main 2>/dev/null || true)"
 start_pkey="$(patch_key 2>/dev/null || true)"
 
 failures=0
@@ -924,9 +929,24 @@ fi
 # 「判了的全绿」与「每一面都判过」是两句话。上一版只说前一句，于是缺工具的格子（印了
 # SKIP 的那些）在判词上与验过同形——同一份字节在一台装了 pwsh 的机器上有 8 面都验过，
 # 在这台只有 7 面，两次都说「全绿」。要推的是字节，不是机器，所以没验的那几面得点名。
-skipped_list="$(printf '%s\n' "${skipped_faces[@]:-}" | awk 'NF && !seen[$0]++' | paste -sd'、' -)"
-if [ -n "${skipped_list}" ]; then
-    echo "PRE-PUSH: 判过的 $(wc -l <"${segment_log}" 2>/dev/null | tr -d ' ') 步全绿；另有 $(printf '%s\n' "${skipped_list}" | tr '、' '\n' | wc -l | tr -d ' ') 面本机没验，不算验过：${skipped_list}。"
+# 名字与条数从同一个地方数出来。上一版用 `paste -d'、' -` 拼名字、再用 `tr '、' '\n'`
+# 数条数：`paste -d` 的分隔符按**字节**取（C locale 下 `、` 只取了首字节 0xe3），印出来是
+# 一个替换符、几个面名黏成一句；而 `tr` 也按字节切，正好把那一个字节切成换行，条数歪打正着
+# 是对的。两处都不能留：名字是给人读的，读不出来等于没点名；条数若哪天跟着改了实现，就没
+# 人发现它其实一直在数错。现在 awk 一次拼出名字（它写的是 UTF-8 字节，不经过任何 locale
+# 规则），条数直接数数组。
+skipped_unique=()
+if [ "${#skipped_faces[@]}" -gt 0 ]; then
+    mapfile -t skipped_unique < <(printf '%s\n' "${skipped_faces[@]}" | awk 'NF && !seen[$0]++')
+fi
+skipped_count="${#skipped_unique[@]}"
+skipped_list=""
+if [ "${skipped_count}" -gt 0 ]; then
+    skipped_list="$(printf '%s\n' "${skipped_unique[@]}" |
+        awk 'NR == 1 { out = $0; next } { out = out "、" $0 } END { printf "%s", out }')"
+fi
+if [ "${skipped_count}" -gt 0 ]; then
+    echo "PRE-PUSH: 判过的 $(wc -l <"${segment_log}" 2>/dev/null | tr -d ' ') 步全绿；另有 ${skipped_count} 面本机没验，不算验过：${skipped_list}。"
     echo "         这几面推上去由 CI 判，它们红了这一跑看不出来——所以别把这一行读成整轮验过。"
 else
     echo "PRE-PUSH: 上列的判据全绿。"
@@ -953,6 +973,7 @@ pkey="$(patch_key)"
 # 两把键都不记。判词本身照常留在输出里——它说的是开跑那棵树。
 moved=0
 moved_why="这棵树在跑的过程中变过"
+tree_moved=0
 if [ -n "${start_ckey}" ] && [ -z "${ckey}" ]; then
     # 「算不出」与「变过」都让这一跑不能记账，但叫人去做的事相反：前者是收尾这一问
     # 读不到（树忽然读不出来），后者是有人动了字节。落进同一条消息里，读的人会去找
@@ -966,15 +987,36 @@ if [ -n "${start_ckey}" ] && [ -z "${ckey}" ]; then
     echo "记账：收尾算不出内容键（开跑 ${start_ckey:0:12}），内容键不记；改动键照记——这一跑判过这批改动，缺的是收尾那一问。" >&2
 elif [ -n "${start_ckey}" ] && [ "${ckey}" != "${start_ckey}" ]; then
     moved=1
+    tree_moved=1
     echo "记账：${moved_why}（开跑 ${start_ckey:0:12}，收尾 ${ckey:0:12}），这一跑的判词不属于现在这份字节，两把键都不记。" >&2
     ckey=""
 fi
 voided_patch=0
-if [ -n "${start_pkey}" ] && [ -n "${pkey}" ] && [ "${pkey}" != "${start_pkey}" ]; then
-    moved=1
+base_now="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+base_moved=0
+if [ -n "${start_base}" ] && [ -n "${base_now}" ] && [ "${base_now}" != "${start_base}" ]; then
+    base_moved=1
+fi
+if [ "${tree_moved}" -ne 0 ]; then
+    # 树自己变过：这批改动与判过的那份不是一回事，两把键都不记（上面已经说过）。
+    # 判据是 `tree_moved` 而不是 `moved`：收尾算不出内容键时 `moved` 也是 1，但那与
+    # 「判过的是不是这批改动」无关，那只该丢内容键。
     voided_patch=1
-    echo "记账：这批改动在跑的过程中变过（开跑 ${start_pkey:0:12}，收尾 ${pkey:0:12}），改动键不记。" >&2
     pkey=""
+elif [ "${base_moved}" -ne 0 ]; then
+    # 远端在这一跑期间往前走了，而树一个位没动。共同祖先只会在一种情况下变深：远端涨到了
+    # 这个 HEAD 的后代（别人把这一支推上去了）。于是「这一推要补上的那一段」缩水了，收尾
+    # 按**新基底**重算的这把才是推前钩子要问的那把——记它，判过的字节没变，不必重判。
+    #
+    # 旁支型前进（远端落了与 HEAD 无关的一笔）不会走到这里：那种情况下共同祖先一个位没动，
+    # 改动键也一个位没动。这条边界值得写下来，否则下一个人会把「远端动了」当成触发器。
+    moved=1
+    echo "记账：远端在这跑期间往前走了（基底 ${start_base:0:12} → ${base_now:0:12}），判过的字节没变，改动键按新基底重记（${pkey:0:12}）。" >&2
+elif [ -n "${start_pkey}" ] && [ -n "${pkey}" ] && [ "${pkey}" != "${start_pkey}" ]; then
+    # 基底没动、改动键却变了：变的是这批改动本身（判过的那批不是你手上这批）。
+    voided_patch=1
+    pkey=""
+    echo "记账：这批改动在跑的过程中变过（开跑 ${start_pkey:0:12}，收尾 ${pkey:0:12}），改动键不记。" >&2
 fi
 if [ -z "${ckey}" ]; then
     # 上面已经说过为什么不记（树变过），这里不再补一句读起来像「写盘失败」的话。
@@ -1000,7 +1042,11 @@ else
     echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
 fi
 if [ "${moved}" -ne 0 ]; then
-    echo "推进账不记：${moved_why}，这一跑判的不是现在这份字节。" >&2
+    if [ "${tree_moved}" -eq 0 ] && [ "${base_moved}" -ne 0 ]; then
+        echo "推进账不记：origin/main 在这跑期间往前走了，这一跑判的（HEAD, origin/main）这一对已经不是现在那一对；内容键与改动键另记，照常能推。" >&2
+    else
+        echo "推进账不记：${moved_why}，这一跑判的不是现在这份字节。" >&2
+    fi
 elif [ "${run_dirty}" -ne 0 ]; then
     echo "推进账另记：工作树上有 ${run_dirty} 处未提交改动，这一跑判的不是 HEAD 的字节，暂不记。"
     echo "      提交之后这棵树的字节没变，内容键照样命中，提交与推送两个钩子都不用再判。"
