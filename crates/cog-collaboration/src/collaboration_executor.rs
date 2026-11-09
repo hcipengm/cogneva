@@ -842,11 +842,6 @@ impl CollaborationExecutor {
     /// in the background like every other knowledge write so it cannot decide
     /// whether the task is done.
     ///
-    /// The reason archived is the run's own, never `fallback`: `fallback` is a
-    /// sentence for the error this returns, and a sentence invented here would
-    /// become the root cause the Evaluator reads back for this class of task.
-    /// A run that states no reason leaves the field empty — "no cause recorded"
-    /// is a reading, "something failed" is not.
     /// Read the configured boundary rules against the decomposition that was
     /// just produced, at the one point where the declaration and the tasks it
     /// is about are both in hand.
@@ -954,6 +949,11 @@ impl CollaborationExecutor {
         reason
     }
 
+    /// The reason archived is the run's own, never `fallback`: `fallback` is a
+    /// sentence for the error this returns, and a sentence invented here would
+    /// become the root cause the Evaluator reads back for this class of task.
+    /// A run that states no reason leaves the field empty — "no cause recorded"
+    /// is a reading, "something failed" is not.
     fn fail_run(
         &self,
         task: &Task,
