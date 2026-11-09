@@ -191,6 +191,30 @@ impl NatsMessageBackend {
         }
     }
 
+    /// 一批载荷按「这条传输收不收得下」分成两堆：收不下的带序号与字节数留在
+    /// 前一堆，其余的下标留在后一堆，两堆合起来恰好是原批。
+    ///
+    /// 分开是**按条**判的，不是按批判的：一条运行历史超限，是它自己太大这个
+    /// 属性，同批的别的消息没有一条跟它共享这个理由。按第一条超限把整批拒掉，
+    /// 代价就是本来装得下的那些一起发不出去。抽成纯函数是为了能直接喂一批
+    /// 尺寸测——批量发布那一路要一台真 NATS 才走得到，而这里判的正是「谁被
+    /// 摘出去」这件事，与网络无关。
+    fn split_batch_by_limit(
+        payloads: &[Vec<u8>],
+        limit: usize,
+    ) -> (Vec<(usize, usize)>, Vec<usize>) {
+        let mut oversized = Vec::new();
+        let mut deliverable = Vec::with_capacity(payloads.len());
+        for (index, payload) in payloads.iter().enumerate() {
+            if payload.len() > limit {
+                oversized.push((index, payload.len()));
+            } else {
+                deliverable.push(index);
+            }
+        }
+        (oversized, deliverable)
+    }
+
     /// 把 JetStream 的发布失败翻成我们的类型。
     ///
     /// 只有一条值得单独翻出来：服务器对「这条消息超过流允许的最大尺寸」有一条
@@ -326,16 +350,20 @@ impl MessageBackend for NatsMessageBackend {
             return Ok(());
         }
         let (_stream, limit) = self.ensure_stream(subject).await?;
-        if let Some(oversized) = payloads.iter().find(|p| p.len() > limit) {
-            return Err(SFError::PayloadTooLarge {
-                size: oversized.len(),
-                limit: Some(limit),
-            });
-        }
+        // 一条超限的载荷不是整批的判据：它挡得住的只有它自己。同一批里别的消息
+        // 没有一条跟它共享那个理由——一次运行的历史有多大，跟它旁边那条任务
+        // 消息该不该落地没有关系。按第一条超限把整批拒掉，代价就是本来装得下
+        // 的那些消息一起发不出去，而它们落不了地没有任何自己的过错。
+        //
+        // 所以超限的按条摘出来（序号、字节数、界写在日志行上：被拒的原因只有
+        // 尺寸，而尺寸是这一条自己的属性），其余的照发，发完再把这次拒交出去。
+        // 交错误而不是 `Ok`，是因为这一批里确有该落地而没落地的消息，答「成功」
+        // 是一句它没赚到的话；先发后报，是为了这个错不掩盖已经写出去的那些。
+        let (oversized, deliverable) = Self::split_batch_by_limit(payloads, limit);
         let subject = subject.to_string();
-        let futures = payloads.iter().map(|payload| {
+        let futures = deliverable.iter().map(|index| {
             let subject = subject.clone();
-            let payload = payload.clone();
+            let payload = payloads[*index].clone();
             let jetstream = self.jetstream.clone();
             async move {
                 let size = payload.len();
@@ -346,8 +374,26 @@ impl MessageBackend for NatsMessageBackend {
                 Ok::<(), SFError>(())
             }
         });
-        futures::future::try_join_all(futures).await?;
-        Ok(())
+        let delivered = futures::future::try_join_all(futures).await;
+        for (index, size) in &oversized {
+            tracing::error!(
+                index = *index,
+                batch_len = payloads.len(),
+                size_bytes = *size,
+                frame_limit_bytes = limit,
+                "payload in this batch is larger than the transport will accept: refusing it on its own instead of the whole batch, the rest were published"
+            );
+        }
+        // 传输出错照旧优先交出：那是「等一等可能就好」的失败，调用方按瞬时失败
+        // 处理，重试的职责不变；超限那条等多久都不会变小，已经被摘在上面了。
+        delivered?;
+        match oversized.iter().map(|(_, size)| *size).max() {
+            Some(size) => Err(SFError::PayloadTooLarge {
+                size,
+                limit: Some(limit),
+            }),
+            None => Ok(()),
+        }
     }
 
     async fn stop_stream(&self, subject: &str, group: &str) {
@@ -669,6 +715,38 @@ mod tests {
             NatsMessageBackend::effective_payload_limit(4_096, 65_536),
             4_096
         );
+    }
+
+    /// 一批里有一条超限，被摘出去的只有那一条：它自己太大，同批别的消息没有
+    /// 一条跟它共享这个理由，所以它们照样在可投递的那一堆里。整批按第一条
+    /// 超限拒掉，代价就是这些装得下的消息一起发不出去。
+    #[test]
+    fn one_oversized_payload_does_not_take_the_rest_of_the_batch_down() {
+        let batch = vec![vec![0u8; 10], vec![0u8; 4_097], vec![0u8; 32]];
+        let (oversized, deliverable) = NatsMessageBackend::split_batch_by_limit(&batch, 4_096);
+        assert_eq!(
+            oversized,
+            vec![(1, 4_097)],
+            "被摘出去的是第 1 条，带着它自己的字节数"
+        );
+        assert_eq!(
+            deliverable,
+            vec![0, 2],
+            "同批里装得下的两条必须留在可投递那一堆里"
+        );
+    }
+
+    /// 整批都装得下 ⇒ 一条都不摘，`publish_batch` 走的是原来那条路。界本身
+    /// 不宽不严：正好等于上限的载荷是能进去的，不多摘一条。
+    #[test]
+    fn a_batch_that_fits_is_untouched_and_the_limit_is_inclusive() {
+        let batch = vec![vec![0u8; 4_096], Vec::new(), vec![0u8; 1]];
+        let (oversized, deliverable) = NatsMessageBackend::split_batch_by_limit(&batch, 4_096);
+        assert!(
+            oversized.is_empty(),
+            "装得下的一批不该被摘掉任何一条: {oversized:?}"
+        );
+        assert_eq!(deliverable, vec![0, 1, 2]);
     }
 
     /// 服务器回的错帧是 JSON，`jetstream::Error` 实现了 `Deserialize` ⇒ 可以拿
