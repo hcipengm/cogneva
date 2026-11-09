@@ -62,6 +62,7 @@ pub mod notifications;
 pub mod observability;
 pub mod observable;
 pub mod output;
+pub mod output_reading;
 pub mod pace_reservations;
 pub mod plugin;
 pub mod pricing;

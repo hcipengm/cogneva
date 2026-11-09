@@ -39,42 +39,7 @@ use serde::Serialize;
 use crate::error::ApiError;
 use crate::GatewayState;
 
-/// 一层产出这一拍读到了没有。
-///
-/// 与能力面同一个形状：`measured` 印值，`unwired` 说清缺哪一层，`unread` 说清这一拍
-/// 为什么读失败。三态要做的修复各不相同，折成一个数就分不出该修哪儿。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum Reading<T> {
-    Measured { value: T },
-    Unwired { because: String },
-    Unread { because: String },
-}
-
-impl<T> Reading<T> {
-    pub fn measured(value: T) -> Self {
-        Reading::Measured { value }
-    }
-
-    pub fn unwired(because: impl Into<String>) -> Self {
-        Reading::Unwired {
-            because: because.into(),
-        }
-    }
-
-    pub fn unread(because: impl Into<String>) -> Self {
-        Reading::Unread {
-            because: because.into(),
-        }
-    }
-
-    pub fn value(&self) -> Option<&T> {
-        match self {
-            Reading::Measured { value } => Some(value),
-            _ => None,
-        }
-    }
-}
+pub use crate::output_reading::Reading;
 
 /// 这一窗口结束的活。
 #[derive(Debug, Clone, PartialEq, Serialize)]
