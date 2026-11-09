@@ -136,7 +136,7 @@ fn production_rows(text: &str, rel: &str) -> Vec<Row> {
     let mut depth: i32 = 0;
     let mut fixtures: Option<i32> = None;
     let mut expecting_test_module = false;
-    let mut raw: Option<usize> = None;
+    let mut scan = ScanState::default();
     let mut above = Above::default();
     for line in text.lines() {
         // 这一行的判词是**上一行之前**攒下来的那一块：常量自己这一行会把块清空，
@@ -144,7 +144,7 @@ fn production_rows(text: &str, rel: &str) -> Vec<Row> {
         let block_above = above.clone();
         above.observe(line);
         let trimmed = line.trim();
-        let code = code_only(line, &mut raw);
+        let code = code_only(line, &mut scan);
         // `#[cfg(test)]` guards whatever comes next -- a module, or a single
         // `fn for_test` -- but attributes and doc comments may sit in between,
         // so the guard waits for the next line that is code.
@@ -654,6 +654,21 @@ const BARE_KUBECTL_TIMEOUT: &str = "kubectl-timeout";
 /// more row in a debt nobody is paying.
 const BARE_LITERAL_CEILING: u64 = 0;
 
+/// 扫描跨行时要带下去的那点状态：raw string 的井号数，以及「这一行结束时还
+/// 在一个普通字符串里面」。
+///
+/// 两样都必须跨行。fixture 里常见的
+/// `format!("#[cfg(test)]\nmod tests {{…}}\n")` 是用行尾 `\` 续行的普通字符串
+/// 写的，读到第二行时它仍然是字符串，而按行读会把那一行当代码——它净 `-4` 个
+/// 花括号，`mod tests` 的深度随即被打穿，之后整个测试模块都按生产代码扫。
+#[derive(Default)]
+struct ScanState {
+    /// raw string 的井号数（`r#"…"#` 是 1）。
+    raw: Option<usize>,
+    /// 走到行尾时仍在普通字符串里。
+    in_str: bool,
+}
+
 /// `Duration::from_*(<literal>)` and byte multipliers, per file and shape.
 ///
 /// Line-oriented and deliberately crude: a number on the same line as a `//`
@@ -686,12 +701,12 @@ fn scan_bare_literals(root: &Path, files: &[PathBuf]) -> BTreeMap<(String, Strin
         let mut depth: i32 = 0;
         let mut fixtures: Option<i32> = None;
         let mut expecting_test_module = false;
-        let mut raw: Option<usize> = None;
+        let mut scan = ScanState::default();
         // A kubectl call split across lines, accumulated until its parens close.
         let mut kubectl_window: Option<String> = None;
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            let code = code_only(line, &mut raw);
+            let code = code_only(line, &mut scan);
             // `#[cfg(test)]` guards whatever follows it -- a module, or a single
             // `fn for_test` -- but attributes and doc comments may sit in
             // between, so the guard waits for the next line that is code.
@@ -782,20 +797,39 @@ fn scan_bare_literals(root: &Path, files: &[PathBuf]) -> BTreeMap<(String, Strin
 /// `"outcome=\"reclaimed\"} 1"` would then close the scan's notion of the test
 /// module a hundred lines early -- the rest of the module would read as
 /// production. A number inside a message is not a dial either, so the same pass
-/// serves both readers. Approximate on purpose: a raw string spanning lines is
-/// not tracked, and every line starts outside one.
-fn code_only(line: &str, raw: &mut Option<usize>) -> String {
+/// serves both readers. Approximate on purpose: the only thing carried across
+/// lines is the two ways a string outlives its line — a raw string, and an
+/// ordinary one, whether the break is spelled `\` or is a real newline.
+/// Measured 2026-11-09: a `format!` fixture continued with a trailing `\` left
+/// `mod tests` four braces too shallow (`change_pipeline.rs`), and every test
+/// line under it read as production code.
+fn code_only(line: &str, scan: &mut ScanState) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::new();
     let mut i = 0;
     while i < chars.len() {
-        if let Some(hashes) = *raw {
+        if let Some(hashes) = scan.raw {
             let closes = chars[i] == '"' && (0..hashes).all(|k| chars.get(i + 1 + k) == Some(&'#'));
             if closes {
                 i += 1 + hashes;
-                *raw = None;
+                scan.raw = None;
             } else {
                 i += 1;
+            }
+            continue;
+        }
+        // Resuming inside an ordinary string: the line that opened it ended
+        // before its closing quote, so what is here is payload, not code.
+        if scan.in_str {
+            match chars[i] {
+                // A trailing `\` is the continuation itself, and the string
+                // runs on into the next line with `in_str` still set.
+                '\\' => i = (i + 2).min(chars.len()),
+                '"' => {
+                    scan.in_str = false;
+                    i += 1;
+                }
+                _ => i += 1,
             }
             continue;
         }
@@ -830,7 +864,7 @@ fn code_only(line: &str, raw: &mut Option<usize>) -> String {
                 k += 1;
             }
             if chars.get(k) == Some(&'"') {
-                *raw = Some(hashes);
+                scan.raw = Some(hashes);
                 i = k + 1;
                 continue;
             }
@@ -838,15 +872,22 @@ fn code_only(line: &str, raw: &mut Option<usize>) -> String {
         match c {
             '"' => {
                 i += 1;
+                let mut closed = false;
                 while i < chars.len() {
                     match chars[i] {
-                        '\\' => i += 2,
+                        // At the end of the line this is the continuation, and
+                        // the line ends still inside the string.
+                        '\\' => i = (i + 2).min(chars.len()),
                         '"' => {
                             i += 1;
+                            closed = true;
                             break;
                         }
                         _ => i += 1,
                     }
+                }
+                if !closed {
+                    scan.in_str = true;
                 }
             }
             '\'' => {
@@ -1035,8 +1076,10 @@ fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
 
 /// The use-site scan's failures also read as green, so both directions are
 /// pinned on a tree written for the purpose: a number above and below a
-/// fixture block is counted, the declared one and the fixture's are not, and a
-/// brace inside a fixture's raw string does not end that block early.
+/// fixture block is counted, the declared one and the fixture's are not, a
+/// brace inside a fixture's raw string does not end that block early, and a
+/// fixture continued with a trailing backslash does not turn its own second
+/// line -- braces, `from_secs(3)` and all -- into production code.
 ///
 /// It is a tree of its own rather than `crates/` because the population is
 /// coming down to zero: an assertion that the real scan finds more than N would
@@ -1071,6 +1114,21 @@ fn call(ctl: &Ctl) {
 fn a_message() -> &'static str {
     "a batch's commit names one task, so every row behind \
      the anchor was accounted for"
+}
+
+/// A fixture written as a string and continued with a trailing backslash, with
+/// a real literal on the continuation line. Read as code, that line is the
+/// fixture's own body: the braces in it close `mod tests` four too early and
+/// the `from_secs(3)` on it counts as a dial this tree turns.
+fn write_sleeping_crate(root: &std::path::Path) {
+    std::fs::write(
+        root.join("src/lib.rs"),
+        format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn slow() {{\n        \
+             std::thread::sleep(std::time::Duration::from_secs(3));\n    }}\n}}\n"
+        ),
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -1115,7 +1173,9 @@ fn below_the_module() -> Duration {
         .unwrap_or(0);
     assert_eq!(
         row, 2,
-        "expected the two production numbers (above and below the fixture block) and          neither the declared one nor the fixture's; the scan found {row}"
+        "expected the two production numbers (above and below the fixture block) and neither \
+         the declared one, the fixture's, nor the one written inside the continued fixture \
+         string; the scan found {row}"
     );
     let kubectl_row = scanned
         .get(&(
