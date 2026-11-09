@@ -53,9 +53,13 @@ case "${1:-}" in
     printf 'the three eval processes were asked to stop, and the eval pods were deleted; the supervisor will not start another round\n'
     ;;
   on)
+    # 开不是「从头再跑一遍」：断点在 checkpoint 里（`$RUNS_DIR/20261018_post-recovery.md`
+    # 一类，落在宿主上、pod 删了也在），只记**判过**的用例。下一轮读它，从判到的那个数
+    # 接着往下判，判过的既不再调模型也不再计费。所以这里只清开关，一个字都不碰
+    # checkpoint——`off` 也一样，它删 pod 是为了止血，不是为了把进度扔掉。
     rm -f "$PAUSE_FLAG" "$SEEN" "$LOGGED"
     printf 'switch=on flag=%s\n' "$PAUSE_FLAG"
-    printf 'the next ensure tick starts a supervisor; nothing here starts one now\n'
+    printf 'the next ensure tick starts a supervisor; it continues from the checkpoint, not from zero; nothing here starts one now\n'
     ;;
   status)
     if eval_paused; then

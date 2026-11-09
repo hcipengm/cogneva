@@ -136,5 +136,19 @@ case "$out" in
   *) bad "空标记被读成开着：$out";;
 esac
 
+# 6. 断点是开关不许碰的东西。关是止血（删掉那一族 pod），开是从 checkpoint 接着判，
+#    判过的用例既不再调模型也不再计费。所以这两个动作一个字节都不许改它——改了就是
+#    「开着的时候从头再来」，而这一条只有在开关真的碰过它时才会红。
+mkdir -p "$TMP/eval-runs"
+ckpt="$TMP/eval-runs/20261018_post-recovery.md"
+printf 'run 1\njudged 7\njudged 8\n' >"$ckpt"
+before=$(cksum <"$ckpt")
+run off "各方面没有理顺，先不做测评" >/dev/null
+run on >/dev/null
+after=$(cksum <"$ckpt")
+[ "$before" = "$after" ] \
+  && ok "off/on 不碰 checkpoint：断点还在，开了接着判" \
+  || bad "off/on 改动了 checkpoint：开了会从头再来"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
