@@ -7,7 +7,24 @@ use std::sync::Arc;
 use tower::{Layer, Service};
 
 use crate::error::{AuthError, AuthResult};
-use cog_core::{AuthProvider, Claims, Permission, RoleRequirement};
+use cog_core::{AuthProvider, Claims, Permission, RoleRequirement, TokenUse};
+
+/// Reject any token that is not an access token.
+///
+/// Access and refresh tokens are signed the same way and carry the same
+/// claims, so a refresh token -- valid for up to a week -- would otherwise be
+/// accepted as a bearer credential on every protected route. This is the same
+/// fail-closed direction `JwtManager::refresh_access_token` enforces in the
+/// other direction: claims decoded from a token issued before `token_use`
+/// existed read as [`TokenUse::Access`] and keep working.
+fn ensure_access_token(claims: &Claims) -> AuthResult<()> {
+    if claims.token_use != TokenUse::Access {
+        return Err(AuthError::InvalidToken(
+            "expected an access token, got a refresh token".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Extract the Bearer token from the `Authorization` header.
 fn extract_bearer_token(headers: &axum::http::HeaderMap) -> AuthResult<&str> {
@@ -45,6 +62,10 @@ pub async fn auth_middleware(
         Ok(c) => c,
         Err(e) => return AuthError::from(e).into_response(),
     };
+
+    if let Err(e) = ensure_access_token(&claims) {
+        return e.into_response();
+    }
 
     let user_id = claims.sub.clone();
     request.extensions_mut().insert(claims);
@@ -216,4 +237,51 @@ where
 /// Convenience constructor for `require_role` layer.
 pub fn require_role(requirement: RoleRequirement) -> RequireRoleLayer {
     RequireRoleLayer::new(requirement)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::{Role, UserType};
+
+    fn claims_with(token_use: TokenUse) -> Claims {
+        Claims {
+            sub: "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
+            iss: "cogneva".into(),
+            aud: "cogneva-api".into(),
+            exp: 4_102_444_800,
+            iat: 1_700_000_000,
+            jti: "3f1c2f7e-0b0a-4c1a-9a3e-2b2f0f7c9d11".into(),
+            token_use,
+            preferred_username: "testuser".into(),
+            user_type: UserType::Standard,
+            workspace_ids: vec!["ws-001".into()],
+            permissions: vec![Permission::AgentRead],
+            roles: vec![Role::Member],
+        }
+    }
+
+    #[test]
+    fn refresh_token_is_refused_as_a_bearer_credential() {
+        let err = ensure_access_token(&claims_with(TokenUse::Refresh)).unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidToken(_)),
+            "a refresh token must not authenticate protected routes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn access_token_is_accepted() {
+        ensure_access_token(&claims_with(TokenUse::Access)).unwrap();
+    }
+
+    #[test]
+    fn legacy_claims_without_token_use_still_authenticate() {
+        let mut value = serde_json::to_value(claims_with(TokenUse::Access)).unwrap();
+        value.as_object_mut().unwrap().remove("token_use").unwrap();
+        let legacy: Claims = serde_json::from_value(value).unwrap();
+
+        assert_eq!(legacy.token_use, TokenUse::Access);
+        ensure_access_token(&legacy).unwrap();
+    }
 }
