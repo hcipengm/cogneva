@@ -59,12 +59,25 @@ pub struct GateReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bound_written_secs_ago: Option<u64>,
     pub slots: Vec<SlotReading>,
+    /// 这份界不覆盖谁，以及它受什么约束。
+    ///
+    /// 带内沙箱执行器在自己的 pod 里编译，受限的是那个 pod 的 cpu / memory quota，
+    /// 不是这个目录里的位子——两层界不是同一件事。它不出现在 `slots` 里是对的；这一格
+    /// 把「不在这个界里」和「没有界」分开，否则读数面会替一个真实存在的约束说没有。
+    pub outside_the_bound: Vec<OutsideReading>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reservation: Option<ReservationReading>,
     pub pressure: Vec<PressureReading>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<LoadReading>,
     pub generated_at: String,
+}
+
+/// 一份界之外的构建方：它是谁，以及它受什么约束。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OutsideReading {
+    pub who: String,
+    pub why: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -172,6 +185,7 @@ pub fn read_gate(dir: Option<&str>, fresh_window: u64, proc_root: &Path) -> Gate
         bound: None,
         bound_written_secs_ago: None,
         slots: Vec::new(),
+        outside_the_bound: outside_the_bound(),
         reservation: None,
         pressure: pressure.clone(),
         load: load.clone(),
@@ -228,11 +242,24 @@ pub fn read_gate(dir: Option<&str>, fresh_window: u64, proc_root: &Path) -> Gate
         bound,
         bound_written_secs_ago: bound_age,
         slots,
+        outside_the_bound: outside_the_bound(),
         reservation: reserve_reading,
         pressure,
         load,
         generated_at,
     }
+}
+
+/// 这一族构建方不受宿主界的约束，读数要说出来。
+///
+/// 它有自己的 pod cpu / memory quota，编译在 pod 里跑；宿主槽位那份 flock 与它无关。
+/// 两者的界不是同一件事，所以它不出现在 `slots` 里——但「不在 slots 里」本身读不出
+/// 这件事，于是列在这里，由页面原样印出。
+fn outside_the_bound() -> Vec<OutsideReading> {
+    vec![OutsideReading {
+        who: cog_core::topology::SANDBOX_EXECUTOR.to_string(),
+        why: "在 pod 内编译，受 pod 的 cpu / memory quota 约束，不占宿主的构建槽位".to_string(),
+    }]
 }
 
 fn slots_name(file: &str) -> String {
@@ -377,6 +404,45 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
+
+    /// 界之外的构建方要在读数里点名。它不在 `slots` 里是对的，但「不在 slots 里」
+    /// 读不出「它有自己的界」——没有这一格，一个在 pod 里跑编译的执行器，在这份
+    /// 读数上与「根本没人在编译」同形。
+    #[test]
+    fn the_reading_names_the_builder_that_is_bound_by_its_pod_instead() {
+        let gate_dir = fixture();
+        let report = read_gate(
+            Some(gate_dir.to_str().expect("夹具目录是 UTF-8")),
+            900,
+            &stand_in_proc_root(),
+        );
+        let who: Vec<&str> = report
+            .outside_the_bound
+            .iter()
+            .map(|outside| outside.who.as_str())
+            .collect();
+        assert!(
+            who.contains(&cog_core::topology::SANDBOX_EXECUTOR),
+            "界之外的那一族要点名：{who:?}"
+        );
+        assert!(
+            report
+                .outside_the_bound
+                .iter()
+                .any(|outside| outside.why.contains("quota")),
+            "要说清它受什么约束，否则「不在界里」还是读成「没有界」：{:?}",
+            report.outside_the_bound
+        );
+    }
+
+    /// 一份什么都读不到的 proc 根：这条用例只看 `outside_the_bound`，与槽位无关。
+    fn stand_in_proc_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cogneva-buildgate-proc-{}-{}",
+            std::process::id(),
+            now_secs()
+        ))
+    }
 
     fn fixture() -> PathBuf {
         // 一条进程里并行跑的那些用例共用同一个 pid 与同一秒，只靠这两个数取目录会让
