@@ -331,6 +331,8 @@ mod message_backend_multi_instance_test;
 mod metric_help_reports_the_wait_the_code_does_test;
 #[path = "network_policy_subjects_name_a_component_the_code_writes_test.rs"]
 mod network_policy_subjects_name_a_component_the_code_writes_test;
+#[path = "no_json_columns_test.rs"]
+mod no_json_columns_test;
 #[path = "notification_contract_matches_its_schema.rs"]
 mod notification_contract_matches_its_schema;
 #[path = "notification_delivery_over_a_socket_test.rs"]
