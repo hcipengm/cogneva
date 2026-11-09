@@ -1340,6 +1340,40 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // answer to one question.
         let lease_broker = self.lease_broker.clone();
 
+        // ── Attempt journal: every attempt's conversation, in order ──
+        // 内核写它（每次模型说话之前、每次工具返回之后），续跑读它。装成进程
+        // 级单例而不是一路传进去：内核不认识数据库，而这条依赖不该为了一个
+        // 辅助设施掉转方向。
+        //
+        // 建表失败只告警、不拦启动：续跑是省钱的辅助，为它让整个进程起不来是
+        // 拿辅助换主线。代价是这一段没有断点，而那条事实出现在启动日志里。
+        if let Some(pool) = self.pg_pool.clone() {
+            let journal = Arc::new(crate::PostgresAttemptJournal::new(pool));
+            match journal.init_schema().await {
+                Ok(()) => {
+                    let keep = crate::postgres::attempt_journal_store::keep_days_from_env();
+                    let shutdown = ctx
+                        .consume::<cog_core::ShutdownSignal>()
+                        .map(|s| (*s).clone())
+                        .unwrap_or_default();
+                    cog_core::attempt_journal::install(journal.clone());
+                    drop(crate::postgres::attempt_journal_store::spawn_sweeper(
+                        journal,
+                        keep.saturating_mul(86_400),
+                        shutdown,
+                    ));
+                    info!(
+                        keep_days = keep,
+                        "attempt journal installed; an interrupted attempt resumes from its last recorded step"
+                    );
+                }
+                Err(e) => warn!(
+                    "the attempt journal table could not be created: {}. Interrupted attempts will restart from the beginning.",
+                    e
+                ),
+            }
+        }
+
         // ── Tier migrator (raw-log cold-tier migration) ──
         if ctx.config().tier_migrator.enabled {
             if let Some(store) = ctx.consume_service::<dyn cog_core::RawLogIndexStore>() {

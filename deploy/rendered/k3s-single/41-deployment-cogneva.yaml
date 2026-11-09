@@ -57,6 +57,7 @@ spec:
         app.kubernetes.io/version: "0.5.10"
     spec:
       serviceAccountName: cogneva
+      terminationGracePeriodSeconds: 45
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

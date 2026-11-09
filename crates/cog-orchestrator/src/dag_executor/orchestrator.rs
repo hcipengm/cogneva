@@ -3118,11 +3118,15 @@ impl DagExecutor {
     /// 它恰好被包在同一层环境信封里，账该记在它头上。
     fn names_the_environment(error: &str) -> bool {
         use cog_core::contract::outcome::{
-            ITERATION_BUDGET_EXHAUSTED_MARKER, TERMINAL_ENV_FAILURE_PREFIX,
-            UPSTREAM_UNAVAILABLE_PREFIX,
+            ITERATION_BUDGET_EXHAUSTED_MARKER, PROCESS_SHUTTING_DOWN_PREFIX,
+            TERMINAL_ENV_FAILURE_PREFIX, UPSTREAM_UNAVAILABLE_PREFIX,
         };
         let t = error.to_ascii_lowercase();
-        (t.contains(UPSTREAM_UNAVAILABLE_PREFIX) || t.contains(TERMINAL_ENV_FAILURE_PREFIX))
+        (t.contains(UPSTREAM_UNAVAILABLE_PREFIX)
+            || t.contains(TERMINAL_ENV_FAILURE_PREFIX)
+            // 进程被要求停下（滚动、节点排空）：活没做错任何事，下一次派发接着续跑。
+            // 记在任务头上等于每次滚动都从它自己的预算里扣一次。
+            || t.contains(PROCESS_SHUTTING_DOWN_PREFIX))
             && !t.contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
     }
 
@@ -6665,6 +6669,57 @@ mod tests {
         }
 
         // 环境回来了，同一件活接着干完。
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+        dag.complete_task(&task_id, serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            dag.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Completed
+        );
+    }
+
+    /// 进程被要求停下（滚动、节点排空）不是这件活的失败，账不该记在它头上。
+    ///
+    /// 排空让在飞的运行停在回合边界、把尝试留在开着，下一次派发从日志续跑——
+    /// 这条链只有在任务的重试预算一格不动时才成立。记了账的话，一天几十次
+    /// 滚动会把一件从来没做错的活滚成 `retry_count >= max_retries` 判死，而
+    /// 台账上读到的原因是"重试预算耗尽"，与它真实发生的事没有一处对得上。
+    #[tokio::test]
+    async fn store_mode_lets_a_restarting_process_pay_without_charging_the_budget() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-rollout".into()).with_state_backend(backend);
+        let task = Task::new("t-rollout", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+
+        // 与内核让路时写下的那句同一个形状，前面套一层调用方自己的包装。
+        let stopped = format!(
+            "Agent execution error: {}: the process is shutting down; the attempt is left open \
+             and the next dispatch resumes from its journal",
+            cog_core::contract::outcome::PROCESS_SHUTTING_DOWN_PREFIX
+        );
+
+        // 比这张矩阵里任何一种任务的预算都多。
+        const ROLLOUTS: u32 = 8;
+        for i in 0..ROLLOUTS {
+            let (retried, _, _) = dag
+                .fail_task_after(&task_id, stopped.clone(), None, None)
+                .await
+                .unwrap();
+            assert!(retried, "第 {i} 次滚动之后任务必须还在队列里");
+            let view = dag.get_task(&task_id).await.unwrap();
+            assert_eq!(view.status, TaskStatus::Pending, "第 {i} 次滚动之后");
+            assert_eq!(
+                view.retry_count, 0,
+                "滚动是环境的事，不是这件活的账（第 {i} 次）"
+            );
+        }
+
+        // 新进程起来了，同一件活接着跑完。
         dag.schedule_task(&task_id).await.unwrap();
         dag.start_task(&task_id).await.unwrap();
         dag.complete_task(&task_id, serde_json::json!({"ok": true}))

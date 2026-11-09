@@ -53,6 +53,11 @@ spec:
         app.kubernetes.io/version: "0.5.10"
     spec:
       serviceAccountName: cogneva
+      # Wider than core.system.shutdown_timeout_ms (30 s): the process stops its
+      # in-flight runs at a turn boundary before exiting, and kubelet only
+      # SIGKILLs when this expires. Held to the pair by
+      # tests/shutdown_budget_contract_test.rs.
+      terminationGracePeriodSeconds: 45
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

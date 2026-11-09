@@ -7,6 +7,7 @@
 pub(crate) use cog_core::fill_slots;
 
 pub mod agent_message_store;
+pub mod attempt_journal_store;
 pub mod audit_recorder;
 pub mod backup_run_store;
 pub mod change_ledger_store;
@@ -35,6 +36,7 @@ pub use agent_message_store::{
     AgentMessage, AgentMessageStore, NewAgentMessage, PostgresAgentMessageStore, SendOutcome,
     ROWS_KEPT_PER_PEER,
 };
+pub use attempt_journal_store::PostgresAttemptJournal;
 pub use audit_recorder::PostgresAuditRecorder;
 pub use backup_run_store::PostgresBackupRunStore;
 pub use change_ledger_store::PostgresChangeLedgerStore;

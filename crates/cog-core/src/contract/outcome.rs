@@ -24,6 +24,17 @@ pub const TERMINAL_ENV_FAILURE_PREFIX: &str = "terminal_env_failure";
 /// repeating, or cost rising with nothing to show for it.
 pub const DEGENERATE_LOOP_PREFIX: &str = "degenerate_loop";
 
+/// Prefix carried by a run that stopped because the process running it was told
+/// to (a rollout, a node draining): the work reached a turn boundary and left
+/// its journal open so the next dispatch continues from there.
+///
+/// It is not a failure of the work, so it must not be charged to the task's
+/// retry budget — a rollout every hour would otherwise spend a task's whole
+/// budget on the environment and drop work that never went wrong. Nor is it
+/// [`TERMINAL_ENV_FAILURE_PREFIX`]: nothing says a re-run fails again; the next
+/// process is exactly the thing that can finish it.
+pub const PROCESS_SHUTTING_DOWN_PREFIX: &str = "process_shutting_down";
+
 /// Prefix carried by a policy refusal — a guardrail rule declined the call.
 ///
 /// Not an environment failure and not a fault: the rule is still in force, so

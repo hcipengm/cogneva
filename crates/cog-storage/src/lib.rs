@@ -74,14 +74,15 @@ pub use mem::{
 pub use postgres::{
     gauge_latest_sql, sha256_of, venue_tasks_sql, AgentMessage, AgentMessageStore, ChatTurn,
     ChatTurnRecord, ChatTurnRole, ChatTurnStore, DatasetCatalog, HookArchiveRow, NewAgentMessage,
-    NewDataset, PostgresAgentMessageStore, PostgresAuditRecorder, PostgresBackupRunStore,
-    PostgresChangeLedgerStore, PostgresChatTurnStore, PostgresDatasetCatalog,
-    PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,
-    PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,
-    PostgresPgeStageStore, PostgresPrincipleLedgerStore, PostgresRawLogIndexStore,
-    PostgresResourceEventStore, PostgresSnapshotStore, PostgresStateBackend,
-    PostgresTasteIntentStore, PostgresUserStore, SendOutcome, DAG_LOCK_WORKSPACE_SQL,
-    EVENTS_PAGE_SQL, LOG_LINES_PER_TASK, ROWS_KEPT_PER_PEER, ROWS_KEPT_PER_SESSION,
+    NewDataset, PostgresAgentMessageStore, PostgresAttemptJournal, PostgresAuditRecorder,
+    PostgresBackupRunStore, PostgresChangeLedgerStore, PostgresChatTurnStore,
+    PostgresDatasetCatalog, PostgresDecisionStatsStore, PostgresGovernanceStore,
+    PostgresHookArchive, PostgresMetricsBackend, PostgresNotificationStore,
+    PostgresObservabilityGateway, PostgresPgeStageStore, PostgresPrincipleLedgerStore,
+    PostgresRawLogIndexStore, PostgresResourceEventStore, PostgresSnapshotStore,
+    PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore, SendOutcome,
+    DAG_LOCK_WORKSPACE_SQL, EVENTS_PAGE_SQL, LOG_LINES_PER_TASK, ROWS_KEPT_PER_PEER,
+    ROWS_KEPT_PER_SESSION,
 };
 
 #[cfg(feature = "redis")]

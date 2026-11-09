@@ -252,6 +252,9 @@ pub struct AgentPlugin {
     pool: Option<Arc<crate::GlobalAgentManager>>,
     lifecycle_client: Option<Arc<dyn cog_core::AgentLifecycleClient>>,
     eval_event_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<cog_core::AgentEvent>>>,
+    /// 关停时等在飞的运行让路多久，来自 `core.system.shutdown_timeout_ms`。
+    /// 零表示没人声明过，那就**不等**：一个没有依据的等待比不等更糟。
+    drain_timeout_ms: std::sync::atomic::AtomicU64,
 }
 
 impl AgentPlugin {
@@ -263,6 +266,7 @@ impl AgentPlugin {
             pool: None,
             lifecycle_client: None,
             eval_event_rx: tokio::sync::Mutex::new(None),
+            drain_timeout_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -283,6 +287,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
         if self.initialized {
             return Ok(());
         }
+
+        self.drain_timeout_ms.store(
+            ctx.config().system.shutdown_timeout_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Snapshot config values to drop immutable borrow before publishing.
         let (
@@ -636,6 +645,15 @@ impl cog_core::SystemPlugin for AgentPlugin {
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // 停机信号交给排空闸：内核在每个回合之间看它一眼，关停的那一侧在
+        // `shutdown()` 里等运行走到边界。装在这里而不是二进制根，是因为
+        // 「谁跑智能体」由这个插件决定，换一个宿主也不能少这一条。
+        //
+        // 在 `start` 而不是 `init`：停机信号是二进制根在 `init_all` 之后才发布
+        // 的（它要在所有插件初始化完才有人等），`init` 里读只会读到没有。
+        if let Some(signal) = ctx.consume::<cog_core::ShutdownSignal>() {
+            cog_core::drain::install((*signal).clone());
+        }
         if let Some(ref pool) = self.pool {
             if let Some(task_runner) = ctx.consume_service::<dyn cog_core::TaskExecutionCallback>()
             {
@@ -725,6 +743,30 @@ impl cog_core::SystemPlugin for AgentPlugin {
     }
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
+        // 先等手上的运行让路，再注销 worker：反过来的话，正在收尾的那一次运行
+        // 会在注册表里找不到自己，而它其实还在跑。
+        //
+        // 等的是「走到回合边界」，不是「整件活做完」——内核在每轮模型调用之前
+        // 看排空闸，走到那里就停，工具结果已经落盘，下一次派发原样接上。
+        if cog_core::drain::requested() {
+            let limit = std::time::Duration::from_millis(
+                self.drain_timeout_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if limit.is_zero() {
+                warn!(
+                    in_flight = cog_core::drain::in_flight(),
+                    "no shutdown timeout was declared; in-flight runs are left to their journals"
+                );
+            } else if cog_core::drain::wait_drained(limit).await {
+                info!("every in-flight run reached a turn boundary before shutdown");
+            } else {
+                warn!(
+                    in_flight = cog_core::drain::in_flight(),
+                    "shutdown ran out of time with runs still in flight; they resume from their journals"
+                );
+            }
+        }
         // 注册表是全集群共享的（多副本同名 worker、其他 pod 的 squad 智能体
         // 都在里面），只能注销本进程自己拉起的 worker；其余条目交给 TTL 自然
         // 过期，心跳侧遇到 key 丢失会自行重新注册。

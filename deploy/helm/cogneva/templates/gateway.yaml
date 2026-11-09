@@ -52,6 +52,10 @@ spec:
         app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     spec:
       serviceAccountName: cogneva
+      {{- /* 必须宽于 core.system.shutdown_timeout_ms：SIGTERM 之后进程在预算内让在飞的
+      运行停在回合边界，宽限期到点 kubelet 才 SIGKILL。宽限短于预算时排空只是在日志里
+      发生过，而清单本身读不出这件事；两者的关系由 shutdown_budget_contract_test 判。 */}}
+      terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGraceSeconds }}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

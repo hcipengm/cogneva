@@ -141,6 +141,8 @@ mod app_config_substitutions_contract_test;
 mod assistant_event_tags_compared_are_tags_the_enum_writes_test;
 #[path = "atomic_replace_is_written_once_test.rs"]
 mod atomic_replace_is_written_once_test;
+#[path = "attempt_resume_test.rs"]
+mod attempt_resume_test;
 #[path = "auth_error_codes_are_one_vocabulary_test.rs"]
 mod auth_error_codes_are_one_vocabulary_test;
 #[path = "autonomous_executor_test.rs"]
@@ -415,6 +417,8 @@ mod scenes_hand_work_to_the_roster_test;
 mod scrape_targets_name_a_port_the_workload_provides_test;
 #[path = "service_account_mount_literals_contract_test.rs"]
 mod service_account_mount_literals_contract_test;
+#[path = "shutdown_budget_contract_test.rs"]
+mod shutdown_budget_contract_test;
 #[path = "skill_directories_contract_test.rs"]
 mod skill_directories_contract_test;
 #[path = "sparse_weights_are_loaded_once_contract_test.rs"]

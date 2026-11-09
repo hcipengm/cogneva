@@ -198,6 +198,11 @@ spec:
         app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     spec:
       serviceAccountName: cogneva-evolution
+      {{- /* 与主应用同一对：这个 Pod 也跑 agent 回合（实测 2026-11-09 它的
+      self-signal-alert-* planner 与主应用的 generator 同时在飞）。没有这一格，
+      进化 Pod 被滚动时宽限期停在默认 30 秒，进程的排空预算还没走完就被 SIGKILL，
+      清单上却看起来「已经做了」。 */}}
+      terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGraceSeconds }}
       securityContext:
         {{- /* lit: 0 fixed — the evolution workload runs as root to drive host-path workspaces */}}
         runAsUser: 0

@@ -1843,6 +1843,29 @@ rows:
   # config file, the env layer that overrides it, the network policy on both
   # sides, the ingress, and the deployment notes -- and a port that moves in one
   # of them reads as a dead backend, not as a half-finished edit.
+  - key: shutdown.drainBudgetMs
+    source: override
+    why: >-
+      How long the process may spend letting in-flight runs reach a turn
+      boundary and stop before it exits. Pinned at 30 s because nothing
+      measures the drain yet: the loop that should set it is "how long does a
+      real drain take", and that reading has no history. It is pinned equal to
+      cogneva.json's shutdown_timeout_ms by a contract test. Debt: once the
+      drain wait has run for a while, this number moves to derived. Top level,
+      not under gateway, because both workloads that run agent turns (the app
+      and the evolution pod) read it.
+
+  - key: shutdown.terminationGraceSeconds
+    source: override
+    why: >-
+      The pod's grace period, for every workload that runs agent turns. It is
+      one half of a pair with drainBudgetMs, not an independent dial: a grace
+      shorter than the budget has kubelet send SIGKILL while the drain hooks
+      are still finishing, which is the drain silently not happening. The
+      pair's relation (grace >= budget + 15 s of margin for log flush and
+      runtime teardown) is asserted by a contract test, since no measurement
+      moves either half yet.
+
   - key: gateway.httpPort
     source: fixed
     why: >-

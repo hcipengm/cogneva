@@ -274,6 +274,16 @@ pub enum RunOutcome {
     /// 写下去。与 [`Self::BudgetExhausted`] 分开计：那一个说轮数不够，这一个说
     /// 轮数够了、动作没有——再给轮数只会换来同一批读。
     NoProgress,
+    /// 进程被要求停下，运行在回合边界主动让路。
+    ///
+    /// 与 [`Self::BudgetExhausted`] 分开计：那一个说「再给几轮就行」，这一个
+    /// 说这次运行是被外部叫停的，轮数还有。它不算交付（没有答案），也不该算
+    /// 这个角色失败——真正读它的是重投之后那一次续跑。
+    ///
+    /// A run that stopped between turns because the process is shutting down.
+    /// It delivered nothing, but nothing it did was wasted: the conversation is
+    /// left open and the next dispatch resumes from it.
+    Preempted,
     /// A guardrail rule refused a tool call and the run's refusal allowance was
     /// spent, so the run stopped without an answer.
     ///

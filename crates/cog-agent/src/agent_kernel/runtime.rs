@@ -1,3 +1,4 @@
+use cog_core::attempt_journal::{self, EffectClass, JournalEntry, JournalKind};
 use cog_core::{
     AgentEvent, AssistantMessageEvent, ContentBlock, Message, SFError, SFResult, ToolCall,
     ToolDefinition,
@@ -375,6 +376,9 @@ pub struct AgentRuntime {
     run_usage: RunUsage,
     /// Turns the run in flight has actually started.
     run_iterations: u32,
+    /// 这次尝试是从日志里接着跑的第几轮之后开始的。迭代预算从它之后算：
+    /// 被杀掉之前花掉的轮次已经花过了，不该从这一次的额度里再扣一遍。
+    resumed_turns: u32,
     /// How the run in flight ended. Reset by every [`Self::run_scoped`] and set
     /// by [`Self::note_run_ending`], so the run's single exit can report the
     /// skill the role was bound to with the same verdict the observable counted
@@ -1029,6 +1033,7 @@ impl AgentRuntime {
             run_usage: RunUsage::default(),
             run_task_id: None,
             run_iterations: 0,
+            resumed_turns: 0,
             run_outcome: None,
             context_overrun_reported: false,
             reply_is_the_result: false,
@@ -1522,6 +1527,10 @@ impl AgentRuntime {
         llm: &dyn cog_core::LlmClient,
         run_task_id: Option<&str>,
     ) -> SFResult<serde_json::Value> {
+        // 这一次运行在飞期间，停机的那一侧会等它走到回合边界（见
+        // `cog_core::drain`）。守卫活着就算在飞，落盘在 `Drop` 里，panic 与
+        // 提前返回都算结束——否则一次失败的运行会让关停永远等不到零。
+        let _in_flight = cog_core::drain::enter_run();
         let started = self.begin_scoped_run(run_task_id);
         let outcome = self.run_turns(input, llm, run_task_id).await;
         self.finish_scoped_run(run_task_id, started, outcome).await
@@ -1585,6 +1594,7 @@ impl AgentRuntime {
     fn begin_scoped_run(&mut self, run_task_id: Option<&str>) -> std::time::Instant {
         self.run_usage = RunUsage::default();
         self.run_iterations = 0;
+        self.resumed_turns = 0;
         // 换了一次运行就是一个新的额度：上一轮报过的那次超大 prompt，不能替这一轮
         // 把嘴堵上，否则第二轮同样的问题会在任何地方都读不到。
         self.context_overrun_reported = false;
@@ -1615,8 +1625,13 @@ impl AgentRuntime {
         // 一跑以错误收场，就在这一处报出去：`run_loop` 的三个出口都汇到这里，
         // 逐出口去报就得在每一处重写一遍「报过没有」，而漏掉的那一处正好是
         // 读者最想知道的那一种结局。
+        // 排空让路不算失败：它是一次计划内的停手，错的是时刻，不是这次运行。
+        // 报成 `AgentError` 会让每次滚动部署都在告警面上留一串「失败」，而
+        // 真正该被看见的失败会被它冲淡。重投由调用方按错误做，那是另一条路。
         if let Err(ref e) = outcome {
-            self.note_run_failure(e).await;
+            if self.run_outcome != Some(crate::observable::RunOutcome::Preempted) {
+                self.note_run_failure(e).await;
+            }
         }
         self.run_task_id = None;
         outcome
@@ -1685,7 +1700,12 @@ impl AgentRuntime {
         // skill: the work may have been right and the tool simply not allowed
         // in this scope. Scoring it would charge the skill for someone else's
         // rule, the same way an upstream outage would.
-        if ending == crate::observable::RunOutcome::Refused {
+        // 一次被叫停的运行也不是关于这个技能的证据：它什么都没做成，不是做得
+        // 不对。记进去等于把「别人的部署」记到这个技能头上。
+        if matches!(
+            ending,
+            crate::observable::RunOutcome::Refused | crate::observable::RunOutcome::Preempted
+        ) {
             return;
         }
         let delivered = ending.delivered();
@@ -1915,6 +1935,200 @@ impl AgentRuntime {
         .await
     }
 
+    /// 这件任务把对话记在哪一行日志下。
+    ///
+    /// 判据是「有没有主的任务」：没有任务的身份（内嵌运行、界面里的一段对话、
+    /// 常驻角色）不记——它们的第二次运行不是同一次尝试的重跑，记下来只会在
+    /// 不相干的两次运行之间搬一段历史。
+    ///
+    /// 名字取 `agent_id` 而不是任务 id：同一件任务上几个角色各干各的
+    /// （`agent_id_for(task, role)`），按任务 id 记会让两个人的对话挤进同一份
+    /// 日志。这个名字由任务与角色**算出来**，进程换了重算还是同一个。
+    fn journal_key(&self) -> Option<&str> {
+        self.config
+            .owner_task_id
+            .as_deref()
+            .map(|_| self.config.agent_id.as_str())
+    }
+
+    /// 记一条。没有装日志、或者这次运行没有主的任务，就什么都不做。
+    ///
+    /// 写不进去不打断运行：续跑是省钱的辅助，把「记不下来」变成「跑不了」，
+    /// 等于拿一条辅助设施换掉主线。失败留一条 warn 并计数，读的人分得清
+    /// 「日志一直在正常工作」与「日志从来没写进去过」。
+    async fn journal(&self, entry: JournalEntry) {
+        let Some(key) = self.journal_key() else {
+            return;
+        };
+        let Some(journal) = attempt_journal::current() else {
+            return;
+        };
+        if let Err(e) = journal.append(key, &entry).await {
+            attempt_journal::record_write_failure();
+            tracing::warn!(agent_id = %self.config.agent_id, error = %e, "attempt journal write failed; this run continues without a resume point");
+        }
+    }
+
+    /// 记下一条进入过上下文的消息。
+    ///
+    /// 取的是**上下文里那一条**（`history` 的最后一条），不是交进去的原文：
+    /// 工具结果进上下文时会按窗口预算收缩，日志要记的正是模型读到的那一份。
+    async fn journal_last_context_message(
+        &self,
+        kind: JournalKind,
+        tool_call_id: Option<String>,
+        tool: Option<String>,
+    ) {
+        let Some(message) = self.context.messages().last().cloned() else {
+            return;
+        };
+        self.journal(JournalEntry::message(kind, message, tool_call_id, tool))
+            .await;
+    }
+
+    /// 一次尝试跑完了：这次对话不再重放。
+    async fn journal_close(&self) {
+        self.journal(JournalEntry::closed()).await;
+    }
+
+    /// 该不该在回合边界让路。
+    ///
+    /// 两个条件缺一不可：进程被要求停下，并且这次运行有日志可续。没有任务的
+    /// 运行没有可续的地方，提前退出只是把已经做出来的东西扔掉。
+    fn should_preempt(&self) -> bool {
+        self.journal_key().is_some() && cog_core::drain::requested()
+    }
+
+    /// 在回合边界让路。记下这个结局，把尝试留在开着的状态。
+    ///
+    /// 返回错误而不是一个「成功的空结果」：这次运行没有交付任何东西，把它读成
+    /// 成功会让上层把一件没做完的活记成做完。
+    fn preempt(&mut self, iterations: u32) -> SFError {
+        tracing::info!(
+            agent_id = %self.config.agent_id,
+            task_id = self.config.owner_task_id.as_deref().unwrap_or(""),
+            iterations,
+            in_flight = cog_core::drain::in_flight(),
+            "the process is shutting down; stopping at the turn boundary, the attempt stays open"
+        );
+        self.note_run_ending(crate::observable::RunOutcome::Preempted, iterations);
+        // 标记写在最前面：派发层把错误拍平成文本再判要不要重试，而这段文本
+        // 拿不到「进程被要求停下」这个事实。带上它，环境付账，任务的重试预算
+        // 一格不动；不带它，每滚一次就扣一次，滚几次之后一件没做错的活被判死。
+        SFError::Agent(format!(
+            "{}: the process is shutting down; the attempt is left open and the next dispatch \
+             resumes from its journal",
+            cog_core::contract::outcome::PROCESS_SHUTTING_DOWN_PREFIX
+        ))
+    }
+
+    /// 接着上一次跑。
+    ///
+    /// 日志里有一条没交付的对话，就把它的消息原样交还给上下文，再把**没有
+    /// 结果的工具调用**按各自的副作用等级处置掉：读的重跑，写的重跑（工具
+    /// 本身拒绝锚点已不在的改写，所以重跑不会落两次），有外部效果的一律不重跑
+    /// ——把「不确定」连同它的事实交给模型，让它先去看一眼世界。
+    async fn resume_from_journal(&mut self) {
+        let Some(key) = self.journal_key().map(str::to_string) else {
+            return;
+        };
+        let Some(journal) = attempt_journal::current() else {
+            return;
+        };
+        let entries = match journal.load(&key).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                attempt_journal::record_write_failure();
+                tracing::warn!(agent_id = %self.config.agent_id, error = %e, "attempt journal could not be read; this run starts from the beginning");
+                return;
+            }
+        };
+        let Some(plan) = crate::agent_kernel::resume::plan(&entries) else {
+            return;
+        };
+        // 上下文里原本可能还留着上一轮的投影（同一个进程里同一件任务被再派
+        // 一次）。日志是耐久的那一份，重建成它，两条路径就只有一份历史。
+        self.context.clear();
+        let messages = plan.messages.len();
+        for message in plan.messages {
+            self.context.add_message(message);
+        }
+        self.resumed_turns = plan.assistant_turns;
+        tracing::info!(
+            agent_id = %self.config.agent_id,
+            task_id = self.config.owner_task_id.as_deref().unwrap_or(""),
+            messages,
+            resumed_turns = plan.assistant_turns,
+            doubts = plan.doubts.len(),
+            "resuming an interrupted attempt from its journal"
+        );
+        self.resolve_doubts(&plan.doubts).await;
+    }
+
+    /// 处置没有结果的工具调用。每个都一定会产生一条结果：一个带调用却缺结果的
+    /// 助手回合，任何上游都不会接受，续跑发出的第一个请求就会失败。
+    async fn resolve_doubts(&mut self, doubts: &[crate::agent_kernel::resume::Doubt]) {
+        if doubts.is_empty() {
+            return;
+        }
+        let scope = self
+            .run_task_id
+            .as_deref()
+            .map(|tid| crate::tools::ToolScope {
+                task_id: tid.to_string(),
+                agent_id: self.config.agent_id.clone(),
+            });
+        for doubt in doubts {
+            let text = match attempt_journal::effect_of(&doubt.tool) {
+                // 只读：重跑一次，与它本来会得到的结果没有区别。
+                EffectClass::Read => self
+                    .tools
+                    .execute_scoped(&doubt.tool, doubt.arguments.clone(), scope.as_ref())
+                    .await
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string()),
+                // 写文件：重跑是安全的，因为工具自己拒绝「锚点已经不在」的改写。
+                // 拦在这里替它猜，反而会让一次真的没落上的写被当成落上了。
+                EffectClass::Write => self
+                    .tools
+                    .execute_scoped(&doubt.tool, doubt.arguments.clone(), scope.as_ref())
+                    .await
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|e| {
+                        serde_json::json!({
+                            "error": e.to_string(),
+                            "note": "this call was in flight when the process stopped and its result was lost; \
+                                     this reply is from a re-run. If the anchor is gone, the write most likely \
+                                     already landed -- read the file before deciding."
+                        })
+                        .to_string()
+                    }),
+                // 有外部效果：**绝不重跑**。提交、推送、起任务、发消息，重跑一次
+                // 就在世界上多留一次效果，而这里没有任何东西能事后把它合并掉。
+                // 交给模型：它能读，它知道自己在干什么，它比这条路径更清楚
+                // 该不该再来一次。
+                EffectClass::Effect => serde_json::json!({
+                    "interrupted": true,
+                    "tool": doubt.tool,
+                    "note": "this call was dispatched but the process stopped before its result was \
+                             recorded, so whether it took effect is unknown. It was NOT repeated. \
+                             Look at the state of the world (the files, the ledger, the command's \
+                             visible output) before deciding whether to run it again."
+                })
+                .to_string(),
+            };
+            let message = Message::tool_result_text(&doubt.call_id, &doubt.tool, text);
+            self.journal(JournalEntry::message(
+                JournalKind::ToolResult,
+                message.clone(),
+                Some(doubt.call_id.clone()),
+                Some(doubt.tool.clone()),
+            ))
+            .await;
+            self.context.add_message(message);
+        }
+    }
+
     /// The run itself, from the first turn to its answer.
     async fn run_turns(
         &mut self,
@@ -1923,6 +2137,20 @@ impl AgentRuntime {
         run_task_id: Option<&str>,
     ) -> SFResult<serde_json::Value> {
         self.begin_run(run_task_id).await?;
+
+        // 这件任务此前跑到哪儿了：先读日志，读得到就从那里接着跑。
+        //
+        // 放在契约与输入之前：那两段是**这一次尝试**才有的东西，历史消息排在
+        // 它们后面。先续、再铺这次的请求，模型的请求就是「同一段说话的继续」，
+        // 上游的前缀缓存也从第一个字节起就命中。
+        self.resume_from_journal().await;
+
+        // 刚被要求停下：连这一次尝试的请求都不再铺开。日志的最后一行还是
+        // 上一次落下的那条有结果的调用，下一次派发从它后面接上——不多记一条
+        // 重复的请求，也不多问一次模型。
+        if self.should_preempt() {
+            return Err(self.preempt(0));
+        }
 
         // The stable half of the input document (the answer contract) is hoisted
         // to the front on its own. The whole document serializes in JSON key
@@ -1967,6 +2195,8 @@ impl AgentRuntime {
             .unwrap_or_else(|| cog_core::contract::prompt::render_varying_half(&payload));
         if media.is_empty() {
             self.context.add_message(Message::user(rendered));
+            self.journal_last_context_message(JournalKind::User, None, None)
+                .await;
         } else {
             // 截图与录屏要作为媒体块交给模型，它才看得见——这是通用循环的
             // 能力，不该只有某一条专用判定路径有。
@@ -1974,6 +2204,8 @@ impl AgentRuntime {
             blocks.push(cog_core::ContentBlock::text(rendered));
             blocks.extend(media);
             self.context.add_message(Message::user_blocks(blocks));
+            self.journal_last_context_message(JournalKind::User, None, None)
+                .await;
         }
 
         self.run_loop(llm, run_task_id).await
@@ -2014,7 +2246,20 @@ impl AgentRuntime {
         // good idea. See `DeliveredResults`.
         let mut delivered = DeliveredResults::default();
 
-        for iteration in 0..self.config.max_iterations {
+        // 这次尝试的轮次从续跑点之后开始，预算按「这一次还能花几轮」算。
+        // 被杀掉之前花掉的那些已经花过了——把它们再扣一遍，一件被中断过两次的
+        // 任务会因为「重跑了几遍」而永远跑不完它本来一轮就能做完的活。
+        let first_turn = self.resumed_turns;
+        let budget_end = first_turn.saturating_add(self.config.max_iterations);
+        for iteration in first_turn..budget_end {
+            // 排空闸。进程被要求停下时，这里不再向模型发起新一轮：上一轮的工具
+            // 批次已经跑完、结果全部落盘，对话正好停在「最后一条有结果的调用
+            // 之后」，下一次派发原样接上，一步不丢。只看**回合之间**：在批次
+            // 中间退出会留下带调用却没有结果的助手回合，那正是续跑要处置的
+            // 不确定——排空就是为了不制造它。
+            if self.should_preempt() {
+                return Err(self.preempt(iteration.saturating_sub(first_turn)));
+            }
             tracing::info!(agent_id = %self.config.agent_id, iteration, "AgentRuntime::run iteration start");
             // 这一步做完了就是「这一轮还在动」的证据。编排侧的回收与执行路由的
             // 守护都读它，而且都只读它：没有任何一条判据看这次运行已经花了多久，
@@ -2030,7 +2275,7 @@ impl AgentRuntime {
             for task_id in [owner, run].into_iter().flatten() {
                 cog_core::progress::beat(task_id);
             }
-            self.run_iterations = iteration + 1;
+            self.run_iterations = iteration + 1 - first_turn;
             // --- Turn Start ---
             self.emit_event(AgentEvent::TurnStart {
                 agent_id: self.config.agent_id.clone(),
@@ -2064,6 +2309,18 @@ impl AgentRuntime {
                 timestamp: chrono::Utc::now(),
             });
 
+            // 模型说过的话**先于它要调用的工具落盘**。这条顺序是续跑唯一的
+            // 判据：日志里有这一条、没有某个调用的结果，当且仅当那次调用执行到
+            // 一半进程没了。记在工具之后，这段窗口里丢掉的是「它想干什么」，
+            // 工具跑没跑也一并丢了。
+            self.journal(JournalEntry::message(
+                JournalKind::Assistant,
+                assistant_msg.clone(),
+                None,
+                None,
+            ))
+            .await;
+
             // If no tool calls, complete normally
             if tool_calls.is_empty() {
                 return self
@@ -2071,7 +2328,7 @@ impl AgentRuntime {
                         llm,
                         thought_text,
                         assistant_msg,
-                        iteration + 1,
+                        iteration + 1 - first_turn,
                         crate::observable::RunOutcome::Delivered,
                     )
                     .await;
@@ -2084,7 +2341,7 @@ impl AgentRuntime {
             // anything over. Writing it off here records a question that was
             // never put as one that cannot be answered — and the budget it
             // would have answered out of is already paid for.
-            if iteration == self.config.max_iterations - 1 {
+            if iteration + 1 == budget_end {
                 tracing::warn!(
                     agent_id = %self.config.agent_id,
                     max_iterations = self.config.max_iterations,
@@ -2110,9 +2367,20 @@ impl AgentRuntime {
                         &tc.name,
                         not_run.to_string(),
                     ));
+                    // 「没跑」也是一条结果，而且要落盘：不落，下一次续跑读到的
+                    // 就是「这几个调用没有结果」，把它们当成执行到一半、再跑一遍
+                    // ——预算结束前明明没跑的东西，续跑时被重放了出去。
+                    self.journal_last_context_message(
+                        JournalKind::ToolResult,
+                        Some(tc.id.clone()),
+                        Some(tc.name.clone()),
+                    )
+                    .await;
                 }
                 self.context
                     .add_message(Message::user(FINAL_DRAFT_INSTRUCTION));
+                self.journal_last_context_message(JournalKind::User, None, None)
+                    .await;
                 // 这一问是整轮里唯一在预算花完之后发出的请求，所以必须自己有界：
                 // 停顿超时只挡「不吭声」，一个一直吐字的流可以在它里面待到很久。
                 let draft_timeout =
@@ -2169,7 +2437,7 @@ impl AgentRuntime {
                             llm,
                             draft,
                             msg,
-                            self.config.max_iterations + 1,
+                            iteration + 2 - first_turn,
                             crate::observable::RunOutcome::DeliveredAfterExhaustion,
                         )
                         .await;
@@ -2216,7 +2484,7 @@ impl AgentRuntime {
 
                 self.note_run_ending(
                     crate::observable::RunOutcome::BudgetExhausted,
-                    iteration + 1,
+                    iteration + 1 - first_turn,
                 );
 
                 return Ok(result);
@@ -2225,7 +2493,7 @@ impl AgentRuntime {
             // Emit ReAct step start before executing tool calls
             self.emit_event(AgentEvent::ReActStepStart {
                 agent_id: self.config.agent_id.clone(),
-                iteration,
+                iteration: iteration - first_turn,
                 timestamp: chrono::Utc::now(),
             })
             .await?;
@@ -2443,7 +2711,7 @@ impl AgentRuntime {
             // Emit ReAct step end after all observations collected
             self.emit_event(AgentEvent::ReActStepEnd {
                 agent_id: self.config.agent_id.clone(),
-                iteration,
+                iteration: iteration - first_turn,
                 thought: thought_text.clone(),
                 tool_calls: tool_calls.clone(),
                 observations: observations.clone(),
@@ -2454,8 +2722,17 @@ impl AgentRuntime {
             // Step 5: Update context
             self.state = RuntimeState::Updating;
             self.context.add_message(assistant_msg);
-            for tr in &tool_result_messages {
+            for (tr, tc) in tool_result_messages.iter().zip(tool_calls.iter()) {
                 self.context.add_message(tr.clone());
+                // 记的是上下文收下的那一条（`messages` 的最后一条，可能被窗口
+                // 预算收缩过），不是交进去的原文：续跑把另一份交还给模型，
+                // 模型读到的历史就与它当时读到的不是同一个东西。
+                self.journal_last_context_message(
+                    JournalKind::ToolResult,
+                    Some(tc.id.clone()),
+                    Some(tc.name.clone()),
+                )
+                .await;
             }
             // After the results, so the note is the last thing read before the
             // next turn: a stretch of reads with nothing written is exactly the
@@ -2463,6 +2740,10 @@ impl AgentRuntime {
             // getting somewhere.
             if let Some(note) = progress.take_note() {
                 self.context.add_message(Message::user(note));
+                // 这段提醒也是对话的一部分：续跑把它补回来，模型读到的历史就
+                // 与当时逐字节一致，上游的前缀缓存也命中同一段。
+                self.journal_last_context_message(JournalKind::User, None, None)
+                    .await;
             }
 
             self.emit_event(AgentEvent::TurnEnd {
@@ -2490,7 +2771,10 @@ impl AgentRuntime {
                      every result is evicted the moment it arrives, so the run ends here \
                      instead of re-sending an identical request until the budget is spent"
                 );
-                self.note_run_ending(crate::observable::RunOutcome::Unreadable, iteration + 1);
+                self.note_run_ending(
+                    crate::observable::RunOutcome::Unreadable,
+                    iteration + 1 - first_turn,
+                );
                 self.emit_event(AgentEvent::AgentEnd {
                     agent_id: self.config.agent_id.clone(),
                     messages: self.published_messages(),
@@ -2503,7 +2787,7 @@ impl AgentRuntime {
                     "status": cog_core::contract::outcome::CONTEXT_FLOOR_EXCEEDS_WINDOW_STATUS,
                     "budget": self.config.context_window_size,
                     "estimated": self.context.token_count(),
-                    "iterations": iteration + 1,
+                    "iterations": iteration + 1 - first_turn,
                 }));
             }
 
@@ -2524,7 +2808,10 @@ impl AgentRuntime {
                      been told twice; ending it here instead of spending the rest of the \
                      task's wall clock on more reads"
                 );
-                self.note_run_ending(crate::observable::RunOutcome::NoProgress, iteration + 1);
+                self.note_run_ending(
+                    crate::observable::RunOutcome::NoProgress,
+                    iteration + 1 - first_turn,
+                );
                 self.emit_event(AgentEvent::AgentEnd {
                     agent_id: self.config.agent_id.clone(),
                     messages: self.published_messages(),
@@ -2536,7 +2823,7 @@ impl AgentRuntime {
                 return Ok(serde_json::json!({
                     "status": cog_core::contract::outcome::NO_CHECKOUT_PROGRESS_STATUS,
                     "calls_since_change": progress.calls_since_change,
-                    "iterations": iteration + 1,
+                    "iterations": iteration + 1 - first_turn,
                 }));
             }
         }
@@ -2726,6 +3013,11 @@ impl AgentRuntime {
         .await?;
 
         self.note_run_ending(outcome, iterations);
+
+        // 交付了，这段对话到此为止：同一件任务的下一次运行从零开始。关闭只写在
+        // 交付这一条出口上——预算用尽、被规则拦下、上游报错都留着那条路，它们的
+        // 对话是还没交出去的东西，下一次派发正是要从那里接着跑。
+        self.journal_close().await;
 
         Ok(result)
     }

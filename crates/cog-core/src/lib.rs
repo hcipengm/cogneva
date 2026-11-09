@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod atomic_write;
+pub mod attempt_journal;
 pub mod audit;
 pub mod build_cache;
 pub mod build_cache_readings;
@@ -10,6 +11,7 @@ pub mod config_sections;
 pub mod contract;
 pub mod day;
 pub mod day_key;
+pub mod drain;
 pub mod env;
 pub mod error;
 pub mod fs_size;
