@@ -46,6 +46,13 @@ pub struct ReclaimOutcome {
 pub fn apply_reclaim(root: &Path, plan: &ReclaimPlan) -> ReclaimOutcome {
     let mut outcome = ReclaimOutcome::default();
     for group in &plan.delete {
+        // A group with no names names no file, so every name of it is gone only
+        // because there were none: charged as a removal it would report freeing
+        // bytes nothing removed, which is exactly what counting the bytes from
+        // the tree rather than from the total is here to prevent.
+        if group.paths.is_empty() {
+            continue;
+        }
         let mut every_name_gone = true;
         for path in &group.paths {
             if !path.starts_with(root) {
@@ -172,5 +179,24 @@ mod tests {
         assert_eq!(outcome.freed_files, 0);
         assert_eq!(outcome.freed_bytes, 0);
         assert_eq!(outcome.failures.len(), 1, "{outcome:?}");
+    }
+
+    /// A group that names no file is a plan with nothing in it: it is not a
+    /// removal, so it is not charged one -- a pass that reported these bytes
+    /// freed would put numbers on the volume that never left it.
+    #[test]
+    fn a_group_with_no_names_frees_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = ReclaimPlan {
+            delete: vec![PlannedGroup {
+                paths: Vec::new(),
+                len: 64,
+            }],
+            delete_bytes: 64,
+            unreachable_bytes: 0,
+        };
+        let outcome = apply_reclaim(root.path(), &plan);
+
+        assert_eq!(outcome, ReclaimOutcome::default());
     }
 }
