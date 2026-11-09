@@ -506,6 +506,16 @@ pub const SOURCES_METRIC: &str = "cogneva_outward_sources_configured";
 
 pub(crate) const LABEL_SOURCE: &str = "source";
 
+/// The `items` cell that counts answer entries the backend ranked but which
+/// carried no http(s) URL, so nothing could be handed over from them.
+///
+/// Named once because two places decide it: `declare_source` seeds the cell at
+/// zero the moment a source is seen, and each pass adds to it. A spelling that
+/// moved in one place and not the other would leave the census declaring a cell
+/// no pass ever writes. It is not `FetchFault::Unparsable`, which is a `passes`
+/// cell: an answer that parsed and held cards is a pass that produced few items.
+pub(crate) const UNUSABLE_CELL: &str = "unusable";
+
 fn bump(map: &mut BTreeMap<String, BTreeMap<String, u64>>, source: &str, cell: &str, by: u64) {
     *map.entry(source.to_string())
         .or_default()
@@ -535,7 +545,7 @@ impl OutwardCensus {
             Handover::Handed.cell(),
             Handover::AlreadyHeld.cell(),
             Handover::Failed.cell(),
-            "unusable",
+            UNUSABLE_CELL,
         ] {
             bump(&mut state.items, source, cell, 0);
         }
@@ -802,7 +812,7 @@ pub fn spawn_outward_loop(
                             )
                             .await;
                         census
-                            .record_items(&source.name, "unusable", tick.unusable as u64)
+                            .record_items(&source.name, UNUSABLE_CELL, tick.unusable as u64)
                             .await;
                         for item in &tick.items {
                             let outcome = hand_over(&orchestrator, source, item).await;
