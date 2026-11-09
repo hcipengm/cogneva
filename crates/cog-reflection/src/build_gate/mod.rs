@@ -2137,13 +2137,61 @@ fn walk_yield_event(
     }
 }
 
+/// What the window that moved the bound was looking at.
+///
+/// The ceiling alone does not say why it is what it is. The io dimension's answer
+/// is the stall budget divided by what one build has been seen to cost the
+/// device, plus whatever device load the builds in flight do not explain -- so
+/// the same ceiling means one thing while a build of ours is running and another
+/// while somebody else is writing. A row that carried only the ceiling and the
+/// dimension could not tell those two apart, and telling them apart is the
+/// question asked of the ledger when the bound is seen to move every few
+/// minutes: whether the derivation is following the host or its own admissions.
+///
+/// Measured on 2026-10-30, thirty-second scrapes of one host: in flight 1 with io
+/// 46.50 answered two, in flight 0 with io 46.77 answered one a window later, and
+/// the only input that had moved was the count. Those two windows are one ceiling
+/// with opposite meanings, and the numbers below are what separates them once the
+/// log line is gone.
+#[derive(Default, Clone, Copy)]
+struct BoundInputs {
+    cores: usize,
+    busy_cores: f64,
+    /// The median the cpu dimension was sized from, rather than the instant.
+    sustained_busy_cores: Option<f64>,
+    cpu_avg60: f64,
+    io_avg60: f64,
+    mem_avg60: f64,
+    builds_in_flight: usize,
+    /// What one build has been seen to cost the device, `None` before one has
+    /// been watched.
+    per_build_io: Option<f64>,
+    /// Builds in flight averaged over the same minute the io reading covers.
+    occupancy_avg60: f64,
+}
+
+impl BoundInputs {
+    fn of(load: &HostLoad) -> Self {
+        Self {
+            cores: load.cores,
+            busy_cores: load.busy_cores,
+            sustained_busy_cores: load.sustained_busy_cores,
+            cpu_avg60: load.pressure.cpu_avg60,
+            io_avg60: load.pressure.io_avg60,
+            mem_avg60: load.pressure.mem_avg60,
+            builds_in_flight: load.pressure.builds_in_flight,
+            per_build_io: load.per_build_io,
+            occupancy_avg60: load.occupancy_avg60,
+        }
+    }
+}
+
 /// The account's event for a bound that moved, or `None` when it did not.
 ///
 /// Stated apart from the measurement so the shape can be judged without a host:
 /// the five things the account promises a reader -- who, when, on which reading,
 /// from what to what, and how it ended -- are all here, and none of them can be
 /// read off the log line this replaces after that line rotates away.
-#[allow(clippy::too_many_arguments)]
 fn bound_move_event(
     current: usize,
     next: usize,
@@ -2151,9 +2199,7 @@ fn bound_move_event(
     dimension: &'static str,
     calm: bool,
     dir: &Path,
-    cores: usize,
-    busy_cores: f64,
-    sustained_busy_cores: Option<f64>,
+    inputs: &BoundInputs,
 ) -> Option<ResourceEvent> {
     if next == current {
         // A decision not to move is not an event: the account records what
@@ -2175,14 +2221,24 @@ fn bound_move_event(
             "dimension": dimension,
             "calm": calm,
             "dir": dir.display().to_string(),
-            "cores": cores,
-            "busy_cores": busy_cores,
+            "cores": inputs.cores,
+            "busy_cores": inputs.busy_cores,
             // Both numbers, because they answer different questions and only
             // one of them moved the bound: `busy_cores` is the instant the
             // window closed on, `sustained_busy_cores` is the median the cpu
             // dimension was sized from. A row that carried only the first would
             // leave a cpu-driven move unexplained by its own reading.
-            "sustained_busy_cores": sustained_busy_cores,
+            "sustained_busy_cores": inputs.sustained_busy_cores,
+            // The device reading beside the count of builds that could have
+            // produced it. Without both, a ceiling read while our own build was
+            // writing and one read while another tenant was writing are the
+            // same row, and the difference is the whole question.
+            "cpu_avg60": inputs.cpu_avg60,
+            "io_avg60": inputs.io_avg60,
+            "mem_avg60": inputs.mem_avg60,
+            "builds_in_flight": inputs.builds_in_flight,
+            "per_build_io": inputs.per_build_io,
+            "occupancy_avg60": inputs.occupancy_avg60,
         }),
         count: 1,
     })
@@ -2900,9 +2956,7 @@ impl BuildGate {
                     dimension,
                     calm,
                     &self.dir,
-                    load.cores,
-                    load.busy_cores,
-                    load.sustained_busy_cores,
+                    &BoundInputs::of(&load),
                 ) {
                     self.record_event(event);
                 }
@@ -8330,10 +8384,33 @@ unevictable 28532736
     /// A bound that moved carries both ends and the reading it moved on; a bound
     /// that did not move is not an event at all, or every quiet window would add
     /// a row saying nothing happened.
+    ///
+    /// And it carries enough of the window to answer *why* later. Two windows can
+    /// answer the same ceiling for opposite reasons -- one while a build of ours
+    /// is writing, one while somebody else is -- and the ledger is the only place
+    /// that distinction survives the log rotating away. A row with just the
+    /// ceiling and the dimension makes the two identical, which is exactly the
+    /// question asked when the bound is seen to move every few minutes.
     #[test]
     fn a_bound_that_moved_is_an_event_with_both_ends() {
         let dir = Path::new("/tmp/gate-dir");
-        let moved = bound_move_event(1, 3, 3, DIM_IO, true, dir, 24, 20.0, Some(14.5))
+        let ours = BoundInputs {
+            cores: 24,
+            busy_cores: 20.0,
+            sustained_busy_cores: Some(14.5),
+            io_avg60: 46.50,
+            builds_in_flight: 1,
+            per_build_io: Some(46.0),
+            occupancy_avg60: 1.0,
+            ..BoundInputs::default()
+        };
+        let theirs = BoundInputs {
+            builds_in_flight: 0,
+            io_avg60: 46.77,
+            occupancy_avg60: 0.0,
+            ..ours
+        };
+        let moved = bound_move_event(1, 3, 3, DIM_IO, true, dir, &ours)
             .expect("a move from 1 to 3 is an event");
         assert_eq!(moved.kind, ResourceEventKind::BoundChange);
         assert_eq!(moved.outcome, ResourceEventOutcome::Applied);
@@ -8348,8 +8425,34 @@ unevictable 28532736
             moved.detail["sustained_busy_cores"], 14.5,
             "the row carries the reading the cpu dimension was sized from, not only the instant"
         );
+
+        // The same ceiling, one window later, with the only difference being
+        // whose writes the device reading contains. A reader has to be able to
+        // tell these apart without the log.
+        let later = bound_move_event(3, 1, 1, DIM_IO, false, dir, &theirs)
+            .expect("a move from 3 to 1 is an event");
+        for key in [
+            "io_avg60",
+            "builds_in_flight",
+            "per_build_io",
+            "occupancy_avg60",
+        ] {
+            assert!(
+                !moved.detail[key].is_null() && !later.detail[key].is_null(),
+                "row carries no {key}：两窗只差在飞构建数，缺了它就分不出是谁的写在读数里"
+            );
+        }
+        // `per_build_io` is what the device has taught across windows, so it is
+        // the same in both; the other three are what changed, and they are the
+        // difference the row has to preserve.
+        for key in ["io_avg60", "builds_in_flight", "occupancy_avg60"] {
+            assert_ne!(
+                moved.detail[key], later.detail[key],
+                "{key} 在两窗之间本该不同（我们自己的构建 vs 别人的写回），行里却一样"
+            );
+        }
         assert!(
-            bound_move_event(2, 2, 2, DIM_IO, false, dir, 24, 24.0, None).is_none(),
+            bound_move_event(2, 2, 2, DIM_IO, false, dir, &ours).is_none(),
             "a bound that stayed where it was is not a move"
         );
     }
