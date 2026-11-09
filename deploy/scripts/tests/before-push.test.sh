@@ -180,7 +180,7 @@ out="$(cd "${leg}" && CARGO_LOG="${cargo_log}" PATH="${leg}/bin:${PATH}" \
     bash deploy/scripts/check-before-push.sh 2>&1)" || rc=$?
 
 case "${out}" in
-  *"== Test：这次要推的提交动过 1 个 crate"*) ;;
+  *"== Test：这次动过 1 个 crate 的源码"*) ;;
   *) fail "改动落在 crates/fake 上，Test 腿没有跑起来 —— ${out}" ;;
 esac
 grep -qE '^test .*-p fake.* -p cogneva|^test .*-p cogneva.* -p fake' "${cargo_log}" ||

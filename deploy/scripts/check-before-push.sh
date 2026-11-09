@@ -594,8 +594,13 @@ done
 capreg_src="crates/cogneva/tests/rust_capacity_constants_registry_test.rs"
 capreg_bin="${TMPDIR:-/tmp}/cogneva-capreg.$$"
 capreg_compiled=no
-if [ -n "${gate_rustc}" ] && CARGO_MANIFEST_DIR="${root}/crates/cogneva" \
-        "${gate_rustc}" --test --edition 2021 -o "${capreg_bin}" "${capreg_src}"; then
+# 这一格也是一次编译，所以要进槽：它原先绕开槽直调 rustc 的那一秒里，与带内构建、
+# 别的会话的构建一起抢同一台机器的 CPU 与 IO，而界是同一个数。不在槽里，读数归不到因，
+# 界也管不住它——「只差一秒」不是理由，界的单位是并发构建数，不是秒。
+if [ -n "${gate_rustc}" ] && \
+        build_slot_run "gate: 容量登记表（rustc 直编）" \
+            env CARGO_MANIFEST_DIR="${root}/crates/cogneva" \
+            "${gate_rustc}" --test --edition 2021 -o "${capreg_bin}" "${capreg_src}"; then
     capreg_compiled=yes
 fi
 if [ "${capreg_compiled}" = yes ]; then
@@ -708,6 +713,33 @@ else
     skip_step "Format" "本机 cargo 没有 rustfmt 组件（CI 的 Format 会整份跑）"
 fi
 
+# 这一跑判的 `crates/*.rs`：要推的范围 ∪ 工作树 ∪ 未跟踪，三段并集。
+#
+# 只取第一段时这里有一个假绿的洞。`origin/main...HEAD` 列的是**提交**，而这一跑末尾盖的
+# 戳记的是**盘上**的字节：一棵带着未提交 `crates/*.rs`、而这些改动一笔都没提交的树，两格
+# 都印「这次要推的提交没动 crates/ 下的 .rs」跳过了，这份字节照样拿到「验过」。2026-11-09
+# 实测：15 个这样的文件，0 个在任何一笔提交里。
+#
+# 未跟踪的也要算：新模块正是那种「还不在任何提交里」的改动，`git diff HEAD` 看不见它。
+touched_crate_sources() {
+    {
+        git diff --name-only 'origin/main...HEAD' -- 'crates/*.rs' 2>/dev/null
+        git diff --name-only HEAD -- 'crates/*.rs' 2>/dev/null
+        git ls-files --others --exclude-standard -- 'crates/*.rs' 2>/dev/null
+    } | sed '/^[[:space:]]*$/d' | sort -u
+}
+
+# 这些字节里还有没有没提交的（已改／未跟踪都算）。Clippy 那一格问它：那一格原先判的是
+# HEAD 展开出来的临时树，而临时树里放不下脏树的改动——脏树上的绿会变成一份对
+# 「没人要推的字节」的判词，而末尾的戳记的却是盘上这份。
+crate_sources_uncommitted() {
+    git status --porcelain -- 'crates/*.rs' 2>/dev/null | sed '/^[[:space:]]*$/d'
+}
+
+# 整跑读一次，Clippy 与 Test 两格共用这一份。两格各读一次会在中间树变了的时候印出
+# 两个不一致的数——而收尾那把内容键本来就会让这一跑不记账，那时这两个数谁也不对。
+uncommitted_crate_sources="$(crate_sources_uncommitted)"
+
 # Clippy 那一格在 CI 里是整份 workspace 的 `--all-targets -- -D warnings`，红一格就判整轮
 # 四十分钟为红。它的红只值一行：2026-10-30 一次 `let mut` 的 `unused_mut` 就这样烧掉了一轮，
 # 而本机此前一条读数都看不见它——脚本末尾那句「未覆盖」里写着 Clippy。
@@ -728,7 +760,7 @@ if [ -n "${cargo_bin}" ]; then
         skip_step "Clippy" "这个工具链没装 clippy 组件（CI 的 Clippy 会整份跑）"
     else
         mapfile -t touched_crates < <(
-            git diff --name-only 'origin/main...HEAD' -- 'crates/*.rs' |
+            touched_crate_sources |
                 awk -F/ '$1 == "crates" && NF >= 3 { print $2 }' | sort -u
         )
         clippy_args=()
@@ -744,7 +776,18 @@ if [ -n "${cargo_bin}" ]; then
                 skip_step "Clippy" "crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Clippy 会整份跑）"
             fi
         done
-        if [ "${crate_count}" -gt 0 ]; then
+        if [ "${crate_count}" -gt 0 ] && [ -n "${uncommitted_crate_sources}" ]; then
+            # 树脏时就地判：临时树里放不下脏树的改动，而末尾盖的戳是盘上这份字节。
+            # 判一份没人要推的字节、再把结论记到这份字节头上，等于用一个别的树的
+            # 结论替这棵树背书。与 Test 那一格同一取舍：多判别人的在飞改动是不绿得
+            # 过头，不是假绿。
+            echo "== Clippy：这次动过 ${crate_count} 个 crate 的源码（其中 $(printf '%s\n' "${uncommitted_crate_sources}" | wc -l | tr -d ' ') 份还没提交），判的是工作树"
+            judge_worktree_clippy() {
+                build_slot_run "clippy ${clippy_args[*]}" \
+                    "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings
+            }
+            run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" judge_worktree_clippy
+        elif [ "${crate_count}" -gt 0 ]; then
             repo_toplevel="$(git rev-parse --show-toplevel)"
             head_tree="$(mktemp -d "${TMPDIR:-/tmp}/cogneva-push-clippy.XXXXXX")"
             git worktree prune 2>/dev/null
@@ -765,7 +808,7 @@ if [ -n "${cargo_bin}" ]; then
                 skip_step "Clippy" "展开不出 HEAD 的临时工作树（${head_tree}），这一份没判（CI 的 Clippy 会整份跑）"
             fi
         else
-            echo "== Clippy：这次要推的提交没动 crates/ 下的 .rs，跳过（CI 的 Clippy 会整份跑）"
+            echo "== Clippy：这次要推的提交与工作树都没动 crates/ 下的 .rs，跳过（CI 的 Clippy 会整份跑）"
         fi
     fi
 else
@@ -792,7 +835,7 @@ if [ -n "${cargo_bin}" ]; then
         skip_step "Test" "本机没有 origin/main，推的范围判不出来（CI 的 Test 会整棵跑）"
     else
         mapfile -t test_crates < <(
-            git diff --name-only 'origin/main...HEAD' -- 'crates/*.rs' |
+            touched_crate_sources |
                 awk -F/ '$1 == "crates" && NF >= 3 { print $2 }' | sort -u
         )
         test_args=(-p cogneva)
@@ -815,14 +858,14 @@ if [ -n "${cargo_bin}" ]; then
             # 这条腿要站在每一次推送前面，代价必须留在分钟级（本机实测整条 Test 腿
             # 4m41s，其中测试本身 133s）。判的因而是**工作树**：树上有未提交改动时，
             # 它测的比这一推多。多测不会假绿，只是可能替别人的改动红一次。
-            echo "== Test：这次要推的提交动过 ${test_count} 个 crate 的源码，判的是工作树，外加装配件 cogneva"
+            echo "== Test：这次动过 ${test_count} 个 crate 的源码（其中 $(printf '%s\n' "${uncommitted_crate_sources}" | wc -l | tr -d ' ') 份还没提交），判的是工作树，外加装配件 cogneva"
             judge_head_tests() {
                 build_slot_run "cargo test ${test_args[*]}" \
                     "${cargo_bin}" test "${test_args[@]}" --no-fail-fast
             }
             run_step "cargo test ${test_args[*]} --no-fail-fast" judge_head_tests
         else
-            echo "== Test：这次要推的提交没动 crates/ 下的 .rs，跳过（CI 的 Test 会整棵跑）"
+            echo "== Test：这次要推的提交与工作树都没动 crates/ 下的 .rs，跳过（CI 的 Test 会整棵跑）"
         fi
     fi
 else
@@ -909,9 +952,21 @@ pkey="$(patch_key)"
 # 开跑时那把指纹与现在这把对不上，说明中间有人动过树：现在这份字节没有被这一跑判过，
 # 两把键都不记。判词本身照常留在输出里——它说的是开跑那棵树。
 moved=0
-if [ -n "${start_ckey}" ] && [ "${ckey}" != "${start_ckey}" ]; then
+moved_why="这棵树在跑的过程中变过"
+if [ -n "${start_ckey}" ] && [ -z "${ckey}" ]; then
+    # 「算不出」与「变过」都让这一跑不能记账，但叫人去做的事相反：前者是收尾这一问
+    # 读不到（树忽然读不出来），后者是有人动了字节。落进同一条消息里，读的人会去找
+    # 一个不存在的改动者。
+    #
+    # 这一支只丢内容键：改动键判的是「这一跑判过的是不是这批改动」，收尾那一问读不到
+    # 与这批改动是不是同一批无关，作废它没有依据。说成「两把都不记」会让读的人把一份
+    # 已经判过的改动重新跑一遍。
     moved=1
-    echo "记账：这棵树在跑的过程中变过（开跑 ${start_ckey:0:12}，收尾 ${ckey:0:12}），这一跑的判词不属于现在这份字节，两把键都不记。" >&2
+    moved_why="收尾算不出内容键"
+    echo "记账：收尾算不出内容键（开跑 ${start_ckey:0:12}），内容键不记；改动键照记——这一跑判过这批改动，缺的是收尾那一问。" >&2
+elif [ -n "${start_ckey}" ] && [ "${ckey}" != "${start_ckey}" ]; then
+    moved=1
+    echo "记账：${moved_why}（开跑 ${start_ckey:0:12}，收尾 ${ckey:0:12}），这一跑的判词不属于现在这份字节，两把键都不记。" >&2
     ckey=""
 fi
 voided_patch=0
@@ -945,7 +1000,7 @@ else
     echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
 fi
 if [ "${moved}" -ne 0 ]; then
-    echo "推进账不记：这棵树在跑的过程中变过，这一跑判的不是现在这份字节。" >&2
+    echo "推进账不记：${moved_why}，这一跑判的不是现在这份字节。" >&2
 elif [ "${run_dirty}" -ne 0 ]; then
     echo "推进账另记：工作树上有 ${run_dirty} 处未提交改动，这一跑判的不是 HEAD 的字节，暂不记。"
     echo "      提交之后这棵树的字节没变，内容键照样命中，提交与推送两个钩子都不用再判。"

@@ -340,4 +340,281 @@ if ( cd "${mtree}" && "${mt_env[@]}" bash deploy/scripts/check-before-push.sh --
     fail "跑的途中变过的树仍被记成验过：那一笔一秒都没被判过；实得：$(cat "${work}/out")"
 fi
 
+# 19) 盘上有还没提交的 `crates/*.rs` ⇒ Test 这一格不许跳过。
+#
+# Test 与 Clippy 的题目原先只从 `origin/main...HEAD` 推：那是一段**已提交**的范围。可收尾
+# 记的内容键是**盘上**这份字节——于是带着未提交 Rust 改动的树跑完整门，两格一句「没动
+# crates/ 下的 .rs」就跳过了，而这份字节照样拿到「验过」。2026-11-09 实测：15 个未提交的
+# `crates/*.rs`，0 个在任何一笔提交里。
+ftree="${work}/ftree"
+mkdir -p "${ftree}/deploy/scripts/tests" "${ftree}/.github/scripts/tests" \
+    "${ftree}/.github/workflows" "${ftree}/bin" "${ftree}/crates/foo/src"
+stage_gate "${repo}" "${ftree}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${ftree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${ftree}/.github/scripts/tests/ok.test.sh"
+cat >"${ftree}/bin/cargo" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
+  fmt) exit 1 ;;
+  clippy) exit 1 ;;
+  *)
+    printf '%s\n' "\$*" >>"${work}/ftree-cargo-calls"
+    echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
+esac
+SH
+chmod +x "${ftree}/bin/cargo"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${ftree}/nothing.sh"
+printf '[workspace]\nmembers = ["crates/foo"]\n' >"${ftree}/Cargo.toml"
+printf '[package]\nname = "foo"\nversion = "0.0.0"\nedition = "2021"\n' >"${ftree}/crates/foo/Cargo.toml"
+printf 'pub fn one() -> u8 { 1 }\n' >"${ftree}/crates/foo/src/lib.rs"
+cat >"${ftree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: nothing
+        run: bash nothing.sh
+YAML
+(
+    cd "${ftree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    git add tracked.txt nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
+        .github/workflows/ci.yml deploy/scripts/tests/ok.test.sh \
+        .github/scripts/tests/ok.test.sh deploy/scripts/check-before-push.sh \
+        deploy/scripts/lib/build-slot.sh
+    git commit -q -m base
+    # 门只跟 `origin/main...HEAD` 比，所以要有一条 origin/main；没有它这一格走的是「推的
+    # 范围判不出来」那条 SKIP，而不是这一例要判的那条。
+    git update-ref refs/remotes/origin/main HEAD
+) || fail "未提交改动那一格的夹具建不起来"
+# 提交之后才改：这一改不进任何一笔提交，正是这一例要的形状。
+printf 'pub fn two() -> u8 { 2 }\n' >"${ftree}/crates/foo/src/lib.rs"
+ft_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/ftree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/ftree.lock"
+    PATH="${ftree}/bin:${PATH}")
+( cd "${ftree}" && "${ft_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
+    fail "未提交改动那一跑自己红了：$(cat "${work}/out")"
+grep -q '没动 crates/ 下的 .rs' "${work}/out" &&
+    fail "盘上有未提交的 crates/foo/src/lib.rs，Test 那一格却说「没动 crates/ 下的 .rs」跳过了：这份字节没有被它判过；实得：$(cat "${work}/out")"
+grep -q -- '-p foo' "${work}/ftree-cargo-calls" 2>/dev/null ||
+    fail "Test 那一格没有把 foo 交给 cargo（未提交的改动没进题目）；实得：$(cat "${work}/ftree-cargo-calls" 2>/dev/null)"
+
+# 20) 树脏时 Clippy 就地判，不判 HEAD 展开出来的临时树。
+#
+# 临时树里放不下脏树的改动，而收尾盖的内容键是盘上这份字节。脏树上去判那份拷贝，绿的是
+# 一份没人要推的字节；把它记成「这份字节验过」，等于用一个别的树的结论替这棵树背书。
+ctree="${work}/ctree"
+mkdir -p "${ctree}/deploy/scripts/tests" "${ctree}/.github/scripts/tests" \
+    "${ctree}/.github/workflows" "${ctree}/bin" "${ctree}/crates/foo/src"
+stage_gate "${repo}" "${ctree}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/.github/scripts/tests/ok.test.sh"
+cat >"${ctree}/bin/cargo" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
+  fmt) exit 1 ;;
+  clippy)
+    case "\$2" in
+      --version) echo "clippy 9.9.9 (fixture)"; exit 0 ;;
+      *) printf '%s\n' "\$(pwd)" >>"${work}/ctree-clippy-cwd"; exit 0 ;;
+    esac ;;
+  *)
+    printf '%s\n' "\$*" >>"${work}/ctree-cargo-calls"
+    echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
+esac
+SH
+chmod +x "${ctree}/bin/cargo"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/nothing.sh"
+printf '[workspace]\nmembers = ["crates/foo"]\n' >"${ctree}/Cargo.toml"
+printf '[package]\nname = "foo"\nversion = "0.0.0"\nedition = "2021"\n' >"${ctree}/crates/foo/Cargo.toml"
+printf 'pub fn one() -> u8 { 1 }\n' >"${ctree}/crates/foo/src/lib.rs"
+cat >"${ctree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: nothing
+        run: bash nothing.sh
+YAML
+(
+    cd "${ctree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    git add tracked.txt nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
+        .github/workflows/ci.yml deploy/scripts/tests/ok.test.sh \
+        .github/scripts/tests/ok.test.sh deploy/scripts/check-before-push.sh \
+        deploy/scripts/lib/build-slot.sh
+    git commit -q -m base
+    git update-ref refs/remotes/origin/main HEAD
+) || fail "Clippy 脏树那一格的夹具建不起来"
+ct_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/ctree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/ctree.lock"
+    PATH="${ctree}/bin:${PATH}")
+printf 'pub fn two() -> u8 { 2 }\n' >"${ctree}/crates/foo/src/lib.rs"
+rm -f "${work}/ctree-clippy-cwd"
+( cd "${ctree}" && "${ct_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
+    fail "Clippy 脏树那一跑自己红了：$(cat "${work}/out")"
+dirty_cwd="$(head -n 1 "${work}/ctree-clippy-cwd" 2>/dev/null)"
+[ -n "${dirty_cwd}" ] || fail "Clippy 在脏树上没跑：$(cat "${work}/out")"
+case "${dirty_cwd}" in
+    "${ctree}") : ;;
+    *) fail "脏树上的 Clippy 判的不是工作树（cwd=${dirty_cwd}），而收尾记的是工作树的键" ;;
+esac
+# 干净树上反过来：判的是 HEAD 展开出来的那份拷贝（原行为，不许被这一改顺手丢掉）。
+rm -f "${work}/ctree-clippy-cwd"
+( cd "${ctree}" && git add crates/foo/src/lib.rs && git commit -q -m "two" ) || fail "干净树造不出来"
+( cd "${ctree}" && "${ct_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
+    fail "Clippy 干净树那一跑自己红了：$(cat "${work}/out")"
+clean_cwd="$(head -n 1 "${work}/ctree-clippy-cwd" 2>/dev/null)"
+[ -n "${clean_cwd}" ] || fail "Clippy 在干净树上没跑：$(cat "${work}/out")"
+case "${clean_cwd}" in
+    *cogneva-push-clippy*) : ;;
+    *) fail "干净树上的 Clippy 没有判 HEAD 展开出来的那份拷贝（cwd=${clean_cwd}）" ;;
+esac
+
+# 21) 容量登记表那格单文件 rustc 直编也要走构建槽。
+#
+# 这一格绕开槽的那段时间里，它与带内构建、别的会话的构建一起抢同一台机器的 CPU 与 IO，
+# 而界是同一个数：不在槽里，读数就归不到因，界也就管不住它。
+rtree="${work}/rtree"
+mkdir -p "${rtree}/deploy/scripts/tests" "${rtree}/.github/scripts/tests" \
+    "${rtree}/.github/workflows" "${rtree}/bin" "${rtree}/crates/cogneva/tests"
+stage_gate "${repo}" "${rtree}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${rtree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${rtree}/.github/scripts/tests/ok.test.sh"
+printf 'fn main() {}\n' >"${rtree}/crates/cogneva/tests/rust_capacity_constants_registry_test.rs"
+cat >"${rtree}/bin/rustc" <<SH
+#!/usr/bin/env bash
+# 跑起来的那一刻把槽文件抄一份：这一例判的就是「它当时在槽里」。
+head -n 1 "\${COGNEVA_BUILD_GATE_LOCK_DIR:-/nonexistent}/slot-0.lock" >>"${work}/rtree-slot-seen" 2>/dev/null
+out=""
+while [ \$# -gt 0 ]; do
+    case "\$1" in -o) out="\$2"; shift 2 ;; *) shift ;; esac
+done
+[ -n "\${out}" ] || exit 1
+printf '#!/usr/bin/env bash\nexit 0\n' >"\${out}"
+chmod +x "\${out}"
+SH
+chmod +x "${rtree}/bin/rustc"
+# 这一例问的是槽，不是 cargo：没有假 cargo 时真 cargo 会去找 `Cargo.toml`、找不到就红，
+# 那一步红会把这一例的结论盖掉。fmt／clippy 的版本探测回非零让那两格照常 SKIP。
+cat >"${rtree}/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
+  fmt) exit 1 ;;
+  clippy) exit 1 ;;
+  *) echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
+esac
+SH
+chmod +x "${rtree}/bin/cargo"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${rtree}/nothing.sh"
+cat >"${rtree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: nothing
+        run: bash nothing.sh
+YAML
+(
+    cd "${rtree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    git add tracked.txt nothing.sh .github/workflows/ci.yml \
+        crates/cogneva/tests/rust_capacity_constants_registry_test.rs \
+        deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
+        deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
+    git commit -q -m base
+    git update-ref refs/remotes/origin/main HEAD
+) || fail "rustc 进槽那一格的夹具建不起来"
+mkdir -p "${work}/rtree-gate"
+: >"${work}/rtree-gate/slot-0.lock"
+: >"${work}/rtree-gate/builds.claim"
+printf '1\n' >"${work}/rtree-gate/buildgate.bound"
+rm -f "${work}/rtree-slot-seen"
+ct_env2=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/rtree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/rtree.lock"
+    PATH="${rtree}/bin:${PATH}")
+( cd "${rtree}" && "${ct_env2[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 ||
+    fail "rustc 进槽那一跑自己红了：$(cat "${work}/out")"
+grep -q '容量登记表' "${work}/rtree-slot-seen" 2>/dev/null ||
+    fail "单文件 rustc 直编没有在槽里跑（槽里那行没有它）：$(cat "${work}/rtree-slot-seen" 2>/dev/null)"
+
+# 22) 收尾算不出内容键 ≠ 这棵树在跑的过程中变过。
+#
+# 两者都让这一跑不能记账，但叫人去做的事相反：前者是「算不出」，后者是「有人动了树」。
+# 开跑指纹取到、收尾取不到，原先落进「变过」那条消息里，读的人会去找一个不存在的改动者。
+gtree="${work}/gtree"
+mkdir -p "${gtree}/deploy/scripts/tests" "${gtree}/.github/scripts/tests" \
+    "${gtree}/.github/workflows" "${gtree}/bin"
+stage_gate "${repo}" "${gtree}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${gtree}/deploy/scripts/tests/ok.test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${gtree}/.github/scripts/tests/ok.test.sh"
+cat >"${gtree}/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  --version|-V) echo "cargo 9.9.9 (fixture)"; exit 0 ;;
+  fmt) exit 1 ;;
+  clippy) exit 1 ;;
+  *) echo "test result: ok. 1 passed; 0 failed; 0 ignored"; exit 0 ;;
+esac
+SH
+chmod +x "${gtree}/bin/cargo"
+# 收尾那一次 `write-tree` 失败，开跑那一次正常。用计数包一层 git，而不是把 `.git` 弄坏：
+# 弄坏会让门里排在收尾之前的每一步都读不到仓库、一起红，于是门在记账之前就退出，这一例
+# 问的那句话根本没被执行到。计数只让第二次 `write-tree` 失败——那正是收尾算内容键的第
+# 一步，其余调用照常转发。
+real_git="$(command -v git)"
+cat >"${gtree}/bin/git" <<SH
+#!/usr/bin/env bash
+if [ "\$1" = write-tree ]; then
+    n="\$(cat "${work}/gtree-write-tree" 2>/dev/null || echo 0)"
+    n=\$((n + 1))
+    echo "\$n" >"${work}/gtree-write-tree"
+    [ "\$n" -eq 1 ] || { echo "fixture: refusing the second write-tree" >&2; exit 1; }
+fi
+exec "${real_git}" "\$@"
+SH
+chmod +x "${gtree}/bin/git"
+cat >"${gtree}/.github/workflows/ci.yml" <<'YAML'
+name: ci
+jobs:
+  repo-conventions:
+    steps:
+      - name: nothing
+        run: bash nothing.sh
+YAML
+(
+    cd "${gtree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'one\n' >tracked.txt
+    printf '#!/usr/bin/env bash\nexit 0\n' >nothing.sh
+    git add tracked.txt nothing.sh .github/workflows/ci.yml \
+        deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
+        deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
+    git commit -q -m base
+    git update-ref refs/remotes/origin/main HEAD
+) || fail "算不出键那一格的夹具建不起来"
+gt_env=(env COGNEVA_BUILD_GATE_LOCK_DIR="${work}/gtree-gate" COGNEVA_BUILD_LOCK_FILE="${work}/gtree.lock"
+    PATH="${gtree}/bin:${PATH}")
+rm -f "${work}/gtree-write-tree"
+( cd "${gtree}" && "${gt_env[@]}" bash deploy/scripts/check-before-push.sh ) >"${work}/out" 2>&1 || true
+grep -q '收尾算不出内容键' "${work}/out" ||
+    fail "收尾算不出内容键时没有说清楚（读的人会当成树变过）：$(cat "${work}/out")"
+grep -q '这棵树在跑的过程中变过' "${work}/out" &&
+    fail "收尾算不出内容键被写成了「这棵树在跑的过程中变过」：叫人去找一个不存在的改动者；实得：$(cat "${work}/out")"
+# 这一支只丢内容键：改动键判的是「这一跑判过的是不是这批改动」，收尾那一问读不到与
+# 这件事无关。说成「两把都不记」会让读的人把一份已经判过的改动重跑一遍两小时。
+grep -q '两把键都不记' "${work}/out" &&
+    fail "收尾算不出内容键那一支说「两把键都不记」，但改动键照常落地：那句话会把一份已经判过的改动说成没判过；实得：$(cat "${work}/out")"
+
 echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效；键不取决于调用方的 PATH 里有没有 cargo"

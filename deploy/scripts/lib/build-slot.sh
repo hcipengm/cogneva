@@ -210,7 +210,17 @@ build_slot_run() { # build_slot_run <what> <command…>
                 done
             fi
             if [ -n "${got}" ]; then
-                build_slot_record_holder "${claimed_slot}" "${name}"
+                # The record in the slot is a reading, and the claim is an
+                # identity. A reader that finds two slots held by
+                # `gate: cargo test …` cannot say which worktree is building;
+                # the worktree's own name answers that. The claim lines below
+                # keep the bare name, because `build_slot_withdraw` compares
+                # against it to tell "the same work" from "another one" -- two
+                # spellings of one work would let a build walk past the turn it
+                # had just reserved.
+                local worktree
+                worktree="$(basename -- "$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "${PWD}")")"
+                build_slot_record_holder "${claimed_slot}" "${name} (${worktree})"
                 [ -r "${build_slot_gate_dir}/builds.claim" ] &&
                     build_slot_record_holder "${build_slot_gate_dir}/builds.claim" "${name}" 2>/dev/null
                 build_slot_withdraw "${name}"

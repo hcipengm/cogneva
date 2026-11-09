@@ -22,4 +22,11 @@ stage_gate() { # stage_gate <repo root> <fixture root>
     # fact about the gate, and a fixture that had to list it would be asserting on
     # its own copy of that fact.
     cp "${repo}/deploy/scripts/lib/"*.sh "${dest}/deploy/scripts/lib/"
+    # The gate also runs two of its siblings by path rather than sourcing them.
+    # A fixture that staged only the gate answered their absence as RED steps
+    # ("python3: can't open file ..."), which is a staging accident wearing a
+    # failing verdict -- and it was the new case that found it, not the tree.
+    # A sibling the gate starts calling is added here the same day.
+    cp "${repo}/deploy/scripts/check-format.sh" "${dest}/deploy/scripts/check-format.sh"
+    cp "${repo}/deploy/scripts/check-commit-references.py" "${dest}/deploy/scripts/check-commit-references.py"
 }
