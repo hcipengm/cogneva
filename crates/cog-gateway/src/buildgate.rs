@@ -427,9 +427,9 @@ mod tests {
         std::fs::write(dir.join("slot-0.lock"), "").unwrap();
         let mut held = std::fs::File::create(dir.join("slot-1.lock")).unwrap();
         // 持有者记录：这一格的名字与它占住的时刻。
-        write!(
+        writeln!(
             held,
-            "4242\t{}\tgate: cargo test -p cogneva\n",
+            "4242\t{}\tgate: cargo test -p cogneva",
             now_secs().saturating_sub(30)
         )
         .unwrap();
