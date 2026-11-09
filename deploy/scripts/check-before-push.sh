@@ -372,6 +372,18 @@ failures=0
 # 机器的忙碌栽给这一笔改动；写成绿更糟，那是一份没人问过的字节被记成验过。所以它自己
 # 一格，挡住推送，但说的是它自己的话。
 unjudged=0
+# 本机没验的面。这一步必须自己报出来，因为「这一格没验」在判词上原来是隐形的：一格
+# `command -v <tool> || SKIP` 让同一份字节在不同机器上得出同一个「绿」，而绿的覆盖面
+# 随机器装了哪几个可选工具而变，这个变化在最后那行判词里一个字节都不显示。2026-11-10
+# 就是这一格：本机四轮全绿，CI 的 Entry Scripts Lint 一直红——那一步在没装 pwsh 的
+# 机器上印 SKIP，而「印了 SKIP」与「验过」在判词上同形，本地没有任何读数说得出来。
+#
+# 记名字不记数字：读的人要的是「哪一面没验」，一个数说不出来，还得回去翻日志。
+skipped_faces=()
+skip_step() { # <面> <为什么没验>
+    skipped_faces+=("$1")
+    printf 'SKIP  %s：%s\n' "$1" "$2"
+}
 
 # ---- 这一跑花在哪 ----
 #
@@ -519,6 +531,9 @@ for step in "${ci_steps[@]}"; do
         SKIP)
             skipped=$((skipped + 1))
             printf 'SKIP  %s（%s）\n' "${a:-这一步没有名字}" "${b}"
+            # CI 里有、本地回放不了的那一步同样是「没验」，一样要进判词：只是它没验
+            # 的原因在于写法（多行块 / 装依赖），不在于本机装了什么。
+            skipped_faces+=("${a:-这一步没有名字}")
             ;;
         OTHER)
             unrecognised=$((unrecognised + 1))
@@ -587,7 +602,7 @@ elif [ -n "${gate_cargo}" ]; then
         build_slot_run "容量登记表" "${gate_cargo}" test -p cogneva --test suite
 else
     # 与 pwsh 那一格同一条规矩：跑不了要说出来，不能安静跳过。
-    echo "SKIP  容量登记表：本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
+    skip_step "容量登记表" "本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
 fi
 
 # 两份「名字」契约：`observability_alert_rule_contract_test.rs` 与
@@ -633,7 +648,7 @@ if [ -n "${cargo_bin}" ]; then
     run_suite_file "名字契约（观测面普查）" observability_scrape_census_contract_test \
         build_slot_run "名字契约（观测面普查）" "${cargo_bin}" test -p cogneva --test suite
 else
-    echo "SKIP  名字契约：本机没有可用的 cargo（CI 的 Code Coverage 会跑这两步）"
+    skip_step "名字契约" "本机没有可用的 cargo（CI 的 Code Coverage 会跑这两步）"
 fi
 
 # 工作区的骨架，两面都由树自己推、没有手工表：依赖方向、仅测试 crate 的豁免、crate 有没有
@@ -654,7 +669,7 @@ fi
 # 门判的是工作树，推上去的是提交，两者任一动了这两处都可能让这一格红在下一次 CI 上。
 if [ -n "${cargo_bin}" ]; then
     if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
-        echo "SKIP  crate 骨架：本机没有 origin/main，推的范围判不出来（CI 的 Test 会跑）"
+        skip_step "crate 骨架" "本机没有 origin/main，推的范围判不出来（CI 的 Test 会跑）"
     else
         skeleton_changed="$(
             { git diff --name-only 'origin/main...HEAD' -- '*Cargo.toml' 'crates/cog-core/src'
@@ -672,7 +687,7 @@ if [ -n "${cargo_bin}" ]; then
         fi
     fi
 else
-    echo "SKIP  crate 骨架：本机没有可用的 cargo（CI 的 Test 会跑这两步）"
+    skip_step "crate 骨架" "本机没有可用的 cargo（CI 的 Test 会跑这两步）"
 fi
 
 # Format 那一格在 CI 里是 `cargo fmt --all -- --check`：整棵树、十秒、一次编译都不用，
@@ -685,7 +700,7 @@ fi
 if [ -n "${cargo_bin}" ] && "${cargo_bin}" fmt --version >/dev/null 2>&1; then
     run_step "cargo fmt --all -- --check（CI 的 Format 作业同一条）" bash "${here}/check-format.sh"
 else
-    echo "SKIP  Format：本机 cargo 没有 rustfmt 组件（CI 的 Format 会整份跑）"
+    skip_step "Format" "本机 cargo 没有 rustfmt 组件（CI 的 Format 会整份跑）"
 fi
 
 # Clippy 那一格在 CI 里是整份 workspace 的 `--all-targets -- -D warnings`，红一格就判整轮
@@ -703,9 +718,9 @@ fi
 # 1m27s，其中大部分是在等别人的构建锁，自己只花 22s CPU。
 if [ -n "${cargo_bin}" ]; then
     if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
-        echo "SKIP  Clippy：本机没有 origin/main，推的范围判不出来（CI 的 Clippy 会整份跑）"
+        skip_step "Clippy" "本机没有 origin/main，推的范围判不出来（CI 的 Clippy 会整份跑）"
     elif ! "${cargo_bin}" clippy --version >/dev/null 2>&1; then
-        echo "SKIP  Clippy：这个工具链没装 clippy 组件（CI 的 Clippy 会整份跑）"
+        skip_step "Clippy" "这个工具链没装 clippy 组件（CI 的 Clippy 会整份跑）"
     else
         mapfile -t touched_crates < <(
             git diff --name-only 'origin/main...HEAD' -- 'crates/*.rs' |
@@ -721,7 +736,7 @@ if [ -n "${cargo_bin}" ]; then
             else
                 # 有 `.rs` 却读不到包名：那个目录不是工作区成员。另一条门
                 # （`crate_source_membership_contract_test`）判这件事，这里只说没判到。
-                echo "SKIP  Clippy：crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Clippy 会整份跑）"
+                skip_step "Clippy" "crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Clippy 会整份跑）"
             fi
         done
         if [ "${crate_count}" -gt 0 ]; then
@@ -742,14 +757,14 @@ if [ -n "${cargo_bin}" ]; then
                 git worktree remove --force "${head_tree}" >/dev/null 2>&1 || rm -rf "${head_tree}"
             else
                 rm -rf "${head_tree}"
-                echo "SKIP  Clippy：展开不出 HEAD 的临时工作树（${head_tree}），这一份没判（CI 的 Clippy 会整份跑）"
+                skip_step "Clippy" "展开不出 HEAD 的临时工作树（${head_tree}），这一份没判（CI 的 Clippy 会整份跑）"
             fi
         else
             echo "== Clippy：这次要推的提交没动 crates/ 下的 .rs，跳过（CI 的 Clippy 会整份跑）"
         fi
     fi
 else
-    echo "SKIP  Clippy：本机没有可用的 cargo 或 python3（CI 的 Clippy 会整份跑）"
+    skip_step "Clippy" "本机没有可用的 cargo 或 python3（CI 的 Clippy 会整份跑）"
 fi
 
 # Test：CI 的 Test 作业跑 `cargo test --workspace --no-fail-fast`。整棵在本机是十几
@@ -769,7 +784,7 @@ fi
 # 清单会说出来，因为「跑过的绿」与「没跑的绿」在读数上同形。
 if [ -n "${cargo_bin}" ]; then
     if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
-        echo "SKIP  Test：本机没有 origin/main，推的范围判不出来（CI 的 Test 会整棵跑）"
+        skip_step "Test" "本机没有 origin/main，推的范围判不出来（CI 的 Test 会整棵跑）"
     else
         mapfile -t test_crates < <(
             git diff --name-only 'origin/main...HEAD' -- 'crates/*.rs' |
@@ -785,7 +800,7 @@ if [ -n "${cargo_bin}" ]; then
             elif [ -z "${package}" ]; then
                 # 有 `.rs` 却读不到包名：那个目录不是工作区成员。另一条门
                 # （`crate_source_membership_contract_test`）判这件事，这里只说没判到。
-                echo "SKIP  Test：crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Test 会整棵跑）"
+                skip_step "Test" "crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Test 会整棵跑）"
             fi
         done
         if [ "${test_count}" -gt 0 ]; then
@@ -806,7 +821,7 @@ if [ -n "${cargo_bin}" ]; then
         fi
     fi
 else
-    echo "SKIP  Test：本机没有可用的 cargo（CI 的 Test 会整棵跑）"
+    skip_step "Test" "本机没有可用的 cargo（CI 的 Test 会整棵跑）"
 fi
 
 # Check 作业本机跑不动（要编译整个工作区，比 CI 还慢），可它红得最多的一种形状本机
@@ -821,7 +836,7 @@ if command -v python3 >/dev/null 2>&1 && git rev-parse --verify --quiet 'origin/
         python3 "${here}/check-commit-references.py" --base origin/main --head HEAD
 else
     # 跑不了要说出来，不能安静跳过：跳过的绿与跑过的绿在读数上一模一样。
-    echo "SKIP  提交引用可达性：本机没有 python3 或没有 origin/main（CI 的 Check 会跑编译）"
+    skip_step "提交引用可达性" "本机没有 python3 或没有 origin/main（CI 的 Check 会跑编译）"
 fi
 
 # ShellCheck：清单同样由 git 推出来，与 CI 同一条命令。
@@ -844,7 +859,7 @@ if command -v pwsh >/dev/null 2>&1; then
     run_step "bootstrap.ps1 语法" bash -c \
         'pwsh -NoProfile -Command "\$errs = \$null; [void][System.Management.Automation.PSParser]::Tokenize((Get-Content -Raw bootstrap.ps1), [ref]\$errs); if (\$errs.Count -gt 0) { \$errs | ForEach-Object { Write-Error \$_ }; exit 1 }"'
 else
-    echo "SKIP  bootstrap.ps1 语法检查：本机没有 pwsh（CI 会跑这一步）"
+    skip_step "bootstrap.ps1 语法检查" "本机没有 pwsh（CI 会跑这一步）"
 fi
 
 echo
@@ -858,7 +873,16 @@ if [ "${failures}" -ne 0 ]; then
     echo "PRE-PUSH: ${failures} 步红，推上去 CI 也会红。"
     exit 1
 fi
-echo "PRE-PUSH: 上列的判据全绿。"
+# 「判了的全绿」与「每一面都判过」是两句话。上一版只说前一句，于是缺工具的格子（印了
+# SKIP 的那些）在判词上与验过同形——同一份字节在一台装了 pwsh 的机器上有 8 面都验过，
+# 在这台只有 7 面，两次都说「全绿」。要推的是字节，不是机器，所以没验的那几面得点名。
+skipped_list="$(printf '%s\n' "${skipped_faces[@]:-}" | awk 'NF && !seen[$0]++' | paste -sd'、' -)"
+if [ -n "${skipped_list}" ]; then
+    echo "PRE-PUSH: 判过的 $(wc -l <"${segment_log}" 2>/dev/null | tr -d ' ') 步全绿；另有 $(printf '%s\n' "${skipped_list}" | tr '、' '\n' | wc -l | tr -d ' ') 面本机没验，不算验过：${skipped_list}。"
+    echo "         这几面推上去由 CI 判，它们红了这一跑看不出来——所以别把这一行读成整轮验过。"
+else
+    echo "PRE-PUSH: 上列的判据全绿。"
+fi
 echo "Clippy 只判这次要推的提交动过的 crate；其余 crate 的 lint 仍由 CI 整份跑。"
 echo "Test 只判这次动过的包加装配件 cogneva；其余 crate 的测试仍由 CI 整棵跑。"
 echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Code Coverage /"
@@ -895,8 +919,9 @@ fi
 if [ -z "${ckey}" ]; then
     # 上面已经说过为什么不记（树变过），这里不再补一句读起来像「写盘失败」的话。
     :
-elif printf '%s %s（工作树，%s 处未提交改动）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
-       "${run_dirty}" > "${stamp_dir}/content.${ckey}" 2>/dev/null; then
+elif printf '%s %s（工作树，%s 处未提交改动%s）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
+       "${run_dirty}" \
+       "${skipped_list:+；本机没验 ${skipped_list}}" > "${stamp_dir}/content.${ckey}" 2>/dev/null; then
     echo "记账：内容键 ${ckey:0:12} 这份字节判过，提交前后都读得到这一笔。"
 else
     echo "记账：写不进 ${stamp_dir}，这一跑照常算数，只是下一次提交／推送还得再判一遍。" >&2

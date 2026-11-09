@@ -309,6 +309,33 @@ mt_after="$( cd "${mtree}" && "${mt_env[@]}" bash deploy/scripts/check-before-pu
     fail "夹具没造出「跑的过程中树变了」：开跑与收尾是同一个指纹"
 grep -q '不属于现在这份字节' "${work}/out" ||
     fail "跑的途中变过，记账时没说这一跑的判词不属于现在这份字节；实得：$(cat "${work}/out")"
+# 17) 这一跑里有面没验（夹具没有 origin/main，推的范围判不出来），判词必须把它自己验了
+#     多少说清。上一版只说「上列的判据全绿」：缺工具的格子印一行 SKIP，然后在判词上与
+#     验过同形。同一份字节在一台装了 pwsh 的机器上多验一面，两边的判词一模一样——2026-11-10
+#     的 Entry Scripts Lint 就是这么红了一整天而本地四轮全绿。
+grep -q '本机没验' "${work}/out" ||
+    fail "这一跑有面没验，判词没说；实得：$(grep '^PRE-PUSH' "${work}/out")"
+grep -q '^PRE-PUSH: 上列的判据全绿。' "${work}/out" &&
+    fail "这一跑有面没验，判词却说「上列的判据全绿」：没验与验过在判词上同形，读的人分不出来"
+grep -q '^PRE-PUSH: 判过的 .* 步全绿；另有 .* 面本机没验，不算验过：' "${work}/out" ||
+    fail "判词没有印出「判了几步、另有几面没验、是哪几面」；实得：$(grep '^PRE-PUSH' "${work}/out")"
+# 没验的那几面要点名，光一个数说不出来是哪些——读的人还得回去翻日志。
+grep -q 'crate 骨架' "${work}/out" ||
+    fail "没验的面没有点名（夹具里 crate 骨架 没验）；实得：$(grep '^PRE-PUSH' "${work}/out")"
+# 18) 同一份夹具换到「装了 pwsh 的机器」上再跑一次：那一面必须真的被判，而不是印 SKIP
+#     了事。没有这一格，夹具里的 bootstrap.ps1 哪天写错了，本机照样绿，只有 CI 会红——
+#     2026-11-10 的 Entry Scripts Lint 红了一整天，本机四轮全绿，就是缺这一格。
+#     标本见 fixtures/pwsh：它只回答「那个文件在不在」，不解析 PowerShell。
+# PATH 要在 `mt_env` 那一份**之上**加：`mt_env` 里那个 `PATH=${PATH}` 是赋值时就展开的，
+# 再在后面另起一个 `PATH=` 会把它整个换掉，夹具里的假 cargo 随之消失——那一跑的
+# fmt / 名字契约 / 容量登记表 会拿真的 cargo 去判，红成与这一格无关的样子。
+( cd "${mtree}" && "${mt_env[@]}" PATH="${repo}/deploy/scripts/tests/fixtures:${mtree}/bin:${PATH}" \
+    bash deploy/scripts/check-before-push.sh ) >"${work}/out2" 2>&1 ||
+    fail "「装了 pwsh」的那一跑红了：$(cat "${work}/out2")"
+grep -qE '^[[:space:]]*[0-9]+[[:space:]]+ok[[:space:]]+bootstrap\.ps1 语法$' "${work}/out2" ||
+    fail "装了 pwsh 时 bootstrap.ps1 语法这一面没被判；实得：$(grep 'bootstrap' "${work}/out2")"
+grep -q '^SKIP  bootstrap\.ps1' "${work}/out2" &&
+    fail "装了 pwsh 却仍把这一面印成 SKIP：那一格一次都没被判过"
 if ( cd "${mtree}" && "${mt_env[@]}" bash deploy/scripts/check-before-push.sh --status-content ) >"${work}/out" 2>&1; then
     fail "跑的途中变过的树仍被记成验过：那一笔一秒都没被判过；实得：$(cat "${work}/out")"
 fi

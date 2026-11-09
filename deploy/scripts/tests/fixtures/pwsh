@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# 标本：`pwsh`，只模拟 `check-before-push.sh` 用到的那一条命令上的行为。
+#
+# 为什么要有它：门里那一步是 `command -v pwsh` ⇒ 有就判、没有就印 SKIP。于是同一份字节
+# 在装了 pwsh 的机器上多验一面，在两台机器上的判词原来一模一样。2026-11-10 的 Entry
+# Scripts Lint 就红在这里：本机没有 pwsh，那一面从来没被判过，而 CI 的 runner 自带 pwsh，
+# 那一步真跑、读不到夹具里的 bootstrap.ps1，整门变红——本机四轮全绿。
+#
+# 这个标本让「装了 pwsh 的机器」在测试里成为可以复现的一格，而不是只能等到 CI：
+#   - bootstrap.ps1 读得到 ⇒ 退 0（真 pwsh 解析通过时就是这样）
+#   - 读不到 ⇒ 退非零（真 pwsh 报 CommandNotFoundException）
+# 它**不是** PowerShell 的解释器，也不假装是：它不解析语法，只回答「那个文件在不在」。
+# 所以它只能替代「这一步会不会跑」，不能替代「bootstrap.ps1 写得对不对」——后者由 CI 判。
+if [ -r bootstrap.ps1 ]; then
+    exit 0
+fi
+printf "Get-Content: Cannot find path 'bootstrap.ps1' because it does not exist.\n" >&2
+exit 1
