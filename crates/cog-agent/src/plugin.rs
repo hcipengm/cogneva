@@ -692,7 +692,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // 写判词的那一位在注册表里也要有心跳：没有它，TTL 一过名册就把这个人
         // 读成「退休了」，而判词还在继续写。丢键（TTL 到期、Redis 被清、另一个
         // 副本关停）之后下一次心跳重新登记，而不是一直告警到重启。
-        if let (Some(eval_id), Some(registry)) = (self.eval_employee.clone(), self.agent_registry.clone())
+        if let (Some(eval_id), Some(registry)) =
+            (self.eval_employee.clone(), self.agent_registry.clone())
         {
             let registration = crate::runtime::manager::task_agent_registration(
                 &eval_id,
@@ -854,7 +855,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
         }
         // 写判词的那一位同样由这个进程拉起，就同样要在走之前从名册上退下来：
         // 留下一条没有进程服务的心跳，读面要等 TTL 过期才把它读成「不在岗」。
-        if let (Some(ref registry), Some(ref eval_id)) = (&self.agent_registry, &self.eval_employee) {
+        if let (Some(ref registry), Some(ref eval_id)) = (&self.agent_registry, &self.eval_employee)
+        {
             if let Err(e) = registry.deregister(eval_id).await {
                 warn!("registry deregister({}) failed: {}", eval_id, e);
             }

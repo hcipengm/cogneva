@@ -86,7 +86,8 @@ fn the_roster_has_exactly_one_write_point() {
 
     // 写：整棵树里 HSET 到这张 hash 的脚本只有两段——建行一段、盖墓碑一段。
     let root = repo_root();
-    let writer_text = std::fs::read_to_string(root.join(ROSTER_WRITER)).expect("registry.rs readable");
+    let writer_text =
+        std::fs::read_to_string(root.join(ROSTER_WRITER)).expect("registry.rs readable");
     let hset_on_roster = production_lines(&writer_text)
         .into_iter()
         .filter(|line| line.contains("HSET', KEYS[1]"))
@@ -114,7 +115,9 @@ fn the_roster_has_exactly_one_write_point() {
     for name in &found {
         let text = std::fs::read_to_string(root.join(name)).expect("source readable");
         assert!(
-            production_lines(&text).iter().any(|line| line.contains("register(")),
+            production_lines(&text)
+                .iter()
+                .any(|line| line.contains("register(")),
             "{name} 建起了内核循环，却在同一份文件里没有登记调用：这个执行体的每一笔\
              花费与每一件产出都挂在一个名册上没有的 id 上"
         );

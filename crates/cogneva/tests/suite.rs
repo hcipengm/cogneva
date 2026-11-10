@@ -277,10 +277,10 @@ mod gateway_refuses_a_caller_named_reply_stream;
 mod governance_routes;
 #[path = "host_paths_are_not_baked_in_test.rs"]
 mod host_paths_are_not_baked_in_test;
-#[path = "image_layout_literals_contract_test.rs"]
-mod image_layout_literals_contract_test;
 #[path = "identity_is_written_once_test.rs"]
 mod identity_is_written_once_test;
+#[path = "image_layout_literals_contract_test.rs"]
+mod image_layout_literals_contract_test;
 #[path = "in_cluster_address_literals_contract_test.rs"]
 mod in_cluster_address_literals_contract_test;
 #[path = "install_face_creates_every_secret_the_apply_path_reads_test.rs"]
