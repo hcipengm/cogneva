@@ -1,3 +1,4 @@
+pub mod config_surface;
 pub mod declared_once;
 pub mod fsio;
 pub mod harness;

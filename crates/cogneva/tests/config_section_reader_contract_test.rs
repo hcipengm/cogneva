@@ -16,13 +16,13 @@
 //! - A key the document writes must have a field behind it. Asserted: any
 //!   occurrence is a defect, whichever section it is in.
 //! - A field the type always produces must be written by the document. Not
-//!   asserted for the sections outside cog-collaboration: `#[serde(default =
-//!   "f")]` lets a field's value under omission differ from the same field in
-//!   the type's `Default`, so writing every producible key into the templates
-//!   is not a mechanical edit — it needs a per-field audit, and a template that
-//!   carries a value the running process does not take is worse than one that
-//!   lets the built-in default apply. The count is printed instead, so the
-//!   backlog is a reading rather than an assumption.
+//!   asserted *here*, for one document: `#[serde(default = "f")]` lets a
+//!   field's value under omission differ from the same field in the type's
+//!   `Default`, so writing every producible key into every template is not a
+//!   mechanical edit — it needs a per-field audit. That audit is the property
+//!   `every_config_knob_is_named_by_a_delivered_document_test` asserts: a knob
+//!   no delivered document names is registered there with its reason. The count
+//!   is printed here as the per-document reading.
 //!
 //! Neither direction reaches a key that has a field and is dropped after
 //! parsing: `agent.heartbeat_interval_secs` had a field and was snapshotted
@@ -31,255 +31,21 @@
 //!
 //! A section's reader is not always one type. `self_evolution`'s own struct has
 //! no field for `artifact_evolution`; that key is read by cog-reflection, which
-//! seeks it out by pointer. Such a key is declared here as a reader of its own,
+//! seeks it out by pointer. Such a key is declared as a reader of its own,
 //! joined to the pointer's spelling in the source, so "a key no type has a
 //! field for" stays a finding rather than becoming an allowance.
+//!
+//! 读回的节类型、声明文档的位置与走节的骨架只有一份，在
+//! `common::config_surface`；本门与 `every_config_knob_is_named_by_a_delivered_document_test`
+//! 都读它。
 
 use crate::common;
 
+use common::config_surface::{
+    check_section, classified_sections, readers, sections_the_process_config_carries,
+    shipped_configs, Readings,
+};
 use common::routes::repo_root;
-
-use serde_json::{Map, Value};
-use std::path::Path;
-
-/// One section's reader: the type that decides what the section may contain,
-/// and where the code spells the section out.
-struct Reader {
-    section: &'static str,
-    /// `(file, text)`: read back from disk, the file must contain the text.
-    /// `None` for a section the process's own config struct reads — there the
-    /// type is the join, and the name is checked against that struct's keys.
-    join: Option<(&'static str, &'static str)>,
-    /// Keys inside this section that a *different* reader takes out of the
-    /// document by pointer. The section's own type has no field for them, so
-    /// without writing them down here the gate would report a knob that is read
-    /// as one that is not — and the declaration is joined to the source the
-    /// same way a section's is.
-    nested: Vec<Reader>,
-    /// Read a section back through the type that reads it: `Ok` with what the
-    /// type keeps, `Err` with why a value does not fit it at all. A value that
-    /// does not fit is a defect of its own — the reader either fails or falls
-    /// back to its defaults, and either way the document reads as applied.
-    read_back: fn(&Value) -> Result<Value, String>,
-}
-
-impl Reader {
-    fn of<T>(section: &'static str, join: Option<(&'static str, &'static str)>) -> Self
-    where
-        T: serde::de::DeserializeOwned + serde::Serialize,
-    {
-        Self {
-            section,
-            join,
-            nested: Vec::new(),
-            read_back: |value| {
-                let typed: T = serde_json::from_value(value.clone()).map_err(|e| {
-                    format!(
-                        "the value does not fit {}, the type that reads it: {e}",
-                        std::any::type_name::<T>()
-                    )
-                })?;
-                Ok(serde_json::to_value(typed).expect("a section read back serializes"))
-            },
-        }
-    }
-
-    /// Declare a key inside this section that another reader takes by pointer.
-    fn with_nested(mut self, reader: Reader) -> Self {
-        self.nested.push(reader);
-        self
-    }
-
-    /// Whether the type demonstrably has a field at `key`, proved by handing it
-    /// a value and reading it back.
-    ///
-    /// A section may write an optional key as `null`, and a null is dropped on
-    /// the way back out exactly like a key no field stands behind — so the
-    /// round trip alone cannot tell an unset knob from a typo'd one. A probe
-    /// value can: a real field keeps it, an unknown key drops every one. A
-    /// probe whose shape the type does not take is not evidence either way, so
-    /// it is skipped rather than read as absence.
-    ///
-    /// The list carries non-empty containers as well as empty ones: a field
-    /// skipped when it is empty (`skip_serializing_if = "Vec::is_empty"`) keeps
-    /// the key for `["probe"]` and drops it for `[]`, and the empty probe alone
-    /// would report a field that is read as one that does not exist.
-    fn has_field(&self, section: &Map<String, Value>, key: &str) -> bool {
-        let probes = [
-            serde_json::json!("probe"),
-            serde_json::json!(1),
-            serde_json::json!(true),
-            serde_json::json!([]),
-            serde_json::json!({}),
-            serde_json::json!(["probe"]),
-            serde_json::json!({"probe": 1}),
-        ];
-        probes.iter().any(|probe| {
-            let mut probed = section.clone();
-            probed.insert(key.to_string(), probe.clone());
-            (self.read_back)(&Value::Object(probed))
-                .map(|read_back| read_back.get(key).is_some())
-                .unwrap_or(false)
-        })
-    }
-}
-
-/// Every classified section and the type that reads it.
-///
-/// The list is hand-written because no type can be named generically, but it is
-/// not free to fall behind: the gate compares it against the section table in
-/// both directions, so a section with no entry fails here, and the entry's join
-/// is read back out of the source it names.
-fn readers() -> Vec<Reader> {
-    vec![
-        // Carried by `cog_core::Config`, the struct the process loads the
-        // document into and the plugins read (`AppConfig` flattens it), so the
-        // field itself is the join and there is no second spelling to check.
-        Reader::of::<cog_core::config::AppInfo>("app", None),
-        Reader::of::<cog_core::config::AgentConfig>("agent", None),
-        Reader::of::<cog_core::config::DagExecutorConfig>("dag_executor", None),
-        Reader::of::<cog_core::config::GatewayConfig>("gateway", None),
-        Reader::of::<cog_core::config::HookEngineConfig>("hook_engine", None),
-        Reader::of::<cog_core::config::MetricsConfig>("metrics", None),
-        Reader::of::<cog_core::config::MultiBackendConsumerConfig>("multi_backend_consumer", None),
-        Reader::of::<cog_core::config::ProviderConfigs>("providers", None),
-        Reader::of::<cog_core::contract::storage::RawLoggerConfig>("raw_logger", None),
-        Reader::of::<cog_core::config::SelfEvolutionConfig>("self_evolution", None).with_nested(
-            Reader::of::<cog_reflection::PolicyEvolutionConfig>(
-                "artifact_evolution",
-                Some((
-                    "crates/cog-reflection/src/policy_evolution.rs",
-                    "pointer(\"/self_evolution/artifact_evolution\")",
-                )),
-            ),
-        ),
-        Reader::of::<cog_core::config::SupervisorConfig>("supervisor", None),
-        Reader::of::<cog_core::config::SystemConfig>("system", None),
-        Reader::of::<cog_core::config::TierMigratorConfig>("tier_migrator", None),
-        // The env supersede map: the loader merges each `PATH=dot.path` pair
-        // over the document, so every value in it is moved as a string.
-        Reader::of::<std::collections::HashMap<String, String>>("env", None),
-        // Read by a crate's own loader, which spells the pointer as a literal.
-        Reader::of::<cog_llm::config::LLMRoutingConfig>(
-            "llm_routing",
-            Some((
-                "crates/cog-llm/src/config.rs",
-                "load_section(\"/llm_routing\"",
-            )),
-        ),
-        Reader::of::<cog_llm::config::TuningConfig>(
-            "tuning",
-            Some(("crates/cog-llm/src/config.rs", "load_section(\"/tuning\"")),
-        ),
-        Reader::of::<cog_agent::config::AgentLoopConfig>(
-            "agent_loop",
-            Some((
-                "crates/cog-agent/src/config.rs",
-                "load_section(\"/agent_loop\"",
-            )),
-        ),
-        Reader::of::<cog_agent::config::AgentManagerConfig>(
-            "agent_pool",
-            Some((
-                "crates/cog-agent/src/config.rs",
-                "load_section(\"/agent_pool\"",
-            )),
-        ),
-        Reader::of::<cog_collaboration::config::BoundaryConfig>(
-            "boundary",
-            Some((
-                "crates/cog-collaboration/src/config.rs",
-                "load_section(\"/boundary\")",
-            )),
-        ),
-        Reader::of::<cog_collaboration::config::PgeSettings>(
-            "pge",
-            Some((
-                "crates/cog-collaboration/src/config.rs",
-                "load_section(\"/pge\")",
-            )),
-        ),
-        Reader::of::<cog_collaboration::config::RalphSettings>(
-            "ralph",
-            Some((
-                "crates/cog-collaboration/src/config.rs",
-                "load_section(\"/ralph\")",
-            )),
-        ),
-        Reader::of::<cog_collaboration::config::SelfReviewSettings>(
-            "self_review",
-            Some((
-                "crates/cog-collaboration/src/config.rs",
-                "load_section(\"/self_review\")",
-            )),
-        ),
-        // Read by seeking the value out of the document by JSON pointer.
-        Reader::of::<cog_github::config::GitHubIntegrationConfig>(
-            "github_integration",
-            Some((
-                "crates/cog-github/src/config.rs",
-                "pointer(\"/github_integration\")",
-            )),
-        ),
-        Reader::of::<cog_github::config::GiteeIntegrationConfig>(
-            "gitee_integration",
-            Some((
-                "crates/cog-github/src/config.rs",
-                "pointer(\"/gitee_integration\")",
-            )),
-        ),
-        Reader::of::<cog_memory::config::MemoryConfig>(
-            "memory",
-            Some(("crates/cog-memory/src/config.rs", "pointer(\"/memory\")")),
-        ),
-        Reader::of::<cog_prompt::config::PromptConfig>(
-            "prompts",
-            Some(("crates/cog-prompt/src/config.rs", "pointer(\"/prompts\")")),
-        ),
-        Reader::of::<cog_observability::config::ObservabilityExportersConfig>(
-            "observability",
-            Some((
-                "crates/cog-observability/src/config.rs",
-                "pointer(\"/observability\")",
-            )),
-        ),
-        // Not read by anything, by design: the delivery comparator drops every
-        // key starting with `_comment` at any depth, which is what makes a
-        // template self-describing without changing what a process reads.
-        Reader::of::<Map<String, Value>>(
-            "_comment",
-            Some((
-                "crates/cog-core/src/config_sections.rs",
-                "!key.starts_with(\"_comment\")",
-            )),
-        ),
-    ]
-}
-
-/// The sections `cog_core::Config` carries, read out of the type rather than
-/// listed here a second time.
-fn sections_the_process_config_carries() -> Vec<String> {
-    let value =
-        serde_json::to_value(cog_core::Config::default()).expect("the process config serializes");
-    let mut names: Vec<String> = value
-        .as_object()
-        .expect("the process config is an object")
-        .keys()
-        .cloned()
-        .collect();
-    names.sort();
-    names
-}
-
-/// Every section the section table classifies.
-fn classified_sections() -> Vec<String> {
-    let mut names: Vec<String> = cog_core::config_sections::CONFIG_SECTIONS
-        .iter()
-        .map(|s| s.name.to_string())
-        .collect();
-    names.sort();
-    names
-}
 
 /// A section's name is classified, and the reader for it is declared here.
 ///
@@ -398,8 +164,8 @@ fn every_key_a_shipped_document_writes_is_read_by_something() {
     }
     println!(
         "config surface: {docs} documents, {} sections, {} keys a section type produces \
-         and its document does not write (reading only — see the note at the top of this \
-         file)",
+         and its document does not write (per-document reading; the knob-level law is \
+         `every_config_knob_is_named_by_a_delivered_document_test`)",
         readings.sections, readings.undocumented
     );
     for line in &omitted {
@@ -441,123 +207,4 @@ fn the_tuned_policy_name_is_the_name_the_recommendation_path_reads() {
         );
     }
     println!("config surface: {seen} shipped documents name the tuned policy");
-}
-
-#[derive(Default)]
-struct Readings {
-    sections: usize,
-    undocumented: usize,
-}
-
-/// Check one section-shaped value against the reader that takes it, and every
-/// key inside it — including a key a nested reader takes by pointer.
-fn check_section(file: &str, reader: &Reader, value: &Value, readings: &mut Readings) {
-    let Value::Object(object) = value else {
-        // Only the top-level `_comment` is not an object: it is one line of
-        // prose the comparator drops, so its shape is its own business.
-        assert_eq!(
-            reader.section, "_comment",
-            "{file} `{}` is not an object, and no reader can read it",
-            reader.section
-        );
-        return;
-    };
-    readings.sections += 1;
-    let read_back =
-        (reader.read_back)(value).unwrap_or_else(|e| panic!("{file} `{}`: {e}", reader.section));
-    let read_back = read_back
-        .as_object()
-        .expect("a section read back is an object");
-    for key in object.keys().filter(|k| !k.starts_with("_comment")) {
-        if let Some(nested) = reader.nested.iter().find(|n| n.section == key.as_str()) {
-            check_section(file, nested, &object[key], readings);
-            continue;
-        }
-        if read_back.contains_key(key) || reader.has_field(object, key) {
-            continue;
-        }
-        panic!(
-            "{file} `{}.{key}` has no field behind it: serde passes it over in silence, \
-             so it reads as applied while nothing uses it",
-            reader.section
-        );
-    }
-    // The other direction, counted rather than asserted: keys the type always
-    // produces that this document does not write.
-    readings.undocumented += read_back
-        .keys()
-        .filter(|k| !object.contains_key(*k))
-        .count();
-}
-
-/// The config where it is shipped: the chart's file, the static manifest the
-/// cluster pulls, the rendered profiles, and the example template.
-fn shipped_configs(root: &Path) -> Vec<(String, Value)> {
-    let mut out = vec![(
-        "cogneva.example.json".to_string(),
-        read_config(&root.join("cogneva.example.json")),
-    )];
-    for relative in [
-        "deploy/helm/cogneva/files/cogneva.json",
-        "deploy/k3s/cogneva-json-configmap.yaml",
-    ] {
-        out.push((relative.to_string(), read_config(&root.join(relative))));
-    }
-    let rendered = root.join("deploy/rendered");
-    let mut profiles: Vec<_> = std::fs::read_dir(&rendered)
-        .unwrap_or_else(|e| panic!("read {}: {e}", rendered.display()))
-        .map(|e| e.expect("readable dir entry").path())
-        .filter(|p| p.is_dir())
-        .collect();
-    profiles.sort();
-    for dir in profiles {
-        let file = dir.join("10-configmap-cogneva-json.yaml");
-        out.push((file.display().to_string(), read_config(&file)));
-    }
-    out
-}
-
-/// Read the config wherever it is shipped: the chart and the example keep it as
-/// a file of its own, a ConfigMap manifest keeps it as a block scalar.
-fn read_config(path: &Path) -> Value {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("json") => read_json(path),
-        Some("yaml") => read_config_manifest(path),
-        other => panic!("{} has no known config format ({other:?})", path.display()),
-    }
-}
-
-fn read_json(path: &Path) -> Value {
-    let raw =
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()))
-}
-
-/// Pull the config back out of a ConfigMap manifest.
-///
-/// The payload is a YAML block scalar indented under its key, so it is
-/// de-indented and parsed as the JSON it is. A manifest that stops carrying the
-/// key, or carries it empty, fails here rather than passing quietly.
-fn read_config_manifest(path: &Path) -> Value {
-    let raw =
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let lines: Vec<&str> = raw.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| l.starts_with("  ") && l.trim_start().starts_with("cogneva.json: |"))
-        .unwrap_or_else(|| panic!("{} embeds no cogneva.json block", path.display()));
-    let mut payload = String::new();
-    for line in &lines[start + 1..] {
-        match line.strip_prefix("    ") {
-            Some(rest) => {
-                payload.push_str(rest);
-                payload.push('\n');
-            }
-            None if line.trim().is_empty() => payload.push('\n'),
-            None => break,
-        }
-    }
-    serde_json::from_str(&payload)
-        .unwrap_or_else(|e| panic!("{} embeds an unparseable config: {e}", path.display()))
 }
