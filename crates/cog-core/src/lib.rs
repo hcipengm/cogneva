@@ -83,6 +83,7 @@ pub use contract::reflection::*;
 pub use contract::reranker::*;
 pub use contract::resilience::*;
 pub use contract::resource_ledger::*;
+pub use contract::runtime_principle::*;
 pub use contract::sandbox::*;
 pub use contract::shutdown::*;
 pub use contract::skill::*;

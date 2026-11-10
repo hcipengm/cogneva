@@ -34,6 +34,8 @@ pub mod pidfile;
 pub mod pin_census;
 pub mod platform;
 pub mod plugin_registry;
+pub mod principles;
+pub mod principles_cli;
 pub mod process_census;
 pub mod process_report;
 pub mod schema_bundle;
@@ -204,6 +206,15 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     plugin_runner.init_all(&ctx).await?;
     cog_observability::boot_footprint::mark("plugins-initialized");
+
+    // 账上此刻生效的规则交给内核：每轮开头随基础指令一起交给员工。与提示词
+    // 本子同一类东西——部署的账，不是编译进二进制的一句；也没有「谁是属主」的
+    // 分支，跑任务的进程与坐在界面里的进程读的是同一本。
+    if let Some(principles) = ctx.consume_service::<dyn cog_core::RuntimePrincipleStore>() {
+        cog_agent::install_principle_source(Arc::new(crate::principles::AccountPrinciples::new(
+            principles,
+        )));
+    }
 
     // 申请改自己：装在**共用**的那张工具表上，不是某一段对话私有的那张。
     //

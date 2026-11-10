@@ -225,6 +225,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 带外 worker 的任务面：读自己名下的任务、按租约开工、把结果发回同一条
         // results 流，完成与依赖调度仍由编排器那一份实现执行。
         Command::Work => cogneva::work::run_from_args().await,
+        // 运行时原则账的一次性读写面：与 governance 同样直接开共享库，因为调用方
+        // 可能是没有平台令牌的宿主进程，而账只有一本。
+        Command::Principles => cogneva::principles_cli::run_from_args().await,
         Command::WindowsService => {
             #[cfg(windows)]
             {

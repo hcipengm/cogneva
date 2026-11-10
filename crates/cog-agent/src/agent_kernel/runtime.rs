@@ -474,6 +474,11 @@ pub struct AgentRuntime {
     /// 留着它是因为重放闸要把它从请求摘要里去掉：上游拒的是这份请求，不是这
     /// 个人；换一个名字重问同一个问题，仍然是在同一个窗口里买同一句拒绝。
     identity_note: Option<String>,
+    /// 上一轮并进系统前缀的那一段规则。账上规则集变了之后，靠它把旧的那段
+    /// 拿掉（见 `absorb_principles`）。
+    principles_note: Option<String>,
+    /// 这一条循环自己的规则账。空着时用进程的那一本（见 `absorb_principles`）。
+    principle_source: Option<Arc<dyn crate::principles::PrincipleSource>>,
 }
 
 /// The token census of one run: every billed LLM call the run made, folded into
@@ -1113,6 +1118,8 @@ impl AgentRuntime {
             display_name: None,
             identity_looked_up: false,
             identity_note: None,
+            principles_note: None,
+            principle_source: None,
         }
     }
 
@@ -1132,6 +1139,22 @@ impl AgentRuntime {
         self.state = RuntimeState::Idle;
         self.steps.clear();
         self.start_time = None;
+    }
+
+    /// Hand this loop its own rule account.
+    ///
+    /// The account is normally the process's (installed by the assembly root,
+    /// see `cog_agent::install_principle_source`); a loop built with its own
+    /// answers from that one instead. A test is the first caller that needs
+    /// this: a process-wide account is shared by every test in the binary, and
+    /// a rule installed to prove one run reads it would also change what the
+    /// other runs read.
+    pub fn with_principle_source(
+        mut self,
+        source: Arc<dyn crate::principles::PrincipleSource>,
+    ) -> Self {
+        self.principle_source = Some(source);
+        self
     }
 
     /// Set the checkpoint store for persistence.
@@ -1658,10 +1681,16 @@ impl AgentRuntime {
     /// 后面再跟一行这一位自己的：叫什么、在哪个工作树里。平台那段话对所有人
     /// 都说同一句，这一行是唯一让模型知道「这些话是**我**在说」的地方——
     /// 没有它，被问「你是谁」只能去工具结果里猜，或者回一句「我是一个 AI 助手」。
+    ///
+    /// 两段之间还有账上此刻生效的规则（见 `crate::principles`）。它们不是角色
+    /// 设定：同一次改写对所有人同时生效，不按这个人是谁挑。上一轮并进去的那
+    /// 一段在规则集变了之后要拿掉——留着的话，这一轮读到的是一条已经撤回的
+    /// 规则，和它现在的替代者并排放在同一段前缀里。
     async fn absorb_base_instruction(&mut self) {
         if let Some(text) = crate::agent_kernel::base_instruction::text() {
             self.context.merge_head_system(&text);
         }
+        self.absorb_principles().await;
         self.look_up_own_name().await;
         let workspace = self.workspace_lane();
         if let Some(note) = crate::agent_kernel::base_instruction::identity_note(
@@ -1671,6 +1700,36 @@ impl AgentRuntime {
         ) {
             self.context.merge_head_system(&note);
             self.identity_note = Some(note);
+        }
+    }
+
+    /// 这一轮账上生效的规则进系统前缀。
+    ///
+    /// 拿上一轮那一段与这一轮比：一样就什么都不做（它已经在里面了），不一样
+    /// 就先把旧的拿掉再放新的。不这么做的话，同一段系统前缀会随着规则改写
+    /// 一轮一轮叠上去，而模型每轮付的是全部叠加的字节。
+    async fn absorb_principles(&mut self) {
+        let section = match self.principle_source.clone() {
+            Some(source) => crate::principles::section_from(&*source).await,
+            None => crate::principles::for_this_run().await,
+        };
+        self.apply_principles_section(section);
+    }
+
+    /// 把这一轮的规则段落放进系统前缀，换掉上一轮那一段。
+    ///
+    /// 分成两步是为了让「换掉」本身可测：不必先装一本真账，也能证明同一段
+    /// 前缀里不会同时留着撤销前的规则与撤销后的规则。
+    fn apply_principles_section(&mut self, section: Option<String>) {
+        if self.principles_note.as_deref() == section.as_deref() {
+            return;
+        }
+        if let Some(old) = self.principles_note.take() {
+            self.context.drop_from_head_system(&old);
+        }
+        if let Some(section) = section {
+            self.context.merge_head_system(&section);
+            self.principles_note = Some(section);
         }
     }
 
@@ -4058,6 +4117,160 @@ mod tests {
             .to_string();
         assert!(!head.contains("名字"), "no name was claimed: {head}");
         assert!(head.contains(&cog_core::worktree_lane("no-one-yet")));
+    }
+
+    /// 账上生效的规则在每次运行开头进系统前缀：这是「随基础指令一起交给员工」
+    /// 唯一能被模型读到的地方。
+    ///
+    /// 这一段不按角色分：同一个内核、同一本账，谁跑都拿到同一批规则，所以这里
+    /// 断言的是「这个进程装的账上那几条到了前缀里」，而不是「这件事的人拿到了
+    /// 这件事的规则」。
+    #[tokio::test]
+    async fn a_run_starts_with_the_rules_the_account_has_in_force() {
+        struct OneRule;
+
+        #[async_trait::async_trait]
+        impl crate::principles::PrincipleSource for OneRule {
+            async fn in_force(&self) -> cog_core::SFResult<Vec<crate::principles::InForce>> {
+                Ok(vec![crate::principles::InForce::new(
+                    "build-before-merge",
+                    "在合并之前",
+                    "构建是不是绿的",
+                    "红了就停下来修",
+                )
+                .expect("a full triple is a rule")])
+            }
+
+            async fn note_used(&self, _: &[String]) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+        }
+
+        let config = RuntimeConfig {
+            agent_id: "kai-a9ab11fc".into(),
+            role: "kai-a9ab11fc".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        // 这一条循环带着自己的账跑，不往进程里装：装进进程的账会被同一个
+        // 测试二进制里每一个运行读到，而其中一个运行只有 400 token 的窗口，
+        // 多出来的这一段会把它的工具结果挤出上下文。
+        let mut agent_loop = AgentRuntime::new(config, tx).with_principle_source(Arc::new(OneRule));
+
+        agent_loop.absorb_base_instruction().await;
+
+        let head = agent_loop
+            .context
+            .messages()
+            .first()
+            .expect("the run's system prefix is in the context")
+            .content()
+            .to_string();
+        for needle in [
+            "build-before-merge",
+            "在合并之前",
+            "构建是不是绿的",
+            "红了就停下来修",
+        ] {
+            assert!(
+                head.contains(needle),
+                "rule part {needle:?} is missing: {head}"
+            );
+        }
+    }
+
+    /// 两轮之间规则集变了：撤销前的那一段必须离开前缀。
+    ///
+    /// 并进去是按「这一段在不在」判断的，不拿掉旧的就再并一段新的，模型这一轮
+    /// 会并排读到已经撤回的规则和它的替代者，而它分不出哪条还算数。
+    #[tokio::test]
+    async fn a_rule_withdrawn_between_turns_stops_being_read() {
+        let config = RuntimeConfig {
+            agent_id: "kai-a9ab11fc".into(),
+            role: "kai-a9ab11fc".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let mut agent_loop = AgentRuntime::new(config, tx);
+
+        let before = crate::principles::section(&[crate::principles::InForce::new(
+            "gone-rule",
+            "第一轮的情况",
+            "第一轮的判据",
+            "第一轮的动作",
+        )
+        .expect("a full triple is a rule")])
+        .expect("one rule is a section");
+        let after = crate::principles::section(&[crate::principles::InForce::new(
+            "replacement-rule",
+            "第二轮的情况",
+            "第二轮的判据",
+            "第二轮的动作",
+        )
+        .expect("a full triple is a rule")])
+        .expect("one rule is a section");
+
+        agent_loop.apply_principles_section(Some(before));
+        agent_loop.apply_principles_section(Some(after.clone()));
+
+        let head = agent_loop
+            .context
+            .messages()
+            .first()
+            .expect("a section alone is worth a prefix")
+            .content()
+            .to_string();
+        assert!(
+            !head.contains("gone-rule") && !head.contains("第一轮的判据"),
+            "the withdrawn rule is still being read: {head}"
+        );
+        assert!(
+            head.contains(&after),
+            "the rule in force is missing: {head}"
+        );
+        assert_eq!(
+            head.matches("平台此刻生效的规则").count(),
+            1,
+            "the section was appended instead of replaced: {head}"
+        );
+    }
+
+    /// 规则没变时同一段不再并一次：同一段话按轮数计费，而且重复的行会让人
+    /// 以为规则增加了一条。
+    #[tokio::test]
+    async fn the_same_rules_are_not_prepended_again_on_the_next_turn() {
+        let config = RuntimeConfig {
+            agent_id: "kai-a9ab11fc".into(),
+            role: "kai-a9ab11fc".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let mut agent_loop = AgentRuntime::new(config, tx);
+
+        let section = crate::principles::section(&[crate::principles::InForce::new(
+            "steady-rule",
+            "任何时候",
+            "这件事有没有做完",
+            "做完了就回报",
+        )
+        .expect("a full triple is a rule")])
+        .expect("one rule is a section");
+
+        agent_loop.apply_principles_section(Some(section.clone()));
+        agent_loop.apply_principles_section(Some(section));
+
+        let head = agent_loop
+            .context
+            .messages()
+            .first()
+            .expect("a section alone is worth a prefix")
+            .content()
+            .to_string();
+        assert_eq!(
+            head.matches("steady-rule").count(),
+            1,
+            "the same section was prepended twice: {head}"
+        );
     }
 
     /// A state word is spelled once: what `Display` prints is what `as_str`

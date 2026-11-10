@@ -39,12 +39,13 @@ pub enum Command {
     WriteRole,
     Governance,
     Work,
+    Principles,
     WindowsService,
 }
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 20] = [
+const SUBCOMMANDS: [(&str, Command); 21] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -65,6 +66,7 @@ const SUBCOMMANDS: [(&str, Command); 20] = [
     ("write-role", Command::WriteRole),
     ("governance", Command::Governance),
     ("work", Command::Work),
+    ("principles", Command::Principles),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -146,6 +148,8 @@ COMMANDS:
     work <SUB> --unit <u>  Act on the tasks the graph assigns to one unit; <SUB> is one
                            of queue, claim, start, heartbeat, complete, fail, release,
                            inbox
+    principles <SUB>       Read the rules the platform's employees work by, and decide
+                           them; <SUB> is one of list, propose, approve, reject, retire
 
     With no COMMAND the full application starts.
 

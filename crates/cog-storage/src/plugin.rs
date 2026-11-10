@@ -1100,6 +1100,25 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; the principle ledger is unavailable in this deployment");
         }
 
+        // ── RuntimePrincipleStore ──
+        // The rules in force are the platform's, not this pod's. Published only
+        // with a pool, for the same reason as the ledgers above: a process-local
+        // copy would tell one pod's employees a different set of rules than the
+        // next pod's, and the difference would look like a rule that comes and
+        // goes. Without a pool runs carry only their base instruction.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::RuntimePrincipleStore> =
+                Arc::new(crate::PostgresRuntimePrincipleStore::new(pool));
+            ctx.publish_service(store);
+            info!("StoragePlugin runtime principle store published");
+        } else if strict_persistence {
+            return Err(cog_core::SFError::Config(
+                "No PostgreSQL pool for RuntimePrincipleStore (strict_persistence=true)".into(),
+            ));
+        } else {
+            warn!("No PostgreSQL pool; runtime principles are unavailable in this deployment");
+        }
+
         // ── ResourceEventStore ──
         // The fourth account, and the same rule for the same reason: the table
         // is where an event outlives the process that saw it, and a

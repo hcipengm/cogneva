@@ -25,6 +25,7 @@ pub mod principle_ledger_store;
 pub mod project_audit_log;
 pub mod raw_log_index_store;
 pub mod resource_event_store;
+pub mod runtime_principle_store;
 pub mod snapshot_store;
 pub mod state_backend;
 pub(crate) mod state_reads;
@@ -59,6 +60,7 @@ pub use principle_ledger_store::PostgresPrincipleLedgerStore;
 pub use project_audit_log::{AuditEntry, AuditRow, PgProjectAuditLog, ProjectAuditLog};
 pub use raw_log_index_store::PostgresRawLogIndexStore;
 pub use resource_event_store::PostgresResourceEventStore;
+pub use runtime_principle_store::PostgresRuntimePrincipleStore;
 pub use snapshot_store::PostgresSnapshotStore;
 pub use state_backend::{
     venue_tasks_sql, PostgresStateBackend, DAG_LOCK_WORKSPACE_SQL, EVENTS_PAGE_SQL,

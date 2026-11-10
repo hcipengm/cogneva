@@ -102,6 +102,48 @@ impl ContextWindow {
             .saturating_sub(estimate_tokens(&old));
     }
 
+    /// 把以前并进开头的那一段拿掉。
+    ///
+    /// 并进去的东西不都是一成不变的：平台此刻生效的规则会变，账上撤掉一条
+    /// 之后，上一轮并进系统前缀的那一段如果留着，模型这一轮会读到一条已经
+    /// 不生效的规则，并且不知道它已经不生效了。并进是按「这一段在不在」判断
+    /// 的，拿掉也按同一粒度：整段移除，再收掉因此留下的空段——不收的话，系统
+    /// 前缀会随着规则改写一次长高一段。
+    ///
+    /// 不在这段系统前缀里就什么都不做：上下文被重建过、或这一段从来没并进来，
+    /// 都不是错误。
+    pub fn drop_from_head_system(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let Some(Message::System { content, .. }) = self.messages.first() else {
+            return;
+        };
+        if !content.contains(text) {
+            return;
+        }
+        let old = content.clone();
+        let mut merged = old.replace(text, "");
+        while merged.contains("\n\n\n") {
+            merged = merged.replace("\n\n\n", "\n\n");
+        }
+        let merged = merged.trim().to_string();
+        if let Some(Message::System { content, .. }) = self.messages.first_mut() {
+            *content = merged.clone();
+        }
+        // 历史开头与实际开头是同一条：模型读过的那份与系统留的那份要一致。
+        if let Some(Message::System { content, .. }) = self.history.first_mut() {
+            if content == &old {
+                *content = merged.clone();
+            }
+        }
+        self.current_tokens = self
+            .current_tokens
+            .saturating_add(estimate_tokens(&merged))
+            .saturating_sub(estimate_tokens(&old));
+    }
+
     /// Whether the context begins with exactly this system message.
     ///
     /// One agent is reused by the same role across turns (one turn per attempt),
@@ -485,6 +527,33 @@ mod tests {
         ctx.merge_head_system("platform base");
         assert_eq!(ctx.messages(), once.as_slice(), "第二遍合并不该留下痕迹");
         assert_eq!(ctx.token_count(), tokens, "token 数也不该涨");
+    }
+
+    /// 拿掉一段以后，系统前缀回到它并进来之前的样子：不含那一段，也不含
+    /// 因为它而多出来的空行。留下空行的话，规则改写一次前缀就长高一段。
+    #[test]
+    fn dropping_a_section_restores_the_head_it_was_merged_into() {
+        let mut ctx = ContextWindow::new(10_000);
+        ctx.add_message(Message::system("run's own instruction"));
+        ctx.merge_head_system("platform base");
+        let before = ctx.messages().to_vec();
+        let tokens = ctx.token_count();
+
+        ctx.merge_head_system("rules in force");
+        assert!(ctx.messages()[0].content().contains("rules in force"));
+
+        ctx.drop_from_head_system("rules in force");
+        assert_eq!(
+            ctx.messages(),
+            before.as_slice(),
+            "拿掉之后应回到并进来之前"
+        );
+        assert_eq!(ctx.token_count(), tokens, "token 数也不该留着那一段");
+
+        // 不在里面的那一段：什么都不做，不是错误。
+        let once = ctx.messages().to_vec();
+        ctx.drop_from_head_system("never merged");
+        assert_eq!(ctx.messages(), once.as_slice());
     }
 
     /// 开头没有 system 时新开一条，而且不碰历史里那条被预算裁掉的内容。
