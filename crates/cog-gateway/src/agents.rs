@@ -489,9 +489,11 @@ pub async fn restore_roster_from(
             Ok(Summon::Held) => pass.present += 1,
             Ok(Summon::Built) => {
                 pass.restored += 1;
+                // 这里不印名字。名字只有一处派生（名册行的 `label`），而这一趟
+                // 只读了雇佣名册、没读员工名册：按 id 现算一个名字，同一个人就
+                // 会在构建日志里与员工页上顶着两个名字。
                 tracing::info!(
                     agent_id = %agent_id,
-                    name = %cog_core::display_name_for(&agent_id),
                     hired_by = %row.hired_by,
                     "an employee named by the roster is back on the pool"
                 );
@@ -1847,7 +1849,7 @@ fn roster_split(regs: &[cog_core::AgentRegistration]) -> (usize, usize) {
 /// 展示名只有这一个来源：有工号的人印 `E0412 林清和`，没工号的人印「待编
 /// 某某」。读面不再各自拼一遍——三处各拼一次时，同一个人在员工页与对话页
 /// 会顶着两个名字，而读的人只会以为是两个人。
-fn identity_of(
+pub fn identity_of(
     agent_id: &str,
     roster: &std::collections::HashMap<String, cog_core::EmployeeRecord>,
 ) -> serde_json::Value {

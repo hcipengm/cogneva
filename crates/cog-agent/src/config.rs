@@ -97,6 +97,10 @@ const AGENT_POOL_ENV: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentLoopConfig {
+    /// 缺省不是一个人。这个配置节给的是池子的**缺省参数**，池子里每一位
+    /// 员工的名字由它自己被造出来时决定（管理器逐位覆盖）；从前这里写着
+    /// `agent-001`，一个谁也没雇过、名册上没有的名字，读配置的人会以为
+    /// 平台上真有这么一位。
     pub agent_id: String,
     pub role: String,
     /// 这一份部署给智能体写下的轮数天花板；`None` 表示**不设天花板**。
@@ -179,7 +183,7 @@ fn default_external_archive_threshold_chars() -> usize {
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
-            agent_id: "agent-001".into(),
+            agent_id: String::new(),
             role: cog_core::roles::PLANNER.into(),
             max_iterations: None,
             eval_max_iterations: None,
@@ -267,7 +271,9 @@ mod tests {
     #[test]
     fn defaults_match_legacy_core_values() {
         let l = AgentLoopConfig::default();
-        assert_eq!(l.agent_id, "agent-001");
+        // 池子的缺省参数不替任何一位员工起名：名字由管理器逐位覆盖，这里空着
+        // 才是实情。写一个名字进来，读配置的人会以为平台上真有那一位。
+        assert!(l.agent_id.is_empty());
         assert_eq!(l.role, "planner");
         // No number written means no ceiling: a default here would be an
         // assertion about every job, made before any of them has run.

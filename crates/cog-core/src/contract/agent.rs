@@ -32,6 +32,10 @@ pub trait AgentRuntime: Send + Sync {
 /// Agent loop configuration.
 #[derive(Clone)]
 pub struct RuntimeConfig {
+    /// 谁在跑这一轮。没有缺省值：空着就是「还没说自己是谁」，构造没问题，
+    /// 开跑时会被拒绝（见运行时入口的检查）。这里曾经默认成 `"agent"`——
+    /// 一个没人雇过、名册上不存在的员工，却会在账上、日志里、名册外一路留下
+    /// 痕迹，读到的人都以为平台上真有这么一个人。
     pub agent_id: String,
     /// Agent role as an open string (e.g. "planner", "generator").
     /// Constants are defined in `cog-agent::AgentRole` so new roles can be
@@ -89,7 +93,7 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            agent_id: "agent".into(),
+            agent_id: String::new(),
             role: crate::roles::PLANNER.into(),
             // No ceiling by default. Ten turns was the old default and it is
             // shorter than one round of read-change-run-test: every repair run

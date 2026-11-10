@@ -54,6 +54,10 @@ pub struct CollaborationExecutor {
     /// 仍旧照跑——只是这一次没有任何一条项目原则被递进来，与「这个仓库没有
     /// 原则管着这些文件」不是一回事，所以缺它要留一条具名日志。
     principle_ledger: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
+    /// 员工名册。有它，这一行日志、变更账上的署名与 git 作者才读得出「谁干的
+    /// 活」；没有它，同一个 id 在这些地方只剩一个机器码，而两处各拼一次名字时，
+    /// 同一个人在账上与名单上会顶着两个名字。
+    roster: Option<Arc<dyn cog_core::AgentRegistry>>,
     /// 派活时的轮转游标。
     ///
     /// 顺序轮流而不是把活都给第一个人：名册上的人都能干同一类活，全都堆在
@@ -99,6 +103,7 @@ impl CollaborationExecutor {
             stage_store: None,
             pause_gate: None,
             principle_ledger: None,
+            roster: None,
             next_worker: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -239,6 +244,26 @@ impl CollaborationExecutor {
         self.principle_ledger = Some(ledger);
         self
     }
+
+    /// 接上员工名册：署名前的那一次「这个人叫什么」从这里读。
+    pub fn with_roster(mut self, roster: Arc<dyn cog_core::AgentRegistry>) -> Self {
+        self.roster = Some(roster);
+        self
+    }
+
+    /// 这个 id 在名册上的那一行怎么说自己，读不到或没接名册就印「待编」。
+    async fn employee_label(&self, agent_id: &str) -> String {
+        match self.roster.as_ref() {
+            Some(roster) => roster
+                .employee(agent_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|row| row.label()),
+            None => None,
+        }
+        .unwrap_or_else(|| cog_core::unregistered_label(agent_id))
+    }
 }
 
 impl Default for CollaborationExecutor {
@@ -377,10 +402,11 @@ impl CollaborationExecutor {
         // 重置只清对话，不动它装配时带上的工具、钩子与账。
         agent.reset().await?;
         let answer = agent.prompt_for_task(&task.id, task.input.clone()).await?;
+        let employee = self.employee_label(&agent_id).await;
         info!(
             task_id = %task.id,
             agent_id = %agent_id,
-            employee = %cog_core::display_name_for(&agent_id),
+            %employee,
             "platform_agent_task answered"
         );
         Ok(TaskResult {
@@ -746,13 +772,14 @@ impl CollaborationExecutor {
                 );
                 ChangeYieldOutcome::NoSink
             } else {
+                let producer = Self::producer_from(task, None);
                 match Self::extract_changes(
                     &result,
                     &goal,
                     &Self::pge_mode_str(&result.pge_mode),
                     task.input.get("issue_number").and_then(|v| v.as_u64()),
                     &task.id,
-                    task.agent_id.as_deref(),
+                    producer,
                     ProducerClass {
                         intent: task.evolution_intent(),
                         kind: task.evolution_kind(),
@@ -1158,6 +1185,26 @@ impl CollaborationExecutor {
     fn pge_payload(squad_result: &crate::squad::SquadResult) -> Option<serde_json::Value> {
         let payload = squad_result.result.clone()?;
         Some(payload.get("roundtable").cloned().unwrap_or(payload))
+    }
+
+    /// 这件活是谁干的：变更账的 `producer` 与 git 作者都写这一个 id。
+    ///
+    /// 三个候选按「离这件活多远」排：执行侧把真正跑完它的那一位传进来，它在就
+    /// 先署他；没有才读派单时写下的名字；再没有才读提交方在 input 里声明的名字
+    /// （小队派活走的就是这一格）。三样都没有就**不署名**——`cog-github` 那一步
+    /// 改用实例身份，那时确实没有执行者可署，那是兜底而不是断言。
+    ///
+    /// 从前这一格直接抄 `task.agent_id`：那是「派给了谁」，不是「谁做的」。小队
+    /// 现起的成员不在任务行上，于是变更账一路写着 `None`，提交作者退回机器人——
+    /// 干了活的人在自己的产出上找不到名字。
+    fn producer_from<'a>(
+        task: &'a cog_core::Task,
+        executed_by: Option<&'a str>,
+    ) -> Option<&'a str> {
+        let named = |id: Option<&'a str>| id.map(str::trim).filter(|id| !id.is_empty());
+        named(executed_by)
+            .or_else(|| named(task.agent_id.as_deref()))
+            .or_else(|| named(task.input.get("agent_id").and_then(|v| v.as_str())))
     }
 
     /// The changes a run produced, or the cause of its producing none.

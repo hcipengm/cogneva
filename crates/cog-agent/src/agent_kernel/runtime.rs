@@ -2021,7 +2021,19 @@ impl AgentRuntime {
     /// 用两种方式声明同一次开始；而循环本身同在一处，两条入口也就不会跑出
     /// 两种工具行为。
     async fn begin_run(&mut self, run_task_id: Option<&str>) -> SFResult<()> {
-        tracing::info!(agent_id = %self.config.agent_id, task_id = run_task_id.unwrap_or(""), "AgentRuntime::run started");
+        // 没有名字就没有这一次运行。缺省不是一个人：一个空 id 会一路走到
+        // 账上、事件里、名册外，成为谁都对不上的「某位员工」，而这比拒绝
+        // 一次运行难查得多——它看起来像系统在工作。这里拒绝，调用方就会
+        // 在造出这个运行的地方把名字补上。
+        let agent_id = self.config.agent_id.trim();
+        if agent_id.is_empty() {
+            return Err(SFError::Config(
+                "this run has no agent_id: an employee cannot run without an identity".into(),
+            ));
+        }
+        let agent_id = agent_id.to_string();
+        self.config.agent_id = agent_id.clone();
+        tracing::info!(agent_id = %agent_id, task_id = run_task_id.unwrap_or(""), "AgentRuntime::run started");
         self.state = RuntimeState::Idle;
         self.steps.clear();
 
@@ -6987,6 +6999,8 @@ mod tests {
         );
         let archive = Arc::new(RecordingArchive::default());
         let config = RuntimeConfig {
+            // 跑这一趟的是一个人，有名有姓：没有 id 的运行在入口就拒绝。
+            agent_id: "archivist-0001".into(),
             context_window_size: 400,
             max_iterations: 4,
             ..Default::default()
@@ -7132,6 +7146,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let config = RuntimeConfig {
+            agent_id: "outcome-recorder-0001".into(),
             role: "skill-outcome-role".into(),
             skill_config: Some(skill),
             max_iterations: 1,

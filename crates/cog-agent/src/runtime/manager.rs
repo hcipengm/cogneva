@@ -577,7 +577,10 @@ impl GlobalAgentManager {
 /// which pod holds which squad, so a stuck squad in one pod and a quiet pod
 /// read the same. The pod name is available as `COGNEVA_POD_NAME` or
 /// `HOSTNAME`, and a plain host run honestly reports that host.
-fn task_agent_registration(agent_id: &str, role: &str) -> cog_core::AgentRegistration {
+pub(crate) fn task_agent_registration(
+    agent_id: &str,
+    role: &str,
+) -> cog_core::AgentRegistration {
     cog_core::AgentRegistration::new(
         agent_id,
         crate::identity::agent_instance(),

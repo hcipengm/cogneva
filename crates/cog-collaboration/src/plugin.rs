@@ -146,6 +146,11 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             if let Some(ref backend) = state_backend {
                 collab = collab.with_state_backend(backend.clone());
             }
+            // 名册接上之后，账与日志里的署名读的是名册行的工号＋名字，而不是
+            // 按 id 现算的第二个名字。
+            if let Some(roster) = ctx.consume_service::<dyn cog_core::AgentRegistry>() {
+                collab = collab.with_roster(roster);
+            }
             // 池停供时这条执行器手里的 Ralph 循环不再开新轮。闸由 supervisor
             // 发布，而它不是本插件的 `requires`——两者落在同一层、并发 init，
             // 现在读它读到的是运气。句柄延后到第一次被问时才解析，那时所有

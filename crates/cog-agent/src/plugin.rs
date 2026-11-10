@@ -9,6 +9,9 @@ pub const GRPC_CONTROL_HEARTBEAT_LOOP: &str = "agent_grpc_control_heartbeat";
 /// Loop name of the reading that moves the pool's concurrency.
 pub const POOL_SIZING_LOOP: &str = "agent_pool_sizing";
 
+/// Loop name of the heartbeat that keeps the evaluator's roster row alive.
+pub const EVAL_EMPLOYEE_HEARTBEAT_LOOP: &str = "agent_eval_employee_heartbeat";
+
 /// How often the container's memory is re-read against the count in force.
 ///
 /// Shorter than the pool's own task length on purpose: a task holds its turn
@@ -252,6 +255,9 @@ pub struct AgentPlugin {
     pool: Option<Arc<crate::GlobalAgentManager>>,
     lifecycle_client: Option<Arc<dyn cog_core::AgentLifecycleClient>>,
     eval_event_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<cog_core::AgentEvent>>>,
+    /// 这个进程里写判词的那一位的 id：登记成功才有。心跳环与关停注销都按这一位
+    /// 走；没有它就是没登上，读面会看到一条告警而不是一个假人。
+    eval_employee: Option<String>,
     /// 关停时等在飞的运行让路多久，来自 `core.system.shutdown_timeout_ms`。
     /// 零表示没人声明过，那就**不等**：一个没有依据的等待比不等更糟。
     drain_timeout_ms: std::sync::atomic::AtomicU64,
@@ -266,6 +272,7 @@ impl AgentPlugin {
             pool: None,
             lifecycle_client: None,
             eval_event_rx: tokio::sync::Mutex::new(None),
+            eval_employee: None,
             drain_timeout_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -497,8 +504,17 @@ impl cog_core::SystemPlugin for AgentPlugin {
         }
         let (eval_event_tx, eval_event_rx) =
             tokio::sync::mpsc::channel::<cog_core::AgentEvent>(128);
+        // 评测这一侧的运行同样是这个进程里的一次模型调用，跑它的也是个人：
+        // 名字与常驻池用同一个派生函数，只是分组不同，所以同一个进程里两批
+        // 人不会撞名。从前这里写着 `eval-agent`——名册上没有、工号也没有的
+        // 一个名字：账上读不出这次判词是谁写的，同事也没法给它发消息。
+        let eval_employee = crate::identity::name_for(
+            &format!("{}:evaluator", crate::identity::agent_instance()),
+            "evaluator",
+            0,
+        );
         let eval_config = cog_core::RuntimeConfig {
-            agent_id: "eval-agent".into(),
+            agent_id: eval_employee.id.clone(),
             role: cog_core::roles::EVALUATOR.into(),
             max_iterations: agent_loop_config.eval_max_iterations.unwrap_or(u32::MAX),
             context_window_size: 32000,
@@ -511,16 +527,35 @@ impl cog_core::SystemPlugin for AgentPlugin {
             owner_task_id: None,
         };
         let mut eval_runtime = crate::AgentRuntime::new(eval_config, eval_event_tx)
-            .with_tools(tool_registry.as_ref().clone());
+            .with_tools(tool_registry.as_ref().clone())
+            .with_roster(agent_registry.clone());
         eval_runtime = eval_runtime.with_sandbox_backend(sandbox_backend_for_eval);
         eval_runtime = eval_runtime.with_plugin_registry(plugin_registry_for_eval);
         if let Some(ref archive) = tool_output_archive {
             eval_runtime = eval_runtime.with_tool_output_archive(archive.clone());
         }
+        // 登记走与常驻池同一条路：注册即建行、发工号。登记不上不拦启动——
+        // 判词照样要写出来——但这条日志要说清读面会缺什么。
+        if let Err(e) = agent_registry
+            .register(&crate::runtime::manager::task_agent_registration(
+                &eval_employee.id,
+                cog_core::roles::EVALUATOR,
+            ))
+            .await
+        {
+            warn!(
+                agent_id = %eval_employee.id,
+                error = %e,
+                "the evaluator could not be registered; its runs still happen, but the roster \
+                 carries no row for the person writing the verdicts"
+            );
+        } else {
+            self.eval_employee = Some(eval_employee.id.clone());
+        }
         let eval_runtime_arc: Arc<tokio::sync::Mutex<dyn cog_core::AgentRuntime>> =
             Arc::new(tokio::sync::Mutex::new(eval_runtime));
         ctx.publish_service(eval_runtime_arc);
-        info!("AgentPlugin eval runtime published");
+        info!(agent_id = %eval_employee.id, "AgentPlugin eval runtime published");
         *self.eval_event_rx.lock().await = Some(eval_event_rx);
 
         // ── GlobalAgentManager ──
@@ -654,6 +689,46 @@ impl cog_core::SystemPlugin for AgentPlugin {
         if let Some(signal) = ctx.consume::<cog_core::ShutdownSignal>() {
             crate::drain::install((*signal).clone());
         }
+        // 写判词的那一位在注册表里也要有心跳：没有它，TTL 一过名册就把这个人
+        // 读成「退休了」，而判词还在继续写。丢键（TTL 到期、Redis 被清、另一个
+        // 副本关停）之后下一次心跳重新登记，而不是一直告警到重启。
+        if let (Some(eval_id), Some(registry)) = (self.eval_employee.clone(), self.agent_registry.clone())
+        {
+            let registration = crate::runtime::manager::task_agent_registration(
+                &eval_id,
+                cog_core::roles::EVALUATOR,
+            );
+            let body = move |_beat: cog_core::loop_health::Beat| {
+                let registry = registry.clone();
+                let eval_id = eval_id.clone();
+                let registration = registration.clone();
+                async move {
+                    if registry.heartbeat(&eval_id).await.is_err() {
+                        if let Err(e) = registry.register(&registration).await {
+                            warn!(
+                                agent_id = %eval_id,
+                                error = %e,
+                                "the evaluator heartbeat could not put it back on the roster"
+                            );
+                        }
+                    }
+                }
+            };
+            let cadence = cog_core::loop_health::Cadence::Periodic(HEARTBEAT_PERIOD);
+            match ctx.consume::<cog_core::ShutdownSignal>() {
+                Some(signal) => drop(cog_core::loop_health::spawn(
+                    EVAL_EMPLOYEE_HEARTBEAT_LOOP,
+                    cadence,
+                    (*signal).clone(),
+                    body,
+                )),
+                None => drop(cog_core::loop_health::spawn_unstoppable(
+                    EVAL_EMPLOYEE_HEARTBEAT_LOOP,
+                    cadence,
+                    body,
+                )),
+            }
+        }
         if let Some(ref pool) = self.pool {
             if let Some(task_runner) = ctx.consume_service::<dyn cog_core::TaskExecutionCallback>()
             {
@@ -775,6 +850,13 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 if let Err(e) = registry.deregister(&agent_id).await {
                     warn!("registry deregister({}) failed: {}", agent_id, e);
                 }
+            }
+        }
+        // 写判词的那一位同样由这个进程拉起，就同样要在走之前从名册上退下来：
+        // 留下一条没有进程服务的心跳，读面要等 TTL 过期才把它读成「不在岗」。
+        if let (Some(ref registry), Some(ref eval_id)) = (&self.agent_registry, &self.eval_employee) {
+            if let Err(e) = registry.deregister(eval_id).await {
+                warn!("registry deregister({}) failed: {}", eval_id, e);
             }
         }
         info!("AgentPlugin shutdown");
