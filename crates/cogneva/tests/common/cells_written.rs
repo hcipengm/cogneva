@@ -16,6 +16,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::common::declared_once::literals_in;
 use crate::common::{fsio, rust_production};
 use crate::promql::selected_cells;
 
@@ -30,7 +31,7 @@ use crate::promql::selected_cells;
 /// own question; the check would then never once answer anything but yes. A
 /// series registered with a deploy path is registered so its producer can be
 /// found, not so the values in that file count as written.
-pub fn literals_the_tree_writes(
+pub fn strings_the_tree_writes(
     root: &Path,
     sources: impl IntoIterator<Item = PathBuf>,
 ) -> BTreeSet<String> {
@@ -47,14 +48,8 @@ pub fn literals_the_tree_writes(
             continue;
         }
         let text = fsio::read(&path);
-        let mut rest = text.as_str();
-        while let Some(open) = rest.find('"') {
-            let after = &rest[open + 1..];
-            let Some(close) = after.find('"') else {
-                break;
-            };
-            out.insert(after[..close].to_string());
-            rest = &after[close + 1..];
+        for literal in literals_in(&text) {
+            out.insert(literal.value.to_string());
         }
     }
     out

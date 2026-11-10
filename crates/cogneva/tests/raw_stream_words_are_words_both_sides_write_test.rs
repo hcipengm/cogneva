@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common;
 
+use common::declared_once::literal_values;
 use common::rust_text::trailing_identifier;
 
 use common::lex::{split_top_level, Dialect};
@@ -176,37 +177,11 @@ fn is_stream_word(word: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
-/// 一段生产代码里的字面量（转义按 Rust 的算法跳过）。
-fn literals(source: &str) -> Vec<String> {
-    let bytes = source.as_bytes();
-    let mut found = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let mut word = String::new();
-        while i < bytes.len() && bytes[i] != b'"' {
-            if bytes[i] == b'\\' {
-                i += 1;
-            }
-            if i < bytes.len() {
-                word.push(bytes[i] as char);
-            }
-            i += 1;
-        }
-        found.push(word);
-        i += 1;
-    }
-    found
-}
-
 /// 一段生产代码里 `*_raw` 形状的字面量。
 fn stream_words(source: &str) -> BTreeSet<String> {
-    literals(source)
+    literal_values(source)
         .into_iter()
+        .map(str::to_string)
         .filter(|word| is_stream_word(word))
         .collect()
 }

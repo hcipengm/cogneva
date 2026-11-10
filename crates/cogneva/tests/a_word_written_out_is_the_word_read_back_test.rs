@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common;
 
+use common::declared_once::literal_values;
 use common::lex::{split_top_level, Dialect};
 use common::rust_text::{raw_string_end, trailing_identifier};
 
@@ -277,32 +278,6 @@ fn match_body(body: &str) -> String {
     body.to_string()
 }
 
-fn literals(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut found = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let mut word = String::new();
-        while i < bytes.len() && bytes[i] != b'"' {
-            if bytes[i] == b'\\' {
-                i += 1;
-            }
-            if i < bytes.len() {
-                word.push(bytes[i] as char);
-            }
-            i += 1;
-        }
-        found.push(word);
-        i += 1;
-    }
-    found
-}
-
 /// `Self::X`／`X::Y::Z`／`Ok(Self::X)` 里那个大写开头的变体名。
 fn leading_variant(text: &str) -> Option<String> {
     let text = text.trim_start();
@@ -362,8 +337,8 @@ impl Consts {
         let mut decls: Vec<(String, String, String)> = Vec::new();
         for (file, source) in sources {
             for (name, rhs) in const_decls(source) {
-                if let Some(word) = literals(&rhs).into_iter().next() {
-                    literal.entry(name.clone()).or_insert(word);
+                if let Some(word) = literal_values(&rhs).into_iter().next() {
+                    literal.entry(name.clone()).or_insert(word.to_string());
                 }
                 decls.push((file.clone(), name, rhs));
             }
@@ -417,8 +392,8 @@ fn written_words(
             continue;
         }
         let right = &arm[arrow + 2..];
-        let word = match literals(right).into_iter().next() {
-            Some(word) => word,
+        let word = match literal_values(right).into_iter().next() {
+            Some(word) => word.to_string(),
             None => {
                 let name = trailing_identifier(right);
                 match consts.get(file, &name) {
@@ -460,11 +435,11 @@ fn display_words(body: &str) -> Vec<(String, String)> {
         if !variant.chars().next().is_some_and(|c| c.is_uppercase()) {
             continue;
         }
-        let Some(word) = literals(&arm[arrow + 2..]).into_iter().next() else {
+        let Some(word) = literal_values(&arm[arrow + 2..]).into_iter().next() else {
             continue;
         };
-        if is_plain_word(&word) {
-            arms.push((variant, word));
+        if is_plain_word(word) {
+            arms.push((variant, word.to_string()));
         }
     }
     arms
@@ -496,9 +471,9 @@ fn explicit_arms(source: &str, owner: &str) -> Vec<(String, String)> {
         if pattern.contains("=>") || pattern.contains('=') {
             continue;
         }
-        for word in literals(pattern) {
-            if is_plain_word(&word) {
-                arms.push((word, variant.clone()));
+        for word in literal_values(pattern) {
+            if is_plain_word(word) {
+                arms.push((word.to_string(), variant.clone()));
             }
         }
     }
@@ -513,7 +488,7 @@ fn read_words(body: &str) -> Vec<(String, String)> {
         let Some(arrow) = arm.find("=>") else {
             continue;
         };
-        let words = literals(&arm[..arrow]);
+        let words = literal_values(&arm[..arrow]);
         if words.is_empty() {
             continue;
         }
@@ -521,7 +496,7 @@ fn read_words(body: &str) -> Vec<(String, String)> {
             continue;
         };
         for word in words {
-            arms.push((word, variant.clone()));
+            arms.push((word.to_string(), variant.clone()));
         }
     }
     arms

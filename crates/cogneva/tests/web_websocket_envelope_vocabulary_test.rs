@@ -256,7 +256,7 @@ fn chat_frames(text: &str) -> BTreeSet<String> {
 ///
 /// `needle` 要一直写到 `.includes(…)` 的被判对象：页面上另有一张三字母时区的
 /// 名单也用 `.includes(` 判定，只认 `].includes(` 就会读错那一张。
-fn literal_list(text: &str, needle: &str) -> BTreeSet<String> {
+fn quoted_list(text: &str, needle: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let Some(at) = text.find(needle) else {
         return names;
@@ -701,7 +701,7 @@ fn the_takeover_page_speaks_only_names_the_gateway_writes() {
     );
 
     let mut complaints = Vec::new();
-    let envelope_list = literal_list(&page, "].includes(msg.type)");
+    let envelope_list = quoted_list(&page, "].includes(msg.type)");
     assert!(
         envelope_list.len() >= 2,
         "只从 {TAKEOVER} 里读出 {} 个信封名字（{envelope_list:?}）：页面换了判法，\

@@ -1190,7 +1190,7 @@ fn every_cell_a_panel_selects_is_a_name_this_tree_writes() {
         }
     }
 
-    let written = cells_written::literals_the_tree_writes(
+    let written = cells_written::strings_the_tree_writes(
         &repo_root(),
         PRODUCED
             .iter()
