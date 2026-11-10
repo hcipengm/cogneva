@@ -666,6 +666,15 @@ impl BuildCacheReadings {
                 freed_bytes = freed,
                 cap_bytes = cap,
                 unmet_bytes = remaining,
+                planned_bytes = plan.delete_bytes,
+                // The part of `unmet_bytes` no pass can close: the bytes the
+                // per-layer floor keeps, plus any held by a file whose other
+                // names the walk did not see. A pass that ran out of discardable
+                // names leaves a remainder the next walk can still meet, while a
+                // cap at or under the floor repeats this same number pass after
+                // pass -- so a recurrence is attributable here instead of only
+                // visible in the count of unmet passes.
+                unreachable_bytes = plan.unreachable_bytes,
                 failures = outcome.failures.len(),
                 first_failures = ?failures,
                 "build cache could not be reclaimed down to its cap"
