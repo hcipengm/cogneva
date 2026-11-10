@@ -18,6 +18,11 @@
 //!       RequireApproval  → 状态 AwaitingReview + 台账 awaiting_approval（审批台待办）
 //! ```
 //!
+//! eval A/B 门有三种结局，不是两种：测过且不拦、测过且拦、以及**没测到**。
+//! 没测到（求值器没接上 / 两组结果读不成 / 评估任务没跑成）不导出「放行」这个动作：
+//! 它落成 `AwaitingApproval` 并说出为什么，等一个人看；「被判方自报没有套件」是一次
+//! 测过的答案，照常走下面的判据。
+//!
 //! 最后那一档不是终态：等待有上限（`awaiting_review_timeout_secs`），到点
 //! 仍未决的记录由 [`AutoPromoter::sweep_expired_approvals`] 按判据与理由决断。
 //!
@@ -95,6 +100,20 @@ pub trait PromotionChannel: Send + Sync {
     async fn already_published(&self, _change_id: &str) -> Option<String> {
         None
     }
+}
+
+/// eval 门这一步导出什么动作。
+///
+/// 三格而不是两格：`Pass` 与 `Block` 是测过之后的两头，`Unmeasured` 是**没测到**——
+/// 它既不是「测过通过」，也不是「测出回归」，所以它有自己的去向（等人工），而不是
+/// 落进前两格中的任何一格。把它并进 `Pass` 就是把一处没接上的接线记成一次放行。
+enum EvalGateAction {
+    /// 测过，判词不拦。
+    Pass,
+    /// 测过，判词拦：带落台账的理由。
+    Block(String),
+    /// 没测到：带一句说清是哪一种没测到。
+    Unmeasured(String),
 }
 
 /// 晋级触发器。无状态时序：配额与熔断全部从台账推导，进程重启不丢。
@@ -240,21 +259,61 @@ impl AutoPromoter {
         // `None`），拿它当门等于把「门从没跑」记成「门放行」。它仍会作为展示判词写进
         // 台账那一列（见下面几处 `record`），那是留痕，不是判据。
         if !matches!(verdict, GateVerdict::Reject { .. }) {
-            if let Some(reason) = self.eval_gate_blocks(&change_id, source).await {
-                self.record(
-                    &change_id,
-                    "unknown",
-                    PromotionStatus::Failed,
-                    &reason,
-                    None,
-                    None,
-                )
-                .await?;
-                let _ = self
-                    .engine
-                    .record_change_outcome(&change_id, false, &reason)
-                    .await;
-                return Ok(());
+            match self.eval_gate_action(&change_id, source).await {
+                EvalGateAction::Pass => {}
+                EvalGateAction::Block(reason) => {
+                    self.record(
+                        &change_id,
+                        "unknown",
+                        PromotionStatus::Failed,
+                        &reason,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    let _ = self
+                        .engine
+                        .record_change_outcome(&change_id, false, &reason)
+                        .await;
+                    return Ok(());
+                }
+                EvalGateAction::Unmeasured(why) => {
+                    // 「门没测到」与「门判了回归」都写 `Failed` 的话，台账上两件事
+                    // 长得一样，而它们要做的事相反：回归是别晋级了，没测到是找个人
+                    // 来看。所以这里落的是等人工的那一格，理由点名没测到哪一种。
+                    let reason = match verdict.reason() {
+                        Some(class_reason) => format!(
+                            "eval 门没测到，没有当成通过：{why}（分级判据：{class_reason}）"
+                        ),
+                        None => format!("eval 门没测到，没有当成通过：{why}"),
+                    };
+                    let level = match &verdict {
+                        GateVerdict::AutoConfig => "l0_config",
+                        GateVerdict::AutoRollout => "l1_rollout",
+                        GateVerdict::RequireApproval { .. } => "l2_approval",
+                        // 上面那道 `!Reject` 已经把它挡在外面。
+                        GateVerdict::Reject { .. } => {
+                            unreachable!("rejected verdicts skip the eval gate")
+                        }
+                    };
+                    warn!(
+                        change_id = %change_id,
+                        reason = %reason,
+                        "promotion parked for a person: the eval gate could not measure"
+                    );
+                    self.record(
+                        &change_id,
+                        level,
+                        PromotionStatus::AwaitingApproval,
+                        &reason,
+                        Some(verdict.kind()),
+                        change.eval_summary.as_ref().map(|r| r.summary.as_str()),
+                    )
+                    .await?;
+                    self.set_change_status(&change_id, EvolutionStatus::AwaitingReview)
+                        .await;
+                    return Ok(());
+                }
             }
         }
 
@@ -478,22 +537,36 @@ impl AutoPromoter {
 
     /// 熔断判定：台账最近记录中，连续 RolledBack ≥ 阈值或
     /// 连续 Failed ≥ 阈值。返回触发原因。
-    /// 跑当次 eval A/B 门；判词拦下时返回理由，否则 `None`。
+    /// 跑当次 eval A/B 门，回三格之一：放行、拦下（带理由）、没测到（带理由）。
     ///
-    /// 门没接上（槽位为空 / 还没填）返回 `None`：那是「门没测」，不是「门判了回归」，
-    /// 因一处接线未完成就拦下整条晋升线，会把「没接线」误判成「全仓都回归了」。求值器
-    /// 自己在没有来源时也记 `Unavailable` 并放行——同一个道理。
-    async fn eval_gate_blocks(
+    /// 门没接上（槽位为空 / 还没填）是 `Unmeasured`，不是 `Pass`。它两件旧写法里
+    /// 读起来都像「没拦」，而它们要做的事相反：拦下是「这条别晋级」，没测到是「找个人
+    /// 来看」。把后者记成放行，等于一处没完成的接线替全仓签了「测过且通过」。
+    ///
+    /// 被判方自报没有套件（`NotApplicable`）是 `Pass`：那是一次**测过**的答案
+    /// ——「这里没有可测的」本身就是结论，把它也转人工会让一个不装评估集的仓
+    /// 永远晋级不了任何东西。
+    async fn eval_gate_action(
         &self,
         change_id: &str,
         source: Option<&PromotionSource>,
-    ) -> Option<String> {
-        let evaluator = self.eval_slot.as_ref().and_then(|slot| slot.get())?;
+    ) -> EvalGateAction {
+        let Some(evaluator) = self.eval_slot.as_ref().and_then(|slot| slot.get()) else {
+            return EvalGateAction::Unmeasured("eval 门的求值器没有接上（槽位空着）".into());
+        };
         let outcome = evaluator.evaluate(change_id, source).await;
         if outcome.blocks_promotion() {
-            Some(outcome.block_reason())
-        } else {
-            None
+            return EvalGateAction::Block(outcome.block_reason());
+        }
+        match outcome {
+            crate::promotion_eval::PromotionEvalOutcome::Measured(..) => EvalGateAction::Pass,
+            crate::promotion_eval::PromotionEvalOutcome::NotApplicable => EvalGateAction::Pass,
+            crate::promotion_eval::PromotionEvalOutcome::Unreadable(reason) => {
+                EvalGateAction::Unmeasured(format!("两组评估结果读不成：{reason}"))
+            }
+            crate::promotion_eval::PromotionEvalOutcome::Unavailable => {
+                EvalGateAction::Unmeasured("评估任务没有跑成（没有来源，或任务没到终态）".into())
+            }
         }
     }
 
@@ -771,7 +844,11 @@ mod tests {
         ledger: Arc<cog_test_support::MemoryStateBackend>,
         channel: Option<Arc<dyn PromotionChannel>>,
     ) -> AutoPromoter {
+        // 门一律接上：生产里它在 `start` 拿到编排器时就填进槽位，这里给它一个
+        // **测过的**答案（被判方自报没有套件）。与门无关的断言不该每条都先接线；
+        // 考「门没接上」的那几条自己造 `AutoPromoter::new`，不经过这一支。
         AutoPromoter::new(policy, ledger, channel, engine())
+            .with_eval_slot(wired(PromotionEvalOutcome::NotApplicable))
     }
 
     /// 部署进程在 `execve` 之前交出的那一条，必须由活着的进程取走并落进台账。
@@ -1604,6 +1681,134 @@ mod tests {
         let records = ledger.recent(10).await.unwrap();
         assert_eq!(records[0].status, PromotionStatus::Promoted);
         assert_eq!(channel.published.lock().unwrap().len(), 1);
+    }
+
+    /// A23：「没测到」不导出「放行」这个动作。
+    ///
+    /// 两种没测到各考一次：求值器跑了但两组结果读不成（`Unreadable`），以及任务
+    /// 根本没跑成（`Unavailable`）。两者都落成等人工的一行、理由点名「没测到」，
+    /// 且一个字节都没有交给发布通道——把这两种中的任何一种记成放行，就是让一次
+    /// 没跑成的测量替全仓签字。
+    #[tokio::test]
+    async fn an_unmeasured_gate_parks_the_change_instead_of_passing_it() {
+        for (id, outcome) in [
+            ("p13", PromotionEvalOutcome::Unavailable),
+            (
+                "p14",
+                PromotionEvalOutcome::Unreadable("before: not an array".into()),
+            ),
+        ] {
+            let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+            let channel = Arc::new(FakeChannel {
+                published: Mutex::new(Vec::new()),
+                fail: false,
+            });
+            let policy = crate::PromotionGateConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let p = promoter(policy, ledger.clone(), Some(channel.clone()))
+                .with_eval_slot(wired(outcome));
+            p.decide_and_promote(&change(id, "crates/cog-agent/src/tools.rs"))
+                .await
+                .unwrap();
+            let records = ledger.recent(10).await.unwrap();
+            assert_eq!(
+                records[0].status,
+                PromotionStatus::AwaitingApproval,
+                "没测到要落成等人工的一行，不是 Failed（那会被读成一次回归）：{id}"
+            );
+            assert!(
+                records[0].outcome.contains("没测到"),
+                "理由要说出「没测到」，台账上才分得开它与回归：{}",
+                records[0].outcome
+            );
+            assert!(
+                channel.published.lock().unwrap().is_empty(),
+                "没测到的那一档不许晋级：{id}"
+            );
+        }
+    }
+
+    /// 门从没接上（槽位空着）是第三种没测到：不晋级、不记成 Failed、理由说清
+    /// 是接线缺了，而不是这次变更不好。
+    #[tokio::test]
+    async fn a_gate_that_was_never_wired_parks_instead_of_passing() {
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        // 不经 `promoter()`：那一支故意把门接上。
+        let p = AutoPromoter::new(policy, ledger.clone(), Some(channel.clone()), engine());
+        p.decide_and_promote(&change("p15", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records[0].status, PromotionStatus::AwaitingApproval);
+        assert!(
+            records[0].outcome.contains("没有接上"),
+            "理由要点名是接线缺了：{}",
+            records[0].outcome
+        );
+        assert!(channel.published.lock().unwrap().is_empty());
+    }
+
+    /// 边界：「被判方自报没有套件」是测过的答案，不是没测到——它照常晋级。
+    ///
+    /// 把这一格也转人工，等于让一个不装评估集的仓永远自动晋级不了任何东西；
+    /// 而它与「没测到」在读数面上本来就是两格（`not_applicable` / `unavailable`）。
+    #[tokio::test]
+    async fn a_gate_that_says_there_is_no_suite_still_promotes() {
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()))
+            .with_eval_slot(wired(PromotionEvalOutcome::NotApplicable));
+        p.decide_and_promote(&change("p16", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records[0].status, PromotionStatus::Promoted);
+        assert_eq!(channel.published.lock().unwrap().len(), 1);
+    }
+
+    /// 停下来的那一行不许再问一次门：等人工就是有人要看，不是下一轮再测一遍
+    /// ——再测一遍会把「等人工」变成「每轮都付一次沙盒双构建」。
+    #[tokio::test]
+    async fn a_parked_change_does_not_ask_the_gate_again() {
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone())).with_eval_slot(
+            wired_counting(PromotionEvalOutcome::Unavailable, Some(calls.clone())),
+        );
+        let c = change("p17", "crates/cog-agent/src/tools.rs");
+        p.decide_and_promote(&c).await.unwrap();
+        p.decide_and_promote(&c).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            ledger.recent(10).await.unwrap().len(),
+            1,
+            "第二次判定要被幂等读挡下，不写第二行"
+        );
     }
 
     #[tokio::test]
