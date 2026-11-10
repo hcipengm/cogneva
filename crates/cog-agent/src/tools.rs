@@ -117,9 +117,18 @@ fn sandbox_task_id(scope: Option<&ToolScope>) -> String {
         // The executor accepts `[A-Za-z0-9_.-]` and nothing else in a task id
         // (see `validate_task_id`); agent ids carry other bytes -- squads are
         // spelled `squad:<task>` -- so the name is folded before it is used.
-        Some(caller) => format!("unscoped-shell-{}", workspace_name(&caller)),
+        Some(caller) => standing_workspace(&caller),
         None => format!("unscoped-shell-{}", uuid::Uuid::new_v4()),
     }
+}
+
+/// 一个没有任务号的员工，手里的命令落在哪条工作树车道上。
+///
+/// 名字是算出来的，不是分出来的：同一句话、同一侧工具、同一侧系统前缀都从
+/// 这里取，所以模型在提示词里读到的车道名，就是它下一次调用真落进去的那条。
+/// 两边各拼一遍的话，改了一边就会让模型以为自己在另一棵树里。
+pub fn standing_workspace(agent_id: &str) -> String {
+    format!("unscoped-shell-{}", workspace_name(agent_id))
 }
 
 /// Fold an agent id into something the worktree router accepts as a directory

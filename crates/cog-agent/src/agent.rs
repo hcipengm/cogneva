@@ -407,6 +407,9 @@ impl Agent {
         let event_bus_sink = self.event_bus_sink.clone();
         let observability = self.observability.clone();
         let tool_output_archive = self.tool_output_archive.clone();
+        // 名册交给运行时的循环：它自己的工号与名字从那一行读。登记在下面
+        // 发生，晚于这里——运行时每轮开头才问一次，问到之前不编名字。
+        let roster = self.registry.clone();
 
         let loop_event_cap = self.loop_event_channel_capacity;
         let handle = tokio::spawn(async move {
@@ -414,6 +417,9 @@ impl Agent {
             let mut agent_loop = AgentRuntime::new(config, loop_event_tx)
                 .with_tools(tools)
                 .with_hooks(hooks);
+            if let Some(ref roster) = roster {
+                agent_loop = agent_loop.with_roster(roster.clone());
+            }
             if let Some(ref sb) = sandbox_backend {
                 agent_loop = agent_loop.with_sandbox_backend(sb.clone());
             }
@@ -1012,6 +1018,8 @@ impl Agent {
         let event_bus_sink = self.event_bus_sink.clone();
         let observability = self.observability.clone();
         let tool_output_archive = self.tool_output_archive.clone();
+        // 与 `start` 同一条理由：恢复出来的这个对象也是名册上的同一个人。
+        let roster = self.registry.clone();
 
         let loop_event_cap = self.loop_event_channel_capacity;
         let handle = tokio::spawn(async move {
@@ -1019,6 +1027,9 @@ impl Agent {
             let mut agent_loop = AgentRuntime::new(config, loop_event_tx)
                 .with_tools(tools)
                 .with_hooks(hooks);
+            if let Some(ref roster) = roster {
+                agent_loop = agent_loop.with_roster(roster.clone());
+            }
             if let Some(ref sb) = sandbox_backend {
                 agent_loop = agent_loop.with_sandbox_backend(sb.clone());
             }

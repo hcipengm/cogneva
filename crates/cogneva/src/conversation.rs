@@ -414,13 +414,18 @@ impl ConversationTurn for PlatformConversation {
             // 员工是通用智能体：它没有预设，有的只是这个进程给它的工具；具体
             // 做哪件活，由拿到的那句话决定。
             let capabilities = tools.names();
-            let mut runtime = cog_agent::AgentRuntime::new(config, events)
-                .with_tools(tools)
-                // 没有身份的连接不声明人：编一个名字会读成真有人花过这笔钱。
-                .with_call_identity(
-                    request.owner.clone(),
-                    cog_core::LlmOrigin::Interactive.as_str(),
-                );
+            let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
+            // 名册交给运行时：它在每轮开头读到自己那一行的工号与名字，写进系统
+            // 前缀。这里不做这件事——构造点不止这一处，漏一处那一种执行体就
+            // 不知道自己的名字，而漏掉不会报错，只会回答「我是 unknown」。
+            if let Some(roster) = self.roster.as_ref() {
+                runtime = runtime.with_roster(roster.clone());
+            }
+            // 没有身份的连接不声明人：编一个名字会读成真有人花过这笔钱。
+            let mut runtime = runtime.with_call_identity(
+                request.owner.clone(),
+                cog_core::LlmOrigin::Interactive.as_str(),
+            );
 
             // 开跑前先读收件箱：同事在它不在的时候发来的话，这一轮要看得见。
             // 读完就确认，下一轮只读新的；回信地址跟着消息一起带进来，等这一轮

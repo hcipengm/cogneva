@@ -421,6 +421,18 @@ pub struct AgentRuntime {
     /// Held on the runtime rather than threaded through every call site because
     /// it is a property of the run, exactly like the usage totals beside it.
     run_task_id: Option<String>,
+    /// 名册。有它才读得到自己那一行的工号与名字（见 `absorb_base_instruction`）。
+    roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+    /// 这一位在人前的名字，`E0412 林清和`。每轮开头读一次名册，读到了就留着。
+    display_name: Option<String>,
+    /// 这一轮是否已经问过名册。每轮开头重置：上一轮没登记上的人，这一轮登记
+    /// 之后应当读到自己的名字，而不是永远停在第一次的那个答案上。
+    identity_looked_up: bool,
+    /// 这一次运行写进系统前缀的那一行（id、名字、车道）。
+    ///
+    /// 留着它是因为重放闸要把它从请求摘要里去掉：上游拒的是这份请求，不是这
+    /// 个人；换一个名字重问同一个问题，仍然是在同一个窗口里买同一句拒绝。
+    identity_note: Option<String>,
 }
 
 /// The token census of one run: every billed LLM call the run made, folded into
@@ -474,7 +486,11 @@ impl RunUsage {
 /// every call, and hashing the serialized message would make every pair of
 /// attempts look like different requests — which is exactly the case this guard
 /// exists for.
-fn request_digest(messages: &[Message], options: &cog_core::ChatOptions) -> String {
+fn request_digest(
+    messages: &[Message],
+    options: &cog_core::ChatOptions,
+    own_line: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     let mut put = |part: &[u8]| {
         hasher.update(part);
@@ -484,7 +500,14 @@ fn request_digest(messages: &[Message], options: &cog_core::ChatOptions) -> Stri
         match message {
             Message::System { content, .. } => {
                 put(b"system");
-                put(content.as_bytes());
+                // 平台自己写进去的那一行（这位是谁、在哪条车道）不算「问的问题」。
+                // 重跑经常换一个新名字——ralph 每轮铸一个新任务 id，名字跟着变
+                // ——把名字算进摘要，同一份被拒的请求就再也不会撞上这道闸，而
+                // 闸正是为这种重跑建的：上游拒的是这份请求，不是这个人。
+                match own_line.filter(|line| content.contains(*line)) {
+                    Some(line) => put(content.replace(line, "").as_bytes()),
+                    None => put(content.as_bytes()),
+                }
             }
             Message::User { content, .. } => {
                 put(b"user");
@@ -1040,6 +1063,10 @@ impl AgentRuntime {
             actor_label: None,
             call_owner: None,
             call_origin: None,
+            roster: None,
+            display_name: None,
+            identity_looked_up: false,
+            identity_note: None,
         }
     }
 
@@ -1136,6 +1163,23 @@ impl AgentRuntime {
     pub fn with_call_identity(mut self, owner: impl Into<String>, origin: &str) -> Self {
         self.call_owner = Some(owner.into());
         self.call_origin = Some(origin.to_string());
+        self
+    }
+
+    /// 把名册交给这一轮：它自己的工号与名字从那一行读，不从调用方抄。
+    ///
+    /// 名字只有一处派生（`EmployeeRecord::label`）。每个构造点各自去名册上
+    /// 捞一遍、再各自传进来，漏掉一个构造点，那一种执行体就不知道自己的名字，
+    /// 而漏掉是不会报错的——它只是回答「我叫 unknown」。交给运行时之后，凡是
+    /// 登记过的执行体都在同一个地方读到同一个名字。
+    pub fn with_roster(mut self, roster: Arc<dyn cog_core::AgentRegistry>) -> Self {
+        self.roster = Some(roster);
+        self
+    }
+
+    /// 这一位在人前的名字。名册不可达时的显式来源，也是测试的入口。
+    pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = Some(name.into());
         self
     }
 
@@ -1570,7 +1614,7 @@ impl AgentRuntime {
         for message in messages {
             self.context.add_message(message);
         }
-        self.absorb_base_instruction();
+        self.absorb_base_instruction().await;
         self.run_loop(llm, None).await
     }
 
@@ -1578,9 +1622,62 @@ impl AgentRuntime {
     ///
     /// 两条入口都要它：一次任务尝试与一轮对话在内核里是同一条循环，只有输入
     /// 从哪儿来不同；一段话只给其中一条，就等于平台上又有了两类智能体。
-    fn absorb_base_instruction(&mut self) {
+    ///
+    /// 后面再跟一行这一位自己的：叫什么、在哪个工作树里。平台那段话对所有人
+    /// 都说同一句，这一行是唯一让模型知道「这些话是**我**在说」的地方——
+    /// 没有它，被问「你是谁」只能去工具结果里猜，或者回一句「我是一个 AI 助手」。
+    async fn absorb_base_instruction(&mut self) {
         if let Some(text) = crate::agent_kernel::base_instruction::text() {
             self.context.merge_head_system(&text);
+        }
+        self.look_up_own_name().await;
+        let workspace = self.workspace_lane();
+        if let Some(note) = crate::agent_kernel::base_instruction::identity_note(
+            &self.config.agent_id,
+            self.display_name.as_deref(),
+            Some(workspace.as_str()),
+        ) {
+            self.context.merge_head_system(&note);
+            self.identity_note = Some(note);
+        }
+    }
+
+    /// 自己那一行的名字。每一轮开头问一次名册，问到了就留着。
+    ///
+    /// 只在读不到时每轮重问：工号是登记时发的，第一轮跑在登记之前就不该把
+    /// 「待编」记成自己的名字——下一轮登记好了，读到的才是真的那个。
+    async fn look_up_own_name(&mut self) {
+        if self.identity_looked_up || self.display_name.is_some() {
+            return;
+        }
+        self.identity_looked_up = true;
+        let Some(roster) = self.roster.as_ref() else {
+            return;
+        };
+        match roster.employee(&self.config.agent_id).await {
+            Ok(Some(row)) => self.display_name = Some(row.label()),
+            Ok(None) => {
+                // 还没登记上：这一轮不编名字。这一轮剩下的回合也不再问——它
+                // 不会在跑到一半时登记上；下一轮开头（`begin_scoped_run` 重置
+                // 这个开关）再问。
+            }
+            Err(e) => tracing::warn!(
+                agent_id = %self.config.agent_id,
+                error = %e,
+                "名册读不到自己那一行：这一轮它不知道自己的名字"
+            ),
+        }
+    }
+
+    /// 这一轮的命令与文件落在哪条工作树车道上。
+    ///
+    /// 与工具侧算的是同一个名字：有任务号就是那条任务的工作树，没有就是这位
+    /// 自己的常驻车道（`crate::tools::standing_workspace`）。系统前缀里说错了
+    /// 一棵树，比不说更坏——模型会照着它去解释另一棵树里的输出。
+    fn workspace_lane(&self) -> String {
+        match self.run_task_id.as_deref() {
+            Some(task) => task.to_string(),
+            None => crate::tools::standing_workspace(&self.config.agent_id),
         }
     }
 
@@ -1599,6 +1696,9 @@ impl AgentRuntime {
         // 把嘴堵上，否则第二轮同样的问题会在任何地方都读不到。
         self.context_overrun_reported = false;
         self.run_outcome = None;
+        // 新的一轮可以重新问一次名册：上一轮跑在登记之前、读不到自己那一行，
+        // 这一轮登记好了就该读到。
+        self.identity_looked_up = false;
         // Set before the first call and cleared at the only exit, so a run that
         // was started without an identity cannot inherit the previous one.
         self.run_task_id = run_task_id.map(str::to_string);
@@ -2170,7 +2270,7 @@ impl AgentRuntime {
         }
         // 平台对每个智能体说的同一段话排在具体指示前面：先是谁都不变的那些
         // （这是什么地方、事实从哪来），再是这件活自己的要求。
-        self.absorb_base_instruction();
+        self.absorb_base_instruction().await;
         // The varying half is rendered request-first, so the attempt counter
         // that used to open it does not sit in front of the one block every
         // attempt of a task shares. See `render_varying_half`.
@@ -3140,7 +3240,7 @@ impl AgentRuntime {
         // 的 attempt、ralph 的下一轮）拿不到这一层发过的字节，所以它们以为自己在
         // 重试，实际上是在同一个窗口里把同一个问题再买一遍，而答案只可能是同一句
         // 拒绝。判据是整份请求的摘要：换了一份请求就是换了一个问题，那是该发出去的。
-        let request = request_digest(&messages, &options);
+        let request = request_digest(&messages, &options, self.identity_note.as_deref());
         if let Some((cause, refusal, remaining)) =
             crate::agent_kernel::replay_guard::suppressed(&request, chrono::Utc::now())
         {
@@ -3707,6 +3807,144 @@ mod tests {
         assert_eq!(restored.state, RuntimeState::Observing);
         assert_eq!(restored.role(), "reviewer");
         assert_eq!(restored.config.agent_id, "before-the-snapshot");
+    }
+
+    /// 名册上只有这一位，工号由测试指定。
+    struct OneNamed(u32);
+
+    #[async_trait::async_trait]
+    impl cog_core::AgentRegistry for OneNamed {
+        async fn register(&self, _: &cog_core::AgentRegistration) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn heartbeat(&self, _: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn deregister(&self, _: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn get(&self, _: &str) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
+            Ok(None)
+        }
+        async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+            Ok(Vec::new())
+        }
+        async fn list_by_role(&self, _: &str) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+            Ok(Vec::new())
+        }
+        async fn list_by_capability(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+            Ok(Vec::new())
+        }
+        async fn employee(
+            &self,
+            agent_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::EmployeeRecord>> {
+            let now = chrono::Utc::now();
+            Ok(Some(cog_core::EmployeeRecord {
+                agent_id: agent_id.to_string(),
+                number: Some(self.0),
+                role: "chat".into(),
+                first_seen: now,
+                last_seen: now,
+                retired_at: None,
+            }))
+        }
+    }
+
+    /// 这一位开跑时，系统前缀里有它自己的工号与名字，还有它这一轮落在哪条
+    /// 工作树车道上。少了这一段，模型被问「你是谁」只能从工具结果里猜。
+    #[tokio::test]
+    async fn the_system_prefix_names_this_employee_and_its_workspace() {
+        let config = RuntimeConfig {
+            agent_id: "kai-a9ab11fc".into(),
+            role: "kai-a9ab11fc".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let mut agent_loop = AgentRuntime::new(config, tx).with_roster(Arc::new(OneNamed(412)));
+
+        agent_loop.absorb_base_instruction().await;
+
+        let head = agent_loop
+            .context
+            .messages()
+            .first()
+            .expect("the run's system prefix is in the context")
+            .content()
+            .to_string();
+        assert!(
+            head.contains(&cog_core::employee_label(412)),
+            "the employee's own label is missing: {head}"
+        );
+        // 同事按这个 id 找得到它：不知道自己的 id，就没法让同事回信。
+        assert!(
+            head.contains("kai-a9ab11fc"),
+            "the agent id peers address is missing: {head}"
+        );
+        // 与工具侧同一条车道名：命令落在哪棵树，前缀里说的就是哪棵树。
+        assert!(
+            head.contains(&crate::tools::standing_workspace("kai-a9ab11fc")),
+            "the workspace lane the calls land in is missing: {head}"
+        );
+    }
+
+    /// 名册上还没有这个人：前缀只说道路，不编名字。编一个名字会让人以为
+    /// 名册上有这一位。
+    #[tokio::test]
+    async fn an_employee_without_a_roster_row_is_given_no_name() {
+        let config = RuntimeConfig {
+            agent_id: "no-one-yet".into(),
+            role: "no-one-yet".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        struct Empty;
+        #[async_trait::async_trait]
+        impl cog_core::AgentRegistry for Empty {
+            async fn register(&self, _: &cog_core::AgentRegistration) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn heartbeat(&self, _: &str) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn deregister(&self, _: &str) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn get(&self, _: &str) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
+                Ok(None)
+            }
+            async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+                Ok(Vec::new())
+            }
+            async fn list_by_role(
+                &self,
+                _: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+                Ok(Vec::new())
+            }
+            async fn list_by_capability(
+                &self,
+                _: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+                Ok(Vec::new())
+            }
+        }
+        let mut agent_loop = AgentRuntime::new(config, tx).with_roster(Arc::new(Empty));
+
+        agent_loop.absorb_base_instruction().await;
+
+        let head = agent_loop
+            .context
+            .messages()
+            .first()
+            .expect("the workspace note alone is worth a prefix")
+            .content()
+            .to_string();
+        assert!(!head.contains("名字"), "no name was claimed: {head}");
+        assert!(head.contains(&crate::tools::standing_workspace("no-one-yet")));
     }
 
     /// A state word is spelled once: what `Display` prints is what `as_str`
