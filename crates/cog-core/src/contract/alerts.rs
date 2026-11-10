@@ -443,6 +443,32 @@ pub struct PersistentAlertDraft {
 /// happened again.
 pub const ALERT_FACE_LABEL: &str = "cogneva_io_face";
 
+/// Rule names of the self-alerts whose subject is the observing side itself.
+///
+/// Both kinds report through the same alert table as any other fault, which is
+/// what makes them reachable at all: the reader that turns firing rows into
+/// work has one door. But they are not faults of the system being watched —
+/// they say a reading could not be taken, or that the configuration in force is
+/// not the one deployed — and a fixer told "investigate the root cause of this
+/// alert" goes to look at the system, which is exactly the thing nobody could
+/// see while the row was firing.
+///
+/// So the consumer names them, and the naming has to agree with the writers on
+/// the first character: the row carries only this string, and a reader that
+/// spells it slightly differently files the work as an ordinary fault without
+/// anything going red. Same reason, same home as [`ALERT_FACE_LABEL`]: the
+/// writer is in `cog-observability`, the reader in `cog-reflection`, and they
+/// do not share a crate.
+pub const EVAL_FAILURE_RULE: &str = "infra_watch_eval_failure";
+
+/// The document this process runs is not the one its revision declares; see
+/// [`EVAL_FAILURE_RULE`].
+pub const CONFIG_DECLARATION_RULE: &str = "config_declaration_mismatch";
+
+/// The rule set this process holds is not the one on disk; see
+/// [`EVAL_FAILURE_RULE`].
+pub const CONFIG_RULES_NOT_LOADED_RULE: &str = "config_rules_not_loaded";
+
 /// Longest an alert label value may be before it is truncated.
 // cap: bound — 告警标签值在被截之前最长能有多长；再长的部分读者认不出是同一件事
 pub const ALERT_LABEL_VALUE_MAX_CHARS: usize = 1024;

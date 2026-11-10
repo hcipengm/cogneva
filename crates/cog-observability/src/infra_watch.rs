@@ -61,7 +61,12 @@ const NON_IDENTITY_LABELS: &[&str] = &["__name__", "job", "endpoint", "service",
 /// through the same persistent state machine as infrastructure alerts so
 /// self-discovery sees the observation gap. Kept distinct from configured
 /// rule names so the series-resolution pass never touches these rows.
-pub const EVAL_FAILURE_RULE: &str = "infra_watch_eval_failure";
+///
+/// The string is declared in the shared contract, because the reader that turns
+/// firing rows into work tells this row apart from an ordinary fault by exactly
+/// this name — and both sides spelling it independently is the one way that
+/// reader can silently start treating an observation gap as a system fault.
+pub use cog_core::alerts::EVAL_FAILURE_RULE;
 
 /// This loop's name in the liveness census.
 pub const INFRA_WATCH_LOOP: &str = "infra_watch";

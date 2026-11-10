@@ -427,6 +427,8 @@ mod rust_capacity_constants_registry_test;
 mod scenes_hand_work_to_the_roster_test;
 #[path = "scrape_targets_name_a_port_the_workload_provides_test.rs"]
 mod scrape_targets_name_a_port_the_workload_provides_test;
+#[path = "self_alert_rule_names_are_declared_once_test.rs"]
+mod self_alert_rule_names_are_declared_once_test;
 #[path = "service_account_mount_literals_contract_test.rs"]
 mod service_account_mount_literals_contract_test;
 #[path = "shutdown_budget_contract_test.rs"]

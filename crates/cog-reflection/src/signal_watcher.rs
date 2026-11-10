@@ -15,7 +15,13 @@
 //!    surface) — runtime reflection cannot see static code properties.
 //! 4. **Persisted alerts**: firing rows in the alert state machine (infra
 //!    watcher, supervisor bridge) are faults something already judged
-//!    alert-worthy; each becomes an intent keyed by its dedup key.
+//!    alert-worthy; each becomes an intent keyed by its dedup key. Two of those
+//!    writers report the observing side instead of the observed one — a rule
+//!    that cannot be evaluated, a configuration that is not the one deployed —
+//!    and their rows arrive through this same door. They are named as their own
+//!    sources (`rule_evaluation`, `config_defect`) rather than filed as ordinary
+//!    faults: an observer told to find "the root cause of this alert" looks at
+//!    the system, which is the one thing that was not being read.
 //! 5. **Taste intents**: judgements submitted from outside the pipeline
 //!    (whether a claimed result holds up, which direction is worth more, what
 //!    the standard of good should be). This is the one channel here whose
@@ -437,6 +443,33 @@ struct SelectedAlerts<'a> {
     in_cooldown: usize,
 }
 
+/// 第四条通道里那两类「读数没读到」的自报，各自的名字。
+///
+/// 普通告警说的都是系统里的一件真事：资源紧了、进程不在了、队列堵了。这两类
+/// 说的不是那件事，而是**观察本身**缺了一格——规则求值失败是这条规则/它选的
+/// 那个指标坏了，配置缺陷是这份进程跑的文档不是部署声明的那个。把两者交给同一句
+/// 「去查这个告警的根因」，接活的人会去查系统，而系统此刻恰恰没有被看见过；
+/// 查到的任何结论都是猜的。名字分开，判据、目标、项目分组才分得开。
+const RULE_EVALUATION_KIND: &str = "rule_evaluation";
+const CONFIG_DEFECT_KIND: &str = "config_defect";
+
+/// 一条 firing 行如果不是普通告警，它属于哪一类自报。
+///
+/// 按规则名认，因为那是行走过存储后唯一还带着的出身信息：`dedup_key` 里也有
+/// 它，但那是拼接出来的身份，读者要的是「这是哪一类」。名字本身声明在共享契约里
+/// ——写行的在 `cog-observability`，读行的在这里，两边不共用一个 crate。
+fn self_alert_kind(rule: &str) -> Option<&'static str> {
+    if rule == cog_core::alerts::EVAL_FAILURE_RULE {
+        return Some(RULE_EVALUATION_KIND);
+    }
+    if rule == cog_core::alerts::CONFIG_DECLARATION_RULE
+        || rule == cog_core::alerts::CONFIG_RULES_NOT_LOADED_RULE
+    {
+        return Some(CONFIG_DEFECT_KIND);
+    }
+    None
+}
+
 /// Turn one firing alert into the intent that will try to fix it.
 ///
 /// The labels are clamped on the way in because this intent's task input is
@@ -451,24 +484,61 @@ fn alert_intent(
     max_label_chars: usize,
 ) -> (String, serde_json::Value) {
     let labels = cog_core::bound_alert_labels(&alert.labels, max_label_chars);
+    let self_kind = self_alert_kind(&alert.rule);
     // The first line is the landing header: the rule name is the part that
     // tells two alert-driven changes apart, so it comes first, where a
-    // shortened header still shows it.
-    let goal = format!(
-        "Fix alert \"{}\"\n\nInvestigate and fix the root cause of firing alert \"{}\" \
-         (severity: {}): {}. Alert labels: {}. The alert fired at {} \
-         and is still active. Identify the underlying defect or \
-         resource condition, implement a durable fix, and explain \
-         how recurrence is prevented.",
-        alert.rule,
-        alert.rule,
-        alert.severity,
-        alert.message,
-        labels,
-        alert.fired_at.to_rfc3339(),
-    );
+    // shortened header still shows it. For a self-alert the header leads with
+    // what kind of gap it is, because "fix alert X" sends the reader looking for
+    // a fault in the system while the row says the system was not looked at.
+    let goal = if self_kind == Some(RULE_EVALUATION_KIND) {
+        format!(
+            "Fix rule evaluation failure \"{}\"\n\nAlert rule \"{}\" cannot be evaluated \
+             (severity: {}): {}. While a rule cannot be evaluated, nothing can say whether \
+             the condition it names is true — a quiet board and a blind reader read the same. \
+             Find why this reading is not produced (the rule's query, the metric it selects, \
+             the scrape path behind it), fix that, and say how a rule that breaks again would \
+             be noticed as broken. Alert labels: {}. The alert fired at {} and is still \
+             active.",
+            alert.rule,
+            alert.rule,
+            alert.severity,
+            alert.message,
+            labels,
+            alert.fired_at.to_rfc3339(),
+        )
+    } else if self_kind == Some(CONFIG_DEFECT_KIND) {
+        format!(
+            "Fix configuration defect \"{}\"\n\nAlert rule \"{}\" reports that the configuration \
+             in force is not the one the deployment declares (severity: {}): {}. Nothing here \
+             says the system is misbehaving — it says every setting read from that document is \
+             a value nobody chose. Find which side is stale (the document that was applied, the \
+             process that did not roll, the revision the deployment points at), fix that, and \
+             say how the two readings would notice drifting apart again. Alert labels: {}. The \
+             alert fired at {} and is still active.",
+            alert.rule,
+            alert.rule,
+            alert.severity,
+            alert.message,
+            labels,
+            alert.fired_at.to_rfc3339(),
+        )
+    } else {
+        format!(
+            "Fix alert \"{}\"\n\nInvestigate and fix the root cause of firing alert \"{}\" \
+             (severity: {}): {}. Alert labels: {}. The alert fired at {} \
+             and is still active. Identify the underlying defect or \
+             resource condition, implement a durable fix, and explain \
+             how recurrence is prevented.",
+            alert.rule,
+            alert.rule,
+            alert.severity,
+            alert.message,
+            labels,
+            alert.fired_at.to_rfc3339(),
+        )
+    };
     let detail = serde_json::json!({
-        "kind": "persisted_alert",
+        "kind": self_kind.unwrap_or("persisted_alert"),
         "rule": alert.rule,
         "dedup_key": alert.dedup_key,
         "severity": alert.severity,
@@ -860,6 +930,24 @@ fn signal_acceptance(detail: &serde_json::Value, project: Option<&str>) -> Strin
             .and_then(|value| value.as_u64())
             .unwrap_or(0)
     };
+    // 两类自报的止损条件和普通告警同一形状——行离开 firing 集合——但说出来的话不同。
+    // 普通告警是「那件事过去了」，这两类是「这一格读数回来了」。读到这句话的人拿它
+    // 判断还要不要等，两种含义压成一句，就是把「系统好了」与「又能看见系统了」写成
+    // 同一件事，而这正是它们要分开的理由。
+    if kind == RULE_EVALUATION_KIND {
+        return format!(
+            "告警「{}」不再处于 firing：这条自报说的是求值这一格恢复了——同一规则重新被\
+             求值之后，存储里这一行由写它的那一侧关掉",
+            text("rule")
+        );
+    }
+    if kind == CONFIG_DEFECT_KIND {
+        return format!(
+            "告警「{}」不再处于 firing：进程跑的配置回到了部署声明的那个修订，行由做这项\
+             检查的那一侧自己关掉",
+            text("rule")
+        );
+    }
     match kind {
         "persisted_alert" => format!(
             "告警「{}」不再处于 firing：下一轮读告警存储时它不在 firing 集合里",
@@ -3552,6 +3640,129 @@ mod tests {
         // Nothing named, nothing invented.
         assert_eq!(signal_project_key(&serde_json::json!({})), None);
         assert_eq!(signal_project_key(&serde_json::json!({"kind": "  "})), None);
+    }
+
+    /// 一条「规则求值失败」的自报是一条自报，不是一条故障：它说的是这一格读数
+    /// 没读到，不是系统里出了事。落成同一个 `persisted_alert`，接活的人会按那句
+    /// 「去查这个告警的根因」去看系统，而系统此刻恰恰没有被读过——他能得到的任何
+    /// 结论都是猜的。
+    #[test]
+    fn a_rule_that_cannot_be_evaluated_is_filed_under_its_own_source() {
+        let mut alert = firing("eval");
+        alert.rule = cog_core::alerts::EVAL_FAILURE_RULE.to_string();
+        alert.message = "rule CognevaPoolDown: query failed".into();
+
+        let (goal, detail) = alert_intent(&alert, 256);
+
+        assert_eq!(
+            detail["kind"].as_str(),
+            Some(RULE_EVALUATION_KIND),
+            "求值失败被当成了普通告警：判据与目标都会按「系统出事了」来写"
+        );
+        assert_eq!(
+            signal_project_key(&detail),
+            Some(format!(
+                "{SIGNAL_PROJECT_PREFIX}{RULE_EVALUATION_KIND}/{}",
+                cog_core::alerts::EVAL_FAILURE_RULE
+            )),
+            "项目按来源分组，才不会和普通告警挤在同一个项目里"
+        );
+        assert!(
+            goal.starts_with(&format!("Fix rule evaluation failure \"{}\"", alert.rule)),
+            "结案头要说出缺的是哪一格读数，而不是笼统的「修这个告警」：{}",
+            goal.lines().next().unwrap_or_default()
+        );
+        let acceptance = signal_acceptance(&detail, signal_project_key(&detail).as_deref());
+        assert!(
+            acceptance.contains("求值"),
+            "验收标准要说出关掉它的是求值恢复，而不是那件条件消失：{acceptance}"
+        );
+    }
+
+    /// 配置级缺陷同理，而且两种都算：文档不是部署声明的那个，以及这份进程手里的
+    /// 规则集不是盘上的那个。两者都说「现在生效的不是有人选过的那一份」。
+    #[test]
+    fn a_configuration_defect_is_filed_under_its_own_source() {
+        for rule in [
+            cog_core::alerts::CONFIG_DECLARATION_RULE,
+            cog_core::alerts::CONFIG_RULES_NOT_LOADED_RULE,
+        ] {
+            let mut alert = firing("cfg");
+            alert.rule = rule.to_string();
+
+            let (goal, detail) = alert_intent(&alert, 256);
+
+            assert_eq!(
+                detail["kind"].as_str(),
+                Some(CONFIG_DEFECT_KIND),
+                "{rule} 被当成了普通告警"
+            );
+            assert_eq!(
+                signal_project_key(&detail),
+                Some(format!(
+                    "{SIGNAL_PROJECT_PREFIX}{CONFIG_DEFECT_KIND}/{rule}"
+                )),
+                "每种配置缺陷自己一个项目：修法不同，不该合成一条流水"
+            );
+            assert!(
+                goal.starts_with(&format!("Fix configuration defect \"{rule}\"")),
+                "结案头先说是配置不是系统：{}",
+                goal.lines().next().unwrap_or_default()
+            );
+            let acceptance = signal_acceptance(&detail, signal_project_key(&detail).as_deref());
+            assert!(
+                acceptance.contains("配置"),
+                "验收标准要说出关掉它的是配置回到声明的修订：{acceptance}"
+            );
+        }
+    }
+
+    /// 分出来的那两类之外，别的告警一个字都不变：它们的 kind、项目、目标句与本
+    /// 次改动之前逐字相同。这条不是怀旧，它是这次改动的边界——只把「读数没读到」
+    /// 那一类挑出来，别把普通故障顺手也改了判据。
+    #[test]
+    fn an_ordinary_fault_keeps_the_plain_kind_and_the_plain_words() {
+        let mut alert = firing("plain");
+        alert.rule = "agent_unhealthy".into();
+
+        let (goal, detail) = alert_intent(&alert, 256);
+
+        assert_eq!(detail["kind"].as_str(), Some("persisted_alert"));
+        assert_eq!(
+            signal_project_key(&detail),
+            Some(format!(
+                "{SIGNAL_PROJECT_PREFIX}persisted_alert/agent_unhealthy"
+            ))
+        );
+        assert!(
+            goal.starts_with("Fix alert \"agent_unhealthy\""),
+            "{}",
+            goal.lines().next().unwrap_or_default()
+        );
+        assert!(
+            goal.contains("Investigate and fix the root cause"),
+            "普通告警仍然叫接活的人去查系统：那是它该做的事"
+        );
+        assert!(
+            signal_acceptance(&detail, None).contains("不再处于 firing"),
+            "普通告警的止损条件没有变"
+        );
+    }
+
+    /// 来源是规则名上的判定，不是 `dedup_key` 上的：同一条规则下的两个主体仍然
+    /// 是一个项目，否则一次求值失败会按每个主体的条数各开一个项目。
+    #[test]
+    fn one_self_alert_rule_is_still_one_project() {
+        let intent = |subject: &str| {
+            let mut alert = firing(subject);
+            alert.rule = cog_core::alerts::EVAL_FAILURE_RULE.to_string();
+            alert_intent(&alert, 256).1
+        };
+        assert_eq!(
+            signal_project_key(&intent("rule_a")),
+            signal_project_key(&intent("rule_b")),
+            "同一条求值失败规则按主体拆项目，会把一次故障读成很多次"
+        );
     }
 
     /// The defect this whole disposition exists for: the attempt failed while
