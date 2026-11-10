@@ -1012,6 +1012,8 @@ mod tests {
                 web_search_base: None,
                 web_search_fallback_base: Some("http://gateway:8081/search-fallback".into()),
                 web_fetch_base: Some("http://render:11235".into()),
+                sandbox_backend: None,
+                shell_timeout: None,
             },
         );
         let tool = registry.get("web_fetch").expect("web_fetch is a built-in");
@@ -3130,6 +3132,16 @@ pub mod builtins {
         /// browser, and a backend that does not answer is reported as such
         /// rather than quietly replaced by the path that cannot run scripts.
         pub web_fetch_base: Option<String>,
+        /// The executor whose checkouts the tree-reading tools (search, glob,
+        /// git, patch) run in. `None` is a process that holds no executor:
+        /// those tools still register and name the missing layer when called,
+        /// because "this process has no checkout" and "there is no search"
+        /// call for different repairs.
+        pub sandbox_backend: Option<Arc<dyn SandboxBackend>>,
+        /// How long one of those tools may run. `None` takes the same wall a
+        /// shell command gets, since what is being timed is the same kind of
+        /// thing: a grep over a tree, a git status, a patch.
+        pub shell_timeout: Option<Duration>,
     }
 
     /// Register every built-in tool into `registry`.
@@ -3149,6 +3161,26 @@ pub mod builtins {
         cog_core::ToolRegistry::register(registry, run_command());
         cog_core::ToolRegistry::register(registry, run_command_background());
         cog_core::ToolRegistry::register(registry, command_output());
+        // 读树与改树的工具：它们与 `run_command` 共用同一个执行器与同一份身份
+        // （agent id 选树），所以答案来自调用者自己那棵树，而不是本进程脚下的
+        // 一份源码。后端缺席时照常注册、调用时报出缺的那一层。
+        let sandbox = SandboxTools::new(
+            inputs.sandbox_backend.clone(),
+            inputs
+                .shell_timeout
+                .unwrap_or_else(|| Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS)),
+        );
+        cog_core::ToolRegistry::register(registry, search_code(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, grep(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, glob(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, git_status(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, git_diff(sandbox.clone()));
+        cog_core::ToolRegistry::register(
+            registry,
+            git_commit(sandbox.clone(), inputs.agent_registry.clone()),
+        );
+        cog_core::ToolRegistry::register(registry, apply_patch(sandbox.clone()));
+        cog_core::ToolRegistry::register(registry, todo());
         match inputs.http_client.clone() {
             Some(client) => cog_core::ToolRegistry::register(
                 registry,
@@ -4200,24 +4232,755 @@ pub mod builtins {
         }
     }
 
-    pub fn search_code() -> Tool {
+    /// 这些工具的答案取决于「我脚下的那棵树现在长什么样」，所以它们在员工自己
+    /// 的工作树里执行，不在主进程的树上。
+    ///
+    /// 搜索、`git status/diff`、打补丁若在本进程跑，读到的是一份与调用者无关的
+    /// 源码，而结果看起来完全正常——这是最坏的一种错：它对得上问题，只是对不上
+    /// 那棵树。所以它们与 `run_command` 走同一个后端、同一份身份：agent id 选树，
+    /// 任务号做归属（见 [`cog_core::worktree_lane`]）。
+    ///
+    /// 后端缺席时工具照常注册、调用时报出缺的那一层。把工具从表里拿掉，「这个
+    /// 进程没有执行器」就会读成「没有搜索」——两者该做的补救完全不同。
+    #[derive(Clone)]
+    pub struct SandboxTools {
+        backend: Option<Arc<dyn SandboxBackend>>,
+        timeout: Duration,
+    }
+
+    impl SandboxTools {
+        pub fn new(backend: Option<Arc<dyn SandboxBackend>>, timeout: Duration) -> Self {
+            Self { backend, timeout }
+        }
+    }
+
+    /// 一条命令在员工树下跑完的完整结果。
+    struct ShellReply {
+        stdout: String,
+        stderr: String,
+        code: i32,
+        workdir: Option<String>,
+    }
+
+    /// 在员工自己的工作树里跑一条命令。
+    ///
+    /// 与 `run_command` 的差别只在命令由工具自己拼：身份那一侧两者一样，否则
+    /// 同一次运行里 `grep` 搜的树和 `run_command` 写进去的树会是两棵。
+    async fn run_in_checkout(
+        tools: &SandboxTools,
+        tool: &str,
+        command: String,
+    ) -> SFResult<ShellReply> {
+        let backend = tools.backend.clone().ok_or_else(|| {
+            SFError::Agent(format!(
+                "SandboxBackend not configured for {tool}: this process holds no executor, so \
+                 there is no checkout to run it in"
+            ))
+        })?;
+        let caller = caller_agent_id();
+        // 归属与选树各取一处已有的派生：任务号用 `sandbox_task_id`（与 shell
+        // 工具同一个口径：有调用者就是它的车道，没有就是一次性的无主名字），
+        // agent id 决定落在哪棵树。两边各拼一遍会让同一次运行里搜索与命令报出
+        // 两个不同的归属。
+        let task_id = sandbox_task_id(None);
+        let agent_id = caller.unwrap_or_else(|| format!("unscoped-tool-{tool}"));
+        let req = SandboxRequest {
+            task_id,
+            agent_id,
+            payload: SandboxPayload::Command { command },
+            input: serde_json::Value::Null,
+            timeout: tools.timeout,
+            limits: Default::default(),
+        };
+        let result = backend.execute(&req).await?;
+        Ok(ShellReply {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            code: result.exit_code,
+            workdir: result.workdir,
+        })
+    }
+
+    /// 把一段文本安全地放进 `sh -c` 的命令行：单引号里什么都不展开，文本里
+    /// 的单引号自己闭合再打开。
+    ///
+    /// 不用双引号：`$`、反引号、反斜杠在双引号里仍然有含义，而调用方给的
+    /// 是搜索词的原文，不是 shell 程序。
+    fn sh_quote(text: &str) -> String {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+
+    /// 一次搜索最多回给模型多少条。
+    // cap: bound — 匹配再多，读的人也不会逐条看，要的是模式；到顶时回复里带 truncated，不会悄悄截短
+    const SEARCH_MAX_RESULTS: usize = 200;
+
+    /// 一份 diff 最多回多少字符。
+    // cap: bound — 一整份 diff 会被每一轮重发；超出这一段的部分对判断「改了什么」没有新信息，回复里带 truncated
+    const GIT_DIFF_MAX_CHARS: usize = 64 * 1024;
+
+    /// 一张待办清单最多几行。
+    // cap: bound — 清单是给这一轮运行看的；再长就不是清单而是账，而账在别处
+    const TODO_MAX_ITEMS: usize = 50;
+
+    /// 进程里同时留几张清单。
+    // cap: bound — 清单的寿命是一轮运行；留着不再动的那几张只是内存，不服务任何人
+    const TODO_MAX_LISTS: usize = 64;
+
+    fn result_cap(args: &serde_json::Value, ceiling: usize) -> usize {
+        args.get("max_results")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).clamp(1, ceiling))
+            .unwrap_or(ceiling)
+    }
+
+    /// 拼一条 `grep -rnI` 命令并截到 `cap` 行。
+    fn grep_command(
+        pattern: &str,
+        path: &str,
+        include: Option<&str>,
+        fixed: bool,
+        ignore_case: bool,
+        cap: usize,
+    ) -> String {
+        // `.git` 是仓库自己的账本，不是这棵树的内容：搜进去只会把配置、日志
+        // 与最近一次提交说明混进结果里。
+        let mut command = String::from("grep -rnI --exclude-dir=.git");
+        if fixed {
+            command.push_str(" -F");
+        }
+        if ignore_case {
+            command.push_str(" -i");
+        }
+        if let Some(include) = include {
+            command.push_str(&format!(" --include={}", sh_quote(include)));
+        }
+        command.push_str(&format!(" -e {} -- {}", sh_quote(pattern), sh_quote(path)));
+        command.push_str(&format!(" | head -n {cap}"));
+        command
+    }
+
+    /// 把 `path:line:text` 拆成三段。路径里可能带冒号，所以找的是「冒号后面
+    /// 全是数字再接一个冒号」的那个位置，而不是第一个冒号。
+    ///
+    /// `grep -r ... .` 回的是以 `./` 开头的路径；去掉它，因为模型拿到的路径
+    /// 是相对检出根的，而 `./src/a.rs` 与 `src/a.rs` 在它眼里是两个字符串。
+    fn split_grep_line(line: &str) -> Option<(String, u64, String)> {
+        for (index, ch) in line.char_indices() {
+            if ch != ':' {
+                continue;
+            }
+            let rest = &line[index + 1..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            if let Some(text) = rest[digits.len()..].strip_prefix(':') {
+                let number = digits.parse().ok()?;
+                let path = &line[..index];
+                let path = path.strip_prefix("./").unwrap_or(path);
+                return Some((path.to_string(), number, text.to_string()));
+            }
+        }
+        None
+    }
+
+    pub fn grep(tools: SandboxTools) -> Tool {
         Tool {
-            name: "search_code".into(),
-            description: "Search for code patterns in the codebase".into(),
+            name: "grep".into(),
+            description: "Search the files under the checkout for a regular expression and get \
+                          the matching lines back as `path:line:text`, the same shape you would \
+                          see from `grep -rn`. Use search_code instead when you want the matches \
+                          already grouped per file. Binary files and `.git` are skipped. Long \
+                          result sets stop at the cap and say `truncated: true`."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search query" }
+                    "pattern": {
+                        "type": "string",
+                        "description": "Extended regular expression, as grep reads it; set fixed to search for the literal text instead"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search, relative to the checkout root; defaults to the whole checkout"
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "Only search files whose name matches this glob, e.g. \"*.rs\""
+                    },
+                    "fixed": {
+                        "type": "boolean",
+                        "description": "Treat the pattern as literal text rather than a regular expression"
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Match case-insensitively"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many matching lines to return at most"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let pattern = args["pattern"]
+                        .as_str()
+                        .ok_or_else(|| SFError::Validation("pattern required".into()))?;
+                    let path = args["path"].as_str().unwrap_or(".");
+                    let include = args["include"].as_str();
+                    let fixed = args["fixed"].as_bool().unwrap_or(false);
+                    let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
+                    let cap = result_cap(&args, SEARCH_MAX_RESULTS);
+                    let command = grep_command(pattern, path, include, fixed, ignore_case, cap);
+                    let reply = run_in_checkout(&tools, "grep", command).await?;
+                    let lines: Vec<&str> = reply.stdout.lines().collect();
+                    let mut out = serde_json::json!({
+                        "matches": lines,
+                        "truncated": lines.len() >= cap,
+                    });
+                    if !reply.stderr.trim().is_empty() {
+                        out["stderr"] = serde_json::json!(reply.stderr);
+                    }
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    pub fn search_code(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "search_code".into(),
+            description: "Search the checkout for a regular expression and get the matches as \
+                          structured entries: one per match, each with the file, the line number \
+                          and the line's text. Use it to find where something lives before \
+                          reading the file; use grep when you want the matching lines as plain \
+                          text. Files are searched from the checkout root; binary files and \
+                          `.git` are skipped."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Extended regular expression to search for"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search, relative to the checkout root; defaults to the whole checkout"
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "Only search files whose name matches this glob, e.g. \"*.rs\""
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many matches to return at most"
+                    }
                 },
                 "required": ["query"]
             }),
-            implementation: ToolImplementation::Native(Arc::new(|args| {
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
                 Box::pin(async move {
                     let query = args["query"]
                         .as_str()
-                        .ok_or_else(|| cog_core::SFError::Validation("query required".into()))?;
-                    // Placeholder - actual implementation would use ripgrep or similar
-                    Ok(serde_json::json!({ "results": [], "query": query }))
+                        .ok_or_else(|| SFError::Validation("query required".into()))?;
+                    let path = args["path"].as_str().unwrap_or(".");
+                    let include = args["include"].as_str();
+                    let cap = result_cap(&args, SEARCH_MAX_RESULTS);
+                    let command = grep_command(query, path, include, false, false, cap);
+                    let reply = run_in_checkout(&tools, "search_code", command).await?;
+                    let lines: Vec<&str> = reply.stdout.lines().collect();
+                    let matches: Vec<serde_json::Value> = lines
+                        .iter()
+                        .filter_map(|line| {
+                            let (path, line_number, text) = split_grep_line(line)?;
+                            Some(serde_json::json!({
+                                "path": path,
+                                "line": line_number,
+                                "text": text,
+                            }))
+                        })
+                        .collect();
+                    let mut out = serde_json::json!({
+                        "matches": matches,
+                        "truncated": lines.len() >= cap,
+                    });
+                    if !reply.stderr.trim().is_empty() {
+                        out["stderr"] = serde_json::json!(reply.stderr);
+                    }
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    /// 一个路径是不是匹配这条 glob。
+    ///
+    /// 只有三种通配：`?` 一个非 `/` 字符、`*` 一段非 `/` 字符、`**` 任意字符
+    /// （含 `/`），`**/` 还可以匹配零个目录——所以 `**/*.rs` 既匹配 `a.rs` 也
+    /// 匹配 `src/a.rs`。模式对的是从检出根算起的整条路径，`*.rs` 只匹配根下的
+    /// 文件；这是 glob 的通行语义，也是「为什么它没找到 src 里的文件」最常见的
+    /// 那个误解，所以工具描述里写明。
+    fn glob_matches(pattern: &str, path: &str) -> bool {
+        let pattern: Vec<char> = pattern.chars().collect();
+        let path: Vec<char> = path.chars().collect();
+        let mut memo: HashMap<(usize, usize), bool> = HashMap::new();
+        fn walk(
+            pattern: &[char],
+            path: &[char],
+            i: usize,
+            j: usize,
+            memo: &mut HashMap<(usize, usize), bool>,
+        ) -> bool {
+            if let Some(hit) = memo.get(&(i, j)) {
+                return *hit;
+            }
+            let answer = if i == pattern.len() {
+                j == path.len()
+            } else if pattern[i] == '*' && pattern.get(i + 1) == Some(&'*') {
+                if pattern.get(i + 2) == Some(&'/') {
+                    // `**/`：零个目录，或者吃掉任意一段直到某个 `/`（含它）。
+                    walk(pattern, path, i + 3, j, memo)
+                        || (j..path.len()).any(|k| path[k] == '/' && walk(pattern, path, i + 3, k + 1, memo))
+                } else {
+                    walk(pattern, path, i + 2, j, memo)
+                        || (j < path.len() && walk(pattern, path, i, j + 1, memo))
+                }
+            } else if pattern[i] == '*' {
+                walk(pattern, path, i + 1, j, memo)
+                    || (j < path.len() && path[j] != '/' && walk(pattern, path, i, j + 1, memo))
+            } else if pattern[i] == '?' {
+                j < path.len() && path[j] != '/' && walk(pattern, path, i + 1, j + 1, memo)
+            } else {
+                j < path.len() && path[j] == pattern[i] && walk(pattern, path, i + 1, j + 1, memo)
+            };
+            memo.insert((i, j), answer);
+            answer
+        }
+        walk(&pattern, &path, 0, 0, &mut memo)
+    }
+
+    pub fn glob(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "glob".into(),
+            description: "List the files in the checkout whose path matches a glob: `?` is one \
+                          character, `*` is any run of characters within one path segment, and \
+                          `**` crosses directories (`**/*.rs` matches `a.rs` and `src/a.rs`). \
+                          Patterns are matched against the whole path from the checkout root, so \
+                          `*.rs` names only files at the top. Tracked files and untracked files \
+                          that git does not ignore are both listed; ignored ones are not."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob to match against paths relative to the checkout root, e.g. \"crates/**/tests/*.rs\""
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many paths to return at most"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let pattern = args["pattern"]
+                        .as_str()
+                        .ok_or_else(|| SFError::Validation("pattern required".into()))?;
+                    let cap = result_cap(&args, SEARCH_MAX_RESULTS);
+                    let reply = run_in_checkout(
+                        &tools,
+                        "glob",
+                        "git ls-files --cached --others --exclude-standard".to_string(),
+                    )
+                    .await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "listing the checkout failed: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    let mut paths: Vec<&str> = reply
+                        .stdout
+                        .lines()
+                        .filter(|path| glob_matches(pattern, path))
+                        .collect();
+                    paths.sort_unstable();
+                    let truncated = paths.len() > cap;
+                    paths.truncate(cap);
+                    let mut out = serde_json::json!({ "paths": paths, "truncated": truncated });
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    pub fn git_status(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "git_status".into(),
+            description: "Show the checkout's branch and what has changed in it, in the short \
+                          form: one line per changed path, `??` for files git is not tracking, \
+                          and the first line names the branch. Read it before committing to see \
+                          what the commit would include."
+                .into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            implementation: ToolImplementation::Native(Arc::new(move |_args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let reply = run_in_checkout(
+                        &tools,
+                        "git_status",
+                        "git status --short --branch".to_string(),
+                    )
+                    .await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "git status failed: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    let mut out = serde_json::json!({ "status": reply.stdout });
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    pub fn git_diff(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "git_diff".into(),
+            description: "Show what changed in the checkout as a unified diff. By default it \
+                          compares the working tree against the last commit; set staged to show \
+                          what a commit would record instead, and stat for the one-line-per-file \
+                          summary. A diff longer than the cap comes back cut off and says \
+                          `truncated: true`."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "staged": {
+                        "type": "boolean",
+                        "description": "Show the changes staged for the next commit rather than the working tree"
+                    },
+                    "stat": {
+                        "type": "boolean",
+                        "description": "Show only the summary of files changed, with line counts"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Limit the diff to this file or directory, relative to the checkout root"
+                    }
+                }
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let mut command = String::from("git diff");
+                    if args["staged"].as_bool().unwrap_or(false) {
+                        command.push_str(" --staged");
+                    }
+                    if args["stat"].as_bool().unwrap_or(false) {
+                        command.push_str(" --stat");
+                    }
+                    if let Some(path) = args["path"].as_str() {
+                        command.push_str(&format!(" -- {}", sh_quote(path)));
+                    }
+                    let reply = run_in_checkout(&tools, "git_diff", command).await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "git diff failed: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    let mut diff = reply.stdout;
+                    let truncated = diff.chars().count() > GIT_DIFF_MAX_CHARS;
+                    if truncated {
+                        let cut: String = diff.chars().take(GIT_DIFF_MAX_CHARS).collect();
+                        diff = cut;
+                    }
+                    let mut out = serde_json::json!({
+                        "diff": diff,
+                        "truncated": truncated,
+                    });
+                    if let Some(workdir) = reply.workdir {
+                        out["workdir"] = serde_json::json!(workdir);
+                    }
+                    Ok(out)
+                })
+            })),
+        }
+    }
+
+    pub fn git_commit(tools: SandboxTools, roster: Option<Arc<dyn cog_core::AgentRegistry>>) -> Tool {
+        Tool {
+            name: "git_commit".into(),
+            description: "Commit the checkout's changes on the branch it is on. Pass paths to \
+                          stage them first; without paths, what is already staged is committed. \
+                          The commit is signed by you -- your employee name and id are the \
+                          author -- so the history says who made the change. It answers with the \
+                          new commit's id. Use git_status first: committing an empty change is \
+                          refused by git, and the refusal is reported rather than retried."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The commit message; state what changed and why it had to"
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Paths to stage before committing, relative to the checkout root; omit to commit what is already staged"
+                    }
+                },
+                "required": ["message"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                let roster = roster.clone();
+                Box::pin(async move {
+                    let message = args["message"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .ok_or_else(|| SFError::Validation("message required".into()))?;
+                    let caller = caller_agent_id();
+                    let id = caller.clone().unwrap_or_else(|| "unattributed".to_string());
+                    // 署名取自主名册的那一行（`E0412 林清和`）：提交历史里该出现
+                    // 的是这个人，而不是一串节点名。名册读不到时退回 id——写上
+                    // id 仍然指得出是谁，编一个名字则指到一个不存在的人。
+                    let name = match (caller.as_deref(), roster.as_ref()) {
+                        (Some(caller), Some(roster)) => roster
+                            .employee(caller)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|record| record.label())
+                            .filter(|label| !label.trim().is_empty())
+                            .unwrap_or_else(|| caller.to_string()),
+                        (Some(caller), None) => caller.to_string(),
+                        (None, _) => id.clone(),
+                    };
+                    let mut command = String::new();
+                    if let Some(paths) = args["paths"].as_array() {
+                        let quoted: Vec<String> = paths
+                            .iter()
+                            .filter_map(|p| p.as_str().map(sh_quote))
+                            .collect();
+                        if !quoted.is_empty() {
+                            command.push_str(&format!("git add -- {} && ", quoted.join(" ")));
+                        }
+                    }
+                    command.push_str(&format!(
+                        "git -c user.name={} -c user.email={} commit -m {} && git rev-parse HEAD",
+                        sh_quote(&name),
+                        sh_quote(&format!("{id}@cogneva.invalid")),
+                        sh_quote(message)
+                    ));
+                    let reply = run_in_checkout(&tools, "git_commit", command).await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "the commit did not happen: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    let commit = reply
+                        .stdout
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    Ok(serde_json::json!({
+                        "commit": commit,
+                        "author": name,
+                        "output": reply.stdout,
+                    }))
+                })
+            })),
+        }
+    }
+
+    pub fn apply_patch(tools: SandboxTools) -> Tool {
+        Tool {
+            name: "apply_patch".into(),
+            description: "Apply a unified diff to the checkout, the way `git apply` does: the \
+                          patch has to name the files it changes with `---`/`+++` headers and \
+                          apply cleanly to what is on disk. Use it for changes that touch many \
+                          places at once; for one exact replacement edit_file is cheaper. A \
+                          patch that does not apply is refused whole -- nothing is half-applied."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "The unified diff to apply, exactly as git format-patch or git diff prints it"
+                    }
+                },
+                "required": ["patch"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let tools = tools.clone();
+                Box::pin(async move {
+                    let patch = args["patch"]
+                        .as_str()
+                        .filter(|p| !p.trim().is_empty())
+                        .ok_or_else(|| SFError::Validation("patch required".into()))?;
+                    // 补丁走标准输入，不落盘：写进来再删会让它在 `git status` 里
+                    // 出现一瞬间，而那一刻正好可能被另一次调用读到。分隔符带随机
+                    // 串，补丁正文里不可能有一行与它相同。
+                    let delimiter = format!("COGNEVA_PATCH_{}", uuid::Uuid::new_v4().simple());
+                    let body = if patch.ends_with('\n') {
+                        patch.to_string()
+                    } else {
+                        format!("{patch}\n")
+                    };
+                    let command = format!(
+                        "git apply --whitespace=nowarn <<'{delimiter}'\n{body}{delimiter}"
+                    );
+                    let reply = run_in_checkout(&tools, "apply_patch", command).await?;
+                    if reply.code != 0 {
+                        return Err(SFError::Agent(format!(
+                            "the patch did not apply: {}",
+                            reply.stderr.trim()
+                        )));
+                    }
+                    Ok(serde_json::json!({ "applied": true }))
+                })
+            })),
+        }
+    }
+
+    /// 一位调用者的一行待办。
+    #[derive(Clone)]
+    struct TodoItem {
+        content: String,
+        status: String,
+    }
+
+    /// 一本账：每位调用者一张清单，各带最后一次写入的时刻——满了要丢的时候，
+    /// 丢的是最久没人动的那张，而不是随便一张。
+    type TodoBook = HashMap<String, (std::time::Instant, Vec<TodoItem>)>;
+
+    fn todo_book() -> &'static std::sync::Mutex<TodoBook> {
+        static BOOK: std::sync::OnceLock<std::sync::Mutex<TodoBook>> = std::sync::OnceLock::new();
+        BOOK.get_or_init(Default::default)
+    }
+
+    pub fn todo() -> Tool {
+        Tool {
+            name: "todo".into(),
+            description: "Record the plan for this piece of work as a list of items with a \
+                          status each (`pending`, `in_progress`, `done`), replacing the list \
+                          wholesale. Use it when the work has several steps: writing the steps \
+                          down keeps the next call aimed at the right one. The answer repeats \
+                          the list with the counts, so the state is read back rather than \
+                          remembered. It lives with this process, not in the checkout -- a \
+                          restart forgets it, and nothing is committed."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "maxItems": TODO_MAX_ITEMS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "done"]
+                                }
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["items"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(|args| {
+                Box::pin(async move {
+                    let items = args["items"].as_array().ok_or_else(|| {
+                        SFError::Validation("items required: an array of {content, status}".into())
+                    })?;
+                    if items.len() > TODO_MAX_ITEMS {
+                        return Err(SFError::Validation(format!(
+                            "the list has {} items and this process keeps at most {TODO_MAX_ITEMS}: \
+                             a list longer than that is a ledger, and the ledger is elsewhere",
+                            items.len()
+                        )));
+                    }
+                    let mut parsed = Vec::with_capacity(items.len());
+                    for item in items {
+                        let content = item["content"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|c| !c.is_empty())
+                            .ok_or_else(|| SFError::Validation("every item needs content".into()))?;
+                        let status = item["status"].as_str().unwrap_or("pending");
+                        if !matches!(status, "pending" | "in_progress" | "done") {
+                            return Err(SFError::Validation(format!(
+                                "unknown status {status:?}: use pending, in_progress or done"
+                            )));
+                        }
+                        parsed.push(TodoItem {
+                            content: content.to_string(),
+                            status: status.to_string(),
+                        });
+                    }
+                    let key = caller_agent_id().unwrap_or_else(|| "unattributed".to_string());
+                    let book = todo_book();
+                    let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+                    if book.len() >= TODO_MAX_LISTS && !book.contains_key(&key) {
+                        // 满了就丢掉最久没人写的那张：清单的寿命是这一轮运行，留着
+                        // 一张已经没人写的，也只是内存。
+                        if let Some(oldest) = book
+                            .iter()
+                            .min_by_key(|(_, (written, _))| *written)
+                            .map(|(owner, _)| owner.clone())
+                        {
+                            book.remove(&oldest);
+                        }
+                    }
+                    book.insert(key, (std::time::Instant::now(), parsed.clone()));
+                    let counts = |status: &str| parsed.iter().filter(|i| i.status == status).count();
+                    Ok(serde_json::json!({
+                        "items": parsed
+                            .iter()
+                            .map(|item| serde_json::json!({
+                                "content": item.content,
+                                "status": item.status,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "pending": counts("pending"),
+                        "in_progress": counts("in_progress"),
+                        "done": counts("done"),
+                    }))
                 })
             })),
         }
@@ -4699,6 +5462,333 @@ pub mod builtins {
             .err()
             .expect("a zero budget is refused");
             assert!(matches!(err, SFError::Validation(_)));
+        }
+    }
+
+    /// 树读与改树的工具：命令对不对，以及它落在谁的树里。
+    ///
+    /// 这两条是这些工具唯一会说谎的地方。命令拼错了，`grep` 什么都不回，看起来
+    /// 像「没有匹配」；树选错了，它回得整整齐齐，只是回的是另一份源码。两种错
+    /// 都不报，所以都在这一层钉住——用一个记账的执行器，把请求原样留下来。
+    #[cfg(test)]
+    mod tree_tool_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        /// 只回话不执行的执行器：记下身份与命令，stdout 由测试摆好。
+        #[derive(Default)]
+        struct Scripted {
+            seen: std::sync::Mutex<Vec<(String, String, String)>>,
+            stdout: std::sync::Mutex<String>,
+            code: AtomicI32,
+        }
+
+        impl Scripted {
+            fn answering(text: &str) -> Self {
+                let backend = Self::default();
+                *backend.stdout.lock().unwrap() = text.to_string();
+                backend
+            }
+
+            fn failing() -> Self {
+                let backend = Self::default();
+                backend.code.store(1, Ordering::SeqCst);
+                backend
+            }
+
+            fn requests(&self) -> Vec<(String, String, String)> {
+                self.seen.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SandboxBackend for Scripted {
+            async fn execute(&self, req: &SandboxRequest) -> SFResult<cog_core::SandboxResult> {
+                let command = match &req.payload {
+                    SandboxPayload::Command { command } => command.clone(),
+                    _ => panic!("the tree tools run commands, not another payload"),
+                };
+                self.seen.lock().unwrap().push((
+                    req.agent_id.clone(),
+                    req.task_id.clone(),
+                    command,
+                ));
+                Ok(cog_core::SandboxResult {
+                    stdout: self.stdout.lock().unwrap().clone(),
+                    exit_code: self.code.load(Ordering::SeqCst),
+                    workdir: Some("/ws/employee-kai-a9ab11fc".into()),
+                    ..Default::default()
+                })
+            }
+
+            async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
+                Err(SFError::Agent("not a wasm backend".into()))
+            }
+        }
+
+        fn tools(backend: Arc<Scripted>) -> SandboxTools {
+            SandboxTools::new(Some(backend as Arc<dyn SandboxBackend>), Duration::from_secs(5))
+        }
+
+        /// 一条匹配回成一个条目：文件、行号、那一行。三样都在，读的人才不必
+        /// 再读一遍整个文件去找第几行。
+        #[tokio::test]
+        async fn search_code_answers_with_where_each_match_lives() {
+            let backend = Arc::new(Scripted::answering(
+                "crates/cog-agent/src/a.rs:12:fn search_code() {}\nweird:dir/b.rs:3:let x = 1;\n",
+            ));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, search_code(tools(backend.clone())));
+            let reply = CALLER_AGENT_ID
+                .scope("kai-a9ab11fc".to_string(), async {
+                    registry
+                        .execute(
+                            "search_code",
+                            serde_json::json!({"query": "fn search_code", "include": "*.rs"}),
+                        )
+                        .await
+                })
+                .await
+                .expect("a scripted search answers");
+
+            let matches = reply["matches"].as_array().expect("matches is a list");
+            assert_eq!(matches.len(), 2, "{reply}");
+            assert_eq!(matches[0]["path"], "crates/cog-agent/src/a.rs");
+            assert_eq!(matches[0]["line"], 12);
+            assert_eq!(matches[0]["text"], "fn search_code() {}");
+            // 路径里的冒号不能把行号读错：拆分点在「冒号后面是数字再接冒号」。
+            assert_eq!(matches[1]["path"], "weird:dir/b.rs");
+            assert_eq!(matches[1]["line"], 3);
+            assert_eq!(reply["truncated"], serde_json::json!(false));
+            assert_eq!(reply["workdir"], "/ws/employee-kai-a9ab11fc");
+
+            let seen = backend.requests();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            let (agent, _task, command) = &seen[0];
+            assert_eq!(agent, "kai-a9ab11fc");
+            assert!(command.contains("--include='*.rs'"), "{command}");
+            assert!(command.contains("'fn search_code'"), "{command}");
+            assert!(command.contains(&format!("head -n {SEARCH_MAX_RESULTS}")), "{command}");
+        }
+
+        /// 树由执行者决定，任务号只做归属。
+        ///
+        /// 反过来（按任务号选树）会让同一件活里的两位挤在一棵树里，而这正是
+        /// 员工要有自己那棵树的原因。
+        #[tokio::test]
+        async fn a_tree_tool_runs_in_the_callers_checkout() {
+            let backend = Arc::new(Scripted::answering("## work/employee-squad-DSC-1-generator\n"));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, git_status(tools(backend.clone())));
+            let reply = CALLER_AGENT_ID
+                .scope("squad:DSC-1-generator".to_string(), async {
+                    registry.execute("git_status", serde_json::json!({})).await
+                })
+                .await
+                .expect("a scripted status answers");
+            assert_eq!(reply["status"], "## work/employee-squad-DSC-1-generator\n");
+
+            let seen = backend.requests();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "squad:DSC-1-generator", "选树的是 agent id");
+            assert_eq!(
+                seen[0].1,
+                cog_core::worktree_lane("squad:DSC-1-generator"),
+                "归属写的是这条车道，不是别处"
+            );
+            assert_eq!(seen[0].2, "git status --short --branch");
+        }
+
+        /// 没公布过调用者时，身份写成「无主」，不编一个名字。
+        #[tokio::test]
+        async fn a_call_without_an_announced_caller_is_marked_unattributed() {
+            let backend = Arc::new(Scripted::answering(""));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, glob(tools(backend.clone())));
+            registry
+                .execute("glob", serde_json::json!({"pattern": "*.rs"}))
+                .await
+                .expect("a scripted listing answers");
+
+            let seen = backend.requests();
+            assert!(seen[0].0.starts_with("unscoped-tool-"), "{seen:?}");
+            assert!(
+                seen[0].1.starts_with("unscoped-shell-"),
+                "无主的请求不该挂到别人的任务号上：{seen:?}"
+            );
+        }
+
+        /// 没有执行器时，报错说的是缺执行器，不是缺工具、也不是没有匹配。
+        #[tokio::test]
+        async fn without_an_executor_the_tool_names_the_missing_layer() {
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(
+                &registry,
+                grep(SandboxTools::new(None, Duration::from_secs(5))),
+            );
+            let err = registry
+                .execute("grep", serde_json::json!({"pattern": "x"}))
+                .await
+                .expect_err("no executor, no answer");
+            assert!(
+                err.to_string().contains("SandboxBackend not configured"),
+                "缺执行器被说成了别的东西：{err}"
+            );
+        }
+
+        /// 同一次调用里 `grep` 搜的树与 `run_command` 写进去的树是同一棵：
+        /// 两条命令的身份必须落在同一条车道上。
+        #[test]
+        fn the_lane_is_derived_once_for_every_tool() {
+            let caller = "squad:DSC-9-reviewer";
+            let lane = cog_core::worktree_lane(caller);
+            assert_eq!(lane, cog_core::worktree_lane(caller));
+            assert!(lane.starts_with(cog_core::WORKTREE_LANE_PREFIX), "{lane}");
+        }
+
+        /// glob 的三种通配各走各的：`*` 不过 `/`，`**` 过，`**/` 还能匹配零层。
+        #[test]
+        fn a_glob_crosses_directories_only_where_the_pattern_says_so() {
+            assert!(glob_matches("*.rs", "main.rs"));
+            assert!(
+                !glob_matches("*.rs", "src/main.rs"),
+                "`*.rs` 只点名根下的文件；这是最容易读错的一格，工具描述里写明了"
+            );
+            assert!(glob_matches("src/*.rs", "src/main.rs"));
+            assert!(!glob_matches("src/*.rs", "src/deep/main.rs"));
+            assert!(glob_matches("src/**/*.rs", "src/deep/main.rs"));
+            assert!(
+                glob_matches("**/*.rs", "main.rs"),
+                "`**/` 要能匹配零个目录"
+            );
+            assert!(glob_matches("**/*.rs", "a/b/c.rs"));
+            assert!(glob_matches("src/?.rs", "src/a.rs"));
+            assert!(!glob_matches("src/?.rs", "src/ab.rs"));
+            assert!(!glob_matches("src/*.rs", "src/a.rs.bak"));
+            assert!(glob_matches("a/b", "a/b"), "没有通配时是逐字相等");
+        }
+
+        /// `path:line:text` 的拆分点在「数字后面那个冒号」，不是第一个冒号。
+        #[test]
+        fn a_match_line_splits_at_its_line_number() {
+            assert_eq!(
+                split_grep_line("src/a.rs:42:let x = 1;"),
+                Some(("src/a.rs".into(), 42, "let x = 1;".into()))
+            );
+            assert_eq!(
+                split_grep_line("C:/src/a.rs:7:data"),
+                Some(("C:/src/a.rs".into(), 7, "data".into()))
+            );
+            assert_eq!(
+                split_grep_line("src/a.rs:8:"),
+                Some(("src/a.rs".into(), 8, String::new()))
+            );
+            // `grep -r ... .` 回的是 `./src/a.rs`；两条写法在模型眼里是两个
+            // 字符串，`read_file` 会照着一个不存在的路径去开。
+            assert_eq!(
+                split_grep_line("./src/a.rs:9:text"),
+                Some(("src/a.rs".into(), 9, "text".into()))
+            );
+            assert_eq!(split_grep_line("no line number here"), None);
+            assert_eq!(split_grep_line("src/a.rs:not-a-number:x"), None);
+        }
+
+        /// 搜索词原样到 shell：引号、`$`、反引号都不许被展开。
+        #[test]
+        fn a_search_word_reaches_the_shell_verbatim() {
+            assert_eq!(sh_quote("plain"), "'plain'");
+            assert_eq!(sh_quote("it's $HOME `x`"), r#"'it'\''s $HOME `x`'"#);
+        }
+
+        /// 补丁从标准输入进去，正文一个字节都不动。
+        #[tokio::test]
+        async fn a_patch_travels_on_stdin_unchanged() {
+            let patch = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+            let backend = Arc::new(Scripted::answering(""));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, apply_patch(tools(backend.clone())));
+            registry
+                .execute("apply_patch", serde_json::json!({ "patch": patch }))
+                .await
+                .expect("a scripted apply answers");
+
+            let seen = backend.requests();
+            let command = &seen[0].2;
+            assert!(command.starts_with("git apply --whitespace=nowarn <<'"), "{command}");
+            assert!(command.contains(patch), "补丁正文被改过了：{command}");
+        }
+
+        /// 补丁没打上去时报错，而不是回一个「成功」。
+        #[tokio::test]
+        async fn a_patch_that_does_not_apply_is_reported() {
+            let backend = Arc::new(Scripted::failing());
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, apply_patch(tools(backend.clone())));
+            let err = registry
+                .execute("apply_patch", serde_json::json!({ "patch": "--- a\n+++ b\n" }))
+                .await
+                .expect_err("a failing apply is not a success");
+            assert!(err.to_string().contains("did not apply"), "{err}");
+        }
+
+        /// 清单按人分开：一个人的清单不是另一个人的。
+        #[tokio::test]
+        async fn each_employee_keeps_its_own_list() {
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, todo());
+            let two = serde_json::json!({"items": [
+                {"content": "read the failing test", "status": "done"},
+                {"content": "fix it", "status": "in_progress"},
+            ]});
+            let one = serde_json::json!({"items": [
+                {"content": "something else entirely", "status": "pending"},
+            ]});
+            let mine = CALLER_AGENT_ID
+                .scope("todo-owner-one".to_string(), async {
+                    registry.execute("todo", two).await
+                })
+                .await
+                .expect("a list is accepted");
+            assert_eq!(mine["pending"], 0);
+            assert_eq!(mine["in_progress"], 1);
+            assert_eq!(mine["done"], 1);
+            CALLER_AGENT_ID
+                .scope("todo-owner-two".to_string(), async {
+                    registry.execute("todo", one).await
+                })
+                .await
+                .expect("another caller's list is its own");
+            let again = CALLER_AGENT_ID
+                .scope("todo-owner-one".to_string(), async {
+                    registry
+                        .execute(
+                            "todo",
+                            serde_json::json!({"items": [
+                                {"content": "read the failing test", "status": "done"},
+                                {"content": "fix it", "status": "done"},
+                            ]}),
+                        )
+                        .await
+                })
+                .await
+                .expect("the first caller still owns its list");
+            assert_eq!(again["done"], 2);
+            assert_eq!(again["in_progress"], 0);
+        }
+
+        /// 未知状态是调用方的错，说清楚，而不是当成 pending 收下。
+        #[tokio::test]
+        async fn an_unknown_status_is_refused() {
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, todo());
+            let err = registry
+                .execute(
+                    "todo",
+                    serde_json::json!({"items": [{"content": "x", "status": "blocked"}]}),
+                )
+                .await
+                .expect_err("blocked is not a status this list has");
+            assert!(err.to_string().contains("unknown status"), "{err}");
         }
     }
 }

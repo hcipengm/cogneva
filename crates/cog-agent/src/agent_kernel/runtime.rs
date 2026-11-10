@@ -914,7 +914,12 @@ fn changes_the_checkout(tool: &str, arguments: &serde_json::Value) -> bool {
     // command is read the same way, because what it does to the checkout is
     // that command's business and not the handle's.
     if tool != "run_command" && tool != "run_command_background" {
-        return tool == "write_file" || tool == "edit_file";
+        // 打补丁与提交都改树：前者的名字不像写文件，后者的名字里有 "git"，
+        // 漏掉它们会让「正在原地打转」这句提示在最该出现的时候不出现。
+        return matches!(
+            tool,
+            "write_file" | "edit_file" | "apply_patch" | "git_commit"
+        );
     }
     let command = arguments
         .get("command")
@@ -7475,6 +7480,20 @@ mod tests {
                 true,
             ),
             ("read_file", serde_json::json!({ "path": "a.rs" }), false),
+            // 树上还有两种写：落一份补丁，记一笔提交。名字都不像写文件，漏掉
+            // 它们会让「这一轮在原地打转」这句提示在最该出现时不出现。
+            (
+                "apply_patch",
+                serde_json::json!({ "patch": "--- a\n+++ b\n" }),
+                true,
+            ),
+            (
+                "git_commit",
+                serde_json::json!({ "message": "fix the thing" }),
+                true,
+            ),
+            ("git_diff", serde_json::json!({}), false),
+            ("git_status", serde_json::json!({}), false),
             (
                 "run_command",
                 serde_json::json!({ "command": "grep -rn foo ." }),

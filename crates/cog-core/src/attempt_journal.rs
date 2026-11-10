@@ -132,8 +132,10 @@ pub enum EffectClass {
 pub fn effect_of(tool: &str) -> EffectClass {
     match tool {
         "read_file" | "raw_list" | "raw_fetch" | "read_task_ledger" | "list_agents"
-        | "search_code" | "command_output" => EffectClass::Read,
-        "write_file" | "edit_file" => EffectClass::Write,
+        | "search_code" | "grep" | "glob" | "git_status" | "git_diff" | "command_output" => {
+            EffectClass::Read
+        }
+        "write_file" | "edit_file" | "apply_patch" => EffectClass::Write,
         _ => EffectClass::Effect,
     }
 }
@@ -193,12 +195,29 @@ mod tests {
     fn a_named_read_tool_never_pays_for_a_second_look() {
         assert_eq!(effect_of("read_file"), EffectClass::Read);
         assert_eq!(effect_of("read_task_ledger"), EffectClass::Read);
+        // 树上的四种读法：搜索、找文件、看改了没有、看改了什么。它们没有一样
+        // 会改树，续跑时重看去一遍是白付一次。
+        assert_eq!(effect_of("search_code"), EffectClass::Read);
+        assert_eq!(effect_of("grep"), EffectClass::Read);
+        assert_eq!(effect_of("glob"), EffectClass::Read);
+        assert_eq!(effect_of("git_status"), EffectClass::Read);
+        assert_eq!(effect_of("git_diff"), EffectClass::Read);
     }
 
     #[test]
     fn file_writes_are_replayable_only_because_the_resume_checks_them_first() {
         assert_eq!(effect_of("write_file"), EffectClass::Write);
         assert_eq!(effect_of("edit_file"), EffectClass::Write);
+        // 补丁是一次落一片的写：没点名的话它会掉进 Effect，那一格仍然安全，
+        // 但「这条要重放」的判断从此只能靠猜。
+        assert_eq!(effect_of("apply_patch"), EffectClass::Write);
+    }
+
+    /// 提交不在可重放的那一类：同一笔提交落两次，历史里就多一个不该有的
+    /// 提交，而这件事事后修不掉。
+    #[test]
+    fn a_commit_is_an_effect_not_a_replayable_write() {
+        assert_eq!(effect_of("git_commit"), EffectClass::Effect);
     }
 
     /// 名单上是 Effect 的，与名单上根本没有的，必须是同一类：一个不认识的工具

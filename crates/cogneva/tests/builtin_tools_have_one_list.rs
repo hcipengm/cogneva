@@ -47,9 +47,15 @@ use cog_storage::MemoryAgentRegistry;
 use cog_stream::MemoryMessageBackend;
 
 /// The names the whole built-in set answers to. Written out, not derived.
-const WHOLE_SET: [&str; 15] = [
+const WHOLE_SET: [&str; 23] = [
+    "apply_patch",
     "command_output",
     "edit_file",
+    "git_commit",
+    "git_diff",
+    "git_status",
+    "glob",
+    "grep",
     "http_request",
     "list_agents",
     "raw_fetch",
@@ -58,8 +64,10 @@ const WHOLE_SET: [&str; 15] = [
     "read_task_ledger",
     "run_command",
     "run_command_background",
+    "search_code",
     "send_to_agent",
     "start_task",
+    "todo",
     "web_fetch",
     "web_search",
     "write_file",
@@ -104,6 +112,11 @@ fn names_with(client: Option<Arc<dyn HttpClient>>, messaging: bool) -> Vec<Strin
             web_search_base: Some("http://searxng.invalid:8080".into()),
             web_search_fallback_base: Some("http://gateway.invalid/search-fallback".into()),
             web_fetch_base: Some("http://render.invalid:11235".into()),
+            // 这一份注册里没有执行器，也正因如此它才证明了那件事：树读工具
+            // 不因缺少执行器而从表里消失。它们的缺席是一句可读的报错（缺的是
+            // 执行器，不是搜索），而少一行只是「没有这个工具」。
+            sandbox_backend: None,
+            shell_timeout: None,
         },
     );
     let mut names = registry.names();
@@ -123,8 +136,8 @@ fn the_whole_builtin_set_is_registered_by_one_constructor() {
     let expected: Vec<String> = WHOLE_SET.iter().map(|n| (*n).to_string()).collect();
     assert_eq!(
         names, expected,
-        "the built-in set is the fifteen named tools; a tool added or dropped here is a \
-         change to what every caller of this process is offered"
+        "the built-in set is the twenty-three named tools; a tool added or dropped here is \
+         a change to what every caller of this process is offered"
     );
 }
 
@@ -176,6 +189,33 @@ fn a_missing_roster_removes_the_two_addressing_tools() {
     );
 }
 
+/// 没有执行器时，树读工具留在表里。
+///
+/// 这一整组（搜索、glob、git、打补丁）的答案取决于调用者自己那棵树，所以要
+/// 一个执行器。执行器不在时它们若从表里消失，「这个进程没有执行器」就读成了
+/// 「没有搜索」——前者要补一层，后者要补一个工具，补救完全不同。所以它们在
+/// 表里，报错时说缺的是执行器。
+#[test]
+fn a_missing_executor_leaves_the_tree_tools_in_the_list() {
+    let names = names_with_client(true);
+    for tool in [
+        "search_code",
+        "grep",
+        "glob",
+        "git_status",
+        "git_diff",
+        "git_commit",
+        "apply_patch",
+        "todo",
+    ] {
+        assert!(
+            names.contains(&tool.to_string()),
+            "{tool} 在没有执行器的进程里从表里消失了：缺执行器被读成了缺工具。\
+             names={names:?}"
+        );
+    }
+}
+
 /// The two paths that serve these tools take the list whole.
 ///
 /// Each must call the one constructor and must not build a tool itself. This is
@@ -200,6 +240,14 @@ fn neither_serving_path_lays_out_its_own_tool_list() {
         "start_task",
         "web_search",
         "web_fetch",
+        "search_code",
+        "grep",
+        "glob",
+        "git_status",
+        "git_diff",
+        "git_commit",
+        "apply_patch",
+        "todo",
     ];
 
     // Relative to this crate's manifest, which is where cargo runs the test.

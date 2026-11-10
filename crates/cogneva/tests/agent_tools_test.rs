@@ -14,7 +14,12 @@ async fn test_tool_registry_builtins() {
     registry.register(cog_agent::tools::builtins::read_file());
     registry.register(cog_agent::tools::builtins::write_file());
     registry.register(cog_agent::tools::builtins::run_command());
-    registry.register(cog_agent::tools::builtins::search_code());
+    // 这一格测的是注册表的机制，不是工具集本身（工具集在
+    // `builtin_tools_have_one_list.rs`）。树读工具要一个执行器才跑得动，而注册
+    // 不需要——所以这里给它的是一份没有后端的 `SandboxTools`。
+    registry.register(cog_agent::tools::builtins::search_code(
+        cog_agent::tools::builtins::SandboxTools::new(None, std::time::Duration::from_secs(1)),
+    ));
 
     assert!(!registry.is_empty());
     assert_eq!(registry.list().len(), 4);

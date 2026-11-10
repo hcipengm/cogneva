@@ -423,15 +423,14 @@ impl cog_core::SystemPlugin for AgentPlugin {
             crate::ToolRegistry::new()
                 .with_wasm_timeout(tool_timeout_secs)
                 .with_shell_timeout(shell_timeout_secs)
-                .with_sandbox_backend(sandbox_backend)
+                .with_sandbox_backend(sandbox_backend.clone())
                 .with_guardrail(guardrail)
                 .with_plugin_registry(plugin_registry)
                 .with_require_identity(require_tool_identity),
         );
         // Built-in execution tools. Without these the registry advertises zero
         // tool definitions and squads can plan but never act on the
-        // environment. search_code stays unregistered until it really
-        // searches — an always-empty tool teaches agents to distrust tools.
+        // environment.
         //
         // The list is registered through the one constructor for it rather
         // than laid out here, because this process is not the only caller: the
@@ -468,6 +467,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 web_search_base: agent_loop_config.web_search_base.clone(),
                 web_search_fallback_base: agent_loop_config.web_search_fallback_base.clone(),
                 web_fetch_base: agent_loop_config.web_fetch_base.clone(),
+                // 搜索、glob、git、打补丁与 `run_command` 走同一个执行器：它们
+                // 的答案取决于调用者自己那棵树，在本进程跑就等于读一份与调用者
+                // 无关的源码。后端在交给注册表时克隆了一份，这里再拿一份。
+                sandbox_backend: Some(sandbox_backend.clone()),
+                shell_timeout: Some(std::time::Duration::from_secs(shell_timeout_secs)),
             },
         );
         info!(
