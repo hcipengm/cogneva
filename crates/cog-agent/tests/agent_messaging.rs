@@ -378,7 +378,9 @@ async fn a_prompt_reaches_the_inbox_the_consumer_group_reads() {
     );
     let decoded: InboxMessage = serde_json::from_slice(payload).expect("the consumer decodes this");
     match decoded {
-        InboxMessage::Prompt { goal, reply_stream } => {
+        InboxMessage::Prompt {
+            goal, reply_stream, ..
+        } => {
             assert_eq!(goal, serde_json::json!("review the patch"));
             assert_eq!(
                 reply_stream, None,
@@ -400,12 +402,14 @@ async fn steering_and_continue_keep_the_instruction_verbatim() {
             "steering",
             InboxMessage::Steering {
                 instruction: "stop refactoring".into(),
+                from_agent: None,
             },
         ),
         (
             "continue",
             InboxMessage::Continue {
                 instruction: "now run the tests".into(),
+                from_agent: None,
             },
         ),
     ] {
@@ -554,6 +558,54 @@ async fn the_run_identity_reaches_the_receipt_and_the_directory_alike() {
         marked,
         vec!["squad:task-1-reviewer"],
         "exactly the caller is marked: {listed}"
+    );
+}
+
+/// 一个 Squad 的成员发给另一个 Squad 的成员，不经中继。
+///
+/// 员工之间平等：名册上有收信人就发得出去，两个人在不在同一队不影响这条路由。
+/// 如果跨队要经过某个中继，那个中继就得知道两边是谁、并且替发信人把话再说一遍
+/// ——它于是成了名册上没有的第三个人，而收件人手里的话就不再带着真正说过它的
+/// 那个人的身份。
+///
+/// 断言拆成两半：落在**收件人自己的收件箱**而不是某个共享的跨队 topic 上；
+/// 线上那条消息自己写着发信人，收件人不必回头问第二处「这是谁说的」。
+#[tokio::test]
+async fn a_member_of_one_squad_reaches_a_member_of_another_without_a_relay() {
+    let roster = Arc::new(Roster::with_roles(&[
+        ("squad:task-1-reviewer", "reviewer", &[]),
+        ("squad:task-2-coder", "coder", &[]),
+    ]));
+    let backend = Arc::new(Recording::default());
+
+    cog_agent::tools::CALLER_AGENT_ID
+        .scope("squad:task-1-reviewer".to_string(), async {
+            call(
+                backend.clone(),
+                roster.clone(),
+                serde_json::json!({
+                    "agent_id": "squad:task-2-coder",
+                    "message": "the patch you sent is green, carry on",
+                    "kind": "steering"
+                }),
+            )
+            .await
+            .expect("another squad's member is addressed like any other employee")
+        })
+        .await;
+
+    let published = backend.published();
+    assert_eq!(published.len(), 1, "one message, and no relay copy of it");
+    assert_eq!(
+        published[0].0,
+        cog_core::agent_inbox_stream("squad:task-2-coder"),
+        "it lands in the recipient's own inbox, not on a shared cross-squad topic"
+    );
+    let decoded: InboxMessage = serde_json::from_slice(&published[0].1).expect("decode");
+    assert_eq!(
+        decoded.from_agent(),
+        Some("squad:task-1-reviewer"),
+        "the receiver reads who said it off the message itself: {decoded:?}"
     );
 }
 

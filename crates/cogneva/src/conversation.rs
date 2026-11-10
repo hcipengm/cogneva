@@ -516,7 +516,7 @@ impl ConversationTurn for PlatformConversation {
                         askers.push(stream.clone());
                     }
                     if let Some(text) = inbox_as_message(&msg) {
-                        history.push(cog_core::Message::user(format!("[同事发来的消息]\n{text}")));
+                        history.push(cog_core::Message::user(text));
                     }
                 }
             }
@@ -735,23 +735,28 @@ fn push_or_log(out: &mut Vec<cog_core::InboxMessage>, bytes: &[u8], agent_id: &s
     }
 }
 
-/// 收件箱里的一条怎么进这一轮的历史。
+/// 收件箱里的一条怎么进这一轮的历史：一行抬头说明出处，下面是它说的话。
 ///
-/// 线上没有发信人：命令的线上形态只带指令，不带谁写的（发信人那半在看到回执的
-/// 发送方手里）。所以这里只说「同事发来的」，不编一个名字。
+/// 消息带发信人就写出是谁——收件人手里只有这一条消息，而它接下来要做的事
+/// （回一句、往下追、把话转给第三个人）全看这句话是谁说的。没留名（平台命令、
+/// 加这一列之前写下的老消息）就只说「同事发来的」，不编一个名字。
 fn inbox_as_message(msg: &cog_core::InboxMessage) -> Option<String> {
     use cog_core::InboxMessage;
-    match msg {
-        InboxMessage::Prompt { goal, .. } => Some(match goal {
+    let text = match msg {
+        InboxMessage::Prompt { goal, .. } => match goal {
             serde_json::Value::String(text) => text.clone(),
             other => other.to_string(),
-        }),
-        InboxMessage::Continue { instruction } | InboxMessage::Steering { instruction } => {
-            Some(instruction.clone())
+        },
+        InboxMessage::Continue { instruction, .. } | InboxMessage::Steering { instruction, .. } => {
+            instruction.clone()
         }
         // 撤停与重置是给正在跑的那一轮的指令，不是一条要说的话。
-        InboxMessage::Abort | InboxMessage::Reset => None,
-    }
+        InboxMessage::Abort | InboxMessage::Reset => return None,
+    };
+    Some(match msg.from_agent() {
+        Some(sender) => format!("[同事 {sender} 发来的消息]\n{text}"),
+        None => format!("[同事发来的消息]\n{text}"),
+    })
 }
 
 /// 这段对话能用的操作：**只读台账、只派活、不执行**。
@@ -1782,34 +1787,66 @@ mod tests {
             inbox_as_message(&InboxMessage::Prompt {
                 goal: serde_json::json!("把首页配色改一下"),
                 reply_stream: None,
+                from_agent: None,
             })
             .as_deref(),
-            Some("把首页配色改一下")
+            Some("[同事发来的消息]\n把首页配色改一下")
         );
         assert_eq!(
             inbox_as_message(&InboxMessage::Prompt {
                 goal: serde_json::json!({"step": 2}),
                 reply_stream: None,
+                from_agent: None,
             })
             .as_deref(),
-            Some("{\"step\":2}")
+            Some("[同事发来的消息]\n{\"step\":2}")
         );
         assert_eq!(
             inbox_as_message(&InboxMessage::Continue {
-                instruction: "接着做".into()
+                instruction: "接着做".into(),
+                from_agent: None
             })
             .as_deref(),
-            Some("接着做")
+            Some("[同事发来的消息]\n接着做")
         );
         assert_eq!(
             inbox_as_message(&InboxMessage::Steering {
-                instruction: "换个方向".into()
+                instruction: "换个方向".into(),
+                from_agent: None
             })
             .as_deref(),
-            Some("换个方向")
+            Some("[同事发来的消息]\n换个方向")
         );
         assert_eq!(inbox_as_message(&InboxMessage::Abort), None);
         assert_eq!(inbox_as_message(&InboxMessage::Reset), None);
+    }
+
+    /// 消息带发信人时，历史里写的是那个人，不是「某个同事」。
+    ///
+    /// 收件人手里只有这一条消息：说完这句话它可能要回信、要往下追、要把话转给
+    /// 第三个人，每一步都得知道话是谁说的。老消息没有这一列，照旧读成无名同事
+    /// ——线上已经进流的条目不能因为加了发信人就变成一条读不懂的消息。
+    #[test]
+    fn a_message_that_names_its_sender_is_read_as_coming_from_that_employee() {
+        use cog_core::InboxMessage;
+        let named = InboxMessage::Steering {
+            instruction: "等下再合，构建还红着".into(),
+            from_agent: Some("squad:task-1-reviewer".into()),
+        };
+        assert_eq!(
+            inbox_as_message(&named).as_deref(),
+            Some("[同事 squad:task-1-reviewer 发来的消息]\n等下再合，构建还红着")
+        );
+
+        let older: InboxMessage = serde_json::from_value(
+            serde_json::json!({"type": "steering", "instruction": "等下再合，构建还红着"}),
+        )
+        .expect("a message written before the sender column existed still parses");
+        assert_eq!(
+            inbox_as_message(&older).as_deref(),
+            Some("[同事发来的消息]\n等下再合，构建还红着"),
+            "没留名就说没留名，不编名字"
+        );
     }
 
     /// 同事发来的消息，开跑前被读出来；读完就确认，不会在下一轮再读一遍。
@@ -1821,6 +1858,7 @@ mod tests {
         let msg = cog_core::InboxMessage::Prompt {
             goal: serde_json::json!("帮我看一下昨天那次发布为什么红了"),
             reply_stream: None,
+            from_agent: Some("E0412".into()),
         };
         backend
             .publish(
@@ -1834,7 +1872,7 @@ mod tests {
         assert_eq!(drained.len(), 1, "收件箱里有一条，读出来了一条");
         assert_eq!(
             inbox_as_message(&drained[0]).as_deref(),
-            Some("帮我看一下昨天那次发布为什么红了")
+            Some("[同事 E0412 发来的消息]\n帮我看一下昨天那次发布为什么红了")
         );
     }
 

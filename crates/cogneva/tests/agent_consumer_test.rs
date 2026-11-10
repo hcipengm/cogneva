@@ -11,6 +11,7 @@ async fn test_send_message_and_consume() {
     let msg = InboxMessage::Prompt {
         goal: serde_json::json!({"task": "hello"}),
         reply_stream: None,
+        from_agent: None,
     };
     AgentConsumer::send_message("agent-1", msg.clone(), backend.as_ref())
         .await

@@ -1290,20 +1290,22 @@ impl Agent {
     /// instead of acking a run that never happened.
     pub async fn handle_inbox(&self, msg: InboxMessage) -> SFResult<()> {
         match msg {
-            InboxMessage::Prompt { goal, reply_stream } => {
+            InboxMessage::Prompt {
+                goal, reply_stream, ..
+            } => {
                 let out = self.prompt(goal).await?;
                 if let Some(stream) = reply_stream {
                     publish_inbox_reply(self.message_backend.as_ref(), &stream, &out).await?;
                 }
                 Ok(())
             }
-            InboxMessage::Continue { instruction } => {
+            InboxMessage::Continue { instruction, .. } => {
                 let input = serde_json::Value::String(instruction);
                 self.continue_(input).await.map(|_| ())
             }
             InboxMessage::Abort => self.abort().await,
             InboxMessage::Reset => self.reset().await,
-            InboxMessage::Steering { instruction } => self.steer(instruction).await,
+            InboxMessage::Steering { instruction, .. } => self.steer(instruction).await,
         }
     }
 

@@ -1130,6 +1130,7 @@ mod conversation_reaches_the_worker_tests {
         handler(InboxMessage::Prompt {
             goal: serde_json::json!("你叫什么名字？"),
             reply_stream: Some(reply_stream.into()),
+            from_agent: None,
         })
         .await
         .expect("the worker answers a sentence without failing");

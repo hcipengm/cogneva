@@ -1541,14 +1541,17 @@ mod tests {
             cog_core::InboxMessage::Prompt {
                 goal: serde_json::Value::Null,
                 reply_stream: None,
+                from_agent: None,
             },
             cog_core::InboxMessage::Continue {
                 instruction: String::new(),
+                from_agent: None,
             },
             cog_core::InboxMessage::Abort,
             cog_core::InboxMessage::Reset,
             cog_core::InboxMessage::Steering {
                 instruction: String::new(),
+                from_agent: None,
             },
         ];
         let mut kinds: Vec<&'static str> = every.iter().map(inbox_kind).collect();

@@ -92,8 +92,8 @@ pub use config::{
     BoundaryConfig, PgeSettings, RalphSettings, SelfReviewSettings, DEFAULT_LOCAL_REPAIR_MAX,
 };
 pub use hierarchy::{
-    cross_squad_notify, AgentIdent, BroadcastRouter, HierarchicalCommunication,
-    HierarchicalMessage, InterSquadMessage, RoutingStrategy, SquadId, TopicName,
+    AgentIdent, BroadcastRouter, HierarchicalCommunication, HierarchicalMessage, RoutingStrategy,
+    SquadId, TopicName,
 };
 pub use ipc::{FileSystemIpc, IpcChannel, IpcMessage};
 pub use observable::{ChangeYieldOutcome, CollaborationObservable};

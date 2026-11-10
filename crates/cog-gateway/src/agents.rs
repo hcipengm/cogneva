@@ -816,6 +816,9 @@ pub async fn send_message_handler(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| WEBUI_SENDER.to_string());
+    // 员工身份只由平台写：这一格收件人会当真（回信、追人），而请求体里的值是
+    // 调用方自己填的。说话的是谁已经记在 `from_unit` 里了。
+    clear_caller_named_sender(&mut msg);
     // Read before delivery: opening the ask rewrites the reply stream on the
     // message, and the transcript is of what was said, not of what was
     // rewritten on the way out.
@@ -1231,8 +1234,8 @@ fn command_body(msg: &cog_core::InboxMessage) -> String {
             serde_json::Value::String(text) => text.clone(),
             other => other.to_string(),
         },
-        cog_core::InboxMessage::Continue { instruction } => instruction.clone(),
-        cog_core::InboxMessage::Steering { instruction } => instruction.clone(),
+        cog_core::InboxMessage::Continue { instruction, .. } => instruction.clone(),
+        cog_core::InboxMessage::Steering { instruction, .. } => instruction.clone(),
         cog_core::InboxMessage::Abort => "(abort)".into(),
         cog_core::InboxMessage::Reset => "(reset)".into(),
     }
@@ -1860,6 +1863,23 @@ fn caller_named_reply_stream(msg: &cog_core::InboxMessage) -> Option<&str> {
     }
 }
 
+/// 线上那条消息里的发信人只由平台写，不从请求体里收。
+///
+/// 这一格说的是「哪个员工说的」，收件人会拿它去回信、去追人、去把话转给第三
+/// 个人。而这条路由背后是一个人（登录主体，或者一个没有登录的 WebUI 通道），
+/// 不是名册上的员工：谁都能在请求体里填一个工号，收件人就会把话记在那个同事
+/// 名下。所以调用方填的值在这里清掉——说话的是谁由转录里的 `from` 记着，那里
+/// 取的是登录主体，不是请求体。员工之间的消息走 `send_to_agent`，那一格的来源
+/// 是运行身份（见 `cog_agent::tools::CALLER_AGENT_ID`）。
+fn clear_caller_named_sender(msg: &mut cog_core::InboxMessage) {
+    match msg {
+        cog_core::InboxMessage::Prompt { from_agent, .. }
+        | cog_core::InboxMessage::Continue { from_agent, .. }
+        | cog_core::InboxMessage::Steering { from_agent, .. } => *from_agent = None,
+        cog_core::InboxMessage::Abort | cog_core::InboxMessage::Reset => {}
+    }
+}
+
 /// One registry record as the roster prints it.
 ///
 /// 这里只搬注册表那一行，**不印名字**：名字来自名册行（工号＋姓名），由
@@ -2295,9 +2315,9 @@ pub async fn checkpoint_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_view, caller_named_reply_stream, enroll, read_people, read_roster,
-        restore_roster_from, roster_split, roster_with_people, PersonRow, RosterRow, Summon,
-        SummonFn, PEOPLE_KEY, ROSTER_KEY,
+        agent_view, caller_named_reply_stream, clear_caller_named_sender, enroll, read_people,
+        read_roster, restore_roster_from, roster_split, roster_with_people, PersonRow, RosterRow,
+        Summon, SummonFn, PEOPLE_KEY, ROSTER_KEY,
     };
     use cog_core::InboxMessage;
     use std::collections::HashMap;
@@ -2831,6 +2851,7 @@ mod tests {
             caller_named_reply_stream(&InboxMessage::Prompt {
                 goal: serde_json::json!({"goal": "run the tests"}),
                 reply_stream: Some("caller:reply:1".to_string()),
+                from_agent: None,
             }),
             Some("caller:reply:1")
         );
@@ -2838,6 +2859,7 @@ mod tests {
             caller_named_reply_stream(&InboxMessage::Prompt {
                 goal: serde_json::json!({"goal": "run the tests"}),
                 reply_stream: None,
+                from_agent: None,
             }),
             None
         );
@@ -2846,5 +2868,37 @@ mod tests {
             None,
             "only a prompt can name a reply stream"
         );
+    }
+
+    /// 请求体里填的发信人到不了线上：三种带话的命令都一样。
+    ///
+    /// 这一格收件人会当真——它决定回信写给谁、往下找谁。这条路由背后是人，
+    /// 不是名册上的员工；允许它填工号，就等于允许一个人在收件箱里冒充那个
+    /// 同事。员工之间的身份由 `send_to_agent` 从运行身份写上去，那一条路不经过
+    /// 这里。
+    #[test]
+    fn a_sender_named_by_the_caller_does_not_reach_the_inbox() {
+        for mut msg in [
+            InboxMessage::Prompt {
+                goal: serde_json::json!("run the tests"),
+                reply_stream: None,
+                from_agent: Some("E0412".into()),
+            },
+            InboxMessage::Continue {
+                instruction: "keep going".into(),
+                from_agent: Some("E0412".into()),
+            },
+            InboxMessage::Steering {
+                instruction: "hold off".into(),
+                from_agent: Some("E0412".into()),
+            },
+        ] {
+            clear_caller_named_sender(&mut msg);
+            assert_eq!(
+                msg.from_agent(),
+                None,
+                "a caller cannot put words in an employee's mouth: {msg:?}"
+            );
+        }
     }
 }

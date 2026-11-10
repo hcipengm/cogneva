@@ -3543,16 +3543,22 @@ pub mod builtins {
                         None
                     };
 
+                    // 发信人随消息走：收件人只拿到这一条，他自己查不到是谁写的。
+                    // 一次没公布身份的运行照样发得出去，只是那一格为空。
+                    let from_agent = caller_agent_id();
                     let inbox = match kind {
                         "prompt" => cog_core::InboxMessage::Prompt {
                             goal: serde_json::Value::String(message.to_string()),
                             reply_stream: ask.clone(),
+                            from_agent,
                         },
                         "steering" => cog_core::InboxMessage::Steering {
                             instruction: message.to_string(),
+                            from_agent,
                         },
                         "continue" => cog_core::InboxMessage::Continue {
                             instruction: message.to_string(),
+                            from_agent,
                         },
                         other => {
                             return Err(SFError::Validation(format!(

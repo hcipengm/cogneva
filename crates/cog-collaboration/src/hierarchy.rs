@@ -15,13 +15,12 @@
 //!   pluggable [`MessageBackend`] (Redis Streams / NATS / in-memory).
 //! * [`BroadcastRouter`] — chooses between the network backend and the
 //!   filesystem IPC fast-path based on the message's scope.
-//! * [`cross_squad_notify`] — DagExecutor-Orchestrator-mediated relay for the
-//!   "Squad-A and Squad-B never talk directly" rule.
-//!   Cross-Squad coordination is intentionally **not** routed through this module
-//!   directly: peer Squads publish [`InterSquadMessage`] envelopes to a shared
-//!   relay topic and the [`DagExecutor`](../../sf_dag_executor/index.html)
-//!   consumes them, evaluates the DAG, and decides whether to schedule the next
-//!   Squad.
+//!
+//! Squads are not a hierarchy of authority: a member of one talks to a member of
+//! another as directly as it talks to a member of its own. This module carries
+//! the addressing (scopes, squad/agent identifiers, topic names); who may reach
+//! whom is settled by the inbox route that delivers the message, not by a relay
+//! that would have to know both ends.
 
 use std::sync::Arc;
 
@@ -105,11 +104,6 @@ impl TopicName {
     /// drifts silently until a command lands in a stream nobody reads.
     pub fn agent_inbox(agent_id: &str) -> String {
         cog_core::agent_inbox_stream(agent_id)
-    }
-
-    /// Cross-Squad relay topic consumed by the DagExecutor Orchestrator.
-    pub fn cross_squad(workspace_id: &str) -> String {
-        format!("orchestrator:crosssquad:{workspace_id}")
     }
 
     /// Per-Agent state Hash key.
@@ -226,90 +220,6 @@ impl HierarchicalMessage {
     /// with no span — enough to group events under one trace, not enough to
     /// continue the chain. That difference is the reason both are checked here
     /// rather than at each consumer.
-    pub fn trace_context(&self) -> Option<cog_core::TraceContext> {
-        if let Some(tp) = self.traceparent.as_deref() {
-            if let Some(ctx) = cog_core::TraceContext::from_traceparent(tp) {
-                return Some(ctx);
-            }
-        }
-        self.trace_id.as_deref().map(|id| {
-            let span = uuid::Uuid::new_v4().to_string().replace('-', "");
-            cog_core::TraceContext::new(id.to_string(), span[..16].to_string())
-        })
-    }
-}
-
-/// Cross-Squad envelope used by the DagExecutor Orchestrator relay.
-/// [`InterSquadMessage`] to the shared cross-Squad topic and the Orchestrator
-/// inspects the DAG before forwarding.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct InterSquadMessage {
-    pub message_id: String,
-    pub from_squad_id: String,
-    /// Intended recipient. `None` means broadcast.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to_squad_id: Option<String>,
-    pub message_type: String,
-    pub payload: serde_json::Value,
-    pub timestamp: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trace_id: Option<String>,
-    /// The `traceparent` this envelope was published under; see
-    /// [`HierarchicalMessage::traceparent`] for why the header travels
-    /// alongside the bare id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-}
-
-impl InterSquadMessage {
-    /// Build a directed cross-Squad message.
-    pub fn directed(
-        message_id: impl Into<String>,
-        from_squad_id: impl Into<String>,
-        to_squad_id: impl Into<String>,
-        message_type: impl Into<String>,
-        payload: serde_json::Value,
-    ) -> Self {
-        Self {
-            message_id: message_id.into(),
-            from_squad_id: from_squad_id.into(),
-            to_squad_id: Some(to_squad_id.into()),
-            message_type: message_type.into(),
-            payload,
-            timestamp: Utc::now(),
-            trace_id: None,
-            traceparent: None,
-        }
-    }
-
-    /// Build a broadcast cross-Squad message (`to_squad_id == None`).
-    pub fn broadcast(
-        message_id: impl Into<String>,
-        from_squad_id: impl Into<String>,
-        message_type: impl Into<String>,
-        payload: serde_json::Value,
-    ) -> Self {
-        Self {
-            message_id: message_id.into(),
-            from_squad_id: from_squad_id.into(),
-            to_squad_id: None,
-            message_type: message_type.into(),
-            payload,
-            timestamp: Utc::now(),
-            trace_id: None,
-            traceparent: None,
-        }
-    }
-
-    /// Attach a full trace context (id and header written from one value).
-    pub fn with_trace(mut self, ctx: &cog_core::TraceContext) -> Self {
-        self.trace_id = Some(ctx.trace_id.clone());
-        self.traceparent = ctx.to_traceparent();
-        self
-    }
-
-    /// Read the publishing context back; `traceparent` wins, the bare id is
-    /// the pre-existing fallback. See [`HierarchicalMessage::trace_context`].
     pub fn trace_context(&self) -> Option<cog_core::TraceContext> {
         if let Some(tp) = self.traceparent.as_deref() {
             if let Some(ctx) = cog_core::TraceContext::from_traceparent(tp) {
@@ -484,23 +394,6 @@ impl BroadcastRouter {
             _ => self.comm.broadcast(message).await,
         }
     }
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Cross-Squad helper
-// ──────────────────────────────────────────────────────────────────────────
-
-/// Publish an [`InterSquadMessage`] onto the workspace's cross-Squad relay
-/// topic.  The DagExecutor Orchestrator subscribes to this topic and is responsible
-/// for forwarding (or rejecting) the message based on the DAG.
-pub async fn cross_squad_notify(
-    backend: &dyn MessageBackend,
-    workspace_id: &str,
-    message: &InterSquadMessage,
-) -> SFResult<()> {
-    let topic = TopicName::cross_squad(workspace_id);
-    let payload = serde_json::to_vec(message)?;
-    backend.publish(&topic, &payload).await
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -692,10 +585,6 @@ mod tests {
             "orchestrator:agent:agent:host:ip:role:inbox"
         );
         assert_eq!(
-            TopicName::cross_squad("ws-1"),
-            "orchestrator:crosssquad:ws-1"
-        );
-        assert_eq!(
             TopicName::agent_state("agent:host:ip:role"),
             "orchestrator:agent:agent:host:ip:role:state"
         );
@@ -836,28 +725,6 @@ mod tests {
             got.trace_context().map(|c| c.trace_id),
             Some("trace-legacy".to_string())
         );
-    }
-
-    #[test]
-    fn test_inter_squad_message_directed_vs_broadcast() {
-        let directed = InterSquadMessage::directed(
-            "im-1",
-            "squad:a",
-            "squad:b",
-            "task_complete",
-            serde_json::json!({"task_id": "t-1"}),
-        );
-        assert_eq!(directed.from_squad_id, "squad:a");
-        assert_eq!(directed.to_squad_id.as_deref(), Some("squad:b"));
-
-        let broadcast = InterSquadMessage::broadcast(
-            "im-2",
-            "squad:a",
-            "artifact_ready",
-            serde_json::json!({"path": "/tmp/x"}),
-        );
-        assert_eq!(broadcast.from_squad_id, "squad:a");
-        assert!(broadcast.to_squad_id.is_none());
     }
 
     // --- broadcast routing ---------------------------------------------------
@@ -1080,61 +947,5 @@ mod tests {
             SFError::Validation(_) => {}
             other => panic!("expected Validation error, got {other:?}"),
         }
-    }
-
-    // --- cross-Crew relay ----------------------------------------------------
-
-    #[tokio::test]
-    async fn test_cross_squad_notify_publishes_to_relay_topic() {
-        let backend: Arc<dyn MessageBackend> = Arc::new(TestBackend::new());
-        // Subscriber acts as the DagExecutor Orchestrator listening on the relay
-        // topic.
-        let mut orch_sub = backend
-            .subscribe(&TopicName::cross_squad("ws-1"), "orchestrator")
-            .await
-            .unwrap();
-
-        let msg = InterSquadMessage::directed(
-            "im-1",
-            "squad:task-1:0",
-            "squad:task-2:0",
-            "task_complete",
-            serde_json::json!({"artifact": "/tmp/out.json"}),
-        );
-        cross_squad_notify(backend.as_ref(), "ws-1", &msg)
-            .await
-            .unwrap();
-
-        let (_, bytes) = orch_sub.next().await.unwrap().unwrap();
-        let got: InterSquadMessage = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(got, msg);
-    }
-
-    #[tokio::test]
-    async fn test_cross_squad_messages_do_not_leak_into_task_topics() {
-        let backend: Arc<dyn MessageBackend> = Arc::new(TestBackend::new());
-
-        // A Task-B subscriber watches *only* its own task topic.  It must NOT
-        // see cross-Squad envelopes — those go to the relay topic.
-        let task_b_topic = TopicName::task_events("task-2");
-        let mut task_b_sub = backend.subscribe(&task_b_topic, "g").await.unwrap();
-
-        let msg = InterSquadMessage::directed(
-            "im-2",
-            "squad:task-1:0",
-            "squad:task-2:0",
-            "task_complete",
-            serde_json::json!({}),
-        );
-        cross_squad_notify(backend.as_ref(), "ws-1", &msg)
-            .await
-            .unwrap();
-
-        let timeout =
-            tokio::time::timeout(std::time::Duration::from_millis(80), task_b_sub.next()).await;
-        assert!(
-            timeout.is_err(),
-            "Task B subscriber must not receive cross-Squad envelopes directly"
-        );
     }
 }
