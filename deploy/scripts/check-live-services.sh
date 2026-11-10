@@ -454,6 +454,13 @@ live_check db 'Live-DB principle refusal shapes' cargo test -p cog-storage --tes
 # the same task see one arrangement rather than two. A database-free
 # double would restate the caller's own assumption about both.
 live_check db 'Live-DB principle gating paths' cargo test -p cog-storage --test principle_gating_paths -- --ignored
+# The runtime account's three claims are all `WHERE` clauses: a proposal is
+# not in force until a decision moves it, a rule already in force refuses a
+# second proposal of the same slug, and a decision repeated twice does not
+# move the date the rule became in force. A memory store answers each of
+# them by whatever its author wrote down, so without a server the suite
+# proves only that the fake agrees with itself.
+live_check db 'Live-DB runtime principle account' cargo test -p cog-storage --test runtime_principle_store -- --ignored
 # The sample-log sweep is expressed almost entirely as one DELETE, so its
 # correctness cannot be checked without a server; the DB-free tests beside
 # it only cover the sweep period. Leaving these out of the gate is how a
