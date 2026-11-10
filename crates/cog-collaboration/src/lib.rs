@@ -87,7 +87,7 @@ pub const LABEL_AGENT_ID: &str = "agent_id";
 pub const LABEL_DIMENSION: &str = "dimension";
 
 pub use actors::{ModeratorDecision, ModeratorOutput};
-pub use collaboration_executor::CollaborationExecutor;
+pub use collaboration_executor::{declared_team, CollaborationExecutor, INPUT_TEAM};
 pub use config::{
     BoundaryConfig, PgeSettings, RalphSettings, SelfReviewSettings, DEFAULT_LOCAL_REPAIR_MAX,
 };

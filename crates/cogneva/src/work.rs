@@ -118,6 +118,8 @@ pub enum Action {
     },
     Claim {
         task: String,
+        /// 接活的人为这件活选的拓扑；`None` 是「没表态」，执行时按量到的路走。
+        team: Option<String>,
     },
     Start {
         task: String,
@@ -161,6 +163,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut task: Option<String> = None;
     let mut result: Option<serde_json::Value> = None;
     let mut error: Option<String> = None;
+    let mut team: Option<String> = None;
     let mut goal: Option<String> = None;
     let mut face: Option<String> = None;
     let mut acceptance: Vec<String> = Vec::new();
@@ -198,6 +201,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
                 );
             }
             "--error" => error = Some(value("--error")?),
+            "--team" => team = Some(value("--team")?),
             "--goal" => goal = Some(value("--goal")?),
             "--face" => face = Some(value("--face")?),
             "--acceptance" => acceptance.push(value("--acceptance")?),
@@ -255,7 +259,10 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         }
         Some("queue") => Action::Queue { json },
         Some("next") => Action::Next { json },
-        Some("claim") => Action::Claim { task: task()? },
+        Some("claim") => Action::Claim {
+            task: task()?,
+            team,
+        },
         Some("start") => Action::Start { task: task()? },
         Some("heartbeat") => Action::Heartbeat,
         Some("complete") => Action::Complete {
@@ -417,17 +424,20 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         }
         Action::Queue { json } => queue(&*backend, workspace, unit, json).await?,
         Action::Next { json } => next(&*backend, workspace, unit, json).await?,
-        Action::Claim { task } => {
+        Action::Claim { task, team } => {
             // 接活判定在 `ready_queue::approve_claim`，与派工侧同一个函数：谁能
             // 接哪件活只有一份答案，两边各判一次，最先漂的总是「已经有人接了」。
             //
             // 这里不再要求「这条行属于你」：任务板上待接的活谁都能接，接了的人
             // 就是责任人——那是这一列的全部意义。只有被人指定给别人的行（面值班
             // 那种）会拒绝。
-            let row = backend
+            let mut row = backend
                 .dag_get_task(workspace, &task)
                 .await?
                 .ok_or_else(|| format!("task {task} does not exist"))?;
+            // 拓扑由接活的人定，所以它写在**认领这一次写**里：接走的那一刻
+            // 行上就带着这个决定，此后任何一次运行读到的都是同一条。
+            declare_team(&mut row, team)?;
             let deps = dependency_state(&*backend, workspace).await?;
             if !row.is_ready(&deps) {
                 return Err(format!(
@@ -845,6 +855,19 @@ async fn owned_task(
         "task {task_id} names no owner and nobody has taken it; claim it first with `claim`"
     )
     .into())
+}
+
+/// 接活的人把选好的拓扑写进这一行；没选就什么都不写。
+///
+/// 写的是执行时读的同一格（`cog_collaboration::INPUT_TEAM`），名字在写之前
+/// 验：一个认不出的拓扑名在这里就该被拒，而不是留在行上等某次运行退回默认。
+fn declare_team(row: &mut Task, team: Option<String>) -> Result<(), String> {
+    let Some(name) = team else {
+        return Ok(());
+    };
+    cog_collaboration::declared_team(&name).map_err(|e| e.to_string())?;
+    row.input[cog_collaboration::INPUT_TEAM] = serde_json::Value::String(name.trim().to_string());
+    Ok(())
 }
 
 /// 一次被拒的认领，翻成带派命令行读得懂的一句话。
@@ -1278,7 +1301,32 @@ mod tests {
         assert_eq!(request.action, Action::Next { json: false });
 
         let request = parse_args(&args(&["claim", "--unit", "8b", "--task", "t-1"])).unwrap();
-        assert_eq!(request.action, Action::Claim { task: "t-1".into() });
+        assert_eq!(
+            request.action,
+            Action::Claim {
+                task: "t-1".into(),
+                team: None
+            }
+        );
+
+        // 接活的人可以顺手把组队方式钉在行上；名字原样交给执行时读的同一格。
+        let request = parse_args(&args(&[
+            "claim",
+            "--unit",
+            "8b",
+            "--task",
+            "t-1",
+            "--team",
+            "roundtable",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request.action,
+            Action::Claim {
+                task: "t-1".into(),
+                team: Some("roundtable".into())
+            }
+        );
 
         let request = parse_args(&args(&["heartbeat", "--unit", "8b"])).unwrap();
         assert_eq!(request.action, Action::Heartbeat);
@@ -1372,6 +1420,43 @@ mod tests {
             owned_count, 2,
             "the face node and another unit's task are not this unit's work"
         );
+    }
+
+    /// 接活时选定的拓扑落在执行时读的那一格上，认不出的名字一个字节也不落。
+    ///
+    /// 写侧与读侧是两段代码：`--team` 只被解析、没人写进行里的话，运行起来
+    /// 照样退回测量，而命令行看起来已经接受了这个决定。
+    #[test]
+    fn the_team_the_claimant_chose_lands_on_the_row_it_claims() {
+        let mut row = Task::new("t-1", cog_core::TaskType::DagNode, serde_json::json!({}));
+
+        declare_team(&mut row, None).expect("没选拓扑不是错误");
+        assert!(
+            row.input.get(cog_collaboration::INPUT_TEAM).is_none(),
+            "没表态就不该在行上留下一个值"
+        );
+
+        declare_team(&mut row, Some("roundtable".into())).expect("roundtable 是一个拓扑");
+        assert_eq!(
+            row.input
+                .get(cog_collaboration::INPUT_TEAM)
+                .and_then(|v| v.as_str()),
+            Some("roundtable"),
+            "负责人选的拓扑必须落在执行时读的同一格上"
+        );
+
+        let mut untouched = Task::new("t-2", cog_core::TaskType::DagNode, serde_json::json!({}));
+        let err = declare_team(&mut untouched, Some("debate".into()))
+            .expect_err("debate 不是本 build 认得的拓扑");
+        assert!(err.contains("debate"), "{err}");
+        assert!(
+            untouched.input.get(cog_collaboration::INPUT_TEAM).is_none(),
+            "被拒的名字不留在行上，等一次运行去猜"
+        );
+
+        let err = declare_team(&mut untouched, Some("plan_only".into()))
+            .expect_err("plan_only 是分解路径的模式，不是原子运行能选的拓扑");
+        assert!(err.contains("plan_only"), "{err}");
     }
 
     /// 从任务板上接来的活，也算这个 unit 手上欠着的。

@@ -9,9 +9,35 @@ use crate::{
         global_observable, ChangeYieldOutcome, BOUNDARY_NO_HARD_RULES, BOUNDARY_PASSED,
         BOUNDARY_VIOLATED,
     },
-    profile::derive_task_profile,
+    profile::{derive_task_profile, PgeMode, RouteDecision, RouteStage, TaskProfile},
     squad::{SquadConfig, SquadExecutor, SquadResult},
 };
+
+/// 任务行上「这支队伍怎么组」的那一格：由接活的人自己写。
+///
+/// 与验收判据同一层——两样都是接手的人对这件活的说法，而不是派单方替它做
+/// 的决定。放在任务行上而不是 `SquadConfig` 里，是因为它必须随行过队列、
+/// 过认领，被下一次运行原样读到。
+pub const INPUT_TEAM: &str = "team";
+
+/// 一个拓扑名是不是一次原子运行真能选的模式。
+///
+/// 认不出或选不了时把「为什么」一并说清：写错名字的负责人要在**接活那一刻**
+/// 就知道，而不是等这件活跑起来才在日志里看到一次默认路由。写侧（认领）与
+/// 读侧（组队）都用这一个函数，两处各判一次的话，最先漂的是「哪些名字能写」。
+pub fn declared_team(name: &str) -> SFResult<PgeMode> {
+    let name = name.trim();
+    match PgeMode::parse(name) {
+        Some(PgeMode::PlanOnly) => Err(SFError::Validation(format!(
+            "{name:?} is the decomposition path's mode, not a topology an atomic run can take"
+        ))),
+        Some(mode) => Ok(mode),
+        None => Err(SFError::Validation(format!(
+            "unknown team {name:?}; the topologies are {:?}",
+            PgeMode::ALL.map(|mode| mode.as_str())
+        ))),
+    }
+}
 
 /// 一件派给名册上任意员工的活。谁接都行——这件活由材料、做法与验收
 /// 判据说了算，不由接活的人的角色说了算。
@@ -699,6 +725,62 @@ impl CollaborationExecutor {
         Ok(task_result)
     }
 
+    /// 这一次运行的产出要不要走抽取与落地那条路。
+    ///
+    /// 判据是任务声明（[`Task::declares_change`]），不是任务类型：同一个员工
+    /// 接一件只交结论的活与接一件要交改动的活，收尾走的是两条不同的路；而
+    /// 「哪一类活能改树」若写死在类型上，对话里发起的改动在结构上就永远落
+    /// 不了地——不是被拒绝，是根本没有一条路能走到。
+    fn yields_changes(task: &Task) -> bool {
+        task.declares_change()
+    }
+
+    /// 这支队伍由谁定拓扑：接了活的人写在行上（[`INPUT_TEAM`]），没写才按量到的路走。
+    ///
+    /// 顺序不能倒过来。按任务量出来的分数是对请求形状的猜测，而写下这一格的
+    /// 人是**为结果负责的那一个**：他要的是另一种组队方式时，选择器再合理也只
+    /// 是替他做了一个他没让做的决定。所以认领者的声明直接生效，读面上记
+    /// [`RouteStage::Claimant`]；只有行上什么都没写，才轮到测量。
+    ///
+    /// 认不出的名字是错误，不是默认值：一个没见过的拓扑名如果静默退回测量，
+    /// 日志里那次运行看起来与「测出来就是它」一模一样，而负责人的决定消失了。
+    pub async fn team_of(
+        &self,
+        task: &Task,
+        goal: &str,
+        profile: &TaskProfile,
+    ) -> SFResult<RouteDecision> {
+        let declared = match task.input.get(INPUT_TEAM) {
+            None => None,
+            Some(serde_json::Value::String(name)) => Some(
+                declared_team(name)
+                    .map_err(|e| SFError::Validation(format!("task {}: {e}", task.id)))?,
+            ),
+            Some(other) => {
+                return Err(SFError::Validation(format!(
+                    "task {} declares team as {other}, but it must be the name of a topology",
+                    task.id
+                )))
+            }
+        };
+
+        if let Some(mode) = declared {
+            let decision = RouteDecision {
+                mode,
+                stage: RouteStage::Claimant,
+                reason: format!(
+                    "the employee who took task {} declared this topology",
+                    task.id
+                ),
+            };
+            global_observable()
+                .record_route_decision(decision.stage.as_str(), decision.mode.as_str());
+            return Ok(decision);
+        }
+
+        Ok(self.mode_selector.select_mode(goal, profile).await)
+    }
+
     /// Atomic execution path: run the full Squad → PGE → SelfReview pipeline,
     /// but with the Planner producing an execution plan
     /// (steps, approach, boundaries) rather than decomposing into sub-tasks.
@@ -725,7 +807,7 @@ impl CollaborationExecutor {
         // The decision is counted by the selector itself; the stage is logged
         // here as well so a reader of this line can see which rule decided
         // without going to the metric plane.
-        let decision = self.mode_selector.select_mode(&goal, &profile).await;
+        let decision = self.team_of(task, &goal, &profile).await?;
         let pge_mode = decision.mode;
         let reason = &decision.reason;
 
@@ -862,14 +944,14 @@ impl CollaborationExecutor {
         let execution_output = Self::extract_execution_result(&result);
         let score = Self::extract_score(&result);
 
-        // If this is a self-evolution task, extract generated changes and
-        // hand them to every ChangeSink (fan-out).
+        // If the task declared that it produces a change, extract it and hand it
+        // to every ChangeSink (fan-out).
         let mut change_ids = Vec::new();
-        if is_self_evolution {
+        if Self::yields_changes(task) {
             let outcome = if self.change_sinks.is_empty() {
                 tracing::warn!(
                     task_id=%task.id,
-                    "Self-evolution task succeeded but no ChangeSink is configured, so any change it produces is dropped"
+                    "A run that declared a change succeeded but no ChangeSink is configured, so any change it produces is dropped"
                 );
                 ChangeYieldOutcome::NoSink
             } else {
@@ -897,7 +979,7 @@ impl CollaborationExecutor {
                         tracing::warn!(
                             task_id=%task.id,
                             outcome=cause.as_str(),
-                            "Self-evolution run yielded no change artifact; nothing to land"
+                            "A run that declared a change yielded no artifact; nothing to land"
                         );
                         cause
                     }
@@ -3065,6 +3147,113 @@ mod employee_dispatch_tests {
             Some("E0456"),
             "真正跑完它的那一位优先于行上写着的认领者"
         );
+    }
+
+    /// 能不能交改动由任务声明，不由任务类型。
+    ///
+    /// 这条用对话类任务做夹具：类型不是自进化，声明一打开就必须走到落地的
+    /// 那条路。判据若还是 `is_self_evolution`，这段活能跑完、能说成功，而它
+    /// 产出的改动一个字节也到不了 ChangeSink。
+    #[test]
+    fn a_task_that_declares_a_change_yields_one_whatever_its_type() {
+        let mut chat = Task::new(
+            "chat-1",
+            TaskType::Custom("conversation".into()),
+            serde_json::json!({}),
+        );
+        assert!(
+            !CollaborationExecutor::yields_changes(&chat),
+            "没说改树的活不该走抽取与落地"
+        );
+        chat.input[cog_core::types::task::INPUT_DECLARES_CHANGE] = serde_json::json!(true);
+        assert!(
+            CollaborationExecutor::yields_changes(&chat),
+            "对话类任务声明了改树，结构上就该能走到抽取与落地"
+        );
+
+        let evolution = Task::new(
+            "evo-1",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({}),
+        );
+        assert!(
+            CollaborationExecutor::yields_changes(&evolution),
+            "自进化的标记本身就是「产出一份变更」那句话"
+        );
+    }
+
+    /// 接了活的人选定的拓扑压过按任务量出来的路由。
+    ///
+    /// 夹具故意用一句点名散文文件的话：量出来的路是捷径（Direct），所以这条
+    /// 断言只在「负责人写的**先于**选择器」时成立——顺序倒过来，这段活仍然
+    /// 能跑完，只是按了一个没让他做的决定组队。
+    #[tokio::test]
+    async fn the_claimants_choice_of_team_outranks_what_the_task_measures() {
+        use crate::profile::{derive_task_profile, PgeMode, RouteStage};
+
+        let executor = CollaborationExecutor::new();
+        let goal = "fix the wording in `docs/quickstart.md`";
+        let mut task = work_item("work-1", serde_json::json!({ "goal": goal }));
+        let profile = derive_task_profile(&task);
+        assert_eq!(
+            crate::select_mode(&profile).mode,
+            PgeMode::Direct,
+            "夹具前提：按任务量出来的路是捷径"
+        );
+
+        task.input[INPUT_TEAM] = serde_json::json!("roundtable");
+        let decision = executor
+            .team_of(&task, goal, &profile)
+            .await
+            .expect("roundtable 是一个可选的拓扑");
+        assert_eq!(
+            decision.mode,
+            PgeMode::Roundtable,
+            "负责人选了圆桌，就该按圆桌组队"
+        );
+        assert_eq!(
+            decision.stage,
+            RouteStage::Claimant,
+            "读面上必须看得出这一次是负责人自己点的，不是选择器推出来的"
+        );
+    }
+
+    /// 行上什么都没写，才轮到测量。
+    #[tokio::test]
+    async fn a_row_that_declares_no_team_falls_back_to_the_measured_route() {
+        use crate::profile::{derive_task_profile, RouteStage};
+
+        let executor = CollaborationExecutor::new();
+        let goal = "fix the wording in `docs/quickstart.md`";
+        let task = work_item("work-1", serde_json::json!({ "goal": goal }));
+        let profile = derive_task_profile(&task);
+        let decision = executor
+            .team_of(&task, goal, &profile)
+            .await
+            .expect("没有声明不是错误");
+        assert_ne!(
+            decision.stage,
+            RouteStage::Claimant,
+            "没人表态时不该冒充一次负责人的选择"
+        );
+        assert_eq!(decision.mode, crate::select_mode(&profile).mode);
+    }
+
+    /// 认不出的拓扑名是错误，不是一次悄悄退回的默认路由。
+    #[tokio::test]
+    async fn an_unknown_team_name_is_an_error_not_a_default_route() {
+        use crate::profile::derive_task_profile;
+
+        let executor = CollaborationExecutor::new();
+        let goal = "fix the wording in `docs/quickstart.md`";
+        let mut task = work_item("work-1", serde_json::json!({ "goal": goal }));
+        task.input[INPUT_TEAM] = serde_json::json!("debate");
+        let profile = derive_task_profile(&task);
+        let err = executor
+            .team_of(&task, goal, &profile)
+            .await
+            .expect_err("debate 不是本 build 认得的拓扑");
+        assert!(err.to_string().contains("debate"), "{err}");
     }
 
     /// 名册空的时候不假装干完了。

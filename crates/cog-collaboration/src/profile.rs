@@ -445,6 +445,12 @@ impl<'de> serde::Deserialize<'de> for PgeMode {
 /// wording drifted would read exactly like a stage that never decided anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteStage {
+    /// 接了这件活的人写在任务行上的拓扑（`input.team`）。
+    ///
+    /// 排在所有测量之前：谁为结果负责，谁就决定这支队伍怎么组；按任务量出
+    /// 来的分数只是没人表态时的默认，不是一次指派。这个值出现在读面上，就
+    /// 说明那次拓扑是责任人自己点的，而不是被选择器推出来的。
+    Claimant,
     /// A measured [`DeclaredScale`] settled it on its own.
     DeclaredScale,
     /// A word in the goal.
@@ -466,7 +472,8 @@ impl RouteStage {
     /// listed here has to be one the router can actually reach — `agent` and
     /// `default` were published for a year while no call could produce either,
     /// which is exactly the reading this list is meant to expose.
-    pub const ALL: [RouteStage; 4] = [
+    pub const ALL: [RouteStage; 5] = [
+        RouteStage::Claimant,
         RouteStage::DeclaredScale,
         RouteStage::Keyword,
         RouteStage::HistoricalPrior,
@@ -475,6 +482,7 @@ impl RouteStage {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            RouteStage::Claimant => "claimant",
             RouteStage::DeclaredScale => "declared_scale",
             RouteStage::Keyword => "keyword",
             RouteStage::HistoricalPrior => "historical_prior",
