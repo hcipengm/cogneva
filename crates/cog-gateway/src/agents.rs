@@ -240,8 +240,11 @@ pub struct PersonRow {
     /// 这段对话的会话 id。名字由它算出来，接着聊也要按它投回同一个人；
     /// 丢了这一格，名单上这个人就只剩一个念不回去的名字。
     pub session_id: String,
-    /// 名册给这个人算出的名字（`Kai#a9ab11fc`）。写入时算一次：读面不该再
-    /// 持有一份名字算法，两份算法迟早会有一个字母不一样。
+    /// 这段会话第一次说出自己是谁时算出的身份种子（`Kai#a9ab11fc`）。它是
+    /// **种子，不是展示名**：展示名只有一处派生，来自 [`cog_core::EmployeeRecord`]
+    /// 的工号；读面拿这一格只用来在绑定行缺失时把同一个人认回来（`persona#short`）。
+    /// 把它当名字印出去，同一个人就会在名册上以 `E0412 林清和`、在对话里以
+    /// `Kai#a9ab11fc` 各出现一次。
     pub display_name: String,
     pub first_seen: chrono::DateTime<chrono::Utc>,
     pub last_seen: chrono::DateTime<chrono::Utc>,
@@ -1949,9 +1952,13 @@ fn roster_with_people(
         .collect();
     idle.sort_by_key(|row| std::cmp::Reverse(row.1.last_seen));
     for (agent_id, row) in idle {
+        // 这里印的不是这一行里存的种子，而是名册上那一位的名字：名字只有一处
+        // 派生（`EmployeeRecord::label`），存下来的那份只是身份的种子。没有
+        // 名册行的人才印「待编」——那是「这个人还没被编号」，不是「这个人叫
+        // Kai#a9ab11fc」。两处各印一个名字，读的人会以为看见了两个人。
         let mut view = serde_json::json!({
             "agent_id": agent_id.clone(),
-            "display_name": row.display_name,
+            "display_name": cog_core::unregistered_label(&agent_id),
             "role": "chat",
             "workspace_id": "default",
             "capabilities": Vec::<String>::new(),
@@ -2644,7 +2651,12 @@ mod tests {
 
         assert_eq!(views.len(), 1);
         assert_eq!(views[0]["agent_id"], "kai-a9ab11fc");
-        assert_eq!(views[0]["display_name"], "Kai#a9ab11fc");
+        // 没被编号的人印「待编」，不印那一串身份种子：种子看着像名字，于是
+        // 没人去补这一次编号。
+        assert_eq!(
+            views[0]["display_name"],
+            cog_core::unregistered_label("kai-a9ab11fc")
+        );
         assert_eq!(views[0]["live"], false);
         assert_eq!(views[0]["session_id"], "conv-1");
     }
