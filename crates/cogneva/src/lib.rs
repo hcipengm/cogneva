@@ -262,6 +262,10 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 principles: ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
                 alerts: ctx.consume_service::<dyn cog_core::AlertStore>(),
             };
+            // 运行时原则账：与上面三本不同，它是这段对话里的人能往里写的一本——
+            // 员工提案、属主拍板。上面装给内核的那一份是同一本（`consume_service`
+            // 不拿走服务），所以批了之后下一轮开头读到的就是它。
+            let runtime_principles = ctx.consume_service::<dyn cog_core::RuntimePrincipleStore>();
             // 平台上每个智能体开头读到的那段话是部署声明的，不是编译进二进制的
             // 一句。声明在 `prompts/` 里，随 ConfigMap 挂进进程；这里把本子交给
             // 内核，任务尝试与界面上的对话都从同一处取。没装提示词插件的进程
@@ -279,6 +283,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     inbox,
                     people,
                     ledgers,
+                    runtime_principles,
                 )))
                 .is_err()
             {

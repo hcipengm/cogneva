@@ -290,10 +290,14 @@ pub struct PlatformConversation {
     /// 三本只读账。读它们回答的是「这件事现在到哪一步了」——答案来自账，不是
     /// 来自印象，也不是从某面墙上抄下来的一段话。
     ledgers: Ledgers,
+    /// 运行时原则账。与上面三本不同的地方只有一处：这段对话里的人能往里写——
+    /// 员工提案，属主拍板。批了之后下一轮开头它就随基础指令交给每个人，所以
+    /// 「从对话里改规则」不用重发版，也不用重启谁。
+    principles: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
 }
 
 impl PlatformConversation {
-    // 八个入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
+    // 九个入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
     // 「这个部署里装了哪些」，把其中几个打包只会让调用方多记一个类型名，
     // 而少掉的参数个数并不能让这行更好读。构造完就各归各位，没有第二处
     // 地方再按这个分组使用它们。
@@ -307,6 +311,7 @@ impl PlatformConversation {
         inbox: Option<Arc<dyn cog_core::MessageBackend>>,
         people: Option<Arc<dyn cog_core::KeyValueStore>>,
         ledgers: Ledgers,
+        principles: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -317,6 +322,7 @@ impl PlatformConversation {
             inbox,
             people,
             ledgers,
+            principles,
         }
     }
 }
@@ -479,6 +485,17 @@ impl ConversationTurn for PlatformConversation {
                 self.audit.clone(),
                 request.owner.clone(),
                 employee.id.clone(),
+            ) {
+                tools.register(tool);
+            }
+            // 规则账：员工提案，属主拍板。拍板的两只只在**这一轮有登录身份**时
+            // 注册——没有人的连接批准不了任何东西，否则账上会多出一行「由一位
+            // 员工替属主做的决定」。提案那只对每个员工都在，缺账时它如实说
+            // 「读不到」，而不是假装提案成功。
+            for tool in principle_tools(
+                self.principles.clone(),
+                employee.id.clone(),
+                owner.is_some(),
             ) {
                 tools.register(tool);
             }
@@ -1317,6 +1334,286 @@ fn active_alerts_tool(alerts: Option<Arc<dyn cog_core::AlertStore>>) -> Tool {
     )
 }
 
+/// 员工在对话里提案一条运行时原则。
+///
+/// 这是员工能做的那半件「改规则」：它写得下一条规则（什么时候、看什么、做什么），
+/// 但写不了「它生效了」——生效只由属主拍板。提案落进与常驻循环同一本账，所以批了
+/// 之后下一轮开头它就在每个人的系统前缀里，不需要重发版、也不需要重启谁。
+pub const PROPOSE_PRINCIPLE: &str = "propose_principle";
+
+/// 属主批准一条提案。
+pub const APPROVE_PRINCIPLE: &str = "approve_principle";
+
+/// 属主否决一条提案。
+pub const REJECT_PRINCIPLE: &str = "reject_principle";
+
+/// 读账上此刻生效的规则与还等着拍的提案。
+pub const LIST_RUNTIME_PRINCIPLES: &str = "list_runtime_principles";
+
+/// 规则账这一组：提案（每个人）+ 拍板（只在有人的对话里）。
+///
+/// 拍板的两只只在**这一轮有登录身份**时注册：没有人的连接批准不了任何东西——
+/// 那份「谁说的」在账上会读成一位员工替属主做的决定，而这里是它唯一不许自己
+/// 拍板的地方。规则与角色无关：这一组对每个员工都一样，谁提的都进同一本账。
+fn principle_tools(
+    account: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
+    employee: String,
+    owner_present: bool,
+) -> Vec<Tool> {
+    let mut tools = vec![
+        list_runtime_principles_tool(account.clone()),
+        propose_principle_tool(account.clone(), employee),
+    ];
+    if owner_present {
+        tools.push(decide_principle_tool(
+            account.clone(),
+            cog_core::RuntimePrincipleState::Approved,
+        ));
+        tools.push(decide_principle_tool(
+            account,
+            cog_core::RuntimePrincipleState::Rejected,
+        ));
+    }
+    tools
+}
+
+fn list_runtime_principles_tool(account: Option<Arc<dyn cog_core::RuntimePrincipleStore>>) -> Tool {
+    make_tool(
+        LIST_RUNTIME_PRINCIPLES,
+        "读运行时原则账：此刻生效的规则（每轮开头交给每个人）与还等着属主拍的提案。\
+         属主问「有什么新提案」「现在按哪些规则做事」时先读它；批准、否决时把返回里的\
+         slug 照抄过去，不要自己编一个。`state` 可以只看一态。它是只读的——改不了账，\
+         也不会把提案变成生效；生效只有属主的批准。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "enum": ["proposed", "approved", "rejected", "retired"],
+                    "description": "只看这一态；不给就看全部"
+                }
+            }
+        }),
+        native(move |args| {
+            let account = account.clone();
+            async move {
+                let Some(store) = account else {
+                    return Ok(ledger_absent("运行时原则账"));
+                };
+                let state = match word_arg(&args, "state") {
+                    Some(word) => match cog_core::RuntimePrincipleState::parse(&word) {
+                        Some(state) => Some(state),
+                        None => {
+                            return Ok(serde_json::json!({
+                                "available": true,
+                                "refused": "unknown_state",
+                                "note": format!(
+                                    "账上没有 {word:?} 这一态：只有 proposed、approved、\
+                                     rejected、retired 四种，照抄其中一个。"
+                                ),
+                            }))
+                        }
+                    },
+                    None => None,
+                };
+                let rows = store.list(state).await?;
+                let rules: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "slug": row.slug,
+                            "state": row.state.as_str(),
+                            "in_force": row.in_force(),
+                            "trigger": row.trigger,
+                            "criterion": row.criterion,
+                            "action": row.action,
+                            "proposed_by": row.proposed_by,
+                            "proposed_at": stamp(Some(row.proposed_at)),
+                            "decided_at": stamp(row.decided_at),
+                            "used": row.used,
+                        })
+                    })
+                    .collect();
+                let pending = rows
+                    .iter()
+                    .filter(|row| row.state == cog_core::RuntimePrincipleState::Proposed)
+                    .count();
+                let in_force = rows.iter().filter(|row| row.in_force()).count();
+                Ok(serde_json::json!({
+                    "available": true,
+                    "rules": rules,
+                    "in_force": in_force,
+                    "pending": pending,
+                    "note": if rows.is_empty() {
+                        "账上此刻一行都没有。"
+                    } else if pending > 0 {
+                        "有几条提案还等着属主拍板：把它们的 slug 照抄给属主，\
+                         不要替属主决定，也不要把提案当成已经在执行的规则。"
+                    } else {
+                        "没有等着拍的提案。"
+                    },
+                }))
+            }
+        }),
+    )
+}
+
+fn propose_principle_tool(
+    account: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
+    employee: String,
+) -> Tool {
+    make_tool(
+        PROPOSE_PRINCIPLE,
+        "把一条想让平台照着做的规则提上账：`trigger` 是它什么时候适用，`criterion` 是看什么，\
+         `action` 是做什么。提了**不生效**：属主批准之后，下一轮运行开头它才随基础指令交到\
+         每个人手上。规则不是对人的设定——写「什么时候、看什么、做什么」，不写「你是谁」；\
+         同一本账对每个员工都一样，不按人、不按角色分。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "description": "这条规则的名字，全账唯一，回复里引用它时照抄"
+                },
+                "trigger": {
+                    "type": "string",
+                    "description": "什么情况下适用"
+                },
+                "criterion": {
+                    "type": "string",
+                    "description": "看什么，看到什么算符合"
+                },
+                "action": {
+                    "type": "string",
+                    "description": "符合与不符合各自做什么"
+                }
+            },
+            "required": ["slug", "trigger", "criterion", "action"]
+        }),
+        native(move |args| {
+            let account = account.clone();
+            let employee = employee.clone();
+            async move {
+                let Some(store) = account else {
+                    return Ok(ledger_absent("运行时原则账"));
+                };
+                let text = |key: &str| {
+                    args.get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let row = match cog_core::RuntimePrinciple::proposed(
+                    text("slug"),
+                    text("trigger"),
+                    text("criterion"),
+                    text("action"),
+                    employee,
+                    chrono::Utc::now(),
+                ) {
+                    Ok(row) => row,
+                    // 三段缺任何一段都不是一条能被判的规则：回给模型看清是哪一段，
+                    // 而不是把它存成一句「这条今天没有内容」。
+                    Err(e) => {
+                        return Ok(serde_json::json!({
+                            "proposed": false,
+                            "refused": "incomplete",
+                            "note": format!("没有进账：{e}"),
+                        }))
+                    }
+                };
+                match store.propose(&row).await {
+                    Ok(()) => Ok(serde_json::json!({
+                        "proposed": true,
+                        "slug": row.slug,
+                        "in_force": false,
+                        "trigger": row.trigger,
+                        "criterion": row.criterion,
+                        "action": row.action,
+                        "note": "提案已经进账，现在还不生效：要属主批准。批准之后，下一轮\
+                                 运行开头它会随基础指令交给每个人；在那之前不要按它做主，\
+                                 回复里说清它还等着批。"
+                    })),
+                    Err(e) => Ok(serde_json::json!({
+                        "proposed": false,
+                        "refused": "not_filed",
+                        "slug": row.slug,
+                        "note": format!("没有进账：{e}"),
+                    })),
+                }
+            }
+        }),
+    )
+}
+
+fn decide_principle_tool(
+    account: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
+    decision: cog_core::RuntimePrincipleState,
+) -> Tool {
+    let (name, verb, meaning) = match decision {
+        cog_core::RuntimePrincipleState::Approved => (
+            APPROVE_PRINCIPLE,
+            "批准",
+            "批准之后它会立刻成为规则：下一轮运行开头随基础指令交给每个人。",
+        ),
+        _ => (
+            REJECT_PRINCIPLE,
+            "否决",
+            "否决的行留在账上，读得到「这条提过、当时没同意」；同一个名字可以按新文本重新提案。",
+        ),
+    };
+    make_tool(
+        name,
+        &format!(
+            "属主{verb}一条提案。只在属主在这段对话里明确说了{verb}时调用——这是属主\
+             的决定，不是你的判断。{meaning}"
+        ),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "description": "要拍的那条提案的名字"
+                }
+            },
+            "required": ["slug"]
+        }),
+        native(move |args| {
+            let account = account.clone();
+            async move {
+                let Some(store) = account else {
+                    return Ok(ledger_absent("运行时原则账"));
+                };
+                let slug = args
+                    .get("slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if slug.is_empty() {
+                    return Ok(serde_json::json!({
+                        "moved": false,
+                        "note": "没有动：要给一个 slug——账上按名字认那条提案，空名字拍不到任何一条。",
+                    }));
+                }
+                let moved = store.decide(&slug, decision, chrono::Utc::now()).await?;
+                Ok(serde_json::json!({
+                    "slug": slug,
+                    "moved": moved,
+                    "state": decision.as_str(),
+                    "in_force": moved && decision.in_force(),
+                    "note": if moved {
+                        "账上这一行动了。"
+                    } else {
+                        "没有动：账上没有这条等着拍的提案——它可能已经批过、被否决了，\
+                         或者名字对不上。先说清这一点，不要宣布它生效了。"
+                    }
+                }))
+            }
+        }),
+    )
+}
+
 /// 把一次工具调用包成内核认的 handler：一个值进、一个值出。
 fn native<F, Fut>(f: F) -> ToolHandler
 where
@@ -1562,6 +1859,7 @@ fn task_summary(task: &cog_core::Task) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::RuntimePrincipleStore as _;
 
     /// 控制面这一组是闭集，而且里面没有执行工具。
     ///
@@ -2299,5 +2597,491 @@ mod tests {
             serde_json::from_str(&kv.stored(&employee.id)).expect("名册那一行要读得回来");
         assert_eq!(row.platform.as_deref(), Some("web"));
         assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    }
+
+    // ── 规则账：员工提案，属主在同一段对话里拍板 ──
+    //
+    // 这一段判的是外循环那半句话：「员工能从对话里提案新原则，属主在同一段对话里
+    // 看到、批准或否决，批准后下一轮即生效」。下一轮生效不在这一段里重造一遍：
+    // 交付是每轮现读（`cog_agent::principles`），所以「下一轮读得到」在这里就是
+    // 「账上这一行成了生效态、`in_force` 收得下它」。
+
+    /// 账的内存版：只实现这张对话用得到的几条，护栏与 PostgreSQL 那份一致。
+    #[derive(Default)]
+    struct FakePrinciples {
+        rows: std::sync::Mutex<Vec<cog_core::RuntimePrinciple>>,
+    }
+
+    impl FakePrinciples {
+        fn state_of(&self, slug: &str) -> Option<cog_core::RuntimePrincipleState> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.slug == slug)
+                .map(|row| row.state)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::RuntimePrincipleStore for FakePrinciples {
+        async fn propose(&self, principle: &cog_core::RuntimePrinciple) -> cog_core::SFResult<()> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.iter_mut().find(|row| row.slug == principle.slug) {
+                Some(row) if row.state == cog_core::RuntimePrincipleState::Rejected => {
+                    *row = principle.clone();
+                    Ok(())
+                }
+                Some(row) => Err(cog_core::SFError::Conflict(format!(
+                    "{} 已经是 {:?}",
+                    principle.slug, row.state
+                ))),
+                None => {
+                    rows.push(principle.clone());
+                    Ok(())
+                }
+            }
+        }
+
+        async fn decide(
+            &self,
+            slug: &str,
+            decision: cog_core::RuntimePrincipleState,
+            at: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<bool> {
+            use cog_core::RuntimePrincipleState::{Approved, Proposed, Rejected, Retired};
+            let from = match decision {
+                Approved | Rejected => Proposed,
+                Retired => Approved,
+                Proposed => {
+                    return Err(cog_core::SFError::Validation(
+                        "拍板只有批准、否决、撤回".into(),
+                    ))
+                }
+            };
+            let mut rows = self.rows.lock().unwrap();
+            match rows
+                .iter_mut()
+                .find(|row| row.slug == slug && row.state == from)
+            {
+                Some(row) => {
+                    row.state = decision;
+                    row.decided_at = Some(at);
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+
+        async fn in_force(&self) -> cog_core::SFResult<Vec<cog_core::RuntimePrinciple>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.in_force())
+                .cloned()
+                .collect())
+        }
+
+        async fn note_used(&self, slugs: &[String]) -> cog_core::SFResult<()> {
+            let mut rows = self.rows.lock().unwrap();
+            for row in rows.iter_mut().filter(|row| slugs.contains(&row.slug)) {
+                row.used += 1;
+            }
+            Ok(())
+        }
+
+        async fn list(
+            &self,
+            state: Option<cog_core::RuntimePrincipleState>,
+        ) -> cog_core::SFResult<Vec<cog_core::RuntimePrinciple>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| state.is_none_or(|state| state == row.state))
+                .cloned()
+                .collect())
+        }
+    }
+
+    async fn call(tools: &[Tool], name: &str, args: serde_json::Value) -> serde_json::Value {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "没有 {name}：{}",
+                    tools
+                        .iter()
+                        .map(|t| &t.name)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+        let ToolImplementation::Native(handler) = &tool.implementation else {
+            panic!("{name} 不是原生工具");
+        };
+        handler(args)
+            .await
+            .unwrap_or_else(|e| panic!("{name} 调用失败：{e}"))
+    }
+
+    fn proposal(slug: &str) -> serde_json::Value {
+        serde_json::json!({
+            "slug": slug,
+            "trigger": "在合并之前",
+            "criterion": "构建是不是绿的",
+            "action": "红了就停下来修"
+        })
+    }
+
+    /// 提案进账、落在提它的那个员工名下，而且当场说清它还不生效。
+    ///
+    /// 这是员工能做的半件事。回一句「已记录」而不说「还等着批」，模型就会把一条
+    /// 没人批准过的句子当成规则照着做——账上它还是提案态，读面与行为从此对不上。
+    #[tokio::test]
+    async fn a_proposal_from_the_chat_lands_under_the_employee_and_is_not_in_force() {
+        let account = Arc::new(FakePrinciples::default());
+        let tools = principle_tools(Some(account.clone()), "E0412".into(), false);
+
+        let answer = call(&tools, PROPOSE_PRINCIPLE, proposal("build-before-merge")).await;
+
+        assert_eq!(answer["proposed"], true, "{answer}");
+        assert_eq!(
+            answer["in_force"], false,
+            "提案当场生效就不是提案了：{answer}"
+        );
+        assert!(
+            answer["note"].as_str().unwrap_or_default().contains("批准"),
+            "回复没有说它等着属主批准：{}",
+            answer["note"]
+        );
+        assert_eq!(
+            account.state_of("build-before-merge"),
+            Some(cog_core::RuntimePrincipleState::Proposed),
+            "账上没有这一行，或者它不是提案态"
+        );
+        let rows = account.rows.lock().unwrap();
+        assert_eq!(rows[0].proposed_by, "E0412", "提案人不是这位员工");
+    }
+
+    /// 三段缺一段就没有进账，而且回给模型的是缺了哪一段。
+    ///
+    /// 少一段的规则读起来像「这一条今天没有内容」——存进去之后，每一轮都会把它
+    /// 当成一条没有约束的规则交出去，而账上看着一切正常。
+    #[tokio::test]
+    async fn an_incomplete_proposal_is_refused_instead_of_filed() {
+        let account = Arc::new(FakePrinciples::default());
+        let tools = principle_tools(Some(account.clone()), "E0412".into(), false);
+
+        let answer = call(
+            &tools,
+            PROPOSE_PRINCIPLE,
+            serde_json::json!({
+                "slug": "half-a-rule",
+                "trigger": "在合并之前",
+                "criterion": "  ",
+                "action": "红了就停下来修"
+            }),
+        )
+        .await;
+
+        assert_eq!(answer["proposed"], false, "{answer}");
+        assert_eq!(answer["refused"], "incomplete", "{answer}");
+        assert!(
+            answer["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("criterion"),
+            "没有说清缺的是哪一段：{}",
+            answer["note"]
+        );
+        assert!(
+            account.rows.lock().unwrap().is_empty(),
+            "缺一段的规则进了账"
+        );
+    }
+
+    /// 属主在同一段对话里批准，下一轮读到它就是规则。
+    ///
+    /// 这就是 A15 那一句：提案与拍板在同一条对话里完成，生效不是重发版换来的，
+    /// 而是账上这一行成了生效态——下一轮开头现读（`in_force`）所以立刻读得到。
+    #[tokio::test]
+    async fn the_owner_approves_in_the_same_conversation_and_the_next_run_reads_it() {
+        let account = Arc::new(FakePrinciples::default());
+        let tools = principle_tools(Some(account.clone()), "E0412".into(), true);
+
+        call(&tools, PROPOSE_PRINCIPLE, proposal("build-before-merge")).await;
+        let answer = call(
+            &tools,
+            APPROVE_PRINCIPLE,
+            serde_json::json!({ "slug": "build-before-merge" }),
+        )
+        .await;
+
+        assert_eq!(answer["moved"], true, "{answer}");
+        assert_eq!(answer["state"], "approved", "{answer}");
+        assert_eq!(answer["in_force"], true, "{answer}");
+        assert_eq!(
+            account.state_of("build-before-merge"),
+            Some(cog_core::RuntimePrincipleState::Approved)
+        );
+        // 下一轮开头读的那一集里已经有它：交付是每轮现读，所以这就是「下一轮生效」。
+        let live = account.in_force().await.unwrap();
+        assert_eq!(
+            live.iter().map(|row| row.slug.as_str()).collect::<Vec<_>>(),
+            vec!["build-before-merge"]
+        );
+    }
+
+    /// 属主在对话里看得见「等着拍的提案」，拍完看得见它进了生效集。
+    ///
+    /// 没有这一只，「批准」就成了一个要凭记忆写 slug 的动作：提案是别的员工在
+    /// 别的会话里提的，属主这一段对话里没有任何地方读得到它——「同一段对话里
+    /// 看到」就只剩下提案人自己在场的那一次。
+    #[tokio::test]
+    async fn the_owner_sees_what_is_waiting_and_then_what_is_in_force() {
+        let account = Arc::new(FakePrinciples::default());
+        let tools = principle_tools(Some(account.clone()), "E0412".into(), true);
+
+        let empty = call(&tools, LIST_RUNTIME_PRINCIPLES, serde_json::json!({})).await;
+        assert_eq!(empty["pending"], 0, "{empty}");
+        assert_eq!(empty["in_force"], 0, "{empty}");
+
+        call(&tools, PROPOSE_PRINCIPLE, proposal("build-before-merge")).await;
+        let waiting = call(
+            &tools,
+            LIST_RUNTIME_PRINCIPLES,
+            serde_json::json!({ "state": "proposed" }),
+        )
+        .await;
+        assert_eq!(waiting["pending"], 1, "{waiting}");
+        assert_eq!(
+            waiting["rules"][0]["slug"], "build-before-merge",
+            "{waiting}"
+        );
+        assert_eq!(
+            waiting["rules"][0]["in_force"], false,
+            "提案被读成了生效：{waiting}"
+        );
+        assert!(
+            waiting["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("slug"),
+            "没有告诉它拍板要用哪个名字：{}",
+            waiting["note"]
+        );
+
+        call(
+            &tools,
+            APPROVE_PRINCIPLE,
+            serde_json::json!({ "slug": "build-before-merge" }),
+        )
+        .await;
+        let live = call(&tools, LIST_RUNTIME_PRINCIPLES, serde_json::json!({})).await;
+        assert_eq!(live["pending"], 0, "{live}");
+        assert_eq!(live["in_force"], 1, "{live}");
+        assert_eq!(live["rules"][0]["in_force"], true, "{live}");
+    }
+
+    /// 读面只认账上的四种拼法：别的词回一句「没有这一态」，不猜成某一种。
+    #[tokio::test]
+    async fn an_unknown_state_word_is_refused_instead_of_guessed() {
+        let account = Arc::new(FakePrinciples::default());
+        let tools = principle_tools(Some(account), "E0412".into(), false);
+
+        let answer = call(
+            &tools,
+            LIST_RUNTIME_PRINCIPLES,
+            serde_json::json!({ "state": "draft" }),
+        )
+        .await;
+
+        assert_eq!(answer["refused"], "unknown_state", "{answer}");
+        assert!(
+            answer.get("rules").is_none(),
+            "猜了一态照样读了账：{answer}"
+        );
+    }
+
+    /// 否决留在账上，而且同一个名字可以按新文本重新提案。
+    ///
+    /// 「当时没同意」本身是一条记录，不是待办；但把它做成一次性用掉的编号，下一版
+    /// 同一个名字就永远提不上来——被否决的规则往往正是最该改的那几条。
+    #[tokio::test]
+    async fn a_rejected_proposal_stays_on_the_account_and_may_come_back() {
+        let account = Arc::new(FakePrinciples::default());
+        let tools = principle_tools(Some(account.clone()), "E0412".into(), true);
+
+        call(&tools, PROPOSE_PRINCIPLE, proposal("build-before-merge")).await;
+        let rejected = call(
+            &tools,
+            REJECT_PRINCIPLE,
+            serde_json::json!({ "slug": "build-before-merge" }),
+        )
+        .await;
+        assert_eq!(rejected["moved"], true, "{rejected}");
+        assert_eq!(
+            rejected["in_force"], false,
+            "否决的东西不能报成生效：{rejected}"
+        );
+        assert!(account.in_force().await.unwrap().is_empty());
+
+        let again = call(&tools, PROPOSE_PRINCIPLE, proposal("build-before-merge")).await;
+        assert_eq!(
+            again["proposed"], true,
+            "被否决的名字提不上来第二次：{again}"
+        );
+        assert_eq!(
+            account.state_of("build-before-merge"),
+            Some(cog_core::RuntimePrincipleState::Proposed)
+        );
+    }
+
+    /// 生效中的规则不能被同一行静默改写：提不进去，而且说的是为什么。
+    ///
+    /// 改一条原则是「先提新的、批了再撤旧的」。允许第二次提案覆盖，就等于允许任何人
+    /// 不经拍板改掉一条属主批过的规则，而账上看不出它被改过。
+    #[tokio::test]
+    async fn a_live_rule_is_not_overwritten_by_proposing_the_same_slug_again() {
+        let account = Arc::new(FakePrinciples::default());
+        let tools = principle_tools(Some(account.clone()), "E0412".into(), true);
+
+        call(&tools, PROPOSE_PRINCIPLE, proposal("build-before-merge")).await;
+        call(
+            &tools,
+            APPROVE_PRINCIPLE,
+            serde_json::json!({ "slug": "build-before-merge" }),
+        )
+        .await;
+        let answer = call(
+            &tools,
+            PROPOSE_PRINCIPLE,
+            serde_json::json!({
+                "slug": "build-before-merge",
+                "trigger": "任何时候",
+                "criterion": "我说了算",
+                "action": "照新的做"
+            }),
+        )
+        .await;
+
+        assert_eq!(answer["proposed"], false, "{answer}");
+        assert_eq!(answer["refused"], "not_filed", "{answer}");
+        assert!(
+            answer["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Conflict")
+                || answer["note"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("已经是"),
+            "没有说出账拒绝它的理由：{}",
+            answer["note"]
+        );
+        let live = account.in_force().await.unwrap();
+        assert_eq!(live[0].criterion, "构建是不是绿的", "生效的那一版被改了");
+    }
+
+    /// 没有登录身份的连接批准不了任何东西：那两只工具根本不注册。
+    ///
+    /// 注册了也挡不住模型去调；账上会多出一行「由一位员工替属主做的决定」，而
+    /// 读账的人分不出它和真的拍板。
+    #[test]
+    fn a_connection_without_a_login_identity_cannot_decide() {
+        let account = Arc::new(FakePrinciples::default());
+        for owner_present in [false, true] {
+            let names: Vec<String> =
+                principle_tools(Some(account.clone()), "E0412".into(), owner_present)
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect();
+            if owner_present {
+                assert_eq!(
+                    names,
+                    vec![
+                        LIST_RUNTIME_PRINCIPLES.to_string(),
+                        PROPOSE_PRINCIPLE.to_string(),
+                        APPROVE_PRINCIPLE.to_string(),
+                        REJECT_PRINCIPLE.to_string()
+                    ],
+                    "有人在的时候四只都在"
+                );
+            } else {
+                assert_eq!(
+                    names,
+                    vec![
+                        LIST_RUNTIME_PRINCIPLES.to_string(),
+                        PROPOSE_PRINCIPLE.to_string()
+                    ],
+                    "没有人的连接拿到了拍板工具：{names:?}"
+                );
+            }
+        }
+    }
+
+    /// 拍一条不在账上等着拍的提案：动没动要分开说，不能报成「批了」。
+    ///
+    /// 重复调用、名字写错、已经批过——三种情况账上都回「没动」。把它们回成成功，
+    /// 模型就会对属主说「已经批准了」，而生效集里没有这一条。
+    #[tokio::test]
+    async fn deciding_a_slug_that_is_not_waiting_does_not_claim_it_moved() {
+        let account = Arc::new(FakePrinciples::default());
+        let tools = principle_tools(Some(account.clone()), "E0412".into(), true);
+
+        let answer = call(
+            &tools,
+            APPROVE_PRINCIPLE,
+            serde_json::json!({ "slug": "never-proposed" }),
+        )
+        .await;
+
+        assert_eq!(answer["moved"], false, "{answer}");
+        assert_eq!(answer["in_force"], false, "{answer}");
+        assert!(
+            answer["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不要宣布"),
+            "没有提醒它别宣布生效：{}",
+            answer["note"]
+        );
+    }
+
+    /// 账缺席时两只工具都如实说「读不到」，不假装提案成功或拍板成功。
+    ///
+    /// 与三本只读账同一句口径：把缺席说成「没有」会让这条活谁也不会再去问。
+    #[tokio::test]
+    async fn an_absent_account_says_it_cannot_read_rather_than_filing_anything() {
+        let tools = principle_tools(None, "E0412".into(), true);
+        for (name, args) in [
+            (LIST_RUNTIME_PRINCIPLES, serde_json::json!({})),
+            (PROPOSE_PRINCIPLE, proposal("build-before-merge")),
+            (
+                APPROVE_PRINCIPLE,
+                serde_json::json!({ "slug": "build-before-merge" }),
+            ),
+            (
+                REJECT_PRINCIPLE,
+                serde_json::json!({ "slug": "build-before-merge" }),
+            ),
+        ] {
+            let answer = call(&tools, name, args).await;
+            assert_eq!(answer["available"], false, "{name}: {answer}");
+            assert!(
+                answer["note"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("读不到"),
+                "{name} 把账缺席说成了别的什么：{}",
+                answer["note"]
+            );
+        }
     }
 }
