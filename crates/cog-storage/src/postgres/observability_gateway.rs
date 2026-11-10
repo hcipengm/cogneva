@@ -832,8 +832,9 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
         // 增量，而它们一条也翻不完。它同时把容量上限变成天花板上的滑动门——表按行数
         // 封顶，增量占八成，别的读窗口就被挤到最小值。
         //
-        // 工具进度增量（`ToolExecutionUpdate`）形状相同，但今天没有量：先按量到的
-        // 那一条改，不替没量过的通路拍板。
+        // 工具进度增量（`ToolExecutionUpdate`）形状相同，但还没有量过它的量：运行时
+        // 自 2026-11-11 起在命令运行中按节拍发出这种帧，一天里到底多少条要读集群的
+        // 数才知道。先按量到的那一条改，不替没量过的通路拍板。
         if matches!(event, AgentEvent::MessageUpdate { .. }) {
             return;
         }

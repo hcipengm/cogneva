@@ -36,6 +36,40 @@ const CALLS_WITHOUT_CHANGE: u32 = 40;
 // cap: bound — 一条提示本身也要付一次回合，且落地会作废它之后的缓存前缀；两次之后不再打断
 const NOTHING_CHANGED_NOTES: u32 = 2;
 
+/// 一条还在跑的工具调用，多久把攒下的输出往外发一次。
+///
+/// 执行器交上来的切片大小不受我们控制：一条 `cargo build` 的进度可能几十毫秒
+/// 一行，整份日志在十分钟里能到几万行。每一片发一帧的话，这场构建会在 WAL、
+/// WebSocket 和界面上各变成几万条记录，而读的人要看的只是「它还在动、动到哪
+/// 了」。攒到一个节拍再发，滚动的观感不变，帧数按节拍被削掉。这个数是给人眼
+/// 看的：比它慢，界面看上去像卡住了；比它快，一屏之内叠着好几帧还没读完。
+// cap: bound — 界面那一格的刷新节奏是人的阅读节奏：比这快，几帧挤在一起还没读完就滚过去了
+const TOOL_UPDATE_FLUSH: Duration = Duration::from_millis(200);
+
+/// 一帧进度最多带多少字符。
+///
+/// 界面上一条工具调用留的是一格，不是一份日志：那一格只留最后 8000 字符，超过
+/// 这个量的帧到了那里也只剩下尾巴。在这里就裁，省下的是总线和 WAL 上的字节，
+/// 读的人看到的东西一点不少。
+// cap: bound — 与界面那一格的窗口同源：更长的帧到了读者那里一样只剩尾巴
+const TOOL_UPDATE_CHARS: usize = 8_000;
+
+/// 把一段新输出接在进度的尾巴上，超出这一帧的容量时丢掉最旧的那一段。
+///
+/// 撞到界时丢开头而不是丢结尾：读的人要的是「它刚说了什么」。开头早在上一个
+/// 节拍就发出去过，把它留在这里只会让这一帧更重，而不会让谁多看到一个字。
+fn note_tool_update(partial: &mut String, chunk: &str) {
+    partial.push_str(chunk);
+    if partial.len() > TOOL_UPDATE_CHARS {
+        let mut cut = partial.len() - TOOL_UPDATE_CHARS;
+        // 字符边界：一段 UTF-8 从中间切开，那条帧在界面上就是一个替换符
+        while !partial.is_char_boundary(cut) {
+            cut += 1;
+        }
+        partial.drain(..cut);
+    }
+}
+
 /// 这条运行该不该被「一直在读、没动过树」收住。
 ///
 /// 先得这件活自己声称要动这棵树：没有这份声明时，「工作树没动」不构成任何证据
@@ -2654,21 +2688,70 @@ impl AgentRuntime {
                     task_id: tid.to_string(),
                     agent_id: self.config.agent_id.clone(),
                 });
+                // What the tool says while it runs. The executor hands its output
+                // over in whatever slices it read, and one frame per slice would
+                // turn a long build into tens of thousands of records on the
+                // bus, in the WAL and in the panel. They are gathered here and
+                // sent on a beat instead: the same stream to the reader, fewer
+                // frames, each carrying everything since the last one.
+                let (update_tx, mut update_rx) = mpsc::unbounded_channel::<String>();
+                let sink: crate::tools::ToolUpdateSink = {
+                    let update_tx = update_tx.clone();
+                    Arc::new(move |chunk: &str| {
+                        // The receiver is the select loop below, which lives
+                        // through every chunk this call will produce. A send
+                        // that fails means the call is already over and there
+                        // is nobody left to show it to.
+                        let _ = update_tx.send(chunk.to_string());
+                    })
+                };
+                let mut partial = String::new();
+                let mut last_flush = tokio::time::Instant::now();
                 // The tool is shared by every agent in this process, so the
                 // handler cannot tell whose call this is unless the dispatcher
                 // says so. It is named around the await rather than passed in:
                 // the handler signature is the same for every native tool, and
                 // only the addressing tools need a caller.
-                let checked = crate::tools::CALLER_AGENT_ID
-                    .scope(
-                        self.config.agent_id.clone(),
-                        self.tools.execute_scoped_checked(
-                            &tc.name,
-                            tc.arguments.clone(),
-                            scope.as_ref(),
-                        ),
-                    )
-                    .await;
+                let mut call = Box::pin(crate::tools::CALLER_AGENT_ID.scope(
+                    self.config.agent_id.clone(),
+                    self.tools.execute_scoped_streaming(
+                        &tc.name,
+                        tc.arguments.clone(),
+                        scope.as_ref(),
+                        Some(&sink),
+                    ),
+                ));
+                let checked = loop {
+                    tokio::select! {
+                        res = &mut call => break res,
+                        Some(chunk) = update_rx.recv() => {
+                            note_tool_update(&mut partial, &chunk);
+                            if last_flush.elapsed() >= TOOL_UPDATE_FLUSH {
+                                self.flush_tool_update(&tc.id, &mut partial).await?;
+                                last_flush = tokio::time::Instant::now();
+                            }
+                        }
+                        // Armed only while something is waiting to be shown: a
+                        // call that has said nothing needs no beat, and an idle
+                        // timer on every native call would be work for nobody.
+                        _ = tokio::time::sleep_until(last_flush + TOOL_UPDATE_FLUSH),
+                            if !partial.is_empty() => {
+                            self.flush_tool_update(&tc.id, &mut partial).await?;
+                            last_flush = tokio::time::Instant::now();
+                        }
+                    }
+                };
+                // The call is over; whatever it said last still has to reach the
+                // reader, and it has to arrive before the end frame that replaces
+                // it. Dropping the tool future first closes the only sender left,
+                // so the drain below sees every chunk the call ever sent.
+                drop(call);
+                drop(sink);
+                drop(update_tx);
+                while let Some(chunk) = update_rx.recv().await {
+                    note_tool_update(&mut partial, &chunk);
+                }
+                self.flush_tool_update(&tc.id, &mut partial).await?;
 
                 // A guardrail refusal is not a tool failure. A failed tool might
                 // succeed on a retry; a refusal cannot, because the rule that
@@ -3551,6 +3634,24 @@ impl AgentRuntime {
                 "run failure could not be announced on the bus"
             );
         }
+    }
+
+    /// 把攒下的输出作为一帧进度发上总线，然后清空缓冲。
+    ///
+    /// 空缓冲不发：界面上一次空的进度，读起来像「这次调用刚开了个头」，而它
+    /// 其实只是这个节拍里没有新的话。
+    async fn flush_tool_update(&self, tool_call_id: &str, partial: &mut String) -> SFResult<()> {
+        if partial.is_empty() {
+            return Ok(());
+        }
+        let text = std::mem::take(partial);
+        self.emit_event(AgentEvent::ToolExecutionUpdate {
+            agent_id: self.config.agent_id.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            partial_result: serde_json::Value::String(text),
+            timestamp: chrono::Utc::now(),
+        })
+        .await
     }
 
     async fn emit_event(&self, event: AgentEvent) -> SFResult<()> {
@@ -6943,6 +7044,221 @@ mod tests {
         async fn health_check(&self) -> bool {
             true
         }
+    }
+
+    /// 一条命令还在跑的时候，它已经说出口的话经总线往外走了。
+    ///
+    /// 判据要落在「命令结束之前」这一条上，不是「事件里有一帧进度」：等到结束
+    /// 才把攒下的全文当一帧发出去，界面上同样是两帧——开始、结束，中间那段空白
+    /// 与「它还活着但什么都没说」完全一样，而那正是这个功能要分开的两种状况。
+    /// 所以这里让执行器在第一段输出之后停四拍再给第二段，并要求第一帧进度里
+    /// 只有第一段。
+    #[tokio::test]
+    async fn a_running_command_reports_what_it_has_already_said() {
+        /// 第一轮要一条命令，第二轮收工。
+        struct RunThenAnswer;
+
+        #[async_trait::async_trait]
+        impl cog_core::LlmClient for RunThenAnswer {
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                // 这里没有可变状态：调用次数记在流的生产者里没有意义，所以判据
+                // 用「消息里已经有工具结果」来决定这一轮是不是最后一轮。
+                let answered = messages
+                    .iter()
+                    .any(|m| matches!(m, Message::ToolResult { .. }));
+                let (stream, producer) = cog_core::EventStream::with_capacity(4);
+                tokio::spawn(async move {
+                    let mut producer = producer;
+                    let content = if answered {
+                        vec![ContentBlock::Text {
+                            text: r#"{"done":true}"#.into(),
+                            text_signature: None,
+                        }]
+                    } else {
+                        vec![ContentBlock::tool_call(
+                            "call-chatty",
+                            "run_command",
+                            serde_json::json!({ "command": "echo first; sleep 0.1; echo second" }),
+                        )]
+                    };
+                    let _ = producer
+                        .push(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: String::new(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                    producer.end(cog_core::ChatResponse {
+                        content,
+                        api: "mock".into(),
+                        provider: "mock".into(),
+                        model: "mock".into(),
+                        response_id: None,
+                        usage: cog_core::Usage::default(),
+                        stop_reason: cog_core::StopReason::Stop,
+                        error_message: None,
+                        upstream_failure: None,
+                        retry_after_secs: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                });
+                Ok(stream)
+            }
+
+            async fn complete_stream(
+                &self,
+                _prompt: &str,
+                _options: &cog_core::CompleteOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                unimplemented!()
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::ChatResponse> {
+                unimplemented!()
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        struct Chatty;
+
+        #[async_trait::async_trait]
+        impl cog_core::SandboxBackend for Chatty {
+            async fn execute(
+                &self,
+                _req: &cog_core::SandboxRequest,
+            ) -> SFResult<cog_core::SandboxResult> {
+                Ok(cog_core::SandboxResult {
+                    stdout: "first\nsecond\n".into(),
+                    exit_code: 0,
+                    ..Default::default()
+                })
+            }
+
+            async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
+                Err(SFError::Agent("no wasm in this test".into()))
+            }
+
+            async fn execute_stream(
+                &self,
+                _req: &cog_core::SandboxRequest,
+            ) -> SFResult<cog_core::CommandEventStream> {
+                let steps = vec![
+                    (
+                        Duration::ZERO,
+                        cog_core::CommandEvent::Stdout {
+                            data: "first\n".into(),
+                        },
+                    ),
+                    // 比节拍长得多的一段沉默：一整条命令的中间，而不是两行之间
+                    (
+                        TOOL_UPDATE_FLUSH * 4,
+                        cog_core::CommandEvent::Stdout {
+                            data: "second\n".into(),
+                        },
+                    ),
+                    (Duration::ZERO, cog_core::CommandEvent::Exit { code: 0 }),
+                ];
+                Ok(Box::pin(futures::stream::unfold(
+                    (steps, 0usize),
+                    |(steps, index)| async move {
+                        let (pause, event) = steps.get(index)?.clone();
+                        if !pause.is_zero() {
+                            tokio::time::sleep(pause).await;
+                        }
+                        Some((event, (steps, index + 1)))
+                    },
+                )))
+            }
+        }
+
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(
+            &registry,
+            cog_core::Tool {
+                name: "run_command".into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+                implementation: cog_core::ToolImplementation::Shell(cog_core::ShellOp::Command),
+            },
+        );
+        let registry = registry.with_sandbox_backend(Arc::new(Chatty));
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "chatty-0001".into(),
+            max_iterations: 4,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        let llm = RunThenAnswer;
+        runtime
+            .run_scoped(serde_json::json!({ "task": "talk" }), &llm, Some("chatty"))
+            .await
+            .expect("the run reaches its answer");
+        // 运行自己握着总线的写端：不先放掉它，下面那次 recv 永远等不到 None。
+        drop(runtime);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        let start = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
+            .expect("the call started");
+        let end = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .expect("the call ended");
+        let updates: Vec<(usize, &str)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                AgentEvent::ToolExecutionUpdate {
+                    tool_call_id,
+                    partial_result,
+                    ..
+                } => {
+                    assert_eq!(
+                        tool_call_id, "call-chatty",
+                        "进度的 id 是界面拿来对上那一格的键，它必须是这次调用的"
+                    );
+                    partial_result.as_str().map(|text| (index, text))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !updates.is_empty(),
+            "命令跑了几百毫秒，总线上却一帧进度都没有：开始与结束之间是空的，\
+             读的人分不出它在干活还是卡住了"
+        );
+        assert!(
+            updates.first().unwrap().0 > start && updates.last().unwrap().0 < end,
+            "进度必须落在这次调用的开始与结束之间，否则界面收到的是一个没有归处的格子"
+        );
+        assert_eq!(
+            updates[0].1, "first\n",
+            "第一帧进度只该带第一段：带着全文说明它是命令结束后才发出的那一帧"
+        );
+        let said: String = updates.iter().map(|(_, text)| *text).collect();
+        assert_eq!(
+            said, "first\nsecond\n",
+            "几帧进度按顺序拼起来，就是这条命令说过的全部"
+        );
     }
 
     #[tokio::test]

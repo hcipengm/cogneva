@@ -68,6 +68,13 @@ pub struct ToolScope {
     pub agent_id: String,
 }
 
+/// 一次还在跑的工具调用往哪儿说话。
+///
+/// 同步的回调而不是一路 channel：调用点在执行器的读循环里，它要的只是「把这
+/// 一段交出去，别等我」。回调本身必须不阻塞——攒帧与节流是派发器的事，工具
+/// 只负责把执行器说的原样说出来。
+pub type ToolUpdateSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 tokio::task_local! {
     /// The agent whose run is making the tool call on this task.
     ///
@@ -475,6 +482,31 @@ impl ToolRegistry {
         arguments: serde_json::Value,
         scope: Option<&ToolScope>,
     ) -> Result<serde_json::Value, ToolRunError> {
+        self.execute_scoped_streaming(name, arguments, scope, None)
+            .await
+    }
+
+    /// The same execution, with somewhere for a still-running tool to say how
+    /// it is going.
+    ///
+    /// A command can run for minutes. Until it ends it has no result, and the
+    /// caller that is watching it has nothing to watch — which is how a run that
+    /// is working and a run that is stuck look the same. The sink is called with
+    /// whatever the executor hands over, as it hands it over: the decision to
+    /// coalesce, throttle or drop belongs to whoever dispatched the call, not to
+    /// the tool, because only the dispatcher knows how expensive a frame is on
+    /// its way to the reader.
+    ///
+    /// Only the shell path streams. A native tool's handler is a single future
+    /// with no output until it resolves, and inventing progress for one would
+    /// mean a tool reporting what it has not produced.
+    pub async fn execute_scoped_streaming(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        scope: Option<&ToolScope>,
+        updates: Option<&ToolUpdateSink>,
+    ) -> Result<serde_json::Value, ToolRunError> {
         let tool = self
             .tools
             .read()
@@ -812,11 +844,26 @@ impl ToolRegistry {
                 // 它不在提示词里，因为只有执行器那台机器知道车道名对应哪条路径；
                 // 不回给模型，模型就得再跑一条 `pwd` 才知道自己在哪。
                 let mut workdir = None;
+                // 一条命令在跑的时候，它的话已经在往外走了：执行器每读到一段就
+                // 交一段出来。这一段同时去两个地方——攒进最终结果，和交给派发器
+                // 让还在等的人先看见。只有 `Command` 往外说：`read_file` 的正文
+                // 本来就是结果本身，提前发一遍等于把同一份内容在总线上放两份。
+                let updates = updates.filter(|_| matches!(op, cog_core::ShellOp::Command));
                 while let Some(event) = stream.next().await {
                     match event {
                         CommandEvent::Workdir { path } => workdir = Some(path),
-                        CommandEvent::Stdout { data } => stdout.push_str(&data),
-                        CommandEvent::Stderr { data } => stderr.push_str(&data),
+                        CommandEvent::Stdout { data } => {
+                            stdout.push_str(&data);
+                            if let Some(sink) = updates {
+                                sink(&data);
+                            }
+                        }
+                        CommandEvent::Stderr { data } => {
+                            stderr.push_str(&data);
+                            if let Some(sink) = updates {
+                                sink(&data);
+                            }
+                        }
                         CommandEvent::Exit { code: c } => code = c,
                     }
                 }
