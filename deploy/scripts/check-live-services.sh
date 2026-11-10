@@ -91,9 +91,10 @@ if [ "${#missing[@]}" -gt 0 ]; then
     exit 2
 fi
 
-# 指向的必须是测试库，不是业务库。清单里有几条一上来就 `DELETE FROM cog_dag_tasks`，
-# 指错了就是把线上数据当 playground——而这一步做错的时候，什么都不会红：那些用例
-# 清完表照样通过。所以判据放在最前面：库名里要有 `test`，没有就拒绝跑。
+# 指向的必须是测试库，不是业务库。清单里有几条一上来就清空整张任务账本
+# （`clear_task_ledger`：定义、状态迁移、投影、尝试四张表），指错了就是把线上数据
+# 当 playground——而这一步做错的时候，什么都不会红：那些用例清完表照样通过。
+# 所以判据放在最前面：库名里要有 `test`，没有就拒绝跑。
 #
 # 这条判据在 CI 与沙箱两侧指的是同一件事，因为两边的库同名（`cogneva_test`）：
 # CI 的 postgres 服务容器按 `POSTGRES_DB` 建它，沙箱的由 `db-role-bootstrap` 建。
@@ -734,9 +735,11 @@ live_check db 'Live-DB taste intent claims' cargo test -p cog-storage --test tas
 live_check db 'Live-DB task work samples' cargo test -p cog-storage --test task_kind_samples -- --ignored --test-threads=1
 # The status census is one GROUP BY plus a branch that decides what a
 # status string this build cannot name does to the total; neither is
-# visible without a server. It runs last because it empties the task
-# table on entry and exit.
-live_check db 'Live-DB task status census' cargo test -p cog-storage --test task_status_counts -- --ignored
+# visible without a server. One test at a time: the census counts every
+# workspace and expects exactly the rows it seeded, so a neighbour in the
+# same binary seeding four more while it counts turns a correct answer
+# into a wrong one.
+live_check db 'Live-DB task status census' cargo test -p cog-storage --test task_status_counts -- --ignored --test-threads=1
 # Whether a ledger row that names something counts as attributed is a
 # `NOT EXISTS` against the task graph, so only a server can answer it. It
 # writes its rows into 2001 and deletes them, so it neither reads nor

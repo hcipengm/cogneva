@@ -20,13 +20,19 @@
 //!   cargo test -p cog-storage --test task_status_counts -- --ignored
 //! ```
 //!
-//! It clears the task table first, so the database is left as it was found.
+//! Each case clears what it is about to write before and after itself. The
+//! cluster-wide census empties the whole ledger first: it counts every
+//! workspace, so a row left behind by anyone else would change its answer.
 
 use cog_core::{StateBackend, TaskStatus, TaskStatusCounts, TaskType};
 use cog_storage::PostgresStateBackend;
 use sqlx::PgPool;
 
 use cog_test_support::database_url;
+
+/// The workspaces the narrow census writes into, named once so the cleanup
+/// cannot drift from the rows it is meant to remove.
+const NARROW_WORKSPACES: [&str; 2] = ["ws-narrow-1", "ws-narrow-2"];
 
 fn task(id: &str, status: TaskStatus) -> cog_core::Task {
     let mut task = cog_core::Task::new(
@@ -114,17 +120,18 @@ async fn a_workspace_census_counts_by_state_and_returns_only_the_states_asked_fo
         .expect("connect to the test database");
     let backend = PostgresStateBackend::new(pool.clone());
     backend.init_schema().await.expect("create the task schema");
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
-        .await
-        .expect("clear the task table");
+    for workspace in NARROW_WORKSPACES {
+        cog_test_support::clear_task_ledger_for(&pool, workspace)
+            .await
+            .expect("clear this test's workspaces");
+    }
 
     for (workspace, id, status) in [
-        ("ws-narrow-1", "n-1", TaskStatus::Running),
-        ("ws-narrow-1", "n-2", TaskStatus::Pending),
-        ("ws-narrow-1", "n-3", TaskStatus::Completed),
+        (NARROW_WORKSPACES[0], "n-1", TaskStatus::Running),
+        (NARROW_WORKSPACES[0], "n-2", TaskStatus::Pending),
+        (NARROW_WORKSPACES[0], "n-3", TaskStatus::Completed),
         // 另一棵树里的行：分组少了工作区条件会把它数进 ws-narrow-1。
-        ("ws-narrow-2", "n-4", TaskStatus::Running),
+        (NARROW_WORKSPACES[1], "n-4", TaskStatus::Running),
     ] {
         backend
             .dag_set_task(workspace, id, &task(id, status))
@@ -158,8 +165,9 @@ async fn a_workspace_census_counts_by_state_and_returns_only_the_states_asked_fo
         "点名的两个状态之外一行都不该回来"
     );
 
-    sqlx::query("DELETE FROM cog_dag_tasks")
-        .execute(&pool)
-        .await
-        .expect("leave the table as it was found");
+    for workspace in NARROW_WORKSPACES {
+        cog_test_support::clear_task_ledger_for(&pool, workspace)
+            .await
+            .expect("leave the ledger as it was found");
+    }
 }

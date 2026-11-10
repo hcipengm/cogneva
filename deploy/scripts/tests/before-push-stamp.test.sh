@@ -364,6 +364,9 @@ case "\$1" in
 esac
 SH
 chmod +x "${ftree}/bin/cargo"
+# pwsh 那一格只在装了 pwsh 的机器上跑（没装就 SKIP），所以夹具缺这个文件时本机照绿、
+# CI 上一跑就红。真仓库里它永远在，夹具得连它一起造齐。
+printf 'Write-Host "fixture"\n' >"${ftree}/bootstrap.ps1"
 printf '#!/usr/bin/env bash\nexit 0\n' >"${ftree}/nothing.sh"
 printf '[workspace]\nmembers = ["crates/foo"]\n' >"${ftree}/Cargo.toml"
 printf '[package]\nname = "foo"\nversion = "0.0.0"\nedition = "2021"\n' >"${ftree}/crates/foo/Cargo.toml"
@@ -382,7 +385,7 @@ YAML
     git config user.email gate@example.invalid
     git config user.name gate
     printf 'one\n' >tracked.txt
-    git add tracked.txt nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
+    git add tracked.txt bootstrap.ps1 nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
         .github/workflows/ci.yml deploy/scripts/tests/ok.test.sh \
         .github/scripts/tests/ok.test.sh deploy/scripts/check-before-push.sh \
         deploy/scripts/lib/build-slot.sh
@@ -428,6 +431,9 @@ case "\$1" in
 esac
 SH
 chmod +x "${ctree}/bin/cargo"
+# pwsh 那一格只在装了 pwsh 的机器上跑（没装就 SKIP），所以夹具缺这个文件时本机照绿、
+# CI 上一跑就红。真仓库里它永远在，夹具得连它一起造齐。
+printf 'Write-Host "fixture"\n' >"${ctree}/bootstrap.ps1"
 printf '#!/usr/bin/env bash\nexit 0\n' >"${ctree}/nothing.sh"
 printf '[workspace]\nmembers = ["crates/foo"]\n' >"${ctree}/Cargo.toml"
 printf '[package]\nname = "foo"\nversion = "0.0.0"\nedition = "2021"\n' >"${ctree}/crates/foo/Cargo.toml"
@@ -446,7 +452,7 @@ YAML
     git config user.email gate@example.invalid
     git config user.name gate
     printf 'one\n' >tracked.txt
-    git add tracked.txt nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
+    git add tracked.txt bootstrap.ps1 nothing.sh Cargo.toml crates/foo/Cargo.toml crates/foo/src/lib.rs \
         .github/workflows/ci.yml deploy/scripts/tests/ok.test.sh \
         .github/scripts/tests/ok.test.sh deploy/scripts/check-before-push.sh \
         deploy/scripts/lib/build-slot.sh
@@ -513,6 +519,9 @@ case "$1" in
 esac
 SH
 chmod +x "${rtree}/bin/cargo"
+# pwsh 那一格只在装了 pwsh 的机器上跑（没装就 SKIP），所以夹具缺这个文件时本机照绿、
+# CI 上一跑就红。真仓库里它永远在，夹具得连它一起造齐。
+printf 'Write-Host "fixture"\n' >"${rtree}/bootstrap.ps1"
 printf '#!/usr/bin/env bash\nexit 0\n' >"${rtree}/nothing.sh"
 cat >"${rtree}/.github/workflows/ci.yml" <<'YAML'
 name: ci
@@ -528,7 +537,7 @@ YAML
     git config user.email gate@example.invalid
     git config user.name gate
     printf 'one\n' >tracked.txt
-    git add tracked.txt nothing.sh .github/workflows/ci.yml \
+    git add tracked.txt bootstrap.ps1 nothing.sh .github/workflows/ci.yml \
         crates/cogneva/tests/rust_capacity_constants_registry_test.rs \
         deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
         deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
@@ -598,7 +607,10 @@ YAML
     git config user.name gate
     printf 'one\n' >tracked.txt
     printf '#!/usr/bin/env bash\nexit 0\n' >nothing.sh
-    git add tracked.txt nothing.sh .github/workflows/ci.yml \
+    # pwsh 那一格只在装了 pwsh 的机器上跑（没装就 SKIP），所以夹具缺这个文件时本机照绿、
+    # CI 上一跑就红。真仓库里它永远在，夹具得连它一起造齐。
+    printf 'Write-Host "fixture"\n' >bootstrap.ps1
+    git add tracked.txt bootstrap.ps1 nothing.sh .github/workflows/ci.yml \
         deploy/scripts/tests/ok.test.sh .github/scripts/tests/ok.test.sh \
         deploy/scripts/check-before-push.sh deploy/scripts/lib/build-slot.sh
     git commit -q -m base

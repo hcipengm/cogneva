@@ -154,10 +154,19 @@ async fn the_venue_read_is_a_lookup_and_returns_the_labeled_rows() {
     // The labeled rows go in through the store, not as hand-built JSON: these
     // are the rows the read has to deserialize, and a field missing from a
     // literal here would be this test's bug rather than the store's.
+    //
+    // The ids are this probe's own (`vi-`), not the venue board's (`v-done`
+    // and friends). A task id is unique across the whole ledger, not per
+    // workspace -- the primary key is `(task_id, rev)` -- so a neighbour
+    // writing the same id under its own workspace collides on the ledger even
+    // though both probes scope their cleanup to themselves. That collision is
+    // exactly what a shared test database turned into a duplicate-key failure
+    // here on 2026-11-10, while the same file was green on a database that
+    // happened to be empty at that moment.
     for (id, venue, status) in [
-        ("v-done", "memory", TaskStatus::Completed),
-        ("v-running", "memory", TaskStatus::Running),
-        ("v-failed", "wiki", TaskStatus::Failed),
+        ("vi-done", "memory", TaskStatus::Completed),
+        ("vi-running", "memory", TaskStatus::Running),
+        ("vi-failed", "wiki", TaskStatus::Failed),
     ] {
         let mut task = Task::new(id, TaskType::DagNode, serde_json::json!({}));
         task.venue = Some(venue.to_string());
@@ -199,7 +208,7 @@ async fn the_venue_read_is_a_lookup_and_returns_the_labeled_rows() {
         .map(|task| task.id)
         .collect();
     read.sort();
-    assert_eq!(read, vec!["v-done", "v-failed", "v-running"]);
+    assert_eq!(read, vec!["vi-done", "vi-failed", "vi-running"]);
 
     clear_probe(&pool).await;
 }
