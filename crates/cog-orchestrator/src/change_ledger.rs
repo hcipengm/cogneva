@@ -7379,40 +7379,37 @@ fn handovers_for_this_pass(verdict: &PoolVerdict, ceiling: usize) -> BatchBound 
         };
     };
     // The same derivation the ready-queue publisher uses, so the two dispatch
-    // paths cannot size their batches by different rules. It also carries the
-    // guard this file used to lack: a pace summed over a subset of the pool is
-    // not a bound for the pool.
-    let Some(fits) =
-        crate::ready_queue::jobs_the_window_can_pay_for(&pace, verdict.measurable_pool_size)
-    else {
+    // paths cannot size their batches by different rules. A pace summed over a
+    // subset of the pool is a lower bound on what the pool can pay for, and a
+    // lower bound is what bounds this batch -- the hour of 2026-11-10 14:48 is
+    // what the other reading cost, when `partial_pool` meant the ceiling and a
+    // measured 1-of-2 pool at allowance zero handed over 154 changes.
+    let Some(fits) = crate::ready_queue::jobs_the_window_can_pay_for(&pace) else {
         // `window_pace` is only set when at least one upstream was measured, so
-        // the remaining ways to get no bound are a missing job cost and a
-        // measurement that covers fewer upstreams than the pool has. They are
-        // different operational facts: the first says the ledger of finished
-        // jobs is too thin to price one, the second says the pool is degraded.
-        let reason = if pace.reserve_tokens == 0 {
-            "no_reserve"
-        } else {
-            "partial_pool"
-        };
+        // the only way left to get no bound is a ledger of finished jobs too
+        // thin to price one; that is a different operational fact from a
+        // degraded pool and is named as one.
         return BatchBound {
             budget: ceiling,
-            reason,
+            reason: "no_reserve",
         };
     };
+    // The subset the bound was derived from travels with it: a bound that
+    // covers part of the pool is still a bound, but a reader deciding whether
+    // to repair the pool or tune the allowance has to be told which one this
+    // batch was sized against.
+    let covers_the_pool = pace.measured_upstreams >= verdict.measurable_pool_size;
     // The cast cannot lose a real batch: `ceiling` is single digits in the
     // hundreds and `fits` only matters below it, so saturating at `ceiling`
     // first keeps a huge remaining allowance from wrapping anything.
-    if fits >= ceiling as u64 {
-        BatchBound {
-            budget: ceiling,
-            reason: "ceiling",
-        }
+    let (budget, reason) = if fits >= ceiling as u64 {
+        (ceiling, "ceiling")
     } else {
-        BatchBound {
-            budget: fits as usize,
-            reason: "window",
-        }
+        (fits as usize, "window")
+    };
+    BatchBound {
+        budget,
+        reason: if covers_the_pool { reason } else { "partial_pool" },
     }
 }
 
@@ -9576,9 +9573,12 @@ mod tests {
             (0, "window")
         );
 
-        // A pace summed over one member of a three-upstream pool is not a bound
-        // for the pool: the other two were never measured, so nothing says the
-        // batch they would serve is refused. The ceiling stands.
+        // A pace summed over one member of a three-upstream pool bounds the
+        // batch by what that member can pay for, and the line says the bound
+        // covers part of the pool. The other reading -- the ceiling, because a
+        // subset "says nothing" -- is the one that spent 2026-11-10 14:48 to
+        // 15:34: 154 handovers, ¥95.87, three products, against a measured
+        // 1-of-2 pool whose allowance was already zero.
         let partial_pool = LlmPoolStatus {
             pace: LlmWindowPace {
                 measured_upstreams: 1,
@@ -9594,7 +9594,7 @@ mod tests {
         };
         assert_eq!(
             bound(&pool_verdict(Some(&partial_pool), now, 300), 200),
-            (200, "partial_pool")
+            (0, "partial_pool")
         );
     }
 
