@@ -134,7 +134,7 @@ use cog_core::contract::llm::UpstreamFailure;
 use cog_core::contract::outcome::FailureCause;
 use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
-use crate::change_measure::{CheckOutcome, CheckTree, Snapshot, UnsettledReason, GREP_KIND};
+use crate::change_measure::{CheckOutcome, CheckTree, Reach, Snapshot, UnsettledReason, GREP_KIND};
 use crate::principle_measure::HOST_REGISTRY_READ_NO_GATE;
 
 /// This loop's name in the process liveness registry, and the value of
@@ -4843,6 +4843,48 @@ impl InEffectReading {
     }
 }
 
+/// Which side of the running revision's line one landing revision falls on.
+///
+/// The split the pass publishes and the per-row answer a reader asks "which of
+/// them" are the same question, so they are asked once, here, rather than once
+/// as a count and once as a set. Two answers and not three: a row the account
+/// holds no landing revision for has nothing to place, and that is a property of
+/// the row -- decided before this is asked -- while both of these are properties
+/// of a revision the row does carry.
+///
+/// The side is read off the ancestor set, not off the order the revisions were
+/// written in: a landing revision is on the line exactly when the running
+/// revision descends from it, and a revision on another branch, in a history that
+/// was rewritten, or in a repository this one was never given is off it -- which
+/// is one answer here because it is one fact to the image that either carries the
+/// commit or does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandedSide {
+    /// The running revision descends from the commit the change landed at.
+    InLine,
+    /// The running revision does not carry the commit the change landed at.
+    OffLine,
+}
+
+impl LandedSide {
+    /// The label this side is named by when a row's placement is written down.
+    fn as_str(self) -> &'static str {
+        match self {
+            LandedSide::InLine => "in-line",
+            LandedSide::OffLine => "off-line",
+        }
+    }
+}
+
+/// Which side of `reach`'s line `landed_rev` falls on.
+fn landed_side(reach: &Reach, landed_rev: &str) -> LandedSide {
+    if reach.contains(landed_rev) {
+        LandedSide::InLine
+    } else {
+        LandedSide::OffLine
+    }
+}
+
 /// Check the account's landed rows against the revision the workloads are
 /// running.
 ///
@@ -4997,13 +5039,19 @@ async fn live_revision_pass(
         };
         still_landed.insert(identity.clone());
         checked += 1;
-        if reach.contains(landed_rev) {
+        // Asked through the classifier rather than with `reach.contains` here,
+        // so that the per-row answer this pass acts on and the one it names are
+        // one question: two spellings of "is this on the line" is how a count
+        // and the names it publishes come to disagree.
+        let side = landed_side(&reach, landed_rev);
+        if side == LandedSide::InLine {
             in_effect += 1;
             if out_of_effect.remove(&identity).is_some() {
                 recovered += 1;
                 info!(
                     change = %identity,
                     landed_rev = %landed_rev,
+                    side = side.as_str(),
                     live_rev = reach.head(),
                     "change ledger: this change is in the revision the workloads are running now"
                 );
@@ -5025,6 +5073,7 @@ async fn live_revision_pass(
             debug!(
                 change = %identity,
                 landed_rev = %landed_rev,
+                side = side.as_str(),
                 live_rev = reach.head(),
                 "change ledger: the commit that landed this change is not in the live rev -- the \
                  project's own line carries it and the workloads are not running it"
@@ -11442,6 +11491,42 @@ mod tests {
             out_of_effect.get(&undeployed).map(String::as_str),
             Some(second.as_str()),
             "the row is held with the revision that landed it: {out_of_effect:?}"
+        );
+    }
+
+    /// The per-row answer the pass splits its reading on: the revision the
+    /// running image descends from is on the line, and one it does not carry is
+    /// off it -- told apart by the ancestor set alone.
+    ///
+    /// Written as its own case because these two sides are the whole of the
+    /// reading: a classifier that answered "in line" for every revision the
+    /// repository can resolve would publish a rollout that had finished on the
+    /// first pass after any landing, which is the collapse this pass exists to
+    /// avoid. The two revisions here are both real commits in the fixture and
+    /// differ only in where the running revision stands relative to them.
+    #[tokio::test]
+    async fn a_landing_revision_is_placed_on_one_side_of_the_running_line() {
+        let (dir, first, second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let reach = tree
+            .reach(&first)
+            .await
+            .expect("the fixture's first commit is a revision this tree can place");
+
+        assert_eq!(
+            landed_side(&reach, &first),
+            LandedSide::InLine,
+            "the revision the line was read from is on its own line"
+        );
+        assert_eq!(
+            landed_side(&reach, &second),
+            LandedSide::OffLine,
+            "a commit the running revision does not descend from is off the line"
+        );
+        assert_eq!(
+            LandedSide::OffLine.as_str(),
+            "off-line",
+            "the side is named when it is written down, and the name says which side"
         );
     }
 
