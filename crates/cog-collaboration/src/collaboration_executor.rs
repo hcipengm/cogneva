@@ -3036,6 +3036,37 @@ mod employee_dispatch_tests {
         assert_eq!(max.seen().len(), 2, "两轮下来 max 该接两件");
     }
 
+    /// 一行被谁认领，它产出的变更就署谁的名。
+    ///
+    /// 中间这个候选从前读的是 `task.agent_id`，那时它记的是「派给了谁」；接活
+    /// 改成认领之后同一格记的是接过这条行的人，于是署名链不必再加候选，但要
+    /// 有一条读数证明它读到的确实是认领写进去的那个名字——否则「认领者就是
+    /// 责任人」在变更账和提交作者那两处仍然可以悄悄退回机器人。
+    #[test]
+    fn a_change_signs_as_the_employee_that_took_the_row() {
+        let mut task = Task::new(
+            "work-1",
+            TaskType::Custom("probe".into()),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            CollaborationExecutor::producer_from(&task, None),
+            None,
+            "哪儿都没有名字时不署名，而不是编一个"
+        );
+        task.take_claim("E0455", chrono::Duration::seconds(300), chrono::Utc::now());
+        assert_eq!(
+            CollaborationExecutor::producer_from(&task, None),
+            Some("E0455"),
+            "认领写下的名字就是责任人，变更账要署他"
+        );
+        assert_eq!(
+            CollaborationExecutor::producer_from(&task, Some("E0456")),
+            Some("E0456"),
+            "真正跑完它的那一位优先于行上写着的认领者"
+        );
+    }
+
     /// 名册空的时候不假装干完了。
     ///
     /// 这条是给「工作台上一张空名册」准备的读数：活没被接走就要报错，
