@@ -58,11 +58,21 @@ pub struct CollaborationExecutor {
     /// 活」；没有它，同一个 id 在这些地方只剩一个机器码，而两处各拼一次名字时，
     /// 同一个人在账上与名单上会顶着两个名字。
     roster: Option<Arc<dyn cog_core::AgentRegistry>>,
-    /// 派活时的轮转游标。
+    /// 此刻每个员工手上正跑着几件活。
     ///
-    /// 顺序轮流而不是把活都给第一个人：名册上的人都能干同一类活，全都堆在
-    /// 一个名下，其余的人就只是名单上的一行，而队列长度会全记在那个人的账上。
-    next_worker: std::sync::atomic::AtomicUsize,
+    /// 这是派工时挑人的第一依据：活给手头最少的那个人。只看轮转游标的问题
+    /// 不在于它不公平，而在于它不知道谁在忙——轮到一个正压着三件活的人时，
+    /// 第四件照样给他。
+    ///
+    /// 计数在**接活**那一刻加、在那一轮结束时减：走了之后才失败的那件同样占
+    /// 了这个人一次。
+    live_takes: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// 手头一样少的人里，轮到谁先接。
+    ///
+    /// 负载只能分开「同时在跑的几件」，分不开「一件接一件」：串行派工时每个人
+    /// 手上的数在两次挑选之间都回到零，只按负载挑就会次次挑中名册第一行——
+    /// 一个人的队列挂着整张名册的招牌。游标只在这一层打平手时说话。
+    take_cursor: std::sync::Mutex<usize>,
 }
 
 /// What the producer said about itself, at the two stages the record keeps.
@@ -77,6 +87,59 @@ pub struct CollaborationExecutor {
 struct ProducerClass<'a> {
     intent: Option<cog_core::EvolutionIntent>,
     kind: Option<&'a str>,
+}
+
+/// 这条行自己写着的那个人，如果有的话。
+///
+/// 两处（认领与执行）读同一格，所以读法只有这一个：先读**活的认领**
+/// （[`Task::claimed_by`]，`agent_id` 在待接行上不算认领），再读
+/// `input.agent_id`（提交方在材料里点名的那种）。直接读 `agent_id` 会让一条
+/// 回到队里的行被它上一轮的执行者永久占住——那件活名义上待接，实际只有一个
+/// 人接得到。
+///
+/// 空串与纯空白不算名字——那不是「某个人」，是一次没填完的字段。
+fn named_employee(task: &Task) -> Option<&str> {
+    task.claimed_by()
+        .or_else(|| task.input.get("agent_id").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// 一次交出去的活，在它结束之前一直记在这个人名下。
+///
+/// Drop 里减掉而不是在每个返回点写一遍：这条路上的提前返回有五处，漏掉任何一处
+/// 都会让那个人永久多背一件活，而读数上看不出来——他只会越来越难被挑中。
+struct TakeNote<'a> {
+    live: &'a std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    agent_id: String,
+}
+
+impl<'a> TakeNote<'a> {
+    fn new(
+        live: &'a std::sync::Mutex<std::collections::HashMap<String, usize>>,
+        agent_id: &str,
+    ) -> Self {
+        if let Ok(mut counts) = live.lock() {
+            *counts.entry(agent_id.to_string()).or_insert(0) += 1;
+        }
+        Self {
+            live,
+            agent_id: agent_id.to_string(),
+        }
+    }
+}
+
+impl Drop for TakeNote<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.live.lock() {
+            if let Some(count) = counts.get_mut(&self.agent_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&self.agent_id);
+                }
+            }
+        }
+    }
 }
 
 impl CollaborationExecutor {
@@ -104,7 +167,8 @@ impl CollaborationExecutor {
             pause_gate: None,
             principle_ledger: None,
             roster: None,
-            next_worker: std::sync::atomic::AtomicUsize::new(0),
+            live_takes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            take_cursor: std::sync::Mutex::new(0),
         }
     }
 
@@ -301,6 +365,12 @@ impl cog_core::TaskExecutor for CollaborationExecutor {
         self.release_task_agents(&task.id).await;
         result
     }
+
+    /// 认领时问的人，与 [`Self::execute`] 实际会用的人是同一个函数算出来的。
+    async fn claimant_for(&self, task: &Task) -> Option<String> {
+        let manager = self.agent_manager.as_ref()?;
+        CollaborationExecutor::claimant_for(self, manager.as_ref(), task).await
+    }
 }
 
 impl CollaborationExecutor {
@@ -397,6 +467,9 @@ impl CollaborationExecutor {
         // 记在接活的那一刻，不记在完成时：走了之后才失败的那一件同样占了这个
         // 人的一次轮转，按结局记会把「他接了很多都没做完」读成「他没接活」。
         crate::observable::global_observable().record_work_item_taken(&agent_id);
+        // 这一次交出去之后到这一轮结束之前，这个人手上都多一件：下一次挑人时
+        // 读的就是这个数。它随作用域结束而减掉，失败与提前返回都不漏。
+        let _taking = TakeNote::new(&self.live_takes, &agent_id);
         // 这件活与这个人手上上一件活无关。对话里留着上一件活的材料与步骤，
         // 这一轮模型就会拿它们当上下文：钱多付一遍，判词也可能被上一件带偏。
         // 重置只清对话，不动它装配时带上的工具、钩子与账。
@@ -421,22 +494,16 @@ impl CollaborationExecutor {
 
     /// The employee that takes this work item.
     ///
-    /// The task's own `agent_id` names one, then `input.agent_id`; without
-    /// either the work goes to the next employee in rotation, because an item
-    /// that only one employee ever picks up is that employee's queue under
-    /// another name.
+    /// The task's own `agent_id` names one — 认领就是写在这一格上的，所以这条行
+    /// 只要被认领过，接活的人就是干活的人。没有名字的行问 [`Self::claimant_for`]
+    /// 同一个答案：认领与执行不能是两个不同的判断，否则行上写着一个人、活却由
+    /// 另一个人跑。
     async fn employee_for(
         &self,
         manager: &dyn cog_core::AgentManager,
         task: &Task,
     ) -> SFResult<(String, Arc<dyn cog_core::Agent>)> {
-        let named = task
-            .agent_id
-            .as_deref()
-            .or_else(|| task.input.get("agent_id").and_then(|v| v.as_str()))
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(id) = named {
+        if let Some(id) = named_employee(task) {
             let agent = manager.get_agent(id).await?.ok_or_else(|| {
                 SFError::Agent(format!(
                     "the work names employee {id}, who is not on the roster"
@@ -444,36 +511,68 @@ impl CollaborationExecutor {
             })?;
             return Ok((id.to_string(), agent));
         }
-
-        // 只从**常驻**员工里挑。名册上还挂着为某件 DAG 任务现起的对象：它们正
-        // 在那件任务的对话里，接过一件无关的活要么排在它后面，要么让两边读到
-        // 彼此的步骤。`owner_task` 为空的那些才是「活着的时间比任何一件活都长」
-        // 的员工，也正是这里要找的人。
-        let roster: Vec<_> = manager
-            .list_workers()
-            .await?
-            .into_iter()
-            .filter(|worker| worker.owner_task.is_none())
-            .collect();
-        if roster.is_empty() {
+        let picked = self
+            .claimant_for(manager, task)
+            .await
+            .filter(|id| !id.trim().is_empty());
+        let Some(agent_id) = picked else {
             return Err(SFError::Agent(
                 "no standing employee is on the roster to take the work item".into(),
             ));
+        };
+        let agent = manager.get_agent(&agent_id).await?.ok_or_else(|| {
+            SFError::Agent(format!(
+                "the employee {agent_id} who was picked to take the work retired first"
+            ))
+        })?;
+        Ok((agent_id, agent))
+    }
+
+    /// 这条活该交给谁——与派工侧认领时问的是同一个函数。
+    ///
+    /// 行上写了名字就是那个人（认得他的名册行才算：写着一个已经走了的人的名字
+    /// 是「这条活没人」，不是「这个人」）。没写名字时挑**手头活最少**的常驻员工；
+    /// 手头一样少时按游标轮流，谁都不会因为排在名册第一行而永远先接。
+    ///
+    /// 只从常驻员工里挑。名册上还挂着为某件 DAG 任务现起的对象：它们正在那件
+    /// 任务的对话里，接过一件无关的活要么排在它后面，要么让两边读到彼此的步骤。
+    /// `owner_task` 为空的那些才是「活着的时间比任何一件活都长」的员工。
+    async fn claimant_for(
+        &self,
+        manager: &dyn cog_core::AgentManager,
+        task: &Task,
+    ) -> Option<String> {
+        if let Some(id) = named_employee(task) {
+            // 名册上的一行不等于一个能接活的活对象：退役随时发生，名字还在纸上
+            // 的那个人可能刚好在这之前走了。那时他不是「这个人」，是「没人」。
+            return match manager.get_agent(id).await {
+                Ok(Some(_)) => Some(id.to_string()),
+                Ok(None) => None,
+                Err(_) => None,
+            };
         }
-        let start = self
-            .next_worker
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        for step in 0..roster.len() {
-            let pick = &roster[(start + step) % roster.len()];
-            // 名册上的一行不等于一个能接活的活对象：退役随时发生，轮到的那个人
-            // 可能刚好在这之前走了。跳过它，不要因此丢掉这件活。
-            if let Some(agent) = manager.get_agent(&pick.agent_id).await? {
-                return Ok((pick.agent_id.clone(), agent));
-            }
+        let roster: Vec<_> = manager
+            .list_workers()
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|worker| worker.owner_task.is_none())
+            .filter(|worker| !worker.agent_id.trim().is_empty())
+            .collect();
+        if roster.is_empty() {
+            return None;
         }
-        Err(SFError::Agent(
-            "every employee on the roster had retired before one could take the work".into(),
-        ))
+        let live = self.live_takes.lock().ok()?;
+        let load = |worker: &cog_core::WorkerInfo| live.get(&worker.agent_id).copied().unwrap_or(0);
+        let least = roster.iter().map(load).min()?;
+        let candidates: Vec<&cog_core::WorkerInfo> = roster
+            .iter()
+            .filter(|worker| load(worker) == least)
+            .collect();
+        let mut cursor = self.take_cursor.lock().ok()?;
+        let picked = candidates[*cursor % candidates.len()].agent_id.clone();
+        *cursor = cursor.wrapping_add(1);
+        Some(picked)
     }
 
     /// Decomposition path: run the Planner and take its atomic task list as the

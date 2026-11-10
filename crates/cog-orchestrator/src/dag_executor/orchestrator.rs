@@ -2690,6 +2690,63 @@ impl DagExecutor {
         Ok(())
     }
 
+    /// 接活：把一条待接的行交给 `claimant`，写负责人与租约，原子地。
+    ///
+    /// 判据在 [`crate::ready_queue::approve_claim`]（谁能接哪件活），写的原子性在
+    /// 存储的 `dag_claim_task`（同一条行只能被接走一次）。这里只做两件事：把两边
+    /// 接起来，以及把「被拒」翻成一个调用方分得清「别人先接了」与「你不该接」的
+    /// 错误。
+    ///
+    /// 返回**认领之后的行**。调用方必须拿它去执行：手里的快照可能已经是一份过期
+    /// 的（认领前读到的），照着它跑会让一件刚被接走的活被再跑一遍。
+    pub async fn claim_task(&self, task_id: &str, claimant: &str) -> SFResult<Task> {
+        let now = chrono::Utc::now();
+        let lease = self.task_lease;
+        let expected = [TaskStatus::Pending, TaskStatus::Scheduled];
+
+        if self.fg().is_some() {
+            let be = self.fg().expect("store mode");
+            let task = self.store_task(task_id).await?;
+            let claimed = crate::ready_queue::approve_claim(&task, claimant, lease, now)
+                .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+            be.dag_claim_task(&self.workspace_id, task_id, &expected, &claimed)
+                .await?;
+            if claimed.status != task.status {
+                self.emit_event(cog_core::TaskEvent::TaskScheduled {
+                    task_id: task_id.into(),
+                    timestamp: now,
+                })
+                .await;
+            }
+            return Ok(claimed);
+        }
+
+        self.ensure_task_present(task_id).await?;
+        let mut inner = self.inner.write().await;
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: "Task not found".into(),
+            })?;
+        let claimed = crate::ready_queue::approve_claim(task, claimant, lease, now)
+            .map_err(|refusal| claim_refusal_as_error(task_id, claimant, refusal))?;
+        let was_pending = task.status == TaskStatus::Pending;
+        *task = claimed.clone();
+        drop(inner);
+        if was_pending {
+            self.emit_event(cog_core::TaskEvent::TaskScheduled {
+                task_id: task_id.into(),
+                timestamp: now,
+            })
+            .await;
+        }
+        self.persist_task_fine_grained(&claimed).await;
+        self.persist_state().await;
+        Ok(claimed)
+    }
+
     pub async fn schedule_task(&self, task_id: &str) -> SFResult<()> {
         if self.fg().is_some() {
             return self
@@ -4500,6 +4557,10 @@ impl cog_core::DagExecutor for DagExecutor {
         self.schedule_task(task_id).await
     }
 
+    async fn claim_task(&self, task_id: &str, claimant: &str) -> SFResult<Task> {
+        DagExecutor::claim_task(self, task_id, claimant).await
+    }
+
     async fn assign_task(&self, task_id: &str, agent_id: &str) -> SFResult<()> {
         self.assign_task(task_id, agent_id).await
     }
@@ -4670,6 +4731,44 @@ fn name_unclosable_kinds(unclosable: &std::collections::BTreeMap<String, Vec<Str
                  rows stay on the board until their producer or a settle pass gives them one"
             );
         }
+    }
+}
+
+/// 一次被拒的认领，翻成调用方要分得清的那两种错。
+///
+/// 「别人先接了」「这条行已经跑起来了」是竞争，不是坏掉：读的人该重读一次或者
+/// 放手，而不是把这条活判成失败。「不归你」「没验收标准」「不是活」是这条行对
+/// 这个请求者的拒绝，重读多少次答案都不变。
+fn claim_refusal_as_error(
+    task_id: &str,
+    claimant: &str,
+    refusal: crate::ready_queue::ClaimRefusal,
+) -> cog_core::SFError {
+    use crate::ready_queue::ClaimRefusal as Refused;
+    use cog_core::SFError;
+    match refusal {
+        Refused::Anonymous => SFError::Validation(format!(
+            "nobody named took task {task_id}: a row with no respondent is a row nobody answers for"
+        )),
+        Refused::MovedOn(status) => SFError::Conflict(format!(
+            "task {task_id} is {:?}, so {claimant} cannot take it: work that is running or \
+             settled is not taken again",
+            status
+        )),
+        Refused::HeldByAnother(held) => SFError::Conflict(format!(
+            "task {task_id} was taken by {held} before {claimant} could"
+        )),
+        Refused::NamesAnotherOwner(owner) => SFError::Conflict(format!(
+            "task {task_id} names {owner} as the unit that runs it; {claimant} is not that unit"
+        )),
+        Refused::NoBodyToRun => SFError::Validation(format!(
+            "task {task_id} has no body to run: it is a graph node or a face's standing duty, \
+             not work"
+        )),
+        Refused::NoCriterion => SFError::Validation(format!(
+            "task {task_id} states no acceptance criterion, so taking it would start work \
+             nobody can close"
+        )),
     }
 }
 
@@ -5397,6 +5496,113 @@ mod tests {
         let pod = DagExecutor::new("ws-solo".into());
         let err = pod.schedule_task("nope").await.unwrap_err();
         assert!(err.to_string().contains("Task not found"));
+    }
+
+    /// 两份都读到「待接」的认领同时写：板上的责任人只能有一个。
+    ///
+    /// 判据必须落在存储里：`approve_claim` 读的是调用方手里的快照，而快照会
+    /// 过期。两个人同时看到「待接」时，这里两份认领都能通过判据，只有那一次
+    /// 写能决定谁赢——写读的是板上的当前行，不是调用方的。
+    #[tokio::test]
+    async fn a_claim_written_against_a_stale_snapshot_cannot_land_twice() {
+        let backend = cog_test_support::MemoryStateBackend::new();
+        let mut task = Task::new("t-stale-claim", TaskType::DagNode, serde_json::json!({}));
+        task.acceptance = vec!["the row is done when its writer says so".to_string()];
+        backend
+            .dag_set_task("ws-stale-claim", "t-stale-claim", &task)
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let lease = chrono::Duration::seconds(300);
+        let first = crate::ready_queue::approve_claim(&task, "E0455", lease, now).unwrap();
+        let second = crate::ready_queue::approve_claim(&task, "E0456", lease, now).unwrap();
+
+        backend
+            .dag_claim_task(
+                "ws-stale-claim",
+                "t-stale-claim",
+                &[TaskStatus::Pending, TaskStatus::Scheduled],
+                &first,
+            )
+            .await
+            .unwrap();
+        let refused = backend
+            .dag_claim_task(
+                "ws-stale-claim",
+                "t-stale-claim",
+                &[TaskStatus::Pending, TaskStatus::Scheduled],
+                &second,
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "第二份认领读的是一份过期的「待接」快照，存储必须按「已被接走」拒掉：{refused:?}"
+        );
+        let row = backend
+            .dag_get_task("ws-stale-claim", "t-stale-claim")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.claimed_by(),
+            Some("E0455"),
+            "板上的责任人只能是先写进去的那个，后写的不能覆盖"
+        );
+
+        // 租约过期之后，这个名字不再拦人：守卫与判据同源（`claim_held_now`），
+        // 否则一条回到队里、名字还留着的行会永远没人接得走。
+        let mut expired = first.clone();
+        expired.lease_expires_at = Some(now - chrono::Duration::seconds(1));
+        backend
+            .dag_set_task("ws-stale-claim", "t-stale-claim", &expired)
+            .await
+            .unwrap();
+        let fresh = crate::ready_queue::approve_claim(&expired, "E0457", lease, now)
+            .expect("租约过期的认领不拦人");
+        backend
+            .dag_claim_task(
+                "ws-stale-claim",
+                "t-stale-claim",
+                &[TaskStatus::Pending, TaskStatus::Scheduled],
+                &fresh,
+            )
+            .await
+            .expect("认领者消失之后，下一个人必须接得走这条行");
+        let row = backend
+            .dag_get_task("ws-stale-claim", "t-stale-claim")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.claimed_by(), Some("E0457"));
+    }
+
+    /// 两个 pod 共享一块板，各自有一份内存：同一行只有一个认领者。
+    #[tokio::test]
+    async fn two_pods_racing_to_take_one_row_leave_exactly_one_holder() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let pod_a = DagExecutor::new("ws-claim-race".into()).with_state_backend(backend.clone());
+        let pod_b = DagExecutor::new("ws-claim-race".into()).with_state_backend(backend);
+        let mut task = Task::new("t-claim-race", TaskType::DagNode, serde_json::json!({}));
+        task.acceptance = vec!["the row is done when it says so".to_string()];
+        pod_a.add_task(task).await.unwrap();
+
+        let (a, b) = tokio::join!(
+            pod_a.claim_task("t-claim-race", "E0455"),
+            pod_b.claim_task("t-claim-race", "E0456"),
+        );
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "同一条待接的行只能有一个认领者，实得 {a:?} / {b:?}"
+        );
+        let holder = if a.is_ok() { "E0455" } else { "E0456" };
+        let row = pod_b.get_task("t-claim-race").await.unwrap();
+        assert_eq!(
+            row.claimed_by(),
+            Some(holder),
+            "两个 pod 之后读到的必须是同一个认领者"
+        );
     }
 
     /// 终态双副本：两个 DagExecutor 共享一个支持细粒度 dag_* 的后端，

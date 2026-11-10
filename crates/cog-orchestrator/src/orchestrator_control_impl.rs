@@ -209,6 +209,10 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.schedule_task(task_id).await
     }
 
+    async fn claim_task(&self, task_id: &str, claimant: &str) -> SFResult<Task> {
+        self.dag_executor.claim_task(task_id, claimant).await
+    }
+
     async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
         self.dag_executor.check_timeouts().await
     }

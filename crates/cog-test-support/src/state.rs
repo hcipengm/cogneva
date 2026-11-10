@@ -285,6 +285,40 @@ impl StateBackend for MemoryStateBackend {
         Ok(())
     }
 
+    async fn dag_claim_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        expected: &[cog_core::TaskStatus],
+        updated: &cog_core::Task,
+    ) -> SFResult<()> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        let tasks = store.dag_tasks.entry(workspace_id.into()).or_default();
+        let current = tasks.get(task_id).ok_or_else(|| SFError::TaskFailed {
+            task_id: task_id.into(),
+            reason: "Task not found".into(),
+        })?;
+        if !expected.contains(&current.status) {
+            return Err(SFError::Conflict(format!(
+                "task {task_id} is in {:?} state, not one of the states a claim accepts",
+                current.status
+            )));
+        }
+        // 守卫读存储里那一行自己的认领，不读调用方的快照：两个人拿同一份「待接」
+        // 去认领时，后到的那一次写必须落不下来。只拦租约还活着的认领——过期的
+        // 认领是「那个人不在了」，与 `approve_claim` 同一个口径。
+        if let Some(held) = current.claim_held_now(chrono::Utc::now()) {
+            return Err(SFError::Conflict(format!(
+                "task {task_id} is already claimed by {held}"
+            )));
+        }
+        tasks.insert(task_id.into(), updated.clone());
+        Ok(())
+    }
+
     async fn dag_transition_owned_task(
         &self,
         workspace_id: &str,

@@ -989,6 +989,62 @@ impl Task {
         self.lease_expires_at = None;
     }
 
+    /// 接活：待接 → 已认领的唯一写点。
+    ///
+    /// 认领写在 `agent_id` 上，不新开一列。这一格在认领到交付之间只有一个含义
+    /// ——「谁为这条行的结果负责」：认领时是接过它的人，跑起来以后仍是同一个人
+    /// （一次运行只能由它的认领者来跑），交付以后还是它。中间不会出现第二个人，
+    /// 所以一个格子够。开一列 `claimed_by` 的代价是把同一句话存两处，然后要
+    /// 回答「两处不一致时信哪个」，而那正是这里最不该有的一个问题。
+    ///
+    /// `Pending` 行上的 `agent_id` 不读作认领（[`Self::claimed_by`] 就在这一处
+    /// 收口）：回到队里的行是一次跑完或回了队的行的旧值，它按定义没人持有。
+    ///
+    /// 租约与认领同时写，和 [`Self::begin_run`] 同一个理由：只写认领不写租约的
+    /// 行，在认领者消失以后永远没人能接手，而它看起来像是有人在干。
+    pub fn take_claim(&mut self, claimant: &str, lease: chrono::Duration, now: DateTime<Utc>) {
+        self.status = TaskStatus::Scheduled;
+        self.agent_id = Some(claimant.to_string());
+        self.lease_owner = Some(claimant.to_string());
+        self.lease_expires_at = Some(now + lease);
+        self.updated_at = now;
+    }
+
+    /// 这条行此刻有没有人认领。`Pending` 是「待接」，不是「已认领」。
+    ///
+    /// 交了活的行（`Completed` / `Failed` / `Cancelled`）也不再有人持有：那一格
+    /// 记的是谁交的，不是谁还拿着。
+    pub fn claimed_by(&self) -> Option<&str> {
+        match self.status {
+            TaskStatus::Scheduled | TaskStatus::Running => self.agent_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// 认领者的租约还有没有效。没有效 = 那个人已经不在了，这条行可以再被接走。
+    ///
+    /// 与 [`Self::lease_expiry`] 分开命名，因为两者答的不是一回事：那个问「这个
+    /// 进程还持不持有」，这个问「这条行还有没有人认」。认领者消失之后进程身份
+    /// 已经换过，只有租约还留在行上。
+    pub fn claim_is_live(&self, lease: chrono::Duration, now: DateTime<Utc>) -> bool {
+        self.claimed_by().is_some()
+            && self
+                .lease_expiry(lease)
+                .is_some_and(|expires| expires > now)
+    }
+
+    /// 这条行此刻被谁持有——只认行上写着的到期时刻。
+    ///
+    /// 与 [`Self::claim_is_live`] 分开：那个用调用方手里的租约长度去补一条没写
+    /// 到期时刻的老行，这个只读板上那一个数。存储里的守卫（认领只能落一次）
+    /// 手里没有租约长度，它读的就是这一条：有名字、且到期时刻还没到，才算有人
+    /// 持有。已经过期或没写到期时刻的认领不拦人——那是「那个人不在了」，不是
+    /// 「这件活有人干」。
+    pub fn claim_held_now(&self, now: DateTime<Utc>) -> Option<&str> {
+        self.claimed_by()
+            .filter(|_| self.lease_expires_at.is_some_and(|expires| expires > now))
+    }
+
     /// Whether re-running this task could succeed, judged on both channels a
     /// failure can arrive by: the typed `error_cause` (what the transport
     /// saw) and the in-band declaration inside the rendered `error` text,
@@ -1191,6 +1247,56 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Running);
         assert!(task.error.is_none(), "开始跑了，上一轮的判词不再说明任何事");
         assert!(task.error_cause.is_none(), "类型通道同理");
+    }
+
+    /// 接活的迁移写下了负责人与租约，租约到期后这条行重新算「没人认领」。
+    ///
+    /// 三处读法必须同源：`claimed_by` 答「谁接了」，`claim_is_live` 答「他还在
+    /// 不在」，而认领者消失之后这条行要能被下一个人接走。判据若分三处写，最先
+    /// 漂的总是「租约到期」那一份。
+    #[test]
+    fn a_claim_names_who_took_the_row_and_lapses_with_its_lease() {
+        let now = Utc::now();
+        let lease = chrono::Duration::seconds(300);
+        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        assert_eq!(task.claimed_by(), None, "待接的行没有人认领");
+
+        task.take_claim("E0412", lease, now);
+        assert_eq!(task.status, TaskStatus::Scheduled);
+        assert_eq!(task.claimed_by(), Some("E0412"));
+        assert_eq!(task.lease_owner.as_deref(), Some("E0412"));
+        assert_eq!(task.lease_expires_at, Some(now + lease));
+        assert!(task.claim_is_live(lease, now + chrono::Duration::seconds(299)));
+        assert!(
+            !task.claim_is_live(lease, now + chrono::Duration::seconds(301)),
+            "认领者过了自己的租约就不再持有它"
+        );
+        assert_eq!(
+            task.claim_held_now(now + chrono::Duration::seconds(299)),
+            Some("E0412"),
+            "板上的守卫读同一个口径：有名字且租约没到期"
+        );
+        assert_eq!(
+            task.claim_held_now(now + chrono::Duration::seconds(301)),
+            None,
+            "过期之后这个名字不再拦人"
+        );
+
+        task.begin_run("run-7", lease, now);
+        assert_eq!(
+            task.claimed_by(),
+            Some("E0412"),
+            "跑起来以后责任人不变：接活的人就是干活的人"
+        );
+        assert_eq!(
+            task.lease_owner.as_deref(),
+            Some("run-7"),
+            "进程身份接管租约，认领者的名字留在责任人那一格"
+        );
+
+        task.clear_run();
+        task.status = TaskStatus::Pending;
+        assert_eq!(task.claimed_by(), None, "回到队里的行按定义没人持有");
     }
 
     /// 两个通道各自都能判死一次重试：类型通道（`error_cause` 为配额/鉴权这类

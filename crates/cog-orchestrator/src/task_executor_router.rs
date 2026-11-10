@@ -308,6 +308,21 @@ impl TaskExecutorRouter {
         executor.execute(task).await
     }
 
+    /// 这条行该由谁来接——问的是**真的会执行它的那个**执行器。
+    ///
+    /// 与 [`Self::execute`] 同一个挑选顺序（第一个 `supports` 的执行器），因为
+    /// 认领与执行若落在不同的执行器上，行上就会写着一个人、活由另一个人干。
+    async fn claimant_for_the_run(&self, task: &Task) -> Option<String> {
+        let executor = self
+            .executors
+            .read()
+            .await
+            .iter()
+            .find(|e| e.supports(&task.task_type))
+            .cloned()?;
+        executor.claimant_for(task).await
+    }
+
     /// Consume ready tasks from the message backend, execute them, and publish
     /// results back to the results stream.
     ///
@@ -887,6 +902,59 @@ impl TaskExecutorRouter {
             return;
         }
 
+        // 接活：先认领，再准入。
+        //
+        // 认领把责任人写在行上（`agent_id`），而执行器跑这一行时读的就是那一格，
+        // 所以「谁接了」与「谁在干」是同一个答案，不再由执行器各自挑一次。认领
+        // 之后拿回来的是**新的行**，下面执行照它走：手里的这份是发布时序列化的
+        // 快照，认领发生在它之后，照旧快照跑等于没认领。
+        //
+        // 执行器说不出一个人（没有名册）时退回旧的交接：先把行挪进已派发、再起。
+        // 那条路上行上没有责任人，所以它是一条要看得见的缺口——只记一行日志，
+        // 不静默。
+        let task = match (
+            self.claimant_for_the_run(&task).await,
+            self.orchestrator.as_ref(),
+        ) {
+            (Some(claimant), Some(orch)) => match orch.claim_task(&task.id, &claimant).await {
+                Ok(claimed) => claimed,
+                Err(cog_core::SFError::NotImplemented(_)) => task,
+                Err(e) => {
+                    // 别人先接了、或者这条行已经跑完了：这条消息来晚了。ack 掉，
+                    // 让队列过得去；行本身归接走它的人，不归这里。
+                    tracing::warn!(
+                        task_id = %task.id,
+                        claimant = %claimant,
+                        msg_id = %msg_id,
+                        "the ready message named work nobody could take ({e}); dropping it"
+                    );
+                    if let Err(e) = pipe
+                        .task_backend
+                        .ack(
+                            &pipe.ready_stream,
+                            &pipe.group,
+                            std::slice::from_ref(&msg_id),
+                        )
+                        .await
+                    {
+                        tracing::warn!(task_id = %task.id, msg_id = %msg_id, "Failed to ack a ready message whose claim was refused: {e}");
+                    }
+                    return;
+                }
+            },
+            (named, _) => {
+                if named.is_none() {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        msg_id = %msg_id,
+                        "no one could be named to take this ready row; it is being admitted \
+                         without a respondent, so the row will carry no one's name"
+                    );
+                }
+                task
+            }
+        };
+
         // Notify orchestrator that task is now running.
         if let Some(ref orch) = self.orchestrator {
             if let Err(e) = orch.admit_and_start(&task.id).await {
@@ -1377,6 +1445,273 @@ mod ready_pipeline_tests {
             other => panic!("expected TaskFailed on a stall, got {other:?}"),
         }
         cog_core::progress::reset_for_tests();
+    }
+
+    /// 一条可以接的活：有验收标准、还在待接。`test_task` 不带验收，接不了。
+    fn claimable_task() -> Task {
+        let mut task = test_task(30);
+        task.id = "t-claim".into();
+        task.acceptance = vec!["done when the executor says it wrote the row".into()];
+        task
+    }
+
+    /// 记下「谁在这一轮里被认作执行者」的控制面：认领写在自己的行上，
+    /// 准入/起跑只记一笔调用顺序。
+    struct ClaimingGraph {
+        row: tokio::sync::Mutex<Task>,
+        calls: tokio::sync::Mutex<Vec<&'static str>>,
+        /// 有人先接了的时候，认领该被拒；文案就是下面那条测试要读的那句。
+        refuse: Option<String>,
+    }
+
+    impl ClaimingGraph {
+        fn new(task: Task) -> Self {
+            Self {
+                row: tokio::sync::Mutex::new(task),
+                calls: tokio::sync::Mutex::new(Vec::new()),
+                refuse: None,
+            }
+        }
+
+        fn refusing(task: Task, reason: &str) -> Self {
+            Self {
+                refuse: Some(reason.to_string()),
+                ..Self::new(task)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OrchestratorControl for ClaimingGraph {
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<Task>) -> SFResult<()> {
+            Ok(())
+        }
+        async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+            Ok(tasks.iter().map(|task| task.id.clone()).collect())
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn add_task(&self, _task: Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn replace_task(&self, _task: Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            false
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            0
+        }
+        async fn get_ready_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn get_all_tasks(&self) -> Vec<Task> {
+            vec![self.row.lock().await.clone()]
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn retry_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn dlq_len(&self) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn start_task(&self, _task_id: &str) -> SFResult<()> {
+            self.calls.lock().await.push("start");
+            self.row.lock().await.status = TaskStatus::Running;
+            Ok(())
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_task(&self, _task_id: &str) -> Option<Task> {
+            Some(self.row.lock().await.clone())
+        }
+        async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
+            self.calls.lock().await.push("schedule");
+            self.row.lock().await.status = TaskStatus::Scheduled;
+            Ok(())
+        }
+        async fn claim_task(&self, _task_id: &str, claimant: &str) -> SFResult<Task> {
+            self.calls.lock().await.push("claim");
+            if let Some(reason) = &self.refuse {
+                return Err(SFError::Conflict(reason.clone()));
+            }
+            let mut row = self.row.lock().await;
+            let claimed = crate::ready_queue::approve_claim(
+                &row,
+                claimant,
+                chrono::Duration::seconds(300),
+                chrono::Utc::now(),
+            )
+            .map_err(|refusal| SFError::Conflict(refusal.as_str().into()))?;
+            *row = claimed.clone();
+            Ok(claimed)
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            Vec::new()
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
+            (Vec::new(), Vec::new())
+        }
+        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn all_completed(&self) -> bool {
+            true
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
+            Ok(false)
+        }
+    }
+
+    /// 会在执行时说出自己拿了哪一行的执行器。
+    struct TakesTheWork {
+        seen: Arc<tokio::sync::Mutex<Option<Task>>>,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for TakesTheWork {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+        async fn claimant_for(&self, _task: &Task) -> Option<String> {
+            Some("E0455".into())
+        }
+        async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
+            *self.seen.lock().await = Some(task.clone());
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({"done": true}),
+                metadata: TaskResultMetadata::new("takes-the-work"),
+            })
+        }
+    }
+
+    /// 接话在准入之前：执行器拿到的必须是**认领之后**的那一行。
+    ///
+    /// 这是一条判别测试，不是流程描述：把认领删掉，执行器手里那一行的
+    /// `agent_id` 就是空的，「谁接了」与「谁在干」重新分成两个答案。
+    #[tokio::test]
+    async fn the_row_handed_to_the_executor_is_the_one_that_was_claimed() {
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let seen = Arc::new(tokio::sync::Mutex::new(None::<Task>));
+        let task = claimable_task();
+        let graph = Arc::new(ClaimingGraph::new(task.clone()));
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(TakesTheWork { seen: seen.clone() }))
+            .await
+            .with_orchestrator(graph.clone());
+
+        router
+            .process_ready_message(
+                &pipe,
+                "m-claim".into(),
+                &serde_json::to_vec(&task).unwrap(),
+                &test_hold(),
+            )
+            .await;
+
+        let ran = seen.lock().await.clone().expect("执行器必须跑到");
+        assert_eq!(
+            ran.claimed_by(),
+            Some("E0455"),
+            "执行器手里那一行必须写着认领者的名字，否则它是在替没人认领的活干活"
+        );
+        assert!(
+            ran.lease_expires_at.is_some(),
+            "认领必须带租约：没有租约的认领永远不会过期，也就永远不会被别人重新接走"
+        );
+        assert_eq!(
+            graph.calls.lock().await.as_slice(),
+            ["claim", "start"],
+            "顺序必须是先接后跑；反过来就是先跑了一件还挂在板上的活"
+        );
+        assert_eq!(
+            graph.row.lock().await.claimed_by(),
+            Some("E0455"),
+            "行上的责任人必须留下"
+        );
+    }
+
+    /// 别人先接了：这条消息来晚了，它不许再开一轮，也不许动那条行。
+    #[tokio::test]
+    async fn a_row_taken_by_someone_else_is_not_run_again() {
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let seen = Arc::new(tokio::sync::Mutex::new(None::<Task>));
+        let task = claimable_task();
+        let graph = Arc::new(ClaimingGraph::refusing(
+            task.clone(),
+            "task t-claim is already claimed by E0456",
+        ));
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(TakesTheWork { seen: seen.clone() }))
+            .await
+            .with_orchestrator(graph.clone());
+
+        router
+            .process_ready_message(
+                &pipe,
+                "m-claim-lost".into(),
+                &serde_json::to_vec(&task).unwrap(),
+                &test_hold(),
+            )
+            .await;
+
+        assert!(
+            seen.lock().await.is_none(),
+            "别人接走的活不许被这个消费者再跑一遍"
+        );
+        assert_eq!(
+            graph.calls.lock().await.as_slice(),
+            ["claim"],
+            "认领被拒之后不许再准入或起跑"
+        );
+        let acks = backend.acks.lock().await;
+        assert_eq!(
+            acks.as_slice(),
+            [(
+                "ready".to_string(),
+                "grp".to_string(),
+                vec!["m-claim-lost".to_string()]
+            )],
+            "这条消息已经没有活可干了，必须 ack 掉让队列过得去"
+        );
     }
 
     /// 上游的失败类型与它明说的等待都要过总线：算出重试时刻的是消费这条消息

@@ -418,25 +418,37 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         Action::Queue { json } => queue(&*backend, workspace, unit, json).await?,
         Action::Next { json } => next(&*backend, workspace, unit, json).await?,
         Action::Claim { task } => {
-            let task = owned_task(&*backend, workspace, &task, unit).await?;
+            // 接活判定在 `ready_queue::approve_claim`，与派工侧同一个函数：谁能
+            // 接哪件活只有一份答案，两边各判一次，最先漂的总是「已经有人接了」。
+            //
+            // 这里不再要求「这条行属于你」：任务板上待接的活谁都能接，接了的人
+            // 就是责任人——那是这一列的全部意义。只有被人指定给别人的行（面值班
+            // 那种）会拒绝。
+            let row = backend
+                .dag_get_task(workspace, &task)
+                .await?
+                .ok_or_else(|| format!("task {task} does not exist"))?;
             let deps = dependency_state(&*backend, workspace).await?;
-            if !task.is_ready(&deps) {
+            if !row.is_ready(&deps) {
                 return Err(format!(
                     "task {} is waiting on dependencies that are not completed",
-                    task.id
+                    row.id
                 )
                 .into());
             }
-            transition(
-                &*backend,
-                workspace,
-                &task.id,
-                &[TaskStatus::Pending],
-                unit,
-                |t| t.status = TaskStatus::Scheduled,
-            )
-            .await?;
-            println!("{} scheduled", task.id);
+            let lease = chrono::Duration::seconds(endpoints.lease_secs as i64);
+            let claimed =
+                cog_orchestrator::ready_queue::approve_claim(&row, unit, lease, Utc::now())
+                    .map_err(|refusal| claim_refused_reason(&row.id, unit, refusal))?;
+            backend
+                .dag_claim_task(
+                    workspace,
+                    &row.id,
+                    &[TaskStatus::Pending, TaskStatus::Scheduled],
+                    &claimed,
+                )
+                .await?;
+            println!("{} claimed by {unit}", row.id);
         }
         Action::Start { task } => {
             let task = owned_task(&*backend, workspace, &task, unit).await?;
@@ -811,16 +823,58 @@ async fn owned_task(
         .dag_get_task(workspace, task_id)
         .await?
         .ok_or_else(|| format!("task {task_id} does not exist"))?;
-    match task.owner_unit.as_deref() {
-        Some(owner) if owner == unit && !task.is_executable => {
-            Err(format!("task {task_id} is a graph node, not work; it has no body to run").into())
+    // 两种说法都算「这件活是这个人的」：提交方把它指定给了这个 unit，或者这个
+    // unit 在任务板上把它接走了。只认第一种，等于接活接不成的活；只认第二种，
+    // 等于指定的活没法开工——两句话都在同一个行上说，读它的人得能读到两处。
+    let designated = task.owner_unit.as_deref() == Some(unit);
+    let taken = task.claimed_by() == Some(unit);
+    if let Some(owner) = task.owner_unit.as_deref() {
+        if !designated && !taken {
+            return Err(format!("task {task_id} is owned by {owner}, not {unit}").into());
         }
-        Some(owner) if owner == unit => Ok(task),
-        Some(owner) => Err(format!("task {task_id} is owned by {owner}, not {unit}").into()),
-        None => Err(format!(
-            "task {task_id} names no owner; it runs on the shared queue, not from this command"
-        )
-        .into()),
+    }
+    if designated || taken {
+        if !task.is_executable {
+            return Err(
+                format!("task {task_id} is a graph node, not work; it has no body to run").into(),
+            );
+        }
+        return Ok(task);
+    }
+    Err(format!(
+        "task {task_id} names no owner and nobody has taken it; claim it first with `claim`"
+    )
+    .into())
+}
+
+/// 一次被拒的认领，翻成带派命令行读得懂的一句话。
+fn claim_refused_reason(
+    task_id: &str,
+    unit: &str,
+    refusal: cog_orchestrator::ready_queue::ClaimRefusal,
+) -> String {
+    use cog_orchestrator::ready_queue::ClaimRefusal as Refused;
+    match refusal {
+        Refused::Anonymous => format!("task {task_id} was claimed with no unit name"),
+        Refused::MovedOn(status) => format!(
+            "task {task_id} is {status:?}, so {unit} cannot take it: work that is running or \
+             settled is not taken again"
+        ),
+        // 也叫「你自己」：同一条活的有效认领不接第二次，否则同一条就绪消息
+        // 会被同一双手跑两遍。
+        Refused::HeldByAnother(held) => format!(
+            "task {task_id} is already claimed by {held}, and that claim's lease has not lapsed; \
+             {unit} cannot take it again"
+        ),
+        Refused::NamesAnotherOwner(owner) => format!(
+            "task {task_id} is designated to {owner}; {unit} can only take work nobody is \
+             designated for"
+        ),
+        Refused::NoBodyToRun => format!("task {task_id} has no body to run"),
+        Refused::NoCriterion => format!(
+            "task {task_id} states no acceptance criterion; taking it would start work nobody \
+             can close"
+        ),
     }
 }
 
@@ -849,12 +903,18 @@ async fn dependency_state(
     })
 }
 
-/// Apply one transition under the owner guard.
+/// Apply one transition under the guard that says the row is this unit's.
 ///
 /// The row is re-read here rather than carried from the caller's earlier read:
 /// between that read and this write another session may have moved the row,
 /// and the guard can only refuse the stale state if it is checked against the
 /// row as it stands now.
+///
+/// Which guard applies is read off the row, not chosen here: a designated row is
+/// guarded by its `owner_unit` (a handover that rebinds it between the two reads
+/// must win), and a row this unit took off the board is guarded by its status
+/// transition — the claim already decided whose it is, and the store refuses a
+/// move on a row that has left the expected state.
 async fn transition<F>(
     backend: &dyn StateBackend,
     workspace: &str,
@@ -870,11 +930,23 @@ where
         .dag_get_task(workspace, task_id)
         .await?
         .ok_or_else(|| format!("task {task_id} does not exist"))?;
+    if updated.owner_unit.as_deref() != Some(unit) && updated.claimed_by() != Some(unit) {
+        return Err(format!(
+            "task {task_id} is neither designated to {unit} nor taken by it; refusing to move it"
+        )
+        .into());
+    }
     mutate(&mut updated);
     updated.updated_at = Utc::now();
-    backend
-        .dag_transition_owned_task(workspace, &updated.id, expected, &updated, unit)
-        .await?;
+    if updated.owner_unit.as_deref() == Some(unit) {
+        backend
+            .dag_transition_owned_task(workspace, &updated.id, expected, &updated, unit)
+            .await?;
+    } else {
+        backend
+            .dag_transition_task(workspace, &updated.id, expected, &updated)
+            .await?;
+    }
     Ok(())
 }
 
@@ -893,7 +965,9 @@ async fn heartbeat(
     let lease = chrono::Duration::seconds(lease_secs as i64);
     let mut renewed = 0usize;
     for task in tasks {
-        if task.owner_unit.as_deref() != Some(unit) || task.status != TaskStatus::Running {
+        // 两种说法都算这个人的：提交方指定给他，或者他在任务板上接走的。
+        let designated = task.owner_unit.as_deref() == Some(unit);
+        if (!designated && task.claimed_by() != Some(unit)) || task.status != TaskStatus::Running {
             continue;
         }
         if task.lease_owner.as_deref() != Some(unit) {
@@ -906,15 +980,21 @@ async fn heartbeat(
         let mut updated = task;
         updated.lease_expires_at = Some(now + lease);
         updated.updated_at = now;
-        backend
-            .dag_transition_owned_task(
-                workspace,
-                &updated.id,
-                &[TaskStatus::Running],
-                &updated,
-                unit,
-            )
-            .await?;
+        if designated {
+            backend
+                .dag_transition_owned_task(
+                    workspace,
+                    &updated.id,
+                    &[TaskStatus::Running],
+                    &updated,
+                    unit,
+                )
+                .await?;
+        } else {
+            backend
+                .dag_transition_task(workspace, &updated.id, &[TaskStatus::Running], &updated)
+                .await?;
+        }
         renewed += 1;
     }
     Ok(renewed)
@@ -929,7 +1009,9 @@ async fn queue(
     let tasks = backend.dag_get_all_tasks(workspace).await?;
     let mut mine: Vec<Task> = tasks
         .into_iter()
-        .filter(|t| t.owner_unit.as_deref() == Some(unit))
+        // 两种说法都算「这件活是我的」：提交方指定给我，或者我在任务板上接走了。
+        // 只读第一种，接来的活就从这个人的队列里消失——他接了却看不到它。
+        .filter(|t| t.owner_unit.as_deref() == Some(unit) || t.claimed_by() == Some(unit))
         // Face nodes name their owner on the same field and are not work: the
         // roster is read with `cogneva governance`, not from the queue.
         .filter(|t| t.is_executable)
@@ -1114,7 +1196,10 @@ fn ready_owned(tasks: Vec<Task>, deps: &TaskDAG, unit: &str) -> (Vec<Task>, usiz
     let mut owned = 0usize;
     let mut ready: Vec<Task> = Vec::new();
     for task in tasks {
-        if task.owner_unit.as_deref() != Some(unit) || !task.is_executable {
+        let designated = task.owner_unit.as_deref() == Some(unit);
+        // 「还欠我几件活」这个读数必须把接来的也算进去：只数指定的，一个人从
+        // 任务板上接得越多，他看上去越闲。
+        if (!designated && task.claimed_by() != Some(unit)) || !task.is_executable {
             continue;
         }
         owned += 1;
@@ -1286,6 +1371,23 @@ mod tests {
         assert_eq!(
             owned_count, 2,
             "the face node and another unit's task are not this unit's work"
+        );
+    }
+
+    /// 从任务板上接来的活，也算这个 unit 手上欠着的。
+    #[test]
+    fn a_row_taken_off_the_board_counts_as_owned_too() {
+        let dag = TaskDAG::default();
+        let mut taken = Task::new("taken", cog_core::TaskType::DagNode, serde_json::json!({}));
+        taken.take_claim("8b", chrono::Duration::seconds(300), chrono::Utc::now());
+        let (picked, owned_count) = ready_owned(vec![taken], &dag, "8b");
+        assert!(
+            picked.is_empty(),
+            "已经接走的行在等 start，不在等下一次挑选"
+        );
+        assert_eq!(
+            owned_count, 1,
+            "接了却没被数进手上的活，这个人会越干越显得闲"
         );
     }
 

@@ -784,6 +784,31 @@ pub trait StateBackend: Send + Sync {
         Err(SFError::NotImplemented("dag_transition_owned_task".into()))
     }
 
+    /// 接活：把一条还在等人接的行交给 `updated` 里写的那个人，原子地。
+    ///
+    /// 与 [`Self::dag_transition_task`] 的差别只有一道守卫，而那道守卫就是「接活
+    /// 只能成功一次」：写入只在**这一行此刻没有人持有时**落地。判据读的是存储里
+    /// 那一行自己的认领与租约，不是调用方读到的快照——两个消费者同时读到「待接」
+    /// 时，只有一个的写会落下来，另一个拿到 [`SFError::Conflict`]，于是同一条活
+    /// 不会被两个人同时认走。
+    ///
+    /// 状态门槛仍是调用方给的 `expected`：一条已经跑完或已被取消的行不在任何
+    /// 一份 `expected` 里，因为接活不是复活。
+    ///
+    /// 默认实现返回 `NotImplemented`，与同一族的另外两个迁移方法一致：没有存储的
+    /// 后端不该悄悄把认领做成一次无条件覆盖。
+    async fn dag_claim_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        _expected: &[crate::TaskStatus],
+        _updated: &crate::Task,
+    ) -> SFResult<()> {
+        let _ = workspace_id;
+        let _ = task_id;
+        Err(SFError::NotImplemented("dag_claim_task".into()))
+    }
+
     /// Remove a task from the DAG state.
     async fn dag_remove_task(&self, workspace_id: &str, task_id: &str) -> SFResult<()> {
         let _ = workspace_id;

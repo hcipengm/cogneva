@@ -220,6 +220,19 @@ pub trait OrchestratorControl: Send + Sync {
     /// Schedule a pending task (move to scheduled state).
     async fn schedule_task(&self, task_id: &str) -> SFResult<()>;
 
+    /// 接活：把一条待接的行交给 `claimant`，写负责人与租约，原子地。
+    ///
+    /// 与 [`Self::schedule_task`] 答的不是一件事：那个把一条行挪进「已派发」，
+    /// 不记谁接了；这个记下责任人，并且只让一个人接走。派工侧在跨过队列边界时
+    /// 用它，员工侧（带外 worker、以后回合里的举手）用同一个。
+    ///
+    /// 默认实现是「做不到」，不是「先排上」：一个接不了活的后端必须让调用方看见
+    /// 它没接上，否则调用方会以为责任已经有人担了。
+    async fn claim_task(&self, task_id: &str, _claimant: &str) -> SFResult<Task> {
+        let _ = task_id;
+        Err(SFError::NotImplemented("claim_task".into()))
+    }
+
     /// Check for timed-out tasks and return their ids + side-effects.
     /// Tuple is `(task_id, retried, cancelled_ids, dlq_pushed)`.
     async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)>;
@@ -294,6 +307,22 @@ pub trait DagExecutor: Send + Sync {
 
     /// Schedule a pending task.
     async fn schedule_task(&self, task_id: &str) -> SFResult<()>;
+
+    /// 接活：把一条待接的行交给 `claimant`，写负责人与租约，原子地；返回认领
+    /// 之后的行。
+    ///
+    /// 与 [`Self::schedule_task`] 分开：那个只把行挪进「已派发」，不记谁接了。
+    /// 接活必须记下责任人，并且只让一个人接走——派工侧的读循环跨过队列边界时
+    /// 用它，员工侧（带外 worker、以后回合里的举手）用同一个。
+    ///
+    /// 默认是「做不到」，不是「先排上」：接不了活的后端必须让调用方看见它没接
+    /// 上，否则调用方会以为责任已经有人担了。
+    async fn claim_task(&self, task_id: &str, _claimant: &str) -> SFResult<Task> {
+        let _ = task_id;
+        Err(SFError::NotImplemented(
+            "claim_task: this DAG implementation cannot record who took a row".into(),
+        ))
+    }
 
     /// Assign a task to a specific agent.
     async fn assign_task(&self, task_id: &str, agent_id: &str) -> SFResult<()>;

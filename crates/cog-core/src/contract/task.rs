@@ -171,6 +171,19 @@ pub trait TaskExecutor: Send + Sync {
 
     /// Execute a single task and return a unified `TaskResult`.
     async fn execute(&self, task: &Task) -> SFResult<TaskResult>;
+
+    /// 这条活该交给谁。
+    ///
+    /// 派工侧在跨过队列边界之前问一次，拿这个名字去认领：认领要把责任人写在行
+    /// 上，而只有执行器知道自己会用谁。答案必须与 [`Self::execute`] 实际用的是
+    /// 同一个人——两处各挑一次，行上写着甲、活由乙跑，署名与责任就分家了。
+    ///
+    /// `None` 是「这个执行器说不出一个人」（没有名册、名册上空无一人）。它不是
+    /// 「谁接都行」：说不出责任人的派工要能被读出来，而不是悄悄退回没有责任人
+    /// 的那条路。
+    async fn claimant_for(&self, _task: &Task) -> Option<String> {
+        None
+    }
 }
 
 // ─── Action Planner ────────────────────────────────────────────────────────

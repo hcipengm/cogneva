@@ -412,6 +412,20 @@ pub struct PostgresStateBackend {
     pool: PgPool,
 }
 
+/// What a state transition must still be true of the row at the moment it lands.
+///
+/// The status check every transition makes is one of these; the two below are the
+/// conditions particular callers add. They are a struct rather than boolean
+/// parameters because a call site reading `Some(unit), true` says nothing about
+/// what the `true` guards, and the two answers here are never both in play.
+#[derive(Default, Clone, Copy)]
+struct TransitionGuard<'a> {
+    /// The row's `owner_unit` must be this unit, and `updated` must still name it.
+    owner: Option<&'a str>,
+    /// The row must be unclaimed: 接活只能成功一次。
+    claim: bool,
+}
+
 impl PostgresStateBackend {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -532,13 +546,16 @@ impl PostgresStateBackend {
     /// status = ANY(...)` is here a read of the last transition under the
     /// workspace lock, so the check and the write are one decision rather than
     /// two statements a second writer can slip between.
+    ///
+    /// `guard` carries the extra conditions a particular caller's write has to
+    /// meet at that same instant; see [`TransitionGuard`].
     async fn transition_task(
         &self,
         workspace_id: &str,
         task_id: &str,
         expected: &[cog_core::TaskStatus],
         updated: &cog_core::Task,
-        owner: Option<&str>,
+        guard: TransitionGuard<'_>,
     ) -> SFResult<()> {
         let mut tx = self
             .pool
@@ -555,7 +572,7 @@ impl PostgresStateBackend {
             });
         };
 
-        if let Some(owner) = owner {
+        if let Some(owner) = guard.owner {
             let row: Option<(Option<String>,)> = sqlx::query_as(
                 "SELECT owner_unit FROM task_defined WHERE task_id = $1 \
                  ORDER BY rev DESC LIMIT 1",
@@ -582,17 +599,55 @@ impl PostgresStateBackend {
             }
         }
 
+        if guard.claim {
+            // 接活只能成功一次。守卫读的是库里这一行自己的认领，不是调用方读到
+            // 的快照：两个消费者同时读到「待接」时，第二个的写必须落不下来，否则
+            // 同一条活会被两个人同时接走，而两边都会认为自己有责任去干。
+            //
+            // 持有 = 有个名字、且那个人的租约还没到期，与 `Task::claim_held_now`
+            // 同一个口径。只读到期的名字不行：一条回到队里、名字还留着的行会永远
+            // 「已经被 X 接了」，而 X 早就不在了——那条活从此没人接得走。
+            // `Pending` 行上的名字同样不算认领（那是上一轮交付的人）。
+            let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+                sqlx::query_as(
+                    "SELECT d.agent_id, c.lease_expires_at \
+                       FROM (SELECT agent_id FROM task_defined \
+                              WHERE task_id = $1 AND workspace_id = $2 \
+                              ORDER BY rev DESC LIMIT 1) d \
+                       LEFT JOIN task_current c \
+                         ON c.task_id = $1 AND c.workspace_id = $2",
+                )
+                .bind(task_id)
+                .bind(workspace_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| SFError::Database(e.to_string()))?;
+            let held = row.and_then(|(agent, expires)| {
+                agent.filter(|_| expires.is_some_and(|expires| expires > chrono::Utc::now()))
+            });
+            if current != cog_core::TaskStatus::Pending {
+                if let Some(held) = held {
+                    return Err(SFError::Conflict(format!(
+                        "task {task_id} is already claimed by {held}"
+                    )));
+                }
+            }
+        }
+
         if !expected.contains(&current) {
             // 两条路对「状态不对」的回答不同，因为这个错在这个调用方那里含义不同：
             // 带 owner 的那条是「我读到的快照过期了，重读一次」，不带 owner 的那条
             // 是「这件任务不该被我推进」。把它报成一个，前者的重试逻辑会退化成把
             // 一次过期读当成本次任务的失败。
-            return Err(match owner {
-                Some(_) => SFError::Conflict(format!(
+            //
+            // 接活走的是前一种：一次没接上（别人先接了）不是这条活坏了，是这次
+            // 读取过期了。
+            return Err(match (guard.owner, guard.claim) {
+                (Some(_), _) | (_, true) => SFError::Conflict(format!(
                     "task {task_id} is in {:?} state, not one of the states this transition accepts",
                     current
                 )),
-                None => SFError::TaskFailed {
+                (None, false) => SFError::TaskFailed {
                     task_id: task_id.into(),
                     reason: format!("Cannot transition task in {current:?} state"),
                 },
@@ -1058,8 +1113,34 @@ impl StateBackend for PostgresStateBackend {
         expected: &[cog_core::TaskStatus],
         updated: &cog_core::Task,
     ) -> SFResult<()> {
-        self.transition_task(workspace_id, task_id, expected, updated, None)
-            .await
+        self.transition_task(
+            workspace_id,
+            task_id,
+            expected,
+            updated,
+            TransitionGuard::default(),
+        )
+        .await
+    }
+
+    async fn dag_claim_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        expected: &[cog_core::TaskStatus],
+        updated: &cog_core::Task,
+    ) -> SFResult<()> {
+        self.transition_task(
+            workspace_id,
+            task_id,
+            expected,
+            updated,
+            TransitionGuard {
+                claim: true,
+                ..TransitionGuard::default()
+            },
+        )
+        .await
     }
 
     async fn dag_transition_owned_task(
@@ -1070,8 +1151,17 @@ impl StateBackend for PostgresStateBackend {
         updated: &cog_core::Task,
         owner: &str,
     ) -> SFResult<()> {
-        self.transition_task(workspace_id, task_id, expected, updated, Some(owner))
-            .await
+        self.transition_task(
+            workspace_id,
+            task_id,
+            expected,
+            updated,
+            TransitionGuard {
+                owner: Some(owner),
+                ..TransitionGuard::default()
+            },
+        )
+        .await
     }
 
     /// Remove every row a task owns.

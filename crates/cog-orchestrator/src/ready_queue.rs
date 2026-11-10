@@ -147,6 +147,97 @@ pub fn is_face_duty(task: &Task) -> bool {
         if kind == crate::governance_acts::FACE_DUTY_TASK_TYPE)
 }
 
+/// 为什么一条活的认领没有被批准。
+///
+/// 每一种都是给读的人的一句话，不是一个计数：被拒的认领在派工侧是常态（别人先
+/// 接了），在员工侧是「这件活不归你」，两种情况要能分开读，否则一次正常的抢单
+/// 失败会和一次越权认领写进同一行日志。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimRefusal {
+    /// 没有名字的认领不是认领：责任人写不出来的活，没人对它负责。
+    Anonymous,
+    /// 这条行已经不在待接状态（在跑、跑完、失败、取消）。
+    MovedOn(cog_core::TaskStatus),
+    /// 已经有人认领，而且那个人的租约还没到期（那个人也可能是发起认领的人自己）。
+    HeldByAnother(String),
+    /// 这条行指定了另一个人来做。
+    NamesAnotherOwner(String),
+    /// 这条行不是一个能执行的体力活（面值班行、图节点）。
+    NoBodyToRun,
+    /// 这条行没说怎么算做完。接走它只会让一件谁也关不掉的行看起来有人在干。
+    NoCriterion,
+}
+
+impl ClaimRefusal {
+    /// 稳态拼写：日志与读数按它分组，翻成人话是界面那一层的事。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClaimRefusal::Anonymous => "anonymous",
+            ClaimRefusal::MovedOn(_) => "moved_on",
+            ClaimRefusal::HeldByAnother(_) => "held_by_another",
+            ClaimRefusal::NamesAnotherOwner(_) => "names_another_owner",
+            ClaimRefusal::NoBodyToRun => "no_body_to_run",
+            ClaimRefusal::NoCriterion => "no_criterion",
+        }
+    }
+}
+
+/// 批准一次认领：把待接的活交给 `claimant`，写负责人与租约。
+///
+/// 这是「谁能接哪件活」的唯一答案。派工的循环、带外员工自己的 `claim`、以后
+/// 员工在回合里举手要活，都问这一个函数；每处各写一遍，最先漂的总是「已经有人
+/// 接了」这一条，而它漂了的后果是两个人同时以为自己负责同一件活。
+///
+/// 它只判、不写。真正的写由 [`cog_core::StateBackend::dag_claim_task`] 在存储里
+/// 原子地落下——判据读的是调用方手里的快照，而快照会过期：两个人同时读到「待接」
+/// 时，谁赢只能由那一次写来定，不能由这里的两份读决定。
+///
+/// 被批准返回的是**认领之后的行**，调用方应该拿它去执行，而不是继续用自己读到
+/// 的那份：执行必须发生在认领之后，否则一件刚被别人接走的活会被照着旧快照再跑
+/// 一遍。
+pub fn approve_claim(
+    task: &Task,
+    claimant: &str,
+    lease: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Task, ClaimRefusal> {
+    let claimant = claimant.trim();
+    if claimant.is_empty() {
+        return Err(ClaimRefusal::Anonymous);
+    }
+    // 「能不能接」先于「谁在接」：一条不是活的行的状态永远不值得解释。
+    if !task.is_executable || is_face_duty(task) {
+        return Err(ClaimRefusal::NoBodyToRun);
+    }
+    if !states_what_done_means(task) {
+        return Err(ClaimRefusal::NoCriterion);
+    }
+    match task.status {
+        cog_core::TaskStatus::Pending | cog_core::TaskStatus::Scheduled => {}
+        moved => return Err(ClaimRefusal::MovedOn(moved)),
+    }
+    // 认领已经成立、租约还没到期，就不再批——**包括认领者自己再问一次**。
+    // 再写一次不会让认领更成立，却会让同一条就绪消息被同一双手跑第二遍：
+    // 认领是一次迁移，不是一个可以反复确认的状态。
+    if let Some(held) = task.claimed_by() {
+        if task.claim_is_live(lease, now) {
+            return Err(ClaimRefusal::HeldByAnother(held.to_string()));
+        }
+    }
+    // 指定的归属是一次路由决定，不是一把锁——只对普通队列成立。急件那一列是
+    // 「谁空谁跑」，它上面留着的归属不拦人（见 [`carries_an_owner`]）。
+    if carries_an_owner(task) {
+        if let Some(owner) = task.owner_unit.as_deref() {
+            if owner != claimant {
+                return Err(ClaimRefusal::NamesAnotherOwner(owner.to_string()));
+            }
+        }
+    }
+    let mut claimed = task.clone();
+    claimed.take_claim(claimant, lease, now);
+    Ok(claimed)
+}
+
 /// The queue a ready task is published to. One definition, because the
 /// publisher and the consumer must answer the same question the same way.
 pub fn ready_stream_for(task: &Task, workspace_id: &str) -> String {
@@ -1488,6 +1579,126 @@ mod tests {
             "没有读数时这一刀一个座位都没分：门类落不落进这一拍由后面按优先序截断那一刀说了算"
         );
         assert_eq!(ordered, vec!["g1", "p1", "g2"], "顺序原样保留");
+    }
+
+    /// 接活：待接的行谁都能接，接完写负责人与租约；已经有人接走的行再接一次
+    /// 必须被拒。
+    ///
+    /// 这条测试判的是「同一条活不会被两个人同时认走」这件事里判据的那一半：
+    /// 谁在读、读到了什么。写的那一半在存储的原子迁移上，但判据只要漏掉
+    /// 「已经有人接了」这一条，另一个人的写就会落在一条已经被认领的行上。
+    #[test]
+    fn a_claim_names_its_holder_and_a_second_claim_on_a_held_row_is_refused() {
+        let now = chrono::Utc::now();
+        let lease = chrono::Duration::seconds(300);
+
+        let mut open = task("t1", TaskType::DagNode, serde_json::json!({}));
+        open.acceptance = vec!["the build passes".into()];
+        let claimed = approve_claim(&open, "E0412", lease, now).expect("待接的行谁都能接");
+        assert_eq!(claimed.status, cog_core::TaskStatus::Scheduled);
+        assert_eq!(claimed.claimed_by(), Some("E0412"));
+        assert_eq!(claimed.lease_expires_at, Some(now + lease));
+
+        assert_eq!(
+            approve_claim(&claimed, "E0455", lease, now),
+            Err(ClaimRefusal::HeldByAnother("E0412".into())),
+            "别人已经接走的活，第二个人接不上"
+        );
+        // 认领者自己再问一次也不批：认领已经成立，再写一次不会让它更成立，
+        // 却会在账上记下第二次接手。
+        assert_eq!(
+            approve_claim(&claimed, "E0412", lease, now),
+            Err(ClaimRefusal::HeldByAnother("E0412".into()))
+        );
+
+        // 认领者消失（租约过期）之后，这条活重新算没人接。
+        let later = now + chrono::Duration::seconds(301);
+        let retaken =
+            approve_claim(&claimed, "E0455", lease, later).expect("租约过期的认领不再拦人");
+        assert_eq!(retaken.claimed_by(), Some("E0455"));
+    }
+
+    /// 不是活的、说不清怎么算完的、已经跑完的行，都不批准认领。
+    ///
+    /// 四种拒绝分开报，因为修法不同：面值班行是类型问题，没验收标准是提交问题，
+    /// 跑完是抢单来晚了。
+    #[test]
+    fn a_claim_is_refused_for_rows_that_are_not_work_or_are_already_settled() {
+        let now = chrono::Utc::now();
+        let lease = chrono::Duration::seconds(300);
+
+        let mut duty = task(
+            "face-work-x",
+            TaskType::Custom(crate::governance_acts::FACE_DUTY_TASK_TYPE.into()),
+            serde_json::json!({}),
+        );
+        duty.acceptance = vec!["the face is staffed".into()];
+        assert_eq!(
+            approve_claim(&duty, "E0412", lease, now),
+            Err(ClaimRefusal::NoBodyToRun)
+        );
+
+        let no_criterion = task("t2", TaskType::DagNode, serde_json::json!({}));
+        assert_eq!(
+            approve_claim(&no_criterion, "E0412", lease, now),
+            Err(ClaimRefusal::NoCriterion)
+        );
+
+        let mut done = task("t3", TaskType::DagNode, serde_json::json!({}));
+        done.acceptance = vec!["the build passes".into()];
+        done.status = cog_core::TaskStatus::Completed;
+        assert_eq!(
+            approve_claim(&done, "E0412", lease, now),
+            Err(ClaimRefusal::MovedOn(cog_core::TaskStatus::Completed)),
+            "接活不是复活"
+        );
+
+        let mut running = task("t4", TaskType::DagNode, serde_json::json!({}));
+        running.acceptance = vec!["the build passes".into()];
+        running.begin_run("run-7", lease, now);
+        assert_eq!(
+            approve_claim(&running, "E0455", lease, now),
+            Err(ClaimRefusal::MovedOn(cog_core::TaskStatus::Running))
+        );
+
+        let mut unnamed = task("t5", TaskType::DagNode, serde_json::json!({}));
+        unnamed.acceptance = vec!["the build passes".into()];
+        assert_eq!(
+            approve_claim(&unnamed, "  ", lease, now),
+            Err(ClaimRefusal::Anonymous)
+        );
+        // 上一条不是死路：同一条行给一个有名字的人就能接。
+        assert!(approve_claim(&unnamed, "E0412", lease, now).is_ok());
+    }
+
+    /// 指定了归属的行只归那个人——急件那一列例外，它是「谁空谁跑」。
+    ///
+    /// 两处的答案必须与 [`carries_an_owner`] 同源：若这里绕过它自己判一次，
+    /// 2026-11-05 那次事故（面主被盖到急件行上，行在队列里等了十小时）会从
+    /// 另一个门再发生一遍。
+    #[test]
+    fn a_designated_row_belongs_to_its_owner_except_in_the_stop_the_line_lane() {
+        let now = chrono::Utc::now();
+        let lease = chrono::Duration::seconds(300);
+
+        let mut designated = task("t1", TaskType::DagNode, serde_json::json!({}));
+        designated.acceptance = vec!["the build passes".into()];
+        designated.owner_unit = Some("ci-face".into());
+        assert_eq!(
+            approve_claim(&designated, "E0412", lease, now),
+            Err(ClaimRefusal::NamesAnotherOwner("ci-face".into()))
+        );
+        assert!(approve_claim(&designated, "ci-face", lease, now).is_ok());
+
+        let mut urgent = designated.clone();
+        urgent.input = serde_json::json!({
+            cog_core::INPUT_READY_LANE: cog_core::READY_LANE_STOP_THE_LINE
+        });
+        assert!(
+            !carries_an_owner(&urgent),
+            "急件行上的归属是一次路由偏好，不是锁"
+        );
+        assert!(approve_claim(&urgent, "E0412", lease, now).is_ok());
     }
 
     /// 两类各自保序：类内部打乱会让同一类里等得最久的那条排到最后。
