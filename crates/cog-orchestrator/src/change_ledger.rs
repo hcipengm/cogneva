@@ -1676,6 +1676,56 @@ pub fn parse_rows_per_handover(raw: &str) -> Result<usize, String> {
     }
 }
 
+/// 把上一代任务板上的续跑指针交给下一代，返回搬过去的个数。
+///
+/// 续跑点挂在**任务 id** 的板上（[`cog_core::checkpoint_field`]），而重派一代
+/// 就是一个新 id：不搬这一步，一次「环境把持有它的进程杀了」的重试必然从头把
+/// 整段对话再买一遍。实测 2026-11-10 的 14:00–15:34：130 次 `-r1` 重派，每一代
+/// 都是新任务、空板，前面已经付过钱的对话一个 token 也没回来——那一小时
+/// 4,780 次有价调用、¥95.87，而没有一件产物落地。
+///
+/// 搬的是指针，不是进度：值仍然指向存储里那份快照，恢复端读到它才谈得上接着跑。
+/// 字段按 [`cog_core::CHECKPOINT_FIELD_PREFIX`] 认，不点名任何角色——角色词表在
+/// 别处定，这里点名就是把两份词表接上，接漏的那天是「某几路不再续跑」，而这条链
+/// 失败的样子正是「任务从头重跑」。
+///
+/// 读不到旧板不是错误：上一代从没跑到写检查点那一步时，它本来就没有指针。
+async fn carry_resume_points(
+    state: &dyn cog_core::StateBackend,
+    previous: &str,
+    next: &str,
+) -> usize {
+    let board = match state.get_board(previous).await {
+        Ok(Some(board)) => board,
+        Ok(None) => return 0,
+        Err(e) => {
+            warn!(
+                task = previous,
+                error = %e,
+                "change ledger: the predecessor's board could not be read, so this re-arm starts \
+                 from the beginning instead of from the progress it had"
+            );
+            return 0;
+        }
+    };
+    let mut carried = 0usize;
+    for (field, pointer) in board.fields {
+        if !field.starts_with(cog_core::CHECKPOINT_FIELD_PREFIX) || pointer.is_empty() {
+            continue;
+        }
+        match state.set_board_field(next, &field, &pointer).await {
+            Ok(()) => carried += 1,
+            Err(e) => warn!(
+                task = next,
+                field = %field,
+                error = %e,
+                "change ledger: a resume point could not be carried into the re-armed task"
+            ),
+        }
+    }
+    carried
+}
+
 /// The task this loop hands owed changes over as.
 ///
 /// One task, up to [`ROWS_PER_HANDOVER`] rows. The id is derived from the
@@ -5668,6 +5718,37 @@ async fn dispatch_pass(
         }
         let goal = dispatch_goal_for(&rows);
         let task = dispatch_task(&rows, batch.generation);
+        // 重派一代时，把上一代真正的进度接过来：只搬 [`DeadEnvironment`] 那一支，
+        // 因为只有那一代的对话是「做到一半被环境杀了」，接着跑正好；落过地又被
+        // 重开、或者从没开跑就被折叠的那两代，旧对话讲的是另一件事（或者根本
+        // 没有），搬过去等于把上一件事的结论喂给这一件。写在提交之前：新任务
+        // 一入图就可能被摘走开跑，恢复端读板只会早不会晚，晚一步就是「续跑点
+        // 明明已经写下去了，这一代还是从头开始」。
+        if batch.generation > 0 {
+            if let Some(state) = events {
+                let anchor = &rows[0].identity;
+                let previous = dispatch_task_id(anchor, batch.generation - 1);
+                let next = dispatch_task_id(anchor, batch.generation);
+                let died_to_the_environment = orchestrator
+                    .get_task(&previous)
+                    .await
+                    .map(|task| classify_handover(&task) == Handover::DeadEnvironment)
+                    .unwrap_or(false);
+                if died_to_the_environment {
+                    let carried = carry_resume_points(state, &previous, &next).await;
+                    if carried > 0 {
+                        info!(
+                            changes = rows.len(),
+                            carried,
+                            generation = batch.generation,
+                            previous = %previous,
+                            next = %next,
+                            "change ledger: a re-armed handover inherits the resume points its predecessor left"
+                        );
+                    }
+                }
+            }
+        }
         let root = dispatch_project_root_for(&batch.project);
         match orchestrator.submit_goal_auto(&goal, vec![root, task]).await {
             Ok(_) => {
@@ -7970,6 +8051,72 @@ mod tests {
         let two = ChangeIdentity::new("grep", "crates/x", "fn thing");
         assert_eq!(dispatch_task_id(&one, 0), dispatch_task_id(&two, 0));
         assert!(dispatch_task_id(&one, 0).starts_with(DISPATCH_TASK_PREFIX));
+    }
+
+    async fn board_field(
+        state: &cog_test_support::MemoryStateBackend,
+        task: &str,
+        field: &str,
+    ) -> Option<String> {
+        state
+            .get_board(task)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|board| board.fields.get(field).cloned())
+    }
+
+    /// 重派一代要把上一代的续跑指针带上：不搬，一次「环境杀了我的进程」的重试
+    /// 就只能从头把整段对话再买一遍（实测 2026-11-10 那一小时 130 次 `-r1`，
+    /// 每一次都是空板、从头跑）。
+    #[tokio::test]
+    async fn a_rearm_carries_the_resume_points_its_predecessor_left() {
+        let state = cog_test_support::MemoryStateBackend::new();
+        state
+            .set_board_field(
+                "wanted-old",
+                &cog_core::checkpoint_field("generator"),
+                "snap-old-generator",
+            )
+            .await
+            .unwrap();
+        state
+            .set_board_field(
+                "wanted-old",
+                &cog_core::checkpoint_field("planner"),
+                "snap-old-planner",
+            )
+            .await
+            .unwrap();
+        // 板上的其他字段不是续跑点：搬过去等于把一块无关的板粘到新任务上。
+        state
+            .set_board_field("wanted-old", "notes", "not a resume point")
+            .await
+            .unwrap();
+
+        let carried = carry_resume_points(&state, "wanted-old", "wanted-old-r1").await;
+
+        assert_eq!(carried, 2);
+        assert_eq!(
+            board_field(&state, "wanted-old-r1", &cog_core::checkpoint_field("generator")).await,
+            Some("snap-old-generator".to_string())
+        );
+        assert_eq!(
+            board_field(&state, "wanted-old-r1", &cog_core::checkpoint_field("planner")).await,
+            Some("snap-old-planner".to_string())
+        );
+        assert_eq!(board_field(&state, "wanted-old-r1", "notes").await, None);
+    }
+
+    /// 上一代从没写到检查点那一步：没有板可读，搬零个，这不是一条错误路径。
+    #[tokio::test]
+    async fn a_rearm_from_a_generation_that_never_wrote_a_checkpoint_carries_nothing() {
+        let state = cog_test_support::MemoryStateBackend::new();
+
+        assert_eq!(
+            carry_resume_points(&state, "wanted-old", "wanted-old-r1").await,
+            0
+        );
     }
 
     /// Two changes in the same part of the tree are two tasks of one project,

@@ -330,6 +330,90 @@ pub async fn checkpoint_task_with_timeout(
     round
 }
 
+/// 一个进程这一轮看了自己持有的几个任务。
+///
+/// `owned` 与 `checked` 必须分开：只报「写了几份」的话，一个手上四十个在跑任务、
+/// 每轮只走到前两个的进程，读数与一个手上只有两个任务的进程逐字相同——前者是
+/// 覆盖缺口，后者是正常工作，而覆盖缺口正是这条链最贵的失败方式（任务从头重跑，
+/// 没有错误、没有日志、没有规则）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedRound {
+    /// 这一轮枚举到的、本进程持有的在跑任务数。
+    pub owned: usize,
+    /// 这一轮真的走到（读过名册、拍过快照）的任务数。
+    pub checked: usize,
+    /// 看过的那几个任务里写下的续跑点数。
+    pub saved: usize,
+    /// 下一轮从这个下标起：接在本轮停下的地方，而不是每次都从队头。
+    pub cursor: usize,
+}
+
+/// 一轮：把本进程持有的任务逐个落检查点，时间用完了就停，下一轮接着走。
+///
+/// 为什么要有 `cursor`：任务名册的顺序在两轮之间几乎不变，而一个卡住的 agent
+/// 会把它那一步的等待上限整段吃掉（实测 2026-11-10：主进程六十分钟里只覆盖了
+/// 4 个任务，同时有 95 个变更队在跑；轮次告警 23 次，每次都是「有些任务这一轮
+/// 没走到」，但走不到的永远是同一批）。固定从头开始＝固定的前缀永远排得上、其余
+/// 永远排不上。轮转起点把这个「谁被饿死」从名册顺序里拿出来：每轮从上一轮停下
+/// 的地方继续，`ceil(owned / 每轮走得完的个数)` 轮之内全覆盖。
+///
+/// 为什么每步的上限要跟着剩余预算缩：整轮还有一个墙（调用方给的 `budget`，同时
+/// 是向存活体系申报的工期界）。若每步都按满额 15 秒等，一轮末尾那一步会越过墙被
+/// 外面砍掉，而砍掉的那一轮连「走到哪了」都留不下来——恰恰是本次要修的那件事。
+/// 缩到剩余预算，一轮总在墙内自己收尾，读数与下一轮的起点都是真的。
+///
+/// 顺序先排序再轮转：起点是下标，枚举面给什么顺序就轮什么顺序的话，同一个任务在
+/// 两轮里可能落在不同下标上，轮转就不再是轮转。
+pub async fn checkpoint_owned(
+    mut tasks: Vec<String>,
+    cursor: usize,
+    agents: &dyn CheckpointAgents,
+    state: &Arc<dyn StateBackend>,
+    budget: Duration,
+) -> (OwnedRound, Vec<CheckpointRound>) {
+    tasks.sort();
+    let owned = tasks.len();
+    let mut coverage = OwnedRound {
+        owned,
+        ..Default::default()
+    };
+    if owned == 0 {
+        return (coverage, Vec::new());
+    }
+    let start = cursor % owned;
+    // 预算与每一步的等待上限由 tokio 的计时器施加，所以期限也读同一只钟：
+    // 两只钟（std 与 tokio）混用，在时间被暂停的测试里预算就完全不生效。
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut rounds = Vec::with_capacity(owned);
+    for offset in 0..owned {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let index = (start + offset) % owned;
+        let round = checkpoint_task_with_timeout(
+            &tasks[index],
+            agents,
+            state,
+            CHECKPOINT_STEP_TIMEOUT.min(remaining),
+        )
+        .await;
+        coverage.saved += round.saved;
+        rounds.push(round);
+    }
+    coverage.checked = rounds.len();
+    coverage.cursor = (start + coverage.checked) % owned;
+    if coverage.checked < owned {
+        tracing::warn!(
+            owned,
+            checked = coverage.checked,
+            budget_secs = budget.as_secs_f64(),
+            "task checkpoint round ran out of budget: the tasks it did not reach are visited next round, starting where this one stopped"
+        );
+    }
+    (coverage, rounds)
+}
+
 /// 产出侧的结局闭集，六个都发布——零也发布。
 ///
 /// 有值的格与「整条不在」是两件事，而产出侧的计数只在真有任务在跑时才会加：一个
@@ -888,6 +972,155 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(500),
             "a hung agent used to block the whole iteration indefinitely"
         );
+    }
+
+    /// 每个任务都要等一段时间的名册：一轮的预算是固定的，所以一轮只走得完前几个。
+    ///
+    /// 这不是为了模拟「慢」，是为了把**覆盖缺口**做成可数的：一个进程手上有五个
+    /// 在跑任务、每轮只走得完两个的时候，缺的那三个在旧读数上不存在——只看「写了
+    /// 几份」，它与「手上只有两个任务」逐字相同。
+    struct SlowTasks {
+        wait: std::time::Duration,
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CheckpointAgents for SlowTasks {
+        async fn agents_of(&self, task_id: &str) -> SFResult<Vec<(String, String)>> {
+            tokio::time::sleep(self.wait).await;
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(task_id.to_string());
+            Ok(vec![(
+                cog_core::agent_id_for(task_id, "planner"),
+                "planner".to_string(),
+            )])
+        }
+        async fn snapshot(&self, task_id: &str, _agent_id: &str) -> SFResult<Snapshot> {
+            Ok(Snapshot {
+                checkpoint_id: format!("cp-{task_id}"),
+                messages: 1,
+            })
+        }
+        async fn persisted(&self, _checkpoint_id: &str) -> SFResult<bool> {
+            Ok(true)
+        }
+        async fn forget(&self, _checkpoint_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    fn seen_tasks(agents: &SlowTasks) -> Vec<String> {
+        agents
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 一轮走不完的名册，下一轮接在停下的地方走：固定的前缀不许永远排得上、
+    /// 其余永远排不上。
+    ///
+    /// 实测 2026-11-10：主进程六十分钟只覆盖了自己持有的 4 个任务，同一时间有
+    /// 95 个变更队在这台进程上跑；轮次被预算砍断 23 次，而每一轮都从队头开始，
+    /// 于是「这一轮没走到的」永远是同一批。改之前的数只报「写了几份」，缺口
+    /// 在读数上完全不存在。
+    #[tokio::test(start_paused = true)]
+    async fn a_round_that_runs_out_of_budget_resumes_where_it_stopped() {
+        let (_, state) = board();
+        let agents = SlowTasks {
+            wait: std::time::Duration::from_millis(40),
+            seen: Mutex::new(Vec::new()),
+        };
+        let tasks: Vec<String> = (1..=5).map(|i| format!("t{i}")).collect();
+        // 40ms + 40ms 之后只剩 20ms：第三个任务起得来、走不完，第四个起不来。
+        let budget = std::time::Duration::from_millis(100);
+
+        let (first, _) = checkpoint_owned(tasks.clone(), 0, &agents, &state, budget).await;
+        assert_eq!(first.owned, 5, "the round knows how many tasks it holds");
+        assert_eq!(
+            first.checked, 3,
+            "the budget covers three attempts of the five; the other two are a gap, not a silence"
+        );
+        assert_eq!(first.cursor, 3, "the next round starts where this one stopped");
+        assert_eq!(
+            seen_tasks(&agents),
+            ["t1", "t2"],
+            "the third attempt started but did not finish inside what was left of the budget"
+        );
+
+        // 接着停下的地方走：下一轮落到第一轮一次都没碰过的 t4、t5 上。
+        let (second, _) =
+            checkpoint_owned(tasks.clone(), first.cursor, &agents, &state, budget).await;
+        assert_eq!(second.cursor, 1, "five attempts in, three covered, wrapped");
+        assert_eq!(
+            seen_tasks(&agents),
+            ["t1", "t2", "t4", "t5"],
+            "the second round reaches the tasks the first never got to"
+        );
+
+        // 轮转把整份名册盖满：最多 owned 轮，每一个任务都至少走完过一次。
+        let covered = |agents: &SlowTasks| {
+            let mut seen = seen_tasks(agents);
+            seen.sort();
+            seen.dedup();
+            seen
+        };
+        let mut cursor = second.cursor;
+        for _ in 0..tasks.len() {
+            if covered(&agents).len() == tasks.len() {
+                break;
+            }
+            let (round, _) = checkpoint_owned(tasks.clone(), cursor, &agents, &state, budget).await;
+            cursor = round.cursor;
+        }
+        assert_eq!(
+            covered(&agents),
+            ["t1", "t2", "t3", "t4", "t5"],
+            "rotation is not a rotation if the tail never comes up"
+        );
+    }
+
+    /// 顺序先定：起点是下标，名册顺序不许在两轮之间换。
+    #[tokio::test(start_paused = true)]
+    async fn the_round_sorts_its_roster_so_the_cursor_means_the_same_thing_twice() {
+        let (_, state) = board();
+        let agents = SlowTasks {
+            wait: std::time::Duration::from_millis(40),
+            seen: Mutex::new(Vec::new()),
+        };
+        let reversed: Vec<String> = (1..=5).rev().map(|i| format!("t{i}")).collect();
+
+        let _ = checkpoint_owned(
+            reversed,
+            0,
+            &agents,
+            &state,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        // 名册给的是倒序，这一轮仍然从 t1 起：起点是下标，而下标只在排好序的名册上
+        // 才指向同一个任务。
+        assert_eq!(seen_tasks(&agents), ["t1", "t2"]);
+    }
+
+    /// 手上没有在跑任务的一轮：不是一个缺口，是这一轮没有工作。
+    #[tokio::test]
+    async fn a_round_with_nothing_owned_is_not_a_shortfall() {
+        let (_, state) = board();
+        let agents = SlowTasks {
+            wait: std::time::Duration::ZERO,
+            seen: Mutex::new(Vec::new()),
+        };
+
+        let (round, rounds) =
+            checkpoint_owned(Vec::new(), 0, &agents, &state, std::time::Duration::from_secs(1))
+                .await;
+
+        assert_eq!(round, OwnedRound::default());
+        assert!(rounds.is_empty());
     }
 
     /// 写得进、读不出的板：只用来把「板读失败」这条路走通。
