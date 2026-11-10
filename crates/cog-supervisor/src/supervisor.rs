@@ -31,17 +31,6 @@ pub const SUPERVISOR_LOOP: &str = "supervisor_main";
 // cap: bound — 一趟超过本环最粗的节拍就已经被自己下一次追上，再等就不是这条环在干活了
 pub const PASS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long one rebalance pass may take before it is abandoned.
-///
-/// [`PASS_TIMEOUT`] is the coarsest of the loop's *sibling* schedules, which is
-/// why it is 30s: it exists so an upstream nobody bounded cannot hold the beat.
-/// It is not this arm's own wait. This arm runs every 300s, so a pass that
-/// takes 45s has not been overtaken by its next turn, and cutting it at a
-/// sibling's 30s recorded a slow pass as a failed round -- on every round,
-/// which is the all-failed shape `supervisor_rebalance_pass_failing` reads.
-// cap: bound — 本臂自己的节拍是 300s，一趟占不到它的五分之一；再长就该怀疑读图卡住了，而不是「再等等」
-pub const REBALANCE_PASS_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Await one pass, but not forever.
 ///
 /// `None` is a verdict of this loop, not of the component that failed to
@@ -56,17 +45,16 @@ async fn bounded_pass<T>(limit: Duration, pass: impl std::future::Future<Output 
 /// The cadence this loop declares for itself.
 ///
 /// The period is the shortest of its arms' intervals, because the loop beats
-/// whenever any of its tickers fires; the work budget is the longest bound any
-/// arm is cut at, [`PASS_TIMEOUT`] or [`REBALANCE_PASS_TIMEOUT`], because what
-/// stands between two beats is one pass and that is the bound the pass is cut
-/// at. Both numbers are read by the rule that compares the
+/// whenever any of its tickers fires; the work budget is [`PASS_TIMEOUT`],
+/// because what stands between two beats is one pass and that is the bound the
+/// pass is cut at. Both numbers are read by the rule that compares the
 /// heartbeat's age against this declaration, so declaring them from one place
 /// is what keeps the wall the alarm uses and the wall the passes are held to
 /// from drifting apart.
 pub fn supervisor_cadence(beat_period: Duration) -> cog_core::loop_health::Cadence {
     cog_core::loop_health::Cadence::PeriodicWithWork {
         period: beat_period,
-        work: PASS_TIMEOUT.max(REBALANCE_PASS_TIMEOUT),
+        work: PASS_TIMEOUT,
     }
 }
 
@@ -950,12 +938,7 @@ impl Supervisor {
                     this.record_pass(SupervisorPass::Quota, ok).await;
                 }
                 _ = rebalance.tick() => {
-                    // The wall is this arm's own, not the loop's fastest tick:
-                    // a pass slow only against the 30s sibling arm is this loop
-                    // doing its work, and a wall three times tighter than the
-                    // work makes every round read as a failed round.
-                    let pass_bound = PASS_TIMEOUT.max(REBALANCE_PASS_TIMEOUT);
-                    let ok = match bounded_pass(pass_bound, this.run_rebalance_pass()).await {
+                    let ok = match bounded_pass(PASS_TIMEOUT, this.run_rebalance_pass()).await {
                         Some(Ok(())) => {
                             *this.last_rebalance.lock().await = Some(Utc::now());
                             true
@@ -965,7 +948,7 @@ impl Supervisor {
                             false
                         }
                         None => {
-                            warn!(limit = ?pass_bound, "Supervisor rebalance pass did not answer within its bound");
+                            warn!(limit = ?PASS_TIMEOUT, "Supervisor rebalance pass did not answer within its bound");
                             false
                         }
                     };
@@ -1345,7 +1328,7 @@ mod announceable_tests {
     fn the_declared_cadence_carries_the_bound_the_passes_are_cut_at() {
         let cadence = supervisor_cadence(Duration::from_secs(5));
         assert_eq!(cadence.period_secs(), 5);
-        assert!(cadence.work_budget_secs() >= PASS_TIMEOUT.as_secs());
+        assert_eq!(cadence.work_budget_secs(), PASS_TIMEOUT.as_secs());
         assert_ne!(
             cadence.work_budget_secs(),
             0,

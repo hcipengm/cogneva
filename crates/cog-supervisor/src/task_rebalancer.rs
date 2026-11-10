@@ -107,13 +107,6 @@ impl TaskRebalancer {
         let agents = self.registry.agents();
         let mut available: Vec<(AgentInfo, usize)> = Vec::with_capacity(agents.len());
 
-        // One read of the graph for the whole pass, folded into per-agent
-        // counts. This used to be a per-agent query that re-read every task row
-        // for each registered agent, so a pass cost one whole-graph clone per
-        // agent and the cost grew with the fleet until the pass outlived its
-        // wall on every round.
-        let in_flight_by_agent = self.in_flight_by_agent().await;
-
         for agent in agents {
             let backend_state = self
                 .state_backend
@@ -131,10 +124,7 @@ impl TaskRebalancer {
                 continue;
             }
 
-            let in_flight = in_flight_by_agent
-                .get(&agent.agent_id)
-                .copied()
-                .unwrap_or(0);
+            let in_flight = self.count_running_tasks_for_agent(&agent.agent_id).await;
 
             if in_flight > self.cfg.max_tasks_per_agent {
                 plan.overloaded_agents
@@ -209,22 +199,16 @@ impl TaskRebalancer {
         Ok(plan)
     }
 
-    /// Count in-flight tasks per agent, from one snapshot of the graph.
-    ///
-    /// This used to be a query per agent that re-read every task row each time,
-    /// so a pass cost one whole-graph clone per registered agent; it costs one
-    /// read now whatever the fleet size.
-    async fn in_flight_by_agent(&self) -> HashMap<String, usize> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for task in self.orchestrator.get_all_tasks().await {
-            if !matches!(task.status, TaskStatus::Scheduled | TaskStatus::Running) {
-                continue;
-            }
-            if let Some(agent_id) = task.agent_id {
-                *counts.entry(agent_id).or_default() += 1;
-            }
-        }
-        counts
+    /// Count the number of running tasks owned by an agent according
+    /// to the orchestrator.
+    async fn count_running_tasks_for_agent(&self, agent_id: &str) -> usize {
+        self.orchestrator
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .filter(|t| t.agent_id.as_deref() == Some(agent_id))
+            .filter(|t| matches!(t.status, TaskStatus::Scheduled | TaskStatus::Running))
+            .count()
     }
 
     /// Build a recovery plan for tasks whose agents were declared Dead.
@@ -243,15 +227,11 @@ impl TaskRebalancer {
     ) -> SupervisorResult<RebalancePlan> {
         let mut plan = RebalancePlan::default();
 
-        // One read of the graph per pass, for the same reason `plan()` takes
-        // one: a recovered checkpoint used to cost its own whole-graph clone,
-        // so a pass after a fleet-wide death read the graph once per casualty.
-        let tasks = self.orchestrator.get_all_tasks().await;
-
         for rc in recovered {
             // Verify the task is still in the orchestrator and not already
             // completed or assigned to another agent.
-            let still_relevant = tasks.iter().any(|t| {
+            let tasks = self.orchestrator.get_all_tasks().await;
+            let still_relevant = tasks.into_iter().any(|t| {
                 t.id == rc.task_id
                     && !matches!(t.status, TaskStatus::Completed | TaskStatus::Failed)
             });
