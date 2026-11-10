@@ -544,13 +544,11 @@ fn state_with(
             websocket_inactivity_timeout_secs: 90,
             websocket_tick_secs: 5,
             notification_limit: 50,
-            sandbox_task_timeout_secs: 30,
             request_timeout_secs: 30,
             notification_webhook_url: None,
             ..Default::default()
         }),
         request_timeout_secs: std::sync::atomic::AtomicU64::new(30),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(30),
         event_tx: broadcast::channel(16).0,
         evolution_stream: None,
         task_event_tx: broadcast::channel(16).0,

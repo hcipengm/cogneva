@@ -1,4 +1,4 @@
-# 刷新批、验证预算、持有序列、基准载荷、审计请求、知识检索与凭据面那十条读数的单测夹具。
+# 刷新批、验证停摆、持有序列、基准载荷、审计请求、知识检索与凭据面那十条读数的单测夹具。
 #
 # 这一族里有三对「A 失败 unless B 成功」的形状（分析刷新、loki 刷新、知识检索），
 # 它们的静格各自单独一格：让成功那一支同时出现，删掉 `unless` 那半那一格会响。
@@ -14,8 +14,8 @@
 rule_files:
   - ../../../../deploy/helm/cogneva/files/cogneva.json
 
-# rule: verification_killed_by_budget
-# rule: deployment_killed_by_budget
+# rule: verification_stopped_moving
+# rule: deployment_stopped_moving
 # rule: series_held_without_producer
 # rule: held_series_check_unreadable
 # rule: benchmark_payload_refused_by_canary
@@ -28,13 +28,13 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
-  # 一切正常：没有超时、没有被持有却没人产出的序列、持有检查读得出来、基准载荷没被拒、
+  # 一切正常：没有停下的运行、没有被持有却没人产出的序列、持有检查读得出来、基准载荷没被拒、
   # 审计请求全是 released、两处刷新都有成功、检索有命中、凭据面读数为 0 且新鲜。十条全静。
   - interval: 1m
     input_series:
-      - series: 'cogneva_verification_timeouts_total{kind="test"}'
+      - series: 'cogneva_verification_stopped_total{kind="test"}'
         values: '0x60'
-      - series: 'cogneva_verification_timeouts_total{kind="build"}'
+      - series: 'cogneva_verification_stopped_total{kind="build"}'
         values: '0x60'
       - series: 'cogneva_metric_held_without_producer'
         values: '0x60'
@@ -62,10 +62,10 @@ tests:
         values: '3500x60'
     alert_rule_test:
       - eval_time: 60m
-        alertname: verification_killed_by_budget
+        alertname: verification_stopped_moving
         exp_alerts: []
       - eval_time: 60m
-        alertname: deployment_killed_by_budget
+        alertname: deployment_stopped_moving
         exp_alerts: []
       - eval_time: 60m
         alertname: series_held_without_producer
@@ -92,13 +92,13 @@ tests:
         alertname: credential_surface_has_open_permissions
         exp_alerts: []
 
-  # 都在说坏消息：测试与构建各被预算杀掉一次、两条持有序列读数都在报、基准载荷被拒一次、
+  # 都在说坏消息：测试与构建各停下不动一次、两条持有序列读数都在报、基准载荷被拒一次、
   # 审计请求有一次没放行、两处刷新全失败、检索报错、凭据面有一个开放权限。十条全亮。
   - interval: 1m
     input_series:
-      - series: 'cogneva_verification_timeouts_total{kind="test"}'
+      - series: 'cogneva_verification_stopped_total{kind="test"}'
         values: '0x50 1x10'
-      - series: 'cogneva_verification_timeouts_total{kind="build"}'
+      - series: 'cogneva_verification_stopped_total{kind="build"}'
         values: '0x45 1x15'
       - series: 'cogneva_metric_held_without_producer'
         values: '1x60'
@@ -122,13 +122,13 @@ tests:
         values: '3500x60'
     alert_rule_test:
       - eval_time: 60m
-        alertname: verification_killed_by_budget
+        alertname: verification_stopped_moving
         exp_alerts:
           - exp_labels:
               severity: warning
               kind: test
       - eval_time: 60m
-        alertname: deployment_killed_by_budget
+        alertname: deployment_stopped_moving
         exp_alerts:
           - exp_labels:
               severity: warning

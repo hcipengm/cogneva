@@ -76,16 +76,25 @@ impl ImageRollout {
         Ok(base)
     }
 
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+    /// 判的是它还在不在产出，不是它跑了多久：一次冷构建要从仓库拉基镜像、解包
+    /// 一点五 GB，安静地忙上很久；而一份卡死的构建与它在那条按秒的界眼里是同一个读数。
+    ///
+    /// 唯一的例外是「等别人的东西就位」（`kubectl rollout status`）：那是我方对集群
+    /// 收敛的耐心，由它自己的 `--timeout` 说，见调用点。
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String> {
         let cmdline = format!("{} {}", program, args.join(" "));
-        let fut = tokio::process::Command::new(program)
-            .args(args)
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).kill_on_drop(true);
+        let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这份部署见过的\
+                     任何一次「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
+                )))
+            }
+            Err(e) => return Err(SFError::IO(format!("failed to run {program}: {e}"))),
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -145,15 +154,13 @@ impl ImageRollout {
         self.run(
             &self.config.builder_bin,
             &["build", "-t", &tag, "-f", &containerfile, &context],
-            timeout,
         )
         .await?;
         info!(tag = %tag, "rollout image built");
 
         // 2. 可选推送
         if self.config.registry_push {
-            self.run(&self.config.builder_bin, &["push", &tag], timeout)
-                .await?;
+            self.run(&self.config.builder_bin, &["push", &tag]).await?;
             info!(tag = %tag, "rollout image pushed");
         }
 
@@ -170,7 +177,6 @@ impl ImageRollout {
                 &deploy_ref,
                 &image_arg,
             ],
-            60,
         )
         .await?;
         info!(deployment = %deploy_ref, tag = %tag, "deployment image updated");
@@ -188,7 +194,6 @@ impl ImageRollout {
                     &deploy_ref,
                     &format!("--timeout={}", status_timeout),
                 ],
-                timeout + 30,
             )
             .await
         {
@@ -197,7 +202,6 @@ impl ImageRollout {
                 .run(
                     &self.config.kubectl_bin,
                     &["-n", &self.config.namespace, "rollout", "undo", &deploy_ref],
-                    120,
                 )
                 .await
             {

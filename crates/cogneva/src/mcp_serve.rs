@@ -33,9 +33,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = cog_extension::executor_backend(system.sandbox_executor_url.clone())?;
     let registry = cog_agent::ToolRegistry::new()
-        .with_wasm_timeout(system.tool_timeout_secs)
-        .with_shell_timeout(system.shell_timeout_secs)
-        .with_sandbox_backend(backend.clone())
+        .with_sandbox_backend(backend)
         .with_guardrail(cog_guardrail::build_default_guardrail(Arc::new(
             cog_guardrail::InMemoryAuditRecorder::new(),
         )))
@@ -82,7 +80,6 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
             // 树读工具在这个进程里也走执行器：MCP 客户端调 `grep`，读的是它自己
             // 那棵树（请求里带 agent id 时），而不是这个进程脚下的源码。
             sandbox_backend: Some(backend),
-            shell_timeout: Some(std::time::Duration::from_secs(system.shell_timeout_secs)),
         },
     );
 

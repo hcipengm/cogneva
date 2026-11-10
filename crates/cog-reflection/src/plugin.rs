@@ -742,7 +742,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         return Err(e);
                     }
                     info!(
-                        exec_timeout_secs = self_evolution.microvm.exec_timeout_secs,
                         "Firecracker microVM sandbox enabled; evolution runs inside cold-start VMs"
                     );
                     let metrics = evolution_metrics.clone();
@@ -820,10 +819,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // 且**同一个对象**提供这两个数——分开传就会出现"读到 3600、实际按 1800 杀"
                 // 的观测面，那比没有读数更坏。
                 let budget =
-                    std::sync::Arc::new(crate::verification_budget::VerificationBudget::new(
-                        self_evolution.test_timeout_secs,
-                        self_evolution.build_timeout_secs,
-                    ));
+                    std::sync::Arc::new(crate::verification_budget::VerificationBudget::new());
 
                 let mut pipeline = crate::ChangePipeline::new(
                     &project_root,
@@ -881,13 +877,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     target_dir: self_evolution.workspaces.target_dir.clone().into(),
                     binary_dir: self_evolution.binary_dir.clone().into(),
                     backup_dir: self_evolution.backup_dir.clone().into(),
-                    test_timeout_secs: self_evolution.test_timeout_secs,
                     test_command: self_evolution.test_command.clone(),
                     fmt_check_command: self_evolution.fmt_check_command.clone(),
                     lint_command: self_evolution.lint_command.clone(),
                     deploy_admission: self_evolution.deploy_admission.clone(),
                     web_admission: self_evolution.web_admission.clone(),
-                    build_timeout_secs: self_evolution.build_timeout_secs,
                     auto_apply: self_evolution.auto_apply,
                     manual_approve: self_evolution.manual_approve,
                     promotion: promotion.clone(),
@@ -951,24 +945,17 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // at the verification had the same face, and the reading that
                 // separates them is the age of the flight in progress.
                 //
-                // The wall it is judged against is the sum of the bounds of its
-                // two slowest steps, taken from the objects that enforce them:
-                // the verification budget the pipeline holds, and the wait the
-                // gate actually refuses at -- the same derived value
-                // `install_for` below hands the gate this process runs under.
-                // A gate that turns out not to be in force (disabled, or a slot
-                // directory it could not create) makes this wall larger than the
-                // flight's true bound, which delays a rule rather than firing
-                // one on a healthy flight. Only the process that runs flights
-                // publishes any of it: the role is the same `executor_enabled`
-                // the queue readings publish, and a second flag here could drift
-                // out of step with that one.
-                let flight_wall_secs = budget.timeout_secs(crate::verification_budget::KIND_TEST)
-                    + build_gate_cfg.wait_secs;
+                // Only the age is published. There is no line above which that
+                // age means "stuck": each step of the flight is stopped when it
+                // stops moving, so a step may keep working for hours, and a wall
+                // drawn on the total would go red on exactly the healthy long
+                // flights this reading exists to describe. Only the process that
+                // runs flights publishes any of it: the role is the same
+                // `executor_enabled` the queue readings publish, and a second flag
+                // here could drift out of step with that one.
                 let flight = Arc::new(if executor_enabled {
                     crate::evolution_flight_readings::EvolutionFlightReadings::new(
                         self_evolution.change_dir.clone(),
-                        flight_wall_secs,
                     )
                 } else {
                     crate::evolution_flight_readings::EvolutionFlightReadings::none(
@@ -1297,11 +1284,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     // 轮首打一次、之后每消费完一条变更再打一次，所以这个界要盖住的是
                     // **一条**变更——队列有多长这条循环才知道，声明的数不能是队列总和。
                     //
-                    // 一条变更的活：三次构建槽排队（闸门 wait_secs，闸门关着时不排队）
-                    // 之后各跑一条命令——clippy 与测试各吃一份测试预算、发布构建吃一份
-                    // 构建预算——再加格式化那一段（每趟封在 fmt 预算上，趟数见
-                    // `FMT_SEGMENT_WALL_SECS`）。三段都取自强制它们的那几个数，不是
-                    // 挑一个整数把规则按住。
+                    // 一条变更的活：几次构建槽排队（闸门 wait_secs，闸门关着时不排队）
+                    // 之后各跑一条命令——clippy、测试、发布构建——再加格式化那一段。
+                    // 命令不再是按秒的界：它们跑到静默超过实测窗口才被判停，所以每一条
+                    // 的上界就是那个窗口；这个数由 `one_change_wall_secs` 从排队次数、
+                    // 命令条数与实测窗口算出来，不是挑一个整数把租约按住。
                     //
                     // Job 那条执行路径不用另外算：它的等待预算（deadline + 余量，默认
                     // 9900 秒）本来就短于这里算出来的进程内上界，盖得住。
@@ -1314,11 +1301,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         0
                     };
                     let one_change_work = std::time::Duration::from_secs(
-                        crate::change_pipeline::one_change_wall_secs(
-                            gate_wait_secs,
-                            budget.timeout_secs(crate::verification_budget::KIND_TEST),
-                            budget.timeout_secs(crate::verification_budget::KIND_BUILD),
-                        ),
+                        crate::change_pipeline::one_change_wall_secs(gate_wait_secs),
                     );
 
                     let Some(cycle_workspaces) = self.workspaces.clone() else {
@@ -4119,12 +4102,12 @@ async fn collect_dispatched_job(
     deps.budget.adopt_run(
         crate::verification_budget::KIND_TEST,
         outcome.test.last_secs,
-        outcome.test.timeouts,
+        outcome.test.stopped,
     );
     deps.budget.adopt_run(
         crate::verification_budget::KIND_BUILD,
         outcome.build.last_secs,
-        outcome.build.timeouts,
+        outcome.build.stopped,
     );
     if let Some(ending) = outcome.build_ending {
         // 结局只有跑在 Job 里的构建自己知道，变更身份只有这一侧知道：两边

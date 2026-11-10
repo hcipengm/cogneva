@@ -956,9 +956,8 @@ mod tests {
         let backup_dir =
             std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
 
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false)
-            .with_auto_apply(true)
-            .with_test_timeout(30);
+        let pipeline =
+            crate::ChangePipeline::new(&project_root, &change_dir, false).with_auto_apply(true);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
 
         let admin =

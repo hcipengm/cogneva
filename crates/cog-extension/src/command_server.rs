@@ -47,6 +47,10 @@ struct AppState {
     /// operations, and a latency reading that existed only on some deployments
     /// would be quoted as if it covered all of them.
     commands: Arc<CommandMetrics>,
+    /// How long this executor's build queue normally waits. The queue is the
+    /// one thing on this side that emits no progress, so it is the one thing
+    /// still judged by a duration — measured, not declared.
+    queue_waits: Arc<BuildQueueWindow>,
 }
 
 /// How many commands may compile at once when the deployment names none.
@@ -85,25 +89,74 @@ fn build_concurrency() -> usize {
 // cap: bound — 记一笔的阈值，不是容量：它只决定哪些等待值得读，不决定谁等多久
 const BUILD_QUEUE_NOTEWORTHY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Wall for a command whose caller named none. Long enough for an interactive
-/// command to finish, short enough that a caller which stopped listening does not
-/// hold the executor; a caller that needs longer asks for it.
-// cap: bound — 调用方没给时的一堵墙：交互命令够跑完，调用方不听了也不至于吊住
-const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The wall one command runs under: the caller's, or the default when it named
-/// none.
+/// How long a build may queue for the shared target directory before the
+/// executor refuses it, as a measurement rather than a number.
 ///
-/// There used to be a second, hardcoded ceiling here (600 s) that clamped every
-/// larger request. It was a second source of truth for one number, and it lost
-/// silently: an operator who raised `system.shell_timeout_secs` to an hour got
-/// ten minutes and a "timed out after 600s" line that named a number appearing
-/// nowhere in their configuration. The client's value comes from that one knob,
-/// so it is honored as given here.
-fn effective_timeout(timeout_ms: Option<u64>) -> std::time::Duration {
-    timeout_ms
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(DEFAULT_TIMEOUT)
+/// The window is the [`cog_core::progress::SILENCE_QUANTILE`] quantile of the
+/// waits this executor has actually admitted. Below
+/// [`cog_core::progress::SAMPLE_FLOOR`] samples there is no window and a waiter
+/// waits — "we have not measured this machine yet" is not "you are stuck", and
+/// the same floor keeps this reader and the movement predicate from disagreeing
+/// about what counts as a sample.
+///
+/// It no longer shares a number with the command's own budget, because there is
+/// no command budget any more: a command is stopped when it stops moving, not
+/// when a clock runs out. What is left to bound here is a *queue*, which emits
+/// no progress by definition, and the honest bound for it is how long this
+/// machine's queue normally is.
+pub struct BuildQueueWindow {
+    inner: std::sync::Mutex<QueueSamples>,
+}
+
+#[derive(Default)]
+struct QueueSamples {
+    ring: std::collections::VecDeque<std::time::Duration>,
+    window: Option<std::time::Duration>,
+}
+
+impl BuildQueueWindow {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(QueueSamples::default()),
+        }
+    }
+
+    fn record(&self, waited: std::time::Duration) {
+        let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        s.ring.push_back(waited);
+        // Recent behaviour, not all of it: a window computed over the worst
+        // hour this executor ever had would only ever widen.
+        let capacity = cog_core::progress::SAMPLE_FLOOR * 10;
+        while s.ring.len() > capacity {
+            s.ring.pop_front();
+        }
+        s.window = quantile(&s.ring);
+    }
+
+    /// The measured window, or `None` when this executor has not admitted
+    /// enough builds to know what a normal wait is.
+    pub fn window(&self) -> Option<std::time::Duration> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).window
+    }
+}
+
+impl Default for BuildQueueWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn quantile(
+    waits: &std::collections::VecDeque<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    if waits.len() < cog_core::progress::SAMPLE_FLOOR {
+        return None;
+    }
+    let mut sorted: Vec<_> = waits.iter().copied().collect();
+    sorted.sort_unstable();
+    let q = cog_core::progress::SILENCE_QUANTILE;
+    let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    Some(sorted[rank - 1])
 }
 
 /// Port the executor listens on when `SANDBOX_EXECUTOR_PORT` names none.
@@ -132,7 +185,6 @@ fn executor_port_from_env() -> u16 {
 #[derive(Deserialize)]
 struct ExecuteRequest {
     payload: SandboxPayload,
-    timeout_ms: Option<u64>,
     task_id: Option<String>,
     agent_id: Option<String>,
 }
@@ -520,6 +572,25 @@ async fn resolve_workdir(
     }
 }
 
+/// The id a command's progress beacon is filed under.
+///
+/// A task id when the caller has one, so the executor's judgement and the
+/// orchestrator's reclaim read the same attempt. An unstamped request still
+/// runs (compatibility); it gets an id of its own so two anonymous commands
+/// cannot overwrite each other's beacon.
+fn command_progress_id(task_id: Option<&str>) -> String {
+    match task_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => id.to_string(),
+        None => {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            format!(
+                "executor-command-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }
+    }
+}
+
 async fn execute_handler(
     State(state): State<AppState>,
     Json(req): Json<ExecuteRequest>,
@@ -528,7 +599,7 @@ async fn execute_handler(
     // step that once cost six seconds of a first tool call, and a reading that
     // began after it would have reported that call as fast.
     let watch = CommandWatch::start(Arc::clone(&state.commands), tool_label(&req.payload));
-    let timeout = effective_timeout(req.timeout_ms);
+    let progress_id = command_progress_id(req.task_id.as_deref());
     let (workdir, cargo_target, worktree_claim) =
         match resolve_workdir(&state, req.task_id.as_deref(), req.agent_id.as_deref()).await {
             Ok(resolved) => resolved,
@@ -561,30 +632,29 @@ async fn execute_handler(
             // so time spent queued is not time spent compiling: without this,
             // every extra build started beside it shortened the wall the others
             // had left, and each of them timed out having read nothing.
-            let build_slot =
-                match build_slot_for(&state, tool_label(&req.payload), command, timeout).await {
-                    Ok(slot) => slot,
-                    // A lane that stays full past the command's own budget is a
-                    // refusal, not a failure of the executor: 503 says try again,
-                    // 500 would say this request was broken.
-                    Err(refusal @ LaneRefusal::Full { .. }) => {
-                        return watch.end(
-                            error_response(StatusCode::SERVICE_UNAVAILABLE, refusal.to_string()),
-                            Outcome::Refused,
-                        )
-                    }
-                    // The semaphore is never closed in this process; a caller that
-                    // lands here is told so rather than run unbounded.
-                    Err(refusal @ LaneRefusal::Closed(_)) => {
-                        return watch.end(
-                            error_response(StatusCode::INTERNAL_SERVER_ERROR, refusal.to_string()),
-                            Outcome::Refused,
-                        )
-                    }
-                };
+            let build_slot = match build_slot_for(&state, tool_label(&req.payload), command).await {
+                Ok(slot) => slot,
+                // A lane that stays full past the command's own budget is a
+                // refusal, not a failure of the executor: 503 says try again,
+                // 500 would say this request was broken.
+                Err(refusal @ LaneRefusal::Full { .. }) => {
+                    return watch.end(
+                        error_response(StatusCode::SERVICE_UNAVAILABLE, refusal.to_string()),
+                        Outcome::Refused,
+                    )
+                }
+                // The semaphore is never closed in this process; a caller that
+                // lands here is told so rather than run unbounded.
+                Err(refusal @ LaneRefusal::Closed(_)) => {
+                    return watch.end(
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, refusal.to_string()),
+                        Outcome::Refused,
+                    )
+                }
+            };
             match crate::runtime::local::spawn_command(
                 command,
-                timeout,
+                &progress_id,
                 workdir.as_deref(),
                 cargo_target.as_deref(),
                 worktree_claim,
@@ -715,35 +785,44 @@ async fn build_slot_for(
     state: &AppState,
     tool: &str,
     command: &str,
-    budget: std::time::Duration,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, LaneRefusal> {
     if !crate::runtime::local::builds_the_tree(command) {
         return Ok(None);
     }
     let queued_at = std::time::Instant::now();
-    // The queue may cost the caller at most the wall this command was given.
-    // Unbounded, a wait is not a wait but a hang: measured on this host
-    // 2026-11-08, compiles queued 190 to 1145 seconds behind one held slot, and
-    // the caller learned nothing until its own tool call expired -- it could
-    // not tell a busy machine from a slow compiler, so it retried into the same
-    // queue. Refused with the number, it can see that the command never ran.
+    // A wait that is never bounded is not a wait but a hang: measured on this
+    // host 2026-11-08, compiles queued 190 to 1145 seconds behind one held
+    // slot, and the caller learned nothing until its own tool call expired --
+    // it could not tell a busy machine from a slow compiler, so it retried into
+    // the same queue. Refused with the number, it can see the command never ran.
     //
-    // The budget is the command's own wall rather than a number of its own: the
-    // caller already declared how long it is willing to spend here, and the
-    // worst case stays two walls -- one queued, one running.
-    let acquired =
-        tokio::time::timeout(budget, Arc::clone(&state.build_slots).acquire_owned()).await;
+    // What bounds it is this machine's own queue history, not the wall of the
+    // command that is waiting. A queue emits no progress, so it is the one
+    // place here a duration is still the right reading -- and it is a measured
+    // one. With too few samples there is no window and the waiter waits.
+    let window = state.queue_waits.window();
+    let acquired = match window {
+        Some(window) => {
+            tokio::time::timeout(window, Arc::clone(&state.build_slots).acquire_owned())
+                .await
+                .map_err(|_| ())
+        }
+        None => Ok(Arc::clone(&state.build_slots).acquire_owned().await),
+    };
     let waited = queued_at.elapsed();
     let ended = match &acquired {
-        Ok(Ok(_)) => LaneWait::Admitted,
+        Ok(Ok(_)) => {
+            state.queue_waits.record(waited);
+            LaneWait::Admitted
+        }
         Ok(Err(_)) => LaneWait::Closed,
-        Err(_) => LaneWait::Full,
+        Err(()) => LaneWait::Full,
     };
     state
         .commands
         .observe_build_wait(tool, ended, waited.as_secs_f64());
     // It is still a wait somebody pays for, so it is said out loud as well: a
-    // round that spent its whole wall queued and one that compiled slowly read
+    // round that spent its whole wait queued and one that compiled slowly read
     // the same on the latency histogram alone.
     if waited >= BUILD_QUEUE_NOTEWORTHY {
         tracing::info!(
@@ -756,17 +835,21 @@ async fn build_slot_for(
     match acquired {
         Ok(Ok(permit)) => Ok(Some(permit)),
         Ok(Err(e)) => Err(LaneRefusal::Closed(e.to_string())),
-        Err(_) => Err(LaneRefusal::Full { waited, budget }),
+        Err(()) => Err(LaneRefusal::Full {
+            waited,
+            window: window.unwrap_or_default(),
+        }),
     }
 }
 
 /// Why a compiling command never reached its child.
 #[derive(Debug)]
 enum LaneRefusal {
-    /// The lane stayed full for the whole wall the caller allotted the command.
+    /// The lane stayed full for longer than this executor's measured queue
+    /// window.
     Full {
         waited: std::time::Duration,
-        budget: std::time::Duration,
+        window: std::time::Duration,
     },
     /// The semaphore is closed; no amount of waiting admits this command.
     Closed(String),
@@ -775,15 +858,15 @@ enum LaneRefusal {
 impl std::fmt::Display for LaneRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LaneRefusal::Full { waited, budget } => write!(
+            LaneRefusal::Full { waited, window } => write!(
                 f,
-                "build lane busy: this command never started. It waited {}s of the {}s \
-                 its own wall allows for a slot among the commands compiling into the \
-                 shared target directory, and did not get one. Nothing was compiled and \
-                 nothing was left behind; ask again later, or give the command a longer \
-                 timeout_ms so it may queue for longer than it may run.",
+                "build lane busy: this command never started. It waited {}s for a slot \
+                 among the commands compiling into the shared target directory, past the \
+                 {}s this executor has measured its queue to take at p99.9, and did not \
+                 get one. Nothing was compiled and nothing was left behind; ask again \
+                 later.",
                 waited.as_secs(),
-                budget.as_secs()
+                window.as_secs()
             ),
             LaneRefusal::Closed(e) => write!(f, "build slot unavailable: {e}"),
         }
@@ -796,6 +879,7 @@ pub fn router() -> Router {
         hostdocs: None,
         build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
         commands: Arc::new(CommandMetrics::new()),
+        queue_waits: Arc::new(BuildQueueWindow::new()),
     })
 }
 
@@ -806,6 +890,7 @@ pub fn app_router_with_workdir(workdir: Arc<WorkdirRouter>) -> Router {
         hostdocs: None,
         build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
         commands: Arc::new(CommandMetrics::new()),
+        queue_waits: Arc::new(BuildQueueWindow::new()),
     })
 }
 
@@ -819,6 +904,7 @@ pub fn app_router_with_hostdocs(
         hostdocs: Some(hostdocs),
         build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
         commands: Arc::new(CommandMetrics::new()),
+        queue_waits: Arc::new(BuildQueueWindow::new()),
     })
 }
 
@@ -1161,6 +1247,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         hostdocs,
         build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
         commands: Arc::new(CommandMetrics::new()),
+        queue_waits: Arc::new(BuildQueueWindow::new()),
     });
 
     tracing::info!(addr = %addr, "sandbox executor listening");
@@ -1180,30 +1267,23 @@ mod tests {
     /// one touching it while it does.
     static BUILD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// 调用方要多久就是多久：这一层不再有自己的硬顶。
-    ///
-    /// 600 秒那道旧硬顶是同一个数的第二个来源，而且它悄悄生效——把
-    /// `system.shell_timeout_secs` 抬到一小时的人，拿到的是十分钟和一句
-    /// "timed out after 600s"，那个数在他的配置里根本不存在。这条判据钉的是
-    /// 抬上去的那一格真的到了执行器。
+    /// 执行器这一侧没有任何「调用方要多久」的入口了：请求体里没有这一格，
+    /// 命令只在它停住时被停。旧的 `timeout_ms` 与 30 秒默认墙都拆了。
     #[test]
-    fn a_longer_wall_than_six_hundred_seconds_is_honored() {
-        assert_eq!(
-            effective_timeout(Some(3_600_000)),
-            std::time::Duration::from_secs(3600),
-            "执行器把调用方要的一小时截回了旧的上限"
-        );
-        assert_eq!(
-            effective_timeout(Some(200_000)),
-            std::time::Duration::from_secs(200)
-        );
-    }
-
-    /// 没写就是那堵 30 秒的墙：调用方不听了，命令不该把执行器吊住。
-    #[test]
-    fn a_caller_that_names_no_wall_gets_the_short_one() {
-        assert_eq!(effective_timeout(None), DEFAULT_TIMEOUT);
-        assert_eq!(DEFAULT_TIMEOUT, std::time::Duration::from_secs(30));
+    fn an_execute_request_carries_no_declared_wall() {
+        let body = serde_json::json!({
+            "payload": {"type": "command", "command": "echo hi"},
+            "task_id": "t-1",
+            "agent_id": "a",
+        });
+        let parsed: ExecuteRequest = serde_json::from_value(body).expect("the request parses");
+        assert_eq!(parsed.task_id.as_deref(), Some("t-1"));
+        // 旧调用方仍带着 `timeout_ms` 时不至于 400：它只是不再被读。
+        let legacy = serde_json::json!({
+            "payload": {"type": "command", "command": "echo hi"},
+            "timeout_ms": 600000,
+        });
+        assert!(serde_json::from_value::<ExecuteRequest>(legacy).is_ok());
     }
 
     /// The default has to be the number of writers the target directory admits,
@@ -1228,35 +1308,38 @@ mod tests {
             hostdocs: None,
             build_slots: Arc::new(tokio::sync::Semaphore::new(n)),
             commands: Arc::new(CommandMetrics::new()),
+            queue_waits: Arc::new(BuildQueueWindow::new()),
         }
     }
 
     /// The bound this exists for: a second build does not start while the
     /// first one holds the last slot, a command that compiles nothing is never
-    /// made to wait for one, and a wait that outlasts the command's own wall is
-    /// refused by name instead of hanging until the caller gives up.
+    /// made to wait for one, and a wait past this executor's *measured* queue
+    /// window is refused by name instead of hanging until the caller gives up.
+    ///
+    /// No caller declares a wall any more, so the window is planted here the
+    /// same way the movement predicate's is: from gaps a test produced.
     #[tokio::test]
     async fn a_build_waits_its_turn_and_a_search_does_not() {
         let state = state_with_build_slots(1);
-        let patience = std::time::Duration::from_secs(60);
-        let held = build_slot_for(
-            &state,
-            "run_command",
-            "cargo test -p cogneva --lib",
-            patience,
-        )
-        .await
-        .expect("the semaphore is open")
-        .expect("a build takes a slot");
+        for _ in 0..cog_core::progress::SAMPLE_FLOOR {
+            state
+                .queue_waits
+                .record(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            state.queue_waits.window(),
+            Some(std::time::Duration::from_millis(50)),
+            "the window is the planted p99.9, not a number of its own"
+        );
 
-        let queued = tokio::time::timeout(std::time::Duration::from_millis(80), async {
-            build_slot_for(
-                &state,
-                "run_command",
-                "cargo clippy --all-targets",
-                patience,
-            )
+        let held = build_slot_for(&state, "run_command", "cargo test -p cogneva --lib")
             .await
+            .expect("the semaphore is open")
+            .expect("a build takes a slot");
+
+        let queued = tokio::time::timeout(std::time::Duration::from_millis(20), async {
+            build_slot_for(&state, "run_command", "cargo clippy --all-targets").await
         })
         .await;
         assert!(
@@ -1267,8 +1350,8 @@ mod tests {
         // A search names the same program without running it, and must not
         // queue behind a build to do so.
         let search = tokio::time::timeout(
-            std::time::Duration::from_millis(80),
-            build_slot_for(&state, "run_command", "grep -rn cargo crates/", patience),
+            std::time::Duration::from_millis(20),
+            build_slot_for(&state, "run_command", "grep -rn cargo crates/"),
         )
         .await
         .expect("a search never queues")
@@ -1278,56 +1361,58 @@ mod tests {
         // Formatting the tree is the same shape: a program that would compile,
         // asked to do something that writes nothing into the target directory.
         let formatting = tokio::time::timeout(
-            std::time::Duration::from_millis(80),
-            build_slot_for(
-                &state,
-                "run_command",
-                "cargo fmt --all -- --check",
-                patience,
-            ),
+            std::time::Duration::from_millis(20),
+            build_slot_for(&state, "run_command", "cargo fmt --all -- --check"),
         )
         .await
         .expect("formatting never queues")
         .expect("the semaphore is open");
         assert!(formatting.is_none(), "formatting holds no build slot");
 
-        // A wait longer than the wall the command was given is a refusal that
-        // names both numbers, not a command started only to be killed.
-        let refused = build_slot_for(
-            &state,
-            "run_command",
-            "cargo clippy --all-targets",
-            std::time::Duration::from_millis(120),
-        )
-        .await;
+        // A wait past the measured window is a refusal that names both numbers,
+        // not a command started only to be killed.
+        let refused = build_slot_for(&state, "run_command", "cargo clippy --all-targets").await;
         match refused {
-            Err(LaneRefusal::Full { waited, budget }) => {
-                assert!(waited >= budget, "the wait is the whole budget and more");
+            Err(LaneRefusal::Full { waited, window }) => {
+                assert!(waited >= window, "the wait outlasted the measured window");
                 assert!(
-                    LaneRefusal::Full { waited, budget }
+                    LaneRefusal::Full { waited, window }
                         .to_string()
                         .contains("never started"),
                     "the refusal says the command did not run"
                 );
             }
-            Ok(_) => panic!("a full lane past the budget must refuse"),
+            Ok(_) => panic!("a full lane past the window must refuse"),
             Err(LaneRefusal::Closed(e)) => panic!("the semaphore was closed: {e}"),
         }
 
         drop(held);
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            build_slot_for(
-                &state,
-                "run_command",
-                "cargo clippy --all-targets",
-                patience,
-            ),
+            build_slot_for(&state, "run_command", "cargo clippy --all-targets"),
         )
         .await
         .expect("the released slot admits the waiting build")
         .expect("the semaphore is open");
         assert!(next.is_some(), "the queued build gets the slot back");
+
+        // With too few samples there is no window, and a waiter waits rather
+        // than being refused on a number nobody measured.
+        let unmeasured = state_with_build_slots(1);
+        assert_eq!(unmeasured.queue_waits.window(), None);
+        let _held_again = build_slot_for(&unmeasured, "run_command", "cargo test -p cogneva")
+            .await
+            .unwrap()
+            .expect("a build takes a slot");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(60),
+                build_slot_for(&unmeasured, "run_command", "cargo clippy --all-targets"),
+            )
+            .await
+            .is_err(),
+            "without a measured window the wait is not refused"
+        );
 
         // The wait is published, so a round that queued and a round that
         // compiled slowly are separable without reading the log.

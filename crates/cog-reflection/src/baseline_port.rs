@@ -406,22 +406,28 @@ impl BaselinePorter {
         self
     }
 
+    /// 跑一条 git 命令（取基线、摘文件），按「还在不在动」判断它是否停住。
+    ///
+    /// 这些命令偶尔要走网络拉一个大仓，慢在别处而不在本机。这里过去罩着一堵
+    /// 120s 的墙，它把「远端在慢慢吐数据」和「远端不应答」判成同一件事，而
+    /// 前者是正常的；现在交给 `cog_core::progress`：没有输出、也没有消耗 CPU 的
+    /// 静默超过这台机器见过的「命令还在干活」的最长推进间隔，才算停住。
     async fn git(&self, args: &[&str]) -> SFResult<String> {
         let cmdline = format!("git {}", args.join(" "));
-        let fut = tokio::process::Command::new("git")
-            .args(args)
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(args)
             .current_dir(&self.repo_dir)
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(GIT_COMMAND_TIMEOUT, fut)
-            .await
-            .map_err(|_| {
-                SFError::IO(crate::cmd_timeout::timed_out(
-                    &cmdline,
-                    GIT_COMMAND_TIMEOUT.as_secs(),
-                ))
-            })?
-            .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;
+            .kill_on_drop(true);
+        let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这次部署见过的\
+                     任何一次「命令还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
+                )))
+            }
+            Err(e) => return Err(SFError::IO(format!("failed to run git: {e}"))),
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::IO(format!("{cmdline} failed: {stderr}")));
@@ -636,10 +642,7 @@ impl BaselinePorter {
             "Baseline port semantic absorption check; read-only judgment",
         ));
 
-        match self
-            .submit_and_wait(orch, task, goal, self.absorb_timeout_secs)
-            .await
-        {
+        match self.submit_and_wait(orch, task, goal).await {
             Ok(Ok(completed)) => {
                 let absorbed = completed
                     .result
@@ -1056,10 +1059,7 @@ impl BaselinePorter {
             "Baseline port resolve; route to the sandbox evolution agent",
         ));
 
-        match self
-            .submit_and_wait(orch, task, goal, self.resolve_timeout_secs)
-            .await?
-        {
+        match self.submit_and_wait(orch, task, goal).await? {
             Ok(_) => Ok(Ok(())),
             Err(reason) => Ok(Err(format!("resolve task {task_id} {reason}"))),
         }
@@ -1075,16 +1075,8 @@ impl BaselinePorter {
         orch: &Arc<dyn OrchestratorControl>,
         task: Task,
         goal: String,
-        timeout_secs: u64,
     ) -> SFResult<Result<Task, String>> {
-        crate::promotion_eval::submit_and_wait(
-            orch,
-            self.poll_interval_secs,
-            task,
-            goal,
-            timeout_secs,
-        )
-        .await
+        crate::promotion_eval::submit_and_wait(orch, self.poll_interval_secs, task, goal).await
     }
 
     fn verified_meta(note: &str) -> ActionPlannerMeta {
@@ -1193,11 +1185,11 @@ impl BaselinePorter {
         if !self.quality_gate {
             return Ok(Ok(()));
         }
-        let (check_ok, check_out) = self.run_cargo(&["check", "--workspace"], 900).await?;
+        let (check_ok, check_out) = self.run_cargo(&["check", "--workspace"]).await?;
         if !check_ok {
             return Ok(Err(tail(&check_out, 8000)));
         }
-        let (test_ok, test_out) = self.run_cargo(&["test", "--workspace"], 1800).await?;
+        let (test_ok, test_out) = self.run_cargo(&["test", "--workspace"]).await?;
         if !test_ok {
             return Ok(Err(tail(&test_out, 8000)));
         }
@@ -1261,10 +1253,7 @@ impl BaselinePorter {
             "Baseline port eval A/B; route to the sandbox evolution agent",
         ));
 
-        let completed = match self
-            .submit_and_wait(orch, task, goal, self.eval_timeout_secs)
-            .await?
-        {
+        let completed = match self.submit_and_wait(orch, task, goal).await? {
             Ok(t) => t,
             Err(reason) => {
                 self.report_eval_gate_outcome(EvalGateOutcome::Unavailable)
@@ -1278,7 +1267,11 @@ impl BaselinePorter {
         Ok(verdict)
     }
 
-    async fn run_cargo(&self, args: &[&str], timeout_secs: u64) -> SFResult<(bool, String)> {
+    /// 在工作树里跑一次 cargo，同样按「还在不在动」判断，不按跑了多久。
+    ///
+    /// 过去 check 给 900s、test 给 1800s：这两个数只回答「跑了多久」，而这台机器
+    /// 上一次全量测试就能跑四十分钟，重活与卡死在钟眼里同形。
+    async fn run_cargo(&self, args: &[&str]) -> SFResult<(bool, String)> {
         let _slot = crate::build_gate::acquire("baseline evaluation").await?;
         let cmdline = format!("cargo {}", args.join(" "));
         let mut cmd = tokio::process::Command::new("cargo");
@@ -1288,11 +1281,16 @@ impl BaselinePorter {
         if let Some(dir) = &self.target_dir {
             cmd.env("CARGO_TARGET_DIR", dir);
         }
-        let fut = cmd.output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run cargo: {e}")))?;
+        let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这次部署见过的\
+                     任何一次「命令还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
+                )))
+            }
+            Err(e) => return Err(SFError::IO(format!("failed to run cargo: {e}"))),
+        };
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -1547,13 +1545,6 @@ pub const BASELINE_PORT_LOOP: &str = "baseline_port";
 /// measures a number the loop does not keep whenever this floor binds.
 // cap: bound — 这条地板生效时循环并不按 poll_interval_secs 走，拿它量节拍会量错
 pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
-
-/// 一条 git 命令（取基线、摘文件）的墙：120s。
-///
-/// 这些命令偶尔要走网络拉一个大仓，慢在别处而不在本机；120s 是「远端在吐数据」
-/// 与「远端不应答」的分界，超时读作基线不可得，而不是基线是空的。
-// cap: bound — 分界「远端在吐数据」与「远端不应答」，超时读作基线不可得而不是基线为空
-const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 基线移植触发循环。第一轮立即执行（启动即对齐新基线，不等一个
 /// 轮询周期），之后按 `poll_interval_secs` 周期运行直到 shutdown。

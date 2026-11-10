@@ -459,7 +459,7 @@ metric_names! {
     // readings.
     //
     // Not filed with the build-outcome cells: those are compile semantics
-    // (`built`/`failed`/`timed_out`/`unstarted`) and a recipe that does not
+    // (`built`/`failed`/`stalled`/`unstarted`) and a recipe that does not
     // compile anything has no way to land in one of them without lying about
     // what happened.
     PROJECT_KIND_TOTAL => "cogneva_project_kind_total",

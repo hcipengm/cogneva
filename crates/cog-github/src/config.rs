@@ -347,8 +347,9 @@ pub struct LandingPolicy {
     /// attempt only: a change that breaks CI twice is out of the generator's
     /// reach and is left to a human.
     pub redrive_on_ci_failure: bool,
-    /// How long to watch a landed commit's CI before giving up on that
-    /// revision (seconds).
+    /// How long a landed commit's CI verdict is expected to take (seconds).
+    /// Past it the watch loop logs once and keeps watching — a CI run that has
+    /// not reported yet is not a CI run that will never report.
     pub ci_watch_timeout_secs: u64,
     /// How often the landing loop re-reads the base branch's CI state (seconds).
     pub ci_poll_interval_secs: u64,

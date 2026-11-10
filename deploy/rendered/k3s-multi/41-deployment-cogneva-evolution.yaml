@@ -15,6 +15,10 @@ metadata:
     app.kubernetes.io/component: evolution
 spec:
   replicas: 1
+  # 显式写出来：不写时生效的是 API 的默认 600 秒，同一个界在清单上看不见，
+  # 读者就以为这一版没被时长判过。它到点只写一条状态条件、不杀 Pod，仓库里也没
+  # 有代码拿那条条件做决定；这个字段本身去不掉（不写还是同一个默认值）。
+  progressDeadlineSeconds: 600
   strategy:
     type: Recreate
   selector:
@@ -26,7 +30,7 @@ spec:
       annotations:
         # 同主应用：这个 Pod 也挂 cogneva-json、也经 envFrom 取 cogneva-config，
         # 两份配置里任何一份变了它都得跟着重启，否则进程读到的仍是启动时那份。
-        checksum/config: 3ba025de855e64036409426a2e0cf7494c5a30b396f3fc1efb967eaac02309cd
+        checksum/config: a3b0b4d1d7afb8de7a8e9de0d7ce7397329a306a9e7ae6501e0c00e3df4e548b
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution

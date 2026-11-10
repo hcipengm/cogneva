@@ -116,7 +116,6 @@ fn names_with(client: Option<Arc<dyn HttpClient>>, messaging: bool) -> Vec<Strin
             // 不因缺少执行器而从表里消失。它们的缺席是一句可读的报错（缺的是
             // 执行器，不是搜索），而少一行只是「没有这个工具」。
             sandbox_backend: None,
-            shell_timeout: None,
         },
     );
     let mut names = registry.names();

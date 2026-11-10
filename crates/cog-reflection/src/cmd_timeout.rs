@@ -28,6 +28,27 @@ pub(crate) fn timed_out_after(timeout_secs: u64) -> String {
     format!("{TIMED_OUT_AFTER} {timeout_secs}s")
 }
 
+/// 判据与生产者共同的那一段：子进程被杀的原因是**它不再动**，不是它跑够了钟点。
+///
+/// 与 [`TIMED_OUT_AFTER`] 同一族、同一个用处：这类错误说的是「我们没等到答案」，
+/// 而不是「答案说这一版坏了」。区别只在判据用什么认出「没动」——时钟停了多久，
+/// 还是它多久没写一个字节。下游把两种都读成「本轮没有观测」，所以两者都要进
+/// 同一张模式表，各写一遍就会有一边悄悄从判据里消失。
+pub(crate) const WENT_SILENT: &str = cog_core::progress::WENT_SILENT;
+
+/// `cmdline` 在 `silent` 里没有新产出、而这段静默已经超过实测窗口 `window` 时，
+/// 写给它下游的那句话。
+///
+/// 句子本身住在 [`cog_core::progress`]——看门狗在那里产出这个结局，别的 crate
+/// （编排、执行器、沙箱）也要写同一句话，放在这里它们就够不着了。
+pub(crate) fn went_silent(
+    cmdline: &str,
+    silent: std::time::Duration,
+    window: std::time::Duration,
+) -> String {
+    cog_core::progress::went_silent(cmdline, silent, window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +61,19 @@ mod tests {
             "判据按这一段认它，生产者写出来却不含这一段，超时就从判据里消失了：{sentence}"
         );
         assert!(sentence.contains("30s"), "秒数要写进去：{sentence}");
+
+        let stalled = went_silent(
+            "kubectl get deploy",
+            std::time::Duration::from_secs(63),
+            std::time::Duration::from_secs(41),
+        );
+        assert!(
+            stalled.contains(WENT_SILENT),
+            "停住的判词也要能被判据认出来：{stalled}"
+        );
+        assert!(
+            stalled.contains("63s") && stalled.contains("41s"),
+            "{stalled}"
+        );
     }
 }

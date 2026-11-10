@@ -109,19 +109,12 @@ const ENV_KUBECTL: &str = "COGNEVA_EVAL_KUBECTL";
 const ENV_NAMESPACE: &str = "COGNEVA_EVAL_TOOLATHLON_NAMESPACE";
 const ENV_PACK_IMAGE: &str = "COGNEVA_EVAL_TOOLATHLON_IMAGE";
 const ENV_PG_IMAGE: &str = "COGNEVA_EVAL_TOOLATHLON_PG_IMAGE";
-const ENV_TIMEOUT_SECS: &str = "COGNEVA_EVAL_TOOLATHLON_TIMEOUT_SECS";
 /// pack 容器的 limits 覆盖位。两个必须一起给：它们是一对，单独改一个只会在额度
 /// 或内存的另一侧撞墙（额度按 limits 求和，内存不够则是 OOM）。
 const ENV_PACK_CPU_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_CPU_LIMIT";
 const ENV_PACK_MEMORY_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_MEMORY_LIMIT";
 /// 运行时的开关：设成 `off` 就是这一次不接。
 const ENV_RUNTIME: &str = "COGNEVA_EVAL_TOOLATHLON_RUNTIME";
-
-/// 单次 Pod 命令的时间上界（秒）。默认比 swe-bench-pro 那一侧宽：一道题要起库、导入
-/// `init.sql.gz`、跑前处理、再跑判分，其中导入那一步本身就按分钟计。这是一个**安全上界**
-/// 不是量出来的界，所以它可覆盖；它的意义是让一条卡住的命令变成一次带原因的失败。
-// cap: bound — 是安全上界而不是量出来的界，所以它可覆盖；它的意义是让一条卡住的命令变成一次带原因的失败
-const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 /// 等库就绪的上界（秒）。超过就报「库没起来」，不是继续跑下去把每一格都判成错。
 // cap: bound — 超过就报「库没起来」，不是继续跑下去把每一格都判成错
@@ -153,11 +146,17 @@ pub(crate) struct RunOutcome {
     pub(crate) code: Option<i32>,
 }
 
+/// 一次 `exec` 调用的身份。看门狗按 id 记「上一次产出是什么时候」，两条并发的命令
+/// 共用一个 id 时，一边的输出会把另一边的静默盖掉。
+fn next_exec_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 这台宿主上的一台 Pod。`kubectl` 前缀在构造时**探**出来，不写死。
 pub struct PodRuntime {
     prefix: Vec<String>,
     namespace: String,
-    timeout: Duration,
 }
 
 impl PodRuntime {
@@ -170,11 +169,6 @@ impl PodRuntime {
         {
             return Ok(None);
         }
-        let timeout = std::env::var(ENV_TIMEOUT_SECS)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         let namespace = std::env::var(ENV_NAMESPACE)
             .ok()
             .map(|v| v.trim().to_string())
@@ -199,11 +193,7 @@ impl PodRuntime {
                 continue;
             }
             if probe(&prefix, &namespace).await {
-                return Ok(Some(Self {
-                    prefix,
-                    namespace,
-                    timeout,
-                }));
+                return Ok(Some(Self { prefix, namespace }));
             }
         }
         Ok(None)
@@ -229,27 +219,36 @@ impl PodRuntime {
         Self {
             prefix,
             namespace: namespace.to_string(),
-            timeout: Duration::from_secs(60),
         }
     }
 
-    /// 跑一条 `kubectl` 命令。超时是**失败**不是空结果：吞掉它，这一格的分就读成
+    /// 跑一条 `kubectl` 命令。停住是**失败**不是空结果：吞掉它，这一格的分就读成
     /// 「模型没做对」，而真相是「这台机器没跑完」。
+    ///
+    /// 判「停住」读的是这条命令**还在不在产出**，不是它跑了多久（2026-11-10 拆掉
+    /// 按钟的 `self.timeout`）：进程每写出一段输出就是一拍，判据在
+    /// `cog_core::progress` 里与编排侧回收、执行路由守护共用同一条。所以一道起库、
+    /// 导入、跑前处理、再判分的题——每一步都在印东西——不会被判，而一条一声不响
+    /// 卡住的命令会，判词里带着两个实数（静默多久、实测窗口多少），读的人能复算它。
     pub(crate) async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
         let mut cmd = self.command();
-        cmd.args(args);
-        let child = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("cannot run `{}`: {e}", self.prefix.join(" ")))?;
-        let out = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
-            Ok(res) => res?,
-            Err(_) => anyhow::bail!(
-                "`{} {}` did not finish within {:?}",
+        cmd.args(args).kill_on_drop(true);
+        // 一次调用一个身份：并发跑的两条命令共用 id 时，一条的输出会被读成另一条
+        // 「还在动」，于是两条都永远不会被判停住。
+        let id = format!("eval-toolathlon:{}", next_exec_id());
+        let out = match cog_core::progress::run_child_watched(cmd, &id).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => anyhow::bail!(
+                "`{} {}` stopped moving: no output for {:?}, and this deployment's measured \
+                 any gap this deployment has ever seen between steps is {:?}",
                 self.prefix.join(" "),
                 args.first().map(String::as_str).unwrap_or(""),
-                self.timeout
+                silent,
+                window
             ),
+            Err(e) => {
+                anyhow::bail!("cannot run `{}`: {e}", self.prefix.join(" "))
+            }
         };
         Ok(RunOutcome {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),

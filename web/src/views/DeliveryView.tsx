@@ -249,7 +249,7 @@ export function DeliveryView() {
               </div>
             </Readings>
             {/* 「成了几个、没成的是哪一种」在表里要一行一行数。四种结局各占一段，
-                比例就是这一轮构建的成败；`timed_out` 与 `failed` 分开着色，因为前者
+                比例就是这一轮构建的成败；`stalled` 与 `failed` 分开着色，因为前者
                 是预算把它杀了、后者是它自己崩了。 */}
             <Strip
               label="窗口里这几次构建各是什么结局"
@@ -576,7 +576,7 @@ function outcomeSegments(runs: { outcome: string }[]): StripSegment[] {
   const counted = new Map<string, number>();
   for (const run of runs) counted.set(run.outcome, (counted.get(run.outcome) ?? 0) + 1);
   const tone = (outcome: string) =>
-    outcome === 'built' ? 'ok' : outcome === 'timed_out' ? 'warn' : outcome === 'unstarted' ? 'muted' : 'danger';
+    outcome === 'built' ? 'ok' : outcome === 'stalled' ? 'warn' : outcome === 'unstarted' ? 'muted' : 'danger';
   return [...counted.entries()]
     .sort((a, b) => b[1] - a[1])
     .map(([outcome, count]) => ({ label: outcome, value: count, tone: tone(outcome) }));
@@ -585,7 +585,7 @@ function outcomeSegments(runs: { outcome: string }[]): StripSegment[] {
 /** 行里那一个词的颜色：成了是绿的，被预算杀的是黄的，其余没成的是红的。 */
 function outcomeColor(outcome: string): string {
   if (outcome === 'built') return 'var(--ok)';
-  if (outcome === 'timed_out') return 'var(--warn)';
+  if (outcome === 'stalled') return 'var(--warn)';
   if (outcome === 'unstarted') return 'var(--muted)';
   return 'var(--danger)';
 }

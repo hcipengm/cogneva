@@ -29,18 +29,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use cog_core::{ChangeIdentity, ChangeState};
-
-/// How long one question to git may take before it is given up on.
-///
-/// The questions are asked of a local repository and take tens of milliseconds.
-/// The bound exists so that a repository on a stalled mount fails as a reading
-/// instead of holding the pass: the pass runs under an owner lease that is
-/// renewed on a cadence, and a pass that hangs is a pass that loses the seat.
-// cap: bound — 让卡死的挂载点表现为一条读数而不是挂住整轮：这一轮持有属主租约，挂住就是丢座位
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where the platform's own deployment mounts the repository it builds from.
 ///
@@ -1315,15 +1305,20 @@ impl CheckTree {
             // tree and not to wherever this process happens to have been started.
             .current_dir(&self.repo)
             .kill_on_drop(true);
-        let out = match tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => {
+        // 判据是它还在不在动，不是它跑了多久：一次要走几百个提交的 `git log`
+        // 与一次卡死的 git 在钟面上同形，而前者不该被砍在中间。
+        let cmdline = format!("git {}", args.join(" "));
+        let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(cog_core::progress::went_silent(&cmdline, silent, window))
+            }
+            Err(e) => {
                 return Err(format!(
                     "git could not be run against {}: {e}",
                     self.repo.display()
                 ))
             }
-            Err(_) => return Err(format!("git did not answer within {GIT_TIMEOUT:?}")),
         };
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());

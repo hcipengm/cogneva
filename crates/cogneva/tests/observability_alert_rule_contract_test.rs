@@ -303,18 +303,13 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_evolution_change_queue_files",
         "crates/cog-reflection/src/evolution_queue_readings.rs",
     ),
-    // The apply/test flight. Neither of these is published by a task: the age is
-    // derived from a stamp the flight leaves behind when the scrape arrives, and
-    // the wall is a property of the process. The pair is what tells a
-    // healthy-but-slow verification from a cycle that has stopped at the flight,
-    // which nothing else could -- every other reading about that work is written
-    // after it ends.
+    // The apply/test flight. Not published by a task: the age is derived from a
+    // stamp the flight leaves behind when the scrape arrives. It is an age and
+    // not a bound compared against an age -- each step of the flight is stopped
+    // when it stops moving, so a flight whose steps are long is healthy, and a
+    // line drawn on the total would go red on exactly those.
     (
         "cogneva_evolution_change_flight_seconds",
-        "crates/cog-reflection/src/evolution_flight_readings.rs",
-    ),
-    (
-        "cogneva_evolution_change_flight_budget_seconds",
         "crates/cog-reflection/src/evolution_flight_readings.rs",
     ),
     (
@@ -835,7 +830,7 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-extension/src/runtime/cgroup.rs",
     ),
     (
-        "cogneva_verification_timeouts_total",
+        "cogneva_verification_stopped_total",
         "crates/cog-reflection/src/verification_budget.rs",
     ),
     // The claim-capacity loop: what became of each volume in each round, and the

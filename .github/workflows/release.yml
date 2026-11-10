@@ -15,7 +15,13 @@ jobs:
   build-release:
     name: Build Release Binary
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The platform's own ceiling, not a budget of ours. A release build that is
+    # still compiling is still working, so the number that ends this job must be
+    # the runner's hard limit rather than a guess at how long a build "should"
+    # take; a guess here throws away every artifact the build had already
+    # produced. GitHub cannot ask whether our step is alive, which is why this
+    # leg keeps a backstop at all while every wait on the host no longer does.
+    timeout-minutes: 360
     permissions:
       contents: write
     steps:
@@ -183,7 +189,11 @@ jobs:
     # 避免 PATCH 把已有 release notes 覆盖成兜底文本。
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # An upload that is still transferring is still working: the parts are 95 MB
+    # each to a host on another continent, and a piece that really failed says
+    # so in its own HTTP answer. Same ceiling as the other legs -- the runner's,
+    # not a guess at how long the mirror takes.
+    timeout-minutes: 360
     steps:
       - name: Create or update Gitee release
         env:

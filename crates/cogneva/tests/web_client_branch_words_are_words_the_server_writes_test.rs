@@ -1,7 +1,7 @@
 //! principle: feedback_no_hardcoding_config_surface
 //!
 //! The WebUI branches on the words the server answers with, and the branch is
-//! where the word is *used*: `outcome === 'timed_out'` picks the colour of a
+//! where the word is *used*: `outcome === 'stalled'` picks the colour of a
 //! build row, `status === 'hook_event'` decides a frame is not a task changing
 //! state, `parsed.error === 'llm_verify_failed'` decides whether the operator is
 //! offered the "save anyway" button at all.
@@ -84,10 +84,10 @@ const SERVER_WORDS: &[ServerWord] = &[
     },
     ServerWord {
         field: "outcome",
-        word: "timed_out",
+        word: "stalled",
         client_file: "web/src/views/DeliveryView.tsx",
         server_file: "crates/cog-reflection/src/evolution_build_readings.rs",
-        server_needle: "BuildEnding::TimedOut(_) => \"timed_out\"",
+        server_needle: "BuildEnding::Stalled { .. } => \"stalled\"",
     },
     ServerWord {
         field: "outcome",

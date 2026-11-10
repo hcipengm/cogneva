@@ -80,8 +80,8 @@ pub use circuit_registry::CircuitBreakerRegistry;
 pub use orchestrator::DagExecutor;
 pub use retry_matrix::{BackoffStrategy, CircuitBreakerConfig, RetryConfig, RetryMatrix};
 pub use task_checkpoint::{
-    checkpoint_task, checkpoint_task_with_timeout, CheckpointAgents, CheckpointRound,
-    LiveCheckpointAgents, CHECKPOINT_STEP_TIMEOUT,
+    checkpoint_task, checkpoint_task_expecting, CheckpointAgents, CheckpointRound,
+    LiveCheckpointAgents, CHECKPOINT_STEP_EXPECTATION,
 };
 pub use task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 

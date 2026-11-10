@@ -698,8 +698,6 @@ impl StackConvergence {
         // 逐文件比要有总预算：每次调用各自的超时叠起来是「文件数 × 超时」，慢的
         // API 会让一轮退化成几十分钟。预算取配置面已有的那一个（与 apply 共用
         // 声明），用完就这一轮没有结论——不新造一个数。
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.cfg.apply_timeout_secs);
         let mut readings: Vec<(String, DiffOutcome)> = Vec::with_capacity(per_file.len());
         let mut line_counts: BTreeMap<String, usize> = BTreeMap::new();
         // 一份文件被拒**不再作废整轮**。代价是实测过的：`01-namespace.yaml` 里那条
@@ -708,16 +706,12 @@ impl StackConvergence {
         // 外观上读作「收敛循环什么都没做」。一份清单的授权缺口只该封住它自己。
         let mut obstacles: Vec<(String, Obstacle)> = Vec::new();
         for (file, body) in &per_file {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if left.is_zero() {
-                return ConvergenceVerdict::NoEvidence(format!(
-                    "{file} 的 diff 没时间跑了：这一轮与集群打交道的预算（{} 秒）在一次比一遍里用完了",
-                    self.cfg.apply_timeout_secs
-                ));
-            }
+            // 每一份的 diff 各自由看门狗看着（判它还在不在动），这一轮不再有
+            // 一个总预算：预算会把「前面几份慢」记成「后面几份没时间跑」，
+            // 那是一条自己造出来的停止，代价是这一轮读不到集群而判成无证据。
             let (code, diff, stderr) = match self
                 .deployer
-                .diff_capture(&self.cfg.namespace, body.as_bytes(), left.as_secs().max(1))
+                .diff_capture(&self.cfg.namespace, body.as_bytes())
                 .await
             {
                 Ok(out) => out,
@@ -819,11 +813,7 @@ impl StackConvergence {
             };
             let (ok, stdout, stderr) = match self
                 .deployer
-                .apply_capture(
-                    &self.cfg.namespace,
-                    body.as_bytes(),
-                    self.cfg.apply_timeout_secs,
-                )
+                .apply_capture(&self.cfg.namespace, body.as_bytes())
                 .await
             {
                 Ok(out) => out,

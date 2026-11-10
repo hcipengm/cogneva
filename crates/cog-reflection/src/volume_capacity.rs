@@ -57,8 +57,6 @@ use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragmen
 use cog_core::{ResourceEvent, ResourceEventKind, ResourceEventOutcome, SFResult, ShutdownSignal};
 use tracing::{debug, info, warn};
 
-use crate::change_execution::{KUBECTL_READ_TIMEOUT_SECS, KUBECTL_TIMEOUT_SECS};
-
 /// What became of one claim in one round, counted per outcome.
 pub const OUTCOME_METRIC: &str = "cogneva_volume_capacity_outcome_total";
 
@@ -1110,12 +1108,21 @@ pub fn targets_from_env() -> Vec<ClaimTarget> {
 /// series that stays empty instead of a deployment that is fine.
 pub const OCCUPANCY_URL_ENV: &str = "COGNEVA_CLAIM_STORE_METRICS_URL";
 
-/// How long one scrape of that endpoint may take.
+/// How long the scrape may go without receiving a byte before it is judged stuck.
 ///
-/// What arrives is already up to one scan interval old, so a scrape that
-/// outlives a round would hold the round for a figure the next one has anyway.
-// cap: bound — 比一拍还慢的抓取拿不到新东西，下一拍读到的还是同一个数
+/// Not a total time: what arrives is already up to one scan interval old, so a
+/// scrape that is still delivering is worth finishing even when it outlives a
+/// round, while a connection that has produced nothing for this long is the
+/// shape a dead endpoint has.
+// cap: bound — 一拍内没有新字节＝这条连接不是慢，是不动了；判据是字节，不是总时长
 pub const OCCUPANCY_SCRAPE_TIMEOUT_SECS: u64 = 10;
+
+/// How long curl may spend before the connection is up.
+// cap: bound — 连不上与连上不动是两件事，这一条只管握手
+const CURL_CONNECT_TIMEOUT_SECS: &str = "15";
+
+/// 只要有字节进来就算在动。写成 1 而不是 0，因为 0 在 curl 里不是「任何速率都算在动」。
+const CURL_SPEED_LIMIT_BYTES_PER_SEC: &str = "1";
 
 /// The label the published series names its namespace with.
 const NAMESPACE_LABEL: &str = "namespace";
@@ -1227,18 +1234,31 @@ async fn scrape_occupancy(
     url: &str,
     namespace: &str,
 ) -> Result<std::collections::BTreeMap<String, u64>, String> {
-    let max_time = OCCUPANCY_SCRAPE_TIMEOUT_SECS.to_string();
-    let out = tokio::time::timeout(
-        Duration::from_secs(OCCUPANCY_SCRAPE_TIMEOUT_SECS),
-        tokio::process::Command::new("curl")
-            .args(["-sSf", "--max-time", &max_time, url])
-            .output(),
-    )
-    .await
-    .map_err(|_| {
-        crate::cmd_timeout::timed_out(&format!("curl {url}"), OCCUPANCY_SCRAPE_TIMEOUT_SECS)
-    })?
-    .map_err(|e| format!("curl {url} could not run: {e}"))?;
+    // 判据是字节，不是总时长：`--max-time` 会砍掉一条慢但一直在送字节的连接，
+    // 而这条读数要的正是「它在不在送」。`--speed-time` 是 curl 自己的「不动」判据。
+    let stall = OCCUPANCY_SCRAPE_TIMEOUT_SECS.to_string();
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args([
+        "-sSf",
+        "--connect-timeout",
+        CURL_CONNECT_TIMEOUT_SECS,
+        "--speed-limit",
+        CURL_SPEED_LIMIT_BYTES_PER_SEC,
+        "--speed-time",
+        &stall,
+        url,
+    ])
+    .kill_on_drop(true);
+    let out = match cog_core::progress::run_child_watched(cmd, &format!("curl {url}")).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+            return Err(format!(
+                "curl {url} 停住了：{silent:?} 没有收到字节，比这份部署见过的任何一次\
+                 「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
+            ))
+        }
+        Err(e) => return Err(format!("curl {url} could not run: {e}")),
+    };
     if !out.status.success() {
         return Err(format!(
             "curl {url} exited {}: {}",
@@ -1252,14 +1272,22 @@ async fn scrape_occupancy(
     ))
 }
 
-async fn kubectl(args: &[&str], timeout_secs: u64) -> Result<String, String> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        tokio::process::Command::new("kubectl").args(args).output(),
-    )
-    .await
-    .map_err(|_| crate::cmd_timeout::timed_out(&format!("kubectl {args:?}"), timeout_secs))?
-    .map_err(|e| format!("kubectl {args:?} could not run: {e}"))?;
+/// 判的是它还在不在产出，不是它跑了多久：一次 `kubectl get` 在 API 服务器忙时可能
+/// 走上很久，而一份卡住的读与它按秒的界眼里是同一个读数。
+async fn kubectl(args: &[&str]) -> Result<String, String> {
+    let cmdline = format!("kubectl {args:?}");
+    let mut cmd = tokio::process::Command::new("kubectl");
+    cmd.args(args).kill_on_drop(true);
+    let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+            return Err(format!(
+                "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这份部署见过的\
+                 任何一次「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
+            ))
+        }
+        Err(e) => return Err(format!("{cmdline} could not run: {e}")),
+    };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
@@ -1443,12 +1471,7 @@ async fn reconcile(
     let peak = state.observe(used);
 
     let ns = namespace();
-    let json = match kubectl(
-        &["get", "pvc", &target.claim, "-n", &ns, "-o", "json"],
-        KUBECTL_READ_TIMEOUT_SECS,
-    )
-    .await
-    {
+    let json = match kubectl(&["get", "pvc", &target.claim, "-n", &ns, "-o", "json"]).await {
         Ok(json) => json,
         Err(e) => {
             warn!(claim = %target.claim, error = %e, "volume capacity: claim unreadable");
@@ -1600,19 +1623,16 @@ async fn reconcile(
         "{{\"spec\":{{\"resources\":{{\"requests\":{{\"storage\":\"{}\"}}}}}}}}",
         wanted
     );
-    match kubectl(
-        &[
-            "patch",
-            "pvc",
-            &target.claim,
-            "-n",
-            &ns,
-            "--type=merge",
-            "-p",
-            &patch,
-        ],
-        KUBECTL_TIMEOUT_SECS,
-    )
+    match kubectl(&[
+        "patch",
+        "pvc",
+        &target.claim,
+        "-n",
+        &ns,
+        "--type=merge",
+        "-p",
+        &patch,
+    ])
     .await
     {
         Ok(_) => {
@@ -1663,12 +1683,7 @@ async fn reconcile(
 /// that watches it lives, and nothing else on any surface says so.
 async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) -> bool {
     let pair = format!("{SHORTFALL_SINCE_ANNOTATION}={now_unix}");
-    if let Err(e) = kubectl(
-        &["annotate", "pvc", claim, "-n", ns, &pair, "--overwrite"],
-        KUBECTL_TIMEOUT_SECS,
-    )
-    .await
-    {
+    if let Err(e) = kubectl(&["annotate", "pvc", claim, "-n", ns, &pair, "--overwrite"]).await {
         warn!(
             claim,
             error = %e,
@@ -1683,12 +1698,7 @@ async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) -> bool {
 
 async fn clear_shortfall_stamp(claim: &str, ns: &str) {
     let removal = format!("{SHORTFALL_SINCE_ANNOTATION}-");
-    if let Err(e) = kubectl(
-        &["annotate", "pvc", claim, "-n", ns, &removal],
-        KUBECTL_TIMEOUT_SECS,
-    )
-    .await
-    {
+    if let Err(e) = kubectl(&["annotate", "pvc", claim, "-n", ns, &removal]).await {
         warn!(
             claim,
             error = %e,
@@ -1702,32 +1712,26 @@ async fn clear_shortfall_stamp(claim: &str, ns: &str) {
 /// quota moves as other claims are created, and a cached ceiling would let this
 /// loop write a request the namespace can no longer accept.
 async fn read_ceiling(ns: &str, own_request: u64) -> Option<Ceiling> {
-    let limit = kubectl(
-        &["get", "limitrange", "-n", ns, "-o", "json"],
-        KUBECTL_READ_TIMEOUT_SECS,
-    )
-    .await
-    .ok()
-    .and_then(|json| match limit_range_max_storage(&json) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "volume capacity: limit range unreadable; ceiling unknown");
-            None
-        }
-    });
-    let quota = kubectl(
-        &["get", "resourcequota", "-n", ns, "-o", "json"],
-        KUBECTL_READ_TIMEOUT_SECS,
-    )
-    .await
-    .ok()
-    .and_then(|json| match quota_free_storage(&json, own_request) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "volume capacity: quota unreadable; ceiling unknown");
-            None
-        }
-    });
+    let limit = kubectl(&["get", "limitrange", "-n", ns, "-o", "json"])
+        .await
+        .ok()
+        .and_then(|json| match limit_range_max_storage(&json) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "volume capacity: limit range unreadable; ceiling unknown");
+                None
+            }
+        });
+    let quota = kubectl(&["get", "resourcequota", "-n", ns, "-o", "json"])
+        .await
+        .ok()
+        .and_then(|json| match quota_free_storage(&json, own_request) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "volume capacity: quota unreadable; ceiling unknown");
+                None
+            }
+        });
     admission_ceiling(limit, quota)
 }
 
@@ -1833,13 +1837,10 @@ pub fn spawn_volume_capacity_loop(
                     // a claim other than the one about to be raised, and a read
                     // taken after the first raise would be answering the
                     // question too late to be acted on.
-                    let blocked_classes = match kubectl(
-                        &["get", "pvc", "-n", &ns, "-o", "json"],
-                        KUBECTL_READ_TIMEOUT_SECS,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|json| parse_claims(&json))
+                    let blocked_classes = match kubectl(&["get", "pvc", "-n", &ns, "-o", "json"])
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|json| parse_claims(&json))
                     {
                         Ok(claims) => classes_that_do_not_expand(&claims, unix_now()),
                         Err(e) => {

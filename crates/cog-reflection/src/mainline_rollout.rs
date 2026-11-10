@@ -34,7 +34,6 @@ use cog_core::{SFError, SFResult};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::change_execution::{KUBECTL_READ_TIMEOUT_SECS, KUBECTL_TIMEOUT_SECS};
 use crate::config::{MainlineDeployerConfig, RolloutTargetConfig};
 use crate::mainline_deployer::{
     bounded, carries_deployment, config_consumer_jsonpath, exit_code, failure_signature, field,
@@ -63,9 +62,10 @@ pub(crate) const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImageP
 
 /// 「落地之前复问一次上游 CI」这一段的墙钟上界（秒）。
 ///
-/// 两头都要用它：这一侧拿它包住整段提问（超时按「没问到」扣住这一轮），派发侧把它
-/// 加进 Job 的 `activeDeadlineSeconds`——只封一头，另一头的界就名不副实。
-// cap: bound — 两头都用它：这一侧包住整段提问，派发侧加进 activeDeadlineSeconds；只封一头另一头就名不副实
+/// 这一侧拿它包住整段提问（超时按「没问到」扣住这一轮）；派发侧把它加进自己的
+/// 等待预算（`judgement_wait_budget`），让它愿意等到这一问有结论。Job 本身没有
+/// 期限了——容器死活由存活探针按进度文件判，所以这里只需要照顾「派发方别先走」。
+// cap: bound — 这一侧包住整段提问，派发侧把它加进自己的等待预算；Job 本身已没有期限
 pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 
 /// 上游答「还在跑」时，这一问愿意等多久（秒）再扣住这一轮。
@@ -77,8 +77,8 @@ pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 /// 任何东西上去过。
 ///
 /// 「还在跑」与「没问到」必须分开处置：后者是路不通，等也没用；前者是判词还在
-/// 生产，再问一句就有。只等这一种，且等到有上界为止——无限等会让 Job 的期限名不
-/// 副实，到点被杀还走不到 Job 自己的回滚。
+/// 生产，再问一句就有。只等这一种，且等到有上界为止——无限等会让这一轮永远不
+/// 结束，而「这一版还在等 CI」与「这一版卡住了」在部署器那边同形。
 ///
 /// 上界要盖住**上游一次完整判定**，不是盖住「第一次答还在跑」：等待从第一次提问
 /// 起算，而那时判词还没开始存在，CI 从起跑到最后一条结论的整段都落在等待里。同一
@@ -260,6 +260,10 @@ const SUPPORT_CAUSE_CONTAINER_LIMIT: usize = 4;
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
 // cap: bound — 探测、致命态复查、部署态查询共用同一节拍
 const ROLLOUT_POLL_SECS: u64 = 5;
+
+/// 这一跑在进度面上的名字。容器里的判断读内存，容器外的存活探针读进度文件
+/// （`COGNEVA_PROGRESS_FILE`），两边读的是同一串拍子。
+const ROLLOUT_PROGRESS_TASK: &str = "mainline-rollout";
 
 /// 一份别人留下的暂停在多久之后算残渣。
 ///
@@ -2844,6 +2848,13 @@ fn kubectl_output_paths() -> (PathBuf, PathBuf) {
     (out, err)
 }
 
+/// 一份落盘输出到现在有多少字节。读不到（文件还没建出来、刚被删掉）算 0——
+/// 那是「这一刻没有新产出」，不是「它停住了」：判停要两次读数一样长，而第一次
+/// 读数之前先打了一拍。
+fn file_len(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
 /// 子进程被杀之前写下的话，取最后一段。
 ///
 /// 外层定时器到点是**杀**进程：输出经管道交回时，进程一死管道就断，已经写出来的
@@ -2975,7 +2986,7 @@ impl RolloutExecutor {
         self
     }
 
-    pub(crate) async fn run_kubectl(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+    pub(crate) async fn run_kubectl(&self, args: &[&str]) -> SFResult<String> {
         let cmdline = format!("kubectl {}", args.join(" "));
         // 动词与实参之外只加命名空间。**不加 `--request-timeout`**：实测这个
         // k3s 编出来的 kubectl（宿主 `/usr/local/bin/k3s` 挂进来的那一份）一旦
@@ -2983,7 +2994,7 @@ impl RolloutExecutor {
         // in-cluster 配置，直接回落到 `http://localhost:8080`，而环境变量与投影
         // 令牌都好好地在（见 [`CLUSTER_CONFIG_MISSING_MARKER`] 记的那一段）。
         // 同一条命令去掉旗标就正常。于是"子进程自己带死线"这条路在这个二进制上
-        // 走不通，改用下面的输出落盘：外层定时器照样兜底，但子进程在死之前写下
+        // 走不通，改用下面的输出落盘：看门狗判停之后仍然杀它，但它在死之前写下
         // 的话不会再跟着它一起消失。
         let mut full: Vec<&str> = vec!["-n", &self.ns];
         full.extend_from_slice(args);
@@ -3009,38 +3020,77 @@ impl RolloutExecutor {
                 )));
             }
         };
-        let waited = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
-        let timed_out = waited.is_err();
-        if timed_out {
-            // 先杀再读：让它停手，否则读到的是一份还在长的文件。
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+        // 判它停没停，判据是**它还在不在写**：这两条文件的长度就是它的产出，每次
+        // 变长是一拍；一段里一个字节都不长时再看 CPU 时间——一份沉默的重查询照样在
+        // 烧 CPU。判停用的是 `progress::stall`，与编排侧的回收、执行路由的守护是
+        // 同一条线，所以三处不会漂移；这套部署还没量够步数时它不判，进程继续跑。
+        //
+        // 为什么不能只是把定时器删掉：kubectl 卡在一条半开的 TCP 连接上时一个字节
+        // 也不会再写，也没有退出码可等。没有看门狗，这一轮滚动就永远停在原地，而
+        // 它占着的那条构建槽与那份镜像一起被拖着。
+        let beat_id = format!(
+            "{cmdline} [{}]",
+            out_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("kubectl")
+        );
+        cog_core::progress::beat(&beat_id);
+        let mut written = (file_len(&out_path), file_len(&err_path));
+        let mut burned: Option<(u64, u64)> = None;
+        let mut stalled: Option<(Duration, Duration)> = None;
+        let status = loop {
+            tokio::select! {
+                status = child.wait() => break status,
+                _ = tokio::time::sleep(cog_core::progress::WATCH_TICK) => {
+                    let now = (file_len(&out_path), file_len(&err_path));
+                    if now != written {
+                        written = now;
+                        cog_core::progress::beat(&beat_id);
+                    }
+                    if let Some(pid) = child.id() {
+                        if let Some(ticks) = cog_core::progress::cpu_ticks(pid) {
+                            if burned.is_some_and(|before| ticks != before) {
+                                cog_core::progress::beat(&beat_id);
+                            }
+                            burned = Some(ticks);
+                        }
+                    }
+                    if let Some((silent, window)) = cog_core::progress::stall(&beat_id) {
+                        stalled = Some((silent, window));
+                        // 先杀再读：让它停手，否则读到的是一份还在长的文件。
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
+                }
+            }
+        };
+        cog_core::progress::forget(&beat_id);
         let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
         let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
         let _ = std::fs::remove_file(&out_path);
         let _ = std::fs::remove_file(&err_path);
-        let status = match waited {
-            Ok(Ok(status)) => status,
-            Ok(Err(e)) => {
+        // 判停被杀：把子进程已经写下的话带上。这正是这条路径存在的理由——
+        // 一次九次尝试、三百多秒的停摆如果只留一句「超时」，事后没人说得清
+        // 是 apiserver 卡住、Pod 的网络栈坏了，还是配置根本没读进来。
+        if let Some((silent, window)) = stalled {
+            return Err(SFError::IO(format!(
+                "{} (kubectl was killed{}): {}",
+                crate::cmd_timeout::went_silent(&cmdline, silent, window),
+                if stderr.trim().is_empty() {
+                    " before it wrote anything"
+                } else {
+                    ""
+                },
+                stderr_tail(&stderr),
+            )));
+        }
+        let status = match status {
+            Ok(status) => status,
+            Err(e) => {
                 return Err(SFError::IO(format!(
                     "{OBSERVATION_TOOL_MARKER}: cannot run {}: {e}",
                     self.kubectl
-                )))
-            }
-            // 到点被杀：把子进程已经写下的话带上。这正是这条路径存在的理由——
-            // 一次九次尝试、三百多秒的停摆如果只留一句「超时」，事后没人说得清
-            // 是 apiserver 卡住、Pod 的网络栈坏了，还是配置根本没读进来。
-            Err(_) => {
-                return Err(SFError::IO(format!(
-                    "{} (kubectl was killed{}): {}",
-                    crate::cmd_timeout::timed_out(&cmdline, timeout_secs),
-                    if stderr.trim().is_empty() {
-                        " before it wrote anything"
-                    } else {
-                        ""
-                    },
-                    stderr_tail(&stderr),
                 )))
             }
         };
@@ -3075,12 +3125,9 @@ impl RolloutExecutor {
     /// `--force-conflicts` 的对手只可能是这边自己留下的旧对象（安装期的客户端 apply、
     /// 以及按 label 的尽力清扫可能没删掉的残件），冲突方不是别的写者——所以接管是对的。
     /// 缺了它，一条清理失败就会把发布永久卡死，而那正是这条路径要修的那种故障。
-    async fn apply_manifest_file(&self, path: &str, timeout_secs: u64) -> SFResult<String> {
-        self.run_kubectl(
-            &["apply", "-f", path, "--server-side", "--force-conflicts"],
-            timeout_secs,
-        )
-        .await
+    async fn apply_manifest_file(&self, path: &str) -> SFResult<String> {
+        self.run_kubectl(&["apply", "-f", path, "--server-side", "--force-conflicts"])
+            .await
     }
 
     /// 落一份支撑清单；清单要改的是 pod 模板不可变的那类对象（`Job`）时，先把旧
@@ -3095,14 +3142,10 @@ impl RolloutExecutor {
     /// 重建是这个对象的正常生命周期——它是一次性 bootstrap，跑完就在那里占着名字，
     /// 模板一变就只能重建。删掉它不会中断任何东西：新的一份随同一次 apply 被创建，
     /// 并按新规格重新跑一遍。次数有界，一份真坏了的清单不会被重试成死循环。
-    pub(crate) async fn apply_support_manifest(
-        &self,
-        path: &str,
-        timeout_secs: u64,
-    ) -> SFResult<String> {
+    pub(crate) async fn apply_support_manifest(&self, path: &str) -> SFResult<String> {
         let mut refused = None;
         for _ in 0..4 {
-            match self.apply_manifest_file(path, timeout_secs).await {
+            match self.apply_manifest_file(path).await {
                 Ok(out) => return Ok(out),
                 Err(SFError::IO(text)) => {
                     let Some((kind, name)) = immutable_object_in(&text) else {
@@ -3123,16 +3166,13 @@ impl RolloutExecutor {
                     // 一种 kind，走到这里必然是 Job；而 RBAC 门是从源码里静态读出
                     // 「这条命令碰什么资源」的，拼出来的槽位它读不出——既证明不了
                     // 角色授了 delete，也说不清这条命令要删的是什么。
-                    self.run_kubectl(
-                        &[
-                            "delete",
-                            "job",
-                            name,
-                            "--ignore-not-found",
-                            "--cascade=foreground",
-                        ],
-                        60,
-                    )
+                    self.run_kubectl(&[
+                        "delete",
+                        "job",
+                        name,
+                        "--ignore-not-found",
+                        "--cascade=foreground",
+                    ])
                     .await?;
                     refused = Some(text);
                 }
@@ -3146,15 +3186,12 @@ impl RolloutExecutor {
 
     async fn set_image(&self, t: &RolloutTarget, image: &str) -> SFResult<()> {
         let image_arg = format!("{}={}", t.container, image);
-        self.run_kubectl(
-            &[
-                "set",
-                "image",
-                &format!("deployment/{}", t.deployment),
-                &image_arg,
-            ],
-            60,
-        )
+        self.run_kubectl(&[
+            "set",
+            "image",
+            &format!("deployment/{}", t.deployment),
+            &image_arg,
+        ])
         .await?;
         Ok(())
     }
@@ -3205,10 +3242,7 @@ impl RolloutExecutor {
         let new_limits = docs.iter().find_map(pod_template_limits)?;
 
         let live_text = self
-            .run_kubectl(
-                &["get", "deployment", &t.deployment, "-o", "json"],
-                KUBECTL_TIMEOUT_SECS,
-            )
+            .run_kubectl(&["get", "deployment", &t.deployment, "-o", "json"])
             .await
             .ok()?;
         let live_json: serde_json::Value = serde_json::from_str(&live_text).ok()?;
@@ -3217,33 +3251,27 @@ impl RolloutExecutor {
         let old_limits = pod_template_limits(&live_doc)?;
 
         let quota_text = self
-            .run_kubectl(
-                &["get", "resourcequota", "-o", "json"],
-                KUBECTL_TIMEOUT_SECS,
-            )
+            .run_kubectl(&["get", "resourcequota", "-o", "json"])
             .await
             .ok()?;
         let quotas = crate::governance_drift::live_quota_usage(&quota_text).ok()?;
         // 这一版自己的 Pod 可能已经在场：上一轮 apply 把它建出来了，它的额度就在
         // 这份 usage 里。再按 surge 记一次，就是拿同一台 Pod 当两台去比天花板。
         let pods_text = self
-            .run_kubectl(
-                &[
-                    "get",
-                    "pods",
-                    "-l",
-                    &format!(
-                        "{}={},{}={}",
-                        cog_core::topology::LABEL_NAME,
-                        t.name,
-                        cog_core::topology::LABEL_COMPONENT,
-                        t.component
-                    ),
-                    "-o",
-                    "json",
-                ],
-                KUBECTL_TIMEOUT_SECS,
-            )
+            .run_kubectl(&[
+                "get",
+                "pods",
+                "-l",
+                &format!(
+                    "{}={},{}={}",
+                    cog_core::topology::LABEL_NAME,
+                    t.name,
+                    cog_core::topology::LABEL_COMPONENT,
+                    t.component
+                ),
+                "-o",
+                "json",
+            ])
             .await
             .unwrap_or_default();
         let already = pod_already_admitted(&pods_text, &t.name, &t.component, &new_limits);
@@ -3264,10 +3292,7 @@ impl RolloutExecutor {
             return verdict;
         }
         let Ok(quota_text) = self
-            .run_kubectl(
-                &["get", "resourcequota", "-o", "json"],
-                KUBECTL_TIMEOUT_SECS,
-            )
+            .run_kubectl(&["get", "resourcequota", "-o", "json"])
             .await
         else {
             return verdict;
@@ -3311,10 +3336,7 @@ impl RolloutExecutor {
         let started = std::time::Instant::now();
         let mut waited = false;
         loop {
-            let Ok(text) = self
-                .run_kubectl(&["get", "pods", "-o", "json"], KUBECTL_READ_TIMEOUT_SECS)
-                .await
-            else {
+            let Ok(text) = self.run_kubectl(&["get", "pods", "-o", "json"]).await else {
                 return waited;
             };
             let Some(names) = terminating_pods(&text) else {
@@ -3362,10 +3384,7 @@ impl RolloutExecutor {
     async fn missing_reference_holds(&self, docs: &[serde_yaml::Value]) -> Option<String> {
         for name in unresolved_configmaps(docs) {
             let exists = match self
-                .run_kubectl(
-                    &["get", "configmap", &name, "-o", "name"],
-                    KUBECTL_TIMEOUT_SECS,
-                )
+                .run_kubectl(&["get", "configmap", &name, "-o", "name"])
                 .await
             {
                 Ok(_) => true,
@@ -3420,7 +3439,7 @@ impl RolloutExecutor {
                     let field_removals = self.field_removals_to_verify(&key, &text).await;
                     let outcome = async {
                         self.clear_superseded_env_values(&staged_path).await?;
-                        self.apply_manifest_file(&path_arg, 60).await.map(|_| ())
+                        self.apply_manifest_file(&path_arg).await.map(|_| ())
                     }
                     .await;
                     // 这份暂存件只服务这一次 apply，名字又按实例唯一（不再被下一轮覆盖），
@@ -3462,10 +3481,7 @@ impl RolloutExecutor {
     /// 读不到就返回 None：调用方据此走"说不清"的那一支（照样滚），而不是把读不到
     /// 当"没变"——那正好是这条判据要防的静默失效。
     async fn configmap_contents(&self) -> Option<BTreeMap<String, serde_json::Value>> {
-        let readout = match self
-            .run_kubectl(&["get", "configmap", "-o", "json"], KUBECTL_TIMEOUT_SECS)
-            .await
-        {
+        let readout = match self.run_kubectl(&["get", "configmap", "-o", "json"]).await {
             Ok(text) => text,
             Err(e) => {
                 warn!(error = %e, "config effect: cannot read the ConfigMaps, treating every consumer as needing a roll");
@@ -3509,7 +3525,6 @@ impl RolloutExecutor {
             let readout = self
                 .probe(
                     &["get", entry.resource, "-o", &jsonpath],
-                    30,
                     self.rollout_timeout_secs,
                 )
                 .await?;
@@ -3625,18 +3640,15 @@ impl RolloutExecutor {
                 }
                 // 打在 apply 之后的支撑快照之前：这样它是"这次 apply 动过的工作负载"
                 // 之一，由紧跟着的支撑等待一并等它回就绪。
-                self.run_kubectl(
-                    &[
-                        "patch",
-                        &consumer.kind,
-                        &consumer.name,
-                        "--type",
-                        "merge",
-                        "-p",
-                        &body,
-                    ],
-                    60,
-                )
+                self.run_kubectl(&[
+                    "patch",
+                    &consumer.kind,
+                    &consumer.name,
+                    "--type",
+                    "merge",
+                    "-p",
+                    &body,
+                ])
                 .await?;
                 info!(
                     workload = %consumer.display(),
@@ -3673,7 +3685,6 @@ impl RolloutExecutor {
                         "-o",
                         "jsonpath={range .items[*]}{.metadata.name} {.metadata.generation}{\"\\n\"}{end}",
                     ],
-                    30,
                     self.rollout_timeout_secs,
                 )
                 .await?;
@@ -3717,7 +3728,6 @@ impl RolloutExecutor {
                     "-o",
                     "json",
                 ],
-                60,
                 self.rollout_timeout_secs,
             )
             .await?;
@@ -3793,7 +3803,6 @@ impl RolloutExecutor {
                     "-o",
                     "json",
                 ],
-                30,
                 self.rollout_timeout_secs,
             )
             .await?;
@@ -3858,10 +3867,7 @@ impl RolloutExecutor {
             let mut still: Vec<&SupportWorkload> = Vec::new();
             for w in pending {
                 let readout = self
-                    .run_kubectl(
-                        &["get", w.kind, &w.name, "-o", settle_jsonpath(w.kind)],
-                        KUBECTL_READ_TIMEOUT_SECS,
-                    )
+                    .run_kubectl(&["get", w.kind, &w.name, "-o", settle_jsonpath(w.kind)])
                     .await?;
                 if support_settled(w.kind, &readout) == Some(true) {
                     continue;
@@ -3888,6 +3894,7 @@ impl RolloutExecutor {
                     causes.join("; ")
                 )));
             }
+            cog_core::progress::beat(ROLLOUT_PROGRESS_TASK);
             tokio::time::sleep(Duration::from_secs(ROLLOUT_POLL_SECS)).await;
         }
         Ok(())
@@ -3903,10 +3910,7 @@ impl RolloutExecutor {
     /// 判据，也不能折成「没起来」。
     async fn support_workload_cause(&self, w: &SupportWorkload) -> String {
         let object = match self
-            .run_kubectl(
-                &["get", w.kind, &w.name, "-o", "json"],
-                KUBECTL_READ_TIMEOUT_SECS,
-            )
+            .run_kubectl(&["get", w.kind, &w.name, "-o", "json"])
             .await
         {
             Ok(text) => text,
@@ -3919,10 +3923,7 @@ impl RolloutExecutor {
             );
         };
         let pods = match self
-            .run_kubectl(
-                &["get", "pods", "-l", &selector, "-o", "json"],
-                KUBECTL_READ_TIMEOUT_SECS,
-            )
+            .run_kubectl(&["get", "pods", "-l", &selector, "-o", "json"])
             .await
         {
             Ok(text) => text,
@@ -3968,10 +3969,7 @@ impl RolloutExecutor {
                 continue;
             };
             let live = match self
-                .run_kubectl(
-                    &["get", &workload.kind_arg(), &workload.name, "-o", "json"],
-                    30,
-                )
+                .run_kubectl(&["get", &workload.kind_arg(), &workload.name, "-o", "json"])
                 .await
             {
                 Ok(out) => serde_json::from_str(&out).unwrap_or(serde_json::Value::Null),
@@ -4007,17 +4005,14 @@ impl RolloutExecutor {
                 dropped = plan.dropped,
                 "cleared env the manifest no longer declares, and env values it now injects from a source"
             );
-            self.run_kubectl(
-                &[
-                    "patch",
-                    &workload.kind_arg(),
-                    &workload.name,
-                    "--type=json",
-                    "-p",
-                    &serde_json::Value::Array(plan.ops).to_string(),
-                ],
-                60,
-            )
+            self.run_kubectl(&[
+                "patch",
+                &workload.kind_arg(),
+                &workload.name,
+                "--type=json",
+                "-p",
+                &serde_json::Value::Array(plan.ops).to_string(),
+            ])
             .await?;
         }
         Ok(())
@@ -4027,10 +4022,7 @@ impl RolloutExecutor {
     async fn current_image(&self, t: &RolloutTarget) -> SFResult<String> {
         let jsonpath = crate::deployment_image::container_image_query(&t.container);
         let img = self
-            .run_kubectl(
-                &["get", "deployment", &t.deployment, "-o", &jsonpath],
-                KUBECTL_READ_TIMEOUT_SECS,
-            )
+            .run_kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath])
             .await?;
         crate::deployment_image::container_image(&img, &t.deployment, &t.container)
     }
@@ -4041,12 +4033,7 @@ impl RolloutExecutor {
     /// 后者（查询成功但输出表明版本有问题）立即返回，那是真的版本结论。
     /// 非集群访问类的失败（选择器非法、资源不存在）同样立即返回——它们也是
     /// 明确的观测结果，不该被静默重试吞掉。
-    pub(crate) async fn probe(
-        &self,
-        args: &[&str],
-        timeout_secs: u64,
-        budget_secs: u64,
-    ) -> SFResult<String> {
+    pub(crate) async fn probe(&self, args: &[&str], budget_secs: u64) -> SFResult<String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(budget_secs);
         // The attempt count and the elapsed time go into the error because the
         // reading has to outlive the process that produced it: one attempt that
@@ -4059,7 +4046,7 @@ impl RolloutExecutor {
         let mut attempts = 0u32;
         loop {
             attempts += 1;
-            match self.run_kubectl(args, timeout_secs).await {
+            match self.run_kubectl(args).await {
                 Ok(out) => return Ok(out),
                 Err(e) if is_cluster_unreachable(&e.to_string()) => {
                     if std::time::Instant::now() >= deadline {
@@ -4069,6 +4056,7 @@ impl RolloutExecutor {
                             started.elapsed().as_secs()
                         )));
                     }
+                    cog_core::progress::beat(ROLLOUT_PROGRESS_TASK);
                     tokio::time::sleep(Duration::from_secs(ROLLOUT_POLL_SECS)).await;
                 }
                 Err(e) => return Err(e),
@@ -4091,9 +4079,7 @@ impl RolloutExecutor {
                 &selector,
                 "-o",
                 "jsonpath={range .items[*]}{range .status.initContainerStatuses[*]}{.state.terminated.finishedAt}{\"|\"}{end}{end}",
-            ],
-            30,
-        )
+            ])
         .await
     }
 
@@ -4103,16 +4089,13 @@ impl RolloutExecutor {
     /// 好版本判成败。
     async fn init_containers_exist(&self, t: &RolloutTarget) -> SFResult<bool> {
         let out = self
-            .run_kubectl(
-                &[
-                    "get",
-                    "deployment",
-                    &t.deployment,
-                    "-o",
-                    "jsonpath={.spec.template.spec.initContainers[*].name}",
-                ],
-                30,
-            )
+            .run_kubectl(&[
+                "get",
+                "deployment",
+                &t.deployment,
+                "-o",
+                "jsonpath={.spec.template.spec.initContainers[*].name}",
+            ])
             .await?;
         Ok(!out.trim().is_empty())
     }
@@ -4176,16 +4159,13 @@ impl RolloutExecutor {
             let mut starting = readiness_deadline.is_none();
             let mut note = String::new();
             match self
-                .run_kubectl(
-                    &[
-                        "get",
-                        "deployment",
-                        &t.deployment,
-                        "-o",
-                        ROLLOUT_STATUS_JSONPATH,
-                    ],
-                    30,
-                )
+                .run_kubectl(&[
+                    "get",
+                    "deployment",
+                    &t.deployment,
+                    "-o",
+                    ROLLOUT_STATUS_JSONPATH,
+                ])
                 .await
             {
                 Ok(out) => {
@@ -4223,10 +4203,11 @@ impl RolloutExecutor {
                                  could hold it, so the pause is leftover state from a writer \
                                  that is gone; resuming it and restarting the wait budget"
                             );
-                            self.run_kubectl(
-                                &["rollout", "resume", &format!("deployment/{}", t.deployment)],
-                                30,
-                            )
+                            self.run_kubectl(&[
+                                "rollout",
+                                "resume",
+                                &format!("deployment/{}", t.deployment),
+                            ])
                             .await
                             .map_err(|e| {
                                 SFError::IO(format!(
@@ -4489,9 +4470,7 @@ impl RolloutExecutor {
                      {.state.waiting.reason}|T|{.lastState.terminated.message}{\"\\n\"}{end}\
                      {.status.containerStatuses[0].state.waiting.reason}|W|{.status.containerStatuses[0].state.waiting.message}{\"\\n\"}\
                      {.status.containerStatuses[0].state.waiting.reason}|T|{.status.containerStatuses[0].lastState.terminated.message}{\"\\n\"}{end}",
-                ],
-                30,
-            )
+                ])
             .await
         {
             Ok(out) => out,
@@ -4534,23 +4513,20 @@ impl RolloutExecutor {
     async fn sample_rollout_pods(&self, t: &RolloutTarget) -> Vec<PodSample> {
         let selector = pod_selector(&t.name, &t.component);
         let out = self
-            .run_kubectl(
-                &[
-                    "get",
-                    "pods",
-                    "-l",
-                    &selector,
-                    "-o",
-                    "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|\
+            .run_kubectl(&[
+                "get",
+                "pods",
+                "-l",
+                &selector,
+                "-o",
+                "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|\
                      {.status.containerStatuses[0].ready}|\
                      {.status.containerStatuses[0].state.waiting.reason}|\
                      {.status.containerStatuses[0].state.waiting.message}|\
                      {.status.containerStatuses[0].state.running.startedAt}|\
                      {.metadata.deletionTimestamp}|\
                      {.status.containerStatuses[0].lastState.terminated.message}{\"\\n\"}{end}",
-                ],
-                30,
-            )
+            ])
             .await
             .unwrap_or_default();
         pod_samples(&out)
@@ -4565,19 +4541,16 @@ impl RolloutExecutor {
     /// 开枪，正是这条判定要消灭的错误。读不到就不判，交回外层 deadline。
     async fn readiness_probe(&self, t: &RolloutTarget) -> Option<ProbeCycle> {
         let out = self
-            .run_kubectl(
-                &[
-                    "get",
-                    "deployment",
-                    &t.deployment,
-                    "-o",
-                    "jsonpath={.spec.template.spec.containers[0].readinessProbe.initialDelaySeconds}|\
+            .run_kubectl(&[
+                "get",
+                "deployment",
+                &t.deployment,
+                "-o",
+                "jsonpath={.spec.template.spec.containers[0].readinessProbe.initialDelaySeconds}|\
                      {.spec.template.spec.containers[0].readinessProbe.periodSeconds}|\
                      {.spec.template.spec.containers[0].readinessProbe.timeoutSeconds}|\
                      {.spec.template.spec.containers[0].readinessProbe.failureThreshold}",
-                ],
-                30,
-            )
+            ])
             .await
             .ok()?;
         // 空输出是查询没生效（路径写错、对象不存在），不是「这个部署没有探针」：
@@ -4620,19 +4593,16 @@ impl RolloutExecutor {
         // 只取 Warning：正常滚动事件（ScalingReplicaSet 等）说明不了病因，
         // 排不上队与探针不过都落在 Warning 里。
         let events = self
-            .run_kubectl(
-                &[
-                    "get",
-                    "events",
-                    "--field-selector",
-                    "type=Warning",
-                    "--sort-by=.lastTimestamp",
-                    "-o",
-                    "jsonpath={range .items[*]}{.involvedObject.kind}|{.involvedObject.name}|\
+            .run_kubectl(&[
+                "get",
+                "events",
+                "--field-selector",
+                "type=Warning",
+                "--sort-by=.lastTimestamp",
+                "-o",
+                "jsonpath={range .items[*]}{.involvedObject.kind}|{.involvedObject.name}|\
                      {.reason}|{.message}{\"\\n\"}{end}",
-                ],
-                30,
-            )
+            ])
             .await
             .unwrap_or_default();
         let mut out = summarize_pod_states(&samples, Utc::now());
@@ -4664,20 +4634,17 @@ impl RolloutExecutor {
     async fn sample_unschedulable_pods(&self, t: &RolloutTarget) -> Vec<(String, String)> {
         let selector = pod_selector(&t.name, &t.component);
         let out = self
-            .run_kubectl(
-                &[
-                    "get",
-                    "pods",
-                    "-l",
-                    &selector,
-                    "-o",
-                    "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|\
+            .run_kubectl(&[
+                "get",
+                "pods",
+                "-l",
+                &selector,
+                "-o",
+                "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|\
                      {.status.conditions[?(@.type==\"PodScheduled\")].status}|\
                      {.status.conditions[?(@.type==\"PodScheduled\")].reason}|\
                      {.status.conditions[?(@.type==\"PodScheduled\")].message}{\"\\n\"}{end}",
-                ],
-                30,
-            )
+            ])
             .await
             .unwrap_or_default();
         unschedulable_pods(&out)
@@ -4695,20 +4662,17 @@ impl RolloutExecutor {
     async fn sample_replicaset_failures(&self, t: &RolloutTarget) -> Vec<ReplicaSetFailure> {
         let selector = pod_selector(&t.name, &t.component);
         let out = self
-            .run_kubectl(
-                &[
-                    "get",
-                    "replicasets",
-                    "-l",
-                    &selector,
-                    "-o",
-                    "jsonpath={range .items[*]}{.metadata.name}|{.spec.replicas}|\
+            .run_kubectl(&[
+                "get",
+                "replicasets",
+                "-l",
+                &selector,
+                "-o",
+                "jsonpath={range .items[*]}{.metadata.name}|{.spec.replicas}|\
                      {.status.conditions[?(@.type==\"ReplicaFailure\")].status}|\
                      {.status.conditions[?(@.type==\"ReplicaFailure\")].reason}|\
                      {.status.conditions[?(@.type==\"ReplicaFailure\")].message}{\"\\n\"}{end}",
-                ],
-                30,
-            )
+            ])
             .await
             .unwrap_or_default();
         replicaset_failures(&out)
@@ -4719,10 +4683,7 @@ impl RolloutExecutor {
     /// requests：能把 Pod 顶出节点的字段远不止 requests。
     async fn current_placement_shape(&self, t: &RolloutTarget) -> SFResult<String> {
         let out = self
-            .run_kubectl(
-                &["get", "deployment", &t.deployment, "-o", "jsonpath={.spec}"],
-                30,
-            )
+            .run_kubectl(&["get", "deployment", &t.deployment, "-o", "jsonpath={.spec}"])
             .await?;
         Ok(normalize_placement_shape(&out))
     }
@@ -4758,6 +4719,9 @@ impl RolloutExecutor {
                 tokio::time::sleep(Duration::from_secs(nap)).await;
             }
             left = left.saturating_sub(nap);
+            // 静置期也是「在推进」：这一段最长可以是一整个 soak，全程不印日志也不动
+            // 别的状态，容器外的探针只能靠这一拍看见它还在。
+            cog_core::progress::beat(ROLLOUT_PROGRESS_TASK);
             if let Some(rq) = (self.host_run_queue)() {
                 window.record(rq);
             }
@@ -4796,7 +4760,6 @@ impl RolloutExecutor {
                         "-o",
                         "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{' '}{.status.containerStatuses[0].state.running.startedAt}{\"\\n\"}{end}",
                     ],
-                    30,
                     self.rollout_timeout_secs,
                 )
                 .await?;
@@ -4987,10 +4950,7 @@ impl RolloutExecutor {
                 "jsonpath={{range {spec}.containers[*]}}{{.name}}={{.image}}{{\"\\n\"}}{{end}}{{range {spec}.initContainers[*]}}{{.name}}={{.image}}{{\"\\n\"}}{{end}}"
             );
             let readout = self
-                .run_kubectl(
-                    &["get", resource, name, "--ignore-not-found", "-o", &jsonpath],
-                    30,
-                )
+                .run_kubectl(&["get", resource, name, "--ignore-not-found", "-o", &jsonpath])
                 .await
                 .map_err(|e| {
                     SFError::IO(format!(
@@ -5063,7 +5023,7 @@ impl RolloutExecutor {
             let target = format!("{resource}/{name}");
             let mut args: Vec<&str> = vec!["set", "image", &target];
             args.extend(specs.iter().map(|s| s.as_str()));
-            match self.run_kubectl(&args, KUBECTL_TIMEOUT_SECS).await {
+            match self.run_kubectl(&args).await {
                 Ok(_) => info!(
                     workload = %target,
                     containers = %specs.join(","),
@@ -5093,10 +5053,7 @@ impl RolloutExecutor {
     /// 有模板可还。
     pub(crate) async fn snapshot_pod_template(&self, name: &str) -> SFResult<TemplateSnapshot> {
         let out = self
-            .run_kubectl(
-                &["get", "deployment", name, "-o", "json"],
-                KUBECTL_READ_TIMEOUT_SECS,
-            )
+            .run_kubectl(&["get", "deployment", name, "-o", "json"])
             .await?;
         let doc: serde_json::Value = serde_json::from_str(&out).map_err(|e| {
             SFError::IO(format!(
@@ -5131,17 +5088,14 @@ impl RolloutExecutor {
         .to_string();
         let target = format!("deployment/{}", snap.name);
         match self
-            .run_kubectl(
-                &[
-                    "patch",
-                    "deployment",
-                    &snap.name,
-                    "--type=merge",
-                    "-p",
-                    &patch,
-                ],
-                60,
-            )
+            .run_kubectl(&[
+                "patch",
+                "deployment",
+                &snap.name,
+                "--type=merge",
+                "-p",
+                &patch,
+            ])
             .await
         {
             Ok(_) => {
@@ -5421,6 +5375,8 @@ impl RolloutExecutor {
     /// 回滚只回退 image：支撑资源不反向删改（apply 是幂等 upsert，旧镜像配新支撑
     /// 资源可运行；删改支撑资源反而可能把在跑集群打坏）。
     pub async fn run(&self, plan: &RolloutPlan) -> Result<(), RolloutFailure> {
+        // 每一步都是一拍：容器外的存活探针判的是「还在不在推进」，不是跑了多久。
+        cog_core::progress::beat(ROLLOUT_PROGRESS_TASK);
         // 上游 CI 的复问。派发侧在派 Job 之前问过一次，但提问到落地之间隔着整段
         // 构建——镜像在这里才被拉下来、apply 在这里才发生，那段时间足够一条要红的
         // 检查跑出结论（实测一次带红上线：派发 2 分 47 秒后应用 Pod 才起来，而
@@ -5513,10 +5469,7 @@ impl RolloutExecutor {
                 // hard 降到当前用量以下」被拒，而挡住的是一条本该成功的滚动。
                 // 读不到就照原样 apply——老行为，不因为一次读数失败而改道。
                 let text = match self
-                    .run_kubectl(
-                        &["get", "resourcequota", "-o", "json"],
-                        KUBECTL_TIMEOUT_SECS,
-                    )
+                    .run_kubectl(&["get", "resourcequota", "-o", "json"])
                     .await
                 {
                     Ok(live) => match crate::governance_drift::live_quota_usage(&live) {
@@ -5563,9 +5516,7 @@ impl RolloutExecutor {
                         );
                         let outcome = async {
                             self.clear_superseded_env_values(&path).await?;
-                            self.apply_support_manifest(&support_arg, 120)
-                                .await
-                                .map(|_| ())
+                            self.apply_support_manifest(&support_arg).await.map(|_| ())
                         }
                         .await;
                         // 这份暂存件只服务这一次 apply，名字又按实例唯一（不再被下一轮覆盖），
@@ -5738,6 +5689,7 @@ impl RolloutExecutor {
         }
         let mut done: Vec<&RolloutTarget> = Vec::new();
         for target in &plan.targets {
+            cog_core::progress::beat(ROLLOUT_PROGRESS_TASK);
             let prev_shape = prev_shapes
                 .iter()
                 .find(|(d, _)| d == &target.deployment)
@@ -5776,7 +5728,10 @@ impl RolloutExecutor {
                 return Err(failure);
             }
             match self.apply_target(plan, target).await {
-                Ok(unverified) => unverified_removals.extend(unverified),
+                Ok(unverified) => {
+                    cog_core::progress::beat(ROLLOUT_PROGRESS_TASK);
+                    unverified_removals.extend(unverified)
+                }
                 Err(e) => {
                     return self
                         .fail_without_blind_rollback(
@@ -5805,6 +5760,7 @@ impl RolloutExecutor {
                     )
                     .await;
             }
+            cog_core::progress::beat(ROLLOUT_PROGRESS_TASK);
             done.push(target);
         }
 
@@ -6206,10 +6162,7 @@ impl RolloutExecutor {
     async fn live_images(&self, resource: &str, name: &str) -> SFResult<Vec<(String, String)>> {
         let jsonpath = "jsonpath={range .spec.template.spec.initContainers[*]}{.name}={.image}{\"\\n\"}{end}{range .spec.template.spec.containers[*]}{.name}={.image}{\"\\n\"}{end}";
         let out = self
-            .run_kubectl(
-                &["get", resource, name, "-o", jsonpath],
-                KUBECTL_READ_TIMEOUT_SECS,
-            )
+            .run_kubectl(&["get", resource, name, "-o", jsonpath])
             .await?;
         let mut images = Vec::new();
         for line in out.lines() {
@@ -6279,6 +6232,9 @@ impl RollbackVerdict {
 /// 内置默认四条（Job 不挂 configmap，与部署侧配置默认值同源）；回滚目标
 /// 由 Job 启动时快照各部署当前镜像得到，不通过参数传入。
 pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
+    // 开工先建进度文件：容器外的存活探针从这一刻起就有东西可读，Job 因此不再需要
+    // 一个按钟杀掉容器的 activeDeadlineSeconds。
+    cog_core::progress::start_progress_file();
     // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
     // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
     // 靠的正是那边装上的 Loki 镜像。

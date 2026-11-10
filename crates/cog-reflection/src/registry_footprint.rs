@@ -193,14 +193,30 @@ impl RegistryClient {
             .write_all(req.as_bytes())
             .await
             .map_err(|e| SFError::IO(format!("registry request write failed: {e}")))?;
+        // 判据是字节，不是总时长：一个还在吐字节的响应哪怕比一整块大也不算停住，
+        // 而「连着、但一个字节也不再进来」正是死掉的那副样子。整段读完的上限会把
+        // 一份慢却正常的响应砍在中间，读出来的是一份残缺的清单。
         let mut raw = Vec::new();
-        tokio::time::timeout(
-            crate::platform_http::READ_TIMEOUT,
-            stream.read_to_end(&mut raw),
-        )
-        .await
-        .map_err(|_| SFError::IO("registry read timed out".into()))?
-        .map_err(|e| SFError::IO(format!("registry read failed: {e}")))?;
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let read = tokio::time::timeout(
+                crate::platform_http::READ_TIMEOUT,
+                tokio::io::AsyncReadExt::read(&mut stream, &mut chunk),
+            )
+            .await
+            .map_err(|_| {
+                SFError::IO(format!(
+                    "registry {} sent nothing for {:?}; judged stopped",
+                    self.endpoint,
+                    crate::platform_http::READ_TIMEOUT
+                ))
+            })?
+            .map_err(|e| SFError::IO(format!("registry read failed: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
         let (status, body) = parse_http_response(&raw)
             .ok_or_else(|| SFError::IO("registry returned a malformed HTTP response".into()))?;
         if status != 200 {

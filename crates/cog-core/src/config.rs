@@ -46,6 +46,11 @@ pub struct Config {
     pub multi_backend_consumer: MultiBackendConsumerConfig,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// The register of bounds the system sets for itself. Nothing in the
+    /// process reads it; a gate does (`bounds_registry_test`). See
+    /// [`crate::config_sections::BoundsConfig`] for why it is here at all.
+    #[serde(default)]
+    pub bounds: crate::config_sections::BoundsConfig,
 }
 
 pub fn redacted(value: &str) -> &str {
@@ -579,8 +584,6 @@ pub struct GatewayConfig {
     pub websocket_tick_secs: u64,
     #[serde(default = "default_notification_limit")]
     pub notification_limit: u32,
-    #[serde(default = "default_sandbox_task_timeout_secs")]
-    pub sandbox_task_timeout_secs: u64,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     /// How often the contribution OAuth refresher wakes up. 0 = built-in
@@ -660,9 +663,6 @@ fn default_websocket_tick_secs() -> u64 {
     0
 }
 fn default_notification_limit() -> u32 {
-    0
-}
-fn default_sandbox_task_timeout_secs() -> u64 {
     0
 }
 fn default_request_timeout_secs() -> u64 {
@@ -978,13 +978,6 @@ pub struct SystemConfig {
     pub loop_restart_backoff_floor_secs: u64,
     /// Interval between monthly-partition maintenance rounds (seconds).
     pub partition_maintenance_interval_secs: u64,
-    /// WASM tool execution timeout (seconds).
-    pub tool_timeout_secs: u64,
-    /// Shell command timeout (seconds). Separate from `tool_timeout_secs`: a
-    /// WASM snippet is bounded work, while a command may legitimately run a
-    /// compiler — one budget cannot serve both. Must not exceed the executor's
-    /// own ceiling, which silently clamps anything larger.
-    pub shell_timeout_secs: u64,
     /// URL of the remote sandbox executor (e.g.
     /// `http://cogneva-sandbox-executor.cogneva.svc:9090`). When set, shell
     /// command tools execute in the isolated executor pod; when absent,
@@ -1042,8 +1035,6 @@ impl Default for SystemConfig {
             loop_restart_max_consecutive: 3,
             loop_restart_backoff_floor_secs: 5,
             partition_maintenance_interval_secs: 3600,
-            tool_timeout_secs: 30,
-            shell_timeout_secs: 600,
             sandbox_executor_url: None,
             require_tool_identity: false,
             pattern_db_max_size: 256,
@@ -1180,8 +1171,6 @@ pub struct MicroVmConfig {
     pub boot_args: String,
     /// API socket 与实例目录的根路径。
     pub instance_root: String,
-    /// 单次进化执行超时；超时即销毁 VM。
-    pub exec_timeout_secs: u64,
 }
 
 impl Default for MicroVmConfig {
@@ -1196,7 +1185,6 @@ impl Default for MicroVmConfig {
             mem_size_mib: 2048,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/evolution/init".into(),
             instance_root: "/tmp/cogneva-microvm".into(),
-            exec_timeout_secs: 1800,
         }
     }
 }
@@ -1557,7 +1545,6 @@ pub struct SelfEvolutionConfig {
     pub health_check_grace_period_secs: u64,
     pub health_check_interval_secs: u64,
     pub health_check_max_retries: u32,
-    pub test_timeout_secs: u64,
     /// The command that judges a generated change, as argv — a program and its
     /// arguments, not a shell line, so a configured value cannot become one.
     /// The default is this workspace's own suite; a project that is not a Rust
@@ -1616,7 +1603,6 @@ pub struct SelfEvolutionConfig {
     /// not the change's.
     /// Empty: this project has no linter, recorded as the stage not running.
     pub lint_command: Option<Vec<String>>,
-    pub build_timeout_secs: u64,
     pub poll_interval_secs: u64,
     /// 反思条目的归档与它的派生层（schema）是两次独立写，第二次失败或中途
     /// 重启会留下「归档在、按 schema 检索不到」的孤儿。这个间隔决定多久重扫
@@ -1752,13 +1738,11 @@ impl Default for SelfEvolutionConfig {
             health_check_grace_period_secs: 10,
             health_check_interval_secs: 5,
             health_check_max_retries: 6,
-            test_timeout_secs: 3600,
             test_command: Self::default_test_command(),
             fmt_check_command: None,
             lint_command: None,
             deploy_admission: None,
             web_admission: None,
-            build_timeout_secs: 3600,
             poll_interval_secs: 60,
             schema_repair_interval_secs: 600,
             notify_on_failure: true,
@@ -1791,6 +1775,7 @@ impl Default for Config {
             system: SystemConfig::default(),
             self_evolution: SelfEvolutionConfig::default(),
             multi_backend_consumer: MultiBackendConsumerConfig::default(),
+            bounds: crate::config_sections::BoundsConfig::default(),
             env: HashMap::new(),
         }
     }

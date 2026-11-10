@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -246,10 +245,8 @@ pub struct WorkspaceManager {
     target_dir: PathBuf,
     meta_dir: PathBuf,
     ephemeral_ttl: Duration,
-    /// `None` 表示跟着 git 超时走，见 [`stale_lock_age_from`]。
+    /// `None` 表示跟着实测静默窗口走，见 [`cog_core::git_budget::stale_lock_age`]。
     stale_lock_age: Option<Duration>,
-    /// 这条卷上跑完过的最慢一条 git 命令，毫秒。超时是它的倍数。
-    git_slowest_ms: AtomicU64,
     /// 索引健康度采样的去处。缺席则只记日志、不上报——丢一个聚合读数不该让
     /// 刷新本身失败。
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
@@ -275,7 +272,6 @@ impl WorkspaceManager {
             meta_dir,
             ephemeral_ttl: DEFAULT_EPHEMERAL_TTL,
             stale_lock_age: None,
-            git_slowest_ms: AtomicU64::new(0),
             metrics: None,
             index_sampled_at: std::sync::Mutex::new(HashMap::new()),
         }
@@ -1024,36 +1020,34 @@ impl WorkspaceManager {
         }
     }
 
-    /// 锁的判定年龄：默认是 git 超时的两倍，见 [`stale_lock_age_from`]。
+    /// 锁的判定年龄：默认跟着实测静默窗口走，见 [`cog_core::git_budget::stale_lock_age`]。
     fn stale_lock_age(&self) -> Duration {
         self.stale_lock_age
-            .unwrap_or_else(|| cog_core::git_budget::stale_lock_age_from(self.git_timeout()))
-    }
-
-    /// 这条卷上一条 git 命令能跑多久：跑完过的最慢那条的倍数，带地板。
-    fn git_timeout(&self) -> Duration {
-        cog_core::git_budget::git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
+            .unwrap_or_else(cog_core::git_budget::stale_lock_age)
     }
 
     async fn run_git_once(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
+        let line = args.join(" ");
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args).kill_on_drop(true);
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }
-        let started = std::time::Instant::now();
-        let out = tokio::time::timeout(self.git_timeout(), cmd.output())
+        let out = match cog_core::progress::run_child_watched(cmd, &format!("git {line}"))
             .await
-            .map_err(|_| SFError::IO(format!("git {} timed out", args.join(" "))))?
-            .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;
-        // 只有跑完的命令才入账，退出码不论：快速失败也是这条卷有多快的证据，
-        // 而永远不返回的那条不能把下一条的界抬上去。
-        self.git_slowest_ms
-            .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?
+        {
+            cog_core::progress::ChildOutcome::Exited(out) => out,
+            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
+                return Err(SFError::IO(format!(
+                    "git {line} 停住了：{silent:?} 里没有输出、也没有 CPU 时间，\
+                     比这套部署见过的任何一段仍在干活的步间隔（{window:?}）都长；已杀掉"
+                )))
+            }
+        };
         if !out.status.success() {
             return Err(SFError::IO(format!(
-                "git {} failed: {}{}",
-                args.join(" "),
+                "git {line} failed: {}{}",
                 String::from_utf8_lossy(&out.stderr),
                 String::from_utf8_lossy(&out.stdout)
             )));

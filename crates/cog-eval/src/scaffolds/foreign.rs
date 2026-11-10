@@ -9,8 +9,9 @@
 //! 1. **定义域**：它吃的是「一棵树 ＋ 一个题面」，吐一个补丁，所以只在有树的列上有定义。
 //!    靠 [`AgentScaffold::applies_to`] 说出来，而不是等到跑起来报错——后者会把「这一列
 //!    本来就没有这一行」记成一次缺陷。
-//! 2. **上限**：循环不在我们手里，步数管不到它，能管的只有时间与这台机器分给它的资源。
-//!    上限由组合根一次给定、所有行共用（见 [`ExecLimits`]）。
+//! 2. **上限**：循环不在我们手里，步数管不到它，能管的只有这台机器分给它的资源。
+//!    上限由组合根一次给定、所有行共用（见 [`ExecLimits`]）。时间不是上限之一：
+//!    它会把「跑得慢」判成「跑不动」。
 //!
 //! 环境不能托管外部程序时，这一行**报错**而不是交一个空补丁：空补丁在判分器那里长得
 //! 就是「没做对」，而真相是这支流派根本没被跑起来——两种读数的处置相反。
@@ -33,7 +34,7 @@ pub struct ForeignFlow {
     /// 在这道题的那台机器里怎么起它。由组合根给定——镜像里装在哪、要带哪些环境变量，
     /// 只有摆镜像的那些人知道。
     entrypoint: String,
-    /// 它能跑多久、能用多少资源。四行三列共用一份。
+    /// 它能用多少资源。四行三列共用一份。
     limits: ExecLimits,
     /// 它在哪些列上有定义（基准名）。空 = 哪一列都没有，那样这一行一个格子也不建，
     /// 是声明写错了而不是跑不动。
@@ -97,7 +98,6 @@ impl AgentScaffold for ForeignFlow {
                 action_params: serde_json::json!({
                     "flow": self.name,
                     "entrypoint": self.entrypoint,
-                    "wall_clock_secs": self.limits.wall_clock.as_secs(),
                     "cpus": self.limits.cpus,
                     "memory_bytes": self.limits.memory_bytes,
                 }),

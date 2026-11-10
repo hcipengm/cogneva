@@ -418,7 +418,6 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         &gateway_state.config,
                         &new_config.gateway,
                         &gateway_state.request_timeout_secs,
-                        &gateway_state.sandbox_task_timeout_secs,
                     );
                 applied.extend(gateway_applied);
                 need_restart.extend(gateway_restart.clone());

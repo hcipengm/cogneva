@@ -60,6 +60,17 @@ printf '%s\n' "${out}" | grep -q '持有者记录' ||
 printf '%s\n' "${out}" | grep -q 'held slot-' ||
     fail "退出时要报出拿了哪个槽、等了多久、跑了多久：${out}"
 
+# 2b. 被服务过就留一行：门的另一半只从这一行知道 `gate: …` 这一问已经被服务过。
+#     没有它就只剩「从没被服务」，于是对这份声明永远让——2026-11-10 主线推进
+#     就这样被饿了三个小时。同一个名字再跑一次只换时间，不叠一行。
+run_in "${work}/own/lock" "${gate_dir}" "持有者记录" true >/dev/null 2>&1 ||
+    fail "第二次拿槽应当照样跑完"
+lines="$(grep -c $'\tgate: 持有者记录$' "${gate_dir}/builds.served" 2>/dev/null || true)"
+[ "${lines}" = "1" ] ||
+    fail "每个名字在 builds.served 里只留一行，实际 ${lines} 行：$(cat "${gate_dir}/builds.served" 2>&1)"
+grep -Eq $'^[0-9]+\tgate: 持有者记录$' "${gate_dir}/builds.served" 2>/dev/null ||
+    fail "被服务过的工作应当在 builds.served 里留一行时间：$(cat "${gate_dir}/builds.served" 2>&1)"
+
 # 3. 被别人占着（bound=1）：等，而不是并排跑。判据是时间顺序，不是字数。
 printf '1\n' >"${gate_dir}/buildgate.bound"
 : >"${gate_dir}/slot-0.lock"

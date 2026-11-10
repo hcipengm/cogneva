@@ -20,14 +20,10 @@ use cog_core::Claims;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use crate::error::ApiError;
 use crate::ide::{ensure_user_root, resolve_under};
 
-/// 一个 git 动作的硬上限。工作区是本机小仓库，慢过一次轮询周期就说明它坏了。
-// cap: bound — 一个 git 动作的硬上限；工作区是本机小仓库，慢过一次轮询周期就说明它坏了
-const GIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 一次点名多少条路径。
 // cap: bound — 一次点名多少条路径
 const MAX_PATHS: usize = 500;
@@ -177,7 +173,7 @@ async fn run_git(root: &Path, args: &[&str], accept: &[i32]) -> Result<GitRun, A
     ];
     full.extend_from_slice(args);
 
-    let (child, mut guard) = crate::git_mirror::spawn_git_group(
+    let (mut child, mut guard) = crate::git_mirror::spawn_git_group(
         Path::new("git"),
         &full,
         None,
@@ -186,8 +182,12 @@ async fn run_git(root: &Path, args: &[&str], accept: &[i32]) -> Result<GitRun, A
     )
     .map_err(|e| ApiError::internal(format!("cannot start git: {e}")))?;
 
-    match tokio::time::timeout(GIT_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(out)) => {
+    // 判据是它还在不在动（产出或 CPU），不是它跑了多久。工作区是本机小仓库，
+    // 但打包一个大仓库、落一次大提交能让一条 git 动作沉默地跑几分钟——那一直在
+    // 干活，钟砍它只会把已经付出的索引重来一遍。
+    let cmdline = format!("git {}", args.join(" "));
+    match cog_core::progress::watch_child(&mut child, &cmdline, None).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(out)) => {
             // 进程已经收尾：pid 可能被复用，再对那个组发信号就会误伤别人。
             guard.disarm();
             let run = GitRun {
@@ -206,13 +206,15 @@ async fn run_git(root: &Path, args: &[&str], accept: &[i32]) -> Result<GitRun, A
                 )))
             }
         }
-        Ok(Err(e)) => Err(ApiError::internal(format!("git did not finish: {e}"))),
-        // 超时：守卫在离开作用域时对整组发 SIGKILL，git 自己起的孙子进程
-        // （打包、分页器）不会在网关里留一条后台链。
-        Err(_) => Err(ApiError::internal(format!(
-            "git timed out after {}s",
-            GIT_TIMEOUT.as_secs()
-        ))),
+        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+            // 看门狗判停时已经对整组发过 SIGKILL（git 自己起的孙子进程——打包、
+            // 分页器——一起收），这里再让守卫发一次就会打到一个可能已被复用的 pid 上。
+            guard.disarm();
+            Err(ApiError::internal(cog_core::progress::went_silent(
+                &cmdline, silent, window,
+            )))
+        }
+        Err(e) => Err(ApiError::internal(format!("git did not finish: {e}"))),
     }
 }
 

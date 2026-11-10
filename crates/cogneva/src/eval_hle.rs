@@ -16,7 +16,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use cog_core::{
     HttpClient, ResourceLimits, SFError, SandboxBackend, SandboxPayload, SandboxRequest, Tool,
@@ -35,9 +34,6 @@ pub struct HleToolInputs {
     pub web_fetch_base: Option<String>,
     pub web_fetch_fallback_base: Option<String>,
     pub sandbox: Arc<dyn SandboxBackend>,
-    /// 一次 `python` 调用最多跑多久。取自平台自己的工具墙，不在这一层另立一个数：
-    /// 另立一个数就会有一条「平台认为工具 30 秒该收、评测台却让它跑 10 分钟」的路。
-    pub python_timeout: Duration,
 }
 
 /// 造 HLE 的工具面。缺席的端点在这里变成错误，错误里带着**要设的那一项**的名字。
@@ -67,7 +63,7 @@ pub fn hle_tool_factory(inputs: HleToolInputs) -> anyhow::Result<Arc<ToolFactory
         Some(fetch_base),
         inputs.web_fetch_fallback_base,
     );
-    let python = python_tool(inputs.sandbox, inputs.python_timeout);
+    let python = python_tool(inputs.sandbox);
 
     // 清单不随题变：HLE 的题面里没有环境，一条题与下一条题在工具面上没有区别。写成
     // 工厂是与另两列同一形状，把「清单可以随题变」留在这层协议里而不是留成注释。
@@ -88,7 +84,7 @@ static PYTHON_CALLS: AtomicU64 = AtomicU64::new(0);
 ///
 /// 退出码是**结果**不是错误：代码抛异常正是模型要看见的东西，把它变成工具错误会让
 /// 外壳以为工具坏了、然后重试同一段代码。
-pub fn python_tool(sandbox: Arc<dyn SandboxBackend>, timeout: Duration) -> Tool {
+pub fn python_tool(sandbox: Arc<dyn SandboxBackend>) -> Tool {
     Tool {
         name: HLE_TOOL_PYTHON.into(),
         description: "Run a Python 3 program in this deployment's sandbox and return what it \
@@ -131,8 +127,7 @@ pub fn python_tool(sandbox: Arc<dyn SandboxBackend>, timeout: Duration) -> Tool 
                         ),
                     },
                     input: serde_json::Value::Null,
-                    timeout,
-                    // 远端执行器不转发 `limits`（它只发 payload/timeout/身份），所以这里
+                    // 远端执行器不转发 `limits`（它只发 payload/身份），所以这里
                     // 写的上限不会生效；隔离由 Pod 边界给，见执行器的部署清单。
                     limits: ResourceLimits::default(),
                 };
@@ -208,7 +203,6 @@ mod tests {
             web_fetch_base: Some("http://crawl4ai.invalid:11235".into()),
             web_fetch_fallback_base: None,
             sandbox,
-            python_timeout: Duration::from_secs(30),
         }
     }
 
@@ -262,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn python_runs_in_the_sandbox_and_returns_the_programs_readings() {
         let seen = recorder();
-        let tool = python_tool(sandbox(seen.clone()), Duration::from_secs(7));
+        let tool = python_tool(sandbox(seen.clone()));
         let out = face(tool)
             .call(HLE_TOOL_PYTHON, serde_json::json!({"code": "print(2 + 2)"}))
             .await
@@ -289,11 +283,10 @@ mod tests {
                 request.task_id, "",
                 "a benchmark call belongs to no task tree"
             );
-            assert_eq!(request.timeout, Duration::from_secs(7));
         }
 
         // 代码里的单引号不会把命令拆开：整段经单引号包住。
-        let tool = python_tool(sandbox(seen.clone()), Duration::from_secs(7));
+        let tool = python_tool(sandbox(seen.clone()));
         face(tool)
             .call(
                 HLE_TOOL_PYTHON,
@@ -315,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn python_refuses_a_call_without_code() {
         let seen = recorder();
-        let tool = python_tool(sandbox(seen.clone()), Duration::from_secs(7));
+        let tool = python_tool(sandbox(seen.clone()));
         let err = face(tool)
             .call(HLE_TOOL_PYTHON, serde_json::json!({}))
             .await

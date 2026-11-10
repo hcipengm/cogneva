@@ -21,11 +21,10 @@ spec:
     spec:
       # 备份失败不重试成串：下一个周期自然再来，连续失败由 history 留证。
       backoffLimit: 1
-      # 卡死的运行必须有人来杀。concurrencyPolicy 是 Forbid，一次挂住的运行会
-      # 让它之后每一次都不再开始——备份停掉，连「谁来给挂住那笔收尾」也一起停。
-      # 这个界杀的是容器，同一个值经 env 进运行自己写的账本行，判超期用的是那一
-      # 行上的数（见 backup.rs 的 run_deadline_seconds）。
-      activeDeadlineSeconds: 3600
+      # 这里曾经是 `activeDeadlineSeconds`：一个到点直接杀掉容器的钟，它不知道这个
+      # 容器是不是还在往外写、还在导出。判停改由容器自己的存活探针做（读进度文件）：
+      # 一步都不推进超过窗口才判死。`concurrencyPolicy: Forbid` 让一次挂住的运行
+      # 挡住之后每一次，所以这一条必须存在——但它判的是「还在不在动」。
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -84,6 +83,26 @@ spec:
               image: localhost:30500/cogneva:local
               imagePullPolicy: Always
               args: ["backup"]
+              # 判停读的是这个文件：进程每推进一段就写一次，窗口写在文件内容里，
+              # 探针拿「现在 - mtime」与它比。命令与窗口的出处是
+              # `cog_core::progress::PROGRESS_PROBE_COMMAND`——探针里不写任何界，
+              # 写死的那个数会在下次窗口变了之后照样自称是窗口。
+              livenessProbe:
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - >-
+                      f="$COGNEVA_PROGRESS_FILE"; if [ -z "$f" ] || [ ! -f "$f" ]; then
+                      echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
+                      age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
+                      echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
+                
+                periodSeconds: 30
+                
+                failureThreshold: 3
+                
+                initialDelaySeconds: 120
               env:
                 - name: TZ
                   value: "Asia/Shanghai"
@@ -91,6 +110,8 @@ spec:
                   value: "true"
                 - name: COGNEVA_LOKI_ENDPOINT
                   value: "http://loki.monitoring.svc.cluster.local:3100"
+                - name: COGNEVA_PROGRESS_FILE
+                  value: /var/run/cogneva-progress/beat
                 # 导出用 cog_app：它是这些表的属主，pg_dump 读得到全部内容。
                 - name: APP_PASSWORD
                   valueFrom:
@@ -104,9 +125,10 @@ spec:
                   value: "http://qdrant.cogneva.svc.cluster.local:6333"
                 - name: COGNEVA_BACKUP_KEEP
                   value: "7"
-                # 与 jobTemplate 的 activeDeadlineSeconds 是同一个值的两个载体：
-                # 一个让 kubelet 到点杀容器，一个让运行把「这次我被给了多久」写
-                # 进账本那一行。分开写两个数会漂，超期判断就跟着漂。
+                # 这个数**不杀任何东西**：容器的死活由上面的存活探针按进度文件判。
+                # 它只被写进账本那一行，让「这一行开着、但没人收尾」有一个可判的
+                # 时刻——一行开着的记录如果有人被杀，只有它自己被开出来时的那个数
+                # 判得了，用今天的旋钮去判昨天那一次是两回事。
                 - name: COGNEVA_BACKUP_RUN_DEADLINE_SECONDS
                   value: "3600"
                 # 实例身份：包里记的「这份字节出自哪个实例」就靠它。只取这一个键，
@@ -174,7 +196,11 @@ spec:
                   mountPath: /backups
                 - name: offsite
                   mountPath: /offsite
+                - name: progress
+                  mountPath: /var/run/cogneva-progress
           volumes:
+            - name: progress
+              emptyDir: {}
             - name: data
               persistentVolumeClaim:
                 claimName: cogneva-data-pvc

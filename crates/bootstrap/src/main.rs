@@ -999,7 +999,7 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
     };
     let k3s_env = format!("K3S_URL={server_url} K3S_TOKEN={token}{version_env}");
     let download = format!(
-        "curl -fsSL --connect-timeout 15 --max-time 900 --retry 2 -o /tmp/cogneva-k3s-install.sh {script_url}"
+        "curl -fsSL --connect-timeout 15 --speed-limit 1 --speed-time 60 --retry 2 -o /tmp/cogneva-k3s-install.sh {script_url}"
     );
     let run_remote = format!("{mirror_env}{k3s_env} sh /tmp/cogneva-k3s-install.sh");
     let prep = if cn_mirror() {

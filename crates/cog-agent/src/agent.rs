@@ -22,7 +22,6 @@ const AGENT_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// change's text. The work is a git diff over a working tree, so two minutes
 /// is sized for a large tree being scanned, not for a slow computation.
 // cap: bound — 活是扫一遍工作树的 git diff，两分钟是按大树的扫描耗时给的，不是按慢计算给的
-const WORKSPACE_CHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// What one call to [`Agent::retire`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,7 +588,6 @@ impl Agent {
             agent_id: self.config.agent_id.clone(),
             payload: cog_core::SandboxPayload::Command { command },
             input: serde_json::Value::Null,
-            timeout: WORKSPACE_CHANGE_TIMEOUT,
             limits: Default::default(),
         };
         let result = backend.execute(&req).await?;

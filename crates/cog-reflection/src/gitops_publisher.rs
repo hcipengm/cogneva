@@ -54,23 +54,27 @@ impl GitOpsPublisher {
         }
     }
 
+    /// 判的是它还在不在产出，不是它跑了多久：冷构建首拉基镜像能安静地忙上很久，
+    /// 而一份卡死的推送与它在那条按秒的界眼里是同一个读数。
     async fn run_in(
         &self,
         program: &str,
         dir: &std::path::Path,
         args: &[&str],
-        timeout_secs: u64,
     ) -> SFResult<String> {
         let cmdline = format!("{} {}", program, args.join(" "));
-        let fut = tokio::process::Command::new(program)
-            .args(args)
-            .current_dir(dir)
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).current_dir(dir).kill_on_drop(true);
+        let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这份部署见过的\
+                     任何一次「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
+                )))
+            }
+            Err(e) => return Err(SFError::IO(format!("failed to run {program}: {e}"))),
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::IO(format!("{cmdline} failed: {stderr}")));
@@ -78,13 +82,12 @@ impl GitOpsPublisher {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
-        self.run_in(program, &self.repo_dir, args, timeout_secs)
-            .await
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String> {
+        self.run_in(program, &self.repo_dir, args).await
     }
 
     async fn git_in(&self, dir: &std::path::Path, args: &[&str]) -> SFResult<String> {
-        self.run_in("git", dir, args, 120).await
+        self.run_in("git", dir, args).await
     }
 
     async fn git(&self, args: &[&str]) -> SFResult<String> {
@@ -170,10 +173,15 @@ impl GitOpsPublisher {
         // 目标写成完整 refname：refspec 的 src 是提交对象时 git 不再猜
         // destination，只给短分支名会被拒。
         let target_branch = self.config.branch.trim_start_matches("refs/heads/");
+        // `--progress`：看门狗按「还有没有产出」判它死，而 git 在 stderr 不是终端
+        // 时默认不吐进度。一次推大 pack 的等待于是既没有输出、也没有本进程的 CPU
+        // ——那是它被误判成停住的最短路径。远端在收包的时候，进度行就是它还在动的
+        // 证据。
         self.git_in(
             &dir,
             &[
                 "push",
+                "--progress",
                 &self.config.repo_url,
                 &format!("{head}:refs/heads/{target_branch}"),
             ],
@@ -183,6 +191,7 @@ impl GitOpsPublisher {
             &dir,
             &[
                 "push",
+                "--progress",
                 &self.config.repo_url,
                 &format!("refs/tags/{tag}:refs/tags/{tag}"),
             ],
@@ -290,10 +299,8 @@ impl GitOpsPublisher {
         let build_refs: Vec<&str> = build_args.iter().map(String::as_str).collect();
         let push_refs: Vec<&str> = push_args.iter().map(String::as_str).collect();
 
-        // 冷构建首拉基镜像（解压 ~1.5GB）给 30 分钟；热构建只有 COPY 秒级。
-        self.run(&self.config.builder_bin, &build_refs, 1800)
-            .await?;
-        self.run(&self.config.builder_bin, &push_refs, 900).await?;
+        self.run(&self.config.builder_bin, &build_refs).await?;
+        self.run(&self.config.builder_bin, &push_refs).await?;
         info!(image = %image, "Promotion overlay image pushed to registry");
         Ok(())
     }
@@ -345,8 +352,8 @@ impl GitOpsPublisher {
 /// 现役 tag 与它自己推镜像走的是同一个执行路径，别为读数另开一条。
 #[async_trait]
 impl CommandRunner for GitOpsPublisher {
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
-        GitOpsPublisher::run(self, program, args, timeout_secs).await
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String> {
+        GitOpsPublisher::run(self, program, args).await
     }
 }
 

@@ -2058,7 +2058,7 @@ export interface BuildRun {
   change_id: string;
   /** 变更的入口；生成它的那一侧没有携带时是 `unattributed`。 */
   intent: string;
-  /** `built` / `failed` / `timed_out` / `unstarted`。 */
+  /** `built` / `failed` / `stalled` / `unstarted`。 */
   outcome: string;
   /** 这次构建占用主机的秒数；`unstarted` 没跑，所以没有这一格而不是 0。 */
   seconds?: number;

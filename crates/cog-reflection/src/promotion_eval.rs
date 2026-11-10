@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cog_core::{
     ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, SFError, SFResult, Task,
@@ -401,7 +401,6 @@ impl PromotionEval {
             self.poll_interval_secs,
             task,
             goal,
-            self.timeout_secs,
         )
         .await
         {
@@ -444,7 +443,7 @@ impl PromotionEval {
         let now = chrono::Utc::now();
         let mut withdrawn = 0usize;
         for task in self.orchestrator.get_all_tasks().await {
-            if !is_abandoned_promotion_eval(&task, now, self.timeout_secs) {
+            if !is_abandoned_promotion_eval(&task, now) {
                 continue;
             }
             match self.orchestrator.cancel_task(&task.id).await {
@@ -512,24 +511,27 @@ pub fn promotion_eval_task(change_id: &str, rev: &str, repo: &Path, timeout_secs
     task
 }
 
-/// 这一行是不是这道门交上去、而等它的那次等待已经不在了的行。
+/// 一行从没被认领过的门行，多久算孤儿。
 ///
-/// 判据只用这道门自己的时钟：等待上限就是「还在等」的界，过了它还没有终态的行，
-/// 要么等的人已经把它收回去（那它就不是这个状态），要么等的人已经不在了——进程
-/// 重启、任务被取消，都算。留一个等待上限的宽限，是为了不在收尾那一刻和正在收尾
-/// 的那次等待抢同一行。
-pub fn is_abandoned_promotion_eval(
-    task: &Task,
-    now: chrono::DateTime<chrono::Utc>,
-    timeout_secs: u64,
-) -> bool {
+/// 这里用一个钟是**可以的**，因为它收的不是一件活：`Pending`/`Scheduled` 上没有
+/// 任何进程在跑，收掉它不杀任何正在干的事，丢的只是那一行。它也不再用等待方的
+/// 上限来算——等待方已经不再有上限了（等的人等到终态为止），所以「等了多久」这
+/// 个读数在这个进程里已经不存在；留下的问题只是「这一行是不是被丢下了」，而这
+/// 与一件活跑了多久无关。
+// cap: override — 只收从没被认领过的行，收掉不杀任何在跑的活；这个数只回答「放这么久还没人认领就是孤儿」
+pub const ABANDONED_PROMOTION_EVAL_GRACE: Duration = Duration::from_secs(7200);
+
+/// 这一行是不是这道门交上去、而再没有人会来读的行。
+///
+/// 判据只剩一条：它从没被认领过，而且比 [孤儿宽限] 更久没动过。
+pub fn is_abandoned_promotion_eval(task: &Task, now: chrono::DateTime<chrono::Utc>) -> bool {
     if !task.id.starts_with(PROMOTION_EVAL_ID_PREFIX) {
         return false;
     }
     if !matches!(task.status, TaskStatus::Pending | TaskStatus::Scheduled) {
         return false;
     }
-    let grace = chrono::Duration::from_std(Duration::from_secs(timeout_secs.saturating_mul(2)))
+    let grace = chrono::Duration::from_std(ABANDONED_PROMOTION_EVAL_GRACE)
         .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX / 1000));
     task.updated_at + grace < now
 }
@@ -554,7 +556,6 @@ pub(crate) async fn submit_and_wait(
     poll_interval_secs: u64,
     task: Task,
     goal: String,
-    timeout_secs: u64,
 ) -> SFResult<Result<Task, String>> {
     let task_id = task.id.clone();
     // 图里同 id 的旧行会吃掉这一次提交：`add_tasks_batch` 撞上已有的 id 一律跳过，
@@ -579,7 +580,9 @@ pub(crate) async fn submit_and_wait(
         .map_err(|e| SFError::Internal(format!("submit task {task_id} failed: {e}")))?;
     let id = ids.into_iter().next().unwrap_or(task_id);
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    // 等到这一行有终态为止，不设等待上限：一件活结不结束由它自己（回收判据读的
+    // 是持有者租约与它上次动的时间）回答。等待方按秒数把它收走，收的是一件可能
+    // 正在干活的活——那正是这里删掉的那个东西。
     loop {
         if let Some(t) = orch.get_task(&id).await {
             match t.status {
@@ -590,21 +593,6 @@ pub(crate) async fn submit_and_wait(
                 TaskStatus::Cancelled => return Ok(Err("cancelled".into())),
                 _ => {}
             }
-        }
-        if Instant::now() >= deadline {
-            // 这次等待结束了，而那一行是它交上去的。就这么走开的话，行会一直挂在
-            // 图上：没有第二处会再来读它（派发器只在行有判据时才开工，清扫器只收
-            // `Scheduled`/`Running`），而按状态读这一行的人分不出「门还在想」与
-            // 「门走了、行留下了」。所以等的人把它收回去。
-            if let Err(e) = orch.cancel_task(&id).await {
-                warn!(
-                    task_id = %id,
-                    error = %e,
-                    "promotion eval: the wait is over but the row it filed could not be \
-                     withdrawn; it stays on the graph with nothing left to read it"
-                );
-            }
-            return Ok(Err(crate::cmd_timeout::timed_out_after(timeout_secs)));
         }
         tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
     }
@@ -645,6 +633,9 @@ mod tests {
         tasks: Mutex<HashMap<String, Task>>,
         cancelled: Mutex<Vec<String>>,
         deleted: Mutex<Vec<String>>,
+        /// 读第一次之后把这一行推到终态：模拟「活自己结束了」。等待方不再有钟，
+        /// 所以测试里让它结束的必须是活本身，而不是等待方的耐心。
+        finish_on_first_read: Mutex<Option<TaskStatus>>,
     }
 
     fn pending_row(id: &str, since: chrono::DateTime<chrono::Utc>) -> Task {
@@ -739,7 +730,18 @@ mod tests {
             Ok(vec![])
         }
         async fn get_task(&self, task_id: &str) -> Option<Task> {
-            self.tasks.lock().unwrap().get(task_id).cloned()
+            let mut held = self.tasks.lock().unwrap();
+            let task = held.get_mut(task_id)?;
+            // 只推还没到终态的行：提交前那次「旧行挡没挡住 id」的读不该把这一次
+            // 的结局提前用掉。
+            if matches!(task.status, TaskStatus::Pending | TaskStatus::Scheduled) {
+                let mut knob = self.finish_on_first_read.lock().unwrap();
+                if let Some(status) = *knob {
+                    task.status = status;
+                    *knob = None;
+                }
+            }
+            Some(task.clone())
         }
         async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
             unimplemented!()
@@ -769,10 +771,12 @@ mod tests {
         }
     }
 
-    /// 等的人走了，行不能留在图上：按状态读它的人分不出「门还在想」与「门走了」。
+    /// 等待方不再有钟：活怎么结束由活自己回答，等待方只把它读回来，不把还在跑的
+    /// 那一行收走。收走一条正在干活的活，丢掉的是它已经付过的全部功夫。
     #[tokio::test]
-    async fn a_wait_that_ran_out_takes_its_row_back() {
+    async fn a_wait_ends_on_the_rows_own_ending_and_takes_nothing_back() {
         let graph = Arc::new(GateGraph::default());
+        *graph.finish_on_first_read.lock().unwrap() = Some(TaskStatus::Cancelled);
         let row = promotion_eval_task(
             "change-ledger-abc",
             "deadbeef",
@@ -781,16 +785,15 @@ mod tests {
         );
 
         let orch: Arc<dyn OrchestratorControl> = graph.clone();
-        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into(), 0).await;
+        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into()).await;
 
         assert!(
             matches!(outcome, Ok(Err(_))),
-            "超时要以理由回来，不是以一条任务回来"
+            "终态行要以理由回来，不是以一条任务回来"
         );
-        assert_eq!(
-            *graph.cancelled.lock().unwrap(),
-            vec![row.id.clone()],
-            "等待结束了，而它交上去的那一行还挂在图上"
+        assert!(
+            graph.cancelled.lock().unwrap().is_empty(),
+            "等待方把一行收走了：那一行可能还在干活"
         );
     }
 
@@ -808,19 +811,19 @@ mod tests {
         let mut ended = row.clone();
         ended.status = TaskStatus::Cancelled;
         graph.tasks.lock().unwrap().insert(ended.id.clone(), ended);
+        *graph.finish_on_first_read.lock().unwrap() = Some(TaskStatus::Cancelled);
 
         let orch: Arc<dyn OrchestratorControl> = graph.clone();
-        let _ = submit_and_wait(&orch, 0, row.clone(), "goal".into(), 0).await;
+        let _ = submit_and_wait(&orch, 0, row.clone(), "goal".into()).await;
 
         assert_eq!(
             *graph.deleted.lock().unwrap(),
             vec![row.id.clone()],
             "旧行没让开，这一次提交会被当成重投跳过"
         );
-        // 让开之后这一次真的交上去了，才会又被这一次自己的等待收回。
-        assert_eq!(
-            *graph.cancelled.lock().unwrap(),
-            vec![row.id.clone()],
+        // 让开之后这一次真的交上去了，图上才会又出现这一行。
+        assert!(
+            graph.tasks.lock().unwrap().contains_key(&row.id),
             "这一次的提交没有落到图上"
         );
     }
@@ -835,8 +838,8 @@ mod tests {
             now - chrono::Duration::hours(20),
         );
         assert!(
-            is_abandoned_promotion_eval(&row, now, DEFAULT_EVAL_TIMEOUT_SECS),
-            "等待上限 3600 秒，而这行已经在图上停了 20 小时"
+            is_abandoned_promotion_eval(&row, now),
+            "孤儿宽限 7200 秒，而这行已经在图上没人认领地停了 20 小时"
         );
     }
 
@@ -846,8 +849,8 @@ mod tests {
         let now = chrono::Utc::now();
         let fresh = pending_row("promotion-eval-change-ledger-new", now);
         assert!(
-            !is_abandoned_promotion_eval(&fresh, now, DEFAULT_EVAL_TIMEOUT_SECS),
-            "刚落地的行还在等待上限之内"
+            !is_abandoned_promotion_eval(&fresh, now),
+            "刚落地的行还在孤儿宽限之内"
         );
 
         let mut done = pending_row(
@@ -856,13 +859,13 @@ mod tests {
         );
         done.status = TaskStatus::Completed;
         assert!(
-            !is_abandoned_promotion_eval(&done, now, DEFAULT_EVAL_TIMEOUT_SECS),
+            !is_abandoned_promotion_eval(&done, now),
             "终态的行不是没人等，是已经等到了"
         );
 
         let foreign = pending_row("some-other-work", now - chrono::Duration::hours(20));
         assert!(
-            !is_abandoned_promotion_eval(&foreign, now, DEFAULT_EVAL_TIMEOUT_SECS),
+            !is_abandoned_promotion_eval(&foreign, now),
             "不是这道门交上去的行，轮不到这道门来收"
         );
     }

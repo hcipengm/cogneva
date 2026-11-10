@@ -70,7 +70,6 @@ pub async fn execute_task(
         agent_id: task.agent_id.clone().unwrap_or_default(),
         payload,
         input: task.input.clone(),
-        timeout: std::time::Duration::from_secs(task.timeout_seconds),
         limits: Default::default(),
     };
 

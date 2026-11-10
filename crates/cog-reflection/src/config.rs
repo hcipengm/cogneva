@@ -314,11 +314,12 @@ pub struct ChangeJobConfig {
     /// 一次最多同时派几个执行 Job。默认 1：与常驻进程里逐条处理的并发度相同，
     /// 也是命名空间配额在现状下容得下的数。值真的用来限并发派发——派满就等。
     pub max_parallel: usize,
-    /// 派发后等这个 Job 结束的上界（秒），同时就是 Job 的
-    /// `activeDeadlineSeconds`：两处必须是同一个数。等待比 Job 自己的上界长，
-    /// 等到的永远是「超时」；短了，会在 Job 还在写结果的时候走掉，把一次可能
-    /// 通过的执行读成「读不到结果」。默认值是算出来的：验证预算 3600 + 构建预算
-    /// 3600 + 构建闸门排队 1800 + 收尾 600。改那两个预算就要一起重算它。
+    /// 派发后等这个 Job 结束的上界（秒）。它**不是** Job 的期限：Job 里没有
+    /// `activeDeadlineSeconds`，死活由容器自己的存活探针按进度文件判（一步都不
+    /// 推进超过窗口才判死）。这个数只是派发方的耐心——等不到就先去干别的，下一
+    /// 轮再来看；Job 名是确定的，重新 apply 不会派重。默认值是算出来的：验证预算
+    /// 3600 + 构建预算 3600 + 构建闸门排队 1800 + 收尾 600。改那两个预算就要一起
+    /// 重算它。
     pub deadline_secs: u64,
     /// Job 结束后对象保留的时长（秒），供事后读日志与终止消息。
     pub ttl_secs_after_finished: u64,
@@ -705,7 +706,6 @@ pub struct UpstreamTrackConfig {
     #[serde(default)]
     pub api_base: Option<String>,
 }
-
 /// 主线跟踪自动部署器配置：进化 Pod 内常驻循环，检测集群内 bare 仓库
 /// （/host-git）公版 main 前进后，沙盒内增量构建 → buildah 叠层推集群内
 /// registry → 派独立 Job 门禁滚动四个 deployment，失败自动回滚。
@@ -729,9 +729,6 @@ pub struct MainlineDeployerConfig {
     /// 网关 git 透传根：上游 URL = `{base}/{platform}/{owner}/{repo}.git`，
     /// 凭证由网关在出口注入。空 = 不跟踪上游。
     pub git_proxy_base: String,
-    /// 单次上游 fetch 的超时（秒）。取的是网络往返的上界：网关到平台
-    /// 断了要能在一轮轮询内翻篇，不能把主循环挂在这里。
-    pub upstream_fetch_timeout_secs: u64,
     /// buildah 在进化 Pod 内 push/from 的 registry 端点（集群 DNS，http）：
     /// Pod 内可解析 svc 名，配合 --tls-verify=false。
     ///
@@ -754,8 +751,6 @@ pub struct MainlineDeployerConfig {
     pub kubectl_host_path: String,
     /// 状态/锁文件目录（sandbox PVC 上，跨重启持久）。
     pub state_dir: String,
-    /// 单次构建超时（秒），也是构建锁陈旧判定阈值。
-    pub build_timeout_secs: u64,
     /// cargo build --jobs 值（4C/7.5G 节点禁并发构建，默认 2）。
     pub cargo_build_jobs: u32,
     /// 四部署全部滚完后的 soak 观察窗（秒）。
@@ -847,7 +842,6 @@ impl Default for MainlineDeployerConfig {
             branch: "main".into(),
             upstreams: Vec::new(),
             git_proxy_base: String::new(),
-            upstream_fetch_timeout_secs: 300,
             registry: String::new(),
             local_registry: String::new(),
             namespace: cog_core::topology::namespace(),
@@ -855,7 +849,6 @@ impl Default for MainlineDeployerConfig {
             kubectl_bin: "kubectl".into(),
             kubectl_host_path: String::new(),
             state_dir: cog_core::paths::app_path_str("sandbox/mainline"),
-            build_timeout_secs: 3600,
             cargo_build_jobs: 2,
             soak_secs: 120,
             restart_threshold: 1,
@@ -943,8 +936,6 @@ pub struct ObservabilityStackConfig {
     /// `BACKENDS` 是同一个开关的两面：清单的处置表把这两个文件标成
     /// `backends`，两边都读它。
     pub backends: bool,
-    /// 单次 apply 的超时（秒）。
-    pub apply_timeout_secs: u64,
     /// 一次收敛最多在告警消息里点名几个资源（其余折叠成计数，消息有界）。
     pub max_named_resources: usize,
 }
@@ -963,7 +954,6 @@ impl Default for ObservabilityStackConfig {
             manifest_dir: "deploy/k3s/observability/manifests".into(),
             namespace: "monitoring".into(),
             backends: true,
-            apply_timeout_secs: 120,
             max_named_resources: 6,
         }
     }
@@ -1077,12 +1067,6 @@ impl MainlineDeployerConfig {
         if let Some(v) = get(cog_core::env::GIT_PROXY_BASE) {
             self.git_proxy_base = v;
         }
-        if let Some(v) = knob(
-            "COGNEVA_MAINLINE_DEPLOYER_UPSTREAM_FETCH_TIMEOUT_SECS",
-            &get,
-        )? {
-            self.upstream_fetch_timeout_secs = v;
-        }
         if let Some(v) = get(REGISTRY_ENV) {
             self.registry = v;
         }
@@ -1094,9 +1078,6 @@ impl MainlineDeployerConfig {
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STATE_DIR") {
             self.state_dir = v;
-        }
-        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_BUILD_TIMEOUT_SECS", &get)? {
-            self.build_timeout_secs = v;
         }
         if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS", &get)? {
             self.cargo_build_jobs = v;
@@ -1151,9 +1132,6 @@ impl MainlineDeployerConfig {
         }
         if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", &get)? {
             self.observability_stack.backends = v;
-        }
-        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS", &get)? {
-            self.observability_stack.apply_timeout_secs = v;
         }
         if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", &get)? {
             self.observability_stack.max_named_resources = v;
@@ -1276,7 +1254,6 @@ mod tests {
             ),
             ("COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE", "mon"),
             ("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", "false"),
-            ("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS", "45"),
             ("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", "3"),
         ]
         .into_iter()
@@ -1290,7 +1267,6 @@ mod tests {
         assert_eq!(stack.manifest_dir, "deploy/other");
         assert_eq!(stack.namespace, "mon");
         assert!(!stack.backends);
-        assert_eq!(stack.apply_timeout_secs, 45);
         assert_eq!(stack.max_named_resources, 3);
 
         let bad: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS", "soon")]

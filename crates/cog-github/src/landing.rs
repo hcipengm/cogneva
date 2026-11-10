@@ -316,6 +316,11 @@ pub struct LandingRecord {
     /// reading counts landings, not passes over one.
     #[serde(default)]
     pub inherited_ci_reported: bool,
+    /// Whether it has already been said that this landing's CI is taking longer
+    /// than the declared window. A latch, not a level: the record keeps being
+    /// watched, so an unlatched report would repeat on every pass.
+    #[serde(default)]
+    pub ci_aged_reported: bool,
     /// Why verification settled this change as one that must not land. Set
     /// together with `Retired`, and the only record of a verdict that leaves
     /// no commit behind.
@@ -831,6 +836,7 @@ impl MainChannel {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: created,
             updated_at: now,
@@ -1561,6 +1567,7 @@ impl cog_core::ChangeLanding for MainChannel {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: created,
             updated_at: now,
@@ -1609,9 +1616,13 @@ impl cog_core::ChangeLanding for MainChannel {
 /// is re-driven once from the failure log — a change that breaks CI twice is
 /// out of the generator's reach and is left to a human.
 ///
-/// A revision whose CI never reports within `ci_watch_timeout_secs` stops
-/// being watched: `None` means no evidence, and waiting forever on a verdict
-/// that is not coming would grow the record set without bound.
+/// A revision whose CI has not reported within `ci_watch_timeout_secs` is not
+/// dropped: the window says how long a verdict is *expected* to take, and past
+/// it the pass logs once and keeps watching. A CI run that has not reported yet
+/// is still running — ending the watch would throw away the verdict it is about
+/// to produce, along with the revert that a red one would trigger. The record
+/// set is bounded by the landings awaiting a verdict, and every one of those is
+/// closed by the CI finishing.
 pub async fn watch_landed(
     channel: &MainChannel,
     reflection: Option<&dyn cog_core::ReflectionEngine>,
@@ -1654,15 +1665,25 @@ pub async fn watch_landed(
             continue;
         }
         let age = (now - record.updated_at).num_seconds().max(0) as u64;
-        if age > policy.ci_watch_timeout_secs {
+        // 过了声明的窗口不再「停止观察」：一条还在跑的 CI 还没有判词，按钟点把
+        // 记录删掉，等于把它的绿色（以及红色的自动回滚）一起扔掉——而它下一轮
+        // 很可能就报出来了。只登一条读数，继续看。记录的增长由「等着判词的落地
+        // 数」界住，那是一个会被 CI 收尾的集合，不是无界的。
+        if age > policy.ci_watch_timeout_secs && !record.ci_aged_reported {
             tracing::warn!(
                 change_id = %record.change.change_id,
                 rev = %record.landed_rev,
                 age_secs = age,
-                "no CI verdict for a landed commit within the watch window; no longer watching"
+                "no CI verdict for a landed commit past the declared window; still watching, \
+                 because a run that has not reported is not a run that will not report"
             );
-            remove_record(&record.change.change_id).await;
-            continue;
+            record.ci_aged_reported = true;
+            // `updated_at` 保持不动：它是量这个年龄的钟，碰它就把要暴露的陈旧
+            // 一起抹掉了。
+            if let Err(e) = save_record(&record).await {
+                tracing::warn!(change_id = %record.change.change_id, error = %e,
+                    "could not latch the aged-CI report; it will repeat next pass");
+            }
         }
 
         let verdict = match channel
@@ -2729,6 +2750,37 @@ mod tests {
         }
         async fn ci_failure_log_for_sha(&self, _sha: &str) -> Result<String> {
             self.log.clone().map_err(CogGitHubError::Provider)
+        }
+    }
+
+    /// CI 还没有判词：仍在跑，或者还没有检查报到。
+    struct PendingCiProvider;
+
+    #[async_trait::async_trait]
+    impl CodePlatformProvider for PendingCiProvider {
+        async fn list_open_issues(&self) -> Result<Vec<crate::provider::PlatformIssue>> {
+            Ok(Vec::new())
+        }
+        async fn create_pull_request(
+            &self,
+            _req: crate::provider::CreatePullRequest,
+        ) -> Result<crate::provider::PlatformPullRequest> {
+            Err(CogGitHubError::Provider("unused".into()))
+        }
+        async fn comment_on_issue(&self, _n: u64, _body: String) -> Result<()> {
+            Ok(())
+        }
+        async fn merge_pull_request(&self, _n: u64, _sha: String) -> Result<()> {
+            Ok(())
+        }
+        async fn get_pull_request(&self, _n: u64) -> Result<crate::provider::PullRequestDetail> {
+            Err(CogGitHubError::Provider("unused".into()))
+        }
+        async fn ci_verdict_for_sha(&self, _sha: &str) -> Result<Option<bool>> {
+            Ok(None)
+        }
+        async fn ci_failure_log_for_sha(&self, _sha: &str) -> Result<String> {
+            Ok(String::new())
         }
     }
 
@@ -4312,6 +4364,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -4373,6 +4426,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: Some("patch does not apply".into()),
             created_at: now - chrono::Duration::seconds(7200),
             updated_at: now - chrono::Duration::seconds(7200),
@@ -4416,6 +4470,7 @@ mod tests {
                 redriven: false,
                 unlanded_reported: false,
                 inherited_ci_reported: false,
+                ci_aged_reported: false,
                 retired_reason: None,
                 created_at: now - chrono::Duration::seconds(age_secs),
                 updated_at: now - chrono::Duration::seconds(age_secs),
@@ -4465,6 +4520,74 @@ mod tests {
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
+    /// 过了窗口而 CI 仍在跑：记录留下、继续看，只登一条读数。
+    ///
+    /// 旧行为是按钟点把记录删掉——那条 CI 下一轮报出来的绿（或红的自动回滚）
+    /// 就再也读不到了。这里用一条「还没有判词」的记录跑两轮：第一轮登读数并上
+    /// 闩，第二轮既不重复说、也不删记录。
+    #[tokio::test]
+    async fn a_landing_whose_ci_is_still_running_is_not_dropped_at_the_window() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let policy = crate::config::LandingPolicy {
+            ci_watch_timeout_secs: 1800,
+            ..Default::default()
+        };
+        let chan = MainChannel::new(
+            "/tmp/nonexistent",
+            GitHubIntegrationConfig {
+                repo: "o/r".into(),
+                landing_policy: policy,
+                ..Default::default()
+            },
+            Arc::new(PendingCiProvider),
+            ContributionController::new_shared(),
+        );
+        let now = Utc::now();
+        save_record(&LandingRecord {
+            change: change(
+                "chg-still-running",
+                &diff_touching(&["crates/cog-github/src/lib.rs"]),
+            ),
+            base: "main".into(),
+            landed_rev: "abc1234".into(),
+            state: LandingState::Landed,
+            failure_recorded: false,
+            redriven: false,
+            unlanded_reported: false,
+            inherited_ci_reported: false,
+            ci_aged_reported: false,
+            retired_reason: None,
+            created_at: now - chrono::Duration::seconds(7200),
+            updated_at: now - chrono::Duration::seconds(7200),
+        })
+        .await
+        .unwrap();
+
+        watch_landed(&chan, None, None).await;
+
+        let rec = load_record("chg-still-running")
+            .await
+            .expect("一条还在跑的 CI 的记录不能被窗口删掉：它的判词下一轮才到");
+        assert!(rec.ci_aged_reported, "过了窗口要登一条读数");
+        assert_eq!(
+            rec.updated_at,
+            now - chrono::Duration::seconds(7200),
+            "量年龄的钟不能被这次登记推动，否则这条读数会在下一轮自己消失"
+        );
+
+        watch_landed(&chan, None, None).await;
+        assert!(
+            load_record("chg-still-running").await.is_some(),
+            "第二轮仍然要留着它"
+        );
+
+        remove_record("chg-still-running").await;
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
     /// A channel whose CI provider answers with a fixed result, so the watch
     /// loop's red-verdict path runs without a network.
     fn watch_channel(policy: crate::config::LandingPolicy, provider: RedCiProvider) -> MainChannel {
@@ -4492,6 +4615,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -4712,6 +4836,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -5004,6 +5129,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -5059,6 +5185,7 @@ mod tests {
             redriven: false,
             unlanded_reported: false,
             inherited_ci_reported: false,
+            ci_aged_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,

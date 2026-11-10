@@ -415,39 +415,29 @@ rows:
   - key: backup.runDeadlineSeconds
     source: override
     why: >-
-      One hour against runs the ledger measures in tens of seconds. The flow
-      already records started_at/finished_at per run, so a derived deadline could
-      be a multiple of the observed run time; nothing computes it.
+      One hour against runs the ledger measures in tens of seconds. It stops
+      nothing: the container's liveness is judged by the progress probe, and
+      this number only sets the instant at which an open row in backup_runs is
+      concluded abandoned. The flow already records started_at/finished_at per
+      run, so a derived value could be a multiple of the observed run time;
+      nothing computes it.
 
-  - key: backup.drillDeadlineSeconds
+  - key: backup.drillStepSilenceSeconds
     source: override
     why: >-
-      This bound and backup.drillPassBudgetSeconds are a pair, not two numbers:
-      the run opens two packages, and only the process can say how long a pass
-      took, because this bound kills the pod and a killed pass writes no row.
-      On 2026-10-27 the pair was out of step -- one restore, measured at 497 s on
-      2026-10-19, had grown to 2271 s as the database grew to 3.6 GB, so the
-      first pass used 38 of the 60 minutes and the second was killed at the
-      bound with nothing recorded. The obligation is
-      activeDeadlineSeconds >= 2 * drillPassBudgetSeconds + slack, and
-      deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh fails
-      when it does not hold, so raising one alone goes red. The bound still
-      exists to stop a hung restore: with Forbid, a stuck drill would otherwise
-      block every drill after it.
-
-  - key: backup.drillPassBudgetSeconds
-    source: override
-    why: >-
-      How long one pass -- unpack through row-by-row comparison -- may take
-      before the drill stops it and records a failed row naming the budget.
-      Held by the process rather than by the job's activeDeadlineSeconds so that
-      a pass that runs long moves state instead of vanishing: a killed process
-      leaves the previous night's row as the latest, which reads exactly like a
-      night that never ran. Measured single-pass cost: 497 s on 2026-10-19,
-      2271 s on 2026-10-27 with a 3.6 GB database. It rises with the data, so a
-      number that fits today is a number that will be wrong later; the pair with
-      backup.drillDeadlineSeconds is what keeps that from silently reaping the
-      second pass.
+      How long one step of a drill -- unpack, verify the manifest, create the
+      scratch database, restore, compare -- may go without advancing before the
+      drill stops itself and records a failed row naming that step. It replaced
+      a whole-pass budget, and the difference is the point: on 2026-10-27 a
+      restore measured at 497 s on 2026-10-19 had grown to 2271 s as the
+      database grew to 3.6 GB, the first pass used 38 of the 60 minutes, and the
+      second pass was killed by the whole-pass clock with nothing recorded --
+      so the oldest unproven package could never be proven. A pass that keeps
+      advancing is no longer stopped at any total. No measured sample of a
+      single step exists yet, which is why this carries the old whole-pass
+      number: at the same value it is strictly more permissive than what it
+      replaced, and it is the value the Job's probe reads until the process has
+      measured a window of its own.
 
   - key: backup.startingDeadlineSeconds
     source: override
@@ -701,18 +691,18 @@ rows:
       from the observed arrival interval of changes; nothing records that
       interval today.
 
-  - key: evolution.testTimeoutSecs
+  - key: evolution.progressDeadlineSeconds
     source: override
     why: >-
-      The wall-clock cap on one verification run. It would be derived from the
-      measured duration of past runs, which the ledger does not keep.
-
-  - key: evolution.buildTimeoutSecs
-    source: override
-    why: >-
-      The wall-clock cap on one build. A derived value would read the build
-      gate's measured build durations; the gate records concurrency and wait, not
-      duration.
+      The controller's default, written down so it can be read: an undeclared
+      progressDeadlineSeconds is 600 seconds, and a bound nobody can see in the
+      manifest is a bound nobody can audit. It kills nothing: at the deadline the
+      controller only writes a status condition (Progressing=False, reason
+      ProgressDeadlineExceeded) and the pod keeps running; nothing in this repo
+      acts on that condition. The field cannot be removed either -- the API
+      applies the same default when it is absent. Raising the number is not the
+      repair -- reading the pod's own startup
+      progress is.
 
   - key: evolution.buildGate.maxConcurrent
     source: derived
@@ -1210,12 +1200,6 @@ rows:
       How long after a failed rollout the deployer waits before trying the same
       revision again. A derived cooldown would follow the observed recovery time;
       the deployer records outcomes but does not turn them into this number.
-
-  - key: mainlineDeployer.observabilityStack.applyTimeoutSecs
-    source: override
-    why: >-
-      The convergence pass's own deadline. A derived value would read how long a
-      pass actually takes; the pass does not publish its duration.
 
   - key: mainlineDeployer.observabilityStack.intervalSecs
     source: override

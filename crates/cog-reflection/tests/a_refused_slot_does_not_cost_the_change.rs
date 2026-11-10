@@ -97,7 +97,7 @@ async fn a_refused_slot_leaves_the_tree_uncommitted() {
         Some(1.0),
         "the refusal is not on the reading"
     );
-    for outcome in ["built", "failed", "timed_out"] {
+    for outcome in ["built", "failed", "stalled"] {
         assert_eq!(
             value(BUILD_OUTCOMES_TOTAL_METRIC, outcome),
             Some(0.0),

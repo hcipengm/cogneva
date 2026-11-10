@@ -432,23 +432,14 @@ impl LLMProvider for OpenAIResponsesProvider {
             let mut thinking_pos: Option<usize> = None;
             let mut tool_accs: BTreeMap<String, ToolAcc> = BTreeMap::new();
 
-            let total_timeout = crate::provider::STREAM_TOTAL_TIMEOUT;
-            let mut event_timeout = total_timeout;
-            let stream_start = std::time::Instant::now();
+            // The gap between events is the measurement; the length of the
+            // stream is not. A stream that keeps emitting is working, and a
+            // total cap ends exactly the streams that were about to finish.
+            let mut event_timeout = crate::provider::STREAM_FIRST_EVENT_GAP;
             let mut first_event_logged = false;
 
             'stream: loop {
-                let elapsed = stream_start.elapsed();
-                if elapsed >= total_timeout {
-                    response.stop_reason = StopReason::Error;
-                    response.error_message = Some(format!(
-                        "SSE stream exceeded total duration limit of {}s",
-                        total_timeout.as_secs()
-                    ));
-                    break;
-                }
-                let remaining = total_timeout - elapsed;
-                let timeout = event_timeout.min(remaining).max(Duration::from_secs(1));
+                let timeout = event_timeout.max(Duration::from_secs(1));
 
                 let line = match tokio::time::timeout(timeout, lines.try_next()).await {
                     Ok(Ok(Some(line))) => line,
@@ -884,27 +875,14 @@ impl LLMProvider for OpenAIResponsesProvider {
 
     async fn chat(&self, messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
         let mut stream = self.chat_stream(messages, options).await?;
-        let chat_timeout = crate::provider::CHAT_CONSUME_TIMEOUT;
-        let consume_result = tokio::time::timeout(chat_timeout, async {
-            let mut final_message: Option<Message> = None;
-            while let Some(event) = stream.next().await {
-                if let AssistantMessageEvent::Done { message, .. } = event {
-                    final_message = Some(message);
-                }
+        // The stream ends by its own rules; a clock at this level would be a
+        // second, coarser wall over the same work and would fire first.
+        let mut final_message: Option<Message> = None;
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::Done { message, .. } = event {
+                final_message = Some(message);
             }
-            final_message
-        })
-        .await;
-
-        let final_message = match consume_result {
-            Ok(msg) => msg,
-            Err(_) => {
-                return Err(SFError::LLM(format!(
-                    "OpenAIResponsesProvider chat() timed out after {}s waiting for stream",
-                    chat_timeout.as_secs()
-                )));
-            }
-        };
+        }
 
         let mut response = stream.result().await;
         if let Some(Message::Assistant { content, .. }) = final_message {

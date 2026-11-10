@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use cog_core::{EvolutionIntent, SFError, SFResult};
 use tracing::{info, warn};
@@ -69,7 +69,6 @@ pub struct EvolutionDeployer {
     binary_dir: PathBuf,
     backup_dir: PathBuf,
     binary_name: String,
-    build_timeout_secs: u64,
     git_name: String,
     git_email: String,
     /// 共享 CARGO_TARGET_DIR：产物不进临时工作树，工作树用完即弃不丢缓存。
@@ -101,7 +100,6 @@ impl EvolutionDeployer {
             binary_dir: binary_dir.into(),
             backup_dir: backup_dir.into(),
             binary_name: cog_core::paths::APP_BINARY_NAME.to_string(),
-            build_timeout_secs: 3600,
             git_name: "Cogneva Self-Evolution".to_string(),
             git_email: "self-evolution@cogneva.ai".to_string(),
             target_dir: None,
@@ -111,29 +109,18 @@ impl EvolutionDeployer {
         }
     }
 
-    /// Attach the observation sink and take the budget from it, for the same
-    /// reason the pipeline does: one number enforced and reported, not two.
+    /// Attach the observation sink the cost of each build is reported to.
     ///
-    /// The field this sets is the fallback for a deployer with no sink. With one
-    /// attached the budget is read at every build (see
-    /// [`Self::build_budget_secs`]): the sink's number moves as runs are
-    /// measured, and a copy taken here would keep killing at a wall the reading
-    /// no longer reports.
+    /// It no longer carries a wall, because this deployer no longer has one:
+    /// a build is judged by whether it is still moving, not by how long it has
+    /// been running. The sink still gets the measured duration of every build
+    /// that ran, which is what the pipeline's divisor is made of.
     pub fn with_verification_budget(
         mut self,
         budget: Arc<crate::verification_budget::VerificationBudget>,
     ) -> Self {
-        self.build_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_BUILD);
         self.budget = Some(budget);
         self
-    }
-
-    /// The build budget this run is held to, as of now.
-    fn build_budget_secs(&self) -> u64 {
-        match &self.budget {
-            Some(budget) => budget.timeout_secs(crate::verification_budget::KIND_BUILD),
-            None => self.build_timeout_secs,
-        }
     }
 
     /// Attach the sink the builds report their cost to. One instance is shared
@@ -204,11 +191,6 @@ impl EvolutionDeployer {
 
     pub fn with_binary_name(mut self, name: impl Into<String>) -> Self {
         self.binary_name = name.into();
-        self
-    }
-
-    pub fn with_build_timeout(mut self, secs: u64) -> Self {
-        self.build_timeout_secs = secs;
         self
     }
 
@@ -391,33 +373,33 @@ impl EvolutionDeployer {
             cmd.env(name, value);
         }
         let started = Instant::now();
-        let budget_secs = self.build_budget_secs();
-        // Spawned rather than handed to `output()`: the pid is what the memory
-        // sampler watches, and there is no way to learn it from a call that
-        // waits for the process to end. The pipes are attached here so the
-        // failure text below is the build's own, and `kill_on_drop` keeps the
-        // budget arm's kill: dropping the wait future drops the child.
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                // cargo could not be spawned at all, so no build happened: same
-                // class as a build the gate refused, and no duration is
-                // reported for it.
-                self.record_build(change_id, intent, BuildEnding::Unstarted, None);
-                return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
-            }
-        };
-        let watcher = child.id().map(|pid| {
-            tokio::spawn(crate::build_rss_peak::watch(
+        // 这段构建不再有一个按秒的预算。判据是它还在不在动：每写出一段输出是一拍，
+        // CPU 时间在涨也是一拍——后者是「沉默的编译」唯一的「还在动」证据，而没有
+        // 它，最忙的那一分钟最像停住。判据与编排侧的回收、执行器的看门狗是同一条
+        // （`cog_core::progress`），三处不会漂移。
+        //
+        // pid 要交出去：内存采样器看的是这个进程，而一个等到进程结束才返回的调用
+        // 里拿不到它。
+        let watcher: std::sync::Arc<
+            std::sync::Mutex<
+                Option<tokio::task::JoinHandle<Option<crate::build_rss_peak::RssPeak>>>,
+            >,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let watcher_from_spawn = watcher.clone();
+        let build_id = format!(
+            "evolution-build:{change_id}:{}",
+            started.elapsed().as_nanos()
+        );
+        let waited = cog_core::progress::run_child_watched_with_pid(cmd, &build_id, move |pid| {
+            let handle = tokio::spawn(crate::build_rss_peak::watch(
                 PathBuf::from("/proc"),
                 pid,
                 crate::build_rss_peak::SAMPLE_PERIOD,
-            ))
-        });
-        let waited =
-            tokio::time::timeout(Duration::from_secs(budget_secs), child.wait_with_output()).await;
+            ));
+            *watcher_from_spawn.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+        })
+        .await;
+        let watcher = watcher.lock().unwrap_or_else(|p| p.into_inner()).take();
         // Read before the arms below, because two of them return: the number
         // belongs to this build and there is no later point at which it could
         // be attributed to this one rather than to whatever runs next. The wait
@@ -433,22 +415,15 @@ impl EvolutionDeployer {
             }
             None => None,
         };
-        // Handed to the gate before the arms below, because a build the budget
-        // killed still measured what it took: the divisor is about what a build
-        // costs, and a build that ran out of time cost that much regardless of
-        // how it ended.
+        // Handed to the gate before the arms below, because a build that was
+        // judged stopped still measured what it took: the divisor is about what
+        // a build costs, and a build that stopped moving cost that much
+        // regardless of how it ended.
         if let Some(bytes) = peak_rss_bytes {
             crate::build_gate::observe_build_memory(bytes);
         }
         let output = match waited {
-            Ok(result) => {
-                let output = match result {
-                    Ok(output) => output,
-                    Err(e) => {
-                        self.record_build(change_id, intent, BuildEnding::Unstarted, None);
-                        return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
-                    }
-                };
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => {
                 if let Some(budget) = &self.budget {
                     budget.record_run(
                         crate::verification_budget::KIND_BUILD,
@@ -457,27 +432,29 @@ impl EvolutionDeployer {
                 }
                 output
             }
-            Err(_) => {
-                // An unbounded release build outlives the pod's own resources
-                // long before it is useful; give up and let the caller roll the
-                // commit back.
-                if let Some(budget) = &self.budget {
-                    budget.record_timeout(crate::verification_budget::KIND_BUILD);
-                }
-                // The host time this build spent is the budget it was cut off
-                // at, and it is reported as such rather than as a measurement
-                // of the work. What it took in memory before it was cut off is
-                // still a real measurement, so it is reported.
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                // 它停了，不是「时候到了」。宿主时间是真的（它确实占了这么久），
+                // 但那个数不是这件活的长度；它停之前占到的内存仍然是一次实测，
+                // 照报。
                 self.record_build(
                     change_id,
                     intent,
-                    BuildEnding::TimedOut(Duration::from_secs(budget_secs)),
+                    BuildEnding::Stalled { silent, window },
                     peak_rss_bytes,
                 );
                 return Err(SFError::IO(format!(
-                    "cargo build --release exceeded the {}s deployment budget and was killed",
-                    budget_secs
+                    "cargo build --release stopped moving: no output and no CPU time for \
+                     {:?}, longer than any gap this deployment has ever seen between steps \
+                     of a build that was still working ({:?}); it was killed",
+                    silent, window
                 )));
+            }
+            Err(e) => {
+                // cargo could not be spawned at all, so no build happened: same
+                // class as a build the gate refused, and no duration is
+                // reported for it.
+                self.record_build(change_id, intent, BuildEnding::Unstarted, None);
+                return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
             }
         };
 
@@ -582,6 +559,7 @@ fn self_evolution_commit_message(change_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// 一个在构建阶段就睡着的 crate：`build.rs` 睡够，`cargo build --release`
     /// 必定超过一秒的预算，而慢的原因握在测试手里，与机器快慢无关。
@@ -601,42 +579,59 @@ mod tests {
         .unwrap();
     }
 
-    /// 部署侧那条界与测试侧是两条：`build_timeout_secs` 与 `test_timeout_secs`。
-    /// 「超预算被杀、且错误里点名是哪条预算杀的」原先只在测试侧有实测（真跑一次
-    /// `cargo test`），部署侧的界只剩「代码里写着」这一个证据——调这个旋钮时，
-    /// 需要的正是「这个界真的在拦」的读数。
+    /// 一条停在半路、既不输出也烧不动 CPU 的构建要被执行器停掉，且错误里把
+    /// 「静了多久」「这个部署见过的最长一步有多长」两个数都写出来。
     ///
-    /// 真跑一次 `cargo build --release`。杀掉的这个动作要留两处痕：错误里点名预算
-    /// （否则事后读这条变更的人分不出「没判过」与「判失败」），结局记成 `TimedOut`
-    /// 而不是「构建失败」（两者占用的宿主时间含义相反，合成一个数就没有哪个数可
-    /// 用来定界）。
+    /// 这两处痕缺一不可：点了名，事后读这条变更的人才分得清「没判过」与「判
+    /// 停住」；结局记成 `Stalled` 而不是「构建失败」，因为两者的宿主时间含义相
+    /// 反——停住的构建占掉的时间不是这件活的长度。
     ///
-    /// 槽位传 `None`：这个测试量的是界本身，不是闸门；在测试里拿一个真槽位会把本
-    /// 进程其它同样真跑构建的测试挤进排队。
+    /// 真跑一次 `cargo build --release`：这个夹具的 `build.rs` 睡 30 秒，期间
+    /// 一个字节都不输出、CPU 时间一 tick 都不涨。种子只种在这个测试里，并持着
+    /// 进程级的那把锁——别的同样真跑构建的测试不会读到这里的窗口。
+    ///
+    /// 槽位传 `None`：这个测试量的是判据本身，不是闸门。
     #[tokio::test]
-    async fn a_release_build_that_outlives_its_budget_is_killed_with_the_budget_named() {
+    async fn a_build_that_stops_moving_is_stopped_and_the_error_names_the_window() {
+        let _guard = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            Duration::from_millis(50),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let root = tempfile::tempdir().unwrap();
         write_slow_build_crate(root.path());
 
         let deployer = EvolutionDeployer::new(root.path(), root.path(), root.path())
-            .with_binary_name("budget-probe")
-            .with_build_timeout(1);
+            .with_binary_name("stall-probe");
 
         let err = deployer
-            .run_cargo_build(root.path(), None, "change-budget-probe", None)
+            .run_cargo_build(root.path(), None, "change-stall-probe", None)
             .await
-            .expect_err("a build that cannot finish in a second must not be waited on");
+            .expect_err("a build that stops moving must not be waited on forever");
 
+        let text = err.to_string();
         assert!(
-            err.to_string()
-                .contains("cargo build --release exceeded the 1s deployment budget"),
-            "the rejection has to name the budget that caused it: {err}"
+            text.contains("stopped moving"),
+            "the rejection has to say the build was judged stopped: {text}"
         );
-        assert_eq!(
-            deployer.last_build_ending(),
-            Some(BuildEnding::TimedOut(Duration::from_secs(1))),
-            "a build cut off at the budget is a timeout, not a failure of the change"
+        assert!(
+            text.contains("50ms"),
+            "the rejection has to name the longest gap this deployment has seen, \
+             otherwise nobody can tell what it was compared against: {text}"
         );
+        match deployer.last_build_ending() {
+            Some(BuildEnding::Stalled { silent, window }) => {
+                assert_eq!(window, Duration::from_millis(50));
+                assert!(
+                    silent > window,
+                    "judged stopped means silent beats the window"
+                );
+            }
+            other => panic!("a build stopped mid-step is Stalled, not {other:?}"),
+        }
+        cog_core::progress::reset_for_tests();
     }
 
     /// The self-generated commit is the one this repository would otherwise

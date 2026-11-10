@@ -60,16 +60,6 @@ pub struct RuntimeConfig {
     /// stream event arrives for this many consecutive seconds, which indicates
     /// a hung connection rather than a slow one.
     pub think_stall_timeout_secs: u64,
-    /// Wall-clock cap for the forced final-draft ask, in seconds.
-    ///
-    /// The stall timeout above bounds silence, not the call: a stream that
-    /// keeps trickling events stays inside it indefinitely. This bounds the
-    /// call itself, and it applies to the one ask that runs *after* the run's
-    /// budget is already spent — the one that must not be open-ended. It is
-    /// larger than the stall timeout on purpose: recoveries that produced a
-    /// deliverable have run into the hundreds of seconds, and the cap exists
-    /// only so a wedged upstream cannot hold a spent run for ten minutes.
-    pub final_draft_timeout_secs: u64,
     /// Optional dynamic skill configuration that overrides role defaults.
     pub skill_config: Option<crate::SkillConfig>,
     /// Optional Crew identifier — attached to lifecycle events so the hook
@@ -148,7 +138,6 @@ impl Default for RuntimeConfig {
             // that hung outright ran 600s. 420s clears every recovery that has
             // ever worked here with margin for the tail, and still cuts the
             // hang well below the ten minutes it used to hold a spent run.
-            final_draft_timeout_secs: 420,
             skill_config: None,
             crew_id: None,
             squad_id: None,

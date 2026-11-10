@@ -99,6 +99,8 @@ impl FirecrackerSandbox {
         let child = tokio::process::Command::new(&self.config.firecracker_bin)
             .arg("--api-sock")
             .arg(&socket_path)
+            // 自己的进程组：判停时整组一起收，guest 与它拉起的进程不会留在宿主上。
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| SFError::IO(format!("spawn {}: {e}", self.config.firecracker_bin)))?;
@@ -177,21 +179,29 @@ impl FirecrackerSandbox {
         let begin = std::time::Instant::now();
         let mut vm = self.cold_start().await?;
 
-        let timeout = Duration::from_secs(self.config.exec_timeout_secs);
-        let completed = match tokio::time::timeout(timeout, vm.child.wait()).await {
-            Ok(Ok(status)) => {
-                if !status.success() {
-                    warn!(vm_id = %vm.id, ?status, "firecracker exited abnormally");
+        // 判据是它还在不在动（guest 吃的 CPU），不是一个声明的钟：一次正常的进化
+        // 可能跑上半小时，按秒砍它等于把整轮付过的功夫扔掉；而一个真正卡死的 guest
+        // 在一段实测窗口里一个 tick 都不会涨。
+        let cmdline = format!("firecracker {}", vm.id);
+        let completed = match cog_core::progress::watch_child(&mut vm.child, &cmdline, None).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => {
+                if !output.status.success() {
+                    warn!(vm_id = %vm.id, status = ?output.status, "firecracker exited abnormally");
                 }
                 true
             }
-            Ok(Err(e)) => {
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                warn!(
+                    vm_id = %vm.id,
+                    ?silent,
+                    ?window,
+                    "microvm stopped moving; destroying"
+                );
+                false
+            }
+            Err(e) => {
                 self.destroy(vm).await.ok();
                 return Err(SFError::IO(format!("wait firecracker: {e}")));
-            }
-            Err(_) => {
-                warn!(vm_id = %vm.id, "microvm exec timeout; destroying");
-                false
             }
         };
 
@@ -366,7 +376,6 @@ mod tests {
             mem_size_mib: 1024,
             boot_args: "init=/evolution/init".into(),
             instance_root: dir.join("instances").to_string_lossy().into(),
-            exec_timeout_secs: 5,
         }
     }
 

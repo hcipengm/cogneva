@@ -11,6 +11,7 @@ pub mod config_sections;
 pub mod contract;
 pub mod day;
 pub mod day_key;
+pub mod declared_wall;
 pub mod env;
 pub mod error;
 pub mod fs_size;

@@ -16,7 +16,6 @@ use cog_core::contract::version::{
     Clause, ContractReport, DeclarationChange, Evidence, ReleaseTag, TagSet, Verdict,
 };
 use cog_core::{SFError, SFResult};
-use std::time::Duration;
 
 /// The version contract's readings, kept apart from its verdicts.
 ///
@@ -37,20 +36,23 @@ pub struct VersionReadings {
 /// `--git-dir` is the only way this module talks to a repository: a bare repo
 /// (what the cluster holds) and a working tree (what CI checks out) are both
 /// addressed the same way, and neither needs a working directory of its own.
-async fn git_out(git_dir: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+async fn git_out(git_dir: &str, args: &[&str]) -> SFResult<String> {
     let mut full: Vec<&str> = vec!["--git-dir", git_dir];
     full.extend_from_slice(args);
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(&full).kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
-        .await
-        .map_err(|_| {
-            SFError::IO(crate::cmd_timeout::timed_out(
-                &format!("git {}", args.join(" ")),
-                timeout_secs,
-            ))
-        })?
-        .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;
+    // 判据是它还在不在动，不是它跑了多久：一次要走几百个提交的 `git log`
+    // 与一次卡死的 git 在钟面上同形，而前者不该被砍在中间。
+    let cmdline = format!("git {}", args.join(" "));
+    let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+        Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+        Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+            return Err(SFError::IO(crate::cmd_timeout::went_silent(
+                &cmdline, silent, window,
+            )))
+        }
+        Err(e) => return Err(SFError::IO(format!("failed to run git: {e}"))),
+    };
     if !output.status.success() {
         return Err(SFError::IO(format!(
             "git {} failed: {}",
@@ -63,7 +65,7 @@ async fn git_out(git_dir: &str, args: &[&str], timeout_secs: u64) -> SFResult<St
 
 /// The commit a tag dereferences to.
 async fn tag_commit_at(git_dir: &str, tag: &str) -> Option<String> {
-    git_out(git_dir, &["rev-list", "-n1", tag], 30)
+    git_out(git_dir, &["rev-list", "-n1", tag])
         .await
         .ok()
         .filter(|rev| !rev.is_empty())
@@ -71,7 +73,7 @@ async fn tag_commit_at(git_dir: &str, tag: &str) -> Option<String> {
 
 /// The version declared at `rev` (`workspace.package.version`).
 async fn declared_version_at(git_dir: &str, rev: &str) -> Option<String> {
-    let manifest = git_out(git_dir, &["show", &format!("{rev}:Cargo.toml")], 30)
+    let manifest = git_out(git_dir, &["show", &format!("{rev}:Cargo.toml")])
         .await
         .ok()?;
     cog_core::contract::version::declared_version(&manifest).map(|v| v.to_string())
@@ -79,7 +81,7 @@ async fn declared_version_at(git_dir: &str, rev: &str) -> Option<String> {
 
 /// Whether `older` is an ancestor of `newer`.
 async fn is_ancestor_at(git_dir: &str, older: &str, newer: &str) -> bool {
-    git_out(git_dir, &["merge-base", "--is-ancestor", older, newer], 30)
+    git_out(git_dir, &["merge-base", "--is-ancestor", older, newer])
         .await
         .is_ok()
 }
@@ -115,7 +117,6 @@ pub async fn evidence_at(
             "--",
             "Cargo.toml",
         ],
-        120,
     )
     .await
     .unwrap_or_default();
@@ -156,7 +157,7 @@ pub async fn evidence_at(
         current_version = Some(version);
     }
 
-    let shallow = git_out(git_dir, &["rev-parse", "--is-shallow-repository"], 30)
+    let shallow = git_out(git_dir, &["rev-parse", "--is-shallow-repository"])
         .await
         .map(|out| out == "true")
         // A repository whose shape could not be read is not a repository known to
@@ -170,7 +171,6 @@ pub async fn evidence_at(
     if let Ok(list) = git_out(
         git_dir,
         &["for-each-ref", "--format=%(refname:short)", "refs/tags/v*"],
-        60,
     )
     .await
     {
@@ -190,7 +190,6 @@ pub async fn evidence_at(
                 if let Ok(count) = git_out(
                     git_dir,
                     &["rev-list", "--count", &format!("{}..{}", commit, rev)],
-                    60,
                 )
                 .await
                 {
@@ -221,12 +220,7 @@ pub async fn evidence_at(
         // strip matches -- every point's set would come back empty, and two empty
         // sets read as agreement. An empty reading must not look like a reading
         // of agreement.
-        let Ok(list) = git_out(
-            git_dir,
-            &["for-each-ref", "--format=%(refname)", &pattern],
-            60,
-        )
-        .await
+        let Ok(list) = git_out(git_dir, &["for-each-ref", "--format=%(refname)", &pattern]).await
         else {
             continue;
         };

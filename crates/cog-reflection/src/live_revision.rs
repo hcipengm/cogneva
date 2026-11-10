@@ -43,7 +43,8 @@ pub const DEPLOYMENTS_JSONPATH: &str = "{.metadata.name}{\"\\t\"}{range .spec.te
 /// 「第一个读不出来的名字就中止、且报出是哪一个」这件事，只能在没有真集群时量。
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String>;
+    /// 没有「能跑多久」这个参数：判的是它还在不在产出，不是它跑了多久。
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String>;
 }
 
 /// 四个主负载里哪一个读不出来、为什么。
@@ -76,7 +77,6 @@ pub async fn read_base_deployments(
             .run(
                 kubectl_bin,
                 &["-n", namespace, "get", &target, "-o", &format],
-                30,
             )
             .await
         {
@@ -168,16 +168,20 @@ pub struct Subprocess;
 
 #[async_trait::async_trait]
 impl CommandRunner for Subprocess {
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+    async fn run(&self, program: &str, args: &[&str]) -> SFResult<String> {
         let cmdline = format!("{program} {}", args.join(" "));
-        let fut = tokio::process::Command::new(program)
-            .args(args)
-            .kill_on_drop(true)
-            .output();
-        let out = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).kill_on_drop(true);
+        let out = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这份部署见过的\
+                     任何一次「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
+                )))
+            }
+            Err(e) => return Err(SFError::IO(format!("failed to run {program}: {e}"))),
+        };
         if !out.status.success() {
             return Err(SFError::IO(format!(
                 "{cmdline} failed: {}",
@@ -277,7 +281,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommandRunner for FakeRunner {
-        async fn run(&self, _program: &str, args: &[&str], _timeout_secs: u64) -> SFResult<String> {
+        async fn run(&self, _program: &str, args: &[&str]) -> SFResult<String> {
             let target = args
                 .iter()
                 .find(|a| a.starts_with("deployment/"))
@@ -415,14 +419,14 @@ mod tests {
     async fn the_subprocess_runner_reports_failure_rather_than_empty_output() {
         assert_eq!(
             Subprocess
-                .run("sh", &["-c", "printf 'a\\tb\\n'"], 5)
+                .run("sh", &["-c", "printf 'a\\tb\\n'"])
                 .await
                 .expect("成功的命令要交回 stdout"),
             "a\tb"
         );
 
         let err = Subprocess
-            .run("sh", &["-c", "echo denied >&2; exit 1"], 5)
+            .run("sh", &["-c", "echo denied >&2; exit 1"])
             .await
             .expect_err("非零退出是失败，不是空输出");
         assert!(err.to_string().contains("denied"), "{err}");
@@ -481,7 +485,6 @@ mod tests {
                     "-o",
                     DEPLOYMENTS_JSONPATH,
                 ],
-                5,
             )
             .await;
         assert!(

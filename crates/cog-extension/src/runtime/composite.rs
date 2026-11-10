@@ -89,7 +89,6 @@ mod tests {
             agent_id: "a".into(),
             payload,
             input: serde_json::json!({}),
-            timeout: std::time::Duration::from_secs(5),
             limits: Default::default(),
         }
     }

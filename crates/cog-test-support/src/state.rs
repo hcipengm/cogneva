@@ -522,6 +522,9 @@ impl StateBackend for MemoryStateBackend {
         task.error = Some(error.clone());
         task.error_cause = cause;
         task.failure_payer = payer;
+        // 与两份真后端同一个判据：行上存的是这次判决真正用的预算，不是提交时
+        // 声明的那一个数。
+        task.max_retries = max_retries;
         task.updated_at = chrono::Utc::now();
 
         if task.retry_count < max_retries {

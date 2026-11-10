@@ -220,7 +220,6 @@ fn runtime(
             context_window_size: 60_000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 30,
             skill_config: None,
             crew_id: None,
             squad_id: None,

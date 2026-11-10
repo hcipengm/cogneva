@@ -474,7 +474,7 @@ data:
         {
           "id": 14,
           "title": "Verification Budget vs Last Run",
-          "description": "How much room the verification and deployment budgets have left, per kind. The budget is the wall the run is killed at; the last run is how long the work actually took. Read them together: a last-run line walking up towards its budget is the warning, and it arrives while changes are still landing — the counter on the next panel only starts moving once they are not. No threshold is drawn on purpose: what counts as 'close' depends on how much the host's load varies, and a ratio picked here would be a guess that fires wrong. Both kinds are on one axis because they share a unit, not because they share a cause.",
+          "description": "The windows the verification and deployment runs are judged against, per kind, and how long the last finished run took. These are durations in a shared unit, not budgets: the window is the longest gap this deployment has measured between two steps of a run that was still working, and a run is stopped only when it is silent for longer than that. A last-run line above its window is therefore not a warning — the run was allowed to take that long because it kept advancing; it is the reading of what a heavy change costs on this host. The counter on the next panel moves only when a run stops advancing. No threshold is drawn on purpose: the comparison is made against the measured window, not against a ratio picked here. Both kinds are on one axis because they share a unit, not because they share a cause.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -484,7 +484,7 @@ data:
           },
           "targets": [
             {
-              "expr": "cogneva_verification_budget_seconds",
+              "expr": "cogneva_verification_window_seconds",
               "legendFormat": "{{kind}} budget",
               "datasource": {
                 "type": "prometheus",
@@ -512,8 +512,8 @@ data:
         },
         {
           "id": 15,
-          "title": "Runs Killed by Their Budget",
-          "description": "Runs the budget killed, per kind, since this process started. Each one is a change that was retired or rolled back without ever being judged, so the code was neither cleared nor blamed. A non-zero flat line here is history rather than a current fault; what matters is whether it is still climbing.",
+          "title": "Runs Stopped for Not Moving",
+          "description": "Runs stopped because they stopped moving, per kind, since this process started: no output and no CPU time for longer than any gap this deployment has seen between two steps of a run that was still working. Each one is a change that was retired or rolled back without ever being judged, so the code was neither cleared nor blamed. There is no budget behind these numbers — a run heavier than any before it is allowed to keep working for as long as it advances. A non-zero flat line here is history rather than a current fault; what matters is whether it is still climbing.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -523,8 +523,8 @@ data:
           },
           "targets": [
             {
-              "expr": "cogneva_verification_timeouts_total",
-              "legendFormat": "{{kind}} killed",
+              "expr": "cogneva_verification_stopped_total",
+              "legendFormat": "{{kind}} stopped",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -709,7 +709,7 @@ data:
         {
           "id": 18,
           "title": "Evolution Build Cost by Change Kind",
-          "description": "What one release build costs, split by which entry point the change came from. The mean and the last build are over the builds that ended on their own: a build the budget killed has no duration of its own, so its seconds are the budget it was cut off at and are drawn separately -- a kind whose killed-build line is walking up is losing changes to its budget while still paying for them. The mean is per build over the window and is blank when no build of that kind ran in it, which is an empty window rather than a broken panel. Nothing here is summed across the kinds: a total would say builds cost time, and the decision is which kind to spend the next one on. The change kind is the same one the landing funnel counts, so build cost can be read against what those changes ended up doing; a build whose entry point was not carried to the deployer reads as unattributed.",
+          "description": "What one release build costs, split by which entry point the change came from. The mean and the last build are over the builds that ended on their own: a build stopped for not moving has no duration of its own, so its seconds are the silence it was stopped after and are drawn separately -- a kind whose stopped line is walking up is losing changes to a stall while still paying for them. The mean is per build over the window and is blank when no build of that kind ran in it, which is an empty window rather than a broken panel. Nothing here is summed across the kinds: a total would say builds cost time, and the decision is which kind to spend the next one on. The change kind is the same one the landing funnel counts, so build cost can be read against what those changes ended up doing; a build whose entry point was not carried to the deployer reads as unattributed.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -735,8 +735,8 @@ data:
               }
             },
             {
-              "expr": "sum by (intent) (increase(cogneva_evolution_build_seconds_total{outcome=\"timed_out\"}[1h]))",
-              "legendFormat": "{{intent}} killed by budget (1h)",
+              "expr": "sum by (intent) (increase(cogneva_evolution_build_seconds_total{outcome=\"stalled\"}[1h]))",
+              "legendFormat": "{{intent}} stopped for not moving (1h)",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -756,7 +756,7 @@ data:
         {
           "id": 19,
           "title": "Evolution Build Outcomes by Change Kind",
-          "description": "How the build attempts of each change kind ended, over 6h. Four classes, because they call for four different responses: built means the binary was staged; failed means cargo ran and produced nothing, so the change's own code is the thing to look at (the rule evolution_build_failed fires on this class); timed_out means the deployment budget killed it, a knob rather than a defect and already counted by deployment_killed_by_budget; unstarted means the build never reached cargo -- the host had no slot or the binary could not be spawned -- so nothing was judged and the change is still waiting. unstarted is the one class with no duration anywhere: a build that never ran has no time to report, and reporting zero seconds for it would read as a build that cost nothing.",
+          "description": "How the build attempts of each change kind ended, over 6h. Four classes, because they call for four different responses: built means the binary was staged; failed means cargo ran and produced nothing, so the change's own code is the thing to look at (the rule evolution_build_failed fires on this class); stalled means it stopped moving and was killed by the measured-gap rule rather than a clock, and is already counted by deployment_stopped_moving; unstarted means the build never reached cargo -- the host had no slot or the binary could not be spawned -- so nothing was judged and the change is still waiting. unstarted is the one class with no duration anywhere: a build that never ran has no time to report, and reporting zero seconds for it would read as a build that cost nothing.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,

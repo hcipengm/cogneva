@@ -216,7 +216,6 @@ pub struct GatewayState {
     pub data_dir: String,
     /// Hot-path timeouts stored as atomics to avoid RwLock on every request.
     pub request_timeout_secs: std::sync::atomic::AtomicU64,
-    pub sandbox_task_timeout_secs: std::sync::atomic::AtomicU64,
     pub event_tx: broadcast::Sender<cog_core::AgentEvent>,
     pub task_event_tx: broadcast::Sender<cog_core::TaskEvent>,
     pub jwt_manager: Arc<dyn cog_core::AuthProvider>,
@@ -3829,7 +3828,6 @@ async fn plugin_unload_handler(
 struct SandboxExecuteRequest {
     payload: serde_json::Value,
     input: serde_json::Value,
-    timeout_secs: Option<u64>,
 }
 
 async fn sandbox_execute_handler(
@@ -3872,13 +3870,6 @@ async fn sandbox_execute_handler(
                 agent_id: "gateway".into(),
                 payload,
                 input: req.input,
-                timeout: std::time::Duration::from_secs(
-                    req.timeout_secs.unwrap_or(
-                        state
-                            .sandbox_task_timeout_secs
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    ),
-                ),
                 limits: Default::default(),
             };
 

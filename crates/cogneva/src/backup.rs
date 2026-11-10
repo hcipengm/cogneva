@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -57,18 +57,18 @@ const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 /// 与「没配」同形。
 const BACKUP_DIR_ENV: &str = "COGNEVA_BACKUP_DIR";
 const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
-/// 演练**单趟**的预算（秒）。一趟 = 一份包从解包到对数完。
+/// 演练里**一步**静默多久算停（秒）。一步 = 解包、核清单、建空库、恢复、对数……之一。
 ///
-/// 界必须由进程自己拿着，而不是只由 Job 的 `activeDeadlineSeconds` 兜着：Job 的界
-/// 到点是把 Pod 杀掉，进程没有机会写那一行，`backup_drills` 里于是只剩上一晚的记录
-/// ——「这一趟被杀了」与「这一趟没跑过」在账上同形。2026-10-27 实测正是这样：第一趟
-/// 2271 s 之后，第二趟在 3600 s 的 Job 界上被杀，一行都没留下。
-const DRILL_PASS_BUDGET_ENV: &str = "COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS";
-/// 没配 env 时单趟的预算。数与 values.yaml 的 `backup.drillPassBudgetSeconds`
-/// 同源，由 `deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh`
-/// 盯着两边与 Job 界的关系。
-// cap: bound — 与 Job 的界同源，由 backup-drill-budget-covers-both-passes 那个测试盯着两边的关系
-const DRILL_PASS_BUDGET_DEFAULT_SECS: u64 = 3600;
+/// 判据从「这一趟总共用了多久」换成「当前这一步静默了多久」：一趟开得慢不是问题，
+/// 一步卡住不动才是。旧的那个数是整趟的钟，它杀的是**还在一步一步往前走**的运行
+/// ——2026-10-27 实测：第一趟 2271 s 之后，第二趟在 3600 s 的整趟界上被杀，账上
+/// 一行都没留下。现在同样的运行只要每一步都在推进就不被杀；被杀的那一趟一定停在
+/// 某一步上，判词点名是哪一步、静默了多久。
+const DRILL_STEP_SILENCE_ENV: &str = "COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS";
+/// 没配 env 时那一步的静默界。数与 values.yaml 的 `backup.drillStepSilenceSeconds`
+/// 同源，由 `deploy/scripts/tests/backup-jobs-stop-on-silence.test.sh` 盯着两边。
+// cap: override — 一步能走多久没有实测样本；沿用被替换掉的整趟预算 3600 s，判据从「整趟时长」换成「单步静默」后只会更宽
+const DRILL_STEP_SILENCE_DEFAULT_SECS: u64 = 3600;
 const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
 const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 
@@ -1716,6 +1716,9 @@ fn tighten_one_surface(dir: &Path) -> std::io::Result<()> {
 }
 
 pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // 开工先记一拍：容器外的存活探针从这一刻起就有东西可读，这一跑在导出、快照这些
+    // 不印日志的段里也一直「在动」。
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
     std::fs::create_dir_all(&cfg.backup_dir)?;
     let now = Utc::now();
     let staging_name = package_name(now)
@@ -1975,14 +1978,17 @@ async fn finish_backup(
     let key = crate::backup_crypto::PackageKey::from_env();
     match run_backup_into(cfg, staging, key.is_some()).await {
         Ok(manifest) => {
+            cog_core::progress::beat(BACKUP_PROGRESS_TASK);
             // 覆盖清单在打包之前算：它说的是「这个包**该有**什么」，而清单是包内
             // 唯一那份声明。打包之后就算不出来了——staging 已经删掉。
             let coverage = package_coverage(&manifest);
             let manifest_json = serde_json::to_string_pretty(&manifest)?;
             std::fs::write(staging.join(MANIFEST_FILE), format!("{manifest_json}\n"))?;
             let package = cfg.backup_dir.join(package_name(now));
+            cog_core::progress::beat(BACKUP_PROGRESS_TASK);
             tar_package_with_key(staging, staging_name, &package, key.as_ref())?;
             std::fs::remove_dir_all(staging)?;
+            cog_core::progress::beat(BACKUP_PROGRESS_TASK);
             let deleted = enforce_retention(&cfg.backup_dir, cfg.keep_count);
             if let Some(dir) = &cfg.offsite_dir {
                 copy_offsite(dir, &package, cfg.keep_count);
@@ -2054,9 +2060,11 @@ async fn run_backup_into(
     // 数据是什么时候被取走的」，不是「这一跑什么时候开始」。
     let mut segments = Vec::new();
     let pool = PgPool::connect(&cfg.database_url).await?;
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
     let postgres = backup_postgres(&pool, &staging.join(PACKAGE_PG_DIR)).await?;
     segments.push(segment_stamp("postgres"));
 
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
     let qdrant = QdrantHttp::new(&cfg.qdrant_http_url)?;
     let qdrant_dir = staging.join(QDRANT_DIR);
     std::fs::create_dir_all(&qdrant_dir)?;
@@ -2065,6 +2073,7 @@ async fn run_backup_into(
         collections.push(qdrant.snapshot_collection(&name, &qdrant_dir).await?);
     }
     segments.push(segment_stamp("qdrant"));
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
 
     // 对象层：备份进程只拿到 `data_dir`，读不到 `providers.storage.options.base_path`，
     // 所以按约定找 `<data_dir>/storage`。约定之外的部署——chart 默认的 seaweedfs 把对象
@@ -2077,8 +2086,10 @@ async fn run_backup_into(
         None => (0, 0),
     };
     segments.push(segment_stamp("objects"));
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
     let artifacts = collect_artifacts(cfg, staging, Some(&pool)).await?;
     segments.push(segment_stamp("artifacts"));
+    cog_core::progress::beat(BACKUP_PROGRESS_TASK);
 
     // 进化 bare 仓：它不在数据根里，是独立的一卷，所以单独打成 git bundle。
     // 打包失败不让整次备份失败——没有 bundle 的包仍然救得回其余全部状态，而
@@ -3936,9 +3947,10 @@ pub struct DrillConfig {
     /// 只开最新那份证明不了保留窗口的其余成员：旧包与读端不同步的问题只在它们
     /// 身上出现，而它们要到真正需要恢复的那天才第一次被打开。
     pub also_unproven: bool,
-    /// 单趟预算：一份包从解包到对数完最多花多久。到点由这一跑自己收尾并落一行
-    /// `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟写不出任何东西。
-    pub pass_budget: Duration,
+    /// 一步静默多久算停。到点由这一跑自己收尾并落一行 `failed`，判词点名停在
+    /// 哪一步、静默了多久——而不是等 kubelet 的存活探针把容器杀掉，那样账上一行
+    /// 都不会有。整趟不受这条界约束：只要每一步都在推进，跑多久都行。
+    pub step_silence: Duration,
 }
 
 impl DrillConfig {
@@ -3963,26 +3975,26 @@ impl DrillConfig {
             migrations_dir: cog_storage::migrate::migrations_dir(&app_dir),
             package,
             also_unproven,
-            pass_budget: pass_budget_from_env(),
+            step_silence: step_silence_from_env(),
         })
     }
 }
 
-/// 单趟预算：`COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS`，没配或读不成数就用默认值。
+/// 一步的静默界：`COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS`，没配或读不成数就用默认值。
 ///
 /// 读不成数不报错：一个拼错的 env 让演练整场起不来，比让它按默认值跑一趟更坏——
 /// 起不来的那一晚，账上没有任何一行说为什么。
-fn pass_budget_from_env() -> Duration {
-    pass_budget_from(std::env::var(DRILL_PASS_BUDGET_ENV).ok().as_deref())
+fn step_silence_from_env() -> Duration {
+    step_silence_from(std::env::var(DRILL_STEP_SILENCE_ENV).ok().as_deref())
 }
 
 /// 解析那一格。`None`、空串、零、非数一律落到默认值：这四种写法在这里是同一件事
 /// （没给出可用的界），而它们各自的来历留给读 env 的人，不该让演练从此起不来。
-fn pass_budget_from(raw: Option<&str>) -> Duration {
+fn step_silence_from(raw: Option<&str>) -> Duration {
     let secs = raw
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
-        .unwrap_or(DRILL_PASS_BUDGET_DEFAULT_SECS);
+        .unwrap_or(DRILL_STEP_SILENCE_DEFAULT_SECS);
     Duration::from_secs(secs)
 }
 
@@ -4678,6 +4690,66 @@ fn read_offsite_observation(dir: &Path) -> Option<OffsiteObservation> {
     }
 }
 
+/// 演练在进度面上的名字。容器里的看门狗与容器外的存活探针读的是同一串拍子，
+/// 两处的名字也必须是同一个：改一处而漏另一处，差别只是日志里少一个可对上的标识。
+const DRILL_PROGRESS_TASK: &str = "backup-drill";
+/// 备份那一跑在进度面上的名字。
+const BACKUP_PROGRESS_TASK: &str = "backup";
+
+/// 演练里「这一步还在动」的拍子。
+///
+/// 判据是**当前这一步静默了多久**，不是这一趟总共用了多久：一趟开得慢不是问题，一步
+/// 卡住不动才是。每一步开工时记一次，静默超过界就由这一跑自己收尾并落一行，判词点名
+/// 是哪一步。
+///
+/// 它同时就是进度文件的那一拍：容器外的存活探针读的是同一个「刚过去了一步」，所以
+/// 两处不会一个说在动、一个说停了。
+struct PassWatch {
+    current: std::sync::Mutex<StepClock>,
+}
+
+struct StepClock {
+    step: &'static str,
+    since: Instant,
+}
+
+impl PassWatch {
+    fn new(first: &'static str) -> Self {
+        Self {
+            current: std::sync::Mutex::new(StepClock {
+                step: first,
+                since: Instant::now(),
+            }),
+        }
+    }
+
+    /// 记一步。名字是**静默时判词要点名的那一个**，所以它写的是这一步在干什么，
+    /// 不是承载它的函数名。
+    fn step(&self, name: &'static str) {
+        *self.current.lock().unwrap_or_else(|p| p.into_inner()) = StepClock {
+            step: name,
+            since: Instant::now(),
+        };
+        cog_core::progress::beat(DRILL_PROGRESS_TASK);
+    }
+
+    fn silent_for(&self) -> (&'static str, Duration) {
+        let current = self.current.lock().unwrap_or_else(|p| p.into_inner());
+        (current.step, current.since.elapsed())
+    }
+
+    /// 等到当前这一步静默超过 `window`，返回（哪一步，静默了多久）。
+    async fn silent_past(&self, window: Duration) -> (&'static str, Duration) {
+        loop {
+            tokio::time::sleep(cog_core::progress::WATCH_TICK).await;
+            let (step, silent) = self.silent_for();
+            if silent > window {
+                return (step, silent);
+            }
+        }
+    }
+}
+
 /// 演练：把一个包装进空库，读它装成了什么。
 ///
 /// 失败不返回 `Err` 而是落进 `error`：一次演练的失败是要**被记录下来**的结果，
@@ -4771,40 +4843,53 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         drill.credential_violations_state_dir = credential_violations_in(dir);
     }
 
-    // 一趟有界：到点就把这一趟收尾并落一行，而不是等 Job 的界把进程杀掉。后者
-    // 账上什么都不留——「被杀」于是读作「没跑过」，而 Job 面只看见一个 DeadlineExceeded，
-    // 说不出是哪一份包、走到哪一步、预算多少。
-    // 先落进一个变量再 match：`match timeout(...).await` 的临时量活到整个 match
-    // 结束，`drill` 的独占借用于是跟着活到每一个分支里。
-    let outcome =
-        tokio::time::timeout(cfg.pass_budget, drill_once(cfg, live, packages, &mut drill)).await;
-    match outcome {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => drill.error = Some(scrub_error(&e.to_string(), &cfg.database_url)),
-        Err(_) => {
-            mark_pass_timed_out(&mut drill, cfg.pass_budget);
-            // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份照着包大小
-            // 铺开的残库不该留到明晚：删不掉也只是警告，那本来就是下一趟的第一次开工。
-            if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
-                tracing::warn!(error = %e, "演练超时的临时库没删掉，下一次开工时会再删一次");
-            }
+    // 判的是**这一步静默了多久**，不是这一趟花了多久。到点由这一跑自己收尾并落
+    // 一行，判词点名停在哪一步；而不是等 kubelet 的探针把容器杀掉——那样账上什么都
+    // 不留，「被杀」于是读作「没跑过」，集群面只看见一个重启计数，说不出是哪一份包。
+    let watch = PassWatch::new("开工");
+    let outcome = tokio::select! {
+        done = drill_once(cfg, live, packages, &mut drill, &watch) => Some(done),
+        (step, silent) = watch.silent_past(cfg.step_silence) => {
+            mark_pass_silent(&mut drill, step, silent, cfg.step_silence);
+            None
         }
+    };
+    if outcome.is_none() {
+        // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份照着包大小
+        // 铺开的残库不该留到明晚：删不掉也只是警告，那本来就是下一趟的第一次开工。
+        if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
+            tracing::warn!(error = %e, "演练停在一步上，临时库没删掉，下一次开工时会再删一次");
+        }
+    }
+    match outcome {
+        Some(Ok(())) => {}
+        Some(Err(e)) => drill.error = Some(scrub_error(&e.to_string(), &cfg.database_url)),
+        None => {}
     }
     drill.finished_at = Utc::now();
     drill
 }
 
-/// 一趟超时之后写到那一行上的结论。
+/// 一步静默超过界之后写到那一行上的结论。
 ///
-/// 单独成函数是为了让它可测：这一行的判词决定读数面能不能把「被杀」与「没跑过」
+/// 单独成函数是为了让它可测：这一行的判词决定读数面能不能把「停在某一步」与「没跑过」
 /// 分开，而它不该靠一次真的挂住的演练来验证。`outcome` 由 `error.is_some()` 推出，
 /// 所以这里只写错误文本、并把已经量到的读数留在原处。
-fn mark_pass_timed_out(drill: &mut BackupDrillRecord, budget: Duration) {
+///
+/// 判词必须点名**哪一步**：整趟的钟到期时读的人只知道「花了很久」，而一步的钟到期
+/// 是一条可以直接去查的线索——卡在「恢复」与卡在「解包」是两件修法完全不同的事。
+fn mark_pass_silent(
+    drill: &mut BackupDrillRecord,
+    step: &str,
+    silent: Duration,
+    window: Duration,
+) {
     drill.error = Some(format!(
-        "这一趟 {} 秒（{DRILL_PASS_BUDGET_ENV}）没有跑完就收尾了。本行其余读数是走到那一步\
-         之前量到的：表数与行数为空 ＝ 还没走到对数那一段，不是零张表。界由这一跑自己拿着，\
-         因为 Job 的 activeDeadlineSeconds 到点是把进程杀掉——那样账上一行都不会有。",
-        budget.as_secs(),
+        "这一趟停在「{step}」上，那一步已经 {} 秒没有推进（界 {} 秒，{DRILL_STEP_SILENCE_ENV}）。\
+         本行其余读数是走到那一步之前量到的：表数与行数为空 ＝ 还没走到对数那一段，不是零张表。\
+         整趟不受时长约束——它在每一步都推进的时候不会被收尾。",
+        silent.as_secs(),
+        window.as_secs(),
     ));
 }
 
@@ -4900,7 +4985,11 @@ async fn drill_once(
     live: &PgPool,
     packages: Vec<PathBuf>,
     drill: &mut BackupDrillRecord,
+    watch: &PassWatch,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 每一步开工先记一拍：静默界量的是「这一步多久没推进」，而判词要点名的是
+    // 这一步在干什么。名字写在这里，与 `PassWatch::step` 的文档是同一件事。
+    watch.step("核最新那份包");
     // 问的是卷上最新那份，不是这一趟打开的：轮换窗口里旧包本来就是明文，点名去开
     // 一份旧包不能替最新那份回答「写端到底用没用口令」。
     if let Some(newest) = packages.last() {
@@ -4922,6 +5011,7 @@ async fn drill_once(
             return Err(reason.into());
         }
     }
+    watch.step("选这一趟要开的包");
     let package = choose_package(&packages, cfg.package.as_deref())
         .map_err(|e| format!("{}：{e}", cfg.backup_dir.display()))?;
     // `outcome=ok` 只说明这一趟跑完了，「读到的是老包」也能 ok。没点名时的默认
@@ -4958,10 +5048,12 @@ async fn drill_once(
     }
 
     // 解包先做：包本身坏了要在这里停，不能等到把库删了再发现。
+    watch.step("解包");
     let extract_root = std::env::temp_dir().join(format!("cogneva-drill-{}", uuid::Uuid::new_v4()));
     let tree = TempTree(extract_root.clone());
     let pkg_dir = untar_package(&package, &extract_root)?;
 
+    watch.step("读清单");
     let manifest: BackupManifest =
         serde_json::from_str(&std::fs::read_to_string(pkg_dir.join(MANIFEST_FILE))?)?;
     tracing::info!(
@@ -4972,15 +5064,18 @@ async fn drill_once(
     );
     // 名字说这是哪一晚的包，内容也得这么说。这一条不读 outcome：它问的是「开的是
     // 不是这一份」，而一套把旧包改名当成新包的流程每一晚都会 ok。
+    watch.step("对账本：包名是不是那一跑的");
     if let Some(reason) = package_belongs_to_its_run(live, &name, &manifest.created_at).await? {
         return Err(reason.into());
     }
     // 名字对上了还不够：盘上这串字节也得还是写它那一跑交给卷的那一串。一条能解开的
     // 包也可能已经不是原件——坏块、截断补零、被同名文件覆盖，恢复时会以数据不对的形式
     // 暴露，而不是以「包坏了」的形式。
+    watch.step("核校验和");
     if let Some(reason) = package_checksum_mismatch(live, &name, &package).await? {
         return Err(reason.into());
     }
+    watch.step("按清单核产物");
     // 清单说这个包里有什么，此刻盘上是事实。这一段覆盖的是 qdrant 与对象层：
     // 它们不进空库，能核的就是「清单声明的字节与文件数是不是真的在包里」。
     verify_package_against_manifest(&pkg_dir, &manifest)?;
@@ -5005,6 +5100,7 @@ async fn drill_once(
     // 清不掉上一趟的残库时，这一趟其实**连包都没打开**：报出来的话要说「开工
     // 没开始」，不能说成「这个包装不回去」。两件事的修法差得很远——一处是清理，
     // 一处是包——而一句「演练没有证明这个包可恢复」会把前者写成后者。
+    watch.step("建空库");
     drop_scratch_database(live, DRILL_DATABASE)
         .await
         .map_err(|e| format!("上一趟演练的临时库清不掉，这一趟没有开工：{e}"))?;
@@ -5019,7 +5115,9 @@ async fn drill_once(
     drill.restore_target = Some(endpoint_of(&scratch_url));
     tracing::info!(database = DRILL_DATABASE, "drill: scratch database created");
 
-    let result = restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill).await;
+    watch.step("恢复并逐表对数");
+    let result = restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill, watch).await;
+    watch.step("删临时库");
     // 无论成败都把库删掉：留着它下一次会先删，但磁盘里那份 1 GB 的残库会一直在。
     if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
         tracing::warn!(error = %e, "drill: 临时库没删掉，下一次演练开工时会再删一次");
@@ -5291,13 +5389,15 @@ async fn restore_and_compare(
     pkg_dir: &Path,
     manifest: &BackupManifest,
     drill: &mut BackupDrillRecord,
+    watch: &PassWatch,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 表结构必须由**这个镜像**的迁移建出来：恢复只做 TRUNCATE + COPY，目标是
     // 一个跑完迁移的空库。改用模板库复制会更快，但那要求源库上没有别的连接——
     // 而源库此刻正被整个平台用着。
-    // 四段的耗时各记一行：这个数随时间涨（库在长），而「一趟多少秒」是一个总数，
-    // 读的人分不出是迁移、建结构、灌数据还是逐表对数长出来的。界（单趟预算）到点
-    // 时日志里最后一行就是走到哪一段，比在账上写一句「超时了」多一个坐标。
+    // 四段各记一拍、各记一行耗时：这个数随时间涨（库在长），而「一趟多少秒」是
+    // 一个总数，读的人分不出是迁移、建结构、灌数据还是逐表对数长出来的。这一步
+    // 静默到界时，账上点名的是这四段里的哪一段，比一句「停了」多一个坐标。
+    watch.step("恢复：跑迁移");
     let phase = std::time::Instant::now();
     cog_storage::migrate::Migrator::new(&cfg.migrations_dir)
         .run(scratch_url)
@@ -5311,6 +5411,7 @@ async fn restore_and_compare(
     let migrations_done = phase.elapsed();
 
     let scratch = PgPool::connect(scratch_url).await?;
+    watch.step("恢复：建 store 表");
     // 迁移只建得出迁移文件里有的表；各 store 首次启动时自己建的那批表也要先建，
     // 否则下一段的 COPY 会在第一张缺失的表上失败——那是镜像建不出自己的结构，
     // 不是包不可恢复。
@@ -5326,6 +5427,7 @@ async fn restore_and_compare(
     if !pg_dir.exists() {
         return Err("包里没有 pg 段，这次演练无表可恢复".into());
     }
+    watch.step("恢复：灌数据");
     let restore_started = std::time::Instant::now();
     let restored = restore_postgres(&scratch, &pg_dir).await?;
     tracing::info!(
@@ -5357,6 +5459,7 @@ async fn restore_and_compare(
 
     // 逐表把「装回来几行」与清单声明比。比对的是**这个镜像的结构装得下的那批表**：
     // 被迁移删掉的表由上面的读数点名，它们的行数无从比，也不该被算成"没装上"。
+    watch.step("逐表对数");
     let compare_started = std::time::Instant::now();
     let without_a_home: std::collections::HashSet<&str> = restored
         .tables_without_a_home
@@ -5456,6 +5559,7 @@ fn scrub_error(text: &str, database_url: &str) -> String {
 
 /// `cogneva backup`：CronJob 与手动共用入口。
 pub async fn run_backup_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    cog_core::progress::start_progress_file();
     let cfg = BackupConfig::from_env()?;
     let package = run_backup(&cfg).await?;
     println!("{}", package.display());
@@ -5468,6 +5572,9 @@ pub async fn run_backup_from_env() -> Result<(), Box<dyn std::error::Error>> {
 /// 用，但两者都要有——只落库不退出非零，集群面看不到这次失败；只退出非零不落库，
 /// 读数面看不到为什么。
 pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    // 开工就把进度文件建出来：容器外的存活探针在第一步完成之前读到的只能是「还没
+    // 开始」，而它没有别的办法把「还没开始」与「一直没开始」分开。
+    cog_core::progress::start_progress_file();
     let cfg = DrillConfig::from_env()?;
     let live = PgPool::connect(&cfg.database_url).await?;
     let store = PostgresBackupRunStore::new(live.clone());
@@ -5719,23 +5826,31 @@ mod tests {
             artifact_errors: Vec::new(),
             error: None,
         };
-        mark_pass_timed_out(&mut drill, Duration::from_secs(3600));
-        let error = drill.error.as_ref().expect("超时的那一趟必须有错误文本");
-        // 判词要能回答「界是多少」，否则读的人只能去翻部署清单。
+        mark_pass_silent(
+            &mut drill,
+            "恢复：灌数据",
+            Duration::from_secs(5000),
+            Duration::from_secs(3600),
+        );
+        let error = drill.error.as_ref().expect("停在一步上的那趟必须有错误文本");
+        // 判词要能回答「哪一步、静默多久、界是多少」：整趟的钟到期时读的人只知道
+        // 「花了很久」，而这三个数是可以直接去查的线索。
+        assert!(error.contains("恢复：灌数据"), "错误文本没点名哪一步：{error}");
+        assert!(error.contains("5000"), "错误文本没写静默了多久：{error}");
         assert!(error.contains("3600"), "错误文本没写界：{error}");
         // 而且它必须让这一行读作 failed：面读数按 outcome 取行，不按过程猜。
-        assert!(!drill.ok(), "超时的行被判成了成功");
+        assert!(!drill.ok(), "停在一步上的行被判成了成功");
     }
 
     /// 界读不成数时按默认值跑，而不是让整场演练起不来——起不来的那一晚，
     /// 账上连一行说「为什么」的都没有。
     #[test]
-    fn a_budget_that_cannot_be_read_falls_back_instead_of_stopping_the_drill() {
-        let default = Duration::from_secs(DRILL_PASS_BUDGET_DEFAULT_SECS);
+    fn a_silence_window_that_cannot_be_read_falls_back_instead_of_stopping_the_drill() {
+        let default = Duration::from_secs(DRILL_STEP_SILENCE_DEFAULT_SECS);
         for raw in [None, Some(""), Some("  "), Some("0"), Some("ten")] {
-            assert_eq!(pass_budget_from(raw), default, "raw={raw:?}");
+            assert_eq!(step_silence_from(raw), default, "raw={raw:?}");
         }
-        assert_eq!(pass_budget_from(Some(" 900 ")), Duration::from_secs(900));
+        assert_eq!(step_silence_from(Some(" 900 ")), Duration::from_secs(900));
     }
 
     #[test]

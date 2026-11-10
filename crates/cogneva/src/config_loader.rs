@@ -285,14 +285,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.schema_repair_interval_secs".into(),
     );
     m.insert(
-        "COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS".into(),
-        "self_evolution.test_timeout_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS".into(),
-        "self_evolution.build_timeout_secs".into(),
-    );
-    m.insert(
         "COGNEVA_SELF_EVOLUTION_WORKSPACES_ROOT".into(),
         "self_evolution.workspaces.root".into(),
     );
@@ -389,12 +381,16 @@ fn default_env_mappings() -> HashMap<String, String> {
         "system.loop_restart_backoff_floor_secs".into(),
     );
     m.insert(
-        "COGNEVA_TOOL_TIMEOUT_SECS".into(),
-        "system.tool_timeout_secs".into(),
+        "COGNEVA_GRPC_RECONNECT_INTERVAL_SECS".into(),
+        "system.grpc_reconnect_interval_secs".into(),
     );
     m.insert(
-        "COGNEVA_SHELL_TIMEOUT_SECS".into(),
-        "system.shell_timeout_secs".into(),
+        "COGNEVA_PROBE_TIMEOUT_SECS".into(),
+        "system.probe_timeout_secs".into(),
+    );
+    m.insert(
+        "COGNEVA_HTTP_TIMEOUT_SECS".into(),
+        "system.http_timeout_secs".into(),
     );
     m.insert(
         "COGNEVA_PARTITION_MAINTENANCE_INTERVAL_SECS".into(),
@@ -424,10 +420,6 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert(
         "COGNEVA_NOTIFICATION_LIMIT".into(),
         "gateway.notification_limit".into(),
-    );
-    m.insert(
-        "COGNEVA_SANDBOX_TASK_TIMEOUT_SECS".into(),
-        "gateway.sandbox_task_timeout_secs".into(),
     );
     m.insert(
         "COGNEVA_REQUEST_TIMEOUT_SECS".into(),
@@ -2033,7 +2025,6 @@ mod tests {
             context_window_size: 8192,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 300,
             memory_api_base: None,
             // Only the fields that map onto RuntimeConfig are asserted below;
             // these are carried to complete the literal.

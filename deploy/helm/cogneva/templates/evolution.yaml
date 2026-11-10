@@ -179,6 +179,10 @@ metadata:
     app.kubernetes.io/component: evolution
 spec:
   replicas: {{ .Values.evolution.replicas }}
+  # 显式写出来：不写时生效的是 API 的默认 600 秒，同一个界在清单上看不见，
+  # 读者就以为这一版没被时长判过。它到点只写一条状态条件、不杀 Pod，仓库里也没
+  # 有代码拿那条条件做决定；这个字段本身去不掉（不写还是同一个默认值）。
+  progressDeadlineSeconds: {{ .Values.evolution.progressDeadlineSeconds }}
   strategy:
     type: Recreate
   selector:

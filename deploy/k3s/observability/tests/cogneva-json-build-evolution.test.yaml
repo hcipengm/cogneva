@@ -34,7 +34,6 @@ rule_files:
 # rule: evolution_queue_has_more_than_one_executor
 # rule: evolution_queue_not_draining
 # rule: evolution_resident_index_outlives_its_changes
-# rule: evolution_change_flight_over_budget
 
 evaluation_interval: 1m
 
@@ -42,7 +41,7 @@ tests:
   # 一套健康的构建与进化面：闸开着（两条槽）、四条宿主读数都在发布、拒绝五次（界 12）、
   # 槽只持有十秒（预算六十秒）、没有预留过期、续约断档一分钟、缓存没超、回收没停、
   # 进化没有失败、学习复现只在前两档、队列正好一个执行者、没有积压、常驻索引比变更少、
-  # 在飞时间在预算内。十六条全静。
+  # 在飞中。十五条全静。
   - interval: 1m
     input_series:
       - series: 'cogneva_build_gate_ceiling{dir="/work",role="builder",dimension="cpu"}'
@@ -99,8 +98,6 @@ tests:
         values: '10x60'
       - series: 'cogneva_evolution_change_flight_seconds{dir="/work"}'
         values: '100x60'
-      - series: 'cogneva_evolution_change_flight_budget_seconds{dir="/work"}'
-        values: '600x60'
     alert_rule_test:
       - eval_time: 60m
         alertname: build_gate_host_readings_unpublished
@@ -146,9 +143,6 @@ tests:
         exp_alerts: []
       - eval_time: 60m
         alertname: evolution_resident_index_outlives_its_changes
-        exp_alerts: []
-      - eval_time: 60m
-        alertname: evolution_change_flight_over_budget
         exp_alerts: []
 
   # 闸在，但宿主读数一条都没发布：`host_readings_unpublished` 亮。拒绝一小时涨了十三次、
@@ -292,8 +286,6 @@ tests:
         values: '5x60'
       - series: 'cogneva_evolution_change_flight_seconds{dir="/work"}'
         values: '900x60'
-      - series: 'cogneva_evolution_change_flight_budget_seconds{dir="/work"}'
-        values: '600x60'
     alert_rule_test:
       - eval_time: 60m
         alertname: evolution_build_failed
@@ -319,12 +311,6 @@ tests:
               dir: /work
       - eval_time: 60m
         alertname: evolution_resident_index_outlives_its_changes
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              dir: /work
-      - eval_time: 60m
-        alertname: evolution_change_flight_over_budget
         exp_alerts:
           - exp_labels:
               severity: warning

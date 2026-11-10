@@ -1,7 +1,7 @@
 # 恢复演练 CronJob：把最新一个备份包装进一个跑完迁移的**空库**，逐表对数、
 # 把账行与源库逐格比，然后把库删掉，答案落进 `backup_drills`。
 #
-# 与 chart 的 `backup.drillSchedule` / `drillDeadlineSeconds` 同值；改这里就是
+# 与 chart 的 `backup.drillSchedule` / `drillStepSilenceSeconds` 同值；改这里就是
 # 改那一份，两边由 field-level parity 门禁对齐。
 apiVersion: batch/v1
 kind: CronJob
@@ -25,10 +25,9 @@ spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
       backoffLimit: 0
       # 一次演练开两份包：最新那份，加窗口里最久没被证明的那份（`--also-unproven`
-      # 第二趟只挑一份）。这个界必须大于**两份的单趟预算之和**，见 chart values 里
-      # `drillDeadlineSeconds` 的注释：2026-10-27 实测单包已长到 2271 s，3600 s 的界
-      # 让第二趟被杀，账上一行都不留。单趟预算 3600 × 2 ＋ 600 余量 = 7800。
-      activeDeadlineSeconds: 7800
+      # 第二趟只挑一份）。这里曾经是 activeDeadlineSeconds——它杀的是「这一趟跑了
+      # 多久」，2026-10-27 实测单包已长到 2271 s，3600 s 的界让第二趟被杀，账上一行
+      # 都不留。判停改由存活探针按进度文件做：一步都不推进超过窗口才判死。
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -74,19 +73,33 @@ spec:
               # 最新那份 ＋ 窗口里最久没被成功打开过的一份；只开最新证明不了
               # 保留窗口的其余成员。
               args: ["backup-drill", "--also-unproven"]
+              # 判停读的是这个文件：判的是「还在不在推进」，两趟一共跑多久不参与。
+              livenessProbe:
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - >-
+                      f="$COGNEVA_PROGRESS_FILE"; if [ -z "$f" ] || [ ! -f "$f" ]; then
+                      echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
+                      age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
+                      echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
+                periodSeconds: 30
+                failureThreshold: 3
+                initialDelaySeconds: 120
               env:
                 - name: TZ
                   value: "Asia/Shanghai"
+                - name: COGNEVA_PROGRESS_FILE
+                  value: /var/run/cogneva-progress/beat
                 - name: COGNEVA_LOKI_ENABLED
                   value: "true"
                 - name: COGNEVA_LOKI_ENDPOINT
                   value: "http://loki.monitoring.svc.cluster.local:3100"
-                # 单趟预算：一份包从解包到对数完。到点由这一跑自己收尾并落一行
-                # `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟账上
-                # 一行都不留，「被杀」于是读作「没跑过」。与 jobTemplate 的
-                # activeDeadlineSeconds 是一对，关系由
-                # deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh 盯。
-                - name: COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS
+                # 一步的静默界：任何一步静默超过它，由这一跑自己收尾并落一行
+                # `failed`，判词点名停在哪一步。整趟不受它约束。两处同一个数由
+                # deploy/scripts/tests/backup-jobs-stop-on-silence.test.sh 盯。
+                - name: COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS
                   value: "3600"
                 - name: BACKUP_PASSWORD
                   valueFrom:
@@ -123,7 +136,11 @@ spec:
                 - name: offsite-state
                   mountPath: /offsite-state
                   readOnly: true
+                - name: progress
+                  mountPath: /var/run/cogneva-progress
           volumes:
+            - name: progress
+              emptyDir: {}
             - name: backup
               persistentVolumeClaim:
                 claimName: cogneva-backup-pvc

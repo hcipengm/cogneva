@@ -91,15 +91,20 @@ pub(crate) fn git_bin_from_env() -> PathBuf {
 /// 为什么判"静默"而不是判"总时长"：这条链路的故障形态是**传了几 MB 之后彻底
 /// 没声**，而 `git clone`/`fetch` 带 `--progress` 的进度输出是秒级的——静默 N 秒
 /// 就等于"没有进展"。用总时长判会把"链路慢"和"链路死"压成同一个结论，而这两种
-/// 情况该做的事相反：慢要等，死要立刻换通道。总时长上限另外设一层（见下）。
-// cap: bound — 静默判据的默认值：慢要等、死要立刻换通道，总时长上限另设一层
+/// 情况该做的事相反：慢要等，死要立刻换通道。这条是这里**唯一**会杀东西的判据；
+/// 总时长那一个数只负责在超点时登一行读数（见下）。
+// cap: bound — 静默判据的默认值：慢要等、死要立刻换通道；这是本模块唯一会杀进程的判据
 const DEFAULT_MIRROR_STALL_SECS: u64 = 180;
 /// 静默判死的下限。允许部署面调小，但不允许小到把正常传输误杀。
 // cap: bound — 静默判死的下限；部署面可调小，但不许小到把正常传输误杀
 const MIRROR_STALL_FLOOR_SECS: u64 = 30;
-/// 单次 clone/fetch/push 的总时长上限（秒）。沉默判死之外再压一层，防的是另一种
-/// 形态：远端**一直在吐进度却永远不结束**——那样静默判据永远不触发，只看总时长。
-// cap: bound — 总时长上限；专治「远端一直在吐进度却永不结束」，那种形态静默判据永远不触发
+/// 单次 clone/fetch/push **预期**要跑多久（秒）。过了这个点登一行告警，然后继续等。
+///
+/// 它从来不是「到点就杀」的刀。曾经是：那时它治的是「远端一直在吐进度却永远不
+/// 结束」。可一个还在吐进度的传输就是在干活——按钟把它切断，作废的是已经传了一半
+/// 的对象，下一次从头再传一遍。真正说得出口的判据是**静默**（[`DEFAULT_MIRROR_STALL_SECS`]）：
+/// 没有新字节才是「没在动」。这个数现在只负责让「慢」在读数面上不隐形。
+// cap: bound — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的传输
 const DEFAULT_MIRROR_OP_TIMEOUT_SECS: u64 = 1800;
 // cap: bound — lowest the deployment may set the operation timeout to; below it a large legitimate fetch is cut
 const MIRROR_OP_TIMEOUT_FLOOR_SECS: u64 = 60;
@@ -134,7 +139,7 @@ pub(crate) struct GitMirrorConfig {
     pub git_bin: PathBuf,
     /// 传输静默多久判死。
     pub stall: std::time::Duration,
-    /// 单次传输的总时长上限。
+    /// 单次传输**预期**多久；过了只登一行读数，不杀。
     pub op_timeout: std::time::Duration,
 }
 
@@ -744,15 +749,20 @@ impl GitExec {
         (self.cfg.stall / 4).clamp(MIRROR_WATCHDOG_MIN_INTERVAL, MIRROR_WATCHDOG_MAX_INTERVAL)
     }
 
-    /// 跑一条 git 命令，并把它的执行**封顶**。
+    /// 跑一条 git 命令，等到它自己结束。
     ///
-    /// `watch_stall` 只对会打进度的子命令（clone/fetch/push）为真——那些命令的
-    /// stderr 是"还在动"的证据；`show-ref` 这类瞬时命令沉默不代表卡住，只看总上限。
+    /// 两条判据，判的都不是「跑了多久」：
     ///
-    /// 超时必须**杀进程组**：SSH 兜底是一条 `git → sh → ssh → 远端` 的链，只杀
-    /// 直接子进程会留下还在往镜像里写 pack 的孙进程（上一次事故里 `git index-pack`
-    /// 在父进程死后又活了十几分钟，下一次 refresh 与它抢同一个对象库）。所以子
-    /// 进程自己成组，超时对整组发 SIGKILL。
+    /// - `watch_stall` 为真的子命令（clone/fetch/push）打进度到 stderr，那份输出
+    ///   是「还在动」的证据；超过静默窗一个字节都没有，才判传输已死。
+    /// - [`Self::op_timeout`] 只是**预期**：过了这个点发一行告警，接着等。它从来不
+    ///   是「到点就杀」的刀——远端还在吐字节的时候把它切断，作废的是已经下了一半
+    ///   的 pack，下一次还得从头再来。
+    ///
+    /// 唯一会杀进程组的是**静默判死**那一条，而它杀的时候必须**杀整组**：SSH 兜底
+    /// 是一条 `git → sh → ssh → 远端` 的链，只杀直接子进程会留下还在往镜像里写
+    /// pack 的孙进程（上一次事故里 `git index-pack` 在父进程死后又活了十几分钟，
+    /// 下一次 refresh 与它抢同一个对象库）。
     async fn bounded(
         &self,
         args: &[&str],
@@ -772,6 +782,10 @@ impl GitExec {
         let err_task = tokio::spawn(read_tail(stderr, last_output.clone()));
         let mut wait_task = tokio::spawn(async move { child.wait().await });
 
+        // 过了预期工期只登一次读数：这条传输还在跑，而一条还在跑的传输不是一条该被
+        // 收走的传输。重复说会把日志刷成一片，一条不说又让「慢」在读数面上隐形。
+        let mut aged_reported = false;
+
         let verdict: Result<std::process::ExitStatus, String> = loop {
             tokio::select! {
                 res = &mut wait_task => {
@@ -787,11 +801,14 @@ impl GitExec {
                 }
                 _ = tokio::time::sleep(self.watchdog_interval()) => {
                     let total = started.elapsed();
-                    if total >= self.cfg.op_timeout {
-                        break Err(format!(
-                            "git {label} 超过总上限 {}s 仍未结束（判为传输不收敛，已杀进程组）",
-                            self.cfg.op_timeout.as_secs()
-                        ));
+                    if total >= self.cfg.op_timeout && !aged_reported {
+                        aged_reported = true;
+                        tracing::warn!(
+                            action = %label,
+                            expected_secs = self.cfg.op_timeout.as_secs(),
+                            elapsed_secs = total.as_secs(),
+                            "git 传输超过了预期的工期仍在跑；继续等它自己结束，不按钟收走"
+                        );
                     }
                     let idle = last_output.lock().unwrap().elapsed();
                     if watch_stall && idle >= self.cfg.stall {
@@ -1877,30 +1894,36 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
+    /// 一直在吐进度、但跑得比**预期工期**久的传输：等它跑完，不按钟收走。
+    ///
+    /// 这条钉的是一个已经被拆掉的行为：从前这里有一条「总时长上限」，到点对整组发
+    /// SIGKILL，理由写的是「远端一直在吐进度却永不结束」。可一个还在吐进度的传输就
+    /// 是在干活——把它切断，作废的是已经传了一半的对象，下一次从头再传一遍，而它
+    /// 未必就传得完。真正的反面形态是**没声**，那一条由静默判据管（见
+    /// `silent_transfer_is_killed_along_with_its_whole_process_group`）。
     #[tokio::test]
-    async fn chatty_but_endless_transfer_hits_the_total_ceiling() {
+    async fn a_chatty_transfer_outliving_its_expectation_is_still_waited_on() {
         let tmp = tempfile::tempdir().unwrap();
-        // 反面形态：远端一直在吐进度却永不结束。静默判据永远不触发，只有总上限
-        // 拦得住——少了这层，一个"一直在动但推不完"的传输就能把写锁占死。
+        // 约两秒，预期工期只给一秒：过点之后它仍在输出，于是必须继续等。
         let fake = write_fake_git(
             tmp.path(),
             "i=0\n\
-             while [ $i -lt 400 ]; do\n\
+             while [ $i -lt 20 ]; do\n\
              \techo \"remote: Receiving objects: $i%\" >&2\n\
-             \tsleep 0.2\n\
+             \tsleep 0.1\n\
              \ti=$((i+1))\n\
-             done",
+             done\n\
+             exit 0",
         );
         let t = test_transport(tmp.path(), fake, DEFAULT_SSH_BASE.into(), 5, 1);
 
         let started = std::time::Instant::now();
-        let err = refresh_retrying_text_busy(&t)
+        refresh_retrying_text_busy(&t)
             .await
-            .expect_err("总上限必须拦下永不结束的传输");
-        assert!(err.contains("总上限"), "错误应说清是总上限: {err}");
+            .expect("一直在输出的传输过了预期工期也不该被杀");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(8),
-            "总上限 1s，判死不该拖这么久: {:?}",
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "传输该被等到自己结束（约两秒），但 {:?} 就回来了：它被按钟收走了",
             started.elapsed()
         );
     }

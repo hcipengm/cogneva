@@ -303,8 +303,6 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // Snapshot config values to drop immutable borrow before publishing.
         let (
             hook_change_dir,
-            tool_timeout_secs,
-            shell_timeout_secs,
             nats_config,
             hook_engine_config,
             agent_config,
@@ -314,8 +312,6 @@ impl cog_core::SystemPlugin for AgentPlugin {
             let config = ctx.config();
             (
                 cog_core::config::self_evolution_hook_dir(&config.self_evolution.change_dir),
-                config.system.tool_timeout_secs,
-                config.system.shell_timeout_secs,
                 config.dag_executor.nats.clone(),
                 config.hook_engine.clone(),
                 config.agent.clone(),
@@ -421,9 +417,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // ── ToolRegistry ──
         let tool_registry = Arc::new(
             crate::ToolRegistry::new()
-                .with_wasm_timeout(tool_timeout_secs)
-                .with_shell_timeout(shell_timeout_secs)
-                .with_sandbox_backend(sandbox_backend.clone())
+                .with_sandbox_backend(sandbox_backend)
                 .with_guardrail(guardrail)
                 .with_plugin_registry(plugin_registry)
                 .with_require_identity(require_tool_identity),
@@ -471,7 +465,6 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 // 的答案取决于调用者自己那棵树，在本进程跑就等于读一份与调用者
                 // 无关的源码。后端在交给注册表时克隆了一份，这里再拿一份。
                 sandbox_backend: Some(sandbox_backend.clone()),
-                shell_timeout: Some(std::time::Duration::from_secs(shell_timeout_secs)),
             },
         );
         info!(
@@ -530,7 +523,6 @@ impl cog_core::SystemPlugin for AgentPlugin {
             context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: agent_loop_config.final_draft_timeout_secs,
             skill_config: None,
             crew_id: None,
             squad_id: None,

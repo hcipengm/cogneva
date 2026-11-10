@@ -33,7 +33,9 @@ spec:
     spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
       backoffLimit: 0
-      activeDeadlineSeconds: 7800
+      # 同备份：这里曾经是 `activeDeadlineSeconds`——它杀的是「这一趟跑了多久」，
+      # 而两趟演练在某些夜晚的总时长本来就会超过任何一个固定的钟。判停改由存活
+      # 探针读进度文件：一步都不推进超过窗口才判死（见容器上那一格）。
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -80,6 +82,24 @@ spec:
               # 最新那份 ＋ 窗口里最久没被成功打开过的一份：只开最新证明不了保留
               # 窗口的其余成员，而旧包与读端不同步的问题只在旧包上出现。
               args: ["backup-drill", "--also-unproven"]
+              # 同备份：探针读的是这一跑写下的进度文件，判的是「还在不在推进」。
+              # 窗内一步都不推进才判死；两趟一共跑多久不参与判断。
+              livenessProbe:
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - >-
+                      f="$COGNEVA_PROGRESS_FILE"; if [ -z "$f" ] || [ ! -f "$f" ]; then
+                      echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
+                      age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
+                      echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
+                
+                periodSeconds: 30
+                
+                failureThreshold: 3
+                
+                initialDelaySeconds: 120
               env:
                 - name: TZ
                   value: "Asia/Shanghai"
@@ -87,11 +107,12 @@ spec:
                   value: "true"
                 - name: COGNEVA_LOKI_ENDPOINT
                   value: "http://loki.monitoring.svc.cluster.local:3100"
-                # 单趟预算：一份包从解包到对数完。到点由这一跑自己收尾并落一行
-                # `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟账上
-                # 一行都不留，「被杀」于是读作「没跑过」。与
-                # `jobTemplate.spec.activeDeadlineSeconds` 是一对。
-                - name: COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS
+                - name: COGNEVA_PROGRESS_FILE
+                  value: /var/run/cogneva-progress/beat
+                # 一步的静默界：解包、核清单、建空库、恢复、对数……任何一步静默
+                # 超过它，由这一跑自己收尾并落一行 `failed`，判词点名停在哪一步。
+                # 整趟不受这条界约束——每一步都在推进时跑多久都行。
+                - name: COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS
                   value: "3600"
                 # 这一处连的是**cog_backup**，一个只带 CREATEDB 的受限角色：演练要在
                 # 同一台服务器上 `CREATE DATABASE` 一个一次性库，所以不能是 `cog_app`
@@ -136,7 +157,11 @@ spec:
                 - name: offsite-state
                   mountPath: /offsite-state
                   readOnly: true
+                - name: progress
+                  mountPath: /var/run/cogneva-progress
           volumes:
+            - name: progress
+              emptyDir: {}
             - name: backup
               persistentVolumeClaim:
                 claimName: cogneva-backup-pvc

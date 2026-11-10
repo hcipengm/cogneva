@@ -300,24 +300,25 @@ impl GitOpsPuller {
         self
     }
 
-    async fn run(
-        &self,
-        program: &str,
-        args: &[&str],
-        dir: Option<&Path>,
-        timeout_secs: u64,
-    ) -> SFResult<String> {
+    /// 判的是它还在不在产出，不是它跑了多久。`git clone` 冷拉一个仓库可以安静地忙
+    /// 很久，而一份卡死的拉取与它在那条按秒的界眼里是同一个读数。
+    async fn run(&self, program: &str, args: &[&str], dir: Option<&Path>) -> SFResult<String> {
         let cmdline = format!("{} {}", program, args.join(" "));
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args).kill_on_drop(true);
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
-        let fut = cmd.output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let output = match cog_core::progress::run_child_watched(cmd, &cmdline).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} 停住了：{silent:?} 没有输出、也没有消耗 CPU，比这份部署见过的\
+                     任何一次「还在干活」的两次推进之间的最长间隔都长（{window:?}）；已杀掉"
+                )))
+            }
+            Err(e) => return Err(SFError::IO(format!("failed to run {program}: {e}"))),
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::IO(format!("{cmdline} failed: {stderr}")));
@@ -345,7 +346,6 @@ impl GitOpsPuller {
                         &self.config.branch,
                     ],
                     None,
-                    60,
                 )
                 .await?;
             if probe.is_empty() {
@@ -365,40 +365,30 @@ impl GitOpsPuller {
                     ".",
                 ],
                 Some(&dir),
-                300,
             )
             .await?;
         } else {
-            self.run(
-                "git",
-                &["fetch", "origin", &self.config.branch],
-                Some(&dir),
-                120,
-            )
-            .await?;
+            self.run("git", &["fetch", "origin", &self.config.branch], Some(&dir))
+                .await?;
             self.run(
                 "git",
                 &["reset", "--hard", &format!("origin/{}", self.config.branch)],
                 Some(&dir),
-                60,
             )
             .await?;
         }
         // tag 也要拉（promote tag 带 level 元数据）。
-        self.run("git", &["fetch", "--tags", "--force"], Some(&dir), 120)
+        self.run("git", &["fetch", "--tags", "--force"], Some(&dir))
             .await?;
-        self.run("git", &["rev-parse", "HEAD"], Some(&dir), 30)
-            .await
+        self.run("git", &["rev-parse", "HEAD"], Some(&dir)).await
     }
 
     /// 从 HEAD 上的 promote tag 解析晋级候选；无 tag 返回 None。
     pub async fn candidate_at_head(&self) -> SFResult<Option<PromotionCandidate>> {
         let dir = self.work_dir();
-        let head = self
-            .run("git", &["rev-parse", "HEAD"], Some(&dir), 30)
-            .await?;
+        let head = self.run("git", &["rev-parse", "HEAD"], Some(&dir)).await?;
         let tags = self
-            .run("git", &["tag", "--points-at", &head], Some(&dir), 30)
+            .run("git", &["tag", "--points-at", &head], Some(&dir))
             .await?;
         let Some(tag) = tags
             .lines()
@@ -411,7 +401,6 @@ impl GitOpsPuller {
                 "git",
                 &["tag", "-l", "--format=%(contents)", tag],
                 Some(&dir),
-                30,
             )
             .await?;
         let (change_id, level, eval_summary) = parse_tag_message(&message);
@@ -523,7 +512,6 @@ impl GitOpsPuller {
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        60,
                     )
                     .await;
             }
@@ -553,7 +541,6 @@ impl GitOpsPuller {
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        60,
                     )
                     .await;
             }
@@ -570,7 +557,6 @@ impl GitOpsPuller {
                         "20s",
                     ],
                     None,
-                    40,
                 )
                 .await;
             match status {
@@ -596,7 +582,6 @@ impl GitOpsPuller {
                             &k,
                             &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                             None,
-                            60,
                         )
                         .await;
                     let _ = self
@@ -604,7 +589,6 @@ impl GitOpsPuller {
                             &k,
                             &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
                             None,
-                            120,
                         )
                         .await;
                     self.ledger
@@ -625,7 +609,6 @@ impl GitOpsPuller {
                     &k,
                     &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                     None,
-                    60,
                 )
                 .await;
             let _ = self
@@ -633,7 +616,6 @@ impl GitOpsPuller {
                     &k,
                     &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
                     None,
-                    120,
                 )
                 .await;
             self.ledger
@@ -673,7 +655,6 @@ impl GitOpsPuller {
                     "jsonpath={.spec.paused}",
                 ],
                 None,
-                30,
             )
             .await?;
         Ok(out.trim() == "true")
@@ -696,7 +677,6 @@ impl GitOpsPuller {
                     "jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas}",
                 ],
                 None,
-                30,
             )
             .await?;
         let parts: Vec<&str> = out.split_whitespace().collect();
@@ -727,7 +707,6 @@ impl GitOpsPuller {
                     &query,
                 ],
                 None,
-                30,
             )
             .await?;
         crate::deployment_image::container_image(
@@ -759,7 +738,6 @@ impl GitOpsPuller {
                     "json",
                 ],
                 None,
-                60,
             )
             .await?;
         Ok(rs_history_holds_image(
@@ -904,7 +882,6 @@ impl GitOpsPuller {
                 "git",
                 &["diff", "--name-only", "HEAD~1", "HEAD"],
                 Some(&dir),
-                30,
             )
             .await?;
 
@@ -918,7 +895,7 @@ impl GitOpsPuller {
         for file in changed.lines() {
             if file == config_manifest {
                 let content = self
-                    .run("git", &["show", &format!("HEAD:{file}")], Some(&dir), 30)
+                    .run("git", &["show", &format!("HEAD:{file}")], Some(&dir))
                     .await?;
                 // The document on the left of the comparison is only there to say
                 // which sections moved. A file that the parent commit does not
@@ -926,7 +903,7 @@ impl GitOpsPuller {
                 // changed: the direction is a rollout too many, never a change
                 // that stays inert.
                 let previous = self
-                    .run("git", &["show", &format!("HEAD~1:{file}")], Some(&dir), 30)
+                    .run("git", &["show", &format!("HEAD~1:{file}")], Some(&dir))
                     .await
                     .unwrap_or_default();
                 restart_sections = cog_core::config_sections::sections_needing_restart_on_change(
@@ -986,7 +963,6 @@ impl GitOpsPuller {
                 "git",
                 &["ls-tree", "-r", "--name-only", "HEAD", "deploy/k3s"],
                 Some(&dir),
-                30,
             )
             .await?;
 
@@ -996,7 +972,7 @@ impl GitOpsPuller {
                 continue;
             }
             let Ok(text) = self
-                .run("git", &["show", &format!("HEAD:{path}")], Some(&dir), 30)
+                .run("git", &["show", &format!("HEAD:{path}")], Some(&dir))
                 .await
             else {
                 // One unreadable manifest must not stop the roll: the workload it
@@ -1029,7 +1005,6 @@ impl GitOpsPuller {
                         &body,
                     ],
                     None,
-                    60,
                 )
                 .await?;
                 rolled.push(name);
@@ -1060,13 +1035,12 @@ impl GitOpsPuller {
                 "git",
                 &["ls-tree", "-r", "--name-only", "HEAD", "prompts/"],
                 Some(&dir),
-                30,
             )
             .await?;
         let mut count = 0usize;
         for rel in listed.lines() {
             let content = self
-                .run("git", &["show", &format!("HEAD:{rel}")], Some(&dir), 30)
+                .run("git", &["show", &format!("HEAD:{rel}")], Some(&dir))
                 .await?;
             let dest = staging.join(rel.trim_start_matches("prompts/"));
             if let Some(parent) = dest.parent() {
@@ -1094,7 +1068,6 @@ impl GitOpsPuller {
                     "yaml",
                 ],
                 None,
-                60,
             )
             .await?;
         let applied = self.kubectl_apply_stdin(&create).await;
@@ -1166,7 +1139,7 @@ impl GitOpsPuller {
         let k = self.config.kubectl_bin.clone();
 
         // 金丝雀节奏：maxSurge=1,maxUnavailable=0 → 新副本先起、旧副本不动。
-        self.run(&k, &canary_strategy_patch_args(&n, d), None, 60)
+        self.run(&k, &canary_strategy_patch_args(&n, d), None)
             .await?;
         // 换镜像之前记下本部署已在跑的副本。此后新出现的副本才是候选，
         // 看护要观测的是它。拿不到这份名单就整轮关掉指标闸门（readiness 与
@@ -1189,7 +1162,6 @@ impl GitOpsPuller {
                 &format!("{c}={image}"),
             ],
             None,
-            60,
         )
         .await?;
         // 起第一个新副本后立即暂停，进入看护。"already paused" 容忍：
@@ -1201,7 +1173,6 @@ impl GitOpsPuller {
                 &k,
                 &["-n", &n, "rollout", "pause", &format!("deployment/{d}")],
                 None,
-                60,
             )
             .await
         {
@@ -1219,7 +1190,6 @@ impl GitOpsPuller {
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        60,
                     )
                     .await
                 {
@@ -1255,7 +1225,6 @@ impl GitOpsPuller {
                             &k,
                             &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                             None,
-                            60,
                         )
                         .await;
                     let _ = self
@@ -1263,7 +1232,6 @@ impl GitOpsPuller {
                             &k,
                             &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
                             None,
-                            120,
                         )
                         .await;
                     self.mark_rolled_back(candidate, &format!("rollout after canary: {e}"))
@@ -1293,7 +1261,6 @@ impl GitOpsPuller {
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        60,
                     )
                     .await;
                 let _ = self
@@ -1301,7 +1268,6 @@ impl GitOpsPuller {
                         &k,
                         &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
                         None,
-                        120,
                     )
                     .await;
                 self.mark_rolled_back(candidate, &format!("canary regression: {e}"))
@@ -1333,7 +1299,6 @@ impl GitOpsPuller {
                 "git",
                 &["diff", "--name-only", "HEAD~1", "HEAD"],
                 Some(&self.work_dir()),
-                30,
             )
             .await?;
         Ok(changed.lines().any(|f| f.starts_with(prefix)))
@@ -1546,7 +1511,6 @@ impl GitOpsPuller {
                     "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
                 ],
                 None,
-                30,
             )
             .await?;
         if out.trim().is_empty() {
@@ -1570,7 +1534,11 @@ impl GitOpsPuller {
         url: &str,
     ) -> SFResult<Option<(CanarySignals, CounterSemantics, HistogramSnapshot)>> {
         let body = self
-            .run("curl", &["-sf", "--max-time", "10", url], None, 15)
+            .run(
+                "curl",
+                &["-sf", "--speed-limit", "1", "--speed-time", "10", url],
+                None,
+            )
             .await?;
         Ok(Some(parse_prometheus_signals(&body)))
     }
@@ -1638,7 +1606,6 @@ impl GitOpsPuller {
                     "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.status.podIP}{\"\\n\"}{end}",
                 ],
                 None,
-                30,
             )
             .await?;
         Ok(out

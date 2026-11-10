@@ -181,6 +181,8 @@ mod backup_retention_is_counted_not_dated;
 mod board_wip_limit_wiring_test;
 #[path = "boot_phase_marks_contract_test.rs"]
 mod boot_phase_marks_contract_test;
+#[path = "bounds_registry_test.rs"]
+mod bounds_registry_test;
 #[path = "builtin_tools_have_one_list.rs"]
 mod builtin_tools_have_one_list;
 #[path = "capability_declarations_are_enumerated.rs"]

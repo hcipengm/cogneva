@@ -35,20 +35,13 @@ pub const DATA_ROOT_ENV: &str = "COG_EVAL_DATA_ROOT";
 pub const SKIP_NEEDS_VISION: &str =
     "the backbone cannot see images, so the case would be a blind guess";
 
-/// 一例最多允许跑多久。
+/// 看门狗多久看一次「这一例还在不在动」。
 ///
-/// 这个数是**读数的尽头**，不是给快例打分的界。逐例推进的一跑里，「很久没有新结果」
-/// 在没有单例上界时是一个二义的量：正在算一道慢题，与挂在一次永远不会返回的等待上，
-/// 印出来的是同一条平线。2026-10-18/19 实测过一次——checkpoint 从 21:13Z 起约
-/// 15 分钟/例地往上加，23:00 之后 55 分钟一行没加，而那个进程 21:44Z 就已经 exit 1
-/// 了。当时能拿到的只有这条平线，分不出「有东西在等」与「已经没人了」。有了单例上界，
-/// 同一件事收在一处可读的结局上：判完，或者记为出错。
-///
-/// 取得宽是有意的：那道慢题实测约 15 分钟/例，上界比它高一倍，才不会把「慢」判成「挂」——
-/// 判错的方向是把还算得出来的题丢掉。它也**不按基准变**：一列一个界，两列的 `errored`
-/// 数就不再是同一件事的数。
-// cap: bound — 最慢那例实测约 15 分钟，取两倍是为了不把「慢」判成「挂」；判错的代价是丢掉一道还算得出来的题
-pub const DEFAULT_CASE_TIMEOUT: Duration = Duration::from_secs(1800);
+/// 这是**读取周期**，不是判据：判据是实测的静默窗口（`cog_core::progress::stall`），
+/// 这一拍只决定多久去看一眼，只能让判词晚到，不会让它变宽或变窄。所以它不必与
+/// 任何实测量对齐。
+// cap: fixed — 读取周期，不是界；界是 cog_core::progress 按实测步间隔算出来的窗口
+const STALL_POLL: Duration = Duration::from_secs(1);
 
 /// 一次实验的配置。
 #[derive(Debug, Clone)]
@@ -93,14 +86,6 @@ pub struct RunConfig {
     /// 把 base64 塞进题面顶上：那不是喂图，是把一段模型读不了的字节每一步重发一次
     /// （2026-10-19 实测，七道带图题吃掉整张表 91.5% 的 token）。
     pub vision: bool,
-    /// 一例最多允许跑多久，从进环境之后算到判词回来。
-    ///
-    /// **不是 `Option`，所以「这次跑有没有单例上界」不是一个可以从配置里消失的问题**——
-    /// 类型本身就挡掉了「忘了给界」这种写法。这与 `max_concurrency` 的不给默认值是同
-    /// 一条道理的两面：那个界少了会让一次跑把无主的宿主当成自己的，这个界少了会让
-    /// 「一直平着」这条读数分不出慢与挂。默认值 `DEFAULT_CASE_TIMEOUT` 是一个宽界，
-    /// 报表的 `## pins` 段写着这一跑实际用的是多少。
-    pub case_timeout: Duration,
 }
 
 /// 检查点的落点与它的身份。
@@ -571,7 +556,6 @@ impl RunConfig {
             // 与上面那个 `None` 不同，这里给一个默认值不是「替调用方定界」而是**兜底**：
             // 少一个上界会让「一例卡住」在报表上与「一例在算」同形，而没有哪个值会宽到
             // 让这件事重新变得可读。要更紧的界就在命令行上写，报表会照着写。
-            case_timeout: DEFAULT_CASE_TIMEOUT,
         }
     }
 
@@ -1000,8 +984,6 @@ impl Rig {
         log: Option<Arc<CheckpointLog>>,
     ) -> anyhow::Result<SeedScore> {
         let started = Instant::now();
-        // 取一份到手上：例子里那个 `async move` 拿不到 `&self`，而上界对整跑是同一个数。
-        let case_timeout = self.config.case_timeout;
         // 有效并发 ＝ min(列的隔离上界, 闸门此刻的界, 静态名额)：两个界都给就都要拿到票。
         // 名单个半区各自可能缺席，`run` 已经保证不会两个都缺席。
         let admission = self.config.admission.clone();
@@ -1048,8 +1030,11 @@ impl Rig {
             // 每例一个自己的计数器，不读共享的那个：同一列的例子是并发跑的，
             // 前后取全局差值会把邻例的请求算进这一例。
             let calls = Arc::new(AtomicU64::new(0));
-            let llm: Arc<dyn LlmClient> =
-                Arc::new(CountingLlm::new(self.llm.clone(), calls.clone()));
+            let llm: Arc<dyn LlmClient> = Arc::new(CountingLlm::new(
+                self.llm.clone(),
+                calls.clone(),
+                case.id.clone(),
+            ));
             let env_provider = bench.env.clone();
             let toolkit = bench.tools.clone();
             let judge = bench.judge.clone();
@@ -1117,23 +1102,35 @@ impl Rig {
                         },
                     }
                 };
-                // 走到这里之后才把次数填上：上面每一个提前 `return` 都在问模型之前，
-                // 它们的 `None`（没走到）与这里的 `Some(0)`（问了零次）不是同一件事。
-                // 超时的那一例也一样填：界到之前已经问过的次数是可读的，丢掉它反而让
-                // 「卡在上游的哪一步」这条线索跟着没了。
-                let mut outcome = match tokio::time::timeout(case_timeout, solved_and_judged).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => CaseOutcome::errored(
-                        &case,
-                        format!(
-                            "the case was still running after {}s: a case that never returns \
-                             and a case that is merely slow print the same flat line until \
-                             something bounds the clock, so this one is recorded as an error \
-                             instead of as a verdict",
-                            case_timeout.as_secs()
-                        ),
-                    ),
+                // 一例的结局由它**自己的进展**决定，不由钟决定（2026-11-10 删掉
+                // `case_timeout`）。判据读的是 `cog_core::progress::stall`：上一次动是
+                // 什么时候，以及这份部署实测过的最长步间隔是多少。两者都有才判——
+                // 量不到窗口时它返回 `None`，于是不判：「这一跑还没跑够步数去量」与
+                // 「这一例停住了」在判据上分开，而不是折成一个没人量过的秒数。
+                //
+                // 一拍在哪里算：外壳每发一次上游请求就是一次 `beat`（见 `CountingLlm`），
+                // 起跑那一刻也记一次。所以「一直很慢但在问模型」的例不会被判，
+                // 「问完就不再动」的例会。
+                cog_core::progress::beat(&case.id);
+                let mut solved = std::pin::pin!(solved_and_judged);
+                let mut outcome = loop {
+                    tokio::select! {
+                        outcome = &mut solved => break outcome,
+                        _ = tokio::time::sleep(STALL_POLL) => {
+                            if let Some((silent, window)) = cog_core::progress::stall(&case.id) {
+                                break CaseOutcome::errored(
+                                    &case,
+                                    format!(
+                                        "the case stopped moving: no step for {:?}, and this \
+                                         deployment has ever seen between steps is {:?}",
+                                        silent, window
+                                    ),
+                                );
+                            }
+                        }
+                    }
                 };
+                cog_core::progress::forget(&case.id);
                 outcome.requests = Some(calls.load(Ordering::Relaxed));
                 // 判分读完之后才回收：回收早了判分就没有现场了。
                 env.teardown().await;
@@ -1259,16 +1256,26 @@ impl CaseOutcome {
 struct CountingLlm {
     inner: Arc<dyn LlmClient>,
     calls: Arc<AtomicU64>,
+    case_id: String,
 }
 
 impl CountingLlm {
-    fn new(inner: Arc<dyn LlmClient>, calls: Arc<AtomicU64>) -> Self {
-        Self { inner, calls }
+    fn new(inner: Arc<dyn LlmClient>, calls: Arc<AtomicU64>, case_id: String) -> Self {
+        Self {
+            inner,
+            calls,
+            case_id,
+        }
     }
 
     /// 数的是**发出去的请求**，不是内容：外壳自己决定问几次、带什么，这里只记次数。
+    ///
+    /// 每一次请求同时也是这一例「还在动」的一拍：看门狗读的静默窗口只认这个信号。
+    /// 没有这一拍，删掉逐例的钟之后就没有任何东西能分开「慢题」与「挂住」——
+    /// 而那是这一条判据存在的全部理由。
     fn counted(&self) {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        cog_core::progress::beat(&self.case_id);
     }
 }
 
@@ -1530,7 +1537,6 @@ mod tests {
                 checkpoint: None,
                 admission: None,
                 vision: false,
-                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         )
     }
@@ -1580,7 +1586,6 @@ mod tests {
                 checkpoint: None,
                 admission: None,
                 vision: false,
-                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         )
     }
@@ -1613,7 +1618,6 @@ mod tests {
                         checkpoint: None,
                         admission: None,
                         vision,
-                        case_timeout: DEFAULT_CASE_TIMEOUT,
                     },
                 )
                 .with_scaffold(Arc::new(AlwaysRight))
@@ -1741,17 +1745,22 @@ mod tests {
         assert!(cell.per_seed[0].failures[0].1.contains("upstream refused"));
     }
 
-    /// 一例跑过界是**一个可读的结局**，不是一条一直平着的线。
+    /// 一例停住是**一个可读的结局**，而且判它的是一条量出来的窗口，不是一个声明的秒数。
     ///
-    /// 两半判据：这一跑必须回来（外层 `timeout` 兜住，不回来就是红），并且那一例在
-    /// `errored` 里带着界自己的秒数——「超过 N 秒」里的 N 若不出现在产物里，读的人
-    /// 分不出它是被界挡下的还是自己失败的。分母不缩水也在这一格里：界挡下的那题
-    /// 记成**没过**，不是记成没跑。
+    /// 这一格在没有这次改动时的判据不同（旧代码按 `case_timeout` 掐），但两边都要求
+    /// 同一件事：这一跑必须回来，并且那一例在 `errored` 里说得清自己是被谁判的。
+    /// 现在说的是「多久没动、这份部署实测过的最长步间隔是多少」——两个数都来自读数，
+    /// 所以读的人能复算它，而不是只能相信一个常数。
     ///
-    /// 反证的方向：把 `run_seed` 里那层 `tokio::time::timeout` 拿掉，这一跑不再回来，
-    /// 外层 5 秒到点后断在「the run must come back」。
+    /// 窗口在这里由测试钉住：`seed_gaps_for_tests` 铺 1000 个 1 秒间隔 ⇒ 最长步间隔 = 1s。
+    /// 造得出窗口是这条判据的前提——没有它，`stall` 一律返回 `None`，一例永远不会被判，
+    /// 那正是「量不到」与「停住」必须分开的那个区别。
+    // 用真实时间：静默窗口读的是 `std::time::Instant`（`cog_core::progress` 里那一个），
+    // 暂停时钟只动 tokio 的定时器，不动它。窗口铺成 50ms，看门狗一拍 1s，所以这一格
+    // 大约一秒多判完，外层 5 秒的兜底仍然在。
     #[tokio::test]
-    async fn a_case_that_never_returns_is_an_error_naming_its_bound() {
+    async fn a_case_that_stops_moving_is_an_error_naming_the_measured_window() {
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::from_millis(50), 1000);
         let rig = Rig::new(
             Arc::new(NeverCalled),
             RunConfig {
@@ -1762,7 +1771,6 @@ mod tests {
                 checkpoint: None,
                 admission: None,
                 vision: false,
-                case_timeout: std::time::Duration::from_secs(1),
             },
         )
         .with_scaffold(Arc::new(NeverReturns));
@@ -1777,11 +1785,15 @@ mod tests {
         assert_eq!(
             cell.errored(),
             1,
-            "the case past the bound is an error, not a verdict"
+            "the case that stopped moving is an error, not a verdict"
         );
         assert_eq!(cell.stat().mean, 0.0, "it counts in the denominator");
         let detail = &cell.per_seed[0].failures[0].1;
-        assert!(detail.contains("still running after 1s"), "{detail}");
+        assert!(detail.contains("stopped moving"), "{detail}");
+        assert!(
+            detail.contains("between steps is 50ms"),
+            "判词里没带上量出来的窗口，读的人无法复算这次判定：{detail}"
+        );
     }
 
     /// 一个环境永远起不来的基准：整列都是 0。
@@ -1922,7 +1934,6 @@ mod tests {
                 checkpoint: Some(cp),
                 admission: None,
                 vision: false,
-                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         )
     }
@@ -2018,7 +2029,6 @@ mod tests {
                 checkpoint: None,
                 admission,
                 vision: false,
-                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         )
         .with_scaffold(Arc::new(AlwaysRight))
@@ -2394,7 +2404,6 @@ mod tests {
                 checkpoint: Some(checkpoint_at(&path, "run-1")),
                 admission: None,
                 vision: false,
-                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         );
         rig.with_scaffold(Arc::new(AsksTwice))

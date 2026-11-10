@@ -38,26 +38,14 @@ const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 
 /// How long a filed work item may stay open when its submitter names no budget.
 ///
-/// The row default is sized for one dispatched round; a work item is carried by
-/// an employee whose turn includes thinking, tool calls and possibly a peer's
-/// answer, and the over-budget sweep fails the row by age rather than by
-/// liveness. A caller that knows better states its own number.
-// cap: bound — 一件活能挂多久；不设的话接活的人活得比行久，行会先被判死
-const DEFAULT_WORK_ITEM_TIMEOUT_SECS: u64 = 3600;
-
-/// Default wall for one WASM tool call. The guest is somebody else's code: a
-/// module that never returns has to come back to the caller as a failure, so
-/// the bound is short — a compute-shaped tool that legitimately needs longer
-/// asks for it instead of raising this.
-// cap: bound — 计算型工具确实需要更久的话该自己报，而不是把这里调大
-const DEFAULT_WASM_TIMEOUT_SECS: u64 = 30;
-
-/// Default wall for one shell tool call. An order of magnitude above the WASM
-/// bound because the thing being timed is a build or a test run, which is
-/// expected to take minutes; what this catches is a command that wedged, not a
-/// command that works.
-// cap: fixed — 与构建侧的墙同源：这些命令本来就以分钟计，这里要抓的是卡住的命令而不是能跑的命令
-const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
+/// A row filed from a tool call carries no duration of its own.
+///
+/// The over-budget sweep compares a row's age against the declared duration on
+/// the row, and the door that files work is not where that declaration belongs:
+/// the caller naming a running time here would be a clock wearing the clothes
+/// of a task. A row filed through this path is waited on for as long as it
+/// moves; what ends it is the lease and the measured silence, not a number the
+/// tool accepts from whoever is calling.
 
 /// Real execution identity of one agent run. Carried explicitly from the
 /// actor (which knows the DAG task) through the runtime into sandbox requests,
@@ -296,10 +284,6 @@ pub struct ToolRegistry {
     sandbox_backend: Option<Arc<dyn SandboxBackend>>,
     guardrail: Option<Arc<dyn cog_core::Guardrail>>,
     plugin_registry: Option<Arc<dyn cog_core::PluginRegistry>>,
-    wasm_timeout: Duration,
-    /// Budget for shell commands. Kept apart from `wasm_timeout`: a snippet is
-    /// bounded work, a command may be a compiler run.
-    shell_timeout: Duration,
     /// When true, shell-class tools reject calls that carry no identity at all
     /// -- neither a [`ToolScope`] nor an announced caller. Evolution pods turn
     /// this on so no command can reach the executor under a synthetic identity;
@@ -321,8 +305,6 @@ impl ToolRegistry {
             sandbox_backend: None,
             guardrail: None,
             plugin_registry: None,
-            wasm_timeout: Duration::from_secs(DEFAULT_WASM_TIMEOUT_SECS),
-            shell_timeout: Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
             require_identity: false,
             calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -335,16 +317,6 @@ impl ToolRegistry {
 
     pub fn set_require_identity(&mut self, require: bool) {
         self.require_identity = require;
-    }
-
-    pub fn with_wasm_timeout(mut self, secs: u64) -> Self {
-        self.wasm_timeout = Duration::from_secs(secs);
-        self
-    }
-
-    pub fn with_shell_timeout(mut self, secs: u64) -> Self {
-        self.shell_timeout = Duration::from_secs(secs);
-        self
     }
 
     pub fn with_sandbox_backend(mut self, backend: Arc<dyn SandboxBackend>) -> Self {
@@ -393,8 +365,6 @@ impl ToolRegistry {
             sandbox_backend: self.sandbox_backend.clone(),
             guardrail: self.guardrail.clone(),
             plugin_registry: self.plugin_registry.clone(),
-            wasm_timeout: self.wasm_timeout,
-            shell_timeout: self.shell_timeout,
             require_identity: self.require_identity,
             calls: self.calls.clone(),
         }
@@ -591,7 +561,6 @@ impl ToolRegistry {
                         entry: export_name.clone(),
                     },
                     input: arguments,
-                    timeout: self.wasm_timeout,
                     limits: Default::default(),
                 };
                 let result = backend.execute(&req).await?;
@@ -640,7 +609,6 @@ impl ToolRegistry {
                                 agent_id: agent_id.clone(),
                                 payload: SandboxPayload::ReadFile { path: path.clone() },
                                 input: serde_json::json!({ "path": path }),
-                                timeout: self.shell_timeout,
                                 limits: Default::default(),
                             };
                             let mut stream = match backend.execute_stream(&req).await {
@@ -758,33 +726,6 @@ impl ToolRegistry {
                 // 而读回结果时还要用它切出调用方要的那一段。
                 let read_offset = arguments.get("offset").and_then(|v| v.as_u64());
                 let read_limit = arguments.get("limit").and_then(|v| v.as_u64());
-                // 单条命令可以自己定一堵墙；不写就用配置那一格。要的比配置大时当场
-                // 拒绝并说出上限：静默改小，调用方会以为它拿到的是自己定的那个数，
-                // 而它拿到的是一次在它没料到的时刻发生的超时。
-                let timeout = match arguments.get("timeout_seconds") {
-                    None => self.shell_timeout,
-                    Some(value) => {
-                        let secs = value.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                            cog_core::SFError::Validation(
-                                "`timeout_seconds` has to be a positive whole number of seconds"
-                                    .into(),
-                            )
-                        })?;
-                        let asked = std::time::Duration::from_secs(secs);
-                        if asked > self.shell_timeout {
-                            return Err(ToolRunError::Failed(cog_core::SFError::Validation(
-                                format!(
-                                    "timeout_seconds {secs} is longer than the {}s wall this \
-                                     process allows (system.shell_timeout_secs); raise that \
-                                     setting for a longer run -- the value is not shortened \
-                                     silently",
-                                    self.shell_timeout.as_secs()
-                                ),
-                            )));
-                        }
-                        asked
-                    }
-                };
                 let req = SandboxRequest {
                     task_id: sandbox_task_id(scope),
                     // 没有任务作用域时，执行者就是派发器公布的那一个：沙箱里的
@@ -797,7 +738,6 @@ impl ToolRegistry {
                         .unwrap_or_else(|| format!("unscoped-tool-{}", name)),
                     payload,
                     input: arguments,
-                    timeout,
                     limits: Default::default(),
                 };
                 // 背景命令：把句柄先交出去，再把流接进那本账里。这一刻起读得到
@@ -920,6 +860,60 @@ impl ToolRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tools.read().unwrap().is_empty()
+    }
+
+    /// The names in `allowed` this registry has no tool behind, in the order
+    /// they were given, each once.
+    ///
+    /// Narrowing drops these without a word; naming them is what turns "this
+    /// role has fewer tools than its skill says" from an absence into a reading.
+    pub fn missing_tools(&self, allowed: &[String]) -> Vec<String> {
+        let source = self.tools.read().unwrap();
+        let mut missing: Vec<String> = Vec::new();
+        for name in allowed {
+            if !source.contains_key(name) && !missing.contains(name) {
+                missing.push(name.clone());
+            }
+        }
+        missing
+    }
+
+    /// A registry holding only the named tools, over the same execution
+    /// machinery — sandbox backend, guardrail, plugin registry, timeouts — so
+    /// a narrowed registry runs a tool exactly as the full one would.
+    ///
+    /// This is how a role's tool boundary is enforced, and it is enforced in
+    /// both directions: the model is offered only these definitions, and a call
+    /// it invents for anything else has nothing behind it to reach. A boundary
+    /// that only hid the definitions would be a suggestion.
+    ///
+    /// A name with no tool behind it is dropped rather than refused. The list
+    /// states what the role is allowed to do; a name that matches nothing is a
+    /// stale entry in that statement, and failing to build the registry over it
+    /// would turn a tidying omission into an outage. What keeps the statement
+    /// honest is a gate over the shipped lists, not a runtime panic.
+    ///
+    /// Which is exactly why the drops have to be reportable: a gate over the
+    /// lists in the repository says nothing about which lists a running
+    /// deployment loaded. [`Self::missing_tools`] is that report.
+    pub fn restricted_to(&self, allowed: &[String]) -> Self {
+        let mut kept = HashMap::new();
+        {
+            let source = self.tools.read().unwrap();
+            for name in allowed {
+                if let Some(tool) = source.get(name) {
+                    kept.insert(name.clone(), tool.clone());
+                }
+            }
+        }
+        Self {
+            tools: Arc::new(std::sync::RwLock::new(kept)),
+            sandbox_backend: self.sandbox_backend.clone(),
+            guardrail: self.guardrail.clone(),
+            plugin_registry: self.plugin_registry.clone(),
+            require_identity: self.require_identity,
+            calls: self.calls.clone(),
+        }
     }
 
     /// 每个工具在本进程里被点过几次，按名字排。
@@ -1060,7 +1054,6 @@ mod tests {
                 web_search_fallback_base: Some("http://gateway:8081/search-fallback".into()),
                 web_fetch_base: Some("http://render:11235".into()),
                 sandbox_backend: None,
-                shell_timeout: None,
             },
         );
         let tool = registry.get("web_fetch").expect("web_fetch is a built-in");
@@ -2207,7 +2200,7 @@ mod tests {
     /// assert what the sandbox plane actually sees.
     #[derive(Default)]
     struct RecordingBackend {
-        seen: tokio::sync::Mutex<Vec<(String, String, Duration)>>,
+        seen: tokio::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait::async_trait]
@@ -2216,7 +2209,7 @@ mod tests {
             self.seen
                 .lock()
                 .await
-                .push((req.task_id.clone(), req.agent_id.clone(), req.timeout));
+                .push((req.task_id.clone(), req.agent_id.clone()));
             Ok(cog_core::SandboxResult {
                 exit_code: 0,
                 ..Default::default()
@@ -2277,24 +2270,26 @@ mod tests {
             .unwrap();
 
         let seen = backend.seen.lock().await.clone();
-        assert_eq!(
-            seen,
-            vec![(
-                "dag-task-7".into(),
-                "worker-3".into(),
-                Duration::from_secs(600)
-            )]
-        );
+        assert_eq!(seen, vec![("dag-task-7".into(), "worker-3".into())]);
     }
 
-    /// 一条命令可以自己把墙立短一点：调用方写多少，沙箱就收到多少。
+    /// 一件活没有「调用方声明它能跑多久」这一格了：判据是它还在不在动。
+    ///
+    /// 这条盯的是**入口**——工具表里那个 `timeout_seconds` 参数已删，模型照着
+    /// 旧习惯写进来时，沙箱收到的仍然只是命令本身，不会有第二个人按秒数决定
+    /// 它什么时候作废。
     #[tokio::test]
-    async fn a_command_can_name_its_own_shorter_wall() {
+    async fn a_command_carries_no_declared_wall() {
         let backend = Arc::new(RecordingBackend::default());
-        let registry = ToolRegistry::new()
-            .with_shell_timeout(600)
-            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        let registry =
+            ToolRegistry::new().with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
         cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        let schema = serde_json::to_string(&builtins::run_command().parameters).unwrap();
+        assert!(
+            !schema.contains("timeout_seconds"),
+            "工具表里不该再有一格按秒数的墙：{schema}"
+        );
 
         registry
             .execute(
@@ -2303,36 +2298,11 @@ mod tests {
             )
             .await
             .unwrap();
-
         let seen = backend.seen.lock().await;
-        assert_eq!(seen[0].2, Duration::from_secs(45), "沙箱收到的是 45 秒");
-    }
-
-    /// 比配置那一格更大时当场拒绝，并把它自己报出来。
-    ///
-    /// 静默截成配置值，调用方会以为它按自己的数在跑，然后在它没料到的时刻看到
-    /// 超时——两个数里真正生效的那个必须出现在它读得到的地方。
-    #[tokio::test]
-    async fn a_command_that_asks_for_longer_than_the_ceiling_is_refused_by_name() {
-        let backend = Arc::new(RecordingBackend::default());
-        let registry = ToolRegistry::new()
-            .with_shell_timeout(300)
-            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
-        cog_core::ToolRegistry::register(&registry, builtins::run_command());
-
-        let err = registry
-            .execute(
-                "run_command",
-                serde_json::json!({"command": "cargo build", "timeout_seconds": 900}),
-            )
-            .await
-            .expect_err("900 秒超过 300 秒的上限，应当拒绝");
-        let text = err.to_string();
-        assert!(text.contains("900"), "要说出调用方要的那个数：{text}");
-        assert!(text.contains("300"), "要说出真正生效的上限：{text}");
+        assert_eq!(seen.len(), 1);
         assert!(
-            backend.seen.lock().await.is_empty(),
-            "拒绝的命令不该已经交给沙箱"
+            matches!(&seen[0], SandboxRequest { .. }),
+            "the request is still the plain command request"
         );
     }
 
@@ -2651,26 +2621,6 @@ mod tests {
             .await
             .expect_err("没有这条命令，读它应当是失败而不是空输出");
         assert!(err.to_string().contains("cmd-doesnotexist"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn shell_commands_get_their_own_budget_not_the_wasm_one() {
-        let backend = Arc::new(RecordingBackend::default());
-        let registry = ToolRegistry::new()
-            .with_wasm_timeout(30)
-            .with_shell_timeout(600)
-            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
-        cog_core::ToolRegistry::register(&registry, builtins::run_command());
-
-        registry
-            .execute("run_command", serde_json::json!({"command": "cargo check"}))
-            .await
-            .unwrap();
-
-        let seen = backend.seen.lock().await.clone();
-        assert_eq!(seen.len(), 1);
-        // A command may be a compiler run; the WASM snippet budget cannot serve it.
-        assert_eq!(seen[0].2, Duration::from_secs(600));
     }
 
     #[tokio::test]
@@ -3044,16 +2994,7 @@ pub mod builtins {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Command to run" },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "How long this one command may run, in seconds. \
-                                        Leave it out for the configured wall \
-                                        (`system.shell_timeout_secs`). A value above that \
-                                        wall is refused with the limit named, never \
-                                        silently shortened, so build and test runs that \
-                                        need longer say so in the call"
-                    }
+                    "command": { "type": "string", "description": "Command to run" }
                 },
                 "required": ["command"]
             }),
@@ -3073,13 +3014,7 @@ pub mod builtins {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Command to run" },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "How long this command may run in total, in seconds. \
-                                        Leave it out for the configured wall; a value above \
-                                        the wall is refused with the limit named"
-                    }
+                    "command": { "type": "string", "description": "Command to run" }
                 },
                 "required": ["command"]
             }),
@@ -3184,10 +3119,6 @@ pub mod builtins {
         /// because "this process has no checkout" and "there is no search"
         /// call for different repairs.
         pub sandbox_backend: Option<Arc<dyn SandboxBackend>>,
-        /// How long one of those tools may run. `None` takes the same wall a
-        /// shell command gets, since what is being timed is the same kind of
-        /// thing: a grep over a tree, a git status, a patch.
-        pub shell_timeout: Option<Duration>,
     }
 
     /// Register every built-in tool into `registry`.
@@ -3210,12 +3141,7 @@ pub mod builtins {
         // 读树与改树的工具：它们与 `run_command` 共用同一个执行器与同一份身份
         // （agent id 选树），所以答案来自调用者自己那棵树，而不是本进程脚下的
         // 一份源码。后端缺席时照常注册、调用时报出缺的那一层。
-        let sandbox = SandboxTools::new(
-            inputs.sandbox_backend.clone(),
-            inputs
-                .shell_timeout
-                .unwrap_or_else(|| Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS)),
-        );
+        let sandbox = SandboxTools::new(inputs.sandbox_backend.clone());
         cog_core::ToolRegistry::register(registry, search_code(sandbox.clone()));
         cog_core::ToolRegistry::register(registry, grep(sandbox.clone()));
         cog_core::ToolRegistry::register(registry, glob(sandbox.clone()));
@@ -3757,11 +3683,6 @@ pub mod builtins {
                         "type": "string",
                         "description": "Returned by an earlier call: add this item to that goal \
                                         instead of starting a new one."
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "How long the row may stay open before the graph fails it \
-                                        (default 3600)."
                     }
                 },
                 "required": ["goal", "acceptance"]
@@ -4008,17 +3929,17 @@ pub mod builtins {
         // around work, not around a role.
         let goal_id = optional_label(args, "goal_id")
             .unwrap_or_else(|| format!("agent-goal-{}", uuid::Uuid::new_v4()));
-        // Zero is refused rather than read as "no limit": the over-budget sweep
-        // compares the row's age against this number, so a zero would fail the
-        // row before it ever ran while the caller read a success.
-        let timeout_seconds = match args.get("timeout_seconds") {
-            Some(value) => value.as_u64().filter(|secs| *secs > 0).ok_or_else(|| {
-                SFError::Validation(
-                    "`timeout_seconds` has to be a positive whole number of seconds".into(),
-                )
-            })?,
-            None => DEFAULT_WORK_ITEM_TIMEOUT_SECS,
-        };
+        // 这条入口不再接受一个「跑多久」。行上那个时长是这一跑的申报，不是这个
+        // 工具从调用者手里收的判词：收下来就是给一件还在动的活提前写好了死期。
+        if let Some(value) = args.get("timeout_seconds") {
+            // 参数还在被旧调用方送进来时，明确拒掉，而不是悄悄忽略——忽略会让
+            // 调用者以为自己设的界生效了。
+            let _ = value;
+            return Err(SFError::Validation(
+                "`timeout_seconds` is not accepted here: a filed row declares its own duration"
+                    .into(),
+            ));
+        }
         // The row has to land in the workspace the platform reads, and the
         // loops run in a process that is not told it by any config section it
         // owns. The deployment sets nothing, which is why the fallback is the
@@ -4042,7 +3963,6 @@ pub mod builtins {
             "id": task_id,
             "task_type": cog_core::contract::work_item::PLATFORM_AGENT_TASK,
             "input": input,
-            "timeout_seconds": timeout_seconds,
         });
         // The caller is stating the work as already decided. Without this the
         // row goes through decomposition, which would spend a planning call to
@@ -4297,12 +4217,11 @@ pub mod builtins {
     #[derive(Clone)]
     pub struct SandboxTools {
         backend: Option<Arc<dyn SandboxBackend>>,
-        timeout: Duration,
     }
 
     impl SandboxTools {
-        pub fn new(backend: Option<Arc<dyn SandboxBackend>>, timeout: Duration) -> Self {
-            Self { backend, timeout }
+        pub fn new(backend: Option<Arc<dyn SandboxBackend>>) -> Self {
+            Self { backend }
         }
     }
 
@@ -4341,7 +4260,6 @@ pub mod builtins {
             agent_id,
             payload: SandboxPayload::Command { command },
             input: serde_json::Value::Null,
-            timeout: tools.timeout,
             limits: Default::default(),
         };
         let result = backend.execute(&req).await?;
@@ -5461,7 +5379,11 @@ pub mod builtins {
             assert_eq!(row["agent_id"], "agent-abc");
             assert_eq!(row["input"]["agent_id"], "agent-abc");
             assert_eq!(row["planner"]["verified"], true);
-            assert_eq!(row["timeout_seconds"], DEFAULT_WORK_ITEM_TIMEOUT_SECS);
+            assert_eq!(
+                row.get("timeout_seconds"),
+                None,
+                "a row filed here carries no duration of its own"
+            );
             assert_eq!(body["goal_id"], filed.goal_id.as_str());
             assert!(
                 body["workspace_id"].as_str().is_some_and(|w| !w.is_empty()),
@@ -5502,17 +5424,18 @@ pub mod builtins {
             assert_eq!(filed.body["goal_id"], "7c1f0d");
         }
 
-        /// Zero would fail the row before it ran, so it is refused where the
-        /// caller can still fix it rather than queued as a success.
+        /// A duration is not the caller's to state here: the row declares its
+        /// own, and a caller that still sends one is told rather than served a
+        /// row whose number nobody will ever read.
         #[test]
-        fn a_zero_budget_is_refused_rather_than_read_as_no_limit() {
+        fn a_filing_that_still_names_a_duration_is_refused() {
             let err = filing(serde_json::json!({
                 "goal": "do the thing",
                 "acceptance": ["the thing is done"],
                 "timeout_seconds": 0,
             }))
             .err()
-            .expect("a zero budget is refused");
+            .expect("a duration is refused rather than silently dropped");
             assert!(matches!(err, SFError::Validation(_)));
         }
     }

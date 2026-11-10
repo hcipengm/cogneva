@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use cog_core::{SFError, SFResult};
 use tracing::{info, warn};
@@ -78,12 +78,6 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
     "CARGO_BUILD_JOBS",
 ];
 
-/// Default wall-clock bound on the format check. Formatted-or-not is settled by
-/// parsing every file in the workspace, which takes seconds; a run that
-/// outlives this bound is a hung `rustfmt`, not a large workspace.
-// cap: bound — 一次格式化以秒计；超过它说明 rustfmt 挂了，不是工作区大
-pub(crate) const DEFAULT_FMT_TIMEOUT_SECS: u64 = 60;
-
 /// The formatter this workspace's deployments ran while the stage was
 /// hardcoded, in the three forms the stage needs: a probe that settles whether
 /// there is a formatter to ask at all, a check that answers whether the tree is
@@ -98,26 +92,14 @@ const BUILTIN_FMT_PROBE: &[&str] = &["cargo", "fmt", "--version"];
 const BUILTIN_FMT_CHECK: &[&str] = &["cargo", "fmt", "--all", "--", "--check"];
 const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
 
-/// Wall-clock bound on one deploy admission command.
+/// 一条变更要跑几条 WebUI 准入命令：声明里通常只有一条（装依赖 + 打包）。
 ///
-/// Measured on the host that judges these changes (2026-10-17): the chart
-/// render-freshness check took 3.7s and the parity check 1.6s. The bound is
-/// two orders of magnitude above that pair on purpose — see the test-side
-/// bound's reasoning — while still being a bound: a command that outlives it
-/// is hung, and a hung command would hold the executor's only in-flight slot.
-// cap: bound — 超了就是挂住了，而挂住的命令会把执行器唯一的在飞槽占死
-const DEPLOY_ADMISSION_TIMEOUT_SECS: u64 = 300;
+/// 这是一个**条数**，不是一个时长：每一条自己按「还在不在动」判，时长来自实测
+/// 窗口（[`progress_window_secs`]）。
+const WEB_ADMISSION_RUNS_PER_CHANGE: u64 = 1;
 
-/// Wall-clock bound on one WebUI admission command.
-///
-/// The command that runs here installs the frontend dependencies and builds the
-/// bundle. A warm dependency cache makes it tens of seconds; a cold one is a
-/// registry round trip over a home connection, which is minutes. The bound sits
-/// above the cold path rather than at the warm reading: a bound that a cold
-/// cache outlives would refuse a sound change for the network it happened to
-/// run on, and the refusal reads exactly like a change that does not build.
-// cap: bound — 冷依赖缓存那趟是分钟级的下载；超了这个数说明命令挂住了
-const WEB_ADMISSION_TIMEOUT_SECS: u64 = 900;
+/// 一条变更跑几趟工具链供给（`rustup install`）。
+const TOOLCHAIN_RUNS_PER_CHANGE: u64 = 1;
 
 /// The linter this workspace's deployments ran while the stage was hardcoded.
 /// `--message-format=json` is what makes its findings comparable against the
@@ -189,20 +171,6 @@ const FMT_CMDS_PER_RUN_FMT: u64 = 4;
 /// 读当前 stable 是哪一版，CI 拿到哪一版，这一侧就是哪一版。
 const BUILTIN_TOOLCHAIN_CHECK: &[&str] = &["rustup", "check"];
 
-/// 装一份工具链要多久：按分钟算，不是按秒。
-///
-/// 它只在某个 stable 发布之后第一次判变更时跑一趟——装好之后目录就在 `RUSTUP_HOME`
-/// 里，同一个 Pod 里后续的判据直接用，不再装。所以它有自己的一份界，不挤进 60 秒的
-/// 格式化界里：把安装塞进那份额度里，额度一到安装被砍，判据又回到旧那一把上，而
-/// 症状会读成「刷新老是失败」，看起来像网络问题。
-///
-/// 这个数是量出来的下限再翻一倍：实测一份 minimal + rustfmt + clippy 的工具链（250 MB
-/// 上下，2026-11-06 那台同时跑着两份下载的机器）装上用了十几分钟。给得紧的坏处
-/// 是「装不上 ⇒ 判据仍是旧那一把 ⇒ 整条链又回到这条要修的病上」，给得松的坏处只是
-/// 停摆告警晚半小时——两边不对称，所以往松的一边取。
-// cap: bound — 一次 stable 发布装一份；装好后同一次部署里不再装
-const TOOLCHAIN_PROVISION_TIMEOUT_SECS: u64 = 1800;
-
 /// `run_cargo_fmt` 之外直接跑的格式化命令有几趟。
 ///
 /// 两趟，都在它之前：apply 之前读一次「这棵树本来就是格式化过的样子吗」，以及更早
@@ -224,29 +192,36 @@ const FMT_CMDS_OUTSIDE_RUN_FMT: u64 = 2;
 // cap: bound — apply 之后那趟，加测试、门禁、linter 三处读基线各一趟
 const FMT_RUNS_PER_CHANGE: u64 = 4;
 
-/// 一条变更在格式化这一段上最长的墙钟时间。
+/// 格式化这一段一条变更跑几趟命令：`run_cargo_fmt` 里那几趟，加外面那两趟
+/// （基线检查、定工具链的刷新）。
 ///
-/// 这一段既不被宿主构建槽约束、也不被任何单一超时约束，只能按"最多跑几趟命令"
-/// 封顶。验证循环把它加进自己声明的工期界里，所以它必须是数出来的：
 /// `the_one_change_wall_counts_every_call_site_it_names` 数着源码里的调用点守着
-/// 上面那三个数，免得加了新调用点而界还停在旧值上。
-///
-/// 工具链那一段（[`TOOLCHAIN_PROVISION_TIMEOUT_SECS`]）单独加在末尾：它不是格式
-/// 化命令，按命令条数乘出来的那份界装不下它（装一份要几分钟，一趟 `cargo fmt` 要几秒）。
-pub(crate) const FMT_SEGMENT_WALL_SECS: u64 = DEFAULT_FMT_TIMEOUT_SECS
-    * (FMT_CMDS_OUTSIDE_RUN_FMT + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT)
-    + TOOLCHAIN_PROVISION_TIMEOUT_SECS;
+/// 这几个数，免得加了新调用点而界还停在旧值上。
+pub(crate) const FMT_COMMANDS_PER_CHANGE: u64 =
+    FMT_CMDS_OUTSIDE_RUN_FMT + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT;
 
-/// 一条变更要跑几条吃**测试**预算的命令：`run_cargo_clippy` 一条，
+/// 一段活最长能持续多久：静默超过「这个部署见过的最长一步」它就已被判停、已被
+/// 杀了（`cog_core::progress::stall`），所以一段活不可能比它更长。
+///
+/// 量不到（样本还没到 `SAMPLE_FLOOR`）时退回一个看门狗周期：那时什么都判不了，
+/// 而「什么都不判」在存活读数上不能读成 0——0 会让每一轮健康的工作都越界。
+pub(crate) fn progress_window_secs() -> u64 {
+    cog_core::progress::longest_gap()
+        .map(|gap| gap.as_secs())
+        .unwrap_or(0)
+        .max(cog_core::progress::WATCH_TICK.as_secs())
+}
+
+/// 一条变更要跑几条**测试那一类**的命令：`run_cargo_clippy` 一条，
 /// `run_test_command` 两条（套件一条，测试失败后读基线失败集合再一条），
 /// 加上 linter 报了东西之后要读的那趟基线（把改动摘掉、同一条命令再跑一遍）。
-/// 最后这一条只在红的路上付，界按上界算，所以也算进来。
+/// 最后这一条只在红的路上付，租约按上界算，所以也算进来。
 // cap: bound — clippy 一条加测试命令两条，加读 linter 基线那一条
-const TEST_BUDGET_RUNS_PER_CHANGE: u64 = 4;
+const TEST_RUNS_PER_CHANGE: u64 = 4;
 
-/// 吃**构建**预算的那一条：发布构建，它的 acquire 在 `evolution_deployer` 里。
-// cap: bound — 吃构建预算的只有发布构建那一条
-const BUILD_BUDGET_RUNS_PER_CHANGE: u64 = 1;
+/// **构建那一类**里的那一条：发布构建，它的 acquire 在 `evolution_deployer` 里。
+// cap: bound — 这一类的命令只有发布构建那一条
+const BUILD_RUNS_PER_CHANGE: u64 = 1;
 
 /// 一条变更的验证最多收窄到几个包；超过就退回整棵 workspace。
 ///
@@ -256,36 +231,6 @@ const BUILD_BUDGET_RUNS_PER_CHANGE: u64 = 1;
 /// 的读数——那种时候跑整棵是更简单的那个答案。
 // cap: bound — 超过这么多个包，收窄省下的编译已经小于它多担的那层读数
 const MAX_SCOPED_PACKAGES: usize = 6;
-
-/// 读一次工作区成员清单的墙钟界。
-///
-/// `cargo metadata --no-deps` 只读清单、不编译，实测在几十毫秒量级；这个界是
-/// 「挂住了」的那条线，不是预算——一条读清单的命令卡住时，收回整棵 workspace
-/// 比等它更接近正确的判断。
-// cap: bound — 只读清单的命令卡住时宁可退回整棵 workspace
-const METADATA_TIMEOUT_SECS: u64 = 120;
-
-/// CI 那一族门禁整段活的墙钟界。
-///
-/// 工作流里那几十条判据在一个密封沙箱里逐个跑，其中一条是
-/// `deploy/scripts/check-live-services.sh`——需要真 PostgreSQL 与真 Redis 的那 64 条
-/// 检查。它是这一段的长尾：2026-11-06 实测 648 秒（热）／728 秒（冷），其余几条合计
-/// 159 秒（读源码树、读渲染产物、起 python3 与 rustup）。整段就是这两部分之和。
-///
-/// 这个界是「挂住了」的那条线，不是预算——一段门禁卡在这个数上时，判成没跑完比等它
-/// 更接近正确的判断。1800 秒按实测那一段（约 890 秒）的两倍取，与下面那次抬界同一个
-/// 倍数：量级变了，界跟着量级走。
-///
-/// 它抬过两次，两次都是同一件事：清单里多了跑得更久的东西。300 秒曾经够用，那时清单
-/// 只认得 `bash deploy/scripts/check-` 一种写法，读出来 52 条、合计 70.7 秒；认全之后
-/// 多出 python 判据、`.github/scripts/` 下的判据和两条 `--check` 只判不写的脚本，
-/// 安静时的读数到了 159 秒，界抬到 600。再抬到 1800 是因为那 64 条从工作流里挪成了
-/// 一条门禁：它们原先在 CI 里是 test job 的 64 个 step，本地一条都没跑过（命令带着包名
-/// 与测试名，被记成「这棵树给不出来」而跳过），挪过来之后本地与上游判的是同一批命令。
-/// 界只留一点几倍余量时，忙起来的宿主会把尾巴上那几条门跳掉，而跳掉只是「没问过」
-/// ——正是这一段要消灭的那种沉默。
-// cap: bound — 整段门禁卡住时宁可判成没跑完
-const REPO_GATE_STAGE_WALL_SECS: u64 = 1800;
 
 /// 一条变更跑几段门禁：判定那一段，以及红了之后读基线的那一段。
 // cap: bound — 判定一段 + 门禁失败后读基线一段
@@ -309,38 +254,28 @@ const CI_GATE_SCRIPT_MARKER: &str = "scripts/check-";
 /// 可它跑起来做的正是同一件事：把树渲染一遍，与提交的那份比。
 const CI_GATE_JUDGE_FLAG: &str = "--check";
 
-/// 一条变更上不受节拍约束的那几段活的墙钟上界——一个心跳到下一个心跳之间最长
-/// 的一段。加的是三段：
+/// 一条变更上不受节拍约束的那几段活能有多长——一个心跳到下一个心跳之间最长的
+/// 一段。加的是两块：
 ///
 /// - 每条 gated 命令各排一次宿主构建槽。闸门每次排队给的界是 `gate_wait_secs`；
-///   闸门关着（或并发上限为 0）时调用方传 0，那时 acquire 不排队。
-/// - 每条命令各吃一份自己的超时预算：`run_cargo_clippy`（判的那一趟与红了之后
-///   读基线的那一趟）与两条 `run_test_command` 吃测试预算，发布构建吃构建预算。
-/// - 门禁那一段，见 [`REPO_GATE_STAGE_WALL_SECS`]；它不排构建槽（跑的是壳脚本，
-///   不是编译器），所以只加时长、不加排队。
-/// - 格式化那一段，见 [`FMT_SEGMENT_WALL_SECS`]。
-/// - WebUI 准入那一段，见 [`WEB_ADMISSION_TIMEOUT_SECS`]。它只跑在碰
-///   `web/src/**` 的变更上，而那种变更**不跑**上面那两段 Rust 的活——两边是互斥
-///   的两条路。这里仍然加上它，因为界要覆盖的是任一种形状的最长一段，而一笔同时
-///   碰 Rust 与 WebUI 的变更在晋级门关掉时两条路都走。
+///   闸门关着时调用方传 0，那时 acquire 不排队。
+/// - 每条命令各占用一段时间。命令本身没有按秒的界了：它跑到静默超过实测窗口才被
+///   判停，所以一条命令最多占一个 [`progress_window_secs`]。段里几条命令就乘几。
 ///
 /// 谁在读它：`reflection_change_verification` 把它声明成
 /// [`cog_core::loop_health::Cadence::PeriodicWithWork`] 的工期界。**声明节拍的人
 /// 和拿这个数当存活界的人，量的必须是同一段活**——所以这里加的全是强制那几段活
 /// 的数，不是挑一个整数把规则按住。
-pub(crate) fn one_change_wall_secs(
-    gate_wait_secs: u64,
-    test_budget_secs: u64,
-    build_budget_secs: u64,
-) -> u64 {
+pub(crate) fn one_change_wall_secs(gate_wait_secs: u64) -> u64 {
     // 每条 gated 命令恰好 acquire 一次，所以排队次数就是命令条数。
-    let gate_waits = TEST_BUDGET_RUNS_PER_CHANGE + BUILD_BUDGET_RUNS_PER_CHANGE;
-    gate_waits * gate_wait_secs
-        + TEST_BUDGET_RUNS_PER_CHANGE * test_budget_secs
-        + BUILD_BUDGET_RUNS_PER_CHANGE * build_budget_secs
-        + WEB_ADMISSION_TIMEOUT_SECS
-        + REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS
-        + FMT_SEGMENT_WALL_SECS
+    let gate_waits = TEST_RUNS_PER_CHANGE + BUILD_RUNS_PER_CHANGE;
+    let commands = TEST_RUNS_PER_CHANGE
+        + BUILD_RUNS_PER_CHANGE
+        + REPO_GATE_RUNS_PER_CHANGE
+        + FMT_COMMANDS_PER_CHANGE
+        + WEB_ADMISSION_RUNS_PER_CHANGE
+        + TOOLCHAIN_RUNS_PER_CHANGE;
+    gate_waits * gate_wait_secs + commands * progress_window_secs()
 }
 
 /// `rustup check` 对 stable 那一行的回答。
@@ -1044,11 +979,6 @@ pub struct ChangePipeline {
     project_root: PathBuf,
     change_dir: PathBuf,
     auto_apply: bool,
-    /// Wall-clock budget for the verification test run. A cold verification
-    /// compiles the whole workspace on the deployment's own hardware before it
-    /// runs a single test, so this bounds a build-plus-test, not just a test;
-    /// a budget shorter than one real run turns every verdict into a timeout.
-    test_timeout_secs: u64,
     /// The command that judges a change, as argv. Comes from the deployment's
     /// `self_evolution.test_command`; the default judges a Rust workspace, so a
     /// project that is not one has to say so here rather than be judged by a
@@ -1071,11 +1001,6 @@ pub struct ChangePipeline {
     /// `None` means this deployment declared none, and such a change is refused
     /// by name rather than sent to a person.
     web_admission: Option<cog_core::WebAdmissionConfig>,
-    /// Wall-clock bound on the format check. Short on purpose: the check does
-    /// not compile anything, so a run this side of the bound is a hung process
-    /// rather than a slow one — and a hung process would hold the executor's
-    /// only in-flight slot, which is the state this bound exists to end.
-    fmt_timeout_secs: u64,
     promotion_policy: Option<crate::PromotionGateConfig>,
     /// 共享 CARGO_TARGET_DIR：把编译产物留在工作树之外，临时工作树用完即弃
     /// 也不会丢增量缓存。
@@ -1272,13 +1197,11 @@ impl ChangePipeline {
             project_root: project_root.into(),
             change_dir: change_dir.into(),
             auto_apply,
-            test_timeout_secs: 3600,
             test_command: cog_core::SelfEvolutionConfig::default().test_command,
             fmt_check_command: None,
             lint_command: None,
             deploy_admission: None,
             web_admission: None,
-            fmt_timeout_secs: DEFAULT_FMT_TIMEOUT_SECS,
             promotion_policy: None,
             target_dir: None,
             budget: None,
@@ -1298,40 +1221,19 @@ impl ChangePipeline {
         self
     }
 
-    /// Attach the observation sink and take the budget from it.
+    /// Attach the observation sink the cost of each verification run is
+    /// reported to.
     ///
-    /// The budget is read out of the sink rather than passed separately so that
-    /// the number reported and the number enforced cannot be two numbers: a
-    /// deployment whose reading said 3600 while its runs were being killed at
-    /// 1800 would be an observation surface that disagrees with the decision it
-    /// is supposed to explain.
-    ///
-    /// The field this sets is the fallback for a pipeline with no sink attached.
-    /// A pipeline that has one reads the budget at every run (see
-    /// [`Self::test_budget_secs`]), because the sink's number moves: a run that
-    /// came within the headroom of the pin raises the budget for the next one,
-    /// and a pipeline holding a copy taken at construction would keep enforcing
-    /// the old wall while the reading advertised the new one.
+    /// It no longer carries a wall: a run is judged by whether it is still
+    /// moving, not by how long it has been running. The sink still gets the
+    /// measured duration of every run that finished, which is what the cost
+    /// reading is made of.
     pub fn with_verification_budget(
         mut self,
         budget: Arc<crate::verification_budget::VerificationBudget>,
     ) -> Self {
-        self.test_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_TEST);
         self.budget = Some(budget);
         self
-    }
-
-    /// The test budget this run is held to.
-    ///
-    /// Read at the moment of the run, not at wiring time: the sink derives it
-    /// from the runs that already happened, so the number that applies to this
-    /// change is the one as of now. Without a sink the pipeline keeps the value
-    /// it was configured with.
-    fn test_budget_secs(&self) -> u64 {
-        match &self.budget {
-            Some(budget) => budget.timeout_secs(crate::verification_budget::KIND_TEST),
-            None => self.test_timeout_secs,
-        }
     }
 
     pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -1343,11 +1245,6 @@ impl ChangePipeline {
     /// 接了分配器的调用方一律改用分配出来的工作树。
     pub fn project_root(&self) -> &std::path::Path {
         &self.project_root
-    }
-
-    pub fn with_test_timeout(mut self, secs: u64) -> Self {
-        self.test_timeout_secs = secs;
-        self
     }
 
     /// The deployment's test command. Taken from the config where the pipeline
@@ -3524,9 +3421,7 @@ impl ChangePipeline {
         };
 
         for command in &config.commands {
-            let (ok, output) = self
-                .run_verification_command(workdir, command, WEB_ADMISSION_TIMEOUT_SECS)
-                .await?;
+            let (ok, output) = self.run_verification_command(workdir, command).await?;
             if !ok {
                 return Ok(Some(format!(
                     "WebUI 准入条件未通过：`{}` 退出非零。{}",
@@ -3690,9 +3585,7 @@ impl ChangePipeline {
         };
 
         for command in &config.commands {
-            let (ok, output) = self
-                .run_verification_command(workdir, command, DEPLOY_ADMISSION_TIMEOUT_SECS)
-                .await?;
+            let (ok, output) = self.run_verification_command(workdir, command).await?;
             if !ok {
                 return Ok(Some(format!(
                     "部署准入条件未通过：`{}` 退出非零。{}",
@@ -3706,9 +3599,7 @@ impl ChangePipeline {
             for path in touched.iter().filter(|p| p.starts_with("deploy/rendered/")) {
                 let mut argv = prefix.clone();
                 argv.push(path.clone());
-                let (ok, output) = self
-                    .run_verification_command(workdir, &argv, DEPLOY_ADMISSION_TIMEOUT_SECS)
-                    .await?;
+                let (ok, output) = self.run_verification_command(workdir, &argv).await?;
                 if !ok {
                     return Ok(Some(format!(
                         "服务端 dry-run 拒绝了 {path}：{}",
@@ -3831,11 +3722,14 @@ impl ChangePipeline {
     /// "what may it run under" keep one answer each rather than one per call
     /// site: a second site that rebuilt these lines by hand would be free to
     /// drop the environment the verdict is only valid in.
+    ///
+    /// 判据是这条命令还在不在动，不是它跑了多久：每一段输出是拍，CPU 时间在涨也
+    /// 是拍。一段静默超过这个部署见过的最长一步就被判停、被杀（`cog_core::progress`），
+    /// 否则一直等下去——判一份整棵 workspace 的活本来就可能比任何写下来的数更长。
     async fn run_verification_command(
         &self,
         workdir: &Path,
         argv: &[String],
-        timeout_secs: u64,
     ) -> SFResult<(bool, String)> {
         let Some(program) = argv.first() else {
             return Err(SFError::Config(
@@ -3847,13 +3741,17 @@ impl ChangePipeline {
         cmd.args(&argv[1..]).current_dir(workdir).kill_on_drop(true);
         self.apply_verification_env(&mut cmd);
 
-        let output = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+        let id = format!("verification:{}", line);
+        let output = match cog_core::progress::run_child_watched(cmd, &id)
             .await
+            .map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?
         {
-            Ok(result) => result.map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?,
-            Err(_) => {
+            cog_core::progress::ChildOutcome::Exited(output) => output,
+            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
                 return Err(SFError::IO(format!(
-                    "{line} exceeded the {timeout_secs}s verification budget and was killed"
+                    "{line} stopped moving: no output and no CPU time for {silent:?}, \
+                     longer than any gap this deployment has ever seen between steps of a \
+                     command that was still working ({window:?}); it was killed"
                 )))
             }
         };
@@ -3867,8 +3765,7 @@ impl ChangePipeline {
     /// The argv is the whole command line, program included.
     async fn run_cargo_fmt_cmd(&self, workdir: &Path, argv: &[&str]) -> SFResult<(bool, String)> {
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
-        self.run_verification_command(workdir, &argv, self.fmt_timeout_secs)
-            .await
+        self.run_verification_command(workdir, &argv).await
     }
 
     /// 把判据这一侧的工具链对到 stable 的最新发布，失败不拦下这笔改动。
@@ -3970,10 +3867,7 @@ impl ChangePipeline {
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
-        match self
-            .run_verification_command(workdir, &argv, TOOLCHAIN_PROVISION_TIMEOUT_SECS)
-            .await
-        {
+        match self.run_verification_command(workdir, &argv).await {
             Ok((true, output)) => {
                 info!(
                     release = %release,
@@ -4113,10 +4007,7 @@ impl ChangePipeline {
             Some(argv) => {
                 let line = argv.join(" ");
                 info!(command = %line, "Running the formatter this deployment declares");
-                match self
-                    .run_verification_command(workdir, argv, self.fmt_timeout_secs)
-                    .await
-                {
+                match self.run_verification_command(workdir, argv).await {
                     Ok((true, _)) => Ok(FormatVerdict::Conformed {
                         rewritten: false,
                         note: format!(
@@ -4190,10 +4081,13 @@ impl ChangePipeline {
         .current_dir(workdir)
         .kill_on_drop(true);
         self.apply_verification_env(&mut cmd);
-        let output = tokio::time::timeout(Duration::from_secs(METADATA_TIMEOUT_SECS), cmd.output())
+        let output = match cog_core::progress::run_child_watched(cmd, "verification:cargo-metadata")
             .await
             .ok()?
-            .ok()?;
+        {
+            cog_core::progress::ChildOutcome::Exited(output) => output,
+            cog_core::progress::ChildOutcome::Stalled { .. } => return None,
+        };
         if !output.status.success() {
             return None;
         }
@@ -4263,29 +4157,26 @@ impl ChangePipeline {
         self.apply_verification_env(&mut cmd);
 
         let started = Instant::now();
-        let budget_secs = self.test_budget_secs();
-        let output =
-            match tokio::time::timeout(Duration::from_secs(budget_secs), cmd.output()).await {
-                Ok(result) => {
-                    let output =
-                        result.map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?;
-                    if let Some(budget) = &self.budget {
-                        budget.record_run(
-                            crate::verification_budget::KIND_TEST,
-                            started.elapsed().as_secs(),
-                        );
-                    }
-                    output
-                }
-                Err(_) => {
-                    if let Some(budget) = &self.budget {
-                        budget.record_timeout(crate::verification_budget::KIND_TEST);
-                    }
-                    return Err(SFError::IO(format!(
-                        "{line} exceeded the {budget_secs}s verification budget and was killed"
-                    )));
-                }
-            };
+        let id = format!("verification:{line}");
+        let output = match cog_core::progress::run_child_watched(cmd, &id)
+            .await
+            .map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?
+        {
+            cog_core::progress::ChildOutcome::Exited(output) => output,
+            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
+                return Err(SFError::IO(format!(
+                    "{line} stopped moving: no output and no CPU time for {silent:?}, \
+                     longer than any gap this deployment has ever seen between steps of a \
+                     command that was still working ({window:?}); it was killed"
+                )))
+            }
+        };
+        if let Some(budget) = &self.budget {
+            budget.record_run(
+                crate::verification_budget::KIND_TEST,
+                started.elapsed().as_secs(),
+            );
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4349,8 +4240,7 @@ impl ChangePipeline {
             argv = scoped_argv(&argv, packages);
         }
         info!(command = %argv.join(" "), "Running the built-in linter");
-        self.run_verification_command(workdir, &argv, self.test_budget_secs())
-            .await
+        self.run_verification_command(workdir, &argv).await
     }
 
     /// What this deployment's linter reads for this tree, as the sentence the
@@ -4402,9 +4292,7 @@ impl ChangePipeline {
             Some(argv) => {
                 let line = argv.join(" ");
                 info!(command = %line, "Running the linter this deployment declares");
-                let (passed, output) = self
-                    .run_verification_command(workdir, argv, self.test_budget_secs())
-                    .await?;
+                let (passed, output) = self.run_verification_command(workdir, argv).await?;
                 (line, passed, output)
             }
             None => {
@@ -4613,7 +4501,9 @@ impl ChangePipeline {
             not_asked: Vec::new(),
             interrupted: false,
         };
-        let deadline = Instant::now() + Duration::from_secs(REPO_GATE_STAGE_WALL_SECS);
+        // 门禁那一段没有按秒的界：每一条各自按「还在不在动」判（`cog_core::progress`），
+        // 一段静默超过这个部署见过的最长一步才算停住。原先那个共享的 deadline 是
+        // 整段的墙：它到点之后剩下的门一条都不问，而「没问过」在读数上与被判红连着。
         for gate in commands {
             let line = gate.line();
             if let Some(only) = only {
@@ -4625,11 +4515,6 @@ impl ChangePipeline {
                 run.not_asked
                     .push((line, "the workflow passes it an argument".into()));
                 continue;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                run.interrupted = true;
-                break;
             }
             let mut cmd = tokio::process::Command::new(&gate.argv[0]);
             cmd.args(&gate.argv[1..])
@@ -4647,18 +4532,23 @@ impl ChangePipeline {
             if let Some(dir) = target_dir {
                 cmd.env("CARGO_TARGET_DIR", dir);
             }
-            let output = match tokio::time::timeout(remaining, cmd.output()).await {
-                Ok(Ok(output)) => output,
+            let output = match cog_core::progress::run_child_watched(
+                cmd,
+                &format!("verification:repo-gate:{line}"),
+            )
+            .await
+            {
+                Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
                 // 启动不起来与门自己说「跑不了」是同一件事：这一条没被问过。差别只在
                 // 谁说的——门用退出码 2 说，操作系统用 errno 说。让一条启动不起来的
                 // 命令把整段门禁带走，这条变更就连别的门的结果都拿不到，而读数上看起来
                 // 是「这一段没跑完」，不是「这一条有问题」。
-                Ok(Err(e)) => {
+                Err(e) => {
                     run.not_asked
                         .push((line, format!("could not be launched: {e}")));
                     continue;
                 }
-                Err(_) => {
+                Ok(cog_core::progress::ChildOutcome::Stalled { .. }) => {
                     run.interrupted = true;
                     break;
                 }
@@ -4850,11 +4740,7 @@ impl ChangePipeline {
         let _slot = crate::build_gate::acquire("change lint verification").await?;
         self.git_reset_hard(workdir, change_content).await?;
         let baseline = match self.lint_command.as_deref() {
-            Some(argv) if !argv.is_empty() => {
-                self.run_verification_command(workdir, argv, self.test_budget_secs())
-                    .await?
-                    .1
-            }
+            Some(argv) if !argv.is_empty() => self.run_verification_command(workdir, argv).await?.1,
             _ => self.run_cargo_clippy(workdir, packages).await?.1,
         };
         self.git_apply(workdir, change_content).await.map_err(|e| {
@@ -5050,8 +4936,8 @@ mod tests {
     /// are different lines and can be moved independently.
     const TEN_LINES: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
 
-    /// [`one_change_wall_secs`] 加的是哪几段活、`FMT_SEGMENT_WALL_SECS` 那个数
-    /// 乘的是哪几趟命令，都是数着源码里的调用点写下来的。加一条 gated 命令、
+    /// [`one_change_wall_secs`] 加的是哪几段活、谁乘的是哪几趟命令，都是数着
+    /// 源码里的调用点写下来的。加一条 gated 命令、
     /// 或让 `run_cargo_fmt` 多跑一趟，界就少算一段——而界少了的症状是停摆告警
     /// 在健康的轮上响，所以调用点数必须钉住。这里数的都是**生产**调用点：测试
     /// 模块里那几处调用带着 `root.path()` 这种实参，与下面这些模式不匹配。
@@ -5070,7 +4956,7 @@ mod tests {
             + deployer.matches("build_gate::acquire(").count();
         assert_eq!(acquire_sites, 4, "gated 命令的函数个数变了");
 
-        // 吃测试预算的：clippy 判一趟、读基线一趟，套件与读基线失败集合各一次。
+        // 测试那一类的：clippy 判一趟、读基线一趟，套件与读基线失败集合各一次。
         let test_runs = pipeline.matches("self.run_test_command(").count();
         assert_eq!(
             pipeline.matches("self.run_cargo_clippy(").count(),
@@ -5079,14 +4965,14 @@ mod tests {
         );
         assert_eq!(
             test_runs as u64 + 2,
-            TEST_BUDGET_RUNS_PER_CHANGE,
-            "吃测试预算的命令 = clippy 两条 + run_test_command 那几条"
+            TEST_RUNS_PER_CHANGE,
+            "测试那一类的命令 = clippy 两条 + run_test_command 那几条"
         );
 
         // 排队次数 = acquire 点 + run_test_command 多走的那一次。
         assert_eq!(
             acquire_sites as u64 + (test_runs as u64 - 1),
-            TEST_BUDGET_RUNS_PER_CHANGE + BUILD_BUDGET_RUNS_PER_CHANGE,
+            TEST_RUNS_PER_CHANGE + BUILD_RUNS_PER_CHANGE,
             "构建槽排队次数与它该覆盖的命令条数对不上了"
         );
 
@@ -5103,21 +4989,23 @@ mod tests {
             "格式化命令的调用点数变了：run_cargo_fmt 里那几处加外面那两趟"
         );
 
-        // 门禁那一段：判定一趟、红了之后读基线一趟，各占一份自己的墙钟界。
-        // 它不排构建槽，所以上面那三个数与它无关——但界里必须算上它，否则一段
-        // 合法的、慢慢跑完的门禁就会在界外，而界外的一段活在告警眼里就是停摆。
-        //
-        // 加数与用法：界是"每条命令一份等待 + 一份预算"，没有别的东西混进来。
-        let gate_segment = REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS;
+        // 每一条命令各占一个实测窗口；闸门那一段只加排队等待。段里几条命令，
+        // 就要乘几个窗口——少乘一段的症状是停摆告警在健康的轮上响。
+        let commands = TEST_RUNS_PER_CHANGE
+            + BUILD_RUNS_PER_CHANGE
+            + REPO_GATE_RUNS_PER_CHANGE
+            + FMT_COMMANDS_PER_CHANGE
+            + WEB_ADMISSION_RUNS_PER_CHANGE
+            + TOOLCHAIN_RUNS_PER_CHANGE;
         assert_eq!(
-            one_change_wall_secs(0, 0, 0),
-            FMT_SEGMENT_WALL_SECS + gate_segment + WEB_ADMISSION_TIMEOUT_SECS,
-            "闸门与预算都是 0 时剩下的是门禁、格式化与 WebUI 准入那三段"
+            one_change_wall_secs(0),
+            commands * progress_window_secs(),
+            "闸门不排队时，界就是每条命令一个窗口"
         );
         assert_eq!(
-            one_change_wall_secs(1, 10, 100),
-            5 + 40 + 100 + gate_segment + FMT_SEGMENT_WALL_SECS + WEB_ADMISSION_TIMEOUT_SECS,
-            "每条 gated 命令一份等待，测试预算四条、构建预算一条，再加门禁、格式化与 WebUI 准入"
+            one_change_wall_secs(1),
+            (TEST_RUNS_PER_CHANGE + BUILD_RUNS_PER_CHANGE) + commands * progress_window_secs(),
+            "每条 gated 命令一份排队等待，再加每条命令一个窗口"
         );
     }
 
@@ -5245,7 +5133,7 @@ mod tests {
     async fn a_run_that_outlives_its_budget_is_killed_with_the_budget_named() {
         let root = tempfile::tempdir().unwrap();
         write_sleeping_crate(root.path(), 30);
-        let budget = Arc::new(crate::verification_budget::VerificationBudget::new(1, 60));
+        let budget = Arc::new(crate::verification_budget::VerificationBudget::new());
         let pipeline = ChangePipeline::new(root.path(), root.path(), false)
             .with_verification_budget(budget.clone());
 
@@ -5260,7 +5148,7 @@ mod tests {
             "the rejection has to name the budget that caused it: {err}"
         );
         assert_eq!(
-            test_kind_reading(&budget, crate::verification_budget::TIMEOUTS_TOTAL_METRIC).await,
+            test_kind_reading(&budget, crate::verification_budget::STOPPED_TOTAL_METRIC).await,
             Some(1.0),
             "a killed run has to be readable as a kill, not only as a log line"
         );
@@ -5365,7 +5253,7 @@ impl Default for MetricsConfig {
     async fn a_run_that_fits_its_budget_reports_its_duration() {
         let root = tempfile::tempdir().unwrap();
         write_sleeping_crate(root.path(), 1);
-        let budget = Arc::new(crate::verification_budget::VerificationBudget::new(120, 60));
+        let budget = Arc::new(crate::verification_budget::VerificationBudget::new());
         let pipeline = ChangePipeline::new(root.path(), root.path(), false)
             .with_verification_budget(budget.clone());
 
@@ -5379,7 +5267,7 @@ impl Default for MetricsConfig {
             "the sleeping crate passes once it finishes: {output}"
         );
         assert_eq!(
-            test_kind_reading(&budget, crate::verification_budget::TIMEOUTS_TOTAL_METRIC).await,
+            test_kind_reading(&budget, crate::verification_budget::STOPPED_TOTAL_METRIC).await,
             Some(0.0)
         );
         let elapsed =
@@ -6463,8 +6351,7 @@ index 1111111..2222222 100644
             "-c".to_string(),
             format!("touch {}", gate_marker.display()),
         ];
-        let budget =
-            std::sync::Arc::new(crate::verification_budget::VerificationBudget::new(60, 60));
+        let budget = std::sync::Arc::new(crate::verification_budget::VerificationBudget::new());
         let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true)
             .with_fmt_check_command(Some(gate.clone()))
             .with_lint_command(Some(gate.clone()))
@@ -6516,7 +6403,7 @@ index 1111111..2222222 100644
                 .map(|m| m.value)
         };
         assert_eq!(
-            cell(crate::verification_budget::TIMEOUTS_TOTAL_METRIC),
+            cell(crate::verification_budget::STOPPED_TOTAL_METRIC),
             Some(0.0),
             "no run of this change was killed by the budget, because none was started"
         );
@@ -6526,8 +6413,8 @@ index 1111111..2222222 100644
             "the published series carries no elapsed run: no slot was ever asked for"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(REPO_GATE_STAGE_WALL_SECS),
-            "the refusal costs the alignment's seconds, not a gate stage's wall: {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(60),
+            "the refusal costs the alignment's seconds, not a gate stage's worth of work: {elapsed:?}"
         );
     }
 

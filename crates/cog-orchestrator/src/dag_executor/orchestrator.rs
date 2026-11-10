@@ -11,7 +11,7 @@ use uuid::Uuid;
 use super::circuit_registry::CircuitBreakerRegistry;
 use super::retry_matrix::RetryMatrix;
 use super::task_checkpoint::{
-    self, checkpoint_task_with_timeout, CheckpointAgents, CheckpointRound, CHECKPOINT_STEP_TIMEOUT,
+    self, checkpoint_task_expecting, CheckpointAgents, CheckpointRound, CHECKPOINT_STEP_EXPECTATION,
 };
 use super::task_phase::PhasedTask;
 use cog_core::contract::outcome::GuardrailRefusal;
@@ -127,13 +127,18 @@ enum ReclaimCause {
         owner: Option<String>,
         expired_at: chrono::DateTime<chrono::Utc>,
     },
-    /// 持有者还在，但这个尝试已经 `silent_secs` 没有做出任何一步，而这份部署
-    /// 实测的步间隔 p99.9 是 `window_secs`。
+    /// 持有者还在，但这个尝试已经 `silent_secs` 没有做出任何一步，比这份部署
+    /// 在「还在动」的状态下见过的**最长**步间隔 `window_secs` 还长。
     ///
     /// 判据读的是「上一次动是什么时候」，不是「已经跑了多久」。对时钟来说，一个
     /// 流式输出了一小时的尝试与一个第一秒就卡住的尝试是同一个读数——那正是旧的
     /// 预算墙唯一能看见的东西；对这条判据它们是两个。所以慢但一直在动的永远不
     /// 会被判，停住的也不用一个声明的时限过期才被发现。
+    ///
+    /// 门槛取极值而不取分位，因为两类错不等价：让一个真停住的再跑一分钟，代价是
+    /// 一分钟；把一个还在干活的判停，代价是这一整次尝试和它已经花掉的钱。分位线
+    /// 会按设计每千次误伤一次，极值线要求静默长过这台机器上「动着」时出现过的
+    /// 任何一次沉默——那是一个从没在活着的尝试上出现过的形状。
     ///
     /// 停住记在任务自己的账上：这是这一轮的事，不是环境换了人。但它**不是**终止
     /// 性的——上游一次真会过去的停顿与一次真的卡死在这个读数上同形，所以下一轮
@@ -191,7 +196,8 @@ impl ReclaimCause {
 /// 会有两种写法，而排查的人是照着其中一条去 grep 的。
 pub(crate) fn stall_reason(silent: std::time::Duration, window: std::time::Duration) -> String {
     format!(
-        "run stopped moving: no step for {}s, and this deployment's measured inter-step p99.9 is {}s",
+        "run stopped moving: no step for {}s, longer than any gap this deployment has \
+         ever seen between steps while one was still moving ({}s)",
         silent.as_secs(),
         window.as_secs()
     )
@@ -3507,6 +3513,11 @@ impl DagExecutor {
         let max_retries = self.effective_max_retries(&error, cause, &task_type);
 
         let task = inner.tasks.get_mut(task_id).expect("task exists");
+        // 落库的那份预算写成这一次判决真正用的那份。任务上原带的数只是提交者
+        // 声明的，判决读的是这张矩阵（失败类还会把预算压到 0）；不写回来的话，
+        // 行里 `retry_count < max_retries` 读的是一个从没参与过判决的新数，
+        // 而同一个任务在"还要不要再来一次"上有两个答案。
+        task.max_retries = max_retries;
         if retry_count < max_retries {
             task.retry_count = retry_count + 1;
             task.status = TaskStatus::Pending;
@@ -3988,7 +3999,7 @@ impl DagExecutor {
             // 计一次 `failed`，其余 agent/任务照常落检查点，毒不倒整轮。
             // spawn 处另有随节拍推导、并向存活体系申报的整轮预算兜底。
             let round =
-                checkpoint_task_with_timeout(&task_id, agents, &state, CHECKPOINT_STEP_TIMEOUT)
+                checkpoint_task_expecting(&task_id, agents, &state, CHECKPOINT_STEP_EXPECTATION)
                     .await;
             saved += round.saved;
             self.record_task_checkpoint(&round).await;
@@ -8485,6 +8496,45 @@ mod tests {
             totals.iter().all(|sample| sample.value == 0.0),
             "the vocabulary lands at zero; the rounds add the values"
         );
+    }
+
+    /// 行里存的预算就是判决用的那个数。判决读矩阵（失败类还会把它压到 0），
+    /// 而任务上原带的是提交时声明的数；不写回来的话，同一行上「还剩几次」
+    /// 有两个答案——读的人按行里那个数算，调度器按另一个数收账。
+    #[tokio::test]
+    async fn the_budget_stored_on_the_row_is_the_one_the_verdict_used() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-budget-copy".into()).with_state_backend(backend);
+        let task = Task::new("t-budget-copy", TaskType::ToolCall, serde_json::json!({}));
+        let task_id = task.id.clone();
+        let declared = task.max_retries;
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+
+        let effective = dag.retry_matrix().max_retries(&TaskType::ToolCall);
+        assert_ne!(
+            declared, effective,
+            "用例只有在声明的数与生效的数不同时才有意义"
+        );
+
+        let (retried, _, _) = dag
+            .fail_task_after_paid(
+                &task_id,
+                "connection reset by peer".into(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(retried, "暂态失败的第一次必须还留在队列里");
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(
+            view.max_retries, effective,
+            "行上存的预算不是这次判决用的那个数"
+        );
+        assert_eq!(view.retry_count, 1);
     }
 
     /// 行里带的界与判决用的界是两个数，差在失败类上：靠重跑清除不了的失败拿

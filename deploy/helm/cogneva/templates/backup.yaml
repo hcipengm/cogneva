@@ -42,11 +42,10 @@ spec:
     spec:
       # 备份失败不重试成串：下一个周期自然再来，连续失败由 history 留证。
       backoffLimit: {{ .Values.backup.backoffLimit }}
-      # 卡死的运行必须有人来杀。concurrencyPolicy 是 Forbid，一次挂住的运行会
-      # 让它之后每一次都不再开始——备份停掉，连「谁来给挂住那笔收尾」也一起停。
-      # 这个界杀的是容器，同一个值经 env 进运行自己写的账本行，判超期用的是那一
-      # 行上的数（见 backup.rs 的 run_deadline_seconds）。
-      activeDeadlineSeconds: {{ .Values.backup.runDeadlineSeconds }}
+      # 这里曾经是 `activeDeadlineSeconds`：一个到点直接杀掉容器的钟，它不知道这个
+      # 容器是不是还在往外写、还在导出。判停改由容器自己的存活探针做（读进度文件）：
+      # 一步都不推进超过窗口才判死。`concurrencyPolicy: Forbid` 让一次挂住的运行
+      # 挡住之后每一次，所以这一条必须存在——但它判的是「还在不在动」。
       ttlSecondsAfterFinished: {{ .Values.backup.ttlSecondsAfterFinished }}
       template:
         metadata:
@@ -112,9 +111,31 @@ spec:
               image: {{ include "cogneva.image" . }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               args: ["backup"]
+              # 判停读的是这个文件：进程每推进一段就写一次，窗口写在文件内容里，
+              # 探针拿「现在 - mtime」与它比。命令与窗口的出处是
+              # `cog_core::progress::PROGRESS_PROBE_COMMAND`——探针里不写任何界，
+              # 写死的那个数会在下次窗口变了之后照样自称是窗口。
+              livenessProbe:
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - >-
+                      f="$COGNEVA_PROGRESS_FILE"; if [ -z "$f" ] || [ ! -f "$f" ]; then
+                      echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
+                      age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
+                      echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
+                {{/* lit: 30 fixed — 探针的读取节奏，不是界；界是进度文件里那个窗口 */}}
+                periodSeconds: 30
+                {{/* lit: 3 fixed — 连续几次读数超窗才判死：一次读盘抖动不该变成一次重启 */}}
+                failureThreshold: 3
+                {{/* lit: 120 fixed — 开工宽限；进程第一件事就是建这个文件 */}}
+                initialDelaySeconds: 120
               env:
                 {{- include "cogneva.timeEnv" . | nindent 16 }}
                 {{- include "cogneva.logEnv" . | nindent 16 }}
+                - name: COGNEVA_PROGRESS_FILE
+                  value: /var/run/cogneva-progress/beat
                 # 导出用 cog_app：它是这些表的属主，pg_dump 读得到全部内容。
                 - name: APP_PASSWORD
                   valueFrom:
@@ -128,9 +149,10 @@ spec:
                   value: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.port) | quote }}
                 - name: COGNEVA_BACKUP_KEEP
                   value: {{ .Values.backup.keepCount | quote }}
-                # 与 jobTemplate 的 activeDeadlineSeconds 是同一个值的两个载体：
-                # 一个让 kubelet 到点杀容器，一个让运行把「这次我被给了多久」写
-                # 进账本那一行。分开写两个数会漂，超期判断就跟着漂。
+                # 这个数**不杀任何东西**：容器的死活由上面的存活探针按进度文件判。
+                # 它只被写进账本那一行，让「这一行开着、但没人收尾」有一个可判的
+                # 时刻——一行开着的记录如果有人被杀，只有它自己被开出来时的那个数
+                # 判得了，用今天的旋钮去判昨天那一次是两回事。
                 - name: COGNEVA_BACKUP_RUN_DEADLINE_SECONDS
                   value: {{ .Values.backup.runDeadlineSeconds | quote }}
                 {{- with .Values.backup.packageKeySecret.name }}
@@ -221,7 +243,11 @@ spec:
                 - name: offsite
                   mountPath: /offsite
                 {{- end }}
+                - name: progress
+                  mountPath: /var/run/cogneva-progress
           volumes:
+            - name: progress
+              emptyDir: {}
             - name: data
               persistentVolumeClaim:
                 claimName: cogneva-data-pvc
@@ -295,7 +321,9 @@ spec:
     spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
       backoffLimit: {{ .Values.backup.drillBackoffLimit }}
-      activeDeadlineSeconds: {{ .Values.backup.drillDeadlineSeconds }}
+      # 同备份：这里曾经是 `activeDeadlineSeconds`——它杀的是「这一趟跑了多久」，
+      # 而两趟演练在某些夜晚的总时长本来就会超过任何一个固定的钟。判停改由存活
+      # 探针读进度文件：一步都不推进超过窗口才判死（见容器上那一格）。
       ttlSecondsAfterFinished: {{ .Values.backup.ttlSecondsAfterFinished }}
       template:
         metadata:
@@ -346,15 +374,34 @@ spec:
               # 最新那份 ＋ 窗口里最久没被成功打开过的一份：只开最新证明不了保留
               # 窗口的其余成员，而旧包与读端不同步的问题只在旧包上出现。
               args: ["backup-drill", "--also-unproven"]
+              # 同备份：探针读的是这一跑写下的进度文件，判的是「还在不在推进」。
+              # 窗内一步都不推进才判死；两趟一共跑多久不参与判断。
+              livenessProbe:
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - >-
+                      f="$COGNEVA_PROGRESS_FILE"; if [ -z "$f" ] || [ ! -f "$f" ]; then
+                      echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
+                      age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
+                      echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
+                {{/* lit: 30 fixed — 探针的读取节奏，不是界；界是进度文件里那个窗口 */}}
+                periodSeconds: 30
+                {{/* lit: 3 fixed — 连续几次读数超窗才判死：一次读盘抖动不该变成一次重启 */}}
+                failureThreshold: 3
+                {{/* lit: 120 fixed — 开工宽限；进程第一件事就是建这个文件 */}}
+                initialDelaySeconds: 120
               env:
                 {{- include "cogneva.timeEnv" . | nindent 16 }}
                 {{- include "cogneva.logEnv" . | nindent 16 }}
-                # 单趟预算：一份包从解包到对数完。到点由这一跑自己收尾并落一行
-                # `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟账上
-                # 一行都不留，「被杀」于是读作「没跑过」。与
-                # `jobTemplate.spec.activeDeadlineSeconds` 是一对。
-                - name: COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS
-                  value: {{ .Values.backup.drillPassBudgetSeconds | quote }}
+                - name: COGNEVA_PROGRESS_FILE
+                  value: /var/run/cogneva-progress/beat
+                # 一步的静默界：解包、核清单、建空库、恢复、对数……任何一步静默
+                # 超过它，由这一跑自己收尾并落一行 `failed`，判词点名停在哪一步。
+                # 整趟不受这条界约束——每一步都在推进时跑多久都行。
+                - name: COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS
+                  value: {{ .Values.backup.drillStepSilenceSeconds | quote }}
                 # 这一处连的是**cog_backup**，一个只带 CREATEDB 的受限角色：演练要在
                 # 同一台服务器上 `CREATE DATABASE` 一个一次性库，所以不能是 `cog_app`
                 # （没有 CREATEDB）；而它也不需要超级用户位——恢复没有它时按外键依赖
@@ -410,7 +457,11 @@ spec:
                   mountPath: /offsite-state
                   readOnly: true
                 {{- end }}
+                - name: progress
+                  mountPath: /var/run/cogneva-progress
           volumes:
+            - name: progress
+              emptyDir: {}
             - name: backup
               persistentVolumeClaim:
                 claimName: cogneva-backup-pvc

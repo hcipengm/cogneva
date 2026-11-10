@@ -7,10 +7,17 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
 /// Runner 配置。
+///
+/// **没有逐例超时这一项**（2026-11-10 删掉 `timeout_seconds`）。原来一例跑到 120 秒
+/// 就被掐断、记成 `Timeout`、按 `retry_count` 重来——那条判据读的是钟，不是这一例
+/// 有没有在动：一个一直在产出、只是慢的例与一个第一秒就卡死的例在它眼里是同一个读数，
+/// 而它更贵的代价在后面：被它掐掉的那次尝试花掉的 token 不进入任何样本，于是「这个
+/// 界合不合适」永远量不出来。现在一例的结局只由它自己的结果决定——跑完、报错、或
+/// 一直没回来。没回来不是没人知道：见 [`in_flight_cases`]，那里读得到谁还在飞、飞了
+/// 多久，这个读数不掐任何东西。
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
     pub max_concurrency: usize,
-    pub timeout_seconds: u64,
     pub retry_count: u32,
     /// 是否启用 LLM-as-a-Judge 对主观指标进行评分。
     pub judge_enabled: bool,
@@ -20,11 +27,45 @@ impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             max_concurrency: 4,
-            timeout_seconds: 120,
             retry_count: 1,
             judge_enabled: false,
         }
     }
+}
+
+/// 一个正在飞的评测例：它是谁、第几次尝试、从几时起。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightCase {
+    pub case_id: String,
+    pub attempt: u32,
+    pub running: std::time::Duration,
+}
+
+fn in_flight() -> &'static Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>> {
+    static IN_FLIGHT: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 现在还有哪些例在飞、各自从几时起。
+///
+/// 这是删掉逐例超时之后，「慢」与「挂住」之间唯一的读数。它**不判**任何一例：
+/// 一份读数被判成「挂住」再拿去掐，就是又造了一个钟——只是把这个钟藏进了读者里。
+/// 要不要处理一个跑了很久的例，由读它的人决定，而他至少能看到「跑在第几次尝试、
+/// 从几时起」，而不是从一条平的进度线上去猜。
+pub async fn in_flight_cases() -> Vec<InFlightCase> {
+    let now = std::time::Instant::now();
+    in_flight()
+        .lock()
+        .await
+        .iter()
+        .map(|(case_id, (attempt, started))| InFlightCase {
+            case_id: case_id.clone(),
+            attempt: *attempt,
+            running: now.saturating_duration_since(*started),
+        })
+        .collect()
 }
 
 /// 评估执行器。
@@ -99,16 +140,19 @@ async fn run_single_case(
     let mut tool_calls: Vec<String> = vec![];
 
     for attempt in 0..=config.retry_count {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(config.timeout_seconds),
-            async {
-                let mut agent = agent.lock().await;
-                agent.run(case.input.clone(), &*llm).await
-            },
-        )
-        .await
-        {
-            Ok(Ok(result)) => {
+        // 从进这一轮到出这一轮，这一例都登记着：它是谁、第几次。删掉钟之后这是
+        // 「它还在」的唯一证据——一个永远不返回的例不会留下别的痕迹。
+        in_flight()
+            .lock()
+            .await
+            .insert(case.id.clone(), (attempt, std::time::Instant::now()));
+        // 这一例的结局由它自己决定，不由钟决定：跑完就是跑完，报错就是报错。
+        let outcome = {
+            let mut agent = agent.lock().await;
+            agent.run(case.input.clone(), &*llm).await
+        };
+        match outcome {
+            Ok(result) => {
                 output = serde_json::to_value(&result).unwrap_or_default();
                 // Extract tool calls from result if present
                 if let Some(tools) = result.get("tool_calls").and_then(|v| v.as_array()) {
@@ -119,11 +163,8 @@ async fn run_single_case(
                 }
                 break;
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 last_error = Some(e.to_string());
-            }
-            Err(_) => {
-                last_error = Some("Timeout".into());
             }
         }
         // 失败之后不许立刻再发：紧循环重试会把一个上游拒绝放大成一场风暴
@@ -134,6 +175,8 @@ async fn run_single_case(
             tokio::time::sleep(retry_wait(last_error.as_deref())).await;
         }
     }
+
+    in_flight().lock().await.remove(&case.id);
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -522,6 +565,170 @@ mod tests {
             retry_wait(Some("Timeout")),
             std::time::Duration::ZERO,
             "an unstated wait must not be a zero-length one"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 一例的结局由它自己决定，不由钟决定
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod no_clock_wall_tests {
+    use super::*;
+    use crate::dataset::EvalCase;
+    use async_trait::async_trait;
+    use cog_core::{ChatOptions, CompleteOptions, Message, SFResult};
+
+    /// 这条路不碰上游；这一组判的是「这一例跑多久」，不是模型答得如何。
+    struct NeverCalled;
+
+    #[async_trait]
+    impl cog_core::LlmClient for NeverCalled {
+        async fn chat_stream(
+            &self,
+            _m: &[Message],
+            _o: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unreachable!()
+        }
+        async fn complete_stream(
+            &self,
+            _p: &str,
+            _o: &CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unreachable!()
+        }
+    }
+
+    fn case(id: &str) -> EvalCase {
+        EvalCase {
+            id: id.into(),
+            name: id.into(),
+            input: serde_json::json!({}),
+            expected_output: None,
+            expected_tools: None,
+            tags: vec![],
+            metrics: vec![],
+            metadata: Default::default(),
+        }
+    }
+
+    /// 一个慢例：它一直在同一个调用里等，但等的是自己的事，不是挂死。
+    struct SlowAgent {
+        secs: u64,
+    }
+
+    #[async_trait]
+    impl cog_core::AgentRuntime for SlowAgent {
+        async fn run(
+            &mut self,
+            _input: serde_json::Value,
+            _llm: &dyn cog_core::LlmClient,
+        ) -> SFResult<serde_json::Value> {
+            tokio::time::sleep(std::time::Duration::from_secs(self.secs)).await;
+            Ok(serde_json::json!({"answer": "done"}))
+        }
+        fn agent_id(&self) -> &str {
+            "slow"
+        }
+        fn role(&self) -> &str {
+            "eval"
+        }
+    }
+
+    /// 这一格在没有改动时会红：旧的 `tokio::time::timeout(120s, ...)` 判的是钟，
+    /// 300 秒的例在 120 秒那一刻被判成 `Timeout`、记成没过。新判据只问它有没有
+    /// 跑完——所以这一格是「慢而不停的例不再被掐」的那条测试。
+    ///
+    /// 虚拟时钟：`start_paused` 让 300 秒在一次测试里瞬间走完，而两个定时器
+    /// 的先后关系与真实时间上完全一样（120 早于 300）。
+    #[tokio::test(start_paused = true)]
+    async fn a_case_that_runs_past_the_old_wall_judges_itself_instead_of_timing_out() {
+        let agent: Arc<Mutex<dyn cog_core::AgentRuntime>> =
+            Arc::new(Mutex::new(SlowAgent { secs: 300 }));
+        let result = run_single_case(
+            agent,
+            Arc::new(NeverCalled),
+            None,
+            case("slow-300s"),
+            RunnerConfig::default(),
+        )
+        .await;
+        assert!(
+            result.passed,
+            "一例跑了 300 秒就判成没过：钟又回来了（error = {:?}）",
+            result.error
+        );
+        assert_eq!(result.error, None);
+    }
+
+    /// 一个永远不返回的例：它不被掐断（这是有意的），但它**必须**在读数面上
+    /// 看得见。没有这一半，删掉钟就等于把「挂住」变成一件没人知道的事。
+    struct GatedAgent {
+        entered: tokio::sync::mpsc::Sender<()>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl cog_core::AgentRuntime for GatedAgent {
+        async fn run(
+            &mut self,
+            _input: serde_json::Value,
+            _llm: &dyn cog_core::LlmClient,
+        ) -> SFResult<serde_json::Value> {
+            let _ = self.entered.send(()).await;
+            let _permit = self.gate.acquire().await.expect("gate never closed");
+            Ok(serde_json::json!({"answer": "released"}))
+        }
+        fn agent_id(&self) -> &str {
+            "gated"
+        }
+        fn role(&self) -> &str {
+            "eval"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_case_that_never_returns_is_visible_in_flight_and_is_never_cut() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(1);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let agent: Arc<Mutex<dyn cog_core::AgentRuntime>> = Arc::new(Mutex::new(GatedAgent {
+            entered: entered_tx,
+            gate: gate.clone(),
+        }));
+
+        let run = tokio::spawn(run_single_case(
+            agent,
+            Arc::new(NeverCalled),
+            None,
+            case("held"),
+            RunnerConfig::default(),
+        ));
+        entered_rx.recv().await.expect("the case never started");
+
+        let flying: Vec<InFlightCase> = in_flight_cases()
+            .await
+            .into_iter()
+            .filter(|c| c.case_id == "held")
+            .collect();
+        assert_eq!(
+            flying.len(),
+            1,
+            "在飞的例没有出现在读数里：删掉钟之后它就是隐形的"
+        );
+        assert_eq!(flying[0].attempt, 0);
+        assert!(!run.is_finished(), "还没跑完的例已经被判完了");
+
+        gate.add_permits(1);
+        let result = run.await.expect("the case panicked");
+        assert!(result.passed);
+        assert!(
+            in_flight_cases()
+                .await
+                .into_iter()
+                .all(|c| c.case_id != "held"),
+            "跑完的例还留在在飞读数里"
         );
     }
 }

@@ -71,11 +71,11 @@ fi
 # 用例 2：产物被改一个字段 -> 红，且 diff 里正是那个字段。
 d="$(case_dir rendered-drift)"
 edit_once "${d}/deploy/rendered/k3s-single/10-configmap-cogneva-json.yaml" \
-  '"test_timeout_secs": 3600' '"test_timeout_secs": 3601'
+  '"shutdown_timeout_ms": 30000' '"shutdown_timeout_ms": 30001'
 if out="$(run "${d}")"; then
   fail "渲染产物被改了一个字段，--check 仍然绿（准入条件永远不会红）：${out}"
 fi
-grep -q 'test_timeout_secs' <<<"${out}" \
+grep -q 'shutdown_timeout_ms' <<<"${out}" \
   || fail "红了，但没报出被改的那一处：${out}"
 
 # 用例 3：chart 侧改了值、产物没重渲染 -> 红（这条命令存在的理由）。

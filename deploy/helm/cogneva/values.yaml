@@ -141,12 +141,11 @@ backup:
   timeZone: "Etc/UTC"
   # 保留最新 N 份，更老的落盘即删。
   keepCount: 7
-  # 一次运行最多能跑多久，秒。一个值两处承载：Job 的 activeDeadlineSeconds
-  # （到点 kubelet 杀容器）和运行 env 里的同一个数（写进账本那一行，超期判断
-  # 用它）。实测的运行时长记在账本 `backup_runs` 的 `started_at`→`finished_at` 上，
-  # 最新一次是几十秒；一小时的界比它高一个数量级，落在里面的是正常
-  # 运行、落在外面的那次是卡死了——而卡死的那次不杀掉，Forbid 会让后面每
-  # 一次都不再开始。
+  # 一次运行最久能在账上「开着」，秒。它**不再杀任何东西**：容器的死活由存活探针
+  # 按进度文件判（一步都不推进超过窗口才判死），这个数只写进账本那一行
+  # （`backup_runs.run_deadline_seconds`），让「这一行没人收尾」有一个可判的时刻——
+  # 一行开着的记录如果有人被杀，只有它自己被开出来时的那个数判得了。
+  # 一小时的界比实测的几十秒高一个数量级，落在里面的是正常运行。
   runDeadlineSeconds: 3600
   # 一个周期错过了多久还算数（秒）：控制器在错过起点后这段时间内仍会补跑一次，
   # 更早就直接放弃。两个 CronJob 读同一个数——它们错过的原因是同一类（节点忙、
@@ -185,22 +184,23 @@ backup:
   # 然后删库，答案落进 `backup_drills`。排在备份之后半小时：装的是当晚刚出的那一
   # 个包，而不是昨天的。时刻与上面同一个 timeZone 解释。
   drillSchedule: "47 3 * * *"
-  # 一次演练最多能跑多久。一次运行开的是**两份**包，不是一份：最新那份，加上窗口
-  # 里最久没被证明的那份（`--also-unproven`，第二趟只挑一份，成不成都不再接着开）。
+  # 一次演练开的是**两份**包，不是一份：最新那份，加上窗口里最久没被证明的那份
+  # （`--also-unproven`，第二趟只挑一份，成不成都不再接着开）。
   #
-  # **这个界必须大于两份的单趟预算，两者是一对**：`drillPassBudgetSeconds` 是进程
-  # 自己拿着的单趟界（到点它自己收尾并落一行 `failed`），这里是 Job 的界（到点把
-  # Pod 杀掉，账上一行都不留）。2026-10-27 的现场就是这一对失配：单包实测已从
-  # 497 s（实测 10-19）长到 2271 s（实测 10-27，本机 3.6 GB 的库），第一趟吃掉 38 min，第二趟在
-  # 3600 s 的界上被杀，`backup_drills` 里没有那一行——于是「窗口里最久没被证明的
-  # 那份」永远证明不了，读数读作「这一趟没跑过」。
+  # 这里曾经有一个 `drillDeadlineSeconds`（Job 的 activeDeadlineSeconds）与它的一对
+  # `drillPassBudgetSeconds`（整趟预算）。2026-10-27 的现场就是这一对：单包实测已从
+  # 497 s（10-19）长到 2271 s（10-27，本机 3.6 GB 的库），第一趟吃掉 38 min，第二趟
+  # 在 3600 s 的界上被杀，`backup_drills` 里没有那一行——于是「窗口里最久没被证明
+  # 的那份」永远证明不了，读数读作「这一趟没跑过」。
   #
-  # 关系由 `deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh`
-  # 盯着：界 ≥ 2 × 单趟预算 ＋ 余量。只改一个数会红，所以别只改一个。
-  drillDeadlineSeconds: 7800
-  # 单趟预算（秒）：一份包从解包到对数完。与 `drillDeadlineSeconds` 是一对，
-  # 见上一条注释。数由 `COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS` 交给进程。
-  drillPassBudgetSeconds: 3600
+  # 两个数都不再是「这一趟花了多久」：判停改由存活探针（Job 面）与进程里的单步
+  # 看门狗（账本面）做，两者读的都是**当前这一步静默了多久**。
+  #
+  # 单步静默界（秒）：解包、核清单、建空库、恢复、对数……任何一步静默超过它，
+  # 由这一跑自己收尾并落一行 `failed`，判词点名停在哪一步。整趟不受它约束：两步
+  # 各跑一小时也照样跑完。数由 `COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS` 交给进程，
+  # 两处同一个数由 `deploy/scripts/tests/backup-jobs-stop-on-silence.test.sh` 盯着。
+  drillStepSilenceSeconds: 3600
   # 备份卷之外的第二个落点：每跑完一次，新包再往这里复制一份，演练自己遍历它、
   # 把「卷外最新那份是不是刚装回去的这个包」记进 `backup_drills`。
   #
@@ -531,15 +531,22 @@ workspaceFetch:
 # 自进化 worker（特权容器 = 文件系统沙盒边界；接 image-based 滚动更新后可关特权）
 evolution:
   enabled: true
-  # 自进化循环自己的三个运行参数。它们此前写死在进化 Pod 的 ConfigMap 里：
-  # 轮询间隔决定「主线动到被发现」的延迟，两个超时决定一次构建/一次验证最多跑多久。
-  # 三者都是随部署规格变的数（节点多快、镜像多大），所以走 values。
+  # 自进化循环的轮询间隔：决定「主线动到被发现」的延迟，随部署节奏变，所以走
+  # values。一次构建 / 一次验证跑多久不再由墙决定——跑得慢不是停，停才是停，
+  # 判据是子进程还发不发进度（cog_core::progress），所以这里没有超时项。
   # 一个进化 worker：它按 Hold 那把构建槽的锁干活，第二个副本争的是同一把锁，
   # 收益是多一份排队而不是多一份吞吐。
   replicas: 1
   pollIntervalSecs: 300
-  testTimeoutSecs: 3600
-  buildTimeoutSecs: 3600
+  # 滚动时控制器等多久没有进展就把这一版标成 `Progressing=False`。写在这里而不是
+  # 留给 API 的默认 600 秒：同一个数在清单上看不见的时候，读者会以为这个部署没有被
+  # 时长判过。
+  #
+  # 它**不杀任何东西**：到点控制器只写一条状态条件（reason `ProgressDeadlineExceeded`），
+  # Pod 照跑、滚动继续，本仓库里没有任何代码或清单拿这条条件做决定（读它的只有网关
+  # 那张工作负载读数屏）。这个字段也无法真正去掉——不写时生效的是同一个默认值；写
+  # 出来只是让它不再是清单上看不见的数。
+  progressDeadlineSeconds: 600
   # fail-closed 身份门禁：进化 Pod 的 Shell 类工具只接受带 DAG task 身份的
   # 调用（prompt_for_task），无身份的命令直接拒绝，不许以伪造身份进 executor。
   requireToolIdentity: true
@@ -1910,7 +1917,6 @@ mainlineDeployer:
     # 与安装脚本的 BACKENDS 是同一个开关：清单里的 09-clickhouse / 10-loki
     # 标着 backends 处置，两边都按它决定交付与否。
     backends: true
-    applyTimeoutSecs: 120
     # 一次收敛最多在告警消息里点名几个资源，其余折成计数（消息有界）。集群可以
     # 漂移一百个对象，消息不能长到没人读。
     maxNamedResources: 6

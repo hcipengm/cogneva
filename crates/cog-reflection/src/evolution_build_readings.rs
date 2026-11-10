@@ -84,15 +84,15 @@ pub const OUTCOME_UNSTARTED: &str = "unstarted";
 /// Every value the outcome label can take. A producer that publishes one series
 /// per class needs the classes it has none of as well, or an empty class is
 /// indistinguishable from a class that was never wired up.
-pub const BUILD_OUTCOMES: [&str; 4] = ["built", "failed", "timed_out", OUTCOME_UNSTARTED];
+pub const BUILD_OUTCOMES: [&str; 4] = ["built", "failed", "stalled", OUTCOME_UNSTARTED];
 
 /// How one build ended, with the time it cost the host.
 ///
 /// The duration is inside the ending that has one, so "a build that never ran
 /// reports a duration" is not a state this code can express. The same shape
-/// keeps the two readings apart: a build the budget killed spent real host time
-/// and is not a measurement of the work, and the caller cannot record it as
-/// one.
+/// keeps the two readings apart: a build that was judged stopped spent real
+/// host time and is not a measurement of the work, and the caller cannot record
+/// it as one.
 ///
 /// 可序列化是为了越过进程边界：构建搬进一个一过性 Job 之后，只有执行侧知道
 /// cargo 是被预算杀的还是自己失败的，而记账要在常驻进程那一侧、记进同一个读数族。
@@ -103,11 +103,17 @@ pub enum BuildEnding {
     Built(Duration),
     /// cargo ran to an end without producing a binary.
     Failed(Duration),
-    /// The deployment budget killed cargo. The duration is the wall it was
-    /// killed at, i.e. the budget: that is what the host was occupied for, and
-    /// reporting it as the length of the work would say the work finishes
-    /// exactly at the limit.
-    TimedOut(Duration),
+    /// cargo was killed because it stopped moving: no output and no CPU time
+    /// for `silent`, past `window` — the longest gap this deployment has ever
+    /// seen between two steps of a build that was still working.
+    ///
+    /// This replaced a deployment budget. The budget was a clock: it killed a
+    /// build at the same second whether the build was compiling or wedged, and
+    /// a build heavier than anything before it could only ever be killed by it
+    /// (a killed build produces no duration to grow the budget from). The
+    /// silence carries the same information a clock never had — whether the
+    /// work was still advancing.
+    Stalled { silent: Duration, window: Duration },
     /// cargo was never invoked — the slot gate refused the build, or the
     /// binary could not be spawned. Both mean no build happened, and neither
     /// leaves a duration to report.
@@ -120,7 +126,7 @@ impl BuildEnding {
         match self {
             BuildEnding::Built(_) => "built",
             BuildEnding::Failed(_) => "failed",
-            BuildEnding::TimedOut(_) => "timed_out",
+            BuildEnding::Stalled { .. } => "stalled",
             BuildEnding::Unstarted => OUTCOME_UNSTARTED,
         }
     }
@@ -128,9 +134,10 @@ impl BuildEnding {
     /// Seconds this build occupied the host, for the endings that occupied it.
     fn host_seconds(self) -> Option<u64> {
         match self {
-            BuildEnding::Built(d) | BuildEnding::Failed(d) | BuildEnding::TimedOut(d) => {
-                Some(d.as_secs())
-            }
+            BuildEnding::Built(d) | BuildEnding::Failed(d) => Some(d.as_secs()),
+            // The host was occupied for the whole silence: that is a real
+            // number about this machine, just not one about the work.
+            BuildEnding::Stalled { silent, .. } => Some(silent.as_secs()),
             BuildEnding::Unstarted => None,
         }
     }
@@ -146,9 +153,8 @@ impl BuildEnding {
     /// the field out rather than by reporting zero.
     fn elapsed_seconds(self) -> Option<f64> {
         match self {
-            BuildEnding::Built(d) | BuildEnding::Failed(d) | BuildEnding::TimedOut(d) => {
-                Some(d.as_secs_f64())
-            }
+            BuildEnding::Built(d) | BuildEnding::Failed(d) => Some(d.as_secs_f64()),
+            BuildEnding::Stalled { silent, .. } => Some(silent.as_secs_f64()),
             BuildEnding::Unstarted => None,
         }
     }
@@ -435,17 +441,20 @@ mod tests {
         );
     }
 
-    /// A build the budget killed is on the host-time reading — it really held
-    /// the machine — but it does not become "how long a build takes": that
-    /// number is the budget, and a reader checking headroom would read it as
-    /// headroom of zero every time.
+    /// A build judged stopped is on the host-time reading — it really held the
+    /// machine — but it does not become "how long a build takes": the number
+    /// carried is how long it had been silent, and a reader checking headroom
+    /// would read that as headroom of zero every time.
     #[tokio::test]
-    async fn a_killed_build_is_host_time_and_not_a_measurement_of_the_work() {
+    async fn a_stopped_build_is_host_time_and_not_a_measurement_of_the_work() {
         let readings = EvolutionBuildReadings::new();
         readings.record(
             "change-audit",
             Some(EvolutionIntent::SelfAudit),
-            BuildEnding::TimedOut(Duration::from_secs(3600)),
+            BuildEnding::Stalled {
+                silent: Duration::from_secs(3600),
+                window: Duration::from_secs(600),
+            },
             None,
         );
         assert_eq!(
@@ -453,7 +462,7 @@ mod tests {
                 &readings,
                 BUILD_OUTCOMES_TOTAL_METRIC,
                 "self_audit",
-                "timed_out"
+                "stalled"
             )
             .await,
             Some(1.0)
@@ -463,7 +472,7 @@ mod tests {
                 &readings,
                 BUILD_SECONDS_TOTAL_METRIC,
                 "self_audit",
-                "timed_out"
+                "stalled"
             )
             .await,
             Some(3600.0)
@@ -549,7 +558,10 @@ mod tests {
         let endings = [
             BuildEnding::Built(Duration::from_secs(1)),
             BuildEnding::Failed(Duration::from_secs(1)),
-            BuildEnding::TimedOut(Duration::from_secs(1)),
+            BuildEnding::Stalled {
+                silent: Duration::from_secs(1),
+                window: Duration::from_millis(500),
+            },
             BuildEnding::Unstarted,
         ];
         for ending in endings {
@@ -709,16 +721,19 @@ mod tests {
         );
     }
 
-    /// A build the budget killed does not become "how long a build takes", but
-    /// the memory it had reached when it was killed is a real measurement — and
-    /// on a build killed for its memory it is the reading worth having.
+    /// A build judged stopped does not become "how long a build takes", but the
+    /// memory it had reached is a real measurement — and on a build stopped for
+    /// its memory it is the reading worth having.
     #[tokio::test]
-    async fn a_killed_build_still_reports_what_it_took() {
+    async fn a_stopped_build_still_reports_what_it_took() {
         let readings = EvolutionBuildReadings::new();
         readings.record(
             "change-k",
             Some(EvolutionIntent::SelfAudit),
-            BuildEnding::TimedOut(Duration::from_secs(3600)),
+            BuildEnding::Stalled {
+                silent: Duration::from_secs(3600),
+                window: Duration::from_secs(600),
+            },
             Some(7 * 1024 * 1024 * 1024),
         );
         assert_eq!(

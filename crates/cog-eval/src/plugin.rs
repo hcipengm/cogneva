@@ -44,7 +44,6 @@ impl cog_core::SystemPlugin for EvalPlugin {
                 llm,
                 crate::RunnerConfig {
                     max_concurrency: 4,
-                    timeout_seconds: 120,
                     retry_count: 1,
                     judge_enabled: true,
                 },

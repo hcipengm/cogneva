@@ -214,7 +214,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         "crates/cog-gateway/src/security_gateway.rs",
     ),
     (
-        "cogneva_verification_budget_seconds",
+        "cogneva_verification_window_seconds",
         &["kind", "source"],
         "crates/cog-reflection/src/verification_budget.rs",
     ),
@@ -224,7 +224,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         "crates/cog-reflection/src/verification_budget.rs",
     ),
     (
-        "cogneva_verification_timeouts_total",
+        "cogneva_verification_stopped_total",
         &["kind"],
         "crates/cog-reflection/src/verification_budget.rs",
     ),

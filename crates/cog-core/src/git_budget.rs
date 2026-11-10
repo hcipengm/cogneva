@@ -1,70 +1,65 @@
-//! How long a git command may run, and when a lock it left behind is a corpse.
+//! When a git lock left behind is a corpse.
 //!
 //! Two crates run git against a volume they do not control -- the sandbox
 //! executor against its task worktrees, the reflection loop against its change
-//! workspaces -- and both need the same two answers. A period chosen once is
-//! wrong in both directions on a volume that changes: a repository that grew
-//! past a full-tree checkout gets killed mid-command, and a volume that got
-//! faster sits out a ceiling it no longer needs. Both crates therefore measure
-//! the slowest command that has completed and take a multiple of it.
+//! workspaces -- and both need the same answer.
+//!
+//! A git command is no longer bounded by a time: it is stopped when it stops
+//! moving (`cog_core::progress`), at the same measured window every other judged
+//! child is stopped at. That same judgement is what makes a leftover lock
+//! readable as a corpse. A live command beats at least once per window (a byte
+//! of output, or CPU time advancing), so a command silent for longer than the
+//! window is killed by its own watchdog -- therefore a lock older than that
+//! cannot belong to a live command.
 //!
 //! The arithmetic lives here so the two loops cannot drift apart on it: two
 //! copies of one control law is the same defect as two copies of one figure.
 
 use std::time::Duration;
 
-/// The ceiling before any command has completed here: only this is available.
-// cap: bound — 命令还没跑完过时唯一可用的上界；有了实测之后由下面那个倍数接管
-pub const GIT_TIMEOUT_FLOOR_SECS: u64 = 120;
-
-/// How many times the slowest completed command a command may take.
-// cap: bound — 从这台机上跑完过的最慢命令推：一条命令最多花它的十倍
-pub const GIT_TIMEOUT_MULTIPLE: u64 = 10;
-
-/// How long a git command may run, from the slowest one that has completed.
-pub fn git_timeout_from(slowest_ms: u64) -> Duration {
-    let measured = (slowest_ms / 1000).saturating_mul(GIT_TIMEOUT_MULTIPLE);
-    Duration::from_secs(measured.max(GIT_TIMEOUT_FLOOR_SECS))
-}
-
-/// How old a git lock has to be before it can only be a corpse.
+/// How old a git lock has to be before it can only be a corpse: twice the
+/// longest silence this deployment has ever seen from a command that was still
+/// working.
 ///
-/// Killed git processes (OOM, node restart) leave `.lock` files behind, and
-/// every git write in these crates is bounded by [`git_timeout_from`] and
-/// kill-on-drop, so a lock older than twice that ceiling cannot belong to a
-/// live command: the command that made it would have been killed first. Twice
-/// rather than once, because a command may have taken the lock just as this
-/// pass looked at the clock.
-pub fn stale_lock_age_from(timeout: Duration) -> Duration {
-    timeout * 2
+/// Twice rather than once, because a command may have taken the lock just as
+/// this pass looked at the clock: a lock that just missed being killed is still
+/// live.
+///
+/// `Duration::MAX` until the deployment has measured a window -- and that is a
+/// reading, not a fallback: before anything has been measured, nothing here
+/// knows how quiet a live command gets, so no lock can be named a corpse. A
+/// substitute figure would be a wall wearing the clothes of a measurement, and
+/// this one clears lock files that other processes may be holding right now.
+pub fn stale_lock_age() -> Duration {
+    match crate::progress::longest_gap() {
+        Some(window) => window.saturating_mul(2),
+        None => Duration::MAX,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress;
 
-    /// The ceiling follows what git has actually cost here, so a volume that
-    /// grew or got slower moves it, and the corpse age moves with it.
+    /// The corpse age follows the measured window and is absent until there is
+    /// one: a deployment that has not measured a gap yet must not clear any
+    /// lock, because it cannot tell a corpse from a command still working.
     #[test]
-    fn the_timeout_follows_the_slowest_command_that_finished() {
-        // Nothing has completed yet: the floor is the only evidence available.
-        assert_eq!(
-            git_timeout_from(0),
-            Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS)
-        );
-        // A 41-second full-tree checkout makes the ceiling its ten times.
-        assert_eq!(git_timeout_from(41_000), Duration::from_secs(410));
-        // Slower than the floor: the floor stops constraining anything.
-        assert_eq!(git_timeout_from(120_000), Duration::from_secs(1200));
-        // The corpse age is twice whatever ceiling is in force, not a
-        // separate figure that can disagree with it.
-        assert_eq!(
-            stale_lock_age_from(Duration::from_secs(410)),
-            Duration::from_secs(820)
-        );
-        assert_eq!(
-            stale_lock_age_from(git_timeout_from(0)),
-            Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS * 2)
-        );
+    fn the_corpse_age_follows_the_measured_window() {
+        let _guard = progress::test_lock();
+        progress::reset_for_tests();
+        // Nothing measured: no lock can be judged a corpse.
+        assert_eq!(stale_lock_age(), Duration::MAX);
+
+        progress::seed_gaps_for_tests(Duration::from_secs(40), progress::SAMPLE_FLOOR);
+        // Twice the longest gap that was still work in progress.
+        assert_eq!(stale_lock_age(), Duration::from_secs(80));
+
+        // A heavier deployment moves it: the same law, a new window.
+        progress::reset_for_tests();
+        progress::seed_gaps_for_tests(Duration::from_secs(610), progress::SAMPLE_FLOOR);
+        assert_eq!(stale_lock_age(), Duration::from_secs(1220));
+        progress::reset_for_tests();
     }
 }

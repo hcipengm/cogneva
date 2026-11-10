@@ -27,22 +27,18 @@
 //!   the state this reading exists to report. Absent while no flight runs, which
 //!   on this face is a reading rather than a silence -- the value is derived at
 //!   scrape time from the process's own state, not left over from the last write.
-//! - `cogneva_evolution_change_flight_budget_seconds{dir}` -- the wall the flight
-//!   is judged against: the two bounds of its two slowest steps, added. Published
-//!   on the same axis so a rule compares the age against this deployment's own
-//!   numbers rather than a constant that goes stale when a budget is configured
-//!   differently.
 //!
-//! The wall is the *sum* because both steps are inside the flight: the wait for a
-//! build slot is bounded by the gate's wait budget and the test run by the
-//! verification budget, and a flight that waits out the first and then runs the
-//! second is doing exactly what it is allowed to do. Both numbers are read from
-//! the objects that enforce them (the verification budget the pipeline holds and
-//! the build gate configuration the same process installed), never re-derived
-//! from the configuration document by a second path that could disagree with
-//! what is being enforced. The steps that are neither -- `git apply`, the format
-//! check, the rollback after a refusal -- take seconds to a minute, so a flight
-//! past the wall is one whose bounded steps can no longer still be running.
+//! There is no second series here saying how long a flight may take, and there
+//! cannot be one that answers: a flight's steps are judged one at a time, and
+//! each of them is stopped only when it stops moving (`cog_core::progress`). A
+//! step may keep printing for hours and still be healthy, so the flight's total
+//! age has no line above which "working" becomes "stuck". The comparison that
+//! used to live here -- the age against the two bounds its slowest steps
+//! declared -- was a wall: it went red on healthy flights whose steps were
+//! long, which is exactly the misjudgement the motion judge exists to remove.
+//! Each step that hangs is now stopped at the measured window and shows up as
+//! that step's error; what is left for this reading is the age itself, to be
+//! read beside the step errors rather than compared against a number.
 //!
 //! A process that runs no flights publishes nothing here. The question "is any
 //! process even set up to verify a change" is answered one family over, by
@@ -70,20 +66,16 @@ use crate::evolution_queue_readings::{resolve_change_dir, DIR_LABEL};
 /// How long the change now in the flight has been in it, in seconds.
 pub const FLIGHT_SECONDS_METRIC: &str = "cogneva_evolution_change_flight_seconds";
 
-/// The wall the flight is judged against, in seconds.
-pub const FLIGHT_BUDGET_SECONDS_METRIC: &str = "cogneva_evolution_change_flight_budget_seconds";
-
 /// Where a change is in its apply/test flight, as one process sees it.
 pub struct EvolutionFlightReadings {
     /// The queue this process reads, resolved the way the pipeline resolves it,
     /// so a rule groups the flight by the same directory the queue readings
     /// report and the two can be joined.
     dir: PathBuf,
-    /// The wall, in seconds. `None` on a process that runs no flights: it
-    /// publishes nothing in this family rather than a zero, which on the axis a
-    /// rule compares would read as a flight bounded at zero seconds -- every
-    /// flight over its wall before it starts.
-    budget_secs: Option<u64>,
+    /// Whether this process runs flights at all. `false` on a process that runs
+    /// none: it publishes nothing in this family rather than a zero, which would
+    /// read as a flight that started this instant.
+    publishes: bool,
     /// When the flight in progress started it, or `None` when no flight is.
     ///
     /// A monotone instant rather than a wall-clock stamp, so a step of the host
@@ -95,12 +87,11 @@ pub struct EvolutionFlightReadings {
 }
 
 impl EvolutionFlightReadings {
-    /// The readings of a process that runs flights, with the wall those flights
-    /// are bounded by.
-    pub fn new(dir: impl Into<PathBuf>, wall_secs: u64) -> Self {
+    /// The readings of a process that runs flights.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: resolve_change_dir(&dir.into()),
-            budget_secs: Some(wall_secs),
+            publishes: true,
             started: Mutex::new(None),
         }
     }
@@ -109,7 +100,7 @@ impl EvolutionFlightReadings {
     pub fn none(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: resolve_change_dir(&dir.into()),
-            budget_secs: None,
+            publishes: false,
             started: Mutex::new(None),
         }
     }
@@ -166,12 +157,11 @@ impl Drop for Flight {
 #[async_trait]
 impl Observable for EvolutionFlightReadings {
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
-        let Some(wall) = self.budget_secs else {
+        if !self.publishes {
             return Ok(Vec::new());
-        };
+        }
         let dir = self.dir.display().to_string();
-        let mut out = vec![RawMetric::new(FLIGHT_BUDGET_SECONDS_METRIC, wall as f64)
-            .with_label(DIR_LABEL, dir.clone())];
+        let mut out = Vec::new();
         if let Some(age) = self.age_secs() {
             out.push(RawMetric::new(FLIGHT_SECONDS_METRIC, age as f64).with_label(DIR_LABEL, dir));
         }
@@ -206,19 +196,15 @@ mod tests {
             .map(|m| m.value)
     }
 
-    /// The flight publishes its age *and* the wall on the same axis, and the
-    /// label that joins them to the queue readings is the resolved directory --
-    /// the same string `EvolutionQueueReadings` reports.
+    /// The flight publishes its age, and the label that joins it to the queue
+    /// readings is the resolved directory -- the same string
+    /// `EvolutionQueueReadings` reports.
     #[tokio::test]
-    async fn an_in_flight_change_publishes_its_age_and_the_wall() {
+    async fn an_in_flight_change_publishes_its_age() {
         let dir = tempfile::tempdir().unwrap();
-        let readings = Arc::new(EvolutionFlightReadings::new(dir.path(), 5400));
+        let readings = Arc::new(EvolutionFlightReadings::new(dir.path()));
         let flight = readings.begin();
         assert_eq!(value(&readings, FLIGHT_SECONDS_METRIC).await, Some(0.0));
-        assert_eq!(
-            value(&readings, FLIGHT_BUDGET_SECONDS_METRIC).await,
-            Some(5400.0)
-        );
         let labels = metrics(&readings)
             .await
             .into_iter()
@@ -230,13 +216,10 @@ mod tests {
             Some(&dir.path().display().to_string())
         );
         drop(flight);
-        // The flight is over: the age series is gone, and what remains is the
-        // wall, which is a property of the process rather than of the flight.
+        // The flight is over: the age series is gone rather than left standing,
+        // which is what makes "no flight" and "a flight that just started"
+        // different readings.
         assert_eq!(value(&readings, FLIGHT_SECONDS_METRIC).await, None);
-        assert_eq!(
-            value(&readings, FLIGHT_BUDGET_SECONDS_METRIC).await,
-            Some(5400.0)
-        );
     }
 
     /// The age is derived when the scrape arrives, from a stamp the flight left
@@ -244,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn the_age_is_computed_at_the_scrape() {
         let dir = tempfile::tempdir().unwrap();
-        let readings = Arc::new(EvolutionFlightReadings::new(dir.path(), 5400));
+        let readings = Arc::new(EvolutionFlightReadings::new(dir.path()));
         let flight = readings.begin();
         assert_eq!(value(&readings, FLIGHT_SECONDS_METRIC).await, Some(0.0));
         tokio::time::sleep(Duration::from_millis(1_100)).await;
@@ -259,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn a_flight_that_unwinds_is_cleared() {
         let dir = tempfile::tempdir().unwrap();
-        let readings = Arc::new(EvolutionFlightReadings::new(dir.path(), 5400));
+        let readings = Arc::new(EvolutionFlightReadings::new(dir.path()));
         let panicking = Arc::clone(&readings);
         let joined = tokio::spawn(async move {
             panicking
@@ -272,7 +255,7 @@ mod tests {
     }
 
     /// A process that runs no flights publishes nothing at all, rather than a
-    /// zero wall that would read as a flight bounded at zero seconds.
+    /// zero that would read as a flight which started this instant.
     #[tokio::test]
     async fn a_process_that_runs_no_flights_publishes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -281,13 +264,13 @@ mod tests {
     }
 
     /// A flight that just started reads as running for zero seconds, and not as
-    /// no flight at all. The two are the states a rule tells apart -- "over its
-    /// wall" versus "nothing is being verified" -- so the reading has to have a
+    /// no flight at all. The two are the states a reader tells apart -- "a change
+    /// is being verified" versus "nothing is" -- so the reading has to have a
     /// distinct value for each from the first instant of the flight.
     #[tokio::test]
     async fn a_flight_at_its_first_instant_is_not_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let readings = Arc::new(EvolutionFlightReadings::new(dir.path(), 3600));
+        let readings = Arc::new(EvolutionFlightReadings::new(dir.path()));
         let entered = readings.begin();
         assert_eq!(value(&readings, FLIGHT_SECONDS_METRIC).await, Some(0.0));
         drop(entered);
@@ -300,7 +283,7 @@ mod tests {
     /// it differently.
     #[test]
     fn the_directory_is_resolved_the_way_the_queue_reads_it() {
-        let readings = EvolutionFlightReadings::new("./evolution-changes", 3600);
+        let readings = EvolutionFlightReadings::new("./evolution-changes");
         assert_eq!(
             readings.dir,
             resolve_change_dir(std::path::Path::new("./evolution-changes"))

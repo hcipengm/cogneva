@@ -4,25 +4,25 @@
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// 整轮预算里留给下一拍启动的余量。
+/// 整轮预期工期里留给节拍本身的余量。
 ///
-/// 检查点整轮（枚举全部在跑任务并逐个落点）必须在下一拍到来之前交还控制权，
-/// 否则 beat 停一次、告警就把这条循环记成卡住。余量是「一拍要留多久给节拍本身」
-/// 的取值：小于一个 DB 往返的抖动就会误判，大过一拍就没有轮次可跑。
-// cap: bound — 小于一个 DB 往返的抖动会误判，大过一拍就没有轮次可跑
+/// 一轮检查点通常在下一拍到来之前就做完了；超过这个点还没有交还控制权，就
+/// 发一条告警（不会切断——见下面的 [`checkpoint_round_budget`]）。余量的取值
+/// 是「一拍要留多久给节拍本身」：小于一个 DB 往返的抖动就会天天误报。
+// cap: bound — 只决定告警点落在哪；不取消任何一轮
 const CHECKPOINT_ROUND_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 整轮预算的下限：节拍再密，也要给一轮留出这么久。
+/// 整轮预期工期的下限：节拍再密，也要给一轮留出这么久，否则告警每轮都响。
 ///
-/// 没有这个下限时，节拍小于余量的部署会得到「零预算」——每轮都被判超时，
-/// 循环看上去永远在超支。10s 是一轮落点在健康集群里的实测耗时上限。
-// cap: bound — 10s 是一轮落点在健康集群里的实测耗时上限；没有这个下限，节拍小于余量的部署每轮都被判超支
+/// 10s 是一轮落点在健康集群里的实测耗时上限。
+// cap: bound — 10s 是一轮落点在健康集群里的实测耗时上限；没有这个下限，节拍小于余量的部署每轮都告警
 const MIN_CHECKPOINT_ROUND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// 一轮检查点允许占用的时间，由它自己的节拍推出。
+/// 一轮检查点的预期工期，由它自己的节拍推出。
 ///
-/// 随节拍动而不是写死：部署把间隔调大，这条界跟着放大；调小到下限以下，
-/// 由下限兜住。返回值恒小于 `cadence`，所以 beat 之间总有空隙。
+/// 随节拍动而不是写死：部署把间隔调大，这个预期跟着放大；调小到下限以下，
+/// 由下限兜住。过了它只发一条告警并继续等——一轮里可能已经落下若干续跑点，
+/// 切断会把它们作废，而没轮到的任务下一拍还要从头再来。
 fn checkpoint_round_budget(cadence: std::time::Duration) -> std::time::Duration {
     std::cmp::max(
         cadence.saturating_sub(CHECKPOINT_ROUND_MARGIN),
@@ -847,31 +847,26 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                 beat.beat();
                                                 tokio::select! {
                                                     _ = interval.tick() => {
-                                                        match tokio::time::timeout(
-                                                            round_budget,
-                                                            checkpoint_orchestrator
-                                                                .checkpoint_owned_tasks(
-                                                                    agents.as_ref(),
-                                                                ),
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(saved) => {
-                                                                if saved > 0 {
-                                                                    tracing::debug!(
-                                                                        saved,
-                                                                        "task checkpoint producer wrote resume points"
-                                                                    );
-                                                                }
-                                                            }
-                                                            Err(_) => {
-                                                                tracing::warn!(
-                                                                    budget_secs =
-                                                                        round_budget
-                                                                            .as_secs(),
-                                                                    "task checkpoint round exceeded its budget and was cut short; some tasks were not checkpointed this cycle"
-                                                                );
-                                                            }
+                                                        // 一轮超过预期就发一条告警继续等：切断会让
+                                                        // 这一轮已经落下的点作废、没轮到的那几个任务
+                                                        // 下一拍从头再来。等的时候 beat 照走，所以
+                                                        // 存活读数不会把「慢」读成「停」。
+                                                        let saved =
+                                                            cog_core::declared_wall::wait_past_wall_beating(
+                                                                round_budget,
+                                                                "task checkpoint round",
+                                                                || beat.beat(),
+                                                                checkpoint_orchestrator
+                                                                    .checkpoint_owned_tasks(
+                                                                        agents.as_ref(),
+                                                                    ),
+                                                            )
+                                                            .await;
+                                                        if saved > 0 {
+                                                            tracing::debug!(
+                                                                saved,
+                                                                "task checkpoint producer wrote resume points"
+                                                            );
                                                         }
                                                     }
                                                     _ = checkpoint_shutdown.wait() => break,

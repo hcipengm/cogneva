@@ -75,14 +75,6 @@ const ENV_BUILDAH: &str = "COGNEVA_EVAL_BUILDAH";
 /// 实测 3.7 MB/s。走镜像站就要把「镜像站给的是不是同一件东西」当成一条判据，所以换过之后
 /// 镜像 ref 会随读数一起出去，读的人看得见这份分是从哪一份镜像来的。
 const ENV_IMAGE_MIRROR: &str = "COGNEVA_EVAL_IMAGE_MIRROR";
-/// 单次容器命令的时间上界（秒）。
-///
-/// 实测一次完整的判分（`npm install` ＋ 跑测试）约 100 秒，一次镜像拉取约 60 秒。这里取 900
-/// 是一个宽得多的**安全上界**，不是量出来的界，所以它可覆盖；它的意义是让一条卡住的命令
-/// 变成一次带原因的失败，而不是一个永远挂在那里的格子。
-const ENV_TIMEOUT_SECS: &str = "COGNEVA_EVAL_CONTAINER_TIMEOUT_SECS";
-// cap: bound — a wide safety ceiling over a measured 100-second score plus a 60-second pull
-const DEFAULT_TIMEOUT_SECS: u64 = 900;
 /// 默认那份（overlay）起不来时换的那一份。选 vfs 而不是 fuse-overlayfs：后者要 Pod 里再装
 /// 一个二进制与一份 `/etc/containers/storage.conf`，而 vfs 是 buildah 自带的、只要一个参数。
 /// 代价写在 `adopt_storage_driver` 上——那是一次性的，而这一族现在一次都跑不起来。
@@ -98,12 +90,11 @@ const ENV_RUNTIME: &str = "COGNEVA_EVAL_CONTAINER_RUNTIME";
 /// 为什么是制表符：名字与列名里不会出现制表符，而命令里什么都会出现——命令是这三段里
 /// 唯一一段自由文本，所以它放最后、占满余下全部。
 pub const ENV_FOREIGN_FLOWS: &str = "COGNEVA_EVAL_FOREIGN_FLOWS";
-/// 一支外部流派跑一次的三条上限：时间、核数、内存。**一起给，缺一条整条声明不成立**。
+/// 一支外部流派跑一次的上限：核数、内存。**一起给，缺一条整条声明不成立**。
 ///
-/// 不给一个猜来的默认值：外部流派的循环不在我们手里，上限就是这次跑唯一能管的那个旋钮，
-/// 而「上限是多少」是被实验定义的东西，不是这里能替人拍的数。给个默认值，读表的人会以为
-/// 那个数是量出来的——见 `ExecLimits`。
-pub const ENV_FOREIGN_WALL_SECS: &str = "COGNEVA_EVAL_FOREIGN_WALL_SECS";
+/// 墙上时钟那一条在 2026-11-10 拆掉了：它判的是「跑了多久」，不是「还在不在动」，
+/// 而一道一直在产出、只是慢的题会因此被判成失败——丢掉的正是还算得出来的那一格。
+/// 停住改由外层的产出看门狗判（`cog_core::progress`），判词里带两个实数。
 pub const ENV_FOREIGN_CPUS: &str = "COGNEVA_EVAL_FOREIGN_CPUS";
 pub const ENV_FOREIGN_MEMORY_MB: &str = "COGNEVA_EVAL_FOREIGN_MEMORY_MB";
 
@@ -195,9 +186,9 @@ fn foreign_limits() -> Result<ExecLimits, String> {
         std::env::var(key)
             .map_err(|_| {
                 format!(
-                    "external flows are declared but `{key}` is not set: how long a foreign flow \
-                     may run and how much of this machine it may take is the one knob this run \
-                     can hold on a loop that is not ours, and this build will not invent it"
+                    "external flows are declared but `{key}` is not set: how much of this \
+                     machine a foreign flow may take is the one knob this run can hold on a \
+                     loop that is not ours, and this build will not invent it"
                 )
             })?
             .trim()
@@ -211,11 +202,9 @@ fn foreign_limits() -> Result<ExecLimits, String> {
                 }
             })
     };
-    let wall = number(ENV_FOREIGN_WALL_SECS)?;
     let cpus = number(ENV_FOREIGN_CPUS)?;
     let memory_mb = number(ENV_FOREIGN_MEMORY_MB)?;
     Ok(ExecLimits {
-        wall_clock: Duration::from_secs(wall as u64),
         cpus: cpus as f32,
         memory_bytes: (memory_mb * 1024.0 * 1024.0) as u64,
     })
@@ -249,7 +238,6 @@ pub struct BuildahRuntime {
     /// 默认先试 `sudo -n buildah`。构造时**探**出来，不写死。
     prefix: Vec<String>,
     mirror: Option<String>,
-    timeout: Duration,
     /// 这台宿主的 store 里现在有哪些镜像 ref。**问一次，整跑记着**：这是一条普查读数，
     /// 每道题各问一遍等于把一次便宜的问摊成题数那么多次。`None` ＝ 问不出来（命令失败或
     /// 这份 buildah 不认 `images`），这时调用方不许把「问不出来」当成「本地没有」。
@@ -276,11 +264,6 @@ impl BuildahRuntime {
         {
             return Ok(None);
         }
-        let timeout = std::env::var(ENV_TIMEOUT_SECS)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         let mirror = std::env::var(ENV_IMAGE_MIRROR)
             .ok()
             .map(|m| m.trim().trim_end_matches('/').to_string())
@@ -306,7 +289,6 @@ impl BuildahRuntime {
                 return Ok(Some(Self {
                     prefix,
                     mirror,
-                    timeout,
                     images: tokio::sync::Mutex::new(None),
                     storage: tokio::sync::OnceCell::new(),
                 }));
@@ -380,19 +362,23 @@ impl BuildahRuntime {
     /// 而真相是「这台机器没跑完」。
     async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
         let mut cmd = self.command();
-        cmd.args(args_with_driver(self.storage_driver(), args));
-        let child = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("cannot run `{}`: {e}", self.prefix.join(" ")))?;
-        let out = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
-            Ok(res) => res?,
-            Err(_) => anyhow::bail!(
-                "`{} {}` did not finish within {:?}",
+        cmd.args(args_with_driver(self.storage_driver(), args))
+            .kill_on_drop(true);
+        // 判停读的是这条命令**还在不在产出**，不是它跑了多久（2026-11-10 拆掉
+        // `self.timeout`）：判据与编排侧的回收共用 `cog_core::progress` 那一条，
+        // 量不到窗口时不判。
+        let id = format!("eval-container:{}", next_exec_id());
+        let out = match cog_core::progress::run_child_watched(cmd, &id).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => anyhow::bail!(
+                "`{} {}` stopped moving: no output for {:?}, and this deployment's measured \
+                 any gap this deployment has ever seen between steps is {:?}",
                 self.prefix.join(" "),
                 args.first().map(String::as_str).unwrap_or(""),
-                self.timeout
+                silent,
+                window
             ),
+            Err(e) => anyhow::bail!("cannot run `{}`: {e}", self.prefix.join(" ")),
         };
         Ok(RunOutcome {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -916,43 +902,36 @@ impl ExecRunner for ContainerForeignRunner {
     }
 }
 
-/// 起一支外部流派的脚本：三条上限都落在这里。
+/// 起一支外部流派的脚本。
 ///
-/// 上限落在**这一次执行**上而不是容器上：这台容器判分那一步还要用，给容器上一条内存界会把
-/// 判分自己也框住，那是另一个改动。所以用 shell 能设的这几条界，它们只作用在这段里。
+/// 只剩**内存**一条界，而且它落在**这一次执行**上而不是容器上：这台容器判分那一步还要用，
+/// 给容器上一条内存界会把判分自己也框住。
+///
+/// 墙上时钟与 CPU 秒这两条界在 2026-11-10 拆掉了：它们判的是「跑了多久」，不是「还在不在
+/// 动」。一道一直在产出、只是慢的题与一道第一秒就卡死的题在那条判据下是同一个读数，而它
+/// 更贵的代价在后面——被它掐掉的那次跑花掉的时间不进任何样本，于是「这条界合不合适」永远
+/// 量不出来。现在停住由外层看门狗按**产出**判（`cog_core::progress`），它读的是这条命令
+/// 上一次印东西是什么时候，与这份部署实测过的最长步间隔比。
 fn foreign_script(entrypoint: &str, limits: ExecLimits) -> String {
-    let wall = limits.wall_clock.as_secs().max(1);
-    // `RLIMIT_CPU` 的单位是**核·秒**：给 n 个核、T 秒，最多就是 n·T 个 CPU 秒。这是从那
-    // 一对值**导出**的一条界，不是另拍的一个数。
-    let cpu_secs = ((limits.cpus.max(0.0) as f64) * wall as f64)
-        .ceil()
-        .max(1.0) as u64;
     let memory_kb = (limits.memory_bytes / 1024).max(1);
     format!(
         "if ! ulimit -v {memory_kb}; then \
            echo \"cannot apply the memory cap: ulimit -v {memory_kb}\" >&2; exit 125; \
          fi\n\
-         if ! ulimit -t {cpu_secs}; then \
-           echo \"cannot apply the cpu cap: ulimit -t {cpu_secs}\" >&2; exit 125; \
-         fi\n\
-         timeout -k 10 {wall} bash -lc {cmd}",
+         bash -lc {cmd}",
         cmd = shq(entrypoint)
     )
 }
 
 /// 这一跑算不算它自己收工的。
 ///
-/// 撞上限与「它自己说不做了」必须分开：前者要问上限是不是给少了，后者要换方法。判据是退出码
-/// ——`timeout(1)` 到点动手用的是 124，`ulimit -t`（CPU 界）到点用的是 SIGXCPU（152），
-/// `ulimit -v` 撞上一般表现为进程被 OOM 掉（137）。这几个码只在这条脚本设的界上出现，而
-/// 这几个界都是组合根给的。
+/// 撞上限与「它自己说不做了」必须分开：前者要问上限是不是给少了，后者要换方法。墙上时钟
+/// 拆掉之后，这条脚本自己设的界只剩内存一条（`ulimit -v`），撞上一般表现为进程被 OOM 掉
+/// （137）。124/152 现在只会来自**这道题自己的** `timeout`/`ulimit`，不再是我们设的界打的，
+/// 所以不再按「撞了我们的界」记。
 fn foreign_finish(code: Option<i32>) -> FinishReason {
     match code {
         Some(0) => FinishReason::Answered,
-        // 152 = 128 + 24（SIGXCPU，CPU 界）。
-        Some(124) | Some(152) => FinishReason::ResourceLimit,
-        // 137 = 128 + 9（SIGKILL）：要么是 `timeout -k` 那一枪，要么是内存界把它 OOM 掉。
-        // 分不清是哪一件，但两件都是**我们设的界**打的，所以按界记。
         Some(137) => FinishReason::ResourceLimit,
         _ => FinishReason::Failed,
     }
@@ -1442,7 +1421,6 @@ docker.m.daocloud.io/library/busybox:1.36
         BuildahRuntime {
             prefix: vec!["sudo".into(), "-n".into(), "buildah".into()],
             mirror: mirror.map(str::to_string),
-            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             images: tokio::sync::Mutex::new(None),
             storage: tokio::sync::OnceCell::new(),
         }
@@ -1450,7 +1428,6 @@ docker.m.daocloud.io/library/busybox:1.36
 
     fn limits() -> ExecLimits {
         ExecLimits {
-            wall_clock: Duration::from_secs(900),
             cpus: 2.0,
             memory_bytes: 4 * 1024 * 1024 * 1024,
         }
@@ -1520,14 +1497,24 @@ docker.m.daocloud.io/library/busybox:1.36
         assert!(err.contains("twice"), "{err}");
     }
 
+    /// 脚本里只剩内存这一条界（2026-11-10 拆掉墙上时钟与 CPU 秒）。
+    ///
+    /// 这一格在没有改动时会红：旧脚本里有 `timeout -k 10 900` 与 `ulimit -t 1800`。
+    /// 判据是「界的是跑了多久还是还在不在动」——钟那种形状的界不许再回到这条脚本里，
+    /// 否则外层的产出看门狗之外又有一个能掐断工作单元的钟，而它不留下任何读数。
     #[test]
-    fn the_three_caps_all_land_in_the_script() {
+    fn the_script_carries_the_memory_cap_and_no_clock() {
         let script = foreign_script("sweagent solve", limits());
         // 内存界按 KB 给（ulimit -v 的单位是 KB）。
         assert!(script.contains("ulimit -v 4194304"), "{script}");
-        // CPU 界是**导出**的：2 核 × 900 秒 = 1800 核·秒，不是另拍的数。
-        assert!(script.contains("ulimit -t 1800"), "{script}");
-        assert!(script.contains("timeout -k 10 900"), "{script}");
+        assert!(
+            !script.contains("timeout -k"),
+            "一条按钟杀工作单元的 `timeout` 又回到了脚本里：{script}"
+        );
+        assert!(
+            !script.contains("ulimit -t"),
+            "CPU 秒数是从墙上时钟导出的一条钟界，它随墙上时钟一起拆掉：{script}"
+        );
         // 命令原样进去，且被引起来：不引的话里面的元字符会静默改写参数。
         assert!(script.contains("'sweagent solve'"), "{script}");
     }
@@ -1541,11 +1528,14 @@ docker.m.daocloud.io/library/busybox:1.36
     }
 
     #[test]
-    fn hitting_a_cap_we_set_is_not_reported_as_the_flow_giving_up() {
+    fn only_the_memory_cap_we_set_reads_as_our_cap_and_not_as_the_flow_giving_up() {
         assert_eq!(foreign_finish(Some(0)), FinishReason::Answered);
-        assert_eq!(foreign_finish(Some(124)), FinishReason::ResourceLimit);
-        assert_eq!(foreign_finish(Some(152)), FinishReason::ResourceLimit);
         assert_eq!(foreign_finish(Some(137)), FinishReason::ResourceLimit);
+        // 124 与 152 是 `timeout` 与 `ulimit -t` 的退出码。我们不再设这两条界，所以它们
+        // 只可能来自**这道题自己的**脚本；把它记成「撞了我们的界」会让读的人去抬一个
+        // 我们已经没有的上限。
+        assert_eq!(foreign_finish(Some(124)), FinishReason::Failed);
+        assert_eq!(foreign_finish(Some(152)), FinishReason::Failed);
         assert_eq!(foreign_finish(Some(1)), FinishReason::Failed);
         // 没有退出码＝被信号打断，不是它自己收工。
         assert_eq!(foreign_finish(None), FinishReason::Failed);

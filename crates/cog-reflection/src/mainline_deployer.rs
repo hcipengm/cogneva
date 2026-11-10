@@ -47,7 +47,6 @@ use crate::registry_footprint::MANIFEST_ACCEPTS;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
-use crate::change_execution::{KUBECTL_READ_TIMEOUT_SECS, KUBECTL_TIMEOUT_SECS};
 use crate::config::{CodePlatform, MainlineDeployerConfig, RolloutTargetConfig};
 use crate::rollout_resources::RolloutResourceReading;
 use crate::version_contract::VersionReadings;
@@ -294,6 +293,10 @@ const SEED_TAG: &str = "seed";
 /// 对应写下的名字，`tag_rev` 与 `main_tag` 两端都取它。
 pub(crate) const MAIN_TAG_PREFIX: &str = "main-";
 
+/// 滚动 Job 的进度文件路径：容器 env 与存活探针读的是同一个字符串，两者都由
+/// `cog_core::progress` 定义的那条命令对齐。
+const PROGRESS_FILE: &str = "/var/run/cogneva-progress/beat";
+
 /// 一轮里最多回收几批镜像库里的老镜像（每批 [`BUILDAH_RMI_BATCH_CHUNK`] 张）。
 ///
 /// 计划本身不设上限是有意的（见 `buildah_store`：保留集就是那个上限，给"可重建的
@@ -309,11 +312,6 @@ const BUILDAH_RMI_BATCHES_PER_ROUND: u64 = 2;
 // cap: bound — 每批删几张，与上面那个数一起构成一轮的上界
 const BUILDAH_RMI_BATCH_CHUNK: usize = 32;
 
-/// 构建那一段里 strip 那一跳的墙钟上界。与 cargo 构建分成两跳（失败不致命），
-/// 所以构建那一段的墙是"cargo 的墙 + 这个数"。
-// cap: bound — strip 与 cargo 分成两跳（失败不致命），构建那一段的墙是 cargo 的墙加这个数
-const STRIP_WALL_SECS: u64 = 60;
-
 /// 判定 Job 还在跑时，就地轮询它的间隔。
 ///
 /// 这个数是"看见它退出"的延迟，不是"等它跑完"的时间：判定本身要跑几分钟，而
@@ -324,9 +322,11 @@ const JUDGEMENT_POLL_SECS: u64 = 15;
 
 /// 部署器这一轮愿意为一次判定等多久。
 ///
-/// 判定的期限是它自己声明的那几段加起来，而其中两段发生在它碰集群**之前**：问一次上游
-/// CI，以及「还在跑」时等到判词的那段等待。这一轮的等待至少要把这两段盖住——比它短的
-/// 预算保证部署器先走，判词被推迟到下一轮，而下一轮是十分钟之后。界长了不算浪费：判定
+/// 这不是 Job 的期限——Job 已经没有期限了，它的死活由容器上的存活探针按进度文件判。
+/// 这个数只是**派发方的耐心**：等等不到就先走，下一轮再来看（Job 名是确定的，重新
+/// apply 不会派重）。其中两段发生在判定进程碰集群**之前**：问一次上游 CI，以及
+/// 「还在跑」时等到判词的那段等待。这一轮的等待至少要把这两段盖住——比它短的预算
+/// 让部署器先走，判词被推迟到下一轮，而下一轮是十分钟之后。界长了不算浪费：判定
 /// 在飞的时候这一轮本来也不会去追更新的 rev。
 fn judgement_wait_budget(soak_secs: u64, rollout_timeout_secs: u64) -> Duration {
     Duration::from_secs(
@@ -336,54 +336,6 @@ fn judgement_wait_budget(soak_secs: u64, rollout_timeout_secs: u64) -> Duration 
             + crate::mainline_rollout::CI_PENDING_WAIT_SECS,
     )
 }
-
-/// 打镜像每一步各自的墙钟上界。步名说的是这一步在干什么，不是 buildah 的子命令
-/// 名——同一个子命令在两条路径上的墙不同（`images --json` 要列整个库，`images -q`
-/// 只问一个 tag 在不在），按子命令归并就把其中一条的墙挪到了另一条上。
-///
-/// **这表是这些墙的唯一来源**：每条命令经 [`MainlineDeployer::buildah_step`] 从表里
-/// 取自己的墙（取不到就 panic，绝不回落到字面量），这一轮声明出去的工期界也从这
-/// 张表取最长的那个（[`MainlineDeployer::round_work_secs`]）。两处各写一个数，就
-/// 等于让"声明节拍的人"和"卡住命令的人"量两个不同的数，读到的界也就不再是这条
-/// 循环真正在跑的那个界。
-const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
-    ("base-from", 1800),
-    ("release-container", 60),
-    ("copy-binary", 300),
-    ("copy-asset", 300),
-    ("web-builder-from", 1800),
-    ("web-copy-src", 600),
-    ("web-build", 1800),
-    ("web-mount", 120),
-    ("web-umount", 120),
-    ("web-builder-rm", 120),
-    ("clear-web", 300),
-    ("copy-web", 300),
-    ("verify-web", 120),
-    ("copy-manifest", 60),
-    ("check-version", 120),
-    ("label-revision", 60),
-    ("commit-image", 600),
-    // 覆盖（不是导出）：2026-11-08 那一次，registry 第一个 blob 的 HEAD 落在 16:21:28，
-    // 16:36:29 收到 `client disconnected during blob PATCH … copied=123352539`——901 秒，
-    // 正好是这一跳的墙把它砍掉，而那时传输还没停。被砍一次这一整轮就白费：下一轮从建镜像
-    // 重来（`cogneva_mainline_build_seconds{outcome="ok"}` 实测 738 秒），再排一次推。而且
-    // 被砍时已经推上去的那些层留在 registry 的盘上，没有任何 manifest 引用它们，要等 registry
-    // 下一次重启跑 GC 才收得走——**推失败连着几次，填的就是 registry 自己的卷**。
-    //
-    // 为什么它本来就要这么久、而不是"少传一点"：相邻两个 rev 的 manifest 逐层比过，只差一层，
-    // registry 里其余那些层的 HEAD 全是 200，可这一推仍然逐层重传了 554 秒（16:22:26→16:31:40，
-    // 约 30 次 blob 上传）还没传完。**这一跳的时长与那一层的增量无关，只与整幅镜像的层数和
-    // 那条链路的带宽有关**——所以它该由「这一跳自己的时长读数」导出，
-    // 不该是凭感觉的数（`cogneva_mainline_build_seconds` 就是这么做的：实测值当读数发布）。
-    // 在那条读数落地之前它是覆盖：钉死 1800，并写明为什么是它。
-    //
-    // 取 1800 还有一个后果要留意：`round_work_secs` 取的是表里最长的那一步，而 1800 已经
-    // 是 `base-from`/`web-build` 的值，所以这一改**不动**这一轮声明出去的工期界。
-    ("push-image", 1800),
-    ("list-store", 300),
-    ("remove-images", 900),
-];
 
 /// 推进连输几轮之后，这一方就去**认领下一个构建名额**（见
 /// `crate::build_gate::reserve_build_field`）。
@@ -419,19 +371,12 @@ const ADVANCE_CLAIM_AFTER_DEFERRALS: u32 = 3;
 // cap: bound — 等满一分钟还没轮到的按被拒处理，下一拍重新排队
 const ADVANCE_BUILD_WAIT: Duration = Duration::from_secs(60);
 
-/// `kubectl auth can-i` 的墙：30s。
+/// 一次 socket 读最多收多少字节。
 ///
-/// 这一步只问一句权限，正常是百毫秒级；30s 是「apiserver 正忙但仍然活着」与
-/// 「叫不动了」之间的分界，报错文案跟着这个数走。
-// cap: bound — 分界「apiserver 正忙但活着」与「叫不动了」，报错文案跟着这个数走
-const KUBECTL_AUTHZ_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 一次带 stdin 的 `kubectl` 调用的墙：60s。
-///
-/// 这里跑的是 apply/create 这类会写进 apiserver 的动作，慢在一次提交的落库与
-/// admission 链；比只读多给一倍，是因为超时后的重试会留下半完成的资源。
-// cap: bound — 写动作慢在一次提交的落库与 admission 链，比只读多给一倍
-const KUBECTL_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 它不是界：判停画在两次字节之间（`READ_TIMEOUT` 内一个字节都没进来才算停），
+/// 块多大只影响系统调用的次数。
+// cap: bound — 读缓冲容量，不改变判据：判停画在两次字节之间，块大小只影响系统调用次数
+const HTTP_READ_CHUNK: usize = 64 * 1024;
 
 /// 稳定叠层基底的 tag：`<registry>/cogneva:seed`。
 ///
@@ -908,19 +853,6 @@ pub(crate) const FATAL_WAITING_REASONS: &[&str] = &[
     "CrashLoopBackOff",
 ];
 
-/// How many read-only pre-flight reads may each spend a whole wait budget
-/// retrying: the support-workload generations before the apply, the same
-/// reading after it, and the workloads' ConfigMap consumers.
-///
-/// All three are reads taken before anything changes, and all three are
-/// allowed to retry for the wait budget when the cluster does not answer (a
-/// single expired attempt is a stall, not a verdict). The Job's deadline is
-/// derived from this count as well as from the per-target budgets, because a
-/// Job killed by its deadline never runs its own rollback — that half-rolled
-/// cluster is what the deadline exists to prevent.
-// cap: bound — 被截止时间杀掉的 Job 不会跑自己的回滚，那个半滚的集群正是截止时间要防的
-const PREFLIGHT_RETRYING_READS: u64 = 3;
-
 /// 支撑工作负载等不到就绪时，贴在判词后面的现场读数与主判词之间的分隔。**判据
 /// 只读它前面那一段**（见 [`primary_message`]）：分隔之后的内容来自集群（Pod 的
 /// `waiting.message`、调度器的 message、kubectl 自己的 stderr），里面出现
@@ -1098,6 +1030,7 @@ const CLUSTER_UNREACHABLE_PATTERNS: &[&str] = &[
     "i/o timeout",
     "Client.Timeout",
     crate::cmd_timeout::TIMED_OUT_AFTER,
+    crate::cmd_timeout::WENT_SILENT,
 ];
 
 /// 错误文本是否是集群访问故障（而非版本缺陷）。纯函数：判据只认文本，
@@ -2160,10 +2093,11 @@ fn killed_reason(
 /// 语义正是"此刻不成、换个时刻可能就成了"，与"任何非零即失败"（版本类走 1）不
 /// 冲突。部署器只在 Job 已失败时读一次终止码，正常路径不多花一次 kubectl。
 ///
-/// 只认这一个确切的码：137/143 这类信号终止码同时对应 OOM、驱逐与
-/// `activeDeadlineSeconds` 到点，**在退出码上**判不出类别，按版本类靠。三种杀法
-/// 本身在 Pod 状态里是可分的（`state.terminated.reason` 与 Pod 的 `status.reason`），
-/// 所以那一侧的原因不丢：落点里的 [`KilledReason`] 就是它。
+/// 只认这一个确切的码：137/143 这类信号终止码同时对应 OOM 与驱逐，
+/// **在退出码上**判不出类别，按版本类靠。两种杀法本身在 Pod 状态里是可分的
+/// （`state.terminated.reason` 与 Pod 的 `status.reason`），所以那一侧的原因不丢：
+/// 落点里的 [`KilledReason`] 就是它。（这个 Job 已经没有按钟杀容器的那条路了；
+/// 存活判据是进度文件。）
 // cap: bound — 与环境类退出码同源；Pod 状态里能分出它的原因，所以切分点在这一侧
 pub(crate) const ROLLOUT_EXIT_ENVIRONMENT: i32 = 75;
 
@@ -2510,8 +2444,8 @@ fn parse_pin(text: Option<&str>) -> PinReading {
 }
 
 /// 构建锁陈旧判定：持锁进程已死，或锁龄超过构建超时（进程僵死/被杀）。
-fn lock_is_stale(age_secs: u64, timeout_secs: u64, owner_still_alive: bool) -> bool {
-    !owner_still_alive || age_secs > timeout_secs
+fn lock_is_stale(owner_still_alive: bool) -> bool {
+    !owner_still_alive
 }
 
 /// 这一次进程启动的标记。
@@ -2538,8 +2472,8 @@ fn launch_token() -> u64 {
 /// 只按 pid 判活在这套部署里正好判不出最要紧的那一种死法：`self_exec` 用
 /// `execve` 把自己换成新二进制，pid 不变、`/proc/<pid>` 一直在，可写锁的那个
 /// 进程镜像已经不在了，它那轮构建也随之消失。实测 2026-10-18 11:54:46 一次
-/// 切换之后，锁被下一个进程判成「仍在构建」，白等满 `build_timeout_secs`
-/// （3600 秒）才抢占，而事实上那一轮在 exec 那一刻就死了。
+/// 切换之后，锁被下一个进程判成「仍在构建」，白等到它自己放弃，而事实上那一轮
+/// 在 exec 那一刻就死了。判活因此读的是启动标记，不是墙上的秒数。
 ///
 /// 同一个 pid 只可能属于本进程（pid 在一个命名空间里唯一），所以「pid 是我们
 /// 自己的、标记却不是这一次启动的」只有一种解释：锁是同一个 pid 的上一次
@@ -3462,7 +3396,6 @@ impl MainlineDeployer {
                     &range,
                 ],
                 None,
-                30,
             )
             .await
             .ok()?;
@@ -3485,7 +3418,6 @@ impl MainlineDeployer {
                     &range,
                 ],
                 None,
-                30,
             )
             .await
             .ok()?;
@@ -3554,7 +3486,6 @@ impl MainlineDeployer {
                     tip,
                 ],
                 None,
-                30,
             )
             .await
             .ok()?;
@@ -3742,7 +3673,6 @@ impl MainlineDeployer {
                     bare,
                 ],
                 None,
-                30,
             )
             .await
             .is_ok();
@@ -3802,8 +3732,11 @@ impl MainlineDeployer {
         )
     }
 
-    /// 构建串行锁：4C/7.5G 节点禁并发构建。锁陈旧（进程死/超构建超时）
+    /// 构建串行锁：4C/7.5G 节点禁并发构建。锁陈旧（写锁的那一次启动已经不在了）
     /// 可抢占；返回 None 表示有其他构建在跑。
+    ///
+    /// 陈旧不再按「持锁多久」算：构建没有一条按秒的界了，持锁一小时可能正是它还在
+    /// 干活。判据只剩一个——写锁的那个进程还是不是写锁的那个进程。
     fn acquire_lock(&self) -> Option<BuildLock> {
         let path = self.lock_path();
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -3818,7 +3751,7 @@ impl MainlineDeployer {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let owner_alive = lock_owner_still_alive(pid, recorded_token);
-            if !lock_is_stale(age, self.cfg.build_timeout_secs, owner_alive) {
+            if !lock_is_stale(owner_alive) {
                 info!(
                     pid,
                     age_secs = age,
@@ -3837,12 +3770,20 @@ impl MainlineDeployer {
         Some(BuildLock { path })
     }
 
+    /// 跑一条子命令，判据是它还在不在动，不是跑了多久。
+    ///
+    /// 每一段输出是拍，CPU 时间在涨也是拍——编译、打包、推镜像这几段里子命令可以
+    /// 好几分钟一个字节都不写，只有 CPU 那一个证据。判据本身在
+    /// `cog_core::progress::stall`，与演进部署器、执行器的看门狗是同一条。
+    ///
+    /// 这段活要是正跑在本循环里，它的每一拍也打在这个循环自己的心跳上：否则
+    /// 「两步之间」的空档就等于整段活的长短，而这个循环要声明自己多久没跳就算
+    /// 停了（[`Self::round_work_secs`]）——那条声明会随步骤变长而变假。
     async fn run_cmd(
         &self,
         program: &str,
         args: &[&str],
         workdir: Option<&Path>,
-        timeout_secs: u64,
     ) -> SFResult<String> {
         let cmdline = format!("{} {}", program, args.join(" "));
         let mut cmd = tokio::process::Command::new(program);
@@ -3850,11 +3791,30 @@ impl MainlineDeployer {
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }
-        let fut = cmd.output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
-            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let id = format!("mainline-{}", cmdline);
+        let outcome = match self.loop_beat.get().cloned() {
+            Some(beat) => {
+                cog_core::progress::run_child_watched_with_pid_and_observer(
+                    cmd,
+                    &id,
+                    |_pid| {},
+                    move || beat.beat(),
+                )
+                .await
+            }
+            None => cog_core::progress::run_child_watched(cmd, &id).await,
+        }
+        .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        let output = match outcome {
+            cog_core::progress::ChildOutcome::Exited(output) => output,
+            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} stopped moving: no output and no CPU time for {silent:?}, \
+                     longer than any gap this deployment has ever seen between steps of a \
+                     command that was still working ({window:?}); it was killed"
+                )));
+            }
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3873,50 +3833,32 @@ impl MainlineDeployer {
     /// 里第几份资产。在每一步的边界上打点之后，两跳之间的空档就恒等于最长的那一步，
     /// 界才只用覆盖它，也才对得上 [`MainlineDeployer::round_work_secs`] 声明的那个数。
     /// 一次性调用路径（没有循环在跑）不装载句柄，打点自然不发生。
-    async fn buildah(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+    async fn buildah(&self, args: &[&str]) -> SFResult<String> {
         if let Some(beat) = self.loop_beat.get() {
             beat.beat();
         }
         let (root, runroot) = (buildah_storage(), buildah_runroot());
         let mut full: Vec<&str> = vec!["--root", &root, "--runroot", &runroot];
         full.extend_from_slice(args);
-        self.run_cmd(&self.cfg.builder_bin, &full, None, timeout_secs)
-            .await
+        self.run_cmd(&self.cfg.builder_bin, &full, None).await
     }
 
-    /// 按步名跑一条 buildah 子命令，墙钟上界取自 [`BUILDAH_STEP_WALLS`]。
+    /// 按步名跑一条 buildah 子命令。
     ///
-    /// 这个包装存在的理由只有一个：让"这条命令最多跑多久"只有一个来源。直接传
-    /// 字面量的话，这一轮声明出去的工期界与命令实际被卡的时长就是两份数——而它们
-    /// 一旦分家，界少算了不会报错，只会让停摆告警在健康的轮上响。
-    async fn buildah_step(&self, step: &str, args: &[&str]) -> SFResult<String> {
-        let wall = BUILDAH_STEP_WALLS
-            .iter()
-            .find(|(name, _)| *name == step)
-            .map(|(_, wall)| *wall)
-            .unwrap_or_else(|| {
-                panic!("{step} 不是 BUILDAH_STEP_WALLS 里声明的步骤：加上它，或者别从这里走")
-            });
-        self.buildah(args, wall).await
-    }
-
-    /// 最长的一步能卡多久——`buildah` 每次开工前都打点，所以这是"两跳之间"能有多长
-    /// 的那个被卡住的步长。
-    fn buildah_max_step_wall_secs() -> u64 {
-        BUILDAH_STEP_WALLS
-            .iter()
-            .map(|(_, wall)| *wall)
-            .max()
-            .unwrap_or(0)
+    /// 步名只留给读代码的人和日志：每一步多久算完不再有张表，判据是这一步还在不在
+    /// 动（[`Self::run_cmd`]）。原先那张按步名写的墙表要的正是「这条命令最长能跑
+    /// 多久」，而那个数对推镜像那一步来说永远是猜的——2026-11-08 实测一次 901 秒的
+    /// 推送正好被墙砍在传输中间，整轮白费，还留下一批没人引用的层等 registry 自己
+    /// 回收。还在传输就不该被砍，这是「动不动」能判出来的，墙判不出来。
+    async fn buildah_step(&self, _step: &str, args: &[&str]) -> SFResult<String> {
+        self.buildah(args).await
     }
 
     /// 这条循环向存活判据声明的一轮工期界：两跳之间**最长**的那段活能干多久。
     ///
-    /// 取"构建那一段 + 最长的一步"而不是一轮里所有段的和：`buildah` 每开一步之前
-    /// 各打一次点，所以两跳之间不可能夹着整轮的活，只可能是相邻的两段——而相邻两段
-    /// 里最长的那一对就是"cargo 构建（加上后一跳 strip）"和"最长的一步"。求和会把界
-    /// 随资产条数线性放大（每份资产一步 `copy`），而界只会越放越松，放到最后等于把
-    /// 这条规则关掉。
+    /// 这个数不再由某条墙算出来：构建与每一步 buildah 在干活的时候自己往这个循环
+    /// 的心跳上打拍（[`Self::run_cmd`]），所以两跳之间的空档由实测的「还在动」窗口
+    /// 定——一段活静默超过它就已经被判停、已经被杀了，空档不可能更长。
     fn round_work_secs(&self) -> u64 {
         // 判定那一段也要算进来（见 `await_judgement`）：一轮要么在构建、要么在等
         // 判定，两者不叠加，所以声明取两者中更长的那个而不是求和。少算这一段，
@@ -3925,7 +3867,11 @@ impl MainlineDeployer {
         // 判定那一段取的是 [`judgement_wait_budget`]，与真正在等的那个数同源：两处各
         // 算一遍，改了一处就等于让声明的界与实际在等的东西错开，而错开的方向永远是
         // 「实际等得更久」——那一侧读出来叫停摆。
-        (self.cfg.build_timeout_secs + STRIP_WALL_SECS + Self::buildah_max_step_wall_secs())
+        let measured = cog_core::progress::longest_gap()
+            .map(|gap| gap.as_secs())
+            .unwrap_or(0)
+            .max(cog_core::progress::WATCH_TICK.as_secs());
+        measured
             .max(judgement_wait_budget(self.cfg.soak_secs, self.cfg.rollout_timeout_secs).as_secs())
     }
 
@@ -3948,13 +3894,10 @@ impl MainlineDeployer {
     /// `cannot <verb> resource "<name>"`），不是从参数里猜：拒绝的原文就是「哪个
     /// 动词、哪个资源」，参数里那个词在 `apply -f <路径>` 这类形状下并不是资源名。
     /// 读不出动词或资源时退回参数里的前两项，读数宁可粗一点也不丢这一次拒绝。
-    async fn kubectl(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+    async fn kubectl(&self, args: &[&str]) -> SFResult<String> {
         let mut full: Vec<&str> = vec!["-n", &self.cfg.namespace];
         full.extend_from_slice(args);
-        match self
-            .run_cmd(&self.cfg.kubectl_bin, &full, None, timeout_secs)
-            .await
-        {
+        match self.run_cmd(&self.cfg.kubectl_bin, &full, None).await {
             Ok(out) => Ok(out),
             Err(e) => {
                 if let Some((verb, resource)) = refused_command(&e.to_string(), args) {
@@ -4045,7 +3988,7 @@ impl MainlineDeployer {
     /// 变成本循环永远不派发。
     async fn can_i(&self, verb: &str, group: &str, resource: &str) -> SFResult<bool> {
         let target = rbac_target(group, resource);
-        let child = tokio::process::Command::new(&self.cfg.kubectl_bin)
+        let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
             .args([
                 "-n",
                 self.cfg.namespace.as_str(),
@@ -4054,15 +3997,25 @@ impl MainlineDeployer {
                 verb,
                 target.as_str(),
             ])
+            // 自己的进程组：判停时整组一起收，只杀领头的那一个会把孙进程留在宿主上。
+            .process_group(0)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| SFError::IO(format!("spawn kubectl auth can-i: {e}")))?;
-        let output = tokio::time::timeout(KUBECTL_AUTHZ_TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| SFError::IO("kubectl auth can-i timed out".into()))?
-            .map_err(|e| SFError::IO(format!("kubectl auth can-i: {e}")))?;
+        let output =
+            match cog_core::progress::watch_child(&mut child, "kubectl auth can-i", None).await {
+                Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+                Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                    return Err(SFError::IO(crate::cmd_timeout::went_silent(
+                        "kubectl auth can-i",
+                        silent,
+                        window,
+                    )))
+                }
+                Err(e) => return Err(SFError::IO(format!("kubectl auth can-i: {e}"))),
+            };
         let stdout = String::from_utf8_lossy(&output.stdout);
         match stdout.trim() {
             "yes" => Ok(true),
@@ -4076,7 +4029,7 @@ impl MainlineDeployer {
 
     async fn git_src(&self, args: &[&str]) -> SFResult<String> {
         let workdir = self.workdir();
-        self.run_cmd("git", args, Some(&workdir), 120).await
+        self.run_cmd("git", args, Some(&workdir)).await
     }
 
     /// The build label: declared version plus commits since the nearest release
@@ -4147,7 +4100,6 @@ impl MainlineDeployer {
                     &self.cfg.branch,
                 ],
                 None,
-                30,
             )
             .await?;
         Ok(out.trim().to_string())
@@ -4382,7 +4334,6 @@ impl MainlineDeployer {
                         release_tags,
                     ],
                     None,
-                    self.cfg.upstream_fetch_timeout_secs,
                 )
                 .await
             {
@@ -4392,7 +4343,6 @@ impl MainlineDeployer {
                             "git",
                             &["--git-dir", &self.cfg.bare_repo, "rev-parse", &local],
                             None,
-                            30,
                         )
                         .await
                     {
@@ -4485,7 +4435,6 @@ impl MainlineDeployer {
                     current,
                 ],
                 None,
-                30,
             )
             .await
         {
@@ -4544,10 +4493,7 @@ impl MainlineDeployer {
         for t in &self.cfg.targets {
             let jsonpath = crate::deployment_image::container_image_query(&t.container);
             let img = self
-                .kubectl(
-                    &["get", "deployment", &t.deployment, "-o", &jsonpath],
-                    KUBECTL_READ_TIMEOUT_SECS,
-                )
+                .kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath])
                 .await?;
             images.push(crate::deployment_image::container_image(
                 &img,
@@ -4583,10 +4529,7 @@ impl MainlineDeployer {
                 "jsonpath={{range .items[*]}}{{range {spec}.containers[*]}}{{.image}}{{\" \"}}{{end}}{{range {spec}.initContainers[*]}}{{.image}}{{\" \"}}{{end}}{{end}}"
             );
             let out = self
-                .kubectl(
-                    &["get", entry.resource, "-o", &jsonpath],
-                    KUBECTL_READ_TIMEOUT_SECS,
-                )
+                .kubectl(&["get", entry.resource, "-o", &jsonpath])
                 .await?;
             for image in out.split_whitespace() {
                 if image_repository(image) != repo.as_str() {
@@ -4651,14 +4594,27 @@ impl MainlineDeployer {
                 .await
                 .map_err(|e| SFError::IO(format!("{host}:{port} body write failed: {e}")))?;
         }
+        // 判据是字节，不是总时长：一个还在吐字节的响应不该被砍在中间（读出来会
+        // 是一份残缺的清单，看起来像「那个镜像不在」），而「连着、但一个字节也
+        // 不再进来」才是死掉的那副样子。所以界画在两次字节之间。
         let mut raw = Vec::new();
-        tokio::time::timeout(
-            crate::platform_http::READ_TIMEOUT,
-            stream.read_to_end(&mut raw),
-        )
-        .await
-        .map_err(|_| SFError::IO(format!("{host}:{port} read timed out")))?
-        .map_err(|e| SFError::IO(format!("{host}:{port} read failed: {e}")))?;
+        let mut chunk = [0u8; HTTP_READ_CHUNK];
+        loop {
+            let read =
+                tokio::time::timeout(crate::platform_http::READ_TIMEOUT, stream.read(&mut chunk))
+                    .await
+                    .map_err(|_| {
+                        SFError::IO(format!(
+                            "{host}:{port} sent nothing for {:?}; judged stopped",
+                            crate::platform_http::READ_TIMEOUT
+                        ))
+                    })?
+                    .map_err(|e| SFError::IO(format!("{host}:{port} read failed: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
         parse_http_response_parts(&raw)
             .ok_or_else(|| SFError::IO(format!("{host}:{port} returned a malformed HTTP response")))
     }
@@ -4742,14 +4698,21 @@ impl MainlineDeployer {
             .write_all(req.as_bytes())
             .await
             .map_err(|_| PlatformReadFailure::Transport)?;
+        // 界画在两次字节之间，不画在整个正文上：作业日志能很大，一份还在往下吐的
+        // 正文被总时长砍掉，读回来的是半截日志——而那读起来像「这个作业没有结论」。
         let mut raw = Vec::new();
-        tokio::time::timeout(
-            crate::platform_http::READ_TIMEOUT,
-            stream.read_to_end(&mut raw),
-        )
-        .await
-        .map_err(|_| PlatformReadFailure::Transport)?
-        .map_err(|_| PlatformReadFailure::Transport)?;
+        let mut chunk = [0u8; HTTP_READ_CHUNK];
+        loop {
+            let read =
+                tokio::time::timeout(crate::platform_http::READ_TIMEOUT, stream.read(&mut chunk))
+                    .await
+                    .map_err(|_| PlatformReadFailure::Transport)?
+                    .map_err(|_| PlatformReadFailure::Transport)?;
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
         let (status, body) = parse_http_response(&raw).ok_or(PlatformReadFailure::UnusableBody)?;
         if status != 200 {
             return Err(PlatformReadFailure::Http(status));
@@ -6879,17 +6842,14 @@ impl MainlineDeployer {
     async fn registry_workload_names(&self) -> SFResult<Vec<String>> {
         let selector = registry_component_selector();
         let out = self
-            .kubectl(
-                &[
-                    "get",
-                    "deployment",
-                    "-l",
-                    &selector,
-                    "-o",
-                    "jsonpath={.items[*].metadata.name}",
-                ],
-                30,
-            )
+            .kubectl(&[
+                "get",
+                "deployment",
+                "-l",
+                &selector,
+                "-o",
+                "jsonpath={.items[*].metadata.name}",
+            ])
             .await?;
         let names: Vec<String> = out.split_whitespace().map(str::to_string).collect();
         if names.is_empty() {
@@ -6931,16 +6891,13 @@ impl MainlineDeployer {
             return None;
         }
         let out = self
-            .kubectl(
-                &[
-                    "get",
-                    "pvc",
-                    self.cfg.registry_claim.trim(),
-                    "-o",
-                    "jsonpath={.spec.resources.requests.storage}",
-                ],
-                30,
-            )
+            .kubectl(&[
+                "get",
+                "pvc",
+                self.cfg.registry_claim.trim(),
+                "-o",
+                "jsonpath={.spec.resources.requests.storage}",
+            ])
             .await
             .ok()?;
         cog_core::claim_footprint::quantity_bytes(out.trim())
@@ -6974,11 +6931,8 @@ impl MainlineDeployer {
     async fn restart_registry(&self) -> SFResult<()> {
         let names = self.registry_workload_names().await?;
         for name in &names {
-            self.kubectl(
-                &["rollout", "restart", &format!("deployment/{name}")],
-                KUBECTL_TIMEOUT_SECS,
-            )
-            .await?;
+            self.kubectl(&["rollout", "restart", &format!("deployment/{name}")])
+                .await?;
             info!(workload = %name, "registry workload restarted to run its garbage collection")
         }
         Ok(())
@@ -7858,11 +7812,8 @@ impl MainlineDeployer {
             // 集群上写，最后落在哪一版取决于谁跑得慢，而那一刻「撤回到底生效没有」
             // 是无解的。删不掉就不派撤回——失败比一个读不出结论的集群好。
             let job = job_name(&inflight.rev);
-            self.kubectl(
-                &["delete", "job", &job, "--ignore-not-found"],
-                KUBECTL_TIMEOUT_SECS,
-            )
-            .await?;
+            self.kubectl(&["delete", "job", &job, "--ignore-not-found"])
+                .await?;
             warn!(
                 rev = %rev12(&inflight.rev),
                 job = %job,
@@ -9194,16 +9145,39 @@ impl MainlineDeployer {
         // at the moment it runs.
         .env(cog_core::env::VERSION_ID, &version_id)
         .kill_on_drop(true);
-        let fut = cmd.output();
-        let output = tokio::time::timeout(Duration::from_secs(self.cfg.build_timeout_secs), fut)
-            .await
-            .map_err(|_| {
-                SFError::IO(crate::cmd_timeout::timed_out(
-                    &cmdline,
-                    self.cfg.build_timeout_secs,
-                ))
-            })?
-            .map_err(|e| SFError::IO(format!("failed to run cargo: {e}")))?;
+        // 这段构建没有按秒的界。判据是它还在不在动：输出是拍，CPU 时间在涨也是拍
+        // ——「沉默的编译」只有后一个证据。判据与演进部署器、执行器的看门狗共用
+        // 同一条 `cog_core::progress::stall`，所以三处不会各写一份、也不会漂移。
+        //
+        // 判据落在「这个部署见过的最长一步」而不是分位数：误杀要重来，重来就是
+        // 整笔投入；晚杀只晚一点。所以宁可等，也要等到比任何一次正常的沉默都久。
+        let build_id = format!("mainline-build:{}", rev12(rev));
+        // 构建的每一拍也打在这个循环自己的心跳上：一轮里有好几分钟只有一个子进程
+        // 在干活，循环自己没有别的拍。「两跳之间最长能有多久」因此由实测的窗口给，
+        // 而不是由一条按秒的构建墙给（[`Self::round_work_secs`]）。
+        let outcome = match self.loop_beat.get().cloned() {
+            Some(beat) => {
+                cog_core::progress::run_child_watched_with_pid_and_observer(
+                    cmd,
+                    &build_id,
+                    |_pid| {},
+                    move || beat.beat(),
+                )
+                .await
+            }
+            None => cog_core::progress::run_child_watched(cmd, &build_id).await,
+        };
+        let output = match outcome {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} stopped moving: no output and no CPU time for {silent:?}, \
+                     longer than any gap this deployment has ever seen between steps of a \
+                     build that was still working ({window:?}); it was killed"
+                )));
+            }
+            Err(e) => return Err(SFError::IO(format!("failed to run cargo: {e}"))),
+        };
         if !output.status.success() {
             return Err(SFError::Agent(format!(
                 "mainline cargo build failed:\n{}{}",
@@ -9217,12 +9191,7 @@ impl MainlineDeployer {
             .join(CARGO_RELEASE_SUBDIR)
             .join(cog_core::paths::APP_BINARY_NAME);
         let _ = self
-            .run_cmd(
-                "strip",
-                &[bin.to_str().unwrap_or("")],
-                None,
-                STRIP_WALL_SECS,
-            )
+            .run_cmd("strip", &[bin.to_str().unwrap_or("")], None)
             .await;
         Ok(())
     }
@@ -9659,11 +9628,8 @@ impl MainlineDeployer {
             JobStatus::Running | JobStatus::NotFound => {}
             JobStatus::Complete | JobStatus::Failed => {
                 info!(rev = %rev12(rev), "replacing finished rollout job before dispatch");
-                self.kubectl(
-                    &["delete", "job", &job_name(rev), "--ignore-not-found"],
-                    KUBECTL_TIMEOUT_SECS,
-                )
-                .await?;
+                self.kubectl(&["delete", "job", &job_name(rev), "--ignore-not-found"])
+                    .await?;
             }
         }
         // 这一次滚动的因果 id：同一条链上的下一段。滚动 Job 自己也是一个进程，
@@ -9753,6 +9719,17 @@ impl MainlineDeployer {
                 "readOnly": true
             }));
         }
+        // 进度文件：滚动进程每推进一步就写一次，容器外的存活探针读它。放在一块
+        // emptyDir 上而不是容器的根文件系统上——根文件系统是不是可写取决于权限面
+        // 照抄来的那一份，探针不该因为那个决定而读不到文件。
+        volumes.push(serde_json::json!({
+            "name": "progress",
+            "emptyDir": {}
+        }));
+        mounts.push(serde_json::json!({
+            "name": "progress",
+            "mountPath": "/var/run/cogneva-progress"
+        }));
         let mut manifest = serde_json::json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
@@ -9771,31 +9748,14 @@ impl MainlineDeployer {
             },
             "spec": {
                 "backoffLimit": 0,
-                // 上界必须覆盖最坏情况：每个目标最多吃 startup + rollout + 15s
-                // 宽限（到点即判败回滚），加上支撑工作负载等就绪的那一段（同为
-                // startup 预算）；Job 被 activeDeadlineSeconds 杀掉走不到 Job
-                // 自己的回滚，留短了会把集群停在半滚状态。
-                //
-                // The two support-snapshot reads are in the bound for the same
-                // reason: each may retry for a whole wait budget before the
-                // first target is touched, and a bound that ignores them is a
-                // bound that can expire mid-rollout.
-                "activeDeadlineSeconds": (self.cfg.startup_timeout_secs
-                    + self.cfg.rollout_timeout_secs
-                    + 15)
-                    * self.cfg.targets.len().max(1) as u64
-                    + self.cfg.soak_secs
-                    + self.cfg.startup_timeout_secs
-                    + PREFLIGHT_RETRYING_READS * self.cfg.rollout_timeout_secs
-                    // 落地之前复问一次上游 CI：那一段在 Job 里、在第一个写动作
-                    // 之前，自带墙钟上界。上界不进这里，慢网关就会把它挤进滚动
-                    // 预算，失败于是以「判定进程没跑完」的形状出现。
-                    + crate::mainline_rollout::CI_ASK_BUDGET_SECS
-                    // 「还在跑」时那一侧会等判词出来再问一次，等多久由它自己的上界
-                    // 定；这段也要进 Job 的期限，否则等待会把滚动预算挤掉，失败就
-                    // 以「判定进程没跑完」的形状出现。
-                    + crate::mainline_rollout::CI_PENDING_WAIT_SECS
-                    + 15,
+                // 这里曾经是 `activeDeadlineSeconds`：它的值是把每一段内部等待
+                // 的界加起来再加宽限，它能做的只有「超过总和就杀掉」。而杀掉
+                // 正是最坏的结果——一次滚动被杀在中间，集群停在半滚状态，Job
+                // 自己的回滚也走不到；一次正常的、只是起得慢的滚动则会被它
+                // 误杀。判停现在是「还在不在推进」：进程每一步写进度文件，
+                // 容器上的存活探针读 `now - mtime` 与文件里那个窗口。一段该停
+                // 没停的滚动仍会被收住（它不再写），而一步一个脚印走三小时的
+                // 滚动不会。
                 "ttlSecondsAfterFinished": 86400,
                 "template": {
                     "metadata": {
@@ -9813,6 +9773,16 @@ impl MainlineDeployer {
                             "imagePullPolicy": "IfNotPresent",
                             "command": [cog_core::paths::APP_BINARY],
                             "args": args,
+                            "env": [{
+                                "name": cog_core::progress::PROGRESS_FILE_ENV,
+                                "value": PROGRESS_FILE,
+                            }],
+                            // 判停的不是一个声明的钟，而是**它还在不在推进**：滚动
+                            // 进程每一步写这个文件，探针读 `now - mtime` 与文件里
+                            // 那个窗口。一步都不推进超过窗口才判死——那时它确实不
+                            // 再动了，而一次只是起得慢、或滚了很多目标的正常滚动
+                            // 永远不会落到那个形状里。
+                            "livenessProbe": cog_core::progress::liveness_probe(),
                             // 不声明资源时 QoS 是 BestEffort——节点内存压力下最先
                             // 被驱逐的一档，而这个容器偏偏是决定"回滚不回滚"的判定
                             // 进程：它被驱逐，部署器就把一次观测中断记成一次版本失败，
@@ -9867,9 +9837,13 @@ impl MainlineDeployer {
         }
         let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
             .args(&args)
+            // 自己的进程组，判停时整组一起收：只杀领头的那一个，它拉起的子命令
+            // 还会攥着连接把这一轮拖着。
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| SFError::IO(format!("spawn kubectl apply: {e}")))?;
@@ -9882,10 +9856,19 @@ impl MainlineDeployer {
             stdin.write_all(body).await?;
             stdin.shutdown().await?;
         }
-        let output = tokio::time::timeout(KUBECTL_WRITE_TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| SFError::IO("kubectl apply timed out".into()))?
-            .map_err(|e| SFError::IO(format!("kubectl apply: {e}")))?;
+        // 判据是它还在不在动（产出或 CPU），不是这一份清单交上去花了多久：
+        // apiserver 的 admission 链慢下来时它一直在干活，而原来那个 60 秒会把
+        // 一次正要成功的 apply 砍在中间，留下半完成的资源。
+        let cmdline = format!("kubectl apply -f - ({what})");
+        let output = match cog_core::progress::watch_child(&mut child, &cmdline, None).await {
+            Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+            Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                return Err(SFError::IO(crate::cmd_timeout::went_silent(
+                    &cmdline, silent, window,
+                )))
+            }
+            Err(e) => return Err(SFError::IO(format!("kubectl apply: {e}"))),
+        };
         if !output.status.success() {
             return Err(SFError::IO(format!(
                 "kubectl apply {what} failed: {}",
@@ -9903,7 +9886,6 @@ impl MainlineDeployer {
             "git",
             &["--git-dir", &self.cfg.bare_repo, "show", &spec],
             None,
-            30,
         )
         .await
     }
@@ -9923,7 +9905,6 @@ impl MainlineDeployer {
                     &spec,
                 ],
                 None,
-                30,
             )
             .await?;
         Ok(out
@@ -9943,10 +9924,10 @@ impl MainlineDeployer {
         &self,
         namespace: &str,
         body: &[u8],
-        timeout_secs: u64,
     ) -> SFResult<(bool, String, String)> {
         let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
             .args(["-n", namespace, "apply", "-f", "-"])
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -9963,12 +9944,17 @@ impl MainlineDeployer {
             stdin.shutdown().await?;
         }
         let output =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-                .map_err(|_| {
-                    SFError::IO(crate::cmd_timeout::timed_out("kubectl apply", timeout_secs))
-                })?
-                .map_err(|e| SFError::IO(format!("kubectl apply: {e}")))?;
+            match cog_core::progress::watch_child(&mut child, "kubectl apply -f -", None).await {
+                Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+                Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                    return Err(SFError::IO(crate::cmd_timeout::went_silent(
+                        "kubectl apply -f -",
+                        silent,
+                        window,
+                    )))
+                }
+                Err(e) => return Err(SFError::IO(format!("kubectl apply: {e}"))),
+            };
         Ok((
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -9986,13 +9972,14 @@ impl MainlineDeployer {
         &self,
         namespace: &str,
         body: &[u8],
-        timeout_secs: u64,
     ) -> SFResult<(i32, String, String)> {
         let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
             .args(["-n", namespace, "diff", "-f", "-"])
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| SFError::IO(format!("spawn kubectl diff: {e}")))?;
@@ -10006,12 +9993,17 @@ impl MainlineDeployer {
             stdin.shutdown().await?;
         }
         let output =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-                .map_err(|_| {
-                    SFError::IO(crate::cmd_timeout::timed_out("kubectl diff", timeout_secs))
-                })?
-                .map_err(|e| SFError::IO(format!("kubectl diff: {e}")))?;
+            match cog_core::progress::watch_child(&mut child, "kubectl diff -f -", None).await {
+                Ok(cog_core::progress::ChildOutcome::Exited(output)) => output,
+                Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => {
+                    return Err(SFError::IO(crate::cmd_timeout::went_silent(
+                        "kubectl diff -f -",
+                        silent,
+                        window,
+                    )))
+                }
+                Err(e) => return Err(SFError::IO(format!("kubectl diff: {e}"))),
+            };
         Ok((
             output.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -10066,13 +10058,7 @@ impl MainlineDeployer {
             );
             return;
         }
-        let live = match self
-            .kubectl(
-                &["get", "resourcequota", "-o", "json"],
-                KUBECTL_READ_TIMEOUT_SECS,
-            )
-            .await
-        {
+        let live = match self.kubectl(&["get", "resourcequota", "-o", "json"]).await {
             Ok(text) => match crate::governance_drift::live_quotas(&text) {
                 Ok(live) => live,
                 Err(e) => {
@@ -10096,13 +10082,7 @@ impl MainlineDeployer {
         // namespace sum would call the two sides equal while every per-container
         // ceiling in the tree could be different. Its failures get their own
         // cells so a reader is told which command to rerun.
-        let live_ranges = match self
-            .kubectl(
-                &["get", "limitrange", "-o", "json"],
-                KUBECTL_READ_TIMEOUT_SECS,
-            )
-            .await
-        {
+        let live_ranges = match self.kubectl(&["get", "limitrange", "-o", "json"]).await {
             Ok(text) => match crate::governance_drift::live_limit_ranges(&text) {
                 Ok(ranges) => ranges,
                 Err(e) => {
@@ -10346,17 +10326,14 @@ impl MainlineDeployer {
     async fn retain_manifest_configmaps(&self, rev: &str) -> SFResult<()> {
         let newest = manifests_configmap_name(rev);
         let out = self
-            .kubectl(
-                &[
-                    "get",
-                    "configmap",
-                    "-l",
-                    &format!("{COMPONENT_LABEL}={MAINLINE_MANIFESTS_COMPONENT}"),
-                    "-o",
-                    "json",
-                ],
-                60,
-            )
+            .kubectl(&[
+                "get",
+                "configmap",
+                "-l",
+                &format!("{COMPONENT_LABEL}={MAINLINE_MANIFESTS_COMPONENT}"),
+                "-o",
+                "json",
+            ])
             .await?;
         let listing: serde_json::Value = serde_json::from_str(&out)?;
         let mut items: Vec<(String, String)> = listing["items"]
@@ -10386,10 +10363,7 @@ impl MainlineDeployer {
             if kept.len() < MANIFEST_BUNDLES_KEPT {
                 kept.push(name);
             } else if let Err(e) = self
-                .kubectl(
-                    &["delete", "configmap", &name, "--ignore-not-found"],
-                    KUBECTL_TIMEOUT_SECS,
-                )
+                .kubectl(&["delete", "configmap", &name, "--ignore-not-found"])
                 .await
             {
                 warn!(configmap = %name, error = %e, "could not delete a stale manifest bundle");
@@ -10434,19 +10408,16 @@ impl MainlineDeployer {
 
     async fn job_status(&self, name: &str) -> SFResult<JobStatus> {
         let out = match self
-            .kubectl(
-                &[
-                    "get",
-                    "job",
-                    name,
-                    "-o",
-                    // 分隔符必须显式占位：空格 + split_whitespace 会吞掉缺失
-                    // 字段，失败任务 succeeded 缺省时 failed 值顶到第一位，
-                    // 会被误判成 Complete。
-                    "jsonpath={.status.succeeded}|{.status.failed}|{.status.active}",
-                ],
-                30,
-            )
+            .kubectl(&[
+                "get",
+                "job",
+                name,
+                "-o",
+                // 分隔符必须显式占位：空格 + split_whitespace 会吞掉缺失
+                // 字段，失败任务 succeeded 缺省时 failed 值顶到第一位，
+                // 会被误判成 Complete。
+                "jsonpath={.status.succeeded}|{.status.failed}|{.status.active}",
+            ])
             .await
         {
             Ok(o) => o,
@@ -10506,7 +10477,6 @@ impl MainlineDeployer {
                     "-o",
                     "jsonpath={range .items[*]}{.status.reason}{\"|\"}{.status.containerStatuses[0].state.terminated.exitCode}{\"|\"}{.status.containerStatuses[0].state.terminated.reason}{\"|\"}{.status.containerStatuses[0].state.terminated.message}{\"\\n\"}{end}",
                 ],
-                30,
             )
             .await
         {
@@ -10600,16 +10570,13 @@ impl MainlineDeployer {
     /// 观测面——Job 本身建得出来，Pod 建不出来。
     async fn job_failed_condition(&self, name: &str) -> Option<String> {
         let out = self
-            .kubectl(
-                &[
-                    "get",
-                    "job",
-                    name,
-                    "-o",
-                    "jsonpath={.status.conditions[?(@.type==\"Failed\")].message}",
-                ],
-                30,
-            )
+            .kubectl(&[
+                "get",
+                "job",
+                name,
+                "-o",
+                "jsonpath={.status.conditions[?(@.type==\"Failed\")].message}",
+            ])
             .await
             .ok()?;
         let text = out.trim();
@@ -10682,7 +10649,6 @@ impl MainlineDeployer {
                     "-o",
                     "jsonpath={range .items[*]}{.status.containerStatuses[0].state.terminated.message}{\"\\n\"}{end}",
                 ],
-                30,
             )
             .await
         {
@@ -12833,10 +12799,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             executor
-                .run_kubectl(
-                    &["get", "deployment", "-o", "json"],
-                    KUBECTL_READ_TIMEOUT_SECS,
-                )
+                .run_kubectl(&["get", "deployment", "-o", "json"])
                 .await
                 .unwrap();
         });
@@ -12880,7 +12843,7 @@ exit 1
         );
         // 预算 0：第一次尝试败了就到点，不走重试节拍。
         let err = executor
-            .probe(&["get", "deployment", "cogneva", "-o", "json"], 30, 0)
+            .probe(&["get", "deployment", "cogneva", "-o", "json"], 0)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -12922,7 +12885,7 @@ exit 1
         );
         let started = std::time::Instant::now();
         let err = executor
-            .run_kubectl(&["get", "deployment", "cogneva"], 1)
+            .run_kubectl(&["get", "deployment", "cogneva"])
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -13083,7 +13046,7 @@ exit 1
             900,
         );
         let err = executor
-            .probe(&["get", "deployment", "cogneva", "-o", "json"], 30, 0)
+            .probe(&["get", "deployment", "cogneva", "-o", "json"], 0)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -15479,9 +15442,11 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
 
     #[test]
     fn lock_staleness() {
-        assert!(!lock_is_stale(10, 3600, true));
-        assert!(lock_is_stale(4000, 3600, true), "age over timeout is stale");
-        assert!(lock_is_stale(10, 3600, false), "dead pid is stale");
+        assert!(!lock_is_stale(true), "a live owner still holds it");
+        assert!(
+            lock_is_stale(false),
+            "a dead owner is stale however recently it wrote the lock"
+        );
     }
 
     #[test]
@@ -16000,7 +15965,6 @@ exit 0
             kubectl_host_path: String::new(),
             state_dir: root.join("state").to_string_lossy().into_owned(),
             observability_stack: crate::config::ObservabilityStackConfig::default(),
-            build_timeout_secs: 60,
             cargo_build_jobs: 2,
             soak_secs: 1,
             restart_threshold: 1,
@@ -16018,7 +15982,6 @@ exit 0
             // 透传根，走真实 git fetch，不改这些用例的网络面）。
             upstreams: Vec::new(),
             git_proxy_base: String::new(),
-            upstream_fetch_timeout_secs: 30,
             // 测试夹具仓库没有 deploy/k3s 清单树；这些用例走 set image 旧路径。
             deliver_manifests: false,
             // 容量回收默认关（没有声明就没有回收）：它要读走查边车与 PVC，
@@ -27954,7 +27917,7 @@ esac
             60,
         );
         executor
-            .apply_support_manifest(&manifest.to_string_lossy(), 30)
+            .apply_support_manifest(&manifest.to_string_lossy())
             .await
             .expect("a changed Job template must not stop the support bundle");
 
@@ -28003,7 +27966,7 @@ esac
             60,
         );
         assert!(executor
-            .apply_support_manifest(&manifest.to_string_lossy(), 30)
+            .apply_support_manifest(&manifest.to_string_lossy())
             .await
             .is_err());
 
@@ -29125,6 +29088,7 @@ exit 0
             "kubectl get deployment x -o jsonpath=... failed: Unable to connect to the server: net/http: TLS handshake timeout",
             "kubectl get pods ... failed: dial tcp 127.0.0.1:6443: connect: connection refused",
             "kubectl get pods ... timed out after 30s",
+            "kubectl get pods went silent for 63s, longer than the 41s this deployment has measured",
             "cluster unreachable: nothing was observed",
         ] {
             assert!(is_cluster_unreachable(msg), "{msg}");
@@ -33810,64 +33774,6 @@ exit 0
             1.0,
             "折了的那一轮不该动 ok 那一格"
         );
-    }
-
-    /// 声明的工期界与命令实际被卡的时长必须同源：每条 buildah 命令都得从
-    /// [`BUILDAH_STEP_WALLS`] 里取墙，表里也不许留一条没人走的步。
-    ///
-    /// 两处各写一个数不会编译不过、也不会跑出错——它只会让界算少了，而界算少了的
-    /// 表现是停摆告警在**健康**的轮上响。所以这条判据读源码，不读行为：一条新加的
-    /// `self.buildah(...)` 字面量、一条只在表里存在的步名、把某个步名走两次，都要
-    /// 在这里红。
-    #[test]
-    fn every_buildah_call_takes_its_wall_from_the_table() {
-        let production = production_text(include_str!("mainline_deployer.rs"));
-
-        // 唯一的 `self.buildah(` 就是包装自己那一跳。
-        assert_eq!(
-            production.matches(".buildah(").count(),
-            1,
-            "除 buildah_step 之外还有直接调用：那里的墙绕过了表，界就算不到它"
-        );
-
-        // `buildah_step("...")` 的步名；定义体那一处（`fn buildah_step(&self,`）
-        // 因为下一个非空白字符不是引号，自然落选。
-        let called: Vec<&str> = production
-            .match_indices("buildah_step(")
-            .filter_map(|(at, _)| {
-                production[at + "buildah_step(".len()..]
-                    .trim_start()
-                    .strip_prefix('"')
-                    .map(|quoted| quoted.split('"').next().unwrap_or_default())
-            })
-            .collect();
-
-        // 表项 `("步名", 墙)`。
-        let table = production
-            .split("const BUILDAH_STEP_WALLS")
-            .nth(1)
-            .and_then(|rest| rest.split("];").next())
-            .expect("BUILDAH_STEP_WALLS is declared");
-        let declared: Vec<&str> = table
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("(\""))
-            .map(|entry| entry.split('"').next().unwrap_or_default())
-            .collect();
-
-        assert!(!declared.is_empty(), "the table declares no step");
-        for name in &called {
-            assert!(
-                declared.contains(name),
-                "{name} 走了 buildah_step 却不在 BUILDAH_STEP_WALLS 里：这条命令有多长，界不知道"
-            );
-        }
-        for name in &declared {
-            assert!(
-                called.contains(name),
-                "{name} 在表里声明了墙却没人走：界被一条不存在的步撑大了"
-            );
-        }
-        // 一个步名走两次是允许的（库存前后各读一次），界取的是最长的一步，不看条数。
     }
 
     /// 一次授权拒绝读出来的是服务端说的那两个词，不是调用方传的那两个词。

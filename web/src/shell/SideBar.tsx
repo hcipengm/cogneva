@@ -705,7 +705,7 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             <Row label="就绪 / 目标" note="滚动还没走完时会差一截" />
             <Row label="条件" note="Progressing=False 是卡住" />
             <Row label="构建跑次" note="一次构建一行，同一变更重试就有多行" />
-            <Row label="结局" note="built / failed / timed_out / unstarted" />
+            <Row label="结局" note="built / failed / stalled / unstarted" />
             <Note>
               上半页读 apiserver：谁在跑第几版。下半页读演进进程：这轮构建过什么、每条
               怎么结束的。下半页的窗口在演进进程内存里，重启清零，所以它回答的是「这一

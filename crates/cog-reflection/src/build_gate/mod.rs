@@ -110,7 +110,7 @@
 
 pub mod arming;
 
-pub use arming::{effective_config, effective_gate_for};
+pub use arming::effective_gate_for;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -357,6 +357,43 @@ const CLAIM_FILE: &str = "builds.claim";
 /// no more than the window — and it is paid only while some build is turned away
 /// by it, which is the state this exists to end.
 const RESERVE_FILE: &str = "builds.reserve";
+/// When each work was last served a build -- took a slot, or took the field --
+/// by the name it asks and claims under.
+///
+/// This is the half of the takeover rule that says a claim has been honoured:
+/// a work stands down for another work's claim while that work has not been
+/// served since the stand-down began, and takes the turn once it has. A claim
+/// is kept fresh by being rewritten, so freshness alone cannot tell a work
+/// waiting its turn from one taking every turn (2026-10-20: the host's clippy
+/// producer rewrote its claim every twenty seconds while it built, and the
+/// deployer stood down on all fourteen rounds).
+///
+/// A file rather than this process's memory, because the gate is two
+/// programs and both serve slots: the host's shell client
+/// (`deploy/scripts/lib/build-slot.sh`) takes a slot by `flock`ing it and
+/// writes its holder record, and this process never sees that happen. The
+/// served fact used to live in an array here, keyed by [`asker_index`], and
+/// both halves of that were wrong for the shell client: its names
+/// (`gate: 名字契约（告警规则契约）`, `gate: clippy …`) are not in
+/// [`BUILD_GATE_ASKERS`], so they all collapsed into the unnamed cell, and
+/// nothing in this process ever moved that cell. The claim therefore looked
+/// unanswered forever and the mainline advance stood down on every round for
+/// three hours on 2026-11-10 -- thirteen deferrals, no advance, while the
+/// shell gate held the slot. The record is by name, not by cell, because the
+/// name is what a claim carries; see [`served_at`] and [`record_served`].
+const SERVED_FILE: &str = "builds.served";
+
+/// How many works [`SERVED_FILE`] keeps, as a bound.
+///
+/// A name leaves only after this many other works have been served since: the
+/// question the record answers is always "was *this* name served after an
+/// instant within the last [`TURN_STAND_DOWN_SECS`]", so entries older than
+/// the whole stand-down window are dead weight. The number is well above the
+/// distinct names that exist -- the ten asker cells plus the host's gate step
+/// labels -- because the cost of a missing line is one more stand-down, and
+/// the cost of a large file is a scan on every takeover question.
+// cap: bound — 远超实际不同名字数的上界：丢一行只多让一轮，文件大了是每次仲裁都扫一遍
+const SERVED_RECORD_CAP: usize = 64;
 
 /// Claims on the next build that lapsed before anyone used them, as a counter
 /// carrying the `asker` that made the claim.
@@ -1644,6 +1681,14 @@ const SOURCE_CALIBRATED: &str = "calibrated";
 /// the only thing that would change it back is a bigger box or a lighter build.
 const SOURCE_FITTED: &str = "fitted";
 
+/// Somebody looked at this deployment and picked the number.
+const SOURCE_CONFIGURED: &str = "configured";
+
+/// Nobody picked it: it is computed from a measurement taken on this host. The
+/// measured build peak is the one input that moves on its own, so its own word
+/// is the only thing that says which input the loop moved.
+const SOURCE_DERIVED: &str = "derived";
+
 /// The model inputs as series, one per input, labelled by which one it is and
 /// by where the value came from.
 ///
@@ -1687,12 +1732,12 @@ fn tuning_readings(
                 // input the loop moved on its own, which is the one thing the
                 // other two words cannot say.
                 Some(_) if field == "build_peak_rss_bytes" && measured_peak.is_some() => {
-                    crate::verification_budget::SOURCE_DERIVED
+                    SOURCE_DERIVED
                 }
                 Some((_, _, s)) if (*s - value).abs() > f64::EPSILON => {
                     match fitted.iter().find(|(f, _, _)| *f == field) {
                         Some((_, _, f)) if (*f - value).abs() <= f64::EPSILON => SOURCE_FITTED,
-                        _ => crate::verification_budget::SOURCE_CONFIGURED,
+                        _ => SOURCE_CONFIGURED,
                     }
                 }
                 _ => SOURCE_CALIBRATED,
@@ -2027,7 +2072,9 @@ pub const BUILD_CACHE_RECLAIM_ASKER: &str = "build-cache-reclaim";
 /// rather than dropped: summed over `asker` the counter is then the number it
 /// carried before this label existed, and a call site asking under words that
 /// are not here shows up as an unnamed row with a number in it instead of
-/// vanishing into the whole.
+/// vanishing into the whole. The host's own clients are the exception, and
+/// matched by the shape of their names rather than by these words: see
+/// [`asker_index`].
 ///
 /// Each pair is `(the words the call site asks with, the value the reading
 /// carries)`. It is a table rather than a type because `what` is a `&str` at
@@ -2050,12 +2097,23 @@ pub const BUILD_GATE_ASKERS: [(&str, &str); 10] = [
     // process tree; its refusals are counted here like any other work's, and
     // without this row they were the one refusal in the reading that named no
     // work at all.
-    ("host build", "host_build"),
+    (BUILD_GATE_HOST_ASKER, "host_build"),
 ];
 
 /// The value an ask carries when it asks under words
 /// [`BUILD_GATE_ASKERS`] does not list.
 pub const BUILD_GATE_ASKER_UNNAMED: &str = "unnamed";
+
+/// The words the host's own builder asks under.
+pub const BUILD_GATE_HOST_ASKER: &str = "host build";
+
+/// What the host's pre-push gate prefixes the step it is running with.
+///
+/// That client asks as `gate: <the step>`, one name per step it runs, so the
+/// only fixed part of its name is the prefix. Matched by shape because there is
+/// no list to match against: a closed vocabulary cannot hold a name that is
+/// free text by construction.
+const HOST_STEP_ASKER_PREFIX: &str = "gate: ";
 
 /// How many asks the refusal counter publishes per wall: the named works and
 /// the unnamed one.
@@ -2064,11 +2122,29 @@ const ASKER_CELLS: usize = BUILD_GATE_ASKERS.len() + 1;
 
 /// The cell an ask is counted in, in the order [`BUILD_GATE_ASKERS`] lists the
 /// works; anything else is the last cell.
+///
+/// The host's clients are matched by the shape of their names as well as by the
+/// exact words, because their names carry the step (`gate: 名字契约（告警规则契约）`)
+/// or the worktree (`host build (wt-emp2)`). Until they did, every host ask fell
+/// into the unnamed cell -- so the reading could not name the work that held
+/// the mainline advance off for three hours on 2026-11-10, which is the one
+/// question a refusal counter exists to answer.
 fn asker_index(what: &str) -> usize {
-    BUILD_GATE_ASKERS
+    if let Some(index) = BUILD_GATE_ASKERS
         .iter()
         .position(|(words, _)| *words == what)
-        .unwrap_or(BUILD_GATE_ASKERS.len())
+    {
+        return index;
+    }
+    let host_shaped =
+        what.starts_with(HOST_STEP_ASKER_PREFIX) || what.starts_with(BUILD_GATE_HOST_ASKER);
+    let host_cell = BUILD_GATE_ASKERS
+        .iter()
+        .position(|(words, _)| *words == BUILD_GATE_HOST_ASKER);
+    match (host_shaped, host_cell) {
+        (true, Some(cell)) => cell,
+        _ => BUILD_GATE_ASKERS.len(),
+    }
 }
 
 /// The value the ask in cell `index` is published under.
@@ -2402,12 +2478,6 @@ pub struct BuildGate {
     /// the same number of turns that a work polling every half second collects
     /// in a second, and the turn it is losing is the same turn.
     turn_stand_down_since: [AtomicU64; ASKER_CELLS],
-    /// When each work was last served -- took a slot or took the field -- per
-    /// asker cell. This is the other half of the takeover rule: a work that
-    /// holds the next build and keeps being served is keeping the turn, and
-    /// that, not the freshness of its claim, is what makes another work's
-    /// stand-down unreasonable.
-    last_served: [AtomicU64; ASKER_CELLS],
     /// How many turns in a row each work has stood down for someone else's
     /// reservation. Reset when it takes the field, so the bound counts one
     /// unbroken series of yields rather than a lifetime total that would
@@ -2497,7 +2567,6 @@ impl BuildGate {
             lapsed_counted: Mutex::new(std::collections::HashMap::new()),
             renew_gap_seconds: std::array::from_fn(|_| AtomicU64::new(0)),
             turn_stand_down_since: std::array::from_fn(|_| AtomicU64::new(0)),
-            last_served: std::array::from_fn(|_| AtomicU64::new(0)),
             walk_yield_streak: Mutex::new(std::collections::HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_dropped: AtomicU64::new(0),
@@ -3209,11 +3278,13 @@ impl BuildGate {
     ///
     /// A work that has been served has had its turn, so a stand-down that
     /// outlives that service is no longer "the turn is not mine yet" -- it is
-    /// the same work being passed over again and again.
+    /// the same work being passed over again and again. Written to
+    /// [`SERVED_FILE`] rather than kept here, because the slot this work was
+    /// served may have been given to it by the host's shell client, which this
+    /// process will never hear from.
     fn note_served(&self, what: &str) {
-        let cell = asker_index(what);
-        self.last_served[cell].store(unix_now(), Ordering::Relaxed);
-        self.turn_stand_down_since[cell].store(0, Ordering::Relaxed);
+        record_served(&self.dir, what, unix_now());
+        self.turn_stand_down_since[asker_index(what)].store(0, Ordering::Relaxed);
     }
 
     /// Whether a work that keeps being told "the next build is somebody else's"
@@ -3228,6 +3299,14 @@ impl BuildGate {
     /// the two is whether the holder was *served* since this work started
     /// standing down: a holder that takes its build and claims again is holding
     /// the turn for itself, and that is the only case this answers yes to.
+    ///
+    /// The service is read from [`SERVED_FILE`] by the claimant's own name, and
+    /// not from a counter kept here keyed by [`asker_index`]: both halves of the
+    /// gate serve slots, and the host's shell client asking as
+    /// `gate: 名字契约（告警规则契约）` is not one of [`BUILD_GATE_ASKERS`], so a
+    /// counter here could only ever have answered "never served" for it. That
+    /// answer, returned on every round, is a stand-down with no end -- it held
+    /// the mainline advance off for three hours on 2026-11-10.
     ///
     /// The stand-down is remembered across calls rather than within one, because
     /// the works that lose turns here ask on their own clocks -- the deployer
@@ -3244,7 +3323,7 @@ impl BuildGate {
             self.turn_stand_down_since[cell].store(now, Ordering::Relaxed);
             return false;
         }
-        self.last_served[asker_index(claimant)].load(Ordering::Relaxed) >= since
+        served_at(&self.dir, claimant).is_some_and(|served| served >= since)
     }
 
     /// How many exclusions stood down for another work's reservation, and how
@@ -3960,6 +4039,51 @@ fn name_holder(dir: &Path, name: &str) -> String {
     }
 }
 
+/// When `name` was last served a build, from [`SERVED_FILE`].
+///
+/// The newest line carrying this name rather than the file's last line: the
+/// record is per name, and an entry for another work says nothing about this
+/// one. A malformed or half-written line is skipped, because the two mistakes
+/// are not equal -- a missed service costs one more stand-down, while reading
+/// a torn line as a service takes a turn from a work that was still waiting.
+fn served_at(dir: &Path, name: &str) -> Option<u64> {
+    read_gate_file(&dir.join(SERVED_FILE))?
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, what)| *what == name)
+        .filter_map(|(epoch, _)| epoch.parse::<u64>().ok())
+        .max()
+}
+
+/// Says that `name` has just been served a build, keeping one line per name.
+///
+/// A read-modify-write of the whole file through [`write_gate_file`], whose
+/// rename is what decides the contents at the name: two writers doing this at
+/// once lose each other's line instead of interleaving half-lines, and that
+/// loss is one more stand-down. It is bounded by [`SERVED_RECORD_CAP`] entries
+/// per name in the vocabulary, so the whole file is a handful of lines.
+fn record_served(dir: &Path, name: &str, now: u64) {
+    let mut entries: Vec<(u64, String)> = read_gate_file(&dir.join(SERVED_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (epoch, what) = line.split_once('\t')?;
+            let epoch = epoch.parse::<u64>().ok()?;
+            (!what.is_empty()).then(|| (epoch, what.to_string()))
+        })
+        .collect();
+    entries.retain(|(_, what)| what != name);
+    entries.push((now, name.to_string()));
+    entries.sort_by_key(|(epoch, _)| *epoch);
+    let excess = entries.len().saturating_sub(SERVED_RECORD_CAP);
+    entries.drain(0..excess);
+    let text: String = entries
+        .iter()
+        .map(|(epoch, what)| format!("{epoch}\t{what}\n"))
+        .collect();
+    let _ = write_gate_file(&dir.join(SERVED_FILE), &text);
+}
+
 /// What a refusal can say about what is holding the slots it could not take.
 ///
 /// Told apart from "no holder" on purpose: a slot taken by a holder that wrote
@@ -4608,7 +4732,7 @@ mod tests {
         assert_eq!(demand.value, 8.0);
         assert_eq!(
             demand.labels.get(crate::LABEL_SOURCE).map(String::as_str),
-            Some(crate::verification_budget::SOURCE_CONFIGURED)
+            Some(SOURCE_CONFIGURED)
         );
         // 同一份读法下没被改过的那几条仍是标定值：整族都翻成 configured
         // 就等于这个标签什么都没说。
@@ -4694,7 +4818,7 @@ mod tests {
             .expect("build_peak_rss_mib 没有出现在这一族里");
         assert_eq!(
             peak.labels.get(crate::LABEL_SOURCE).map(String::as_str),
-            Some(crate::verification_budget::SOURCE_DERIVED),
+            Some(SOURCE_DERIVED),
             "量出来的除数必须自己说它是量出来的"
         );
     }
@@ -7162,6 +7286,68 @@ unevictable 28532736
         );
     }
 
+    /// A service performed by another process is what makes the turn movable.
+    ///
+    /// The host's shell client takes a slot by `flock`ing it and writes the one
+    /// line in [`SERVED_FILE`]; nothing about that reaches this process's
+    /// memory. When the served fact lived in an array here, a claim held by
+    /// such a work read as unanswered on every round, so the work waiting on it
+    /// stood down forever -- the mainline advance for three hours on 2026-11-10.
+    /// Two gate values over one directory are the two processes.
+    #[test]
+    fn a_service_from_the_other_half_of_the_gate_gives_the_turn_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let serving = gate(dir.path(), 1, 0);
+        let waiting = gate(dir.path(), 1, 0);
+        let claimant = "gate: 名字契约（告警规则契约）";
+        write_gate_file(
+            &dir.path().join(RESERVE_FILE),
+            &format!("{claimant}\t{}\n", unix_now().saturating_sub(60)),
+        )
+        .unwrap();
+
+        assert!(
+            !waiting.reserve_build_field("mainline advance"),
+            "the first stand-down leaves the turn to the work that asked first"
+        );
+        serving.note_served(claimant);
+        assert!(
+            waiting.reserve_build_field("mainline advance"),
+            "the work that was served has had its turn, so this one takes the claim"
+        );
+        assert_eq!(
+            waiting.reservation().map(|(who, _)| who).as_deref(),
+            Some("mainline advance")
+        );
+    }
+
+    /// A service older than the stand-down is not a turn this work lost. The
+    /// record is per name and the comparison is against the instant the
+    /// stand-down began, so a work served before this one started waiting is
+    /// still waiting its turn rather than already served.
+    #[test]
+    fn a_service_older_than_the_stand_down_leaves_the_turn_where_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let claimant = "gate: 名字契约（告警规则契约）";
+        write_gate_file(
+            &dir.path().join(RESERVE_FILE),
+            &format!("{claimant}\t{}\n", unix_now().saturating_sub(60)),
+        )
+        .unwrap();
+        write_gate_file(
+            &dir.path().join(SERVED_FILE),
+            &format!("{}\t{claimant}\n", unix_now().saturating_sub(30)),
+        )
+        .unwrap();
+
+        assert!(!gate.reserve_build_field("mainline advance"));
+        assert!(
+            !gate.reserve_build_field("mainline advance"),
+            "a service that predates the stand-down says nothing about this turn"
+        );
+    }
+
     /// An exclusion that is turned away by a *build* claims the next one without
     /// its caller having to say so: the sweep's cycle is long and the builds it
     /// is losing to arrive back to back, so the walk after a refusal would find
@@ -8003,6 +8189,33 @@ unevictable 28532736
                 .sum::<f64>(),
             3.0,
             "summed over the asks the counter is the number it carried before the label"
+        );
+    }
+
+    /// The host's own clients are one work, whatever step they are running.
+    ///
+    /// Their names carry the step (`gate: 名字契约（告警规则契约）`) or the
+    /// worktree (`host build (wt-emp2)`), so a vocabulary of exact words matches
+    /// none of them and every one of their refusals landed in the unnamed cell.
+    /// On 2026-11-10 that cell is where the work that held the mainline advance
+    /// off for three hours would have been counted -- the reading could not name
+    /// it. Anything else still lands in the unnamed cell, which is what that
+    /// cell is for.
+    #[test]
+    fn the_hosts_step_names_are_counted_under_the_hosts_cell() {
+        let host = BUILD_GATE_ASKERS
+            .iter()
+            .position(|(words, _)| *words == BUILD_GATE_HOST_ASKER)
+            .expect("the host has a cell");
+        assert_eq!(asker_index("gate: 名字契约（告警规则契约）"), host);
+        assert_eq!(asker_index("gate: clippy --workspace"), host);
+        assert_eq!(asker_index("host build (wt-emp2)"), host);
+        assert_eq!(asker_index(BUILD_GATE_HOST_ASKER), host);
+        assert_ne!(asker_index("mainline advance"), host);
+        assert_eq!(
+            asker_index("a build in the first slot"),
+            BUILD_GATE_ASKERS.len(),
+            "a name that is neither listed nor host-shaped is still unnamed"
         );
     }
 

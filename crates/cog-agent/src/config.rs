@@ -58,10 +58,6 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
         "COGNEVA_AGENT_LOOP_THINK_STALL_TIMEOUT_SECS",
         "think_stall_timeout_secs",
     ),
-    (
-        "COGNEVA_AGENT_LOOP_FINAL_DRAFT_TIMEOUT_SECS",
-        "final_draft_timeout_secs",
-    ),
     // The platform's own HTTP surface, borrowed the way the business pods
     // borrow the gateway (see `COGNEVA_GITHUB_API_BASE`): the loop archives an
     // oversized tool output by POSTing to it, carrying no token. Named without
@@ -123,10 +119,6 @@ pub struct AgentLoopConfig {
     /// Abort a streaming think turn only after no stream event arrives for
     /// this many consecutive seconds (stall detection, not a wall-clock cap).
     pub think_stall_timeout_secs: u64,
-    /// Wall-clock cap for the forced final-draft ask (seconds). Unlike the
-    /// stall timeout this bounds the whole call, because that ask is the one
-    /// that runs after the run's budget is already spent.
-    pub final_draft_timeout_secs: u64,
     /// Base URL of the platform memory API where an oversized tool output is
     /// archived. Absent when the deployment names none; the loop then still
     /// truncates, and the failure reading carries the cause.
@@ -189,7 +181,6 @@ impl Default for AgentLoopConfig {
             context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
-            final_draft_timeout_secs: 420,
             memory_api_base: None,
             external_archive_threshold_chars: default_external_archive_threshold_chars(),
             web_search_base: None,
@@ -220,7 +211,6 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
             context_window_size: c.context_window_size,
             skill_cache_ttl_secs: c.skill_cache_ttl_secs,
             think_stall_timeout_secs: c.think_stall_timeout_secs,
-            final_draft_timeout_secs: c.final_draft_timeout_secs,
             skill_config: None,
             crew_id: None,
             squad_id: None,

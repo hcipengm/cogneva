@@ -130,9 +130,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 report.error(format!("self_evolution.{name} is empty while enabled=true"));
             }
         }
-        if se.test_timeout_secs == 0 || se.build_timeout_secs == 0 {
-            report.error("self_evolution timeouts must be > 0");
-        }
         if se.manual_approve {
             report.ok("self_evolution.manual_approve = true (human-in-the-loop gate active)");
         }

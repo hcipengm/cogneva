@@ -606,14 +606,17 @@ impl CollaborationExecutor {
     /// deliverable's contract is structural, so the gate on it is structural too
     /// and there is nothing for the other two roles to do.
     async fn execute_decomposition(&self, task: &Task) -> SFResult<TaskResult> {
-        // Global retry budget: if DagExecutor has already retried this task
-        // up to max_retries, fail fast to prevent cross-layer retry storms.
-        if task.retry_count >= task.max_retries {
-            return Err(SFError::Agent(format!(
-                "Global retry budget exhausted: retry_count={} >= max_retries={}",
-                task.retry_count, task.max_retries
-            )));
-        }
+        // 这里曾经有一道「Global retry budget exhausted」的自查：`retry_count >=
+        // max_retries` 就直接回错。它读的是任务行上的一个**平铺配额**，而那个配额
+        // 的真实判据在调度器里，按失败原因算（环境付账的失败根本不进这份账）。于是
+        // 两件事错了：一是执行器拿一个自己不曾参与计算的数替调度器判死，二是这件事
+        // 发生在活还没跑之前——被拦下的活一次都没有跑起来，账面上却记成「重试预算
+        // 耗尽」。2026-11-04 实测就是这样：一件活连着三次在 300 秒时限处被截断，
+        // 第四次还没开始就被这句话判死，而它真正的缺口是「从没拿到过比第一次更多的
+        // 时间」。
+        //
+        // 预算由决定它的那一层花：调度器按失败原因给出 max_retries，并把每一次尝试
+        // 的结局写进任务行。执行器只负责把这次活跑好——能跑就让它跑。
 
         let profile = derive_task_profile(task);
 
@@ -787,12 +790,9 @@ impl CollaborationExecutor {
     /// (steps, approach, boundaries) rather than decomposing into sub-tasks.
     /// Generator executes the plan, Evaluator assesses quality.
     async fn execute_atomic_via_squad(&self, task: &Task) -> SFResult<TaskResult> {
-        if task.retry_count >= task.max_retries {
-            return Err(SFError::Agent(format!(
-                "Global retry budget exhausted: retry_count={} >= max_retries={}",
-                task.retry_count, task.max_retries
-            )));
-        }
+        // 预算由调度器按失败原因花（见 [`Self::execute_decomposition`] 上那段说明）：
+        // 执行器不再拿任务行上的平铺配额替它判死。预算耗尽时调度器本来就不会再投递
+        // 这件活——真正到达这里的任务，就是该跑的那一次。
 
         let profile = derive_task_profile(task);
 
@@ -1957,6 +1957,34 @@ mod tests {
             archived.metadata.feedback.as_deref(),
             Some("the planner never produced a task list"),
             "失败模式里的因由来自这一次运行，不能换成调用点编的句子"
+        );
+    }
+
+    /// 走到执行器手里的活，就该被执行器跑——哪怕它行上的 `retry_count` 已经
+    /// 等于 `max_retries`。
+    ///
+    /// 那个数不是执行器算的，它按失败原因在调度器里得出（环境付账的失败根本
+    /// 不进这份账）。预算真的耗尽时，调度器不会再投递这条活；还会到这里来的，
+    /// 就是该跑的那一次。执行器拿这个数替调度器判死，等于让一件从没跑起来过的
+    /// 活被记成「重试预算耗尽」——2026-11-04 实测：连着三次在时限处被截断，第四
+    /// 次还没开始就被这一句判死。
+    #[tokio::test]
+    async fn a_task_at_its_last_retry_is_still_run() {
+        let executor = CollaborationExecutor::new();
+        let mut task = cog_core::Task::new(
+            "task-1",
+            cog_core::TaskType::Generator,
+            serde_json::json!({ "goal": "do the thing" }),
+        );
+        task.retry_count = task.max_retries;
+
+        let err = executor
+            .execute_decomposition(&task)
+            .await
+            .expect_err("this executor has no planner wired, so the run has to fail");
+        assert!(
+            !err.to_string().contains("Global retry budget"),
+            "执行器不该拿调度器的预算替它判死: {err}"
         );
     }
 

@@ -782,9 +782,6 @@ pub struct WorkdirRouter {
     last_move_unix: AtomicI64,
     stillness_secs: AtomicU64,
     last_fetch_unix: AtomicI64,
-    /// The longest git command that has completed here, in milliseconds. What
-    /// the timeout is a multiple of; see [`cog_core::git_budget`].
-    git_slowest_ms: AtomicU64,
     /// The last reclamation pass's duration, in milliseconds, and when it
     /// started. What the interval is a multiple of.
     gc_pass_millis: AtomicU64,
@@ -837,7 +834,6 @@ impl WorkdirRouter {
             last_move_unix: AtomicI64::new(0),
             stillness_secs: AtomicU64::new(0),
             last_fetch_unix: AtomicI64::new(0),
-            git_slowest_ms: AtomicU64::new(0),
             gc_pass_millis: AtomicU64::new(0),
             last_gc_unix: AtomicI64::new(0),
             cache_pass_millis: AtomicU64::new(0),
@@ -2259,42 +2255,33 @@ impl WorkdirRouter {
         }
     }
 
-    /// How long a git command may run here: a multiple of the slowest one that
-    /// has completed on this volume, floored. Recomputed per call so a volume
-    /// that got slower (a bigger repository, a busier disk) is allowed the time
-    /// it now needs, rather than being killed at a number written elsewhere.
-    fn git_timeout(&self) -> Duration {
-        cog_core::git_budget::git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
-    }
-
-    /// How old a git lock has to be before it can only be a corpse.
-    ///
-    /// Killed git processes (OOM, node restart) leave `.lock` files behind, and
-    /// every git write here is bounded by [`Self::git_timeout`] and
-    /// kill-on-drop. So a lock older than twice that timeout cannot belong to a
-    /// live command: the command that made it would have been killed first. Twice
-    /// rather than once, because a command may have taken the lock just as this
-    /// pass looked at the clock.
+    /// How old a git lock has to be before it can only be a corpse; see
+    /// [`cog_core::git_budget`]. Absent until this deployment has measured how
+    /// quiet a live command gets, and then no lock is cleared.
     fn stale_lock_age(&self) -> Duration {
-        self.git_timeout() * 2
+        cog_core::git_budget::stale_lock_age()
     }
 
     async fn run_git_once(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
+        let line = args.join(" ");
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args).kill_on_drop(true);
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }
-        let started = std::time::Instant::now();
-        let out = tokio::time::timeout(self.git_timeout(), cmd.output())
+        let out = match cog_core::progress::run_child_watched(cmd, &format!("git {line}"))
             .await
-            .map_err(|_| SFError::IO(format!("git {} timed out", args.join(" "))))?
-            .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;
-        // Only completed commands are recorded, whatever their exit code: a
-        // command that failed fast is still evidence of how fast git is here,
-        // and one that never returns must not raise the bar for the next.
-        self.git_slowest_ms
-            .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?
+        {
+            cog_core::progress::ChildOutcome::Exited(out) => out,
+            cog_core::progress::ChildOutcome::Stalled { silent, window } => {
+                return Err(SFError::IO(format!(
+                    "git {line} stopped moving: no output and no CPU time for {silent:?}, \
+                     longer than any gap this deployment has ever seen between steps of a \
+                     command that was still working ({window:?}); it was killed"
+                )))
+            }
+        };
         if !out.status.success() {
             return Err(SFError::IO(format!(
                 "git {} failed: {}{}",

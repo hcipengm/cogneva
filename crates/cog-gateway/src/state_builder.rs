@@ -124,9 +124,6 @@ pub async fn build_gateway_state(
         request_timeout_secs: std::sync::atomic::AtomicU64::new(
             config.gateway.request_timeout_secs,
         ),
-        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(
-            config.gateway.sandbox_task_timeout_secs,
-        ),
         event_tx: event_tx.clone(),
         task_event_tx: task_event_tx.clone(),
         jwt_manager: jwt_manager.clone(),

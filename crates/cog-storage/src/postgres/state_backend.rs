@@ -1876,6 +1876,11 @@ SELECT t.to_state, COUNT(*)::bigint
         task.error = Some(error.clone());
         task.error_cause = cause;
         task.failure_payer = payer;
+        // 这一行存下来的预算就是这次判决真正用的那个数。调用方传进来的是矩阵
+        // 按失败类算出的生效值（确定性失败是 0），而任务上原来记着的只是提交
+        // 时声明的那个数；不写回来的话，同一行上「还剩几次」有两个答案，读的
+        // 人按行里那个数算，调度器按另一个数收账。
+        task.max_retries = max_retries;
         task.updated_at = Utc::now();
 
         let should_retry = task.retry_count < max_retries;

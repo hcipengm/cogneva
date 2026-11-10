@@ -77,27 +77,11 @@ fn note_tool_update(partial: &mut String, chunk: &str) {
 /// 工作」读成「它没有进展」。声明随任务来（`Task::deliverable`），不随接手
 /// 的人的角色来：同一个工程师换了件活，答案跟着那件活变。
 ///
-/// 再加上真的半小时没动、且已经提醒过两次，三条一起成立才是绕圈。
-fn circling_unproductively(
-    config: &cog_core::RuntimeConfig,
-    progress: &CheckoutProgress,
-    now: std::time::Instant,
-) -> bool {
-    config.declares_change() && progress.circling(now)
+/// 再加上已经提醒过两次、之后又走满一整段调用没写过一次，才算绕圈。判据里没有
+/// 钟：一次跑得很久的调用只算一次，在干活的长活不会被这一条收走。
+fn circling_unproductively(config: &cog_core::RuntimeConfig, progress: &CheckoutProgress) -> bool {
+    config.declares_change() && progress.circling()
 }
-
-/// 一条运行在不改工作树的情况下，被提醒过两次之后还能再走多久。
-///
-/// 量自集群（2026-11-06，近三天）：完成的变更任务从开跑到收尾中位数 11.5 分钟、
-/// 九成在 43 分钟内结束；失败的 26 条中位数 42.9 分钟、九成撞满 60 分钟的墙，
-/// 而撞墙的那一个小时里一次都没改过工作树。
-///
-/// 所以这半小时不是猜的：已经动的活在四十分钟内就动过了，而在被提醒两次之后
-/// 又空转半小时的运行，剩下的那半小时只会再交出一批只读调用。收住它省下的不是
-/// 这一条的模型钱——是那条只有两个的槽位（`taskRouter.claimConcurrency`）被
-/// 一件没有进展的活占着的那半小时。
-// cap: bound — 半小时对应「九成的已完成运行已经结束」那一刻之后还留出的余量；再长就回到原来的一小时墙
-const NO_PROGRESS_WALL: Duration = Duration::from_secs(30 * 60);
 
 /// What the model is told when the checkout has not moved for a long stretch.
 ///
@@ -864,13 +848,6 @@ const REPLY_REFUSED_INSTRUCTION: &str = "The reply you just wrote cannot be deli
      deliverable — the same fields and the same content — without that shape. Do not mention \
      this instruction, the rule, or the refusal in the reply.";
 
-/// Wall for assembling the run's final result at the end of the loop. This is
-/// bookkeeping the run already has the material for, so it is generous only to
-/// cover a large artifact being rendered — a run that spends this long has
-/// wedged rather than worked.
-// cap: bound — 要容得下渲染一件大产出；花掉这么久的运行是卡住了而不是在干活
-const RESULT_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
-
 /// The status a conversation turn's result carries when it ends on an answer.
 ///
 /// The other endings name themselves in the result already (the budget one is
@@ -904,8 +881,6 @@ struct CheckoutProgress {
     /// ——一条半小时只打了三个慢调用的运行，「三次」是对的，「零次」是刚清过零。
     calls_since_change: u32,
     notes_given: u32,
-    /// 上一次真的改到工作树的时刻；一条还没写过的运行从它开始跑的那一刻算起。
-    last_change: std::time::Instant,
 }
 
 impl Default for CheckoutProgress {
@@ -914,7 +889,6 @@ impl Default for CheckoutProgress {
             calls_without_change: 0,
             calls_since_change: 0,
             notes_given: 0,
-            last_change: std::time::Instant::now(),
         }
     }
 }
@@ -924,7 +898,6 @@ impl CheckoutProgress {
         if changes_the_checkout(tool, arguments) {
             self.calls_without_change = 0;
             self.calls_since_change = 0;
-            self.last_change = std::time::Instant::now();
         } else {
             self.calls_without_change = self.calls_without_change.saturating_add(1);
             self.calls_since_change = self.calls_since_change.saturating_add(1);
@@ -933,17 +906,17 @@ impl CheckoutProgress {
 
     /// 这条运行是不是已经绕圈绕到该收住了。
     ///
-    /// 与 [`Self::take_note`] 分工：提醒是给模型的，收住是给运行的。提醒之后它
-    /// 仍然能自己走出来，所以收住多要一段时间——被提醒过两次**并且**距上一次真的
-    /// 改动工作树已经过了 [`NO_PROGRESS_WALL`]，两条一起成立才算。
+    /// 与 [`Self::take_note`] 分工：提醒是给模型的，收住是给运行的。被提醒过两次
+    /// 之后它仍然能自己走出来，所以收住多要一整段**调用次数**：两次提醒之后再走满
+    /// [`CALLS_WITHOUT_CHANGE`] 次调用，一次都没改过工作树，才算。
     ///
-    /// 只有次数不够：四十次只读在一分钟内就能凑齐（模型一次能并发发好几条），
-    /// 那样的运行不是迷路，是刚开始读。只有时间也不够：一次长编译可以在不改工作
-    /// 树的情况下占满这半小时，而它显然是在干活。次数管住「真的在动」，时间管住
-    /// 「动了多久」，缺一个都会误伤正常的长活。
-    fn circling(&self, now: std::time::Instant) -> bool {
+    /// 判据是调用次数，不是钟。按钟判会误杀：一次长编译可以在不改工作树的情况下
+    /// 跑满半小时，而它显然是在干活——按次判不会，那半小时只贡献一次调用。反过来
+    /// 只凭最先那段次数就收也不够：四十次只读在一分钟内就能凑齐（模型一次能并发
+    /// 发好几条），那样的运行不是迷路，是刚开始读，所以先说话，再等一段。
+    fn circling(&self) -> bool {
         self.notes_given >= NOTHING_CHANGED_NOTES
-            && now.saturating_duration_since(self.last_change) >= NO_PROGRESS_WALL
+            && self.calls_without_change >= CALLS_WITHOUT_CHANGE
     }
 
     /// The note to put in front of the model, once the count has run past
@@ -2690,14 +2663,12 @@ impl AgentRuntime {
                     .add_message(Message::user(FINAL_DRAFT_INSTRUCTION));
                 self.journal_last_context_message(JournalKind::User, None, None)
                     .await;
-                // 这一问是整轮里唯一在预算花完之后发出的请求，所以必须自己有界：
-                // 停顿超时只挡「不吭声」，一个一直吐字的流可以在它里面待到很久。
-                let draft_timeout =
-                    Duration::from_secs(self.config.final_draft_timeout_secs.max(1));
-                let forced = match tokio::time::timeout(draft_timeout, self.think_stream_final(llm))
-                    .await
-                {
-                    Ok(Ok(msg)) => {
+                // 这一问不再有自己的钟：它有没有卡住由流自己的停顿判据回答
+                // （`think_stall_timeout_secs`，每收到一个流事件就重置）。在它之上
+                // 再压一个总时长，挡住的不是「卡住的上游」，而是「一直在吐字的
+                // 长回答」——那恰好是这一问存在的理由。
+                let forced = match self.think_stream_final(llm).await {
+                    Ok(msg) => {
                         let text = assistant_text(&msg);
                         if text.trim().is_empty() {
                             // 追问过了，模型还是不交东西：这件事必须跟着哨兵走。
@@ -2717,23 +2688,13 @@ impl AgentRuntime {
                     // 追问本身失败（上游抖动、流断）不改写这一轮的定性：预算确实
                     // 用完了，照哨兵走终止性失败，比把一次追问的传输错误报成整轮
                     // 失败更接近事实。
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         tracing::warn!(
                             agent_id = %self.config.agent_id,
                             error = %e,
                             "the final-draft call failed; the run still ends on its spent budget"
                         );
                         (None, "unavailable")
-                    }
-                    // 到点了还没给完。这一问是「最后再问一次」，不是「想聊多久都行」：
-                    // 没有这条，一个卡住的上游能把一个已经花光预算的轮次再攥住十分钟。
-                    Err(_) => {
-                        tracing::warn!(
-                            agent_id = %self.config.agent_id,
-                            final_draft_timeout_secs = draft_timeout.as_secs(),
-                            "the final-draft call ran past its bound; the run still ends on its spent budget"
-                        );
-                        (None, "timeout")
                     }
                 };
                 if let Some((draft, msg)) = forced.0 {
@@ -3189,20 +3150,20 @@ impl AgentRuntime {
                 }));
             }
 
-            // 一直在读、一直在搜、被提醒过两次仍然不写：这条运行不是在探索，是在
-            // 绕圈。它此前唯一的出口是任务级的那面 3600 秒的墙——一个小时之后由
-            // 回收器替它收场，读数是「跑满预算没有产出」，而真正的事实是「这段
-            // 时间里一次都没动过工作树」。在这里收住，名字说的是事实，而且省下的
-            // 是那个只有两个的槽位。
-            if circling_unproductively(&self.config, &progress, std::time::Instant::now()) {
+            // 一直在读、一直在搜、被提醒过两次之后又走满一整段仍然不写：这条运行
+            // 不是在探索，是在绕圈。收住它的判据是调用次数，不是跑了多久——一次长
+            // 编译按次只算一次，不会被这一条收走。名字说的是事实：这段调用里一次
+            // 都没动过工作树。
+            if circling_unproductively(&self.config, &progress) {
                 self.state = RuntimeState::Complete;
                 tracing::warn!(
                     agent_id = %self.config.agent_id,
                     calls_since_change = progress.calls_since_change,
+                    calls_without_change = progress.calls_without_change,
                     notes_given = progress.notes_given,
-                    "the checkout has not moved for half an hour and the run has already \
-                     been told twice; ending it here instead of spending the rest of the \
-                     task's wall clock on more reads"
+                    "the checkout has not moved across another full stretch of calls after \
+                     the run had been told twice; ending it here instead of spending more \
+                     turns on reads"
                 );
                 self.note_run_ending(
                     crate::observable::RunOutcome::NoProgress,
@@ -3307,28 +3268,14 @@ impl AgentRuntime {
                 self.context.add_message(turn_message);
                 self.context
                     .add_message(Message::user(REPLY_REFUSED_INSTRUCTION));
-                // The rewrite is one more request on this transcript, so it is
-                // bounded the same way the final-draft ask is: a stall timeout
-                // only catches silence, and a stream that keeps emitting can
-                // otherwise hold a finished run open indefinitely.
-                let timeout = Duration::from_secs(self.config.final_draft_timeout_secs.max(1));
-                let rewritten = tokio::time::timeout(timeout, self.think_stream_final(llm)).await;
-                let (text, message) = match rewritten {
-                    Ok(Ok(message)) => (assistant_text(&message), message),
-                    Ok(Err(e)) => {
+                // 同 `final draft` 那一处：这一问有没有卡住由流自己的停顿判据回答，
+                // 不在它之上再压一个总时长。一直在吐字的改写不是卡住。
+                let (text, message) = match self.think_stream_final(llm).await {
+                    Ok(message) => (assistant_text(&message), message),
+                    Err(e) => {
                         return Err(self.reply_refusal(
                             rule,
                             format!("{reason} (the rewrite could not be obtained: {e})"),
-                            iterations,
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(self.reply_refusal(
-                            rule,
-                            format!(
-                                "{reason} (the rewrite did not finish within {}s)",
-                                timeout.as_secs()
-                            ),
                             iterations,
                         ));
                     }
@@ -3362,21 +3309,11 @@ impl AgentRuntime {
                 "reply": plain_answer(&draft),
             })
         } else {
-            match tokio::time::timeout(RESULT_BUILD_TIMEOUT, async { self.build_result(&draft) })
-                .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    let err = SFError::Agent(format!(
-                        "AgentRuntime::build_result timed out after {}s for agent {}",
-                        RESULT_BUILD_TIMEOUT.as_secs(),
-                        self.config.agent_id
-                    ));
-                    tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime build_result timeout");
-                    return Err(err);
-                }
-            }
+            // 这里曾包着一层 `tokio::time::timeout(RESULT_BUILD_TIMEOUT, …)`。它从来
+            // 不可能燃着：`build_result` 是同步函数，里面没有一个 await，被判的那段
+            // 代码根本不会把控制权还给运行时，计时器永远等不到自己的那一拍。拆掉它
+            // 不改变任何行为——它只是让读的人以为这里有一个界。
+            self.build_result(&draft)?
         };
 
         self.steps.push(RuntimeStep {
@@ -5237,7 +5174,6 @@ mod tests {
             agent_id: agent_id.into(),
             max_iterations: 1,
             think_stall_timeout_secs: 1,
-            final_draft_timeout_secs: 300,
             ..Default::default()
         };
         AgentRuntime::new(config, tx)
@@ -5626,7 +5562,6 @@ mod tests {
             agent_id: agent_id.into(),
             max_iterations: 1,
             think_stall_timeout_secs: 5,
-            final_draft_timeout_secs: 300,
             ..Default::default()
         };
         AgentRuntime::new(config, tx)
@@ -5781,7 +5716,6 @@ mod tests {
             agent_id: "failing".into(),
             max_iterations: 1,
             think_stall_timeout_secs: 5,
-            final_draft_timeout_secs: 300,
             ..Default::default()
         };
         let mut runtime = AgentRuntime::new(config, tx);
@@ -5959,7 +5893,6 @@ mod tests {
             context_window_size: 100,
             max_iterations: 1,
             think_stall_timeout_secs: 5,
-            final_draft_timeout_secs: 300,
             ..Default::default()
         };
         let mut runtime = AgentRuntime::new(config, tx);
@@ -6520,7 +6453,6 @@ mod tests {
             role: role.into(),
             max_iterations: 1,
             think_stall_timeout_secs: 5,
-            final_draft_timeout_secs: 300,
             ..Default::default()
         };
         let mut runtime = AgentRuntime::new(config, tx);
@@ -6636,7 +6568,6 @@ mod tests {
             max_iterations: 1,
             // 停顿窗口远大于这道墙，二者不会互相顶替：1s 后必须由墙收场。
             think_stall_timeout_secs: 300,
-            final_draft_timeout_secs: 1,
             ..Default::default()
         };
         let mut runtime = AgentRuntime::new(config, tx);
@@ -7886,7 +7817,6 @@ mod tests {
             skill_config: Some(skill),
             max_iterations: 1,
             think_stall_timeout_secs: 5,
-            final_draft_timeout_secs: 300,
             ..Default::default()
         };
         let mut runtime = AgentRuntime::new(config, tx).with_reflection_engine(reflection.clone());
@@ -8103,23 +8033,11 @@ mod tests {
 
     /// 「工作树没动」只对**声称要动它**的那件活是证据，与接手的人的角色无关。
     ///
-    /// 判据换输入就换答案：同一份「半小时没动、提醒过两次」的证据，加上声明就
-    /// 该收，撤回声明就该放。角色名在这里不起作用——一位 generator 跑一段读取
-    /// 结论的活，与一位工程师跑一件要交改动的活，各自按任务判。
+    /// 判据换输入就换答案：同一份「提醒过两次、之后又走满一整段只读」的证据，
+    /// 加上声明就该收，撤回声明就该放。角色名在这里不起作用——一位 generator 跑
+    /// 一段读取结论的活，与一位工程师跑一件要交改动的活，各自按任务判。
     #[test]
     fn only_a_task_that_declares_a_change_can_be_stopped_for_not_making_one() {
-        let mut progress = CheckoutProgress::default();
-        let start = progress.last_change;
-        for _ in 0..CALLS_WITHOUT_CHANGE {
-            progress.note_call("run_command", &read_call());
-        }
-        assert!(progress.take_note().is_some());
-        for _ in 0..CALLS_WITHOUT_CHANGE {
-            progress.note_call("run_command", &read_call());
-        }
-        assert!(progress.take_note().is_some(), "两次提醒都要响");
-        let now = start + NO_PROGRESS_WALL;
-
         let declaring = cog_core::RuntimeConfig {
             agent_id: "kai-a9ab11fc".into(),
             role: cog_core::roles::PLANNER.into(),
@@ -8131,61 +8049,72 @@ mod tests {
             ..declaring.clone()
         };
 
+        let mut progress = CheckoutProgress::default();
+        for _ in 0..CALLS_WITHOUT_CHANGE {
+            progress.note_call("run_command", &read_call());
+        }
+        assert!(progress.take_note().is_some());
+        for _ in 0..CALLS_WITHOUT_CHANGE {
+            progress.note_call("run_command", &read_call());
+        }
+        assert!(progress.take_note().is_some(), "两次提醒都要响");
+        // 第二次提醒把这一段清零了：此刻新的一段才刚开始，不是绕圈。
+        assert!(!circling_unproductively(&declaring, &progress));
+        for _ in 0..CALLS_WITHOUT_CHANGE {
+            progress.note_call("run_command", &read_call());
+        }
+
         assert!(
-            circling_unproductively(&declaring, &progress, now),
-            "声称要动这棵树、半小时没动、提醒过两次：这就是绕圈"
+            circling_unproductively(&declaring, &progress),
+            "声称要动这棵树、提醒过两次、之后又走满一整段只读：这就是绕圈"
         );
         assert!(
-            !circling_unproductively(&quiet, &progress, now),
+            !circling_unproductively(&quiet, &progress),
             "没有声明要动树时，「树没动」不构成证据：读结论的活本就不该动它"
         );
-        // 声明了、但时间还没到：那是在读，不是在绕。
-        assert!(!circling_unproductively(
-            &declaring,
-            &progress,
-            start + NO_PROGRESS_WALL / 2
-        ));
     }
 
-    /// 收住要多要一条时间证据：只读次数凑够了、时间还没到，那是在读；时间过了、
-    /// 中间写过一次，那是在干活。两条一起成立才是绕圈。
+    /// 收住要多要一整段调用：只提醒过一次——不收；提醒过两次但新的一段还没走满
+    /// ——不收；走满了——收。写一次就重新算。
+    ///
+    /// 这里没有任何时刻参与：判据是调用次数，所以一次跑很久的调用只算一次，一条
+    /// 在干活的长活不会被这一条收走。
     #[test]
-    fn circling_needs_both_the_two_notes_and_the_wall() {
+    fn circling_needs_the_two_notes_and_another_full_stretch() {
         let mut progress = CheckoutProgress::default();
-        let start = progress.last_change;
 
-        // 只读，但已经走满那段时间——却只被提醒过一次：还不到收的时候。
         for _ in 0..CALLS_WITHOUT_CHANGE {
             progress.note_call("run_command", &read_call());
         }
         assert!(progress.take_note().is_some(), "第一次提醒必须响");
         assert_eq!(progress.notes_given, 1);
         assert!(
-            !progress.circling(start + NO_PROGRESS_WALL),
-            "只提醒过一次、次数还没到，不算绕圈：收住得先把话说两遍"
+            !progress.circling(),
+            "只提醒过一次，不收：收住得先把话说两遍"
         );
 
-        // 第二次提醒之后，两条都成立。
         for _ in 0..CALLS_WITHOUT_CHANGE {
             progress.note_call("run_command", &read_call());
         }
         assert!(progress.take_note().is_some(), "第二次提醒必须响");
         assert!(
-            !progress.circling(start + NO_PROGRESS_WALL - Duration::from_secs(1)),
-            "提醒过两次，但那半小时还差一秒：不收"
-        );
-        assert!(
-            progress.circling(start + NO_PROGRESS_WALL),
-            "提醒过两次、而且半小时没动过工作树：必须收住"
+            !progress.circling(),
+            "刚说完第二遍就收，这一遍等于白说：提醒之后要给它一整段"
         );
 
-        // 写过一次就重新计时：绕圈的那半小时从这一次改动算起。
-        progress.note_call("run_command", &write_call());
-        let after_write = progress.last_change;
+        for _ in 0..CALLS_WITHOUT_CHANGE - 1 {
+            progress.note_call("run_command", &read_call());
+        }
+        assert!(!progress.circling(), "差一次还不算走满一段");
+        progress.note_call("run_command", &read_call());
         assert!(
-            !progress.circling(after_write + NO_PROGRESS_WALL - Duration::from_secs(1)),
-            "一次真的改动之后，那半小时要重新算"
+            progress.circling(),
+            "两次提醒之后又走满一整段，一次没写：必须收住"
         );
+
+        // 写过一次就重新算：绕圈的那一段从那一次改动算起。
+        progress.note_call("run_command", &write_call());
+        assert!(!progress.circling(), "一次真的改动之后，那一段要重新算");
     }
 
     /// The reading this exists for: a run that searches and never writes is

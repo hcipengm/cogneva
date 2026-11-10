@@ -19,8 +19,6 @@ pub struct SandboxRequest {
     pub payload: SandboxPayload,
     /// Single-run input arguments.
     pub input: serde_json::Value,
-    /// Maximum execution duration.
-    pub timeout: std::time::Duration,
     /// Resource ceiling.
     pub limits: ResourceLimits,
 }

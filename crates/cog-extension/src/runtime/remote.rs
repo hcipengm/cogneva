@@ -93,9 +93,10 @@ impl RemoteExecutor {
         Ok(Self {
             base_url: base_url.into(),
             replacement_window,
-            // No total timeout: long-running commands are bounded by the
-            // server-side timeout, the client must not cut the stream early.
-            // The connect phase is bounded separately: if the executor pod is
+            // No total timeout: a long-running command is stopped by the
+            // executor when it stops moving, and the client must not cut the
+            // stream early. The connect phase is bounded separately: if the
+            // executor pod is
             // down or unreachable (e.g. blocked by network policy), fail fast
             // in 10s instead of leaving the caller hanging on SYN retries.
             http: reqwest::Client::builder()
@@ -129,7 +130,6 @@ impl SandboxBackend for RemoteExecutor {
         let url = format!("{}/execute", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "payload": req.payload,
-            "timeout_ms": req.timeout.as_millis(),
             "task_id": req.task_id,
             "agent_id": req.agent_id,
         });
@@ -245,7 +245,6 @@ mod tests {
                 command: command.into(),
             },
             input: serde_json::json!({}),
-            timeout: std::time::Duration::from_secs(5),
             limits: Default::default(),
         }
     }
