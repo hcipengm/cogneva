@@ -433,6 +433,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         allowance_tokens: 1_000,
         spent_tokens: 1_200,
         reserve_tokens: 300,
+        reserve_population: 9,
         window_start_unix: 1_700_000_000,
         upstreams: vec![PaceUpstreamEvidence {
             upstream: "https://a.example.com|m1".to_string(),

@@ -172,6 +172,11 @@ pub struct PaceEvidence {
     pub allowance_tokens: u64,
     pub spent_tokens: u64,
     pub reserve_tokens: u64,
+    /// `reserve_tokens` 是样本均值，没有 N 就复算不出这一拍：同样一个 300k，
+    /// 取自九件活与取自一件是同一个数、两种读数。旧行缺这一格，按 0 读作
+    /// "没有样本量"，不是"样本量为零"。
+    #[serde(default)]
+    pub reserve_population: u64,
     /// 这一窗的起点。不能省：`allowance_tokens = 0` 本身分不清"窗口还没开张"
     /// 与"已经烧到零"，边界时刻必须自带。
     pub window_start_unix: i64,

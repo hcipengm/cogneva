@@ -2824,6 +2824,7 @@ fn pace_verdict(
         allowance_tokens: pool.allowance_tokens,
         spent_tokens: pool.spent_tokens,
         reserve_tokens: pool.reserve_tokens,
+        reserve_population: pool.reserve_population,
         window_start_unix: pool.window_start_unix,
         upstreams: blocked,
     })
@@ -15692,6 +15693,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             evidence.allowance_tokens, 5_000,
             "the scalars are the pool report, the same numbers the 429 body carries"
         );
+        assert_eq!(
+            evidence.reserve_population, 9,
+            "the reserve is a sample mean: the row carries the N it rests on"
+        );
         assert_eq!(evidence.upstreams.len(), 2);
         let fast = evidence
             .upstreams
@@ -15783,6 +15788,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 allowance_tokens: 1_500_000,
                 spent_tokens: 0,
                 reserve_tokens: 1_000_000,
+                reserve_population: 9,
                 window_start_unix: now - 10,
                 upstreams: vec![PaceUpstreamEvidence {
                     upstream: key.clone(),
