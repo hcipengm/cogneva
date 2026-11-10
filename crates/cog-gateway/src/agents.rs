@@ -285,15 +285,29 @@ pub struct SessionEmployee {
     pub stable: bool,
 }
 
-/// 读一段会话绑定的人。没有绑定、或那一行读不懂时回 `None`，让调用方去分配。
-pub async fn read_bound_session(
+/// 一个登录身份落在哪位员工身上：一张不过期的表，键是 `user_id`。
+///
+/// 会话绑人只答得对「这一段对话是谁」。同一个属主开第二段对话，按会话认出来
+/// 的是第二个人——名单上于是出现两个员工、两行名册、两套工号，而干活、署名、
+/// 记账的其实是同一个人。人不是会话的一部分：谁登录，谁就是那位员工；会话只是
+/// 他此刻开的那一段。
+///
+/// 表与 [`SESSION_EMPLOYEE_KEY`] 分开，是因为它们回答的问题不同：一个是「这一段
+/// 对话是谁」，一个是「这个人是谁」。同时有两者时以人为准，会话那一行只留给没有
+/// 登录身份的连接与升级前就存在的老会话。
+pub const USER_EMPLOYEE_KEY: &str = "cogneva:user_employee";
+
+/// 从一张绑定表里读一行。读不到、读不懂都回 `None`，让调用方去分配。
+async fn read_binding(
     kv: &dyn cog_core::KeyValueStore,
-    session_id: &str,
+    key: &str,
+    field: &str,
+    what: &str,
 ) -> Option<SessionEmployee> {
-    let text = match kv.hget(SESSION_EMPLOYEE_KEY, session_id).await {
+    let text = match kv.hget(key, field).await {
         Ok(text) => text?,
         Err(e) => {
-            tracing::warn!(error = %e, session_id, "a session binding could not be read");
+            tracing::warn!(error = %e, field, "a {what} binding could not be read");
             return None;
         }
     };
@@ -302,12 +316,28 @@ pub async fn read_bound_session(
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                session_id,
-                "a session binding does not parse; the next turn re-mints it"
+                field,
+                "a {what} binding does not parse; the next turn re-mints it"
             );
             None
         }
     }
+}
+
+/// 读一段会话绑定的人。没有绑定、或那一行读不懂时回 `None`，让调用方去分配。
+pub async fn read_bound_session(
+    kv: &dyn cog_core::KeyValueStore,
+    session_id: &str,
+) -> Option<SessionEmployee> {
+    read_binding(kv, SESSION_EMPLOYEE_KEY, session_id, "session").await
+}
+
+/// 读一个登录身份绑定的人。
+pub async fn read_bound_user(
+    kv: &dyn cog_core::KeyValueStore,
+    user_id: &str,
+) -> Option<SessionEmployee> {
+    read_binding(kv, USER_EMPLOYEE_KEY, user_id, "user").await
 }
 
 /// 把一段会话绑到一位员工身上。后写覆盖先写是有意的：调用方只在表里没有这一
@@ -319,6 +349,16 @@ pub async fn write_bound_session(
 ) -> cog_core::SFResult<()> {
     let text = serde_json::to_string(row)?;
     kv.hset(SESSION_EMPLOYEE_KEY, session_id, &text).await
+}
+
+/// 把一个登录身份绑到一位员工身上。后写覆盖先写，理由同会话那一张。
+pub async fn write_bound_user(
+    kv: &dyn cog_core::KeyValueStore,
+    user_id: &str,
+    row: &SessionEmployee,
+) -> cog_core::SFResult<()> {
+    let text = serde_json::to_string(row)?;
+    kv.hset(USER_EMPLOYEE_KEY, user_id, &text).await
 }
 
 /// 这段会话在「说过话的人」名册上的那一行。

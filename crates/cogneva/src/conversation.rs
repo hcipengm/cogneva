@@ -123,28 +123,51 @@ fn fingerprint() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// 这一段对话的人：先读绑定，没有再分配一个并写回去。
+/// 这一段对话的人：先认登录身份，再认会话，都没有才分配一个并写回去。
 ///
-/// 名字的算法把实例指纹拌进种子里，所以同一段会话在滚过一次 Pod 之后会算出一个
-/// 新名字。绑定把「第一次见面时的那个人」钉在会话上：之后无论哪个实例接手，名册
-/// 上、账上、消息上读到的都是这一行。
+/// 认人的顺序就是「这个人是谁」离得由近到远：
 ///
-/// 绑定表是后加的，老会话没有。这时先认它在「说过话的人」名册上的那一行——
-/// 那一行就是它的人；认不出来才新发一个。不认这一步，升级之后同一个会话会在
-/// 名单上变成两个人，而那正是要修的病。
+/// 1. 登录身份（`owner`）。同一个属主开第二段对话，读到的是**同一位员工**——
+///    名册上不多一行、工号不重发、账上不换人。人不是会话的一部分。
+/// 2. 会话那一行。没有登录身份的连接（探针、升级前的老客户端）只有这一条线，
+///    它把「第一次见面时的那个人」钉在会话上，滚一次 Pod 也不换人。
+/// 3. 「说过话的人」名册上属于这段会话的那一行。绑定表是后加的，更老的会话
+///    没有它；不认这一步，升级之后同一个会话会在名单上变成两个人。
+/// 4. 都没有才按「实例指纹 ＋ 会话」新发一个——名字是算出来的，不是查出来的。
+///
+/// 写回时两边都写：会话那一行让同一段对话接着是这个人，身份那一行让他的下一段
+/// 对话也是这个人。没有第二句，「同一个人开两段对话就是两个人」这个病会从另一
+/// 个门原样回来。
 async fn bound_employee(
     kv: &Arc<dyn cog_core::KeyValueStore>,
     fingerprint: Option<&str>,
+    owner: Option<&str>,
     session_id: &str,
 ) -> cog_agent::identity::AgentName {
+    let owner = owner.map(str::trim).filter(|owner| !owner.is_empty());
+    let as_name = |row: cog_gateway::agents::SessionEmployee| cog_agent::identity::AgentName {
+        persona: row.persona,
+        short: row.short,
+        handle: row.handle,
+        id: row.agent_id,
+        stable: row.stable,
+    };
+
+    if let Some(owner) = owner {
+        if let Some(row) = cog_gateway::agents::read_bound_user(&**kv, owner).await {
+            let employee = as_name(row);
+            // 这一段会话也记到他名下：会话表是给「没有登录身份的连接」与老会话
+            // 用的，有登录身份的这一段同样要能按会话认回来。
+            bind_session(kv, session_id, &employee).await;
+            return employee;
+        }
+    }
     if let Some(row) = cog_gateway::agents::read_bound_session(&**kv, session_id).await {
-        return cog_agent::identity::AgentName {
-            persona: row.persona,
-            short: row.short,
-            handle: row.handle,
-            id: row.agent_id,
-            stable: row.stable,
-        };
+        let employee = as_name(row);
+        // 这一段对话的人已经有了，而这个属主从前没有绑定：把他记下来，下一段
+        // 会话才认得回同一个人。
+        bind_user(kv, owner, &employee).await;
+        return employee;
     }
     // 老会话：名册行上的 id 与名字就是它的人，按那一行认，不再重算。
     let existing = cog_gateway::agents::person_for_session(kv, session_id).await;
@@ -163,14 +186,29 @@ async fn bound_employee(
         Some(employee) => employee,
         None => employee_named(fingerprint, session_id),
     };
-    let binding = cog_gateway::agents::SessionEmployee {
+    bind_session(kv, session_id, &employee).await;
+    bind_user(kv, owner, &employee).await;
+    employee
+}
+
+fn binding_of(employee: &cog_agent::identity::AgentName) -> cog_gateway::agents::SessionEmployee {
+    cog_gateway::agents::SessionEmployee {
         agent_id: employee.id.clone(),
         persona: employee.persona.clone(),
         short: employee.short.clone(),
         handle: employee.handle.clone(),
         stable: true,
-    };
-    if let Err(e) = cog_gateway::agents::write_bound_session(&**kv, session_id, &binding).await {
+    }
+}
+
+async fn bind_session(
+    kv: &Arc<dyn cog_core::KeyValueStore>,
+    session_id: &str,
+    employee: &cog_agent::identity::AgentName,
+) {
+    if let Err(e) =
+        cog_gateway::agents::write_bound_session(&**kv, session_id, &binding_of(employee)).await
+    {
         tracing::warn!(
             agent_id = %employee.id,
             session_id,
@@ -178,7 +216,25 @@ async fn bound_employee(
             "会话没有绑定到人：下一位接手的实例会重算这个名字"
         );
     }
-    employee
+}
+
+async fn bind_user(
+    kv: &Arc<dyn cog_core::KeyValueStore>,
+    owner: Option<&str>,
+    employee: &cog_agent::identity::AgentName,
+) {
+    let Some(owner) = owner else {
+        return;
+    };
+    if let Err(e) = cog_gateway::agents::write_bound_user(&**kv, owner, &binding_of(employee)).await
+    {
+        tracing::warn!(
+            agent_id = %employee.id,
+            owner,
+            error = %e,
+            "登录身份没有绑定到人：这个属主的下一段对话会换成另一个人"
+        );
+    }
 }
 
 /// 名字的算法本体：种子是「实例指纹 ＋ 会话」，两样都变才换人。
@@ -325,35 +381,53 @@ impl ConversationTurn for PlatformConversation {
         events: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = SFResult<serde_json::Value>> + Send + 'a>> {
         Box::pin(async move {
-            // 这一段对话是谁：绑在会话上的人，跨轮、跨实例不变。派活与记账都按
-            // 这个名字。没有绑定表（进程没装 KV）时退回按会话算出来的那个名字。
+            // 这一段对话是谁：绑在登录身份上的人，跨会话、跨轮、跨实例不变。
+            // 派活与记账都按这个名字。没有绑定表（进程没装 KV）时退回按会话
+            // 算出来的那个名字。
+            let owner = Some(request.owner.as_str()).filter(|owner| !owner.trim().is_empty());
             let employee = match self.people.as_ref() {
-                Some(kv) => bound_employee(kv, fingerprint().as_deref(), &request.session_id).await,
+                Some(kv) => {
+                    bound_employee(kv, fingerprint().as_deref(), owner, &request.session_id).await
+                }
                 None => employee_for(&request.session_id),
             };
             // 先把他记进「说过话的人」名册：注册表上的心跳在他闭嘴几十秒后就
             // 过期，而人要找的是「那个跟我聊过的人」。写不进去不是这一轮的
             // 失败——他照样能说话，只是名单上从此少一个人；这一句是那个差别的
             // 唯一读数。
+            //
+            // 没有登录身份的连接不写这一行：名册要回答「这个人是谁」，而
+            // 一条没有身份的连接答不出这一问。给它记一行，名单上就多一个
+            // 没有属主的员工，读的人分不出那是「有人坐在这儿」还是「一个探针
+            // 开了一段会话、说了一句、再也没回来」——2026-11-06 名册上那 29 行
+            // 全是后者。
             if let Some(kv) = self.people.as_ref() {
-                let origin = PersonOrigin {
-                    platform: request.platform.clone(),
-                    device_id: request.device_id.clone(),
-                };
-                if let Err(e) = note_person(
-                    &**kv,
-                    &employee,
-                    &request.session_id,
-                    &origin,
-                    chrono::Utc::now(),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        agent_id = %employee.id,
-                        error = %e,
-                        "这位员工没有记进名册：他在名单上不会出现"
+                if owner.is_none() {
+                    tracing::debug!(
+                        session_id = %request.session_id,
+                        "a connection without a login identity said nothing to the roster: \
+                         the row would name an employee nobody can ask about"
                     );
+                } else {
+                    let origin = PersonOrigin {
+                        platform: request.platform.clone(),
+                        device_id: request.device_id.clone(),
+                    };
+                    if let Err(e) = note_person(
+                        &**kv,
+                        &employee,
+                        &request.session_id,
+                        &origin,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            agent_id = %employee.id,
+                            error = %e,
+                            "这位员工没有记进名册：他在名单上不会出现"
+                        );
+                    }
                 }
             }
             let config = RuntimeConfig {
@@ -2047,7 +2121,7 @@ mod tests {
         let store = Arc::new(FakePeople::default());
         let kv: Arc<dyn cog_core::KeyValueStore> = store;
 
-        let first = bound_employee(&kv, Some("inst-7f3a"), "conv-1").await;
+        let first = bound_employee(&kv, Some("inst-7f3a"), None, "conv-1").await;
         // 同一个会话，另一个实例接手：指纹不同，按会话重算会算出另一个人。
         let unbound_after_roll = employee_named(Some("inst-9c02"), "conv-1");
         assert_ne!(
@@ -2055,7 +2129,7 @@ mod tests {
             "这条判据的前提是重算会换名；指纹已经不参与名字了，得换个前提"
         );
 
-        let after_roll = bound_employee(&kv, Some("inst-9c02"), "conv-1").await;
+        let after_roll = bound_employee(&kv, Some("inst-9c02"), None, "conv-1").await;
 
         assert_eq!(after_roll.id, first.id);
         assert_eq!(after_roll.handle, first.handle);
@@ -2081,10 +2155,78 @@ mod tests {
         .unwrap();
 
         // 升级之后接手的是另一个实例：按会话重算会得到另一个人。
-        let employee = bound_employee(&kv, Some("inst-bbbb"), "conv-1").await;
+        let employee = bound_employee(&kv, Some("inst-bbbb"), None, "conv-1").await;
 
         assert_eq!(employee.id, older.id);
         assert_eq!(employee.handle, older.handle);
+    }
+
+    /// 同一个属主开两段对话，是同一个人；人不是会话的一部分。
+    ///
+    /// 按会话绑人时，同一个人每开一个新窗口就多一位员工：名册上行数随窗口数涨，
+    /// 工号一个个发出去，账上他今天花的钱被拆成好几个人。这条病读起来完全正常
+    /// ——每一行都有号、都有名字、都不重复。
+    ///
+    /// 判据说的是「员工行数不变」，所以除了两个会话读到同一个 id，还要数一遍：
+    /// 绑定表里这个属主只有一行，名册上没有多出行来。
+    #[tokio::test]
+    async fn one_owner_is_one_employee_across_sessions() {
+        let store = Arc::new(FakePeople::default());
+        let kv: Arc<dyn cog_core::KeyValueStore> = store;
+
+        let first = bound_employee(&kv, Some("inst-7f3a"), Some("user-1"), "conv-1").await;
+        // 第二段对话换了一个实例指纹：没有登录身份这条线，重算会算出另一个人。
+        let unbound_second = employee_named(Some("inst-9c02"), "conv-2");
+        assert_ne!(
+            unbound_second.id, first.id,
+            "这条判据的前提是换了会话就会换人；前提没了，得换个问法"
+        );
+
+        let second = bound_employee(&kv, Some("inst-9c02"), Some("user-1"), "conv-2").await;
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.handle, first.handle);
+        assert_eq!(
+            cog_core::KeyValueStore::hlen(&*kv, cog_gateway::agents::USER_EMPLOYEE_KEY)
+                .await
+                .unwrap(),
+            1,
+            "同一个属主绑出了不止一行：他的名字下已经是一个部门，而不是一个人"
+        );
+        assert_eq!(
+            cog_core::KeyValueStore::hlen(&*kv, cog_gateway::agents::PEOPLE_KEY)
+                .await
+                .unwrap(),
+            0,
+            "绑人不该顺手往「说过话的人」名册里写行——那是说过话才写的地方"
+        );
+    }
+
+    /// 没有登录身份的连接不往属主绑定表里写东西。
+    ///
+    /// 探针、升级前的老客户端、以及任何没带登录身份的连接，`owner` 都是空的。
+    /// 空串当成一个属主写下去，名册上就有了一行「无名氏」，之后每一台没登录的
+    /// 机器都会绑到它身上——一个谁都对得上的身份。
+    #[tokio::test]
+    async fn a_connection_without_a_login_identity_binds_nobody() {
+        let store = Arc::new(FakePeople::default());
+        let kv: Arc<dyn cog_core::KeyValueStore> = store;
+
+        let employee = bound_employee(&kv, Some("inst-7f3a"), None, "conv-1").await;
+        bound_employee(&kv, Some("inst-7f3a"), Some("   "), "conv-1").await;
+
+        assert_eq!(
+            cog_core::KeyValueStore::hlen(&*kv, cog_gateway::agents::USER_EMPLOYEE_KEY)
+                .await
+                .unwrap(),
+            0,
+            "没有登录身份的连接在属主绑定表里留下了一行：之后任何一个空属主都会绑到它身上"
+        );
+        // 会话这一行照写：没有登录身份也还是这一段对话的人。
+        let bound = cog_gateway::agents::read_bound_session(&*kv, "conv-1")
+            .await
+            .expect("会话照样绑人");
+        assert_eq!(bound.agent_id, employee.id);
     }
 
     /// 名册那一行记着这个人从哪儿来，且不会被一轮没声明来源的话擦掉。
