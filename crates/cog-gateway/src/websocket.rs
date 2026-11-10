@@ -65,30 +65,30 @@ async fn send_connected_event(
     send_server_message(socket, &msg).await
 }
 
-/// 握手时客户端自报的「我在哪儿」。
+/// 一条连接的来历：它自己叫什么、以谁的身份连着、从哪个客户端连上来。
 ///
-/// 两格回答的是同一个问题，所以一起走：分行传只是把参数个数加一。它们不是身份
-/// ——身份是认证主体；这两格只回答「这一行是谁开出来的会话」，让名单上分得出
-/// 人和探针。
-#[derive(Debug, Clone, Copy, Default)]
-struct ClientOrigin<'a> {
-    platform: Option<&'a str>,
-    device_id: Option<&'a str>,
+/// 三格回答的是同一个问题，所以一起走——分行传只是把参数个数往上加，加到第八个
+/// 时 clippy 会以「太多」判红，而它说的正是这件事：这些格子属于一个整体。三格里
+/// 没有一格是多出来的：`id` 是这条连接自己的名字（订阅与事件分发按它找），
+/// `user_id` 是握手时认出来的人（聊天花销记在他身上），`origin` 是客户端自报的
+/// 我在哪儿（只回答名单上「这一行是谁开出来的会话」，不是认证主体）。
+#[derive(Debug, Clone, Copy)]
+struct Connection<'a> {
+    id: &'a str,
+    /// The person this connection authenticated as, from the verified token
+    /// taken at upgrade. Chat spend is charged to it: the socket is the only
+    /// place on the platform where a human's identity is established, so it is
+    /// the only place a per-person ceiling can be enforced from.
+    user_id: &'a str,
+    origin: crate::chat::ClientOrigin<'a>,
 }
 
 async fn handle_type_message(
     socket: &mut WebSocket,
     state: &Arc<GatewayState>,
-    connection_id: &str,
-    // The person this connection authenticated as, from the verified token
-    // taken at upgrade. Chat spend is charged to it: the socket is the only
-    // place on the platform where a human's identity is established, so it is
-    // the only place a per-person ceiling can be enforced from.
-    user_id: &str,
+    conn: Connection<'_>,
     text: &str,
     out_tx: &tokio::sync::mpsc::Sender<String>,
-    // 转发进这一轮，落到「说过话的人」那一行上。
-    origin: ClientOrigin<'_>,
     // 这条连接上正在跑的轮：`chat_cancel` 按会话找它们。
     running: &crate::chat::RunningTurns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -117,7 +117,7 @@ async fn handle_type_message(
                 .connection_manager
                 .as_ref()
                 .ok_or("connection manager not available")?;
-            let subscribed = mgr.subscribe(connection_id, &channels).await;
+            let subscribed = mgr.subscribe(conn.id, &channels).await;
             let resp = ServerMessage::Subscribed {
                 channels: subscribed,
                 server_time: now_iso(),
@@ -141,15 +141,18 @@ async fn handle_type_message(
             let state = state.clone();
             let out = out_tx.clone();
             let session = session_id.unwrap_or_else(|| "default".into());
-            let owner = user_id.to_string();
-            let platform = origin.platform.map(str::to_string);
-            let device_id = origin.device_id.map(str::to_string);
+            let owner = conn.user_id.to_string();
+            // 借用版活不过 spawn：来历里那两格先拷成自己的字符串，闭包里再借回去。
+            let platform = conn.origin.platform.map(str::to_string);
+            let device_id = conn.origin.device_id.map(str::to_string);
             let running = running.clone();
             tokio::spawn(async move {
-                crate::chat::run_chat_turn(
-                    state, out, session, content, owner, platform, device_id, running,
-                )
-                .await;
+                let origin = crate::chat::ClientOrigin {
+                    platform: platform.as_deref(),
+                    device_id: device_id.as_deref(),
+                };
+                crate::chat::run_chat_turn(state, out, session, content, owner, origin, running)
+                    .await;
             });
         }
         ClientMessage::ChatCancel { session_id, .. } => {
@@ -357,14 +360,16 @@ pub async fn handle_socket(
                             handle_type_message(
                                 &mut socket,
                                 &state,
-                                &connection_id,
-                                &user_id,
+                                Connection {
+                                    id: &connection_id,
+                                    user_id: &user_id,
+                                    origin: crate::chat::ClientOrigin {
+                                        platform: platform.as_deref(),
+                                        device_id: device_id.as_deref(),
+                                    },
+                                },
                                 &text,
                                 &out_tx,
-                                ClientOrigin {
-                                    platform: platform.as_deref(),
-                                    device_id: device_id.as_deref(),
-                                },
                                 &running,
                             )
                             .await

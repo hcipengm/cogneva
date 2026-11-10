@@ -71,6 +71,16 @@ pub struct ConversationRequest {
     pub device_id: Option<String>,
 }
 
+/// 握手时客户端自报的「我在哪儿」，借用版。
+///
+/// [`ConversationRequest`] 里那两格是它穿过总线时的样子；这一份只在一跳里活着，
+/// 所以借而不拷。两格回答的是同一个问题，所以一起走：分行传只是把参数个数加一。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClientOrigin<'a> {
+    pub platform: Option<&'a str>,
+    pub device_id: Option<&'a str>,
+}
+
 /// 循环往网关送事件的管道有多深。
 ///
 /// 一个模型的回合可以连着吐几百个小增量，而界面那头的写是有背压的（慢客户端会
@@ -582,8 +592,8 @@ pub async fn run_chat_turn(
     // 没有人的那一格，与「声明了某个人」分开。
     owner: String,
     // 这条连接握手时自报的平台与设备，原样带进这一轮。见 [`ConversationRequest`]。
-    platform: Option<String>,
-    device_id: Option<String>,
+    // 两格一起走：它们回答同一个问题，分开传只是把参数个数往上加一个。
+    origin: ClientOrigin<'_>,
     // 这条连接上正在跑的轮。这一轮登记进去，客户端的停止才找得到它。
     running: RunningTurns,
 ) {
@@ -654,8 +664,8 @@ pub async fn run_chat_turn(
                 owner,
                 messages,
                 llm,
-                platform,
-                device_id,
+                platform: origin.platform.map(str::to_string),
+                device_id: origin.device_id.map(str::to_string),
             },
             events_tx,
         ),

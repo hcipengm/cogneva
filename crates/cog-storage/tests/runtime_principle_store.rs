@@ -357,7 +357,7 @@ async fn note_used_counts_the_runs_a_rule_was_handed_to() {
 
     probe
         .store
-        .note_used(&[slug.clone()])
+        .note_used(std::slice::from_ref(&slug))
         .await
         .expect("count one run");
     probe
