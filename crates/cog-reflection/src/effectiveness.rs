@@ -255,8 +255,6 @@ mod tests {
         registry.insert_skill_config(cog_core::SkillConfig {
             skill_id: skill_id.to_string(),
             name: skill_id.to_string(),
-            system_prompt: String::new(),
-            tools: Vec::new(),
             max_iterations: Some(1),
             role_type: "role".to_string(),
         });

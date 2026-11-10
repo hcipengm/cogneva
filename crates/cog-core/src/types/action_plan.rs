@@ -26,34 +26,24 @@ pub struct Skill {
 
 /// One row of the executor table, loaded dynamically from JSON.
 ///
-/// A row answers three questions: which kind of hand this is (`role_type`), what
-/// that hand may call (`tools`), and how many iterations it gets — when the
-/// operator has stated one (`max_iterations`). Agents are configured from a row by role
+/// A row answers two questions: which kind of hand this is (`role_type`), and
+/// how many iterations it gets — when the operator has stated one
+/// (`max_iterations`). Agents are configured from a row by role
 /// (`skill_for_role`), and goal decomposition is handed the rows so it can name
 /// the kind of hand for each sub-task.
 ///
-/// The table is not a capability catalogue: it lists the hands that exist, and an
-/// empty table is legal — a run then declares no per-role tool boundary and the
-/// planner names a generic executor kind instead of a registered one.
-/// **Note:** `system_prompt` is deprecated. LLM calls must use structured
-/// JSON input via `cog_llm::execute_structured` instead of natural-language
-/// prompts. The field is retained only for backward-compatible deserialisation.
+/// 这一行不再回答「这一位能用哪些工具」。工具只有一套：手上有什么由**身体所在的
+/// 进程**决定（有没有沙盒、有没有消息队列、有没有出门的客户端），不是由「它是
+/// 哪种手」决定。按角色收窄时，同一个进程里两个人对同一张注册表看到两套工具，
+/// 而谁被收窄取决于注册表上一个自由标签——换个标签，同一件活就做不成了。
+///
+/// 这一行也不再带人格（`system_prompt`）。它是一个执行体的系统前缀：写明它是谁
+/// 在这里是多余的，写错则是把一种流水线的口吻安在另一个人身上。那一轮做什么，
+/// 由它拿到的那件活说。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct SkillConfig {
     pub skill_id: String,
     pub name: String,
-    #[serde(default)]
-    pub system_prompt: String,
-    /// The registry tools this role may call, by the name the registry knows
-    /// them by. A role's skill is where its boundary is declared, next to the
-    /// iteration budget it already carries, so the two halves of "how much may
-    /// this role do" are read from one place.
-    ///
-    /// An empty list means the boundary is not declared, and a run under this
-    /// skill gets the whole registry. An entry that matches no registered tool
-    /// is dropped, so a typo here narrows a role silently — which is why the
-    /// shipped lists are gated against the registry rather than trusted.
-    pub tools: Vec<String>,
     /// The turn ceiling this role starts from — absent means there is none.
     ///
     /// A written number is the operator's own decision for this deployment, and
@@ -75,7 +65,8 @@ pub struct SkillConfig {
     /// agent's role to its row, and goal decomposition hands it to the planner as
     /// the row's `description`, which is how a sub-task ends up naming a kind of
     /// hand. It is a kind name (`planner`, `generator`, …), not a capability
-    /// claim: the row's boundary is `tools`, next to it.
+    /// claim and not a permission: every row sees the same tool registry, the
+    /// one its process installed.
     pub role_type: String,
 }
 

@@ -522,40 +522,26 @@ pub async fn read(state: &GatewayState) -> Inventory {
     )
 }
 
-/// 分工表里「谁能点它」：按动作列开点名的角色，另加没有声明边界的角色。
+/// 分工表里「谁能点它」：没有角色声明边界，所以每个角色都能点每一项。
 ///
-/// 读法与运行时收窄一轮时一样：`skill_configs` 数出有哪些角色，`skill_for_role`
-/// 决定同一个角色有多行时哪一行算数。用别的读法（比如把每一行都算上），这一栏会
-/// 报出运行时并不会给的许可——一份被高优先级行盖掉的旧清单会重新长出一个「允许」。
+/// 工具只有一套：手上有什么由**进程装了什么**决定，不由「它是哪种手」决定。技能行
+/// 上曾经有一张 `tools` 白名单，按角色收窄一轮的工具表；那一栏现在没有来源了，
+/// 于是这里只报一份角色名单，全部落在「不设边界」那一侧。
 ///
-/// 空表 `tools` 的角色单独返回，不摊到每个动作上：空表的意思是「不设边界，拿整张
-/// 注册表」，所以它出现在这里就等于「每一项它都能点」。把它读成「什么都不能调」，
-/// 恰好把最宽的那个角色读成最窄的。
+/// 空表这一档不是「什么都不能调」，是「拿整张注册表」：把它读成禁止，恰好把最宽
+/// 的那个角色读成最窄的。
 ///
 /// 单独一段是为了能判：它只吃一份技能表，不需要一棵接了插件的网关状态。
 fn callers_by_tool(
     registry: &cog_core::SkillRegistry,
 ) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
-    let mut roles: BTreeSet<String> = BTreeSet::new();
-    for config in registry.skill_configs() {
-        roles.insert(config.role_type.clone());
-    }
-    let mut per_tool: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut unbounded: Vec<String> = Vec::new();
+    let roles: BTreeSet<String> = registry
+        .skill_configs()
+        .into_iter()
+        .map(|config| config.role_type.clone())
+        .collect();
     // 角色名已经按 `BTreeSet` 排过：同一项的两个角色，顺序不随哈希历史变。
-    for role in roles {
-        let Some(config) = registry.skill_for_role(&role) else {
-            continue;
-        };
-        if config.tools.is_empty() {
-            unbounded.push(role);
-            continue;
-        }
-        for tool in &config.tools {
-            per_tool.entry(tool.clone()).or_default().push(role.clone());
-        }
-    }
-    (per_tool, unbounded)
+    (BTreeMap::new(), roles.into_iter().collect())
 }
 
 /// 把三路拼到的东西收成一份清单：排序、同一来源里同名的合成一行、每层条数与行数同源。
@@ -926,68 +912,44 @@ mod tests {
     /// 点了名允许调它的角色按动作列开：这一栏答的是「运行时会不会放它进去」。
     ///
     /// 名册那一栏（`holders`）写的是角色名或自由文本，这一栏要的是动作名；两边
-    /// 说的不是同一组词，所以这一栏必须从分工表读，不能从名册自报读。
-    #[test]
-    fn a_role_that_names_the_action_is_listed_as_its_caller() {
-        let registry = registry_with(
-            r#"[
-                {"skill_id":"planner","name":"Planner","tools":["read_file","search"],"role_type":"planner"},
-                {"skill_id":"generator","name":"Generator","tools":["write_file"],"role_type":"generator"}
-            ]"#,
-        );
-        let (per_tool, unbounded) = callers_by_tool(&registry);
-        assert_eq!(
-            per_tool.get("read_file").map(Vec::as_slice),
-            Some(&["planner".to_string()][..])
-        );
-        assert_eq!(
-            per_tool.get("write_file").map(Vec::as_slice),
-            Some(&["generator".to_string()][..])
-        );
-        assert!(unbounded.is_empty(), "两份技能都声明了边界");
-    }
-
-    /// 空 `tools` 的角色单独一栏，不摊到每个动作上：空表是「不设边界，拿整张
-    /// 注册表」，把它读成「什么都不能调」恰好把最宽的角色读成了最窄的。
-    #[test]
-    fn a_role_with_no_declared_tools_is_unbounded_rather_than_forbidden() {
-        let registry = registry_with(
-            r#"[
-                {"skill_id":"free","name":"Free","tools":[],"role_type":"generalist"},
-                {"skill_id":"planner","name":"Planner","tools":["read_file"],"role_type":"planner"}
-            ]"#,
-        );
-        let (per_tool, unbounded) = callers_by_tool(&registry);
-        assert_eq!(unbounded, vec!["generalist".to_string()]);
-        assert_eq!(
-            per_tool.get("read_file").map(Vec::as_slice),
-            Some(&["planner".to_string()][..])
-        );
-        assert_eq!(per_tool.len(), 1, "不设边界的角色不被摊到任何一项上");
-    }
-
-    /// 同一个角色有多行时，这一栏算的是运行时用的那一行，不是每一行都算。
+    /// 没有角色声明边界之后，每个角色都落在「不设边界」那一侧。
     ///
-    /// 把被盖掉的旧行也算上，这一栏会报出一个运行时并不给的许可——而那一栏的
-    /// 全部价值就是「说得出谁能点它」。
+    /// 这一栏从分工表读而不是从名册自报读，理由没变：两处说的不是同一组词。变的是
+    /// 分工表里不再有边界——工具只有一套，谁拿到的都是整张注册表。
     #[test]
-    fn the_row_that_governs_a_role_is_the_one_the_run_uses() {
-        let mut registry = registry_with(
+    fn every_role_is_unbounded_since_no_row_declares_a_boundary() {
+        let registry = registry_with(
             r#"[
-                {"skill_id":"a-generator","name":"A","tools":["write_file"],"role_type":"generator"},
-                {"skill_id":"b-generator","name":"B","tools":["admin_shell"],"role_type":"generator"}
+                {"skill_id":"planner","name":"Planner","role_type":"planner"},
+                {"skill_id":"generator","name":"Generator","role_type":"generator"}
             ]"#,
         );
-        // 同优先级按 skill id 定序（与 `skill_for_role` 一致）：a-generator 算数。
-        let (rows, _) = callers_by_tool(&registry);
-        assert_eq!(rows.keys().collect::<Vec<_>>(), vec!["write_file"]);
-        registry.set_priority("b-generator", 10);
-        let (rows, _) = callers_by_tool(&registry);
-        assert_eq!(
-            rows.keys().collect::<Vec<_>>(),
-            vec!["admin_shell"],
-            "高优先级那一行接管这个角色之后，旧行的工具不再算允许"
+        let (per_tool, unbounded) = callers_by_tool(&registry);
+        assert!(
+            per_tool.is_empty(),
+            "有动作被摊到了某个角色头上：分工表里已经没有任何边界可以声明它"
         );
+        assert_eq!(
+            unbounded,
+            vec!["generator".to_string(), "planner".to_string()],
+            "每个角色都该落进「拿整张注册表」那一栏，而不是被读成什么都不能调"
+        );
+    }
+
+    /// 同一个角色有多行时，这一栏只列它一次。
+    ///
+    /// 这一栏答的是「有哪些角色」，不是「有哪些行」：按行列，同一个角色会因为
+    /// 表里多出一行而在读者那里变成两个人。
+    #[test]
+    fn a_role_with_several_rows_is_listed_once() {
+        let registry = registry_with(
+            r#"[
+                {"skill_id":"a-generator","name":"A","role_type":"generator"},
+                {"skill_id":"b-generator","name":"B","role_type":"generator"}
+            ]"#,
+        );
+        let (_, unbounded) = callers_by_tool(&registry);
+        assert_eq!(unbounded, vec!["generator".to_string()]);
     }
 
     /// 「分工表没读到」与「读到了、没有角色点名它」在线上要分得开。

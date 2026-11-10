@@ -2947,8 +2947,9 @@ export interface CapabilityInventory {
   /** 名册这一拍没读到的原因；`null`/缺省是读到了（含读到但没人自报）。 */
   roster_caveat?: string;
   /**
-   * 没有声明 `tools` 的角色：它们拿整张注册表，所以每一项都能点。`null` 是分工表
-   * 没读到，不是「没有这种角色」——后者是空数组。
+   * 不设边界的角色：它们拿整张注册表，所以每一项都能点。分工表里已无人声明
+   * `tools`，所以这一栏通常就是全部角色。`null` 是分工表没读到，不是「没有这种
+   * 角色」——后者是空数组。
    */
   unbounded_roles: string[] | null;
 }

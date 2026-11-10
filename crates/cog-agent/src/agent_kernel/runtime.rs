@@ -1190,29 +1190,15 @@ impl AgentRuntime {
         self
     }
 
+    /// 把这一轮能用的工具交给它：整张注册表，不按角色收窄。
+    ///
+    /// 手上有什么工具由**这个进程装了什么**决定——有没有沙盒、有没有消息队列、
+    /// 有没有出门的客户端——不由「它是哪种手」决定。曾经这里按技能行上声明的
+    /// `tools` 裁一刀：同一个进程里的两位对同一张注册表看到两套工具，而裁成哪一套
+    /// 取决于注册表上一个自由标签。换个标签，同一件活就做不成了；而裁掉的那一项
+    /// 不会报错，它只是「不存在」，模型于是学会了不去用它。
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
-        self.tools = match self.config.skill_config.as_ref() {
-            Some(skill) if !skill.tools.is_empty() => {
-                let missing = tools.missing_tools(&skill.tools);
-                if !missing.is_empty() {
-                    // Both sides of the count are deduplicated: `missing` already
-                    // is, and a declared list that repeats a name would otherwise
-                    // subtract a shorter missing list from a longer declared one
-                    // and report a role as better off than it is.
-                    let declared: std::collections::HashSet<&String> = skill.tools.iter().collect();
-                    let kept = declared.len() - missing.len();
-                    tracing::warn!(
-                        skill = %skill.skill_id,
-                        missing = ?missing,
-                        kept,
-                        declared = declared.len(),
-                        "skill declares tools the registry does not hold; the role runs without them"
-                    );
-                }
-                tools.restricted_to(&skill.tools)
-            }
-            _ => tools,
-        };
+        self.tools = tools;
         self
     }
 
@@ -4045,8 +4031,6 @@ mod tests {
         let skill = SkillConfig {
             skill_id: "custom-planner".into(),
             name: "Custom Planner".into(),
-            system_prompt: "You are a custom planning expert.".into(),
-            tools: vec!["md".into()],
             max_iterations: Some(42),
             role_type: "planner".into(),
         };
@@ -4078,8 +4062,6 @@ mod tests {
         let skill = SkillConfig {
             skill_id: "fast-evaluator".into(),
             name: "Fast Evaluator".into(),
-            system_prompt: "Evaluate quickly.".into(),
-            tools: vec![],
             max_iterations: Some(3),
             role_type: "evaluator".into(),
         };
@@ -4158,71 +4140,42 @@ mod tests {
         AgentRuntime::new(config, tx)
     }
 
-    fn skill_naming(role: &str, tools: &[&str]) -> SkillConfig {
+    fn skill_naming(role: &str) -> SkillConfig {
         SkillConfig {
             skill_id: format!("{role}-boundary-test"),
             name: role.into(),
-            system_prompt: String::new(),
-            tools: tools.iter().map(|t| (*t).into()).collect(),
             max_iterations: Some(5),
             role_type: role.into(),
         }
     }
 
-    /// 角色说自己能用什么，跑起来就只能用什么：边界落在运行时持有的那份工具上，
-    /// 而不是只落在给模型看的定义列表上——后者是一句建议。
+    /// 工具只有一套：同一张注册表交给两件不同活的运行，两边手上是同一份。
+    ///
+    /// 这里曾经按技能行上的白名单收窄：同一个进程里的两位对同一张注册表看到两套
+    /// 工具，而裁成哪一套取决于注册表上一个自由标签。换个标签，同一件活就做不成了；
+    /// 裁掉的那一项不会报错，它只是「不存在」，模型于是学会了不去用它。
     #[test]
-    fn a_run_holds_the_tools_its_skill_declares() {
+    fn every_run_holds_the_whole_registry_its_process_installed() {
         let whole = registry_of(&["read_file", "write_file", "run_command"]);
-        let runtime = runtime_with(
-            Some(skill_naming("boundary-narrow-test", &["read_file"])),
-            "boundary-narrow-test",
-        )
-        .with_tools(whole.clone());
+        let mut expected = whole.names();
+        expected.sort();
 
-        let mut held = runtime.tools.names();
-        held.sort();
-        assert_eq!(held, vec!["read_file".to_string()]);
-
-        // 收窄的是这一轮手上的那份，共享的那份不动：否则一个角色的边界会变成别人的。
-        assert_eq!(
-            whole.names().len(),
-            3,
-            "narrowing one run must not shrink the registry it was handed"
-        );
-    }
-
-    /// 没声明边界就没有边界。空名单不是"什么都不许"，它是一个没人描述过这个角色
-    /// 需要什么的证据；凭它把角色清空，是把缺失当成了限制。
-    #[test]
-    fn an_undeclared_boundary_leaves_the_run_the_whole_registry() {
-        let whole = registry_of(&["read_file", "write_file", "run_command"]);
-
-        for skill in [None, Some(skill_naming("boundary-absent-test", &[]))] {
-            let runtime = runtime_with(skill, "boundary-absent-test").with_tools(whole.clone());
+        for role in ["planner", "generator", "evaluator"] {
+            let runtime =
+                runtime_with(Some(skill_naming(role)), role).with_tools(whole.clone());
+            let mut held = runtime.tools.names();
+            held.sort();
             assert_eq!(
-                runtime.tools.names().len(),
-                3,
-                "an absent tool list is not a boundary"
+                held, expected,
+                "{role} 手上少了几件工具：工具由进程装了什么决定，不由这一行的种类决定"
             );
         }
-    }
 
-    /// 名单里写错一个名字，只该少那一个；剩下的照常收窄，构建不出错。
-    /// 让一处笔误把整轮跑挂掉，是把整理遗漏变成了一次事故。
-    #[test]
-    fn a_name_with_no_tool_behind_it_narrows_without_failing() {
-        let whole = registry_of(&["read_file", "run_command"]);
-        let runtime = runtime_with(
-            Some(skill_naming(
-                "boundary-typo-test",
-                &["read_file", "reed_file"],
-            )),
-            "boundary-typo-test",
-        )
-        .with_tools(whole);
-
-        assert_eq!(runtime.tools.names(), vec!["read_file".to_string()]);
+        // 没有技能行的那一位也一样：没有行不等于没有工具。
+        let bare = runtime_with(None, "no-skill-row").with_tools(whole);
+        let mut held = bare.tools.names();
+        held.sort();
+        assert_eq!(held, expected);
     }
 
     /// 没有观测就原样用种子：凭一个没看见过的事实改数字，只是把猜数换了个地方。
@@ -7143,8 +7096,6 @@ mod tests {
         let skill = SkillConfig {
             skill_id: "skill-outcome-skill".into(),
             name: "Skill Outcome Test".into(),
-            system_prompt: String::new(),
-            tools: Vec::new(),
             max_iterations: Some(1),
             role_type: "skill-outcome-role".into(),
         };

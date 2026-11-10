@@ -484,7 +484,7 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             <Row label="调用点" note="在＝按名字点单会真的跑；「只声明」点了落空" />
             <Row
               label="谁能点它"
-              note="分工表里点了名的角色；没有声明 tools 的角色能点每一项，不摊在这一栏"
+              note="没有一个角色声明工具边界：每个角色都拿整张注册表，所以只在不设边界那一侧列名"
             />
             <Row label="要什么参数" note="schema 里声明的必填与总数；「清单没给」不是「不要参数」" />
             <Row label="跑在哪" note="进程内 / WASM 沙箱 / 远端执行器——它决定做砸了长什么样" />

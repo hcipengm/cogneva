@@ -15,7 +15,7 @@
  * 只有声明的那几项自己说出来——混在一起读，这张表就退化成「装了什么」。
  *
  * 「谁能点它」另占一栏，读的是分工表（每个角色声明的 tools），不是名册自报——名册
- * 那一栏写的是角色名，而运行时收窄一轮用的是分工表。没有声明 tools 的角色是「不设
+ * 那一栏写的是角色名，而工具由进程装了什么决定。每个角色都是「不设
  * 边界，拿整张注册表」，单独一句话说清：不点破的话，那一栏的空格会被读成「谁都不许」。
  *
  * 三要件各占一栏：名字、调用点、边界（要什么参数）。第四栏是「点过几次」——它不属
@@ -67,7 +67,7 @@ export function CapabilitiesView() {
   // 两个都印，主数才是「会做什么」。
   const callable = data?.entries.filter((e) => e.reach === 'callable').length ?? 0;
   const declaredOnly = (data?.entries.length ?? 0) - callable;
-  // 分工表里没有声明 tools 的角色：它们拿整张注册表，所以每一项都能点。`null` 是这张
+  // 不设边界的角色：它们拿整张注册表，所以每一项都能点。`null` 是这张
   // 表没读到——那时「没有这种角色」无从说起。
   const unboundedRoles = data?.unbounded_roles ?? null;
 
@@ -164,11 +164,11 @@ export function CapabilitiesView() {
           的登记表，那两个数要分开读。
         </p>
         {unboundedRoles && unboundedRoles.length > 0 ? (
-          // 空表 `tools` 不是「什么都不能调」，是「不设边界，拿整张注册表」——
-          // 不点破的话，「谁能点它」那一栏的空格会被读成「谁都不许」，而那恰好
-          // 把最宽的角色读成了最窄的。
+          // 分工表里已经没有 `tools` 了，每个角色都拿整张注册表。这一栏照旧读
+          // 「不设边界」那一档：空着不是「什么都不能调」，不点破的话，「谁能点它」
+          // 的空格会被读成「谁都不许」，而那恰好把最宽的角色读成了最窄的。
           <p className="px-4 pb-2 text-[11px] leading-relaxed text-[var(--warn,var(--muted))]">
-            {unboundedRoles.join('、')} 没有声明 tools：它们拿整张注册表，所以每一项都能点。
+            工具只有一套：{unboundedRoles.join('、')} 拿的都是整张注册表，所以每一项都能点。
             「谁能点它」那一栏空着，不等于谁都不许。
           </p>
         ) : null}

@@ -254,7 +254,9 @@ impl SkillRegistry {
             id: skill.skill_id.clone(),
             name: skill.name.clone(),
             description: skill.role_type.clone(),
-            tools: skill.tools.clone(),
+            // 这一行不再声明边界：镜像里的空表就是「不设边界，拿整张注册表」，
+            // 而这张表现在每一行都是空的——工具由进程装了什么决定，不由哪种手决定。
+            tools: Vec::new(),
             complexity_score: 0,
             blocked_by: Vec::new(),
             blocks: Vec::new(),
@@ -601,12 +603,10 @@ mod tests {
         }
     }
 
-    fn config(id: &str, role_type: &str, tools: Vec<&str>) -> SkillConfig {
+    fn config(id: &str, role_type: &str) -> SkillConfig {
         SkillConfig {
             skill_id: id.to_string(),
             name: id.to_string(),
-            system_prompt: String::new(),
-            tools: tools.into_iter().map(String::from).collect(),
             max_iterations: None,
             role_type: role_type.to_string(),
         }
@@ -617,11 +617,14 @@ mod tests {
     #[test]
     fn the_mirror_carries_the_executor_kind() {
         let mut registry = SkillRegistry::new();
-        registry.insert_skill_config(config("gen-v2", "generator", vec!["write_file"]));
+        registry.insert_skill_config(config("gen-v2", "generator"));
 
         let mirrored = registry.get("gen-v2").expect("the row must be mirrored");
         assert_eq!(mirrored.description, "generator");
-        assert_eq!(mirrored.tools, vec!["write_file".to_string()]);
+        assert!(
+            mirrored.tools.is_empty(),
+            "镜像里出现了工具边界：技能行已经不再声明边界，这一栏只该是「不设边界」"
+        );
         assert_eq!(registry.get_skill("gen-v2").unwrap().role_type, "generator");
         assert_eq!(
             registry

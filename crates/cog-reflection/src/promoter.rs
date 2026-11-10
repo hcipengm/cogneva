@@ -237,8 +237,6 @@ impl LearningPromoter for DefaultLearningPromoter {
                 let config = SkillConfig {
                     skill_id: skill_id.clone(),
                     name: format!("Best Practice: {}", learning.summary),
-                    system_prompt: String::new(), // Deprecated per SkillConfig docs.
-                    tools: vec![],
                     max_iterations: None,
                     role_type: "best_practice".into(),
                 };
@@ -259,8 +257,6 @@ impl LearningPromoter for DefaultLearningPromoter {
                 let config = SkillConfig {
                     skill_id: skill_id.clone(),
                     name: format!("Correction Rule: {}", learning.summary),
-                    system_prompt: String::new(),
-                    tools: vec![],
                     max_iterations: None,
                     role_type: "correction".into(),
                 };
@@ -295,8 +291,6 @@ impl LearningPromoter for DefaultLearningPromoter {
                         let config = SkillConfig {
                             skill_id: skill_id.clone(),
                             name: format!("Wiki: {}", learning.summary),
-                            system_prompt: String::new(),
-                            tools: vec![],
                             max_iterations: None,
                             role_type: "documentation".into(),
                         };

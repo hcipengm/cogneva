@@ -2792,8 +2792,6 @@ mod tests {
         registry.insert_skill_config(cog_core::SkillConfig {
             skill_id: "planner".into(),
             name: "Planner".into(),
-            system_prompt: String::new(),
-            tools: vec!["read_file".into()],
             max_iterations: Some(10),
             role_type: "planner".into(),
         });
