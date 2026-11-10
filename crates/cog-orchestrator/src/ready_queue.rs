@@ -175,28 +175,15 @@ pub fn ready_group(workspace_id: &str) -> String {
 ///
 /// `None` is "no bound is derivable", and it is never zero: a missing
 /// measurement read as a zero bound would stop dispatch for the whole length of
-/// a rollout, which is a driver traded for a reading. Two cases return it --
-/// nothing measured (`measured_upstreams == 0`) and no job cost to divide by
-/// (`reserve_tokens == 0`).
-///
-/// A measurement that covers fewer upstreams than the pool has used to return
-/// `None` as well, on the argument that a subset says nothing about the pool.
-/// It does say one thing: what the measured subset can pay for is a **lower**
-/// bound on the pool's capacity, and turning that into "no bound" made it an
-/// upper bound of everything a pass could carry. Measured 2026-11-10, 14:48 to
-/// 15:34: the pool was two upstreams, one of which states no window at all and
-/// one measured at allowance 0 with 9,763 tokens spent, so the sum covered one
-/// member of two, the bound reported `partial_pool` and meant "the ceiling",
-/// and the change ledger handed over 154 changes in 62 minutes -- 4,780 priced
-/// calls, ¥95.87, three handovers with a product.
-///
-/// The trade is real and it is worth stating which side was picked: a lower
-/// bound used as an upper bound holds back work an unmeasured member could have
-/// served, while the opposite spends whatever that member will take with no
-/// reading that says so. Idleness a pass names (`window_exhausted`, or
-/// `partial_pool` on the batch line) is the cheaper mistake, and its repair is
-/// on the pool -- give the member a window, or take it out -- not on this
-/// number.
+/// a rollout, which is a driver traded for a reading. Three cases return it --
+/// nothing measured (`measured_upstreams == 0`), no job cost to divide by
+/// (`reserve_tokens == 0`), and a measurement that covers fewer upstreams than
+/// the pool has. The last one is the guard that keeps this from repeating the
+/// refusal's old mistake: allowance and spend are summed over the upstreams
+/// that reported a window, so a pool where only one member reports would be
+/// sized by that member's ruler and the rest of the pool judged by it. A subset
+/// says nothing about the pool, and `pool_size == 0` is "not reported" rather
+/// than an empty pool.
 ///
 /// `reserve_tokens` is one whole job, measured over finished jobs, so this is a
 /// count of jobs and not an average call -- the gateway's own `blocked` test
@@ -205,8 +192,14 @@ pub fn ready_group(workspace_id: &str) -> String {
 ///
 /// Spend past the allowance (a snapshot read after the window rolled) yields
 /// zero rather than a wrapped-around huge number: saturated subtraction.
-pub fn jobs_the_window_can_pay_for(pace: &cog_core::LlmWindowPace) -> Option<u64> {
+pub fn jobs_the_window_can_pay_for(
+    pace: &cog_core::LlmWindowPace,
+    pool_size: usize,
+) -> Option<u64> {
     if pace.measured_upstreams == 0 || pace.reserve_tokens == 0 {
+        return None;
+    }
+    if pool_size > 0 && pace.measured_upstreams < pool_size {
         return None;
     }
     Some(pace.allowance_tokens.saturating_sub(pace.spent_tokens) / pace.reserve_tokens)
@@ -219,12 +212,9 @@ pub fn jobs_the_window_can_pay_for(pace: &cog_core::LlmWindowPace) -> Option<u64
 /// the subscription, model, or account is not there, so the same refusal will
 /// be there for as long as the configuration stands. Counting them makes the
 /// measurement permanently partial -- two of the four upstreams in the pool
-/// this was written against answer that way -- and a partial measurement used
-/// to admit everything, which is the failure the bound exists to prevent,
-/// reintroduced through the denominator. That is why this exclusion exists, and
-/// it still decides what a pass *calls* the bound: with the count correct, a
-/// batch the window could not pay for is `partial_pool` rather than a claim
-/// about the whole pool.
+/// this was written against answer that way -- and a partial measurement is
+/// deliberately `None`, which admits everything. That is the failure the bound
+/// exists to prevent, reintroduced through the denominator.
 ///
 /// A member that is merely out of quota still counts: its window rolls, so it
 /// is part of what the pool will be able to pay for.
@@ -267,7 +257,7 @@ pub fn jobs_the_window_can_pay_for_status(status: &cog_core::LlmPoolStatus) -> O
     if status.unavailable {
         return Some(0);
     }
-    jobs_the_window_can_pay_for(&status.pace)
+    jobs_the_window_can_pay_for(&status.pace, measurable_pool_size(status))
 }
 
 /// The instant before which a ready-queue pass may be skipped outright.
@@ -948,12 +938,12 @@ mod tests {
     #[test]
     fn a_measured_pool_yields_the_jobs_its_remaining_allowance_pays_for() {
         assert_eq!(
-            jobs_the_window_can_pay_for(&pace(2, 5_000_000, 3_000_000, 500_000)),
+            jobs_the_window_can_pay_for(&pace(2, 5_000_000, 3_000_000, 500_000), 2),
             Some(4)
         );
         // Spent past the allowance is zero, not a wrapped-around huge count.
         assert_eq!(
-            jobs_the_window_can_pay_for(&pace(2, 1_000_000, 2_000_000, 500_000)),
+            jobs_the_window_can_pay_for(&pace(2, 1_000_000, 2_000_000, 500_000), 2),
             Some(0)
         );
     }
@@ -963,11 +953,11 @@ mod tests {
         // A missing measurement read as a zero bound would stop dispatch for
         // as long as the reading is missing.
         assert_eq!(
-            jobs_the_window_can_pay_for(&pace(0, 0, 0, 500_000)),
+            jobs_the_window_can_pay_for(&pace(0, 0, 0, 500_000), 2),
             None
         );
         assert_eq!(
-            jobs_the_window_can_pay_for(&pace(2, 5_000_000, 0, 0)),
+            jobs_the_window_can_pay_for(&pace(2, 5_000_000, 0, 0), 2),
             None
         );
     }
@@ -1131,7 +1121,7 @@ mod tests {
         let down = status(2, 2, true, &["quota_cycle", "quota_cycle"]);
         assert_eq!(jobs_the_window_can_pay_for_status(&down), Some(0));
         assert!(
-            jobs_the_window_can_pay_for(&down.pace).unwrap_or(0) > 0,
+            jobs_the_window_can_pay_for(&down.pace, measurable_pool_size(&down)).unwrap_or(0) > 0,
             "the fixture must keep paying for a job, or it cannot show the two reasons apart"
         );
         assert_eq!(
@@ -1157,11 +1147,10 @@ mod tests {
     }
 
     #[test]
-    fn a_measurement_that_covers_less_than_the_usable_pool_bounds_it_from_below() {
-        // One of the two members that can come back reported, and what it
-        // reported is what the queue may spend: a subset is a lower bound on
-        // the pool, not a reading of zero capacity, so it bounds the batch
-        // rather than admitting everything.
+    fn a_measurement_that_covers_less_than_the_usable_pool_is_still_no_bound() {
+        // One of the two members that can come back reported. That is a subset
+        // of the usable pool, so it is still no bound -- the entitlement
+        // exclusion must not turn a partial reading into a usable one.
         assert_eq!(
             jobs_the_window_can_pay_for_status(&status(
                 4,
@@ -1169,7 +1158,7 @@ mod tests {
                 false,
                 &["quota_cycle", "entitlement", "quota_cycle", "entitlement"]
             )),
-            Some(4)
+            None
         );
     }
 
@@ -1298,27 +1287,16 @@ mod tests {
     }
 
     #[test]
-    fn a_measurement_covering_part_of_the_pool_is_a_bound_and_not_a_pass() {
-        // The shape of 2026-11-10: one member of the pool states a window and
-        // it is spent past its allowance, the other states none. Measured 1 of
-        // 2, allowance 0, 9,763 tokens spent, one job costing 1,613,973: the
-        // answer used to be "no bound", and 154 handovers went out in 62
-        // minutes for ¥95.87 with three products. It is zero.
+    fn a_measurement_covering_part_of_the_pool_is_no_bound() {
+        // One member's window summed as if it were the pool's repeats the
+        // refusal's old category error on the enqueue side.
         assert_eq!(
-            jobs_the_window_can_pay_for(&cog_core::LlmWindowPace {
-                measured_upstreams: 1,
-                allowance_tokens: 0,
-                spent_tokens: 9_763,
-                reserve_tokens: 1_613_973,
-                reserve_population: 5,
-                window_secs: 18_000,
-                window_start_unix: 0,
-            }),
-            Some(0)
+            jobs_the_window_can_pay_for(&pace(1, 5_000_000, 0, 500_000), 3),
+            None
         );
-        // And when the same subset still has room, the room is the bound.
+        // `pool_size == 0` is "not reported", not a pool of no upstreams.
         assert_eq!(
-            jobs_the_window_can_pay_for(&pace(1, 5_000_000, 0, 500_000)),
+            jobs_the_window_can_pay_for(&pace(1, 5_000_000, 0, 500_000), 0),
             Some(10)
         );
     }

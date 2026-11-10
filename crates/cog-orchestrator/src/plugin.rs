@@ -847,24 +847,31 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                 beat.beat();
                                                 tokio::select! {
                                                     _ = interval.tick() => {
-                                                        // 整轮的墙由产出侧自己守：它按剩余预算缩每一步的
-                                                        // 等待上限，所以这一轮总在 `round_budget` 内自己收尾，
-                                                        // 并带着「看了几个、写了几个、下一轮从哪起」回来。
-                                                        // 外面不再套一层超时——砍掉那一轮砍掉的正是这三个读数，
-                                                        // 而它们就是这一格要修的东西。
-                                                        let coverage = checkpoint_orchestrator
-                                                            .checkpoint_owned_tasks(
-                                                                agents.as_ref(),
-                                                                round_budget,
-                                                            )
-                                                            .await;
-                                                        if coverage.saved > 0 {
-                                                            tracing::debug!(
-                                                                saved = coverage.saved,
-                                                                owned = coverage.owned,
-                                                                checked = coverage.checked,
-                                                                "task checkpoint producer wrote resume points"
-                                                            );
+                                                        match tokio::time::timeout(
+                                                            round_budget,
+                                                            checkpoint_orchestrator
+                                                                .checkpoint_owned_tasks(
+                                                                    agents.as_ref(),
+                                                                ),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(saved) => {
+                                                                if saved > 0 {
+                                                                    tracing::debug!(
+                                                                        saved,
+                                                                        "task checkpoint producer wrote resume points"
+                                                                    );
+                                                                }
+                                                            }
+                                                            Err(_) => {
+                                                                tracing::warn!(
+                                                                    budget_secs =
+                                                                        round_budget
+                                                                            .as_secs(),
+                                                                    "task checkpoint round exceeded its budget and was cut short; some tasks were not checkpointed this cycle"
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                     _ = checkpoint_shutdown.wait() => break,

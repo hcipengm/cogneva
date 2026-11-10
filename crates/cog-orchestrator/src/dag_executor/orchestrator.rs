@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use super::circuit_registry::CircuitBreakerRegistry;
 use super::retry_matrix::RetryMatrix;
-use super::task_checkpoint::{self, CheckpointAgents, CheckpointRound};
+use super::task_checkpoint::{
+    self, checkpoint_task_with_timeout, CheckpointAgents, CheckpointRound, CHECKPOINT_STEP_TIMEOUT,
+};
 use super::task_phase::PhasedTask;
 use cog_core::contract::outcome::GuardrailRefusal;
 use cog_core::{DeadLetterEntry, DeadLetterQueue, RetryAttempt, SuggestedAction};
@@ -109,11 +111,6 @@ pub struct DagExecutor {
     /// `scheduled`」，这里拦「进 `running`」，两处必须是**同一个对象**，否则看板
     /// 上印的上限与真正拦住的那个数会在有人只改了一边的那天分家。
     board_wip_limits: std::sync::RwLock<cog_core::BoardWipLimits>,
-    /// 检查点产出下一轮从任务名册的哪个下标起。
-    ///
-    /// 一个进程自己的东西，不进任何载储：轮转起点只需要跨「本进程的上一轮」记住，
-    /// 换了进程，名册与租约也一起换了。
-    checkpoint_cursor: std::sync::atomic::AtomicUsize,
 }
 
 /// 为什么一个 Running 任务需要被回收。
@@ -341,7 +338,6 @@ impl DagExecutor {
             metrics: std::sync::RwLock::new(None),
             agent_manager: std::sync::RwLock::new(None),
             board_wip_limits: std::sync::RwLock::new(cog_core::BoardWipLimits::from_env().0),
-            checkpoint_cursor: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -3921,53 +3917,26 @@ impl DagExecutor {
     /// 是我的」，而检查点写的是同一批任务——两处对「我的」的定义必须是同一个，
     /// 否则会给别人的任务写续跑点。
     ///
-    /// 起点接着上一轮停下的地方（[`crate::dag_executor::task_checkpoint::OwnedRound::cursor`]）：
-    /// 实测 2026-11-10 主进程六十分钟只覆盖了自己持有的 4 个任务，而有 95 个变更队
-    /// 在这台进程上跑——固定从头开始、又碰上卡住的 agent 把整轮预算吃掉，名册后半
-    /// 段永远排不上。轮转之后「谁被饿死」不再由名册顺序决定。
-    ///
-    /// 返回本轮看了几个、写了几个，调用方据此把覆盖缺口念出来。
-    pub async fn checkpoint_owned_tasks(
-        &self,
-        agents: &dyn CheckpointAgents,
-        budget: std::time::Duration,
-    ) -> crate::dag_executor::task_checkpoint::OwnedRound {
+    /// 返回本轮真正写下的续跑点数。
+    pub async fn checkpoint_owned_tasks(&self, agents: &dyn CheckpointAgents) -> usize {
         let Some(state) = self.state_backend.clone() else {
             tracing::debug!(
                 "no state backend attached: a checkpoint would have nowhere to hang its resume pointer"
             );
-            return Default::default();
+            return 0;
         };
-        let tasks = self.owned_running_tasks().await;
-        let cursor = self
-            .checkpoint_cursor
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let deadline = tokio::time::Instant::now() + budget;
-        // 每个动作都带上单步等待上限：一个卡死的 agent 快照或存储调用只计一次
-        // `failed`，其余 agent/任务照常落检查点，毒不倒整轮；整轮的墙由调用方
-        // 随节拍推导并申报（`PeriodicWithWork`），这里不再另设一个。
-        let (coverage, rounds) = crate::dag_executor::task_checkpoint::checkpoint_owned(
-            tasks,
-            cursor,
-            agents,
-            &state,
-            budget,
-        )
-        .await;
-        // 起点先落，再记读数：记读数是每个任务一次存储/指标写，它慢下来的话这一轮
-        // 会被外面的墙砍掉——而起点要是也跟着丢了，下一轮又从队头开始，等于没修。
-        self.checkpoint_cursor
-            .store(coverage.cursor, std::sync::atomic::Ordering::Relaxed);
-        for round in &rounds {
-            // 读数也是这一轮的工作量，所以也吃同一个预算：越过墙就不再记。
-            // 少记一格是账面缺一笔，记住起点、下一轮照常轮转；而为了把读数记全
-            // 让整轮越过申报的工期界，换来的是循环告警——两害里取轻的那个。
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            self.record_task_checkpoint(round).await;
+        let mut saved = 0usize;
+        for task_id in self.owned_running_tasks().await {
+            // 每个动作都带上单步等待上限：一个卡死的 agent 快照或存储调用只
+            // 计一次 `failed`，其余 agent/任务照常落检查点，毒不倒整轮。
+            // spawn 处另有随节拍推导、并向存活体系申报的整轮预算兜底。
+            let round =
+                checkpoint_task_with_timeout(&task_id, agents, &state, CHECKPOINT_STEP_TIMEOUT)
+                    .await;
+            saved += round.saved;
+            self.record_task_checkpoint(&round).await;
         }
-        coverage
+        saved
     }
 
     /// 本进程持有的在跑任务 id。
