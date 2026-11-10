@@ -3835,7 +3835,10 @@ mod tests {
         async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
             Ok(Vec::new())
         }
-        async fn list_by_role(&self, _: &str) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+        async fn list_by_role(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
             Ok(Vec::new())
         }
         async fn list_by_capability(
@@ -3919,7 +3922,10 @@ mod tests {
             async fn deregister(&self, _: &str) -> cog_core::SFResult<()> {
                 Ok(())
             }
-            async fn get(&self, _: &str) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
+            async fn get(
+                &self,
+                _: &str,
+            ) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
                 Ok(None)
             }
             async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
@@ -4164,8 +4170,7 @@ mod tests {
         expected.sort();
 
         for role in ["planner", "generator", "evaluator"] {
-            let runtime =
-                runtime_with(Some(skill_naming(role)), role).with_tools(whole.clone());
+            let runtime = runtime_with(Some(skill_naming(role)), role).with_tools(whole.clone());
             let mut held = runtime.tools.names();
             held.sort();
             assert_eq!(

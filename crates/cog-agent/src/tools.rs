@@ -2069,8 +2069,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_reply_names_the_checkout_it_ran_in() {
         let (backend, tx) = OpenStream::pair();
-        let registry =
-            ToolRegistry::new().with_sandbox_backend(backend as Arc<dyn SandboxBackend>);
+        let registry = ToolRegistry::new().with_sandbox_backend(backend as Arc<dyn SandboxBackend>);
         cog_core::ToolRegistry::register(&registry, builtins::run_command());
 
         tx.send(CommandEvent::Workdir {
@@ -4553,7 +4552,8 @@ pub mod builtins {
                 if pattern.get(i + 2) == Some(&'/') {
                     // `**/`：零个目录，或者吃掉任意一段直到某个 `/`（含它）。
                     walk(pattern, path, i + 3, j, memo)
-                        || (j..path.len()).any(|k| path[k] == '/' && walk(pattern, path, i + 3, k + 1, memo))
+                        || (j..path.len())
+                            .any(|k| path[k] == '/' && walk(pattern, path, i + 3, k + 1, memo))
                 } else {
                     walk(pattern, path, i + 2, j, memo)
                         || (j < path.len() && walk(pattern, path, i, j + 1, memo))
@@ -4733,7 +4733,10 @@ pub mod builtins {
         }
     }
 
-    pub fn git_commit(tools: SandboxTools, roster: Option<Arc<dyn cog_core::AgentRegistry>>) -> Tool {
+    pub fn git_commit(
+        tools: SandboxTools,
+        roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+    ) -> Tool {
         Tool {
             name: "git_commit".into(),
             description: "Commit the checkout's changes on the branch it is on. Pass paths to \
@@ -4807,13 +4810,7 @@ pub mod builtins {
                             reply.stderr.trim()
                         )));
                     }
-                    let commit = reply
-                        .stdout
-                        .lines()
-                        .last()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
+                    let commit = reply.stdout.lines().last().unwrap_or("").trim().to_string();
                     Ok(serde_json::json!({
                         "commit": commit,
                         "author": name,
@@ -4859,9 +4856,8 @@ pub mod builtins {
                     } else {
                         format!("{patch}\n")
                     };
-                    let command = format!(
-                        "git apply --whitespace=nowarn <<'{delimiter}'\n{body}{delimiter}"
-                    );
+                    let command =
+                        format!("git apply --whitespace=nowarn <<'{delimiter}'\n{body}{delimiter}");
                     let reply = run_in_checkout(&tools, "apply_patch", command).await?;
                     if reply.code != 0 {
                         return Err(SFError::Agent(format!(
@@ -4941,7 +4937,9 @@ pub mod builtins {
                             .as_str()
                             .map(str::trim)
                             .filter(|c| !c.is_empty())
-                            .ok_or_else(|| SFError::Validation("every item needs content".into()))?;
+                            .ok_or_else(|| {
+                                SFError::Validation("every item needs content".into())
+                            })?;
                         let status = item["status"].as_str().unwrap_or("pending");
                         if !matches!(status, "pending" | "in_progress" | "done") {
                             return Err(SFError::Validation(format!(
@@ -4968,7 +4966,8 @@ pub mod builtins {
                         }
                     }
                     book.insert(key, (std::time::Instant::now(), parsed.clone()));
-                    let counts = |status: &str| parsed.iter().filter(|i| i.status == status).count();
+                    let counts =
+                        |status: &str| parsed.iter().filter(|i| i.status == status).count();
                     Ok(serde_json::json!({
                         "items": parsed
                             .iter()
@@ -5527,7 +5526,10 @@ pub mod builtins {
         }
 
         fn tools(backend: Arc<Scripted>) -> SandboxTools {
-            SandboxTools::new(Some(backend as Arc<dyn SandboxBackend>), Duration::from_secs(5))
+            SandboxTools::new(
+                Some(backend as Arc<dyn SandboxBackend>),
+                Duration::from_secs(5),
+            )
         }
 
         /// 一条匹配回成一个条目：文件、行号、那一行。三样都在，读的人才不必
@@ -5568,7 +5570,10 @@ pub mod builtins {
             assert_eq!(agent, "kai-a9ab11fc");
             assert!(command.contains("--include='*.rs'"), "{command}");
             assert!(command.contains("'fn search_code'"), "{command}");
-            assert!(command.contains(&format!("head -n {SEARCH_MAX_RESULTS}")), "{command}");
+            assert!(
+                command.contains(&format!("head -n {SEARCH_MAX_RESULTS}")),
+                "{command}"
+            );
         }
 
         /// 树由执行者决定，任务号只做归属。
@@ -5577,7 +5582,9 @@ pub mod builtins {
         /// 员工要有自己那棵树的原因。
         #[tokio::test]
         async fn a_tree_tool_runs_in_the_callers_checkout() {
-            let backend = Arc::new(Scripted::answering("## work/employee-squad-DSC-1-generator\n"));
+            let backend = Arc::new(Scripted::answering(
+                "## work/employee-squad-DSC-1-generator\n",
+            ));
             let registry = ToolRegistry::new();
             cog_core::ToolRegistry::register(&registry, git_status(tools(backend.clone())));
             let reply = CALLER_AGENT_ID
@@ -5657,10 +5664,7 @@ pub mod builtins {
             assert!(glob_matches("src/*.rs", "src/main.rs"));
             assert!(!glob_matches("src/*.rs", "src/deep/main.rs"));
             assert!(glob_matches("src/**/*.rs", "src/deep/main.rs"));
-            assert!(
-                glob_matches("**/*.rs", "main.rs"),
-                "`**/` 要能匹配零个目录"
-            );
+            assert!(glob_matches("**/*.rs", "main.rs"), "`**/` 要能匹配零个目录");
             assert!(glob_matches("**/*.rs", "a/b/c.rs"));
             assert!(glob_matches("src/?.rs", "src/a.rs"));
             assert!(!glob_matches("src/?.rs", "src/ab.rs"));
@@ -5714,7 +5718,10 @@ pub mod builtins {
 
             let seen = backend.requests();
             let command = &seen[0].2;
-            assert!(command.starts_with("git apply --whitespace=nowarn <<'"), "{command}");
+            assert!(
+                command.starts_with("git apply --whitespace=nowarn <<'"),
+                "{command}"
+            );
             assert!(command.contains(patch), "补丁正文被改过了：{command}");
         }
 
@@ -5725,7 +5732,10 @@ pub mod builtins {
             let registry = ToolRegistry::new();
             cog_core::ToolRegistry::register(&registry, apply_patch(tools(backend.clone())));
             let err = registry
-                .execute("apply_patch", serde_json::json!({ "patch": "--- a\n+++ b\n" }))
+                .execute(
+                    "apply_patch",
+                    serde_json::json!({ "patch": "--- a\n+++ b\n" }),
+                )
                 .await
                 .expect_err("a failing apply is not a success");
             assert!(err.to_string().contains("did not apply"), "{err}");

@@ -79,10 +79,18 @@ pub enum CommandEvent {
     /// executor turns that name into a directory. A model that has to run
     /// `pwd` to learn where it is spends a round trip finding out something the
     /// reply already knew.
-    Workdir { path: String },
-    Stdout { data: String },
-    Stderr { data: String },
-    Exit { code: i32 },
+    Workdir {
+        path: String,
+    },
+    Stdout {
+        data: String,
+    },
+    Stderr {
+        data: String,
+    },
+    Exit {
+        code: i32,
+    },
 }
 
 /// Stream of command output events, boxed for object safety.

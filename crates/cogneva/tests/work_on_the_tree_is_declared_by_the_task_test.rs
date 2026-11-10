@@ -67,7 +67,10 @@ fn a_task_says_whether_its_work_changes_the_checkout() {
         !reads.declares_change(),
         "没声明要动树的活不该被读成要动：它会被「树没动」当成没进展收住"
     );
-    assert!(evolution.declares_change(), "自进化生成变更本身就是那份声明");
+    assert!(
+        evolution.declares_change(),
+        "自进化生成变更本身就是那份声明"
+    );
 
     // 运行时读的是这一位，缺省是没有声明——没有声明时不拿「树没动」当证据。
     assert!(!cog_core::RuntimeConfig::default().declares_change);
@@ -107,8 +110,11 @@ fn nobody_decides_who_may_write_the_tree_by_role() {
         let mut from = 0usize;
         while let Some(offset) = text[from..].find("crate::resume::create_role_agent(") {
             let start = from + offset;
-            let Some(end) = matching_paren(&text, start + "crate::resume::create_role_agent".len(), Dialect::Rust)
-            else {
+            let Some(end) = matching_paren(
+                &text,
+                start + "crate::resume::create_role_agent".len(),
+                Dialect::Rust,
+            ) else {
                 break;
             };
             let call = &text[start..=end];

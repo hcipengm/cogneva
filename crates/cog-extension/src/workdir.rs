@@ -2503,7 +2503,10 @@ pub(crate) mod tests {
             "the pool is meant to be cut ahead of demand"
         );
 
-        let (path, took_warm) = r.route_validated(&lane("squad:DSC-1A2B-planner"), true).await.unwrap();
+        let (path, took_warm) = r
+            .route_validated(&lane("squad:DSC-1A2B-planner"), true)
+            .await
+            .unwrap();
         assert!(took_warm, "the slot was there and had to be handed out");
         let head = tokio::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])

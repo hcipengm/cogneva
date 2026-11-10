@@ -78,9 +78,7 @@ fn the_executor_routes_by_the_employee_before_the_task() {
         resolve.contains("worktree_for_agent"),
         "执行器不再按执行者选树：\n{resolve}"
     );
-    let by_employee = resolve
-        .find("worktree_for_agent")
-        .expect("checked above");
+    let by_employee = resolve.find("worktree_for_agent").expect("checked above");
     let by_task = resolve.find("task_id").expect("任务号仍然要读，作为退路");
     assert!(
         by_employee < by_task,
@@ -92,8 +90,8 @@ fn the_executor_routes_by_the_employee_before_the_task() {
 #[test]
 fn a_checkout_is_cut_on_a_branch_named_after_its_lane() {
     let workdir = source("crates/cog-extension/src/workdir.rs");
-    let cut = rust_function_body(&workdir, "cut_worktree")
-        .expect("cut_worktree 还在：切树的唯一入口");
+    let cut =
+        rust_function_body(&workdir, "cut_worktree").expect("cut_worktree 还在：切树的唯一入口");
     assert!(
         cut.contains("lane_branch"),
         "切出来的树没有分支名：提交会落进没有名字的地方\n{cut}"

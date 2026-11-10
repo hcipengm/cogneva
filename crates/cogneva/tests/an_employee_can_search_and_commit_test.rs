@@ -62,7 +62,9 @@ impl SandboxBackend for Checkout {
     }
 
     async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
-        Err(SFError::Agent("this backend runs commands, not wasm".into()))
+        Err(SFError::Agent(
+            "this backend runs commands, not wasm".into(),
+        ))
     }
 }
 
@@ -156,7 +158,10 @@ async fn a_search_really_searches() {
 
     // 真的不存在的词回空列表，且不报错——这是空集，不是失败。
     let none = registry
-        .execute("search_code", serde_json::json!({ "query": "no_such_symbol_anywhere" }))
+        .execute(
+            "search_code",
+            serde_json::json!({ "query": "no_such_symbol_anywhere" }),
+        )
         .await
         .expect("an empty result set is not an error");
     assert_eq!(none["matches"], serde_json::json!([]));
@@ -218,7 +223,10 @@ async fn git_sees_the_change_and_commits_it() {
         .await
         .expect("status answers");
     assert!(
-        status["status"].as_str().unwrap_or_default().contains("?? a.txt"),
+        status["status"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("?? a.txt"),
         "新文件该是未跟踪：{status}"
     );
 
@@ -230,18 +238,28 @@ async fn git_sees_the_change_and_commits_it() {
         .await
         .expect("a commit happens");
     let commit = committed["commit"].as_str().unwrap_or_default();
-    assert_eq!(commit.len(), 40, "回的是一个提交 id，不是一句话：{committed}");
+    assert_eq!(
+        commit.len(),
+        40,
+        "回的是一个提交 id，不是一句话：{committed}"
+    );
 
     let after = registry
         .execute("git_status", serde_json::json!({}))
         .await
         .expect("status answers");
     assert!(
-        after["status"].as_str().unwrap_or_default().contains("## main"),
+        after["status"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("## main"),
         "提交之后该站在 main 上：{after}"
     );
     assert!(
-        !after["status"].as_str().unwrap_or_default().contains("?? a.txt"),
+        !after["status"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("?? a.txt"),
         "提交过的文件不该再是未跟踪：{after}"
     );
 

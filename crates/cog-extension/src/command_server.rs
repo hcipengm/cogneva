@@ -407,20 +407,23 @@ fn ndjson_response(
     watch: Option<CommandWatch>,
     announce: Option<CommandEvent>,
 ) -> Response {
-    let stream = futures::stream::unfold((rx, watch, announce), |(mut rx, watch, pending)| async move {
-        let event = match pending {
-            Some(event) => event,
-            None => rx.recv().await?,
-        };
-        if let (Some(w), CommandEvent::Exit { code }) = (watch.as_ref(), &event) {
-            w.mark(if *code == 0 {
-                Outcome::Ok
-            } else {
-                Outcome::Failed
-            });
-        }
-        Some((event, (rx, watch, None)))
-    })
+    let stream = futures::stream::unfold(
+        (rx, watch, announce),
+        |(mut rx, watch, pending)| async move {
+            let event = match pending {
+                Some(event) => event,
+                None => rx.recv().await?,
+            };
+            if let (Some(w), CommandEvent::Exit { code }) = (watch.as_ref(), &event) {
+                w.mark(if *code == 0 {
+                    Outcome::Ok
+                } else {
+                    Outcome::Failed
+                });
+            }
+            Some((event, (rx, watch, None)))
+        },
+    )
     .map(|event| {
         let mut line = serde_json::to_string(&event).expect("CommandEvent serializes");
         line.push('\n');
@@ -1571,7 +1574,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(printed.trim(), expected.to_string_lossy(), "pwd 与报出的目录对不上");
+        assert_eq!(
+            printed.trim(),
+            expected.to_string_lossy(),
+            "pwd 与报出的目录对不上"
+        );
 
         // 无名无任务的调用落在任何树之外：这时「什么都不报」才是真的。
         let events = events_of(

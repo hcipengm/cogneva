@@ -29,7 +29,10 @@ fn shipped_skill_files() -> Vec<std::path::PathBuf> {
         .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
         .collect();
     files.sort();
-    assert!(!files.is_empty(), "skills/ 里一份 JSON 都没有：这条判据读了个空");
+    assert!(
+        !files.is_empty(),
+        "skills/ 里一份 JSON 都没有：这条判据读了个空"
+    );
     files
 }
 
@@ -44,8 +47,7 @@ fn a_skill_row_carries_neither_a_persona_nor_a_tool_boundary() {
             path.display()
         );
 
-        let row: serde_json::Value =
-            serde_json::from_str(&text).expect("技能行是一份 JSON 对象");
+        let row: serde_json::Value = serde_json::from_str(&text).expect("技能行是一份 JSON 对象");
         for key in ["system_prompt", "tools"] {
             assert!(
                 row.get(key).is_none(),

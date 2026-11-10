@@ -91,9 +91,16 @@ mod tests {
     /// 不知道名字就只说道路：编一个名字会让读的人以为名册上有这一位。
     #[test]
     fn a_run_without_a_roster_row_gets_the_workspace_but_no_name() {
-        let note = identity_note("no-one-yet", None, Some(&cog_core::worktree_lane("no-one-yet")))
-            .expect("the workspace alone is worth saying");
-        assert!(note.contains(&cog_core::worktree_lane("no-one-yet")), "{note}");
+        let note = identity_note(
+            "no-one-yet",
+            None,
+            Some(&cog_core::worktree_lane("no-one-yet")),
+        )
+        .expect("the workspace alone is worth saying");
+        assert!(
+            note.contains(&cog_core::worktree_lane("no-one-yet")),
+            "{note}"
+        );
         assert!(!note.contains("名字"), "no name was claimed: {note}");
     }
 

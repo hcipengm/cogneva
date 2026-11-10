@@ -127,6 +127,10 @@ mod agent_tools_test;
 mod agent_wal_test;
 #[path = "agent_wrapper_test.rs"]
 mod agent_wrapper_test;
+#[path = "an_employee_can_search_and_commit_test.rs"]
+mod an_employee_can_search_and_commit_test;
+#[path = "an_employee_works_in_its_own_checkout_test.rs"]
+mod an_employee_works_in_its_own_checkout_test;
 #[path = "an_identifier_is_quoted_in_one_place_test.rs"]
 mod an_identifier_is_quoted_in_one_place_test;
 #[path = "an_occupied_id_is_not_work_in_hand_test.rs"]
@@ -277,10 +281,10 @@ mod gateway_refuses_a_caller_named_reply_stream;
 mod governance_routes;
 #[path = "host_paths_are_not_baked_in_test.rs"]
 mod host_paths_are_not_baked_in_test;
-#[path = "image_layout_literals_contract_test.rs"]
-mod image_layout_literals_contract_test;
 #[path = "identity_is_written_once_test.rs"]
 mod identity_is_written_once_test;
+#[path = "image_layout_literals_contract_test.rs"]
+mod image_layout_literals_contract_test;
 #[path = "in_cluster_address_literals_contract_test.rs"]
 mod in_cluster_address_literals_contract_test;
 #[path = "install_face_creates_every_secret_the_apply_path_reads_test.rs"]
@@ -425,6 +429,8 @@ mod service_account_mount_literals_contract_test;
 mod shutdown_budget_contract_test;
 #[path = "skill_directories_contract_test.rs"]
 mod skill_directories_contract_test;
+#[path = "skills_carry_no_persona_and_no_boundary_test.rs"]
+mod skills_carry_no_persona_and_no_boundary_test;
 #[path = "sparse_weights_are_loaded_once_contract_test.rs"]
 mod sparse_weights_are_loaded_once_contract_test;
 #[path = "store_counter_window_contract_test.rs"]
@@ -479,14 +485,6 @@ mod unwired_modules_contract_test;
 mod volume_footprint_declaration_test;
 #[path = "wal_event_round_trip_test.rs"]
 mod wal_event_round_trip_test;
-#[path = "work_on_the_tree_is_declared_by_the_task_test.rs"]
-mod work_on_the_tree_is_declared_by_the_task_test;
-#[path = "skills_carry_no_persona_and_no_boundary_test.rs"]
-mod skills_carry_no_persona_and_no_boundary_test;
-#[path = "an_employee_works_in_its_own_checkout_test.rs"]
-mod an_employee_works_in_its_own_checkout_test;
-#[path = "an_employee_can_search_and_commit_test.rs"]
-mod an_employee_can_search_and_commit_test;
 #[path = "web_chat_frames_read_fields_the_socket_writes_test.rs"]
 mod web_chat_frames_read_fields_the_socket_writes_test;
 #[path = "web_client_api_functions_are_called_test.rs"]
@@ -533,6 +531,8 @@ mod wiki_vector_index_test;
 mod wire_words_are_not_derived_from_debug_test;
 #[path = "word_constants_with_the_same_name_say_the_same_word_test.rs"]
 mod word_constants_with_the_same_name_say_the_same_word_test;
+#[path = "work_on_the_tree_is_declared_by_the_task_test.rs"]
+mod work_on_the_tree_is_declared_by_the_task_test;
 #[path = "workload_label_pairs_contract_test.rs"]
 mod workload_label_pairs_contract_test;
 /// Whether a file can share this process with the others.
