@@ -1652,6 +1652,69 @@ fn credential_surface_refusal(drill: Option<&cog_core::BackupDrillRecord>) -> Op
     ))
 }
 
+/// 把这一趟自己看得见的凭证面收紧到判据线上：目录恰为 0700，顶层 `*.tar.zst`
+/// 恰为 0600，收完再量一遍——判据按量到的数，不按「我试过了」。
+///
+/// 写者原来只会拒绝，而那条拒绝没有出路：上一次演练量到的开放权限里，只要是
+/// **旧包**上的那几条，写者这一侧永远不会把它们修掉——收紧只发生在新字节落盘的
+/// 那一刻，而旧包是更早的某一趟写出来的。于是每一晚的运行都读到同一行读数、拒绝、
+/// 不产包，卷上的包一晚上比一晚上旧（备份包过旧那条告警正是这么一直响着的），
+/// 而演练下一趟量到的还是那几份旧包，读数一个字节都不变。写者有手能改权限，却只
+/// 把它写进一句「请先用 0700 收紧」的判词里，等于把一个自己能闭上的环留给一个不在
+/// 环上的人。
+///
+/// `Err` 只说一件事：这个面收完之后**仍然**有别人读得到的条目，或者收不动。那时
+/// 才该拒绝——拒绝的依据是「这个面上还能不能被别人读到」。落点不存在（这个安装
+/// 没有这一处）与演练那一侧「没量过」同一个口径，不拿去拦住下一份包。
+fn tighten_credential_surface(cfg: &BackupConfig) -> Result<(), String> {
+    let mut surfaces: Vec<&Path> = vec![cfg.backup_dir.as_path()];
+    if let Some(dir) = &cfg.offsite_dir {
+        surfaces.push(dir.as_path());
+    }
+    let mut still_open: Vec<String> = Vec::new();
+    for dir in surfaces {
+        if let Err(e) = tighten_one_surface(dir) {
+            still_open.push(format!("{}：{e}", dir.display()));
+            continue;
+        }
+        match credential_violations_in(dir) {
+            Some(0) => {}
+            Some(count) => {
+                still_open.push(format!("{}：收紧之后仍量到 {count} 条", dir.display()));
+            }
+            None => {}
+        }
+    }
+    if still_open.is_empty() {
+        Ok(())
+    } else {
+        Err(still_open.join("；"))
+    }
+}
+
+/// 一处凭证面的收紧：目录 0700，顶层 `*.tar.zst` 0600。别的文件不动——判据不看
+/// 它们，动它们只是无端改动别人放在那里的东西。落点不在就什么都不做。
+fn tighten_one_surface(dir: &Path) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    restrict_to_owner(dir, 0o700)?;
+    for entry in std::fs::read_dir(dir)?.filter_map(|e| e.ok()) {
+        let is_package = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(PACKAGE_SUFFIX));
+        if !is_package {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_file() {
+            restrict_to_owner(&path, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cfg.backup_dir)?;
     let now = Utc::now();
@@ -1694,25 +1757,38 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
             }
         };
         if let Some(reason) = refusal {
-            tracing::error!(run = %staging_name, reason = %reason, "备份被凭证面拦住");
-            let _ = std::fs::remove_dir_all(&staging);
-            record_run(
-                run_store.as_ref(),
-                &staging_name,
-                BackupRunClosing {
-                    outcome: BackupOutcome::Failed,
-                    finished_at: Utc::now(),
-                    package: None,
-                    bytes: None,
-                    package_checksum: None,
-                    package_coverage: None,
-                    kept_after: None,
-                    oldest_kept_at: None,
-                    error: Some(reason.clone()),
-                },
-            )
-            .await;
-            return Err(reason.into());
+            // 拒绝之前先自己动手：能改的权限这一趟就改掉，再按改完的现场问一次。
+            // 这一步是「备份包过旧」那条告警的出口，见 [`tighten_credential_surface`]：
+            // 上一次演练的读数说的是那一刻的现场，而这一趟已经把现场改了。
+            match tighten_credential_surface(cfg) {
+                Ok(()) => tracing::warn!(
+                    run = %staging_name,
+                    reason = %reason,
+                    "备份：凭证面由这一趟自己收紧到 0700/0600，照常出包"
+                ),
+                Err(detail) => {
+                    let reason = format!("{reason}；这一趟自己收紧之后仍然收不住：{detail}");
+                    tracing::error!(run = %staging_name, reason = %reason, "备份被凭证面拦住");
+                    let _ = std::fs::remove_dir_all(&staging);
+                    record_run(
+                        run_store.as_ref(),
+                        &staging_name,
+                        BackupRunClosing {
+                            outcome: BackupOutcome::Failed,
+                            finished_at: Utc::now(),
+                            package: None,
+                            bytes: None,
+                            package_checksum: None,
+                            package_coverage: None,
+                            kept_after: None,
+                            oldest_kept_at: None,
+                            error: Some(reason.clone()),
+                        },
+                    )
+                    .await;
+                    return Err(reason.into());
+                }
+            }
         }
     }
 
@@ -6385,6 +6461,40 @@ mod tests {
             reason.contains("backup-drill"),
             "拦住之后要给出解除的办法：{reason}"
         );
+    }
+
+    /// 收紧之后判据要归零。拒绝原来是闭着的环：旧包上的那几条权限写者从来不修，
+    /// 于是每一晚都被同一行读数拦下、包越来越旧。这里钉住出口的那一半——同一趟
+    /// 运行把看得见的条目改回 0700/0600，下一趟演练量到的就是 0。
+    #[cfg(unix)]
+    #[test]
+    fn tightening_a_surface_leaves_nothing_open_for_the_next_drill_to_find() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("backups");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pkg = dir.join("cogneva-backup-20261018T031700Z.tar.zst");
+        std::fs::write(&pkg, b"x").unwrap();
+        std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // 判据不看松散文件，收紧也就不该动它们。
+        let loose = dir.join("notes.txt");
+        std::fs::write(&loose, b"x").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(credential_violations_in(&dir), Some(2));
+
+        tighten_one_surface(&dir).unwrap();
+
+        assert_eq!(
+            credential_violations_in(&dir),
+            Some(0),
+            "收紧之后这个面不该再有别人读得到的条目"
+        );
+        let loose_mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(loose_mode, 0o644, "判据不看的文件不该被改动");
+
+        // 落点不存在不是错误：这个安装没有这一处。
+        tighten_one_surface(&root.path().join("absent")).unwrap();
     }
 
     #[cfg(unix)]
