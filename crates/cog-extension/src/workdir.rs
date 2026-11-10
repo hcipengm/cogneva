@@ -90,11 +90,15 @@ const META_DIR_NAME: &str = ".meta";
 /// deciding whether a task's tree is still the one git registered.
 const WORKTREE_LINK: &str = ".git";
 
-/// Maximum task id length, keeps the on-disk directory name clear of
+/// Maximum lane length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
 /// `<owner-task>-ralph-roundtable-i12-<8 hex>`.
-// cap: bound — 目录名要躲开 ENAMETOOLONG，又要装得下生成的 id
-const MAX_TASK_ID_LEN: usize = 128;
+///
+/// Taken from `cog-core` rather than chosen here: the lane name is derived
+/// there and validated here, and a second, tighter ceiling would reject exactly
+/// the long ids that derivation promised a checkout -- with no error, since an
+/// invalid lane reads as a caller that named none.
+const MAX_TASK_ID_LEN: usize = cog_core::MAX_CHECKOUT_NAME_CHARS;
 
 /// The shortest time between two reclamation passes, and the pace the loop
 /// wakes at whatever the derived interval turns out to be -- waking is cheap,
@@ -514,6 +518,12 @@ fn split_seed_urls(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// What a tree's sidecar records about it.
+///
+/// `task_id` holds the lane the tree belongs to. The field kept its name so the
+/// sidecars on a running volume still read back: a rename would make every
+/// existing tree look like a registration without a record, and the boot pass
+/// would adopt each one as if its sidecar had been lost.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct TaskMeta {
     task_id: String,
@@ -938,18 +948,22 @@ impl WorkdirRouter {
         }
     }
 
-    /// Resolve the working directory for a task id and claim it for the command
+    /// Resolve the working directory for a lane and claim it for the command
     /// about to run there, lazily creating the tree on first sight.
+    ///
+    /// A lane is an employee's checkout (see [`worktree_for_agent`]); a bare
+    /// task id still routes, for a caller that named no employee, so an old
+    /// entry point keeps landing somewhere rather than nowhere.
     ///
     /// The claim is taken before the first filesystem call: a reclamation pass
     /// that has already listed this tree must still see it in use when it
     /// reaches its own decision, and the only moment a claim can protect a tree
-    /// is before anything starts using it. Invalid ids and add failures surface
-    /// as errors instead of silently collapsing onto a shared directory.
-    pub async fn route(self: &Arc<Self>, task_id: &str) -> SFResult<(PathBuf, WorktreeUse)> {
-        validate_task_id(task_id)?;
-        let use_guard = self.claim(task_id);
-        let (path, took_warm) = self.route_validated(task_id, true).await?;
+    /// is before anything starts using it. Invalid lanes and add failures
+    /// surface as errors instead of silently collapsing onto a shared directory.
+    pub async fn route(self: &Arc<Self>, lane: &str) -> SFResult<(PathBuf, WorktreeUse)> {
+        validate_task_id(lane)?;
+        let use_guard = self.claim(lane);
+        let (path, took_warm) = self.route_validated(lane, true).await?;
         // Refill after the answer, never before it: the caller is waiting for
         // a directory to run in, and the tree that replaces the one just taken
         // is for a task that has not arrived yet.
@@ -1010,7 +1024,7 @@ impl WorkdirRouter {
     /// Move a waiting tree onto `path` instead of cutting a new one there.
     /// Returns whether one was taken; a pool that is empty, disabled, or whose
     /// move failed falls through to the ordinary checkout.
-    async fn take_warm(&self, task_id: &str, path: &Path) -> bool {
+    async fn take_warm(&self, lane: &str, path: &Path) -> bool {
         if self.cfg.warm_trees == 0 {
             return false;
         }
@@ -1022,12 +1036,12 @@ impl WorkdirRouter {
         // two leaves a reclaimable record rather than an untracked tree.
         let now = unix_now();
         let meta = TaskMeta {
-            task_id: task_id.to_string(),
+            task_id: lane.to_string(),
             created_at_unix: now,
             last_used_unix: now,
         };
         if let Err(e) = self.write_meta(&meta).await {
-            warn!(task_id = %task_id, error = %e, "warm tree not taken: could not write its sidecar");
+            warn!(lane = %lane, error = %e, "warm tree not taken: could not write its sidecar");
             return false;
         }
         if let Err(e) = self
@@ -1039,9 +1053,9 @@ impl WorkdirRouter {
             ])
             .await
         {
-            self.remove_meta(task_id);
+            self.remove_meta(lane);
             warn!(
-                task_id = %task_id,
+                lane = %lane,
                 from = %slot.display(),
                 error = %e,
                 "warm tree not taken: moving it onto the task path failed"
@@ -1050,36 +1064,41 @@ impl WorkdirRouter {
         }
         let _ = tokio::fs::remove_file(Self::ready_marker(&slot)).await;
         self.register_safe_directory(path).await;
-        // The pool is filled ahead of demand, so the tree may have been cut
-        // before `main` moved. Re-pointing it is what keeps a warm tree from
-        // being a stale one: a task that gets a tree three commits behind would
-        // read the platform's own source wrong, and nothing on the surface
-        // would say why.
-        self.reset_to_main(path).await;
+        // The slot was cut detached and the pool is filled ahead of demand, so
+        // two things have to happen at hand-out: the tree gets its owner's
+        // branch, and it is re-pointed at `main` in case the branch of that
+        // name was cut before `main` moved. `checkout -B` does both at once --
+        // a tree handed out three commits behind would read the platform's own
+        // source wrong, and nothing on the surface would say why.
+        //
+        // Untracked files need no cleanup here: a slot is cut and handed out
+        // without ever being run in, so there is nothing but `main` in it.
+        self.point_at_branch(path, lane).await;
         info!(
-            task_id = %task_id,
+            lane = %lane,
             from = %slot.display(),
-            "handed a warm worktree to a new task instead of cutting one"
+            "handed a warm worktree to an employee instead of cutting one"
         );
         true
     }
 
-    /// Point a task tree at `main`, and drop anything the previous user left in
-    /// it. Best effort: the tree is usable either way, and a failure here is
-    /// the next command's own to report.
-    async fn reset_to_main(&self, path: &Path) {
-        let Ok(head) = self.run_git(&["rev-parse", "HEAD"], Some(path)).await else {
-            return;
-        };
-        let Ok(main) = self.git_bare(&["rev-parse", "main"]).await else {
-            return;
-        };
-        if head.trim() == main.trim() {
-            // Nothing to move and nothing to drop: the tree was cut from the
-            // commit it is about to be handed out at.
-            return;
+    /// Put `path` on the branch its lane owns, starting from the current
+    /// `main`. Best effort: the tree is usable either way, and a failure here
+    /// is the next command's own to report.
+    async fn point_at_branch(&self, path: &Path, lane: &str) {
+        let branch = lane_branch(lane);
+        if let Err(e) = self
+            .run_git(&["checkout", "-B", &branch, "main"], Some(path))
+            .await
+        {
+            warn!(
+                lane = %lane,
+                branch = %branch,
+                error = %e,
+                "warm tree handed out but its lane branch could not be checked out; \
+                 the tree is usable and its commits would go to a detached head"
+            );
         }
-        let _ = self.run_git(&["reset", "--hard", "main"], Some(path)).await;
     }
 
     /// Cut trees until the pool holds as many as the deployment asked for.
@@ -1146,7 +1165,7 @@ impl WorkdirRouter {
                     continue;
                 }
             }
-            if let Err(e) = self.cut_worktree(&slot).await {
+            if let Err(e) = self.cut_worktree(&slot, None).await {
                 warn!(error = %e, slot = %slot.display(), "warm worktree pool: cutting a tree failed");
                 return;
             }
@@ -1164,39 +1183,39 @@ impl WorkdirRouter {
     /// The tree on its own, without a claim: a caller that will run something in
     /// it must go through [`Self::route`], which is the only thing that keeps a
     /// reclamation pass from deleting it while the command runs.
-    async fn route_validated(&self, task_id: &str, own_claim: bool) -> SFResult<(PathBuf, bool)> {
-        let path = self.cfg.workspaces_root.join(task_id);
+    async fn route_validated(&self, lane: &str, own_claim: bool) -> SFResult<(PathBuf, bool)> {
+        let path = self.cfg.workspaces_root.join(lane);
         if self.is_healthy(&path).await {
-            self.touch(task_id).await;
+            self.touch(lane).await;
             return Ok((path, false));
         }
         let _g = self.create_lock.lock().await;
         if self.is_healthy(&path).await {
-            self.touch(task_id).await;
+            self.touch(lane).await;
             return Ok((path, false));
         }
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            if self.commands_running(task_id, own_claim) > 0 {
+            if self.commands_running(lane, own_claim) > 0 {
                 // Rebuilding means removing first, and a command is running in
                 // this tree: the caller can come back, the command cannot.
                 return Err(SFError::IO(format!(
-                    "task worktree for {task_id} is in use by a running command and is not a \
+                    "worktree for {lane} is in use by a running command and is not a \
                      healthy worktree; refusing to rebuild it from under that command"
                 )));
             }
-            warn!(task_id = %task_id, path = %path.display(),
-                "task path exists but is not a healthy worktree; rebuilding");
+            warn!(lane = %lane, path = %path.display(),
+                "lane path exists but is not a healthy worktree; rebuilding");
             self.force_remove(&path).await;
         }
         // The hand-out first, and the cap after it: a task that takes a warm
         // tree adds nothing to the volume, so asking the cap to make room for
         // it would reclaim a tree nobody needed to lose.
-        if self.take_warm(task_id, &path).await {
+        if self.take_warm(lane, &path).await {
             self.refresh_count_metric().await;
             return Ok((path, true));
         }
         self.enforce_cap(1).await;
-        if let Err(e) = self.add_worktree(task_id, &path).await {
+        if let Err(e) = self.add_worktree(lane, &path).await {
             self.metrics.inc_error("worktree_add");
             return Err(e);
         }
@@ -1204,43 +1223,57 @@ impl WorkdirRouter {
         Ok((path, false))
     }
 
-    async fn add_worktree(&self, task_id: &str, path: &Path) -> SFResult<()> {
+    async fn add_worktree(&self, lane: &str, path: &Path) -> SFResult<()> {
         let now = unix_now();
         let meta = TaskMeta {
-            task_id: task_id.to_string(),
+            task_id: lane.to_string(),
             created_at_unix: now,
             last_used_unix: now,
         };
         // Sidecar lands before the tree: a crash between the two leaves a
         // reclaimable record; the reverse order leaves an untracked tree.
         self.write_meta(&meta).await?;
-        if let Err(e) = self.cut_worktree(path).await {
-            self.remove_meta(task_id);
+        if let Err(e) = self.cut_worktree(path, Some(lane)).await {
+            self.remove_meta(lane);
             return Err(e);
         }
-        info!(task_id = %task_id, path = %path.display(), "created per-task worktree");
+        info!(lane = %lane, path = %path.display(), "created the employee's worktree");
         self.register_safe_directory(path).await;
         Ok(())
     }
 
-    /// Check out `main` into `path` as a detached worktree of the bare repo.
-    /// Shared by the task path and the warm pool, which want the same tree and
-    /// differ only in what they record about it.
-    async fn cut_worktree(&self, path: &Path) -> SFResult<()> {
+    /// Cut `main` into `path` as a worktree of the bare repo.
+    ///
+    /// With a lane, the tree is checked out on that lane's branch rather than
+    /// detached: a detached checkout takes commits into no branch at all, so a
+    /// reader could not tell which tree a commit landed on, and the employee's
+    /// next turn would find nothing it had committed. Without a lane -- the warm
+    /// pool, whose slot has no owner yet -- the tree is cut detached and the
+    /// branch is attached when the slot is handed out (`take_warm`).
+    ///
+    /// `-B` rather than `-b`: a lane's branch outlives its tree, so a re-cut
+    /// finds the name taken. Moving it back to `main` is the point -- a tree
+    /// starts from the platform's current code, and the work of a tree that has
+    /// already been reclaimed belongs to the change it became, not to this
+    /// checkout.
+    async fn cut_worktree(&self, path: &Path, lane: Option<&str>) -> SFResult<()> {
         if let Some(root) = path.parent() {
             tokio::fs::create_dir_all(root).await.map_err(|e| {
                 SFError::IO(format!("create worktree root {}: {e}", root.display()))
             })?;
         }
-        self.git_bare(&[
-            "worktree",
-            "add",
-            "--detach",
-            path.to_str().unwrap_or(""),
-            "main",
-        ])
-        .await
-        .map(|_| ())
+        let branch = lane.map(lane_branch);
+        let mut args = vec!["worktree", "add"];
+        match branch.as_deref() {
+            Some(branch) => {
+                args.push("-B");
+                args.push(branch);
+            }
+            None => args.push("--detach"),
+        }
+        args.push(path.to_str().unwrap_or(""));
+        args.push("main");
+        self.git_bare(&args).await.map(|_| ())
     }
 
     /// Healthy = worktree dir present with the `.git` link the bare repo
@@ -1332,15 +1365,15 @@ impl WorkdirRouter {
         // counted. Without a second tree there is no arrival interval to read,
         // and the configured TTL stands.
         //
-        // Measured over the task lane only, because that is the lane the TTL
-        // governs: a standing shell is never reaped for idleness and is held
-        // for as long as its agent exists, so counting it would stretch the
-        // span by however old that conversation is and report a hold time
-        // derived from a tree the rule does not apply to.
-        let task_trees = trees.iter().filter(|(id, _)| !is_standing_lane(id)).count();
+        // Measured over the task-kind trees only, because those are the trees
+        // the TTL governs: an employee's checkout is never reaped for idleness
+        // and is held for as long as its employee is registered, so counting it
+        // would stretch the span by however old that conversation is and report
+        // a hold time derived from a tree the rule does not apply to.
+        let task_trees = trees.iter().filter(|(id, _)| !is_employee_lane(id)).count();
         let oldest = trees
             .iter()
-            .filter(|(id, _)| !is_standing_lane(id))
+            .filter(|(id, _)| !is_employee_lane(id))
             .filter_map(|(id, _)| self.read_meta(id))
             .map(|meta| meta.created_at_unix)
             .min();
@@ -1367,14 +1400,14 @@ impl WorkdirRouter {
             if self.commands_running(id, false) > 0 {
                 continue;
             }
-            // An idle hour is not evidence that a standing shell is done with:
-            // its id comes back on the next turn, so the TTL would delete the
-            // user's files between two conversations rather than after one.
-            // The cap still reclaims it when a slot is needed -- see
-            // [`is_standing_lane`].
+            // An idle hour is not evidence that an employee is done with its
+            // checkout: the lane comes back on the next turn, so the TTL would
+            // delete the user's files between two conversations rather than
+            // after one. The cap still reclaims it when a slot is needed -- see
+            // [`is_employee_lane`].
             let reap = match self.read_meta(id) {
                 Some(meta) => {
-                    !is_standing_lane(id) && now.saturating_sub(meta.last_used_unix) >= ttl
+                    !is_employee_lane(id) && now.saturating_sub(meta.last_used_unix) >= ttl
                 }
                 None => {
                     // Registered tree without sidecar: adopt rather than reap,
@@ -1434,12 +1467,13 @@ impl WorkdirRouter {
         if trees.len() + warm + incoming <= max {
             return;
         }
-        // Two lanes, and the eviction order is per lane: a task tree pays
-        // before a standing shell does. See [`is_standing_lane`] for why the
-        // LRU premise does not hold for the second one.
+        // Two kinds of tree, and the eviction order is per kind: one round of
+        // task work pays before an employee's checkout does. See
+        // [`is_employee_lane`] for why the LRU premise does not hold for the
+        // second one.
         trees.sort_by_key(|(id, _)| {
             (
-                is_standing_lane(id),
+                is_employee_lane(id),
                 self.read_meta(id.as_str())
                     .map(|m| m.last_used_unix)
                     .unwrap_or(i64::MIN),
@@ -2298,27 +2332,47 @@ pub(crate) fn validate_task_id(id: &str) -> SFResult<()> {
     }
 }
 
-/// The prefix `cog-agent` gives the task id of a call that carries no task
-/// scope: one workspace per calling agent, named after that agent. Kept in
-/// step with `sandbox_task_id` in `crates/cog-agent/src/tools.rs`; the two
-/// crates do not depend on each other, so the spelling is shared by this
-/// comment rather than by an import.
-const STANDING_SHELL_PREFIX: &str = "unscoped-shell-";
-
-/// Whether a task id names a standing agent's shell rather than one round of
-/// task work.
+/// Whether a lane belongs to an employee rather than to one round of task work.
 ///
-/// The cap evicts by least-recently-used, and that rule rests on an assumption:
-/// a tree nobody touched recently is a tree nobody will ask for again. It holds
-/// for a task tree, whose id is spent by the round that created it, and it
-/// fails for a conversation shell, whose id is the calling agent's own name and
-/// is handed back verbatim on the next turn. Measured on the deployed chat lane
-/// (2026-11-06): a squad pipeline creating a tree roughly every minute churned
-/// an eight-slot pool, `unscoped-shell-vera-82191e4a` was reclaimed 144 s after
-/// the turn that used it, and the files written in that turn went with it --
-/// the next turn was routed to a fresh checkout and could not see its own work.
-fn is_standing_lane(task_id: &str) -> bool {
-    task_id.starts_with(STANDING_SHELL_PREFIX)
+/// The prefix is `cog-core`'s, because the run names its own checkout from the
+/// same spelling this router reads: two spellings leave the model told about one
+/// tree and the executor routing to another.
+///
+/// The distinction is what the cap and the TTL are told apart by. The cap evicts
+/// by least-recently-used, and that rule rests on an assumption: a tree nobody
+/// touched recently is a tree nobody will ask for again. It holds for a task's
+/// tree, whose id is spent by the round that created it, and it fails for an
+/// employee's, whose lane is handed back verbatim on the next turn. Measured on
+/// the deployed chat lane (2026-11-06): a squad pipeline creating a tree roughly
+/// every minute churned an eight-slot pool, `unscoped-shell-vera-82191e4a` was
+/// reclaimed 144 s after the turn that used it, and the files written in that
+/// turn went with it -- the next turn was routed to a fresh checkout and could
+/// not see its own work.
+fn is_employee_lane(lane: &str) -> bool {
+    lane.starts_with(cog_core::WORKTREE_LANE_PREFIX)
+}
+
+/// The branch a lane's checkout is on.
+///
+/// Under `work/` so a reader listing the bare repo's branches can see whose
+/// work is where; the lane name is unique per employee, and a branch name may
+/// carry `/` even where a directory name may not.
+fn lane_branch(lane: &str) -> String {
+    format!("work/{lane}")
+}
+
+/// The checkout an employee works in, from the employee's own id.
+///
+/// The one answer to "which tree is this request's", for a request that named
+/// its caller. `None` when the request named nobody: a caller with no identity
+/// is routed by the task id it carried, which is where such a call landed
+/// before lanes existed.
+pub fn worktree_for_agent(agent_id: &str) -> Option<String> {
+    if agent_id.trim().is_empty() {
+        return None;
+    }
+    let lane = cog_core::worktree_lane(agent_id);
+    validate_task_id(&lane).ok().map(|_| lane)
 }
 
 fn unix_now() -> i64 {
@@ -2401,6 +2455,90 @@ pub fn anchor_path(base: Option<&Path>, path: &str) -> PathBuf {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The lane an employee id routes to. The tests say `lane("vera-…")` rather
+    /// than spelling the name so that a change to the derivation is felt here
+    /// too: a literal would keep passing while the run named a different tree.
+    fn lane(agent_id: &str) -> String {
+        worktree_for_agent(agent_id).expect("a named agent has a lane")
+    }
+
+    /// 一辆树的车道上挂着自己的分支：树被回收之后，那份活落在哪仍然读得出来。
+    ///
+    /// 以前切出来的是游离头（`--detach`），在上面提交等于把提交放进没有名字的
+    /// 地方——读的人说不出它落在哪棵树上，而这一位下一回合回来也找不到自己刚提
+    /// 过的那个提交。
+    #[tokio::test]
+    async fn a_lane_checkout_is_on_a_branch_named_after_its_lane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let (path, _) = r.route(&lane("squad:DSC-1A2B-generator")).await.unwrap();
+
+        let head = tokio::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        let branch = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        assert_eq!(
+            branch,
+            lane_branch(&lane("squad:DSC-1A2B-generator")),
+            "车道上的树要站在自己的分支上，否则提交没有落点"
+        );
+        assert_ne!(branch, "HEAD", "游离头上的提交不属于任何一棵树");
+    }
+
+    /// 暖池交出去的树同样站在车道的分支上：池子里的槽是游离切出来的，分支在
+    /// 交出去的那一刻才挂上。
+    #[tokio::test]
+    async fn a_warm_tree_is_handed_out_on_its_lane_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 1);
+        r.warm_pool_once().await;
+        assert!(
+            !r.warm_slots().await.is_empty(),
+            "the pool is meant to be cut ahead of demand"
+        );
+
+        let (path, took_warm) = r.route_validated(&lane("squad:DSC-1A2B-planner"), true).await.unwrap();
+        assert!(took_warm, "the slot was there and had to be handed out");
+        let head = tokio::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            lane_branch(&lane("squad:DSC-1A2B-planner")),
+            "暖池交出去的树也必须站在车道的分支上"
+        );
+    }
+
+    /// 请求里的执行者决定树，请求里的任务号只做归属。
+    ///
+    /// 同一个任务里的几位以前共用一棵树：规划器读的文件、生成器写的文件、评审
+    /// 跑的命令都在同一个工作区里，而任务号做完就废，树也跟着废。这里钉住的是
+    /// 「两个执行者、同一个任务号 → 两棵树」。
+    #[tokio::test]
+    async fn two_employees_on_one_task_do_not_share_a_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let generator = lane("squad:DSC-1A2B-generator");
+        let planner = lane("squad:DSC-1A2B-planner");
+        let (g, _) = r.route(&generator).await.unwrap();
+        let (p, _) = r.route(&planner).await.unwrap();
+        assert_ne!(g, p, "同一个任务里的两个执行者挤进了一棵树");
+        assert!(g.ends_with(&generator) && p.ends_with(&planner));
+        assert!(
+            worktree_for_agent("").is_none(),
+            "没报名号的请求没有车道，只能按任务号退回去"
+        );
+    }
 
     #[test]
     fn config_parses_env_with_safe_floors() {
@@ -3235,17 +3373,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// A conversation shell is named after the agent and comes back on the next
-    /// turn; a task tree is named after one round and never comes back. Under a
-    /// plain LRU the older shell loses every time a pipeline round needs a
-    /// slot, and the user's files lose with it.
+    /// An employee's checkout is named after the employee and comes back on the
+    /// next turn; a task's tree is named after one round and never comes back.
+    /// Under a plain LRU the older checkout loses every time a pipeline round
+    /// needs a slot, and the user's files lose with it.
     #[tokio::test]
-    async fn a_standing_shell_outlives_the_task_trees_that_share_its_cap() {
+    async fn an_employee_checkout_outlives_the_task_trees_that_share_its_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK);
         // The shell is the oldest tree on the volume, so plain LRU takes it.
-        r.route("unscoped-shell-vera-82191e4a").await.unwrap();
+        r.route(&lane("vera-82191e4a")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
         r.route("round-a").await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -3258,7 +3396,7 @@ pub(crate) mod tests {
             .map(|(id, _)| id)
             .collect();
         assert!(
-            ids.contains(&"unscoped-shell-vera-82191e4a".to_string()),
+            ids.contains(&lane("vera-82191e4a")),
             "a conversation must keep the tree its files are in: {ids:?}"
         );
         assert!(ids.contains(&"round-b".to_string()), "{ids:?}");
@@ -3269,34 +3407,35 @@ pub(crate) mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         let bare2 = seed_bare(tmp2.path());
         let r = router(tmp2.path(), &bare2, 1, DEFAULT_TTL_SECS_FALLBACK);
-        r.route("unscoped-shell-old").await.unwrap();
+        r.route(&lane("old")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        r.route("unscoped-shell-new").await.unwrap();
+        r.route(&lane("new")).await.unwrap();
         let ids: Vec<String> = r
             .list_task_trees()
             .await
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(ids, vec!["unscoped-shell-new".to_string()]);
+        assert_eq!(ids, vec![lane("new")]);
         assert_eq!(r.metrics.cap_deferred.get(), 0.0);
     }
 
-    /// The idle TTL is a rule about finished work: a task tree's id is spent by
-    /// its round, so an idle one is a tree nobody will ask for. A standing shell
-    /// comes back by name, so the same idle hour says nothing — reaping it would
-    /// delete the user's files between two conversations rather than after one.
+    /// The idle TTL is a rule about finished work: a task's tree is spent by
+    /// its round, so an idle one is a tree nobody will ask for. An employee's
+    /// checkout comes back by name, so the same idle hour says nothing —
+    /// reaping it would delete the user's files between two conversations
+    /// rather than after one.
     #[tokio::test]
-    async fn the_idle_ttl_leaves_a_standing_shell_alone() {
+    async fn the_idle_ttl_leaves_an_employee_checkout_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
-        let (shell, _) = r.route("unscoped-shell-vera-82191e4a").await.unwrap();
+        let (shell, _) = r.route(&lane("vera-82191e4a")).await.unwrap();
         let (round, _) = r.route("round-a").await.unwrap();
         // Stamped together so the arrival span is zero and the configured TTL
         // stands; the derived one is floored at an hour and would hide the rule.
         let together = unix_now();
-        for id in ["unscoped-shell-vera-82191e4a", "round-a"] {
+        for id in [lane("vera-82191e4a").as_str(), "round-a"] {
             let mut meta = r.read_meta(id).expect("a routed tree has a sidecar");
             meta.created_at_unix = together;
             meta.last_used_unix = together;
@@ -3317,7 +3456,7 @@ pub(crate) mod tests {
     }
 
     /// The idle rule reaps task trees, so the hold time it derives has to come
-    /// from their arrivals. A conversation that has been open for a week would
+    /// from their arrivals. A checkout that has been open for a week would
     /// otherwise stretch the span by that week and publish a hold time the rule
     /// never applied — a number that reads as "idle rounds are kept for weeks".
     #[tokio::test]
@@ -3325,14 +3464,14 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        r.route("unscoped-shell-vera-82191e4a").await.unwrap();
+        r.route(&lane("vera-82191e4a")).await.unwrap();
         for id in ["round-a", "round-b", "round-c", "round-d"] {
             r.route(id).await.unwrap();
         }
         let week_ago = unix_now() - 7 * 86_400;
         let hour_ago = unix_now() - 3_600;
         for id in [
-            "unscoped-shell-vera-82191e4a",
+            lane("vera-82191e4a").as_str(),
             "round-a",
             "round-b",
             "round-c",
@@ -3362,7 +3501,7 @@ pub(crate) mod tests {
         );
 
         fn is_standing(id: &str) -> bool {
-            id.starts_with("unscoped-shell-")
+            is_employee_lane(id)
         }
     }
 

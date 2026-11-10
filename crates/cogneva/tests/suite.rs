@@ -483,6 +483,8 @@ mod wal_event_round_trip_test;
 mod work_on_the_tree_is_declared_by_the_task_test;
 #[path = "skills_carry_no_persona_and_no_boundary_test.rs"]
 mod skills_carry_no_persona_and_no_boundary_test;
+#[path = "an_employee_works_in_its_own_checkout_test.rs"]
+mod an_employee_works_in_its_own_checkout_test;
 #[path = "web_chat_frames_read_fields_the_socket_writes_test.rs"]
 mod web_chat_frames_read_fields_the_socket_writes_test;
 #[path = "web_client_api_functions_are_called_test.rs"]

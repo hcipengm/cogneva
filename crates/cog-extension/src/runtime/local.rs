@@ -435,8 +435,10 @@ pub(crate) async fn collect_stream(mut stream: CommandEventStream) -> SandboxRes
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut exit_code = 0;
+    let mut workdir = None;
     while let Some(event) = stream.next().await {
         match event {
+            CommandEvent::Workdir { path } => workdir = Some(path),
             CommandEvent::Stdout { data } => stdout.push_str(&data),
             CommandEvent::Stderr { data } => stderr.push_str(&data),
             CommandEvent::Exit { code } => exit_code = code,
@@ -449,6 +451,7 @@ pub(crate) async fn collect_stream(mut stream: CommandEventStream) -> SandboxRes
         output: None,
         duration_ms: 0,
         resource_usage: Default::default(),
+        workdir,
     }
 }
 

@@ -386,8 +386,11 @@ fn tool_label(payload: &SandboxPayload) -> &'static str {
     }
 }
 
-fn stream_response(rx: tokio::sync::mpsc::Receiver<CommandEvent>) -> Response {
-    ndjson_response(rx, None)
+fn stream_response(
+    rx: tokio::sync::mpsc::Receiver<CommandEvent>,
+    announce: Option<CommandEvent>,
+) -> Response {
+    ndjson_response(rx, None, announce)
 }
 
 /// Serialize a command's events as NDJSON for the caller.
@@ -396,12 +399,19 @@ fn stream_response(rx: tokio::sync::mpsc::Receiver<CommandEvent>) -> Response {
 /// where the caller stops waiting: at the final event, or at the moment the
 /// connection closes with the command still writing. Neither is visible from
 /// the handler, which returns before the first frame is read.
+///
+/// `announce`, when present, is the first line: the checkout the call ran in,
+/// whose absolute path only this side of the wire knows.
 fn ndjson_response(
     rx: tokio::sync::mpsc::Receiver<CommandEvent>,
     watch: Option<CommandWatch>,
+    announce: Option<CommandEvent>,
 ) -> Response {
-    let stream = futures::stream::unfold((rx, watch), |(mut rx, watch)| async move {
-        let event = rx.recv().await?;
+    let stream = futures::stream::unfold((rx, watch, announce), |(mut rx, watch, pending)| async move {
+        let event = match pending {
+            Some(event) => event,
+            None => rx.recv().await?,
+        };
         if let (Some(w), CommandEvent::Exit { code }) = (watch.as_ref(), &event) {
             w.mark(if *code == 0 {
                 Outcome::Ok
@@ -409,7 +419,7 @@ fn ndjson_response(
                 Outcome::Failed
             });
         }
-        Some((event, (rx, watch)))
+        Some((event, (rx, watch, None)))
     })
     .map(|event| {
         let mut line = serde_json::to_string(&event).expect("CommandEvent serializes");
@@ -440,23 +450,39 @@ fn single_shot(result: std::io::Result<String>) -> tokio::sync::mpsc::Receiver<C
     rx
 }
 
-/// Resolve the task worktree for a request. A valid task id anchors the
-/// command cwd and relative file paths; routing errors fail the request
-/// instead of silently falling back to a shared directory. When the router is
-/// enabled, every command additionally receives the shared CARGO_TARGET_DIR.
+/// Resolve the checkout for a request. A valid lane anchors the command cwd and
+/// relative file paths; routing errors fail the request instead of silently
+/// falling back to a shared directory. When the router is enabled, every
+/// command additionally receives the shared CARGO_TARGET_DIR.
+///
+/// The tree belongs to the employee, so the agent id decides it and the task id
+/// does not. Routing by task id put every role of one task in one checkout --
+/// a planner's reads, a generator's writes and an evaluator's runs sharing one
+/// working tree -- and it made the tree's lifetime the task's, so a finished
+/// task took the files with it while the person was still here. The task id is
+/// still read, but only for a request that named no employee: that call has no
+/// lane of its own and something has to name it.
 async fn resolve_workdir(
     state: &AppState,
     task_id: Option<&str>,
+    agent_id: Option<&str>,
 ) -> Result<(Option<PathBuf>, Option<PathBuf>, Option<CommandHold>), Box<Response>> {
     let Some(router) = state.workdir.as_ref() else {
         return Ok((None, None, None));
     };
-    match task_id.filter(|id| !id.trim().is_empty()) {
+    let from_employee = agent_id.and_then(workdir::worktree_for_agent);
+    let lane = from_employee.or_else(|| {
+        task_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    });
+    match lane {
         // The claim travels with the request and is handed to whatever runs the
         // command: the tree is in use from here until that command is over, and
         // a reclamation pass that only knows `last_used_unix` cannot tell the
         // difference on its own.
-        Some(id) => match router.route(id).await {
+        Some(lane) => match router.route(&lane).await {
             Ok((dir, claim)) => Ok((
                 Some(dir),
                 Some(router.target_dir().to_path_buf()),
@@ -466,19 +492,21 @@ async fn resolve_workdir(
                 router.metrics().inc_error("route");
                 Err(Box::new(error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("task worktree unavailable: {e}"),
+                    format!("worktree unavailable for {lane}: {e}"),
                 )))
             }
         },
         None => {
             // The business side must stamp identity (require_tool_identity);
             // an unstamped request still runs for compatibility, but outside
-            // any task tree and is counted for observability. It builds into the
+            // any checkout and is counted for observability. It builds into the
             // shared cache like any other command, so it takes the command slot
             // all the same: a command that is not tracked is a build the
             // reclamation pass cannot see.
             router.metrics().inc_unscoped();
-            tracing::warn!("sandbox request without task id; running outside per-task worktree");
+            tracing::warn!(
+                "sandbox request naming neither an employee nor a task; running outside any checkout"
+            );
             Ok((
                 None,
                 Some(router.target_dir().to_path_buf()),
@@ -498,10 +526,17 @@ async fn execute_handler(
     let watch = CommandWatch::start(Arc::clone(&state.commands), tool_label(&req.payload));
     let timeout = effective_timeout(req.timeout_ms);
     let (workdir, cargo_target, worktree_claim) =
-        match resolve_workdir(&state, req.task_id.as_deref()).await {
+        match resolve_workdir(&state, req.task_id.as_deref(), req.agent_id.as_deref()).await {
             Ok(resolved) => resolved,
             Err(resp) => return watch.end(*resp, Outcome::Refused),
         };
+    // The checkout's absolute path goes in front of every reply: the caller
+    // knows the lane's name, only this side knows where that name lives. A
+    // call outside any checkout announces nothing rather than a path that
+    // would read as "somewhere real".
+    let announce = workdir.as_ref().map(|dir| CommandEvent::Workdir {
+        path: dir.display().to_string(),
+    });
     match req.payload {
         SandboxPayload::Command { ref command } => {
             if command.trim().is_empty() {
@@ -553,7 +588,7 @@ async fn execute_handler(
             ) {
                 // The command's outcome is its own exit code, which arrives as
                 // the last event; the watch reads it there.
-                Ok(rx) => ndjson_response(rx, Some(watch)),
+                Ok(rx) => ndjson_response(rx, Some(watch), announce),
                 Err(e) => watch.end(
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
                     Outcome::Refused,
@@ -566,7 +601,7 @@ async fn execute_handler(
             // A file operation's own result is already known here, so the
             // watch is closed now rather than through the buffered stream.
             let outcome = outcome_of(&result);
-            watch.end(stream_response(single_shot(result)), outcome)
+            watch.end(stream_response(single_shot(result), announce), outcome)
         }
         SandboxPayload::WriteFile {
             ref path,
@@ -576,7 +611,10 @@ async fn execute_handler(
             if let Some(parent) = anchored.parent() {
                 if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                        return watch.end(stream_response(single_shot(Err(e))), Outcome::Failed);
+                        return watch.end(
+                            stream_response(single_shot(Err(e)), announce),
+                            Outcome::Failed,
+                        );
                     }
                 }
             }
@@ -584,7 +622,7 @@ async fn execute_handler(
                 .await
                 .map(|_| String::new());
             let outcome = outcome_of(&result);
-            watch.end(stream_response(single_shot(result)), outcome)
+            watch.end(stream_response(single_shot(result), announce), outcome)
         }
         SandboxPayload::EditFile {
             ref path,
@@ -601,7 +639,7 @@ async fn execute_handler(
                 .map(|report| report.describe(path))
                 .map_err(std::io::Error::other);
             let outcome = outcome_of(&result);
-            watch.end(stream_response(single_shot(result)), outcome)
+            watch.end(stream_response(single_shot(result), announce), outcome)
         }
         SandboxPayload::Wasm { .. } => watch.end(
             error_response(
@@ -1477,6 +1515,78 @@ mod tests {
         assert!(
             body.contains("sandbox_workspace_cap_deferred_total 1"),
             "a finished command leaves nothing to defer: {body}"
+        );
+    }
+
+    /// 执行器先报出这条命令落在哪个目录，而那个路径只有它知道。
+    ///
+    /// 调用方按车道名选树，但车道名不是路径：从名字到目录那一步发生在执行器
+    /// 这台机器上。不把结果回带，模型想知道自己在哪就只剩跑一条 `pwd`——用一次
+    /// 往返去问一个回复里本来就有的答案。没有车道的调用不许报出一个看着像真的
+    /// 路径，所以这里同时钉住「未挂钩时什么都不说」。
+    #[tokio::test]
+    async fn a_reply_names_the_checkout_it_ran_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = crate::workdir::tests::seed_bare(tmp.path());
+        let workdir = crate::workdir::tests::router(
+            tmp.path(),
+            &bare,
+            8,
+            std::time::Duration::from_secs(21600),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = workdir.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app_router_with_workdir(serving))
+                .await
+                .unwrap();
+        });
+
+        let events = events_of(
+            post(
+                addr,
+                serde_json::json!({
+                    "payload": {"type": "command", "command": "pwd"},
+                    "agent_id": "kai-a9ab11fc",
+                }),
+            )
+            .await,
+        )
+        .await;
+        let lane = cog_core::worktree_lane("kai-a9ab11fc");
+        let expected = tmp.path().join("workspaces").join(&lane);
+        match events.first() {
+            Some(CommandEvent::Workdir { path }) => assert_eq!(
+                std::path::Path::new(path),
+                expected.as_path(),
+                "执行器报的目录不是这条车道的那棵树"
+            ),
+            other => panic!("回复的第一帧必须报出工作目录：{other:?}"),
+        }
+        let printed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                CommandEvent::Stdout { data } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(printed.trim(), expected.to_string_lossy(), "pwd 与报出的目录对不上");
+
+        // 无名无任务的调用落在任何树之外：这时「什么都不报」才是真的。
+        let events = events_of(
+            post(
+                addr,
+                serde_json::json!({"payload": {"type": "command", "command": "echo hi"}}),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CommandEvent::Workdir { .. })),
+            "没有车道的调用报了工作目录，读者会把它当成一棵真树：{events:?}"
         );
     }
 

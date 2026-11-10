@@ -1664,14 +1664,12 @@ impl AgentRuntime {
 
     /// 这一轮的命令与文件落在哪条工作树车道上。
     ///
-    /// 与工具侧算的是同一个名字：有任务号就是那条任务的工作树，没有就是这位
-    /// 自己的常驻车道（`crate::tools::standing_workspace`）。系统前缀里说错了
-    /// 一棵树，比不说更坏——模型会照着它去解释另一棵树里的输出。
+    /// 车道由执行者自己决定，不由这一轮接的是哪件活决定：树是员工的，同一件活
+    /// 换了个人接就换一棵树，而一件活做完之后那棵树还在。与执行器那边算的是
+    /// 同一个名字（`cog_core::worktree_lane`），两边各拼一遍的话，模型会在前缀
+    /// 里读到一棵树、在文件里改到另一棵——系统前缀里说错一棵树，比不说更坏。
     fn workspace_lane(&self) -> String {
-        match self.run_task_id.as_deref() {
-            Some(task) => task.to_string(),
-            None => crate::tools::standing_workspace(&self.config.agent_id),
-        }
+        cog_core::worktree_lane(&self.config.agent_id)
     }
 
     /// The prologue every run shares, whichever way its input arrives.
@@ -3889,7 +3887,7 @@ mod tests {
         );
         // 与工具侧同一条车道名：命令落在哪棵树，前缀里说的就是哪棵树。
         assert!(
-            head.contains(&crate::tools::standing_workspace("kai-a9ab11fc")),
+            head.contains(&cog_core::worktree_lane("kai-a9ab11fc")),
             "the workspace lane the calls land in is missing: {head}"
         );
     }
@@ -3947,7 +3945,7 @@ mod tests {
             .content()
             .to_string();
         assert!(!head.contains("名字"), "no name was claimed: {head}");
-        assert!(head.contains(&crate::tools::standing_workspace("no-one-yet")));
+        assert!(head.contains(&cog_core::worktree_lane("no-one-yet")));
     }
 
     /// A state word is spelled once: what `Display` prints is what `as_str`

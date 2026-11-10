@@ -250,7 +250,7 @@ async fn one_employee_is_the_same_name_everywhere() {
     );
 
     // 三、车道名：工作树按这一位的 id 切，读者从车道名回得到同一个人。
-    let lane = cog_agent::tools::standing_workspace(AGENT_ID);
+    let lane = cog_core::worktree_lane(AGENT_ID);
     assert!(
         lane.ends_with(AGENT_ID),
         "工作树车道名 `{lane}` 回不到 {AGENT_ID}：树与人对不上，产出落在哪棵树上就读不出来"

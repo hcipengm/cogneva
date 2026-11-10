@@ -48,6 +48,7 @@ impl SandboxBackend for WasmRuntime {
             output: Some(req.input.clone()),
             duration_ms: 0,
             resource_usage: Default::default(),
+            workdir: None,
         })
     }
 

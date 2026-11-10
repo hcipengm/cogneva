@@ -71,6 +71,97 @@ pub fn agent_id_for(task_id: &str, role: &str) -> String {
     format!("{}-{role}", squad_id_for(task_id))
 }
 
+/// The prefix every employee's checkout is named with.
+///
+/// The prefix is also how the executor tells an employee's tree from a task's
+/// leftover one: an employee's tree comes back on the next turn and must not be
+/// reaped for idleness, while a task's tree is spent by the round that made it.
+pub const WORKTREE_LANE_PREFIX: &str = "employee-";
+
+/// The longest a checkout's name may be.
+///
+/// A lane is used as a directory name (`<workspaces>/<lane>`) and as a branch
+/// name (`work/<lane>`), so what bounds it is the filesystem's limit on one
+/// path component -- 255 bytes on Linux -- with the branch's own prefix taken
+/// off. Exported because the executor's router validates the same names and
+/// would otherwise keep a ceiling of its own: the tighter of the two silently
+/// becomes the real one, and an id past it loses its checkout rather than
+/// failing anywhere a reader could see.
+// cap: bound — Linux NAME_MAX (255 bytes per path component) less the `work/` a branch name adds; a platform ceiling, not a capacity reading of this deployment, so no reading moves it
+pub const MAX_CHECKOUT_NAME_CHARS: usize = 255 - "work/".len();
+
+/// How much of an agent id the lane name keeps.
+///
+/// Subtracted from [`MAX_CHECKOUT_NAME_CHARS`] rather than written as a round
+/// number, because the prefix is what consumes the budget: a lane whose prefix
+/// grew must shorten by exactly that much.
+const LANE_NAME_MAX_CHARS: usize = MAX_CHECKOUT_NAME_CHARS - WORKTREE_LANE_PREFIX.len();
+
+/// `-` plus the eight hex digits that end a truncated lane.
+// cap: bound — 一个 `-` 和八位十六进制；它数的是指纹的写法，不是这台机器能承受多少
+const TRUNCATION_TAIL_CHARS: usize = 9;
+
+/// A stable 32-bit fingerprint of the whole id, used only to end a truncated
+/// lane.
+///
+/// Written out instead of taking `std::collections::hash_map::DefaultHasher`,
+/// whose algorithm is deliberately unspecified: a toolchain upgrade would
+/// compute a different name for the same employee and hand it an empty tree.
+fn lane_fingerprint(text: &str) -> u32 {
+    // FNV-1a.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// The checkout an employee works in, named after the employee.
+///
+/// One derivation, two readers that cannot import each other: the run writes
+/// this name into the system prefix so the model knows where its files land,
+/// and the executor routes every request by it. Two spellings do not fail --
+/// they put a turn's files in one tree while the prompt names another, and
+/// every later read of that tree then reads a checkout the model was never
+/// told about.
+///
+/// The id is folded to the byte set a worktree directory accepts, because agent
+/// ids carry characters a path should not: a task's agent is spelled
+/// `squad:<task>-<role>`, and a chat employee's id is a uuid.
+///
+/// A name that has to be shortened ends with a fingerprint of the full id.
+/// Truncating alone aliases: two ids sharing their first `LANE_NAME_MAX_CHARS`
+/// characters would land in one tree, and nothing downstream could tell that
+/// two people were writing there.
+pub fn worktree_lane(agent_id: &str) -> String {
+    let folded: String = agent_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // A leading dot names a hidden directory, which the router refuses; taking
+    // it off here means the refusal never has to be discovered as a failed
+    // call, and the prompt still names the tree that will be used.
+    let folded = folded.trim_start_matches('.').to_string();
+    if folded.chars().count() <= LANE_NAME_MAX_CHARS {
+        return format!("{WORKTREE_LANE_PREFIX}{folded}");
+    }
+    let kept: String = folded
+        .chars()
+        .take(LANE_NAME_MAX_CHARS - TRUNCATION_TAIL_CHARS)
+        .collect();
+    format!(
+        "{WORKTREE_LANE_PREFIX}{kept}-{:08x}",
+        lane_fingerprint(&folded)
+    )
+}
+
 /// 数字员工名册：人名的唯一来源。
 ///
 /// 列表只管"好不好认"：唯一性由 id 尾部那 8 位短码承担（见 [`unregistered_label`]
@@ -172,6 +263,41 @@ pub fn unregistered_label(agent_id: &str) -> String {
 #[cfg(test)]
 mod naming_tests {
     use super::*;
+
+    /// 车道名只由 id 决定，且落在目录名允许的那一组字节里。
+    ///
+    /// 任务里的执行体是 `squad:<task>-<role>`，冒号不是目录名该有的字节；折完
+    /// 之后名字仍然认得出是谁（任务号与角色都在），只是换了几个分隔符。
+    #[test]
+    fn a_lane_name_is_folded_from_the_agent_id() {
+        assert_eq!(
+            worktree_lane("squad:DSC-1A2B-generator"),
+            "employee-squad-DSC-1A2B-generator"
+        );
+        assert_eq!(
+            worktree_lane("kai.a9ab11fc"),
+            "employee-kai.a9ab11fc",
+            "合法的字节不该被动，读者要能一眼认出是谁"
+        );
+        // 前导点会被路由当成隐藏目录拒绝；去掉它，而不是让调用去撞那道拒绝。
+        assert_eq!(worktree_lane(".hidden"), "employee-hidden");
+        // 超长 id 截断在文件系统给单个名字的上限以内：车道既是目录名，也是
+        // `work/<lane>` 这条分支名，两处都得装得下。
+        let long = worktree_lane(&"x".repeat(400));
+        assert!(
+            long.len() + "work/".len() <= 255,
+            "车道名 {} 字节，加上分支前缀就超过文件系统的单名上限了",
+            long.len()
+        );
+        // 截断不许制造别名：两个 id 前 300 个字符一样，也必须落进两棵树。
+        // 截断后系统上看不出这是两个人，两份改动会互相覆盖而且不报错。
+        let shared = "y".repeat(300);
+        let one = worktree_lane(&format!("{shared}-a"));
+        let two = worktree_lane(&format!("{shared}-b"));
+        assert_ne!(one, two, "两条长 id 落进了同一棵树：{one}");
+        // 同一个 id 永远同一个名字：系统前缀与路由各算一次，不能算出两个结果。
+        assert_eq!(worktree_lane("squad:t-role"), worktree_lane("squad:t-role"));
+    }
 
     /// 工号唯一 ⇒ 展示名唯一。这是「员工不要重名」这条要求在代码里的判据：
     /// 只要这个循环里出现一次相等，名册上就有一个读不出是谁的名字。

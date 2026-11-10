@@ -2023,6 +2023,7 @@ mod workspace_change_tests {
             output: None,
             duration_ms: 0,
             resource_usage: Default::default(),
+            workdir: None,
         }
     }
 

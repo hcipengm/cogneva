@@ -41,6 +41,10 @@ pub struct Command {
     started: Instant,
     stdout: Mutex<String>,
     stderr: Mutex<String>,
+    /// The checkout the command runs in, as the executor announced it. A
+    /// background run answers with a handle before the executor has said
+    /// anything, so the path arrives with a later poll, not with the handle.
+    workdir: Mutex<Option<String>>,
     ending: Mutex<Option<Ending>>,
     done: tokio::sync::watch::Sender<bool>,
     done_rx: tokio::sync::watch::Receiver<bool>,
@@ -54,6 +58,7 @@ impl Command {
             started: Instant::now(),
             stdout: Mutex::new(String::new()),
             stderr: Mutex::new(String::new()),
+            workdir: Mutex::new(None),
             ending: Mutex::new(None),
             done,
             done_rx,
@@ -74,6 +79,10 @@ impl Command {
             }
             CommandEvent::Stderr { data } => {
                 self.stderr.lock().unwrap().push_str(&data);
+                None
+            }
+            CommandEvent::Workdir { path } => {
+                *self.workdir.lock().unwrap() = Some(path);
                 None
             }
             CommandEvent::Exit { code } => Some(code),
@@ -135,6 +144,9 @@ impl Command {
                 ("failed", serde_json::Value::Null, serde_json::json!(why))
             }
         };
+        if let Some(workdir) = self.workdir.lock().unwrap().clone() {
+            out["workdir"] = serde_json::json!(workdir);
+        }
         out["state"] = serde_json::json!(state);
         out["exit_code"] = code;
         out["error"] = error;

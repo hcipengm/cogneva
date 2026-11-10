@@ -40,6 +40,8 @@ pub fn text() -> Option<String> {
 /// 工作树说的是**车道的名字**，不是绝对路径：路径在执行器那台机器上，这一侧
 /// 的进程不持有它。编一个出来比不说更坏——模型会拿它去 `cd`，而那条路径在这
 /// 一侧根本不存在。名字是两边都认的那个：命令落在哪条车道，就是这个名字。
+/// 绝对路径由执行器在每条回复的 `workdir` 里给出，所以这一段不猜它，只告诉
+/// 模型去哪读。
 pub fn identity_note(
     agent_id: &str,
     display_name: Option<&str>,
@@ -58,7 +60,8 @@ pub fn identity_note(
     note.push('。');
     if let Some(tree) = tree {
         note.push_str(&format!(
-            "你这一轮的命令与文件落在工作树「{tree}」里（绝对路径以命令自己报的为准）。"
+            "你这一轮的命令与文件落在工作树「{tree}」里（绝对路径在执行器那条机器上，\
+             工具回复的 `workdir` 就是它；不必自己 `pwd` 去问）。"
         ));
     }
     Some(note)
@@ -74,20 +77,23 @@ mod tests {
         let note = identity_note(
             "kai-a9ab11fc",
             Some("E0412 林清和"),
-            Some("unscoped-shell-kai-a9ab11fc"),
+            Some(&cog_core::worktree_lane("kai-a9ab11fc")),
         )
         .expect("an id is always known, so there is a note");
         assert!(note.contains("kai-a9ab11fc"), "{note}");
         assert!(note.contains("E0412 林清和"), "{note}");
-        assert!(note.contains("unscoped-shell-kai-a9ab11fc"), "{note}");
+        assert!(
+            note.contains(&cog_core::worktree_lane("kai-a9ab11fc")),
+            "{note}"
+        );
     }
 
     /// 不知道名字就只说道路：编一个名字会让读的人以为名册上有这一位。
     #[test]
     fn a_run_without_a_roster_row_gets_the_workspace_but_no_name() {
-        let note = identity_note("no-one-yet", None, Some("task-42"))
+        let note = identity_note("no-one-yet", None, Some(&cog_core::worktree_lane("no-one-yet")))
             .expect("the workspace alone is worth saying");
-        assert!(note.contains("task-42"), "{note}");
+        assert!(note.contains(&cog_core::worktree_lane("no-one-yet")), "{note}");
         assert!(!note.contains("名字"), "no name was claimed: {note}");
     }
 

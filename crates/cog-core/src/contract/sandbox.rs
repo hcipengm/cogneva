@@ -71,6 +71,15 @@ pub enum SandboxPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum CommandEvent {
+    /// The checkout this call is running in, as an absolute path on the
+    /// executor's machine.
+    ///
+    /// It travels with the reply rather than in the caller's prompt because
+    /// only the executor knows it: the caller composes the lane's name, the
+    /// executor turns that name into a directory. A model that has to run
+    /// `pwd` to learn where it is spends a round trip finding out something the
+    /// reply already knew.
+    Workdir { path: String },
     Stdout { data: String },
     Stderr { data: String },
     Exit { code: i32 },
@@ -96,16 +105,23 @@ pub struct SandboxResult {
     pub output: Option<serde_json::Value>,
     pub duration_ms: u64,
     pub resource_usage: ResourceUsage,
+    /// Where the call ran, as the executor reported it. `None` is a local or
+    /// unnamed run: those have no checkout to name.
+    pub workdir: Option<String>,
 }
 
 impl SandboxResult {
     pub fn into_json(self) -> serde_json::Value {
         self.output.unwrap_or_else(|| {
-            serde_json::json!({
+            let mut reply = serde_json::json!({
                 "stdout": self.stdout,
                 "stderr": self.stderr,
                 "exit_code": self.exit_code,
-            })
+            });
+            if let Some(workdir) = self.workdir {
+                reply["workdir"] = serde_json::Value::String(workdir);
+            }
+            reply
         })
     }
 }

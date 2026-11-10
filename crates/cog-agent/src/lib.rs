@@ -15,7 +15,6 @@ pub mod runtime;
 pub mod tools;
 pub mod wal;
 pub mod web;
-pub mod worktree;
 
 /// The label naming how a reading ended.
 ///

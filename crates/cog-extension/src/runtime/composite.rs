@@ -74,6 +74,7 @@ mod tests {
                 output: None,
                 duration_ms: 0,
                 resource_usage: Default::default(),
+                workdir: None,
             })
         }
 

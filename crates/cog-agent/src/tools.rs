@@ -91,64 +91,32 @@ pub fn caller_agent_id() -> Option<String> {
     CALLER_AGENT_ID.try_with(|id| id.clone()).ok()
 }
 
-/// The sandbox task id for a tool call: the scoped task when there is one, and
-/// otherwise one workspace per caller.
+/// The task id a tool call carries: the scoped task when there is one, and
+/// otherwise the caller's own lane.
 ///
 /// A call with no task scope used to get a fresh random id every time, and the
-/// executor routes a task id to a worktree — so every call in a conversation
-/// was handed a different checkout. Measured on the deployed chat path
-/// (2026-11-06): `pwd` answered
-/// `/opt/cogneva/sandbox/workspaces/unscoped-shell-f294ca21-…`, and the next
-/// call in the same conversation would have named a different directory. That
-/// makes a conversation unable to finish any job that takes two calls —
+/// executor routes by it — so every call in a conversation was handed a
+/// different checkout. Measured on the deployed chat path (2026-11-06): `pwd`
+/// answered `/opt/cogneva/sandbox/workspaces/unscoped-shell-f294ca21-…`, and the
+/// next call in the same conversation would have named a different directory.
+/// That makes a conversation unable to finish any job that takes two calls —
 /// `write_file` then `run_command` tests nothing, because the file was written
 /// into a tree the next call never sees — which is exactly the "one call at a
 /// time" ceiling the tools were meant to lift.
 ///
-/// The run loop already announces who is calling, and that identity is stable
-/// for a conversation, so it is the workspace's name. A caller nobody announced
-/// still gets the random id: two unknown callers sharing one directory would be
-/// worse than the churn.
+/// The id is attribution, not routing: the tree a request lands in is chosen by
+/// the agent id (see [`cog_core::worktree_lane`]), so a call that names its
+/// caller lands in that caller's checkout whichever task it says it is for. A
+/// caller nobody announced still gets the random id: two unknown callers
+/// sharing one directory would be worse than the churn.
 fn sandbox_task_id(scope: Option<&ToolScope>) -> String {
     if let Some(scope) = scope {
         return scope.task_id.clone();
     }
     match caller_agent_id() {
-        // The executor accepts `[A-Za-z0-9_.-]` and nothing else in a task id
-        // (see `validate_task_id`); agent ids carry other bytes -- squads are
-        // spelled `squad:<task>` -- so the name is folded before it is used.
-        Some(caller) => standing_workspace(&caller),
+        Some(caller) => cog_core::worktree_lane(&caller),
         None => format!("unscoped-shell-{}", uuid::Uuid::new_v4()),
     }
-}
-
-/// 一个没有任务号的员工，手里的命令落在哪条工作树车道上。
-///
-/// 名字是算出来的，不是分出来的：同一句话、同一侧工具、同一侧系统前缀都从
-/// 这里取，所以模型在提示词里读到的车道名，就是它下一次调用真落进去的那条。
-/// 两边各拼一遍的话，改了一边就会让模型以为自己在另一棵树里。
-pub fn standing_workspace(agent_id: &str) -> String {
-    format!("unscoped-shell-{}", workspace_name(agent_id))
-}
-
-/// Fold an agent id into something the worktree router accepts as a directory
-/// name, keeping it recognizable.
-fn workspace_name(agent_id: &str) -> String {
-    let folded: String = agent_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // A leading dot is refused by the router (it would name a hidden directory),
-    // and an over-long id is refused too; both are the router's rules, so both
-    // are applied here rather than discovered as a failed call.
-    let folded = folded.trim_start_matches('.').to_string();
-    folded.chars().take(96).collect()
 }
 
 /// `read_file` 在调用方没说要看多少行时给出的一页。
@@ -661,6 +629,9 @@ impl ToolRegistry {
                                     CommandEvent::Stdout { data } => stdout.push_str(&data),
                                     CommandEvent::Stderr { data } => stderr.push_str(&data),
                                     CommandEvent::Exit { code: c } => code = c,
+                                    // 这一批的每一份文件都在同一棵树上；条目里不带
+                                    // 路径，模型已经用相对路径问的
+                                    CommandEvent::Workdir { .. } => {}
                                 }
                             }
                             if code == 0 {
@@ -837,19 +808,30 @@ impl ToolRegistry {
                 let mut stdout = String::new();
                 let mut stderr = String::new();
                 let mut code = 0;
+                // 执行器最先说的那句话是「这条命令落在哪个目录」的绝对路径。
+                // 它不在提示词里，因为只有执行器那台机器知道车道名对应哪条路径；
+                // 不回给模型，模型就得再跑一条 `pwd` 才知道自己在哪。
+                let mut workdir = None;
                 while let Some(event) = stream.next().await {
                     match event {
+                        CommandEvent::Workdir { path } => workdir = Some(path),
                         CommandEvent::Stdout { data } => stdout.push_str(&data),
                         CommandEvent::Stderr { data } => stderr.push_str(&data),
                         CommandEvent::Exit { code: c } => code = c,
                     }
                 }
                 match op {
-                    cog_core::ShellOp::Command => Ok(serde_json::json!({
-                        "stdout": stdout,
-                        "stderr": stderr,
-                        "code": code,
-                    })),
+                    cog_core::ShellOp::Command => {
+                        let mut reply = serde_json::json!({
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "code": code,
+                        });
+                        if let Some(workdir) = workdir {
+                            reply["workdir"] = serde_json::Value::String(workdir);
+                        }
+                        Ok(reply)
+                    }
                     cog_core::ShellOp::ReadFile => {
                         if code == 0 {
                             Ok(read_window(&stdout, read_offset, read_limit))
@@ -2000,6 +1982,7 @@ mod tests {
                         output: None,
                         duration_ms: 0,
                         resource_usage: Default::default(),
+                        workdir: None,
                     }
                 }
                 SandboxPayload::ReadFile { path } => match tokio::fs::read_to_string(path).await {
@@ -2072,6 +2055,58 @@ mod tests {
         assert!(
             !shared.names().iter().any(|name| name == "read_file"),
             "装在这张表上的工具漏进了共用的那张：一条运行的工具会变成每个 agent 的工具"
+        );
+    }
+
+    /// 执行器报的目录要落到模型的回复里，而不是只落在事件流里。
+    ///
+    /// 车道名是调用方拼的，目录只有执行器知道：它按名字把树解出来，语言里
+    /// 没有第二条路能让模型拿到那个绝对路径。所以回复里带一格 `workdir`；
+    /// 落在任何树之外的调用（本机执行、无名无任务）反过来不许凭空报出一条
+    /// 路径——那会让模型以为自己在某棵树里。
+    #[tokio::test]
+    async fn a_command_reply_names_the_checkout_it_ran_in() {
+        let (backend, tx) = OpenStream::pair();
+        let registry =
+            ToolRegistry::new().with_sandbox_backend(backend as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        tx.send(CommandEvent::Workdir {
+            path: "/srv/workspaces/employee-kai-a9ab11fc".into(),
+        })
+        .unwrap();
+        tx.send(CommandEvent::Stdout {
+            data: "/srv/workspaces/employee-kai-a9ab11fc\n".into(),
+        })
+        .unwrap();
+        tx.send(CommandEvent::Exit { code: 0 }).unwrap();
+        drop(tx);
+
+        let out = registry
+            .execute("run_command", serde_json::json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["workdir"], "/srv/workspaces/employee-kai-a9ab11fc",
+            "执行器报出的目录没有回给模型：它只能再跑一条 pwd 去问一个回复里本就有的答案"
+        );
+
+        let (backend, tx) = OpenStream::pair();
+        let bare = ToolRegistry::new().with_sandbox_backend(backend as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&bare, builtins::run_command());
+        tx.send(CommandEvent::Stdout {
+            data: "hi\n".into(),
+        })
+        .unwrap();
+        tx.send(CommandEvent::Exit { code: 0 }).unwrap();
+        drop(tx);
+        let out = bare
+            .execute("run_command", serde_json::json!({"command": "echo hi"}))
+            .await
+            .unwrap();
+        assert!(
+            out.get("workdir").is_none(),
+            "没有车道的调用凭空报了一个工作目录：{out}"
         );
     }
 
@@ -2486,6 +2521,10 @@ mod tests {
         assert_eq!(out["state"], "running");
 
         // 命令还在跑，已经写出来的那一截读得到。
+        tx.send(CommandEvent::Workdir {
+            path: "/srv/worktrees/employee-kai-a9ab11fc".into(),
+        })
+        .unwrap();
         tx.send(CommandEvent::Stdout {
             data: "compiling crate A\n".into(),
         })
@@ -2534,6 +2573,10 @@ mod tests {
         assert_eq!(done["state"], "exited");
         assert_eq!(done["exit_code"], 3);
         assert_eq!(done["stderr"], "warning: unused import\n");
+        assert_eq!(
+            done["workdir"], "/srv/worktrees/employee-kai-a9ab11fc",
+            "执行器报出的工作目录要跟着输出一起回给模型：否则长命令跑完，读者仍不知道自己刚才在哪编译"
+        );
 
         let cursor = done["next_offset"].as_u64().unwrap();
         let again = registry
@@ -2646,34 +2689,15 @@ mod tests {
         let seen = backend.seen.lock().await.clone();
         assert_eq!(seen.len(), 3, "{seen:?}");
         assert_eq!(
-            seen[0].0, "unscoped-shell-ralph-3be244e0",
-            "an unscoped call is named after the agent making it: {seen:?}"
+            seen[0].0,
+            cog_core::worktree_lane("ralph-3be244e0"),
+            "an unscoped call lands in the calling agent's own checkout: {seen:?}"
         );
         assert!(
             seen.iter().all(|call| call.0 == seen[0].0),
             "every call one agent makes has to land in one workspace, or a write \
              is invisible to the read after it: {seen:?}"
         );
-    }
-
-    /// An agent id the executor would refuse is folded into one it accepts.
-    ///
-    /// The worktree router takes `[A-Za-z0-9_.-]` and refuses everything else,
-    /// while agent ids carry other bytes — a squad is spelled
-    /// `squad:<task id>`. Unfolded, every call from such an agent would fail
-    /// with "invalid task id for workspace routing" instead of running.
-    #[test]
-    fn an_agent_id_is_folded_into_a_workspace_name() {
-        assert_eq!(
-            workspace_name("squad:DSC-1A2B-generator"),
-            "squad-DSC-1A2B-generator"
-        );
-        assert_eq!(
-            workspace_name(".hidden"),
-            "hidden",
-            "a leading dot would name a hidden directory, which the router refuses"
-        );
-        assert_eq!(workspace_name(&"x".repeat(200)).len(), 96);
     }
 
     #[tokio::test]
@@ -2746,7 +2770,10 @@ mod tests {
             2,
             "an announced caller is not refused: {seen:?}"
         );
-        assert_eq!(seen[0].0, "unscoped-shell-squad-DSC-1A2B-generator");
+        assert_eq!(
+            seen[0].0,
+            cog_core::worktree_lane("squad:DSC-1A2B-generator")
+        );
         assert_eq!(
             seen[1].0, seen[0].0,
             "the second call landed in another workspace: {seen:?}"
