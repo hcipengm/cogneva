@@ -1,4 +1,4 @@
-use cog_agent::lifecycle::{HeartbeatConfig, LifecycleManager, StateTransitionHook};
+use cog_agent::lifecycle::{LifecycleManager, StateTransitionHook};
 use cog_core::{AgentState, StateBackend};
 use cog_storage::MemoryStateBackend;
 use std::sync::Arc;
@@ -74,27 +74,104 @@ async fn test_transition_hook_fired() {
     );
 }
 
+/// 一次失败的尝试不把员工从名册上判死。
+///
+/// 失败的是这一条活，不是这个人：循环还在、命令通道还开着，下一次派发照样能接。
+/// 把这一行写成 `Dead` 的话，监管者把它报成死的、再平衡把它排除在外，一个活着
+/// 的员工从此接不到活——而每一次失败都会再判一次，谁也不会因此收到一条错误。
 #[tokio::test]
-async fn test_heartbeat_marks_suspect_then_dead() {
-    let backend = mk_backend();
-    let mgr = LifecycleManager::new(backend.clone()).with_heartbeat_config(HeartbeatConfig {
-        interval_ms: 50,
-        suspect_threshold: 1,
-        dead_threshold: 2,
-    });
+async fn a_failed_attempt_does_not_take_the_employee_off_the_board() {
+    struct FailingLlm;
 
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for FailingLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            Err(cog_core::SFError::LLM("upstream is down".into()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            Err(cog_core::SFError::LLM("upstream is down".into()))
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            Err(cog_core::SFError::LLM("upstream is down".into()))
+        }
+
+        async fn health_check(&self) -> bool {
+            false
+        }
+    }
+
+    let backend = mk_backend();
+    let agent = cog_agent::Agent::new(
+        cog_core::RuntimeConfig {
+            agent_id: "a-1".into(),
+            max_iterations: 1,
+            ..Default::default()
+        },
+        Arc::new(FailingLlm),
+    )
+    .with_lifecycle(Arc::new(LifecycleManager::new(backend.clone())));
+    agent.start().await;
+    assert_eq!(
+        backend.get_agent_state("a-1").await.unwrap(),
+        Some(AgentState::Idle)
+    );
+
+    let outcome = agent
+        .prompt(serde_json::json!({"task": "the attempt fails"}))
+        .await;
+    assert!(outcome.is_err(), "这一次尝试本来就该失败");
+    assert_eq!(
+        backend.get_agent_state("a-1").await.unwrap(),
+        Some(AgentState::Idle),
+        "一次失败的尝试把员工判成了死的：它还在，下一次派发还要接活"
+    );
+
+    agent.retire().await;
+}
+
+/// 死是终点，回得来只有一条路：同一个工号重新登记。
+///
+/// 两条判据各自对付一边。`transition` 出不去，是为了让活着的对象没法把一行
+/// `Dead` 改回自己能干活的状态——那样「谁被判死了」就只是最后一次写入者的
+/// 说法。`register` 回得来，是因为同一个名字重新上岗是常态：旧对象被回收、
+/// 进程重启后同名重建、任务重跑再起一个。不回来的话，死过一次的员工从此读成
+/// `Dead`，监管者把它报成死的、再平衡把它排除在外——一个正在干活的员工接不到活。
+#[tokio::test]
+async fn test_dead_comes_back_only_through_registration() {
+    let backend = mk_backend();
+    let mgr = LifecycleManager::new(backend);
     mgr.register("a-1").await.unwrap();
     mgr.transition("a-1", AgentState::Registered).await.unwrap();
     mgr.transition("a-1", AgentState::Active).await.unwrap();
-    mgr.start_heartbeat("a-1").await;
+    mgr.transition("a-1", AgentState::Dead).await.unwrap();
 
-    // Wait for heartbeat to mark suspect then dead
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert!(
+        mgr.transition("a-1", AgentState::Active).await.is_err(),
+        "活着的对象不能把一行 Dead 改成自己能干活的状态"
+    );
+    assert_eq!(mgr.get_state("a-1").await.unwrap(), Some(AgentState::Dead));
 
-    let state = mgr.get_state("a-1").await.unwrap();
-    assert_eq!(state, Some(AgentState::Dead));
-
-    mgr.stop_heartbeat("a-1").await;
+    mgr.register("a-1").await.unwrap();
+    assert_eq!(
+        mgr.get_state("a-1").await.unwrap(),
+        Some(AgentState::Registered),
+        "同一个工号重新登记，这一行要回到「已登记」，而不是停在上一次的死上"
+    );
+    mgr.transition("a-1", AgentState::Idle).await.unwrap();
 }
 
 #[tokio::test]
@@ -230,4 +307,109 @@ async fn test_concurrent_transition_race() {
 
     let state = mgr.get_state("a-1").await.unwrap();
     assert_eq!(state, Some(AgentState::Active));
+}
+
+/// 同一个员工身上连着到的两条 Prompt，是两件活，不是一段对话。
+///
+/// 收件箱的 `Prompt` 说的是「开始一次新的运行」；「接着说」是 `Continue`，另一条。
+/// 员工无状态：上一轮留在窗口里的对话不属于这一次，这一次从账（尝试日志）与这条
+/// 消息重建。不重置的话，第二件活的首个请求里带着第一件活的请求与它工具的结果，
+/// 模型把那些当成这一件的前提——它不报错，它只是照着别人的活说。
+#[tokio::test]
+async fn two_inbox_prompts_on_one_employee_do_not_share_a_window() {
+    #[derive(Default)]
+    struct RecordingLlm {
+        calls: std::sync::Mutex<Vec<Vec<cog_core::Message>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for RecordingLlm {
+        async fn chat_stream(
+            &self,
+            messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            self.calls.lock().unwrap().push(messages.to_vec());
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            let text = r#"{"content":"ok","artifacts":[]}"#.to_string();
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let _ = producer
+                    .push(cog_core::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: text.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![cog_core::ContentBlock::text(text)],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("the kernel loop never asks for a single-shot completion")
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            unimplemented!("the kernel loop streams")
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    let llm = Arc::new(RecordingLlm::default());
+    let agent = cog_agent::Agent::new(
+        cog_core::RuntimeConfig {
+            agent_id: "a-inbox".into(),
+            max_iterations: 1,
+            ..Default::default()
+        },
+        llm.clone(),
+    );
+    agent.start().await;
+    for marker in ["inbox-first", "inbox-second"] {
+        agent
+            .handle_inbox(cog_core::InboxMessage::Prompt {
+                goal: serde_json::json!({ "task": format!("这一件活 {marker}") }),
+                reply_stream: None,
+                from_agent: None,
+            })
+            .await
+            .expect("投递的这一条要真的跑起来");
+    }
+
+    let calls = llm.calls.lock().unwrap();
+    let second = calls.last().expect("第二件活发出了它的请求");
+    assert!(
+        !second.iter().any(|m| m.content().contains("inbox-first")),
+        "第二件活的首个请求里带着第一件活的消息：员工把上一次运行留在了进程里"
+    );
+    assert!(
+        second.iter().any(|m| m.content().contains("inbox-second")),
+        "第二件活的请求没有进来：{second:?}"
+    );
+    drop(calls);
+    agent.retire().await;
 }

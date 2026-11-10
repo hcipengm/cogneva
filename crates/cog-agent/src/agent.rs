@@ -158,6 +158,12 @@ pub struct Agent {
 }
 
 struct AgentInner {
+    /// 这个对象这一刻的相位：开跑、忙、让位、离开。
+    ///
+    /// 不是持久面上的那一行。持久面（`LifecycleManager`）记的是「这一位在系统
+    /// 里处于什么状态」，读者是监管者、调度与界面；这一格随进程消失而消失，
+    /// 只回答「手里这个对象现在能不能派活」。两者同名不同物，混用就会让一次
+    /// 失败的尝试把一个人的持久状态写成死的——那是这个字段旁边唯一要守的界线。
     state: AgentState,
     cmd_tx: Option<mpsc::Sender<AgentCommand>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
@@ -467,13 +473,21 @@ impl Agent {
         inner.task_handle = Some(handle);
         inner.state = AgentState::Idle;
 
-        // Lifecycle integration: Init → Registered → Idle + heartbeat
+        // Lifecycle integration: Init → Registered → Idle。
+        //
+        // 登记失败要说出来：这一位会在持久面上没有行，而它照样会跑、照样花钱
+        // ——读面看到的是「这位员工不在任何一格上」，一个沉默的缺口。
         if let Some(ref lifecycle) = self.lifecycle {
             let agent_id = &self.config.agent_id;
-            let _ = lifecycle.register(agent_id).await;
+            if let Err(e) = lifecycle.register(agent_id).await {
+                tracing::warn!(
+                    agent_id,
+                    error = %e,
+                    "this employee could not be put on the lifecycle row; it will run without one"
+                );
+            }
             let _ = lifecycle.transition(agent_id, AgentState::Registered).await;
             let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
-            lifecycle.start_heartbeat(agent_id).await;
         }
 
         // Global registry integration: register this agent so supervisors
@@ -632,11 +646,16 @@ impl Agent {
                         let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
                     }
                 } else {
-                    inner.state = AgentState::Dead;
+                    // 这一条没答上来，不等于是个死人：循环还在，下一次派发照样
+                    // 能接活。把持久面写成 Dead 会让监管者把它报成死的、再平衡
+                    // 把它排除在外——一次失败的尝试就把一个活着的员工永久请出
+                    // 名册。真正死掉的是通道那一侧（下面 `Err(_)` 分支）：命令都
+                    // 没人接了，那才说明这个对象完了。
+                    inner.state = AgentState::Idle;
                     if let Some(ref lifecycle) = self.lifecycle {
-                        let _ = lifecycle
-                            .transition(&self.config.agent_id, AgentState::Dead)
-                            .await;
+                        let agent_id = &self.config.agent_id;
+                        let _ = lifecycle.transition(agent_id, AgentState::Completing).await;
+                        let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
                     }
                 }
                 result
@@ -689,11 +708,16 @@ impl Agent {
                         let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
                     }
                 } else {
-                    inner.state = AgentState::Dead;
+                    // 这一条没答上来，不等于是个死人：循环还在，下一次派发照样
+                    // 能接活。把持久面写成 Dead 会让监管者把它报成死的、再平衡
+                    // 把它排除在外——一次失败的尝试就把一个活着的员工永久请出
+                    // 名册。真正死掉的是通道那一侧（下面 `Err(_)` 分支）：命令都
+                    // 没人接了，那才说明这个对象完了。
+                    inner.state = AgentState::Idle;
                     if let Some(ref lifecycle) = self.lifecycle {
-                        let _ = lifecycle
-                            .transition(&self.config.agent_id, AgentState::Dead)
-                            .await;
+                        let agent_id = &self.config.agent_id;
+                        let _ = lifecycle.transition(agent_id, AgentState::Completing).await;
+                        let _ = lifecycle.transition(agent_id, AgentState::Idle).await;
                     }
                 }
                 result
@@ -758,7 +782,6 @@ impl Agent {
     pub async fn abort(&self) -> SFResult<()> {
         if let Some(ref lifecycle) = self.lifecycle {
             let agent_id = &self.config.agent_id;
-            let _ = lifecycle.stop_heartbeat(agent_id).await;
             let _ = lifecycle.transition(agent_id, AgentState::Completing).await;
             let _ = lifecycle.transition(agent_id, AgentState::Inactive).await;
         }
@@ -829,7 +852,6 @@ impl Agent {
 
         if let Some(ref lifecycle) = self.lifecycle {
             let agent_id = &self.config.agent_id;
-            let _ = lifecycle.stop_heartbeat(agent_id).await;
             let _ = lifecycle.transition(agent_id, AgentState::Inactive).await;
         }
         if let Some(ref registry) = self.registry {
@@ -1293,6 +1315,17 @@ impl Agent {
             InboxMessage::Prompt {
                 goal, reply_stream, ..
             } => {
+                // 一条 Prompt 是「开始一次新的运行」，不是「接着说」——后者是
+                // `Continue`，下面那一条。员工无状态：上一轮留在窗口里的对话
+                // 不属于这一次，这一次从账（尝试日志）与这条消息重建。要接着
+                // 中断的那次尝试往下跑，靠的是日志续跑——它只在这一次运行有主
+                // 的任务（日志键由任务与角色算出来）时发生，铺回的就是那份账，
+                // 不是这个窗口。
+                //
+                // 不清的话，同一个对象连着收到的两条活会接成一段对话：模型读到
+                // 上一件活的请求与它工具的结果，并把那些当成这一件的前提——它不
+                // 报错，它只是照着别人的活说。
+                self.reset().await?;
                 let out = self.prompt(goal).await?;
                 if let Some(stream) = reply_stream {
                     publish_inbox_reply(self.message_backend.as_ref(), &stream, &out).await?;
@@ -1475,7 +1508,6 @@ impl Drop for Agent {
             let agent_id = self.config.agent_id.clone();
             let lifecycle = lifecycle.clone();
             finish_off_thread(async move {
-                lifecycle.stop_heartbeat(&agent_id).await;
                 let _ = lifecycle.transition(&agent_id, AgentState::Inactive).await;
             });
         }

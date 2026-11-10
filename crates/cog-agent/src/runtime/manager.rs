@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::Agent;
+use crate::{Agent, LifecycleManager};
 use cog_core::{
     AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, SFResult, StateBackend,
 };
@@ -73,6 +73,13 @@ pub struct GlobalAgentManager {
     registry: Arc<dyn AgentRegistry>,
     message_backend: Arc<dyn MessageBackend>,
     state_backend: Arc<dyn StateBackend>,
+    /// 员工生命周期的那台机器，交给池子里每一个新对象。
+    ///
+    /// 放在管理器上而不是逐个新建：它只包着同一本 `StateBackend`，池子里的
+    /// 对象共享同一张转换表与同一个持久面。挂上它，池子里每个员工在开跑时
+    /// 就有一行可读的状态，监管者的健康判决与再平衡才有东西可读——不挂的
+    /// 时候一切照跑，只是「谁在什么状态」这件事在持久面上从来没有答案。
+    lifecycle: Arc<LifecycleManager>,
     workers: RwLock<Vec<WorkerHandle>>,
     round_robin: Mutex<usize>,
     default_runtime_config: cog_core::RuntimeConfig,
@@ -151,10 +158,12 @@ impl GlobalAgentManager {
         message_backend: Arc<dyn MessageBackend>,
         state_backend: Arc<dyn StateBackend>,
     ) -> Self {
+        let lifecycle = Arc::new(LifecycleManager::new(state_backend.clone()));
         Self {
             registry,
             message_backend,
             state_backend,
+            lifecycle,
             workers: RwLock::new(Vec::new()),
             round_robin: Mutex::new(0),
             // The rest comes from the one default rather than a second copy of
@@ -382,7 +391,8 @@ impl GlobalAgentManager {
                 .with_registry(self.registry.clone())
                 .with_registration(registration)
                 .with_message_backend(self.message_backend.clone())
-                .with_state_backend(self.state_backend.clone());
+                .with_state_backend(self.state_backend.clone())
+                .with_lifecycle(self.lifecycle.clone());
             if let Some(secs) = self.heartbeat_interval_secs {
                 a = a.with_heartbeat_interval(secs);
             }
@@ -648,7 +658,8 @@ impl cog_core::AgentManager for GlobalAgentManager {
                 .with_registry(self.registry.clone())
                 .with_registration(registration)
                 .with_message_backend(self.message_backend.clone())
-                .with_state_backend(self.state_backend.clone());
+                .with_state_backend(self.state_backend.clone())
+                .with_lifecycle(self.lifecycle.clone());
             if let Some(secs) = self.heartbeat_interval_secs {
                 a = a.with_heartbeat_interval(secs);
             }

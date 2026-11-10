@@ -132,6 +132,13 @@ pub struct HealthChecker {
     registry: Arc<AgentRegistry>,
     state_backend: Arc<dyn StateBackend>,
     cfg: HealthCheckerConfig,
+    /// 这一台看着的每一格是从哪一刻起就是这一格的（见 [`Self::observed_since`]）。
+    ///
+    /// 只在 `Active` 的「多久」上用到，但每一格都记：从 `Idle` 换过来的那一刻
+    /// 才是起点，不记 `Idle` 就会把「上一次被看见」当成「换格的那一刻」。
+    /// 与这一拍判过的人同寿命，离开舰队的 id 在换班时被清掉。
+    observed:
+        std::sync::RwLock<std::collections::HashMap<String, (AgentState, chrono::DateTime<Utc>)>>,
 }
 
 impl HealthChecker {
@@ -144,7 +151,34 @@ impl HealthChecker {
             registry,
             state_backend,
             cfg,
+            observed: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// 这一格是从哪一刻起就是这一格的。
+    ///
+    /// `seed` 是第一次看见这一位时的起点（`AgentInfo::state_since`）。之后只要
+    /// 读到的格与上一次相同，起点不动；格变了，起点就是现在。持久面那一格没有
+    /// 时间戳，这份观察是「多久」唯一的来源——没有它，判据只能退回「这个进程
+    /// 多久前第一次看见这个人」，那与「它在这一格里待了多久」无关。
+    fn observed_since(
+        &self,
+        agent_id: &str,
+        state: AgentState,
+        seed: chrono::DateTime<Utc>,
+        now: chrono::DateTime<Utc>,
+    ) -> chrono::DateTime<Utc> {
+        let mut observed = self
+            .observed
+            .write()
+            .expect("the observed-state table is poisoned");
+        let entry = observed
+            .entry(agent_id.to_string())
+            .or_insert_with(|| (state, seed.min(now)));
+        if entry.0 != state {
+            *entry = (state, now);
+        }
+        entry.1
     }
 
     /// Run a single health check pass over the registry.
@@ -203,6 +237,15 @@ impl HealthChecker {
                 .ok()
                 .flatten();
 
+            // 持久面那一格没有时间戳，起点由这里自己记：读到的格与上一拍不同，
+            // 就是刚换的；第一次看见某一位时用它的 `state_since` 作起点——那是
+            // 这个进程第一次看见它的时刻，对一个新登记的员工就是登记时刻。
+            //
+            // 记在判死之前：被判死、被判可疑的那几拍也要记。否则一个掉线又回来
+            // 的员工换到 Active 时，起点还停在很久以前的那一拍，一回来就「卡住」。
+            let seen_at = backend_state
+                .map(|state| self.observed_since(&agent.agent_id, state, agent.state_since, now));
+
             if let Some(AgentState::Dead) = backend_state {
                 report.dead.push((
                     agent.agent_id.clone(),
@@ -239,10 +282,14 @@ impl HealthChecker {
             }
 
             // 3. Stuck detection — Agent has been in Active too long.
-            if matches!(backend_state, Some(AgentState::Active)) {
-                let active_for = (now - agent.state_since)
-                    .to_std()
-                    .unwrap_or(Duration::from_secs(0));
+            //
+            // 「多久」从这一格**被看见为这一格**的那一刻算，不从员工被这个进程
+            // 第一次看见的时刻算。两者在员工活过十分钟之后完全不是一回事：
+            // 一个开工不到一分钟的员工，按 first-seen 算已经「在 Active 待了
+            // 三小时」，于是每一拍都被判卡住，而它正在干活。
+            if backend_state == Some(AgentState::Active) {
+                let since = seen_at.unwrap_or(agent.state_since);
+                let active_for = (now - since).to_std().unwrap_or(Duration::from_secs(0));
                 if active_for >= self.cfg.stuck_after {
                     report.stuck.push((
                         agent.agent_id.clone(),
@@ -308,6 +355,14 @@ impl HealthChecker {
                      have refreshed their verdict again"
                 );
             }
+        }
+
+        // 观察表与这一拍判过的人同寿命：一个已经离开舰队的 id 不再占一格，否则
+        // 这张表会像上面那张一样只增不减——每多一个一次性角色就多一条永不回收的
+        // 记录，而它读的东西从那一拍起再也用不上。
+        if let Ok(mut observed) = self.observed.write() {
+            let judged: HashSet<&str> = agents.iter().map(|a| a.agent_id.as_str()).collect();
+            observed.retain(|id, _| judged.contains(id.as_str()));
         }
 
         Ok(report)

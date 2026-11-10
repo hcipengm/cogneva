@@ -88,6 +88,44 @@ async fn stuck_active_agent_detected() {
     assert_eq!(report.stuck.len(), 1);
 }
 
+/// 一个被这个进程看见很久的员工刚刚开工，不算卡住。
+///
+/// 「卡住」问的是「在这一格里连续待了多久」，而 `AgentInfo::state_since` 记的
+/// 是这个进程第一次看见这一位（或它注册）的时刻。员工池子里的人一活就是几小时，
+/// 两者完全不是一回事：按 first-seen 算，任何一个开工不到一分钟的员工都已经
+/// 「在 Active 待了三小时」，体检每一拍都把它判成卡住，而它正在正常干活——
+/// 持久面有那一格之后，这条误报每一拍都会点亮一次，真正卡住的那个被它埋掉。
+///
+/// 判据落在「格变了的那一刻」：第一拍看见 Idle（起点是它登记的时刻），第二拍
+/// 看见 Active——起点必须是第二拍，不是第一拍。
+#[tokio::test]
+async fn an_agent_that_just_started_working_is_not_stuck() {
+    let reg = fresh_registry();
+    let mut agent = make_agent("a-1", 1);
+    // 这一位在这个进程里已经待了很久。
+    agent.state_since = Utc::now() - chrono::Duration::seconds(700);
+    reg.register_agent(agent);
+
+    let backend = Arc::new(MemoryStateBackend::new());
+    backend
+        .set_agent_state("a-1", &AgentState::Idle)
+        .await
+        .unwrap();
+    let checker = HealthChecker::new(reg, backend.clone(), HealthCheckerConfig::default());
+    let report = checker.check().await.unwrap();
+    assert!(report.stuck.is_empty(), "还没开工就判卡住：{report:?}");
+
+    backend
+        .set_agent_state("a-1", &AgentState::Active)
+        .await
+        .unwrap();
+    let report = checker.check().await.unwrap();
+    assert!(
+        report.stuck.is_empty(),
+        "开工不到一拍就被判卡住：起点该是换到 Active 的那一刻，而不是这个进程第一次看见它的那一刻——{report:?}"
+    );
+}
+
 // ─── 舰队名单决定这一拍可以忘掉谁 ────────────────────────────────────
 //
 // 这张表只增不减时，每一个曾经存在过的 id 都被永久判死：每拍重新判一次死、重新点亮

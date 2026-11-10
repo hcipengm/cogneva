@@ -108,7 +108,7 @@ pub use hooks::{
     HookEngineConfig, HookHandler, HookPublisher, HookType, LifecycleHookEngine,
     LifecycleHookEvent, TieredHookPublisher, DEFAULT_LIFECYCLE_CHANNEL_BUFFER,
 };
-pub use lifecycle::{HeartbeatConfig, LifecycleManager, StateTransitionHook};
+pub use lifecycle::{LifecycleManager, StateTransitionHook};
 pub use observable::AgentObservable;
 pub use runtime::{GlobalAgentManager, WorkerHandle};
 pub use tools::builtins;

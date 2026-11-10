@@ -259,3 +259,182 @@ async fn one_employee_is_the_same_name_everywhere() {
         "工作树车道名 `{lane}` 回不到 {AGENT_ID}：树与人对不上，产出落在哪棵树上就读不出来"
     );
 }
+
+/// 一轮结束，员工进程里不留下一轮要用的东西；生命周期那一行只由系统侧写。
+///
+/// 「员工无状态、系统有状态机」这句话在树上有四个可以错的落点，每一个错了都
+/// 不会报：
+///
+/// - 员工自带一个心跳倒计时。它数的是自己发的 tick，从不看对方有没有回应，
+///   于是接上它的每个员工都会在几十秒后被自己判死——系统宣布一个正在干活的
+///   员工死了，而没有任何一方报错。存活的证据是名册上的心跳与监管者的健康
+///   报告，不是这里。
+/// - 员工对象直接写生命周期那一行（`set_agent_state` / `cas_agent_state`）。
+///   每多一处绕开转换表的写法，「死是终点」「状态只有一格」就少一条保证。
+/// - 内核换了一件活，还接着上一件活留在窗口里的消息说。第二件活的首个请求里
+///   带着第一件活的请求与工具结果，模型会拿别人的活当前提——它不报错，它照着
+///   别人的活往下说。
+/// - 界面那一轮用的是「接着说」的入口，历史来自进程而不是调用方。那样同一段
+///   对话的上下文就在进程里跨轮累积，谁也不再知道模型这一轮到底读到了哪几句。
+#[tokio::test]
+async fn a_turn_leaves_no_state_behind() {
+    let root = repo_root();
+
+    // 一、没有自己的倒计时。
+    for needle in ["start_heartbeat", "HeartbeatConfig"] {
+        let hits = mentions(needle);
+        assert!(
+            hits.is_empty(),
+            "树上还有 `{needle}`：一个数自己 tick 的心跳会把活着的员工判死，\
+             而存活证据在名册心跳与健康报告里。命中的是 {hits:?}"
+        );
+    }
+
+    // 二、那一行状态的写点：生命周期那台机器，和监管者按健康报告下的判决。
+    let mut writers = BTreeSet::new();
+    for needle in [".set_agent_state(", ".cas_agent_state("] {
+        writers.extend(mentions(needle).into_keys());
+    }
+    let known: BTreeSet<String> = [
+        "crates/cog-agent/src/lifecycle.rs",
+        "crates/cog-supervisor/src/lifecycle_coordinator.rs",
+        "crates/cog-supervisor/src/registry.rs",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        writers, known,
+        "员工生命周期那一行出现了新的写点：{writers:?}。它只该由那台校验转换表的\
+         机器（`lifecycle.rs`）与监管者写——员工对象、对话、插件直接写它，就绕开了\
+         「死是终点」和「一次只有一格」这两条"
+    );
+
+    // 三、界面里的那一轮铺的是调用方给的历史，不是进程里留着的。
+    let conversation = std::fs::read_to_string(root.join("crates/cogneva/src/conversation.rs"))
+        .expect("conversation.rs readable");
+    let conversation_lines = production_lines(&conversation);
+    assert!(
+        conversation_lines
+            .iter()
+            .any(|line| line.contains("run_conversation(")),
+        "界面的那一轮没有再走「调用方交来整段历史」的入口：进程里留下的消息会跟着\
+         下一轮一起进去，模型读到的是哪几句就没人说得清了"
+    );
+    assert!(
+        !conversation_lines
+            .iter()
+            .any(|line| line.contains(".continue_(")),
+        "界面那一轮改走 `continue_`：历史从此来自进程而不是调用方，同一段对话的\
+         上下文跨轮累积，而读面看到的是每轮都只有一句新话"
+    );
+
+    // 四、内核：换了一件活的那一次运行，窗口里没有上一件活的消息。
+    //
+    // 读的是模型真正收到的那一份请求。判据必须落在这一侧：只要上一件活的消息
+    // 还在窗口里，写不写、写多少都由这一次渲染决定，而模型是不是拿它当前提，
+    // 只能从它收到的字节里看。
+    let llm = RecordingLlm::default();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<cog_core::AgentEvent>(64);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let config = cog_core::RuntimeConfig {
+        agent_id: "gate-turn-leaves-nothing".into(),
+        max_iterations: 1,
+        think_stall_timeout_secs: 5,
+        final_draft_timeout_secs: 300,
+        ..Default::default()
+    };
+    let mut runtime = cog_agent::AgentRuntime::new(config, tx);
+    for (task, marker) in [
+        ("gate-turn-task-a", "上一件活 gate-turn-first"),
+        ("gate-turn-task-b", "这一件活 gate-turn-second"),
+    ] {
+        runtime
+            .run_scoped(serde_json::json!({"task": marker}), &llm, Some(task))
+            .await
+            .expect("the run delivers");
+    }
+    let calls = llm.calls();
+    let second = calls.last().expect("the second run made a call");
+    assert!(
+        !second
+            .iter()
+            .any(|m| m.content().contains("gate-turn-first")),
+        "第二件活的首个请求里带着第一件活的消息：员工把上一次运行留在了进程里"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|m| m.content().contains("gate-turn-second")),
+        "第二件活的请求没有进来：{second:?}"
+    );
+}
+
+/// 只记下每次调用收到的消息，回一句可交付的空结果。
+#[derive(Default)]
+struct RecordingLlm {
+    calls: std::sync::Mutex<Vec<Vec<cog_core::Message>>>,
+}
+
+impl RecordingLlm {
+    fn calls(&self) -> Vec<Vec<cog_core::Message>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::LlmClient for RecordingLlm {
+    async fn chat_stream(
+        &self,
+        messages: &[cog_core::Message],
+        _options: &cog_core::ChatOptions,
+    ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let (stream, producer) = cog_core::EventStream::with_capacity(4);
+        let text = r#"{"content":"ok","artifacts":[]}"#.to_string();
+        tokio::spawn(async move {
+            let mut producer = producer;
+            let _ = producer
+                .push(cog_core::AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: text.clone(),
+                    timestamp: chrono::Utc::now(),
+                })
+                .await;
+            producer.end(cog_core::ChatResponse {
+                content: vec![cog_core::ContentBlock::text(text)],
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                response_id: None,
+                usage: cog_core::Usage::default(),
+                stop_reason: cog_core::StopReason::Stop,
+                error_message: None,
+                upstream_failure: None,
+                retry_after_secs: None,
+                timestamp: chrono::Utc::now(),
+            });
+        });
+        Ok(stream)
+    }
+
+    async fn complete_stream(
+        &self,
+        _prompt: &str,
+        _options: &cog_core::CompleteOptions,
+    ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+        unimplemented!("the kernel loop never asks for a single-shot completion")
+    }
+
+    async fn chat(
+        &self,
+        _messages: &[cog_core::Message],
+        _options: &cog_core::ChatOptions,
+    ) -> cog_core::SFResult<cog_core::ChatResponse> {
+        unimplemented!("the kernel loop streams")
+    }
+
+    async fn health_check(&self) -> bool {
+        true
+    }
+}

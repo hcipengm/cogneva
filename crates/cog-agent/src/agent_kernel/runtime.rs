@@ -462,6 +462,21 @@ pub struct AgentRuntime {
     /// Held on the runtime rather than threaded through every call site because
     /// it is a property of the run, exactly like the usage totals beside it.
     run_task_id: Option<String>,
+    /// 上一次运行替哪件活干的（`begin_scoped_run` 收到的那一个）。
+    ///
+    /// 与上面那个不同：那个是「这一次运行」，运行结束就清；这个跨运行留着，
+    /// 只回答一个问题——这一次的活还是不是上一次那一件。换了活的那一刻，上一件
+    /// 活留在进程里的对话不再属于这一次：员工无状态，下一次从账与收件箱重建
+    /// （见 `begin_scoped_run`）。
+    last_run_task: Option<String>,
+    /// 这个进程里已经跑过至少一次（`begin_scoped_run` 置位，永不回零）。
+    ///
+    /// 用来分开「换了另一件活」与「这是本进程的第一次」：两者在 `last_run_task`
+    /// 上都是 `None -> Some`，但第一次要接着读上一次进程留下的尝试日志，换了活
+    /// 的那一次不能读。
+    run_seen: bool,
+    /// 这一次运行不接日志续跑（由 `begin_scoped_run` 置位，`run_turns` 读掉即清）。
+    resume_is_from_another_task: bool,
     /// 名册。有它才读得到自己那一行的工号与名字（见 `absorb_base_instruction`）。
     roster: Option<Arc<dyn cog_core::AgentRegistry>>,
     /// 这一位在人前的名字，`E0412 林清和`。每轮开头读一次名册，读到了就留着。
@@ -1106,6 +1121,9 @@ impl AgentRuntime {
             tool_output_archive: None,
             run_usage: RunUsage::default(),
             run_task_id: None,
+            last_run_task: None,
+            run_seen: false,
+            resume_is_from_another_task: false,
             run_iterations: 0,
             resumed_turns: 0,
             run_outcome: None,
@@ -1791,6 +1809,39 @@ impl AgentRuntime {
         // Set before the first call and cleared at the only exit, so a run that
         // was started without an identity cannot inherit the previous one.
         self.run_task_id = run_task_id.map(str::to_string);
+        // 一换活，上一件活留在进程里的对话就不属于这一次了。
+        //
+        // 员工无状态：一轮结束进程里不留跨轮的上下文，下一次从账（尝试日志）、
+        // 收件箱与任务读回来。同一个对象先后被两件活用过时，第二件活如果接着
+        // 上一件的第一条消息往下说，模型读到的是别人的请求与别人工具的结果，
+        // 并把这些当成自己的前提——它不会报错，它只是照着别人的活说。
+        //
+        // 同一件活的重跑不清：那是同一段对话的继续，日志续跑也从这个窗口重建
+        // （见 `resume_from_journal`）；没有日志可续时窗口里留着的正是上一次
+        // 尝试读到的那一份，清掉等于把一次真实的续跑变成一次重来。没有任务
+        // 身份的运行（`continue_`、界面里的一段对话）也不清：那是调用方明说
+        // 要接着说下去的，对话那一侧自己每轮铺一遍历史。
+        //
+        // 这个进程里的第一次运行不算「换了活」（`run_seen`）：那一次要接着读
+        // 上一次进程留下的尝试日志，正是续跑存在的理由。
+        let other_task =
+            self.run_seen && run_task_id.is_some() && self.last_run_task.as_deref() != run_task_id;
+        if other_task {
+            self.context.clear();
+            // 系统前缀里那两段随上下文一起没了，「上一轮并进去的是哪一段」的
+            // 记录也要跟着清：不清的话规则那一段会被认为还在里面，这一次运行
+            // 读到的规则一条都没有。
+            self.principles_note = None;
+            self.identity_note = None;
+            // 下面这一位还会让这一次运行不接日志续跑：日志的键是这一位自己的
+            // 名字，里面是另一件活走到一半的对话——续上就等于把它从账上搬了
+            // 回来，上面清掉的窗口又从账上长回来（见 `run_turns`）。
+        }
+        // 每一次运行都重新置这一位：上一次置过而这一次没走到读它的那一步
+        // （比如 `begin_run` 就拒绝了），不能替下一次运行决定读不读日志。
+        self.resume_is_from_another_task = other_task;
+        self.run_seen = true;
+        self.last_run_task = run_task_id.map(str::to_string);
         // 新的一次尝试从「刚刚动过」开始，而不是从上一轮留下的时刻开始。上一轮
         // 的读数如果留着，重试的第一拍就会被判成停住——判据本身没错，它读到的
         // 是另一个尝试的时刻。第一次心跳不产生间隔样本（没有前驱），所以这里
@@ -2345,7 +2396,20 @@ impl AgentRuntime {
         // 放在契约与输入之前：那两段是**这一次尝试**才有的东西，历史消息排在
         // 它们后面。先续、再铺这次的请求，模型的请求就是「同一段说话的继续」，
         // 上游的前缀缓存也从第一个字节起就命中。
-        self.resume_from_journal().await;
+        //
+        // 换了一件活的那一次不读：日志的键是这一位自己的名字，里面是另一件活
+        // 走到一半的对话。读回来，上面清掉的窗口又从账上长回来。
+        if self.resume_is_from_another_task {
+            self.resume_is_from_another_task = false;
+            tracing::info!(
+                agent_id = %self.config.agent_id,
+                task_id = run_task_id.unwrap_or(""),
+                "this run is for a different task than the attempt in the journal; starting from \
+                 the request instead of resuming another task's conversation"
+            );
+        } else {
+            self.resume_from_journal().await;
+        }
 
         // 刚被要求停下：连这一次尝试的请求都不再铺开。日志的最后一行还是
         // 上一次落下的那条有结果的调用，下一次派发从它后面接上——不多记一条
@@ -6178,6 +6242,56 @@ mod tests {
         assert!(
             second.contains("\"id\":\"t2\""),
             "换了的请求必须整块出现，否则这一轮就没有任务可做：{second}"
+        );
+    }
+
+    /// 同一件活的第二次尝试接着上一次说；换了一件活的那一次不带上一件活的消息。
+    ///
+    /// 员工无状态：一轮结束，进程里不留跨轮的上下文，下一次从账（尝试日志）、
+    /// 收件箱与任务读回来。同一个对象先后替两件活干过时，第二条活的请求里若还
+    /// 带着第一条活的消息，模型会拿别人的请求与工具结果当前提——它不会报错，
+    /// 它只是照着别人的活往下说。反过来，同一件活的重跑必须还看得见自己上一次
+    /// 走到了哪——那是同一段对话的继续，日志续跑也从这里重建。
+    #[tokio::test]
+    async fn a_run_for_a_new_task_starts_without_the_previous_tasks_messages() {
+        let llm = RecordingLlm::default();
+        let mut runtime = census_runtime("task-identity-resets-context");
+        let first = "第一件活的请求 identity-reset-first";
+        let second = "第一件活的第二次尝试 identity-reset-second";
+        let other = "另一件活的请求 identity-reset-other";
+        for (task, marker, attempt) in [
+            ("identity-reset-task-a", first, 1),
+            ("identity-reset-task-a", second, 2),
+            ("identity-reset-task-b", other, 1),
+        ] {
+            runtime
+                .run_scoped(
+                    serde_json::json!({"task": marker, "context": {"attempt": attempt}}),
+                    &llm,
+                    Some(task),
+                )
+                .await
+                .expect("the run delivers");
+        }
+
+        let calls = llm.calls();
+        assert_eq!(calls.len(), 3, "每一次运行都花了一次调用");
+        let retry = &calls[1];
+        assert!(
+            retry.iter().any(|m| m.content().contains(first)),
+            "同一件活的重跑读不到上一次自己说过什么：这会把一次续跑变成一次重来"
+        );
+        let other_task = &calls[2];
+        assert!(
+            !other_task
+                .iter()
+                .any(|m| m.content().contains("identity-reset-first")
+                    || m.content().contains("identity-reset-second")),
+            "换了一件活的那次请求里还带着上一件活的消息：员工把上一次运行留在了进程里"
+        );
+        assert!(
+            other_task.iter().any(|m| m.content().contains(other)),
+            "新一件活的请求没有进来：{other_task:?}"
         );
     }
 
