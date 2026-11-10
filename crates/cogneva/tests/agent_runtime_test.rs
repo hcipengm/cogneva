@@ -22,6 +22,7 @@ async fn test_agent_loop_completes_without_tools() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -69,6 +70,7 @@ async fn test_agent_loop_state_transitions() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -97,6 +99,7 @@ async fn test_agent_loop_steps_recorded() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -126,6 +129,7 @@ async fn test_agent_loop_max_iterations() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -168,6 +172,7 @@ async fn test_agent_loop_chat_stream_returns_raw_stream() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -211,6 +216,7 @@ async fn test_agent_loop_checkpoint() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -244,6 +250,7 @@ async fn test_react_loop_wraps_agent_loop() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -269,6 +276,7 @@ async fn test_react_loop_emits_react_events() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -325,6 +333,7 @@ async fn test_react_loop_steps_extracted_correctly() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     );
@@ -378,6 +387,7 @@ async fn test_agent_runtime_discovers_dynamically_registered_tool() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     )
@@ -449,6 +459,7 @@ fn runtime_with_one_tool(
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         event_tx,
     )

@@ -44,6 +44,12 @@ pub struct SquadConfig {
     pub boundary_config: Option<crate::BoundaryConfig>,
     /// true = 这是一个 self_evolution 任务；使用更激进的短路径以控制延迟。
     pub is_self_evolution: bool,
+    /// 这件活自己声称要交一份改动（`Task::declares_change`）。
+    ///
+    /// 只有接下「产出这份改动」那一份活的角色拿到它：同一件任务上做评审的人
+    /// 不该因为工作树没动被收住，而做变更的人该。所以它不是「这件任务整体是
+    /// 不是变更」，是这一份活要不要动手。
+    pub declares_change: bool,
     /// 通过 Skill ID 指定 Planner 角色的 prompt/schema 来源（None = 内置默认）。
     pub planner_skill_id: Option<String>,
     /// 通过 Skill ID 指定 Generator 角色的 prompt/schema 来源。
@@ -63,6 +69,7 @@ impl Default for SquadConfig {
             profile: None,
             boundary_config: None,
             is_self_evolution: false,
+            declares_change: false,
             planner_skill_id: None,
             generator_skill_id: None,
             evaluator_skill_id: None,
@@ -458,6 +465,7 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::PLANNER,
+                false,
             )
             .await
             {
@@ -510,6 +518,7 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::GENERATOR,
+                squad.config.declares_change,
             )
             .await
             {
@@ -529,6 +538,7 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::EVALUATOR,
+                false,
             )
             .await
             {
@@ -603,6 +613,7 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::PLANNER,
+                    false,
                 )
                 .await;
                 let generator = crate::resume::create_role_agent(
@@ -611,6 +622,7 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::GENERATOR,
+                    squad.config.declares_change,
                 )
                 .await;
                 let evaluator = crate::resume::create_role_agent(
@@ -619,6 +631,7 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::EVALUATOR,
+                    false,
                 )
                 .await;
                 // Moderator is optional — failure to create it is non-fatal.
@@ -628,6 +641,7 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::MODERATOR,
+                    false,
                 )
                 .await
                 .ok();
@@ -757,6 +771,7 @@ impl SquadExecutor {
                                 deps.state_backend.as_ref(),
                                 &squad.task_id,
                                 cog_core::roles::MERGER,
+                                false,
                             )
                             .await
                             {

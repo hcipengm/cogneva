@@ -858,6 +858,17 @@ pub const INPUT_PRINCIPLES: &str = "principles";
 /// for the reason the markers above state.
 pub const INPUT_READY_LANE: &str = "ready_lane";
 
+/// The `task.input` key by which a task says its work changes the checkout.
+///
+/// 「这件活要动工作树」是任务自己的事，不是接手的人是谁的事。按角色判时，同一个
+/// 人接了另一类活就判错：一位工程师做评审时被当成该写树的（于是被「半小时没动」
+/// 收住），而一个小队队员做变更时被当成只读的（于是绕圈一小时没人叫停）。生产
+/// 者在提交时说清楚这一件活要交什么，读的人只问任务。
+///
+/// 写成键而不是一句话，理由与上面几个标记相同：两端各拼一遍，写的那一端继续写
+/// 旧词、读的那一端比对新词，任务只是安静地不再被认出来。
+pub const INPUT_DECLARES_CHANGE: &str = "declares_change";
+
 /// The lane for work that must run before ordinary work, whether or not the
 /// ordinary lane is full.
 ///
@@ -1044,6 +1055,28 @@ impl Task {
                 .get(INPUT_EVOLUTION_MODE)
                 .and_then(|v| v.as_str())
                 == Some(EVOLUTION_MODE_GENERATE_CHANGE)
+    }
+
+    /// 这件活要不要动工作树——由任务说，不由接手的人的角色说。
+    ///
+    /// 两种声明都算数：
+    ///
+    /// - 输入里明说（[`INPUT_DECLARES_CHANGE`] 为真）。生产者在提交时知道这一件
+    ///   活要交一份改动还是只交一段结论。
+    /// - 自进化生成变更这一类（[`Self::is_self_evolution`]）。它的标记本身就是
+    ///   「产出一份变更」那句话，再让生产者抄一遍只是多一个会漂的副本。
+    ///
+    /// 读的人要的是「这一件活得改树吗」，问出来的答案只取决于任务本身：同一个人
+    /// 接了另一件活，答案跟着那件活变；角色标签怎么变都不影响它。
+    pub fn declares_change(&self) -> bool {
+        let named = match self.input.get(INPUT_DECLARES_CHANGE) {
+            Some(serde_json::Value::Bool(flag)) => *flag,
+            Some(serde_json::Value::String(word)) => {
+                matches!(word.trim(), "true" | "yes" | "1")
+            }
+            _ => false,
+        };
+        named || self.is_self_evolution()
     }
 
     /// The producer's own spelling of this task's entry point, or `None` for a
@@ -1344,6 +1377,46 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(task.is_self_evolution());
+    }
+
+    /// 要不要动工作树是任务说的，且换个任务答案就跟着变。
+    ///
+    /// 旧判据问的是接手的人的角色：同一位工程师做评审时被当成「该写树的」，
+    /// 做变更时若不是 generator 又被当成「只读的」。这里把同一份输入换一换，
+    /// 只看任务的声明变不变。
+    #[test]
+    fn a_task_says_whether_its_work_changes_the_checkout() {
+        let writes = Task::new(
+            "t-review",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ "goal": "raise the timeout", INPUT_DECLARES_CHANGE: true }),
+        );
+        let reads = Task::new(
+            "t-review",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ "goal": "read the timeout" }),
+        );
+        assert!(writes.declares_change());
+        assert!(!reads.declares_change());
+
+        // 生产者从环境里读来的配置常常是字符串。
+        let spelled = Task::new(
+            "t-spelled",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DECLARES_CHANGE: "true" }),
+        );
+        assert!(spelled.declares_change());
+
+        // 自进化的生成变更那类任务，标记本身就是声明。
+        let evolution = Task::new(
+            "t-evo",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({}),
+        );
+        assert!(
+            evolution.declares_change(),
+            "自进化生成变更的任务没有另抄一遍声明就该被认出来"
+        );
     }
 
     #[test]

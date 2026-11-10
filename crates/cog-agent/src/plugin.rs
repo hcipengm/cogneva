@@ -509,8 +509,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // 人不会撞名。从前这里写着 `eval-agent`——名册上没有、工号也没有的
         // 一个名字：账上读不出这次判词是谁写的，同事也没法给它发消息。
         let eval_employee = crate::identity::name_for(
-            &format!("{}:evaluator", crate::identity::agent_instance()),
-            "evaluator",
+            &format!("{}:{}", crate::identity::agent_instance(), cog_core::roles::EVALUATOR),
+            cog_core::roles::EVALUATOR,
             0,
         );
         let eval_config = cog_core::RuntimeConfig {
@@ -525,6 +525,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            // 评测不是一件要动工作树的活。
+            declares_change: false,
         };
         let mut eval_runtime = crate::AgentRuntime::new(eval_config, eval_event_tx)
             .with_tools(tool_registry.as_ref().clone())

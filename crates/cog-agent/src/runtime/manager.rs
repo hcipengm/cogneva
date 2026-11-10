@@ -601,6 +601,19 @@ impl cog_core::AgentManager for GlobalAgentManager {
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
         task_id: Option<&str>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
+        // 没有声明：调用方没带任务，答不出这件活要不要动树。
+        self.create_agent_declaring(agent_id, role, llm, task_id, false)
+            .await
+    }
+
+    async fn create_agent_declaring(
+        &self,
+        agent_id: &str,
+        role: &str,
+        llm: std::sync::Arc<dyn cog_core::LlmClient>,
+        task_id: Option<&str>,
+        declares_change: bool,
+    ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
         // 同一个名字只对应一个活的对象。
         //
         // 名字是按 (task, role) 推出来的（`agent_id_for`），所以同一件任务被
@@ -626,6 +639,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
         // 就是这个任务的 id（`create_role_agent` 与 roundtable 的角色都是这么建
         // 的），所以这里不做推断。
         config.owner_task_id = task_id.map(str::to_string);
+        // 这件活要不要动工作树，是拿到任务的那一层说的（`Task::declares_change`）。
+        // 运行时够不到任务对象，只读这一位；按角色名判时，同一个人换件活就判错。
+        config.declares_change = declares_change;
 
         let capabilities = vec![role.to_string()];
         let registration = task_agent_registration(agent_id, role);

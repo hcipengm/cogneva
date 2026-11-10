@@ -226,6 +226,8 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            // 配置文件不知道这次要跑哪件活；声明由拿到任务的那一层补。
+            declares_change: false,
         }
     }
 }

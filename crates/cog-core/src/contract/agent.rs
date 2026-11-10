@@ -88,6 +88,15 @@ pub struct RuntimeConfig {
     /// `None` 表示这个 agent 不属于任何任务（常驻角色、临时评测），它的调用
     /// 就按运行 id 记——不编一个任务名，编出来的会读成一件真花过钱的任务。
     pub owner_task_id: Option<String>,
+    /// 这件活声称自己会改工作树（见 [`crate::Task::declares_change`]）。
+    ///
+    /// 运行时手里只有这份 config，没有任务对象，而「这次运行该不该动手」是任务
+    /// 说的。所以拿到任务的那一层（认领、派单、小队建角色）把它抄进来；抄的人
+    /// 只有一处入口，判的人只有这一位——按角色名判时，同一个人换个任务就被判错。
+    ///
+    /// 缺省是 `false`：没有声明就是「没说自己要动树」，那就不拿「树没动」当它
+    /// 没进展的证据。这不等于它不会写——它照样能写，只是不会因为没写被收住。
+    pub declares_change: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -116,6 +125,7 @@ impl Default for RuntimeConfig {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         }
     }
 }
@@ -523,6 +533,24 @@ pub trait AgentManager: Send + Sync {
         llm: std::sync::Arc<dyn crate::llm::LlmClient>,
         task_id: Option<&str>,
     ) -> crate::SFResult<std::sync::Arc<dyn crate::Agent>>;
+
+    /// [`Self::create_agent`], plus what the task says about the run's shape.
+    ///
+    /// 「这件活要改工作树」这件事只有拿着任务的那一层答得出来（[`crate::Task::declares_change`]），
+    /// 而判它的是运行时。缺省实现忽略这一位、退化成 [`Self::create_agent`]：一个
+    /// 还不知道怎么用它的管理器不会因此编造答案，只是那位 agent 少一条「该动手」
+    /// 的证据——而这正是没有声明时的行为。真正把它传进运行时的管理器要覆盖它。
+    async fn create_agent_declaring(
+        &self,
+        agent_id: &str,
+        role: &str,
+        llm: std::sync::Arc<dyn crate::llm::LlmClient>,
+        task_id: Option<&str>,
+        declares_change: bool,
+    ) -> crate::SFResult<std::sync::Arc<dyn crate::Agent>> {
+        let _ = declares_change;
+        self.create_agent(agent_id, role, llm, task_id).await
+    }
 
     /// Retire every agent this manager created for `task_id`, returning how many
     /// it let go.

@@ -24,6 +24,7 @@ async fn test_agent_prompt_completes() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -55,6 +56,7 @@ async fn test_agent_subscribe_receives_events() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -94,6 +96,7 @@ async fn test_agent_state_transitions() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -125,6 +128,7 @@ async fn test_agent_abort_resets_to_idle() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         Arc::new(MockProvider::new("slow result")),
     );
@@ -162,6 +166,7 @@ async fn test_agent_reset_clears_state() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -188,6 +193,7 @@ async fn test_agent_continue_preserves_context() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         Arc::new(MockProvider::new("acknowledged")),
     );
@@ -223,6 +229,7 @@ async fn test_agent_wait_for_idle() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -257,6 +264,7 @@ async fn test_agent_chat_stream_bypasses_loop() {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
+            declares_change: false,
         },
         Arc::new(MockProvider::new("hello stream")),
     );

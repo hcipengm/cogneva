@@ -36,13 +36,20 @@ const CALLS_WITHOUT_CHANGE: u32 = 40;
 // cap: bound — 一条提示本身也要付一次回合，且落地会作废它之后的缓存前缀；两次之后不再打断
 const NOTHING_CHANGED_NOTES: u32 = 2;
 
-/// 这条角色写不写工作树。
+/// 这条运行该不该被「一直在读、没动过树」收住。
 ///
-/// 规划、评审、主持都是只读的：「工作树没动」对它们不构成任何证据——它们本来
-/// 就不该动它。所以「半小时没动就收住」只对生成侧成立，别的角色跑多久都不该
-/// 因为这一条被收。
-fn writes_the_checkout(role: &str) -> bool {
-    role == cog_core::roles::GENERATOR
+/// 先得这件活自己声称要动这棵树：没有这份声明时，「工作树没动」不构成任何证据
+/// ——评审、规划、一段对话本来就不该动它，拿这一条去收它们，等于把「它做了本职
+/// 工作」读成「它没有进展」。声明随任务来（`Task::declares_change`），不随接手
+/// 的人的角色来：同一个工程师换了件活，答案跟着那件活变。
+///
+/// 再加上真的半小时没动、且已经提醒过两次，三条一起成立才是绕圈。
+fn circling_unproductively(
+    config: &cog_core::RuntimeConfig,
+    progress: &CheckoutProgress,
+    now: std::time::Instant,
+) -> bool {
+    config.declares_change && progress.circling(now)
 }
 
 /// 一条运行在不改工作树的情况下，被提醒过两次之后还能再走多久。
@@ -2909,9 +2916,7 @@ impl AgentRuntime {
             // 回收器替它收场，读数是「跑满预算没有产出」，而真正的事实是「这段
             // 时间里一次都没动过工作树」。在这里收住，名字说的是事实，而且省下的
             // 是那个只有两个的槽位。
-            if writes_the_checkout(self.config.role.as_str())
-                && progress.circling(std::time::Instant::now())
-            {
+            if circling_unproductively(&self.config, &progress, std::time::Instant::now()) {
                 self.state = RuntimeState::Complete;
                 tracing::warn!(
                     agent_id = %self.config.agent_id,
@@ -7366,22 +7371,50 @@ mod tests {
         serde_json::json!({ "command": "sed -i 's/a/b/' crates/x.rs" })
     }
 
-    /// 「工作树没动」只对写工作树的角色是证据：规划与评审本来就不该动它，
-    /// 拿这一条去收它们，等于把「它做了本职工作」读成「它没有进展」。
+    /// 「工作树没动」只对**声称要动它**的那件活是证据，与接手的人的角色无关。
+    ///
+    /// 判据换输入就换答案：同一份「半小时没动、提醒过两次」的证据，加上声明就
+    /// 该收，撤回声明就该放。角色名在这里不起作用——一位 generator 跑一段读取
+    /// 结论的活，与一位工程师跑一件要交改动的活，各自按任务判。
     #[test]
-    fn only_a_role_that_writes_the_checkout_can_be_stopped_for_not_writing_it() {
-        assert!(writes_the_checkout(cog_core::roles::GENERATOR));
-        for read_only in [
-            cog_core::roles::PLANNER,
-            cog_core::roles::EVALUATOR,
-            cog_core::roles::MODERATOR,
-            cog_core::roles::MERGER,
-        ] {
-            assert!(
-                !writes_the_checkout(read_only),
-                "{read_only} 是只读角色，不该因为工作树没动被收住"
-            );
+    fn only_a_task_that_declares_a_change_can_be_stopped_for_not_making_one() {
+        let mut progress = CheckoutProgress::default();
+        let start = progress.last_change;
+        for _ in 0..CALLS_WITHOUT_CHANGE {
+            progress.note_call("run_command", &read_call());
         }
+        assert!(progress.take_note().is_some());
+        for _ in 0..CALLS_WITHOUT_CHANGE {
+            progress.note_call("run_command", &read_call());
+        }
+        assert!(progress.take_note().is_some(), "两次提醒都要响");
+        let now = start + NO_PROGRESS_WALL;
+
+        let declaring = cog_core::RuntimeConfig {
+            agent_id: "kai-a9ab11fc".into(),
+            role: cog_core::roles::PLANNER.into(),
+            declares_change: true,
+            ..Default::default()
+        };
+        let quiet = cog_core::RuntimeConfig {
+            declares_change: false,
+            ..declaring.clone()
+        };
+
+        assert!(
+            circling_unproductively(&declaring, &progress, now),
+            "声称要动这棵树、半小时没动、提醒过两次：这就是绕圈"
+        );
+        assert!(
+            !circling_unproductively(&quiet, &progress, now),
+            "没有声明要动树时，「树没动」不构成证据：读结论的活本就不该动它"
+        );
+        // 声明了、但时间还没到：那是在读，不是在绕。
+        assert!(!circling_unproductively(
+            &declaring,
+            &progress,
+            start + NO_PROGRESS_WALL / 2
+        ));
     }
 
     /// 收住要多要一条时间证据：只读次数凑够了、时间还没到，那是在读；时间过了、

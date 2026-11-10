@@ -224,6 +224,7 @@ fn runtime(
             crew_id: None,
             squad_id: None,
             owner_task_id: Some(task_id.to_string()),
+            declares_change: false,
         },
         tx,
     )

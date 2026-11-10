@@ -24,19 +24,24 @@ pub const RESUME_OUTCOMES: [&str; 2] = ["restored", "failed"];
 /// 恢复必须发生在 agent 开跑之前：`restore` 会 abort 在跑的任务并重置命令
 /// 通道，那是「把状态换成快照里的状态」的实现方式，对已经开工的 agent 调用
 /// 等于把当前这一步丢掉。
+/// `declares_change` 是这一份活自己的声明（`Task::declares_change`），不是接手
+/// 的人的角色：同一个人做评审时它不成立，做变更时成立。建 agent 的这一层拿着
+/// 任务，所以由它说；运行时只读这一位。
 pub(crate) async fn create_role_agent(
     manager: &Arc<dyn AgentManager>,
     llm: &Arc<dyn LlmClient>,
     state: Option<&Arc<dyn StateBackend>>,
     task_id: &str,
     role: &str,
+    declares_change: bool,
 ) -> SFResult<Arc<dyn Agent>> {
     let agent = manager
-        .create_agent(
+        .create_agent_declaring(
             &cog_core::agent_id_for(task_id, role),
             role,
             llm.clone(),
             Some(task_id),
+            declares_change,
         )
         .await?;
     resume_if_checkpointed(state, &agent, task_id, role).await;
