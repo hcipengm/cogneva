@@ -69,10 +69,16 @@ const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
 /// 导出、灌回、打包、解包、算摘要这五条搬数据的路都按块记拍（[`BeatsOnIo`]）——只要
 /// 还有一块进去，这一跑就还在动，判词也就不会落在它身上。
 const DRILL_STEP_SILENCE_ENV: &str = "COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS";
-/// 没配 env 时那一步的静默界。数与 values.yaml 的 `backup.drillStepSilenceSeconds`
-/// 同源，由 `deploy/scripts/tests/backup-jobs-stop-on-silence.test.sh` 盯着两边。
-// cap: override — 一步能走多久没有实测样本；沿用被替换掉的整趟预算 3600 s，判据从「整趟时长」换成「单步静默」后只会更宽
-const DRILL_STEP_SILENCE_DEFAULT_SECS: u64 = 3600;
+/// 没配 env 时那一步的静默界：**不另起一个数**，就是容器探针读的那个窗口下限
+/// （[`cog_core::progress::PROGRESS_FILE_WINDOW_FLOOR_SECS`]）。
+///
+/// 同一趟运行上有两个读者问同一件事：本进程的看门狗先问，问到了就自己收尾、把
+/// `failed` 连同步名落进账本；容器探针后问，问到了由 kubelet 把容器判掉。探针要连着
+/// 失败 [`cog_core::progress::PROBE_FAILURE_THRESHOLD`] 次才判停，所以自报这一侧天然
+/// 先开口——前提是两个窗口同源。这里若另写一个字面量，改了一处没改另一处，看门狗
+/// 就会在探针还认为在动的时候先收尾，或者说出口的时候容器已经被判掉、账上那行没写。
+// cap: derived — 从探针窗口下限派生（同一趟运行、同一件事、同一个窗口）；清单里那个 env 是它的覆盖，门在 deploy/scripts/tests/backup-jobs-stop-on-silence.test.sh
+const DRILL_STEP_SILENCE_DEFAULT_SECS: u64 = cog_core::progress::PROGRESS_FILE_WINDOW_FLOOR_SECS;
 const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
 const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 
@@ -5973,6 +5979,21 @@ mod tests {
             assert_eq!(step_silence_from(raw), default, "raw={raw:?}");
         }
         assert_eq!(step_silence_from(Some(" 900 ")), Duration::from_secs(900));
+    }
+
+    /// 自报的那一侧必须先开口：容器探针一判停容器就没了，账上那行也就写不下去。
+    ///
+    /// 探针最早在「窗口 + (threshold-1) 个读取周期」才判停，所以自报的界只要不晚于
+    /// 窗口，它就一定有机会把那句 `failed` 写进账本。这条量的是那个先后，不是相等——
+    /// 往小改是允许的（更早自报），往大改就是把判词交给 kubelet。
+    #[test]
+    fn the_watchdog_speaks_no_later_than_the_probe_can_kill() {
+        let probe_window = Duration::from_secs(cog_core::progress::PROGRESS_FILE_WINDOW_FLOOR_SECS);
+        let watchdog = step_silence_from(None);
+        assert!(
+            watchdog <= probe_window,
+            "自报的静默界 {watchdog:?} 晚于探针窗口 {probe_window:?}：那时容器已经被判掉，账上不会有这一行"
+        );
     }
 
     #[test]

@@ -109,8 +109,12 @@ check "chart 渲染件/演练" "${rendered}" "cogneva-backup-drill"
 check "deploy/k3s 静态清单/备份" "${repo}/deploy/k3s/backup-cronjob.yaml" "cogneva-backup"
 check "deploy/k3s 静态清单/演练" "${repo}/deploy/k3s/backup-drill-cronjob.yaml" "cogneva-backup-drill"
 
-# 单步静默界：两份清单与代码默认值必须同源。容器没拿到 env 时进程拿默认值跑，
-# 那一趟的判词会写出一个与部署清单不同的界，读的人只能去翻代码。
+# 单步静默界：两份清单同值，而代码默认值是从探针窗口下限派生的，不是另抄一个数。
+#
+# 同一趟演练上有两个读者问同一件事：进程自己的看门狗先问（问到就自己收尾、落一行
+# failed），容器探针后问（问到由 kubelet 把容器判掉）。探针要连着失败几次才判停，
+# 所以自报那一侧只要不晚于探针的窗口就一定先开口。这里量两件事：清单里的数不晚于
+# 探针窗口，代码默认值确实从探针窗口下限派生（不是碰巧相等的两个字面量）。
 chart_silence="$(inspect "${rendered}" cogneva-backup-drill | sed -n 's/^step_silence=//p')"
 static_silence="$(inspect "${repo}/deploy/k3s/backup-drill-cronjob.yaml" cogneva-backup-drill | sed -n 's/^step_silence=//p')"
 [[ -n "${chart_silence}" ]] \
@@ -118,11 +122,17 @@ static_silence="$(inspect "${repo}/deploy/k3s/backup-drill-cronjob.yaml" cogneva
 [[ "${chart_silence}" == "${static_silence}" ]] \
   || fail "两份清单的单步静默界不同（chart=${chart_silence} static=${static_silence}）"
 
-code_default="$(sed -n 's/^const DRILL_STEP_SILENCE_DEFAULT_SECS: u64 = \([0-9]*\);$/\1/p' \
-  "${repo}/crates/cogneva/src/backup.rs")"
-[[ -n "${code_default}" ]] \
-  || fail "crates/cogneva/src/backup.rs 里找不到 DRILL_STEP_SILENCE_DEFAULT_SECS"
-[[ "${code_default}" == "${chart_silence}" ]] \
-  || fail "代码默认单步静默界 ${code_default}s 与清单 ${chart_silence}s 不同：没注入 env 的那一趟会写出另一个界"
+progress_floor="$(sed -n 's/^pub const PROGRESS_FILE_WINDOW_FLOOR_SECS: u64 = \([0-9]*\);$/\1/p' \
+  "${repo}/crates/cog-core/src/progress.rs")"
+[[ -n "${progress_floor}" ]] \
+  || fail "crates/cog-core/src/progress.rs 里找不到 PROGRESS_FILE_WINDOW_FLOOR_SECS"
 
-echo "OK：两个 Job 都没有 activeDeadlineSeconds，判停读进度文件；单步静默界 ${chart_silence}s 在两份清单与代码里同值"
+code_derives="$(grep -c '^const DRILL_STEP_SILENCE_DEFAULT_SECS: u64 = cog_core::progress::PROGRESS_FILE_WINDOW_FLOOR_SECS;$' \
+  "${repo}/crates/cogneva/src/backup.rs" || true)"
+[[ "${code_derives}" == "1" ]] \
+  || fail "crates/cogneva/src/backup.rs 的单步静默默认值不是从探针窗口下限派生的：没注入 env 的那一趟会按另一个窗口判，而容器探针按这一个判"
+
+[[ $((chart_silence)) -le $((progress_floor)) ]] \
+  || fail "清单的单步静默界 ${chart_silence}s 晚于探针窗口 ${progress_floor}s：容器会先被 kubelet 判掉，账上那行 failed 写不下来"
+
+echo "OK：两个 Job 都没有 activeDeadlineSeconds，判停读进度文件；单步静默界 ${chart_silence}s 不晚于探针窗口 ${progress_floor}s，代码默认值由后者派生"
