@@ -306,7 +306,10 @@ fn looks_like_a_namespace(candidate: &str) -> bool {
 }
 
 /// `at` 之后的第一个词：引号里的取引号内，否则取到空白或分隔符为止。
-fn literal_after(line: &str, at: usize) -> Option<String> {
+///
+/// 取的是「这里命名的那个词」，不是 Rust 字面量：名字不落在 `literal_` 那一族，
+/// 免得共享读法的普查把它当成第二个读字面量的实现。
+fn word_after(line: &str, at: usize) -> Option<String> {
     let rest = line[at..].trim_start_matches(|c: char| c == '=' || c.is_whitespace());
     let token: String = match rest.chars().next() {
         Some(quote @ ('"' | '\'')) => rest[1..].chars().take_while(|c| *c != quote).collect(),
@@ -356,8 +359,8 @@ fn script_literals_in(line: &str) -> Vec<(String, String)> {
     while let Some(found) = line[from..].find("--namespace") {
         let at = from + found + "--namespace".len();
         from = at;
-        if let Some(literal) = literal_after(line, at) {
-            out.push(("--namespace".to_string(), literal));
+        if let Some(word) = word_after(line, at) {
+            out.push(("--namespace".to_string(), word));
         }
     }
 
@@ -400,8 +403,8 @@ fn script_literals_in(line: &str) -> Vec<(String, String)> {
             ) {
                 continue;
             }
-            if let Some(literal) = literal_after(line, at + 2) {
-                out.push(("-n".to_string(), literal));
+            if let Some(word) = word_after(line, at + 2) {
+                out.push(("-n".to_string(), word));
             }
         }
     }

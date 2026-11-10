@@ -43,6 +43,7 @@ use std::path::Path;
 
 use crate::common;
 
+use common::declared_once::literals_in;
 use common::lex::Dialect;
 use common::routes::{matching_brace, repo_root};
 use common::rules::{promql_expressions, rule_document};
@@ -208,36 +209,6 @@ fn idents_in(line: &str) -> Vec<(&str, usize)> {
             }
             None => i += 1,
         }
-    }
-    out
-}
-
-/// 每个 `"…"` 字面量的内容与它在行内的位置。
-fn string_literals(line: &str) -> Vec<(&str, usize)> {
-    let bytes = line.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let start = i + 1;
-        let mut j = start;
-        while j < bytes.len() {
-            if bytes[j] == b'\\' {
-                j += 2;
-                continue;
-            }
-            if bytes[j] == b'"' {
-                break;
-            }
-            j += 1;
-        }
-        if j <= bytes.len() {
-            out.push((&line[start..j.min(line.len())], start));
-        }
-        i = j.max(i + 1);
     }
     out
 }
@@ -417,9 +388,9 @@ fn emitter_keys(
                     named.extend(values.iter().cloned());
                 }
             }
-            for (literal, _) in string_literals(line) {
-                if literal.starts_with("cogneva_") {
-                    named.insert(literal.to_string());
+            for literal in literals_in(line) {
+                if literal.value.starts_with("cogneva_") {
+                    named.insert(literal.value.to_string());
                 }
             }
             if named.is_empty() {

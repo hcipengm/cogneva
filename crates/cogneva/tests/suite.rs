@@ -263,6 +263,8 @@ mod event_bus_metric_seed_test;
 mod every_agent_unhealthy_writer_consults_the_judgement;
 #[path = "every_alert_condition_has_a_promql_shape_test.rs"]
 mod every_alert_condition_has_a_promql_shape_test;
+#[path = "every_declared_once_gate_shares_the_one_reader_test.rs"]
+mod every_declared_once_gate_shares_the_one_reader_test;
 #[path = "every_file_in_the_static_tree_is_delivered_or_declared_test.rs"]
 mod every_file_in_the_static_tree_is_delivered_or_declared_test;
 #[path = "every_first_party_container_prints_time_in_the_clusters_timezone_test.rs"]

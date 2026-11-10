@@ -38,6 +38,7 @@ use std::path::Path;
 
 use crate::common;
 
+use common::declared_once::literal_values;
 use common::routes::repo_root;
 
 use common::rust_production::{production_lines, production_sources, relative_name};
@@ -105,39 +106,6 @@ fn env_shaped(value: &str) -> bool {
         && value.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
-/// Every string literal on a line, in order.
-///
-/// A line can hold several (`m.insert("COGNEVA_X".into(), "cfg.key".into())`),
-/// and missing the second half is how the shape read through a helper went
-/// unseen.
-fn literals(line: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut rest = line;
-    while let Some(start) = rest.find('"') {
-        let after = &rest[start + 1..];
-        let mut escaped = false;
-        let mut end = None;
-        for (i, c) in after.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match c {
-                '\\' => escaped = true,
-                '"' => {
-                    end = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let Some(end) = end else { break };
-        out.push(&after[..end]);
-        rest = &after[end + 1..];
-    }
-    out
-}
-
 /// The name a `env::var` / `env::var_os` call reads as a literal, if it is one.
 fn read_name(line: &str) -> Option<&str> {
     let call = line
@@ -159,7 +127,7 @@ fn read_name(line: &str) -> Option<&str> {
 /// through a declaration and contributes nothing — that is the shape being
 /// asked for.
 fn spelled_names(line: &str) -> Vec<&str> {
-    let mut names: Vec<&str> = literals(line)
+    let mut names: Vec<&str> = literal_values(line)
         .into_iter()
         .filter(|value| platform_env_name(value))
         .collect();
@@ -175,7 +143,7 @@ fn spelled_names(line: &str) -> Vec<&str> {
 /// Build scripts are read too: they spell names at compile time, and a version
 /// that arrives as an empty string is the same silent default as a missing
 /// runtime variable.
-fn literal_sites(root: &Path) -> BTreeMap<String, Vec<(String, String)>> {
+fn env_name_sites(root: &Path) -> BTreeMap<String, Vec<(String, String)>> {
     let mut sites: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for path in production_sources(root) {
         let text =
@@ -210,7 +178,7 @@ fn build_time(name: &str) -> Option<&'static [&'static str]> {
 
 #[test]
 fn every_env_name_is_spelled_in_one_place() {
-    let sites = literal_sites(&repo_root());
+    let sites = env_name_sites(&repo_root());
     assert!(
         sites.len() > 50,
         "只读出 {} 个环境变量名，这条判据没有题目",
@@ -256,7 +224,7 @@ fn every_env_name_is_spelled_in_one_place() {
 
 #[test]
 fn a_foreign_name_that_stops_being_foreign_is_reported() {
-    let sites = literal_sites(&repo_root());
+    let sites = env_name_sites(&repo_root());
     let stale: Vec<&str> = FOREIGN
         .iter()
         .map(|(name, _)| *name)
@@ -271,7 +239,7 @@ fn a_foreign_name_that_stops_being_foreign_is_reported() {
 
 #[test]
 fn a_build_time_licence_whose_sites_moved_is_reported() {
-    let sites = literal_sites(&repo_root());
+    let sites = env_name_sites(&repo_root());
     for (name, pinned) in BUILD_TIME {
         let hits = sites
             .get(*name)

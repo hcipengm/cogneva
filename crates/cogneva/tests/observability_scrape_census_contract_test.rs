@@ -59,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common;
 
+use common::declared_once::literal_values;
 use common::routes::{read_repo, repo_root};
 use common::rust_production::{all_crate_files, production_sources, production_text};
 use common::service_topology;
@@ -883,9 +884,10 @@ fn production_query_reads() -> BTreeSet<String> {
             // `http_request_duration_ms` 与 `memory_*` 一族就不是。认「闭集里有没有
             // 这个词」而不是「它长得像不像」，前缀是别处登记表的形状，不是这里的。
             found.extend(
-                string_literals(&span)
+                literal_values(&span)
                     .into_iter()
-                    .filter(|literal| registry.contains(literal.as_str())),
+                    .filter(|literal| registry.contains(literal))
+                    .map(str::to_string),
             );
             for ident in metric_path_idents(&span) {
                 if let Some(name) = ident_to_name.get(ident.as_str()) {
@@ -895,46 +897,6 @@ fn production_query_reads() -> BTreeSet<String> {
         }
     }
     found
-}
-
-/// `text` 里每一个双引号字符串的内容。
-///
-/// 反斜杠转义整体跳过，所以 SQL 常量里的 `\"` 不会把一段代码读成一个字符串。字符
-/// 字面量与行注释不跳：它们在这个位置不出现，出现了也只会多切一段、少认一个名字，
-/// 不会让一个调用点凭空读出一条序列。
-fn string_literals(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let mut value = String::new();
-        i += 1;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\\' => {
-                    if let Some(next) = text[i + 1..].chars().next() {
-                        value.push(next);
-                    }
-                    i += 2;
-                }
-                b'"' => {
-                    i += 1;
-                    break;
-                }
-                _ => {
-                    let ch = text[i..].chars().next().unwrap_or('"');
-                    value.push(ch);
-                    i += ch.len_utf8();
-                }
-            }
-        }
-        out.push(value);
-    }
-    out
 }
 
 /// 一次生产代码里 `query_*` 调用的实参区间。
@@ -1546,7 +1508,7 @@ mod tests {
             vec!["\"a(name)\"".to_string()],
             "字符串里的括号不配对，跟着它走会把区间延到文件末尾"
         );
-        assert_eq!(string_literals("\"a(name)\""), vec!["a(name)".to_string()]);
+        assert_eq!(literal_values("\"a(name)\""), vec!["a(name)"]);
     }
 
     /// 名字经形参转手时这一层看不见它，而看不见的方向是多记一笔欠账。
@@ -1560,7 +1522,7 @@ mod tests {
         let spans = query_call_spans(through_a_variable);
         assert_eq!(spans, vec!["name".to_string()]);
         assert!(
-            string_literals(&spans[0]).is_empty() && metric_path_idents(&spans[0]).is_empty(),
+            literal_values(&spans[0]).is_empty() && metric_path_idents(&spans[0]).is_empty(),
             "形参不是名字，这一层只认得写下来的字面量与常量路径"
         );
     }
