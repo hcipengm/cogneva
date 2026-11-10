@@ -502,6 +502,7 @@ impl GatewayState {
     pub fn ops_state(&self) -> state::OpsState {
         state::OpsState {
             quota_manager: self.quota_manager.clone(),
+            llm_usage: self.llm_usage.clone(),
             hierarchy_manager: self.hierarchy_manager.clone(),
             supervisor: self.supervisor.clone(),
             agent_registry: self.agent_registry.clone(),

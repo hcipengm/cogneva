@@ -51,6 +51,14 @@ pub struct InfraState {
 #[derive(Clone)]
 pub struct OpsState {
     pub quota_manager: Arc<dyn cog_core::QuotaManager>,
+    /// 逐笔 token 账（`gateway_llm_usage`）的读口，给需要按项目判花销的运维读面用。
+    ///
+    /// 与上面的 `quota_manager` 并排，因为两者答的是同一个问题的两半：额度拦的是
+    /// 下一次调用，账判的是已经花掉的。它是 `None` 时「这个项目有没有超预算」判不了，
+    /// 那一格报的是「装配没接上」，不是零花销——把缺账读成零，等于让超支的项目与
+    /// 在预算内的项目同形。装配处（`GatewayState::ops_state`）照原样把它灌进来，
+    /// 只有真的没有这个面时才留空。
+    pub llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>>,
     pub hierarchy_manager: Option<Arc<dyn cog_core::HierarchyManager>>,
     pub supervisor: Option<Arc<dyn cog_core::Supervisor>>,
     pub agent_registry: Option<Arc<dyn cog_core::AgentRegistry>>,
