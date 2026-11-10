@@ -1676,6 +1676,35 @@ pub fn parse_rows_per_handover(raw: &str) -> Result<usize, String> {
     }
 }
 
+/// The graph rows one change is handed over as, for a caller outside the loop.
+///
+/// The chat turn's "hand this row over" and the pass here submit the same shape:
+/// the id derived from the identity, the project anchor the row hangs under, and
+/// the acceptance that names the account. A second builder in the caller would
+/// be a copy of three decisions that only look independent -- and the first one
+/// to change would leave a row that reads as handed over in one path and not the
+/// other, which is the one difference no reader can afford.
+///
+/// The generation is the caller's because a hand-over filed under an id the
+/// graph already holds is an idempotent no-op, and the caller would report
+/// "submitted" for work nothing took. Only the graph knows which of the closed
+/// set in [`dispatch_task_ids`] it already holds, and only the dispatch loop
+/// knows when a failed attempt was the environment's fault rather than the
+/// change's -- a caller that has not read either asks for generation 0, the id
+/// every hand-over carried before generations existed.
+///
+/// One row, not a batch: batching is the pass's economy, and a request names one
+/// change.
+pub fn handover_on_request(
+    row: &ChangeLedgerRow,
+    generation: u32,
+) -> (String, Vec<cog_core::Task>) {
+    let goal = dispatch_goal_for(std::slice::from_ref(row));
+    let task = dispatch_task(std::slice::from_ref(row), generation);
+    let root = dispatch_project_root_for(&dispatch_project_key(row));
+    (goal, vec![root, task])
+}
+
 /// The task this loop hands owed changes over as.
 ///
 /// One task, up to [`ROWS_PER_HANDOVER`] rows. The id is derived from the

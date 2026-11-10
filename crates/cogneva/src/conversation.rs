@@ -294,10 +294,14 @@ pub struct PlatformConversation {
     /// 员工提案，属主拍板。批了之后下一轮开头它就随基础指令交给每个人，所以
     /// 「从对话里改规则」不用重发版，也不用重启谁。
     principles: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
+    /// 进化控制面：放行一条等审批的变更、把正在跑的那一版退回去。它由反射插件
+    /// 发布；没装的进程照实缺席，而不是把「这里没有能拍板的东西」说成「没有
+    /// 待批的变更」——那两个读数要做的事相反。
+    evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
 }
 
 impl PlatformConversation {
-    // 九个入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
+    // 十个入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
     // 「这个部署里装了哪些」，把其中几个打包只会让调用方多记一个类型名，
     // 而少掉的参数个数并不能让这行更好读。构造完就各归各位，没有第二处
     // 地方再按这个分组使用它们。
@@ -312,6 +316,7 @@ impl PlatformConversation {
         people: Option<Arc<dyn cog_core::KeyValueStore>>,
         ledgers: Ledgers,
         principles: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
+        evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -323,6 +328,7 @@ impl PlatformConversation {
             people,
             ledgers,
             principles,
+            evolution,
         }
     }
 }
@@ -496,6 +502,20 @@ impl ConversationTurn for PlatformConversation {
                 self.principles.clone(),
                 employee.id.clone(),
                 owner.is_some(),
+            ) {
+                tools.register(tool);
+            }
+            // 方向盘：定档、把账上一行交出去、放行与回滚。四只与上面那几组同一处装。
+            // 定档与拍板只在有登录身份时注册（写进去的是「谁说的」）；交出去与派活
+            // 同级，任何一段对话都能做，判据仍然取账上那一行。
+            for tool in change_direction_tools(
+                self.ledgers.changes.clone(),
+                self.orchestrator.clone(),
+                self.evolution.clone(),
+                self.admission.clone(),
+                self.audit.clone(),
+                owner.map(str::to_string),
+                employee.id.clone(),
             ) {
                 tools.register(tool);
             }
@@ -1096,6 +1116,397 @@ fn change_says(row: &cog_core::ChangeLedgerRow, needle: &str) -> bool {
         row.assertion.as_deref().unwrap_or_default()
     );
     haystack.to_lowercase().contains(needle)
+}
+
+/// 属主给一条变更定档时，账上那个「文档」的名字前缀。
+///
+/// 按人分开：账的每一条引用记着「这是谁说的」，两个属主对同一条变更说了不同的
+/// 档，读的人要分得出是谁的那一句。同一个属主再说一次，是他自己那一格被改写，
+/// 不是多出一条别人说的。
+const OWNER_BAND_DOC_PREFIX: &str = "owner:";
+
+/// 三段身份：三格分开给，不从 `kind:scope:literal` 那串里拆。
+///
+/// 正文里常带冒号，拆错了问的就是另一条变更，而账上会诚实地回「没有这一条」——
+/// 读的人于是以为这条变更不存在。
+fn identity_arg(args: &serde_json::Value) -> SFResult<cog_core::ChangeIdentity> {
+    Ok(cog_core::ChangeIdentity::new(
+        require_str(args, "kind")?,
+        require_str(args, "scope")?,
+        require_str(args, "literal")?,
+    ))
+}
+
+/// 外循环的方向盘：属主的一句话落到派工顺序与判据上。
+///
+/// 与那四只只读账工具分开，因为它们写：定档改的是「多急」，交出去改的是「现在
+/// 谁做」，放行与回滚改的是「正在跑的是哪一版」。判「做完没有」仍然不在这里——
+/// 那只由看树的那一侧写，`dispatch_change` 交出去的活也还是按账上那一行判。
+///
+/// 定档与拍板只在**这一段连接带登录身份**时注册：账上的一行引用要写「是谁说的」，
+/// 一条没有人的连接答不出这一问；给它记一行，账上就多一条没有人的决定。
+///
+/// 交出去与 `dispatch_goal` 一样要过准入：它是一次派活，钱从同一个额度里出。拒绝
+/// 写进的也是同一格审计，拒的 actor 是这位员工而不是「用这个界面的人」。
+#[allow(clippy::too_many_arguments)]
+fn change_direction_tools(
+    changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    orchestrator: Arc<dyn OrchestratorControl>,
+    evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
+    admission: Option<Arc<dyn HierarchyManager>>,
+    audit: Option<Arc<dyn AuditStream>>,
+    owner: Option<String>,
+    actor: String,
+) -> Vec<Tool> {
+    let mut tools = vec![dispatch_change_tool(
+        changes.clone(),
+        orchestrator,
+        admission,
+        audit,
+        // 没有登录身份时是空串：准入照提交面同一句「没人配过上限不等于谁都不许
+        // 提交」放行，而账上记的 owner 是空的，不编一个人。
+        owner.clone().unwrap_or_default(),
+        actor,
+    )];
+    if let Some(owner) = owner {
+        tools.push(set_change_priority_tool(changes, owner));
+        tools.push(approve_change_tool(evolution.clone()));
+        tools.push(rollback_change_tool(evolution));
+    }
+    tools
+}
+
+fn set_change_priority_tool(
+    changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    owner: String,
+) -> Tool {
+    // 这个属主在账上的名字。写进去的是引用，不是行上的一个档位列：一条变更的
+    // 档位是它所有引用里最高的那一条，改写自己那一格不会动别人的说法。
+    let doc = format!("{OWNER_BAND_DOC_PREFIX}{owner}");
+    make_tool(
+        "set_change_priority",
+        "给变更账上的一条定档：p0 最急，p3 最缓，unstated 表示不再要任何档。\
+         档决定派工顺序——同一面里 p0 的行先被量、先被交出去。写的是属主自己那一格\
+         引用，同一个属主再说一次会改写前一句，不会留下两句互相矛盾的话。\
+         一条变更的档是它所有引用里最高的那一条：你把它降下来时，若还有别的文档\
+         要求得更急，返回里的 effective 会比你要的高，照实说给属主，别宣布降成了。\
+         只对账上已有的行生效：三段身份照抄 list_changes，别在这里新造一条变更。\
+         这是写账，但它改的是「多急」，不是「做完没有」——后者只能由看树的那一侧量。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "description": "检查的种类，如 grep / absent / exists" },
+                "scope": { "type": "string", "description": "检查看哪里：一个路径或一个目录" },
+                "literal": { "type": "string", "description": "逐字匹配的那段正文" },
+                "band": {
+                    "type": "string",
+                    "enum": ["p0", "p1", "p2", "p3", "unstated"],
+                    "description": "要的档位；unstated 是撤回属主要求的档"
+                }
+            },
+            "required": ["kind", "scope", "literal", "band"]
+        }),
+        native(move |args| {
+            let changes = changes.clone();
+            let doc = doc.clone();
+            async move {
+                let Some(store) = changes else {
+                    return Ok(ledger_absent("变更账"));
+                };
+                let identity = identity_arg(&args)?;
+                let asked = require_str(&args, "band")?;
+                let priority = match asked.parse::<cog_core::ChangePriority>() {
+                    Ok(priority) => priority,
+                    Err(_) => {
+                        return Ok(serde_json::json!({
+                            "available": true,
+                            "refused": "unknown_band",
+                            "note": format!(
+                                "账上没有 {asked:?} 这一档：只有 p0、p1、p2、p3、unstated，\
+                                 照抄其中一个。"
+                            ),
+                        }));
+                    }
+                };
+                if store.get(&identity).await?.is_none() {
+                    return Ok(serde_json::json!({
+                        "available": true,
+                        "refused": "unknown_change",
+                        "note": "账上没有这条身份，也没有替它新开一行：三段里差一个字就是\
+                                 另一条变更。先用 list_changes 按字面找一遍。",
+                    }));
+                }
+                let reading = cog_core::ChangeReading {
+                    identity: identity.clone(),
+                    // 只改档：标题与正文留空，账上已有的那两格不被这一次改写。
+                    title: None,
+                    assertion: None,
+                    source: cog_core::ChangeSource {
+                        doc,
+                        verdict: None,
+                        priority,
+                        block: cog_core::ChangeBlock::NONE,
+                    },
+                };
+                store
+                    .record_readings(std::slice::from_ref(&reading), None)
+                    .await?;
+                let effective = store
+                    .get(&identity)
+                    .await?
+                    .map(|row| row.priority())
+                    .unwrap_or(priority);
+                Ok(serde_json::json!({
+                    "available": true,
+                    "change": identity.as_key(),
+                    "asked": priority.as_str(),
+                    "effective": effective.as_str(),
+                    "note": if effective == priority {
+                        format!("这一条现在按 {} 排队。", priority.as_str())
+                    } else {
+                        format!(
+                            "你要的是 {}，账算出来是 {}：这一条的档是所有引用里最高的那一条，\
+                             还有别的文档要求得更急。属主要的是「不再这么急」，得让那条文档改口，\
+                             这一句不要替他宣布。",
+                            priority.as_str(),
+                            effective.as_str()
+                        )
+                    },
+                }))
+            }
+        }),
+    )
+}
+
+fn dispatch_change_tool(
+    changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    orchestrator: Arc<dyn OrchestratorControl>,
+    admission: Option<Arc<dyn HierarchyManager>>,
+    audit: Option<Arc<dyn AuditStream>>,
+    owner: String,
+    actor: String,
+) -> Tool {
+    make_tool(
+        "dispatch_change",
+        "把变更账上的这一行现在就交给执行者：它按这条变更的正文做出一笔改动，判据就是账上\
+         这一行——同一身份落到 landed 或 retired 才算完，不是它自己说做完了就算完。\
+         交之前先 get_change 看一眼：已经了结的行不派。同一身份重复派不会多出一行任务，\
+         返回里的 status 会说是新交的还是本来就在。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "description": "检查的种类，如 grep / absent / exists" },
+                "scope": { "type": "string", "description": "检查看哪里：一个路径或一个目录" },
+                "literal": { "type": "string", "description": "逐字匹配的那段正文" }
+            },
+            "required": ["kind", "scope", "literal"]
+        }),
+        native(move |args| {
+            let changes = changes.clone();
+            let orchestrator = orchestrator.clone();
+            let admission = admission.clone();
+            let audit = audit.clone();
+            let owner = owner.clone();
+            let actor = actor.clone();
+            async move {
+                let Some(store) = changes else {
+                    return Ok(ledger_absent("变更账"));
+                };
+                let identity = identity_arg(&args)?;
+                let Some(row) = store.get(&identity).await? else {
+                    return Ok(serde_json::json!({
+                        "available": true,
+                        "refused": "unknown_change",
+                        "note": "账上没有这条身份：三段里差一个字就是另一条变更，\
+                                 先用 list_changes 按字面找一遍。",
+                    }));
+                };
+                if matches!(
+                    row.state,
+                    cog_core::ChangeState::Landed | cog_core::ChangeState::Retired
+                ) {
+                    return Ok(serde_json::json!({
+                        "available": true,
+                        "refused": "already_settled",
+                        "state": row.state.as_str(),
+                        "note": "这一条已经了结：派出去也不会被当成一件还欠着的活。",
+                    }));
+                }
+                // 这个控制面认不认「按变更派工」，要它自己说：一个不跑派工环的
+                // 实现回 `None`，它给的 id 集合会是空的，编一个 id 就等于派给
+                // 一个不存在的数。这里照它的缺席说「这里不按变更派工」。
+                let Some(ids) = orchestrator.change_dispatch_ids(&identity) else {
+                    return Ok(serde_json::json!({
+                        "available": true,
+                        "refused": "not_dispatched_here",
+                        "note": "这个进程的控制面不按变更派工：这里没有能把这一行交出去的派工环。",
+                    }));
+                };
+                // 同一个 id 在图里已经有一行时，再交一次是幂等的空操作。先看一遍
+                // 图：已经有了就说「本来就在」，并且点名那一行。这里**不**换一个
+                // 世代再交一次——开新的一代是派工环按「这次失败是环境的，不是这条
+                // 变更的」做出的判断；一段对话看得到的是「这条还没落地」，看不到
+                // 那个分类。按一下开一代，就会按一下多烧一份同一条变更的活，而读
+                // 面只会看到「交出去了」。
+                let held: std::collections::HashSet<String> = orchestrator
+                    .get_all_tasks()
+                    .await
+                    .into_iter()
+                    .map(|task| task.id)
+                    .collect();
+                if let Some(generation) = ids.iter().position(|id| held.contains(id)) {
+                    return Ok(serde_json::json!({
+                        "available": true,
+                        "status": "already_held",
+                        "change": identity.as_key(),
+                        "task_id": ids[generation],
+                        "generation": generation,
+                        "acceptance": "同一身份的账行落到 landed 或 retired，判据取账上那一行",
+                        "note": "这一条在图上已经有一行了，再交一次不会多出一笔。那一行\
+                                 还在不在跑、为什么没跑完，读任务台账；要重跑那一次就用 \
+                                 retry_task。重新开一代是派工环在环境失败时做的判断，\
+                                 不是这里按一下——多按几次就是同一条变更烧好几份钱。",
+                    }));
+                }
+                // 交在第 0 代上：那是身份本身，也是以前每一次派工用的那个 id。
+                let (goal, rows) = cog_orchestrator::change_ledger::handover_on_request(&row, 0);
+                // 与 `dispatch_goal` 同一道门、同一份估值：交一条变更也是一次派活，
+                // 钱从同一个额度里出。挡下时回的是这一轮的结果，不是错误——模型要
+                // 把原因说出来，而不是把同一次重试一遍。
+                if let Some(refusal) = admission_refusal(admission.as_ref(), &owner, &goal).await {
+                    record_refusal(audit.as_ref(), &actor, &owner, &refusal).await;
+                    return Ok(serde_json::json!({
+                        "available": true,
+                        "status": "refused",
+                        "reason": refusal.sentence(),
+                        "note": "这一次没有交出去，账上那一行还是欠着的。把原因说给属主，\
+                                 不要重试同一次提交。",
+                    }));
+                }
+                let task_id = ids[0].clone();
+                let added = orchestrator.submit_goal_auto(&goal, rows).await?;
+                let fresh = added.iter().any(|id| id == &task_id);
+                Ok(serde_json::json!({
+                    "available": true,
+                    "status": if fresh { "submitted" } else { "already_held" },
+                    "change": identity.as_key(),
+                    "task_id": task_id,
+                    "generation": 0,
+                    "acceptance": "同一身份的账行落到 landed 或 retired，判据取账上那一行",
+                    "note": "进展用 list_tasks（goal_id 就是这条变更所属的那一组）看；\
+                             这一行什么时候算完，读变更账，不读这条任务的回话。",
+                }))
+            }
+        }),
+    )
+}
+
+fn approve_change_tool(evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>) -> Tool {
+    make_tool(
+        "approve_change",
+        "放行一条等人工审批的变更：它已经过了门、停在「等属主拍板」，这一句把它交上去——\
+         提交、构建、切换。只对等审批的行有效，别的状态会回一句「没动」。它是写：会换掉\
+         正在跑的那一版。`change_id` 照抄 list 出来的那个，不要自己编。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "change_id": {
+                    "type": "string",
+                    "description": "等审批的那条变更的 id，照抄后台列出来的值"
+                }
+            },
+            "required": ["change_id"]
+        }),
+        native(move |args| {
+            let evolution = evolution.clone();
+            async move {
+                let Some(admin) = evolution else {
+                    return Ok(admin_absent());
+                };
+                let change_id = require_str(&args, "change_id")?.to_string();
+                match admin.approve_change(&change_id).await {
+                    Ok(done) => Ok(serde_json::json!({
+                        "available": true,
+                        "approved": true,
+                        "change_id": done.change_id,
+                        "commit": done.commit_hash,
+                        "switched": done.switched,
+                        "note": "已经交上去了。切换完的那一版要等它起来，别在这一句之后\
+                                 就宣布线已经是新的。",
+                    })),
+                    Err(e) => Ok(serde_json::json!({
+                        "available": true,
+                        "approved": false,
+                        "note": format!(
+                            "没有放行：{e}。这不等于它已经在跑，也不等于被否决——\
+                             照实说给属主，不要重试同一次。"
+                        ),
+                    })),
+                }
+            }
+        }),
+    )
+}
+
+fn rollback_change_tool(evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>) -> Tool {
+    make_tool(
+        "rollback_change",
+        "把正在跑的那一版退回上一次部署，并重启。这是**部署级**回滚：退的是整条线上\
+         的那一版，不是把账上某一行改回未落——账上的行只有 landed 与 retired 两种了结，\
+         退回来之后下一次量会照实把它判回未落。属主说「把刚才那次回滚掉」时用它；\
+         说「这一条别做了」那是定档与账的事，不是回滚。`why` 会被记下来。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "why": {
+                    "type": "string",
+                    "description": "为什么要退：写清是哪一次、因为什么"
+                }
+            }
+        }),
+        native(move |args| {
+            let evolution = evolution.clone();
+            async move {
+                let Some(admin) = evolution else {
+                    return Ok(admin_absent());
+                };
+                // 理由不送给 admin：它那次调用不带理由，但这条调用自己要留下
+                // 一笔——读日志的人至少看得出是谁、为什么按了它。
+                let why = args
+                    .get("why")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or_default();
+                tracing::info!(why, "rollback requested from a conversation");
+                match admin.rollback().await {
+                    Ok(done) => Ok(serde_json::json!({
+                        "available": true,
+                        "rolled_back": done.rolled_back,
+                        "message": done.message,
+                        "note": "退回去的那一版要等它起来，别在这一句之后就宣布线已经回去了。",
+                    })),
+                    Err(e) => Ok(serde_json::json!({
+                        "available": true,
+                        "rolled_back": false,
+                        "note": format!(
+                            "没有回滚：{e}。照实说给属主；不要重试同一次，也不要宣布退回去了。"
+                        ),
+                    })),
+                }
+            }
+        }),
+    )
+}
+
+/// 这个进程没有装配进化控制面时回的那一条。
+///
+/// 与账缺席同一个道理：「这里没有能放行/回滚的东西」不是「没有值得放行的变更」。
+fn admin_absent() -> serde_json::Value {
+    serde_json::json!({
+        "available": false,
+        "note": "这个进程没有装配进化控制面：这里没有能放行或回滚的东西。\
+                 这是「做不了」，不是「没有该做的」——别把这一句转述成「没有待批的变更」。",
+    })
 }
 
 fn list_changes_tool(changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>) -> Tool {
@@ -1889,6 +2300,11 @@ fn task_summary(task: &cog_core::Task) -> serde_json::Value {
     })
 }
 
+/// 方向盘那四只的门。单独一个文件，因为它要造的假账里有几个账契约的写入口，
+/// 而「读账的这一层不许出现写入口」那道门按文本读这个文件。
+#[cfg(test)]
+mod direction_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2208,7 +2624,7 @@ mod tests {
     }
 
     /// 一个只剩硬上限的管理器：每一级都已经用完。
-    struct Exhausted;
+    pub(super) struct Exhausted;
 
     #[async_trait::async_trait]
     impl HierarchyManager for Exhausted {
@@ -2292,7 +2708,27 @@ mod tests {
 
     /// 一条只记不读的审计流，用来数拒绝有没有落账。
     #[derive(Default)]
-    struct RecordingAudit(std::sync::Mutex<Vec<(AuditKind, String, String, String)>>);
+    pub(super) struct RecordingAudit(std::sync::Mutex<Vec<(AuditKind, String, String, String)>>);
+
+    impl RecordingAudit {
+        pub(super) fn actions(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|row| row.3.clone())
+                .collect()
+        }
+
+        pub(super) fn actors(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|row| row.1.clone())
+                .collect()
+        }
+    }
 
     #[async_trait::async_trait]
     impl AuditStream for RecordingAudit {
@@ -2740,7 +3176,11 @@ mod tests {
         }
     }
 
-    async fn call(tools: &[Tool], name: &str, args: serde_json::Value) -> serde_json::Value {
+    pub(super) async fn call(
+        tools: &[Tool],
+        name: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
         let tool = tools
             .iter()
             .find(|tool| tool.name == name)
