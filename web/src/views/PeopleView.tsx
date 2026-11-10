@@ -4,6 +4,8 @@ import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { hireEmployee, type AgentConversationLine } from '@/api/client';
 import { ConversationPane } from '@/conversation/ConversationPane';
+import { SessionDock } from '@/conversation/SessionDock';
+import { conversationNames } from '@/conversation/callsign';
 import { useChatStore } from '@/store/chatStore';
 import { useServices } from '@/shell/context';
 import { USE_MOCK } from '@/runtime';
@@ -171,34 +173,58 @@ function Line({ line, showReply }: { line: AgentConversationLine; showReply: boo
  *
  * 这一格画的是实时对话面（`ConversationPane`），不是只读的历史列表：往收件箱投
  * 一句话给一个不读收件箱的人看不出任何回音，而一个只能看不能说的窗格也不叫对话框。
+ *
+ * 上面那一条是拨号条：点开一个人只是把「他那一段」放到这一格里，别的几段仍然
+ * 开着。几段同时开是这一面的常态——一段在等回答时，另一段照常能说话。
  */
-function ChatPersonPane({ sessionId, name }: { sessionId: string; name: string }) {
+function ChatLane({
+  employeeSessionId,
+  employeeName,
+}: {
+  employeeSessionId: string;
+  employeeName: string;
+}) {
   const { clientRef } = useServices();
   const openSession = useChatStore((s) => s.openSession);
+  const closeSession = useChatStore((s) => s.closeSession);
+  const order = useChatStore((s) => s.order);
+  const active = useChatStore((s) => s.active);
+  const names = conversationNames(order);
 
   // 会话先入账再画：`hydrate` 只认已经在 store 里的那一段，不在的话它会一声不响地
   // 返回，于是这一格永远是空的——看起来像「这段对话没有历史」。
   useEffect(() => {
-    openSession(sessionId);
-  }, [openSession, sessionId]);
+    openSession(employeeSessionId);
+  }, [openSession, employeeSessionId]);
 
+  const onThisEmployee = active === employeeSessionId;
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
-        <span>{`与 ${name} 的对话（会话 ${sessionId}）`}</span>
+        <span>
+          {onThisEmployee
+            ? `与 ${employeeName} 的对话（会话 ${employeeSessionId}）`
+            : `开着的第 ${order.indexOf(active) + 1} 段对话（会话 ${active}）`}
+        </span>
       </div>
+      <SessionDock clientRef={clientRef} />
+      {/*
+        换一段就是换一面：草稿、展开的思考、滚动位置都该各归各的。不换 key 的话，
+        在一段里写了一半的话会跟着到另一段上去。
+      */}
       <ConversationPane
-        sessionId={sessionId}
-        name={name}
+        key={active}
+        sessionId={active}
+        name={onThisEmployee ? employeeName : names.get(active) ?? '对话'}
         active
         onFocus={() => {}}
-        onClose={() => {}}
-        closable={false}
+        onClose={() => closeSession(active)}
+        closable={order.length > 1}
         historyEnabled={!USE_MOCK}
         clientRef={clientRef}
       />
       <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
-        这个人只在说话的那一段时间里活着，名下没有常驻进程；能接着跟他聊，是因为名字由会话 id 算出来。
+        同时开着几段就排成几个名字，段与段互不打扰。每个人只在说话的那一段时间里活着，名下没有常驻进程；能接着跟他聊，是因为名字由会话 id 算出来。
       </p>
     </section>
   );
@@ -436,7 +462,7 @@ export function PeopleView() {
           </aside>
 
           {chosen?.session_id ? (
-            <ChatPersonPane sessionId={chosen.session_id} name={chosen.display_name} />
+            <ChatLane employeeSessionId={chosen.session_id} employeeName={chosen.display_name} />
           ) : (
           <section className="flex min-h-0 flex-1 flex-col">
             <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-3 py-1.5 text-[11px] text-[var(--muted)]">

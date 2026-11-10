@@ -585,6 +585,8 @@ struct EmployeeLease {
     roster: Arc<dyn cog_core::AgentRegistry>,
     agent_id: String,
     beat: tokio::task::JoinHandle<()>,
+    /// 已经在 `release` 里下过线了。`Drop` 看这一位决定还要不要再下一次。
+    released: bool,
 }
 
 impl EmployeeLease {
@@ -620,14 +622,45 @@ impl EmployeeLease {
             roster,
             agent_id: employee.id.clone(),
             beat,
+            released: false,
         }
     }
 
-    async fn release(self) {
+    async fn release(mut self) {
+        self.released = true;
         self.beat.abort();
         if let Err(e) = self.roster.deregister(&self.agent_id).await {
             tracing::warn!(agent_id = %self.agent_id, error = %e, "名册注销失败");
         }
+    }
+}
+
+/// 没走 `release` 就消失的那一轮，也要下线。
+///
+/// 这一轮是一个 future：界面按下停止、连接被丢掉、或者它在上游出错的地方被放下时，
+/// 这个 lease 随它一起被丢下，`release` 那一行根本走不到。而心跳是一条独立的
+/// 任务，没有这一处，它会一直替一个已经没人回答的员工续约——名册上这个人永远
+/// 「在岗」，同事发给他的话投进一个没人读的收件箱，读名单的人以为他还醒着。
+///
+/// 所以下线跟着 lease 自己的寿命走，不跟着某一行代码有没有被执行到。
+impl Drop for EmployeeLease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.beat.abort();
+        // 注销是异步的，而 Drop 里不能 await：交给运行时的另一条任务。运行时不在了
+        // （进程正在收尾）就没有可交的地方——那时名册本身也在消失。
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let roster = self.roster.clone();
+        let agent_id = self.agent_id.clone();
+        handle.spawn(async move {
+            if let Err(e) = roster.deregister(&agent_id).await {
+                tracing::warn!(agent_id = %agent_id, error = %e, "名册注销失败");
+            }
+        });
     }
 }
 
@@ -3051,6 +3084,91 @@ mod tests {
                 .contains("不要宣布"),
             "没有提醒它别宣布生效：{}",
             answer["note"]
+        );
+    }
+
+    /// 一轮被放下时，名册上那个人也要下线。
+    ///
+    /// 一轮对话是一个 future。界面按下停止、连接被丢掉，这个 future 在中间就被放下
+    /// 了，`release` 那一行走不到——而心跳是一条独立的任务，不停它，名册上这个人
+    /// 会一直「在岗」并每十秒续一次约。名单上多一个永远醒着、却再也不回答的人，
+    /// 比少一行更坏：同事发给他的话投进一个没人读的收件箱。
+    #[tokio::test]
+    async fn a_turn_that_is_dropped_also_takes_its_name_off_the_roster() {
+        #[derive(Default)]
+        struct CountingRoster {
+            heartbeats: AtomicUsize,
+            deregistrations: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::AgentRegistry for CountingRoster {
+            async fn register(&self, _r: &cog_core::AgentRegistration) -> cog_core::SFResult<()> {
+                Ok(())
+            }
+            async fn heartbeat(&self, _agent_id: &str) -> cog_core::SFResult<()> {
+                self.heartbeats.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn deregister(&self, _agent_id: &str) -> cog_core::SFResult<()> {
+                self.deregistrations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn get(
+                &self,
+                _agent_id: &str,
+            ) -> cog_core::SFResult<Option<cog_core::AgentRegistration>> {
+                Ok(None)
+            }
+            async fn list(&self) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+                Ok(Vec::new())
+            }
+            async fn list_by_role(
+                &self,
+                _role: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+                Ok(Vec::new())
+            }
+            async fn list_by_capability(
+                &self,
+                _capability: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::AgentRegistration>> {
+                Ok(Vec::new())
+            }
+        }
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let roster = Arc::new(CountingRoster::default());
+        let employee = employee_named(Some("inst-7f3a"), "cancelled-turn");
+        let registry: Arc<dyn cog_core::AgentRegistry> = roster.clone();
+        let lease = EmployeeLease::take(registry, &employee, vec![]).await;
+        // 心跳的第一拍是立刻到的：先让它真的开始续约，再把它放下。
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            roster.heartbeats.load(Ordering::SeqCst) >= 1,
+            "心跳根本没跑起来"
+        );
+
+        drop(lease);
+        for _ in 0..100 {
+            if roster.deregistrations.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            roster.deregistrations.load(Ordering::SeqCst),
+            1,
+            "那一轮被放下了，名册上这个人还在：下一次打开名单会读到他「在岗」"
+        );
+
+        let beats = roster.heartbeats.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            roster.heartbeats.load(Ordering::SeqCst),
+            beats,
+            "心跳还在替一个已经不在的人续约"
         );
     }
 

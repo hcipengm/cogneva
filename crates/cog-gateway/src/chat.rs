@@ -3,9 +3,10 @@
 //! `agent_event` envelopes (message.start / message.text_delta / message.end),
 //! matching what the SPA's `useEventStream` store renders.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::websocket_protocol::ServerMessage;
 use crate::GatewayState;
@@ -78,11 +79,145 @@ pub struct ConversationRequest {
 // cap: bound — 事件管道深度，界的是「读者慢多久会堵住循环」
 const EVENT_CHANNEL_CAP: usize = 512;
 
-/// 这一轮从循环里读回来的东西：回复正文，以及它派出去的目标号。
+/// 被叫停之后，最多等多久把已经说出口的那半句读回来。
+///
+/// 正常情况下这个等待立刻结束：那一轮被丢下时，它手里的事件发送端一起没了，读
+/// 回那一头马上看到管道关闭。这个数只兜「有人另留了一份发送端」的底——那时界面
+/// 上的停止按钮会卡在这个等待里，而这正是它最不该表现出犹豫的地方。
+// cap: bound — 停止之后等读回管道关闭的上限，界的是停止按钮的响应时间
+const STOPPED_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 这一轮从循环里读回来的东西：回复正文，它派出去的目标号，它翻开过的变更。
 #[derive(Default)]
 struct TurnJournal {
     reply: String,
     goals: Vec<String>,
+    changes: Vec<String>,
+}
+
+/// 这一条连接上正在跑的轮，按会话号索引。
+///
+/// 客户端只拿着会话号：`chat_cancel` 寻址的是「这一段对话」，而一轮的身份是服务端
+/// 生成的。同一段对话里可以同时有好几轮（用户连发两句，前一句还在答），所以一格里
+/// 是若干条停止信号，一次停止把它们全发了。
+///
+/// 存的是 `watch` 的发送端而不是 `AbortHandle`：停的方式必须是「让那一轮自己放下
+/// 手里的 future」，而不是在任务边界上砍一刀——被砍掉的任务不会走它自己的收尾，
+/// 名册、记录、界面都会停在一个中间态上。这里只负责把信号递到那一轮手里。
+#[derive(Clone, Default)]
+pub struct RunningTurns {
+    turns: Arc<Mutex<HashMap<String, Vec<RunningTurn>>>>,
+}
+
+struct RunningTurn {
+    message_id: String,
+    stop: watch::Sender<bool>,
+}
+
+impl RunningTurns {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 登记一轮，拿回它的停止信号。
+    fn register(&self, session_id: &str, message_id: &str) -> watch::Receiver<bool> {
+        let (stop, rx) = watch::channel(false);
+        let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+        turns
+            .entry(session_id.to_string())
+            .or_default()
+            .push(RunningTurn {
+                message_id: message_id.to_string(),
+                stop,
+            });
+        rx
+    }
+
+    /// 这一轮结束了（答完、失败或被停），把它从名册上摘掉。
+    ///
+    /// 摘不摘都要能再停一次而不出错，所以这里只按 message_id 精确地删：同一段对话
+    /// 里别的那几轮不能被顺手清掉。
+    fn finish(&self, session_id: &str, message_id: &str) {
+        let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(list) = turns.get_mut(session_id) {
+            list.retain(|turn| turn.message_id != message_id);
+            // 空格子不留在表里：一段开过很多轮的会话关掉以后，这里不该留着一串
+            // 空 vec 让下一个人以为还有东西在跑。
+            if list.is_empty() {
+                turns.remove(session_id);
+            }
+        }
+    }
+
+    /// 停掉这一段上正在跑的每一轮，返回停掉了几轮。
+    pub fn cancel(&self, session_id: &str) -> usize {
+        let list = {
+            let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+            turns.remove(session_id).unwrap_or_default()
+        };
+        let stopped = list.len();
+        for turn in list {
+            // 接收方已经走了（那一轮刚好在这之前结束）时 send 会失败，这不是错。
+            let _ = turn.stop.send(true);
+        }
+        stopped
+    }
+}
+
+/// 这一轮在名册上的那一格，随这个 guard 一起消失。
+///
+/// 不用「在每条 return 之前调一次 finish」：这条路有五六处出口（没有执行器、没有
+/// 模型、正常答完、被叫停），漏一处，那一格就永远留在表里，下一次停止会发给一个
+/// 不存在的轮，而真正该停的那一轮收不到。
+struct RunningGuard<'a> {
+    running: &'a RunningTurns,
+    session_id: &'a str,
+    message_id: &'a str,
+}
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.running.finish(self.session_id, self.message_id);
+    }
+}
+
+/// 等到有人说停为止。
+///
+/// 通道关掉而没有人说过停时**永远不返回**：那一轮的任务没了收件人，不等于用户
+/// 按了停止。把「信号消失」读成「停止」，会在连接断开、名册被清掉这类与用户
+/// 意图无关的时刻，把一轮好好的回答砍掉。
+async fn wait_cancelled(mut stop: watch::Receiver<bool>) {
+    loop {
+        if stop.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        if *stop.borrow_and_update() {
+            return;
+        }
+    }
+}
+
+/// 一轮的两种结局：跑完了，或者被叫停。
+enum TurnOutcome<T> {
+    Finished(T),
+    Stopped,
+}
+
+/// 跑这一轮，直到它自己结束或者有人叫停。
+///
+/// 叫停的做法是**放下**这个 future：循环、模型调用、工具调用都在它里面，丢下它，
+/// 这一轮就真的不往下走了。只把结果扔掉的写法（让它继续跑完、不采纳结果）在屏幕上
+/// 看起来一模一样，而模型那边还在生成、花销还在记——停止按钮不能只是遮住这一轮。
+async fn run_until_stopped<F, T>(work: F, stop: watch::Receiver<bool>) -> TurnOutcome<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        // 用户按下停止的那一刻优先：两边同时就绪时，留下的那一半应该真的是他想停的。
+        biased;
+        _ = wait_cancelled(stop) => TurnOutcome::Stopped,
+        value = work => TurnOutcome::Finished(value),
+    }
 }
 
 /// 把循环的事件翻成界面认的帧，顺便把这一轮说过的话记下来。
@@ -105,7 +240,7 @@ async fn pump_events(
     // 结局那一帧只有调用号，没有工具名：名字在开始那一帧上。对照表按调用号把它们
     // 接起来——猜「是不是 dispatch_goal」只能看返回里有没有 goal_id，而别的工具也
     // 可以回一个目标号，那时界面会多出一条它并不负责的目标帧。
-    let mut in_flight: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut in_flight: HashMap<String, String> = HashMap::new();
     // 这一轮是谁在说，说过没有。名字从事件自己身上取：网关不重算一遍，两份
     // 名字算法迟早会有一个字母不一样，而那时界面按名字认人，认不出来也不报错。
     let mut told: Option<String> = None;
@@ -170,29 +305,52 @@ async fn pump_events(
             }
             // 目标身份单独发一帧：界面要拿它去接「这个目标下的执行者在做什么」，
             // 而不是去解析回复正文里的一个 id。值与工具回给模型的同一份。
+            //
+            // 变更同理：它翻开的是账上哪一条，只有工具返回里那一串三段身份答得准。
+            // 不单独发这一帧，界面上「这条变更」就只是回复正文里的几个字，点不进
+            // 变更账——而它刚刚读的那一行就在账上，离一次点击那么近。
             AgentEvent::ToolExecutionEnd {
                 tool_call_id,
                 result,
                 ..
-            } => {
-                let is_dispatch =
-                    in_flight.remove(&tool_call_id).as_deref() == Some("dispatch_goal");
-                if !is_dispatch {
-                    continue;
-                }
-                if let Some(goal_id) = result.get("goal_id").and_then(|v| v.as_str()) {
-                    if !journal.goals.iter().any(|g| g == goal_id) {
-                        journal.goals.push(goal_id.to_string());
-                        emit(
-                            &out,
-                            &session_id,
-                            "message.goal",
-                            serde_json::json!({ "message_id": message_id, "goal_id": goal_id }),
-                        )
-                        .await;
+            } => match in_flight.remove(&tool_call_id).as_deref() {
+                Some("dispatch_goal") => {
+                    if let Some(goal_id) = result.get("goal_id").and_then(|v| v.as_str()) {
+                        if !journal.goals.iter().any(|g| g == goal_id) {
+                            journal.goals.push(goal_id.to_string());
+                            emit(
+                                &out,
+                                &session_id,
+                                "message.goal",
+                                serde_json::json!({ "message_id": message_id, "goal_id": goal_id }),
+                            )
+                            .await;
+                        }
                     }
                 }
-            }
+                Some("get_change") => {
+                    let change_id = result
+                        .get("change")
+                        .and_then(|change| change.get("identity"))
+                        .and_then(|v| v.as_str());
+                    if let Some(change_id) = change_id {
+                        if !journal.changes.iter().any(|c| c == change_id) {
+                            journal.changes.push(change_id.to_string());
+                            emit(
+                                &out,
+                                &session_id,
+                                "message.change",
+                                serde_json::json!({
+                                    "message_id": message_id,
+                                    "change_id": change_id,
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -426,6 +584,8 @@ pub async fn run_chat_turn(
     // 这条连接握手时自报的平台与设备，原样带进这一轮。见 [`ConversationRequest`]。
     platform: Option<String>,
     device_id: Option<String>,
+    // 这条连接上正在跑的轮。这一轮登记进去，客户端的停止才找得到它。
+    running: RunningTurns,
 ) {
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).
@@ -436,6 +596,15 @@ pub async fn run_chat_turn(
 
     let assistant_mid = format!("assistant-{}", uuid::Uuid::new_v4());
     emit_message_start(&out, &session_id, &assistant_mid, "assistant").await;
+    // 登记得早，摘得晚：这中间只要漏一条路，停止按钮就会在这段对话上找不到这一
+    // 轮，而用户已经按下去了。所以摘不靠某一条 return，靠 guard——它的寿命就是
+    // 这一轮在这个函数里的寿命。
+    let stop = running.register(&session_id, &assistant_mid);
+    let _registered = RunningGuard {
+        running: &running,
+        session_id: &session_id,
+        message_id: &assistant_mid,
+    };
 
     let Some(conversation) = state.conversation.get().cloned() else {
         let reason =
@@ -471,15 +640,15 @@ pub async fn run_chat_turn(
     // 3. Hand it over. 事件由另一个任务读：循环要能一直往管道里写，不因为这一头
     //    在等它返回而互相卡住。
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
-    let pump = tokio::spawn(pump_events(
+    let mut pump = tokio::spawn(pump_events(
         events_rx,
         out.clone(),
         state.event_tx.clone(),
         session_id.clone(),
         assistant_mid.clone(),
     ));
-    let outcome = conversation
-        .turn(
+    let outcome = run_until_stopped(
+        conversation.turn(
             ConversationRequest {
                 session_id: session_id.clone(),
                 owner,
@@ -489,11 +658,53 @@ pub async fn run_chat_turn(
                 device_id,
             },
             events_tx,
+        ),
+        stop,
+    )
+    .await;
+
+    // 被叫停时，那一轮的 future 刚被丢下：它手里的事件发送端跟着没了，读回这一头
+    // 应当立刻看到管道关闭。等一会儿只是兜底——真有谁克隆了发送端、把管道撑住，
+    // 也不能让停止按钮卡在这里。已经流到屏幕上的字不算白说：那一半记在这一轮的
+    // 记录里，用户看到的就是结束在这儿。
+    let journal = if matches!(&outcome, TurnOutcome::Stopped) {
+        match tokio::time::timeout(STOPPED_DRAIN, &mut pump).await {
+            Ok(journal) => journal.unwrap_or_default(),
+            Err(_) => {
+                pump.abort();
+                TurnJournal::default()
+            }
+        }
+    } else {
+        pump.await.unwrap_or_default()
+    };
+
+    // 4a. 被停掉的那一轮：先说「停了」，再说「这一轮结束了」。
+    //
+    // 叫停的那一刻，这一轮的结果已经被丢下了；一个「丢了还能读回来」的结果只可能
+    // 是假的，所以这里不再看它。
+    if matches!(&outcome, TurnOutcome::Stopped) {
+        let reason = "已中止";
+        emit(
+            &out,
+            &session_id,
+            "message.cancelled",
+            serde_json::json!({ "message_id": assistant_mid }),
         )
         .await;
-    let journal = pump.await.unwrap_or_default();
+        // 记录先落，再发收尾帧：界面上收到上面那一帧会立刻允许追问，而下一轮读
+        // 历史就在这之后——不先落库，被停掉的那一句在下一轮的上下文里不存在。
+        record_failed_turn(&state.chat_turns, &session_id, &content, reason).await;
+        emit_message_end(&out, &session_id, &assistant_mid).await;
+        return;
+    }
 
     // 4. 收尾：说过的字已经在屏幕上，这里只补这一轮没话可说的那两种情况。
+    let outcome = match outcome {
+        TurnOutcome::Finished(outcome) => outcome,
+        // 上面已经 return。
+        TurnOutcome::Stopped => unreachable!("a stopped turn returned above"),
+    };
     let mut reply = journal.reply;
     let mut failure: Option<String> = None;
     match outcome {
@@ -1088,5 +1299,165 @@ mod tests {
         assert_eq!(v["payload"]["type"], "message.start");
         assert_eq!(v["payload"]["payload"]["message_id"], "m1");
         assert_eq!(v["payload"]["payload"]["role"], "assistant");
+    }
+
+    /// 停止是一族有名字的上行消息，名字就是 `chat_cancel`。
+    ///
+    /// 界面按这个名字发，网关按这个名字认。名字错了不会有报错：那条消息落进
+    /// 「不是这一族的上行消息」，用户按下的停止在服务端根本没有发生过。
+    #[test]
+    fn a_stop_is_a_message_of_its_own_named_chat_cancel() {
+        let raw = serde_json::json!({
+            "type": "chat_cancel",
+            "session_id": "s-1",
+            "timestamp": "2026-11-11T00:00:00Z",
+        });
+        match serde_json::from_value::<crate::websocket_protocol::ClientMessage>(raw) {
+            Ok(crate::websocket_protocol::ClientMessage::ChatCancel { session_id, .. }) => {
+                assert_eq!(session_id, "s-1");
+            }
+            other => panic!("`chat_cancel` 没有解析成停止：{other:?}"),
+        }
+        // 不带时间戳也要认得出：时间戳只是旁注，不是这条消息的身份。
+        let bare = serde_json::json!({ "type": "chat_cancel", "session_id": "s-1" });
+        assert!(matches!(
+            serde_json::from_value::<crate::websocket_protocol::ClientMessage>(bare),
+            Ok(crate::websocket_protocol::ClientMessage::ChatCancel { .. })
+        ));
+        // 反过来：一句聊天不是一个停止。两条消息共用一个名字时，用户每说一句话
+        // 就会把自己上一轮停掉。
+        let chat = serde_json::json!({ "type": "chat_message", "content": "你好" });
+        assert!(matches!(
+            serde_json::from_value::<crate::websocket_protocol::ClientMessage>(chat),
+            Ok(crate::websocket_protocol::ClientMessage::ChatMessage { .. })
+        ));
+    }
+
+    /// 一次停止停的是这一段上**全部**在跑的轮，别的那一段一轮都不动。
+    ///
+    /// 同一段对话里可以同时有好几轮（用户连发两句），而客户端只拿着会话号；
+    /// 把「发一句就少停一轮」写进这里，第二句的回答会在用户停手之后继续往下说。
+    #[tokio::test]
+    async fn a_stop_reaches_every_turn_in_that_session_and_no_other() {
+        let running = RunningTurns::new();
+        let first = running.register("s-1", "m-1");
+        let second = running.register("s-1", "m-2");
+        let elsewhere = running.register("s-2", "m-3");
+
+        // 没有停止之前，一段上那两个接收端一个都不该动。
+        let mut first = first.clone();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), first.changed())
+                .await
+                .is_err()
+        );
+
+        assert_eq!(running.cancel("s-1"), 2);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), wait_cancelled(first))
+                .await
+                .is_ok(),
+            "这一段上第一轮没有收到停止"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), wait_cancelled(second))
+                .await
+                .is_ok(),
+            "这一段上第二轮没有收到停止"
+        );
+        // 另一段对话上那一轮的信号没有被动过：它还在等。
+        let mut elsewhere = elsewhere;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), elsewhere.changed())
+                .await
+                .is_err()
+        );
+    }
+
+    /// 结束掉的那一轮再也不会被停：停止按钮不该停到上一轮的尸体上。
+    ///
+    /// 不摘干净的话，名册会一直长：一段开过几十轮的对话关掉以后，这里留着一串
+    /// 没人接的信号，下一次停止发给它们，而真正在跑的那一轮收不到。
+    #[tokio::test]
+    async fn a_finished_turn_is_not_stopped_again() {
+        let running = RunningTurns::new();
+        let stop = running.register("s-1", "m-1");
+        running.finish("s-1", "m-1");
+        assert_eq!(running.cancel("s-1"), 0);
+        assert!(!*stop.borrow());
+    }
+
+    /// 停止信号消失不等于用户按了停止。
+    ///
+    /// 通道的发送端在「这一轮结束」「连接被清掉」时都会消失；把这件事读成停止，
+    /// 会在与用户意图无关的时刻把一轮好好的回答砍掉——而那正是最难复现的一类。
+    #[tokio::test]
+    async fn a_signal_that_disappears_without_a_stop_does_not_stop_anything() {
+        let (stop, rx) = watch::channel(false);
+        drop(stop);
+        let work = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            7
+        };
+        match run_until_stopped(work, rx).await {
+            TurnOutcome::Finished(value) => assert_eq!(value, 7),
+            TurnOutcome::Stopped => panic!("发送端关掉被读成了「用户按了停止」"),
+        }
+    }
+
+    /// 停下来的那一轮是真的被放下了，不是「结果没人要」。
+    ///
+    /// 循环、模型调用、工具调用都在那个 future 里。只丢结果不丢 future 的写法在
+    /// 屏幕上看起来一模一样，而模型那边还在生成、花销还在记——停止按钮就成了一个
+    /// 遮住屏幕的动作。
+    #[tokio::test]
+    async fn a_stop_drops_the_turn_instead_of_letting_it_finish() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Dropped(dropped.clone());
+        let (stop, rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            run_until_stopped(
+                async move {
+                    let _flag = flag;
+                    std::future::pending::<()>().await;
+                },
+                rx,
+            )
+            .await
+        });
+
+        // 让那一轮真的开始等，再按停止：不然这里测的是「还没开始就被丢掉」。
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        stop.send(true).expect("the turn is still registered");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("停止之后那一轮没有结束")
+            .expect("the turn task did not panic");
+        assert!(matches!(outcome, TurnOutcome::Stopped));
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "那一轮的结果被丢掉了，但它自己还在跑：停止没有真的停下来"
+        );
+    }
+
+    /// 一轮先跑完、停止后到：结局是跑完，不是被停。
+    #[tokio::test]
+    async fn a_turn_that_ends_before_the_stop_is_not_called_stopped() {
+        let (stop, rx) = watch::channel(false);
+        let outcome = run_until_stopped(async { 7 }, rx).await;
+        let _ = stop;
+        match outcome {
+            TurnOutcome::Finished(value) => assert_eq!(value, 7),
+            TurnOutcome::Stopped => panic!("已经答完的一轮被读成了被停"),
+        }
     }
 }

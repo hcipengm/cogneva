@@ -49,6 +49,21 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// 停止这一段对话里正在跑的轮。
+    ///
+    /// 寻址按会话，不按某一轮：客户端拿着的是会话号，一轮的身份（`message_id`）
+    /// 是服务端生出来的，用户按下停止时屏幕上并没有它。同一段对话里可以有好几轮
+    /// 同时在跑（用户连发两句），所以一次停止停的是这一段上全部在跑的那些。
+    ///
+    /// 停的那一轮会收到 `message.cancelled` 再收到 `message.end`：界面靠前一帧
+    /// 把这一轮标成「被停掉」，靠后一帧收掉光标；只发后者的话，一屏被停掉的回答
+    /// 与一屏「模型没有返回任何内容」长得一模一样。
+    #[serde(rename = "chat_cancel")]
+    ChatCancel {
+        session_id: String,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
 }
 
 /// Server → Client WebSocket messages.

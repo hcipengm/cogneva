@@ -220,6 +220,14 @@ interface ShellState {
    * 消费掉——它才是唯一知道这一行在正文里是什么位置的那一层。
    */
   reveal: { path: string; line: number; query: string } | null;
+  /**
+   * 「把这一道目标 / 这一条变更打开到账上」的请求。
+   *
+   * 与 `reveal` 同一个形状的理由：对话里读到的是身份（`goal_id`、三段变更身份），
+   * 而落到哪一行、需不需要先翻页，只有账那一面自己知道。请求留在这里，账那面
+   * 读到之后自己消费掉——它才是唯一知道这一行在不在当前那一页上的那一层。
+   */
+  focus: { kind: 'goal' | 'change'; id: string } | null;
 
   setActivity: (activity: ActivityId) => void;
   toggleSidebar: () => void;
@@ -237,6 +245,9 @@ interface ShellState {
   appendOutput: (line: string) => void;
   clearOutput: () => void;
   setReveal: (reveal: ShellState['reveal']) => void;
+  setFocus: (focus: ShellState['focus']) => void;
+  /** 打开对应的账并把焦点落到这一行。 */
+  focusRecord: (kind: 'goal' | 'change', id: string) => void;
 }
 
 const FIRST_TAB: EditorTab = {
@@ -259,6 +270,7 @@ export const useShell = create<ShellState>((set, get) => ({
   paletteSeed: '',
   output: [],
   reveal: null,
+  focus: null,
 
   setActivity: (activity) =>
     set((state) => {
@@ -369,6 +381,13 @@ export const useShell = create<ShellState>((set, get) => ({
     })),
   clearOutput: () => set({ output: [] }),
   setReveal: (reveal) => set({ reveal }),
+  setFocus: (focus) => set({ focus }),
+  focusRecord: (kind, id) => {
+    // 先切到那一面（它会开出或激活对应页签），再把落点留下。顺序反过来时，
+    // 目标那一面已经挂载、读到的是空的落点，于是这一跳什么都不发生。
+    get().setActivity(kind === 'goal' ? 'projects' : 'changes');
+    set({ focus: { kind, id } });
+  },
 }));
 
 /** 一页页签的身份：视图键就是身份，同一面不会开两页。 */

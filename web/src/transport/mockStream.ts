@@ -39,8 +39,31 @@ export class MockEventStreamClient {
     this.options.onStatusChange?.('closed');
   }
 
-  send(_message: unknown): void {
-    // Mock transport does not send to a real server.
+  /**
+   * 演示流不往服务端送东西，除了一个停止：那一帧在这里要真的应验，否则演示里
+   * 的停止按钮就是一个按下去什么都不发生的按钮——而它与真后端上的那个长得一样。
+   */
+  send(message: unknown): void {
+    const type = (message as { type?: string } | null)?.type;
+    if (type === 'chat_cancel') this.cancelStream();
+  }
+
+  /** 正在流的那一条。停止要停的是它，不是随便哪一条。 */
+  private streamingMid: string | null = null;
+
+  private cancelStream(): void {
+    if (!this.streamingMid) return;
+    const mid = this.streamingMid;
+    this.streamingMid = null;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    // 与服务端同序：先说「停了」，再说「这一轮结束了」。
+    this.chat('cancelled', mid);
+    this.chat('end', mid);
+    this.emit('state_change', { from: 'thinking', to: 'idle' });
+    this.emit('agent_end', { messages: [] });
   }
 
   simulateUserMessage(text: string): void {
@@ -57,7 +80,7 @@ export class MockEventStreamClient {
 
   /** 一帧聊天。名字带点，与 `crates/cog-gateway/src/chat.rs` 发的一致。 */
   private chat(
-    kind: 'start' | 'text_delta' | 'end' | 'identity',
+    kind: 'start' | 'text_delta' | 'end' | 'cancelled' | 'identity',
     messageId: string,
     fields: Record<string, unknown> = {}
   ): void {
@@ -70,6 +93,8 @@ export class MockEventStreamClient {
       role: (fields.role as 'user' | 'assistant' | null) ?? null,
       delta: (fields.delta as string | null) ?? null,
       goalId: (fields.goalId as string | null) ?? null,
+      // 假流也不翻账：变更身份只从真服务的工具返回里来，这里没有就是没有。
+      changeId: (fields.changeId as string | null) ?? null,
       // 假流不扮身份：没有人脸要报，就没有这一格。字段必填是为了让真流里
       // 「这一轮是谁在说」不会静默缺一帧；空值在这里就是「假流不报」。
       agentId: (fields.agentId as string | null) ?? null,
@@ -107,9 +132,11 @@ export class MockEventStreamClient {
     this.chat('start', replyMid, { role: 'assistant' });
 
     let index = 0;
+    this.streamingMid = replyMid;
     const stream = () => {
       if (!this.connected) return;
       if (index >= replyText.length) {
+        this.streamingMid = null;
         this.chat('end', replyMid);
         // 回话之后调一次工具：活动面板要能看见「读了哪个文件」，而不是只有
         // 一段文字流过去。

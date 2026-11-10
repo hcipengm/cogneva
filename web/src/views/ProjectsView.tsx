@@ -33,6 +33,7 @@ import {
   rowsForProject,
   type LiveTaskRow,
 } from '@/store/liveProjects';
+import { useRecordFocus } from '@/shell/useRecordFocus';
 import { useLiveProjectStore } from '@/store/liveProjectStore';
 import { STRIP_CAP, visibleProjects } from '@/views/projectStrip';
 import {
@@ -182,6 +183,20 @@ export function ProjectsView() {
   const projects = useProjectPages();
   const rows = projects.rows;
   const totalProjects = projects.totalProjects;
+
+  // 对话里点了一道目标：把它放到这一面选中的那一格上。
+  //
+  // 认领的条件是「这一行已经在读回来的这一页里」——还没读到就等下一次：这一面
+  // 是按任务数分页读的，一次点击不该因为读数慢半拍就落到别的项目上。
+  const pickGoal = useCallback(
+    (id: string) => {
+      if (!rows.some((row) => row.id === id)) return false;
+      setPicked(id);
+      return true;
+    },
+    [rows]
+  );
+  useRecordFocus('goal', pickGoal);
 
   // 没选过就落在任务最多的那个真项目上。落在未分组桶上会一进门就是一屏
   // 「这桶没有范围结构」，读者会以为整个项目面是坏的。

@@ -89,6 +89,8 @@ async fn handle_type_message(
     out_tx: &tokio::sync::mpsc::Sender<String>,
     // 转发进这一轮，落到「说过话的人」那一行上。
     origin: ClientOrigin<'_>,
+    // 这条连接上正在跑的轮：`chat_cancel` 按会话找它们。
+    running: &crate::chat::RunningTurns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -142,12 +144,20 @@ async fn handle_type_message(
             let owner = user_id.to_string();
             let platform = origin.platform.map(str::to_string);
             let device_id = origin.device_id.map(str::to_string);
+            let running = running.clone();
             tokio::spawn(async move {
                 crate::chat::run_chat_turn(
-                    state, out, session, content, owner, platform, device_id,
+                    state, out, session, content, owner, platform, device_id, running,
                 )
                 .await;
             });
+        }
+        ClientMessage::ChatCancel { session_id, .. } => {
+            // 没有在跑的那一段上按停止不是错：用户可能刚好在上一轮结束的那一瞬
+            // 按下去。这时什么都不发生，也不该有一条「取消失败」的帧——他真正
+            // 关心的是屏幕上那一轮停了没有，而它已经停了。
+            let stopped = running.cancel(&session_id);
+            tracing::debug!(session = %session_id, stopped, "chat cancel");
         }
     }
 
@@ -223,6 +233,9 @@ pub async fn handle_socket(
     // Outbound queue for messages produced outside the event broadcast (e.g.
     // chat replies from spawned LLM tasks).
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
+    // 这一条连接上正在跑的轮。按连接分，不放进 `GatewayState`：一段对话的停止是
+    // 「这一次连接里跑着的那几轮」，从别的标签页发出的停止不该停掉这一页上的回答。
+    let running = crate::chat::RunningTurns::new();
 
     // Register connection and send "connected" event.
     if let Some(ref mgr) = state.connection_manager {
@@ -352,6 +365,7 @@ pub async fn handle_socket(
                                     platform: platform.as_deref(),
                                     device_id: device_id.as_deref(),
                                 },
+                                &running,
                             )
                             .await
                         {

@@ -491,6 +491,8 @@ mod volume_footprint_declaration_test;
 mod wal_event_round_trip_test;
 #[path = "web_chat_frames_read_fields_the_socket_writes_test.rs"]
 mod web_chat_frames_read_fields_the_socket_writes_test;
+#[path = "web_chat_works_like_a_workspace_test.rs"]
+mod web_chat_works_like_a_workspace_test;
 #[path = "web_client_api_functions_are_called_test.rs"]
 mod web_client_api_functions_are_called_test;
 #[path = "web_client_branch_words_are_words_the_server_writes_test.rs"]

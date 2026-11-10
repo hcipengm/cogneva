@@ -3,6 +3,7 @@ import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch'
 import type { StreamClient } from '@/hooks/useEventStream';
 import { sessionKind, useChatStore, type ChatMessage, type ChatSession } from '@/store/chatStore';
 import { useStreamStore, type ToolCallRecord } from '@/store/streamStore';
+import { useShell } from '@/shell/store';
 import { Note } from '@/ui/Note';
 
 /**
@@ -18,6 +19,16 @@ function stamp(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+}
+
+/**
+ * 账上一条变更的叫法。身份是 `kind:scope:literal` 三段，正文里那段才是人认得的；
+ * 整串放在悬停提示里——点进去靠的是整串，读名字靠的是这一段。
+ */
+function shortChange(id: string): string {
+  const parts = id.split(':');
+  const literal = parts.length >= 3 ? parts.slice(2).join(':') : id;
+  return literal.length > 14 ? `${literal.slice(0, 14)}…` : literal;
 }
 
 function Turn({ message }: { message: ChatMessage }) {
@@ -272,6 +283,8 @@ export function ConversationPane({
   const session = useChatStore((s) => s.sessions[sessionId]);
   const appendUserTurn = useChatStore((s) => s.appendUserTurn);
   const hydrate = useChatStore((s) => s.hydrate);
+  /** 把账上的某一行打开。这一面只知道身份，落到哪一行由账那一面决定。 */
+  const focusRecord = useShell((s) => s.focusRecord);
   const [draft, setDraft] = useState('');
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
@@ -402,6 +415,17 @@ export function ConversationPane({
 
   const streaming = Boolean(session.streaming);
 
+  /**
+   * 停下这一段上正在跑的那一轮。
+   *
+   * 界面上不做本地拦截：停了没有，由服务端那一帧说了算（`message.cancelled`
+   * 之后紧跟收尾帧）。本地先把光标收掉的话，一次没送到的停止会看起来像停下了，
+   * 而模型那边还在说——屏幕和账从此不是一件事。
+   */
+  const stop = () => {
+    clientRef.current?.send({ type: 'chat_cancel', session_id: sessionId });
+  };
+
   return (
     <section
       onMouseDown={onFocus}
@@ -444,13 +468,41 @@ export function ConversationPane({
           {session.title}
         </Note>
         <KindBadge session={session} live={live} />
+        {/*
+          目标与变更都是账上的行，所以每一个都能点进去。这里只是入口：这一面
+          不知道那一行在账的第几页，所以它把身份交出去，由账那一面落位。
+        */}
         {session.goals.length > 0 && (
-          <Note
-            className="mono shrink-0 text-[10px] text-[var(--muted)]"
-            text={`目标 ${session.goals.map((goal) => goal.id).join('、')}`}
-          >
-            目标 {session.goals.map((goal) => shortGoal(goal.id)).join(' ')}
-          </Note>
+          <span className="flex shrink-0 items-baseline gap-1 text-[10px] text-[var(--muted)]">
+            目标
+            {session.goals.map((goal) => (
+              <button
+                key={goal.id}
+                type="button"
+                onClick={() => focusRecord('goal', goal.id)}
+                title={`在项目面打开目标 ${goal.id}`}
+                className="mono text-[var(--brass)] transition-opacity hover:opacity-70"
+              >
+                {shortGoal(goal.id)}
+              </button>
+            ))}
+          </span>
+        )}
+        {session.changes.length > 0 && (
+          <span className="flex min-w-0 shrink items-baseline gap-1 text-[10px] text-[var(--muted)]">
+            变更
+            {session.changes.slice(-3).map((change) => (
+              <button
+                key={change.id}
+                type="button"
+                onClick={() => focusRecord('change', change.id)}
+                title={`在变更账上打开 ${change.id}`}
+                className="mono max-w-[12ch] truncate text-[var(--brass)] transition-opacity hover:opacity-70"
+              >
+                {shortChange(change.id)}
+              </button>
+            ))}
+          </span>
         )}
         <span className="ml-auto flex items-center gap-3">
           {session.hydrating && (
@@ -530,6 +582,17 @@ export function ConversationPane({
             aria-label="说一句话"
             className="min-w-0 flex-1 bg-transparent px-0.5 py-1 text-[13px] text-[var(--paper)] outline-none placeholder:text-[var(--muted)]"
           />
+          {streaming && (
+            <button
+              type="button"
+              onClick={stop}
+              className="mono shrink-0 px-2 text-[10px] transition-opacity hover:opacity-70"
+              style={{ color: 'var(--danger)' }}
+              title="停下这一段上正在跑的这一轮；说过的字留着，这一轮记为已中止"
+            >
+              ■ 停止
+            </button>
+          )}
           <button
             type="button"
             onClick={send}

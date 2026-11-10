@@ -64,9 +64,22 @@ export interface ChatSession {
    * 一答。空表示还不知道——这一轮还没开始，或者服务端比这一页老。
    */
   agentId: string | null;
+  /**
+   * 这一段对话翻开过的变更，带翻开的时间。
+   *
+   * 与目标同一类东西：它们是这段对话在账上真读过的那几行，而正文里提到的「那条
+   * 变更」只是一句话。点得到账上的那一行，靠的是这串身份。
+   */
+  changes: ChangeRef[];
 }
 
 export interface GoalRef {
+  id: string;
+  at: string;
+}
+
+/** 账上的一条变更：`kind:scope:literal` 三段身份。 */
+export interface ChangeRef {
   id: string;
   at: string;
 }
@@ -132,10 +145,10 @@ function titleFrom(text: string): string {
  */
 const FIRST = 'default';
 
-function emptySession(id: string): ChatSession {
+function emptySession(id: string, title = '新的对话'): ChatSession {
   return {
     id,
-    title: '新的对话',
+    title,
     messages: [],
     hydrated: false,
     hydrating: false,
@@ -143,7 +156,64 @@ function emptySession(id: string): ChatSession {
     streaming: null,
     goals: [],
     agentId: null,
+    changes: [],
   };
+}
+
+/**
+ * 开着哪几段对话，记在这一台机器的这个浏览器里。
+ *
+ * 与左栏宽度、页签顺序同一类：它回答的是「我上次开着什么」，不是平台的事。
+ * 不记的话，刷新一次多段对话就全回到默认那一段——而「同时开几段、来回切」正是
+ * 这个界面存在的理由之一。
+ */
+const DOCK_STORAGE_KEY = 'cogneva.chatSessions';
+
+interface DockEntry {
+  id: string;
+  title: string;
+}
+
+function bootDock(): { sessions: Record<string, ChatSession>; order: string[]; active: string } {
+  let entries: DockEntry[] = [{ id: FIRST, title: '新的对话' }];
+  try {
+    const raw = window.localStorage.getItem(DOCK_STORAGE_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    if (Array.isArray(parsed)) {
+      const read = parsed
+        .filter(
+          (entry): entry is DockEntry =>
+            Boolean(entry) &&
+            typeof (entry as DockEntry).id === 'string' &&
+            (entry as DockEntry).id.length > 0 &&
+            typeof (entry as DockEntry).title === 'string'
+        )
+        .map((entry) => ({ id: entry.id, title: entry.title }));
+      if (read.length > 0) entries = read;
+    }
+  } catch {
+    // 隐私模式下面 localStorage 会抛：这一段照样能开新对话，只是刷新后回到默认。
+  }
+  const sessions: Record<string, ChatSession> = {};
+  const order: string[] = [];
+  for (const entry of entries) {
+    if (sessions[entry.id]) continue;
+    sessions[entry.id] = emptySession(entry.id, entry.title);
+    order.push(entry.id);
+  }
+  return { sessions, order, active: order[0] };
+}
+
+/** 把现在的顺序与标题写回去。写不进去只影响下一次打开，不影响这一屏。 */
+function saveDock(state: Pick<ChatState, 'sessions' | 'order'>): void {
+  try {
+    const entries = state.order
+      .filter((id) => state.sessions[id])
+      .map((id) => ({ id, title: state.sessions[id].title }));
+    window.localStorage.setItem(DOCK_STORAGE_KEY, JSON.stringify(entries));
+  } catch {
+    // 同上。
+  }
 }
 
 /** 改一段会话的一份副本再放回去。所有写入都走它，免得某处漏改一个字段。 */
@@ -172,10 +242,12 @@ function withMessage(
   return touched ? { ...session, messages } : session;
 }
 
+const boot = bootDock();
+
 export const useChatStore = create<ChatState>((set, get) => ({
-  sessions: { [FIRST]: emptySession(FIRST) },
-  order: [FIRST],
-  active: FIRST,
+  sessions: boot.sessions,
+  order: boot.order,
+  active: boot.active,
 
   createSession: (title) => {
     const id = `conv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -187,10 +259,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       order: [id, ...state.order],
       active: id,
     }));
+    saveDock(get());
     return id;
   },
 
-  openSession: (id) =>
+  openSession: (id) => {
     set((state) => {
       if (state.sessions[id]) return { active: id };
       return {
@@ -198,12 +271,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         order: [id, ...state.order],
         active: id,
       };
-    }),
+    });
+    saveDock(get());
+  },
 
   setActive: (id) =>
     set((state) => (state.sessions[id] ? { active: id } : state)),
 
-  closeSession: (id) =>
+  closeSession: (id) => {
     set((state) => {
       pendingEcho.delete(id);
       const order = state.order.filter((other) => other !== id);
@@ -216,10 +291,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         order,
         active: state.active === id ? order[0] : state.active,
       };
-    }),
+    });
+    saveDock(get());
+  },
 
-  renameSession: (id, title) =>
-    set((state) => withSession(state, id, (session) => ({ ...session, title }))),
+  renameSession: (id, title) => {
+    set((state) => withSession(state, id, (session) => ({ ...session, title })));
+    saveDock(get());
+  },
 
   appendUserTurn: (sessionId, text) => {
     const id = localId();
@@ -250,7 +329,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return id;
   },
 
-  ingestFrame: (frame) =>
+  ingestFrame: (frame) => {
+    const known = Boolean(get().sessions[frame.sessionId]);
     set((state) => {
       const base = state.sessions[frame.sessionId] ?? emptySession(frame.sessionId);
       let session = base;
@@ -329,12 +409,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
           break;
         }
 
-        case 'end': {
+        case 'cancelled': {
+          // 被停掉的那一轮：它没有失败原因（模型没坏），也不该被画成答完了。
+          // 原因只写一次——收尾帧紧跟着来，再来一次会把这句话盖成别的原因。
           session = withMessage(session, frame.messageId, (message) => ({
             ...message,
-            status: message.text.trim() ? 'done' : 'failed',
-            failure: message.text.trim() ? message.failure : '这一轮没有说出任何内容',
+            status: 'failed',
+            failure: message.failure ?? '已中止（这一轮没有跑完）',
           }));
+          if (session.streaming === frame.messageId) {
+            session = { ...session, streaming: null };
+          }
+          break;
+        }
+
+        case 'end': {
+          session = withMessage(session, frame.messageId, (message) => {
+            // 已经有原因的（被停掉、上游失败）不再改写成别的：收尾帧只负责收掉
+            // 这一轮，它不知道这一轮为什么停，而屏幕上的原因已经写对了。
+            if (message.failure) return { ...message, status: 'failed' };
+            const spoke = Boolean(message.text.trim());
+            return {
+              ...message,
+              status: spoke ? 'done' : 'failed',
+              failure: spoke ? null : '这一轮没有说出任何内容',
+            };
+          });
           if (session.streaming === frame.messageId) {
             session = { ...session, streaming: null };
           }
@@ -374,6 +474,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           }
           break;
         }
+
+        case 'change': {
+          if (!frame.changeId) break;
+          if (!session.changes.some((change) => change.id === frame.changeId)) {
+            session = {
+              ...session,
+              changes: [...session.changes, { id: frame.changeId, at: frame.timestamp }],
+            };
+          }
+          break;
+        }
       }
 
       return {
@@ -382,7 +493,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ? state.order
           : [frame.sessionId, ...state.order],
       };
-    }),
+    });
+    // 帧带来了一段新的对话：它现在开在拨号条上，刷新之后也应该还在。
+    if (!known) saveDock(get());
+  },
 
   hydrate: async (sessionId) => {
     const existing = get().sessions[sessionId];

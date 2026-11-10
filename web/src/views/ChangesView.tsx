@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import {
   getChangeFunnel,
   getChangeTimeline,
@@ -11,6 +11,7 @@ import {
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { useRecordFocus } from '@/shell/useRecordFocus';
 import { resourceKey } from '@/store/frameTick';
 import { money } from '@/topology/format';
 import { Note } from '@/ui/Note';
@@ -347,6 +348,19 @@ export function ChangesView() {
 
   const page = ledger.data;
   const changes = queue.data?.changes ?? [];
+
+  // 对话里点了一条变更：打开这一行的来路。身份是三段，这里只按整串匹配——
+  // 拆开再拼会拼出另一条身份，而错的那一条在账上通常也「存在」，只是不是它。
+  const pickChange = useCallback(
+    (identity: string) => {
+      const row = page?.outstanding.find((item) => item.identity === identity);
+      if (!row) return false;
+      setPicked(row);
+      return true;
+    },
+    [page]
+  );
+  useRecordFocus('change', pickChange);
 
   return (
     <ViewFrame
