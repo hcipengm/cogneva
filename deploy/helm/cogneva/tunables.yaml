@@ -433,11 +433,15 @@ rows:
       database grew to 3.6 GB, the first pass used 38 of the 60 minutes, and the
       second pass was killed by the whole-pass clock with nothing recorded --
       so the oldest unproven package could never be proven. A pass that keeps
-      advancing is no longer stopped at any total. No measured sample of a
-      single step exists yet, which is why this carries the old whole-pass
-      number: at the same value it is strictly more permissive than what it
-      replaced, and it is the value the Job's probe reads until the process has
-      measured a window of its own.
+      advancing is no longer stopped at any total. Advancing is measured, not
+      assumed: the five paths that move data -- export, restore, package,
+      unpack, digest -- record a beat every few megabytes, so one table copied
+      for forty minutes is forty minutes of motion, not forty minutes of
+      silence, and the window only expires when nothing has moved at all. No
+      measured sample of a single step exists yet, which is why this carries
+      the old whole-pass number: at the same value it is strictly more
+      permissive than what it replaced, and it is the value the Job's probe
+      reads until the process has measured a window of its own.
 
   - key: backup.startingDeadlineSeconds
     source: override

@@ -57,13 +57,17 @@ const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 /// 与「没配」同形。
 const BACKUP_DIR_ENV: &str = "COGNEVA_BACKUP_DIR";
 const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
-/// 演练里**一步**静默多久算停（秒）。一步 = 解包、核清单、建空库、恢复、对数……之一。
+/// 演练静默多久算停（秒）。「静默」是**一步之内也没有一块数据搬动**，不是这一步
+/// 走了多久。
 ///
-/// 判据从「这一趟总共用了多久」换成「当前这一步静默了多久」：一趟开得慢不是问题，
-/// 一步卡住不动才是。旧的那个数是整趟的钟，它杀的是**还在一步一步往前走**的运行
-/// ——2026-10-27 实测：第一趟 2271 s 之后，第二趟在 3600 s 的整趟界上被杀，账上
-/// 一行都没留下。现在同样的运行只要每一步都在推进就不被杀；被杀的那一趟一定停在
-/// 某一步上，判词点名是哪一步、静默了多久。
+/// 判据从「这一趟总共用了多久」换成「还有没有在搬」：一趟开得慢不是问题，停下来才是。
+/// 旧的那个数是整趟的钟，它杀的是**还在一步一步往前走**的运行——2026-10-27 实测：
+/// 第一趟 2271 s 之后，第二趟在 3600 s 的整趟界上被杀，账上那一行都没留下。
+///
+/// 光把单位从整趟换到单步还不够：一次 COPY 一张几百万行的表，能在这「一步」里跑上
+/// 几十分钟，边界上仍然只有一次拍，于是「灌得很久」与「灌不动了」读起来一样。所以
+/// 导出、灌回、打包、解包、算摘要这五条搬数据的路都按块记拍（[`BeatsOnIo`]）——只要
+/// 还有一块进去，这一跑就还在动，判词也就不会落在它身上。
 const DRILL_STEP_SILENCE_ENV: &str = "COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS";
 /// 没配 env 时那一步的静默界。数与 values.yaml 的 `backup.drillStepSilenceSeconds`
 /// 同源，由 `deploy/scripts/tests/backup-jobs-stop-on-silence.test.sh` 盯着两边。
@@ -675,6 +679,9 @@ async fn copy_package_table_into(
             break;
         }
         copy_in.send(buf[..n].to_vec()).await?;
+        // 同导出：这一块进去了就是一拍。灌一张几百万行的表可以跑很久，但只要还在
+        // 往里送，它就不是「停住」。
+        cog_core::progress::beat(DATA_PROGRESS_TASK);
     }
     copy_in.finish().await?;
     Ok(())
@@ -765,6 +772,9 @@ pub async fn backup_postgres(
         use std::io::Write;
         while let Some(chunk) = copy_out.next().await {
             file.write_all(&chunk?)?;
+            // 一块就是一段工作量：大表要导很久，而「导了很久」与「导不动了」必须在
+            // 读数面上分得开，否则判停只剩按时间杀这一条路。
+            cog_core::progress::beat(DATA_PROGRESS_TASK);
         }
         drop(copy_out);
         report.tables.push(TableReport {
@@ -1155,6 +1165,9 @@ pub fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
                 bytes += entry.metadata()?.len();
                 std::fs::copy(entry.path(), target)?;
                 files += 1;
+                // 一个文件是一段工作量。对象层与工作区可以有很多小文件，也可以有
+                // 几个很大的：两种都按「搬过一个」记拍，静默才只表示没人搬。
+                cog_core::progress::beat(DATA_PROGRESS_TASK);
             }
         }
     }
@@ -1238,7 +1251,7 @@ impl QdrantHttp {
             .ok_or("qdrant snapshot response missing result.name")?
             .to_string();
 
-        let resp = self
+        let mut resp = self
             .client
             .get(format!(
                 "{}/collections/{collection}/snapshots/{snap_name}",
@@ -1249,8 +1262,19 @@ impl QdrantHttp {
         if !resp.status().is_success() {
             return Err(format!("qdrant download {snap_name} -> {}", resp.status()).into());
         }
-        let bytes = resp.bytes().await?;
-        std::fs::write(out_dir.join(format!("{collection}.snapshot")), &bytes)?;
+        // 一个集合的快照可以有几百 MB，整段读进 `bytes()` 是一次没有中间的等待：外面
+        // 看得见的就是「这一跑很久没动了」，而它其实一直在收字节。按块落盘、按块记拍，
+        // 下载多久只要还在进数据，就不是停住。
+        let path = out_dir.join(format!("{collection}.snapshot"));
+        let mut file = std::fs::File::create(&path)?;
+        {
+            use std::io::Write;
+            while let Some(chunk) = resp.chunk().await? {
+                file.write_all(&chunk)?;
+                cog_core::progress::beat(DATA_PROGRESS_TASK);
+            }
+            file.flush()?;
+        }
 
         let resp = self
             .client
@@ -1455,7 +1479,9 @@ fn tar_package_with_key(
 ) -> std::io::Result<()> {
     let tmp = out.with_extension("tmp");
     {
-        let file = std::fs::File::create(&tmp)?;
+        // 打包是一段读整棵 staging、写整份包的长活：每写出一块记一拍，卡住与「包很大」
+        // 才分得开。
+        let file = BeatsOnIo::new(std::fs::File::create(&tmp)?);
         // 临时名也可能从上一趟没清掉的残留来，所以不放宽成「只在新建时设」。
         restrict_to_owner(&tmp, 0o600)?;
         match key {
@@ -1517,7 +1543,8 @@ fn untar_package_with_key(
     } else {
         Box::new(file)
     };
-    let decoder = zstd::Decoder::new(reader)?;
+    // 解包读的是整份包：每读一块记一拍，解一份大包与解不动在读数面上才分得开。
+    let decoder = zstd::Decoder::new(BeatsOnIo::new(reader))?;
     let mut archive = tar::Archive::new(decoder);
     std::fs::create_dir_all(dest)?;
     // 解出来的树里有 Secret 清单，包内的条目权限沿用了打包时的 0644；
@@ -3949,9 +3976,10 @@ pub struct DrillConfig {
     /// 只开最新那份证明不了保留窗口的其余成员：旧包与读端不同步的问题只在它们
     /// 身上出现，而它们要到真正需要恢复的那天才第一次被打开。
     pub also_unproven: bool,
-    /// 一步静默多久算停。到点由这一跑自己收尾并落一行 `failed`，判词点名停在
+    /// 多久没有一处推进算停。到点由这一跑自己收尾并落一行 `failed`，判词点名停在
     /// 哪一步、静默了多久——而不是等 kubelet 的存活探针把容器杀掉，那样账上一行
-    /// 都不会有。整趟不受这条界约束：只要每一步都在推进，跑多久都行。
+    /// 都不会有。整趟不受这条界约束，一步之内也不受：只要还有一块数据在搬，跑多久
+    /// 都行（记拍的粒度见 [`DATA_PROGRESS_TASK`]）。
     pub step_silence: Duration,
 }
 
@@ -4304,6 +4332,9 @@ fn package_digest(path: &Path) -> std::io::Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
+        // 算摘要要把整份包读一遍，几百 MB 的包读起来比一次导出还久。读一块记一拍：
+        // 这一路也是「在搬」，不是「一步开始了就等它结束」。
+        cog_core::progress::beat(DATA_PROGRESS_TASK);
     }
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
@@ -4698,14 +4729,70 @@ const DRILL_PROGRESS_TASK: &str = "backup-drill";
 /// 备份那一跑在进度面上的名字。
 const BACKUP_PROGRESS_TASK: &str = "backup";
 
-/// 演练里「这一步还在动」的拍子。
+/// 搬数据那几条路共用的名字：导出、灌回、打包、解包、算摘要。
 ///
-/// 判据是**当前这一步静默了多久**，不是这一趟总共用了多久：一趟开得慢不是问题，一步
-/// 卡住不动才是。每一步开工时记一次，静默超过界就由这一跑自己收尾并落一行，判词点名
-/// 是哪一步。
+/// 这些路一条都可能跑上几十分钟而不印一行日志——一次 COPY 就是一大段。只按「做完一步」
+/// 记拍，一段本该在动的活看起来与卡死一模一样，判停就只能按时间杀了。所以记拍的粒度
+/// 跟**工作量**走：搬过一块，就是一拍。
+const DATA_PROGRESS_TASK: &str = "backup-data";
+
+/// 搬多少字节记一拍。它只决定读数的分辨率，不参与任何判断——判据是「多久没有一拍」，
+/// 拍子越密，「静默」越接近「真的没在搬」。
+// cap: fixed — 记拍粒度，不是界；界是那个静默窗口
+const PROGRESS_BYTES_PER_BEAT: usize = 4 * 1024 * 1024;
+
+/// 每搬过 [`PROGRESS_BYTES_PER_BEAT`] 字节记一拍。
 ///
-/// 它同时就是进度文件的那一拍：容器外的存活探针读的是同一个「刚过去了一步」，所以
-/// 两处不会一个说在动、一个说停了。
+/// 包一层读写而不是在每个循环里各写一遍：导出、灌回、打包、解包、算摘要五条路读或写
+/// 的都是同一种流。任何一条忘了记拍，那一条就退回「按跑了多久判死」，而它在读数面上
+/// 与真的停住分不开——正是这种分不开让误杀无从发现。
+struct BeatsOnIo<T> {
+    inner: T,
+    moved: usize,
+}
+
+impl<T> BeatsOnIo<T> {
+    fn new(inner: T) -> Self {
+        Self { inner, moved: 0 }
+    }
+
+    fn note(&mut self, bytes: usize) {
+        self.moved = self.moved.saturating_add(bytes);
+        if self.moved >= PROGRESS_BYTES_PER_BEAT {
+            self.moved = 0;
+            cog_core::progress::beat(DATA_PROGRESS_TASK);
+        }
+    }
+}
+
+impl<T: std::io::Read> std::io::Read for BeatsOnIo<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.note(n);
+        Ok(n)
+    }
+}
+
+impl<T: std::io::Write> std::io::Write for BeatsOnIo<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.note(n);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// 演练里「还在动」的拍子。
+///
+/// 判据是**多久没有任何一处推进**，不是这一趟总共用了多久，也不只是这一步开头到现在的
+/// 距离：每一步开工记一次，搬数据的循环每搬过一块再记一次（[`DATA_PROGRESS_TASK`]）。
+/// 只要还有一块在进去，静默就从那一块算起——判的是动静，不是时长。
+///
+/// 它同时就是进度文件的那一拍：容器外的存活探针读的是同一串拍子，所以两处不会一个
+/// 说在动、一个说停了。
 struct PassWatch {
     current: std::sync::Mutex<StepClock>,
 }
@@ -4737,7 +4824,19 @@ impl PassWatch {
 
     fn silent_for(&self) -> (&'static str, Duration) {
         let current = self.current.lock().unwrap_or_else(|p| p.into_inner());
-        (current.step, current.since.elapsed())
+        let step_silent = current.since.elapsed();
+        // 一步之内也在记拍：搬数据的循环每搬过一块就记一拍。最近一拍比这一步开工更近
+        // 时，静默从那一拍算起——否则「一张表灌了四十分钟」会被读成「这一步静默了四十分钟」，
+        // 而它明明一直在搬。判的是有没有动静，不是这一段花了多久。
+        let beat_silent = [DRILL_PROGRESS_TASK, DATA_PROGRESS_TASK]
+            .into_iter()
+            .filter_map(cog_core::progress::last_beat)
+            .map(|instant| instant.elapsed())
+            .min();
+        let silent = beat_silent
+            .filter(|beat| *beat < step_silent)
+            .unwrap_or(step_silent);
+        (current.step, silent)
     }
 
     /// 等到当前这一步静默超过 `window`，返回（哪一步，静默了多久）。
@@ -5135,6 +5234,9 @@ async fn verify_artifact_stores(
     drill: &mut BackupDrillRecord,
 ) {
     for root in &manifest.artifacts {
+        // 每一个产物根都是一个工作单元：逐个核对可以跑很久，但每过一个根就说明这一跑
+        // 还在往前走，不该被读成停住。
+        cog_core::progress::beat(DATA_PROGRESS_TASK);
         let base = pkg_dir.join(ARTIFACTS_DIR).join(&root.root);
         if root.policies_present {
             let store = cog_reflection::PolicyStore::new(cog_reflection::policies_path(&base));
@@ -5844,6 +5946,22 @@ mod tests {
         assert!(error.contains("3600"), "错误文本没写界：{error}");
         // 而且它必须让这一行读作 failed：面读数按 outcome 取行，不按过程猜。
         assert!(!drill.ok(), "停在一步上的行被判成了成功");
+    }
+
+    /// 「一步之内也在搬」必须在判据里看得见：一张表灌上半小时，只要块还在进去，
+    /// 静默就从最后一块算起，而不是从这一步开工算起。看不见的话，判停就只剩
+    /// 「这一步走了多久」一条路——那就是按时间杀活，正是要拆掉的那种。
+    #[tokio::test]
+    async fn a_chunk_moving_inside_a_step_keeps_the_watch_from_reading_silence() {
+        let watch = PassWatch::new("恢复：灌数据");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cog_core::progress::beat(DATA_PROGRESS_TASK);
+        let (step, silent) = watch.silent_for();
+        assert_eq!(step, "恢复：灌数据");
+        assert!(
+            silent < Duration::from_millis(150),
+            "刚搬过一块的步骤仍被读成静默 {silent:?}：判据又回到了「这一步走了多久」"
+        );
     }
 
     /// 界读不成数时按默认值跑，而不是让整场演练起不来——起不来的那一晚，
