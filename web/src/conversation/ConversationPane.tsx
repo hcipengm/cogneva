@@ -476,15 +476,16 @@ export function ConversationPane({
           <span className="flex shrink-0 items-baseline gap-1 text-[10px] text-[var(--muted)]">
             目标
             {session.goals.map((goal) => (
-              <button
+              <Note
+                as="button"
                 key={goal.id}
                 type="button"
                 onClick={() => focusRecord('goal', goal.id)}
-                title={`在项目面打开目标 ${goal.id}`}
+                text={`在项目面打开目标 ${goal.id}`}
                 className="mono text-[var(--brass)] transition-opacity hover:opacity-70"
               >
                 {shortGoal(goal.id)}
-              </button>
+              </Note>
             ))}
           </span>
         )}
@@ -492,15 +493,16 @@ export function ConversationPane({
           <span className="flex min-w-0 shrink items-baseline gap-1 text-[10px] text-[var(--muted)]">
             变更
             {session.changes.slice(-3).map((change) => (
-              <button
+              <Note
+                as="button"
                 key={change.id}
                 type="button"
                 onClick={() => focusRecord('change', change.id)}
-                title={`在变更账上打开 ${change.id}`}
+                text={`在变更账上打开 ${change.id}`}
                 className="mono max-w-[12ch] truncate text-[var(--brass)] transition-opacity hover:opacity-70"
               >
                 {shortChange(change.id)}
-              </button>
+              </Note>
             ))}
           </span>
         )}
@@ -583,15 +585,16 @@ export function ConversationPane({
             className="min-w-0 flex-1 bg-transparent px-0.5 py-1 text-[13px] text-[var(--paper)] outline-none placeholder:text-[var(--muted)]"
           />
           {streaming && (
-            <button
+            <Note
+              as="button"
               type="button"
               onClick={stop}
               className="mono shrink-0 px-2 text-[10px] transition-opacity hover:opacity-70"
               style={{ color: 'var(--danger)' }}
-              title="停下这一段上正在跑的这一轮；说过的字留着，这一轮记为已中止"
+              text="停下这一段上正在跑的这一轮；说过的字留着，这一轮记为已中止"
             >
               ■ 停止
-            </button>
+            </Note>
           )}
           <button
             type="button"
