@@ -506,16 +506,6 @@ pub const SOURCES_METRIC: &str = "cogneva_outward_sources_configured";
 
 pub(crate) const LABEL_SOURCE: &str = "source";
 
-/// The `items` cell that counts answer entries the backend ranked but which
-/// carried no http(s) URL, so nothing could be handed over from them.
-///
-/// Named once because two places decide it: `declare_source` seeds the cell at
-/// zero the moment a source is seen, and each pass adds to it. A spelling that
-/// moved in one place and not the other would leave the census declaring a cell
-/// no pass ever writes. It is not `FetchFault::Unparsable`, which is a `passes`
-/// cell: an answer that parsed and held cards is a pass that produced few items.
-pub(crate) const UNUSABLE_CELL: &str = "unusable";
-
 fn bump(map: &mut BTreeMap<String, BTreeMap<String, u64>>, source: &str, cell: &str, by: u64) {
     *map.entry(source.to_string())
         .or_default()
@@ -534,18 +524,17 @@ impl OutwardCensus {
         self.state.lock().await.config = Some((cell, sources));
     }
 
-    /// 这条源的四格结局从见到它那一刻起就存在，值可以是 0。
+    /// 这条源的三格结局从见到它那一刻起就存在，值可以是 0。
     ///
     /// 计数只在事情发生时加一，于是「一条也没交出去」与「这一格没接上」在读数面
     /// 上长得一样：两条都是序列缺席。外循环最要紧的那个问题恰好是前一种——它跑
-    /// 了、抓到了、却一条也没交出去——所以四格先落到 0，之后只往上加。
+    /// 了、抓到了、却一条也没交出去——所以三格先落到 0，之后只往上加。
     pub async fn declare_source(&self, source: &str) {
         let mut state = self.state.lock().await;
         for cell in [
             Handover::Handed.cell(),
             Handover::AlreadyHeld.cell(),
             Handover::Failed.cell(),
-            UNUSABLE_CELL,
         ] {
             bump(&mut state.items, source, cell, 0);
         }
@@ -810,9 +799,6 @@ pub fn spawn_outward_loop(
                                 &source.name,
                                 tick.fault.map(FetchFault::cell).unwrap_or("ok"),
                             )
-                            .await;
-                        census
-                            .record_items(&source.name, UNUSABLE_CELL, tick.unusable as u64)
                             .await;
                         for item in &tick.items {
                             let outcome = hand_over(&orchestrator, source, item).await;
@@ -1344,7 +1330,7 @@ mod tests {
     /// 一条也没交出去，读数要说 0，而不是整条缺席。
     ///
     /// 缺席的序列与「跑了一整天、一条都没交出去」在面板上是同一片空白，而后者
-    /// 正是外循环要回答的问题。四格在见到源的那一刻就落到 0。
+    /// 正是外循环要回答的问题。三格在见到源的那一刻就落到 0。
     #[tokio::test]
     async fn a_source_that_handed_nothing_reads_zero_rather_than_nothing() {
         let census = OutwardCensus::new();
@@ -1358,9 +1344,8 @@ mod tests {
                 ("rust".to_string(), "already_held".to_string(), 0.0),
                 ("rust".to_string(), "failed".to_string(), 0.0),
                 ("rust".to_string(), "handed".to_string(), 0.0),
-                ("rust".to_string(), "unusable".to_string(), 0.0),
             ],
-            "四格先落到 0：读者要能分清「一条都没交出去」与「这一格没接上」"
+            "三格先落到 0：读者要能分清「一条都没交出去」与「这一格没接上」"
         );
 
         census.record_items("rust", "handed", 1).await;
