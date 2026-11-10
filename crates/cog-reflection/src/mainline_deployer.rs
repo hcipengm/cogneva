@@ -1291,7 +1291,12 @@ pub(crate) enum KilledReason {
     Oom,
     /// 节点在挤，Pod 被驱逐（Pod 状态里的 `Evicted`）。
     Evicted,
-    /// Job 自己的期限到点（`DeadlineExceeded`），判定进程没跑完。
+    /// 对象自己报了 `DeadlineExceeded`：判定进程没跑完就被收走了。
+    ///
+    /// 本仓库建的判定 Job **不再声明任何期限**（判停由存活探针按进度文件做），所以
+    /// 这一档没有新的来源；留着它是因为滚动过程中还在跑的那一轮可能是上一版清单建
+    /// 出来的 Job，它带着期限——读回签名时认不出这一档，那一轮的死因就会被读成
+    /// 「不知道为什么死的」。
     Deadline,
     /// 读得到"被杀"（信号终止码）、读不到为什么。是一档而不是没有证据：它比
     /// 别的杀法弱，但比"不知道"强。
@@ -8110,7 +8115,7 @@ impl MainlineDeployer {
                     return Ok(());
                 }
                 Some(JobStatus::Failed) => {
-                    // 失败的那一轮也要它的资源读数：被杀（OOM、到点）这一档正是
+                    // 失败的那一轮也要它的资源读数：被杀（OOM、存活探针判停）这一档正是
                     // 额度声明不足的典型下场，读数不在的话这一轮只剩一个退出码。
                     self.report_rollout_resources(&job).await;
                     // 类别取自 Job 的终止码、落点取自它的终止消息（环境类不回滚
@@ -24365,7 +24370,7 @@ exit 0
             failure_of("kempty", "#!/bin/sh\nexit 0\n").await.class,
             FailureClass::Version
         );
-        // 137（信号终止：OOM / 驱逐 / 到点被杀都长这样）同样按版本类靠——类别口径
+        // 137（信号终止：OOM / 驱逐 / 探针判停被杀都长这样）同样按版本类靠——类别口径
         // 不变；变的是原因不再跟着丢掉，见下面那几条。
         assert_eq!(
             failure_of("k137", "#!/bin/sh\necho '|137||'\nexit 0\n")

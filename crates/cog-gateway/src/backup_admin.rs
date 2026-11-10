@@ -72,6 +72,15 @@ pub const PACKAGE_KEY_ENV: &str = cog_core::env::BACKUP_PACKAGE_KEY;
 const CRONJOB_ENV: &str = "COGNEVA_BACKUP_CRONJOB";
 const DEFAULT_CRONJOB: &str = "cogneva-backup";
 
+/// 进度文件挂在哪：与 chart 里两个 CronJob、执行变更那个 Job 是同一处路径。
+///
+/// 三处必须同一个字符串——环境变量、挂载点、探针命令。对不上的时候探针读到的永远
+/// 是「没有文件」，而那在集群面上与「这一趟还没开始」同形，判停就此失效，还看不出
+/// 是哪一处写错了。
+const PROGRESS_VOLUME: &str = "progress";
+const PROGRESS_DIR: &str = "/var/run/cogneva-progress";
+const PROGRESS_FILE: &str = "/var/run/cogneva-progress/beat";
+
 /// 发布目录在容器里的位置。与 [`EXPORTS_SUBDIR`] 是同一处事实的两个写法。
 fn publish_dir() -> PathBuf {
     cog_core::paths::data_path(EXPORTS_SUBDIR)
@@ -141,12 +150,18 @@ fn export_job(cronjob: &Value, name: &str, passphrase: Option<&str>) -> Result<V
         .and_then(Value::as_array_mut)
         .ok_or("备份 Job 模板里没有容器的 env，无法把发布目录写进去")?;
     env.retain(|entry| {
-        entry.get("name").and_then(Value::as_str) != Some(cog_core::env::BACKUP_PUBLISH_DIR)
-            && entry.get("name").and_then(Value::as_str) != Some(PACKAGE_KEY_ENV)
+        let name = entry.get("name").and_then(Value::as_str);
+        name != Some(cog_core::env::BACKUP_PUBLISH_DIR)
+            && name != Some(PACKAGE_KEY_ENV)
+            && name != Some(cog_core::progress::PROGRESS_FILE_ENV)
     });
     env.push(json!({
         "name": cog_core::env::BACKUP_PUBLISH_DIR,
         "value": publish_dir().to_string_lossy(),
+    }));
+    env.push(json!({
+        "name": cog_core::progress::PROGRESS_FILE_ENV,
+        "value": PROGRESS_FILE,
     }));
     if let Some(passphrase) = passphrase {
         env.push(json!({
@@ -155,7 +170,33 @@ fn export_job(cronjob: &Value, name: &str, passphrase: Option<&str>) -> Result<V
         }));
     }
 
-    // 3. 名字与标签。名字里带时刻：同一个名字建两次会被 apiserver 拒（409），而那
+    // 3. 判停面由这一趟自己带，不从模板继承。
+    //
+    //    集群里那个 CronJob 可能是**拆掉期限之前**的那一版：它还带着
+    //    `activeDeadlineSeconds`，也不认识进度文件。两处都得在这一步抹平——
+    //    把期限抄进这一趟，等于从后门放回「到点杀掉一趟还在导出的活」；只删期限
+    //    不装探针，卡住的一趟就再没有人收尾，而它占着数据卷和一块 Job 额度。
+    let pod = spec
+        .pointer_mut("/template/spec")
+        .ok_or("备份 Job 模板里没有 pod spec，导不出一个跑得起来的 Job")?;
+    let volumes = pod
+        .pointer_mut("/volumes")
+        .and_then(Value::as_array_mut)
+        .ok_or("备份 Job 模板里没有 volumes，进度文件没有地方落")?;
+    volumes.retain(|volume| volume.get("name").and_then(Value::as_str) != Some(PROGRESS_VOLUME));
+    volumes.push(json!({ "name": PROGRESS_VOLUME, "emptyDir": {} }));
+    let container = pod
+        .pointer_mut("/containers/0")
+        .ok_or("备份 Job 模板里没有容器")?;
+    let mounts = container
+        .pointer_mut("/volumeMounts")
+        .and_then(Value::as_array_mut)
+        .ok_or("备份 Job 模板里没有容器的 volumeMounts")?;
+    mounts.retain(|mount| mount.get("mountPath").and_then(Value::as_str) != Some(PROGRESS_DIR));
+    mounts.push(json!({ "name": PROGRESS_VOLUME, "mountPath": PROGRESS_DIR }));
+    container["livenessProbe"] = cog_core::progress::liveness_probe();
+
+    // 4. 名字与标签。名字里带时刻：同一个名字建两次会被 apiserver 拒（409），而那
     //    恰好是对的——第二趟导出是另一份包，不是同一份。
     //    标签两面都打：Job 自己用来列表，Pod 用来在日志与事件里认领。
     let labels = json!({ EXPORT_LABEL_KEY: EXPORT_LABEL_VALUE });
@@ -168,7 +209,6 @@ fn export_job(cronjob: &Value, name: &str, passphrase: Option<&str>) -> Result<V
         },
         "spec": {
             "backoffLimit": spec.get("backoffLimit").cloned().unwrap_or(json!(0)),
-            "activeDeadlineSeconds": spec.get("activeDeadlineSeconds").cloned(),
             // 这一趟是一次性的、有人等着的翻页动作：一小时之后把 Job 连同它的
             // env（含口令）一起从 etcd 里清掉。包在卷上，不受这条影响。
             "ttlSecondsAfterFinished": 3600,
@@ -605,6 +645,53 @@ mod tests {
             .find(|mount| mount["mountPath"] == "/backups")
             .unwrap();
         assert!(backup.get("readOnly").is_none());
+    }
+
+    /// 集群里那个 CronJob 可能还是**拆掉期限之前**的那一版：它带着
+    /// `activeDeadlineSeconds`，也不认识进度文件。克隆时两处都得抹平——期限抄进来
+    /// 就是「到点杀掉一趟还在导出的活」从后门回来了；只删期限不装探针，卡住的一趟
+    /// 就再没有人收尾，而它占着数据卷与一块 Job 额度。
+    #[test]
+    fn an_old_template_cannot_smuggle_a_deadline_into_the_export() {
+        let job = export_job(&cronjob(), "cogneva-backup-export-6", None).unwrap();
+        assert!(
+            job.pointer("/spec/activeDeadlineSeconds")
+                .map(|value| value.is_null())
+                .unwrap_or(true),
+            "模板里的期限不许抄进这一趟：那是按钟杀掉一趟还在跑的导出"
+        );
+        let container = job.pointer("/spec/template/spec/containers/0").unwrap();
+        assert_eq!(
+            container["livenessProbe"]["exec"]["command"][2],
+            cog_core::progress::PROGRESS_PROBE_COMMAND,
+            "判停要读进度文件，而不是按这一趟跑了多久"
+        );
+        let env = container["env"].as_array().unwrap();
+        assert!(
+            env.iter().any(
+                |entry| entry["name"] == cog_core::progress::PROGRESS_FILE_ENV
+                    && entry["value"] == PROGRESS_FILE
+            ),
+            "探针读的就是这个变量指向的那个文件"
+        );
+        let mounts = container["volumeMounts"].as_array().unwrap();
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["name"] == PROGRESS_VOLUME && mount["mountPath"] == PROGRESS_DIR),
+            "文件要落在可写卷上：容器的根文件系统可能是只读的"
+        );
+        let volumes = job
+            .pointer("/spec/template/spec/volumes")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume["name"] == PROGRESS_VOLUME && volume.get("emptyDir").is_some()),
+            "挂载点得有对应的卷，否则 Pod 建不出来"
+        );
     }
 
     #[test]

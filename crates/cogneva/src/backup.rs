@@ -77,13 +77,17 @@ const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 // cap: bound — 错误本身通常只有一行；这个界让一条失控的长错误（整段响应体、整张表名清单）不至于把行撑成不可读的东西
 const ERROR_TEXT_MAX_CHARS: usize = 2000;
 
-/// 一次运行默认的期限，也是集群清单里那个 `activeDeadlineSeconds` 的默认值。
+/// 一次运行开出来时记下的期限：只落进账本，不杀任何东西。
 ///
-/// 实测一次运行 41 秒（含导出、快照、打包、裁剪），一小时的界是它的一百多倍：
-/// 落在里面的运行照跑，落在外面的那个不是慢，是卡死了——而它卡着的时候，
-/// 调度器的 `Forbid` 会让后面每一次都不再开始。没有这个界，一次挂住的运行
-/// 就能把备份永久停掉，顺带把「谁来给它收尾」也一并停掉。
-// cap: bound — 调度器的 Forbid 会让后面每一次都不再开始；没有这个界，一次挂住的运行就能把备份永久停掉
+/// 容器的死活由备份 Job 的存活探针判——每走一步更新一次进展文件，超过实测到的
+/// 最长步间隔没有新的一拍，kubelet 才判这一趟停了。整趟跑了多久不参与判定，
+/// 一次慢但一直在推进的运行不会被它收走。
+///
+/// 这个数只写进账本 `backup_runs` 那一行的 `run_deadline_seconds`，让「一条开着
+/// 却没人收尾的记录」有一个可判的时刻：判那一行要用**它自己被开出来时**的期限，
+/// 不是今天的旋钮。实测一次运行 41 秒（含导出、快照、打包、裁剪），一小时的界
+/// 是它的一百多倍。
+// cap: bound — 账本里一条开着的记录没有别的判据；这个数只判那一行，不掐正在跑的容器
 const DEFAULT_RUN_DEADLINE_SECONDS: i32 = 3600;
 
 /// 内部实例密钥对象名：业务 Pod 读的那一份（数据库/缓存/内部签名/S3/邮件）。
@@ -338,13 +342,11 @@ pub struct BackupConfig {
     /// 发出去。**缺判据**：那条读数没有 `source` 标签（界读数该标来源），也没有
     /// 东西在包体量长期贴住卷容量时报。
     pub keep_count: usize,
-    /// 这一次运行最长能跑多久。集群侧同一个值同时是 Job 的
-    /// `activeDeadlineSeconds`（到点由 kubelet 杀容器）和这里的 env——一个值
-    /// 两处承载，不许各自写一份。
+    /// 这一次运行开出来时的期限，随这一行落进账本的 `run_deadline_seconds`。
     ///
-    /// 它落进账本那一行的 `run_deadline_seconds`，因为那个数要跟着这一行走：
-    /// 一行运行中的记录没人在跑，只有拿**它自己被开出来时**的期限才能判，用
-    /// 今天的旋钮去判昨天那一次是两回事。
+    /// 它**不是**判这一趟死活的判据：Job 的死活由存活探针按进展文件判，整趟跑了
+    /// 多久不参与判定。它跟着这一行走，是因为一条开着却没人在跑的记录，只有拿
+    /// **它自己被开出来时**的期限才判得了——用今天的旋钮去判昨天那一次是两回事。
     pub run_deadline_seconds: i32,
     /// 备份卷之外的第二个落点：每跑完一次，新包再往这里复制一份。
     ///
@@ -4878,12 +4880,7 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
 ///
 /// 判词必须点名**哪一步**：整趟的钟到期时读的人只知道「花了很久」，而一步的钟到期
 /// 是一条可以直接去查的线索——卡在「恢复」与卡在「解包」是两件修法完全不同的事。
-fn mark_pass_silent(
-    drill: &mut BackupDrillRecord,
-    step: &str,
-    silent: Duration,
-    window: Duration,
-) {
+fn mark_pass_silent(drill: &mut BackupDrillRecord, step: &str, silent: Duration, window: Duration) {
     drill.error = Some(format!(
         "这一趟停在「{step}」上，那一步已经 {} 秒没有推进（界 {} 秒，{DRILL_STEP_SILENCE_ENV}）。\
          本行其余读数是走到那一步之前量到的：表数与行数为空 ＝ 还没走到对数那一段，不是零张表。\
@@ -5116,7 +5113,8 @@ async fn drill_once(
     tracing::info!(database = DRILL_DATABASE, "drill: scratch database created");
 
     watch.step("恢复并逐表对数");
-    let result = restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill, watch).await;
+    let result =
+        restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill, watch).await;
     watch.step("删临时库");
     // 无论成败都把库删掉：留着它下一次会先删，但磁盘里那份 1 GB 的残库会一直在。
     if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
@@ -5832,10 +5830,16 @@ mod tests {
             Duration::from_secs(5000),
             Duration::from_secs(3600),
         );
-        let error = drill.error.as_ref().expect("停在一步上的那趟必须有错误文本");
+        let error = drill
+            .error
+            .as_ref()
+            .expect("停在一步上的那趟必须有错误文本");
         // 判词要能回答「哪一步、静默多久、界是多少」：整趟的钟到期时读的人只知道
         // 「花了很久」，而这三个数是可以直接去查的线索。
-        assert!(error.contains("恢复：灌数据"), "错误文本没点名哪一步：{error}");
+        assert!(
+            error.contains("恢复：灌数据"),
+            "错误文本没点名哪一步：{error}"
+        );
         assert!(error.contains("5000"), "错误文本没写静默了多久：{error}");
         assert!(error.contains("3600"), "错误文本没写界：{error}");
         // 而且它必须让这一行读作 failed：面读数按 outcome 取行，不按过程猜。
