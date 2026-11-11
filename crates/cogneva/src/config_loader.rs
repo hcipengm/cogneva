@@ -628,9 +628,11 @@ pub fn from_env() -> AppConfig {
 /// Apply environment-variable overrides to an existing [`AppConfig`].
 /// Reads the `env` field (env-var name → JSON dot-path), fetches each
 /// variable from the process environment and writes it into the matching
-/// config path.  No env-var names are hard-coded here — the mapping lives
-/// entirely in `cogneva.json` (or `default_env_mappings` when no file is
-/// present).
+/// config path. No env-var names are hard-coded here: both halves of the
+/// table apply — the one the loaded document carries and the built-in
+/// [`default_env_mappings`]. A document does not replace the built-in table,
+/// it supplements it: the merge below decides that, and the file-layer gate in
+/// the tests pins what it implies.
 pub fn apply_env_overrides(config: &mut AppConfig) {
     let mut value = match serde_json::to_value(&*config) {
         Ok(v) => v,
@@ -1204,10 +1206,70 @@ mod tests {
         );
     }
 
-    /// The file layer really is what drives overrides, not just the built-in
-    /// table. A variable that exists only in the loaded file's map must reach
-    /// its field; if it does not, the deploy map is decoration and the schema
-    /// check above is checking the wrong table.
+    /// A mapping names a setting, and nothing checked that it names one.
+    ///
+    /// `set_json_path` writes through whatever path it is handed, so a mapping
+    /// aimed at a whole section replaces that section with a scalar — and then
+    /// `apply_env_overrides` drops the entire result, because the deserialize
+    /// fails inside an `if let Ok(..)` and the config in hand is left as it
+    /// was. Every variable the deployment set goes away, not only the one that
+    /// was wrong. `holds_path` cannot see this: it asks whether the key is
+    /// there, and the leaf of `dag_executor` is a key of the serialized config
+    /// either way. So the leaf is asked what it is, in both trees a mapping can
+    /// point into: where the document carries a value at the target, and where
+    /// the serialized config does, that value has to be a setting.
+    #[test]
+    fn every_env_mapping_targets_a_setting_not_a_section() {
+        let schema =
+            serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
+        let mut checked = 0usize;
+        let mut broken: Vec<String> = Vec::new();
+        for (file, document) in documents_with_an_env_map() {
+            let env = document["env"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{file} carries no `env` map"));
+            for (key, target) in env {
+                if !key.starts_with("COGNEVA_") {
+                    continue;
+                }
+                let target = target
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{file}: {key} maps to a non-string target"));
+                let held = value_at(&document, target).or_else(|| value_at(&schema, target));
+                let Some(held) = held else {
+                    continue;
+                };
+                checked += 1;
+                if held.is_object() || held.is_array() {
+                    broken.push(format!("{file}: {key} -> {target}"));
+                }
+            }
+        }
+        // A join over nothing agrees with itself: every mapping whose leaf is
+        // absent from both trees is skipped above, so a reader that stops
+        // finding leaves would empty this test rather than fail it.
+        assert!(
+            checked >= 80,
+            "只读到 {checked} 条映射落在树上的值，floor 80——比较没看到东西"
+        );
+        assert!(
+            broken.is_empty(),
+            "these mappings point at a section instead of at a setting, and the write \
+             replaces the section wholesale: {broken:?}"
+        );
+    }
+
+    /// The document's map is joined with the built-in table, not swapped for
+    /// it: the file decides *where* a name goes, never *which* names exist. The
+    /// built-in table is therefore not a fallback for installations without a
+    /// file — it is the floor a real installation's document supplements, and
+    /// saying otherwise is what once left every name the document omitted dead.
+    ///
+    /// Both directions have to hold in one load. A variable only the file's map
+    /// knows must reach its field; if it does not, the deploy map is decoration
+    /// and the schema check above is checking the wrong table. A variable only
+    /// the built-in table knows must reach its field with that same document
+    /// loaded; if it does not, the manifests go on setting a name nothing reads.
     #[test]
     fn env_mappings_are_taken_from_the_loaded_file() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -1219,16 +1281,27 @@ mod tests {
         )
         .unwrap();
         let _sentinel = EnvGuard::set("COGNEVA_SENTINEL_ONLY_IN_FILE", "true");
+        // A name the built-in table knows and this document's map does not.
+        let _builtin_only = EnvGuard::set("COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED", "false");
         let _config_path = EnvGuard::set("COGNEVA_CONFIG_PATH", &path.to_string_lossy());
         assert!(
             !default_env_mappings().contains_key("COGNEVA_SENTINEL_ONLY_IN_FILE"),
             "the sentinel must not be in the built-in table for this test to mean anything"
+        );
+        assert!(
+            default_env_mappings().contains_key("COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED"),
+            "the built-in-only name must be in the built-in table for this test to mean anything"
         );
 
         let loaded = try_load().expect("the config file is present and valid");
         assert!(
             loaded.system.strict_persistence,
             "the file's own env map did not apply"
+        );
+        assert!(
+            !loaded.self_evolution.executor_enabled,
+            "loading a document replaced the built-in table instead of joining it: a \
+             name the document omits is still a name the manifests set"
         );
     }
 
@@ -1491,13 +1564,22 @@ mod tests {
     /// else in the pipeline parses them until a pod reads the file at startup,
     /// where a stray comma is a crash-loop rather than a build failure. Both
     /// are parsed here so the syntax has a gate that runs before deploy.
+    ///
+    /// Parsing is not the whole of it: `{}` parses. A document that loses its
+    /// body — an emptied file, a block read under one indicator and not the
+    /// others, a reader that stops at the first line — would pass a parse gate
+    /// and then make every comparison against it agree, because two empty trees
+    /// are equal and hold no mapping left to check. So each carrier is also
+    /// required to still carry the config it is a carrier of: its sections, and
+    /// the override table a deployment reads out of it.
     #[test]
     fn shipped_deploy_configs_parse_as_json() {
         let chart_path = deploy_file("helm/cogneva/files/cogneva.json");
         let chart_raw = std::fs::read_to_string(&chart_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", chart_path.display()));
-        serde_json::from_str::<serde_json::Value>(&chart_raw)
+        let chart: serde_json::Value = serde_json::from_str(&chart_raw)
             .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", chart_path.display()));
+        assert_document_carries_a_config(&chart, &chart_path.display().to_string());
 
         let baseline_path = deploy_file("k3s/cogneva-json-configmap.yaml");
         let baseline_raw = std::fs::read_to_string(&baseline_path)
@@ -1508,12 +1590,40 @@ mod tests {
                 baseline_path.display()
             )
         });
-        serde_json::from_str::<serde_json::Value>(&embedded).unwrap_or_else(|e| {
+        let baseline: serde_json::Value = serde_json::from_str(&embedded).unwrap_or_else(|e| {
             panic!(
                 "the JSON block in {} is not valid: {e}",
                 baseline_path.display()
             )
         });
+        assert_document_carries_a_config(&baseline, &baseline_path.display().to_string());
+    }
+
+    /// The body a parsed carrier has to have: the sections a config document
+    /// has, and the override table its deployments read. A floor, not a count —
+    /// a section added to the document is not this gate's business, a document
+    /// that arrives empty is.
+    fn assert_document_carries_a_config(document: &serde_json::Value, label: &str) {
+        let sections = document
+            .as_object()
+            .unwrap_or_else(|| panic!("{label} is not a JSON object"))
+            .len();
+        assert!(
+            sections >= 20,
+            "{label}: {sections} top-level sections, floor 20 — a document this empty parses \
+             and then agrees with every comparison made against it"
+        );
+        let entries = document["env"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{label} carries no `env` override table"))
+            .keys()
+            .filter(|name| name.starts_with("COGNEVA_"))
+            .count();
+        assert!(
+            entries >= 85,
+            "{label}: {entries} COGNEVA_* override entries, floor 85 — the map nothing reads \
+             is the one this gate is here for"
+        );
     }
 
     /// The two carriers have to be one document, and nothing compared them.
