@@ -25,28 +25,29 @@ pub struct MultiBackendEventConsumer {
 }
 
 impl MultiBackendEventConsumer {
-    pub fn new(
+    /// The channel, consumer group and retry interval all come from the config.
+    ///
+    /// A group spelled here instead would be a second source: the operator can
+    /// change `multi_backend_consumer.group`, the consumer would keep reading
+    /// the literal, and two deployments configured with different groups would
+    /// still land in one.
+    pub fn from_config(
         primary: Arc<dyn MessageBackend>,
         event_tx: broadcast::Sender<AgentEvent>,
-        channel: impl Into<String>,
+        config: &cog_core::MultiBackendConsumerConfig,
     ) -> Self {
         Self {
             primary,
             fallback: None,
             event_tx,
-            channel: channel.into(),
-            group: "supervisor-multi".into(),
-            retry_interval_secs: 5,
+            channel: config.channel.clone(),
+            group: config.group.clone(),
+            retry_interval_secs: config.retry_interval_secs,
         }
     }
 
     pub fn with_fallback(mut self, fallback: Arc<dyn MessageBackend>) -> Self {
         self.fallback = Some(fallback);
-        self
-    }
-
-    pub fn with_retry_interval(mut self, secs: u64) -> Self {
-        self.retry_interval_secs = secs;
         self
     }
 

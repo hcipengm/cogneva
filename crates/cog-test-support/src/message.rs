@@ -62,6 +62,21 @@ impl MemoryMessageBackend {
         self
     }
 
+    /// 哪些消费组在这条流上订阅过，按名字排序。
+    ///
+    /// `subscribe(subject, group)` 为每一对登记一个停止信号，所以这张表的键
+    /// 已经是「谁读过这条流」的观测，不必再加一份记录。
+    pub fn subscribed_groups(&self, subject: &str) -> Vec<String> {
+        let stops = self.stops.lock().unwrap();
+        let mut groups: Vec<String> = stops
+            .keys()
+            .filter(|(stream, _)| stream == subject)
+            .map(|(_, group)| group.clone())
+            .collect();
+        groups.sort();
+        groups
+    }
+
     fn get_or_create_state(&self, subject: &str) -> MemoryChannelState {
         let mut channels = self.channels.lock().unwrap();
         channels

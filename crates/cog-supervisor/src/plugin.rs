@@ -315,12 +315,11 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
                 if let Some(event_tx) =
                     ctx.consume::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()
                 {
-                    let consumer = crate::MultiBackendEventConsumer::new(
+                    let consumer = crate::MultiBackendEventConsumer::from_config(
                         backend.clone(),
                         (*event_tx).clone(),
-                        &mbc.channel,
-                    )
-                    .with_retry_interval(mbc.retry_interval_secs);
+                        &mbc,
+                    );
                     info!(
                         events_on_bus = mbc.events_on_bus,
                         "MultiBackendEventConsumer started"
