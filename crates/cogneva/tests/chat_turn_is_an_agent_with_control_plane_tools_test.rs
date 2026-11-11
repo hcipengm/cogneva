@@ -174,6 +174,25 @@ fn a_dispatch_from_the_chat_asks_the_same_quota_as_the_submit_face() {
     );
 }
 
+/// 对话里说的一句「什么算好」与网关那个提交面落到同一本账。
+///
+/// 这条通道最容易坏成静默的一种：装配根写 `None` 照样编译，工具还在，只是每次
+/// 都说「这个进程没接到判定账」。属主说完了、员工回了「记不下来」，而部署里其实
+/// 装着那本账——读数上这长得像「这个部署没有那条面」，不是像一条没接的线。
+#[test]
+fn a_direction_stated_in_the_chat_lands_in_the_store_the_submit_face_uses() {
+    let boot = source(BOOT);
+    assert!(
+        boot.contains("consume_service::<dyn cog_core::TasteIntentSink>()"),
+        "装配根没有把判定账交给这段对话：属主在对话里说的那一句只会得到「记不下来」，\
+         而网关那个提交面照常收得下——同一种提交在一个入口上有、另一个入口上没有"
+    );
+    assert!(
+        boot.contains("taste_sink,"),
+        "取到了判定账却没有往会话里传：工具拿到的永远是空的那一格"
+    );
+}
+
 #[test]
 fn the_one_tool_that_changes_the_system_is_dispatch() {
     let text = source(ASSEMBLY);

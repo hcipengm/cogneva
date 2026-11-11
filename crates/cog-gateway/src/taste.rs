@@ -25,10 +25,13 @@ use uuid::Uuid;
 use cog_core::{AuditKind, Claims, TasteIntent, TasteIntentPayload};
 
 /// 审计链上记这类提交的 kind。
-const TASTE_AUDIT_KIND: &str = "taste_intent_submitted";
+///
+/// 公开是因为提交有两个入口：这一条 HTTP 面，与对话里属主说的那一句。两处各写
+/// 一遍这个字面量，链上就会长出一对读起来像两件事的 kind。
+pub const TASTE_AUDIT_KIND: &str = "taste_intent_submitted";
 
 /// 审计链上的动作名：收到的是一次提交，不是一个已经做过的判定。
-const TASTE_AUDIT_ACTION: &str = "submit";
+pub const TASTE_AUDIT_ACTION: &str = "submit";
 
 /// 提交体。
 ///

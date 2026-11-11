@@ -298,10 +298,15 @@ pub struct PlatformConversation {
     /// 发布；没装的进程照实缺席，而不是把「这里没有能拍板的东西」说成「没有
     /// 待批的变更」——那两个读数要做的事相反。
     evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
+    /// 外部价值判定的落盘面：属主就「什么算好」说的一句话，原样记进账。
+    ///
+    /// 与上面那几件同一类可选能力——没有装的进程照实缺席，工具会说「记不下来」，
+    /// 而不是回一句「已记录」把一句没落盘的话说成落盘了。
+    taste: Option<Arc<dyn cog_core::TasteIntentSink>>,
 }
 
 impl PlatformConversation {
-    // 十个入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
+    // 十一个入参各自是一件可选能力，没有哪几件天然该合成一个名词：会话要的是
     // 「这个部署里装了哪些」，把其中几个打包只会让调用方多记一个类型名，
     // 而少掉的参数个数并不能让这行更好读。构造完就各归各位，没有第二处
     // 地方再按这个分组使用它们。
@@ -317,6 +322,7 @@ impl PlatformConversation {
         ledgers: Ledgers,
         principles: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
         evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
+        taste: Option<Arc<dyn cog_core::TasteIntentSink>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -329,6 +335,7 @@ impl PlatformConversation {
             ledgers,
             principles,
             evolution,
+            taste,
         }
     }
 }
@@ -505,15 +512,17 @@ impl ConversationTurn for PlatformConversation {
             ) {
                 tools.register(tool);
             }
-            // 方向盘：定档、把账上一行交出去、放行与回滚。四只与上面那几组同一处装。
-            // 定档与拍板只在有登录身份时注册（写进去的是「谁说的」）；交出去与派活
-            // 同级，任何一段对话都能做，判据仍然取账上那一行。
+            // 方向盘：定档、把账上一行交出去、放行与回滚、说一句「什么算好」。
+            // 五只与上面那几组同一处装。定档、拍板与说判据只在有登录身份时注册
+            // （写进去的是「谁说的」）；交出去与派活同级，任何一段对话都能做，
+            // 判据仍然取账上那一行。
             for tool in change_direction_tools(
                 self.ledgers.changes.clone(),
                 self.orchestrator.clone(),
                 self.evolution.clone(),
                 self.admission.clone(),
                 self.audit.clone(),
+                self.taste.clone(),
                 owner.map(str::to_string),
                 employee.id.clone(),
             ) {
@@ -1170,11 +1179,13 @@ fn identity_arg(args: &serde_json::Value) -> Result<cog_core::ChangeIdentity, se
 /// 外循环的方向盘：属主的一句话落到派工顺序与判据上。
 ///
 /// 与那四只只读账工具分开，因为它们写：定档改的是「多急」，交出去改的是「现在
-/// 谁做」，放行与回滚改的是「正在跑的是哪一版」。判「做完没有」仍然不在这里——
-/// 那只由看树的那一侧写，`dispatch_change` 交出去的活也还是按账上那一行判。
+/// 谁做」，放行与回滚改的是「正在跑的是哪一版」，说一句「什么算好」改的是这件事
+/// 该往哪儿算。判「做完没有」仍然不在这里——那只由看树的那一侧写，
+/// `dispatch_change` 交出去的活也还是按账上那一行判。
 ///
-/// 定档与拍板只在**这一段连接带登录身份**时注册：账上的一行引用要写「是谁说的」，
-/// 一条没有人的连接答不出这一问；给它记一行，账上就多一条没有人的决定。
+/// 定档、拍板与说判据只在**这一段连接带登录身份**时注册：账上的一行引用要写
+/// 「是谁说的」，一条没有人的连接答不出这一问；给它记一行，账上就多一条没有人的
+/// 决定。
 ///
 /// 交出去与 `dispatch_goal` 一样要过准入：它是一次派活，钱从同一个额度里出。拒绝
 /// 写进的也是同一格审计，拒的 actor 是这位员工而不是「用这个界面的人」。
@@ -1185,6 +1196,7 @@ fn change_direction_tools(
     evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
     admission: Option<Arc<dyn HierarchyManager>>,
     audit: Option<Arc<dyn AuditStream>>,
+    taste: Option<Arc<dyn cog_core::TasteIntentSink>>,
     owner: Option<String>,
     actor: String,
 ) -> Vec<Tool> {
@@ -1192,16 +1204,20 @@ fn change_direction_tools(
         changes.clone(),
         orchestrator,
         admission,
-        audit,
+        audit.clone(),
         // 没有登录身份时是空串：准入照提交面同一句「没人配过上限不等于谁都不许
         // 提交」放行，而账上记的 owner 是空的，不编一个人。
         owner.clone().unwrap_or_default(),
         actor,
     )];
     if let Some(owner) = owner {
-        tools.push(set_change_priority_tool(changes, owner));
+        tools.push(set_change_priority_tool(changes, owner.clone()));
         tools.push(approve_change_tool(evolution.clone()));
         tools.push(rollback_change_tool(evolution));
+        // 说一句「什么算好」也只在有人的连接上：这一行署的是提交者，一句没有人
+        // 署名的判据日后会被读成一条系统自己的标准。审计流与 HTTP 面那一格同一条：
+        // 两个入口进来的是同一种提交，链上不该读成两件事。
+        tools.push(submit_taste_intent_tool(taste, audit, owner));
     }
     tools
 }
@@ -1309,6 +1325,292 @@ fn set_change_priority_tool(
             }
         }),
     )
+}
+
+/// 属主说一句「什么算好」，记成一条外部判定。
+///
+/// 这是味道（taste）这条输入在对话里的入口。别的进化输入都是缺陷语义——失败的活、
+/// 还在响的告警——它们说哪里疼，说不出往哪走；这条说的是后者。它照原话落盘、署属主
+/// 的名，随后和网关那个提交面一样，被读成一件活；而那句话随任务走，判这件活的每个
+/// 座位的判据后面都会逐字带上它。
+fn submit_taste_intent_tool(
+    tastes: Option<Arc<dyn cog_core::TasteIntentSink>>,
+    audit: Option<Arc<dyn AuditStream>>,
+    owner: String,
+) -> Tool {
+    make_tool(
+        "submit_taste_intent",
+        "把属主说的一句「什么算好」记成一条外部判定，原话照录、署属主的名字。三种：\
+         direction_preference 说两个方向里偏好哪一个（preferred 相比 alternative，都要说出来，\
+         只说一个方向是建议去做一件事，不是两个里选一个）；rubric_override 说评判标准本身\
+         该改读成什么（criterion 是现在的判据名，new_wording 是它该说的话）；\
+         evaluator_verdict 判某份材料够不够格（insufficient 不能支持结论、contradicted 指向\
+         反面、confirmed 确实支持）——这一种说的是这一次的结果，不是往后的方向，它不会进\
+         判据。三种都要 rationale：一张没有理由的判据，日后没人能说清它为什么该在。\
+         subject 是这条判定针对的东西，同一个 subject 加同一种判定在冷却期内只落成一件活。\
+         evidence_refs 指这次判断依据的材料（source id 或绝对 URI），没有就不填——\
+         别把 subject 换成一段描述，那不是键，日后查不回来。\
+         记之前先跟属主对一遍原话：这是署他名字的判定，不是你的总结。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subject": { "type": "string", "description": "这条判定针对的是什么，用属主的说法；重复提交的抑制按它加判定种类做键" },
+                "kind": {
+                    "type": "string",
+                    "enum": ["direction_preference", "rubric_override", "evaluator_verdict"],
+                    "description": "判定的种类"
+                },
+                "preferred": { "type": "string", "description": "direction_preference：属主偏好的那个方向" },
+                "alternative": { "type": "string", "description": "direction_preference：它比下去的那个方向" },
+                "criterion": { "type": "string", "description": "rubric_override：要改的那条标准，按系统里的名字说" },
+                "new_wording": { "type": "string", "description": "rubric_override：它该读成什么" },
+                "verdict": {
+                    "type": "string",
+                    "enum": ["insufficient", "contradicted", "confirmed"],
+                    "description": "evaluator_verdict：材料对结论值多少"
+                },
+                "rationale": { "type": "string", "description": "为什么，用属主的原话" },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "这次判断依据的材料，按引用给（source id 或绝对 URI）"
+                }
+            },
+            "required": ["subject", "kind", "rationale"]
+        }),
+        native(move |args| {
+            let tastes = tastes.clone();
+            let audit = audit.clone();
+            let owner = owner.clone();
+            async move {
+                let Some(sink) = tastes else {
+                    return Ok(ledger_absent("判定账"));
+                };
+                let subject = match taste_text(&args, "subject") {
+                    Some(subject) => subject,
+                    None => {
+                        return Ok(taste_refused(
+                            "unnamed_subject",
+                            "subject 必填：这条判定针对的是什么，用属主的说法说出来。\
+                             没有它的判定日后查不回来，也抑制不了重复提交。",
+                        ));
+                    }
+                };
+                let Some(kind) = taste_text(&args, "kind") else {
+                    return Ok(taste_refused(
+                        "unknown_kind",
+                        "kind 必填：direction_preference、rubric_override、evaluator_verdict 里选一个。",
+                    ));
+                };
+                let payload = match taste_payload(&args, &kind.to_ascii_lowercase()) {
+                    Ok(payload) => payload,
+                    Err(refusal) => return Ok(refusal),
+                };
+                let evidence_refs = match evidence_refs_arg(&args) {
+                    Ok(refs) => refs,
+                    Err(refusal) => return Ok(refusal),
+                };
+                let intent = cog_core::TasteIntent {
+                    id: uuid::Uuid::new_v4(),
+                    subject,
+                    // 署名的是坐在连接这一端的人，不是替他记下这句的员工：账上读
+                    // 「谁说的」，不是「谁打字快」。
+                    submitted_by: owner.clone(),
+                    submitted_at: chrono::Utc::now(),
+                    payload,
+                    evidence_refs,
+                };
+                if let Err(error) = intent.validate() {
+                    return Ok(taste_refused("invalid_submission", &error));
+                }
+                let kind = intent.payload.kind();
+                let summary = intent.payload.summary();
+                sink.submit(&intent).await?;
+                // 落盘之后的审计那一格，与 HTTP 提交面同一条 kind、同一个动作名：
+                // 两个入口进来的是同一种提交，链上不该读成两件事。写不进去只告警、
+                // 不退回：提交已经落盘，此时回错会让属主重说一遍，而重说说不动任何
+                // 已经写下的事实。
+                if let Some(audit) = audit.as_ref() {
+                    let detail = serde_json::json!({
+                        "kind": kind,
+                        "subject": intent.subject,
+                        "payload": intent.payload,
+                        "evidence_refs": intent.evidence_refs,
+                    });
+                    if let Err(error) = audit
+                        .append(
+                            AuditKind::Custom(cog_gateway::taste::TASTE_AUDIT_KIND.to_string()),
+                            &intent.submitted_by,
+                            &intent.subject,
+                            cog_gateway::taste::TASTE_AUDIT_ACTION,
+                            detail,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            id = %intent.id,
+                            error = %error,
+                            "taste intent stored but not written to the audit chain"
+                        );
+                    }
+                }
+                Ok(serde_json::json!({
+                    "available": true,
+                    "id": intent.id.to_string(),
+                    "kind": kind,
+                    "subject": intent.subject,
+                    "submitted_by": intent.submitted_by,
+                    "summary": summary,
+                    "note": "记下了，署的是属主的名字。它随后经与其它信号同一条冷却/幂等框架\
+                             变成一件活；那句话会随这件活走，判它的每个座位都在判据后面读到原话。\
+                             已经被同一 subject 同一种判定接住时不会再来一件——那是抑制，不是丢失。",
+                }))
+            }
+        }),
+    )
+}
+
+/// 一个给人看的拒绝：记下来这件事没成，以及为什么。
+fn taste_refused(kind: &str, note: &str) -> serde_json::Value {
+    serde_json::json!({
+        "available": true,
+        "refused": kind,
+        "note": note,
+    })
+}
+
+/// 提交体里的一段正文：去空白，空串当没给。
+fn taste_text(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 按种类把参数拼成判定体；缺哪一半就在拼的时候说清楚，而不是等落盘时才发现。
+///
+/// 返回 `Err` 是给人看的拒绝（这一轮该把它说出来），不是异常：模型重试同一句不该
+/// 把一次缺字段的调用变成一次失败。
+fn taste_payload(
+    args: &serde_json::Value,
+    kind: &str,
+) -> Result<cog_core::TasteIntentPayload, serde_json::Value> {
+    let rationale = taste_text(args, "rationale");
+    match kind {
+        "direction_preference" => {
+            let preferred = taste_text(args, "preferred");
+            let alternative = taste_text(args, "alternative");
+            let (Some(preferred), Some(alternative), Some(rationale)) =
+                (preferred, alternative, rationale)
+            else {
+                return Err(taste_refused(
+                    "incomplete_judgement",
+                    "direction_preference 要把两边都说出来：preferred（属主偏好的方向）、\
+                     alternative（它比下去的方向）、rationale（为什么）三个都必填。\
+                     只说一个方向是「去做这件事」的建议，不是两个方向里选一个——\
+                     落成的活是两回事，替属主补出另一边就是替他做了选择。",
+                ));
+            };
+            Ok(cog_core::TasteIntentPayload::DirectionPreference(
+                cog_core::DirectionPreferenceIntent {
+                    preferred,
+                    alternative,
+                    rationale,
+                },
+            ))
+        }
+        "rubric_override" => {
+            let criterion = taste_text(args, "criterion");
+            let new_wording = taste_text(args, "new_wording");
+            let (Some(criterion), Some(new_wording), Some(rationale)) =
+                (criterion, new_wording, rationale)
+            else {
+                return Err(taste_refused(
+                    "incomplete_judgement",
+                    "rubric_override 要说清改哪一条、改成什么：criterion（要改的那条标准，\
+                     按系统里的名字说）、new_wording（它该读成什么）、rationale（为什么）\
+                     三个都必填。缺了 criterion 的那一端，接手的人不知道改哪儿，\
+                     会先来问你一次——这一问本来在这里就能省掉。",
+                ));
+            };
+            Ok(cog_core::TasteIntentPayload::RubricOverride(
+                cog_core::RubricOverrideIntent {
+                    criterion,
+                    new_wording,
+                    rationale,
+                },
+            ))
+        }
+        "evaluator_verdict" => {
+            let Some(verdict) = taste_text(args, "verdict") else {
+                return Err(taste_refused(
+                    "unknown_verdict",
+                    "evaluator_verdict 要说材料对结论值多少：insufficient（不能支持）、\
+                     contradicted（指向反面）、confirmed（确实支持）三个词里选一个。",
+                ));
+            };
+            let verdict = match verdict.to_ascii_lowercase().as_str() {
+                "insufficient" => cog_core::EvaluatorVerdict::Insufficient,
+                "contradicted" => cog_core::EvaluatorVerdict::Contradicted,
+                "confirmed" => cog_core::EvaluatorVerdict::Confirmed,
+                other => {
+                    return Err(taste_refused(
+                        "unknown_verdict",
+                        &format!(
+                            "{other:?} 不在闭集里：只有 insufficient、contradicted、confirmed。\
+                             照抄其中一个，别换一个近义词——这三个词决定了接着做什么。"
+                        ),
+                    ));
+                }
+            };
+            let Some(rationale) = rationale else {
+                return Err(taste_refused(
+                    "incomplete_judgement",
+                    "evaluator_verdict 要有 rationale：结论单独拿出来，接手的人无从下手。",
+                ));
+            };
+            Ok(cog_core::TasteIntentPayload::EvaluatorVerdict(
+                cog_core::EvaluatorVerdictIntent { verdict, rationale },
+            ))
+        }
+        other => Err(taste_refused(
+            "unknown_kind",
+            &format!(
+                "{other:?} 不是一种判定：只有 direction_preference、rubric_override、\
+                 evaluator_verdict。这三种覆盖不开的东西，说明它其实是一件活或一条缺陷，\
+                 走那条路。"
+            ),
+        )),
+    }
+}
+
+/// 材料引用：每一项都得是一个字符串。
+///
+/// 形状与上限由契约层判（`TasteIntent::validate`），这里只保证拼得进那份结构：一个
+/// 数字或一个对象拼进列表，落盘时会被读成「没有引用材料」，而这正是这一格要防的事。
+fn evidence_refs_arg(args: &serde_json::Value) -> Result<Vec<String>, serde_json::Value> {
+    match args.get("evidence_refs") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => {
+            let mut refs = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(text) = item.as_str() else {
+                    return Err(taste_refused(
+                        "bad_evidence",
+                        "evidence_refs 的每一项都是一条引用：材料的 source id，或者一个绝对 URI。\
+                         列表里有一项不是字符串。",
+                    ));
+                };
+                refs.push(text.to_string());
+            }
+            Ok(refs)
+        }
+        Some(_) => Err(taste_refused(
+            "bad_evidence",
+            "evidence_refs 是一个列表，每一项是一条引用（source id 或绝对 URI）。",
+        )),
+    }
 }
 
 fn dispatch_change_tool(

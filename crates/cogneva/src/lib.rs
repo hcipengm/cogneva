@@ -269,6 +269,9 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 进化控制面：属主在对话里放行一条等审批的变更、把正在跑的那一版退回去。
             // 由反射插件发布；没装的进程照实缺席，工具会把它说出来。
             let evolution_admin = ctx.consume_service::<dyn cog_core::EvolutionAdmin>();
+            // 外部价值判定的落盘面：属主在对话里说一句「什么算好」，与网关那个提交面
+            // 落到同一本账、署同一个人。没发布的进程照实缺席，工具会说「记不下来」。
+            let taste_sink = ctx.consume_service::<dyn cog_core::TasteIntentSink>();
             // 平台上每个智能体开头读到的那段话是部署声明的，不是编译进二进制的
             // 一句。声明在 `prompts/` 里，随 ConfigMap 挂进进程；这里把本子交给
             // 内核，任务尝试与界面上的对话都从同一处取。没装提示词插件的进程
@@ -288,6 +291,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     ledgers,
                     runtime_principles,
                     evolution_admin,
+                    taste_sink,
                 )))
                 .is_err()
             {

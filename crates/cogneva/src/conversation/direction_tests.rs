@@ -546,12 +546,23 @@ fn direction_tools(
     admin: Option<Arc<DecidingAdmin>>,
     owner: Option<&str>,
 ) -> Vec<Tool> {
+    direction_tools_with_taste(ledger, graph, admin, None, owner)
+}
+
+fn direction_tools_with_taste(
+    ledger: Option<Arc<BandLedger>>,
+    graph: &Arc<HandoverGraph>,
+    admin: Option<Arc<DecidingAdmin>>,
+    taste: Option<Arc<dyn cog_core::TasteIntentSink>>,
+    owner: Option<&str>,
+) -> Vec<Tool> {
     change_direction_tools(
         ledger.map(|ledger| ledger as Arc<dyn cog_core::ChangeLedgerStore>),
         graph.clone(),
         admin.map(|admin| admin as Arc<dyn cog_core::EvolutionAdmin>),
         None,
         None,
+        taste,
         owner.map(str::to_string),
         "luna-1822ab0e".into(),
     )
@@ -950,6 +961,7 @@ async fn a_hand_over_over_the_day_s_quota_is_refused_and_booked_like_the_submit_
         None,
         Some(admission),
         Some(stream),
+        None,
         Some("ferris".into()),
         "luna-1822ab0e".into(),
     );
@@ -1010,7 +1022,7 @@ async fn a_control_plane_that_does_not_dispatch_by_change_says_so() {
     );
 }
 
-/// 属主的三只开关只在**这一段连接带登录身份**时注册。
+/// 属主的四只开关只在**这一段连接带登录身份**时注册。
 ///
 /// 账上的一行引用要写「这是谁说的」，一条没有人的连接答不出这一问；给它记
 /// 一行，账上就多一条没有人的决定。交出去与派活同级，任何一段对话都能做。
@@ -1031,6 +1043,7 @@ fn the_owners_switches_exist_only_when_a_person_is_on_the_connection() {
             "set_change_priority".to_string(),
             "approve_change".to_string(),
             "rollback_change".to_string(),
+            "submit_taste_intent".to_string(),
         ],
         "方向盘是闭集：加一只就要在这里说清它改的是什么"
     );
@@ -1120,4 +1133,217 @@ async fn an_owner_can_let_a_held_change_through_and_can_take_the_line_back() {
     assert_eq!(answer["rolled_back"], true, "{answer}");
     assert_eq!(answer["message"], "back on the previous image", "{answer}");
     assert_eq!(admin.rollbacks(), 1);
+}
+
+/// 一本会说话的判定账：记下收到的每一条，别的一律说没接。
+#[derive(Default)]
+struct RecordingTaste {
+    stored: std::sync::Mutex<Vec<cog_core::TasteIntent>>,
+}
+
+impl RecordingTaste {
+    fn stored(&self) -> Vec<cog_core::TasteIntent> {
+        self.stored.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::TasteIntentSink for RecordingTaste {
+    async fn submit(&self, intent: &cog_core::TasteIntent) -> cog_core::SFResult<()> {
+        self.stored.lock().unwrap().push(intent.clone());
+        Ok(())
+    }
+}
+
+/// 属主在对话里说一句「我更想要哪个」，落成的判定署的是属主的名字。
+///
+/// 离开这一步，这句偏好就只留在聊天记录里：网关那个提交面署的是提交连接的身份，
+/// 而员工替属主记下的一句话若署员工的名，账上读到的「谁说的」就是错的——日后一条
+/// 判据按它立起来，没有一个人能对这句话负责。
+#[tokio::test]
+async fn a_direction_the_owner_states_is_recorded_under_the_owner() {
+    let graph = HandoverGraph::dispatching();
+    let taste = Arc::new(RecordingTaste::default());
+    let tools = direction_tools_with_taste(None, &graph, None, Some(taste.clone()), Some("ferris"));
+
+    let answer = call(
+        &tools,
+        "submit_taste_intent",
+        serde_json::json!({
+            "subject": "判据里的严格程度",
+            "kind": "direction_preference",
+            "preferred": "把回归也当成缺陷",
+            "alternative": "只看目标项",
+            "rationale": "上一轮漏掉的那次回归就是被目标项盖过去的",
+            "evidence_refs": ["raw:review-42"],
+        }),
+    )
+    .await;
+
+    assert_eq!(answer["available"], true, "{answer}");
+    assert_eq!(answer["kind"], "direction_preference", "{answer}");
+    assert_eq!(answer["submitted_by"], "ferris", "{answer}");
+    let stored = taste.stored();
+    assert_eq!(stored.len(), 1, "应落成一条判定：{stored:?}");
+    let intent = &stored[0];
+    assert_eq!(
+        intent.submitted_by, "ferris",
+        "署名的必须是坐在连接这一端的人"
+    );
+    assert_eq!(intent.subject, "判据里的严格程度");
+    assert_eq!(intent.evidence_refs, vec!["raw:review-42".to_string()]);
+    match &intent.payload {
+        cog_core::TasteIntentPayload::DirectionPreference(p) => {
+            assert_eq!(p.preferred, "把回归也当成缺陷");
+            assert_eq!(p.alternative, "只看目标项");
+        }
+        other => panic!("种类被读成了别的东西：{other:?}"),
+    }
+    let summary = answer["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.contains("把回归也当成缺陷") && summary.contains("只看目标项"),
+        "回执里的人话没有把两个方向都说出来：{summary}"
+    );
+}
+
+/// 只说了一个方向时不落盘：那是「去做这件事」的建议，不是两个方向里选一个。
+///
+/// 替属主补出另一边就是替他做了选择，而账上那一行会读成「属主比过之后选了这个」。
+#[tokio::test]
+async fn a_preference_with_only_one_side_is_refused_before_anything_is_stored() {
+    let graph = HandoverGraph::dispatching();
+    let taste = Arc::new(RecordingTaste::default());
+    let tools = direction_tools_with_taste(None, &graph, None, Some(taste.clone()), Some("ferris"));
+
+    let answer = call(
+        &tools,
+        "submit_taste_intent",
+        serde_json::json!({
+            "subject": "判据里的严格程度",
+            "kind": "direction_preference",
+            "preferred": "把回归也当成缺陷",
+            "rationale": "上一次的回归漏过去了",
+        }),
+    )
+    .await;
+
+    assert_eq!(answer["refused"], "incomplete_judgement", "{answer}");
+    assert!(
+        answer["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("alternative"),
+        "拒绝的话没有点名缺的是哪一半：{answer}"
+    );
+    assert!(taste.stored().is_empty(), "缺一边的偏好不该落盘");
+}
+
+/// 闭集之外的结论词不落盘，并说出闭集是什么。
+#[tokio::test]
+async fn a_verdict_word_outside_the_closed_set_is_refused() {
+    let graph = HandoverGraph::dispatching();
+    let taste = Arc::new(RecordingTaste::default());
+    let tools = direction_tools_with_taste(None, &graph, None, Some(taste.clone()), Some("ferris"));
+
+    let answer = call(
+        &tools,
+        "submit_taste_intent",
+        serde_json::json!({
+            "subject": "那份证据",
+            "kind": "evaluator_verdict",
+            "verdict": "probably",
+            "rationale": "看着像",
+        }),
+    )
+    .await;
+
+    assert_eq!(answer["refused"], "unknown_verdict", "{answer}");
+    assert!(
+        answer["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("insufficient"),
+        "拒绝的话没有把闭集说出来：{answer}"
+    );
+    assert!(taste.stored().is_empty(), "闭集外的结论词不该落盘");
+}
+
+/// 这一个进程没装判定账时说「记不下来」，不能说成「记下了」。
+///
+/// 两个读数要做的事相反：一个是去找谁没装，一个是放心地不再提这件事。
+#[tokio::test]
+async fn a_process_without_a_judgement_store_says_it_cannot() {
+    let graph = HandoverGraph::dispatching();
+    let tools = direction_tools_with_taste(None, &graph, None, None, Some("ferris"));
+
+    let answer = call(
+        &tools,
+        "submit_taste_intent",
+        serde_json::json!({
+            "subject": "判据里的严格程度",
+            "kind": "direction_preference",
+            "preferred": "更严格",
+            "alternative": "更宽松",
+            "rationale": "上一轮漏了",
+        }),
+    )
+    .await;
+
+    assert_eq!(answer["available"], false, "{answer}");
+    assert!(
+        answer["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("判定账"),
+        "缺席的话没有点名缺的是什么：{answer}"
+    );
+}
+
+/// 从对话里说的那一句和从网关提交的那一条，在审计链上是同一条。
+///
+/// 两个入口一个是 HTTP 请求、一个是属主开口，但记下的是同一件事：一条署名提交。
+/// 这条链上没有这一行，「谁就什么说过一句」只剩判定账里那份存储，而审计面读不到
+/// 它——同一种提交在两个入口上一个留痕一个不留。
+#[tokio::test]
+async fn a_stated_direction_leaves_the_same_audit_row_the_submit_face_does() {
+    let graph = HandoverGraph::dispatching();
+    let taste = Arc::new(RecordingTaste::default());
+    let audit = Arc::new(RecordingAudit::default());
+    let stream: Arc<dyn AuditStream> = audit.clone();
+    let tools = change_direction_tools(
+        None,
+        graph.clone(),
+        None,
+        None,
+        Some(stream),
+        Some(taste.clone()),
+        Some("ferris".to_string()),
+        "luna-1822ab0e".into(),
+    );
+
+    let answer = call(
+        &tools,
+        "submit_taste_intent",
+        serde_json::json!({
+            "subject": "判据里的严格程度",
+            "kind": "rubric_override",
+            "criterion": "自审判据",
+            "new_wording": "回归也算缺陷",
+            "rationale": "上一轮漏了一次回归",
+        }),
+    )
+    .await;
+    assert_eq!(answer["available"], true, "{answer}");
+    assert_eq!(taste.stored().len(), 1);
+
+    assert_eq!(
+        audit.actions(),
+        vec![cog_gateway::taste::TASTE_AUDIT_ACTION.to_string()],
+        "对话里提交的判定没有在审计链上留下与 HTTP 面同名的动作"
+    );
+    assert_eq!(
+        audit.actors(),
+        vec!["ferris".to_string()],
+        "审计那一行署的不是提交的人"
+    );
 }
