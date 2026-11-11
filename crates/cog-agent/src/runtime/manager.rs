@@ -21,7 +21,12 @@ use cog_core::{
 /// for that role, which is not the same statement as "this role wants the
 /// default" — it is simply no evidence, and inventing one would change
 /// behaviour for roles nobody has described yet.
-async fn runtime_config_for(
+///
+/// Public because it is the single construction point for an agent's config,
+/// and a differential over "the same work under two labels" has to read the
+/// config the production path would hand each of them. A test that rebuilt the
+/// config by hand would be comparing its own copy of the rules, not the rules.
+pub async fn runtime_config_for(
     default_config: &cog_core::RuntimeConfig,
     skill_registry: Option<&RwLock<cog_core::SkillRegistry>>,
     agent_id: &str,
@@ -611,8 +616,14 @@ impl cog_core::AgentManager for GlobalAgentManager {
         task_id: Option<&str>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
         // 没有声明：调用方没带任务，答不出这件活交什么。
-        self.create_agent_declaring(agent_id, role, llm, task_id, cog_core::Deliverable::Unstated)
-            .await
+        self.create_agent_declaring(
+            agent_id,
+            role,
+            llm,
+            task_id,
+            cog_core::Deliverable::Unstated,
+        )
+        .await
     }
 
     async fn create_agent_declaring(

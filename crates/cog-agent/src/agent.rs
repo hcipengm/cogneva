@@ -1193,7 +1193,10 @@ impl Agent {
     /// 两个入口一个构造点：`actor` 是归因（谁的账），`deliverable` 是判据
     /// （判的什么物）。分开是因为它们此前共用「角色名」这一个词，同一个人
     /// 换个任务就判错。
-    fn self_review_loop(&self, config: &cog_core::SelfReviewConfig) -> crate::self_review::SelfReviewLoop {
+    fn self_review_loop(
+        &self,
+        config: &cog_core::SelfReviewConfig,
+    ) -> crate::self_review::SelfReviewLoop {
         crate::self_review::SelfReviewLoop::new(config.clone())
             .with_actor(self.review_actor())
             .with_deliverable(self.config.deliverable)

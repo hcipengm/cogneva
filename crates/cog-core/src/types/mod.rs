@@ -27,8 +27,8 @@ pub use message::{
 pub use self_review::{SelfReviewConfig, SelfReviewRecord, SelfReviewResult};
 pub use task::{
     task_result_stream, ActionPlannerMeta, ActionPlannerSource, DagMessage, Deliverable,
-    EvolutionIntent, GoalClass, GoalClassSource, GoalMessage, GoalSource, Task, TaskDAG, TaskFilter,
-    TaskKindRecord, TaskPayload, TaskPlan, TaskStatus, TaskStatusCounts, TaskType,
+    EvolutionIntent, GoalClass, GoalClassSource, GoalMessage, GoalSource, Task, TaskDAG,
+    TaskFilter, TaskKindRecord, TaskPayload, TaskPlan, TaskStatus, TaskStatusCounts, TaskType,
     EVOLUTION_MODE_GENERATE_CHANGE, INPUT_EVOLUTION_MODE, INPUT_PRINCIPLES, INPUT_READY_LANE,
     INPUT_TASK_KIND, READY_LANE_STOP_THE_LINE, TASK_RESULT_STREAM_PREFIX, UNGROUPED_PROJECT,
 };

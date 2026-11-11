@@ -301,6 +301,8 @@ mod knowledge_namespace_write_contract_test;
 mod knowledge_retrieval_round_trip_test;
 #[path = "knowledge_retrieval_series_test.rs"]
 mod knowledge_retrieval_series_test;
+#[path = "label_differential_test.rs"]
+mod label_differential_test;
 #[path = "llm_actor_label_contract_test.rs"]
 mod llm_actor_label_contract_test;
 #[path = "llm_spend_verdict_contract_test.rs"]
