@@ -19,6 +19,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use cog_core::contract::observability::METRICS_PATH;
 use cog_core::{CommandEvent, SFError, SandboxPayload};
 use futures::StreamExt;
 use prometheus::{Encoder, HistogramOpts, HistogramVec, IntGaugeVec, Opts, Registry, TextEncoder};
@@ -825,7 +826,7 @@ fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(health))
         .route("/health/ready", get(health))
-        .route("/metrics", get(metrics_handler))
+        .route(METRICS_PATH, get(metrics_handler))
         .route("/execute", post(execute_handler))
         .route("/documents/list", post(documents_list_handler))
         .route("/documents/organize", post(documents_organize_handler))

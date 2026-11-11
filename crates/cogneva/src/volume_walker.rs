@@ -34,6 +34,7 @@ use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use cog_core::contract::observability::METRICS_PATH;
 use cog_core::observability_text::render_raw_metrics;
 use cog_core::{Observable, ShutdownSignal};
 use cog_observability::data_volume::{self, DataVolumeObservable};
@@ -95,7 +96,7 @@ pub fn router(observables: Vec<Arc<DataVolumeObservable>>) -> Router {
     Router::new()
         .route("/health/live", get(health))
         .route("/health/ready", get(health))
-        .route("/metrics", get(metrics))
+        .route(METRICS_PATH, get(metrics))
         .with_state(WalkerState {
             observables: Arc::new(observables),
         })

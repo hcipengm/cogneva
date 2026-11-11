@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use cog_core::contract::observability::METRICS_PATH;
 use cog_core::contract::resource_ledger::{ResourceEvent, ResourceEventKind, ResourceEventOutcome};
 use cog_core::contract::version::VersionId;
 use cog_core::{SFError, SFResult, ShutdownSignal};
@@ -6910,7 +6911,7 @@ impl MainlineDeployer {
         let (host, _) = endpoint_host_port(&endpoint)?;
         let port = self.cfg.registry_walker_port;
         let (status, _, body) = self
-            .plain_http(host, port, "GET", "/metrics", &[], None)
+            .plain_http(host, port, "GET", METRICS_PATH, &[], None)
             .await
             .ok()?;
         if status != 200 {

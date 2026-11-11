@@ -27,6 +27,7 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Datelike, Utc};
+use cog_core::contract::observability::{METRICS_JSON_PATH, METRICS_PATH};
 use cog_core::contract::platform_sign::{
     platform_signature, PlatformOutlet, SignRefusal, SignRequest, SIGN_PATH,
 };
@@ -10806,8 +10807,8 @@ fn router(state: AppState, llm_channel: bool) -> Router {
     let r = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/metrics", get(metrics_handler))
-        .route("/metrics/json", get(metrics_json_handler));
+        .route(METRICS_PATH, get(metrics_handler))
+        .route(METRICS_JSON_PATH, get(metrics_json_handler));
     let r = if llm_channel {
         r.merge(llm_channel_router()).merge(code_channel_router())
     } else {
@@ -10852,8 +10853,8 @@ fn metrics_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/metrics", get(metrics_handler))
-        .route("/metrics/json", get(metrics_json_handler))
+        .route(METRICS_PATH, get(metrics_handler))
+        .route(METRICS_JSON_PATH, get(metrics_json_handler))
         .with_state(state)
 }
 

@@ -52,6 +52,7 @@ use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use cog_core::contract::observability::METRICS_PATH;
 use cog_core::observability_text::render_raw_metrics;
 use cog_core::{Observable, ShutdownSignal};
 use cog_observability::claim_store::{self, ClaimStoreObservable, Scan};
@@ -304,7 +305,7 @@ pub fn router(
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
-        .route("/metrics", get(metrics))
+        .route(METRICS_PATH, get(metrics))
         .with_state(StoreState {
             observable,
             images,

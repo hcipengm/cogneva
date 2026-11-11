@@ -229,7 +229,11 @@ impl PushgatewayClient {
             .client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PushgatewayClient has no HttpClient configured"))?;
-        let mut path = format!("/metrics/job/{}", percent_encode(job));
+        let mut path = format!(
+            "{}/job/{}",
+            cog_core::contract::observability::METRICS_PATH,
+            percent_encode(job)
+        );
         for (k, v) in grouping {
             path.push_str(&format!("/{}/{}", percent_encode(k), percent_encode(v)));
         }
@@ -262,7 +266,11 @@ impl PushgatewayClient {
             .client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PushgatewayClient has no HttpClient configured"))?;
-        let mut path = format!("/metrics/job/{}", percent_encode(job));
+        let mut path = format!(
+            "{}/job/{}",
+            cog_core::contract::observability::METRICS_PATH,
+            percent_encode(job)
+        );
         for (k, v) in grouping {
             path.push_str(&format!("/{}/{}", percent_encode(k), percent_encode(v)));
         }

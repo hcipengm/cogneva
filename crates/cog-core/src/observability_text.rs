@@ -132,12 +132,13 @@ fn escape_label_value(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::observability::METRICS_PATH;
 
     #[test]
     fn labels_render_in_canonical_name_order() {
         let labels: HashMap<String, String> = [
             ("status", "200"),
-            ("endpoint", "/metrics"),
+            ("endpoint", METRICS_PATH),
             ("method", "GET"),
         ]
         .iter()
@@ -145,7 +146,7 @@ mod tests {
         .collect();
         assert_eq!(
             format_labels(&labels),
-            "endpoint=\"/metrics\",method=\"GET\",status=\"200\""
+            format!("endpoint=\"{METRICS_PATH}\",method=\"GET\",status=\"200\"")
         );
     }
 

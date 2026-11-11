@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
+use cog_core::contract::observability::METRICS_PATH;
 use cog_core::TraceContext;
 use serde::Deserialize;
 use serde_json::json;
@@ -700,7 +701,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/auth/login", post(auth::login_handler))
         .route("/api/v1/auth/register", post(auth::register_handler))
         .route("/api/v1/auth/refresh", post(auth::refresh_handler))
-        .route("/metrics", get(prometheus_metrics_handler))
+        .route(METRICS_PATH, get(prometheus_metrics_handler))
         // A2A 的发现入口：对端的第一步是「先取名片、再按名片上声明的方式取凭证」。
         // 名片要是也跟在业务鉴权组里，这一步就闭成环——先有凭证才能知道该用什么
         // 凭证。名片只公布地址、能力与鉴权方式，不含任何业务数据，所以它公开；

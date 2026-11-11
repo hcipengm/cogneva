@@ -255,7 +255,6 @@
   },
   "metrics": {
     "enabled": true,
-    "endpoint": "/metrics",
     "_comment_sample_max_rows": "cog_metrics_samples 是只追加的观测样本日志，这条是它的容量上限（行数），0=不清理。清理按最早的先删，直到回到上限为止，但每个 gauge series 的最新一行永不删——gauge 的值就是这张表里它最新那条。清理的判据是容量不是时间：流量可以在任何时间窗内塞进任意多行，而窗到期的清理照样会删掉正在读的行、留着没人要的行。设 0 的进程不参与清理（演化 Pod 就是这样，清理的属主是主应用）。",
     "sample_max_rows": 200000
   },

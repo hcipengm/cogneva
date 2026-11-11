@@ -90,7 +90,9 @@ pub const CONFIG_SECTIONS: &[ConfigSection] = &[
     section!(
         "metrics",
         RestartRequired,
-        "The endpoint is bound at startup; the reload path can only report the change."
+        "The scrape path is a compile-time contract, not a setting. The switch, the sample-log \
+         cap and the scrape dimensions are read when their owners start; reload changes nothing \
+         here."
     ),
     section!(
         "llm_routing",

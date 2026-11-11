@@ -891,12 +891,31 @@ pub trait EvolutionMetrics: Send + Sync {
 
 // ─── Infrastructure vs business traffic ────────────────────────────────────
 
+/// The path every HTTP surface serves Prometheus text on.
+///
+/// The extension executor, the gateway, the security gateway and the binary's
+/// three standalone observability subcommands answer on it; the security
+/// gateway also serves the JSON projection under the same name, and the
+/// Pushgateway client builds `/metrics/job/...` from it. The declaration lives
+/// here because a copy in each crate is how one surface ends up answering on a
+/// path the others never heard of, and nothing fails when it happens: the
+/// scraper gets a 404 from one replica and a reading that looks like a quiet
+/// pod.
+pub const METRICS_PATH: &str = "/metrics";
+
+/// The JSON projection of the same reading, under [`METRICS_PATH`].
+///
+/// A separate declaration rather than a runtime concatenation so route
+/// registration stays static; a unit test keeps it from drifting out from
+/// under the parent path.
+pub const METRICS_JSON_PATH: &str = "/metrics/json";
+
 /// Whether an `endpoint` label names an infrastructure route rather than
 /// business work.
 ///
 /// Liveness probes (`/health`, `/health/live`, `/health/ready`) and the
-/// scraper's own poll of `/metrics` run on a fixed timer, always answer 2xx,
-/// and carry no user intent. Folded into the same counter as business
+/// scraper's own poll of [`METRICS_PATH`] run on a fixed timer, always answer
+/// 2xx, and carry no user intent. Folded into the same counter as business
 /// requests they pad the denominator of every ratio computed over it: probes
 /// tick several times a minute while real traffic can fall to zero, so the
 /// ratio ends up dominated by requests that cannot fail and a regression
@@ -908,10 +927,10 @@ pub trait EvolutionMetrics: Send + Sync {
 /// before the producer stopped emitting them. Liveness stays observed: a
 /// failing probe surfaces as the pod's readiness state and restart count.
 pub fn is_infra_endpoint(endpoint: &str) -> bool {
+    let metrics = endpoint.strip_prefix(METRICS_PATH);
     endpoint == "/health"
         || endpoint.starts_with("/health/")
-        || endpoint == "/metrics"
-        || endpoint.starts_with("/metrics/")
+        || metrics.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The `endpoint` label of a rendered Prometheus series line, if it has one.
@@ -976,9 +995,21 @@ pub fn is_retired_metric(name: &str) -> bool {
 mod infra_endpoint_tests {
     use super::{
         collect_metrics_for_dimensions, is_infra_endpoint, is_retired_metric, series_endpoint,
-        DimensionSpec, Observable, RawMetric, SFResult, TraceFragment, RETIRED_METRIC_NAMES,
+        DimensionSpec, Observable, RawMetric, SFResult, TraceFragment, METRICS_JSON_PATH,
+        METRICS_PATH, RETIRED_METRIC_NAMES,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn the_json_path_sits_under_the_text_path() {
+        assert_eq!(
+            METRICS_JSON_PATH.strip_prefix(METRICS_PATH),
+            Some("/json"),
+            "the JSON endpoint has to be a child of the text endpoint; otherwise it is a \
+             second path that only looks related"
+        );
+        assert!(is_infra_endpoint(METRICS_JSON_PATH));
+    }
 
     #[test]
     fn classified_as_infra() {

@@ -799,7 +799,6 @@ pub struct AgentConfig {
 #[serde(default)]
 pub struct MetricsConfig {
     pub enabled: bool,
-    pub endpoint: String,
     /// Ceiling on rows held in the metrics sample log. `0` prunes nothing.
     ///
     /// The sample log is append-only: one row per observation. What bounds it
@@ -839,7 +838,6 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            endpoint: "/metrics".into(),
             sample_max_rows: 500_000,
             scrape_dimensions: Vec::new(),
         }
