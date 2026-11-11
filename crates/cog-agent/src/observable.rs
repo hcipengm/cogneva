@@ -122,6 +122,18 @@ pub struct AgentObservable {
     /// no queue depth changes. The caller learns it from the tool result and
     /// nobody else would ever learn it at all, which is what this is for.
     inbox_ask_total: Mutex<HashMap<&'static str, u64>>,
+    /// 每一轮跑完时，这件活的声明来自哪一类，按来源计数。
+    ///
+    /// 与 [`RoleCalibration`] 分开：那个按角色名数结局，这个数的是「这轮待遇
+    /// 由什么决定」里属于活自己的那一半。四态全部计数，包括 `Unreadable`——
+    /// 「说了但读不出来」单列一格，才看得出有多少活带着一句没人读懂的话在跑。
+    decisions_by_declaration: Mutex<HashMap<cog_core::DeclarationState, u64>>,
+    /// 每一轮跑完时，轮次上限是哪一个来源给的，按来源计数。
+    ///
+    /// 与 `decisions_by_declaration` 并列而不是交叉成一张表：交叉之后每一格
+    /// 都是一小撮运行，而这两个问题各自有各自的读者——一个问「活自己说了没」，
+    /// 一个问「上限是操作者钉的还是实测出来的」。交叉表只会同时答不上来。
+    decisions_by_ceiling: Mutex<HashMap<CeilingSource, u64>>,
     /// How many tasks the pool may run at once, how many workers it holds, and
     /// the measured capacity those two are converging on.
     ///
@@ -315,6 +327,61 @@ impl RunOutcome {
     }
 }
 
+/// 这一轮跑的轮次上限是谁给的。
+///
+/// 只有两个来源能定它——操作者在配置面上钉的数，和这个进程自己跑出来的交卷
+/// 读数——外加一格表示两边都没有。三格分开，是因为「量到就是这么多」与「量不到」
+/// 在读数里必须分得开：上限停在某个数上时，读者要能说出是实测给的，还是没人钉、
+/// 也没有一条样本，于是这一轮根本没有上限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CeilingSource {
+    /// 操作者钉在配置面上的数。实测读数只报它绑不绑，不改它。
+    Operated,
+    /// 没人钉数，这个进程最近的交卷轮次给出的值。
+    Measured,
+    /// 没人钉数，这个进程也还没有一条交卷样本：量不到，所以这一轮无上限。
+    Unmeasured,
+}
+
+impl CeilingSource {
+    /// 读数标签上的那一个字。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Operated => "operated",
+            Self::Measured => "measured",
+            Self::Unmeasured => "unmeasured",
+        }
+    }
+}
+
+/// 一轮运行跑完之后要记下的「待遇由谁决定」。
+///
+/// 与结局、花销一起在 [`AgentObservable::record_run`] 的同一处写，而不是由调用方
+/// 顺手另记一笔：那一笔漏掉时，来源计数会安静地小于运行总数，而「小于」在读数面
+/// 上看不出是漏记还是这部分运行本来就不存在。传一个值而不是两个可选参数，也让
+/// 「这一轮没说」只能是一个明确的 `Unstated`，不能是忘了传。
+#[derive(Debug, Clone, Copy)]
+pub struct RunDecision {
+    /// 这件活的声明来自哪一类。
+    pub declaration: cog_core::DeclarationState,
+    /// 轮次上限是哪个来源给的。
+    pub ceiling: CeilingSource,
+}
+
+#[cfg(test)]
+impl RunDecision {
+    /// 单元测试里不关心待遇时的取值：没有声明，也没有实测样本。
+    ///
+    /// 只在本 crate 的测试里可用；其它 crate 的测试要自己写出那两个值，
+    /// 因为那里的运行通常正是在验证其中一个。
+    pub const fn no_declaration() -> Self {
+        Self {
+            declaration: cog_core::DeclarationState::Unstated,
+            ceiling: CeilingSource::Unmeasured,
+        }
+    }
+}
+
 impl AgentObservable {
     pub fn new() -> Self {
         Self::default()
@@ -468,8 +535,23 @@ impl AgentObservable {
         iterations: u32,
         steps: usize,
         tool_calls: usize,
+        decision: RunDecision,
     ) {
         self.run_count.fetch_add(1, Ordering::Relaxed);
+        // 「这轮待遇由谁决定」在同一处记账：漏记时来源计数会小于运行总数，
+        // 而分开记的两个调用点迟早会有一个被绕过。
+        *self
+            .decisions_by_declaration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(decision.declaration)
+            .or_insert(0) += 1;
+        *self
+            .decisions_by_ceiling
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(decision.ceiling)
+            .or_insert(0) += 1;
         if outcome.delivered() {
             self.success_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -577,33 +659,46 @@ impl AgentObservable {
     /// going to retries that never turned into deliveries, and the only number
     /// anyone had measured was never consulted.
     pub fn iteration_budget_for(&self, seed: u32) -> u32 {
+        self.iteration_budget_decision_for(seed).0
+    }
+
+    /// 同上，并交出「这个数是谁给的」。
+    ///
+    /// 与 [`Self::iteration_budget_for`] 是同一次判断，不是两次：分两处各算一遍，
+    /// 读数上标的来源与实际用的上限迟早会各自演化，而这一对读数存在的意义正是
+    /// 让读者能指出「这一轮的上限是量出来的还是钉死的」。
+    ///
+    /// `Unmeasured` 不是第三来源，是两边都没有：没人钉数，这个进程也还没有一条
+    /// 交卷样本。此时返回的上限就是那个「没人说」的记号，这一轮无上限——读数上
+    /// 必须能与「实测给出 u32::MAX」分开，后者不可能发生，但前者必须看得见。
+    pub fn iteration_budget_decision_for(&self, seed: u32) -> (u32, CeilingSource) {
+        // Any value other than `u32::MAX` is the operator's own decision for this
+        // deployment and stands as written. It used to be raised whenever the
+        // measurement was larger, back when the seed could also arrive from a
+        // role's skill row — a number written for a label, which the work was
+        // allowed to outgrow. The only seed left is the process-wide config: a
+        // statement about this deployment, which a measurement may report on (the
+        // exhausted-runs reading says when it is binding) but not silently
+        // overrule.
+        if seed != u32::MAX {
+            return (seed, CeilingSource::Operated);
+        }
         let sample = self
             .delivered_iterations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if sample.is_empty() {
-            return seed;
+            return (seed, CeilingSource::Unmeasured);
         }
         let mut sample: Vec<u32> = sample.iter().copied().collect();
         let admitted = ninetieth_percentile(&mut sample);
         let sum: u32 = sample.iter().sum();
         let typical = sum.div_ceil(sample.len() as u32);
         let calibrated = admitted.saturating_add(typical);
-        // `u32::MAX` is this field's spelling of "nobody stated a ceiling", not a
+        // `u32::MAX` is the seed's spelling of "nobody stated a ceiling", not a
         // ceiling of four billion turns. Taking the max against it discards the
         // only measured number, so the calibration answers instead.
-        //
-        // Any other value is the operator's own decision for this deployment and
-        // stands as written. It used to be raised whenever the measurement was
-        // larger, back when the seed could also arrive from a role's skill row —
-        // a number written for a label, which the work was allowed to outgrow.
-        // The only seed left is the process-wide config: a statement about this
-        // deployment, which a measurement may report on (the exhausted-runs
-        // reading says when it is binding) but not silently overrule.
-        if seed == u32::MAX {
-            return calibrated;
-        }
-        seed
+        (calibrated, CeilingSource::Measured)
     }
 }
 
@@ -645,6 +740,36 @@ impl Observable for AgentObservable {
             "agent_total_tool_calls",
             self.total_tool_calls.load(Ordering::Relaxed) as f64,
         ));
+
+        // 每一轮跑完都记下待遇的两半由谁决定：活自己声明的是哪一态，轮次上限由
+        // 操作者钉的数还是这个进程的实测样本给出。运行总数是分母——这两族逐个
+        // 来源加起来应当等于它，少了就是有运行没记下自己的决定。
+        //
+        // 写「见过的那些格」而不是每次都写全零：一个从没出现过的来源在这一刻
+        // 是零，但 scrape 之间它可能刚发生又刚翻页，写零会把「发生过」抹成
+        // 「没发生」。没写过的那一格读作「这进程里没发生过」，这正是对的。
+        for (state, count) in self
+            .decisions_by_declaration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            metrics.push(
+                RawMetric::new("agent_runs_by_declaration", *count as f64)
+                    .with_label(crate::LABEL_DECLARATION, state.as_str()),
+            );
+        }
+        for (source, count) in self
+            .decisions_by_ceiling
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            metrics.push(
+                RawMetric::new("agent_runs_by_ceiling", *count as f64)
+                    .with_label(crate::LABEL_CEILING_SOURCE, source.as_str()),
+            );
+        }
 
         // The iteration ceiling is decided per role, so the reading of it has
         // to be per role too: a single process-wide number here could not tell
@@ -891,6 +1016,114 @@ impl Observable for AgentObservable {
 mod tests {
     use super::*;
 
+    /// 一律按「活自己声明了什么、上限谁给的」记账：三样决定者的第一样与第三样
+    /// 每轮都要在读数里留下自己那一格。
+    ///
+    /// 漏记是这条读数的坏法：某一格变小，在读数面上与「这种运行本来就更少」
+    /// 长得一样。所以两个方向都判——每个来源的格子数对得上，且加起来等于运行
+    /// 总数，没有哪一轮漏报了自己的决定。
+    #[tokio::test]
+    async fn every_run_names_the_declaration_and_the_ceiling_that_decided_it() {
+        let o = AgentObservable::new();
+        let decided = |declaration, ceiling| RunDecision {
+            declaration,
+            ceiling,
+        };
+        o.record_run(
+            "generator",
+            RunOutcome::Delivered,
+            4,
+            9,
+            3,
+            decided(cog_core::DeclarationState::Stated, CeilingSource::Measured),
+        );
+        o.record_run(
+            "generator",
+            RunOutcome::Delivered,
+            4,
+            9,
+            3,
+            decided(cog_core::DeclarationState::Stated, CeilingSource::Measured),
+        );
+        o.record_run(
+            "evaluator",
+            RunOutcome::BudgetExhausted,
+            10,
+            12,
+            2,
+            decided(
+                cog_core::DeclarationState::Unstated,
+                CeilingSource::Unmeasured,
+            ),
+        );
+
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        let by_label = |name: &str, key: &str| -> HashMap<String, f64> {
+            metrics
+                .iter()
+                .filter(|m| m.name == name)
+                .map(|m| (m.labels.get(key).cloned().unwrap_or_default(), m.value))
+                .collect()
+        };
+
+        let declarations = by_label("agent_runs_by_declaration", crate::LABEL_DECLARATION);
+        assert_eq!(declarations.get("stated"), Some(&2.0), "{declarations:?}");
+        assert_eq!(declarations.get("unstated"), Some(&1.0), "{declarations:?}");
+
+        let ceilings = by_label("agent_runs_by_ceiling", crate::LABEL_CEILING_SOURCE);
+        assert_eq!(ceilings.get("measured"), Some(&2.0), "{ceilings:?}");
+        assert_eq!(ceilings.get("unmeasured"), Some(&1.0), "{ceilings:?}");
+
+        let runs = metrics
+            .iter()
+            .find(|m| m.name == "agent_run_count")
+            .map(|m| m.value)
+            .expect("agent_run_count");
+        let declared: f64 = declarations.values().sum();
+        let decided_by: f64 = ceilings.values().sum();
+        assert_eq!(
+            (declared, decided_by),
+            (runs, runs),
+            "有运行没记下自己的决定：运行 {runs}，按声明记下 {declared}，按上限来源记下 {decided_by}"
+        );
+    }
+
+    /// 上限的来源与上限本身是同一次判定：没人钉数、也没有交卷样本时，上限是
+    /// 「没有」，读数是 `unmeasured`，不是「实测给出一个很大的数」。
+    #[test]
+    fn an_empty_sample_with_no_stated_ceiling_reads_as_unmeasured() {
+        let o = AgentObservable::new();
+        assert_eq!(
+            o.iteration_budget_decision_for(u32::MAX),
+            (u32::MAX, CeilingSource::Unmeasured)
+        );
+        assert_eq!(
+            o.iteration_budget_decision_for(25),
+            (25, CeilingSource::Operated)
+        );
+
+        o.record_run(
+            "generator",
+            RunOutcome::Delivered,
+            6,
+            9,
+            3,
+            RunDecision {
+                declaration: cog_core::DeclarationState::Unstated,
+                ceiling: CeilingSource::Unmeasured,
+            },
+        );
+        let (value, source) = o.iteration_budget_decision_for(u32::MAX);
+        assert_eq!(source, CeilingSource::Measured);
+        assert!(value > 6, "实测给出的上限要容得下交过的那一轮：{value}");
+
+        // 钉了数就还是钉的数，有样本也一样。
+        assert_eq!(
+            o.iteration_budget_decision_for(25),
+            (25, CeilingSource::Operated)
+        );
+    }
+
     /// The collector asks an observable that declares no dimensions once, with
     /// an empty name; that is the only call this observable ever answers.
     async fn readings(o: &AgentObservable) -> (f64, f64, f64) {
@@ -1111,7 +1344,14 @@ mod tests {
     async fn a_run_that_spent_its_budget_is_counted_as_an_exhaustion_not_a_success() {
         let o = AgentObservable::new();
         o.note_budget_exhausted("generator");
-        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        o.record_run(
+            "generator",
+            RunOutcome::BudgetExhausted,
+            10,
+            21,
+            12,
+            RunDecision::no_declaration(),
+        );
 
         let (runs, successes, exhausted) = readings(&o).await;
         assert_eq!(runs, 1.0);
@@ -1135,6 +1375,7 @@ mod tests {
             11,
             21,
             12,
+            RunDecision::no_declaration(),
         );
 
         let (runs, successes, exhausted) = readings(&o).await;
@@ -1155,6 +1396,7 @@ mod tests {
             11,
             21,
             12,
+            RunDecision::no_declaration(),
         );
         assert_eq!(
             o.iteration_budget_for(10),
@@ -1166,7 +1408,14 @@ mod tests {
     #[tokio::test]
     async fn a_run_that_delivered_an_answer_is_counted_as_a_success() {
         let o = AgentObservable::new();
-        o.record_run("generator", RunOutcome::Delivered, 3, 7, 2);
+        o.record_run(
+            "generator",
+            RunOutcome::Delivered,
+            3,
+            7,
+            2,
+            RunDecision::no_declaration(),
+        );
 
         let (runs, successes, exhausted) = readings(&o).await;
         assert_eq!(runs, 1.0);
@@ -1181,7 +1430,14 @@ mod tests {
         let o = AgentObservable::new();
         assert_eq!(o.iteration_budget_for(10), 10);
         // 只有被截断的运行也不是"跑完过"的证据：它没交卷，也就没说需要多少轮。
-        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        o.record_run(
+            "generator",
+            RunOutcome::BudgetExhausted,
+            10,
+            21,
+            12,
+            RunDecision::no_declaration(),
+        );
         assert_eq!(o.iteration_budget_for(10), 10);
     }
 
@@ -1192,7 +1448,14 @@ mod tests {
     fn an_unstated_ceiling_takes_the_calibration_instead_of_discarding_it() {
         let o = AgentObservable::new();
         for _ in 0..4 {
-            o.record_run("generator", RunOutcome::Delivered, 12, 21, 12);
+            o.record_run(
+                "generator",
+                RunOutcome::Delivered,
+                12,
+                21,
+                12,
+                RunDecision::no_declaration(),
+            );
         }
         // 最长 12 + 均值 12。
         assert_eq!(
@@ -1214,7 +1477,14 @@ mod tests {
     fn an_unstated_ceiling_stays_unstated_until_something_is_measured() {
         let o = AgentObservable::new();
         assert_eq!(o.iteration_budget_for(u32::MAX), u32::MAX);
-        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        o.record_run(
+            "generator",
+            RunOutcome::BudgetExhausted,
+            10,
+            21,
+            12,
+            RunDecision::no_declaration(),
+        );
         assert_eq!(o.iteration_budget_for(u32::MAX), u32::MAX);
     }
 
@@ -1225,7 +1495,14 @@ mod tests {
     fn the_ceiling_admits_the_longest_run_this_process_has_delivered() {
         let o = AgentObservable::new();
         for iterations in [6, 8] {
-            o.record_run("generator", RunOutcome::Delivered, iterations, 20, 5);
+            o.record_run(
+                "generator",
+                RunOutcome::Delivered,
+                iterations,
+                20,
+                5,
+                RunDecision::no_declaration(),
+            );
         }
         let budget = o.iteration_budget_for(u32::MAX);
         assert!(
@@ -1245,9 +1522,23 @@ mod tests {
     fn one_outlier_does_not_raise_every_runs_ceiling() {
         let o = AgentObservable::new();
         for _ in 0..18 {
-            o.record_run("generator", RunOutcome::Delivered, 5, 20, 4);
+            o.record_run(
+                "generator",
+                RunOutcome::Delivered,
+                5,
+                20,
+                4,
+                RunDecision::no_declaration(),
+            );
         }
-        o.record_run("generator", RunOutcome::Delivered, 169, 20, 4);
+        o.record_run(
+            "generator",
+            RunOutcome::Delivered,
+            169,
+            20,
+            4,
+            RunDecision::no_declaration(),
+        );
         let budget = o.iteration_budget_for(u32::MAX);
         assert!(
             budget < 60,
@@ -1270,8 +1561,22 @@ mod tests {
         let labeled_generator = AgentObservable::new();
         let labeled_evaluator = AgentObservable::new();
         for _ in 0..4 {
-            labeled_generator.record_run("generator", RunOutcome::Delivered, 20, 40, 8);
-            labeled_evaluator.record_run("evaluator", RunOutcome::Delivered, 20, 40, 8);
+            labeled_generator.record_run(
+                "generator",
+                RunOutcome::Delivered,
+                20,
+                40,
+                8,
+                RunDecision::no_declaration(),
+            );
+            labeled_evaluator.record_run(
+                "evaluator",
+                RunOutcome::Delivered,
+                20,
+                40,
+                8,
+                RunDecision::no_declaration(),
+            );
         }
         assert_eq!(
             labeled_generator.iteration_budget_for(u32::MAX),
@@ -1290,11 +1595,25 @@ mod tests {
     fn runs_under_two_labels_share_one_sample() {
         let o = AgentObservable::new();
         for _ in 0..4 {
-            o.record_run("generator", RunOutcome::Delivered, 6, 20, 5);
+            o.record_run(
+                "generator",
+                RunOutcome::Delivered,
+                6,
+                20,
+                5,
+                RunDecision::no_declaration(),
+            );
         }
         let one_label = o.iteration_budget_for(u32::MAX);
         for _ in 0..4 {
-            o.record_run("evaluator", RunOutcome::Delivered, 30, 20, 5);
+            o.record_run(
+                "evaluator",
+                RunOutcome::Delivered,
+                30,
+                20,
+                5,
+                RunDecision::no_declaration(),
+            );
         }
         let two_labels = o.iteration_budget_for(u32::MAX);
         assert!(
@@ -1309,7 +1628,14 @@ mod tests {
     fn the_sample_window_stays_bounded_and_recent() {
         let o = AgentObservable::new();
         for _ in 0..(BUDGET_SAMPLE_WINDOW + 10) {
-            o.record_run("generator", RunOutcome::Delivered, 40, 80, 8);
+            o.record_run(
+                "generator",
+                RunOutcome::Delivered,
+                40,
+                80,
+                8,
+                RunDecision::no_declaration(),
+            );
         }
         // 40 * (window + 10) 如果全留下会把均值抬到 40，上限就成 80 了。
         assert_eq!(
@@ -1325,7 +1651,14 @@ mod tests {
     fn only_completed_runs_raise_the_ceiling() {
         let o = AgentObservable::new();
         for _ in 0..50 {
-            o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+            o.record_run(
+                "generator",
+                RunOutcome::BudgetExhausted,
+                10,
+                21,
+                12,
+                RunDecision::no_declaration(),
+            );
         }
         assert_eq!(o.iteration_budget_for(10), 10);
     }
@@ -1338,9 +1671,23 @@ mod tests {
         // 撞墙记在判定的那一刻，终局记在 run 结束时——按真实顺序两件都走一遍。
         for _ in 0..2 {
             o.note_budget_exhausted("generator");
-            o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+            o.record_run(
+                "generator",
+                RunOutcome::BudgetExhausted,
+                10,
+                21,
+                12,
+                RunDecision::no_declaration(),
+            );
         }
-        o.record_run("evaluator", RunOutcome::Delivered, 3, 7, 2);
+        o.record_run(
+            "evaluator",
+            RunOutcome::Delivered,
+            3,
+            7,
+            2,
+            RunDecision::no_declaration(),
+        );
 
         let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
         let exhausted = |role: &str| {
@@ -1369,7 +1716,14 @@ mod tests {
         let o = AgentObservable::new();
         for _ in 0..2 {
             o.note_budget_exhausted("generator");
-            o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+            o.record_run(
+                "generator",
+                RunOutcome::BudgetExhausted,
+                10,
+                21,
+                12,
+                RunDecision::no_declaration(),
+            );
         }
         o.note_budget_exhausted("generator");
         o.record_run(
@@ -1378,6 +1732,7 @@ mod tests {
             10,
             21,
             12,
+            RunDecision::no_declaration(),
         );
 
         let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
@@ -1406,12 +1761,40 @@ mod tests {
     #[tokio::test]
     async fn a_run_stopped_by_a_rule_is_counted_per_role_under_its_own_name() {
         let o = AgentObservable::new();
-        o.record_run("writer", RunOutcome::Refused, 2, 3, 2);
-        o.record_run("writer", RunOutcome::Refused, 2, 3, 2);
-        o.record_run("planner", RunOutcome::Delivered, 4, 9, 3);
+        o.record_run(
+            "writer",
+            RunOutcome::Refused,
+            2,
+            3,
+            2,
+            RunDecision::no_declaration(),
+        );
+        o.record_run(
+            "writer",
+            RunOutcome::Refused,
+            2,
+            3,
+            2,
+            RunDecision::no_declaration(),
+        );
+        o.record_run(
+            "planner",
+            RunOutcome::Delivered,
+            4,
+            9,
+            3,
+            RunDecision::no_declaration(),
+        );
         // A budget ending must not land on this series: the two are different
         // findings and a reader that cannot separate them cannot act on either.
-        o.record_run("planner", RunOutcome::BudgetExhausted, 10, 21, 12);
+        o.record_run(
+            "planner",
+            RunOutcome::BudgetExhausted,
+            10,
+            21,
+            12,
+            RunDecision::no_declaration(),
+        );
 
         let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
         let read = |role: &str| {
@@ -1437,8 +1820,22 @@ mod tests {
     #[tokio::test]
     async fn the_published_set_is_exactly_the_cumulative_counters() {
         let o = AgentObservable::new();
-        o.record_run("generator", RunOutcome::Delivered, 3, 7, 2);
-        o.record_run("evaluator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        o.record_run(
+            "generator",
+            RunOutcome::Delivered,
+            3,
+            7,
+            2,
+            RunDecision::no_declaration(),
+        );
+        o.record_run(
+            "evaluator",
+            RunOutcome::BudgetExhausted,
+            10,
+            21,
+            12,
+            RunDecision::no_declaration(),
+        );
 
         let mut names: Vec<String> = o
             .collect_metrics("")
@@ -1462,6 +1859,8 @@ mod tests {
                 "agent_iteration_budget_exhausted",
                 "agent_iteration_budget_exhausted_no_deliverable",
                 "agent_run_count",
+                "agent_runs_by_ceiling",
+                "agent_runs_by_declaration",
                 "agent_success_count",
                 "agent_total_steps",
                 "agent_total_tool_calls",

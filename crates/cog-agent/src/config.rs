@@ -227,6 +227,7 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
             owner_task_id: None,
             // 配置文件不知道这次要跑哪件活；声明由拿到任务的那一层补。
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
             stated_directions: Vec::new(),
         }
     }

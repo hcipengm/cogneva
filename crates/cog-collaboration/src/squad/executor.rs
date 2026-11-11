@@ -44,12 +44,15 @@ pub struct SquadConfig {
     pub boundary_config: Option<crate::BoundaryConfig>,
     /// true = 这是一个 self_evolution 任务；使用更激进的短路径以控制延迟。
     pub is_self_evolution: bool,
-    /// 这件活自己交什么（`Task::deliverable`）。
+    /// 这件活自己交什么、这句话从哪儿来（`Task::deliverable_declaration`）。
     ///
     /// 只有接下「产出这份物」那一份活的座位拿到它：同一件任务上做评审的人
     /// 不该因为工作树没动被收住，而做变更的人该。所以它不是「这件任务整体是
     /// 不是变更」，是这一份活交给谁、判成什么。
-    pub deliverable: cog_core::Deliverable,
+    ///
+    /// 带着来源走：小队建的是运行时，而运行时要在读数里指出这一轮待遇由哪一样
+    /// 决定。只传结论的话，来源在小队这一层就丢了，运行只能落回「没人说」。
+    pub deliverable: cog_core::DeliverableDeclaration,
     /// 有人就这件活说过的方向，原文照录（`Task::stated_directions`）。
     ///
     /// 与 `deliverable` 成对：前者说交什么，这一格说往哪儿算好。每个座位都带着它
@@ -74,7 +77,7 @@ impl Default for SquadConfig {
             profile: None,
             boundary_config: None,
             is_self_evolution: false,
-            deliverable: cog_core::Deliverable::Unstated,
+            deliverable: cog_core::DeliverableDeclaration::Unstated,
             stated_directions: Vec::new(),
             planner_skill_id: None,
             generator_skill_id: None,
@@ -471,7 +474,7 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::PLANNER,
-                cog_core::Deliverable::Plan,
+                cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
                 squad.config.stated_directions.clone(),
             )
             .await
@@ -525,7 +528,7 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::GENERATOR,
-                squad.config.deliverable,
+                squad.config.deliverable.clone(),
                 squad.config.stated_directions.clone(),
             )
             .await
@@ -546,7 +549,7 @@ impl SquadExecutor {
                 deps.state_backend.as_ref(),
                 &squad.task_id,
                 cog_core::roles::EVALUATOR,
-                cog_core::Deliverable::Judgement,
+                cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
                 squad.config.stated_directions.clone(),
             )
             .await
@@ -622,7 +625,7 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::PLANNER,
-                    cog_core::Deliverable::Plan,
+                    cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
                     squad.config.stated_directions.clone(),
                 )
                 .await;
@@ -632,7 +635,7 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::GENERATOR,
-                    squad.config.deliverable,
+                    squad.config.deliverable.clone(),
                     squad.config.stated_directions.clone(),
                 )
                 .await;
@@ -642,7 +645,7 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::EVALUATOR,
-                    cog_core::Deliverable::Judgement,
+                    cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
                     squad.config.stated_directions.clone(),
                 )
                 .await;
@@ -653,7 +656,7 @@ impl SquadExecutor {
                     state,
                     &squad.task_id,
                     cog_core::roles::MODERATOR,
-                    cog_core::Deliverable::Answer,
+                    cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Answer),
                     squad.config.stated_directions.clone(),
                 )
                 .await
@@ -784,7 +787,9 @@ impl SquadExecutor {
                                 deps.state_backend.as_ref(),
                                 &squad.task_id,
                                 cog_core::roles::MERGER,
-                                cog_core::Deliverable::Answer,
+                                cog_core::DeliverableDeclaration::protocol(
+                                    cog_core::Deliverable::Answer,
+                                ),
                                 squad.config.stated_directions.clone(),
                             )
                             .await

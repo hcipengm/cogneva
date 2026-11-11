@@ -15,8 +15,15 @@ use crate::common;
 use common::root::repo_root;
 use common::rust_production::{production_sources, relative_name};
 
-use cog_agent::observable::{AgentObservable, RunOutcome};
+use cog_agent::observable::{AgentObservable, CeilingSource, RunDecision, RunOutcome};
 use cog_core::roles;
+
+/// 这一批运行不关心声明来源；上限的来源随每轮的种子在运行时决定，
+/// 这里的两次记录只是为了把交卷样本喂进去。
+const UNDECLARED: RunDecision = RunDecision {
+    declaration: cog_core::DeclarationState::Unstated,
+    ceiling: CeilingSource::Unmeasured,
+};
 
 /// 同一批运行，两个标签，两个上限必须相同。
 ///
@@ -27,8 +34,15 @@ fn the_same_runs_under_two_labels_yield_the_same_ceiling() {
     let under_planner = AgentObservable::new();
     let under_generator = AgentObservable::new();
     for _ in 0..6 {
-        under_planner.record_run(roles::PLANNER, RunOutcome::Delivered, 9, 20, 4);
-        under_generator.record_run(roles::GENERATOR, RunOutcome::Delivered, 9, 20, 4);
+        under_planner.record_run(roles::PLANNER, RunOutcome::Delivered, 9, 20, 4, UNDECLARED);
+        under_generator.record_run(
+            roles::GENERATOR,
+            RunOutcome::Delivered,
+            9,
+            20,
+            4,
+            UNDECLARED,
+        );
     }
 
     let planner = under_planner.iteration_budget_for(u32::MAX);

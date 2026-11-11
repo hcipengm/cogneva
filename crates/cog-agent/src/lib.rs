@@ -47,6 +47,19 @@ pub const LABEL_CAUSE: &str = "cause";
 /// 读数按「哪个工具」归属时用的标签键。
 pub const LABEL_TOOL: &str = "tool";
 
+/// 读数按「这件活的声明来自哪一类」归属时用的标签键。
+///
+/// 与 [`LABEL_ROLE`] 是两个问题：角色是名册上的一行，声明是活自己的话。同一个
+/// 人接不同活时，前者不变、后者该变——这正是「待遇跟活走，不跟名字走」在读面上
+/// 的样子。
+pub const LABEL_DECLARATION: &str = "declaration";
+
+/// 读数按「这个数是谁给的」归属时用的标签键。
+///
+/// 目前只有轮次上限用它：钉死的数、实测给出、与两边都没有（无上限）是三种
+/// 读数上必须分得开的情形。
+pub const LABEL_CEILING_SOURCE: &str = "source";
+
 pub use archive::{HttpToolOutputArchive, ToolOutputArchive};
 pub use config::{AgentLoopConfig, AgentManagerConfig};
 

@@ -71,6 +71,7 @@ struct DecisionRecord {
 /// 决定，测试当场红。`who` 那一半不在这张表里——名字与花销行本来就不决定待遇。
 const TREATMENT_SOURCES: &[(&str, &str)] = &[
     ("deliverable", "declared"),
+    ("deliverable_state", "declared"),
     ("deliverable_source", "declared"),
     ("stated_directions", "declared"),
     ("rubric", "declared"),
@@ -104,6 +105,7 @@ fn split_config(config: RuntimeConfig) -> (serde_json::Value, serde_json::Value)
         squad_id,
         owner_task_id,
         deliverable,
+        deliverable_state,
         stated_directions,
     } = config;
     let who = serde_json::json!({
@@ -121,6 +123,7 @@ fn split_config(config: RuntimeConfig) -> (serde_json::Value, serde_json::Value)
         "think_stall_timeout_secs": think_stall_timeout_secs,
         "final_draft_timeout_secs": final_draft_timeout_secs,
         "deliverable": format!("{deliverable:?}"),
+        "deliverable_state": deliverable_state.as_str(),
         "stated_directions": stated_directions,
     });
     (who, treatment)
@@ -290,6 +293,7 @@ async fn record_for(label: &str, tools: &[String]) -> DecisionRecord {
     // 这里照做，免得这条记录量的是「测试自己拼的配置」而不是运行时会拿到的那一份。
     let base = RuntimeConfig {
         deliverable: declared,
+        deliverable_state: task.deliverable_declaration().state(),
         stated_directions: directions.clone(),
         ..Default::default()
     };

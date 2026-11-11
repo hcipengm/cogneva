@@ -431,6 +431,7 @@ async fn test_agent_loop_with_wal_persists_events() {
         // 这一条测的是 WAL 往返，不关心这次运行替谁干活。
         owner_task_id: None,
         deliverable: cog_core::Deliverable::Unstated,
+        deliverable_state: cog_core::DeclarationState::Unstated,
     };
     let mut agent_loop = AgentRuntime::new(config, event_tx).with_wal(wal);
 

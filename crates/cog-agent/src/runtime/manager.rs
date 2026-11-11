@@ -621,7 +621,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
             role,
             llm,
             task_id,
-            cog_core::Deliverable::Unstated,
+            cog_core::DeliverableDeclaration::Unstated,
             Vec::new(),
         )
         .await
@@ -633,7 +633,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
         role: &str,
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
         task_id: Option<&str>,
-        deliverable: cog_core::Deliverable,
+        deliverable: cog_core::DeliverableDeclaration,
         stated_directions: Vec<String>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
         // 同一个名字只对应一个活的对象。
@@ -661,9 +661,12 @@ impl cog_core::AgentManager for GlobalAgentManager {
         // 就是这个任务的 id（`create_role_agent` 与 roundtable 的角色都是这么建
         // 的），所以这里不做推断。
         config.owner_task_id = task_id.map(str::to_string);
-        // 这份活交什么，是拿到任务的那一层说的（`Task::deliverable`）。运行时够不到
-        // 任务对象，只读这一位；按角色名判时，同一个人换件活就判错。
-        config.deliverable = deliverable;
+        // 这份活交什么、这个结论从哪儿来，是拿到任务的那一层说的
+        // （`Task::deliverable_declaration`）。运行时够不到任务对象，只读这两格；
+        // 按角色名判时，同一个人换件活就判错。结论与来源从同一份声明里取出，
+        // 所以两格不会各自漂。
+        config.deliverable = deliverable.conclusion();
+        config.deliverable_state = deliverable.state();
         // 同一份声明里来自人的那半：有人就这件活说过的方向。抄进来而不是让运行时
         // 自己去读，理由与上一句相同——运行时够不到任务，读不到就没得判。
         config.stated_directions = stated_directions;

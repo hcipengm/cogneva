@@ -521,6 +521,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
             cog_core::roles::EVALUATOR,
             0,
         );
+        let eval_declaration =
+            cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement);
         let eval_config = cog_core::RuntimeConfig {
             agent_id: eval_employee.id.clone(),
             role: cog_core::roles::EVALUATOR.into(),
@@ -533,8 +535,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
-            // 这一份活交的是判词：它不动工作树，判的是别人交的东西。
-            deliverable: cog_core::Deliverable::Judgement,
+            // 这一份活交的是判词：它不动工作树，判的是别人交的东西。这句是这段
+            // 常驻评测的结构说的，不是行上某个字段说的，所以来源是 `protocol`。
+            // 结论与来源从同一份声明里取出：两格各写一遍就会各漂一次。
+            deliverable: eval_declaration.conclusion(),
+            deliverable_state: eval_declaration.state(),
             // 常驻的评测员工没有一件具体的活，也就没有人就它说过方向。
             stated_directions: Vec::new(),
         };

@@ -24,6 +24,7 @@ async fn test_agent_loop_completes_without_tools() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -73,6 +74,7 @@ async fn test_agent_loop_state_transitions() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -103,6 +105,7 @@ async fn test_agent_loop_steps_recorded() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -134,6 +137,7 @@ async fn test_agent_loop_max_iterations() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -178,6 +182,7 @@ async fn test_agent_loop_chat_stream_returns_raw_stream() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -223,6 +228,7 @@ async fn test_agent_loop_checkpoint() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -258,6 +264,7 @@ async fn test_react_loop_wraps_agent_loop() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -285,6 +292,7 @@ async fn test_react_loop_emits_react_events() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -343,6 +351,7 @@ async fn test_react_loop_steps_extracted_correctly() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -398,6 +407,7 @@ async fn test_agent_runtime_discovers_dynamically_registered_tool() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     )
@@ -471,6 +481,7 @@ fn runtime_with_one_tool(
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     )

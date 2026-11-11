@@ -100,6 +100,15 @@ pub struct RuntimeConfig {
     /// 不是默认的 `WorkProduct`，是为了让「没人说」与「有人说是工作产物」在读数里
     /// 分得开。
     pub deliverable: crate::Deliverable,
+    /// 上面那一格的来源属于哪一类（见 [`crate::DeclarationState`]）。
+    ///
+    /// 与 `deliverable` 是同一份声明的两半：这一格说「这个结论从哪儿来」，那一格
+    /// 说「结论是什么」。两格一起写，写的人只有拿到任务的那一层；分开放是因为
+    /// 运行期的读数要按来源计数，而结论本身回答不了「是没人说、还是说了读不出来」。
+    ///
+    /// 缺省 `Unstated`：没人说。它不等于「说了是工作产物」——那会把一个拼错的词
+    /// 算进「生产者说过了」里。
+    pub deliverable_state: crate::DeclarationState,
     /// 有人就这件活说过的方向，原文照录（见 [`crate::Task::stated_directions`]）。
     ///
     /// 与 `deliverable` 同一个理由、同一条路：运行时没有任务对象，「这一轮什么算好」
@@ -145,6 +154,7 @@ impl Default for RuntimeConfig {
             squad_id: None,
             owner_task_id: None,
             deliverable: crate::Deliverable::Unstated,
+            deliverable_state: crate::DeclarationState::Unstated,
             stated_directions: Vec::new(),
         }
     }
@@ -565,13 +575,17 @@ pub trait AgentManager: Send + Sync {
     /// [`crate::Task::stated_directions`]）。它和 `deliverable` 一起传，是因为两者
     /// 回答的是同一次运行的两个问题——「交什么」与「往哪儿算好」——只传前一个
     /// 的话，判活的标准仍是没人说话的那一份。
+    ///
+    /// `deliverable` 传的是整份声明而不是结论：[`crate::DeliverableDeclaration`]
+    /// 带着来源，运行时靠它把「生产者说的」「平台推的」「没人说」「说了读不出来」
+    /// 分成四个可计数的来源。只传结论的话，这四个到了运行时就只剩一个。
     async fn create_agent_declaring(
         &self,
         agent_id: &str,
         role: &str,
         llm: std::sync::Arc<dyn crate::llm::LlmClient>,
         task_id: Option<&str>,
-        deliverable: crate::Deliverable,
+        deliverable: crate::DeliverableDeclaration,
         stated_directions: Vec<String>,
     ) -> crate::SFResult<std::sync::Arc<dyn crate::Agent>> {
         let _ = (deliverable, stated_directions);

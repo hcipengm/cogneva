@@ -230,7 +230,7 @@ impl Agent for StubAgent {
 #[derive(Debug, Clone)]
 struct Seat {
     role: String,
-    deliverable: cog_core::Deliverable,
+    deliverable: cog_core::DeliverableDeclaration,
     directions: Vec<String>,
 }
 
@@ -291,7 +291,7 @@ impl AgentManager for StubAgentManager {
         role: &str,
         llm: Arc<dyn LlmClient>,
         task_id: Option<&str>,
-        deliverable: cog_core::Deliverable,
+        deliverable: cog_core::DeliverableDeclaration,
         stated_directions: Vec<String>,
     ) -> cog_core::SFResult<Arc<dyn Agent>> {
         self.seats.lock().unwrap().push(Seat {
@@ -394,7 +394,7 @@ fn squad_config(goal: &str, task: &Task, pge_mode: PgeMode) -> SquadConfig {
         max_retries: 0,
         profile: Some(derive_task_profile(task)),
         is_self_evolution: task.is_self_evolution(),
-        deliverable: task.deliverable(),
+        deliverable: task.deliverable_declaration(),
         stated_directions: task.stated_directions(),
         ..Default::default()
     }
@@ -454,6 +454,50 @@ async fn run_declared_recording(
         "the run must use the routed topology"
     );
     (result.success, log, seats)
+}
+
+/// 声明的来源跟着结论一起到座位上。
+///
+/// 只把结论传下去时，运行时那一头永远读成「没人说」——结论对、来源丢在半路，
+/// 而读数上「生产者说的」与「平台推的」从此都归到没人说那一格。这条走真实派单
+/// 路径，看每个座位建 agent 时真正交出去的那份声明：没有一个是 `unstated`，
+/// 产出改动的那一位拿到的是任务自己的来源。
+#[tokio::test]
+async fn the_source_of_each_declaration_reaches_the_agent_that_runs_it() {
+    let task = self_evolution_task("raise the timeout");
+    let (_, _, seats) =
+        run_declared_recording(Checkout::Changed(WORKSPACE_DIFF.to_string()), task).await;
+    let seats = seats.lock().unwrap().clone();
+    assert!(
+        !seats.is_empty(),
+        "这次运行一个座位都没建：这条判据什么都没在守"
+    );
+    for seat in &seats {
+        assert_ne!(
+            seat.deliverable.state(),
+            cog_core::DeclarationState::Unstated,
+            "建 {} 时把声明的来源丢了：运行时会把这一轮读成「没人就这份活说过话」\n{:?}",
+            seat.role,
+            seat.deliverable
+        );
+    }
+    let producing: Vec<_> = seats
+        .iter()
+        .filter(|seat| seat.deliverable.conclusion().declares_change())
+        .collect();
+    assert!(
+        !producing.is_empty(),
+        "没有一位座位接的是任务自己声明的改动：这条判据量不到来源"
+    );
+    for seat in producing {
+        assert_eq!(
+            seat.deliverable.state(),
+            cog_core::DeclarationState::Derived,
+            "{} 接的是自进化入口推出来的那份声明，来源却不是 `derived`：{:?}",
+            seat.role,
+            seat.deliverable
+        );
+    }
 }
 
 /// 有人就这件活说过方向，每个座位都带着它去判自己的产出。

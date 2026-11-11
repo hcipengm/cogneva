@@ -226,6 +226,7 @@ fn runtime(
             squad_id: None,
             owner_task_id: Some(task_id.to_string()),
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         tx,
     )

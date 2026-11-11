@@ -426,6 +426,12 @@ pub struct AgentRuntime {
     /// — the ending is decided at three different places, and only the exit is
     /// common to all of them.
     run_outcome: Option<crate::observable::RunOutcome>,
+    /// 这一轮跑的轮次上限是谁给的（见 [`crate::observable::CeilingSource`]）。
+    ///
+    /// 在构造时定下，与 `config.max_iterations` 是同一判定的两个出口：一个数，
+    /// 一个来源。运行结束时两样一起报给 observable，读者才能把「这一轮的上限
+    /// 是量出来的还是操作者钉的」指出来，而不是只看到一个数。
+    ceiling_source: crate::observable::CeilingSource,
     /// Whether this run has already reported a prompt that did not fit the
     /// configured context window.
     ///
@@ -1095,7 +1101,9 @@ impl AgentRuntime {
         // 换个标签接手就换一个天花板，而那正是「标签决定行为」。写成「没写就取
         // 10」同样不行：2026-11-05 实测 generator 在第十轮带着一个没跑完的工具
         // 调用被砍，下一轮从头再来，同一条 CI 红修了六版。
-        config.max_iterations = observable.iteration_budget_for(config.max_iterations);
+        let (ceiling, ceiling_source) =
+            observable.iteration_budget_decision_for(config.max_iterations);
+        config.max_iterations = ceiling;
 
         let context = ContextWindow::new(config.context_window_size);
 
@@ -1129,6 +1137,7 @@ impl AgentRuntime {
             run_iterations: 0,
             resumed_turns: 0,
             run_outcome: None,
+            ceiling_source,
             context_overrun_reported: false,
             reply_is_the_result: false,
             actor_label: None,
@@ -1894,6 +1903,10 @@ impl AgentRuntime {
             iterations,
             steps,
             tool_calls,
+            crate::observable::RunDecision {
+                declaration: self.config.deliverable_state,
+                ceiling: self.ceiling_source,
+            },
         );
         self.run_outcome = Some(outcome);
     }
@@ -4515,6 +4528,10 @@ mod tests {
                 iterations,
                 20,
                 5,
+                crate::observable::RunDecision {
+                    declaration: cog_core::DeclarationState::Unstated,
+                    ceiling: crate::observable::CeilingSource::Unmeasured,
+                },
             );
         }
 

@@ -28,6 +28,7 @@ async fn test_agent_loop_restore_preserves_context() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -65,6 +66,7 @@ async fn test_agent_loop_restore_preserves_context() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx2,
     );
@@ -97,6 +99,7 @@ async fn test_agent_loop_restore_changes_role_and_state() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -120,6 +123,7 @@ async fn test_agent_loop_restore_changes_role_and_state() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx2,
     );
@@ -147,6 +151,7 @@ async fn test_agent_snapshot_and_restore() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -196,6 +201,7 @@ async fn test_agent_restore_allows_continue() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("acknowledged")),
     );
@@ -251,6 +257,7 @@ async fn test_snapshot_event_replay_with_wal() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     )
@@ -291,6 +298,7 @@ async fn test_snapshot_event_replay_with_wal() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx2,
     )
@@ -337,6 +345,7 @@ async fn test_snapshot_without_wal_has_zero_offset() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );
@@ -363,6 +372,7 @@ async fn test_restore_resets_steps() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         event_tx,
     );

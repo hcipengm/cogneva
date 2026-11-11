@@ -26,6 +26,7 @@ async fn test_agent_prompt_completes() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -59,6 +60,7 @@ async fn test_agent_subscribe_receives_events() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -100,6 +102,7 @@ async fn test_agent_state_transitions() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -133,6 +136,7 @@ async fn test_agent_abort_resets_to_idle() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("slow result")),
     );
@@ -172,6 +176,7 @@ async fn test_agent_reset_clears_state() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -200,6 +205,7 @@ async fn test_agent_continue_preserves_context() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("acknowledged")),
     );
@@ -237,6 +243,7 @@ async fn test_agent_wait_for_idle() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -273,6 +280,7 @@ async fn test_agent_chat_stream_bypasses_loop() {
             squad_id: None,
             owner_task_id: None,
             deliverable: cog_core::Deliverable::Unstated,
+            deliverable_state: cog_core::DeclarationState::Unstated,
         },
         Arc::new(MockProvider::new("hello stream")),
     );

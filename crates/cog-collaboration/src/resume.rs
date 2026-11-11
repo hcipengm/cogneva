@@ -24,9 +24,10 @@ pub const RESUME_OUTCOMES: [&str; 2] = ["restored", "failed"];
 /// 恢复必须发生在 agent 开跑之前：`restore` 会 abort 在跑的任务并重置命令
 /// 通道，那是「把状态换成快照里的状态」的实现方式，对已经开工的 agent 调用
 /// 等于把当前这一步丢掉。
-/// `deliverable` 是这一份活自己的声明（`Task::deliverable`），不是接手的人
-/// 的角色：同一个人做评审时交的是判词，做变更时交的是改动。建 agent 的这一层
-/// 拿着任务，所以由它说；运行时只读这一位。
+/// `deliverable` 是这一份活自己的声明（`Task::deliverable_declaration`），不是
+/// 接手的人的角色：同一个人做评审时交的是判词，做变更时交的是改动。建 agent 的
+/// 这一层拿着任务，所以由它说；运行时只读这一位。传整份声明而不是结论，是为了
+/// 让「这句话是谁说的」一路走到运行时的读数里。
 ///
 /// `stated_directions` 是同一份声明里来自人的那半（`Task::stated_directions`）：
 /// 有人就这件活说过「往哪儿算好」。它跟着声明一起走，因为它改的也是判活的标准，
@@ -37,7 +38,7 @@ pub(crate) async fn create_role_agent(
     state: Option<&Arc<dyn StateBackend>>,
     task_id: &str,
     role: &str,
-    deliverable: cog_core::Deliverable,
+    deliverable: cog_core::DeliverableDeclaration,
     stated_directions: Vec<String>,
 ) -> SFResult<Arc<dyn Agent>> {
     let agent = manager

@@ -986,6 +986,12 @@ pub enum StatementVia {
     Delivers,
     /// 只会写旧键 [`INPUT_DECLARES_CHANGE`]，真值为真。
     DeclaresChange,
+    /// 平台在代码里为这道工序说的：这段结构固定产出这个物，不由行上的字段说。
+    ///
+    /// 与 `Delivers` 分开，因为它不是某一份活自己说的——它在任何任务行被读之前
+    /// 就成立。合进 `Delivers` 会让读数把「行上写了」与「这段代码就是这样」算成
+    /// 同一个数，而收尾旧拼法时要知道的正是行上还有多少份没被生产者说出来。
+    Protocol,
 }
 
 /// 哪条规则把任务行上的一个标记读成了交付物。
@@ -1046,6 +1052,68 @@ impl DeliverableDeclaration {
             Self::Stated { conclusion, .. } | Self::Derived { conclusion, .. } => *conclusion,
             Self::Unreadable { .. } | Self::Unstated => Deliverable::Unstated,
         }
+    }
+
+    /// 平台自己为一道工序说的那份声明（见 [`StatementVia::Protocol`]）。
+    ///
+    /// `by` 空着：这句话不是某个人说的，是这段结构说的。编一个提交人会让
+    /// 「谁说的」在读数里指到一个没说过它的人。
+    pub const fn protocol(conclusion: Deliverable) -> Self {
+        Self::Stated {
+            conclusion,
+            by: None,
+            via: StatementVia::Protocol,
+        }
+    }
+
+    /// 这份声明来自哪一类来源，不带内容。
+    pub const fn state(&self) -> DeclarationState {
+        match self {
+            Self::Stated { .. } => DeclarationState::Stated,
+            Self::Derived { .. } => DeclarationState::Derived,
+            Self::Unreadable { .. } => DeclarationState::Unreadable,
+            Self::Unstated => DeclarationState::Unstated,
+        }
+    }
+}
+
+/// 一份声明的来源属于哪一类。
+///
+/// 与 [`DeliverableDeclaration`] 分开：运行期的读数要按来源计数，而整份声明里
+/// 的 `by`、`at`、`from` 与待遇无关——把它们当标签，同一条读数会被拆成一串只
+/// 差时间戳的格子。
+///
+/// 四态而不是两态：「说了」与「没说」之间还隔着「说了但读不出来」，那正是
+/// 「量不到」与「量到的就是没有」的区别，合进 `Unstated` 之后一个拼错的词会
+/// 永远安静地落在没人说那一格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclarationState {
+    /// 生产者自己说的。
+    Stated,
+    /// 平台按行上一个标记推出来的。
+    Derived,
+    /// 行上写了东西，读不成声明。
+    Unreadable,
+    /// 没人说，也没有一条规则读得出它。
+    Unstated,
+}
+
+impl DeclarationState {
+    /// 读数标签上的那一个字（与序列化同名）。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stated => "stated",
+            Self::Derived => "derived",
+            Self::Unreadable => "unreadable",
+            Self::Unstated => "unstated",
+        }
+    }
+}
+
+impl std::fmt::Display for DeclarationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1957,6 +2025,72 @@ mod tests {
         assert_eq!(
             silent.deliverable_declaration(),
             DeliverableDeclaration::Unstated
+        );
+    }
+
+    /// 来源那一类要能把「量不到」与「量到的就是没有」分开。
+    ///
+    /// 四态逐个走一遍：结论相同的两份声明（`stated` 与 `derived` 都读出
+    /// `Change`）在来源上必须不同——运行期按来源计数，合成的读数会把「生产者
+    /// 说的」和「平台推的」算成同一个数。拼错的那份落在 `unreadable`，不是
+    /// `unstated`。
+    #[test]
+    fn a_declarations_state_keeps_unreadable_apart_from_unstated() {
+        let stated = Task::new(
+            "t-state-stated",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "change" }),
+        );
+        let derived = Task::new(
+            "t-state-derived",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({}),
+        );
+        let unreadable = Task::new(
+            "t-state-unreadable",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "chagne" }),
+        );
+        let unstated = Task::new(
+            "t-state-unstated",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({}),
+        );
+
+        assert_eq!(
+            stated.deliverable_declaration().state(),
+            DeclarationState::Stated
+        );
+        assert_eq!(
+            derived.deliverable_declaration().state(),
+            DeclarationState::Derived
+        );
+        assert_eq!(
+            unreadable.deliverable_declaration().state(),
+            DeclarationState::Unreadable
+        );
+        assert_eq!(
+            unstated.deliverable_declaration().state(),
+            DeclarationState::Unstated
+        );
+
+        // 结论相同的两份声明，来源不同：来源那一栏不是结论的别名。
+        assert_eq!(stated.deliverable(), derived.deliverable());
+        assert_ne!(
+            stated.deliverable_declaration().state(),
+            derived.deliverable_declaration().state()
+        );
+
+        // 平台替一道工序说的话有自己的来源，不冒认成行上写的。
+        let protocol = DeliverableDeclaration::protocol(Deliverable::Judgement);
+        assert_eq!(protocol.state(), DeclarationState::Stated);
+        assert_eq!(
+            protocol,
+            DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Judgement,
+                by: None,
+                via: StatementVia::Protocol,
+            }
         );
     }
 

@@ -376,7 +376,7 @@ impl TestHarness {
             context_window_size: None,
             boundary_config: None,
             is_self_evolution: false,
-            deliverable: cog_core::Deliverable::Unstated,
+            deliverable: cog_core::DeliverableDeclaration::Unstated,
             planner_skill_id: None,
             generator_skill_id: None,
             evaluator_skill_id: None,

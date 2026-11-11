@@ -953,7 +953,8 @@ impl PgeRoundtable {
                 cog_core::roles::PLANNER,
                 llm.clone(),
                 Some(&task.id),
-                cog_core::Deliverable::Plan,
+                // 这一段工序固定产出计划：平台在代码里说的，不由行上的字段说。
+                cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Plan),
                 task.stated_directions(),
             )
             .await
@@ -965,7 +966,7 @@ impl PgeRoundtable {
                 cog_core::roles::GENERATOR,
                 llm.clone(),
                 Some(&task.id),
-                task.deliverable(),
+                task.deliverable_declaration(),
                 task.stated_directions(),
             )
             .await
@@ -976,7 +977,8 @@ impl PgeRoundtable {
                 cog_core::roles::EVALUATOR,
                 llm.clone(),
                 Some(&task.id),
-                cog_core::Deliverable::Judgement,
+                // 同上：这一段的产出是判词，由 roundtable 的结构定。
+                cog_core::DeliverableDeclaration::protocol(cog_core::Deliverable::Judgement),
                 task.stated_directions(),
             )
             .await

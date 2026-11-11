@@ -121,6 +121,21 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["role"],
         "crates/cog-agent/src/observable.rs",
     ),
+    // 每一轮跑完都记下待遇的两半由谁决定。按来源计数而不是按角色：角色是名册上
+    // 的一行，而这两族回答的是「活自己说了没有」与「上限是钉的还是量出来的」。
+    // 各来源之和等于 `agent_run_count`，少一个就是有运行没记下自己的决定。
+    (
+        "agent_runs_by_declaration",
+        &["declaration"],
+        "crates/cog-agent/src/observable.rs",
+    ),
+    // 与上面同一处记的另一个问题：轮次上限的来源。`unmeasured` 是两边都没有——
+    // 没人钉数，也还没有一条交卷样本，那一轮无上限；它不能读成一个很大的实测值。
+    (
+        "agent_runs_by_ceiling",
+        &["source"],
+        "crates/cog-agent/src/observable.rs",
+    ),
     // How many task rows nobody can be handed, per status. The producer reads
     // one fact out of the shared store, so every reporting pod carries the same
     // numbers and the panel draws them with `max`: a sum would multiply the
