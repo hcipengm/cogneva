@@ -319,7 +319,7 @@ fn marker_wall(root: &Path) -> Wall<'static> {
             .entry(declaration.value.clone())
             .or_insert_with(|| {
                 Declared::new(declaration.name, declaration.value)
-                    .as_prefix()
+                    .spelled_as_prefix()
                     .owned_by(declaration.file)
             });
     }

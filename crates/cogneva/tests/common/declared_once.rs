@@ -69,12 +69,12 @@ impl Declared {
         }
     }
 
-    pub fn as_prefix(mut self) -> Self {
+    pub fn spelled_as_prefix(mut self) -> Self {
         self.spell = Spell::Prefix;
         self
     }
 
-    pub fn as_text(mut self) -> Self {
+    pub fn spelled_as_text(mut self) -> Self {
         self.spell = Spell::Text;
         self
     }
@@ -527,7 +527,7 @@ mod tests {
             "FAILURE_PREFIX",
             "terminal_env_failure",
         )
-        .as_prefix()]);
+        .spelled_as_prefix()]);
         let hits = |text: &str| wall.read_text("crates/x/src/a.rs", text).len();
         assert_eq!(hits(r#"let m = "terminal_env_failure: 没有产物";"#), 1);
         assert_eq!(hits(r#"let m = "terminal_env_failure";"#), 1);

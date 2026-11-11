@@ -400,8 +400,11 @@ async fn two_inbox_prompts_on_one_employee_do_not_share_a_window() {
             .expect("投递的这一条要真的跑起来");
     }
 
-    let calls = llm.calls.lock().unwrap();
-    let second = calls.last().expect("第二件活发出了它的请求");
+    // 守卫只活过这一次读：读到的请求拷一份出来，锁在 `retire().await` 之前就放掉。
+    let second = {
+        let calls = llm.calls.lock().unwrap();
+        calls.last().expect("第二件活发出了它的请求").clone()
+    };
     assert!(
         !second.iter().any(|m| m.content().contains("inbox-first")),
         "第二件活的首个请求里带着第一件活的消息：员工把上一次运行留在了进程里"
@@ -410,6 +413,5 @@ async fn two_inbox_prompts_on_one_employee_do_not_share_a_window() {
         second.iter().any(|m| m.content().contains("inbox-second")),
         "第二件活的请求没有进来：{second:?}"
     );
-    drop(calls);
     agent.retire().await;
 }

@@ -44,13 +44,13 @@ fn wall() -> Wall<'static> {
         .declared(vec![
             Declared::new("TRACEPARENT_HEADER", o::TRACEPARENT_HEADER).owned_by(DECLARATION),
             Declared::new("TRACE_ID_HEADER", o::TRACE_ID_HEADER)
-                .as_text()
+                .spelled_as_text()
                 .owned_by(DECLARATION),
             Declared::new("SPAN_ID_HEADER", o::SPAN_ID_HEADER)
-                .as_text()
+                .spelled_as_text()
                 .owned_by(DECLARATION),
             Declared::new("PARENT_SPAN_ID_HEADER", o::PARENT_SPAN_ID_HEADER)
-                .as_text()
+                .spelled_as_text()
                 .owned_by(DECLARATION),
         ])
         .floor(4)
