@@ -23,7 +23,7 @@
 //!
 //! 判不了什么：
 //!
-//! * 生产侧（`#[cfg(test)]` 之外）的解析器：`cog-core::contract::reflection` 的
+//! * 生产侧（`#[cfg(test)]` 之外）的解析器：`cog-reflection::config_reachability` 的
 //!   `literal_field_assignment` 判的是「整行右值是不是一个字面量」，不枚举、不认
 //!   转义；`bootstrap` 的生产代码读 `/etc/os-release`、apt sources 与 kubespray
 //!   输出；`takeover` 发的是静态 HTML。它们问的是别的形状，不是「这一行里有几个

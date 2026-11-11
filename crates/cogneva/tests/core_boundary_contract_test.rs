@@ -37,6 +37,16 @@
 //! doing anything. `the_marker_scan_separates_a_call_from_a_mention` pins that
 //! distinction on both polarities.
 //!
+//! Third, a reading with one consumer has a home: the consumer's crate. The
+//! base was carrying the config-reachability parser -- the one that decides
+//! whether a written default is reachable from any deployment document -- while
+//! the only crate calling it was the reflection pipeline. A pure function is
+//! not a shape, and one caller is not sharing. What stays is the half more than
+//! one crate reaches: the diff readers are called by landing and collaboration
+//! too, and moving them would leave those crates with no way to name the base.
+//! The test below reads both sides, so a move in either direction -- into the
+//! base or out of it -- fails here.
+//!
 //! Where this gate lives, and why not in the crate it measures: its subject is
 //! the workspace's layering, and the base is the crate that is supposed to stop
 //! changing. A test directory inside it would make every future boundary
@@ -650,6 +660,47 @@ fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
     println!(
         "{acting} of {} modules in the base do work; the rest are shapes and names",
         modules.len()
+    );
+}
+
+/// A reading one crate calls lives in that crate; a reading more than one crate
+/// calls stays in the base.
+///
+/// The two sides are read from the tree rather than kept as a table: if the
+/// parser drifts back into the base, the first half fails; if the shared diff
+/// reader is moved out with it, the second half fails. Neither failure can be
+/// answered by editing this file alone, which is the point -- the reading is
+/// about which crate can name the symbol.
+#[test]
+fn a_reading_with_one_consumer_lives_in_that_consumer() {
+    let base = common::routes::read_repo(&format!("{BASE_SRC}/contract/reflection.rs"));
+    let consumer = common::routes::read_repo("crates/cog-reflection/src/config_reachability.rs");
+
+    for name in [
+        "unreachable_defaults",
+        "default_impl_blocks",
+        "literal_field_assignment",
+    ] {
+        let declared = format!("fn {name}(");
+        assert!(
+            !base.contains(&declared),
+            "`{name}` is back in the base: its only caller is the reflection \
+             pipeline, and a reader one crate calls belongs in that crate"
+        );
+        assert!(
+            consumer.contains(&declared),
+            "`{name}` is in neither the base nor `cog-reflection::config_reachability`: \
+             the reading the change pipeline needs has no home"
+        );
+    }
+
+    // The diff reader three crates name must not be swept out with the parser.
+    let shared = "pub fn parse_diff_affected_files(";
+    assert!(
+        base.contains(shared),
+        "`parse_diff_affected_files` left the base, but landing and \
+         collaboration call it too: a crate other than the assembly can reach \
+         the base and nothing else, so the shared half has no other home"
     );
 }
 

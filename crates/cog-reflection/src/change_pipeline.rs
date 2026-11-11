@@ -4541,7 +4541,7 @@ impl ChangePipeline {
         }
 
         let unreachable =
-            cog_core::contract::reflection::unreachable_defaults(&written, &sources, &documents);
+            crate::config_reachability::unreachable_defaults(&written, &sources, &documents);
         if unreachable.is_empty() {
             return None;
         }

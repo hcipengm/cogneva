@@ -13,7 +13,7 @@
 //!
 //! 它是 dev-only 的：生产代码不用这份读法，`crate_dependency_contract_test` 把
 //! 「正常依赖指向它」判成 `linked into the artifact`。生产侧读声明的那几条判据
-//! （`cog-core::contract::reflection` 的 `literal_field_assignment`）各自问的是别的
+//! （`cog-reflection::config_reachability` 的 `literal_field_assignment`）各自问的是别的
 //! 形状，不枚举一行里的每一个字面量。
 //!
 //! 它必须证明自己读得对：转义、整字面量、行内第二处三条岔路各有一个反例，抄件们
