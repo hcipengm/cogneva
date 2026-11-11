@@ -142,9 +142,14 @@ impl PgeSettings {
         load_section_from(path, "/pge")
     }
 
-    /// Return the configured schema for `actor`, if any.
-    pub fn schema_for(&self, actor: &str) -> Option<serde_json::Value> {
-        self.schemas.get(actor).cloned()
+    /// 这个席位交什么形状的产物。
+    ///
+    /// 键是**席位**——协议里按名字寻址的那一格，不是坐上去的人的标签：同一个席位
+    /// 换个人坐，拿到的是同一份 schema。调用方传的是 `cog_core::roles` 里的席位常量，
+    /// 不是某个 agent 的名字；这里把参数就叫 `seat`，免得下一个读代码的人以为它可以
+    /// 收一个人的标签。
+    pub fn schema_for(&self, seat: &str) -> Option<serde_json::Value> {
+        self.schemas.get(seat).cloned()
     }
 }
 

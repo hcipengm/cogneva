@@ -7,21 +7,25 @@
 //! 标签接手，待遇变了」。所以这里换一种判法：**同一份任务输入，两个不同的标签各走
 //! 一遍**，把这条路上每一处决定待遇的读数收进一份记录，逐字段比。
 //!
-//! 记录分两半，边界写在类型上：
+//! 记录分两半，边界不是手挑的：
 //!
-//! - **身份**（`identity`）与**归因行**（`attribution_row`）**允许**不同：那是标签
-//!   该回答的问题——这一次花销记在谁头上、这次运行以谁的名义留下痕迹。
-//! - **待遇**（`ceiling` / `deliverable` / `rubric` / `schema` / `task_type` / `tools`）
-//!   **必须逐字相同**。任一字段随标签变，这份记录就红，并点名是哪一个——那一个就是
-//!   「还有哪一处按标签决定待遇」的剩余清单，不需要再靠人去读。
+//! - **`who`**（运行身份、归因行、路由）**允许**不同：那是标签该回答的问题——这一次
+//!   花销记在谁头上、这次运行以谁的名义留下痕迹。
+//! - **`treatment`**（整份运行配置里决定待遇的每一格，加上判官收到的标尺、席位读到
+//!   的 schema、任务类型与工具清单）**必须逐字相同**。任一格随标签变，记录就红，并
+//!   点名是哪一个——那一个就是「还有哪一处按标签决定待遇」的剩余清单。
+//!
+//! 两半的划分由 `split_config` 对 `RuntimeConfig` 做**无 `..` 的解构**得出：配置多
+//! 一个字段，解构先编译不过，作者必须回答它属于哪一半。这样，「新旋钮悄悄落在待遇
+//! 外面」和「新待遇格没说由什么决定」都过不了编译或测试，不必靠人去读。
 //!
 //! 两个方向都判：只判「待遇相同」会被一对都取不到值的字段骗过去（注册表没认领任何
-//! 标签时，两边都是 `None`，记录逐字相同而什么都没证明）。所以先断言两个标签在身份
-//! 与归因上**确实不同**，待遇那一半的相同才有意义。
+//! 标签时，两边都是 `None`，记录逐字相同而什么都没证明）。所以先断言两个标签在 `who`
+//! 上**确实不同**，待遇那一半的相同才有意义。
 //!
-//! 可点工具这一栏读的是进程装的那一份清单（`register_builtins` 一处注册），不由标签
-//! 分发。把它记进来是为了让「有一天它开始按标签分发」这件事落在判据里，不是因为今天
-//! 它可能不同。
+//! 判不了什么：决定待遇、却一个字节都不落进上面这些读数的地方——比如某个按标签切换
+//! 的沙箱权限。它不改上限、标尺、schema、任务类型、工具清单或运行配置的任何一格，
+//! 这份记录就看不见。这类地方要自己带一条同形状的读数进来，否则不在本门的覆盖里。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,33 +50,79 @@ const DELIVERED: &str = "t1: read the file, then t2: deploy";
 const SEAT: &str = "generator";
 
 /// 一条决策记录：这条路上每一处会决定「这件活怎么被对待」的读数。
+///
+/// 两半的边界不是这里手挑的：`who` 与 `treatment` 由 [`split_config`] 从整份运行
+/// 配置里按字段分出来，再加上判官实际收到的标尺、席位读到的那份 schema、任务自己
+/// 的类型与进程装的那份工具清单。
 #[derive(Debug, Clone)]
 struct DecisionRecord {
-    /// 谁在跑。**允许**不同——这正是换标签的意思。
-    identity: String,
-    /// 归因行（技能行的 id）。**允许**不同：它只把花销记到某只手上。
-    attribution_row: Option<String>,
-    /// 以下全部**必须**相同：它们决定这件活被怎么对待。
-    ceiling: u32,
-    deliverable: String,
-    rubric: String,
-    schema: Option<serde_json::Value>,
-    task_type: String,
-    tools: Vec<String>,
+    /// 标签**该**回答的那一半：谁在跑、花销记在哪一行、这次运行路由到哪。
+    /// **允许**不同——这正是「换一个标签接手」的意思。
+    who: serde_json::Value,
+    /// 待遇那一半。**必须**逐字相同；摊成 JSON 是为了差异项能逐键点出来，
+    /// 而不是只得到一句「不相等」。
+    treatment: serde_json::Value,
 }
 
-impl DecisionRecord {
-    /// 待遇那一半，摊成 JSON：差异项因此可以逐键点出来，而不是只得到一句「不相等」。
-    fn treatment(&self) -> serde_json::Value {
-        serde_json::json!({
-            "ceiling": self.ceiling,
-            "deliverable": self.deliverable,
-            "rubric": self.rubric,
-            "schema": self.schema,
-            "task_type": self.task_type,
-            "tools": self.tools,
-        })
-    }
+/// 待遇的每一格由什么决定。终态只认三种来源：活自己声明了什么（`declared`）、
+/// 接手这个人的实测交卷数据（`measured`）、操作者的显式覆盖（`override`）。
+///
+/// 这张表必须与记录里的待遇键逐个对上：新加一格却说不出它由这三者里的哪一个
+/// 决定，测试当场红。`who` 那一半不在这张表里——名字与花销行本来就不决定待遇。
+const TREATMENT_SOURCES: &[(&str, &str)] = &[
+    ("deliverable", "declared"),
+    ("stated_directions", "declared"),
+    ("rubric", "declared"),
+    ("schema", "declared"),
+    ("task_type", "declared"),
+    ("tools", "override"),
+    // 操作者钉的数与本进程交卷运行的轮次读数；样本按标签共享，见上限那一处的门。
+    ("max_iterations", "override+measured"),
+    ("context_window_size", "override"),
+    ("skill_cache_ttl_secs", "override"),
+    ("think_stall_timeout_secs", "override"),
+    ("final_draft_timeout_secs", "override"),
+];
+
+/// 把整份运行配置按字段分成两半：谁在跑，与这件活怎么被对待。
+///
+/// 这里**故意不写 `..`**。`RuntimeConfig` 多出一个字段时，这段解构编译不过，
+/// 作者必须先回答它是 `who` 还是待遇，才能让测试重新编出来——一个悄悄落在待遇
+/// 那一半外面的旋钮，是这份差分唯一看不见的坏法。
+fn split_config(config: RuntimeConfig) -> (serde_json::Value, serde_json::Value) {
+    let RuntimeConfig {
+        agent_id,
+        role,
+        max_iterations,
+        context_window_size,
+        skill_cache_ttl_secs,
+        think_stall_timeout_secs,
+        final_draft_timeout_secs,
+        skill_config,
+        crew_id,
+        squad_id,
+        owner_task_id,
+        deliverable,
+        stated_directions,
+    } = config;
+    let who = serde_json::json!({
+        "agent_id": agent_id,
+        "role": role,
+        "attribution_row": skill_config.map(|row| row.skill_id),
+        "crew_id": crew_id,
+        "squad_id": squad_id,
+        "owner_task_id": owner_task_id,
+    });
+    let treatment = serde_json::json!({
+        "max_iterations": max_iterations,
+        "context_window_size": context_window_size,
+        "skill_cache_ttl_secs": skill_cache_ttl_secs,
+        "think_stall_timeout_secs": think_stall_timeout_secs,
+        "final_draft_timeout_secs": final_draft_timeout_secs,
+        "deliverable": format!("{deliverable:?}"),
+        "stated_directions": stated_directions,
+    });
+    (who, treatment)
 }
 
 /// 判一次，只把请求正文记下来：标尺是不是同一份，从外面只看得到这一段。
@@ -108,9 +158,11 @@ impl Recorder {
     }
 
     fn response(&self) -> ChatResponse {
+        // 判表要的是「一个要求一行」：引规格里的一句、正文里的一句，状态 met。
+        // 行数是 1 而不是 0——空表在判官那里是「一条都没判」，会直接报错。
         ChatResponse {
             content: vec![ContentBlock::text(
-                r#"{"issues":[],"missing":[],"strengths":[],"score":1.0,"gaps":[],"aligned":[]}"#,
+                r#"{"rows":[{"requirement":"the text does t1 and t2","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file, then t2: deploy"}]}"#,
             )],
             api: "recorder".into(),
             provider: "recorder".into(),
@@ -209,29 +261,54 @@ fn installed_tools() -> Vec<String> {
     registry.names()
 }
 
+/// 这件活本身：交什么由任务说，有人就「往哪儿算好」说过的原话也留在任务上。
+/// 两个标签接手的是**同一个任务对象**，不是各拼一份。
+fn declared_work() -> serde_json::Value {
+    serde_json::json!({
+        cog_core::types::task::INPUT_DELIVERS: "change",
+        cog_core::INPUT_SIGNAL: {
+            "kind": cog_core::TASTE_SIGNAL_KIND,
+            "taste_kind": "direction_preference",
+            "payload": {
+                "kind": "direction_preference",
+                "preferred": "quote the failing line",
+                "alternative": "summarise the change",
+                "rationale": "a summary cannot be checked",
+            },
+        },
+    })
+}
+
 /// 让 `label` 接手同一份活，把这一路的待遇收进一条记录。
 async fn record_for(label: &str, tools: &[String]) -> DecisionRecord {
-    // 这件活本身：任务类型与「交什么」都由任务说，两个标签读到的是同一个任务对象。
-    let task = Task::new(
-        "t-1",
-        TaskType::Custom("change".into()),
-        serde_json::json!({"delivers": "change"}),
-    );
+    let task = Task::new("t-1", TaskType::Custom("change".into()), declared_work());
+    let declared = task.deliverable();
+    let directions = task.stated_directions();
 
-    // 运行配置：生产上创建 agent 的那一处（角色行只挂上去做归因）。
+    // 运行配置：生产上创建 agent 的那一处。任务声明在拿任务的那一层抄进配置，
+    // 这里照做，免得这条记录量的是「测试自己拼的配置」而不是运行时会拿到的那一份。
+    let base = RuntimeConfig {
+        deliverable: declared,
+        stated_directions: directions.clone(),
+        ..Default::default()
+    };
     let registry = Arc::new(RwLock::new(two_hands()));
-    let config =
-        runtime_config_for(&RuntimeConfig::default(), Some(&registry), "agent-1", label).await;
-    let attribution_row = config.skill_config.as_ref().map(|row| row.skill_id.clone());
+    let config = runtime_config_for(&base, Some(&registry), "agent-1", label).await;
 
     // 评判标尺：与运行时入口同一处构造（`Agent::self_review_loop`），只把 actor 换成标签。
+    //
+    // 走判表（`revise: false`）：标尺只在这条路上进请求。整轮改写走的是批评与
+    // 比较两步，那两份提示里没有标尺——从那里量到的「rubric」两边当然相同，
+    // 因为它根本不是标尺。
     let recorder = Recorder::new();
     let loop_ = SelfReviewLoop::new(SelfReviewConfig {
         spec: Some(SPEC.into()),
+        revise: false,
         ..Default::default()
     })
     .with_actor(self_review_actor(label))
-    .with_deliverable(task.deliverable());
+    .with_deliverable(declared)
+    .with_stated_directions(directions);
     loop_
         .review(DELIVERED, &recorder)
         .await
@@ -247,16 +324,21 @@ async fn record_for(label: &str, tools: &[String]) -> DecisionRecord {
         ..Default::default()
     };
 
-    DecisionRecord {
-        identity: label.to_string(),
-        attribution_row,
-        ceiling: config.max_iterations,
-        deliverable: format!("{:?}", task.deliverable()),
-        rubric,
-        schema: settings.schema_for(SEAT),
-        task_type: format!("{:?}", task.task_type),
-        tools: tools.to_vec(),
-    }
+    let (who, mut treatment) = split_config(config);
+    let fields = treatment
+        .as_object_mut()
+        .expect("split_config 的待遇那一半是一张表");
+    fields.insert("rubric".into(), serde_json::json!(rubric));
+    fields.insert(
+        "schema".into(),
+        serde_json::json!(settings.schema_for(SEAT)),
+    );
+    fields.insert(
+        "task_type".into(),
+        serde_json::json!(format!("{:?}", task.task_type)),
+    );
+    fields.insert("tools".into(), serde_json::json!(tools));
+    DecisionRecord { who, treatment }
 }
 
 /// 同一份任务输入，两个标签各走一遍：待遇逐字段相等，身份与归因确有其差别。
@@ -273,23 +355,23 @@ async fn decision_record() {
 
     // 先证两条记录确实来自两个不同的标签：否则下面那一半的「相等」可能只是两边都空。
     assert_ne!(
-        planner.identity, generator.identity,
+        planner.who, generator.who,
         "两个标签没被区分开，这份差分什么都没证明"
     );
+    assert_eq!(planner.who["role"], "planner");
+    assert_eq!(generator.who["role"], "generator");
     assert_eq!(
-        planner.attribution_row.as_deref(),
-        Some("planner"),
+        planner.who["attribution_row"], "planner",
         "planner 的归因行没挂上：注册表没认领这个标签，待遇那半的相等也就不作数"
     );
     assert_eq!(
-        generator.attribution_row.as_deref(),
-        Some("generator"),
+        generator.who["attribution_row"], "generator",
         "generator 的归因行没挂上：注册表没认领这个标签，待遇那半的相等也就不作数"
     );
 
     // 再逐字段比待遇：差异项就是「还有哪一处按标签决定」的剩余清单。
-    let a = planner.treatment();
-    let b = generator.treatment();
+    let a = &planner.treatment;
+    let b = &generator.treatment;
     let mut differing: Vec<String> = Vec::new();
     if let (Some(a), Some(b)) = (a.as_object(), b.as_object()) {
         for (field, value) in a {
@@ -306,7 +388,42 @@ async fn decision_record() {
         b
     );
 
+    // 记录里的每一格都要说出它由什么决定；表与记录对不上，这扇门就漏了一格。
+    let mut recorded: Vec<&str> = a
+        .as_object()
+        .expect("待遇是一张表")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    recorded.sort_unstable();
+    let mut registered: Vec<&str> = TREATMENT_SOURCES.iter().map(|(field, _)| *field).collect();
+    registered.sort_unstable();
+    assert_eq!(
+        recorded, registered,
+        "待遇表与记录对不上：多出来的一格没登记它由什么决定，少一格是表过期了"
+    );
+    for (field, source) in TREATMENT_SOURCES {
+        for part in source.split('+') {
+            assert!(
+                matches!(part, "declared" | "measured" | "override"),
+                "`{field}` 的来源写成 `{part}`：决定待遇的只许是活自己的声明、\
+                 接手人的实测交卷、操作者的显式覆盖"
+            );
+        }
+    }
+
     // 任务说的是什么，记录就该读到什么——不然上面那一行「相同」可能两处都错得一样。
-    assert_eq!(planner.deliverable, "Change");
-    assert_eq!(planner.ceiling, u32::MAX, "没人钉上限时不该凭空出现一个");
+    assert_eq!(planner.treatment["deliverable"], "Change");
+    assert_eq!(
+        planner.treatment["max_iterations"],
+        serde_json::json!(u32::MAX),
+        "没人钉上限时不该凭空出现一个"
+    );
+    // 人的原话确实进了标尺：否则「两边都空」也会让待遇那半相等。
+    assert!(
+        planner.treatment["rubric"]
+            .as_str()
+            .is_some_and(|rubric| rubric.contains("quote the failing line")),
+        "任务上写明的方向没有走到判尺上：这条差分量到的 rubric 是空的"
+    );
 }
