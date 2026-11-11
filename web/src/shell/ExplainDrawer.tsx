@@ -79,14 +79,19 @@ export function ExplainDrawer() {
     >
       {/* 抓的是这条 6px 的窄带而不是一像素的边框：边框太细，按不中就等于没有。
           常显一条淡线，读者才知道这里可以拖。 */}
-      <div
+      <Note
+        as="div"
         role="separator"
         aria-orientation="vertical"
         aria-label="拖拽调整抽屉宽度"
         onPointerDown={startDrag}
         onDoubleClick={() => setWidth(DRAWER_DEFAULT_WIDTH)}
-        title="拖拽调整宽度，双击回到默认"
-        className="absolute -left-[3px] top-0 h-full w-[6px] cursor-col-resize bg-transparent transition-colors hover:bg-[var(--line-strong)]"
+        text="拖拽调整宽度，双击回到默认"
+        // 注释组件默认把锚点设成 `relative`；这条 6px 的抓带必须浮在抽屉边上，
+        // 所以显式写回 `absolute`——只删掉这一行，抓带会退回文档流里，布局照样
+        // 能看，拖拽却抓不到了。
+        style={{ position: 'absolute' }}
+        className="-left-[3px] top-0 h-full w-[6px] cursor-col-resize bg-transparent transition-colors hover:bg-[var(--line-strong)]"
         data-drawer-resizer="true"
       />
       <header className="flex h-9 shrink-0 items-center gap-2 border-b border-[var(--line)] px-3">

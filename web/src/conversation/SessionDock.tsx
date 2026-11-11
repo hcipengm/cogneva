@@ -1,6 +1,7 @@
 import { conversationNames } from '@/conversation/callsign';
 import type { StreamClient } from '@/hooks/useEventStream';
 import { useChatStore } from '@/store/chatStore';
+import { Note } from '@/ui/Note';
 
 /**
  * 开着的几段对话，一条一条排在一行上。
@@ -57,11 +58,12 @@ export function SessionDock({
             }`}
             style={{ borderColor: current ? 'var(--line-strong)' : 'var(--line)' }}
           >
-            <button
+            <Note
+              as="button"
               type="button"
               onClick={() => setActive(id)}
               aria-current={current ? 'true' : undefined}
-              title={`${session?.title ?? '新的对话'}（会话 ${id}）`}
+              text={`${session?.title ?? '新的对话'}（会话 ${id}）`}
               className="flex min-w-0 items-baseline gap-1.5 text-left"
             >
               <span
@@ -81,7 +83,7 @@ export function SessionDock({
               <span className="max-w-[12ch] truncate text-[var(--muted)]">
                 {session?.title ?? '新的对话'}
               </span>
-            </button>
+            </Note>
             {order.length > 1 && (
               <button
                 type="button"
@@ -95,14 +97,15 @@ export function SessionDock({
           </div>
         );
       })}
-      <button
+      <Note
+        as="button"
         type="button"
         onClick={() => createSession()}
         className="mono shrink-0 px-1.5 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--brass)]"
-        title="再开一段对话，原来那几段继续开着"
+        text="再开一段对话，原来那几段继续开着"
       >
         ＋ 新对话
-      </button>
+      </Note>
     </div>
   );
 }
