@@ -3059,7 +3059,11 @@ mod tests {
             "an unreadable diff has to stay retryable: {early:?}"
         );
 
-        let denied = change("c2", &diff_touching(&["deploy/cogneva/pg.yaml"]));
+        // A path the whitelist does not carry. `deploy/**` used to be the
+        // example here, but deploy changes now reach their admission gate
+        // instead of being refused by path, so this fixture is a path no gate
+        // has since claimed: the whitelist alone decides it.
+        let denied = change("c2", &diff_touching(&["docs/notes.md"]));
         assert_eq!(
             chan.check_policy(&denied, false).unwrap_err().category,
             LandingCategory::Path
@@ -3536,7 +3540,11 @@ mod tests {
     #[tokio::test]
     async fn a_whitelist_violation_is_counted_under_path() {
         let (chan, metrics) = measured_channel(Default::default());
-        let ch = change("c1", &diff_touching(&["deploy/helm/cogneva/values.yaml"]));
+        // Not whitelisted, so the whitelist is the guard that refuses it.
+        // `deploy/**` stopped being a whitelist violation the moment the
+        // landing policy stopped forbidding it; the family is judged by its
+        // admission conditions now.
+        let ch = change("c1", &diff_touching(&["docs/notes.md"]));
 
         chan.land(&ch, None).await.unwrap_err();
 
