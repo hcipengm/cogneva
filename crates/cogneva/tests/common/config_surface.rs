@@ -420,6 +420,13 @@ struct Source {
     text: String,
 }
 
+/// 树上某个结构体的名字：`(crate, 类型名)`。
+type TypeName = (String, String);
+
+/// 已解析的结构体，按名字记；`None` 是「读到过、但没有可解析的声明」，记下来是为了
+/// 每份文档不必再读一次树。
+type ParsedTypes = RefCell<BTreeMap<TypeName, Option<Rc<TypeInfo>>>>;
+
 /// The config type graph, read from the declarations under `crates/*/src`.
 ///
 /// The graph is built once per gate run: walking the same type for every
@@ -427,8 +434,8 @@ struct Source {
 pub struct TypeGraph {
     root: PathBuf,
     sources: Vec<Source>,
-    definitions: BTreeMap<(String, String), Vec<usize>>,
-    parsed: RefCell<BTreeMap<(String, String), Option<Rc<TypeInfo>>>>,
+    definitions: BTreeMap<TypeName, Vec<usize>>,
+    parsed: ParsedTypes,
 }
 
 impl TypeGraph {
@@ -437,7 +444,7 @@ impl TypeGraph {
         walk(&root.join("crates"), &["rs"], &mut paths);
         paths.sort();
         let mut sources = Vec::new();
-        let mut definitions: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+        let mut definitions: BTreeMap<TypeName, Vec<usize>> = BTreeMap::new();
         for path in paths {
             let Some(crate_name) = crate_name_of(root, &path) else {
                 continue;
