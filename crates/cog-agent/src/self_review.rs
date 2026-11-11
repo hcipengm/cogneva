@@ -211,9 +211,8 @@ impl SelfReviewLoop {
 
     /// 这份活交什么（见 [`cog_core::Task::deliverable`]）。判据按它挑。
     ///
-    /// 不设时是 `Unstated`——没有声明就按「一件被要求满足规格的产出」判，
-    /// 而这一格本身留着 `Unstated`，读数上分得开「没人说过」与「有人说是
-    /// work_product」。
+    /// 不设时是 `Unstated`——没有声明不是「按最常见的形状判」：判据要求评判先
+    /// 从原文探明它是五种里的哪一种，并说出依据；探不明才是这一格里唯一的 unmet。
     pub fn with_deliverable(mut self, deliverable: Deliverable) -> Self {
         self.deliverable = deliverable;
         self
@@ -726,10 +725,11 @@ impl SelfReviewLoop {
     ///
     /// It has to stay byte-identical across calls, because it is the head of
     /// the request and the only part an upstream prefix cache can hold across
-    /// tasks. `Unstated` takes the work-product wording — that is the standard
-    /// a text asked to meet a specification is judged by — but it stays its own
-    /// state on the record, so "nobody said" and "somebody said work product"
-    /// do not collapse into one reading.
+    /// tasks. `Unstated` gets wording of its own, and the first thing it asks
+    /// for is the step nobody took: say which of the five this text is, from the
+    /// text, and quote what decided it. Handing it the work-product wording
+    /// would have made "nobody said" and "somebody said work product" the same
+    /// treatment, which is the collapse the field exists to prevent.
     fn judging_rubric(deliverable: Deliverable) -> &'static str {
         match deliverable {
             Deliverable::Plan => {
@@ -770,7 +770,23 @@ impl SelfReviewLoop {
                  states the requirement, in `spec_quote`, verbatim; a quote that is not in the \
                  specification does not count."
             }
-            Deliverable::Change | Deliverable::WorkProduct | Deliverable::Unstated => {
+            // 没人说过交什么，就不许当成最常见的那一种判：那会让「没人说」与「有人说是
+            // 产物」在待遇上同形，而那正是这个字段被加进来的理由。这一格要判的第一件事
+            // 是**先探明它是什么**，把判断依据（原文的哪几个字）说出来；判据本身仍是规格。
+            Deliverable::Unstated => {
+                "Nobody said what this work delivers, and this review must not assume the \
+                 commonest kind. First say which of the five it is -- a plan, a change, a \
+                 judgement, an answer, or a work product -- quoting the words of the text that \
+                 made you decide, and judge the text as that kind. A text whose words do not \
+                 settle the question is the one thing this rubric calls unmet: name the part \
+                 that reads two ways and what the task would have to say to settle it.\n\n\
+                 List every requirement the specification states. For each one decide met, unmet \
+                 or undetermined, and for `met` quote the words of the text that carry it, \
+                 character for character, whitespace aside. Every row also quotes the sentence of \
+                 the specification that states the requirement, in `spec_quote`, verbatim; a \
+                 quote that is not in the specification does not count."
+            }
+            Deliverable::Change | Deliverable::WorkProduct => {
                 "The text under judgement is a WORK PRODUCT the task asked for. List every \
                  requirement the specification states. For each one decide met, unmet or \
                  undetermined, and for `met` quote the words of the text that carry it, \
@@ -1754,6 +1770,34 @@ mod tests {
         assert!(
             SelfReviewLoop::judging_rubric(Deliverable::Answer).contains("FINAL ANSWER"),
             "结论按结论判"
+        );
+    }
+
+    /// 没人说过交什么，判据不许兜底成最常见的那一种形状。
+    ///
+    /// 「信息不足」是一等状态，有去处：先探明它是什么，把依据说出来。兜底会让
+    /// 「没人说」与「有人说是产物」得到同一套待遇，而这两件事在读数上分得开，
+    /// 正是这个字段存在的全部理由。
+    #[test]
+    fn an_unstated_deliverable_is_probed_rather_than_defaulted() {
+        let unstated = SelfReviewLoop::judging_rubric(Deliverable::Unstated);
+        let work_product = SelfReviewLoop::judging_rubric(Deliverable::WorkProduct);
+        assert_ne!(
+            unstated, work_product,
+            "没人说过却按最常见的那种形状判：两个不同的输入得到同一套待遇，读数上再也分不开"
+        );
+        assert!(
+            unstated.contains("Nobody said what this work delivers"),
+            "这一格的第一件事是承认没人说过：{unstated}"
+        );
+        assert!(
+            unstated.contains("quoting the words of the text"),
+            "探明之后要说出依据，否则「探明了」与「猜的」同形：{unstated}"
+        );
+        // 判据仍是规格：探明形状不改变量它的尺子。
+        assert!(
+            unstated.contains("spec_quote"),
+            "探明形状不该把规格那条尺子弄丢：{unstated}"
         );
     }
 
