@@ -1081,19 +1081,38 @@ impl AgentRuntime {
         &self.config
     }
 
-    pub fn new(mut config: RuntimeConfig, event_tx: mpsc::Sender<AgentEvent>) -> Self {
-        // 技能面写下的界只是这个角色的起点；没写就没有界。写成「没写就取 10」
-        // 会让每一个角色都被同一个没人量过的数字裁着，而它裁的恰恰是「这一轮还
-        // 要不要接着干」——2026-11-05 实测 generator 在第十轮带着一个没跑完的
-        // 工具调用被砍，下一轮从头再来，同一条 CI 红修了六版。
-        if let Some(iterations) = config.skill_config.as_ref().and_then(|s| s.max_iterations) {
-            config.max_iterations = iterations;
-        }
-        // 预算由这个角色自己跑出来的读数推：种子（配置面或技能面）只在还没有
-        // 观测时生效。写死一个数在这里就是把它交给一个永远不知道工作量的常量，
-        // 而它要裁的恰恰是"这一轮还要不要接着干"。
-        config.max_iterations = crate::observable::global_observable()
-            .iteration_budget_for(&config.role, config.max_iterations);
+    pub fn new(config: RuntimeConfig, event_tx: mpsc::Sender<AgentEvent>) -> Self {
+        Self::with_observable(config, event_tx, &crate::observable::global_observable())
+    }
+
+    /// Build a runtime whose ceiling is derived from `observable` instead of the
+    /// process-wide one.
+    ///
+    /// The production path reads the global observable on purpose: the sample is
+    /// a fact about the work this process does, not about one test's fixture.
+    /// Tests that assert what a particular sample produces need their own bucket
+    /// — every other test that runs a loop writes into the global one, and a
+    /// shared bucket would make the assertion depend on test order.
+    #[cfg(test)]
+    pub(crate) fn new_with_observable(
+        config: RuntimeConfig,
+        event_tx: mpsc::Sender<AgentEvent>,
+        observable: &crate::observable::AgentObservable,
+    ) -> Self {
+        Self::with_observable(config, event_tx, observable)
+    }
+
+    fn with_observable(
+        mut config: RuntimeConfig,
+        event_tx: mpsc::Sender<AgentEvent>,
+        observable: &crate::observable::AgentObservable,
+    ) -> Self {
+        // 轮次上限只有两个来源：操作者在配置面上钉的数（覆盖），和这个进程自己
+        // 跑出来的读数（实测）。技能行不是第三个——那一行按角色名分发，同一件活
+        // 换个标签接手就换一个天花板，而那正是「标签决定行为」。写成「没写就取
+        // 10」同样不行：2026-11-05 实测 generator 在第十轮带着一个没跑完的工具
+        // 调用被砍，下一轮从头再来，同一条 CI 红修了六版。
+        config.max_iterations = observable.iteration_budget_for(config.max_iterations);
 
         let context = ContextWindow::new(config.context_window_size);
 
@@ -4418,12 +4437,9 @@ mod tests {
         let skill = SkillConfig {
             skill_id: "custom-planner".into(),
             name: "Custom Planner".into(),
-            max_iterations: Some(42),
             role_type: "planner".into(),
         };
 
-        // 角色取一个只有本用例用的名字：预算现在还跟着"这个角色跑出来的读数"走，
-        // 借用别的用例会写进去的角色名，断言就变成了对执行顺序的断言。
         let config = RuntimeConfig {
             role: "skill-prompt-test".into(),
             skill_config: Some(skill.clone()),
@@ -4431,9 +4447,11 @@ mod tests {
         };
 
         let (tx, _rx) = mpsc::channel(1);
-        let agent_loop = AgentRuntime::new(config, tx);
-        // max_iterations is still overridden by skill config inside AgentRuntime::new
-        assert_eq!(agent_loop.config.max_iterations, 42);
+        let agent_loop = AgentRuntime::new_with_observable(
+            config,
+            tx,
+            &crate::observable::AgentObservable::new(),
+        );
         // No system message should be injected when using structured JSON input
         let messages = agent_loop.get_context().messages();
         assert!(
@@ -4444,12 +4462,16 @@ mod tests {
         );
     }
 
+    /// 技能行不能移动轮次上限。
+    ///
+    /// 这条以前量的是相反的断言：行上的数字覆盖配置。那一跳就是「按标签分发
+    /// 天花板」的入口——行按角色名取，同一件活换个标签接手就换一个上限。现在
+    /// 行只剩身份与种类，上限只来自配置面（覆盖）与实测（样本）。
     #[test]
-    fn agent_loop_config_skill_overrides_max_iterations() {
+    fn a_skill_row_cannot_move_the_ceiling() {
         let skill = SkillConfig {
             skill_id: "fast-evaluator".into(),
             name: "Fast Evaluator".into(),
-            max_iterations: Some(3),
             role_type: "evaluator".into(),
         };
 
@@ -4461,20 +4483,25 @@ mod tests {
         };
 
         let (tx, _rx) = mpsc::channel(1);
-        let agent_loop = AgentRuntime::new(config, tx);
-        // max_iterations should be overridden by skill config
-        assert_eq!(agent_loop.config.max_iterations, 3);
+        let agent_loop = AgentRuntime::new_with_observable(
+            config,
+            tx,
+            &crate::observable::AgentObservable::new(),
+        );
+        assert_eq!(agent_loop.config.max_iterations, 100);
     }
 
-    /// 这个角色自己跑出来的读数决定上限：种子（配置面 / 技能面）只在还没有
-    /// 观测时生效，有了观测就不再是那个数。写死一个常量的坏处正在这里——它
-    /// 永远不知道这一轮的工作量，而它要裁的恰恰是"还要不要接着干"。
+    /// 这个进程自己跑出来的读数决定上限：种子（配置面）只在还没有观测时生效，
+    /// 有了观测就不再是那个数。写死一个常量的坏处正在这里——它永远不知道这一
+    /// 轮的工作量，而它要裁的恰恰是"还要不要接着干"。
+    ///
+    /// 样本按进程收，不按角色：同一件活换个标签接手，读到的必须是同一个数。
     #[test]
-    fn the_iteration_budget_follows_this_roles_own_runs() {
-        let role = "budget-calibrated-test";
+    fn the_iteration_budget_follows_the_runs_this_process_delivered() {
+        let observable = crate::observable::AgentObservable::new();
         for iterations in [6u32, 8] {
-            crate::observable::global_observable().record_run(
-                role,
+            observable.record_run(
+                "budget-calibrated-test",
                 crate::observable::RunOutcome::Delivered,
                 iterations,
                 20,
@@ -4483,21 +4510,22 @@ mod tests {
         }
 
         let config = RuntimeConfig {
-            role: role.into(),
-            max_iterations: 10,
+            role: "budget-calibrated-test".into(),
+            // 没人写过上限：只有这时标定才回答。
+            max_iterations: u32::MAX,
             ..Default::default()
         };
         let (tx, _rx) = mpsc::channel(1);
-        let agent_loop = AgentRuntime::new(config, tx);
+        let agent_loop = AgentRuntime::new_with_observable(config, tx, &observable);
 
         assert!(
-            agent_loop.config.max_iterations > 10,
-            "the seed was binding for this role's own runs, so it must not stay the ceiling: {}",
+            agent_loop.config.max_iterations > 8,
+            "the ceiling must admit the longest run this process has delivered: {}",
             agent_loop.config.max_iterations
         );
         assert!(
-            agent_loop.config.max_iterations > 8,
-            "the ceiling must admit the longest run this role has delivered"
+            agent_loop.config.max_iterations < u32::MAX,
+            "with measurements in hand the answer is a number, not 'unbounded'"
         );
     }
 
@@ -4531,7 +4559,6 @@ mod tests {
         SkillConfig {
             skill_id: format!("{role}-boundary-test"),
             name: role.into(),
-            max_iterations: Some(5),
             role_type: role.into(),
         }
     }
@@ -4566,14 +4593,18 @@ mod tests {
 
     /// 没有观测就原样用种子：凭一个没看见过的事实改数字，只是把猜数换了个地方。
     #[test]
-    fn a_role_without_observations_keeps_its_seed_budget() {
+    fn a_process_without_observations_keeps_its_seed_budget() {
         let config = RuntimeConfig {
             role: "budget-unobserved-test".into(),
             max_iterations: 7,
             ..Default::default()
         };
         let (tx, _rx) = mpsc::channel(1);
-        let agent_loop = AgentRuntime::new(config, tx);
+        let agent_loop = AgentRuntime::new_with_observable(
+            config,
+            tx,
+            &crate::observable::AgentObservable::new(),
+        );
         assert_eq!(agent_loop.config.max_iterations, 7);
     }
 
@@ -6419,11 +6450,10 @@ mod tests {
             spent, 1.0,
             "a run salvaged out of a budget it had already spent is still a spent budget"
         );
-        assert_eq!(
-            observer.iteration_budget_for(role, 7),
-            7,
-            "where it stopped is where the ceiling put it, not evidence the ceiling was low"
-        );
+        // 另一半（它停下的位置不能反过来抬上限）量在 observable 自己的用例里：
+        // 样本现在是进程的，这里的每一次运行与同一进程里别的用例共用一份，断言
+        // 绝对值就成了对执行顺序的断言。可判的那一半是上面这条：它记进的是
+        // 「撞墙」的读数，不是「交卷」的样本。
     }
 
     /// 预算内照常给工具调用，撞墙后那次「不带工具的追问」既不吐字也不结束。
@@ -7747,7 +7777,6 @@ mod tests {
         let skill = SkillConfig {
             skill_id: "skill-outcome-skill".into(),
             name: "Skill Outcome Test".into(),
-            max_iterations: Some(1),
             role_type: "skill-outcome-role".into(),
         };
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);

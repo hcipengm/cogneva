@@ -9,15 +9,17 @@ use cog_core::{
 
 /// Build the runtime config a new agent of `role` starts from.
 ///
-/// Installing the role's skill here is the single point where the skill's
-/// declared parameters reach the runtime: `AgentRuntime::new` applies the
-/// skill's iteration budget on top of the config value, and the per-role
-/// calibration in the observable moves it from there. Without this hop the
-/// skill file is written, validated, and evolved while nothing reads it.
+/// The role's row is attached here so that a run's outcome can be reported
+/// against the hand that produced it (`report_skill_outcome`), which is what
+/// feeds the skill-effectiveness tracker. It is the row and nothing else: the
+/// turn ceiling is not read off it — a row is dispatched by role name, and a
+/// ceiling keyed by a label is the same work running under a different limit
+/// depending on which name was written on the worker. The ceiling comes from
+/// the operator's config and from this process's own delivered runs.
 ///
-/// A role with no registered skill keeps the config value: the mapping is
-/// absent for that role, which is not the same statement as "this role wants
-/// the default" — it is simply no evidence, and inventing one would change
+/// A role with no registered row keeps the config value: the mapping is absent
+/// for that role, which is not the same statement as "this role wants the
+/// default" — it is simply no evidence, and inventing one would change
 /// behaviour for roles nobody has described yet.
 async fn runtime_config_for(
     default_config: &cog_core::RuntimeConfig,
@@ -794,18 +796,15 @@ mod tests {
         Arc::new(RwLock::new(registry))
     }
 
-    fn skill_json(role: &str, max_iterations: u32) -> String {
-        format!(
-            r#"[{{"skill_id":"{role}","name":"{role}","tools":[],"max_iterations":{max_iterations},"role_type":"{role}"}}]"#
-        )
+    fn skill_json(role: &str) -> String {
+        format!(r#"[{{"skill_id":"{role}","name":"{role}","role_type":"{role}"}}]"#)
     }
 
-    /// 技能面的预算要真的走到运行时头上。这条链路曾经只差最后一跳——技能
-    /// 被装上、被校验、被改写，运行时却没有任何读点，于是"自进化能调预算"
-    /// 看起来是真的而实际是死的。这里量的是那一跳。
+    /// 角色绑定的那一行要真的走到运行时头上：结局按这一行报给有效性追踪器，
+    /// 少了这一跳，技能被装上、被校验、被改写，却收不到任何一条结局。
     #[tokio::test]
     async fn the_roles_skill_reaches_the_runtime_config() {
-        let registry = registry_with(&skill_json("generator", 17));
+        let registry = registry_with(&skill_json("generator"));
         let config = runtime_config_for(
             &cog_core::RuntimeConfig::default(),
             Some(registry.as_ref()),
@@ -816,7 +815,6 @@ mod tests {
 
         let skill: &SkillConfig = config.skill_config.as_ref().expect("skill installed");
         assert_eq!(skill.skill_id, "generator");
-        assert_eq!(skill.max_iterations, Some(17));
         assert_eq!(config.role, "generator");
         assert_eq!(config.agent_id, "squad-a-generator");
     }
@@ -824,7 +822,7 @@ mod tests {
     /// 技能是**按角色**取的：别的角色的技能不能顺手落到这个角色头上。
     #[tokio::test]
     async fn another_roles_skill_is_not_installed() {
-        let registry = registry_with(&skill_json("generator", 17));
+        let registry = registry_with(&skill_json("generator"));
         let config = runtime_config_for(
             &cog_core::RuntimeConfig::default(),
             Some(registry.as_ref()),
@@ -853,9 +851,6 @@ mod tests {
         assert_eq!(config.max_iterations, 23);
     }
 
-    /// 那一跳的另一半：装上的技能预算真的成为运行时的预算。角色名只有本用例
-    /// 用——预算还跟着该角色自己跑出来的读数走，借用别的用例写过的角色名会把
-    /// 断言变成对执行顺序的断言。
     /// 名册上"这个 agent 跑在哪里"必须答得出真话。原来每个任务角色的 agent
     /// 都登记成 `cog-agent`——那不是任何一台机器的名字，于是「某个 pod 里的
     /// squad 卡住了」和「那个 pod 闲著」在名册上读成同一行。
@@ -878,12 +873,20 @@ mod tests {
         }
     }
 
+    /// 装上的那一行不移动轮次上限：上限只来自配置面（覆盖）与实测（样本）。
+    ///
+    /// 这条以前量的是相反的断言——行上的预算成为运行时的预算。那一跳正是按标签
+    /// 分发天花板的入口：行按角色名取，同一件活换个标签接手就换一个上限。
     #[tokio::test]
-    async fn the_installed_skill_sets_the_runtime_budget() {
+    async fn the_installed_skill_cannot_move_the_budget() {
         let role = "skill-chain-budget-test";
-        let registry = registry_with(&skill_json(role, 17));
+        let registry = registry_with(&skill_json(role));
+        let default_config = cog_core::RuntimeConfig {
+            max_iterations: 23,
+            ..Default::default()
+        };
         let config = runtime_config_for(
-            &cog_core::RuntimeConfig::default(),
+            &default_config,
             Some(registry.as_ref()),
             "skill-chain-budget-test-agent",
             role,
@@ -891,7 +894,11 @@ mod tests {
         .await;
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let runtime = crate::AgentRuntime::new(config, tx);
-        assert_eq!(runtime.config().max_iterations, 17);
+        let runtime = crate::AgentRuntime::new_with_observable(
+            config,
+            tx,
+            &crate::observable::AgentObservable::new(),
+        );
+        assert_eq!(runtime.config().max_iterations, 23);
     }
 }

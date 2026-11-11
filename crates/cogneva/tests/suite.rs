@@ -473,6 +473,8 @@ mod supervisor_udp_heartbeat_test;
 mod task_claim_concurrency_wiring_test;
 #[path = "task_resume_wiring_contract_test.rs"]
 mod task_resume_wiring_contract_test;
+#[path = "the_ceiling_follows_the_work_not_the_label_test.rs"]
+mod the_ceiling_follows_the_work_not_the_label_test;
 #[path = "the_fixture_reading_steps_are_written_once_test.rs"]
 mod the_fixture_reading_steps_are_written_once_test;
 #[path = "the_production_cut_is_defined_once_test.rs"]

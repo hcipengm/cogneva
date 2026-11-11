@@ -237,7 +237,6 @@ impl LearningPromoter for DefaultLearningPromoter {
                 let config = SkillConfig {
                     skill_id: skill_id.clone(),
                     name: format!("Best Practice: {}", learning.summary),
-                    max_iterations: None,
                     role_type: "best_practice".into(),
                 };
                 registry.insert_skill_config(config);
@@ -257,7 +256,6 @@ impl LearningPromoter for DefaultLearningPromoter {
                 let config = SkillConfig {
                     skill_id: skill_id.clone(),
                     name: format!("Correction Rule: {}", learning.summary),
-                    max_iterations: None,
                     role_type: "correction".into(),
                 };
                 registry.insert_skill_config(config);
@@ -291,7 +289,6 @@ impl LearningPromoter for DefaultLearningPromoter {
                         let config = SkillConfig {
                             skill_id: skill_id.clone(),
                             name: format!("Wiki: {}", learning.summary),
-                            max_iterations: None,
                             role_type: "documentation".into(),
                         };
                         registry.insert_skill_config(config);

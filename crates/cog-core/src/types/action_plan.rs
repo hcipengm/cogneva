@@ -26,39 +26,29 @@ pub struct Skill {
 
 /// One row of the executor table, loaded dynamically from JSON.
 ///
-/// A row answers two questions: which kind of hand this is (`role_type`), and
-/// how many iterations it gets — when the operator has stated one
-/// (`max_iterations`). Agents are configured from a row by role
-/// (`skill_for_role`), and goal decomposition is handed the rows so it can name
-/// the kind of hand for each sub-task.
+/// A row answers one question: which kind of hand this is (`role_type`). Agents
+/// are bound to a row by role (`skill_for_role`) so that a run's outcome can be
+/// attributed to the hand that produced it, and goal decomposition is handed the
+/// rows so it can name the kind of hand for each sub-task.
 ///
-/// 这一行不再回答「这一位能用哪些工具」。工具只有一套：手上有什么由**身体所在的
+/// 这一行不回答「这一位能用哪些工具」。工具只有一套：手上有什么由**身体所在的
 /// 进程**决定（有没有沙盒、有没有消息队列、有没有出门的客户端），不是由「它是
 /// 哪种手」决定。按角色收窄时，同一个进程里两个人对同一张注册表看到两套工具，
 /// 而谁被收窄取决于注册表上一个自由标签——换个标签，同一件活就做不成了。
 ///
-/// 这一行也不再带人格（`system_prompt`）。它是一个执行体的系统前缀：写明它是谁
+/// 这一行也不带人格（`system_prompt`）。它是一个执行体的系统前缀：写明它是谁
 /// 在这里是多余的，写错则是把一种流水线的口吻安在另一个人身上。那一轮做什么，
 /// 由它拿到的那件活说。
+///
+/// 这一行更不写轮次上限。它曾经有一个 `max_iterations`：行按角色名取，于是同一
+/// 件活换个标签接手就换一个天花板，而「这一轮还要不要接着干」是标签最不该决定
+/// 的事。上限现在只有两个来源——操作者在配置面上钉的数（覆盖），和这个进程自己
+/// 交卷运行跑出来的轮数（实测，见 `AgentObservable::iteration_budget_for`）。
+/// 字段删掉而不是留着不读：一个按标签分发、却没人读的数，比没有它更难发现。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct SkillConfig {
     pub skill_id: String,
     pub name: String,
-    /// The turn ceiling this role starts from — absent means there is none.
-    ///
-    /// A written number is the operator's own decision for this deployment, and
-    /// it is read as the starting point of the per-role calibration rather than
-    /// as a wall the calibration may never move. Absent means the run has no
-    /// turn ceiling: the loop ends when the model stops asking for tools, and
-    /// what bounds it is the stall timeout, the context window and the cost
-    /// ledger — not a number written down before the work was seen.
-    ///
-    /// The default used to be ten, for every role, in this row's absence. Ten
-    /// turns is shorter than one round of "read the failing test, change the
-    /// code, run it again": a repair run stopped at ten with one tool call
-    /// still pending, every round, and the round after it started over.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_iterations: Option<u32>,
     /// The kind of hand this row registers — the dispatch key.
     ///
     /// Read in two places: [`crate::SkillRegistry::skill_for_role`] binds an

@@ -43,10 +43,7 @@ pub mod fallback {
              Generate an improved version as valid JSON with the same schema:\n\
              - skill_id (keep identical: '{}')\n\
              - name (improved if needed)\n\
-             - tools (add/remove based on learnings)\n\
-             - max_iterations (tune if needed)\n\
-             - role_type (keep or refine)\n\
-             - system_prompt (the actual prompt text that guides the agent)",
+             - role_type (keep or refine)",
             skill_json, skill_id
         )
     }
@@ -534,7 +531,7 @@ impl EvolutionEngine {
                 &system_prompt,
                 serde_json::json!(prompt),
                 "The reply is one JSON object holding the improved skill: skill_id (unchanged), \
-                 name, tools, max_iterations, role_type and system_prompt.",
+                 name and role_type.",
                 180,
             )
             .await?;
@@ -944,13 +941,6 @@ impl EvolutionEngine {
         }
         if skill.name.is_empty() {
             return Ok(false);
-        }
-        // 没写界是合法的一种：界不是每个角色都该有的东西，写了就必须是个
-        // 别人看得懂的数字。
-        if let Some(iterations) = skill.max_iterations {
-            if iterations == 0 || iterations > 1000 {
-                return Ok(false);
-            }
         }
         if skill.role_type.is_empty() {
             return Ok(false);

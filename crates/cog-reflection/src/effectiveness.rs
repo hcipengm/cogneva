@@ -255,7 +255,6 @@ mod tests {
         registry.insert_skill_config(cog_core::SkillConfig {
             skill_id: skill_id.to_string(),
             name: skill_id.to_string(),
-            max_iterations: Some(1),
             role_type: "role".to_string(),
         });
         registry

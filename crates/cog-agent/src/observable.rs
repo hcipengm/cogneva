@@ -26,12 +26,25 @@ pub struct AgentObservable {
     budget_exhausted_count: AtomicU64,
     total_steps: AtomicU64,
     total_tool_calls: AtomicU64,
-    /// Per-role reads of how many iterations a run actually took, keyed by role.
+    /// Per-role counts of how a role's runs ended, keyed by role.
     ///
-    /// The key is a role, which is a closed set the code names — not a task id
-    /// or a path, which would grow without bound. The sample itself is a recent
-    /// window (see [`BUDGET_SAMPLE_WINDOW`]), so the map stays bounded too.
+    /// Readings, not inputs: a label says which roster row keeps meeting a
+    /// guardrail, and nothing here decides what a run does. The key is a role,
+    /// which is a closed set the code names — not a task id or a path, which
+    /// would grow without bound.
     role_calibrations: Arc<Mutex<HashMap<String, RoleCalibration>>>,
+    /// Iterations consumed by the most recent runs that delivered on their own,
+    /// in one sample for the whole process.
+    ///
+    /// One bucket and not one per role: a role is a free label on the roster and
+    /// every worker in a pool takes every kind of work, so the label no longer
+    /// predicts how long the next piece of work runs. Splitting one pool's
+    /// sample by label only makes each window shorter — under ten samples the
+    /// percentile is the maximum, so a split sample admits one outlier — and it
+    /// lets the same work run under two different ceilings depending on which
+    /// name was written on the worker. What this measures is how long the work
+    /// this process does takes.
+    delivered_iterations: Arc<Mutex<VecDeque<u32>>>,
     /// The agents the manager currently holds, one entry per live object.
     ///
     /// Published by the manager on every change and read at scrape time, so the
@@ -199,7 +212,7 @@ struct RosterEntry {
     task_scoped: bool,
 }
 
-/// How many of a role's most recent completed runs feed its budget.
+/// How many of the most recent completed runs feed the process's budget.
 ///
 /// A window rather than a lifetime archive on purpose: the ceiling is meant to
 /// track the workload as it is now, and a run from a month ago under a
@@ -207,25 +220,19 @@ struct RosterEntry {
 // cap: bound — 窗口跟的是现在的负载；一个月前另一个模型下的一轮跑，说不了今天的活要多少
 const BUDGET_SAMPLE_WINDOW: usize = 64;
 
-/// What a role's own finished runs say about how many iterations it needs.
+/// How a role's own finished runs ended.
 ///
 /// The iteration budget used to be one literal for every role, which can only
 /// be right by accident: set too low, a run that was still working is cut off
 /// mid-exploration and returns nothing (measured: 6 of 8 generator runs stopped
 /// at exactly the ceiling with tool calls still pending, against a 25% delivery
 /// rate); set too high, every run pays for slack it does not use. How much work
-/// a role needs is observable from the runs it completes, so the ceiling is
-/// derived from that instead of being a number someone has to guess and keep
-/// guessing.
+/// a run needs is observable from the runs that complete, which is where the
+/// ceiling comes from — but those runs are counted once for the process
+/// ([`AgentObservable::delivered_iterations`]) and only their *endings* are
+/// split by label here.
 #[derive(Default)]
 struct RoleCalibration {
-    /// Iterations consumed by runs of this role that finished with an answer it
-    /// reached on its own. A run cut off at the ceiling is left out even when
-    /// the forced ask salvaged an answer: it stopped where the ceiling said, so
-    /// its length measures the ceiling, not the work. Feeding it back lets every
-    /// rescue raise the next ceiling, which makes the next rescue more likely —
-    /// a ceiling climbing on its own record of having been hit.
-    delivered_iterations: VecDeque<u32>,
     /// Runs of this role that were cut off at the ceiling. A run that stops
     /// this way is direct evidence the ceiling was binding, which is what an
     /// operator needs to see when the derived value is not moving.
@@ -448,11 +455,12 @@ impl AgentObservable {
 
     /// Record a high-level agent run (called by AgentRuntime::run).
     ///
-    /// `role` is what makes the reading usable at all: the iteration ceiling is
-    /// derived per role, and a run counted without its role cannot inform any
-    /// decision. `iterations` is in the same unit the ceiling is expressed in —
-    /// not `steps`, which counts assistant turns and would silently rescale
-    /// every reading it fed.
+    /// `role` labels the ending counts only. The budget sample is the process's
+    /// own, because a label no longer predicts the work: a run counted under a
+    /// different name must not land in a different window from the same run
+    /// counted under this one. `iterations` is in the same unit the ceiling is
+    /// expressed in — not `steps`, which counts assistant turns and would
+    /// silently rescale every reading it fed.
     pub fn record_run(
         &self,
         role: &str,
@@ -469,17 +477,22 @@ impl AgentObservable {
         self.total_tool_calls
             .fetch_add(tool_calls as u64, Ordering::Relaxed);
 
+        if outcome == RunOutcome::Delivered {
+            let mut sample = self
+                .delivered_iterations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if sample.len() == BUDGET_SAMPLE_WINDOW {
+                sample.pop_front();
+            }
+            sample.push_back(iterations);
+        }
+
         let mut calibrations = self
             .role_calibrations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let calibration = calibrations.entry(role.to_string()).or_default();
-        if outcome == RunOutcome::Delivered {
-            if calibration.delivered_iterations.len() == BUDGET_SAMPLE_WINDOW {
-                calibration.delivered_iterations.pop_front();
-            }
-            calibration.delivered_iterations.push_back(iterations);
-        }
         // Counted here, at the run's end, and not at the moment the ceiling is
         // judged spent (`note_budget_exhausted`): only the ending says whether
         // the forced ask produced an answer. The judgement-time counter cannot
@@ -513,28 +526,36 @@ impl AgentObservable {
             .exhausted_runs += 1;
     }
 
-    /// The iteration ceiling to run this role under, given the value a caller
-    /// would use with no evidence behind it (`seed`: the operator's config, or
-    /// the role's skill).
+    /// The iteration ceiling to run this piece of work under, given the value a
+    /// caller would use with no evidence behind it (`seed`: the operator's
+    /// config).
     ///
-    /// With nothing observed about this role the seed stands — moving a number
-    /// without evidence would be guesswork with extra steps. Once runs have
-    /// completed, the ceiling is the shape this role usually needs plus one more
-    /// typical run's worth of room:
+    /// There are exactly two sources for a ceiling — the operator's number and
+    /// this process's own measurements — and neither is keyed by a label. A role
+    /// is a free tag on the roster; keying the ceiling by it meant the same work
+    /// handed to a worker under another name ran under another ceiling, which is
+    /// the label deciding behaviour.
     ///
-    /// - the floor of experience is the ninetieth percentile of what the role
-    ///   has delivered, not the longest of it. A ceiling that will not admit the
-    ///   shape this role is known to need is a defect, and ninety in a hundred
+    /// Only one of the two can answer at a time. A stated seed stands — it is the
+    /// operator's own decision for this deployment, and moving a number without
+    /// evidence would be guesswork with extra steps. Only where nobody stated
+    /// one (`u32::MAX`) does the measurement answer, and the ceiling it gives is
+    /// the shape the work usually takes plus one more typical run's worth of
+    /// room:
+    ///
+    /// - the floor of experience is the ninetieth percentile of what has been
+    ///   delivered, not the longest of it. A ceiling that will not admit the
+    ///   shape this work is known to need is a defect, and ninety in a hundred
     ///   delivered runs is that shape. Taking the maximum makes a single outlier
-    ///   the ceiling for every run of every task until it ages out of the sample
-    ///   window, which is the opposite of following the workload: measured on
-    ///   2026-11-06 over 215 delivered generator runs in 24 hours, the median was
-    ///   5 iterations, the ninetieth percentile 32, the maximum 169. The 9.8% of
-    ///   runs above 32 carried 24.6% of every generator call, and the runs that
-    ///   spent a whole 3600s task budget without producing an artifact sat at
-    ///   63 — above the percentile, far below the maximum. A ceiling at the
-    ///   maximum was ~183 and bound nothing; at the percentile it is ~46 and
-    ///   binds exactly on the tail where the spend stops buying deliveries.
+    ///   the ceiling for every run until it ages out of the sample window, which
+    ///   is the opposite of following the workload: measured on 2026-11-06 over
+    ///   215 delivered generator runs in 24 hours, the median was 5 iterations,
+    ///   the ninetieth percentile 32, the maximum 169. The 9.8% of runs above 32
+    ///   carried 24.6% of every generator call, and the runs that spent a whole
+    ///   3600s task budget without producing an artifact sat at 63 — above the
+    ///   percentile, far below the maximum. A ceiling at the maximum was ~183 and
+    ///   bound nothing; at the percentile it is ~46 and binds exactly on the tail
+    ///   where the spend stops buying deliveries.
     /// - the headroom is what keeps the ceiling from being a claim about the
     ///   past. A ceiling set exactly to the percentile cuts off the first run
     ///   that is slightly harder than anything seen, and that cut is total: the
@@ -555,18 +576,15 @@ impl AgentObservable {
     /// on its first ralph iteration (60 of 60 over 14 days). The spend was
     /// going to retries that never turned into deliveries, and the only number
     /// anyone had measured was never consulted.
-    pub fn iteration_budget_for(&self, role: &str, seed: u32) -> u32 {
-        let calibrations = self
-            .role_calibrations
+    pub fn iteration_budget_for(&self, seed: u32) -> u32 {
+        let sample = self
+            .delivered_iterations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(calibration) = calibrations.get(role) else {
-            return seed;
-        };
-        if calibration.delivered_iterations.is_empty() {
+        if sample.is_empty() {
             return seed;
         }
-        let mut sample: Vec<u32> = calibration.delivered_iterations.iter().copied().collect();
+        let mut sample: Vec<u32> = sample.iter().copied().collect();
         let admitted = ninetieth_percentile(&mut sample);
         let sum: u32 = sample.iter().sum();
         let typical = sum.div_ceil(sample.len() as u32);
@@ -574,10 +592,18 @@ impl AgentObservable {
         // `u32::MAX` is this field's spelling of "nobody stated a ceiling", not a
         // ceiling of four billion turns. Taking the max against it discards the
         // only measured number, so the calibration answers instead.
+        //
+        // Any other value is the operator's own decision for this deployment and
+        // stands as written. It used to be raised whenever the measurement was
+        // larger, back when the seed could also arrive from a role's skill row —
+        // a number written for a label, which the work was allowed to outgrow.
+        // The only seed left is the process-wide config: a statement about this
+        // deployment, which a measurement may report on (the exhausted-runs
+        // reading says when it is binding) but not silently overrule.
         if seed == u32::MAX {
             return calibrated;
         }
-        seed.max(calibrated)
+        seed
     }
 }
 
@@ -1131,7 +1157,7 @@ mod tests {
             12,
         );
         assert_eq!(
-            o.iteration_budget_for("generator", 10),
+            o.iteration_budget_for(10),
             10,
             "在上限处被截断的运行，不能是「上限太低」的证据"
         );
@@ -1151,12 +1177,12 @@ mod tests {
     /// 没有任何观测就该原样用调用方给的种子：凭一个没看见过的事实改数字，
     /// 只是把猜数换了个地方猜。
     #[test]
-    fn a_role_with_no_completed_run_keeps_the_seed_budget() {
+    fn a_pool_with_no_completed_run_keeps_the_seed_budget() {
         let o = AgentObservable::new();
-        assert_eq!(o.iteration_budget_for("generator", 10), 10);
+        assert_eq!(o.iteration_budget_for(10), 10);
         // 只有被截断的运行也不是"跑完过"的证据：它没交卷，也就没说需要多少轮。
         o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
-        assert_eq!(o.iteration_budget_for("generator", 10), 10);
+        assert_eq!(o.iteration_budget_for(10), 10);
     }
 
     /// 调用方没写上限时（`u32::MAX` 就是"这里没写天花板"的拼法），标定不能被它
@@ -1170,14 +1196,16 @@ mod tests {
         }
         // 最长 12 + 均值 12。
         assert_eq!(
-            o.iteration_budget_for("generator", u32::MAX),
+            o.iteration_budget_for(u32::MAX),
             24,
             "没写上限不等于不要上限：测到的那一份就是上限"
         );
-        // 写死的种子照旧压过标定，操作者的决定不由标定推翻。
-        assert_eq!(o.iteration_budget_for("generator", 40), 40);
-        // 比标定小的种子仍是「已知形状放不下」，标定把它抬起来。
-        assert_eq!(o.iteration_budget_for("generator", 3), 24);
+        // 写下的数照原样用，写大了也一样。
+        assert_eq!(o.iteration_budget_for(40), 40);
+        // 写小了也照原样用：这个数现在是操作者对本部署的决定，不是某一行的
+        // 数。标定只在没有人写过上限的时候回答。上限绑得太紧由「撞墙」那条
+        // 读数说，不靠标定悄悄改写一个人的决定。
+        assert_eq!(o.iteration_budget_for(3), 3);
     }
 
     /// 一次都没交付过的时候，没写上限就仍然是没有上限：这时没有测到任何数，
@@ -1185,28 +1213,28 @@ mod tests {
     #[test]
     fn an_unstated_ceiling_stays_unstated_until_something_is_measured() {
         let o = AgentObservable::new();
-        assert_eq!(o.iteration_budget_for("generator", u32::MAX), u32::MAX);
+        assert_eq!(o.iteration_budget_for(u32::MAX), u32::MAX);
         o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
-        assert_eq!(o.iteration_budget_for("generator", u32::MAX), u32::MAX);
+        assert_eq!(o.iteration_budget_for(u32::MAX), u32::MAX);
     }
 
-    /// 上限必须容得下这个角色**已经交付过**的轮数，否则它不是安全线而是缺陷：
+    /// 上限必须容得下这个进程**已经交付过**的轮数，否则它不是安全线而是缺陷：
     /// 一个已知形状的运行会被砍在半路，而且砍掉是全额的——什么都没产出，
     /// 花掉的却全花了。
     #[test]
-    fn the_ceiling_admits_the_longest_run_this_role_has_delivered() {
+    fn the_ceiling_admits_the_longest_run_this_process_has_delivered() {
         let o = AgentObservable::new();
         for iterations in [6, 8] {
             o.record_run("generator", RunOutcome::Delivered, iterations, 20, 5);
         }
-        let budget = o.iteration_budget_for("generator", 10);
+        let budget = o.iteration_budget_for(u32::MAX);
         assert!(
             budget > 8,
             "the ceiling must clear the longest completed run: {budget}"
         );
         assert!(
             budget > 10,
-            "two delivered runs of 6 and 8 say the seed was binding, not that 10 is right: {budget}"
+            "two delivered runs of 6 and 8 say the shape is longer than that: {budget}"
         );
     }
 
@@ -1220,7 +1248,7 @@ mod tests {
             o.record_run("generator", RunOutcome::Delivered, 5, 20, 4);
         }
         o.record_run("generator", RunOutcome::Delivered, 169, 20, 4);
-        let budget = o.iteration_budget_for("generator", u32::MAX);
+        let budget = o.iteration_budget_for(u32::MAX);
         assert!(
             budget < 60,
             "an outlier must not become every run's ceiling: {budget}"
@@ -1231,15 +1259,48 @@ mod tests {
         );
     }
 
-    /// 读数按角色分开：另外一条角色的运行说不了这个角色需要多少轮。
+    /// 同一批运行，换一个标签写进去，读出来的上限是同一个数。
+    ///
+    /// 这是「换一个标签接，行为不变」在预算这一面上的量法：两个 observable 收
+    /// 到的是同样四次交付（20 轮），只是记在 `generator` 与 `evaluator` 两个名字
+    /// 下。以前上限按角色存，这两个数会分叉——一个名字接手同一件活，天花板就
+    /// 换了；现在样本是进程的，标签只落在读数上。
     #[test]
-    fn one_roles_runs_do_not_set_another_roles_ceiling() {
+    fn a_different_label_does_not_move_the_ceiling() {
+        let labeled_generator = AgentObservable::new();
+        let labeled_evaluator = AgentObservable::new();
+        for _ in 0..4 {
+            labeled_generator.record_run("generator", RunOutcome::Delivered, 20, 40, 8);
+            labeled_evaluator.record_run("evaluator", RunOutcome::Delivered, 20, 40, 8);
+        }
+        assert_eq!(
+            labeled_generator.iteration_budget_for(u32::MAX),
+            labeled_evaluator.iteration_budget_for(u32::MAX),
+            "同一个进程同样的运行，标签不同，预算必须相同"
+        );
+        assert!(
+            labeled_generator.iteration_budget_for(u32::MAX) > 20,
+            "四次 20 轮的交付给出的是一个容得下它们的数，换个标签也一样"
+        );
+    }
+
+    /// 一个标签下的运行，也确实是同一个样本的一部分：同一个 observable 里两种
+    /// 标签交卷的轮数一起算，不因为名字不同就分进两个窗口各算各的。
+    #[test]
+    fn runs_under_two_labels_share_one_sample() {
         let o = AgentObservable::new();
         for _ in 0..4 {
-            o.record_run("generator", RunOutcome::Delivered, 20, 40, 8);
+            o.record_run("generator", RunOutcome::Delivered, 6, 20, 5);
         }
-        assert_eq!(o.iteration_budget_for("evaluator", 5), 5);
-        assert!(o.iteration_budget_for("generator", 10) > 10);
+        let one_label = o.iteration_budget_for(u32::MAX);
+        for _ in 0..4 {
+            o.record_run("evaluator", RunOutcome::Delivered, 30, 20, 5);
+        }
+        let two_labels = o.iteration_budget_for(u32::MAX);
+        assert!(
+            two_labels > one_label,
+            "第二次记录必须落进同一个窗口并把它抬起来：{one_label} -> {two_labels}"
+        );
     }
 
     /// 窗口是有界的：上限只跟着最近一轮的样本走，不会把整个历史累加进内存，
@@ -1252,7 +1313,7 @@ mod tests {
         }
         // 40 * (window + 10) 如果全留下会把均值抬到 40，上限就成 80 了。
         assert_eq!(
-            o.iteration_budget_for("generator", 1),
+            o.iteration_budget_for(u32::MAX),
             40 + 40,
             "the ceiling must be derived from the retained window, not the whole history"
         );
@@ -1266,7 +1327,7 @@ mod tests {
         for _ in 0..50 {
             o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
         }
-        assert_eq!(o.iteration_budget_for("generator", 10), 10);
+        assert_eq!(o.iteration_budget_for(10), 10);
     }
 
     /// 每个角色的截断次数要能被读到：上限是不是在绑住某条路径，是这次改动

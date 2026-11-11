@@ -9,11 +9,11 @@
 //!
 //!- the **Markdown skill** above — an instruction document an agent reads;
 //!- [`SkillConfig`] — one row of the **executor table**: which kind of hand a
-//!  sub-task can be handed to, which tools that hand may call, and how many
-//!  iterations it gets. `SkillRegistry` holds these rows, and goal
+//!  sub-task can be handed to. `SkillRegistry` holds these rows, and goal
 //!  decomposition reads exactly this table to learn the kinds of hand it may
 //!  name. It is not a list of what the system can do, and an empty table is a
-//!  legal state rather than a half-configured one.
+//!  legal state rather than a half-configured one. A row is identity and kind
+//!  only: it cannot carry a tool list, a persona or a turn ceiling.
 
 use crate::{
     storage::VectorBackend, AtomicTask, BoundaryReport, BoundaryRule, BoundaryViolation, RuleType,
@@ -607,7 +607,6 @@ mod tests {
         SkillConfig {
             skill_id: id.to_string(),
             name: id.to_string(),
-            max_iterations: None,
             role_type: role_type.to_string(),
         }
     }
@@ -875,48 +874,38 @@ mod tests {
     fn test_skill_registry_load_skills_from_json() {
         let mut registry = SkillRegistry::new();
         let json = r#"[
-            {"skill_id":"planner","name":"Planner","tools":["md"],"max_iterations":10,"role_type":"planner"},
-            {"skill_id":"evaluator","name":"Evaluator","tools":["test"],"max_iterations":5,"role_type":"evaluator"}
+            {"skill_id":"planner","name":"Planner","tools":["md"],"role_type":"planner"},
+            {"skill_id":"evaluator","name":"Evaluator","tools":["test"],"role_type":"evaluator"}
         ]"#;
         registry.load_skills_from_json(json).unwrap();
         assert!(registry.get_skill("planner").is_some());
         assert!(registry.get_skill("evaluator").is_some());
         let planner = registry.get_skill("planner").unwrap();
         assert_eq!(planner.name, "Planner");
-        assert_eq!(planner.max_iterations, Some(10));
         assert_eq!(planner.role_type, "planner");
     }
 
-    /// 没写轮数的技能没有界，而不是拿到一个别人替你写的 10。
+    /// 技能行没有轮次上限这一格：文件里写了也不读，写出去也不带。
     ///
-    /// 技能文件原先缺这个字段就按 10 补——于是「这个角色该跑多少轮」由一个从没
-    /// 量过工作的常量回答，而且它一路从技能面传到运行时，每一层都以为别处决定
-    /// 了它。缺省不是「十是合理的」，缺省是「这里没有界」。
+    /// 这一格曾经是「按角色分发天花板」的入口——行按角色名取，同一件活换个标签
+    /// 接手就换一个上限。它现在不存在了；上限只有配置面（覆盖）与这个进程自己
+    /// 交卷运行跑出来的轮数（实测）两个来源。文件里残留这个键不算错，但它必须
+    /// 读不出任何东西。
     #[test]
-    fn a_skill_that_states_no_budget_has_none() {
+    fn a_skill_row_has_no_ceiling_to_read() {
         let mut registry = SkillRegistry::new();
         registry
             .load_skills_from_json(
-                r#"[{"skill_id":"generator","name":"Generator","tools":["code"],"role_type":"generator"}]"#,
+                r#"[{"skill_id":"generator","name":"Generator","role_type":"generator","max_iterations":7}]"#,
             )
             .unwrap();
-        assert_eq!(
-            registry
-                .skill_for_role("generator")
-                .expect("generator skill")
-                .max_iterations,
-            None
-        );
-
-        // 写了就照写的读：操作者给的界是一条决定，不能被一个补缺省值的习惯盖掉。
-        registry
-            .load_skills_from_json(
-                r#"[{"skill_id":"planner","name":"Planner","tools":["md"],"max_iterations":7,"role_type":"planner"}]"#,
-            )
-            .unwrap();
-        assert_eq!(
-            registry.skill_for_role("planner").unwrap().max_iterations,
-            Some(7)
+        let row = registry
+            .skill_for_role("generator")
+            .expect("generator skill");
+        let shaped = serde_json::to_value(row).expect("技能行写得出去");
+        assert!(
+            shaped.get("max_iterations").is_none(),
+            "技能行又把轮次写出来了：这一格回来，按标签分发天花板也会跟着回来"
         );
     }
 
@@ -926,12 +915,12 @@ mod tests {
         let path = dir.path();
         std::fs::write(
             path.join("planner.json"),
-            r#"{"skill_id":"planner","name":"Planner","tools":["md"],"max_iterations":10,"role_type":"planner"}"#,
+            r#"{"skill_id":"planner","name":"Planner","tools":["md"],"role_type":"planner"}"#,
         )
         .unwrap();
         std::fs::write(
             path.join("evaluator.json"),
-            r#"{"skill_id":"evaluator","name":"Evaluator","tools":["test"],"max_iterations":5,"role_type":"evaluator"}"#,
+            r#"{"skill_id":"evaluator","name":"Evaluator","tools":["test"],"role_type":"evaluator"}"#,
         )
         .unwrap();
 
@@ -971,8 +960,8 @@ mod tests {
         registry
             .load_skills_from_json(
                 r#"[
-                    {"skill_id":"generator","name":"Generator","tools":["code"],"max_iterations":10,"role_type":"generator"},
-                    {"skill_id":"planner","name":"Planner","tools":["md"],"max_iterations":10,"role_type":"planner"}
+                    {"skill_id":"generator","name":"Generator","role_type":"generator"},
+                    {"skill_id":"planner","name":"Planner","role_type":"planner"}
                 ]"#,
             )
             .unwrap();
@@ -981,7 +970,6 @@ mod tests {
             .skill_for_role("generator")
             .expect("generator skill");
         assert_eq!(generator.skill_id, "generator");
-        assert_eq!(generator.max_iterations, Some(10));
         assert!(
             registry.skill_for_role("moderator").is_none(),
             "a role with no skill must resolve to nothing, not to some other role's skill"
@@ -996,7 +984,7 @@ mod tests {
         registry
             .load_skills_from_json(
                 r#"[
-                    {"skill_id":"a-generator","name":"A","tools":[],"max_iterations":5,"role_type":"generator"},
+                    {"skill_id":"a-generator","name":"A","tools":[],"role_type":"generator"},
                     {"skill_id":"b-generator","name":"B","tools":[],"max_iterations":20,"role_type":"generator"}
                 ]"#,
             )
