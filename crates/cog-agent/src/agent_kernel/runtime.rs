@@ -1085,23 +1085,6 @@ impl AgentRuntime {
         Self::with_observable(config, event_tx, &crate::observable::global_observable())
     }
 
-    /// Build a runtime whose ceiling is derived from `observable` instead of the
-    /// process-wide one.
-    ///
-    /// The production path reads the global observable on purpose: the sample is
-    /// a fact about the work this process does, not about one test's fixture.
-    /// Tests that assert what a particular sample produces need their own bucket
-    /// — every other test that runs a loop writes into the global one, and a
-    /// shared bucket would make the assertion depend on test order.
-    #[cfg(test)]
-    pub(crate) fn new_with_observable(
-        config: RuntimeConfig,
-        event_tx: mpsc::Sender<AgentEvent>,
-        observable: &crate::observable::AgentObservable,
-    ) -> Self {
-        Self::with_observable(config, event_tx, observable)
-    }
-
     fn with_observable(
         mut config: RuntimeConfig,
         event_tx: mpsc::Sender<AgentEvent>,
@@ -3960,6 +3943,32 @@ impl cog_core::AgentRuntime for AgentRuntime {
 
     fn role(&self) -> &str {
         self.config.role.as_str()
+    }
+}
+
+/// The test-only seam, kept after every production item on purpose.
+///
+/// `#[cfg(test)]` is not just an attribute here: one reader of this tree takes
+/// "the file's first `#[cfg(test)]` to the end" as the test region, and counts
+/// `AgentEvent` constructions above that line as the ones a live face can rely
+/// on. A test-only constructor declared next to `new` would move that line to
+/// the top of the file and make every event this runtime emits look unbuilt.
+#[cfg(test)]
+impl AgentRuntime {
+    /// Build a runtime whose ceiling is derived from `observable` instead of the
+    /// process-wide one.
+    ///
+    /// The production path reads the global observable on purpose: the sample is
+    /// a fact about the work this process does, not about one test's fixture.
+    /// Tests that assert what a particular sample produces need their own bucket
+    /// — every other test that runs a loop writes into the global one, and a
+    /// shared bucket would make the assertion depend on test order.
+    pub(crate) fn new_with_observable(
+        config: RuntimeConfig,
+        event_tx: mpsc::Sender<AgentEvent>,
+        observable: &crate::observable::AgentObservable,
+    ) -> Self {
+        Self::with_observable(config, event_tx, observable)
     }
 }
 
