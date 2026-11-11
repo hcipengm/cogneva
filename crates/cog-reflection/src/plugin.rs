@@ -2299,7 +2299,7 @@ where
         // 交出去之前把这条任务**自己声明的执行契约**取下来：它决定这条探针多久
         // 没结局就该作废，见 `outcome_deadline`。取在这里是因为 `task` 下面那一步
         // 就交给编排器了，交出去之后这一侧再也读不到它。
-        let timeout_secs = task.timeout_seconds;
+        let declared_secs = task.declared_duration_seconds;
         // 返回值不当成败判：它只说这一趟往图里加了几行（已经在图里的幂等提交不算数），
         // 离「这条探针跑成了没有」还隔着一整条回路。那一段要先把 `TaskType::Custom`
         // 的结局在哪个面可读量出来，在那之前把 Ok 读成成功就是拿「提交成功」冒充
@@ -2316,7 +2316,7 @@ where
                 // 空列表（幂等提交，那件事已经在图里）不记：它的结局归**早先交出
                 // 它的那一拍**管，这里再记一行就是同一件事记两遍。
                 if let Some(id) = ids.first() {
-                    handed_over.push((id.clone(), probe, timeout_secs));
+                    handed_over.push((id.clone(), probe, declared_secs));
                 }
             }
             Err(e) => {
@@ -2376,7 +2376,7 @@ struct PendingProbe {
 /// 一条探针的结局最晚什么时候该回来。
 ///
 /// 由**那条任务行上带的那个数**导出，不钉一个数：`Task::new` 给每条任务写一个
-/// `timeout_seconds`，这条册子拿它当「按经验这条探针也该有结局了」的尺度。
+/// `declared_duration_seconds`，这条册子拿它当「按经验这条探针也该有结局了」的尺度。
 ///
 /// 它**不再是一条会被兑现的界**：执行侧不按时钟回收任何一条正在跑的尝试，停住
 /// 由实测的步间隔判（`TaskStalled`）。所以这里的越界只说明「按经验该回来了」，
@@ -2390,9 +2390,9 @@ struct PendingProbe {
 /// 这个边界怎么重新量：轮次那一行里 `still_open` 长期非零而任务其实早就结束了 ⇒
 /// 余量偏小；`expired` 有值而任务随后仍跑出结果 ⇒ 同一个方向。两者恒为 0 而
 /// `row_missing` 有值 ⇒ 这块册子根本收不到东西，别再抬。
-fn outcome_deadline(timeout_secs: u64, period: std::time::Duration) -> std::time::Instant {
+fn outcome_deadline(declared_secs: u64, period: std::time::Duration) -> std::time::Instant {
     std::time::Instant::now()
-        + std::time::Duration::from_secs(timeout_secs)
+        + std::time::Duration::from_secs(declared_secs)
         + period * OUTCOME_QUEUE_MARGIN_ROUNDS
 }
 
@@ -2401,13 +2401,13 @@ fn outcome_deadline(timeout_secs: u64, period: std::time::Duration) -> std::time
 // cap: bound — 是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测
 const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
 
-/// 一条探针的执行契约（秒）：`Task::new` 给每一条任务写的 `timeout_seconds`。
+/// 一条探针的执行契约（秒）：`Task::new` 给每一条任务写的 `declared_duration_seconds`。
 ///
 /// 这里写一份是为了让**一轮的工期**有一个可读的来源——一轮把几条探针依次交给编排器，
 /// 每一次交接等的是同一条流水线，那条流水线对「最多跑多久」的声明就是它。真值仍在
 /// `Task::new` 里：`discovery_probe_declares_the_contract_its_round_is_sized_from`
 /// 那条测试盯着两处一致，那边改了而这里没跟，它会红。
-// cap: fixed — 与 `Task::new` 给每条任务写的 `timeout_seconds` 同源，两处一致由那条测试盯着
+// cap: fixed — 与 `Task::new` 给每条任务写的 `declared_duration_seconds` 同源，两处一致由那条测试盯着
 const DISCOVERY_PROBE_CONTRACT_SECS: u64 = 300;
 
 /// 一轮最多能把多久花在「开始新的交接」上。
@@ -2851,11 +2851,11 @@ fn spawn_discovery_loop(
                     // 受理了就要欠着一条结局——**这一句是回程的入口**。少了它，
                     // `evaluate_discovery_result` 又一次没有调用者，而这条环会在每一拍
                     // 重新问同一个问题、没有任何一条证据留下来。
-                    for (task_id, probe, timeout_secs) in round.handed_over {
+                    for (task_id, probe, declared_secs) in round.handed_over {
                         pending.push(PendingProbe {
                             task_id,
                             probe,
-                            deadline: outcome_deadline(timeout_secs, period),
+                            deadline: outcome_deadline(declared_secs, period),
                         });
                     }
                     if round.held_back > 0 {
@@ -5906,7 +5906,7 @@ mod tests {
 
     /// 轮的墙与告警的工期界都从探针自己的执行契约导出，而契约的真值在 `Task::new`。
     ///
-    /// 这一条盯的是那两处的一致性：`Task::new` 的默认 `timeout_seconds` 改了而
+    /// 这一条盯的是那两处的一致性：`Task::new` 的默认 `declared_duration_seconds` 改了而
     /// `DISCOVERY_PROBE_CONTRACT_SECS` 没跟，`background_loop_stalled` 就会按一个
     /// 比真实往返短的界判这条环——池一慢它就红，而环其实在干活。反过来，这里要是
     /// 比真值大，红会晚到，迟到的红等于没有。
@@ -5927,7 +5927,7 @@ mod tests {
             .expect("no probe proposed");
         let (_goal, task) = discovery_probe_task(&probe);
         assert_eq!(
-            task.timeout_seconds, DISCOVERY_PROBE_CONTRACT_SECS,
+            task.declared_duration_seconds, DISCOVERY_PROBE_CONTRACT_SECS,
             "一轮的工期界是按这个数算的：`Task::new` 的契约改了这一行也得跟着改"
         );
 
@@ -5961,12 +5961,12 @@ mod tests {
     fn pending_probe(
         probe: &crate::types::DiscoveryTask,
         task_id: &str,
-        timeout_secs: u64,
+        declared_secs: u64,
     ) -> PendingProbe {
         PendingProbe {
             task_id: task_id.to_string(),
             probe: probe.clone(),
-            deadline: outcome_deadline(timeout_secs, std::time::Duration::from_secs(60)),
+            deadline: outcome_deadline(declared_secs, std::time::Duration::from_secs(60)),
         }
     }
 

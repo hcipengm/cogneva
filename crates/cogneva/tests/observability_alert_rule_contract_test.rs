@@ -303,15 +303,6 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_evolution_change_queue_files",
         "crates/cog-reflection/src/evolution_queue_readings.rs",
     ),
-    // The apply/test flight. Not published by a task: the age is derived from a
-    // stamp the flight leaves behind when the scrape arrives. It is an age and
-    // not a bound compared against an age -- each step of the flight is stopped
-    // when it stops moving, so a flight whose steps are long is healthy, and a
-    // line drawn on the total would go red on exactly those.
-    (
-        "cogneva_evolution_change_flight_seconds",
-        "crates/cog-reflection/src/evolution_flight_readings.rs",
-    ),
     (
         "cogneva_evolution_build_outcomes_total",
         "crates/cog-reflection/src/evolution_build_readings.rs",

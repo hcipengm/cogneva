@@ -872,6 +872,7 @@ const CONVERSATION_REPLY_STATUS: &str = "completed";
 /// So the reading kept here is of effect, not of effort: how many calls
 /// have passed since the checkout changed. The note it produces is a
 /// correction to that silence, not a ceiling on the run.
+#[derive(Default)]
 struct CheckoutProgress {
     calls_without_change: u32,
     /// 距上一次真的改动工作树过了多少次调用。
@@ -881,16 +882,6 @@ struct CheckoutProgress {
     /// ——一条半小时只打了三个慢调用的运行，「三次」是对的，「零次」是刚清过零。
     calls_since_change: u32,
     notes_given: u32,
-}
-
-impl Default for CheckoutProgress {
-    fn default() -> Self {
-        Self {
-            calls_without_change: 0,
-            calls_since_change: 0,
-            notes_given: 0,
-        }
-    }
 }
 
 impl CheckoutProgress {
@@ -6566,8 +6557,10 @@ mod tests {
             agent_id: "hung-draft".into(),
             role: role.into(),
             max_iterations: 1,
-            // 停顿窗口远大于这道墙，二者不会互相顶替：1s 后必须由墙收场。
-            think_stall_timeout_secs: 300,
+            // 追问挂住时收场的是**这一跑自己的停顿窗口**：它随每个流事件重置，所以
+            // 慢而有动静的生成不会被判死，只有一整个窗口一点动静都没有的连接才会。
+            // 单独那道「追问墙」已经拆掉（2026-11-10：按钟判死一律换成按动静判停）。
+            think_stall_timeout_secs: 1,
             ..Default::default()
         };
         let mut runtime = AgentRuntime::new(config, tx);

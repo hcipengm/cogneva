@@ -422,27 +422,6 @@ rows:
       run, so a derived value could be a multiple of the observed run time;
       nothing computes it.
 
-  - key: backup.drillStepSilenceSeconds
-    source: override
-    why: >-
-      How long one step of a drill -- unpack, verify the manifest, create the
-      scratch database, restore, compare -- may go without advancing before the
-      drill stops itself and records a failed row naming that step. It replaced
-      a whole-pass budget, and the difference is the point: on 2026-10-27 a
-      restore measured at 497 s on 2026-10-19 had grown to 2271 s as the
-      database grew to 3.6 GB, the first pass used 38 of the 60 minutes, and the
-      second pass was killed by the whole-pass clock with nothing recorded --
-      so the oldest unproven package could never be proven. A pass that keeps
-      advancing is no longer stopped at any total. Advancing is measured, not
-      assumed: the five paths that move data -- export, restore, package,
-      unpack, digest -- record a beat every few megabytes, so one table copied
-      for forty minutes is forty minutes of motion, not forty minutes of
-      silence, and the window only expires when nothing has moved at all. No
-      measured sample of a single step exists yet, which is why this carries
-      the old whole-pass number: at the same value it is strictly more
-      permissive than what it replaced, and it is the value the Job's probe
-      reads until the process has measured a window of its own.
-
   - key: backup.startingDeadlineSeconds
     source: override
     why: >-
@@ -1044,6 +1023,37 @@ rows:
       quota. The measurement exists and was turned into a number by hand; no loop
       re-measures start durations back into it, and the roots only grow with the
       images pulled.
+
+  # The backup and drill Jobs answer a different question than the probes above:
+  # not "will the process respond" but "is it still making progress". Their
+  # stop bound is not in this file at all -- the process writes the window it
+  # was measured to need into the progress file on every step, and the probe
+  # compares the file's age against that window. These four leaves are only the
+  # asking rhythm, so no loop can read a window back into them.
+  - key: healthProbes.progressFile.periodSeconds
+    source: fixed
+    why: >-
+      The probe contract's own period. Asking more often cannot stop a Job any
+      earlier than the first tick after the age passes the window the file
+      names, so a finer period buys nothing but probe noise.
+
+  - key: healthProbes.progressFile.timeoutSeconds
+    source: fixed
+    why: >-
+      The probe contract's timeout, written out for the same reason as every
+      other probe here: the kubelet default is the idle-node number.
+
+  - key: healthProbes.progressFile.failureThreshold
+    source: fixed
+    why: >-
+      Three misses at 30 seconds, so one flaky read of the progress file does not
+      become a restart. A practice, not a measurement.
+
+  - key: healthProbes.progressFile.initialDelaySeconds
+    source: fixed
+    why: >-
+      The first thing the Job does is create the progress file, so the grace
+      only covers scheduling and volume mounting.
 
   # --- host document organising ----------------------------------------------
   - key: hostDocuments.approvalTtlSecs
@@ -1705,21 +1715,12 @@ rows:
       value.
 
   # --- workspace fetch bounds (evolution and sandbox share one) ---------------
-  - key: workspaceFetch.timeoutSecs
-    source: override
-    why: >-
-      One wall-clock bound on a public-git clone or fetch of the workspace repo.
-      Both workers read this one number because they share the same outbound
-      path, and a per-worker copy would leave one side on an old bound. A derived
-      value would read the transfer-time distribution; the failure branch records
-      no duration, so nothing feeds one back.
-
   - key: workspaceFetch.connectTimeoutSecs
     source: override
     why: >-
       How long git may wait for the mirror to answer at all, so an unreachable
-      mirror does not consume the whole wall-clock bound. Nothing records the
-      observed connect latency, so no reading closes over it.
+      mirror does not sit on a half-open connection. Nothing records the observed
+      connect latency, so no reading closes over it.
 
   - key: workspaceFetch.lowSpeedLimitBytesPerSec
     source: override

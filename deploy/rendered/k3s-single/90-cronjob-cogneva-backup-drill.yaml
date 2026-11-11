@@ -94,12 +94,10 @@ spec:
                       echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
                       age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
                       echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
-                
-                periodSeconds: 30
-                
                 failureThreshold: 3
-                
                 initialDelaySeconds: 120
+                periodSeconds: 30
+                timeoutSeconds: 10
               env:
                 - name: TZ
                   value: "Asia/Shanghai"
@@ -109,11 +107,8 @@ spec:
                   value: "http://loki.monitoring.svc.cluster.local:3100"
                 - name: COGNEVA_PROGRESS_FILE
                   value: /var/run/cogneva-progress/beat
-                # 一步的静默界：解包、核清单、建空库、恢复、对数……任何一步静默
-                # 超过它，由这一跑自己收尾并落一行 `failed`，判词点名停在哪一步。
-                # 整趟不受这条界约束——每一步都在推进时跑多久都行。
-                - name: COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS
-                  value: "3600"
+                # 这一步静默多久算停不在部署里：进程开工时向 `progress_bounds`
+                # 问这个作业类上一次运行量到的极值，没有那行就不判停。
                 # 这一处连的是**cog_backup**，一个只带 CREATEDB 的受限角色：演练要在
                 # 同一台服务器上 `CREATE DATABASE` 一个一次性库，所以不能是 `cog_app`
                 # （没有 CREATEDB）；而它也不需要超级用户位——恢复没有它时按外键依赖

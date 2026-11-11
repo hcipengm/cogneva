@@ -125,12 +125,8 @@ spec:
                       echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
                       age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
                       echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
-                {{/* lit: 30 fixed — 探针的读取节奏，不是界；界是进度文件里那个窗口 */}}
-                periodSeconds: 30
-                {{/* lit: 3 fixed — 连续几次读数超窗才判死：一次读盘抖动不该变成一次重启 */}}
-                failureThreshold: 3
-                {{/* lit: 120 fixed — 开工宽限；进程第一件事就是建这个文件 */}}
-                initialDelaySeconds: 120
+                {{- /* 节奏与容错次数取自 values 的一处；探针文本里不写数 */ -}}
+                {{- toYaml .Values.healthProbes.progressFile | nindent 16 }}
               env:
                 {{- include "cogneva.timeEnv" . | nindent 16 }}
                 {{- include "cogneva.logEnv" . | nindent 16 }}
@@ -386,22 +382,15 @@ spec:
                       echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
                       age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
                       echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
-                {{/* lit: 30 fixed — 探针的读取节奏，不是界；界是进度文件里那个窗口 */}}
-                periodSeconds: 30
-                {{/* lit: 3 fixed — 连续几次读数超窗才判死：一次读盘抖动不该变成一次重启 */}}
-                failureThreshold: 3
-                {{/* lit: 120 fixed — 开工宽限；进程第一件事就是建这个文件 */}}
-                initialDelaySeconds: 120
+                {{- /* 节奏与容错次数取自 values 的一处；探针文本里不写数 */ -}}
+                {{- toYaml .Values.healthProbes.progressFile | nindent 16 }}
               env:
                 {{- include "cogneva.timeEnv" . | nindent 16 }}
                 {{- include "cogneva.logEnv" . | nindent 16 }}
                 - name: COGNEVA_PROGRESS_FILE
                   value: /var/run/cogneva-progress/beat
-                # 一步的静默界：解包、核清单、建空库、恢复、对数……任何一步静默
-                # 超过它，由这一跑自己收尾并落一行 `failed`，判词点名停在哪一步。
-                # 整趟不受这条界约束——每一步都在推进时跑多久都行。
-                - name: COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS
-                  value: {{ .Values.backup.drillStepSilenceSeconds | quote }}
+                # 这一步静默多久算停不在部署里：进程开工时向 `progress_bounds`
+                # 问这个作业类上一次运行量到的极值，没有那行就不判停。
                 # 这一处连的是**cog_backup**，一个只带 CREATEDB 的受限角色：演练要在
                 # 同一台服务器上 `CREATE DATABASE` 一个一次性库，所以不能是 `cog_app`
                 # （没有 CREATEDB）；而它也不需要超级用户位——恢复没有它时按外键依赖

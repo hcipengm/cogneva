@@ -148,7 +148,7 @@ pub(crate) struct RunOutcome {
 
 /// 一次 `exec` 调用的身份。看门狗按 id 记「上一次产出是什么时候」，两条并发的命令
 /// 共用一个 id 时，一边的输出会把另一边的静默盖掉。
-fn next_exec_id() -> u64 {
+pub(crate) fn next_exec_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

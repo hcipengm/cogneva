@@ -1405,7 +1405,8 @@ export interface TaskRow {
   lease_expires_at?: string | null;
   retry_not_before?: string | null;
   started_at?: string | null;
-  timeout_seconds?: number;
+  /** 这一行声明自己会花多久。不是刀：没有东西按它结束行。 */
+  declared_duration_seconds?: number;
   retry_count?: number;
   max_retries?: number;
   priority?: number;

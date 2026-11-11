@@ -73,7 +73,7 @@ fn registry_for(root: &std::path::Path) -> ToolRegistry {
     let backend: Arc<dyn SandboxBackend> = Arc::new(Checkout {
         root: root.to_path_buf(),
     });
-    let tools = SandboxTools::new(Some(backend), std::time::Duration::from_secs(60));
+    let tools = SandboxTools::new(Some(backend));
     registry.register(search_code(tools.clone()));
     registry.register(grep(tools.clone()));
     registry.register(glob(tools.clone()));
@@ -109,7 +109,6 @@ async fn sh(root: &std::path::Path, command: &str) -> SandboxResult {
             command: command.to_string(),
         },
         input: serde_json::Value::Null,
-        timeout: std::time::Duration::from_secs(30),
         limits: Default::default(),
     })
     .await

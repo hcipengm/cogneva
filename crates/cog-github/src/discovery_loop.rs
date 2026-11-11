@@ -29,10 +29,11 @@ use crate::triage::{IssueTriage, TriageDecision};
 /// 段代码的两个实例，它们防的是同一件事——两个副本各自顺着同一批 issue 追问同一句话。
 pub const DISCOVERY_ROLE: &str = "issue_discovery";
 
-/// DAG-side timeout for a single assess task (must exceed the wait budget
-/// below so the poller gives up around the same time the task would be killed).
-// cap: bound — 必须长于下面的等待预算，这样轮询放弃与任务被杀几乎同时发生
-const ASSESS_TASK_TIMEOUT_SECS: u64 = 120;
+/// What a single assess task declares it will take. Nothing ends the row at
+/// this number; it must still exceed the wait budget below, so the poller's
+/// "I stopped waiting" is the statement a round hears, not the row's.
+// cap: bound — 必须长于下面的等待预算，这样轮询放弃先于任何对行的看法
+const ASSESS_TASK_DECLARED_SECS: u64 = 120;
 /// How long the discovery loop blocks waiting for an assess verdict before it
 /// gives up and falls back to the local heuristic this round.
 // cap: bound — 等这么久拿不到判词就落回本地启发式，这一轮不再等下去
@@ -82,10 +83,10 @@ Write the question in the same language the reporter used.";
 /// Maximum cross-validation tasks running concurrently for this instance.
 // cap: bound — 这个实例同时能跑几条交叉验证
 const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
-/// DAG-side timeout for one cross-validation task (apply + workspace tests +
-/// optional eval A/B in the sandbox).
-// cap: bound — 一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以按小时计
-const CROSS_VALIDATE_TASK_TIMEOUT_SECS: u64 = 3600;
+/// What one cross-validation task declares it will take (apply + workspace
+/// tests + optional eval A/B in the sandbox).
+// cap: bound — 一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以声明按小时计
+const CROSS_VALIDATE_TASK_DECLARED_SECS: u64 = 3600;
 /// Upper bound of the per-intent exponential backoff after terminal
 /// (deterministic) upstream failures. Quota/billing windows reset on a
 /// day scale; probing more often than this cap only adds failed attempts
@@ -1968,7 +1969,7 @@ impl GitHubDiscoveryLoop {
             confidence: None,
             timestamp: Some(chrono::Utc::now()),
         });
-        task.timeout_seconds = ASSESS_TASK_TIMEOUT_SECS;
+        task.declared_duration_seconds = ASSESS_TASK_DECLARED_SECS;
         task.venue = Some("github".into());
         task.acceptance.push(assess_acceptance(&task_id));
 
@@ -2560,7 +2561,7 @@ impl GitHubDiscoveryLoop {
                 confidence: None,
                 timestamp: Some(chrono::Utc::now()),
             });
-            task.timeout_seconds = CROSS_VALIDATE_TASK_TIMEOUT_SECS;
+            task.declared_duration_seconds = CROSS_VALIDATE_TASK_DECLARED_SECS;
 
             match orchestrator.submit_goal_auto(&goal, vec![task]).await {
                 Ok(ids) => {

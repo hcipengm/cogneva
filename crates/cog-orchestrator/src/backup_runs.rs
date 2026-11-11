@@ -131,6 +131,14 @@ enum BackupReadout {
     /// behind them, counted by the store across the window rather than read off
     /// the newest drill's row.
     DrillWindowUnprovenPackages,
+    /// Drill attempts that opened and whose end nobody ever saw.
+    ///
+    /// Not `drill_latest_age_seconds` with a different label: a killed pass
+    /// leaves no row in the drill ledger at all, so the newest-row reading ages
+    /// exactly as it would if nobody had scheduled one. This counts the nights
+    /// that started and never finished, which is the only shape in which "it
+    /// was killed from outside" and "it stopped on its own criterion" differ.
+    DrillAttemptsNeverSeen,
     /// Permission violations on the credential-bearing material the drill could
     /// see: the backup volume, the offsite copy and the host state directory.
     /// The total is published for the face, and the three counts beside it say
@@ -173,6 +181,7 @@ impl BackupReadout {
         BackupReadout::SegmentSkewSeconds,
         BackupReadout::SegmentSkewBoundSeconds,
         BackupReadout::DrillWindowUnprovenPackages,
+        BackupReadout::DrillAttemptsNeverSeen,
         BackupReadout::CredentialSurfaceLive,
         BackupReadout::CredentialSurfaceViolationsBackupPvc,
         BackupReadout::CredentialSurfaceViolationsOffsite,
@@ -206,6 +215,7 @@ impl BackupReadout {
             BackupReadout::SegmentSkewSeconds => "segment_skew_seconds",
             BackupReadout::SegmentSkewBoundSeconds => "segment_skew_bound_seconds",
             BackupReadout::DrillWindowUnprovenPackages => "drill_window_unproven_packages",
+            BackupReadout::DrillAttemptsNeverSeen => "drill_attempts_never_seen",
             BackupReadout::CredentialSurfaceLive => "credential_surface_live",
             BackupReadout::CredentialSurfaceViolationsBackupPvc => {
                 "credential_surface_violations_backup_pvc"
@@ -429,6 +439,16 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
         BackupReadout::DrillWindowUnprovenPackages,
         ReadoutReader::Rule("backup_restore_drill_window_has_unproven_packages"),
     ),
+    // The one backup reading whose rule reads a *change* rather than a level:
+    // an attempt that dies leaves exactly one row, and after a first kill this
+    // counter stays above zero for good, so a rule on the value would fire once
+    // and never clear. What deserves an alert is the night that opened and did
+    // not finish, so the rule takes `increase` over the drill's own schedule --
+    // the same shape `backup_run_abandoned` already uses for the run counter.
+    (
+        BackupReadout::DrillAttemptsNeverSeen,
+        ReadoutReader::Rule("backup_restore_drill_attempt_never_finished"),
+    ),
     // The credential surface. One rule reads the total, because one open bit on
     // any of the three surfaces is the same fact: material that holds the whole
     // database is readable by an account that was never given the key. The three
@@ -592,6 +612,9 @@ fn value_of(
         // open. A green newest row and a window nobody has opened are both
         // ordinary, and only one of them is what a restore needs.
         BackupReadout::DrillWindowUnprovenPackages => Some(account.drill_unproven_packages as f64),
+        // A count of attempts whose end nobody saw. Absent is not zero here -- the
+        // field is a plain count, and a deployment that never lost a drill reads 0.
+        BackupReadout::DrillAttemptsNeverSeen => Some(account.drill_attempts_never_seen as f64),
         // The three counts are read off one drill row and each is absent on its
         // own: a directory the drill was not given is not a clean one.
         BackupReadout::CredentialSurfaceViolationsBackupPvc => drill

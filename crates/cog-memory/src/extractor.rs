@@ -382,19 +382,21 @@ impl ExtractionMemo {
     }
 }
 
-/// How long one extraction may run once an employee picks it up.
+/// How long one extraction declares it will take once an employee picks it up.
 ///
 /// A general employee answers through its own loop rather than one bounded
-/// completion, so the ceiling is the task row's, not a call's. It is set well
-/// above one model round because the loop may read a tool before it answers.
-// cap: bound — one turn of the employee's loop is a model round plus whatever tool it chooses to read; the ceiling has to fit both, or a working extraction is killed halfway and reads as a failed one.
-const EXTRACT_TASK_TIMEOUT_SECS: u64 = 180;
+/// completion, so the declaration sits on the task row, not on a call. Nothing
+/// ends the row at this number -- the holder's lease and the measured
+/// inter-step window decide when it stopped -- so it is sized above one model
+/// round because the loop may read a tool before it answers.
+// cap: bound — one turn of the employee's loop is a model round plus whatever tool it chooses to read; the declaration has to fit both, even though nothing ends the row at it.
+const EXTRACT_TASK_DECLARED_SECS: u64 = 180;
 
 /// How long the ingest pass waits for that answer before giving up on this
-/// transcript. It sits just under the task's own ceiling, so a pass that runs
-/// out of patience and the task that runs out of time are two different
-/// statements rather than the same one made twice.
-// cap: bound — ten seconds under the row's own ceiling (180): the waiter has to give up first, otherwise "we stopped waiting" and "it timed out" arrive together and the two readings cannot be told apart.
+/// transcript. It sits just under the row's declared duration, so "the pass
+/// stopped waiting" and "the row declared more than the pass will wait" are two
+/// different statements rather than the same one made twice.
+// cap: bound — ten seconds under the row's declared duration (180): the waiter has to give up first, otherwise "we stopped waiting" and "the declaration outlasted the pass" arrive together and the two readings cannot be told apart.
 const EXTRACT_WAIT_TIMEOUT_SECS: u64 = 170;
 
 /// One work item in, one answer out.
@@ -580,7 +582,7 @@ impl AgentMemoryExtractor {
             confidence: None,
             timestamp: Some(chrono::Utc::now()),
         });
-        task.timeout_seconds = EXTRACT_TASK_TIMEOUT_SECS;
+        task.declared_duration_seconds = EXTRACT_TASK_DECLARED_SECS;
         // 这件活落在 memory 这个场地上。场地是活上的标签，不是接活那个人的
         // 身份：同一个员工明天接 wiki 的活，仍是同一个人。
         task.venue = Some("memory".into());

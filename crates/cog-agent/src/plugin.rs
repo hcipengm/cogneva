@@ -417,7 +417,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // ── ToolRegistry ──
         let tool_registry = Arc::new(
             crate::ToolRegistry::new()
-                .with_sandbox_backend(sandbox_backend)
+                .with_sandbox_backend(sandbox_backend.clone())
                 .with_guardrail(guardrail)
                 .with_plugin_registry(plugin_registry)
                 .with_require_identity(require_tool_identity),

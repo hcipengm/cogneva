@@ -28,6 +28,15 @@ pub const CONFIG_DIR: &str = "/etc/cogneva";
 pub const CONFIG_FILE_NAME: &str = "cogneva.json";
 /// The runtime directory (sockets, pids) the deployment mounts.
 pub const RUN_DIR: &str = "/run/cogneva";
+/// 作业类 Pod 里那块「还在动」的空卷。
+///
+/// 不挂在 [`RUN_DIR`] 下是有意的：那一棵由宿主机挂进来，按 Pod 之外的生命期算；这一块是
+/// 每个 Pod 自己的 `emptyDir`，随 Pod 生死。两个生命期不同的东西共用一棵树，下一次有人
+/// 「顺手」把其中一棵换个挂法，另一棵就读到一个空目录——而空目录报出来的是「还没有数据」。
+pub const PROGRESS_DIR: &str = "/var/run/cogneva-progress";
+/// [`PROGRESS_DIR`] 里那份「最近一拍」。作业进程写它，容器外的探针与看护方读它；写者与
+/// 读者必须拼同一个字符串，所以只有这一处拼。
+pub const PROGRESS_FILE: &str = "/var/run/cogneva-progress/beat";
 /// Where the deployment mounts the bare git repository the evolution loop reads
 /// and the change jobs clone from.
 pub const TREE_REPO: &str = "/host-git";

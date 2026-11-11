@@ -542,19 +542,20 @@ pub enum TaskEvent {
     },
     TaskTimeout {
         task_id: String,
-        timeout_seconds: u64,
+        declared_duration_seconds: u64,
         timestamp: DateTime<Utc>,
     },
     /// A running attempt stopped doing anything: no step for longer than this
     /// deployment's measured inter-step window.
     ///
-    /// Distinct from [`Self::TaskTimeout`] even though both end a run: a
-    /// timeout says the run spent a declared allowance, which is a statement
-    /// about the allowance; this says the run moved zero steps for a window
-    /// measured from what the fleet actually does, which is a statement about
-    /// the run. A reader given `TaskTimeout` for a stall would conclude the
-    /// declared budget was too small and raise it — the change that never
-    /// helped, because the budget was never what the stuck run exhausted.
+    /// Distinct from [`Self::TaskTimeout`] even though both describe a run that
+    /// went on too long: a timeout compares the run against the duration its
+    /// submitter declared, which is a statement about that declaration; this
+    /// says the run moved zero steps for a window measured from what the fleet
+    /// actually does, which is a statement about the run. A reader given
+    /// `TaskTimeout` for a stall would conclude the declared duration was too
+    /// small and raise it — the change that never helped, because the
+    /// declaration was never what the stuck run exhausted.
     ///
     /// Both numbers travel: `silent_secs` alone cannot be judged without the
     /// window it was compared against, since the same silence is normal on a
@@ -567,10 +568,10 @@ pub enum TaskEvent {
     },
     /// A running task stopped being renewed by whoever held it. Distinct from
     /// [`Self::TaskTimeout`] because the two say opposite things to a reader:
-    /// a timeout is a run that spent its whole budget, while this is a run
-    /// nobody is holding any more, reclaimed long before its budget elapsed.
-    /// Folding the two into `TaskTimeout` would make a restart read as a run
-    /// that used everything it was given.
+    /// a timeout is a run that outlived the duration its submitter declared,
+    /// while this is a run nobody is holding any more, reclaimed long before
+    /// that duration elapsed. Folding the two into `TaskTimeout` would make a
+    /// restart read as a run that used everything it was given.
     TaskLeaseExpired {
         task_id: String,
         /// The process whose renewal stopped. Absent only for a row written

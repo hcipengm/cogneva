@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -57,8 +57,8 @@ const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 /// 与「没配」同形。
 const BACKUP_DIR_ENV: &str = "COGNEVA_BACKUP_DIR";
 const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
-/// 演练静默多久算停（秒）。「静默」是**一步之内也没有一块数据搬动**，不是这一步
-/// 走了多久。
+/// 演练静默多久算停：**这一步之内也没有一处推进**，不是这一步走了多久，也不是部署里
+/// 写死的一个数。
 ///
 /// 判据从「这一趟总共用了多久」换成「还有没有在搬」：一趟开得慢不是问题，停下来才是。
 /// 旧的那个数是整趟的钟，它杀的是**还在一步一步往前走**的运行——2026-10-27 实测：
@@ -66,19 +66,12 @@ const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
 ///
 /// 光把单位从整趟换到单步还不够：一次 COPY 一张几百万行的表，能在这「一步」里跑上
 /// 几十分钟，边界上仍然只有一次拍，于是「灌得很久」与「灌不动了」读起来一样。所以
-/// 导出、灌回、打包、解包、算摘要这五条搬数据的路都按块记拍（[`BeatsOnIo`]）——只要
-/// 还有一块进去，这一跑就还在动，判词也就不会落在它身上。
-const DRILL_STEP_SILENCE_ENV: &str = "COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS";
-/// 没配 env 时那一步的静默界：**不另起一个数**，就是容器探针读的那个窗口下限
-/// （[`cog_core::progress::PROGRESS_FILE_WINDOW_FLOOR_SECS`]）。
+/// 导出、灌回、打包、解包、算摘要这五条搬数据的路都按块记拍（[`BeatsOnIo`]），对面
+/// 还在执行时另有一条证据（[`PEER_PROGRESS_TASK`]）——只要还有一条通道在前进，这一跑
+/// 就还在动，判词也就不会落在它身上。
 ///
-/// 同一趟运行上有两个读者问同一件事：本进程的看门狗先问，问到了就自己收尾、把
-/// `failed` 连同步名落进账本；容器探针后问，问到了由 kubelet 把容器判掉。探针要连着
-/// 失败 [`cog_core::progress::PROBE_FAILURE_THRESHOLD`] 次才判停，所以自报这一侧天然
-/// 先开口——前提是两个窗口同源。这里若另写一个字面量，改了一处没改另一处，看门狗
-/// 就会在探针还认为在动的时候先收尾，或者说出口的时候容器已经被判掉、账上那行没写。
-// cap: derived — 从探针窗口下限派生（同一趟运行、同一件事、同一个窗口）；清单里那个 env 是它的覆盖，门在 deploy/scripts/tests/backup-jobs-stop-on-silence.test.sh
-const DRILL_STEP_SILENCE_DEFAULT_SECS: u64 = cog_core::progress::PROGRESS_FILE_WINDOW_FLOOR_SECS;
+/// 界本身不在这里：它是这个作业类上一次运行量到的最长间隔（`progress_bounds`），
+/// 开工时采纳（[`load_measured_bound`]）。量不到就不判停。
 const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
 const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 
@@ -751,6 +744,9 @@ pub async fn backup_postgres(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
+    // 从这一刻起，对面还在执行就是证据：导出最先的几十分钟常常花在服务端把查询跑完上，
+    // 那一整段我们这侧一个字节都没读到。
+    let _peer = backend_pid(&mut tx).await.map(|pid| watch_peer(pool, pid));
 
     let tables: Vec<String> = sqlx::query_scalar(DISCOVER_TABLES_SQL)
         .fetch_all(&mut *tx)
@@ -898,6 +894,9 @@ pub async fn restore_postgres(
             .await?;
         let mut load = tables.clone();
         let mut tx = pool.begin().await?;
+        // 同导出：`COPY … FROM STDIN` 在最后等服务端把这一张表收完，那一段我们这侧
+        // 没有一块数据可搬，只有对面那条后端仍然 active 这一条证据。
+        let _peer = backend_pid(&mut tx).await.map(|pid| watch_peer(pool, pid));
         if is_superuser {
             sqlx::query("SET LOCAL session_replication_role = 'replica'")
                 .execute(&mut *tx)
@@ -1754,6 +1753,10 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
     // 开工先记一拍：容器外的存活探针从这一刻起就有东西可读，这一跑在导出、快照这些
     // 不印日志的段里也一直「在动」。
     cog_core::progress::beat(BACKUP_PROGRESS_TASK);
+    // 同演练：界是上一次运行量出来的，开工时采纳；量不到就是没有界，这一跑不判停。
+    load_measured_bound(&cfg.database_url, BACKUP_BOUND_CLASS)
+        .await
+        .adopt();
     std::fs::create_dir_all(&cfg.backup_dir)?;
     let now = Utc::now();
     let staging_name = package_name(now)
@@ -1830,7 +1833,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
         }
     }
 
-    match finish_backup(cfg, now, &staging, &staging_name).await {
+    let result = match finish_backup(cfg, now, &staging, &staging_name).await {
         Ok(left) => {
             record_run(
                 run_store.as_ref(),
@@ -1875,7 +1878,11 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
             .await;
             Err(e)
         }
-    }
+    };
+    // 这一跑量到的最长一次间隔留给下一趟。成功与失败都写：失败那一趟停下之前走过的
+    // 步骤，同样是这个作业类的真实快慢。
+    record_measured_bound(&cfg.database_url, BACKUP_BOUND_CLASS).await;
+    result
 }
 
 /// 把刚打好的包再复制一份到卷外，并按同样的份数裁掉旧的。
@@ -3982,11 +3989,6 @@ pub struct DrillConfig {
     /// 只开最新那份证明不了保留窗口的其余成员：旧包与读端不同步的问题只在它们
     /// 身上出现，而它们要到真正需要恢复的那天才第一次被打开。
     pub also_unproven: bool,
-    /// 多久没有一处推进算停。到点由这一跑自己收尾并落一行 `failed`，判词点名停在
-    /// 哪一步、静默了多久——而不是等 kubelet 的存活探针把容器杀掉，那样账上一行
-    /// 都不会有。整趟不受这条界约束，一步之内也不受：只要还有一块数据在搬，跑多久
-    /// 都行（记拍的粒度见 [`DATA_PROGRESS_TASK`]）。
-    pub step_silence: Duration,
 }
 
 impl DrillConfig {
@@ -4011,27 +4013,8 @@ impl DrillConfig {
             migrations_dir: cog_storage::migrate::migrations_dir(&app_dir),
             package,
             also_unproven,
-            step_silence: step_silence_from_env(),
         })
     }
-}
-
-/// 一步的静默界：`COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS`，没配或读不成数就用默认值。
-///
-/// 读不成数不报错：一个拼错的 env 让演练整场起不来，比让它按默认值跑一趟更坏——
-/// 起不来的那一晚，账上没有任何一行说为什么。
-fn step_silence_from_env() -> Duration {
-    step_silence_from(std::env::var(DRILL_STEP_SILENCE_ENV).ok().as_deref())
-}
-
-/// 解析那一格。`None`、空串、零、非数一律落到默认值：这四种写法在这里是同一件事
-/// （没给出可用的界），而它们各自的来历留给读 env 的人，不该让演练从此起不来。
-fn step_silence_from(raw: Option<&str>) -> Duration {
-    let secs = raw
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(DRILL_STEP_SILENCE_DEFAULT_SECS);
-    Duration::from_secs(secs)
 }
 
 /// `backup-drill` 自己在子命令之后认的那个操作数。
@@ -4742,9 +4725,75 @@ const BACKUP_PROGRESS_TASK: &str = "backup";
 /// 跟**工作量**走：搬过一块，就是一拍。
 const DATA_PROGRESS_TASK: &str = "backup-data";
 
+/// 对面还在干活的证据：库在这条事务上仍然在执行。
+///
+/// 有一整类「看起来什么也没动、其实正在干活」的时刻，本进程这一侧一个字节都读不到：
+/// 大表 COPY 之前服务端还要把查询跑完、一条几千万行的 COPY 在 `finish` 上等服务端
+/// 收尾。这些时刻 CPU 是平的、读到的字节是零，与卡死同形。唯一还看得见的证据在对面：
+/// `pg_stat_activity` 里那条后端仍然 active。它记的是 [`cog_core::progress::mark`]，
+/// 不进间隔水库——对面每秒报一次活会把水库填成一秒的间隔，把实测极值压低。
+const PEER_PROGRESS_TASK: &str = "backup-peer";
+
+/// 判这一步「还在不在动」的那几拍：步骤开工、搬过一块、对面还在执行。
+///
+/// 三选一即可：任何一条通道还在前进，这一步就没有静默。判据只有这一份，
+/// 看门狗、探针与账上的判词都读它。
+const WATCHED_TASKS: [&str; 3] = [DRILL_PROGRESS_TASK, DATA_PROGRESS_TASK, PEER_PROGRESS_TASK];
+
+/// 对面这条后台查询还活着的时长：自己消失了就退出，不额外留住一条连接。
+struct PeerWatch {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PeerWatch {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// 盯着「这条后端还在不在执行」，在就记一拍。
+///
+/// 用池里另借一条连接去读 `pg_stat_activity`：正在 COPY 的那条连接上是发不出查询的，
+/// 而它什么时候在等、等多久，只有从旁边看才看得见。借不到连接就不记——一条读不到的
+/// 证据比一条编出来的证据好：编出来的会把卡死读成活。
+fn watch_peer(pool: &PgPool, pid: i32) -> PeerWatch {
+    let pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(cog_core::progress::WATCH_TICK).await;
+            // 在等锁也算「还在执行」：等锁的后端是个活着的后端，它只是排在别人后面。
+            // 把它排除掉，一个排在长事务后面等了一刻钟的 COPY 就会在本进程这条通道上
+            // 读成静默——而它一动没动错，错的是我们只数了「在跑」没数「在等」。
+            let state: Result<Option<bool>, sqlx::Error> =
+                sqlx::query_scalar("SELECT state = 'active' FROM pg_stat_activity WHERE pid = $1")
+                    .bind(pid)
+                    .fetch_optional(&pool)
+                    .await;
+            match state {
+                Ok(Some(true)) => cog_core::progress::mark(PEER_PROGRESS_TASK),
+                // 这条后端已经不在、或者不在执行：没有证据，什么也不写。
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "读不到对面的状态，这一趟只剩本进程的记拍");
+                    break;
+                }
+            }
+        }
+    });
+    PeerWatch { handle }
+}
+
+/// 这条连接的后端 pid。读不到时返回 `None`：那是「没装上这条证据」，不是「它没在干活」。
+async fn backend_pid(tx: &mut sqlx::PgConnection) -> Option<i32> {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .ok()
+}
+
 /// 搬多少字节记一拍。它只决定读数的分辨率，不参与任何判断——判据是「多久没有一拍」，
 /// 拍子越密，「静默」越接近「真的没在搬」。
-// cap: fixed — 记拍粒度，不是界；界是那个静默窗口
+// cap: bound — 记拍粒度钉在这里，不是界；界是那个实测静默窗口
 const PROGRESS_BYTES_PER_BEAT: usize = 4 * 1024 * 1024;
 
 /// 每搬过 [`PROGRESS_BYTES_PER_BEAT`] 字节记一拍。
@@ -4800,60 +4849,166 @@ impl<T: std::io::Write> std::io::Write for BeatsOnIo<T> {
 /// 它同时就是进度文件的那一拍：容器外的存活探针读的是同一串拍子，所以两处不会一个
 /// 说在动、一个说停了。
 struct PassWatch {
-    current: std::sync::Mutex<StepClock>,
-}
-
-struct StepClock {
-    step: &'static str,
-    since: Instant,
+    current: std::sync::Mutex<&'static str>,
 }
 
 impl PassWatch {
     fn new(first: &'static str) -> Self {
         Self {
-            current: std::sync::Mutex::new(StepClock {
-                step: first,
-                since: Instant::now(),
-            }),
+            current: std::sync::Mutex::new(first),
         }
     }
 
     /// 记一步。名字是**静默时判词要点名的那一个**，所以它写的是这一步在干什么，
     /// 不是承载它的函数名。
     fn step(&self, name: &'static str) {
-        *self.current.lock().unwrap_or_else(|p| p.into_inner()) = StepClock {
-            step: name,
-            since: Instant::now(),
-        };
+        *self.current.lock().unwrap_or_else(|p| p.into_inner()) = name;
         cog_core::progress::beat(DRILL_PROGRESS_TASK);
     }
 
-    fn silent_for(&self) -> (&'static str, Duration) {
-        let current = self.current.lock().unwrap_or_else(|p| p.into_inner());
-        let step_silent = current.since.elapsed();
-        // 一步之内也在记拍：搬数据的循环每搬过一块就记一拍。最近一拍比这一步开工更近
-        // 时，静默从那一拍算起——否则「一张表灌了四十分钟」会被读成「这一步静默了四十分钟」，
-        // 而它明明一直在搬。判的是有没有动静，不是这一段花了多久。
-        let beat_silent = [DRILL_PROGRESS_TASK, DATA_PROGRESS_TASK]
-            .into_iter()
-            .filter_map(cog_core::progress::last_beat)
-            .map(|instant| instant.elapsed())
-            .min();
-        let silent = beat_silent
-            .filter(|beat| *beat < step_silent)
-            .unwrap_or(step_silent);
-        (current.step, silent)
+    /// 等到这一步静默超过**这个作业类实测到的**极值，返回（哪一步，静默了多久，那道界）。
+    ///
+    /// 界不是这里给的，是 [`cog_core::declared_wall::wait_until_stalled`] 回答的：它取
+    /// 这一跑开工时采纳的上一次运行的极值，以及这一跑自己量到的样本。量不到时它就
+    /// 不返回 —— 也就是说，在有人量过之前，这一跑不判停。
+    ///
+    /// 静默从**最近的那一拍**算起，而拍子有好几条通道：搬数据的循环每搬过一块记一拍，
+    /// 对面还在执行也记一拍。少了这一层，一张表灌了四十分钟会被读成「这一步静默了
+    /// 四十分钟」——判据就成了「这一步走了多久」，正是要拆掉的那种墙。
+    async fn stalled(&self) -> (&'static str, Duration, Duration) {
+        let (silent, bound) = cog_core::declared_wall::wait_until_stalled(&WATCHED_TASKS).await;
+        let step = *self.current.lock().unwrap_or_else(|p| p.into_inner());
+        (step, silent, bound)
     }
+}
 
-    /// 等到当前这一步静默超过 `window`，返回（哪一步，静默了多久）。
-    async fn silent_past(&self, window: Duration) -> (&'static str, Duration) {
-        loop {
-            tokio::time::sleep(cog_core::progress::WATCH_TICK).await;
-            let (step, silent) = self.silent_for();
-            if silent > window {
-                return (step, silent);
-            }
-        }
+/// 这个作业类在 `progress_bounds` 里的名字。备份与演练各一行：两者的步骤快慢毫无关系，
+/// 共用一个界只会让慢的那个把快的拖进误杀。
+const DRILL_BOUND_CLASS: &str = "backup-drill";
+
+/// 备份那一趟自己的界。与演练分开，理由同上。
+const BACKUP_BOUND_CLASS: &str = "backup";
+
+/// 上一次运行量到的最长间隔，读不到的每一种情形都是
+/// [`cog_core::declared_wall::Bound::Unmeasured`]。
+///
+/// 读不到（表还没有、库暂时连不上）与「没有记录」在这里是同一件事：这一跑没有界，
+/// 不判停。两种情况都不该让一趟开工失败——界是读数，不是开工资格。
+async fn load_measured_bound(database_url: &str, class: &str) -> cog_core::declared_wall::Bound {
+    use cog_core::declared_wall::Bound;
+    use sqlx::Connection as _;
+    let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await else {
+        return Bound::Unmeasured;
+    };
+    let secs: Option<f64> =
+        sqlx::query_scalar("SELECT longest_gap_seconds FROM progress_bounds WHERE job_class = $1")
+            .bind(class)
+            .fetch_optional(&mut conn)
+            .await
+            .ok()
+            .flatten();
+    Bound::from_stored(secs)
+}
+
+/// 把这一跑**自己量到**的最长一次间隔写回去，供下一趟在开工时采纳。
+///
+/// 写的是这一跑的读数，不取历史最大值：一个只会变宽的界和常量是同一种毛病——它不再
+/// 跟着实际发生的事情变。这一跑没量到就不写，让上一次的数留着：把 0 或极小值写回去
+/// 会让下一趟拿一个不存在的界去判停。
+async fn record_measured_bound(database_url: &str, class: &str) {
+    use cog_core::declared_wall::Bound;
+    let Bound::Measured(gap) = Bound::observed() else {
+        return;
+    };
+    use sqlx::Connection as _;
+    let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await else {
+        return;
+    };
+    let samples = cog_core::progress::gap_sample_count() as i64;
+    if let Err(e) = sqlx::query(
+        "INSERT INTO progress_bounds (job_class, longest_gap_seconds, samples, observed_at) \
+         VALUES ($1, $2, $3, now()) \
+         ON CONFLICT (job_class) DO UPDATE SET \
+           longest_gap_seconds = EXCLUDED.longest_gap_seconds, \
+           samples = EXCLUDED.samples, \
+           observed_at = EXCLUDED.observed_at",
+    )
+    .bind(class)
+    .bind(gap.as_secs_f64())
+    .bind(samples)
+    .execute(&mut conn)
+    .await
+    {
+        tracing::warn!(class, error = %e, "实测界没能写回去：下一趟仍按上一次的数跑");
+    }
+}
+
+/// 这一趟演练**开过工**：在收尾之前先落一行。
+///
+/// 收尾那一行（`backup_drills`）是结论，写在最后。于是一个被容器外探针杀掉的进程
+/// 什么都不留，那一夜在账上与「根本没跑」同形——而它跑到了半路，可能已经建了一半
+/// 临时库。开工先写一行，收尾再把它合上，三种形状就分开了：有 `finished_at`（自己
+/// 走到了收尾）、有行没 `finished_at`（开过工，结局没被任何人看见）、没有行（没开过）。
+///
+/// 写不进去只是少一种读法，不是这一趟不能跑：它是证据，不是开工资格。
+async fn open_drill_attempt(
+    database_url: &str,
+    drill_id: &str,
+    started_at: chrono::DateTime<Utc>,
+    opening_bound: &str,
+) {
+    use sqlx::Connection as _;
+    let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await else {
+        return;
+    };
+    // 先把上一趟没合上的合上：被杀掉的进程回不来写自己那一行，而一行永远开着就等于
+    // 说「它还在跑」。和 `backup_runs` 的 `abandon_overdue` 同一条道理，区别只是这里
+    // 由下一趟开工顺手扫——演练同时只许一场（会话咨询锁），所以开工那一刻之前还开着的
+    // 只可能是上一次没走完的那一场。
+    if let Err(e) = sqlx::query(
+        "UPDATE backup_drill_attempts SET finished_at = now(), ended_by = 'never_seen' \
+         WHERE ended_by IS NULL AND drill_id <> $1",
+    )
+    .bind(drill_id)
+    .execute(&mut conn)
+    .await
+    {
+        tracing::warn!(drill_id, error = %e, "上一次没走完的开工行没合上：账上会多一行「还在飞」");
+    }
+    if let Err(e) = sqlx::query(
+        "INSERT INTO backup_drill_attempts (drill_id, started_at, opening_silence_bound) \
+         VALUES ($1, $2, $3) ON CONFLICT (drill_id) DO NOTHING",
+    )
+    .bind(drill_id)
+    .bind(started_at)
+    .bind(opening_bound)
+    .execute(&mut conn)
+    .await
+    {
+        tracing::warn!(drill_id, error = %e, "开工那一行没落下来：这一趟若被杀掉，账上读得出「没跑」而读不出「跑到半路」");
+    }
+}
+
+/// 这一趟走到了收尾，把开工那一行合上。
+///
+/// 只有走到这里的那一趟才会合上它；被外部杀掉的那一趟永远停在这一步之前，于是
+/// 「开过工、结局没被看见」在账上是一个可查的形状，而不是一句推测。
+async fn close_drill_attempt(database_url: &str, drill_id: &str) {
+    use sqlx::Connection as _;
+    let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await else {
+        return;
+    };
+    // 收尾的时刻取库里的 now()：与 `started_at` 同一个钟（那一格也是这么写的），
+    // 表上的 `finished_at >= started_at` 才不会因为两个钟的偏差把这一趟读成倒流。
+    if let Err(e) = sqlx::query(
+        "UPDATE backup_drill_attempts SET finished_at = now(), ended_by = 'itself' \
+         WHERE drill_id = $1 AND ended_by IS NULL",
+    )
+    .bind(drill_id)
+    .execute(&mut conn)
+    .await
+    {
+        tracing::warn!(drill_id, error = %e, "收尾没合上开工那一行：这一趟会被读成「结局没被看见」");
     }
 }
 
@@ -4873,6 +5028,7 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         package_bytes: None,
         restore_source: None,
         restore_target: None,
+        silence_bound: None,
         segment_skew_seconds: None,
         segment_skew_bound_seconds: None,
         packages_on_volume: 0,
@@ -4953,11 +5109,25 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     // 判的是**这一步静默了多久**，不是这一趟花了多久。到点由这一跑自己收尾并落
     // 一行，判词点名停在哪一步；而不是等 kubelet 的探针把容器杀掉——那样账上什么都
     // 不留，「被杀」于是读作「没跑过」，集群面只看见一个重启计数，说不出是哪一份包。
+    // 上一次运行量到的极值先装进来：这一跑从开工起就有一个别人量过的界，而不是等自己
+    // 攒够样本。量不到（这个作业类还从没成功跑完过）就是没有界，这一跑不判停。
+    load_measured_bound(&cfg.database_url, DRILL_BOUND_CLASS)
+        .await
+        .adopt();
+    // 开工这一行先落下去，带着**开工时**那个界。界在收尾时可能已经不同（这一跑自己
+    // 攒到了样本），两处都写、各写各的时刻，才读得出「这一趟是按什么开始、按什么结束」。
+    open_drill_attempt(
+        &cfg.database_url,
+        &drill.drill_id,
+        drill.started_at,
+        &cog_core::declared_wall::Bound::now().words(),
+    )
+    .await;
     let watch = PassWatch::new("开工");
     let outcome = tokio::select! {
         done = drill_once(cfg, live, packages, &mut drill, &watch) => Some(done),
-        (step, silent) = watch.silent_past(cfg.step_silence) => {
-            mark_pass_silent(&mut drill, step, silent, cfg.step_silence);
+        (step, silent, bound) = watch.stalled() => {
+            mark_pass_silent(&mut drill, step, silent, bound);
             None
         }
     };
@@ -4974,6 +5144,18 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         None => {}
     }
     drill.finished_at = Utc::now();
+    // 这一趟是**按哪个界在跑**，与这一趟自己量到的最长间隔一起写进行上。判停的界只住在
+    // `progress_bounds` 的当前值里，下一趟收尾就把它覆盖；没有这一格，一趟跑成功的、
+    // 被外部杀掉的、从没跑过的演练，事后都说不出它当时有没有一个界、界是多少。
+    // 词与进度文件同一份（[`cog_core::declared_wall::Bound::words`]）：`unbounded` 是
+    // 「还没有人量过」，不是缺席。
+    drill.silence_bound = Some(cog_core::declared_wall::Bound::now().words());
+    // 这一跑量到的最长一次间隔留给下一趟当开工时的界。写在收尾之后：哪怕这一趟是
+    // 被自己的判据停下的，它停下之前走过的那些步骤仍然是这个作业类的真实快慢。
+    record_measured_bound(&cfg.database_url, DRILL_BOUND_CLASS).await;
+    // 走到这里说明这一趟看见了结尾。合上开工那一行之后，账上剩下的没合上的行就都是
+    // 「开过工、结局没被任何人看见」——被探针杀掉的那一趟正是其中之一。
+    close_drill_attempt(&cfg.database_url, &drill.drill_id).await;
     drill
 }
 
@@ -4985,13 +5167,14 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
 ///
 /// 判词必须点名**哪一步**：整趟的钟到期时读的人只知道「花了很久」，而一步的钟到期
 /// 是一条可以直接去查的线索——卡在「恢复」与卡在「解包」是两件修法完全不同的事。
-fn mark_pass_silent(drill: &mut BackupDrillRecord, step: &str, silent: Duration, window: Duration) {
+fn mark_pass_silent(drill: &mut BackupDrillRecord, step: &str, silent: Duration, bound: Duration) {
     drill.error = Some(format!(
-        "这一趟停在「{step}」上，那一步已经 {} 秒没有推进（界 {} 秒，{DRILL_STEP_SILENCE_ENV}）。\
+        "这一趟停在「{step}」上，那一步已经 {} 秒没有推进：没有一块数据在搬，对面也不在执行。\
+         判据取的是这个作业类实测到的最长一次间隔（{} 秒），不是部署里写死的钟。\
          本行其余读数是走到那一步之前量到的：表数与行数为空 ＝ 还没走到对数那一段，不是零张表。\
          整趟不受时长约束——它在每一步都推进的时候不会被收尾。",
         silent.as_secs(),
-        window.as_secs(),
+        bound.as_secs(),
     ));
 }
 
@@ -5906,6 +6089,7 @@ mod tests {
             package_bytes: None,
             restore_source: Some("postgres:5432/cogneva".into()),
             restore_target: None,
+            silence_bound: None,
             segment_skew_seconds: None,
             segment_skew_bound_seconds: None,
             packages_on_volume: 7,
@@ -5959,41 +6143,96 @@ mod tests {
     /// 「这一步走了多久」一条路——那就是按时间杀活，正是要拆掉的那种。
     #[tokio::test]
     async fn a_chunk_moving_inside_a_step_keeps_the_watch_from_reading_silence() {
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        // 界摆在 200 毫秒：这个测试自己的等待就要越过它，于是「有没有新的一拍」
+        // 成了两次读数之间唯一的差别。
+        cog_core::progress::adopt_longest_gap(Duration::from_millis(200));
         let watch = PassWatch::new("恢复：灌数据");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        watch.step("恢复：灌数据");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_some(),
+            "没有任何一处推进时，界就该成立——不然下一句证明不了是那一拍把它救回来的"
+        );
         cog_core::progress::beat(DATA_PROGRESS_TASK);
-        let (step, silent) = watch.silent_for();
-        assert_eq!(step, "恢复：灌数据");
         assert!(
-            silent < Duration::from_millis(150),
-            "刚搬过一块的步骤仍被读成静默 {silent:?}：判据又回到了「这一步走了多久」"
+            cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_none(),
+            "刚搬过一块仍被读成静默：判据又回到了「这一步走了多久」"
         );
+        cog_core::progress::reset_for_tests();
     }
 
-    /// 界读不成数时按默认值跑，而不是让整场演练起不来——起不来的那一晚，
-    /// 账上连一行说「为什么」的都没有。
-    #[test]
-    fn a_silence_window_that_cannot_be_read_falls_back_instead_of_stopping_the_drill() {
-        let default = Duration::from_secs(DRILL_STEP_SILENCE_DEFAULT_SECS);
-        for raw in [None, Some(""), Some("  "), Some("0"), Some("ten")] {
-            assert_eq!(step_silence_from(raw), default, "raw={raw:?}");
-        }
-        assert_eq!(step_silence_from(Some(" 900 ")), Duration::from_secs(900));
-    }
-
-    /// 自报的那一侧必须先开口：容器探针一判停容器就没了，账上那行也就写不下去。
+    /// 这个作业类还没有一条实测界时，判据不成立：这一跑不会被一个没人量过的数收尾。
     ///
-    /// 探针最早在「窗口 + (threshold-1) 个读取周期」才判停，所以自报的界只要不晚于
-    /// 窗口，它就一定有机会把那句 `failed` 写进账本。这条量的是那个先后，不是相等——
-    /// 往小改是允许的（更早自报），往大改就是把判词交给 kubelet。
+    /// 这正是 3600 被删掉之后要守的东西。若哪天有人为了让「看起来能判停」给它补一个
+    /// 默认值，这条会红——那时它已经不是一个读数，而是一个挑出来的钟。
     #[test]
-    fn the_watchdog_speaks_no_later_than_the_probe_can_kill() {
-        let probe_window = Duration::from_secs(cog_core::progress::PROGRESS_FILE_WINDOW_FLOOR_SECS);
-        let watchdog = step_silence_from(None);
-        assert!(
-            watchdog <= probe_window,
-            "自报的静默界 {watchdog:?} 晚于探针窗口 {probe_window:?}：那时容器已经被判掉，账上不会有这一行"
+    fn a_class_without_a_measured_bound_does_not_stop_a_pass() {
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::beat(DRILL_PROGRESS_TASK);
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            cog_core::declared_wall::Bound::now(),
+            cog_core::declared_wall::Bound::Unmeasured,
+            "没有样本也没有采纳值时，界必须是「量不到」"
         );
+        assert!(
+            cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_none(),
+            "没有实测界时判停不成立：拿一个挑出来的数杀掉还在干的活是这里最贵的错误"
+        );
+        cog_core::progress::reset_for_tests();
+    }
+
+    /// 采纳一条实测界之后，同一组通道立刻可以判停——判据跟着读数走，不是反过来。
+    #[test]
+    fn an_adopted_bound_is_what_the_pass_is_judged_against() {
+        use cog_core::declared_wall::Bound;
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::beat(DRILL_PROGRESS_TASK);
+        Bound::Measured(Duration::from_millis(5)).adopt();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let (silent, bound) = cog_core::declared_wall::stall_any(&WATCHED_TASKS)
+            .expect("静默超过采纳的界，就该有判词");
+        assert_eq!(bound, Duration::from_millis(5));
+        assert!(silent > bound);
+        cog_core::progress::reset_for_tests();
+    }
+
+    /// 闭环的两个方向各走一趟：读不出来的那一格装不进判据，量到的极值装进去就能改判。
+    ///
+    /// 这条量的是「换输入 ⇒ 值跟着变」：同一个作业类，持久面写 0 秒与写 5 毫秒，判停的
+    /// 结论必须不同。两次一样，就说明读的那一步没接上，界仍是某处的常量。
+    #[test]
+    fn the_closed_loop_between_the_store_and_the_judgement_is_live() {
+        use cog_core::declared_wall::Bound;
+        let _serial = cog_core::progress::test_lock();
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::beat(DRILL_PROGRESS_TASK);
+        std::thread::sleep(Duration::from_millis(30));
+
+        // 持久面写了 0：读作「量不到」，装进判据后仍然不判停。
+        Bound::from_stored(Some(0.0)).adopt();
+        assert_eq!(Bound::now(), Bound::Unmeasured);
+        assert!(cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_none());
+
+        // 持久面写的是一条实测：装进去，同一组通道立刻判停。
+        Bound::from_stored(Some(0.005)).adopt();
+        assert!(cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_some());
+
+        // 写回持久面的那个数是这一跑自己量到的，不是采纳进来的那个。这里比的是
+        // 「没有被采纳值顶替」，不是「一定量不到」：同一进程里别的用例也在打拍，
+        // 它们会留下自己的间隔样本，而这一条要证的是闭环的方向，不是样本的清零。
+        assert_ne!(
+            Bound::observed(),
+            Bound::Measured(Duration::from_millis(5)),
+            "the adopted window leaked into the reading written back"
+        );
+        cog_core::progress::reset_for_tests();
     }
 
     #[test]
@@ -6673,6 +6912,7 @@ mod tests {
             package_bytes: Some(1),
             restore_source: Some("postgres:5432/cogneva".into()),
             restore_target: Some("postgres:5432/cogneva_drill".into()),
+            silence_bound: None,
             segment_skew_seconds: Some(1),
             segment_skew_bound_seconds: Some(300),
             packages_on_volume: 1,

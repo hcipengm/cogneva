@@ -33,7 +33,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = cog_extension::executor_backend(system.sandbox_executor_url.clone())?;
     let registry = cog_agent::ToolRegistry::new()
-        .with_sandbox_backend(backend)
+        .with_sandbox_backend(backend.clone())
         .with_guardrail(cog_guardrail::build_default_guardrail(Arc::new(
             cog_guardrail::InMemoryAuditRecorder::new(),
         )))

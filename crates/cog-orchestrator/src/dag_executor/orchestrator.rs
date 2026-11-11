@@ -226,9 +226,9 @@ fn reclaim_cause(
     // 信标是进程内的，所以这活不是本进程在跑时这里读不到它——那时 `None` 说的
     // 是「我看不见」，不是「它死了」。窗口没量出来时同样不判：`None` 是「这份
     // 部署还没跑够步数去量」，折成一个默认秒数就是又一个没人量过的墙。两种
-    // `None` 对调用方是同一个答案，所以判据只写在一处（`progress::stall`），
+    // `None` 对调用方是同一个答案，所以判据只写在一处（`declared_wall::stall`），
     // 执行侧那道守护读的是同一条。
-    let (silent, window) = cog_core::progress::stall(&task.id)?;
+    let (silent, window) = cog_core::declared_wall::stall(&task.id)?;
     Some(ReclaimCause::Silent { silent, window })
 }
 
@@ -7508,7 +7508,7 @@ mod tests {
             let t = inner.tasks.get_mut("t-expired").unwrap();
             t.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
             t.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
-            t.timeout_seconds = 3600;
+            t.declared_duration_seconds = 3600;
         }
 
         let results = dag.check_timeouts().await;
@@ -7554,7 +7554,7 @@ mod tests {
             t.retry_count = spent;
             t.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
             t.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
-            t.timeout_seconds = 3600;
+            t.declared_duration_seconds = 3600;
         }
 
         let results = dag.check_timeouts().await;
@@ -7592,7 +7592,7 @@ mod tests {
         row.retry_count = spent;
         row.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
         row.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
-        row.timeout_seconds = 3600;
+        row.declared_duration_seconds = 3600;
         backend
             .dag_set_task("ws-lease-nc-fg", "t-nc-fg", &row)
             .await
@@ -7675,6 +7675,54 @@ mod tests {
         cog_core::progress::reset_for_tests();
     }
 
+    /// 行上声明的预算不是判词。判断这一条要不要收，只认两条证据：持有者的租约
+    /// 过期，与这个尝试按实测的步间隔算是停住了。
+    ///
+    /// 这条把两个数摆到最刺眼的位置——`declared_duration_seconds = 1`、开跑在一周前
+    /// ——而持有者刚续过租约、信标也从没停过，于是它必须原样留在 `Running`。这个数
+    /// 曾是一道按时钟砍人的墙，代价见
+    /// `a_stalled_attempt_is_reclaimed_and_charged_to_the_task` 里那笔实测。判据挪走
+    /// 之后，它只剩「行声明自己会花多久」这一种读法（台账的 `past_its_declaration`
+    /// 数它，评审的册子拿它当「该有结局了」的尺度）。
+    #[tokio::test]
+    async fn a_row_past_its_declared_budget_is_not_reclaimed_while_its_lease_is_live() {
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        let dag = DagExecutor::new("ws-budget-reading".into()).with_task_lease_secs(600);
+        dag.add_task(Task::new(
+            "t-budget-reading",
+            TaskType::DagNode,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        dag.schedule_task("t-budget-reading").await.unwrap();
+        dag.start_task("t-budget-reading").await.unwrap();
+        {
+            let mut inner = dag.inner.write().await;
+            let t = inner.tasks.get_mut("t-budget-reading").unwrap();
+            t.declared_duration_seconds = 1;
+            t.started_at = Some(chrono::Utc::now() - chrono::Duration::days(7));
+            t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(600));
+        }
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
+
+        let now = chrono::Utc::now();
+        let row = dag.get_task("t-budget-reading").await.unwrap();
+        assert!(
+            reclaim_cause(&row, dag.task_lease, now).is_none(),
+            "租约还新、信标没停，行比它自己声明的时长老了六天也不构成回收的证据: {row:?}"
+        );
+        assert!(
+            dag.check_timeouts().await.is_empty(),
+            "清扫读的是同一条判据：预算不是它的输入"
+        );
+        let view = dag.get_task("t-budget-reading").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Running, "这一面不改行，只读行");
+        assert!(view.error.is_none(), "没有人判过它失败: {:?}", view.error);
+        cog_core::progress::reset_for_tests();
+    }
+
     /// 新一轮不继承上一轮的信标。
     ///
     /// 信标是进程内的，任务行却是跨轮次的：同一个 id 重跑时，上一轮留下的那个
@@ -7700,7 +7748,7 @@ mod tests {
         dag.start_task("t-restart").await.unwrap();
 
         assert!(
-            cog_core::progress::stall("t-restart").is_none(),
+            cog_core::declared_wall::stall("t-restart").is_none(),
             "新一轮的第一拍之前没有证据说它停住了，上一轮的信标不构成证据"
         );
         cog_core::progress::reset_for_tests();
@@ -7708,14 +7756,14 @@ mod tests {
 
     /// 部署前起的任务行里没有租约字段。没有租约就没有"到期时刻"，但 started_at
     /// 加上租约仍然是它该被回收的时刻——否则这些存量行要么永远 Running，要么
-    /// 得白等满整个 timeout。
+    /// 得白等满整条租约。
     #[tokio::test]
     async fn a_legacy_claim_without_a_lease_expires_from_its_start_time() {
         let dag = DagExecutor::new("ws-legacy".into()).with_task_lease_secs(60);
         let mut task = Task::new("t-legacy", TaskType::DagNode, serde_json::json!({}));
         task.status = TaskStatus::Running;
         task.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
-        task.timeout_seconds = 3600;
+        task.declared_duration_seconds = 3600;
         dag.add_task(task).await.unwrap();
 
         assert_eq!(
@@ -7739,7 +7787,7 @@ mod tests {
         let dag = DagExecutor::new("ws-pending".into()).with_task_lease_secs(60);
         let mut task = Task::new("t-pending", TaskType::DagNode, serde_json::json!({}));
         task.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3600));
-        task.timeout_seconds = 1;
+        task.declared_duration_seconds = 1;
         dag.add_task(task).await.unwrap();
 
         assert!(dag.check_timeouts().await.is_empty());
@@ -7770,7 +7818,7 @@ mod tests {
             .expect("the row was persisted");
         row.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
         row.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
-        row.timeout_seconds = 3600;
+        row.declared_duration_seconds = 3600;
         backend
             .dag_set_task("ws-lease-fg", "t-fg", &row)
             .await
@@ -8616,7 +8664,7 @@ mod tests {
             },
             cog_core::TaskEvent::TaskTimeout {
                 task_id: "t".into(),
-                timeout_seconds: 1,
+                declared_duration_seconds: 1,
                 timestamp: now,
             },
             cog_core::TaskEvent::TaskLeaseExpired {

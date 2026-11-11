@@ -907,7 +907,7 @@ fn governance_task(
         max_retries: 0,
         retry_not_before: None,
         started_at: None,
-        timeout_seconds: 0,
+        declared_duration_seconds: 0,
         lease_owner: None,
         lease_expires_at: None,
         action_planner_meta: None,

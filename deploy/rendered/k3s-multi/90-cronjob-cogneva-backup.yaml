@@ -97,12 +97,10 @@ spec:
                       echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi;
                       age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
                       echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
-                
-                periodSeconds: 30
-                
                 failureThreshold: 3
-                
                 initialDelaySeconds: 120
+                periodSeconds: 30
+                timeoutSeconds: 10
               env:
                 - name: TZ
                   value: "Asia/Shanghai"

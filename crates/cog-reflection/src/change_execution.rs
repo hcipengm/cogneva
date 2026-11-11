@@ -838,8 +838,8 @@ const JOB_CONTAINER: &str = "change-execution";
 /// 进度文件那一卷挂在哪、文件叫什么。执行进程写、存活探针读；两者读的名字是同一个，
 /// 所以这里只写一次，容器 env 与探针命令各自引它。
 const PROGRESS_VOLUME: &str = "progress";
-const PROGRESS_DIR: &str = "/var/run/cogneva-progress";
-const PROGRESS_FILE: &str = "/var/run/cogneva-progress/beat";
+const PROGRESS_DIR: &str = cog_core::paths::PROGRESS_DIR;
+const PROGRESS_FILE: &str = cog_core::paths::PROGRESS_FILE;
 /// 父进程容器的名字：镜像摘要与挂载面都从**这个容器**的现场读。写错名字的后果
 /// 是一条指名道姓的拒绝，而不是一个别处的镜像。
 const PARENT_CONTAINER: &str = cog_core::topology::MAIN_CONTAINER;
@@ -2149,6 +2149,10 @@ mod tests {
         // 请求里的路径分布在三个卷上：sandbox（change/workspace/bin/backup/投递）、
         // source（项目根与共享 target）、git-remote（裸仓）。多挂的（app-data、
         // /etc/cogneva、kubectl）不进清单。
+        //
+        // 第四个是进度卷：它不是请求里的路径，而是这个 Job 自己的心跳。执行进程每一步
+        // 写一次，容器外的存活探针读它——探针读不到就等于判停，所以它必须挂在一块
+        // 自己的 emptyDir 上，而不是容器的可写层。
         let mut mounted: Vec<String> = container["volumeMounts"]
             .as_array()
             .unwrap()
@@ -2162,21 +2166,25 @@ mod tests {
                 "/host-git".to_string(),
                 "/opt/cogneva/sandbox".to_string(),
                 "/opt/cogneva/sandbox/src".to_string(),
+                cog_core::paths::PROGRESS_DIR.to_string(),
             ]
         );
-        // 卷按**名字**取，不按下标：这份清单里三项的顺序不承载任何含义（kubelet
+        // 卷按**名字**取，不按下标：这份清单里各项的顺序不承载任何含义（kubelet
         // 按名字认领），钉住它只会让一次无关的重排变红。
         let volumes = manifest["spec"]["template"]["spec"]["volumes"]
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(volumes.len(), 3);
+        assert_eq!(volumes.len(), 4);
         let mut names: Vec<&str> = volumes
             .iter()
             .map(|v| v["name"].as_str().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["git-remote", "sandbox-data", "source"]);
+        assert_eq!(
+            names,
+            vec!["git-remote", PROGRESS_VOLUME, "sandbox-data", "source"]
+        );
         let with_name = |name: &str| -> serde_json::Value {
             volumes
                 .iter()
@@ -2215,9 +2223,20 @@ mod tests {
         let names = keys(&manifest);
 
         // 执行侧的环境面由镜像与代码定（校验用的那份环境本身就是一个白名单，
-        // 里面没有部署变量），所以清单里不该有 env——加一份透传就是给"子进程的
-        // 世界"造第二个声明处。
-        for forbidden in ["env", "envFrom", "envFromValue", "secret", "secretKeyRef"] {
+        // 里面没有部署变量），所以清单里不该有透传的 env——加一份透传就是给"子进程的
+        // 世界"造第二个声明处。唯一允许的一条是进度文件的落点：它不是部署变量，而是
+        // **挂载面**的一半（卷挂在哪，写者与探针就得按同一个路径拼），所以声明它的人和
+        // 挂载它的人是同一处。`env` 因此不在禁令里，改为逐字断言那一条的形状。
+        let container = &manifest["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(
+            container["env"],
+            serde_json::json!([{
+                "name": cog_core::progress::PROGRESS_FILE_ENV,
+                "value": PROGRESS_FILE,
+            }]),
+            "the only environment a change job may carry is where it writes its beat"
+        );
+        for forbidden in ["envFrom", "secret", "secretKeyRef"] {
             assert!(
                 !names.iter().any(|k| k == forbidden),
                 "the job manifest carries {forbidden}"
@@ -2292,8 +2311,7 @@ mod tests {
         );
         assert_eq!(container["env"][0]["value"], PROGRESS_FILE);
         assert_eq!(
-            container["livenessProbe"]["exec"]["command"][1],
-            "-c",
+            container["livenessProbe"]["exec"]["command"][1], "-c",
             "探针得是一条命令，不是一次裸 exec：它要读文件、算差、比窗口"
         );
         assert_eq!(
@@ -2302,7 +2320,10 @@ mod tests {
         );
         // 探针读的那个文件必须落在挂进来的那块卷上，否则它读的是容器的可写层，
         // 而那一层在 `readOnlyRootFilesystem` 下根本写不进去。
-        let mounts = container["volumeMounts"].as_array().expect("mounts").clone();
+        let mounts = container["volumeMounts"]
+            .as_array()
+            .expect("mounts")
+            .clone();
         assert!(
             mounts.iter().any(|m| m["mountPath"] == PROGRESS_DIR),
             "进度文件那一卷没挂上：{mounts:?}"

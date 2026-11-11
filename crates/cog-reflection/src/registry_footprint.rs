@@ -148,6 +148,14 @@ pub(crate) fn repo_path_of(repository: &str, rest: &str) -> String {
 // cap: bound — 界的是可读的范围；超界的清单让这次走查失败，而不是静默少算
 const MAX_INDEX_DEPTH: usize = 2;
 
+/// 读响应时每次系统调用取多少字节。
+///
+/// 它不是判据：判的是「两个字节之间有没有停下来」（`platform_http::READ_TIMEOUT`
+/// 包的是单次读完，超时即判这条读停了），而不是「整段读了多少秒」。改这个数只改
+/// 每次系统调用的批量，不改任何一次判停。
+// cap: bound — 只决定一次系统调用搬多少字节，不参与判停：判据是两次读之间停没停
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// The read side of the registry's HTTP API, over the plain-HTTP path `buildah`
 /// already uses for the same store.
 #[derive(Debug, Clone)]
@@ -168,7 +176,7 @@ impl RegistryClient {
     /// whether the store is full has to tell "this path was not there" from "the
     /// size was zero", and a body it could not parse from an empty one.
     pub async fn get(&self, path: &str, accept: &[&str]) -> SFResult<Vec<u8>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let (host, port) = endpoint_host_port(&self.endpoint).ok_or_else(|| {
             SFError::Config(format!(
                 "registry endpoint {:?} is not host:port",
@@ -197,7 +205,7 @@ impl RegistryClient {
         // 而「连着、但一个字节也不再进来」正是死掉的那副样子。整段读完的上限会把
         // 一份慢却正常的响应砍在中间，读出来的是一份残缺的清单。
         let mut raw = Vec::new();
-        let mut chunk = [0u8; 64 * 1024];
+        let mut chunk = [0u8; READ_CHUNK_BYTES];
         loop {
             let read = tokio::time::timeout(
                 crate::platform_http::READ_TIMEOUT,

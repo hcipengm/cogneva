@@ -604,7 +604,7 @@ mod tests {
         write_slow_build_crate(root.path());
 
         let deployer = EvolutionDeployer::new(root.path(), root.path(), root.path())
-            .with_binary_name("stall-probe");
+            .with_binary_name("budget-probe");
 
         let err = deployer
             .run_cargo_build(root.path(), None, "change-stall-probe", None)

@@ -1511,6 +1511,16 @@ mod tests {
     /// reclaim while it runs.
     #[tokio::test]
     async fn a_running_command_holds_its_task_worktree() {
+        // 这条命令在等一个文件：它不印东西、也不烧 CPU，按任何一枚窄窗都会被判停——
+        // 而这条用例量的是「跑着的命令占着那棵树」，判停不是它要证的事。窗口由本用例
+        // 自己落（水库是进程级的，测试二进制里量的是别的活的节奏）。
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            std::time::Duration::from_secs(300),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let tmp = tempfile::tempdir().unwrap();
         let bare = crate::workdir::tests::seed_bare(tmp.path());
         let workdir = crate::workdir::tests::router(
@@ -1605,6 +1615,7 @@ mod tests {
             body.contains("sandbox_workspace_cap_deferred_total 1"),
             "a finished command leaves nothing to defer: {body}"
         );
+        cog_core::progress::reset_for_tests();
     }
 
     /// 执行器先报出这条命令落在哪个目录，而那个路径只有它知道。

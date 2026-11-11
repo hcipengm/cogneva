@@ -599,6 +599,12 @@ mod no_clock_wall_tests {
         ) -> SFResult<cog_core::AssistantMessageEventStream> {
             unreachable!()
         }
+        async fn chat(&self, _m: &[Message], _o: &ChatOptions) -> SFResult<cog_core::ChatResponse> {
+            unreachable!()
+        }
+        async fn health_check(&self) -> bool {
+            false
+        }
     }
 
     fn case(id: &str) -> EvalCase {

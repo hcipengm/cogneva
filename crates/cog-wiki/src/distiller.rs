@@ -25,9 +25,9 @@ use cog_core::{DistilledPage, SFError, SFResult, Task, WikiBackend, WikiDistille
 // cap: bound — 一份来源交给员工的上限；超出部分记在提示里而不是静默丢掉
 pub const DISTILL_SOURCE_CHARS: usize = 8_000;
 
-// cap: bound — 一件活的执行预算；超时由平台判，这里是任务行上的界
-const DISTILL_TASK_TIMEOUT_SECS: u64 = 180;
-// cap: bound — 这里等答案的上界，比任务预算短，让平台先说出自己的终态与原因
+// cap: bound — 一件活声明自己会花多久；没有东西按这个数结束行，回收读的是租约与实测步间隔
+const DISTILL_TASK_DECLARED_SECS: u64 = 180;
+// cap: bound — 这里等答案的上界，比行声明的时长短，让等待的一方先说出自己为什么不再等
 const DISTILL_WAIT_TIMEOUT_SECS: u64 = 170;
 
 /// 把一件活交给名册、把答复拿回来的那一格。
@@ -169,7 +169,7 @@ impl WikiDistiller for WorkItemDistiller {
             confidence: None,
             timestamp: Some(chrono::Utc::now()),
         });
-        task.timeout_seconds = DISTILL_TASK_TIMEOUT_SECS;
+        task.declared_duration_seconds = DISTILL_TASK_DECLARED_SECS;
         // 场地标签跟着活走，不跟着接活的人走：读「wiki 这一栏今天收了多少」
         // 的人读的是这一列，而不是谁在这个场地上。
         task.venue = Some("wiki".into());
@@ -400,7 +400,7 @@ mod tests {
             task.action_planner_meta.as_ref().map(|m| m.verified),
             Some(true)
         );
-        assert!(task.timeout_seconds > 0);
+        assert!(task.declared_duration_seconds > 0);
         assert_eq!(
             task.venue.as_deref(),
             Some("wiki"),

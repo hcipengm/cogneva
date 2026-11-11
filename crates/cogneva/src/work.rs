@@ -85,9 +85,10 @@ OPTIONS:
     --acceptance <text>    What done means (file); repeat for several criteria.
     --priority <n>         Higher runs first (file; default 1).
     --blocked-by <id>      A task that must finish first (file); repeatable.
-    --timeout-secs <n>     How long the row may stay open before the graph fails
-                           it (file; default a week -- the lease, renewed by
-                           heartbeat, is what says the holder is still there).
+    --declared-secs <n>    How long the row declares it will take (file; default
+                           a week). Nothing ends the row at this number: the lease
+                           says the holder is still there, and the measured
+                           inter-step window says it is still moving.
     --result <json|@file>  The result payload for complete; @file reads a file.
     --error <text>         The failure text for fail.
     --door-url <url>       The zero-credential submission face to file through
@@ -108,7 +109,7 @@ pub enum Action {
         acceptance: Vec<String>,
         priority: i32,
         blocked_by: Vec<String>,
-        timeout_secs: u64,
+        declared_secs: u64,
     },
     Queue {
         json: bool,
@@ -169,7 +170,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut acceptance: Vec<String> = Vec::new();
     let mut priority: Option<i32> = None;
     let mut blocked_by: Vec<String> = Vec::new();
-    let mut timeout_secs: Option<u64> = None;
+    let mut declared_secs: Option<u64> = None;
     let mut json = false;
     let mut workspace = None;
     let mut database_url = None;
@@ -213,11 +214,11 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
                         .map_err(|_| format!("--priority is not a number: {raw}"))?,
                 );
             }
-            "--timeout-secs" => {
-                let raw = value("--timeout-secs")?;
-                timeout_secs = Some(
+            "--declared-secs" => {
+                let raw = value("--declared-secs")?;
+                declared_secs = Some(
                     raw.parse()
-                        .map_err(|_| format!("--timeout-secs is not a number: {raw}"))?,
+                        .map_err(|_| format!("--declared-secs is not a number: {raw}"))?,
                 );
             }
             "--workspace" => workspace = Some(value("--workspace")?),
@@ -254,7 +255,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
                 acceptance,
                 priority: priority.unwrap_or(1),
                 blocked_by,
-                timeout_secs: timeout_secs.unwrap_or(UNIT_WORK_BUDGET_SECS),
+                declared_secs: declared_secs.unwrap_or(UNIT_WORK_DECLARED_SECS),
             }
         }
         Some("queue") => Action::Queue { json },
@@ -382,7 +383,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             acceptance,
             priority,
             blocked_by,
-            timeout_secs,
+            declared_secs,
         } => {
             let filing = Filing {
                 id: &task,
@@ -391,7 +392,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
                 acceptance: &acceptance,
                 priority,
                 blocked_by: &blocked_by,
-                timeout_secs,
+                declared_secs,
             };
             let body = filing_body(&filing, unit, workspace)?;
             preflight(&*backend, workspace, &task, &blocked_by).await?;
@@ -572,7 +573,7 @@ struct Filing<'a> {
     acceptance: &'a [String],
     priority: i32,
     blocked_by: &'a [String],
-    timeout_secs: u64,
+    declared_secs: u64,
 }
 
 /// What a filed row declares it will take, unless the caller says otherwise.
@@ -588,7 +589,7 @@ struct Filing<'a> {
 // cap: bound — a week is the outer edge of "a unit of work", and the number is
 // read by people and dashboards rather than enforced; how long real rows stay
 // open is the lease's reading, not this number's.
-const UNIT_WORK_BUDGET_SECS: u64 = 7 * 24 * 60 * 60;
+const UNIT_WORK_DECLARED_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// How long one filing request may take. The door answers as soon as it has
 /// judged the submission; the decomposition it starts runs behind the answer.
@@ -632,7 +633,7 @@ fn filing_body(filing: &Filing, unit: &str, workspace: &str) -> Result<serde_jso
         acceptance,
         priority,
         blocked_by,
-        timeout_secs,
+        declared_secs,
     } = *filing;
     if id.trim().is_empty() {
         return Err("--task is empty".into());
@@ -670,7 +671,7 @@ fn filing_body(filing: &Filing, unit: &str, workspace: &str) -> Result<serde_jso
         "blocked_by": blocked_by,
         "priority": priority,
         "unit_id": unit,
-        "timeout_seconds": timeout_secs,
+        "declared_duration_seconds": declared_secs,
     });
     // The role name is read from its one declaration: a second spelling here keeps
     // working after a rename while every reader that picks a schema or a checkpoint
@@ -1551,7 +1552,7 @@ mod tests {
                 acceptance: vec!["CI is green on main".into()],
                 priority: 1,
                 blocked_by: Vec::new(),
-                timeout_secs: UNIT_WORK_BUDGET_SECS,
+                declared_secs: UNIT_WORK_DECLARED_SECS,
             }
         );
         // Each of these would otherwise reach a row that says less than a row
@@ -1590,7 +1591,7 @@ mod tests {
             acceptance,
             priority,
             blocked_by,
-            timeout_secs,
+            declared_secs,
         } = request.action
         else {
             panic!("file must parse as file");
@@ -1602,7 +1603,7 @@ mod tests {
             acceptance: &acceptance,
             priority,
             blocked_by: &blocked_by,
-            timeout_secs,
+            declared_secs,
         };
         let body = filing_body(&filing, &request.unit, "cogneva").unwrap();
 
@@ -1619,7 +1620,7 @@ mod tests {
         assert_eq!(row["face_id"], "CI/构建/部署");
         assert_eq!(row["unit_id"], "8b");
         assert_eq!(row["priority"], 1);
-        assert_eq!(row["timeout_seconds"], UNIT_WORK_BUDGET_SECS);
+        assert_eq!(row["declared_duration_seconds"], UNIT_WORK_DECLARED_SECS);
         assert_eq!(
             row["planner"]["verified"], true,
             "without the verified claim the orchestrator plans the row again"
@@ -1651,7 +1652,7 @@ mod tests {
             acceptance,
             priority,
             blocked_by,
-            timeout_secs,
+            declared_secs,
         } = request.action
         else {
             panic!("file must parse as file");
@@ -1663,7 +1664,7 @@ mod tests {
             acceptance: &acceptance,
             priority,
             blocked_by: &blocked_by,
-            timeout_secs,
+            declared_secs,
         };
         let body = filing_body(&filing, &request.unit, "cogneva").unwrap();
         let read: CreateTaskRequest =
@@ -1676,7 +1677,10 @@ mod tests {
         assert_eq!(rows[0].id, "close-the-ci-gap");
         assert_eq!(rows[0].face_id.as_deref(), Some("CI/构建/部署"));
         assert_eq!(rows[0].unit_id.as_deref(), Some("8b"));
-        assert_eq!(rows[0].timeout_seconds, Some(UNIT_WORK_BUDGET_SECS));
+        assert_eq!(
+            rows[0].declared_duration_seconds,
+            Some(UNIT_WORK_DECLARED_SECS)
+        );
         assert!(
             rows[0].planner.as_ref().is_some_and(|claim| claim.verified),
             "the row is injected without decomposition only if this claim arrives"
@@ -1731,7 +1735,7 @@ mod tests {
             acceptance,
             priority: 1,
             blocked_by: &[],
-            timeout_secs: UNIT_WORK_BUDGET_SECS,
+            declared_secs: UNIT_WORK_DECLARED_SECS,
         }
     }
 
@@ -1749,22 +1753,23 @@ mod tests {
         assert!(filing_body(&filing("t", " ", &stated), "8b", "ws").is_err());
     }
 
-    /// The executor's own default is five minutes, and the over-budget rule
-    /// reads the age of the row rather than whether its holder is still there.
-    /// A filed row left on that default would fail under a unit that was
-    /// heartbeating at the time -- the row's own unit, on work it just started.
+    /// The executor's own row default is five minutes, sized for one dispatched
+    /// round. Nothing ends the row at the declared number -- a held row is
+    /// judged by whether its holder keeps stepping -- so this field is what a
+    /// reader sizes its patience from, and a filed row that said five minutes
+    /// would tell every reader a unit's work is one round long.
     #[test]
-    fn a_filed_row_outlives_a_five_minute_executor_run() {
+    fn a_filed_row_declares_a_units_length_not_one_executor_round() {
         let stated = vec!["CI is green on main".to_string()];
         let body = filing_body(&filing("t", "g", &stated), "8b", "ws").unwrap();
-        let stated_budget = body["tasks"][0]["timeout_seconds"]
+        let stated_duration = body["tasks"][0]["declared_duration_seconds"]
             .as_u64()
             .expect("the budget travels with the submission");
         assert!(
-            stated_budget > 300,
-            "a filed row left on the executor's budget fails while its owner is alive"
+            stated_duration > 300,
+            "a filed row reading as one dispatched round misstates the unit's work"
         );
-        assert_eq!(stated_budget, UNIT_WORK_BUDGET_SECS);
+        assert_eq!(stated_duration, UNIT_WORK_DECLARED_SECS);
     }
 
     /// The door is addressed the way every other caller of that face addresses

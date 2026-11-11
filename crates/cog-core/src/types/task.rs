@@ -184,7 +184,7 @@ pub struct Task {
     /// 沙盒工具要把一个外部进程按住不让它跑飞。那些等待由发起方兑现，不由平台
     /// 兑现——平台这边读它的地方只有读数（「按经验这条活该有结局了」），没有
     /// 一处拿它做删除或取消。
-    pub timeout_seconds: u64,
+    pub declared_duration_seconds: u64,
     /// 持有本任务执行权的进程身份，随进程消亡而失效。
     ///
     /// 它不是实例身份：同一台机器上换一个进程，持有者就换了一个值，而这正是
@@ -1150,7 +1150,7 @@ impl Task {
             max_retries: 3,
             retry_not_before: None,
             started_at: None,
-            timeout_seconds: 300,
+            declared_duration_seconds: 300,
             lease_owner: None,
             lease_expires_at: None,
             action_planner_meta: None,

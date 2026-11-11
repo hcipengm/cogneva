@@ -4561,8 +4561,8 @@ mod tests {
         assert_eq!(stored.status, cog_core::TaskStatus::Pending);
         // 自我进化任务不领一个时长预算：计划器不再往行上写一个秒数当墙。
         assert_eq!(
-            stored.timeout_seconds,
-            Task::new("probe", TaskType::DagNode, serde_json::json!({})).timeout_seconds,
+            stored.declared_duration_seconds,
+            Task::new("probe", TaskType::DagNode, serde_json::json!({})).declared_duration_seconds,
             "计划器不该覆盖任务自带的那个数：它已经不是一条可回收的界了"
         );
         assert_eq!(
@@ -4600,9 +4600,10 @@ mod tests {
             .unwrap();
         assert_eq!(submitted, vec!["issue-12".to_string()]);
         let stored = dag.get_task("issue-12").await.unwrap();
-        let born = Task::new("probe", TaskType::DagNode, serde_json::json!({})).timeout_seconds;
+        let born =
+            Task::new("probe", TaskType::DagNode, serde_json::json!({})).declared_duration_seconds;
         assert_eq!(
-            stored.timeout_seconds, born,
+            stored.declared_duration_seconds, born,
             "行上那个数只能是造这条任务的人写的，不能是计划器按一类活的历史时长猜的"
         );
     }
@@ -4631,7 +4632,7 @@ mod tests {
             // 提交方自己声明的耐心。planner 不许覆盖它：规划器手上一度有一份按
             // 种类查出来的时长预算，写进每一行，从此这一列是那一刻的快照，而不是
             // 任何一条实测。一个显眼的数就能验「这一行是谁写的」。
-            t.timeout_seconds = 1234;
+            t.declared_duration_seconds = 1234;
             t
         };
 
@@ -4655,7 +4656,7 @@ mod tests {
         let stored = dag.get_task("github-issue-11").await.unwrap();
         assert!(stored.is_executable);
         assert_eq!(
-            stored.timeout_seconds, 1234,
+            stored.declared_duration_seconds, 1234,
             "planner 把提交方声明的耐心覆盖成了自己的快照"
         );
         assert_eq!(dag.get_all_tasks().await.len(), 1);
@@ -4706,7 +4707,7 @@ mod tests {
             }),
         );
         // 提交方声明的耐心，planner 不许改写（见自进化那条测试）。
-        leaf.timeout_seconds = 1234;
+        leaf.declared_duration_seconds = 1234;
 
         let ids = planner
             .process_goal_impl("fix the firing alert", vec![anchor, leaf], &registry)
@@ -4733,7 +4734,7 @@ mod tests {
         let stored_leaf = dag.get_task("self-signal-alert-abc").await.unwrap();
         assert!(stored_leaf.is_executable);
         assert_eq!(
-            stored_leaf.timeout_seconds, 1234,
+            stored_leaf.declared_duration_seconds, 1234,
             "planner 把提交方声明的耐心覆盖成了自己的快照"
         );
         assert_eq!(stored_leaf.goal_id.as_deref(), Some("signal:alert/r"));

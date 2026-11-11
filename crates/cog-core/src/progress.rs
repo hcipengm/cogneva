@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 /// This is an alerting line, not a judgement line: an attempt past it has been
 /// quiet longer than 999 steps in 1000, which is worth a log line and a
 /// dashboard, and is also what a few live attempts a day look like. Nothing is
-/// stopped here — [`stall`] acts at the extreme instead, because a false stop
+/// stopped here — [`crate::declared_wall::stall`] acts at the extreme instead, because a false stop
 /// costs the whole attempt and a late stop costs only the time it was late.
 ///
 /// It is also what the sample floor is derived from (see [`SAMPLE_FLOOR`]), so
@@ -84,8 +84,22 @@ struct GapSamples {
     /// minute costs a minute; stopping one that was working costs the whole
     /// attempt and its spend. So the reading that drives a kill is the extreme
     /// of the population, not its p99.9: silence longer than any gap a moving
-    /// attempt has ever shown on this deployment. See [`stall`].
+    /// attempt has ever shown on this deployment. See [`crate::declared_wall::stall`].
     longest: Option<Duration>,
+    /// 这一跑**自己**量到的最长一次间隔，只增不减，不受水库淘汰影响。
+    ///
+    /// 水库按条数淘汰，而高频率的进度拍（每搬一块数据一拍）能在几秒内把水库灌满，
+    /// 把早先那些真正长的间隔挤出去——于是「这一跑量到的极值」会缩成几毫秒，写回
+    /// 持久面的界跟着缩，下一趟开工就用一个不存在的窄界去判停。极值不能住在会被
+    /// 高频样本冲掉的容器里，所以它单独记一份；它跟着这一跑的生死走，每跑重新量，
+    /// 不会像常量那样永远停在一个数上。
+    run_longest: Option<Duration>,
+    /// 上一次运行留下的实测极值（[`adopt_longest_gap`]）。
+    ///
+    /// 一个刚起的进程没有任何间隔样本，若只看自己的水库，那么每一趟都只能回答
+    /// 「量不到」——判据于是要么永远不成立，要么退回一个挑出来的数。带上它，这一跑
+    /// 从开工起就有一个**别人量过的**界，而且它仍然是一个读数，不是常量。
+    adopted: Option<Duration>,
 }
 
 impl GapSamples {
@@ -98,6 +112,10 @@ impl GapSamples {
 
     fn push(&mut self, gap: Duration) {
         self.seen = self.seen.saturating_add(1);
+        self.run_longest = Some(match self.run_longest {
+            Some(previous) => previous.max(gap),
+            None => gap,
+        });
         if self.ring.len() < Self::capacity() {
             self.ring.push(gap);
         } else {
@@ -204,7 +222,43 @@ pub fn silence_window() -> Option<Duration> {
 /// this deployment's work get while it is still moving" — and silence past it
 /// is a shape that has not once been observed on an attempt that was working.
 pub fn longest_gap() -> Option<Duration> {
-    gaps().lock().unwrap_or_else(|p| p.into_inner()).longest
+    let gaps = gaps().lock().unwrap_or_else(|p| p.into_inner());
+    // 水库的极值还要跟这一跑自己的极值取大：水库按条数淘汰，密集的拍能在几小时里把
+    // 早先那些真正长的间隔全挤出去，于是「这套部署干活时最多静默过多久」缩成一个窄数，
+    // 而判停线一窄就是误杀。`run_longest` 不过期，但它也不在样本到量之前单独成立——
+    // 三个样本的最大值不是关于尾巴的证据，这一条与 `compute_longest` 同一个门槛。
+    let measured = match (gaps.longest, gaps.run_longest) {
+        (Some(recent), Some(run)) => Some(recent.max(run)),
+        (recent, _) => recent,
+    };
+    match (measured, gaps.adopted) {
+        (Some(measured), Some(adopted)) => Some(measured.max(adopted)),
+        (measured, adopted) => measured.or(adopted),
+    }
+}
+
+/// 采纳上一次运行量到的极值，让这一跑从开工起就有一个别人量过的界。
+///
+/// 传进来的必须是一个**量出来的**数（`observed_longest_gap` 的返回），不是谁挑的。
+/// 多次采纳取最大：两个来源都成立时，往宽松那一侧走是误杀成本更低的那一边。
+pub fn adopt_longest_gap(gap: Duration) {
+    let mut gaps = gaps().lock().unwrap_or_else(|p| p.into_inner());
+    gaps.adopted = Some(match gaps.adopted {
+        Some(previous) => previous.max(gap),
+        None => gap,
+    });
+}
+
+/// 这一次运行**自己**量到的最长间隔，不受 [`SAMPLE_FLOOR`] 限制，也不含采纳值。
+///
+/// 这是写回持久面的那个数：一个作业类每一趟只走几十步，凑不满量分位所需的样本，
+/// 而「这个作业类成功跑里最长的一次间隔」是一个极值问题，不是分位问题——极值从两个
+/// 样本起就是一条事实，只是它有多可靠要跟样本数一起说。
+pub fn observed_longest_gap() -> Option<Duration> {
+    // 读 `run_longest` 而不是对水库取最大：水库按条数淘汰，而一次高频率进度（每搬一块
+    // 数据一拍）能把水库灌满，把早先那些真正长的间隔挤出窗口——`max()` 于是返回这一阵
+    // 的毫秒级间隔，写回持久面就成了下一趟判停用的窄界。极值必须住在不会被冲掉的容器里。
+    gaps().lock().unwrap_or_else(|p| p.into_inner()).run_longest
 }
 
 /// Has this attempt been quiet long enough to be *worth looking at*?
@@ -213,7 +267,8 @@ pub fn longest_gap() -> Option<Duration> {
 /// busy fleet is a few attempts a day that are still perfectly alive. Nothing
 /// must stop a run on this — stopping one that was working costs the whole
 /// attempt, while letting a stopped one run another minute costs a minute.
-/// Alerting and log lines read it; [`stall`] is what a supervisor acts on.
+/// Alerting and log lines read it; [`crate::declared_wall::stall`] is what a
+/// supervisor acts on.
 pub fn quiet_longer_than_usual(task_id: &str) -> Option<(Duration, Duration)> {
     let last = last_beat(task_id)?;
     let window = silence_window()?;
@@ -221,31 +276,20 @@ pub fn quiet_longer_than_usual(task_id: &str) -> Option<(Duration, Duration)> {
     (silent > window).then_some((silent, window))
 }
 
-/// The stall verdict: how long this attempt has been quiet and the measured
-/// window it exceeded, or `None` when there is no evidence that it stopped.
+/// 记一条「别人还在干活」的证据：更新这一拍，但**不产生一个间隔样本**。
 ///
-/// One definition, read by both things that can end a run — the orchestrator's
-/// reclaim sweep and the executor router's watchdog. Two copies would be two
-/// predicates, and the day they drift is the day one side stops a run while the
-/// other keeps waiting for it, with no reading that says which is right.
-///
-/// The threshold is [`longest_gap`], not the p99.9 window, because the two
-/// errors here cost different amounts: a stopped attempt left running for
-/// another minute wastes a minute, and a working attempt stopped wastes the
-/// whole attempt. A p99.9 line would stop roughly one live attempt in a
-/// thousand on purpose; the extreme line stops an attempt only after a silence
-/// this deployment has never once produced while working.
-///
-/// `None` covers three different situations on purpose, because all three mean
-/// the same thing to a caller: nobody measured a beat for this attempt, or the
-/// deployment has not run enough steps to know what a long gap is, or the
-/// attempt is inside the window. In each case "do not stop it" is the only
-/// answer supported by evidence.
-pub fn stall(task_id: &str) -> Option<(Duration, Duration)> {
-    let last = last_beat(task_id)?;
-    let longest = longest_gap()?;
-    let silent = last.elapsed();
-    (silent > longest).then_some((silent, longest))
+/// 与 [`beat`] 的区别是这条证据不是我们这一步完成了一个单位，而是对面报告它还在
+/// 执行。它同样要被容器外的探针看见，所以也发布进度文件；但它不该进入间隔水库——
+/// 对端每秒报一次活，会把水库填满一秒的间隔，把实测极值压低，最后又把误杀拉回来。
+pub fn mark(task_id: &str) {
+    if task_id.is_empty() {
+        return;
+    }
+    beacons()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(task_id.to_string(), Instant::now());
+    publish_progress(false);
 }
 
 /// How many gap samples have been observed, for a reader that has to say whether
@@ -263,21 +307,19 @@ pub fn gap_sample_count() -> usize {
 /// 下次窗口变了它不会跟着变，而它读起来还是「这条窗口」。
 pub const PROGRESS_FILE_ENV: &str = "COGNEVA_PROGRESS_FILE";
 
-/// 进度文件里写的窗口下限：这个进程还没量够步数时用这个数。
+/// 进度文件里「还没有实测窗口」时写的那个词。
 ///
-/// 「量不到」与「量到就是这个值」必须是两个读数（见 [`longest_gap`]），而文件里只能
-/// 写一个数，所以这里写的是**下限**：实测窗口只把它撑大，不把它压小——压小是往
-/// 误杀那一侧走。默认值沿用被它替换掉的那几处 Job 期限（3600 s）：那些界量的是
-/// **总时长**，这里量的是**静默**，同一个数在后一种判据下只会更宽松——一次跑两小时、
-/// 每一步都在推进的活儿以前会被杀掉，现在不会。
-// cap: override — 这个进程上没有一条测量给出窗口；沿用被替换的 Job 期限 3600 s，判据从「总时长」换成「静默」后只会更宽
-pub const PROGRESS_FILE_WINDOW_FLOOR_SECS: u64 = 3600;
+/// 「量不到」与「量到就是这个值」必须是两个读数（见 [`longest_gap`]），而文件里只能写
+/// 一个值。写一个数进去会把「我们还没量过」伪装成「界就是这个数」——一个没人量过、
+/// 却会被容器外的人当判据用的数，正是这个仓里明令禁止的硬编码。所以没有实测时就写
+/// 这个词，探针读到它只报读数、不判停：等它自己结束，比拿一个挑出来的数杀掉它便宜。
+pub const PROGRESS_FILE_UNBOUNDED: &str = "unbounded";
 
 /// 写进度文件的最小间隔：一拍输出就写一次盘，写盘量会跟着 token 走。
 ///
 /// 它不改判据，只改这条读数自己的开销；一秒一次足够让探针读到「它还活着」，而
 /// `mtime` 的精度也就是秒。
-// cap: fixed — 写盘频率，不是界；界是文件里那个窗口
+// cap: bound — 写盘频率是钉住的节奏，不是界；界是文件里那个窗口
 const PROGRESS_FILE_WRITE_TICK: Duration = Duration::from_secs(1);
 
 /// kubelet 的 exec 探针在容器里跑的那一条命令。
@@ -285,23 +327,26 @@ const PROGRESS_FILE_WRITE_TICK: Duration = Duration::from_secs(1);
 /// 读的正是 [`PROGRESS_FILE_ENV`] 指向的文件：没有文件＝这一跑还没发布过任何一步，
 /// 静默超过文件里写的窗口＝它不再动。窗口与被测的静默都来自容器自己，所以探针里
 /// 不含任何可调的界——它只把两个数读出来再比。
-pub const PROGRESS_PROBE_COMMAND: &str = r#"f="$COGNEVA_PROGRESS_FILE"; if [ -z "$f" ] || [ ! -f "$f" ]; then echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi; age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f"); echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]"#;
+///
+/// 文件里写的是 [`PROGRESS_FILE_UNBOUNDED`] 时（这个作业类还没有一条实测），探针只报
+/// 读数、不判停。拿一个挑出来的数去杀一件没人量过的事，正是这个仓要拆掉的那种钟。
+pub const PROGRESS_PROBE_COMMAND: &str = r#"f="$COGNEVA_PROGRESS_FILE"; if [ -z "$f" ] || [ ! -f "$f" ]; then echo "no progress file (COGNEVA_PROGRESS_FILE='$f')"; exit 1; fi; age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f"); echo "quiet ${age}s, window ${win}"; if [ "$win" = "unbounded" ]; then exit 0; fi; [ "$age" -le "$win" ]"#;
 
 /// 探针多久读一次。
 ///
 /// 这只是判词最晚多久出现，不是判据：判据是文件里那个窗口，探针的节奏只决定
 /// 「停住」最多晚几分钟被说出来。
-// cap: fixed — 读取周期，不是判据
+// cap: bound — 读取周期钉在这里，不是判据；判据是文件里的实测窗口
 pub const PROBE_PERIOD_SECS: u64 = 30;
 
 /// 连续几次读数超窗才判死。窗口本身已经是「这套部署从没在干活时静默过这么久」，
 /// 再要几次连续读数，是为了不让一次读盘抖动变成一次重启。
-// cap: fixed — 连续读数次数，不是界
+// cap: bound — 连续读数次数钉在这里，不是界；界是实测窗口，它只防一次抖动
 pub const PROBE_FAILURE_THRESHOLD: u32 = 3;
 
 /// 容器起来之后先给多久再开始探。进程开工第一件事就是建这个文件
 /// （[`start_progress_file`]），这段时间只是留给拉镜像与解压的。
-// cap: fixed — 开工宽限，不是判据
+// cap: bound — 开工宽限钉在这里，不是判据；它只留拉镜像与解压的时间
 pub const PROBE_INITIAL_DELAY_SECS: u64 = 120;
 
 fn last_progress_write() -> &'static Mutex<Option<Instant>> {
@@ -326,13 +371,17 @@ fn publish_progress(force: bool) {
         }
         *last = Some(Instant::now());
     }
-    let window = longest_gap()
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        .max(PROGRESS_FILE_WINDOW_FLOOR_SECS);
-    if let Err(e) = std::fs::write(path, format!("{window}\n")) {
+    let window = crate::declared_wall::Bound::now().words();
+    // 先写临时文件再改名：`std::fs::write` 会先截断再写，探针正好落在中间那一瞬就会
+    // 读到一个空文件，而空文件在探针里不是「没有界」，是一次解析失败——那是判死。
+    // 改名在同一文件系统上是原子的，读者要么看到上一格，要么看到这一格。
+    let staged = format!("{path}.new");
+    let body = format!("{window}\n");
+    let written = std::fs::write(&staged, &body).and_then(|()| std::fs::rename(&staged, path));
+    if let Err(e) = written {
         // 写不成就没有进度面，而「文件不动」与「根本没有文件」在集群面上同形——
         // 后者会让这一跑在自己的窗口上被杀掉。所以这一条不是噪音。
+        let _ = std::fs::remove_file(&staged);
         tracing::warn!(path, error = %e, "progress file could not be written");
     }
 }
@@ -361,9 +410,10 @@ pub fn liveness_probe() -> serde_json::Value {
 
 /// 看门狗的读取节奏：多久去看一眼「它还在不在动」。
 ///
-/// 这是**读取周期，不是判据**：判据是 [`stall`] 那条实测窗口，这一拍只决定判词
+/// 这是**读取周期，不是判据**：判据是 [`crate::declared_wall::stall`] 那条实测窗口，
+/// 这一拍只决定判词
 /// 最晚多久出现，不会让它变宽或变窄。所以它不参与任何「多少秒算停」的决定。
-// cap: fixed — 读取周期，不是界；界是实测的步间隔窗口
+// cap: bound — 读取周期钉在这里，不是界；界是实测的步间隔窗口
 pub const WATCH_TICK: Duration = Duration::from_secs(1);
 
 /// 判据与生产者共同的那一段：子进程被杀的原因是**它不再动**，不是它跑够了钟点。
@@ -393,7 +443,7 @@ pub enum ChildOutcome {
 /// 跑一个子进程，按**它还在不在产出**判它停没停——不按一个声明的钟。
 ///
 /// 进程每写出一段 stdout/stderr 就是一拍，所以「慢但一直在印」的不会被判，「一声
-/// 不响」的会。判据与编排侧的回收、执行路由的守护读的是同一条（[`stall`]），因此
+/// 不响」的会。判据与编排侧的回收、执行路由的守护读的是同一条（[`crate::declared_wall::stall`]），因此
 /// 三处的判词不会漂移。**量不到窗口时它不判**（这一套部署还没跑够步数去量），
 /// 那一刻没有证据，进程继续跑——「量不到」与「停住」在这里同样是两件事。
 ///
@@ -500,26 +550,24 @@ pub async fn watch_child(
     }
 
     let mut stalled = None;
-    let mut burned: Option<(u64, u64)> = None;
+    // 「什么算还在动」这条口径住在 `declared_wall`，与判据同处：读的是子进程的 CPU 与
+    // 读写字节，动一次记一拍。写在这里而不是 `run_child_watched` 的调用方里，是因为
+    // 只有这里握着那个 pid。
+    let mut movement = crate::declared_wall::Movement::new();
     let status = loop {
         tokio::select! {
             status = child.wait() => break status?,
             _ = tokio::time::sleep(WATCH_TICK) => {
                 // 干活不只是印东西：编译、链接、算矩阵这一段里它一个字节都不输出，
-                // 但它一直在吃 CPU。CPU 时间在涨就是「还在动」最硬的证据——没有
-                // 这一拍，一份沉默的重活会在它自己最忙的时候被判成停住。
+                // 但计数一直在涨。没有这一读，一份沉默的重活会在它自己最忙的时候被判成停住。
                 if let Some(pid) = child.id() {
-                    if let Some(now) = cpu_ticks(pid) {
-                        if burned.is_some_and(|before| now != before) {
-                            beat(id);
-                            if let Some(also) = &also {
-                                also();
-                            }
+                    if movement.sample(pid, id) {
+                        if let Some(also) = &also {
+                            also();
                         }
-                        burned = Some(now);
                     }
                 }
-                if let Some((silent, window)) = stall(id) {
+                if let Some((silent, window)) = crate::declared_wall::stall(id) {
                     stalled = Some((silent, window));
                     // 判停之后才动手：在这之前它的每一下产出与每一段 CPU 都被读到了。
                     if let Some(pid) = child.id() {
@@ -576,6 +624,63 @@ pub fn cpu_ticks(pid: u32) -> Option<(u64, u64)> {
     let utime: u64 = fields.get(11)?.parse().ok()?;
     let stime: u64 = fields.get(12)?.parse().ok()?;
     Some((utime, stime))
+}
+
+/// 一个进程「还在动」的**直接**证据：它烧掉的 CPU，和它读写的字节数。
+///
+/// 拍是间接证据——它只证明这个尝试主动报告过一次推进。可是编译、链接、算一个矩阵、
+/// 走一次大查询，这几种工作在很长时间里一个字节都不输出、也不走任何一步，而它们一直
+/// 在动；只按「没有拍」判停，就是把最忙的那一段读成停住。这三项是操作系统替它记的账，
+/// 不依赖它自己开口，也不受它印不印东西影响。
+///
+/// 字段是 `Option`：这个平台没有 `/proc/<pid>/io`（或权限不够）时，I/O 那两项是
+/// **量不到**，不是零。把量不到当零，下面 [`Activity::moved_since`] 会把「读不到」读成
+/// 「没动」，于是又回到「静默判死」那条老路上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Activity {
+    cpu_ticks: u64,
+    read_bytes: Option<u64>,
+    written_bytes: Option<u64>,
+}
+
+impl Activity {
+    pub fn new(cpu_ticks: u64, read_bytes: Option<u64>, written_bytes: Option<u64>) -> Self {
+        Self {
+            cpu_ticks,
+            read_bytes,
+            written_bytes,
+        }
+    }
+
+    /// 与上一读相比有没有动。只比**两次都读到了**的那几项。
+    pub fn moved_since(self, older: Self) -> bool {
+        let moved = |now: Option<u64>, then: Option<u64>| match (now, then) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        self.cpu_ticks != older.cpu_ticks
+            || moved(self.read_bytes, older.read_bytes)
+            || moved(self.written_bytes, older.written_bytes)
+    }
+}
+
+/// 读一个进程的活动计数。进程已退出、没有 procfs、读 `stat` 没权限，都是 `None`。
+pub fn process_activity(pid: u32) -> Option<Activity> {
+    let (utime, stime) = cpu_ticks(pid)?;
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok();
+    let field = |name: &str| -> Option<u64> {
+        io.as_deref()?
+            .lines()
+            .find_map(|line| line.strip_prefix(name))?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some(Activity::new(
+        utime.saturating_add(stime),
+        field("rchar:"),
+        field("wchar:"),
+    ))
 }
 
 async fn read_beating<R>(
@@ -670,6 +775,8 @@ pub fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 判据与界住在 `declared_wall`：这里的用例仍然读它们，因为它们量的是同一批样本。
+    use crate::declared_wall::{stall, stall_any, Bound};
 
     /// The sample floor is the number of quantile points, not a number anybody
     /// picked: `1 / (1 - q)`. A floor that stopped following the quantile would
@@ -793,16 +900,20 @@ mod tests {
     async fn a_child_that_keeps_printing_is_not_stopped_for_taking_long() {
         let _serial = async_test_lock().await;
         reset_for_tests();
-        seed_gaps_for_tests(Duration::from_millis(500), SAMPLE_FLOOR);
+        // 窗口取 2 秒而不是 500 毫秒：判据一拍一秒才看一次，而被测的是**这台机器**
+        // 有没有把这一拍按时调度上。窗口窄到与拍子同量级时，一次正常的调度抖动就够
+        // 越过它——那读的是我们自己的饥饿，不是子进程的沉默。窗口仍远小于下面这段
+        // 产出撑起的时长，所以「有产出就不该被判停」这半句照样被证到。
+        seed_gaps_for_tests(Duration::from_secs(2), SAMPLE_FLOOR);
 
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args([
             "-c",
-            "i=0; while [ $i -lt 40 ]; do echo step $i; sleep 0.04; done",
+            "i=0; while [ $i -lt 120 ]; do echo step $i; sleep 0.04; done",
         ]);
-        // 40 steps × 40 ms runs three times past the window, and no single gap
-        // between two steps is anywhere near it: nothing but the beats keeps the
-        // child alive, which is the point.
+        // 120 steps × 40 ms runs well past the window, and no single gap between
+        // two steps is anywhere near it: nothing but the beats keeps the child
+        // alive, which is the point.
         match run_child_watched(cmd, "chatty").await.expect("spawn") {
             ChildOutcome::Exited(out) => assert!(out.status.success()),
             ChildOutcome::Stalled { silent, window } => panic!(
@@ -878,8 +989,8 @@ mod tests {
 
         assert_eq!(
             written.trim(),
-            PROGRESS_FILE_WINDOW_FLOOR_SECS.to_string(),
-            "还没量到窗口时写的是下限；量到之后只可能更大"
+            PROGRESS_FILE_UNBOUNDED,
+            "还没量到窗口时写的是「没有界」这个词，不是一个挑出来的数——写了数，容器外的人就会拿它当判据"
         );
     }
 
@@ -911,5 +1022,168 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "the verdict came from the child ending, not from the watchdog"
         );
+    }
+
+    /// 一个刚起的进程没有自己的样本，只有上一次运行留下的实测值；判据必须跟着它走。
+    ///
+    /// 这条量的是「换输入 ⇒ 值跟着变」：同一个进程，采纳的极值从 2 s 换成 9 s，
+    /// 判停线就得跟着从 2 s 挪到 9 s。挪不动，就说明那个界又从测量退化成了常量。
+    #[test]
+    fn an_adopted_bound_moves_the_judgement_line() {
+        let _serial = test_lock();
+        reset_for_tests();
+        // 水库凑不满样本，这一跑自己什么也没量到。
+        seed_gaps_for_tests(Duration::from_millis(5), 3);
+        assert_eq!(longest_gap(), None, "样本不足时不该有一条自己量出来的界");
+
+        adopt_longest_gap(Duration::from_secs(2));
+        assert_eq!(longest_gap(), Some(Duration::from_secs(2)));
+
+        adopt_longest_gap(Duration::from_secs(9));
+        assert_eq!(
+            longest_gap(),
+            Some(Duration::from_secs(9)),
+            "采纳的界换了，判停线没跟着换：它就不再是读数了"
+        );
+        reset_for_tests();
+    }
+
+    /// 写回持久面的那个数不受样本下限约束，也不含采纳值——它问的是「这一跑自己看到了多长的间隔」。
+    #[test]
+    fn the_observed_extreme_is_this_runs_own_reading() {
+        let _serial = test_lock();
+        reset_for_tests();
+        seed_gaps_for_tests(Duration::from_millis(100), 2);
+        seed_gaps_for_tests(Duration::from_millis(700), 1);
+        adopt_longest_gap(Duration::from_secs(60));
+
+        assert_eq!(observed_longest_gap(), Some(Duration::from_millis(700)));
+        assert_eq!(longest_gap(), Some(Duration::from_secs(60)));
+        reset_for_tests();
+    }
+
+    /// 一条长间隔不能被后来那些密集的拍挤出水库。
+    ///
+    /// 这是这一族里最难靠读代码看出来的缺陷：水库按**条数**淘汰，一个例如每搬 4 MB 记一拍的
+    /// 作业能在几秒内把它灌满。挤出去的是早先那些真正长的间隔，于是「这一跑量到的极值」
+    /// 缩成几毫秒，写回持久面，下一趟开工就拿着一个根本不存在的窄界去判停——界越窄，
+    /// 误杀越多，而每一步读数看起来都正常。
+    #[test]
+    fn a_long_gap_survives_the_reservoir_filling_up() {
+        let _serial = test_lock();
+        reset_for_tests();
+        let long = Duration::from_secs(90);
+        seed_gaps_for_tests(long, 1);
+        // 把水库整整换过一遍还多一条：按条数淘汰的话，那一条长间隔此刻已经不在里面了。
+        seed_gaps_for_tests(Duration::from_millis(1), GapSamples::capacity() + 1);
+
+        assert_eq!(
+            observed_longest_gap(),
+            Some(long),
+            "写回持久面的极值被高频率的拍冲掉了：下一趟会用一条不存在的窄界判停"
+        );
+        assert_eq!(
+            longest_gap(),
+            Some(long),
+            "判停线同样不能因为水库换过一轮就缩窄"
+        );
+        reset_for_tests();
+    }
+
+    /// 持久面读不出来的那一格不是一道更小的界，是没有界。
+    ///
+    /// 三种读法各一格：没有那一行、读回来是 0、读回来不是有限数。谁把它们折成
+    /// `Measured(0)`，下一趟就会在第一次静默时被杀——界从「没人量过」变成了「零秒」。
+    #[test]
+    fn a_stored_bound_that_cannot_be_read_is_unmeasured_not_zero() {
+        assert_eq!(Bound::from_stored(None), Bound::Unmeasured);
+        assert_eq!(Bound::from_stored(Some(0.0)), Bound::Unmeasured);
+        assert_eq!(Bound::from_stored(Some(-5.0)), Bound::Unmeasured);
+        assert_eq!(Bound::from_stored(Some(f64::NAN)), Bound::Unmeasured);
+        assert_eq!(
+            Bound::from_stored(Some(12.5)),
+            Bound::Measured(Duration::from_secs_f64(12.5))
+        );
+    }
+
+    /// 「量不到」在写给人看的那一面也只有一个词：进度文件、判词、写回持久面读的是
+    /// 同一句。分叉的那天，容器外看到的界与进程判停用的界就是两个数。
+    #[test]
+    fn an_unmeasured_bound_says_so_in_the_same_word_everywhere() {
+        let _serial = test_lock();
+        reset_for_tests();
+        assert_eq!(Bound::now(), Bound::Unmeasured);
+        assert_eq!(Bound::now().words(), PROGRESS_FILE_UNBOUNDED);
+        assert_eq!(Bound::observed(), Bound::Unmeasured);
+        adopt_longest_gap(Duration::from_secs(42));
+        assert_eq!(Bound::now(), Bound::Measured(Duration::from_secs(42)));
+        assert_eq!(Bound::now().words(), "42");
+        assert_eq!(
+            Bound::observed(),
+            Bound::Unmeasured,
+            "采纳来的不是这一跑量到的：写回持久面的必须是自己看到的那个数"
+        );
+        reset_for_tests();
+    }
+
+    /// 秒数向上取整：一个不到一秒的界不能写成「0」。
+    ///
+    /// 这一格是容器外探针的判据。写成 0，探针的 `age <= 0` 几乎立刻不成立，于是一个
+    /// 每一步都在推进的容器被自己的窗口杀掉——误杀就是从一次截断开始的。
+    #[test]
+    fn a_sub_second_bound_is_never_written_as_zero() {
+        assert_eq!(Bound::Measured(Duration::from_millis(400)).words(), "1");
+        assert_eq!(Bound::Measured(Duration::from_millis(1)).words(), "1");
+        assert_eq!(Bound::Measured(Duration::from_secs(42)).words(), "42");
+        assert_eq!(Bound::Measured(Duration::from_millis(42_500)).words(), "43");
+        assert_eq!(Bound::Unmeasured.words(), PROGRESS_FILE_UNBOUNDED);
+    }
+
+    /// 一组通道里最年轻的一拍就是这一步的年龄：任何一条还在动，这一步就不算静默。
+    #[test]
+    fn the_youngest_channel_is_this_steps_age() {
+        let _serial = test_lock();
+        reset_for_tests();
+        seed_gaps_for_tests(Duration::from_millis(200), SAMPLE_FLOOR);
+        beat("step");
+
+        assert!(stall_any(&["step"]).is_none(), "刚记过的一拍不该被判停");
+        std::thread::sleep(Duration::from_millis(260));
+        let (silent, bound) = stall_any(&["step"]).expect("静默超过实测界就该有判词");
+        assert_eq!(bound, Duration::from_millis(200));
+        assert!(silent > bound);
+
+        // 对端报一次活，即使它不产生间隔样本，这一步也不再静默。
+        mark("peer");
+        assert!(
+            stall_any(&["step", "peer"]).is_none(),
+            "对端还在执行时这一步没有静默——把它算停就是把「等对面干活」读成卡死"
+        );
+        reset_for_tests();
+    }
+
+    /// 探针读到「没有界」只报读数，不判停。
+    #[test]
+    fn the_probe_reports_an_unbounded_window_without_killing() {
+        let _serial = test_lock();
+        let dir =
+            std::env::temp_dir().join(format!("cog-progress-unbounded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("progress");
+        std::fs::write(&file, PROGRESS_FILE_UNBOUNDED).expect("write");
+
+        let out = std::process::Command::new("sh")
+            .args(["-c", PROGRESS_PROBE_COMMAND])
+            .env(PROGRESS_FILE_ENV, &file)
+            .output()
+            .expect("run probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            out.status.success(),
+            "关掉检测进程的「没有界」不该判停：{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains(PROGRESS_FILE_UNBOUNDED));
     }
 }

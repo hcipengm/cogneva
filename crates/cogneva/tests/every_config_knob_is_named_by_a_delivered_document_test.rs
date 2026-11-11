@@ -94,11 +94,6 @@ const CODE_ONLY: &[CodeOnly] = &[
          算停了」的判据，随部署的模型延迟走",
     ),
     code_only(
-        "agent_loop.final_draft_timeout_secs",
-        "由 `COGNEVA_AGENT_LOOP_FINAL_DRAFT_TIMEOUT_SECS` 覆盖；它界的是预算花完之后\
-         那一次收尾调用，默认值随上游尾延迟走",
-    ),
-    code_only(
         "agent_loop.memory_api_base",
         "由 `COGNEVA_MEMORY_API_BASE` 覆盖；指向平台自己的 HTTP 面，地址随部署走",
     ),

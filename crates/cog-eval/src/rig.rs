@@ -37,10 +37,10 @@ pub const SKIP_NEEDS_VISION: &str =
 
 /// 看门狗多久看一次「这一例还在不在动」。
 ///
-/// 这是**读取周期**，不是判据：判据是实测的静默窗口（`cog_core::progress::stall`），
+/// 这是**读取周期**，不是判据：判据是实测的静默窗口（`cog_core::declared_wall::stall`），
 /// 这一拍只决定多久去看一眼，只能让判词晚到，不会让它变宽或变窄。所以它不必与
 /// 任何实测量对齐。
-// cap: fixed — 读取周期，不是界；界是 cog_core::progress 按实测步间隔算出来的窗口
+// cap: bound — 读取周期钉在这里，不是界；界是 cog_core::progress 按实测步间隔算出来的窗口
 const STALL_POLL: Duration = Duration::from_secs(1);
 
 /// 一次实验的配置。
@@ -1103,7 +1103,7 @@ impl Rig {
                     }
                 };
                 // 一例的结局由它**自己的进展**决定，不由钟决定（2026-11-10 删掉
-                // `case_timeout`）。判据读的是 `cog_core::progress::stall`：上一次动是
+                // `case_timeout`）。判据读的是 `cog_core::declared_wall::stall`：上一次动是
                 // 什么时候，以及这份部署实测过的最长步间隔是多少。两者都有才判——
                 // 量不到窗口时它返回 `None`，于是不判：「这一跑还没跑够步数去量」与
                 // 「这一例停住了」在判据上分开，而不是折成一个没人量过的秒数。
@@ -1117,7 +1117,7 @@ impl Rig {
                     tokio::select! {
                         outcome = &mut solved => break outcome,
                         _ = tokio::time::sleep(STALL_POLL) => {
-                            if let Some((silent, window)) = cog_core::progress::stall(&case.id) {
+                            if let Some((silent, window)) = cog_core::declared_wall::stall(&case.id) {
                                 break CaseOutcome::errored(
                                     &case,
                                     format!(
@@ -1760,7 +1760,14 @@ mod tests {
     // 大约一秒多判完，外层 5 秒的兜底仍然在。
     #[tokio::test]
     async fn a_case_that_stops_moving_is_an_error_naming_the_measured_window() {
-        cog_core::progress::seed_gaps_for_tests(std::time::Duration::from_millis(50), 1000);
+        // 窗口由这条用例自己落：水库是进程级的，不先清掉的话，跑在前面的用例留下的
+        // 极值会变成这里的界，这条判据就变成在等别人的数。
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            std::time::Duration::from_millis(50),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
         let rig = Rig::new(
             Arc::new(NeverCalled),
             RunConfig {
@@ -1775,12 +1782,13 @@ mod tests {
         )
         .with_scaffold(Arc::new(NeverReturns));
         let table = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             rig.run(&[bench_named("hle", cases()[..1].to_vec(), Arc::new(OkEnv))]),
         )
         .await
         .expect("the run must come back: a case with no bound keeps it running for ever")
         .unwrap();
+        cog_core::progress::reset_for_tests();
         let cell = table.cell("never-returns", "hle").unwrap();
         assert_eq!(
             cell.errored(),

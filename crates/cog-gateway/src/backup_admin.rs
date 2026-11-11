@@ -78,8 +78,8 @@ const DEFAULT_CRONJOB: &str = "cogneva-backup";
 /// 是「没有文件」，而那在集群面上与「这一趟还没开始」同形，判停就此失效，还看不出
 /// 是哪一处写错了。
 const PROGRESS_VOLUME: &str = "progress";
-const PROGRESS_DIR: &str = "/var/run/cogneva-progress";
-const PROGRESS_FILE: &str = "/var/run/cogneva-progress/beat";
+const PROGRESS_DIR: &str = cog_core::paths::PROGRESS_DIR;
+const PROGRESS_FILE: &str = cog_core::paths::PROGRESS_FILE;
 
 /// 发布目录在容器里的位置。与 [`EXPORTS_SUBDIR`] 是同一处事实的两个写法。
 fn publish_dir() -> PathBuf {

@@ -341,7 +341,6 @@ async fn a_turn_leaves_no_state_behind() {
         agent_id: "gate-turn-leaves-nothing".into(),
         max_iterations: 1,
         think_stall_timeout_secs: 5,
-        final_draft_timeout_secs: 300,
         ..Default::default()
     };
     let mut runtime = cog_agent::AgentRuntime::new(config, tx);

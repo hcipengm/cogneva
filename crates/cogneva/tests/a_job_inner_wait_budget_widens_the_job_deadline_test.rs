@@ -158,8 +158,11 @@ fn the_scan_names_the_bound_it_compares() {
 fn a_budget_missing_from_the_computation_is_reported() {
     let budgets = vec!["CI_ASK_BUDGET_SECS".to_string()];
     assert!(
-        missing_from("fn judgement_wait_budget() {\n  1 + CI_ASK_BUDGET_SECS\n}\n", &budgets)
-            .is_empty(),
+        missing_from(
+            "fn judgement_wait_budget() {\n  1 + CI_ASK_BUDGET_SECS\n}\n",
+            &budgets
+        )
+        .is_empty(),
         "在里面时不该报"
     );
     assert_eq!(

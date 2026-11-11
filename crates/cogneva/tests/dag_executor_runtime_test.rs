@@ -34,7 +34,7 @@ fn make_test_task(id: &str) -> Task {
         max_retries: 3,
         retry_not_before: None,
         started_at: None,
-        timeout_seconds: 300,
+        declared_duration_seconds: 300,
         lease_owner: None,
         lease_expires_at: None,
         action_planner_meta: None,

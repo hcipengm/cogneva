@@ -273,7 +273,7 @@ impl TaskExecutorRouter {
     /// 会无限期占住串行消费位置（实测 90+ 分钟不返回，后续就绪消息全部队头
     /// 阻塞）。
     ///
-    /// 判据与编排侧的回收是同一条读数（[`cog_core::progress::stall`]）：两份
+    /// 判据与编排侧的回收是同一条读数（[`cog_core::declared_wall::stall`]）：两份
     /// 判据只要各写一份，就会有一天一边判停住、另一边继续等，而那正是「这条活
     /// 到底还在不在跑」没人答得上来的状态。等待的长度只决定判据最晚多久被读到
     /// 一次，不参与判定。
@@ -284,7 +284,7 @@ impl TaskExecutorRouter {
                 result = &mut run => return result,
                 _ = tokio::time::sleep(stall_poll_interval()) => {}
             }
-            if let Some((silent, window)) = cog_core::progress::stall(&task.id) {
+            if let Some((silent, window)) = cog_core::declared_wall::stall(&task.id) {
                 return Err(SFError::Agent(
                     crate::dag_executor::orchestrator::stall_reason(silent, window),
                 ));
@@ -1314,7 +1314,7 @@ mod ready_pipeline_tests {
         }
     }
 
-    fn test_task(timeout_seconds: u64) -> Task {
+    fn test_task(declared_seconds: u64) -> Task {
         let now = chrono::Utc::now();
         // task_type custom 变体即可，SlowExecutor supports 全部类型。
         let task: Task = serde_json::from_value(serde_json::json!({
@@ -1329,7 +1329,7 @@ mod ready_pipeline_tests {
             "updated_at": now,
             "retry_count": 0,
             "max_retries": 3,
-            "timeout_seconds": timeout_seconds,
+            "declared_duration_seconds": declared_seconds,
             "is_executable": true
         }))
         .unwrap();
@@ -1788,7 +1788,7 @@ mod ready_pipeline_tests {
         let task = test_task(60);
         let mut drifted = serde_json::to_value(&task).unwrap();
         // 同一个字段换了类型：这一份一定读不进 `Task`，而 `id` 毫发无伤。
-        drifted["timeout_seconds"] = serde_json::json!("sixty");
+        drifted["declared_duration_seconds"] = serde_json::json!("sixty");
         let bytes = serde_json::to_vec(&drifted).unwrap();
         assert!(
             serde_json::from_slice::<Task>(&bytes).is_err(),
@@ -2371,7 +2371,7 @@ mod ready_permit_fast_lane_tests {
             "updated_at": now,
             "retry_count": 0,
             "max_retries": 3,
-            "timeout_seconds": 5,
+            "declared_duration_seconds": 5,
             "is_executable": true
         }))
         .unwrap()

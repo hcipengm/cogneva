@@ -1798,16 +1798,15 @@ async fn distribute_via_daemonset(tar: &str, namespace: &str) -> Result<()> {
         run("kubectl", &["apply", "-f", &mstr]).await?;
         info!("注入镜像包到分发服务 Pod...");
         // 镜像服务是 Deployment（裸 Pod 被驱逐后无控制器重建，2026-09-14 实证
-        // 导致分发器永久 CrashLoop）；等 Available 后按 label 解析当前 Pod 名
-        // 再 cp。超时给足 10 分钟：空白机首拉 busybox 镜像（经镜像站）可能
-        // 远超 2 分钟，超时不等于失败
-        run(
-            "kubectl",
-            &[
-                "-n", namespace, "wait", "--for=condition=Available",
-                &format!("deployment/{}", cog_core::topology::IMAGE_SERVER),
-                "--timeout=600s",
-            ],
+        // 导致分发器永久 CrashLoop）；等它自己说齐了再按 label 解析当前 Pod 名
+        // 再 cp。空白机首拉 busybox 镜像（经镜像站）可能远超十分钟，所以这里没有
+        // 钟：过了申报点只说一句，收尾只认对象自己说齐、或平台自己判它停。
+        wait_workload_ready(
+            namespace,
+            "deployment",
+            cog_core::topology::IMAGE_SERVER,
+            IMAGE_SERVER_DECLARED,
+            "image server",
         )
         .await?;
         let cp_cmd = format!(
@@ -1830,19 +1829,17 @@ async fn distribute_via_daemonset(tar: &str, namespace: &str) -> Result<()> {
         )
         .await?;
         info!("等待全部分发节点完成导入（DaemonSet rollout）...");
-        run(
-            "kubectl",
-            &[
-                "-n",
-                namespace,
-                "rollout",
-                "status",
-                &format!("daemonset/{}", cog_core::topology::IMAGE_DISTRIBUTOR),
-                "--timeout=900s",
-            ],
+        wait_workload_ready(
+            namespace,
+            "daemonset",
+            cog_core::topology::IMAGE_DISTRIBUTOR,
+            IMAGE_DISTRIBUTOR_DECLARED,
+            "image distributor",
         )
         .await
-        .context("镜像分发超时：请检查节点 containerd socket 路径与 ctr 二进制（详见 deploy/k8s/README.md）")?;
+        .context(
+            "镜像分发未完成：请检查节点 containerd socket 路径与 ctr 二进制（详见 deploy/k8s/README.md）",
+        )?;
         Ok(())
     }
     .await;
@@ -1987,25 +1984,22 @@ async fn seed_cluster_registry(namespace: &str) -> Result<()> {
     // Pod may not even have its image pulled. 300s expired on a 6-core /
     // 12GiB machine whose install did finish, and the same wait passed on a
     // 12-core one -- the budget was measuring the machine, not the registry.
-    // It now matches the other image-landing wait in this file.
-    if let Err(e) = run(
-        "kubectl",
-        &[
-            "-n",
-            namespace,
-            "wait",
-            "--for=condition=Available",
-            &format!("deployment/{}", cog_core::topology::REGISTRY),
-            "--timeout=900s",
-        ],
+    // So there is no budget here any more: the wait ends when the object says
+    // it is whole, or when the platform declares it stalled.
+    if let Err(e) = wait_workload_ready(
+        namespace,
+        "deployment",
+        cog_core::topology::REGISTRY,
+        REGISTRY_DECLARED,
+        "cluster registry",
     )
     .await
     {
-        // Print what was on the machine when the budget ran out. Without it the
-        // log says only "wait timed out" -- the same words whether the registry
-        // is crash-looping or still pulling.
+        // Print what was on the machine when the wait ended. Without it the log
+        // says only "not ready" -- the same words whether the registry is
+        // crash-looping or still pulling.
         let _ = run("kubectl", &["-n", namespace, "get", "pods", "-o", "wide"]).await;
-        return Err(e).context("等待集群内 registry 就绪超时（上面是超时那一刻的 Pod 现场）");
+        return Err(e).context("集群内 registry 未就绪（上面是判定那一刻的 Pod 现场）");
     }
     // k3s 是多调用二进制（argv0=ctr），标准 containerd 直接用 ctr。
     let (program, ctr_prefix): (&str, &[&str]) = if command_exists("k3s").await {
@@ -3371,7 +3365,196 @@ fn chart_values() -> Result<serde_yaml::Value> {
     Ok(serde_yaml::from_str(&text)?)
 }
 
-/// 就绪门禁：两个 Deployment 都 rollout 成功才算装机完成。
+/// 等一个工作负载就绪时的轮询节拍。
+// cap: bound — 一拍的代价是一次 kubectl get；比它更密只是重复读同一份状态
+const WORKLOAD_POLL_SECS: u64 = 5;
+
+/// 对象不在集群里时，判词里的那一句。按它把「该组件没部署」与「还没就绪」分开：
+/// 两者在前台是同一条退出路径，处置完全不同（一个跳过、一个报失败）。
+const WORKLOAD_NOT_FOUND_MARKER: &str = "does not exist in this cluster";
+
+/// 镜像服务：申报的期望工期。空白机首拉 busybox（经镜像站）可能远超两分钟，而
+/// 过了点只是说一句、继续等，所以它是申报而不是预算。
+// cap: bound — 申报的期望工期（过了点只说话）；空白机首拉镜像的时长由机器与镜像站决定
+const IMAGE_SERVER_DECLARED: Duration = Duration::from_secs(600);
+
+/// 镜像分发 DaemonSet：逐节点导入整包镜像，时长随节点数与盘速变。
+// cap: bound — 申报的期望工期（过了点只说话）；逐节点导入的时长由节点数与盘速决定
+const IMAGE_DISTRIBUTOR_DECLARED: Duration = Duration::from_secs(900);
+
+/// 集群内 registry：播种基镜像前它自己要先起来，而它自己也可能在拉镜像。
+// cap: bound — 申报的期望工期（过了点只说话）；registry 自己的启动时长由镜像与盘速决定
+const REGISTRY_DECLARED: Duration = Duration::from_secs(900);
+
+/// 装机完成前的就绪门禁：两个工作负载各自滚动完成。
+// cap: bound — 申报的期望工期（过了点只说话）；它只说「比预期慢」，不收尾
+const READY_DECLARED: Duration = Duration::from_secs(180);
+
+/// 等一个 Deployment / DaemonSet 就绪，收尾只认**平台自己写的证据**。
+///
+/// 每拍读两样：这一代模板被控制器处理到哪一步、副本数与就绪数；以及平台写在
+/// `Progressing` 条件上的原因。收尾只有两种——对象自己说齐了；或者控制器在它自己的
+/// `progressDeadlineSeconds` 内看不到任何推进，写下 `ProgressDeadlineExceeded`。
+///
+/// 没有任何一道钟在这里收尾。空白机上首拉镜像、把镜像页写回盘都可能比任何一道钟长，
+/// 而那段时长与「这个组件坏了」是两件事：按钟收尾会把一次本来会自己好的装机判成失败，
+/// 而引导器一旦把「部署完成」交出去，使用者看到的是一个打不开也不能自愈的系统。
+/// 真正停住的东西不会漏掉：控制器的进度死线是它自己量的，推进一次就重新起算。
+struct WorkloadSettle<'a> {
+    namespace: &'a str,
+    /// `deployment` 或 `daemonset`：词表只有这两条，读法按它选。
+    kind: &'a str,
+    name: &'a str,
+}
+
+/// 工作负载读数的前两格：模板代数、控制器已经处理到的代数。两种读法都从这两格开始。
+const WORKLOAD_READOUT_HEAD: &str = "jsonpath={.metadata.generation}|{.status.observedGeneration}|";
+/// 读数的最后一格：平台写在 `Progressing` 条件上的原因（`ProgressDeadlineExceeded`
+/// 就是从这里读到的）。
+const WORKLOAD_READOUT_TAIL: &str = "{.status.conditions[?(@.type==\"Progressing\")].reason}";
+
+impl cog_core::declared_wall::SettleProbe for WorkloadSettle<'_> {
+    type State = String;
+
+    async fn step(&mut self) -> Result<cog_core::declared_wall::Step<String>, String> {
+        use cog_core::declared_wall::Step;
+        // 读法与 `cog-reflection` 那一侧同形：代数、观测到的代数、副本数、以及平台
+        // 写的原因。竖线占位保证缺字段（omitempty 的 updatedReplicas 等）不顶掉后面
+        // 字段的位置。
+        // 两种工作负载共用的头与尾各写一次：头是「这一代被处理到哪一步」，尾是平台写在
+        // `Progressing` 上的原因。抄第二遍的那一刻，改一处不会让另一处跟着改，而两处读
+        // 的是同一个判据。
+        let middle = if self.kind == "daemonset" {
+            "{.status.desiredNumberScheduled}|{.status.numberReady}|\
+             {.status.updatedNumberScheduled}|"
+        } else {
+            "{.spec.replicas}|{.status.updatedReplicas}|{.status.readyReplicas}|\
+             {.status.unavailableReplicas}|"
+        };
+        let query = format!("{}{middle}{}", WORKLOAD_READOUT_HEAD, WORKLOAD_READOUT_TAIL);
+        let out = Command::new("kubectl")
+            .args([
+                "-n",
+                self.namespace,
+                "get",
+                self.kind,
+                self.name,
+                "-o",
+                &query,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| format!("无法执行 kubectl get {} {}: {e}", self.kind, self.name))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            // 对象不在：外部自己给的答案（该组件未部署），不是「还没动」。
+            if stderr.contains("NotFound") || stderr.contains("not found") {
+                return Ok(Step::Failed(format!(
+                    "{} {} {WORKLOAD_NOT_FOUND_MARKER}: {stderr}",
+                    self.kind, self.name
+                )));
+            }
+            // 连不上、没权限：这一眼看不清，等待继续，日志留一行。
+            return Err(if stderr.is_empty() {
+                format!(
+                    "kubectl get {} {} returned no message",
+                    self.kind, self.name
+                )
+            } else {
+                stderr
+            });
+        }
+        let readout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if workload_settled(self.kind, &readout) {
+            return Ok(Step::Done(readout));
+        }
+        // 判词只属于**当前这一代**：`apply` 之后的第一眼往往早于控制器，那一段读数
+        // 里可能还带着上一代的 `ProgressDeadlineExceeded`，认了它就会把刚下发的一代
+        // 在第一次采样上判成坏的。代数追上了再说平台这一句话。
+        let (generation, observed) = cog_core::declared_wall::readout_generation(&readout);
+        if cog_core::declared_wall::platform_declares_stall(generation, observed, &readout) {
+            return Ok(Step::Failed(format!(
+                "{} {} was declared stalled by the platform ({}): its controller saw no progress \
+                 for its own progress deadline (last: {readout})",
+                self.kind,
+                self.name,
+                cog_core::declared_wall::PROGRESS_DEADLINE_EXCEEDED
+            )));
+        }
+        Ok(Step::Moving(readout))
+    }
+}
+
+/// 这一代模板被控制器处理过了没有：`observedGeneration` 追上 `metadata.generation`。
+///
+/// 没有这一条，`apply` 之后的第一眼读到的仍是上一代的账——那份账可能已经是齐的，
+/// 也可能是判死的。
+fn workload_generation_observed(readout: &str) -> bool {
+    let (generation, observed) = cog_core::declared_wall::readout_generation(readout);
+    cog_core::declared_wall::generation_reaches(generation, observed)
+}
+
+fn readout_number<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<i64> {
+    parts.next()?.trim().parse().ok()
+}
+
+/// 这份读数说这个工作负载齐了没有。
+///
+/// 期望值取自对象自己的读数，不在这里另抄一份——抄下来的数在 chart 改了之后会与
+/// 清单分叉，而这正是「按对象说齐了没有」要免掉的那类副本。任何一格读不出来都回答
+/// 「没齐」：读不到不是「已经够了」。
+fn workload_settled(kind: &str, readout: &str) -> bool {
+    if !workload_generation_observed(readout) {
+        return false;
+    }
+    let mut parts = readout.split('|').skip(2);
+    if kind == "daemonset" {
+        let (Some(desired), Some(ready), Some(updated)) = (
+            readout_number(&mut parts),
+            readout_number(&mut parts),
+            readout_number(&mut parts),
+        ) else {
+            return false;
+        };
+        ready >= desired && updated >= desired
+    } else {
+        let (Some(want), Some(updated), Some(ready), Some(unavailable)) = (
+            readout_number(&mut parts),
+            readout_number(&mut parts),
+            readout_number(&mut parts),
+            readout_number(&mut parts),
+        ) else {
+            return false;
+        };
+        ready >= want && updated >= want && unavailable == 0
+    }
+}
+
+/// 等一个工作负载就绪，`declared` 只是申报的期望工期：过了点由控制律说一句、继续等。
+async fn wait_workload_ready(
+    namespace: &str,
+    kind: &str,
+    name: &str,
+    declared: Duration,
+    what: &str,
+) -> Result<String> {
+    cog_core::declared_wall::wait_for_settled_with(
+        declared,
+        what,
+        &format!("bootstrap-{kind}-{name}"),
+        Duration::from_secs(WORKLOAD_POLL_SECS),
+        WorkloadSettle {
+            namespace,
+            kind,
+            name,
+        },
+    )
+    .await
+    .map_err(anyhow::Error::msg)
+}
+
+/// 就绪门禁：两个 Deployment 都滚动完成才算装机完成。
 ///
 /// 未就绪**不是**告警：调用方在这之后就会打印"部署完成"、建端口转发、打开浏览器
 /// ——把一个没起来的系统当成功交出去，使用者看到的是一个打不开的页面，而唯一的
@@ -3386,33 +3569,18 @@ async fn wait_ready(namespace: &str) -> Result<()> {
         cog_core::topology::MAIN_DEPLOYMENT,
         cog_core::topology::SECURITY_GATEWAY,
     ] {
-        let out = Command::new("kubectl")
-            .args([
-                "-n",
-                namespace,
-                "rollout",
-                "status",
-                &format!("deployment/{deploy}"),
-                "--timeout=180s",
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .with_context(|| format!("无法执行 kubectl rollout status deployment/{deploy}"))?;
-        if out.status.success() {
-            continue;
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if stderr.contains("NotFound") || stderr.contains("not found") {
+        let what = format!("deployment/{deploy}");
+        let detail =
+            match wait_workload_ready(namespace, "deployment", deploy, READY_DECLARED, &what).await
+            {
+                Ok(_) => continue,
+                Err(e) => e.to_string(),
+            };
+        if detail.contains(WORKLOAD_NOT_FOUND_MARKER) {
             warn!("deployment/{deploy} 不存在，视为该组件未部署（安全网关注销？）");
             continue;
         }
-        let detail = if stderr.is_empty() {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        } else {
-            stderr
-        };
-        warn!("deployment/{deploy} 未在超时内 Ready: {detail}");
+        warn!("deployment/{deploy} 未就绪: {detail}");
         not_ready.push(deploy);
     }
     if !not_ready.is_empty() {

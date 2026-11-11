@@ -9,7 +9,7 @@
 //!   * A lost update is one interleaving away. Two writers that read the same
 //!     document and each change a different field overwrite each other, and no
 //!     constraint can say which of the two the second one meant to keep.
-//!   * A value read once is frozen forever. `timeout_seconds` was computed from
+//!   * A value read once is frozen forever. `declared_duration_seconds` was computed from
 //!     measured samples at planning time and copied into the document; nothing
 //!     recomputed it, so tasks planned on 2026-11-08 still carried 3600 when
 //!     the export of that hour said 3463.
@@ -131,7 +131,7 @@ pub(crate) struct LedgerRow {
     pub created_at: DateTime<Utc>,
     pub priority: i32,
     pub max_retries: i32,
-    pub timeout_seconds: i64,
+    pub declared_duration_seconds: i64,
     pub is_executable: bool,
     pub acceptance: Vec<String>,
     pub blocked_by: Vec<String>,
@@ -219,7 +219,7 @@ impl LedgerRow {
             max_retries: self.max_retries.max(0) as u32,
             retry_not_before: self.not_before,
             started_at: self.started_at,
-            timeout_seconds: self.timeout_seconds.max(0) as u64,
+            declared_duration_seconds: self.declared_duration_seconds.max(0) as u64,
             lease_owner: self.lease_owner,
             lease_expires_at: self.lease_expires_at,
             action_planner_meta,
@@ -269,7 +269,7 @@ SELECT d.workspace_id       AS workspace_id,
        d.created_at         AS created_at,
        d.priority           AS priority,
        d.max_retries        AS max_retries,
-       d.timeout_seconds    AS timeout_seconds,
+       d.declared_duration_seconds    AS declared_duration_seconds,
        d.is_executable      AS is_executable,
        d.acceptance         AS acceptance,
        d.blocked_by         AS blocked_by,
@@ -475,7 +475,7 @@ pub(crate) async fn save_definition(
                COALESCE(bool_or(
                    kind = $3 AND input = $4 AND created_at = $5
                    AND priority = $6 AND max_retries = $7
-                   AND timeout_seconds = $8 AND is_executable = $9
+                   AND declared_duration_seconds = $8 AND is_executable = $9
                    AND acceptance = $10 AND blocked_by = $11
                    AND agent_id IS NOT DISTINCT FROM $12
                    AND goal_id IS NOT DISTINCT FROM $13
@@ -501,7 +501,7 @@ pub(crate) async fn save_definition(
     .bind(task.created_at)
     .bind(task.priority)
     .bind(task.max_retries as i32)
-    .bind(task.timeout_seconds as i64)
+    .bind(task.declared_duration_seconds as i64)
     .bind(task.is_executable)
     .bind(&task.acceptance)
     .bind(&task.blocked_by)
@@ -534,7 +534,7 @@ pub(crate) async fn save_definition(
         r#"
         INSERT INTO task_defined (
             task_id, rev, at, workspace_id, kind, input, created_at, priority,
-            max_retries, timeout_seconds, is_executable, acceptance, blocked_by,
+            max_retries, declared_duration_seconds, is_executable, acceptance, blocked_by,
             agent_id, goal_id, parent_task_id, sink_task_id, face_id, venue,
             owner_unit, bound_by_handover_id, submitted_by, planner_verified,
             planner_version, planner_note, planner_source, planner_confidence,
@@ -552,7 +552,7 @@ pub(crate) async fn save_definition(
     .bind(task.created_at)
     .bind(task.priority)
     .bind(task.max_retries as i32)
-    .bind(task.timeout_seconds as i64)
+    .bind(task.declared_duration_seconds as i64)
     .bind(task.is_executable)
     .bind(&task.acceptance)
     .bind(&task.blocked_by)

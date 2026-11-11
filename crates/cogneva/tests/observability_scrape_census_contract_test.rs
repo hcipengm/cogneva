@@ -303,6 +303,22 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // rather than as `NotAReading` because each one does carry a fact -- a
     // share of the graph and the moment it was measured -- and as gaps rather
     // than `Elsewhere` because no face reads that fact anywhere today.
+    // The flight's age lost its reader on 2026-11-11, when the wall it was
+    // compared against went out with the rest of the clock-based stops. The
+    // pair was `cogneva_evolution_change_flight_seconds` against
+    // `cogneva_evolution_change_flight_budget_seconds`, and both the rule and
+    // the budget series are gone: each step of the flight is stopped by whether
+    // it is moving, so a flight that waits out a long build slot and then runs
+    // a long test is healthy, and a line on the total went red on exactly those
+    // flights. The age is still published, to be read beside the step errors;
+    // what it is owed is not a reader but a bound, and no bound exists once each
+    // step carries its own measured window. Filed as a gap rather than as
+    // `NotAReading` because the age does carry a fact, and rather than as
+    // `Elsewhere` because no face states it.
+    (
+        "cogneva_evolution_change_flight_seconds",
+        Unread::Gap("how long the change now in the flight has been in it, with no rule on it since the flight's wall was removed: each step of the flight is now stopped when it stops moving, so the total has no duration above which a still-stepping flight is stuck, and the reading is left to be read beside the step errors"),
+    ),
     (
         "cogneva_project_control_coverable_rows",
         Unread::Gap("how many rows the earned-value arithmetic could cover, published with no reader since the baseline alert came off; the reader owed here is the estimator's own skip counter, not an alert on a cold-start population"),
@@ -526,7 +542,7 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// behind its own commentary. The debt is real -- nothing draws those three --
 /// and the reader they are owed is on the producing side rather than in a
 /// rule.
-const GAPS_AT_SCRAPE_CENSUS: usize = 3;
+const GAPS_AT_SCRAPE_CENSUS: usize = 4;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
@@ -585,6 +601,16 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 3;
 /// published for and the reason the dashboard comment above describes it as
 /// registered ahead of a reader. The rest of the family is still counted here;
 /// only the running flag left. The row also stays in the produced table.
+///
+/// Seven, unchanged, and the reason is worth keeping: on 2026-11-11
+/// `cogneva_evolution_change_flight_seconds` lost its reader when the flight's
+/// wall was removed with the clock-based stops, and it did not land here. Its
+/// rule compared the age against `cogneva_evolution_change_flight_budget_seconds`,
+/// and both went because each step of the flight is now stopped by motion, not
+/// by a duration. The count above is of names still registered on one of the two
+/// produced tables; this series came off the alert-rule table with its rule, so
+/// it is owed a face rather than a reader, and `UNREGISTERED` carries that debt
+/// with its own count.
 const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 7;
 
 #[test]

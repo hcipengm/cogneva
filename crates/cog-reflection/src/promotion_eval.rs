@@ -505,7 +505,7 @@ pub fn promotion_eval_task(change_id: &str, rev: &str, repo: &Path, timeout_secs
             "repo": repo.display().to_string(),
         }),
     );
-    task.timeout_seconds = timeout_secs;
+    task.declared_duration_seconds = timeout_secs;
     task.acceptance
         .push(promotion_eval_acceptance(change_id, rev));
     task
@@ -518,7 +518,7 @@ pub fn promotion_eval_task(change_id: &str, rev: &str, repo: &Path, timeout_secs
 /// 上限来算——等待方已经不再有上限了（等的人等到终态为止），所以「等了多久」这
 /// 个读数在这个进程里已经不存在；留下的问题只是「这一行是不是被丢下了」，而这
 /// 与一件活跑了多久无关。
-// cap: override — 只收从没被认领过的行，收掉不杀任何在跑的活；这个数只回答「放这么久还没人认领就是孤儿」
+// cap: bound — 只收从没被认领过的行，收掉不杀任何在跑的活；这个数只回答「放这么久还没人认领就是孤儿」
 pub const ABANDONED_PROMOTION_EVAL_GRACE: Duration = Duration::from_secs(7200);
 
 /// 这一行是不是这道门交上去、而再没有人会来读的行。

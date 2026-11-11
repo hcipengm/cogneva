@@ -131,14 +131,15 @@ pub const PLATFORM_BASE_ENV: &str = "COG_EVAL_PLATFORM_BASE";
 /// 平台 API 的 bearer token。平台的运营路由按角色判，多数部署要带一枚；未设置时
 /// 按匿名发，收不收由服务侧的鉴权层决定。
 pub const PLATFORM_TOKEN_ENV: &str = "COG_EVAL_PLATFORM_TOKEN";
-/// 一题在平台侧最多等多久（秒）。
+/// 桥替一题申报的期望工期（秒）。过了它只说一句，不杀任何东西。
 pub const PLATFORM_DEADLINE_ENV: &str = "COG_EVAL_PLATFORM_DEADLINE_SECS";
-/// 行上的预算比桥的等待短多少秒。
+/// 行上声明的时长比桥申报的期望短多少秒。
 ///
-/// 这一段的用途只有一个：让平台成为先判超时的那一方。反过来（桥先放弃）时，表里那一格
-/// 只剩「平台没跑完」，平台本来会写下的原因就没人读得到了。
-// cap: bound — 一次轮询到下一轮的余量；比 POLL_INTERVAL 大，才能在放弃前读到平台写的终态
-const PLATFORM_BUDGET_MARGIN_SECS: u64 = 30;
+/// 这一段的用途只有一个：桥对一道题的期望与它写进行的那条声明不该是同一个数——
+/// 否则「桥开始说超期」与「这一行刚好到期」同时发生，读的人分不清是哪一方说的。
+/// 两个数都不杀任何东西：判一条正在跑的活停没停，读的是租约与实测步间隔。
+// cap: bound — 两个申报值之间的余量；比 POLL_INTERVAL 大，才不会在同一拍上互相盖住
+const PLATFORM_DECLARED_MARGIN_SECS: u64 = 30;
 
 /// 接活的人读到的做法：这道题要交回什么。
 ///
@@ -154,9 +155,10 @@ const CASE_CONTRACT: &str = "Answer one benchmark question. The question is in \
 /// 而提交方读到的只是 202。所以这一条是这道桥能跑起来的一部分，不是装饰。
 const CASE_ACCEPTANCE: &str =
     "The reply answers the question in `task`, in the form that question asks for.";
-// cap: bound — a platform case's wall budget; a case that cannot finish must not be scored
+// cap: bound — the expectation the bridge declares for one case; passing it only publishes a
+// line, and a case that must stop is stopped by the platform's lease-and-motion verdict
 const DEFAULT_DEADLINE_SECS: u64 = 3600;
-// cap: bound — polling period for a submitted platform case; the wall budget is DEFAULT_DEADLINE_SECS
+// cap: bound — polling period for a submitted platform case; the declared wall is DEFAULT_DEADLINE_SECS
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// 轨迹列表一次取多少条。按最近的排，刚跑完的那条在最前面。
 // cap: bound — 按最近的排，刚跑完的那条在最前；一页够翻，再多也没有人在看
@@ -447,9 +449,8 @@ impl PlatformApiRunner {
     /// 投进去的这一行变成占位符。带着这两项，这一行直接进图、由名册上的一位员工接走，
     /// 题面在 `input.task` 上（活的做法在 `input.contract`，判据在 `input.acceptance`）。
     ///
-    /// 行上的 `timeout_seconds` 比桥自己的等待短一段：平台先判超预算，这里才能把平台
-    /// 报的原因写进表；反过来这里是先超时的那一方，一格「平台没说话」会把平台自己
-    /// 说过的原因盖掉。
+    /// 行上声明的时长比桥自己的等待短一段：桥的等待先到，这里才能把「平台没说话」
+    /// 那段读成桥自己的界，而不是被平台那一路盖掉。
     async fn submit(&self, case_id: &str, request: &PlatformRequest) -> anyhow::Result<()> {
         // 键名从契约里取，不在这里各拼一遍：做法那一栏的键名由渲染它的运行时定，
         // 请求那一栏同理——两边各写一个字符串，改了一边另一边就把它读成普通材料。
@@ -475,8 +476,8 @@ impl PlatformApiRunner {
                 // 「在哪儿做」是另一列，场地读数靠它分组。
                 "venue": "eval",
                 "input": input,
-                "timeout_seconds": self.settings.deadline_secs.saturating_sub(
-                    PLATFORM_BUDGET_MARGIN_SECS
+                "declared_duration_seconds": self.settings.deadline_secs.saturating_sub(
+                    PLATFORM_DECLARED_MARGIN_SECS
                 ).max(1),
                 "blocked_by": [],
                 "priority": 0,
@@ -506,26 +507,50 @@ impl PlatformApiRunner {
     /// 轮询的是**投进去的那一行**：平台把这道题拆了的话，它会是一条不可执行的占位行，
     /// 终态由它点出的那条任务带过来（见本段开头的两条约定）。返回时占位行上带着那条
     /// 声明，调用方据此去读真正干活的那一行。
+    ///
+    /// 等多久不是判据：这道题要停，由平台按租约与实测步间隔去判（回收判据在那一边），
+    /// 桥只等它自己走到终态。过了申报的墙说一句、继续等。
+    ///
+    /// 这里**不**拿 `stall` 判停，理由是界量不到：那条律的界是「这份进程干活时最多
+    /// 静默过多久」，样本来自一步一步的推进；而这一行的读数一次跑只变两三次
+    /// （Pending → Running → 终态），拿进程级那枚界去比它，等于把「平台正常地算着
+    /// 一道题」读成停住——界是为另一种节奏量的，套过来就是误杀。这道题自己有一份
+    /// 回收判据（租约、实测步间隔），它判停、它把结论写回这一行；桥读到的终态或
+    /// 者读失败（平台不答了）都是直接证据，两个里任何一个到了这里才收尾。
     async fn await_terminal(&self, case_id: &str) -> anyhow::Result<TaskFacts> {
-        let deadline = Duration::from_secs(self.settings.deadline_secs);
-        let started = std::time::Instant::now();
-        loop {
-            let facts = self.fetch_facts(case_id).await?;
-            // 终态按声明判，不按拼法判：读面印的是 `TaskStatus::as_str` 的词，写死另一种
-            // 拼法的话这里一个终态都认不出来，那道题会一直轮询到预算耗尽再报「平台没跑完」。
-            if TaskStatus::parse(&facts.status).is_some_and(|status| status.is_terminal()) {
-                return Ok(facts);
-            }
-            if started.elapsed() >= deadline {
-                anyhow::bail!(
-                    "the platform left task {case_id} in {} for the whole {}s budget: a case that \
-                     cannot finish must not be scored as an answer",
-                    facts.status,
-                    self.settings.deadline_secs
-                );
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
+        let declared = Duration::from_secs(self.settings.deadline_secs);
+        let channel = format!("eval-case-{case_id}");
+        cog_core::declared_wall::wait_past_wall(
+            declared,
+            "the platform case submitted for scoring",
+            async {
+                let mut last: Option<String> = None;
+                loop {
+                    let facts = self.fetch_facts(case_id).await?;
+                    // 终态按声明判，不按拼法判：读面印的是 `TaskStatus::as_str` 的词，写死
+                    // 另一种拼法的话这里一个终态都认不出来。
+                    if TaskStatus::parse(&facts.status).is_some_and(|status| status.is_terminal()) {
+                        return Ok(facts);
+                    }
+                    // 推进的证据只有这一行自己的读数：状态变了、错误出现了、拆解声明
+                    // 落上来了，都是它在动。轮询本身不算——那会让判据永远不响。记这一拍
+                    // 是为了容器外那个探针：它读进度文件的 mtime，等着的桥也得让那份文件
+                    // 跟上平台的动静。
+                    let reading = format!(
+                        "{}|{}|{}",
+                        facts.status,
+                        facts.error.is_some(),
+                        facts.sink_task_id.is_some()
+                    );
+                    if last.as_deref() != Some(reading.as_str()) {
+                        last = Some(reading);
+                        cog_core::progress::mark(&channel);
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+            },
+        )
+        .await
     }
 
     /// 取这道题的执行轨迹。列表按最近排，刚跑完的那条在最前面。
@@ -1067,7 +1092,7 @@ mod tests {
                 .is_some_and(|a| !a.trim().is_empty()),
             "a verified row must state what its answer has to look like"
         );
-        assert!(sent["tasks"][0]["timeout_seconds"]
+        assert!(sent["tasks"][0]["declared_duration_seconds"]
             .as_u64()
             .is_some_and(|s| s > 0));
         // 做法随活一起走：接活的人不知道这是评测，只有这一句告诉他答案要放在正文里。
@@ -1163,22 +1188,30 @@ mod tests {
         );
     }
 
+    /// 平台没把这道题送进终态时，桥不替它下结论：这道题该不该停，由平台自己的
+    /// 回收判据（租约、实测步间隔）给直接证据；桥这一侧量不到界，就继续等。
+    ///
+    /// 「等到申报的期限就记零分」是拿我们的钟换平台的心跳：它交出去的不是一个
+    /// 没跑完的答案，而是一个假装跑完了的零分。反过来，申报的期限到点仍要说一句
+    /// （`wait_past_wall`），只是不收尾。
     #[tokio::test]
-    async fn a_case_that_never_finishes_is_an_error_not_a_zero() {
+    async fn a_case_that_never_finishes_is_waited_on_not_scored() {
         let id = case_task_id(&request("slow question", 0));
         let fake = FakePlatform::new(
             task_view(&id, cog_core::TaskStatus::Pending, None, None),
             trace_for(&id),
         );
         let served = Served::start(fake).await;
-        let err = served
-            .runner(0)
-            .run(request("slow question", 0))
-            .await
-            .expect_err("a case that cannot finish must not be scored");
-        let text = err.to_string();
-        assert!(text.contains(TaskStatus::Pending.as_str()), "{text}");
-        assert!(text.contains("cannot finish"), "{text}");
+        // 申报期限 0：第一眼就过墙。过墙之后要么收尾、要么继续等——这条锁后一半。
+        let observed = tokio::time::timeout(
+            Duration::from_secs(12),
+            served.runner(0).run(request("slow question", 0)),
+        )
+        .await;
+        assert!(
+            observed.is_err(),
+            "a case the platform has not finished must not be turned into a score at the declared wall"
+        );
     }
 
     #[tokio::test]

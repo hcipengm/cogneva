@@ -175,16 +175,33 @@ pub struct TaskItem {
     /// row filed without one is visible only in the unfiltered task list.
     #[serde(default)]
     pub venue: Option<String>,
-    /// How long this row may stay open before the graph fails it.
+    /// How long the submitter declares this work will take, in seconds.
     ///
-    /// The default on a task is sized for one dispatched round. A row a worker
-    /// holds across many heartbeats is a different shape, and the over-budget
-    /// rule reads the age of the row rather than the liveness of its holder --
-    /// so without a stated budget such a row is failed while its owner is
-    /// demonstrably alive. That is the submitter's call to make, not something
-    /// to infer from the row's type.
+    /// A declaration, not a deadline: nothing in the platform ends a running row
+    /// by comparing its age to this number. Reclaim reads two things instead --
+    /// whether the holder's lease expired, and whether the attempt stopped
+    /// moving (`cog_core::declared_wall::stall`) -- because a row whose owner is
+    /// demonstrably alive and whose work is demonstrably progressing must not be
+    /// failed for having taken a while. What this field does is size the
+    /// expectations around the row: producers read it back as "how long this
+    /// kind of work should take", and the ledger counts rows that outlived their
+    /// own declaration (`past_its_declaration`), which is a reading and not a
+    /// verdict.
+    ///
+    /// Zero is not "no limit": it declares a duration of nothing, so every
+    /// reader that sizes its patience from the row reads the smallest duration
+    /// there is before the work has started. A submitter that means "no limit"
+    /// has to say a length.
     #[serde(default)]
-    pub timeout_seconds: Option<u64>,
+    pub declared_duration_seconds: Option<u64>,
+    /// The field's old name, kept only so the door can refuse it by name.
+    ///
+    /// A rename that lets the old spelling fall through would be read as an
+    /// unknown field and silently replaced by the default -- a submitter who
+    /// asked for an hour would get the row's five minutes and a 202. Naming it
+    /// here turns that into a 400 that says what to send instead.
+    #[serde(default, rename = "timeout_seconds")]
+    pub renamed_timeout_seconds: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -345,7 +362,7 @@ pub struct TaskView {
     pub retry_not_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
-    pub timeout_seconds: u64,
+    pub declared_duration_seconds: u64,
     /// 服务哪个面（面节点的这一列指向自己）。`None` 是不服务任何面，不是默认面。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub face_id: Option<String>,
@@ -389,7 +406,7 @@ impl From<Task> for TaskView {
             lease_expires_at: t.lease_expires_at.map(|at| at.to_rfc3339()),
             retry_not_before: t.retry_not_before.map(|at| at.to_rfc3339()),
             started_at: t.started_at.map(|at| at.to_rfc3339()),
-            timeout_seconds: t.timeout_seconds,
+            declared_duration_seconds: t.declared_duration_seconds,
             face_id: t.face_id,
             bound_by_handover_id: t.bound_by_handover_id,
             venue: t.venue,
@@ -734,18 +751,34 @@ fn injected_row_without_acceptance(req: &CreateTaskRequest) -> Option<&str> {
     })
 }
 
-/// The first row in this submission that states a budget of zero seconds.
+/// The first row in this submission that states a duration of zero seconds.
 ///
-/// Zero is not "no limit" -- the over-budget rule compares the age of the row
-/// against this number, so zero reads as "over budget before it started": the
-/// row is accepted, queued, and failed on the first sweep. A submitter that
-/// meant "no limit" has to say a length, and this check is what tells them
-/// their row was read the other way.
-fn row_with_zero_budget(req: &CreateTaskRequest) -> Option<&str> {
+/// Zero is not "no limit". A duration of zero declares that this work is
+/// expected to take no time at all, and every reader of the field -- the
+/// ledger's `past_its_declaration`, the producers sizing a wait against it --
+/// reads it as the smallest duration there is. A submitter that meant "no
+/// limit" has to say a length, and this check is what tells them their row was
+/// read the other way.
+fn row_with_zero_duration(req: &CreateTaskRequest) -> Option<&str> {
     req.tasks
         .as_ref()?
         .iter()
-        .find(|item| item.timeout_seconds == Some(0))
+        .find(|item| item.declared_duration_seconds == Some(0))
+        .map(|item| item.id.as_str())
+}
+
+/// The first row that still spells the declared duration `timeout_seconds`.
+///
+/// The name moved when the meaning did: the row's number is a declaration, and
+/// `timeout` in this tree means the point at which something is killed. A body
+/// that still says `timeout_seconds` parses into nothing, so without this check
+/// the row would be filed on its default while its submitter read a 202 -- the
+/// quiet half of a rename.
+fn row_with_the_old_duration_name(req: &CreateTaskRequest) -> Option<&str> {
+    req.tasks
+        .as_ref()?
+        .iter()
+        .find(|item| item.renamed_timeout_seconds.is_some())
         .map(|item| item.id.as_str())
 }
 
@@ -790,8 +823,8 @@ fn submitted_tasks(
                     // being layered under it: a submitter that says "this stays
                     // open for a week" is answering the same question the
                     // default answers.
-                    if let Some(secs) = item.timeout_seconds {
-                        task.timeout_seconds = secs;
+                    if let Some(secs) = item.declared_duration_seconds {
+                        task.declared_duration_seconds = secs;
                     }
                     // Only a submission that says it is a task can carry the
                     // "no planning needed" claim. A goal is decomposed by
@@ -920,15 +953,28 @@ pub async fn create_task_handler(
         .with_code("acceptance_required"));
     }
 
-    // A budget of zero is refused here rather than read as "no limit": it is
-    // the number the over-budget sweep compares against, so the row would be
-    // failed before it ever ran -- while the submitter read a 202.
-    if let Some(id) = row_with_zero_budget(&req) {
+    // The field was called `timeout_seconds`, and a submitter who still sends
+    // that spelling must be told so: an unknown key would be dropped and the
+    // row would fall back to its default while the submitter read a 202.
+    if let Some(id) = row_with_the_old_duration_name(&req) {
         return Err(ApiError::bad_request(format!(
-            "task {id} states a budget of 0 seconds, which is over budget before it starts; \
-             say how long the row may stay open"
+            "task {id} carries `timeout_seconds`, which is now `declared_duration_seconds`: \
+             the row's number is the length its submitter declares, not a point at which \
+             anything is killed. Send the same number under the new name."
         ))
-        .with_code("timeout_required"));
+        .with_code("renamed_field"));
+    }
+
+    // A duration of zero is refused here rather than read as "no limit": the
+    // number is what a reader sizes its own patience from, so a zero hands
+    // every reader the smallest duration there is before the work starts --
+    // while the submitter read a 202.
+    if let Some(id) = row_with_zero_duration(&req) {
+        return Err(ApiError::bad_request(format!(
+            "task {id} states a declared duration of 0 seconds, which declares the work takes \
+             no time at all; say how long the row declares it will take"
+        ))
+        .with_code("duration_required"));
     }
 
     // A row that names a face or a unit is checked against the roster here,
@@ -2515,7 +2561,8 @@ mod tests {
                 face_id: None,
                 unit_id: None,
                 venue: None,
-                timeout_seconds: None,
+                declared_duration_seconds: None,
+                renamed_timeout_seconds: None,
             }]),
             workspace_id: "ws".into(),
             priority: None,
@@ -2599,7 +2646,8 @@ mod tests {
             face_id: None,
             unit_id: None,
             venue: None,
-            timeout_seconds: None,
+            declared_duration_seconds: None,
+            renamed_timeout_seconds: None,
         }
     }
 
@@ -2777,13 +2825,13 @@ mod tests {
         );
     }
 
-    /// 提交者声明的预算要真的落到行上。超预算判据读的是**行的年龄**、不看心跳，
-    /// 所以一条跨很多次心跳的行如果在这里丢掉预算，就会在它主人还活着的时候被判
-    /// 超时——而门口回的是 202。
+    /// 提交者声明的时长要真的落到行上。行上是**声明**，不是刀：回收读的是租约
+    /// 和实测的步间窗口，这个数只喂给台账里「过了自己声明的时长」那条读数。丢掉
+    /// 它不会砍行，但会让那条读数对着一个别人编的值说话。
     #[test]
-    fn a_stated_budget_lands_on_the_row() {
+    fn a_stated_duration_lands_on_the_row() {
         let mut item = task_item("t1", Some(true));
-        item.timeout_seconds = Some(7 * 24 * 60 * 60);
+        item.declared_duration_seconds = Some(7 * 24 * 60 * 60);
         let req = CreateTaskRequest {
             goal_id: None,
             goal: "hold this for a while".into(),
@@ -2794,15 +2842,15 @@ mod tests {
         };
         let tasks = submitted_tasks(&req, "g", None);
         assert_eq!(
-            tasks[0].timeout_seconds,
+            tasks[0].declared_duration_seconds,
             7 * 24 * 60 * 60,
-            "the submitter's budget is the one the sweep will read"
+            "the submitter's declaration is the one the ledger reading will compare"
         );
     }
 
-    /// 没声明预算的行保持原来的默认值：这条口子不许把「没说话」读成「无限期」。
+    /// 没声明时长的行保持原来的默认值：这条口子不许把「没说话」读成「零」。
     #[test]
-    fn a_row_that_states_no_budget_keeps_the_executor_default() {
+    fn a_row_that_states_no_duration_keeps_the_executor_default() {
         let req = CreateTaskRequest {
             goal_id: None,
             goal: "one round".into(),
@@ -2812,15 +2860,15 @@ mod tests {
             intent_kind: IntentKind::Task,
         };
         let tasks = submitted_tasks(&req, "g", None);
-        assert_eq!(tasks[0].timeout_seconds, 300);
+        assert_eq!(tasks[0].declared_duration_seconds, 300);
     }
 
-    /// 0 秒不是「不限时」：判据拿它比行的年龄，所以 0 读作「还没开始就超预算」。
-    /// 这一条要在门口点名，而不是收下以后在第一次扫描里判死。
+    /// 0 秒不是「不限时」：它声明这件活不花时间，台账里那条读数就会在行刚开时
+    /// 说它已经过了自己的声明。这一条要在门口点名，而不是收下以后让读数去说。
     #[test]
-    fn a_zero_budget_is_named_at_the_door() {
+    fn a_zero_duration_is_named_at_the_door() {
         let mut item = task_item("t1", Some(true));
-        item.timeout_seconds = Some(0);
+        item.declared_duration_seconds = Some(0);
         let req = CreateTaskRequest {
             goal_id: None,
             goal: "no limit".into(),
@@ -2829,7 +2877,49 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Task,
         };
-        assert_eq!(row_with_zero_budget(&req), Some("t1"));
+        assert_eq!(row_with_zero_duration(&req), Some("t1"));
+    }
+
+    /// 旧名必须被门口认出来、回 400 点名新名。serde 默认会把未知键静静丢掉，
+    /// 于是提交者写 `timeout_seconds` 的行会落回默认值，而他读到的是一个 202。
+    #[test]
+    fn the_old_budget_name_is_named_at_the_door_not_dropped() {
+        let body = serde_json::json!({
+            "goal": "do the thing",
+            "workspace_id": "ws",
+            "intent_kind": "task",
+            "tasks": [{
+                "id": "t1",
+                "task_type": "benchmark_case",
+                "input": { "x": 1 },
+                "timeout_seconds": 3600,
+            }],
+        });
+        let req: CreateTaskRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(row_with_the_old_duration_name(&req), Some("t1"));
+        assert!(
+            row_with_zero_duration(&req).is_none(),
+            "旧名不是零值错误：两条拒绝各有各的码"
+        );
+
+        let body = serde_json::json!({
+            "goal": "do the thing",
+            "workspace_id": "ws",
+            "intent_kind": "task",
+            "tasks": [{
+                "id": "t1",
+                "task_type": "benchmark_case",
+                "input": { "x": 1 },
+                "declared_duration_seconds": 3600,
+            }],
+        });
+        let req: CreateTaskRequest = serde_json::from_value(body).unwrap();
+        assert!(row_with_the_old_duration_name(&req).is_none());
+        let tasks = submitted_tasks(&req, "g", None);
+        assert_eq!(
+            tasks[0].declared_duration_seconds, 3600,
+            "新名是收的，而且落下的是提交者说的那个数"
+        );
     }
 
     /// 一条什么都不说的直注行在门口就被点名，而不是被收下以后静静躺在板上。
@@ -3014,7 +3104,7 @@ mod tests {
         t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
         t.retry_not_before = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
         t.started_at = Some(chrono::Utc::now());
-        t.timeout_seconds = 900;
+        t.declared_duration_seconds = 900;
         t.face_id = Some("face-resources".into());
         t.bound_by_handover_id = Some("handover-7".into());
 
@@ -3028,7 +3118,7 @@ mod tests {
         assert!(view.lease_expires_at.is_some());
         assert!(view.retry_not_before.is_some());
         assert!(view.started_at.is_some());
-        assert_eq!(view.timeout_seconds, 900);
+        assert_eq!(view.declared_duration_seconds, 900);
         assert_eq!(view.face_id.as_deref(), Some("face-resources"));
         assert_eq!(view.bound_by_handover_id.as_deref(), Some("handover-7"));
     }

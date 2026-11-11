@@ -30,6 +30,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# `declared_wall` 的判据里有一半是「什么时候**不**说」，那一半只能从订阅侧观察：
+# 只剩「说了」的那一半时，错的正是没说错的那一次。
+tracing-subscriber = { workspace = true }
 # `start_paused` 只在这个 crate 自己的测试里用。工作区里别的 crate 打开了它，
 # 所以整树 `cargo test` 一直是绿的，而 `cargo test -p cog-core` 单跑编译不过——
 # 一个 crate 的测试必须是能单独跑的测试。

@@ -48,28 +48,28 @@
       {
         "id": "github-assess-timeout",
         "file": "crates/cog-github/src/discovery_loop.rs",
-        "symbol": "ASSESS_TASK_TIMEOUT_SECS",
+        "symbol": "ASSESS_TASK_DECLARED_SECS",
         "value": "120s",
         "why": "它是提交方写进任务契约的声明，不是平台手里的刀：crates/cog-core/src/contract/work_item.rs 写明平台不按任何已用时长掐一件正在跑的活，所以这个数只说明这张问票预期多久，删掉它只是抹掉一条可读的意图。真正决定放不放弃的是这一侧自己的耐心 ASSESS_WAIT_TIMEOUT_SECS——那也不是判决，交活的一方停止等待时活还在跑，结果照样落到行上。两者都不是「到点杀掉正在干活的进程」，不该按 declared_wall 改。"
       },
       {
         "id": "github-cross-validate-timeout",
         "file": "crates/cog-github/src/discovery_loop.rs",
-        "symbol": "CROSS_VALIDATE_TASK_TIMEOUT_SECS",
+        "symbol": "CROSS_VALIDATE_TASK_DECLARED_SECS",
         "value": "3600s",
         "why": "同上一条：写进任务契约的是提交方的预期，平台不按它掐活；交叉验证跑得久只说明它还在跑，放弃等待的是调用方那一侧，而不是把正在复核的东西扔掉。"
       },
       {
         "id": "memory-extract-timeout",
         "file": "crates/cog-memory/src/extractor.rs",
-        "symbol": "EXTRACT_TASK_TIMEOUT_SECS",
+        "symbol": "EXTRACT_TASK_DECLARED_SECS",
         "value": "180s",
         "why": "写进任务契约的是提交方对一次抽取的预期，平台不按它掐正在跑的抽取。真正会让人以为「失败了」的是等待那一侧的 EXTRACT_WAIT_TIMEOUT_SECS，而它按契约只是这一侧的耐心：停止等待时活还在跑，答案照样落到行上，所以它也没有杀任何东西，两条都不该按 declared_wall 改。"
       },
       {
         "id": "wiki-distill-timeout",
         "file": "crates/cog-wiki/src/distiller.rs",
-        "symbol": "DISTILL_TASK_TIMEOUT_SECS",
+        "symbol": "DISTILL_TASK_DECLARED_SECS",
         "value": "180s",
         "why": "同记忆抽取那一条：任务行的 EXTRACT 式声明只表达预期，平台不按已用时长收任何正在跑的活；配套的 DISTILL_WAIT_TIMEOUT_SECS 是调用方的耐心，放弃等待不等于蒸馏被掐断，两者都不在杀正在产出的工作。"
       },
@@ -130,18 +130,18 @@
         "why": "首事件之前量的是**没有进展**，不是这一轮跑了多久：长推理窗口的上游在吐出第一个字之前可以安静很久，那是它还在想。安静到十分钟一个事件都没有，才按这条流不可用收尾。同族的 STREAM_EVENT_TIMEOUT 管首事件之后，两个数分工是「想想可以，卡住不行」，都不按总时长判。"
       },
       {
-        "id": "task-work-item-timeout",
+        "id": "task-work-item-declared-duration",
         "file": "crates/cog-core/src/types/task.rs",
-        "symbol": "timeout_seconds",
+        "symbol": "declared_duration_seconds",
         "value": "300s",
-        "why": "声明不是判据：这个数写在任务行上，说明提交者预期这件活跑多久；回收判据（`reclaim_cause`）只认租约与实测的步间隔，按它判死的那条路已经拆掉。`timeout_seconds` 现在只喂两处读数——发现册子的 outcome_deadline「按经验该有结局了」与 UI 的预期」，都不杀任何进程。"
+        "why": "声明不是判据：这个数写在任务行上，说明提交者预期这件活跑多久；回收判据（`reclaim_cause`）只认租约与实测的步间隔，按它判死的那条路已经拆掉。字段名 2026-11-10 从 `timeout_seconds` 改成 `declared_duration_seconds`——这个仓里 `timeout` 的意思是到点杀，而这个数从来不是刀。它现在只喂两处读数：发现册子的 outcome_deadline「按经验该有结局了」与 UI 的预期。"
       },
       {
-        "id": "agent-work-item-timeout",
+        "id": "agent-work-item-declared-duration",
         "file": "crates/cog-agent/src/tools.rs",
-        "symbol": "DEFAULT_WORK_ITEM_TIMEOUT_SECS",
+        "symbol": "DEFAULT_WORK_ITEM_DECLARED_SECS",
         "value": "3600s",
-        "why": "声明不是判据：agent 提交一件活时没写预算才用这个数，它只落在任务行上喂 `outcome_deadline` 那种「按经验该有结局了」的读数；执行侧不按它收任何还在跑的活（回收只看租约与实测步间隔）。"
+        "why": "声明不是判据：agent 提交一件活时没写声明才用这个数，它只落在任务行上喂 `outcome_deadline` 那种「按经验该有结局了」的读数；执行侧不按它收任何还在跑的活（回收只看租约与实测步间隔）。"
       },
       {
         "id": "agent-ask-timeout",
@@ -163,13 +163,6 @@
         "symbol": "DEFAULT_RUN_DEADLINE_SECONDS",
         "value": "3600s",
         "why": "它**不杀任何东西**：容器的死活由备份 Job 的存活探针按进度文件判（一步都不推进超过窗口才判死）。这个数只写进账本 backup_runs 那一行，让「这一行开着但没人收尾」有一个可判的时刻——一份开着的记录如果有人被杀，只有它自己被开出来时的那个数判得了。"
-      },
-      {
-        "id": "backup-drill-step-silence",
-        "file": "crates/cogneva/src/backup.rs",
-        "symbol": "DRILL_STEP_SILENCE_DEFAULT_SECS",
-        "value": "3600s",
-        "why": "量的是**当前这一步静默了多久**，不是这一趟花了多久：解包、核清单、建空库、恢复、对数，任何一步静默超界才收尾，判词点名停在哪一步。整趟不受它约束——两步各跑一小时也照样跑完。它替换掉的是整趟预算，2026-10-27 那次正是被整趟预算杀掉的。"
       },
       {
         "id": "evolution-rollout-progress-deadline",

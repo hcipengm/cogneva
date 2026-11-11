@@ -665,26 +665,7 @@ pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
-        .layer(from_fn({
-            let state = state.clone();
-            move |req: Request, next: Next| {
-                let state = state.clone();
-                async move {
-                    let timeout_secs = state
-                        .request_timeout_secs
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let timeout = std::time::Duration::from_secs(timeout_secs);
-                    match tokio::time::timeout(timeout, next.run(req)).await {
-                        Ok(response) => response,
-                        Err(_) => {
-                            let mut response = Response::new(axum::body::Body::empty());
-                            *response.status_mut() = StatusCode::REQUEST_TIMEOUT;
-                            response
-                        }
-                    }
-                }
-            }
-        }))
+        .layer(from_fn(answer_deadline(state.clone())))
         .with_state(state)
 }
 
@@ -1549,26 +1530,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .layer(from_fn(security_headers_middleware))
         .layer(cors_layer)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
-        .layer(from_fn({
-            let state = state.clone();
-            move |req: Request, next: Next| {
-                let state = state.clone();
-                async move {
-                    let timeout_secs = state
-                        .request_timeout_secs
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let timeout = std::time::Duration::from_secs(timeout_secs);
-                    match tokio::time::timeout(timeout, next.run(req)).await {
-                        Ok(response) => response,
-                        Err(_) => {
-                            let mut response = Response::new(axum::body::Body::empty());
-                            *response.status_mut() = StatusCode::REQUEST_TIMEOUT;
-                            response
-                        }
-                    }
-                }
-            }
-        }))
+        .layer(from_fn(answer_deadline(state.clone())))
         .layer(CompressionLayer::new())
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -2962,6 +2924,40 @@ async fn quota_clear_limits_handler(
     match quota_limits_body(hierarchy, scope, &target_id).await {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(response) => *response,
+    }
+}
+
+/// 一次 HTTP 请求的应答期限。
+///
+/// 这**不是**对活儿的判词：处理这枚请求的活（一次构建、一次滚动）在期限之后仍会自己
+/// 走完，只是这一头没有人在等它的回应了。所以它是一条覆盖，上限由
+/// `request_timeout_secs`（运维可调）给——理由是网关不能把一条永远不回话的连接留在
+/// 客户端手里，而不是「这件事该停了」。而「这件活该不该停」由
+/// [`cog_core::declared_wall`] 那一侧按实测的动静判；把期限写进活儿本身，就是把钟
+/// 变成判词，那正是这条控制律要拆掉的东西。
+///
+/// 两处 router 共用这一条：正文上限、压缩、追踪两套各挂一次，各自抄一遍分支时改
+/// 一处不会报错，另一处会继续用旧的处置（比如不再回 408，而把连接挂住）。
+fn answer_deadline(
+    state: Arc<GatewayState>,
+) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
+       + Clone {
+    move |req: Request, next: Next| {
+        let state = state.clone();
+        Box::pin(async move {
+            let timeout_secs = state
+                .request_timeout_secs
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match tokio::time::timeout(timeout, next.run(req)).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let mut response = Response::new(axum::body::Body::empty());
+                    *response.status_mut() = StatusCode::REQUEST_TIMEOUT;
+                    response
+                }
+            }
+        })
     }
 }
 

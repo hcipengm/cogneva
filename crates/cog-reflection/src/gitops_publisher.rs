@@ -16,12 +16,10 @@
 //! 金丝雀镜像是最小 overlay（cogneva 基镜像 + 新编译二进制一个层），
 //! 构建无编译、push/pull 秒级。
 
-use std::path::PathBuf;
-use std::time::Duration;
-
 use crate::GitOpsConfig;
 use async_trait::async_trait;
 use cog_core::{SFError, SFResult};
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::auto_promoter::{PromotionChannel, PromotionSource};

@@ -16,6 +16,12 @@
 pub(crate) const TIMED_OUT_AFTER: &str = "timed out after";
 
 /// `cmdline` 在 `timeout_secs` 秒后仍未结束时，写给它下游的那句话。
+///
+/// 这一族的生产者已经全部改成按「多久没有产出」判停（[`went_silent`]），所以眼下没有
+/// 调用方。留着它是因为判据仍按 [`TIMED_OUT_AFTER`] 认这一类错误：下一次有调用方要写
+/// 这句话时，唯一合法的拼法必须是这里，而不是在别处重新拼一遍——删掉它，下一个人只会
+/// 去拼字面量，而那条门要到提交时才红。
+#[allow(dead_code)]
 pub(crate) fn timed_out(cmdline: &str, timeout_secs: u64) -> String {
     format!("{cmdline} {}", timed_out_after(timeout_secs))
 }
@@ -23,7 +29,8 @@ pub(crate) fn timed_out(cmdline: &str, timeout_secs: u64) -> String {
 /// 没有命令行可写时（等的是任务状态、不是子进程）的那半句。
 ///
 /// 单独留一个入口而不是让调用方自己拼「空命令行加空格」：被认的那一段仍然只有
-/// 一份，前导空格这类差别也不会漂到判据里。
+/// 一份，前导空格这类差别也不会漂到判据里。没有调用方的理由同 [`timed_out`]。
+#[allow(dead_code)]
 pub(crate) fn timed_out_after(timeout_secs: u64) -> String {
     format!("{TIMED_OUT_AFTER} {timeout_secs}s")
 }

@@ -157,9 +157,8 @@ mod tests {
         };
 
         let request_timeout = std::sync::atomic::AtomicU64::new(30);
-        let sandbox_timeout = std::sync::atomic::AtomicU64::new(30);
         let (applied, need_restart) =
-            apply_gateway_config_update(&current, &new_config, &request_timeout, &sandbox_timeout);
+            apply_gateway_config_update(&current, &new_config, &request_timeout);
 
         assert!(
             need_restart.is_empty(),
@@ -175,10 +174,6 @@ mod tests {
         assert_eq!(cfg.http_port, 8080);
         assert_eq!(
             request_timeout.load(std::sync::atomic::Ordering::Relaxed),
-            30
-        );
-        assert_eq!(
-            sandbox_timeout.load(std::sync::atomic::Ordering::Relaxed),
             30
         );
     }

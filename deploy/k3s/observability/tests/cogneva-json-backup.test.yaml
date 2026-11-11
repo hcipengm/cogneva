@@ -1,6 +1,6 @@
-# 备份那二十七条读数的单测夹具。它们守的是「持久化还能不能恢复」：最近一次成功多久了、
-# 从来没成功过、CronJob 停了或被挂起、演练跑没跑/多久没跑/跑失败、保留策略漏留、
-# 离站副本写没写/是不是最新/缺没缺包/密钥老不老、跑得超过自己的期限、跑被放弃、
+# 备份那二十八条读数的单测夹具。它们守的是「持久化还能不能恢复」：最近一次成功多久了、
+# 从来没成功过、CronJob 停了或被挂起、演练跑没跑/多久没跑/跑失败/开了工没有下文、保留策略
+# 漏留、离站副本写没写/是不是最新/缺没缺包/密钥老不老、跑得超过自己的期限、跑被放弃、
 # 成功没记账、包缩水。
 #
 # 这一族的规则几乎每条都带**新鲜度腿**（`(time() - …_observed_timestamp_seconds) < 1800`）：
@@ -36,6 +36,7 @@ rule_files:
 # rule: backup_restore_drill_is_stale
 # rule: backup_restore_drill_failed
 # rule: backup_restore_drill_window_has_unproven_packages
+# rule: backup_restore_drill_attempt_never_finished
 # rule: backup_volume_package_count_disagrees_with_the_last_run
 # rule: backup_offsite_copy_never_written
 # rule: backup_offsite_copy_is_stale
@@ -58,7 +59,7 @@ tests:
   # 一套健康的备份：一小时前成功过、失败 0 / 成功 5 / 在跑 0 / 放弃 0、没有超期、
   # 包数与保留目标一致（14/14）、最老的包还没到保留线、演练一小时前跑过且成功、
   # 离站副本存在且就是最新那个包、没有缺包、密钥一天前轮过、仓库十四分钟前刚看过、
-  # CronJob 没挂起也确实在调度。二十七条全静。
+  # CronJob 没挂起也确实在调度。二十八条全静。
   - interval: 1m
     input_series:
       - series: 'cogneva_backup_run_readings{readout="latest_success_age_seconds"}'
@@ -90,6 +91,8 @@ tests:
       - series: 'cogneva_backup_run_readings{readout="drill_latest_ok"}'
         values: '1x60'
       - series: 'cogneva_backup_run_readings{readout="drill_window_unproven_packages"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_attempts_never_seen"}'
         values: '0x60'
       - series: 'cogneva_backup_run_readings{readout="offsite_newest_age_seconds"}'
         values: '3600x60'
@@ -132,6 +135,8 @@ tests:
       - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_latest_ok"}'
         values: '3500x60'
       - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_window_unproven_packages"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_attempts_never_seen"}'
         values: '3500x60'
       - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_newest_age_seconds"}'
         values: '3500x60'
@@ -195,6 +200,9 @@ tests:
         exp_alerts: []
       - eval_time: 60m
         alertname: backup_restore_drill_window_has_unproven_packages
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_attempt_never_finished
         exp_alerts: []
       - eval_time: 60m
         alertname: backup_volume_package_count_disagrees_with_the_last_run
@@ -398,8 +406,9 @@ tests:
 
   # 读数在写、而且都在说坏消息：最近成功 27 小时前、演练 27 小时前且失败、演练窗口里有
   # 三个包没验过、包数 14 与账上 20 对不上、离站副本 27 小时前且不是最新、缺一个包、
-  # 远端 27 小时前、密钥 92 天、本次跑超期、放弃在涨、保留多留六个、最老的包过了保留线。
-  # 十四条亮。同一格里 `has_no_snapshot` 静（仓库观测缺席时它不问，那是下一条的活）。
+  # 远端 27 小时前、密钥 92 天、本次跑超期、放弃在涨、演练开工了却没有下文、保留多留六个、
+  # 最老的包过了保留线。十五条亮。同一格里 `has_no_snapshot` 静（仓库观测缺席时它不问，
+  # 那是下一条的活）。
   - interval: 1m
     input_series:
       - series: 'cogneva_backup_run_readings{readout="latest_success_age_seconds"}'
@@ -424,6 +433,8 @@ tests:
         values: '0x60'
       - series: 'cogneva_backup_run_readings{readout="drill_window_unproven_packages"}'
         values: '3x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_attempts_never_seen"}'
+        values: '0x40 1x20'
       - series: 'cogneva_backup_run_readings{readout="offsite_newest_age_seconds"}'
         values: '100000x60'
       - series: 'cogneva_backup_run_readings{readout="offsite_matches_volume"}'
@@ -456,6 +467,8 @@ tests:
         values: '3500x60'
       - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_window_unproven_packages"}'
         values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_attempts_never_seen"}'
+        values: '3500x60'
       - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_newest_age_seconds"}'
         values: '3500x60'
       - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_matches_volume"}'
@@ -484,6 +497,11 @@ tests:
               severity: warning
       - eval_time: 60m
         alertname: backup_restore_drill_window_has_unproven_packages
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_restore_drill_attempt_never_finished
         exp_alerts:
           - exp_labels:
               severity: warning
@@ -781,3 +799,20 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: critical
+
+  # 演练开工行在涨，而账本已经停写：这一条的新鲜度腿先把它按住。
+  #
+  # 这一条读的是**增量**（`increase(…[26h])`），所以守着它的那一格必须让窗口里真的有
+  # 样本：一小时一个点喂三十个小时，求值点上窗口里还有东西——能把它压空的只剩观测
+  # 时间戳那一半。删掉那条腿，这条规则就会在「写者早就不在了」的数据上照常响，而它
+  # 报的是一件两小时前可能已经自己收尾了的事。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_backup_run_readings{readout="drill_attempts_never_seen"}'
+        values: '0x10 1x20'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_attempts_never_seen"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: backup_restore_drill_attempt_never_finished
+        exp_alerts: []

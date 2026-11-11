@@ -96,9 +96,11 @@ const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
 ///
 /// 这是一个**条数**，不是一个时长：每一条自己按「还在不在动」判，时长来自实测
 /// 窗口（[`progress_window_secs`]）。
+// cap: bound — 条数不是时长：每条命令各自按动静判，时长由实测窗口供给；这个数只数「要跑几条」
 const WEB_ADMISSION_RUNS_PER_CHANGE: u64 = 1;
 
 /// 一条变更跑几趟工具链供给（`rustup install`）。
+// cap: bound — 同上，是条数：几趟供给各占一个自己的实测窗口，不按钟收尾
 const TOOLCHAIN_RUNS_PER_CHANGE: u64 = 1;
 
 /// The linter this workspace's deployments ran while the stage was hardcoded.
@@ -201,7 +203,7 @@ pub(crate) const FMT_COMMANDS_PER_CHANGE: u64 =
     FMT_CMDS_OUTSIDE_RUN_FMT + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT;
 
 /// 一段活最长能持续多久：静默超过「这个部署见过的最长一步」它就已被判停、已被
-/// 杀了（`cog_core::progress::stall`），所以一段活不可能比它更长。
+/// 杀了（`cog_core::declared_wall::stall`），所以一段活不可能比它更长。
 ///
 /// 量不到（样本还没到 `SAMPLE_FLOOR`）时退回一个看门狗周期：那时什么都判不了，
 /// 而「什么都不判」在存活读数上不能读成 0——0 会让每一轮健康的工作都越界。
@@ -5115,47 +5117,42 @@ mod tests {
             .map(|m| m.value)
     }
 
-    /// A verification run that does not fit its budget is killed, and the error
-    /// names the budget that killed it.
+    /// A verification run that outlives its budget is waited on, not killed, and
+    /// the reading afterwards is a duration rather than a stop.
     ///
-    /// What this replaces was not a wrong verdict but an absent one: the knob
-    /// was stored on the pipeline and never read, so a stuck
-    /// `cargo test --workspace` held the executor's only in-flight slot
-    /// indefinitely and every change behind it queued forever. The reason
-    /// matters as much as the kill — a retired change is read afterwards by
-    /// whoever investigates it, and only "exceeded the Ns budget" says the
-    /// change was never judged.
+    /// 这条替换掉的是「到点就杀」：预算曾经是这把刀，而它砍掉的是一次**还在跑**的
+    /// `cargo test`——宿主已经为它付过整段编译，砍掉只让下一轮再付一次。预算现在只是
+    /// 一份期望：过了它说一句、继续等；一条**不再动**的命令由实测窗口判停
+    /// （`run_child_watched` 那条律），与这里申报的数无关。
     ///
-    /// The sleep is what makes this deterministic. The run is slow for a reason
-    /// the test controls, so the budget is exceeded whether the kill lands
-    /// during the compile or during the test.
+    /// 睡三秒而不是三十秒：这条用例量的是「过没过墙」，不是「等了多久」，而判据在
+    /// 过墙之后一点都没变——同样的判定，用最短的那次跑出来就够了。
     #[tokio::test]
-    async fn a_run_that_outlives_its_budget_is_killed_with_the_budget_named() {
+    async fn a_run_that_outlives_its_budget_is_waited_on_not_killed() {
         let root = tempfile::tempdir().unwrap();
-        write_sleeping_crate(root.path(), 30);
+        write_sleeping_crate(root.path(), 3);
         let budget = Arc::new(crate::verification_budget::VerificationBudget::new());
         let pipeline = ChangePipeline::new(root.path(), root.path(), false)
             .with_verification_budget(budget.clone());
 
-        let err = pipeline
+        let (ok, output) = pipeline
             .run_test_command(root.path(), None)
             .await
-            .expect_err("a run that cannot finish in a second must not be waited on");
+            .expect("a run that outlives its declared budget is waited on");
 
-        assert!(
-            err.to_string()
-                .contains("exceeded the 1s verification budget"),
-            "the rejection has to name the budget that caused it: {err}"
-        );
+        assert!(ok, "the suite passed, so the reading is a pass: {output}");
         assert_eq!(
             test_kind_reading(&budget, crate::verification_budget::STOPPED_TOTAL_METRIC).await,
-            Some(1.0),
-            "a killed run has to be readable as a kill, not only as a log line"
+            Some(0.0),
+            "nothing was stopped, and the counter is the place that says so"
         );
-        assert_eq!(
-            test_kind_reading(&budget, crate::verification_budget::LAST_RUN_SECONDS_METRIC).await,
-            None,
-            "a run cut short at the budget has no duration of its own to report"
+        let lasted =
+            test_kind_reading(&budget, crate::verification_budget::LAST_RUN_SECONDS_METRIC)
+                .await
+                .expect("a run that finished has a duration of its own to report");
+        assert!(
+            lasted >= 3.0,
+            "the duration has to cover the work that was waited on, got {lasted}s"
         );
     }
 

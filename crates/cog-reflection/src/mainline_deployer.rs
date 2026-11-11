@@ -294,8 +294,9 @@ const SEED_TAG: &str = "seed";
 pub(crate) const MAIN_TAG_PREFIX: &str = "main-";
 
 /// 滚动 Job 的进度文件路径：容器 env 与存活探针读的是同一个字符串，两者都由
-/// `cog_core::progress` 定义的那条命令对齐。
-const PROGRESS_FILE: &str = "/var/run/cogneva-progress/beat";
+/// `cog_core::progress` 定义的那条命令对齐。声明在 [`cog_core::paths`]：备份作业、
+/// 变更作业与这里挂的是同一块卷、写的是同一条路径。
+const PROGRESS_FILE: &str = cog_core::paths::PROGRESS_FILE;
 
 /// 一轮里最多回收几批镜像库里的老镜像（每批 [`BUILDAH_RMI_BATCH_CHUNK`] 张）。
 ///
@@ -3779,7 +3780,7 @@ impl MainlineDeployer {
     ///
     /// 每一段输出是拍，CPU 时间在涨也是拍——编译、打包、推镜像这几段里子命令可以
     /// 好几分钟一个字节都不写，只有 CPU 那一个证据。判据本身在
-    /// `cog_core::progress::stall`，与演进部署器、执行器的看门狗是同一条。
+    /// `cog_core::declared_wall::stall`，与演进部署器、执行器的看门狗是同一条。
     ///
     /// 这段活要是正跑在本循环里，它的每一拍也打在这个循环自己的心跳上：否则
     /// 「两步之间」的空档就等于整段活的长短，而这个循环要声明自己多久没跳就算
@@ -9152,7 +9153,7 @@ impl MainlineDeployer {
         .kill_on_drop(true);
         // 这段构建没有按秒的界。判据是它还在不在动：输出是拍，CPU 时间在涨也是拍
         // ——「沉默的编译」只有后一个证据。判据与演进部署器、执行器的看门狗共用
-        // 同一条 `cog_core::progress::stall`，所以三处不会各写一份、也不会漂移。
+        // 同一条 `cog_core::declared_wall::stall`，所以三处不会各写一份、也不会漂移。
         //
         // 判据落在「这个部署见过的最长一步」而不是分位数：误杀要重来，重来就是
         // 整笔投入；晚杀只晚一点。所以宁可等，也要等到比任何一次正常的沉默都久。
@@ -9733,7 +9734,7 @@ impl MainlineDeployer {
         }));
         mounts.push(serde_json::json!({
             "name": "progress",
-            "mountPath": "/var/run/cogneva-progress"
+            "mountPath": cog_core::paths::PROGRESS_DIR
         }));
         let mut manifest = serde_json::json!({
             "apiVersion": "batch/v1",
@@ -11771,7 +11772,12 @@ const CLUSTER_REGISTRY_COMPONENT: &str = cog_core::topology::COMPONENT_REGISTRY;
 /// the platform workloads' labels — but they are still declared once: the
 /// selector that collects the bundles back and the label that was written on
 /// them have to be the same string.
-const MAINLINE_ROLLOUT_COMPONENT: &str = "mainline-rollout";
+///
+/// `pub(crate)` because the Job's own half names its progress channel after this
+/// same string: the progress file is read by the liveness probe standing outside
+/// the container, and the name it finds there has to be the name the Job was
+/// created under, or the probe watches a channel nobody beats.
+pub(crate) const MAINLINE_ROLLOUT_COMPONENT: &str = "mainline-rollout";
 const MAINLINE_MANIFESTS_COMPONENT: &str = "mainline-manifests";
 
 /// The label selector that names the workload serving the delivered images.
@@ -12693,7 +12699,6 @@ mod tests {
         }
     }
 
-    use crate::rust_production::production_text;
     use crate::test_support::http_200;
 
     // 滚动侧已搬去 `mainline_rollout`：本模块的用例仍直接调它们，所以只在测试面
@@ -12867,16 +12872,17 @@ exit 1
         );
     }
 
-    /// 被我们自己的定时器杀掉的那一支：kubectl 到点还没退出，但它**已经写下的**
-    /// 那句原因必须留下。这正是 2026-10-24 那次黑箱失败的对偶——那一版用管道收
-    /// 输出，进程一死管道就断，写了的字跟着丢。
+    /// 收尾的是子进程自己，不是我们挑的钟：kubectl 写下原因、拖了一会儿才以失败
+    /// 退出，等待它的这一侧必须**等它自己结束**，并且把它写下的那句原因带进判词。
+    /// 被看门狗判停杀掉是另一条路（判词带 `showed no movement for`），这条用例锁的
+    /// 是它不该被走——测试进程里界未量到，本来就没有可用的钟去杀。
     #[tokio::test]
-    async fn what_kubectl_wrote_before_the_backstop_killed_it_survives() {
+    async fn what_kubectl_wrote_before_it_ended_survives() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let script = r#"#!/bin/sh
 echo 'Unable to connect to the server: dial tcp 10.43.0.1:443: i/o timeout' >&2
-sleep 10
+sleep 2
 exit 1
 "#;
         write_fake_bin(&dir, "fake-kubectl", script);
@@ -12888,7 +12894,6 @@ exit 1
             300,
             900,
         );
-        let started = std::time::Instant::now();
         let err = executor
             .run_kubectl(&["get", "deployment", "cogneva"])
             .await
@@ -12896,15 +12901,15 @@ exit 1
         let msg = err.to_string();
         assert!(
             msg.contains("i/o timeout"),
-            "the words written before the kill have to reach the verdict: {msg}"
+            "the words kubectl wrote have to reach the verdict: {msg}"
         );
         assert!(
-            msg.contains("timed out after 1s"),
-            "the verdict still has to say who ended it: {msg}"
+            msg.contains("failed:"),
+            "the verdict has to be kubectl's own exit, not our kill: {msg}"
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(6),
-            "the backstop has to kill the child, not wait it out"
+            !cog_core::declared_wall::is_stall_verdict(&msg),
+            "with no measured bound nothing may kill a child that is still writing: {msg}"
         );
     }
 
@@ -24710,10 +24715,12 @@ exit 0
         let bin_dir = tmp.path().to_path_buf();
         // 快照（.image jsonpath）返回各部署当前镜像；rollout 查询（generation
         // jsonpath）：第一个目标 security-gateway 永远不完成——**它的新副本建成过**
-        // （updatedReplicas=1）却一直不 ready，所以这是版本类的超时、要回滚；写成
-        // updatedReplicas=0 会落到"新版本一个 Pod 都没建成"那一档（环境类、不回滚），
-        // 那是另一个用例的事。其余正常。set image 都成功。
+        // （updatedReplicas=1）却一直不 ready，平台因此在自己的进度死线上写下
+        // `ProgressDeadlineExceeded`：那是收尾唯一的直接证据（新律下没有按钟的判词），
+        // 这一档是版本类、要回滚；写成 updatedReplicas=0 会落到"新版本一个 Pod 都没
+        // 建成"那一档（环境类、不回滚），那是另一个用例的事。其余正常。set image 都成功。
         let log = bin_dir.join("kubectl.log");
+        let count = bin_dir.join("poll.count");
         let script = format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
@@ -24729,8 +24736,13 @@ for a in "$@"; do
 done
 case "$*" in
   *generation*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
     case "$*" in
-      *cogneva-security-gateway*) echo "1|1|1|1|0|" ;;
+      # 平台判词从第二轮起出现：第一眼必须先读到 `updatedReplicas=1`，否则
+      # 「新版本建过 Pod」这条证据没被记下，这一档会被读成环境类而不回滚。
+      *cogneva-security-gateway*)
+        if [ "$n" -ge 2 ]; then echo "1|1|1|1|0||ProgressDeadlineExceeded"; else echo "1|1|1|1|0|"; fi ;;
       *) echo "1|1|1|1|1|" ;;
     esac ;;
   *"initContainers"*) ;;
@@ -24740,10 +24752,11 @@ case "$*" in
 esac
 exit 0
 "#,
-            log = log.display()
+            log = log.display(),
+            count = count.display()
         );
         write_fake_bin(&bin_dir, "fake-kubectl", &script);
-        // 轮询间隔 5s，超时 1s：首轮即败、醒后第二轮越过死线，快速失败。
+        // 轮询间隔 5s：第二眼读到平台判词，等待就此收尾。
         let executor = RolloutExecutor::new(
             bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
             "cogneva",
@@ -24755,7 +24768,11 @@ exit 0
         let cfg = MainlineDeployerConfig::default();
         let plan = RolloutPlan::from_config(&cfg, "localhost:30500/cogneva:main-new".into());
         let err = executor.run(&plan).await.unwrap_err();
-        assert!(err.to_string().contains("did not complete"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("was declared failed by the platform (ProgressDeadlineExceeded)"),
+            "{err}"
+        );
 
         let calls = std::fs::read_to_string(&log).unwrap();
         // 回滚目标来自 Job 启动时快照（.image 查询），不是参数传入。
@@ -24770,11 +24787,11 @@ exit 0
         );
     }
 
-    /// 整段预算里新版本**一个 Pod 都没建成**：读数永远是 `1|1|1|||1`
-    /// （`updatedReplicas` 缺席），所以超时那一刻能采到的现场全是旧版本的——
-    /// 没有 Pod 可看等待原因、RS 上也没有拒绝条件。这一档说不出新版本的好坏，
-    /// 必须记成环境类且**不回滚**：判成版本类会把一次"还没轮到"记成"这一版坏了"，
-    /// 再花一次没有任何证据支持的回滚。
+    /// 整段等待里新版本**一个 Pod 都没建成**：读数永远是 `1|1|1|||1`
+    /// （`updatedReplicas` 缺席），平台在自己的进度死线上写下 `ProgressDeadlineExceeded`
+    /// 收尾，而那一刻能采到的现场全是旧版本的——没有 Pod 可看等待原因、RS 上也没有
+    /// 拒绝条件。这一档说不出新版本的好坏，必须记成环境类且**不回滚**：判成版本类会把
+    /// 一次"还没轮到"记成"这一版坏了"，再花一次没有任何证据支持的回滚。
     #[tokio::test]
     async fn a_rollout_that_never_created_a_pod_of_the_new_revision_is_not_a_version_verdict() {
         let tmp = tempfile::tempdir().unwrap();
@@ -24796,7 +24813,7 @@ for a in "$@"; do
   prev="$a"
 done
 case "$*" in
-  *generation*) echo "1|1|1|||1" ;;
+  *generation*) echo "1|1|1|||1||ProgressDeadlineExceeded" ;;
   *"initContainers"*) ;;
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"get pods"*) echo "0 true " ;;
@@ -24866,7 +24883,8 @@ done
 case "$*" in
   *generation*)
     if [ -f '{seen}' ]; then
-      echo "2|2|1|||1"
+      # 平台判词从第二眼起出现：收尾靠它，不靠任何一道钟。
+      echo "2|2|1|||1||ProgressDeadlineExceeded"
     else
       : > '{seen}'
       echo "2|1|1|1||1"
@@ -25821,6 +25839,7 @@ exit 0
         )
         .unwrap();
         let log = bin_dir.join("kubectl.log");
+        let count = bin_dir.join("poll.count");
         // 目标永远不收敛（新副本没就绪），其余照旧；支撑工作负载的代数不变，所以没有
         // 支撑等待。`updatedReplicas=1`：这一档要的是"新副本建成过、但没起来"的版本类
         // 失败；写成 0 会落到"新版本一个 Pod 都没建成"（环境类、不回滚），那是另一个
@@ -25839,14 +25858,19 @@ case "$*" in
   *"get statefulset -o"*) ;;
   *"get configmap -o"*) echo '{{"items":[]}}' ;;
   *"jsonpath={{.spec}}"*) echo '{{"replicas":1}}' ;;
-  *generation*) echo "1|1|1|1|0|" ;;
+  *generation*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -ge 2 ]; then echo "1|1|1|1|0|||ProgressDeadlineExceeded"; else echo "1|1|1|1|0|"; fi
+    ;;
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"get pods"*) echo "0 true " ;;
   *) echo ok ;;
 esac
 exit 0
 "#,
-            log = log.display()
+            log = log.display(),
+            count = count.display()
         );
         write_fake_bin(&bin_dir, "fake-kubectl", &script);
         let executor = RolloutExecutor::new(
@@ -25870,7 +25894,11 @@ exit 0
         };
         let err = executor.run(&plan).await.unwrap_err();
         assert_eq!(err.class, FailureClass::Version, "{err}");
-        assert!(err.to_string().contains("stuck in startup phase"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("was declared failed by the platform (ProgressDeadlineExceeded)"),
+            "{err}"
+        );
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
@@ -26829,7 +26857,7 @@ echo "||1"
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         // 采样永远落后一代：这个支撑工作负载不会就绪。
-        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 999, true);
+        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, NEVER_SETTLES, true);
 
         let executor = RolloutExecutor::new(
             bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
@@ -26870,6 +26898,39 @@ echo "||1"
         assert!(
             !calls.contains("set image "),
             "no target may be rolled while the support workload it depends on is not ready: {calls}"
+        );
+    }
+
+    /// `apply` 把代数推到 2 之后，第一眼读到的仍是**上一代**的账：控制器还没处理回来
+    /// （`observedGeneration=1`），上一代那次进度死线的 `ProgressDeadlineExceeded` 还挂在
+    /// conditions 上。那份判词说的不是这一代，不能拿它判这一代的死——判了就是把一次
+    /// 成功的滚动误杀在它刚起步的那一眼。
+    #[tokio::test]
+    async fn a_deadline_left_over_from_the_previous_generation_does_not_fail_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) =
+            fake_kubectl_support_settle(&bin_dir, STALE_DEADLINE_THEN_SETTLES, true);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        executor.run(&plan).await.unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("set image "),
+            "the rollout stopped on a verdict that belonged to the previous generation: {calls}"
         );
     }
 
@@ -27318,7 +27379,7 @@ spec:
     async fn an_unreadable_settle_cause_still_blames_the_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
-        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 999, false);
+        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, NEVER_SETTLES, false);
 
         let executor = RolloutExecutor::new(
             bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
@@ -27340,13 +27401,23 @@ spec:
         // 读不到就写读不到，而不是折成「没起来」。
         assert!(msg.contains("cause unreadable"), "{msg}");
         assert!(
-            msg.contains("did not become ready within 1s"),
+            msg.contains("did not become ready") && msg.contains("ProgressDeadlineExceeded"),
             "the primary verdict has to survive the failed reading: {msg}"
         );
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(!calls.contains("set image "), "{calls}");
     }
+
+    /// 夹具里「这个支撑工作负载永远不就绪」的那一档：它自己永远不会好，于是收尾的
+    /// 唯一直接证据只能来自平台自己的进度死线（见下面那条 `if`）。
+    const NEVER_SETTLES: u32 = u32::MAX;
+
+    /// 第一眼读到的是**上一代**留下的进度死线判词，第二眼已经收敛：`apply` 刚把代数
+    /// 推到 2，控制器还没处理回来（`observedGeneration=1`），上一代那次的
+    /// `ProgressDeadlineExceeded` 还挂在 conditions 上。判词说的是哪一代，是这条档
+    /// 唯一的考点。
+    const STALE_DEADLINE_THEN_SETTLES: u32 = u32::MAX - 1;
 
     /// 假 kubectl：支撑清单里 registry 被 apply 改了 spec（代数前进），`set image`
     /// 在它回到就绪之前一律硬失败。`settle_at` 是第几次采样才报就绪；
@@ -27426,11 +27497,27 @@ case "$*" in
     fi
     ;;
   *"get pods -l app=cogneva-registry -o json") printf '%s\n' '{pods_json}' ;;
-  # 等就绪：第 settle_at 次采样才就绪，之前一直落后一代。
+  # 等就绪：第 settle_at 次采样才就绪，之前一直落后一代。收敛的那些档**不写判词**
+  # ——判词是收尾证据，一到就结束等待，落后者那几眼就再也走不到就绪那一眼。
+  # 「永远不就绪」那一档（settle_at = NEVER_SETTLES）写的就是平台自己会写的收尾：
+  # 控制器认下了这一代、在它的进度死线里一次推进都没看到。新律下没有钟替它收尾。
+  # 「上一代的判词」那一档（settle_at = STALE_DEADLINE_THEN_SETTLES）第一眼让
+  # observedGeneration 停在 1、判词挂在上一代身上，第二眼才追上——这种判词不得
+  # 判这一代的死。
   *"get deployment cogneva-registry -o"*)
     n=$(cat '{count}' 2>/dev/null || echo 0)
     n=$((n+1)); echo "$n" > '{count}'
-    if [ "$n" -ge {settle_at} ]; then touch '{settled}'; echo "2|2|1|1|1|1|"; else echo "2|1|1|0|0|0|"; fi
+    if [ "$n" -ge {settle_at} ]; then
+      touch '{settled}'; echo "2|2|1|1|1|1|"
+    elif [ '{stalled}' = "yes" ]; then
+      echo "2|2|1|0|0|0|ProgressDeadlineExceeded"
+    elif [ '{stale}' = "yes" ] && [ "$n" -lt 2 ]; then
+      echo "2|1|1|0|0|0|ProgressDeadlineExceeded"
+    elif [ '{stale}' = "yes" ]; then
+      touch '{settled}'; echo "2|2|1|1|1|1|"
+    else
+      echo "2|1|1|0|0|0|"
+    fi
     ;;
   *"get deployment "*)
     echo "1|1|1|1|1|" ;;
@@ -27454,6 +27541,16 @@ exit 0
             settled = settled.display(),
             count = count.display(),
             settle_at = settle_at,
+            stalled = if settle_at == NEVER_SETTLES {
+                "yes"
+            } else {
+                "no"
+            },
+            stale = if settle_at == STALE_DEADLINE_THEN_SETTLES {
+                "yes"
+            } else {
+                "no"
+            },
             cause_readable = if cause_readable { "yes" } else { "no" },
             extra_cases = extra_cases
         );
@@ -28249,6 +28346,14 @@ esac
         } else {
             r#"[ "$n" -ge 2 ]"#
         };
+        // init 永远跑不完 ⇒ Pod 永远不会 ready，计数器也就不该报收敛。夹具说出的
+        // 读数必须是集群可能出现的状态：一个 init 卡着而副本全就绪的部署不存在，
+        // 而滚动会把那份读数当「齐了」。
+        let generation_cond = if init_never_finishes {
+            "false"
+        } else {
+            r#"[ "$n" -ge 2 ]"#
+        };
         let init_body = format!(
             r#"n=$(cat '{count}' 2>/dev/null || echo 1)
     if {finish_cond}; then echo "2026-09-17T03:17:10Z|"; else echo "|"; fi
@@ -28277,7 +28382,7 @@ case "$*" in
   *"generation"*)
     n=$(cat '{count}' 2>/dev/null || echo 0)
     n=$((n+1)); echo "$n" > '{count}'
-    if [ "$n" -ge 2 ]; then echo "1|1|1|1|1|"; else echo "1|1|1|1|0|1"; fi
+    if {generation_cond}; then echo "1|1|1|1|1|"; else echo "1|1|1|1|0|1"; fi
     ;;
   # Pod 现场查询（就绪门禁与诊断共用）也含 waiting.reason，必须比它先匹配：
   # 被诊断那支接走会返回空串，门禁读成"没有可判的副本"而不判收敛。
@@ -28291,7 +28396,8 @@ exit 0
 "#,
             log = log.display(),
             count = count.display(),
-            init_body = init_body
+            init_body = init_body,
+            generation_cond = generation_cond
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         dir.join("fake-kubectl").to_string_lossy().to_string()
@@ -28318,7 +28424,7 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         let kubectl = fake_kubectl_slow_init(&bin_dir, false);
-        // 就绪预算 0：启动阶段一旦被算进就绪预算，首轮即判败回滚。
+        // 申报工期 0、就绪门禁开着：启动阶段一旦被算成就绪预算用掉，首轮即判败回滚。
         let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 0, 300);
         let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
 
@@ -28334,19 +28440,48 @@ exit 0
         );
     }
 
+    /// init 卡死时，申报的启动工期到点只说话、不收尾：那一段是种子在做网络克隆，
+    /// 耗时由它要连的外部决定，与这次上线的版本无关——按钟判死会把一次本来会自己
+    /// 好的上线判成「这一版坏了」，而回滚只有走到这一步的进程才会执行。真正停住的
+    /// 东西由平台自己的进度死线给出直接证据（Deployment 的
+    /// `ProgressDeadlineExceeded`，见 [`cog_core::declared_wall::saw_progress_deadline`]），这条用例锁的
+    /// 是另一半：过了墙也还在等。
     #[tokio::test]
-    async fn an_init_container_that_never_finishes_hits_the_startup_budget() {
+    async fn an_init_container_that_never_finishes_is_waited_on_past_the_startup_wall() {
+        // 这条等待里读数一直不变（init 就在那儿跑着），它要证的是「过了墙还在等」。
+        // 判停需要一枚属于这类工作的窗口；测试二进制里那座水库量的是别的活的节奏，
+        // 拿它判，这条等待会在自己的第二眼就被判停并回滚。窗口由本用例自己落。
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            Duration::from_secs(60),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         let kubectl = fake_kubectl_slow_init(&bin_dir, true);
-        // 启动预算 0、就绪预算 300：判败必须来自启动阶段的上界，说明两段
-        // 预算是分开的——init 卡死不能靠就绪预算兜底（那正是好版本被误回滚
-        // 的成因），也不能无限等（等不到干净回滚）。
-        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 300, 0);
+        // 申报工期取 0：第一轮回读就过了墙。过墙之后要么收尾、要么继续等。
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 0, 0);
         let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
 
-        let err = executor.run(&plan).await.unwrap_err();
-        assert!(err.to_string().contains("stuck in startup phase"), "{err}");
+        let waited = tokio::time::timeout(Duration::from_secs(8), executor.run(&plan)).await;
+        assert!(
+            waited.is_err(),
+            "an init container that is still running must not become a verdict at the declared wall"
+        );
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !calls.contains("set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"),
+            "no rollback may be issued while the init container is still running: {calls}"
+        );
+        // 过了墙还在读：两轮轮询说明等待没有在第一眼就收尾。
+        assert!(
+            calls.matches("generation").count() >= 2,
+            "the wait must keep polling its evidence past the declared wall: {calls}"
+        );
+        cog_core::progress::reset_for_tests();
     }
 
     /// 单个不带 init 容器的目标：主应用。就绪阶段从 apply 起算，没有启动阶段。
@@ -28368,14 +28503,10 @@ exit 0
     /// `age_secs` 秒之前——传 0 就是「每次采样时它都刚刚重启」，传一个远大于
     /// 就绪预算的数就是「这个容器已经跑完了它自己的整段预算」。第 4 轮收敛
     /// 且该副本就绪；`converges = false` 则永远不收敛。
-    fn fake_kubectl_restarting_pod(dir: &Path, age_secs: u64, converges: bool) -> String {
+    fn fake_kubectl_restarting_pod(dir: &Path, age_secs: u64) -> String {
         let log = dir.join("kubectl.log");
         let count = dir.join("poll.count");
-        let converge_cond = if converges {
-            r#"[ "$n" -ge 4 ]"#
-        } else {
-            "false"
-        };
+        let converge_cond = r#"[ "$n" -ge 4 ]"#;
         let script = format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
@@ -28421,15 +28552,26 @@ exit 0
 
     /// 容器中途退出重来，不能让新容器替上一次的启动买单。
     ///
-    /// 墙钟上的就绪预算从 apply 起算，而容器被杀重来后只跑了几十秒：真实现场是
-    /// 启动时抢不到 schema 锁（仍在服务的旧副本占着），容器退出、重启、四分钟后
-    /// 才 ready，判词却写成「就绪阶段超时」。预算 5 秒、每轮采样里容器都是刚起
-    /// 的，只有按容器自己的启动时刻重算才可能等到第 4 轮的就绪。
+    /// 就绪门禁按**容器自己的启动时刻**起算，而容器被杀重来后只跑了几十秒：真实
+    /// 现场是启动时抢不到 schema 锁（仍在服务的旧副本占着），容器退出、重启、
+    /// 四分钟后才 ready。每轮采样里容器都是刚起的，只有按它自己的起点算才可能
+    /// 等到第 4 轮的就绪——按进程墙钟算的话，第二眼就判死了。
     #[tokio::test]
-    async fn a_container_that_kept_restarting_is_not_judged_at_the_wall_clock() {
+    async fn a_container_that_kept_restarting_is_not_judged_by_the_walls_clock() {
+        // 这条滚动要四拍才收敛，每拍之间状态**没有变**（都是「没就绪」）——它的推进
+        // 证据是「容器自己的启动时刻被重新读了」，不是读数变了。所以它需要一个属于
+        // 类似工作的窗口：测试二进制里那座水库量的是别的活（毫秒级），拿它来判，
+        // 这条滚动在自己的第二拍就被判停了。窗口由这把锁保护、由本用例自己落。
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            Duration::from_secs(60),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
-        let kubectl = fake_kubectl_restarting_pod(&bin_dir, 0, true);
+        let kubectl = fake_kubectl_restarting_pod(&bin_dir, 0);
         let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 5, 300);
         let plan = main_app_plan("localhost:30500/cogneva:main-new");
 
@@ -28437,22 +28579,7 @@ exit 0
             .run(&plan)
             .await
             .expect("a restart inside the boot must not be charged to the new container");
-    }
-
-    /// 重算不等于无限等：一个跑满自己整段预算仍未就绪的容器照旧判败。
-    #[tokio::test]
-    async fn a_container_past_its_own_budget_still_fails_at_the_wall_clock() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bin_dir = tmp.path().to_path_buf();
-        let kubectl = fake_kubectl_restarting_pod(&bin_dir, 600, false);
-        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 5, 300);
-        let plan = main_app_plan("localhost:30500/cogneva:main-new");
-
-        let err = executor.run(&plan).await.unwrap_err();
-        assert!(
-            err.to_string().contains("did not complete within 5s"),
-            "{err}"
-        );
+        cog_core::progress::reset_for_tests();
     }
 
     /// 假 kubectl：第一轮轮询里选择器匹配到的还是旧 Pod（它的 init 早已结束），
@@ -28524,59 +28651,16 @@ exit 0
         );
     }
 
-    /// 反面：没有 init 容器的部署不存在启动阶段，就绪预算必须照旧从第一轮起算。
-    /// "没见过 init 在跑"这条判据只能用在带 init 容器的部署上，否则主容器永不
-    /// ready 的版本会被一路拖到启动预算才判败。
-    #[tokio::test]
-    async fn a_deployment_without_init_containers_still_spends_the_readiness_budget() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bin_dir = tmp.path().to_path_buf();
-        let log = bin_dir.join("kubectl.log");
-        let script = format!(
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> '{log}'
-case "$*" in
-  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
-  *"initContainers"*) ;;
-  *"generation"*) echo "1|1|1|1|0|1" ;;
-  *"restartCount"*) echo "0 true " ;;
-  *"waiting.reason"*) ;;
-  *) echo ok ;;
-esac
-exit 0
-"#,
-            log = log.display()
-        );
-        write_fake_bin(&bin_dir, "fake-kubectl", &script);
-        // 就绪预算 0、启动预算 300：判败必须来自就绪预算。
-        let executor = RolloutExecutor::new(
-            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
-            "cogneva",
-            0,
-            1,
-            0,
-            300,
-        );
-        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
-
-        let err = executor.run(&plan).await.unwrap_err();
-        assert!(
-            err.to_string().contains(
-                "rollout of deployment/cogneva-sandbox-executor did not complete within 0s"
-            ),
-            "{err}"
-        );
-    }
-
-    /// 一段没收敛的预算，宿主给过时间与没给过时间必须分开处置。
+    /// 一段没收敛的等待，宿主给过时间与没给过时间必须分开处置。
     ///
     /// 宿主的负载不是这一版的属性：整段都在排队时，回滚既救不回它（旧镜像一样
     /// 排不上），又会把一台机器别人的负载记成代码缺陷；而留在原地的这一版在宿主
-    /// 松下来之后自己会起来。
+    /// 松下来之后自己会起来。判停那一类与平台判的进度死线是同一件事——「这一整段
+    /// 没看到推进」——所以两类判词都要看这份读数。
     ///
     /// principle: feedback_a_wall_clock_budget_under_host_contention_measures_someone_elses_load
     #[tokio::test]
-    async fn a_budget_spent_queued_on_a_loaded_host_says_nothing_about_the_revision() {
+    async fn a_wait_spent_queued_on_a_loaded_host_says_nothing_about_the_revision() {
         let (tmp, kubectl, plan) = never_converging_rollout();
         let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 0, 300)
             .with_host_run_queue(a_queued_host);
@@ -28597,10 +28681,10 @@ exit 0
         );
     }
 
-    /// 反面：同样的清单、同样的预算，宿主安静时这条超时仍然是这一版的结论——
+    /// 反面：同样的清单、同样的判词，宿主安静时它仍然是这一版的结论——
     /// 不加这一半，上面那条判据会把所有起不来的版本都读成「机器忙」。
     #[tokio::test]
-    async fn the_same_budget_on_a_calm_host_is_still_a_verdict_about_the_revision() {
+    async fn the_same_wait_on_a_calm_host_is_still_a_verdict_about_the_revision() {
         let (tmp, kubectl, plan) = never_converging_rollout();
         let executor =
             RolloutExecutor::new(kubectl, "cogneva", 0, 1, 0, 300).with_host_run_queue(a_calm_host);
@@ -28618,25 +28702,33 @@ exit 0
 
     /// 一份永远不收敛的滚动：新 Pod 建出来了、一直没 ready、不在任何致命等待态。
     /// 端点由用例自己换（宿主读数、预算），这份夹具只负责把判词逼到「通用超时」
-    /// 那一条出口上。
+    /// 那一条出口上：第二轮轮询起，集群自己的控制器写下
+    /// `Progressing=False / ProgressDeadlineExceeded`——那是平台对「整段没有推进」
+    /// 下的结论，也是收尾那一类判词唯一合法的直接证据（进程内量不到实测界）。
     fn never_converging_rollout() -> (tempfile::TempDir, String, RolloutPlan) {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         let log = bin_dir.join("kubectl.log");
+        let count = bin_dir.join("poll.count");
         let script = format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"initContainers"*) ;;
-  *"generation"*) echo "1|1|1|1|0|1" ;;
+  *"generation"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -ge 2 ]; then echo "1|1|1|1|0|1||ProgressDeadlineExceeded"; else echo "1|1|1|1|0|1"; fi
+    ;;
   *"restartCount"*) echo "0 true " ;;
   *"waiting.reason"*) ;;
   *) echo ok ;;
 esac
 exit 0
 "#,
-            log = log.display()
+            log = log.display(),
+            count = count.display()
         );
         write_fake_bin(&bin_dir, "fake-kubectl", &script);
         let kubectl = bin_dir.join("fake-kubectl").to_string_lossy().to_string();
@@ -28656,24 +28748,30 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         let log = bin_dir.join("kubectl.log");
+        let count = bin_dir.join("poll.count");
         let script = format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"terminated.finishedAt"*) echo "|" ;;
-  *"generation"*) echo "1|1|1|1|0|1" ;;
+  *"generation"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -ge 2 ]; then echo "1|1|1|1|0|1||ProgressDeadlineExceeded"; else echo "1|1|1|1|0|1"; fi
+    ;;
   *"waiting.reason"*) printf 'ImagePullBackOff\nPodInitializing\n' ;;
   *) echo ok ;;
 esac
 exit 0
 "#,
-            log = log.display()
+            log = log.display(),
+            count = count.display()
         );
         write_fake_bin(&bin_dir, "fake-kubectl", &script);
-        // 启动预算 0：判败走的是预算到期那一刻的判定，而不是首轮的早退——拉取
-        // 失败会自愈，判它快慢没有意义。（这个部署带 init 容器，到期的是启动
-        // 预算：init 一直没结束，就绪预算还没起算。）
+        // 收尾来自集群自己写的进度死线判词（第二轮起），不是任何一道钟：拉取失败
+        // 会自愈，判它快慢没有意义；而判词到时，等待要先把「Pod 卡在镜像源上」这条
+        // 现场读出来，把这一版摘出去。
         let executor = RolloutExecutor::new(
             bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
             "cogneva",
@@ -28993,7 +29091,8 @@ case "$*" in
     echo "cogneva-sandbox-executor-6d9f4c|1|True|FailedCreate|pods \"cogneva-sandbox-executor-6d9f4c-9xq2p\" is forbidden: exceeded quota: cogneva-quota, requested: limits.cpu=500m, used: limits.cpu=16500m, limited: limits.cpu=17"
     echo "cogneva-sandbox-executor-57bc1f|0|True|FailedCreate|pods \"cogneva-sandbox-executor-57bc1f-zzzzz\" is forbidden: exceeded quota: cogneva-quota"
     ;;
-  *"generation"*) echo "1|1|1|0|0|1" ;;
+  # 平台判词写在第 8 格：收尾只有这条直接证据，不再有一道钟把它读出来。
+  *"generation"*) echo "1|1|1|0|0|1||ProgressDeadlineExceeded" ;;
   *"deletionTimestamp"*) echo "" ;;
   *"PodScheduled"*) echo "" ;;
   *"readinessProbe"*) echo "5|10|1|3" ;;
@@ -29018,7 +29117,7 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         let kubectl = fake_kubectl_admission_rejected(&bin_dir);
-        // 就绪预算 0：第一轮轮询即判超时，用例不空等。
+        // 第一轮轮询就读到平台自己写的进度死线判词，等待当场收尾，用例不空等。
         let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 0, 300);
         let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
 
@@ -29153,6 +29252,7 @@ exit 0
                 ".status.readyReplicas",
                 ".status.updatedReplicas",
                 ".status.replicas",
+                ".status.conditions[?(@.type==\"Progressing\")].reason",
             ]
         );
         assert_eq!(
@@ -29163,6 +29263,7 @@ exit 0
                 ".status.desiredNumberScheduled",
                 ".status.numberReady",
                 ".status.updatedNumberScheduled",
+                ".status.conditions[?(@.type==\"Progressing\")].reason",
             ]
         );
         assert_eq!(
@@ -29175,6 +29276,7 @@ exit 0
                 ".status.readyReplicas",
                 ".status.unavailableReplicas",
                 ".spec.paused",
+                ".status.conditions[?(@.type==\"Progressing\")].reason",
             ]
         );
     }
@@ -29233,22 +29335,21 @@ exit 0
     /// 滚动失败，`rolling back count=4` 把刚推上去的四个部署全滚回旧版。
     /// 观测能力故障不是版本结论，必须既不回滚、也不当作收敛。
     #[tokio::test]
-    async fn a_cluster_that_cannot_be_observed_does_not_roll_back_the_pushed_revision() {
+    async fn a_cluster_that_cannot_be_observed_is_waited_out_not_judged() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
-        // 永远观测不到部署态：正常路径之外的每一次查询都不可达。
+        // 整段都观测不到部署态：正常路径之外的每一次查询都不可达。
         let kubectl = fake_kubectl_blind_observations(&bin_dir, 100_000);
-        // 启动预算 6s：两三轮回合就判「预算耗尽且从未观测到」。
         let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 6, 6);
         let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
 
-        let err = executor
-            .run(&plan)
-            .await
-            .expect_err("an unobservable cluster must not be reported as a healthy rollout");
+        // 读不出来不是「没动」，也不是「这一版坏了」：等待既不回滚也不收尾。旧设计在
+        // 这里按预算判「看不到集群」；新律下量不到就不判——误杀一个正在滚的版本比
+        // 多等一段贵得多。观测恢复之后照常收敛（见 `a_transient_blackout_*`）。
+        let waited = tokio::time::timeout(Duration::from_secs(12), executor.run(&plan)).await;
         assert!(
-            is_cluster_unreachable(&err.to_string()),
-            "the failure must carry the unreachable marker so the caller keeps the new revision: {err}"
+            waited.is_err(),
+            "an unreadable cluster was turned into a verdict instead of being waited on"
         );
 
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();

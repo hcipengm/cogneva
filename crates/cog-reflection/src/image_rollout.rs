@@ -7,14 +7,25 @@
 //!    （tag = `{image_repo}:change-{change_id}`，change_id 经字符白名单消毒）；
 //! 2. 可选 `<builder> push`（k3s 节点本地镜像可关）；
 //! 3. `kubectl set image` change 目标 Deployment；
-//! 4. `kubectl rollout status` 等待滚动完成；失败自动 `rollout undo` 回滚。
+//! 4. 短查询轮询滚动读数，**按动静判**：完成或平台声明失败才收尾，过了申报的
+//!    墙只留一行字；失败（有直接证据）自动 `rollout undo` 回滚。
 //!
-//! 所有外部命令带超时；任何一步失败都会尽量回滚滚动更新。
+//! 外部命令按动静判停（[`cog_core::progress::run_child_watched`]）；任何一步失败
+//! 都会尽量回滚滚动更新。
 
 use std::time::Duration;
 
+use cog_core::declared_wall::Step;
 use cog_core::{ImageRolloutConfig, SFError, SFResult};
 use tracing::{info, warn};
+
+/// 读部署状态的节奏。读取周期，不是界：界是
+/// [`cog_core::declared_wall::wait_for_settled`] 按实测窗口判的那一条。
+// cap: bound — 读取周期钉在这里，不参与判停
+const ROLLOUT_POLL: Duration = Duration::from_secs(10);
+
+/// 「滚动读数变了」这条证据通道的名字。等待方与判停方读同一个名字。
+const ROLLOUT_CHANNEL: &str = "image-rollout";
 
 pub struct ImageRollout {
     config: ImageRolloutConfig,
@@ -103,6 +114,52 @@ impl ImageRollout {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// 一次短查询读滚动的现状：完成 / 平台声明失败 / 还在走。
+    ///
+    /// 失败那一支只认 `Progressing=False` 的 `ProgressDeadlineExceeded`——那是部署
+    /// 自己申报的期望工期被越过且不再推进，是平台给出的判词。读不出来（查询本身
+    /// 失败）不是「停住」：交给等待方继续问，不在这里把一眼看不清写成失败。
+    async fn rollout_step(&self, deploy_ref: &str) -> Result<Step<String>, String> {
+        let out = self
+            .run(
+                &self.config.kubectl_bin,
+                &[
+                    "-n",
+                    &self.config.namespace,
+                    "get",
+                    "deployment",
+                    &self.config.deployment,
+                    "-o",
+                    "jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas} {.status.conditions[?(@.type==\"Progressing\")].reason}",
+                ],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let parts: Vec<&str> = out.split_whitespace().collect();
+        if parts.len() < 5 {
+            return Ok(Step::Moving(out));
+        }
+        let gen: u64 = parts[0].parse().unwrap_or(0);
+        let obs: u64 = parts[1].parse().unwrap_or(0);
+        let spec: u32 = parts[2].parse().unwrap_or(0);
+        let updated: u32 = parts[3].parse().unwrap_or(0);
+        let ready: u32 = parts[4].parse().unwrap_or(0);
+        if cog_core::declared_wall::generation_reaches(gen, obs) && updated == spec && ready == spec
+        {
+            return Ok(Step::Done(deploy_ref.to_string()));
+        }
+        // 判词只对控制器处理过的那一代作数：`apply` 之后的第一眼可能还带着上一代
+        // 留下的 `ProgressDeadlineExceeded`。词表取自控制律那一侧，这一格按空格分列。
+        if cog_core::declared_wall::generation_reaches(gen, obs)
+            && parts.get(5) == Some(&cog_core::declared_wall::PROGRESS_DEADLINE_EXCEEDED)
+        {
+            return Ok(Step::Failed(format!(
+                "{deploy_ref} reports Progressing=False (ProgressDeadlineExceeded): {out}"
+            )));
+        }
+        Ok(Step::Moving(out))
+    }
+
     /// 在 staged 二进制同目录生成最小 Containerfile 并返回构建上下文目录。
     async fn write_containerfile(
         &self,
@@ -181,23 +238,24 @@ impl ImageRollout {
         .await?;
         info!(deployment = %deploy_ref, tag = %tag, "deployment image updated");
 
-        // 4. 等待滚动完成；失败自动 undo
-        let status_timeout = format!("{}s", timeout);
-        if let Err(e) = self
-            .run(
-                &self.config.kubectl_bin,
-                &[
-                    "-n",
-                    &self.config.namespace,
-                    "rollout",
-                    "status",
-                    &deploy_ref,
-                    &format!("--timeout={}", status_timeout),
-                ],
-            )
-            .await
-        {
-            warn!(error = %e, "rollout status failed; rolling back");
+        // 4. 等待滚动完成：只在完成或平台声明失败时走下一步，过了申报的墙只说话。
+        //    `rollout status --timeout` 把「等了 N 秒」写成了判词；一次慢拉取就会让
+        //    一个还在往前走的滚动被 undo 掉。
+        let declared = Duration::from_secs(timeout);
+        let settled = cog_core::declared_wall::wait_for_settled(
+            declared,
+            "the rollout after an image change",
+            ROLLOUT_CHANNEL,
+            ROLLOUT_POLL,
+            || {
+                let deploy_ref = deploy_ref.clone();
+                async move { self.rollout_step(&deploy_ref).await }
+            },
+        )
+        .await;
+        if let Err(why) = settled {
+            let e = SFError::Agent(why);
+            warn!(error = %e, "rollout did not settle; rolling back");
             if let Err(rb) = self
                 .run(
                     &self.config.kubectl_bin,
@@ -239,12 +297,15 @@ mod tests {
             "fake-builder",
             &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nexit 0\n"),
         );
-        // fake kubectl：rollout status 按 rollout_ok 决定成败，其余记录参数
+        // fake kubectl：部署读数按 rollout_ok 回答「滚完了」或「平台声明失败」，
+        // 其余记录参数。
         let kubectl_script = if rollout_ok {
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nexit 0\n")
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$*\" in *observedGeneration*) echo \"3 3 2 2 2\" ;; esac\nexit 0\n"
+            )
         } else {
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$*\" in *\"rollout status\"*) exit 1;; esac\nexit 0\n"
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$*\" in *observedGeneration*) echo \"3 3 2 1 1 ProgressDeadlineExceeded\" ;; esac\nexit 0\n"
             )
         };
         write_fake_bin(dir, "fake-kubectl", &kubectl_script);
@@ -294,7 +355,7 @@ mod tests {
         assert!(calls.contains("build -t localhost/cogneva:change-p-1"));
         assert!(calls.contains("push localhost/cogneva:change-p-1"));
         assert!(calls.contains("set image deployment/cogneva cogneva=localhost/cogneva:change-p-1"));
-        assert!(calls.contains("rollout status deployment/cogneva"));
+        assert!(calls.contains(".status.observedGeneration"));
     }
 
     #[tokio::test]
@@ -351,7 +412,10 @@ mod tests {
         let art = artifact(tmp.path());
 
         let err = r.deploy(&art).await.unwrap_err();
-        assert!(err.to_string().contains("rollout status"));
+        assert!(
+            err.to_string().contains("ProgressDeadlineExceeded"),
+            "回滚的判词要说出是哪条直接证据：{err}"
+        );
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(calls.contains("rollout undo deployment/cogneva"));

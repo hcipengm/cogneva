@@ -633,6 +633,7 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         package_bytes: Some(1),
         restore_source: Some("postgres:5432/cogneva".into()),
         restore_target: Some("postgres:5432/cogneva_drill".into()),
+        silence_bound: None,
         segment_skew_seconds: Some(12),
         segment_skew_bound_seconds: Some(300),
         packages_on_volume: 1,

@@ -93,7 +93,7 @@ targets AS (\
        AND c.state IN ('{pending}', '{scheduled}')) \
 INSERT INTO task_defined (\
     task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
-    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    declared_duration_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
     parent_task_id, sink_task_id, face_id, venue, owner_unit, \
     bound_by_handover_id, submitted_by, planner_verified, planner_version, \
     planner_note, planner_source, planner_confidence, planner_at) \
@@ -101,7 +101,7 @@ SELECT task_id, rev + 1, workspace_id, kind, \
        CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
             THEN jsonb_set(input::jsonb, '{owner_unit}', to_jsonb($3::text), true)::text \
             ELSE input END, \
-       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       created_at, priority, max_retries, declared_duration_seconds, is_executable, \
        acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
        face_id, venue, $3, $4, submitted_by, planner_verified, \
        planner_version, planner_note, planner_source, planner_confidence, planner_at \
@@ -132,7 +132,7 @@ targets AS (\
        AND c.state IN ('{pending}', '{scheduled}')) \
 INSERT INTO task_defined (\
     task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
-    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    declared_duration_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
     parent_task_id, sink_task_id, face_id, venue, owner_unit, \
     bound_by_handover_id, submitted_by, planner_verified, planner_version, \
     planner_note, planner_source, planner_confidence, planner_at) \
@@ -140,7 +140,7 @@ SELECT task_id, rev + 1, workspace_id, kind, \
        CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
             THEN jsonb_set(input::jsonb, '{owner_unit}', to_jsonb($3::text), true)::text \
             ELSE input END, \
-       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       created_at, priority, max_retries, declared_duration_seconds, is_executable, \
        acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
        face_id, venue, $3, bound_by_handover_id, submitted_by, planner_verified, \
        planner_version, planner_note, planner_source, planner_confidence, planner_at \
@@ -167,7 +167,7 @@ targets AS (\
        AND c.state IN ('{pending}', '{scheduled}')) \
 INSERT INTO task_defined (\
     task_id, rev, workspace_id, kind, input, created_at, priority, max_retries, \
-    timeout_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
+    declared_duration_seconds, is_executable, acceptance, blocked_by, agent_id, goal_id, \
     parent_task_id, sink_task_id, face_id, venue, owner_unit, \
     bound_by_handover_id, submitted_by, planner_verified, planner_version, \
     planner_note, planner_source, planner_confidence, planner_at) \
@@ -175,7 +175,7 @@ SELECT task_id, rev + 1, workspace_id, kind, \
        CASE WHEN jsonb_typeof(input::jsonb) = 'object' \
             THEN ((input::jsonb) - 'owner_unit')::text \
             ELSE input END, \
-       created_at, priority, max_retries, timeout_seconds, is_executable, \
+       created_at, priority, max_retries, declared_duration_seconds, is_executable, \
        acceptance, blocked_by, NULL, goal_id, parent_task_id, sink_task_id, \
        face_id, venue, NULL, bound_by_handover_id, submitted_by, planner_verified, \
        planner_version, planner_note, planner_source, planner_confidence, planner_at \

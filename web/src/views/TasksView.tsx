@@ -454,7 +454,7 @@ function TaskDetail({
           )}
         </Field>
         <Field label="时间">
-          开始 {task.started_at ? fmt(task.started_at) : '未开始'} · 超时 {task.timeout_seconds ?? '—'} 秒
+          开始 {task.started_at ? fmt(task.started_at) : '未开始'} · 预计 {task.declared_duration_seconds ?? '—'} 秒
         </Field>
         <Field label="创建 / 更新">
           <Moment iso={task.created_at} /> · <Moment iso={task.updated_at} />

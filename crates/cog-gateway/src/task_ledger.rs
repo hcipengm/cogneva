@@ -93,8 +93,8 @@ pub struct LedgerRow {
     pub started_at: Option<DateTime<Utc>>,
     /// 接手之后跑了多少秒；没接手时为 `None`。
     pub running_seconds: Option<i64>,
-    /// 这一行自己写着多久算超时。读数不替它判过没过，只把两个数一起给出来。
-    pub timeout_seconds: u64,
+    /// 这一行自己声明要花多久。读数不替它判过没过，只把两个数一起给出来。
+    pub declared_duration_seconds: u64,
     pub retry_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_id: Option<String>,
@@ -113,14 +113,14 @@ pub struct LedgerReading {
     /// 在册的行里已经有人接手的条数。这就是「正在跑的量」——它与 `by_status` 里
     /// 那一格 `running` 不一定相等：接手过又落回排队（重试）的行两个都算。
     pub claimed: usize,
-    /// 在册的行里，接手时刻离现在已经超过它自己那条 `timeout_seconds` 的条数。
+    /// 在册的行里，接手时刻离现在已经超过它自己声明时长的条数。
     ///
     /// 这是算术，不是判据：它只是把行上本来就有的两个数（`started_at`、
-    /// `timeout_seconds`）与「现在」比了一次。改由实测的步间隔判停摆之后，这两个
-    /// 数已经**都不是**回收会读的东西了，所以这一格比以往更只是一条历史尺度：
-    /// 它回答「这一行比它自己声明的活了更久」，不回答「它该不该收」。判停摆要读
-    /// 的是上一次动是什么时候，而那不在这一行上。
-    pub past_its_timeout: usize,
+    /// `declared_duration_seconds`）与「现在」比了一次。回收读的是持有者的租约与
+    /// 实测的步间窗口，这两个数**都不是**回收会读的东西，所以这一格只是一条
+    /// 历史尺度：它回答「这一行比它自己声明的活了更久」，不回答「它该不该收」。
+    /// 判停摆要读的是上一次动是什么时候，而那不在这一行上。
+    pub past_its_declaration: usize,
     /// 满足条件的行按状态分。已终态的行留在这里，因为「这几天清掉了多少」与
     /// 「还压着多少」是同一张账的两半。
     pub by_status: BTreeMap<String, usize>,
@@ -170,7 +170,7 @@ pub fn read_task_ledger(
     let mut open_rows: Vec<&cog_core::Task> = Vec::new();
     let mut unclaimed = 0usize;
     let mut claimed = 0usize;
-    let mut past_its_timeout = 0usize;
+    let mut past_its_declaration = 0usize;
 
     for task in &matched {
         *by_status
@@ -189,8 +189,8 @@ pub fn read_task_ledger(
             None => unclaimed += 1,
             Some(started) => {
                 claimed += 1;
-                if (now - started).num_seconds() > task.timeout_seconds as i64 {
-                    past_its_timeout += 1;
+                if (now - started).num_seconds() > task.declared_duration_seconds as i64 {
+                    past_its_declaration += 1;
                 }
             }
         }
@@ -217,7 +217,7 @@ pub fn read_task_ledger(
         open,
         unclaimed,
         claimed,
-        past_its_timeout,
+        past_its_declaration,
         by_status,
         by_kind_status,
         by_venue,
@@ -323,7 +323,7 @@ fn row_of(task: &cog_core::Task, now: DateTime<Utc>) -> LedgerRow {
         age_seconds: (now - task.created_at).num_seconds(),
         started_at: task.started_at,
         running_seconds: task.started_at.map(|started| (now - started).num_seconds()),
-        timeout_seconds: task.timeout_seconds,
+        declared_duration_seconds: task.declared_duration_seconds,
         retry_count: task.retry_count,
         goal_id: task.goal_id.clone(),
     }
@@ -437,29 +437,29 @@ mod tests {
         assert_eq!(by_id("f1").running_seconds, Some(600));
     }
 
-    /// 过了自己那条时限要能被数出来，但那是行上两个数的算术，不是这一面下的判据：
-    /// 超时窗是行自己写的，读数只把它与「现在」比一次。
+    /// 过了自己声明的时长要能被数出来，但那是行上两个数的算术，不是这一面下的判据：
+    /// 声明是行自己写的，读数只把它与「现在」比一次。
     #[test]
-    fn a_row_past_its_own_timeout_is_counted_and_not_judged() {
+    fn a_row_past_its_own_declaration_is_counted_and_not_judged() {
         let now = Utc::now();
         let mut late = row("late", TaskStatus::Running, 300);
         late.started_at = Some(now - Duration::seconds(901));
-        late.timeout_seconds = 900;
+        late.declared_duration_seconds = 900;
         let mut on_time = row("on-time", TaskStatus::Running, 300);
         on_time.started_at = Some(now - Duration::seconds(100));
-        on_time.timeout_seconds = 900;
+        on_time.declared_duration_seconds = 900;
 
         let reading = read_task_ledger(&[late, on_time], now, &LedgerQuery::default());
 
         assert_eq!(reading.claimed, 2);
         assert_eq!(
-            reading.past_its_timeout, 1,
-            "只有过了它自己那条时限的那条算"
+            reading.past_its_declaration, 1,
+            "只有过了它自己声明的时长的那条算"
         );
         assert_eq!(
             reading.by_status.get("running"),
             Some(&2),
-            "过了时限的行仍然是 running：这一面不改行，只读行"
+            "过了自己声明的行仍然是 running：这一面不改行，只读行"
         );
     }
 

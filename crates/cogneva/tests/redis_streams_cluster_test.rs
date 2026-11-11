@@ -51,7 +51,7 @@ fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: 
         max_retries: 2,
         retry_not_before: None,
         started_at: None,
-        timeout_seconds: 30,
+        declared_duration_seconds: 30,
         lease_owner: None,
         lease_expires_at: None,
         action_planner_meta: None,

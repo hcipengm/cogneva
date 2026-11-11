@@ -31,6 +31,7 @@ use cog_core::{SFError, SFResult, ToolExecutor};
 /// 进程不在，与「不能建」是同一个结论。
 // cap: bound — 这条探测只判「这台机器能不能建」，命令本身是秒级；20s 还没结束说明守护进程不在，与「不能建」是同一个结论
 const PROBE_CONTAINER_WAIT: Duration = Duration::from_secs(20);
+use crate::eval_toolathlon::next_exec_id;
 use cog_eval::{
     parse_test_list, swe_pro_tool_definitions, tools_bound_to, CaseEnv, EvalCase, ExecLimits,
     ExecOutcome, ExecRequest, ExecRunner, ExecSeam, FinishReason, SweProBackend, SweProTestReport,
@@ -358,7 +359,7 @@ impl BuildahRuntime {
         cmd
     }
 
-    /// 跑一条容器命令。超时是**失败**不是空结果：吞掉它，这一格的分就读成「模型没做对」，
+    /// 跑一条容器命令。判停是**失败**不是空结果：吞掉它，这一格的分就读成「模型没做对」，
     /// 而真相是「这台机器没跑完」。
     async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
         let mut cmd = self.command();
@@ -371,12 +372,16 @@ impl BuildahRuntime {
         let out = match cog_core::progress::run_child_watched(cmd, &id).await {
             Ok(cog_core::progress::ChildOutcome::Exited(out)) => out,
             Ok(cog_core::progress::ChildOutcome::Stalled { silent, window }) => anyhow::bail!(
-                "`{} {}` stopped moving: no output for {:?}, and this deployment's measured \
-                 any gap this deployment has ever seen between steps is {:?}",
-                self.prefix.join(" "),
-                args.first().map(String::as_str).unwrap_or(""),
-                silent,
-                window
+                "{}",
+                cog_core::progress::went_silent(
+                    &format!(
+                        "`{} {}`",
+                        self.prefix.join(" "),
+                        args.first().map(String::as_str).unwrap_or("")
+                    ),
+                    silent,
+                    window,
+                )
             ),
             Err(e) => anyhow::bail!("cannot run `{}`: {e}", self.prefix.join(" ")),
         };

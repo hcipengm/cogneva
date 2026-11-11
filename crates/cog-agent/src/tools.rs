@@ -36,16 +36,17 @@ const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 // cap: bound — the cap that keeps a peer's silence from becoming an unbounded wait
 const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 
-/// How long a filed work item may stay open when its submitter names no budget.
+/// How long a filed work item declares it will take when the submitter names no
+/// budget.
 ///
-/// A row filed from a tool call carries no duration of its own.
-///
-/// The over-budget sweep compares a row's age against the declared duration on
-/// the row, and the door that files work is not where that declaration belongs:
-/// the caller naming a running time here would be a clock wearing the clothes
-/// of a task. A row filed through this path is waited on for as long as it
-/// moves; what ends it is the lease and the measured silence, not a number the
-/// tool accepts from whoever is calling.
+/// Nothing ends the row at this number: a held row is judged by whether its
+/// holder is still stepping (the measured inter-step window), and an abandoned
+/// one by its lease. The number is what a reader takes off the row when sizing
+/// its own patience, so it is sized to the whole turn -- thinking, tool calls
+/// and possibly a peer's answer -- rather than to one dispatched round, which
+/// is what the executor's own row default covers.
+// cap: bound — 一件活声明自己会花多久：不再按它砍行，按一轮接活的形状（想、调工具、等同伴）定这个声明
+const DEFAULT_WORK_ITEM_DECLARED_SECS: u64 = 3600;
 
 /// Real execution identity of one agent run. Carried explicitly from the
 /// actor (which knows the DAG task) through the runtime into sandbox requests,
@@ -2300,9 +2301,9 @@ mod tests {
             .unwrap();
         let seen = backend.seen.lock().await;
         assert_eq!(seen.len(), 1);
-        assert!(
-            matches!(&seen[0], SandboxRequest { .. }),
-            "the request is still the plain command request"
+        assert_eq!(
+            seen[0].1, "unscoped-tool-run_command",
+            "这次调用仍然是一次普通的命令请求：多写进来的秒数没有变成第二个判它死活的人"
         );
     }
 
@@ -2722,14 +2723,7 @@ mod tests {
             .await
             .unwrap();
         let seen = backend.seen.lock().await.clone();
-        assert_eq!(
-            seen,
-            vec![(
-                "dag-task-9".into(),
-                "worker-1".into(),
-                Duration::from_secs(600)
-            )]
-        );
+        assert_eq!(seen, vec![("dag-task-9".into(), "worker-1".into())]);
     }
 
     /// An announced caller is an identity, and it is the only one a task-less
@@ -2804,8 +2798,8 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ("dag-a".into(), "w-1".into(), Duration::from_secs(600)),
-                ("dag-b".into(), "w-2".into(), Duration::from_secs(600))
+                ("dag-a".into(), "w-1".into()),
+                ("dag-b".into(), "w-2".into())
             ]
         );
     }
@@ -2836,14 +2830,9 @@ mod tests {
             .unwrap();
 
         let seen = backend.seen.lock().await.clone();
-        // A WASM snippet keeps the tight snippet budget.
         assert_eq!(
             seen,
-            vec![(
-                "unscoped-tool-wasm_echo".into(),
-                "plugin-42".into(),
-                Duration::from_secs(30)
-            )]
+            vec![("unscoped-tool-wasm_echo".into(), "plugin-42".into())]
         );
     }
 }
@@ -3683,6 +3672,12 @@ pub mod builtins {
                         "type": "string",
                         "description": "Returned by an earlier call: add this item to that goal \
                                         instead of starting a new one."
+                    },
+                    "declared_duration_seconds": {
+                        "type": "integer",
+                        "description": "How long the work declares it will take (default 3600). \
+                                        Nothing ends the row at this number: the holder's lease \
+                                        and the measured inter-step window decide when it stops."
                     }
                 },
                 "required": ["goal", "acceptance"]
@@ -3929,17 +3924,19 @@ pub mod builtins {
         // around work, not around a role.
         let goal_id = optional_label(args, "goal_id")
             .unwrap_or_else(|| format!("agent-goal-{}", uuid::Uuid::new_v4()));
-        // 这条入口不再接受一个「跑多久」。行上那个时长是这一跑的申报，不是这个
-        // 工具从调用者手里收的判词：收下来就是给一件还在动的活提前写好了死期。
-        if let Some(value) = args.get("timeout_seconds") {
-            // 参数还在被旧调用方送进来时，明确拒掉，而不是悄悄忽略——忽略会让
-            // 调用者以为自己设的界生效了。
-            let _ = value;
-            return Err(SFError::Validation(
-                "`timeout_seconds` is not accepted here: a filed row declares its own duration"
-                    .into(),
-            ));
-        }
+        // Zero is refused rather than read as "no limit": the number is the
+        // declaration a reader sizes its own patience from, so a zero would
+        // hand every reader the smallest budget there is while the caller read
+        // a success.
+        let declared_duration_seconds = match args.get("declared_duration_seconds") {
+            Some(value) => value.as_u64().filter(|secs| *secs > 0).ok_or_else(|| {
+                SFError::Validation(
+                    "`declared_duration_seconds` has to be a positive whole number of seconds"
+                        .into(),
+                )
+            })?,
+            None => DEFAULT_WORK_ITEM_DECLARED_SECS,
+        };
         // The row has to land in the workspace the platform reads, and the
         // loops run in a process that is not told it by any config section it
         // owns. The deployment sets nothing, which is why the fallback is the
@@ -3963,6 +3960,7 @@ pub mod builtins {
             "id": task_id,
             "task_type": cog_core::contract::work_item::PLATFORM_AGENT_TASK,
             "input": input,
+            "declared_duration_seconds": declared_duration_seconds,
         });
         // The caller is stating the work as already decided. Without this the
         // row goes through decomposition, which would spend a planning call to
@@ -5380,9 +5378,8 @@ pub mod builtins {
             assert_eq!(row["input"]["agent_id"], "agent-abc");
             assert_eq!(row["planner"]["verified"], true);
             assert_eq!(
-                row.get("timeout_seconds"),
-                None,
-                "a row filed here carries no duration of its own"
+                row["declared_duration_seconds"],
+                DEFAULT_WORK_ITEM_DECLARED_SECS
             );
             assert_eq!(body["goal_id"], filed.goal_id.as_str());
             assert!(
@@ -5424,18 +5421,18 @@ pub mod builtins {
             assert_eq!(filed.body["goal_id"], "7c1f0d");
         }
 
-        /// A duration is not the caller's to state here: the row declares its
-        /// own, and a caller that still sends one is told rather than served a
-        /// row whose number nobody will ever read.
+        /// Zero would hand every reader that sizes its patience from the row
+        /// the smallest duration there is, so it is refused where the caller can
+        /// still fix it rather than queued as a success.
         #[test]
-        fn a_filing_that_still_names_a_duration_is_refused() {
+        fn a_zero_duration_is_refused_rather_than_read_as_no_limit() {
             let err = filing(serde_json::json!({
                 "goal": "do the thing",
                 "acceptance": ["the thing is done"],
-                "timeout_seconds": 0,
+                "declared_duration_seconds": 0,
             }))
             .err()
-            .expect("a duration is refused rather than silently dropped");
+            .expect("a zero duration is refused");
             assert!(matches!(err, SFError::Validation(_)));
         }
     }
@@ -5502,10 +5499,7 @@ pub mod builtins {
         }
 
         fn tools(backend: Arc<Scripted>) -> SandboxTools {
-            SandboxTools::new(
-                Some(backend as Arc<dyn SandboxBackend>),
-                Duration::from_secs(5),
-            )
+            SandboxTools::new(Some(backend as Arc<dyn SandboxBackend>))
         }
 
         /// 一条匹配回成一个条目：文件、行号、那一行。三样都在，读的人才不必
@@ -5605,10 +5599,7 @@ pub mod builtins {
         #[tokio::test]
         async fn without_an_executor_the_tool_names_the_missing_layer() {
             let registry = ToolRegistry::new();
-            cog_core::ToolRegistry::register(
-                &registry,
-                grep(SandboxTools::new(None, Duration::from_secs(5))),
-            );
+            cog_core::ToolRegistry::register(&registry, grep(SandboxTools::new(None)));
             let err = registry
                 .execute("grep", serde_json::json!({"pattern": "x"}))
                 .await

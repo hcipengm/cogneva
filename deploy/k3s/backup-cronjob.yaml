@@ -93,6 +93,7 @@ spec:
                       age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
                       echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
                 periodSeconds: 30
+                timeoutSeconds: 10
                 failureThreshold: 3
                 initialDelaySeconds: 120
               env:

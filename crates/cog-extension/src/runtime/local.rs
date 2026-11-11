@@ -364,7 +364,7 @@ pub(crate) fn spawn_command(
                             burned = Some(now);
                         }
                     }
-                    if let Some(verdict) = cog_core::progress::stall(&task_id) {
+                    if let Some(verdict) = cog_core::declared_wall::stall(&task_id) {
                         *stalled.lock().unwrap_or_else(|p| p.into_inner()) = Some(verdict);
                         if let Some(pid) = group {
                             kill_group(pid);

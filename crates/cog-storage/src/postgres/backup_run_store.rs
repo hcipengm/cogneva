@@ -126,6 +126,8 @@ SELECT \
     (SELECT count(*) FROM snapshot WHERE outcome = '{outcome:failed}')         AS failed, \
     (SELECT count(*) FROM snapshot WHERE outcome = '{outcome:abandoned}')      AS abandoned, \
     (SELECT max(finished_at) FROM snapshot)                          AS latest_finish_at, \
+    (SELECT count(*) FROM backup_drill_attempts WHERE ended_by = 'never_seen') \
+                                                              AS drill_attempts_never_seen, \
     open.started_at            AS open_started_at, \
     open.run_deadline_seconds  AS open_run_deadline_seconds, \
     newest.run_id          AS package_run_id, \
@@ -196,9 +198,9 @@ INSERT INTO backup_drills ( \
     artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at, \
     segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages, \
     credential_violations_backup_pvc, credential_violations_offsite, credential_violations_state_dir, \
-    tables_without_a_home, restore_source, restore_target \
+    tables_without_a_home, restore_source, restore_target, silence_bound \
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34) \
+          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35) \
 ON CONFLICT (drill_id) DO NOTHING";
 
 /// The newest drill, failed or not.
@@ -215,7 +217,7 @@ SELECT drill_id, started_at, finished_at, outcome, package, package_written_at, 
        artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at, \
        segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages, \
        credential_violations_backup_pvc, credential_violations_offsite, credential_violations_state_dir, \
-       tables_without_a_home, restore_source, restore_target \
+       tables_without_a_home, restore_source, restore_target, silence_bound \
 FROM backup_drills \
 ORDER BY finished_at DESC, drill_id DESC \
 LIMIT 1";
@@ -388,6 +390,9 @@ impl BackupRunStore for PostgresBackupRunStore {
             oldest_running_deadline_seconds,
             newest_package,
             drill_unproven_packages,
+            drill_attempts_never_seen: row
+                .try_get("drill_attempts_never_seen")
+                .map_err(|e| SFError::Database(format!("drill_attempts_never_seen: {e}")))?,
         })
     }
 
@@ -446,6 +451,7 @@ impl BackupRunStore for PostgresBackupRunStore {
             .bind(&drill.tables_without_a_home)
             .bind(drill.restore_source.as_deref())
             .bind(drill.restore_target.as_deref())
+            .bind(drill.silence_bound.as_deref())
             .execute(&self.pool)
             .await
             .map_err(|e| {
@@ -514,6 +520,9 @@ impl BackupRunStore for PostgresBackupRunStore {
             restore_target: row
                 .try_get("restore_target")
                 .map_err(|e| SFError::Database(format!("drill restore_target: {e}")))?,
+            silence_bound: row
+                .try_get("silence_bound")
+                .map_err(|e| SFError::Database(format!("drill silence_bound: {e}")))?,
             source_runs_matched: row
                 .try_get("source_runs_matched")
                 .map_err(|e| SFError::Database(format!("drill source_runs_matched: {e}")))?,

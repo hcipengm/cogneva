@@ -18,8 +18,8 @@
 #   4. 进度文件落在挂进来的那一卷上（不落在容器的可写层：根文件系统只读时写不进去，
 #      而探针会读到「没有文件」并一路判死）。
 #
-# 演练另有一条：单步静默界在清单与代码默认值里是同一个数。容器没拿到 env 时进程
-# 拿默认值跑，那一趟的判词会写出另一个界。
+# 演练另有一条：单步静默界不在清单里。它是一个作业类量出来的极值（`progress_bounds`），
+# 不是部署可调的数；部署里再出现那一格，就等于把「谁先挑的数」请回来判一件还在干的活。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,7 +65,6 @@ with open(path) as fh:
         print(f"probe={probe[-1] if probe else ''}")
         print(f"mounts={','.join(f'{k}:{v}' for k, v in mounts.items())}")
         print(f"volumes={','.join(sorted(volumes))}")
-        print(f"step_silence={env.get('COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS', '')}")
         break
     else:
         sys.exit(f"{path} 里没有 CronJob/{want}")
@@ -109,30 +108,19 @@ check "chart 渲染件/演练" "${rendered}" "cogneva-backup-drill"
 check "deploy/k3s 静态清单/备份" "${repo}/deploy/k3s/backup-cronjob.yaml" "cogneva-backup"
 check "deploy/k3s 静态清单/演练" "${repo}/deploy/k3s/backup-drill-cronjob.yaml" "cogneva-backup-drill"
 
-# 单步静默界：两份清单同值，而代码默认值是从探针窗口下限派生的，不是另抄一个数。
+# 静默界不在部署里：它是一行实测（`progress_bounds`），不是一个部署可调的数。
 #
-# 同一趟演练上有两个读者问同一件事：进程自己的看门狗先问（问到就自己收尾、落一行
-# failed），容器探针后问（问到由 kubelet 把容器判掉）。探针要连着失败几次才判停，
-# 所以自报那一侧只要不晚于探针的窗口就一定先开口。这里量两件事：清单里的数不晚于
-# 探针窗口，代码默认值确实从探针窗口下限派生（不是碰巧相等的两个字面量）。
-chart_silence="$(inspect "${rendered}" cogneva-backup-drill | sed -n 's/^step_silence=//p')"
-static_silence="$(inspect "${repo}/deploy/k3s/backup-drill-cronjob.yaml" cogneva-backup-drill | sed -n 's/^step_silence=//p')"
-[[ -n "${chart_silence}" ]] \
-  || fail "chart 渲染件：演练容器没有 COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS"
-[[ "${chart_silence}" == "${static_silence}" ]] \
-  || fail "两份清单的单步静默界不同（chart=${chart_silence} static=${static_silence}）"
+# 这里曾经量的是「两份清单与代码默认值同值」。那个界 3600 s 是一颗挑出来的数：部署里
+# 调它，等于让人用一个事先定的值决定一件可能还在干的活的死活。现在没有这一格可调——
+# 作业类自己量出来的极值在库里，量不到就不判停。所以这条门改成量**它没有回来**：
+# 两份清单里都不许再出现那个 env，`values.yaml` 里不许再有那一格。
+for manifest in "${rendered}" "${repo}/deploy/k3s/backup-drill-cronjob.yaml"; do
+  if grep -q 'COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS' "${manifest}"; then
+    fail "${manifest}：单步静默界又长回清单里了。界是 progress_bounds 里的实测值，不是部署可调的数"
+  fi
+done
+if grep -qE '^[[:space:]]*drillStepSilenceSeconds:' "${repo}/deploy/helm/cogneva/values.yaml"; then
+  fail "values.yaml：drillStepSilenceSeconds 又长回来了。一个事先挑好的数不该决定一件还在干的活的死活"
+fi
 
-progress_floor="$(sed -n 's/^pub const PROGRESS_FILE_WINDOW_FLOOR_SECS: u64 = \([0-9]*\);$/\1/p' \
-  "${repo}/crates/cog-core/src/progress.rs")"
-[[ -n "${progress_floor}" ]] \
-  || fail "crates/cog-core/src/progress.rs 里找不到 PROGRESS_FILE_WINDOW_FLOOR_SECS"
-
-code_derives="$(grep -c '^const DRILL_STEP_SILENCE_DEFAULT_SECS: u64 = cog_core::progress::PROGRESS_FILE_WINDOW_FLOOR_SECS;$' \
-  "${repo}/crates/cogneva/src/backup.rs" || true)"
-[[ "${code_derives}" == "1" ]] \
-  || fail "crates/cogneva/src/backup.rs 的单步静默默认值不是从探针窗口下限派生的：没注入 env 的那一趟会按另一个窗口判，而容器探针按这一个判"
-
-[[ $((chart_silence)) -le $((progress_floor)) ]] \
-  || fail "清单的单步静默界 ${chart_silence}s 晚于探针窗口 ${progress_floor}s：容器会先被 kubelet 判掉，账上那行 failed 写不下来"
-
-echo "OK：两个 Job 都没有 activeDeadlineSeconds，判停读进度文件；单步静默界 ${chart_silence}s 不晚于探针窗口 ${progress_floor}s，代码默认值由后者派生"
+echo "OK：两个 Job 都没有 activeDeadlineSeconds，判停读进度文件；静默界是 progress_bounds 里的实测值，部署里没有这一格可调"

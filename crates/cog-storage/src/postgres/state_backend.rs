@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS task_defined (
                 created_at TIMESTAMPTZ NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
                 max_retries INTEGER NOT NULL DEFAULT 0,
-                timeout_seconds BIGINT NOT NULL DEFAULT 0,
+                declared_duration_seconds BIGINT NOT NULL DEFAULT 0,
                 is_executable BOOLEAN NOT NULL DEFAULT TRUE,
                 acceptance TEXT[] NOT NULL DEFAULT '{}',
                 blocked_by TEXT[] NOT NULL DEFAULT '{}',

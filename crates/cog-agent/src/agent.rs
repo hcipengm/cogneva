@@ -18,11 +18,6 @@ use cog_core::RuntimeConfig;
 // cap: bound — 是对这段等待的判断，不是任务时长的分位数：空闲的消费者总能赶到，忙的那个总值得记一行
 const AGENT_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Wall for the one command this crate runs on a checkout to produce a
-/// change's text. The work is a git diff over a working tree, so two minutes
-/// is sized for a large tree being scanned, not for a slow computation.
-// cap: bound — 活是扫一遍工作树的 git diff，两分钟是按大树的扫描耗时给的，不是按慢计算给的
-
 /// What one call to [`Agent::retire`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetireReport {

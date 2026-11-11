@@ -637,7 +637,7 @@ impl BaselinePorter {
                 "baseline_tag": new_tag,
             }),
         );
-        task.timeout_seconds = self.absorb_timeout_secs;
+        task.declared_duration_seconds = self.absorb_timeout_secs;
         task.action_planner_meta = Some(Self::verified_meta(
             "Baseline port semantic absorption check; read-only judgment",
         ));
@@ -1054,7 +1054,7 @@ impl BaselinePorter {
                 "failure_feedback": failure,
             }),
         );
-        task.timeout_seconds = self.resolve_timeout_secs;
+        task.declared_duration_seconds = self.resolve_timeout_secs;
         task.action_planner_meta = Some(Self::verified_meta(
             "Baseline port resolve; route to the sandbox evolution agent",
         ));
@@ -1248,7 +1248,7 @@ impl BaselinePorter {
                 "round": round,
             }),
         );
-        task.timeout_seconds = self.eval_timeout_secs;
+        task.declared_duration_seconds = self.eval_timeout_secs;
         task.action_planner_meta = Some(Self::verified_meta(
             "Baseline port eval A/B; route to the sandbox evolution agent",
         ));

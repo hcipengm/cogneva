@@ -18,7 +18,7 @@ async fn test_tool_registry_builtins() {
     // `builtin_tools_have_one_list.rs`）。树读工具要一个执行器才跑得动，而注册
     // 不需要——所以这里给它的是一份没有后端的 `SandboxTools`。
     registry.register(cog_agent::tools::builtins::search_code(
-        cog_agent::tools::builtins::SandboxTools::new(None, std::time::Duration::from_secs(1)),
+        cog_agent::tools::builtins::SandboxTools::new(None),
     ));
 
     assert!(!registry.is_empty());

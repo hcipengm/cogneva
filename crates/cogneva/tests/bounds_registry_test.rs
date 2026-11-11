@@ -68,10 +68,9 @@ fn every_registered_bound_names_a_symbol_that_is_still_there() {
         let path = root.join(file);
         match std::fs::read_to_string(&path) {
             Err(e) => missing.push(format!("{} {}: {e}", entry["id"], file)),
-            Ok(text) if !text.contains(symbol) => missing.push(format!(
-                "{}: {file} 里已经没有 {symbol} 了",
-                entry["id"]
-            )),
+            Ok(text) if !text.contains(symbol) => {
+                missing.push(format!("{}: {file} 里已经没有 {symbol} 了", entry["id"]))
+            }
             Ok(_) => {}
         }
     }
@@ -113,7 +112,11 @@ fn every_entry_says_why_it_is_kept() {
             ));
         }
     }
-    assert!(thin.is_empty(), "登记簿里有没写清楚的行：\n  {}", thin.join("\n  "));
+    assert!(
+        thin.is_empty(),
+        "登记簿里有没写清楚的行：\n  {}",
+        thin.join("\n  ")
+    );
 }
 
 /// 判据 4：篮子还在。空了说明有人把登记整段删掉而没有留下任何判据——

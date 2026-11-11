@@ -1,8 +1,9 @@
 # 恢复演练 CronJob：把最新一个备份包装进一个跑完迁移的**空库**，逐表对数、
 # 把账行与源库逐格比，然后把库删掉，答案落进 `backup_drills`。
 #
-# 与 chart 的 `backup.drillSchedule` / `drillStepSilenceSeconds` 同值；改这里就是
-# 改那一份，两边由 field-level parity 门禁对齐。
+# 与 chart 的 `backup.drillSchedule` 同值；改这里就是改那一份，两边由 field-level
+# parity 门禁对齐。判停的静默界不在这份清单里：它是这个作业类自己量出来的极值
+# （`progress_bounds`），开工时装进来，收工时把这一趟量到的写回去。
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -85,6 +86,7 @@ spec:
                       age=$(( $(date +%s) - $(date -r "$f" +%s) )); win=$(cat "$f");
                       echo "quiet ${age}s, window ${win}s"; [ "$age" -le "$win" ]
                 periodSeconds: 30
+                timeoutSeconds: 10
                 failureThreshold: 3
                 initialDelaySeconds: 120
               env:
@@ -96,11 +98,8 @@ spec:
                   value: "true"
                 - name: COGNEVA_LOKI_ENDPOINT
                   value: "http://loki.monitoring.svc.cluster.local:3100"
-                # 一步的静默界：任何一步静默超过它，由这一跑自己收尾并落一行
-                # `failed`，判词点名停在哪一步。整趟不受它约束。两处同一个数由
-                # deploy/scripts/tests/backup-jobs-stop-on-silence.test.sh 盯。
-                - name: COGNEVA_BACKUP_DRILL_STEP_SILENCE_SECS
-                  value: "3600"
+                # 这一步静默多久算停不在清单里：进程开工时向 `progress_bounds`
+                # 问这个作业类上一次运行量到的极值，没有那行就不判停。
                 - name: BACKUP_PASSWORD
                   valueFrom:
                     secretKeyRef:

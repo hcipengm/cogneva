@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use crate::mainline_deployer::FATAL_WAITING_REASONS;
 use crate::GitOpsConfig;
+use cog_core::declared_wall::Step;
 use cog_core::{
     PromotionLedger, PromotionRecord, PromotionStatus, SFError, SFResult,
     COUNTER_SEMANTICS_CUMULATIVE, COUNTER_SEMANTICS_MARKER,
@@ -142,6 +143,13 @@ pub const CLUSTER_LABEL: &str = "cluster";
 /// 完成；10s 也是这条循环在发布期间的全部负载。
 // cap: bound — Pod 重建以十秒计，更密的轮询只多打几次 kubectl，不会让发布更早完成
 const ROLLOUT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 等全量滚动时「读数变了」这条证据通道的名字。
+///
+/// 一个名字，两处读者：等待方在读数变化时记一拍，判停方（
+/// [`cog_core::declared_wall::wait_for_settled`]）按同一个名字问「多久没动」。
+/// 名字分叉＝两边各说各的，判据永远不响。
+const ROLLOUT_PROGRESS_CHANNEL: &str = "gitops-rollout";
 
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,23 +552,13 @@ impl GitOpsPuller {
                     )
                     .await;
             }
-            let status = self
-                .run(
-                    &k,
-                    &[
-                        "-n",
-                        &n,
-                        "rollout",
-                        "status",
-                        &format!("deployment/{d}"),
-                        "--timeout",
-                        "20s",
-                    ],
-                    None,
-                )
-                .await;
-            match status {
-                Ok(_) => {
+            // 问一次状态，不按钟问。`rollout status --timeout 20s` 把「等了二十秒」
+            // 当成了判词：puller 重启后的那一进程里，二十秒可能只是慢镜拉取，滚动
+            // 还在往前走，而失败就被读成 undo。现在只有两种读法能结束这一行：
+            // 完成，或者平台自己声明失败（`ProgressDeadlineExceeded`、坏镜像/坏挂载）。
+            // 还在滚就原样留 Pending，下一轮 poll 回来看——不写台账，于是没有重试风暴。
+            match self.rollout_step().await {
+                Ok(Step::Done(_)) => {
                     // 台账这一行要让人看出「这条是补收尾的」，不是一次完整的金丝雀：
                     // 暂停是死掉的写者留下的，本轮把它解开了。
                     let reason = if was_paused {
@@ -573,10 +571,10 @@ impl GitOpsPuller {
                         .update_status(&rec.id, PromotionStatus::Promoted, reason)
                         .await?;
                 }
-                Err(e) => {
-                    // 镜像已换但滚动卡死（拉不到镜像/副本不起）：回滚。
+                Ok(Step::Failed(why)) => {
+                    // 平台给出了失败的直接证据：回滚。
                     // resume 先于 undo（paused 部署 undo 会被 kubectl 拒绝）。
-                    warn!(error = %e, "orphaned canary stuck; rolling back");
+                    warn!(why = %why, "orphaned canary failed on direct evidence; rolling back");
                     let _ = self
                         .run(
                             &k,
@@ -595,9 +593,21 @@ impl GitOpsPuller {
                         .update_status(
                             &rec.id,
                             PromotionStatus::RolledBack,
-                            &format!("orphaned canary rolled back after puller restart: {e}"),
+                            &format!("orphaned canary rolled back after puller restart: {why}"),
                         )
                         .await?;
+                }
+                Ok(Step::Moving(state)) => {
+                    // 还在滚：这不是失败的证据，只是「还没完」。留 Pending 下一轮再看，
+                    // 此刻 undo 会杀掉一个可能马上完成的滚动。
+                    info!(
+                        state = %state,
+                        "orphaned canary is still rolling; leaving the row pending for the next poll"
+                    );
+                }
+                Err(e) => {
+                    // 读不出来不是「滚动失败」：这一眼没看清，下一轮再读。
+                    warn!(error = %e, "orphaned canary state unreadable; leaving the row pending");
                 }
             }
         } else if self.deployment_paused().await.unwrap_or(false) {
@@ -660,10 +670,14 @@ impl GitOpsPuller {
         Ok(out.trim() == "true")
     }
 
-    /// 全量滚动是否完成：observedGeneration 追上 generation 且更新后
-    /// 副本数与就绪副本数都达到期望。短查询（相对 rollout status 长等）
-    /// 不怕 puller 所在旧副本被杀——每次调用都是独立命令。
-    async fn rollout_complete(&self) -> SFResult<bool> {
+    /// 全量滚动的现状，一次短查询：完成 / 平台声明失败 / 还在走。
+    ///
+    /// 短查询（相对 `rollout status` 长等）不怕 puller 所在旧副本被杀——每次调用
+    /// 都是独立命令。失败那一支读的是 `Progressing` 条件里的 `ProgressDeadlineExceeded`：
+    /// 那是**部署自己**申报的期望工期被越过、且状态不再推进，是平台给出的判词，
+    /// 不是我们替它挑的一个数。还在走的那一支把原始读数带回给等待方，读数变了
+    /// 才算动过。
+    async fn rollout_step(&self) -> SFResult<Step<String>> {
         let out = self
             .run(
                 &self.config.kubectl_bin.clone(),
@@ -674,21 +688,42 @@ impl GitOpsPuller {
                     "deployment",
                     &self.config.deployment,
                     "-o",
-                    "jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas}",
+                    "jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas} {.status.conditions[?(@.type==\"Progressing\")].reason}",
                 ],
                 None,
             )
             .await?;
         let parts: Vec<&str> = out.split_whitespace().collect();
         if parts.len() < 5 {
-            return Ok(false);
+            return Ok(Step::Moving(out.trim().to_string()));
         }
         let gen: u64 = parts[0].parse().unwrap_or(0);
         let obs: u64 = parts[1].parse().unwrap_or(0);
         let spec: u32 = parts[2].parse().unwrap_or(0);
         let updated: u32 = parts[3].parse().unwrap_or(0);
         let ready: u32 = parts[4].parse().unwrap_or(0);
-        Ok(obs >= gen && gen > 0 && updated == spec && ready == spec)
+        if cog_core::declared_wall::generation_reaches(gen, obs) && updated == spec && ready == spec
+        {
+            return Ok(Step::Done(out.trim().to_string()));
+        }
+        // 判词只对控制器处理过的那一代作数：`apply` 之后的第一眼可能还带着上一代
+        // 留下的 `ProgressDeadlineExceeded`。词表取自控制律那一侧，这一格按空格分列。
+        if cog_core::declared_wall::generation_reaches(gen, obs)
+            && parts.get(5) == Some(&cog_core::declared_wall::PROGRESS_DEADLINE_EXCEEDED)
+        {
+            return Ok(Step::Failed(format!(
+                "deployment {} reports Progressing=False (ProgressDeadlineExceeded): {}",
+                self.config.deployment,
+                out.trim()
+            )));
+        }
+        Ok(Step::Moving(out.trim().to_string()))
+    }
+
+    /// 全量滚动是否完成：observedGeneration 追上 generation 且更新后
+    /// 副本数与就绪副本数都达到期望。
+    async fn rollout_complete(&self) -> SFResult<bool> {
+        Ok(matches!(self.rollout_step().await?, Step::Done(_)))
     }
 
     /// 当前部署在跑的容器镜像。
@@ -1199,26 +1234,27 @@ impl GitOpsPuller {
                 }
                 // 等全量滚动完成。不用 `rollout status --timeout`：puller
                 // 跑在被滚动的部署里，长连接命令会随旧副本被杀而失败，
-                // 把成功的滚动误判成失败进而 undo 掉好版本。改为短查询
-                // 轮询完成条件；puller 中途被杀则台账留 Pending，由
-                // reconcile_pending 收尾。
-                let rollout_deadline = std::time::Instant::now()
-                    + Duration::from_secs(self.config.canary_watch_secs.max(300));
-                let mut rolled_out = false;
-                while std::time::Instant::now() < rollout_deadline {
-                    if self.rollout_complete().await.unwrap_or(false) {
-                        rolled_out = true;
-                        break;
-                    }
-                    tokio::time::sleep(ROLLOUT_POLL_INTERVAL).await;
-                }
-                if !rolled_out {
-                    // 看护通过但全量滚动失败（新副本后续拉不到镜像/不起）：
+                // 把成功的滚动误判成失败进而 undo 掉好版本。也不按钟收尾——
+                // 只有「完成」与「平台声明失败」两种读法能结束这一段：
+                // 读回来的读数变了就是还在动，过了申报的墙只留一行字。
+                // puller 中途被杀则台账留 Pending，由 reconcile_pending 收尾。
+                let declared = Duration::from_secs(self.config.canary_watch_secs.max(300));
+                let rolled_out = cog_core::declared_wall::wait_for_settled(
+                    declared,
+                    "the full rollout after the canary",
+                    ROLLOUT_PROGRESS_CHANNEL,
+                    ROLLOUT_POLL_INTERVAL,
+                    || async { self.rollout_step().await.map_err(|e| e.to_string()) },
+                )
+                .await;
+                if let Err(why) = rolled_out {
+                    // 看护通过但全量滚动失败（新副本后续拉不到镜像/不起、平台
+                    // 宣布 ProgressDeadlineExceeded，或静默越过了实测界）：
                     // 与看护失败同等处理——回滚 + RolledBack。否则候选记
                     // Failed 下轮 poll 会反复金丝雀（重试风暴），部署也
                     // 停在坏镜像上（2026-08-07 cluster-2 实测）。
                     // resume 先于 undo（paused 部署 undo 会被 kubectl 拒绝）。
-                    let e = SFError::Agent("rollout did not complete in time".into());
+                    let e = SFError::Agent(why);
                     warn!(error = %e, "rollout after canary failed; rolling back");
                     let _ = self
                         .run(
@@ -5077,6 +5113,7 @@ spec:
         let script = format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n\
              *spec.paused*) echo true ;;\n\
+             *observedGeneration*) echo \"3 3 2 2 2\" ;;\n\
              *containers*) echo localhost:30500/cogneva:promote-candidate-1 ;;\n\
              esac\nexit 0\n",
             tmp.path().join("kubectl.log").display()
@@ -5125,7 +5162,7 @@ spec:
              revision unable to roll out: {calls}"
         );
         assert!(
-            calls.contains("rollout status deployment/cogneva"),
+            calls.contains(".status.observedGeneration"),
             "the pause is not the same question as the pods; the rollout still has to be \
              read after resuming: {calls}"
         );
@@ -5146,6 +5183,45 @@ spec:
             "the row has to say the pause was cleared by this round, not that a canary \
              completed cleanly: {}",
             row.outcome
+        );
+    }
+
+    /// 一次读状态只有三种答案：完成、平台自己声明的失败、还在走。
+    ///
+    /// 第三种必须与第二种分开：把「还没读完」读成失败，就是 2026-10-11 那次
+    /// 二十秒判词在同一张脸上的另一副样子——好的版本被 undo 掉。
+    #[tokio::test]
+    async fn the_rollout_read_tells_completion_failure_and_movement_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let script = format!("#!/bin/sh\ncat '{}'\n", state.display());
+        let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
+        let cfg = GitOpsConfig {
+            kubectl_bin: kubectl.to_string_lossy().to_string(),
+            namespace: "cogneva".into(),
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            ..Default::default()
+        };
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let puller = GitOpsPuller::new(cfg, ledger, "cluster-a".into());
+
+        std::fs::write(&state, "3 3 2 2 2\n").unwrap();
+        assert!(
+            matches!(puller.rollout_step().await.unwrap(), Step::Done(_)),
+            "every replica ready and observed is done"
+        );
+
+        std::fs::write(&state, "3 3 2 1 1 ProgressDeadlineExceeded\n").unwrap();
+        match puller.rollout_step().await.unwrap() {
+            Step::Failed(why) => assert!(why.contains("ProgressDeadlineExceeded"), "{why}"),
+            _ => panic!("the platform's own failure verdict was not read as one"),
+        }
+
+        std::fs::write(&state, "3 3 2 1 1\n").unwrap();
+        assert!(
+            matches!(puller.rollout_step().await.unwrap(), Step::Moving(_)),
+            "a rollout that is still going is movement, not failure"
         );
     }
 }

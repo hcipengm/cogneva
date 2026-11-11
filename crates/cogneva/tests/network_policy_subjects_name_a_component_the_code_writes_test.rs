@@ -52,7 +52,16 @@ fn constants_in(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in production_lines(text) {
         let trimmed = line.trim();
-        if !(trimmed.starts_with("const ") || trimmed.starts_with("pub const ")) {
+        // The visibility prefix is not part of the question: a constant another
+        // module in the same crate reads is `pub(crate)`, and it still spells a
+        // component value the code stamps. Only the declaration has to remain a
+        // `const`, so the name and the literal are checked the same way below.
+        let declaration = trimmed
+            .strip_prefix("pub(crate) ")
+            .or_else(|| trimmed.strip_prefix("pub(super) "))
+            .or_else(|| trimmed.strip_prefix("pub "))
+            .unwrap_or(trimmed);
+        if !declaration.starts_with("const ") {
             continue;
         }
         if !trimmed.contains("COMPONENT") || !trimmed.contains(": &str =") {
