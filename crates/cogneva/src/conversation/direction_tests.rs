@@ -611,6 +611,67 @@ async fn an_owners_band_lands_as_a_citation_and_the_row_takes_the_highest_one() 
     assert_eq!(row.sources.len(), 2, "属主的那一句把账上原来那条文档挤掉了");
 }
 
+/// 写账的两只工具先过判据面：判不了的形状当场拒，账上一个字都不写。
+///
+/// 拒在写点，因为行一旦进了账，读者看到的是「还欠着」，而没有任何东西能把它
+/// 还清。拒在这里，说话的人还在，还能改一句再写。只读的 `get_change` 不拦：
+/// 账上已有的旧行（`absent`）还要读得出来。
+#[tokio::test]
+async fn a_declaration_the_judge_cannot_answer_never_reaches_the_ledger() {
+    let ledger = BandLedger::holding(vec![
+        ledger_row(
+            "absent",
+            "crates/",
+            "fn a()",
+            cog_core::ChangeState::Landed,
+            &[("spec-x", cog_core::ChangePriority::Unstated)],
+        ),
+        ledger_row(
+            "grep",
+            "crates/",
+            "fn a()",
+            cog_core::ChangeState::Pending,
+            &[("spec-x", cog_core::ChangePriority::Unstated)],
+        ),
+    ]);
+    let graph = HandoverGraph::dispatching();
+    let tools = direction_tools(Some(ledger.clone()), &graph, None, Some("ferris"));
+
+    // 判据面已经退役的名字：它同时写着两个相反的诉求，看树分不出是哪一句。
+    let retired = call(
+        &tools,
+        "set_change_priority",
+        band_args("absent", "crates/", "fn a()", "p1"),
+    )
+    .await;
+    assert_eq!(retired["available"], true, "{retired}");
+    assert_eq!(retired["refused"], "retired_kind", "{retired}");
+    assert!(
+        ledger.written().is_empty(),
+        "拒了却往账上写了引用：拒绝要发生在写之前，不是写完再喊停"
+    );
+
+    // 树外的 scope：账查的是树，树外没有字节可以量。
+    let outside = call(
+        &tools,
+        "dispatch_change",
+        change_args("grep", "/etc/passwd", "fn a()"),
+    )
+    .await;
+    assert_eq!(outside["refused"], "scope_outside_tree", "{outside}");
+    assert!(ledger.written().is_empty(), "拒了却写了引用");
+
+    // 阳性对照：判得了的同一只工具照常工作——否则这一格只是证明了门被焊死。
+    let accepted = call(
+        &tools,
+        "set_change_priority",
+        band_args("grep", "crates/", "fn a()", "p2"),
+    )
+    .await;
+    assert_eq!(accepted["effective"], "p2", "{accepted}");
+    assert_eq!(ledger.written().len(), 1, "受理的那一条没写成引用");
+}
+
 /// 同一个属主再说一次，是他自己那一格被改写，不是多出一条别人说的。
 #[tokio::test]
 async fn saying_it_again_rewrites_the_owners_own_citation_instead_of_leaving_two() {

@@ -1129,12 +1129,42 @@ const OWNER_BAND_DOC_PREFIX: &str = "owner:";
 ///
 /// 正文里常带冒号，拆错了问的就是另一条变更，而账上会诚实地回「没有这一条」——
 /// 读的人于是以为这条变更不存在。
-fn identity_arg(args: &serde_json::Value) -> SFResult<cog_core::ChangeIdentity> {
-    Ok(cog_core::ChangeIdentity::new(
-        require_str(args, "kind")?,
-        require_str(args, "scope")?,
-        require_str(args, "literal")?,
-    ))
+/// 三段身份在写账之前先过判据面：判不了的形状当场拒，并说清是哪一条线。
+///
+/// 校验放在写点，不放在判据处：判据处已经答得了「这一次量不了」，但那一答发生在
+/// 行**落进账之后**——读者看到的是「还欠着」，而没有任何东西能把它还清。写点是从
+/// 模型手里接话的那一处，模型还在，还能改一句再写。
+///
+/// 拒法回 JSON 而不是 `Err`：这是这一轮的结果，模型该把它说出来，而不是把同一次
+/// 调用重试一遍——与这张表上其他拒法（`unknown_band`、`unknown_change`）同一档。
+fn identity_arg(args: &serde_json::Value) -> Result<cog_core::ChangeIdentity, serde_json::Value> {
+    let read = |key: &str| {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default()
+    };
+    let (kind, scope, literal) = (read("kind"), read("scope"), read("literal"));
+    for (field, value) in [("kind", kind), ("scope", scope), ("literal", literal)] {
+        if value.is_empty() {
+            return Err(serde_json::json!({
+                "available": true,
+                "refused": "blank",
+                "field": field,
+                "note": format!(
+                    "{field} 是空的。一条变更的身份是 kind、scope、literal 三段，\
+                     缺一段就查不了任何东西——先 list_changes 找一条真实的身份，照抄那三段。"
+                ),
+            }));
+        }
+    }
+    cog_orchestrator::change_measure::measurable_identity(kind, scope, literal).map_err(|refused| {
+        serde_json::json!({
+            "available": true,
+            "refused": refused.code(),
+            "note": refused.reason(),
+        })
+    })
 }
 
 /// 外循环的方向盘：属主的一句话落到派工顺序与判据上。
@@ -1195,7 +1225,7 @@ fn set_change_priority_tool(
         serde_json::json!({
             "type": "object",
             "properties": {
-                "kind": { "type": "string", "description": "检查的种类，如 grep / absent / exists" },
+                "kind": { "type": "string", "description": "检查的种类：grep（scope 下要有这段原文）、exists（scope 这个路径要在树上）、gone（这个路径不在树上）" },
                 "scope": { "type": "string", "description": "检查看哪里：一个路径或一个目录" },
                 "literal": { "type": "string", "description": "逐字匹配的那段正文" },
                 "band": {
@@ -1213,7 +1243,10 @@ fn set_change_priority_tool(
                 let Some(store) = changes else {
                     return Ok(ledger_absent("变更账"));
                 };
-                let identity = identity_arg(&args)?;
+                let identity = match identity_arg(&args) {
+                    Ok(identity) => identity,
+                    Err(refusal) => return Ok(refusal),
+                };
                 let asked = require_str(&args, "band")?;
                 let priority = match asked.parse::<cog_core::ChangePriority>() {
                     Ok(priority) => priority,
@@ -1295,7 +1328,7 @@ fn dispatch_change_tool(
         serde_json::json!({
             "type": "object",
             "properties": {
-                "kind": { "type": "string", "description": "检查的种类，如 grep / absent / exists" },
+                "kind": { "type": "string", "description": "检查的种类：grep（scope 下要有这段原文）、exists（scope 这个路径要在树上）、gone（这个路径不在树上）" },
                 "scope": { "type": "string", "description": "检查看哪里：一个路径或一个目录" },
                 "literal": { "type": "string", "description": "逐字匹配的那段正文" }
             },
@@ -1312,7 +1345,10 @@ fn dispatch_change_tool(
                 let Some(store) = changes else {
                     return Ok(ledger_absent("变更账"));
                 };
-                let identity = identity_arg(&args)?;
+                let identity = match identity_arg(&args) {
+                    Ok(identity) => identity,
+                    Err(refusal) => return Ok(refusal),
+                };
                 let Some(row) = store.get(&identity).await? else {
                     return Ok(serde_json::json!({
                         "available": true,
@@ -1597,7 +1633,7 @@ fn get_change_tool(changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>) -> Too
         serde_json::json!({
             "type": "object",
             "properties": {
-                "kind": { "type": "string", "description": "检查的种类，如 grep / absent / exists" },
+                "kind": { "type": "string", "description": "检查的种类：grep（scope 下要有这段原文）、exists（scope 这个路径要在树上）、gone（这个路径不在树上）" },
                 "scope": { "type": "string", "description": "检查看哪里：一个路径或一个目录" },
                 "literal": { "type": "string", "description": "逐字匹配的那段正文" }
             },

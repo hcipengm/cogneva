@@ -18,9 +18,7 @@
 use std::sync::Arc;
 
 use cog_core::contract::tool::Tool;
-use cog_core::{
-    ChangeIdentity, ChangePriority, ChangeReading, ChangeSource, ToolHandler, ToolImplementation,
-};
+use cog_core::{ChangePriority, ChangeReading, ChangeSource, ToolHandler, ToolImplementation};
 
 /// 员工用来申请改自己的那只工具。
 pub const PROPOSE_SELF_CHANGE: &str = "propose_self_change";
@@ -49,6 +47,9 @@ pub enum Refusal {
     OutsideTree(String),
     /// 某个必填项是空的。空话进不了账。
     Blank(&'static str),
+    /// `literal` 是一句判词而不是树上的一段原文：它带着判词的分隔符，判据面读不成
+    /// 一个片段，这条申请永远量不出来。
+    Rendering(String),
 }
 
 impl Refusal {
@@ -77,6 +78,16 @@ impl Refusal {
                     "没有进账：{path} 不在这棵树里。账的判据是看树，「落地了没有」只有\
                      这棵树上的字节能回答；树外的路径进去就是一条永远量不出来的行。\
                      写相对树根的路径。"
+                ),
+            }),
+            Refusal::Rendering(literal) => serde_json::json!({
+                "queued": false,
+                "refused": "literal_is_a_rendering",
+                "literal": literal,
+                "note": format!(
+                    "没有进账：{literal:?} 是一句判词，不是树上的片段——它带着判词的分隔符。\
+                     账的判据是「这段原文在这个文件里出现过」，所以 literal 要写成你要在\
+                     文件里找到的那段原文本身。"
                 ),
             }),
             Refusal::Blank(field) => serde_json::json!({
@@ -114,15 +125,26 @@ impl Proposal {
         if why.is_empty() {
             return Err(Refusal::Blank("why"));
         }
-        if path.starts_with('/') || path.split('/').any(|part| part == "..") {
-            return Err(Refusal::OutsideTree(path.to_string()));
-        }
-        let path = path.trim_start_matches("./").to_string();
-        if cog_reflection::criteria_face::is_carrier_path(&path) {
-            return Err(Refusal::Carrier(path));
+        let path = path.trim_start_matches("./");
+        // 形状的校验只有一份：判据面自己说得出「这条变更量得出来吗」，这里不另抄
+        // 一份绝对路径／`..` 的判据——抄出来的第二份迟早与判据面说的不是一件事。
+        let identity = cog_orchestrator::change_measure::measurable_identity("grep", path, literal)
+            .map_err(|refused| match refused {
+                cog_orchestrator::change_measure::DeclarationRefusal::ScopeNotInTree(scope) => {
+                    Refusal::OutsideTree(scope)
+                }
+                cog_orchestrator::change_measure::DeclarationRefusal::LiteralIsARendering(
+                    literal,
+                ) => Refusal::Rendering(literal),
+                // 这段身份写死是 `grep`，空 literal 上面已经拒过：这两种拒法在这条路上
+                // 够不到，够到了就是这段代码被改坏了。
+                other => unreachable!("grep 是判据面答得了的一种，且 literal 非空：{other:?}"),
+            })?;
+        if cog_reflection::criteria_face::is_carrier_path(path) {
+            return Err(Refusal::Carrier(path.to_string()));
         }
         Ok(ChangeReading {
-            identity: ChangeIdentity::new("grep", path, literal),
+            identity,
             title: Some(format!("self-change: {}", one_line(why))),
             assertion: Some(format!(
                 "{asker} 申请：{} 里出现 {}",
@@ -371,6 +393,26 @@ mod tests {
         let mut p = proposal("", "x");
         p.why = "因为".into();
         assert_eq!(p.reading("employee-7"), Err(Refusal::Blank("path")));
+    }
+
+    /// 一句判词不是树上的片段：带判词分隔符的 literal 量不出来，当场拒。
+    ///
+    /// 这条以前会进账，然后永远停在 `undecided`——判据面看得出它读不成片段，
+    /// 而那一答发生在行已经进了账之后。写点拒它的代价是提申请的人改一句，不拒
+    /// 的代价是一条谁也还不了的欠债。
+    #[test]
+    fn a_literal_that_is_a_finding_written_out_is_refused() {
+        let refusal = proposal("cogneva.example.json", "grep crates/ :: fn a()")
+            .reading("employee-7")
+            .expect_err("判词不是片段");
+        assert!(matches!(refusal, Refusal::Rendering(_)), "{refusal:?}");
+        let answer = refusal.answer();
+        assert_eq!(answer["queued"], false);
+        assert_eq!(answer["refused"], "literal_is_a_rendering");
+        assert!(
+            answer["note"].as_str().unwrap_or_default().contains("原文"),
+            "拒绝没说清该写什么：{answer}"
+        );
     }
 
     /// 账缺席时说的是「没记下」，不是「被拒了」，更不是「已受理」。

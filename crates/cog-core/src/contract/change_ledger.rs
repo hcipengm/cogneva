@@ -29,7 +29,7 @@ use crate::SFResult;
 /// its parts -- it is a rendering for humans, not the key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChangeIdentity {
-    /// The kind of check: `grep`, `absent`, `exists`, ...
+    /// The kind of check: `grep`, `exists`, `gone`, ...
     pub kind: String,
     /// What the check looks in: a path or a directory.
     pub scope: String,
