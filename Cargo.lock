@@ -1542,6 +1542,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
+ "cog-test-support",
  "ed25519-dalek",
  "futures",
  "hex",
@@ -2036,6 +2037,7 @@ version = "0.5.10"
 dependencies = [
  "anyhow",
  "cog-core",
+ "cog-test-support",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

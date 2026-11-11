@@ -62,15 +62,17 @@ fn classify(path: &str) -> Option<(String, String)> {
 }
 
 /// 源码里出现的每一条 apiserver 路径字面量。
-fn literals() -> Vec<String> {
-    let mut out = Vec::new();
-    for piece in SOURCE.split('"').skip(1).step_by(2) {
+///
+/// 引号与转义由 `cog_test_support::literal_values` 认——那是全仓唯一的一份读法。
+/// 旧版本按 `"` 切分取奇数段：`\"` 会让切分点落在字符串中间，而后面没有任何东西
+/// 会因此变红，只是那一条读路径悄悄不在探针表里。
+fn apiserver_paths() -> Vec<String> {
+    cog_test_support::literal_values(SOURCE)
+        .into_iter()
         // `/version` 不在 `/api` 下面，但它是同一个客户端、同一条读面。
-        if piece.starts_with("/api") || piece == "/version" {
-            out.push(piece.to_string());
-        }
-    }
-    out
+        .filter(|piece| piece.starts_with("/api") || *piece == "/version")
+        .map(str::to_string)
+        .collect()
 }
 
 /// 资源名落在哪个分组。探针表只带资源名，分组是 apiserver 的事。
@@ -102,7 +104,7 @@ fn every_collection_the_face_reads_is_probed() {
         .collect();
     let mut unprobed = Vec::new();
     let mut source_shapes = BTreeSet::new();
-    for literal in literals() {
+    for literal in apiserver_paths() {
         let Some(key) = classify(&literal) else {
             // 按名读（`…/<resource>/<name>`）与子资源在 classify 里落不到形状上；
             // 它们读的是同一批集合，集合那条已经被探针覆盖，代理那一条在豁免表里。

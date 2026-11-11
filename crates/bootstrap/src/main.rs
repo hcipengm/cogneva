@@ -4913,6 +4913,7 @@ mod rust_production;
 #[cfg(test)]
 mod key_value_literal_tests {
     use super::rust_production::production_text;
+    use cog_test_support::literal_values;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -4922,7 +4923,7 @@ mod key_value_literal_tests {
     /// 写第二遍的那一刻，两处就是两份约定，而漂移不会报错——它会以某一处**少一个
     /// 选项**的形式发生。这里不是假设：ssh 选项曾经四处各写一遍，本机免密自检那一处
     /// 少了 `ConnectTimeout`，于是自检通过而装机连不上，两侧读起来都正常。
-    fn literals_in(dir: &Path, out: &mut BTreeMap<String, Vec<String>>) {
+    fn collect_key_value_literals(dir: &Path, out: &mut BTreeMap<String, Vec<String>>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -4930,7 +4931,7 @@ mod key_value_literal_tests {
         paths.sort();
         for path in paths {
             if path.is_dir() {
-                literals_in(&path, out);
+                collect_key_value_literals(&path, out);
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -4957,34 +4958,24 @@ mod key_value_literal_tests {
     }
 
     /// 一行里所有 `"Key=value"` 形状的字面量。
+    ///
+    /// 引号、转义与行内第二处由 `cog_test_support::literal_values` 认；这里只判形状。
+    /// 自己再扫一遍字节会多出第二份读法——旧抄件把 `\"` 当成字面量的结尾，与共享
+    /// 读法对同一行给出的答案不同。
     fn quoted_key_values(line: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let bytes = line.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] != b'"' {
-                i += 1;
-                continue;
-            }
-            let start = i + 1;
-            let mut j = start;
-            while j < bytes.len() && bytes[j] != b'"' {
-                j += 1;
-            }
-            let value = &line[start..j.min(line.len())];
-            let key = value.split('=').next().unwrap_or("");
-            let shaped = value.contains('=')
-                && !value.contains(' ')
-                && !key.is_empty()
-                && key
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'));
-            if shaped {
-                out.push(value.to_string());
-            }
-            i = j + 1;
-        }
-        out
+        literal_values(line)
+            .into_iter()
+            .filter(|value| {
+                let key = value.split('=').next().unwrap_or("");
+                value.contains('=')
+                    && !value.contains(' ')
+                    && !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     /// 对照：同一个字面量写两遍必须被报出来。少了这条，上面那条判据哪天读不到
@@ -5005,7 +4996,7 @@ mod key_value_literal_tests {
         )
         .unwrap();
         let mut found = BTreeMap::new();
-        literals_in(&dir, &mut found);
+        collect_key_value_literals(&dir, &mut found);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             found.get("BatchMode=yes").map(|files| files.len()),
@@ -5017,7 +5008,7 @@ mod key_value_literal_tests {
     #[test]
     fn a_key_value_literal_is_written_once() {
         let mut found = BTreeMap::new();
-        literals_in(
+        collect_key_value_literals(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut found,
         );
