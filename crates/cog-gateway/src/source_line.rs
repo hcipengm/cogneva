@@ -6,6 +6,10 @@
 //! - **编辑**：一次改动从某个工作树出发，工作树的名字就是它那条分支的名字。宿主上的
 //!   工作树目录不在网关的挂载里，但每条分支的尖端在裸仓库里，且带着提交时间与标题——
 //!   「谁最近在这条线上动了」这句话只从引用里就能读出来，不必进那棵工作树。
+//!   判「此刻在编辑的是哪一棵」不靠阈值：参考点就是 `main` 的尖端——上一次推进这件事
+//!   本身。尖端比它晚的分支，是推进之后还有人落笔的那几条；一条很久以前分叉出去、
+//!   此后再没动过的旧线（例如一条 9 天前的 release 分支）不在其中。把它读成「编辑」，
+//!   页面就会说「有人在改这条分支」，而它其实早就不动了。
 //! - **推送**：部署器只跟 `main`。`refs/heads/main` 走到哪个字节、多久没动过，就是
 //!   「推上去了没有」这一问的读数。
 //!
@@ -76,6 +80,17 @@ pub struct SourceLineReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub main: Option<BranchReading>,
     pub branches: Vec<BranchReading>,
+    /// 「编辑」那一格该写谁：尖端比 `main` 的尖端更晚的那条分支里最新的一条。
+    ///
+    /// 判据不是「非 main 里最新的那条」——那条可能是一天前分叉出去、此后一直没动
+    /// 的旧线，把它读成「此刻在编辑的那棵树」等于给一条死分支安上一个活归因。
+    /// `None` 有两种来处，都由 `why` 分开：裸仓库里没有 `main`（没有参考点），或者
+    /// 没有任何分支在最后一次推进之后还有提交（此刻没有树在动）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editing: Option<BranchReading>,
+    /// 与 [`Self::editing`] 同属「推进之后还在动」的其余分支数。只给 `editing` 一个
+    /// 名字，会读成「台上只有一棵树在动」。
+    pub editing_others: u32,
     /// 被截断时这里说还有几条没列。`None` 是「全列上了」。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub more_branches: Option<u32>,
@@ -119,6 +134,8 @@ impl SourceLineReport {
             repo,
             main: None,
             branches: Vec::new(),
+            editing: None,
+            editing_others: 0,
             more_branches: None,
             generated_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -162,6 +179,10 @@ pub fn read_source_line(repo: &Path) -> SourceLineReport {
     };
 
     let mut all: Vec<BranchReading> = Vec::new();
+    // 尖端那笔提交的 unix 时刻，按分支名留一份：「编辑」那一格要拿它和 `main` 的
+    // 尖端比先后，而 `BranchReading` 里存的是给人看的相对秒数与 rfc3339。
+    let mut committed_unix: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     for line in listing.lines().filter(|line| !line.trim().is_empty()) {
         // 前三个字段固定，第四个是提交标题（里面可以有制表符）。
         let mut parts = line.splitn(4, FIELD_SEP);
@@ -171,6 +192,9 @@ pub fn read_source_line(repo: &Path) -> SourceLineReport {
         let subject = parts.next().unwrap_or("").trim().to_string();
         if name.is_empty() || sha.is_empty() {
             continue;
+        }
+        if let Some(unix) = committed {
+            committed_unix.insert(name.clone(), unix);
         }
         all.push(BranchReading {
             name,
@@ -185,6 +209,39 @@ pub fn read_source_line(repo: &Path) -> SourceLineReport {
 
     let mut main = all.iter().find(|b| b.name == "main").cloned();
     let main_sha = main.as_ref().map(|b| b.sha.clone());
+
+    // 「编辑」那一格：参考点是 `main` 自己的尖端——上一次推进这件事本身——不另设
+    // 阈值。比它晚的分支是推进之后还有人落笔的那几条；一条很久以前分叉、此后再没
+    // 动过的旧线因此不会被读成「此刻在编辑的那棵树」。
+    let main_committed = committed_unix.get("main").copied();
+    let mut moving: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.name != "main")
+        .filter(
+            |(_, b)| match (committed_unix.get(&b.name).copied(), main_committed) {
+                // 比不出来（没有 main，或某一侧没有提交时刻）就不算「在动」：宁可
+                // 少说一棵树，也不替它编一个活的归因。
+                (Some(tip), Some(anchor)) => tip > anchor,
+                _ => false,
+            },
+        )
+        .map(|(index, _)| index)
+        .collect();
+    moving.sort_by_key(|index| {
+        std::cmp::Reverse(committed_unix.get(&all[*index].name).copied().unwrap_or(0))
+    });
+    // 关系（是否包含 main、多几笔）算在这条副本上：它可能落在截断之外，不能指望
+    // 下面那个只跑 `shown_branches` 的循环顺带把它算上。
+    let mut editing = moving.first().map(|index| all[*index].clone());
+    if let Some(editing) = editing.as_mut() {
+        if let Some(main_sha) = main_sha.as_deref() {
+            let (contains, ahead) = relation(repo, main_sha, &editing.sha);
+            editing.contains_main = contains;
+            editing.ahead_of_main = ahead;
+        }
+    }
+    let editing_others = moving.len().saturating_sub(1) as u32;
 
     // 分支按提交时间倒序（git 已经排好），截断只影响「列出来哪些」，不影响 main 有没有
     // 找到——main 是从全表里找的。
@@ -224,6 +281,8 @@ pub fn read_source_line(repo: &Path) -> SourceLineReport {
         repo: shown,
         main,
         branches: shown_branches,
+        editing,
+        editing_others,
         more_branches: (more > 0).then_some(more),
         generated_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -331,6 +390,55 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// 同 [`git_in`]，但把提交时刻钉死。`editing` 的判据是比较两个提交的先后，
+    /// 同一秒里连着提交的两笔在时间上分不出先后——夹具必须自己写出那个先后。
+    fn git_in_dated(dir: &Path, args: &[&str], date: &str) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t.invalid")
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// 在 `dir` 里按给定时刻落一笔提交，并把它推到裸仓库的 `branch`。
+    fn commit_and_push(
+        bare: &Path,
+        dir: &Path,
+        file: &str,
+        subject: &str,
+        date: &str,
+        branch: &str,
+    ) {
+        std::fs::write(dir.join(file), subject).unwrap();
+        git_in_dated(dir, &["add", file], date);
+        git_in_dated(dir, &["commit", "-qm", subject], date);
+        git_in_dated(
+            dir,
+            &[
+                "push",
+                "-q",
+                bare.to_str().unwrap(),
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+            date,
+        );
     }
 
     /// 一棵工作树 + 一个裸仓库：往工作树里提交，再把它推进裸仓库的某条分支。
@@ -542,5 +650,100 @@ mod tests {
             report.main.is_some(),
             "截断只影响列出来的那些，main 是从全表里找的"
         );
+    }
+
+    /// 一条很早以前就停下的分支，不能因为「它是非 main 里最新的那条」就被读成
+    /// 「此刻在编辑的那棵树」——那会给一条死分支安上一个活的归因。
+    #[test]
+    fn a_branch_that_stopped_before_the_last_advance_is_not_the_editing_tree() {
+        let root = scratch("stale-editor");
+        let bare = root.join("tree.git");
+        git_in(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_in(&work, &["init", "-q"]);
+        commit_and_push(
+            &bare,
+            &work,
+            "a.txt",
+            "stale work",
+            "2026-11-01T09:00:00+0000",
+            "old-line",
+        );
+        commit_and_push(
+            &bare,
+            &work,
+            "b.txt",
+            "main advanced",
+            "2026-11-10T09:00:00+0000",
+            "main",
+        );
+
+        let report = read_source_line(&bare);
+        assert!(
+            report.editing.is_none(),
+            "比 main 的尖端还早的分支不是「推进之后还在动」：{:?}",
+            report.editing
+        );
+        assert_eq!(report.editing_others, 0);
+        assert_eq!(report.branches.len(), 2, "它仍然要出现在分支表里");
+    }
+
+    /// 推进之后还有人落笔的分支才是「编辑」；有几条要说几条。
+    #[test]
+    fn the_branches_committed_after_the_last_advance_are_the_editing_trees() {
+        let root = scratch("live-editor");
+        let bare = root.join("tree.git");
+        git_in(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_in(&work, &["init", "-q"]);
+        commit_and_push(
+            &bare,
+            &work,
+            "a.txt",
+            "main advanced",
+            "2026-11-09T09:00:00+0000",
+            "main",
+        );
+        commit_and_push(
+            &bare,
+            &work,
+            "b.txt",
+            "still typing",
+            "2026-11-10T09:00:00+0000",
+            "wt-emp2",
+        );
+        commit_and_push(
+            &bare,
+            &work,
+            "c.txt",
+            "other tree",
+            "2026-11-10T10:00:00+0000",
+            "gate-eval",
+        );
+
+        let report = read_source_line(&bare);
+        let editing = report.editing.expect("推进之后的这两条分支里要选出一条");
+        assert_eq!(editing.name, "gate-eval", "选最新落笔的那条");
+        assert_eq!(
+            report.editing_others, 1,
+            "另一条也要数进去，否则会读成台上只有一棵树在动"
+        );
+    }
+
+    /// 没有 main 就没有「上一次推进」这个参考点：这时不许拿任意一条分支顶上。
+    #[test]
+    fn without_main_there_is_no_reference_point_so_no_tree_reads_as_editing() {
+        let root = scratch("no-reference");
+        let bare = repo_with_commits(&root, "topic", &["one"]);
+
+        let report = read_source_line(&bare);
+        assert!(
+            report.editing.is_none(),
+            "没有 main 就没有可比的那一版：{:?}",
+            report.editing
+        );
+        assert_eq!(report.editing_others, 0);
     }
 }

@@ -57,6 +57,25 @@ pub fn source_texts(root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// 一段源码里两个标记之间的那一段。
+///
+/// 四份 Web 面的夹具各抄过一遍，逐字相同：它们问的都是「这一面里、从这个名字到那个名字
+/// 之间，写的是什么」。抄件的毛病不在重复，在于找不到标记时那句 panic 各写各的——
+/// 一旦其中一份把 panic 换成 `unwrap_or_default()`，找不到标记就变成一段空字符串，
+/// 而「这段里没有那句话」与「这段没找到」在判词上同形，那一面从此对什么都点头。
+///
+/// 收的是纯文本，不认方言：TS、Rust、YAML 三种源码都在用，去注释由调用方自己先做。
+pub fn region_between(text: &str, from: &str, to: &str) -> String {
+    let start = text
+        .find(from)
+        .unwrap_or_else(|| panic!("源码里找不到 `{from}`"));
+    let end = start
+        + text[start..]
+            .find(to)
+            .unwrap_or_else(|| panic!("`{from}` 之后找不到 `{to}`"));
+    text[start..end].to_string()
+}
+
 /// One path reduced to the shape both sides can be compared by.
 ///
 /// `$` and `{}` are handled in one pass because a `${...}` may carry a nested

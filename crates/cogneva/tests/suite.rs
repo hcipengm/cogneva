@@ -519,6 +519,10 @@ mod web_client_response_fields_are_written_somewhere_test;
 mod web_client_routes_are_served_test;
 #[path = "web_client_word_lists_are_declared_test.rs"]
 mod web_client_word_lists_are_declared_test;
+#[path = "web_delivery_chain_cells_answer_where_the_change_is_stuck_test.rs"]
+mod web_delivery_chain_cells_answer_where_the_change_is_stuck_test;
+#[path = "web_delivery_chain_shows_where_the_gate_spent_its_time_test.rs"]
+mod web_delivery_chain_shows_where_the_gate_spent_its_time_test;
 #[path = "web_event_payloads_are_the_fields_the_server_writes_test.rs"]
 mod web_event_payloads_are_the_fields_the_server_writes_test;
 #[path = "web_event_vocabulary_contract_test.rs"]

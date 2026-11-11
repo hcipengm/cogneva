@@ -44,6 +44,21 @@ const RESERVE_FILE: &str = "builds.reserve";
 const SLOT_PREFIX: &str = "slot-";
 const SLOT_SUFFIX: &str = ".lock";
 
+/// 推之前那道门把每一格的秒数与结局写在这个子目录里，与槽位文件分开：
+/// 位子那一面按 `slot-*.lock` 读，两边互不干扰。
+const RUNS_SUBDIR: &str = "runs";
+/// 收尾的记号是改名，不另写终止行：多一种行，读的时候就要多认一种。
+const RUN_DONE_SUFFIX: &str = ".segments";
+const RUN_LIVE_SUFFIX: &str = ".running";
+/// 交付链上共用这份记录的三段。闭集：写的那一侧按这三个词落文件名，读的这一侧按后缀认。
+const RUN_STAGES: [&str; 3] = ["precommit", "gate", "prepush"];
+/// 文件名里没有阶段的那一种，就是整门——记录最早只有这一种。
+const LEGACY_STAGE: &str = "gate";
+// cap: bound — 每棵树每阶段各留一跑；三阶段 × 两棵在动的树，再留一点余量
+const MAX_RUNS: usize = 8;
+// cap: bound — 一跑最多带几格；一道门一百多格，上千格不是读数多，是有人在灌
+const MAX_RUN_STEPS: usize = 512;
+
 /// 一格读数。`state` 是闭集里的一个词，页面据此决定画读数还是画理由。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GateReport {
@@ -70,7 +85,59 @@ pub struct GateReport {
     pub pressure: Vec<PressureReading>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<LoadReading>,
+    /// 推之前那道门最近跑过的那几跑：每格花了多少秒、结局是什么。
+    ///
+    /// 这一面回答的是「刚才那一推慢在哪」，而槽位那一面回答的是「现在谁在编译」——
+    /// 两个问题不对等：一道两小时的门跑完之后，槽位读数恢复成「空着」，读者从这里
+    /// 再也看不出时间花在哪一格。记录就落在同一个目录里，所以这里加的是读数，不是
+    /// 通道。
+    ///
+    /// 空列表不是错误：这道门是后加的记录，槽目录里还没有它写过的东西；`runs_why`
+    /// 只说「读不动」那一种。
+    pub runs: Vec<RunReading>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runs_why: Option<String>,
     pub generated_at: String,
+}
+
+/// 推之前那道门的一跑：在哪棵树上、跑到哪儿了、每一格多少秒。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RunReading {
+    /// 这一跑所在的树。目录名把路径里的 `/` 换成了 `_`，读者据此认出是哪棵工作树。
+    pub tree: String,
+    /// 这是交付链上的哪一段：`precommit` / `gate` / `prepush`。
+    ///
+    /// 三个钩子共用同一份记录实现，读者按阶段把一跑放回链路上对应的那一格；没有
+    /// 这一格，一段 4 秒的提交前钩子会顶掉两小时的整门，成为页面上「最近一跑」。
+    pub stage: String,
+    /// 从开跑到这一刻过了多久。跑完的那一份是这一跑的时长。
+    pub started_secs_ago: u64,
+    /// 这一跑有没有收尾。没收尾的是「还在跑，或者被杀了」——记录本身不替它猜是哪一种。
+    pub finished: bool,
+    /// 最后一次落笔是多久以前。没收尾的那一跑，这一格是它「停了多久」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_write_secs_ago: Option<u64>,
+    /// 各格秒数之和。它不等于这一跑的墙钟时长：格子之间与构建槽排队的时间不在里面。
+    pub total_secs: u64,
+    pub red: usize,
+    pub unjudged: usize,
+    /// 记录在、内容读不出来（权限、是个目录、坏编码）时的原因。
+    ///
+    /// 没有这一格，读不动与「这一跑一格都没记」在页面上同形：两份都是空表配合计 0。
+    /// 读者是另一个 uid（Pod 里 1001，宿主上是跑门的那个人），所以这条不是理论上的：
+    /// 门在一个把 `umask` 收成 077 的 shell 里跑过，记录就是 0600，Pod 只读得到目录。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
+    pub steps: Vec<StepReading>,
+}
+
+/// 一跑里的一格：与这道门印成本表用的三列同一个来源。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StepReading {
+    pub seconds: u64,
+    /// `ok` / `RED` / `UNJUDGED`，由写记录的那一侧判定，这里原样转手。
+    pub verdict: String,
+    pub what: String,
 }
 
 /// 一份界之外的构建方：它是谁，以及它受什么约束。
@@ -189,6 +256,8 @@ pub fn read_gate(dir: Option<&str>, fresh_window: u64, proc_root: &Path) -> Gate
         reservation: None,
         pressure: pressure.clone(),
         load: load.clone(),
+        runs: Vec::new(),
+        runs_why: None,
         generated_at: generated_at.clone(),
     };
 
@@ -234,6 +303,7 @@ pub fn read_gate(dir: Option<&str>, fresh_window: u64, proc_root: &Path) -> Gate
         Some(p) => read_bound(p),
         None => (None, None),
     };
+    let (runs, runs_why) = read_runs(&path);
 
     GateReport {
         state: "measured".to_string(),
@@ -246,7 +316,171 @@ pub fn read_gate(dir: Option<&str>, fresh_window: u64, proc_root: &Path) -> Gate
         reservation: reserve_reading,
         pressure,
         load,
+        runs,
+        runs_why,
         generated_at,
+    }
+}
+
+/// 读最近的那几跑门。返回的第二个值是「读不动」的理由——目录不在**不是**理由：
+/// 那是「这道门还没往这里写过」，与「读不出来」处置相反，页面必须分得开。
+fn read_runs(dir: &Path) -> (Vec<RunReading>, Option<String>) {
+    let runs_dir = dir.join(RUNS_SUBDIR);
+    if !runs_dir.exists() {
+        return (Vec::new(), None);
+    }
+    let entries = match std::fs::read_dir(&runs_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "{} 读不动（{e}）：这里报不出最近几跑花了多少",
+                    runs_dir.display()
+                )),
+            )
+        }
+    };
+    let mut found: Vec<FoundRun> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some((tree, stage, started, finished)) = parse_run_name(&name) {
+            found.push(FoundRun {
+                tree,
+                stage,
+                started,
+                finished,
+                path,
+            });
+        }
+    }
+    // 新的一跑在前：读者要的是「刚才那一推」，不是「最早那一推」。
+    found.sort_by_key(|run| std::cmp::Reverse(run.started));
+    // 每一格只留最近的一跑：提交前钩子、整门、推之前钩子各占一格，按阶段各取最新的
+    // 那一份。不分组的话，一段几秒的钩子会把两小时的那一跑挤出上限，链路上就再也
+    // 看不见最贵的那一段。
+    let mut seen: Vec<(String, String)> = Vec::new();
+    found.retain(|run| {
+        let key = (run.tree.clone(), run.stage.clone());
+        if seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        true
+    });
+    let now = now_secs();
+    let runs = found
+        .into_iter()
+        .take(MAX_RUNS)
+        .map(|run| read_run(&run, now))
+        .collect();
+    (runs, None)
+}
+
+struct FoundRun {
+    tree: String,
+    stage: String,
+    started: u64,
+    finished: bool,
+    path: PathBuf,
+}
+
+/// 文件名就是这一跑的身份：`<树>-<阶段>-<开跑时刻>-<pid>[.running|.segments]`。
+///
+/// 树的路径里本来就有 `-` 和数字，所以从**右边**切两刀：最后一段是 pid，倒数第二段
+/// 是开跑时刻，剩下的整段是「树 + 阶段」。阶段是闭集里的三个词之一，按后缀认；
+/// 认不出就不切——那样整段都是树名，是这份记录最早的形状（那时只有整门一种）。
+/// pid 不进读数：读者要的是「哪一跑」，不是「谁的」。
+fn parse_run_name(name: &str) -> Option<(String, String, u64, bool)> {
+    let (base, finished) = if let Some(base) = name.strip_suffix(RUN_DONE_SUFFIX) {
+        (base, true)
+    } else {
+        (name.strip_suffix(RUN_LIVE_SUFFIX)?, false)
+    };
+    let mut parts = base.rsplitn(3, '-');
+    let pid = parts.next()?;
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let started = parts.next()?.parse::<u64>().ok()?;
+    let rest = parts.next()?;
+    let (tree, stage) = split_stage(rest);
+    if tree.is_empty() {
+        return None;
+    }
+    Some((tree.to_string(), stage.to_string(), started, finished))
+}
+
+/// 把「树 + 阶段」切成两段。阶段取闭集里的词，按 `-<词>` 后缀认。
+fn split_stage(rest: &str) -> (&str, &str) {
+    for stage in RUN_STAGES {
+        if let Some(tree) = rest.strip_suffix(&format!("-{stage}")) {
+            return (tree, stage);
+        }
+    }
+    (rest, LEGACY_STAGE)
+}
+
+fn read_run(run: &FoundRun, now: u64) -> RunReading {
+    let last_write_secs_ago = std::fs::metadata(&run.path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| now.saturating_sub(d.as_secs()));
+    let (text, read_error) = match std::fs::read_to_string(&run.path) {
+        Ok(text) => (text, None),
+        Err(e) => (
+            String::new(),
+            Some(format!(
+                "{} 读不动（{e}）",
+                run.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| run.path.display().to_string())
+            )),
+        ),
+    };
+    let mut steps: Vec<StepReading> = Vec::new();
+    let mut total_secs = 0u64;
+    let mut red = 0usize;
+    let mut unjudged = 0usize;
+    for line in text.lines() {
+        if steps.len() >= MAX_RUN_STEPS {
+            break;
+        }
+        let mut columns = line.split('\t');
+        let Some(seconds) = columns.next().and_then(|s| s.trim().parse::<u64>().ok()) else {
+            continue;
+        };
+        let verdict = columns.next().unwrap_or("").trim().to_string();
+        let what = columns.next().unwrap_or("").trim().to_string();
+        if verdict.is_empty() || what.is_empty() {
+            continue;
+        }
+        total_secs += seconds;
+        match verdict.as_str() {
+            "RED" => red += 1,
+            "UNJUDGED" => unjudged += 1,
+            _ => {}
+        }
+        steps.push(StepReading {
+            seconds,
+            verdict,
+            what,
+        });
+    }
+    RunReading {
+        tree: run.tree.clone(),
+        stage: run.stage.clone(),
+        started_secs_ago: now.saturating_sub(run.started),
+        finished: run.finished,
+        last_write_secs_ago,
+        total_secs,
+        red,
+        unjudged,
+        read_error,
+        steps,
     }
 }
 
@@ -607,5 +841,157 @@ mod tests {
         let report = read_gate(None, 900, &proc);
         assert!(report.pressure.is_empty(), "没有那一行就不印 0");
         assert!(report.load.is_none());
+    }
+
+    /// 一跑写完的那一份：三列照读，红的步数单独数出来——读者先要看见「哪一格红」，
+    /// 其次才是「一共花了多少」。
+    #[test]
+    fn a_finished_run_carries_every_step_and_counts_the_red_ones() {
+        let dir = fixture();
+        let runs = dir.join(RUNS_SUBDIR);
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(
+            runs.join("home_cogneva_work_wt-emp2-1700000000-4242.segments"),
+            "900\tok\tTest（整棵工作区）\n61\tok\tClippy\n4\tRED\tFormat\n",
+        )
+        .unwrap();
+        let report = read_gate(Some(dir.to_str().unwrap()), 900, &proc_fixture(None, None));
+        assert!(report.runs_why.is_none(), "{:?}", report.runs_why);
+        let run = report.runs.first().expect("写完的那一跑要读出来");
+        assert_eq!(run.tree, "home_cogneva_work_wt-emp2");
+        assert!(run.finished);
+        assert_eq!(run.steps.len(), 3);
+        assert_eq!(run.total_secs, 965);
+        assert_eq!(run.red, 1);
+        assert_eq!(run.steps[2].verdict, "RED");
+        assert_eq!(run.steps[2].what, "Format");
+    }
+
+    /// 没收尾的那一份：它还留在 `.running` 上。读数只说「没收尾」，不替它猜是还在跑
+    /// 还是被杀了——两种处置不同，读数分不出来就不许编。
+    #[test]
+    fn an_unfinished_run_says_so_instead_of_inventing_a_verdict() {
+        let dir = fixture();
+        let runs = dir.join(RUNS_SUBDIR);
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(
+            runs.join("home_cogneva_work_wt-emp2-1700000000-4242.running"),
+            "12\tok\tFormat\n",
+        )
+        .unwrap();
+        let report = read_gate(Some(dir.to_str().unwrap()), 900, &proc_fixture(None, None));
+        let run = report.runs.first().expect("没收尾的那一跑也要读出来");
+        assert!(!run.finished);
+        assert_eq!(run.steps.len(), 1, "跑到哪儿就读到哪儿");
+        assert!(
+            run.last_write_secs_ago.is_some(),
+            "「停了多久」是这一格唯一的证据：{:?}",
+            run.last_write_secs_ago
+        );
+    }
+
+    /// 阶段进文件名、进读数；没有阶段的那一种（记录最早只有整门）读成 gate。
+    #[test]
+    fn a_run_carries_the_stage_it_belongs_to() {
+        let dir = fixture();
+        let runs = dir.join(RUNS_SUBDIR);
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(
+            runs.join("tree-precommit-300-1.segments"),
+            "4\tok\t10-registered-producer-paths\n",
+        )
+        .unwrap();
+        std::fs::write(runs.join("tree-200-1.segments"), "900\tok\tTest\n").unwrap();
+        let report = read_gate(Some(dir.to_str().unwrap()), 900, &proc_fixture(None, None));
+        let stages: Vec<&str> = report.runs.iter().map(|r| r.stage.as_str()).collect();
+        assert_eq!(
+            stages,
+            vec!["precommit", "gate"],
+            "新的在前；没有阶段后缀的那一种读成整门"
+        );
+    }
+
+    /// 每一格只留最近的一跑：一段几秒的钩子不能把两小时的整门顶出上限。
+    #[test]
+    fn each_stage_keeps_its_newest_run() {
+        let dir = fixture();
+        let runs = dir.join(RUNS_SUBDIR);
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("tree-gate-100-1.segments"), "1\tok\told\n").unwrap();
+        std::fs::write(runs.join("tree-gate-200-1.segments"), "2\tok\tnew\n").unwrap();
+        std::fs::write(runs.join("tree-prepush-300-1.segments"), "3\tok\trefs\n").unwrap();
+        let report = read_gate(Some(dir.to_str().unwrap()), 900, &proc_fixture(None, None));
+        let gate_runs: Vec<&RunReading> =
+            report.runs.iter().filter(|r| r.stage == "gate").collect();
+        assert_eq!(gate_runs.len(), 1, "同一阶段只留最新的一跑");
+        assert_eq!(gate_runs[0].steps[0].what, "new");
+        assert!(
+            report.runs.iter().any(|r| r.stage == "prepush"),
+            "另一阶段那一跑没被整门的记录顶掉：{:?}",
+            report.runs
+        );
+    }
+
+    /// 槽目录在、`runs/` 不在：这是「这道门还没往这里写过」，不是读不动——两者处置
+    /// 相反，读数面必须分得开。
+    #[test]
+    fn a_missing_runs_directory_is_no_record_yet_not_a_read_failure() {
+        let dir = fixture();
+        std::fs::write(dir.join(BOUND_FILE), "1\n").unwrap();
+        let report = read_gate(Some(dir.to_str().unwrap()), 900, &proc_fixture(None, None));
+        assert!(report.runs.is_empty());
+        assert!(
+            report.runs_why.is_none(),
+            "没有记录与读不动是两句话：{:?}",
+            report.runs_why
+        );
+        assert_eq!(report.state, "measured", "槽位那一面照常读");
+    }
+
+    /// 形状不对的文件名不进读数：名字里没有开跑时刻，就归不到哪一跑上。
+    #[test]
+    fn a_run_name_without_a_start_time_is_ignored() {
+        let dir = fixture();
+        let runs = dir.join(RUNS_SUBDIR);
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("notes.segments"), "1\tok\tx\n").unwrap();
+        std::fs::write(runs.join("tree-notanumber-1.segments"), "1\tok\tx\n").unwrap();
+        let report = read_gate(Some(dir.to_str().unwrap()), 900, &proc_fixture(None, None));
+        assert!(report.runs.is_empty(), "{:?}", report.runs);
+    }
+
+    /// 灌进来的行不读：一跑最多带那么多格，多了不是读数多。
+    #[test]
+    fn a_run_carrying_more_steps_than_the_bound_is_truncated() {
+        let dir = fixture();
+        let runs = dir.join(RUNS_SUBDIR);
+        std::fs::create_dir_all(&runs).unwrap();
+        let mut text = String::new();
+        for index in 0..(MAX_RUN_STEPS + 10) {
+            text.push_str(&format!("1\tok\tstep {index}\n"));
+        }
+        std::fs::write(runs.join("tree-100-1.segments"), text).unwrap();
+        let report = read_gate(Some(dir.to_str().unwrap()), 900, &proc_fixture(None, None));
+        assert_eq!(report.runs[0].steps.len(), MAX_RUN_STEPS);
+    }
+
+    /// 记录在、内容读不出来：这一格必须说「读不动」，不能读成「这一跑一格都没记」。
+    ///
+    /// 两份在页面上原本同形：空表配合计 0。而真实的成因不是假设——读的人与写的人是
+    /// 两个 uid，写的那一侧把 `umask` 收紧了，权限就是 0600。
+    /// 夹具用「同名目录」而不是 chmod 000：`read_to_string` 对它报 EISDIR，与跑测试的
+    /// 是不是 root 无关。
+    #[test]
+    fn an_unreadable_run_says_so_instead_of_reading_as_empty() {
+        let dir = fixture();
+        let runs = dir.join(RUNS_SUBDIR);
+        std::fs::create_dir_all(runs.join("tree-100-1.segments")).unwrap();
+        let report = read_gate(Some(dir.to_str().unwrap()), 900, &proc_fixture(None, None));
+        let run = report.runs.first().expect("记录在，就该有一跑");
+        assert!(run.steps.is_empty());
+        assert!(
+            run.read_error.is_some(),
+            "读不动被读成「一格都没记」：{run:?}"
+        );
     }
 }

@@ -2110,7 +2110,49 @@ export interface BuildGateReport {
   reservation?: BuildGateReservation;
   pressure: BuildGatePressure[];
   load?: { load1: string; load5: string; load15: string };
+  /**
+   * 推之前那道门的最近两跑：每格花了多少秒、结局是什么。
+   *
+   * 空数组不是错误：这道门是后加的记录，槽目录里还没有它写过的东西。读不动另说——
+   * 那种情形由 `runs_why` 说话。
+   */
+  runs: BuildGateRun[];
+  /** `runs/` 读不动的理由；没有记录时不给。 */
+  runs_why?: string;
   generated_at: string;
+}
+
+export interface BuildGateRun {
+  /** 这一跑落在哪棵工作树上（路径里的 `/` 换成了 `_`）。 */
+  tree: string;
+  /**
+   * 交付链上的哪一段：`precommit` / `gate` / `prepush`。
+   * 三段共用同一份记录格式，页面按它把一跑放回链路上对应的那一格。
+   */
+  stage: string;
+  /** 从开跑到这一刻过了多久；跑完的那一份就是这一跑的时长。 */
+  started_secs_ago: number;
+  /** 有没有收尾。没收尾的是「还在跑，或者被杀了」——读数不替它二选一。 */
+  finished: boolean;
+  /** 最后一次落笔是多久以前：没收尾的那一跑，这一格是它停了多久。 */
+  last_write_secs_ago?: number;
+  /** 各格秒数之和，不含构建槽排队与格子之间的空隙。 */
+  total_secs: number;
+  red: number;
+  unjudged: number;
+  /**
+   * 记录在、内容读不出来（权限、坏文件）时的理由。
+   * 没有这一格，「读不动」与「这一跑一格都没记」都是空表配合计 0，页面上同形。
+   */
+  read_error?: string;
+  steps: BuildGateStep[];
+}
+
+export interface BuildGateStep {
+  seconds: number;
+  /** `ok` / `RED` / `UNJUDGED`，由写记录的那一侧判。 */
+  verdict: string;
+  what: string;
 }
 
 export interface BuildGateSlot {
@@ -2159,6 +2201,13 @@ export interface SourceLineReport {
   /** 仓库读得到但里面没有 main 时这一格缺席——那是第四种事实，不是「读不动」。 */
   main?: SourceLineBranch;
   branches: SourceLineBranch[];
+  /**
+   * 「编辑」那一格该写谁：尖端比 main 还晚、且已在推进之后有新提交的那条分支。
+   * 判在服务端，页面不重算——一条很早以前分叉、此后再没动过的旧分支不是编辑现场。
+   */
+  editing?: SourceLineBranch;
+  /** 与 `editing` 同属「推进之后还在动」的其余分支数。 */
+  editing_others: number;
   /** 被截断时还有几条没列；缺席是「全列上了」。 */
   more_branches?: number;
   generated_at: string;

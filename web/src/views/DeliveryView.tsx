@@ -1,10 +1,14 @@
 import {
   getBuildGate,
   getBuildRuns,
+  getObservabilityReadings,
   getSourceLine,
   getWorkloads,
   type BuildGateReport,
+  type BuildGateRun,
+  type BuildGateStep,
   type BuildRunsView,
+  type ObservabilityReading,
   type SourceLineReport,
   type WorkloadView,
   type WorkloadsReport,
@@ -45,6 +49,10 @@ export function DeliveryView() {
   // 源线同样来自宿主上的文件（共享裸仓库），没有任何总线事件会在引用移动时说话。
   // 与槽同一档的理由：一份「推上去没有」的读数晚半分钟就答不了「现在为什么不动」。
   const line = useResource('源线', getSourceLine, 15_000);
+  // 部署器「此刻被 CI 扣住没有」只写在它自己的三行读数上，工作负载与源线都不知道。
+  // 一次取回整张读数表（四十来条序列打 Prometheus），所以按 30 秒取，比槽慢一档：
+  // 这一格答的是「为什么还没上线」，一份晚半分钟的答案仍然答对了那一问。
+  const observability = useResource('观测读数', getObservabilityReadings, 30_000);
   // 两半各有各的帧：工作负载来自集群对象，一次滚动的每一步都是一次写；构建跑次
   // 来自演进进程，一次跑完就落一条。两张表在同一屏上，一次触发两半一起重读——
   // 分两次读会让上半页先变、下半页还是上一轮。
@@ -72,6 +80,7 @@ export function DeliveryView() {
     gateError: gate.error,
     builds: view ?? null,
     workloads: report,
+    observability: observability.data?.readings ?? null,
   });
 
   return (
@@ -84,7 +93,11 @@ export function DeliveryView() {
       }
     >
       <section className="border-b border-[var(--line)]">
-        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">链路</h2>
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+          链路 · 编辑到部署 {chain.length} 步
+        </h2>
+        <StepLane nodes={chain} />
+        <FlowSteps nodes={chain} />
         <ChainPanel nodes={chain} />
         <BranchLineTable line={line.data} error={line.error} onRetry={line.refresh} />
       </section>
@@ -431,7 +444,118 @@ function BuildGatePanel({
         全量门与宿主上的构建都从这里拿位子；没拿到位子的那一格在门的读数里是「没判」，
         不是「红了」。
       </p>
+      <GateRunPanel report={report} />
     </>
+  );
+}
+
+/**
+ * 推之前那道门最近跑过的几跑：每一格多少秒、哪一格红。
+ *
+ * 槽位那一面回答「现在谁在编译」；这一面回答「刚才那一推慢在哪」。两问不对等——一跑
+ * 两小时的门跑完之后，槽位读数恢复成「空着」，从那张表上再也看不出钱花在哪一格。
+ *
+ * 记录由门自己写进同一个槽目录（`runs/`），所以这里是加读数，不是加通道：宿主进不了
+ * 网关的 ingest，但槽目录本来就已经挂进来。
+ */
+function GateRunPanel({ report }: { report: BuildGateReport }) {
+  if (report.runs_why) {
+    return <p className="px-4 py-2 text-[11px] text-[var(--warn)]">{report.runs_why}</p>;
+  }
+  if (report.runs.length === 0) {
+    return (
+      <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+        槽目录里还没有门的跑次记录：这一面是后加的，下一次推之前跑门就会有一行。
+        没有记录不是「门没跑过」——它只说明这一份记录还没被写过。
+      </p>
+    );
+  }
+  // 这一节是「整门」的读数：提交前与推之前那两段各自在链路那一格上，不混进这张表。
+  const gateRuns = report.runs.filter((candidate) => candidate.stage === 'gate');
+  const run = gateRuns[0];
+  if (!run) {
+    return (
+      <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+        `runs/` 里有记录，但没有整门的那一份（只有提交前或推之前那两段）：这一节只读整门。
+      </p>
+    );
+  }
+  if (run.read_error) {
+    return (
+      <p className="px-4 py-2 text-[11px] text-[var(--warn)]">
+        最近一跑（{run.tree}，{formatAge(run.started_secs_ago)}前）的记录读不动：{run.read_error}。
+        这不是「这一跑一格都没记」——文件在，读不出内容。读的人与写的人不是同一个 uid：
+        写记录的那一侧把权限钉成 0644，正是为了让这里读得到。
+      </p>
+    );
+  }
+  const steps = [...run.steps].sort((a, b) => b.seconds - a.seconds);
+  const tone = run.red > 0 ? 'warn' : run.unjudged > 0 ? 'warn' : 'ok';
+  return (
+    <div className="border-t border-[var(--line)]">
+      <Readings
+        from={{ what: '推之前那道门', at: report.generated_at }}
+        source="GET /api/v1/delivery/build-gate（槽目录 runs/）"
+        caveat="合计是各格秒数之和，不是这一跑的墙钟时长：格子之间与构建槽排队的时间不在里面。"
+      >
+        <div className="flex flex-wrap py-2">
+          <Reading
+            label="这一跑"
+            value={formatAge(run.started_secs_ago)}
+            tone={tone}
+            note={`${run.tree} · ${run.finished ? '已收尾' : `没收尾（最后一次落笔在 ${run.last_write_secs_ago == null ? '读不到' : `${formatAge(run.last_write_secs_ago)}前`}）`}`}
+          />
+          <Reading label="格数" value={run.steps.length} note="每格一步：编译、测试、每一条脚本判据" />
+          <Reading
+            label="红 / 没判"
+            value={`${run.red} / ${run.unjudged}`}
+            tone={run.red > 0 || run.unjudged > 0 ? 'warn' : 'plain'}
+            note={run.red > 0 ? '红的那几格在下面表里' : run.unjudged > 0 ? '没进构建槽，不算验过' : '都判过了'}
+          />
+          <Reading label="合计" value={formatAge(run.total_secs)} note="各格秒数之和" />
+        </div>
+      </Readings>
+      <Table
+        columns={[
+          {
+            key: 'seconds',
+            title: '秒',
+            width: '80px',
+            render: (step) => <span className="mono text-[11px]">{step.seconds}</span>,
+          },
+          {
+            key: 'verdict',
+            title: '结局',
+            width: '90px',
+            render: (step) => (
+              <span
+                className="mono text-[11px]"
+                style={{
+                  color:
+                    step.verdict === 'RED'
+                      ? 'var(--warn)'
+                      : step.verdict === 'UNJUDGED'
+                        ? 'var(--warn)'
+                        : 'var(--ok)',
+                }}
+              >
+                {step.verdict}
+              </span>
+            ),
+          },
+          { key: 'what', title: '这一步', render: (step) => step.what },
+        ]}
+        rows={steps}
+        rowKey={(step) => `${step.what}-${step.seconds}`}
+      />
+      {gateRuns.length > 1 ? (
+        <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+          另有一跑整门在盘上（{gateRuns[1].finished ? '上一次收尾的结果' : '开了头没走完'}，
+          开跑在 {formatAge(gateRuns[1].started_secs_ago)}前）：一跑是「这一跑到哪儿了」，
+          一跑是「上一跑怎么样」，两跑不能合读成一跑。
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -516,12 +640,13 @@ function Replicas({ workload }: { workload: WorkloadView }) {
 }
 
 /**
- * 一次改动从编辑到现网的五个环节，每格五句话：状态、结论、依据、归属、从何时起。
+ * 一次改动从编辑到现网的七个环节，每格五句话：状态、结论、依据、归属、从何时起。
  *
- * 为什么不是七格：流程上「提交」与「推前自检」都在同一棵工作树里、由同一个人在同一段
- * 时间里做完，它们的读数与「编辑」那一格是同一份（分支尖端 + 槽位记录），拆成三格会
- * 让同一件事在页面上显示成三段互不相干的进度。合并的是**读数相同**的格子，不是环节
- * 本身——依据那一列写着每格读的是哪一个接口，合并之后也还看得见。
+ * 「提交」与「推前自检」曾经是合在「编辑」那一格里的，理由是读数相同：三件事在同一棵
+ * 工作树里、由同一个人在同一段时间里做完。真正的原因其实是当时没有逐阶段的记录——钩子
+ * 只往终端上印。记录带上阶段之后，这两步各自有「这一笔被哪一格挡下、花了多少秒」的
+ * 读数，拆开才是如实：一次秒级的推前拦截不该被两小时的整门盖住，也不该被编辑那一格
+ * 盖住。依据那一列写着每格读的是哪一个接口。
  *
  * 每一格读不到的处置都写在结论里，而不是画成一个 0：这份链路的用处就是让人一眼看出
  * 「卡在哪一环」，而一格空白与一格「读不到」在这件事上是两个完全不同的答案。
@@ -538,6 +663,11 @@ interface ChainNode {
   sinceNote?: string;
   /** 结论之外还要说的一句：例如「这一格不覆盖谁」。不写就会让它读成「没有」。 */
   aside?: string;
+  /**
+   * 这一格这一跑实际走过的步。清单来自记录本身，不是这一页写死的：钩子可以增删、
+   * 整门的格随判据变，页面对流程的增减不欠一次改动。
+   */
+  steps?: BuildGateStep[];
 }
 
 function chainNodes({
@@ -547,6 +677,7 @@ function chainNodes({
   gateError,
   builds,
   workloads,
+  observability,
 }: {
   line: SourceLineReport | null;
   lineError: string | null;
@@ -554,14 +685,151 @@ function chainNodes({
   gateError: string | null;
   builds: BuildRunsView | null;
   workloads: WorkloadsReport | null;
+  observability: ObservabilityReading[] | null;
 }): ChainNode[] {
-  return [
+  // 七步就是一条字节走到现网要经过的地方，顺序即发生顺序：编辑、提交前的钩子、整门、
+  // 推之前的钩子、推到 main、镜像构建、部署。镜像构建曾经排在「推到 main」前面——那是
+  // 这张表自己的顺序错误，读者照着读会把「还没推上去」当成「还没编完」。
+  const nodes = [
     editNode(line, lineError),
+    commitNode(gate, gateError),
     gateNode(gate, gateError),
-    buildNode(builds),
+    prePushNode(gate, gateError),
     pushNode(line, lineError),
-    deployNode(workloads),
+    buildNode(builds, workloads),
+    deployNode(workloads, line, observability),
   ];
+  // 逐步记录只从记录里取，不为某一格编：写下 `precommit`/`gate`/`prepush` 的那一侧
+  // 这一跑记了哪些格，页面就摊哪些格。整门那 196 格每 5 秒随记录重读，流程本身改了
+  // （多一份钩子、少一条判据）页面下一次轮询就是新的，不需要改这一页。
+  const recorded: Record<string, string> = { commit: 'precommit', gate: 'gate', prepush: 'prepush' };
+  return nodes.map((node) => {
+    const stage = recorded[node.id];
+    if (!stage) return node;
+    const run = lastRun(gate, stage);
+    return run && !run.read_error ? { ...node, steps: run.steps } : node;
+  });
+}
+
+/**
+ * 交付链那三段共用同一份记录（`runs/`），按阶段取最近的一跑。
+ *
+ * 取 `runs[0]` 是错的：一段几秒的提交前钩子比两小时的整门更新，整门就再也轮不到
+ * 显示出来。
+ */
+function lastRun(gate: BuildGateReport | null, stage: string): BuildGateRun | undefined {
+  return gate?.runs.find((run) => run.stage === stage);
+}
+
+/** 三个钩子阶段共用的「读不到」判词：没有记录、读不动、接口本身读不到。 */
+function hookRunBlocker(
+  base: Pick<ChainNode, 'id' | 'stage' | 'evidence'>,
+  run: BuildGateRun | undefined,
+  gateError: string | null,
+  missing: string
+): ChainNode {
+  if (gateError) {
+    return { ...base, state: 'unknown', verdict: `读不到记录：${gateError}`, sinceNote: '没有读数' };
+  }
+  if (!run) {
+    return { ...base, state: 'unknown', verdict: missing, sinceNote: '没有读数' };
+  }
+  if (run.read_error) {
+    return {
+      ...base,
+      state: 'unknown',
+      verdict: `记录读不动：${run.read_error}`,
+      owner: run.tree,
+      sinceSecs: run.started_secs_ago,
+      sinceNote: '文件在，内容读不出来',
+    };
+  }
+  // 调用方只在上面三种情况下进来；走到这一行说明调用条件被改了。
+  return {
+    ...base,
+    state: 'unknown',
+    verdict: '记录读得到了，却走到了「读不到」这一支',
+    sinceNote: '没有读数',
+  };
+}
+
+/**
+ * 「提交」那一步：pre-commit 钩子放行还是挡下这一笔。
+ *
+ * 钩子退出码非零时提交不会发生，而那份记录正是唯一留下「被哪一格挡下」的地方——
+ * 终端的滚动缓冲活不过下一次翻页。
+ */
+function commitNode(gate: BuildGateReport | null, gateError: string | null): ChainNode {
+  const base = {
+    id: 'commit',
+    stage: '提交',
+    evidence: 'GET /api/v1/delivery/build-gate（runs/ precommit）',
+  };
+  const run = lastRun(gate, 'precommit');
+  if (!run || gateError || run.read_error) {
+    return hookRunBlocker(base, run, gateError, '没有读数：pre-commit 钩子还没往这里写过记录');
+  }
+  const head = { ...base, owner: run.tree, sinceSecs: run.started_secs_ago };
+  if (!run.finished) {
+    return {
+      ...head,
+      state: 'running',
+      verdict: `提交前的钩子在跑：已记 ${run.steps.length} 格`,
+      sinceNote:
+        run.last_write_secs_ago == null
+          ? '最后一次落笔的时刻读不到'
+          : '最后一格落笔到现在；它可能还在跑，也可能被杀了',
+    };
+  }
+  const reds = run.steps.filter((step) => step.verdict === 'RED');
+  if (reds.length > 0) {
+    return {
+      ...head,
+      state: 'stuck',
+      verdict: `这一笔提交被挡在 ${reds.map((step) => step.what).join('、')}`,
+    };
+  }
+  return {
+    ...head,
+    state: 'ok',
+    verdict: `提交前的 ${run.steps.length} 格都放行了，合计 ${formatAge(run.total_secs)}`,
+  };
+}
+
+/**
+ * 「推之前」那一步：pre-push 钩子放行还是挡下这一推。
+ *
+ * 与整门分开是因为问的不是一件事：整门问「这棵树的字节验过没有」（两小时），
+ * pre-push 问「这一推带的是不是验过的那份字节」（秒级）。合成一格的话，一次秒级的
+ * 拦截会被两小时的那一跑盖住。
+ */
+function prePushNode(gate: BuildGateReport | null, gateError: string | null): ChainNode {
+  const base = {
+    id: 'prepush',
+    stage: '推之前',
+    evidence: 'GET /api/v1/delivery/build-gate（runs/ prepush）',
+  };
+  const run = lastRun(gate, 'prepush');
+  if (!run || gateError || run.read_error) {
+    return hookRunBlocker(base, run, gateError, '没有读数：pre-push 钩子还没往这里写过记录');
+  }
+  const head = { ...base, owner: run.tree, sinceSecs: run.started_secs_ago };
+  if (!run.finished) {
+    return { ...head, state: 'running', verdict: `推之前的检查在跑：已记 ${run.steps.length} 格` };
+  }
+  const reds = run.steps.filter((step) => step.verdict === 'RED');
+  if (reds.length > 0) {
+    return {
+      ...head,
+      state: 'stuck',
+      verdict: `这一推被挡在 ${reds.map((step) => step.what).join('、')}`,
+    };
+  }
+  return {
+    ...head,
+    state: 'ok',
+    verdict: `推之前的 ${run.steps.length} 问都过了，合计 ${formatAge(run.total_secs)}`,
+  };
 }
 
 const SOURCE_LINE_EVIDENCE = 'GET /api/v1/delivery/source-line';
@@ -580,24 +848,51 @@ function editNode(line: SourceLineReport | null, error: string | null): ChainNod
       sinceNote: '没有读数',
     };
   }
-  // 最近动过的那条分支就是此刻有人在编辑的那一条。main 自己也在这张表里，但它是
-  // 「推送」那一格的归属，拿它当「编辑」会把主线的最新一次合并读成有人正在改。
-  const tips = line.branches
-    .filter((branch) => branch.name !== 'main')
-    .sort((a, b) => (a.committed_secs_ago ?? Infinity) - (b.committed_secs_ago ?? Infinity));
-  const tip = tips[0] ?? line.branches[0];
-  if (!tip) {
-    return { ...base, state: 'unknown', verdict: '裸仓库里一条分支都没有', sinceNote: '没有读数' };
+  // 「此刻在编辑的那棵树」由读数自己判定：尖端比 main 的尖端更晚的那几条分支。
+  // 判据不是「非 main 里最新的那条」——那条可能是一天前分叉、此后一直没动的旧线，
+  // 页面会因此给一条死分支安上一个活的归因。判定与依据在同一处（source_line.rs），
+  // 这里只渲染。
+  const editing = line.editing;
+  if (!editing) {
+    if (!line.main) {
+      // 没有 main 就没有「上一次推进」这个参考点。这一句不能说成「推进之后没有
+      // 分支再落笔」——那是拿一个不存在的参考点下的结论。
+      return {
+        ...base,
+        state: 'unknown',
+        verdict: line.why ?? '裸仓库里没有 main：没有可比的那一次推进',
+        sinceNote: '没有读数',
+      };
+    }
+    // 有推进、但推进之后无人落笔。
+    const newest = line.branches
+      .filter((branch) => branch.name !== 'main')
+      .sort((a, b) => (a.committed_secs_ago ?? Infinity) - (b.committed_secs_ago ?? Infinity))[0];
+    if (!newest) {
+      return {
+        ...base,
+        state: 'ok',
+        verdict: '共享裸仓库里没有工作树分支：此刻没有树在动',
+        sinceNote: '没有起点',
+      };
+    }
+    return {
+      ...base,
+      state: 'ok',
+      verdict: `共享裸仓库里，main 最后一次推进之后没有分支再落笔（最新的一条是 ${newest.name}：${newest.subject}）`,
+      owner: newest.name,
+      sinceSecs: newest.committed_secs_ago,
+    };
   }
-  // 「还有几条分支最近有提交」是这一格的全部用处：属主要的不是一个名字，是
+  // 「还有几条分支也在动」是这一格的全部用处：属主要的不是一个名字，是
   // 「台上现在有几棵树在动」。一条与三条在结论那一句里必须读得出来。
-  const others = tips.length > 1 ? `（另有 ${tips.length - 1} 条分支最近有提交）` : '';
+  const others = line.editing_others > 0 ? `（另有 ${line.editing_others} 条分支也在动）` : '';
   return {
     ...base,
     state: 'ok',
-    verdict: `${tip.name} 的尖端：${tip.subject}${others}`,
-    owner: tip.name,
-    sinceSecs: tip.committed_secs_ago,
+    verdict: `${editing.name} 的尖端：${editing.subject}${others}`,
+    owner: editing.name,
+    sinceSecs: editing.committed_secs_ago,
   };
 }
 
@@ -620,12 +915,70 @@ function gateNode(gate: BuildGateReport | null, error: string | null): ChainNode
       ? `界之外：${gate.outside_the_bound.map((o) => `${o.who}（${o.why}）`).join('；')}`
       : undefined;
   const held = gate.slots.filter((slot) => slot.held);
+  // 「槽顺着/占着」答的是「现在有没有人在编译」，不是「刚才那一推花了多少」。门把每格
+  // 的秒数写进了同一个目录，所以这一格按记录说话：先看有没有一跑没收尾，再看上一跑
+  // 红没红，最后才回落到「槽空着」。
+  const run = lastRun(gate, 'gate');
+  if (run?.read_error) {
+    return {
+      ...base,
+      state: 'unknown',
+      verdict: `最近一跑（${run.tree}）的记录读不动：${run.read_error}`,
+      owner: run.tree,
+      sinceSecs: run.started_secs_ago,
+      sinceNote: '文件在，内容读不出来——不按绿也不按红判',
+      aside,
+    };
+  }
+  if (run && !run.finished) {
+    const slowest = [...run.steps].sort((a, b) => b.seconds - a.seconds)[0];
+    return {
+      ...base,
+      state: 'running',
+      verdict: `一跑还没收尾：${run.steps.length} 格已记下${slowest ? `，最贵的一格 ${slowest.what}（${formatAge(slowest.seconds)}）` : ''}`,
+      owner: run.tree,
+      sinceSecs: run.last_write_secs_ago,
+      sinceNote:
+        run.last_write_secs_ago == null
+          ? '最后一次落笔的时刻读不到'
+          : '最后一格落笔到现在；它可能还在跑，也可能被杀了',
+      aside,
+    };
+  }
+  if (run && run.finished && run.red > 0) {
+    const reds = run.steps.filter((step) => step.verdict === 'RED');
+    return {
+      ...base,
+      state: 'stuck',
+      verdict: `上一跑红了 ${run.red} 格：${reds.map((step) => step.what).join('、')}`,
+      owner: run.tree,
+      sinceSecs: run.started_secs_ago,
+      sinceNote: '开跑到现在',
+      aside,
+    };
+  }
+  if (run && run.finished && run.unjudged > 0) {
+    return {
+      ...base,
+      state: 'unknown',
+      verdict: `上一跑有 ${run.unjudged} 格没进构建槽、没判：没判过的字节不算验过`,
+      owner: run.tree,
+      sinceSecs: run.started_secs_ago,
+      sinceNote: '开跑到现在',
+      aside,
+    };
+  }
   if (held.length === 0) {
+    const lastRun = run
+      ? `上一跑（${run.tree}）全绿：${run.steps.length} 格，合计 ${formatAge(run.total_secs)}，最贵一格 ${[...run.steps].sort((a, b) => b.seconds - a.seconds)[0]?.what ?? '读不到'}`
+      : undefined;
     return {
       ...base,
       state: 'ok',
-      verdict: `槽空着（${gate.slots.length} 个位子）：没有编译在跑`,
-      sinceNote: '空着，没有起点',
+      verdict: lastRun ?? `槽空着（${gate.slots.length} 个位子）：没有编译在跑`,
+      owner: run?.tree,
+      sinceSecs: run?.started_secs_ago,
+      sinceNote: run ? '上一跑开跑到现在' : '空着，没有起点',
       aside,
     };
   }
@@ -641,14 +994,66 @@ function gateNode(gate: BuildGateReport | null, error: string | null): ChainNode
   };
 }
 
-function buildNode(builds: BuildRunsView | null): ChainNode {
+/**
+ * 主线部署的 Job：名字就是它要上线的那一版（`cogneva-mainline-<rev>`，前缀由部署器
+ * 自己声明）。它做的是「从 main 的这一版编出镜像 → apply → 等 rollout」，所以链路上
+ * 「镜像构建」这一格问的就是它。
+ */
+function mainlineJob(
+  workloads: WorkloadView[]
+): { rev: string; workload: WorkloadView; at: number | null } | null {
+  const jobs = workloads
+    .filter((w) => w.kind === 'Job' && w.name.startsWith('cogneva-mainline-'))
+    .map((w) => ({
+      rev: w.name.slice('cogneva-mainline-'.length),
+      workload: w,
+      at: conditionMoment(w),
+    }));
+  if (jobs.length === 0) return null;
+  // 按条件时刻取最新；都没带时刻就取第一条并说明先后不可分（下面 sinceNote 交代）。
+  jobs.sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
+  return jobs[0];
+}
+
+function buildNode(builds: BuildRunsView | null, workloads: WorkloadsReport | null): ChainNode {
   const base = { id: 'build', stage: '镜像构建', evidence: 'GET /api/v1/evolution/builds' };
+  // 链路上的镜像构建是主线部署那个 Job。演进进程那份窗口记的是**变更级**构建，且随
+  // 进程重启清零：2026-11-10 实测它 13:54 重启后一直为空，而同一时间主线 Job 已经把
+  // 18c1a02049b0 编出来并滚上了现网。只读那份窗口，这一格就会一直说「启动以来还没
+  // 有构建过」——读者据此以为镜像没编，而现网跑着的那一版正是它编的。
+  const job = workloads && !workloads.error ? mainlineJob(workloads.workloads) : null;
+  const windowAside =
+    builds && builds.attached && builds.runs.length > 0
+      ? `本轮变更构建 ${builds.runs.length} 次（演进进程窗口，重启清零）`
+      : undefined;
+  if (job) {
+    const failed = job.workload.conditions.some((c) => c.kind === 'Failed' && c.ok);
+    const done = job.workload.desired != null && isRolled(job.workload);
+    const ageSecs = job.at == null ? undefined : Math.max(0, (Date.now() - job.at) / 1000);
+    return {
+      ...base,
+      evidence: 'GET /api/v1/cluster/deployments（主线部署 Job）',
+      state: failed ? 'stuck' : done ? 'ok' : 'running',
+      verdict: `主线 Job 构建 ${job.rev.slice(0, 12)}：${failed ? '失败' : done ? '完成' : '在跑'}`,
+      owner: `${job.workload.namespace}/${job.workload.name}`,
+      sinceSecs: ageSecs,
+      sinceNote: ageSecs == null ? '这个 Job 的条件没带时刻，先后分不出' : undefined,
+      aside: windowAside,
+    };
+  }
   if (!builds) return { ...base, state: 'unknown', verdict: '这个进程没挂构建读数', sinceNote: '没有读数' };
   if (!builds.attached) {
     return { ...base, state: 'unknown', verdict: '没挂构建读数：0 行不是「没构建过」，是没人报', sinceNote: '没有读数' };
   }
   if (builds.runs.length === 0) {
-    return { ...base, state: 'unknown', verdict: '挂了读数，但启动以来还没有构建过', sinceNote: '没有读数' };
+    return {
+      ...base,
+      state: 'unknown',
+      verdict: workloads && !workloads.error
+        ? '变更构建窗口空着，集群里也没有主线部署 Job：两处都读不到构建'
+        : '挂了读数，但启动以来还没有构建过',
+      sinceNote: '没有读数',
+    };
   }
   // 这个窗口按结束顺序留着，取 `at` 最新的那一条——同一秒的两次尝试也要有确定答案。
   const latest = builds.runs.reduce((newest, run) =>
@@ -679,16 +1084,90 @@ function pushNode(line: SourceLineReport | null, error: string | null): ChainNod
     // 仓库读得到、主线缺席：这是一句「没有推上去过」，不是「读不动」。
     return { ...base, state: 'waiting', verdict: line.why ?? '裸仓库里没有 main 引用', sinceNote: '没有起点' };
   }
+  // 「main 在 X」说的是主线走到哪了，答不了「我的改动进去了没有」。此刻在动的那条
+  // 分支还差几笔没进 main，必须写在这一格上：只报 main 的尖端时，这一格在改动还停在
+  // 分支上的时候照样报绿，与部署那一格旧的毛病是同一个形状。
+  const moving = line.editing;
+  const behind =
+    moving == null
+      ? null
+      : moving.contains_main === false
+        ? `在动的 ${moving.name} 不含 main：要先变基才推得上`
+        : moving.ahead_of_main != null && moving.ahead_of_main > 0
+          ? `在动的 ${moving.name} 还差 ${moving.ahead_of_main} 笔没进 main`
+          : null;
   return {
     ...base,
-    state: 'ok',
+    state: behind ? 'waiting' : 'ok',
     verdict: `main 在 ${line.main.sha.slice(0, 12)}：${line.main.subject}`,
     owner: 'main',
     sinceSecs: line.main.committed_secs_ago,
+    aside: behind ?? undefined,
   };
 }
 
-function deployNode(workloads: WorkloadsReport | null): ChainNode {
+/**
+ * 这个工作负载的镜像跑的是主线哪一版。
+ *
+ * 标签是部署器自己写的（`MAIN_TAG_PREFIX` + rev，见
+ * `crates/cog-reflection/src/mainline_deployer.rs`），所以标签里的那段 sha 是「镜像
+ * 从哪个提交编出来的」唯一的读法。Deployment 自己的 `revision` 答不了这一问：那是
+ * 「第几次滚动」，升一版加一，与 main 到哪无关。
+ *
+ * 读不出这个形状就返回 null——`registry:2`、`postgres:16-alpine` 这些不是从 main
+ * 编出来的，不该被算进「现网跑的是哪一版」。
+ */
+function liveMainRev(workload: WorkloadView): string | null {
+  for (const image of workload.images) {
+    // 标签是最后一个 `/` 之后的那个冒号后面的事；`localhost:30500/x` 里的冒号是
+    // 端口，不是标签。
+    const colon = image.lastIndexOf(':');
+    if (colon <= image.lastIndexOf('/')) continue;
+    const tag = image.slice(colon + 1);
+    if (tag.startsWith('main-') && tag.length > 'main-'.length) return tag.slice('main-'.length);
+  }
+  return null;
+}
+
+/**
+ * 哪些工作负载的镜像代表「现网跑的是哪一版」。
+ *
+ * 只有长驻、且会被滚动更新的那三种。Job 不算：主线部署本身就是一个 Job，它跑的
+ * 镜像恰恰是**要上线的那一版**——拿它当现网，新版本还没起来页面就说「已经上线
+ * 了」；2026-11-10 实测集群里同时躺着 `main-1968dbff1b45` 与 `main-a943172fc2bc`
+ * 两个 Job 的镜像，混进来就会读成「同一批工作负载跑着三版 main」。裸 Pod 也不算：
+ * 它不被滚动，那一行读数属于某一次执行，不属于现网持续状态。
+ */
+function carriesTheLiveRev(workload: WorkloadView): boolean {
+  return (
+    workload.kind === 'Deployment' ||
+    workload.kind === 'StatefulSet' ||
+    workload.kind === 'DaemonSet'
+  );
+}
+
+/**
+ * 部署器此刻是不是被 CI 扣住，扣了多久。
+ *
+ * 三行读数各有分工，混用会读错：`_active` 答「扣着没有」，`_seconds` 答「这段红持续
+ * 了多久」——后者在 hold 结束之后仍然非零（2026-11-02 实测 4802 秒而 hold 早已结束），
+ * 拿它判「扣着没有」会把一次过去的事读成正在发生。读不到就返回 null，不读成 0。
+ */
+function ciHold(
+  readings: ObservabilityReading[] | null
+): { active: boolean; seconds: number | null } | null {
+  if (!readings) return null;
+  const active = readings.find((r) => r.id === 'mainline_ci_hold_active');
+  if (!active || active.value == null) return null;
+  const seconds = readings.find((r) => r.id === 'mainline_ci_hold_seconds');
+  return { active: active.value >= 1, seconds: seconds?.value ?? null };
+}
+
+function deployNode(
+  workloads: WorkloadsReport | null,
+  line: SourceLineReport | null,
+  observability: ObservabilityReading[] | null
+): ChainNode {
   const base = { id: 'deploy', stage: '部署与现网', evidence: 'GET /api/v1/cluster/deployments' };
   if (!workloads) return { ...base, state: 'unknown', verdict: '还在读工作负载', sinceNote: '没有读数' };
   if (workloads.error) return { ...base, state: 'unknown', verdict: workloads.error, sinceNote: '没有读数' };
@@ -702,20 +1181,80 @@ function deployNode(workloads: WorkloadsReport | null): ChainNode {
   const short = rolling.filter((w) => !isRolled(w));
   const allRolled = short.length === 0;
   const moment = chainMoment(allRolled ? rolling : short, allRolled);
+  const rolloutVerdict = allRolled
+    ? `${rolled.length} / ${rolling.length} 已滚到位`
+    : `${rolled.length} / ${rolling.length} 已滚到位，差 ${short.length} 个`;
+  const stuckOwner =
+    short
+      .slice(0, 3)
+      .map((w) => `${w.namespace}/${w.name}`)
+      .join(' · ') + (short.length > 3 ? ` 等 ${short.length} 个` : '');
+
+  // 「滚到位」只说明这一版的副本都起来了，不说明它就是 main 上那一版：main 在上一次
+  // 部署之后又推进过时，集群会一直报「N / N 已滚到位」，而新提交一行代码都没上线。
+  // 这一格答的是「我的改动上线没有」，所以必须比镜像标签里的 sha。
+  const live: { rev: string; names: string[] }[] = [];
+  for (const workload of rolling.filter(carriesTheLiveRev)) {
+    const rev = liveMainRev(workload);
+    if (!rev) continue;
+    const name = `${workload.namespace}/${workload.name}`;
+    const known = live.find((entry) => entry.rev === rev);
+    if (known) known.names.push(name);
+    else live.push({ rev, names: [name] });
+  }
+  const main = line?.state === 'measured' ? line.main ?? null : null;
+  if (live.length > 1) {
+    return {
+      ...base,
+      state: 'waiting',
+      verdict: `同一批工作负载跑着 ${live.length} 版 main：${live.map((entry) => entry.rev.slice(0, 12)).join(' 与 ')}（滚动中）`,
+      owner: live
+        .flatMap((entry) => entry.names)
+        .slice(0, 3)
+        .join(' · '),
+      sinceSecs: moment.secs,
+      sinceNote: moment.note,
+      aside: rolloutVerdict,
+    };
+  }
+  if (live.length === 1 && main && !main.sha.startsWith(live[0].rev)) {
+    // 「为什么还没上线」这一问的答案不在工作负载里：部署器 hold 的原因只写在它自己
+    // 的那几行读数上。读到了就说读到的那句，读不到就指到那两行，不替它猜。
+    const hold = ciHold(observability);
+    const why =
+      hold == null
+        ? '为什么还没上线看观测读数的 mainline_ci_hold_active 与 mainline_ci_hold_seconds'
+        : hold.active
+          ? `部署器被 CI 扣住${hold.seconds != null ? `，这段红已经 ${formatAge(hold.seconds)}` : ''}：主线在等一个绿 rev`
+          : '部署器没有被 CI 扣住：这一版在排队，或者部署器根本没在跑';
+    return {
+      ...base,
+      state: 'waiting',
+      verdict: `现网跑的是 ${live[0].rev.slice(0, 12)}，main 已经是 ${main.sha.slice(0, 12)}：这一版还没上线`,
+      owner: live[0].names.slice(0, 3).join(' · '),
+      // 「从何时起没上线」的起点是 main 那一次推进，不是这次采集：main 停下之后
+      // 无论等多久，这个差都不会变。
+      sinceSecs: main.committed_secs_ago,
+      sinceNote: 'main 上一次推进到现在',
+      aside: `${rolloutVerdict}——滚的是上一版；${why}`,
+    };
+  }
   return {
     ...base,
     state: allRolled ? 'ok' : 'waiting',
-    verdict: allRolled
-      ? `${rolled.length} / ${rolling.length} 已滚到位`
-      : `${rolled.length} / ${rolling.length} 已滚到位，差 ${short.length} 个`,
-    owner: allRolled
-      ? undefined
-      : short
-          .slice(0, 3)
-          .map((w) => `${w.namespace}/${w.name}`)
-          .join(' · ') + (short.length > 3 ? ` 等 ${short.length} 个` : ''),
+    verdict: rolloutVerdict,
+    owner: allRolled ? undefined : stuckOwner,
     sinceSecs: moment.secs,
     sinceNote: moment.note,
+    // 比不了就直说比不了：没有带 main 标签的镜像时，「都到位了」只是说滚动这一半
+    // 结束了，它答不了「上线的是不是 main 那一版」；裸仓库里没有 main 时，连可比
+    // 的那一头都没有。
+    aside:
+      live.length === 0
+        ? '没有工作负载的镜像带 main 标签：这一格只报了滚动，没报现网是哪一版'
+        : main
+          ? undefined
+          : '裸仓库里没有 main：现网是哪一版没有可比的那一头',
   };
 }
 
@@ -784,6 +1323,140 @@ function chainStateWord(state: ChainNode['state']): string {
   return words[state];
 }
 
+/**
+ * 全局那一行：七步各一格，颜色是结局，下面一行是这一格的一句话。
+ *
+ * 表在下面把每一格的读数摊开；这里先回答「卡在哪一步」——七格里哪一格不是绿的，
+ * 一眼就该看出来，不必逐行读结论。
+ */
+function StepLane({ nodes }: { nodes: ChainNode[] }) {
+  return (
+    <div className="flex flex-wrap gap-[2px] px-4 py-2">
+      {nodes.map((node, index) => (
+        <div
+          key={node.id}
+          className="min-w-[110px] flex-1 rounded-[4px] border border-[var(--line)] px-2 py-1"
+          style={{ borderTop: `3px solid ${chainColor(node.state)}` }}
+        >
+          <div className="text-[10px] text-[var(--muted)]">
+            {index + 1} · {node.stage}
+            {/* 步数是这一跑记录里的格数，不是常量：钩子增删、判据增减，这里跟着变。 */}
+            {node.steps?.length ? ` · ${node.steps.length} 步` : ''}
+          </div>
+          <div className="text-[11px]" style={{ color: chainColor(node.state) }}>
+            {chainStateWord(node.state)}
+          </div>
+          <div className="truncate text-[10px] text-[var(--muted)]">{node.verdict}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+interface FlowStepRow {
+  key: string;
+  order: number;
+  stage: string;
+  what: string;
+  seconds: number | null;
+  verdict: string;
+}
+
+/** 把每一格的逐步记录按环节顺序摊平；没有逐步记录的环节占一行，说清它只到环节一级。 */
+function flowStepRows(nodes: ChainNode[]): FlowStepRow[] {
+  const rows: FlowStepRow[] = [];
+  for (const node of nodes) {
+    const steps = node.steps ?? [];
+    if (steps.length === 0) {
+      rows.push({
+        key: `${node.id}-stage`,
+        order: rows.length + 1,
+        stage: node.stage,
+        what: `这一格只到环节一级：${node.verdict}`,
+        seconds: null,
+        verdict: '',
+      });
+      continue;
+    }
+    for (const [index, step] of steps.entries()) {
+      rows.push({
+        key: `${node.id}-${index}-${step.what}`,
+        order: rows.length + 1,
+        stage: node.stage,
+        what: step.what,
+        seconds: step.seconds,
+        verdict: step.verdict,
+      });
+    }
+  }
+  return rows;
+}
+
+/**
+ * 端到端逐步摊开：从编辑到部署，这一轮具体走过哪些步、每步多少秒、结局是什么。
+ *
+ * 步骤清单不是这一页写死的。写下 `precommit` / `gate` / `prepush` 的那一侧这一跑记了
+ * 哪些格，这里就铺哪些格——提交前的钩子可以增删、整门的格随判据变，流程改了页面
+ * 不该跟着改一次；轮询（槽那份每 5 秒）把新的一跑取回来，这张表下一个周期就是新的。
+ * 没有逐步记录的三格（编辑、推到 main、镜像构建与部署）各占一行并写明它只到环节
+ * 一级，而不是让它们从流程里消失。
+ */
+function FlowSteps({ nodes }: { nodes: ChainNode[] }) {
+  const rows = flowStepRows(nodes);
+  const verdictColor = (verdict: string) =>
+    verdict === 'RED' ? 'var(--danger)' : verdict === 'UNJUDGED' ? 'var(--warn)' : 'var(--ok)';
+  return (
+    <div className="max-h-[320px] overflow-auto">
+      <Table
+        columns={[
+          {
+            key: 'order',
+            title: '步',
+            width: '48px',
+            render: (r) => <span className="mono text-[10px] text-[var(--muted)]">{r.order}</span>,
+          },
+          {
+            key: 'stage',
+            title: '环节',
+            width: '90px',
+            render: (r) => <span className="text-[11px] text-[var(--muted)]">{r.stage}</span>,
+          },
+          {
+            key: 'what',
+            title: '步骤',
+            render: (r) => <span className="text-[11px]">{r.what}</span>,
+          },
+          {
+            key: 'seconds',
+            title: '秒',
+            width: '70px',
+            render: (r) => (
+              <span className="mono text-[11px] text-[var(--paper-dim)]">
+                {r.seconds == null ? '—' : r.seconds}
+              </span>
+            ),
+          },
+          {
+            key: 'verdict',
+            title: '结局',
+            width: '90px',
+            render: (r) =>
+              r.verdict ? (
+                <span className="mono text-[11px]" style={{ color: verdictColor(r.verdict) }}>
+                  {r.verdict}
+                </span>
+              ) : (
+                <span className="text-[10px] text-[var(--muted)]">环节级</span>
+              ),
+          },
+        ]}
+        rows={rows}
+        rowKey={(r) => r.key}
+      />
+    </div>
+  );
+}
+
 function ChainPanel({ nodes }: { nodes: ChainNode[] }) {
   return (
     <>
@@ -848,10 +1521,11 @@ function ChainPanel({ nodes }: { nodes: ChainNode[] }) {
         rowKey={(n) => n.id}
       />
       <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
-        这条链按「一个字节从哪来」排，不按时间排：最上面是有人在改的那条分支，最下面
-        是集群里真的在跑的副本。三处读数各自出自不同的地方，所以三处都可能读不到，而
-        「读不到」写在状态列上，不画成 0——这条链唯一的用处就是看出一件事卡在哪一环，
-        而一格空着与一格「没人报」在那件事上是两个完全不同的答案。
+        这条链按发生顺序排，不按读数新鲜度排：最上面是有人在改的那条分支，最下面
+        是集群里真的在跑的副本。七格各有各的读数出处（源线、三份钩子记录、构建跑次、
+        工作负载），所以每一格都可能读不到，而「读不到」写在状态列上，不画成 0——
+        这条链唯一的用处就是看出一件事卡在哪一环，而一格空着与一格「没人报」在那件
+        事上是两个完全不同的答案。
       </p>
     </>
   );

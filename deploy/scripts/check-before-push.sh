@@ -57,6 +57,11 @@ if [ ! -r "${here}/lib/build-slot.sh" ]; then
 fi
 # shellcheck source=lib/build-slot.sh
 . "${here}/lib/build-slot.sh"
+# 这一跑每一格的秒数与结局也写进构建槽目录下的 runs/：网关在它已有的「编译与测」那一面
+# 读，页面因此不必另开一条通道，也不必在宿主上再落一份自成一体的台账。缺了它只是屏上
+# 少这一面读数，判据不受影响。
+# shellcheck source=lib/gate-run-record.sh
+. "${here}/lib/gate-run-record.sh"
 
 # ---- 验过没有：按字节记的戳 ----
 #
@@ -408,10 +413,29 @@ skip_ci_step() { # <这一步的名字> <为什么回放不了>
 # cargo 里面，这道门看不见。别把「本格 900 秒」读成「编译了 900 秒」——它可能是 100 秒
 # 编译加 800 秒排队。要分开这两者，得给排队那一层加上自己的读数，那是下一件事。
 segment_log="$(mktemp "${TMPDIR:-/tmp}/cogneva-gate-segments.XXXXXX")" || segment_log=/dev/null
-trap 'rm -f "${segment_log}"' EXIT
+# 同一份格子另写一份到构建槽目录：那份活得过这一跑的终端，网关从它已有的挂载里读出来，
+# 页面上的「编译与测」那一格就答得了「刚才那一推慢在哪」。写不进去只是少这一面读数，
+# 这一跑照常判——所以这里不问、也不拦。
+# 目录取构建槽客户端算好的那一个：同一个键、同一个默认值，两处各写一遍会在改过路径的
+# 机器上分叉——记录落在一个没人读的目录里，屏上永远是「没有这一跑」。
+run_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+run_file=""
+case "${run_root}" in
+# 夹具树是 `mktemp -d` 造的。把一次夹具跑记成「最近一跑」，页面上就会出现一棵早已删掉
+# 的树、一段几秒的「编译与测」——测试的产物穿着交付读数的外衣。判据只有一处，所以这条
+# 守卫写在这里，不散在各个夹具里。
+"${TMPDIR:-/tmp}"/*) ;;
+*) run_file="$(gate_run_begin "$(build_slot_dir)" "${run_root}" gate "$(date +%s)" "$$")" ;;
+esac
+finish_segments() {
+    rm -f "${segment_log}"
+    gate_run_finish "${run_file}"
+}
+trap finish_segments EXIT
 
 record_segment() { # <秒> <结局> <说明>
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"${segment_log}" 2>/dev/null
+    gate_run_append "${run_file}" "$1" "$2" "$3"
 }
 
 run_suite_file() { # run_suite_file <说明> <模块名>
