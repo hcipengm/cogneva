@@ -36,6 +36,10 @@ use crate::common::rust_production::{
 };
 
 /// 读法本体只有一份，在 dev-only 的支撑 crate 里；这里转给用 `common` 的夹具。
+///
+/// `common` 被编进每一个测试二进制，其中大多数用不到这条转出——不是这条转出没用，
+/// 是它的用户不在这一份二进制里，所以「这一个二进制没用到」不算未使用。
+#[allow(unused_imports)]
 pub use cog_test_support::{literal_values, literals_in, Literal};
 
 /// 一个声明值怎么才算被「又写了一遍」。
