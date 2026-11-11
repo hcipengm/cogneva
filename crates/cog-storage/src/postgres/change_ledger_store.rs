@@ -1206,6 +1206,15 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // not work -- its question is answered -- and leaving it in would hand a
         // fixture identity back to the tree, whose check would only overwrite the
         // retirement with the unsettled answer it was retired to stop repeating.
+        // `landed` is terminal, and this exclusion is where the account says so:
+        // a row it stops answering is a row no later pass is handed to measure,
+        // so a criterion corrected afterwards never reaches the rows that landed
+        // under the old one. A criterion revision is a property of the
+        // (identity, revision) pair: re-pointing it declares a fresh change rather
+        // than re-reading the old row, and the rows landed under the old criterion
+        // stay landed. Read the other way round they look like a backlog this
+        // queue forgot, and a pass that reopened them would be moving state on a
+        // reading rather than on a measurement -- which the state column is not
         //
         // Both orderings end on the identity, and that is not decoration. Every
         // row a fold writes in one transaction shares one `now()`, so a batch of
