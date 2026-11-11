@@ -820,7 +820,10 @@ mod tests {
             );
         }
 
-        for template in ["cogneva.example.json", "deploy/helm/cogneva/files/cogneva.json"] {
+        for template in [
+            "cogneva.example.json",
+            "deploy/helm/cogneva/files/cogneva.json",
+        ] {
             let raw = std::fs::read_to_string(repo_root().join(template))
                 .unwrap_or_else(|e| panic!("读不到 {template}：{e}"));
             let doc: serde_json::Value = serde_json::from_str(&raw)
@@ -828,12 +831,16 @@ mod tests {
             let patterns: Vec<&str> = doc
                 .pointer("/github_integration/landing_policy/forbidden_paths")
                 .and_then(|v| v.as_array())
-                .unwrap_or_else(|| panic!("{template} 没有 github_integration.landing_policy.forbidden_paths"))
+                .unwrap_or_else(|| {
+                    panic!("{template} 没有 github_integration.landing_policy.forbidden_paths")
+                })
                 .iter()
                 .filter_map(|v| v.as_str())
                 .collect();
             assert!(
-                !patterns.iter().any(|p| crate::landing::path_forbidden(probe, p)),
+                !patterns
+                    .iter()
+                    .any(|p| crate::landing::path_forbidden(probe, p)),
                 "{template} 的 forbidden_paths 仍然禁止 `deploy/`：与部署准入条件重复且相斥，\
                  部署变更到不了准入门"
             );
