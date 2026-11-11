@@ -65,7 +65,7 @@
 
 ### M4 嵌套配置节没有进判据
 
-- 状态：已完成（本次提交，已双推）
+- 状态：已完成（提交 `d65dbc2`，已双推）
 - 证据：
   - `common/config_surface.rs` 新增类型图：`TypeGraph` 从 `crates/*/src` 读声明，
     `Reader::of` 记下 `type_name`，`TypeInfo` / `FieldInfo` 保留字段名、别名、
@@ -99,7 +99,7 @@
 
 ### M5 `skip_serializing_if` 字段对读回不可见
 
-- 状态：已完成（本次提交，已双推）
+- 状态：已完成（提交 `d65dbc2`，已双推）
 - 证据：
   - `produced` 现在是两处之和：读回该节得到的键 ∪ 类型声明的字段键（减掉
     `#[serde(skip)]` 与 `#[serde(skip_deserializing)]`）；别名也算同一个旋钮；
@@ -185,7 +185,7 @@
 
 ### M11 `_for_seconds_comment` 是藏起来的说明文字
 
-- 状态：已完成（本次提交，已双推）
+- 状态：已完成（提交 `d65dbc2`，已双推）
 - 证据：
   - 改名并同步所有交付文档：`_for_seconds_comment` → `_comment_for_seconds`、
     `_retired_rules_comment` → `_comment_retired_rules`、
@@ -266,4 +266,4 @@
 - 2026-11-11：建立台账；M1–M3 记为已完成（`f117611`、`b979f2b` 已双推）。
 - 2026-11-11：M4 + M5 + M11 关闭：类型图递归、`produced` 并上字段声明、说明键改名；
   顺带修掉 19 处 `dormancy` 与 26 个嵌套旋钮的交付缺口（18 条写进 chart，
-  8 条进 `CODE_ONLY`）。
+  8 条进 `CODE_ONLY`）。提交 `d65dbc2`，已双推。
