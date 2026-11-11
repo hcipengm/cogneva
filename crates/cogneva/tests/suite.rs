@@ -493,6 +493,8 @@ mod the_repo_root_is_computed_in_one_place_test;
 mod the_token_counters_are_a_projection_of_the_ledger_test;
 #[path = "trace_header_names_contract_test.rs"]
 mod trace_header_names_contract_test;
+#[path = "treatment_is_decided_without_the_label_test.rs"]
+mod treatment_is_decided_without_the_label_test;
 #[path = "tunable_registry_contract_test.rs"]
 mod tunable_registry_contract_test;
 #[path = "unwired_modules_contract_test.rs"]

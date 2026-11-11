@@ -436,9 +436,11 @@ impl SquadExecutor {
         let self_review = &deps.self_review;
         let pge_schemas = &deps.pge_schemas;
         let skill_registry = &deps.skill_registry;
-        let schema_for = |actor: &str| -> Option<serde_json::Value> {
-            pge_schemas.as_ref()?.get(actor).cloned()
-        };
+        // 键是**席位**不是人名：调用点传的全是 `roles::*` 常量，同一个座位换个人坐
+        // 拿到同一份 schema。参数叫 `actor` 时它与「接手的人叫什么」同形，读代码的
+        // 人分不出这里是在寻址还是在按名字分待遇。
+        let schema_for =
+            |seat: &str| -> Option<serde_json::Value> { pge_schemas.as_ref()?.get(seat).cloned() };
         // 解析 SquadConfig 指定的 prompt skills（解析失败回退内置 prompt）。
         let planner_skill = crate::actors::resolve_prompt_skill(
             skill_registry.as_ref(),
