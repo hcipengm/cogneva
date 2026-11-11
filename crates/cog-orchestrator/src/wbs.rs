@@ -177,6 +177,7 @@ pub fn check_work_package(id: &str, acceptance: &[String]) -> Vec<WbsDefect> {
         estimated_seconds: 0,
         parent_id: None,
         acceptance: acceptance.to_vec(),
+        delivers: None,
     };
     check(&[package])
 }
@@ -220,6 +221,7 @@ mod tests {
             estimated_seconds: 60,
             parent_id: parent.map(String::from),
             acceptance: acceptance.iter().map(|s| s.to_string()).collect(),
+            delivers: None,
         }
     }
 

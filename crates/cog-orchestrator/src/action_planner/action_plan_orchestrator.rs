@@ -744,6 +744,22 @@ impl ActionPlanOrchestrator {
         // 验收标准跟着任务行走，不跟着基线行：没有估算的工作包不落基线行，写在
         // 那里会在入图那一刻丢掉，而重规划正是要读它。
         task.acceptance = at.acceptance.clone();
+        // 分解说的那一句交给落定那一格：原样的词写进行上，读不成闭集里的词时
+        // 入口会记成「读不出来」，而不是在这里换一个座位名去猜。
+        if let Some(word) = at
+            .delivers
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+        {
+            if let Some(fields) = task.input.as_object_mut() {
+                fields.insert(
+                    cog_core::types::task::INPUT_DELIVERS.to_string(),
+                    serde_json::json!(word),
+                );
+            }
+        }
+        task.settle_deliverable();
         task
     }
 
@@ -2348,6 +2364,7 @@ mod tests {
             parent_id: None,
             // 工作包要带验收标准，分解门才会放行：这条夹具走的是同一条入图路径。
             acceptance: vec!["有产出".into()],
+            delivers: None,
         };
         Arc::new(MockTaskExecutor {
             atomic_tasks: vec![task],
@@ -2840,6 +2857,7 @@ mod tests {
             parent_id: None,
             // 叶子工作包带验收标准：分解门会拒没有判据的叶子，夹具按合规的造。
             acceptance: vec!["有产出".into()],
+            delivers: None,
         }
     }
 
@@ -2879,6 +2897,47 @@ mod tests {
         let task =
             ActionPlanOrchestrator::atomic_task_to_task(&atomic_task_with_skill("t", "web_search"));
         assert_eq!(task.task_type, TaskType::Custom("web_search".into()));
+    }
+
+    /// 分解说的那一句，原样走到任务行的记录上；没说就是「没人说」。
+    ///
+    /// 这一段是「让平台自己的生产者写声明」的第一处：计划知道每一片交什么，
+    /// 让它说，而不是让派发时按 `skill_id` 反推。反推出来的形状换个座位接手就变，
+    /// 正是这套改动要清掉的那种待遇。
+    #[test]
+    fn the_decomposition_states_what_each_package_delivers() {
+        let stated = ActionPlanOrchestrator::atomic_task_to_task(&AtomicTask {
+            delivers: Some("judgement".into()),
+            ..atomic_task_with_skill("t", "evaluator")
+        });
+        assert_eq!(stated.deliverable(), cog_core::Deliverable::Judgement);
+        assert_eq!(
+            stated.deliverable_declaration(),
+            cog_core::DeliverableDeclaration::Stated {
+                conclusion: cog_core::Deliverable::Judgement,
+                by: None,
+                via: cog_core::StatementVia::Delivers,
+            }
+        );
+
+        // 不说就不猜：座位是 evaluator 也不把交付物推成判词。
+        let silent =
+            ActionPlanOrchestrator::atomic_task_to_task(&atomic_task_with_skill("t", "evaluator"));
+        assert_eq!(silent.deliverable(), cog_core::Deliverable::Unstated);
+
+        // 说出来但不在闭集里：记成读不出来，不退回旧键，也不改写成一个形状。
+        let misspelled = ActionPlanOrchestrator::atomic_task_to_task(&AtomicTask {
+            delivers: Some("review".into()),
+            ..atomic_task_with_skill("t", "evaluator")
+        });
+        assert!(
+            matches!(
+                misspelled.deliverable_declaration(),
+                cog_core::DeliverableDeclaration::Unreadable { .. }
+            ),
+            "闭集外的词被读成了：{:?}",
+            misspelled.deliverable_declaration()
+        );
     }
 
     /// TaskExecutor that replies a scripted sequence of atomic-task lists,

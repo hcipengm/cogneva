@@ -2409,6 +2409,12 @@ async fn wbs_verdict_no_longer_holds(
             estimated_seconds: 0,
             parent_id: task.parent_task_id.clone(),
             acceptance: task.acceptance.clone(),
+            // 从任务行反推工作包时，声明随它一起走：`Unstated` 就是空，
+            // 不在这里补一个词。
+            delivers: match task.deliverable() {
+                cog_core::Deliverable::Unstated => None,
+                other => Some(other.as_str().to_string()),
+            },
         })
         .collect();
     if plan.is_empty() {

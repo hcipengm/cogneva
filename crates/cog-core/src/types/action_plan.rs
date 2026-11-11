@@ -96,6 +96,13 @@ pub struct AtomicTask {
     /// 非叶子（有人挂在它下面）不要求填：它的完成是由子节点汇上来的。
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// 这一片交什么：闭集里的一个词，由分解时读这件活得出。
+    ///
+    /// 不从 `skill_id` 反推。那个字段说的是「派给哪个座位」，是同一次分解的另一个
+    /// 回答；两者一旦互为代理，同一件活换个座位接手就在读数里换了交付物。分解说不出
+    /// 来时留空——入口落定的是一份「没人说」，不是一个默认形状。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivers: Option<String>,
 }
 
 /// The complete action plan produced by Stage 1 decomposition.
@@ -388,6 +395,7 @@ mod tests {
             estimated_seconds: 0,
             parent_id: None,
             acceptance: vec![],
+            delivers: None,
         }
     }
 

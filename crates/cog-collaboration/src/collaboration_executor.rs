@@ -1605,6 +1605,9 @@ impl CollaborationExecutor {
             // 的形状，只是此前计划这一侧根本没有字段能装它。
             parent_id: None,
             acceptance: spec.acceptance.clone(),
+            // 分解自己说的那一句随工作包一起走；分解没说的就是 None，
+            // 不在这一步替它猜一个形状。
+            delivers: spec.delivers.clone(),
         }
     }
 
@@ -1807,11 +1810,41 @@ mod tests {
             input: serde_json::json!({ "query": "do it" }),
             blocked_by: Vec::new(),
             acceptance: vec!["the test covers both branches".into()],
+            delivers: None,
         };
         let atomic = CollaborationExecutor::task_spec_to_atomic(&spec);
         assert_eq!(
             atomic.acceptance, spec.acceptance,
             "计划说的验收标准必须原样落到任务行上：丢掉它，分解门就永远说不出来这片怎样算做完"
+        );
+    }
+
+    /// 分解说的交付物也随工作包走，原样、不按座位名补。
+    ///
+    /// 这一格丢掉的后果与验收标准不同：任务照样跑，只是「这份活交什么」退回
+    /// 「没人说」，判据与输出形状只能按座位猜——正是这套改动要清掉的那种待遇。
+    #[test]
+    fn a_sub_tasks_deliverable_travels_onto_the_atomic_task() {
+        let spec = crate::TaskSpec {
+            id: "t1".into(),
+            name: "judge the change".into(),
+            task_type: "evaluator".into(),
+            input: serde_json::json!({ "query": "judge it" }),
+            blocked_by: Vec::new(),
+            acceptance: vec!["the verdict names a defect or says none".into()],
+            delivers: Some("judgement".into()),
+        };
+        let atomic = CollaborationExecutor::task_spec_to_atomic(&spec);
+        assert_eq!(atomic.delivers.as_deref(), Some("judgement"));
+
+        let silent = crate::TaskSpec {
+            delivers: None,
+            ..spec
+        };
+        let atomic = CollaborationExecutor::task_spec_to_atomic(&silent);
+        assert_eq!(
+            atomic.delivers, None,
+            "分解没说的交付物不许在这一步按 task_type 补出来"
         );
     }
 
@@ -2163,6 +2196,7 @@ mod tests {
             input: serde_json::json!({ "body": "x".repeat(chars) }),
             blocked_by: Vec::new(),
             acceptance: Vec::new(),
+            delivers: None,
         }
     }
 

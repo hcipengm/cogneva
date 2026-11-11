@@ -31,6 +31,13 @@ pub struct TaskSpec {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub acceptance: Vec<String>,
+    /// 这一片交什么，由分解读这件活得出，闭集与任务行的 `delivers` 相同。
+    ///
+    /// 计划是平台自己的生产者：它比任何外部提交者都更清楚这一片要交出哪种产物，
+    /// 让它在分解时说出来，任务行才能带着来源而不是「没人说」进入派发。说不出时
+    /// 留空，入口落成 `Unstated`，不拿 `task_type`（座位）反推一个形状。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivers: Option<String>,
 }
 
 /// Output produced by a Planner agent.

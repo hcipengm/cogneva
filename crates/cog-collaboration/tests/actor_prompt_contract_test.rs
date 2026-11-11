@@ -329,6 +329,30 @@ async fn every_stable_half_names_the_answers_its_own_parser_reads() {
     }
 }
 
+/// 分解被要求在每一片上说清交什么，并且明确不许从座位名反推。
+///
+/// 计划是平台自己的生产者：它比外部提交者更清楚每一片要交出哪种产物。字段一旦
+/// 从契约里掉出去，模型就不会再答，任务行从此回到「没人说」——差分与判据那一侧
+/// 全绿，因为问题不在读的那一端。
+#[tokio::test]
+async fn the_planner_asks_each_sub_task_what_it_delivers() {
+    let roles = two_prompts_from_every_actor().await;
+    let agent = roles
+        .iter()
+        .find(|(role, _, _)| *role == "planner")
+        .map(|(_, agent, _)| agent)
+        .expect("planner 没有发过一份可读的文档");
+    let contract = stable_half(agent.inputs()[0].clone());
+    assert!(
+        contract.contains("\"delivers\""),
+        "分解契约不再问每一片交什么，任务行会退回「没人说」：{contract}"
+    );
+    assert!(
+        contract.contains("never from the executor's name"),
+        "契约没有说清交付物不能从座位名反推：{contract}"
+    );
+}
+
 /// No actor hands the model a role to play.
 ///
 /// The agent that runs a step is a colleague with an identity of its own; the

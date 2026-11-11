@@ -741,6 +741,7 @@ mod tests {
             estimated_seconds: seconds,
             parent_id: None,
             acceptance: vec![],
+            delivers: None,
         }
     }
 
