@@ -628,6 +628,58 @@ async fn an_evaluator_that_spent_its_budget_is_not_self_reviewed() {
     );
 }
 
+/// The decomposition loop reads the plan it just parsed against its own
+/// structural gate and hands that refusal to the next round, so a self-review
+/// here would be a second judge over the same bytes — and its rewritten text
+/// would be re-judged by the same gate anyway.
+///
+/// The control is the same actor and the same reply on the plain `plan` entry
+/// point: the skip belongs to the caller that already holds a verdict, not to
+/// the planner never being reviewed.
+#[tokio::test]
+async fn a_plan_the_caller_judges_downstream_is_not_self_reviewed() {
+    let reply = serde_json::json!({
+        "summary": "mock plan",
+        "plan": {"approach": "mock"},
+        "sub_tasks": [
+            {"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": [],
+             "acceptance": ["the answer names the file it changed"]}
+        ],
+    });
+
+    let judged_agent = MockAgent::new(reply.clone());
+    let judged_calls = judged_agent.review_calls.clone();
+    let planner = PlannerActor::new(Arc::new(judged_agent)).with_self_review(self_review_config());
+    let output = planner
+        .plan_judged_downstream(&test_task("plan the widget"), 0, None, None, None, None)
+        .await;
+
+    assert_eq!(
+        *judged_calls.lock().unwrap(),
+        0,
+        "a plan the caller judges by program is not worth a second judge"
+    );
+    assert_eq!(
+        output.summary, "mock plan",
+        "the skip must not swallow or rewrite the plan the caller is about to judge"
+    );
+
+    let reviewed_agent = MockAgent::new(reply);
+    let reviewed_calls = reviewed_agent.review_calls.clone();
+    let planner =
+        PlannerActor::new(Arc::new(reviewed_agent)).with_self_review(self_review_config());
+    let output = planner
+        .plan(&test_task("plan the widget"), 0, None, None, None, None)
+        .await;
+
+    assert_eq!(
+        *reviewed_calls.lock().unwrap(),
+        1,
+        "the skip is about the caller already holding a verdict, not about the planner"
+    );
+    assert_eq!(output.summary, "mock plan");
+}
+
 #[tokio::test]
 async fn collaboration_executor_archives_successful_execution() {
     let knowledge = Arc::new(MockKnowledgeBackend::new());
