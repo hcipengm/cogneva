@@ -610,8 +610,8 @@ impl cog_core::AgentManager for GlobalAgentManager {
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
         task_id: Option<&str>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
-        // 没有声明：调用方没带任务，答不出这件活要不要动树。
-        self.create_agent_declaring(agent_id, role, llm, task_id, false)
+        // 没有声明：调用方没带任务，答不出这件活交什么。
+        self.create_agent_declaring(agent_id, role, llm, task_id, cog_core::Deliverable::Unstated)
             .await
     }
 
@@ -621,7 +621,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
         role: &str,
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
         task_id: Option<&str>,
-        declares_change: bool,
+        deliverable: cog_core::Deliverable,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
         // 同一个名字只对应一个活的对象。
         //
@@ -648,9 +648,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
         // 就是这个任务的 id（`create_role_agent` 与 roundtable 的角色都是这么建
         // 的），所以这里不做推断。
         config.owner_task_id = task_id.map(str::to_string);
-        // 这件活要不要动工作树，是拿到任务的那一层说的（`Task::declares_change`）。
-        // 运行时够不到任务对象，只读这一位；按角色名判时，同一个人换件活就判错。
-        config.declares_change = declares_change;
+        // 这份活交什么，是拿到任务的那一层说的（`Task::deliverable`）。运行时够不到
+        // 任务对象，只读这一位；按角色名判时，同一个人换件活就判错。
+        config.deliverable = deliverable;
 
         let capabilities = vec![role.to_string()];
         let registration = task_agent_registration(agent_id, role);

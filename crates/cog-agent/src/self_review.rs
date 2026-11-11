@@ -1,6 +1,6 @@
 use cog_core::{
-    execute_structured, ChatOptions, ChatResponse, LlmClient, Message, ResponseFormat, SFError,
-    SFResult, SelfReviewConfig, SelfReviewResult, ThinkingLevel,
+    execute_structured, ChatOptions, ChatResponse, Deliverable, LlmClient, Message, ResponseFormat,
+    SFError, SFResult, SelfReviewConfig, SelfReviewResult, ThinkingLevel,
 };
 
 /// Observation of an agent output.
@@ -174,6 +174,12 @@ pub fn self_review_actor(role: &str) -> String {
 pub struct SelfReviewLoop {
     pub config: SelfReviewConfig,
     actor: String,
+    /// 这份活交什么，由它挑判据（见 [`SelfReviewLoop::judging_rubric`]）。
+    ///
+    /// 与 `actor` 分开记，因为两者答的不是同一问：`actor` 答「谁在花这笔钱」，
+    /// 这一格答「被审的是什么物」。原先判据从 `actor` 里的角色名取，同一个人换
+    /// 件活就判错——被判的是物，标准就该跟着物走。
+    deliverable: Deliverable,
     /// The DAG task this review is being run for, when it is being run for one.
     ///
     /// 与 `actor` 分开记，因为两者答的不是同一问：`actor` 答「哪个角色在花」，
@@ -189,15 +195,33 @@ impl SelfReviewLoop {
         Self {
             config,
             actor: DEFAULT_SELF_REVIEW_ACTOR.to_string(),
+            deliverable: Deliverable::Unstated,
             task: None,
         }
     }
 
     /// Report this loop's token spend under `actor`, so a caller that reviews
     /// on behalf of a specific agent can be charged for it.
+    ///
+    /// 这只决定花销记在谁头上，不决定怎么判。
     pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
         self.actor = actor.into();
         self
+    }
+
+    /// 这份活交什么（见 [`cog_core::Task::deliverable`]）。判据按它挑。
+    ///
+    /// 不设时是 `Unstated`——没有声明就按「一件被要求满足规格的产出」判，
+    /// 而这一格本身留着 `Unstated`，读数上分得开「没人说过」与「有人说是
+    /// work_product」。
+    pub fn with_deliverable(mut self, deliverable: Deliverable) -> Self {
+        self.deliverable = deliverable;
+        self
+    }
+
+    /// 这一次用的是哪一种判据，以及它有没有人说出来。
+    pub fn rubric_source(&self) -> Deliverable {
+        self.deliverable
     }
 
     /// Charge this review's spend to `task`, so "what did this change cost"
@@ -488,7 +512,7 @@ impl SelfReviewLoop {
             ));
         }
         let user_payload = serde_json::to_string(&JudgeRequest {
-            rubric: SelfReviewLoop::judging_rubric(&self.actor),
+            rubric: SelfReviewLoop::judging_rubric(self.deliverable),
             spec,
             output,
         })?;
@@ -698,17 +722,17 @@ impl SelfReviewLoop {
     /// asks a plan to answer the task cannot be passed by any plan, and a gate
     /// that never opens teaches its readers to ignore it.
     ///
-    /// The text is chosen by the role the review is charged to. It has to stay
-    /// byte-identical across calls, because it is the head of the request and
-    /// the only part an upstream prefix cache can hold across tasks.
-    fn judging_rubric(actor: &str) -> &'static str {
-        // 名字从 `cog_core::roles` 读，不在这里再拼一遍：这五个词是配置、代码与
-        // 存下来的标识三者必须同意的一份声明，第二处拼写改了名不会报错，只会让
-        // 这个角色悄悄落在 `_` 那一臂上、拿默认判据去判。
-        use cog_core::roles::{EVALUATOR, MERGER, MODERATOR, PLANNER};
-        let role = actor.rsplit(':').next().unwrap_or(actor);
-        match role {
-            PLANNER => {
+    /// The text is chosen by what the work delivers, not by who delivers it.
+    ///
+    /// It has to stay byte-identical across calls, because it is the head of
+    /// the request and the only part an upstream prefix cache can hold across
+    /// tasks. `Unstated` takes the work-product wording — that is the standard
+    /// a text asked to meet a specification is judged by — but it stays its own
+    /// state on the record, so "nobody said" and "somebody said work product"
+    /// do not collapse into one reading.
+    fn judging_rubric(deliverable: Deliverable) -> &'static str {
+        match deliverable {
+            Deliverable::Plan => {
                 "The text under judgement is a PLAN: a decomposition of a task into sub-tasks. \
                  A plan is not expected to answer the task or to carry out any step -- that is \
                  what its sub-tasks are for -- so \"it does not give the answer\", \"it does not \
@@ -727,7 +751,7 @@ impl SelfReviewLoop {
                  character against the text, whitespace aside, and a quote that is not there is \
                  not a `met`."
             }
-            EVALUATOR => {
+            Deliverable::Judgement => {
                 "The text under judgement is a JUDGEMENT about someone else's work. Judge it as \
                  a judgement: whether it names what it assessed, states a verdict, and says what \
                  the verdict rests on. Whether the work itself is good is not this text's \
@@ -738,7 +762,7 @@ impl SelfReviewLoop {
                  the specification that states the requirement, in `spec_quote`, verbatim; a \
                  quote that is not in the specification does not count."
             }
-            MODERATOR | MERGER => {
+            Deliverable::Answer => {
                 "The text under judgement is a FINAL ANSWER to the task. List every requirement \
                  the specification states. For each one decide met, unmet or undetermined, and \
                  for `met` quote the words of the text that carry it, character for character, \
@@ -746,7 +770,7 @@ impl SelfReviewLoop {
                  states the requirement, in `spec_quote`, verbatim; a quote that is not in the \
                  specification does not count."
             }
-            _ => {
+            Deliverable::Change | Deliverable::WorkProduct | Deliverable::Unstated => {
                 "The text under judgement is a WORK PRODUCT the task asked for. List every \
                  requirement the specification states. For each one decide met, unmet or \
                  undetermined, and for `met` quote the words of the text that carry it, \
@@ -1218,6 +1242,7 @@ mod tests {
         body: &'static str,
         calls: std::sync::atomic::AtomicUsize,
         levels: std::sync::Mutex<Vec<Option<ThinkingLevel>>>,
+        payloads: std::sync::Mutex<Vec<String>>,
     }
 
     impl TableLlm {
@@ -1226,11 +1251,17 @@ mod tests {
                 body,
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 levels: std::sync::Mutex::new(Vec::new()),
+                payloads: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// 每次请求带出去的正文，按调用顺序。
+        fn payloads(&self) -> Vec<String> {
+            self.payloads.lock().unwrap().clone()
         }
 
         /// 每次请求带出去的思考档，按调用顺序。
@@ -1259,11 +1290,15 @@ mod tests {
 
         async fn chat(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             options: &ChatOptions,
         ) -> SFResult<ChatResponse> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.levels.lock().unwrap().push(options.reasoning);
+            self.payloads
+                .lock()
+                .unwrap()
+                .push(messages.last().map(|m| m.content()).unwrap_or_default());
             Ok(ChatResponse {
                 content: vec![cog_core::ContentBlock::text(self.body)],
                 ..Default::default()
@@ -1702,19 +1737,70 @@ mod tests {
     /// 去判计划，计划永远过不了，这道门也就永远开不了。
     #[test]
     fn a_plan_is_judged_as_a_plan() {
-        let plan = SelfReviewLoop::judging_rubric("self_review:planner");
+        let plan = SelfReviewLoop::judging_rubric(Deliverable::Plan);
         assert!(
             plan.contains("is not expected to answer the task"),
             "计划这条判据必须把「没有回答任务」划出缺陷之外：{plan}"
         );
         assert!(
-            !SelfReviewLoop::judging_rubric("self_review:generator")
+            !SelfReviewLoop::judging_rubric(Deliverable::WorkProduct)
                 .contains("is not expected to answer the task"),
             "生成物就是答案，不能沿用计划那条豁免"
         );
         assert!(
-            SelfReviewLoop::judging_rubric("self_review:evaluator").contains("JUDGEMENT"),
+            SelfReviewLoop::judging_rubric(Deliverable::Judgement).contains("JUDGEMENT"),
             "判词按判词判"
+        );
+        assert!(
+            SelfReviewLoop::judging_rubric(Deliverable::Answer).contains("FINAL ANSWER"),
+            "结论按结论判"
+        );
+    }
+
+    /// 同一件活换个标签接手，判据逐字相同——标签只决定花销记在谁头上。
+    ///
+    /// 这条是「角色不决定行为」在本模块的落点：改之前判据从 actor 里取角色名，
+    /// 两个角色接同一份活拿到两份标准；两个都绿不了，或者一个绿一个不绿，而
+    /// 读数上看不出是标准换了。
+    #[tokio::test]
+    async fn the_label_does_not_choose_the_rubric() {
+        const TABLE: &str = r#"{"rows":[
+             {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"}]}"#;
+        const SPEC: &str = "t1 and t2 must be done";
+
+        async fn payload_under(actor: &str, deliverable: Deliverable) -> (String, Deliverable) {
+            let llm = TableLlm::new(TABLE);
+            let loop_ = SelfReviewLoop::new(SelfReviewConfig {
+                revise: false,
+                spec: Some(SPEC.into()),
+                ..Default::default()
+            })
+            .with_actor(actor)
+            .with_deliverable(deliverable);
+            let source = loop_.rubric_source();
+            loop_
+                .review("t1: read the file, then t2: deploy", &llm)
+                .await
+                .unwrap();
+            (llm.payloads().pop().expect("一次评判一次请求"), source)
+        }
+
+        let (planner, _) = payload_under("self_review:planner", Deliverable::Plan).await;
+        let (generator, source) = payload_under("self_review:generator", Deliverable::Plan).await;
+        assert_eq!(
+            planner, generator,
+            "同一个声明、两个标签接手，判据正文必须逐字相同；标签只该决定花销记在谁头上"
+        );
+        assert!(
+            planner.contains("is not expected to answer the task"),
+            "这条活声明的是计划，判据就得是计划那条：{planner}"
+        );
+        assert_eq!(source, Deliverable::Plan);
+
+        let (other, _) = payload_under("self_review:planner", Deliverable::Judgement).await;
+        assert_ne!(
+            other, planner,
+            "同一份活声明成别的物，判据必须跟着变——否则「按物判」只是换了块牌子"
         );
     }
 

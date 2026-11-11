@@ -365,7 +365,7 @@ fn squad_config(goal: &str, task: &Task, pge_mode: PgeMode) -> SquadConfig {
         max_retries: 0,
         profile: Some(derive_task_profile(task)),
         is_self_evolution: task.is_self_evolution(),
-        declares_change: task.declares_change(),
+        deliverable: task.deliverable(),
         ..Default::default()
     }
 }

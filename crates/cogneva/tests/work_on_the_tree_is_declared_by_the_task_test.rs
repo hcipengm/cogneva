@@ -73,7 +73,7 @@ fn a_task_says_whether_its_work_changes_the_checkout() {
     );
 
     // 运行时读的是这一位，缺省是没有声明——没有声明时不拿「树没动」当证据。
-    assert!(!cog_core::RuntimeConfig::default().declares_change);
+    assert!(!cog_core::RuntimeConfig::default().declares_change());
 }
 
 /// 树上不再有按角色名决定「谁可以写工作树」的地方。
@@ -91,7 +91,7 @@ fn nobody_decides_who_may_write_the_tree_by_role() {
     let manager = std::fs::read_to_string(root.join("crates/cog-agent/src/runtime/manager.rs"))
         .expect("manager.rs readable");
     assert!(
-        manager.contains("config.declares_change = declares_change"),
+        manager.contains("config.deliverable = deliverable"),
         "管理器不再把任务的声明抄进运行时：那一句没了，声明就只写在构造函数里，\
          运行时永远读到 false，而「半小时没动」从此再也收不住任何人"
     );
@@ -121,15 +121,15 @@ fn nobody_decides_who_may_write_the_tree_by_role() {
             let produces = call.contains("roles::GENERATOR");
             if produces {
                 assert!(
-                    call.contains("declares_change"),
-                    "{name} 建了一个要交改动的角色，却没把任务的声明传进去：这一位的\
-                     每一轮都读成「没有声明要动树」，绕圈时不会被收住\n{call}"
+                    call.contains("squad.config.deliverable"),
+                    "{name} 建了一个产出那份物的座位，却没把任务的声明传进去：这一位\
+                     的每一轮都读成「没有声明要动树」，绕圈时不会被收住\n{call}"
                 );
             } else {
                 assert!(
-                    call.contains("false"),
-                    "{name} 建了一个只出结论的角色，却带了声明：它会被「树没动」当成\
-                     没进展收住，而它做的正是本职工作\n{call}"
+                    !call.contains("squad.config.deliverable"),
+                    "{name} 建了一个只出结论的座位，却接了任务的声明：它会被判成\
+                     产物、被「树没动」当成没进展收住，而它做的正是本职工作\n{call}"
                 );
             }
             checked += 1;

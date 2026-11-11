@@ -688,7 +688,7 @@ impl CollaborationExecutor {
                     context_window_size: None,
                     boundary_config: self.boundary_config.clone(),
                     is_self_evolution: false,
-                    declares_change: false,
+                    deliverable: task.deliverable(),
                     planner_skill_id: None,
                     generator_skill_id: None,
                     evaluator_skill_id: None,
@@ -727,7 +727,7 @@ impl CollaborationExecutor {
 
     /// 这一次运行的产出要不要走抽取与落地那条路。
     ///
-    /// 判据是任务声明（[`Task::declares_change`]），不是任务类型：同一个员工
+    /// 判据是任务声明（[`Task::deliverable`]），不是任务类型：同一个员工
     /// 接一件只交结论的活与接一件要交改动的活，收尾走的是两条不同的路；而
     /// 「哪一类活能改树」若写死在类型上，对话里发起的改动在结构上就永远落
     /// 不了地——不是被拒绝，是根本没有一条路能走到。
@@ -892,7 +892,7 @@ impl CollaborationExecutor {
                     context_window_size: None,
                     boundary_config: self.boundary_config.clone(),
                     is_self_evolution,
-                    declares_change: task.declares_change(),
+                    deliverable: task.deliverable(),
                     planner_skill_id: None,
                     generator_skill_id: None,
                     evaluator_skill_id: None,

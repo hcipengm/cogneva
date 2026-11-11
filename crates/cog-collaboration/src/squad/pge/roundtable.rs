@@ -956,14 +956,14 @@ impl PgeRoundtable {
             )
             .await
             .ok()?;
-        // 这一支的活是产出一份改动：它要不要动树由任务说，不由角色名说。
+        // 这一支交什么，由任务说，不由角色名说。
         let generator = manager
             .create_agent_declaring(
                 &format!("{}-generator", prefix),
                 cog_core::roles::GENERATOR,
                 llm.clone(),
                 Some(&task.id),
-                task.declares_change(),
+                task.deliverable(),
             )
             .await
             .ok()?;

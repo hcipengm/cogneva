@@ -1181,12 +1181,22 @@ impl Agent {
         output: &str,
         config: &cog_core::SelfReviewConfig,
     ) -> SFResult<cog_core::SelfReviewResult> {
-        let loop_ =
-            crate::self_review::SelfReviewLoop::new(config.clone()).with_actor(self.review_actor());
+        let loop_ = self.self_review_loop(config);
         loop_
             .review(output, self.llm.as_ref())
             .await
             .map(|(_, result)| result)
+    }
+
+    /// 这个 agent 的自审循环：花销记在它头上，判据按它手上这份活交什么挑。
+    ///
+    /// 两个入口一个构造点：`actor` 是归因（谁的账），`deliverable` 是判据
+    /// （判的什么物）。分开是因为它们此前共用「角色名」这一个词，同一个人
+    /// 换个任务就判错。
+    fn self_review_loop(&self, config: &cog_core::SelfReviewConfig) -> crate::self_review::SelfReviewLoop {
+        crate::self_review::SelfReviewLoop::new(config.clone())
+            .with_actor(self.review_actor())
+            .with_deliverable(self.config.deliverable)
     }
 
     /// Token-attribution label for reviews this agent runs on its own output.
@@ -1203,8 +1213,7 @@ impl Agent {
         output: &str,
         config: &cog_core::SelfReviewConfig,
     ) -> SFResult<(String, cog_core::SelfReviewResult)> {
-        let loop_ =
-            crate::self_review::SelfReviewLoop::new(config.clone()).with_actor(self.review_actor());
+        let loop_ = self.self_review_loop(config);
         loop_.review(output, self.llm.as_ref()).await
     }
 
@@ -1220,9 +1229,7 @@ impl Agent {
         config: &cog_core::SelfReviewConfig,
         task_id: &str,
     ) -> SFResult<(String, cog_core::SelfReviewResult)> {
-        let loop_ = crate::self_review::SelfReviewLoop::new(config.clone())
-            .with_actor(self.review_actor())
-            .with_task(task_id);
+        let loop_ = self.self_review_loop(config).with_task(task_id);
         loop_.review(output, self.llm.as_ref()).await
     }
 

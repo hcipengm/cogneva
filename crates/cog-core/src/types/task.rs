@@ -869,6 +869,81 @@ pub const INPUT_READY_LANE: &str = "ready_lane";
 /// 旧词、读的那一端比对新词，任务只是安静地不再被认出来。
 pub const INPUT_DECLARES_CHANGE: &str = "declares_change";
 
+/// The `task.input` key by which a task says what it delivers.
+///
+/// 这是 [`INPUT_DECLARES_CHANGE`] 所代理的那个量本身。判据、输出形状、任务类型都跟
+/// 「这份活交什么」走，而这件事只有任务说得出来；以前它们从接手人的角色名反推，于是
+/// 同一件活换个标签接手就换一套待遇。声明写明时以声明为准，`declares_change` 只作为
+/// 旧生产者还不会写新键时的兼容读法。
+pub const INPUT_DELIVERS: &str = "delivers";
+
+/// What a piece of work delivers.
+///
+/// The closed set the treatment of the work follows: the rubric that judges it,
+/// the shape its output is asked for in, the task type it runs as. Who takes the
+/// work is not one of the inputs — the same work taken by two labels must be
+/// treated the same.
+///
+/// `Unstated` is a state rather than a kind: the row did not say what it
+/// delivers. It is spelled out instead of defaulting to the commonest kind,
+/// because a default would make "nobody said" and "somebody said work product"
+/// read the same, and telling those two apart is the whole point of recording
+/// the declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Deliverable {
+    /// A decomposition of a task into sub-tasks.
+    Plan,
+    /// A change to the checkout: an expected state of the tree.
+    Change,
+    /// A judgement about someone else's work.
+    Judgement,
+    /// A final answer to the task's question.
+    Answer,
+    /// Anything else the task asked for: a report, a build artifact, one run.
+    WorkProduct,
+    /// The row did not say. Not a kind; a state that readers must answer for.
+    Unstated,
+}
+
+impl Deliverable {
+    /// Read the word a producer writes, or nothing for a word outside the set.
+    ///
+    /// The two spellings `judgement` / `judgment` and the dashed form of
+    /// `work_product` are accepted because they are what people actually type in
+    /// a JSON body; anything else is not silently coerced to a kind.
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word.trim() {
+            "plan" => Some(Self::Plan),
+            "change" => Some(Self::Change),
+            "judgement" | "judgment" => Some(Self::Judgement),
+            "answer" => Some(Self::Answer),
+            "work_product" | "work-product" => Some(Self::WorkProduct),
+            "unstated" => Some(Self::Unstated),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Change => "change",
+            Self::Judgement => "judgement",
+            Self::Answer => "answer",
+            Self::WorkProduct => "work_product",
+            Self::Unstated => "unstated",
+        }
+    }
+
+    /// Whether a run for this work is expected to change the checkout.
+    ///
+    /// The one question the runtime asked before the set existed; kept as a
+    /// reading of the declaration rather than as a second field.
+    pub const fn declares_change(&self) -> bool {
+        matches!(self, Self::Change)
+    }
+}
+
 /// The lane for work that must run before ordinary work, whether or not the
 /// ordinary lane is full.
 ///
@@ -1124,7 +1199,15 @@ impl Task {
     ///
     /// 读的人要的是「这一件活得改树吗」，问出来的答案只取决于任务本身：同一个人
     /// 接了另一件活，答案跟着那件活变；角色标签怎么变都不影响它。
-    pub fn declares_change(&self) -> bool {
+    pub fn deliverable(&self) -> Deliverable {
+        // 写明的声明优先：它是这套读法要补的那个量本身，`declares_change`
+        // 只是它缺席时的兼容读法。两者同时出现且互相矛盾时以声明为准——
+        // 让布尔盖住声明，等于让旧键继续决定新键该说什么。
+        if let Some(word) = self.input.get(INPUT_DELIVERS).and_then(|v| v.as_str()) {
+            if let Some(named) = Deliverable::from_word(word) {
+                return named;
+            }
+        }
         let named = match self.input.get(INPUT_DECLARES_CHANGE) {
             Some(serde_json::Value::Bool(flag)) => *flag,
             Some(serde_json::Value::String(word)) => {
@@ -1132,7 +1215,15 @@ impl Task {
             }
             _ => false,
         };
-        named || self.is_self_evolution()
+        if named || self.is_self_evolution() {
+            Deliverable::Change
+        } else {
+            Deliverable::Unstated
+        }
+    }
+
+    pub fn declares_change(&self) -> bool {
+        self.deliverable().declares_change()
     }
 
     /// The producer's own spelling of this task's entry point, or `None` for a
@@ -1523,6 +1614,55 @@ mod tests {
             evolution.declares_change(),
             "自进化生成变更的任务没有另抄一遍声明就该被认出来"
         );
+    }
+
+    /// 闭集里每一个显式取值都读得出来，两种缺席都读成「没说」。
+    ///
+    /// 「没说」不许兜底成最常见的种类：兜底之后「没人说过」与「有人说是
+    /// work_product」在读数上同形，而把这两者分开正是记这一格的用处。
+    #[test]
+    fn a_task_reads_the_closed_set_of_deliverables() {
+        for (word, expected) in [
+            ("plan", Deliverable::Plan),
+            ("change", Deliverable::Change),
+            ("judgement", Deliverable::Judgement),
+            ("judgment", Deliverable::Judgement),
+            ("answer", Deliverable::Answer),
+            ("work_product", Deliverable::WorkProduct),
+            ("work-product", Deliverable::WorkProduct),
+        ] {
+            let task = Task::new(
+                "t-word",
+                TaskType::Custom("platform_task".into()),
+                serde_json::json!({ INPUT_DELIVERS: word }),
+            );
+            assert_eq!(task.deliverable(), expected, "声明 {word} 读错了");
+        }
+
+        let silent = Task::new(
+            "t-silent",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ "goal": "read the timeout" }),
+        );
+        assert_eq!(silent.deliverable(), Deliverable::Unstated);
+
+        // 闭集外的词不猜：一个拼错的声明不比没有声明多知道什么。
+        let outside = Task::new(
+            "t-outside",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "plan-ish" }),
+        );
+        assert_eq!(outside.deliverable(), Deliverable::Unstated);
+        assert!(!outside.declares_change(), "不在闭集里的词不该被读成变更");
+
+        // 写明的声明优先于旧键：两者矛盾时以声明为准。
+        let both = Task::new(
+            "t-both",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "plan", INPUT_DECLARES_CHANGE: true }),
+        );
+        assert_eq!(both.deliverable(), Deliverable::Plan);
+        assert!(!both.declares_change(), "旧键不该盖过声明");
     }
 
     #[test]

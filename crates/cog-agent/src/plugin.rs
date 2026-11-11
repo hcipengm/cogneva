@@ -533,8 +533,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
             crew_id: None,
             squad_id: None,
             owner_task_id: None,
-            // 评测不是一件要动工作树的活。
-            declares_change: false,
+            // 这一份活交的是判词：它不动工作树，判的是别人交的东西。
+            deliverable: cog_core::Deliverable::Judgement,
         };
         let mut eval_runtime = crate::AgentRuntime::new(eval_config, eval_event_tx)
             .with_tools(tool_registry.as_ref().clone())

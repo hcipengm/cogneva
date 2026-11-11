@@ -74,7 +74,7 @@ fn note_tool_update(partial: &mut String, chunk: &str) {
 ///
 /// 先得这件活自己声称要动这棵树：没有这份声明时，「工作树没动」不构成任何证据
 /// ——评审、规划、一段对话本来就不该动它，拿这一条去收它们，等于把「它做了本职
-/// 工作」读成「它没有进展」。声明随任务来（`Task::declares_change`），不随接手
+/// 工作」读成「它没有进展」。声明随任务来（`Task::deliverable`），不随接手
 /// 的人的角色来：同一个工程师换了件活，答案跟着那件活变。
 ///
 /// 再加上真的半小时没动、且已经提醒过两次，三条一起成立才是绕圈。
@@ -83,7 +83,7 @@ fn circling_unproductively(
     progress: &CheckoutProgress,
     now: std::time::Instant,
 ) -> bool {
-    config.declares_change && progress.circling(now)
+    config.declares_change() && progress.circling(now)
 }
 
 /// 一条运行在不改工作树的情况下，被提醒过两次之后还能再走多久。
@@ -8033,11 +8033,11 @@ mod tests {
         let declaring = cog_core::RuntimeConfig {
             agent_id: "kai-a9ab11fc".into(),
             role: cog_core::roles::PLANNER.into(),
-            declares_change: true,
+            deliverable: cog_core::Deliverable::Change,
             ..Default::default()
         };
         let quiet = cog_core::RuntimeConfig {
-            declares_change: false,
+            deliverable: cog_core::Deliverable::Unstated,
             ..declaring.clone()
         };
 
