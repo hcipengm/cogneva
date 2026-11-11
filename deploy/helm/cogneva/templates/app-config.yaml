@@ -184,7 +184,6 @@ data:
   # 走 in-memory 模式，凡是要跨重启活下来的状态就不能放在共享 memory 数据集里，
   # 得由其属主自己落到 app.data_dir 下。
   COGNEVA_MEMORY_ENABLED: "false"
-  COGNEVA_VECTOR_BACKEND_REQUIRED: "false"
   COGNEVA_STRICT_PERSISTENCE: "false"
   # 记忆衰减留在主 app：这条循环的单写者租约（角色 memory_decay）只回答「谁可以
   # 写」，不回答「写的那个人看到的是不是同一份数据」。本 Pod 的 memory 后端将来若

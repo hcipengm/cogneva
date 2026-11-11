@@ -89,7 +89,7 @@ impl cog_core::SystemPlugin for StreamPlugin {
                                 "RedisMessageBackend fallback failed: {}. Using in-memory.",
                                 e2
                             );
-                            Some(Arc::new(crate::MemoryMessageBackend::new()))
+                            Some(Arc::new(memory_fallback(&ctx.config().system)))
                         }
                     }
                 }
@@ -115,7 +115,7 @@ impl cog_core::SystemPlugin for StreamPlugin {
                         "RedisMessageBackend failed: {}. Using in-memory fallback.",
                         e
                     );
-                    Some(Arc::new(crate::MemoryMessageBackend::new()))
+                    Some(Arc::new(memory_fallback(&ctx.config().system)))
                 }
             }
         };
@@ -199,6 +199,18 @@ impl cog_core::SystemPlugin for StreamPlugin {
     }
 }
 
+/// The in-memory fallback, sized by the knob that names it.
+///
+/// `system.memory_message_broadcast_capacity` is the bound on how far a slow
+/// subscriber may fall behind before the channel reports a lag instead of
+/// holding more for it. The floor is not cosmetic: `broadcast::channel(0)`
+/// panics, and a deployment that writes 0 should lose the buffering, not the
+/// process at startup.
+fn memory_fallback(config: &cog_core::config::SystemConfig) -> crate::MemoryMessageBackend {
+    crate::MemoryMessageBackend::new()
+        .with_broadcast_capacity(config.memory_message_broadcast_capacity.max(1))
+}
+
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "stream",
@@ -206,3 +218,41 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     optional_requires: &[],
     factory: || Box::new(StreamPlugin::new()),
 };
+
+#[cfg(test)]
+mod tests {
+    use super::memory_fallback;
+    use cog_core::MessageBackend;
+    use futures::StreamExt;
+
+    /// The knob sizes the reader's window. With one slot, a reader that has not
+    /// consumed the first message loses it to the second and is told so; with
+    /// room to spare, both wait for it. Reading the value without this shape
+    /// would pass even if the capacity were still the old constant.
+    #[tokio::test]
+    async fn the_fallback_window_is_the_configured_capacity() {
+        let mut config = cog_core::config::SystemConfig::default();
+        config.memory_message_broadcast_capacity = 1;
+        let backend = memory_fallback(&config);
+        let mut narrow = backend.subscribe("subject", "reader").await.unwrap();
+        backend.publish("subject", b"one").await.unwrap();
+        backend.publish("subject", b"two").await.unwrap();
+        assert!(
+            narrow.next().await.unwrap().is_err(),
+            "a one-slot reader that has not read must be told the second publish overflowed it"
+        );
+
+        config.memory_message_broadcast_capacity = 8;
+        let roomy_backend = memory_fallback(&config);
+        let mut roomy = roomy_backend
+            .subscribe("subject", "reader")
+            .await
+            .unwrap();
+        roomy_backend.publish("subject", b"one").await.unwrap();
+        roomy_backend.publish("subject", b"two").await.unwrap();
+        assert!(
+            roomy.next().await.unwrap().is_ok(),
+            "eight slots hold two pending messages, so this reader must not report a lag"
+        );
+    }
+}

@@ -33,9 +33,6 @@ data:
         "sandbox_executor_url": "http://cogneva-sandbox-executor:9090",
         "require_tool_identity": false,
         "skill_hot_reload_interval_secs": 30,
-        "grpc_reconnect_interval_secs": 5,
-        "probe_timeout_secs": 5,
-        "http_timeout_secs": 10,
         "pattern_db_max_size": 256,
         "pattern_max_age_days": 30,
         "pg_max_connections": 16,
@@ -47,7 +44,6 @@ data:
         "websocket_event_cache_capacity": 1000,
         "anthropic_default_max_tokens": 4096,
         "strict_persistence": true,
-        "vector_backend_required": true,
         "_comment_plugin_filtering": "Plugin loading control. enabled_plugins = whitelist (omit for all). disabled_plugins = blacklist (applied when enabled_plugins is omitted).",
         "disabled_plugins": []
       },
@@ -57,7 +53,6 @@ data:
         "COGNEVA_APP_VERSION": "app.version",
         "COGNEVA_LOG_LEVEL": "app.log_level",
         "COGNEVA_DATA_DIR": "app.data_dir",
-        "COGNEVA_CONFIG_DIR": "app.config_dir",
         "COGNEVA_APP_DIR": "app.app_dir",
         "COGNEVA_DB_PROVIDER": "providers.db.provider",
         "COGNEVA_PG_PROVIDER": "providers.pg.provider",
@@ -145,9 +140,6 @@ data:
         "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS": "system.skill_hot_reload_interval_secs",
         "COGNEVA_LOOP_RESTART_MAX_CONSECUTIVE": "system.loop_restart_max_consecutive",
         "COGNEVA_LOOP_RESTART_BACKOFF_FLOOR_SECS": "system.loop_restart_backoff_floor_secs",
-        "COGNEVA_GRPC_RECONNECT_INTERVAL_SECS": "system.grpc_reconnect_interval_secs",
-        "COGNEVA_PROBE_TIMEOUT_SECS": "system.probe_timeout_secs",
-        "COGNEVA_HTTP_TIMEOUT_SECS": "system.http_timeout_secs",
         "COGNEVA_PATTERN_DB_MAX_SIZE": "system.pattern_db_max_size",
         "COGNEVA_PATTERN_MAX_AGE_DAYS": "system.pattern_max_age_days",
         "COGNEVA_PG_MAX_CONNECTIONS": "system.pg_max_connections",
@@ -174,16 +166,13 @@ data:
         "COGNEVA_STREAM_CAPACITY": "tuning.stream_capacity",
         "COGNEVA_HIGH_WATERMARK": "tuning.high_watermark",
         "COGNEVA_LOW_WATERMARK": "tuning.low_watermark",
-        "COGNEVA_MAX_SUMMARIES": "tuning.max_summaries",
-        "COGNEVA_STRICT_PERSISTENCE": "system.strict_persistence",
-        "COGNEVA_VECTOR_BACKEND_REQUIRED": "system.vector_backend_required"
+        "COGNEVA_STRICT_PERSISTENCE": "system.strict_persistence"
       },
       "app": {
         "name": "cogneva",
         "version": "0.1.0",
         "log_level": "info",
         "data_dir": "/var/lib/cogneva-data",
-        "config_dir": "/etc/cogneva",
         "app_dir": "/opt/cogneva"
       },
       "llm_routing": {
@@ -300,7 +289,6 @@ data:
         "workspace_id": "default",
         "consumer_group": "cogneva",
         "max_retries": 3,
-        "retry_delay_ms": 1000,
         "ready_task_poll_interval_secs": 5,
         "batch_persistence_enabled": false,
         "batch_persistence_max_changes": 10,
@@ -3903,8 +3891,7 @@ data:
       "tuning": {
         "stream_capacity": 256,
         "high_watermark": 1000,
-        "low_watermark": 100,
-        "max_summaries": 10
+        "low_watermark": 100
       },
       "prompts": {
         "_comment": "外部 prompt 模板目录，由 cogneva-prompts configmap 挂载；hot_reload 捕捉 configmap 交换（L0 配置晋级热更新通道）。",
@@ -3981,7 +3968,6 @@ data:
           "cpu_sample_gap_ms": 200,
           "reserve_fresh_secs": 900
         },
-        "notify_on_success": true,
         "notify_on_failure": true,
         "artifact_evolution": {
           "_comment": "Autonomous search over the meta-learning policy's tuning parameters (min_samples, margin). Each round replays the recorded decision outcomes under every candidate parameter set and adopts one only when a two-proportion z-test says it beats what the recommendation path is currently using; the winner is saved as a new version and hot-swapped. The input is this process's own recorded results, so it runs without LLM or network access. min_trials is the floor — below it the test cannot be significant and the round writes nothing. Ownership: the policy artifact lives under this process's own data dir, so this loop needs no per-deployment owner switch.",

@@ -42,7 +42,6 @@ pub const TUNING_ENV: &[(&str, &str)] = &[
     ("COGNEVA_STREAM_CAPACITY", "stream_capacity"),
     ("COGNEVA_HIGH_WATERMARK", "high_watermark"),
     ("COGNEVA_LOW_WATERMARK", "low_watermark"),
-    ("COGNEVA_MAX_SUMMARIES", "max_summaries"),
 ];
 
 /// LLM 后端配置。`api_key` 在 Debug 输出中脱敏，防止泄漏到日志。
@@ -125,7 +124,6 @@ pub struct TuningConfig {
     pub stream_capacity: usize,
     pub high_watermark: usize,
     pub low_watermark: usize,
-    pub max_summaries: usize,
 }
 
 impl TuningConfig {

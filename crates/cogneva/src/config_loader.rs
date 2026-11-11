@@ -61,7 +61,6 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert("COGNEVA_APP_VERSION".into(), "app.version".into());
     m.insert(cog_core::env::LOG_LEVEL.into(), "app.log_level".into());
     m.insert(cog_core::paths::DATA_DIR_ENV.into(), "app.data_dir".into());
-    m.insert("COGNEVA_CONFIG_DIR".into(), "app.config_dir".into());
     m.insert(cog_core::paths::APP_DIR_ENV.into(), "app.app_dir".into());
     // providers
     m.insert("COGNEVA_DB_PROVIDER".into(), "providers.db.provider".into());
@@ -400,18 +399,6 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert(
         "COGNEVA_SHELL_TIMEOUT_SECS".into(),
         "system.shell_timeout_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_GRPC_RECONNECT_INTERVAL_SECS".into(),
-        "system.grpc_reconnect_interval_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_PROBE_TIMEOUT_SECS".into(),
-        "system.probe_timeout_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_HTTP_TIMEOUT_SECS".into(),
-        "system.http_timeout_secs".into(),
     );
     m.insert(
         "COGNEVA_PARTITION_MAINTENANCE_INTERVAL_SECS".into(),
@@ -2094,7 +2081,7 @@ mod tests {
         let _g1 = EnvGuard::set("TEST_APP_NAME", "interpolated-app");
 
         let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
-        let json = r#"{ "app": { "name": "${TEST_APP_NAME}", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp" } }"#;
+        let json = r#"{ "app": { "name": "${TEST_APP_NAME}", "log_level": "info", "data_dir": "/tmp", "app_dir": "/tmp" } }"#;
         tmpfile.write_all(json.as_bytes()).unwrap();
 
         let config = from_json_file(tmpfile.path()).unwrap();

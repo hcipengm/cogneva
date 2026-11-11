@@ -73,7 +73,7 @@ pub const CONFIG_SECTIONS: &[ConfigSection] = &[
     section!(
         "app",
         RestartRequired,
-        "Reload covers app.log_level only. name/version/data_dir/config_dir/app_dir are read at startup."
+        "Reload covers app.log_level only. name/version/data_dir/app_dir are read at startup."
     ),
     section!(
         "gateway",

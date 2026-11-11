@@ -29,7 +29,6 @@ LimitNPROC=4096
 
 # Environment
 Environment="RUST_LOG=info"
-Environment="COGNEVA_CONFIG_DIR=/etc/cogneva"
 
 # Restart policy
 Restart=on-failure

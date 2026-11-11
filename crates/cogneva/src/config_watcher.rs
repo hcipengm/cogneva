@@ -135,7 +135,7 @@ mod watcher_tests {
         {
             let mut file = std::fs::File::create(&config_path).unwrap();
             file.write_all(
-                br#"{"app": {"name": "test-v1", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp"}}"#,
+                br#"{"app": {"name": "test-v1", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "app_dir": "/tmp"}}"#,
             )
             .unwrap();
         }
@@ -161,7 +161,7 @@ mod watcher_tests {
         {
             let mut file = std::fs::File::create(&config_path).unwrap();
             file.write_all(
-                br#"{"app": {"name": "test-v2", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp"}}"#,
+                br#"{"app": {"name": "test-v2", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "app_dir": "/tmp"}}"#,
             )
             .unwrap();
         }
@@ -190,7 +190,7 @@ mod watcher_tests {
         let config_path = dir.path().join("cogneva.json");
         std::fs::write(
             &config_path,
-            br#"{"app": {"name": "test-v1", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp"}}"#,
+            br#"{"app": {"name": "test-v1", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "app_dir": "/tmp"}}"#,
         )
         .unwrap();
 
@@ -222,7 +222,7 @@ mod watcher_tests {
         // The watcher is still live: the next complete write still lands.
         std::fs::write(
             &config_path,
-            br#"{"app": {"name": "test-v2", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp"}}"#,
+            br#"{"app": {"name": "test-v2", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "app_dir": "/tmp"}}"#,
         )
         .unwrap();
         tokio::time::timeout(Duration::from_secs(5), sub.changed())

@@ -70,9 +70,8 @@ pub struct AppInfo {
     pub name: String,
     pub version: String,
     pub log_level: String,
-    pub data_dir: String,   // see cog_core::paths::DATA_DIR
-    pub config_dir: String, // see cog_core::paths::CONFIG_DIR
-    pub app_dir: String,    // see cog_core::paths::APP_DIR
+    pub data_dir: String, // see cog_core::paths::DATA_DIR
+    pub app_dir: String,  // see cog_core::paths::APP_DIR
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,7 +194,6 @@ pub struct DagExecutorConfig {
     pub workspace_id: String,
     pub consumer_group: String,
     pub max_retries: u32,
-    pub retry_delay_ms: u64,
     #[serde(default = "default_ready_task_poll_interval_secs")]
     pub ready_task_poll_interval_secs: u64,
     /// How often the process holding a task writes a checkpoint of that task's
@@ -504,7 +502,6 @@ impl Default for DagExecutorConfig {
             workspace_id: String::new(),
             consumer_group: String::new(),
             max_retries: 3,
-            retry_delay_ms: 1000,
             ready_task_poll_interval_secs: default_ready_task_poll_interval_secs(),
             task_checkpoint_interval_secs: default_task_checkpoint_interval_secs(),
             scheduled_task_stall_secs: default_scheduled_task_stall_secs(),
@@ -1004,12 +1001,6 @@ pub struct SystemConfig {
     /// self-evolution deployment profile sets this true as a fail-closed gate.
     #[serde(default)]
     pub require_tool_identity: bool,
-    /// gRPC client reconnect interval (seconds).
-    pub grpc_reconnect_interval_secs: u64,
-    /// Health probe default timeout (seconds).
-    pub probe_timeout_secs: u64,
-    /// HTTP client default timeout for observability calls (seconds).
-    pub http_timeout_secs: u64,
     /// Maximum pattern DB size for ActionPlanOrchestrator.
     pub pattern_db_max_size: usize,
     /// Maximum pattern age in days for ActionPlanOrchestrator.
@@ -1034,8 +1025,6 @@ pub struct SystemConfig {
     pub anthropic_default_max_tokens: u32,
     /// When true, fail fast on missing persistence backends (no memory fallback).
     pub strict_persistence: bool,
-    /// When true, require a persistent vector backend for summary/embedding layer.
-    pub vector_backend_required: bool,
     /// Explicitly enabled system plugins. When `None`, all registered plugins are loaded.
     /// When `Some(list)`, only plugins whose names appear in the list are initialised.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1060,9 +1049,6 @@ impl Default for SystemConfig {
             shell_timeout_secs: 600,
             sandbox_executor_url: None,
             require_tool_identity: false,
-            grpc_reconnect_interval_secs: 5,
-            probe_timeout_secs: 5,
-            http_timeout_secs: 10,
             pattern_db_max_size: 256,
             pattern_max_age_days: 30,
             pg_max_connections: 50,
@@ -1075,7 +1061,6 @@ impl Default for SystemConfig {
             skill_hot_reload_interval_secs: 30,
             anthropic_default_max_tokens: 4096,
             strict_persistence: true,
-            vector_backend_required: true,
             enabled_plugins: None,
             disabled_plugins: Vec::new(),
         }
@@ -1641,7 +1626,6 @@ pub struct SelfEvolutionConfig {
     /// 一次并补上缺口，0 表示关闭重扫。补齐只读本地归档、不调 LLM，所以上游
     /// 断供时也该照跑。
     pub schema_repair_interval_secs: u64,
-    pub notify_on_success: bool,
     pub notify_on_failure: bool,
     /// Image-based 滚动更新；enabled=false 时忽略整块配置。
     pub image_rollout: ImageRolloutConfig,
@@ -1780,7 +1764,6 @@ impl Default for SelfEvolutionConfig {
             build_timeout_secs: 3600,
             poll_interval_secs: 60,
             schema_repair_interval_secs: 600,
-            notify_on_success: false,
             notify_on_failure: true,
             image_rollout: ImageRolloutConfig::default(),
             microvm: MicroVmConfig::default(),
