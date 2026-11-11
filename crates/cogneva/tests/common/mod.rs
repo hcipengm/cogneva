@@ -1,3 +1,4 @@
+pub mod config_consumption;
 pub mod config_surface;
 pub mod declared_once;
 pub mod fsio;

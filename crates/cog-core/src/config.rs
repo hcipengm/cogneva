@@ -174,8 +174,6 @@ impl std::fmt::Debug for NatsAuthConfig {
 pub struct NatsTlsConfig {
     pub enabled: bool,
     pub ca_cert_path: Option<String>,
-    pub client_cert_path: Option<String>,
-    pub client_key_path: Option<String>,
     pub insecure_skip_verify: bool,
 }
 

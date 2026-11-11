@@ -38,9 +38,7 @@ fn load_section_from<T: serde::de::DeserializeOwned + Default>(
 /// The env-var names this section answers to. Published so the deploy-config
 /// gate can tell "honored, but not by the core schema" from "honored by
 /// nobody".
-pub const TUNING_ENV: &[(&str, &str)] = &[
-    ("COGNEVA_STREAM_CAPACITY", "stream_capacity"),
-];
+pub const TUNING_ENV: &[(&str, &str)] = &[("COGNEVA_STREAM_CAPACITY", "stream_capacity")];
 
 /// LLM 后端配置。`api_key` 在 Debug 输出中脱敏，防止泄漏到日志。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +93,6 @@ impl Default for LLMBackendConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LLMRoutingConfig {
-    pub strategy: String,
     pub backends: Vec<LLMBackendConfig>,
     pub retry_on_429: bool,
     pub retry_on_402: bool,
@@ -152,12 +149,11 @@ mod tests {
         let path = dir.join("cogneva.json");
         std::fs::write(
             &path,
-            r#"{"llm_routing": {"strategy": "failover", "backends": [{"provider": "anthropic", "api_key": "sk-secret", "model": "claude"}]},
+            r#"{"llm_routing": {"backends": [{"provider": "anthropic", "api_key": "sk-secret", "model": "claude"}]},
                 "tuning": {"stream_capacity": 64}}"#,
         )
         .unwrap();
         let r = LLMRoutingConfig::load_from(&path).unwrap();
-        assert_eq!(r.strategy, "failover");
         assert_eq!(r.backends.len(), 1);
         // api_key 脱敏
         let dbg = format!("{:?}", r.backends[0]);

@@ -308,6 +308,120 @@ pub struct SectionShape {
     pub produced: BTreeSet<String>,
 }
 
+/// One field of a config type, with the document path it is written at.
+///
+/// This is the population a consumption census walks: what the type declares,
+/// not what the document happens to write. A field only reachable through a
+/// `#[serde(flatten)]` field keeps its parent's path, because that is the level
+/// the document writes it at; a flatten field's own name is not a key.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ConfigField {
+    /// The dotted path the document writes, `[]` marking a list element.
+    pub section_path: String,
+    /// The Rust identifier production code reads the field by.
+    pub ident: String,
+    /// The type that declares the field.
+    pub owner_type: String,
+    /// The crate the declaring type lives in.
+    pub owner_crate: String,
+}
+
+/// A struct's field as written in its declaration: identifier and type text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TypeField {
+    pub ident: String,
+    pub ty: String,
+}
+
+/// A struct's declaration, reduced to what a reader of access chains needs.
+#[derive(Clone)]
+pub struct TypeShape {
+    pub crate_name: String,
+    pub name: String,
+    pub fields: Vec<TypeField>,
+}
+
+impl TypeShape {
+    pub fn field(&self, ident: &str) -> Option<&TypeField> {
+        self.fields.iter().find(|field| field.ident == ident)
+    }
+}
+
+/// The inner type of a wrapper the code reads through by field access.
+///
+/// `state.config.read().unwrap().notification_limit` walks through `Arc`,
+/// `RwLock` and two calls; the type that owns `notification_limit` is the
+/// innermost argument. References are stripped before matching, so
+/// `&'a Arc<T>` unwraps to `T` here as well.
+pub fn container_inner(ty: &str) -> Option<String> {
+    let bare = strip_reference(ty);
+    if let Some((name, inner)) = generic_first_arg(bare) {
+        if matches!(
+            name.as_str(),
+            "Option"
+                | "Arc"
+                | "Rc"
+                | "Box"
+                | "RwLock"
+                | "Mutex"
+                | "RefCell"
+                | "Cell"
+                | "Cow"
+                | "Pin"
+                | "Vec"
+                | "BTreeSet"
+                | "HashSet"
+                | "VecDeque"
+        ) {
+            return Some(inner);
+        }
+    }
+    array_element(bare)
+}
+
+/// `path::Wrapper<first, rest>` → wrapper's last segment and first argument.
+///
+/// Unlike [`outer_arg`], the wrapper may be spelled with a full path
+/// (`std::sync::Arc<T>`); the text before `<` is read as a path and only its
+/// last segment decides whether the shape is a wrapper.
+fn generic_first_arg(ty: &str) -> Option<(String, String)> {
+    let bare = strip_reference(ty).trim();
+    let open = bare.find('<')?;
+    let head = bare[..open].trim();
+    if head.is_empty() || !head.contains("::") && !head.chars().next()?.is_alphanumeric() {
+        return None;
+    }
+    let rest = &bare[open + 1..];
+    let mut depth = 1i64;
+    let mut end = None;
+    for (index, c) in rest.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    if !rest[end + 1..].trim().is_empty() {
+        return None;
+    }
+    let first = split_top(&rest[..end], ',')
+        .into_iter()
+        .next()?
+        .trim()
+        .to_string();
+    if first.is_empty() {
+        return None;
+    }
+    Some((last_segment(head), first))
+}
+
 /// Check one section-shaped value against the reader that takes it, and every
 /// key inside it — including a key a nested reader takes by pointer.
 pub fn check_section(
@@ -374,6 +488,10 @@ pub fn section_shapes(
 /// A parsed field of a config type.
 #[derive(Clone)]
 struct FieldInfo {
+    /// The Rust identifier the production code reads the field by. The
+    /// canonical name is what the document writes; they differ wherever serde
+    /// renames, and a census of readers has to look for the identifier.
+    ident: String,
     /// The name the type writes back out.
     canonical: String,
     /// Every name the type accepts on the way in: the canonical one plus the
@@ -469,6 +587,180 @@ impl TypeGraph {
             definitions,
             parsed: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    /// Every field the reader types declare, with the document path it is
+    /// written at and the type that declares it.
+    ///
+    /// The population is the declarations, not a delivered document: a field
+    /// the chart omits is still a field the process reads (and the knob gate
+    /// already judges whether some document writes it).
+    pub fn config_fields(&self, readers: &[Reader]) -> Vec<ConfigField> {
+        let mut out = Vec::new();
+        for reader in readers {
+            if matches!(reader.section, "_comment" | "env") {
+                continue;
+            }
+            self.collect_reader_fields(reader, reader.section, &mut out);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn collect_reader_fields(&self, reader: &Reader, path: &str, out: &mut Vec<ConfigField>) {
+        if let Some(info) = self.reader_type(reader.type_name) {
+            let mut stack = Vec::new();
+            self.collect_type_fields(&info, path, &mut stack, out);
+        }
+        for nested in &reader.nested {
+            self.collect_reader_fields(nested, &format!("{path}.{}", nested.section), out);
+        }
+    }
+
+    fn collect_type_fields(
+        &self,
+        info: &Rc<TypeInfo>,
+        path: &str,
+        stack: &mut Vec<(String, String)>,
+        out: &mut Vec<ConfigField>,
+    ) {
+        let key = (info.crate_name.clone(), info.name.clone());
+        if stack.contains(&key) {
+            return;
+        }
+        stack.push(key);
+        for field in &info.fields {
+            if field.skip || field.skip_deserializing {
+                continue;
+            }
+            if field.flatten {
+                // A flattened field's own name is not a document key: its
+                // subfields sit at the parent's level.
+                if let Shape::Struct(sub) = self.classify(&field.ty, info) {
+                    self.collect_type_fields(&sub, path, stack, out);
+                }
+                continue;
+            }
+            let field_path = format!("{path}.{}", field.canonical);
+            out.push(ConfigField {
+                section_path: field_path.clone(),
+                ident: field.ident.clone(),
+                owner_type: info.name.clone(),
+                owner_crate: info.crate_name.clone(),
+            });
+            match self.classify(&field.ty, info) {
+                Shape::Struct(sub) => {
+                    self.collect_type_fields(&sub, &field_path, stack, out);
+                }
+                Shape::Seq(element) => {
+                    if let Shape::Struct(sub) = *element {
+                        self.collect_type_fields(&sub, &format!("{field_path}[]"), stack, out);
+                    }
+                }
+                Shape::Map | Shape::Leaf => {}
+            }
+        }
+        stack.pop();
+    }
+
+    /// 这个名字是否在多个 crate 里都有声明：裸名解析会撞车，读的一方必须补全。
+    pub fn ambiguous_name(&self, name: &str) -> bool {
+        self.definitions
+            .keys()
+            .filter(|(_, declared)| declared == name)
+            .count()
+            > 1
+    }
+
+    /// 声明索引里有没有这个 `(crate, 类型名)`。
+    pub fn declared_in(&self, crate_name: &str, name: &str) -> bool {
+        self.definitions
+            .contains_key(&(crate_name.to_string(), name.to_string()))
+    }
+
+    /// A named struct's declaration, for resolving an access chain's receiver.
+    ///
+    /// `from_crate` is the crate the name was written in; a bare name is looked
+    /// up there first, then across the tree if exactly one crate declares it.
+    /// `from_path` lets the definition index prefer the module the crate's
+    /// layout implies, the same way [`Self::classify`] does.
+    pub fn shape_named(
+        &self,
+        ty: &str,
+        from_crate: &str,
+        from_path: Option<&Path>,
+    ) -> Option<TypeShape> {
+        let bare = strip_reference(ty).trim();
+        if bare.is_empty() || container_inner(bare).is_some() {
+            return None;
+        }
+        let prefer = from_path.unwrap_or_else(|| Path::new(""));
+        let candidates: Vec<(String, String)> = if let Some(rest) = bare
+            .strip_prefix("crate::")
+            .or_else(|| bare.strip_prefix("self::"))
+            .or_else(|| bare.strip_prefix("super::"))
+        {
+            vec![(from_crate.to_string(), last_segment(rest))]
+        } else if bare.contains("::") {
+            let first = bare.split("::").next().unwrap_or_default().to_string();
+            if self
+                .definitions
+                .keys()
+                .any(|(crate_name, _)| crate_name == &first)
+            {
+                vec![(first, last_segment(bare))]
+            } else {
+                // `use config::X` 这样的 uniform path：相对当前 crate 的模块路径。
+                // 名字在别的 crate 里同样存在时，由 `type_info` 在下面判空。
+                vec![(from_crate.to_string(), last_segment(bare))]
+            }
+        } else {
+            let same = self
+                .definitions
+                .contains_key(&(from_crate.to_string(), bare.to_string()));
+            if same {
+                vec![(from_crate.to_string(), bare.to_string())]
+            } else {
+                let found: Vec<(String, String)> = self
+                    .definitions
+                    .keys()
+                    .filter(|(_, name)| name == bare)
+                    .cloned()
+                    .collect();
+                if found.len() == 1 {
+                    found
+                } else {
+                    return None;
+                }
+            }
+        };
+        for (crate_name, name) in candidates {
+            let preferred_path = if prefer.as_os_str().is_empty() {
+                None
+            } else {
+                Some(prefer)
+            };
+            let Some(info) = self.type_info(&crate_name, &name, preferred_path) else {
+                continue;
+            };
+            if info.kind != TypeKind::Struct {
+                return None;
+            }
+            return Some(TypeShape {
+                crate_name: info.crate_name.clone(),
+                name: info.name.clone(),
+                fields: info
+                    .fields
+                    .iter()
+                    .map(|field| TypeField {
+                        ident: field.ident.clone(),
+                        ty: field.ty.clone(),
+                    })
+                    .collect(),
+            });
+        }
+        None
     }
 
     /// The shape of `value` read as `T`, without a document or a reader: the
@@ -1064,7 +1356,19 @@ fn parse_fields(path: &Path, owner: &str, body: &str, rename_all: Option<&str>) 
             i += 1;
             continue;
         }
-        if line.starts_with("#[") || line.starts_with("///") || line.starts_with("//!") {
+        if line.starts_with("#[") {
+            // 属性可以写多行：`#[serde(\n default,\n ...\n)]`。
+            let mut attr = line.to_string();
+            while !attr.trim_end().ends_with(']') && i + 1 < lines.len() {
+                i += 1;
+                attr.push(' ');
+                attr.push_str(strip_line_comment(lines[i]).trim());
+            }
+            pending.push(attr);
+            i += 1;
+            continue;
+        }
+        if line.starts_with("///") || line.starts_with("//!") {
             pending.push(line.to_string());
             i += 1;
             continue;
@@ -1075,7 +1379,8 @@ fn parse_fields(path: &Path, owner: &str, body: &str, rename_all: Option<&str>) 
                 path.display()
             );
         };
-        while !type_complete(&ty) && i + 1 < lines.len() {
+        // 类型可以写在冒号下一行：`pub hook:\n    Option<...>`。
+        while (ty.is_empty() || !type_complete(&ty)) && i + 1 < lines.len() {
             i += 1;
             ty.push(' ');
             ty.push_str(strip_line_comment(lines[i]).trim());
@@ -1098,6 +1403,7 @@ fn parse_fields(path: &Path, owner: &str, body: &str, rename_all: Option<&str>) 
         let mut accepted = vec![canonical.clone()];
         accepted.extend(aliases);
         fields.push(FieldInfo {
+            ident,
             canonical,
             accepted,
             ty: ty.trim().trim_end_matches(',').trim().to_string(),
@@ -1119,9 +1425,6 @@ fn field_start(line: &str) -> Option<(String, String)> {
         return None;
     }
     let ty = line[colon + 1..].trim();
-    if ty.is_empty() {
-        return None;
-    }
     Some((ident.to_string(), ty.to_string()))
 }
 
@@ -1129,7 +1432,8 @@ fn type_complete(ty: &str) -> bool {
     let mut depth = 0i64;
     let mut in_string = false;
     let mut escaped = false;
-    for c in ty.chars() {
+    let mut chars = ty.chars().peekable();
+    while let Some(c) = chars.next() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -1142,6 +1446,10 @@ fn type_complete(ty: &str) -> bool {
         }
         match c {
             '"' => in_string = true,
+            // 返回类型里的 `->`：`>` 不是泛型的闭合，不能减深度。
+            '-' if chars.peek() == Some(&'>') => {
+                chars.next();
+            }
             '<' | '(' | '[' => depth += 1,
             '>' | ')' | ']' => depth -= 1,
             _ => {}
@@ -1208,8 +1516,11 @@ fn outer_arg(ty: &str, outer: &str) -> Option<String> {
 
 fn array_element(ty: &str) -> Option<String> {
     let rest = ty.strip_prefix('[')?;
-    let (element, _) = rest.split_once(';')?;
-    Some(element.trim().to_string())
+    // `[T; N]` 与切片 `[T]` 的元素类型都是 `T`。
+    if let Some((element, _)) = rest.split_once(';') {
+        return Some(element.trim().to_string());
+    }
+    Some(rest.strip_suffix(']')?.trim().to_string())
 }
 
 fn strip_reference(ty: &str) -> &str {

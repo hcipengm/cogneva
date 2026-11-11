@@ -2205,7 +2205,6 @@ mod tests {
             name: "TokenBudget".into(),
             rule_type: cog_core::RuleType::Hard,
             threshold: Some(threshold),
-            description: "no task may be estimated above the threshold".into(),
             enabled,
         }
     }
