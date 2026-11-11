@@ -4047,10 +4047,10 @@
       "_comment_max_changed_lines": "null = no ceiling. A ceiling here is what made a batched demand unlandable and therefore split into one task per item, and the split is what costs: every attempt pays a plan, a generation and a validation run whatever its size. Set a number only if you want a bound on one change's blast radius more than you want the merged form.",
       "forbidden_paths": [
         ".github/workflows",
-        "deploy/",
         "secrets/",
         "*.lock"
       ],
+      "_comment_forbidden_paths": "deploy/ is deliberately absent: deploy changes are judged by the deploy admission gate (render freshness, parity, rollback, dry-run on the applied tree), so forbidding the path here would refuse them before that gate could run. The entries that stay have no executable judge.",
       "revert_on_ci_failure": true,
       "redrive_on_ci_failure": true,
       "ci_watch_timeout_secs": 1800,

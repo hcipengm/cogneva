@@ -373,9 +373,17 @@ impl Default for LandingPolicy {
     fn default() -> Self {
         Self {
             max_changed_lines: None,
+            // `deploy/` is not on this list on purpose. It used to be, and the
+            // two guards together meant a deploy change could never land: the
+            // whitelist let the path in, this list then refused it, and the
+            // deploy admission gate -- which runs the render, parity and
+            // dry-run checks on the applied tree -- was never reached. The
+            // family is now judged by that gate instead of by its path. The
+            // entries that remain have no executable judge: workflows define
+            // who may run what, `secrets/` is credentials, and lock files are
+            // a supply-chain decision.
             forbidden_paths: vec![
                 ".github/workflows".into(),
-                "deploy/".into(),
                 "secrets/".into(),
                 "*.lock".into(),
             ],
@@ -784,6 +792,52 @@ mod tests {
         let root = repo_root();
         assert_surface_matches(&root.join("cogneva.example.json"));
         assert_surface_matches(&root.join("deploy/helm/cogneva/files/cogneva.json"));
+    }
+
+    /// 部署族由准入条件判，不由路径判：默认策略与两份交付模板都不能再禁止
+    /// `deploy/`。三个写点必须一起动——只改代码默认，部署里那份配置照旧把
+    /// 每一笔部署变更挡在落地之外，部署准入门（渲染、parity、回滚、dry-run）
+    /// 根本没有机会跑，读者看到的是「部署变更永远落不了地」而没有一句原因。
+    #[test]
+    fn deploy_is_judged_by_admission_not_by_the_landing_path_policy() {
+        let probe = "deploy/helm/cogneva/values.yaml";
+        let default = LandingPolicy::default();
+        assert!(
+            !default
+                .forbidden_paths
+                .iter()
+                .any(|p| crate::landing::path_forbidden(probe, p)),
+            "默认落地策略仍然禁止 `deploy/`：部署变更会在准入门之前被拒收"
+        );
+        // 其余几条仍在：这次只放部署族过去，别把别的守卫一起撤了。
+        for guarded in [".github/workflows/ci.yml", "secrets/x.yaml", "Cargo.lock"] {
+            assert!(
+                default
+                    .forbidden_paths
+                    .iter()
+                    .any(|p| crate::landing::path_forbidden(guarded, p)),
+                "`{guarded}` 不再被默认策略拦：撤部署那条时把手边的守卫一起撤掉了"
+            );
+        }
+
+        for template in ["cogneva.example.json", "deploy/helm/cogneva/files/cogneva.json"] {
+            let raw = std::fs::read_to_string(repo_root().join(template))
+                .unwrap_or_else(|e| panic!("读不到 {template}：{e}"));
+            let doc: serde_json::Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("{template} 不是合法 JSON：{e}"));
+            let patterns: Vec<&str> = doc
+                .pointer("/github_integration/landing_policy/forbidden_paths")
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("{template} 没有 github_integration.landing_policy.forbidden_paths"))
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                !patterns.iter().any(|p| crate::landing::path_forbidden(probe, p)),
+                "{template} 的 forbidden_paths 仍然禁止 `deploy/`：与部署准入条件重复且相斥，\
+                 部署变更到不了准入门"
+            );
+        }
     }
 
     #[test]

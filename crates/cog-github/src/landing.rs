@@ -2416,7 +2416,7 @@ fn workspace_members() -> &'static BTreeSet<String> {
 /// A leading `*` matches a filename suffix (`.lock` files), a trailing `/`
 /// matches a directory prefix, and anything else matches the path exactly or
 /// as a prefix. Deliberately small: these are path guards, not a glob engine.
-fn path_forbidden(path: &str, pattern: &str) -> bool {
+pub(crate) fn path_forbidden(path: &str, pattern: &str) -> bool {
     let p = path.strip_prefix("./").unwrap_or(path);
     if let Some(suffix) = pattern.strip_prefix('*') {
         return p.ends_with(suffix);
