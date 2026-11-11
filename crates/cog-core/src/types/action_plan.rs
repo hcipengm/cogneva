@@ -136,7 +136,6 @@ pub struct BoundaryRule {
     pub rule_type: RuleType,
     #[serde(default)]
     pub threshold: Option<u64>,
-    pub description: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -475,7 +474,6 @@ mod tests {
             name: "OutputQuality".into(),
             rule_type: RuleType::Soft,
             threshold: None,
-            description: "代码输出必须包含单元测试".into(),
             enabled: true,
         };
         assert_eq!(rule.name, "OutputQuality");

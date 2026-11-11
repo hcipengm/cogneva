@@ -231,8 +231,10 @@ mod tests {
     /// would pass even if the capacity were still the old constant.
     #[tokio::test]
     async fn the_fallback_window_is_the_configured_capacity() {
-        let mut config = cog_core::config::SystemConfig::default();
-        config.memory_message_broadcast_capacity = 1;
+        let config = cog_core::config::SystemConfig {
+            memory_message_broadcast_capacity: 1,
+            ..Default::default()
+        };
         let backend = memory_fallback(&config);
         let mut narrow = backend.subscribe("subject", "reader").await.unwrap();
         backend.publish("subject", b"one").await.unwrap();
@@ -242,7 +244,10 @@ mod tests {
             "a one-slot reader that has not read must be told the second publish overflowed it"
         );
 
-        config.memory_message_broadcast_capacity = 8;
+        let config = cog_core::config::SystemConfig {
+            memory_message_broadcast_capacity: 8,
+            ..Default::default()
+        };
         let roomy_backend = memory_fallback(&config);
         let mut roomy = roomy_backend
             .subscribe("subject", "reader")

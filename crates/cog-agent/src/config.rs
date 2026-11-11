@@ -88,7 +88,6 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
 ];
 
 const AGENT_POOL_ENV: &[(&str, &str)] = &[
-    ("COGNEVA_AGENT_POOL_ENABLED", "enabled"),
     ("COGNEVA_AGENT_POOL_WORKER_COUNT", "worker_count"),
     ("COGNEVA_AGENT_POOL_WORKER_ROLE", "worker_role"),
 ];
@@ -237,7 +236,6 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentManagerConfig {
-    pub enabled: bool,
     /// 操作者自己写下的并发上限；0 表示不写，此时只有资源读数约束并发。
     ///
     /// 它曾经是并发本身：写 3 就同时跑 3 个任务，谁也不问容器装不装得下。
@@ -250,7 +248,6 @@ pub struct AgentManagerConfig {
 impl Default for AgentManagerConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             worker_count: 0,
             worker_role: cog_core::roles::PLANNER.into(),
         }
@@ -283,7 +280,6 @@ mod tests {
         assert_eq!(l.max_iterations, None);
         assert_eq!(l.eval_max_iterations, None);
         let p = AgentManagerConfig::default();
-        assert!(p.enabled);
         // 0 = 不声明上限：默认并发由资源读数决定，不再是一个写死的数。
         assert_eq!(p.worker_count, 0);
     }

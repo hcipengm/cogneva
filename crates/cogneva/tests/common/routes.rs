@@ -268,6 +268,28 @@ pub fn matching_in(
     None
 }
 
+/// 调用方只在 `blanked` 上工作时的配平，偏移全是 `blanked` 自己的字节偏移。
+///
+/// [`matching_in`] 要把字符下标译回**原文**的字节偏移，为此每次调用都要数一遍前缀的
+/// 字符数、再逐字符 zip 两份文本；而有的调用方（按 `blanked` 切段读访问链的普查）
+/// 本来就只在 `blanked` 的坐标系里定位，这份翻译是白做的，热路径上它把一道普查从
+/// 秒级拖到分钟级。UTF-8 的续字节都 ≥ 0x80，扫字节不会把多字节字符误认成 ASCII
+/// 括号，所以单份 `blanked` 上按字节配平是安全的。
+pub fn matching_blanked(blanked: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
+    let mut depth = 0i32;
+    for (at, byte) in blanked.bytes().enumerate().skip(open.min(blanked.len())) {
+        if byte == opening {
+            depth += 1;
+        } else if byte == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at);
+            }
+        }
+    }
+    None
+}
+
 /// The offset of the paren closing the one at `open`, skipping spans inside
 /// a string or a comment because a bracket there is not a bracket.
 ///

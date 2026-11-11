@@ -174,7 +174,6 @@ data:
       },
       "llm_routing": {
         "_comment": "多 LLM 故障转移。api_style 声明兼容的 API 风格：openai 或 anthropic。默认 openai。",
-        "strategy": "failover",
         "retry_on_429": true,
         "retry_on_402": true,
         "max_failover_attempts": 3,
@@ -264,8 +263,6 @@ data:
           "tls": {
             "enabled": false,
             "ca_cert_path": null,
-            "client_cert_path": null,
-            "client_key_path": null,
             "insecure_skip_verify": false
           },
           "_comment_consumer": "消费者侧的界与自动建流的保留策略。ack 等待要盖过最坏单条处理时延（记忆摄取含归档与两次 LLM 调用，分钟级），否则处理途中重投会重复消费；max_deliver 是毒药消息的判定，超次写 DLQ 后 ack 终止；max_ack_pending 是背压闸门，积压留在流里而不是消费进程内存里。stream_retention 默认 workqueue（任一消费组 ack 后即删，任务分发语义）；事件面等多订阅方场景必须是 limits，否则先 ack 的组会把消息从别的组嘴里删掉——注意既有流上不能把 retention 改入/改出 workqueue，改它只能删流重建。",
@@ -420,14 +417,12 @@ data:
             "name": "TokenBudget",
             "rule_type": "hard",
             "threshold": 100000,
-            "description": "单个任务的 estimated_tokens 不得超过阈值",
             "enabled": true
           },
           {
             "name": "OutputQuality",
             "rule_type": "soft",
             "threshold": null,
-            "description": "生成输出必须满足以下质量标准：1) 代码必须包含单元测试 2) 文档必须完整 3) 无已知安全漏洞",
             "enabled": true
           }
         ]
@@ -3886,7 +3881,6 @@ data:
         "hot_reload": true
       },
       "agent_pool": {
-        "enabled": true,
         "_comment_worker_count": "并发上限，操作者自己写下的数，0 = 不声明。实际并发由容器内存读数与单任务实测开销每三十秒算一次，比它更紧时以它为准；量不到单任务开销时（本平台的活跑在沙箱 Pod 里，这个进程的内存读数不随它变）这个数是唯一的界，不写就永远停在 1。",
         "worker_count": 3,
         "worker_role": "planner"
