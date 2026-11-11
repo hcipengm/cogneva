@@ -179,6 +179,90 @@ async fn the_agent_entry_point_forwards_the_task_to_every_review_call() {
     }
 }
 
+/// 记下每次请求的正文，并回答一张能通过的要求表。
+///
+/// 要求表的每一行都要有 `spec_quote` 且能在规格里找到，否则它会被判成没判过——
+/// 这条测试量的是请求里带着什么，替身的回答必须能过，才轮得到量。
+struct TableRecordingLlm {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl LlmClient for TableRecordingLlm {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _options: &ChatOptions,
+    ) -> SFResult<AssistantMessageEventStream> {
+        unimplemented!("the review loop asks non-streaming")
+    }
+
+    async fn complete_stream(
+        &self,
+        _prompt: &str,
+        _options: &CompleteOptions,
+    ) -> SFResult<AssistantMessageEventStream> {
+        unimplemented!("the review loop asks non-streaming")
+    }
+
+    async fn chat(&self, messages: &[Message], _options: &ChatOptions) -> SFResult<ChatResponse> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(messages.last().map(|m| m.content()).unwrap_or_default());
+        let body = r#"{"rows":[
+             {"requirement":"names the file","spec_quote":"name the file","status":"met",
+              "evidence":"it says docs/quickstart.md"}]}"#;
+        Ok(ChatResponse {
+            content: vec![ContentBlock::text(body)],
+            ..Default::default()
+        })
+    }
+
+    async fn health_check(&self) -> bool {
+        true
+    }
+}
+
+/// 运行时就带着「有人就这件活说过的方向」，判它的时候那份方向要到请求上。
+///
+/// 这一层同样是编译得过的丢参数：运行时里有一格，`self_review_loop` 不抄给循环，
+/// 判活的尺子上就没有它——人说了话，而读数上「说过了」与「没人说」同形。
+#[tokio::test]
+async fn an_agent_carries_the_direction_it_was_given_into_its_review() {
+    const DIRECTION: &str = "prefers \"quoting the failing line\" over \"a prose verdict\": \
+                             prose verdicts could not be checked";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        RuntimeConfig {
+            role: "generator".into(),
+            stated_directions: vec![DIRECTION.into()],
+            ..Default::default()
+        },
+        Arc::new(TableRecordingLlm { seen: seen.clone() }),
+    );
+    let config = SelfReviewConfig {
+        max_iterations: 1,
+        quality_threshold: 0.5,
+        revise: false,
+        spec: Some("name the file".into()),
+        best_practices: Vec::new(),
+    };
+
+    let _ = AgentContract::review_and_revise(&agent, "draft", &config)
+        .await
+        .unwrap();
+
+    let payloads = seen.lock().unwrap().clone();
+    let payload = payloads.last().expect("the agent asked something");
+    let request: serde_json::Value = serde_json::from_str(payload).expect("请求是 JSON");
+    let rubric = request["rubric"].as_str().unwrap_or_default();
+    assert!(
+        rubric.contains(DIRECTION),
+        "运行时带着方向，判活时却没到请求上：这一层把它丢了\n{rubric}"
+    );
+}
+
 /// 不带任务的那个入口不编一个 id 出来：同一层包装，少一格就必须真的少一格。
 #[tokio::test]
 async fn the_agent_entry_point_without_a_task_carries_no_task_header() {

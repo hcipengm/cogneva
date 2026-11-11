@@ -15,6 +15,7 @@ async fn test_agent_loop_restore_preserves_context() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "restore-agent".into(),
             role: "planner".to_string(),
             max_iterations: 3,
@@ -51,6 +52,7 @@ async fn test_agent_loop_restore_preserves_context() {
     let (event_tx2, _event_rx2) = mpsc::channel(128);
     let mut restored_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "restore-agent".into(),
             role: "planner".to_string(),
             max_iterations: 3,
@@ -82,6 +84,7 @@ async fn test_agent_loop_restore_changes_role_and_state() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "role-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -104,6 +107,7 @@ async fn test_agent_loop_restore_changes_role_and_state() {
     let (event_tx2, _event_rx2) = mpsc::channel(128);
     let mut restored_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "role-agent".into(),
             role: "generator".to_string(),
             max_iterations: 2,
@@ -130,6 +134,7 @@ async fn test_agent_loop_restore_changes_role_and_state() {
 async fn test_agent_snapshot_and_restore() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "wrapper-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -178,6 +183,7 @@ async fn test_agent_snapshot_and_restore() {
 async fn test_agent_restore_allows_continue() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "continue-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -232,6 +238,7 @@ async fn test_snapshot_event_replay_with_wal() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "replay-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -271,6 +278,7 @@ async fn test_snapshot_event_replay_with_wal() {
     let (event_tx2, _event_rx2) = mpsc::channel(128);
     let mut restored_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "replay-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -316,6 +324,7 @@ async fn test_snapshot_without_wal_has_zero_offset() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "no-wal-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -341,6 +350,7 @@ async fn test_restore_resets_steps() {
     let (event_tx, _event_rx) = mpsc::channel(128);
     let mut agent_loop = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "steps-agent".into(),
             role: "planner".to_string(),
             max_iterations: 2,

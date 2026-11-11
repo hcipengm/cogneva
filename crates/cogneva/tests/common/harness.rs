@@ -367,6 +367,7 @@ impl TestHarness {
     /// Build a default [`SquadConfig`] for the given goal.
     pub fn squad_config_for_goal(goal: &str) -> SquadConfig {
         SquadConfig {
+            stated_directions: Vec::new(),
             goal: goal.into(),
             context: serde_json::json!({}),
             pge_mode: PgeMode::Pipeline,

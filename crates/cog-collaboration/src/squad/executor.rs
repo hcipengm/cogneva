@@ -50,6 +50,11 @@ pub struct SquadConfig {
     /// 不该因为工作树没动被收住，而做变更的人该。所以它不是「这件任务整体是
     /// 不是变更」，是这一份活交给谁、判成什么。
     pub deliverable: cog_core::Deliverable,
+    /// 有人就这件活说过的方向，原文照录（`Task::stated_directions`）。
+    ///
+    /// 与 `deliverable` 成对：前者说交什么，这一格说往哪儿算好。每个座位都带着它
+    /// 建 agent——判据是每个座位判自己产出的那把尺子，不只产出改动的那一个。
+    pub stated_directions: Vec<String>,
     /// 通过 Skill ID 指定 Planner 角色的 prompt/schema 来源（None = 内置默认）。
     pub planner_skill_id: Option<String>,
     /// 通过 Skill ID 指定 Generator 角色的 prompt/schema 来源。
@@ -70,6 +75,7 @@ impl Default for SquadConfig {
             boundary_config: None,
             is_self_evolution: false,
             deliverable: cog_core::Deliverable::Unstated,
+            stated_directions: Vec::new(),
             planner_skill_id: None,
             generator_skill_id: None,
             evaluator_skill_id: None,
@@ -466,6 +472,7 @@ impl SquadExecutor {
                 &squad.task_id,
                 cog_core::roles::PLANNER,
                 cog_core::Deliverable::Plan,
+                squad.config.stated_directions.clone(),
             )
             .await
             {
@@ -519,6 +526,7 @@ impl SquadExecutor {
                 &squad.task_id,
                 cog_core::roles::GENERATOR,
                 squad.config.deliverable,
+                squad.config.stated_directions.clone(),
             )
             .await
             {
@@ -539,6 +547,7 @@ impl SquadExecutor {
                 &squad.task_id,
                 cog_core::roles::EVALUATOR,
                 cog_core::Deliverable::Judgement,
+                squad.config.stated_directions.clone(),
             )
             .await
             {
@@ -614,6 +623,7 @@ impl SquadExecutor {
                     &squad.task_id,
                     cog_core::roles::PLANNER,
                     cog_core::Deliverable::Plan,
+                    squad.config.stated_directions.clone(),
                 )
                 .await;
                 let generator = crate::resume::create_role_agent(
@@ -623,6 +633,7 @@ impl SquadExecutor {
                     &squad.task_id,
                     cog_core::roles::GENERATOR,
                     squad.config.deliverable,
+                    squad.config.stated_directions.clone(),
                 )
                 .await;
                 let evaluator = crate::resume::create_role_agent(
@@ -632,6 +643,7 @@ impl SquadExecutor {
                     &squad.task_id,
                     cog_core::roles::EVALUATOR,
                     cog_core::Deliverable::Judgement,
+                    squad.config.stated_directions.clone(),
                 )
                 .await;
                 // Moderator is optional — failure to create it is non-fatal.
@@ -642,6 +654,7 @@ impl SquadExecutor {
                     &squad.task_id,
                     cog_core::roles::MODERATOR,
                     cog_core::Deliverable::Answer,
+                    squad.config.stated_directions.clone(),
                 )
                 .await
                 .ok();
@@ -772,6 +785,7 @@ impl SquadExecutor {
                                 &squad.task_id,
                                 cog_core::roles::MERGER,
                                 cog_core::Deliverable::Answer,
+                                squad.config.stated_directions.clone(),
                             )
                             .await
                             {

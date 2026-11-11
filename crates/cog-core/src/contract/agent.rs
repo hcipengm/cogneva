@@ -100,6 +100,15 @@ pub struct RuntimeConfig {
     /// 不是默认的 `WorkProduct`，是为了让「没人说」与「有人说是工作产物」在读数里
     /// 分得开。
     pub deliverable: crate::Deliverable,
+    /// 有人就这件活说过的方向，原文照录（见 [`crate::Task::stated_directions`]）。
+    ///
+    /// 与 `deliverable` 同一个理由、同一条路：运行时没有任务对象，「这一轮什么算好」
+    /// 里那些来自人的话只有拿到任务的那一层抄得进来。判别的时候贴在判据后面，判据
+    /// 本身不动——方向改的是「往哪儿算好」，不是「什么算完整」。
+    ///
+    /// 空表示没人就这件活说过方向。空不是「没有偏好」：它只说明这一条通道上没人
+    /// 开口，而不是说人没有意见。
+    pub stated_directions: Vec<String>,
 }
 
 impl RuntimeConfig {
@@ -136,6 +145,7 @@ impl Default for RuntimeConfig {
             squad_id: None,
             owner_task_id: None,
             deliverable: crate::Deliverable::Unstated,
+            stated_directions: Vec::new(),
         }
     }
 }
@@ -550,6 +560,11 @@ pub trait AgentManager: Send + Sync {
     /// 而判它的是运行时。缺省实现忽略这一位、退化成 [`Self::create_agent`]：一个
     /// 还不知道怎么用它的管理器不会因此编造答案，只是那位 agent 拿着 `Unstated`
     /// 跑——而这正是没有声明时的行为。真正把它传进运行时的管理器要覆盖它。
+    ///
+    /// `stated_directions` 是同一份声明的另一半：有人就这件活说过的方向（见
+    /// [`crate::Task::stated_directions`]）。它和 `deliverable` 一起传，是因为两者
+    /// 回答的是同一次运行的两个问题——「交什么」与「往哪儿算好」——只传前一个
+    /// 的话，判活的标准仍是没人说话的那一份。
     async fn create_agent_declaring(
         &self,
         agent_id: &str,
@@ -557,8 +572,9 @@ pub trait AgentManager: Send + Sync {
         llm: std::sync::Arc<dyn crate::llm::LlmClient>,
         task_id: Option<&str>,
         deliverable: crate::Deliverable,
+        stated_directions: Vec<String>,
     ) -> crate::SFResult<std::sync::Arc<dyn crate::Agent>> {
-        let _ = deliverable;
+        let _ = (deliverable, stated_directions);
         self.create_agent(agent_id, role, llm, task_id).await
     }
 

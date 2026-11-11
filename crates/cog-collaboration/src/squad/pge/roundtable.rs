@@ -948,15 +948,17 @@ impl PgeRoundtable {
 
         let prefix = format!("{}-branch-{}", task.id, branch_id);
         let planner = manager
-            .create_agent(
+            .create_agent_declaring(
                 &format!("{}-planner", prefix),
                 cog_core::roles::PLANNER,
                 llm.clone(),
                 Some(&task.id),
+                cog_core::Deliverable::Plan,
+                task.stated_directions(),
             )
             .await
             .ok()?;
-        // 这一支交什么，由任务说，不由角色名说。
+        // 这一支交什么、往哪儿算好，都由任务说，不由角色名说。
         let generator = manager
             .create_agent_declaring(
                 &format!("{}-generator", prefix),
@@ -964,15 +966,18 @@ impl PgeRoundtable {
                 llm.clone(),
                 Some(&task.id),
                 task.deliverable(),
+                task.stated_directions(),
             )
             .await
             .ok()?;
         let evaluator = manager
-            .create_agent(
+            .create_agent_declaring(
                 &format!("{}-evaluator", prefix),
                 cog_core::roles::EVALUATOR,
                 llm.clone(),
                 Some(&task.id),
+                cog_core::Deliverable::Judgement,
+                task.stated_directions(),
             )
             .await
             .ok()?;

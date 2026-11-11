@@ -622,6 +622,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
             llm,
             task_id,
             cog_core::Deliverable::Unstated,
+            Vec::new(),
         )
         .await
     }
@@ -633,6 +634,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
         task_id: Option<&str>,
         deliverable: cog_core::Deliverable,
+        stated_directions: Vec<String>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
         // 同一个名字只对应一个活的对象。
         //
@@ -662,6 +664,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
         // 这份活交什么，是拿到任务的那一层说的（`Task::deliverable`）。运行时够不到
         // 任务对象，只读这一位；按角色名判时，同一个人换件活就判错。
         config.deliverable = deliverable;
+        // 同一份声明里来自人的那半：有人就这件活说过的方向。抄进来而不是让运行时
+        // 自己去读，理由与上一句相同——运行时够不到任务，读不到就没得判。
+        config.stated_directions = stated_directions;
 
         let capabilities = vec![role.to_string()];
         let registration = task_agent_registration(agent_id, role);

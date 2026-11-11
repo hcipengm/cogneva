@@ -877,6 +877,22 @@ pub const INPUT_DECLARES_CHANGE: &str = "declares_change";
 /// 旧生产者还不会写新键时的兼容读法。
 pub const INPUT_DELIVERS: &str = "delivers";
 
+/// The `task.input` key under which a signal-filed task carries the detail of
+/// the reading that filed it.
+///
+/// The reader that filed the row (`signal_watcher`) puts the whole detail here,
+/// so a task made from an outside judgement still carries what was said when
+/// it is judged later. Read through [`Task::stated_directions`]; spelled as a
+/// key for the same reason as the markers above — two hand-written copies drift.
+pub const INPUT_SIGNAL: &str = "signal";
+
+/// The detail's own `kind` for a taste submission.
+///
+/// A signal detail is tagged by kind, and only this kind carries a taste
+/// payload. Matching on anything else would let an alert whose detail happens
+/// to have a `payload` key be read as a stated direction.
+pub const TASTE_SIGNAL_KIND: &str = "taste_intent";
+
 /// What a piece of work delivers.
 ///
 /// The closed set the treatment of the work follows: the rubric that judges it,
@@ -1224,6 +1240,37 @@ impl Task {
 
     pub fn declares_change(&self) -> bool {
         self.deliverable().declares_change()
+    }
+
+    /// 有人就这份活说过的方向，原文照录；没人说过就是空的。
+    ///
+    /// 「这一轮什么算好」不只有规格说了算。外部提交的判词里，`direction_preference`
+    /// 说了两个方向里偏好哪一个，`rubric_override` 说判据本身该改成什么——这两类此前
+    /// 只变成一件新活，改不动判活的标准。文件这条任务的那次读数把提交的内容留在
+    /// [`INPUT_SIGNAL`] 里，所以从任务自己读得出来：与 [`Self::deliverable`] 同一个
+    /// 读法，读任务，不读接手的人。
+    ///
+    /// 只收这两类。`evaluator_verdict` 说的是某份材料够不够格，不是「以后按什么算
+    /// 好」；把它也当成方向，等于让一次对结果的判断永久改写判据。读不出、种类不对、
+    /// 字段缺，一律当没说过——这里不猜。
+    pub fn stated_directions(&self) -> Vec<String> {
+        let Some(detail) = self.input.get(INPUT_SIGNAL) else {
+            return Vec::new();
+        };
+        if detail.get("kind").and_then(|v| v.as_str()) != Some(TASTE_SIGNAL_KIND) {
+            return Vec::new();
+        }
+        let Some(payload) = detail.get("payload") else {
+            return Vec::new();
+        };
+        let Ok(payload) = serde_json::from_value::<crate::TasteIntentPayload>(payload.clone())
+        else {
+            return Vec::new();
+        };
+        if matches!(payload, crate::TasteIntentPayload::EvaluatorVerdict(_)) {
+            return Vec::new();
+        }
+        vec![payload.summary()]
     }
 
     /// The producer's own spelling of this task's entry point, or `None` for a
@@ -1663,6 +1710,96 @@ mod tests {
         );
         assert_eq!(both.deliverable(), Deliverable::Plan);
         assert!(!both.declares_change(), "旧键不该盖过声明");
+    }
+
+    /// 外部就这份活说过的方向，任务自己带得住；没说、说了别的种类、读不出来，都不编。
+    ///
+    /// 这两类判词此前只变成一件新活，改不动判活的标准。任务带着提交时的 detail
+    /// 走，判它的时候就还在；这条测试钉的是「读得回来」与「不猜」两半。
+    #[test]
+    fn a_task_carries_the_direction_stated_about_it() {
+        fn filed(input: serde_json::Value) -> Task {
+            Task::new("t-direction", TaskType::Custom("self_signal".into()), input)
+        }
+        let detail = |payload: serde_json::Value| {
+            serde_json::json!({
+                INPUT_SIGNAL: {
+                    "kind": TASTE_SIGNAL_KIND,
+                    "taste_kind": payload["kind"].clone(),
+                    "payload": payload,
+                }
+            })
+        };
+
+        let preferred = filed(detail(serde_json::json!({
+            "kind": "direction_preference",
+            "preferred": "the stricter one",
+            "alternative": "the looser one",
+            "rationale": "the looser one hid a regression"
+        })));
+        assert_eq!(
+            preferred.stated_directions(),
+            vec![
+                "prefers \"the stricter one\" over \"the looser one\": the looser one hid a \
+                 regression"
+                    .to_string()
+            ],
+            "提交原文要原样回到判它的人手里，不是重新概括一遍"
+        );
+
+        let override_ = filed(detail(serde_json::json!({
+            "kind": "rubric_override",
+            "criterion": "the review rubric",
+            "new_wording": "quote the failing line",
+            "rationale": "prose verdicts could not be checked"
+        })));
+        assert_eq!(
+            override_.stated_directions(),
+            vec![
+                "the evaluation criterion \"the review rubric\" should read \"quote the failing \
+                 line\": prose verdicts could not be checked"
+                    .to_string()
+            ],
+            "改判据的那一类也是方向，同样要到得了判活的那一侧"
+        );
+
+        // 对某份材料的判断不是「以后按什么算好」：把它当方向，等于让一次对结果的
+        // 判断永久改写判据。
+        let verdict = filed(detail(serde_json::json!({
+            "kind": "evaluator_verdict",
+            "verdict": "insufficient",
+            "rationale": "the log lines do not show the retry"
+        })));
+        assert!(verdict.stated_directions().is_empty());
+
+        // 没有 detail、detail 不是这一种、payload 读不出来：都当没说过。
+        let plain = Task::new(
+            "t-plain",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ "goal": "read the timeout" }),
+        );
+        assert!(plain.stated_directions().is_empty());
+
+        let alert = filed(serde_json::json!({
+            INPUT_SIGNAL: { "kind": "persisted_alert", "rule": "ApiDown",
+                            "payload": { "kind": "rubric_override", "criterion": "x",
+                                         "new_wording": "y", "rationale": "z" } }
+        }));
+        assert!(
+            alert.stated_directions().is_empty(),
+            "别的信号碰巧带一个 payload 键，不该被读成方向"
+        );
+
+        let broken = filed(serde_json::json!({
+            INPUT_SIGNAL: {
+                "kind": TASTE_SIGNAL_KIND,
+                "payload": { "kind": "direction_preference", "preferred": "a" }
+            }
+        }));
+        assert!(
+            broken.stated_directions().is_empty(),
+            "字段缺一半的提交读不成方向：猜出来的那半句会冒充提交者的话"
+        );
     }
 
     #[test]

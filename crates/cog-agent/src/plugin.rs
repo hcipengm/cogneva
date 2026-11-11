@@ -535,6 +535,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
             owner_task_id: None,
             // 这一份活交的是判词：它不动工作树，判的是别人交的东西。
             deliverable: cog_core::Deliverable::Judgement,
+            // 常驻的评测员工没有一件具体的活，也就没有人就它说过方向。
+            stated_directions: Vec::new(),
         };
         let mut eval_runtime = crate::AgentRuntime::new(eval_config, eval_event_tx)
             .with_tools(tool_registry.as_ref().clone())

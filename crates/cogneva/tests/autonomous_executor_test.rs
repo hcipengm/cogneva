@@ -505,6 +505,7 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
 
     // Execute Squad directly
     let config = SquadConfig {
+        stated_directions: Vec::new(),
         goal: format!("Execute task: {}", task_id),
         context: task.input.clone(),
         pge_mode: cog_collaboration::select_mode(&derive_task_profile(&task)).mode,
@@ -610,6 +611,7 @@ async fn test_squad_retry_mechanism() {
     // Execute squad with max_retries=0 so failures are terminal.
     // Since stub agents always pass, we verify the retry infrastructure is wired.
     let config = SquadConfig {
+        stated_directions: Vec::new(),
         goal: format!("Execute task: {}", task_id),
         context: serde_json::json!({"goal": "task that will trigger retry"}),
         pge_mode: PgeMode::Pipeline,

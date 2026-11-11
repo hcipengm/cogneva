@@ -1191,8 +1191,9 @@ impl Agent {
     /// 这个 agent 的自审循环：花销记在它头上，判据按它手上这份活交什么挑。
     ///
     /// 两个入口一个构造点：`actor` 是归因（谁的账），`deliverable` 是判据
-    /// （判的什么物）。分开是因为它们此前共用「角色名」这一个词，同一个人
-    /// 换个任务就判错。
+    /// （判的什么物），`stated_directions` 是有人就这件活说过的方向（往哪儿
+    /// 算好）。三者分开是因为它们此前共用「角色名」这一个词，同一个人换个
+    /// 任务就判错；方向则根本没有入口，人说的话到不了判活的那一侧。
     fn self_review_loop(
         &self,
         config: &cog_core::SelfReviewConfig,
@@ -1200,6 +1201,7 @@ impl Agent {
         crate::self_review::SelfReviewLoop::new(config.clone())
             .with_actor(self.review_actor())
             .with_deliverable(self.config.deliverable)
+            .with_stated_directions(self.config.stated_directions.clone())
     }
 
     /// Token-attribution label for reviews this agent runs on its own output.

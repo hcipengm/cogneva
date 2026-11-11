@@ -712,8 +712,11 @@ fn taste_intent(intent: &cog_core::TasteIntent) -> (String, serde_json::Value) {
         intent.submitted_by,
         intent.submitted_at.to_rfc3339(),
     );
+    // The kind word is a constant because the task reads it back: a copy spelled
+    // by hand here would drift from the reader and the direction would silently
+    // stop reaching the work it was stated about.
     let detail = serde_json::json!({
-        "kind": "taste_intent",
+        "kind": cog_core::TASTE_SIGNAL_KIND,
         "taste_kind": intent.payload.kind(),
         "subject": intent.subject,
         "submitted_by": intent.submitted_by,
@@ -1431,7 +1434,7 @@ async fn submit_intent(
                     "goal": goal,
                     (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
                     (cog_core::INPUT_TASK_KIND): task_kind,
-                    "signal": detail,
+                    (cog_core::INPUT_SIGNAL): detail,
                 }),
             );
             // The same defect the change ledger's handover had: the goal path

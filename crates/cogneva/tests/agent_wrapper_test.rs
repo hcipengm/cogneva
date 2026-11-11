@@ -13,6 +13,7 @@ use mock_provider::MockProvider;
 async fn test_agent_prompt_completes() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -45,6 +46,7 @@ async fn test_agent_prompt_completes() {
 async fn test_agent_subscribe_receives_events() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -85,6 +87,7 @@ async fn test_agent_subscribe_receives_events() {
 async fn test_agent_state_transitions() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -117,6 +120,7 @@ async fn test_agent_state_transitions() {
 async fn test_agent_abort_resets_to_idle() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 10,
@@ -155,6 +159,7 @@ async fn test_agent_abort_resets_to_idle() {
 async fn test_agent_reset_clears_state() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -182,6 +187,7 @@ async fn test_agent_reset_clears_state() {
 async fn test_agent_continue_preserves_context() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -218,6 +224,7 @@ async fn test_agent_continue_preserves_context() {
 async fn test_agent_wait_for_idle() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,
@@ -253,6 +260,7 @@ async fn test_agent_wait_for_idle() {
 async fn test_agent_chat_stream_bypasses_loop() {
     let agent = Agent::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: "test".into(),
             role: "planner".to_string(),
             max_iterations: 2,

@@ -180,6 +180,12 @@ pub struct SelfReviewLoop {
     /// 这一格答「被审的是什么物」。原先判据从 `actor` 里的角色名取，同一个人换
     /// 件活就判错——被判的是物，标准就该跟着物走。
     deliverable: Deliverable,
+    /// 有人就这份活说过的方向，原文照录（见 `cog_core::Task::stated_directions`）。
+    ///
+    /// 与 `deliverable` 分开：`deliverable` 说这份活交什么物、由它挑判据；
+    /// 这一格说「往哪儿算好」——外部提交的偏好与判据改写，是判据**之外**的
+    /// 一份标准。空表示没人就这份活说过方向，不是「人没有偏好」。
+    stated_directions: Vec<String>,
     /// The DAG task this review is being run for, when it is being run for one.
     ///
     /// 与 `actor` 分开记，因为两者答的不是同一问：`actor` 答「哪个角色在花」，
@@ -196,8 +202,16 @@ impl SelfReviewLoop {
             config,
             actor: DEFAULT_SELF_REVIEW_ACTOR.to_string(),
             deliverable: Deliverable::Unstated,
+            stated_directions: Vec::new(),
             task: None,
         }
+    }
+
+    /// 有人就这份活说过的方向，原文照录。判据后面会被逐字引用（见
+    /// [`SelfReviewLoop::rubric`]），所以这里不概括、不改写。
+    pub fn with_stated_directions(mut self, directions: Vec<String>) -> Self {
+        self.stated_directions = directions;
+        self
     }
 
     /// Report this loop's token spend under `actor`, so a caller that reviews
@@ -510,8 +524,9 @@ impl SelfReviewLoop {
                 "the review has no specification to hold the text to".into(),
             ));
         }
+        let rubric = self.rubric();
         let user_payload = serde_json::to_string(&JudgeRequest {
-            rubric: SelfReviewLoop::judging_rubric(self.deliverable),
+            rubric: rubric.as_ref(),
             spec,
             output,
         })?;
@@ -725,7 +740,9 @@ impl SelfReviewLoop {
     ///
     /// It has to stay byte-identical across calls, because it is the head of
     /// the request and the only part an upstream prefix cache can hold across
-    /// tasks. `Unstated` gets wording of its own, and the first thing it asks
+    /// tasks. Anything a person said about this particular piece of work is
+    /// appended after it by [`SelfReviewLoop::rubric`], never folded into it.
+    /// `Unstated` gets wording of its own, and the first thing it asks
     /// for is the step nobody took: say which of the five this text is, from the
     /// text, and quote what decided it. Handing it the work-product wording
     /// would have made "nobody said" and "somebody said work product" the same
@@ -795,6 +812,33 @@ impl SelfReviewLoop {
                  quote that is not in the specification does not count."
             }
         }
+    }
+
+    /// 这一轮交给判官的标准：判据本身在前，有人就这份活说过的话逐字贴在后。
+    ///
+    /// 顺序是有意的：判据每次相同，是请求里能被上游前缀缓存命中的那一段；方向按任务
+    /// 不同，贴在它后面，换了方向只坏在尾上。方向只引用、不归纳——提交者的理由是全部
+    /// 输入，判官读到的要是原话；它也不取代上面的要求，两份标准各管各的。
+    fn rubric(&self) -> std::borrow::Cow<'static, str> {
+        let base = SelfReviewLoop::judging_rubric(self.deliverable);
+        if self.stated_directions.is_empty() {
+            return std::borrow::Cow::Borrowed(base);
+        }
+        let mut stated = String::from(
+            "\n\nSomeone outside this work stated a direction for it, quoted here verbatim. \
+             Weigh it as part of what counts as good in this round; it does not replace the \
+             requirements above:\n",
+        );
+        for direction in &self.stated_directions {
+            stated.push_str("- ");
+            stated.push_str(direction);
+            stated.push('\n');
+        }
+        // 容量就是拼出来多长：贴上去的是人的原话，长短由提交者决定，这里不猜一个数。
+        let mut text = String::with_capacity(base.len() + stated.len());
+        text.push_str(base);
+        text.push_str(&stated);
+        std::borrow::Cow::Owned(text)
     }
 
     /// Step 4: Decide — PASS or NEED_REVISION based on score vs threshold.
@@ -1798,6 +1842,57 @@ mod tests {
         assert!(
             unstated.contains("spec_quote"),
             "探明形状不该把规格那条尺子弄丢：{unstated}"
+        );
+    }
+
+    /// 有人就这份活说过的方向，要真的到得了判官手里，而且不顶替判据。
+    ///
+    /// 改之前人说的话只变成一件新活：判这份活的尺子不带它，于是「按我的偏好算好」
+    /// 与「按默认算好」在读数上同形——两者都是「有一份判据」。这条测试钉两半：方向
+    /// 出现在请求里（逐字），判据本身仍是请求的开头（换了方向只坏在尾上）。
+    #[tokio::test]
+    async fn a_stated_direction_reaches_the_rubric_without_replacing_it() {
+        const TABLE: &str = r#"{"rows":[
+             {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"}]}"#;
+
+        async fn rubric_under(directions: Vec<String>) -> String {
+            let llm = TableLlm::new(TABLE);
+            let loop_ = SelfReviewLoop::new(SelfReviewConfig {
+                revise: false,
+                spec: Some("t1 and t2 must be done".into()),
+                ..Default::default()
+            })
+            .with_stated_directions(directions);
+            let _ = loop_.review("t1: read the file", &llm).await.unwrap();
+            let payload = llm.payloads().pop().expect("一次评判一次请求");
+            let request: serde_json::Value = serde_json::from_str(&payload).expect("请求是 JSON");
+            request["rubric"]
+                .as_str()
+                .expect("判据在请求里")
+                .to_string()
+        }
+
+        let head = SelfReviewLoop::judging_rubric(Deliverable::Unstated);
+        let silent = rubric_under(Vec::new()).await;
+        assert_eq!(
+            silent, head,
+            "没人说过方向时，判据必须与原来逐字相同：多一个字都会让前缀缓存失效"
+        );
+
+        let direction =
+            "prefers \"the stricter one\" over \"the looser one\": the looser one hid a regression";
+        let spoken = rubric_under(vec![direction.to_string()]).await;
+        assert!(
+            spoken.starts_with(&silent),
+            "判据本身必须还是开头：方向贴在尾上，换了方向只坏在尾上\n{spoken}"
+        );
+        assert!(
+            spoken.contains(direction),
+            "方向要原样到判官手里，概括过的那句不是提交者的话\n{spoken}"
+        );
+        assert!(
+            spoken.contains("does not replace the requirements"),
+            "方向是加在判据之外的一份标准，不该被读成把要求换掉了\n{spoken}"
         );
     }
 

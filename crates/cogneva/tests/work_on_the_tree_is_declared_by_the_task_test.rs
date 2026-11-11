@@ -141,3 +141,66 @@ fn nobody_decides_who_may_write_the_tree_by_role() {
         "一处 create_role_agent 都没普查到：这条判据读的名字改了，它现在什么都没在守"
     );
 }
+
+/// 有人就一件活说过的方向，从任务一路走到判它的那把尺子上。
+///
+/// 中间三层各丢一次都是编译得过的：管理器不抄进运行时、运行时不交给自审循环、
+/// 小队建座位时不传。丢了之后「按我说过的算好」与「按默认算好」在读数上同形，而
+/// 两边读起来都是「有一份判据」——这正是这条判据要红的那一格。
+#[test]
+fn a_stated_direction_travels_from_the_task_to_the_judge() {
+    let root = repo_root();
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}：{e}"))
+    };
+
+    let manager = read("crates/cog-agent/src/runtime/manager.rs");
+    assert!(
+        manager.contains("config.stated_directions = stated_directions"),
+        "管理器不再把任务上的方向抄进运行时：「往哪儿算好」在运行时就只剩默认的那一份"
+    );
+
+    let agent = read("crates/cog-agent/src/agent.rs");
+    assert!(
+        agent.contains(".with_stated_directions(self.config.stated_directions.clone())"),
+        "运行时带着方向，自审循环却没拿到：判活的尺子上没有人的话"
+    );
+
+    // 每个建座位上坡的地方都要把它交出去——不只产出改动的那一个：判据是每个
+    // 座位判自己产出的那把尺子。
+    let mut checked = 0;
+    for path in production_sources(&root) {
+        let name = relative_name(&root, &path);
+        if !name.starts_with("crates/cog-collaboration/src/") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for needle in [
+            "crate::resume::create_role_agent(",
+            ".create_agent_declaring(",
+        ] {
+            let mut from = 0usize;
+            while let Some(offset) = text[from..].find(needle) {
+                let start = from + offset;
+                let Some(end) = matching_paren(&text, start + needle.len() - 1, Dialect::Rust)
+                else {
+                    break;
+                };
+                let call = &text[start..=end];
+                assert!(
+                    call.contains("stated_directions"),
+                    "{name} 建了一个座位却没把任务上的方向传进去：它判自己的产出时\
+                     按的是没人说过的那一份标准\n{call}"
+                );
+                checked += 1;
+                from = end + 1;
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "一处建座位的地方都没普查到：这条判据读的名字改了，它现在什么都没在守"
+    );
+}

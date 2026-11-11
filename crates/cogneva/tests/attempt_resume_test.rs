@@ -213,6 +213,7 @@ fn runtime(
     let (tx, rx) = mpsc::channel::<AgentEvent>(256);
     let agent = AgentRuntime::new(
         RuntimeConfig {
+            stated_directions: Vec::new(),
             agent_id: agent_id.into(),
             role: "worker".to_string(),
             max_iterations: 4,
