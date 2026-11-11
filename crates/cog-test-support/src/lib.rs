@@ -7,19 +7,21 @@
 //! 只是绿的来源不同。
 //!
 //! 判据在 `crates/cogneva/tests/the_fixture_reading_steps_are_written_once_test.rs`：
-//! 这份文件里定义过的函数体，不许在任何一份夹具里再出现一遍。
+//! 这个 crate 里定义过的函数体，不许在任何一份夹具里再出现一遍。
 
 use std::path::{Path, PathBuf};
 
 use sqlx::Connection as _;
 
 mod backends;
+mod literals;
 mod message;
 mod metrics;
 mod state;
 mod task_ledger;
 
 pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
+pub use literals::{literal_values, literals_in, Literal};
 pub use message::MemoryMessageBackend;
 pub use metrics::MemoryMetricsBackend;
 pub use state::MemoryStateBackend;
