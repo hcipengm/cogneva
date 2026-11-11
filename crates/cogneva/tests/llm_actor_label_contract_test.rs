@@ -80,6 +80,13 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         "crates/cogneva/tests/collaboration_self_review_test.rs",
         &["self_review:{role}"],
     ),
+    // The label differential drives the review loop once per label to compare
+    // the treatments; it names the actor the same way the loop does, through
+    // the shared helper, so it reports under the same family.
+    (
+        "crates/cogneva/tests/label_differential_test.rs",
+        &["self_review:{role}"],
+    ),
 ];
 
 /// Files whose actor is not a value written at the call site: the value is
@@ -460,6 +467,10 @@ const TASK_KEYING: &[(&str, TaskKeying)] = &[
     (
         "crates/cogneva/tests/collaboration_self_review_test.rs",
         TaskKeying::KeyedBy("一个替身：它不发出任何计费调用"),
+    ),
+    (
+        "crates/cogneva/tests/label_differential_test.rs",
+        TaskKeying::KeyedBy("一个替身：它把每次调用的读数录下来比较，不发出计费调用"),
     ),
 ];
 
