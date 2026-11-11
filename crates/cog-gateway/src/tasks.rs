@@ -822,6 +822,18 @@ fn submitted_tasks(
                             task.acceptance = stated_acceptance(&item.input);
                         }
                     }
+                    // 这一行是提交面唯一把一件活写进账的地方：在这里把它交什么
+                    // 落成一份带来源的记录，后面的派发、判尺、输出形状都读那一格。
+                    // 提交人此时已经知道（令牌），再晚就没有这一格了。
+                    //
+                    // 请求体里自带的记录先丢掉：那一格是服务端写的，里面有「谁说的」。
+                    // 收下一个调用方自己填的 `by`，等于让任何人把一句声明记到别人头上。
+                    // 丢掉之后仍按提交内容重新落定，声明本身不受影响。
+                    if let Some(fields) = task.input.as_object_mut() {
+                        fields.remove(cog_core::types::task::INPUT_DELIVERABLE_RECORD);
+                        fields.remove(cog_core::types::task::INPUT_DELIVERABLE_SUPERSEDED);
+                    }
+                    task.settle_deliverable();
                     task
                 })
                 .collect()
@@ -2865,6 +2877,54 @@ mod tests {
         assert_eq!(named[0].submitted_by.as_deref(), Some("u-1"));
         let anonymous = submitted_tasks(&req, "goal-1", None);
         assert_eq!(anonymous[0].submitted_by, None);
+    }
+
+    /// 提交面把「这件活交什么」在门口落成一份带来源的记录。
+    ///
+    /// 提交人从令牌来，只有门口这个时刻同时知道声明与提交人；过了这一格再想补，
+    /// 就只能编一个名字或者留空。说了的行记成 `stated`，没说的行记成 `unstated`
+    /// ——「没人说」不在这里被推成一个默认的交付物。
+    #[test]
+    fn a_submitted_row_settles_what_it_delivers_with_its_source() {
+        let mut stated = task_item("stated", None);
+        stated.input = serde_json::json!({
+            cog_core::types::task::INPUT_DELIVERS: "judgement",
+            // 调用方自带一份「谁说的」：门口必须丢掉它，按令牌重新落定。
+            cog_core::types::task::INPUT_DELIVERABLE_RECORD: {
+                "state": "stated",
+                "conclusion": "answer",
+                "by": "someone-else",
+                "via": "delivers",
+            },
+        });
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "judge the change".into(),
+            tasks: Some(vec![stated, task_item("silent", None)]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let rows = submitted_tasks(&req, "goal-1", Some("u-1"));
+
+        assert_eq!(
+            rows[0].deliverable_declaration(),
+            cog_core::DeliverableDeclaration::Stated {
+                conclusion: cog_core::Deliverable::Judgement,
+                by: Some("u-1".into()),
+                via: cog_core::StatementVia::Delivers,
+            }
+        );
+        assert_eq!(rows[0].deliverable(), cog_core::Deliverable::Judgement);
+
+        assert_eq!(
+            rows[1].deliverable_declaration(),
+            cog_core::DeliverableDeclaration::Unstated
+        );
+        assert!(rows[1]
+            .input
+            .get(cog_core::types::task::INPUT_DELIVERABLE_RECORD)
+            .is_some());
     }
 
     /// 目标提交不受这条约束：它交给分解，验收标准由规划给出，提交时不要求写。

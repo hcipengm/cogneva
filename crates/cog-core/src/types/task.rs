@@ -960,6 +960,95 @@ impl Deliverable {
     }
 }
 
+/// The `task.input` key where a settled declaration is written.
+///
+/// 「这件活交什么」此前每次都在读的那一端现推：新键一个读法、旧布尔一个读法、
+/// 自进化标记又一个读法。哪一端以后加了条件，同一行在不同人手里就有了两个答案，
+/// 而谁也没错——错的只是没有一个共同的落点。这一格就是那个落点：写下一次，之后
+/// 所有读的人都读它。
+pub const INPUT_DELIVERABLE_RECORD: &str = "deliverable_record";
+
+/// The `task.input` key holding every declaration this row's record replaced.
+///
+/// 新声明覆盖旧声明时旧的那份不丢：`who` 什么时候说过什么、后来被谁改成了什么，
+/// 是审计与差分要读的东西。只留最新一份，覆盖这件事本身就没有证据了。
+pub const INPUT_DELIVERABLE_SUPERSEDED: &str = "deliverable_superseded";
+
+/// 生产者是用哪种拼法说出这份活交什么的。
+///
+/// 与 [`Deliverable`] 分开：那是「交什么」，这是「话是怎么说出来的」。合成一格
+/// 之后，旧布尔写下的 `change` 与按新键写下的 `change` 在读数里就分不开了，而
+/// 「旧键还会被读多久」正是收尾旧拼法时要看的数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatementVia {
+    /// 按 [`INPUT_DELIVERS`] 写了闭集里的一个词。
+    Delivers,
+    /// 只会写旧键 [`INPUT_DECLARES_CHANGE`]，真值为真。
+    DeclaresChange,
+}
+
+/// 哪条规则把任务行上的一个标记读成了交付物。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivationRule {
+    /// 自进化入口：任务类型或模式标记本身就是「交一份变更」那句话。
+    SelfEvolutionEntry,
+}
+
+/// 一件活交什么，以及这个结论是从哪儿来的。
+///
+/// 终态要能指出来源：一份活交什么只由「活自己说了什么」「接手的人实测交过什么」
+/// 「操作者显式覆盖」这三样决定。这一个类型就是第一样的载体——`Stated` 有人、
+/// 有拼法，`Derived` 有原文、有规则、有时间，`Unstated` 与 `Unreadable` 分开，
+/// 因为「没人说」和「说了但读不出来」在读数里必须是两个数，否则一个拼错的词会
+/// 永远安静地落在「没人说」那一格里。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeliverableDeclaration {
+    /// 生产者自己在提交时说了。
+    Stated {
+        conclusion: Deliverable,
+        /// 说这句话的是谁。提交人从令牌来，行上没有身份时这里是 `None`——
+        /// 空着比编一个名字诚实。
+        by: Option<String>,
+        via: StatementVia,
+    },
+    /// 平台按行上的一个标记推出来的。
+    ///
+    /// 三格缺一不可：`from` 是当时读到的原文（不是概括），`rule` 是哪条规则，
+    /// `at` 是这个结论在行上成立的时间。没有这三格，「推出来的」与「生产者
+    /// 说的」在读数里长得一样。
+    Derived {
+        conclusion: Deliverable,
+        from: String,
+        rule: DerivationRule,
+        /// 取行自己的 `created_at`。读取本身不读时钟：同一行读多少次都得到
+        /// 同一份声明，重放一次历史也不会得到第二个答案。
+        at: DateTime<Utc>,
+    },
+    /// 行上写了东西，但读不成声明——拼错的词、读不懂的标记、坏掉的记录。
+    Unreadable {
+        /// 原样留下当时写着的那一段，不概括、不截断。
+        raw: String,
+    },
+    /// 行上没写，也没有一条规则读得出它。
+    Unstated,
+}
+
+impl DeliverableDeclaration {
+    /// 这份声明说的交付物；读不出来就是 [`Deliverable::Unstated`]。
+    ///
+    /// 「读不出来」与「没人说」在这里合流，因为这个问题只问交什么；要分辨两者
+    /// 的读数读的是本类型本身，不是这个函数。
+    pub const fn conclusion(&self) -> Deliverable {
+        match self {
+            Self::Stated { conclusion, .. } | Self::Derived { conclusion, .. } => *conclusion,
+            Self::Unreadable { .. } | Self::Unstated => Deliverable::Unstated,
+        }
+    }
+}
+
 /// The lane for work that must run before ordinary work, whether or not the
 /// ordinary lane is full.
 ///
@@ -1206,35 +1295,133 @@ impl Task {
 
     /// 这件活要不要动工作树——由任务说，不由接手的人的角色说。
     ///
-    /// 两种声明都算数：
+    /// 答案来自 [`Self::deliverable_declaration`]：行上已经落定了记录时读那份记录，
+    /// 否则按输入得出。按输入得出时三种来源都算数：
     ///
-    /// - 输入里明说（[`INPUT_DECLARES_CHANGE`] 为真）。生产者在提交时知道这一件
-    ///   活要交一份改动还是只交一段结论。
+    /// - 输入里明说（[`INPUT_DELIVERS`]），这是要补的那个量本身。
+    /// - 只会写旧键（[`INPUT_DECLARES_CHANGE`] 为真），兼容读法。
     /// - 自进化生成变更这一类（[`Self::is_self_evolution`]）。它的标记本身就是
     ///   「产出一份变更」那句话，再让生产者抄一遍只是多一个会漂的副本。
     ///
     /// 读的人要的是「这一件活得改树吗」，问出来的答案只取决于任务本身：同一个人
     /// 接了另一件活，答案跟着那件活变；角色标签怎么变都不影响它。
     pub fn deliverable(&self) -> Deliverable {
+        self.deliverable_declaration().conclusion()
+    }
+
+    /// 这件活交什么，连同这个结论的来源。
+    ///
+    /// 行上有记录时读记录——那是唯一的写入点写下的东西，读的人不再各自回到输入里
+    /// 重推；没有记录时才按输入得出（旧键、自进化标记）。两种读法的规则都只在这一
+    /// 个函数里，读的人要的答案与它们从哪儿来一起回去。
+    pub fn deliverable_declaration(&self) -> DeliverableDeclaration {
+        match self.input.get(INPUT_DELIVERABLE_RECORD) {
+            Some(value) => serde_json::from_value(value.clone())
+                // 坏掉的记录不当成「没有记录」再推出一个：那会让一次损坏悄悄变成
+                // 另一个看似合理、其实没人说过的答案。它读不成就是读不成。
+                .unwrap_or_else(|_| DeliverableDeclaration::Unreadable {
+                    raw: value.to_string(),
+                }),
+            None => self.deliverable_from_inputs(),
+        }
+    }
+
+    /// 把一个声明写进任务行——**唯一的写入点**。
+    ///
+    /// 已有记录时那个旧声明先移进 [`INPUT_DELIVERABLE_SUPERSEDED`]，再写新的：
+    /// 覆盖留下证据，才不会出现「昨天读出来是 A、今天读出来是 B、中间没有人说过话」。
+    pub fn declare_deliverable(&mut self, declaration: DeliverableDeclaration) {
+        let Some(fields) = self.input.as_object_mut() else {
+            return;
+        };
+        if let Some(previous) = fields.get(INPUT_DELIVERABLE_RECORD).cloned() {
+            let history = fields
+                .entry(INPUT_DELIVERABLE_SUPERSEDED)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let Some(list) = history.as_array_mut() {
+                list.push(previous);
+            }
+        }
+        if let Ok(value) = serde_json::to_value(&declaration) {
+            fields.insert(INPUT_DELIVERABLE_RECORD.to_string(), value);
+        }
+    }
+
+    /// 确保这一行带着一份落定的声明，并把它读回来。
+    ///
+    /// 入口处调用一次即可。已有记录时原样返回、不回到输入重推：一次写定之后，
+    /// 改旧标记不改读法——这正是「记录」与「每次现推」的区别。
+    pub fn settle_deliverable(&mut self) -> DeliverableDeclaration {
+        if self.input.get(INPUT_DELIVERABLE_RECORD).is_some() {
+            return self.deliverable_declaration();
+        }
+        let declaration = self.deliverable_from_inputs();
+        self.declare_deliverable(declaration.clone());
+        declaration
+    }
+
+    /// 只按任务行上的输入得出一份声明；不读记录。
+    fn deliverable_from_inputs(&self) -> DeliverableDeclaration {
         // 写明的声明优先：它是这套读法要补的那个量本身，`declares_change`
         // 只是它缺席时的兼容读法。两者同时出现且互相矛盾时以声明为准——
         // 让布尔盖住声明，等于让旧键继续决定新键该说什么。
-        if let Some(word) = self.input.get(INPUT_DELIVERS).and_then(|v| v.as_str()) {
-            if let Some(named) = Deliverable::from_word(word) {
-                return named;
-            }
+        if let Some(value) = self.input.get(INPUT_DELIVERS) {
+            // 新键出现但词不在闭集里时不再退回旧布尔：生产者已经用新拼法开口，
+            // 拼错是一个要看得见的错过，不是一个可以安静换条路读过去的缺席。
+            return match value.as_str().and_then(Deliverable::from_word) {
+                Some(conclusion) => DeliverableDeclaration::Stated {
+                    conclusion,
+                    by: self.submitted_by.clone(),
+                    via: StatementVia::Delivers,
+                },
+                None => DeliverableDeclaration::Unreadable {
+                    raw: value.to_string(),
+                },
+            };
         }
-        let named = match self.input.get(INPUT_DECLARES_CHANGE) {
-            Some(serde_json::Value::Bool(flag)) => *flag,
-            Some(serde_json::Value::String(word)) => {
-                matches!(word.trim(), "true" | "yes" | "1")
+        let legacy = match self.input.get(INPUT_DECLARES_CHANGE) {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(serde_json::Value::Bool(true)) => true,
+            Some(serde_json::Value::String(word)) => match word.trim() {
+                "true" | "yes" | "1" => true,
+                "false" | "no" | "0" | "" => false,
+                _ => return DeliverableDeclaration::Unreadable { raw: word.clone() },
+            },
+            Some(other) => {
+                return DeliverableDeclaration::Unreadable {
+                    raw: other.to_string(),
+                }
             }
-            _ => false,
         };
-        if named || self.is_self_evolution() {
-            Deliverable::Change
-        } else {
-            Deliverable::Unstated
+        if legacy {
+            return DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Change,
+                by: self.submitted_by.clone(),
+                via: StatementVia::DeclaresChange,
+            };
+        }
+        if self.is_self_evolution() {
+            return DeliverableDeclaration::Derived {
+                conclusion: Deliverable::Change,
+                from: self.self_evolution_marker(),
+                rule: DerivationRule::SelfEvolutionEntry,
+                at: self.created_at,
+            };
+        }
+        DeliverableDeclaration::Unstated
+    }
+
+    /// 让这条任务被认成自进化的那个标记，原文照录。
+    fn self_evolution_marker(&self) -> String {
+        match &self.task_type {
+            TaskType::Custom(name) if name == "self_evolution" => format!("task_type:{name}"),
+            _ => format!(
+                "{INPUT_EVOLUTION_MODE}:{}",
+                self.input
+                    .get(INPUT_EVOLUTION_MODE)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+            ),
         }
     }
 
@@ -1710,6 +1897,158 @@ mod tests {
         );
         assert_eq!(both.deliverable(), Deliverable::Plan);
         assert!(!both.declares_change(), "旧键不该盖过声明");
+    }
+
+    /// 一份声明要说得出来源：谁说的、用哪种拼法、按哪条规则、读的是哪段原文。
+    ///
+    /// 「交什么」与「从哪儿来」分开记，是为了让终态那句「待遇只由三样东西决定」
+    /// 在读得出来之前先写得下来：生产者说的、平台推的、没人说的，差的不只是结论。
+    #[test]
+    fn a_declaration_names_where_it_came_from() {
+        let mut stated = Task::new(
+            "t-stated",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "judgement" }),
+        );
+        stated.submitted_by = Some("op@example".into());
+        assert_eq!(
+            stated.deliverable_declaration(),
+            DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Judgement,
+                by: Some("op@example".into()),
+                via: StatementVia::Delivers,
+            }
+        );
+
+        let legacy = Task::new(
+            "t-legacy",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DECLARES_CHANGE: true }),
+        );
+        assert_eq!(
+            legacy.deliverable_declaration(),
+            DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Change,
+                by: None,
+                via: StatementVia::DeclaresChange,
+            }
+        );
+
+        let evolution = Task::new(
+            "t-evolution",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({ "goal": "raise the timeout" }),
+        );
+        assert_eq!(
+            evolution.deliverable_declaration(),
+            DeliverableDeclaration::Derived {
+                conclusion: Deliverable::Change,
+                from: "task_type:self_evolution".into(),
+                rule: DerivationRule::SelfEvolutionEntry,
+                at: evolution.created_at,
+            }
+        );
+
+        let silent = Task::new(
+            "t-silent",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            silent.deliverable_declaration(),
+            DeliverableDeclaration::Unstated
+        );
+    }
+
+    /// 一次写定之后，改旧标记不改读法。
+    ///
+    /// 这条是「记录」与「每次现推」的分界：没有它，同一行在写入前后可以被两个
+    /// 标记读出两个答案，而两边都声称自己读的是任务。
+    #[test]
+    fn a_settled_declaration_is_not_reread_from_the_old_marker() {
+        let mut task = Task::new(
+            "t-settle",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "change" }),
+        );
+        assert_eq!(task.settle_deliverable().conclusion(), Deliverable::Change);
+
+        task.input.as_object_mut().unwrap().remove(INPUT_DELIVERS);
+        task.input
+            .as_object_mut()
+            .unwrap()
+            .insert(INPUT_DECLARES_CHANGE.into(), serde_json::json!(false));
+        assert_eq!(
+            task.deliverable(),
+            Deliverable::Change,
+            "落定的声明被行上的旧标记改写了"
+        );
+
+        // 落定是幂等的：再调一次既不改结论，也不往覆盖史里再记一笔。
+        assert_eq!(task.settle_deliverable().conclusion(), Deliverable::Change);
+        assert!(task.input.get(INPUT_DELIVERABLE_SUPERSEDED).is_none());
+    }
+
+    /// 新声明覆盖旧声明时，旧的那份留在行上。
+    ///
+    /// 覆盖不留证据，读数就只能看见最后一个答案，「谁在什么时候改了口」永远查不到。
+    #[test]
+    fn superseding_a_declaration_keeps_the_old_one() {
+        let mut task = Task::new(
+            "t-supersede",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({}),
+        );
+        task.declare_deliverable(DeliverableDeclaration::Stated {
+            conclusion: Deliverable::Plan,
+            by: Some("planner@example".into()),
+            via: StatementVia::Delivers,
+        });
+        task.declare_deliverable(DeliverableDeclaration::Stated {
+            conclusion: Deliverable::Answer,
+            by: Some("op@example".into()),
+            via: StatementVia::Delivers,
+        });
+
+        assert_eq!(task.deliverable(), Deliverable::Answer);
+        let history = task
+            .input
+            .get(INPUT_DELIVERABLE_SUPERSEDED)
+            .and_then(|v| v.as_array())
+            .expect("覆盖史应当留在行上");
+        assert_eq!(history.len(), 1);
+        let superseded: DeliverableDeclaration =
+            serde_json::from_value(history[0].clone()).expect("旧声明应当读得回来");
+        assert_eq!(superseded.conclusion(), Deliverable::Plan);
+        assert_eq!(
+            superseded,
+            DeliverableDeclaration::Stated {
+                conclusion: Deliverable::Plan,
+                by: Some("planner@example".into()),
+                via: StatementVia::Delivers,
+            }
+        );
+    }
+
+    /// 新键拼错是一个看得见的错过，不是一条安静退回旧键的路。
+    ///
+    /// 旧读法会接着读 `declares_change`，于是一个写错词的提交者拿到的仍是旧语义，
+    /// 谁也不知道那句新声明没被读懂。
+    #[test]
+    fn a_misspelled_new_key_is_unreadable_not_silent() {
+        let task = Task::new(
+            "t-misspell",
+            TaskType::Custom("platform_task".into()),
+            serde_json::json!({ INPUT_DELIVERS: "plan-ish", INPUT_DECLARES_CHANGE: true }),
+        );
+        assert_eq!(
+            task.deliverable_declaration(),
+            DeliverableDeclaration::Unreadable {
+                raw: "\"plan-ish\"".into(),
+            }
+        );
+        assert_eq!(task.deliverable(), Deliverable::Unstated);
+        assert!(!task.declares_change(), "拼错的新键不该退回旧键去读");
     }
 
     /// 外部就这份活说过的方向，任务自己带得住；没说、说了别的种类、读不出来，都不编。

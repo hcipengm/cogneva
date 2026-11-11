@@ -71,6 +71,7 @@ struct DecisionRecord {
 /// 决定，测试当场红。`who` 那一半不在这张表里——名字与花销行本来就不决定待遇。
 const TREATMENT_SOURCES: &[(&str, &str)] = &[
     ("deliverable", "declared"),
+    ("deliverable_source", "declared"),
     ("stated_directions", "declared"),
     ("rubric", "declared"),
     ("schema", "declared"),
@@ -338,6 +339,12 @@ async fn record_for(label: &str, tools: &[String]) -> DecisionRecord {
         serde_json::json!(format!("{:?}", task.task_type)),
     );
     fields.insert("tools".into(), serde_json::json!(tools));
+    // 声明连同来源一起收进来：这道差分不只比结论，也比「这个结论是谁说的」。
+    // 两个标签读的是同一个任务对象，来源那一栏相同才说明待遇跟声明走、不跟标签走。
+    fields.insert(
+        "deliverable_source".into(),
+        serde_json::to_value(task.deliverable_declaration()).expect("声明总是可序列化"),
+    );
     DecisionRecord { who, treatment }
 }
 
