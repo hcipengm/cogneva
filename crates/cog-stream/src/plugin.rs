@@ -249,10 +249,7 @@ mod tests {
             ..Default::default()
         };
         let roomy_backend = memory_fallback(&config);
-        let mut roomy = roomy_backend
-            .subscribe("subject", "reader")
-            .await
-            .unwrap();
+        let mut roomy = roomy_backend.subscribe("subject", "reader").await.unwrap();
         roomy_backend.publish("subject", b"one").await.unwrap();
         roomy_backend.publish("subject", b"two").await.unwrap();
         assert!(
