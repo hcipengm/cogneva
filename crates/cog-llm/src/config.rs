@@ -40,8 +40,6 @@ fn load_section_from<T: serde::de::DeserializeOwned + Default>(
 /// nobody".
 pub const TUNING_ENV: &[(&str, &str)] = &[
     ("COGNEVA_STREAM_CAPACITY", "stream_capacity"),
-    ("COGNEVA_HIGH_WATERMARK", "high_watermark"),
-    ("COGNEVA_LOW_WATERMARK", "low_watermark"),
 ];
 
 /// LLM 后端配置。`api_key` 在 Debug 输出中脱敏，防止泄漏到日志。
@@ -122,8 +120,6 @@ impl LLMRoutingConfig {
 #[serde(default)]
 pub struct TuningConfig {
     pub stream_capacity: usize,
-    pub high_watermark: usize,
-    pub low_watermark: usize,
 }
 
 impl TuningConfig {

@@ -80,7 +80,6 @@ pub struct AppInfo {
 pub struct ProviderConfigs {
     pub db: ProviderConfig,
     pub pg: ProviderConfig,
-    pub vector: ProviderConfig,
     pub media: ProviderConfig,
     pub storage: ProviderConfig,
     #[serde(default)]

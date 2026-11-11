@@ -66,10 +66,6 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert("COGNEVA_DB_PROVIDER".into(), "providers.db.provider".into());
     m.insert("COGNEVA_PG_PROVIDER".into(), "providers.pg.provider".into());
     m.insert(
-        "COGNEVA_VECTOR_PROVIDER".into(),
-        "providers.vector.provider".into(),
-    );
-    m.insert(
         "COGNEVA_MEDIA_PROVIDER".into(),
         "providers.media.provider".into(),
     );

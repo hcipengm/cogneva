@@ -46,7 +46,6 @@ data:
             "COGNEVA_APP_DIR": "app.app_dir",
             "COGNEVA_DB_PROVIDER": "providers.db.provider",
             "COGNEVA_PG_PROVIDER": "providers.pg.provider",
-            "COGNEVA_VECTOR_PROVIDER": "providers.vector.provider",
             "COGNEVA_MEDIA_PROVIDER": "providers.media.provider",
             "COGNEVA_STORAGE_PROVIDER": "providers.storage.provider",
             "COGNEVA_WIKI_PROVIDER": "providers.wiki.provider",
@@ -154,8 +153,6 @@ data:
             "COGNEVA_NOTIFICATION_WECHAT_WORK_URL": "gateway.notification_wechat_work.webhook_url",
             "COGNEVA_NOTIFICATION_SIGN_BASE": "gateway.notification_sign_base",
             "COGNEVA_STREAM_CAPACITY": "tuning.stream_capacity",
-            "COGNEVA_HIGH_WATERMARK": "tuning.high_watermark",
-            "COGNEVA_LOW_WATERMARK": "tuning.low_watermark",
             "COGNEVA_STRICT_PERSISTENCE": "system.strict_persistence"
           },
           "app": {
@@ -216,15 +213,6 @@ data:
                 "database": "cogneva",
                 "user": "cog_app",
                 "password": "${APP_PASSWORD}"
-              }
-            },
-            "vector": {
-              "provider": "qdrant",
-              "enabled": true,
-              "options": {
-                "url": "http://qdrant.cogneva.svc.cluster.local:6334",
-                "collection": "summaries",
-                "api_key": null
               }
             },
             "media": {
@@ -3879,9 +3867,7 @@ data:
             "heartbeat_interval_secs": 10
           },
           "tuning": {
-            "stream_capacity": 256,
-            "high_watermark": 1000,
-            "low_watermark": 100
+            "stream_capacity": 256
           },
           "prompts": {
             "_comment": "外部 prompt 模板目录，由 cogneva-prompts configmap 挂载；hot_reload 捕捉 configmap 交换（L0 配置晋级热更新通道）。",

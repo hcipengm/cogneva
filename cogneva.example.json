@@ -31,7 +31,6 @@
     "COGNEVA_APP_DIR": "app.app_dir",
     "COGNEVA_DB_PROVIDER": "providers.db.provider",
     "COGNEVA_PG_PROVIDER": "providers.pg.provider",
-    "COGNEVA_VECTOR_PROVIDER": "providers.vector.provider",
     "COGNEVA_MEDIA_PROVIDER": "providers.media.provider",
     "COGNEVA_STORAGE_PROVIDER": "providers.storage.provider",
     "COGNEVA_WIKI_PROVIDER": "providers.wiki.provider",
@@ -110,8 +109,6 @@
     "COGNEVA_REQUEST_TIMEOUT_SECS": "gateway.request_timeout_secs",
     "COGNEVA_NOTIFICATION_WEBHOOK_URL": "gateway.notification_webhook_url",
     "COGNEVA_STREAM_CAPACITY": "tuning.stream_capacity",
-    "COGNEVA_HIGH_WATERMARK": "tuning.high_watermark",
-    "COGNEVA_LOW_WATERMARK": "tuning.low_watermark",
     "COGNEVA_STRICT_PERSISTENCE": "system.strict_persistence"
   },
   "app": {
@@ -161,15 +158,6 @@
         "database": "cogneva",
         "user": "cog_user",
         "password": "${PG_PASSWORD}"
-      }
-    },
-    "vector": {
-      "provider": "qdrant",
-      "enabled": true,
-      "options": {
-        "url": "http://qdrant.cogneva.svc.cluster.local:6334",
-        "collection": "summaries",
-        "api_key": null
       }
     },
     "media": {
@@ -480,9 +468,7 @@
     "heartbeat_interval_secs": 10
   },
   "tuning": {
-    "stream_capacity": 256,
-    "high_watermark": 1000,
-    "low_watermark": 100
+    "stream_capacity": 256
   },
   "agent_pool": {
     "enabled": true,

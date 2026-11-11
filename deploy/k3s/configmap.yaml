@@ -27,8 +27,7 @@ data:
   # 投影（三份 profile 的副本数都是 1），权威源在 chart templates/configmap.yaml。
   COGNEVA_PG_SHARING_PROCESSES: "4"
 
-  # Vector DB
-  COGNEVA_VECTOR_PROVIDER: "qdrant"
+  # Vector DB：后端地址直接由代码读 QDRANT_URL，没有第二个 provider 开关。
   QDRANT_URL: "http://qdrant.cogneva.svc.cluster.local:6334"
 
   # Media provider (local-sfu / trtc)

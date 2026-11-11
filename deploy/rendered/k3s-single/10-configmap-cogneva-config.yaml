@@ -34,7 +34,7 @@ data:
   # 分摊就会按过期的进程数做。`+1` 是滚动影子——同一次滚动里新 Pod 已经连上、
   # 旧 Pod 还没退出，两者都要算。
   COGNEVA_PG_SHARING_PROCESSES: "4"
-  COGNEVA_VECTOR_PROVIDER: "qdrant"
+  # 向量后端的地址直接由代码读 QDRANT_URL；没有第二个 provider 开关要同步。
   QDRANT_URL: "http://qdrant.cogneva.svc.cluster.local:6334"
   COGNEVA_MEDIA_PROVIDER: "local-sfu"
   COGNEVA_STORAGE_PROVIDER: "local-fs"

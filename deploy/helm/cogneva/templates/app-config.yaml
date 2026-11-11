@@ -60,7 +60,6 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
       "\"port\": 9091" (printf "\"port\": %d" (int .Values.gateway.webhookPort))
       "\"port\": 5432" (printf "\"port\": %d" (int .Values.backends.postgres.port))
       (printf "postgres.%s.svc.cluster.local:5432" $ns) (printf "postgres.%s.svc.cluster.local:%d" $ns (int .Values.backends.postgres.port))
-      (printf "qdrant.%s.svc.cluster.local:6334" $ns) (printf "qdrant.%s.svc.cluster.local:%d" $ns (int .Values.backends.qdrant.grpcPort))
       (printf "seaweedfs.%s.svc.cluster.local:8333" $ns) (printf "seaweedfs.%s.svc.cluster.local:%d" $ns (int .Values.backends.seaweedfs.s3Port))
       (printf "meilisearch.%s.svc.cluster.local:7700" $ns) (printf "meilisearch.%s.svc.cluster.local:%d" $ns (int .Values.backends.meilisearch.port))
       (printf "redis-0.redis.%s.svc.cluster.local:6379" $ns) (printf "redis-0.redis.%s.svc.cluster.local:%d" $ns (int .Values.backends.redis.port))
