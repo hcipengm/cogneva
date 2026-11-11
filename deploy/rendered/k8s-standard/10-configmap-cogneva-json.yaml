@@ -290,7 +290,12 @@ data:
             "client_cert_path": null,
             "client_key_path": null,
             "insecure_skip_verify": false
-          }
+          },
+          "_comment_consumer": "消费者侧的界与自动建流的保留策略。ack 等待要盖过最坏单条处理时延（记忆摄取含归档与两次 LLM 调用，分钟级），否则处理途中重投会重复消费；max_deliver 是毒药消息的判定，超次写 DLQ 后 ack 终止；max_ack_pending 是背压闸门，积压留在流里而不是消费进程内存里。stream_retention 默认 workqueue（任一消费组 ack 后即删，任务分发语义）；事件面等多订阅方场景必须是 limits，否则先 ack 的组会把消息从别的组嘴里删掉——注意既有流上不能把 retention 改入/改出 workqueue，改它只能删流重建。",
+          "consumer_ack_wait_secs": 900,
+          "consumer_max_deliver": 5,
+          "consumer_max_ack_pending": 1024,
+          "stream_retention": "workqueue"
         },
         "workspace_id": "default",
         "consumer_group": "cogneva",
@@ -466,7 +471,12 @@ data:
         "loki": {
           "_comment": "应用侧结构化日志的耐久面。主应用与进化进程的 tracing 事件此前只有 stdout 一张脸，随 Pod 消失（raw stream 存的是 LLM/协议原始报文，不是运行日志）；默认端点指向集群内观测栈。网关那一侧另有自己的 pusher，读的是同一份配置段。",
           "enabled": true,
-          "endpoint": "http://loki.monitoring.svc.cluster.local:3100"
+          "endpoint": "http://loki.monitoring.svc.cluster.local:3100",
+          "_comment_batching": "推送的批与退避：max_batch_size 条或 flush_interval_sec 秒先到者触发一次落盘；timeout_secs 是单次推送的等待上界，max_retries 是推送失败后的重试次数。这三条决定 Loki 短时不可达时进程内存里能压多少日志、以及一次故障要重投多久。",
+          "max_retries": 3,
+          "timeout_secs": 10,
+          "flush_interval_sec": 5,
+          "max_batch_size": 100
         },
         "config_declaration": {
           "_comment": "本进程读到的配置文档，与本 rev 声明的那份是否同一份。规则住在文档里，所以没有任何一条规则能报出文档自己没到；这一判在代码里跑，拿进程启动时读的那份，比对本二进制编译进来的那份。三次读取：settle_secs 之后的第二次是为了把「挂载还没跟上」和「文档确实落后」分开——文件在此期间已经前进，说明进程只是被替换的路上，不是卡住。第二次仍然落后时再等 hold_secs 读第三次：换版的 Pod 在这个窗口里被替换掉、判据随之消失，而卡在旧文档上的进程活得比自己的替换更久——2026-10-22 实测，一次改配置的滚动会为此先写一行 73 秒的告警，而那是「我的替换还没发生」，不是故障。",
@@ -479,7 +489,7 @@ data:
           "prometheus_url": "http://cog-observability-prometheus.monitoring:9090",
           "poll_interval_secs": 60,
           "eval_failure_alert_after": 3,
-          "_mirror_alerts_comment": "Prometheus 自己求值的告警里，哪些该抄进同一张告警表。这里给一对标签键值：带这对标签的 firing 告警每拍被抄成一行，Prometheus 里不再 firing 就 resolve。标在规则上而不是列在这里，是为了让规则和它的投递声明同一次改动落地、改名也丢不掉投递。名字已经在本进程 rules 里的跳过：那条由进程内求值记账，两个写者会为同一件事开两行。不配 = 不抄。另外两个键：`include_unmarked` 打开后连**不带标记**的告警也抄——集群自带的规则库（kube-prometheus 的 KubeJobFailed、CPUThrottlingHigh 一类）不带这个标记，不打开它们就永远进不了账本，账本也就不是全集；打开之前先确认读这张表的任务面排得空，因为每一行都会开一个演进任务。`exclude` 里点名的规则无论带不带标记都不抄，默认是 kube-prometheus 的两个哨兵：Watchdog 按构造常亮、InfoInhibitor 在没有任何 info 级告警时亮，两者进账本都只是在描述「没事」。",
+          "_comment_mirror_alerts": "Prometheus 自己求值的告警里，哪些该抄进同一张告警表。这里给一对标签键值：带这对标签的 firing 告警每拍被抄成一行，Prometheus 里不再 firing 就 resolve。标在规则上而不是列在这里，是为了让规则和它的投递声明同一次改动落地、改名也丢不掉投递。名字已经在本进程 rules 里的跳过：那条由进程内求值记账，两个写者会为同一件事开两行。不配 = 不抄。另外两个键：`include_unmarked` 打开后连**不带标记**的告警也抄——集群自带的规则库（kube-prometheus 的 KubeJobFailed、CPUThrottlingHigh 一类）不带这个标记，不打开它们就永远进不了账本，账本也就不是全集；打开之前先确认读这张表的任务面排得空，因为每一行都会开一个演进任务。`exclude` 里点名的规则无论带不带标记都不抄，默认是 kube-prometheus 的两个哨兵：Watchdog 按构造常亮、InfoInhibitor 在没有任何 info 级告警时亮，两者进账本都只是在描述「没事」。",
           "mirror_alerts": {
             "label": "cogneva_io_managed",
             "value": "true",
@@ -489,7 +499,7 @@ data:
               "InfoInhibitor"
             ]
           },
-          "_retired_rules_comment": "已经停用的规则名。从 rules 里删掉一条规则不会动它已经开着的行，那些行会以「正在持续」的样子一直留在 state=firing 那一面上（resolved_at 空、last_seen_at 停在删除那一刻），会去关它的只有那条规则自己，而它已经不在了。点名在这里的，watcher 启动时按普通解析的同一路径把它们结算掉。停用的名字不能同时出现在 rules 里。",
+          "_comment_retired_rules": "已经停用的规则名。从 rules 里删掉一条规则不会动它已经开着的行，那些行会以「正在持续」的样子一直留在 state=firing 那一面上（resolved_at 空、last_seen_at 停在删除那一刻），会去关它的只有那条规则自己，而它已经不在了。点名在这里的，watcher 启动时按普通解析的同一路径把它们结算掉。停用的名字不能同时出现在 rules 里。",
           "retired_rules": [
             "llm_pool_down",
             "live_image_not_on_mainline",
@@ -821,7 +831,7 @@ data:
             },
             {
               "name": "declared_failure_class_unrecorded",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "error_only_state",
                 "why": "cog-collaboration/src/observable.rs emits this gauge only on the branch where a failure class could not be recorded; healthy operation exports nothing, which the rule reads as \"no problem\"."
               },
@@ -1260,7 +1270,7 @@ data:
             },
             {
               "name": "face_remediation_could_not_be_submitted",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "只在动作规划器**拒收**修复目标时计数（cog-orchestrator/src/face_drift.rs 的 Err 支）；24 小时里一次都没被拒，这条序列就不存在，而「没被拒」与「没创建」在这种计数器上同形。"
               },
@@ -1314,7 +1324,7 @@ data:
             },
             {
               "name": "trace_tier_migration_failing",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Counted only when a trace-tier pass fails (cog-observability/src/snapshot.rs); no failure in the window."
               },
@@ -1438,7 +1448,7 @@ data:
             },
             {
               "name": "task_graph_measure_failed",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "The counter is created by its first failure, not by the process starting: `crates/cog-orchestrator/src/observable.rs` publishes it only once `snapshot.measure_failures > 0`, because a graph nobody has read yet must publish no zeros. On a cluster where every read has succeeded, no series exists, and \"no read failed\" and \"the counter was never created\" are the same shape here. The rule still fires on the first failure; the counter is absent only while there is nothing to count."
               },
@@ -1453,7 +1463,7 @@ data:
             },
             {
               "name": "runtime_asset_not_refreshed",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "error_only_state",
                 "why": "Same gauge and same export rule; not_refreshed is absent because every checked asset matched its manifest."
               },
@@ -1467,7 +1477,7 @@ data:
             },
             {
               "name": "runtime_asset_content_drift",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "error_only_state",
                 "why": "cog-reflection/src/runtime_assets.rs exports state gauges only for problem states of destinations that have one; a healthy asset is absent. The check's own timestamp is a separate series (cogneva_runtime_asset_check_seconds, present)."
               },
@@ -1592,7 +1602,7 @@ data:
             },
             {
               "name": "landing_mirror_behind",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Counted only when a mirror push is refused (cog-github/src/landing.rs record_counter on the failure branch); no refusal in 24h means the counter was never created. The rule fires on the first one."
               },
@@ -1621,7 +1631,7 @@ data:
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Counted only on the branch where the orchestrator refuses a re-drive the channel has already bought (crates/cog-github/src/landing.rs); a day in which every bought round was accepted exports no sample at all, and on a counter \"nothing was refused\" and \"nothing was ever created\" are the same shape."
               },
@@ -1640,7 +1650,7 @@ data:
             },
             {
               "name": "redrive_budget_forgotten",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Read-side ledger loss is counted only when the ledger read fails (cog-github/src/landing.rs); today the read succeeds, so the {side=\"read\"} series does not exist."
               },
@@ -1654,7 +1664,7 @@ data:
             },
             {
               "name": "redrive_charge_not_persisted",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Write-side ledger loss is counted only when the ledger write fails (cog-github/src/landing.rs); today the write succeeds, so the {side=\"write\"} series does not exist."
               },
@@ -1698,7 +1708,7 @@ data:
             },
             {
               "name": "held_series_check_unreadable",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "error_only_state",
                 "why": "cog-gateway/src/lib.rs exports this gauge only when the held-series check cannot be read; a readable check is absent, and the rule's max() sees no series."
               },
@@ -2053,7 +2063,7 @@ data:
             },
             {
               "name": "registry_tag_deletion_refused",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Counted only when a registry prune is refused (cog-reflection/src/mainline_deployer.rs); no refusal in the window."
               },
@@ -2138,7 +2148,7 @@ data:
             },
             {
               "name": "llm_pool_window_will_be_gone_before_it_resets",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "code_not_deployed",
                 "why": "The four series this rule projects over are published by commit 325075f7, which is not an ancestor of the revision the workloads are running (main-73954b19ad1f): that commit is six steps ahead of the live image, so the gauge values cannot exist on this cluster yet, and their absence says nothing about the pool's pacing. The rule becomes measurable on the next rollout; if the series are still absent after a revision containing 325075f7 is live, this declaration is stale and the reading turns red — check with `git merge-base --is-ancestor 325075f7 <live rev>` rather than by reading this sentence."
               },
@@ -2802,7 +2812,7 @@ data:
             },
             {
               "name": "mainline_delivery_preflight_refused",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Counted only when the preflight refuses a deploy (cog-reflection/src/mainline_deployer.rs); refused_total has no zero-value series until the first refusal."
               },
@@ -2816,7 +2826,7 @@ data:
             },
             {
               "name": "mainline_kubectl_refused",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Counted only when the cluster's authorization refuses one of the deployer's kubectl calls (cog-reflection/src/mainline_deployer.rs record_kubectl_refused, refusal branch only); labels are the server's own verb+resource, so the family is created by the first refusal and the rule fires on it. Emitter landed in 252fe47b, inside the running image main-93ebcda35e7a."
               },
@@ -2830,7 +2840,7 @@ data:
             },
             {
               "name": "mainline_rollout_refused",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Counted only when the cluster's admission face keeps a rollout from creating a Pod (cog-reflection/src/mainline_deployer.rs record_rollout_refused, admission branch only); labels are the wall (quota/limitrange/podsecurity/admission), so the family is created by the first refusal and the rule fires on it. The emitter ships in the same change as this row, so the series stays absent until that build is running."
               },
@@ -2844,7 +2854,7 @@ data:
             },
             {
               "name": "mainline_admission_held",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears."
               },
@@ -3088,7 +3098,7 @@ data:
             },
             {
               "name": "memory_backend_operation_never_succeeds",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "lazy_counter",
                 "why": "Counted only on a failed memory backend operation (cog-memory/src/metrics_instrumented.rs); no error in the window means no series. The rule also requires memory_operations_total, which is present on the success path."
               },
@@ -3394,7 +3404,7 @@ data:
             },
             {
               "name": "gitee_token_not_rotated",
-              "dormancy": {
+              "_comment_dormancy": {
                 "reason": "feature_off",
                 "why": "cog-gateway/src/contribution_admin.rs publishes this reading only when the stored contribution config says provider=gitee and mode=oauth with an obtained_at -- the refresher writes it on every tick before deciding whether to renew, and again after a successful write-back. A deployment connected with a hand-supplied token keeps mode=manual_or_device, and that token has no renewal this loop can perform, so nothing is published and the rule correctly stays silent; the loop's own health is still published either way (cogneva_loop_period_seconds and cogneva_loop_deaths_total on loop=gateway_gitee_token_refresher), so a refresher that stopped is read by background_loop_stalled rather than here."
               },
@@ -3959,7 +3969,18 @@ data:
           "enabled": true,
           "max_concurrent": 0,
           "wait_secs": 1800,
-          "lock_dir": "/var/lib/cogneva-build-gate"
+          "lock_dir": "/var/lib/cogneva-build-gate",
+          "_comment_measurements": "下面十个数是本部署宿主上的实测出厂值，不是定律：一个构建吃几个核、峰值多少内存、除构建外宿主必须留住多少、多安静算安静、界的移动阻尼与采样间隔。换一台机器就该在这里重量一遍、改掉。其中 build_demand_cores 与 build_peak_rss_mib 描述的是机器而不是构建，读它们的一层会压到本机付得起的范围（核数、MemTotal 减一个构建的峰值），只压不抬，读数 source 标签写 fitted。实测口径在 cog-core 的字段注释里。",
+          "build_demand_cores": 4.1,
+          "build_peak_rss_mib": 4481,
+          "mem_floor_mib": 24576,
+          "io_stall_budget_pct": 70.0,
+          "cpu_calm_pct": 5.0,
+          "io_calm_pct": 1.0,
+          "mem_calm_pct": 1.0,
+          "bound_window_secs": 60,
+          "cpu_sample_gap_ms": 200,
+          "reserve_fresh_secs": 900
         },
         "notify_on_success": true,
         "notify_on_failure": true,

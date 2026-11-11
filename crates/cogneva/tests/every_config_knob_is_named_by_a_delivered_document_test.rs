@@ -15,10 +15,19 @@
 //! 节类型、声明文档的位置、走节的骨架都只有一份，在 `common::config_surface`；
 //! 本门与 `config_section_reader_contract_test` 共用它。
 //!
+//! `produced` 来自两处之和：读回该节得到的键，与读取器类型的字段声明。只靠读回
+//! 时会漏掉 `skip_serializing_if` 在默认值上省掉的字段（`dag_executor.nats_url`、
+//! `system.enabled_plugins`），它们在文档里看不见，却真的能被类型读进来；声明把
+//! 这一半补上。字段声明同时给出 `#[serde(skip)]`（不算旋钮）与 `#[serde(alias)]`
+//! （同一个旋钮的另一个拼写）的答案。
+//!
+//! 字段声明跟着字段类型往下走：`Option` / `Vec` / `Box` / `Arc` 剥壳，本地结构体
+//! 递归，`HashMap` / `Value` 是动态键。所以 `observability.loki.*`、
+//! `infra_watch.rules[]`、`providers.*` 这些内层旋钮与顶层在同一条判据下，而不是
+//! 只对顶层成立。
+//!
 //! 判不了什么：
 //!
-//! * 被 `skip_serializing_if` 在默认值上省掉的字段：读回的类型里不出现这个键，
-//!   本门看不见它。这是类型层面的盲区，任何读回判据都有；本门不假装能代替它。
 //! * 键与消费者的连接：字段有、文档写了、代码没读，本门看不见。那是阅读器与
 //!   消费者之间的连接，`config_section_reader_contract_test` 的文件头已说明。
 //! * 只活在 `src/` 里的常量式旋钮（超时、上限、名字）：它们根本不进配置面，由
@@ -28,7 +37,7 @@ use std::collections::BTreeSet;
 
 use crate::common;
 
-use common::config_surface::{readers, section_shapes, shipped_configs};
+use common::config_surface::{readers, section_shapes, shipped_configs, TypeGraph};
 use common::routes::repo_root;
 
 /// At least this many knobs must be produced by the reader types. A floor,
@@ -219,6 +228,46 @@ const CODE_ONLY: &[CodeOnly] = &[
         "由 `COGNEVA_PARTITION_MAINTENANCE_INTERVAL_SECS` 覆盖；维护周期随部署的\
          分区规模走",
     ),
+    code_only(
+        "dag_executor.nats_url",
+        "旧的单 URL 拼写，载入时升级并入 `dag_executor.nats.urls`；交付文档只写升级\
+         后的形状，两处都写会让同一个端点有两个来源",
+    ),
+    code_only(
+        "github_integration.bot_identity.persona",
+        "实例自治身份：首次进化时生成并持久化。样例写一个名字等于替每个部署定下同\
+         一位人格",
+    ),
+    code_only(
+        "github_integration.bot_identity.fingerprint",
+        "实例机器指纹，缺失时首次使用自动生成；样例写一个值会让两个部署共用同一\
+         指纹，把各自的记录认成对方的",
+    ),
+    code_only(
+        "github_integration.bot_identity.app_slug",
+        "GitHub App 的公开 slug，随实际安装的 App 走；未配置时只认 username。样例\
+         没有 App 可指，写它会读成「这个部署以 App 身份发言」",
+    ),
+    code_only(
+        "observability.data_volume_watch.claim",
+        "由 `COGNEVA_DATA_VOLUME_CLAIM` 给出（`cog-core/src/claim_footprint.rs`）；\
+         空 = 不启动观测，而 PVC 名是部署拓扑事实，不是平台能替它写的",
+    ),
+    code_only(
+        "observability.data_volume_watch.volumes",
+        "由 `COGNEVA_DATA_VOLUME_MOUNTS` 给出；每个额外挂载的 claim/path 配对只有\
+         该部署自己知道（见字段注释），样例不替它声明自己挂了哪些卷",
+    ),
+    code_only(
+        "self_evolution.deploy_admission.server_dry_run",
+        "`Option<Vec<String>>`：省略就是这个部署没有开启集群侧 dry-run。样例写一个\
+         argv 会读成检查已开启，而判据进程可能根本连不上自己的 API server",
+    ),
+    code_only(
+        "system.enabled_plugins",
+        "`None` = 加载全部插件；写进样例即变成白名单，把插件面收窄成一个选择。\
+         黑名单是 `disabled_plugins`，样例写的是它",
+    ),
 ];
 
 fn registered(path: &str) -> Option<&'static CodeOnly> {
@@ -232,6 +281,7 @@ fn surfaces(root: &std::path::Path) -> (BTreeSet<String>, BTreeSet<String>, usiz
     let mut produced = BTreeSet::new();
     let documents = shipped_configs(root);
     let docs = documents.len();
+    let graph = TypeGraph::new(root);
     for (file, doc) in documents {
         for reader in readers() {
             if reader.section == "_comment" {
@@ -241,7 +291,7 @@ fn surfaces(root: &std::path::Path) -> (BTreeSet<String>, BTreeSet<String>, usiz
                 continue;
             };
             let mut shapes = Vec::new();
-            section_shapes(&file, &reader, section, reader.section, &mut shapes);
+            section_shapes(&graph, &file, &reader, section, reader.section, &mut shapes);
             for shape in shapes {
                 for key in shape.produced {
                     produced.insert(format!("{}.{key}", shape.path));

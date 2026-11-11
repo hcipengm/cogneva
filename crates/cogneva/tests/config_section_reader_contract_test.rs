@@ -29,6 +29,12 @@
 //! into a binding the code never used. That join is between the reader and its
 //! consumer, and no type-level check can stand in for it.
 //!
+//! The walk follows the reader type's declared fields, so the assertion reaches a
+//! key inside a nested object (`observability.loki.*`) or an array element
+//! (`observability.infra_watch.rules[]`), not only the top level of a section.
+//! A nested section whose key is read by *another* type is still declared as a
+//! reader of its own; see the paragraph below.
+//!
 //! A section's reader is not always one type. `self_evolution`'s own struct has
 //! no field for `artifact_evolution`; that key is read by cog-reflection, which
 //! seeks it out by pointer. Such a key is declared as a reader of its own,
@@ -43,7 +49,7 @@ use crate::common;
 
 use common::config_surface::{
     check_section, classified_sections, readers, sections_the_process_config_carries,
-    shipped_configs, Readings,
+    shipped_configs, Readings, TypeGraph,
 };
 use common::routes::repo_root;
 
@@ -116,6 +122,7 @@ fn every_reader_spells_the_section_out_where_it_says_it_does() {
 #[test]
 fn every_key_a_shipped_document_writes_is_read_by_something() {
     let root = repo_root();
+    let graph = TypeGraph::new(&root);
     let mut readings = Readings::default();
     let mut nested_seen: Vec<&str> = Vec::new();
     let mut omitted: Vec<String> = Vec::new();
@@ -145,7 +152,7 @@ fn every_key_a_shipped_document_writes_is_read_by_something() {
                     .filter(|n| section.get(n.section).is_some())
                     .map(|n| n.section),
             );
-            check_section(&file, &reader, section, &mut readings);
+            check_section(&graph, &file, &reader, section, &mut readings);
         }
     }
     assert!(docs >= 5, "only {docs} shipped configs were found");

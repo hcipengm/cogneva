@@ -19,14 +19,14 @@
 | M1 | 已完成 | 字面量读法收敛为一份，并有一道门判「不再长出第二份」 |
 | M2 | 已完成 | Wall / Report 控制律一份；夹具里逐字重复的体已清 |
 | M3 | 已完成 | 配置面读法一份；每个类型产生的旋钮至少被一份交付文档写出 |
-| M4 | 未开始 | 嵌套配置节没有进判据：只递归了唯一登记的一个指针节 |
-| M5 | 未开始 | `skip_serializing_if` 在默认值上省掉的字段，读回判据看不见 |
+| M4 | 已完成 | 嵌套配置节进入判据：类型图递归字段声明，内层与顶层同一条判据 |
+| M5 | 已完成 | `produced` = 读回 ∪ 字段声明，`skip_serializing_if` 字段不再消失 |
 | M6 | 未开始 | 9 个配置字段没有任何生产读取 |
 | M7 | 未开始 | 4 个字段只有同名碰撞，没有配置读取 |
 | M8 | 未开始 | `multi_backend_consumer.group` 被硬编码成 `"supervisor-multi"` |
 | M9 | 未开始 | `/metrics` 在四处硬编码，`metrics.endpoint` 无人读 |
 | M10 | 未开始 | `cogneva.example.json` 是手工维护的第二配置源 |
-| M11 | 未开始 | `observability.infra_watch._for_seconds_comment` 是藏起来的说明文字 |
+| M11 | 已完成 | 4 个藏起来的说明键与 19 处 `dormancy` 改名成 `_comment_*` |
 | M12 | 未开始 | 读法普查的人口只有 `tests/`，且头部有一句与事实不符 |
 | M13 | 未开始 | 纯词法读法该搬到 `cog-test-support`（dev-only 有门保证） |
 | M14 | 未开始 | 生产侧字段消费普查尚未成为判据 |
@@ -58,44 +58,57 @@
 - 状态：已完成（提交 `b979f2b`，已双推）
 - 证据：`crates/cogneva/tests/common/config_surface.rs`；
   `every_config_knob_is_named_by_a_delivered_document_test` 判「类型产生的键至少
-  被一份交付文档写出」，`CODE_ONLY` 登记了 32 条审计过的例外，`PRODUCED_FLOOR=300`、
+  被一份交付文档写出」，`CODE_ONLY` 登记了 40 条审计过的例外，`PRODUCED_FLOOR=300`、
   `DOCUMENT_FLOOR=5`。
 - 关闭判据：该门跑绿。已满足。
-- 注意：这道判据只对**顶层**字段成立；内层节是 M4。
+- 注意：M4 关闭后，内层节与顶层走同一条判据。
 
 ### M4 嵌套配置节没有进判据
 
-- 状态：未开始
+- 状态：已完成（本次提交，已双推）
 - 证据：
-  - `config_surface.rs:124` 是整棵树唯一的 `with_nested` 注册（`self_evolution → artifact_evolution`）；
-  - `section_shapes`（`config_surface.rs:329`）只在 `reader.nested` 命中时递归，其余
-    嵌套对象走到 `read_back.contains_key(key) || has_field(...)` 就停；
-  - `ObservabilityExportersConfig` 的 `loki`、`jaeger`、`clickhouse`、`alertmanager`、
-    `elasticsearch`、`infra_watch`、`trace_collector`、`data_volume_watch`、
-    `config_declaration` 都是结构体字段，内层键两边都不判；
-  - `_for_seconds_comment` 能漏进来，就是这个洞的症状（见 M11）。
-- 影响：「文档写的键有字段接着」和「类型产生的键有文档写出」这两句话，目前只对
-  顶层成立。内层两个方向都是盲的。
-- 关闭判据：
-  1. 从读取器类型出发递归字段类型：`Option<T>` / `Vec<T>` / `Box<T>` / `Arc<T>` 剥壳；
-     `HashMap` / `serde_json::Value` 视为动态键、不逐键判；枚举、外部叶子停；带环保护。
-     本地结构体自动下钻，`with_nested` 不再需要手写登记（跨 crate 的指针读除外）。
-  2. `artifact_evolution` 这类由另一个 crate 按 JSON 指针读、而父类型没有该字段的键，
-     保留一条最小登记，并在注释里写明它为什么不能从父类型推出来。
-  3. 反证：往某个嵌套节里塞一个没有字段的键，门必须红；删掉真实字段，`produced`
-     必须少一个键。
+  - `common/config_surface.rs` 新增类型图：`TypeGraph` 从 `crates/*/src` 读声明，
+    `Reader::of` 记下 `type_name`，`TypeInfo` / `FieldInfo` 保留字段名、别名、
+    `skip` / `skip_deserializing` / `flatten` 与 `rename_all`；
+  - `walk` 跟着字段类型下钻：`Option` / `Vec` / `Box` / `Arc` / `Cow` 剥壳，
+    本地结构体递归，`HashMap` / `Value` 是动态键，数组元素用 `section[]` 作路径，
+    带环保护；未知键在**任意一层**都是红；
+  - `with_nested` 只剩 `self_evolution → artifact_evolution` 一条：父类型没有该字段，
+    那是 cog-reflection 按 JSON 指针自己读的节；
+  - 自证（`config_surface::self_proofs`）：
+    `a_key_inside_a_nested_section_with_no_field_is_a_finding`、
+    `a_key_inside_an_array_element_with_no_field_is_a_finding` 证内层未知键会红；
+    `produced_is_read_from_the_declaration_not_from_a_default` 在临时树里删掉字段，
+    下一次读 `produced` 少一个键。
+  - 递归遍历与配平括号复用共享实现（`common::routes::walk` / `matching_brace`），
+    夹具普查门跑绿。
+- 顺带判出的真实缺陷（已随本条修掉）：
+  - `deploy/helm/cogneva/files/cogneva.json` 的
+    `observability.infra_watch.rules[]._comment_dormancy` 原名 `dormancy`，
+    19 处，`InfraRule` 没有该字段，交付比较器也不丢它——说明文字被当成旋钮；
+  - `_for_seconds_comment`、`_retired_rules_comment`、`_mirror_alerts_comment`
+    不以 `_comment` 开头，同一形状。
+  - 全部改名后重新渲染 k3s 静态清单与三份 profile。
+- 嵌套判据上线后暴露 26 个「类型产生、交付文档没写」的旋钮，已逐条关闭：
+  - 写进 chart（权威交付文档）：`dag_executor.nats.*` 4 条、`observability.loki.*`
+    4 条、`self_evolution.build_gate.*` 10 条实测值；
+  - `CODE_ONLY` 新增 8 条：`dag_executor.nats_url`、`bot_identity` 3 条、
+    `data_volume_watch` 2 条、`deploy_admission.server_dry_run`、
+    `system.enabled_plugins`，每条写明为什么只能由代码或环境变量给值。
+- 关闭判据：两道门 + 自证 + 夹具普查门全绿。已满足。
 
 ### M5 `skip_serializing_if` 字段对读回不可见
 
-- 状态：未开始
+- 状态：已完成（本次提交，已双推）
 - 证据：
-  - `crates/cog-core/src/config.rs:193` `dag_executor.nats_url: Option<String>`，
-    `#[serde(skip_serializing_if = "Option::is_none")]`；
-  - `crates/cog-core/src/config.rs:1043` `system.enabled_plugins: Option<Vec<String>>`，同；
-  - 默认值为 `None` 时序列化会把键丢掉，判据里的 `produced` 来自读回，于是看不见它们；
-    `has_field` 的非空探针能判「文档键有字段」，但判不了「类型产生的键文档有没有写」。
-- 关闭判据：`produced` = 读回键 ∪ 声明字段键（减掉 `#[serde(skip)]`）；上述两个键必须
-  出现在 `produced` 里，并有一条自证（删掉字段，`produced` 少一个键）。
+  - `produced` 现在是两处之和：读回该节得到的键 ∪ 类型声明的字段键（减掉
+    `#[serde(skip)]` 与 `#[serde(skip_deserializing)]`）；别名也算同一个旋钮；
+  - 自证 `a_field_serialization_omits_is_still_produced`：`dag_executor` 的默认读回
+    里没有 `nats_url`，而 `produced` 有它；同时断言内层
+    `nats.stream_retention` / `nats.consumer_ack_wait_secs` 被走到；
+  - `system.enabled_plugins` 在 `CODE_ONLY` 里写明「`None` = 全部插件，写进样例即
+    变成白名单」。
+- 关闭判据：上述自证跑绿。已满足。
 
 ### M6 9 个配置字段没有任何生产读取
 
@@ -172,12 +185,16 @@
 
 ### M11 `_for_seconds_comment` 是藏起来的说明文字
 
-- 状态：未开始
-- 证据：`cogneva.example.json` 的 `observability.infra_watch._for_seconds_comment`
-  不以 `_comment` 开头；当前交付比较器只丢 `_comment` 前缀，嵌套判据又没下钻（M4），
-  所以它既没被当说明文字丢掉，也没被当旋钮判。
-- 关闭判据：改名成 `_comment_for_seconds`（或并进既有的 `_comment`），所有交付文档
-  同步；M4 落地后内层说明文字按同一规则被丢。
+- 状态：已完成（本次提交，已双推）
+- 证据：
+  - 改名并同步所有交付文档：`_for_seconds_comment` → `_comment_for_seconds`、
+    `_retired_rules_comment` → `_comment_retired_rules`、
+    `_mirror_alerts_comment` → `_comment_mirror_alerts`；
+  - 同一形状的 `dormancy`（chart 内 19 处）→ `_comment_dormancy`；
+  - k3s ConfigMap 与三份 rendered profile 由 `deploy/scripts/render-deploy.sh`
+    重新生成（Chart 仍是唯一手改入口）。
+- 关闭判据：M4 的内层判据把「不以 `_comment` 开头的键」判成旋钮；改名后门绿。
+  已满足。
 
 ### M12 读法普查的人口与头部事实
 
@@ -237,7 +254,7 @@
 
 ## 执行顺序
 
-1. M4 + M5 + M11：类型图递归（最大覆盖缺口，且能顺手判出 M11）。
+1. ~~M4 + M5 + M11：类型图递归（最大覆盖缺口，且能顺手判出 M11）。~~ 已完成。
 2. M13 + M12：读法搬家与普查人口。
 3. M8 + M9 + M7 + M6：真实失效与无读取字段（接线或删除）。
 4. M10：example 去独立化（需要先定 (a) 还是 (b)）。
@@ -247,3 +264,6 @@
 ## 变更记录
 
 - 2026-11-11：建立台账；M1–M3 记为已完成（`f117611`、`b979f2b` 已双推）。
+- 2026-11-11：M4 + M5 + M11 关闭：类型图递归、`produced` 并上字段声明、说明键改名；
+  顺带修掉 19 处 `dormancy` 与 26 个嵌套旋钮的交付缺口（18 条写进 chart，
+  8 条进 `CODE_ONLY`）。
