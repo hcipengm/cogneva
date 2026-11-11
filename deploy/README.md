@@ -33,6 +33,7 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 | 脚本 | 功能 |
 |---|---|
 | `render-deploy.sh` | 用 `helm template -f profiles/<p>.yaml` 把 chart 渲染进 `rendered/<profile>/`；`--check` 做 CI 新鲜度门禁（重渲染有 diff 即红） |
+| `gen-example-config.py` | 从 chart 的 `files/cogneva.json` 生成仓库根 `cogneva.example.json`：只换首行说明、把 `github_integration.repo` 换成占位符、把告警规则裁到十条示例，其余逐字照抄（键序也照抄）；`--check` 判已提交的示例是否等于投影，CI 强制。示例不是手改源——改 chart 后重跑，手改示例判红 |
 | `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁：资源集合、每工作负载的 Pod 模板标签与容器内外全部字段、Service/NetworkPolicy/Ingress/StorageClass/Namespace/ServiceAccount/CronJob 的整份对象、治理对象与 ConfigMap 的整份 spec（安装来源标签除外）。比了多少资源、多少类由脚本自己报（资源随拓扑增减，别在文档里钉死），CI 强制 |
 | `check-pg-sharing-processes.sh` | Postgres 连接分摊门禁：渲染产物里 `COGNEVA_PG_SHARING_PROCESSES` 必须 ≥ 带 `COGNEVA_DATABASE_URL` 的常驻 Deployment 副本数之和 + 1（滚动影子）。这个数决定每个进程把服务器连接上限摊成每池几条；少算的那份平时是余量、滚动时被新 Pod 当成自己的，实测新 Pod 报 `pool timed out while waiting for an open connection`。读渲染产物而不是模板，表达式写对没生效也会红。CI 强制 |
 | `check-config-checksum-wiring.sh` | 配置内容与 Pod 身份的接线门禁：Pod 模板引用**同一份产物交付的**任一 ConfigMap（配置面从产物里读，不写名单；目前是 `cogneva-json` / `cogneva-prompts` / `cogneva-evolution-config` / `cogneva-config` / `searxng-settings`）的工作负载必须带 `checksum/config`（64 位 sha256），否则只改配置的升级不会滚动——配置换了、Pod 还是旧的，而渲染、parity、Pod 状态三面全绿。读同一组配置的消费者指纹必须相同（按「读到的配置有交集」分族，不同配置各自哈希不同的文档），形态之间不能全等（全等＝表达式被换成写死的字面量）。第二段真渲染两次、只改一个只进 env 配置的键，由两次渲染比出哪几份 ConfigMap 变了，要求它们的消费者指纹跟着变——否则把表达式改回只哈希卷里那份，上面几条仍全绿，而运维配好通知地址、升级成功后 Pod 一个都不换。CI 强制 |

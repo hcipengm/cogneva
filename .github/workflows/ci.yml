@@ -785,6 +785,11 @@ jobs:
         run: bash deploy/scripts/check-deploy-parity.sh
       - name: Check rendered profiles are fresh
         run: bash deploy/scripts/render-deploy.sh --check
+      # 示例配置也是生成物：它是 chart 配置文档的投影，比渲染产物晚一步被人想起来。
+      # 手改示例，或改了 chart 忘了重生成，都只在这条上红；别的门读的是它的内容，
+      # 而「内容合法」与「内容等于源」是两件事。
+      - name: Check the example config is generated from the chart
+        run: python3 deploy/scripts/gen-example-config.py --check
       # 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹）。新鲜度门只管
       # deploy/rendered/，parity 只管字段级对齐，两块都不问「抄过来的那两份还等于
       # 源吗」——于是改一次配置、忘了手抄，静态清单会一直落后而三道门全绿。

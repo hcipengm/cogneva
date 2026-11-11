@@ -33,7 +33,7 @@ spec:
       annotations:
         # 本 Pod 经 envFrom 取 cogneva-config。env 只在进程启动时读一次，所以
         # 只改配置的那次升级必须换掉这个模板，否则改完地址也不会生效。
-        checksum/config: 604ed8f84d618885e90100255dcb44a5190d852a0541ccb9bab6dc2bd8f15454
+        checksum/config: 5b2b2d65c93a5ec6d5a5e3c0fbbe1973b20ffecce17d65cf9e2ba9f336da4233
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
