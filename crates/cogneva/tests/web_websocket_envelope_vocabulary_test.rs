@@ -687,13 +687,13 @@ fn the_takeover_page_speaks_only_names_the_gateway_writes() {
     let frames = chat_frames(&production(&root.join(CHAT)));
     let events = agent_wire_names(&read(&root.join(EVENT_WIRE)));
 
-    // 九帧：start / text_delta / end / cancelled / thinking_start / thinking_delta /
-    // thinking_end / goal / change。数少了说明读取器与 chat.rs 的写法对不上——这条
-    // 数不是「帧的种类应当这么多」，是「读取器还看得见写者」的读数。
+    // 十帧：start / text_delta / end / cancelled / thinking_start / thinking_delta /
+    // thinking_end / goal / change / usage。数少了说明读取器与 chat.rs 的写法对不上——
+    // 这条数不是「帧的种类应当这么多」，是「读取器还看得见写者」的读数。
     assert_eq!(
         frames.len(),
-        9,
-        "只读出 {} 个聊天帧名字（{frames:?}）：写者是 chat.rs 的 envelope 调用，读不出九帧\
+        10,
+        "只读出 {} 个聊天帧名字（{frames:?}）：写者是 chat.rs 的 envelope 调用，读不出十帧\
          说明读取器与那边的写法已经对不上",
         frames.len()
     );
