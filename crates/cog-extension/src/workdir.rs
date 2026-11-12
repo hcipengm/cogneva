@@ -3590,10 +3590,17 @@ pub(crate) mod tests {
     /// creation straddles a second boundary give a span of two, which derives
     /// `MIN_TTL_SECS` and reaps nothing at all. That made this assertion fail
     /// on CI on 2026-11-03 (reaped 0 where it asserts 1) on a runner slow
-    /// enough for the two routes below to land in different seconds. So the
-    /// premise this test needs — "the configured TTL is the one in force" — is
-    /// written down instead of hoped for: both trees are stamped as arriving at
-    /// the same instant, which is what makes the derivation decline to answer.
+    /// enough for the two routes below to land in different seconds, and again
+    /// on 2026-11-12 in a full-suite run, where the same two routes sat more
+    /// than a second apart in wall-clock time.
+    ///
+    /// So this test no longer asks which of the two TTLs is in force. It stamps
+    /// both trees **older than either one** — the configured `ZERO` and the
+    /// largest value the derivation can return, `MIN_TTL_SECS` — and then the
+    /// only thing left deciding the outcome is the in-use exception, which is
+    /// the premise the test exists for. The arrivals are still stamped at one
+    /// instant, so a reader that wonders which branch ran is not answered by a
+    /// race either.
     #[tokio::test]
     async fn ttl_reaps_idle_trees_but_not_one_in_use() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3602,10 +3609,14 @@ pub(crate) mod tests {
         let (running, _in_use) = r.route("running").await.unwrap();
         let (idle, _) = r.route("idle").await.unwrap();
         let arriving_together = unix_now();
+        // Older than every TTL a pass can pick, so neither branch can spare an
+        // idle tree and the assertion measures the exception rather than the
+        // derivation.
+        let past_every_ttl = arriving_together - MIN_TTL_SECS as i64 - 1;
         for id in ["running", "idle"] {
             let mut meta = r.read_meta(id).expect("a routed tree has a sidecar");
             meta.created_at_unix = arriving_together;
-            meta.last_used_unix = arriving_together;
+            meta.last_used_unix = past_every_ttl;
             r.write_meta(&meta).await.unwrap();
         }
 
