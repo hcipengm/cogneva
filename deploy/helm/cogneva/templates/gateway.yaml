@@ -340,7 +340,7 @@ spec:
             - name: COGNEVA_CLUSTER_NAME
               value: {{ .Values.gitops.clusterName | quote }}
             - name: COGNEVA_GITOPS_METRICS_URL
-              value: {{ printf "http://localhost:%d/metrics" (int .Values.gateway.httpPort) | quote }}
+              value: {{ printf "http://localhost:%d%s" (int .Values.gateway.httpPort) .Values.observability.metricsPath | quote }}
             # 数据卷占用只由写它的进程量得出来：目录型卷的"容量"是整个节点文件系统，
             # 声明量与实际占用之间没有任何东西对账。进程知道自己写哪个目录、不知道
             # 目录背后是哪张 PVC，所以由部署侧指名（与上面挂载的 claimName 同一个）。

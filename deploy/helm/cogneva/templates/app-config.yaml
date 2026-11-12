@@ -70,7 +70,7 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
       "cogneva-security-gateway:8081" (printf "cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort))
       "http://loki.monitoring.svc.cluster.local:3100" (printf "%s" .Values.observability.loki.endpoint)
       "http://cog-observability-prometheus.monitoring:9090" (printf "%s" .Values.observability.infraWatch.prometheusUrl)
-      "localhost:8080/metrics" (printf "localhost:%d/metrics" (int .Values.gateway.httpPort))
+      "localhost:8080/metrics" (printf "localhost:%d%s" (int .Values.gateway.httpPort) .Values.observability.metricsPath)
 -}}
 {{- range $from, $to := $portage }}{{ if not (contains $from $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so this replacement would silently keep the old port -- update the pattern here to the file's new form" $from) }}{{ end }}{{ $json = replace $from $to $json }}{{ end }}
 apiVersion: v1

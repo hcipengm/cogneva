@@ -433,6 +433,11 @@ securityGateway:
 # files/cogneva.json 里又写一份。搬观测栈时改一处、另一处留在旧地址，症状是主应用
 # 那侧「日志不再落地」——没有任何报错，只是日志面上少了一个进程。
 observability:
+  # 指标路径的唯一部署侧声明。Rust 侧的同一个值在
+  # `cog-core::contract::observability::METRICS_PATH`；Helm 读不到 Rust 常量，所以
+  # 两边由 `crates/cogneva/tests/metrics_path_matches_deploy_test.rs` 比对，不同即红。
+  # 网关、claim-store 与自监控的抓取地址都从这一份拼：改这里，三处一起改。
+  metricsPath: /metrics
   loki:
     enabled: true
     endpoint: "http://loki.monitoring.svc.cluster.local:3100"

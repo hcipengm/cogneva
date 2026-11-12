@@ -370,7 +370,7 @@ spec:
             # 不配这一条不会「不抬」，而是每一拍都读成 unmeasured：没有读数就不下判据，
             # 那些卷停在 values 里的声明上，涨到头来要靠人改。
             - name: COGNEVA_CLAIM_STORE_METRICS_URL
-              value: {{ printf "http://cogneva-claim-store.%s.svc:%d/metrics" (include "cogneva.namespace" .) (int .Values.claimStore.port) | quote }}
+              value: {{ printf "http://cogneva-claim-store.%s.svc:%d%s" (include "cogneva.namespace" .) (int .Values.claimStore.port) .Values.observability.metricsPath | quote }}
             {{- end }}
             {{- if .Values.clusterRegistry.enabled }}
             # 集群内 registry 的卷不归本 Pod 写，走查也不在它的挂载表里：本 Pod 的
