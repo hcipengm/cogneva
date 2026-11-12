@@ -23,6 +23,7 @@ chrono = { workspace = true }
 schemars = { workspace = true }
 uuid = { workspace = true }
 jsonschema = { workspace = true }
+rand = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
