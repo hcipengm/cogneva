@@ -1088,3 +1088,41 @@ fn the_registry_endpoints_the_code_reads_are_declared_on_both_paths() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Batches of the end state land one group at a time, and a group that has
+/// landed must not carry `override` rows again: `override` is the word the end
+/// state deletes, so a re-added row reopens debt that was closed by measuring
+/// or deleting the value.
+///
+/// A deleted key is absent from the registry and that is the point -- if it
+/// comes back as an override, the row reappears here and this test names it.
+#[test]
+fn a_landed_batch_carries_no_override() {
+    const LANDED_GROUPS: &[(&str, &[&str])] = &[(
+        // Address and platform defaults: one leaf is an address four objects
+        // agree on, and three restated a platform default or upstream default.
+        "B0",
+        &[
+            "clusterRegistry.port",
+            "evolution.progressDeadlineSeconds",
+            "backup.ttlSecondsAfterFinished",
+            "webSearch.safeSearch",
+        ],
+    )];
+
+    let registry = registry();
+    let mut wrong = Vec::new();
+    for (batch, keys) in LANDED_GROUPS {
+        for key in *keys {
+            if let Some(row) = registry.rows.iter().find(|r| r.key == *key) {
+                if row.source == Source::Override {
+                    wrong.push(format!(
+                        "{batch}: `{key}` is back to `override` -- a landed group \
+                         may only be `derived` or `fixed`, or be gone"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
