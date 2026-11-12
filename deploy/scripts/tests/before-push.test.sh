@@ -188,6 +188,33 @@ grep -qE '^test .*-p fake.* -p cogneva|^test .*-p cogneva.* -p fake' "${cargo_lo
 echo "OK: 改动落在哪个包，Test 腿就判那个包加装配件"
 echo "OK: Test 腿真的调用了 cargo test -p fake -p cogneva（rc=${rc}）"
 
+# 同一句话里的「其中 N 份还没提交」得跟着树走。上一版的写法是
+# `printf '%s\n' "${uncommitted_crate_sources}" | wc -l`，空表上仍输出一个空行、数出 1，
+# 于是**干净树**印「其中 1 份还没提交」——这句的用处正是让人看出这一跑判的比这一推多，
+# 数错就把一份干净的字节说成有脏改动（2026-11-12 实测：/tmp/gate-wall11.log:2777 印 1，
+# 同一刻 `git status --porcelain` 是空的）。
+#
+# 两个方向都要判：只判 0 那一半，把数写死成 0 也能过；只判 1 那一半，脏树上永远印 1
+# 与「没数」同形。这里数的是这一格自己的树：上面那个 crate 的改动已经提交了。
+case "${out}" in
+  *"（其中 0 份还没提交）"*) ;;
+  *) fail "干净树上「还有几份没提交」不是 0 —— ${out}" ;;
+esac
+echo "OK: 干净树上「其中 0 份还没提交」"
+
+# 反方向：留一份没提交的 crates/*.rs 在工作树里，同一个数要变成 1——并且它必须只数
+# `crates/*.rs`，不是数整棵树的脏处。
+printf 'pub fn c() {}\n' >>"${leg}/crates/fake/src/lib.rs"
+: >"${cargo_log}"
+rc=0
+out_dirty="$(cd "${leg}" && CARGO_LOG="${cargo_log}" PATH="${leg}/bin:${PATH}" \
+    bash deploy/scripts/check-before-push.sh 2>&1)" || rc=$?
+case "${out_dirty}" in
+  *"（其中 1 份还没提交）"*) ;;
+  *) fail "树上有一份没提交的 crates/*.rs 时，「没提交」的数没有跟上 —— ${out_dirty}" ;;
+esac
+echo "OK: 有一份未提交的 crates/*.rs 时「其中 1 份还没提交」（rc=${rc}）"
+
 # ---- 脚本测试继承到 git 定位变量时，不许把调用方那棵树翻成裸库 ----
 # 这条门由 pre-push 钩子拉起时，钩子的 git 会把 `GIT_DIR` / `GIT_WORK_TREE` 指向
 # **调用方那棵树**。`deploy/scripts/tests/*.test.sh` 各自 `git init` 夹具仓库，定位
