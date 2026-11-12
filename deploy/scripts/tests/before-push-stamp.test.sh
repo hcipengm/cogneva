@@ -130,8 +130,9 @@ there_key="$(GIT_DIR="${caller}/.git" GIT_WORK_TREE="${caller}" \
 #
 # 为什么要有它：2026-11-08 实测，整门跑两小时，而远端每 66～123 分钟往前走一笔。要推就得
 # 先变基，一变基这棵树里就多了别人的文件，按树记的两把键一起作废——于是每个会话都在重复
-# 这两小时，不是红，是永远差一步。这几格钉住的是 patch-id 的两面：干净的变基之后同一批
-# 改动仍是验过的，而解冲突改了解法之后它就不再是同一批。
+# 这两小时，不是红，是永远差一步。这几格钉住的是改动键的三面：干净的变基之后同一批改动仍
+# 是验过的（上游只动别的文件是一格、动同一个文件的紧邻处是另一格——后者换了 `@@` 的切法），
+# 而解冲突改了解法之后它就不再是同一批。
 ptree="${work}/ptree"
 mkdir -p "${ptree}/deploy/scripts"
 stage_gate "${repo}" "${ptree}"
@@ -186,6 +187,61 @@ base2="$(git -C "${ptree}" rev-parse upstream)"
 # 笼统的「已验证」会让读的人把这两件事当成一件。
 grep -q '不是它与基底' "${work}/out" ||
     fail "放行的那一句没说清「验的是改动本身、不是合并结果」；实得：$(cat "${work}/out")"
+
+# 12b) 上游在**紧邻处**插进一行 ⇒ 同一片改动被切成两片，仍是同一批改动，账照样命中。
+#      这一格与上一格问的不是同一件事：上一格上游只动别的文件，这份 diff 一字不变；这一格
+#      上游动的是同一个文件——变基之后增删行仍然一字不差，只是 `@@` 从一片变成两片。2026-11-12
+#      实测：这正是 `git patch-id --stable` 会换 id 的形状（切法进了哈希），10 笔干净变基之后
+#      两小时的整门就此作废。所以这一格先自证形状（增删行相同、切法不同），再判账。
+htree="${work}/htree"
+mkdir -p "${htree}/deploy/scripts"
+stage_gate "${repo}" "${htree}"
+(
+    cd "${htree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n' >h.txt
+    git add h.txt
+    git commit -q -m base
+) || fail "夹具仓（切法）建不起来"
+hbase="$(git -C "${htree}" rev-parse HEAD)"
+# 这批改动改第 2 行与第 9 行，中间隔着 6 行——按默认的 3 行上下文，这 6 行正好把两处并进
+# 同一片 `@@`。上游插的第 4 行两头都够：它撑大了中间那段，两处只好各占一片；它又紧挨着
+# 第一处（三行上下文之内），于是作为上下文行进补丁正文——这正是 `git patch-id` 会换 id 的
+# 那一面（2026-11-12 实测：86dc873b… → 67e5cc8b…，增删行一字不差）。
+(
+    cd "${htree}" || exit 1
+    printf 'l1\nL2\nl3\nl4\nl5\nl6\nl7\nl8\nL9\nl10\n' >h.txt
+    git add h.txt
+    git commit -q -m mine
+) || fail "夹具的这批改动提交不掉"
+hmine="$(git -C "${htree}" rev-parse HEAD)"
+hkey="$( cd "${htree}" && bash deploy/scripts/check-before-push.sh --key-patch "${hbase}" )" ||
+    fail "--key-patch 退非零（切法夹具）"
+[ -n "${hkey}" ] || fail "--key-patch 什么都没印（切法夹具）"
+mkdir -p "${htree}/.git/check-before-push"
+printf 'fixture\n' >"${htree}/.git/check-before-push/patch.${hkey}"
+(
+    cd "${htree}" || exit 1
+    git checkout -q -b upstream "${hbase}"
+    printf 'l1\nl2\nl3\ninserted\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n' >h.txt
+    git add h.txt
+    git commit -q -m upstream
+) || fail "夹具的上游那一笔建不起来（切法）"
+hbase2="$(git -C "${htree}" rev-parse upstream)"
+( cd "${htree}" && git checkout -q main && git rebase -q upstream ) || fail "夹具的干净变基没走完（切法）"
+# 形状自证：同一批增删行，切法从一片变成两片。这一格哪天不再造出这个形状，它就不再判
+# 「切法」这件事了——那时要换夹具，而不是让它继续绿着。
+same_lines() { git -C "${htree}" diff --no-color "$1" "$2" -- h.txt | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)'; }
+[ "$(git -C "${htree}" diff --no-color "${hbase}" "${hmine}" -- h.txt | grep -c '^@@')" = "1" ] ||
+    fail "夹具没造出「一片 @@」的形状：$(git -C "${htree}" diff --no-color "${hbase}" "${hmine}" -- h.txt | grep -c '^@@') 片"
+[ "$(git -C "${htree}" diff --no-color "${hbase2}" HEAD -- h.txt | grep -c '^@@')" = "2" ] ||
+    fail "变基之后没切成两片：$(git -C "${htree}" diff --no-color "${hbase2}" HEAD -- h.txt | grep -c '^@@') 片"
+[ "$(same_lines "${hbase}" "${hmine}")" = "$(same_lines "${hbase2}" HEAD)" ] ||
+    fail "夹具的增删行变了，这一格就不再是「只是切法变了」"
+( cd "${htree}" && bash deploy/scripts/check-before-push.sh --status-patch "${hbase2}" ) >"${work}/out" 2>&1 ||
+    fail "上游在紧邻处插一行（切法变了、增删行没变）之后这批改动的账失效了；实得：$(cat "${work}/out")"
 
 # 13) 解冲突改了解法 ⇒ 这批改动不再是判过的那一批，旧账不许替它说话。
 (
