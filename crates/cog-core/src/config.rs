@@ -46,11 +46,10 @@ pub struct Config {
     pub multi_backend_consumer: MultiBackendConsumerConfig,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// The register of bounds the system sets for itself. Nothing in the
-    /// process reads it; a gate does (`bounds_registry_test`). See
-    /// [`crate::config_sections::BoundsConfig`] for why it is here at all.
-    #[serde(default)]
-    pub bounds: crate::config_sections::BoundsConfig,
+    // `bounds` 不在这个类型里，虽然它是一份交付配置的顶层段：这个进程不读它。
+    // 它是「系统给自己设的界」的登记簿，读者是 `crates/cogneva/tests/bounds_registry_test.rs`
+    // ——在那里按文档原样读（`doc.get("bounds")`），不经过一个没人消费的反序列化。
+    // serde 会略过不认识的键，所以文档里那段照样合法。
 }
 
 pub fn redacted(value: &str) -> &str {
@@ -1775,7 +1774,6 @@ impl Default for Config {
             system: SystemConfig::default(),
             self_evolution: SelfEvolutionConfig::default(),
             multi_backend_consumer: MultiBackendConsumerConfig::default(),
-            bounds: crate::config_sections::BoundsConfig::default(),
             env: HashMap::new(),
         }
     }

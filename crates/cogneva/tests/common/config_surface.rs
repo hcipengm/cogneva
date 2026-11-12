@@ -162,6 +162,20 @@ pub fn readers() -> Vec<Reader> {
         ),
         Reader::of::<cog_core::config::SupervisorConfig>("supervisor", None),
         Reader::of::<cog_core::config::SystemConfig>("system", None),
+        // Not read by the process, by design: `bounds` is the register of the
+        // bounds the system still sets for itself, and its reader is the gate
+        // that compares it against the code (`bounds_registry_test`). It is
+        // free-form registry data rather than a typed knob — every entry is a
+        // paragraph for a reader, not a value a running process turns — so the
+        // reader is the document's own shape, not a struct `Config` carries and
+        // nothing consumes.
+        Reader::of::<Map<String, Value>>(
+            "bounds",
+            Some((
+                "crates/cogneva/tests/bounds_registry_test.rs",
+                "doc.get(\"bounds\")",
+            )),
+        ),
         Reader::of::<cog_core::config::TierMigratorConfig>("tier_migrator", None),
         // The env supersede map: the loader merges each `PATH=dot.path` pair
         // over the document, so every value in it is moved as a string.

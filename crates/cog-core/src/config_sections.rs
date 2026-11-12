@@ -226,60 +226,6 @@ pub fn effect_of(name: &str) -> Option<ConfigEffect> {
         .map(|s| s.effect)
 }
 
-/// The `bounds` section: the register of bounds this system sets for itself.
-///
-/// Nothing in the process reads it. It exists so that every bound which still
-/// stops or refuses work is named in one document the owner can review, with
-/// the reason it was not removed written next to it, and so that a gate can
-/// fail when the register and the code disagree. A bound with no entry here is
-/// a bound nobody has judged.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct BoundsConfig {
-    /// Bounds judged not to be removed. Each must say why.
-    #[serde(default)]
-    pub kept: Vec<KeptBound>,
-    /// Bounds of the same shape as the ones already removed, still to be
-    /// removed. Listed so the remaining surface is visible, not approved.
-    #[serde(default)]
-    pub scheduled: Vec<ScheduledBound>,
-}
-
-/// A bound that stays, and why.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct KeptBound {
-    #[serde(default)]
-    pub id: String,
-    /// Repo-relative path of the file that declares it.
-    #[serde(default)]
-    pub file: String,
-    /// The symbol inside that file.
-    #[serde(default)]
-    pub symbol: String,
-    #[serde(default)]
-    pub value: String,
-    #[serde(default)]
-    pub why: String,
-}
-
-/// A bound of the same shape that is still to be removed.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct ScheduledBound {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub file: String,
-    #[serde(default)]
-    pub symbol: String,
-    #[serde(default)]
-    pub value: String,
-    /// What work it currently ends or refuses.
-    #[serde(default)]
-    pub what_it_kills: String,
-    /// What the removal looks like.
-    #[serde(default)]
-    pub next_step: String,
-}
-
 /// Top-level sections whose value differs between two documents, including
 /// sections one side does not have at all.
 pub fn changed_sections(old: &Value, new: &Value) -> BTreeSet<String> {

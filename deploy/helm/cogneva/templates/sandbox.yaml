@@ -76,7 +76,6 @@ spec:
           command:
             - sh
             - -c
-            {{- /* lit: 124 fixed — coreutils timeout's exit status; a shell contract, not a dial */}}
             - |
               set -e
               root=/opt/cogneva/sandbox
