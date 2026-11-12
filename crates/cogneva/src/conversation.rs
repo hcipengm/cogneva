@@ -393,6 +393,74 @@ pub(crate) async fn note_person(
         .await
 }
 
+/// 屏幕上那一问里「它要拿什么动手」这一行最多多长。
+///
+/// 界的是这一行的体积，不是参数能有多大：真正拦住大参数的是工具自己的上限，
+/// 这里只保证一条询问不会把整份文件正文塞进对话框。
+// cap: bound — 一行摘要的长度，界的是问句在屏幕上的体积
+const PERMISSION_SUMMARY_CHARS: usize = 240;
+
+/// 把一次调用的参数压成一行：`command` / `path` 这类最要紧的那一格先说，
+/// 那样屏幕上第一眼看到的就是它要动什么。
+fn permission_summary(arguments: &serde_json::Value) -> String {
+    let text = match arguments {
+        serde_json::Value::Object(map) => {
+            const LEAD: [&str; 4] = ["command", "path", "file_path", "pattern"];
+            let mut parts: Vec<String> = Vec::new();
+            for key in LEAD {
+                if let Some(value) = map.get(key).and_then(|v| v.as_str()) {
+                    parts.push(format!("{key}={value}"));
+                }
+            }
+            if parts.is_empty() {
+                serde_json::Value::Object(map.clone()).to_string()
+            } else {
+                parts.join("  ")
+            }
+        }
+        other => other.to_string(),
+    };
+    if text.chars().count() <= PERMISSION_SUMMARY_CHARS {
+        text
+    } else {
+        let head: String = text.chars().take(PERMISSION_SUMMARY_CHARS).collect();
+        format!("{head}…")
+    }
+}
+
+/// 把内核的「问一句」接到这条连接上。
+///
+/// 内核只知道有人会被问；这一层知道问的是这条 socket，答的是坐在它后面的人。
+/// 两个结局各自原样返回：内核据此决定执行还是把理由交回模型。
+struct ConversationPermissions {
+    bridge: Arc<dyn cog_gateway::chat::PermissionBridge>,
+    session_id: String,
+}
+
+#[async_trait::async_trait]
+impl cog_agent::permission::PermissionDecider for ConversationPermissions {
+    async fn decide(
+        &self,
+        ask: &cog_agent::permission::PermissionAsk,
+    ) -> cog_agent::permission::PermissionVerdict {
+        let view = cog_gateway::chat::PermissionAskView {
+            request_id: format!("perm-{}", uuid::Uuid::new_v4()),
+            session_id: self.session_id.clone(),
+            tool: ask.tool.clone(),
+            summary: permission_summary(&ask.arguments),
+            mode: ask.mode.as_str().to_string(),
+        };
+        match self.bridge.ask(view).await {
+            cog_gateway::chat::PermissionAnswer::Allow => {
+                cog_agent::permission::PermissionVerdict::Allow
+            }
+            cog_gateway::chat::PermissionAnswer::Deny { reason } => {
+                cog_agent::permission::PermissionVerdict::Deny { reason }
+            }
+        }
+    }
+}
+
 impl ConversationTurn for PlatformConversation {
     fn turn<'a>(
         &'a self,
@@ -535,6 +603,22 @@ impl ConversationTurn for PlatformConversation {
             // 做哪件活，由拿到的那句话决定。
             let capabilities = tools.names();
             let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
+            // 动手之前先问人。通道来自这条连接（网页），模式来自这一段对话当前
+            // 那一格；名字不认识时落到 `default`——比「不问」严、比「只读」松，
+            // 一次手误不该让这一轮问得更少。没有通道的连接不是「不问」，而是
+            // 需要问的那一步拒绝执行（见 `permission::decide`）。
+            let permission_mode =
+                cog_agent::permission::PermissionMode::parse(&request.permission_mode)
+                    .unwrap_or_default();
+            let permission_session = request.session_id.clone();
+            let decider: Option<Arc<dyn cog_agent::permission::PermissionDecider>> =
+                request.permissions.map(|bridge| {
+                    Arc::new(ConversationPermissions {
+                        bridge,
+                        session_id: permission_session,
+                    }) as Arc<dyn cog_agent::permission::PermissionDecider>
+                });
+            runtime = runtime.with_permissions(decider, permission_mode);
             // 名册交给运行时：它在每轮开头读到自己那一行的工号与名字，写进系统
             // 前缀。这里不做这件事——构造点不止这一处，漏一处那一种执行体就
             // 不知道自己的名字，而漏掉不会报错，只会回答「我是 unknown」。
@@ -3978,6 +4062,121 @@ mod tests {
                 "{name} 把账缺席说成了别的什么：{}",
                 answer["note"]
             );
+        }
+    }
+
+    /// 把一条连接上的问答记下来，好在问完之后看问的是什么。
+    struct ARecordingBridge {
+        answer: cog_gateway::chat::PermissionAnswer,
+        seen: std::sync::Mutex<Vec<cog_gateway::chat::PermissionAskView>>,
+    }
+
+    impl ARecordingBridge {
+        fn answering(answer: cog_gateway::chat::PermissionAnswer) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_gateway::chat::PermissionBridge for ARecordingBridge {
+        async fn ask(
+            &self,
+            view: cog_gateway::chat::PermissionAskView,
+        ) -> cog_gateway::chat::PermissionAnswer {
+            self.seen.lock().unwrap().push(view);
+            self.answer.clone()
+        }
+    }
+
+    /// 屏幕上那一行先说它要动什么。
+    ///
+    /// 只报工具名的话，连续十次 `write_file` 在对话框里是十行一样的字，人看不出
+    /// 这一问与上一问的区别，于是「确认」退化成闭眼点允许。界还必须有：一条询问
+    /// 不能把整份文件正文顶进对话框。
+    #[test]
+    fn a_question_leads_with_what_it_is_about_to_touch() {
+        let summary = permission_summary(&serde_json::json!({
+            "command": "cargo test -p cog-agent",
+            "cwd": "/opt/cogneva/sandbox",
+        }));
+        assert!(
+            summary.starts_with("command=cargo test"),
+            "最要紧的那一格没有排在前面：{summary}"
+        );
+
+        let huge = "x".repeat(PERMISSION_SUMMARY_CHARS * 3);
+        let capped = permission_summary(&serde_json::json!({ "path": huge }));
+        assert_eq!(
+            capped.chars().count(),
+            PERMISSION_SUMMARY_CHARS + 1,
+            "超长的摘要要在界上截断并留一个省略号，而不是整段塞进对话框"
+        );
+        assert!(capped.ends_with('…'), "{capped}");
+    }
+
+    /// 人答的那一句原样变成内核的判词：允许就执行，拒绝连理由一起交回模型。
+    ///
+    /// 这一层是内核与那条 socket 之间唯一的翻译。它把拒绝翻成允许（或者把理由
+    /// 吃掉）时，屏幕上点头的那个人说的话就不作数了，而内核那边每一步都还在按
+    /// 「有人说可以」往下跑。
+    #[tokio::test]
+    async fn the_answer_becomes_the_verdict_the_kernel_acts_on() {
+        let allow = ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::Allow);
+        let decider = ConversationPermissions {
+            bridge: allow.clone(),
+            session_id: "session-42".into(),
+        };
+        let ask = cog_agent::permission::PermissionAsk {
+            call_id: "call-1".into(),
+            agent_id: "agent-7".into(),
+            tool: "write_file".into(),
+            arguments: serde_json::json!({ "path": "crates/x.rs" }),
+            mode: cog_agent::permission::PermissionMode::Default,
+        };
+        let verdict =
+            <ConversationPermissions as cog_agent::permission::PermissionDecider>::decide(
+                &decider, &ask,
+            )
+            .await;
+        assert!(
+            matches!(verdict, cog_agent::permission::PermissionVerdict::Allow),
+            "人答了允许，内核却拿到拒绝"
+        );
+        {
+            let seen = allow.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].session_id, "session-42", "问句要落到这条会话上");
+            assert_eq!(seen[0].tool, "write_file");
+            assert_eq!(seen[0].mode, "default");
+            assert!(
+                seen[0].request_id.starts_with("perm-"),
+                "请求号要能带回来寻址：{}",
+                seen[0].request_id
+            );
+        }
+
+        let deny = ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::Deny {
+            reason: "这一步先别动这个文件".into(),
+        });
+        let decider = ConversationPermissions {
+            bridge: deny,
+            session_id: "session-42".into(),
+        };
+        match <ConversationPermissions as cog_agent::permission::PermissionDecider>::decide(
+            &decider, &ask,
+        )
+        .await
+        {
+            cog_agent::permission::PermissionVerdict::Deny { reason } => {
+                assert_eq!(
+                    reason, "这一步先别动这个文件",
+                    "拒绝的理由被吃掉了：模型收到的会是一句没有来由的失败"
+                );
+            }
+            other => panic!("人答了拒绝，内核却拿到 {other:?}"),
         }
     }
 }

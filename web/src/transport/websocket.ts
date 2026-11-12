@@ -8,6 +8,20 @@ import type { NotificationItem } from '@/api/client';
 
 export type ConnectionStatus = 'connecting' | 'open' | 'closed' | 'error';
 
+/**
+ * 服务端那一帧「要不要动手」按线路上的样子。
+ *
+ * 只声明会读的那几格：服务端还带着 `mode`，这一页用它显示「这一问是在哪一格下
+ * 发生的」；其余字段不声明，免得在这里长出一份与 Rust 侧悄悄分家的字段表。
+ */
+export interface PermissionAskWire {
+  request_id?: string;
+  session_id?: string;
+  tool?: string;
+  summary?: string;
+  mode?: string;
+}
+
 export interface WebSocketOptions {
   url: string;
   channels?: string[];
@@ -25,6 +39,12 @@ export interface WebSocketOptions {
    * 分派里只会被当成不认识的事件丢掉。
    */
   onChatFrame?: (frame: ChatFrame) => void;
+  /**
+   * 一次「要不要动手」的询问。它不经过 `onEvent`：这不是循环吐出来的事件，而是
+   * 一个正卡在那里等人回答的调用——丢进事件流里，屏幕上就只剩下一行日志，而
+   * 那一轮会一直等到连接断掉才被拒绝。
+   */
+  onPermissionRequest?: (ask: PermissionAskWire) => void;
   onStatusChange?: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -193,6 +213,14 @@ export class EventStreamClient {
       if (event) {
         this.options.onEvent(event);
       }
+    } else if (message.type === 'permission_request') {
+      // 认不出请求号的帧不能落地：答案是按它回去的，没有它就等于一条永远等在
+      // 那里的问题。
+      const wire = message as unknown as PermissionAskWire;
+      const requestId = wire.request_id;
+      if (!requestId) return;
+      this.options.onPermissionRequest?.(wire);
+      return;
     } else if (message.type === 'notification' && message.payload) {
       const notification = normalizeNotification(
         message.payload,

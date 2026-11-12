@@ -21,6 +21,7 @@ import { useFrameTickStore } from '@/store/frameTickStore';
 import { resourceKey } from '@/store/frameTick';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
+import { usePermissionStore } from '@/store/permissionStore';
 
 /**
  * 一条消息里的纯文本。
@@ -337,6 +338,19 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           onChatFrame: ingestChatFrame,
           onNotification: (notification) =>
             notificationHandler.current?.(notification),
+          // 问句直接进那一页的账：它不是一轮里的某一帧，而是一个正等在那里的
+          // 调用，丢进事件流只会被当成不认识的事件计数一次。
+          onPermissionRequest: (wire) => {
+            const id = wire.request_id;
+            if (!id) return;
+            usePermissionStore.getState().ask({
+              id,
+              sessionId: wire.session_id ?? 'default',
+              tool: wire.tool ?? '',
+              summary: wire.summary ?? '',
+              mode: wire.mode ?? 'default',
+            });
+          },
           onStatusChange: (status) => setConnectionStatus(status),
           onError: (error) => {
             console.error('WebSocket error:', error);

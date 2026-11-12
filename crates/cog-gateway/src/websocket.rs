@@ -91,6 +91,8 @@ async fn handle_type_message(
     out_tx: &tokio::sync::mpsc::Sender<String>,
     // 这条连接上正在跑的轮：`chat_cancel` 按会话找它们。
     running: &crate::chat::RunningTurns,
+    // 这条连接上的权限通道：问句出去、答案回来都走它，模式按会话记在这里。
+    permissions: &Arc<crate::chat::PermissionChannel>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -146,14 +148,56 @@ async fn handle_type_message(
             let platform = conn.origin.platform.map(str::to_string);
             let device_id = conn.origin.device_id.map(str::to_string);
             let running = running.clone();
+            // 这一轮的问人通道就是这条连接：问句从这里出去，答案从下面的
+            // `permission_response` 回来。模式取这一段对话当前那一格。
+            let mode = permissions.mode(&session);
+            let bridge: Arc<dyn crate::chat::PermissionBridge> =
+                Arc::new(crate::chat::SocketPermissionBridge::new(
+                    session.clone(),
+                    out_tx.clone(),
+                    Arc::clone(permissions),
+                ));
             tokio::spawn(async move {
                 let origin = crate::chat::ClientOrigin {
                     platform: platform.as_deref(),
                     device_id: device_id.as_deref(),
                 };
-                crate::chat::run_chat_turn(state, out, session, content, owner, origin, running)
-                    .await;
+                crate::chat::run_chat_turn(
+                    state,
+                    out,
+                    session,
+                    content,
+                    owner,
+                    origin,
+                    running,
+                    mode,
+                    Some(bridge),
+                )
+                .await;
             });
+        }
+        ClientMessage::PermissionResponse {
+            request_id,
+            allow,
+            reason,
+            ..
+        } => {
+            let answer = if allow {
+                crate::chat::PermissionAnswer::Allow
+            } else {
+                crate::chat::PermissionAnswer::Deny {
+                    reason: reason.unwrap_or_else(|| "人在对话框里拒绝了这一次执行。".into()),
+                }
+            };
+            // 没人等这一问（重复的答案、或者那一轮已经被停掉）不是错误：那一问
+            // 已经不在了，答案落地与否不改变任何结果。
+            let delivered = permissions.answer(&request_id, answer);
+            tracing::debug!(request = %request_id, delivered, "permission answer");
+        }
+        ClientMessage::PermissionMode {
+            session_id, mode, ..
+        } => {
+            permissions.set_mode(&session_id, &mode);
         }
         ClientMessage::ChatCancel { session_id, .. } => {
             // 没有在跑的那一段上按停止不是错：用户可能刚好在上一轮结束的那一瞬
@@ -239,6 +283,8 @@ pub async fn handle_socket(
     // 这一条连接上正在跑的轮。按连接分，不放进 `GatewayState`：一段对话的停止是
     // 「这一次连接里跑着的那几轮」，从别的标签页发出的停止不该停掉这一页上的回答。
     let running = crate::chat::RunningTurns::new();
+    // 这条连接上的权限通道：一段对话一格模式，一行问题一个等待位。
+    let permissions = Arc::new(crate::chat::PermissionChannel::new());
 
     // Register connection and send "connected" event.
     if let Some(ref mgr) = state.connection_manager {
@@ -371,6 +417,7 @@ pub async fn handle_socket(
                                 &text,
                                 &out_tx,
                                 &running,
+                                &permissions,
                             )
                             .await
                         {

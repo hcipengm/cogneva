@@ -64,6 +64,27 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// 人对一次执行前询问的回答。
+    ///
+    /// 按请求号寻址，不按会话号：同一段对话里可能有两问同时在等（用户连发两句），
+    /// 按会话答会把答案交给错的那一个。
+    #[serde(rename = "permission_response")]
+    PermissionResponse {
+        request_id: String,
+        allow: bool,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
+    /// 这一段对话处哪种权限模式。闭集由内核定义，这里只搬名字。
+    #[serde(rename = "permission_mode")]
+    PermissionMode {
+        session_id: String,
+        mode: String,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
 }
 
 /// Server → Client WebSocket messages.
@@ -109,6 +130,19 @@ pub enum ServerMessage {
         event_id: String,
         payload: serde_json::Value,
         server_time: String,
+    },
+    /// 一次执行前询问：内核要动这个文件、跑这条命令，先问这条连接上的人。
+    ///
+    /// 按请求号寻址，不按会话号：同一段对话里可能有两问同时在等，答案带着这个
+    /// 号回来才不会交到错的那一个手上。`summary` 是一句人话——工具名加它要碰
+    /// 的东西，不是整份参数。
+    #[serde(rename = "permission_request")]
+    PermissionRequest {
+        request_id: String,
+        session_id: String,
+        tool: String,
+        summary: String,
+        mode: String,
     },
 }
 

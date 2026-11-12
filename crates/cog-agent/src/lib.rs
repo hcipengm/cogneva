@@ -10,6 +10,7 @@ pub mod hooks;
 pub mod identity;
 pub mod lifecycle;
 pub mod observable;
+pub mod permission;
 pub mod pool_sizing;
 pub mod principles;
 pub mod runtime;

@@ -412,6 +412,13 @@ pub struct AgentRuntime {
     /// that fit: with no archiver a truncated output is lost, and the handle is
     /// what carries the reading that says so.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
+    /// 工具执行之前那一问由谁回答，以及这一轮处在哪种模式下。
+    ///
+    /// 没有配置回答者时不是「不问」，而是「要问的那一步拒绝」：见
+    /// [`crate::permission::decide`]。默认模式是 `bypass`，也就是今天的行为——
+    /// 不问、全放行——但这个选择有名字，因此会话上可读、可改。
+    permission: Option<Arc<dyn crate::permission::PermissionDecider>>,
+    permission_mode: crate::permission::PermissionMode,
     /// What the run in flight has been billed for so far. Reset by every
     /// [`Self::run_scoped`]; read when the run ends.
     run_usage: RunUsage,
@@ -1130,6 +1137,8 @@ impl AgentRuntime {
             skills_cache_instant: None,
             observability: None,
             tool_output_archive: None,
+            permission: None,
+            permission_mode: crate::permission::PermissionMode::Bypass,
             run_usage: RunUsage::default(),
             run_task_id: None,
             last_run_task: None,
@@ -1296,6 +1305,21 @@ impl AgentRuntime {
 
     pub fn with_sandbox_backend(mut self, backend: Arc<dyn cog_core::SandboxBackend>) -> Self {
         self.sandbox_backend = Some(backend);
+        self
+    }
+
+    /// 让这一轮在动手之前先问一句。
+    ///
+    /// 两样一起给，因为它们回答的是同一个问题：「谁说了算」。只给模式不给回答者，
+    /// 要问的那一步会拒绝（[`crate::permission::decide`]），所以调用方必须清楚自己
+    /// 选的是哪一种。
+    pub fn with_permissions(
+        mut self,
+        decider: Option<Arc<dyn crate::permission::PermissionDecider>>,
+        mode: crate::permission::PermissionMode,
+    ) -> Self {
+        self.permission = decider;
+        self.permission_mode = mode;
         self
     }
 
@@ -2823,6 +2847,46 @@ impl AgentRuntime {
                         }
                         continue;
                     }
+                }
+
+                // 动手之前先问。模式能自己定的就不出门；要问的，答案决定这一格是
+                // 执行还是把理由交回模型。理由不是工具失败：同一个调用再发一遍会
+                // 得到同一个答案，所以它带着 `permission` 标记，让循环看得出这一
+                // 条换不掉重试。
+                let ask = crate::permission::PermissionAsk {
+                    call_id: tc.id.clone(),
+                    agent_id: self.config.agent_id.clone(),
+                    tool: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                    mode: self.permission_mode,
+                };
+                if let crate::permission::PermissionVerdict::Deny { reason } =
+                    crate::permission::decide(self.permission_mode, self.permission.as_ref(), &ask)
+                        .await
+                {
+                    let denied = serde_json::json!({
+                        "error": reason.clone(),
+                        "permission": "denied",
+                        "mode": self.permission_mode.as_str(),
+                    });
+                    observations.push(denied.clone());
+                    tool_result_messages.push(Message::tool_result_text(
+                        &tc.id,
+                        &tc.name,
+                        denied.to_string(),
+                    ));
+                    self.emit_event(AgentEvent::ToolExecutionEnd {
+                        agent_id: self.config.agent_id.clone(),
+                        tool_call_id: tc.id.clone(),
+                        result: denied,
+                        is_error: true,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await?;
+                    if let Some(ref after) = self.hooks.after_tool_call {
+                        after(&tc.name, &tc.arguments, &Err(SFError::Agent(reason)));
+                    }
+                    continue;
                 }
 
                 self.state = RuntimeState::Acting;
@@ -8255,5 +8319,166 @@ mod tests {
                 if *expected { "写" } else { "只读" }
             );
         }
+    }
+
+    /// 需要人点头的工具，在人说「不」的时候不执行；理由回到模型手里。
+    ///
+    /// 这条测的是三件事一起成立：工具体一次都没跑；这一轮没有因此报错退出（理由
+    /// 是给模型看的，不是给运行时的）；模型第二次被问到时，读到的是那句理由，
+    /// 而不是一条空结果。少任何一条，界面上都会出现「它说它要动手，然后什么也
+    /// 没发生」。
+    #[tokio::test]
+    async fn a_tool_that_needs_a_yes_does_not_run_when_the_answer_is_no() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Denying;
+        #[async_trait::async_trait]
+        impl crate::permission::PermissionDecider for Denying {
+            async fn decide(
+                &self,
+                _ask: &crate::permission::PermissionAsk,
+            ) -> crate::permission::PermissionVerdict {
+                crate::permission::PermissionVerdict::Deny {
+                    reason: "这一次不同意".into(),
+                }
+            }
+        }
+
+        /// 第一次要动 `write_file`，之后每次只交一句话；第二次被问到时把读到的
+        /// 消息抄一份下来，供断言理由到没到。
+        struct AskOnceThenAnswer {
+            calls: AtomicUsize,
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::LlmClient for AskOnceThenAnswer {
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+                if turn > 0 {
+                    let mut seen = self.seen.lock().unwrap();
+                    seen.extend(messages.iter().map(|m| format!("{m:?}")));
+                }
+                let (stream, producer) = cog_core::EventStream::with_capacity(4);
+                tokio::spawn(async move {
+                    let mut producer = producer;
+                    let text = if turn == 0 {
+                        "先动手"
+                    } else {
+                        "好吧，不动了"
+                    };
+                    let _ = producer
+                        .push(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: text.to_string(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                    let mut content = vec![ContentBlock::Text {
+                        text: text.to_string(),
+                        text_signature: None,
+                    }];
+                    if turn == 0 {
+                        content.push(ContentBlock::tool_call(
+                            "call-write",
+                            "write_file",
+                            serde_json::json!({"path": "a.txt", "content": "x"}),
+                        ));
+                    }
+                    producer.end(cog_core::ChatResponse {
+                        content,
+                        api: "mock".into(),
+                        provider: "mock".into(),
+                        model: "mock".into(),
+                        response_id: None,
+                        usage: cog_core::Usage::default(),
+                        stop_reason: cog_core::StopReason::Stop,
+                        error_message: None,
+                        upstream_failure: None,
+                        retry_after_secs: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                });
+                Ok(stream)
+            }
+
+            async fn complete_stream(
+                &self,
+                _prompt: &str,
+                _options: &cog_core::CompleteOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                unimplemented!()
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::ChatResponse> {
+                unimplemented!()
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let registry = ToolRegistry::new();
+        {
+            let ran = Arc::clone(&ran);
+            cog_core::ToolRegistry::register(
+                &registry,
+                cog_core::Tool {
+                    name: "write_file".into(),
+                    description: "writes a file".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    implementation: cog_core::ToolImplementation::Native(Arc::new(move |_args| {
+                        let ran = Arc::clone(&ran);
+                        Box::pin(async move {
+                            ran.fetch_add(1, Ordering::SeqCst);
+                            Ok(serde_json::json!({ "written": true }))
+                        })
+                    })),
+                },
+            );
+        }
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "needs-a-yes".into(),
+            role: "needs-a-yes-test".into(),
+            max_iterations: 4,
+            ..Default::default()
+        };
+        let decider: Arc<dyn crate::permission::PermissionDecider> = Arc::new(Denying);
+        let mut runtime = AgentRuntime::new(config, tx)
+            .with_tools(registry)
+            .with_permissions(Some(decider), crate::permission::PermissionMode::Default);
+        let llm = AskOnceThenAnswer {
+            calls: AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+
+        runtime
+            .run(serde_json::json!({"task": "写一个文件"}), &llm)
+            .await
+            .expect("人拒绝是一次结论，不是运行时的一次失败");
+
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "没点头的工具一次都不许跑");
+        let seen = llm.seen.lock().unwrap().join("\n");
+        assert!(
+            seen.contains("这一次不同意"),
+            "拒绝的理由要回到模型手里，模型才可能换一条路: {seen}"
+        );
+        assert!(
+            seen.contains("permission"),
+            "这一条结果要自报是「没被允许」，与一次执行失败分得开: {seen}"
+        );
     }
 }

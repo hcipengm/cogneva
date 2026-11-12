@@ -55,6 +55,185 @@ pub trait ConversationTurn: Send + Sync {
     >;
 }
 
+/// 一次执行前的询问，从装配层递到界面上。
+///
+/// 网关不认识「权限模式」这个类型，只认识它的名字：模式是内核的闭集，网关只负责
+/// 让这个名字原样出现在问句里，并在答案回来时原样送回。名字不认识的由装配层拒绝，
+/// 网关不猜一个默认值。
+#[derive(Debug, Clone)]
+pub struct PermissionAskView {
+    pub request_id: String,
+    pub session_id: String,
+    pub tool: String,
+    /// 人要看的那一行：这个工具要拿什么参数。只报工具名的话，屏幕上会出现一百次
+    /// 一模一样的「write_file」。
+    pub summary: String,
+    pub mode: String,
+}
+
+/// 人给回来的答案。拒绝要带理由，理由要交回模型。
+#[derive(Debug, Clone)]
+pub enum PermissionAnswer {
+    Allow,
+    Deny { reason: String },
+}
+
+/// 谁把那一问送到人面前。
+///
+/// 实现在连接那一侧：它知道这条 socket 在哪里，也知道答案从哪一条上行消息回来。
+/// 网关的聊天函数只拿着这个 trait——它不执行工具，也就不该知道工具长什么样。
+#[async_trait::async_trait]
+pub trait PermissionBridge: Send + Sync {
+    async fn ask(&self, view: PermissionAskView) -> PermissionAnswer;
+}
+
+/// 一条连接上的权限通道：等着人答的问题，和每一段对话用的模式。
+///
+/// 两样放在一起，是因为它们都只活在这一条连接上：问题按请求号索引（同一段对话里
+/// 可以有两问同时在等），模式按会话号索引（同一段对话跨轮次保持同一格）。
+pub struct PermissionChannel {
+    pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<PermissionAnswer>>>,
+    modes: Mutex<HashMap<String, String>>,
+}
+
+impl Default for PermissionChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PermissionChannel {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            modes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 这一段对话现在用哪一格模式。没声明过就是 `default`——比「不问」严，
+    /// 比「只读」松，是人在场时的常态。
+    pub fn mode(&self, session_id: &str) -> String {
+        self.modes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// 换这一段对话的模式。名字原样存下，不认识的名字由装配层在用到时拒绝——
+    /// 网关不认识闭集，也就不该在这里替它猜一格。
+    pub fn set_mode(&self, session_id: &str, mode: &str) {
+        self.modes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_string(), mode.to_string());
+    }
+
+    /// 把一条上行答案交给等着的那一问。没人等（重复的答案、已经断开的问）就是
+    /// 什么都没有发生——不是错误，也不该造一条回执。
+    pub fn answer(&self, request_id: &str, answer: PermissionAnswer) -> bool {
+        let sender = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id);
+        match sender {
+            Some(tx) => tx.send(answer).is_ok(),
+            None => false,
+        }
+    }
+
+    /// 这一问的那一头没了：从表上摘掉，不再等答案。
+    ///
+    /// 不摘的话这张表跟着「连上来又断掉、每次都问过一句」的连接数长，而每一行都是一个
+    /// 等不到答案的发送端——它自己不会消失。
+    fn forget(&self, request_id: &str) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id);
+    }
+
+    fn register(&self, request_id: &str) -> tokio::sync::oneshot::Receiver<PermissionAnswer> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id.to_string(), tx);
+        rx
+    }
+}
+
+/// 走这条 socket 的问人通道。
+///
+/// 问句从这条连接自己的出站管道发出去，与聊天帧走同一条路；答案从另一条上行消息
+/// 回来。上行消息在套接字循环里处理，这一问在聊天任务里等——两件事不在同一个任务
+/// 上，所以答案表是共享的，按请求号找。
+pub struct SocketPermissionBridge {
+    session_id: String,
+    out: mpsc::Sender<String>,
+    channel: Arc<PermissionChannel>,
+}
+
+impl SocketPermissionBridge {
+    pub fn new(
+        session_id: String,
+        out: mpsc::Sender<String>,
+        channel: Arc<PermissionChannel>,
+    ) -> Self {
+        Self {
+            session_id,
+            out,
+            channel,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PermissionBridge for SocketPermissionBridge {
+    async fn ask(&self, view: PermissionAskView) -> PermissionAnswer {
+        let rx = self.channel.register(&view.request_id);
+        let Ok(frame) = serde_json::to_string(
+            &crate::websocket_protocol::ServerMessage::PermissionRequest {
+                request_id: view.request_id.clone(),
+                session_id: self.session_id.clone(),
+                tool: view.tool.clone(),
+                summary: view.summary.clone(),
+                mode: view.mode.clone(),
+            },
+        ) else {
+            self.channel.forget(&view.request_id);
+            return PermissionAnswer::Deny {
+                reason: "这一问没能发出去，所以没有执行。".into(),
+            };
+        };
+        if self.out.send(frame).await.is_err() {
+            self.channel.forget(&view.request_id);
+            return PermissionAnswer::Deny {
+                reason: "这条连接已经关闭，没有人回答，所以没有执行。".into(),
+            };
+        }
+        // 没有人给这一问上时限：人在读它。但「没人会再读到它」必须立刻结束，否则这一轮
+        // 会一直挂在「等我点头」上，而读它的那个人已经不在了——答案永远不会回来，`rx`
+        // 也就永远不报错（发答案的那一头还活在这条通道的表里）。出站管道那一头没了就是
+        // 连接断了，按拒绝收场，一个悬着的问不会变成一次默认放行，也不会变成一次泄漏。
+        let answer = tokio::select! {
+            got = rx => got.ok(),
+            _ = self.out.closed() => None,
+        };
+        match answer {
+            Some(answer) => answer,
+            None => {
+                self.channel.forget(&view.request_id);
+                PermissionAnswer::Deny {
+                    reason: "这条连接在回答之前关闭了，所以没有执行。".into(),
+                }
+            }
+        }
+    }
+}
+
 /// 交给那一轮的全部输入。历史由网关装配——它读的是这段对话在库里的记录。
 pub struct ConversationRequest {
     pub session_id: String,
@@ -69,6 +248,12 @@ pub struct ConversationRequest {
     pub platform: Option<String>,
     /// 同一台设备的同一个客户端，同样来自握手。
     pub device_id: Option<String>,
+    /// 这一轮处在哪种权限模式下，取的是闭集里的名字。不认识的由装配层按更严的
+    /// 那一格处理——一次拼错的模式名不该让这一轮问得更少。
+    pub permission_mode: String,
+    /// 这条连接上「问人」的那条路。没有它时，需要确认的那一步拒绝执行并说明
+    /// 为什么——不是一个没人做过的决定被记成做过的。
+    pub permissions: Option<Arc<dyn PermissionBridge>>,
 }
 
 /// 握手时客户端自报的「我在哪儿」，借用版。
@@ -583,6 +768,11 @@ async fn record_failed_turn(
 ///
 /// 这一屏不执行任何工作。它能不能读台账、能不能派活，取决于装配层给那条循环装了
 /// 哪些工具；它自己只有一条把历史交出去、把事件读回来的路。
+///
+/// 参数多是这一屏本来的形状：一轮对话的六样输入，加上问不问人的两样配置。打包成
+/// 结构体只是把同一组参数挪进另一个括号，而按签名读正文的那些普查（回声的正文来自
+/// 哪个参数、记录的写入在哪一步）会因此失去抓手。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_chat_turn(
     state: Arc<GatewayState>,
     out: mpsc::Sender<String>,
@@ -596,6 +786,10 @@ pub async fn run_chat_turn(
     origin: ClientOrigin<'_>,
     // 这条连接上正在跑的轮。这一轮登记进去，客户端的停止才找得到它。
     running: RunningTurns,
+    // 这一轮处在哪种权限模式下（闭集里的名字），以及问人的那条路。两格一起走：
+    // 模式决定问不问，通道决定问得到谁。
+    permission_mode: String,
+    permissions: Option<Arc<dyn PermissionBridge>>,
 ) {
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).
@@ -666,6 +860,8 @@ pub async fn run_chat_turn(
                 llm,
                 platform: origin.platform.map(str::to_string),
                 device_id: origin.device_id.map(str::to_string),
+                permission_mode,
+                permissions,
             },
             events_tx,
         ),
@@ -797,6 +993,67 @@ pub async fn run_chat_turn(
 mod tests {
     use super::*;
     use cog_core::ChatTurnStore;
+
+    /// 一次询问要走到人面前，答案要回到正好问出它的那一问上。
+    ///
+    /// 三条一起成立才算通：问句真的出了这条连接（屏幕上没有它，那一轮就一直等
+    /// 到断线）；请求号原样带出去（答案按它回来）；答案落到等待的那一问上，
+    /// 而不是落到「这一段对话上正在等的那一个」——同一段对话可以有两问同时在等。
+    #[tokio::test]
+    async fn an_answer_reaches_the_question_that_asked_for_it() {
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let channel = Arc::new(PermissionChannel::new());
+        let bridge = SocketPermissionBridge::new("s1".into(), out_tx, Arc::clone(&channel));
+        let ask = PermissionAskView {
+            request_id: "perm-1".into(),
+            session_id: "s1".into(),
+            tool: "write_file".into(),
+            summary: "path=a.txt".into(),
+            mode: "default".into(),
+        };
+        let waiter = tokio::spawn(async move { bridge.ask(ask).await });
+
+        let frame = out_rx.recv().await.expect("问句必须出门");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("问句是 JSON");
+        assert_eq!(parsed["type"], "permission_request");
+        assert_eq!(parsed["request_id"], "perm-1");
+        assert_eq!(parsed["tool"], "write_file");
+
+        assert!(
+            channel.answer("perm-1", PermissionAnswer::Allow),
+            "这一问正在等，答案必须找得到它"
+        );
+        assert!(matches!(waiter.await.unwrap(), PermissionAnswer::Allow));
+        assert!(
+            !channel.answer("perm-1", PermissionAnswer::Allow),
+            "同一个请求号答第二次不该再落进任何一问"
+        );
+    }
+
+    /// 没人回答的那一问不是默认放行：连接那一头消失时，等的人拿到的是拒绝。
+    #[tokio::test]
+    async fn a_question_whose_connection_disappears_is_refused() {
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let channel = Arc::new(PermissionChannel::new());
+        let bridge = SocketPermissionBridge::new("s1".into(), out_tx, Arc::clone(&channel));
+        let ask = PermissionAskView {
+            request_id: "perm-2".into(),
+            session_id: "s1".into(),
+            tool: "run_command".into(),
+            summary: "command=cargo test".into(),
+            mode: "default".into(),
+        };
+        let waiter = tokio::spawn(async move { bridge.ask(ask).await });
+        let _ = out_rx.recv().await.expect("问句必须出门");
+        // 出站那一头没了（连接断掉），等的那一头必须立刻得到拒绝。
+        drop(out_rx);
+        match waiter.await.unwrap() {
+            PermissionAnswer::Deny { reason } => {
+                assert!(reason.contains("没有执行"), "{reason}")
+            }
+            PermissionAnswer::Allow => panic!("没人回答时不许放行"),
+        }
+    }
 
     /// 目标身份必须走自己的一帧。
     ///

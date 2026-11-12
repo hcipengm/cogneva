@@ -3,6 +3,11 @@ import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch'
 import type { StreamClient } from '@/hooks/useEventStream';
 import { sessionKind, useChatStore, type ChatMessage, type ChatSession } from '@/store/chatStore';
 import { useStreamStore, type ToolCallRecord } from '@/store/streamStore';
+import {
+  DEFAULT_PERMISSION_MODE,
+  usePermissionStore,
+  type PermissionAsk,
+} from '@/store/permissionStore';
 import { useShell } from '@/shell/store';
 import { Note } from '@/ui/Note';
 
@@ -286,6 +291,19 @@ export function ConversationPane({
   /** 把账上的某一行打开。这一面只知道身份，落到哪一行由账那一面决定。 */
   const focusRecord = useShell((s) => s.focusRecord);
   const [draft, setDraft] = useState('');
+  /**
+   * 等着这一段答的「要不要动手」。
+   *
+   * 按会话筛，不按连接筛：同一段对话可以有几问同时在等（用户连发两句），而它们
+   * 各自按请求号回去，抢不得。这一段已经停掉的那一轮不会有问留下——服务端在连接
+   * 与那一轮一起消失时自己拒绝。
+   */
+  const allPermissionAsks = usePermissionStore((s) => s.asks);
+  const permissionAsks = useMemo(
+    () => allPermissionAsks.filter((ask) => ask.sessionId === sessionId),
+    [allPermissionAsks, sessionId]
+  );
+  const permissionMode = usePermissionStore((s) => s.modes[sessionId] ?? DEFAULT_PERMISSION_MODE);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   /** 这一段交出去的目标，按总览折出来的现状。总览里还没有的那几道如实缺席。 */
@@ -426,6 +444,28 @@ export function ConversationPane({
     clientRef.current?.send({ type: 'chat_cancel', session_id: sessionId });
   };
 
+  /**
+   * 答一次「要不要动手」。
+   *
+   * 账上的那一行先摘掉再发：答案没送到时服务端仍然是拒绝（连接消失那一头自己
+   * 拒绝），所以摘掉不会让一次执行悄悄发生。反过来留着它，屏幕上就一直挂着一个
+   * 已经不存在的问。
+   */
+  const answerPermission = (ask: PermissionAsk, allow: boolean) => {
+    clientRef.current?.send({
+      type: 'permission_response',
+      request_id: ask.id,
+      allow,
+    });
+    usePermissionStore.getState().answered(ask.id);
+  };
+
+  /** 换这一段对话的模式。名字是闭集里的那一格，服务端不认识时按更严的一格处理。 */
+  const changePermissionMode = (next: string) => {
+    usePermissionStore.getState().setMode(sessionId, next);
+    clientRef.current?.send({ type: 'permission_mode', session_id: sessionId, mode: next });
+  };
+
   return (
     <section
       onMouseDown={onFocus}
@@ -468,6 +508,22 @@ export function ConversationPane({
           {session.title}
         </Note>
         <KindBadge session={session} live={live} />
+        {/*
+          这一段处在哪一格模式：问两句还是一句不问，是这一面唯一一处能改的东西。
+          放在标题行上，因为它是这一段对话的属性，不是某一条消息的。
+        */}
+        <select
+          value={permissionMode}
+          onChange={(e) => changePermissionMode(e.target.value)}
+          aria-label="权限模式"
+          className="mono ml-auto shrink-0 bg-transparent text-[10px] outline-none"
+          style={{ color: 'var(--muted)' }}
+        >
+          <option value="plan">plan · 只读</option>
+          <option value="default">default · 动手前问</option>
+          <option value="acceptEdits">acceptEdits · 编辑不问</option>
+          <option value="bypass">bypass · 全不问</option>
+        </select>
         {/*
           目标与变更都是账上的行，所以每一个都能点进去。这里只是入口：这一面
           不知道那一行在账的第几页，所以它把身份交出去，由账那一面落位。
@@ -557,6 +613,46 @@ export function ConversationPane({
         </div>
       </div>
 
+      {permissionAsks.length > 0 && (
+        <div className="shrink-0 px-4 pb-1">
+          {permissionAsks.map((ask) => (
+            <div
+              key={ask.id}
+              className="mb-2 border-t pt-2"
+              style={{ borderColor: 'var(--line-strong)' }}
+            >
+              <div className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
+                要动手：{ask.tool}（{ask.mode} 模式）
+              </div>
+              <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-[12px] text-[var(--paper)]">
+                {ask.summary}
+              </pre>
+              <div className="mt-2 flex gap-3">
+                <Note
+                  as="button"
+                  type="button"
+                  onClick={() => answerPermission(ask, true)}
+                  className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                  style={{ color: 'var(--brass)' }}
+                  text="允许这一次执行；下一次同类调用仍然会问"
+                >
+                  允许
+                </Note>
+                <Note
+                  as="button"
+                  type="button"
+                  onClick={() => answerPermission(ask, false)}
+                  className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                  style={{ color: 'var(--danger)' }}
+                  text="拒绝这一次，并把理由交回模型；同一个调用再发一遍会得到同一个答案"
+                >
+                  拒绝
+                </Note>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="shrink-0 px-4 pb-4 pt-1">
         {/*
           一条发问的行，不是一个输入框。
