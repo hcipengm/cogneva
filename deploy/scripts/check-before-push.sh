@@ -985,9 +985,11 @@ echo "Version Contract / Web Build / Bootstrap Cross-Platform。"
 # 三笔分开记，因为它们回答三个不同的问题：
 #   - 内容键（`content.<键>`）：这一跑判的就是工作树的字节，脏不脏无关——提交之后字节不变，
 #     所以提交前后同一份指纹，提交那一问（`--status-content`）命中的正是判过的那一份；
-#   - 改动键（`patch.<键>`）：从共同祖先到工作树的那份 diff 的 patch-id。远端往前走了、
-#     变基到新基底上，改动还是这一批，这一笔照样命中；改动本身被改过（解冲突改了解法）
-#     才作废。推送那一问（`--status-patch`）问的是它；
+#   - 改动键（`patch.<键>`）：从共同祖先到工作树的那份 diff 的 patch-id，再加上整门的
+#     输入（`gate_inputs`：门脚本、`ci.yml`、工具版本）。远端往前走了、变基到新基底上，
+#     改动还是这一批，这一笔照样命中——**前提是那几笔没动整门自己的输入**：输入变了，
+#     那一跑判的是旧输入下的结论，这一批要按新输入重判。改动本身被改过（解冲突改了解法）
+#     同样作废。推送那一问（`--status-patch`）问的是它；
 #   - 推送键（`<HEAD+origin/main>`）：只在干净的树上成立，因为推上去的是 HEAD，而这跑判的
 #     是工作树；脏的时候两者不是同一份字节，只在结尾说明。
 mkdir -p "${stamp_dir}" 2>/dev/null
@@ -1089,7 +1091,7 @@ elif [ -z "${pkey}" ]; then
 elif printf '%s %s（改动，基底 %s）\n' "$(date -Is)" "$(git rev-parse --short HEAD 2>/dev/null)" \
        "$(git merge-base HEAD origin/main 2>/dev/null | cut -c1-7)" \
        > "${stamp_dir}/patch.${pkey}" 2>/dev/null; then
-    echo "记账：改动键 ${pkey:0:12} 这批改动判过；远端往前走了、变基到新基底上照样命中。"
+    echo "记账：改动键 ${pkey:0:12} 这批改动判过；远端往前走了、变基到新基底上照样命中（前提是那几笔没动整门的输入：门脚本、ci.yml、工具版本）。"
 else
     echo "记账：算不出改动键（没有共同祖先，或临时索引写不了），这一跑照常算数，只是变基之后还得重判。" >&2
 fi

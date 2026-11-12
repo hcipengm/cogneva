@@ -780,4 +780,52 @@ grep -q '远端在这跑期间已经含了这一支' "${work}/cout" ||
 grep -q '没有改动键可记' "${work}/cout" ||
     fail "收尾没把「没有要推的那一段」说成一句自己的话；实得：$(grep '记账' "${work}/cout")"
 
-echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效，远端在跑期间追上了这一支时按新基底重记而不是作废、并且变基之后照样命中；远端已经含了这一支时说的是「没有改动可判」而不是「算不出」；键不取决于调用方的 PATH 里有没有 cargo"
+# 17) 远端那几笔动了**整门自己的输入**（`ci.yml`、门脚本、工具版本）⇒ 变基再干净也不命中：
+#     那一跑判的是旧输入下的结论，这一批要按新输入重判。
+#
+# 「变基照样命中」容易被读成无条件，连记账那一行也这么印。2026-11-11 实测：整门绿的之后
+# 远端改了一格 `ci.yml`，照那句话以为变基就能推，pre-push 判「没验过」，两小时白跑。
+# 这一格让两面同形（patch 逐字相同、变基干净），只让 `ci.yml` 变，问：旧账还命中吗。
+itree="${work}/itree"
+mkdir -p "${itree}/deploy/scripts" "${itree}/.github/workflows"
+stage_gate "${repo}" "${itree}"
+(
+    cd "${itree}" || exit 1
+    git init -q -b main .
+    git config user.email gate@example.invalid
+    git config user.name gate
+    printf 'jobs: {}\n' >.github/workflows/ci.yml
+    printf 'a\n' >f.txt
+    git add .github/workflows/ci.yml f.txt
+    git commit -q -m base
+) || fail "整门输入变了的夹具建不起来"
+ibase="$(git -C "${itree}" rev-parse HEAD)"
+printf 'a\nb\n' >"${itree}/f.txt"
+ikey="$( cd "${itree}" && bash deploy/scripts/check-before-push.sh --key-patch-tree "${ibase}" )" ||
+    fail "--key-patch-tree 在输入变的夹具上退非零"
+[ -n "${ikey}" ] || fail "--key-patch-tree 在输入变的夹具上什么都没印"
+mkdir -p "${itree}/.git/check-before-push"
+printf 'fixture\n' >"${itree}/.git/check-before-push/patch.${ikey}"
+(
+    cd "${itree}" || exit 1
+    git add -A
+    git commit -q -m work
+) || fail "输入变了的夹具提交不掉"
+# 正向对照：输入没动之前，同一份账命中。没有这一格，下面那次「不命中」可能来自别的
+# 原因（基底给错、夹具没搭好），这一格让两边的差别只剩「输入变没变」。
+( cd "${itree}" && bash deploy/scripts/check-before-push.sh --status-patch "${ibase}" ) >"${work}/out" 2>&1 ||
+    fail "输入没动时这批改动就报没验过（夹具本身不对，下面的「不命中」证明不了任何事）：$(cat "${work}/out")"
+(
+    cd "${itree}" || exit 1
+    git checkout -q -b upstream "${ibase}"
+    printf 'jobs: {timeout: 1}\n' >.github/workflows/ci.yml
+    git add .github/workflows/ci.yml
+    git commit -q -m "the gate input moves upstream"
+    git checkout -q main
+    git rebase -q upstream
+) || fail "输入变了的夹具变基没走完"
+if ( cd "${itree}" && bash deploy/scripts/check-before-push.sh --status-patch "$(git -C "${itree}" rev-parse upstream)" ) >"${work}/out" 2>&1; then
+    fail "整门的输入变了（ci.yml）、这批改动逐字没变，旧账仍说验过：那一跑判的是旧输入下的结论"
+fi
+
+echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效、整门输入变了就失效，远端在跑期间追上了这一支时按新基底重记而不是作废、并且变基之后照样命中；远端已经含了这一支时说的是「没有改动可判」而不是「算不出」；键不取决于调用方的 PATH 里有没有 cargo"
