@@ -98,6 +98,8 @@ export class MockEventStreamClient {
       // 假流不扮身份：没有人脸要报，就没有这一格。字段必填是为了让真流里
       // 「这一轮是谁在说」不会静默缺一帧；空值在这里就是「假流不报」。
       agentId: (fields.agentId as string | null) ?? null,
+      // 假流不记账：token 与轮次只有真的跑过一轮才量得到，这里不编一个数。
+      usage: null,
       timestamp: new Date().toISOString(),
     });
   }

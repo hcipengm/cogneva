@@ -88,6 +88,51 @@ fn a_stop_also_comes_from_the_escape_key() {
     );
 }
 
+/// 一轮花掉的量，从循环量出来到画在屏幕上是一条链：循环挂在交付物上 → 网关
+/// 发 `message.usage` → 客户端认得这个名字 → store 记在说那句话的那一条上 →
+/// 对话面画一行、会话头画上下文占用。任何一环断掉，屏幕上都是「这一轮花了多少
+/// 不知道」，而它看起来与「这一轮没花什么」一模一样。
+#[test]
+fn what_a_turn_spent_is_read_off_the_loop_and_drawn_under_the_turn() {
+    let agent = read_repo("crates/cog-agent/src/agent_kernel/runtime.rs");
+    assert!(
+        agent.contains("\"usage\"") && agent.contains("\"context_tokens\""),
+        "循环不再把这一轮的用量挂到交付物上：后面每一环都无从读起"
+    );
+
+    let chat = read_repo(CHAT);
+    assert!(
+        chat.contains("\"message.usage\"") && chat.contains("emit_turn_usage"),
+        "{CHAT} 不再发 `message.usage`：界面收不到这一轮花了多少"
+    );
+    assert!(
+        chat.contains(".get(\"usage\")"),
+        "{CHAT} 没去交付物里读用量：那一帧即便发了，装的也不是循环量出来的数"
+    );
+
+    let events = read_repo(EVENTS);
+    assert!(
+        events.contains("'message.usage': 'usage'"),
+        "{EVENTS} 认不出 `message.usage`：这一帧会在解析那一步被整条丢掉"
+    );
+
+    let store = read_repo(STORE);
+    assert!(
+        store.contains("case 'usage'"),
+        "{STORE} 不把用量记在任何一条消息上：屏幕上那一行没有落点"
+    );
+
+    let pane = read_repo(PANE);
+    assert!(
+        pane.contains("usageLine(message.usage)"),
+        "{PANE} 不在这一条消息下面画花销：服务端量到了、屏幕上没有"
+    );
+    assert!(
+        pane.contains("上下文 {compactCount(contextTokens)}"),
+        "{PANE} 的会话头不显示上下文占用：背着多重的历史读不出来"
+    );
+}
+
 #[test]
 fn several_conversations_can_be_open_at_once_and_survive_a_reload() {
     let dock = read_repo(DOCK);

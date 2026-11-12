@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { getSessionMessages } from '@/api/client';
-import type { ChatFrame, ChatRole } from '@/types/events';
+import type { ChatFrame, ChatRole, TurnUsage } from '@/types/events';
 
 export type { ChatRole };
 
@@ -34,6 +34,13 @@ export interface ChatMessage {
   status: ChatStatus;
   /** 这一轮没答上来的原因。有值即 `failed`（或 `done` 但内容为空）。 */
   failure: string | null;
+  /**
+   * 这一轮花掉的量，由服务端的 `usage` 帧带进来。
+   *
+   * `null` 不是「花了零」：读回的历史里没有这一格（服务端只把正文落了库），
+   * 失败与被叫停的那一轮也没有。界面上因此不画这一行，而不是画一排零。
+   */
+  usage: TurnUsage | null;
   at: string;
 }
 
@@ -317,7 +324,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
             title: firstTurn ? titleFrom(text) : base.title,
             messages: [
               ...base.messages,
-              { id, role: 'user', text, thinking: '', status: 'sending', failure: null, at },
+              {
+                id,
+                role: 'user',
+                text,
+                thinking: '',
+                status: 'sending',
+                failure: null,
+                usage: null,
+                at,
+              },
             ],
           },
         },
@@ -369,6 +385,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   thinking: '',
                   status: 'streaming',
                   failure: null,
+                  usage: null,
                   at: frame.timestamp,
                 },
               ],
@@ -396,6 +413,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   thinking: '',
                   status: 'streaming',
                   failure: null,
+                  usage: null,
                   at: frame.timestamp,
                 },
               ],
@@ -464,6 +482,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
           break;
         }
 
+        case 'usage': {
+          // 记在说这句话的那一条上，不另开一行：这一轮花了多少是这条消息的
+          // 属性，不是一句新的话。帧排在 `end` 之前，所以它到的时候这一条还
+          // 在流里，`withMessage` 找得到。
+          if (!frame.usage) break;
+          const usage = frame.usage;
+          session = withMessage(session, frame.messageId, (message) => ({
+            ...message,
+            usage,
+          }));
+          break;
+        }
+
         case 'goal': {
           if (!frame.goalId) break;
           if (!session.goals.some((goal) => goal.id === frame.goalId)) {
@@ -517,6 +548,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             thinking: '',
             status: line.failure ? 'failed' : 'done',
             failure: line.failure,
+            // 落库的只有正文：这一次读回来的花销没有存放处，于是空着。
+            usage: null,
             at: line.created_at,
           }));
           // 读回的历史排在前，本地还没落定的排在后面。已经落定、且历史里

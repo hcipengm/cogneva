@@ -500,13 +500,25 @@ pub struct AgentRuntime {
 /// carrying them is consumed and dropped at the end of the streaming call — the
 /// assistant message handed back up has no token fields, so a run's spend was
 /// visible only to the process-wide counters, never to the task that paid it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
     /// Billed calls, including the deliverable-reformat fallback.
     pub llm_calls: u32,
+    /// 最近一次调用带进模型的那一截提示词长度。它就是这一跑结束时上下文占了
+    /// 多少：累加的总量回答「花了多少」，这一个回答「现在背着多重的历史」。
+    pub last_prompt_tokens: u32,
+    /// 各次调用按声明价目算出来的钱（美元）。一次都没有报出价目时是 `None`。
+    ///
+    /// 不能拿 `Some(0.0)` 代答：上游没声明价目时算出来的一律是 0.0，画在界面上
+    /// 就是白纸黑字地说这一轮不要钱——而它只是没算。「没算」与「正好是零」在
+    /// 读数上要分得开。
+    pub cost_usd: Option<f64>,
+    /// 最后一次答话的是哪一路模型。上游池里的成员可以互相顶替，所以它是每次
+    /// 调用自己报回来的那个名字，不是配置里排第一的那个。
+    pub model: Option<String>,
 }
 
 impl RunUsage {
@@ -525,6 +537,18 @@ impl RunUsage {
             .total_tokens
             .saturating_add(u64::from(usage.total_tokens).max(prompt.saturating_add(completion)));
         self.llm_calls = self.llm_calls.saturating_add(1);
+        self.last_prompt_tokens = usage.input;
+        // 价目没声明时 `calculate_cost` 算出来的四个分量全是 0.0；任意一个非零
+        // 才说明这一台真的报了价。加起来而不是只读 `total`：有一条上游把
+        // `total` 留成 0 而分量有数。
+        let billed = if usage.cost.total > 0.0 {
+            usage.cost.total
+        } else {
+            usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write
+        };
+        if billed > 0.0 {
+            *self.cost_usd.get_or_insert(0.0) += billed;
+        }
     }
 }
 
@@ -1688,7 +1712,33 @@ impl AgentRuntime {
     ) -> SFResult<serde_json::Value> {
         let started = self.begin_scoped_run(None);
         let outcome = self.run_conversation_turns(messages, llm).await;
-        self.finish_scoped_run(None, started, outcome).await
+        // 这一轮花了多少、谁答的、答了几回：循环知道这三件事，而读它的只有
+        // 网关。趁 `run_usage` 还属于这一跑（下一次 `begin_run` 会清零）抄一份，
+        // 挂在这一轮的交付物上带走。它是加法——`reply` 仍然在原来那个键上。
+        let usage = self.run_usage.clone();
+        let rounds = self.run_iterations;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let mut outcome = self.finish_scoped_run(None, started, outcome).await;
+        if let Some(object) = outcome
+            .as_mut()
+            .ok()
+            .and_then(|value| value.as_object_mut())
+        {
+            object.insert(
+                "usage".to_string(),
+                serde_json::json!({
+                    "input_tokens": usage.prompt_tokens,
+                    "output_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "rounds": rounds,
+                    "context_tokens": usage.last_prompt_tokens,
+                    "duration_ms": elapsed_ms,
+                    "model": usage.model,
+                    "cost_usd": usage.cost_usd,
+                }),
+            );
+        }
+        outcome
     }
 
     async fn run_conversation_turns(
@@ -3603,6 +3653,12 @@ impl AgentRuntime {
         // billed too -- it consumed the tokens it consumed, and the error path
         // returns from here before anything else could count them.
         self.run_usage.add(&response.usage);
+        // 谁答的也记在这里，理由与上面那行相同：这个名字只活在这份返回里，
+        // 助手消息不带它。空名字不是名字——上游没报就不记，别拿它盖掉上一次
+        // 真的报了的那一路。
+        if !response.model.trim().is_empty() {
+            self.run_usage.model = Some(response.model.clone());
+        }
         self.note_context_overrun(response.usage.input).await;
 
         if let Some(error) = stream_error {
@@ -7271,6 +7327,49 @@ mod tests {
             result["reply"],
             serde_json::json!(said),
             "交付出去的还是那个壳：屏幕上读到花括号，同事收到的是转义的 JSON"
+        );
+    }
+
+    /// 一轮对话把它花掉的量一起带走：界面上的那一行（token、轮次、时长、谁答的、
+    /// 算没算钱）全部读这一格。
+    ///
+    /// 三条一起判：读到的 token 是上游报的那个数；名字是上游报的那一路；费用没
+    /// 声明时是 `null` 而不是 0——假模型的 usage 全是零、价目也没声明，这时算出来
+    /// 的 0.0 是「没算」，画成 $0.0000 就是白纸黑字地说这一轮不要钱。
+    #[tokio::test]
+    async fn a_conversation_carries_what_it_spent() {
+        let llm = ScriptedReplyLlm::new(&["查过了，没有未了结的变更。"]);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut runtime = AgentRuntime::new(
+            RuntimeConfig {
+                agent_id: "spend-reader".into(),
+                role: "employee".into(),
+                ..Default::default()
+            },
+            tx,
+        );
+        let result = runtime
+            .run_conversation(vec![Message::user("查一下")], &llm)
+            .await
+            .expect("一轮对话");
+
+        let usage = result
+            .get("usage")
+            .expect("这一轮的用量要跟着交付物一起走：界面那一行读的就是它");
+        assert!(usage["rounds"].as_u64().unwrap_or(0) >= 1, "{usage}");
+        assert_eq!(
+            usage["total_tokens"].as_u64(),
+            Some(0),
+            "假模型报的是 0 个 token"
+        );
+        assert_eq!(
+            usage["model"].as_str(),
+            Some("mock"),
+            "答话的是哪一路模型，取的是上游自己报回来的那一个"
+        );
+        assert!(
+            usage["cost_usd"].is_null(),
+            "没有声明价目时费用是 null：没算不是免费（{usage}）"
         );
     }
 

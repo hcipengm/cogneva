@@ -152,7 +152,8 @@ export type ChatFrameKind =
   | 'thinking_end'
   | 'goal'
   | 'change'
-  | 'identity';
+  | 'identity'
+  | 'usage';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -174,6 +175,10 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   // 前端算不出同一个，所以它跟着帧来。没有它，这位员工自己调的工具就归不到这段
   // 对话下面——帧上只有 `agent_id`，而这里不知道它等于谁。
   'agent.identity': 'identity',
+  // 这一轮花了多少：token、轮次、时长、上下文占用、哪一路模型答的、算了多少钱。
+  // 数字是循环量出来的那一份，网关原样搬来。它排在 `message.end` 之前——收尾帧
+  // 一到，这一条就定稿了，还没读到的花销再也没有落点。
+  'message.usage': 'usage',
 };
 
 /**
@@ -208,7 +213,35 @@ export interface ChatFrame {
   changeId: string | null;
   /** 只有 `identity` 帧带着：这一轮在总线上叫什么（`employee:<指纹>` 形式）。 */
   agentId: string | null;
+  /** 只有 `usage` 帧带着：这一轮的花销。 */
+  usage: TurnUsage | null;
   timestamp: string;
+}
+
+/**
+ * 一轮对话花掉的量，读的是服务端量出来的那一份。
+ *
+ * 除了模型名与费用，其余都是计数，缺了就发 `null`——这一层不替服务端补零：
+ * 屏幕上写「输入 0 tokens」与写「输入没读到」是两句不同的话。
+ */
+export interface TurnUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  /** 这一轮里模型开口了几次（一次工具调用之后接着说，算下一次）。 */
+  rounds: number | null;
+  /** 这一轮结束时上下文背了多少：最后一次调用带进去的提示词长度。 */
+  contextTokens: number | null;
+  durationMs: number | null;
+  /** 答话的那一路模型。上游没报名字时 `null`，不是「未知模型」这个名字。 */
+  model: string | null;
+  /** 按声明价目算出来的美元数。上游没声明价目时 `null`：没算，不是免费。 */
+  costUsd: number | null;
+}
+
+/** 帧里的数字转成界面认得的数：不是有限数就是 `null`，不猜 0。 */
+function frameCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 /**
@@ -243,6 +276,19 @@ export function normalizeChatFrame(
     goalId: typeof inner.goal_id === 'string' ? inner.goal_id : null,
     changeId: typeof inner.change_id === 'string' ? inner.change_id : null,
     agentId: typeof inner.agent_id === 'string' ? inner.agent_id : null,
+    usage:
+      kind === 'usage'
+        ? {
+            inputTokens: frameCount(inner.input_tokens),
+            outputTokens: frameCount(inner.output_tokens),
+            totalTokens: frameCount(inner.total_tokens),
+            rounds: frameCount(inner.rounds),
+            contextTokens: frameCount(inner.context_tokens),
+            durationMs: frameCount(inner.duration_ms),
+            model: typeof inner.model === 'string' ? inner.model : null,
+            costUsd: frameCount(inner.cost_usd),
+          }
+        : null,
     timestamp:
       (payload.timestamp as string | undefined) ?? new Date().toISOString(),
   };

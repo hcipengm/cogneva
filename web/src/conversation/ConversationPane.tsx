@@ -9,6 +9,7 @@ import {
   type PermissionAsk,
 } from '@/store/permissionStore';
 import { useShell } from '@/shell/store';
+import type { TurnUsage } from '@/types/events';
 import { Note } from '@/ui/Note';
 
 /**
@@ -34,6 +35,32 @@ function shortChange(id: string): string {
   const parts = id.split(':');
   const literal = parts.length >= 3 ? parts.slice(2).join(':') : id;
   return literal.length > 14 ? `${literal.slice(0, 14)}…` : literal;
+}
+
+/** 一万以上按「3.2 万」读，以下的整数带千分位。 */
+function compactCount(n: number): string {
+  if (n >= 10000) return `${(n / 10000).toFixed(1)} 万`;
+  return n.toLocaleString('zh-CN');
+}
+
+/**
+ * 一轮花销读成一行：轮次、进出 token、时长、模型、费用。
+ *
+ * 读不到的那几项不写：费用只有上游声明了价目才有数，模型名只有上游报了才有，
+ * 把它们写成 0 或「未知」就是拿一个没读到的值冒充一个读到的值。
+ */
+function usageLine(usage: TurnUsage): string {
+  const parts: string[] = [];
+  if (usage.rounds !== null) parts.push(`${usage.rounds} 轮`);
+  if (usage.inputTokens !== null || usage.outputTokens !== null) {
+    const input = usage.inputTokens === null ? '—' : compactCount(usage.inputTokens);
+    const output = usage.outputTokens === null ? '—' : compactCount(usage.outputTokens);
+    parts.push(`输入 ${input} · 输出 ${output}`);
+  }
+  if (usage.durationMs !== null) parts.push(`${(usage.durationMs / 1000).toFixed(1)} 秒`);
+  if (usage.model) parts.push(usage.model);
+  if (usage.costUsd !== null) parts.push(`$${usage.costUsd.toFixed(4)}`);
+  return parts.join(' · ');
 }
 
 function Turn({ message }: { message: ChatMessage }) {
@@ -90,6 +117,14 @@ function Turn({ message }: { message: ChatMessage }) {
         {message.text}
         {streaming && <span className="chat-caret" aria-hidden />}
       </p>
+
+      {/*
+        这一轮花了多少。只有服务端真的量到了才有一行：读回的历史与被叫停的那
+        一轮没有这一格，那时屏幕上什么也不写，而不是写一排零。
+      */}
+      {message.role === 'assistant' && message.usage && (
+        <p className="mono mt-1 text-[10px] text-[var(--muted)]">{usageLine(message.usage)}</p>
+      )}
     </article>
   );
 }
@@ -443,6 +478,19 @@ export function ConversationPane({
   const streaming = Boolean(session?.streaming);
 
   /**
+   * 会话头那一格上下文占用：最近一条带着用量的消息，它最后一次调用读进去的
+   * 提示词长度。没有它就是没读到过（刷新读回的历史不带花销），那一格不出现。
+   */
+  const contextTokens = useMemo(() => {
+    const messages = session?.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const seen = messages[i].usage?.contextTokens;
+      if (seen !== null && seen !== undefined) return seen;
+    }
+    return null;
+  }, [session?.messages]);
+
+  /**
    * Esc 与「■ 停止」走同一条路：只在有轮在跑时挂上，停的是这一段上所有在跑的轮。
    *
    * 不避让输入框——Esc 在这里没有第二种含义，而「手还在键盘上、想让它停下」正是
@@ -526,6 +574,14 @@ export function ConversationPane({
           {session.title}
         </Note>
         <KindBadge session={session} live={live} />
+        {contextTokens !== null && (
+          <Note
+            className="mono shrink-0 text-[10px] text-[var(--muted)]"
+            text="这一轮结束时模型读进去的提示词长度：这段对话现在背着多重的上下文"
+          >
+            上下文 {compactCount(contextTokens)}
+          </Note>
+        )}
         {/*
           这一段处在哪一格模式：问两句还是一句不问，是这一面唯一一处能改的东西。
           放在标题行上，因为它是这一段对话的属性，不是某一条消息的。

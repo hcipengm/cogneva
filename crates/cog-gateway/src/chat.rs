@@ -647,6 +647,42 @@ async fn emit_message_end(out: &mpsc::Sender<String>, session_id: &str, message_
     .await;
 }
 
+/// 这一轮花了多少：token、轮次、时长、上下文占用、哪一路模型答的、算了多少钱。
+///
+/// 数字全部来自循环挂在交付物上的那一格，这里一个也不算——token 与轮次只有
+/// 跑循环的那边数得准，网关重算一遍就有了两套账。模型名与费用缺省时发 `null`：
+/// 上游没报名字、没声明价目，都是「没读到」，界面上那一格因此空着而不是写零。
+///
+/// 只在循环真的交了用量时发这一帧。失败与被叫停的那一轮没有交付物，屏幕上就
+/// 不出现这一行——发一帧全零的用量，读起来是「这一轮没花钱」，而事实是这一轮
+/// 的账没有读回来。
+async fn emit_turn_usage(
+    out: &mpsc::Sender<String>,
+    session_id: &str,
+    message_id: &str,
+    usage: Option<&serde_json::Value>,
+) {
+    let Some(usage) = usage else { return };
+    let count = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+    emit(
+        out,
+        session_id,
+        "message.usage",
+        serde_json::json!({
+            "message_id": message_id,
+            "input_tokens": count("input_tokens"),
+            "output_tokens": count("output_tokens"),
+            "total_tokens": count("total_tokens"),
+            "rounds": count("rounds"),
+            "context_tokens": count("context_tokens"),
+            "duration_ms": count("duration_ms"),
+            "model": usage.get("model").and_then(serde_json::Value::as_str),
+            "cost_usd": usage.get("cost_usd").and_then(serde_json::Value::as_f64),
+        }),
+    )
+    .await;
+}
+
 /// 这一轮给模型看的历史：最近 [`SESSION_HISTORY_CAP`] 条，旧的最先。
 ///
 /// 读不到就按「没有历史」回答，不按「历史是空的」记一笔：这两种在读数上要分得开，
@@ -911,6 +947,14 @@ pub async fn run_chat_turn(
         // 上面已经 return。
         TurnOutcome::Stopped => unreachable!("a stopped turn returned above"),
     };
+    // 这一轮花了什么：循环把用量挂在这一轮的交付物上（`usage` 那一个键），
+    // 这里只搬，不重算——token 与轮次只有循环那边数得准。失败的那一轮没有
+    // 交付物，也就没有这一格；那是「没读到」，不是「花了零」。
+    let turn_usage = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("usage"))
+        .cloned();
     let mut reply = journal.reply;
     let mut failure: Option<String> = None;
     match outcome {
@@ -982,7 +1026,11 @@ pub async fn run_chat_turn(
         },
     }
 
-    // 6. 收尾帧放最后：`message.end` 是「这一轮结束了」的信号，界面收到它就把下
+    // 6. 这一轮的花销：排在收尾帧之前，因为界面把它画在这一条消息下面——收尾帧
+    //    一到，这一条就定稿了。
+    emit_turn_usage(&out, &session_id, &assistant_mid, turn_usage.as_ref()).await;
+
+    // 7. 收尾帧放最后：`message.end` 是「这一轮结束了」的信号，界面收到它就把下
     //    一句发上来，而 `run_chat_turn` 每一轮是各自 spawn 的。记录写在这一帧之后，
     //    用户立刻追问时下一轮读历史的那一次查询就跑在上一轮提交之前——上一轮在
     //    上下文里不存在，模型只能说「我看不到刚才那轮」。实测（2026-11-05）：连续
@@ -1305,6 +1353,45 @@ mod tests {
         assert!(frames[0].contains("agent.identity"), "{frames:?}");
         assert!(frames[1].contains("message.goal") && frames[1].contains("goal-1"));
         assert!(frames[2].contains("goal-2"));
+    }
+
+    /// 这一轮的花销原样交给界面：网关不重算，只搬循环量出来的那一份。
+    #[tokio::test]
+    async fn the_turn_s_usage_reaches_the_interface_as_one_frame() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let counted = serde_json::json!({
+            "input_tokens": 1234,
+            "output_tokens": 56,
+            "total_tokens": 1290,
+            "rounds": 3,
+            "context_tokens": 1234,
+            "duration_ms": 4200,
+            "model": "some-model",
+            "cost_usd": 0.0123,
+        });
+
+        emit_turn_usage(&out_tx, "s1", "m-1", Some(&counted)).await;
+
+        let frame = out_rx.recv().await.expect("这一帧要发出去");
+        assert!(frame.contains("\"message.usage\""), "{frame}");
+        assert!(frame.contains("\"rounds\":3"), "{frame}");
+        assert!(frame.contains("\"input_tokens\":1234"), "{frame}");
+        assert!(frame.contains("\"model\":\"some-model\""), "{frame}");
+        assert!(frame.contains("\"cost_usd\":0.0123"), "{frame}");
+    }
+
+    /// 没读到就不发：一帧全零的花销，读起来是「这一轮不要钱、没花时间」。
+    #[tokio::test]
+    async fn a_turn_without_a_reading_does_not_get_a_frame_of_zeroes() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+
+        emit_turn_usage(&out_tx, "s1", "m-1", None).await;
+        drop(out_tx);
+
+        assert!(
+            out_rx.recv().await.is_none(),
+            "循环没交出用量时，屏幕上不该出现一行零"
+        );
     }
 
     /// 历史从记录里来，不从这个进程的内存里来。
