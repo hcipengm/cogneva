@@ -68,6 +68,10 @@ slot_report="$(mktemp "${TMPDIR:-/tmp}/cogneva-gate-slot-waits.XXXXXX")" 2>/dev/
 # 少这一面读数，判据不受影响。
 # shellcheck source=lib/gate-run-record.sh
 . "${here}/lib/gate-run-record.sh"
+# 按格记账：一格判过、它读的东西没变，下一次就不必再判一遍。没有它，这一跑仍然是对的，
+# 只是每一格都重判（改一个测试文件，199 格一起作废重跑）。
+# shellcheck source=lib/cell-stamp.sh
+. "${here}/lib/cell-stamp.sh"
 
 # ---- 验过没有：按字节记的戳 ----
 #
@@ -85,6 +89,13 @@ slot_report="$(mktemp "${TMPDIR:-/tmp}/cogneva-gate-slot-waits.XXXXXX")" 2>/dev/
 # 因此不会让一笔已经验过的提交反复失效，也不会被当成验过。
 stamp_dir="$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/check-before-push"
 case "${stamp_dir}" in /*) ;; *) stamp_dir="${root}/${stamp_dir}" ;; esac
+
+# 每格的账与整份的账放在一起，但**按树分开**：两棵 worktree 共用同一个 git 目录，
+# 而它们的字节不同、作用域也不同，混在一个目录里会让一棵树的判词替另一棵背书。
+# 键取的是**路径**不是字节：字节一变目录就变，缓存永远命不中，等于没做。
+COGNEVA_CELL_STAMP_DIR="${stamp_dir}/cells/$(printf '%s' "${root}" | sha256sum | cut -c1-16)"
+export COGNEVA_CELL_STAMP_DIR
+mkdir -p "${COGNEVA_CELL_STAMP_DIR}" 2>/dev/null || true
 
 tree_key() {
     {
@@ -545,6 +556,34 @@ run_step() { # run_step <说明> <命令…>
     return 0
 }
 
+# 与 run_step 同形，但这一格**按格记账**：它读的东西没变，上一次的判词就照用。
+#
+# 只收外部命令（`bash …`、`cargo …`、`python3 …`）：作用域是 strace 量出来的，而一个
+# bash 函数在本进程里跑，量不到（ptrace 只能跟子进程，本机 `ptrace_scope=1`）。
+# 拿不准的格子继续走 run_step——不记账只是慢一点，记错账是把没判过的字节说成判过。
+run_cell_step() { # run_cell_step <说明> <外部命令…>
+    local what="$1"; shift
+    local t0=${SECONDS} status=0 wait0
+    # 与 run_step 同一条口径：等槽的秒数从构建槽客户端的报告里拆出去，记在另一行。
+    # 把整段记成一格等于把「机器满」和「判据贵」写成同一个数——这两件事要的动作相反。
+    wait0="$(build_slot_reported_lines)"
+    cell_run "${what}" "$@" || status=$?
+    if [ "${status}" -eq 0 ]; then
+        record_cell "${t0}" "${wait0}" ok "${what}"
+        return 0
+    fi
+    if [ "${status}" -eq 75 ]; then
+        printf 'UNJUDGED  %s：这一格没进构建槽，一行判据都没跑（不是红，也不是绿）。\n' "${what}" >&2
+        unjudged=$((unjudged + 1))
+        record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
+        return 0
+    fi
+    printf 'RED  %s\n' "${what}" >&2
+    failures=$((failures + 1))
+    record_cell "${t0}" "${wait0}" RED "${what}"
+    return 0
+}
+
 # CI 里这两个作业的每一步都是单行 `run: <解释器> <路径> [参数]`，按作业块取出来原样跑。
 # 作业名以 ci.yml 里那两个块的键为准；取不到就红——静静地跑零步是另一种假绿。
 #
@@ -653,7 +692,8 @@ git_locators=(-u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECT
               -u GIT_PREFIX)
 mapfile -t script_tests < <(printf '%s\n' deploy/scripts/tests/*.test.sh .github/scripts/tests/*.test.sh)
 for t in "${script_tests[@]}"; do
-    run_step "${t}" env "${git_locators[@]}" bash "${t}"
+    # 按格记账：改一个测试文件，只有读了它的那几格重判，其余的沿用上一次的判词。
+    run_cell_step "${t}" env "${git_locators[@]}" bash "${t}"
 done
 
 # 容量登记表：`crates/cogneva/tests/rust_capacity_constants_registry_test.rs` 是**唯一**
