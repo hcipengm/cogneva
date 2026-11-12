@@ -507,6 +507,8 @@ mod task_resume_wiring_contract_test;
 mod the_ceiling_follows_the_work_not_the_label_test;
 #[path = "the_fixture_reading_steps_are_written_once_test.rs"]
 mod the_fixture_reading_steps_are_written_once_test;
+#[path = "the_generator_keeps_a_file_so_a_reader_must_watch_it_test.rs"]
+mod the_generator_keeps_a_file_so_a_reader_must_watch_it_test;
 #[path = "the_production_cut_is_defined_once_test.rs"]
 mod the_production_cut_is_defined_once_test;
 #[path = "the_quota_cells_are_written_by_a_projection_test.rs"]
