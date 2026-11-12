@@ -25,6 +25,24 @@
 //! Both are read from the file, not listed: `the_suite_and_the_directory_agree`
 //! fails when a file on disk is neither here nor justified by one of the two
 //! properties above, and when a line here names a file that is gone.
+//!
+//! What admits this family, and why it is a condition rather than a row: a
+//! whitelist entry admits whatever file happens to sit at the path, so it goes
+//! on admitting a `suite.rs` that has stopped being the entry point. The
+//! condition is read off the tree on every run, by
+//! `the_suite_entry_point_earns_its_family`:
+//!
+//! 1. one file under `tests/` answers to the stem `suite`, so the entry point is
+//!    named by what it is rather than by a row someone once matched on a path;
+//! 2. every `#[path]` line above names a file that is there and that
+//!    `cannot_share_a_process` clears -- the same predicate the census below
+//!    applies to a file it does not list, called here rather than restated;
+//! 3. the census below skips this file by that stem, so being the entry point is
+//!    what exempts it, and it is never a member of its own list.
+//!
+//! A test that goes red naming the file and the property it broke is an
+//! admission condition. A name in a list is only a promise that the path was
+//! right once.
 
 #[path = "common/cells_written.rs"]
 pub mod cells_written;
@@ -577,6 +595,23 @@ fn cannot_share_a_process(text: &str) -> Option<&'static str> {
     None
 }
 
+/// The files the module list above pulls in, each by its path without the `.rs`.
+///
+/// Read out of this file's own text wherever a test has to reason about what
+/// the list covers, so the list has one reader and not one per test: a line
+/// added above is seen by all of them, and a line that stops being a line is
+/// seen by none.
+fn listed_modules(list: &str) -> Vec<&str> {
+    list.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("#[path = \"")
+                .and_then(|rest| rest.strip_suffix("\"]"))
+                .map(|file| file.trim_end_matches(".rs"))
+        })
+        .collect()
+}
+
 /// The suite and the directory say the same thing.
 ///
 /// This is the maintenance side of merging two hundred binaries into one: the
@@ -590,15 +625,7 @@ fn the_suite_and_the_directory_agree() {
     const FLOOR: usize = 150;
     let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let list = include_str!("suite.rs");
-    let listed: Vec<&str> = list
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("#[path = \"")
-                .and_then(|rest| rest.strip_suffix("\"]"))
-                .map(|file| file.trim_end_matches(".rs"))
-        })
-        .collect();
+    let listed = listed_modules(list);
     assert!(
         listed.len() >= FLOOR,
         "the list names {} files, fewer than the {FLOOR} this suite is known to hold; \
@@ -646,4 +673,78 @@ fn the_suite_and_the_directory_agree() {
         "the census read {on_disk} files on disk, fewer than the {FLOOR} this suite is known to \
          hold; the directory scan has gone wrong"
     );
+}
+
+/// The entry point of the merged suite earns its own path family.
+///
+/// `crates/cogneva/tests/suite.rs` is a family of one file, and the difference
+/// between a family with an admission condition and an exception someone wrote
+/// down once is that the condition is read off the tree every time this runs:
+/// one file answers to the stem, every line of the list resolves to a file that
+/// is there and clears the exemption predicate, and the entry point stays out of
+/// the census by that stem instead of by being listed as itself. A rename, a
+/// dangling line or a second file with the same stem fails here, naming the file
+/// and the property, rather than waiting for the next round of CI.
+#[test]
+fn the_suite_entry_point_earns_its_family() {
+    let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let list = include_str!("suite.rs");
+    let listed = listed_modules(list);
+    let own_stem = std::path::Path::new(file!())
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // (1) Exactly one file answers to the stem this family is named by.
+    let mut same_stem: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&tests).expect("tests directory is readable") {
+        let path = entry.expect("directory entry").path();
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if stem == own_stem {
+            same_stem.push(path.display().to_string());
+        }
+    }
+    let answering = same_stem.len();
+    assert!(
+        answering == 1,
+        "the merged suite is admitted as the one file with the stem `{own_stem}`, and the \
+         directory holds {answering} that answer to it: {same_stem:?}"
+    );
+
+    // (2) Every line of the list resolves, and to a file that can share this
+    // process -- the same predicate a file outside the list has to satisfy.
+    for name in &listed {
+        let path = tests.join(format!("{name}.rs"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{name}.rs: named by the entry point but unreadable: {e}"));
+        if let Some(why) = cannot_share_a_process(&text) {
+            panic!(
+                "{name}.rs: the entry point may only pull in files that can share this process, \
+                 and this one {why}"
+            );
+        }
+    }
+
+    // (3) The entry point is not a member of its own list, and the census keeps
+    // it out by the stem (1) shows is unique rather than by its full path.
+    for name in &listed {
+        let stem = std::path::Path::new(name)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            stem != own_stem,
+            "{name}.rs: the entry point lists a module carrying its own stem `{own_stem}`; the \
+             census skips that stem, so the file would never be counted either way"
+        );
+    }
 }
