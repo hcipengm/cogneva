@@ -31,8 +31,10 @@
 #
 # 仓根与脚本目录自算，不从调用方继承：被 source 的脚本拿别人的变量，换一个调用方就错。
 
-cell_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
-cell_root="$(cd "${cell_here}/../.." && pwd)" || exit 1
+cell_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+# 上溯写在这一行、从自身位置数三级（lib → scripts → deploy → 仓根），不借 cell_here
+# 再数两级：仓根的落点要能被 root-climb 那条门从这一行读出来，绕一次变量它就读不到了。
+cell_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)" || exit 1
 
 # 账本目录在**调用时**读，不在 source 时读：调用方（门）是在 source 之后才算得出
 # `stamp_dir` 的，source 时读一次就把空串记死了——每一格都以为自己在「不记账」模式，
@@ -90,7 +92,7 @@ cell_key() { # cell_key <id>
         done <"${scope}"
         gate_inputs
         # 门自己的其余字节：`lib/*.sh` 也是判据，改了它的判词就不作数。
-        sha256sum "${cell_here}/lib/"*.sh 2>/dev/null
+        sha256sum "${cell_here}/"*.sh 2>/dev/null
         printf 'id=%s\n' "${id}"
     } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
@@ -174,7 +176,9 @@ cell_stored() { # cell_stored <id> <字段> —— 读上次记下的那一行�
     local file
     file="$(cell_dir "$1")/verdict"
     [ -f "${file}" ] || return 1
-    sed -n "s/^$2=//p" "${file}" | head -n 1
+    # 取第一条匹配就在 sed 里退出：`sed | head` 把判词交给 head，而 head 永远成功，
+    # 读不动账本的那一次因此和「读到了空值」同形。
+    sed -n "/^$2=/ { s///; p; q }" "${file}"
 }
 
 # 跑一格：键命中就沿用上次的判词，不命中就（在 strace 下）真跑一遍并记账。
