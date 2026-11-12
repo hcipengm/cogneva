@@ -429,10 +429,6 @@ export function ConversationPane({
     }
   }, [appendUserTurn, clientRef, draft, sessionId]);
 
-  if (!session) return null;
-
-  const streaming = Boolean(session.streaming);
-
   /**
    * 停下这一段上正在跑的那一轮。
    *
@@ -440,9 +436,31 @@ export function ConversationPane({
    * 之后紧跟收尾帧）。本地先把光标收掉的话，一次没送到的停止会看起来像停下了，
    * 而模型那边还在说——屏幕和账从此不是一件事。
    */
-  const stop = () => {
+  const stop = useCallback(() => {
     clientRef.current?.send({ type: 'chat_cancel', session_id: sessionId });
-  };
+  }, [clientRef, sessionId]);
+
+  const streaming = Boolean(session?.streaming);
+
+  /**
+   * Esc 与「■ 停止」走同一条路：只在有轮在跑时挂上，停的是这一段上所有在跑的轮。
+   *
+   * 不避让输入框——Esc 在这里没有第二种含义，而「手还在键盘上、想让它停下」正是
+   * 这个键存在的理由。监听挂在 window 上而不是这一面的元素上：焦点多半就在那个
+   * 输入框里，元素级监听会在刚说完一句、还没点别处的时候收不到。
+   */
+  useEffect(() => {
+    if (!streaming) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      stop();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [streaming, stop]);
+
+  if (!session) return null;
 
   /**
    * 答一次「要不要动手」。

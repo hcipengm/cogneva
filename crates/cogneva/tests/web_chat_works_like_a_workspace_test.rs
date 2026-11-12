@@ -63,6 +63,31 @@ fn a_stop_travels_from_the_button_to_the_turn_and_back() {
     );
 }
 
+/// Esc 是「■ 停止」的第二个入口，不是第二个停止实现。
+///
+/// 判据分三件：这个键确实挂上了（`keydown` + `Escape`），它只在有轮在跑时挂
+/// （否则空白对话里一按 Esc 就发一条不该有的上行），以及它走的是同一个发点——
+/// 全文件只有一处 `chat_cancel`。第三件是这一条的主旨：两个入口各写一份发送逻辑
+/// 时，停止的语义（按会话、不本地拦截）要记两遍，改一处就有一处漏。
+#[test]
+fn a_stop_also_comes_from_the_escape_key() {
+    let pane = read_repo(PANE);
+    assert!(
+        pane.contains("addEventListener('keydown'") && pane.contains("event.key !== 'Escape'"),
+        "{PANE} 没有挂在 Esc 上的停止：按钮能用，手在键盘上的人停不下来"
+    );
+    assert!(
+        pane.contains("if (!streaming) return;"),
+        "{PANE} 的 Esc 监听不是在「有轮在跑」时才挂的：空白对话里按一下也会发停止"
+    );
+    assert_eq!(
+        pane.matches("type: 'chat_cancel'").count(),
+        1,
+        "{PANE} 里有多处发 `chat_cancel` 的地方：Esc 与按钮各写了一份停止语义，\
+         迟早只改一处"
+    );
+}
+
 #[test]
 fn several_conversations_can_be_open_at_once_and_survive_a_reload() {
     let dock = read_repo(DOCK);
