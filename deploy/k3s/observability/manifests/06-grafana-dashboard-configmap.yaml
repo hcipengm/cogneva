@@ -3599,7 +3599,7 @@ data:
         {
           "id": 85,
           "title": "Shutdown Drain: How Long, and What It Bought",
-          "description": "Every shutdown that had a drain budget reports three things here, and they are one reading because the log line they replace says the same sentence either way. The quantile says how long the wait for in-flight runs took; it is a histogram and not a mean because the number the budget should be set from is the slow tail, and a rollout that took ninety seconds is the observation that matters. The abandoned counter says what the wait bought: zero means every run reached a turn boundary before the process exited, while a value above zero means that many attempts were handed to their journals mid-step. The undeclared counter is a separate series rather than a zero-second observation on the histogram, because a process that never drained and one that drained instantly are opposite facts; it counts shutdowns that found no budget at all. Read them together: a rising q95 with a flat abandoned count is a budget that is short but still doing its job, while an abandoned count that moves at all is the drain not finishing. The histogram is absent until the first shutdown, which is a deployment that has not been rolled rather than a quiet one.",
+          "description": "Every shutdown that had a drain budget reports three things here, and they are one reading because the log line they replace says the same sentence either way. The quantile says how long the wait for in-flight runs took, in milliseconds; it is a histogram and not a mean because the tail is the observation that matters, and the ladder is the `_ms` one because the `_seconds` ladder tops out at 16.384 s -- every drain approaching the budget would land in one overflow count, and a reading that cannot tell 20 s from 45 s cannot say whether the grace is too small. The abandoned counter says what the wait bought: zero means every run reached a turn boundary before the process exited, while a value above zero means that many attempts were handed to their journals mid-step. The undeclared counter is a separate series rather than a zero-second observation on the histogram, because a process that never drained and one that drained instantly are opposite facts; it counts shutdowns that found no budget at all. Read them together: a rising q95 with a flat abandoned count is a budget that is short but still doing its job, while an abandoned count that moves at all is the drain not finishing. The histogram is absent until the first shutdown, which is a deployment that has not been rolled rather than a quiet one.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -3609,8 +3609,8 @@ data:
           },
           "targets": [
             {
-              "expr": "histogram_quantile(0.95, sum by (le) (rate(cogneva_shutdown_drain_seconds_bucket[1h])))",
-              "legendFormat": "q95 drain seconds",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(cogneva_shutdown_drain_milliseconds_bucket[1h])))",
+              "legendFormat": "q95 drain ms",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

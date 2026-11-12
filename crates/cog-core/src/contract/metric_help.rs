@@ -1414,16 +1414,24 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
          different questions",
     ),
     (
-        crate::metric_names::SHUTDOWN_DRAIN_SECONDS.as_str(),
+        crate::metric_names::SHUTDOWN_DRAIN_MILLISECONDS.as_str(),
         "How long one shutdown waited for in-flight runs to reach a turn \
-         boundary, observed once per shutdown, labelled by `outcome`. `drained` \
-         is a wait that reached zero; `timeout` is one that ran out of its \
-         budget with runs still going. A histogram rather than a mean because \
-         the number a budget should be set from is the slow tail -- one rollout \
-         that took ninety seconds is the observation that matters, and an \
-         average over a day is the one that hides it. Read as a quantile over a \
-         window long enough to contain a rollout: the budget has to cover the \
-         slow ones, not the typical one.",
+         boundary, in milliseconds, observed once per shutdown and labelled by \
+         `outcome`. `drained` is a wait that reached zero; `timeout` is one that \
+         ran out of its budget with runs still going. A histogram rather than a \
+         mean because the number the grace period must cover is the slow tail -- \
+         one rollout that took thirty seconds is the observation that matters, \
+         and an average over a day is the one that hides it. Milliseconds \
+         because the bucket ladder doubles from the unit its name declares: the \
+         seconds ladder stops at 16.384 s, which is inside the range a drain is \
+         allowed to take, so the slow observations -- the only ones that say the \
+         grace is too small -- would all share one overflow count. The two \
+         outcomes are not interchangeable when read as a distribution: a \
+         `drained` duration is the real wait, while a `timeout` one is censored \
+         at the cap it was given and only says `at least this long`. So a \
+         quantile belongs on the `drained` rows, and the `timeout` rows are read \
+         as a count -- any of them is evidence that the cap was reached, which \
+         is the one fact a quantile of the censored rows would hide.",
     ),
 ];
 

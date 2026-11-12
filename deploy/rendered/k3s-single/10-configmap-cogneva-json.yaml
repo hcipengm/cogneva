@@ -190,6 +190,7 @@ data:
         "event_channel_capacity": 1024,
         "task_event_channel_capacity": 256,
         "shutdown_timeout_ms": 30000,
+        "_comment_shutdown_timeout_ms": "进程收到 SIGTERM 之后等在飞的运行停在回合边界的时长。这里的 30000 是脱离清单直接跑（开发机、单元测试）时的默认值；部署到集群的那一份由镜像清单注入 COGNEVA_SHUTDOWN_TIMEOUT_MS，值是 Pod 宽限期减去收尾余量，与 kubelet 到点 SIGKILL 的那一格同源（chart 的 shutdown.terminationGraceSeconds）。两个数不在文件里同步，因为清单里的宽限期一改，预算必须跟着改——分两处写就只剩人记得同步这一种机制。",
         "timeout_checker_interval_secs": 30,
         "loop_restart_max_consecutive": 3,
         "loop_restart_backoff_floor_secs": 5,
@@ -295,6 +296,7 @@ data:
         "COGNEVA_BUILD_GATE_WAIT_SECS": "self_evolution.build_gate.wait_secs",
         "COGNEVA_BUILD_GATE_LOCK_DIR": "self_evolution.build_gate.lock_dir",
         "COGNEVA_SANDBOX_EXECUTOR_URL": "system.sandbox_executor_url",
+        "COGNEVA_SHUTDOWN_TIMEOUT_MS": "system.shutdown_timeout_ms",
         "COGNEVA_REQUIRE_TOOL_IDENTITY": "system.require_tool_identity",
         "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS": "system.skill_hot_reload_interval_secs",
         "COGNEVA_LOOP_RESTART_MAX_CONSECUTIVE": "system.loop_restart_max_consecutive",
@@ -3999,7 +4001,7 @@ data:
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "{value} agent attempt(s) were still in flight when a shutdown ran out of its drain budget in the last half hour. A drain is supposed to cost nothing: the run is stopped at a turn boundary with its tool results already written, and the next dispatch continues from the journal without re-buying anything. This counter is the case where that did not happen -- the process exited while runs were still mid-step, and each of those attempts is now resumed from its journal at the cost of whatever the interrupted call was doing. It is read here rather than off the drain histogram because the histogram says how long the wait was and this says what it bought: a drain that times out with nothing left lost nothing, and a drain that times out with three runs going handed three attempts to their journals, while the log line for both reads the same. Read it beside cogneva_shutdown_drain_seconds{outcome=\"timeout\"} on the panel: the pair separates a budget that is merely short from a workload whose turns have grown longer than any budget would cover. The repair is at both ends of the pair the budget belongs to -- shutdown.drainBudgetMs and terminationGracePeriodSeconds -- because a budget raised past the grace only moves which half does the killing. The counter is seeded at zero on every shutdown, so a window with no abandonment reads as zero rather than as an absent series.",
+              "summary": "{value} agent attempt(s) were still in flight when a shutdown ran out of its drain budget in the last half hour. A drain is supposed to cost nothing: the run is stopped at a turn boundary with its tool results already written, and the next dispatch continues from the journal without re-buying anything. This counter is the case where that did not happen -- the process exited while runs were still mid-step, and each of those attempts is now resumed from its journal at the cost of whatever the interrupted call was doing. It is read here rather than off the drain histogram because the histogram says how long the wait was and this says what it bought: a drain that times out with nothing left lost nothing, and a drain that times out with three runs going handed three attempts to their journals, while the log line for both reads the same. Read it beside cogneva_shutdown_drain_milliseconds{outcome=\"timeout\"} on the panel: the pair separates a budget that is merely short from a workload whose turns have grown longer than any budget would cover. The repair is the one number the budget is computed from -- shutdown.terminationGraceSeconds -- because raising it moves the wait and the kill together; a budget pinned beside the grace instead only moves which half does the killing. The counter is seeded at zero on every shutdown, so a window with no abandonment reads as zero rather than as an absent series.",
               "face": "资源泄漏与长稳"
             },
             {

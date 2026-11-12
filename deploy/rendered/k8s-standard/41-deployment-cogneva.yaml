@@ -49,7 +49,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: 204ae64952a4ffeeaa47d929e838610fe6bac8d6e2ff5e5ed6b37da89d93e59f
+        checksum/config: 8c3a4fec3f94ea376c0a36cd4e5b66942d1ab5ee52a586bff8178df901896309
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -94,6 +94,8 @@ spec:
           env:
             - name: TZ
               value: "Asia/Shanghai"
+            - name: COGNEVA_SHUTDOWN_TIMEOUT_MS
+              value: "30000"
             # 槽目录只有一处设置。这个键在 cogneva-evolution-config 里，而本 Pod 的
             # envFrom 只取 cogneva-config——不在这里给一遍，两个 Pod 就各读各的默认值，
             # 定制过路径的部署上页面读的是一个空目录。

@@ -20,7 +20,7 @@ spec:
       annotations:
         # 同主应用：这个 Pod 也挂 cogneva-json、也经 envFrom 取 cogneva-config，
         # 两份配置里任何一份变了它都得跟着重启，否则进程读到的仍是启动时那份。
-        checksum/config: b199e3e09905f9ca820a98497736155327b18e2fbfd0c58a332d1a1157f57ca3
+        checksum/config: 56a0dfc65d4b6fb5260ee3330a95161c1ff2cc9886b75510adccdf0d1a7147c6
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
@@ -28,9 +28,9 @@ spec:
         app.kubernetes.io/version: "0.5.10"
     spec:
       serviceAccountName: cogneva-evolution
-      # Same pair as the main app: this pod also runs agent turns, so its grace
-      # period must stay wider than core.system.shutdown_timeout_ms (30 s) or a
-      # rollout SIGKILLs it mid-drain. Held by tests/shutdown_budget_contract_test.rs.
+      # Same cell as the main app: this pod also runs agent turns, so it takes
+      # the same grace, and its drain budget (injected below) is computed from
+      # it the same way. Held by tests/shutdown_budget_contract_test.rs.
       terminationGracePeriodSeconds: 45
       # The evolution worker runs as root inside a privileged container so it
       # can chmod, apt install, git init, self_exec, and build release binaries.
@@ -132,6 +132,10 @@ spec:
           env:
             - name: TZ
               value: "Asia/Shanghai"
+            # 排空预算：宽限期 45 s 减去 15 s 收尾余量，与 chart 的
+            # cogneva.drainBudgetEnv 同一个算法；这条路径不经渲染，数写在这里。
+            - name: COGNEVA_SHUTDOWN_TIMEOUT_MS
+              value: "30000"
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
             # 本 Pod 的名字：按变更派出的执行 Job 要跑**同一份代码**，而"同一份"

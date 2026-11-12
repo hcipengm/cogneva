@@ -52,9 +52,9 @@ spec:
         app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     spec:
       serviceAccountName: cogneva
-      {{- /* 必须宽于 core.system.shutdown_timeout_ms：SIGTERM 之后进程在预算内让在飞的
-      运行停在回合边界，宽限期到点 kubelet 才 SIGKILL。宽限短于预算时排空只是在日志里
-      发生过，而清单本身读不出这件事；两者的关系由 shutdown_budget_contract_test 判。 */}}
+      {{- /* 关停面唯一的数：kubelet 到点 SIGKILL。进程的排空预算由它减去收尾余量算出
+      （见 cogneva.drainBudgetEnv），所以「宽限短于预算」不是两个值之间的约定，而是
+      同一格算出来的两段——排空永远在宽限期用完之前结束。 */}}
       terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGraceSeconds }}
       affinity:
         podAntiAffinity:
@@ -92,6 +92,7 @@ spec:
                 name: cogneva-config
           env:
             {{- include "cogneva.timeEnv" . | nindent 12 }}
+            {{- include "cogneva.drainBudgetEnv" . | nindent 12 }}
             {{- if .Values.evolution.buildGate.enabled }}
             # 槽目录只有一处设置。这个键在 cogneva-evolution-config 里，而本 Pod 的
             # envFrom 只取 cogneva-config——不在这里给一遍，两个 Pod 就各读各的默认值，

@@ -26,7 +26,7 @@ spec:
       annotations:
         # 同主应用：这个 Pod 也挂 cogneva-json、也经 envFrom 取 cogneva-config，
         # 两份配置里任何一份变了它都得跟着重启，否则进程读到的仍是启动时那份。
-        checksum/config: d3eb2d309999f5d901cf2b29c75c44a2c0d45ca5a8156005f33bfeffdb4987ad
+        checksum/config: 7347e50e35d87eca18a581a826cb4215eb6e9cca790bc54e9551d273f1c9462b
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
@@ -123,6 +123,8 @@ spec:
           env:
             - name: TZ
               value: "Asia/Shanghai"
+            - name: COGNEVA_SHUTDOWN_TIMEOUT_MS
+              value: "30000"
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
             # 本 Pod 的名字：按变更派出的执行 Job 要跑**同一份代码**，而"同一份"

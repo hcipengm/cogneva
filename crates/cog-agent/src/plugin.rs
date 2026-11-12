@@ -287,7 +287,7 @@ impl AgentPlugin {
     /// 三条、这一次一条没留」在同一条序列上读得出来——一个只在坏结局里才出现的
     /// 计数器，读的人分不清「归零了」与「这版还没装」。写失败只打一行日志：
     /// 进程正在退出，读数写不进去不该改变关停顺序。
-    async fn record_drain(&self, seconds: f64, outcome: &'static str, left: usize) {
+    async fn record_drain(&self, millis: f64, outcome: &'static str, left: usize) {
         let Some(metrics) = self.metrics.as_ref() else {
             return;
         };
@@ -295,8 +295,8 @@ impl AgentPlugin {
         labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
         if let Err(e) = metrics
             .record_histogram(
-                cog_core::metric_names::SHUTDOWN_DRAIN_SECONDS,
-                seconds,
+                cog_core::metric_names::SHUTDOWN_DRAIN_MILLISECONDS,
+                millis,
                 labels,
             )
             .await
@@ -921,7 +921,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 self.record_drain_undeclared().await;
             } else if crate::drain::wait_drained(limit).await {
                 info!("every in-flight run reached a turn boundary before shutdown");
-                self.record_drain(started.elapsed().as_secs_f64(), DRAIN_DRAINED, 0)
+                self.record_drain(started.elapsed().as_secs_f64() * 1000.0, DRAIN_DRAINED, 0)
                     .await;
             } else {
                 let left = crate::drain::in_flight();
@@ -929,8 +929,12 @@ impl cog_core::SystemPlugin for AgentPlugin {
                     in_flight = left,
                     "shutdown ran out of time with runs still in flight; they resume from their journals"
                 );
-                self.record_drain(started.elapsed().as_secs_f64(), DRAIN_TIMEOUT, left)
-                    .await;
+                self.record_drain(
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    DRAIN_TIMEOUT,
+                    left,
+                )
+                .await;
             }
         }
         // 注册表是全集群共享的（多副本同名 worker、其他 pod 的 squad 智能体
@@ -1255,17 +1259,17 @@ mod shutdown_drain_readings_tests {
     async fn a_drained_shutdown_reports_its_duration_and_zero_abandoned() {
         let spy = Arc::new(RecordingMetrics::default());
         plugin_with(spy.clone())
-            .record_drain(12.5, DRAIN_DRAINED, 0)
+            .record_drain(12_500.0, DRAIN_DRAINED, 0)
             .await;
-        let seconds = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_SECONDS);
+        let seconds = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_MILLISECONDS);
         assert_eq!(
             seconds.len(),
             1,
             "one observation per shutdown: {seconds:?}"
         );
         assert_eq!(
-            seconds[0].2, 12.5,
-            "the observed duration is the wait itself"
+            seconds[0].2, 12_500.0,
+            "the observed duration is the wait itself, in the unit the bucket ladder covers"
         );
         assert_eq!(
             seconds[0].1.get(crate::LABEL_OUTCOME).map(String::as_str),
@@ -1285,9 +1289,9 @@ mod shutdown_drain_readings_tests {
     async fn a_timed_out_drain_reports_the_runs_it_left_in_flight() {
         let spy = Arc::new(RecordingMetrics::default());
         plugin_with(spy.clone())
-            .record_drain(30.0, DRAIN_TIMEOUT, 3)
+            .record_drain(30_000.0, DRAIN_TIMEOUT, 3)
             .await;
-        let seconds = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_SECONDS);
+        let seconds = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_MILLISECONDS);
         assert_eq!(
             seconds[0].1.get(crate::LABEL_OUTCOME).map(String::as_str),
             Some(DRAIN_TIMEOUT),
@@ -1305,7 +1309,7 @@ mod shutdown_drain_readings_tests {
         let spy = Arc::new(RecordingMetrics::default());
         plugin_with(spy.clone()).record_drain_undeclared().await;
         assert!(
-            spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_SECONDS)
+            spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_MILLISECONDS)
                 .is_empty(),
             "a process that never waited must not observe a duration"
         );
@@ -1323,7 +1327,7 @@ mod shutdown_drain_readings_tests {
         // 没有后端时这些调用必须是空操作：关停路径上的一次 panic 会把「读数写不
         // 进去」升级成「进程退不掉」。
         let plugin = AgentPlugin::new();
-        plugin.record_drain(1.0, DRAIN_DRAINED, 0).await;
+        plugin.record_drain(1_000.0, DRAIN_DRAINED, 0).await;
         plugin.record_drain_undeclared().await;
     }
 }

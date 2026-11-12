@@ -1,0 +1,77 @@
+# 关停那一面的两条规则的单测夹具：排空放弃了几个尝试、续跑时撞上了几个结果不可知的
+# 外部调用。它们与排空耗时直方图是一组读数：直方图说等了多久，这两条说那一等值不值。
+#
+# 两条都只在**发生**时才亮（`> 0`），所以夹具必须给出两半：
+#   一、一切正常的格：计数器在写、值一直是 0 —— 两条都不许响。没有这一格，
+#       「永远响」与「判对了」在读数上同形。
+#   二、越界的格：计数器在窗口里涨上去 —— 两条都必须响。
+#
+# 第二条规则只认 `effect="external"`：读与写两种调用续跑时会自动重放，代价是多一次
+# 调用；外部调用不重放，它的结果只有模型能判。第一格里专门让 `read` 那一格一直涨，
+# 断言它**不**触发第二条——删掉表达式里的 `effect="external"` 过滤，这一格会先红。
+#
+# 窗口是 30 分钟，求值点取 60 分钟，所以越界那一格把跳变放在 45 分钟处：
+# `increase(...[30m])` 在 60 分钟时看得见它，而放红点在 30 分钟处就看不见。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-shutdown-drain.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: shutdown_drain_left_attempts_behind
+# rule: attempt_resumed_with_external_effects
+
+evaluation_interval: 1m
+
+tests:
+  # 一、一次干净的滚动：排空没放弃任何运行，续跑只撞上可重放的读调用。两条都静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_shutdown_drain_abandoned_total{pod="cogneva-7f9c4"}'
+        values: '0x60'
+      - series: 'cogneva_shutdown_drain_milliseconds_bucket{outcome="drained",le="+Inf",pod="cogneva-7f9c4"}'
+        values: '0x60'
+      - series: 'cogneva_attempt_unresolved_calls_total{effect="read",pod="cogneva-7f9c4"}'
+        values: '0+1x60'
+      - series: 'cogneva_attempt_unresolved_calls_total{effect="write",pod="cogneva-7f9c4"}'
+        values: '0+1x60'
+      - series: 'cogneva_attempt_unresolved_calls_total{effect="external",pod="cogneva-7f9c4"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: shutdown_drain_left_attempts_behind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: attempt_resumed_with_external_effects
+        exp_alerts: []
+
+  # 二、排空到点还有三个运行在飞：45 分钟时放弃计数从 0 跳到 3，60 分钟这一格必须响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_shutdown_drain_abandoned_total{pod="cogneva-7f9c4"}'
+        values: '0x45 3x15'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: shutdown_drain_left_attempts_behind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      # 反向：同一个跳变在窗口之前就已经发生过了（此刻求值点看的是 30 分钟窗口），
+      # 这条在 30 分钟时还不该看见它。
+      - eval_time: 30m
+        alertname: shutdown_drain_left_attempts_behind
+        exp_alerts: []
+
+  # 三、续跑撞上一个结果不可知的外部调用：必须响，且分组只带 effect 那一格。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_attempt_unresolved_calls_total{effect="external",pod="cogneva-7f9c4"}'
+        values: '0x45 1x15'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: attempt_resumed_with_external_effects
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              effect: external

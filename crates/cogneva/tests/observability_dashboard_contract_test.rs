@@ -1044,7 +1044,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     // 有几个没结果的调用）画在同一块面板上，因为读者问的是同一个问题——
     // 这次滚动丢了几步。
     (
-        "cogneva_shutdown_drain_seconds",
+        "cogneva_shutdown_drain_milliseconds",
         &["outcome"],
         "crates/cog-agent/src/plugin.rs",
     ),

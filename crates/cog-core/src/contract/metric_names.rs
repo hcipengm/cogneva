@@ -2144,14 +2144,22 @@ metric_names! {
     // whether the next attempt actually continued from the journal rather than
     // re-buying the conversation.
     //
-    // `seconds` is a histogram, not a counter, because the question the budget
-    // is set from is "how long does a real drain take", and that is a
-    // distribution: a single slow rollout is the observation that moves the
-    // budget, and a mean over a day hides it. The `outcome` label keeps the
-    // two endings apart -- a drain that reached zero and one that ran out of
-    // budget are both events here, and summing the label away would let a
-    // process that never drains on time look like one that always does.
-    SHUTDOWN_DRAIN_SECONDS => "cogneva_shutdown_drain_seconds",
+    // A histogram, not a counter, because the question the grace is set from is
+    // "how long does a real drain take", and that is a distribution: a single
+    // slow rollout is the observation that raises the grace, and a mean over a
+    // day hides it. The `outcome` label keeps the two endings apart -- a drain
+    // that reached zero and one that ran out of budget are both events here,
+    // and summing the label away would let a process that never drains on time
+    // look like one that always does.
+    //
+    // Milliseconds rather than seconds because the bucket ladder follows the
+    // name's suffix: the `_seconds` ladder doubles from 1 ms and tops out at
+    // 16.384 s, so every drain that mattered -- the ones approaching the grace
+    // it has to fit under -- would land in one indistinguishable `+Inf` count,
+    // and a reading that cannot tell 17 s from 30 s cannot say whether the
+    // grace is too small. The `_ms` ladder reaches 65.5 s, which covers the
+    // whole range a drain is allowed to take.
+    SHUTDOWN_DRAIN_MILLISECONDS => "cogneva_shutdown_drain_milliseconds",
     // Runs still in flight when the drain budget ran out. The histogram above
     // says how long the wait was; this says what it bought. A drain that times
     // out with nothing left has lost nothing, while one that times out with
