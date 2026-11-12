@@ -36,6 +36,8 @@
 #   COGNEVA_BUILD_RESERVE_FRESH_SECS   how long another work's claim on the next
 #                                      build counts as still being asked for.
 #   COGNEVA_BUILD_SERVED_LINES         how many works the served record keeps.
+#   COGNEVA_BUILD_SLOT_REPORT          a file to append `<waited>\t<held>\t<name>`
+#                                      to after each run; unset prints the line only.
 
 build_slot_gate_dir="${COGNEVA_BUILD_GATE_LOCK_DIR:-/var/lib/cogneva-build-gate}"
 build_slot_own_lock="${COGNEVA_BUILD_LOCK_FILE:-${HOME}/.local/state/cogneva/build.lock}"
@@ -69,6 +71,42 @@ build_slot_reserve_fresh="$(build_slot_num "${build_slot_reserve_fresh}" 900)"
 build_slot_served_lines="$(build_slot_num "${build_slot_served_lines}" 64)"
 
 build_slot_warn() { printf 'build slot: %s\n' "$*" >&2; }
+
+# Where the wait is reported, when the caller wants the two numbers apart.
+#
+# The line printed on the way out is for a reader; a caller that adds up its own
+# time cannot subtract prose. `COGNEVA_BUILD_SLOT_REPORT` names a file, and each
+# `build_slot_run` appends `<waited>\t<held>\t<name>` to it. Unset means the line
+# only -- which is what every caller but the gate gets, so joining the slots puts
+# no new obligation on the cluster's builder.
+build_slot_report() { # <waited> <held> <what>
+    [ -n "${COGNEVA_BUILD_SLOT_REPORT:-}" ] || return 0
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"${COGNEVA_BUILD_SLOT_REPORT}" 2>/dev/null || true
+}
+
+# Where the report stands now, as a line count. A cell can only tell its own
+# waiting apart from the rest of the run by bracketing itself with this and
+# asking for the sum since.
+build_slot_reported_lines() {
+    [ -n "${COGNEVA_BUILD_SLOT_REPORT:-}" ] && [ -r "${COGNEVA_BUILD_SLOT_REPORT}" ] || {
+        printf '0'
+        return 0
+    }
+    wc -l <"${COGNEVA_BUILD_SLOT_REPORT}" 2>/dev/null | tr -d ' ' || printf '0'
+}
+
+# Seconds waited, summed over the lines added after `<from>`. Unreadable counts as
+# no wait: a caller that cannot read the record must not subtract a number it did
+# not measure -- the cell is then reported whole, which is the honest reading.
+build_slot_reported_waits_since() { # <lines the cell started at>
+    [ -n "${COGNEVA_BUILD_SLOT_REPORT:-}" ] && [ -r "${COGNEVA_BUILD_SLOT_REPORT}" ] || {
+        printf '0'
+        return 0
+    }
+    awk -F'\t' -v from="${1:-0}" \
+        'NR > from && NF >= 3 && $1 ~ /^[0-9]+$/ { sum += $1 } END { printf "%d", sum + 0 }' \
+        "${COGNEVA_BUILD_SLOT_REPORT}" 2>/dev/null || printf '0'
+}
 
 # How many builds the gate admits. Readable but absent is not the same as
 # readable and one: an unreadable bound is reported as such so the wait line
@@ -278,7 +316,9 @@ build_slot_run() { # build_slot_run <what> <command…>
                 # still held would have a reader see a holder that has finished.
                 exec 7<&-
                 exec 9<&-
-                build_slot_warn "\"${name}\" held slot-${got} for $(( $(date +%s) - held_from ))s after waiting $(( held_from - waited_from ))s"
+                local held=$(( $(date +%s) - held_from )) waited=$(( held_from - waited_from ))
+                build_slot_report "${waited}" "${held}" "${name}"
+                build_slot_warn "\"${name}\" held slot-${got} for ${held}s after waiting ${waited}s"
                 return "${rc}"
             fi
             if [ "$(date +%s)" -ge "${deadline}" ]; then
@@ -311,11 +351,14 @@ build_slot_run() { # build_slot_run <what> <command…>
         build_slot_warn "no build lock after ${build_slot_wait}s; refusing to run \"${what}\""
         return 75
     fi
-    local held_from
+    local held_from held waited
     held_from=$(date +%s)
     "$@"
     rc=$?
     exec 8>&-
-    build_slot_warn "\"${what}\" ran under this host's own lock for $(( $(date +%s) - held_from ))s after waiting $(( held_from - waited_from ))s"
+    held=$(( $(date +%s) - held_from ))
+    waited=$(( held_from - waited_from ))
+    build_slot_report "${waited}" "${held}" "${what}"
+    build_slot_warn "\"${what}\" ran under this host's own lock for ${held}s after waiting ${waited}s"
     return "${rc}"
 }

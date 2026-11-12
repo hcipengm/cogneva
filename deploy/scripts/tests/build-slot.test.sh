@@ -134,4 +134,60 @@ rc=$?
 set -e
 [ "${rc}" -eq 7 ] || fail "命令自己的退出码应当原样传出去，实际退 ${rc}"
 
-echo "ok - 没有槽时退到本机的锁并说明；有槽时写持有者记录、被占时等待、等不到退 75、命令的退出码原样传出"
+# 7. 等槽与干活分两个数报出来：问的人要的是「这一格自己花了多久」，而终端上那行
+#    给人读的文字（`held … for Ns after waiting Ms`）不能拿去减。设了文件名就要有
+#    一行 `<waited>\t<held>\t<name>`，没设就一个字都不多写——别的调用方不必跟着改。
+printf '1\n' >"${gate_dir}/buildgate.bound"
+: >"${gate_dir}/slot-0.lock"
+rm -f "${gate_dir}/builds.reserve"
+report="${work}/waits.tsv"
+(
+    exec 5<"${gate_dir}/slot-0.lock"
+    flock -x 5
+    sleep 2
+) &
+holder=$!
+sleep 0.5
+report_in() { # <报告文件> <说明> <命令…>
+    local file="$1" what="$2"; shift 2
+    (
+        COGNEVA_BUILD_SLOT_REPORT="${file}" \
+            COGNEVA_BUILD_GATE_LOCK_DIR="${gate_dir}" \
+            COGNEVA_BUILD_LOCK_FILE="${work}/own/lock" \
+            COGNEVA_BUILD_SLOT_WAIT_SECS=20 \
+            COGNEVA_BUILD_SLOT_POLL_SECS=1 \
+            bash -c '. "$1"; shift; build_slot_run "$@"' _ "${lib}" "${what}" "$@"
+    )
+}
+export COGNEVA_BUILD_SLOT_REPORT="${report}"
+lines_before="$(build_slot_reported_lines)"
+report_in "${report}" "报等槽" true >/dev/null 2>&1 || fail "带报告文件时应当照样跑完"
+wait "${holder}" 2>/dev/null || true
+[ -s "${report}" ] || fail "设了 COGNEVA_BUILD_SLOT_REPORT 却没有留下任何一行"
+line="$(tail -n 1 "${report}")"
+case "${line}" in
+*$'\t'gate:\ 报等槽) ;;
+*) fail "报告行应当是 <等槽秒>\\t<干活秒>\\t<名字>，实际：${line}" ;;
+esac
+waited="$(printf '%s' "${line}" | cut -f1)"
+held="$(printf '%s' "${line}" | cut -f2)"
+[ "${waited}" -ge 1 ] || fail "被占着的时候等槽秒数应当大于 0，实际 ${waited}：${line}"
+case "${held}" in '' | *[!0-9]*) fail "干活秒数应当是数字，实际 ${held}：${line}" ;; esac
+[ "$(build_slot_reported_waits_since "${lines_before}")" = "${waited}" ] ||
+    fail "从某个位置往后求和应当只数这一行：得 $(build_slot_reported_waits_since "${lines_before}")，行里是 ${waited}"
+[ "$(build_slot_reported_waits_since 0)" -ge "${waited}" ] || fail "从头求和应当不少于这一行"
+
+# 没设文件名：一个字都不多写，终端那行照旧。别的调用方（集群里的构建）不该因为门
+# 要这个读数而多出一份文件，也不该因为它不设就少一行给人读的话。
+unset COGNEVA_BUILD_SLOT_REPORT
+[ "$(build_slot_reported_lines)" = "0" ] || fail "没设报告文件时行数应当是 0"
+[ "$(build_slot_reported_waits_since 0)" = "0" ] || fail "没设报告文件时等槽秒数应当是 0"
+out="$(
+    COGNEVA_BUILD_GATE_LOCK_DIR="${gate_dir}" \
+        COGNEVA_BUILD_LOCK_FILE="${work}/own/lock" \
+        COGNEVA_BUILD_SLOT_WAIT_SECS=20 \
+        bash -c '. "$1"; shift; build_slot_run "$@"' _ "${lib}" "不报" true 2>&1
+)" || fail "没设报告文件时应当照样跑完：${out}"
+printf '%s\n' "${out}" | grep -q 'held slot-' || fail "没设报告文件时终端那行照旧要有：${out}"
+
+echo "ok - 没有槽时退到本机的锁并说明；有槽时写持有者记录、被占时等待、等不到退 75、命令的退出码原样传出；等槽与干活分两个数落一份记录"

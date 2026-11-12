@@ -57,6 +57,12 @@ if [ ! -r "${here}/lib/build-slot.sh" ]; then
 fi
 # shellcheck source=lib/build-slot.sh
 . "${here}/lib/build-slot.sh"
+# 等槽的秒数记在这里，由 lib/build-slot.sh 每次退出槽时追加一行。不这么做，表上的一格
+# 就是「这一格花了多少秒」，而其中可能有一半是排队——两件事要相反的应对（一格真慢要
+# 拆判据，排队久要加槽或让路），混在一行里读的人只会去优化编译。
+# 写不进去只是少了这一面拆分：这一跑照常判，格子按整段记，不拿一个没量到的数去减。
+slot_report="$(mktemp "${TMPDIR:-/tmp}/cogneva-gate-slot-waits.XXXXXX")" 2>/dev/null || slot_report=""
+[ -n "${slot_report}" ] && export COGNEVA_BUILD_SLOT_REPORT="${slot_report}"
 # 这一跑每一格的秒数与结局也写进构建槽目录下的 runs/：网关在它已有的「编译与测」那一面
 # 读，页面因此不必另开一条通道，也不必在宿主上再落一份自成一体的台账。缺了它只是屏上
 # 少这一面读数，判据不受影响。
@@ -429,13 +435,34 @@ case "${run_root}" in
 esac
 finish_segments() {
     rm -f "${segment_log}"
+    [ -z "${slot_report}" ] || rm -f "${slot_report}"
     gate_run_finish "${run_file}"
 }
 trap finish_segments EXIT
 
+segments_written=0
 record_segment() { # <秒> <结局> <说明>
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"${segment_log}" 2>/dev/null
     gate_run_append "${run_file}" "$1" "$2" "$3"
+    segments_written=$((segments_written + 1))
+}
+
+# 一格只记一行，排队的秒数从这一格里拆出来单独记一行「等槽」。
+#
+# 拆的依据是构建槽客户端写的那份报告（`build_slot_report`），量不到就不拆：宁可把整段
+# 记在这格上，也不拿一个没量到的数去减——减错的那一格会让人去拆一条并不慢的判据。
+# 这一行同时是「这一跑有多少时间不是在判」的唯一读数：门慢可以是判据贵，也可以是机器
+# 满，而这两个答案要求完全相反的动作。
+record_cell() { # <起始秒> <起始等槽行数> <结局> <说明>
+    local t0="$1" wait0="$2" outcome="$3" what="$4" row secs out txt
+    local waited
+    local -a rows=()
+    waited="$(build_slot_reported_waits_since "${wait0}")"
+    mapfile -t rows < <(cell_rows "$((SECONDS - t0))" "${waited}" "${outcome}" "${what}")
+    for row in "${rows[@]}"; do
+        IFS="$(printf '\t')" read -r secs out txt <<<"${row}"
+        record_segment "${secs}" "${out}" "${txt}"
+    done
 }
 
 run_suite_file() { # run_suite_file <说明> <模块名>
@@ -446,51 +473,59 @@ run_suite_file() { # run_suite_file <说明> <模块名>
     # 退出码，还要求它真的报出至少一条通过的用例。
     local what="$1"; shift
     local filter="$1"; shift
-    local out status t0=${SECONDS}
+    local out status t0=${SECONDS} wait0
+    wait0="$(build_slot_reported_lines)"
     out="$("$@" "${filter}" 2>&1)"
     status=$?
     printf '%s\n' "${out}" | tail -6
     if [ "${status}" -eq 75 ]; then
         printf 'UNJUDGED  %s：这一格没进构建槽，一行判据都没跑（不是红，也不是绿）。\n' "${what}" >&2
         unjudged=$((unjudged + 1))
-        record_segment "$((SECONDS - t0))" UNJUDGED "${what}"
+        record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
         return 0
     fi
     if [ "${status}" -ne 0 ]; then
         printf 'RED  %s\n' "${what}" >&2
         failures=$((failures + 1))
-        record_segment "$((SECONDS - t0))" RED "${what}"
+        record_cell "${t0}" "${wait0}" RED "${what}"
         return 0
     fi
     if ! printf '%s\n' "${out}" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
         printf 'RED  %s：filter“%s”一条用例都没命中，这条判据没跑\n' "${what}" "${filter}" >&2
         failures=$((failures + 1))
-        record_segment "$((SECONDS - t0))" RED "${what}"
+        record_cell "${t0}" "${wait0}" RED "${what}"
         return 0
     fi
-    record_segment "$((SECONDS - t0))" ok "${what}"
+    record_cell "${t0}" "${wait0}" ok "${what}"
     return 0
 }
 
 run_step() { # run_step <说明> <命令…>
     local what="$1"; shift
-    local t0=${SECONDS} status
+    local t0=${SECONDS} status wait0 written0
+    wait0="$(build_slot_reported_lines)"
+    written0=${segments_written}
     printf '== %s\n' "${what}"
     "$@"
     status=$?
+    # 命令自己记过一格的，这一格不再记第二行：表上的两行会把同一段时间算两遍，
+    # 而「合计」是拿来排期的。外层只负责在里层什么都没记时兜底。
+    if [ "${segments_written}" -ne "${written0}" ]; then
+        return 0
+    fi
     if [ "${status}" -eq 0 ]; then
-        record_segment "$((SECONDS - t0))" ok "${what}"
+        record_cell "${t0}" "${wait0}" ok "${what}"
         return 0
     fi
     if [ "${status}" -eq 75 ]; then
         printf 'UNJUDGED  %s：这一格没进构建槽，一行判据都没跑（不是红，也不是绿）。\n' "${what}" >&2
         unjudged=$((unjudged + 1))
-        record_segment "$((SECONDS - t0))" UNJUDGED "${what}"
+        record_cell "${t0}" "${wait0}" UNJUDGED "${what}"
         return 0
     fi
     printf 'RED  %s\n' "${what}" >&2
     failures=$((failures + 1))
-    record_segment "$((SECONDS - t0))" RED "${what}"
+    record_cell "${t0}" "${wait0}" RED "${what}"
     return 0
 }
 

@@ -3,9 +3,9 @@
 # 每一格都在、按秒数从长到短、红的那一格也在表上。表缺了哪一格，压缩门的时候就会按错的
 # 那一格动刀——砍掉零成本的一步，或者砍掉唯一会红的那一步。
 #
-# 「等了多久、等谁」这一面这里不判，因为它现在**没有读数**：格子直接调 cargo，排队在
-# cargo 里面。表上的一格是「这一格花了多少秒」，不是「编译了多少秒」——用例把这一点也
-# 钉住，免得下一次有人拿它当编译成本。
+# 等槽从这一版起有读数了：构建槽客户端每次退出槽都报一行 `<等槽秒>\t<干活秒>\t<名字>`，
+# 门据此把一格拆成「等槽」与它自己两行。用例判三件事——两行都在表上、拆开不改变合计、
+# 量不到时不拆（整段记在格上，不产出一个负数）。
 #
 # 一整跑要两小时，而这张表的判据不该跟着两小时一起付，所以门留了个只念段日志的入口；
 # 这里喂一份合成的段日志，判的是读法，不是跑法。
@@ -60,4 +60,39 @@ printf '%s\n' "${out}" | grep -q '合计 965 秒' || fail "合计不对（应为
 out="$(bash "${work}/deploy/scripts/check-before-push.sh" --cost-table "${seg}" 2>&1)"
 [ -z "${out}" ] || fail "空段日志不该印出表；实得：${out}"
 
-echo "ok - before-push 的成本表：每格都在、长的在前、红的带记号、合计是各格之和，空日志不印表"
+# 6) 等槽单独成行：门慢可以是判据贵，也可以是机器满，两个答案要求的动作相反。一行
+#    里混着两种时间，读的人只会去优化编译——而那一半根本不在这一步里。两行都在表上，
+#    合计仍是各行之数（拆开不改变总额，只改变看得见什么）。
+printf '40\t等槽\tcargo test -p cogneva\n' >"${seg}"
+printf '60\tok\tcargo test -p cogneva\n' >>"${seg}"
+out="$(bash "${work}/deploy/scripts/check-before-push.sh" --cost-table "${seg}" 2>&1)"
+printf '%s\n' "${out}" | grep -qE '^ *40 +等槽 +cargo test -p cogneva$' ||
+    fail "等槽的那一段没有单独成行；实得：${out}"
+printf '%s\n' "${out}" | grep -qE '^ *60 +ok +cargo test -p cogneva$' ||
+    fail "去掉排队之后这一格自己的时长应当还在表上；实得：${out}"
+printf '%s\n' "${out}" | grep -q '合计 100 秒' ||
+    fail "拆开之后合计仍应当是 100；实得：${out}"
+
+# 7) 行是怎么切出来的：切法只有一处（`lib/gate-run-record.sh` 的 `cell_rows`），判它自己。
+#    量不到就不切——整段记在格上，也不产出一个负数或者一个凭空减掉的时间。
+# shellcheck source=../lib/gate-run-record.sh
+. "${repo}/deploy/scripts/lib/gate-run-record.sh"
+rows_of() { cell_rows "$@" | cut -f1,2 | tr '\t' ' ' | tr '\n' ' '; }
+[ "$(rows_of 100 0 ok X)" = "100 ok " ] || fail "没有等槽时不该拆：$(rows_of 100 0 ok X)"
+[ "$(rows_of 100 40 ok X)" = "40 等槽 60 ok " ] ||
+    fail "有等槽时要拆成两行且加起来仍是一整段：$(rows_of 100 40 ok X)"
+[ "$(rows_of 100 200 ok X)" = "100 ok " ] ||
+    fail "等得比这一格还久说明两个读数的口径对不上，按量不到处理：$(rows_of 100 200 ok X)"
+[ "$(rows_of 100 '' ok X)" = "100 ok " ] || fail "空值按量不到处理：$(rows_of 100 '' ok X)"
+[ "$(rows_of 100 abc ok X)" = "100 ok " ] || fail "非数字按量不到处理：$(rows_of 100 abc ok X)"
+
+# 8) 门不许绕过它去记整段：`record_segment "$((SECONDS - t0))"` 再出现一次，就是「排队
+#    又混进了格子」，而那正是这一条落地时要消失的形状。
+if grep -Eq 'record_segment "\$\(\(SECONDS - t0\)\)"' "${gate}"; then
+    fail "门里还有一处把整段记成格子，排队没被拆出去：$(grep -n 'record_segment "\$((SECONDS - t0))"' "${gate}")"
+fi
+grep -q 'record_cell' "${gate}" || fail "门没有用 record_cell 记格子"
+grep -q 'COGNEVA_BUILD_SLOT_REPORT' "${gate}" ||
+    fail "门没有让构建槽客户端报等槽秒数，那一列永远是空的"
+
+echo "ok - before-push 的成本表：每格都在、长的在前、红的带记号、合计是各格之和，空日志不印表，等槽单独成行且格子不再含排队"

@@ -99,6 +99,26 @@ gate_run_begin() { # <构建槽目录> <仓库根> <阶段> <开跑时刻> <pid>
     printf '%s' "${file}"
 }
 
+# 一格的时长里有多少是排队等构建槽，多少是它自己。
+#
+# 为什么必须拆：门慢可以是判据贵，也可以是机器满。前者要拆判据，后者要加槽或让路，
+# 两个答案要求的动作相反。混在一行时，读的人只会去优化编译——而那一半时间根本不
+# 在这一步里。
+#
+# 为什么可能拆不出来：等槽的秒数不是这一格量的（它由构建槽客户端写进另一份记录），
+# 两个数对不上时按「没量到」处理——整段记在这格上，也不产出一个负数或者一个凭空
+# 减掉的时间。量不到只是一个更粗的读数，减错是一个假读数。
+cell_rows() { # <耗时秒> <等槽秒> <结局> <说明>
+    local elapsed="$1" waited="$2" outcome="$3" what="$4"
+    case "${waited}" in '' | *[!0-9]*) waited=0 ;; esac
+    case "${elapsed}" in '' | *[!0-9]*) elapsed=0 ;; esac
+    [ "${waited}" -le "${elapsed}" ] || waited=0
+    if [ "${waited}" -gt 0 ]; then
+        printf '%s\t%s\t%s\n' "${waited}" 等槽 "${what}"
+    fi
+    printf '%s\t%s\t%s\n' "$((elapsed - waited))" "${outcome}" "${what}"
+}
+
 # 记一格。写不进去就算了：这一跑照常判，只是屏上少一格读数。
 gate_run_append() { # <记录文件> <秒> <结局> <说明>
     local file="$1"
