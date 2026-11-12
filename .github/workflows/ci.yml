@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -430,6 +430,32 @@ jobs:
       # 把这份声明推上去的那个人核。
       - name: Check every required check is one a workflow can report
         run: python3 deploy/scripts/check-required-checks.py
+
+  # 远端只许一个分支头：main。分支存在的代价不在「推上去」那一刻，而在它之后：2026-11-10
+  # 实测远端积了 8 条头（`ahead8`/`ghost9`/`same`/`master`/`store-ledger`/…），除 `master`
+  # 外每条的内容都早已落在 main 上——删它们的成本全在「证明能删」，每条都要对着往前走了
+  # 两百多笔的 trunk 用 cherry 逐条证一遍。一条分支从诞生到被删之间的每一刻都得有人回答
+  # 「它能不能删」；不诞生就没人要回答。
+  #
+  # 这一条判**已经存在的**头（本地 + 远端，除 main 外一个都不许有），与内容无关：内容已经
+  # 在 main 上恰恰是它该被删的形状，不是留下来的理由。挡在诞生那一刻的是宿主上的
+  # pre-push 钩子（推非 main 的分支头直接拒），两条合起来才闭合：钩子挡住下一个，这里
+  # 发现漏网的。分开两个作业也是这个原因——本地那条推前自检按作业名取步骤，把需要网络的
+  # 判据塞进去等于让每一次推都依赖 GitHub 可达。
+  branch-singularity:
+    name: Branch Singularity
+    runs-on: ubuntu-latest
+    steps:
+      # 判据要看全部头，不是一个深度的提交。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # detached HEAD 的检出里没有 `refs/heads/main`，判据会以「trunk 不在」退出 3——
+      # 那是「判不了」，不是合格。先把 trunk 建成一个本地头再判。
+      - name: Check the repository carries one branch, main
+        run: |
+          git branch -f main origin/main
+          bash deploy/scripts/check-branch-convergence.sh . --trunk main --remote origin --single
 
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
