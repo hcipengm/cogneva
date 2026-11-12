@@ -302,6 +302,43 @@ impl Inventory {
             .filter(|e| e.reach == Reach::Callable)
             .count()
     }
+
+    /// 各层报出的调用次数之和，以及**哪几层没有计数器**。
+    ///
+    /// 外层 `None` 是没有任何一层带计数器——那时「一次都没被点」与「这一格没接计数
+    /// 器」在读数面上必须分得开，所以这里不给 0。有计数器的一层报 `Some(0)` 是量到
+    /// 的零（「量过，没人点」），它照常参与求和。
+    ///
+    /// 里层那串来源是缺计数器的层：少算了几层要让读者看得见，否则「插件 7 项」会被
+    /// 读成「这 7 项没人点」。今天缺的是插件与 MCP——插件声明的动作本来就没人能调，
+    /// MCP 的调用走网关自己的路由，不经过这张登记表，两条理由都写在 `Entry` 的
+    /// `calls` 那一栏上。
+    ///
+    /// 求和而不是按层印：工作台那一行问的是「有没有人在点这些动作」，一层一条会把
+    /// 一格的明细撑成一张表，而那几层在这个问题上不是分开的答案。
+    pub fn call_total(&self) -> Option<(u64, Vec<Source>)> {
+        let mut total = 0u64;
+        let mut counted = false;
+        let mut without_counter: Vec<Source> = Vec::new();
+        for source in [Source::Builtin, Source::Plugin, Source::Mcp] {
+            let mut entries = 0usize;
+            let mut with_counter = 0usize;
+            for entry in self.entries.iter().filter(|e| e.source == source) {
+                entries += 1;
+                if let Some(calls) = entry.calls {
+                    with_counter += 1;
+                    total = total.saturating_add(calls);
+                }
+            }
+            if with_counter > 0 {
+                counted = true;
+            } else if entries > 0 {
+                // 这一层有项、却一项都没报次数：它不是「没人点」，是没有计数器。
+                without_counter.push(source);
+            }
+        }
+        counted.then_some((total, without_counter))
+    }
 }
 
 /// 拼出这份清单。任何一个来源读不到都不影响其余来源——缺的那一层在 `sources` 里
@@ -850,6 +887,54 @@ mod tests {
         })
         .unwrap();
         assert_eq!(counted["calls"], 0);
+    }
+
+    /// 次数之和按行加，缺计数器的层要点名；一层都没有计数器时不算出 0。
+    ///
+    /// 三种形状各判一次，因为它们要的动作相反：求和是读数，点名缺哪层是接线缺口，
+    /// 全都没有计数器时印 0 会把「没人记」说成「没人用」。
+    #[test]
+    fn the_usage_total_sums_the_counted_layers_and_names_the_uncounted_ones() {
+        let row = |name: &str, source, calls| Entry {
+            name: name.into(),
+            source,
+            reach: Reach::Callable,
+            description: None,
+            boundary: None,
+            runs_in: None,
+            calls,
+            allowed_roles: None,
+            holders: Vec::new(),
+        };
+        let inventory = |entries: Vec<Entry>| Inventory {
+            entries,
+            ..Default::default()
+        };
+
+        // 内建两层各有计数，插件那一层没有：和是两个内建的和，缺口点名插件。
+        let mixed = inventory(vec![
+            row("read_file", Source::Builtin, Some(3)),
+            row("write_file", Source::Builtin, Some(0)),
+            row("helper", Source::Plugin, None),
+        ]);
+        assert_eq!(
+            mixed.call_total(),
+            Some((3, vec![Source::Plugin])),
+            "有计数器的层（含量到 0 的）参与求和，没有计数器的层被点名"
+        );
+
+        // 有计数器、一次都没点过：这是量到的 0，不是没量到。
+        let counted_zero = inventory(vec![row("read_file", Source::Builtin, Some(0))]);
+        assert_eq!(counted_zero.call_total(), Some((0, Vec::new())));
+
+        // 一项都没有：尚未量到。把它读成 0 次会让人以为是「查过了，没人用」。
+        assert_eq!(inventory(Vec::new()).call_total(), None);
+        let uncounted = inventory(vec![row("helper", Source::Plugin, None)]);
+        assert_eq!(
+            uncounted.call_total(),
+            None,
+            "整份清单只有没计数器的层时，这一格是没量到"
+        );
     }
 
     /// 每一层的「其中几个能调」按行算，不照抄拼装时那个数。

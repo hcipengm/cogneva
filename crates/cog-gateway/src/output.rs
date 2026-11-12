@@ -8,8 +8,10 @@
 //!
 //! **不新建任何存储。** 这张表由已经在跑的三路拼出来：
 //!
-//! - 完成的活：进程内任务图（`progress::merged_tasks` 的那一份）与库里的面节点；
-//! - 构建产物：演进进程的构建跑次（`BuildRunsView`），本进程窗口，重启清零；
+//! - 完成的活：编排器的整张任务图（`progress::merged_tasks`：接了存储时这一次读来自
+//!   库，重启不清零；没有存储时才来自进程内存）与治理工作区里的面节点；
+//! - 构建产物：本进程挂着的那份构建跑次（`BuildRunsView`），进程窗口，重启清零——
+//!   构建跑在别的进程里时这里读到一个空窗口，那不是「没构建过」；
 //! - 带提交落地的变更：变更账的漏斗（`ChangeLedgerStore::funnel`）里 `landed_with_rev`
 //!   那一栏——那些行的落定带着一个真的提交。它与同一个漏斗里的 `landed` 不是一回事：
 //!   后者绝大多数是「文档要的，树本来就满足」，一条提交都没送出去，把它读成产出会把
@@ -261,7 +263,8 @@ pub fn build(inputs: Inputs<'_>) -> Outputs {
                     with_result,
                     failed,
                     note: Some(
-                        "任务图活在进程内存里（面节点从库里补齐），重启清零；窗口按 updated_at 划"
+                        "读的是编排器的整张任务图：接了存储时来自库（重启不清零），没有存储时\
+                         来自进程内存；窗口按 updated_at 划"
                             .into(),
                     ),
                 }),
@@ -282,7 +285,11 @@ pub fn build(inputs: Inputs<'_>) -> Outputs {
             Reading::measured(Builds {
                 built,
                 total: view.runs.len(),
-                note: Some("本进程的窗口，重启清零".into()),
+                // 这一层读的是**本进程**挂着的那份构建读数。构建在另一个进程里跑
+                // （同一个镜像的另一份进程、或沙盒执行器）时，这里读到的是一个空
+                // 窗口——0 不是「没构建过」，是「没在这一份读数里」。把这句与数一起
+                // 印，读者才知道 0 该去找谁。
+                note: Some("本进程的构建读数窗口，重启清零；别的进程里的构建不在这里".into()),
             })
         }
     };
@@ -504,6 +511,53 @@ mod tests {
             Reading::Unread { because } => assert!(because.contains("连不上库")),
             other => panic!("读失败该是 unread，实际是 {other:?}"),
         }
+    }
+
+    /// 两条限定语跟着数一起走：任务图那一段的口径（接了存储时来自库，而不是重启清零
+    /// 的进程内存），与构建那一段的窗口（本进程，别的进程里的构建不在里面）。
+    ///
+    /// 这两句曾经都不准：任务图说成「进程内存、重启清零」，可部署里它读的是库——一句
+    /// 说反的口径能把真读数读成假读数；构建那句笼统得读不出「0 是因为没人构建，还是
+    /// 因为构建发生在另一份进程里」。两句话都要与数同源，所以在这里钉住。
+    #[test]
+    fn each_layer_says_which_process_its_window_belongs_to() {
+        let run = cog_core::BuildRunInfo {
+            change_id: "chg-1".into(),
+            intent: "self_review".into(),
+            outcome: "built".into(),
+            seconds: Some(12.0),
+            at: Utc::now(),
+        };
+        let view = cog_core::BuildRunsView {
+            attached: true,
+            limit: 64,
+            runs: vec![run],
+        };
+        let outputs = build(Inputs {
+            now: Utc::now(),
+            window_hours: 24,
+            tasks: Some(&[task("a", TaskStatus::Completed, 5, true)]),
+            builds: Some(&Ok(view)),
+            funnel: None,
+        });
+
+        let work_note = outputs
+            .work
+            .value()
+            .and_then(|work| work.note.clone())
+            .unwrap_or_default();
+        assert!(
+            work_note.contains("存储") && work_note.contains("库"),
+            "任务图那一段要说清有没有存储是两种口径：{work_note:?}"
+        );
+
+        let builds = outputs.builds.value().expect("构建跑次读到了");
+        assert_eq!(builds.built, 1);
+        let builds_note = builds.note.clone().unwrap_or_default();
+        assert!(
+            builds_note.contains("本进程") && builds_note.contains("别的进程"),
+            "构建那一段要说出它的窗口属于哪个进程：{builds_note:?}"
+        );
     }
 
     /// 窗口按小时算、漏斗按天记账：向上取整，且 24 小时正好是一天。

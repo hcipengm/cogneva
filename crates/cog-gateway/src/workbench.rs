@@ -579,11 +579,37 @@ fn capability_cell(inventory: &crate::capabilities::Inventory) -> Cell {
             },
             Row {
                 label: "使用次数",
-                reading: Reading::not_wired("能力还没有使用计数：工具跑完不写任何读数"),
+                reading: usage_reading(inventory),
                 warn: false,
             },
         ],
     }
+}
+
+/// 能力格那一行「使用次数」：把能力清单里各层报的次数加起来。
+///
+/// 这一行问的是「这些动作有没有人在点」。以前它写死成「还没有使用计数」，而派发点
+/// 早就在数了（`cog-agent` 在 guardrail 之前对每一次调用加一），网关只是在清单上
+/// 拿得到那个数却不去拿。写死那阵子，一个天天在用的动作与一个从没人点过的动作在
+/// 工作台上同形。
+///
+/// 两处限定语跟着数一起印，因为它们改变这个数的读法：
+///
+/// - **窗口是进程的**：计数器在被调起工具的那个进程里，重启清零。所以它是「本进程自
+///   启动以来」，不是「历史上」；把两个读数并排看之前先看这一句。
+/// - **哪几层没计数**：插件与 MCP 那两层没有计数器（见清单里 `calls` 的来源说明）。
+///   求和时它们不贡献，一行字把它们点出来，否则「插件 7 项」会被读成「7 项没人点」。
+fn usage_reading(inventory: &crate::capabilities::Inventory) -> Reading {
+    let Some((total, without_counter)) = inventory.call_total() else {
+        // 一层都没有计数器时才到这里。这不是 0：`0` 是量到的「没人点」。
+        return Reading::not_wired("能力清单里没有一层报出使用计数：缺的是派发点的计数器");
+    };
+    let mut note = String::from("本进程自启动以来在派发点累计（含被拦下的调用），重启清零");
+    if !without_counter.is_empty() {
+        let names: Vec<&str> = without_counter.iter().map(|s| s.as_str()).collect();
+        note.push_str(&format!("；{} 没有调用计数器，不计入", names.join(" / ")));
+    }
+    Reading::number(total as f64, Unit::Count).qualified(note)
 }
 
 // ── 状态灯 ──────────────────────────────────────────────────────────────────
@@ -933,6 +959,73 @@ mod tests {
             .find(|r| r.label == "窗口")
             .expect("投入格必须有窗口这一行");
         assert_eq!(number_of(&window.reading), Some(24.0));
+    }
+
+    /// 能力格的「使用次数」印清单里的真计数，并把它的窗口与缺口一起说出来。
+    ///
+    /// 曾经这一行写死成「还没有使用计数」，而派发点一直在数：于是天天在用的动作与
+    /// 没人点过的动作在格子上同形。这里钉三件事——数是真的和、窗口是进程的、没计数器
+    /// 的那几层被点名。少了任何一件，读者对这个数的读法就偏。
+    #[test]
+    fn the_usage_row_carries_the_counted_total_with_its_window_and_its_gaps() {
+        let entry = |name: &str, source, calls| crate::capabilities::Entry {
+            name: name.into(),
+            source,
+            reach: crate::capabilities::Reach::Callable,
+            description: None,
+            boundary: None,
+            runs_in: None,
+            calls,
+            allowed_roles: None,
+            holders: Vec::new(),
+        };
+        let inventory = crate::capabilities::Inventory {
+            sources: vec![
+                (
+                    crate::capabilities::Source::Builtin,
+                    crate::capabilities::SourceReading::Measured {
+                        entries: 2,
+                        callable: 2,
+                    },
+                ),
+                (
+                    crate::capabilities::Source::Plugin,
+                    crate::capabilities::SourceReading::Measured {
+                        entries: 1,
+                        callable: 0,
+                    },
+                ),
+            ],
+            entries: vec![
+                entry("read_file", crate::capabilities::Source::Builtin, Some(4)),
+                entry("write_file", crate::capabilities::Source::Builtin, Some(1)),
+                entry("helper", crate::capabilities::Source::Plugin, None),
+            ],
+            ..Default::default()
+        };
+        let bench = build(Inputs {
+            capabilities: inventory,
+            ..empty_inputs(Utc::now())
+        });
+        let usage = cell(&bench, CellId::Capability)
+            .rows
+            .iter()
+            .find(|r| r.label == "使用次数")
+            .expect("能力格必须有使用次数这一行");
+        assert_eq!(
+            number_of(&usage.reading),
+            Some(5.0),
+            "两个内建工具点过的次数加起来"
+        );
+        let note = usage.reading.because.as_deref().unwrap_or("");
+        assert!(
+            note.contains("本进程") && note.contains("重启清零"),
+            "这个数的窗口是进程的，必须与数一起印：{note:?}"
+        );
+        assert!(
+            note.contains("plugin"),
+            "没有计数器的那一层要点名，否则「插件 1 项」被读成「1 项没人点」：{note:?}"
+        );
     }
 
     /// 项目是容器：主数是桶的个数（含 `ungrouped`），明细是桶里的活按状态摊开。
