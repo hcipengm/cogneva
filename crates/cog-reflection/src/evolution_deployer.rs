@@ -616,14 +616,21 @@ mod tests {
             text.contains("stopped moving"),
             "the rejection has to say the build was judged stopped: {text}"
         );
-        assert!(
-            text.contains("50ms"),
-            "the rejection has to name the longest gap this deployment has seen, \
-             otherwise nobody can tell what it was compared against: {text}"
-        );
+        // 判词里那个数要与判据用的那个数是同一个：界只跟这一趟量到的间隔取大
+        // （见 `longest_gap`），所以它可能比种下的 50ms 宽——cargo 自己的两拍之间
+        // 就有一段真实的间隔。认死 50ms 会让这条用例在判词完全正确时红。
         match deployer.last_build_ending() {
             Some(BuildEnding::Stalled { silent, window }) => {
-                assert_eq!(window, Duration::from_millis(50));
+                assert!(
+                    window >= Duration::from_millis(50),
+                    "界不能比种下的样本还窄：{window:?}"
+                );
+                assert!(
+                    text.contains(&format!("{window:?}")),
+                    "the rejection has to name the longest gap this deployment has \
+                     seen ({window:?}), otherwise nobody can tell what it was compared \
+                     against: {text}"
+                );
                 assert!(
                     silent > window,
                     "judged stopped means silent beats the window"

@@ -218,7 +218,7 @@ pub async fn checkpoint_task_expecting(
     let mut round = CheckpointRound::default();
     let roster = match awaited(
         step_expectation,
-        "checkpoint: enumerate the agents of a running task",
+        "enumerate the agents of a running task",
         agents.agents_of(task_id),
     )
     .await
@@ -235,7 +235,7 @@ pub async fn checkpoint_task_expecting(
     // 容量是附带条件，不能因为后者读不到就把前者停掉。
     let previous = match awaited(
         step_expectation,
-        "checkpoint: read the task board",
+        "read the task board",
         state.get_board(task_id),
     )
     .await
@@ -252,7 +252,7 @@ pub async fn checkpoint_task_expecting(
         round.agents += 1;
         let snapshot = match awaited(
             step_expectation,
-            "checkpoint: take an agent snapshot",
+            "take an agent snapshot",
             agents.snapshot(task_id, &agent_id),
         )
         .await
@@ -285,7 +285,7 @@ pub async fn checkpoint_task_expecting(
         let checkpoint_id = snapshot.checkpoint_id;
         match awaited(
             step_expectation,
-            "checkpoint: read a checkpoint back to confirm it was persisted",
+            "read a checkpoint back to confirm it was persisted",
             agents.persisted(&checkpoint_id),
         )
         .await
@@ -295,7 +295,7 @@ pub async fn checkpoint_task_expecting(
             Ok(true) => {
                 match awaited(
                     step_expectation,
-                    "checkpoint: record the resume pointer on the task board",
+                    "record the resume pointer on the task board",
                     state.set_board_field(task_id, &checkpoint_field(&role), &checkpoint_id),
                 )
                 .await
@@ -311,7 +311,7 @@ pub async fn checkpoint_task_expecting(
                             // 一份没人指的实物。
                             match awaited(
                                 step_expectation,
-                                "checkpoint: delete the checkpoint this one replaces",
+                                "delete the checkpoint this one replaces",
                                 agents.forget(old),
                             )
                             .await

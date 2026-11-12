@@ -399,8 +399,20 @@ fn a_size_nothing_can_carry_out_is_not_written_and_the_write_sits_behind_that_ve
     let guard = body
         .find("if !may_raise(")
         .expect("单卷决策里没有 may_raise 这一判：白名单算出来了却没人用");
+    // The verb and the resource it is sent to, found by what they say rather
+    // than by how they are laid out: wrapping the call in the guard above
+    // changes the indentation, and a judge that reads the indent would go red
+    // on a decision that still sits in the right place.
     let patch = body
-        .find("\"patch\",\n            \"pvc\",")
+        .match_indices("\"patch\",")
+        .map(|(at, _)| at)
+        .find(|at| {
+            body[*at..]
+                .chars()
+                .take(120)
+                .collect::<String>()
+                .contains("\"pvc\",")
+        })
         .expect("单卷决策里找不到改卷声明的 patch");
     assert!(
         guard < patch,

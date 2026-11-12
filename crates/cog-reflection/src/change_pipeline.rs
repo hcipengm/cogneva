@@ -5248,16 +5248,28 @@ impl Default for MetricsConfig {
     /// to binding before anything has been retired for it.
     #[tokio::test]
     async fn a_run_that_fits_its_budget_reports_its_duration() {
+        // 这一趟量的是预算读数，不是判停：睡一秒的 crate 在构建那一秒里既不输出
+        // 也不涨 CPU，若界取的是这个测试进程里别人量到的极值（可能是几百毫秒），
+        // 它会被判成停住，而判据本身完全没错。所以界在这里种宽，让这一秒的沉默
+        // 落在界内，测到的就只剩预算这一件事。
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            std::time::Duration::from_secs(60),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let root = tempfile::tempdir().unwrap();
         write_sleeping_crate(root.path(), 1);
         let budget = Arc::new(crate::verification_budget::VerificationBudget::new());
         let pipeline = ChangePipeline::new(root.path(), root.path(), false)
             .with_verification_budget(budget.clone());
 
-        let (passed, output) = pipeline
-            .run_test_command(root.path(), None)
-            .await
-            .expect("a run inside its budget must be waited on");
+        // 先收下结果再清种子：`.expect` 直接写在 await 上，红的时候种子留在这个
+        // 进程里，后面每个用例都拿着一条 60 秒的界。
+        let result = pipeline.run_test_command(root.path(), None).await;
+        cog_core::progress::reset_for_tests();
+        let (passed, output) = result.expect("a run inside its budget must be waited on");
 
         assert!(
             passed,

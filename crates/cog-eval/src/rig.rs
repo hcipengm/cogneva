@@ -1781,9 +1781,15 @@ mod tests {
             },
         )
         .with_scaffold(Arc::new(NeverReturns));
+        // 这一例的 id 必须是这条用例独有的：拍子按 id 记，而同一二进制里别的
+        // 用例跑的就是 `cases()` 里那两个 id。共用 id 时，那边每跑一步都替这一例
+        // 记一拍——两边并行时这一例永远「还在动」，于是它等不到判停、整条用例
+        // 耗在外层兜底上。红的不是判据，是两边共用了同一个名字。
+        let mut stalled_case = cases()[0].clone();
+        stalled_case.id = "stalled-only-case".into();
         let table = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            rig.run(&[bench_named("hle", cases()[..1].to_vec(), Arc::new(OkEnv))]),
+            rig.run(&[bench_named("hle", vec![stalled_case], Arc::new(OkEnv))]),
         )
         .await
         .expect("the run must come back: a case with no bound keeps it running for ever")
@@ -1798,9 +1804,17 @@ mod tests {
         assert_eq!(cell.stat().mean, 0.0, "it counts in the denominator");
         let detail = &cell.per_seed[0].failures[0].1;
         assert!(detail.contains("stopped moving"), "{detail}");
+        // 判词要带上判据用的那个窗口。这里不认死种下的 50ms：水库是进程级的，
+        // 同一二进制里别的用例每推进一拍就往里记一段真实间隔，界只跟它们取大
+        // （见 `longest_gap`）。认死一个字面量时，判词完全正确也会红。
+        let recorded = detail
+            .split("between steps is ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("判词里没带上量出来的窗口，读的人无法复算这次判定：{detail}"))
+            .trim();
         assert!(
-            detail.contains("between steps is 50ms"),
-            "判词里没带上量出来的窗口，读的人无法复算这次判定：{detail}"
+            recorded.ends_with('s') && recorded != "0s",
+            "窗口读数应当是一个正的时长，而不是没有一个数：{recorded:?}"
         );
     }
 

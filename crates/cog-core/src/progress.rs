@@ -372,16 +372,20 @@ fn publish_progress(force: bool) {
         *last = Some(Instant::now());
     }
     let window = crate::declared_wall::Bound::now().words();
-    // 先写临时文件再改名：`std::fs::write` 会先截断再写，探针正好落在中间那一瞬就会
-    // 读到一个空文件，而空文件在探针里不是「没有界」，是一次解析失败——那是判死。
-    // 改名在同一文件系统上是原子的，读者要么看到上一格，要么看到这一格。
-    let staged = format!("{path}.new");
+    // 整份替换交给 `atomic_write`：`std::fs::write` 会先截断再写，探针正好落在
+    // 中间那一瞬就会读到一个空文件，而空文件在探针里不是「没有界」，是一次解析
+    // 失败——那是判死。改名在同一文件系统上是原子的，读者要么看到上一格，要么看
+    // 到这一格。耐用性只要同内核：这个文件随时可以重写，断电之后重写一次就是。
     let body = format!("{window}\n");
-    let written = std::fs::write(&staged, &body).and_then(|()| std::fs::rename(&staged, path));
+    let written = crate::atomic_write::write_bytes(
+        std::path::Path::new(path),
+        body.as_bytes(),
+        crate::atomic_write::Durability::SameKernel,
+    );
     if let Err(e) = written {
         // 写不成就没有进度面，而「文件不动」与「根本没有文件」在集群面上同形——
-        // 后者会让这一跑在自己的窗口上被杀掉。所以这一条不是噪音。
-        let _ = std::fs::remove_file(&staged);
+        // 后者会让这一跑在自己的窗口上被杀掉。所以这一条不是噪音。临时文件由
+        // `atomic_write` 自己收拾，这里只管报。
         tracing::warn!(path, error = %e, "progress file could not be written");
     }
 }
@@ -760,12 +764,18 @@ pub async fn async_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
     serial().lock().await
 }
 
-/// Test hook: clear every beacon and every sample.
+/// Test hook: clear every beacon, every sample, and any adopted bound.
 ///
 /// Exists because this state is process-global and the tests in different
 /// modules would otherwise read each other's beacons — a specimen that shares
 /// the population it measures is the failure mode this module's own tests must
 /// not have.
+///
+/// The adopted bound is cleared with the samples because it is read the same
+/// way: a test that adopts 90 s leaves [`longest_gap`] at 90 s for every test
+/// after it in the same binary, and an assertion like "this run measured
+/// nothing yet" then describes a previous test's measurement. Widening is
+/// right for a real run and wrong between specimens.
 #[doc(hidden)]
 pub fn reset_for_tests() {
     beacons().lock().unwrap_or_else(|p| p.into_inner()).clear();
@@ -909,7 +919,7 @@ mod tests {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args([
             "-c",
-            "i=0; while [ $i -lt 120 ]; do echo step $i; sleep 0.04; done",
+            "i=0; while [ $i -lt 120 ]; do echo step $i; i=$((i+1)); sleep 0.04; done",
         ]);
         // 120 steps × 40 ms runs well past the window, and no single gap between
         // two steps is anywhere near it: nothing but the beats keeps the child

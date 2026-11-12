@@ -107,6 +107,7 @@ spec:
                   mountPath: /offsite
                 {{- end }}
           containers:
+            {{- /* lit: 1 fixed — the shell's "this check failed" status two lines into the probe command below; a probe's exit status is read by kubelet as failed, never sized by anyone, and the same `exit 1` is written at the drill's site for the same reason */}}
             - name: backup
               image: {{ include "cogneva.image" . }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}

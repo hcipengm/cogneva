@@ -1,4 +1,4 @@
--- Migration: 096_runtime_principle
+-- Migration: 100_runtime_principle
 -- The rules the platform's employees work by, as rows rather than code.
 --
 -- This is not the principle ledger. That one asks whether each of the repo's own

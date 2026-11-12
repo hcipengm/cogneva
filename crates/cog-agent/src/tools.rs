@@ -863,60 +863,6 @@ impl ToolRegistry {
         self.tools.read().unwrap().is_empty()
     }
 
-    /// The names in `allowed` this registry has no tool behind, in the order
-    /// they were given, each once.
-    ///
-    /// Narrowing drops these without a word; naming them is what turns "this
-    /// role has fewer tools than its skill says" from an absence into a reading.
-    pub fn missing_tools(&self, allowed: &[String]) -> Vec<String> {
-        let source = self.tools.read().unwrap();
-        let mut missing: Vec<String> = Vec::new();
-        for name in allowed {
-            if !source.contains_key(name) && !missing.contains(name) {
-                missing.push(name.clone());
-            }
-        }
-        missing
-    }
-
-    /// A registry holding only the named tools, over the same execution
-    /// machinery — sandbox backend, guardrail, plugin registry, timeouts — so
-    /// a narrowed registry runs a tool exactly as the full one would.
-    ///
-    /// This is how a role's tool boundary is enforced, and it is enforced in
-    /// both directions: the model is offered only these definitions, and a call
-    /// it invents for anything else has nothing behind it to reach. A boundary
-    /// that only hid the definitions would be a suggestion.
-    ///
-    /// A name with no tool behind it is dropped rather than refused. The list
-    /// states what the role is allowed to do; a name that matches nothing is a
-    /// stale entry in that statement, and failing to build the registry over it
-    /// would turn a tidying omission into an outage. What keeps the statement
-    /// honest is a gate over the shipped lists, not a runtime panic.
-    ///
-    /// Which is exactly why the drops have to be reportable: a gate over the
-    /// lists in the repository says nothing about which lists a running
-    /// deployment loaded. [`Self::missing_tools`] is that report.
-    pub fn restricted_to(&self, allowed: &[String]) -> Self {
-        let mut kept = HashMap::new();
-        {
-            let source = self.tools.read().unwrap();
-            for name in allowed {
-                if let Some(tool) = source.get(name) {
-                    kept.insert(name.clone(), tool.clone());
-                }
-            }
-        }
-        Self {
-            tools: Arc::new(std::sync::RwLock::new(kept)),
-            sandbox_backend: self.sandbox_backend.clone(),
-            guardrail: self.guardrail.clone(),
-            plugin_registry: self.plugin_registry.clone(),
-            require_identity: self.require_identity,
-            calls: self.calls.clone(),
-        }
-    }
-
     /// 每个工具在本进程里被点过几次，按名字排。
     ///
     /// 表里的每一个名字都在，没人点过的记 0：「这项没人用」与「这项不在这张表

@@ -4884,10 +4884,14 @@ impl PassWatch {
 
 /// 这个作业类在 `progress_bounds` 里的名字。备份与演练各一行：两者的步骤快慢毫无关系，
 /// 共用一个界只会让慢的那个把快的拖进误杀。
-const DRILL_BOUND_CLASS: &str = "backup-drill";
+///
+/// 名字读的是进度面那一个，不是又写了一遍：这一行与 `cogneva_*_progress` 那几拍
+/// 记的是同一趟活，运维要把「界」与「拍子」按名字对上，两处漂开的那一刻这个 join
+/// 就断了，而断掉的样子与「这一跑没有界」同形。
+const DRILL_BOUND_CLASS: &str = DRILL_PROGRESS_TASK;
 
-/// 备份那一趟自己的界。与演练分开，理由同上。
-const BACKUP_BOUND_CLASS: &str = "backup";
+/// 备份那一趟自己的界。与演练分开，理由同上；名字与进度面同源，理由同上。
+const BACKUP_BOUND_CLASS: &str = BACKUP_PROGRESS_TASK;
 
 /// 上一次运行量到的最长间隔，读不到的每一种情形都是
 /// [`cog_core::declared_wall::Bound::Unmeasured`]。
@@ -6145,19 +6149,36 @@ mod tests {
     async fn a_chunk_moving_inside_a_step_keeps_the_watch_from_reading_silence() {
         let _serial = cog_core::progress::async_test_lock().await;
         cog_core::progress::reset_for_tests();
-        // 界摆在 200 毫秒：这个测试自己的等待就要越过它，于是「有没有新的一拍」
-        // 成了两次读数之间唯一的差别。
+        // 这两条通道是这一格独有的，不用 `WATCHED_TASKS` 里那三个名字：那是
+        // **进程级**的名字，同一二进制里别的用例跑真的搬运循环时也往同名通道上
+        // 记拍。共用时「谁都没有推进」这个前提会被别人的一拍推翻，于是这条用例
+        // 在判据完全正确时红——红的读数是宿主上同时在跑的别的测试。
+        const STEP: &str = "backup-stall-probe-step";
+        const CHUNK: &str = "backup-stall-probe-chunk";
+        let channels = [STEP, CHUNK];
+        // 界摆在 200 毫秒：界只跟实测取大，别的用例量到的间隔可能把它抬宽，
+        // 所以下面等的是「判据成立」而不是一个写死的时长——等不到才是红。
         cog_core::progress::adopt_longest_gap(Duration::from_millis(200));
-        let watch = PassWatch::new("恢复：灌数据");
-        watch.step("恢复：灌数据");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        cog_core::progress::beat(STEP);
+        let mut waited = Duration::ZERO;
+        let (silent, bound) = loop {
+            if let Some(verdict) = cog_core::declared_wall::stall_any(&channels) {
+                break verdict;
+            }
+            assert!(
+                waited < Duration::from_secs(20),
+                "没有任何一处推进时，界就该成立——不然下一句证明不了是那一拍把它救回来的"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += Duration::from_millis(50);
+        };
         assert!(
-            cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_some(),
-            "没有任何一处推进时，界就该成立——不然下一句证明不了是那一拍把它救回来的"
+            silent > bound,
+            "判停的条件是静默越过界：{silent:?} 对 {bound:?}"
         );
-        cog_core::progress::beat(DATA_PROGRESS_TASK);
+        cog_core::progress::beat(CHUNK);
         assert!(
-            cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_none(),
+            cog_core::declared_wall::stall_any(&channels).is_none(),
             "刚搬过一块仍被读成静默：判据又回到了「这一步走了多久」"
         );
         cog_core::progress::reset_for_tests();

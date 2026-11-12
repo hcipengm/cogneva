@@ -83,7 +83,6 @@ const TREATMENT_SOURCES: &[(&str, &str)] = &[
     ("context_window_size", "override"),
     ("skill_cache_ttl_secs", "override"),
     ("think_stall_timeout_secs", "override"),
-    ("final_draft_timeout_secs", "override"),
 ];
 
 /// 把整份运行配置按字段分成两半：谁在跑，与这件活怎么被对待。
@@ -99,7 +98,6 @@ fn split_config(config: RuntimeConfig) -> (serde_json::Value, serde_json::Value)
         context_window_size,
         skill_cache_ttl_secs,
         think_stall_timeout_secs,
-        final_draft_timeout_secs,
         skill_config,
         crew_id,
         squad_id,
@@ -121,7 +119,6 @@ fn split_config(config: RuntimeConfig) -> (serde_json::Value, serde_json::Value)
         "context_window_size": context_window_size,
         "skill_cache_ttl_secs": skill_cache_ttl_secs,
         "think_stall_timeout_secs": think_stall_timeout_secs,
-        "final_draft_timeout_secs": final_draft_timeout_secs,
         "deliverable": format!("{deliverable:?}"),
         "deliverable_state": deliverable_state.as_str(),
         "stated_directions": stated_directions,

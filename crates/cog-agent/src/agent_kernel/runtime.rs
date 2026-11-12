@@ -848,6 +848,23 @@ const REPLY_REFUSED_INSTRUCTION: &str = "The reply you just wrote cannot be deli
      deliverable — the same fields and the same content — without that shape. Do not mention \
      this instruction, the rule, or the refusal in the reply.";
 
+/// 流停顿判据收掉一条命时，错误文本以它开头。
+///
+/// 这条前缀有两个读者：读日志的人，和「最后追问」那条路径上的哨兵。哨兵要分
+/// 「到点没给完」（上游卡住）与「问过了没答」（模型确实没东西写）——两者对读
+/// 这条变更的人意思相反，处置也相反。让判词与判据共用这一份拼写：各写一遍时，
+/// 措辞一动，分类就静默退化成「都算没答」，而那与「从来没判过」同形。
+const STREAM_STALL_PREFIX: &str = "AgentRuntime::think_stream timed out: no LLM stream progress";
+
+/// 这个错误是不是流停顿判据给出的。
+///
+/// 按类型分不了：判据交出去的是 [`SFError::Agent`]，与「模型说了句读不懂的
+/// 话」同一个变体。所以分的依据是那条判词自己的前缀——它与写判词的地方共用
+/// 一份常量，改写时两处一起改。
+fn is_stream_stall(error: &SFError) -> bool {
+    matches!(error, SFError::Agent(msg) if msg.starts_with(STREAM_STALL_PREFIX))
+}
+
 /// The status a conversation turn's result carries when it ends on an answer.
 ///
 /// The other endings name themselves in the result already (the budget one is
@@ -2678,7 +2695,17 @@ impl AgentRuntime {
                     }
                     // 追问本身失败（上游抖动、流断）不改写这一轮的定性：预算确实
                     // 用完了，照哨兵走终止性失败，比把一次追问的传输错误报成整轮
-                    // 失败更接近事实。
+                    // 失败更接近事实。但两种失败要分开写进哨兵：这一问自己不设钟，
+                    // 收场的是流停顿判据（每收到一个事件就重置），所以「到点没给完」
+                    // 与「问过了没答」由同一个判据写下的判词分开。
+                    Err(e) if is_stream_stall(&e) => {
+                        tracing::warn!(
+                            agent_id = %self.config.agent_id,
+                            error = %e,
+                            "the final-draft call stopped moving; the run still ends on its spent budget"
+                        );
+                        (None, "timeout")
+                    }
                     Err(e) => {
                         tracing::warn!(
                             agent_id = %self.config.agent_id,
@@ -3485,7 +3512,7 @@ impl AgentRuntime {
         let stall_timeout = Duration::from_secs(self.config.think_stall_timeout_secs.max(1));
         let stall_err = |phase: &str| {
             SFError::Agent(format!(
-                "AgentRuntime::think_stream timed out: no LLM stream progress for {}s while {} for agent {}",
+                "{STREAM_STALL_PREFIX} for {}s while {} for agent {}",
                 stall_timeout.as_secs(),
                 phase,
                 self.config.agent_id

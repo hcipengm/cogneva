@@ -381,18 +381,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "system.loop_restart_backoff_floor_secs".into(),
     );
     m.insert(
-        "COGNEVA_GRPC_RECONNECT_INTERVAL_SECS".into(),
-        "system.grpc_reconnect_interval_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_PROBE_TIMEOUT_SECS".into(),
-        "system.probe_timeout_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_HTTP_TIMEOUT_SECS".into(),
-        "system.http_timeout_secs".into(),
-    );
-    m.insert(
         "COGNEVA_PARTITION_MAINTENANCE_INTERVAL_SECS".into(),
         "system.partition_maintenance_interval_secs".into(),
     );

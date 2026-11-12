@@ -637,6 +637,13 @@ mod tests {
 
         let backend = LocalExecutor::new();
         let result = backend.execute(&cmd("sleep 30")).await.unwrap();
+        // 判据用的界在这一刻就是它：这一趟自己的拍会往水库里记真实的间隔，界只
+        // 会跟它们取大（见 `longest_gap`）。读回它，而不是认死上面那个 50ms——
+        // 认死的话，一次调度抖动记进来的间隔也会把界抬过 50ms，于是这条用例在
+        // 判词完全正确的时候红，红的原因却是宿主比种子慢。
+        let window = cog_core::declared_wall::Bound::now()
+            .value()
+            .expect("种下了样本就有一条界");
 
         cog_core::progress::reset_for_tests();
         assert_eq!(result.exit_code, -1);
@@ -646,8 +653,12 @@ mod tests {
             result.stderr
         );
         assert!(
-            result.stderr.contains("50ms"),
-            "the measured window must be in the record: {}",
+            window >= std::time::Duration::from_millis(50),
+            "界不能比种下的样本还窄：{window:?}"
+        );
+        assert!(
+            result.stderr.contains(&format!("{window:?}")),
+            "the record must name the window the judgement used ({window:?}): {}",
             result.stderr
         );
     }
