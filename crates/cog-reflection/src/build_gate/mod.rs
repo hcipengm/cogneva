@@ -3178,6 +3178,19 @@ impl BuildGate {
         true
     }
 
+    /// Whether a claim `age` seconds old has left the window it was written in.
+    ///
+    /// The bound is strict: a claim exactly [`Tuning::reserve_fresh`] seconds old
+    /// is still inside its window, because a claim is written to be honoured for
+    /// that many seconds and one tick of the clock between the write and the read
+    /// must not turn a live waiter into a loss. A lapse is charged from this one
+    /// predicate and nowhere else, so the drop, the count and the answer to the
+    /// arrival that read the claim are a single branch rather than two
+    /// comparisons kept in step by hand.
+    fn claim_expired(&self, age: u64) -> bool {
+        age > self.tuning.reserve_fresh.as_secs()
+    }
+
     /// The claim on the next build, when there is a fresh one.
     fn reservation(&self) -> Option<(String, u64)> {
         let text = read_gate_file(&self.dir.join(RESERVE_FILE))?;
@@ -3188,7 +3201,7 @@ impl BuildGate {
             return None;
         }
         let age = unix_now().saturating_sub(since);
-        if age > self.tuning.reserve_fresh.as_secs() {
+        if self.claim_expired(age) {
             // A claim that is not being refreshed is a work that stopped asking:
             // honoring it would hold builds out for a waiter that is gone.
             // Count it before dropping it: the work that asked loses this turn
@@ -7217,6 +7230,23 @@ unevictable 28532736
             lapsed(&gate),
             2,
             "a claim still inside its window has not lapsed"
+        );
+
+        // The window is a strict bound, and an arrival must not read a claim
+        // that is still inside it as a turn already lost: a claim written with a
+        // second to spare is honoured and charges nothing, even though a tick of
+        // the clock may land between the write and the read.
+        let inside = unix_now().saturating_sub(shipped().reserve_fresh.as_secs() - 1);
+        write_gate_file(&path, &format!("mainline advance\t{inside}\n")).unwrap();
+        assert_eq!(
+            gate.reservation().map(|(holder, _)| holder),
+            Some("mainline advance".to_string()),
+            "a claim one second inside its window is still this work's turn"
+        );
+        assert_eq!(
+            lapsed(&gate),
+            2,
+            "and it charges no lapse to the work that made it"
         );
     }
 
