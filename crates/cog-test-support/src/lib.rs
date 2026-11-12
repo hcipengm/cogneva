@@ -17,6 +17,7 @@ mod backends;
 mod literals;
 mod message;
 mod metrics;
+mod orchestrator;
 mod state;
 mod task_ledger;
 
@@ -24,6 +25,7 @@ pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
 pub use literals::{literal_values, literals_in, Literal};
 pub use message::MemoryMessageBackend;
 pub use metrics::MemoryMetricsBackend;
+pub use orchestrator::TaskGraphStub;
 pub use state::MemoryStateBackend;
 pub use task_ledger::{clear_task_ledger, clear_task_ledger_for, purge_task};
 
