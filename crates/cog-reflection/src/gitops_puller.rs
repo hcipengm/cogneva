@@ -4807,7 +4807,7 @@ spec:
             dir.path(),
             "kubectl",
             &format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\ncat >> '{log}'\necho ok\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncat >> '{log}'\necho ok\n",
                 log = log.display()
             ),
         );
@@ -4861,7 +4861,7 @@ spec:
             dir.path(),
             "kubectl",
             &format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\necho patched\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\necho patched\n",
                 log = calls.display()
             ),
         );
@@ -4979,7 +4979,7 @@ spec:
         // 新模板还没被控制器处理（observedGeneration < generation），且新版本一个
         // 副本都没起来：这就是主线正在滚的那个现场。
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\necho \"2 1 1 0 0\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho \"2 1 1 0 0\"\n",
             tmp.path().join("kubectl.log").display()
         );
         let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
@@ -5037,7 +5037,7 @@ spec:
         // 部署停在 pause 上：收尾时要问一次 .spec.paused，问出来是 true
         // 才有那一次 resume。
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in *spec.paused*) echo true;; esac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *spec.paused*) echo true;; esac\n",
             tmp.path().join("kubectl.log").display()
         );
         let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
@@ -5108,7 +5108,7 @@ spec:
         let (repo_url, branch) = promotion_repo_with_a_candidate(tmp.path());
         // 现场是三句话：部署停在 pause、模板已经是候选镜像、Pod 其实起齐了。
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in\n\
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n\
              *spec.paused*) echo true ;;\n\
              *containers*) echo localhost:30500/cogneva:promote-candidate-1 ;;\n\
              esac\nexit 0\n",

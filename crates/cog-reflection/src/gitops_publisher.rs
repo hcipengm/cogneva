@@ -469,7 +469,7 @@ mod tests {
         crate::test_support::write_executable(
             dir,
             "fake-buildah",
-            &format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n", log.display()),
         )
     }
 

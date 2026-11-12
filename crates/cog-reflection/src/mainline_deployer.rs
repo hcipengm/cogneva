@@ -12815,7 +12815,7 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         let log = dir.join("kubectl.log");
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> '{log}'\necho 'deployment.apps/cogneva'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\necho 'deployment.apps/cogneva'\n",
             log = log.display()
         );
         write_fake_bin(&dir, "fake-kubectl", &script);
@@ -12863,7 +12863,7 @@ mod tests {
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 echo 'Unable to connect to the server: dial tcp 10.43.0.1:443: i/o timeout' >&2
 exit 1
 "#,
@@ -15732,7 +15732,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let log = dir.join("buildah.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "from" ]; then echo "ctr-test-123"; exit 0; fi
@@ -15773,7 +15773,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -15813,7 +15813,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 git --git-dir '{bare}' update-ref refs/heads/main {rev}
 case "$*" in
   *"get deployment"*) echo "{deployed_image}" ;;
@@ -15850,7 +15850,7 @@ exit 0
         let count = dir.join("kubectl-failures");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment"*)
     n=0
@@ -15881,7 +15881,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -15922,7 +15922,7 @@ exit 0
         std::fs::write(&seq, lines.join("\n") + "\n").unwrap();
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -15957,7 +15957,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -16290,7 +16290,7 @@ fi
     fn fake_cargo(dir: &Path, target_dir: &Path) {
         let script = format!(
             r#"#!/bin/sh
-{preamble}echo "$@" >> '{log}'
+{preamble}printf '%s\n' "$*" >> '{log}'
 echo "$COGNEVA_GIT_REVISION" >> '{envlog}'
 mkdir -p '{target}/release'
 echo 'fake-binary' > '{target}/release/cogneva'
@@ -22354,7 +22354,7 @@ exec {real} "$@"
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/usr/bin/env bash
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"app.kubernetes.io/component=cluster-registry"*) printf '%s' '{registry}' ;;
   *"items"*) printf '%s' '{live}' ;;
@@ -22649,7 +22649,7 @@ exit 0
         let count = bin_dir.join("restarts");
         let script = format!(
             r#"#!/usr/bin/env bash
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"app.kubernetes.io/component=cluster-registry"*) printf '%s' 'cogneva-registry' ;;
   *"items"*) printf '%s' '' ;;
@@ -22744,7 +22744,7 @@ exit 0
         let (deployer, registry_log, kubectl_log) = registry_round_fixture(root, 1, 2).await;
         let images = vec!["localhost:30500/cogneva:main-000000000001".to_string()];
         // 数**出现次数**而不是行数：这些假 kubectl 的日志没有可靠的行结构。两条
-        // 独立的原因：`echo "$@"` 会把实参开头的 `-n` 当成自己的开关 ⇒ 每次调用既被
+        // 独立的原因：`printf '%s\n' "$*"` 会把实参开头的 `-n` 当成自己的开关 ⇒ 每次调用既被
         // 吞掉那个实参、又不带结尾换行；而实参里的 jsonpath 自己可能带换行 ⇒ 行边界
         // 还会断在调用中间。实测同一份日志：`lines()` 数出 4 个片段、`matches()` 数出
         // 2 次调用。按行读的断言在"根本没做到"时也会绿。
@@ -22884,7 +22884,7 @@ exit 0
         let (deployer, _registry_log, kubectl_log) = registry_round_fixture(root, 0, 2).await;
         let images = vec!["localhost:30500/cogneva:main-000000000001".to_string()];
         // 数**出现次数**而不是行数：这些假 kubectl 的日志没有可靠的行结构。两条
-        // 独立的原因：`echo "$@"` 会把实参开头的 `-n` 当成自己的开关 ⇒ 每次调用既被
+        // 独立的原因：`printf '%s\n' "$*"` 会把实参开头的 `-n` 当成自己的开关 ⇒ 每次调用既被
         // 吞掉那个实参、又不带结尾换行；而实参里的 jsonpath 自己可能带换行 ⇒ 行边界
         // 还会断在调用中间。实测同一份日志：`lines()` 数出 4 个片段、`matches()` 数出
         // 2 次调用。按行读的断言在"根本没做到"时也会绿。
@@ -22923,7 +22923,7 @@ exit 0
         // （非零退出 + stderr），而其它查询照常答。
         let script = format!(
             r#"#!/usr/bin/env bash
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"app.kubernetes.io/component=cluster-registry"*) printf '%s' 'cogneva-registry' ;;
   *"rollout restart"*) echo "deployment.apps/cogneva-registry restarted" ;;
@@ -23833,7 +23833,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment"*) echo "{deployed_image}" ;;
   *"job-name="*) printf '{message}' ;;
@@ -24263,7 +24263,7 @@ exit 0
         // 四部署已被外部 apply 打回 :local（Legacy），而同 rev 的 Job 已完成。
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -24331,7 +24331,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"job-name="*) echo "{pod_state}" ;;
   *"get job"*) echo "|1|" ;;
@@ -24748,7 +24748,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -24816,7 +24816,7 @@ exit 0
         // 其余（快照、init 容器、pods、events）与"能收敛"的那份替身一致。
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -24884,7 +24884,7 @@ exit 0
         // 上一代的 Pod。之后：`gen=2 obs=2`，`updatedReplicas` 缺省——现场那条读数。
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -24958,7 +24958,7 @@ exit 0
         // resume 之后同一份读法收敛——Pod 是 resume 那一刻才开始建的。
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -25036,7 +25036,7 @@ exit 0
         // 同一个模板照样滚完——读数收敛。
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -25108,7 +25108,7 @@ exit 0
         // 预算 1 秒、轮询 5 秒：把暂停算进预算，第二眼就判超时。
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -25229,7 +25229,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment app --ignore-not-found"*)
     printf '%s\n' 'app=localhost:30500/cogneva:main-old' 'sidecar=redis:7-alpine' 'seed=localhost:30500/cogneva:main-old' ;;
@@ -25325,7 +25325,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"set image statefulset/redis"*)
     echo 'Error from server (Forbidden): statefulsets.apps "redis" is forbidden' >&2
@@ -25390,7 +25390,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 echo ok
 exit 0
 "#,
@@ -25500,7 +25500,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment cogneva-evolution -o jsonpath={{range"*)
     printf '%s\n' 'seed-source=localhost:30500/cogneva:main-seedold' 'cogneva=localhost:30500/cogneva:main-stale' ;;
@@ -25590,7 +25590,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment cogneva-evolution -o jsonpath={{range"*)
     printf '%s\n' 'seed-source=localhost:30500/cogneva:main-seedold' 'cogneva=localhost:30500/cogneva:main-old' ;;
@@ -25670,7 +25670,7 @@ exit 0
         let patched = bin_dir.join("patched.marker");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"patch deployment cogneva-evolution --type=merge"*)
     touch '{patched}'
@@ -25761,7 +25761,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"patch deployment cogneva-evolution"*)
     echo 'Error from server (Forbidden): deployments.apps "cogneva-evolution" is forbidden' >&2
@@ -25861,7 +25861,7 @@ exit 0
         // 恰好满值），拿它当"新版本有 Pod"会被这版新判据挡掉，落到环境类上去。
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment cogneva-registry --ignore-not-found"*)
     printf '%s\n' 'volume-walker=localhost:30500/cogneva:main-walkerold' ;;
@@ -25928,7 +25928,7 @@ exit 0
         // 崩溃"这个前提自洽（缺席的 updatedReplicas 说的是另一个场景）。
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -26836,7 +26836,7 @@ echo "||1"
             support_argv.contains("--server-side") && support_argv.contains("--force-conflicts"),
             "the support set must not go through a client-side apply: {support_argv}"
         );
-        // 按字节位置比而不是按行：假 kubectl 用 `echo "$@"` 落日志，实参里的
+        // 按字节位置比而不是按行：假 kubectl 用 `printf '%s\n' "$*"` 落日志，实参里的
         // `\n`（jsonpath 的换行转义）会被 sh 的 echo 展开成真换行，行切分靠不住。
         let first_target = calls.find("set image ").expect("no target rolled");
         let last_settle_poll = calls
@@ -27425,7 +27425,7 @@ spec:
         let pods_json = r#"{"items":[{"metadata":{"name":"cogneva-registry-57bb6bd886-ndccz"},"status":{"phase":"Running","containerStatuses":[{"name":"registry","ready":true,"restartCount":0,"state":{"running":{"startedAt":"2026-09-27T18:00:00Z"}}},{"name":"volume-walker","ready":false,"restartCount":13,"state":{"waiting":{"reason":"CrashLoopBackOff","message":"back-off 5m0s restarting failed container=volume-walker"}},"lastState":{"terminated":{"reason":"Error","exitCode":1}}}]}}]}"#;
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -27601,7 +27601,7 @@ exit 0
         let settled = dir.join("settled.marker");
         // 暂存件在 apply 那一刻的读数：把 apply 实参里那个 `-f` 路径**原样**记下来，
         // 连同它当时在不在盘上。判"删掉了没"只能从这个实参出发——日志不是分行的文本：
-        // `echo "$@"` 会把实参开头的 `-n` 当成自己的开关，于是每次调用都被吞掉首个实参
+        // `printf '%s\n' "$*"` 会把实参开头的 `-n` 当成自己的开关，于是每次调用都被吞掉首个实参
         // 且不带结尾换行，整份日志是一串首尾相连的调用（实测按 `-f` 取到的"路径"是
         // `...yamlcogneva` 这种把下一次调用粘进来的碎片）。碎片当然不存在，`exists()`
         // 于是恒为假——那条断言在种植回归下照样绿。
@@ -27625,7 +27625,7 @@ exit 0
         };
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -27781,7 +27781,7 @@ exit 0
         let live = r#"{"kind":"Deployment","metadata":{"name":"cogneva"},"spec":{"template":{"spec":{"containers":[{"name":"app","env":[{"name":"TOKEN","value":"a-plaintext-leftover"}]}]}}}}"#;
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment cogneva -o json"*) printf '%s\n' '{live}' ;;
   *"patch deployment cogneva"*) echo "deployment.apps/cogneva patched" ;;
@@ -27856,7 +27856,7 @@ spec:
         let live = r#"{"kind":"Job","metadata":{"name":"cogneva-db-role-bootstrap"},"spec":{"template":{"spec":{"containers":[{"name":"bootstrap","env":[{"name":"PGHOST","value":"postgres"},{"name":"BACKUP_PASSWORD","valueFrom":{"secretKeyRef":{"name":"cogneva-secrets","key":"backup-password"}}}]}]}}}}"#;
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get job cogneva-db-role-bootstrap -o json"*) printf '%s\n' '{live}' ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
@@ -28214,7 +28214,7 @@ esac
             .expect("rollout should succeed");
 
         let calls = std::fs::read_to_string(&log).unwrap();
-        // 按字节位置比而不是按行：假 kubectl 用 `echo "$@"` 落日志，实参里的
+        // 按字节位置比而不是按行：假 kubectl 用 `printf '%s\n' "$*"` 落日志，实参里的
         // `\n`（jsonpath 的换行转义）会被 sh 的 echo 展开成真换行，行切分靠不住。
         let first_target = calls.find("set image ").expect("no target rolled");
         for workload in ["cogneva-patcher", "cogneva"] {
@@ -28290,7 +28290,7 @@ esac
         );
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -28410,7 +28410,7 @@ exit 0
         };
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -28494,7 +28494,7 @@ exit 0
         let count = dir.join("poll.count");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -28566,7 +28566,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"initContainers"*) ;;
@@ -28657,7 +28657,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"initContainers"*) ;;
@@ -28690,7 +28690,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"terminated.finishedAt"*) echo "|" ;;
@@ -28754,7 +28754,7 @@ exit 0
         let count = dir.join("pods.count");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -28803,7 +28803,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -28844,7 +28844,7 @@ exit 0
         let count = dir.join("probe.count");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -29007,7 +29007,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -29218,7 +29218,7 @@ exit 0
         let count = dir.join("blind.count");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -30751,14 +30751,13 @@ spec:
         // 早已越过，越过后每一轮都在建 ConfigMap 这一步失败、整条滚动链路停摆，而失败
         // 只是一条 WARN。
         //
-        // fake kubectl 用 `echo "$@"`，而 argv 的首项是 `-n`——被 sh 的 echo 当成自己的
-        // flag 吃掉，于是日志里每条 argv 既少了前导 `-n ` 又不换行。所以这里不按行边界
-        // 切段，按 argv 的字面形状找：紧跟这条 argv 的正文就是它经 stdin 传的对象。
+        // 日志里每条 argv 独占一行（`printf '%s\n' "$*"`，前导 `-n ` 原样保留），
+        // 经 stdin 传的对象由 `cat` 写在下一行。按 argv 的字面形状找，正文从下一行起。
         let argv = "apply -f - --server-side --force-conflicts";
         let at = log
             .find(argv)
             .unwrap_or_else(|| panic!("清单包没有走服务端 apply: {log}"));
-        let body = &log[at + argv.len()..];
+        let body = log[at + argv.len()..].trim_start();
         assert!(
             body.starts_with('{') && body.contains("\"kind\": \"ConfigMap\""),
             "服务端 apply 之后紧跟的必须是清单包这个对象: {}",
@@ -30846,7 +30845,7 @@ spec:
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *" get "*|get\ *)
     case "$*" in
@@ -31816,7 +31815,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment"*"configMapRef"*) echo "app-deploy|cogneva-json|" ;;
   *"get statefulset"*"configMapRef"*) echo "app-sts|cogneva-json|" ;;
@@ -32528,7 +32527,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get resourcequota"*) printf '%s' '{items}' ;;
   *"get limitrange"*) printf '%s' '{ranges}' ;;
@@ -32555,7 +32554,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get resourcequota"*) printf '%s' '{items}' ;;
   *"get limitrange"*) {body} ;;
@@ -32577,7 +32576,7 @@ exit 0
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get resourcequota"*) {body} ;;
   *"get limitrange"*) printf '%s' '{ranges}' ;;
@@ -33355,7 +33354,7 @@ exit 0
         let log = bin_dir.join("buildah.log");
         let script = format!(
             r#"#!/usr/bin/env bash
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"--json"*) cat '{inv}' ;;
   *"rmi"*)
@@ -33381,7 +33380,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/usr/bin/env bash
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"jsonpath"*) printf '%s' '{live}' ;;
   *) printf '' ;;
@@ -33558,7 +33557,7 @@ exit 0
         let log = bin_dir.join("buildah.log");
         let script = format!(
             r#"#!/usr/bin/env bash
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 printf '%s' 'buildah: image store is not initialized'
 exit 0
 "#,
@@ -33666,7 +33665,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/usr/bin/env bash
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"jsonpath"*) echo "Error from server (Forbidden): deployments is forbidden" >&2; exit 1 ;;
   *) printf '' ;;
@@ -33952,7 +33951,7 @@ exit 0
         }
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get configmap"*) echo '{{"items":[{}]}}' ;;
   *"delete configmap"*) echo "configmap deleted" ;;
@@ -34024,7 +34023,7 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get configmap"*) echo "not json" ;;
   *) echo ok ;;

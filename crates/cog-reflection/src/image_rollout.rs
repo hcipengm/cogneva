@@ -233,14 +233,14 @@ mod tests {
         write_fake_bin(
             dir,
             "fake-builder",
-            &format!("#!/bin/sh\necho \"$@\" >> '{log}'\nexit 0\n"),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nexit 0\n"),
         );
         // fake kubectl：rollout status 按 rollout_ok 决定成败，其余记录参数
         let kubectl_script = if rollout_ok {
-            format!("#!/bin/sh\necho \"$@\" >> '{log}'\nexit 0\n")
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nexit 0\n")
         } else {
             format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$*\" in *\"rollout status\"*) exit 1;; esac\nexit 0\n"
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$*\" in *\"rollout status\"*) exit 1;; esac\nexit 0\n"
             )
         };
         write_fake_bin(dir, "fake-kubectl", &kubectl_script);
