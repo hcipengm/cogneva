@@ -85,6 +85,21 @@ async fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> SFResult<()> {
     .await
 }
 
+/// 把一个目录的**目录项**刷到盘上：`File::open(dir)` 之后 `sync_all`。
+///
+/// 这一句是给目录用的，不是给文件用的。[`write_atomic`] 里那一次目录 fsync 只覆盖
+/// `{store}/{name}` 内部的 `000001.json` 与 `ACTIVE` 两条项，它管不到 `{store}` 里
+/// 「有 `{name}` 这一条」——那一条属于 store 根，只有刷 store 根本身才算数。掉电后
+/// 它若丢，整棵策略子树一起消失，而调用方手里已经是 `Ok`。
+async fn sync_dir(dir: &Path) -> SFResult<()> {
+    tokio::fs::File::open(dir)
+        .await
+        .map_err(|e| SFError::IO(format!("open {} to fsync it: {e}", dir.display())))?
+        .sync_all()
+        .await
+        .map_err(|e| SFError::IO(format!("fsync {}: {e}", dir.display())))
+}
+
 impl PolicyStore {
     pub fn new(dir: impl AsRef<Path>) -> Self {
         Self {
@@ -197,6 +212,26 @@ impl PolicyStore {
         Ok(versions)
     }
 
+    /// 建好策略目录，并把「store 根里有这一条」刷到盘上。
+    ///
+    /// 顺序是「建 store 根 → 建策略目录 → fsync store 根」。store 根本身可能是本次
+    /// 首建（调用点给的是一个还不存在的目录），所以根也要 create_dir_all；根的
+    /// fsync 是无条件的，既覆盖本次新建的目录项，也覆盖上一次运行留下、还没落盘的
+    /// 那一条。代价是一次目录 fsync，而策略保存是低频路径（人工门审批 / 显著升级
+    /// 才写），这一档不值当省。
+    ///
+    /// 边界：store 根自己在挂载点里的那条目录项不在这里，那是数据卷的事——把它算进
+    /// 来只会让这条保证听起来比它做到的多。
+    async fn ensure_policy_dir(&self, dir: &Path) -> SFResult<()> {
+        tokio::fs::create_dir_all(&self.dir)
+            .await
+            .map_err(|e| SFError::IO(format!("create {}: {e}", self.dir.display())))?;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| SFError::IO(format!("create {}: {e}", dir.display())))?;
+        sync_dir(&self.dir).await
+    }
+
     /// 保存新版本（version = 最新 + 1）并立即热替换为 active。
     pub async fn save_new_version(
         &self,
@@ -217,9 +252,7 @@ impl PolicyStore {
         let artifact = PolicyArtifact::new(name, version, payload, &parent_hash, reason);
 
         let dir = self.policy_dir(name);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| SFError::IO(format!("create {}: {e}", dir.display())))?;
+        self.ensure_policy_dir(&dir).await?;
         let text = serde_json::to_string_pretty(&artifact)
             .map_err(|e| SFError::Validation(format!("serialize artifact: {e}")))?;
         write_atomic(&self.version_path(name, version), text).await?;
@@ -752,5 +785,53 @@ mod tests {
         assert_eq!(weak.verdict, crate::EvalVerdict::Inconclusive);
         let err = evo.approve("routing.llm").await.unwrap_err();
         assert!(err.to_string().contains("no staged policy candidate"));
+    }
+
+    /// 新建链路：store 根与策略目录都还不存在时，一次保存要把两者建出来，再把版本
+    /// 文件与 ACTIVE 发布出去，且不留临时文件。
+    ///
+    /// 这一条测的是发布结果，不是掉电之后还在不在——「目录项真的落了盘」在这里量不
+    /// 出来，它靠 [`sync_dir`] 那一步与 core 那一档 [`Durability::SurvivesPowerLoss`]
+    /// 的语义。别把这条测试读成持久性证明。
+    #[tokio::test]
+    async fn a_store_root_and_policy_dir_are_both_created_and_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fresh/policies");
+        let store = PolicyStore::new(&root);
+
+        let saved = store
+            .save_new_version(
+                "meta_learning.mode",
+                serde_json::json!({"margin": 0.10}),
+                "init",
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.version, 1);
+
+        let dir = root.join("meta_learning.mode");
+        assert!(
+            dir.join("000001.json").is_file(),
+            "version file was not published under a store root created on the same call"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ACTIVE")).unwrap().trim(),
+            "1"
+        );
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(".tmp")),
+            "temporary file left behind: {names:?}"
+        );
+
+        let active = store
+            .load_active("meta_learning.mode")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, 1);
     }
 }
