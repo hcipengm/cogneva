@@ -41,7 +41,7 @@ pub const MAX_REPORTS: usize = 64;
 // cap: bound — 名字最长多少字符；进程名本来就短，长的是命令行，而这一面不读命令行
 pub const MAX_COMMAND_CHARS: usize = 64;
 /// 一份自报多久之后算过期。容器停掉之后不会再有新的一拍，旧表不能一直当现状显示。
-// cap: derived — 由自报的节拍决定；容器停掉后不再有新的一拍，旧表不能一直当现状
+// cap: bound — 按自报的节拍取两拍：容器停掉后不再有新的一拍，旧表不能一直当现状
 pub const FRESH_FOR: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -862,12 +862,12 @@ const DECLARATION_MAX_PER_PASS: usize = 4;
 /// The widths the intake columns hold. A row wider than its column is refused
 /// here rather than truncated by the writer: a shortened identity is a
 /// different change sharing a row.
-// cap: derived — the declared `VARCHAR` widths of the columns these values are written to, read from the
+// cap: fixed — the declared `VARCHAR` widths of the columns these values are written to, taken from the
 // store's own DDL; a value here that the column cannot hold is the truncation this refuses.
 const DECLARATION_WIDTH_SCOPE: usize = 191;
-// cap: derived — the `literal` column's declared width, same source as the scope width above.
+// cap: fixed — the `literal` column's declared width, same source as the scope width above.
 const DECLARATION_WIDTH_LITERAL: usize = 512;
-// cap: derived — the `doc` column's declared width, same source as the scope width above.
+// cap: fixed — the `doc` column's declared width, same source as the scope width above.
 const DECLARATION_WIDTH_DOC: usize = 512;
 
 /// What one out-of-band commit left behind that a check can settle.

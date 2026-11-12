@@ -56,7 +56,7 @@ const DEFAULT_WASM_TIMEOUT_SECS: u64 = 30;
 /// bound because the thing being timed is a build or a test run, which is
 /// expected to take minutes; what this catches is a command that wedged, not a
 /// command that works.
-// cap: derived — 与构建侧的墙同源：这些命令本来就以分钟计，这里要抓的是卡住的命令而不是能跑的命令
+// cap: fixed — 与构建侧的墙同源：这些命令本来就以分钟计，这里要抓的是卡住的命令而不是能跑的命令
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
 
 /// Real execution identity of one agent run. Carried explicitly from the

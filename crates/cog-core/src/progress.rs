@@ -47,7 +47,7 @@ const SILENCE_QUANTILE: f64 = 0.999;
 /// Derived from [`SILENCE_QUANTILE`] rather than picked, so the two cannot
 /// disagree — a floor that stayed at 100 while the quantile moved to 0.9999
 /// would report a window from a sample that cannot support it.
-// cap: derived — 1 / (1 - SILENCE_QUANTILE)：估 0.999 分位要至少有一个落在它之外的点
+// cap: bound — 1 / (1 - SILENCE_QUANTILE)：估 0.999 分位要至少有一个落在它之外的点
 pub const SAMPLE_FLOOR: usize = 1000;
 
 fn beacons() -> &'static Mutex<HashMap<String, Instant>> {

@@ -229,7 +229,7 @@ pub const HEADROOM_PERCENT: u64 = 120;
 /// Walks whose peak is kept. Six is about an hour at the default cadence, which
 /// is longer than any one build and shorter than the day a mis-sized
 /// declaration otherwise survives.
-// cap: derived — 峰值要盖过任何一次构建，又要短于「填错一次能活一整天」
+// cap: bound — 峰值要盖过任何一次构建，又要短于「填错一次能活一整天」
 pub const PEAK_ROUNDS: usize = 6;
 
 /// Cadence of the loop when the deployment states none.

@@ -47,14 +47,14 @@ use tokio::sync::Notify;
 /// 按 30–60s 代理 worst 值越过 20 的分钟占 26%（io 25%、cpu 1.6%、memory 1.4%）；
 /// 1s 粒度活采里 17% 的样本越线、最大 49.8 —— 这条线够得着，不是摆设。它对行为也有
 /// 实权：把两条 PSI 红灯整个去掉，界停在 1 的时间从 54.9% 掉到 44.1%。
-// cap: derived — 7d 实测的 PSI avg10 分布定出的红灯线；是历史读数，不是这台机器当下的值
+// cap: bound — 7d 实测的 PSI avg10 分布定出的红灯线；是历史读数，不是这台机器当下的值
 pub const PSI_RED_AVG10: f64 = 20.0;
 /// 绿灯：PSI 三项的 `avg60` 全在这条线以下才加一。
 ///
 /// 实测：5.0 落在这台宿主自己 worst_avg60 分布的第 67 分位（p50 1.51、p75 21.7），
 /// 不是圆整数。但它是这条律里最不灵敏的旋钮：5 → 20 或 5 → 2，界停在 1 的时间只在
 /// 53.8%–56.7% 之间动（一到三个百分点）。别把它当主要调节手段。
-// cap: derived — 7d 实测 worst_avg60 的第 67 分位；同上，来自一次量过的分布
+// cap: bound — 7d 实测 worst_avg60 的第 67 分位；同上，来自一次量过的分布
 pub const PSI_GREEN_AVG60: f64 = 5.0;
 /// 可用内存的两条线，按这台宿主的 MemTotal 折算出来的字节数。
 ///
@@ -70,14 +70,14 @@ pub struct MemoryLines {
 }
 
 /// 有牙齿的地板占实测宿主 MemTotal 的份额（44 GiB / 62.7 GiB）。
-// cap: derived — 7d 实测：44 GiB 地板 / 62.7 GiB MemTotal
+// cap: bound — 7d 实测：44 GiB 地板 / 62.7 GiB MemTotal
 const MEM_FLOOR_PERCENT: u64 = 70;
 /// 绿灯线占实测宿主 MemTotal 的份额（46.4 GiB / 62.7 GiB）。
 ///
 /// 它比地板高出的那 4 个点就是回滞带：绿灯只排除实测里最干的那部分分钟，界不会在
 /// 地板附近抖着加一减半。两条线各有来源，不是「地板的倍数」——把绿灯写回地板乘二，
 /// 抬一侧会静默关死另一侧。
-// cap: derived — 7d 实测：46.4 GiB（MemAvailable p5）/ 62.7 GiB MemTotal
+// cap: bound — 7d 实测：46.4 GiB（MemAvailable p5）/ 62.7 GiB MemTotal
 const MEM_GREEN_PERCENT: u64 = 74;
 
 /// 这台宿主的两条内存线。`total_bytes` 是 `/proc/meminfo` 的 MemTotal。

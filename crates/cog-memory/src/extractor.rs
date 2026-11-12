@@ -394,7 +394,7 @@ const EXTRACT_TASK_TIMEOUT_SECS: u64 = 180;
 /// transcript. It sits just under the task's own ceiling, so a pass that runs
 /// out of patience and the task that runs out of time are two different
 /// statements rather than the same one made twice.
-// cap: derived — ten seconds under the row's own ceiling (180): the waiter has to give up first, otherwise "we stopped waiting" and "it timed out" arrive together and the two readings cannot be told apart.
+// cap: bound — ten seconds under the row's own ceiling (180): the waiter has to give up first, otherwise "we stopped waiting" and "it timed out" arrive together and the two readings cannot be told apart.
 const EXTRACT_WAIT_TIMEOUT_SECS: u64 = 170;
 
 /// One work item in, one answer out.

@@ -239,7 +239,7 @@ const UNCHARGED_TURNS_BEFORE_SLOWING: u32 = 6;
 /// 平台量出来的额度窗口是一周（`quota_window_secs: 604800`），12 小时是它的
 /// 一个零头——窗口回来的当天，这些活半天之内都会重新被看到，而又不会在窗口
 /// 还没回来时把额度一片一片吃掉。
-// cap: derived — 上界钉在实测额度窗口（604800s）的零头上；窗口变了这个数跟着变
+// cap: bound — 上界钉在额度窗口（配置的 quota_window_secs: 604800）的一个零头上：窗口回来的当天这些活会重新被看到，又不会在窗口回来前把额度一片片吃掉。窗口是配置值，这个界是人按窗口钉的，没有闭环让它跟着动
 const UNCHARGED_REQUEUE_WAIT_CAP_SECS: u64 = 12 * 3600;
 
 /// One lane's share of what a stall sweep did.

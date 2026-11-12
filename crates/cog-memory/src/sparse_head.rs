@@ -26,7 +26,7 @@ use crate::bge_m3_sparse_linear::{BIAS, WEIGHT};
 
 /// 一批多少条。与建立会话那一侧用的分批大小一致——`BatchLongest` 补齐意味着
 /// 换一个批大小，同一句话就可能补到另一个长度。
-// cap: derived — 照抄 fastembed 建立会话那一侧的分批大小；两侧取的是同一个数，那边改了这里要一起看
+// cap: fixed — 照抄 fastembed 建立会话那一侧的分批大小；两侧取的是同一个数，那边改了这里要一起看
 pub(crate) const BATCH: usize = 256;
 
 /// 权重目录里指向「当前这一版」的那份引用文件名。
@@ -36,7 +36,7 @@ pub(crate) const BATCH: usize = 256;
 const CURRENT_REF: &str = "refs/main";
 
 /// 截断长度上限。同样取建立会话那一侧的默认值。
-// cap: derived — 与建立会话那一侧取同一个截断长度；两侧必须一致，那边改了这里要一起看
+// cap: fixed — 与建立会话那一侧取同一个截断长度；两侧必须一致，那边改了这里要一起看
 const MAX_LENGTH: usize = 512;
 
 /// BGE-M3 词表里 `<s>`、`<pad>`、`</s>`、`<unk>` 的编号，稀疏权重不计它们。

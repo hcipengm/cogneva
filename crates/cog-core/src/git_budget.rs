@@ -18,7 +18,7 @@ use std::time::Duration;
 pub const GIT_TIMEOUT_FLOOR_SECS: u64 = 120;
 
 /// How many times the slowest completed command a command may take.
-// cap: derived — 从这台机上跑完过的最慢命令推：一条命令最多花它的十倍
+// cap: bound — 从这台机上跑完过的最慢命令推：一条命令最多花它的十倍
 pub const GIT_TIMEOUT_MULTIPLE: u64 = 10;
 
 /// How long a git command may run, from the slowest one that has completed.

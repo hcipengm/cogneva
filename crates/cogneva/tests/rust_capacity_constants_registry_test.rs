@@ -4,13 +4,23 @@
 //! and a new one fails this test until it does.
 //!
 //! The chart has had `deploy/helm/cogneva/tunables.yaml` for this: one row per
-//! numeric leaf, each row either naming the reading the value is derived from
-//! or saying why it is a bound rather than a measurement. Rust had nothing, so
-//! a number describing the machine could be typed into a `const` and nothing
-//! anywhere asked where it came from -- which is how a hand-measured figure
-//! outlives the measurement and starts reading as a fact about the deployment.
+//! numeric leaf, answered with `derived`, `override` or `fixed`. A chart leaf is
+//! read at run time, so `derived` is something a leaf can be -- a measurement
+//! moves it. A `const` cannot: its value is fixed when the crate is compiled and
+//! no later reading moves it. The words a constant can carry are therefore
+//! `bound` (pinned against the world; the reason says what pins it, and a loop
+//! that could have moved it but does not is the debt stated there) and `fixed`
+//! (not a dial; the reason names the agreement it comes from). `derived` is
+//! refused on a constant on purpose: a constant that claims to follow a reading
+//! is exactly the shape that let a hand-measured figure outlive its measurement
+//! and start reading as a fact about the deployment. When a reading really does
+//! move a working value, the derivation belongs on the value that moves, and its
+//! evidence belongs there with it.
 //!
-//! The answer lives on the constant, as a `// cap: derived` or `// cap: bound`
+//! Rust had nothing, so a number describing the machine could be typed into a
+//! `const` and nothing anywhere asked where it came from.
+//!
+//! The answer lives on the constant, as a `// cap: bound` or `// cap: fixed`
 //! line in the comment block right above it: one word for which kind of answer
 //! this is, and a reason after a dash. The reason goes on that same line rather
 //! than in the prose above, because a block can describe a number without ever
@@ -46,7 +56,9 @@
 //! There is no third answer and no place to park one: a constant that arrives
 //! without a `cap:` line is red, and the two words are the whole closed set. A
 //! debt column would have been the easy shape and the wrong one -- "not judged
-//! yet" is exactly what a registry of every number was supposed to end.
+//! yet" is exactly what a registry of every number was supposed to end. The same
+//! reasoning refuses `derived` rather than admitting it as a third word: a
+//! constant carrying it does not become a moving value, it only reads like one.
 //!
 //! The other half of the same question is on this file too: a number written at
 //! the point of *use* rather than in a declaration. The census above cannot see
@@ -71,8 +83,13 @@ use common::rust_production::{production_sources, sources_of_tree};
 /// The word that answers for a constant, in the comment block above it.
 const CAP_MARKER: &str = "// cap:";
 
-/// The whole closed set of answers.
-const CAP_SOURCES: [&str; 2] = ["derived", "bound"];
+/// The whole closed set of answers a constant may carry.
+const CAP_SOURCES: [&str; 2] = ["bound", "fixed"];
+
+/// The chart's word for a value a measurement moves. A `const` is frozen at
+/// compile time, so it is not an answer a constant can give; naming it here
+/// keeps the refusal separate from "a word we have never heard of".
+const DERIVED: &str = "derived";
 
 /// One written number: where it is, what it says, and what the block above it
 /// answered.
@@ -81,7 +98,7 @@ struct Row {
     file: String,
     name: String,
     value: String,
-    /// `derived` or `bound`; empty when the constant carries no marker.
+    /// `bound` or `fixed`; empty when the constant carries no marker.
     source: String,
     /// The reason after the dash. Empty means the marker is a label and nothing
     /// else, which is the thing this test exists to refuse.
@@ -364,18 +381,30 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
 /// numbers nobody decided about, and then reads green.
 ///
 /// The rows the census refuses, split by which refusal it is: no marker at all,
-/// a word outside the vocabulary, and a marker with no reason on it.
+/// a word outside the vocabulary, a `derived` claim on a constant, and a marker
+/// with no reason on it.
+///
+/// `derived` gets its own bucket rather than joining the unknown words because
+/// the refusal is about the shape, not the spelling: a reader who wrote it was
+/// answering a question a constant cannot answer, and the message has to say
+/// what to do instead. Filing it under "not in the vocabulary" would hide that
+/// behind a set listing.
 ///
 /// Split out from the test so a fixture tree can be judged by the same code the
 /// real tree is judged by -- a fixture that restated the partition would agree
 /// with the test no matter which way either one was written.
-fn refuses(rows: &[Row]) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn refuses(rows: &[Row]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     let mut unmarked = Vec::new();
     let mut unknown = Vec::new();
+    let mut moves = Vec::new();
     let mut unreasoned = Vec::new();
     for row in rows {
         if row.source.is_empty() {
             unmarked.push(format!("{}:{} = {}", row.file, row.name, row.value));
+            continue;
+        }
+        if row.source == DERIVED {
+            moves.push(format!("{}:{} = {}", row.file, row.name, row.value));
             continue;
         }
         if !CAP_SOURCES.contains(&row.source.as_str()) {
@@ -392,7 +421,7 @@ fn refuses(rows: &[Row]) -> (Vec<String>, Vec<String>, Vec<String>) {
             unreasoned.push(format!("{}:{} = {}", row.file, row.name, row.value));
         }
     }
-    (unmarked, unknown, unreasoned)
+    (unmarked, unknown, moves, unreasoned)
 }
 
 /// A `// cap: bound` says which kind of answer the number is; the reason after
@@ -413,20 +442,31 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
         scanned.len()
     );
 
-    let (unmarked, unknown, unreasoned) = refuses(&scanned);
+    let (unmarked, unknown, moves, unreasoned) = refuses(&scanned);
     assert!(
         unmarked.is_empty(),
         "these written numbers say nothing about where they come from. Put a line in \
-         the block above each one -- `// cap: derived` when it follows a reading, \
-         `// cap: bound` when no measurement should move it -- and the reason it \
-         rests on after a dash. The reason goes on that same line, not in the prose \
-         above: a block can describe a number without saying why it is that one:\n{}",
+         the block above each one -- `// cap: bound` when the value is pinned, \
+         `// cap: fixed` when it is not a dial -- and the reason it rests on after a \
+         dash. The reason goes on that same line, not in the prose above: a block can \
+         describe a number without saying why it is that one:\n{}",
         unmarked.join("\n")
     );
     assert!(
         unknown.is_empty(),
-        "these say something the vocabulary does not have; the set is {CAP_SOURCES:?}:\n{}",
+        "these say something the vocabulary does not accept; a constant's answers are \
+         {CAP_SOURCES:?}:\n{}",
         unknown.join("\n")
+    );
+    assert!(
+        moves.is_empty(),
+        "these claim to follow a reading, and a constant cannot: its value is fixed \
+         when the crate is compiled, so no measurement moves it and a test that \
+         changes its input can only change it through a rebuild. Label the pinned \
+         value `bound` (say what pins it) or the agreement `fixed` (name it). A \
+         value a reading really moves gets its derivation -- and its evidence -- on \
+         the value that moves, not on a const that restates the number:\n{}",
+        moves.join("\n")
     );
     assert!(
         unreasoned.is_empty(),
@@ -443,8 +483,10 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
 /// exactly when the work succeeds. What the fixture pins is the rule -- a marker
 /// with a prose block above it and no reason on its own line is a label, and the
 /// block saying something `about` the number does not make it an answer. The
-/// four rows around it are the ones the rule must not touch, so a version that
-/// simply refused every marker cannot pass either.
+/// row claiming `derived` is refused for a different reason -- a constant cannot
+/// follow a reading -- and the row carrying a real reason is the one the rule
+/// must not touch, so a version that simply refused every marker cannot pass
+/// either.
 #[test]
 fn a_marker_is_a_label_until_it_carries_its_reason() {
     let root = std::env::temp_dir().join(format!("cog-cap-marker-{}", std::process::id()));
@@ -467,18 +509,21 @@ pub const UNMARKED: usize = 4;
 
 // cap: 凭空捏的
 pub const INVENTED: usize = 2;
+
+// cap: derived — 跟着读数走
+pub const FOLLOWS_A_READING: usize = 16;
 "##,
     )
     .unwrap();
     let rows = scan(&root, &sources_of_tree(&root));
     assert_eq!(
         rows.len(),
-        5,
-        "the fixture declares five numbers and the scan read {} of them: the walk is \
+        6,
+        "the fixture declares six numbers and the scan read {} of them: the walk is \
          broken, not the fixture",
         rows.len()
     );
-    let (unmarked, unknown, unreasoned) = refuses(&rows);
+    let (unmarked, unknown, moves, unreasoned) = refuses(&rows);
     assert_eq!(
         unmarked,
         vec!["crates/probe/src/numbers.rs:UNMARKED = 4".to_string()],
@@ -488,6 +533,12 @@ pub const INVENTED: usize = 2;
         unknown,
         vec!["crates/probe/src/numbers.rs:INVENTED says `cap: 凭空捏的`".to_string()],
         "a word outside the vocabulary went unreported"
+    );
+    assert_eq!(
+        moves,
+        vec!["crates/probe/src/numbers.rs:FOLLOWS_A_READING = 16".to_string()],
+        "a constant claiming to follow a reading went unreported, so the one word a \
+         frozen number must never carry still passes"
     );
     assert_eq!(
         unreasoned,

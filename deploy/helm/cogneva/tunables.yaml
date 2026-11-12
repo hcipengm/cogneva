@@ -1,7 +1,7 @@
 # The tunable registry: one row per numeric leaf `values.yaml` carries.
 #
 # The Rust half of the same account lives on the constants themselves, as a
-# `// cap: derived` or `// cap: bound` line in the comment block above each one,
+# `// cap: bound` or `// cap: fixed` line in the comment block above each one,
 # judged by `crates/cogneva/tests/rust_capacity_constants_registry_test.rs`: a
 # numeric `const` in production code with no such line is red the same way a
 # chart leaf with no row here is. The two are split by what they enumerate, not
@@ -9,6 +9,13 @@
 # accounted here, and one that never leaves the process is accounted on the
 # constant. The account is not a second file in either half: a row for a number
 # that no longer exists is the drift this shape was chosen to make impossible.
+#
+# The Rust half has two words, not three, and that is deliberate: a `const` is
+# frozen at compile time, so no reading can move it and `derived` is not an
+# answer it can give. What a constant can be is `bound` (pinned against the
+# world; the reason says what pins it) or `fixed` (not a dial; the reason names
+# the agreement). A `derived` marker on a constant is refused with that reason,
+# not accepted as a third spelling of "somebody measured it once".
 #
 # A number a deployment ships is one of three things, and the page shows all
 # three as the same number:

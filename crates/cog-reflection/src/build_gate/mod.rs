@@ -1715,7 +1715,7 @@ fn tuning_readings(
 /// stall nobody measured. Capping at the sample's own horizon makes the counter
 /// a floor rather than a total, which is the safe direction for a rule that
 /// fires on it being large.
-// cap: derived — 取的是下限而不是总量，这对「它大就触发」的规则是安全方向
+// cap: bound — 取的是下限而不是总量，这对「它大就触发」的规则是安全方向
 const IO_SAMPLE_HORIZON: Duration = Duration::from_secs(60);
 
 /// What share of `since` a look at the disk may charge to [`BUILD_GATE_IO_OUTSIDE_SECONDS`].

@@ -50,7 +50,7 @@ pub const EXIT_REFUSED: i32 = 1;
 ///
 /// 与变更本身无关，也不含任何结论——调用方据此把变更留在队列里重试，而不是记成
 /// 一次失败。取 75（EX_TEMPFAIL），与一次性滚动入口的环境类退出码同源。
-// cap: derived — 取 75（EX_TEMPFAIL），与滚动入口的环境类退出码同源
+// cap: fixed — 取 75（EX_TEMPFAIL），与滚动入口的环境类退出码同源
 pub const EXIT_UNAVAILABLE: i32 = 75;
 
 /// 容器终止消息（kubelet 的 `terminationMessagePath` 默认值）。类别在退出码上，
