@@ -718,7 +718,7 @@ capreg_compiled=no
 # 别的会话的构建一起抢同一台机器的 CPU 与 IO，而界是同一个数。不在槽里，读数归不到因，
 # 界也管不住它——「只差一秒」不是理由，界的单位是并发构建数，不是秒。
 if [ -n "${gate_rustc}" ] && \
-        build_slot_run "gate: 容量登记表（rustc 直编）" \
+        build_slot_run "容量登记表（rustc 直编）" \
             env CARGO_MANIFEST_DIR="${root}/crates/cogneva" \
             "${gate_rustc}" --test --edition 2021 -o "${capreg_bin}" "${capreg_src}"; then
     capreg_compiled=yes

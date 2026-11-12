@@ -1210,6 +1210,18 @@ const PRODUCED: &[(&str, &str)] = &[
         "agent_inbox_ask_total",
         "crates/cog-agent/src/observable.rs",
     ),
+    // 关停排空留下的、与续跑捡起来的。两族是一句话的两面：排空让被通知的
+    // 终止零损失，日志让硬杀至多丢一步，而在此之前两个结局各只写一行日志，
+    // 于是「这次滚动丢了几步」在读数面上不存在。放弃计数由关停那一格写，
+    // 未决调用计数由续跑那一格写。
+    (
+        "cogneva_shutdown_drain_abandoned_total",
+        "crates/cog-agent/src/plugin.rs",
+    ),
+    (
+        "cogneva_attempt_unresolved_calls_total",
+        "crates/cog-agent/src/agent_kernel/runtime.rs",
+    ),
     // 退役清扫只删「无主且空」的 inbox。另一半——属主已经不在注册表、条目却
     // 还在——永远不会被投递、也不会被删，而清扫的输出只报它删掉了多少：没人
     // 计过它留下的。两族都出声：只数流分不出「一条搁浅的命令」与「一万条」。

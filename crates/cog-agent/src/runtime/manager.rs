@@ -111,6 +111,8 @@ pub struct GlobalAgentManager {
     event_bus_sink: Option<crate::EventBusSink>,
     /// Durable per-task token census sink handed to every spawned worker.
     observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    /// Handed to every worker so a resumed attempt can report itself.
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     /// Where a worker's checkpoint is persisted when something asks for a
     /// snapshot.
     ///
@@ -188,6 +190,7 @@ impl GlobalAgentManager {
             event_bus: None,
             event_bus_sink: None,
             observability: None,
+            metrics: None,
             checkpoint_store: None,
             wal_backend: None,
             wal_missing_reported: AtomicBool::new(false),
@@ -315,6 +318,12 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Give every spawned worker the series a resumed attempt reports itself on.
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Give every spawned worker the store its snapshots are persisted to.
     pub fn with_checkpoint_store(mut self, store: Arc<dyn cog_core::CheckpointStore>) -> Self {
         self.checkpoint_store = Some(store);
@@ -430,6 +439,9 @@ impl GlobalAgentManager {
             }
             if let Some(ref ob) = self.observability {
                 a = a.with_observability(ob.clone());
+            }
+            if let Some(ref m) = self.metrics {
+                a = a.with_metrics(m.clone());
             }
             if let Some(ref cp) = self.checkpoint_store {
                 a = a.with_checkpoint_store(cp.clone());
@@ -711,6 +723,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
             }
             if let Some(ref ob) = self.observability {
                 a = a.with_observability(ob.clone());
+            }
+            if let Some(ref m) = self.metrics {
+                a = a.with_metrics(m.clone());
             }
             if let Some(ref cp) = self.checkpoint_store {
                 a = a.with_checkpoint_store(cp.clone());

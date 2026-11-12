@@ -1826,13 +1826,21 @@ rows:
     source: override
     why: >-
       How long the process may spend letting in-flight runs reach a turn
-      boundary and stop before it exits. Pinned at 30 s because nothing
-      measures the drain yet: the loop that should set it is "how long does a
-      real drain take", and that reading has no history. It is pinned equal to
-      cogneva.json's shutdown_timeout_ms by a contract test. Debt: once the
-      drain wait has run for a while, this number moves to derived. Top level,
-      not under gateway, because both workloads that run agent turns (the app
-      and the evolution pod) read it.
+      boundary and stop before it exits. Still pinned at 30 s, but the reading
+      this number should be derived from now exists: every shutdown observes
+      `cogneva_shutdown_drain_seconds{outcome}` and the runs it left in flight
+      on `cogneva_shutdown_drain_abandoned_total`. What is missing is the loop,
+      not the input -- nothing yet reads that histogram back and writes a
+      budget, so a derived row here would name a reading that nothing consumes
+      and a proof test with no subject. The budget is pinned equal to
+      cogneva.json's shutdown_timeout_ms by a contract test, and the pair with
+      terminationGraceSeconds is asserted by the same test. Debt, stated
+      exactly: when the histogram has a rollout's worth of history, the budget
+      becomes a high quantile of it with the grace kept above it, and that
+      conversion is one change -- this row, the loop that reads the reading,
+      and the proof test that moves the input. Top level, not under gateway,
+      because both workloads that run agent turns (the app and the evolution
+      pod) read it.
 
   - key: shutdown.terminationGraceSeconds
     source: override

@@ -261,6 +261,9 @@ pub struct AgentPlugin {
     /// 关停时等在飞的运行让路多久，来自 `core.system.shutdown_timeout_ms`。
     /// 零表示没人声明过，那就**不等**：一个没有依据的等待比不等更糟。
     drain_timeout_ms: std::sync::atomic::AtomicU64,
+    /// 关停排空的读数写到哪里。与 `drain_timeout_ms` 相邻不是偶然：那个数是
+    /// 这一格的界，这个读数说的是界够不够用，两个必须落在同一个进程里。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl AgentPlugin {
@@ -274,9 +277,65 @@ impl AgentPlugin {
             eval_event_rx: tokio::sync::Mutex::new(None),
             eval_employee: None,
             drain_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            metrics: None,
+        }
+    }
+
+    /// 记一次排空：等了多久、等到了没有、还有几条没等到。
+    ///
+    /// `left` 只在超时时非零；等到零的那一次它也记一条 0，让「上一次超时留下了
+    /// 三条、这一次一条没留」在同一条序列上读得出来——一个只在坏结局里才出现的
+    /// 计数器，读的人分不清「归零了」与「这版还没装」。写失败只打一行日志：
+    /// 进程正在退出，读数写不进去不该改变关停顺序。
+    async fn record_drain(&self, seconds: f64, outcome: &'static str, left: usize) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
+        if let Err(e) = metrics
+            .record_histogram(
+                cog_core::metric_names::SHUTDOWN_DRAIN_SECONDS,
+                seconds,
+                labels,
+            )
+            .await
+        {
+            warn!(error = %e, "could not record how long the shutdown drain took");
+        }
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::SHUTDOWN_DRAIN_ABANDONED_TOTAL,
+                left as f64,
+                std::collections::HashMap::new(),
+            )
+            .await
+        {
+            warn!(error = %e, "could not record the runs the drain left behind");
+        }
+    }
+
+    /// 记一次「没有声明预算、根本没有等」。
+    async fn record_drain_undeclared(&self) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::SHUTDOWN_DRAIN_UNDECLARED_TOTAL,
+                1.0,
+                std::collections::HashMap::new(),
+            )
+            .await
+        {
+            warn!(error = %e, "could not record a shutdown with no drain budget");
         }
     }
 }
+
+/// 排空这一格的结局取值。闭集，读者按它选行。
+const DRAIN_DRAINED: &str = "drained";
+const DRAIN_TIMEOUT: &str = "timeout";
 
 impl Default for AgentPlugin {
     fn default() -> Self {
@@ -295,6 +354,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             return Ok(());
         }
 
+        self.metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
         self.drain_timeout_ms.store(
             ctx.config().system.shutdown_timeout_ms,
             std::sync::atomic::Ordering::Relaxed,
@@ -543,6 +603,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
         if let Some(ref archive) = tool_output_archive {
             eval_runtime = eval_runtime.with_tool_output_archive(archive.clone());
         }
+        if let Some(ref metrics) = self.metrics {
+            eval_runtime = eval_runtime.with_metrics(metrics.clone());
+        }
         // 登记走与常驻池同一条路：注册即建行、发工号。登记不上不拦启动——
         // 判词照样要写出来——但这条日志要说清读面会缺什么。
         if let Err(e) = agent_registry
@@ -643,6 +706,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
             pool_builder = pool_builder.with_external_skill_registry(esr.clone());
         }
         pool_builder = pool_builder.with_observability(observability);
+        // 续跑读数走同一份后端：每个 worker 都要报「这次是从日志接着跑的，
+        // 还是从头开始」，而它们在池子里建，池子只有这一个后端。
+        if let Some(ref metrics) = self.metrics {
+            pool_builder = pool_builder.with_metrics(metrics.clone());
+        }
         pool_builder = pool_builder.with_wal_backend(wal_backend);
         // 检查点存储：把快照交给 agent 的落盘那一半。缺了它，快照照样返回、
         // 事件照样发、日志照样绿，只有 save 那一步不存在——于是「可续跑的
@@ -838,18 +906,31 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 self.drain_timeout_ms
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
+            // 等多久是这一格的界，等出来的结果是它的读数。两件事在同一段里量：
+            // 分开放会让「界够不够」只能靠日志里那句话去猜——而两种结局写下的
+            // 是同一句「等着让路」。
+            let started = std::time::Instant::now();
             if limit.is_zero() {
+                // 没有声明过预算就没有排空可量：这一跑**没有等**，而不是等了零秒。
+                // 把它记成一条 0 秒的观测量，会让「预算缺了」与「一次瞬间完成的排空」
+                // 在读面上同形，而这两件事要求的动作相反。
                 warn!(
                     in_flight = crate::drain::in_flight(),
                     "no shutdown timeout was declared; in-flight runs are left to their journals"
                 );
+                self.record_drain_undeclared().await;
             } else if crate::drain::wait_drained(limit).await {
                 info!("every in-flight run reached a turn boundary before shutdown");
+                self.record_drain(started.elapsed().as_secs_f64(), DRAIN_DRAINED, 0)
+                    .await;
             } else {
+                let left = crate::drain::in_flight();
                 warn!(
-                    in_flight = crate::drain::in_flight(),
+                    in_flight = left,
                     "shutdown ran out of time with runs still in flight; they resume from their journals"
                 );
+                self.record_drain(started.elapsed().as_secs_f64(), DRAIN_TIMEOUT, left)
+                    .await;
             }
         }
         // 注册表是全集群共享的（多副本同名 worker、其他 pod 的 squad 智能体
@@ -1145,5 +1226,104 @@ mod conversation_reaches_the_worker_tests {
             answer.to_string().contains("Ada#1234"),
             "the answer on the reply stream is the worker's own: {answer}"
         );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_drain_readings_tests {
+    //! 关停排空的三条结局各自是读得出来的一格。
+    //!
+    //! 三种结局在日志里是同一句话——「等着让路」——差别只在结尾那一段。读数面
+    //! 存在的理由就是把它们分开：等到零、超时还留着几条、以及根本没有预算所以
+    //! 没等。第三种尤其不能记成一个 0 秒的观测量，那会让「没排空」与「瞬间排空」
+    //! 同形，而两者要求的动作相反。
+    //!
+    //! 判的是序列名、标签与数值：读者按 `outcome` 选行，标签写错等于这一族永远
+    //! 选不中。
+
+    use super::*;
+    use crate::recording_metrics::RecordingMetrics;
+    use std::sync::Arc;
+
+    fn plugin_with(spy: Arc<RecordingMetrics>) -> AgentPlugin {
+        let mut plugin = AgentPlugin::new();
+        plugin.metrics = Some(spy);
+        plugin
+    }
+
+    #[tokio::test]
+    async fn a_drained_shutdown_reports_its_duration_and_zero_abandoned() {
+        let spy = Arc::new(RecordingMetrics::default());
+        plugin_with(spy.clone())
+            .record_drain(12.5, DRAIN_DRAINED, 0)
+            .await;
+        let seconds = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_SECONDS);
+        assert_eq!(
+            seconds.len(),
+            1,
+            "one observation per shutdown: {seconds:?}"
+        );
+        assert_eq!(
+            seconds[0].2, 12.5,
+            "the observed duration is the wait itself"
+        );
+        assert_eq!(
+            seconds[0].1.get(crate::LABEL_OUTCOME).map(String::as_str),
+            Some(DRAIN_DRAINED),
+            "a drain that reached zero must be told apart by its outcome label"
+        );
+        let abandoned = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_ABANDONED_TOTAL);
+        assert_eq!(
+            abandoned.len(),
+            1,
+            "a zero is a measurement, so it must be written too: {abandoned:?}"
+        );
+        assert_eq!(abandoned[0].2, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_drain_reports_the_runs_it_left_in_flight() {
+        let spy = Arc::new(RecordingMetrics::default());
+        plugin_with(spy.clone())
+            .record_drain(30.0, DRAIN_TIMEOUT, 3)
+            .await;
+        let seconds = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_SECONDS);
+        assert_eq!(
+            seconds[0].1.get(crate::LABEL_OUTCOME).map(String::as_str),
+            Some(DRAIN_TIMEOUT),
+            "the two endings share a histogram only because the label separates them"
+        );
+        let abandoned = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_ABANDONED_TOTAL);
+        assert_eq!(
+            abandoned[0].2, 3.0,
+            "three runs were handed to their journals; the count is the damage"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_with_no_budget_is_not_an_instant_drain() {
+        let spy = Arc::new(RecordingMetrics::default());
+        plugin_with(spy.clone()).record_drain_undeclared().await;
+        assert!(
+            spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_SECONDS)
+                .is_empty(),
+            "a process that never waited must not observe a duration"
+        );
+        let undeclared = spy.rows_for(cog_core::metric_names::SHUTDOWN_DRAIN_UNDECLARED_TOTAL);
+        assert_eq!(
+            undeclared.len(),
+            1,
+            "the missing budget has a reading of its own"
+        );
+        assert_eq!(undeclared[0].2, 1.0, "one increment per shutdown");
+    }
+
+    #[tokio::test]
+    async fn no_metrics_backend_still_lets_the_process_exit() {
+        // 没有后端时这些调用必须是空操作：关停路径上的一次 panic 会把「读数写不
+        // 进去」升级成「进程退不掉」。
+        let plugin = AgentPlugin::new();
+        plugin.record_drain(1.0, DRAIN_DRAINED, 0).await;
+        plugin.record_drain_undeclared().await;
     }
 }

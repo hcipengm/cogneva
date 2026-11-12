@@ -2132,6 +2132,60 @@ metric_names! {
     TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL => "cogneva_tool_output_archive_failed_total",
     TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL => "cogneva_tool_output_fetch_budget_exhausted_total",
 
+    // cog-agent — what a shutdown lost, and what a resume picked back up.
+    //
+    // The drain and the attempt journal are one promise read from two sides:
+    // a notified stop (SIGTERM, a rollout) costs nothing because the run stops
+    // at a turn boundary with its tool results already written, and a hard kill
+    // (SIGKILL, OOM) costs at most the one call that had no result. Until these
+    // series existed that promise could not be falsified: the drain only wrote
+    // a log line and the resume only a log line, so after a rollout nobody
+    // could say how long the drain took, how many runs it left behind, or
+    // whether the next attempt actually continued from the journal rather than
+    // re-buying the conversation.
+    //
+    // `seconds` is a histogram, not a counter, because the question the budget
+    // is set from is "how long does a real drain take", and that is a
+    // distribution: a single slow rollout is the observation that moves the
+    // budget, and a mean over a day hides it. The `outcome` label keeps the
+    // two endings apart -- a drain that reached zero and one that ran out of
+    // budget are both events here, and summing the label away would let a
+    // process that never drains on time look like one that always does.
+    SHUTDOWN_DRAIN_SECONDS => "cogneva_shutdown_drain_seconds",
+    // Runs still in flight when the drain budget ran out. The histogram above
+    // says how long the wait was; this says what it bought. A drain that times
+    // out with nothing left has lost nothing, while one that times out with
+    // three runs still going has handed three attempts to the journal — and
+    // the log line those two produce is the same sentence.
+    SHUTDOWN_DRAIN_ABANDONED_TOTAL => "cogneva_shutdown_drain_abandoned_total",
+    // Shutdowns that found no declared drain budget and therefore did not wait
+    // at all. Kept apart from the histogram rather than observed there as a
+    // zero: "the process did not drain" and "the process drained instantly"
+    // are opposite facts about the same second, and a reader that saw only a
+    // zero would have no way to tell which one it was looking at.
+    SHUTDOWN_DRAIN_UNDECLARED_TOTAL => "cogneva_shutdown_drain_undeclared_total",
+    // Attempts that started by reading the journal, labelled by `outcome`.
+    //
+    // `resumed` means a previous attempt left an unfinished conversation and
+    // this one continued it; `fresh` means the journal had nothing to continue
+    // (no entries, or a closed one) and the run paid for its first turn. The
+    // pair is one reading because the count of resumes alone cannot be read:
+    // five resumes in a day is a healthy rolling deploy if there were five
+    // attempts and a runaway restart loop if there were five thousand, and
+    // which one it is decides whether anyone should be woken.
+    ATTEMPT_RESUME_TOTAL => "cogneva_attempt_resume_total",
+    // Tool calls a resumed attempt found without a result, labelled by the
+    // side-effect class the journal decides them by.
+    //
+    // This is the "at most one step lost" claim in its measurable form. A
+    // resume plan with no doubt lost nothing; a plan with doubts names exactly
+    // the calls that were interrupted, and their class decides what the resume
+    // does with them -- replay a read, replay a write that refuses a stale
+    // anchor, or hand an external effect back to the model. Counting them by
+    // class is what tells a rollout that cost nothing from one that cost an
+    // external action.
+    ATTEMPT_UNRESOLVED_CALLS_TOTAL => "cogneva_attempt_unresolved_calls_total",
+
     // cog-orchestrator -- what the backup account holds, folded into one series
     // by `readout`.
     //

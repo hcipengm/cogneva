@@ -3981,6 +3981,26 @@ data:
                   "severity": "warning",
                   "summary": "能力 {capability} 的上一份判词已经比它自己声明的节拍旧了两倍以上：判定循环还在被登记、没有记录成死亡，但它已经连着两轮以上没交出结论。这条补的是循环存活读数看不见的那一半——循环心跳只看它有没有醒来，而一次醒着却卡在判定里（读数据库挂了、上游不答）同样能让判词停在那里不动，两种坏法的第一步处置不同。界不写在规则里，是两条读数算出来的：`verdict_age` 减两倍 `cadence`，能力改节拍时判据跟着动，不会留下一处需要人去它对。两倍而不是一倍：稳态下年龄本来就从 0 长到一拍，按一拍当界会让每个健康的能力在自己的节拍末尾都红了。十分钟保持跨过一次抓取抖动。",
                   "face": "落地≠生效"
+                },
+                {
+                  "name": "shutdown_drain_left_attempts_behind",
+                  "promql": "max without (pod, container, instance) (increase(cogneva_shutdown_drain_abandoned_total[30m]))",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "{value} agent attempt(s) were still in flight when a shutdown ran out of its drain budget in the last half hour. A drain is supposed to cost nothing: the run is stopped at a turn boundary with its tool results already written, and the next dispatch continues from the journal without re-buying anything. This counter is the case where that did not happen -- the process exited while runs were still mid-step, and each of those attempts is now resumed from its journal at the cost of whatever the interrupted call was doing. It is read here rather than off the drain histogram because the histogram says how long the wait was and this says what it bought: a drain that times out with nothing left lost nothing, and a drain that times out with three runs going handed three attempts to their journals, while the log line for both reads the same. Read it beside cogneva_shutdown_drain_seconds{outcome=\"timeout\"} on the panel: the pair separates a budget that is merely short from a workload whose turns have grown longer than any budget would cover. The repair is at both ends of the pair the budget belongs to -- shutdown.drainBudgetMs and terminationGracePeriodSeconds -- because a budget raised past the grace only moves which half does the killing. The counter is seeded at zero on every shutdown, so a window with no abandonment reads as zero rather than as an absent series.",
+                  "face": "资源泄漏与长稳"
+                },
+                {
+                  "name": "attempt_resumed_with_external_effects",
+                  "promql": "max by (effect) (increase(cogneva_attempt_unresolved_calls_total{effect=\"external\"}[30m]))",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "{value} tool call(s) were found with no result when a resumed attempt read its journal, and their side-effect class is external -- the one class the resume will not replay. A hard kill in the middle of such a call leaves its outcome unknowable from inside the platform: the journal proves the call started and nothing proves whether it finished, so the resume hands the doubt to the model instead of running it twice. That is the design working, which is why this is a warning and not a page -- but it is also the only reading that prices a kill at anything above a retried call, and a rollout that keeps landing here is a workload whose external calls outlast its grace period. Only the external cell is alerted because the other two are replayed automatically and their cost is one extra call; they are on the panel beside this rule. A raise here with no shutdown in the window names a SIGKILL rather than a drain -- an OOM, a node eviction -- and the pod's own log is the only place that case is still visible. No threshold above zero is declared: one unresolved external call is already an outcome nobody knows.",
+                  "face": "任务管理"
                 }
               ]
             },

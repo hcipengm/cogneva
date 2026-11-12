@@ -254,6 +254,23 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
         MetricDerivation::Process,
     ),
     ("cogneva_notification_sign_total", MetricDerivation::Process),
+    // 关停排空与尝试续跑：四个数都是**每个进程自己数自己的**。一次关停只有
+    // 一个进程经历，一次尝试只有一个进程跑，因此两台各自的 3 与 5 加起来是
+    // 8 件发生过的事，而不是同一件事的两次渲染。`sum` 就是这里的答案；面板
+    // 上的「一小时内几次」正是这么读的。
+    (
+        "cogneva_shutdown_drain_abandoned_total",
+        MetricDerivation::Process,
+    ),
+    (
+        "cogneva_shutdown_drain_undeclared_total",
+        MetricDerivation::Process,
+    ),
+    ("cogneva_attempt_resume_total", MetricDerivation::Process),
+    (
+        "cogneva_attempt_unresolved_calls_total",
+        MetricDerivation::Process,
+    ),
     (
         "cogneva_registry_prune_failures_total",
         MetricDerivation::Process,

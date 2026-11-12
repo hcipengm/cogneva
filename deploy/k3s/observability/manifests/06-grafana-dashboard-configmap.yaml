@@ -3595,6 +3595,100 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 85,
+          "title": "Shutdown Drain: How Long, and What It Bought",
+          "description": "Every shutdown that had a drain budget reports three things here, and they are one reading because the log line they replace says the same sentence either way. The quantile says how long the wait for in-flight runs took; it is a histogram and not a mean because the number the budget should be set from is the slow tail, and a rollout that took ninety seconds is the observation that matters. The abandoned counter says what the wait bought: zero means every run reached a turn boundary before the process exited, while a value above zero means that many attempts were handed to their journals mid-step. The undeclared counter is a separate series rather than a zero-second observation on the histogram, because a process that never drained and one that drained instantly are opposite facts; it counts shutdowns that found no budget at all. Read them together: a rising q95 with a flat abandoned count is a budget that is short but still doing its job, while an abandoned count that moves at all is the drain not finishing. The histogram is absent until the first shutdown, which is a deployment that has not been rolled rather than a quiet one.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 392
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(cogneva_shutdown_drain_seconds_bucket[1h])))",
+              "legendFormat": "q95 drain seconds",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(increase(cogneva_shutdown_drain_abandoned_total[1h]))",
+              "legendFormat": "attempts left in flight (1h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(increase(cogneva_shutdown_drain_undeclared_total[1h]))",
+              "legendFormat": "shutdowns with no budget (1h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 86,
+          "title": "Attempts: Continued from the Journal, or Started Fresh",
+          "description": "How each attempt opened, and what the kill left behind. The two `outcome` cells of the resume counter are one reading because either alone is ambiguous: five resumes in a day is a healthy rolling deploy out of five attempts and a restart loop out of five thousand, so the share is what says which -- read the resumed line over the sum of both. The unresolved-calls counter is the measurable form of the promise that a hard kill costs at most one step: every increment names a tool call whose result the next attempt could not find, split by the side-effect class the resume treats differently -- `read` and `write` are replayed, `external` is handed back to the model and is the only one of the three that can cost an action nobody can undo. A resumed attempt with no unresolved calls lost nothing; that is the ordinary case for a notified stop. Both families are counters written per attempt in the process that runs it, so the lines move with the work rather than with the scrape, and a flat line beside a live run count is a deployment whose attempts are always starting fresh -- either a journal that is not configured or a workload that is never interrupted, and the attempt count on the panels above is what tells the two apart.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 400
+          },
+          "targets": [
+            {
+              "expr": "sum(increase(cogneva_attempt_resume_total[1h]))",
+              "legendFormat": "attempts (1h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum by (outcome) (increase(cogneva_attempt_resume_total[1h]))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum by (effect) (increase(cogneva_attempt_unresolved_calls_total[1h]))",
+              "legendFormat": "unresolved: {{effect}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
