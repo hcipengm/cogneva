@@ -820,6 +820,15 @@ crate_sources_uncommitted() {
 # 两个不一致的数——而收尾那把内容键本来就会让这一跑不记账，那时这两个数谁也不对。
 uncommitted_crate_sources="$(crate_sources_uncommitted)"
 
+# 数一次，两格共用。空表数出来是 0，不是 1：`printf '%s\n' ""` 仍然输出一个空行，
+# `wc -l` 于是报 1，干净树上那句「其中 1 份还没提交」就是这么印出来的（2026-11-12
+# 实测：Test 表头印了 1，同一刻 `git status --porcelain` 是空的）。这句话的用处正是
+# 让人看出「判的比这一推多」，数错就把一份干净的字节说成有脏改动。
+uncommitted_crate_count=0
+if [ -n "${uncommitted_crate_sources}" ]; then
+    uncommitted_crate_count="$(printf '%s\n' "${uncommitted_crate_sources}" | wc -l | tr -d ' ')"
+fi
+
 # Clippy 那一格在 CI 里是整份 workspace 的 `--all-targets -- -D warnings`，红一格就判整轮
 # 四十分钟为红。它的红只值一行：2026-10-30 一次 `let mut` 的 `unused_mut` 就这样烧掉了一轮，
 # 而本机此前一条读数都看不见它——脚本末尾那句「未覆盖」里写着 Clippy。
@@ -856,12 +865,12 @@ if [ -n "${cargo_bin}" ]; then
                 skip_step "Clippy" "crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Clippy 会整份跑）"
             fi
         done
-        if [ "${crate_count}" -gt 0 ] && [ -n "${uncommitted_crate_sources}" ]; then
+        if [ "${crate_count}" -gt 0 ] && [ "${uncommitted_crate_count}" -gt 0 ]; then
             # 树脏时就地判：临时树里放不下脏树的改动，而末尾盖的戳是盘上这份字节。
             # 判一份没人要推的字节、再把结论记到这份字节头上，等于用一个别的树的
             # 结论替这棵树背书。与 Test 那一格同一取舍：多判别人的在飞改动是不绿得
             # 过头，不是假绿。
-            echo "== Clippy：这次动过 ${crate_count} 个 crate 的源码（其中 $(printf '%s\n' "${uncommitted_crate_sources}" | wc -l | tr -d ' ') 份还没提交），判的是工作树"
+            echo "== Clippy：这次动过 ${crate_count} 个 crate 的源码（其中 ${uncommitted_crate_count} 份还没提交），判的是工作树"
             judge_worktree_clippy() {
                 build_slot_run "clippy ${clippy_args[*]}" \
                     "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings
@@ -938,7 +947,7 @@ if [ -n "${cargo_bin}" ]; then
             # 这条腿要站在每一次推送前面，代价必须留在分钟级（本机实测整条 Test 腿
             # 4m41s，其中测试本身 133s）。判的因而是**工作树**：树上有未提交改动时，
             # 它测的比这一推多。多测不会假绿，只是可能替别人的改动红一次。
-            echo "== Test：这次动过 ${test_count} 个 crate 的源码（其中 $(printf '%s\n' "${uncommitted_crate_sources}" | wc -l | tr -d ' ') 份还没提交），判的是工作树，外加装配件 cogneva"
+            echo "== Test：这次动过 ${test_count} 个 crate 的源码（其中 ${uncommitted_crate_count} 份还没提交），判的是工作树，外加装配件 cogneva"
             judge_head_tests() {
                 build_slot_run "cargo test ${test_args[*]}" \
                     "${cargo_bin}" test "${test_args[@]}" --no-fail-fast
