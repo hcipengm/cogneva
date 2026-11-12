@@ -15,7 +15,7 @@ use crate::common;
 use common::root::repo_root;
 use common::rust_production::{production_sources, relative_name};
 
-use cog_agent::observable::{AgentObservable, CeilingSource, RunDecision, RunOutcome};
+use cog_agent::observable::{AgentObservable, CeilingSource, RunCost, RunDecision, RunOutcome};
 use cog_core::roles;
 
 /// 这一批运行不关心声明来源；上限的来源随每轮的种子在运行时决定，
@@ -27,26 +27,40 @@ const UNDECLARED: RunDecision = RunDecision {
 
 /// 同一批运行，两个标签，两个上限必须相同。
 ///
-/// 两个 observable 收到的是同样六次交付（9 轮），唯一差别是记在哪个角色名下。
-/// 按角色存样本时这会读出两个不同的天花板——同一件活换个人接，上限就换了。
+/// 两个 observable 收到的是同样六次交付（9 轮），由同一个员工交给两个不同的
+/// 角色名。按角色存样本时这会读出两个不同的天花板——同一件活换个标签接，上限
+/// 就换了。样本按员工存：标签只落在读数上，不进这条推导。
 #[test]
 fn the_same_runs_under_two_labels_yield_the_same_ceiling() {
     let under_planner = AgentObservable::new();
     let under_generator = AgentObservable::new();
     for _ in 0..6 {
-        under_planner.record_run(roles::PLANNER, RunOutcome::Delivered, 9, 20, 4, UNDECLARED);
+        under_planner.record_run(
+            "employee-1",
+            roles::PLANNER,
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 9,
+                steps: 20,
+                tool_calls: 4,
+            },
+            UNDECLARED,
+        );
         under_generator.record_run(
+            "employee-1",
             roles::GENERATOR,
             RunOutcome::Delivered,
-            9,
-            20,
-            4,
+            RunCost {
+                iterations: 9,
+                steps: 20,
+                tool_calls: 4,
+            },
             UNDECLARED,
         );
     }
 
-    let planner = under_planner.iteration_budget_for(u32::MAX);
-    let generator = under_generator.iteration_budget_for(u32::MAX);
+    let planner = under_planner.iteration_budget_for(u32::MAX, "employee-1");
+    let generator = under_generator.iteration_budget_for(u32::MAX, "employee-1");
     assert_eq!(
         planner, generator,
         "同一件活换一个标签接，上限必须一样：planner 读到 {planner}，generator 读到 {generator}"
@@ -54,6 +68,55 @@ fn the_same_runs_under_two_labels_yield_the_same_ceiling() {
     assert!(
         planner > 9,
         "六次 9 轮的交付给出的上限要容得下它们：{planner}"
+    );
+}
+
+/// 反过来也必须成立：同一个标签下，两个人带着不同的交卷记录，读到不同的上限。
+///
+/// 前一条挡的是「标签换了，天花板跟着换」；这一条挡的是另一个坏法——上限按进程
+/// 算一个数喂给所有人，于是这个人交过什么与他无关。待遇的三样决定者里，「接手
+/// 这个人的实测交卷数据」只有按人读才指得出来。第三个人还没有自己的记录，读
+/// 这个进程的，来源在读数上分得开（`measured_process`）。
+#[test]
+fn two_employees_in_one_process_read_their_own_records() {
+    let observable = AgentObservable::new();
+    for _ in 0..6 {
+        observable.record_run(
+            "quick-hand",
+            roles::GENERATOR,
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 4,
+                steps: 20,
+                tool_calls: 4,
+            },
+            UNDECLARED,
+        );
+        observable.record_run(
+            "deep-hand",
+            roles::GENERATOR,
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 40,
+                steps: 200,
+                tool_calls: 40,
+            },
+            UNDECLARED,
+        );
+    }
+
+    let quick = observable.iteration_budget_decision_for(u32::MAX, "quick-hand");
+    let deep = observable.iteration_budget_decision_for(u32::MAX, "deep-hand");
+    assert_eq!(quick.0, 8, "六次 4 轮的交付：4 + 4");
+    assert_eq!(deep.0, 80, "六次 40 轮的交付：40 + 40");
+    assert_eq!(quick.1, CeilingSource::MeasuredOwn);
+    assert_eq!(deep.1, CeilingSource::MeasuredOwn);
+
+    let newcomer = observable.iteration_budget_decision_for(u32::MAX, "newcomer");
+    assert_eq!(
+        newcomer.1,
+        CeilingSource::MeasuredProcess,
+        "还没有自己的交卷记录，先用这个进程的，来源上要分得开"
     );
 }
 

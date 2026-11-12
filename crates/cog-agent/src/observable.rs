@@ -34,17 +34,27 @@ pub struct AgentObservable {
     /// would grow without bound.
     role_calibrations: Arc<Mutex<HashMap<String, RoleCalibration>>>,
     /// Iterations consumed by the most recent runs that delivered on their own,
-    /// in one sample for the whole process.
+    /// one window for the process and one for each employee.
     ///
-    /// One bucket and not one per role: a role is a free label on the roster and
-    /// every worker in a pool takes every kind of work, so the label no longer
-    /// predicts how long the next piece of work runs. Splitting one pool's
-    /// sample by label only makes each window shorter — under ten samples the
-    /// percentile is the maximum, so a split sample admits one outlier — and it
-    /// lets the same work run under two different ceilings depending on which
-    /// name was written on the worker. What this measures is how long the work
-    /// this process does takes.
+    /// The treatment rule is that a piece of work is treated by what it declares,
+    /// by the measured delivery record of the person taking it, and by the
+    /// operator's explicit override — so the person's own finished runs answer
+    /// first. The process window stays as the fallback for an employee with no
+    /// record of its own: a new hire has none, and reading that as `unmeasured`
+    /// would hand every first run no ceiling at all.
+    ///
+    /// The two windows stay distinguishable in the reading (`measured_own` /
+    /// `measured_process`): "measured from this person" and "measured from the
+    /// process" are different claims, and a single `measured` label would make
+    /// them look the same.
+    ///
+    /// Neither is keyed by role: a role is a free label on the roster, and the
+    /// same work must not run under a different ceiling because a different name
+    /// was written on the worker. The per-employee map is bounded by the live
+    /// roster — [`Self::publish_roster`] drops the windows of employees that are
+    /// no longer there — so employee churn cannot grow it without bound.
     delivered_iterations: Arc<Mutex<VecDeque<u32>>>,
+    delivered_iterations_by_agent: Arc<Mutex<HashMap<String, VecDeque<u32>>>>,
     /// The agents the manager currently holds, one entry per live object.
     ///
     /// Published by the manager on every change and read at scrape time, so the
@@ -213,6 +223,13 @@ fn lifetime_label(task_scoped: bool) -> &'static str {
 /// One live agent as the manager holds it.
 #[derive(Clone)]
 struct RosterEntry {
+    /// The employee this object is, not the label on it.
+    ///
+    /// Carried so the budget sample can be pruned to the employees that are
+    /// still here. Without it the per-employee windows would outlive every
+    /// employee that ever ran, and a long-lived process would accumulate one
+    /// window per name it has ever seen.
+    agent_id: String,
     role: String,
     created_at: std::time::Instant,
     /// Whether this object is scoped to a task or lives as long as the process.
@@ -329,29 +346,47 @@ impl RunOutcome {
 
 /// 这一轮跑的轮次上限是谁给的。
 ///
-/// 只有两个来源能定它——操作者在配置面上钉的数，和这个进程自己跑出来的交卷
-/// 读数——外加一格表示两边都没有。三格分开，是因为「量到就是这么多」与「量不到」
-/// 在读数里必须分得开：上限停在某个数上时，读者要能说出是实测给的，还是没人钉、
-/// 也没有一条样本，于是这一轮根本没有上限。
+/// 操作者在配置面上钉的数、接手这个人自己的交卷读数、这个人还没有自己的读数时
+/// 这个进程的交卷读数，三样各成一格；外加一格表示三边都没有。分开不是为了好看：
+/// 「量到的是这个人的」与「量到的是这个进程的，而这个人还没有」是两个不同的结论，
+/// 而「量不到」是第三个。上限停在某个数上时，读者要能说出它是哪一样给的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CeilingSource {
     /// 操作者钉在配置面上的数。实测读数只报它绑不绑，不改它。
     Operated,
-    /// 没人钉数，这个进程最近的交卷轮次给出的值。
-    Measured,
+    /// 没人钉数，接手这个人自己的交卷运行给出的值。
+    MeasuredOwn,
+    /// 没人钉数，这个人还没有自己的交卷样本；这个进程的交卷运行给出的值。
+    MeasuredProcess,
     /// 没人钉数，这个进程也还没有一条交卷样本：量不到，所以这一轮无上限。
     Unmeasured,
 }
 
 impl CeilingSource {
-    /// 读数标签上的那一个字。
+    /// 读数标签上的那个词。
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Operated => "operated",
-            Self::Measured => "measured",
+            Self::MeasuredOwn => "measured_own",
+            Self::MeasuredProcess => "measured_process",
             Self::Unmeasured => "unmeasured",
         }
     }
+}
+
+/// 一轮运行跑完之后的代价，三项都是读数直接要用的量。
+///
+/// 打成一个值而不是三个位置参数：它们一起进 [`AgentObservable::record_run`]，
+/// 一起决定「这一轮值多少」；逐项摆出来时，多一个读数项就多一个参数，而漏传
+/// 一项在编译期看不见——结构体字段少一项就会在解构处响。
+#[derive(Debug, Clone, Copy)]
+pub struct RunCost {
+    /// 上限与实测窗口使用的单位：轮数。
+    pub iterations: u32,
+    /// 助手回合数。
+    pub steps: usize,
+    /// 工具调用次数。
+    pub tool_calls: usize,
 }
 
 /// 一轮运行跑完之后要记下的「待遇由谁决定」。
@@ -411,7 +446,8 @@ impl AgentObservable {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = memory_fraction;
     }
 
-    /// Replace the published roster with `entries` (role, creation instant).
+    /// Replace the published roster with `entries`
+    /// (agent id, role, creation instant, task scoped).
     ///
     /// Replaced wholesale rather than incremented on create and on retire: a
     /// reader comparing a count that was incremented and decremented on two
@@ -419,13 +455,18 @@ impl AgentObservable {
     /// failed to decrement looks exactly like a path that never ran. Publishing
     /// the list makes the manager the single owner of the truth and the scrape
     /// a plain view of it.
+    ///
+    /// The same publish is what bounds the per-employee budget windows: the
+    /// roster is the set of employees that are still here, so a window for an id
+    /// the roster no longer names is a window nothing can ever read again.
     pub fn publish_roster(
         &self,
-        entries: impl IntoIterator<Item = (String, std::time::Instant, bool)>,
+        entries: impl IntoIterator<Item = (String, String, std::time::Instant, bool)>,
     ) {
         let next: Vec<RosterEntry> = entries
             .into_iter()
-            .map(|(role, created_at, task_scoped)| RosterEntry {
+            .map(|(agent_id, role, created_at, task_scoped)| RosterEntry {
+                agent_id,
                 role,
                 created_at,
                 task_scoped,
@@ -439,6 +480,15 @@ impl AgentObservable {
             for entry in &next {
                 roles.insert((entry.role.clone(), entry.task_scoped), ());
             }
+        }
+        {
+            let live: std::collections::HashSet<&str> =
+                next.iter().map(|entry| entry.agent_id.as_str()).collect();
+            let mut samples = self
+                .delivered_iterations_by_agent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            samples.retain(|agent, _| live.contains(agent.as_str()));
         }
         *self
             .roster
@@ -522,19 +572,19 @@ impl AgentObservable {
 
     /// Record a high-level agent run (called by AgentRuntime::run).
     ///
-    /// `role` labels the ending counts only. The budget sample is the process's
-    /// own, because a label no longer predicts the work: a run counted under a
+    /// `agent` is the employee that ran; the window kept under its id is what the
+    /// next run of the same employee starts its ceiling from. `role` labels the
+    /// ending counts only: a role is a free label, and a run counted under a
     /// different name must not land in a different window from the same run
-    /// counted under this one. `iterations` is in the same unit the ceiling is
-    /// expressed in — not `steps`, which counts assistant turns and would
+    /// counted under this one. `cost.iterations` is in the same unit the ceiling
+    /// is expressed in — not `steps`, which counts assistant turns and would
     /// silently rescale every reading it fed.
     pub fn record_run(
         &self,
+        agent: &str,
         role: &str,
         outcome: RunOutcome,
-        iterations: u32,
-        steps: usize,
-        tool_calls: usize,
+        cost: RunCost,
         decision: RunDecision,
     ) {
         self.run_count.fetch_add(1, Ordering::Relaxed);
@@ -555,19 +605,30 @@ impl AgentObservable {
         if outcome.delivered() {
             self.success_count.fetch_add(1, Ordering::Relaxed);
         }
-        self.total_steps.fetch_add(steps as u64, Ordering::Relaxed);
+        self.total_steps
+            .fetch_add(cost.steps as u64, Ordering::Relaxed);
         self.total_tool_calls
-            .fetch_add(tool_calls as u64, Ordering::Relaxed);
+            .fetch_add(cost.tool_calls as u64, Ordering::Relaxed);
 
         if outcome == RunOutcome::Delivered {
-            let mut sample = self
-                .delivered_iterations
+            {
+                let mut sample = self
+                    .delivered_iterations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                push_bounded(&mut sample, cost.iterations);
+            }
+            // The employee's own window is the one its next ceiling reads first.
+            // Kept per id (not per role) so a different person taking the same
+            // work starts from their own record, not from the previous holder's.
+            let mut windows = self
+                .delivered_iterations_by_agent
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if sample.len() == BUDGET_SAMPLE_WINDOW {
-                sample.pop_front();
-            }
-            sample.push_back(iterations);
+            push_bounded(
+                windows.entry(agent.to_string()).or_default(),
+                cost.iterations,
+            );
         }
 
         let mut calibrations = self
@@ -658,20 +719,25 @@ impl AgentObservable {
     /// on its first ralph iteration (60 of 60 over 14 days). The spend was
     /// going to retries that never turned into deliveries, and the only number
     /// anyone had measured was never consulted.
-    pub fn iteration_budget_for(&self, seed: u32) -> u32 {
-        self.iteration_budget_decision_for(seed).0
+    pub fn iteration_budget_for(&self, seed: u32, agent: &str) -> u32 {
+        self.iteration_budget_decision_for(seed, agent).0
     }
 
     /// 同上，并交出「这个数是谁给的」。
     ///
     /// 与 [`Self::iteration_budget_for`] 是同一次判断，不是两次：分两处各算一遍，
     /// 读数上标的来源与实际用的上限迟早会各自演化，而这一对读数存在的意义正是
-    /// 让读者能指出「这一轮的上限是量出来的还是钉死的」。
+    /// 让读者能指出「这一轮的上限是谁给的」。
     ///
-    /// `Unmeasured` 不是第三来源，是两边都没有：没人钉数，这个进程也还没有一条
-    /// 交卷样本。此时返回的上限就是那个「没人说」的记号，这一轮无上限——读数上
+    /// 三个来源按顺序问：操作者钉的数（`operated`），接手这个人自己的交卷运行
+    /// （`measured_own`），这才进场的人还没有自己的样本时退回这个进程的
+    /// （`measured_process`）。退到进程样本这一步不改变「待遇跟着人走」：自己的
+    /// 样本一出现，下一轮就换成它。
+    ///
+    /// `Unmeasured` 不是第四个来源，是三个人都没有：没人钉数，这个进程也还没有
+    /// 一条交卷样本。此时返回的上限就是那个「没人说」的记号，这一轮无上限——读数上
     /// 必须能与「实测给出 u32::MAX」分开，后者不可能发生，但前者必须看得见。
-    pub fn iteration_budget_decision_for(&self, seed: u32) -> (u32, CeilingSource) {
+    pub fn iteration_budget_decision_for(&self, seed: u32, agent: &str) -> (u32, CeilingSource) {
         // Any value other than `u32::MAX` is the operator's own decision for this
         // deployment and stands as written. It used to be raised whenever the
         // measurement was larger, back when the seed could also arrive from a
@@ -683,6 +749,17 @@ impl AgentObservable {
         if seed != u32::MAX {
             return (seed, CeilingSource::Operated);
         }
+        let own = {
+            let windows = self
+                .delivered_iterations_by_agent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            windows.get(agent).cloned()
+        };
+        if let Some(own) = own.filter(|window| !window.is_empty()) {
+            let sample: Vec<u32> = own.into_iter().collect();
+            return (calibrated_ceiling(sample), CeilingSource::MeasuredOwn);
+        }
         let sample = self
             .delivered_iterations
             .lock()
@@ -690,16 +767,27 @@ impl AgentObservable {
         if sample.is_empty() {
             return (seed, CeilingSource::Unmeasured);
         }
-        let mut sample: Vec<u32> = sample.iter().copied().collect();
-        let admitted = ninetieth_percentile(&mut sample);
-        let sum: u32 = sample.iter().sum();
-        let typical = sum.div_ceil(sample.len() as u32);
-        let calibrated = admitted.saturating_add(typical);
-        // `u32::MAX` is the seed's spelling of "nobody stated a ceiling", not a
-        // ceiling of four billion turns. Taking the max against it discards the
-        // only measured number, so the calibration answers instead.
-        (calibrated, CeilingSource::Measured)
+        let sample: Vec<u32> = sample.iter().copied().collect();
+        (calibrated_ceiling(sample), CeilingSource::MeasuredProcess)
     }
+}
+
+/// Push `value` into `window`, dropping the oldest entry once it is full.
+fn push_bounded(window: &mut VecDeque<u32>, value: u32) {
+    if window.len() == BUDGET_SAMPLE_WINDOW {
+        window.pop_front();
+    }
+    window.push_back(value);
+}
+
+/// The ceiling a sample of delivered runs supports: the ninetieth percentile
+/// (how long this work usually takes) plus one typical run (the mean, room for
+/// work slightly harder than anything seen). Both terms move with the sample.
+fn calibrated_ceiling(mut sample: Vec<u32>) -> u32 {
+    let admitted = ninetieth_percentile(&mut sample);
+    let sum: u32 = sample.iter().sum();
+    let typical = sum.div_ceil(sample.len() as u32);
+    admitted.saturating_add(typical)
 }
 
 /// The ninetieth percentile of a sample of delivered run lengths, nearest rank.
@@ -1030,27 +1118,42 @@ mod tests {
             ceiling,
         };
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::Delivered,
-            4,
-            9,
-            3,
-            decided(cog_core::DeclarationState::Stated, CeilingSource::Measured),
+            RunCost {
+                iterations: 4,
+                steps: 9,
+                tool_calls: 3,
+            },
+            decided(
+                cog_core::DeclarationState::Stated,
+                CeilingSource::MeasuredOwn,
+            ),
         );
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::Delivered,
-            4,
-            9,
-            3,
-            decided(cog_core::DeclarationState::Stated, CeilingSource::Measured),
+            RunCost {
+                iterations: 4,
+                steps: 9,
+                tool_calls: 3,
+            },
+            decided(
+                cog_core::DeclarationState::Stated,
+                CeilingSource::MeasuredOwn,
+            ),
         );
         o.record_run(
+            "employee-1",
             "evaluator",
             RunOutcome::BudgetExhausted,
-            10,
-            12,
-            2,
+            RunCost {
+                iterations: 10,
+                steps: 12,
+                tool_calls: 2,
+            },
             decided(
                 cog_core::DeclarationState::Unstated,
                 CeilingSource::Unmeasured,
@@ -1071,7 +1174,7 @@ mod tests {
         assert_eq!(declarations.get("unstated"), Some(&1.0), "{declarations:?}");
 
         let ceilings = by_label("agent_runs_by_ceiling", crate::LABEL_CEILING_SOURCE);
-        assert_eq!(ceilings.get("measured"), Some(&2.0), "{ceilings:?}");
+        assert_eq!(ceilings.get("measured_own"), Some(&2.0), "{ceilings:?}");
         assert_eq!(ceilings.get("unmeasured"), Some(&1.0), "{ceilings:?}");
 
         let runs = metrics
@@ -1094,32 +1197,40 @@ mod tests {
     fn an_empty_sample_with_no_stated_ceiling_reads_as_unmeasured() {
         let o = AgentObservable::new();
         assert_eq!(
-            o.iteration_budget_decision_for(u32::MAX),
+            o.iteration_budget_decision_for(u32::MAX, "employee-1"),
             (u32::MAX, CeilingSource::Unmeasured)
         );
         assert_eq!(
-            o.iteration_budget_decision_for(25),
+            o.iteration_budget_decision_for(25, "employee-1"),
             (25, CeilingSource::Operated)
         );
 
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::Delivered,
-            6,
-            9,
-            3,
+            RunCost {
+                iterations: 6,
+                steps: 9,
+                tool_calls: 3,
+            },
             RunDecision {
                 declaration: cog_core::DeclarationState::Unstated,
                 ceiling: CeilingSource::Unmeasured,
             },
         );
-        let (value, source) = o.iteration_budget_decision_for(u32::MAX);
-        assert_eq!(source, CeilingSource::Measured);
+        let (value, source) = o.iteration_budget_decision_for(u32::MAX, "employee-1");
+        assert_eq!(source, CeilingSource::MeasuredOwn);
         assert!(value > 6, "实测给出的上限要容得下交过的那一轮：{value}");
+
+        // 同一个进程里另一个还没有自己样本的员工，读到的是进程样本，来源分得开。
+        let (inherited, inherited_source) = o.iteration_budget_decision_for(u32::MAX, "employee-2");
+        assert_eq!(inherited_source, CeilingSource::MeasuredProcess);
+        assert_eq!(inherited, value, "自己的样本还没有时，先用这个进程的读数");
 
         // 钉了数就还是钉的数，有样本也一样。
         assert_eq!(
-            o.iteration_budget_decision_for(25),
+            o.iteration_budget_decision_for(25, "employee-1"),
             (25, CeilingSource::Operated)
         );
     }
@@ -1151,8 +1262,13 @@ mod tests {
     async fn an_emptied_role_is_written_as_zero_rather_than_left_out() {
         let o = AgentObservable::new();
         let now = std::time::Instant::now();
-        o.publish_roster(vec![("planner".to_string(), now, true)]);
-        o.publish_roster(Vec::<(String, std::time::Instant, bool)>::new());
+        o.publish_roster(vec![(
+            "planner-1".to_string(),
+            "planner".to_string(),
+            now,
+            true,
+        )]);
+        o.publish_roster(Vec::<(String, String, std::time::Instant, bool)>::new());
 
         let metrics = o.collect_metrics("").await.expect("collect_metrics");
         let count = metrics
@@ -1183,8 +1299,13 @@ mod tests {
         let o = AgentObservable::new();
         let now = std::time::Instant::now();
         o.publish_roster(vec![
-            ("planner".to_string(), now, true),
-            ("mode_selector".to_string(), now, false),
+            ("planner-1".to_string(), "planner".to_string(), now, true),
+            (
+                "mode-selector".to_string(),
+                "mode_selector".to_string(),
+                now,
+                false,
+            ),
         ]);
 
         let metrics = o.collect_metrics("").await.expect("collect_metrics");
@@ -1220,9 +1341,14 @@ mod tests {
         let now = std::time::Instant::now();
         let long_lived = now - std::time::Duration::from_secs(30);
         o.publish_roster(vec![
-            ("planner".to_string(), now, true),
-            ("planner".to_string(), now, true),
-            ("planner".to_string(), long_lived, false),
+            ("planner-1".to_string(), "planner".to_string(), now, true),
+            ("planner-2".to_string(), "planner".to_string(), now, true),
+            (
+                "planner-3".to_string(),
+                "planner".to_string(),
+                long_lived,
+                false,
+            ),
         ]);
 
         let metrics = o.collect_metrics("").await.expect("collect_metrics");
@@ -1345,11 +1471,14 @@ mod tests {
         let o = AgentObservable::new();
         o.note_budget_exhausted("generator");
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::BudgetExhausted,
-            10,
-            21,
-            12,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
             RunDecision::no_declaration(),
         );
 
@@ -1370,11 +1499,14 @@ mod tests {
         let o = AgentObservable::new();
         o.note_budget_exhausted("generator");
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::DeliveredAfterExhaustion,
-            11,
-            21,
-            12,
+            RunCost {
+                iterations: 11,
+                steps: 21,
+                tool_calls: 12,
+            },
             RunDecision::no_declaration(),
         );
 
@@ -1391,15 +1523,18 @@ mod tests {
         let o = AgentObservable::new();
         o.note_budget_exhausted("generator");
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::DeliveredAfterExhaustion,
-            11,
-            21,
-            12,
+            RunCost {
+                iterations: 11,
+                steps: 21,
+                tool_calls: 12,
+            },
             RunDecision::no_declaration(),
         );
         assert_eq!(
-            o.iteration_budget_for(10),
+            o.iteration_budget_for(10, "employee-1"),
             10,
             "在上限处被截断的运行，不能是「上限太低」的证据"
         );
@@ -1409,11 +1544,14 @@ mod tests {
     async fn a_run_that_delivered_an_answer_is_counted_as_a_success() {
         let o = AgentObservable::new();
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::Delivered,
-            3,
-            7,
-            2,
+            RunCost {
+                iterations: 3,
+                steps: 7,
+                tool_calls: 2,
+            },
             RunDecision::no_declaration(),
         );
 
@@ -1428,17 +1566,20 @@ mod tests {
     #[test]
     fn a_pool_with_no_completed_run_keeps_the_seed_budget() {
         let o = AgentObservable::new();
-        assert_eq!(o.iteration_budget_for(10), 10);
+        assert_eq!(o.iteration_budget_for(10, "employee-1"), 10);
         // 只有被截断的运行也不是"跑完过"的证据：它没交卷，也就没说需要多少轮。
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::BudgetExhausted,
-            10,
-            21,
-            12,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
             RunDecision::no_declaration(),
         );
-        assert_eq!(o.iteration_budget_for(10), 10);
+        assert_eq!(o.iteration_budget_for(10, "employee-1"), 10);
     }
 
     /// 调用方没写上限时（`u32::MAX` 就是"这里没写天花板"的拼法），标定不能被它
@@ -1449,26 +1590,29 @@ mod tests {
         let o = AgentObservable::new();
         for _ in 0..4 {
             o.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::Delivered,
-                12,
-                21,
-                12,
+                RunCost {
+                    iterations: 12,
+                    steps: 21,
+                    tool_calls: 12,
+                },
                 RunDecision::no_declaration(),
             );
         }
         // 最长 12 + 均值 12。
         assert_eq!(
-            o.iteration_budget_for(u32::MAX),
+            o.iteration_budget_for(u32::MAX, "employee-1"),
             24,
             "没写上限不等于不要上限：测到的那一份就是上限"
         );
         // 写下的数照原样用，写大了也一样。
-        assert_eq!(o.iteration_budget_for(40), 40);
+        assert_eq!(o.iteration_budget_for(40, "employee-1"), 40);
         // 写小了也照原样用：这个数现在是操作者对本部署的决定，不是某一行的
         // 数。标定只在没有人写过上限的时候回答。上限绑得太紧由「撞墙」那条
         // 读数说，不靠标定悄悄改写一个人的决定。
-        assert_eq!(o.iteration_budget_for(3), 3);
+        assert_eq!(o.iteration_budget_for(3, "employee-1"), 3);
     }
 
     /// 一次都没交付过的时候，没写上限就仍然是没有上限：这时没有测到任何数，
@@ -1476,16 +1620,19 @@ mod tests {
     #[test]
     fn an_unstated_ceiling_stays_unstated_until_something_is_measured() {
         let o = AgentObservable::new();
-        assert_eq!(o.iteration_budget_for(u32::MAX), u32::MAX);
+        assert_eq!(o.iteration_budget_for(u32::MAX, "employee-1"), u32::MAX);
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::BudgetExhausted,
-            10,
-            21,
-            12,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
             RunDecision::no_declaration(),
         );
-        assert_eq!(o.iteration_budget_for(u32::MAX), u32::MAX);
+        assert_eq!(o.iteration_budget_for(u32::MAX, "employee-1"), u32::MAX);
     }
 
     /// 上限必须容得下这个进程**已经交付过**的轮数，否则它不是安全线而是缺陷：
@@ -1496,15 +1643,18 @@ mod tests {
         let o = AgentObservable::new();
         for iterations in [6, 8] {
             o.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::Delivered,
-                iterations,
-                20,
-                5,
+                RunCost {
+                    iterations,
+                    steps: 20,
+                    tool_calls: 5,
+                },
                 RunDecision::no_declaration(),
             );
         }
-        let budget = o.iteration_budget_for(u32::MAX);
+        let budget = o.iteration_budget_for(u32::MAX, "employee-1");
         assert!(
             budget > 8,
             "the ceiling must clear the longest completed run: {budget}"
@@ -1523,23 +1673,29 @@ mod tests {
         let o = AgentObservable::new();
         for _ in 0..18 {
             o.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::Delivered,
-                5,
-                20,
-                4,
+                RunCost {
+                    iterations: 5,
+                    steps: 20,
+                    tool_calls: 4,
+                },
                 RunDecision::no_declaration(),
             );
         }
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::Delivered,
-            169,
-            20,
-            4,
+            RunCost {
+                iterations: 169,
+                steps: 20,
+                tool_calls: 4,
+            },
             RunDecision::no_declaration(),
         );
-        let budget = o.iteration_budget_for(u32::MAX);
+        let budget = o.iteration_budget_for(u32::MAX, "employee-1");
         assert!(
             budget < 60,
             "an outlier must not become every run's ceiling: {budget}"
@@ -1553,72 +1709,205 @@ mod tests {
     /// 同一批运行，换一个标签写进去，读出来的上限是同一个数。
     ///
     /// 这是「换一个标签接，行为不变」在预算这一面上的量法：两个 observable 收
-    /// 到的是同样四次交付（20 轮），只是记在 `generator` 与 `evaluator` 两个名字
-    /// 下。以前上限按角色存，这两个数会分叉——一个名字接手同一件活，天花板就
-    /// 换了；现在样本是进程的，标签只落在读数上。
+    /// 到的是同样四次交付（20 轮），都由同一个员工交，只是记在 `generator` 与
+    /// `evaluator` 两个名字下。以前上限按角色存，这两个数会分叉——一个名字接手
+    /// 同一件活，天花板就换了；现在样本按员工存，标签只落在读数上。
     #[test]
     fn a_different_label_does_not_move_the_ceiling() {
         let labeled_generator = AgentObservable::new();
         let labeled_evaluator = AgentObservable::new();
         for _ in 0..4 {
             labeled_generator.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::Delivered,
-                20,
-                40,
-                8,
+                RunCost {
+                    iterations: 20,
+                    steps: 40,
+                    tool_calls: 8,
+                },
                 RunDecision::no_declaration(),
             );
             labeled_evaluator.record_run(
+                "employee-1",
                 "evaluator",
                 RunOutcome::Delivered,
-                20,
-                40,
-                8,
+                RunCost {
+                    iterations: 20,
+                    steps: 40,
+                    tool_calls: 8,
+                },
                 RunDecision::no_declaration(),
             );
         }
         assert_eq!(
-            labeled_generator.iteration_budget_for(u32::MAX),
-            labeled_evaluator.iteration_budget_for(u32::MAX),
+            labeled_generator.iteration_budget_for(u32::MAX, "employee-1"),
+            labeled_evaluator.iteration_budget_for(u32::MAX, "employee-1"),
             "同一个进程同样的运行，标签不同，预算必须相同"
         );
         assert!(
-            labeled_generator.iteration_budget_for(u32::MAX) > 20,
+            labeled_generator.iteration_budget_for(u32::MAX, "employee-1") > 20,
             "四次 20 轮的交付给出的是一个容得下它们的数，换个标签也一样"
         );
     }
 
-    /// 一个标签下的运行，也确实是同一个样本的一部分：同一个 observable 里两种
-    /// 标签交卷的轮数一起算，不因为名字不同就分进两个窗口各算各的。
+    /// 一个员工名下的运行，不因标签不同就分进两个窗口：同一个 observable 里
+    /// 同一个人换着标签交卷，轮数一起算。分窗口的那个键是员工，不是标签。
     #[test]
     fn runs_under_two_labels_share_one_sample() {
         let o = AgentObservable::new();
         for _ in 0..4 {
             o.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::Delivered,
-                6,
-                20,
-                5,
+                RunCost {
+                    iterations: 6,
+                    steps: 20,
+                    tool_calls: 5,
+                },
                 RunDecision::no_declaration(),
             );
         }
-        let one_label = o.iteration_budget_for(u32::MAX);
+        let one_label = o.iteration_budget_for(u32::MAX, "employee-1");
         for _ in 0..4 {
             o.record_run(
+                "employee-1",
                 "evaluator",
                 RunOutcome::Delivered,
-                30,
-                20,
-                5,
+                RunCost {
+                    iterations: 30,
+                    steps: 20,
+                    tool_calls: 5,
+                },
                 RunDecision::no_declaration(),
             );
         }
-        let two_labels = o.iteration_budget_for(u32::MAX);
+        let two_labels = o.iteration_budget_for(u32::MAX, "employee-1");
         assert!(
             two_labels > one_label,
             "第二次记录必须落进同一个窗口并把它抬起来：{one_label} -> {two_labels}"
+        );
+    }
+
+    /// 待遇跟着人走：同一个进程里两个人交出不同形状的活，各自的上限就各自不同；
+    /// 第三个还没有自己样本的人先读进程的，读数上标得出来，等他交出第一轮就换。
+    ///
+    /// 「同一个座位换个人坐，待遇跟着变」在这里是反过来的：同一个座位（同一种活、
+    /// 同一个标签）换个人坐，他带的是自己那份交卷记录，不继承前任的。
+    #[test]
+    fn each_employee_brings_their_own_record_to_the_same_seat() {
+        let o = AgentObservable::new();
+        for _ in 0..6 {
+            o.record_run(
+                "quick-hand",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 4,
+                    steps: 20,
+                    tool_calls: 5,
+                },
+                RunDecision::no_declaration(),
+            );
+            o.record_run(
+                "deep-hand",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 40,
+                    steps: 200,
+                    tool_calls: 40,
+                },
+                RunDecision::no_declaration(),
+            );
+        }
+
+        let (quick, quick_source) = o.iteration_budget_decision_for(u32::MAX, "quick-hand");
+        let (deep, deep_source) = o.iteration_budget_decision_for(u32::MAX, "deep-hand");
+        assert_eq!(quick_source, CeilingSource::MeasuredOwn);
+        assert_eq!(deep_source, CeilingSource::MeasuredOwn);
+        assert_eq!(quick, 8, "六次 4 轮的交付：4 + 4");
+        assert_eq!(deep, 80, "六次 40 轮的交付：40 + 40");
+
+        // 新来的人坐同一个座位：先读进程的，来源是 measured_process。
+        let (inherited, inherited_source) = o.iteration_budget_decision_for(u32::MAX, "newcomer");
+        assert_eq!(inherited_source, CeilingSource::MeasuredProcess);
+        assert_eq!(
+            inherited,
+            40 + 22,
+            "进程窗口里两位都在：40 轮的第 90 百分位 + 22 的平均"
+        );
+
+        // 他交出第一轮之后，读的就是自己的了。
+        o.record_run(
+            "newcomer",
+            "generator",
+            RunOutcome::Delivered,
+            RunCost {
+                iterations: 6,
+                steps: 20,
+                tool_calls: 4,
+            },
+            RunDecision::no_declaration(),
+        );
+        let (own_now, own_source) = o.iteration_budget_decision_for(u32::MAX, "newcomer");
+        assert_eq!(own_source, CeilingSource::MeasuredOwn);
+        assert_eq!(own_now, 12, "自己那条 6 轮：6 + 6");
+    }
+
+    /// 员工走了，他的窗口跟着走：名册是唯一还认得这个 id 的地方，名册里没有他
+    /// 了，这份窗口就再也没有读者——留着它只会让同一个 id 再出现时继承一段
+    /// 已经不属于任何人的历史。
+    #[test]
+    fn an_employee_that_leaves_the_roster_takes_their_window_with_them() {
+        let o = AgentObservable::new();
+        let now = std::time::Instant::now();
+        o.publish_roster(vec![
+            ("departing".to_string(), "generator".to_string(), now, true),
+            ("staying".to_string(), "generator".to_string(), now, true),
+        ]);
+        for _ in 0..4 {
+            o.record_run(
+                "departing",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 40,
+                    steps: 20,
+                    tool_calls: 4,
+                },
+                RunDecision::no_declaration(),
+            );
+            o.record_run(
+                "staying",
+                "generator",
+                RunOutcome::Delivered,
+                RunCost {
+                    iterations: 4,
+                    steps: 20,
+                    tool_calls: 4,
+                },
+                RunDecision::no_declaration(),
+            );
+        }
+        assert_eq!(o.iteration_budget_for(u32::MAX, "departing"), 80);
+
+        o.publish_roster(vec![(
+            "staying".to_string(),
+            "generator".to_string(),
+            now,
+            true,
+        )]);
+        assert_eq!(
+            o.iteration_budget_decision_for(u32::MAX, "departing").1,
+            CeilingSource::MeasuredProcess,
+            "走了的人还剩进程样本可读，但不是他自己的那一份了"
+        );
+        assert_eq!(
+            o.iteration_budget_decision_for(u32::MAX, "staying").1,
+            CeilingSource::MeasuredOwn,
+            "还在名册上的人，自己的窗口不受影响"
         );
     }
 
@@ -1629,17 +1918,20 @@ mod tests {
         let o = AgentObservable::new();
         for _ in 0..(BUDGET_SAMPLE_WINDOW + 10) {
             o.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::Delivered,
-                40,
-                80,
-                8,
+                RunCost {
+                    iterations: 40,
+                    steps: 80,
+                    tool_calls: 8,
+                },
                 RunDecision::no_declaration(),
             );
         }
         // 40 * (window + 10) 如果全留下会把均值抬到 40，上限就成 80 了。
         assert_eq!(
-            o.iteration_budget_for(u32::MAX),
+            o.iteration_budget_for(u32::MAX, "employee-1"),
             40 + 40,
             "the ceiling must be derived from the retained window, not the whole history"
         );
@@ -1652,15 +1944,18 @@ mod tests {
         let o = AgentObservable::new();
         for _ in 0..50 {
             o.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::BudgetExhausted,
-                10,
-                21,
-                12,
+                RunCost {
+                    iterations: 10,
+                    steps: 21,
+                    tool_calls: 12,
+                },
                 RunDecision::no_declaration(),
             );
         }
-        assert_eq!(o.iteration_budget_for(10), 10);
+        assert_eq!(o.iteration_budget_for(10, "employee-1"), 10);
     }
 
     /// 每个角色的截断次数要能被读到：上限是不是在绑住某条路径，是这次改动
@@ -1672,20 +1967,26 @@ mod tests {
         for _ in 0..2 {
             o.note_budget_exhausted("generator");
             o.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::BudgetExhausted,
-                10,
-                21,
-                12,
+                RunCost {
+                    iterations: 10,
+                    steps: 21,
+                    tool_calls: 12,
+                },
                 RunDecision::no_declaration(),
             );
         }
         o.record_run(
+            "employee-1",
             "evaluator",
             RunOutcome::Delivered,
-            3,
-            7,
-            2,
+            RunCost {
+                iterations: 3,
+                steps: 7,
+                tool_calls: 2,
+            },
             RunDecision::no_declaration(),
         );
 
@@ -1717,21 +2018,27 @@ mod tests {
         for _ in 0..2 {
             o.note_budget_exhausted("generator");
             o.record_run(
+                "employee-1",
                 "generator",
                 RunOutcome::BudgetExhausted,
-                10,
-                21,
-                12,
+                RunCost {
+                    iterations: 10,
+                    steps: 21,
+                    tool_calls: 12,
+                },
                 RunDecision::no_declaration(),
             );
         }
         o.note_budget_exhausted("generator");
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::DeliveredAfterExhaustion,
-            10,
-            21,
-            12,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
             RunDecision::no_declaration(),
         );
 
@@ -1762,37 +2069,49 @@ mod tests {
     async fn a_run_stopped_by_a_rule_is_counted_per_role_under_its_own_name() {
         let o = AgentObservable::new();
         o.record_run(
+            "employee-1",
             "writer",
             RunOutcome::Refused,
-            2,
-            3,
-            2,
+            RunCost {
+                iterations: 2,
+                steps: 3,
+                tool_calls: 2,
+            },
             RunDecision::no_declaration(),
         );
         o.record_run(
+            "employee-1",
             "writer",
             RunOutcome::Refused,
-            2,
-            3,
-            2,
+            RunCost {
+                iterations: 2,
+                steps: 3,
+                tool_calls: 2,
+            },
             RunDecision::no_declaration(),
         );
         o.record_run(
+            "employee-1",
             "planner",
             RunOutcome::Delivered,
-            4,
-            9,
-            3,
+            RunCost {
+                iterations: 4,
+                steps: 9,
+                tool_calls: 3,
+            },
             RunDecision::no_declaration(),
         );
         // A budget ending must not land on this series: the two are different
         // findings and a reader that cannot separate them cannot act on either.
         o.record_run(
+            "employee-1",
             "planner",
             RunOutcome::BudgetExhausted,
-            10,
-            21,
-            12,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
             RunDecision::no_declaration(),
         );
 
@@ -1821,19 +2140,25 @@ mod tests {
     async fn the_published_set_is_exactly_the_cumulative_counters() {
         let o = AgentObservable::new();
         o.record_run(
+            "employee-1",
             "generator",
             RunOutcome::Delivered,
-            3,
-            7,
-            2,
+            RunCost {
+                iterations: 3,
+                steps: 7,
+                tool_calls: 2,
+            },
             RunDecision::no_declaration(),
         );
         o.record_run(
+            "employee-1",
             "evaluator",
             RunOutcome::BudgetExhausted,
-            10,
-            21,
-            12,
+            RunCost {
+                iterations: 10,
+                steps: 21,
+                tool_calls: 12,
+            },
             RunDecision::no_declaration(),
         );
 

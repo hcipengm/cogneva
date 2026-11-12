@@ -217,7 +217,14 @@ impl GlobalAgentManager {
             observer.publish_roster(
                 workers
                     .iter()
-                    .map(|w| (w.role.clone(), w.created_at, w.task_id.is_some()))
+                    .map(|w| {
+                        (
+                            w.agent_id.clone(),
+                            w.role.clone(),
+                            w.created_at,
+                            w.task_id.is_some(),
+                        )
+                    })
                     .collect::<Vec<_>>(),
             );
         }

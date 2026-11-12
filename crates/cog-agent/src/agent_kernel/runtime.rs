@@ -1096,13 +1096,14 @@ impl AgentRuntime {
         event_tx: mpsc::Sender<AgentEvent>,
         observable: &crate::observable::AgentObservable,
     ) -> Self {
-        // 轮次上限只有两个来源：操作者在配置面上钉的数（覆盖），和这个进程自己
-        // 跑出来的读数（实测）。技能行不是第三个——那一行按角色名分发，同一件活
-        // 换个标签接手就换一个天花板，而那正是「标签决定行为」。写成「没写就取
-        // 10」同样不行：2026-11-05 实测 generator 在第十轮带着一个没跑完的工具
-        // 调用被砍，下一轮从头再来，同一条 CI 红修了六版。
+        // 轮次上限只有两个来源：操作者在配置面上钉的数（覆盖），和实测出来的
+        // 读数（接手这个人自己的交卷运行，还没有时才取这个进程的）。技能行不是
+        // 第三个——那一行按角色名分发，同一件活换个标签接手就换一个天花板，而那
+        // 正是「标签决定行为」。写成「没写就取 10」同样不行：2026-11-05 实测
+        // generator 在第十轮带着一个没跑完的工具调用被砍，下一轮从头再来，同一条
+        // CI 红修了六版。
         let (ceiling, ceiling_source) =
-            observable.iteration_budget_decision_for(config.max_iterations);
+            observable.iteration_budget_decision_for(config.max_iterations, &config.agent_id);
         config.max_iterations = ceiling;
 
         let context = ContextWindow::new(config.context_window_size);
@@ -1898,11 +1899,14 @@ impl AgentRuntime {
         let steps = self.steps.len();
         let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
         crate::observable::global_observable().record_run(
+            &self.config.agent_id,
             &self.config.role,
             outcome,
-            iterations,
-            steps,
-            tool_calls,
+            crate::observable::RunCost {
+                iterations,
+                steps,
+                tool_calls,
+            },
             crate::observable::RunDecision {
                 declaration: self.config.deliverable_state,
                 ceiling: self.ceiling_source,
@@ -4518,16 +4522,20 @@ mod tests {
     /// 轮的工作量，而它要裁的恰恰是"还要不要接着干"。
     ///
     /// 样本按进程收，不按角色：同一件活换个标签接手，读到的必须是同一个数。
+    /// 这个员工自己还没有交卷样本，所以它读到的是进程样本。
     #[test]
     fn the_iteration_budget_follows_the_runs_this_process_delivered() {
         let observable = crate::observable::AgentObservable::new();
         for iterations in [6u32, 8] {
             observable.record_run(
+                "someone-else",
                 "budget-calibrated-test",
                 crate::observable::RunOutcome::Delivered,
-                iterations,
-                20,
-                5,
+                crate::observable::RunCost {
+                    iterations,
+                    steps: 20,
+                    tool_calls: 5,
+                },
                 crate::observable::RunDecision {
                     declaration: cog_core::DeclarationState::Unstated,
                     ceiling: crate::observable::CeilingSource::Unmeasured,
@@ -4536,6 +4544,7 @@ mod tests {
         }
 
         let config = RuntimeConfig {
+            agent_id: "a-new-employee".into(),
             role: "budget-calibrated-test".into(),
             // 没人写过上限：只有这时标定才回答。
             max_iterations: u32::MAX,
