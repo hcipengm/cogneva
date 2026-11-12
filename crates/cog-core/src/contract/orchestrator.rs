@@ -410,6 +410,17 @@ pub trait DagExecutor: Send + Sync {
     /// All tasks currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
 
+    /// All tasks currently in the graph, with a read that failed reported as
+    /// such. The reason is [`OrchestratorControl::get_all_tasks_checked`]'s:
+    /// [`Self::get_all_tasks`] answers an empty graph when the store is down,
+    /// and a reading built on it prints "0 tasks" -- the one number a reader
+    /// cannot question. The default folds `get_all_tasks`, which is honest for
+    /// an executor holding its graph in memory; one backed by a store has to
+    /// override this, and until it does the fold is the same silent zero.
+    async fn all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_all_tasks().await)
+    }
+
     /// The tasks that carry a venue label, and only those.
     ///
     /// Same answer as filtering [`Self::get_all_tasks`] by
