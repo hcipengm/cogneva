@@ -45,6 +45,7 @@ pub const STANDING_VENUES: &[&str] = &["memory", "wiki", "eval"];
 ///
 /// 取一整天而不是「全部历史」：场地是每天在动的，从建库第一天起累加出来的
 /// 字节数只会单调上涨，涨到后面就不再回答「今天这一栏有多活跃」。
+// cap: bound — 场地按天在动；取一整天才能回答「今天这一栏有多活跃」，全部历史只会单调上涨
 pub const WRITE_BACK_WINDOW: Duration = Duration::hours(24);
 
 /// 一个场地在这一次读数里的三行。

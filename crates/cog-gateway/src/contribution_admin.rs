@@ -74,6 +74,7 @@ pub const GITEE_TOKEN_REFRESHER_LOOP: &str = "gateway_gitee_token_refresher";
 
 /// Gitee OAuth states are single-use and expire quickly: the user is mid-flow
 /// in another tab, anything older than this is abandoned.
+// cap: bound — the user is mid-flow in another tab; anything older than this is an abandoned flow
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// A generated Ed25519 keypair in OpenSSH formats.

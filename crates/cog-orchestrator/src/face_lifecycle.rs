@@ -39,6 +39,7 @@ use cog_core::{BlockCensus, ChangeBlock, OrchestratorControl, PersistedAlert, Ta
 /// are one per face per day, so a day is the period this account already has an
 /// answer for. A face whose last row moved inside that period may simply not
 /// have been written to yet today.
+// cap: bound — the account is projected into a day file with one goal per face per day, so a day is the period it already answers for
 pub const FACE_RETIRE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The goal id for one day's "name a face for the unclaimed work".

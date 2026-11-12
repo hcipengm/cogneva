@@ -19,6 +19,7 @@ use std::time::Duration;
 // whose message this sweeper is no longer going to deliver. Defined once in
 // cog-core so the two cannot drift into a pair that publishes a duplicate while
 // the first copy is still on its way.
+// cap: fixed — 1000 is the seconds-to-milliseconds conversion, not a dial; the window itself is DEFAULT_READY_CLAIM_IDLE_SECS
 const PENDING_IDLE_MS: u64 = cog_core::config::DEFAULT_READY_CLAIM_IDLE_SECS * 1000;
 // cap: bound — sweeper poll period; PENDING_IDLE_MS is the claim threshold, this only sets how late a stuck message is seen
 const CLAIM_INTERVAL: Duration = Duration::from_secs(60);

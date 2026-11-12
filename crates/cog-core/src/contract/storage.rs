@@ -1460,9 +1460,11 @@ pub struct TierPolicy {
 }
 
 /// 默认热层保留 7 天：最近一周的原始流是排障与评测最常回看的那一段。
+// cap: bound — 最近一周的原始流是排障与评测最常回看的那一段；这是一次回看窗口的取舍，不是测量
 const DEFAULT_HOT_DURATION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// 默认温层保留 90 天：超过一个季度的事件已经属于归档，但仍要能查。
+// cap: bound — 一个季度之后的事件属于归档但仍要能查；这是分层策略的取舍，不是测量
 const DEFAULT_WARM_DURATION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// 默认每小时扫一次分层：分层是按时间的判据，密到分钟级只会重复搬同一批对象。

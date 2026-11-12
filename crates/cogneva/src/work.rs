@@ -1120,6 +1120,7 @@ async fn next(
 /// how long its owner had been quiet, and "quiet for ten minutes" and "never
 /// registered" would both arrive as the same missing key. Keep the record past
 /// that window and let the rule read a timestamp.
+// cap: bound — the record must outlive the idle window the rule reads; 1.5 windows is past that window with room for one renewal
 const UNIT_PRESENCE_TTL_SECS: u64 = cog_core::OWNER_IDLE_AFTER_SECS as u64 * 3 / 2;
 
 /// Record that this unit is alive, under the name its faces name it by.
@@ -1161,6 +1162,7 @@ async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Bo
 /// Half of [`UNIT_PRESENCE_TTL_SECS`], so one missed renewal still leaves the
 /// record standing: a unit that is listening is alive whatever its queue looks
 /// like, and the face readings ask the registry rather than the queue.
+// cap: bound — half the record TTL, so one missed renewal still leaves the record standing
 const INBOX_PRESENCE_RENEWAL: Duration = Duration::from_secs(UNIT_PRESENCE_TTL_SECS / 2);
 
 /// Read the messages other agents sent this unit, and acknowledge them.

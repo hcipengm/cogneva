@@ -2059,6 +2059,7 @@ pub const BUILD_GATE_ASKER_UNNAMED: &str = "unnamed";
 
 /// How many asks the refusal counter publishes per wall: the named works and
 /// the unnamed one.
+// cap: fixed — one cell per named asker plus the unnamed one; the +1 is that cell, not a dial
 const ASKER_CELLS: usize = BUILD_GATE_ASKERS.len() + 1;
 
 /// The cell an ask is counted in, in the order [`BUILD_GATE_ASKERS`] lists the

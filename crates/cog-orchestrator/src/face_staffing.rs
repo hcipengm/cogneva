@@ -74,6 +74,7 @@ pub const FACE_HOLDER_ROLE: &str = cog_core::roles::EXTERNAL_WORKER;
 /// single window would move faces during the key's own lifetime -- turning a
 /// restart into a handover. Two windows is past the expiry with room for one
 /// missed renewal on top.
+// cap: bound — the presence key outlives the last heartbeat by 1.5 idle windows; two windows clears that expiry and one missed renewal
 pub const STAFFING_GRACE_SECS: i64 = OWNER_IDLE_AFTER_SECS * 2;
 
 /// Why the pass withdrew a draft it had opened.

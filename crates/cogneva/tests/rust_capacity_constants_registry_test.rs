@@ -48,7 +48,7 @@
 //! `DEFAULT_SEARCH_RESULTS`, `CHARS_PER_ESTIMATED_TOKEN`). A number a
 //! deployment's behaviour depends on does not become harmless because its name
 //! does not contain `LIMIT`. So the population is now every `const` of a numeric
-//! type or `Duration` whose initializer starts with a digit, and the judgement
+//! type or `Duration` whose initializer holds a typed digit, and the judgement
 //! that a given one is not a dial belongs in the `cap:` word, where it is read
 //! by a person, rather than in a name filter, where it is made by a string
 //! match.
@@ -105,15 +105,18 @@ struct Row {
     note: String,
 }
 
-/// Every `const NAME: <numeric type> = <initializer starting with a digit>;`
+/// Every `const NAME: <numeric type> = <initializer holding a written number>;`
 /// in `files`.
 ///
-/// Deliberately syntactic. A number computed from other constants at compile
-/// time (`const SIXTY: u64 = SECS * 60;`) is not a written number and is not an
-/// entry; `const LIMIT: u64 = 4096 * 1024;` is, because the 4096 is typed in and
-/// no measurement will move it. The initializer's first character is the whole
-/// test -- parsing expressions would mean half-reading them, and a half-read
-/// expression in a registry reads as a decision.
+/// What counts is a typed digit, not the shape of the expression around it.
+/// `const LIMIT: u64 = 4096 * 1024;` is two typed digits and no measurement,
+/// and so is `const HALF: u64 = WINDOW * 3 / 2;`. Reading only the initializer's
+/// first character put the second shape outside both registers: the census
+/// skipped it, and the use-site scan skips declarations, so the 3 and the 2 had
+/// no row anywhere. Dropping the identifiers first and asking whether a digit is
+/// left is still syntactic -- no expression is parsed -- and an initializer made
+/// only of names (`const SAME: u64 = OTHER;`) holds no number of its own and
+/// stays out.
 ///
 /// The population is the caller's: shipping sources, and a fixture's numbers
 /// are the fixture's business. This used to decide that for itself by keeping
@@ -296,6 +299,63 @@ fn strip_qualified(text: &str) -> &str {
     }
 }
 
+/// Whether the initializer opens with a number, sign included.
+fn opens_with_a_number(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('-') | Some('+') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+/// A cadence spelled as a single integer inside a unit constructor:
+/// `Duration::from_secs(120)` reads as `120s`.
+///
+/// Arithmetic inside the parens is not read here; it answers the same question
+/// as arithmetic anywhere else, in [`holds_a_written_number`].
+fn duration_literal(value: &str) -> Option<String> {
+    ["secs", "millis", "hours", "mins"].iter().find_map(|u| {
+        let inner = value
+            .strip_prefix(&format!("Duration::from_{u}("))?
+            .strip_suffix(')')?
+            .trim();
+        let literal = inner
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '_')
+            .then(|| inner.to_string())?;
+        let suffix = match *u {
+            "secs" => "s",
+            "millis" => "ms",
+            "hours" => "h",
+            _ => "m",
+        };
+        Some(format!("{literal}{suffix}"))
+    })
+}
+
+/// Whether the initializer types a number anywhere, not only in front.
+///
+/// Identifiers are skipped whole, so the digits in `WINDOW_SECS_2` are part of
+/// a name and not a literal; what is left is literals and punctuation, and one
+/// digit in it is a number a person wrote.
+fn holds_a_written_number(value: &str) -> bool {
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_alphabetic() || c == '_' {
+            while chars
+                .peek()
+                .is_some_and(|n| n.is_ascii_alphanumeric() || *n == '_')
+            {
+                chars.next();
+            }
+        } else if c.is_ascii_digit() {
+            return true;
+        }
+    }
+    false
+}
+
 fn parse_const(line: &str, file: &str) -> Option<Row> {
     let line = line.trim_start();
     let line = match line.strip_prefix("pub(") {
@@ -327,16 +387,13 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
     let value = value.strip_suffix(';')?.trim();
     let value = strip_qualified(value);
     let value = match ty {
-        // Any initializer that starts with a number is a written number,
+        // Any initializer that holds a written digit is a written number,
         // arithmetic included: `4096 * 1024` is two typed digits and no
-        // measurement, and calling it "computed" is what let the class hide.
+        // measurement, and so is `SECS * 3 / 2`. Calling the second shape
+        // "computed" is what let the multiplier hide.
         "u64" | "u32" | "u16" | "u8" | "usize" | "u128" | "i64" | "i32" | "i16" | "i8" | "i128"
         | "f64" | "f32" => {
-            let mut chars = value.chars();
-            let first = chars.next()?;
-            let numeric = first.is_ascii_digit()
-                || ((first == '-' || first == '+') && chars.next()?.is_ascii_digit());
-            if !numeric {
+            if !opens_with_a_number(value) && !holds_a_written_number(value) {
                 return None;
             }
             value.to_string()
@@ -344,23 +401,14 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
         // A cadence written as `Duration::from_secs(120)` is the same kind of
         // number as `120` in a `u64`, and reading only the integers left the
         // most common spelling of a period outside the registry altogether.
-        "Duration" => ["secs", "millis", "hours", "mins"].iter().find_map(|u| {
-            let inner = value
-                .strip_prefix(&format!("Duration::from_{u}("))?
-                .strip_suffix(')')?
-                .trim();
-            let literal = inner
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == '_')
-                .then(|| inner.to_string())?;
-            let suffix = match *u {
-                "secs" => "s",
-                "millis" => "ms",
-                "hours" => "h",
-                _ => "m",
-            };
-            Some(format!("{literal}{suffix}"))
-        })?,
+        // The arithmetic and unit spellings (`from_secs(30 * 60)`,
+        // `Duration::hours(24)`) carry a typed digit too and fall through to
+        // the same question as the integers above.
+        "Duration" => match duration_literal(value) {
+            Some(literal) => literal,
+            None if holds_a_written_number(value) => value.to_string(),
+            None => return None,
+        },
         _ => return None,
     };
     Some(Row {
@@ -618,6 +666,45 @@ const PLAIN: u64 = 30;
     assert_eq!(value_of("BARE").as_deref(), Some("7s"));
     assert_eq!(value_of("QUALIFIED").as_deref(), Some("250ms"));
     assert_eq!(value_of("PLAIN").as_deref(), Some("30"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A multiplier, an offset or a unit conversion inside the initializer is a
+/// written number like a leading one, and the census has to read it.
+///
+/// Reading only the first character left `SECS * 3 / 2` in neither register:
+/// the census skipped it because it opens with a name, and the use-site scan
+/// skips declarations. The 3 and the 2 then had no row anywhere -- no reason
+/// to review, and no row to be red about. An initializer that is only a name
+/// holds no number of its own and stays out.
+#[test]
+fn a_number_inside_the_initializer_is_still_typed_in() {
+    let root = std::env::temp_dir().join(format!("cog-computed-{}", std::process::id()));
+    let src = root.join("crates/probe/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("dials.rs"),
+        r#"
+const HALF: u64 = WINDOW * 3 / 2;
+const OFFSET: Duration = Duration::from_secs(30 * 60);
+const UNITS: usize = NAMES.len() + 1;
+const SAME: u64 = OTHER;
+"#,
+    )
+    .unwrap();
+    let value_of = |name: &str| {
+        scan(&root, &sources_of_tree(&root))
+            .into_iter()
+            .find(|r| r.name == name)
+            .map(|r| r.value)
+    };
+    assert_eq!(value_of("HALF").as_deref(), Some("WINDOW * 3 / 2"));
+    assert_eq!(
+        value_of("OFFSET").as_deref(),
+        Some("Duration::from_secs(30 * 60)")
+    );
+    assert_eq!(value_of("UNITS").as_deref(), Some("NAMES.len() + 1"));
+    assert_eq!(value_of("SAME"), None);
     std::fs::remove_dir_all(&root).ok();
 }
 
