@@ -28,7 +28,6 @@ spec:
       # 让它之后每一次都不再开始——备份停掉，连「谁来给挂住那笔收尾」也一起停。
       # 判停读的是容器自己写的进度文件：一步都不推进超过窗口才判死（见容器上的
       # 存活探针）。这里曾经是 activeDeadlineSeconds——它杀的是「跑了多久」。
-      ttlSecondsAfterFinished: 86400
       template:
         metadata:
           labels:

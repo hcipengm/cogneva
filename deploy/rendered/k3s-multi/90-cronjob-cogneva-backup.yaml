@@ -25,7 +25,6 @@ spec:
       # 容器是不是还在往外写、还在导出。判停改由容器自己的存活探针做（读进度文件）：
       # 一步都不推进超过窗口才判死。`concurrencyPolicy: Forbid` 让一次挂住的运行
       # 挡住之后每一次，所以这一条必须存在——但它判的是「还在不在动」。
-      ttlSecondsAfterFinished: 86400
       template:
         metadata:
           labels:

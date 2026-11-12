@@ -46,7 +46,6 @@ spec:
       # 容器是不是还在往外写、还在导出。判停改由容器自己的存活探针做（读进度文件）：
       # 一步都不推进超过窗口才判死。`concurrencyPolicy: Forbid` 让一次挂住的运行
       # 挡住之后每一次，所以这一条必须存在——但它判的是「还在不在动」。
-      ttlSecondsAfterFinished: {{ .Values.backup.ttlSecondsAfterFinished }}
       template:
         metadata:
           labels:
@@ -321,7 +320,6 @@ spec:
       # 同备份：这里曾经是 `activeDeadlineSeconds`——它杀的是「这一趟跑了多久」，
       # 而两趟演练在某些夜晚的总时长本来就会超过任何一个固定的钟。判停改由存活
       # 探针读进度文件：一步都不推进超过窗口才判死（见容器上那一格）。
-      ttlSecondsAfterFinished: {{ .Values.backup.ttlSecondsAfterFinished }}
       template:
         metadata:
           labels:

@@ -36,7 +36,6 @@ spec:
       # 同备份：这里曾经是 `activeDeadlineSeconds`——它杀的是「这一趟跑了多久」，
       # 而两趟演练在某些夜晚的总时长本来就会超过任何一个固定的钟。判停改由存活
       # 探针读进度文件：一步都不推进超过窗口才判死（见容器上那一格）。
-      ttlSecondsAfterFinished: 86400
       template:
         metadata:
           labels:

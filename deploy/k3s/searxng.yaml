@@ -65,7 +65,6 @@ data:
       # JSON 默认不开。`web_search` 读的就是这一面——少了这行，工具每次拿回 403，
       # 错误里会点名这一项。
     search:
-      safe_search: 0
       formats:
         - html
         - json
@@ -89,7 +88,7 @@ spec:
       annotations:
         # searxng-settings 的指纹：只改配置的那次升级也必须换 Pod，否则进程仍按
         # 启动时读到的 settings.yml 跑（文件由 kubelet 就地更新，进程不会重读）。
-        checksum/config: c7199d948378f29bd252537515cfa56905d6860e1053ab4576ffe789f38d3ede
+        checksum/config: b73d81e84b48f76239b5c68c7da87d9527993e963946f090feece0b72db17eb9
       labels:
         app.kubernetes.io/name: searxng
         app.kubernetes.io/component: search

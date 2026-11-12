@@ -70,7 +70,6 @@ data:
       # JSON 默认不开。`web_search` 读的就是这一面——少了这行，工具每次拿回 403，
       # 错误里会点名这一项。
     search:
-      safe_search: 0
       formats:
         - html
         - json

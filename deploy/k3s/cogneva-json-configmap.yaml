@@ -173,13 +173,6 @@ data:
                 "symbol": "DEFAULT_RUN_DEADLINE_SECONDS",
                 "value": "3600s",
                 "why": "它**不杀任何东西**：容器的死活由备份 Job 的存活探针按进度文件判（一步都不推进超过窗口才判死）。这个数只写进账本 backup_runs 那一行，让「这一行开着但没人收尾」有一个可判的时刻——一份开着的记录如果有人被杀，只有它自己被开出来时的那个数判得了。"
-              },
-              {
-                "id": "evolution-rollout-progress-deadline",
-                "file": "deploy/helm/cogneva/templates/evolution.yaml",
-                "symbol": "progressDeadlineSeconds",
-                "value": "evolution.progressDeadlineSeconds",
-                "why": "它不杀任何东西：Deployment 控制器到点只把 `Progressing` 置成 `False`（reason `ProgressDeadlineExceeded`）并写进对象状态，Pod 照跑、滚动继续；本仓库里没有任何代码或清单拿这条状态做决定（读它的只有网关那张工作负载读数），所以它结束不了任何正在推进的工作。这个字段也无法「去掉」——不写时生效的是同一个 600 秒的 API 默认值；写出来只是让它不再是清单上看不见的数。"
               }
             ]
           },

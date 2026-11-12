@@ -155,9 +155,6 @@ backup:
   # 同一个原因，只留一份时第二晚的诊断对象已经被回收。
   successfulJobsHistoryLimit: 2
   failedJobsHistoryLimit: 3
-  # 跑完的 Job 与它的 Pod 多久后清掉（秒）：一天，够把当天的现场翻完，
-  # 又不至于让对象和日志一直攒在 etcd 里。
-  ttlSecondsAfterFinished: 86400
   # 失败重试几次：备份一次（下一晚自然再来，连着重试只会在同一个原因上撞几次），
   # 演练零次（答案已经落进 backup_drills 了，重试没有新信息）。
   backoffLimit: 1
@@ -542,15 +539,6 @@ evolution:
   # 收益是多一份排队而不是多一份吞吐。
   replicas: 1
   pollIntervalSecs: 300
-  # 滚动时控制器等多久没有进展就把这一版标成 `Progressing=False`。写在这里而不是
-  # 留给 API 的默认 600 秒：同一个数在清单上看不见的时候，读者会以为这个部署没有被
-  # 时长判过。
-  #
-  # 它**不杀任何东西**：到点控制器只写一条状态条件（reason `ProgressDeadlineExceeded`），
-  # Pod 照跑、滚动继续，本仓库里没有任何代码或清单拿这条条件做决定（读它的只有网关
-  # 那张工作负载读数屏）。这个字段也无法真正去掉——不写时生效的是同一个默认值；写
-  # 出来只是让它不再是清单上看不见的数。
-  progressDeadlineSeconds: 600
   # fail-closed 身份门禁：进化 Pod 的 Shell 类工具只接受带 DAG task 身份的
   # 调用（prompt_for_task），无身份的命令直接拒绝，不许以伪造身份进 executor。
   requireToolIdentity: true
@@ -1723,9 +1711,6 @@ webSearch:
   # 检索后端的端口：`base` 里的地址、容器端口、Service 与 egree 放行都按它取，
   # 而 base 与策略各写一个字面量时，改一处的那次查询被策略静默丢弃。
   port: 8080
-  # SearXNG 的 safe_search 档位（0 关 / 1 中等 / 2 严格）。默认关：这一层是给
-  # agent 取事实用的，过滤掉的结果在 tools 返回值里不留痕，读起来像"没有这一页"。
-  safeSearch: 0
   # 空 = 从 port 与 Service 名派生（http://searxng:<port>）。设值则整条地址由
   # 运维给——那时端口也跟着这条地址走，`port` 只再决定容器/Service/策略三处。
   # 默认不写字面量：同一个端口在一份文件里写两遍，就是两次机会让它们分家。

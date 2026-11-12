@@ -441,12 +441,6 @@ rows:
       The same count for failures, kept one higher so that two consecutive nights
       can be compared. Nothing measures how often a failure is looked at.
 
-  - key: backup.ttlSecondsAfterFinished
-    source: override
-    why: >-
-      A day before a finished Job and its Pod are collected: long enough to read
-      the day's failure, short enough not to accumulate objects. Not a reading.
-
   - key: backup.backoffLimit
     source: override
     why: >-
@@ -565,11 +559,13 @@ rows:
       push or pull pressure, so no loop moves this number.
 
   - key: clusterRegistry.port
-    source: override
+    source: fixed
     why: >-
-      The registry's service port, read by the Service, the container port, the
-      deployer's Service DNS and the network policy. A derived value would read the
-      port the registry actually bound; the process reports no such reading.
+      An address, not a size: the Service port, the container port, the deployer's
+      Service DNS and the network policy all name this one number, so it is a
+      protocol fact those four agree on. Nothing measures how large it should be --
+      a derived value would have to read the port the registry bound, and the
+      process reports no such reading.
 
   - key: clusterRegistry.nodePort
     source: fixed
@@ -673,19 +669,6 @@ rows:
       How often the self-evolution loop looks for new work. It would be derived
       from the observed arrival interval of changes; nothing records that
       interval today.
-
-  - key: evolution.progressDeadlineSeconds
-    source: override
-    why: >-
-      The controller's default, written down so it can be read: an undeclared
-      progressDeadlineSeconds is 600 seconds, and a bound nobody can see in the
-      manifest is a bound nobody can audit. It kills nothing: at the deadline the
-      controller only writes a status condition (Progressing=False, reason
-      ProgressDeadlineExceeded) and the pod keeps running; nothing in this repo
-      acts on that condition. The field cannot be removed either -- the API
-      applies the same default when it is absent. Raising the number is not the
-      repair -- reading the pod's own startup
-      progress is.
 
   - key: evolution.buildGate.maxConcurrent
     source: derived
@@ -2012,15 +1995,6 @@ rows:
     why: >-
       The render backend's port, read the same way as webSearch.port. An
       address.
-
-  - key: webSearch.safeSearch
-    source: override
-    why: >-
-      A policy, not an address: 0/1/2 is the operator's call on how much search
-      filtering this deployment wants. The default is off because a filtered
-      result leaves no trace in the tool's return value, so it reads exactly like
-      "the page does not exist". Nothing measures whether the level is right, so
-      no loop moves it.
 
   - key: ingress.proxyTimeoutSecs
     source: override

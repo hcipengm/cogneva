@@ -9,7 +9,7 @@
 # `COGNEVA_BACKUP_CRONJOB` 这个覆盖只在不改 rbac 的前提下没意义——改名要连这行一起改，
 # 否则导出的表现是「读不到备份 CronJob」，而备份本身一切正常。
 #
-# jobs 只给 get/list/create：删由 Job 自己的 ttlSecondsAfterFinished 做，导出端没有
+# jobs 只给 get/list/create：Job 的个数由 CronJob 的 history 上限封住，导出端没有
 # 任何理由去删一个正在跑或已经跑完的 Job。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

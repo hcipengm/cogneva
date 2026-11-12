@@ -24,7 +24,7 @@ spec:
         # 升级就不换 Pod——搜索面仍按旧设置跑，而渲染、parity、Pod 状态三面全绿。
         # 指纹只哈希那份配置模板（searxng-settings.yaml），与主应用那几条读主配置的
         # 工作负载不同值是正确的：它们哈希的不是同一组文档。
-        checksum/config: c7199d948378f29bd252537515cfa56905d6860e1053ab4576ffe789f38d3ede
+        checksum/config: b73d81e84b48f76239b5c68c7da87d9527993e963946f090feece0b72db17eb9
       labels:
         app.kubernetes.io/name: searxng
         app.kubernetes.io/component: search
