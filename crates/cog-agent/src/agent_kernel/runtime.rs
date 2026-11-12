@@ -7373,6 +7373,58 @@ mod tests {
         );
     }
 
+    /// 折一次调用的读数：没价目的一次不能让这一跑读成花了零，报了价目的那次要
+    /// 加进去；上下文占用取的是最近一次带进去的长度，不是累加。
+    #[test]
+    fn a_priced_call_is_counted_and_an_unpriced_one_stays_unread() {
+        let mut usage = RunUsage::default();
+        usage.add(&cog_core::Usage {
+            input: 10,
+            output: 5,
+            total_tokens: 15,
+            ..Default::default()
+        });
+        assert_eq!(usage.cost_usd, None, "算不出来的那一次不能落成 0.0");
+        assert_eq!(usage.last_prompt_tokens, 10);
+        assert_eq!(usage.llm_calls, 1);
+
+        usage.add(&cog_core::Usage {
+            input: 1000,
+            output: 500,
+            total_tokens: 1500,
+            cost: cog_core::Cost {
+                input: 0.002,
+                output: 0.001,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.003,
+            },
+            ..Default::default()
+        });
+        assert_eq!(usage.cost_usd, Some(0.003), "报了价目的那一次要算进去");
+        // 只报分量、不报 total 的上游：分量加起来也是对的钱。
+        usage.add(&cog_core::Usage {
+            input: 1,
+            output: 1,
+            total_tokens: 2,
+            cost: cog_core::Cost {
+                input: 0.001,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            ..Default::default()
+        });
+        assert_eq!(usage.cost_usd, Some(0.004), "total 缺省时按分量求和");
+        assert_eq!(usage.prompt_tokens, 1011, "累加的是总量");
+        assert_eq!(
+            usage.last_prompt_tokens, 1,
+            "上下文占用是最近一次的提示词长度，不是求和"
+        );
+        assert_eq!(usage.llm_calls, 3);
+    }
+
     /// 一段真的以 JSON 为内容的回答不会被当成壳拆掉。
     #[test]
     fn a_deliverable_is_not_mistaken_for_a_shell() {
