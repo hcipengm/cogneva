@@ -111,4 +111,21 @@ ls "${wrapgate}/runs/"*.segments >/dev/null 2>&1 \
 ls "${wrapgate}/runs/"*.running >/dev/null 2>&1 \
     && fail "被拦下的那一段还挂在 .running 上：$(ls "${wrapgate}/runs/")"
 
+# 12) 门的调用点必须问槽客户端要目录，而且点名的那个东西客户端里真的有。
+#     2026-11-12 实测：调用点写的是 `build_slot_dir`，而槽客户端里从来没有这个函数——
+#     每一跑都在 stderr 上印一行 command not found，读数一条都不落盘，门却照样给出判词。
+#     「写不进去只是少一面读数」这条宽松只适用于**目录不可用**，不适用于**名字写错**：
+#     后者在每台机器上都失败，屏上却长得像「这台机器没装集群」。所以这里钉两件：
+#     调用点用的是客户端算好的那个变量，且那个变量在客户端里真的定义着。
+slot_lib="${repo}/deploy/scripts/lib/build-slot.sh"
+[ -f "${slot_lib}" ] || fail "槽客户端不存在：${slot_lib}"
+call_site="$(grep -n 'gate_run_begin' "${gate}" | head -1)"
+printf '%s' "${call_site}" | grep -q 'build_slot_dir_path' \
+    || fail "门的调用点没问槽客户端要目录：${call_site}"
+grep -qE '^build_slot_dir_path\(\)' "${slot_lib}" \
+    || fail "调用点点名的 build_slot_dir_path 在槽客户端里没有定义"
+if grep -qE '\bbuild_slot_dir\b' "${gate}" "${slot_lib}"; then
+    fail "还有对 build_slot_dir 的调用——那个名字从未定义过"
+fi
+
 echo "ok  gate-run-record"

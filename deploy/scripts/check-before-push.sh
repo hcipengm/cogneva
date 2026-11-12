@@ -425,7 +425,7 @@ case "${run_root}" in
 # 的树、一段几秒的「编译与测」——测试的产物穿着交付读数的外衣。判据只有一处，所以这条
 # 守卫写在这里，不散在各个夹具里。
 "${TMPDIR:-/tmp}"/*) ;;
-*) run_file="$(gate_run_begin "$(build_slot_dir)" "${run_root}" gate "$(date +%s)" "$$")" ;;
+*) run_file="$(gate_run_begin "$(build_slot_dir_path)" "${run_root}" gate "$(date +%s)" "$$")" ;;
 esac
 finish_segments() {
     rm -f "${segment_log}"

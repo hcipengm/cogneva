@@ -43,6 +43,16 @@ build_slot_reserve_fresh="${COGNEVA_BUILD_RESERVE_FRESH_SECS:-900}"
 
 # A non-numeric or empty value falls back to the default rather than reaching an
 # arithmetic expansion, where it would turn a knob into a crash.
+# The directory the gate keeps its own readings in, as a value for callers.
+#
+# Callers read it through this function instead of "${build_slot_gate_dir}"
+# because shellcheck does not follow sourced files without `-x`, and a gate that
+# reads a sourced variable directly is reported as "referenced but not assigned"
+# on every run -- the same shape of false reading the variable itself is here to
+# avoid. A function is not reported, the default still lives in one place, and a
+# caller that names this function can be checked for it existing.
+build_slot_dir_path() { printf '%s' "${build_slot_gate_dir}"; }
+
 build_slot_num() { # build_slot_num <value> <default>
     case "${1:-}" in
     '' | *[!0-9]*) printf '%s' "$2" ;;
