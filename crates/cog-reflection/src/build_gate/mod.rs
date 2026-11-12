@@ -1830,11 +1830,11 @@ fn readings(
     // hit nor the works it has refused. The ask is the outer loop because the
     // wall is the older axis and its rows keep their order.
     for wall in RefusedBy::ALL {
-        for asker in 0..ASKER_CELLS {
+        for (asker, by_wall) in c.refused.iter().enumerate() {
             out.push(
                 label(RawMetric::new(
                     BUILD_GATE_REFUSED_TOTAL,
-                    c.refused[asker][wall.index()] as f64,
+                    by_wall[wall.index()] as f64,
                 ))
                 .with_label(crate::LABEL_REASON, wall.as_str().to_string())
                 .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
@@ -1845,11 +1845,11 @@ fn readings(
     // only once the counter moves would read as "this work never asked for the
     // next build" and "this work never lost its turn" the same way, and the
     // second is the one an operator has to notice.
-    for asker in 0..ASKER_CELLS {
+    for (asker, lapsed) in c.lapsed.iter().enumerate() {
         out.push(
             label(RawMetric::new(
                 BUILD_GATE_RESERVATION_LAPSED_TOTAL,
-                c.lapsed[asker] as f64,
+                *lapsed as f64,
             ))
             .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
         );
@@ -1859,11 +1859,11 @@ fn readings(
     // renewal runs at 890 seconds" and "this work never asked" the same absent
     // row. Zero is the "no renewal yet" value here, and the pair with the lapse
     // counter is what tells the two apart.
-    for asker in 0..ASKER_CELLS {
+    for (asker, gap) in c.renew_gap_seconds.iter().enumerate() {
         out.push(
             label(RawMetric::new(
                 BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS,
-                c.renew_gap_seconds[asker] as f64,
+                *gap as f64,
             ))
             .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
         );
@@ -1873,12 +1873,12 @@ fn readings(
     // counter moves would read "this walk never met a claim" and "this walk
     // never stood down" the same way, and the second is the one that says a
     // reservation was written and then ignored.
-    for asker in 0..ASKER_CELLS {
+    for (asker, by_outcome) in c.walk_yield.iter().enumerate() {
         for outcome in WalkOutcome::ALL {
             out.push(
                 label(RawMetric::new(
                     BUILD_GATE_WALK_YIELD_TOTAL,
-                    c.walk_yield[asker][outcome.index()] as f64,
+                    by_outcome[outcome.index()] as f64,
                 ))
                 .with_label(crate::LABEL_ASKER, asker_label(asker).to_string())
                 .with_label(crate::LABEL_OUTCOME, outcome.as_str().to_string()),
