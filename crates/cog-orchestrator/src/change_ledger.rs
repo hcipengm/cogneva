@@ -1608,10 +1608,11 @@ fn dispatch_priority(row: &ChangeLedgerRow) -> i32 {
     DISPATCH_TASK_PRIORITY.saturating_add(i32::from(row.priority().rank().max(blocking)))
 }
 
-/// The knob a deployment raises the batch with.
+/// The knob a deployment pins the batch with, or `0` to let the graph's
+/// batches set it.
 pub const ROWS_PER_HANDOVER_ENV: &str = "COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER";
 
-/// How many rows one hand-over carries when the deployment states no number.
+/// How many rows one hand-over carries when nothing has measured a bigger one.
 ///
 /// Not the landing cap, and not the pass's slice: the slice
 /// ([`HANDOVERS_PER_PASS`]) is how many rows a pass may *start*, and this is how
@@ -1621,41 +1622,50 @@ pub const ROWS_PER_HANDOVER_ENV: &str = "COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER
 /// whatever the task carries. So the rows are gathered until a batch is worth
 /// paying it for.
 ///
-/// Why there is a number at all rather than "as many as the project owes": the
-/// limit is the generator's, not this loop's. A batch is written as one change,
-/// so a batch past what one generation can write comes back truncated, fails
-/// the suite and costs the whole batch -- the opposite of the saving. Five is
-/// the starting point, not a boundary this code believes in: the dominant shape
-/// of the queue is one gate per row (a test, a header and a check), a few of
-/// those fit one generation with room for the reasoning that writes them, and
-/// a deployment whose model writes more raises the knob. The reading that says
-/// whether to raise it is the pass line's own `submitted` against
-/// `tasks_submitted`: batches that land whole argue for a bigger one, and a
-/// batch that keeps coming back refused argues for a smaller one.
-// cap: bound — 一批太大时生成会被截断、整批报废；这个数按一次生成装得下几条修复定，部署可抬
+/// The starting point, not a boundary this code believes in: the dominant shape
+/// of the queue is one gate per row (a test, a header and a check), and a batch
+/// of five is what one generation has been observed to write whole. Above it the
+/// bound is what the graph measured -- see [`rows_per_handover_bound`] -- and
+/// this number only stands while no batch bigger than it has completed.
+// cap: bound — 一批太大时生成会被截断、整批报废；这是「还没量到更大的批次」时用的起点，不是界本身
 const DEFAULT_ROWS_PER_HANDOVER: usize = 5;
 
-/// How many rows a batch carries this pass, from the deployment.
+/// How long a refused batch speaks about what one generation in front of us can
+/// write.
 ///
-/// `0` is refused rather than read as "no limit": a batch of zero rows is a pass
-/// that gathers forever and hands nothing over, and "unlimited" is the one value
-/// that would put the whole pending set into a single generation. A value that
-/// cannot be read falls back to the default and says so, by name -- an operator
-/// whose number was silently replaced would read the same pass line either way
-/// and conclude the knob does nothing.
-fn rows_per_handover() -> usize {
+/// A refusal is evidence about the generator that was handed the batch, and a
+/// generator is replaced (a new model, a raised output budget) without any
+/// event this loop can subscribe to. Without a window the first refusal would
+/// pin the bound below its failing size for ever; with one, a refusal ages out
+/// and the next attempt at that size is a new measurement rather than a
+/// contradiction. Thirty days is longer than a deployment's model changes and
+/// shorter than "for ever".
+// cap: bound — 退回的证据只对交出去的那个生成器有效；换模型没有事件可订阅，按这个窗口让旧证据过期
+const BATCH_REFUSAL_WINDOW_SECS: i64 = 30 * 24 * 3600;
+
+/// The batch size the deployment pinned, or `None` to derive it.
+///
+/// `0`, an empty string and an unset variable all mean "derive": the pass has a
+/// reading of its own (the graph's completed and refused batches), and a
+/// deployment that says nothing is asking it to use that reading. A positive
+/// number is a floor the deployment insists on, reported as `override` so the
+/// reading face says which of the two is in force. A value that cannot be read
+/// falls back to deriving and says so, by name -- an operator whose number was
+/// silently replaced would read the same pass line either way and conclude the
+/// knob does nothing.
+fn pinned_rows_per_handover() -> Option<usize> {
     match std::env::var(ROWS_PER_HANDOVER_ENV) {
-        Err(_) => DEFAULT_ROWS_PER_HANDOVER,
+        Err(_) => None,
         Ok(raw) => match parse_rows_per_handover(&raw) {
-            Ok(n) => n,
+            Ok(pinned) => pinned,
             Err(problem) => {
                 warn!(
                     variable = ROWS_PER_HANDOVER_ENV,
                     problem = %problem,
-                    using = DEFAULT_ROWS_PER_HANDOVER,
-                    "change ledger: the batch size could not be read; using the default"
+                    "change ledger: the pinned batch size could not be read; deriving it from \
+                     the graph's batches instead"
                 );
-                DEFAULT_ROWS_PER_HANDOVER
+                None
             }
         },
     }
@@ -1663,16 +1673,111 @@ fn rows_per_handover() -> usize {
 
 /// The batch size a value names, or what is wrong with it.
 ///
-/// Pure so the refusal of zero and of an unreadable number can be stated without
-/// the process environment: both are answers an operator needs, and a test that
-/// had to write the variable would race every other test in the binary.
-pub fn parse_rows_per_handover(raw: &str) -> Result<usize, String> {
-    match raw.trim().parse::<usize>() {
-        Ok(0) => Err(
-            "0 would gather forever and hand nothing over; leave it unset for the default".into(),
-        ),
-        Ok(n) => Ok(n),
-        Err(_) => Err(format!("`{}` is not a count of rows", raw.trim())),
+/// `Ok(None)` is the derive spelling (`0`, or empty), not a refusal: zero used
+/// to be refused because it would have meant "gather for ever", and it now
+/// means "let the measurement decide", which is the same freedom to gather and
+/// hand nothing over only if the measurement says so. Pure so the decision can
+/// be stated without the process environment: a test that had to write the
+/// variable would race every other test in the binary.
+pub fn parse_rows_per_handover(raw: &str) -> Result<Option<usize>, String> {
+    match raw.trim() {
+        "" => Ok(None),
+        other => match other.parse::<usize>() {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(format!("`{other}` is not a count of rows")),
+        },
+    }
+}
+
+/// How many rows a batch may carry, from what the graph's own batches measured.
+///
+/// One law, read from two numbers the graph already holds:
+///
+/// - the largest batch a hand-over carried to completion is the largest size
+///   one generation has proven it can write whole; the bound is one above it, so
+///   a bigger one is tried and, if it lands, becomes the new proof;
+/// - the smallest batch a generation refused (for the work's own reason, inside
+///   [`BATCH_REFUSAL_WINDOW_SECS`]) caps the bound one below that size, so a
+///   size that came back truncated is not handed the same shape again until the
+///   evidence ages out.
+///
+/// A refusal below what has already landed says nothing about size -- the
+/// proven size still works -- so only refusals above the landed proof cap the
+/// bound. With no proof at all the seed stands, and with no refusal the bound
+/// climbs one size per landing, which is the only rate the measurement supports.
+pub fn rows_per_handover_bound(
+    seed: usize,
+    landed_max: Option<usize>,
+    refused_min: Option<usize>,
+) -> usize {
+    let seed = seed.max(1);
+    let grown = landed_max.map_or(seed, |landed| seed.max(landed.saturating_add(1)));
+    let proven = landed_max.unwrap_or(0);
+    let capped = refused_min
+        .filter(|refused| *refused > proven)
+        .map(|refused| refused.saturating_sub(1));
+    capped.map_or(grown, |cap| grown.min(cap)).max(1)
+}
+
+/// The batch sizes the graph answers for: the largest a hand-over carried to
+/// completion, and the smallest one a generation refused.
+///
+/// Read off the task table the pass already holds. A hand-over of one row is
+/// not a batch and says nothing about size, so it is left out; a cancelled
+/// task is a fold or a shutdown rather than a refusal, so it is left out too.
+/// A refusal that paid to the environment is the pool's answer, not the
+/// change's -- the same split `classify_handover` makes for every other reader
+/// of this table, reused here so the bound does not shrink because an upstream
+/// was down.
+fn measured_batch_sizes(tasks: &[Task], now_unix: i64) -> (Option<usize>, Option<usize>) {
+    let mut landed_max: Option<usize> = None;
+    let mut refused_min: Option<usize> = None;
+    for task in tasks {
+        if !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_TASK_KIND) {
+            continue;
+        }
+        let carried = dispatched_identities(task).len();
+        if carried < 2 {
+            continue;
+        }
+        if task.status == TaskStatus::Completed {
+            landed_max = Some(landed_max.map_or(carried, |seen| seen.max(carried)));
+            continue;
+        }
+        if task.status != TaskStatus::Failed || classify_handover(task) != Handover::DeadWork {
+            continue;
+        }
+        let age_secs = now_unix.saturating_sub(task.updated_at.timestamp());
+        if age_secs > BATCH_REFUSAL_WINDOW_SECS {
+            continue;
+        }
+        refused_min = Some(refused_min.map_or(carried, |seen| seen.min(carried)));
+    }
+    (landed_max, refused_min)
+}
+
+/// The batch this pass carries, and which input set chose it.
+///
+/// A pinned number short-circuits the measurement: the deployment asked for
+/// that size and the graph's batches are not consulted, which is also why the
+/// evaluation counter does not move in that mode -- there is no law being
+/// evaluated. Derived mode recomputes every pass, publishes the answer even
+/// when it equals the last one, and counts the evaluation, because a bound that
+/// only publishes when it changes cannot be told apart from one whose loop
+/// stopped.
+fn batch_size_for_this_pass(
+    tasks: &[Task],
+    now_unix: i64,
+) -> (usize, &'static str) {
+    match pinned_rows_per_handover() {
+        Some(pinned) => (pinned, crate::observable::SOURCE_OVERRIDE),
+        None => {
+            let (landed_max, refused_min) = measured_batch_sizes(tasks, now_unix);
+            let bound = rows_per_handover_bound(DEFAULT_ROWS_PER_HANDOVER, landed_max, refused_min);
+            crate::observable::rows_per_handover_observable().record_evaluation();
+            (bound, crate::observable::SOURCE_DERIVED)
+        }
     }
 }
 
@@ -5622,7 +5727,14 @@ async fn dispatch_pass(
     // One task per project, holding the rows this pass would otherwise have
     // filed one at a time. Filled by the loop below, submitted after it.
     let mut batches: Vec<HandoverBatch> = Vec::new();
-    let rows_per_batch = rows_per_handover();
+    // The batch size is recomputed every pass from the graph this pass already
+    // holds -- the completed batches and the ones a generation refused -- and
+    // the answer is published whether or not it moved. A number that only
+    // reached the reading face when it changed would leave a stopped loop and a
+    // quiet graph as the same flat line.
+    let (rows_per_batch, rows_per_batch_source) = batch_size_for_this_pass(&graph_tasks, now);
+    crate::observable::rows_per_handover_observable()
+        .record(rows_per_batch, rows_per_batch_source);
     // Hand-overs this pass may take back so their rows can be batched, and how
     // many rows each project could still put in a batch -- both read off the
     // snapshot the pass already took, so neither costs a lookup.
@@ -5811,6 +5923,11 @@ async fn dispatch_pass(
             handovers_with_product = readback.products,
             handovers_unreadable = readback.unreadable,
             pool = verdict.reading.as_str(),
+            // The batch size this pass gathered at and which input set chose
+            // it, so a reader of this line can tell a pinned number from one
+            // the graph's own batches just measured.
+            rows_per_handover = rows_per_batch,
+            rows_per_handover_source = rows_per_batch_source,
             not_handed_over = %held_back_summary(&rows),
             "change ledger: handed this pass's slice of the pending set to the goal path"
         );
@@ -12520,14 +12637,87 @@ mod tests {
     /// The batch size a deployment states is read, and a value that cannot mean
     /// a batch is refused with a reason rather than quietly replaced.
     #[test]
-    fn a_batch_size_that_cannot_mean_a_batch_is_refused() {
-        assert_eq!(parse_rows_per_handover("12"), Ok(12));
-        assert_eq!(parse_rows_per_handover(" 12 "), Ok(12));
-        assert!(
-            parse_rows_per_handover("0").is_err(),
-            "0 读成「不限」或「停摆」都会把额度花光的形状藏起来"
+    fn a_batch_size_the_deployment_states_is_read_and_zero_means_derive_it() {
+        assert_eq!(parse_rows_per_handover("12"), Ok(Some(12)));
+        assert_eq!(parse_rows_per_handover(" 12 "), Ok(Some(12)));
+        assert_eq!(
+            parse_rows_per_handover("0"),
+            Ok(None),
+            "0 现在说的是「让图里的批次定」，不是「不限」：不限只由测量说出来，不由一个空串说出来"
         );
+        assert_eq!(parse_rows_per_handover(""), Ok(None));
         assert!(parse_rows_per_handover("five").is_err());
+    }
+
+    /// The bound follows the graph's own batches: one above the largest that
+    /// landed whole, and never a size a generation refused.
+    ///
+    /// Four measurements, one law. Nothing measured keeps the seed. A batch of
+    /// five landing argues for six. A six that comes back refused puts the bound
+    /// back to five -- the largest proven size -- and a refusal of four, below
+    /// what has already landed, does not shrink the proof, because five has been
+    /// observed to work and four failing says something else was wrong. With no
+    /// landing at all the seed stands for six rows.
+    #[test]
+    fn the_batch_bound_follows_the_graphs_batch_outcomes() {
+        assert_eq!(rows_per_handover_bound(5, None, None), 5);
+        assert_eq!(rows_per_handover_bound(5, Some(5), None), 6);
+        assert_eq!(rows_per_handover_bound(5, Some(5), Some(6)), 5);
+        assert_eq!(rows_per_handover_bound(5, Some(5), Some(4)), 6);
+        assert_eq!(rows_per_handover_bound(5, Some(9), Some(7)), 10);
+        assert_eq!(rows_per_handover_bound(5, None, Some(5)), 4);
+        assert_eq!(rows_per_handover_bound(5, None, Some(1)), 1);
+    }
+
+    /// The measurement reads completed batches and refused ones, and nothing
+    /// else off the task table.
+    ///
+    /// The environment refusal is the pool's answer and must not shrink the
+    /// boundary; the cancelled task is a fold or a shutdown; the one-row
+    /// hand-over is not a batch and says nothing about how many rows fit. The
+    /// old refusal is outside the window: a generator replaced since then is not
+    /// the one that failed.
+    #[test]
+    fn the_outcome_reading_counts_batches_and_ignores_everything_else() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap();
+        let at = now.timestamp();
+        let rows = |n: usize| -> Vec<ChangeLedgerRow> {
+            (0..n)
+                .map(|i| ChangeLedgerRow {
+                    identity: ChangeIdentity::new("grep", "crates/x", format!("fn row_{i}")),
+                    ..row(ChangeState::Pending, None)
+                })
+                .collect()
+        };
+        let mut tasks: Vec<Task> = Vec::new();
+        for (n, status, age_days) in [
+            (3usize, TaskStatus::Completed, 2i64),
+            (6, TaskStatus::Completed, 1),
+            (7, TaskStatus::Failed, 1),
+            (1, TaskStatus::Completed, 1),
+            (9, TaskStatus::Failed, 0),
+            (8, TaskStatus::Failed, 45),
+        ] {
+            let mut task = dispatch_task(&rows(n), 0);
+            task.status = status;
+            task.updated_at = now - chrono::Duration::days(age_days);
+            // The 7-row failure is the work's own -- a size refusal. The 9-row
+            // one is the pool's answer, which says nothing about rows per
+            // batch, so it is marked as the environment's.
+            if n == 9 {
+                task.error_cause = Some(UpstreamFailure::Auth);
+            }
+            tasks.push(task);
+        }
+        let mut cancelled = dispatch_task(&rows(4), 0);
+        cancelled.status = TaskStatus::Cancelled;
+        tasks.push(cancelled);
+
+        assert_eq!(
+            measured_batch_sizes(&tasks, at),
+            (Some(6), Some(7)),
+            "落地最大的是 6 条那批；被退回的 7 条那批记下界，9 条那批是环境拒绝、8 条那批在窗口外、4 条那批被取消、1 条那批不是批次"
+        );
     }
 
     /// A batch the account has not fully settled stays open.

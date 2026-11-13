@@ -267,7 +267,9 @@ shutdown:
   drainTeardownMarginMs: 15000
 
 gateway:
-  # 单副本：单节点集群双副本无可用性收益，只放大内存与凭证副本；多节点后调回 2
+  # 种子：运行时副本数跟着集群就绪节点数走（一节点一个、多节点两个——两个是
+  # 「任意一台可以不见」的最小集合，再多只是同一份凭证多存几份）。这个数只在
+  # 回路第一次读到节点数之前生效，之后由 `cogneva_workload_replicas` 发布实际值。
   replicas: 1
   # 主应用的五个端口。这五个数此前各写三到六遍：容器端口、Service、configmap 里的
   # env、files/cogneva.json（进程真正按它监听的那一份）、网络策略、ingress、
@@ -333,6 +335,8 @@ gitIdentity:
 # 独立安全网关：代持全部敏感凭证，沙盒 Pod 零凭证
 securityGateway:
   enabled: true
+  # 种子：与主应用同一条副本律（就绪节点数，一到二）。运行时的值由
+  # `cogneva_workload_replicas` 发布。
   replicas: 1
   # 网关的三个监听面，与容器里的端口名一一对应（名字不改，Service 的 targetPort
   # 按名字引用它们）。这三个数此前写满整棵 chart：容器端口、Service、网络策略的
@@ -681,7 +685,7 @@ sandboxExecutor:
   # 每任务工作树生命周期（秒）：空闲超 TTL 回收，数量超上限按 LRU 驱逐。
   # **TTL 由两个读数推，不由「空闲多久后被复用」推**：后者有个自指陷阱——空闲超过
   # TTL 的树已经被回收了，能观察到的间隔永远短于它要喂的那个数，按它调只会一轮轮
-  # 翻倍。现在用的是不依赖 TTL 的两头：卷能装多少棵树（见 maxTaskWorkspaces 那段）＋
+  # 翻倍。现在用的是不依赖 TTL 的两头：卷实测能装多少棵树（见 maxTaskWorkspaces 那段）＋
   # 新树到达的间隔（元数据里的 created_at 算出来），取「新树把半个卷填满要多久」。
   # 树来得快、卷更小，TTL 就短；量不出来（不足两棵树）时才用这个数。
   workspaceTtlSecs: 21600
@@ -696,11 +700,12 @@ sandboxExecutor:
   # 上游一小时才推一次时，仍然每 5 分钟抓一遍是白花；反过来推得勤时又要跟上。循环
   # 本身按地板节奏唤醒并上报心跳，所以「抓取间隔」变了不会被误读成循环停摆。
   repoFetchIntervalSecs: 300
-  # 上限是**两个数里较小的那个**：这个策略上限（同时服务多少棵树），与这块卷实测能
-  # 容纳多少个（每轮 GC 读 `df` 的可用字节，除以同一次 GC 里量出的单树大小，留 15%
-  # 余量给写入中的 git 命令）。树随仓库变大、卷被同住者占满时，实测那头会自己降下来
-  # ——写成固定值就等于把某一天的树大小封进配置，之后它不再跟着变。还没有任何树时
-  # 测不出单树大小，只剩这个策略值。
+  # **只在量出单树大小之前生效的种子。** 之后上限跟着实测走：每轮 GC 读 `df` 的
+  # 可用字节，除以同一次 GC 里量出的单树大小，留一棵树的余量给写入中的 git 命令
+  # （`workspace_cap`），读数报在 `sandbox_workspace_cap` 上，`source` 标明这一轮
+  # 用的是 seed 还是 measured。树随仓库变大、卷被同住者占满时，实测那头会自己降下来
+  # ——把某一天的树大小写进配置，之后它就不再跟着变了。还没有任何树时测不出单树大小，
+  # 这个数才生效。
   #
   # **2026-11-07：8 低于同时在干活的任务数，于是这条上限自己在制造它要避免的代价。**
   # 实测 30 分钟内执行器见到 14 个不同的任务 id、建了 17 棵、回收了 18 棵——同一个任务
@@ -719,9 +724,13 @@ sandboxExecutor:
   # 6.69 秒，其中 6.5 秒花在 `git worktree add`（本机 49 MB 一棵，单独实测 3403 ms）；
   # 同一对话 5 分钟后的下一次工具调用 0.128 秒——同一条命令、同一个 Pod，区别只是树
   # 已经在。所以「跟员工说话很慢」主要不是模型慢，是每个新对话先付一次检出。
-  # 取值 2：实测到达率约 1.1 个任务/分钟、补一次池约 3.4 秒，2 棵盖得住两次补池之间
-  # 的到达。池子另有两道约束，不靠这个数兜底：永不大于任务上限的一半，且只有在任务
-  # 上限还装得下时才补——没到达的任务不许挤掉正在跑的任务。
+  # **只在量出来之前生效的种子。** 之后池子大小由两个读数推：到达率（每棵树被领走
+  # 的时间记进窗口）乘以一次检出的实测耗时（最近若干次 `git worktree add` 的中位数），
+  # 乘积就是一次检出期间有多少个到达在等树，读数报在 `sandbox_workspace_warm_trees` 上，`source` 标明用的是
+  # seed 还是 measured。到达更快或检出更贵，池子就更大；两者都不用时它自己缩回去。
+  # 池子另有一道约束，不用这个数兜底：永不大于当轮实测上限的一半，没到达的任务不许
+  # 挤掉正在跑的任务。
+  # 取值 2 是种子：实测到达率约 1.1 个任务/分钟、补一次池约 3.4 秒。
   warmTrees: 2
   # 本 Pod 自己那块构建缓存（`CARGO_TARGET_DIR`）的上限与复测周期。**它与进化侧
   # 的 `evolution.workspaces.targetMaxBytes` 是两个对象，不是同一个旋钮的两种写法**：
@@ -850,10 +859,14 @@ hostDocuments:
   # table here would be a second thing to keep in step, and its drift shows up as a folder
   # that is silently never sorted.
   classifyRules: ""
-  # How many bytes of one body a classification question carries, and how many files one
-  # question may cover. Both are "do less" bounds: past either of them the question is not
-  # asked at all rather than asked about part of the folder -- a partial answer would make
-  # the plan depend on which files happened to fit.
+  # The two seeds one classification question starts from: how many wire bytes of one body
+  # it may carry, and how many files it may cover. They are the floor the plan may raise but
+  # never lower -- the plan follows the largest question this channel answered, and probes a
+  # larger one only within the audited channel's bound (securityGateway.auditedLlmMaxBodyBytes).
+  # The numbers in force are published as `sandbox_host_docs_assist_body_bytes` and
+  # `sandbox_host_docs_assist_question_files` with a `source` label; a folder that does not
+  # fit is not asked about at all, because a partial answer would make the plan depend on
+  # which files happened to fit.
   assistBodyBytes: 2048
   assistMaxCandidates: 50
 
@@ -1124,6 +1137,10 @@ healthProbes:
   # 六十个五秒的探针在它开始监听前几秒把它判死，容器重启一次之后才起来——而那一次
   # 恰好发生在换镜像的时候。冷启动是每一次换镜像都要付的，所以这里放到一百二十个
   # 五秒，留一倍余量；真坏掉的镜像晚几分钟被判死，比换一次镜像回滚一次便宜。
+  # failureThreshold 是**下限，不是种子**：回路每拍把窗口里最长的一次成功启动
+  # （Pod startTime 到第一次 Ready）× 120% ÷ periodSeconds 写回，只往上不往下
+  # ——比预算更慢的启动走不到 Ready，也就永远不会成为一个样本，缩小预算就是
+  # 把自己下次失败变成看不见的。值报在 `cogneva_workload_startup_failure_threshold`。
   appStartup:
     periodSeconds: 5
     timeoutSeconds: 5
@@ -1134,6 +1151,7 @@ healthProbes:
   # 绑定本身应当是瞬时的；真撞破它说明有别的东西挡住了 bind，那确实该重启。
   # 走查本身的耗时没变：本机实测 3m35s（containerd 60.5 GB + podman 55 GB +
   # buildah 11 GB，200m 配额下），2026-10-26 那次 4m12s。
+  # 与 appStartup 同一条律、同一个窗口：这个数是下限，实测最长启动把它抬高。
   claimStoreStartup:
     periodSeconds: 5
     timeoutSeconds: 5
@@ -1642,7 +1660,13 @@ taskRouter:
   # agent inbox 的活成立。squad 的 planner／generator／evaluator／moderator 是
   # `AgentManager::create_agent` 直接建的，不经过 `pool_worker_handler` 里那道
   # `gate.acquire()`，所以池子不是变更产能的上限，这一笔只动这一格。
-  claimConcurrency: 2
+  #
+  # **2026-11-13 起 0 = 按池子的窗口导出。** 上面几次抬高／落回都是在猜「几条在飞
+  # 才不再烧钱」，而答案在池子自己的读数里：窗口还剩多少额度、一条活实测花多少
+  # （`reserve_tokens`，按已完成任务量），相除就是这一窗还付得起几条。这个数随窗口
+  # 滚动，配置里写下的任何正数都只是写下那天的窗口；所以这里交给导出，每拍重算并
+  # 写回 `cogneva_task_router_claim_slots` 与求值计数。正数仍是覆盖位。
+  claimConcurrency: 0
 
   # 本地车道（`:local`）的在途上限。这一条与上面那格分开算：只有带 executor 角色的
   # 部署读本地就绪流，变更任务全在这条流上，别的部署配多少与它无关。
@@ -1687,13 +1711,18 @@ changeLedger:
   # 任务就是把这同一份固定价格付了 1,957 次。
   #
   # 上限在生成侧：一批写成一份变更，超过一次生成写得完的量会截断、整批报废，
-  # 那比不并更贵。所以这一格应当按「一次生成装得下几条修复」来配，而不是拍一个
-  # 数；判据是变更账派发行的 `submitted / tasks_submitted`（每道任务平均承载几条）
-  # 配上这一批的落地率：整批落得下的批次可以继续抬，成批被拒的批次要往回收。
+  # 那比不并更贵。所以界该按「一次生成装得下几条修复」量，而不是拍一个数。
   #
-  # 5 是起点：队列主形状的一条欠账是一道门（测试、头注释、检查脚本），实测几十行，
-  # 5 条连同写它们的推理还在一次生成的输出预算里。
-  rowsPerHandover: 5
+  # **2026-11-13 起 0 = 按图里的批次导出。** 变更账每一拍读一次任务表里它自己交
+  # 出去的批次：**落地整批的最大条数 + 1** 就是下一拍的界（更大的批次是一次要
+  # 验证的尝试，落地了就成为新证据）；**因工作本身被退回的最小条数 - 1** 给界封
+  # 顶，退回的证据 30 天后过期（换模型/抬输出预算没有事件可订阅，旧证据不该永久
+  # 钉住界）。低于已落地条数的退回不封顶——那说明问题不在批大小。还没有任何批次
+  # 落地时用 5 作起点。界写回 `cogneva_change_ledger_rows_per_handover` 并带
+  # `source` 标签，每一拍记一次
+  # `cogneva_change_ledger_rows_per_handover_evaluations_total`：界不动时，
+  # 只有这条计数能说明回路还在算。正数仍是覆盖位（钉死它，读数面就报这个数）。
+  rowsPerHandover: 0
 
 webSearch:
   enabled: true
@@ -1791,20 +1820,13 @@ networkPolicy:
 # buildah 推集群内 registry → 派独立 Job 门禁滚动四部署，失败自动回滚。
 # 依赖 RBAC / NetworkPolicy(apiserver) / kubectl 二进制 / 集群内 registry 就位。
 changeVerification:
-  # 变更验证那一趟的编译宽度（`CARGO_BUILD_JOBS`）。它是这台 Pod 上唯一能直接压住
-  # 验证内存峰值的旋钮：验证跑的是整个工作区的测试构建，链接器按进程数并行，实测
-  # 2026-11-07 进化 Pod 在构建占用的那 78% 时间里平均 9.81 GiB、峰值 15.6 GiB，而
-  # 容器上限 16 GiB、不构建时只有 3.02 GiB（同一组实测）。撞上限的代价不是慢，是 OOM：
-  # 两条在跑的
-  # 任务一起从头再来。
+  # 变更验证那一趟的编译宽度（`CARGO_BUILD_JOBS`）。生效值由构建闸每拍从宿主量出来：
+  # 宿主核数 ÷ 一个构建要多少核，与闸门判「同时放几道构建」用的是同一份测量；验证
+  # 构建与主线构建派生前各读一次，下一道构建就跟着走，不需要重启。
   #
-  # 收窄的代价只是慢——闸门余量在那儿（同一窗口平均等待 1.65 分钟）。这个数按「压到
-  # 多少」定，不按「多快」定：3 是让峰值落到容器上限之下的起点，落地后读
-  # `max_over_time(container_memory_working_set_bytes{pod=~"cogneva-evolution-.*"}[24h])`
-  # 判它够不够，够了再谈把本地车道抬到 2。
-  #
-  # 它不进主线部署器的构建：那条路自己显式设 `CARGO_BUILD_JOBS`
-  # （`COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS`），不受这里影响。
+  # 下面这个数是**种子**：闸没装、或还没有一拍量到宿主时用它。历史依据是 2026-11-07
+  # 进化 Pod 实测：峰值 15.6 GiB 顶着 16 GiB 容器上限，3 是让峰值落回上限之下的起点。
+  # 量到宿主之后，宽度由实测取代，不再按这个数压。
   cargoBuildJobs: 3
 
 mainlineDeployer:
@@ -1812,15 +1834,12 @@ mainlineDeployer:
   pollIntervalSecs: 600
   soakSecs: 120
   failureCooldownSecs: 3600
-  # 宿主构建闸同一时刻只放行一个构建，构建期间别的构建者全被挡住，所以这个数
-  # 直接决定"主线一轮占住宿主多久"，进而决定部署能跟到多快。
-  # 实测（2026-10-19，进化 Pod 内采样）：jobs=2 时构建里恰好 2 个 rustc 各占满
-  # 一核、合计 RSS 0.7~1.1 GiB；而该 Pod 的 CPU 上限是 8 核、内存上限 16 GiB，
-  # 两个界都远没撞到。取 6 = CPU 上限 8 减去 Pod 自身（变更验证、进化循环）要留
-  # 的 2 核；内存这一侧 0.55 GiB/进程 × 6 ≈ 3.3 GiB，不设限。
-  # 同一时段三次构建实测 1989 / 2011 / 2173 秒，改大之后看
-  # cogneva_mainline_build_seconds 是否随之下降；不降就说明瓶颈不在并行度，
-  # 不要再往上加。
+  # 主线构建的编译宽度。生效值与验证构建同源：构建闸每拍把「宿主核数 ÷ 单构建需求」
+  # 发布成每道构建的份额，主线在派构建时读它，下一道构建就跟着走。
+  #
+  # 下面这个数是**种子**：闸没装、或还没有一拍量到宿主时用它。历史依据是 2026-10-19
+  # 进化 Pod 内实测（jobs=2 时两个 rustc 各占一核、合计 RSS 0.7~1.1 GiB；Pod 上限
+  # 8 核 / 16 GiB，取 6 = 8 核减去 Pod 自身要留的 2 核）。量到宿主之后由实测取代。
   cargoBuildJobs: 6
   # 部署器从裸仓库的哪个目录读清单（仓库内相对路径）。两种形态都能消费：目录里
   # 有 `kustomization.yaml` 就按它的 resources 列表读（发布资源集的权威顺序），
@@ -1886,6 +1905,11 @@ mainlineDeployer:
   # 时重启 registry 是有代价的动作。占用与声明量的比达到阈值、且距上次回收超过冷却窗
   # 才动手；冷却窗给的是"回收后仍高于阈值"这种情况（常驻底座本身大时，没有它就会变成
   # 每个轮询重启一次 registry）。
+  #
+  # 阈值本身按实测导出：两次回收之间隔着冷却窗，窗里新推的 rev 继续占盘，所以阈值
+  # 留出的是「一个窗里的增长」所需的空间（相邻两拍体积读数之差 ÷ 间隔 × 窗长 ÷ 声明），
+  # 且至少留出一个实测 rev 的边际字节。下面这个数是量不到时的种子，不是生效值——
+  # 生效值每拍发布在 `cogneva_retention_target{knob="…threshold"}` 上。
   registryMaintenance:
     threshold: 0.5
     cooldownSecs: 21600
@@ -1909,6 +1933,3 @@ mainlineDeployer:
     # 与安装脚本的 BACKENDS 是同一个开关：清单里的 09-clickhouse / 10-loki
     # 标着 backends 处置，两边都按它决定交付与否。
     backends: true
-    # 一次收敛最多在告警消息里点名几个资源，其余折成计数（消息有界）。集群可以
-    # 漂移一百个对象，消息不能长到没人读。
-    maxNamedResources: 6

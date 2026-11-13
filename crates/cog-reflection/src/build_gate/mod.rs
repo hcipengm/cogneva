@@ -395,6 +395,24 @@ const SERVED_FILE: &str = "builds.served";
 // cap: bound — 远超实际不同名字数的上界：丢一行只多让一轮，文件大了是每次仲裁都扫一遍
 const SERVED_RECORD_CAP: usize = 64;
 
+/// How many cargo jobs one build gets, from the same measurement the gate uses
+/// to decide how many builds fit: the host's cores divided by what one build
+/// demands of them.
+///
+/// Declared here rather than in the contract half beside the other gate names:
+/// nothing outside this crate reads it yet, and a new metric name is not a
+/// reason to make every crate rebuild.
+pub const BUILD_GATE_CARGO_JOBS: &str = "cogneva_build_gate_cargo_jobs";
+
+/// Windows in which [`BUILD_GATE_CARGO_JOBS`] was recomputed.
+///
+/// The width can stay the same for days on a host whose core count and build
+/// demand do not move, so "the reading is live" needs a count rather than the
+/// gauge: without it, a width frozen because the derivation stopped looks
+/// exactly like a stable host.
+pub const BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL: &str =
+    "cogneva_build_gate_cargo_jobs_evaluations_total";
+
 /// Claims on the next build that lapsed before anyone used them, as a counter
 /// carrying the `asker` that made the claim.
 ///
@@ -572,6 +590,19 @@ pub fn global() -> Option<Arc<BuildGate>> {
     GLOBAL.get().cloned()
 }
 
+/// How many cargo jobs one build should fan out over, from the latest window's
+/// measurement of the host.
+///
+/// `None` means this process has no gate in force or no window has measured a
+/// host yet: the caller keeps its declared seed, exactly as the gate itself
+/// falls back to the declaration when the host cannot be read. The width is
+/// read at the moment a build is spawned, so a build started after the window
+/// that changed the host uses the new share without a restart.
+pub fn cargo_jobs() -> Option<u64> {
+    let width = global()?.job_width.load(Ordering::Relaxed);
+    (width > 0).then_some(width)
+}
+
 /// Records the peak resident memory of a build this process ran.
 ///
 /// A free function rather than a method reached through the deployer, because
@@ -698,6 +729,8 @@ impl Observable for InactiveBuildGate {
                 dir: &dir_identity(Path::new(&self.dir)),
                 role: BUILD_GATE_ROLE_CONTROL_PLANE,
             },
+            0,
+            0,
             0,
         ))
     }
@@ -1796,6 +1829,27 @@ fn io_outside_credit(
     Some(since.min(IO_SAMPLE_HORIZON))
 }
 
+/// How many cargo jobs one build gets, from the host's cores and the share one
+/// build is booked for.
+///
+/// The gate already measured both numbers for its own question: how many builds
+/// the CPU can host at once is cores divided by one build's demand. Giving each
+/// admitted build that same share is what makes the two readings agree -- cargo
+/// fans a build out over exactly the cores the gate booked for it, so the gate's
+/// admission arithmetic and the build's own parallelism are the same measurement
+/// rather than two guesses. A width wider than the box is never useful, so the
+/// result is capped at the core count.
+///
+/// `None` when either reading is missing or impossible (no cores, a demand of
+/// zero): the caller then keeps its declared seed instead of inventing a width.
+fn cargo_jobs_for(cores: f64, demand_cores: f64) -> Option<u64> {
+    if !cores.is_finite() || cores < 1.0 || !demand_cores.is_finite() || demand_cores <= 0.0 {
+        return None;
+    }
+    let width = (cores / demand_cores).floor().max(1.0);
+    Some(width.min(cores.floor()) as u64)
+}
+
 /// The whole series set, in one place: a reader that has to tell "no bound here"
 /// from "this deployment never reported" cannot do it if the two sources of the
 /// set can drift.
@@ -1807,6 +1861,8 @@ fn readings(
     c: Counters,
     origin: Origin<'_>,
     wait_budget_ms: u64,
+    cargo_jobs: u64,
+    cargo_job_evaluations: u64,
 ) -> Vec<RawMetric> {
     let label = |m: RawMetric| {
         m.with_label(
@@ -1911,6 +1967,15 @@ fn readings(
         label(RawMetric::new(
             BUILD_GATE_WAIT_BUDGET_MS,
             wait_budget_ms as f64,
+        )),
+        // Zero means no window has derived a width yet, not "cargo gets no
+        // jobs": the consumers fall back to their declared seed until this
+        // moves, and the counter beside it is what separates "stable" from
+        // "stopped".
+        label(RawMetric::new(BUILD_GATE_CARGO_JOBS, cargo_jobs as f64)),
+        label(RawMetric::new(
+            BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL,
+            cargo_job_evaluations as f64,
         )),
     ]);
     out
@@ -2378,6 +2443,14 @@ pub struct BuildGate {
     /// The ceiling of that measurement: what the host could take if it stayed
     /// quiet, before the control law's say. 0 before any measurement.
     measured_ceiling: AtomicU64,
+    /// The core count of the machine this process landed on, read once. The
+    /// core count does not change while the process lives, so the pinned gate
+    /// can derive the cargo width without taking a host sample of its own.
+    host_cores: u64,
+    /// The cargo job width the latest window derived; 0 before any window.
+    job_width: AtomicU64,
+    /// Windows in which that width was recomputed.
+    job_width_evaluations: AtomicU64,
     /// The integer the last window held after the dead band, which is what the
     /// next window damps against. Kept apart from `measured_ceiling` because
     /// that one is the measurement as it stands, published as such: a reader
@@ -2552,6 +2625,7 @@ impl BuildGate {
             installed = create_slot_dir(&dir).is_ok();
         }
         let wait = Duration::from_secs(cfg.wait_secs);
+        let host_cores = HostFacts::read().map(|host| host.cores).unwrap_or(0);
         let pacing = Arc::new(cog_core::pacing::PacingReadings::new());
         // The seed is the declared budget and nothing else: a gate that has
         // never made anybody wait has no measurement to overrule it with. The
@@ -2568,6 +2642,9 @@ impl BuildGate {
             tuning: fit_to_host(Tuning::from_config(cfg)),
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
+            host_cores,
+            job_width: AtomicU64::new(0),
+            job_width_evaluations: AtomicU64::new(0),
             held_ceiling: AtomicU64::new(0),
             per_build_io: AtomicU64::new(0),
             occupancy_avg: AtomicU64::new(0),
@@ -2917,6 +2994,18 @@ impl BuildGate {
         next
     }
 
+    /// Derives the cargo job width from a host core count and publishes it.
+    ///
+    /// Called from every window (and from every ask on a pinned gate), so the
+    /// evaluations counter answers "is this still being computed" even when the
+    /// number itself has not moved for days.
+    fn derive_cargo_jobs(&self, cores: f64) {
+        if let Some(width) = cargo_jobs_for(cores, self.tuning.build_demand_cores) {
+            self.job_width.store(width, Ordering::Relaxed);
+            self.job_width_evaluations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Re-derives the bound, at most once per window, and persists it where this
     /// process is the one elected to.
     ///
@@ -2944,6 +3033,17 @@ impl BuildGate {
         // facts disagreeing that this directory exists to prevent. Written by
         // the controller only, and only when it disagrees.
         if let Some(fixed) = self.fixed {
+            // A pinned gate measures no bound, but the core count is a reading
+            // the host gave once and the cargo width is a function of it. The
+            // window still paces the derivation: an ask is not a beat.
+            let due = {
+                let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+                window.map_or(true, |last| last.elapsed() >= self.tuning.bound_window)
+            };
+            if due {
+                self.derive_cargo_jobs(self.host_cores as f64);
+                *self.window.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            }
             if self.is_controller() && self.persisted_bound() != Some(fixed) {
                 self.persist_bound(fixed);
             }
@@ -2972,6 +3072,9 @@ impl BuildGate {
             );
             return;
         };
+        // Same window, same host reading: the width a build fans out over is
+        // the share the CPU booked for it.
+        self.derive_cargo_jobs(load.cores as f64);
         // The measurement and the number this window enforces, side by side:
         // the second one is the first held through the dead band against what
         // the previous window enforced, so a host whose reading straddles an
@@ -4588,6 +4691,8 @@ impl Observable for BuildGate {
             self.counters(),
             origin,
             self.wait_budget_ms(),
+            self.job_width.load(Ordering::Relaxed),
+            self.job_width_evaluations.load(Ordering::Relaxed),
         );
         // The sample the ceiling came from, published beside it. `step` above
         // may have just taken one; a scrape that arrives inside the bound
@@ -5034,6 +5139,74 @@ mod tests {
             lock_dir: dir.to_string_lossy().into_owned(),
             ..BuildGateConfig::default()
         }))
+    }
+
+    /// 编译宽度是宿主核数与单构建需求的函数：同样的机器上需求变大，宽度变小；
+    /// 机器变小，宽度也变小；宽度不会超过核数，也不会小于一；量不到时不出数，
+    /// 由调用方落回声明——不猜一个宽度。
+    #[test]
+    fn cargo_jobs_follow_the_measured_cores_and_build_demand() {
+        assert_eq!(cargo_jobs_for(24.0, 4.1), Some(5));
+        assert_eq!(cargo_jobs_for(24.0, 8.0), Some(3));
+        assert_eq!(cargo_jobs_for(8.0, 8.0), Some(1));
+        assert_eq!(cargo_jobs_for(8.0, 0.5), Some(8), "宽度不超过核数");
+        assert_eq!(cargo_jobs_for(1.0, 4.1), Some(1), "一个构建至少一个 job");
+        for (cores, demand) in [
+            (0.0, 4.1),
+            (f64::NAN, 4.1),
+            (24.0, 0.0),
+            (24.0, -1.0),
+            (24.0, f64::INFINITY),
+        ] {
+            assert_eq!(cargo_jobs_for(cores, demand), None, "{cores}/{demand}");
+        }
+    }
+
+    /// 每个窗口重算一次宽度并让求值计数往上走：宽度可以几天不变，但「这个回路
+    /// 还在算」只能由计数回答。读数面同时带着宽度与计数。
+    #[tokio::test]
+    async fn the_cargo_width_is_recomputed_every_window_and_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = BuildGate::new(&BuildGateConfig {
+            enabled: true,
+            lock_dir: dir.path().to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
+        });
+        gate.tuning.build_demand_cores = 4.0;
+        gate.derive_cargo_jobs(24.0);
+        assert_eq!(gate.job_width.load(Ordering::Relaxed), 6);
+        gate.derive_cargo_jobs(16.0);
+        assert_eq!(gate.job_width.load(Ordering::Relaxed), 4);
+        assert_eq!(gate.job_width_evaluations.load(Ordering::Relaxed), 2);
+
+        let identity = String::new();
+        let series = readings(
+            0,
+            0,
+            0,
+            DIM_NONE,
+            Counters::default(),
+            Origin {
+                dir: &identity,
+                role: BUILD_GATE_ROLE_BUILDER,
+            },
+            0,
+            gate.job_width.load(Ordering::Relaxed),
+            gate.job_width_evaluations.load(Ordering::Relaxed),
+        );
+        // 这条序列带的就是闸门那一族固定的 `role` 标签（builder / control-plane），
+        // 宽度按进程角色分开读，不另起一套标签。
+        assert_eq!(crate::LABEL_ROLE, "role");
+        let width = series
+            .iter()
+            .find(|m| m.name == BUILD_GATE_CARGO_JOBS)
+            .expect("width series");
+        assert_eq!(width.value, 4.0);
+        let evaluations = series
+            .iter()
+            .find(|m| m.name == BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL)
+            .expect("evaluation series");
+        assert_eq!(evaluations.value, 2.0);
     }
 
     /// The outside-io reading counts one situation and nothing near it.
@@ -8260,6 +8433,12 @@ unevictable 28532736
             BUILD_GATE_HELD_MS_TOTAL,
             BUILD_GATE_HELD_MS_MAX,
             BUILD_GATE_WAIT_BUDGET_MS,
+            // Zero means no window has derived a width yet, not "cargo gets
+            // no jobs"; the counter beside it is what separates a stable
+            // width from a stopped derivation. Both are part of the set a
+            // process with no builds publishes.
+            BUILD_GATE_CARGO_JOBS,
+            BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL,
         ]);
         assert_eq!(
             names, expected,

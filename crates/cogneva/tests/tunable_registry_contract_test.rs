@@ -1339,6 +1339,45 @@ fn a_landed_batch_carries_no_override() {
                 "llmUsageRetention.keepDays",
             ],
         ),
+        (
+            // Capacity dials that were hand-pinned while nothing measured them:
+            // replicas follow the ready-node count, the build gate follows the
+            // dimension it measured last, the registry wave follows the time the
+            // last wave took, the workspace cache follows the tree it kept, the
+            // startup budget follows the longest measured start, the claim slot
+            // bound follows the pool's own price, the hand-over batch follows
+            // what the generator wrote whole, and the model station's two
+            // numbers follow the largest question the audited channel answered.
+            // The LimitRange defaults are the same size law on the namespace's
+            // typical container; its three floors are the cheap ones' grids
+            // (`fixed`). `maxNamedResources` is gone: the stack derives its own
+            // named-resource ceiling, so a chart number for it was a second
+            // answer to the same question.
+            "B5",
+            &[
+                "changeLedger.rowsPerHandover",
+                "changeVerification.cargoBuildJobs",
+                "gateway.replicas",
+                "healthProbes.appStartup.failureThreshold",
+                "healthProbes.claimStoreStartup.failureThreshold",
+                "hostDocuments.assistBodyBytes",
+                "hostDocuments.assistMaxCandidates",
+                "mainlineDeployer.cargoBuildJobs",
+                "mainlineDeployer.observabilityStack.maxNamedResources",
+                "mainlineDeployer.registryMaintenance.threshold",
+                "resourceGovernance.limitRange.defaultCpu",
+                "resourceGovernance.limitRange.defaultMemory",
+                "resourceGovernance.limitRange.defaultRequestCpu",
+                "resourceGovernance.limitRange.defaultRequestMemory",
+                "resourceGovernance.limitRange.minCpu",
+                "resourceGovernance.limitRange.minMemory",
+                "resourceGovernance.limitRange.pvcMinStorage",
+                "sandboxExecutor.maxTaskWorkspaces",
+                "sandboxExecutor.warmTrees",
+                "securityGateway.replicas",
+                "taskRouter.claimConcurrency",
+            ],
+        ),
     ];
 
     let registry = registry();

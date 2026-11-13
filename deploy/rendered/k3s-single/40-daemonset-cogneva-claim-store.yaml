@@ -47,6 +47,10 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.5.10"
     app.kubernetes.io/component: claim-store
+  annotations:
+    # 启动预算由实测启动时长决定（Pod 从 startTime 到第一次 Ready），
+    # 只改带这个标记的对象。
+    cogneva.io/startup-policy: measured
 spec:
   selector:
     matchLabels:

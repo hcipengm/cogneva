@@ -36,15 +36,21 @@ const CLAIM_BATCH: usize = 16;
 /// k3 的 5 小时窗口（1,670,569 token）在开窗 10 分钟里被花掉 1,105,275，
 /// 八道变更各走一半、一道也没走完。这种数只能改代码才改得动，而它要改的时机
 /// 恰好是额度读数变了的时候。
+///
+/// 现在它有了读数一侧：不配、配 `0` 或配空串都是「按池子的额度导出」，
+/// 正数是钉死的覆盖位（见 [`pinned_claim_concurrency`]）。
 pub const CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_TASK_CLAIM_CONCURRENCY";
 
-/// 没有配置时的在途执行上限。
+/// 还没量到窗口时的在途执行上限，也是导出循环的起点。
 ///
-/// 与 [`cog_core::BoardWipLimits`] 同一个口径：**不配就按默认值跑，不配不等于
+/// 与 [`cog_core::BoardWipLimits`] 同一个口径：**量不到就按这个数跑，量不到不等于
 /// 零**。一个凭空造出来的 0 会让所有执行停摆，而它与「没配」在读数上是同一个
-/// 空白。
+/// 空白。窗口一旦读出来，下一次重算就把它换成 `(额度-已花)/单任务价格`。
 // cap: bound — 进程级许可：本进程读的每条就绪队列共用同一份，多读一条队列不该把在途执行翻倍
 pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
+
+/// 认领上限的导出循环在存活登记里的名字。
+pub const CLAIM_WINDOW_LOOP: &str = "task_claim_window_bound";
 
 /// How many stop-the-line tasks one process runs at once.
 ///
@@ -131,9 +137,9 @@ pub const DEFAULT_LOCAL_CLAIM_CONCURRENCY: usize = 1;
 /// （或误读成不限）都会把额度花光的形状藏起来。拒绝时用默认值，并把这一行
 /// 报告出去——悄悄换成默认值等于运维以为自己改的那个数生效了。
 ///
-/// 本地车道那一格不到这里：它在调用之前就把 `0` 读成「按读数导出」
-/// （见 [`local_claim_concurrency`]），所以同一条命令行在两条车道上含义不同，
-/// 而这是有意的——那条车道的界真的可以量出来。
+/// 两条能导出界值的车道都不到这里：它们在调用之前就把 `0` 读成「按读数导出」
+/// （见 [`local_claim_concurrency`] 与 [`pinned_claim_concurrency`]），所以同一条
+/// 命令行在「钉死」与「导出」上的含义是统一的。
 pub fn parse_claim_concurrency(raw: &str) -> Result<usize, String> {
     match raw.trim().parse::<usize>() {
         Ok(0) => Err(
@@ -144,27 +150,174 @@ pub fn parse_claim_concurrency(raw: &str) -> Result<usize, String> {
     }
 }
 
-/// 本进程的在途执行上限，从环境读。
+/// 本进程钉死的在途执行上限，从环境读；`None` = 由池子的额度导出。
+///
+/// 与 [`local_claim_concurrency`] 同一个口径，而理由不同：这条车道的界不是
+/// 「容器装得下几条」，是「这一窗的额度还付得起几条」——`(额度-已花) ÷ 单任务
+/// 价格`，两个数都在池子的状态里、都随窗口滚动，配置里写下的那个数只能是写下
+/// 那天窗口的样子。所以「没配」读成「去量」，正数是覆盖位。
+///
+/// `0`/空串是导出的写法，与 `COGNEVA_BUILD_GATE_MAX_CONCURRENT: "0"`、目标容量
+/// `"auto"` 同一套词。写坏的值退回导出而不是默认值：默认值是一个没人量过的数，
+/// 退回它等于把一次配置笔误伪装成一次测量。
+pub fn pinned_claim_concurrency() -> Option<usize> {
+    match std::env::var(CLAIM_CONCURRENCY_ENV) {
+        Err(_) => None,
+        Ok(raw) if raw.trim() == "0" || raw.trim().is_empty() => None,
+        Ok(raw) => match parse_claim_concurrency(&raw) {
+            Ok(n) => Some(n),
+            Err(problem) => {
+                tracing::warn!(
+                    variable = CLAIM_CONCURRENCY_ENV,
+                    problem = %problem,
+                    using = "the derived bound",
+                    "task claim concurrency entry ignored"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// 本进程的在途执行上限：钉死的那个数，或者还没量到窗口时的起点。
 ///
 /// 进程级上限：本进程读的每条 ready 队列共用同一份许可，多读一条队列不该把
 /// 在途执行翻倍。它同时是 `cogneva_task_router_claim_slots` 报出去的那个数，
 /// 所以配了多少、生效了多少在读数面是同一个值。
 pub fn claim_concurrency() -> usize {
-    match std::env::var(CLAIM_CONCURRENCY_ENV) {
-        Err(_) => DEFAULT_CLAIM_CONCURRENCY,
-        Ok(raw) => match parse_claim_concurrency(&raw) {
-            Ok(n) => n,
-            Err(problem) => {
-                tracing::warn!(
-                    variable = CLAIM_CONCURRENCY_ENV,
-                    problem = %problem,
-                    using = DEFAULT_CLAIM_CONCURRENCY,
-                    "task claim concurrency entry ignored"
-                );
-                DEFAULT_CLAIM_CONCURRENCY
+    pinned_claim_concurrency().unwrap_or(DEFAULT_CLAIM_CONCURRENCY)
+}
+
+/// 下一拍的认领上限：这一窗还付得起几条，就放到几条。
+///
+/// 与 `lane_memory::next_bound` 同形——下降立即，上升要凭据（当前的界被真的用满
+/// 过才爬一格）——底部不同：内存的界不能是 0，0 个许可等于那条车道永远不读，而
+/// 内存量不到时至少一条能跑；额度窗口的界**可以**是 0，那正是「这一窗已经付不起
+/// 一条活」的读数。此时再放进一条，只是把一个执行位置花在一条必然停在上游前的
+/// 活上。停线车道有自己的一份许可，不受这个 0 影响。
+///
+/// 窗口量不到（`None`，见 `jobs_the_window_can_pay_for_status`）不到这里：调用点
+/// 不动界。把「量不到」读成「付得起零条」会让一次滚动发布停掉整条普通车道。
+pub fn next_claim_bound(bound: usize, ceiling: usize, ran_full: bool) -> usize {
+    if ceiling == 0 {
+        return 0;
+    }
+    crate::lane_memory::next_bound(
+        bound,
+        ceiling,
+        crate::lane_memory::should_grow(bound, ceiling, ran_full),
+    )
+}
+
+/// 把这一拍算出来的界落到许可上，返回真正生效的条数以及界是否往上走过。
+///
+/// 收缩只能收回空闲许可，在跑的那几条要等自己结束，所以「算出来的界」与「生效的
+/// 条数」可以差几拍——读数面报的是生效的那个。界往上走过一次，下一格上升的凭据
+/// 就清掉：新界要重新被用满过。
+pub fn apply_claim_ceiling(
+    slots: &tokio::sync::Semaphore,
+    capacity: usize,
+    ceiling: usize,
+    ran_full: bool,
+) -> (usize, bool) {
+    let want = next_claim_bound(capacity, ceiling, ran_full);
+    let applied = crate::lane_memory::apply_bound(slots, capacity, want);
+    (applied, applied > capacity)
+}
+
+/// 认领上限的导出循环：每一拍读池子的窗口，按「还剩多少额度 ÷ 单任务价格」
+/// 重算普通车道能同时跑几条。
+///
+/// `streams` 是共用这份许可的那几条普通流：导出的界必须写回它们的读数，否则
+/// `claim_slots` 会一直报进程启动时的那个数，而许可早已换成另一个——这正是这个
+/// 数被写死时没人看得见它的原因。
+///
+/// 拍子与认领循环同一个 [`CLAIM_INTERVAL`]：上限的输入是池子对「一道活多贵」的
+/// 实测，那个测量在任务结束时就已在状态里，一拍一次足够它跟到下一拍；更密的轮询
+/// 买的只是同一个读数。
+pub fn spawn_claim_window_bound(
+    streams: Vec<String>,
+    slots: Arc<tokio::sync::Semaphore>,
+    seed: usize,
+    source: Arc<dyn cog_core::LlmPoolStatusSource>,
+    shutdown: ShutdownSignal,
+) {
+    if streams.is_empty() {
+        // 这个进程不读普通车道：没有许可要调，也没有读数要写回。
+        return;
+    }
+    drop(cog_core::loop_health::spawn(
+        CLAIM_WINDOW_LOOP,
+        cog_core::loop_health::Cadence::Periodic(CLAIM_INTERVAL),
+        shutdown.clone(),
+        move |beat| {
+            let shutdown = shutdown.clone();
+            let slots = Arc::clone(&slots);
+            let streams = streams.clone();
+            let source = Arc::clone(&source);
+            // `capacity` 是真正发给信号量的许可条数；`seed` 是还没量到窗口时的
+            // 起点。缩界时两者可以不相等：在跑的许可要等它们自己释放才收得回来。
+            let mut capacity = seed;
+            // 这个界有没有被真的用满过。爬一格的前提，每爬一次清一次。
+            let mut ran_full = false;
+            async move {
+                let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // 第一格立即到点：先读一次窗口，再谈放几条。
+                ticker.tick().await;
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = shutdown.wait() => break,
+                    }
+                    let Some(status) = source.status().await else {
+                        // 读不到就不动界：一次滚动发布里的空读不是空池子。
+                        continue;
+                    };
+                    let Some(ceiling) =
+                        crate::ready_queue::jobs_the_window_can_pay_for_status(&status)
+                    else {
+                        // 测量不足以给池子定界（没量到、储备为 0、只覆盖了一部分
+                        // upstream）：同样不动界，把「量不到」当成「没有额度」
+                        // 会把一次测量缺口变成一次停摆。
+                        continue;
+                    };
+                    let ceiling = ceiling as usize;
+                    let in_flight = capacity
+                        .saturating_sub(slots.available_permits())
+                        .min(capacity);
+                    if in_flight >= capacity {
+                        ran_full = true;
+                    }
+                    let (applied, grew) =
+                        apply_claim_ceiling(&slots, capacity, ceiling, ran_full);
+                    if grew {
+                        ran_full = false;
+                    }
+                    if applied != capacity {
+                        let observable = crate::observable::claim_slots_observable();
+                        for stream in &streams {
+                            observable.set_slots(stream, applied);
+                        }
+                        tracing::debug!(
+                            from = capacity,
+                            to = applied,
+                            ceiling,
+                            allowance_tokens = status.pace.allowance_tokens,
+                            spent_tokens = status.pace.spent_tokens,
+                            reserve_tokens = status.pace.reserve_tokens,
+                            "claim bound moved with the pool's token window"
+                        );
+                        capacity = applied;
+                    }
+                    // 目标没动也要记一次：同一个窗口得出同一个界是正确行为，
+                    // 「这个回路还在算」只能由求值计数来答。
+                    crate::observable::claim_slots_observable().record_bound_evaluation();
+                }
             }
         },
-    }
+    ));
 }
 
 /// 本进程本地车道的在途执行上限，从环境读；`None` = 由读数导出。
@@ -238,6 +391,13 @@ const STALL_POLL_FLOOR: Duration = Duration::from_secs(1);
 pub struct TaskExecutorRouter {
     executors: Arc<tokio::sync::RwLock<Vec<Arc<dyn TaskExecutor>>>>,
     orchestrator: Option<Arc<dyn OrchestratorControl>>,
+    /// 池子的额度读数，认领上限的唯一输入。
+    ///
+    /// 空表示这个进程读不到池子（单进程部署）：那时上限停在
+    /// [`DEFAULT_CLAIM_CONCURRENCY`]，「读不到窗口」不是「窗口是零」。它由
+    /// `start` 挂上——发布它的 crate 与本 crate 的 `init` 谁先谁后不由这里定，
+    /// 而 `start` 在所有 `init` 之后才跑。
+    pool_source: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
 }
 
 impl TaskExecutorRouter {
@@ -245,7 +405,17 @@ impl TaskExecutorRouter {
         Self {
             executors: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             orchestrator: None,
+            pool_source: None,
         }
+    }
+
+    /// 挂上池子的额度读数，让认领上限跟着窗口走。
+    pub fn with_pool_status_source(
+        mut self,
+        source: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
+    ) -> Self {
+        self.pool_source = source;
+        self
     }
 
     pub async fn with_executor(self, executor: Arc<dyn TaskExecutor>) -> Self {
@@ -342,15 +512,20 @@ impl TaskExecutorRouter {
         // 主订阅循环与清扫器共用的执行许可：新鲜投递与 idle 认领合计最多
         // `claim_concurrency()` 条在途执行。读一次，两条腿用的是同一个数——
         // 一处读一次会让「报出去的预算」和「真正的许可数」各走各的。
-        let claim_concurrency = claim_concurrency();
+        let pinned_claim = pinned_claim_concurrency();
+        let claim_concurrency = pinned_claim.unwrap_or(DEFAULT_CLAIM_CONCURRENCY);
         let claim_slots = Arc::new(tokio::sync::Semaphore::new(claim_concurrency));
 
         let claim = ClaimBudget {
-            slots: claim_slots,
+            slots: claim_slots.clone(),
             limit: claim_concurrency,
-            // 普通活那一格是部署钉的：它的界在 token 预算维度上，进程里没有
-            // 那个读数可导（见 `deploy/helm/cogneva/tunables.yaml` 的同名行）。
-            source: crate::observable::SOURCE_OVERRIDE,
+            // 普通活那一格的界来自池子的额度读数（每窗重算，见
+            // [`spawn_claim_window_bound`]）；正数环境变量是它的覆盖位。
+            source: if pinned_claim.is_some() {
+                crate::observable::SOURCE_OVERRIDE
+            } else {
+                crate::observable::SOURCE_DERIVED
+            },
         };
         // 停线那条通道的许可不来自上面那一份：它的整条理由就是「别的活占满
         // 所有许可时它仍然要跑」。共用一份时，优先级最高的那条变更也只是排在
@@ -404,7 +579,28 @@ impl TaskExecutorRouter {
             );
         }
 
-        let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
+        let streams = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role);
+        // 共用普通许可的那几条流：导出循环把每一拍的新界写回它们的读数。只有
+        // 没钉死、并且真的读得到池子时才起这条循环——单进程部署里每拍问一次
+        // 不存在的读数，只是一条空转的循环。
+        if pinned_claim.is_none() {
+            if let Some(pool_source) = self.pool_source.clone() {
+                let ordinary: Vec<String> = streams
+                    .iter()
+                    .filter(|stream| **stream != stop_the_line && **stream != local)
+                    .cloned()
+                    .collect();
+                spawn_claim_window_bound(
+                    ordinary,
+                    claim_slots.clone(),
+                    claim_concurrency,
+                    pool_source,
+                    shutdown.clone(),
+                );
+            }
+        }
+
+        let loops = streams
             .into_iter()
             .map(|ready_stream| {
                 let budget = if ready_stream == stop_the_line {
@@ -2923,6 +3119,124 @@ mod claim_concurrency_tests {
             "0 asks for the derived bound; a stop would be the one reading it must never have"
         );
         std::env::remove_var(LOCAL_CLAIM_CONCURRENCY_ENV);
+    }
+
+    /// `0` 在普通车道上也读作「按窗口导出」，而不是被退回默认值。
+    ///
+    /// 退回默认值会把一次「请开始量」的配置读成「就按 4 跑」——一个再也不会
+    /// 跟着窗口动的数，而它在读数面上与导出模式同形（都是 `claim_slots` 一个数）。
+    #[test]
+    fn a_zero_ordinary_budget_asks_for_the_window_derived_bound() {
+        let _serial = lane_env_lock();
+        std::env::set_var(CLAIM_CONCURRENCY_ENV, "0");
+        assert_eq!(
+            pinned_claim_concurrency(),
+            None,
+            "0 asks for the derived bound, not the default"
+        );
+        assert_eq!(claim_concurrency(), DEFAULT_CLAIM_CONCURRENCY);
+        std::env::remove_var(CLAIM_CONCURRENCY_ENV);
+    }
+
+    /// 认领上限跟着池子的窗口走：窗口比界大就爬一格，小就当场降，付不起就是 0。
+    ///
+    /// 与内存车道同一个律（`lane_memory::next_bound`），底部不同：内存的界不能是 0
+    /// ——0 个许可等于那条车道永远不读；额度窗口的界可以是 0，那正是「这一窗付不起
+    /// 一条活」。
+    #[test]
+    fn the_claim_bound_follows_the_pool_window() {
+        // 窗口还有位置：当前的界没被用满过就原地，用满过才爬一格。
+        assert_eq!(next_claim_bound(4, 12, false), 4);
+        assert_eq!(next_claim_bound(4, 12, true), 5);
+        // 窗口变小：当场降到它，不用等凭据。
+        assert_eq!(next_claim_bound(5, 3, false), 3);
+        // 窗口付不起一条：界就是 0。
+        assert_eq!(next_claim_bound(3, 0, false), 0);
+        assert_eq!(next_claim_bound(1, 0, false), 0);
+        // 从 0 恢复也要先「用满」过（0 个许可永远算用满），再爬一格。
+        assert_eq!(next_claim_bound(0, 2, true), 1);
+    }
+
+    /// 同一个信号量、同一份读数面：窗口从 12 改到 3，下一拍报出去的界就跟着改，
+    /// 不重启；窗口没变的那一拍，求值计数仍然往上走。
+    ///
+    /// 这是登记表里 `taskRouter.claimConcurrency` 的行为证明。
+    #[tokio::test]
+    async fn the_claim_bound_is_republished_when_the_window_moves() {
+        use cog_core::observability::RawMetric;
+        use cog_core::Observable;
+
+        let observer = Arc::new(crate::observable::ClaimSlotsObservable::new());
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        const STREAM: &str = "ws:ready";
+        observer.register(STREAM, slots.clone(), 4, crate::observable::SOURCE_DERIVED);
+
+        let reading = |metrics: &[RawMetric], name: &str| {
+            metrics
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.value)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        let published = |observer: &Arc<crate::observable::ClaimSlotsObservable>| {
+            let observer = Arc::clone(observer);
+            async move { observer.collect_metrics("D8").await.unwrap() }
+        };
+
+        // 第一拍：窗口付得起 12 条，当前界 4 条且被用满过 -> 爬一格到 5。
+        let (applied, grew) = apply_claim_ceiling(&slots, 4, 12, true);
+        assert_eq!((applied, grew), (5, true));
+        observer.set_slots(STREAM, applied);
+        observer.record_bound_evaluation();
+        let metrics = published(&observer).await;
+        assert_eq!(
+            reading(&metrics, crate::observable::TASK_ROUTER_CLAIM_SLOTS_METRIC),
+            5.0
+        );
+        assert_eq!(slots.available_permits(), 5);
+
+        // 第二拍：窗口没变、这一格还没重新挣到「用满」的凭据，目标不动；但求值
+        // 计数必须往上走——「还在算」不能由目标本身来答。
+        let (applied, grew) = apply_claim_ceiling(&slots, 5, 12, false);
+        assert_eq!((applied, grew), (5, false));
+        observer.set_slots(STREAM, applied);
+        observer.record_bound_evaluation();
+        let metrics = published(&observer).await;
+        assert_eq!(
+            reading(&metrics, crate::observable::TASK_ROUTER_CLAIM_SLOTS_METRIC),
+            5.0
+        );
+
+        // 第三拍：窗口缩到 3 条，界当场降下来，已发出的许可只收得回空闲的那几条。
+        let (applied, grew) = apply_claim_ceiling(&slots, 5, 3, false);
+        assert_eq!((applied, grew), (3, false));
+        observer.set_slots(STREAM, applied);
+        observer.record_bound_evaluation();
+        let metrics = published(&observer).await;
+        assert_eq!(
+            reading(&metrics, crate::observable::TASK_ROUTER_CLAIM_SLOTS_METRIC),
+            3.0
+        );
+        assert_eq!(slots.available_permits(), 3);
+
+        // 第四拍：窗口付不起一条，界是 0。
+        let (applied, grew) = apply_claim_ceiling(&slots, 3, 0, false);
+        assert_eq!((applied, grew), (0, false));
+        observer.set_slots(STREAM, applied);
+        observer.record_bound_evaluation();
+        let metrics = published(&observer).await;
+        assert_eq!(
+            reading(&metrics, crate::observable::TASK_ROUTER_CLAIM_SLOTS_METRIC),
+            0.0
+        );
+        assert_eq!(
+            reading(
+                &metrics,
+                crate::observable::TASK_ROUTER_CLAIM_BOUND_EVALUATIONS_METRIC
+            ),
+            4.0,
+            "each beat that evaluated the law is one count, whether or not the target moved"
+        );
     }
 
     /// 写同一对进程级环境变量的用例之间的一把锁。

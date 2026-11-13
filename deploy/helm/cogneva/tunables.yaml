@@ -1516,18 +1516,25 @@ rows:
 
   # --- evolution worker -------------------------------------------------------
   - key: changeVerification.cargoBuildJobs
-    source: override
+    source: derived
     why: >-
-      The width the verification build fans its linkers out at, and the one knob
-      on this pod that presses directly on the memory peak: verification builds
-      the whole workspace's tests, and the evolution pod's working set measured
-      9.81 GiB while the build gate was held and 3.02 GiB while it was free,
-      peaking at 15.6 GiB under a 16 GiB ceiling on 2026-11-07. Three is the
-      width that puts the peak under that ceiling, not a throughput choice; the
-      reading that says whether it was enough is
-      `max_over_time(container_memory_working_set_bytes{pod=~"cogneva-evolution-.*"}[24h])`.
-      It does not reach the mainline deployer's build, which sets
-      CARGO_BUILD_JOBS itself.
+      The width the verification build fans out at, recomputed from the build
+      gate's own measurement of this host: the host's cores divided by what one
+      build demands of them, the same division the gate uses to decide how many
+      builds fit. The verification process reads that width when it is spawned,
+      so a build started after a window that changed the host follows without a
+      restart, and the mainline build reads the same number. The declared 3 is
+      the seed used while no gate is in force or no window has measured the
+      host; the published gauge carries the width and the counter beside it says
+      how many windows recomputed it, even when the number did not move.
+    published:
+      owner: crates/cog-reflection/src/build_gate/mod.rs
+      file: crates/cog-reflection/src/build_gate/mod.rs
+      metric: BUILD_GATE_CARGO_JOBS
+      label: role
+    proof:
+      file: crates/cog-reflection/src/build_gate/mod.rs
+      test: cargo_jobs_follow_the_measured_cores_and_build_demand
 
   - key: evolution.replicas
     source: fixed
@@ -1809,11 +1816,28 @@ rows:
 
   # --- main application -------------------------------------------------------
   - key: gateway.replicas
-    source: override
+    source: derived
     why: >-
-      One replica on a single-node cluster: two add memory and credential
-      copies without availability. Two nodes make this a two; nothing measures
-      per-replica load to derive it.
+      Replicas are the number of failure domains that can be lost: one Ready
+      node gets one replica, two or more get two. Two is the smallest set that
+      survives any single node going away, and a third copy on a third node
+      buys no new failure domain -- only another copy of the credential
+      material. The workload-resources loop reads `/api/v1/nodes` every round,
+      counts Ready nodes, and patches `/spec/replicas` on the Deployments
+      carrying `cogneva.io/replica-policy: topology`; the seed applies only
+      before the first round has read the cluster.
+      The connection budget follows: the rendered
+      `COGNEVA_PG_SHARING_PROCESSES` counts the worst-case replica count of
+      every workload that shares the database, so a scale-out does not leave
+      each process dividing the server's ceiling by a stale process count.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REPLICAS_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_workload_replicas_follow_the_ready_node_count
 
   - key: gateway.resources.requests.cpu
     source: derived
@@ -1892,24 +1916,44 @@ rows:
       test: a_request_follows_the_measured_draw
 
   - key: taskRouter.claimConcurrency
-    source: override
+    source: derived
     why: >-
       How many tasks one executing process runs at once -- the number of
       concurrent spenders of the token window, and the only global bound on
       parallelism: the board's column limits are per goal, so a `running=1`
       there holds each goal to one and says nothing about eight goals running
-      eight tasks. Measured 2026-11-01 before this was a knob: both processes
-      held four (eight tasks running across eight goals) and spent 1,105,275 of
-      the k3 five-hour window's 1,670,569 tokens in the first ten minutes of
-      the window, none of the eight changes finishing. Measured again
-      2026-11-05, the premise was gone: zero refusals in `gateway_llm_usage`
-      all day with `refusal_kind` empty, a peak of 73 million input tokens in
-      one hour against 4-15 million in the hours pinned at one, and 31 changes
-      landed against a target of 120 -- two processes running one 14.4-minute
-      task each is 8 tasks an hour, and the recorded readings say the limit was
-      never the token window. The companion bound is `agent_pool.worker_count`
-      in `cogneva.json`: nothing here is claimed until that pool has a turn, so
-      the two numbers have to move together.
+      eight tasks. The bound is now the pool's own arithmetic: once per claim
+      interval `crates/cog-orchestrator/src/task_executor_router.rs` reads the
+      pool's window status and divides what the window has left by what one
+      whole job has actually cost -- `(allowance - spent) / reserve`, where the
+      reserve is the supervisor's measure over finished jobs. The difference
+      falls immediately (only idle permits can be taken back, in-flight work
+      finishes), a rise climbs one step and only after the current bound was
+      actually full, and a window that can pay for nothing closes the lane to
+      zero. The ordinary read loops share the permits, so the new bound is
+      written back to every one of their `claim_slots` readings and the
+      evaluation counter rises on every beat that recomputed it, whether or
+      not the number moved. The shipped 0 asks for that derivation; a positive
+      value is still the override. The seed (4) applies only until the first
+      window is read, and an unreadable or partial measurement leaves the bound
+      where it is rather than treating silence as an empty window. Why the old
+      pinned values are not kept: measured 2026-11-01, both processes held four
+      and spent 1,105,275 of the k3 five-hour window's 1,670,569 tokens in the
+      first ten minutes, none of the eight changes finishing; measured again
+      2026-11-05, zero refusals all day and a peak of 73 million input tokens an
+      hour against 4-15 million in the hours pinned at one -- the recorded
+      readings say the limit was never the token window, and no pinned number
+      can follow the window as it rolls. The companion bound is
+      `agent_pool.worker_count` in `cogneva.json`: nothing here is claimed until
+      that pool has a turn, so the two numbers still have to move together.
+    published:
+      owner: crates/cog-orchestrator/src/task_executor_router.rs
+      file: crates/cog-orchestrator/src/observable.rs
+      metric: TASK_ROUTER_CLAIM_SLOTS_METRIC
+      label: source
+    proof:
+      file: crates/cog-orchestrator/src/task_executor_router.rs
+      test: the_claim_bound_is_republished_when_the_window_moves
 
   - key: taskRouter.localClaimConcurrency
     source: derived
@@ -1942,21 +1986,39 @@ rows:
       test: the_bound_follows_the_container_limit
 
   - key: changeLedger.rowsPerHandover
-    source: override
+    source: derived
     why: >-
-      How many owed changes one hand-over carries. The price of a task is mostly
-      its fixed part -- a plan, a run's context, a sandbox round over the whole
-      tree -- and that part does not grow with what the task carries, so handing
-      the queue over one row per task paid it once per row: measured
+      How many owed changes one hand-over carries, recomputed on every ledger
+      pass from the batches the pass itself handed over. The price of a task is
+      mostly its fixed part -- a plan, a run's context, a sandbox round over the
+      whole tree -- and that part does not grow with what the task carries, so
+      handing the queue over one row per task paid it once per row: measured
       2026-11-06, 1,957 pending rows of which 1,694 were the same shape ("give
       principle X the gate it is owed"), against about 102 LLM calls and about
       one yuan per task attempt. What bounds the batch is the generator, not this
       loop: a batch becomes one change, and a batch past what one generation can
-      write comes back truncated and loses everything in it. So the number
-      belongs to what a generation can contain, and it is a deployment's to
-      state rather than a loop's to measure -- no reading moves it, because the
-      reading that would (`submitted / tasks_submitted` against the batch's
-      landing rate) comes from the loop's own pass line and a person reads it.
+      write comes back truncated and loses everything in it. So the bound is the
+      largest batch a hand-over carried to completion, plus one -- a bigger size
+      is tried, and landing it is what makes it the new proof. A batch a
+      generation refused for the work's own reason caps the bound one below its
+      size, so a refused shape is not repeated while the evidence is younger
+      than 30 days; a refusal below what has already landed caps nothing,
+      because the proven size still works. A refusal paid to the environment is
+      the pool's answer and moves nothing. While no batch bigger than the seed
+      has completed, the seed (5) stands. The pass writes the bound and its
+      `source` to `cogneva_change_ledger_rows_per_handover` and counts every
+      recomputation on `cogneva_change_ledger_rows_per_handover_evaluations_total`,
+      because a bound that only moves with its inputs cannot show that the loop
+      behind it is still running. The deployment's 0 means derive; a positive
+      number pins the batch and is reported as `override`.
+    published:
+      owner: crates/cog-orchestrator/src/change_ledger.rs
+      file: crates/cog-orchestrator/src/observable.rs
+      metric: ROWS_PER_HANDOVER_METRIC
+      label: source
+    proof:
+      file: crates/cog-orchestrator/src/change_ledger.rs
+      test: the_batch_bound_follows_the_graphs_batch_outcomes
 
   # --- probe budgets ----------------------------------------------------------
   - key: healthProbes.liveness.periodSeconds
@@ -2027,15 +2089,30 @@ rows:
       The startup half of the probe contract, for the main app's own budget.
 
   - key: healthProbes.appStartup.failureThreshold
-    source: override
+    source: derived
     why: >-
-      120 attempts at 5 seconds is the ten-minute budget, against a first start
-      measured at 323 s on this host on 2026-11-06 (model load, the schema batch
+      Attempts at a 5 s probe, sized by how long this deployment's starts
+      actually take: the workload-resources loop reads every Ready pod's time
+      from `status.startTime` to the transition that made it Ready, keeps the
+      longest in a seven-day window, adds 20% headroom and divides by the probe
+      period. It patches `startupProbe.failureThreshold` on the Deployments
+      carrying `cogneva.io/startup-policy: measured`.
+      The declared value is a floor, not a seed that yields: a start too slow
+      for the budget never reaches Ready and so never becomes a sample, and
+      shrinking below the last declared number is how this loop would turn its
+      own failure into silence. Only a slower measured start raises it. The
+      first start on 2026-11-06 measured 323 s (model load, a schema batch
       queued behind other readers' locks, a collection create retrying through
-      its own timeout) and a second start at 205 s once the image's pages were
-      cached. Every rollout starts cold, so the budget is the slow-case
-      measurement doubled by hand; no loop re-measures start durations back into
-      it, and the deployer's own 900 s still bounds the whole rollout.
+      its own timeout), so 120 attempts is the starting floor; the deployer's
+      900 s still bounds the whole rollout.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: STARTUP_THRESHOLD_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: the_startup_budget_follows_the_longest_measured_start
 
   - key: healthProbes.claimStoreStartup.periodSeconds
     source: fixed
@@ -2050,13 +2127,26 @@ rows:
       The startup half of the probe contract, for the claim store's own budget.
 
   - key: healthProbes.claimStoreStartup.failureThreshold
-    source: override
+    source: derived
     why: >-
-      120 attempts at 5 seconds is the ten-minute budget, twice the 3m35s start
-      measured on this host with containerd, podman and buildah roots at a 200m
-      quota. The measurement exists and was turned into a number by hand; no loop
-      re-measures start durations back into it, and the roots only grow with the
+      The same startup-budget law as the main app, applied to the claim store's
+      own start: longest Ready transition minus `status.startTime` over the
+      seven-day window, 20% headroom, divided by the 5 s probe period. The
+      DaemonSet carries `cogneva.io/startup-policy: measured`, so the
+      workload-resources loop patches its `startupProbe.failureThreshold`. The
+      declared value is a floor: a start that outgrows the budget never becomes
+      a Ready sample, and only a slower successful start raises the budget. The
+      3m35s start measured on this host (containerd, podman and buildah roots
+      at a 200m quota) is what the floor covers; the roots only grow with the
       images pulled.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: STARTUP_THRESHOLD_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: the_startup_budget_follows_the_longest_measured_start
 
   # The backup and drill Jobs answer a different question than the probes above:
   # not "will the process respond" but "is it still making progress". Their
@@ -2112,18 +2202,58 @@ rows:
       test: the_approval_window_follows_the_measured_latency
 
   - key: hostDocuments.assistBodyBytes
-    source: override
+    source: derived
     why: >-
-      How much of one body a classification question carries. It is a "do less"
-      bound: past it the question is not asked at all, because a partial answer
-      would make the plan depend on which files fit. A derived bound would read
-      the classifier's own input window; that window is not published.
+      How many wire bytes of one body a classification question carries. The
+      plan is recomputed on every organize run that reaches the model station.
+      Its window is the largest request this audited channel answered, floored
+      by the deployment's own practice (this seed times the candidate seed plus
+      the prompt's fixed text) and capped by the channel's audited body bound
+      (`securityGateway.auditedLlmMaxBodyBytes`, handed over as
+      `HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES`). The per-body prefix is at least
+      this seed and at most what a typical file in the folder needs, so a
+      question carries whole files when it can and never less of a body than the
+      deployment called evidence. The request is counted in the bytes the
+      channel's bound counts -- the serialized body, escapes included -- and a
+      question larger than the window is only probed when the audit bound or a
+      smaller failure says it fits; a probe that fails caps the next one at one
+      byte under it. The two numbers in force are published as
+      `sandbox_host_docs_assist_body_bytes` and
+      `sandbox_host_docs_assist_question_files` under a `source` label, and each
+      recompute is counted on `sandbox_host_docs_assist_plan_evaluations_total`:
+      the value not moving and the loop not running have to be different
+      readings. The seed is the floor while nothing has been measured, not a
+      ceiling.
+    published:
+      owner: crates/cog-extension/src/hostdocs.rs
+      file: crates/cog-extension/src/hostdocs.rs
+      metric: ASSIST_BODY_BYTES_METRIC
+      label: source
+    proof:
+      file: crates/cog-extension/src/hostdocs.rs
+      test: the_question_plan_follows_the_answered_question_and_the_beat_counts
 
   - key: hostDocuments.assistMaxCandidates
-    source: override
+    source: derived
     why: >-
-      How many files one classification question may cover, for the same reason
-      as the body bound. Nothing measures the classification cost back into it.
+      How many files one classification question covers. Same loop and same
+      window as the body prefix above: the count in force is the window's
+      capacity at that prefix, raised by what the channel has answered. A folder
+      larger than the plan still covers is asked about in full only when a probe
+      is allowed (the audited channel's bound, or a failure above the size being
+      tried); otherwise the run is refused as `over_candidates` rather than
+      asked about in part, because a partial answer would make the plan depend
+      on which files happened to fit. The count in force is published as
+      `sandbox_host_docs_assist_question_files` under `source`, with the same
+      evaluation counter behind it. The seed is the floor, not a ceiling.
+    published:
+      owner: crates/cog-extension/src/hostdocs.rs
+      file: crates/cog-extension/src/hostdocs.rs
+      metric: ASSIST_QUESTION_FILES_METRIC
+      label: source
+    proof:
+      file: crates/cog-extension/src/hostdocs.rs
+      test: the_question_plan_follows_the_answered_question_and_the_beat_counts
 
   - key: hostDocuments.maxPlanBytes
     source: fixed
@@ -2424,12 +2554,25 @@ rows:
 
   # --- mainline deployer ------------------------------------------------------
   - key: mainlineDeployer.cargoBuildJobs
-    source: override
+    source: derived
     why: >-
-      How many cargo jobs a sandbox build runs. A derived value would read the
-      host's cores, which the build gate already measures for a different
-      question (how many builds at once, not how parallel one build is); nothing
-      feeds the core count into this number.
+      How many cargo jobs the mainline build runs, from the same build-gate
+      window the verification build reads: the host's cores divided by what one
+      build demands, so the mainline and the verification builds fan out over
+      the share the gate booked for each. The width is read when the build is
+      spawned, so the next build after a window that changed the host follows
+      without a restart. The declared 6 is the seed when no gate is in force or
+      no window has measured the host; the published gauge carries the width and
+      the counter beside it shows the window recomputed it even when the number
+      did not move.
+    published:
+      owner: crates/cog-reflection/src/build_gate/mod.rs
+      file: crates/cog-reflection/src/build_gate/mod.rs
+      metric: BUILD_GATE_CARGO_JOBS
+      label: role
+    proof:
+      file: crates/cog-reflection/src/build_gate/mod.rs
+      test: cargo_jobs_follow_the_measured_cores_and_build_demand
 
   - key: mainlineDeployer.failureCooldownSecs
     source: derived
@@ -2464,12 +2607,6 @@ rows:
       file: crates/cog-reflection/src/observability_stack.rs
       test: the_convergence_wait_follows_what_a_round_cost
 
-  - key: mainlineDeployer.observabilityStack.maxNamedResources
-    source: override
-    why: >-
-      How many resources one alert message may name before folding the rest into
-      a count. A derived bound would follow the measured message length a reader
-      tolerates; that is a judgement, not a reading.
 
   - key: mainlineDeployer.pollIntervalSecs
     source: derived
@@ -2529,13 +2666,27 @@ rows:
       test: the_registry_retention_follows_the_volume_and_the_measured_rev_footprint
 
   - key: mainlineDeployer.registryMaintenance.threshold
-    source: override
+    source: derived
     why: >-
-      The used-bytes-to-declared-bytes ratio that triggers reclamation. The
-      measurement it reads exists (the walker sidecar's on-disk bytes), so this is
-      the one number here closest to a loop: it is a hand-set threshold on a
-      measured input, and a derived version would weigh the reclaim cost against
-      the disk's free space.
+      The used-bytes-to-declared-bytes ratio that triggers reclamation,
+      recomputed on every poll from the volume's own readings: the growth
+      between two consecutive walker readings, projected over one measured
+      cooldown window, sets the headroom the threshold must leave (1 - growth
+      in the window / declared). The floor is one revision's measured unique
+      footprint, so a quiet volume still keeps one push of room. A faster
+      growing or smaller volume lowers the threshold and reclaims earlier
+      without a restart. The declared 0.5 is the seed used when the volume or
+      the declared size has not been read yet; the published target carries
+      which side the round used, and the evaluations counter shows every poll
+      evaluated the loop even when the target did not move.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: the_reclaim_threshold_follows_the_measured_growth_and_window
 
   - key: mainlineDeployer.rolloutJob.cpuRequest
     source: derived
@@ -2716,49 +2867,106 @@ rows:
       The memory request of the same pod, counted into the reserved total the
       way the limit is counted into the ceiling.
   - key: resourceGovernance.limitRange.defaultCpu
-    source: override
+    source: derived
     why: >-
-      The default for a container that declares no CPU. It is a hand-set practice:
-      low enough that a forgotten declaration is visible in the totals, high
-      enough that it does not throttle an idle sidecar. The projection copies it
-      through unchanged.
+      The CPU limit a container that declares none gets. It is one more call of
+      the same law the per-container targets already use, on the same beat: the
+      namespace's measured container requests are collapsed into one typical
+      container (median request, p95 limit with the same headroom), clamped into
+      the LimitRange's own admitted [min,max], and written back onto the
+      `cogneva-limits` object as a merge patch carrying the full `spec.limits`
+      array (the PVC entry and the max/min ride along; a partial patch would
+      drop them). Admission reads the object, not this reading -- not writing
+      back would leave the measured shape on the reading face only. Until any
+      container has been measured the object's own declared default is published
+      as the seed. The value in force and its `source` are published per
+      limitRange, and every evaluation is counted, so "the value did not move"
+      and "the loop did not run" are different readings.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: DEFAULT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: the_namespace_default_follows_the_measured_requests
 
   - key: resourceGovernance.limitRange.defaultMemory
-    source: override
+    source: derived
     why: >-
-      The memory default for the same containers; same reasoning as the CPU
-      default, and likewise copied through by the projection.
+      The memory limit for the same containers: the same call of the same law
+      (p95 over the window with the configured headroom, quantized up), clamped
+      into the LimitRange's admitted range and written back with the full
+      `spec.limits` array. Published per limitRange with its `source` and the
+      evaluation counter beside the other three defaults.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: DEFAULT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: the_namespace_default_follows_the_measured_requests
 
   - key: resourceGovernance.limitRange.defaultRequestCpu
-    source: override
+    source: derived
     why: >-
-      The request a container gets when it declares none. A practice rather than a
-      measurement: the scheduler needs some number, and a small one keeps a
-      forgotten declaration out of the reserved total.
+      The CPU request a container that declares none gets: the median of the
+      namespace's measured container requests, clamped into the LimitRange's
+      admitted [min,max] with the limit kept at or above it (a request above its
+      limit is rejected at admission). Written back with the full
+      `spec.limits` array, published per limitRange with its `source`, and
+      counted on the same evaluation counter.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: DEFAULT_REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: the_namespace_default_follows_the_measured_requests
 
   - key: resourceGovernance.limitRange.defaultRequestMemory
-    source: override
+    source: derived
     why: >-
-      The memory request for the same containers; same reasoning as the CPU
-      request default.
+      The memory request for the same containers: the same median, quantized up
+      to the loop's memory grid, clamped into the LimitRange's admitted range
+      with the limit at or above it, written back with the full `spec.limits`
+      array and published per limitRange with its `source`.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: DEFAULT_REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: the_namespace_default_follows_the_measured_requests
 
   - key: resourceGovernance.limitRange.minCpu
-    source: override
+    source: fixed
     why: >-
-      The admission floor for one container's CPU: below it a workload is almost
-      certainly a typo, and the scheduler cannot do anything useful with it.
+      The admission floor for one container's CPU. It is the resource loop's own
+      quantization grid (`CPU_QUANTUM_MILLICORES`, 10m): the loop never writes a
+      request below one quantum, so a floor at that quantum refuses exactly what
+      the loop cannot express. A different floor would be an admission rule the
+      measurements are not on the same grid as, and the two would disagree in a
+      direction nobody could name.
 
   - key: resourceGovernance.limitRange.minMemory
-    source: override
+    source: fixed
     why: >-
-      The admission floor for one container's memory; same reasoning as the CPU
-      floor.
+      The admission floor for one container's memory: the same quantum
+      (`MEMORY_QUANTUM_BYTES`, 16Mi) the resource loop rounds to, for the same
+      reason as the CPU floor.
 
   - key: resourceGovernance.limitRange.pvcMinStorage
-    source: override
+    source: fixed
     why: >-
-      The smallest PVC the namespace admits. A practice that keeps an empty claim
-      from looking intentional; nothing measures it.
+      The smallest PVC the namespace admits. It is the volume loop's own grid:
+      `volume_capacity.rs` rounds a grown claim up to whole GiB, so a floor of
+      1Gi refuses exactly the claims that loop cannot express. Nothing measures
+      it, and nothing should: it is the scale at which the only writer of
+      storage requests works.
 
   # --- sandbox executor -------------------------------------------------------
   # `sandboxExecutor.buildCacheMaxBytes` 没有行：values 里不再有这个数。上限是
@@ -2795,60 +3003,80 @@ rows:
       test: the_cache_walk_interval_follows_the_slowest_pass
 
   - key: sandboxExecutor.maxTaskWorkspaces
-    source: override
+    source: derived
     why: >-
-      A policy ceiling -- how many task worktrees this executor serves at once
-      -- not a statement about the machine. The effective cap is the lower of
-      this and what the volume is measured to hold: on every GC pass the
-      executor reads `df` available bytes on the workspaces root, divides by
-      the size of one tree measured in that same pass, and keeps 15% of the
-      room free for git writes. Trees growing with the repository and
-      co-tenants filling the volume both lower that reading, so the disk stops
-      this ceiling from outliving the volume.
-      `the_worktree_cap_follows_the_volume_and_the_measured_tree_size` shows
-      the reading following both inputs; the executor logs `declared` beside
-      `measured` whenever the volume is the tighter of the two.
-      2026-11-07: the ceiling was 8 while 14 distinct tasks were active inside
-      half an hour, so the executor built 17 trees and reclaimed 18 in that
-      window -- one task's tree was reclaimed and rebuilt four times in five
-      minutes, and each rebuild costs 9 seconds here (measured) and restores
-      only committed content, so an agent's uncommitted files go with the tree.
-      Raised to 32: about one hour of arrivals at the measured rate, and about
-      1.6 GiB of trees.
-      On a directory-backed volume (local-path) the `df` reading on the
-      workspaces root describes the node's filesystem, not the claim, so the
-      measured side cannot bind here and this ceiling is the only cap in
-      force -- the tightness the paragraph above describes is a claim on which
-      this deployment cannot currently collect.
+      How many task worktrees the volume can hold at the size these trees
+      actually measure. Every reclamation pass reads `df` available bytes on
+      the workspaces root, divides by the size of one tree measured in that
+      same pass, and keeps one tree's worth of room free for the git writes of
+      the next cut. Trees growing with the repository and co-tenants filling
+      the volume both move that reading, and the pass after either answers a
+      different cap.
+      The configured number is the seed: before any tree exists there is no
+      per-tree figure to divide by, and it stops applying as soon as one does.
+      What it was before this: a policy ceiling that stayed in force alongside
+      the measurement, and on 2026-11-07, at 8 while 14 distinct tasks were
+      active inside half an hour, it was the tighter of the two -- the executor
+      built 17 trees and reclaimed 18 in that window, one task's tree was
+      reclaimed and rebuilt four times in five minutes, and each rebuild costs
+      9 seconds here (measured) and restores only committed content, so an
+      agent's uncommitted files went with the tree. A number about this volume
+      cannot outlive this volume that way; the reading can only be as wrong as
+      the next pass.
+      On a directory-backed volume (local-path) `df` on the workspaces root
+      describes the node's filesystem. That is the volume's backing store, so
+      it is still the room these trees have -- what it does not give is a
+      per-claim attribution, and nothing here needs one.
+    published:
+      # The number in force and the one input set that chose it. A rule reading
+      # only the seed could not tell a pass that measured from a pass that
+      # never had a tree to measure.
+      owner: crates/cog-extension/src/workdir.rs
+      file: crates/cog-extension/src/workdir.rs
+      metric: WORKSPACE_CAP_METRIC
+      label: source
+    proof:
+      # Grows the measured footprint on the same router and reads a different
+      # cap from the very next pass; the evaluation counter shows the beat ran.
+      file: crates/cog-extension/src/workdir.rs
+      test: the_worktree_cap_is_recomputed_from_the_volume_on_the_next_pass
 
   - key: sandboxExecutor.warmTrees
-    source: override
+    source: derived
     why: >-
       How many trees are kept cut and waiting so an arriving task does not pay
-      for a checkout. What it buys is one number: a conversation's first tool
-      call measured 6.69 s end to end, 6.5 s of it `git worktree add` (3403 ms
-      measured on its own for this 49 MB repository), against 0.128 s for the
-      same command five minutes later in a tree that already existed. A value
-      of 2 covers the measured arrival rate -- about 1.1 tasks a minute against
-      a 3.4 s refill -- and the pool is bounded twice more without this number:
-      it never exceeds half the task ceiling, and its slots count against that
-      same ceiling rather than beside it, so a refill at a full ceiling
-      reclaims the least recently used task tree instead of standing down.
-      2026-11-07, the second bound was the other way round: a refill stood down
+      for a checkout. The size is Little's law over two measurements: how many
+      lanes get a tree per second (arrival timestamps kept in a window), times
+      how long one checkout costs (the median of the last successful
+      `git worktree add` durations). Their product is how many arrivals are
+      waiting while one tree is cut, which is exactly the pool that removes
+      that wait. The target is clamped to half the measured task capacity: the
+      pool exists to make arrivals cheap, and spending the capacity on trees no
+      task has asked for would make the tasks themselves wait.
+      The configured number is the seed, and only applies until both
+      measurements exist. What it was measured at: a conversation's first tool
+      call took 6.69 s end to end, 6.5 s of it `git worktree add` (3403 ms on
+      its own for this 49 MB repository), against 0.128 s for the same command
+      five minutes later in a tree that already existed. About 1.1 tasks a
+      minute against a 3.4 s refill is what made 2 the seed.
+      2026-11-07, one former bound was the other way round: a refill stood down
       whenever the ceiling was full, and with the ceiling at 32 and the volume
-      holding 32 the pool was drained by two hand-outs at 09:04 and 09:13 and
-      never refilled again -- every arrival after that paid the checkout the
-      pool exists to remove, while the log read healthy, because the one refill
-      that happened and the hand-outs were each recorded and the standing down
-      was not. What a slot costs now is the directory of one task tree the next
-      arrival would have reclaimed anyway. Measured after it first shipped (30
-      minutes on 2026-11-07): 11 hand-outs against 3 fresh cuts and 2 LRU
-      reclaims, where the same lane had been 17 cuts and 17 reclaims in 40
-      minutes -- so two is enough for the arrival rate, and what a third
-      simultaneous arrival costs is one cut. That fallback got cheap on the same
-      day: with the pod at 4 cores a cut measures 0.6-0.8 s, so a burst of three
-      new conversations measured 1.1-4.1 s per first tool call rather than 6.5 s
-      each. Raising this number buys that burst case and nothing else.
+      holding 32 the pool was drained by two hand-outs and never refilled
+      again. What a slot costs now is the directory of one task tree the next
+      arrival would have reclaimed anyway.
+    published:
+      # The target in force and the input set that chose it, plus the number of
+      # recomputations: a target that happens not to move still has to show the
+      # pass that read its inputs is running.
+      owner: crates/cog-extension/src/workdir.rs
+      file: crates/cog-extension/src/workdir.rs
+      metric: WARM_TREES_METRIC
+      label: source
+    proof:
+      # Feeds the two measurements to the running router and reads the target
+      # back on the next pass, with the evaluation counter moving with it.
+      file: crates/cog-extension/src/workdir.rs
+      test: the_warm_pool_target_is_recomputed_on_the_next_reclamation_pass
 
   - key: sandboxExecutor.repoFetchIntervalSecs
     source: derived
@@ -3028,10 +3256,23 @@ rows:
       ports because those inject upstream credentials. An address.
 
   - key: securityGateway.replicas
-    source: override
+    source: derived
     why: >-
-      One replica on a single-node cluster; a second adds memory and credential
-      copies without availability. Load per replica is not measured to derive it.
+      The same failure-domain law as the main gateway: one Ready node gets one
+      replica, two or more get two, and the security gateway carries
+      `cogneva.io/replica-policy: topology` so the workload-resources loop
+      patches it from the live node count. The seed applies only until the
+      first read. The rendered PostgreSQL sharing count budgets for the
+      worst-case two replicas, so each credential-holding process divides the
+      server's ceiling by the number of processes that can exist at once.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REPLICAS_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_workload_replicas_follow_the_ready_node_count
 
   - key: securityGateway.gitMirror.stallSecs
     source: derived

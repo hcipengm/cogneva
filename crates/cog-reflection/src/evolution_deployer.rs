@@ -372,6 +372,12 @@ impl EvolutionDeployer {
         for (name, value) in release_build_env(self.target_dir.as_deref()) {
             cmd.env(name, value);
         }
+        // 每道构建的并行宽度取构建闸这一拍量出来的份额（宿主核数 ÷ 一个构建的
+        // 需求），与主线构建同一份测量。闸没装或还没量到宿主时保留进程环境里的
+        // 声明值——那是这台部署给出的种子，不是第二处默认。
+        if let Some(jobs) = crate::build_gate::cargo_jobs() {
+            cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+        }
         let started = Instant::now();
         // 这段构建不再有一个按秒的预算。判据是它还在不在动：每写出一段输出是一拍，
         // CPU 时间在涨也是一拍——后者是「沉默的编译」唯一的「还在动」证据，而没有

@@ -26,8 +26,9 @@
 //! WorkspaceManager: cog-extension must not depend on upper crates, and only
 //! about a hundred lines of that semantics apply here.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,7 +58,7 @@ const DEFAULT_TTL_SECS: u64 = 21600;
 const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
 // cap: bound — seed; applies only until the first observed move of main, then the fetch period follows that
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
-// cap: bound — policy ceiling when the deployment names none; the disk measurement can still lower it
+// cap: bound — seed when the deployment names none; the volume's own reading replaces it as soon as one tree exists
 const DEFAULT_MAX_WORKSPACES: usize = 8;
 
 /// Trees kept cut and ready under `workspaces/.warm`, so a new task's first
@@ -72,7 +73,7 @@ const DEFAULT_MAX_WORKSPACES: usize = 8;
 /// is only worth holding
 /// until the next arrival: arrivals measured ~1.1 a minute on this host, and
 /// the refill runs off the request path.
-// cap: bound — seed; a deployment that names none gets two, the pool never holds more than half the task ceiling
+// cap: bound — seed; applies until an arrival rate and a checkout cost have both been measured
 const DEFAULT_WARM_TREES: usize = 2;
 
 /// Where warm trees wait between arrivals. Dot-prefixed because every listing
@@ -143,6 +144,80 @@ const SOURCES: [&str; 3] = ["configured", "floor", "measured"];
 
 /// The published name of the idle TTL the reclamation pass is using.
 const TTL_METRIC: &str = "sandbox_workspace_ttl_seconds";
+
+/// How many task trees the volume is measured to hold, and the input set that
+/// chose it. The deployment's number is only the seed: before a tree exists
+/// there is no per-tree figure to divide the volume by, and after one exists
+/// the volume's own reading is the cap.
+const WORKSPACE_CAP_METRIC: &str = "sandbox_workspace_cap";
+
+/// How many times the cap has been recomputed. The number itself only moves
+/// when the volume or the trees do; this shows the pass that reads them is
+/// running.
+const WORKSPACE_CAP_EVALUATIONS_METRIC: &str = "sandbox_workspace_cap_evaluations_total";
+
+/// The input sets [`WORKSPACE_CAP_METRIC`] can name: the deployment's seed
+/// before any tree has been measured, the volume's reading after.
+const CAP_SOURCES: [&str; 2] = ["seed", "measured"];
+
+/// The number of trees the pool is keeping ready, and the input set that chose
+/// it. The seed is what the deployment names; the measurement is an arrival
+/// rate times a checkout cost. Without this series the seed is the only number
+/// anyone can see, and a pool that never left it looks the same as a pool whose
+/// law happens to agree with it.
+const WARM_TREES_METRIC: &str = "sandbox_workspace_warm_trees";
+
+/// How many times the pool's target has been recomputed. A value that only
+/// changes when its inputs do cannot show that the loop is running; this can.
+const WARM_TREES_EVALUATIONS_METRIC: &str = "sandbox_workspace_warm_trees_evaluations_total";
+
+/// The input sets [`WARM_TREES_METRIC`] can name: the deployment's seed before
+/// both measurements exist, the measurement after.
+const WARM_TREES_SOURCES: [&str; 2] = ["seed", "measured"];
+
+/// The window arrival samples are kept over. Longer than any working day, so a
+/// burst is not averaged away by the quiet hours around it.
+const ARRIVAL_WINDOW_SECS: i64 = 7 * 24 * 3600;
+
+/// How many arrival timestamps to keep. A cap rather than a promise: the window
+/// above already bounds the queue for realistic rates, and this bounds it for
+/// a pathological one.
+const MAX_ARRIVAL_SAMPLES: usize = 1024;
+
+/// How many checkout durations to keep for the median. Small on purpose: the
+/// cost follows the repository's size, which changes over days, not seconds.
+const CHECKOUT_SAMPLES: usize = 32;
+
+/// How many ready trees are worth holding: Little's law over the two costs the
+/// pool trades against each other.
+///
+/// An arrival every `span / arrivals` seconds, each costing `checkout_secs` to
+/// serve, means that many arrivals are in flight while one tree is being cut.
+/// Holding exactly that many removes the checkout from the request path without
+/// spending the volume on trees no one has asked for. The ceiling is half the
+/// task capacity, because the pool exists to make arrivals cheap and spending
+/// the whole volume on trees no task has asked for would make the tasks
+/// themselves wait.
+///
+/// `None` until both a rate and a cost have been measured: a number invented
+/// from one measurement is the configured value wearing a measurement's
+/// clothes.
+fn warm_trees_from(
+    arrivals: usize,
+    span_secs: u64,
+    checkout_secs: f64,
+    ceiling: usize,
+) -> Option<usize> {
+    if arrivals < 2 || span_secs == 0 || checkout_secs <= 0.0 {
+        return None;
+    }
+    if ceiling == 0 {
+        return Some(0);
+    }
+    let per_second = arrivals as f64 / span_secs as f64;
+    let in_flight = (per_second * checkout_secs).ceil() as usize;
+    Some(in_flight.clamp(1, ceiling))
+}
 
 /// The published name of the wait the volume walk is currently keeping.
 const VOLUME_WALK_INTERVAL_METRIC: &str = "sandbox_volume_walk_interval_seconds";
@@ -385,11 +460,20 @@ pub struct WorkdirConfig {
     pub ttl: Duration,
     pub gc_interval: Duration,
     pub fetch_interval: Duration,
+    /// The cap's seed: how many trees this executor is meant to serve before
+    /// the volume has been measured. Once a tree exists its own size and the
+    /// volume's free room set the cap, and this stops applying.
     pub max_workspaces: usize,
-    /// How many trees to keep cut and ready under [`WARM_DIR_NAME`]. Never
-    /// more than half the task ceiling: the pool exists to make arrivals
-    /// cheap, and spending the ceiling on trees no task has asked for would
-    /// make the tasks themselves wait.
+    /// A fixture volume of a known capacity, for tests that need a ceiling
+    /// smaller than a test host's disk. Production never sets it: the cap is
+    /// what the volume measures.
+    #[cfg(test)]
+    pub cap_override: Option<usize>,
+    /// How many trees to keep cut and ready under [`WARM_DIR_NAME`], before an
+    /// arrival rate and a checkout cost have both been measured. The measured
+    /// target is clamped to half the task capacity: the pool exists to make
+    /// arrivals cheap, and spending the capacity on trees no task has asked
+    /// for would make the tasks themselves wait.
     pub warm_trees: usize,
     /// Claim-backed volumes this process measures the footprint of. Which claim
     /// backs which directory is a fact only the deployment knows, so it comes
@@ -431,8 +515,7 @@ impl WorkdirConfig {
         let warm = std::env::var("SANDBOX_WARM_TREES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_WARM_TREES)
-            .min(max / 2);
+            .unwrap_or(DEFAULT_WARM_TREES);
         let (data_volumes, data_volume_declaration_error) =
             match std::env::var(cog_core::claim_footprint::MOUNTS_ENV) {
                 Ok(raw) => match cog_core::claim_footprint::parse_claim_paths(&raw) {
@@ -494,6 +577,8 @@ impl WorkdirConfig {
                 30,
             ),
             max_workspaces: max,
+            #[cfg(test)]
+            cap_override: None,
             warm_trees: warm,
             data_volumes,
             data_volume_declaration_error,
@@ -568,6 +653,14 @@ pub struct WorkdirMetrics {
     gc_interval_seconds: PeriodGauge,
     /// The volume walk's interval in force, published the same way.
     volume_walk_interval_seconds: PeriodGauge,
+    /// The task-tree cap in force, and the input set that chose it.
+    cap: Gauge,
+    cap_source: GaugeVec,
+    cap_evaluations: Counter,
+    /// The warm pool's target in force, and the input set that chose it.
+    warm_trees: Gauge,
+    warm_trees_source: GaugeVec,
+    warm_trees_evaluations: Counter,
 }
 
 impl WorkdirMetrics {
@@ -654,6 +747,57 @@ impl WorkdirMetrics {
             "Seconds between walks of the volumes this executor writes",
             cfg.data_volume_interval,
         )?;
+        let cap = Gauge::new(
+            WORKSPACE_CAP_METRIC,
+            "Task worktrees the volume is measured to hold at the size these trees are",
+        )?;
+        let cap_source = GaugeVec::new(
+            Opts::new(
+                format!("{WORKSPACE_CAP_METRIC}_source"),
+                "Which input set chose the task-tree cap: 1 for that one, 0 for the other",
+            ),
+            &[SOURCE_LABEL],
+        )?;
+        let cap_evaluations = Counter::new(
+            WORKSPACE_CAP_EVALUATIONS_METRIC,
+            "Recomputations of the task-tree cap from the volume's reading",
+        )?;
+        registry.register(Box::new(cap.clone()))?;
+        registry.register(Box::new(cap_source.clone()))?;
+        registry.register(Box::new(cap_evaluations.clone()))?;
+        cap.set(cfg.max_workspaces as f64);
+        for candidate in CAP_SOURCES {
+            cap_source
+                .with_label_values(&[candidate])
+                .set(if candidate == "seed" { 1.0 } else { 0.0 });
+        }
+        let warm_trees = Gauge::new(
+            WARM_TREES_METRIC,
+            "Trees the warm pool is keeping cut and ready, chosen from an arrival rate and a checkout cost",
+        )?;
+        let warm_trees_source = GaugeVec::new(
+            Opts::new(
+                format!("{WARM_TREES_METRIC}_source"),
+                "Which input set chose the pool target: 1 for that one, 0 for the other",
+            ),
+            &[SOURCE_LABEL],
+        )?;
+        let warm_trees_evaluations = Counter::new(
+            WARM_TREES_EVALUATIONS_METRIC,
+            "Recomputations of the warm pool target by the reclamation pass",
+        )?;
+        registry.register(Box::new(warm_trees.clone()))?;
+        registry.register(Box::new(warm_trees_source.clone()))?;
+        registry.register(Box::new(warm_trees_evaluations.clone()))?;
+        // Registered at the seed rather than at zero: zero would read as a
+        // pool that has been turned off, which is a decision the measurement
+        // has not made yet.
+        for candidate in WARM_TREES_SOURCES {
+            warm_trees_source
+                .with_label_values(&[candidate])
+                .set(if candidate == "seed" { 1.0 } else { 0.0 });
+        }
+        warm_trees.set(cfg.warm_trees as f64);
         Ok(Self {
             registry,
             workspaces,
@@ -669,7 +813,33 @@ impl WorkdirMetrics {
             ttl_seconds,
             gc_interval_seconds,
             volume_walk_interval_seconds,
+            cap,
+            cap_source,
+            cap_evaluations,
+            warm_trees,
+            warm_trees_source,
+            warm_trees_evaluations,
         })
+    }
+
+    /// Publish the task-tree cap in force and the one input set that chose it.
+    fn set_cap(&self, trees: usize, source: &str) {
+        self.cap.set(trees as f64);
+        for candidate in CAP_SOURCES {
+            self.cap_source
+                .with_label_values(&[candidate])
+                .set(if candidate == source { 1.0 } else { 0.0 });
+        }
+    }
+
+    /// Publish the pool target in force and the one input set that chose it.
+    fn set_warm_trees(&self, trees: usize, source: &str) {
+        self.warm_trees.set(trees as f64);
+        for candidate in WARM_TREES_SOURCES {
+            self.warm_trees_source
+                .with_label_values(&[candidate])
+                .set(if candidate == source { 1.0 } else { 0.0 });
+        }
     }
 
     pub fn render(&self) -> String {
@@ -798,6 +968,18 @@ pub struct WorkdirRouter {
     /// The same two for the walk over the volumes this executor writes.
     volume_pass_millis: AtomicU64,
     last_volume_walk_unix: AtomicI64,
+    /// How many ready trees the pool should hold right now. Seeded from the
+    /// deployment, then recomputed by every reclamation pass from the arrival
+    /// rate and the checkout cost it measures.
+    warm_target: AtomicUsize,
+    /// When lanes last arrived, most recent last. The rate is counted over the
+    /// span these cover, so a burst is visible while it happens rather than
+    /// averaged away against the process's whole life.
+    arrivals: std::sync::Mutex<VecDeque<i64>>,
+    /// The last few successful checkout durations, in milliseconds. A checkout
+    /// is the cost the pool removes from the request path, and it is what the
+    /// rate is multiplied by.
+    checkout_millis: std::sync::Mutex<VecDeque<u64>>,
 }
 
 impl WorkdirRouter {
@@ -826,6 +1008,7 @@ impl WorkdirRouter {
             })
             .collect();
         let build_cache = Arc::new(cfg.build_cache.readings(cfg.target_dir.clone()));
+        let warm_seed = cfg.warm_trees;
         Ok(Arc::new(Self {
             cfg,
             meta_dir,
@@ -846,6 +1029,9 @@ impl WorkdirRouter {
             last_cache_walk_unix: AtomicI64::new(0),
             volume_pass_millis: AtomicU64::new(0),
             last_volume_walk_unix: AtomicI64::new(0),
+            warm_target: AtomicUsize::new(warm_seed),
+            arrivals: std::sync::Mutex::new(VecDeque::new()),
+            checkout_millis: std::sync::Mutex::new(VecDeque::new()),
         }))
     }
 
@@ -983,6 +1169,100 @@ impl WorkdirRouter {
         self.cfg.workspaces_root.join(WARM_DIR_NAME)
     }
 
+    /// Record that a lane just got a tree, so the pool's target follows how
+    /// fast lanes actually arrive. Counted for a warm hand-out too: the pool
+    /// still has to replace the tree that was handed over, and the rate that
+    /// matters is arrivals, not checkouts.
+    fn note_arrival(&self) {
+        let now = unix_now();
+        let mut arrivals = self
+            .arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        arrivals.push_back(now);
+        while arrivals
+            .front()
+            .is_some_and(|first| now.saturating_sub(*first) > ARRIVAL_WINDOW_SECS)
+        {
+            arrivals.pop_front();
+        }
+        while arrivals.len() > MAX_ARRIVAL_SAMPLES {
+            arrivals.pop_front();
+        }
+    }
+
+    /// Record how long a successful checkout took. The median of the recent
+    /// samples is the cost the pool removes; the median rather than the mean so
+    /// one stalled `git worktree add` does not set the pool's size for as long
+    /// as it stays in the window.
+    fn note_checkout(&self, millis: u64) {
+        let mut samples = self
+            .checkout_millis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        samples.push_back(millis);
+        while samples.len() > CHECKOUT_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    /// How fast lanes arrive: how many got a tree, over the span the samples
+    /// cover. `None` until two arrivals are far enough apart in time to define
+    /// an interval.
+    fn arrival_rate(&self) -> Option<(usize, u64)> {
+        let arrivals = self
+            .arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = *arrivals.front()?;
+        let span = unix_now().saturating_sub(first);
+        (arrivals.len() >= 2 && span > 0).then_some((arrivals.len(), span as u64))
+    }
+
+    /// The checkout cost in force, as seconds.
+    fn checkout_secs(&self) -> Option<f64> {
+        let mut samples: Vec<u64> = self
+            .checkout_millis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        Some(median as f64 / 1000.0)
+    }
+
+    /// Recompute the pool's target from this pass's capacity, the arrival rate
+    /// and the checkout cost. `seed` stands until all three exist.
+    fn derive_warm_target(&self, capacity: usize) {
+        self.metrics.warm_trees_evaluations.inc();
+        let seed = self.cfg.warm_trees;
+        if seed == 0 {
+            self.warm_target.store(0, Ordering::Relaxed);
+            self.metrics.set_warm_trees(0, "seed");
+            return;
+        }
+        let ceiling = capacity / 2;
+        let measured = self.arrival_rate().and_then(|(arrivals, span)| {
+            warm_trees_from(arrivals, span, self.checkout_secs()?, ceiling)
+        });
+        match measured {
+            Some(target) => {
+                self.warm_target.store(target, Ordering::Relaxed);
+                self.metrics.set_warm_trees(target, "measured");
+            }
+            None => {
+                let target = seed.min(ceiling);
+                self.warm_target.store(target, Ordering::Relaxed);
+                self.metrics.set_warm_trees(target, "seed");
+            }
+        }
+    }
+
     /// The file that says a slot finished being cut. `git worktree add` writes
     /// the `.git` link before it checks anything out, so a slot caught halfway
     /// through looks exactly like a finished one -- and being handed a
@@ -1027,7 +1307,7 @@ impl WorkdirRouter {
     /// Returns whether one was taken; a pool that is empty, disabled, or whose
     /// move failed falls through to the ordinary checkout.
     async fn take_warm(&self, lane: &str, path: &Path) -> bool {
-        if self.cfg.warm_trees == 0 {
+        if self.warm_target.load(Ordering::Relaxed) == 0 {
             return false;
         }
         let slots = self.warm_slots().await;
@@ -1120,7 +1400,7 @@ impl WorkdirRouter {
     /// recorded the one refill and the two hand-outs and said nothing about the
     /// pool that stayed empty.
     async fn warm_pool_once(&self) {
-        let want = self.cfg.warm_trees;
+        let want = self.warm_target.load(Ordering::Relaxed);
         if want == 0 {
             return;
         }
@@ -1213,6 +1493,7 @@ impl WorkdirRouter {
         // tree adds nothing to the volume, so asking the cap to make room for
         // it would reclaim a tree nobody needed to lose.
         if self.take_warm(lane, &path).await {
+            self.note_arrival();
             self.refresh_count_metric().await;
             return Ok((path, true));
         }
@@ -1221,6 +1502,7 @@ impl WorkdirRouter {
             self.metrics.inc_error("worktree_add");
             return Err(e);
         }
+        self.note_arrival();
         self.refresh_count_metric().await;
         Ok((path, false))
     }
@@ -1275,7 +1557,12 @@ impl WorkdirRouter {
         }
         args.push(path.to_str().unwrap_or(""));
         args.push("main");
-        self.git_bare(&args).await.map(|_| ())
+        let started = std::time::Instant::now();
+        let out = self.git_bare(&args).await;
+        if out.is_ok() {
+            self.note_checkout(started.elapsed().as_millis() as u64);
+        }
+        out.map(|_| ())
     }
 
     /// Healthy = worktree dir present with the `.git` link the bare repo
@@ -1363,6 +1650,7 @@ impl WorkdirRouter {
         let now = unix_now();
         let trees = self.list_task_trees().await;
         let capacity = self.cap_for(&trees).await;
+        self.derive_warm_target(capacity);
         // Oldest arrival to now, so the span covers exactly the trees being
         // counted. Without a second tree there is no arrival interval to read,
         // and the configured TTL stands.
@@ -2196,28 +2484,32 @@ impl WorkdirRouter {
         parse_df(&String::from_utf8_lossy(&out.stdout))
     }
 
-    /// The cap this pass runs under. Two different numbers, and the lower one
-    /// wins: the configured value is a policy ceiling (how many trees this
-    /// executor is meant to serve at once), while the measured one is what the
-    /// volume can actually hold at the size these trees are. A policy ceiling
-    /// on its own cannot stop the disk filling up -- the trees grow with the
-    /// repository -- and a disk reading on its own cannot stop inotify watches
-    /// and git processes multiplying.
+    /// The cap this pass runs under: what the volume is measured to hold at
+    /// the size these trees are. The deployment's number is the seed for the
+    /// passes before any tree exists -- there is no per-tree figure to divide
+    /// the volume by yet -- and stops applying as soon as one does. A policy
+    /// ceiling that kept applying would be a number about a volume somebody
+    /// measured once, held against a volume that has changed since: trees grow
+    /// with the repository, and co-tenants fill the same disk.
     async fn cap_for(&self, trees: &[(String, PathBuf)]) -> usize {
-        let declared = self.cfg.max_workspaces;
+        self.metrics.cap_evaluations.inc();
+        #[cfg(test)]
+        if let Some(cap) = self.cfg.cap_override {
+            // A fixture volume of a known size: the cap tests need a ceiling
+            // the workspace root of a test host does not naturally provide.
+            self.metrics.set_cap(cap, "measured");
+            return cap;
+        }
         match self.measured_cap(trees).await {
             Some(measured) => {
-                if measured < declared {
-                    info!(
-                        declared,
-                        measured,
-                        trees = trees.len(),
-                        "task worktree cap lowered to what the volume holds"
-                    );
-                }
-                measured.min(declared)
+                self.metrics.set_cap(measured, "measured");
+                measured
             }
-            None => declared,
+            None => {
+                let seed = self.cfg.max_workspaces;
+                self.metrics.set_cap(seed, "seed");
+                seed
+            }
         }
     }
 
@@ -2613,6 +2905,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            cap_override: Some(8),
             warm_trees: 0,
             data_volumes: vec![ClaimMount {
                 claim: claim.to_string(),
@@ -2706,6 +2999,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            cap_override: Some(8),
             warm_trees: 0,
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
@@ -2765,6 +3059,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: 8,
+            cap_override: Some(8),
             warm_trees: 0,
             data_volumes: vec![
                 ClaimMount {
@@ -2970,6 +3265,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: max,
+            cap_override: Some(max),
             warm_trees: 0,
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
@@ -2996,6 +3292,7 @@ pub(crate) mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: max,
+            cap_override: Some(max),
             warm_trees: warm,
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
@@ -3771,6 +4068,18 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stale_git_lock_is_cleared_and_retried() {
+        // How old a lock has to be before it can only be a corpse is the
+        // deployment's own measured window doubled, not a number chosen here:
+        // until something has been measured no lock may be cleared, because a
+        // corpse cannot be told from a command still working. So the window is
+        // seeded first and the lock is backdated past twice it.
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            Duration::from_secs(300),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
@@ -3778,7 +4087,7 @@ pub(crate) mod tests {
         let gitdir = PathBuf::from(git_out(&path, &["rev-parse", "--absolute-git-dir"]));
         let lock = gitdir.join("index.lock");
         std::fs::write(&lock, "").unwrap();
-        // Backdate mtime past the 600s stale threshold.
+        // Backdate mtime past twice the 300s window seeded above.
         let old = std::time::SystemTime::now() - Duration::from_secs(900);
         let times = std::fs::FileTimes::new()
             .set_accessed(old)
@@ -3793,6 +4102,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(!lock.exists());
+        cog_core::progress::reset_for_tests();
     }
 
     /// The cap is a reading, not a setting: it says what this volume holds at
@@ -3824,6 +4134,121 @@ pub(crate) mod tests {
         // Nothing measured yet: no per-tree figure, so no invented cap.
         assert_eq!(workspace_cap(disk_with(4096), 0, 0), None);
         assert_eq!(workspace_cap(disk_with(4096), 0, 4), None);
+    }
+
+    /// The cap is not a setting: a pass reads the volume, and when the
+    /// footprint these trees occupy changes, the very next pass answers a
+    /// different cap. No restart, no configuration.
+    #[tokio::test]
+    async fn the_worktree_cap_is_recomputed_from_the_volume_on_the_next_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let cfg = WorkdirConfig {
+            workspaces_root: tmp.path().join("workspaces"),
+            bare_repo: bare.clone(),
+            target_dir: tmp.path().join("src").join("target"),
+            seed_urls: Vec::new(),
+            ttl: DEFAULT_TTL_SECS_FALLBACK,
+            gc_interval: Duration::from_secs(600),
+            fetch_interval: Duration::from_secs(300),
+            max_workspaces: 32,
+            cap_override: None,
+            warm_trees: 0,
+            data_volumes: Vec::new(),
+            data_volume_declaration_error: None,
+            data_volume_interval: Duration::from_secs(30),
+            build_cache: BuildCacheConfig::default(),
+        };
+        let r = WorkdirRouter::new(cfg).unwrap();
+        r.route("one").await.unwrap();
+        r.route("two").await.unwrap();
+        r.gc_once().await.unwrap();
+        let before = r.metrics().cap.get();
+        assert!(
+            before > 32.0,
+            "a volume this empty holds more than the seed: {before}"
+        );
+        assert_eq!(
+            r.metrics()
+                .cap_source
+                .with_label_values(&["measured"])
+                .get(),
+            1.0
+        );
+
+        // The same trees, a footprint eight mebibytes larger: the next pass
+        // can only answer a smaller cap. This is the input the law divides by.
+        std::fs::write(
+            tmp.path().join("workspaces").join("grown.bin"),
+            vec![0u8; 8 * 1024 * 1024],
+        )
+        .unwrap();
+        r.gc_once().await.unwrap();
+        let after = r.metrics().cap.get();
+        assert!(
+            after < before,
+            "the cap did not follow the measured footprint: {before} -> {after}"
+        );
+        assert!(r.metrics().cap_evaluations.get() >= 2.0);
+    }
+
+    /// The pool's size is a function of two measurements: how often lanes
+    /// arrive and what one checkout costs. A different input answers
+    /// differently, which is the whole difference between this and a number
+    /// someone chose.
+    #[test]
+    fn the_warm_pool_target_follows_arrivals_and_checkout_cost() {
+        // Two arrivals in a minute at a 3.4 s checkout: less than one tree in
+        // flight, so the pool holds one.
+        assert_eq!(warm_trees_from(2, 60, 3.4, 16), Some(1));
+        // Thirty a minute at the same cost: two are in flight while one is cut.
+        assert_eq!(warm_trees_from(30, 60, 3.4, 16), Some(2));
+        // The same arrivals against a cheaper checkout need one.
+        assert_eq!(warm_trees_from(30, 60, 1.0, 16), Some(1));
+        // Never more than half the capacity, however busy the volume is.
+        assert_eq!(warm_trees_from(6000, 60, 3.4, 4), Some(4));
+        // Nothing measured: no target, so the seed stands.
+        assert_eq!(warm_trees_from(1, 60, 3.4, 16), None);
+        assert_eq!(warm_trees_from(2, 0, 3.4, 16), None);
+        assert_eq!(warm_trees_from(2, 60, 0.0, 16), None);
+        assert_eq!(warm_trees_from(2, 60, 3.4, 0), Some(0));
+    }
+
+    /// The target is recomputed by every reclamation pass and published with
+    /// the input set that chose it. The evaluation counter is what shows the
+    /// beat is running when the number happens not to move.
+    #[tokio::test]
+    async fn the_warm_pool_target_is_recomputed_on_the_next_reclamation_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 1);
+        r.gc_once().await.unwrap();
+        assert_eq!(r.metrics().warm_trees.get(), 1.0);
+        assert_eq!(
+            r.metrics()
+                .warm_trees_source
+                .with_label_values(&["seed"])
+                .get(),
+            1.0
+        );
+        let beats = r.metrics().warm_trees_evaluations.get();
+
+        // Two arrivals a second apart and a checkout measured at 3.4 s: seven
+        // would be in flight, clamped to half the eight-tree capacity.
+        r.note_checkout(3400);
+        r.note_arrival();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        r.note_arrival();
+        r.gc_once().await.unwrap();
+        assert_eq!(r.metrics().warm_trees.get(), 4.0);
+        assert_eq!(
+            r.metrics()
+                .warm_trees_source
+                .with_label_values(&["measured"])
+                .get(),
+            1.0
+        );
+        assert!(r.metrics().warm_trees_evaluations.get() > beats);
     }
 
     /// Polling is paid for by how often the thing being polled changes.

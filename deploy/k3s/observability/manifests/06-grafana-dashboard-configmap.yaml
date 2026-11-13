@@ -3807,6 +3807,288 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 90,
+          "title": "Declarations The Loops Rewrite",
+          "description": "这四个数以前钉在部署面，现在各自由一个回路从实测重算：副本数跟着节点容量和负载需求走，启动失败预算跟着观测到的启动次数走，cargo 并行度跟着宿主核数与构建需求走，变更账一批几条跟着落地/退回的批次大小走。线动了是回路跟上了输入；线不动未必是回路停了——同一个输入得出同一个答案是正确行为，旁边的求值计数才是「还在算」的那一半证据。source 标签写明这条线是实测的答案还是种子仍在代班。",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 424
+          },
+          "targets": [
+            {
+              "expr": "max by (workload) (cogneva_workload_replicas)",
+              "legendFormat": "{{workload}} replicas",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (workload, container) (cogneva_workload_startup_failure_threshold)",
+              "legendFormat": "{{workload}}/{{container}} startup failures",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_build_gate_cargo_jobs)",
+              "legendFormat": "cargo jobs",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_ledger_rows_per_handover)",
+              "legendFormat": "ledger rows per handover",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 91,
+          "title": "Namespace CPU Defaults From Measurement",
+          "description": "命名空间的 LimitRange 给不声明资源的容器一个 CPU 上限与请求。这两个数以前钉在部署面，现在由回路取命名空间内容器请求的中位数，再夹进这只对象自己的 [min,max]。线跟着中位数走；limitrange 标签点名被写的那只对象。min 是量化网格（10m），那一条仍是固定的结构协议，不是可调的数。",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 424
+          },
+          "targets": [
+            {
+              "expr": "max by (limitrange) (cogneva_limit_range_default_cpu_millicores)",
+              "legendFormat": "{{limitrange}} limit",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (limitrange) (cogneva_limit_range_default_request_cpu_millicores)",
+              "legendFormat": "{{limitrange}} request",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 92,
+          "title": "Namespace Memory Defaults From Measurement",
+          "description": "同一套尺寸法则算内存，写进 LimitRange 的上限与请求。请求不超过上限是回路的写回前提，所以这里两条线要一起看：上限压到请求之下只可能是写回被夹过或输入突然变小，两者都值得追。",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 432
+          },
+          "targets": [
+            {
+              "expr": "max by (limitrange) (cogneva_limit_range_default_memory_bytes)",
+              "legendFormat": "{{limitrange}} limit",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (limitrange) (cogneva_limit_range_default_request_memory_bytes)",
+              "legendFormat": "{{limitrange}} request",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 93,
+          "title": "Every Declaration Loop's Beat",
+          "description": "每一条会重算声明的回路，在它算过的每一拍上给这个计数加一。上面的目标值可以因为输入没变而长时间是一条平线，那是回路算完后的正确结论；这条计数不能平——平了就是回路没了，声明冻在最后一个值上，而面板上看不出这两者的区别。回路按自己的节奏走：周期拍，或由某个事件触发，两种都算运行。",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 432
+          },
+          "targets": [
+            {
+              "expr": "sum by (pacing) (cogneva_pacing_evaluations_total)",
+              "legendFormat": "{{pacing}} cadence",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (knob) (cogneva_retention_evaluations_total)",
+              "legendFormat": "{{knob}} retention",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (workload) (cogneva_workload_replicas_evaluations_total)",
+              "legendFormat": "{{workload}} replicas",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (workload, container) (cogneva_workload_startup_failure_threshold_evaluations_total)",
+              "legendFormat": "{{workload}}/{{container}} startup",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (limitrange) (cogneva_limit_range_defaults_evaluations_total)",
+              "legendFormat": "{{limitrange}} namespace defaults",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_build_gate_cargo_jobs_evaluations_total)",
+              "legendFormat": "build gate",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_ledger_rows_per_handover_evaluations_total)",
+              "legendFormat": "ledger batch",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_task_router_claim_bound_evaluations_total)",
+              "legendFormat": "claim bound",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 94,
+          "title": "Retention Targets From Measurement",
+          "description": "每条保留回路量的是自己的输入到得多快，窗宽由那个速度导出。unit 说明这个数在数什么（行、天、条、秒），source 说明它是实测的答案还是种子仍在代班。输入稳定的日子里目标本来就不该动；动没动过由上方那一拍的计数作证，所以这条线要配着那条计数读。",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 440
+          },
+          "targets": [
+            {
+              "expr": "max by (knob, unit, source) (cogneva_retention_target)",
+              "legendFormat": "{{knob}} ({{unit}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 95,
+          "title": "Cadence Targets From Measurement",
+          "description": "每条回路自己的节奏跟着上一趟的实际耗时走：目标秒数是「按现在这个节奏，一件事大致要跑多久」的答案，source 说明它是实测的还是种子。回路跟上了输入，这条线才会动；停止的回路会把它和目标值一起留在最后一拍，所以它要和「Every Declaration Loop's Beat」里同名 pacing 的计数一起看。",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 448
+          },
+          "targets": [
+            {
+              "expr": "max by (pacing, source) (cogneva_pacing_target_seconds)",
+              "legendFormat": "{{pacing}} target (s)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

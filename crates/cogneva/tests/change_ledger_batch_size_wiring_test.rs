@@ -57,9 +57,11 @@ fn the_values_key_exists_and_reads_as_a_batch_size() {
         });
     let parsed = cog_orchestrator::change_ledger::parse_rows_per_handover(&value)
         .unwrap_or_else(|problem| panic!("values.yaml 里的 {VALUES_KEY} 进程读不动：{problem}"));
+    // 部署面写的 0 必须读成「按图导出」（`None`），不能读成「一拍零条」：前者是
+    // 回路在算，后者是一拍会一直攒、一条也派不出去。正数才是钉死的批大小。
     assert!(
-        parsed > 0,
-        "解析成功却得到 0 行一批：一拍会一直攒、一条也派不出去"
+        parsed.is_none_or(|rows| rows > 0),
+        "解析成功却得到一个零行一批的读数：0 只能读成「按图导出」"
     );
 }
 

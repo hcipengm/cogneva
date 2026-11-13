@@ -1135,6 +1135,106 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["pacing"],
         "crates/cog-core/src/pacing.rs",
     ),
+    // The declarations the loops rewrite: replicas and the startup failure
+    // budget per workload, the build gate's cargo width, and the change
+    // ledger's rows per handover. Each was a pinned value and each now moves
+    // with a measurement; `source` says whether the reading is the
+    // measurement's answer or the seed still in force. The evaluation counter
+    // beside each gauge is the half of the proof a scrape can see -- the value
+    // may hold still because the input did, so "the beat ran" needs its own
+    // series.
+    (
+        "cogneva_workload_replicas",
+        &["workload", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_replicas_evaluations_total",
+        &["workload", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_startup_failure_threshold",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_startup_failure_threshold_evaluations_total",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_build_gate_cargo_jobs",
+        &["dir", "role"],
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    (
+        "cogneva_build_gate_cargo_jobs_evaluations_total",
+        &["dir", "role"],
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    (
+        "cogneva_change_ledger_rows_per_handover",
+        &["source"],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
+        "cogneva_change_ledger_rows_per_handover_evaluations_total",
+        &[],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    // The namespace defaults the LimitRange loop writes: a container that
+    // declares nothing gets these four numbers, derived from the namespace
+    // median and clamped into the object's own bounds. `limitrange` names the
+    // object written; `source` separates measured values from seeds.
+    (
+        "cogneva_limit_range_default_cpu_millicores",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_limit_range_default_memory_bytes",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_limit_range_default_request_cpu_millicores",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_limit_range_default_request_memory_bytes",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_limit_range_defaults_evaluations_total",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    // The retention loops: one target per knob, with the unit it counts and
+    // whether the value is derived. A target that holds still is the loop
+    // agreeing with a steady input; the evaluation counter is what says the
+    // loop is still there to agree.
+    (
+        "cogneva_retention_target",
+        &["knob", "unit", "source"],
+        "crates/cog-core/src/retention.rs",
+    ),
+    (
+        "cogneva_retention_evaluations_total",
+        &["knob"],
+        "crates/cog-core/src/retention.rs",
+    ),
+    // The claim window's own evaluation count. The bound is per process, so
+    // the counter is too: it climbs when the window could be read and a bound
+    // computed, and stays still when there was no input to compute from --
+    // those are different facts and the panel draws it beside the bound.
+    (
+        "cogneva_task_router_claim_bound_evaluations_total",
+        &[],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

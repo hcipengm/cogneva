@@ -3345,6 +3345,12 @@ impl ChangePipeline {
         {
             cmd.env(key, value);
         }
+        // 编译宽度按构建闸这一拍的测量覆盖部署声明：闸已经把「宿主核数 ÷ 一个
+        // 构建要多少核」算成每道构建的份额，验证与主线构建读同一份。没有闸时上面
+        // 那趟透传的环境值就是种子，不在这里再写一个默认。
+        if let Some(jobs) = crate::build_gate::cargo_jobs() {
+            cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+        }
         // 刷新那一趟定下的工具链要真的被用上：只装不指等于没刷，而「用的是哪一把
         // 编译器」正是这条判据与 CI 会不会各说一套的全部内容。写在这里而不是写进
         // [`verification_env`]，因为后者是「部署的配置进不了判据」那条规则的载体，

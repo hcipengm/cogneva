@@ -55,11 +55,15 @@ spec:
               value: "false"
             - name: HOST_DOCS_AUDITED_LLM_URL
               value: "http://cogneva-security-gateway-audited:8083/v1/chat/completions"
-            # 一次提问带多少正文、最多带几份文件。两条都是"少做"的界：越过就整问都不问，而不是问一部分。
+            # 一次提问带多少正文、最多带几份文件。两条都是声明的下限（种子）：
+            # 回路的窗口由通道答过的问句抬高，这两个数只界定"证据"从多少开始。
             - name: HOST_DOCS_ASSIST_BODY_BYTES
               value: "2048"
             - name: HOST_DOCS_ASSIST_MAX_CANDIDATES
               value: "50"
+            # 受审通道自报的正文上限，与 chart 的同一条同源：探针不越过它。
+            - name: HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES
+              value: "8388608"
           volumeMounts:
             - name: host-docs-alice
               mountPath: /opt/cogneva/host-docs/alice

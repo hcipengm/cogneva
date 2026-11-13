@@ -787,6 +787,9 @@ impl BuildahReading<'_> {
 /// registry 保留回路的旋钮名：登记表里的键，也是读数上点名回路的那一维。
 pub const REGISTRY_RETENTION_KNOB: &str = "mainlineDeployer.registryMaintenance.retention";
 
+/// registry 回收阈值的旋钮名：与保留窗口同一条读数面，按 `knob` 标签分开。
+pub const REGISTRY_THRESHOLD_KNOB: &str = "mainlineDeployer.registryMaintenance.threshold";
+
 /// 每个 rev 的边际字节：删掉一个 rev 能释放多少。
 ///
 /// 只算「只有它一个 tag 引用的层」加它自己的元数据：与别的 tag 共用的层是共同
@@ -877,6 +880,39 @@ fn lineage_root<'a>(
                 .cmp(&b.layers.len())
                 .then(a.created_unix.cmp(&b.created_unix))
         })
+}
+
+/// 回收阈值这一拍该是多少：卷在**下一次来得及回收**之前还会长多少。
+///
+/// 阈值判的是「占用 ÷ 声明」这条线。它要压住的是两次回收之间那段时间里的增长：
+/// 两轮之间隔着冷却窗（冷却本身实测自一次回收重启让 tag 服务缺席多久），窗里新推
+/// 的 rev 继续占盘，而这段时间里没有第二次回收可救。所以阈值留出的正是这段增长
+/// 需要的空间——1 − 窗里的增长 ÷ 声明。增长越快、卷越小，阈值越低，回收来得越早。
+///
+/// 增长由相邻两拍体积读数之差除以间隔得到，是每拍一次真实读数，不是外推常数。
+/// 另外至少留一个 rev 的边际字节：上一次 tag 走查量到的一个 rev 实际占多少。
+/// 少了这一条，一段安静期里的阈值会停在 1.0——那时一次推送就能在两次读数之间把
+/// 卷写满，而回收还认为「没有增长、不需要动」。两个输入都量不到时返回 `None`：
+/// 没有「窗里要长多少」这句话可讲，由调用方落回部署声明的 seed。
+fn reclaim_threshold(
+    declared_bytes: u64,
+    growth: Option<(u64, u64)>,
+    window_secs: u64,
+    rev_footprint_bytes: Option<u64>,
+) -> Option<f64> {
+    if declared_bytes == 0 {
+        return None;
+    }
+    let accrued = growth.and_then(|(bytes, elapsed_secs)| {
+        (elapsed_secs > 0)
+            .then(|| bytes as f64 / elapsed_secs as f64 * window_secs as f64)
+    });
+    let reserve = match (accrued, rev_footprint_bytes) {
+        (None, None) => return None,
+        (accrued, footprint) => accrued.unwrap_or(0.0).max(footprint.unwrap_or(0) as f64),
+    };
+    let reserved = reserve.min(declared_bytes as f64) / declared_bytes as f64;
+    Some((1.0 - reserved).clamp(0.0, 1.0))
 }
 
 /// 容量回收是否到期。
@@ -3149,6 +3185,12 @@ pub struct MainlineDeployer {
     /// 两轮回收共用的冷却：从一次回收实测花多久导出。
     registry_cooldown_budget:
         std::sync::OnceLock<Option<std::sync::Arc<cog_core::pacing::TailBudget>>>,
+    /// 上一拍量到的卷占用与它的时刻。回收阈值读的是「相邻两拍之间长了多少」，
+    /// 所以要有一拍可减；进程重启后第一拍没有基线，落回 seed。
+    registry_volume_seen: std::sync::Mutex<Option<(i64, u64)>>,
+    /// 上一次 tag 走查量到的一个 rev 占多少字节（独有层加元数据，按 rev 平分）。
+    /// 阈值至少留出这一个 rev 的空间：安静期里也不能让一次推送把卷写满。
+    registry_rev_footprint: std::sync::Mutex<Option<u64>>,
 }
 
 /// 平台读失败的四支——只有在这一层还分得开。
@@ -3326,6 +3368,8 @@ impl MainlineDeployer {
             soak_budget: std::sync::OnceLock::new(),
             failure_cooldown_budget: std::sync::OnceLock::new(),
             registry_cooldown_budget: std::sync::OnceLock::new(),
+            registry_volume_seen: std::sync::Mutex::new(None),
+            registry_rev_footprint: std::sync::Mutex::new(None),
         }
     }
 
@@ -7310,6 +7354,44 @@ impl MainlineDeployer {
         target.max(0) as usize
     }
 
+    /// 这一拍的回收阈值：把上一拍的体积读数与这一拍的差换成「一个冷却窗里的增长」。
+    ///
+    /// 每拍都读一次、算一次、报一次，即使算出来与上一拍相同——「这一拍算过」由求值
+    /// 计数回答。测量齐备时（声明量与两拍体积都在）目标由实测决定并标 `derived`；
+    /// 缺一样就落回部署声明的 seed 并标 `seed`，与保留窗口同一条规矩。
+    fn effective_registry_threshold(
+        &self,
+        now: i64,
+        used: Option<u64>,
+        declared: Option<u64>,
+    ) -> f64 {
+        let growth = used.and_then(|used| {
+            let mut seen = self.registry_volume_seen.lock().unwrap();
+            let previous = *seen;
+            *seen = Some((now, used));
+            previous
+                .filter(|(at, _)| now > *at)
+                .map(|(at, before)| (used.saturating_sub(before), (now - at) as u64))
+        });
+        let footprint = *self.registry_rev_footprint.lock().unwrap();
+        let derived = declared.and_then(|declared| {
+            reclaim_threshold(
+                declared,
+                growth,
+                self.effective_registry_cooldown_secs(),
+                footprint,
+            )
+        });
+        let (target, derived) = match derived {
+            Some(threshold) => (threshold, true),
+            None => (self.cfg.registry_maintenance_threshold, false),
+        };
+        if let Some(readings) = &self.retention {
+            readings.evaluate(REGISTRY_THRESHOLD_KNOB, target, "ratio", derived);
+        }
+        target
+    }
+
     /// tag 服务答不答话：`GET /v2/` 通就是能服务。
     ///
     /// 问的是它自己给的回答，不是"它该起来了"的推断。读的也刻意是**最原始的那个
@@ -7518,18 +7600,26 @@ impl MainlineDeployer {
         // 本方法前面还压着一条更早的早退。回收动作本身仍然要等在飞滚动结束：在别人
         // 拉镜像时重启 registry 会把新副本打成 ErrImagePull，那正是判据归成环境类、
         // 不回滚的那种失败。
-        if state.in_flight.is_some() {
-            return;
-        }
+        // 两格读数与阈值在**在飞早退之前**取：阈值判的是卷的增长，与「这一轮推不
+        // 推进」无关；而一次滚动恰恰是往这张卷里写镜像的那段，跳过这几拍正好把
+        // 增长量成零。动作仍在下面，滚动在飞时不做。
         let now = chrono::Utc::now().timestamp();
         let used = self.registry_volume_used_bytes().await;
         let declared = self.registry_declared_bytes().await;
+        let threshold = self.effective_registry_threshold(
+            now,
+            used,
+            declared.filter(|bytes| *bytes >= 1.0).map(|bytes| bytes as u64),
+        );
+        if state.in_flight.is_some() {
+            return;
+        }
         if !maintenance_due(
             used,
             declared,
             state.registry_maintenance_unix,
             now,
-            self.cfg.registry_maintenance_threshold,
+            threshold,
             self.effective_registry_cooldown_secs(),
         ) {
             // 不到回收的时候，但**上一轮欠的账还没还**：欠账跟冷却无关——冷却管的是
@@ -7581,6 +7671,15 @@ impl MainlineDeployer {
                 return;
             }
         };
+        // 走查量到的「一个 rev 占多少」留给下一拍算阈值：安静期里阈值也至少留出
+        // 一个 rev 的空间，一次推送不会在两次读数之间把卷写满。没有可数的 rev 时
+        // 不动这一格——那不是「每个 rev 零字节」，是这一拍没有量到。
+        let revs = tags.iter().filter(|t| tag_rev(&t.tag).is_some()).count();
+        if revs > 0 {
+            if let Some(total) = marginal_bytes_per_rev(&tags) {
+                *self.registry_rev_footprint.lock().unwrap() = Some(total / revs as u64);
+            }
+        }
         // 保留窗口这一拍按实测的卷与每 rev 边际字节重算：声明里的数只是量不到时的
         // 种子，不是这次删除的天花板。
         let retention = self.effective_registry_retention(
@@ -9536,7 +9635,12 @@ impl MainlineDeployer {
     }
 
     async fn build_binary(&self, rev: &str) -> SFResult<()> {
-        let jobs = self.cfg.cargo_build_jobs.to_string();
+        // 宽度取构建闸这一拍量出来的份额：它已经把「宿主核数 ÷ 一个构建要多少核」
+        // 算成每道构建该拿多少，主线构建与验证构建读同一份，才不会一个按旧声明、
+        // 一个按实测各开各的。没有闸（没装、或还没量到宿主）时才落回声明的种子。
+        let jobs = crate::build_gate::cargo_jobs()
+            .unwrap_or(self.cfg.cargo_build_jobs as u64)
+            .to_string();
         let version_id = self.git_version_id(rev).await?;
         let cmdline = format!("cargo build --release --bin cogneva (jobs={jobs})");
         // CARGO_HOME 换 PVC 后，镜像 /usr/local/cargo/config.toml 里的 sparse
@@ -22972,6 +23076,20 @@ exit 0
         ]
     }
 
+    /// The volume that holds exactly `revs` of this fixture's revisions.
+    ///
+    /// The retention window is derived from the measured volume divided by the
+    /// measured per-rev footprint, not from the configured seed. These cases are
+    /// about what the whitelist and the closed set protect, so the volume has to
+    /// say "hold this many" in the same terms the derivation reads: one rev is
+    /// its config descriptor plus its manifest body plus the layer only it
+    /// references, and the fixture states all three.
+    fn volume_holding_revs(revs: u64) -> String {
+        let body = oci_manifest("sha256:c0", &["L0"]);
+        let per_rev = 10 + 10 + body.len() as u64;
+        (per_rev * revs).to_string()
+    }
+
     /// 回收只删保留窗之外、且不在保留集里的 rev：窗内两个不动，浮动签与基底不
     /// 动（闭集），正在跑的部署不动（白名单）。删完让 registry 重启一次——它的
     /// initContainer 才是 GC。
@@ -22981,7 +23099,7 @@ exit 0
         let root = tmp.path();
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry", "");
+        let kubectl = fake_kubectl_pvc(&bin_dir, &volume_holding_revs(2), "cogneva-registry", "");
         let claim = "cogneva-registry-pvc";
 
         let tags = [
@@ -23108,7 +23226,7 @@ exit 0
         std::fs::create_dir_all(&bin_dir).unwrap();
         let kubectl = fake_kubectl_pvc(
             &bin_dir,
-            "10Gi",
+            &volume_holding_revs(2),
             "cogneva-registry",
             "localhost:30500/cogneva:main-000000000001 foreign.example/cogneva:main-000000000002",
         );
@@ -23217,6 +23335,7 @@ exit 0
         std::fs::create_dir_all(&bin_dir).unwrap();
         let log = bin_dir.join("kubectl.log");
         let count = bin_dir.join("restarts");
+        let volume = volume_holding_revs(retention as u64);
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> '{log}'
@@ -23233,13 +23352,14 @@ case "$*" in
       exit 1
     fi
     echo "deployment.apps/cogneva-registry restarted" ;;
-  *) printf '%s' '10Gi' ;;
+  *) printf '%s' '{volume}' ;;
 esac
 exit 0
 "#,
             log = log.display(),
             count = count.display(),
-            failures = restart_failures
+            failures = restart_failures,
+            volume = volume
         );
         let kubectl = write_fake_bin(&bin_dir, "fake-kubectl", &script)
             .to_string_lossy()
@@ -24199,6 +24319,74 @@ exit 0
         off.registry_retention = 0;
         let off = MainlineDeployer::new(off, test_workspaces(root, Path::new("/nonexistent")));
         assert_eq!(off.effective_registry_retention(&tags(), Some(1000)), 0);
+    }
+
+    /// 回收阈值是这一拍实测的函数：窗里的增长越大、卷越小，阈值越低（回收来得越早），
+    /// 且至少留出一个实测 rev 的空间。相邻两拍读数一变，下一拍的读数面就跟着变，
+    /// 不需要重启；量不到时如实落回 seed。
+    #[test]
+    fn the_reclaim_threshold_follows_the_measured_growth_and_window() {
+        // 10000 字节的卷、3600 秒的窗：600 秒里长了 100 字节，窗里就是 600，
+        // 阈值 = 1 − 600/10000。
+        let slow = reclaim_threshold(10_000, Some((100, 600)), 3_600, None).unwrap();
+        assert!((slow - 0.94).abs() < 1e-9, "{slow}");
+        // 增长翻倍，留出的空间翻倍，阈值下降。
+        let fast = reclaim_threshold(10_000, Some((200, 600)), 3_600, None).unwrap();
+        assert!((fast - 0.88).abs() < 1e-9, "{fast}");
+        // 窗更长（回收更少、每次要等更久），同样要留出的更多。
+        let longer = reclaim_threshold(10_000, Some((100, 600)), 7_200, None).unwrap();
+        assert!(longer < slow, "{longer} vs {slow}");
+        // 增长已经超过整张卷：阈值压到 0（每次许可都该回收），不会变成负数。
+        assert_eq!(
+            reclaim_threshold(10_000, Some((10_000, 1)), 3_600, None),
+            Some(0.0)
+        );
+        // 安静期里没有增长，但一个 rev 实测占 500 字节：至少留出它的空间，
+        // 否则一次推送就能在两次读数之间把卷写满。
+        assert_eq!(
+            reclaim_threshold(10_000, Some((0, 60)), 3_600, Some(500)),
+            Some(0.95)
+        );
+        // 两个量都量不到时没有「窗里要长多少」这句话，调用方落回 seed。
+        assert_eq!(reclaim_threshold(10_000, None, 3_600, None), None);
+        assert_eq!(reclaim_threshold(0, Some((100, 60)), 3_600, None), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "buildah", "kubectl");
+        cfg.registry_maintenance_threshold = 0.5;
+        cfg.registry_maintenance_cooldown_secs = 3_600;
+        let readings = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+                .with_retention(readings.clone());
+        let declared = Some(10_000);
+        // 第一拍没有上一拍可减：仍是声明的 seed，读数如实标 seed。
+        assert_eq!(
+            deployer.effective_registry_threshold(1_000, Some(1_000), declared),
+            0.5
+        );
+        assert_eq!(
+            readings.reading(REGISTRY_THRESHOLD_KNOB),
+            Some((0.5, 1, false))
+        );
+        // 第二拍：60 秒里长了 100 字节 → 窗里 6000 → 阈值 0.4，来源翻成 derived。
+        let second = deployer.effective_registry_threshold(1_060, Some(1_100), declared);
+        assert!((second - 0.4).abs() < 1e-9, "{second}");
+        assert_eq!(
+            readings.reading(REGISTRY_THRESHOLD_KNOB),
+            Some((second, 2, true))
+        );
+        // 第三拍：同样 60 秒长了 4000 字节，超过整张卷 → 阈值 0，回收每次许可都来。
+        let third = deployer.effective_registry_threshold(1_120, Some(5_100), declared);
+        assert_eq!(third, 0.0);
+        // 第四拍没有增长，但走查量到一个 rev 占 500 字节 → 至少留出这 5%。
+        *deployer.registry_rev_footprint.lock().unwrap() = Some(500);
+        let quiet = deployer.effective_registry_threshold(1_180, Some(5_100), declared);
+        assert!((quiet - 0.95).abs() < 1e-9, "{quiet}");
+        let (_, evaluations, derived) = readings.reading(REGISTRY_THRESHOLD_KNOB).unwrap();
+        assert_eq!(evaluations, 4, "每一拍都算过，哪怕目标没变");
+        assert!(derived);
     }
 
     #[test]

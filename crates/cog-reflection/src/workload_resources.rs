@@ -152,6 +152,75 @@ const INTERVAL_ENV: &str = "COGNEVA_WORKLOAD_RESOURCES_INTERVAL_SECS";
 /// 本回路在 `cogneva_loop_tick_age_seconds{loop=...}` 里的名字。
 pub const LOOP: &str = "workload_resources";
 
+/// 工作负载选择「副本跟集群节点数走」这件事的标记。由 chart 写在对象上，
+/// 本回路只改带这个标记的 Deployment：其余工作负载的单/多副本是各自的结构
+/// 事实（单写者、单卷），不是这份部署能按节点数翻倍的东西。
+pub const REPLICA_POLICY_ANNOTATION: &str = "cogneva.io/replica-policy";
+
+/// 工作负载选择「启动预算跟实测启动时长走」这件事的标记。只有带它的工作负载
+/// 的 startupProbe.failureThreshold 会被改写：其余探针的预算是探针契约。
+pub const STARTUP_POLICY_ANNOTATION: &str = "cogneva.io/startup-policy";
+
+/// 副本目标。没有节点（或读不到）时没有答案。
+pub const REPLICAS_METRIC: &str = "cogneva_workload_replicas";
+
+/// 副本目标的求值次数。值不变是合法结果，拍子停没停靠这个数分辨。
+pub const REPLICAS_EVALUATIONS_METRIC: &str = "cogneva_workload_replicas_evaluations_total";
+
+/// 启动探针的失败预算（次数）。
+pub const STARTUP_THRESHOLD_METRIC: &str = "cogneva_workload_startup_failure_threshold";
+
+/// 启动预算的求值次数。
+pub const STARTUP_EVALUATIONS_METRIC: &str =
+    "cogneva_workload_startup_failure_threshold_evaluations_total";
+
+/// 命名空间默认层给一个不声明资源的容器的 CPU 上限，毫核。
+pub const DEFAULT_CPU_METRIC: &str = "cogneva_limit_range_default_cpu_millicores";
+
+/// 同一个容器的内存上限，字节。
+pub const DEFAULT_MEMORY_METRIC: &str = "cogneva_limit_range_default_memory_bytes";
+
+/// 同一个容器的 CPU 请求，毫核。
+pub const DEFAULT_REQUEST_CPU_METRIC: &str =
+    "cogneva_limit_range_default_request_cpu_millicores";
+
+/// 同一个容器的内存请求，字节。
+pub const DEFAULT_REQUEST_MEMORY_METRIC: &str =
+    "cogneva_limit_range_default_request_memory_bytes";
+
+/// 默认层这一拍算过几次。值不动时它照样走，是「拍子在跑」的那一半读数。
+pub const DEFAULTS_EVALUATIONS_METRIC: &str = "cogneva_limit_range_defaults_evaluations_total";
+
+/// 默认层落在哪只对象上。chart 渲染的那只，名字就是准入读的那只。
+pub const LIMIT_RANGE_NAME: &str = "cogneva-limits";
+
+/// 默认层读数上的对象名标签。
+pub const LIMIT_RANGE_LABEL: &str = "limitrange";
+
+/// 副本数：让任意一台节点消失时仍有至少一个副本在，且不再多。
+///
+/// 一个副本在节点消失时一起消失；两个副本是「任意一台可以不见」的最小集合。
+/// 再多就是同一份凭证在更多 Pod 里各存一份，换不到新的失败域——所以节点数
+/// 只决定「一还是二」，不决定「几」。
+pub fn replicas_for_ready_nodes(ready_nodes: usize) -> Option<u64> {
+    (ready_nodes > 0).then(|| ready_nodes.min(2) as u64)
+}
+
+/// 启动探针的失败预算：最长的实测成功启动 × 余量，除以探针周期。
+///
+/// 预算按次数算，所以分母是 periodSeconds：一次启动占掉的尝试次数就是它
+/// 需要覆盖的预算。种子是下限而不是起点——能观测到的只有「成功走到 Ready」
+/// 的那几次启动，把预算缩到比它们还短只会制造一次观测不到的失败启动；只有
+/// 更慢的启动可以把它抬高。
+pub fn startup_failure_threshold(longest_start_secs: u64, period_secs: u64, seed: u64) -> u64 {
+    if period_secs == 0 {
+        return seed;
+    }
+    let with_headroom = longest_start_secs.saturating_mul(HEADROOM_PERCENT);
+    let attempts = with_headroom.div_ceil(period_secs.saturating_mul(100));
+    attempts.max(seed)
+}
+
 /// 一个容器在一拍里的用量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sample {
@@ -239,6 +308,173 @@ pub fn size_targets(cpu_samples: &[u64], memory_samples: &[u64]) -> Option<Targe
     })
 }
 
+/// 一个不声明资源的容器该按什么算。
+///
+/// 输入与逐容器那条律是同一份测量（本回路为每个**声明了**资源的容器算出
+/// 的请求），问的是另一个问题：不是「这一个多大」，而是「这里典型的一个
+/// 多大」。所以请求取中位数——一个被忘掉的声明应该长得像它旁边的容器，而
+/// 不是像最忙的那一个；上限取 p95 加同一条余量，让默认出来的容器和声明过
+/// 的容器有同样的突发余量。中位与 p95 都是分布上的位置，不是挑出来的尺寸。
+pub fn default_shape(cpu_requests: &[u64], memory_requests: &[u64]) -> Option<Targets> {
+    let mut cpu = cpu_requests.to_vec();
+    let mut memory = memory_requests.to_vec();
+    if cpu.is_empty() || memory.is_empty() {
+        return None;
+    }
+    cpu.sort_unstable();
+    memory.sort_unstable();
+    let cpu_request = quantize_up(percentile(&cpu, 50)?, CPU_QUANTUM_MILLICORES);
+    let memory_request = quantize_up(percentile(&memory, 50)?, MEMORY_QUANTUM_BYTES);
+    let cpu_limit = quantize_up(
+        percentile(&cpu, 95)?.saturating_mul(HEADROOM_PERCENT) / 100,
+        CPU_QUANTUM_MILLICORES,
+    )
+    .max(cpu_request);
+    let memory_limit = quantize_up(
+        percentile(&memory, 95)?.saturating_mul(HEADROOM_PERCENT) / 100,
+        MEMORY_QUANTUM_BYTES,
+    )
+    .max(memory_request);
+    Some(Targets {
+        cpu_request_millicores: cpu_request,
+        memory_request_bytes: memory_request,
+        cpu_limit_millicores: cpu_limit,
+        memory_limit_bytes: memory_limit,
+    })
+}
+
+/// 默认层被准入夹住的区间：地板与天花板。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultRange {
+    pub min_cpu_millicores: u64,
+    pub min_memory_bytes: u64,
+    pub max_cpu_millicores: Option<u64>,
+    pub max_memory_bytes: Option<u64>,
+}
+
+/// 把算出来的默认形状夹进对象自己声明的准入区间。
+///
+/// 夹不是防御性编程：写进对象的默认值会直接成为下一个未声明容器的
+/// request/limit，落在 `max` 之上的那一份会被 apiserver 在准入时拒掉——
+/// 一次测量于是变成一次起不来的 Pod。请求先于上限夹，且上限不低于请求，
+/// 因为 `requests ≤ limits` 是对象合法性的一部分。
+pub fn bounded_defaults(shape: Targets, range: &DefaultRange) -> Targets {
+    let clamp = |value: u64, floor: u64, ceiling: Option<u64>| {
+        let floor = floor.max(1);
+        let ceiling = ceiling.unwrap_or(u64::MAX).max(floor);
+        value.clamp(floor, ceiling)
+    };
+    let cpu_request = clamp(
+        shape.cpu_request_millicores,
+        range.min_cpu_millicores,
+        range.max_cpu_millicores,
+    );
+    let memory_request = clamp(
+        shape.memory_request_bytes,
+        range.min_memory_bytes,
+        range.max_memory_bytes,
+    );
+    let cpu_limit = clamp(
+        shape.cpu_limit_millicores.max(cpu_request),
+        cpu_request,
+        range.max_cpu_millicores,
+    );
+    let memory_limit = clamp(
+        shape.memory_limit_bytes.max(memory_request),
+        memory_request,
+        range.max_memory_bytes,
+    );
+    Targets {
+        cpu_request_millicores: cpu_request,
+        memory_request_bytes: memory_request,
+        cpu_limit_millicores: cpu_limit,
+        memory_limit_bytes: memory_limit,
+    }
+}
+
+/// 一只 LimitRange 对象当前说的默认值与区间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultsReading {
+    pub current: Targets,
+    pub range: DefaultRange,
+}
+
+/// 从 `kubectl get limitrange -o json` 的输出里读默认层。
+///
+/// 没有 Container 条目的对象返回 `None`：那就没有一只对象可以让默认值落
+/// 在上面，替它发明一份等于在这条回路里再声明一次策略的形状。
+pub fn parse_limit_range(json: &Value) -> Option<DefaultsReading> {
+    let limits = json.pointer("/spec/limits")?.as_array()?;
+    let container = limits.iter().find(|item| {
+        item.get("type").and_then(Value::as_str) == Some("Container")
+    })?;
+    let quantity = |block: &str, field: &str, parse: fn(&str) -> Option<u64>| {
+        container
+            .get(block)
+            .and_then(|block| block.get(field))
+            .and_then(Value::as_str)
+            .and_then(parse)
+    };
+    Some(DefaultsReading {
+        current: Targets {
+            cpu_request_millicores: quantity("defaultRequest", "cpu", parse_cpu_millicores)
+                .unwrap_or(0),
+            memory_request_bytes: quantity("defaultRequest", "memory", parse_memory_bytes)
+                .unwrap_or(0),
+            cpu_limit_millicores: quantity("default", "cpu", parse_cpu_millicores).unwrap_or(0),
+            memory_limit_bytes: quantity("default", "memory", parse_memory_bytes).unwrap_or(0),
+        },
+        range: DefaultRange {
+            min_cpu_millicores: quantity("min", "cpu", parse_cpu_millicores).unwrap_or(0),
+            min_memory_bytes: quantity("min", "memory", parse_memory_bytes).unwrap_or(0),
+            max_cpu_millicores: quantity("max", "cpu", parse_cpu_millicores),
+            max_memory_bytes: quantity("max", "memory", parse_memory_bytes),
+        },
+    })
+}
+
+/// 把默认层移到 `shape` 的 patch，已经在那儿时没有 patch。
+///
+/// 整条 `limits` 数组一起带上，不是只带 Container 那一条：merge patch 对数组
+/// 是整段替换，只回一条会把 PVC 那条与准入要用的 `max`/`min` 一起删掉。
+pub fn limit_range_patch_body(current_object: &Value, shape: &Targets) -> Option<Value> {
+    let limits = current_object.pointer("/spec/limits")?.as_array()?;
+    let mut changed = false;
+    let mut out = Vec::with_capacity(limits.len());
+    for item in limits {
+        if item.get("type").and_then(Value::as_str) != Some("Container") {
+            out.push(item.clone());
+            continue;
+        }
+        let mut item = item.clone();
+        for (block, cpu, memory) in [
+            (
+                "defaultRequest",
+                cpu_quantity(shape.cpu_request_millicores),
+                memory_quantity(shape.memory_request_bytes),
+            ),
+            (
+                "default",
+                cpu_quantity(shape.cpu_limit_millicores),
+                memory_quantity(shape.memory_limit_bytes),
+            ),
+        ] {
+            let entry = item
+                .as_object_mut()?
+                .entry(block.to_string())
+                .or_insert_with(|| json!({}));
+            let entry = entry.as_object_mut()?;
+            let same = entry.get("cpu").and_then(Value::as_str) == Some(cpu.as_str())
+                && entry.get("memory").and_then(Value::as_str) == Some(memory.as_str());
+            changed |= !same;
+            entry.insert("cpu".to_string(), json!(cpu));
+            entry.insert("memory".to_string(), json!(memory));
+        }
+        out.push(item);
+    }
+    changed.then(|| json!({ "spec": { "limits": out } }))
+}
+
 /// 一次滚动 Job 的实测：平均核数、内存峰值、被限流的周期占比。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RunSample {
@@ -292,6 +528,17 @@ pub fn prune_runs(history: &mut Vec<RunSample>, now: u64) {
 pub struct Window {
     #[serde(default)]
     entries: BTreeMap<String, VecDeque<Sample>>,
+    /// 每次观测到的成功启动时长，按工作负载/容器分桶。与用量同一份文件、
+    /// 同一条窗口：两者都是「这份部署最近实际是什么样」的样本。
+    #[serde(default)]
+    startups: BTreeMap<String, VecDeque<StartupSample>>,
+}
+
+/// 一次成功启动：从 Pod 被创建到它第一次 Ready。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupSample {
+    pub at: u64,
+    pub secs: u64,
 }
 
 impl Window {
@@ -310,6 +557,29 @@ impl Window {
         self.entries.get(key).map(VecDeque::len).unwrap_or(0)
     }
 
+    /// 记一次成功启动的时长。
+    ///
+    /// 同一个值只留一份：一个活着的 Pod 每一拍都会被再看到一次，而这条律只
+    /// 问「最长的一次是多少」；按值去重让窗口随启动形态变化增长，不随拍子数
+    /// 增长。
+    pub fn push_startup(&mut self, key: &str, secs: u64, now: u64) {
+        let bucket = self.startups.entry(key.to_string()).or_default();
+        if bucket.iter().any(|s| s.secs == secs) {
+            return;
+        }
+        bucket.push_back(StartupSample { at: now, secs });
+        let oldest = now.saturating_sub(WINDOW_SECS);
+        while bucket.front().is_some_and(|s| s.at < oldest) {
+            bucket.pop_front();
+        }
+    }
+
+    /// 这条工作负载/容器在这条窗口里最长的一次成功启动。一次就够：预算要
+    /// 盖住的是最慢的合法启动，而不是平均启动。
+    pub fn longest_startup(&self, key: &str) -> Option<u64> {
+        self.startups.get(key)?.iter().map(|s| s.secs).max()
+    }
+
     /// 这一桶的目标，样本不足 [`MIN_SAMPLES`] 时没有答案。
     pub fn targets(&self, key: &str) -> Option<Targets> {
         let bucket = self.entries.get(key)?;
@@ -325,6 +595,12 @@ impl Window {
     pub fn prune(&mut self, now: u64) {
         let oldest = now.saturating_sub(WINDOW_SECS);
         self.entries.retain(|_, bucket| {
+            while bucket.front().is_some_and(|s| s.at < oldest) {
+                bucket.pop_front();
+            }
+            !bucket.is_empty()
+        });
+        self.startups.retain(|_, bucket| {
             while bucket.front().is_some_and(|s| s.at < oldest) {
                 bucket.pop_front();
             }
@@ -381,6 +657,17 @@ pub struct ContainerSpec {
     pub init: bool,
     /// 对象里已经声明的资源。`None` 表示这个容器有意不声明，回路不碰它。
     pub declared: Option<Declared>,
+    /// 对象里声明的 startupProbe 的周期与失败预算。只有带启动探针的容器
+    /// 才有；没有探针就没有次数可写。
+    pub startup_probe: Option<StartupProbe>,
+}
+
+/// 一个容器声明的启动探针的两个数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupProbe {
+    pub period_secs: u64,
+    /// 当前声明的失败预算，也是这条律的下限。
+    pub failure_threshold: u64,
 }
 
 /// 一个可 patch 的工作负载对象。
@@ -391,6 +678,12 @@ pub struct WorkloadSpec {
     pub containers: Vec<ContainerSpec>,
     /// 内存介质、声明了 `sizeLimit` 的卷。没有上限的卷不在里面：那没有数可写回。
     pub shm: Vec<ShmVolume>,
+    /// 当前声明的副本数。DaemonSet/CronJob 没有这个数。
+    pub replicas: Option<u64>,
+    /// 这个对象的副本数由节点数决定（见 [`REPLICA_POLICY_ANNOTATION`]）。
+    pub replica_policy: bool,
+    /// 这个对象的启动预算由实测启动时长决定（见 [`STARTUP_POLICY_ANNOTATION`]）。
+    pub startup_policy: bool,
 }
 
 /// 一块以内存为介质的卷，以及挂载它的容器。
@@ -494,10 +787,19 @@ fn containers_from(spec: &Value) -> Vec<ContainerSpec> {
             let Some(name) = item.get("name").and_then(Value::as_str) else {
                 continue;
             };
+            let startup_probe = item.get("startupProbe").and_then(|probe| {
+                let period_secs = probe.get("periodSeconds").and_then(Value::as_u64)?;
+                let failure_threshold = probe.get("failureThreshold").and_then(Value::as_u64)?;
+                (period_secs > 0 && failure_threshold > 0).then_some(StartupProbe {
+                    period_secs,
+                    failure_threshold,
+                })
+            });
             out.push(ContainerSpec {
                 name: name.to_string(),
                 init,
                 declared: declared_from(item.get("resources")),
+                startup_probe,
             });
         }
     }
@@ -594,11 +896,24 @@ pub fn parse_workloads(list: &Value) -> Vec<WorkloadSpec> {
         if containers.is_empty() {
             continue;
         }
+        let annotated = |key: &str, wanted: &str| {
+            item.pointer("/metadata/annotations")
+                .and_then(|annotations| annotations.get(key))
+                .and_then(Value::as_str)
+                == Some(wanted)
+        };
+        let replicas = match kind.as_str() {
+            "Deployment" | "StatefulSet" => item.pointer("/spec/replicas").and_then(Value::as_u64),
+            _ => None,
+        };
         out.push(WorkloadSpec {
             kind,
             name,
             containers,
             shm: shm_from(spec),
+            replicas,
+            replica_policy: annotated(REPLICA_POLICY_ANNOTATION, "topology"),
+            startup_policy: annotated(STARTUP_POLICY_ANNOTATION, "measured"),
         });
     }
     out
@@ -760,17 +1075,29 @@ pub fn patch_body(
     workload: &WorkloadSpec,
     changes: &BTreeMap<String, Targets>,
     shm_changes: &BTreeMap<String, u64>,
+    startup_changes: &BTreeMap<String, u64>,
+    replicas: Option<u64>,
 ) -> Option<Value> {
     let mut regular = Vec::new();
     let mut init = Vec::new();
     for container in &workload.containers {
-        let Some(targets) = changes.get(&container.name) else {
+        let targets = changes.get(&container.name);
+        let startup = startup_changes.get(&container.name);
+        if targets.is_none() && startup.is_none() {
             continue;
-        };
-        let entry = json!({
-            "name": container.name,
-            "resources": resources_json(targets),
-        });
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("name".to_string(), json!(container.name));
+        if let Some(targets) = targets {
+            entry.insert("resources".to_string(), resources_json(targets));
+        }
+        if let Some(threshold) = startup {
+            entry.insert(
+                "startupProbe".to_string(),
+                json!({ "failureThreshold": threshold }),
+            );
+        }
+        let entry = Value::Object(entry);
         if container.init {
             init.push(entry);
         } else {
@@ -788,25 +1115,38 @@ pub fn patch_body(
             }))
         })
         .collect();
-    if regular.is_empty() && init.is_empty() && volumes.is_empty() {
+    if regular.is_empty() && init.is_empty() && volumes.is_empty() && replicas.is_none() {
         return None;
     }
-    let mut spec = serde_json::Map::new();
+    let mut pod = serde_json::Map::new();
     if !regular.is_empty() {
-        spec.insert("containers".to_string(), Value::Array(regular));
+        pod.insert("containers".to_string(), Value::Array(regular));
     }
     if !init.is_empty() {
-        spec.insert("initContainers".to_string(), Value::Array(init));
+        pod.insert("initContainers".to_string(), Value::Array(init));
     }
     if !volumes.is_empty() {
-        spec.insert("volumes".to_string(), Value::Array(volumes));
+        pod.insert("volumes".to_string(), Value::Array(volumes));
     }
-    let pod_spec = json!({ "spec": spec });
+    let pod_changed = !pod.is_empty();
+    let pod_spec = json!({ "spec": pod });
     match workload.kind.as_str() {
         "CronJob" => Some(json!({
             "spec": { "jobTemplate": { "spec": { "template": pod_spec } } }
         })),
-        _ => Some(json!({ "spec": { "template": pod_spec } })),
+        _ => {
+            let mut spec = serde_json::Map::new();
+            if let Some(replicas) = replicas {
+                spec.insert("replicas".to_string(), json!(replicas));
+            }
+            // `template` is only added when the pod itself changed: a replica
+            // scale must not send an empty pod template into a strategic merge,
+            // where it would be indistinguishable from a template replacement.
+            if pod_changed {
+                spec.insert("template".to_string(), pod_spec);
+            }
+            Some(json!({ "spec": spec }))
+        }
     }
 }
 
@@ -825,6 +1165,37 @@ fn kind_arg(kind: &str) -> &'static str {
 pub struct WorkloadResourcesReadings {
     rows: Mutex<BTreeMap<String, Row>>,
     shm: Mutex<BTreeMap<String, ShmRow>>,
+    replicas: Mutex<BTreeMap<String, ReplicaRow>>,
+    startups: Mutex<BTreeMap<String, StartupRow>>,
+    defaults: Mutex<Option<DefaultsRow>>,
+}
+
+/// 命名空间默认层上一拍的样子。
+#[derive(Debug, Clone)]
+struct DefaultsRow {
+    limit_range: String,
+    shape: Targets,
+    source: &'static str,
+    evaluations: u64,
+}
+
+/// 一个工作负载的副本目标。
+#[derive(Debug, Clone)]
+struct ReplicaRow {
+    workload: String,
+    replicas: u64,
+    source: &'static str,
+    evaluations: u64,
+}
+
+/// 一个容器的启动失败预算。
+#[derive(Debug, Clone)]
+struct StartupRow {
+    workload: String,
+    container: String,
+    threshold: u64,
+    source: &'static str,
+    evaluations: u64,
 }
 
 /// 一块内存盘在这个读数面上的状态。
@@ -908,6 +1279,128 @@ impl WorkloadResourcesReadings {
             .unwrap_or(0)
     }
 
+    /// 这一拍对某个工作负载的副本数求过值。
+    pub fn note_replicas_evaluated(&self, workload: &str) {
+        let mut rows = self.replicas.lock().unwrap();
+        let row = rows
+            .entry(workload.to_string())
+            .or_insert_with(|| ReplicaRow {
+                workload: workload.to_string(),
+                replicas: 0,
+                source: SOURCE_SEED,
+                evaluations: 0,
+            });
+        row.evaluations = row.evaluations.saturating_add(1);
+    }
+
+    /// 这一拍的副本目标。
+    pub fn observe_replicas(&self, workload: &str, replicas: u64, source: &'static str) {
+        let mut rows = self.replicas.lock().unwrap();
+        let row = rows
+            .entry(workload.to_string())
+            .or_insert_with(|| ReplicaRow {
+                workload: workload.to_string(),
+                replicas,
+                source,
+                evaluations: 0,
+            });
+        row.replicas = replicas;
+        row.source = source;
+    }
+
+    /// 这一拍对某个容器的启动预算求过值。
+    pub fn note_startup_evaluated(&self, workload: &str, container: &str) {
+        let mut rows = self.startups.lock().unwrap();
+        let row = rows
+            .entry(format!("{workload}/{container}"))
+            .or_insert_with(|| StartupRow {
+                workload: workload.to_string(),
+                container: container.to_string(),
+                threshold: 0,
+                source: SOURCE_SEED,
+                evaluations: 0,
+            });
+        row.evaluations = row.evaluations.saturating_add(1);
+    }
+
+    /// 这一拍的启动失败预算。
+    pub fn observe_startup(&self, workload: &str, container: &str, threshold: u64, source: &'static str) {
+        let mut rows = self.startups.lock().unwrap();
+        let row = rows
+            .entry(format!("{workload}/{container}"))
+            .or_insert_with(|| StartupRow {
+                workload: workload.to_string(),
+                container: container.to_string(),
+                threshold,
+                source,
+                evaluations: 0,
+            });
+        row.threshold = threshold;
+        row.source = source;
+    }
+
+    /// 这个工作负载的副本求值次数。
+    pub fn replica_evaluations(&self, workload: &str) -> u64 {
+        self.replicas
+            .lock()
+            .unwrap()
+            .get(workload)
+            .map(|row| row.evaluations)
+            .unwrap_or(0)
+    }
+
+    /// 这个容器的启动预算求值次数。
+    pub fn startup_evaluations(&self, workload: &str, container: &str) -> u64 {
+        self.startups
+            .lock()
+            .unwrap()
+            .get(&format!("{workload}/{container}"))
+            .map(|row| row.evaluations)
+            .unwrap_or(0)
+    }
+
+    /// 这一拍重算过命名空间默认层。计数在写回之前就加：对象不存在或没有
+    /// 样本时，读者仍要看到「拍子走到了这一格」。
+    pub fn note_defaults_evaluated(&self, limit_range: &str) {
+        let mut slot = self.defaults.lock().unwrap();
+        let row = slot.get_or_insert_with(|| DefaultsRow {
+            limit_range: limit_range.to_string(),
+            shape: Targets {
+                cpu_request_millicores: 0,
+                memory_request_bytes: 0,
+                cpu_limit_millicores: 0,
+                memory_limit_bytes: 0,
+            },
+            source: SOURCE_SEED,
+            evaluations: 0,
+        });
+        row.evaluations = row.evaluations.saturating_add(1);
+    }
+
+    /// 默认层的求值次数。
+    pub fn defaults_evaluations(&self) -> u64 {
+        self.defaults
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|row| row.evaluations)
+            .unwrap_or(0)
+    }
+
+    /// 这一拍的默认形状，与它来自实测还是对象自己的种子。
+    pub fn observe_defaults(&self, limit_range: &str, shape: Targets, source: &'static str) {
+        let mut slot = self.defaults.lock().unwrap();
+        let row = slot.get_or_insert_with(|| DefaultsRow {
+            limit_range: limit_range.to_string(),
+            shape,
+            source,
+            evaluations: 0,
+        });
+        row.limit_range = limit_range.to_string();
+        row.shape = shape;
+        row.source = source;
+    }
+
     /// 这一拍这块内存盘的目标。
     pub fn observe_shm(
         &self,
@@ -953,6 +1446,31 @@ impl Observable for WorkloadResourcesReadings {
                 );
             }
         }
+        for row in self.replicas.lock().unwrap().values() {
+            for (metric, value) in [
+                (REPLICAS_METRIC, row.replicas),
+                (REPLICAS_EVALUATIONS_METRIC, row.evaluations),
+            ] {
+                out.push(
+                    RawMetric::new(metric, value as f64)
+                        .with_label(WORKLOAD_LABEL, row.workload.clone())
+                        .with_label(SOURCE_LABEL, row.source),
+                );
+            }
+        }
+        for row in self.startups.lock().unwrap().values() {
+            for (metric, value) in [
+                (STARTUP_THRESHOLD_METRIC, row.threshold),
+                (STARTUP_EVALUATIONS_METRIC, row.evaluations),
+            ] {
+                out.push(
+                    RawMetric::new(metric, value as f64)
+                        .with_label(WORKLOAD_LABEL, row.workload.clone())
+                        .with_label(CONTAINER_LABEL, row.container.clone())
+                        .with_label(SOURCE_LABEL, row.source),
+                );
+            }
+        }
         for row in self.shm.lock().unwrap().values() {
             // 内存盘的拍子与容器那一条同一拍：容器那一行的求值计数就是它的
             // 证据。这里再发一个同标签的计数只会让同一个数出现两次。
@@ -962,6 +1480,21 @@ impl Observable for WorkloadResourcesReadings {
                     .with_label(VOLUME_LABEL, row.volume.clone())
                     .with_label(SOURCE_LABEL, row.source),
             );
+        }
+        if let Some(row) = self.defaults.lock().unwrap().as_ref() {
+            for (metric, value) in [
+                (DEFAULT_CPU_METRIC, row.shape.cpu_limit_millicores),
+                (DEFAULT_MEMORY_METRIC, row.shape.memory_limit_bytes),
+                (DEFAULT_REQUEST_CPU_METRIC, row.shape.cpu_request_millicores),
+                (DEFAULT_REQUEST_MEMORY_METRIC, row.shape.memory_request_bytes),
+                (DEFAULTS_EVALUATIONS_METRIC, row.evaluations),
+            ] {
+                out.push(
+                    RawMetric::new(metric, value as f64)
+                        .with_label(LIMIT_RANGE_LABEL, row.limit_range.clone())
+                        .with_label(SOURCE_LABEL, row.source),
+                );
+            }
         }
         Ok(out)
     }
@@ -1011,6 +1544,51 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// How many nodes are Ready. A node that will not take pods is not a failure
+/// domain, and counting it would size availability against a machine that is
+/// gone.
+pub fn ready_node_count(nodes: &Value) -> usize {
+    nodes
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|node| {
+                    node.pointer("/status/conditions")
+                        .and_then(Value::as_array)
+                        .is_some_and(|conditions| {
+                            conditions.iter().any(|condition| {
+                                condition.get("type").and_then(Value::as_str) == Some("Ready")
+                                    && condition.get("status").and_then(Value::as_str) == Some("True")
+                            })
+                        })
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Seconds from a pod being started to it first reporting Ready. `None` for a
+/// pod that has never been Ready: a start that did not finish is not a
+/// measurement of how long a start takes.
+pub fn pod_ready_secs(pod: &Value) -> Option<u64> {
+    let start = pod.pointer("/status/startTime").and_then(Value::as_str)?;
+    let ready = pod
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|condition| {
+            condition.get("type").and_then(Value::as_str) == Some("Ready")
+                && condition.get("status").and_then(Value::as_str) == Some("True")
+        })?
+        .get("lastTransitionTime")
+        .and_then(Value::as_str)?;
+    let start = chrono::DateTime::parse_from_rfc3339(start).ok()?;
+    let ready = chrono::DateTime::parse_from_rfc3339(ready).ok()?;
+    ready.signed_duration_since(start).num_seconds().try_into().ok()
+}
+
 /// 一拍的工作。
 pub struct RoundSummary {
     pub evaluated: usize,
@@ -1056,6 +1634,12 @@ pub async fn round(
 
     let nodes: Value = serde_json::from_str(&kubectl(&["get", "nodes", "-o", "json"]).await?)
         .map_err(|e| format!("nodes: {e}"))?;
+    let ready_nodes = ready_node_count(&nodes);
+    let by_name: HashMap<String, usize> = workloads
+        .iter()
+        .enumerate()
+        .map(|(index, workload)| (workload.name.clone(), index))
+        .collect();
     let mut usage: HashMap<String, HashMap<String, Sample>> = HashMap::new();
     for node in nodes
         .get("items")
@@ -1098,6 +1682,18 @@ pub async fn round(
         if !known.contains(&workload) {
             continue;
         }
+        // A pod that reached Ready carries the only measurement of how long a
+        // start takes. The duration is attributed to every container of that
+        // workload that declares a startup probe: the Ready condition is on the
+        // pod, and the chart puts the probe on the container whose start it is.
+        if let (Some(secs), Some(index)) = (pod_ready_secs(&pod), by_name.get(&workload)) {
+            let spec = &workloads[*index];
+            if spec.startup_policy {
+                for container in spec.containers.iter().filter(|c| c.startup_probe.is_some()) {
+                    window.push_startup(&spec.key(container), secs, now);
+                }
+            }
+        }
         let Some(containers) = usage.get(pod_name) else {
             continue;
         };
@@ -1123,7 +1719,70 @@ pub async fn round(
 
     let mut evaluated = 0usize;
     let mut patched = 0usize;
+    // 这一拍给每个声明了资源的容器算出的请求。默认层问的是同一份测量的
+    // 另一个问题（见 `default_shape`），所以在下面那段循环里顺手收起来，
+    // 不另读一次集群。
+    let mut namespace_cpu_requests: Vec<u64> = Vec::new();
+    let mut namespace_memory_requests: Vec<u64> = Vec::new();
     for workload in &workloads {
+        // Replicas follow the live node count for the workloads that ask for
+        // it: a replica on each failure domain is what makes the deployment
+        // survive one node going away, and the number of failure domains is
+        // read from the cluster every round.
+        let mut replica_change = None;
+        if workload.replica_policy {
+            readings.note_replicas_evaluated(&workload.name);
+            match replicas_for_ready_nodes(ready_nodes) {
+                Some(target) => {
+                    readings.observe_replicas(&workload.name, target, SOURCE_DERIVED);
+                    if workload.replicas != Some(target) {
+                        replica_change = Some(target);
+                    }
+                }
+                None => {
+                    if let Some(declared) = workload.replicas {
+                        readings.observe_replicas(&workload.name, declared, SOURCE_SEED);
+                    }
+                }
+            }
+        }
+        // Startup budgets follow the longest successful start in the window,
+        // never below the budget already declared. A start too slow for the
+        // budget never reaches Ready and so never becomes a sample; the seed is
+        // a floor for exactly that case.
+        let mut startup_changes = BTreeMap::new();
+        if workload.startup_policy {
+            for container in &workload.containers {
+                let Some(probe) = container.startup_probe else {
+                    continue;
+                };
+                readings.note_startup_evaluated(&workload.name, &container.name);
+                match window.longest_startup(&workload.key(container)) {
+                    Some(secs) => {
+                        let target = startup_failure_threshold(
+                            secs,
+                            probe.period_secs,
+                            probe.failure_threshold,
+                        );
+                        readings.observe_startup(
+                            &workload.name,
+                            &container.name,
+                            target,
+                            SOURCE_DERIVED,
+                        );
+                        if target != probe.failure_threshold {
+                            startup_changes.insert(container.name.clone(), target);
+                        }
+                    }
+                    None => readings.observe_startup(
+                        &workload.name,
+                        &container.name,
+                        probe.failure_threshold,
+                        SOURCE_SEED,
+                    ),
+                }
+            }
+        }
         let mut changes = BTreeMap::new();
         // 这一轮已经算出目标、可以喂给下游（内存盘）的容器。
         let mut resolved: BTreeMap<String, Targets> = BTreeMap::new();
@@ -1138,6 +1797,8 @@ pub async fn round(
             match window.targets(&key) {
                 Some(targets) => {
                     resolved.insert(container.name.clone(), targets);
+                    namespace_cpu_requests.push(targets.cpu_request_millicores);
+                    namespace_memory_requests.push(targets.memory_request_bytes);
                     readings.observe(
                         &workload.name,
                         &container.name,
@@ -1213,7 +1874,13 @@ pub async fn round(
                 }
             }
         }
-        let Some(body) = patch_body(workload, &changes, &shm_changes) else {
+        let Some(body) = patch_body(
+            workload,
+            &changes,
+            &shm_changes,
+            &startup_changes,
+            replica_change,
+        ) else {
             continue;
         };
         let body = body.to_string();
@@ -1234,7 +1901,10 @@ pub async fn round(
         .await
         {
             Ok(_) => {
-                patched += changes.len() + shm_changes.len();
+                patched += changes.len()
+                    + shm_changes.len()
+                    + startup_changes.len()
+                    + usize::from(replica_change.is_some());
                 debug!(
                     kind = %workload.kind,
                     workload = %workload.name,
@@ -1255,6 +1925,66 @@ pub async fn round(
             }
         }
     }
+
+    // 命名空间默认层：一个不声明资源的容器按什么算。它与上面那一圈是同一
+    // 条律的第二个调用点——输入还是这一拍算出的容器请求，只是把「每个容器
+    // 的目标」收成「这里典型的一个」。写回对象是必须的一步：准入读的是对象
+    // 上的默认值，不是这条回路的读数面；不写回，量到的形状就只停在读数上。
+    match kubectl(&["get", "limitrange", LIMIT_RANGE_NAME, "-n", ns, "-o", "json"]).await {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw).ok() {
+            Some(object) => match parse_limit_range(&object) {
+                Some(reading) => {
+                    readings.note_defaults_evaluated(LIMIT_RANGE_NAME);
+                    match default_shape(&namespace_cpu_requests, &namespace_memory_requests) {
+                        Some(shape) => {
+                            let shape = bounded_defaults(shape, &reading.range);
+                            readings.observe_defaults(LIMIT_RANGE_NAME, shape, SOURCE_DERIVED);
+                            if let Some(body) = limit_range_patch_body(&object, &shape) {
+                                let body = body.to_string();
+                                match kubectl(&[
+                                    "patch",
+                                    "limitrange",
+                                    LIMIT_RANGE_NAME,
+                                    "-n",
+                                    ns,
+                                    "--type",
+                                    "merge",
+                                    "-p",
+                                    &body,
+                                ])
+                                .await
+                                {
+                                    Ok(_) => patched += 1,
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        "resource defaults: the LimitRange patch was refused; the object keeps the defaults it had"
+                                    ),
+                                }
+                            }
+                        }
+                        // 还没有一个容器被量够：把对象自己声明的默认值发出去，
+                        // 标成 seed。一个空读数与「这一层没在跟测量走」是两件事。
+                        None => readings.observe_defaults(
+                            LIMIT_RANGE_NAME,
+                            reading.current,
+                            SOURCE_SEED,
+                        ),
+                    }
+                }
+                None => warn!(
+                    "resource defaults: the LimitRange holds no Container entry; there is no object to write a default onto"
+                ),
+            },
+            None => warn!(
+                "resource defaults: the LimitRange answer was not JSON; nothing was written"
+            ),
+        },
+        Err(e) => debug!(
+            error = %e,
+            "resource defaults: no LimitRange in this namespace; the default layer is not part of this deployment"
+        ),
+    }
+
     Ok(RoundSummary {
         evaluated,
         patched,
@@ -1402,6 +2132,106 @@ mod tests {
         assert!(loaded.targets("Deployment/a/c").is_some());
     }
 
+    /// Replicas are a function of the live failure domains: one node cannot
+    /// lose a replica and still serve, so it gets one; two or more get two,
+    /// because a second copy on a third node buys no new failure domain.
+    #[test]
+    fn a_workload_replicas_follow_the_ready_node_count() {
+        assert_eq!(replicas_for_ready_nodes(0), None);
+        assert_eq!(replicas_for_ready_nodes(1), Some(1));
+        assert_eq!(replicas_for_ready_nodes(2), Some(2));
+        assert_eq!(replicas_for_ready_nodes(9), Some(2));
+
+        let nodes = json!({
+            "items": [
+                {"status": {"conditions": [{"type": "Ready", "status": "True"}]}},
+                {"status": {"conditions": [{"type": "Ready", "status": "False"}]}},
+            ]
+        });
+        assert_eq!(ready_node_count(&nodes), 1);
+
+        let mut spec = workload("Deployment", "gateway");
+        spec.replica_policy = true;
+        spec.replicas = Some(1);
+        let body = patch_body(&spec, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(), Some(2))
+            .expect("a replica move is a patch");
+        assert_eq!(body.pointer("/spec/replicas"), Some(&json!(2)));
+        assert!(
+            body.pointer("/spec/template").is_none(),
+            "a scale must not carry an empty pod template: {body}"
+        );
+    }
+
+    /// The startup budget covers the longest start that actually reached
+    /// Ready, with headroom, and never goes below what the object already
+    /// declared: a start too slow for the budget cannot be observed as a
+    /// sample, so shrinking is how this loop would kill its own evidence.
+    #[test]
+    fn the_startup_budget_follows_the_longest_measured_start() {
+        // 323 s at a 5 s probe: 78 attempts with 20% headroom.
+        assert_eq!(startup_failure_threshold(323, 5, 1), 78);
+        // A start that grows answers a larger budget on the next beat.
+        assert!(startup_failure_threshold(520, 5, 1) > 78);
+        // The declared budget is a floor.
+        assert_eq!(startup_failure_threshold(10, 5, 120), 120);
+        // No probe period, no arithmetic to do.
+        assert_eq!(startup_failure_threshold(323, 0, 120), 120);
+
+        let mut window = Window::default();
+        window.push_startup("Deployment/gateway/app", 323, 10);
+        window.push_startup("Deployment/gateway/app", 323, 20);
+        assert_eq!(window.longest_startup("Deployment/gateway/app"), Some(323));
+        window.push_startup("Deployment/gateway/app", 520, 30);
+        assert_eq!(
+            window.longest_startup("Deployment/gateway/app"),
+            Some(520),
+            "the next beat reads the longer start"
+        );
+
+        let mut spec = workload("Deployment", "gateway");
+        spec.startup_policy = true;
+        spec.containers[0].startup_probe = Some(StartupProbe {
+            period_secs: 5,
+            failure_threshold: 120,
+        });
+        let body = patch_body(
+            &spec,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::from([("c".to_string(), 150)]),
+            None,
+        )
+        .expect("a startup budget move is a patch");
+        assert_eq!(
+            body.pointer("/spec/template/spec/containers/0/startupProbe/failureThreshold"),
+            Some(&json!(150))
+        );
+    }
+
+    /// A pod that never became Ready is not a measurement of how long a start
+    /// takes; a Ready one is, from start to the transition that says so.
+    #[test]
+    fn only_a_ready_pod_measures_a_start() {
+        let ready = json!({
+            "status": {
+                "startTime": "2026-11-13T10:00:00Z",
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "lastTransitionTime": "2026-11-13T10:05:23Z"
+                }]
+            }
+        });
+        assert_eq!(pod_ready_secs(&ready), Some(323));
+        let not_ready = json!({
+            "status": {
+                "startTime": "2026-11-13T10:00:00Z",
+                "conditions": [{"type": "Ready", "status": "False"}]
+            }
+        });
+        assert_eq!(pod_ready_secs(&not_ready), None);
+    }
+
     #[test]
     fn a_container_seen_once_is_not_a_target() {
         let mut window = Window::default();
@@ -1437,8 +2267,12 @@ mod tests {
                     cpu_limit_millicores: Some(500),
                     memory_limit_bytes: Some(256 * 1024 * 1024),
                 }),
+                startup_probe: None,
             }],
             shm: Vec::new(),
+            replicas: Some(1),
+            replica_policy: false,
+            startup_policy: false,
         }
     }
 
@@ -1455,7 +2289,7 @@ mod tests {
     fn a_deployment_patch_lands_under_the_pod_template() {
         let mut changes = BTreeMap::new();
         changes.insert("c".to_string(), targets(800, 512 * 1024 * 1024));
-        let body = patch_body(&workload("Deployment", "gateway"), &changes, &BTreeMap::new()).unwrap();
+        let body = patch_body(&workload("Deployment", "gateway"), &changes, &BTreeMap::new(), &BTreeMap::new(), None).unwrap();
         assert_eq!(
             body.pointer("/spec/template/spec/containers/0/name")
                 .and_then(Value::as_str),
@@ -1472,7 +2306,7 @@ mod tests {
     fn a_cronjob_patch_lands_under_the_job_template() {
         let mut changes = BTreeMap::new();
         changes.insert("c".to_string(), targets(800, 512 * 1024 * 1024));
-        let body = patch_body(&workload("CronJob", "cogneva-backup"), &changes, &BTreeMap::new()).unwrap();
+        let body = patch_body(&workload("CronJob", "cogneva-backup"), &changes, &BTreeMap::new(), &BTreeMap::new(), None).unwrap();
         assert!(body
             .pointer("/spec/jobTemplate/spec/template/spec/containers/0/resources")
             .is_some());
@@ -1590,7 +2424,7 @@ mod tests {
         );
         let mut shm = BTreeMap::new();
         shm.insert("shm".to_string(), 1024u64 * 1024 * 1024);
-        let body = patch_body(&workload, &containers, &shm).unwrap();
+        let body = patch_body(&workload, &containers, &shm, &BTreeMap::new(), None).unwrap();
         assert_eq!(
             body.pointer("/spec/template/spec/volumes/0/emptyDir/sizeLimit")
                 .and_then(Value::as_str),
@@ -1599,7 +2433,7 @@ mod tests {
 
         let mut shm = BTreeMap::new();
         shm.insert("shm".to_string(), 4u64 * 1024 * 1024 * 1024);
-        let body = patch_body(&workload, &containers, &shm).unwrap();
+        let body = patch_body(&workload, &containers, &shm, &BTreeMap::new(), None).unwrap();
         assert_eq!(
             body.pointer("/spec/template/spec/volumes/0/emptyDir/sizeLimit")
                 .and_then(Value::as_str),
@@ -1628,6 +2462,152 @@ mod tests {
         // 没有容器挂它，调用方就不会把它放进 `shm_changes`；这里钉住的是解析面
         // 给出的答案：`container` 是空的，所以回路不会替它算。
         assert_eq!(workload.shm[0].container, None);
-        assert!(patch_body(&workload, &containers, &BTreeMap::new()).is_some());
+        assert!(patch_body(&workload, &containers, &BTreeMap::new(), &BTreeMap::new(), None).is_some());
+    }
+
+    /// The namespace default is a function of the same measurement the
+    /// per-container law reads, asked what a typical container here looks
+    /// like: the median sets the request, the busy edge sets the limit.
+    #[test]
+    fn the_namespace_default_follows_the_measured_requests() {
+        let mib = 1024 * 1024;
+        let quiet =
+            default_shape(&[100, 100, 100, 100], &[64 * mib, 64 * mib, 64 * mib, 64 * mib])
+                .unwrap();
+        let busy = default_shape(
+            &[800, 800, 800, 800],
+            &[512 * mib, 512 * mib, 512 * mib, 512 * mib],
+        )
+        .unwrap();
+        assert_eq!(quiet.cpu_request_millicores, 100);
+        assert_eq!(quiet.memory_request_bytes, 64 * mib);
+        assert!(busy.cpu_request_millicores > quiet.cpu_request_millicores);
+        assert!(busy.memory_limit_bytes > quiet.memory_limit_bytes);
+
+        // 一个尖峰抬上限、不抬请求：默认的请求该像这里典型的一个。
+        let spiky = default_shape(
+            &[100, 100, 100, 100, 100, 100, 100, 100, 100, 1000],
+            &[64 * mib; 10],
+        )
+        .unwrap();
+        assert_eq!(spiky.cpu_request_millicores, 100);
+        assert_eq!(spiky.cpu_limit_millicores, 1200);
+
+        // 没有样本就没有形状：这一层退回对象自己声明的值。
+        assert!(default_shape(&[], &[]).is_none());
+        assert!(default_shape(&[100], &[]).is_none());
+    }
+
+    /// A default outside the object's own admitted range would be a
+    /// measurement that refuses the next Pod, so it is clamped into it.
+    #[test]
+    fn a_default_is_clamped_into_the_admitted_range() {
+        let mib = 1024 * 1024;
+        let range = DefaultRange {
+            min_cpu_millicores: 10,
+            min_memory_bytes: 16 * mib,
+            max_cpu_millicores: Some(150),
+            max_memory_bytes: Some(100 * mib),
+        };
+        let bounded = bounded_defaults(
+            Targets {
+                cpu_request_millicores: 100,
+                memory_request_bytes: 64 * mib,
+                cpu_limit_millicores: 200,
+                memory_limit_bytes: 128 * mib,
+            },
+            &range,
+        );
+        assert_eq!(bounded.cpu_request_millicores, 100);
+        assert_eq!(bounded.cpu_limit_millicores, 150);
+        assert_eq!(bounded.memory_request_bytes, 64 * mib);
+        assert_eq!(bounded.memory_limit_bytes, 100 * mib);
+
+        // 地板抬请求；请求抬上限，`requests ≤ limits` 不被夹坏。
+        let floored = bounded_defaults(
+            Targets {
+                cpu_request_millicores: 1,
+                memory_request_bytes: mib,
+                cpu_limit_millicores: 2,
+                memory_limit_bytes: 2 * mib,
+            },
+            &range,
+        );
+        assert_eq!(floored.cpu_request_millicores, 10);
+        assert_eq!(floored.memory_request_bytes, 16 * mib);
+        assert!(floored.cpu_limit_millicores >= floored.cpu_request_millicores);
+        assert!(floored.memory_limit_bytes >= floored.memory_request_bytes);
+    }
+
+    fn limit_range_object() -> Value {
+        json!({"spec": {"limits": [
+            {
+                "type": "Container",
+                "default": {"cpu": "500m", "memory": "512Mi"},
+                "defaultRequest": {"cpu": "50m", "memory": "64Mi"},
+                "max": {"cpu": "4", "memory": "4Gi"},
+                "min": {"cpu": "10m", "memory": "16Mi"},
+            },
+            {
+                "type": "PersistentVolumeClaim",
+                "max": {"storage": "100Gi"},
+                "min": {"storage": "1Gi"},
+            },
+        ]}})
+    }
+
+    /// The write-back moves the two default blocks and nothing else: the
+    /// bounds admission reads and the PVC entry have to survive a merge
+    /// patch that replaces the array.
+    #[test]
+    fn the_limit_range_patch_moves_only_the_defaults() {
+        let mib = 1024 * 1024;
+        let object = limit_range_object();
+        let reading = parse_limit_range(&object).unwrap();
+        assert_eq!(reading.current.cpu_limit_millicores, 500);
+        assert_eq!(reading.current.cpu_request_millicores, 50);
+        assert_eq!(reading.range.max_cpu_millicores, Some(4000));
+        assert_eq!(reading.range.max_memory_bytes, Some(4 * 1024 * mib));
+        assert_eq!(reading.range.min_cpu_millicores, 10);
+
+        let shape = Targets {
+            cpu_request_millicores: 200,
+            memory_request_bytes: 96 * mib,
+            cpu_limit_millicores: 1500,
+            memory_limit_bytes: 512 * mib,
+        };
+        let body = limit_range_patch_body(&object, &shape).expect("a moved default is a patch");
+        let limits = body.pointer("/spec/limits").and_then(Value::as_array).unwrap();
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].pointer("/default/cpu").and_then(Value::as_str), Some("1500m"));
+        assert_eq!(
+            limits[0].pointer("/defaultRequest/cpu").and_then(Value::as_str),
+            Some("200m")
+        );
+        assert_eq!(limits[0].pointer("/max/cpu").and_then(Value::as_str), Some("4"));
+        assert_eq!(limits[0].pointer("/min/cpu").and_then(Value::as_str), Some("10m"));
+        assert_eq!(limits[1].pointer("/type").and_then(Value::as_str), Some("PersistentVolumeClaim"));
+
+        // 同一个形状第二次不产生 patch：差异小于一格时写回只让对象换个版本号。
+        assert!(limit_range_patch_body(&object, &shape).is_some());
+        let patched_object = json!({"spec": {"limits": limits}});
+        assert!(limit_range_patch_body(&patched_object, &shape).is_none());
+
+        // 没有 Container 条目就没有可写的默认层。
+        let pvc_only = json!({"spec": {"limits": [{"type": "PersistentVolumeClaim"}]}});
+        assert!(parse_limit_range(&pvc_only).is_none());
+        assert!(limit_range_patch_body(&pvc_only, &shape).is_none());
+    }
+
+    /// The beat is the evidence: the value may not move, the counter does.
+    #[test]
+    fn the_default_beat_counts_even_when_the_value_does_not_move() {
+        let readings = WorkloadResourcesReadings::new();
+        let same = targets(100, 64 * 1024 * 1024);
+        for _ in 0..3 {
+            readings.note_defaults_evaluated(LIMIT_RANGE_NAME);
+            readings.observe_defaults(LIMIT_RANGE_NAME, same, SOURCE_DERIVED);
+        }
+        assert_eq!(readings.defaults_evaluations(), 3);
     }
 }

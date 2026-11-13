@@ -33,9 +33,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::hostdocs_assist::{
-    build_prompt, truncate_body, AuditedChannel, ASSIST_MAX_BODY_BYTES_ENV,
-    ASSIST_MAX_CANDIDATES_ENV, ASSIST_OUTCOMES, DEFAULT_ASSIST_MAX_BODY_BYTES,
-    DEFAULT_ASSIST_MAX_CANDIDATES, URL_ENV as AUDITED_LLM_URL_ENV,
+    build_prompt, question_plan, request_body, scaffold_upper_bound, truncate_to_wire, wire_len,
+    AuditedChannel, QuestionPlan, ASSIST_MAX_BODY_BYTES_ENV, ASSIST_MAX_CANDIDATES_ENV,
+    ASSIST_OUTCOMES, AUDIT_BUDGET_ENV,
+    DEFAULT_ASSIST_MAX_BODY_BYTES, DEFAULT_ASSIST_MAX_CANDIDATES,
+    URL_ENV as AUDITED_LLM_URL_ENV,
 };
 use crate::hostdocs_organizer::{
     propose, OrganizeProposal, OrganizeRules, CLASSIFIED_OUTCOMES, DEFAULT_RULES, ORGANIZE_OUTCOMES,
@@ -67,6 +69,18 @@ pub const MAX_LIST_ENTRIES_ENV: &str = "HOST_DOCS_MAX_LIST_ENTRIES";
 pub const APPROVAL_TTL_SECS_ENV: &str = "HOST_DOCS_APPROVAL_TTL_SECS";
 /// The approvability window this gate is actually keeping, in seconds.
 pub const APPROVAL_TTL_METRIC: &str = "sandbox_host_docs_approval_ttl_seconds";
+/// The wire bytes one body prefix may take in a question: the plan in force.
+pub const ASSIST_BODY_BYTES_METRIC: &str = "sandbox_host_docs_assist_body_bytes";
+/// How many files one question covers: the plan in force.
+pub const ASSIST_QUESTION_FILES_METRIC: &str = "sandbox_host_docs_assist_question_files";
+/// Which input chose the assist plan in force: the declaration (`seed`) or a
+/// measured question (`derived`). One-hot, for the same reason the approval
+/// window's source is.
+pub const ASSIST_PLAN_SOURCE_METRIC: &str = "sandbox_host_docs_assist_plan_source";
+/// How many times the assist plan has been recomputed. The value may not move
+/// when nothing was measured; this is what tells a quiet station from a stalled one.
+pub const ASSIST_PLAN_EVALUATIONS_METRIC: &str =
+    "sandbox_host_docs_assist_plan_evaluations_total";
 /// The label that says whether the window in force came from the declaration
 /// (`seed`) or from a measured approval (`derived`).
 pub const SOURCE_LABEL: &str = "source";
@@ -109,6 +123,12 @@ const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 /// a window shorter than a month would call a quiet fortnight an empty one.
 const APPROVAL_LATENCY_WINDOW_SECS: u64 = 30 * 86_400;
 
+/// How long a question's measured wire size stays in the window the assist plan
+/// is computed from. Thirty days, the same shape as the approval window: which
+/// folders this station meets changes with the work, and the work has a weekly
+/// shape, so a shorter window would call a quiet fortnight an empty one.
+const QUESTION_WINDOW_SECS: u64 = 30 * 86_400;
+
 /// Headroom over the slowest measured approval. The measurement is one sample
 /// of a person's schedule, so the window gives the next one a quarter more
 /// room than the slowest one already took.
@@ -134,6 +154,16 @@ fn env_positive(key: &str, default: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(default)
+}
+
+/// Read a positive integer that the deployment may also leave unset. Unset,
+/// zero and unparseable all mean "not stated": a bound of zero is not a bound.
+fn env_optional_positive(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
 }
 
 /// Read a URL from the environment. Blank or absent means "not configured" rather than an
@@ -185,11 +215,16 @@ pub struct HostDocsConfig {
     /// a run then does what the rules alone can do -- which is also what happens while the
     /// egress switch is off, and both states are readable on the assist counter.
     pub audited_llm_url: Option<String>,
-    /// How many bytes of one body the question carries, and how many files one question
-    /// covers. Both are "do less" bounds: past either of them no question is asked at all
-    /// rather than a partial one.
+    /// How many bytes of one body the question carries and how many files it covers:
+    /// the two **seeds** the plan starts from. They are lower bounds, not ceilings --
+    /// once the channel has answered something the plan grows from what it measured
+    /// (see [`crate::hostdocs_assist::question_plan`]).
     pub assist_max_body_bytes: usize,
     pub assist_max_candidates: usize,
+    /// The audited channel's own audit bound, as the deployment declares it: one
+    /// question may not carry a body the channel would refuse to audit. `None` means
+    /// the deployment states no bound, and the plan has only its own measurements.
+    pub assist_audit_budget_bytes: Option<usize>,
 }
 
 impl HostDocsConfig {
@@ -220,6 +255,7 @@ impl HostDocsConfig {
             env_positive(ASSIST_MAX_BODY_BYTES_ENV, DEFAULT_ASSIST_MAX_BODY_BYTES);
         cfg.assist_max_candidates =
             env_positive(ASSIST_MAX_CANDIDATES_ENV, DEFAULT_ASSIST_MAX_CANDIDATES);
+        cfg.assist_audit_budget_bytes = env_optional_positive(AUDIT_BUDGET_ENV);
         cfg
     }
 
@@ -274,6 +310,7 @@ impl HostDocsConfig {
             audited_llm_url: None,
             assist_max_body_bytes: DEFAULT_ASSIST_MAX_BODY_BYTES,
             assist_max_candidates: DEFAULT_ASSIST_MAX_CANDIDATES,
+            assist_audit_budget_bytes: None,
         }
     }
 
@@ -750,9 +787,11 @@ struct AskOutcome {
     hints: BTreeMap<String, String>,
     /// How many bodies went into the question.
     ///
-    /// Zero when no question was built -- which is every refusal decided **before** the
-    /// bodies were read. It is deliberately not zero on a refusal that came back about a
-    /// question already asked: those bodies were read and sent, and how much left this
+    /// Zero whenever no question was built -- which is every refusal, including the one
+    /// decided after the bodies were read to plan it (`over_candidates`): reading a
+    /// candidate is local, and the assist counter is about what went out. Those reads are
+    /// on the read counter. It is deliberately not zero on a refusal that came back about
+    /// a question already asked: those bodies were read and sent, and how much left this
     /// process is the reading an operator wants on exactly that path -- the channel saw
     /// them and refused, which is the moment the question "how much went out?" is asked.
     candidates: usize,
@@ -760,7 +799,8 @@ struct AskOutcome {
 }
 
 impl AskOutcome {
-    /// A refusal decided before any body was read: nothing left this process.
+    /// A refusal with nothing on the wire. Whether bodies were read to reach the
+    /// decision is the read counter's reading, not this one's.
     fn refused(outcome: &'static str) -> Self {
         Self {
             outcome,
@@ -794,6 +834,12 @@ struct HostDocsMetrics {
     approval_ttl_source: prometheus::GaugeVec,
     /// 这条回路算过几拍。目标不动时它照样走，是"回路在跑"的那一半读数。
     approval_ttl_evaluations: prometheus::IntCounter,
+    /// 这一道问句生效的两个数，以及选择它的那一侧（只有一侧为 1）。
+    assist_body_bytes: Gauge,
+    assist_question_files: Gauge,
+    assist_plan_source: prometheus::GaugeVec,
+    /// 计划算过几道问句。数值不动时它照样走。
+    assist_plan_evaluations: prometheus::IntCounter,
     ops: CounterVec,
     rollbacks: CounterVec,
     lists: CounterVec,
@@ -829,6 +875,33 @@ impl HostDocsMetrics {
             "How many times the approval window has been recomputed",
         ))?;
         registry.register(Box::new(approval_ttl_evaluations.clone()))?;
+        let assist_body_bytes = Gauge::new(
+            ASSIST_BODY_BYTES_METRIC,
+            "Wire bytes one body prefix may take in a question, from the declaration and the questions this channel answered",
+        )?;
+        let assist_question_files = Gauge::new(
+            ASSIST_QUESTION_FILES_METRIC,
+            "How many unclassified files one question covers, from the declaration and the questions this channel answered",
+        )?;
+        let assist_plan_source = prometheus::GaugeVec::new(
+            Opts::new(
+                ASSIST_PLAN_SOURCE_METRIC,
+                "Which input chose the assist plan: 1 for that one, 0 for the other",
+            ),
+            &[SOURCE_LABEL],
+        )?;
+        registry.register(Box::new(assist_body_bytes.clone()))?;
+        registry.register(Box::new(assist_question_files.clone()))?;
+        registry.register(Box::new(assist_plan_source.clone()))?;
+        // 与批准窗口同一条理由：两族都先以 0 登记，「还没量过」与「量出来是零」
+        // 必须是两条不同的读数。
+        assist_plan_source.with_label_values(&["seed"]).set(1.0);
+        assist_plan_source.with_label_values(&["derived"]).set(0.0);
+        let assist_plan_evaluations = prometheus::IntCounter::with_opts(Opts::new(
+            ASSIST_PLAN_EVALUATIONS_METRIC,
+            "How many times the assist question plan has been recomputed",
+        ))?;
+        registry.register(Box::new(assist_plan_evaluations.clone()))?;
         let scopes = Gauge::new(
             "sandbox_host_docs_scopes",
             "Host document scopes configured on this executor",
@@ -933,6 +1006,10 @@ impl HostDocsMetrics {
             approval_ttl,
             approval_ttl_source,
             approval_ttl_evaluations,
+            assist_body_bytes,
+            assist_question_files,
+            assist_plan_source,
+            assist_plan_evaluations,
             ops,
             rollbacks,
             lists,
@@ -1002,6 +1079,29 @@ impl HostDocsMetrics {
             .set(if derived { 1.0 } else { 0.0 });
         self.approval_ttl_evaluations.inc();
     }
+
+    /// Record one recompute of the assist plan: the two numbers in force, which
+    /// input chose them, and that the recompute happened at all.
+    fn set_assist_plan(&self, plan: &QuestionPlan) {
+        self.assist_body_bytes.set(plan.body_bytes as f64);
+        self.assist_question_files.set(plan.max_candidates as f64);
+        self.assist_plan_source
+            .with_label_values(&["seed"])
+            .set(if plan.derived { 0.0 } else { 1.0 });
+        self.assist_plan_source
+            .with_label_values(&["derived"])
+            .set(if plan.derived { 1.0 } else { 0.0 });
+        self.assist_plan_evaluations.inc();
+    }
+
+    /// Publish the declaration as the plan in force before anything was
+    /// measured. Deliberately not a recompute: the evaluation count stays at
+    /// zero until the loop has actually run, so "seeded" and "evaluated once
+    /// and found the seed right" cannot read the same.
+    fn set_assist_seed(&self, body_bytes: usize, candidates: usize) {
+        self.assist_body_bytes.set(body_bytes as f64);
+        self.assist_question_files.set(candidates as f64);
+    }
 }
 
 pub struct HostDocs {
@@ -1020,6 +1120,10 @@ pub struct HostDocs {
     /// 实测输入——窗口要盖住人真正花的时间，不是写下的一整天。按
     /// [`APPROVAL_LATENCY_WINDOW_SECS`] 裁剪。
     approval_latencies: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// 已上过线的每一道问句：`(时刻, 请求正文的 wire 字节, 是否被回答)`。
+    /// 这条回路唯一的实测输入——一道问句能有多大，不是写下的那两个种子。
+    /// 按 [`QUESTION_WINDOW_SECS`] 裁剪。
+    question_wire: std::sync::Mutex<Vec<(u64, usize, bool)>>,
 }
 
 impl HostDocs {
@@ -1034,6 +1138,10 @@ impl HostDocs {
             "host document scopes configured"
         );
         let assist = cfg.audited_llm_url.clone().map(AuditedChannel::new);
+        // The declaration is the plan in force until the first question is
+        // planned; publishing it here keeps the reading from being "no plan at
+        // all" on a pod that has not yet met a folder.
+        metrics.set_assist_seed(cfg.assist_max_body_bytes, cfg.assist_max_candidates);
         Ok(Arc::new(Self {
             cfg,
             metrics,
@@ -1041,6 +1149,7 @@ impl HostDocs {
             apply_lock: Mutex::new(()),
             id_seq: AtomicU64::new(0),
             approval_latencies: std::sync::Mutex::new(Vec::new()),
+            question_wire: std::sync::Mutex::new(Vec::new()),
         }))
     }
 
@@ -1069,6 +1178,34 @@ impl HostDocs {
             .lock()
             .unwrap()
             .push((approved_at, approved_at.saturating_sub(staged_at)));
+    }
+
+    /// 窗口内两个实测大小：被回答过的最大请求，与发出后失败过的最小请求。
+    /// 失败的判据是「有过回应」：通道真的答了什么（含答非所问）说明字节到
+    /// 得了它那里，只有连回应都没有的那类失败才可能是字节太多。
+    fn question_window(&self, now: u64) -> (Option<usize>, Option<usize>) {
+        let mut samples = self.question_wire.lock().unwrap();
+        let since = now.saturating_sub(QUESTION_WINDOW_SECS);
+        samples.retain(|(at, _, _)| *at >= since);
+        let accepted = samples
+            .iter()
+            .filter(|(_, _, answered)| *answered)
+            .map(|(_, wire, _)| *wire)
+            .max();
+        let failed = samples
+            .iter()
+            .filter(|(_, _, answered)| !*answered)
+            .map(|(_, wire, _)| *wire)
+            .min();
+        (accepted, failed)
+    }
+
+    /// 记下一道问句真正上线的请求大小，以及它是否得到了回应。
+    fn note_question(&self, now: u64, wire_bytes: usize, answered: bool) {
+        self.question_wire
+            .lock()
+            .unwrap()
+            .push((now, wire_bytes, answered));
     }
 
     /// Resolve a scope name to its configured root. An unknown name is a hard
@@ -1325,6 +1462,13 @@ impl HostDocs {
     /// asked about at all -- a partial answer would make the plan depend on which files
     /// happened to fit.
     ///
+    /// The two numbers a question runs under -- how much of each body, and how many
+    /// files -- are recomputed here from the questions this channel has already answered
+    /// or failed (see [`question_plan`]). The seeds in the config are the declaration the
+    /// plan may raise but never lower. Every run that reaches this point publishes the
+    /// plan in force, measured or not, so a station that stops recomputing is a reading
+    /// rather than an inference.
+    ///
     /// The switch is checked before any body is read, and the read would refuse anyway
     /// (`disabled`); doing it here is what keeps the assist counter's `switch_off` cell
     /// from being an inference someone has to make from the read counter instead.
@@ -1341,25 +1485,37 @@ impl HostDocs {
         let Some(channel) = self.assist.as_ref() else {
             return AskOutcome::refused("unconfigured");
         };
-        if candidates.len() > self.cfg.assist_max_candidates {
-            warn!(
-                scope = %scope,
-                candidates = candidates.len(),
-                ceiling = self.cfg.assist_max_candidates,
-                "more unclassified files than one question covers; asking about none of them"
-            );
-            return AskOutcome::refused("over_candidates");
-        }
-        let mut bodies = Vec::with_capacity(candidates.len());
-        let mut truncated = 0;
+        let buckets: Vec<String> = self
+            .cfg
+            .classify_rules
+            .buckets()
+            .map(str::to_string)
+            .collect();
+        let now = now_unix();
+        // How much of one body is worth keeping: the plan never gives a body
+        // more than its share of the window, and the window is bounded by the
+        // stated audit bound (or, without one, by the practice window). Keeping
+        // that much per body bounds the folder's memory by one window rather
+        // than by one read ceiling per file.
+        let keep = {
+            let (accepted, _) = self.question_window(now);
+            let seed_body = self.cfg.assist_max_body_bytes.max(1);
+            let seed_window = seed_body
+                .saturating_mul(self.cfg.assist_max_candidates.max(1))
+                .saturating_add(scaffold_upper_bound(&buckets, candidates));
+            let cap = self
+                .cfg
+                .assist_audit_budget_bytes
+                .unwrap_or_else(|| seed_window.max(accepted.unwrap_or(0)));
+            seed_body.max(cap / candidates.len())
+        };
+        let mut read_bodies = Vec::with_capacity(candidates.len());
         for path in candidates {
             match self.read(scope, path) {
                 Ok(read) => {
-                    let (text, cut) = truncate_body(&read.content, self.cfg.assist_max_body_bytes);
-                    if cut {
-                        truncated += 1;
-                    }
-                    bodies.push((path.clone(), read.bytes as usize, text.to_string()));
+                    let full_wire = wire_len(&read.content);
+                    let (prefix, _) = truncate_to_wire(&read.content, keep);
+                    read_bodies.push((path.clone(), read.bytes as usize, full_wire, prefix.to_string()));
                 }
                 Err(refusal) => {
                     warn!(
@@ -1372,25 +1528,76 @@ impl HostDocs {
                 }
             }
         }
-        let buckets: Vec<String> = self
-            .cfg
-            .classify_rules
-            .buckets()
-            .map(str::to_string)
-            .collect();
+        // The fixed part of the request: everything but the bodies. Measured
+        // with the real headers (paths and printed byte counts) and empty
+        // bodies, so the plan's arithmetic and the wire agree about what is
+        // left for the file contents.
+        let scaffold = request_body(&build_prompt(
+            &buckets,
+            &read_bodies
+                .iter()
+                .map(|(path, bytes, _, _)| (path.clone(), *bytes, String::new()))
+                .collect::<Vec<_>>(),
+        ))
+        .len();
+        let sizes: Vec<usize> = read_bodies.iter().map(|(_, _, wire, _)| *wire).collect();
+        let (accepted, failed) = self.question_window(now);
+        let plan = question_plan(
+            self.cfg.assist_max_body_bytes,
+            self.cfg.assist_max_candidates,
+            self.cfg.assist_audit_budget_bytes,
+            scaffold,
+            &sizes,
+            accepted,
+            failed,
+        );
+        self.metrics.set_assist_plan(&plan);
+        if candidates.len() > plan.max_candidates {
+            warn!(
+                scope = %scope,
+                candidates = candidates.len(),
+                ceiling = plan.max_candidates,
+                probe = plan.probe,
+                "more unclassified files than one question covers at the prefix it needs; asking about none of them"
+            );
+            return AskOutcome::refused("over_candidates");
+        }
+        let mut bodies = Vec::with_capacity(read_bodies.len());
+        let mut truncated = 0;
+        for (path, bytes, full_wire, prefix) in &read_bodies {
+            let (text, _) = truncate_to_wire(prefix, plan.body_bytes);
+            if *full_wire > plan.body_bytes {
+                truncated += 1;
+            }
+            bodies.push((path.clone(), *bytes, text.to_string()));
+        }
         let prompt = build_prompt(&buckets, &bodies);
+        // What the channel's bound counts: the serialized request, escaping and
+        // all. Recording this -- not the plan's estimate -- is what makes the
+        // next window a measurement rather than a second guess.
+        let wire = request_body(&prompt).len();
         match channel.ask(&prompt).await {
-            Ok(hints) => AskOutcome {
-                outcome: "answered",
-                hints,
-                candidates: bodies.len(),
-                truncated,
-            },
+            Ok(hints) => {
+                self.note_question(now, wire, true);
+                AskOutcome {
+                    outcome: "answered",
+                    hints,
+                    candidates: bodies.len(),
+                    truncated,
+                }
+            }
             Err(cell) => {
+                // Only a completion that came back is an answer about size: the
+                // channel refusing the request (including at its own audited
+                // bound) and the network failing are both "these bytes did not
+                // get through", so both cap what the next probe may try.
+                let answered = cell == "unparsed";
+                self.note_question(now, wire, answered);
                 warn!(
                     scope = %scope,
                     outcome = %cell,
                     bodies = bodies.len(),
+                    wire_bytes = wire,
                     "the model station decided nothing about a question that had already been sent"
                 );
                 AskOutcome::refused_after_question(cell, bodies.len(), truncated)
@@ -3099,6 +3306,98 @@ mod tests {
             .unwrap_or(0)
     }
 
+    fn assist_measure(metrics: &str, name: &str) -> f64 {
+        metrics
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(f64::NAN)
+    }
+
+    /// 问题计划是通道答过的那道问句的函数：同一个进程里，下一拍按新的窗口重算，
+    /// 不用重启。计数每一拍都走，数值不动时也是——「安静」与「停摆」只能靠它分开。
+    #[tokio::test]
+    async fn the_question_plan_follows_the_answered_question_and_the_beat_counts() {
+        let (_d, cfg) = temp_scope();
+        let root = scope_root(&cfg);
+        std::fs::write(root.join("IMG_0421"), "a photo of a harbour at dusk").unwrap();
+        let (url, seen) = spawn_channel(r#"{"IMG_0421":"images","another":"images","diary":"documents"}"#).await;
+        let mut on = reading(&cfg);
+        on.audited_llm_url = Some(url);
+        // 小到能在断言里读出算法：一份正文 8 wire 字节、一道问句一个文件、
+        // 通道自报一个很大的审计界。
+        on.assist_max_body_bytes = 8;
+        on.assist_max_candidates = 1;
+        on.assist_audit_budget_bytes = Some(1000);
+        let docs = open_docs(&on);
+        assert_eq!(
+            assist_measure(&docs.metrics(), ASSIST_BODY_BYTES_METRIC),
+            8.0,
+            "没有实测之前，声明就是生效的计划"
+        );
+        assert_eq!(
+            assist_measure(&docs.metrics(), ASSIST_PLAN_EVALUATIONS_METRIC),
+            0.0,
+            "还没算过一拍：声明与「算过、发现声明是对的」必须是两条读数"
+        );
+        assert!(
+            docs.metrics()
+                .contains(&format!("{ASSIST_PLAN_SOURCE_METRIC}{{source=\"seed\"}} 1")),
+            "登记时是声明：{}",
+            docs.metrics()
+        );
+
+        // 一个文件：计划保留声明的前缀，问句盖住一个文件。
+        let first = docs.organize("alice").await.unwrap();
+        assert_eq!(first.assist, "answered");
+        assert_eq!(assist_measure(&docs.metrics(), ASSIST_BODY_BYTES_METRIC), 8.0);
+        assert_eq!(assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC), 1.0);
+        assert!(
+            docs.metrics()
+                .contains(&format!("{ASSIST_PLAN_SOURCE_METRIC}{{source=\"seed\"}} 1")),
+            "第一道问句的计划只能来自声明：它自己的回答还没发生：{}",
+            docs.metrics()
+        );
+
+        // 第二个未分类文件：声明的前缀下已放不进一道问句，但通道报了界，
+        // 所以整夹一起问——这道探针把窗口抬到它真正答过的那个大小。
+        std::fs::write(root.join("another"), "unknown").unwrap();
+        let second = docs.organize("alice").await.unwrap();
+        assert_eq!(second.assist, "answered");
+        assert_eq!(second.assist_candidates, 2, "探针问的是整夹");
+        assert_eq!(assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC), 2.0);
+        assert!(
+            docs.metrics()
+                .contains(&format!("{ASSIST_PLAN_SOURCE_METRIC}{{source=\"derived\"}} 1")),
+            "有了一次回答，下一拍计划的来源就是实测：{}",
+            docs.metrics()
+        );
+
+        // 同样的两个文件再来一拍：答过的那道问句就是窗口，两个都放得下，
+        // 不再探针——计划跟着上一拍的实测走，不需要重启。
+        let third = docs.organize("alice").await.unwrap();
+        assert_eq!(third.assist_candidates, 2);
+        assert_eq!(assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC), 2.0);
+
+        // 只剩一个更大的文件：窗口已经是两个正文的份额，它的整块份额高过声明
+        // 的前缀，于是前缀跟着走。整条回路是 实测→窗口→前缀。
+        std::fs::remove_file(root.join("IMG_0421")).unwrap();
+        std::fs::remove_file(root.join("another")).unwrap();
+        std::fs::write(root.join("diary"), "x".repeat(100)).unwrap();
+        let fourth = docs.organize("alice").await.unwrap();
+        assert_eq!(fourth.assist, "answered");
+        assert!(
+            assist_measure(&docs.metrics(), ASSIST_BODY_BYTES_METRIC) > 8.0,
+            "窗口抬起来之后，前缀必须跟着抬: {}",
+            docs.metrics()
+        );
+        assert_eq!(assist_measure(&docs.metrics(), ASSIST_PLAN_EVALUATIONS_METRIC), 4.0);
+
+        // 四次都真的上过线：计数不是唯一的证据。
+        assert_eq!(seen.lock().await.len(), 4);
+    }
+
     #[tokio::test]
     async fn a_plan_over_the_review_ceiling_is_refused_before_it_is_stored() {
         let (_d, mut cfg) = temp_scope();
@@ -4012,6 +4311,9 @@ mod tests {
         let mut capped = reading(&cfg2);
         capped.audited_llm_url = Some(url2);
         capped.assist_max_candidates = 1;
+        // Small enough that the two bodies do not fit one question's window:
+        // whether a folder fits is bytes, not a file count.
+        capped.assist_max_body_bytes = 8;
         std::fs::write(scope_root(&capped).join("another"), b"unknown").unwrap();
         let capped_docs = open_docs(&capped);
         let over = capped_docs.organize("alice").await.unwrap();
@@ -4088,6 +4390,7 @@ mod tests {
         let mut over_cfg = reading(&cfg4);
         over_cfg.audited_llm_url = Some(url4);
         over_cfg.assist_max_candidates = 1;
+        over_cfg.assist_max_body_bytes = 8;
         let over = open_docs(&over_cfg);
         assert_eq!(
             over.organize("alice").await.unwrap().assist,

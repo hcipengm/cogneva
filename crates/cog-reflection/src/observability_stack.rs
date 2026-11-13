@@ -461,8 +461,12 @@ impl ConvergenceVerdict {
         }
     }
 
-    /// 给人读的结论，有界（点名的资源数由配置上限截断，其余折成计数）。
-    pub fn message(&self, rev: &str, max_named: usize) -> String {
+    /// 给人读的结论。修回时点名**每一个**与现场不一致的清单文件。
+    ///
+    /// 不截断：被比较的清单集是仓库里一棵封闭且很小的目录，长度天然有界；而折成
+    /// 「+N more」的代价是恰好把已经修好的那个文件藏起来——读的人只看到一个计数，
+    /// 没法知道是哪一个漂了。
+    pub fn message(&self, rev: &str) -> String {
         match self {
             ConvergenceVerdict::Converged { resources } => {
                 format!("可观测性栈与仓库声明一致（{resources} 个资源，rev {}）", rev12(rev))
@@ -470,7 +474,7 @@ impl ConvergenceVerdict {
             ConvergenceVerdict::DriftRepaired { repaired } => format!(
                 "可观测性栈的现场与仓库声明不一致，已按 rev {} 修回（与现场不一致的清单文件）：{}（不是第一次出现的修复说明有个东西在改集群，或者上一次交付没跑到）",
                 rev12(rev),
-                join_named(repaired, max_named)
+                join_named(repaired)
             ),
             ConvergenceVerdict::Obstructed(o) => format!(
                 "可观测性栈没能在 rev {} 与仓库声明收敛：{}。{}",
@@ -505,18 +509,11 @@ fn clip(text: &str, max: usize) -> String {
     out
 }
 
-fn join_named(names: &[String], max_named: usize) -> String {
+fn join_named(names: &[String]) -> String {
     if names.is_empty() {
         return "（无）".into();
     }
-    if names.len() <= max_named {
-        return names.join(", ");
-    }
-    format!(
-        "{}, +{} more",
-        names[..max_named].join(", "),
-        names.len() - max_named
-    )
+    names.join(", ")
 }
 
 /// 收敛面。
@@ -881,7 +878,7 @@ impl StackConvergence {
 
     /// 把结论送进持久化告警面（恢复时同一调用解除）。
     async fn publish(&self, verdict: &ConvergenceVerdict, rev: &str) {
-        let message = verdict.message(rev, self.cfg.max_named_resources);
+        let message = verdict.message(rev);
         let firing = verdict.is_firing();
         if firing {
             warn!(rev = %rev, "{}", message);
@@ -971,11 +968,6 @@ pub fn validate_config(cfg: &ObservabilityStackConfig) -> SFResult<()> {
             ObservabilityStackConfig::MIN_INTERVAL_SECS
         )));
     }
-    if cfg.max_named_resources == 0 {
-        return Err(SFError::Config(
-            "mainline_deployer.observability_stack.max_named_resources must be > 0".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -997,7 +989,7 @@ mod tests {
         )];
         let verdict = obstructed_after_partial(&obstacles, 3);
         assert!(verdict.is_firing(), "有文件没交付，结论必须是没收敛");
-        let message = verdict.message("0123456789abcdef", 8);
+        let message = verdict.message("0123456789abcdef");
         assert!(
             message.contains("01-namespace.yaml"),
             "结论没说清是哪一份被拒：{message}"
@@ -1021,7 +1013,7 @@ mod tests {
                 Obstacle::Forbidden("b".into()),
             ),
         ];
-        let message = obstructed_after_partial(&obstacles, 0).message("0123456789abcdef", 8);
+        let message = obstructed_after_partial(&obstacles, 0).message("0123456789abcdef");
         assert!(
             message.contains("2 份"),
             "只报了第一条，份数丢了：{message}"
@@ -1308,20 +1300,21 @@ mod tests {
         };
         assert!(repaired.is_firing());
         assert!(repaired
-            .message("abcdef1234567890", 6)
+            .message("abcdef1234567890")
             .contains("已按 rev abcdef123456 修回"));
         let converged = ConvergenceVerdict::Converged { resources: 7 };
         assert!(!converged.is_firing());
-        assert!(converged.message("abcdef1234567890", 6).contains("一致"));
+        assert!(converged.message("abcdef1234567890").contains("一致"));
     }
 
-    /// 点名的文件数必须有界：目录里可以有二十个文件都漂移，消息不能长到没人读。
+    /// 修回时点名**每一个**漂移的文件：被比较的清单集是一棵封闭的小目录，长度天然
+    /// 有界；折成计数会把「是哪一个漂了」藏起来，而那正是这条消息唯一的信息。
     #[test]
-    fn the_message_names_a_bounded_number_of_files() {
+    fn the_message_names_every_file_that_drifted() {
         let many: Vec<String> = (0..20).map(|i| format!("{i:02}-manifest.yaml")).collect();
-        let msg = ConvergenceVerdict::DriftRepaired { repaired: many }.message("rev", 6);
-        assert!(msg.contains("+14 more"), "{msg}");
-        assert!(msg.matches("-manifest.yaml").count() == 6, "{msg}");
+        let msg = ConvergenceVerdict::DriftRepaired { repaired: many }.message("rev");
+        assert!(msg.matches("-manifest.yaml").count() == 20, "{msg}");
+        assert!(!msg.contains("more"), "{msg}");
     }
 
     /// 没有结论这件事本身要说出来，且要说清是"没读到"而不是"没问题"。
@@ -1329,7 +1322,7 @@ mod tests {
     fn no_evidence_says_so_rather_than_reading_as_healthy() {
         let verdict = ConvergenceVerdict::NoEvidence("bare rev 读不到".into());
         assert!(verdict.is_firing());
-        let msg = verdict.message("rev", 6);
+        let msg = verdict.message("rev");
         assert!(msg.contains("没有结论"), "{msg}");
         assert!(msg.contains("读不到"), "{msg}");
     }

@@ -384,6 +384,13 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_task_router_claim_hold_bound_seconds",
         "crates/cog-orchestrator/src/observable.rs",
     ),
+    // The ordinary lane's bound is derived from the pool's window, and a window
+    // that does not move leaves the bound where it is: the target unchanged is
+    // the correct answer, so only an evaluation count can say the loop is still
+    // recomputing rather than stopped. That count is a dashboard reading, not a
+    // rule input -- a quiet lane may owe it no evaluation, so a rule on the
+    // count would fire on a healthy host; the dashboard's beat panel reads it
+    // beside the bound instead, and the row lives in that contract's table.
     // The two task-graph readings a rule on "the graph stopped moving" is
     // built from, and they are a pair for the reason a stall is hard to read:
     // the oldest-untouched age grows while everything else holds still, and

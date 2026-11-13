@@ -23,9 +23,11 @@ data:
   # 同一台 Postgres 上有几个进程各开一套连接池：主应用、进化、安全网关，再加一个
   # 滚动更新时同时活着的新 Pod。每个进程把服务器的连接上限按这个数分摊到自己的池
   # 上，数少了就是把别人的份也算成自己的——实测 2026-10-30 滚动时新 Pod 报
-  # `pool timed out while waiting for an open connection`。这里是 chart 渲染值的
-  # 投影（三份 profile 的副本数都是 1），权威源在 chart templates/configmap.yaml。
-  COGNEVA_PG_SHARING_PROCESSES: "4"
+  # `pool timed out while waiting for an open connection`。主应用与安全网关的
+  # 副本数由就绪节点数在运行时给出（一节点一个、多节点两个），所以按可能达到的
+  # 上限 2 计，而不是按种子 1 计：这里是 chart 渲染值的投影，权威源在
+  # chart templates/configmap.yaml。
+  COGNEVA_PG_SHARING_PROCESSES: "6"
 
   # Vector DB：后端地址直接由代码读 QDRANT_URL，没有第二个 provider 开关。
   QDRANT_URL: "http://qdrant.cogneva.svc.cluster.local:6334"
@@ -69,10 +71,10 @@ data:
   # 2026-11-06 抬到 6：3 生效后一小时里变更任务才第一次并行开工，而一道变更仍要
   # 33~50 分钟，3 槽折合约 86 笔/天，低于 120 的目标；队列不是瓶颈（885 条 scheduled
   # 分属 885 个 goal）。拿不到构建槽的变更不判负、只重试，所以多出来的槽位在等构建。
-  # 不能导出：这一格的界在 token 预算维度（一次窗口买得起几件活），不在内存维度；
-  # 网关用量按车道分摊的读数不存在，所以没有分子也没有分母。2 的依据是
-  # 2026-11-06 那次实测（一道变更 33~50 分钟，3 槽折合约 86 笔/天）。
-  COGNEVA_TASK_CLAIM_CONCURRENCY: "2"
+  # 0 = 按池子的窗口导出：每拍读 `(额度-已花) ÷ 单任务价格`（价格是池子对已完成
+  # 任务的实测），把界写回 `cogneva_task_router_claim_slots` 并带 `source` 标签；
+  # 正数是钉死的覆盖位。两种情形报的都是真正在用的那个界。
+  COGNEVA_TASK_CLAIM_CONCURRENCY: "0"
 
   # 本地车道（`:local`）自己的在途上限，只有带 executor 角色的部署读这条流，变更
   # 任务全在它上面跑。与上面那格分开算：一个进程读得到的别的流不受这个数影响。
@@ -93,9 +95,13 @@ data:
   # 变更账一拍把一个项目的几条欠账并成一道任务派出去。价格的大头是任务的固定部分
   # （一次规划、一轮上下文、一轮沙箱验证），它不随任务承载几条增长，所以并得越多、
   # 每条欠账摊到的钱越少。上限在生成侧而不在这一格：一批写成一份变更，超过一次
-  # 生成写得完的量就会截断、整批报废，所以它是「一次生成装得下几条修复」，不是
-  # 拍板定的界——要抬就直接改这一格，代码里那个默认值只是没配时的起点。
-  COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER: "5"
+  # 生成写得完的量就会截断、整批报废。
+  #
+  # 0 = 按图里的批次导出：每拍读一次它自己交出去的批次，落地整批的最大条数 + 1
+  # 就是下一拍的界，被工作本身退回的批次给界封顶（证据 30 天后过期）；还没量到
+  # 更大的批次时用 5 作起点。界写回 `cogneva_change_ledger_rows_per_handover`
+  # 并带 `source`，每拍记一次 `_evaluations_total`。正数是钉死的覆盖位。
+  COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER: "0"
 
   # Gateway
   COGNEVA_HTTP_PORT: "8080"

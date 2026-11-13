@@ -6,6 +6,11 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: gateway
+  annotations:
+    # 副本数由集群就绪节点数决定（两个是「任意一台可以不见」的最小集合），
+    # 启动预算由实测启动时长决定；两个回路都只改带标记的对象。
+    cogneva.io/replica-policy: topology
+    cogneva.io/startup-policy: measured
 spec:
   replicas: {{ .Values.gateway.replicas }}
   # Surge by one, keep both ready during the handoff: the old pod serves until
