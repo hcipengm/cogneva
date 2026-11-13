@@ -491,3 +491,66 @@ pub(crate) mod checkout;
 /// 单测共用的样例：一片写满字节的文件，与 chart 里那条按名字取的规则。
 #[cfg(test)]
 pub(crate) mod test_support;
+
+/// 本文件声明的每一个标签键，它的值必须是它自己那个标识符去掉 `label_` 前缀后的小写。
+///
+/// 标签键在这一处声明、被各模块引用；手抄一份值（`alertName`、`alert_type_`）
+/// 编译期看不出来，只会在 chart 的选择子上变成一条匹配不到任何序列的规则。
+/// 表里逐行抄的是常量本身而不是它的值，所以值漂了这条用例就红。
+#[cfg(test)]
+mod label_spellings {
+    use super::*;
+
+    /// 本文件每一条 `LABEL_*` 常量与它自己的标识符。
+    const DECLARED: [(&str, &str); 33] = [
+        ("LABEL_NODE", LABEL_NODE),
+        ("LABEL_STATE", LABEL_STATE),
+        ("LABEL_REASON", LABEL_REASON),
+        ("LABEL_RESULT", LABEL_RESULT),
+        ("LABEL_MESSAGE", LABEL_MESSAGE),
+        ("LABEL_SERVICE", LABEL_SERVICE),
+        ("LABEL_AGENT_ID", LABEL_AGENT_ID),
+        ("LABEL_ALERT_TYPE", LABEL_ALERT_TYPE),
+        ("LABEL_TIER", LABEL_TIER),
+        ("LABEL_TRIGGER", LABEL_TRIGGER),
+        ("LABEL_CHANNEL", LABEL_CHANNEL),
+        ("LABEL_SLICE", LABEL_SLICE),
+        ("LABEL_CAUSE", LABEL_CAUSE),
+        ("LABEL_WORKSPACE_ID", LABEL_WORKSPACE_ID),
+        ("LABEL_CREW_ID", LABEL_CREW_ID),
+        ("LABEL_CONSUMER", LABEL_CONSUMER),
+        ("LABEL_PHASE", LABEL_PHASE),
+        ("LABEL_JOB", LABEL_JOB),
+        ("LABEL_METRIC", LABEL_METRIC),
+        ("LABEL_TASK_ID", LABEL_TASK_ID),
+        ("LABEL_ALERTNAME", LABEL_ALERTNAME),
+        ("LABEL_SEVERITY", LABEL_SEVERITY),
+        ("LABEL_LEVEL", LABEL_LEVEL),
+        ("LABEL_SUSPECT_COUNT", LABEL_SUSPECT_COUNT),
+        ("LABEL_POOL_SIZE", LABEL_POOL_SIZE),
+        ("LABEL_MIN_HEALTHY", LABEL_MIN_HEALTHY),
+        ("LABEL_MIN_HEALTHY_SOURCE", LABEL_MIN_HEALTHY_SOURCE),
+        (
+            "LABEL_EVIDENCED_RECOVERY_UNIX",
+            LABEL_EVIDENCED_RECOVERY_UNIX,
+        ),
+        ("LABEL_NEXT_ATTEMPT_UNIX", LABEL_NEXT_ATTEMPT_UNIX),
+        ("LABEL_QUOTA_WINDOW_SECS", LABEL_QUOTA_WINDOW_SECS),
+        ("LABEL_UNAVAILABLE", LABEL_UNAVAILABLE),
+        ("LABEL_SCHEDULER_PAUSED", LABEL_SCHEDULER_PAUSED),
+        ("LABEL_THRESHOLD", LABEL_THRESHOLD),
+    ];
+
+    #[test]
+    fn every_label_spelling_is_its_own_identifier() {
+        for (ident, value) in DECLARED {
+            let expected = ident.to_lowercase();
+            let expected = expected.strip_prefix("label_");
+            assert_eq!(
+                Some(value),
+                expected,
+                "label spelling drifted from its identifier"
+            );
+        }
+    }
+}
