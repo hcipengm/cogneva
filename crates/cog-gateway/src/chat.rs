@@ -1187,6 +1187,7 @@ async fn record_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
     user: &str,
+    model: Option<&str>,
     attachments: &[cog_core::ChatAttachment],
     assistant: &str,
 ) {
@@ -1198,7 +1199,7 @@ async fn record_turn(
         return;
     };
     if let Err(e) = store
-        .record_turn(session_id, user, attachments, assistant)
+        .record_turn(session_id, user, model, attachments, assistant)
         .await
     {
         tracing::warn!(
@@ -1219,6 +1220,7 @@ async fn record_dispatched_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
     user: &str,
+    model: Option<&str>,
     attachments: &[cog_core::ChatAttachment],
     assistant: &str,
     goal_id: &str,
@@ -1231,7 +1233,7 @@ async fn record_dispatched_turn(
         return;
     };
     if let Err(e) = store
-        .record_dispatched_turn(session_id, user, attachments, assistant, goal_id)
+        .record_dispatched_turn(session_id, user, model, attachments, assistant, goal_id)
         .await
     {
         tracing::warn!(
@@ -1290,6 +1292,9 @@ pub async fn run_chat_turn(
     out: mpsc::Sender<String>,
     session_id: String,
     content: String,
+    // 这一句点的哪一条命令（`/名字`），`None` 是普通的一句话。命令不是发给模型的
+    // 那句话：`content` 是人打的那一行，交给模型的是展开后的说明。
+    command: Option<crate::commands::Invocation>,
     // 随这一句上来的图片 / PDF / 音频。数据保持 base64：交给循环的媒体块就是
     // 这个形状，网关不拆包也不重编。
     attachments: Vec<cog_core::ChatAttachment>,
@@ -1404,16 +1409,56 @@ pub async fn run_chat_turn(
         return;
     };
 
+    // 这一轮的窗口尺：长消息的折叠与技能说明的上限都用它。窗口从会话执行器读，
+    // 不在网关另写一个数——两处不同源，界面上落成文件的那条线就会与循环真正被
+    // 撑破的那条线错开。
+    let threshold = oversized_threshold_tokens(
+        conversation.context_window_tokens(),
+        MAX_INBOUND_FRAME_BYTES,
+    );
+
+    // 1b. 一条命令：认名字、展开说明。认不出来就在这儿说，不交给模型——屏幕上
+    //     要是让模型去答「/websearch 是什么」，它只能用猜的，而真正发生的是平台
+    //     不认识那个名字。展开后的那一段只活在这一轮：记录里存的是人打的那一行
+    //     （给读记录的人看），交给模型的那一份另存一列（给后面几轮看），两列都
+    //     不是「这一句话」的替身。
+    let expansion = match command.as_ref() {
+        None => None,
+        Some(invocation) => {
+            match crate::commands::expand(
+                state.external_skill_registry.as_ref(),
+                invocation,
+                threshold,
+            )
+            .await
+            {
+                Ok(text) => Some(text),
+                Err(reason) => {
+                    emit_delta(&out, &session_id, &assistant_mid, &reason).await;
+                    // 记成没答的那一轮：这句话确实对这个平台说过，认不出命令也是
+                    // 这一轮的事实。没答的那一轮不进模型的历史（见 `history`），
+                    // 所以模型不会把一句平台提示当成自己说过的话。
+                    record_failed_turn(
+                        &state.chat_turns,
+                        &session_id,
+                        &content,
+                        &attachments,
+                        &reason,
+                    )
+                    .await;
+                    emit_message_end(&out, &session_id, &assistant_mid).await;
+                    return;
+                }
+            }
+        }
+    };
+
     // 2. Build the transcript: what this session already said, plus this
     //    sentence. 循环读到的是这段记录，不是网关的记忆。员工的指示不在这里：
     //    它是那位员工自己的事，由会话执行器按声明取，网关只搬对话。
     //
     //    读历史时同一条规则再生效一次：记录里存的是原文（界面上要能读回它），
     //    而循环读到的是引用加开头（整句再进一次上下文，窗口撑破的就是它）。
-    let threshold = oversized_threshold_tokens(
-        conversation.context_window_tokens(),
-        MAX_INBOUND_FRAME_BYTES,
-    );
     let mut messages = load_history(
         &state.chat_turns,
         &session_id,
@@ -1421,9 +1466,10 @@ pub async fn run_chat_turn(
         state.sandbox_backend.as_ref(),
     )
     .await;
-    let text = match &archived {
-        Some(archived) => archived.reference.clone(),
-        None => content.clone(),
+    let text = match (&archived, &expansion) {
+        (Some(archived), _) => archived.reference.clone(),
+        (None, Some(expansion)) => expansion.clone(),
+        (None, None) => content.clone(),
     };
     // `@` 点名的文件在这一轮就铺进上下文：人是拿它补充这句话的，等模型自己
     // 想起来再读一遍，是把一句已经给了材料的话当成一个调研任务。
@@ -1589,6 +1635,7 @@ pub async fn run_chat_turn(
                     &state.chat_turns,
                     &session_id,
                     &content,
+                    expansion.as_deref(),
                     &attachments,
                     &reply,
                     goal_id,
@@ -1600,6 +1647,7 @@ pub async fn run_chat_turn(
                     &state.chat_turns,
                     &session_id,
                     &content,
+                    expansion.as_deref(),
                     &attachments,
                     &reply,
                 )
@@ -1993,7 +2041,7 @@ mod tests {
     async fn the_history_the_model_sees_comes_from_the_store() {
         let store = std::sync::Arc::new(FakeTurns::default());
         store
-            .record_turn("s1", "上一问", &[], "上一答")
+            .record_turn("s1", "上一问", None, &[], "上一答")
             .await
             .expect("seed the fake transcript");
         let handle: crate::ChatTurnHandle = Some(store.clone());
@@ -2168,6 +2216,7 @@ mod tests {
             .record_turn(
                 "s1",
                 "这里错了",
+                None,
                 &[cog_core::ChatAttachment {
                     name: Some("shot.png".into()),
                     mime_type: "image/png".into(),
@@ -2209,6 +2258,7 @@ mod tests {
             .record_turn(
                 "s1",
                 &long,
+                None,
                 &[cog_core::ChatAttachment {
                     name: Some("shot.png".into()),
                     mime_type: "image/png".into(),
@@ -2250,6 +2300,40 @@ mod tests {
         );
     }
 
+    /// 一条命令：记录里存的是人打的那一行，后面几轮读到的却是展开后的说明。
+    ///
+    /// 两格要是读成同一份，两个方向都是错的：重开页面时人看到一整份 SKILL.md 画成
+    /// 「我说的话」；第二句追问时模型手上没有那份规程，只能按自己的猜法继续——一段
+    /// 用技能开的对话，从第二轮起就不再是那个技能在做了。
+    #[tokio::test]
+    async fn a_command_leaves_what_the_person_typed_and_what_the_model_read() {
+        let store = std::sync::Arc::new(FakeTurns::default());
+        let handle: crate::ChatTurnHandle = Some(store.clone());
+        record_turn(
+            &handle,
+            "s1",
+            "/web-research 查一下 1.90",
+            Some("先搜，再读。"),
+            &[],
+            "查到了",
+        )
+        .await;
+
+        // 模型那一侧（下一轮读历史）拿到的是展开后的说明。
+        let messages = load_history(&handle, "s1", NEVER_OVERSIZED, None).await;
+        assert_eq!(
+            messages[0].content(),
+            "先搜，再读。",
+            "后面几轮读到的不是展开后的说明"
+        );
+        // 读者的那一侧是原来的人话（替身把两者分开存着，见 `FakeTurns`）。
+        assert_eq!(
+            store.typed.lock().await.clone(),
+            vec!["/web-research 查一下 1.90".to_string()],
+            "人打的那一行没有被记下来"
+        );
+    }
+
     /// 一个只回答「写成功了」的沙箱：这一条量的是折叠，不是文件怎么写。
     struct AcceptingBackend;
 
@@ -2280,7 +2364,7 @@ mod tests {
     async fn an_answered_turn_is_written_down_as_a_pair() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_turn(&handle, "s1", "问", &[], "答").await;
+        record_turn(&handle, "s1", "问", None, &[], "答").await;
         let held = store.turns.lock().await.clone();
         assert_eq!(
             held,
@@ -2308,7 +2392,7 @@ mod tests {
     async fn a_dispatched_turn_keeps_its_goal_where_the_history_can_read_it() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_dispatched_turn(&handle, "s1", "把这件事做了", &[], "已受理", "goal-7").await;
+        record_dispatched_turn(&handle, "s1", "把这件事做了", None, &[], "已受理", "goal-7").await;
 
         // 问句与答复照样成对进上下文：交出去不等于这一轮就不用记。
         let held = store.turns.lock().await.clone();
@@ -2352,7 +2436,7 @@ mod tests {
             .await
             .is_empty());
         // 不发散：这里只要求「不写进任何东西」——没有第二个家可写。
-        record_turn(&handle, "s1", "问", &[], "答").await;
+        record_turn(&handle, "s1", "问", None, &[], "答").await;
         record_failed_turn(&handle, "s1", "问", &[], "答不出来").await;
     }
 
@@ -2361,7 +2445,7 @@ mod tests {
     async fn a_transcript_that_cannot_be_read_answers_without_context() {
         let store = std::sync::Arc::new(FakeTurns::default());
         store
-            .record_turn("s1", "问", &[], "答")
+            .record_turn("s1", "问", None, &[], "答")
             .await
             .expect("seed the fake transcript");
         store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2370,7 +2454,7 @@ mod tests {
             .await
             .is_empty());
         // 写也失败时不许把这一轮的回答吞掉：record_turn 只留 warn。
-        record_turn(&handle, "s1", "问", &[], "答").await;
+        record_turn(&handle, "s1", "问", None, &[], "答").await;
     }
 
     /// 一份内存里的记录，只作测试替身。生产里没有它的对应物——这次改动拆掉的
@@ -2382,6 +2466,9 @@ mod tests {
         unanswered: tokio::sync::Mutex<Vec<(String, String)>>,
         /// 交出去的那几轮与它们的目标：(问句, goal_id)。
         dispatched: tokio::sync::Mutex<Vec<(String, String)>>,
+        /// 人打过的每一行原话。真实实现把它写进 `content`、把展开写进 `model_content`，
+        /// 这里分成两格，测的才是「两者不是同一份」。
+        typed: tokio::sync::Mutex<Vec<String>>,
         last_limit: tokio::sync::Mutex<Option<usize>>,
         fail: std::sync::atomic::AtomicBool,
     }
@@ -2392,6 +2479,7 @@ mod tests {
             &self,
             session_id: &str,
             user: &str,
+            model: Option<&str>,
             attachments: &[cog_core::ChatAttachment],
             assistant: &str,
         ) -> cog_core::SFResult<()> {
@@ -2402,9 +2490,12 @@ mod tests {
             if session_id != "s1" {
                 return Ok(());
             }
+            self.typed.lock().await.push(user.to_string());
+            // 与 SQL 里那条 `COALESCE(model_content, content)` 同一个读法：这一格
+            // 存的是交给模型的那一份，不是人打的那一行。
             held.push(cog_core::ChatTurn {
                 role: cog_core::ChatTurnRole::User,
-                content: user.to_string(),
+                content: model.unwrap_or(user).to_string(),
                 attachments: attachments.to_vec(),
             });
             held.push(cog_core::ChatTurn {
@@ -2419,6 +2510,7 @@ mod tests {
             &self,
             session_id: &str,
             user: &str,
+            model: Option<&str>,
             attachments: &[cog_core::ChatAttachment],
             assistant: &str,
             goal_id: &str,
@@ -2432,7 +2524,7 @@ mod tests {
             let mut held = self.turns.lock().await;
             held.push(cog_core::ChatTurn {
                 role: cog_core::ChatTurnRole::User,
-                content: user.to_string(),
+                content: model.unwrap_or(user).to_string(),
                 attachments: attachments.to_vec(),
             });
             held.push(cog_core::ChatTurn {

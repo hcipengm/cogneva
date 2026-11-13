@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { getWorkspaceTree, type WorkspaceEntry } from '@/api/client';
+import {
+  getChatCommands,
+  getWorkspaceTree,
+  type ChatCommand,
+  type WorkspaceEntry,
+} from '@/api/client';
 import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch';
 import { Markdown } from '@/conversation/Markdown';
 import { TodoPanel, todoListsIn } from '@/conversation/TodoPanel';
@@ -166,6 +171,32 @@ export function mentionAt(
  */
 export function mentionedPath(entry: { path: string; dir: boolean }): string {
   return `@${entry.path}${entry.dir ? '/' : ' '}`;
+}
+
+/**
+ * 这一句是不是一条命令：`/名字 要求`。
+ *
+ * 名字后面必须紧跟空白或行尾——`/usr/local/bin 不见了` 是一句话，`/web-research
+ * 查一下` 是一条命令。两者的分别不在开头的那个 `/`，而在名字边界；按「以 `/`
+ * 开头就算命令」去分，一句报错会被当成一条命令去执行。
+ */
+export function commandLine(text: string): { name: string; arguments: string } | null {
+  const match = /^\/([A-Za-z0-9_-]+)(?:[ \t]+([\s\S]*))?$/.exec(text.trim());
+  if (!match) return null;
+  return { name: match[1], arguments: match[2] ?? '' };
+}
+
+/**
+ * 光标还在第一行第一个词里时，那半截名字；`null` 是「没在打命令」。
+ *
+ * 只认整句开头的那一个 `/`：一句话中间出现的斜杠（路径、日期、分数）不是在点
+ * 命令。名字里出现空白或别的字符就是这一句已经往下写了，列表该收。
+ */
+export function slashQuery(text: string, caret: number): string | null {
+  if (!text.startsWith('/') || caret < 1) return null;
+  const word = text.slice(1, caret);
+  if (!/^[A-Za-z0-9_-]*$/.test(word)) return null;
+  return word;
 }
 
 /**
@@ -549,6 +580,24 @@ export function ConversationPane({
   const mentionDir = mention?.query.dir;
 
   /**
+   * 正在打的那条命令（`/` 开头、光标还在名字里）。
+   *
+   * 名单每次都向服务端要：技能目录是热加载的，人刚放进去的一份说明应当在下一
+   * 次打 `/` 时就看得见。`error` 与「候选是空的」分开——前者是没读到，后者是读到
+   * 了但没有这个名字。
+   */
+  const [slash, setSlash] = useState<{
+    query: string;
+    index: number;
+    list: ChatCommand[];
+    note?: string;
+    error: string | null;
+    /** 名单到手了没有。「还没读到」与「一条都没有」在屏幕上要分得开。 */
+    loaded: boolean;
+  } | null>(null);
+  const slashOpen = slash !== null;
+
+  /**
    * 把选来 / 贴进来的文件收成附件。
    *
    * 太大的那一个不进队列，也不再静默丢掉：一句「带不动」当场写在输入框上方，
@@ -633,6 +682,61 @@ export function ConversationPane({
     },
     [draft, mention]
   );
+
+  useEffect(() => {
+    if (!slashOpen) return;
+    let live = true;
+    getChatCommands()
+      .then((answer) => {
+        if (!live) return;
+        setSlash((prev) =>
+          prev
+            ? { ...prev, list: answer.commands, note: answer.note, error: null, loaded: true }
+            : prev
+        );
+      })
+      .catch((e) => {
+        if (!live) return;
+        setSlash((prev) =>
+          prev
+            ? {
+                ...prev,
+                list: [],
+                error: (e as { message?: string })?.message ?? '读不到命令名单',
+                loaded: true,
+              }
+            : prev
+        );
+      });
+    return () => {
+      live = false;
+    };
+  }, [slashOpen]);
+
+  /** 把挑中的那一条接进草稿：只补名字与一个空格，要求由人接着打。 */
+  const acceptSlash = useCallback(
+    (command: ChatCommand) => {
+      const head = '/' + command.name + ' ';
+      setDraft(head);
+      setSlash(null);
+      requestAnimationFrame(() => {
+        const el = draftRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(head.length, head.length);
+      });
+    },
+    []
+  );
+
+  /** 名字以打了一半的那几个字符起头的命令。 */
+  const slashCandidates = useMemo(() => {
+    if (!slash) return [];
+    const query = slash.query.toLowerCase();
+    return slash.list
+      .filter((command) => command.name.toLowerCase().startsWith(query))
+      .slice(0, MENTION_ROWS);
+  }, [slash]);
 
   /** 这一层里以打了一半的名字起头的那几行。目录与文件一起列：先打得进去，再挑内容。 */
   const mentionCandidates = useMemo(() => {
@@ -798,20 +902,32 @@ export function ConversationPane({
 
     const client = clientRef.current;
     if (!client) return;
+    // 线上形状按服务端那一边的名字写：`mime_type` 是那条协议的语言，不是这里的。
+    const attachments = files.map((file) => ({
+      name: file.name,
+      mime_type: file.mimeType,
+      data: file.data,
+    }));
+    // 一条命令与一句话走两条帧：服务端不必按开头的 `/` 去猜，一段以 `/usr/...`
+    // 开头的报错也就不会被当成一条命令去执行。
+    const command = commandLine(text);
     if ('simulateUserMessage' in client) {
       client.setSession?.(sessionId);
       client.simulateUserMessage(text);
+    } else if (command) {
+      client.send({
+        type: 'command',
+        session_id: sessionId,
+        name: command.name,
+        arguments: command.arguments,
+        attachments,
+      });
     } else {
       client.send({
         type: 'chat_message',
         session_id: sessionId,
         content: text,
-        // 线上形状按服务端那一边的名字写：`mime_type` 是那条协议的语言，不是这里的。
-        attachments: files.map((file) => ({
-          name: file.name,
-          mime_type: file.mimeType,
-          data: file.data,
-        })),
+        attachments,
       });
     }
   }, [appendUserTurn, clientRef, draft, pendingFiles, sessionId]);
@@ -1302,6 +1418,60 @@ export function ConversationPane({
           </div>
         )}
         {/*
+          整句以 `/` 开头时列出来的命令名单。挑中的是一个名字，不是「这一句」——
+          名字后面还要接着打要求，回车才发。
+        */}
+        {slash && (
+          <div
+            className="mono mb-1 max-h-48 overflow-auto border text-[11px]"
+            style={{ borderColor: 'var(--line)' }}
+          >
+            {slash.error ? (
+              <div className="px-2 py-1 text-[10px]" style={{ color: 'var(--danger)' }}>
+                {slash.error}
+              </div>
+            ) : !slash.loaded ? (
+              <div className="px-2 py-1 text-[10px]" style={{ color: 'var(--muted)' }}>
+                正在读名单…
+              </div>
+            ) : slashCandidates.length === 0 ? (
+              <div className="px-2 py-1 text-[10px]" style={{ color: 'var(--muted)' }}>
+                没有以「{slash.query}」起头的命令
+              </div>
+            ) : (
+              slashCandidates.map((command, index) => (
+                <button
+                  key={command.name}
+                  type="button"
+                  // 按下时不许输入框失焦：失焦就先把这份名单收掉了，点空。
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    acceptSlash(command);
+                  }}
+                  onMouseEnter={() =>
+                    setSlash((prev) => (prev ? { ...prev, index } : prev))
+                  }
+                  className="block w-full truncate px-2 py-0.5 text-left"
+                  style={{
+                    background: index === slash.index ? 'var(--line)' : 'transparent',
+                    color: 'var(--paper-dim)',
+                  }}
+                >
+                  /{command.name}
+                  <span className="ml-2 text-[10px]" style={{ color: 'var(--muted)' }}>
+                    {command.description}
+                  </span>
+                </button>
+              ))
+            )}
+            {slash.note && (
+              <div className="px-2 py-1 text-[10px]" style={{ color: 'var(--muted)' }}>
+                {slash.note}
+              </div>
+            )}
+          </div>
+        )}
+        {/*
           打 `@` 列出来的那一层文件。挑中的是一条路径，不是「这一句」——它接在
           光标处，接着往下打时列表跟着下一层走。
         */}
@@ -1388,9 +1558,20 @@ export function ConversationPane({
                 }
                 return { query, entries: [], index: 0, error: null };
               });
+              // `/` 只在整句开头算一条命令：一句话中间的斜杠是在打路径，不是在
+              // 点技能。名单只在刚打开时取一次，之后继续打字只筛已有的那几行。
+              const command = slashQuery(value, caret);
+              setSlash((prev) => {
+                if (command === null) return null;
+                if (prev) return { ...prev, query: command, index: 0 };
+                return { query: command, index: 0, list: [], error: null, loaded: false };
+              });
             }}
             onFocus={onFocus}
-            onBlur={() => setMention(null)}
+            onBlur={() => {
+              setMention(null);
+              setSlash(null);
+            }}
             onPaste={(e) => {
               // 截图直接贴进来：剪贴板里带文件时，文件才是这一次要说的东西。
               const files = Array.from(e.clipboardData?.items ?? [])
@@ -1402,6 +1583,37 @@ export function ConversationPane({
               void attach(files);
             }}
             onKeyDown={(e) => {
+              // 命令名单开着时，上下键与回车/Tab 归名单：这一下挑的是一个名字，
+              // 不是把 `/webres` 当成一句话发出去。挑完只补到名字与一个空格上，
+              // 要求还要接着打——命令执行的是名字，后面那段是人自己写的。
+              if (slash) {
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setSlash(null);
+                  return;
+                }
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  const step = e.key === 'ArrowDown' ? 1 : -1;
+                  const size = Math.max(slashCandidates.length, 1);
+                  setSlash((prev) =>
+                    prev ? { ...prev, index: (prev.index + step + size) % size } : prev
+                  );
+                  return;
+                }
+                if (
+                  (e.key === 'Enter' || e.key === 'Tab') &&
+                  !e.nativeEvent.isComposing &&
+                  e.nativeEvent.keyCode !== 229
+                ) {
+                  const pick = slashCandidates[slash.index] ?? slashCandidates[0];
+                  if (pick) {
+                    e.preventDefault();
+                    acceptSlash(pick);
+                    return;
+                  }
+                }
+              }
               // 文件列表开着时，上下键与回车/Tab 归列表：这一下挑的是一条路径，
               // 不是把半句话发出去。Esc 收掉列表，回车回到「发出去」。
               if (mention) {

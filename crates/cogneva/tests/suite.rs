@@ -483,6 +483,8 @@ mod shutdown_budget_contract_test;
 mod skill_directories_contract_test;
 #[path = "skills_carry_no_persona_and_no_boundary_test.rs"]
 mod skills_carry_no_persona_and_no_boundary_test;
+#[path = "slash_commands_reach_the_conversation_test.rs"]
+mod slash_commands_reach_the_conversation_test;
 #[path = "sparse_weights_are_loaded_once_contract_test.rs"]
 mod sparse_weights_are_loaded_once_contract_test;
 #[path = "store_counter_window_contract_test.rs"]

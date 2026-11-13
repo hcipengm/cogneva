@@ -1,0 +1,18 @@
+-- Migration: 102_chat_turn_model_content
+-- A slash command keeps the instructions it expanded into.
+--
+-- A command line is two different sentences at once: what the person typed
+-- (`/web-research 查一下 X`) and what the model was handed (that line plus the
+-- skill's own SKILL.md). The transcript kept only the first, so the following
+-- turn rebuilt a history in which the model had apparently answered a bare
+-- `/web-research` with no procedure in front of it. A conversation opened with a
+-- skill stopped following that skill from its second turn on.
+--
+-- The reader-facing column stays `content`: reopening a conversation must show
+-- the line the person actually wrote, not the file it expanded into. This column
+-- is only read by the prompt builder (`history`), and only when it is set.
+--
+-- Null for every row that is not a command, and for rows written before this
+-- column existed: "the person's words are what the model read" is the normal
+-- case, and the writer only fills the column when the two differ.
+ALTER TABLE chat_turns ADD COLUMN IF NOT EXISTS model_content TEXT;

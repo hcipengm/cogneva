@@ -67,6 +67,10 @@ pub struct ChatAttachment {
 
 /// One line of the transcript, oldest first when returned by
 /// [`ChatTurnStore::history`].
+///
+/// `content` 是**交给模型的那一份**：一句以 `/名字` 打头的命令，人在界面上打的是
+/// `/web-research 查一下`，模型看到的是展开后的那份说明。两者不同的地方只在这一
+/// 句是命令时；记录里另有一列存人打的那一行，给读记录的人看（[`ChatTurnRecord`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatTurn {
     pub role: ChatTurnRole,
@@ -131,10 +135,16 @@ pub trait ChatTurnStore: Send + Sync {
     ///
     /// `attachments` 与这一句同写一行：它们是这句话的一部分，分开写就有一瞬间
     /// 「这句话带不带那张图」没有答案。
+    ///
+    /// `model_content` 是这一句交给模型时用的正文，只在它与人打的那一行不同时才
+    /// 给：一条 `/名字` 命令展开成技能说明之后，人打的那一行与模型读到的不是同一段
+    /// 字。`None` 是「两者是同一句」——不是「模型什么都没看到」。后面几轮读历史
+    /// 用的是它，否则一段用技能开的对话在第二轮就不再带着那份规程。
     async fn record_turn(
         &self,
         session_id: &str,
         user: &str,
+        model_content: Option<&str>,
         attachments: &[ChatAttachment],
         assistant: &str,
     ) -> SFResult<()>;
@@ -150,6 +160,7 @@ pub trait ChatTurnStore: Send + Sync {
         &self,
         session_id: &str,
         user: &str,
+        model_content: Option<&str>,
         attachments: &[ChatAttachment],
         assistant: &str,
         goal_id: &str,

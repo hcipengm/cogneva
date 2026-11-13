@@ -83,6 +83,62 @@ struct Connection<'a> {
     origin: crate::chat::ClientOrigin<'a>,
 }
 
+/// 把这一轮放到后台跑起来。
+///
+/// 一轮对话可能要几十秒——绝不能挡住套接字这一圈（心跳与事件转发都在这条路上）。
+/// 一句话与一条命令走的是同一条路：命令只是多带了一样东西（点了哪一个名字），
+/// 回声、记录、停止与问人的通道都是共用的，所以这里是同一个出口。
+#[allow(clippy::too_many_arguments)]
+fn start_chat_turn(
+    state: &Arc<GatewayState>,
+    out_tx: &tokio::sync::mpsc::Sender<String>,
+    conn: Connection<'_>,
+    running: &crate::chat::RunningTurns,
+    permissions: &Arc<crate::chat::PermissionChannel>,
+    session_id: Option<String>,
+    content: String,
+    command: Option<crate::commands::Invocation>,
+    attachments: Vec<cog_core::ChatAttachment>,
+) {
+    let state = state.clone();
+    let out = out_tx.clone();
+    let session = session_id.unwrap_or_else(|| "default".into());
+    let owner = conn.user_id.to_string();
+    // 借用版活不过 spawn：来历里那两格先拷成自己的字符串，闭包里再借回去。
+    let platform = conn.origin.platform.map(str::to_string);
+    let device_id = conn.origin.device_id.map(str::to_string);
+    let running = running.clone();
+    // 这一轮的问人通道就是这条连接：问句从这里出去，答案从 `permission_response`
+    // 回来。模式取这一段对话当前那一格。
+    let mode = permissions.mode(&session);
+    let bridge: Arc<dyn crate::chat::PermissionBridge> =
+        Arc::new(crate::chat::SocketPermissionBridge::new(
+            session.clone(),
+            out_tx.clone(),
+            Arc::clone(permissions),
+        ));
+    tokio::spawn(async move {
+        let origin = crate::chat::ClientOrigin {
+            platform: platform.as_deref(),
+            device_id: device_id.as_deref(),
+        };
+        crate::chat::run_chat_turn(
+            state,
+            out,
+            session,
+            content,
+            command,
+            attachments,
+            owner,
+            origin,
+            running,
+            mode,
+            Some(bridge),
+        )
+        .await;
+    });
+}
+
 async fn handle_type_message(
     socket: &mut WebSocket,
     state: &Arc<GatewayState>,
@@ -141,44 +197,41 @@ async fn handle_type_message(
             if content.is_empty() && attachments.is_empty() {
                 return Ok(());
             }
-            // The LLM call can take tens of seconds — never block the socket
-            // loop (heartbeats, event forwarding) on a chat turn.
-            let state = state.clone();
-            let out = out_tx.clone();
-            let session = session_id.unwrap_or_else(|| "default".into());
-            let owner = conn.user_id.to_string();
-            // 借用版活不过 spawn：来历里那两格先拷成自己的字符串，闭包里再借回去。
-            let platform = conn.origin.platform.map(str::to_string);
-            let device_id = conn.origin.device_id.map(str::to_string);
-            let running = running.clone();
-            // 这一轮的问人通道就是这条连接：问句从这里出去，答案从下面的
-            // `permission_response` 回来。模式取这一段对话当前那一格。
-            let mode = permissions.mode(&session);
-            let bridge: Arc<dyn crate::chat::PermissionBridge> =
-                Arc::new(crate::chat::SocketPermissionBridge::new(
-                    session.clone(),
-                    out_tx.clone(),
-                    Arc::clone(permissions),
-                ));
-            tokio::spawn(async move {
-                let origin = crate::chat::ClientOrigin {
-                    platform: platform.as_deref(),
-                    device_id: device_id.as_deref(),
-                };
-                crate::chat::run_chat_turn(
-                    state,
-                    out,
-                    session,
-                    content,
-                    attachments,
-                    owner,
-                    origin,
-                    running,
-                    mode,
-                    Some(bridge),
-                )
-                .await;
-            });
+            start_chat_turn(
+                state,
+                out_tx,
+                conn,
+                running,
+                permissions,
+                session_id,
+                content,
+                None,
+                attachments,
+            );
+        }
+        ClientMessage::Command {
+            session_id,
+            name,
+            arguments,
+            attachments,
+            ..
+        } => {
+            let invocation = crate::commands::Invocation { name, arguments };
+            // 空名字不是一条命令，也不是一句话：什么都不说就是不说话。
+            if invocation.line().trim() == "/" {
+                return Ok(());
+            }
+            start_chat_turn(
+                state,
+                out_tx,
+                conn,
+                running,
+                permissions,
+                session_id,
+                invocation.line(),
+                Some(invocation),
+                attachments,
+            );
         }
         ClientMessage::PermissionResponse {
             request_id,

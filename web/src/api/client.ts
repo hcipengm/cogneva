@@ -3485,6 +3485,27 @@ function sourceQuery(source: FileSource): string {
   return source === 'workspace' ? '' : `&source=${source}`;
 }
 
+/**
+ * 这一段对话能点的命令：一行 `/` 打头时列出来的那份名单。
+ *
+ * 名字打不出来的技能、或者整个技能表读不到时，服务端在 `note` 里说一句为什么
+ * 名单短了——那不是「一条都没有」，两者在界面上要分得开。
+ */
+export interface ChatCommand {
+  name: string;
+  description: string;
+  kind: 'skill' | 'builtin';
+}
+
+export interface ChatCommandList {
+  commands: ChatCommand[];
+  note?: string;
+}
+
+export async function getChatCommands(): Promise<ChatCommandList> {
+  return api.get<ChatCommandList>('/api/v1/chat/commands');
+}
+
 export async function getWorkspaceTree(
   path = '',
   source: FileSource = 'workspace'

@@ -37,6 +37,7 @@ pub mod capabilities;
 pub mod chat;
 pub mod cluster;
 pub mod collaboration;
+pub mod commands;
 pub mod contribution_admin;
 pub mod dashboard;
 pub mod datasets;
@@ -1102,6 +1103,9 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(progress::progress_handler),
         )
         .route("/api/v1/workbench", get(workbench::workbench_handler))
+        // 对话里 `/` 打头那一句能点哪些名字。与上面的能力面同一种读法：这份名单
+        // 是「这个部署里真有的」技能表读出来的，不是一个写死的列表。
+        .route("/api/v1/chat/commands", get(commands::catalogue_handler))
         .route(
             "/api/v1/capabilities",
             get(capabilities::capabilities_handler),

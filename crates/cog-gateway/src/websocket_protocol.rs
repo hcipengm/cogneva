@@ -54,6 +54,29 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// 一条斜杠命令：`/名字 要求`。
+    ///
+    /// 与 `chat_message` 分开，因为这两句是同一格文字里不同的两件事：一句是「对它
+    /// 说这句话」，一句是「点这个技能，照它的说明做这一件事」。合成一句、让服务端
+    /// 按开头的 `/` 去猜，代价在猜错的那一边——一段以 `/usr/local/bin` 开头的
+    /// 报错会被当成一条命令去执行，而一段 `/websearch 查一下`（名字打错了）会被
+    /// 当成普通的一句话交给模型，屏幕上于是是「模型答得奇怪」，真正发生的是这里
+    /// 不认识那个名字。
+    ///
+    /// `name` 不带 `/`；`arguments` 是名字之后那一整段话。附件照样可以随它上来：
+    /// 「用这个技能看看这张图」和别的一句话一样是一句话加一张图。
+    #[serde(rename = "command")]
+    Command {
+        #[serde(default)]
+        session_id: Option<String>,
+        name: String,
+        #[serde(default)]
+        arguments: String,
+        #[serde(default)]
+        attachments: Vec<cog_core::ChatAttachment>,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
     /// 停止这一段对话里正在跑的轮。
     ///
     /// 寻址按会话，不按某一轮：客户端拿着的是会话号，一轮的身份（`message_id`）

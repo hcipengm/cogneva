@@ -132,7 +132,7 @@ fn the_page_carries_what_was_pasted_and_shows_it_afterwards() {
         "{PANE} 上行时换了字段名：服务端那一帧读到的类型是空的"
     );
     assert!(
-        pane.contains("attachments: files.map"),
+        pane.contains("const attachments = files.map") && pane.contains("attachments,\n"),
         "{PANE} 发出去的那一帧不带附件：读进来的东西没有出门"
     );
     assert!(

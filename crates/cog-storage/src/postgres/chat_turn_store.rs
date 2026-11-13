@@ -46,10 +46,15 @@ impl PostgresChatTurnStore {
     /// `assistant` and `failure` are the two shapes a turn has: an answer that
     /// was delivered, or the reason none was. Exactly one of them is given, so a
     /// row can never claim both.
+    ///
+    /// `model` 只在「人打的那一行」与「模型读到的那一段」不是同一段字时给出
+    /// （一条 `/名字` 命令）：它写在用户那一行上，助手那一行永远是空的——回答
+    /// 展开成什么，交给模型的和界面上看到的是同一段。
     async fn write(
         &self,
         session_id: &str,
         user: &str,
+        model: Option<&str>,
         attachments: &[ChatAttachment],
         assistant: Option<&str>,
         failure: Option<&str>,
@@ -78,8 +83,12 @@ impl PostgresChatTurnStore {
         .bind(session_id)
         .bind(user);
         query = match (assistant, goal) {
-            (Some(reply), Some(goal_id)) => query.bind(attachments).bind(reply).bind(goal_id),
-            (Some(reply), None) => query.bind(attachments).bind(reply),
+            (Some(reply), Some(goal_id)) => query
+                .bind(attachments)
+                .bind(model)
+                .bind(reply)
+                .bind(goal_id),
+            (Some(reply), None) => query.bind(attachments).bind(model).bind(reply),
             (None, _) => query.bind(failure.unwrap_or("")).bind(attachments),
         };
         query
@@ -105,15 +114,15 @@ impl PostgresChatTurnStore {
 /// One statement for the pair, so the transcript never holds a question whose
 /// answer is missing.
 const INSERT_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content, attachments) \
-VALUES ($1, 'user', $2, $3), ($1, 'assistant', $4, NULL)";
+INSERT INTO chat_turns (session_id, role, content, attachments, model_content) \
+VALUES ($1, 'user', $2, $3, $4), ($1, 'assistant', $5, NULL, NULL)";
 
 /// The same pair for a turn that handed its work to the orchestrator. The goal
 /// goes on the assistant row only: the reply is where the platform said what it
 /// did with the message, and the question is not what carries a goal.
 const INSERT_DISPATCHED_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content, attachments, goal_id) \
-VALUES ($1, 'user', $2, $3), ($1, 'assistant', $4, NULL, $5)";
+INSERT INTO chat_turns (session_id, role, content, attachments, model_content, goal_id) \
+VALUES ($1, 'user', $2, $3, $4), ($1, 'assistant', $5, NULL, NULL, $6)";
 
 /// The same pair for an exchange that never got an answer: the reply's content
 /// is empty because nothing was said, and `failure` carries why. Both rows get
@@ -136,9 +145,11 @@ WHERE session_id = $1 \
 /// The newest `limit` rows, then put back into the order a prompt is built in.
 /// Reading oldest-first directly would need a count of the session, which is a
 /// second query that can disagree with the first under a concurrent write.
+/// `model_content` 优先：一行命令在记录里存的是人打的那一行，交给模型的却是展开
+/// 后的说明，而这一条查询回答的正是「这一段对话交给过模型什么」。
 const HISTORY_SQL: &str = "\
-SELECT role, content, attachments FROM ( \
-    SELECT id, role, content, attachments FROM chat_turns \
+SELECT role, COALESCE(model_content, content) AS content, attachments FROM ( \
+    SELECT id, role, content, model_content, attachments FROM chat_turns \
     WHERE session_id = $1 AND failure IS NULL \
     ORDER BY id DESC LIMIT $2 \
 ) newest \
@@ -177,17 +188,27 @@ impl ChatTurnStore for PostgresChatTurnStore {
         &self,
         session_id: &str,
         user: &str,
+        model_content: Option<&str>,
         attachments: &[ChatAttachment],
         assistant: &str,
     ) -> SFResult<()> {
-        self.write(session_id, user, attachments, Some(assistant), None, None)
-            .await
+        self.write(
+            session_id,
+            user,
+            model_content,
+            attachments,
+            Some(assistant),
+            None,
+            None,
+        )
+        .await
     }
 
     async fn record_dispatched_turn(
         &self,
         session_id: &str,
         user: &str,
+        model_content: Option<&str>,
         attachments: &[ChatAttachment],
         assistant: &str,
         goal_id: &str,
@@ -202,6 +223,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
         self.write(
             session_id,
             user,
+            model_content,
             attachments,
             Some(assistant),
             None,
@@ -217,8 +239,16 @@ impl ChatTurnStore for PostgresChatTurnStore {
         attachments: &[ChatAttachment],
         failure: &str,
     ) -> SFResult<()> {
-        self.write(session_id, user, attachments, None, Some(failure), None)
-            .await
+        self.write(
+            session_id,
+            user,
+            None,
+            attachments,
+            None,
+            Some(failure),
+            None,
+        )
+        .await
     }
 
     async fn history(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurn>> {

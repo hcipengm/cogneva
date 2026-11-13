@@ -165,7 +165,7 @@ fn the_loop_reads_the_reference_while_the_record_keeps_the_body() {
         "{CHAT} 不再在回声之前归档：长消息照旧整条进上下文"
     );
     assert!(
-        chat.contains("Some(archived) => archived.reference.clone()"),
+        chat.contains("(Some(archived), _) => archived.reference.clone()"),
         "{CHAT} 给循环的不是引用：原文又整条进了上下文"
     );
     assert!(
