@@ -9,8 +9,8 @@
 //!
 //! Why computed rather than declared: a hand-written dashboard is a second
 //! copy of the same facts, kept true by whoever remembers to edit both. It has
-//! no diff that means anything — a threshold moved by one digit arrives as a
-//! 204 KB file replaced — and nothing in it answers "who asked for this
+//! no diff that means anything — a threshold moved by one digit arrives as the
+//! whole file replaced — and nothing in it answers "who asked for this
 //! panel". The tables it duplicates already have to exist: a series outside
 //! the closed set cannot be written, and a reading that names no series cannot
 //! be judged.
@@ -262,6 +262,18 @@ impl GrafanaEndpoint {
         )
     }
 
+    /// The `Authorization` header the dashboard API wants: basic auth as the
+    /// Grafana administrator. Composed here rather than at the call site so the
+    /// password is read in exactly one place.
+    fn authorization(&self) -> String {
+        use base64::Engine as _;
+        let raw = format!("admin:{}", self.password);
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        )
+    }
+
     /// [`from_env`] with the declarations handed in, so the rule about what
     /// counts as declared can be read without an environment to set.
     fn from_parts(url: Option<&str>, password: Option<&str>) -> Result<Self, String> {
@@ -355,15 +367,12 @@ const PUSH_RETRY_CEILING_SECONDS: u64 = 300;
 /// the reason the API gave.
 pub async fn keep_pushing(endpoint: GrafanaEndpoint) {
     let boards = panels_from_registry();
-    let client = match reqwest::Client::builder()
-        // cap: fixed — 一次推送要么很快回来要么算失败：卡住的推送挡住的是下一次
-        // 推送，而面板晚一分钟出现不影响任何判词
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
+    // 装配层注入的那一个，不是在这里现造：超时、连接池、代理只有一处定义，
+    // 第二份设置只会在别处改了参数而这条路没跟上时被发现。
+    let client = match crate::contribution_admin::http_client() {
         Ok(client) => client,
-        Err(e) => {
-            warn!("grafana dashboard export off: the HTTP client could not be built: {e}");
+        Err(why) => {
+            warn!("grafana dashboard export off: {why}");
             return;
         }
     };
@@ -387,8 +396,14 @@ pub async fn keep_pushing(endpoint: GrafanaEndpoint) {
 /// the identity, so a re-push replaces a board rather than accumulating copies
 /// beside it. A failure names the board it was on, because "the export failed"
 /// with a hundred boards is not a fact anybody can act on.
+/// The deadline for one push. A push that cannot answer in this long has
+/// already failed; the retry loop is what carries the next attempt.
+// cap: fixed — 一次推送的等待上限：超时当作失败重试，等更久只是让下一次尝试更晚，
+// 面板晚一分钟出现不影响任何判词
+const PUSH_TIMEOUT_SECS: u64 = 30;
+
 pub async fn push_once(
-    client: &reqwest::Client,
+    client: &std::sync::Arc<dyn cog_core::HttpClient>,
     endpoint: &GrafanaEndpoint,
     boards: &[Board],
 ) -> Result<usize, String> {
@@ -400,19 +415,21 @@ pub async fn push_once(
             "overwrite": true,
             "message": "written by the gateway from the metric and reading registries",
         });
-        let response = client
-            .post(&url)
-            .basic_auth("admin", Some(endpoint.password.as_str()))
+        let request = cog_core::HttpRequest::post(&url)
+            .header("Authorization", endpoint.authorization())
             .json(&body)
-            .send()
+            .map_err(|e| format!("推送 {} 失败：请求体序列化不了：{e}", board.uid))?
+            .timeout(PUSH_TIMEOUT_SECS);
+        let response = client
+            .execute(request)
             .await
             .map_err(|e| format!("推送 {} 失败：{e}", board.uid))?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+        if !response.is_success() {
+            let text = String::from_utf8_lossy(&response.body);
             return Err(format!(
-                "推送 {} 被 Grafana 拒绝（{status}）：{}",
+                "推送 {} 被 Grafana 拒绝（{}）：{}",
                 board.uid,
+                response.status,
                 text.trim()
             ));
         }
@@ -428,7 +445,7 @@ mod tests {
     /// Every series the closed set publishes lands on a panel.
     ///
     /// The claim this replaces — "the dashboard covers what the code
-    /// publishes" — used to be a hand check against a 204 KB file and is now
+    /// publishes" — used to be a hand check against a written file and is now
     /// arithmetic.
     #[test]
     fn every_registered_series_is_drawn() {
