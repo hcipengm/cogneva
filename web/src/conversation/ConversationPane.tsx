@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch';
+import { Markdown } from '@/conversation/Markdown';
 import { TodoPanel, todoListsIn } from '@/conversation/TodoPanel';
+import { toolDiff } from '@/conversation/toolDiff';
 import type { StreamClient } from '@/hooks/useEventStream';
 import { sessionKind, useChatStore, type ChatMessage, type ChatSession } from '@/store/chatStore';
 import { useStreamStore, type ToolCallRecord } from '@/store/streamStore';
@@ -111,13 +113,14 @@ function Turn({ message }: { message: ChatMessage }) {
         </div>
       )}
 
-      <p
-        className="whitespace-pre-wrap break-words text-[13px] leading-[1.7]"
-        style={{ color: message.role === 'user' ? 'var(--paper)' : 'var(--paper-dim)' }}
-      >
-        {message.text}
-        {streaming && <span className="chat-caret" aria-hidden />}
-      </p>
+      {/*
+        正文按 Markdown 画：回复里带的是列表、代码块和 diff，按纯文本铺出来，
+        读者要自己对齐正负号、自己认哪一段是代码。两边的颜色仍然分开——「你」说
+        的是纸色，回复略暗一档。
+      */}
+      <div style={{ color: message.role === 'user' ? 'var(--paper)' : 'var(--paper-dim)' }}>
+        <Markdown text={message.text} streaming={streaming} />
+      </div>
 
       {/*
         这一轮花了多少。只有服务端真的量到了才有一行：读回的历史与被叫停的那
@@ -139,6 +142,8 @@ function Turn({ message }: { message: ChatMessage }) {
  */
 function ToolTurn({ call }: { call: ToolCallRecord }) {
   const [open, setOpen] = useState(false);
+  /** 改动类工具折成的那份 diff；别的调用是 `null`（见 `toolDiff`）。 */
+  const diff = useMemo(() => toolDiff(call), [call]);
   const tone =
     call.status === 'error' ? 'var(--danger)' : call.status === 'running' ? 'var(--brass)' : 'var(--ok)';
   const label = call.status === 'error' ? '失败' : call.status === 'running' ? '进行中' : '返回';
@@ -166,6 +171,35 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
         </span>
         <span className="mono ml-auto text-[10px] text-[var(--muted)]">{stamp(call.startedAt)}</span>
       </Note>
+      {/*
+        改动类工具直接在流里画那一份 diff，不用先展开：这一行最要紧的信息是「改了
+        哪几行」，而它在入参与返回那两份 JSON 里只有自己找。展开仍然是原文——diff
+        是给眼睛的，原文是给核对的。
+      */}
+      {diff && (
+        <div className="tool-diff mt-1 border-l border-[var(--line)] pl-2">
+          <div className="mono flex flex-wrap items-baseline gap-2 text-[10px] text-[var(--muted)]">
+            {diff.path && (
+              <span className="break-all" style={{ color: 'var(--paper-dim)' }}>
+                {diff.path}
+              </span>
+            )}
+            <span>{diff.label}</span>
+            <span style={{ color: 'var(--ok)' }}>+{diff.added}</span>
+            <span style={{ color: 'var(--danger)' }}>−{diff.removed}</span>
+            {call.status === 'running' && <span>调用还没回来</span>}
+          </div>
+          <pre className="mono mt-1 max-h-64 overflow-auto text-[11px] leading-[1.5]">
+            {diff.lines.map((line, index) => (
+              <span key={index} className={`diff-${line.kind}`}>
+                {line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : ' '}
+                {line.text || ' '}
+                {'\n'}
+              </span>
+            ))}
+          </pre>
+        </div>
+      )}
       {open && (
         <div className="mt-1 flex flex-col gap-1 border-l border-[var(--line)] pl-2">
           <div>

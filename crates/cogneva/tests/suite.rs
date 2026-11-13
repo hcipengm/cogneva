@@ -443,6 +443,8 @@ mod redis_connection_contract_test;
 mod redis_streams_cluster_test;
 #[path = "repeated_path_components_are_named_once_test.rs"]
 mod repeated_path_components_are_named_once_test;
+#[path = "replies_render_markdown_test.rs"]
+mod replies_render_markdown_test;
 #[path = "resource_faces_read_the_whole_cluster_test.rs"]
 mod resource_faces_read_the_whole_cluster_test;
 #[path = "resource_governance_projection_test.rs"]

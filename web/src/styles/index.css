@@ -35,13 +35,17 @@ canvas {
  * 光标是「这里还在长」的唯一指示。用闪烁而不是旋转图标：文字在长，读者要看的
  * 是长到哪儿了，一个转圈只说明「忙」，说不出进度。尊重 reduced-motion 时改为
  * 常亮——动画去掉，位置信息保留。
+ *
+ * 挂在正文最后一块的 `::after` 上，不插一个空元素：正文是按 Markdown 画的
+ * 若干个块，插在它们后面，光标会掉到下一行的行首——那不是字长到的地方。
  */
 @keyframes chat-caret {
   0%, 45% { opacity: 1; }
   55%, 100% { opacity: 0.15; }
 }
 
-.chat-caret {
+.md[data-streaming] > :last-child::after {
+  content: '';
   display: inline-block;
   width: 0.5em;
   height: 1em;
@@ -52,8 +56,106 @@ canvas {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .chat-caret { animation: none; opacity: 1; }
+  .md[data-streaming] > :last-child::after { animation: none; opacity: 1; }
 }
+
+/*
+ * 一段回复的正文：Markdown 画出来的样子。
+ *
+ * 块与块之间留一点空，但整体比正文本身密：一段回复常常是七八个短块，按网页
+ * 文章的间距排开，一条消息就能占满一屏。代码块与 diff 用等宽体，底色比画布
+ * 深一档——它们是被引用的一段字节，不是这句话本身。
+ */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+
+.md p { margin: 0.4em 0; }
+
+.md h1, .md h2, .md h3, .md h4 {
+  margin: 0.8em 0 0.35em;
+  font-weight: 600;
+  color: var(--paper);
+}
+.md h1 { font-size: 1.15em; }
+.md h2 { font-size: 1.08em; }
+.md h3, .md h4 { font-size: 1em; }
+
+.md ul, .md ol { margin: 0.4em 0; padding-left: 1.4em; }
+.md ul { list-style: disc; }
+.md ol { list-style: decimal; }
+.md li { margin: 0.15em 0; }
+.md li > p { margin: 0; }
+
+.md blockquote {
+  margin: 0.5em 0;
+  padding-left: 0.7em;
+  border-left: 2px solid var(--line-strong);
+  color: var(--muted);
+}
+
+.md a { color: var(--brass); text-decoration: underline; text-underline-offset: 2px; }
+
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--ink-800);
+  padding: 0.1em 0.3em;
+  border-radius: 2px;
+}
+
+.md .md-code {
+  margin: 0.5em 0;
+  padding: 0.55em 0.7em;
+  overflow-x: auto;
+  background: var(--ink-800);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  line-height: 1.55;
+}
+
+/* 围起来的代码块里的 `code` 不再套内联代码的底色。 */
+.md .md-code code { background: none; padding: 0; font-size: 1em; }
+
+.md table { border-collapse: collapse; margin: 0.5em 0; font-size: 0.95em; }
+.md th, .md td { border: 1px solid var(--line); padding: 0.25em 0.5em; text-align: left; }
+.md th { color: var(--paper); font-weight: 600; }
+
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 0.8em 0; }
+
+/*
+ * diff：新加的一行与删掉的一行各自着色。整块套一个颜色的话，读者分不出哪几行
+ * 是新加的；一行一块 `span`，正负号在同一行上看得见。
+ */
+.md .md-diff { padding: 0.55em 0; }
+.md .md-diff code { display: block; }
+
+/*
+ * 一行一块。同一个记号在围栏里的 diff 与改动类工具的画布上都用：读的人在两处
+ * 看到的「新加」「删掉」是同一个颜色。
+ */
+.diff-add, .diff-del, .diff-meta, .diff-same {
+  display: block;
+  padding: 0 0.7em;
+  white-space: pre;
+}
+.diff-add { background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ok); }
+.diff-del { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+.diff-meta { color: var(--muted); }
+.diff-same { color: var(--paper-dim); }
+
+/*
+ * 高亮出来的记号。色板只取这一面已有的几档：多一套颜色，读者就要重新认一遍
+ * 「这个颜色是什么意思」。
+ */
+.md .hljs-comment, .md .hljs-quote { color: var(--muted); font-style: italic; }
+.md .hljs-keyword, .md .hljs-selector-tag, .md .hljs-literal, .md .hljs-section, .md .hljs-doctag, .md .hljs-type, .md .hljs-name, .md .hljs-strong { color: var(--brass); }
+.md .hljs-string, .md .hljs-regexp, .md .hljs-addition, .md .hljs-attribute, .md .hljs-meta .hljs-string { color: var(--ok); }
+.md .hljs-number, .md .hljs-symbol, .md .hljs-bullet, .md .hljs-link, .md .hljs-meta, .md .hljs-deletion { color: var(--warn); }
+.md .hljs-title, .md .hljs-title.class_, .md .hljs-title.function_, .md .hljs-variable, .md .hljs-template-variable { color: var(--live); }
+.md .hljs-built_in, .md .hljs-attr, .md .hljs-selector-id, .md .hljs-selector-class { color: var(--paper); }
+.md .hljs-emphasis { font-style: italic; }
 
 /*
  * 集群图上的呼吸：一个环从紧到松再回来。
