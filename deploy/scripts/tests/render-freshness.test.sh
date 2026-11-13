@@ -113,7 +113,9 @@ edit_once "${d}/deploy/helm/cogneva/templates/network-policy.yaml" \
     app.kubernetes.io/name: crawl4ai
     app.kubernetes.io/component: fetch
 '
-if out="$(bash "${d}/${gate_rel}" 2>&1)"; then
+# 写这一遍要重算额度，而额度里的节点数在真机上取自 live cluster；这份用例是一棵
+# 没有集群的副本，按脚本给离线渲染留的口子显式给拓扑（与 CI 上重渲染同一条件）。
+if out="$(COGNEVA_NODES=1 bash "${d}/${gate_rel}" 2>&1)"; then
   fail "模板里写重了键，渲染仍然写出了产物（解析不了的清单会一直被提交）：${out}"
 fi
 grep -q "duplicate key 'app.kubernetes.io/name'" <<<"${out}" \
@@ -130,7 +132,7 @@ edit_once "${d}/deploy/helm/cogneva/templates/postgres.yaml" \
 ' \
   '            - name: postgres-metrics
 '
-if out="$(bash "${d}/${gate_rel}" 2>&1)"; then
+if out="$(COGNEVA_NODES=1 bash "${d}/${gate_rel}" 2>&1)"; then
   fail "端口名超过 15 字符，渲染仍然写出了产物（apply 会整份拒掉）：${out}"
 fi
 grep -q "超过 15 的上限" <<<"${out}" \

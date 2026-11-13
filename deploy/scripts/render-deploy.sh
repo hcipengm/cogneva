@@ -8,6 +8,10 @@
 #   bash deploy/scripts/render-deploy.sh --check   # CI 新鲜度门禁：重渲染到临时目录，
 #                                                  # 与已提交产物 diff，漂移即失败
 #
+# 额度里的节点数（DaemonSet 逐节点铺开）在写回的那一路从当前连着的集群读；
+# 没有集群的机器要显式给拓扑：COGNEVA_NODES=N bash deploy/scripts/render-deploy.sh。
+# `--check` 只按生成文件里记下的拓扑重算，不需要集群。
+#
 # 渲染产物是构建产物，不要手改；改拓扑请动 chart templates / values / profile，
 # 然后重跑本脚本并一并提交。
 set -euo pipefail
@@ -72,8 +76,9 @@ helm_render() {
   COGNEVA_RENDER_RAW="$raw" bash "$SCRIPT_DIR/render-chart.sh" "$profile" > "$out"
 }
 
-# 从一次渲染里投影出额度并写回（或只核对）。读的只有工作负载自己的声明与
-# chart values 里那两项算不出来的输入。
+# 从一次渲染里投影出额度并写回（或只核对）。读的只有工作负载自己的声明、
+# chart values 里的 LimitRange 策略，以及拓扑（节点数）：写回的那一路从
+# live cluster 读，`--check` 那一路按生成文件首部记下的拓扑重算。
 project_governance() {
   local profile="$1" raw="$2" values_out="$3" quota_out="$4"
   shift 4
@@ -214,10 +219,12 @@ if [[ "${1:-}" == "--check" ]]; then
   # 问题出在数上还是出在模板上。
   for p in "${PROFILES[@]}"; do
     helm_render "$p" "$tmp/raw-$p.yaml"
+    # CI 没有集群：拓扑按生成文件首部记下的那份重算。它和数值同属这份产物，
+    # 被人改过或工作负载变了都会在这里漂出来。
     if [ "$p" = k3s-single ]; then
-      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "$QUOTA_BASELINE" --check
+      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "$QUOTA_BASELINE" --check --nodes-from "$(generated_values "$p")"
     else
-      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "" --check
+      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "" --check --nodes-from "$(generated_values "$p")"
     fi
   done
   for p in "${PROFILES[@]}"; do

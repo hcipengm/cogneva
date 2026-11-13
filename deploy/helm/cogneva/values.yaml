@@ -33,43 +33,17 @@ storage:
 # 渲染新鲜度门禁核「文件 == 重新投影」。手写过的那份数在历史上漂过不止一次，形态
 # 都一样：工作负载长大了、额度没跟，而现场读起来是"这一版永远滚不上去"。
 #
-# 只有两项不是渲染集算出来的，因为没有任何清单能告诉渲染器它们是多少：
-#   - runtimeWorkloads：渲染集之外、**不由产品创建**的 Pod 的形状。产品自己创建
-#     的那部分不在这儿声明——建它的代码按自己的清单把额度抬到装得下，见下面；
-#   - clusterNodes：DaemonSet 逐节点铺开后有几分 Pod。它随拓扑变，所以由 profile
-#     给（单节点 profile 就是 1），投影按 profile 里的这个数算。多节点时把它改成
-#     实际节点数并重跑 render-deploy.sh——**两个数必须同一次改**：只改 profile 不
-#     重跑投影，额度仍是单节点的，多出来的节点上的 DaemonSet Pod 会在准入被拒。
+# 还有两项曾经写在这里、现在都不写了：
+#   - 节点数：DaemonSet 逐节点铺开后有几分 Pod 必须计入额度，而这不是任何一份清单
+#     能说出来的。投影器在**渲染宿主**上从 live cluster 读节点数，并把它记进生成
+#     文件的首部（`# topology-nodes: N`）；`render-deploy.sh --check` 在 CI 上没有
+#     集群，就按生成文件记录的拓扑重算，所以漂移判据仍在，而数不再是手写的。
+#   - 运行期自建 Pod 的形状：产品创建的评测 Pod 与宿主创建的注册评测补跑 Pod，都在
+#     创建前按自己那份清单把额度抬到装得下、结束后放回去。形状的唯一来源是建它
+#     的那份代码，这里再写一遍就是第二处声明，而 2026-10-26 的实测显示它漂起来时
+#     的表现是「滚动被第三方的 Pod 借走 surge，连续两轮 mainline 没上去」。
 resourceGovernance:
   enabled: true
-  clusterNodes: 1
-  # 渲染集之外、由产品自己在运行期建的 Pod（评测台按题起一台），它们不进渲染集，
-  # 却和渲染集里的 Pod 抢同一份额度。**这里一个数也不写**：那台 Pod 有多大，只有
-  # 建它的那份代码知道（容器的 limits 就在它写出的清单里），所以由它自己在创建前
-  # 按清单算出占多少、把额度抬到装得下（跑完再放回去），而不是在这里预写一份
-  # "留多少核"的预算——预算写大了浪费、写小了那台 Pod 进不去，而它跟着代码走就
-  # 不会错位。这个键留给**不由产品创建、也不会自己抬额度**的那类 Pod：那样一台
-  # Pod 只能在这儿声明整台的形状，由投影加进同一条求和。空列表不是省略，是"没有
-  # 这一类"；投影读不到这个键要报错，而不是当作 0。
-  #
-  # 现在列表里只有一台：宿主侧注册评测的补跑（宿主的
-  # `scripts/host/eval-registered-rerun.sh` 直接 `kubectl apply` 一台 Pod）。它由
-  # 宿主脚本建、不是产品建的，也不认识额度——所以它要么在下面声明，要么就**从别的
-  # 用途的预留里借地方**。2026-10-26 本机实测借走的是滚动那份额度：这台 3Gi 的 Pod
-  # 在跑时，`cogneva` 那一笔滚动的 surge 需要一个完整的新 Pod（12Gi，同一次实测），
-  # 准入算出来 `58Gi + 12Gi > 69Gi`（这台机器），部署器按设计扣住不动，连续两轮
-  # mainline 一个 rev 都没上去（16:54:17Z 与 17:09:40Z 两次，`limits.memory` 同一条
-  # 短差）。**滚动的重叠额度不是余量**：它已经被算进天花板，任何第三方 Pod 吃掉的都是
-  # 它。所以这台 Pod 的形状在这里声明一次，天花板按它加发一份，surge 那份就不再被借。
-  #
-  # 三个数必须与那份脚本里写出的清单逐字相同（limits 与 requests 都算），改一边就得
-  # 改另一边；`scripts/host/eval-registered-rerun.test.sh` 比对这两处，单独改哪边都红。
-  runtimeWorkloads:
-    - name: eval-registered-rerun
-      cpuLimit: "2"
-      memoryLimit: 3Gi
-      cpuRequest: 500m
-      memoryRequest: 1Gi
   limitRange:
     # 下面四项是**策略**而不是投影：它们管的是"没有声明 resources 的容器按什么
     # 算"。上限（max）与单卷上限由投影给，因为它们必须 ≥ 渲染集里最大的那份声明，
@@ -953,8 +927,8 @@ hostLedger:
   # 那个节点于是静默地没有账本（tolerations 挡不住这件事）。当前选择：接受，并让
   # host_ledger_node_unreported 报「有节点、没账本」。不给它 priorityClassName——
   # 为了报一条读数去抢占工作负载，代价比它大。Pod 额度本身是另一件事：它由渲染集
-  # 投影出来（见 resourceGovernance 段），这个 DaemonSet 的副本随 clusterNodes 进
-  # 算式，所以多一个节点不是"配额要人重推"，是投影自己变大。
+  # 投影出来（见 resourceGovernance 段），这个 DaemonSet 的副本随渲染宿主从 live
+  # cluster 读到的节点数进算式，所以多一个节点不是"配额要人重推"，是投影自己变大。
 
 # 卷账的全集面（claim-store DaemonSet）：每节点一个进程，走查本节点存储根下的每个
 # claim 目录，把每个目录占的字节发布成 `cogneva_data_volume_used_bytes`

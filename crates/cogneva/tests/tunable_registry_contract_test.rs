@@ -912,8 +912,8 @@ fn an_endpoint_the_code_requires_is_filled_by_the_chart() {
 const PROFILES: &str = "deploy/helm/cogneva/profiles";
 
 /// Where a values leaf may be read from when no template names it: the scripts
-/// that project the chart's numbers (the resource governance projection reads
-/// `resourceGovernance.clusterNodes`, and no manifest can).
+/// that consume the chart directly (the resource governance projection reads the
+/// LimitRange strategy by hand, and no manifest can).
 const DEPLOY_SCRIPTS: &str = "deploy/scripts";
 
 /// Every dotted path a template reads through `.Values.`.
@@ -1376,6 +1376,25 @@ fn a_landed_batch_carries_no_override() {
                 "sandboxExecutor.warmTrees",
                 "securityGateway.replicas",
                 "taskRouter.claimConcurrency",
+            ],
+        ),
+        (
+            // The last two hand-written governance inputs, both now measured or
+            // declared by the party that actually owns them. The node count is
+            // read by the projector from the live cluster at render time and
+            // recorded in the generated header; an offline render must pass the
+            // topology rather than let it guess. The rerun pod's shape is
+            // derived by the host script from the live deployment's own
+            // container resources, and the quota is raised by exactly that
+            // shape before the pod exists. All five keys are deleted from the
+            // chart, so they must stay absent instead of reappearing as pins.
+            "B6",
+            &[
+                "resourceGovernance.clusterNodes",
+                "resourceGovernance.runtimeWorkloads.0.cpuLimit",
+                "resourceGovernance.runtimeWorkloads.0.cpuRequest",
+                "resourceGovernance.runtimeWorkloads.0.memoryLimit",
+                "resourceGovernance.runtimeWorkloads.0.memoryRequest",
             ],
         ),
     ];

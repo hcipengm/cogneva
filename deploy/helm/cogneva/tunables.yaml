@@ -2814,58 +2814,22 @@ rows:
   # The ceiling numbers are not chart values: they are projected from the rendered
   # declarations by `deploy/scripts/project-resource-governance.py` into
   # `values.resource-governance.<profile>.yaml`, which carries a GENERATED header
-  # and is re-derived (and compared byte for byte) on every render. So no row here covers
-  # them -- a row would be a second source for a number whose whole point is that
-  # nobody writes it. What remains below are the inputs to that projection -- the
-  # only terms no rendered manifest can declare -- and the policy defaults it copies
-  # through. The runtime workloads are inputs of the same kind: their shape is a
-  # declaration the pod's own code makes, and the projection sums it like any other
-  # workload rather than trusting a hand-written budget.
-  - key: resourceGovernance.clusterNodes
-    source: override
-    why: >-
-      How many nodes the DaemonSets spread over, which is how many Pods the quota
-      must admit per DaemonSet. No manifest can say it: the same tree is applied
-      to a one-node K3s and to a production cluster. The profile names it, and the
-      projection reads it from there -- so a cluster with more nodes is a profile
-      edit plus a re-render, not a number typed into the ceiling.
-
-  # 运行期自建 Pod 那部分额度没有行，因为它没有一个写在 values 里的数：评测台
-  # 创建 Pod 前按自己那份清单算出它占多少、把额度抬到装得下，跑完放回去——尺寸
-  # 的唯一来源是建它的代码，跟着它变，没有第二处可漂。`runtimeWorkloads` 留给
-  # 不由产品创建、也不会自己抬额度的那类 Pod：其中的形状在这里有行（见下）。
+  # and is re-derived (and compared byte for byte) on every render. So no row here
+  # covers them -- a row would be a second source for a number whose whole point
+  # is that nobody writes it. What remains below are the LimitRange policy
+  # defaults the projection copies through.
   #
-  # 这一族没有测量面可跟：那台 Pod 由宿主脚本 `scripts/host/eval-registered-rerun.sh`
-  # 直接 apply，它不认识命名空间额度，也不会把自己的占用报给任何人。所以四个数
-  # 只能登记成 override——写的是"谁定的"，不是"谁会让它动"。两处不许单独漂：
-  # `scripts/host/eval-registered-rerun.test.sh` 逐字比对这里的形状与脚本那份清单。
-  - key: resourceGovernance.runtimeWorkloads.0.cpuLimit
-    source: override
-    why: >-
-      The CPU ceiling of the registered-eval rerun pod, which a host script
-      creates and the product never sees. No reading can move it: the pod is
-      outside the process that would publish one. The host script's manifest
-      names the same number and a test compares the two.
-
-  - key: resourceGovernance.runtimeWorkloads.0.cpuRequest
-    source: override
-    why: >-
-      The CPU request of the same pod. It is what the projection adds to the
-      quota's reserved total, so it is pinned next to the limit rather than
-      derived: a request nobody declared would be scheduled from a default.
-
-  - key: resourceGovernance.runtimeWorkloads.0.memoryLimit
-    source: override
-    why: >-
-      The memory ceiling of the rerun pod; when the ceiling it is counted into
-      is too small, the rollout holds and no revision lands, which is why this
-      one is declared rather than left to borrow the surge reserve.
-
-  - key: resourceGovernance.runtimeWorkloads.0.memoryRequest
-    source: override
-    why: >-
-      The memory request of the same pod, counted into the reserved total the
-      way the limit is counted into the ceiling.
+  # Two inputs that used to live here are gone because neither is a number anyone
+  # writes any more:
+  #   - the node count: the projector reads it from the live cluster on the render
+  #     host and records it in the generated header. A machine with no cluster
+  #     must pass the topology (`COGNEVA_NODES=N` / `--nodes N`); the projection
+  #     will not guess one, because a guessed 1 and a real 1 look identical in
+  #     the artifact.
+  #   - the rerun pod's shape: `scripts/eval/eval-registered-rerun.sh` derives it
+  #     from the live deployment's own container resources and raises the quota
+  #     by exactly that shape before the pod exists, so there is nothing for
+  #     values to pin and nothing for a row to track.
   - key: resourceGovernance.limitRange.defaultCpu
     source: derived
     why: >-
