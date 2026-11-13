@@ -1675,16 +1675,17 @@ export function ConversationPane({
           style={{ borderColor: draft || pendingFiles.length > 0 ? 'var(--line-strong)' : 'var(--line)' }}
         >
           <span className="mono flex items-center pl-0.5 text-[12px] text-[var(--brass)]">›</span>
-          <button
+          <Note
+            as="button"
             type="button"
             onClick={() => fileInputRef.current?.click()}
             aria-label="附上文件"
-            title="附一张图、一份 PDF 或一段音视频；也可以直接把它们贴进这一格"
+            text="附一张图、一份 PDF 或一段音视频；也可以直接把它们贴进这一格"
             className="mono shrink-0 px-1 text-[13px] transition-opacity hover:opacity-70"
             style={{ color: 'var(--muted)' }}
           >
             ＋
-          </button>
+          </Note>
           <input
             ref={fileInputRef}
             type="file"
