@@ -579,10 +579,14 @@ mod tests {
             wait_after_pass(Some(&pacer), Duration::from_secs(900), Duration::from_secs(1800)),
             Duration::ZERO
         );
-        assert_eq!(
-            readings.target("claimStore.imageScanIntervalSecs"),
-            Some((Duration::from_secs(1800), 2, true))
-        );
+        let (target, evaluations, derived) = readings
+            .target("claimStore.imageScanIntervalSecs")
+            .expect("both waits were beats");
+        assert_eq!(target, Duration::from_secs(1800));
+        // The count is what says the beat is running: a second walk of the same
+        // cost leaves the target where it was and still counts.
+        assert_eq!(evaluations, 2);
+        assert!(derived);
     }
     const STORE: &str = "containerd";
 

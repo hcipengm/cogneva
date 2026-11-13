@@ -701,6 +701,10 @@ mod tests {
             let (target, beats, derived) = readings.reading(KNOB).expect("a beat");
             assert_eq!(target, 120_000.0);
             assert_eq!(beats, expected, "a steady target is still a beat");
+            assert_eq!(readings.evaluations(KNOB), expected);
+            // The read window is recomputed and recorded by the same pass, so
+            // its count has to move with the ceiling's.
+            assert_eq!(readings.evaluations(KNOB_READ_WINDOW), expected);
             assert!(derived);
         }
     }

@@ -724,6 +724,7 @@ mod tests {
         let second = readings.reading(KNOB).expect("second beat");
         assert_eq!(second.0, 524_288.0);
         assert_eq!(second.1, 2, "a steady target is still a beat");
+        assert_eq!(readings.evaluations(KNOB), 2);
     }
 
     /// A bound that cannot be read falls back instead of switching the sweep

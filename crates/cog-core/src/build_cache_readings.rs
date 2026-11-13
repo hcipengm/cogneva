@@ -240,6 +240,9 @@ pub struct BuildCacheReadings {
     /// from the clock would move between the pass that deleted to it and the
     /// scrape that reported it.
     derived_cap: AtomicU64,
+    /// Walks that derived the cap. A steady cache derives the same number every
+    /// walk, so the number alone cannot say whether the derivation still runs.
+    cap_evaluations: AtomicU64,
     /// What the volume behind this directory leaves for it, measured by the
     /// loop that owns the volume; [`NO_CEILING`] when nothing has measured it.
     ///
@@ -266,6 +269,10 @@ pub struct BuildCacheReadings {
     /// what a pass costs is the measurement an interval should follow, and
     /// only the loop that runs the passes has it.
     scan_interval_secs: AtomicU64,
+    /// Passes that stated the cadence. The interval changes only when a pass's
+    /// cost does; this moves on every pass, which is what tells a steady loop
+    /// from a stopped one.
+    scan_interval_evaluations: AtomicU64,
     /// Where the cap came from, or `None` to read it as the deployment's.
     ///
     /// A cap in force that nothing said otherwise about is one the deployment
@@ -300,9 +307,11 @@ impl BuildCacheReadings {
             scanned_at: AtomicU64::new(0),
             cap: CacheCapSetting::Unbounded,
             derived_cap: AtomicU64::new(0),
+            cap_evaluations: AtomicU64::new(0),
             cap_ceiling: AtomicU64::new(NO_CEILING),
             peak: Mutex::new(Peak::default()),
             scan_interval_secs: AtomicU64::new(0),
+            scan_interval_evaluations: AtomicU64::new(0),
             cap_source: None,
             reclaim: Mutex::new(ReclaimState::default()),
             reclaimed_bytes: AtomicU64::new(0),
@@ -445,6 +454,12 @@ impl BuildCacheReadings {
         // cap, so a derived cap bottoms out at one byte.
         let derived = if peak == 0 { 0 } else { cap.max(1) };
         self.derived_cap.store(derived, Ordering::Release);
+        self.cap_evaluations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Walks that derived the cap from their own measurement.
+    pub fn cap_evaluations(&self) -> u64 {
+        self.cap_evaluations.load(Ordering::Relaxed)
     }
 
     /// How long between walks.
@@ -462,6 +477,12 @@ impl BuildCacheReadings {
     /// against it would be comparing against something nothing runs at.
     pub fn set_scan_interval_secs(&self, secs: u64) {
         self.scan_interval_secs.store(secs, Ordering::Release);
+        self.scan_interval_evaluations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Passes that stated the cadence they are keeping.
+    pub fn scan_interval_evaluations(&self) -> u64 {
+        self.scan_interval_evaluations.load(Ordering::Relaxed)
     }
 
     /// Record one completed walk.
@@ -708,6 +729,16 @@ impl BuildCacheReadings {
             RawMetric::new(
                 BUILD_TARGET_SCAN_INTERVAL_METRIC,
                 self.scan_interval_secs() as f64,
+            )
+            .with_label(DIR_LABEL, dir),
+            RawMetric::new(
+                BUILD_TARGET_SCAN_INTERVAL_EVALUATIONS_METRIC,
+                self.scan_interval_evaluations() as f64,
+            )
+            .with_label(DIR_LABEL, dir),
+            RawMetric::new(
+                BUILD_TARGET_CAP_EVALUATIONS_METRIC,
+                self.cap_evaluations() as f64,
             )
             .with_label(DIR_LABEL, dir),
             RawMetric::new(
@@ -1083,6 +1114,11 @@ mod tests {
         // measured", and a full disk must not read as unbounded.
         readings.derive_cap(2_000, Some(0));
         assert_eq!(readings.cap_bytes(), Some(1));
+
+        // Five walks derived, five counts: the value alone cannot say whether
+        // the derivation is still running, and 1200 -> 1200 is what a stopped
+        // loop and a steady cache both look like.
+        assert_eq!(readings.cap_evaluations(), 5);
     }
 
     /// A ceiling measured by the loop that owns the volume wins over both

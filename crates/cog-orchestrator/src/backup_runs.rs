@@ -499,6 +499,20 @@ fn age_seconds(now: DateTime<Utc>, instant: DateTime<Utc>) -> f64 {
     (now - instant).num_seconds().max(0) as f64
 }
 
+/// How long ago the newest run concluded, as the loop publishes it.
+///
+/// Public because it is the last-beat reading of the run that derives the keep
+/// count: the run writes a fresh `finished_at` every time, even when the count
+/// it computed did not move, and this age is what a reader sees advance. A
+/// steady `keep_target` beside an advancing age is a loop that is running; the
+/// target alone cannot tell that from a loop that stopped.
+pub fn latest_finish_age_seconds(
+    account: &BackupAccountReading,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    account.latest_finish_at.map(|at| age_seconds(now, at))
+}
+
 /// The value of one readout, or `None` when the account has nothing to say for
 /// it.
 ///
@@ -518,9 +532,7 @@ fn value_of(
         BackupReadout::RunsOk => Some(account.ok as f64),
         BackupReadout::RunsFailed => Some(account.failed as f64),
         BackupReadout::RunsAbandoned => Some(account.abandoned as f64),
-        BackupReadout::LatestFinishAgeSeconds => {
-            account.latest_finish_at.map(|at| age_seconds(now, at))
-        }
+        BackupReadout::LatestFinishAgeSeconds => latest_finish_age_seconds(account, now),
         BackupReadout::LatestSuccessAgeSeconds => account
             .newest_package
             .as_ref()

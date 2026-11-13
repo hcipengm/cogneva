@@ -2363,6 +2363,28 @@ mod tests {
         assert_eq!(readings.evaluations("gateway", "cogneva"), 3);
     }
 
+    /// 节点数不变时副本目标不变，拍子仍然在走。
+    #[test]
+    fn the_replica_beat_counts_even_when_the_node_count_does_not_move() {
+        let readings = WorkloadResourcesReadings::new();
+        for expected in 1..=2 {
+            readings.note_replicas_evaluated("gateway");
+            readings.observe_replicas("gateway", 2, SOURCE_DERIVED);
+            assert_eq!(readings.replica_evaluations("gateway"), expected);
+        }
+    }
+
+    /// 最长启动时间不变时预算不变，拍子仍然在走。
+    #[test]
+    fn the_startup_beat_counts_even_when_the_longest_start_does_not_move() {
+        let readings = WorkloadResourcesReadings::new();
+        for expected in 1..=2 {
+            readings.note_startup_evaluated("gateway", "cogneva");
+            readings.observe_startup("gateway", "cogneva", 78, SOURCE_DERIVED);
+            assert_eq!(readings.startup_evaluations("gateway", "cogneva"), expected);
+        }
+    }
+
     #[test]
     fn a_pod_resolves_through_its_replicaset_to_the_deployment() {
         let mut replicasets = HashMap::new();

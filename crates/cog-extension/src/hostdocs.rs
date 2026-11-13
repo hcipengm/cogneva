@@ -69,6 +69,11 @@ pub const MAX_LIST_ENTRIES_ENV: &str = "HOST_DOCS_MAX_LIST_ENTRIES";
 pub const APPROVAL_TTL_SECS_ENV: &str = "HOST_DOCS_APPROVAL_TTL_SECS";
 /// The approvability window this gate is actually keeping, in seconds.
 pub const APPROVAL_TTL_METRIC: &str = "sandbox_host_docs_approval_ttl_seconds";
+/// How many times the approval window has been recomputed. The window only ever
+/// widens, so a quiet station and a stalled loop publish the same seconds; this
+/// is the reading that tells them apart.
+pub const APPROVAL_TTL_EVALUATIONS_METRIC: &str =
+    "sandbox_host_docs_approval_ttl_evaluations_total";
 /// The wire bytes one body prefix may take in a question: the plan in force.
 pub const ASSIST_BODY_BYTES_METRIC: &str = "sandbox_host_docs_assist_body_bytes";
 /// How many files one question covers: the plan in force.
@@ -871,7 +876,7 @@ impl HostDocsMetrics {
         approval_ttl_source.with_label_values(&["seed"]).set(1.0);
         approval_ttl_source.with_label_values(&["derived"]).set(0.0);
         let approval_ttl_evaluations = prometheus::IntCounter::with_opts(Opts::new(
-            "sandbox_host_docs_approval_ttl_evaluations_total",
+            APPROVAL_TTL_EVALUATIONS_METRIC,
             "How many times the approval window has been recomputed",
         ))?;
         registry.register(Box::new(approval_ttl_evaluations.clone()))?;
@@ -3285,6 +3290,11 @@ mod tests {
             text.contains(&format!("{APPROVAL_TTL_METRIC} 216000")),
             "两天最慢一次批准的窗口是两天半: {text}"
         );
+        assert!(
+            text.contains(APPROVAL_TTL_EVALUATIONS_METRIC),
+            "the beat is published as its own series, so a window that stops \
+             moving can still be told from a loop that stopped: {text}"
+        );
 
         // 下一份计划拿到的是重算后的窗口，不需要重启。
         let second = docs.stage("alice", &ops).await.unwrap();
@@ -3300,7 +3310,7 @@ mod tests {
     fn evaluations_count(metrics: &str) -> u64 {
         metrics
             .lines()
-            .find(|line| line.starts_with("sandbox_host_docs_approval_ttl_evaluations_total "))
+            .find(|line| line.starts_with(&format!("{APPROVAL_TTL_EVALUATIONS_METRIC} ")))
             .and_then(|line| line.rsplit(' ').next())
             .and_then(|value| value.parse().ok())
             .unwrap_or(0)

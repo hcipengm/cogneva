@@ -4854,10 +4854,14 @@ mod tests {
             ),
             std::time::Duration::ZERO
         );
-        assert_eq!(
-            readings.target(DISCOVERY_POLL_PACING),
-            Some((std::time::Duration::from_secs(700), 2, true))
-        );
+        let (target, evaluations, derived) = readings
+            .target(DISCOVERY_POLL_PACING)
+            .expect("both waits were beats");
+        assert_eq!(target, std::time::Duration::from_secs(700));
+        // Two waits, two beats: the count is what separates a loop that is
+        // keeping its cadence from one that last moved the target and stopped.
+        assert_eq!(evaluations, 2);
+        assert!(derived);
     }
 
     /// 探针 → 任务那一跳单独量：目标文本与 payload 里的 `goal` 必须是同一个值

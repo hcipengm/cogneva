@@ -584,10 +584,14 @@ mod tests {
             wait_after_pass(Some(&pacer), Duration::from_secs(300), Duration::from_secs(900)),
             Duration::ZERO
         );
-        assert_eq!(
-            readings.target("claimStore.scanIntervalSecs"),
-            Some((Duration::from_secs(900), 2, true))
-        );
+        let (target, evaluations, derived) = readings
+            .target("claimStore.scanIntervalSecs")
+            .expect("both waits were beats");
+        assert_eq!(target, Duration::from_secs(900));
+        // The count is what says the beat is running: the target moved because a
+        // walk was measured, not because a number was written down.
+        assert_eq!(evaluations, 2);
+        assert!(derived);
     }
 
     fn scratch(name: &str) -> cog_test_support::ScratchDir {

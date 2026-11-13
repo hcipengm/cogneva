@@ -6951,6 +6951,47 @@ mod tests {
         );
     }
 
+    /// 保留数不变的一跑仍然是一跑：每跑收尾都写下一个新的时刻，读侧发布的
+    /// `latest_finish_age_seconds` 因此每跑重置。它是这条回路的「最后一拍」。
+    ///
+    /// 只留 `keep_target` 的账面对「这一跑算过、算出同一个数」与「回路停了」
+    /// 发布同一个数；年龄是两者之间唯一的区别。
+    #[test]
+    fn the_keep_beat_is_the_newest_run_finishing_even_when_the_count_stands() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap();
+        let account = |finished_at: DateTime<Utc>| cog_core::BackupAccountReading {
+            latest_finish_at: Some(finished_at),
+            newest_package: Some(cog_core::BackupPackageRecord {
+                run_id: format!("cogneva-backup-{}", finished_at.timestamp()),
+                finished_at,
+                package: None,
+                bytes: None,
+                package_checksum: None,
+                package_coverage: None,
+                keep_target: 7,
+                kept_after: Some(7),
+                oldest_kept_at: None,
+            }),
+            ..Default::default()
+        };
+        let yesterday = account(now - chrono::Duration::hours(24));
+        let just_now = account(now - chrono::Duration::minutes(5));
+        assert_eq!(
+            yesterday.newest_package.as_ref().map(|p| p.keep_target),
+            just_now.newest_package.as_ref().map(|p| p.keep_target),
+            "both runs derived the same count"
+        );
+        assert_eq!(
+            cog_orchestrator::backup_runs::latest_finish_age_seconds(&yesterday, now),
+            Some(86_400.0)
+        );
+        assert_eq!(
+            cog_orchestrator::backup_runs::latest_finish_age_seconds(&just_now, now),
+            Some(300.0),
+            "the last beat moved even though the count stood"
+        );
+    }
+
     #[test]
     fn secret_manifest_is_applyable_sorted_and_base64() {
         // 复刻 K8s Secret 卷的真实形态：每个 key 是指向 ..data/<key> 的符号

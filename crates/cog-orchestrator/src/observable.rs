@@ -522,6 +522,12 @@ impl ClaimSlotsObservable {
         self.bound_evaluations.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 普通车道的界被重算过几拍；见
+    /// [`TASK_ROUTER_CLAIM_BOUND_EVALUATIONS_METRIC`]。
+    pub fn bound_evaluations(&self) -> u64 {
+        self.bound_evaluations.load(Ordering::Relaxed)
+    }
+
     fn streams(&self) -> std::sync::MutexGuard<'_, HashMap<String, ClaimStreamState>> {
         // A panic elsewhere must not take the reading surface down with it; the
         // state behind the lock is a set of counters, and the worst a poisoned

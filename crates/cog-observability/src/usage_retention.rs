@@ -552,6 +552,7 @@ mod tests {
             let (target, beats, derived) = readings.reading(KNOB).expect("a beat");
             assert_eq!(target, 7.0);
             assert_eq!(beats, expected, "a steady target is still a beat");
+            assert_eq!(readings.evaluations(KNOB), expected);
             assert!(derived);
         }
         assert_eq!(

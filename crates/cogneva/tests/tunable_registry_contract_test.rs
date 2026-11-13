@@ -134,6 +134,11 @@ struct Published {
     metric: String,
     /// The label on that reading that carries where the value came from.
     label: String,
+    /// For a derived row: what makes the loop compute the number again --
+    /// `periodic` (a timer) or `event` (a request or a pass that carries it).
+    /// Absent on a fixed row, which has no loop to tick.
+    #[serde(default)]
+    cadence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +146,13 @@ struct Published {
 struct Proof {
     file: String,
     test: String,
+    /// The test that shows the loop computing the number again in the same
+    /// process, rather than measuring it once at start-up.
+    beat: String,
+    /// The counter or last-beat reading the beat test reads, and the published
+    /// file carries. A claim that a loop runs is worth nothing if nothing
+    /// counts the beats.
+    evidence: String,
 }
 
 fn registry() -> Registry {
@@ -148,8 +160,8 @@ fn registry() -> Registry {
     let registry: Registry = serde_yaml::from_str(&text)
         .unwrap_or_else(|e| panic!("{REGISTRY} does not parse as a registry: {e}"));
     assert_eq!(
-        registry.version, 2,
-        "{REGISTRY}: this test reads version 2, and the version is here so that a \
+        registry.version, 3,
+        "{REGISTRY}: this test reads version 3, and the version is here so that a \
          change to the row shape is a version bump rather than a silent reinterpretation"
     );
     registry
@@ -191,6 +203,56 @@ fn has_test(text: &str, name: &str) -> bool {
             .rsplit('\n')
             .take(2)
             .any(|line| line.trim() == "#[test]" || line.trim() == "#[tokio::test]")
+}
+
+/// The body of `fn <name>(...)` in `text`, braces matched, comments and string
+/// literals skipped.
+///
+/// The proof check is about what a test *does*, and a name in a comment or in a
+/// message is not a call. Cutting the body out is the only way to ask that
+/// without running the test here. The scanner is deliberately small: it tracks
+/// double-quoted strings, escapes and line comments, which is every form a
+/// brace can hide behind in these test bodies. A file it cannot parse answers
+/// `None`, and the caller reports that rather than passing the row.
+fn test_body(text: &str, name: &str) -> Option<String> {
+    let at = text.find(&format!("fn {name}("))?;
+    let body = &text[at..];
+    let bytes = body.as_bytes();
+    let mut index = bytes.iter().position(|b| *b == b'{')?;
+    let start = index;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_line_comment = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_line_comment {
+            if byte == b'\n' {
+                in_line_comment = false;
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            in_line_comment = true;
+        } else if byte == b'{' {
+            depth += 1;
+        } else if byte == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(body[start..=index].to_string());
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Whether `text` is a number the chart would read as a value: `123`, `0.5`,
@@ -324,11 +386,60 @@ fn a_key_with_no_row_is_the_same_hole_as_a_key_with_no_loop() {
                 row.key, proof.test, proof.file
             ));
         }
+        // The value following its input is one half. A number measured once at
+        // start-up follows its input just as well as one recomputed every
+        // window, and the difference is only visible in a second test: the loop
+        // running again with the target unchanged, and the reading that counts
+        // the beats moving anyway.
+        if !has_test(&text, &proof.beat) {
+            wrong.push(format!(
+                "`{}` is registered as derived and its beat proof `{}` is not a \
+                 test in `{}`, so nothing shows the loop running rather than \
+                 measuring once",
+                row.key, proof.beat, proof.file
+            ));
+        } else {
+            match test_body(&text, &proof.beat) {
+                Some(body) if body.contains(&proof.evidence) => {}
+                Some(_) => wrong.push(format!(
+                    "`{}` names `{}` as the reading that counts its beats, and its \
+                     beat test `{}` never reads it",
+                    row.key, proof.evidence, proof.beat
+                )),
+                None => wrong.push(format!(
+                    "`{}` has a beat test `{}` whose body could not be read in `{}`",
+                    row.key, proof.beat, proof.file
+                )),
+            }
+        }
+        // The evidence has to be something the publisher actually writes: a
+        // counter named in the registry and nowhere in the code counts nothing,
+        // and the row would read as proof while the reading had no beat cell.
+        if let Some(published) = &row.published {
+            let publisher =
+                without_line_comments(&read(&repo_root().join(&published.file)));
+            if !publisher.contains(&proof.evidence) {
+                wrong.push(format!(
+                    "`{}` names `{}` as its beat evidence, and `{}` does not carry \
+                     that reading",
+                    row.key, proof.evidence, published.file
+                ));
+            }
+            match published.cadence.as_deref() {
+                Some("periodic") | Some("event") => {}
+                other => wrong.push(format!(
+                    "`{}` is registered as derived and its reading says the loop \
+                     ticks on {:?}; a derived number has to say whether a timer or \
+                     an event recomputes it (`periodic` or `event`)",
+                    row.key, other
+                )),
+            }
+        }
     }
     assert!(
         wrong.is_empty(),
-        "a value registered as derived without a test that moves its input is a \
-         constant with a comment: {wrong:#?}"
+        "a value registered as derived without a test that moves its input, and a \
+         beat test that reads the count, is a constant with a comment: {wrong:#?}"
     );
 }
 

@@ -118,6 +118,12 @@ const MAINTENANCE_OVERHEAD_MULTIPLE: u64 = 20;
 /// The published name of the interval the reclamation loop is keeping.
 const GC_INTERVAL_METRIC: &str = "sandbox_workspace_gc_interval_seconds";
 
+/// How many times the reclamation interval has been recomputed. A pass that
+/// costs the same every time keeps the interval where it is, so the interval
+/// alone cannot say the loop is still running.
+const GC_INTERVAL_EVALUATIONS_METRIC: &str =
+    "sandbox_workspace_gc_interval_evaluations_total";
+
 /// The shortest wait between two upstream fetches. Below this the loop would be
 /// asking the mirror for the same commit faster than a push can arrive, and the
 /// cost of the git round trip stops being paid for by anything. A floor rather
@@ -132,6 +138,12 @@ const MIN_FETCH_INTERVAL_SECS: u64 = 30;
 /// see, and the loop silently stopping to use it would be invisible.
 const FETCH_INTERVAL_METRIC: &str = "sandbox_repo_fetch_interval_seconds";
 
+/// How many times the fetch wait has been recomputed. An unchanged head keeps
+/// the period where it is; this is what tells a still repository from a loop
+/// that stopped asking.
+const FETCH_INTERVAL_EVALUATIONS_METRIC: &str =
+    "sandbox_repo_fetch_interval_evaluations_total";
+
 /// The label saying which input set a published period -- configuration, floor
 /// or measurement. Without it the configured number is the only one anyone can
 /// see, and the loop silently stopping to use it would be invisible.
@@ -144,6 +156,11 @@ const SOURCES: [&str; 3] = ["configured", "floor", "measured"];
 
 /// The published name of the idle TTL the reclamation pass is using.
 const TTL_METRIC: &str = "sandbox_workspace_ttl_seconds";
+
+/// How many times the hold time has been recomputed. A steady arrival rate
+/// derives the same hold every pass, so the count is the only sign the law is
+/// still being evaluated.
+const TTL_EVALUATIONS_METRIC: &str = "sandbox_workspace_ttl_evaluations_total";
 
 /// How many task trees the volume is measured to hold, and the input set that
 /// chose it. The deployment's number is only the seed: before a tree exists
@@ -653,6 +670,12 @@ pub struct WorkdirMetrics {
     gc_interval_seconds: PeriodGauge,
     /// The volume walk's interval in force, published the same way.
     volume_walk_interval_seconds: PeriodGauge,
+    /// Recomputations of the fetch wait, the hold time and the reclamation
+    /// interval. Each of those numbers only moves when its input does, so the
+    /// period in force cannot say whether the loop that derives it still runs.
+    fetch_interval_evaluations: Counter,
+    ttl_evaluations: Counter,
+    gc_interval_evaluations: Counter,
     /// The task-tree cap in force, and the input set that chose it.
     cap: Gauge,
     cap_source: GaugeVec,
@@ -747,6 +770,21 @@ impl WorkdirMetrics {
             "Seconds between walks of the volumes this executor writes",
             cfg.data_volume_interval,
         )?;
+        let fetch_interval_evaluations = Counter::new(
+            FETCH_INTERVAL_EVALUATIONS_METRIC,
+            "Recomputations of the wait between upstream fetches",
+        )?;
+        let ttl_evaluations = Counter::new(
+            TTL_EVALUATIONS_METRIC,
+            "Recomputations of the idle hold time during a reclamation pass",
+        )?;
+        let gc_interval_evaluations = Counter::new(
+            GC_INTERVAL_EVALUATIONS_METRIC,
+            "Recomputations of the interval between reclamation passes",
+        )?;
+        registry.register(Box::new(fetch_interval_evaluations.clone()))?;
+        registry.register(Box::new(ttl_evaluations.clone()))?;
+        registry.register(Box::new(gc_interval_evaluations.clone()))?;
         let cap = Gauge::new(
             WORKSPACE_CAP_METRIC,
             "Task worktrees the volume is measured to hold at the size these trees are",
@@ -813,6 +851,9 @@ impl WorkdirMetrics {
             ttl_seconds,
             gc_interval_seconds,
             volume_walk_interval_seconds,
+            fetch_interval_evaluations,
+            ttl_evaluations,
+            gc_interval_evaluations,
             cap,
             cap_source,
             cap_evaluations,
@@ -1674,6 +1715,9 @@ impl WorkdirRouter {
                 now.saturating_sub(first).max(0) as u64,
             )
         });
+        // Counted whether or not the hold moved: a steady arrival rate derives
+        // the same number every pass, and that is the case the count exists for.
+        self.metrics.ttl_evaluations.inc();
         if let Some(d) = derived {
             self.metrics.ttl_seconds.set(d.as_secs() as f64, "measured");
         } else {
@@ -1825,6 +1869,9 @@ impl WorkdirRouter {
         self.metrics
             .fetch_interval
             .set(wait.as_secs() as f64, source);
+        // Every ask is one recomputation; the wait only moves when a head has
+        // been still for a different length of time.
+        self.metrics.fetch_interval_evaluations.inc();
         let last = self.last_fetch_unix.load(Ordering::Relaxed);
         if last == 0 {
             return true;
@@ -1837,10 +1884,14 @@ impl WorkdirRouter {
     /// volume it walks gets. Recomputed per call, for the same reason the git
     /// timeout is.
     fn gc_interval(&self) -> Duration {
-        gc_interval_from(
+        let interval = gc_interval_from(
             self.gc_pass_millis.load(Ordering::Relaxed),
             self.cfg.gc_interval,
-        )
+        );
+        // Same pass cost, same interval -- and still a beat. The counter is the
+        // only reading that moves on a volume whose passes stay cheap.
+        self.metrics.gc_interval_evaluations.inc();
+        interval
     }
 
     /// Whether the interval since the last pass has elapsed.
@@ -4249,6 +4300,83 @@ pub(crate) mod tests {
             1.0
         );
         assert!(r.metrics().warm_trees_evaluations.get() > beats);
+    }
+
+    /// The fetch wait is recomputed on every ask, and the count moves even when
+    /// the head has been still for the same length of time.
+    #[tokio::test]
+    async fn the_fetch_beat_counts_even_when_the_period_does_not_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 0);
+        let before = r.metrics().fetch_interval_evaluations.get();
+        assert!(r.fetch_due(), "no fetch has run yet");
+        r.last_fetch_unix.store(unix_now(), Ordering::Relaxed);
+        assert!(!r.fetch_due(), "no time has passed since the last fetch");
+        assert_eq!(
+            r.metrics().fetch_interval_evaluations.get() - before,
+            2.0,
+            "both asks evaluated the wait, whatever the wait answered"
+        );
+        assert_eq!(
+            r.metrics().fetch_interval.seconds.get(),
+            300.0,
+            "nothing measured a moving head, so the configured period stands"
+        );
+    }
+
+    /// The reclamation interval is recomputed before every pass, and a pass
+    /// that costs the same keeps the same interval while the count rises.
+    #[tokio::test]
+    async fn the_gc_beat_counts_even_when_the_interval_does_not_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 0);
+        let before = r.metrics().gc_interval_evaluations.get();
+        let first = r.gc_interval();
+        let second = r.gc_interval();
+        assert_eq!(first, second, "the same pass cost is the same interval");
+        assert_eq!(
+            r.metrics().gc_interval_evaluations.get() - before,
+            2.0,
+            "two recomputations, counted even though the number did not move"
+        );
+    }
+
+    /// The hold time is recomputed by every reclamation pass, and the count
+    /// moves on a pass that finds no tree to reap.
+    #[tokio::test]
+    async fn the_ttl_beat_counts_even_when_the_hold_time_does_not_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 0);
+        let before = r.metrics().ttl_evaluations.get();
+        r.gc_once().await.unwrap();
+        r.gc_once().await.unwrap();
+        assert_eq!(
+            r.metrics().ttl_evaluations.get() - before,
+            2.0,
+            "each pass evaluated the hold, including the passes with no trees"
+        );
+    }
+
+    /// The cache walk states its cadence every time it is due, and the count
+    /// rises whether or not the walk's cost moved the interval.
+    #[tokio::test]
+    async fn the_cache_walk_beat_counts_even_when_the_interval_does_not_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 0);
+        let cache = r.build_cache().clone();
+        let before = cache.scan_interval_evaluations();
+        assert!(r.cache_walk_due(&cache), "no walk has run yet");
+        r.last_cache_walk_unix.store(unix_now(), Ordering::Relaxed);
+        assert!(!r.cache_walk_due(&cache), "no time has passed");
+        assert_eq!(
+            cache.scan_interval_evaluations() - before,
+            2,
+            "the interval was stated twice, even when it did not move"
+        );
     }
 
     /// Polling is paid for by how often the thing being polled changes.

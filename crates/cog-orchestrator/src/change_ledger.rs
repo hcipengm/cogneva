@@ -12669,6 +12669,34 @@ mod tests {
         assert_eq!(rows_per_handover_bound(5, None, Some(1)), 1);
     }
 
+    /// Every pass asks for the bound, whether or not the graph moved, and the
+    /// observable's evaluation count is the evidence of it.
+    ///
+    /// Two passes over a graph with nothing measured keep the seed both times.
+    /// Without the count, that steady bound and a loop that stopped after the
+    /// first pass publish the same number.
+    #[test]
+    fn the_batch_bound_beat_counts_even_when_the_graph_does_not_move() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 13, 12, 0, 0)
+            .unwrap()
+            .timestamp();
+        let observable = crate::observable::rows_per_handover_observable();
+        let before = observable.evaluations();
+        let (first, first_source) = batch_size_for_this_pass(&[], now);
+        let (second, second_source) = batch_size_for_this_pass(&[], now);
+        assert_eq!(first, DEFAULT_ROWS_PER_HANDOVER);
+        assert_eq!(second, first, "nothing measured is the same answer");
+        assert_eq!(first_source, crate::observable::SOURCE_DERIVED);
+        assert_eq!(second_source, first_source);
+        assert!(
+            observable.evaluations() >= before + 2,
+            "two passes, two evaluations: {} -> {}",
+            before,
+            observable.evaluations()
+        );
+    }
+
     /// The measurement reads completed batches and refused ones, and nothing
     /// else off the task table.
     ///

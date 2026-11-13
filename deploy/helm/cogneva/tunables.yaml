@@ -45,20 +45,31 @@
 #     red, and a row whose key left the chart goes red too.
 #   - every row says something. For `fixed` that is the reason it is not
 #     derived; for `derived` it is what the value reads.
-#   - a `derived` row names two tests, because one cannot carry both halves of
-#     the claim: the law test shows a different input answering a different
-#     value, and the beat test shows the loop computing that value again in the
-#     same process, with the reading that counts the beats rising even when the
-#     value did not move. A comment claiming a number tracks the world is not
-#     evidence that it does, and a value that is measured once at start-up is a
-#     constant with a loop somewhere else.
+#   - a `derived` row names one or two tests, because one cannot always carry
+#     both halves of the claim: the law test shows a different input answering a
+#     different value, and the beat test shows the loop computing that value
+#     again in the same process, with the reading that counts the beats rising
+#     even when the value did not move. Where the law test already counts the
+#     beats, the same test names both halves -- a second test over the same
+#     fixture would be a copy, not a second piece of evidence. A comment
+#     claiming a number tracks the world is not evidence that it does, and a
+#     value that is measured once at start-up is a constant with a loop
+#     somewhere else.
+#   - the beat test reads the `evidence` the row names, and the file that
+#     publishes the value carries that reading outside a comment: a count the
+#     publisher never writes would be a proof about a number no reader sees.
+#   - every `derived` row says its `cadence`: `periodic` when a timer drives
+#     the loop, `event` when a request or a pass carries it. The cadence is a
+#     statement about what makes the next beat happen, which no test over one
+#     call can prove; it is here so a reader can tell a loop that must tick from
+#     one that only runs when work arrives.
 #   - a row that lands on a reading has to use a word the reading can carry,
 #     and the file it names has to publish that metric and that label.
 #
 # `fixed` is not a leftover. It is a complete answer for a protocol constant,
 # and it is the only answer that does not move. What is not allowed is a value
 # that is neither measured nor agreed, or a row that says none.
-version: 2
+version: 3
 rows:
 
   # --- notification / alerting ------------------------------------------------
@@ -86,9 +97,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_declaration_below_the_peak_is_raised_to_the_headroom_rounded_up
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   # --- optional backends ------------------------------------------------------
   - key: backends.meilisearch.replicas
@@ -141,9 +155,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: backends.meilisearch.resources.requests.cpu
     source: derived
@@ -160,9 +177,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.meilisearch.resources.requests.memory
     source: derived
@@ -179,9 +199,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.meilisearch.resources.limits.cpu
     source: derived
@@ -199,9 +222,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.meilisearch.resources.limits.memory
     source: derived
@@ -217,9 +243,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
   - key: backends.nats.storage
     source: derived
     why: >-
@@ -229,9 +258,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: backends.nats.resources.requests.cpu
     source: derived
@@ -248,9 +280,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.nats.resources.requests.memory
     source: derived
@@ -267,9 +302,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.nats.resources.limits.cpu
     source: derived
@@ -287,9 +325,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.nats.resources.limits.memory
     source: derived
@@ -305,9 +346,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
   - key: backends.postgres.storage
     source: derived
     why: >-
@@ -317,9 +361,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: backends.postgres.resources.requests.cpu
     source: derived
@@ -336,9 +383,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.postgres.resources.requests.memory
     source: derived
@@ -355,9 +405,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.postgres.resources.limits.cpu
     source: derived
@@ -375,9 +428,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.postgres.resources.limits.memory
     source: derived
@@ -393,9 +449,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   # The metrics sidecar's own bounds. A sidecar in the same Pod is charged to the
   # namespace ceiling like any other container, so these are part of the sum the
@@ -417,9 +476,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.postgres.exporterResources.requests.memory
     source: derived
@@ -438,9 +500,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.postgres.exporterResources.limits.cpu
     source: derived
@@ -460,9 +525,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.postgres.exporterResources.limits.memory
     source: derived
@@ -480,9 +548,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.qdrant.storage
     source: derived
@@ -493,9 +564,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: backends.qdrant.resources.requests.cpu
     source: derived
@@ -512,9 +586,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.qdrant.resources.requests.memory
     source: derived
@@ -531,9 +608,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.qdrant.resources.limits.cpu
     source: derived
@@ -551,9 +631,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.qdrant.resources.limits.memory
     source: derived
@@ -569,9 +652,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
   - key: backends.redis.storage
     source: derived
     why: >-
@@ -581,9 +667,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: backends.redis.resources.requests.cpu
     source: derived
@@ -600,9 +689,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.resources.requests.memory
     source: derived
@@ -619,9 +711,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.resources.limits.cpu
     source: derived
@@ -639,9 +734,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.resources.limits.memory
     source: derived
@@ -657,9 +755,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.aofRepair.resources.requests.cpu
     source: derived
@@ -676,9 +777,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.aofRepair.resources.requests.memory
     source: derived
@@ -695,9 +799,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.aofRepair.resources.limits.cpu
     source: derived
@@ -715,9 +822,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.aofRepair.resources.limits.memory
     source: derived
@@ -733,9 +843,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.aofReportExporter.resources.requests.cpu
     source: derived
@@ -752,9 +865,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.aofReportExporter.resources.requests.memory
     source: derived
@@ -771,9 +887,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.aofReportExporter.resources.limits.cpu
     source: derived
@@ -791,9 +910,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.redis.aofReportExporter.resources.limits.memory
     source: derived
@@ -809,9 +931,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
   - key: backends.redis.infoExporter.intervalSeconds
     source: fixed
     why: >-
@@ -848,9 +973,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
   - key: backends.redis.infoExporter.resources.requests.memory
     source: derived
     why: >-
@@ -866,9 +994,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
   - key: backends.redis.infoExporter.resources.limits.cpu
     source: derived
     why: >-
@@ -885,9 +1016,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
   - key: backends.redis.infoExporter.resources.limits.memory
     source: derived
     why: >-
@@ -902,9 +1036,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
   - key: backends.seaweedfs.resources.requests.cpu
     source: derived
     why: >-
@@ -920,9 +1057,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.seaweedfs.resources.requests.memory
     source: derived
@@ -939,9 +1079,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.seaweedfs.resources.limits.cpu
     source: derived
@@ -959,9 +1102,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.seaweedfs.resources.limits.memory
     source: derived
@@ -977,9 +1123,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backends.seaweedfs.storage
     source: derived
@@ -990,9 +1139,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
   - key: backup.keepCount
     source: derived
     why: >-
@@ -1010,9 +1162,12 @@ rows:
       file: crates/cog-orchestrator/src/backup_runs.rs
       metric: BACKUP_RUN_READINGS
       label: readout
+      cadence: periodic
     proof:
       file: crates/cogneva/src/backup.rs
       test: the_keep_count_follows_the_volume_and_the_measured_package_size
+      beat: the_keep_beat_is_the_newest_run_finishing_even_when_the_count_stands
+      evidence: latest_finish_age_seconds
 
   - key: backup.runDeadlineSeconds
     source: fixed
@@ -1085,9 +1240,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
   - key: backup.resources.requests.cpu
     source: derived
     why: >-
@@ -1103,9 +1261,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backup.resources.requests.memory
     source: derived
@@ -1122,9 +1283,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backup.resources.limits.cpu
     source: derived
@@ -1142,9 +1306,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backup.resources.limits.memory
     source: derived
@@ -1160,9 +1327,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backup.drillResources.requests.cpu
     source: derived
@@ -1181,9 +1351,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backup.drillResources.requests.memory
     source: derived
@@ -1202,9 +1375,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backup.drillResources.limits.cpu
     source: derived
@@ -1223,9 +1399,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: backup.drillResources.limits.memory
     source: derived
@@ -1243,9 +1422,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: buildah.resources.requests.cpu
     source: derived
@@ -1262,9 +1444,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: buildah.resources.requests.memory
     source: derived
@@ -1281,9 +1466,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: buildah.resources.limits.cpu
     source: derived
@@ -1301,9 +1489,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: buildah.resources.limits.memory
     source: derived
@@ -1319,9 +1510,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   # --- in-cluster registry ----------------------------------------------------
   - key: clusterRegistry.replicas
@@ -1362,9 +1556,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: clusterRegistry.resources.requests.memory
     source: derived
@@ -1381,9 +1578,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: clusterRegistry.resources.limits.cpu
     source: derived
@@ -1401,9 +1601,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: clusterRegistry.resources.limits.memory
     source: derived
@@ -1419,9 +1622,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: clusterRegistry.storage
     source: derived
@@ -1432,9 +1638,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: clusterRegistry.walkerPort
     source: fixed
@@ -1459,9 +1668,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: clusterRegistry.walkerResources.requests.memory
     source: derived
@@ -1480,9 +1692,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: clusterRegistry.walkerResources.limits.cpu
     source: derived
@@ -1501,9 +1716,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: clusterRegistry.walkerResources.limits.memory
     source: derived
@@ -1520,9 +1738,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   # --- evolution worker -------------------------------------------------------
   - key: changeVerification.cargoBuildJobs
@@ -1542,9 +1763,12 @@ rows:
       file: crates/cog-reflection/src/build_gate/mod.rs
       metric: BUILD_GATE_CARGO_JOBS
       label: role
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/build_gate/mod.rs
       test: cargo_jobs_follow_the_measured_cores_and_build_demand
+      beat: the_cargo_width_is_recomputed_every_window_and_published
+      evidence: BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL
 
   - key: evolution.replicas
     source: fixed
@@ -1567,9 +1791,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/plugin.rs
       test: the_discovery_wait_follows_what_a_round_cost
+      beat: the_discovery_wait_follows_what_a_round_cost
+      evidence: evaluations
 
   - key: evolution.buildGate.maxConcurrent
     source: derived
@@ -1587,9 +1814,12 @@ rows:
       file: crates/cog-reflection/src/build_gate/mod.rs
       metric: BUILD_GATE_CEILING
       label: dimension
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/build_gate/mod.rs
       test: the_ceiling_is_the_tightest_dimension
+      beat: the_cargo_width_is_recomputed_every_window_and_published
+      evidence: BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL
 
   - key: evolution.buildGate.waitSecs
     source: derived
@@ -1604,9 +1834,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/build_gate/mod.rs
       test: the_wait_budget_follows_the_waits_that_actually_happened
+      beat: the_wait_budget_follows_the_waits_that_actually_happened
+      evidence: evaluations
 
   - key: evolution.dataStorage
     source: derived
@@ -1617,9 +1850,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: evolution.gitRemote.storage
     source: derived
@@ -1630,9 +1866,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: evolution.resources.requests.cpu
     source: derived
@@ -1649,9 +1888,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: evolution.resources.requests.memory
     source: derived
@@ -1668,9 +1910,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: evolution.resources.limits.cpu
     source: derived
@@ -1688,9 +1933,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: evolution.resources.limits.memory
     source: derived
@@ -1706,9 +1954,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: evolution.sandboxStorage
     source: derived
@@ -1719,9 +1970,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: evolution.sourceStorage
     source: derived
@@ -1732,9 +1986,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: evolution.workspaces.cacheScanIntervalSecs
     source: derived
@@ -1749,9 +2006,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-core/src/build_cache_readings.rs
       test: the_wait_between_passes_follows_what_the_last_pass_cost
+      beat: the_wait_between_passes_follows_what_the_last_pass_cost
+      evidence: evaluations
 
   - key: evolution.workspaces.ephemeralTtlSecs
     source: derived
@@ -1773,9 +2033,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workspace.rs
       test: the_ephemeral_ttl_follows_the_measured_volume_and_arrivals
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: evaluations
 
   - key: evolution.workspaces.orphanBranchTtlSecs
     source: derived
@@ -1796,9 +2059,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workspace.rs
       test: the_orphan_branch_ttl_follows_the_measured_repo_and_rotations
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: evaluations
 
   - key: evolution.workspaces.targetMaxBytes
     source: derived
@@ -1818,11 +2084,14 @@ rows:
       file: crates/cog-core/src/build_cache_readings.rs
       metric: BUILD_TARGET_CAP_METRIC
       label: source
+      cadence: periodic
     proof:
       # Moves the walk's total and the volume's free bytes, and reads the cap
       # back: the two inputs are the whole of what the number may depend on.
       file: crates/cog-core/src/build_cache_readings.rs
       test: a_derived_cap_follows_its_two_inputs
+      beat: a_derived_cap_follows_its_two_inputs
+      evidence: cap_evaluations
 
   # --- main application -------------------------------------------------------
   - key: gateway.replicas
@@ -1845,9 +2114,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REPLICAS_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_workload_replicas_follow_the_ready_node_count
+      beat: the_replica_beat_counts_even_when_the_node_count_does_not_move
+      evidence: replica_evaluations
 
   - key: gateway.resources.requests.cpu
     source: derived
@@ -1864,9 +2136,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: gateway.resources.requests.memory
     source: derived
@@ -1883,9 +2158,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: gateway.resources.limits.cpu
     source: derived
@@ -1903,9 +2181,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: gateway.resources.limits.memory
     source: derived
@@ -1921,9 +2202,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: taskRouter.claimConcurrency
     source: derived
@@ -1961,9 +2245,12 @@ rows:
       file: crates/cog-orchestrator/src/observable.rs
       metric: TASK_ROUTER_CLAIM_SLOTS_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-orchestrator/src/task_executor_router.rs
       test: the_claim_bound_is_republished_when_the_window_moves
+      beat: the_claim_bound_is_republished_when_the_window_moves
+      evidence: record_bound_evaluation
 
   - key: taskRouter.localClaimConcurrency
     source: derived
@@ -1991,9 +2278,12 @@ rows:
       file: crates/cog-orchestrator/src/observable.rs
       metric: TASK_ROUTER_CLAIM_SLOTS_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-orchestrator/src/lane_memory.rs
       test: the_bound_follows_the_container_limit
+      beat: the_bound_beat_counts_even_when_the_container_does_not_move
+      evidence: bound_evaluations
 
   - key: changeLedger.rowsPerHandover
     source: derived
@@ -2026,9 +2316,12 @@ rows:
       file: crates/cog-orchestrator/src/observable.rs
       metric: ROWS_PER_HANDOVER_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-orchestrator/src/change_ledger.rs
       test: the_batch_bound_follows_the_graphs_batch_outcomes
+      beat: the_batch_bound_beat_counts_even_when_the_graph_does_not_move
+      evidence: evaluations
 
   # --- probe budgets ----------------------------------------------------------
   - key: healthProbes.liveness.periodSeconds
@@ -2120,9 +2413,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: STARTUP_THRESHOLD_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: the_startup_budget_follows_the_longest_measured_start
+      beat: the_startup_beat_counts_even_when_the_longest_start_does_not_move
+      evidence: startup_evaluations
 
   - key: healthProbes.claimStoreStartup.periodSeconds
     source: fixed
@@ -2154,9 +2450,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: STARTUP_THRESHOLD_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: the_startup_budget_follows_the_longest_measured_start
+      beat: the_startup_beat_counts_even_when_the_longest_start_does_not_move
+      evidence: startup_evaluations
 
   # The backup and drill Jobs answer a different question than the probes above:
   # not "will the process respond" but "is it still making progress". Their
@@ -2207,9 +2506,12 @@ rows:
       file: crates/cog-extension/src/hostdocs.rs
       metric: APPROVAL_TTL_METRIC
       label: source
+      cadence: event
     proof:
       file: crates/cog-extension/src/hostdocs.rs
       test: the_approval_window_follows_the_measured_latency
+      beat: a_measured_approval_widens_the_next_window_and_the_beat_counts
+      evidence: APPROVAL_TTL_EVALUATIONS_METRIC
 
   - key: hostDocuments.assistBodyBytes
     source: derived
@@ -2239,9 +2541,12 @@ rows:
       file: crates/cog-extension/src/hostdocs.rs
       metric: ASSIST_BODY_BYTES_METRIC
       label: source
+      cadence: event
     proof:
       file: crates/cog-extension/src/hostdocs.rs
       test: the_question_plan_follows_the_answered_question_and_the_beat_counts
+      beat: the_question_plan_follows_the_answered_question_and_the_beat_counts
+      evidence: ASSIST_PLAN_EVALUATIONS_METRIC
 
   - key: hostDocuments.assistMaxCandidates
     source: derived
@@ -2261,9 +2566,12 @@ rows:
       file: crates/cog-extension/src/hostdocs.rs
       metric: ASSIST_QUESTION_FILES_METRIC
       label: source
+      cadence: event
     proof:
       file: crates/cog-extension/src/hostdocs.rs
       test: the_question_plan_follows_the_answered_question_and_the_beat_counts
+      beat: the_question_plan_follows_the_answered_question_and_the_beat_counts
+      evidence: ASSIST_PLAN_EVALUATIONS_METRIC
 
   - key: hostDocuments.maxPlanBytes
     source: fixed
@@ -2307,9 +2615,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: hostLedger.resources.requests.memory
     source: derived
@@ -2326,9 +2637,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: hostLedger.resources.limits.cpu
     source: derived
@@ -2346,9 +2660,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: hostLedger.resources.limits.memory
     source: derived
@@ -2364,9 +2681,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   # --- process census (per-node account of every container's processes) ------
   - key: processCensus.resources.requests.cpu
@@ -2384,9 +2704,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: processCensus.resources.requests.memory
     source: derived
@@ -2403,9 +2726,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: processCensus.resources.limits.cpu
     source: derived
@@ -2423,9 +2749,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: processCensus.resources.limits.memory
     source: derived
@@ -2441,9 +2770,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   # --- claim store (per-node account of claims and the image store) -----------
   - key: claimStore.port
@@ -2467,9 +2799,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: claimStore.resources.requests.memory
     source: derived
@@ -2486,9 +2821,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: claimStore.resources.limits.cpu
     source: derived
@@ -2506,9 +2844,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: claimStore.resources.limits.memory
     source: derived
@@ -2524,9 +2865,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: claimStore.scanIntervalSecs
     source: derived
@@ -2541,9 +2885,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-observability/src/claim_store.rs
       test: the_wait_after_a_walk_follows_what_the_walk_cost
+      beat: the_wait_after_a_walk_follows_what_the_walk_cost
+      evidence: evaluations
 
   - key: claimStore.imageScanIntervalSecs
     source: derived
@@ -2558,9 +2905,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-observability/src/image_store.rs
       test: the_wait_after_a_walk_follows_what_the_walk_cost
+      beat: the_wait_after_a_walk_follows_what_the_walk_cost
+      evidence: evaluations
 
   # --- mainline deployer ------------------------------------------------------
   - key: mainlineDeployer.cargoBuildJobs
@@ -2580,9 +2930,12 @@ rows:
       file: crates/cog-reflection/src/build_gate/mod.rs
       metric: BUILD_GATE_CARGO_JOBS
       label: role
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/build_gate/mod.rs
       test: cargo_jobs_follow_the_measured_cores_and_build_demand
+      beat: the_cargo_width_is_recomputed_every_window_and_published
+      evidence: BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL
 
   - key: mainlineDeployer.failureCooldownSecs
     source: derived
@@ -2597,9 +2950,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: a_second_environment_failure_stretches_the_cooldown
+      beat: a_second_environment_failure_stretches_the_cooldown
+      evidence: evaluations
 
   - key: mainlineDeployer.observabilityStack.intervalSecs
     source: derived
@@ -2613,9 +2969,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/observability_stack.rs
       test: the_convergence_wait_follows_what_a_round_cost
+      beat: the_convergence_wait_follows_what_a_round_cost
+      evidence: evaluations
 
 
   - key: mainlineDeployer.pollIntervalSecs
@@ -2630,9 +2989,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: the_mainline_wait_follows_what_a_cycle_cost
+      beat: the_mainline_wait_follows_what_a_cycle_cost
+      evidence: evaluations
 
   - key: mainlineDeployer.registryMaintenance.cooldownSecs
     source: derived
@@ -2647,9 +3009,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: the_reclaim_cooldown_follows_how_long_a_rebuild_held_the_service
+      beat: the_reclaim_cooldown_follows_how_long_a_rebuild_held_the_service
+      evidence: evaluations
 
   - key: mainlineDeployer.registryMaintenance.retention
     source: derived
@@ -2671,9 +3036,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: the_registry_retention_follows_the_volume_and_the_measured_rev_footprint
+      beat: the_registry_retention_follows_the_volume_and_the_measured_rev_footprint
+      evidence: evaluations
 
   - key: mainlineDeployer.registryMaintenance.threshold
     source: derived
@@ -2694,9 +3062,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: the_reclaim_threshold_follows_the_measured_growth_and_window
+      beat: the_reclaim_threshold_follows_the_measured_growth_and_window
+      evidence: evaluations
 
   - key: mainlineDeployer.rolloutJob.cpuRequest
     source: derived
@@ -2713,9 +3084,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
+      beat: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
+      evidence: evaluations
 
   - key: mainlineDeployer.rolloutJob.cpuLimit
     source: derived
@@ -2732,9 +3106,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
+      beat: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
+      evidence: evaluations
 
   - key: mainlineDeployer.rolloutJob.memoryRequest
     source: derived
@@ -2751,9 +3128,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
+      beat: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
+      evidence: evaluations
 
   - key: mainlineDeployer.rolloutJob.memoryLimit
     source: derived
@@ -2768,9 +3148,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
+      beat: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
+      evidence: evaluations
 
   - key: mainlineDeployer.rolloutTimeoutSecs
     source: derived
@@ -2785,9 +3168,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: a_measured_wait_turns_the_next_rollouts_declared_window
+      beat: a_measured_wait_turns_the_next_rollouts_declared_window
+      evidence: evaluations
 
   - key: mainlineDeployer.soakSecs
     source: derived
@@ -2800,9 +3186,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: a_measured_wait_turns_the_next_rollouts_declared_window
+      beat: a_measured_wait_turns_the_next_rollouts_declared_window
+      evidence: evaluations
 
   - key: mainlineDeployer.startupTimeoutSecs
     source: derived
@@ -2816,9 +3205,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/mainline_deployer.rs
       test: a_measured_wait_turns_the_next_rollouts_declared_window
+      beat: a_measured_wait_turns_the_next_rollouts_declared_window
+      evidence: evaluations
 
   # --- resource governance ----------------------------------------------------
   # The ceiling numbers are not chart values: they are projected from the rendered
@@ -2861,9 +3253,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: DEFAULT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: the_namespace_default_follows_the_measured_requests
+      beat: the_default_beat_counts_even_when_the_value_does_not_move
+      evidence: defaults_evaluations
 
   - key: resourceGovernance.limitRange.defaultMemory
     source: derived
@@ -2878,9 +3273,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: DEFAULT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: the_namespace_default_follows_the_measured_requests
+      beat: the_default_beat_counts_even_when_the_value_does_not_move
+      evidence: defaults_evaluations
 
   - key: resourceGovernance.limitRange.defaultRequestCpu
     source: derived
@@ -2896,9 +3294,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: DEFAULT_REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: the_namespace_default_follows_the_measured_requests
+      beat: the_default_beat_counts_even_when_the_value_does_not_move
+      evidence: defaults_evaluations
 
   - key: resourceGovernance.limitRange.defaultRequestMemory
     source: derived
@@ -2912,9 +3313,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: DEFAULT_REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: the_namespace_default_follows_the_measured_requests
+      beat: the_default_beat_counts_even_when_the_value_does_not_move
+      evidence: defaults_evaluations
 
   - key: resourceGovernance.limitRange.minCpu
     source: fixed
@@ -2972,9 +3376,12 @@ rows:
       file: crates/cog-core/src/build_cache_readings.rs
       metric: BUILD_TARGET_SCAN_INTERVAL_METRIC
       label: dir
+      cadence: periodic
     proof:
       file: crates/cog-extension/src/workdir.rs
       test: the_cache_walk_interval_follows_the_slowest_pass
+      beat: the_cache_walk_beat_counts_even_when_the_interval_does_not_move
+      evidence: scan_interval_evaluations
 
   - key: sandboxExecutor.maxTaskWorkspaces
     source: derived
@@ -3009,11 +3416,14 @@ rows:
       file: crates/cog-extension/src/workdir.rs
       metric: WORKSPACE_CAP_METRIC
       label: source
+      cadence: periodic
     proof:
       # Grows the measured footprint on the same router and reads a different
       # cap from the very next pass; the evaluation counter shows the beat ran.
       file: crates/cog-extension/src/workdir.rs
       test: the_worktree_cap_is_recomputed_from_the_volume_on_the_next_pass
+      beat: the_worktree_cap_is_recomputed_from_the_volume_on_the_next_pass
+      evidence: cap_evaluations
 
   - key: sandboxExecutor.warmTrees
     source: derived
@@ -3046,11 +3456,14 @@ rows:
       file: crates/cog-extension/src/workdir.rs
       metric: WARM_TREES_METRIC
       label: source
+      cadence: periodic
     proof:
       # Feeds the two measurements to the running router and reads the target
       # back on the next pass, with the evaluation counter moving with it.
       file: crates/cog-extension/src/workdir.rs
       test: the_warm_pool_target_is_recomputed_on_the_next_reclamation_pass
+      beat: the_warm_pool_target_is_recomputed_on_the_next_reclamation_pass
+      evidence: warm_trees_evaluations
 
   - key: sandboxExecutor.repoFetchIntervalSecs
     source: derived
@@ -3072,11 +3485,14 @@ rows:
       file: crates/cog-extension/src/workdir.rs
       metric: FETCH_INTERVAL_METRIC
       label: source
+      cadence: periodic
     proof:
       # Drives the observed stillness and the configured period and reads the
       # wait back: those two inputs are the whole of what it may depend on.
       file: crates/cog-extension/src/workdir.rs
       test: the_fetch_period_follows_how_long_main_was_still
+      beat: the_fetch_beat_counts_even_when_the_period_does_not_move
+      evidence: fetch_interval_evaluations
 
   - key: sandboxExecutor.resources.requests.cpu
     source: derived
@@ -3093,9 +3509,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: sandboxExecutor.resources.requests.memory
     source: derived
@@ -3112,9 +3531,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: sandboxExecutor.resources.limits.cpu
     source: derived
@@ -3132,9 +3554,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: sandboxExecutor.resources.limits.memory
     source: derived
@@ -3150,9 +3575,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: sandboxExecutor.storage
     source: derived
@@ -3163,9 +3591,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: sandboxExecutor.workspaceGcIntervalSecs
     source: derived
@@ -3180,9 +3611,12 @@ rows:
       file: crates/cog-extension/src/workdir.rs
       metric: GC_INTERVAL_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-extension/src/workdir.rs
       test: the_gc_interval_follows_the_slowest_pass_not_a_written_period
+      beat: the_gc_beat_counts_even_when_the_interval_does_not_move
+      evidence: gc_interval_evaluations
 
   - key: sandboxExecutor.workspaceTtlSecs
     source: derived
@@ -3204,9 +3638,12 @@ rows:
       file: crates/cog-extension/src/workdir.rs
       metric: TTL_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-extension/src/workdir.rs
       test: the_idle_ttl_follows_arrivals_and_capacity_not_reuse_gaps
+      beat: the_ttl_beat_counts_even_when_the_hold_time_does_not_move
+      evidence: ttl_evaluations
 
   # --- security gateway -------------------------------------------------------
   - key: securityGateway.auditedLlmMaxBodyBytes
@@ -3244,9 +3681,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REPLICAS_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_workload_replicas_follow_the_ready_node_count
+      beat: the_replica_beat_counts_even_when_the_node_count_does_not_move
+      evidence: replica_evaluations
 
   - key: securityGateway.gitMirror.stallSecs
     source: derived
@@ -3262,9 +3702,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-gateway/src/git_mirror.rs
       test: a_measured_silence_widens_the_window_the_next_transfer_is_judged_by
+      beat: a_measured_silence_widens_the_window_the_next_transfer_is_judged_by
+      evidence: evaluations
 
   - key: securityGateway.gitMirror.timeoutSecs
     source: derived
@@ -3279,9 +3722,12 @@ rows:
       file: crates/cog-core/src/pacing.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-gateway/src/git_mirror.rs
       test: a_measured_silence_widens_the_window_the_next_transfer_is_judged_by
+      beat: a_measured_silence_widens_the_window_the_next_transfer_is_judged_by
+      evidence: evaluations
 
   - key: securityGateway.gitMirror.storage
     source: derived
@@ -3292,9 +3738,12 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       metric: BYTES_METRIC
       label: state
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: outcome_count
 
   - key: securityGateway.resources.requests.cpu
     source: derived
@@ -3311,9 +3760,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: securityGateway.resources.requests.memory
     source: derived
@@ -3330,9 +3782,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: securityGateway.resources.limits.cpu
     source: derived
@@ -3350,9 +3805,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: securityGateway.resources.limits.memory
     source: derived
@@ -3368,9 +3826,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   # --- workspace quota (WebUI file surface) ---
   - key: workspaceFetch.connectTimeoutSecs
@@ -3426,9 +3887,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: webSearch.resources.requests.memory
     source: derived
@@ -3445,9 +3909,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: webSearch.resources.limits.cpu
     source: derived
@@ -3465,9 +3932,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: webSearch.resources.limits.memory
     source: derived
@@ -3483,9 +3953,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   # --- 网页抓取（渲染后端，Crawl4AI）------------------------------------------
   - key: webFetch.replicas
@@ -3505,9 +3978,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: SHM_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: the_shm_size_follows_the_measured_memory
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: webFetch.resources.requests.cpu
     source: derived
@@ -3524,9 +4000,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: webFetch.resources.requests.memory
     source: derived
@@ -3543,9 +4022,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: REQUEST_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: webFetch.resources.limits.cpu
     source: derived
@@ -3563,9 +4045,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_CPU_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   - key: webFetch.resources.limits.memory
     source: derived
@@ -3581,9 +4066,12 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       metric: LIMIT_MEMORY_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
+      beat: the_evaluation_counter_keeps_time_when_the_target_does_not_move
+      evidence: evaluations
 
   # --- platform webhook -------------------------------------------------------
   - key: webhook.nodePort
@@ -3821,9 +4309,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-storage/src/observability_event_cap.rs
       test: a_beat_whose_target_does_not_move_still_counts
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: evaluations
 
   - key: observability.eventLog.readWindowSeconds
     source: derived
@@ -3842,9 +4333,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-storage/src/observability_event_cap.rs
       test: the_read_window_follows_the_longest_question_asked
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: evaluations
 
   - key: checkpointStore.maxRows
     source: derived
@@ -3862,9 +4356,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-storage/src/checkpoint_cap.rs
       test: a_beat_whose_target_does_not_move_still_counts
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: evaluations
 
   - key: llmExchangeRetention.keepDays
     source: derived
@@ -3885,9 +4382,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-observability/src/exchange_retention.rs
       test: the_retention_follows_the_measured_daily_write
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: evaluations
 
   - key: taskEventRetention.keepDays
     source: derived
@@ -3908,9 +4408,12 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-storage/src/task_event_retention.rs
       test: the_retention_follows_the_measured_daily_write
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: evaluations
 
   - key: llmUsageRetention.keepDays
     source: derived
@@ -3931,7 +4434,10 @@ rows:
       file: crates/cog-core/src/retention.rs
       metric: TARGET_METRIC
       label: source
+      cadence: periodic
     proof:
       file: crates/cog-observability/src/usage_retention.rs
       test: the_retention_follows_the_measured_daily_write
+      beat: a_beat_whose_target_does_not_move_still_counts
+      evidence: evaluations
 

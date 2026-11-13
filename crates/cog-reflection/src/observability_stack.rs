@@ -1342,10 +1342,15 @@ mod tests {
             next_wait(Some(&pacer), Duration::from_secs(300), Duration::from_secs(900)),
             Duration::ZERO
         );
-        assert_eq!(
-            readings.target(INTERVAL_PACING),
-            Some((Duration::from_secs(900), 2, true))
-        );
+        let (target, evaluations, derived) = readings
+            .target(INTERVAL_PACING)
+            .expect("both waits were beats");
+        assert_eq!(target, Duration::from_secs(900));
+        // Two waits, two beats: a cadence that has not moved for hours and a
+        // stopped loop both read as a steady target, and only this count says
+        // which one is happening.
+        assert_eq!(evaluations, 2);
+        assert!(derived);
     }
 
     #[test]

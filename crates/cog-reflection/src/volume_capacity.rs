@@ -2546,6 +2546,23 @@ mod tests {
         }
     }
 
+    /// 目标不变的一拍仍然是一拍：连续两拍记下同一个结果，计数必须往上走。
+    ///
+    /// 界没动时，`outcome_count` 是唯一能说这条回路还在走的东西；没有它，
+    /// 一个安静卷与一条停摆的回路发布的是同一个形状。
+    #[test]
+    fn a_beat_whose_target_does_not_move_still_counts() {
+        let readings = VolumeCapacityReadings::new();
+        for expected in 1..=2 {
+            readings.record("cogneva-evolution-source-pvc", CapacityOutcome::AtTarget);
+            assert_eq!(
+                readings.outcome_count("cogneva-evolution-source-pvc", CapacityOutcome::AtTarget),
+                expected,
+                "a steady clock is still a round"
+            );
+        }
+    }
+
     fn target() -> ClaimTarget {
         ClaimTarget {
             claim: "cogneva-evolution-source-pvc".to_string(),
