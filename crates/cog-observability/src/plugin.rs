@@ -702,6 +702,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // frequent than the retention is wide. Runs beside the rollup on the
         // same store, and publishes what it retired so the promise is
         // checkable rather than merely declared.
+        // Both retention loops recompute their target from the measured cost of
+        // a day's writes against the declared database volume. They share one
+        // reading face, so the two knobs appear side by side with a beat count
+        // rather than as two unrelated gauges.
+        let retention_readings = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
+        ctx.publish_observable(retention_readings.clone());
+        let database_volume = cog_core::retention::database_volume_from_env();
         if let Some(store) = self.usage_store.clone() {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
@@ -712,7 +719,9 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             );
             let mut sweep =
                 crate::exchange_retention::ExchangeRetention::new(store.pool().clone(), keep)
-                    .with_deployment(crate::exchange_retention::deployment_name());
+                    .with_deployment(crate::exchange_retention::deployment_name())
+                    .with_database_volume(database_volume)
+                    .with_readings(retention_readings.clone());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 sweep = sweep.with_metrics(mb);
             }
@@ -735,7 +744,9 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 crate::usage_retention::keep_days_from_env() as u64 * 86_400,
             );
             let mut sweep = crate::usage_retention::UsageRetention::new(store.pool().clone(), keep)
-                .with_deployment(crate::usage_retention::deployment_name());
+                .with_deployment(crate::usage_retention::deployment_name())
+                .with_database_volume(database_volume)
+                .with_readings(retention_readings.clone());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 sweep = sweep.with_metrics(mb);
             }

@@ -45,7 +45,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: 96aa09224310e93cb1371707adea7f5433914e4cbf736ae41b1dc87d38b5eb6e
+        checksum/config: 804f230e74bc6c0b9ca3adef9ad4d6798ffaa7bdea1bc4a304e87a4e899cc04b
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -160,6 +160,10 @@ spec:
             # （判据 deploy/scripts/check-deployment-name-wiring.sh）。
             - name: COGNEVA_DEPLOYMENT_NAME
               value: cogneva
+            # 数据库卷的声明大小，与 chart 的 backends.postgres.storage 同源：保留回路
+            # 的容量一侧，每张表按实测每行/每日字节从自己那份卷里算目标。
+            - name: COGNEVA_DATABASE_STORAGE_BYTES
+              value: "10Gi"
             # 观测事件日志的容量与读窗口，与 chart 的 observability.eventLog 同源。
             # 容量是清理目标，读窗口是清理不许越过的线；窗口自己就超过容量时清理停手
             # 并把 cogneva_observability_events_over_capacity 置 1。置 0 = 不清理。
@@ -167,13 +171,12 @@ spec:
               value: "1000000"
             - name: COGNEVA_OBSERVABILITY_EVENT_READ_WINDOW_SECS
               value: "86400"
-            # 续跑点存储的容量与读窗口，与 chart 的 checkpointStore 同源。任务板指着
-            # 的那份快照与读窗口内的行都不许删；两条地板合起来超过容量时清理停手并把
-            # cogneva_checkpoints_over_capacity 置 1。置 0 = 不清理。
+            # 续跑点存储的容量，与 chart 的 checkpointStore 同源。任务板指着的那份
+            # 快照不许删（它是续跑点）；没有指针的名字就是残物，与年龄无关。指针
+            # 自己就超过容量时清理停手并把 cogneva_checkpoints_over_capacity 置 1。
+            # 置 0 = 不清理。
             - name: COGNEVA_CHECKPOINT_MAX_ROWS
               value: "40000"
-            - name: COGNEVA_CHECKPOINT_READ_WINDOW_SECS
-              value: "86400"
             # 提示词留底的保留天数，与 chart 的 llmExchangeRetention.keepDays 同源。
             # 清理循环跑在主应用里，把这个数发布成读数，告警拿它和最老一行的年龄比；
             # 1 以下退回 30。

@@ -70,12 +70,9 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: test-password
-          resources:
-            limits:
-              memory: 256Mi
-            requests:
-              cpu: 20m
-              memory: 64Mi
+          # 不声明资源：这是个装完就跑完的钩子 Job，跑不过几秒，没有可测量的
+          # 稳态；命名空间 LimitRange 的默认值是"容器不声明 resource 时按什么
+          # 算"，这一格正是它管的形状。这里再写一份只会是一个没人读的硬编码。
           volumeMounts:
             - name: bootstrap-script
               mountPath: /bootstrap

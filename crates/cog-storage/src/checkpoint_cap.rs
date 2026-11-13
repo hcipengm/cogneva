@@ -15,36 +15,38 @@
 //! restores the whole dump to prove it — so the garbage is paid for every night
 //! by a restore that has a per-pass budget to finish inside.
 //!
-//! Two things a sweep may never buy here, and they are different from the
-//! metrics sample log's floor and from the observability event log's:
+//! One thing a sweep may never buy here: **a snapshot a board points at is the
+//! resume point.** Losing it means a task cannot be resumed, and the board
+//! would still point at the id — a silent gap in exactly the mechanism this
+//! table exists for. The board is written before the old snapshot is deleted
+//! for the same reason, so the pointer is the only authority there is.
 //!
-//! - **A snapshot a board points at is the resume point.** Losing it means a
-//!   task cannot be resumed, and the board would still point at the id — a
-//!   silent gap in exactly the mechanism this table exists for. The board is
-//!   written before the old snapshot is deleted for the same reason, so the
-//!   pointer is the only authority there is.
-//! - **A snapshot younger than the read window is not deletable either.** The
-//!   snapshots view lists the newest first; a sweep that deleted inside that
-//!   window would answer a well-formed query with "no snapshots" while the
-//!   table is full.
+//! There is no age floor beside it, and none is needed: a row no board names
+//! is a leftover by construction, whatever its age — the round that wrote it
+//! has already pointed the board elsewhere, and no reader can reach it by task.
+//! An age floor would have been a number protecting a view that does not read
+//! this table by time, so it protected nothing.
 //!
-//! When the pointers and the window together hold more rows than the capacity
-//! allows, the sweep stops and says so. That state is a policy question and not
-//! a fault — the useful set is one checkpoint per live (task, role), boards are
-//! never retired, so the ceiling on what may be deleted is the number of tasks
-//! that have finished. Raising the capacity, retiring finished tasks' boards, or
-//! accepting the table's size are all answers, and none of them is a code
-//! change.
+//! When the pointers hold more rows than the capacity allows, the sweep stops
+//! and says so. That state is a policy question and not a fault: boards are
+//! never retired, so the ceiling on what may be deleted is the number of
+//! snapshots that have finished. Raising the capacity or retiring finished
+//! tasks' boards are both answers, and neither is a code change.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+use cog_core::retention::{
+    row_budget_against_volume, RetentionReadings, SOURCE_DERIVED, UNIT_ROWS,
+};
 use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
+
+/// The registry key this loop's target answers to.
+pub const KNOB: &str = "checkpointStore.maxRows";
 
 /// The table the checkpoint store writes.
 pub const SNAPSHOTS_TABLE: &str = "cog_snapshots";
@@ -76,19 +78,8 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 // cap: bound — 要给活集留出还能增长数倍的空间才算成为墙；这是不说自己容量的部署的默认值，不是策略
 pub const DEFAULT_MAX_ROWS: u64 = 40_000;
 
-/// How far back the snapshots view is promised rows, in seconds.
-///
-/// Not a retention knob — it is the floor the capacity may not cross. One day
-/// is four orders of magnitude wider than the view's default page (the newest
-/// hundred), so a reader that asks for the recent ones never sees a gap the
-/// sweep made.
-// cap: bound — 比视图默认那一页（最新一百行）宽四个数量级，所以问近期的人不会看见清扫挖出的缺口
-pub const DEFAULT_READ_WINDOW_SECS: u64 = 86_400;
-
-/// The environment variables that carry the two numbers.
+/// The environment variable that carries the row ceiling.
 pub const MAX_ROWS_ENV: &str = "COGNEVA_CHECKPOINT_MAX_ROWS";
-/// See [`MAX_ROWS_ENV`].
-pub const READ_WINDOW_ENV: &str = "COGNEVA_CHECKPOINT_READ_WINDOW_SECS";
 
 /// Longest the sweeper will wait between passes.
 ///
@@ -120,10 +111,18 @@ pub struct CheckpointSweepOutcome {
     pub removed: u64,
     /// The capacity the pass was aiming at; `None` when pruning is off.
     pub budget: Option<i64>,
-    /// Set when the board pointers and the read window together stopped the
+    /// The capacity this pass computed, whether or not it was allowed to prune
+    /// against it. Zero when the deployment opted out of pruning.
+    pub target: i64,
+    /// Which input decided `target` this pass: the deployment's seed, or the
+    /// measured cost of a row on the declared volume.
+    pub target_source: &'static str,
+    /// Set when the board pointers stopped the
     /// pass short of the capacity. The table is over budget and no amount of
     /// further sweeping may fix it.
     pub held_above: bool,
+    /// The table's size on disk when the pass started, when it could be read.
+    pub bytes: Option<u64>,
 }
 
 /// Holds the checkpoint store under a row capacity, outside the read window
@@ -132,9 +131,14 @@ pub struct CheckpointCap {
     pool: PgPool,
     table: String,
     boards: String,
-    budget: i64,
-    read_window: Duration,
+    /// The row ceiling this deployment declared. It is what a process with no
+    /// measured cost keeps, and zero turns pruning off.
+    seed_budget: i64,
+    /// The declared size of the database volume; with it and the measured cost
+    /// of a row, every pass recomputes the ceiling.
+    volume_bytes: Option<u64>,
     metrics: Option<Arc<dyn MetricsBackend>>,
+    readings: Option<Arc<RetentionReadings>>,
     role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
     deployment: Option<String>,
 }
@@ -156,17 +160,28 @@ impl CheckpointCap {
             pool,
             table: SNAPSHOTS_TABLE.to_string(),
             boards: BOARDS_TABLE.to_string(),
-            budget: budget as i64,
-            read_window: Duration::from_secs(DEFAULT_READ_WINDOW_SECS),
+            seed_budget: budget as i64,
+            volume_bytes: None,
             metrics: None,
+            readings: None,
             role: None,
             deployment: None,
         }
     }
 
-    /// The window below which no row is deletable.
-    pub fn with_read_window(mut self, window: Duration) -> Self {
-        self.read_window = window;
+    /// The declared size of the volume this table lives on.
+    ///
+    /// With a volume and a measured cost per row, every pass recomputes the row
+    /// ceiling; without one the deployment's seed stands. The volume itself
+    /// changes only with a resize, so it is read once.
+    pub fn with_database_volume(mut self, bytes: Option<u64>) -> Self {
+        self.volume_bytes = bytes;
+        self
+    }
+
+    /// Attach the reading face that carries this loop's target and beat count.
+    pub fn with_readings(mut self, readings: Arc<RetentionReadings>) -> Self {
+        self.readings = Some(readings);
         self
     }
 
@@ -257,9 +272,8 @@ impl CheckpointCap {
                             table = self.table,
                             held = outcome.held,
                             budget = outcome.budget,
-                            window_secs = self.read_window.as_secs(),
                             "Checkpoint store is over capacity and cannot be pruned further: \
-                             every remaining row is a board pointer or inside the read window"
+                             every remaining row is a board pointer"
                         );
                     }
                     period = next_period(previous, &outcome);
@@ -287,17 +301,28 @@ impl CheckpointCap {
     }
 
     /// Measure the table and prune nothing.
+    ///
+    /// The ceiling is still computed: this deployment is not the one allowed to
+    /// prune, but the reading it publishes is the same function of the same
+    /// measurements, so a reader does not have to ask which replica swept.
     pub async fn measure_once(&self) -> SFResult<CheckpointSweepOutcome> {
+        let held = self.row_count().await?;
+        let bytes = self.table_bytes().await;
+        let (target, target_source) =
+            row_budget_against_volume(self.seed_budget, self.volume_bytes, held, bytes);
         Ok(CheckpointSweepOutcome {
-            held: self.row_count().await?,
+            held,
             removed: 0,
             budget: None,
+            target,
+            target_source,
             held_above: false,
+            bytes,
         })
     }
 
     /// Delete oldest-first until the table is within capacity, or until every
-    /// row left is a board pointer or inside the read window.
+    /// row left is a board pointer.
     pub async fn sweep_once(&self) -> SFResult<CheckpointSweepOutcome> {
         self.sweep_once_beating(|| {}).await
     }
@@ -320,11 +345,17 @@ impl CheckpointCap {
         progress: impl Fn(),
     ) -> SFResult<CheckpointSweepOutcome> {
         let held = self.row_count().await?;
+        let bytes = self.table_bytes().await;
+        let (target, target_source) =
+            row_budget_against_volume(self.seed_budget, self.volume_bytes, held, bytes);
         let mut outcome = CheckpointSweepOutcome {
             held,
             removed: 0,
-            budget: self.budget_enabled().then_some(self.budget),
+            budget: self.budget_enabled().then_some(target),
+            target,
+            target_source,
             held_above: false,
+            bytes,
         };
 
         let Some(budget) = outcome.budget else {
@@ -334,7 +365,6 @@ impl CheckpointCap {
             return Ok(outcome);
         }
 
-        let cutoff = Utc::now() - chrono::Duration::from_std(self.read_window).unwrap_or_default();
         let mut remaining = held - budget;
         // The pass stops early only on a batch that took nothing. That is not
         // the same claim as the count read back afterwards still standing above
@@ -344,9 +374,7 @@ impl CheckpointCap {
         let mut stalled = false;
         while remaining > 0 {
             progress();
-            let batch = self
-                .delete_surplus(BATCH_ROWS.min(remaining), cutoff)
-                .await?;
+            let batch = self.delete_surplus(BATCH_ROWS.min(remaining)).await?;
             outcome.removed += batch;
             remaining -= batch as i64;
             if batch == 0 {
@@ -362,11 +390,10 @@ impl CheckpointCap {
 
     /// Delete up to `limit` rows older than `cutoff` that no board points at,
     /// oldest first.
-    async fn delete_surplus(&self, limit: i64, cutoff: DateTime<Utc>) -> SFResult<u64> {
+    async fn delete_surplus(&self, limit: i64) -> SFResult<u64> {
         let sql = delete_surplus_sql(&self.table, &self.boards);
         Ok(sqlx::query(&sql)
             .bind(limit.max(1))
-            .bind(cutoff)
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))?
@@ -374,12 +401,36 @@ impl CheckpointCap {
     }
 
     fn budget_enabled(&self) -> bool {
-        self.budget > 0
+        self.seed_budget > 0
+    }
+
+    /// What the table costs on disk, when it can be read.
+    async fn table_bytes(&self) -> Option<u64> {
+        match crate::relation_bytes::relation_bytes(&self.pool, &self.table).await {
+            Ok(bytes) => Some(bytes.max(0) as u64),
+            Err(e) => {
+                warn!(table = self.table, error = %e, "checkpoint store size unavailable");
+                None
+            }
+        }
     }
 
     /// Publish what the table holds, what it may hold, whether the floor is
     /// what stops it, and what it costs on disk.
     async fn report(&self, outcome: &CheckpointSweepOutcome) {
+        // The beat goes out even when nothing else does: a deployment that
+        // holds no lease still recomputes the ceiling, and a stopped loop and a
+        // steady table would otherwise read the same.
+        if self.budget_enabled() {
+            if let Some(ref readings) = self.readings {
+                readings.evaluate(
+                    KNOB,
+                    outcome.target as f64,
+                    UNIT_ROWS,
+                    outcome.target_source == SOURCE_DERIVED,
+                );
+            }
+        }
         let Some(ref mb) = self.metrics else { return };
 
         self.emit(
@@ -407,12 +458,9 @@ impl CheckpointCap {
             .await;
         }
 
-        match crate::relation_bytes::relation_bytes(&self.pool, &self.table).await {
-            Ok(bytes) => {
-                self.emit(mb, cog_core::metric_names::CHECKPOINTS_BYTES, bytes as f64)
-                    .await
-            }
-            Err(e) => warn!(table = self.table, error = %e, "checkpoint store size unavailable"),
+        if let Some(bytes) = outcome.bytes {
+            self.emit(mb, cog_core::metric_names::CHECKPOINTS_BYTES, bytes as f64)
+                .await;
         }
     }
 
@@ -464,16 +512,14 @@ async fn publish_pass_outcome(
 /// Exported rather than inlined so a test explains the text the sweep executes
 /// rather than a copy of it.
 ///
-/// `$1` is the batch size and `$2` the cutoff. Three things hold at once:
-/// nothing at or after the cutoff goes (the read window), nothing a board field
-/// names goes (the resume point), and what does go is the oldest first, so the
-/// index on `timestamp` answers the order and the cutoff in one scan.
+/// `$1` is the batch size. Two things hold at once: nothing a board field names
+/// goes (the resume point), and what does go is the oldest first, so the index
+/// on `timestamp` answers the order in one scan.
 pub fn delete_surplus_sql(table: &str, boards: &str) -> String {
     format!(
         "DELETE FROM {table} WHERE snapshot_id IN (
              SELECT s.snapshot_id FROM {table} s
-             WHERE s.timestamp < $2
-               AND NOT EXISTS (
+             WHERE NOT EXISTS (
                    SELECT 1 FROM {boards} b WHERE b.field_value = s.snapshot_id
                )
              ORDER BY s.timestamp, s.snapshot_id
@@ -529,34 +575,21 @@ pub fn max_rows_from(raw: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_MAX_ROWS)
 }
 
-/// The read window this process was promised, or the default.
-pub fn read_window_from_env() -> Duration {
-    read_window_from(std::env::var(READ_WINDOW_ENV).ok().as_deref())
-}
-
-/// See [`read_window_from_env`].
-///
-/// A window of zero would make every row deletable the moment it is written, so
-/// a zero or unparsable value falls back to the default instead — the floor is
-/// the promise to readers, and no configuration may remove it.
-pub fn read_window_from(raw: Option<&str>) -> Duration {
-    let secs = raw
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(DEFAULT_READ_WINDOW_SECS);
-    Duration::from_secs(secs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use cog_core::retention::SOURCE_SEED;
 
     fn outcome(held: i64, budget: Option<i64>, held_above: bool) -> CheckpointSweepOutcome {
         CheckpointSweepOutcome {
             held,
             removed: 0,
             budget,
+            target: budget.unwrap_or(0),
+            target_source: SOURCE_SEED,
             held_above,
+            bytes: None,
         }
     }
 
@@ -604,9 +637,9 @@ mod tests {
     /// literal. A rewrite that dropped the board exclusion would still delete
     /// rows — and would delete the resume point of a running task.
     #[test]
-    fn the_delete_statement_keeps_the_window_the_order_and_the_pointers() {
+    fn the_delete_statement_keeps_the_order_and_the_pointers() {
         let sql = delete_surplus_sql("cog_snapshots", "cog_context_boards");
-        assert!(sql.contains("s.timestamp < $2"), "{sql}");
+        assert!(!sql.contains("s.timestamp < $"), "no age floor: {sql}");
         assert!(
             sql.contains("NOT EXISTS (\n                   SELECT 1 FROM \"cog_context_boards\" b WHERE b.field_value = s.snapshot_id"),
             "the board pointer has to be an exclusion in the statement itself: {sql}"
@@ -651,9 +684,51 @@ mod tests {
         );
     }
 
+    /// 目标不变的一拍仍然是一拍：读数上的求值计数必须往上走，来源标签必须
+    /// 从 seed 变成 derived。没有这一条，「回路在算」就只剩启动时那一次。
+    #[tokio::test]
+    async fn a_beat_whose_target_does_not_move_still_counts() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://probe:probe@127.0.0.1:1/probe")
+            .expect("lazy pool");
+        let readings = Arc::new(RetentionReadings::new());
+        let cap = CheckpointCap::new(pool, 40_000)
+            .with_readings(Arc::clone(&readings));
+
+        cap.report(&CheckpointSweepOutcome {
+            held: 1_000,
+            removed: 0,
+            budget: Some(524_288),
+            target: 524_288,
+            target_source: SOURCE_DERIVED,
+            held_above: false,
+            bytes: Some(1024 * 1024),
+        })
+        .await;
+        let first = readings.reading(KNOB).expect("first beat");
+        assert_eq!(first.0, 524_288.0);
+        assert_eq!(first.1, 1);
+        assert!(first.2, "the target came from a measurement");
+
+        // 同一个目标：值不变，计数必须变。
+        cap.report(&CheckpointSweepOutcome {
+            held: 1_000,
+            removed: 0,
+            budget: Some(524_288),
+            target: 524_288,
+            target_source: SOURCE_DERIVED,
+            held_above: false,
+            bytes: Some(1024 * 1024),
+        })
+        .await;
+        let second = readings.reading(KNOB).expect("second beat");
+        assert_eq!(second.0, 524_288.0);
+        assert_eq!(second.1, 2, "a steady target is still a beat");
+        assert_eq!(readings.evaluations(KNOB), 2);
+    }
+
     /// A bound that cannot be read falls back instead of switching the sweep
-    /// off, and a read window of zero is refused rather than honoured: the
-    /// floor is a promise, and no environment variable may remove it.
+    /// off; an explicit zero is how a deployment opts out.
     #[test]
     fn a_bound_that_cannot_be_read_falls_back_instead_of_switching_off() {
         assert_eq!(max_rows_from(Some("not a number")), DEFAULT_MAX_ROWS);
@@ -663,14 +738,5 @@ mod tests {
             0,
             "an explicit zero is how a deployment opts out"
         );
-        assert_eq!(
-            read_window_from(Some("0")),
-            Duration::from_secs(DEFAULT_READ_WINDOW_SECS)
-        );
-        assert_eq!(
-            read_window_from(Some("nope")),
-            Duration::from_secs(DEFAULT_READ_WINDOW_SECS)
-        );
-        assert_eq!(read_window_from(Some("3600")), Duration::from_secs(3_600));
     }
 }

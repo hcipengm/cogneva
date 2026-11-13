@@ -6,6 +6,11 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: gateway
+  annotations:
+    # 副本数由集群就绪节点数决定（两个是「任意一台可以不见」的最小集合），
+    # 启动预算由实测启动时长决定；两个回路都只改带标记的对象。
+    cogneva.io/replica-policy: topology
+    cogneva.io/startup-policy: measured
 spec:
   replicas: {{ .Values.gateway.replicas }}
   # Surge by one, keep both ready during the handoff: the old pod serves until
@@ -136,6 +141,11 @@ spec:
             # （判据 deploy/scripts/check-deployment-name-wiring.sh）。
             - name: COGNEVA_DEPLOYMENT_NAME
               value: cogneva
+            # 数据库卷的声明大小。保留回路的容量一侧：每张表按自己的实测每行
+            # 字节（或每日写入字节）从这里分到的那份卷里算出目标，改卷只需改
+            # 这个值；表的实测成本来自表自身的读数，二者每拍重算。
+            - name: COGNEVA_DATABASE_STORAGE_BYTES
+              value: {{ .Values.backends.postgres.storage | quote }}
             # 观测事件日志的容量与读窗口。这条表只追加、且从没有过删除者，于是它的
             # 大小就是平台在线时长乘以事件速率——运维每天备份、演练每趟恢复的都是
             # 它。两个数是一对：容量是清理目标，读窗口是清理不许越过的线（历史事件
@@ -145,16 +155,14 @@ spec:
               value: {{ .Values.observability.eventLog.maxRows | int | quote }}
             - name: COGNEVA_OBSERVABILITY_EVENT_READ_WINDOW_SECS
               value: {{ .Values.observability.eventLog.readWindowSeconds | int | quote }}
-            # 续跑点存储的容量与读窗口。每轮巡检写一份新快照、把任务板指过去，然后
-            # 才删被替下的那份——所以任务板是指针的唯一权威，其余都是残物。任务结束
+            # 续跑点存储的容量。每轮巡检写一份新快照、把任务板指过去，然后才删
+            # 被替下的那份——所以任务板是指针的唯一权威，其余都是残物。任务结束
             # 后最后那份没人删（任务板从不退役），于是这张表的大小是「活着的续跑点
-            # 加上每个跑完过的任务的最后一份」。两个数是一对：容量是清理目标，读窗口
-            # 与任务板指针是清理不许越过的两条线——删掉指针指着的那份等于让这个任务
-            # 再也续不上，而指针还在。属主由租约选举；置 0 = 本 Pod 不参与清理。
+            # 加上每个跑完过的任务的最后一份」。容量是清理目标；任务板指针是清理
+            # 不许越过的那条线——删掉指针指着的那份等于让这个任务再也续不上，而
+            # 指针还在。属主由租约选举；置 0 = 本 Pod 不参与清理。
             - name: COGNEVA_CHECKPOINT_MAX_ROWS
               value: {{ .Values.checkpointStore.maxRows | int | quote }}
-            - name: COGNEVA_CHECKPOINT_READ_WINDOW_SECS
-              value: {{ .Values.checkpointStore.readWindowSeconds | int | quote }}
             # 提示词留底（gateway_llm_exchange）的保留期。保底的是「一次调用到底发了
             # 什么、回来什么」这件事后能答而不必再买一次；成本由单次正文大小决定，
             # 所以只按时间封顶。清理循环跑在主应用里而不是网关里——网关每次滚动都重启，

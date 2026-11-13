@@ -39,6 +39,17 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+use cog_core::retention::{
+    longest_read_span, read_window_secs, row_budget_against_volume, RetentionReadings,
+    SOURCE_DERIVED, UNIT_ROWS, UNIT_SECONDS,
+};
+
+/// The registry key this loop's target answers to.
+pub const KNOB: &str = "observability.eventLog.maxRows";
+
+/// The registry key this loop's read window answers to.
+pub const KNOB_READ_WINDOW: &str = cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_KNOB;
+
 use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
 
 /// The append-only event log written by the observability gateway.
@@ -76,7 +87,8 @@ pub const DEFAULT_MAX_ROWS: u64 = 1_000_000;
 /// matches the default window of the historical-events query, so a reader that
 /// asks for what it asks for by default never sees a gap the sweep made.
 // cap: bound — 不是保留旋钮，是容量不许越过的地板：与历史事件查询的默认窗同值，按默认问的人不会看见清扫挖出的缺口
-pub const DEFAULT_READ_WINDOW_SECS: u64 = 86_400;
+pub const DEFAULT_READ_WINDOW_SECS: u64 =
+    cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS;
 
 /// The environment variables that carry the two numbers.
 ///
@@ -85,7 +97,7 @@ pub const DEFAULT_READ_WINDOW_SECS: u64 = 86_400;
 /// process that runs the loop is the one the deployment told.
 pub const MAX_ROWS_ENV: &str = "COGNEVA_OBSERVABILITY_EVENT_MAX_ROWS";
 /// See [`MAX_ROWS_ENV`].
-pub const READ_WINDOW_ENV: &str = "COGNEVA_OBSERVABILITY_EVENT_READ_WINDOW_SECS";
+pub const READ_WINDOW_ENV: &str = cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_ENV;
 
 /// Longest the sweeper will wait between passes.
 ///
@@ -122,9 +134,23 @@ pub struct EventSweepOutcome {
     pub removed: u64,
     /// The capacity the pass was aiming at; `None` when pruning is off.
     pub budget: Option<i64>,
+    /// The capacity this pass computed, whether or not it was allowed to prune
+    /// against it. Zero when the deployment opted out of pruning.
+    pub target: i64,
+    /// Which input decided `target` this pass: the deployment's seed, or the
+    /// measured cost of a row on the declared volume.
+    pub target_source: &'static str,
     /// Set when the read window stopped the pass short of the capacity. The
     /// table is over budget and no amount of further sweeping may fix it.
     pub window_held: bool,
+    /// The table's size on disk when the pass started, when it could be read.
+    pub bytes: Option<u64>,
+    /// The floor this pass enforced: the declaration, widened by the longest
+    /// span a reader actually asked for.
+    pub window_secs: u64,
+    /// Whether `window_secs` was widened by a measurement rather than standing
+    /// on the declaration.
+    pub window_derived: bool,
 }
 
 /// Holds the observability event log under a row capacity, outside the read
@@ -132,9 +158,15 @@ pub struct EventSweepOutcome {
 pub struct EventLogCap {
     pool: PgPool,
     table: String,
-    budget: i64,
+    /// The row ceiling this deployment declared. It is what a process with no
+    /// measured cost keeps, and zero turns pruning off.
+    seed_budget: i64,
+    /// The declared size of the database volume; with it and the measured cost
+    /// of a row, every pass recomputes the ceiling.
+    volume_bytes: Option<u64>,
     read_window: Duration,
     metrics: Option<Arc<dyn MetricsBackend>>,
+    readings: Option<Arc<RetentionReadings>>,
     role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
     deployment: Option<String>,
 }
@@ -155,12 +187,35 @@ impl EventLogCap {
         Self {
             pool,
             table: EVENTS_TABLE.to_string(),
-            budget: budget as i64,
+            seed_budget: budget as i64,
+            volume_bytes: None,
             read_window: Duration::from_secs(DEFAULT_READ_WINDOW_SECS),
             metrics: None,
+            readings: None,
             role: None,
             deployment: None,
         }
+    }
+
+    /// The declared size of the volume this table lives on.
+    ///
+    /// With a volume and a measured cost per row, every pass recomputes the row
+    /// ceiling; without one the deployment's seed stands. The volume itself
+    /// changes only with a resize, so it is read once.
+    pub fn with_database_volume(mut self, bytes: Option<u64>) -> Self {
+        self.volume_bytes = bytes;
+        self
+    }
+
+    /// Attach the reading face that carries this loop's target and beat count.
+    pub fn with_readings(mut self, readings: Arc<RetentionReadings>) -> Self {
+        self.readings = Some(readings);
+        self
+    }
+
+    /// The floor this beat enforces, and whether a reader's question widened it.
+    fn effective_read_window(&self) -> (u64, bool) {
+        read_window_secs(self.read_window.as_secs(), longest_read_span(KNOB_READ_WINDOW))
     }
 
     /// The window below which no row is deletable.
@@ -257,7 +312,7 @@ impl EventLogCap {
                             table = self.table,
                             held = outcome.held,
                             budget = outcome.budget,
-                            window_secs = self.read_window.as_secs(),
+                            window_secs = outcome.window_secs,
                             "Observability event log is over capacity and cannot be pruned \
                              further without deleting rows inside the read window"
                         );
@@ -295,11 +350,21 @@ impl EventLogCap {
     /// process that is not pruning reports as `None` is exactly the one it is
     /// not enforcing.
     pub async fn measure_once(&self) -> SFResult<EventSweepOutcome> {
+        let held = self.row_count().await?;
+        let bytes = self.table_bytes().await;
+        let (target, target_source) =
+            row_budget_against_volume(self.seed_budget, self.volume_bytes, held, bytes);
+        let (window_secs, window_derived) = self.effective_read_window();
         Ok(EventSweepOutcome {
-            held: self.row_count().await?,
+            held,
             removed: 0,
             budget: None,
+            target,
+            target_source,
             window_held: false,
+            bytes,
+            window_secs,
+            window_derived,
         })
     }
 
@@ -323,11 +388,20 @@ impl EventLogCap {
     /// on the queue.
     pub async fn sweep_once_beating(&self, progress: impl Fn()) -> SFResult<EventSweepOutcome> {
         let held = self.row_count().await?;
+        let bytes = self.table_bytes().await;
+        let (target, target_source) =
+            row_budget_against_volume(self.seed_budget, self.volume_bytes, held, bytes);
+        let (window_secs, window_derived) = self.effective_read_window();
         let mut outcome = EventSweepOutcome {
             held,
             removed: 0,
-            budget: self.budget_enabled().then_some(self.budget),
+            budget: self.budget_enabled().then_some(target),
+            target,
+            target_source,
             window_held: false,
+            bytes,
+            window_secs,
+            window_derived,
         };
 
         let Some(budget) = outcome.budget else {
@@ -337,7 +411,9 @@ impl EventLogCap {
             return Ok(outcome);
         }
 
-        let cutoff = Utc::now() - chrono::Duration::from_std(self.read_window).unwrap_or_default();
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(Duration::from_secs(outcome.window_secs))
+                .unwrap_or_default();
         let mut remaining = held - budget;
         // The pass stops early only on a batch that took nothing. That is not
         // the same claim as the count read back afterwards still standing above
@@ -376,12 +452,46 @@ impl EventLogCap {
     }
 
     fn budget_enabled(&self) -> bool {
-        self.budget > 0
+        self.seed_budget > 0
+    }
+
+    /// What the table costs on disk, when it can be read.
+    async fn table_bytes(&self) -> Option<u64> {
+        match crate::relation_bytes::relation_bytes(&self.pool, &self.table).await {
+            Ok(bytes) => Some(bytes.max(0) as u64),
+            Err(e) => {
+                warn!(table = self.table, error = %e, "event log size unavailable");
+                None
+            }
+        }
     }
 
     /// Publish what the table holds, what it may hold, whether the window is
     /// what stops it, and what it costs on disk.
     async fn report(&self, outcome: &EventSweepOutcome) {
+        // The beat goes out even when nothing else does: a deployment that
+        // holds no lease still recomputes the ceiling, and a stopped loop and a
+        // steady table would otherwise read the same.
+        if self.budget_enabled() {
+            if let Some(ref readings) = self.readings {
+                readings.evaluate(
+                    KNOB,
+                    outcome.target as f64,
+                    UNIT_ROWS,
+                    outcome.target_source == SOURCE_DERIVED,
+                );
+            }
+        }
+        // The floor is a promise to readers whether or not this deployment
+        // prunes, and its beat is the same evidence as the ceiling's.
+        if let Some(ref readings) = self.readings {
+            readings.evaluate(
+                KNOB_READ_WINDOW,
+                outcome.window_secs as f64,
+                UNIT_SECONDS,
+                outcome.window_derived,
+            );
+        }
         let Some(ref mb) = self.metrics else { return };
 
         self.emit(
@@ -409,16 +519,13 @@ impl EventLogCap {
             .await;
         }
 
-        match crate::relation_bytes::relation_bytes(&self.pool, &self.table).await {
-            Ok(bytes) => {
-                self.emit(
-                    mb,
-                    cog_core::metric_names::OBSERVABILITY_EVENTS_BYTES,
-                    bytes as f64,
-                )
-                .await
-            }
-            Err(e) => warn!(table = self.table, error = %e, "event log size unavailable"),
+        if let Some(bytes) = outcome.bytes {
+            self.emit(
+                mb,
+                cog_core::metric_names::OBSERVABILITY_EVENTS_BYTES,
+                bytes as f64,
+            )
+            .await;
         }
     }
 
@@ -543,24 +650,88 @@ pub fn read_window_from_env() -> Duration {
 /// a zero or unparsable value falls back to the default instead — the floor is
 /// the promise to readers, and no configuration may remove it.
 pub fn read_window_from(raw: Option<&str>) -> Duration {
-    let secs = raw
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(DEFAULT_READ_WINDOW_SECS);
-    Duration::from_secs(secs)
+    Duration::from_secs(cog_core::retention::read_window_seed(
+        raw,
+        DEFAULT_READ_WINDOW_SECS,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::retention::SOURCE_SEED;
 
     fn outcome(held: i64, budget: Option<i64>, window_held: bool) -> EventSweepOutcome {
         EventSweepOutcome {
             held,
             removed: 0,
             budget,
+            target: budget.unwrap_or(0),
+            target_source: SOURCE_SEED,
             window_held,
+            bytes: None,
+            window_secs: DEFAULT_READ_WINDOW_SECS,
+            window_derived: false,
         }
+    }
+
+    /// 目标不变的一拍仍然是一拍：求值计数往上走，来源标签从 seed 变成
+    /// derived。没有这一条，「回路在算」就只剩启动时那一次。
+    #[tokio::test]
+    async fn a_beat_whose_target_does_not_move_still_counts() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://probe:probe@127.0.0.1:1/probe")
+            .expect("lazy pool");
+        let readings = Arc::new(RetentionReadings::new());
+        let cap = EventLogCap::new(pool, 100_000).with_readings(Arc::clone(&readings));
+
+        for expected in 1..=2 {
+            cap.report(&EventSweepOutcome {
+                held: 80_000,
+                removed: 0,
+                budget: Some(120_000),
+                target: 120_000,
+                target_source: SOURCE_DERIVED,
+                window_held: false,
+                bytes: Some(64 * 1024 * 1024),
+                window_secs: DEFAULT_READ_WINDOW_SECS,
+                window_derived: false,
+            })
+            .await;
+            let (target, beats, derived) = readings.reading(KNOB).expect("a beat");
+            assert_eq!(target, 120_000.0);
+            assert_eq!(beats, expected, "a steady target is still a beat");
+            assert_eq!(readings.evaluations(KNOB), expected);
+            // The read window is recomputed and recorded by the same pass, so
+            // its count has to move with the ceiling's.
+            assert_eq!(readings.evaluations(KNOB_READ_WINDOW), expected);
+            assert!(derived);
+        }
+    }
+
+    /// 地板跟着读者实际问过的跨度走：问得更宽，下一拍就变宽并标 derived；
+    /// 问得比声明窄，声明仍是生效值。
+    #[tokio::test]
+    async fn the_read_window_follows_the_longest_question_asked() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://probe:probe@127.0.0.1:1/probe")
+            .expect("lazy pool");
+        let cap = EventLogCap::new(pool, 100_000);
+        assert_eq!(
+            cap.effective_read_window(),
+            (DEFAULT_READ_WINDOW_SECS, false)
+        );
+        cog_core::retention::record_read_span(KNOB_READ_WINDOW, DEFAULT_READ_WINDOW_SECS / 2);
+        assert_eq!(
+            cap.effective_read_window(),
+            (DEFAULT_READ_WINDOW_SECS, false),
+            "a narrower question does not shrink the floor"
+        );
+        cog_core::retention::record_read_span(KNOB_READ_WINDOW, DEFAULT_READ_WINDOW_SECS * 7);
+        assert_eq!(
+            cap.effective_read_window(),
+            (DEFAULT_READ_WINDOW_SECS * 7, true)
+        );
     }
 
     fn pass_ago(held: i64, secs: u64) -> Option<PreviousPass> {

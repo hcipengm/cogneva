@@ -261,6 +261,11 @@ spec:
               value: {{ .Values.hostDocuments.assistBodyBytes | int64 | quote }}
             - name: HOST_DOCS_ASSIST_MAX_CANDIDATES
               value: {{ .Values.hostDocuments.assistMaxCandidates | int64 | quote }}
+            # 受审通道自己那条正文上限。执行器用它给探针封顶：超过它的问题注定被
+            # 通道拒，而那道拒绝在读数面上与"上游撑不下"同形。两个值同源一次下发，
+            # 各写一个数时执行器会一直探到通道拒绝为止。
+            - name: HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES
+              value: {{ .Values.securityGateway.auditedLlmMaxBodyBytes | int64 | quote }}
             {{- end }}
           startupProbe:
             httpGet:

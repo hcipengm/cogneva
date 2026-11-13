@@ -44,6 +44,12 @@ pub const BACKUP_RUNS_LOOP: &str = "backup_runs";
 /// is not changing the other.
 pub const BACKUP_RUNS_ROLE: &str = "backup_runs";
 
+/// 读数上点名这一格的标签名，与 [`crate::LABEL_READOUT`] 同一个词。
+///
+/// 本文件同时发布指标名与这格的名字；登记表要在**一个**文件里读到两者，而把
+/// 标签抄成一个字符串字面量会让它与其他账本的 `readout` 各自漂移。
+pub const READOUT_LABEL: &str = crate::LABEL_READOUT;
+
 /// How long one round waits for the next.
 ///
 /// The account changes at most a few times a day -- a run opens, and it closes
@@ -493,6 +499,20 @@ fn age_seconds(now: DateTime<Utc>, instant: DateTime<Utc>) -> f64 {
     (now - instant).num_seconds().max(0) as f64
 }
 
+/// How long ago the newest run concluded, as the loop publishes it.
+///
+/// Public because it is the last-beat reading of the run that derives the keep
+/// count: the run writes a fresh `finished_at` every time, even when the count
+/// it computed did not move, and this age is what a reader sees advance. A
+/// steady `keep_target` beside an advancing age is a loop that is running; the
+/// target alone cannot tell that from a loop that stopped.
+pub fn latest_finish_age_seconds(
+    account: &BackupAccountReading,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    account.latest_finish_at.map(|at| age_seconds(now, at))
+}
+
 /// The value of one readout, or `None` when the account has nothing to say for
 /// it.
 ///
@@ -512,9 +532,7 @@ fn value_of(
         BackupReadout::RunsOk => Some(account.ok as f64),
         BackupReadout::RunsFailed => Some(account.failed as f64),
         BackupReadout::RunsAbandoned => Some(account.abandoned as f64),
-        BackupReadout::LatestFinishAgeSeconds => {
-            account.latest_finish_at.map(|at| age_seconds(now, at))
-        }
+        BackupReadout::LatestFinishAgeSeconds => latest_finish_age_seconds(account, now),
         BackupReadout::LatestSuccessAgeSeconds => account
             .newest_package
             .as_ref()
@@ -713,10 +731,7 @@ async fn publish_account_once(
                 continue;
             };
             let mut labels = HashMap::new();
-            labels.insert(
-                crate::LABEL_READOUT.to_string(),
-                readout.as_str().to_string(),
-            );
+            labels.insert(READOUT_LABEL.to_string(), readout.as_str().to_string());
             if let Err(e) = metrics
                 .record_gauge(metric_names::BACKUP_RUN_READINGS, value, labels)
                 .await

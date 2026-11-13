@@ -337,6 +337,15 @@ impl Observable for StreamPendingObservable {
 /// but it is the same number on each of them.
 pub const TASK_ROUTER_CLAIM_SLOTS_METRIC: &str = "cogneva_task_router_claim_slots";
 
+/// 普通车道的认领上限算过几拍。
+///
+/// 窗口没变时界应当停在原地，所以「这个回路还在算」不能由界本身来答；没有这一条，
+/// 一个停摆的导出循环与一个安静窗口在 `claim_slots` 上是同一个数。它数的是
+/// **读到了窗口并算出了界**的拍子：读不到池子或测量不足以定界的那一拍没有求值，
+/// 那不是「算出来没变」，是「没有可算的输入」。
+pub const TASK_ROUTER_CLAIM_BOUND_EVALUATIONS_METRIC: &str =
+    "cogneva_task_router_claim_bound_evaluations_total";
+
 /// 停摆判据用的那个窗口，以及撑起它的样本数。
 ///
 /// 两条读数缺一不可。窗口本身是判「一个尝试停住了没有」的唯一尺度；样本数是
@@ -356,7 +365,8 @@ pub const STALL_GAP_SAMPLES_METRIC: &str = "cogneva_stall_gap_samples";
 /// 之后唯一看得见的样子。注册表的 `derived` 行要求发布方自己说出这一格（见
 /// `deploy/helm/cogneva/tunables.yaml` 与 `tunable_registry_contract_test.rs`）。
 pub const CLAIM_SLOTS_SOURCE_LABEL: &str = crate::outward::LABEL_SOURCE;
-/// 界由读数导出（`lane_memory` 每窗重算）。
+/// 界由读数导出：`lane_memory` 每窗按容器内存重算，普通车道每窗按池子的额度
+/// 窗口重算。
 pub const SOURCE_DERIVED: &str = "derived";
 /// 界由部署钉死（环境变量给了正数）。
 pub const SOURCE_OVERRIDE: &str = "override";
@@ -493,6 +503,9 @@ fn budget_bound_seconds(
 pub struct ClaimSlotsObservable {
     streams: std::sync::Mutex<HashMap<String, ClaimStreamState>>,
     next_token: AtomicU64,
+    /// 普通车道的界被重算过几次；见
+    /// [`TASK_ROUTER_CLAIM_BOUND_EVALUATIONS_METRIC`]。
+    bound_evaluations: AtomicU64,
 }
 
 impl ClaimSlotsObservable {
@@ -500,7 +513,19 @@ impl ClaimSlotsObservable {
         Self {
             streams: std::sync::Mutex::new(HashMap::new()),
             next_token: AtomicU64::new(0),
+            bound_evaluations: AtomicU64::new(0),
         }
+    }
+
+    /// 这一拍按窗口重算过一次普通车道的认领上限。目标可以不动，这一格每拍都动。
+    pub fn record_bound_evaluation(&self) {
+        self.bound_evaluations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 普通车道的界被重算过几拍；见
+    /// [`TASK_ROUTER_CLAIM_BOUND_EVALUATIONS_METRIC`]。
+    pub fn bound_evaluations(&self) -> u64 {
+        self.bound_evaluations.load(Ordering::Relaxed)
     }
 
     fn streams(&self) -> std::sync::MutexGuard<'_, HashMap<String, ClaimStreamState>> {
@@ -615,6 +640,12 @@ impl Observable for ClaimSlotsObservable {
                 window.as_secs_f64(),
             ));
         }
+        // 求值计数是进程级的一条：上限是同一个回路算出来的，写回共用它的每条流
+        // 的是同一个数；挂在每条流下面会把它数成几份。
+        out.push(RawMetric::new(
+            TASK_ROUTER_CLAIM_BOUND_EVALUATIONS_METRIC,
+            self.bound_evaluations.load(Ordering::Relaxed) as f64,
+        ));
         for (stream, state) in streams.iter() {
             // Only the streams that registered exist here, so a stream this
             // process does not read publishes nothing rather than a zero.
@@ -649,6 +680,119 @@ impl Observable for ClaimSlotsObservable {
                         .with_label(crate::LABEL_STREAM, stream.as_str()),
                 );
             }
+        }
+        Ok(out)
+    }
+
+    async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
+        Ok(Vec::new())
+    }
+
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        Vec::new()
+    }
+}
+
+// -- the change ledger's batch bound --
+
+/// 一拍把几条欠账并成一道变更，作为 gauge，带 `source` 标签。
+///
+/// 与 `cogneva_task_router_claim_slots` 同一个形状：同一个数有两种来路——按图里
+/// 已完成/已退回的批次量出来的界，和部署钉死的一个数。没有这条读数，导出的界
+/// 与钉死的界在抓取面上同形，一个停在一个数上的回路看不出它停在哪儿。
+pub const ROWS_PER_HANDOVER_METRIC: &str = "cogneva_change_ledger_rows_per_handover";
+
+/// 批大小从图里的批次重算过几拍。
+///
+/// 界只在某批落地或退回时动，输入安静时不动才是对的；这条计数分开「算子还
+/// 在跑、只是没有新证据」与「算子停了、界冻在最后一次的值」。
+pub const ROWS_PER_HANDOVER_EVALUATIONS_METRIC: &str =
+    "cogneva_change_ledger_rows_per_handover_evaluations_total";
+
+static ROWS_PER_HANDOVER: OnceLock<Arc<RowsPerHandoverObservable>> = OnceLock::new();
+
+/// 进程级的批大小读数。变更账的一拍写它，抓取面读它。
+pub fn rows_per_handover_observable() -> Arc<RowsPerHandoverObservable> {
+    ROWS_PER_HANDOVER
+        .get_or_init(|| Arc::new(RowsPerHandoverObservable::new()))
+        .clone()
+}
+
+/// 变更账一拍用的批大小，以及它是从哪来的。
+///
+/// 第一拍之前**不发**：一个还没跑过的回路没有「现在用几」可报，发 0 会被读成
+/// 一批零条。见 [`ROWS_PER_HANDOVER_METRIC`]。
+#[derive(Default)]
+pub struct RowsPerHandoverObservable {
+    bound: AtomicU64,
+    /// 0 = 还没算过，1 = 导出的，2 = 钉死的。见 [`SOURCE_DERIVED`] /
+    /// [`SOURCE_OVERRIDE`]。
+    source: AtomicU64,
+    evaluations: AtomicU64,
+}
+
+impl RowsPerHandoverObservable {
+    const UNRECORDED: u64 = 0;
+    const DERIVED: u64 = 1;
+    const OVERRIDE: u64 = 2;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 这一拍算出的界（算出来没变也写）与它的来路。
+    pub fn record(&self, bound: usize, source: &'static str) {
+        self.bound.store(bound as u64, Ordering::Relaxed);
+        self.source.store(
+            if source == SOURCE_DERIVED {
+                Self::DERIVED
+            } else {
+                Self::OVERRIDE
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// 这一拍按图里的批次重算过一次。目标可以不动，这一格每拍都动；钉死的界
+    /// 没有算子，不记这一格。
+    pub fn record_evaluation(&self) {
+        self.evaluations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn published(&self) -> Option<(usize, &'static str)> {
+        match self.source.load(Ordering::Relaxed) {
+            Self::UNRECORDED => None,
+            Self::DERIVED => Some((self.bound.load(Ordering::Relaxed) as usize, SOURCE_DERIVED)),
+            _ => Some((self.bound.load(Ordering::Relaxed) as usize, SOURCE_OVERRIDE)),
+        }
+    }
+
+    pub fn bound(&self) -> Option<usize> {
+        self.published().map(|(bound, _)| bound)
+    }
+
+    pub fn source(&self) -> Option<&'static str> {
+        self.published().map(|(_, source)| source)
+    }
+
+    pub fn evaluations(&self) -> u64 {
+        self.evaluations.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl Observable for RowsPerHandoverObservable {
+    async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
+        let mut out = Vec::new();
+        out.push(RawMetric::new(
+            ROWS_PER_HANDOVER_EVALUATIONS_METRIC,
+            self.evaluations() as f64,
+        ));
+        if let Some((bound, source)) = self.published() {
+            out.push(
+                RawMetric::new(ROWS_PER_HANDOVER_METRIC, bound as f64)
+                    .with_label(CLAIM_SLOTS_SOURCE_LABEL, source),
+            );
         }
         Ok(out)
     }
@@ -1525,6 +1669,76 @@ mod tests {
         assert!(
             metric(&released, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC).is_none(),
             "许可放回之后不许留下一个 0 的上界"
+        );
+    }
+
+    /// 批大小读数：第一拍之前不发这个数，钉子与导出的来路分开，求值计数只在
+    /// 导出的那一支动。
+    ///
+    /// 这三件事都是注册表那一行在读数面上的兑现：`derived` 行要求发布方自己
+    /// 说出 `source`，B7 的证明要求「输入变了下一次重算跟着变」之外还有一条
+    /// 「重算确实在跑」的证据——界不动时那只能是求值计数。
+    #[tokio::test]
+    async fn the_batch_bound_publishes_its_source_and_the_beats_that_recompute_it() {
+        let observer = RowsPerHandoverObservable::new();
+        let before = observer.collect_metrics("D8").await.unwrap();
+        assert!(
+            metric(&before, ROWS_PER_HANDOVER_METRIC).is_none(),
+            "第一拍之前没有「现在用几」可报，发 0 会被读成一批零条"
+        );
+        assert_eq!(
+            metric(&before, ROWS_PER_HANDOVER_EVALUATIONS_METRIC)
+                .unwrap()
+                .value,
+            0.0
+        );
+
+        observer.record(5, SOURCE_DERIVED);
+        observer.record_evaluation();
+        let derived = observer.collect_metrics("D8").await.unwrap();
+        let gauge = metric(&derived, ROWS_PER_HANDOVER_METRIC).unwrap();
+        assert_eq!(gauge.value, 5.0);
+        assert_eq!(
+            gauge.labels.get(CLAIM_SLOTS_SOURCE_LABEL).map(String::as_str),
+            Some(SOURCE_DERIVED)
+        );
+        assert_eq!(
+            metric(&derived, ROWS_PER_HANDOVER_EVALUATIONS_METRIC)
+                .unwrap()
+                .value,
+            1.0
+        );
+
+        // 目标不动，计数照动：这正是「界安静」与「回路停了」的分界。
+        observer.record(5, SOURCE_DERIVED);
+        observer.record_evaluation();
+        let again = observer.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            metric(&again, ROWS_PER_HANDOVER_METRIC).unwrap().value,
+            5.0
+        );
+        assert_eq!(
+            metric(&again, ROWS_PER_HANDOVER_EVALUATIONS_METRIC)
+                .unwrap()
+                .value,
+            2.0
+        );
+
+        // 钉死的界没有算子：读数说出 `override`，求值计数不动。
+        observer.record(8, SOURCE_OVERRIDE);
+        let pinned = observer.collect_metrics("D8").await.unwrap();
+        let gauge = metric(&pinned, ROWS_PER_HANDOVER_METRIC).unwrap();
+        assert_eq!(gauge.value, 8.0);
+        assert_eq!(
+            gauge.labels.get(CLAIM_SLOTS_SOURCE_LABEL).map(String::as_str),
+            Some(SOURCE_OVERRIDE)
+        );
+        assert_eq!(
+            metric(&pinned, ROWS_PER_HANDOVER_EVALUATIONS_METRIC)
+                .unwrap()
+                .value,
+            2.0,
+            "钉死的那一支没有算子，求值计数不能假装它在算"
         );
     }
 

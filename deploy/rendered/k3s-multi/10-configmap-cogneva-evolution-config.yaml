@@ -103,8 +103,8 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: "120"
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: "3600"
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: "6"
-  # 变更验证那一趟的编译宽度。白名单会把它带进判据进程（`CARGO_BUILD_JOBS`）；不进
-  # 主线部署器的构建——那条路自己显式设这个变量。
+  # 变更验证那一趟的编译宽度种子。两条构建路径（验证与主线）在派生子进程时都会用
+  # 构建闸当拍量出的宽度覆盖它；这里只是没有闸、或还没有一拍测量时的种子。
   CARGO_BUILD_JOBS: "3"
   # 集群内 registry 那张卷的容量回收。声明量只有一个来源（PVC 自己的 spec），所以
   # 这里不配"卷有多大"；这里配的是判据与保留策略，占用读数取自 registry Pod 里只读
@@ -138,4 +138,3 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_STACK_MANIFEST_DIR: "deploy/k3s/observability/manifests"
   COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE: "monitoring"
   COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS: "true"
-  COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES: "6"

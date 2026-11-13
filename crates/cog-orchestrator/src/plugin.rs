@@ -329,6 +329,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         // the bus stopped answering or because this process had no permit to
         // take another message, and only these series can tell a reader which.
         ctx.publish_observable(crate::observable::claim_slots_observable());
+        // The change ledger's batch size, written by the pass and read here.
+        // Published even before the first pass writes it: the observable then
+        // renders only the evaluation counter, which is the honest reading of a
+        // loop that has not decided anything yet -- the alternative is a zero
+        // on the gauge, and a batch of zero rows is not what "not yet
+        // evaluated" means.
+        ctx.publish_observable(crate::observable::rows_per_handover_observable());
         // The current shape of the task graph, read from the executor that owns
         // it. Separate from the D1 counters above: those meter this process's
         // outcomes, this one reports the graph itself, which outlives the
@@ -912,10 +919,20 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             .shared_orchestrator
                             .clone()
                             .expect("shared orchestrator");
-                        let exec_loop = exec_loop.as_ref().clone().with_orchestrator(Arc::new(
-                            crate::OrchestratorControlImpl::new(orchestrator),
-                        )
-                            as Arc<dyn cog_core::OrchestratorControl>);
+                        let exec_loop = exec_loop
+                            .as_ref()
+                            .clone()
+                            .with_orchestrator(Arc::new(
+                                crate::OrchestratorControlImpl::new(orchestrator),
+                            )
+                                as Arc<dyn cog_core::OrchestratorControl>)
+                            // The pool's window is what the ordinary lane's claim
+                            // bound is derived from. Attached here because `start`
+                            // runs after every plugin's `init`, and the supervisor
+                            // publishes it during its own.
+                            .with_pool_status_source(
+                                ctx.consume_service::<dyn cog_core::LlmPoolStatusSource>(),
+                            );
                         tokio::spawn(async move {
                             if let Err(e) = exec_loop
                                 .run_consumer(

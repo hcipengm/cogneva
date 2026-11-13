@@ -113,6 +113,7 @@ ring = "0.17"
 # （起容器里的 MCP server），不是测试——放在 dev-dependencies 里只有测试 profile 编译得过，
 # `cargo build` 会红。
 serde_yaml = "0.9"
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

@@ -91,8 +91,8 @@ impl Scratch {
             .collect()
     }
 
-    fn cap(&self, pool: &PgPool, budget: u64, window_secs: u64) -> CheckpointCap {
-        CheckpointCap::new(pool.clone(), budget).with_read_window(Duration::from_secs(window_secs))
+    fn cap(&self, pool: &PgPool, budget: u64) -> CheckpointCap {
+        CheckpointCap::new(pool.clone(), budget)
     }
 
     async fn done(&self) {
@@ -130,7 +130,7 @@ async fn scratch(case: &str) -> (Scratch, PgPool) {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn unreferenced_rows_past_the_window_go_oldest_first() {
+async fn unreferenced_rows_go_oldest_first() {
     let (scratch, pool) = scratch("oldest_first").await;
     for n in 0..5 {
         scratch
@@ -142,7 +142,7 @@ async fn unreferenced_rows_past_the_window_go_oldest_first() {
         .await;
 
     let outcome = scratch
-        .cap(&pool, 2, 3_600)
+        .cap(&pool, 2)
         .sweep_once()
         .await
         .expect("sweep");
@@ -150,13 +150,11 @@ async fn unreferenced_rows_past_the_window_go_oldest_first() {
     assert_eq!(outcome.removed, 4, "four rows have to go to reach two");
     assert_eq!(outcome.held, 2);
     assert!(!outcome.held_above, "the capacity was reachable");
-    // Four of the five old rows go, oldest first: what survives is the
-    // youngest of them, plus the row inside the window that was never a
-    // candidate.
+    // Four of the six go, oldest first: what survives is the two youngest.
     assert_eq!(
         scratch.ids(&pool).await,
-        vec!["old-0".to_string(), "recent".to_string()],
-        "the oldest go first, and the row inside the window is not a candidate at all"
+        vec!["old-4".to_string(), "recent".to_string()],
+        "the oldest go first, and nothing but a board pointer is exempt"
     );
 
     scratch.done().await;
@@ -179,7 +177,7 @@ async fn a_snapshot_a_board_names_survives_at_any_age() {
     scratch.point_at(&pool, "task-resume", "resume").await;
 
     let outcome = scratch
-        .cap(&pool, 1, 3_600)
+        .cap(&pool, 1)
         .sweep_once()
         .await
         .expect("sweep");
@@ -204,61 +202,26 @@ async fn a_snapshot_a_board_names_survives_at_any_age() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_snapshot_inside_the_window_survives_even_unreferenced() {
-    let (scratch, pool) = scratch("window").await;
-    scratch
-        .snapshot(&pool, "just-outside", ChronoDuration::seconds(3_700))
-        .await;
-    scratch
-        .snapshot(&pool, "just-inside", ChronoDuration::seconds(3_500))
-        .await;
-
-    let outcome = scratch
-        .cap(&pool, 1, 3_600)
-        .sweep_once()
-        .await
-        .expect("sweep");
-
-    assert_eq!(outcome.removed, 1, "only the row outside the window goes");
-    assert_eq!(
-        scratch.ids(&pool).await,
-        vec!["just-inside".to_string()],
-        "the window is the floor: not one row inside it may go"
-    );
-
-    scratch.done().await;
-}
-
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_store_the_pointers_and_the_window_hold_over_capacity_says_so() {
+async fn a_store_the_pointers_hold_over_capacity_says_so() {
     let (scratch, pool) = scratch("held_above").await;
-    // Five unreferenced rows inside the window, all of them over a capacity of
-    // one. Reaching the capacity would mean deleting rows a reader may still
-    // ask for, so the pass has to stop and say so.
-    for n in 0..5 {
-        scratch
-            .snapshot(
-                &pool,
-                &format!("recent-{n}"),
-                ChronoDuration::minutes(10 + n),
-            )
-            .await;
+    // Three rows a board names, all over a capacity of one. Reaching the
+    // capacity would mean deleting a resume point, so the pass has to stop and
+    // say so rather than report the capacity met.
+    for n in 0..3 {
+        let id = format!("resume-{n}");
+        scratch.snapshot(&pool, &id, ChronoDuration::days(10 + n)).await;
+        scratch.point_at(&pool, &format!("task-{n}"), &id).await;
     }
 
-    let outcome = scratch
-        .cap(&pool, 1, 3_600)
-        .sweep_once()
-        .await
-        .expect("sweep");
+    let outcome = scratch.cap(&pool, 1).sweep_once().await.expect("sweep");
 
-    assert_eq!(outcome.removed, 0, "nothing inside the window is deletable");
-    assert_eq!(outcome.held, 5);
+    assert_eq!(outcome.removed, 0, "nothing a board names is deletable");
+    assert_eq!(outcome.held, 3);
     assert!(
         outcome.held_above,
-        "a table the floor holds over budget must say so, not report the capacity met"
+        "a table the pointers hold over budget must say so, not report the capacity met"
     );
-    assert_eq!(scratch.ids(&pool).await.len(), 5);
+    assert_eq!(scratch.ids(&pool).await.len(), 3);
 
     scratch.done().await;
 }
@@ -289,7 +252,7 @@ async fn a_pass_that_needs_more_than_one_batch_reports_progress_between_them() {
     let beats = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&beats);
     let outcome = scratch
-        .cap(&pool, 1, 1)
+        .cap(&pool, 1)
         .sweep_once_beating(move || {
             counter.fetch_add(1, Ordering::Relaxed);
         })
@@ -318,7 +281,7 @@ async fn a_pass_with_pruning_off_deletes_nothing() {
     }
 
     let outcome = scratch
-        .cap(&pool, 0, 3_600)
+        .cap(&pool, 0)
         .sweep_once()
         .await
         .expect("sweep");

@@ -2006,6 +2006,7 @@ dependencies = [
  "filetime",
  "futures",
  "hex",
+ "libc",
  "notify 6.1.1",
  "redis",
  "reqwest 0.12.28",

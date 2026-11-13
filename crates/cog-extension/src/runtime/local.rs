@@ -351,7 +351,14 @@ pub(crate) fn spawn_command(
             let stalled = stalled.clone();
             let task_id = task_id.clone();
             tokio::spawn(async move {
-                let mut burned: Option<(u64, u64)> = None;
+                // Read the counters once before the first judgement, not on the
+                // first tick: a change can only be seen against an earlier
+                // reading, and the read tick is a full second while the window
+                // can be a few milliseconds. Without this first sample a command
+                // that burns CPU from its first instant looked static at the
+                // first tick -- the tick that also exceeds the window -- and was
+                // killed for the one thing it was doing.
+                let mut burned: Option<(u64, u64)> = group.and_then(cog_core::progress::cpu_ticks);
                 loop {
                     tokio::time::sleep(cog_core::progress::WATCH_TICK).await;
                     if let Some(pid) = group {
@@ -543,8 +550,20 @@ mod tests {
     use super::*;
 
     fn req(payload: SandboxPayload) -> SandboxRequest {
+        // A fresh id per request, not one shared literal. The beacon table is
+        // process-wide and keyed by task id, so a fixed `"t"` made every
+        // command in this file refresh every other test's beacon: the silence
+        // test's `sleep 30` stayed "moving" whenever a sibling test ran a
+        // command, and it finished normally instead of being judged. The
+        // tests that judge a silence serialise against each other, but the
+        // ordinary command tests here do not take that lock and would still
+        // keep beating for them.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         SandboxRequest {
-            task_id: "t".into(),
+            task_id: format!(
+                "t{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
             agent_id: "test".into(),
             payload,
             input: serde_json::json!({}),

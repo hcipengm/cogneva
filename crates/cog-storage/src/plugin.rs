@@ -1536,6 +1536,15 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // capacity may not cross, because the historical-events view asks for
         // the last day and a sweep that deleted inside it would answer a
         // well-formed query with a silent gap.
+        // Every retention loop in this process reports through one reading
+        // face: the target each beat computed, the unit it is in, whether its
+        // input was measured, and how many beats it has run. A target that does
+        // not move between beats is correct; the beat count is what separates a
+        // steady table from a stopped sweep.
+        let retention_readings =
+            std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
+        ctx.publish_observable(retention_readings.clone());
+        let database_volume = cog_core::retention::database_volume_from_env();
         let event_max_rows = crate::observability_event_cap::max_rows_from_env();
         let event_read_window = crate::observability_event_cap::read_window_from_env();
         if let Some(pool) = self.pg_pool.clone() {
@@ -1545,6 +1554,8 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 .unwrap_or_default();
             let mut cap = crate::EventLogCap::new(pool, event_max_rows)
                 .with_read_window(event_read_window)
+                .with_database_volume(database_volume)
+                .with_readings(retention_readings.clone())
                 .with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 cap = cap.with_metrics(mb);
@@ -1576,19 +1587,19 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // of it travels in the nightly backup whose restore the drill has to
         // finish inside a budget.
         //
-        // The floor is two-part and neither half is a knob: a row a board points
-        // at is the resume point, and a row inside the read window is what the
-        // snapshots view is promised. A sweep that crossed either would answer a
-        // well-formed question with a silent gap.
+        // The floor is the board pointer, and it is not a knob: a row a board
+        // points at is the resume point, so a sweep that crossed it would answer
+        // a well-formed question with a silent gap. A row no board names is a
+        // leftover whatever its age — nothing reads this table by time.
         let checkpoint_max_rows = crate::checkpoint_cap::max_rows_from_env();
-        let checkpoint_read_window = crate::checkpoint_cap::read_window_from_env();
         if let Some(pool) = self.pg_pool.clone() {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
             let mut cap = crate::CheckpointCap::new(pool, checkpoint_max_rows)
-                .with_read_window(checkpoint_read_window)
+                .with_database_volume(database_volume)
+                .with_readings(retention_readings.clone())
                 .with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 cap = cap.with_metrics(mb);
@@ -1600,11 +1611,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             if checkpoint_max_rows == 0 {
                 info!("Checkpoint capacity disabled (max rows = 0)");
             } else {
-                info!(
-                    checkpoint_max_rows,
-                    read_window_secs = checkpoint_read_window.as_secs(),
-                    "Checkpoint capacity started"
-                );
+                info!(checkpoint_max_rows, "Checkpoint capacity started");
             }
         } else {
             info!("Checkpoint capacity disabled (no PostgreSQL pool)");
@@ -1630,8 +1637,10 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 .unwrap_or_default();
             let keep = task_event_keep_days
                 .map(|days| std::time::Duration::from_secs(days as u64 * 86_400));
-            let mut sweep =
-                crate::TaskEventRetention::new(pool, keep).with_deployment(deployment_name());
+            let mut sweep = crate::TaskEventRetention::new(pool, keep)
+                .with_database_volume(database_volume)
+                .with_readings(retention_readings.clone())
+                .with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 sweep = sweep.with_metrics(mb);
             }

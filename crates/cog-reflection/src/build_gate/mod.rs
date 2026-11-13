@@ -395,6 +395,24 @@ const SERVED_FILE: &str = "builds.served";
 // cap: bound — 远超实际不同名字数的上界：丢一行只多让一轮，文件大了是每次仲裁都扫一遍
 const SERVED_RECORD_CAP: usize = 64;
 
+/// How many cargo jobs one build gets, from the same measurement the gate uses
+/// to decide how many builds fit: the host's cores divided by what one build
+/// demands of them.
+///
+/// Declared here rather than in the contract half beside the other gate names:
+/// nothing outside this crate reads it yet, and a new metric name is not a
+/// reason to make every crate rebuild.
+pub const BUILD_GATE_CARGO_JOBS: &str = "cogneva_build_gate_cargo_jobs";
+
+/// Windows in which [`BUILD_GATE_CARGO_JOBS`] was recomputed.
+///
+/// The width can stay the same for days on a host whose core count and build
+/// demand do not move, so "the reading is live" needs a count rather than the
+/// gauge: without it, a width frozen because the derivation stopped looks
+/// exactly like a stable host.
+pub const BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL: &str =
+    "cogneva_build_gate_cargo_jobs_evaluations_total";
+
 /// Claims on the next build that lapsed before anyone used them, as a counter
 /// carrying the `asker` that made the claim.
 ///
@@ -485,6 +503,18 @@ impl WalkOutcome {
 // cap: bound — 构建以分钟计，它只决定一个空出来的槽多快被捡走
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The registry key this gate's wait budget is declared under, and the name its
+/// reading is published under.
+pub const WAIT_PACING: &str = "evolution.buildGate.waitSecs";
+
+/// The shortest wait worth handing a caller: two polls. A budget under one poll
+/// never re-asks, which is `try_acquire` under another name, and the gate would
+/// report a refusal it never actually waited for. This is a floor on what a
+/// measurement may derive, not a value anybody configures.
+fn wait_floor() -> Duration {
+    POLL_INTERVAL * 2
+}
+
 /// How many turns in a row an exclusion stands down for someone else's claim on
 /// the next build before it takes the field anyway.
 ///
@@ -558,6 +588,19 @@ pub fn install(cfg: &BuildGateConfig) -> Arc<BuildGate> {
 /// The process-wide gate, when one has been installed.
 pub fn global() -> Option<Arc<BuildGate>> {
     GLOBAL.get().cloned()
+}
+
+/// How many cargo jobs one build should fan out over, from the latest window's
+/// measurement of the host.
+///
+/// `None` means this process has no gate in force or no window has measured a
+/// host yet: the caller keeps its declared seed, exactly as the gate itself
+/// falls back to the declaration when the host cannot be read. The width is
+/// read at the moment a build is spawned, so a build started after the window
+/// that changed the host uses the new share without a restart.
+pub fn cargo_jobs() -> Option<u64> {
+    let width = global()?.job_width.load(Ordering::Relaxed);
+    (width > 0).then_some(width)
 }
 
 /// Records the peak resident memory of a build this process ran.
@@ -686,6 +729,8 @@ impl Observable for InactiveBuildGate {
                 dir: &dir_identity(Path::new(&self.dir)),
                 role: BUILD_GATE_ROLE_CONTROL_PLANE,
             },
+            0,
+            0,
             0,
         ))
     }
@@ -822,7 +867,7 @@ struct HostLoad {
 /// the volume a non-root build must not plan on. A filesystem that cannot be
 /// read contributes no reading rather than a zero -- "this volume is full" and
 /// "nothing could be asked about this volume" are different facts.
-fn disk_bytes(dir: &Path) -> Option<u64> {
+pub(crate) fn disk_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     // SAFETY: `statvfs` writes into the `statvfs` it is given and retains
@@ -1784,6 +1829,27 @@ fn io_outside_credit(
     Some(since.min(IO_SAMPLE_HORIZON))
 }
 
+/// How many cargo jobs one build gets, from the host's cores and the share one
+/// build is booked for.
+///
+/// The gate already measured both numbers for its own question: how many builds
+/// the CPU can host at once is cores divided by one build's demand. Giving each
+/// admitted build that same share is what makes the two readings agree -- cargo
+/// fans a build out over exactly the cores the gate booked for it, so the gate's
+/// admission arithmetic and the build's own parallelism are the same measurement
+/// rather than two guesses. A width wider than the box is never useful, so the
+/// result is capped at the core count.
+///
+/// `None` when either reading is missing or impossible (no cores, a demand of
+/// zero): the caller then keeps its declared seed instead of inventing a width.
+fn cargo_jobs_for(cores: f64, demand_cores: f64) -> Option<u64> {
+    if !cores.is_finite() || cores < 1.0 || !demand_cores.is_finite() || demand_cores <= 0.0 {
+        return None;
+    }
+    let width = (cores / demand_cores).floor().max(1.0);
+    Some(width.min(cores.floor()) as u64)
+}
+
 /// The whole series set, in one place: a reader that has to tell "no bound here"
 /// from "this deployment never reported" cannot do it if the two sources of the
 /// set can drift.
@@ -1795,6 +1861,8 @@ fn readings(
     c: Counters,
     origin: Origin<'_>,
     wait_budget_ms: u64,
+    cargo_jobs: u64,
+    cargo_job_evaluations: u64,
 ) -> Vec<RawMetric> {
     let label = |m: RawMetric| {
         m.with_label(
@@ -1899,6 +1967,15 @@ fn readings(
         label(RawMetric::new(
             BUILD_GATE_WAIT_BUDGET_MS,
             wait_budget_ms as f64,
+        )),
+        // Zero means no window has derived a width yet, not "cargo gets no
+        // jobs": the consumers fall back to their declared seed until this
+        // moves, and the counter beside it is what separates "stable" from
+        // "stopped".
+        label(RawMetric::new(BUILD_GATE_CARGO_JOBS, cargo_jobs as f64)),
+        label(RawMetric::new(
+            BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL,
+            cargo_job_evaluations as f64,
         )),
     ]);
     out
@@ -2352,6 +2429,13 @@ pub struct BuildGate {
     /// measurement that cannot see the deployment's other users.
     fixed: Option<usize>,
     wait: Duration,
+    /// The waits that actually happened, as the loop's one input. A wait
+    /// shorter than one poll is not recorded: it says a slot was free, which is
+    /// what "no wait" means, and a window full of those would drive the budget
+    /// to its floor and turn every busy moment into an immediate refusal. What
+    /// the budget is sized by is how long a caller had to wait when it did.
+    wait_budget: Arc<cog_core::pacing::TailBudget>,
+    pacing: Arc<cog_core::pacing::PacingReadings>,
     installed: bool,
     /// The bound this process derived last, as the number it is enforcing; 0
     /// before any measurement.
@@ -2359,6 +2443,14 @@ pub struct BuildGate {
     /// The ceiling of that measurement: what the host could take if it stayed
     /// quiet, before the control law's say. 0 before any measurement.
     measured_ceiling: AtomicU64,
+    /// The core count of the machine this process landed on, read once. The
+    /// core count does not change while the process lives, so the pinned gate
+    /// can derive the cargo width without taking a host sample of its own.
+    host_cores: u64,
+    /// The cargo job width the latest window derived; 0 before any window.
+    job_width: AtomicU64,
+    /// Windows in which that width was recomputed.
+    job_width_evaluations: AtomicU64,
     /// The integer the last window held after the dead band, which is what the
     /// next window damps against. Kept apart from `measured_ceiling` because
     /// that one is the measurement as it stands, published as such: a reader
@@ -2532,14 +2624,27 @@ impl BuildGate {
         if cfg.enabled {
             installed = create_slot_dir(&dir).is_ok();
         }
+        let wait = Duration::from_secs(cfg.wait_secs);
+        let host_cores = HostFacts::read().map(|host| host.cores).unwrap_or(0);
+        let pacing = Arc::new(cog_core::pacing::PacingReadings::new());
+        // The seed is the declared budget and nothing else: a gate that has
+        // never made anybody wait has no measurement to overrule it with. The
+        // floor is structural (two polls), so a measured budget can be short
+        // but never a budget that cannot poll.
+        let wait_budget = pacing.tail(WAIT_PACING, wait, wait_floor(), 2.0);
         Self {
             fixed: (cfg.max_concurrent > 0).then_some(cfg.max_concurrent),
-            wait: Duration::from_secs(cfg.wait_secs),
+            wait,
+            wait_budget,
+            pacing,
             installed,
             dir,
             tuning: fit_to_host(Tuning::from_config(cfg)),
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
+            host_cores,
+            job_width: AtomicU64::new(0),
+            job_width_evaluations: AtomicU64::new(0),
             held_ceiling: AtomicU64::new(0),
             per_build_io: AtomicU64::new(0),
             occupancy_avg: AtomicU64::new(0),
@@ -2889,6 +2994,18 @@ impl BuildGate {
         next
     }
 
+    /// Derives the cargo job width from a host core count and publishes it.
+    ///
+    /// Called from every window (and from every ask on a pinned gate), so the
+    /// evaluations counter answers "is this still being computed" even when the
+    /// number itself has not moved for days.
+    fn derive_cargo_jobs(&self, cores: f64) {
+        if let Some(width) = cargo_jobs_for(cores, self.tuning.build_demand_cores) {
+            self.job_width.store(width, Ordering::Relaxed);
+            self.job_width_evaluations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Re-derives the bound, at most once per window, and persists it where this
     /// process is the one elected to.
     ///
@@ -2916,6 +3033,17 @@ impl BuildGate {
         // facts disagreeing that this directory exists to prevent. Written by
         // the controller only, and only when it disagrees.
         if let Some(fixed) = self.fixed {
+            // A pinned gate measures no bound, but the core count is a reading
+            // the host gave once and the cargo width is a function of it. The
+            // window still paces the derivation: an ask is not a beat.
+            let due = {
+                let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+                window.map_or(true, |last| last.elapsed() >= self.tuning.bound_window)
+            };
+            if due {
+                self.derive_cargo_jobs(self.host_cores as f64);
+                *self.window.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            }
             if self.is_controller() && self.persisted_bound() != Some(fixed) {
                 self.persist_bound(fixed);
             }
@@ -2944,6 +3072,9 @@ impl BuildGate {
             );
             return;
         };
+        // Same window, same host reading: the width a build fans out over is
+        // the share the CPU booked for it.
+        self.derive_cargo_jobs(load.cores as f64);
         // The measurement and the number this window enforces, side by side:
         // the second one is the first held through the dead band against what
         // the previous window enforced, so a host whose reading straddles an
@@ -3461,15 +3592,47 @@ impl BuildGate {
     /// force, since nothing is being waited for.
     fn wait_budget_ms(&self) -> u64 {
         if self.in_force() {
-            self.wait.as_millis() as u64
+            self.effective_wait().as_millis() as u64
         } else {
             0
+        }
+    }
+
+    /// The budget this gate hands the next caller.
+    ///
+    /// Before the first measured wait it is the declared value: nothing has
+    /// happened that could overrule it, and a gate that has never waited on
+    /// anybody has no evidence that it should wait less. Afterwards it is the
+    /// tail of the waits that did happen, times two, above a floor of two
+    /// polls -- so a gate whose contention clears in milliseconds stops tying
+    /// a caller up for half an hour, and one whose builders take twenty minutes
+    /// to free a slot stops refusing at a budget that only ever fit the fast
+    /// case.
+    fn effective_wait(&self) -> Duration {
+        if self.wait_budget.samples() == 0 {
+            self.wait
+        } else {
+            self.wait_budget.target()
         }
     }
 
     /// Records a wait that ended in taking a slot, and hands back when the slot
     /// was taken so the hold can be measured when it is released.
     fn slot_taken(&self, waited: Duration) -> Instant {
+        // The measurement the budget is derived from. Recorded at the moment a
+        // slot was actually taken, so the sample is "how long a caller had to
+        // wait to get one", which is the only question a wait budget answers.
+        //
+        // Only waits that outlasted a poll count. A caller that found the slot
+        // on its first pass measured microseconds, and a window full of those
+        // would pull the budget to the floor -- the gate would then refuse at
+        // the first moment of contention, having "learned" from waits that were
+        // not waits. Refusals are not recorded either: a caller that ran out of
+        // budget says the budget was too short *for it*, and feeding that back
+        // would let one unbroken build stretch the budget forever.
+        if waited >= POLL_INTERVAL {
+            self.wait_budget.observe(waited);
+        }
         let waited_ms = waited.as_millis() as u64;
         self.wait_ms_total.fetch_add(waited_ms, Ordering::Relaxed);
         self.wait_ms_max.fetch_max(waited_ms, Ordering::Relaxed);
@@ -3499,7 +3662,11 @@ impl BuildGate {
 
     /// Takes a slot, waiting for one up to the configured budget.
     pub async fn acquire(self: &Arc<Self>, what: &str) -> SFResult<BuildPermit> {
-        self.acquire_within(what, self.wait).await
+        // Read per call, not stored at construction: the budget is a reading of
+        // how long callers have had to wait, and a value frozen at start-up
+        // would be the declaration wearing the measurement's name.
+        let budget = self.effective_wait();
+        self.acquire_within(what, budget).await
     }
 
     /// Takes a slot only if one is free right now.
@@ -4524,6 +4691,8 @@ impl Observable for BuildGate {
             self.counters(),
             origin,
             self.wait_budget_ms(),
+            self.job_width.load(Ordering::Relaxed),
+            self.job_width_evaluations.load(Ordering::Relaxed),
         );
         // The sample the ceiling came from, published beside it. `step` above
         // may have just taken one; a scrape that arrives inside the bound
@@ -4550,6 +4719,12 @@ impl Observable for BuildGate {
             origin,
             HostFacts::read(),
         ));
+        // The wait budget's own loop, on the shared pacing series: its target,
+        // whether that came from the declaration or from a measured wait, and
+        // how many waits have moved it. `wait_budget_ms` above carries the same
+        // number for the panels and rules that already read it; these two are
+        // what say whether the number is still being computed at all.
+        metrics.extend(self.pacing.collect_metrics("").await?);
         Ok(metrics)
     }
 
@@ -4964,6 +5139,74 @@ mod tests {
             lock_dir: dir.to_string_lossy().into_owned(),
             ..BuildGateConfig::default()
         }))
+    }
+
+    /// 编译宽度是宿主核数与单构建需求的函数：同样的机器上需求变大，宽度变小；
+    /// 机器变小，宽度也变小；宽度不会超过核数，也不会小于一；量不到时不出数，
+    /// 由调用方落回声明——不猜一个宽度。
+    #[test]
+    fn cargo_jobs_follow_the_measured_cores_and_build_demand() {
+        assert_eq!(cargo_jobs_for(24.0, 4.1), Some(5));
+        assert_eq!(cargo_jobs_for(24.0, 8.0), Some(3));
+        assert_eq!(cargo_jobs_for(8.0, 8.0), Some(1));
+        assert_eq!(cargo_jobs_for(8.0, 0.5), Some(8), "宽度不超过核数");
+        assert_eq!(cargo_jobs_for(1.0, 4.1), Some(1), "一个构建至少一个 job");
+        for (cores, demand) in [
+            (0.0, 4.1),
+            (f64::NAN, 4.1),
+            (24.0, 0.0),
+            (24.0, -1.0),
+            (24.0, f64::INFINITY),
+        ] {
+            assert_eq!(cargo_jobs_for(cores, demand), None, "{cores}/{demand}");
+        }
+    }
+
+    /// 每个窗口重算一次宽度并让求值计数往上走：宽度可以几天不变，但「这个回路
+    /// 还在算」只能由计数回答。读数面同时带着宽度与计数。
+    #[tokio::test]
+    async fn the_cargo_width_is_recomputed_every_window_and_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = BuildGate::new(&BuildGateConfig {
+            enabled: true,
+            lock_dir: dir.path().to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
+        });
+        gate.tuning.build_demand_cores = 4.0;
+        gate.derive_cargo_jobs(24.0);
+        assert_eq!(gate.job_width.load(Ordering::Relaxed), 6);
+        gate.derive_cargo_jobs(16.0);
+        assert_eq!(gate.job_width.load(Ordering::Relaxed), 4);
+        assert_eq!(gate.job_width_evaluations.load(Ordering::Relaxed), 2);
+
+        let identity = String::new();
+        let series = readings(
+            0,
+            0,
+            0,
+            DIM_NONE,
+            Counters::default(),
+            Origin {
+                dir: &identity,
+                role: BUILD_GATE_ROLE_BUILDER,
+            },
+            0,
+            gate.job_width.load(Ordering::Relaxed),
+            gate.job_width_evaluations.load(Ordering::Relaxed),
+        );
+        // 这条序列带的就是闸门那一族固定的 `role` 标签（builder / control-plane），
+        // 宽度按进程角色分开读，不另起一套标签。
+        assert_eq!(crate::LABEL_ROLE, "role");
+        let width = series
+            .iter()
+            .find(|m| m.name == BUILD_GATE_CARGO_JOBS)
+            .expect("width series");
+        assert_eq!(width.value, 4.0);
+        let evaluations = series
+            .iter()
+            .find(|m| m.name == BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL)
+            .expect("evaluation series");
+        assert_eq!(evaluations.value, 2.0);
     }
 
     /// The outside-io reading counts one situation and nothing near it.
@@ -7698,6 +7941,77 @@ unevictable 28532736
         drop(slot_copy);
     }
 
+    /// The wait budget is the tail of the waits that actually happened.
+    ///
+    /// The declared budget is 2s. A wait of 1.5s is recorded the way `acquire`
+    /// records one (the moment a slot is taken), and the next caller is then
+    /// admitted after waiting 2.something seconds -- longer than the declaration,
+    /// which is the half of the loop a pure-function test cannot show: the next
+    /// acquisition is running against the derived budget, not the pinned one.
+    /// The second wait moves the budget again, and the evaluation count says the
+    /// loop is computing rather than the number having been written once.
+    #[tokio::test]
+    async fn the_wait_budget_follows_the_waits_that_actually_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 2);
+        assert_eq!(
+            gate.effective_wait(),
+            Duration::from_secs(2),
+            "with nothing measured, the declaration is the budget"
+        );
+        assert_eq!(gate.wait_budget.evaluations(), 0);
+
+        // The same call `acquire_within` makes when it takes a slot.
+        gate.slot_taken(Duration::from_millis(1500));
+        assert_eq!(
+            gate.wait_budget.evaluations(),
+            1,
+            "one measured wait is one turn of the loop"
+        );
+        assert!(
+            gate.effective_wait() >= Duration::from_secs(3),
+            "a 1.5s wait has to set the next budget at twice that, got {:?}",
+            gate.effective_wait()
+        );
+        assert_eq!(
+            gate.wait_budget_ms(),
+            gate.effective_wait().as_millis() as u64,
+            "the published budget is the one in force"
+        );
+
+        // A wait longer than the declared 2s: only the derived budget admits it.
+        let held = gate.try_acquire("holder").await.unwrap();
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.acquire("queued build").await })
+        };
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        drop(held);
+        let permit = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the caller is admitted by the derived budget, not the 2s declaration")
+            .unwrap()
+            .unwrap();
+        assert!(permit.held());
+        assert_eq!(
+            gate.wait_budget.evaluations(),
+            2,
+            "the caller's own wait is a second sample"
+        );
+        assert!(
+            gate.effective_wait() >= Duration::from_secs(4),
+            "the second wait was at least 2s, so the budget follows it, got {:?}",
+            gate.effective_wait()
+        );
+
+        // And the loop is on the published pacing series, not only in a field.
+        let metrics = gate.collect_metrics("").await.unwrap();
+        assert!(
+            metrics.iter().any(|m| m.name == cog_core::pacing::TARGET_METRIC),
+            "the wait budget's target must be published under the shared pacing series"
+        );
+    }
+
     /// A waiting build is a reading of its own: a gate at its bound with nothing
     /// queued and a gate whose queue is stuck look the same from the outside
     /// unless the waiters are counted.
@@ -8119,6 +8433,12 @@ unevictable 28532736
             BUILD_GATE_HELD_MS_TOTAL,
             BUILD_GATE_HELD_MS_MAX,
             BUILD_GATE_WAIT_BUDGET_MS,
+            // Zero means no window has derived a width yet, not "cargo gets
+            // no jobs"; the counter beside it is what separates a stable
+            // width from a stopped derivation. Both are part of the set a
+            // process with no builds publishes.
+            BUILD_GATE_CARGO_JOBS,
+            BUILD_GATE_CARGO_JOBS_EVALUATIONS_TOTAL,
         ]);
         assert_eq!(
             names, expected,

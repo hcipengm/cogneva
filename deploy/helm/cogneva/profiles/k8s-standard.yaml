@@ -26,14 +26,12 @@ resourceGovernance:
   # （见 deploy/scripts/project-resource-governance.py），同一套清单在任何规模的
   # 集群上都算得出自己的额度。不开的理由是另一条：生产集群上还会有人往这个命名
   # 空间里放不在渲染集里的东西，而一份人没复核过的天花板在被撞到时，症状是
-  # `FailedCreate: exceeded quota`，比"暂时没有天花板"更难查。要开就先把节点数
-  # 声明对（DaemonSet 逐节点进算式），再把下面两行改成
-  #   enabled: true / clusterNodes: <N>
-  # 然后重跑 deploy/scripts/render-deploy.sh —— 额度是按这两个数投影出来的，
-  # 只用 --set 打开等于让集群收到一份没算过这份拓扑的产物。
+  # `FailedCreate: exceeded quota`，比"暂时没有天花板"更难查。要开就把下面一行
+  # 改成 `enabled: true`，并在一份连得上目标集群的检出上重跑
+  # deploy/scripts/render-deploy.sh —— 节点数由投影器从 live cluster 读到（DaemonSet
+  # 逐节点进算式），只拿 --set 打开等于让集群收到一份没算过这份拓扑的产物。
   # K3s 两个 profile 默认开启。
   enabled: false
-  clusterNodes: 1
 
 storage:
   localRetainClass:

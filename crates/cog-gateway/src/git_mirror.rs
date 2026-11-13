@@ -40,6 +40,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::security_gateway::suspect_backoff_secs;
 
+/// 两条传输时限回路在读数面上的名字：与 tunables 注册表的键一一对应，改一处
+/// 就必须改另一处——这是部署面与读数面唯一共用的字面量。
+pub(crate) const STALL_PACING: &str = "securityGateway.gitMirror.stallSecs";
+pub(crate) const OP_TIMEOUT_PACING: &str = "securityGateway.gitMirror.timeoutSecs";
+
 /// 镜像根目录：`<root>/github/<owner>/<repo>.git`。
 pub(crate) const DEFAULT_MIRROR_ROOT: &str = cog_core::paths::GIT_MIRROR_ROOT;
 /// 私钥挂载点（来自 Secret `cogneva-secrets` 的 `git-ssh-private-key`）。
@@ -141,6 +146,10 @@ pub(crate) struct GitMirrorConfig {
     pub stall: std::time::Duration,
     /// 单次传输**预期**多久；过了只登一行读数，不杀。
     pub op_timeout: std::time::Duration,
+    /// 两条时限回路的地板（静默窗、预期工期）。`None` = 结构下限（生产）。
+    /// 测试把假 git 压到秒级以下，地板必须跟着压，否则「实测跟随」在测试里
+    /// 永远被地板挡住、看不见。
+    pub pacing_floor: Option<(std::time::Duration, std::time::Duration)>,
 }
 
 impl GitMirrorConfig {
@@ -154,6 +163,7 @@ impl GitMirrorConfig {
             git_bin: PathBuf::from(DEFAULT_GIT_BIN),
             stall: std::time::Duration::from_secs(DEFAULT_MIRROR_STALL_SECS),
             op_timeout: std::time::Duration::from_secs(DEFAULT_MIRROR_OP_TIMEOUT_SECS),
+            pacing_floor: None,
         }
     }
 
@@ -363,6 +373,12 @@ impl GitTransport {
     /// 选路状态：谁该先走（实测优先、策略表兜底）。
     pub fn routing(&self) -> &Arc<crate::git_routing::TransportRouting> {
         &self.routing
+    }
+
+    /// 传输时限回路的读数面。抓取端经 [`crate::security_gateway`] 的 `/metrics`
+    /// 渲染它：这两条界会自己变，外部必须看得见它们现在是多少、算过几拍。
+    pub fn pacing(&self) -> &Arc<cog_core::pacing::PacingReadings> {
+        &self.exec.pacing
     }
 
     /// 镜像配置的副本（后台实测要拿密钥与 SSH 前缀，且不能借走 `&self`）。
@@ -703,11 +719,56 @@ impl GitTransport {
 #[derive(Clone)]
 struct GitExec {
     cfg: GitMirrorConfig,
+    /// 传输时限的实测面。两条回路共用一个面，发布出去是同一族序列。
+    pacing: Arc<cog_core::pacing::PacingReadings>,
+    /// 静默判死的界：成功传输里最长的那段无声。
+    stall_budget: Arc<cog_core::pacing::TailBudget>,
+    /// 预期工期的界：成功传输实际跑了多久。
+    op_budget: Arc<cog_core::pacing::TailBudget>,
 }
 
 impl GitExec {
     fn new(cfg: GitMirrorConfig) -> Self {
-        Self { cfg }
+        let pacing = Arc::new(cog_core::pacing::PacingReadings::new());
+        // 地板是结构下限，不是配置值：配置只是「还没有实测时用多少」。生产上
+        // 环境解析已经拒绝低于结构下限的声明；测试用它把两条界压到秒级以下，
+        // 让「实测跟随」在假 git 上也能被看见。
+        let (stall_floor, op_floor) = cfg.pacing_floor.unwrap_or((
+            std::time::Duration::from_secs(MIRROR_STALL_FLOOR_SECS),
+            std::time::Duration::from_secs(MIRROR_OP_TIMEOUT_FLOOR_SECS),
+        ));
+        let stall_budget = pacing.tail(STALL_PACING, cfg.stall, stall_floor, 2.0);
+        let op_budget = pacing.tail(OP_TIMEOUT_PACING, cfg.op_timeout, op_floor, 2.0);
+        Self {
+            cfg,
+            pacing,
+            stall_budget,
+            op_budget,
+        }
+    }
+
+    /// 这一拍生效的静默窗。还没有任何一次成功传输时就是部署声明的值；有样本之后
+    /// 由成功传输里最长的那段无声决定——一段被证明能活下来的沉默，才是这条界
+    /// 唯一说得出口的依据。
+    fn stall_window(&self) -> std::time::Duration {
+        self.stall_budget.target()
+    }
+
+    /// 这一拍生效的预期工期（只用于「慢」的读数，不杀任何东西）。
+    fn op_expectation(&self) -> std::time::Duration {
+        self.op_budget.target()
+    }
+
+    /// 记一次成功传输的两个读数：它最长静默了多久、它总共跑了多久。
+    ///
+    /// 只记成功的：一次被杀掉的传输留下的「沉默时长」恰好等于当时那条界，把它
+    /// 记进来会自己喂自己——判死越频繁，界越大，越判不出死。失败路径的样本属于
+    /// 「被杀」这件事本身，不是「传输可以静默这么久」的证据。
+    fn note_transfer(&self, peak_idle: std::time::Duration, total: std::time::Duration) {
+        if !peak_idle.is_zero() {
+            self.stall_budget.observe(peak_idle);
+        }
+        self.op_budget.observe(total);
     }
 
     /// 跑一条命令并缓冲 stdout；失败信息给 stderr 的**尾部**——进度刷屏在头部，
@@ -746,7 +807,8 @@ impl GitExec {
     /// 另立一个旋钮——两个独立旋钮必然会出现"窗口 30s、巡检 60s"这种判据比
     /// 被判断的对象还粗的组合；测试里把窗口压到秒级时它也跟着变细。
     fn watchdog_interval(&self) -> std::time::Duration {
-        (self.cfg.stall / 4).clamp(MIRROR_WATCHDOG_MIN_INTERVAL, MIRROR_WATCHDOG_MAX_INTERVAL)
+        (self.stall_window() / 4)
+            .clamp(MIRROR_WATCHDOG_MIN_INTERVAL, MIRROR_WATCHDOG_MAX_INTERVAL)
     }
 
     /// 跑一条 git 命令，等到它自己结束。
@@ -777,9 +839,16 @@ impl GitExec {
         let stdout = child.stdout.take().ok_or("git stdout 未接管")?;
         let stderr = child.stderr.take().ok_or("git stderr 未接管")?;
 
-        let last_output = Arc::new(Mutex::new(std::time::Instant::now()));
+        let last_output = Arc::new(Mutex::new(started));
+        // 这一轮里最长的一段「没有新字节」：它才是静默判据的实测输入。只看总时长
+        // 会把「链路慢」和「链路死」压成同一个结论，而这两种情况该做的事相反。
+        let idle_peak = Arc::new(Mutex::new(std::time::Duration::ZERO));
         let out_task = tokio::spawn(read_all(stdout));
-        let err_task = tokio::spawn(read_tail(stderr, last_output.clone()));
+        let err_task = tokio::spawn(read_tail(
+            stderr,
+            last_output.clone(),
+            idle_peak.clone(),
+        ));
         let mut wait_task = tokio::spawn(async move { child.wait().await });
 
         // 过了预期工期只登一次读数：这条传输还在跑，而一条还在跑的传输不是一条该被
@@ -801,17 +870,19 @@ impl GitExec {
                 }
                 _ = tokio::time::sleep(self.watchdog_interval()) => {
                     let total = started.elapsed();
-                    if total >= self.cfg.op_timeout && !aged_reported {
+                    let expectation = self.op_expectation();
+                    if total >= expectation && !aged_reported {
                         aged_reported = true;
                         tracing::warn!(
                             action = %label,
-                            expected_secs = self.cfg.op_timeout.as_secs(),
+                            expected_secs = expectation.as_secs(),
                             elapsed_secs = total.as_secs(),
+                            evaluations = self.op_budget.evaluations(),
                             "git 传输超过了预期的工期仍在跑；继续等它自己结束，不按钟收走"
                         );
                     }
                     let idle = last_output.lock().unwrap().elapsed();
-                    if watch_stall && idle >= self.cfg.stall {
+                    if watch_stall && idle >= self.stall_window() {
                         break Err(format!(
                             "git {label} 静默 {}s（无任何进度输出，判为传输已死，已杀进程组）",
                             idle.as_secs()
@@ -825,6 +896,12 @@ impl GitExec {
             Ok(status) => {
                 // 进程已经归位，号可以复用了：守卫到此为止。
                 group.disarm();
+                if watch_stall {
+                    // 只把 clone/fetch/push 记进窗口：注册表里那两条界说的就是
+                    // 「一次传输」。本地的 show-ref/rev-parse 以毫秒计，混进来会
+                    // 把尾部压成零，让这条界退化成地板。
+                    self.note_transfer(*idle_peak.lock().unwrap(), started.elapsed());
+                }
                 status
             }
             Err(reason) => {
@@ -1114,6 +1191,7 @@ async fn read_all(mut r: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
 async fn read_tail(
     mut r: impl tokio::io::AsyncRead + Unpin,
     last_output: Arc<Mutex<std::time::Instant>>,
+    idle_peak: Arc<Mutex<std::time::Duration>>,
 ) -> Vec<u8> {
     let cap = STDERR_TAIL_CHARS * 8;
     let mut buf = vec![0u8; 4096];
@@ -1122,7 +1200,19 @@ async fn read_tail(
         match r.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                *last_output.lock().unwrap() = std::time::Instant::now();
+                let now = std::time::Instant::now();
+                // 先量"距上一段输出过了多久"，再刷新时刻：这段间隔就是这一轮的
+                // 静默实测样本，取最大值即「最长的一次沉默」。
+                let mut last = last_output.lock().unwrap();
+                let gap = now.saturating_duration_since(*last);
+                {
+                    let mut peak = idle_peak.lock().unwrap();
+                    if gap > *peak {
+                        *peak = gap;
+                    }
+                }
+                *last = now;
+                drop(last);
                 out.extend_from_slice(&buf[..n]);
                 if out.len() > cap {
                     let drop = out.len() - cap;
@@ -1695,6 +1785,33 @@ mod tests {
         cfg.git_bin = git_bin;
         cfg.stall = std::time::Duration::from_secs(stall_secs);
         cfg.op_timeout = std::time::Duration::from_secs(timeout_secs);
+        // 测试里的窗口本来就是"部署把界压到秒级"，结构下限在这里不适用；
+        // 不跟着压的话，每条秒级用例都会被 30s 的地板拖住。
+        cfg.pacing_floor = Some((
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        ));
+        GitTransport::new(cfg)
+    }
+
+    /// 秒级以下的窗口：时限回路的地板必须跟着压下去，否则实测跟随在测试里
+    /// 永远被结构下限挡住。
+    fn test_transport_with(
+        root: &Path,
+        git_bin: PathBuf,
+        ssh_base: String,
+        stall: std::time::Duration,
+        op_timeout: std::time::Duration,
+    ) -> GitTransport {
+        let mut cfg =
+            GitMirrorConfig::from_parts(root.to_path_buf(), Some(root.join("dummy_key")), ssh_base);
+        cfg.git_bin = git_bin;
+        cfg.stall = stall;
+        cfg.op_timeout = op_timeout;
+        cfg.pacing_floor = Some((
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        ));
         GitTransport::new(cfg)
     }
 
@@ -1892,6 +2009,90 @@ mod tests {
             .await
             .expect("一直在输出的传输不该被杀");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// 静默判死窗是**上一次成功传输教出来的**，不是钉住的数。
+    ///
+    /// 同一条「静默一秒再继续」的传输：执行体只知道种子（0.4s）时它被判死；
+    /// 刚记下「上一次成功传输最长静默 1.2s」之后，同一条传输被等到结束。再记
+    /// 一次更长的沉默，界继续跟着走——输入变了，下一拍就变，而且求值计数在涨，
+    /// 说明这条回路确实在算，不是一张纯函数映射。
+    #[tokio::test]
+    async fn a_measured_silence_widens_the_window_the_next_transfer_is_judged_by() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = write_fake_git(
+            tmp.path(),
+            "sleep 1\n\
+             echo 'remote: Receiving objects: 90%' >&2\n\
+             sleep 0.1\n\
+             exit 0",
+        );
+        let seed = std::time::Duration::from_millis(400);
+        let budget = std::time::Duration::from_secs(30);
+        let fresh = test_transport_with(
+            tmp.path(),
+            fake.clone(),
+            DEFAULT_SSH_BASE.into(),
+            seed,
+            budget,
+        );
+        let started = std::time::Instant::now();
+        let err = refresh_retrying_text_busy(&fresh)
+            .await
+            .expect_err("只知道种子时，静默一秒的传输必须被判死");
+        assert!(err.contains("静默"), "错误应说清是静默判死: {err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let taught = test_transport_with(
+            tmp.path(),
+            fake,
+            DEFAULT_SSH_BASE.into(),
+            seed,
+            budget,
+        );
+        taught.exec.note_transfer(
+            std::time::Duration::from_millis(1200),
+            std::time::Duration::from_millis(1200),
+        );
+        assert_eq!(
+            taught.exec.stall_budget.evaluations(),
+            1,
+            "记下一次成功传输就该有一拍求值，否则外部看不出这条回路在跑"
+        );
+        assert!(
+            taught.exec.stall_window() >= std::time::Duration::from_millis(2400),
+            "一次 1.2s 的沉默该把下一棒的窗撑到至少 2.4s，实际 {:?}",
+            taught.exec.stall_window()
+        );
+
+        // 输入变了，下一拍跟着变。
+        taught.exec.note_transfer(
+            std::time::Duration::from_millis(2000),
+            std::time::Duration::from_millis(2000),
+        );
+        assert!(
+            taught.exec.stall_window() >= std::time::Duration::from_secs(4),
+            "沉默变成 2s 之后窗该跟着走到 4s，实际 {:?}",
+            taught.exec.stall_window()
+        );
+        assert_eq!(taught.exec.stall_budget.evaluations(), 2);
+
+        refresh_retrying_text_busy(&taught)
+            .await
+            .expect("在被实测撑开（4s）的窗里，静默一秒的传输不该被杀");
+
+        // 预期工期走同一份读数面、同一个实测：这次真的跑完了，它的耗时被记进
+        // 第二条回路（两次人工样本 + 这一拍），界也跟着它走。
+        assert_eq!(
+            taught.exec.op_budget.evaluations(),
+            3,
+            "预期工期回路必须真的被算过：两次人工样本加一次成功传输"
+        );
+        assert!(
+            taught.exec.op_expectation() >= std::time::Duration::from_secs(4),
+            "最长一次传输 2s，预期工期该是它的两倍，实际 {:?}",
+            taught.exec.op_expectation()
+        );
     }
 
     /// 一直在吐进度、但跑得比**预期工期**久的传输：等它跑完，不按钟收走。

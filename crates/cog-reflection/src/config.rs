@@ -936,8 +936,6 @@ pub struct ObservabilityStackConfig {
     /// `BACKENDS` 是同一个开关的两面：清单的处置表把这两个文件标成
     /// `backends`，两边都读它。
     pub backends: bool,
-    /// 一次收敛最多在告警消息里点名几个资源（其余折叠成计数，消息有界）。
-    pub max_named_resources: usize,
 }
 
 impl ObservabilityStackConfig {
@@ -954,7 +952,6 @@ impl Default for ObservabilityStackConfig {
             manifest_dir: "deploy/k3s/observability/manifests".into(),
             namespace: "monitoring".into(),
             backends: true,
-            max_named_resources: 6,
         }
     }
 }
@@ -1133,9 +1130,6 @@ impl MainlineDeployerConfig {
         if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", &get)? {
             self.observability_stack.backends = v;
         }
-        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", &get)? {
-            self.observability_stack.max_named_resources = v;
-        }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BUILDER_BIN") {
             self.builder_bin = v;
         }
@@ -1254,7 +1248,6 @@ mod tests {
             ),
             ("COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE", "mon"),
             ("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", "false"),
-            ("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", "3"),
         ]
         .into_iter()
         .collect();
@@ -1267,7 +1260,6 @@ mod tests {
         assert_eq!(stack.manifest_dir, "deploy/other");
         assert_eq!(stack.namespace, "mon");
         assert!(!stack.backends);
-        assert_eq!(stack.max_named_resources, 3);
 
         let bad: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS", "soon")]
             .into_iter()

@@ -135,6 +135,22 @@ pub const BUILD_TARGET_LAST_RECLAIM_METRIC: &str = "cogneva_build_target_last_re
 /// carrying a copy of the interval that goes stale when it is configured.
 pub const BUILD_TARGET_SCAN_INTERVAL_METRIC: &str = "cogneva_build_target_scan_interval_seconds";
 
+/// How many walks have stated the cadence they are keeping.
+///
+/// The interval moves only when a pass's cost does, so a cadence that has not
+/// changed for hours and one whose loop stopped are the same number. This is
+/// what separates them: it moves on every pass, whatever the interval did.
+pub const BUILD_TARGET_SCAN_INTERVAL_EVALUATIONS_METRIC: &str =
+    "cogneva_build_target_scan_interval_evaluations_total";
+
+/// How many walks have derived the cap from their own measurement.
+///
+/// The cap is derived once per walk from the peak and the volume's free space;
+/// a cache growing at a steady size derives the same number every time. The
+/// count is the only reading that says the derivation is still running.
+pub const BUILD_TARGET_CAP_EVALUATIONS_METRIC: &str =
+    "cogneva_build_target_cap_evaluations_total";
+
 /// The layer label.
 pub const LAYER_LABEL: &str = "layer";
 

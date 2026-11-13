@@ -43,7 +43,8 @@ use crate::mainline_deployer::{
     CiNoVerdictReason, ConfigConsumer, FailureClass, FailureLocus, MainlineDeployer, PodSample,
     RolloutTarget, WaitingState, WorkloadKind, CLUSTER_UNREACHABLE_MARKER, FATAL_WAITING_REASONS,
     IMAGE_SOURCE_UNAVAILABLE_MARKER, OBSERVATION_TOOL_MARKER, ROLLOUT_EXIT_ENVIRONMENT,
-    ROLLOUT_PRECHECK_STAGE, SUPPORT_CAUSE_MESSAGE_CHARS, SUPPORT_CAUSE_SEPARATOR, WORKLOAD_KINDS,
+    ROLLOUT_PRECHECK_STAGE, SUPPORT_CAUSE_MESSAGE_CHARS, SUPPORT_CAUSE_SEPARATOR,
+    WORKLOAD_KINDS,
 };
 use crate::rollout_resources::{self, RolloutResourceReading};
 
@@ -261,7 +262,7 @@ const SUPPORT_CAUSE_CONTAINER_LIMIT: usize = 4;
 
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
 // cap: bound — 探测、致命态复查、部署态查询共用同一节拍
-const ROLLOUT_POLL_SECS: u64 = 5;
+pub(crate) const ROLLOUT_POLL_SECS: u64 = 5;
 
 /// 这一跑在进度面上的名字。容器里的判断读内存，容器外的存活探针读进度文件
 /// （`COGNEVA_PROGRESS_FILE`），两边读的是同一串拍子——而探针那边按 Job 的组件名
@@ -730,6 +731,9 @@ pub(crate) struct HostSoakWindow {
     pub peak: Option<HostRunQueue>,
     /// 读数来自哪台机器，已带上是节点名还是 hostname；`None` 是读不到任何标识。
     pub reader: Option<String>,
+    /// 窗口里最后一次采到「宿主在排队」是在第几秒。静置的申报界按它取：一段
+    /// 排队的宿主会把刚起来的副本挤掉，静置至少要盖住这一段。
+    pub loaded_secs: u64,
 }
 
 impl HostSoakWindow {
@@ -741,10 +745,11 @@ impl HostSoakWindow {
         self.polls > 0 && self.queued_polls.saturating_mul(2) >= self.polls
     }
 
-    fn record(&mut self, rq: HostRunQueue) {
+    fn record(&mut self, rq: HostRunQueue, at_secs: u64) {
         self.polls += 1;
         if rq.is_loaded() {
             self.queued_polls += 1;
+            self.loaded_secs = self.loaded_secs.max(at_secs);
             if self
                 .peak
                 .is_none_or(|p| rq.load1 / rq.cores > p.load1 / p.cores)
@@ -2570,6 +2575,9 @@ struct RolloutWait<'a> {
     has_init_containers: Option<bool>,
     /// 最近一眼看到 init 还在跑。只进判词，说清失败发生在哪个相位。
     init_running: bool,
+    /// 第一次看到 init 结束的时刻。滚动阶段从这一刻起算——这一段时长是
+    /// `mainlineDeployer.rolloutTimeoutSecs` 的实测输入，前提里不能含 init。
+    init_done_at: Option<std::time::Instant>,
     readiness_probe: Option<ProbeCycle>,
     /// 整段里有没有见过属于新版本的一个 Pod。没有的话，能采到的现场全是旧版本的。
     new_pod_seen: bool,
@@ -2601,6 +2609,7 @@ impl<'a> RolloutWait<'a> {
             diagnosed: false,
             has_init_containers: None,
             init_running: false,
+            init_done_at: None,
             readiness_probe: None,
             new_pod_seen: false,
             pause_resumes: 0,
@@ -2611,6 +2620,11 @@ impl<'a> RolloutWait<'a> {
             loaded_peak: None,
             last_readout: String::new(),
         }
+    }
+
+    /// 滚动阶段（init 结束之后）已经走了多久。没有 init 的部署整段都是滚动。
+    fn rollout_phase_elapsed(&self) -> Duration {
+        self.init_done_at.unwrap_or(self.started).elapsed()
     }
 }
 
@@ -2755,7 +2769,11 @@ impl cog_core::declared_wall::SettleProbe for RolloutWait<'_> {
             if self.has_init_containers == Some(true) {
                 // 滚动中新旧 Pod 交替、containerStatuses 可能暂时缺失，空输出不当致命。
                 if let Ok(progress) = exec.init_containers_progress(t).await {
+                    let was_running = self.init_running;
                     self.init_running = progress.lines().any(|l| l.trim() == "|");
+                    if was_running && !self.init_running && self.init_done_at.is_none() {
+                        self.init_done_at = Some(std::time::Instant::now());
+                    }
                     reading = format!("{out}#init:{progress}");
                 }
             }
@@ -3215,6 +3233,48 @@ pub struct RolloutExecutor {
     /// 读数：这条判据读的是**跑用例的那台机器**的负载，不换掉，同一份用例在空闲的
     /// 笔记本上与一台正在编译的 CI 机上会给出两种类别。
     host_run_queue: fn() -> Option<HostRunQueue>,
+    /// 这次跑里三段等待各自走完花了多久。Job 是短命进程，读数只有它自己拿得到；
+    /// 它随着终止消息回到部署器，成为下一轮三份申报界的实测输入。
+    observed: std::sync::Mutex<WaitDurations>,
+}
+
+/// 一次判定里三段等待各自量到的时长。
+///
+/// 三段分开记，因为它们是三个不同的申报界（`startupTimeoutSecs`、
+/// `rolloutTimeoutSecs`、`soakSecs`）的输入：把三段并成一个「这次跑了多久」，
+/// 下一轮就只买得起一个界，另外两个仍得靠人给。没走完的那一段缺席——失败或判停
+/// 的那一段是墙，不是这件事要花的时间。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WaitDurations {
+    pub startup: Option<std::time::Duration>,
+    pub rollout: Option<std::time::Duration>,
+    pub soak: Option<std::time::Duration>,
+}
+
+/// 三段等待，各自对应部署器上的一个申报界。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitPhase {
+    Startup,
+    Rollout,
+    Soak,
+}
+
+impl WaitDurations {
+    fn any(&self) -> bool {
+        self.startup.is_some() || self.rollout.is_some() || self.soak.is_some()
+    }
+
+    fn startup_usec(&self) -> Option<u64> {
+        self.startup.map(|d| d.as_micros() as u64)
+    }
+
+    fn rollout_usec(&self) -> Option<u64> {
+        self.rollout.map(|d| d.as_micros() as u64)
+    }
+
+    fn soak_usec(&self) -> Option<u64> {
+        self.soak.map(|d| d.as_micros() as u64)
+    }
 }
 
 /// 一次「落地之前再问一次 CI」的全部输入：要问的 rev，以及问哪些上游。
@@ -3286,7 +3346,23 @@ impl RolloutExecutor {
             } else {
                 read_host_run_queue_now
             },
+            observed: std::sync::Mutex::new(WaitDurations::default()),
         }
+    }
+
+    /// 记下某一段等待走完花了多久。三段各有各的界，所以各记各的槽。
+    fn note_duration(&self, phase: WaitPhase, value: Duration) {
+        let mut observed = self.observed.lock().unwrap();
+        match phase {
+            WaitPhase::Startup => observed.startup = Some(value),
+            WaitPhase::Rollout => observed.rollout = Some(value),
+            WaitPhase::Soak => observed.soak = Some(value),
+        }
+    }
+
+    /// 这次跑量到的三段时长。部署器读回终止消息时用它说「下一轮会申报什么」。
+    pub(crate) fn wait_durations(&self) -> WaitDurations {
+        *self.observed.lock().unwrap()
     }
 
     /// 挂上"动手之前复问上游 CI"这一趟。只有从命令行起的 Job 会调它。
@@ -4189,7 +4265,11 @@ impl RolloutExecutor {
     /// 读不到集群不在这里下结论：失败读数不记拍、也不算动，等待继续；真的一直读不到，
     /// 由调用方在其它落点上看到同一件事（读不到是我们看不见，不是这份发布集坏了）。
     async fn wait_support_settled(&self, workloads: &[SupportWorkload]) -> SFResult<()> {
+        // 这个界是部署器**这一轮申报的期望**，已经由它按上一轮实测算好随参数带来。
+        // Job 自己只有这一个数，没有别的输入可用；它量出来的是**这一轮花了多久**，
+        // 由终止消息带回给部署器，成为下一轮申报的输入。
         let declared = Duration::from_secs(self.startup_timeout_secs);
+        let started = std::time::Instant::now();
         let mut probe = SupportSettle {
             exec: self,
             pending: workloads.iter().collect(),
@@ -4203,7 +4283,7 @@ impl RolloutExecutor {
             &mut probe,
         )
         .await;
-        match verdict {
+        let settled = match verdict {
             Ok(_) => Ok(()),
             Err(why) => {
                 // 收尾的两种直接证据——实测界判停、平台自己写的进度死线——说的是同一件
@@ -4229,7 +4309,13 @@ impl RolloutExecutor {
                     causes.join("; ")
                 )))
             }
+        };
+        // 只有走完的支撑等待才是「这一次启动花了多久」的样本：判停的那一段是墙，
+        // 不是启动时间。记下来，随终止消息回到部署器，下一轮申报的界跟着它走。
+        if settled.is_ok() {
+            self.note_duration(WaitPhase::Startup, started.elapsed());
         }
+        settled
     }
 
     /// 判死那一刻，一个还没就绪的支撑工作负载的现场。
@@ -4450,10 +4536,10 @@ impl RolloutExecutor {
     /// 这个部署的放置面时，说的是**集群放不下**，不是版本不好（见
     /// PLACEMENT_BLOCKED_MARKER）。`prev_shape` 是 apply 之前快照的放置面。
     async fn wait_rollout_complete(&self, t: &RolloutTarget, prev_shape: &str) -> SFResult<()> {
-        let declared = Duration::from_secs(
-            self.startup_timeout_secs
-                .saturating_add(self.rollout_timeout_secs),
-        );
+        // 两个界都是部署器这一轮申报的期望，已经按上一轮实测算好随参数带来：启动
+        // 那一段与滚动那一段各有各的界，等的时候合起来看。
+        let declared = Duration::from_secs(self.startup_timeout_secs)
+            .saturating_add(Duration::from_secs(self.rollout_timeout_secs));
         let what = format!("rollout of deployment/{}", t.deployment);
         let mut wait = RolloutWait::new(self, t, prev_shape, declared);
         let verdict = cog_core::declared_wall::wait_for_settled_with(
@@ -4465,7 +4551,12 @@ impl RolloutExecutor {
         )
         .await;
         match verdict {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // 滚动阶段从 init 结束那一刻算起：这一段才是这个界要覆盖的事，
+                // init 的启动有它自己的界。换一次滚动时长，下一轮的申报跟着变。
+                self.note_duration(WaitPhase::Rollout, wait.rollout_phase_elapsed());
+                Ok(())
+            }
             Err(why) => Err(self.rollout_wait_failure(&wait, why).await),
         }
     }
@@ -4830,6 +4921,7 @@ impl RolloutExecutor {
             reader: host_reader_identity(),
             ..HostSoakWindow::default()
         };
+        let started = std::time::Instant::now();
         let mut left = soak_secs;
         loop {
             let nap = left.min(ROLLOUT_POLL_SECS);
@@ -4841,7 +4933,7 @@ impl RolloutExecutor {
             // 别的状态，容器外的探针只能靠这一拍看见它还在。
             cog_core::progress::beat(ROLLOUT_PROGRESS_TASK);
             if let Some(rq) = (self.host_run_queue)() {
-                window.record(rq);
+                window.record(rq, started.elapsed().as_secs());
             }
             if left == 0 {
                 return window;
@@ -5882,14 +5974,22 @@ impl RolloutExecutor {
             done.push(target);
         }
 
-        info!(
-            soak_secs = self.soak_secs,
-            "mainline rollout: all targets updated, soaking"
-        );
+        // 静置的时长由部署器按上一轮「宿主真的排到队的那一刻」算好带进来
+        // （`soakSecs`）；这一轮量到的排队时刻随终止消息回去。
+        let soak_secs = self.soak_secs;
+        info!(soak_secs, "mainline rollout: all targets updated, soaking");
         // 静置的这段时间同时是「宿主有没有给过时间」的观察窗口：Pod 健康复查只能
         // 看到这一刻，而一个刚重启过的就绪 Pod 是不是被宿主挤出来的，是一段窗口里
         // 的比例问题。采样在这里做，判定在 pods_healthy 里读，两处共用一个界。
-        let host_window = self.soak_and_watch_host(self.soak_secs).await;
+        let host_window = self.soak_and_watch_host(soak_secs).await;
+        // 这一窗里宿主排队排到第几秒，就是下一轮静置该盖住的时长；一次都没排过
+        // 时不记样本，静置停在配置值上——「没排过」不是「排了零秒」。
+        if host_window.loaded_secs > 0 {
+            self.note_duration(
+                WaitPhase::Soak,
+                Duration::from_secs(host_window.loaded_secs),
+            );
+        }
         for target in &plan.targets {
             if let Err(e) = self.pods_healthy(target, &host_window).await {
                 return self
@@ -6353,6 +6453,9 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
     // 开工先建进度文件：容器外的存活探针从这一刻起就有东西可读，Job 因此不再需要
     // 一个按钟杀掉容器的 activeDeadlineSeconds。
     cog_core::progress::start_progress_file();
+    // 资源读数要报「这次跑的平均核数」，而 cgroup 里只有累计用量、没有起步
+    // 时刻。起步时刻只有这里知道，所以从这里一路带进终止消息。
+    let started = std::time::Instant::now();
     // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
     // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
     // 靠的正是那边装上的 Loki 镜像。
@@ -6394,7 +6497,7 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         // 成功也留下读数：这一轮跑得离上限有多近，只有跑完的这一刻在同一个进程里
         // 对照得出来（上限写在 Job 清单里，用掉的量在这个容器自己的 cgroup 里）。
         Ok(()) => {
-            report_termination_message(None, None);
+            report_termination_message(None, None, started.elapsed(), executor.wait_durations());
             Ok(())
         }
         // 失败分两条通道过 Job 边界：类别走退出码（环境类用独立的 75，让部署器
@@ -6403,7 +6506,12 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         // "这个容器为什么死"留的窄通道，读出端按结构化字段取，不解析日志。
         // `process::exit` 不走返回路径，因为 Box<dyn Error> 出去一律是 1。
         Err(f) => {
-            report_termination_message(Some(&f.signature), f.admission_hold);
+            report_termination_message(
+                Some(&f.signature),
+                f.admission_hold,
+                started.elapsed(),
+                executor.wait_durations(),
+            );
             if f.class == FailureClass::Environment {
                 tracing::error!(error = %f, exit_code = ROLLOUT_EXIT_ENVIRONMENT, "mainline rollout failed for environment reasons");
                 std::process::exit(ROLLOUT_EXIT_ENVIRONMENT);
@@ -6545,11 +6653,24 @@ const TERMINATION_LOG: &str = "/dev/termination-log";
 /// 写不进去不能影响失败本身的交付：类别还走退出码，落点没了只是让部署器少一份证据
 /// （它会往"停下"的一侧取，不会因此多滚一轮）。读数同理由：它是这一轮跑得怎么样的一份
 /// 证据，不是这一轮成败的判据。
-fn report_termination_message(signature: Option<&str>, admission_hold: Option<&str>) {
+fn report_termination_message(
+    signature: Option<&str>,
+    admission_hold: Option<&str>,
+    elapsed: std::time::Duration,
+    waits: WaitDurations,
+) {
+    // 时长不需要 cgroup：节点上没有可自读的 cgroup 时，资源那几个字段缺席，
+    // 三段等待的量到的时长照样随这条通道回去。整条读数一个字段都没有时才不写行。
     let reading = RolloutResourceReading::read_from(
         Path::new(rollout_resources::CGROUP_ROOT),
         chrono::Utc::now().timestamp().max(0) as u64,
-    );
+    )
+    .or_else(|| waits.any().then(RolloutResourceReading::default))
+    .map(|reading| {
+        reading
+            .with_elapsed(elapsed.as_micros() as u64)
+            .with_wait_durations(waits.startup_usec(), waits.rollout_usec(), waits.soak_usec())
+    });
     match reading.as_ref() {
         Some(reading) => tracing::info!(reading = %reading, "rollout resource reading"),
         None => tracing::warn!(

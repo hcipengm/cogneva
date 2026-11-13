@@ -80,7 +80,7 @@ assist_rs="${repo}/crates/cog-extension/src/hostdocs_assist.rs"
 for env_name in HOST_DOCS_SCOPES HOST_DOCS_JOURNAL_DIR HOST_DOCS_MAX_WRITE_BYTES \
   HOST_DOCS_MAX_READ_BYTES HOST_DOCS_APPROVAL_TTL_SECS HOST_DOCS_MAX_PLAN_BYTES \
   HOST_DOCS_CLASSIFY_RULES HOST_DOCS_AUDITED_LLM_URL HOST_DOCS_ASSIST_BODY_BYTES \
-  HOST_DOCS_ASSIST_MAX_CANDIDATES; do
+  HOST_DOCS_ASSIST_MAX_CANDIDATES HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES; do
   # The whole crate, not two files: the reading lives wherever the reading lives, and a
   # fixed file list goes stale the moment the capability is split across one more module
   # -- which is exactly how a dead knob would then pass this check.
@@ -214,7 +214,8 @@ got="$(env_value "${work}/scopes.yaml" cogneva-sandbox-executor sandbox-executor
 case "${got}" in
   ''|*[!0-9]*) fail "HOST_DOCS_APPROVAL_TTL_SECS reads '${got}'; it must be a decimal integer second count" ;;
 esac
-for bound_env in HOST_DOCS_ASSIST_BODY_BYTES HOST_DOCS_ASSIST_MAX_CANDIDATES; do
+for bound_env in HOST_DOCS_ASSIST_BODY_BYTES HOST_DOCS_ASSIST_MAX_CANDIDATES \
+  HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES; do
   got="$(env_value "${work}/scopes.yaml" cogneva-sandbox-executor sandbox-executor "${bound_env}")"
   case "${got}" in
     ''|*[!0-9]*) fail "${bound_env} reads '${got}'; it must be a decimal integer count" ;;

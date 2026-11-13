@@ -1073,6 +1073,168 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["tool"],
         "crates/cog-extension/src/command_server.rs",
     ),
+    // The workload-resource loop's six readings. The four declarations are the
+    // numbers the chart used to pin and the loop now writes: request at the
+    // window's p95, limit at its peak times the same headroom the volume loop
+    // uses, per workload and container, with `source` saying whether the value
+    // is the measurement's answer or the chart seed still in force. The last
+    // two are the loop's own cadence -- samples behind each window and rounds
+    // evaluated -- which are what tell a declaration that was measured and left
+    // alone apart from one nobody computes any more. All six are scrape-only:
+    // the loop renders them on its own `/metrics` and hands none to a store.
+    (
+        "cogneva_workload_request_cpu_millicores",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_request_memory_bytes",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_limit_cpu_millicores",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_limit_memory_bytes",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_resources_samples",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_resources_evaluations_total",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    // The memory-backed volume: the same size law, written to
+    // `volumes[].emptyDir.sizeLimit` instead of a container's resources. Filed
+    // here so the scrape census has the reader the series needs, and so a panel
+    // that selects it is judged against these labels rather than against none.
+    (
+        "cogneva_workload_shm_size_bytes",
+        &["workload", "volume", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    // The shared pacing surface: every loop whose cadence follows its own last
+    // pass publishes the target it is running at and how many times it has been
+    // evaluated. The evaluation counter is the half of the proof a scrape can
+    // see -- a target that did not move is still a beat that ran.
+    (
+        "cogneva_pacing_target_seconds",
+        &["pacing", "source"],
+        "crates/cog-core/src/pacing.rs",
+    ),
+    (
+        "cogneva_pacing_evaluations_total",
+        &["pacing"],
+        "crates/cog-core/src/pacing.rs",
+    ),
+    // The declarations the loops rewrite: replicas and the startup failure
+    // budget per workload, the build gate's cargo width, and the change
+    // ledger's rows per handover. Each was a pinned value and each now moves
+    // with a measurement; `source` says whether the reading is the
+    // measurement's answer or the seed still in force. The evaluation counter
+    // beside each gauge is the half of the proof a scrape can see -- the value
+    // may hold still because the input did, so "the beat ran" needs its own
+    // series.
+    (
+        "cogneva_workload_replicas",
+        &["workload", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_replicas_evaluations_total",
+        &["workload", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_startup_failure_threshold",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_startup_failure_threshold_evaluations_total",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_build_gate_cargo_jobs",
+        &["dir", "role"],
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    (
+        "cogneva_build_gate_cargo_jobs_evaluations_total",
+        &["dir", "role"],
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    (
+        "cogneva_change_ledger_rows_per_handover",
+        &["source"],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
+        "cogneva_change_ledger_rows_per_handover_evaluations_total",
+        &[],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    // The namespace defaults the LimitRange loop writes: a container that
+    // declares nothing gets these four numbers, derived from the namespace
+    // median and clamped into the object's own bounds. `limitrange` names the
+    // object written; `source` separates measured values from seeds.
+    (
+        "cogneva_limit_range_default_cpu_millicores",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_limit_range_default_memory_bytes",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_limit_range_default_request_cpu_millicores",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_limit_range_default_request_memory_bytes",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_limit_range_defaults_evaluations_total",
+        &["limitrange", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    // The retention loops: one target per knob, with the unit it counts and
+    // whether the value is derived. A target that holds still is the loop
+    // agreeing with a steady input; the evaluation counter is what says the
+    // loop is still there to agree.
+    (
+        "cogneva_retention_target",
+        &["knob", "unit", "source"],
+        "crates/cog-core/src/retention.rs",
+    ),
+    (
+        "cogneva_retention_evaluations_total",
+        &["knob"],
+        "crates/cog-core/src/retention.rs",
+    ),
+    // The claim window's own evaluation count. The bound is per process, so
+    // the counter is too: it climbs when the window could be read and a bound
+    // computed, and stays still when there was no input to compute from --
+    // those are different facts and the panel draws it beside the bound.
+    (
+        "cogneva_task_router_claim_bound_evaluations_total",
+        &[],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

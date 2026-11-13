@@ -23,11 +23,11 @@ ingress:
 
 resourceGovernance:
   # 额度本身不用在这里给：它由渲染集投影出来（容器声明、副本数、滚动重叠），
-  # 唯一跟节点数有关的是 DaemonSet 逐节点铺开后有几分 Pod，那由 clusterNodes 说。
-  # 投影按这里的数算，所以真到 N 节点时把下面这个 1 改成 N 并重跑
-  # deploy/scripts/render-deploy.sh；只改这里不重跑，产出物仍是单节点的额度。
+  # 唯一跟节点数有关的是 DaemonSet 逐节点铺开后有几个 Pod，而节点数也不是这里
+  # 的一个数——投影器在渲染宿主上从 live cluster 读，多节点宿主渲染出来就是多
+  # 节点额度。没有集群的机器渲染这份 profile 时要显式给拓扑（`COGNEVA_NODES=N`
+  # 或 `--nodes N`），投影不会替它猜一个 1。
   enabled: true
-  clusterNodes: 1
 
 evolution:
   gitRemote:

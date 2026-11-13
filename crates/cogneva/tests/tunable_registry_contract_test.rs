@@ -15,8 +15,8 @@
 //!   without a row is a hole this test names rather than an absence nobody
 //!   notices -- "nobody has looked at this yet" has to be a missing row, not a
 //!   silently unjudged number.
-//! - every row says something. For `override`/`fixed` that is the reason the
-//!   value is not derived; for `derived` it is what the value reads.
+//! - every row says something. For `fixed` that is the reason the value is not
+//!   derived; for `derived` it is what the value reads.
 //! - a `derived` row names the reading its number lands on and a test that shows
 //!   the number following its input. A comment claiming a value tracks the world
 //!   is not evidence that it does; the test is the part of the claim a machine
@@ -76,8 +76,6 @@ const CAP_METRIC: &str = "BUILD_TARGET_CAP_METRIC";
 enum Source {
     /// A measurement loop sets it, so it moves when the input it reads moves.
     Derived,
-    /// The deployment names it, so it stays where it was pinned.
-    Override,
     /// Not a dial: a protocol number or a practice, which no measurement should
     /// move. Registered so that "fixed by agreement" and "nobody has derived
     /// this yet" are told apart by the row rather than by whoever reads it next.
@@ -94,7 +92,6 @@ impl Source {
     fn as_label(self) -> Option<&'static str> {
         match self {
             Source::Derived => Some("derived"),
-            Source::Override => Some("override"),
             Source::Fixed => None,
         }
     }
@@ -137,6 +134,11 @@ struct Published {
     metric: String,
     /// The label on that reading that carries where the value came from.
     label: String,
+    /// For a derived row: what makes the loop compute the number again --
+    /// `periodic` (a timer) or `event` (a request or a pass that carries it).
+    /// Absent on a fixed row, which has no loop to tick.
+    #[serde(default)]
+    cadence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +146,13 @@ struct Published {
 struct Proof {
     file: String,
     test: String,
+    /// The test that shows the loop computing the number again in the same
+    /// process, rather than measuring it once at start-up.
+    beat: String,
+    /// The counter or last-beat reading the beat test reads, and the published
+    /// file carries. A claim that a loop runs is worth nothing if nothing
+    /// counts the beats.
+    evidence: String,
 }
 
 fn registry() -> Registry {
@@ -151,8 +160,8 @@ fn registry() -> Registry {
     let registry: Registry = serde_yaml::from_str(&text)
         .unwrap_or_else(|e| panic!("{REGISTRY} does not parse as a registry: {e}"));
     assert_eq!(
-        registry.version, 1,
-        "{REGISTRY}: this test reads version 1, and the version is here so that a \
+        registry.version, 3,
+        "{REGISTRY}: this test reads version 3, and the version is here so that a \
          change to the row shape is a version bump rather than a silent reinterpretation"
     );
     registry
@@ -194,6 +203,56 @@ fn has_test(text: &str, name: &str) -> bool {
             .rsplit('\n')
             .take(2)
             .any(|line| line.trim() == "#[test]" || line.trim() == "#[tokio::test]")
+}
+
+/// The body of `fn <name>(...)` in `text`, braces matched, comments and string
+/// literals skipped.
+///
+/// The proof check is about what a test *does*, and a name in a comment or in a
+/// message is not a call. Cutting the body out is the only way to ask that
+/// without running the test here. The scanner is deliberately small: it tracks
+/// double-quoted strings, escapes and line comments, which is every form a
+/// brace can hide behind in these test bodies. A file it cannot parse answers
+/// `None`, and the caller reports that rather than passing the row.
+fn test_body(text: &str, name: &str) -> Option<String> {
+    let at = text.find(&format!("fn {name}("))?;
+    let body = &text[at..];
+    let bytes = body.as_bytes();
+    let mut index = bytes.iter().position(|b| *b == b'{')?;
+    let start = index;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_line_comment = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_line_comment {
+            if byte == b'\n' {
+                in_line_comment = false;
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            in_line_comment = true;
+        } else if byte == b'{' {
+            depth += 1;
+        } else if byte == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(body[start..=index].to_string());
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Whether `text` is a number the chart would read as a value: `123`, `0.5`,
@@ -327,11 +386,60 @@ fn a_key_with_no_row_is_the_same_hole_as_a_key_with_no_loop() {
                 row.key, proof.test, proof.file
             ));
         }
+        // The value following its input is one half. A number measured once at
+        // start-up follows its input just as well as one recomputed every
+        // window, and the difference is only visible in a second test: the loop
+        // running again with the target unchanged, and the reading that counts
+        // the beats moving anyway.
+        if !has_test(&text, &proof.beat) {
+            wrong.push(format!(
+                "`{}` is registered as derived and its beat proof `{}` is not a \
+                 test in `{}`, so nothing shows the loop running rather than \
+                 measuring once",
+                row.key, proof.beat, proof.file
+            ));
+        } else {
+            match test_body(&text, &proof.beat) {
+                Some(body) if body.contains(&proof.evidence) => {}
+                Some(_) => wrong.push(format!(
+                    "`{}` names `{}` as the reading that counts its beats, and its \
+                     beat test `{}` never reads it",
+                    row.key, proof.evidence, proof.beat
+                )),
+                None => wrong.push(format!(
+                    "`{}` has a beat test `{}` whose body could not be read in `{}`",
+                    row.key, proof.beat, proof.file
+                )),
+            }
+        }
+        // The evidence has to be something the publisher actually writes: a
+        // counter named in the registry and nowhere in the code counts nothing,
+        // and the row would read as proof while the reading had no beat cell.
+        if let Some(published) = &row.published {
+            let publisher =
+                without_line_comments(&read(&repo_root().join(&published.file)));
+            if !publisher.contains(&proof.evidence) {
+                wrong.push(format!(
+                    "`{}` names `{}` as its beat evidence, and `{}` does not carry \
+                     that reading",
+                    row.key, proof.evidence, published.file
+                ));
+            }
+            match published.cadence.as_deref() {
+                Some("periodic") | Some("event") => {}
+                other => wrong.push(format!(
+                    "`{}` is registered as derived and its reading says the loop \
+                     ticks on {:?}; a derived number has to say whether a timer or \
+                     an event recomputes it (`periodic` or `event`)",
+                    row.key, other
+                )),
+            }
+        }
     }
     assert!(
         wrong.is_empty(),
-        "a value registered as derived without a test that moves its input is a \
-         constant with a comment: {wrong:#?}"
+        "a value registered as derived without a test that moves its input, and a \
+         beat test that reads the count, is a constant with a comment: {wrong:#?}"
     );
 }
 
@@ -541,9 +649,52 @@ fn the_registrys_words_are_the_labels_words() {
         Source::Derived.as_label(),
         Some(CapSource::Derived.as_str())
     );
+    // `fixed` is not a word a reading can carry: it lands nowhere, which is why
+    // a row that names a reading has to be `derived`.
+    assert_eq!(Source::Fixed.as_label(), None);
+}
+
+/// The third word is gone, and its absence is a rule rather than a count.
+///
+/// `override` used to mean "the deployment pinned this number". Every such row
+/// was either turned into a loop that measures the value or deleted, so the
+/// word now has no meaning a row could carry: a number nothing measures is
+/// either an agreement (`fixed`) or not a dial. Re-adding the word re-opens the
+/// end state one row at a time, and the row itself looks entirely ordinary on
+/// the page -- so the vocabulary refuses it, and this test names the refusal
+/// instead of letting serde report an unknown variant from inside `registry()`.
+#[test]
+fn the_registry_vocabulary_has_no_override() {
     assert_eq!(
-        Source::Override.as_label(),
-        Some(CapSource::Override.as_str())
+        serde_yaml::from_str::<Source>("derived").expect("`derived` is a source"),
+        Source::Derived
+    );
+    assert_eq!(
+        serde_yaml::from_str::<Source>("fixed").expect("`fixed` is a source"),
+        Source::Fixed
+    );
+    assert!(
+        serde_yaml::from_str::<Source>("override").is_err(),
+        "`override` is a source again: the end state has two words, `derived` \
+         (a measurement sets it) and `fixed` (an agreement, not a dial)"
+    );
+
+    let text = read(&repo_root().join(REGISTRY));
+    let offenders: Vec<String> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let line = line.trim_start();
+            line.strip_prefix("source:").is_some_and(|rest| rest.trim() == "override")
+        })
+        .map(|(index, _)| format!("{REGISTRY}:{}", index + 1))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these rows are registered as `override`, a word this registry no longer \
+         carries -- a value either has a loop that measures it (`derived`) or is \
+         an agreement no measurement should move (`fixed`); a number nobody \
+         measures is not a third kind, it is an unfinished row: {offenders:#?}"
     );
 }
 
@@ -912,8 +1063,8 @@ fn an_endpoint_the_code_requires_is_filled_by_the_chart() {
 const PROFILES: &str = "deploy/helm/cogneva/profiles";
 
 /// Where a values leaf may be read from when no template names it: the scripts
-/// that project the chart's numbers (the resource governance projection reads
-/// `resourceGovernance.clusterNodes`, and no manifest can).
+/// that consume the chart directly (the resource governance projection reads the
+/// LimitRange strategy by hand, and no manifest can).
 const DEPLOY_SCRIPTS: &str = "deploy/scripts";
 
 /// Every dotted path a template reads through `.Values.`.
@@ -1107,44 +1258,6 @@ fn the_registry_endpoints_the_code_reads_are_declared_on_both_paths() {
                 "{STATIC} never passes {env}, so the apply path leaves the deployer \
                  without an endpoint while the chart path has one"
             ));
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-/// Batches of the end state land one group at a time, and a group that has
-/// landed must not carry `override` rows again: `override` is the word the end
-/// state deletes, so a re-added row reopens debt that was closed by measuring
-/// or deleting the value.
-///
-/// A deleted key is absent from the registry and that is the point -- if it
-/// comes back as an override, the row reappears here and this test names it.
-#[test]
-fn a_landed_batch_carries_no_override() {
-    const LANDED_GROUPS: &[(&str, &[&str])] = &[(
-        // Address and platform defaults: one leaf is an address four objects
-        // agree on, and three restated a platform default or upstream default.
-        "B0",
-        &[
-            "clusterRegistry.port",
-            "evolution.progressDeadlineSeconds",
-            "backup.ttlSecondsAfterFinished",
-            "webSearch.safeSearch",
-        ],
-    )];
-
-    let registry = registry();
-    let mut wrong = Vec::new();
-    for (batch, keys) in LANDED_GROUPS {
-        for key in *keys {
-            if let Some(row) = registry.rows.iter().find(|r| r.key == *key) {
-                if row.source == Source::Override {
-                    wrong.push(format!(
-                        "{batch}: `{key}` is back to `override` -- a landed group \
-                         may only be `derived` or `fixed`, or be gone"
-                    ));
-                }
-            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

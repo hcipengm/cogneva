@@ -242,11 +242,12 @@ fn a_closed_pool_gate_releases_the_role_instead_of_holding_through_it() {
          之后一直攥着」的老写法，池关着时租约面上仍是「有人持着」。"
     );
 
-    // 闸那一段（到它自己的 `continue` 为止）必须把 owner 读数写成**自己站开**。
+    // 闸那一段（到它自己的 `break 'round;` 为止——这一轮到此为止，但这一拍
+    // 的收尾读数与节拍照走）必须把 owner 读数写成**自己站开**。
     let branch = &body[gate..];
     let cont = branch
-        .find("continue;")
-        .expect("池闸那一段没有收尾的 continue");
+        .find("break 'round;")
+        .expect("池闸那一段没有收尾的 break 'round;");
     assert!(
         branch[..cont].contains("Ownership::Yielded"),
         "闸那一段没有把 owner 读数写成 `Yielded`：`cogneva_loop_owner_held` 会停在上一轮的 1 上\
@@ -270,8 +271,10 @@ fn the_rounds_beat_is_not_behind_either_gate() {
         .find("loop {")
         .expect("spawn_discovery_loop 里没有循环");
     let beat = body.find("beat.beat()").expect("循环体里没有 beat.beat()");
+    // 每轮的等待由实测的节拍给出（`wait`），不再是固定周期的 `interval.tick()`：
+    // 位置要钉的是「每轮一次等待」，不是实现它的那个函数名。
     let next = body
-        .find("interval.tick().await")
+        .find("tokio::time::sleep(wait)")
         .expect("循环里没有节拍等待");
     let hold = body.find(ROLE_ASK).expect("循环体里没有 hold.may_act()");
     let gate = body

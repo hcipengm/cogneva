@@ -482,24 +482,32 @@ pub async fn run_claim_store_scan(
     observable: Arc<ClaimStoreObservable>,
     interval_secs: u64,
     shutdown: ShutdownSignal,
+    pacer: Option<cog_core::pacing::Pacer>,
 ) {
-    let interval = Duration::from_secs(interval_secs.max(MIN_INTERVAL_SECS));
+    let seed = Duration::from_secs(interval_secs.max(MIN_INTERVAL_SECS));
     let loop_name = format!("{SCAN_LOOP}:{}", observable.node());
     let _ = cog_core::loop_health::spawn(
         loop_name,
-        cog_core::loop_health::Cadence::Periodic(interval),
+        cog_core::loop_health::Cadence::Periodic(seed),
         shutdown.clone(),
         move |beat| {
             let observable = Arc::clone(&observable);
             let shutdown = shutdown.clone();
+            let pacer = pacer.clone();
             async move {
                 tracing::info!(
                     root = %observable.root().display(),
                     node = observable.node(),
-                    interval_secs = interval.as_secs(),
+                    interval_secs = seed.as_secs(),
                     "claim store scan started"
                 );
-                let mut ticker = tokio::time::interval(interval);
+                // The wait after a walk is what that walk measured, not a second
+                // copy of the seed: a walk of a node with a real image history
+                // can outlast the cadence, and the loop that comes back after it
+                // is running at the period the walk implies. The published
+                // target says which one that is. The first pass starts at once,
+                // as the ticker it replaces did.
+                let mut wait = Duration::ZERO;
                 loop {
                     // Stamped whether or not this pass found anything to walk:
                     // the age is a reading of the loop, and a loop that only
@@ -509,23 +517,41 @@ pub async fn run_claim_store_scan(
                     tokio::select! {
                         biased;
                         _ = shutdown.wait() => break,
-                        _ = ticker.tick() => {
-                            match observable.scan_blocking().await {
-                                Scan::Completed(report) => tracing::debug!(
-                                    dirs = report.dirs,
-                                    readable = report.readable,
-                                    skipped = report.skipped,
-                                    "claim store scanned"
-                                ),
-                                Scan::RootUnreadable => {}
-                            }
-                        }
+                        _ = tokio::time::sleep(wait) => {}
                     }
+                    let started = tokio::time::Instant::now();
+                    match observable.scan_blocking().await {
+                        Scan::Completed(report) => tracing::debug!(
+                            dirs = report.dirs,
+                            readable = report.readable,
+                            skipped = report.skipped,
+                            "claim store scanned"
+                        ),
+                        Scan::RootUnreadable => {}
+                    }
+                    let pass = started.elapsed();
+                    wait = wait_after_pass(pacer.as_ref(), seed, pass);
                 }
             }
         },
     )
     .await;
+}
+
+/// 一轮走了 `pass` 之后等多久。
+///
+/// 目标周期由同一条律给出（上轮耗时、种子、地板），等待是它减去这一轮已经用掉
+/// 的时间：走得比种子久时这一轮已经把等待用光了，不再在它之外叠一个种子。
+pub fn wait_after_pass(
+    pacer: Option<&cog_core::pacing::Pacer>,
+    seed: Duration,
+    pass: Duration,
+) -> Duration {
+    let target = match pacer {
+        Some(pacer) => pacer.beat(Some(pass)),
+        None => seed,
+    };
+    target.saturating_sub(pass)
 }
 
 #[cfg(test)]
@@ -537,6 +563,36 @@ mod tests {
     use std::path::Path;
 
     const NODE: &str = "node-a";
+
+    #[test]
+    fn the_wait_after_a_walk_follows_what_the_walk_cost() {
+        // The loop's own arithmetic, driven with two walks of different cost:
+        // the same seed, a different measured pass, a different wait and a
+        // different published target.
+        let readings = Arc::new(cog_core::pacing::PacingReadings::new());
+        let pacer = readings.pacer(
+            "claimStore.scanIntervalSecs",
+            Duration::from_secs(300),
+            Duration::from_secs(300),
+            1.0,
+        );
+        assert_eq!(
+            wait_after_pass(Some(&pacer), Duration::from_secs(300), Duration::from_secs(3)),
+            Duration::from_secs(297)
+        );
+        assert_eq!(
+            wait_after_pass(Some(&pacer), Duration::from_secs(300), Duration::from_secs(900)),
+            Duration::ZERO
+        );
+        let (target, evaluations, derived) = readings
+            .target("claimStore.scanIntervalSecs")
+            .expect("both waits were beats");
+        assert_eq!(target, Duration::from_secs(900));
+        // The count is what says the beat is running: the target moved because a
+        // walk was measured, not because a number was written down.
+        assert_eq!(evaluations, 2);
+        assert!(derived);
+    }
 
     fn scratch(name: &str) -> cog_test_support::ScratchDir {
         cog_test_support::ScratchDir::new(&format!("claim-store-{name}"))

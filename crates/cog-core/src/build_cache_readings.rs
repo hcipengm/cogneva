@@ -240,6 +240,9 @@ pub struct BuildCacheReadings {
     /// from the clock would move between the pass that deleted to it and the
     /// scrape that reported it.
     derived_cap: AtomicU64,
+    /// Walks that derived the cap. A steady cache derives the same number every
+    /// walk, so the number alone cannot say whether the derivation still runs.
+    cap_evaluations: AtomicU64,
     /// What the volume behind this directory leaves for it, measured by the
     /// loop that owns the volume; [`NO_CEILING`] when nothing has measured it.
     ///
@@ -266,6 +269,10 @@ pub struct BuildCacheReadings {
     /// what a pass costs is the measurement an interval should follow, and
     /// only the loop that runs the passes has it.
     scan_interval_secs: AtomicU64,
+    /// Passes that stated the cadence. The interval changes only when a pass's
+    /// cost does; this moves on every pass, which is what tells a steady loop
+    /// from a stopped one.
+    scan_interval_evaluations: AtomicU64,
     /// Where the cap came from, or `None` to read it as the deployment's.
     ///
     /// A cap in force that nothing said otherwise about is one the deployment
@@ -300,9 +307,11 @@ impl BuildCacheReadings {
             scanned_at: AtomicU64::new(0),
             cap: CacheCapSetting::Unbounded,
             derived_cap: AtomicU64::new(0),
+            cap_evaluations: AtomicU64::new(0),
             cap_ceiling: AtomicU64::new(NO_CEILING),
             peak: Mutex::new(Peak::default()),
             scan_interval_secs: AtomicU64::new(0),
+            scan_interval_evaluations: AtomicU64::new(0),
             cap_source: None,
             reclaim: Mutex::new(ReclaimState::default()),
             reclaimed_bytes: AtomicU64::new(0),
@@ -445,6 +454,12 @@ impl BuildCacheReadings {
         // cap, so a derived cap bottoms out at one byte.
         let derived = if peak == 0 { 0 } else { cap.max(1) };
         self.derived_cap.store(derived, Ordering::Release);
+        self.cap_evaluations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Walks that derived the cap from their own measurement.
+    pub fn cap_evaluations(&self) -> u64 {
+        self.cap_evaluations.load(Ordering::Relaxed)
     }
 
     /// How long between walks.
@@ -462,6 +477,12 @@ impl BuildCacheReadings {
     /// against it would be comparing against something nothing runs at.
     pub fn set_scan_interval_secs(&self, secs: u64) {
         self.scan_interval_secs.store(secs, Ordering::Release);
+        self.scan_interval_evaluations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Passes that stated the cadence they are keeping.
+    pub fn scan_interval_evaluations(&self) -> u64 {
+        self.scan_interval_evaluations.load(Ordering::Relaxed)
     }
 
     /// Record one completed walk.
@@ -711,6 +732,16 @@ impl BuildCacheReadings {
             )
             .with_label(DIR_LABEL, dir),
             RawMetric::new(
+                BUILD_TARGET_SCAN_INTERVAL_EVALUATIONS_METRIC,
+                self.scan_interval_evaluations() as f64,
+            )
+            .with_label(DIR_LABEL, dir),
+            RawMetric::new(
+                BUILD_TARGET_CAP_EVALUATIONS_METRIC,
+                self.cap_evaluations() as f64,
+            )
+            .with_label(DIR_LABEL, dir),
+            RawMetric::new(
                 BUILD_TARGET_RECLAIMED_METRIC,
                 self.reclaimed_bytes.load(Ordering::Relaxed) as f64,
             )
@@ -876,25 +907,63 @@ impl Observable for BuildCacheReadings {
     }
 }
 
+/// The wait before the next pass, from what the last one cost.
+///
+/// Split out because it is the loop's whole decision: a pass that took a real
+/// share of the interval it ran at pushes the next one out by the same
+/// multiple, and a pass that was cheap leaves the cadence where the deployment
+/// put it. No handle means no measurement, and then the cadence does not move --
+/// reporting a derived wait that nobody computed would be worse than not having
+/// one.
+fn next_scan_wait(
+    pacing: Option<&crate::pacing::Pacer>,
+    current: Duration,
+    pass: Duration,
+) -> Duration {
+    match pacing {
+        Some(pacing) => pacing.beat(Some(pass)),
+        None => current,
+    }
+}
+
 /// Re-measure the cache on a timer, publish the result on `readings`, and
 /// enforce its cap.
+///
+/// `pacing` is the loop's own cadence handle: each pass is timed, and the wait
+/// before the next one is derived from what that pass cost (`paced_interval`).
+/// Without a handle the cadence stays at the configured interval — a caller
+/// that did not install the loop publishes no target, and pretending otherwise
+/// would be a reading nobody computes.
 pub fn spawn_build_cache_watch(
     readings: Arc<BuildCacheReadings>,
     shutdown: ShutdownSignal,
+    pacing: Option<Arc<crate::pacing::Pacer>>,
 ) -> tokio::task::JoinHandle<()> {
     let dir = readings.dir().to_path_buf();
-    let interval = Duration::from_secs(readings.scan_interval_secs());
+    let interval = pacing
+        .as_ref()
+        .map(|p| p.seed())
+        .unwrap_or_else(|| Duration::from_secs(readings.scan_interval_secs()));
     // Every series this watcher publishes is its own measurement — the size, the
     // cap it is held to, what a pass reclaimed. If the task died, all of them
     // stop being written, and a cache nobody is measuring reads exactly like a
     // cache that is small. Its liveness therefore cannot come from itself.
+    //
+    // The pass itself is bounded by one interval (the walk timeout), so the
+    // declared wall is two: a cadence that moved under the measurement is
+    // published on the pacing series, which is where the operating period is
+    // read; this declaration stays the loop's liveness bound.
     crate::loop_health::spawn(
         BUILD_CACHE_WATCH_LOOP,
-        crate::loop_health::Cadence::Periodic(interval),
+        crate::loop_health::Cadence::PeriodicWithWork {
+            period: interval,
+            work: interval,
+        },
         shutdown.clone(),
         // Rebuilt per attempt, so everything the body consumes is cloned here.
         move |beat| {
             let readings = Arc::clone(&readings);
+            let pacing = pacing.clone();
             let dir = dir.clone();
             let shutdown = shutdown.clone();
             async move {
@@ -918,7 +987,7 @@ pub fn spawn_build_cache_watch(
                     ),
                 }
 
-                let mut ticker = tokio::time::interval(interval);
+                let mut wait = interval;
                 loop {
                     // One stamp per pass, whatever the pass measured: a cache that did not
                     // grow is not a watcher that stopped.
@@ -926,16 +995,24 @@ pub fn spawn_build_cache_watch(
                     tokio::select! {
                         biased;
                         _ = shutdown.wait() => break,
-                        _ = ticker.tick() => {
+                        _ = tokio::time::sleep(wait) => {
                             // Read per pass rather than remembered: the gate is
                             // installed during startup and the readings object is
                             // built beside it, so a slot captured once could be
                             // the empty one and the cap would then be reported as
                             // unenforceable for the life of the process.
                             let slot = crate::contract::build_gate::cache_slot();
+                            let started = std::time::Instant::now();
                             readings
                                 .measure_and_enforce(slot.as_ref().map(|g| g as &dyn CacheSlot))
                                 .await;
+                            // The pass just timed is the input: the next wait is
+                            // what that much work says it should be. The number
+                            // the readings publish is set here as well, so a rule
+                            // comparing a pass against its cadence sees the
+                            // cadence the loop is actually keeping.
+                            wait = next_scan_wait(pacing.as_deref(), wait, started.elapsed());
+                            readings.set_scan_interval_secs(wait.as_secs());
                         }
                     }
                 }
@@ -947,6 +1024,48 @@ pub fn spawn_build_cache_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait between passes follows what the last pass cost, and the
+    /// evaluation count says the loop has computed it. This is the decision the
+    /// watcher makes after every pass; the test feeds it the two passes a real
+    /// walk produces (a cheap one, then one that ate a real share of the
+    /// interval) and checks the cadence moves with the second.
+    #[test]
+    fn the_wait_between_passes_follows_what_the_last_pass_cost() {
+        let pacing = Arc::new(crate::pacing::PacingReadings::new());
+        let seed = Duration::from_secs(60);
+        let pacer = Arc::new(pacing.pacer("cache_scan_probe", seed, seed, 20.0));
+
+        // A pass far below a twentieth of the interval leaves the declaration in
+        // force: there is nothing in one millisecond of work worth a wider gap.
+        let cheap = next_scan_wait(Some(&pacer), seed, Duration::from_millis(1));
+        assert_eq!(cheap, seed);
+        assert_eq!(pacer_evaluations(&pacing), 1);
+
+        // A pass that took twice the interval is a real share of it: the next
+        // wait is twenty times the pass, and the target the pacing series
+        // publishes follows in the same beat.
+        let expensive = next_scan_wait(Some(&pacer), cheap, Duration::from_secs(120));
+        assert_eq!(expensive, Duration::from_secs(2400));
+        assert_eq!(
+            pacing.target("cache_scan_probe").map(|(t, _, _)| t),
+            Some(Duration::from_secs(2400))
+        );
+        assert_eq!(pacer_evaluations(&pacing), 2);
+
+        // No handle, no measurement: the cadence does not invent one.
+        assert_eq!(
+            next_scan_wait(None, seed, Duration::from_secs(120)),
+            seed
+        );
+    }
+
+    fn pacer_evaluations(pacing: &crate::pacing::PacingReadings) -> u64 {
+        pacing
+            .target("cache_scan_probe")
+            .map(|(_, evaluations, _)| evaluations)
+            .unwrap_or(0)
+    }
 
     /// The published interval is the one the loop keeps, not the one the
     /// deployment named: the loop times its passes and states the period it
@@ -995,6 +1114,11 @@ mod tests {
         // measured", and a full disk must not read as unbounded.
         readings.derive_cap(2_000, Some(0));
         assert_eq!(readings.cap_bytes(), Some(1));
+
+        // Five walks derived, five counts: the value alone cannot say whether
+        // the derivation is still running, and 1200 -> 1200 is what a stopped
+        // loop and a steady cache both look like.
+        assert_eq!(readings.cap_evaluations(), 5);
     }
 
     /// A ceiling measured by the loop that owns the volume wins over both

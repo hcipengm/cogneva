@@ -30,20 +30,22 @@ data:
   # `pool timed out while waiting for an open connection`：每进程五个池各九条，
   # 三个进程九十条，服务器只剩九十七条，第四个进程一上来就超。
   #
-  # 值从各工作负载的副本数算出来，不是这里另写一个数：改了副本数而这里不动，
-  # 分摊就会按过期的进程数做。`+1` 是滚动影子——同一次滚动里新 Pod 已经连上、
-  # 旧 Pod 还没退出，两者都要算。
-  COGNEVA_PG_SHARING_PROCESSES: "4"
+  # 值按各工作负载**可能达到的副本数上限**算：主应用与安全网关的副本数由
+  # 集群就绪节点数在运行时给出（一节点一个、多节点两个），渲染时只知道种子上限，
+  # 所以这里取 `max(种子, 2)`——按运行时的最小值算，分摊就会按过期的进程数做，
+  # 多出来的那个 Pod 一上来就会等到 `pool timed out`。`+1` 是滚动影子——同一次
+  # 滚动里新 Pod 已经连上、旧 Pod 还没退出，两者都要算。
+  COGNEVA_PG_SHARING_PROCESSES: "6"
   # 向量后端的地址直接由代码读 QDRANT_URL；没有第二个 provider 开关要同步。
   QDRANT_URL: "http://qdrant.cogneva.svc.cluster.local:6334"
   COGNEVA_MEDIA_PROVIDER: "local-sfu"
   COGNEVA_STORAGE_PROVIDER: "local-fs"
 
   COGNEVA_WORKSPACE_ID: "default"
-  # 每个用户工作区的字节上限（0 = 不限）。拒绝写入时把这条错误信息里点名的
-  # 就是这一个键，所以它必须真的能从 values 走到这里——否则报错指的是一条
-  # 运维按正常路径改不动的开关。
-  COGNEVA_WORKSPACE_MAX_BYTES: "1073741824"
+  # 每个用户工作区的字节上限。这里**不写默认值**：网关自己有同一条界（它的
+  # 默认在建工作区的那段代码里），chart 再抄一份就是同一件事的第二处声明。
+  # 但这条 env 必须留着可写——拒绝写入的错误信息点名这个键，运维要能沿正常
+  # 路径把它传进去；不传时由网关自己的默认生效。
   COGNEVA_CONSUMER_GROUP: "cogneva"
   # 看板列的在制品上限。空串＝没配＝不限，渲染成空串而不是省略：省略会让「清单里
   # 没有这个键」与「运维没配」变成同一件事。发布侧与看板读面都经 envFrom 取这一份，
@@ -55,9 +57,12 @@ data:
 
   # 一个执行进程同时跑几道任务，也就是同时花 token 额度的条数。进程级：本进程
   # 读的每条就绪队列共用这一份许可。它是「全局一次跑几道」的那个数——看板的列
-  # 上限按 goal 分区，管不到跨 goal 的并行。进程读它一次，并把它作为
-  # `cogneva_task_router_claim_slots` 报出去，所以配置与生效在读数面是同一个值。
-  COGNEVA_TASK_CLAIM_CONCURRENCY: "2"
+  # 上限按 goal 分区，管不到跨 goal 的并行。
+  #
+  # 0 = 按池子的窗口导出：每拍读 `(额度-已花) ÷ 单任务价格`（价格是池子对已完成
+  # 任务的实测），把界写回 `cogneva_task_router_claim_slots` 并带 `source` 标签；
+  # 正数是钉死的覆盖位。两种情形报的都是真正在用的那个界。
+  COGNEVA_TASK_CLAIM_CONCURRENCY: "0"
 
   # 本地车道（`:local`）自己的在途上限。只有带 executor 角色的部署读这条流，变更
   # 任务全在它上面跑；与上面那格分开，因为一个进程读得到的别的流并不受这个数影响。
@@ -68,9 +73,13 @@ data:
   # 变更账一拍把一个项目的几条欠账并成一道任务派出去。价格的大头是任务的固定部分
   # （一次规划、一轮上下文、一轮沙箱验证），它不随任务承载几条增长，所以并得越多、
   # 每条欠账摊到的钱越少。上限在生成侧而不在这一格：一批写成一份变更，超过一次
-  # 生成写得完的量就会截断、整批报废，所以它是「一次生成装得下几条修复」，不是
-  # 拍板定的界——要抬就直接改这一格，代码里那个默认值只是没配时的起点。
-  COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER: "5"
+  # 生成写得完的量就会截断、整批报废。
+  #
+  # 0 = 按图里的批次导出：每拍读一次它自己交出去的批次，落地整批的最大条数 + 1
+  # 就是下一拍的界，被工作本身退回的批次给界封顶（证据 30 天后过期）；还没量到
+  # 更大的批次时用 5 作起点。界写回 `cogneva_change_ledger_rows_per_handover`
+  # 并带 `source`，每拍记一次 `_evaluations_total`。正数是钉死的覆盖位。
+  COGNEVA_CHANGE_LEDGER_ROWS_PER_HANDOVER: "0"
 
   # 进程被告知的三个端口，与容器实际监听的那三个同源（values 的 gateway.*Port，
   # 也与 files/cogneva.json 里的 gateway.*_port 同源）：env 层覆盖 JSON，两处

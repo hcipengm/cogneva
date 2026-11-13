@@ -51,7 +51,8 @@
 # 那个镜像。见 memory/feedback_a_checkpoint_is_keyed_on_the_software_rev_so_an_image_change_starts_over.md。
 #
 # 退出码：0＝到目标；1＝时间用尽仍未到目标（读数在日志里）；2＝参数错；
-#         3＝前置条件问不出来（kubectl 不可用／checkpoint 读不到），不许当 0 读。
+#         3＝前置条件问不出来（kubectl 不可用／checkpoint 读不到／线上 deployment
+#         的容器形状读不到），不许当 0 读。
 set -u
 
 NAMESPACE=${NAMESPACE:-cogneva}
@@ -107,10 +108,14 @@ PSTALL_MIN_BYTES_PER_SEC=${PSTALL_MIN_BYTES_PER_SEC:-64}
 NODE_NAME=${NODE_NAME:-$(hostname)}
 LOG=${LOG:-$RUNS_DIR/.runner/rerun.log}
 DRY_RUN=${DRY_RUN:-}
-# 只打印这台 Pod 的清单、不碰集群。清单里的形状（limits/requests）同时被 chart 的
-# `resourceGovernance.runtimeWorkloads` 声明了一次——额度按那一份把天花板加发一份，
-# 两边不一致时准入按另一份数算，滚动的重叠额度就会被这台 Pod 借走。测试拿这个开关
-# 比对两边，见 `eval-registered-rerun.test.sh`。
+# 这台 Pod 的资源形状不在这份脚本里写死：它跟线上部署的容器声明走——那组数是部署侧
+# 从实测读数推出来的（`crates/cog-reflection/src/workload_resources.rs`），把这台 Pod
+# 按同一个形状放进命名空间，它占的就是「线上那份工作负载的一份」。读不到形状时线上
+# 那一跑退 3，不回落成一份写死的预算。
+#
+# 只打印这台 Pod 的清单、不建任何东西。它会**读**一次集群（只为拿线上形状）；问不到
+# 时退回一个明说的种子形状，清单上的 `cogneva.dev/resources-source` 注解记着用的是
+# 哪一份（`deployment/<名字>` 或 `seed`）。CI 与刚克隆下来的机器靠这一支看形状。
 PRINT_POD=${PRINT_POD:-}
 # 只做「把这一族留下的 Pod 收干净」并印判词，然后退出。给测试一个不建 Pod、不连评估
 # 循环的入口；线上每一轮起 Pod 之前走的是同一段（见 reclaim）。
@@ -141,7 +146,9 @@ Usage: eval-registered-rerun.sh [options]
   --dry-run <file>   replay past samples (`<epoch> <bytes> <io 或 ->` one per line);
                      prints the verdict and builds nothing
   --print-pod        print the pod manifest this run would create and exit; builds
-                     nothing (the quota's runtime-pod budget is declared from it)
+                     nothing. Its shape is read from the live deployment's own
+                     container resources (a stated seed only when that cannot be
+                     read); the manifest names which one it used
   --reclaim          delete the pods this run left behind, wait until the checkpoint is
                      free, print the verdict and exit; creates nothing
 EOF
@@ -272,9 +279,18 @@ stop_round() {
   [ -n "$pod" ] || return 0
   CURRENT_POD=
   $KUBECTL -n "$NAMESPACE" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1
+  # 等它真的消失再减额度：还在终止的 Pod 仍记 used，先减会让配额短暂落在 used 之下，
+  # 别人的下一次准入会先被拒。等不到也照样减——多留一份比缺一份更容易被下一轮看见。
+  $KUBECTL -n "$NAMESPACE" wait --for=delete "pod/$pod" --timeout=60s >/dev/null 2>&1 || true
   log "deleted this round's pod $pod: the driver is stopping, and a pod that outlives it holds the checkpoint"
 }
-trap stop_round EXIT
+# 被 TERM/INT/正常结束时，Pod 与它撑开的额度都要跟着走。配额那一份在 Pod 还活着时
+# 抬上去、Pod 消失后放回来；trap 跑不到的 SIGKILL 由下一次 drift 读数发现。
+cleanup() {
+  stop_round
+  quota_restore
+}
+trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 
@@ -301,6 +317,156 @@ deployed_rev() {
 live_image() {
   $KUBECTL -n "$NAMESPACE" get deployment "$LIVE_DEPLOYMENT" \
     -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null
+}
+
+# ── 这一轮 Pod 的形状：跟线上部署的容器声明走 ────────────────────────────────
+#
+# 这台 Pod 跑的是线上那份二进制、读同一套数据、连同一个网关，所以它在准入里占的
+# 就是线上工作负载的一份。那组 requests/limits 本身是部署侧的读数推出来的
+# （workload_resources 回路把测量结果写回 deployment 的容器声明），这里照抄它，
+# 形状就只剩一个来源：线上此刻的样子。写死一份的代价 2026-10-26 实测过——那台
+# 3Gi 的 Pod 在跑时，滚动 surge 恰好差 1Gi 装不进去，部署器按设计扣住不动。
+#
+# 问不出形状时线上那一跑退 3，不回落：回落成的数会与「线上是什么」在准入面重新
+# 同形，而那正是这次要拆开的东西。只有 --print-pod（不建任何东西）退回种子，
+# 清单的注解写明它用的是哪一份。
+SHAPE_CPU_REQ=
+SHAPE_MEM_REQ=
+SHAPE_CPU_LIM=
+SHAPE_MEM_LIM=
+RESOURCES_SOURCE=
+# 种子只服务 --print-pod 的离线分支；它不参与任何一次真实的准入。
+SEED_CPU_REQ=${SEED_CPU_REQ:-500m}
+SEED_MEM_REQ=${SEED_MEM_REQ:-1Gi}
+SEED_CPU_LIM=${SEED_CPU_LIM:-2}
+SEED_MEM_LIM=${SEED_MEM_LIM:-3Gi}
+
+live_shape() {
+  $KUBECTL -n "$NAMESPACE" get deployment "$LIVE_DEPLOYMENT" \
+    -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}{" "}{.spec.template.spec.containers[0].resources.requests.memory}{" "}{.spec.template.spec.containers[0].resources.limits.cpu}{" "}{.spec.template.spec.containers[0].resources.limits.memory}' 2>/dev/null
+}
+
+# resolve_shape <live|print>
+resolve_shape() {
+  local mode=$1 raw cr mr cl ml
+  raw=$(live_shape) || raw=''
+  # 全部四个都要有：准入在 requests 与 limits 两个面上都读，缺一维意味着这份部署
+  # 没声明它，按另一份数补就是猜。
+  read -r cr mr cl ml <<<"$raw" || true
+  if [ -n "${cr:-}" ] && [ -n "${mr:-}" ] && [ -n "${cl:-}" ] && [ -n "${ml:-}" ]; then
+    SHAPE_CPU_REQ=$cr
+    SHAPE_MEM_REQ=$mr
+    SHAPE_CPU_LIM=$cl
+    SHAPE_MEM_LIM=$ml
+    RESOURCES_SOURCE="deployment/$LIVE_DEPLOYMENT"
+    return 0
+  fi
+  if [ "$mode" = print ]; then
+    SHAPE_CPU_REQ=$SEED_CPU_REQ
+    SHAPE_MEM_REQ=$SEED_MEM_REQ
+    SHAPE_CPU_LIM=$SEED_CPU_LIM
+    SHAPE_MEM_LIM=$SEED_MEM_LIM
+    RESOURCES_SOURCE=seed
+    return 0
+  fi
+  log "cannot read the container resources of deployment/$LIVE_DEPLOYMENT in namespace $NAMESPACE (got '${raw}'): the pod takes its shape from there, and a made-up one would put it in the quota under different numbers than the workload it stands in for"
+  exit 3
+}
+
+# ── 配额：创建前按这台 Pod 的形状抬上去，删掉之后再放回来 ────────────────────
+#
+# 为什么不是写进 chart 的一份预算：那台 Pod 的尺寸只有一个来源（线上部署此刻的
+# 声明），预算是它的第二个数。抬/减都是**加性**的：只加自己这一份，没碰别人的
+# 头寸；中途被杀时靠 EXIT trap 放回，trap 也跑不到的那种残余由 drift 门禁读到
+# （它比的是声明的硬顶，多出来的那一份不会自己消失）。
+QUOTA_NAME=${QUOTA_NAME:-cogneva-quota}
+QUOTA_RAISED=
+QUOTA_SAVED=
+
+cpu_milli() { # 500m -> 500, 2 -> 2000
+  awk -v v="$1" 'BEGIN { if (v == "") exit 1; if (v ~ /m$/) { sub(/m$/, "", v); printf "%.0f\n", v } else { printf "%.0f\n", v * 1000 } }'
+}
+
+mem_bytes() { # 3Gi -> 3221225472
+  awk -v v="$1" 'BEGIN {
+    if (v == "") exit 1
+    u["Ki"] = 1024; u["Mi"] = 1024^2; u["Gi"] = 1024^3
+    u["Ti"] = 1024^4; u["Pi"] = 1024^5; u["Ei"] = 1024^6
+    u["k"] = 1000; u["M"] = 1000^2; u["G"] = 1000^3
+    u["T"] = 1000^4; u["P"] = 1000^5; u["E"] = 1000^6
+    for (s in u) { if (length(v) > length(s) && substr(v, length(v) - length(s) + 1) == s) {
+      printf "%.0f\n", substr(v, 1, length(v) - length(s)) * u[s]; exit } }
+    printf "%.0f\n", v
+  }'
+}
+
+fmt_cpu_milli() {
+  if [ $(( $1 % 1000 )) -eq 0 ]; then echo $(( $1 / 1000 )); else echo "${1}m"; fi
+}
+
+fmt_mem_bytes() {
+  if [ $(( $1 % 1073741824 )) -eq 0 ]; then echo "$(( $1 / 1073741824 ))Gi"
+  elif [ $(( $1 % 1048576 )) -eq 0 ]; then echo "$(( $1 / 1048576 ))Mi"
+  elif [ $(( $1 % 1024 )) -eq 0 ]; then echo "$(( $1 / 1024 ))Ki"
+  else echo "$1"; fi
+}
+
+# 当前硬顶的五维（缺的维留空，空格分隔）。没有配额时输出为空且 rc=0——那不是在
+# 问问题，是这份部署本来就没有天花板。
+quota_hard() {
+  $KUBECTL -n "$NAMESPACE" get resourcequota "$QUOTA_NAME" --ignore-not-found \
+    -o jsonpath='{.spec.hard.requests\.cpu}{" "}{.spec.hard.requests\.memory}{" "}{.spec.hard.limits\.cpu}{" "}{.spec.hard.limits\.memory}{" "}{.spec.hard.pods}' 2>/dev/null
+}
+
+quota_raise() {
+  local hard cr mr cl ml pods body=''
+  hard=$(quota_hard) || {
+    log "cannot read resourcequota/$QUOTA_NAME in namespace $NAMESPACE"
+    return 1
+  }
+  case "$hard" in *[![:space:]]*) ;; *) hard='' ;; esac
+  if [ -z "$hard" ]; then
+    log "no resourcequota/$QUOTA_NAME in $NAMESPACE: the run creates its pod without a namespace ceiling"
+    return 0
+  fi
+  read -r cr mr cl ml pods <<<"$hard"
+  QUOTA_SAVED="$cr $mr $cl $ml $pods"
+  # requests 与 limits 各加一份 Pod 自己的形状；pods 加 1。缺的那一维不加——配额
+  # 没声明它，就没有什么可撑开的。
+  [ -n "$cr" ] && body="$body\"requests.cpu\":\"$(fmt_cpu_milli $(( $(cpu_milli "$cr") + $(cpu_milli "$SHAPE_CPU_REQ") )))\","
+  [ -n "$mr" ] && body="$body\"requests.memory\":\"$(fmt_mem_bytes $(( $(mem_bytes "$mr") + $(mem_bytes "$SHAPE_MEM_REQ") )))\","
+  [ -n "$cl" ] && body="$body\"limits.cpu\":\"$(fmt_cpu_milli $(( $(cpu_milli "$cl") + $(cpu_milli "$SHAPE_CPU_LIM") )))\","
+  [ -n "$ml" ] && body="$body\"limits.memory\":\"$(fmt_mem_bytes $(( $(mem_bytes "$ml") + $(mem_bytes "$SHAPE_MEM_LIM") )))\","
+  [ -n "$pods" ] && body="$body\"pods\":\"$(( pods + 1 ))\","
+  body=${body%,}
+  if ! $KUBECTL -n "$NAMESPACE" patch resourcequota "$QUOTA_NAME" --type=merge \
+      -p "{\"spec\":{\"hard\":{$body}}}" >/dev/null 2>&1; then
+    log "cannot widen resourcequota/$QUOTA_NAME by this pod's shape; refusing to create a pod under a ceiling that does not admit it"
+    return 1
+  fi
+  QUOTA_RAISED=1
+  log "widened resourcequota/$QUOTA_NAME by this pod's shape (requests $SHAPE_CPU_REQ/$SHAPE_MEM_REQ, limits $SHAPE_CPU_LIM/$SHAPE_MEM_LIM, pods +1); it goes back once the pod is gone"
+  return 0
+}
+
+quota_restore() {
+  [ -n "${QUOTA_RAISED:-}" ] || return 0
+  QUOTA_RAISED=
+  local cr mr cl ml pods body=''
+  read -r cr mr cl ml pods <<<"${QUOTA_SAVED:-}"
+  [ -n "$cr" ] && body="$body\"requests.cpu\":\"$cr\","
+  [ -n "$mr" ] && body="$body\"requests.memory\":\"$mr\","
+  [ -n "$cl" ] && body="$body\"limits.cpu\":\"$cl\","
+  [ -n "$ml" ] && body="$body\"limits.memory\":\"$ml\","
+  [ -n "$pods" ] && body="$body\"pods\":\"$pods\","
+  body=${body%,}
+  [ -n "$body" ] || return 0
+  if $KUBECTL -n "$NAMESPACE" patch resourcequota "$QUOTA_NAME" --type=merge \
+      -p "{\"spec\":{\"hard\":{$body}}}" >/dev/null 2>&1; then
+    log "resourcequota/$QUOTA_NAME is back at its declared ceiling"
+  else
+    log "could not put resourcequota/$QUOTA_NAME back at its declared ceiling: this round's raise is still in place, and the governance drift check will read it"
+  fi
 }
 
 judged() {
@@ -429,12 +595,15 @@ metadata:
     # 这一轮由哪个宿主进程起的。下一轮起 Pod 前靠它分辨「上一轮的残余」与「另一个还在
     # 跑的驱动」：前者该删，后者该让。
     cogneva.dev/runner-pid: "$$"
+    # 这台 Pod 的形状是从哪儿读来的（deployment/<名字>，或离线打印时的 seed）。
+    # 准入按形状记账，读的人要知道这份形状跟着谁走。
+    cogneva.dev/resources-source: "$RESOURCES_SOURCE"
 spec:
   restartPolicy: Never
   nodeName: $NODE_NAME
   containers:
   - name: eval
-    # 空的只会出现在 --print-pod：那一分支是纯渲染、不连集群，所以问不到线上镜像。
+    # 空的只会出现在 --print-pod：那一分支不读线上镜像（无集群时形状也用种子）。
     # （这一段是不加引号的 heredoc，反引号会被当成命令替换执行，所以这里不用反引号。）
     image: ${IMAGE:-localhost:30500/cogneva:live}
     env:
@@ -450,7 +619,7 @@ spec:
            "--scaffolds","gepa,agentflow",
            "--seeds","0,1,2","--tools","platform","--concurrency-slot","4",
            "--out","$OUT"]
-    resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 3Gi}}
+    resources: {requests: {cpu: $SHAPE_CPU_REQ, memory: $SHAPE_MEM_REQ}, limits: {cpu: "$SHAPE_CPU_LIM", memory: $SHAPE_MEM_LIM}}
     volumeMounts:
     - {name: data, mountPath: /data, readOnly: true}
     - {name: runs, mountPath: /eval}
@@ -465,8 +634,13 @@ spec:
 EOF
 }
 
-# 打印就到此为止：下面每一行都会连集群。
-if [ -n "$PRINT_POD" ]; then manifest "${PRINT_POD_NAME:-eval-registered-rerun-shape}"; exit 0; fi
+# 打印就到此为止：下面每一行都会建东西。这里只读一次集群拿形状；问不到时用明说的
+# 种子，清单上的注解记着是哪一个。
+if [ -n "$PRINT_POD" ]; then
+  resolve_shape print
+  manifest "${PRINT_POD_NAME:-eval-registered-rerun-shape}"
+  exit 0
+fi
 
 # 只收残余：不读镜像、不问能不能建 Pod、不起任何东西。判词是机器可读的一行。
 if [ -n "$RECLAIM_ONLY" ]; then
@@ -480,9 +654,10 @@ if [ -n "$RECLAIM_ONLY" ]; then
 fi
 
 # 前置条件问不出来就判 3，别让它跑成一串「0 例」。
-# 这一段排在 `--print-pod` **之后**：打印清单是纯渲染，不连集群，也不读检查点。
-# 排在前面时，任何一台没有集群的机器（CI、刚克隆下来读形状的人）拿到的都是 3，
-# 而不是那份清单——判据看起来最严，实际把这个功能关在了只有集群机器上。
+# 这一段排在 `--print-pod` **之后**：打印清单不建任何东西、也不读检查点，只读一次
+# 集群拿形状（读不到就用明说的种子）。排在前面时，任何一台没有集群的机器（CI、
+# 刚克隆下来读形状的人）拿到的都是 3，而不是那份清单——判据看起来最严，实际把这个
+# 功能关在了只有集群机器上。
 $KUBECTL -n "$NAMESPACE" auth can-i create pods >/dev/null 2>&1 || { log "cannot ask the cluster whether pods may be created"; exit 3; }
 [ -f "$CKPT" ] || [ "$(judged)" = 0 ] || { log "the checkpoint cannot be read: $CKPT"; exit 3; }
 
@@ -524,8 +699,14 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     exit 3
   fi
   $KUBECTL -n "$NAMESPACE" delete pod "$name" --ignore-not-found --wait=false >/dev/null 2>&1
+  # 形状每一轮重读：部署会在这一跑的几个小时里滚好几次，workload_resources 回路
+  # 会把新测出来的那组数写回 deployment。读不到就是 3（resolve_shape 自己退），
+  # 不拿上一轮的形状继续建。
+  resolve_shape live
+  quota_raise || exit 3
   if ! manifest "$name" | $KUBECTL apply -f - >/dev/null 2>&1; then
     log "the pod could not be created ($name); retrying"
+    quota_restore
     sleep "$PAUSE"; continue
   fi
   CURRENT_POD=$name
@@ -559,6 +740,9 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   log "run $name phase=$phase dur=$(( $(date +%s) - started ))s judged=$before->$after scaffolds=$(by_scaffold) last=${last:-<no output>}"
   $KUBECTL -n "$NAMESPACE" delete pod "$name" --ignore-not-found --wait=false >/dev/null 2>&1
   CURRENT_POD=
+  # 等它不再记 used，再把自己那一份额度放回去。
+  $KUBECTL -n "$NAMESPACE" wait --for=delete "pod/$name" --timeout=60s >/dev/null 2>&1 || true
+  quota_restore
   if [ "$after" -gt "$before" ]; then sleep "$PAUSE_AFTER_GAIN"; else sleep "$PAUSE"; fi
 done
 

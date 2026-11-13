@@ -30,9 +30,17 @@ use tracing::warn;
 /// `http://cogneva-security-gateway:8083/v1/chat/completions`. Absent or empty means this
 /// station is not wired up, and a run then does what the rules alone can do.
 pub const URL_ENV: &str = "HOST_DOCS_AUDITED_LLM_URL";
-/// How many bytes of one body the question carries.
+/// The most one question may put on the wire: the audited channel's own audit
+/// bound, handed to this pod from the same chart value the channel enforces.
+/// Absent means this deployment does not state one; the plan then has only what
+/// it has measured itself.
+pub const AUDIT_BUDGET_ENV: &str = "HOST_DOCS_ASSIST_AUDIT_BUDGET_BYTES";
+/// The smallest prefix a question gives one body. Not a ceiling: the plan may
+/// give a body more (see [`question_plan`]); this is the amount below which
+/// this deployment has said a prefix stops being evidence of what a file is.
 pub const ASSIST_MAX_BODY_BYTES_ENV: &str = "HOST_DOCS_ASSIST_BODY_BYTES";
-/// How many files one question may cover.
+/// The smallest number of files one question covers. Also a seed rather than a
+/// ceiling: a folder that needs more asks for more (again [`question_plan`]).
 pub const ASSIST_MAX_CANDIDATES_ENV: &str = "HOST_DOCS_ASSIST_MAX_CANDIDATES";
 
 /// A body is evidence of what a file is, not the whole of it: a couple of kilobytes of a
@@ -44,6 +52,156 @@ pub const DEFAULT_ASSIST_MAX_BODY_BYTES: usize = 2048;
 /// the rule table rather than about the files.
 // cap: bound — 几十个未分类文件说明的是规则表的问题，不是这些文件的问题
 pub const DEFAULT_ASSIST_MAX_CANDIDATES: usize = 50;
+
+/// The two numbers one question runs under, and how they were reached.
+///
+/// `body_bytes` is a **wire** budget: the bytes a body prefix costs inside the
+/// JSON request (see [`wire_len`]), because that is the quantity both the
+/// plan's arithmetic and the channel's bound are made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestionPlan {
+    pub body_bytes: usize,
+    /// How many files one question covers in force: this folder's own count
+    /// when it can be asked about in full, and otherwise the capacity at this
+    /// prefix -- the number the caller compares the folder against to decide
+    /// whether to ask at all.
+    pub max_candidates: usize,
+    /// This question is deliberately larger than anything the channel has
+    /// answered yet: the folder asks for more than the measured window, and
+    /// nothing has failed at this size. Answering it raises the window;
+    /// failing it caps the next one.
+    pub probe: bool,
+    /// At least one question has been answered or failed, so the numbers are a
+    /// function of that rather than of the deployment's seeds.
+    pub derived: bool,
+}
+
+/// The plan for one question.
+///
+/// The window is what one question is expected to carry without probing. It is
+/// **at least the deployment's own practice** -- the two seeds multiplied into
+/// a request, plus the prompt's fixed text -- so derivation never makes the
+/// deployment ask less than it declared, and the first folders behave exactly
+/// as they did before this was derived. An answered request raises the window
+/// to its size; a stated audit bound caps it at what the channel will accept.
+/// A failure is the only evidence the bytes were too many for what sits behind
+/// the channel, and a network blip looks exactly like an overflow from here, so
+/// a failure never shrinks the window -- it only caps a probe at one byte under
+/// the size that failed.
+///
+/// The body prefix is at least the declared seed and at most what a typical
+/// file in this folder needs, so the question carries whole files when it can
+/// and never less of a body than the deployment called evidence. When the whole
+/// folder does not fit the window at that prefix, the question is asked anyway
+/// **if** the evidence allows it: that probe is how the window grows to meet
+/// the folders this deployment actually has. What "allows it" means is the
+/// audit bound when the deployment states one, and otherwise the largest size
+/// the evidence itself supports -- one byte under a request that failed. With
+/// neither, the deployment's own practice is the ceiling: a bigger question
+/// would be a guess about what sits behind the channel. When the question
+/// cannot be asked, `max_candidates` is the capacity and the caller refuses --
+/// a partial answer would make the plan depend on which files happened to fit.
+pub fn question_plan(
+    seed_body_bytes: usize,
+    seed_candidates: usize,
+    audit_budget_bytes: Option<usize>,
+    scaffold_bytes: usize,
+    sizes: &[usize],
+    accepted_wire_bytes: Option<usize>,
+    failed_wire_bytes: Option<usize>,
+) -> QuestionPlan {
+    let seed_body = seed_body_bytes.max(1);
+    let seed_candidates = seed_candidates.max(1);
+    let n = sizes.len().max(1);
+    let seed_window =
+        scaffold_bytes.saturating_add(seed_body.saturating_mul(seed_candidates));
+    // A floor can only be lowered by the channel's own stated bound: evidence
+    // about one request is not evidence that the deployment's practice is
+    // wrong, and a failure it cannot explain (a blip) must not leave the
+    // station refusing every folder for the length of the window.
+    let window = accepted_wire_bytes
+        .unwrap_or(seed_window)
+        .max(seed_window)
+        .min(audit_budget_bytes.unwrap_or(usize::MAX));
+    let typical = median(sizes).unwrap_or(seed_body);
+    let per_file = window.saturating_sub(scaffold_bytes) / n;
+    let body_bytes = seed_body.max(typical.min(per_file)).max(1);
+    let capacity = window.saturating_sub(scaffold_bytes) / body_bytes;
+    // What this folder actually costs: a body shorter than the prefix costs its
+    // own length, so two small files can fit a window that the prefix's full
+    // price would call too small. Estimating from the prefix alone would make
+    // the plan probe a size it has already been answered at.
+    let needed = scaffold_bytes.saturating_add(
+        sizes
+            .iter()
+            .map(|size| (*size).min(body_bytes))
+            .sum::<usize>(),
+    );
+    // A probe may not repeat a size that already failed (`failed - 1` is the
+    // largest one still allowed), and may not exceed a stated audit bound.
+    // Without either, the practice window is the ceiling.
+    let probe_cap = match (audit_budget_bytes, failed_wire_bytes) {
+        (Some(budget), Some(failed)) => budget.min(failed.saturating_sub(1)),
+        (Some(budget), None) => budget,
+        (None, Some(failed)) => failed.saturating_sub(1),
+        (None, None) => window,
+    };
+    let fits = needed <= window;
+    let probe = !fits && needed <= probe_cap;
+    QuestionPlan {
+        body_bytes,
+        max_candidates: if fits || probe { n } else { capacity },
+        probe,
+        derived: accepted_wire_bytes.is_some() || failed_wire_bytes.is_some(),
+    }
+}
+
+/// The upper median of a set of sizes; `None` for an empty set.
+fn median(sizes: &[usize]) -> Option<usize> {
+    if sizes.is_empty() {
+        return None;
+    }
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied()
+}
+
+/// What one character costs inside the JSON request.
+///
+/// `serde_json` escapes quotes and backslashes with one extra byte, the short
+/// control characters as two (`\n`), and the rest as six (`\u00XX`); everything
+/// else is its UTF-8 length. The channel's bound counts the request body, so
+/// the plan has to count the same bytes the wire will carry.
+fn escaped_len(ch: char) -> usize {
+    match ch {
+        '"' | '\\' => 2,
+        '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// How many wire bytes a body costs.
+pub fn wire_len(body: &str) -> usize {
+    body.chars().map(escaped_len).sum()
+}
+
+/// Cut a body to a wire budget, on a character boundary.
+///
+/// Returns whether it was cut, for the same reason [`truncate_body`] does: the
+/// answer was about the beginning of a file, and an operator comparing it
+/// against the file should know that.
+pub fn truncate_to_wire(body: &str, max_wire_bytes: usize) -> (&str, bool) {
+    let mut used = 0;
+    for (index, ch) in body.char_indices() {
+        let cost = escaped_len(ch);
+        if used + cost > max_wire_bytes {
+            return (&body[..index], true);
+        }
+        used += cost;
+    }
+    (body, false)
+}
 /// An answer to one question. Long enough for a slow upstream, short enough that a run
 /// cannot hang on a channel that accepted the connection and then went quiet.
 // cap: bound — 一次问答的墙：够慢上游，又不至于挂在接了连接不说话的通道上
@@ -68,9 +226,11 @@ const ACTOR: &str = "sandbox-document-organizer";
 ///   deployment change, not a switch.
 /// - `no_candidates`: the rules placed everything, so there was nothing to ask about.
 ///   **This cell is the healthy one**: a table that fits the folder shows up here.
-/// - `over_candidates`: there were more unclassified files than one question covers, so
-///   nothing was asked. The action is to widen the rule table (or raise the ceiling): a
-///   partial answer would make the plan depend on which files happened to fit.
+/// - `over_candidates`: there were more unclassified files than one question covers at
+///   the prefix they need (the plan in force is published beside this counter), so
+///   nothing was asked. The action is to widen the rule table, or to raise the seeds
+///   while the plan is still the declaration: a partial answer would make the plan depend
+///   on which files happened to fit.
 /// - `read_refused`: at least one candidate body could not be obtained. Nothing was asked,
 ///   for the same reason as the previous cell -- and which body and why is on the read
 ///   counter, so this cell stays a decision about this station.
@@ -207,6 +367,19 @@ pub fn build_prompt(buckets: &[String], bodies: &[(String, usize, String)]) -> S
         prompt.push_str(&format!("--- {path} ({bytes} bytes) ---\n{body}\n\n"));
     }
     prompt
+}
+
+/// An upper bound on the fixed part of a request for these paths: the prompt's
+/// own text and one header per file, with every body empty and every printed
+/// byte count at the widest a `usize` gets. It exists so a caller can bound how
+/// much of each body it has to keep before the plan -- which needs the exact
+/// counts, and so the bodies themselves -- is known.
+pub fn scaffold_upper_bound(buckets: &[String], paths: &[String]) -> usize {
+    let widest: Vec<(String, usize, String)> = paths
+        .iter()
+        .map(|path| (path.clone(), usize::MAX, String::new()))
+        .collect();
+    request_body(&build_prompt(buckets, &widest)).len()
 }
 
 /// Cut a body down to what one question carries, on a character boundary.
@@ -348,6 +521,188 @@ mod tests {
         assert!(extract_content(r#"{"choices":[]}"#).is_none());
         assert!(extract_content(r#"{"choices":[{}]}"#).is_none());
         assert!(extract_content(r#"{"choices":[{"message":{"content":"  "}}]}"#).is_none());
+    }
+
+    /// The plan counts the bytes the channel's bound counts: the serialized
+    /// request, looked at from both sides. If these two disagreed, a plan could
+    /// call a request "inside the window" while the channel refused it.
+    #[test]
+    fn the_plan_counts_the_bytes_the_wire_will_carry() {
+        assert_eq!(wire_len("a"), 1);
+        assert_eq!(wire_len("\""), 2, "a quote is escaped with one extra byte");
+        assert_eq!(wire_len("\n"), 2, "a short control character costs two");
+        assert_eq!(wire_len("\u{1}"), 6, "the rest of the controls cost six");
+        assert_eq!(wire_len("文"), 3, "everything else is its UTF-8 length");
+
+        let body = "a\"b\nc\u{1}文".to_string();
+        let with = request_body(&build_prompt(&buckets(), &[("f".into(), 4, body.clone())]));
+        let without = request_body(&build_prompt(&buckets(), &[("f".into(), 4, String::new())]));
+        assert_eq!(
+            with.len() - without.len(),
+            wire_len(&body),
+            "the body's cost inside the request is what wire_len says it is"
+        );
+
+        // Cutting on that budget walks to a character boundary and reports it.
+        assert_eq!(truncate_to_wire("aa\"bb", 3), ("aa", true));
+        assert_eq!(truncate_to_wire("\"ab", 2), ("\"", true));
+        assert_eq!(truncate_to_wire("文档", 3), ("文", true));
+        assert_eq!(truncate_to_wire("short", 5), ("short", false));
+        assert_eq!(truncate_to_wire("", 0), ("", false));
+
+        // The pre-plan bound on the fixed part is a bound on the real one.
+        let bound = scaffold_upper_bound(&buckets(), &["mystery".to_string()]);
+        let actual = request_body(&build_prompt(
+            &buckets(),
+            &[("mystery".into(), 4, String::new())],
+        ))
+        .len();
+        assert!(bound >= actual);
+    }
+
+    /// The plan is a function of what the channel answered: before anything was
+    /// measured it is the deployment's practice, after an answer it covers what
+    /// that answer showed the channel can carry. Nothing restarts.
+    #[test]
+    fn the_plan_follows_the_question_the_channel_answered() {
+        let (seed_body, seed_candidates, scaffold) = (100, 2, 10);
+        // Practice alone: two files of 100 wire bytes, plus 10 bytes of prompt.
+        let quiet = question_plan(
+            seed_body,
+            seed_candidates,
+            None,
+            scaffold,
+            &[50, 60],
+            None,
+            None,
+        );
+        assert_eq!(
+            (quiet.body_bytes, quiet.max_candidates, quiet.probe, quiet.derived),
+            (100, 2, false, false),
+            "with nothing measured the declaration is the plan, and the reading says so"
+        );
+
+        // The channel answered a 1500-byte question: the next question may be
+        // that large, and the same three files now fit in one question.
+        let answered = question_plan(
+            seed_body,
+            seed_candidates,
+            None,
+            scaffold,
+            &[700, 800],
+            Some(1500),
+            None,
+        );
+        assert_eq!(
+            (answered.body_bytes, answered.max_candidates),
+            (745, 2),
+            "a body may now take its even share of the answered window"
+        );
+        assert!(answered.derived && !answered.probe);
+
+        let third = question_plan(
+            seed_body,
+            seed_candidates,
+            None,
+            scaffold,
+            &[700, 800, 900],
+            Some(1500),
+            None,
+        );
+        assert_eq!(third.max_candidates, 3);
+        assert!(!third.probe);
+        assert!(
+            third.body_bytes < answered.body_bytes,
+            "three files share the same window"
+        );
+    }
+
+    /// A question larger than the evidence is a probe, and a probe only runs
+    /// when something says how large the channel may be: its stated audit
+    /// bound, or a request that failed above the size being tried. Without
+    /// either, the practice window is the ceiling and the folder is refused.
+    #[test]
+    fn a_probe_needs_a_bound_or_a_failure_to_stand_on() {
+        let (seed_body, seed_candidates, scaffold) = (100, 2, 10);
+        let sizes = [1000, 1000, 1000];
+        let unprompted = question_plan(
+            seed_body,
+            seed_candidates,
+            None,
+            scaffold,
+            &sizes,
+            None,
+            None,
+        );
+        assert!(!unprompted.probe);
+        assert_eq!(unprompted.max_candidates, 2, "the seed's capacity");
+        // Three files do not fit two: the caller refuses rather than ask part
+        // of the folder.
+        assert!(sizes.len() > unprompted.max_candidates);
+
+        // A stated audit bound lets the probe through...
+        let bounded = question_plan(
+            seed_body,
+            seed_candidates,
+            Some(400),
+            scaffold,
+            &sizes,
+            None,
+            None,
+        );
+        assert!(bounded.probe);
+        assert_eq!(bounded.max_candidates, 3);
+        assert_eq!(bounded.body_bytes, 100, "the declared prefix is the floor");
+
+        // ...but not up to a size that already failed: one byte under it is
+        // the most the evidence allows.
+        let failed_below = question_plan(
+            seed_body,
+            seed_candidates,
+            Some(400),
+            scaffold,
+            &sizes,
+            None,
+            Some(250),
+        );
+        assert!(!failed_below.probe);
+        assert_eq!(failed_below.max_candidates, 2);
+
+        // Without a stated bound a failure is itself the bound: 310 bytes is
+        // under the 400 that failed, so the probe runs.
+        let failure_only = question_plan(
+            seed_body,
+            seed_candidates,
+            None,
+            scaffold,
+            &sizes,
+            None,
+            Some(400),
+        );
+        assert!(failure_only.probe);
+
+        // A tiny stated bound is the one thing that can take the window below
+        // the deployment's practice -- and even then the prefix is not cut
+        // below what the deployment called evidence.
+        let tiny = question_plan(
+            seed_body,
+            seed_candidates,
+            Some(50),
+            scaffold,
+            &[1000, 1000],
+            None,
+            None,
+        );
+        assert_eq!(tiny.body_bytes, seed_body);
+        assert_eq!(tiny.max_candidates, 0);
+        assert!(2 > tiny.max_candidates);
+
+        // The prefix is a ceiling per body, not a bill per file: two files
+        // shorter than the prefix fit a window the prefix's full price would
+        // call too small. Reading it as an overflow would probe a size the
+        // channel has already answered.
+        let short = question_plan(8, 1, None, 0, &[8, 7], Some(15), None);
+        assert_eq!((short.max_candidates, short.probe), (2, false));
     }
 
     #[test]
