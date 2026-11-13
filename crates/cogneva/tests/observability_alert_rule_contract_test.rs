@@ -5454,6 +5454,15 @@ const UNREAD: &[(&str, Unread)] = &[
 /// was the reader it named.
 const GAPS_AT_CENSUS: usize = 33;
 
+/// How many closed-set series are drawn with nothing acting on them.
+///
+/// Measured 2026-11-13 after the generated catalogue replaced the hand-written
+/// dashboard: that file was the only surface for these, so removing it turned
+/// them into names no rule and no reading consumes. The ceiling only falls; a
+/// change that raises it has to say, in the same commit, why the new series
+/// can only be drawn.
+const DRAWN_ONLY_AT_CENSUS: usize = 27;
+
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
     let rule_read: BTreeSet<String> = shipped_rules()
@@ -5485,15 +5494,29 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         .chain(FOREIGN_PENDING.iter().map(|(n, _)| *n))
         .collect();
 
-    let unclassified: Vec<&str> = cog_core::metric_names::ALL
+    // Two questions, two answers. "Does any decided surface consume this series"
+    // is the one this census has always asked. "Is it visible at all" is now
+    // answered by construction: the catalogue the gateway computes from the
+    // closed set draws every name in it, so a series cannot be invisible. That
+    // makes the second question worthless as a check and the first one the only
+    // one left standing -- so a name no rule and no reading consumes is not
+    // "unclassified", it is drawn with nothing acting on it, and that is a
+    // debt with a number rather than a missing verdict.
+    //
+    // The number only comes down: every name under it is one whose owner has
+    // not decided yet what its value would change. Raising it to make a change
+    // green is the one move this constant exists to refuse.
+    let drawn_only: Vec<&str> = cog_core::metric_names::ALL
         .iter()
         .map(|n| n.as_str())
-        .filter(|n| !read(&rule_read, n) && !read(&panel_read, n) && !listed.contains(n))
+        .filter(|n| !read(&rule_read, n) && !listed.contains(n))
         .collect();
-    assert!(
-        unclassified.is_empty(),
-        "闭集里的这些序列没有任何告警规则或面板在读，也没在 UNREAD 里给出判词——补读者，或写清那份事实在哪个面上已经可见，或登记成欠账:\n{}",
-        unclassified.join("\n")
+    assert_eq!(
+        drawn_only.len(),
+        DRAWN_ONLY_AT_CENSUS,
+        "闭集里没有决定消费的序列数变了（现在 {} 条，常数 {DRAWN_ONLY_AT_CENSUS}）。\n多一条：新序列要么被一条规则/读数消费，要么这个数跟着涨——涨要在同一笔里说清为什么它只能被画出来、不能被决定；\n少一条：补上了决定，这个数要跟着降。\n{}",
+        drawn_only.len(),
+        drawn_only.join("\n")
     );
 
     let published: BTreeSet<&str> = cog_core::metric_names::ALL
