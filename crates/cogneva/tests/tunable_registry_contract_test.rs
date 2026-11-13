@@ -1242,6 +1242,35 @@ fn a_landed_batch_carries_no_override() {
             "webFetch.resources.limits.memory",
             ],
         ),
+        (
+            // The volume declarations: the capacity loop reads each claim's used
+            // bytes (walked from inside the process for the claims we mount,
+            // read from the claim-store walker for the backends nothing of ours
+            // runs in), keeps the peak and raises the declaration to peak x
+            // 120%. A PVC cannot shrink, so the loop only ever moves these up.
+            // `webFetch.shmSize` is the tmpfs the same size law patches from the
+            // renderer's measured memory. The per-user workspace cap is gone
+            // from the chart: the gateway owns that bound.
+            "B2",
+            &[
+                "backends.meilisearch.storage",
+                "backends.nats.storage",
+                "backends.postgres.storage",
+                "backends.qdrant.storage",
+                "backends.redis.storage",
+                "backends.seaweedfs.storage",
+                "backup.storage",
+                "clusterRegistry.storage",
+                "evolution.dataStorage",
+                "evolution.gitRemote.storage",
+                "evolution.sandboxStorage",
+                "evolution.sourceStorage",
+                "sandboxExecutor.storage",
+                "securityGateway.gitMirror.storage",
+                "webFetch.shmSize",
+                "workspace.maxBytes",
+            ],
+        ),
     ];
 
     let registry = registry();

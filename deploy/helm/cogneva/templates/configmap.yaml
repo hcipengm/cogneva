@@ -34,10 +34,13 @@ data:
   COGNEVA_STORAGE_PROVIDER: "local-fs"
 
   COGNEVA_WORKSPACE_ID: "default"
-  # 每个用户工作区的字节上限（0 = 不限）。拒绝写入时把这条错误信息里点名的
-  # 就是这一个键，所以它必须真的能从 values 走到这里——否则报错指的是一条
-  # 运维按正常路径改不动的开关。
-  COGNEVA_WORKSPACE_MAX_BYTES: {{ .Values.workspace.maxBytes | int64 | quote }}
+  # 每个用户工作区的字节上限。这里**不写默认值**：网关自己有同一条界（它的
+  # 默认在建工作区的那段代码里），chart 再抄一份就是同一件事的第二处声明。
+  # 但这条 env 必须留着可写——拒绝写入的错误信息点名这个键，运维要能沿正常
+  # 路径把它传进去；不传时由网关自己的默认生效。
+  {{- with .Values.workspace.maxBytes }}
+  COGNEVA_WORKSPACE_MAX_BYTES: {{ . | int64 | quote }}
+  {{- end }}
   COGNEVA_CONSUMER_GROUP: "cogneva"
   # 看板列的在制品上限。空串＝没配＝不限，渲染成空串而不是省略：省略会让「清单里
   # 没有这个键」与「运维没配」变成同一件事。发布侧与看板读面都经 envFrom 取这一份，

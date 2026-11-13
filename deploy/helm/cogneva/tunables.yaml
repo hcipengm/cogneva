@@ -123,11 +123,17 @@ rows:
       count. Not a reading.
 
   - key: backends.meilisearch.storage
-    source: override
+    source: derived
     why: >-
-      The search index volume. A derived value would read the index's used bytes
-      against the volume's free space; the volume usage is alerted on, not fed
-      back into the declaration.
+      The search index volume. The capacity loop reads this claim's used bytes from the claim-store walker (no process of ours runs inside the backend Pod), keeps the peak over its window, and raises the declaration to peak x 120% rounded up to whole GiB when the peak no longer fits. A PVC cannot shrink, so the reading only ever moves the declaration up; `cogneva_volume_capacity_bytes{claim,state}` publishes the peak the round measured and the declaration it left on the object.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: backends.meilisearch.resources.requests.cpu
     source: derived
@@ -205,11 +211,17 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
   - key: backends.nats.storage
-    source: override
+    source: derived
     why: >-
-      JetStream stream storage. It is bounded by the stream's retention, so a
-      derived value would read that retention against the message rate; nothing
-      computes it.
+      JetStream stream storage, bounded by the retention the streams carry. The capacity loop measures the claim from the claim-store walker and raises the declaration when the measured peak, times the shared 120% headroom, exceeds it; the reading under `cogneva_volume_capacity_bytes{claim,state}` moves with what the streams actually hold.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: backends.nats.resources.requests.cpu
     source: derived
@@ -287,11 +299,17 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
   - key: backends.postgres.storage
-    source: override
+    source: derived
     why: >-
-      The database volume, sized for the tables the platform owns plus WAL. A
-      derived value would follow the measured growth of pg_database_size; no loop
-      reads it back.
+      The database volume: tables plus WAL. The capacity loop reads the claim's used bytes from the claim-store walker and raises the declaration to the measured peak x 120% (whole GiB) when the peak has outgrown it. It cannot read `pg_database_size` from inside the database and does not need to: the figure the declaration has to cover is the bytes on disk, which is what the walker reads.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: backends.postgres.resources.requests.cpu
     source: derived
@@ -457,10 +475,17 @@ rows:
       test: a_request_follows_the_measured_draw
 
   - key: backends.qdrant.storage
-    source: override
+    source: derived
     why: >-
-      The vector store volume. Its size tracks the number of indexed chunks, which
-      the application already knows; the declaration does not read that number.
+      The vector store volume. The capacity loop measures this claim's peak from the claim-store walker and raises the declaration to peak x 120% (whole GiB). The number of indexed vectors decides it, but that count is not the figure the declaration needs: the bytes on the volume are, and those are read every round.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: backends.qdrant.resources.requests.cpu
     source: derived
@@ -538,11 +563,17 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
   - key: backends.redis.storage
-    source: override
+    source: derived
     why: >-
-      The persistence volume. An AOF rewrite can briefly need almost twice the
-      dataset on disk, which is why the declaration is not the dataset size. A
-      derived value would read the rewritten file size; nothing does.
+      The persistence volume. An AOF rewrite can briefly need almost twice the resident set, so the loop keeps the peak over its window and raises to peak x 120% rounded up to whole GiB; a transient spike carried in the window is what the headroom is for. The reading is published per claim.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: backends.redis.resources.requests.cpu
     source: derived
@@ -939,13 +970,17 @@ rows:
       test: a_request_follows_the_measured_draw
 
   - key: backends.seaweedfs.storage
-    source: override
+    source: derived
     why: >-
-      Write-once object storage for the permanent-memory raw and cold layers;
-      15 GiB was already in use when this was set, so 20Gi. The volume only grows,
-      and a cap that followed its growth has no loop.
-
-  # --- backup ----------------------------------------------------------------
+      Write-once object storage for the permanent-memory raw records and cache. The loop reads the claim from the claim-store walker, keeps the peak, and raises the declaration when peak x 120% exceeds it; objects are never rewritten, so the figure only grows and the declaration follows it up.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
   - key: backup.keepCount
     source: override
     why: >-
@@ -994,12 +1029,17 @@ rows:
       retry produces no new information. Not a reading.
 
   - key: backup.storage
-    source: override
+    source: derived
     why: >-
-      The backup volume. Keep count times package size is the flow, and the
-      package size is measured per run; the declaration does not read it.
-
-  # --- node image builds ------------------------------------------------------
+      The backup volume. Keep count times package size is the flow into it, and the loop does not assume either: it reads the claim's used bytes from the walker and raises the declaration to the measured peak x 120% (whole GiB). A shrinking keep count never shrinks the claim -- PVCs cannot shrink -- so the reading only moves it up.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
   - key: backup.resources.requests.cpu
     source: derived
     why: >-
@@ -1336,12 +1376,17 @@ rows:
       test: a_request_follows_the_measured_draw
 
   - key: clusterRegistry.storage
-    source: override
+    source: derived
     why: >-
-      Canary overlays accumulate per revision; 7.4Gi was measured on disk when
-      this was set, so 10Gi. The disk usage is measured by the walker sidecar and
-      drives the retention loop, but the loop prunes revisions; it does not resize
-      the claim.
+      Canary overlays accumulate per revision, and 7.4Gi was measured on a working deployment. The capacity loop reads the registry claim from the claim-store walker (the registry API reports referenced layers, a different figure) and raises the declaration to the measured peak x 120% when it no longer fits.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: clusterRegistry.walkerPort
     source: fixed
@@ -1488,18 +1533,30 @@ rows:
       does not record hold times yet.
 
   - key: evolution.dataStorage
-    source: override
+    source: derived
     why: >-
-      The evolution process's own /var/lib/cogneva-data, a different writer from
-      the main application at the same path, so a separate claim. 49Gi measured,
-      almost all raw-logs, so 64Gi. raw-logs are only layered down, never deleted,
-      and nothing feeds the measured use back.
+      The evolution process's own data directory, a different claim from the app's. The loop measures it from its own walk (this process mounts it) and raises the declaration to peak x 120%; `cogneva_volume_capacity_bytes{claim,state}` publishes both the peak and what the round left declared.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: evolution.gitRemote.storage
-    source: override
+    source: derived
     why: >-
-      The bare git mirror. Its size is a function of the repository's history,
-      which the mirror itself could measure; the declaration does not read it.
+      The bare git mirror. Its size is a function of the repositories it carries, which the loop does not model: it reads the claim's peak from the claim-store walker and raises the declaration to peak x 120% (whole GiB) when the peak has outgrown it.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: evolution.resources.requests.cpu
     source: derived
@@ -1578,19 +1635,30 @@ rows:
       test: a_request_follows_the_measured_draw
 
   - key: evolution.sandboxStorage
-    source: override
+    source: derived
     why: >-
-      The sandbox working area for evolution tasks. A derived value would read the
-      live working-set size against the volume's free space; the cache walk
-      publishes sizes per layer, and nothing turns them into this claim.
+      The sandbox working area for evolution tasks. The loop walks this claim from inside the process (it is mounted) and raises the declaration when the measured peak x 120% exceeds it; task workspaces come and go, so the window's peak, not the current reading, is the input.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: evolution.sourceStorage
-    source: override
+    source: derived
     why: >-
-      Holds the shared CARGO_TARGET_DIR, measured at 149GiB on 2026-10-21 and
-      growing with every build. This is the one claim whose shortfall stops
-      builds outright (an evicted cache means a full rebuild), and the cache walk
-      already measures its size; the claim does not follow it.
+      Holds the shared CARGO_TARGET_DIR; measured at 149GiB on 2026-11-12 against a 72Gi declaration, and the loop raised it to 179Gi. The reading is the walk's peak times 120%, rounded up to whole GiB, and it only moves up because the claim cannot shrink.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: evolution.workspaces.cacheScanIntervalSecs
     source: override
@@ -2672,15 +2740,17 @@ rows:
       test: a_request_follows_the_measured_draw
 
   - key: sandboxExecutor.storage
-    source: override
+    source: derived
     why: >-
-      The executor's own volume. How full it is, is measured: the walk over the
-      declared claims publishes cogneva_data_volume_used_bytes for this claim,
-      over the whole mount that the task worktrees, the bare repository and the
-      build cache share. What is still hand-set is the size itself -- resizing a
-      claim is a delivery decision, not a value this process may write -- so the
-      reading is what someone resizes from, and no loop turns it into a new PVC
-      size.
+      The executor's own volume. How full it is, is measured: the loop walks the claim from the executor process and raises the declaration to the walk's peak x 120% (whole GiB). The number of task worktrees is the input it follows, not a figure the declaration names.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: sandboxExecutor.workspaceGcIntervalSecs
     source: derived
@@ -2767,11 +2837,17 @@ rows:
       human; nothing re-measures and adjusts.
 
   - key: securityGateway.gitMirror.storage
-    source: override
+    source: derived
     why: >-
-      The mirror volume, rebuildable from the upstream, so the volume is sized
-      generously against the repository's measured size. Nothing reads that size
-      back into the declaration.
+      The mirror volume, rebuildable from upstream, so the volume is not a durability question but a capacity one. The loop reads its peak from the claim-store walker and raises the declaration when peak x 120% no longer fits.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_claim_target_follows_the_measured_used_bytes
 
   - key: securityGateway.resources.requests.cpu
     source: derived
@@ -2850,17 +2926,6 @@ rows:
       test: a_request_follows_the_measured_draw
 
   # --- workspace quota (WebUI file surface) ---
-  - key: workspace.maxBytes
-    source: override
-    why: >-
-      A per-user cap on the workspace under the shared data volume. Nothing
-      reads a user's usage back into it: the volume-level headroom is judged by
-      the container and volume readings, which cannot see one user's share, so
-      the number stays pinned until a reading of per-user usage exists. Zero
-      means unlimited and is a deliberate deployment choice, not a missing
-      value.
-
-  # --- workspace fetch bounds (evolution and sandbox share one) ---------------
   - key: workspaceFetch.connectTimeoutSecs
     source: override
     why: >-
@@ -2977,14 +3042,17 @@ rows:
       A deployment that runs it hot raises this by hand.
 
   - key: webFetch.shmSize
-    source: override
+    source: derived
     why: >-
-      The size of the tmpfs mounted at /dev/shm. It is a dial, not a protocol
-      constant: Chromium dies on the 64MiB default and reports it as a timeout,
-      so it has to be given room. Sized from the page sizes this backend is
-      expected to render; nothing reads a renderer's actual shared-memory use
-      back into this number. Raising it alone widens the Pod, so it moves with
-      webFetch.resources.limits.memory.
+      The size of the tmpfs mounted at /dev/shm. It is memory, so it follows the renderer's own measurement: the size law takes the container's memory peak x 120% from the kubelet summary, quantised to 16Mi, and that is what the volume's `sizeLimit` is patched to. `cogneva_workload_shm_size_bytes{workload,volume,source}` publishes the reading; `source=seed` until the seven-day window has enough samples.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: SHM_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: the_shm_size_follows_the_measured_memory
 
   - key: webFetch.resources.requests.cpu
     source: derived

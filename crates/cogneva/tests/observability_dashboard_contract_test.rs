@@ -1112,6 +1112,15 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["workload", "container", "source"],
         "crates/cog-reflection/src/workload_resources.rs",
     ),
+    // The memory-backed volume: the same size law, written to
+    // `volumes[].emptyDir.sizeLimit` instead of a container's resources. Filed
+    // here so the scrape census has the reader the series needs, and so a panel
+    // that selects it is judged against these labels rather than against none.
+    (
+        "cogneva_workload_shm_size_bytes",
+        &["workload", "volume", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

@@ -70,11 +70,21 @@ pub const EVALUATIONS_METRIC: &str = "cogneva_workload_resources_evaluations_tot
 /// 窗口里这个容器有多少个样本。样本数为 0 时这一族读数只说明没在量。
 pub const SAMPLES_METRIC: &str = "cogneva_workload_resources_samples";
 
+/// 内存盘（`emptyDir` `medium: Memory`）的目标，字节。
+///
+/// 它与容器内存上限同一条律、同一个窗口：tmpfs 的页是内存，一个容器能写进
+/// `/dev/shm` 的不会超过它自己被量出来的内存上限。单独一个序列名，是因为它
+/// 按**卷**而不是按容器发布——一个工作负载可以挂多块，读者要能分辨是哪一块。
+pub const SHM_METRIC: &str = "cogneva_workload_shm_size_bytes";
+
 /// 工作负载名。
 pub const WORKLOAD_LABEL: &str = "workload";
 
 /// 容器名。
 pub const CONTAINER_LABEL: &str = "container";
+
+/// 卷名（内存盘那一条读数面）。
+pub const VOLUME_LABEL: &str = "volume";
 
 /// 这个值是怎么来的：`derived`（实测窗口给了目标）或 `seed`（窗口还没够）。
 pub const SOURCE_LABEL: &str = "source";
@@ -379,6 +389,19 @@ pub struct WorkloadSpec {
     pub kind: String,
     pub name: String,
     pub containers: Vec<ContainerSpec>,
+    /// 内存介质、声明了 `sizeLimit` 的卷。没有上限的卷不在里面：那没有数可写回。
+    pub shm: Vec<ShmVolume>,
+}
+
+/// 一块以内存为介质的卷，以及挂载它的容器。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShmVolume {
+    pub volume: String,
+    /// 把这块卷挂在 `/dev/shm` 的普通容器。找不到就只发布读数、不写回：
+    /// 不知道该跟谁的内存上限走时，任何目标都是凭空造的。
+    pub container: Option<String>,
+    /// 当前声明的 `sizeLimit`；写了但解析不出也是 `None`，那时会被当成「该写」。
+    pub declared: Option<u64>,
 }
 
 impl WorkloadSpec {
@@ -481,6 +504,63 @@ fn containers_from(spec: &Value) -> Vec<ContainerSpec> {
     out
 }
 
+/// `/dev/shm` 是这个回路认的挂载点。
+///
+/// 不按「任何挂内存介质的卷」泛化：只有 `/dev/shm` 的语义是固定的（渲染进程
+/// 拿它当共享内存工作区），别的内存卷跟着哪个容器走没有同一条约定，硬套会把
+/// 一个不相关的容器内存上限写到它头上。
+const SHM_MOUNT_PATH: &str = "/dev/shm";
+
+/// 一个 pod spec 里声明的内存盘。
+fn shm_from(spec: &Value) -> Vec<ShmVolume> {
+    let mut mounted: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    let Some(containers) = spec.get("containers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    for container in containers {
+        let Some(name) = container.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(mounts) = container.get("volumeMounts").and_then(Value::as_array) else {
+            continue;
+        };
+        for mount in mounts {
+            if mount.get("mountPath").and_then(Value::as_str) != Some(SHM_MOUNT_PATH) {
+                continue;
+            }
+            if let Some(volume) = mount.get("name").and_then(Value::as_str) {
+                mounted.entry(volume).or_insert(name);
+            }
+        }
+    }
+    let Some(volumes) = spec.get("volumes").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for volume in volumes {
+        if volume.pointer("/emptyDir/medium").and_then(Value::as_str) != Some("Memory") {
+            continue;
+        }
+        let Some(name) = volume.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let declared = volume
+            .pointer("/emptyDir/sizeLimit")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if declared.is_none() {
+            // 没有声明上限的内存盘不在这条律里：没有数要跟着测量走。
+            continue;
+        }
+        out.push(ShmVolume {
+            volume: name.to_string(),
+            container: mounted.get(name).map(|name| name.to_string()),
+            declared: declared.as_deref().and_then(parse_memory_bytes),
+        });
+    }
+    out
+}
+
 /// 从 `kubectl get deployments,statefulsets,daemonsets,cronjobs -o json` 的
 /// 输出里读出可 patch 的对象。
 pub fn parse_workloads(list: &Value) -> Vec<WorkloadSpec> {
@@ -518,6 +598,7 @@ pub fn parse_workloads(list: &Value) -> Vec<WorkloadSpec> {
             kind,
             name,
             containers,
+            shm: shm_from(spec),
         });
     }
     out
@@ -671,8 +752,15 @@ pub fn memory_quantity(bytes: u64) -> String {
     }
 }
 
-/// 一次 patch 的请求体。`changes` 按容器名给目标，init 与普通容器分开。
-pub fn patch_body(workload: &WorkloadSpec, changes: &BTreeMap<String, Targets>) -> Option<Value> {
+/// 一次 patch 的请求体。
+///
+/// `changes` 按容器名给目标，init 与普通容器分开；`shm_changes` 按卷名给内存盘的
+/// 目标。两组都不动时返回 `None`——一次没有内容的 patch 只会让对象换一个版本号。
+pub fn patch_body(
+    workload: &WorkloadSpec,
+    changes: &BTreeMap<String, Targets>,
+    shm_changes: &BTreeMap<String, u64>,
+) -> Option<Value> {
     let mut regular = Vec::new();
     let mut init = Vec::new();
     for container in &workload.containers {
@@ -689,7 +777,18 @@ pub fn patch_body(workload: &WorkloadSpec, changes: &BTreeMap<String, Targets>) 
             regular.push(entry);
         }
     }
-    if regular.is_empty() && init.is_empty() {
+    let volumes: Vec<Value> = workload
+        .shm
+        .iter()
+        .filter_map(|volume| {
+            let bytes = shm_changes.get(&volume.volume)?;
+            Some(json!({
+                "name": volume.volume,
+                "emptyDir": { "sizeLimit": memory_quantity(*bytes) },
+            }))
+        })
+        .collect();
+    if regular.is_empty() && init.is_empty() && volumes.is_empty() {
         return None;
     }
     let mut spec = serde_json::Map::new();
@@ -698,6 +797,9 @@ pub fn patch_body(workload: &WorkloadSpec, changes: &BTreeMap<String, Targets>) 
     }
     if !init.is_empty() {
         spec.insert("initContainers".to_string(), Value::Array(init));
+    }
+    if !volumes.is_empty() {
+        spec.insert("volumes".to_string(), Value::Array(volumes));
     }
     let pod_spec = json!({ "spec": spec });
     match workload.kind.as_str() {
@@ -722,6 +824,16 @@ fn kind_arg(kind: &str) -> &'static str {
 #[derive(Debug, Default)]
 pub struct WorkloadResourcesReadings {
     rows: Mutex<BTreeMap<String, Row>>,
+    shm: Mutex<BTreeMap<String, ShmRow>>,
+}
+
+/// 一块内存盘在这个读数面上的状态。
+#[derive(Debug, Clone)]
+struct ShmRow {
+    workload: String,
+    volume: String,
+    size_bytes: u64,
+    source: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -795,6 +907,28 @@ impl WorkloadResourcesReadings {
             .map(|row| row.evaluations)
             .unwrap_or(0)
     }
+
+    /// 这一拍这块内存盘的目标。
+    pub fn observe_shm(
+        &self,
+        workload: &str,
+        volume: &str,
+        size_bytes: u64,
+        source: &'static str,
+    ) {
+        let mut rows = self.shm.lock().unwrap();
+        let row = rows
+            .entry(format!("{workload}/{volume}"))
+            .or_insert_with(|| ShmRow {
+                workload: workload.to_string(),
+                volume: volume.to_string(),
+                size_bytes,
+                source,
+            });
+        row.size_bytes = size_bytes;
+        row.source = source;
+    }
+
 }
 
 #[async_trait]
@@ -818,6 +952,16 @@ impl Observable for WorkloadResourcesReadings {
                         .with_label(SOURCE_LABEL, row.source),
                 );
             }
+        }
+        for row in self.shm.lock().unwrap().values() {
+            // 内存盘的拍子与容器那一条同一拍：容器那一行的求值计数就是它的
+            // 证据。这里再发一个同标签的计数只会让同一个数出现两次。
+            out.push(
+                RawMetric::new(SHM_METRIC, row.size_bytes as f64)
+                    .with_label(WORKLOAD_LABEL, row.workload.clone())
+                    .with_label(VOLUME_LABEL, row.volume.clone())
+                    .with_label(SOURCE_LABEL, row.source),
+            );
         }
         Ok(out)
     }
@@ -981,6 +1125,8 @@ pub async fn round(
     let mut patched = 0usize;
     for workload in &workloads {
         let mut changes = BTreeMap::new();
+        // 这一轮已经算出目标、可以喂给下游（内存盘）的容器。
+        let mut resolved: BTreeMap<String, Targets> = BTreeMap::new();
         for container in &workload.containers {
             let Some(declared) = container.declared else {
                 continue;
@@ -991,6 +1137,7 @@ pub async fn round(
             let samples = window.samples(&key);
             match window.targets(&key) {
                 Some(targets) => {
+                    resolved.insert(container.name.clone(), targets);
                     readings.observe(
                         &workload.name,
                         &container.name,
@@ -1037,7 +1184,36 @@ pub async fn round(
                 }
             }
         }
-        let Some(body) = patch_body(workload, &changes) else {
+        // 内存盘跟的是挂载它的那个容器的内存上限：同一份窗口、同一条律，
+        // 只是写到的字段从 `resources` 换成了 `volumes[].emptyDir.sizeLimit`。
+        let mut shm_changes = BTreeMap::new();
+        for volume in &workload.shm {
+            evaluated += 1;
+            let target = volume
+                .container
+                .as_ref()
+                .and_then(|container| resolved.get(container))
+                .map(|targets| targets.memory_limit_bytes);
+            match target {
+                Some(bytes) => {
+                    readings.observe_shm(&workload.name, &volume.volume, bytes, SOURCE_DERIVED);
+                    if wants_write(volume.declared, bytes, MEMORY_QUANTUM_BYTES) {
+                        shm_changes.insert(volume.volume.clone(), bytes);
+                    }
+                }
+                None => {
+                    if let Some(declared) = volume.declared {
+                        readings.observe_shm(
+                            &workload.name,
+                            &volume.volume,
+                            declared,
+                            SOURCE_SEED,
+                        );
+                    }
+                }
+            }
+        }
+        let Some(body) = patch_body(workload, &changes, &shm_changes) else {
             continue;
         };
         let body = body.to_string();
@@ -1058,11 +1234,12 @@ pub async fn round(
         .await
         {
             Ok(_) => {
-                patched += changes.len();
+                patched += changes.len() + shm_changes.len();
                 debug!(
                     kind = %workload.kind,
                     workload = %workload.name,
                     containers = changes.len(),
+                    volumes = shm_changes.len(),
                     "workload resources: patched"
                 );
             }
@@ -1261,6 +1438,7 @@ mod tests {
                     memory_limit_bytes: Some(256 * 1024 * 1024),
                 }),
             }],
+            shm: Vec::new(),
         }
     }
 
@@ -1277,7 +1455,7 @@ mod tests {
     fn a_deployment_patch_lands_under_the_pod_template() {
         let mut changes = BTreeMap::new();
         changes.insert("c".to_string(), targets(800, 512 * 1024 * 1024));
-        let body = patch_body(&workload("Deployment", "gateway"), &changes).unwrap();
+        let body = patch_body(&workload("Deployment", "gateway"), &changes, &BTreeMap::new()).unwrap();
         assert_eq!(
             body.pointer("/spec/template/spec/containers/0/name")
                 .and_then(Value::as_str),
@@ -1294,7 +1472,7 @@ mod tests {
     fn a_cronjob_patch_lands_under_the_job_template() {
         let mut changes = BTreeMap::new();
         changes.insert("c".to_string(), targets(800, 512 * 1024 * 1024));
-        let body = patch_body(&workload("CronJob", "cogneva-backup"), &changes).unwrap();
+        let body = patch_body(&workload("CronJob", "cogneva-backup"), &changes, &BTreeMap::new()).unwrap();
         assert!(body
             .pointer("/spec/jobTemplate/spec/template/spec/containers/0/resources")
             .is_some());
@@ -1375,5 +1553,81 @@ mod tests {
             pod_workload(&pod, &HashMap::new(), &jobs),
             Some(("CronJob".to_string(), "cogneva-backup".to_string()))
         );
+    }
+
+    fn shm_workload() -> WorkloadSpec {
+        let list = json!({"items": [{
+            "kind": "Deployment",
+            "metadata": {"name": "crawl4ai"},
+            "spec": {"template": {"spec": {
+                "containers": [{
+                    "name": "crawl4ai",
+                    "resources": {"limits": {"memory": "2Gi"}},
+                    "volumeMounts": [{"name": "shm", "mountPath": "/dev/shm"}],
+                }],
+                "volumes": [{
+                    "name": "shm",
+                    "emptyDir": {"medium": "Memory", "sizeLimit": "1Gi"},
+                }],
+            }}},
+        }]});
+        parse_workloads(&list).remove(0)
+    }
+
+    #[test]
+    fn the_shm_size_follows_the_measured_memory() {
+        // 同一份输入、两个不同的实测：写进 `sizeLimit` 的数必须跟着动。
+        let workload = shm_workload();
+        assert_eq!(workload.shm.len(), 1);
+        assert_eq!(workload.shm[0].volume, "shm");
+        assert_eq!(workload.shm[0].container.as_deref(), Some("crawl4ai"));
+        assert_eq!(workload.shm[0].declared, Some(1024 * 1024 * 1024));
+
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "crawl4ai".to_string(),
+            targets(300, 512 * 1024 * 1024),
+        );
+        let mut shm = BTreeMap::new();
+        shm.insert("shm".to_string(), 1024u64 * 1024 * 1024);
+        let body = patch_body(&workload, &containers, &shm).unwrap();
+        assert_eq!(
+            body.pointer("/spec/template/spec/volumes/0/emptyDir/sizeLimit")
+                .and_then(Value::as_str),
+            Some("1Gi")
+        );
+
+        let mut shm = BTreeMap::new();
+        shm.insert("shm".to_string(), 4u64 * 1024 * 1024 * 1024);
+        let body = patch_body(&workload, &containers, &shm).unwrap();
+        assert_eq!(
+            body.pointer("/spec/template/spec/volumes/0/emptyDir/sizeLimit")
+                .and_then(Value::as_str),
+            Some("4Gi"),
+            "内存盘的目标没跟着实测变，说明它被当成一个写死的数了"
+        );
+    }
+
+    #[test]
+    fn a_memory_volume_no_container_mounts_is_not_written() {
+        // 找不到挂载它的容器时不猜一个目标：那块盘没有「自己」的内存可以跟。
+        let list = json!({"items": [{
+            "kind": "Deployment",
+            "metadata": {"name": "x"},
+            "spec": {"template": {"spec": {
+                "containers": [{"name": "c", "resources": {"limits": {"memory": "1Gi"}}}],
+                "volumes": [{"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "1Gi"}}],
+            }}},
+        }]});
+        let workload = parse_workloads(&list).remove(0);
+        assert_eq!(workload.shm[0].container, None);
+        let mut containers = BTreeMap::new();
+        containers.insert("c".to_string(), targets(100, 1024 * 1024 * 1024));
+        let mut shm = BTreeMap::new();
+        shm.insert("shm".to_string(), 2u64 * 1024 * 1024 * 1024);
+        // 没有容器挂它，调用方就不会把它放进 `shm_changes`；这里钉住的是解析面
+        // 给出的答案：`container` 是空的，所以回路不会替它算。
+        assert_eq!(workload.shm[0].container, None);
+        assert!(patch_body(&workload, &containers, &BTreeMap::new()).is_some());
     }
 }

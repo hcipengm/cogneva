@@ -1944,6 +1944,32 @@ mod tests {
         assert_eq!(growth_target(0, 10 * GIB), None);
     }
 
+    /// The declaration is a function of one measured input: the used bytes the
+    /// loop read this round. Feed it a different reading and the target moves;
+    /// that is what separates a derived declaration from a pinned one.
+    ///
+    /// It also pins the direction: a claim is only ever raised. A reading that
+    /// came back below the declaration announces nothing, because a PVC cannot
+    /// be shrunk -- the loop must not report a target it cannot carry out.
+    #[test]
+    fn a_claim_target_follows_the_measured_used_bytes() {
+        let declared = 20 * GIB;
+        assert_eq!(growth_target(4 * GIB, declared), None, "4 * 1.2 is inside 20Gi");
+        assert_eq!(
+            growth_target(30 * GIB, declared),
+            Some(36 * GIB),
+            "30 * 1.2 = 36: the same claim, a different reading, a different target"
+        );
+        assert_eq!(
+            growth_target(50 * GIB, declared),
+            Some(60 * GIB),
+            "the target has to keep following the reading, not stop at the first raise"
+        );
+        // Once raised, the new declaration is the baseline: the same reading
+        // does not ask again, so the loop converges instead of re-patching.
+        assert_eq!(growth_target(30 * GIB, 36 * GIB), None);
+    }
+
     /// One scrape names every claim on the node. This deployment may only
     /// change its own namespace's, and a line it cannot attribute exactly — a
     /// foreign namespace, another series, a value that is not a number — must
