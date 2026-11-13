@@ -215,7 +215,29 @@ export interface ChatFrame {
   agentId: string | null;
   /** 只有 `usage` 帧带着：这一轮的花销。 */
   usage: TurnUsage | null;
+  /**
+   * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
+   *
+   * 服务端对长消息只回一段开头，原文在执行器那边成了一份文件；界面据此把这一条
+   * 画成附件（带全文长度），而不是把开头当成这句话的全部。
+   */
+  attachment: ChatAttachment | null;
   timestamp: string;
+}
+
+/** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
+export interface ChatAttachment {
+  path: string;
+  /** 原文的字符数——界面上写的是这个数，不是开头那一段的长度。读不到就是 `null`。 */
+  chars: number | null;
+}
+
+/** 帧里的附件格。没有路径就不认它：一个打不开的附件只能让人以为全文在那里。 */
+function chatAttachment(value: unknown): ChatAttachment | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as { path?: unknown; chars?: unknown };
+  if (typeof raw.path !== 'string' || !raw.path.trim()) return null;
+  return { path: raw.path, chars: frameCount(raw.chars) };
 }
 
 /**
@@ -276,6 +298,7 @@ export function normalizeChatFrame(
     goalId: typeof inner.goal_id === 'string' ? inner.goal_id : null,
     changeId: typeof inner.change_id === 'string' ? inner.change_id : null,
     agentId: typeof inner.agent_id === 'string' ? inner.agent_id : null,
+    attachment: chatAttachment(inner.attachment),
     usage:
       kind === 'usage'
         ? {

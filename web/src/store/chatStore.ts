@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { getSessionMessages } from '@/api/client';
-import type { ChatFrame, ChatRole, TurnUsage } from '@/types/events';
+import type { ChatAttachment, ChatFrame, ChatRole, TurnUsage } from '@/types/events';
 
 export type { ChatRole };
 
@@ -41,6 +41,13 @@ export interface ChatMessage {
    * 失败与被叫停的那一轮也没有。界面上因此不画这一行，而不是画一排零。
    */
   usage: TurnUsage | null;
+  /**
+   * 这一句的原文落成的文件。只有超过窗口的那些带它：服务端把原文逐字写进执行器
+   * 的一个文件，界面上这一条因此画成附件（带全文长度），而不是把开头当成全部。
+   *
+   * 读回的历史里没有这一格（记录只存正文），界面按正文长度把它画成同一类附件。
+   */
+  attachment: ChatAttachment | null;
   at: string;
 }
 
@@ -332,6 +339,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 status: 'sending',
                 failure: null,
                 usage: null,
+                attachment: null,
                 at,
               },
             ],
@@ -372,6 +380,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               id: frame.messageId,
               text: '',
               status: 'streaming',
+              attachment: frame.attachment,
             }));
           } else {
             session = {
@@ -386,6 +395,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   status: 'streaming',
                   failure: null,
                   usage: null,
+                  attachment: frame.attachment,
                   at: frame.timestamp,
                 },
               ],
@@ -414,6 +424,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   status: 'streaming',
                   failure: null,
                   usage: null,
+                  attachment: null,
                   at: frame.timestamp,
                 },
               ],
@@ -550,6 +561,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             failure: line.failure,
             // 落库的只有正文：这一次读回来的花销没有存放处，于是空着。
             usage: null,
+            // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
+            attachment: null,
             at: line.created_at,
           }));
           // 读回的历史排在前，本地还没落定的排在后面。已经落定、且历史里

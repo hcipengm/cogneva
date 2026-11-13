@@ -100,6 +100,8 @@ export class MockEventStreamClient {
       agentId: (fields.agentId as string | null) ?? null,
       // 假流不记账：token 与轮次只有真的跑过一轮才量得到，这里不编一个数。
       usage: null,
+      // 假流不落文件：演示里的每一句都远在窗口之内，没有附件这回事。
+      attachment: null,
       timestamp: new Date().toISOString(),
     });
   }

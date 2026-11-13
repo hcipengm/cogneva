@@ -1136,11 +1136,25 @@ fn the_chat_roles_the_client_names_are_the_roles_the_writers_write() {
          少读一处就等于把一个角色裁掉",
         calls.len()
     );
+    // 角色实参在第几位，从声明里读。按「最后一个实参」读的那一版，在签名尾部追加
+    // 一个 `attachment` 之后读到了 `None`——那不是红，是判据空转，比红更坏。
+    let signature_at = production
+        .find("fn emit_message_start")
+        .unwrap_or_else(|| panic!("`chat.rs` 里读不到 `emit_message_start` 的声明"));
+    let open = signature_at + "fn emit_message_start".len();
+    let close = matching_paren(&production, open, Dialect::Rust)
+        .unwrap_or_else(|| panic!("`emit_message_start` 的签名括号没有配平"));
+    let parameters = split_top_level(&production[open + 1..close], Dialect::Rust);
+    let role_index = parameters
+        .iter()
+        .position(|part| part.split(':').next().map(str::trim) == Some("role"))
+        .unwrap_or_else(|| panic!("`emit_message_start` 的签名里没有 `role` 参数：{parameters:?}"));
+
     let mut frames: Vec<String> = Vec::new();
     for call in calls {
         // 顶层逗号只有一处切法（`lex`），方言是 Rust——这些调用写在 `chat.rs` 里。
         let parts = split_top_level(call, Dialect::Rust);
-        let role = parts.last().map_or("", |part| part.trim());
+        let role = parts.get(role_index).map_or("", |part| part.trim());
         let word = role
             .strip_prefix('"')
             .and_then(|r| r.strip_suffix('"'))

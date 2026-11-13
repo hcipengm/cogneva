@@ -529,7 +529,21 @@ impl cog_agent::permission::PermissionDecider for ConversationPermissions {
     }
 }
 
+/// 这一段对话跑在多大的窗口里。
+///
+/// 内核的构造只写了几格，其余取 [`cog_core::RuntimeConfig`] 的默认，窗口正是其中
+/// 之一。网关判「这条消息是不是太大了」读的就是这个数（见
+/// [`cog_gateway::chat::oversized_threshold_tokens`]），所以两处必须同源：在这里
+/// 另写一个数，界面上落成文件的那条线就会与循环真正被撑破的那条线错开。
+fn conversation_context_window_tokens() -> usize {
+    cog_core::RuntimeConfig::default().context_window_size
+}
+
 impl ConversationTurn for PlatformConversation {
+    fn context_window_tokens(&self) -> usize {
+        conversation_context_window_tokens()
+    }
+
     fn turn<'a>(
         &'a self,
         request: ConversationRequest,
@@ -599,6 +613,9 @@ impl ConversationTurn for PlatformConversation {
                 // 止损不靠轮数：卡住由内核的单步停滞超时兜底，上下文有自己的窗口，
                 // 花销记在使用账上。轮数是这三样缺位时的替代品，这里不再拿它当尺。
                 max_iterations: u32::MAX,
+                // 窗口由上面那个读数给出，不在这里另写一次：网关拿它判「这条消息
+                // 是不是太大了」，判的必须是这一轮真正跑在的那个窗口。
+                context_window_size: conversation_context_window_tokens(),
                 ..Default::default()
             };
             // 工具面 = 这个进程装配好的那一份 ＋ 控制面五只。

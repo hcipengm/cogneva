@@ -18,8 +18,187 @@ use crate::GatewayState;
 // cap: bound — 一次会话带多少轮历史进上下文，界的是请求体积
 const SESSION_HISTORY_CAP: usize = 40;
 
+/// 一条长消息落成的文件放在哪。这个路径由**执行器**解释：写入与读回都走同一个
+/// 沙箱后端（模型用 `read_file` 读绝对路径，执行器原样认它），所以这里写死一个
+/// 两边都在的位置，而不是这个进程自己的临时目录——网关与执行器未必在同一台机器上。
+pub const ATTACHMENT_ROOT: &str = "/tmp/cogneva-chat-attachments";
+
+/// 一帧能带多大。传输库自己用的就是这个数（axum/tungstenite 的 64 MiB 默认），
+/// 这里把它写出来只为一件事：阈值要读它。不写出来的话「帧上限」在阈值那一段
+/// 是一个没人写过的数，两个数之间也就没有关系可言。
+// cap: fixed — 传输层的协议默认值，不是谁挑的拨盘；钉出来让阈值读得到它
+pub const MAX_INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// UTF-8 一个字最多几个字节。把字节上限折成字符时按最坏的算，读出来的字数就
+/// 不会比真到手的多。
+// cap: fixed — UTF-8 编码本身给的上界
+const MAX_UTF8_BYTES_PER_CHAR: usize = 4;
+
+/// 这一轮窗口里，一句用户话最多占到几分之一。
+///
+/// 窗口不只装这一句话：系统前缀、工具表、前面的历史与这一轮的回答都住在里面。
+/// 一句话可以长，但不能长到把回答挤出去——超过这个份额的，原文落成文件，循环
+/// 拿到的是引用与开头。
+// cap: bound — 窗口分给一句提问的份额，剩下来的要装前缀、工具表、历史与回答
+const INPUT_SHARE_OF_CONTEXT: usize = 8;
+
+/// 引用里留多长的开头：阈值的几分之一。够看出这条消息在讲什么，又不至于让
+/// 「引用」自己再吃一大口窗口。
+// cap: bound — 开头摘录占阈值的份额，与阈值同向变化
+const HEAD_SHARE_OF_THRESHOLD: usize = 4;
+
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// 一条消息多大就不再整条进上下文，而是落成文件。
+///
+/// 两条读数取最紧的一条：
+///
+/// - **模型窗口**：这一段对话真正跑在多大的窗口里（由执行体报，见
+///   [`ConversationTurn::context_window_tokens`]），留一份给一句提问。窗口大的
+///   部署能把更长的消息直接读进来；窗口小的部署更早落文件。
+/// - **帧上限**：一帧带得进来的字符数。超过它，消息连送都送不进来，落文件也就
+///   无从谈起——所以它也是这条阈值的一个上界，哪怕今天它比窗口松。
+///
+/// 两条都是入参：换窗口、换帧上限，返回值跟着变（有一条测试就量这个）。
+pub fn oversized_threshold_tokens(context_window_tokens: usize, frame_limit_bytes: usize) -> usize {
+    // 字节 → 字符按最坏编码算，再按工作区唯一的口径（`cog_core::token_estimate`）
+    // 折成 token。两步都用别的模块已经钉死的数，这里不自造一个换算。
+    let frame_chars = frame_limit_bytes / MAX_UTF8_BYTES_PER_CHAR;
+    let frame_tokens = frame_chars / cog_core::token_estimate::CHARS_PER_TOKEN;
+    let context_tokens = context_window_tokens / INPUT_SHARE_OF_CONTEXT;
+    frame_tokens.min(context_tokens).max(1)
+}
+
+/// 一段话落成的文件路径。
+///
+/// 按内容取哈希：同一段原文永远落在同一个路径上。这不是省事——记录里存的是原文
+/// 本身，下一轮读历史时要把同一句话再折成引用，而那条路上没有「这条消息的文件
+/// 在哪」的列可查；路径能由内容算回来，读回全文这件事就不依赖一张额外的表。
+pub fn attachment_path(session_id: &str, content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(content.as_bytes()));
+    format!(
+        "{ATTACHMENT_ROOT}/{}/{}",
+        session_dir_name(session_id),
+        &digest[..16]
+    )
+}
+
+/// 会话号进目录名。会话号是客户端给的，直接拼进路径就是一条可以走出目录的边
+/// （`../` 之类的字符在文件系统里是有含义的），所以只留名字里的字，其余落成 `-`。
+fn session_dir_name(session_id: &str) -> String {
+    let name: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if name.trim_matches('-').is_empty() {
+        "unattributed".to_string()
+    } else {
+        name
+    }
+}
+
+/// 一条落成文件的消息，循环看到的那一句。
+///
+/// 它不是截断后的正文：开头之后没有半句话，参考文自己说清「完整原文在哪、它有多
+/// 长、这一段只是开头」，读它的模型因此知道自己少看了什么，以及去哪儿补。
+pub fn oversized_reference(content: &str, path: &str, threshold_tokens: usize) -> String {
+    let head_chars = (threshold_tokens / HEAD_SHARE_OF_THRESHOLD)
+        .saturating_mul(cog_core::token_estimate::CHARS_PER_TOKEN)
+        .max(1);
+    let total = content.chars().count();
+    let head: String = content.chars().take(head_chars).collect();
+    format!(
+        "[这条消息有 {total} 个字符，比这一轮能直接带进对话的量（约 {threshold_tokens} token）\
+         大；原文已逐字存成文件 {path}，要看全文就用 read_file 读这个路径。下面是开头的一部分，\
+         不是全文。]\n\n{head}"
+    )
+}
+
+/// 一条已经落成文件的消息：界面认它、循环读它，用的都是这两格。
+#[derive(Debug, Clone)]
+pub struct OversizedAttachment {
+    pub path: String,
+    pub chars: usize,
+    /// 循环看到的那一句（引用 + 开头 + 读回全文的路径）。
+    pub reference: String,
+}
+
+/// 把原文逐字写进执行器的文件系统，并给出循环该看到的那一句。
+///
+/// 走的是模型自己读文件用的那个后端：写在这个进程的磁盘上，执行器那边的
+/// `read_file` 读不到；写在同一份后端上，「落成文件」与「能读回」才是同一件事。
+pub async fn archive_oversized(
+    backend: Option<&Arc<dyn cog_core::SandboxBackend>>,
+    session_id: &str,
+    content: &str,
+    threshold_tokens: usize,
+) -> Result<OversizedAttachment, String> {
+    let Some(backend) = backend else {
+        return Err("这个部署没有装配沙箱后端，原文没有地方可写".into());
+    };
+    let path = attachment_path(session_id, content);
+    let request = cog_core::SandboxRequest {
+        task_id: format!("chat-attachment-{session_id}"),
+        agent_id: String::new(),
+        payload: cog_core::SandboxPayload::WriteFile {
+            path: path.clone(),
+            content: content.to_string(),
+        },
+        input: serde_json::Value::Null,
+        limits: cog_core::ResourceLimits::default(),
+    };
+    match backend.execute(&request).await {
+        Ok(result) if result.exit_code == 0 => Ok(OversizedAttachment {
+            reference: oversized_reference(content, &path, threshold_tokens),
+            path,
+            chars: content.chars().count(),
+        }),
+        Ok(result) => Err(format!(
+            "写入执行器失败（exit {}）：{}",
+            result.exit_code,
+            result.stderr.trim()
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// 超过阈值就落文件，否则原样放过。
+///
+/// 阈值要问执行体自己的窗口；循环没接上（槽是空的）时这一轮本来就跑不了，也就不
+/// 值得为它写文件——返回 `None`，让后面那条「还没接上」的话照原样说出去。
+async fn archive_if_oversized(
+    state: &GatewayState,
+    session_id: &str,
+    content: &str,
+) -> Result<Option<OversizedAttachment>, String> {
+    let Some(window) = state
+        .conversation
+        .get()
+        .map(|turn| turn.context_window_tokens())
+    else {
+        return Ok(None);
+    };
+    let threshold = oversized_threshold_tokens(window, MAX_INBOUND_FRAME_BYTES);
+    if cog_core::estimate_tokens(content) <= threshold {
+        return Ok(None);
+    }
+    archive_oversized(
+        state.sandbox_backend.as_ref(),
+        session_id,
+        content,
+        threshold,
+    )
+    .await
+    .map(Some)
 }
 
 /// 装配层在启动时用这同一个句柄填进来的执行器。
@@ -53,6 +232,14 @@ pub trait ConversationTurn: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = cog_core::SFResult<serde_json::Value>> + Send + 'a>,
     >;
+
+    /// 这一段对话真正跑在多大的窗口里（token）。
+    ///
+    /// 不是旁注：一句多长的用户话要落成文件，判据就是它。窗口只有执行体知道——
+    /// 循环的构造在它手里——所以这条数值由它报，网关算阈值时读的就是这一个数。
+    /// 报一个比真窗口大的数，会有消息没落文件却把窗口撑破；报一个比真窗口小的，
+    /// 本来读得下的话被提前推到文件里。
+    fn context_window_tokens(&self) -> usize;
 
     /// 这个人手上还有哪些「总是允许 / 总是拒绝」的规则。
     ///
@@ -651,12 +838,21 @@ async fn emit_message_start(
     session_id: &str,
     message_id: &str,
     role: &str,
+    // 这条消息的原文落在哪个文件、有多长。不是每一条都有：只有超过窗口的消息才
+    // 落文件，其余的是 `null`——界面上「附件」与「正文」因此能分开画。
+    attachment: Option<(&str, usize)>,
 ) {
     emit(
         out,
         session_id,
         "message.start",
-        serde_json::json!({ "message_id": message_id, "role": role }),
+        serde_json::json!({
+            "message_id": message_id,
+            "role": role,
+            "attachment": attachment.map(|(path, chars)| {
+                serde_json::json!({ "path": path, "chars": chars })
+            }),
+        }),
     )
     .await;
 }
@@ -756,7 +952,12 @@ async fn emit_turn_usage(
 ///
 /// 读不到就按「没有历史」回答，不按「历史是空的」记一笔：这两种在读数上要分得开，
 /// 而这一趟能做的只有回答——拿一个读不到的库把聊天停掉，是把「不知道」当成「没有」。
-async fn load_history(store: &crate::ChatTurnHandle, session_id: &str) -> Vec<cog_core::Message> {
+async fn load_history(
+    store: &crate::ChatTurnHandle,
+    session_id: &str,
+    threshold_tokens: usize,
+    backend: Option<&Arc<dyn cog_core::SandboxBackend>>,
+) -> Vec<cog_core::Message> {
     let Some(store) = store else {
         tracing::warn!(
             session = %session_id,
@@ -764,17 +965,39 @@ async fn load_history(store: &crate::ChatTurnHandle, session_id: &str) -> Vec<co
         );
         return Vec::new();
     };
-    match store.history(session_id, SESSION_HISTORY_CAP).await {
-        Ok(turns) => turns_to_messages(turns),
+    let turns = match store.history(session_id, SESSION_HISTORY_CAP).await {
+        Ok(turns) => turns,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 session = %session_id,
                 "聊天：历史读不出来，这一轮按没有上下文回答"
             );
-            Vec::new()
+            return Vec::new();
+        }
+    };
+    let mut messages = turns_to_messages(turns);
+    for message in messages.iter_mut() {
+        if !matches!(message, cog_core::Message::User { .. }) {
+            continue;
+        }
+        let text = message.content();
+        if cog_core::estimate_tokens(&text) <= threshold_tokens {
+            continue;
+        }
+        // 每个用户自己的话都先写一遍文件：执行器的 `/tmp` 会随它的重启消失，
+        // 而记录里的原文还在。写一次就写一次——读到一条引用却打不开它，比读到
+        // 一段被截断的正文更糟。
+        match archive_oversized(backend, session_id, &text, threshold_tokens).await {
+            Ok(archived) => *message = cog_core::Message::user(archived.reference),
+            Err(reason) => tracing::warn!(
+                session = %session_id,
+                error = %reason,
+                "聊天：上一轮的原文没有写回执行器，这一轮只能按记录里的原文带进去"
+            ),
         }
     }
+    messages
 }
 
 /// 记录里的一行变成模型看得懂的一条。角色的闭集在存储面，这里只做搬运。
@@ -896,15 +1119,48 @@ pub async fn run_chat_turn(
     permission_mode: String,
     permissions: Option<Arc<dyn PermissionBridge>>,
 ) {
+    // 一条太长、整条进不了上下文的消息，先在执行器那边落成文件：原文一个字节都
+    // 不丢，循环看到的只是引用与开头。这一步排在回声之前，因为回声那一帧就要把
+    // 「这条消息是附件」带给界面。
+    //
+    // 写不进去就不发：这条消息发出去只能被窗口切掉一半，而「原文没被截断」是这个
+    // 平台对每一句话的承诺，不是能拿「反正模型也读不完」换掉的东西。
+    let archived = match archive_if_oversized(&state, &session_id, &content).await {
+        Ok(archived) => archived,
+        Err(reason) => {
+            let user_mid = format!("user-{}", uuid::Uuid::new_v4());
+            emit_message_start(&out, &session_id, &user_mid, "user", None).await;
+            emit_delta(&out, &session_id, &user_mid, &content).await;
+            let assistant_mid = format!("assistant-{}", uuid::Uuid::new_v4());
+            emit_message_start(&out, &session_id, &assistant_mid, "assistant", None).await;
+            let text = format!(
+                "这条消息太长，要落成文件才能整条留下，而原文没有写进去（{reason}）。\
+                 发出去只会被窗口截掉一半，所以这一轮没有发。"
+            );
+            emit_delta(&out, &session_id, &assistant_mid, &text).await;
+            record_failed_turn(&state.chat_turns, &session_id, &content, &text).await;
+            emit_message_end(&out, &session_id, &user_mid).await;
+            emit_message_end(&out, &session_id, &assistant_mid).await;
+            return;
+        }
+    };
+
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).
     let user_mid = format!("user-{}", uuid::Uuid::new_v4());
-    emit_message_start(&out, &session_id, &user_mid, "user").await;
+    emit_message_start(
+        &out,
+        &session_id,
+        &user_mid,
+        "user",
+        archived.as_ref().map(|a| (a.path.as_str(), a.chars)),
+    )
+    .await;
     emit_delta(&out, &session_id, &user_mid, &content).await;
     emit_message_end(&out, &session_id, &user_mid).await;
 
     let assistant_mid = format!("assistant-{}", uuid::Uuid::new_v4());
-    emit_message_start(&out, &session_id, &assistant_mid, "assistant").await;
+    emit_message_start(&out, &session_id, &assistant_mid, "assistant", None).await;
     // 登记得早，摘得晚：这中间只要漏一条路，停止按钮就会在这段对话上找不到这一
     // 轮，而用户已经按下去了。所以摘不靠某一条 return，靠 guard——它的寿命就是
     // 这一轮在这个函数里的寿命。
@@ -943,8 +1199,24 @@ pub async fn run_chat_turn(
     // 2. Build the transcript: what this session already said, plus this
     //    sentence. 循环读到的是这段记录，不是网关的记忆。员工的指示不在这里：
     //    它是那位员工自己的事，由会话执行器按声明取，网关只搬对话。
-    let mut messages = load_history(&state.chat_turns, &session_id).await;
-    messages.push(cog_core::Message::user(content.clone()));
+    //
+    //    读历史时同一条规则再生效一次：记录里存的是原文（界面上要能读回它），
+    //    而循环读到的是引用加开头（整句再进一次上下文，窗口撑破的就是它）。
+    let threshold = oversized_threshold_tokens(
+        conversation.context_window_tokens(),
+        MAX_INBOUND_FRAME_BYTES,
+    );
+    let mut messages = load_history(
+        &state.chat_turns,
+        &session_id,
+        threshold,
+        state.sandbox_backend.as_ref(),
+    )
+    .await;
+    messages.push(cog_core::Message::user(match &archived {
+        Some(archived) => archived.reference.clone(),
+        None => content.clone(),
+    }));
 
     // 3. Hand it over. 事件由另一个任务读：循环要能一直往管道里写，不因为这一头
     //    在等它返回而互相卡住。
@@ -1110,6 +1382,9 @@ pub async fn run_chat_turn(
 mod tests {
     use super::*;
     use cog_core::ChatTurnStore;
+
+    /// 一个把每一句都放过去的阈值：下面这几条量的是历史本身，不是「多长算长」。
+    const NEVER_OVERSIZED: usize = usize::MAX / 2;
 
     /// 一次询问要走到人面前，答案要回到正好问出它的那一问上。
     ///
@@ -1482,7 +1757,7 @@ mod tests {
             .expect("seed the fake transcript");
         let handle: crate::ChatTurnHandle = Some(store.clone());
 
-        let messages = load_history(&handle, "s1").await;
+        let messages = load_history(&handle, "s1", NEVER_OVERSIZED, None).await;
         assert_eq!(
             messages.iter().map(|m| m.role()).collect::<Vec<_>>(),
             vec!["user", "assistant"]
@@ -1564,7 +1839,9 @@ mod tests {
     #[tokio::test]
     async fn a_deployment_without_a_store_answers_without_history() {
         let handle: crate::ChatTurnHandle = None;
-        assert!(load_history(&handle, "s1").await.is_empty());
+        assert!(load_history(&handle, "s1", NEVER_OVERSIZED, None)
+            .await
+            .is_empty());
         // 不发散：这里只要求「不写进任何东西」——没有第二个家可写。
         record_turn(&handle, "s1", "问", "答").await;
         record_failed_turn(&handle, "s1", "问", "答不出来").await;
@@ -1580,7 +1857,9 @@ mod tests {
             .expect("seed the fake transcript");
         store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        assert!(load_history(&handle, "s1").await.is_empty());
+        assert!(load_history(&handle, "s1", NEVER_OVERSIZED, None)
+            .await
+            .is_empty());
         // 写也失败时不许把这一轮的回答吞掉：record_turn 只留 warn。
         record_turn(&handle, "s1", "问", "答").await;
     }

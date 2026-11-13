@@ -66,6 +66,48 @@ function usageLine(usage: TurnUsage): string {
   return parts.join(' · ');
 }
 
+/**
+ * 一条长消息画成附件时，正文先折起来的那条线（字符）。
+ *
+ * override — 屏幕上的折叠线，人按「一眼就知道这不是一句话」的量级挑的，不随窗口
+ * 变；它只决定「折起来还是铺开」，不决定「留下还是丢掉」——原文一个字节都不少，
+ * 服务端已经按它自己量出来的阈值把原文落成了文件。
+ */
+const LONG_MESSAGE_CHARS = 2000;
+
+/**
+ * 一条长消息：长度、原文落在哪，正文折起来。
+ *
+ * 服务端对超过窗口的消息只把开头交给循环，原文逐字落在执行器的文件里；这一条
+ * 因此不能按普通正文画——那样读到的「全文」其实是开头，而读者不会知道少了什么。
+ * 附件那一行写的是**全文**的字符数，正文只是屏幕上的折叠。
+ */
+function LongMessage({ message }: { message: ChatMessage }) {
+  const [open, setOpen] = useState(false);
+  const chars = message.attachment?.chars ?? message.text.length;
+  return (
+    <div className="long-message border-l border-[var(--line)] pl-2">
+      <div className="mono flex flex-wrap items-baseline gap-2 text-[10px] text-[var(--muted)]">
+        <span style={{ color: 'var(--paper-dim)' }}>长消息 · {compactCount(chars)} 字符</span>
+        {message.attachment && (
+          <span className="break-all">原文已存成文件 {message.attachment.path}</span>
+        )}
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="transition-colors hover:text-[var(--paper-dim)]"
+        >
+          {open ? '收起' : '展开全文'}
+        </button>
+      </div>
+      {/* 正文仍然走同一个渲染器：折叠的是高度，不是这一条话的读法。 */}
+      <div className={`mt-1 ${open ? '' : 'max-h-40 overflow-hidden'}`}>
+        <Markdown text={message.text} />
+      </div>
+    </div>
+  );
+}
+
 function Turn({ message }: { message: ChatMessage }) {
   const [showThinking, setShowThinking] = useState(false);
   const streaming = message.status === 'streaming' || message.status === 'sending';
@@ -114,13 +156,23 @@ function Turn({ message }: { message: ChatMessage }) {
       )}
 
       {/*
-        正文按 Markdown 画：回复里带的是列表、代码块和 diff，按纯文本铺出来，
-        读者要自己对齐正负号、自己认哪一段是代码。两边的颜色仍然分开——「你」说
-        的是纸色，回复略暗一档。
+        一条长得不像一句话的消息画成附件：服务端把原文落成了文件，这一条就不该
+        铺成正文——铺开来是一整屏，读的人还会以为屏幕上这段就是全部。界面按正文
+        长度认出读回历史里的那几条（记录里没有附件那一格），按附件那一格认出刚
+        发出去的这几条。
       */}
-      <div style={{ color: message.role === 'user' ? 'var(--paper)' : 'var(--paper-dim)' }}>
-        <Markdown text={message.text} streaming={streaming} />
-      </div>
+      {message.attachment || (message.role === 'user' && message.text.length > LONG_MESSAGE_CHARS) ? (
+        <LongMessage message={message} />
+      ) : (
+        /*
+          正文按 Markdown 画：回复里带的是列表、代码块和 diff，按纯文本铺出来，
+          读者要自己对齐正负号、自己认哪一段是代码。两边的颜色仍然分开——「你」说
+          的是纸色，回复略暗一档。
+        */
+        <div style={{ color: message.role === 'user' ? 'var(--paper)' : 'var(--paper-dim)' }}>
+          <Markdown text={message.text} streaming={streaming} />
+        </div>
+      )}
 
       {/*
         这一轮花了多少。只有服务端真的量到了才有一行：读回的历史与被叫停的那
