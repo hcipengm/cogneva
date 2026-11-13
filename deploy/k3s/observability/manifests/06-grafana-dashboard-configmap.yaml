@@ -2470,7 +2470,6 @@ data:
           "id": 58,
           "title": "Volume Capacity: Declaration, Granted and Measured Peak",
           "description": "The three numbers the growth loop decides from, per claim, drawn side by side: the declaration in force, what the storage side gave back (`granted`, the claim status capacity), and the highest usage ever measured against them. The `ceiling` line appears only while a claim is actually clamped, and its legend names the object that set it -- `limit_range` or `quota` -- so the wall and its owner arrive together rather than being inferred. The loop raises a declaration once the peak no longer fits, so on a healthy volume the peak line stays below the declared one and the gap is the headroom the loop is working with. A granted line below the declared one is an expansion that was asked for and never handed back -- on a class that cannot carry one it stays below forever, and the volume has no real bound at all. A peak above the granted line is data already on disk past what the volume was given. Neither number is derivable from the other side of the account -- the declaration is a request, the granted size is an answer, and the peak is a measurement -- which is why they are drawn rather than reduced to one ratio.",
-    
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -3136,8 +3135,7 @@ data:
               }
             }
           }
-        }
-        ,
+        },
         {
           "id": 73,
           "title": "Startup Phases: When Each One Was Reached",
@@ -3177,8 +3175,7 @@ data:
               }
             }
           }
-        }
-        ,
+        },
         {
           "id": 74,
           "title": "Startup Phases: CPU Seconds Spent When Each Was Reached",
@@ -3674,6 +3671,123 @@ data:
             {
               "expr": "sum by (effect) (increase(cogneva_attempt_unresolved_calls_total[1h]))",
               "legendFormat": "unresolved: {{effect}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 87,
+          "title": "Workload CPU Declarations From Measurement",
+          "description": "The CPU declaration the resource loop wrote into each container, and where the number came from. The request is the p95 of what the container actually drew, read from the kubelet summary over a seven-day window and rounded up to 10m; the limit is that window's peak times the same 120% headroom the volume-capacity loop uses, never below the request. Both lines move when the draw moves, so neither is a number somebody picked once. `source=\"derived\"` means the window holds enough samples and the line is the loop's answer; `source=\"seed\"` means it does not yet and the line is still the chart's declared value -- a name that stays on seed for days is a container the loop cannot measure (the summary endpoint, RBAC, or a node it cannot reach), not a workload that draws exactly that. A declaration the loop raises or lowers is a patch against the live object; the rolling update that follows is the loop's effect, not a fault.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 408
+          },
+          "targets": [
+            {
+              "expr": "max by (workload, container, source) (cogneva_workload_request_cpu_millicores)",
+              "legendFormat": "{{workload}}/{{container}} request ({{source}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (workload, container, source) (cogneva_workload_limit_cpu_millicores)",
+              "legendFormat": "{{workload}}/{{container}} limit ({{source}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 88,
+          "title": "Workload Memory Declarations From Measurement",
+          "description": "The memory declaration the resource loop wrote into each container, and where the number came from. The request is the p95 of `memory.workingSetBytes` over a seven-day window, rounded up to 16Mi; the limit is that window's peak times the same 120% headroom, never below the request. `source=\"derived\"` is a value the measurement set and `source=\"seed\"` is the chart's declared value, still in force because the window is short of samples. The gap between the two lines is the headroom the loop is working with; a limit that sits close to the request is one the loop has not seen a peak above yet.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 408
+          },
+          "targets": [
+            {
+              "expr": "max by (workload, container, source) (cogneva_workload_request_memory_bytes)",
+              "legendFormat": "{{workload}}/{{container}} request ({{source}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (workload, container, source) (cogneva_workload_limit_memory_bytes)",
+              "legendFormat": "{{workload}}/{{container}} limit ({{source}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 89,
+          "title": "Workload Resource Loop: Samples Behind Each Declaration",
+          "description": "Whether the declarations above are recomputed rather than computed once. `samples` is how many readings the seven-day window holds for each container; the loop refuses to move a declaration below twelve, so a line that stops climbing is one the loop sees but has not sampled long enough. `evaluations` counts the rounds that evaluated this container, and it climbs even when the target does not move. A flat target with a climbing counter is the loop measuring and deciding to leave the declaration alone; a flat counter is the loop gone, and from here the declarations freeze with nobody writing them. This is the reading that separates those two, which is why the target lines are drawn beside it rather than on their own.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 416
+          },
+          "targets": [
+            {
+              "expr": "max by (workload, container) (cogneva_workload_resources_samples)",
+              "legendFormat": "{{workload}}/{{container}} samples",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (workload, container) (cogneva_workload_resources_evaluations_total)",
+              "legendFormat": "{{workload}}/{{container}} evaluations",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

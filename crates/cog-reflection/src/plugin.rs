@@ -145,6 +145,9 @@ pub struct ReflectionPlugin {
     /// 进程会起循环，别的进程上这一族序列不存在，读作「没人在看这张卷」，
     /// 与「看了、够用」是两件事。
     volume_capacity: Arc<crate::volume_capacity::VolumeCapacityReadings>,
+    /// 容器资源请求/上限跟着实测用量走那条闭环的读数。同样无条件建：
+    /// 只有跑构建那个进程会起循环，别处读到「没人在量」正是事实。
+    workload_resources: Arc<crate::workload_resources::WorkloadResourcesReadings>,
 }
 
 impl ReflectionPlugin {
@@ -168,6 +171,9 @@ impl ReflectionPlugin {
             rework_gate: None,
             promotion_eval_slot: Arc::new(std::sync::OnceLock::new()),
             volume_capacity: Arc::new(crate::volume_capacity::VolumeCapacityReadings::new()),
+            workload_resources: Arc::new(
+                crate::workload_resources::WorkloadResourcesReadings::new(),
+            ),
         }
     }
 }
@@ -977,6 +983,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // 「这张卷没人在看」本身就是读者最需要看到的那一格。
                 ctx.publish_observable(self.volume_capacity.clone());
 
+                // 资源请求/上限的实测目标。与卷容量同一条理由：发布无条件，
+                // 由跑构建那个进程在 start() 起循环；别处读到的是「没人量」。
+                ctx.publish_observable(self.workload_resources.clone());
+
                 // 自动晋级运行时一键暂停开关：admin API 与 AutoPromoter
                 // 共享同一实例，暂停立即对排队晋级生效。
                 let promotion_switch = Arc::new(crate::PromotionSwitch::new());
@@ -1630,6 +1640,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     shutdown.trigger();
                 });
             }
+            // 容器资源的目标跟着实测走。与卷容量同一条角色前提：只有跑构建
+            // 那个进程有这套 kubectl 与 RBAC；别处起这条循环改不了对象。
+            drop(crate::workload_resources::spawn_workload_resources_loop(
+                self.workload_resources.clone(),
+                shutdown.clone(),
+            ));
             drop(crate::volume_capacity::spawn_volume_capacity_loop(
                 self.volume_capacity.clone(),
                 // The cache, so the same loop that measures the claim tells the
@@ -1894,7 +1910,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // process reading them shares its life. The handle itself was
                 // published in init -- see the field's own note for why it cannot
                 // be published from here.
-                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces);
+                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces)
+                    // 判定 Job 的下一轮尺寸进同一个读数面：同一条律、同一个
+                    // source 标签，别让它单独长一套指标名。
+                    .with_workload_resources(self.workload_resources.clone());
                 let deployer = match self.governance_drift.clone() {
                     Some(drift) => deployer.with_governance_drift(drift),
                     // init publishes it under this same guard, so reaching here

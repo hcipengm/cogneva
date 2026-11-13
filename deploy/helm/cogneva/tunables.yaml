@@ -130,24 +130,80 @@ rows:
       back into the declaration.
 
   - key: backends.meilisearch.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.meilisearch.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.meilisearch.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.meilisearch.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Sized for the search index this store holds with room for index rebuilds; no loop re-measures the index against the bound.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
   - key: backends.nats.storage
     source: override
     why: >-
@@ -156,24 +212,80 @@ rows:
       computes it.
 
   - key: backends.nats.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.nats.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.nats.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.nats.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Sized for the JetStream backlog with room for file-store buffers; the backlog is measured elsewhere but never read back into this bound.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
   - key: backends.postgres.storage
     source: override
     why: >-
@@ -182,54 +294,167 @@ rows:
       reads it back.
 
   - key: backends.postgres.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.postgres.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.postgres.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.postgres.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Sized for the database already carried (962 MB on 2026-10-18) plus WAL and connections; no loop re-measures it.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   # The metrics sidecar's own bounds. A sidecar in the same Pod is charged to the
   # namespace ceiling like any other container, so these are part of the sum the
   # projection reads -- they are not free because they are small.
   - key: backends.postgres.exporterResources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim sized for a handful of read-only queries per scrape; no
-      measurement feeds back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The metrics
+      sidecar sits in the same Pod and is charged to the namespace ceiling like
+      any other container, so its own draw is measured the same way. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.postgres.exporterResources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the sidecar; the working set
-      it needs over a scrape is carried by the limit.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      metrics sidecar sits in the same Pod and is charged to the namespace ceiling
+      like any other container, so its own draw is measured the same way. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.postgres.exporterResources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for a scrape over many tables; the steady rate sits far below
-      it and no measurement of the burst feeds back into it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The metrics sidecar sits in the same Pod and is charged to the namespace
+      ceiling like any other container, so its own draw is measured the same way.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.postgres.exporterResources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Has to cover the exporter's heap after the table count and scrape history
-      have grown it: pinned at the steady average it is OOM-killed after a run of
-      scrapes, and a restarting sidecar reads exactly like a database with no
-      connections. No loop measures that growth today, so the bound is named here
-      rather than derived.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The metrics sidecar sits in
+      the same Pod and is charged to the namespace ceiling like any other
+      container, so its own draw is measured the same way. The reading published
+      under this key carries `source=derived` once the window has enough samples,
+      and `source=seed` with the declared value before that, so a reader can
+      always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.qdrant.storage
     source: override
@@ -238,24 +463,80 @@ rows:
       the application already knows; the declaration does not read that number.
 
   - key: backends.qdrant.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.qdrant.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.qdrant.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.qdrant.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Sized for the vector index with room for segment merges; no loop re-measures it.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
   - key: backends.redis.storage
     source: override
     why: >-
@@ -264,74 +545,232 @@ rows:
       derived value would read the rewritten file size; nothing does.
 
   - key: backends.redis.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      The store's steady draw is well under a core; the request exists so the
-      scheduler places it, not to express measured load. Nothing reads a measured
-      figure back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the store; the working set
-      is carried by the limit. A request at working-set size would be a permanent
-      claim for a figure that only exists after the RDB is loaded.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for startup loading and AOF rewrites; the steady rate sits far
-      below it and no measurement of the burst is fed back into the limit.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      The dataset loads 485.56 MB from RDB before the store accepts a connection,
-      and 512Mi left about 27MB for AOF increments and write buffers, so the
-      container was killed roughly twenty seconds after every start. The live
-      patch raised it to 2Gi and the service has held with zero restarts since;
-      the chart follows that value. A derived limit would read the loaded dataset
-      size, and nothing does today.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.aofRepair.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.aofRepair.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.aofRepair.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.aofRepair.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      A one-shot rewrite of the whole AOF before redis starts: the bound is a practice, not a measurement.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.aofReportExporter.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.aofReportExporter.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.aofReportExporter.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.redis.aofReportExporter.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      A textfile collector beside redis; the footprint is the process plus the file it serves, and no reading moves it.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
   - key: backends.redis.infoExporter.intervalSeconds
     source: override
     why: >-
@@ -352,51 +791,152 @@ rows:
       cogneva_redis_wal_scan_interval_seconds, so a staleness rule reads the
       cadence it was configured with instead of holding a second copy.
   - key: backends.redis.infoExporter.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim, not a measured draw: one redis-cli call every 30 s sits far below it and nothing reads a figure back into it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
   - key: backends.redis.infoExporter.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Small enough that a tight node still schedules the poller; the footprint is the shell plus one redis-cli process, and the limit carries it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
   - key: backends.redis.infoExporter.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for the poll loop. The burst is real and now measured: at
-      100m the poller spent 57% of its CFS periods throttled while drawing under
-      a millicore on average, because a fork-and-parse burst spends the whole
-      100 ms quota in its first few milliseconds -- which is why the draw is not
-      the reading that decides this number. Raised to 500m against that ratio on
-      2026-10-23. Still an override: nothing re-derives it, so a pod that begins
-      throttling again is caught by CPUThrottlingHigh and by the ledger row for
-      an alert the mirror never sees, not by this value moving on its own.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
   - key: backends.redis.infoExporter.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      The poller's whole working set is the INFO reply it parses; no reading moves this bound.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
   - key: backends.seaweedfs.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      The object store's steady draw is a fraction of a core; the request only
-      has to let a tight node schedule it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.seaweedfs.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Volume-server buffers are small beside the data itself, which lives on the
-      volume; the limit carries the working set, not this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.seaweedfs.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound for compaction and S3 request handling; nothing measures the
-      burst back into the limit.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.seaweedfs.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      The raw and cold layers only grow (15 GiB in use when sized), but this bound
-      covers buffers, not the data; no loop re-measures it.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backends.seaweedfs.storage
     source: override
@@ -461,94 +1001,239 @@ rows:
 
   # --- node image builds ------------------------------------------------------
   - key: backup.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A streaming COPY-to-file job whose resident set is small by construction;
-      the request only has to let a tight node schedule it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backup.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      See requests.cpu above: the working set is small and no measurement feeds
-      back into this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backup.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A ceiling for a straggling compression pass; the run time is measured per
-      run, but nothing reads it back into this limit.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backup.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      The tar.zst stream buffers only; the bound is a practice, not a reading.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backup.drillResources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      The drill restores the package into a scratch database; the request only
-      has to let a tight node schedule it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The drill
+      CronJob's pods are resolved through the Jobs it creates, so the loop
+      measures and patches the Job template. The reading published under this key
+      carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backup.drillResources.requests.memory
-    source: override
+    source: derived
     why: >-
-      The restore streams through COPY on the postgres side, so the client's
-      resident set is small and no measurement feeds back into this claim.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      drill CronJob's pods are resolved through the Jobs it creates, so the loop
+      measures and patches the Job template. The reading published under this key
+      carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backup.drillResources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A ceiling for a restore that has to finish inside the deadline; the
-      deadline is what bounds it and neither value is derived.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The drill CronJob's pods are resolved through the Jobs it creates, so the
+      loop measures and patches the Job template. The reading published under this
+      key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: backup.drillResources.limits.memory
-    source: override
+    source: derived
     why: >-
-      See the backup job's bound: a practice, not a reading.
-
-  - key: dbRoleBootstrap.resources.requests.cpu
-    source: override
-    why: >-
-      The role bootstrap runs once and then exits; the request only has to let a
-      tight node schedule it, and nothing measures the run back into this claim.
-
-  - key: dbRoleBootstrap.resources.requests.memory
-    source: override
-    why: >-
-      See requests.cpu above: the job holds a psql session and a loop over object
-      names, so its resident set is small by construction.
-
-  - key: dbRoleBootstrap.resources.limits.memory
-    source: override
-    why: >-
-      A ceiling for the ownership loop on a large schema; the loop's length is
-      what varies, not its footprint, so no reading feeds back into this bound.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The drill CronJob's pods are
+      resolved through the Jobs it creates, so the loop measures and patches the
+      Job template. The reading published under this key carries `source=derived`
+      once the window has enough samples, and `source=seed` with the declared
+      value before that, so a reader can always tell which side of the measurement
+      it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: buildah.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      The daemon idles near 1Mi and is only busy during a build, so the request is
-      the resident draw. A derived pair would read this container's measured peak;
-      the resource face of a buildah DaemonSet is not published today.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: buildah.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Sized for the idle daemon so a small node is not blocked by a permanent
-      half-gigabyte claim. The build burst is carried by the limit.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: buildah.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A burst bound, not a steady rate: the daemon is idle except while a build
-      runs, and no reading of that burst is fed back into the limit.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: buildah.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Room for one image build; the node's actual headroom carries the rest. The
-      measured peak of a build is the input a derived limit would read, and the
-      build gate measures something adjacent (concurrent builds), not this.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   # --- in-cluster registry ----------------------------------------------------
   - key: clusterRegistry.replicas
@@ -575,33 +1260,80 @@ rows:
       address, not a dial.
 
   - key: clusterRegistry.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      The registry is a third-party process that publishes no metrics of its own;
-      the request is a small floor. A derived pair would read the container's
-      measured working set, which nothing collects for this pod.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: clusterRegistry.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      A floor for an idle registry. The volume it serves is measured by the walker
-      sidecar, not this process's memory.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: clusterRegistry.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Burst room for a push, and now a reading behind it: kubelet reports every
-      container's cfs periods, and on 2026-10-23 this one spent 0.304 of them
-      throttled while averaging 23m of cpu, which is what moved the bound from
-      200m to 500m. It stays `override` because a reading is not a loop: nothing
-      walks this number from the throttled ratio on its own, so the honest record
-      is that somebody read it and changed it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: clusterRegistry.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Burst room for a push. The push rate and payload size are not measured back
-      into this bound.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: clusterRegistry.storage
     source: override
@@ -618,28 +1350,86 @@ rows:
       monitoring discovers. An address, not a dial.
 
   - key: clusterRegistry.walkerResources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      The walk is readdir+stat and does not eat CPU. A derived pair would read the
-      walk's own duration against the scan interval; nothing publishes that for
-      this sidecar.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. This is the
+      registry-walker sidecar; the loop measures each container in the Pod
+      separately. The reading published under this key carries `source=derived`
+      once the window has enough samples, and `source=seed` with the declared
+      value before that, so a reader can always tell which side of the measurement
+      it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: clusterRegistry.walkerResources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Sized by the directory tree it walks; the store is far smaller than the
-      declaration. The tree size is a measurement the walk already takes, and it
-      is not read back into the request.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. This is
+      the registry-walker sidecar; the loop measures each container in the Pod
+      separately. The reading published under this key carries `source=derived`
+      once the window has enough samples, and `source=seed` with the declared
+      value before that, so a reader can always tell which side of the measurement
+      it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: clusterRegistry.walkerResources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      A ceiling for a metadata walk. No reading of the sidecar's CPU is collected.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      This is the registry-walker sidecar; the loop measures each container in the
+      Pod separately. The reading published under this key carries
+      `source=derived` once the window has enough samples, and `source=seed` with
+      the declared value before that, so a reader can always tell which side of
+      the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: clusterRegistry.walkerResources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Room for one full walk of the store. The walk's peak is not published.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. This is the registry-walker
+      sidecar; the loop measures each container in the Pod separately. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   # --- evolution worker -------------------------------------------------------
   - key: changeVerification.cargoBuildJobs
@@ -712,34 +1502,80 @@ rows:
       which the mirror itself could measure; the declaration does not read it.
 
   - key: evolution.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim for a workload whose real draw is a build burst. The
-      container's cgroup is read by the build gate's cgroup_memory dimension, but
-      that dimension reads the memory limit, not this request.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: evolution.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      A scheduling claim, separate from the limit the build gate reads. The
-      measured working set would be the derived input; it is not published for
-      this container.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: evolution.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Sized so the container can run its build with the rest of the workload.
-      CFS throttling is visible in the cluster's own readings, and nothing closes
-      that reading back into the limit.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: evolution.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Read by the build gate's cgroup_memory dimension: the gate asks how many
-      concurrent builds this cgroup can hold, so the number has a consumer, but
-      the number itself is still named here. Raising it requires raising the
-      LimitRange's per-container maximum in the same change, or the Pod is
-      refused at admission.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: evolution.sandboxStorage
     source: override
@@ -812,33 +1648,80 @@ rows:
       per-replica load to derive it.
 
   - key: gateway.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A scheduling claim for a workload whose draw is inference bursts. The
-      container's working set is published by the cluster, and nothing turns it
-      into the request.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: gateway.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Declares what the scheduler reserves; the real consumption is read from
-      container_memory_working_set_bytes at runtime, and tightening this later
-      trims the margin rather than the capability. The reading is available; the
-      loop that would set the number is not.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: gateway.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Room for intra-thread inference during model load. CPU throttling is
-      visible in the cluster's readings; nothing feeds it back into this bound.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: gateway.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Sized from measured RSS: about 1.67GiB per loaded session (the two embedding
-      sessions share one weight file) plus reranker and activation headroom, for
-      three sessions. The measurement exists; it was turned into a number by a
-      human, and no loop re-measures it.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: taskRouter.claimConcurrency
     source: override
@@ -1088,53 +1971,157 @@ rows:
       The scrape port of the per-node ledger. An address.
 
   - key: hostLedger.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      Each scrape reads three small files; the resident and burst draw are noise.
-      A derived pair would read the process's own measured cost; nothing collects
-      it for this DaemonSet.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: hostLedger.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Sized to the resident cost of a read-only reader. No measurement of it is
-      published.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: hostLedger.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Room for one scrape. Not derived from anything.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: hostLedger.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Room for one scrape's buffers. Not derived from anything.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   # --- process census (per-node account of every container's processes) ------
   - key: processCensus.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      Each tick walks the cgroup tree and reads a few hundred small /proc files;
-      the resident and burst draw are noise next to one millicore. A derived pair
-      would read the census's own measured cost, and nothing collects it.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: processCensus.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Sized to the resident cost of a reader that holds one container's process
-      list at a time. No measurement of it is published.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: processCensus.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Room for one full sweep of the tree. Not derived from anything: the tick
-      that paces the sweep is the loop's own interval, not a reading of this
-      bound.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: processCensus.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Room for one sweep's buffers. Not derived from anything.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   # --- claim store (per-node account of claims and the image store) -----------
   - key: claimStore.port
@@ -1144,28 +2131,80 @@ rows:
       and the container port are both read from it.
 
   - key: claimStore.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      Two metadata walks per cadence and nothing in between. A derived pair would
-      read the walker's own measured cost; nothing collects it for this DaemonSet.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: claimStore.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      The walker holds one entry per claim directory and one per store part, so
-      its memory follows the number of entries rather than their bytes -- and the
-      byte counts it publishes say how many entries there are. The request itself
-      is not read back from anything.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: claimStore.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Room for one walk. Not derived from anything.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: claimStore.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Room for one walk's directory entries. Not derived from anything.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: claimStore.scanIntervalSecs
     source: override
@@ -1245,32 +2284,78 @@ rows:
       the disk's free space.
 
   - key: mainlineDeployer.rolloutJob.cpuRequest
-    source: override
+    source: derived
     why: >-
-      Both an admission claim and the container's CFS weight; 200m sits below the
-      busiest-minute average and well above the per-run average measured across
-      six rollouts. Those readings exist in the cluster and are not closed back
-      into the request.
+      The rollout judgement's own scheduling claim follows what its past runs
+      measured of themselves: each finished Job writes its average CPU and peak
+      memory into its termination message, the deployer keeps that run history on
+      disk, and sizes the next Job by the same law. The request is the p95 of
+      those runs, rounded up to 10m. The reading on `workload="mainline-rollout"`
+      carries `source=derived` once a run history exists and `source=seed` with
+      the chart value until then; the first run therefore keeps the seed.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
 
   - key: mainlineDeployer.rolloutJob.cpuLimit
-    source: override
+    source: derived
     why: >-
-      Two cores, after the container's own cgroup showed half its active CFS
-      periods throttled at one core. The throttle counts are the measurement a
-      derived limit would use; they are re-measured per rollout, not fed back.
+      The rollout judgement's own CPU bound is the peak of its measured runs times
+      the 120% headroom, rounded up to 10m and never below the request; when the
+      last few runs spent more than 10% of their CFS periods throttled, the bound
+      is raised by that ratio on top, so a limit that was biting stops before the
+      next run. The reading on `workload="mainline-rollout"` carries
+      `source=derived` once a run history exists and `source=seed` with the chart
+      value until then; the first run therefore keeps the seed.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
 
   - key: mainlineDeployer.rolloutJob.memoryRequest
-    source: override
+    source: derived
     why: >-
-      Covers the resident heap between kubectl bursts. The working-set reading
-      exists; nothing turns it into the request.
+      The rollout judgement's own scheduling claim follows what its past runs
+      measured of themselves: each finished Job writes its average CPU and peak
+      memory into its termination message, the deployer keeps that run history on
+      disk, and sizes the next Job by the same law. The request is the p95 of
+      those runs, rounded up to 16Mi. The reading on `workload="mainline-rollout"`
+      carries `source=derived` once a run history exists and `source=seed` with
+      the chart value until then; the first run therefore keeps the seed.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
 
   - key: mainlineDeployer.rolloutJob.memoryLimit
-    source: override
+    source: derived
     why: >-
-      512Mi against a measured working-set peak of 243MiB, because this is the
-      process that decides whether to roll back and its failure is an OOM kill.
-      The peak is measured per rollout; it is not read back into the limit.
+      The rollout judgement's own memory bound is the peak of its measured runs
+      times the 120% headroom, rounded up to 16Mi and never below the request. The
+      reading on `workload="mainline-rollout"` carries `source=derived` once a run
+      history exists and `source=seed` with the chart value until then; the first
+      run therefore keeps the seed.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
 
   - key: mainlineDeployer.rolloutTimeoutSecs
     source: override
@@ -1511,55 +2596,80 @@ rows:
       test: the_fetch_period_follows_how_long_main_was_still
 
   - key: sandboxExecutor.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      The container's parallelism is already one (cpu.max 100000/100000), so the
-      request is not a concurrency knob; it is a claim for a bursty workload. The
-      cgroup readings are available, and nothing turns them into the request.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: sandboxExecutor.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      Sized to the resident draw; this is a bursty workload, and a higher request
-      would only pin it to the node. The peak is published as
-      sandbox_memory_peak_bytes, and nothing turns that reading into the request:
-      a request set from a peak would pin a bursty workload to the node for the
-      rest of its life.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: sandboxExecutor.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Deliberately untouched when the memory limit moved: CFS throttling in the
-      window was 918 of 5012 periods and was not the cause of the OOM kills. The
-      container now publishes that measurement itself, as
-      sandbox_cpu_throttle_events and sandbox_cpu_throttled_seconds from its own
-      cpu.stat; a derived limit would be set from those, and nothing does, so
-      this stays a stated policy ceiling with a reading that can falsify it.
-      2026-11-07 that reading falsified it: 805 of 2099 periods throttled (38%)
-      within the first minutes of a boot, 16.3 seconds throttled, while two
-      agent-issued builds ran. It was still not the OOM's cause -- but a
-      throttled container cannot answer its own health probes in time either,
-      and that restarts the pod just as effectively. Raised to 4 cores on a
-      24-core node; the namespace limits.cpu quota (39) leaves room for it.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: sandboxExecutor.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      3 GiB, after one build was measured at 1.685 GiB of unreclaimable anon and
-      2 GiB left almost no growth room; the falsifier is the outcome reading
-      sandbox_oom_kills_total staying at zero, which a human judges against a
-      window. sandbox_memory_peak_bytes is published beside it, so a peak that
-      walks up to the limit is visible before the kills start. That is a
-      decision procedure, not a loop that sets the value. 2026-11-07: the
-      container was OOMKilled at 00:01:46 and sandbox_oom_kills_total read 0 --
-      it is an in-process counter, incremented only when a child is killed by
-      signal, and a container-level kill takes the process with it before it can
-      write. The counter is zero on the far side of exactly the event it was
-      named to detect, so it is retired as this limit's falsifier. The one that
-      can see the event is the container outcome that
-      check-container-headroom.sh already reads (kube-state-metrics
-      last_terminated_reason / restart count); it was red. Raised to 8 GiB --
-      about three times the 2.71 GiB peak RSS that window recorded.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: sandboxExecutor.storage
     source: override
@@ -1664,27 +2774,80 @@ rows:
       back into the declaration.
 
   - key: securityGateway.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      The gateway sits in front of every call chain; without a request the
-      scheduler treats it as BestEffort and evicts it first. Sized from its
-      measured resident cost; the reading is not fed back.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: securityGateway.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      The resident cost of the proxy process. A derived value would read the
-      measured working set; nothing does.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: securityGateway.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Burst room for proxy traffic. Not derived from a reading.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: securityGateway.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Burst room over the resident cost. Not derived from a reading.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   # --- workspace quota (WebUI file surface) ---
   - key: workspace.maxBytes
@@ -1729,33 +2892,80 @@ rows:
       hand.
 
   - key: webSearch.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A request, not a measurement: without one the scheduler treats the Pod as
-      BestEffort and evicts it first, and an evicted search backend turns every
-      web_search call into a failure. Sized from an idle serving cost observed
-      when the instance was added; nothing reads that cost back.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: webSearch.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      The resident cost of an idle SearXNG process with its engines loaded. A
-      derived value would read the measured working set; nothing does.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: webSearch.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Burst room for concurrent queries. Each query is a fan-out to upstream
-      engines, so the burst is longer than a single request; no reading of query
-      latency or concurrency is fed back into this number.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: webSearch.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Burst room over the resident cost for one query's parsed pages. Not derived
-      from a reading. This number and the namespace quota are one knob in two
-      places: the governance check refuses a ceiling the quota cannot admit, so
-      raising it alone stops the next rollout rather than this Pod.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   # --- 网页抓取（渲染后端，Crawl4AI）------------------------------------------
   - key: webFetch.replicas
@@ -1777,34 +2987,80 @@ rows:
       webFetch.resources.limits.memory.
 
   - key: webFetch.resources.requests.cpu
-    source: override
+    source: derived
     why: >-
-      A request, not a measurement: without one the scheduler treats the Pod as
-      BestEffort and evicts it first, and an evicted renderer turns every
-      web_fetch into an error rather than a page. Sized from an idle serving cost
-      when the backend was added; nothing reads that cost back.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `cpu.usageNanoCores` from the kubelet summary every few minutes,
+      keeps a seven-day window, and patches the request to the window's p95,
+      rounded up to 10m, whenever the move is at least one quantum. The reading
+      published under this key carries `source=derived` once the window has enough
+      samples, and `source=seed` with the declared value before that, so a reader
+      can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: webFetch.resources.requests.memory
-    source: override
+    source: derived
     why: >-
-      The resident cost of an idle browser-control server before any page is
-      rendered. A derived value would read the measured working set; nothing
-      does.
+      The scheduling claim is not pinned: the workload-resources loop reads this
+      container's `memory.workingSetBytes` from the kubelet summary every few
+      minutes, keeps a seven-day window, and patches the request to the window's
+      p95, rounded up to 16Mi, whenever the move is at least one quantum. The
+      reading published under this key carries `source=derived` once the window
+      has enough samples, and `source=seed` with the declared value before that,
+      so a reader can always tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REQUEST_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: webFetch.resources.limits.cpu
-    source: override
+    source: derived
     why: >-
-      Burst room for a page render, which is several requests and a layout pass.
-      No reading of render latency or concurrency is fed back into this number.
+      The CPU bound follows the measured draw: the loop patches the limit to the
+      window's peak on `cpu.usageNanoCores` times the 120% headroom the
+      volume-capacity loop also uses, rounded up to 10m and never below the
+      request; a run that keeps being throttled at the bound raises it further.
+      The reading published under this key carries `source=derived` once the
+      window has enough samples, and `source=seed` with the declared value before
+      that, so a reader can always tell which side of the measurement it is
+      looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_CPU_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   - key: webFetch.resources.limits.memory
-    source: override
+    source: derived
     why: >-
-      Browser plus the tmpfs above: the limit has to stay at least one GiB above
-      webFetch.shmSize, because the shared-memory pages count against this Pod.
-      This number and the namespace quota are one knob in two places: the
-      governance check refuses a ceiling the quota cannot admit, so raising it
-      alone stops the next rollout rather than this Pod.
+      The memory bound follows the measured draw: the loop patches the limit to
+      the window's peak on `memory.workingSetBytes` times the same 120% headroom,
+      rounded up to 16Mi and never below the request. The reading published under
+      this key carries `source=derived` once the window has enough samples, and
+      `source=seed` with the declared value before that, so a reader can always
+      tell which side of the measurement it is looking at.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: LIMIT_MEMORY_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_request_follows_the_measured_draw
 
   # --- platform webhook -------------------------------------------------------
   - key: webhook.nodePort

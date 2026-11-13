@@ -6353,6 +6353,9 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
     // 开工先建进度文件：容器外的存活探针从这一刻起就有东西可读，Job 因此不再需要
     // 一个按钟杀掉容器的 activeDeadlineSeconds。
     cog_core::progress::start_progress_file();
+    // 资源读数要报「这次跑的平均核数」，而 cgroup 里只有累计用量、没有起步
+    // 时刻。起步时刻只有这里知道，所以从这里一路带进终止消息。
+    let started = std::time::Instant::now();
     // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
     // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
     // 靠的正是那边装上的 Loki 镜像。
@@ -6394,7 +6397,7 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         // 成功也留下读数：这一轮跑得离上限有多近，只有跑完的这一刻在同一个进程里
         // 对照得出来（上限写在 Job 清单里，用掉的量在这个容器自己的 cgroup 里）。
         Ok(()) => {
-            report_termination_message(None, None);
+            report_termination_message(None, None, started.elapsed());
             Ok(())
         }
         // 失败分两条通道过 Job 边界：类别走退出码（环境类用独立的 75，让部署器
@@ -6403,7 +6406,7 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         // "这个容器为什么死"留的窄通道，读出端按结构化字段取，不解析日志。
         // `process::exit` 不走返回路径，因为 Box<dyn Error> 出去一律是 1。
         Err(f) => {
-            report_termination_message(Some(&f.signature), f.admission_hold);
+            report_termination_message(Some(&f.signature), f.admission_hold, started.elapsed());
             if f.class == FailureClass::Environment {
                 tracing::error!(error = %f, exit_code = ROLLOUT_EXIT_ENVIRONMENT, "mainline rollout failed for environment reasons");
                 std::process::exit(ROLLOUT_EXIT_ENVIRONMENT);
@@ -6545,11 +6548,16 @@ const TERMINATION_LOG: &str = "/dev/termination-log";
 /// 写不进去不能影响失败本身的交付：类别还走退出码，落点没了只是让部署器少一份证据
 /// （它会往"停下"的一侧取，不会因此多滚一轮）。读数同理由：它是这一轮跑得怎么样的一份
 /// 证据，不是这一轮成败的判据。
-fn report_termination_message(signature: Option<&str>, admission_hold: Option<&str>) {
+fn report_termination_message(
+    signature: Option<&str>,
+    admission_hold: Option<&str>,
+    elapsed: std::time::Duration,
+) {
     let reading = RolloutResourceReading::read_from(
         Path::new(rollout_resources::CGROUP_ROOT),
         chrono::Utc::now().timestamp().max(0) as u64,
-    );
+    )
+    .map(|reading| reading.with_elapsed(elapsed.as_micros() as u64));
     match reading.as_ref() {
         Some(reading) => tracing::info!(reading = %reading, "rollout resource reading"),
         None => tracing::warn!(

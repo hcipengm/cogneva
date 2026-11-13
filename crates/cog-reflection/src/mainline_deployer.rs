@@ -50,6 +50,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::{CodePlatform, MainlineDeployerConfig, RolloutTargetConfig};
 use crate::rollout_resources::RolloutResourceReading;
 use crate::version_contract::VersionReadings;
+use crate::workload_resources;
 
 /// buildah 存储库放 sandbox PVC：与金丝雀 publisher 共享基镜像层缓存，
 /// Pod 重启不丢。
@@ -2999,6 +3000,13 @@ pub struct MainlineDeployer {
     /// runs and only logs: its existence does not depend on anyone subscribing to
     /// its readings.
     metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
+    /// 判定 Job 的下一轮尺寸读数落在哪。
+    ///
+    /// Job 活不过一轮，主回路看不见它，所以它不进主回路的实测窗口；但它是同一条
+    /// 尺寸律的第二个调用点，读数也该落在同一个面、带同一个 `source` 标签——
+    /// 另开一套指标名只会让同一个量在两处读起来像两个东西。由部署器在 Job 结束后
+    /// 把「下一次会写成什么」写进这里。
+    workload_resources: Option<std::sync::Arc<crate::workload_resources::WorkloadResourcesReadings>>,
     /// The governance declarations read at the tracked revision, kept to compare
     /// against what the cluster is enforcing.
     ///
@@ -3221,6 +3229,7 @@ impl MainlineDeployer {
             workspaces,
             upstream_note: std::sync::Mutex::new("pending".to_string()),
             metrics: None,
+            workload_resources: None,
             declared_governance: std::sync::Mutex::new(None),
             governance_drift: None,
             orchestrator: None,
@@ -3239,6 +3248,15 @@ impl MainlineDeployer {
     /// Report the version contract's own readings.
     pub fn with_metrics(mut self, metrics: std::sync::Arc<dyn cog_core::MetricsBackend>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// 判定 Job 的尺寸读数并进容器资源回路的那一面。
+    pub fn with_workload_resources(
+        mut self,
+        readings: std::sync::Arc<crate::workload_resources::WorkloadResourcesReadings>,
+    ) -> Self {
+        self.workload_resources = Some(readings);
         self
     }
 
@@ -9736,6 +9754,33 @@ impl MainlineDeployer {
             "name": "progress",
             "mountPath": cog_core::paths::PROGRESS_DIR
         }));
+        // 判定 Job 的资源：有运行史就按实测算，没有就沿用 chart 的种子。这是
+        // 同一个尺寸律的第二个调用点——输入是上一批 Job 的自量读数。
+        let job_sizing = self.next_rollout_job_resources();
+        let quantity = |derived: Option<u64>, seed: &str| match (derived, &job_sizing) {
+            (Some(millicores), Some(_)) => workload_resources::cpu_quantity(millicores),
+            _ => seed.to_string(),
+        };
+        let memory_quantity = |derived: Option<u64>, seed: &str| match (derived, &job_sizing) {
+            (Some(bytes), Some(_)) => workload_resources::memory_quantity(bytes),
+            _ => seed.to_string(),
+        };
+        let cpu_request = quantity(
+            job_sizing.map(|(targets, _)| targets.cpu_request_millicores),
+            &self.cfg.job_cpu_request,
+        );
+        let memory_request = memory_quantity(
+            job_sizing.map(|(targets, _)| targets.memory_request_bytes),
+            &self.cfg.job_memory_request,
+        );
+        let cpu_limit = quantity(
+            job_sizing.map(|(targets, _)| targets.cpu_limit_millicores),
+            &self.cfg.job_cpu_limit,
+        );
+        let memory_limit = memory_quantity(
+            job_sizing.map(|(targets, _)| targets.memory_limit_bytes),
+            &self.cfg.job_memory_limit,
+        );
         let mut manifest = serde_json::json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
@@ -9795,12 +9840,12 @@ impl MainlineDeployer {
                             // 集群还停在滚到一半的状态（Job 没跑完，它自己的回滚也没走）。
                             "resources": {
                                 "requests": {
-                                    "cpu": self.cfg.job_cpu_request,
-                                    "memory": self.cfg.job_memory_request,
+                                    "cpu": cpu_request,
+                                    "memory": memory_request,
                                 },
                                 "limits": {
-                                    "cpu": self.cfg.job_cpu_limit,
-                                    "memory": self.cfg.job_memory_limit,
+                                    "cpu": cpu_limit,
+                                    "memory": memory_limit,
                                 },
                             },
                         }],
@@ -10593,6 +10638,116 @@ impl MainlineDeployer {
         }
     }
 
+    /// 判定 Job 的运行史落点。与 state.json 同一块持久卷：换掉进程映像换不掉它。
+    fn rollout_sizing_path(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.cfg.state_dir).join("rollout-resource-window.json")
+    }
+
+    fn load_rollout_sizing(&self) -> Vec<workload_resources::RunSample> {
+        match std::fs::read_to_string(self.rollout_sizing_path()) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn save_rollout_sizing(&self, history: &[workload_resources::RunSample]) {
+        let path = self.rollout_sizing_path();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(path = %parent.display(), error = %e, "could not create the rollout sizing directory; this run's reading is not persisted");
+                return;
+            }
+        }
+        match serde_json::to_string(history) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(&path, text) {
+                    warn!(path = %path.display(), error = %e, "could not save the rollout sizing history");
+                }
+            }
+            Err(e) => warn!(error = %e, "could not encode the rollout sizing history"),
+        }
+    }
+
+    /// 把一次跑的自量读数并进运行史。写进去的是**这一次跑**的平均核数与内存峰值，
+    /// 不是声明的上限：上限是这一轮写进去的输入，拿它当结果等于没有测量。
+    fn record_rollout_sizing(&self, reading: &RolloutResourceReading) {
+        let (Some(cpu), Some(memory)) = (
+            reading.average_cpu_millicores(),
+            reading.memory_peak_bytes,
+        ) else {
+            return;
+        };
+        let at = reading
+            .at_unix
+            .unwrap_or_else(|| chrono::Utc::now().timestamp().max(0) as u64);
+        let mut history = self.load_rollout_sizing();
+        history.push(workload_resources::RunSample {
+            at,
+            cpu_millicores: cpu,
+            memory_bytes: memory,
+            throttled_ratio: reading.cpu_throttled_period_ratio().unwrap_or(0.0),
+        });
+        workload_resources::prune_runs(&mut history, at);
+        self.save_rollout_sizing(&history);
+    }
+
+    /// 下一次判定 Job 的目标资源；运行史不够时 `None`，调用方沿用 chart 的种子。
+    fn next_rollout_job_resources(
+        &self,
+    ) -> Option<(workload_resources::Targets, &'static str)> {
+        workload_resources::rollout_job_targets(&self.load_rollout_sizing())
+            .map(|targets| (targets, workload_resources::SOURCE_DERIVED))
+    }
+
+    /// 把「下一次判定 Job 会写成什么」报到容器资源回路的读数面上。
+    ///
+    /// 判定 Job 与容器资源回路共用一个面：同一条尺寸律、同一个 `source` 标签。
+    /// 运行史还不够一趟时清单会沿用 chart 的种子，读数也照实说自己是种子，别让
+    /// 下游把「还没量到」读成「量出来是这些」。
+    fn publish_rollout_sizing(&self) {
+        let Some(readings) = &self.workload_resources else {
+            return;
+        };
+        let workload = workload_resources::ROLLOUT_JOB_WORKLOAD;
+        let container = workload_resources::ROLLOUT_JOB_CONTAINER;
+        // 每一拍都记一次求值：目标不动时读数也不会动，这个计数是「回路还在
+        // 跑」的唯一证据。
+        readings.note_evaluated(workload, container);
+        let target = self.next_rollout_job_resources().or_else(|| {
+            self.rollout_job_seed()
+                .map(|targets| (targets, workload_resources::SOURCE_SEED))
+        });
+        match target {
+            Some((targets, source)) => {
+                let samples = self.load_rollout_sizing().len();
+                readings.observe(workload, container, targets, source, samples);
+            }
+            None => warn!(
+                "the rollout job's chart seed did not parse as quantities; its sizing is not published"
+            ),
+        }
+    }
+
+    /// chart 给判定 Job 的四个种子量，转成与实测 target 同一种单位。
+    ///
+    /// 四个里有一个解析不了就整组不给：只报一半会让读数看起来像一次完整的实测。
+    fn rollout_job_seed(&self) -> Option<workload_resources::Targets> {
+        Some(workload_resources::Targets {
+            cpu_request_millicores: workload_resources::parse_cpu_millicores(
+                &self.cfg.job_cpu_request,
+            )?,
+            memory_request_bytes: workload_resources::parse_memory_bytes(
+                &self.cfg.job_memory_request,
+            )?,
+            cpu_limit_millicores: workload_resources::parse_cpu_millicores(
+                &self.cfg.job_cpu_limit,
+            )?,
+            memory_limit_bytes: workload_resources::parse_memory_bytes(
+                &self.cfg.job_memory_limit,
+            )?,
+        })
+    }
+
     /// 把这一轮判定的资源读数报到观测面。
     ///
     /// 两侧的对照在这里合起来：**声明的量**是部署器自己写进 Job 清单的，**用掉的量**是判定
@@ -10613,6 +10768,11 @@ impl MainlineDeployer {
             return;
         };
         info!(job = %name, reading = %reading, "the rollout judgement's own resource reading");
+
+        // 先记运行史，再发布：发布的是「下一次会写成什么」，而它正是由这条
+        // 刚读回来的读数决定的。
+        self.record_rollout_sizing(&reading);
+        self.publish_rollout_sizing();
 
         let Some(metrics) = &self.metrics else {
             return;
@@ -32452,6 +32612,8 @@ exit 0
             cpu_period_us: Some(100_000),
             cpu_periods: Some(263),
             cpu_throttled_periods: Some(7),
+            cpu_usage_usec: Some(2_041_858),
+            elapsed_usec: Some(36_300_000),
             memory_max_bytes: Some(2_147_483_648),
             memory_peak_bytes: Some(1_073_741_824),
         }
@@ -32590,6 +32752,77 @@ exit 0
                 "{metric} 在没有读数的一轮里被写了个值"
             );
         }
+    }
+
+    /// 判定 Job 的尺寸与容器资源回路共用同一个读数面：运行史还不够一趟时是 chart 的
+    /// 种子（`source=seed`），够一趟之后同一个量换成实测（`source=derived`）。求值计数
+    /// 每一拍都走——目标不动时，这个计数是回路还在跑的唯一证据。
+    #[tokio::test]
+    async fn the_rollout_jobs_sizing_lands_on_the_container_resource_surface() {
+        use cog_core::contract::observability::Observable;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cfg = test_config(root, Path::new("/nonexistent"), "noop", "kubectl");
+        let readings =
+            std::sync::Arc::new(workload_resources::WorkloadResourcesReadings::new());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_workload_resources(readings.clone());
+
+        async fn published(
+            readings: &workload_resources::WorkloadResourcesReadings,
+            name: &str,
+        ) -> cog_core::contract::observability::RawMetric {
+            let metrics = readings.collect_metrics("").await.unwrap();
+            metrics
+                .into_iter()
+                .find(|m| {
+                    m.name == name
+                        && m.labels.get(workload_resources::CONTAINER_LABEL).map(String::as_str)
+                            == Some(workload_resources::ROLLOUT_JOB_CONTAINER)
+                })
+                .unwrap_or_else(|| panic!("{name} 没有出现在读数面上"))
+        }
+
+        deployer.publish_rollout_sizing();
+        let seed = published(&readings, workload_resources::REQUEST_CPU_METRIC).await;
+        assert_eq!(seed.value, 7.0, "还没量到任何一趟时，读的应是 chart 的种子");
+        assert_eq!(
+            seed.labels.get(workload_resources::SOURCE_LABEL).map(String::as_str),
+            Some(workload_resources::SOURCE_SEED)
+        );
+        assert_eq!(
+            readings.evaluations(
+                workload_resources::ROLLOUT_JOB_WORKLOAD,
+                workload_resources::ROLLOUT_JOB_CONTAINER
+            ),
+            1
+        );
+
+        for _ in 0..12 {
+            deployer.record_rollout_sizing(&a_reading());
+        }
+        deployer.publish_rollout_sizing();
+
+        let derived = published(&readings, workload_resources::REQUEST_CPU_METRIC).await;
+        assert_eq!(
+            derived.value, 60.0,
+            "请求应取实测均值的 p95 再按 10m 向上取整，而不是任何声明的数"
+        );
+        assert_eq!(
+            derived.labels.get(workload_resources::SOURCE_LABEL).map(String::as_str),
+            Some(workload_resources::SOURCE_DERIVED)
+        );
+        let memory = published(&readings, workload_resources::REQUEST_MEMORY_METRIC).await;
+        assert_eq!(memory.value, 1_073_741_824.0, "内存请求应取实测峰值的 p95");
+        assert_eq!(
+            readings.evaluations(
+                workload_resources::ROLLOUT_JOB_WORKLOAD,
+                workload_resources::ROLLOUT_JOB_CONTAINER
+            ),
+            2,
+            "目标没动的那一拍也必须留下求值记录"
+        );
     }
 
     /// fake kubectl：两条治理查询各回给定的 items 数组文本，其余成功。

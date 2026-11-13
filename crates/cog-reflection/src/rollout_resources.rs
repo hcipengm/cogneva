@@ -48,6 +48,12 @@ pub struct RolloutResourceReading {
     /// 这次跑经历的 CFS 周期数与其中被限流的周期数。
     pub cpu_periods: Option<u64>,
     pub cpu_throttled_periods: Option<u64>,
+    /// 这个容器活到现在用掉的 CPU 时间（微秒）。与 `elapsed_usec` 相除就是
+    /// 这次跑的平均核数——请求该按它定，而不是按上限反推。
+    pub cpu_usage_usec: Option<u64>,
+    /// 这次跑从进程起步到读数取走的时长（微秒）。由调用方给：cgroup 里没有
+    /// 起步时刻，而读数自己的钟只回答「什么时候取的」。
+    pub elapsed_usec: Option<u64>,
     /// 内存上限与整轮运行的峰值占用，单位字节。上限为 `max` 时缺席。
     pub memory_max_bytes: Option<u64>,
     pub memory_peak_bytes: Option<u64>,
@@ -55,12 +61,14 @@ pub struct RolloutResourceReading {
 
 /// 字段名与它们在结构里的位置，**编码与解码同读这一张表**：两边各拼一遍名字，改一处就
 /// 会静默地少读一个字段。顺序即线上顺序，只影响可读性，解析按 `key=value` 走。
-const FIELDS: [&str; 7] = [
+const FIELDS: [&str; 9] = [
     "at",
     "cpu_quota_us",
     "cpu_period_us",
     "cpu_periods",
     "cpu_throttled_periods",
+    "cpu_usage_usec",
+    "elapsed_usec",
     "memory_max",
     "memory_peak",
 ];
@@ -98,6 +106,7 @@ impl RolloutResourceReading {
                 match key {
                     "nr_periods" => reading.cpu_periods = Some(value),
                     "nr_throttled" => reading.cpu_throttled_periods = Some(value),
+                    "usage_usec" => reading.cpu_usage_usec = Some(value),
                     _ => {}
                 }
             }
@@ -114,6 +123,19 @@ impl RolloutResourceReading {
         }
 
         measured.then_some(reading)
+    }
+
+    /// 补上这次跑的时长。cgroup 里没有这个数：起步时刻只有进程自己知道。
+    pub fn with_elapsed(mut self, elapsed_usec: u64) -> Self {
+        self.elapsed_usec = Some(elapsed_usec);
+        self
+    }
+
+    /// 这次跑的平均 CPU 用量（毫核）。时长缺失或为 0 时没有答案。
+    pub fn average_cpu_millicores(&self) -> Option<u64> {
+        let used = self.cpu_usage_usec?;
+        let elapsed = self.elapsed_usec?;
+        (elapsed > 0).then(|| (used.saturating_mul(1000) / elapsed) as u64)
     }
 
     /// 被限流的周期占比。这是"上限咬着这次跑"的**频度**读数。
@@ -144,6 +166,8 @@ impl RolloutResourceReading {
             "cpu_period_us" => self.cpu_period_us,
             "cpu_periods" => self.cpu_periods,
             "cpu_throttled_periods" => self.cpu_throttled_periods,
+            "cpu_usage_usec" => self.cpu_usage_usec,
+            "elapsed_usec" => self.elapsed_usec,
             "memory_max" => self.memory_max_bytes,
             "memory_peak" => self.memory_peak_bytes,
             _ => None,
@@ -159,6 +183,8 @@ impl RolloutResourceReading {
             "cpu_period_us" => self.cpu_period_us = Some(value),
             "cpu_periods" => self.cpu_periods = Some(value),
             "cpu_throttled_periods" => self.cpu_throttled_periods = Some(value),
+            "cpu_usage_usec" => self.cpu_usage_usec = Some(value),
+            "elapsed_usec" => self.elapsed_usec = Some(value),
             "memory_max" => self.memory_max_bytes = Some(value),
             "memory_peak" => self.memory_peak_bytes = Some(value),
             _ => return false,
@@ -247,6 +273,7 @@ mod tests {
         assert_eq!(reading.cpu_period_us, Some(100_000));
         assert_eq!(reading.cpu_periods, Some(263));
         assert_eq!(reading.cpu_throttled_periods, Some(7));
+        assert_eq!(reading.cpu_usage_usec, Some(2_041_858));
         assert_eq!(reading.memory_max_bytes, Some(2_147_483_648));
         assert_eq!(reading.memory_peak_bytes, Some(141_529_088));
         assert_eq!(reading.at_unix, Some(1_700_000_000));

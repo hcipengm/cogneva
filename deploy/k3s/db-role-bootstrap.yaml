@@ -306,12 +306,6 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: test-password
-          resources:
-            requests:
-              cpu: 20m
-              memory: 64Mi
-            limits:
-              memory: 256Mi
           volumeMounts:
             - name: bootstrap-script
               mountPath: /bootstrap

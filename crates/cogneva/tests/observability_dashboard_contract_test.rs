@@ -1073,6 +1073,45 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["tool"],
         "crates/cog-extension/src/command_server.rs",
     ),
+    // The workload-resource loop's six readings. The four declarations are the
+    // numbers the chart used to pin and the loop now writes: request at the
+    // window's p95, limit at its peak times the same headroom the volume loop
+    // uses, per workload and container, with `source` saying whether the value
+    // is the measurement's answer or the chart seed still in force. The last
+    // two are the loop's own cadence -- samples behind each window and rounds
+    // evaluated -- which are what tell a declaration that was measured and left
+    // alone apart from one nobody computes any more. All six are scrape-only:
+    // the loop renders them on its own `/metrics` and hands none to a store.
+    (
+        "cogneva_workload_request_cpu_millicores",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_request_memory_bytes",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_limit_cpu_millicores",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_limit_memory_bytes",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_resources_samples",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
+    (
+        "cogneva_workload_resources_evaluations_total",
+        &["workload", "container", "source"],
+        "crates/cog-reflection/src/workload_resources.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the
