@@ -29,6 +29,36 @@ use cog_memory::{PostgresEntryStore, PostgresSchemaBackend};
 
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
+/// The storage contract's schema runner, over the one pool these two tests
+/// build their tables on: the text goes in as one unit and a failure comes
+/// back as the contract's own database error.
+///
+/// It carries none of the production lock-wait bound or retry. That behaviour
+/// is measured against the real runner in
+/// `crates/cog-storage/tests/schema_lock_bound.rs`, and a fixture that
+/// pretended to have it would make those assertions green for a reason of
+/// their own.
+struct PoolSchemaRunner {
+    pool: sqlx::PgPool,
+}
+
+impl PoolSchemaRunner {
+    fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::SchemaRunner for PoolSchemaRunner {
+    async fn apply_schema(&self, ddl: &str) -> cog_core::SFResult<()> {
+        sqlx::raw_sql(ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| cog_core::SFError::Database(e.to_string()))?;
+        Ok(())
+    }
+}
+
 /// The table as it stood before `observed_by`, `first_seen` and `last_seen`
 /// meant anything: the two timestamps are there but empty, and the observer
 /// list does not exist at all.
@@ -65,7 +95,7 @@ async fn the_lists_fill_a_table_that_predates_its_columns_and_are_safe_to_repeat
         .await
         .expect("the legacy table is built with a row in it");
 
-    let runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+    let runner = PoolSchemaRunner::new(pool.clone());
 
     // Two starts: the second is the one every restart after an upgrade does,
     // and it has to be a no-op rather than an error.
@@ -123,7 +153,7 @@ async fn the_summary_store_also_writes_its_rows_outside_the_shape() {
     let schema = own_schema(&url, "memorder").await;
     let pool = schema_pool_with(&url, &schema, 4).await;
 
-    let runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+    let runner = PoolSchemaRunner::new(pool.clone());
     PostgresEntryStore::from_pool(pool.clone())
         .init_table(&runner)
         .await
