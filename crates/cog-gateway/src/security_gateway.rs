@@ -2572,6 +2572,9 @@ fn failed_attempt_usage(
         // 试过但没成的一发也记在声明的那个人名下。
         task: task.map(str::to_string),
         owner: owner.map(str::to_string),
+        // 拒绝行不属于任何一段对话：它没到过上游、没用量帧，会话花销按
+        // 「真的花出去的钱」折叠，漏掉这些行不改变任何合计。
+        session: None,
         latency_ms,
         // 这一行不是配速拒的：这一拍的额度读数与它无关，写上去会读成"缺口为零"。
         pace: None,
@@ -2638,6 +2641,7 @@ fn pooled_refusal_usage(
         // 被熔断拒掉的那一发，也仍然是某人名下的。
         task: task.map(str::to_string),
         owner: owner.map(str::to_string),
+        session: None,
         latency_ms: 0,
         // 熔断拒的依据是健康表，不是额度；这一格留空，缺口只在配速行上算。
         pace: None,
@@ -2688,6 +2692,7 @@ fn paced_refusal_usage(
         retry_after_secs: None,
         task: task.map(str::to_string),
         owner: owner.map(str::to_string),
+        session: None,
         latency_ms: 0,
         // 这一行存在的全部理由就是这一拍的数：没有它，拒绝只剩一句"被拒了"，
         // 缺口要等到下一拍再猜。
@@ -2738,6 +2743,7 @@ fn unidentified_refusal_usage(
         retry_after_secs: None,
         task: task.map(str::to_string),
         owner: owner.map(str::to_string),
+        session: None,
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -2980,7 +2986,8 @@ struct TaskBudgetRefusal {
     task: String,
     spent_today: u64,
     hard_limit: u64,
-    /// 到下一个 UTC 午夜的秒数——预算按 UTC 日归零，这个数就是「什么时候再来」。
+    /// 到下一个日界（这台进程时钟的零点，见 `cog_core::day`）的秒数——预算按日归零，
+    /// 这个数就是「什么时候再来」。
     wait_secs: u64,
 }
 
@@ -3094,13 +3101,14 @@ fn task_budget_refusal_usage(
         price_book: None,
         // 拒绝发生在向上游发请求之前，没有正文可分类。
         refusal_kind: None,
-        // 这一格是「什么时候可以再来」：到下一个 UTC 午夜，那时预算归零。
+        // 这一格是「什么时候可以再来」：到下一个日界（本机时钟的零点），那时预算归零。
         // 与配速那行不同，这个数不是上游的窗口，是我们自己那份预算的重置点。
         retry_after_secs: Some(retry_after_secs),
         task: Some(task.to_string()),
         // 这被拒的一发也是记在这个人名下的：一件工作被自己的预算截断，
         // 不等于它不花这个人的额度。
         owner: owner.map(str::to_string),
+        session: None,
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -3124,7 +3132,8 @@ struct OwnerBudgetRefusal {
     owner: Option<String>,
     spent_today: u64,
     hard_limit: u64,
-    /// 到下一个 UTC 午夜的秒数。额度按 UTC 日归零，这个数就是「什么时候再来」。
+    /// 到下一个日界（这台进程时钟的零点，见 `cog_core::day`）的秒数。额度按日归零，
+    /// 这个数就是「什么时候再来」。
     wait_secs: u64,
 }
 
@@ -3418,6 +3427,7 @@ fn owner_budget_refusal_usage(
         // 计数追不出这个人——只有这一格记得住。拒绝的主体是租户时这一格可能为空
         // （任务没有提交人），那时的身份要从 `task` 连回任务图。
         owner: refusal.owner.clone(),
+        session: None,
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -3897,6 +3907,12 @@ struct RequestSide {
     /// 的当日额度拿它去拒——所以它必须来自一个已经通过鉴权的身份，不能是调用方
     /// 随便起的名字。`None` 是"没有声明"，不是"声明为某个人"。
     owner: Option<String>,
+    /// 这次调用属于哪一段对话，由调用方在请求头上声明。
+    ///
+    /// 与 `task` 和 `owner` 回答三件不同的事：哪一件工作、谁付钱、哪一段对话。
+    /// 它不被判定——一段对话没有上限——所以写错一个值只是读错一个数，不会花掉
+    /// 别人的额度。`None` 是"没有声明"，不是"声明为某一段"。
+    session: Option<String>,
     /// [`price_request`] 的读数。`None` 是"这条路径没量过"，不是"量出来是 0"：台账
     /// 那一列可空正是因为两者修法相反——一个说明装配面还没接上，一个是空提示词——
     /// 所以量不出来的路径一律传 `None`，绝不填 0 冒充量过。
@@ -4124,6 +4140,11 @@ async fn record_llm_tokens(
             // （见 `project_quota_usage`），所以人只能写在这里、只写一次：
             // 两处各记一遍，「这个人今天花了多少」就会有两个答案。
             owner: request.owner.clone(),
+            // 这一发是为哪一段对话花的。与 owner 各管一件事：owner 回答"记在谁
+            // 头上"，session 回答"算进哪段会话的合计"——界面上的会话花销是账本
+            // 按这一列折叠出来的投影，不写这一格，那段会话的合计就会比它下面每
+            // 一轮加起来少。
+            session: request.session.clone(),
             latency_ms,
             // 真实调用的一行：配速没参与这一次的判定。
             pace: None,
@@ -7173,6 +7194,13 @@ async fn stream_forward(
             .get(cog_core::LLM_OWNER_HEADER)
             .and_then(|v| v.to_str().ok()),
     );
+    // 会话那一轴，读取与归一规则同上，且同样缺省为空。它不被判定，只被记录：一段
+    // 对话没有上限，所以它读错一个值时坏掉的是一个读数，不是谁的额度。
+    let session = normalize_task(
+        req.headers()
+            .get(cog_core::LLM_SESSION_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    );
     // 身份是**前置条件**，不是事后补的一格。以前这里把缺名字的调用归一成
     // `unknown` 再照常转发，于是平台为一整段无人认领的调用付了钱：2026-10-04 至
     // 10-19 的 987 次调用、2,802 万输入 token 全落在那一格，事后只能靠请求体里的
@@ -7736,6 +7764,7 @@ async fn stream_forward(
                     origin: origin.clone(),
                     task: task.clone(),
                     owner: owner.clone(),
+                    session: session.clone(),
                     estimated_input: Some(estimated_input),
                     request_body: Some(request_body.clone()),
                 },
@@ -7840,6 +7869,7 @@ async fn stream_forward(
                 origin: origin.clone(),
                 task: task.clone(),
                 owner: owner.clone(),
+                session: session.clone(),
                 estimated_input: Some(estimated_input),
                 request_body: Some(request_body.clone()),
             },
@@ -8639,6 +8669,7 @@ async fn call_one_upstream(
             origin: origin.to_string(),
             task: None,
             owner: None,
+            session: None,
             estimated_input: Some(estimated_input),
             // 这条路自己拼 JSON，不经过可留底的那份字节。
             request_body: None,
@@ -8703,6 +8734,7 @@ async fn call_one_upstream(
         origin: origin.to_string(),
         task: None,
         owner: None,
+        session: None,
         estimated_input: Some(estimated_input),
         // 这条路自己拼 JSON，不经过可留底的那份字节。
         request_body: None,
@@ -11487,6 +11519,7 @@ mod tests {
                 origin: "gateway_pool".to_string(),
                 task: None,
                 owner: None,
+                session: None,
                 estimated_input: None,
                 request_body: None,
             },
@@ -11538,6 +11571,7 @@ mod tests {
                 origin: "gateway_pool".to_string(),
                 task: None,
                 owner: None,
+                session: None,
                 estimated_input: None,
                 request_body: None,
             },
@@ -12438,6 +12472,7 @@ mod tests {
                 origin: "gateway_pool".to_string(),
                 task: None,
                 owner: None,
+                session: None,
                 // 这条夹具没有请求体可定价，取一个非零数只为了让这条路径落的是
                 // "量过"而不是"没量过"——被丢掉的流要带的就是请求侧钉下的那一份。
                 // 它到不到台账，在这个进程里看不见（测试的 `durable`/`usage` 都是
@@ -19808,6 +19843,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             unimplemented!("projection stand-in")
         }
         async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn spend_for_session(
+            &self,
+            _: &str,
+        ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
             unimplemented!("projection stand-in")
         }
         async fn priced_spend_between(

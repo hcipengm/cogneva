@@ -12,107 +12,17 @@
 //! 1. 行为：剩余 = 上限 - 当天投影花销；旁边放一个旧账的余额格子不影响任何读数。
 //! 2. 形状：生产源码里不再出现那几族旧键，第二本账要回来就得先让这条红。
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use cog_core::{HierarchyManager as _, KeyValueStore, QuotaLimits, QuotaScope};
 use cog_quota::{HierarchyManager, QuotaManager};
 
-/// 层级管理器用到的形状：字符串加一个不生效的过期时间。
-#[derive(Default)]
-struct FakeStore {
-    strings: Mutex<HashMap<String, String>>,
-}
-
-#[async_trait::async_trait]
-impl KeyValueStore for FakeStore {
-    async fn get(&self, key: &str) -> cog_core::SFResult<Option<String>> {
-        Ok(self.strings.lock().unwrap().get(key).cloned())
-    }
-
-    async fn set(&self, key: &str, value: &str) -> cog_core::SFResult<()> {
-        self.strings
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_string());
-        Ok(())
-    }
-
-    async fn set_ex(&self, key: &str, value: &str, _ttl_secs: u64) -> cog_core::SFResult<()> {
-        self.set(key, value).await
-    }
-
-    async fn del(&self, key: &str) -> cog_core::SFResult<()> {
-        self.strings.lock().unwrap().remove(key);
-        Ok(())
-    }
-
-    async fn expire(&self, _key: &str, _ttl_secs: i64) -> cog_core::SFResult<()> {
-        Ok(())
-    }
-
-    async fn ttl(&self, _key: &str) -> cog_core::SFResult<i64> {
-        Ok(-1)
-    }
-
-    async fn incr(&self, key: &str, by: i64) -> cog_core::SFResult<i64> {
-        let mut strings = self.strings.lock().unwrap();
-        let next = strings
-            .get(key)
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0)
-            + by;
-        strings.insert(key.to_string(), next.to_string());
-        Ok(next)
-    }
-
-    async fn incr_ex(&self, _key: &str, _by: i64, _ttl_secs: u64) -> cog_core::SFResult<i64> {
-        unreachable!("额度层级不用带过期的自增")
-    }
-
-    async fn decr(&self, key: &str, by: i64) -> cog_core::SFResult<i64> {
-        self.incr(key, -by).await
-    }
-
-    async fn sadd(&self, _key: &str, _member: &str) -> cog_core::SFResult<()> {
-        unreachable!("额度层级不用集合")
-    }
-
-    async fn srem(&self, _key: &str, _member: &str) -> cog_core::SFResult<()> {
-        unreachable!("额度层级不用集合")
-    }
-
-    async fn smembers(&self, _key: &str) -> cog_core::SFResult<Vec<String>> {
-        unreachable!("额度层级不用集合")
-    }
-
-    async fn hset(&self, _key: &str, _field: &str, _value: &str) -> cog_core::SFResult<()> {
-        unreachable!("额度层级不用哈希字段")
-    }
-
-    async fn hget(&self, _key: &str, _field: &str) -> cog_core::SFResult<Option<String>> {
-        unreachable!("额度层级不用哈希字段")
-    }
-
-    async fn hdel(&self, _key: &str, _field: &str) -> cog_core::SFResult<()> {
-        unreachable!("额度层级不用哈希字段")
-    }
-
-    async fn hvals(&self, _key: &str) -> cog_core::SFResult<Vec<String>> {
-        unreachable!("额度层级不用哈希字段")
-    }
-
-    async fn hgetall(&self, _key: &str) -> cog_core::SFResult<Vec<(String, String)>> {
-        unreachable!("额度层级不整读哈希")
-    }
-
-    async fn hlen(&self, _key: &str) -> cog_core::SFResult<u64> {
-        unreachable!("额度层级不用哈希字段")
-    }
-}
-
-fn manager() -> (QuotaManager, Arc<HierarchyManager>, Arc<FakeStore>) {
-    let store = Arc::new(FakeStore::default());
+fn manager() -> (
+    QuotaManager,
+    Arc<HierarchyManager>,
+    Arc<crate::common::kv::MemoryStore>,
+) {
+    let store = Arc::new(crate::common::kv::MemoryStore::default());
     let hierarchy = Arc::new(HierarchyManager::new(
         store.clone(),
         QuotaLimits::new(80_000, 100_000),

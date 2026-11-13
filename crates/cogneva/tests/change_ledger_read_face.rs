@@ -454,6 +454,12 @@ impl cog_core::LlmUsageLedger for FakeUsage {
             .cloned()
             .collect())
     }
+    async fn spend_for_session(
+        &self,
+        _: &str,
+    ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
+        unimplemented!("read-only stand-in")
+    }
     async fn priced_spend_between(
         &self,
         _: chrono::DateTime<chrono::Utc>,

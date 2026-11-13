@@ -381,7 +381,13 @@ async fn an_attachment_rides_with_its_row_and_keeps_its_bytes() {
     };
     probe
         .store
-        .record_turn(&probe.session, "这里错了", None, &[shot.clone()], "看到了")
+        .record_turn(
+            &probe.session,
+            "这里错了",
+            None,
+            std::slice::from_ref(&shot),
+            "看到了",
+        )
         .await
         .expect("record a turn that carried a picture");
 

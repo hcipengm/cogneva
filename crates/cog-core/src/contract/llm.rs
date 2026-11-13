@@ -67,6 +67,25 @@ pub const LLM_TASK_HEADER: &str = "x-cogneva-task";
 /// whole platform.
 pub const LLM_OWNER_HEADER: &str = "x-cogneva-owner";
 
+/// Inbound header carrying the conversation a call is spent for.
+///
+/// The four axes already on this request answer which component, which
+/// environment, which job and whose budget; none of them answers "which
+/// conversation", and a person's spend is not a conversation's: one person
+/// runs several at once, and each of them is a thing a reader asks the cost of
+/// -- "这段对话花了多少" has no answer from a per-person total.
+///
+/// Not judged, only recorded. Unlike [`LLM_OWNER_HEADER`] there is no ceiling
+/// on a conversation, so a wrong value costs a wrong reading rather than
+/// somebody else's budget.
+///
+/// Absent is a supported state and means "not attributed to a conversation" --
+/// most callers are components finishing a job, not turns in a chat. Like the
+/// other optional axes it must not be defaulted to a placeholder: every
+/// unattributed call would gather under it and read as one very expensive
+/// conversation.
+pub const LLM_SESSION_HEADER: &str = "x-cogneva-session";
+
 /// The standard header an upstream uses to say when it can serve us again.
 pub const RETRY_AFTER_HEADER: &str = "retry-after";
 
@@ -331,6 +350,20 @@ impl ChatOptions {
         if !owner.is_empty() {
             self.headers
                 .insert(LLM_OWNER_HEADER.to_string(), owner.to_string());
+        }
+        self
+    }
+
+    /// Declare the conversation this call is spent for.
+    ///
+    /// Blank-tolerant like the three before it, and for the same reason: the
+    /// reader folds spend by this value, so an empty string would be a
+    /// conversation of its own that nobody can open.
+    pub fn with_session(mut self, session: &str) -> Self {
+        let session = session.trim();
+        if !session.is_empty() {
+            self.headers
+                .insert(LLM_SESSION_HEADER.to_string(), session.to_string());
         }
         self
     }
@@ -1347,6 +1380,58 @@ mod task_header_tests {
             options.headers.get(LLM_TASK_HEADER).map(String::as_str),
             Some("task-1")
         );
+    }
+}
+
+#[cfg(test)]
+mod session_header_tests {
+    use super::*;
+
+    /// The conversation id goes onto the wire exactly as the chat names it, so
+    /// the ledger's column joins back to the transcript it belongs to.
+    #[test]
+    fn the_declared_session_travels_verbatim() {
+        let options = ChatOptions::default().with_session("s-42");
+        assert_eq!(
+            options.headers.get(LLM_SESSION_HEADER).map(String::as_str),
+            Some("s-42")
+        );
+    }
+
+    /// Blank is "not attributed to a conversation", not a conversation named
+    /// "": every unattributed call would gather under the empty string and read
+    /// as one very expensive conversation.
+    #[test]
+    fn a_blank_session_declares_nothing() {
+        for blank in ["", "   "] {
+            let options = ChatOptions::default().with_session(blank);
+            assert!(!options.headers.contains_key(LLM_SESSION_HEADER));
+        }
+    }
+
+    /// Four axes, four independent headers: declaring one must not overwrite
+    /// another, or a call would lose the identity it already carried.
+    #[test]
+    fn session_sits_beside_actor_origin_task_and_owner() {
+        let options = ChatOptions::default()
+            .with_actor("agent:planner")
+            .with_origin("gateway_pool")
+            .with_task("task-1")
+            .with_owner("u-1")
+            .with_session("s-42");
+        for (header, expected) in [
+            (LLM_ACTOR_HEADER, "agent:planner"),
+            (LLM_ORIGIN_HEADER, "gateway_pool"),
+            (LLM_TASK_HEADER, "task-1"),
+            (LLM_OWNER_HEADER, "u-1"),
+            (LLM_SESSION_HEADER, "s-42"),
+        ] {
+            assert_eq!(
+                options.headers.get(header).map(String::as_str),
+                Some(expected),
+                "{header} did not survive the other declarations"
+            );
+        }
     }
 }
 

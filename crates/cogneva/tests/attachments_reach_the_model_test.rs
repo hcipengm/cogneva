@@ -40,7 +40,7 @@ fn a_message_with_an_attachment_carries_it_as_a_media_block() {
     };
     assert_eq!(content.len(), 2, "正文与附件没有各占一格：{content:?}");
     assert_eq!(
-        content[0].as_text().as_deref(),
+        content[0].as_text(),
         Some("这里错了"),
         "第一格不是正文：模型先看到的是图，不是那句话"
     );

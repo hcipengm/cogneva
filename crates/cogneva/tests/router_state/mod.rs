@@ -129,6 +129,133 @@ impl QuotaManager for OpenQuota {
     }
 }
 
+/// 一个从不被问到的账本。
+///
+/// 有的读面要一对「账本 + 额度层级」，却只判其中一面（例如对话里的配额格子只
+/// 读层级）。把另一面交给这个替身，它每一条都 `unreachable!()`：一条落到账本上
+/// 的读会当场说出是哪一条，而不是悄悄答一个空值让人以为「那就是读数」。
+pub struct UnaskedLedger;
+
+#[async_trait::async_trait]
+impl cog_core::LlmUsageLedger for UnaskedLedger {
+    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn upstream_window(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<cog_core::UpstreamWindowReading, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn burned_between(&self, _: &str, _: i64, _: i64) -> Result<u64, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn record_window(&self, _: &cog_core::StoredWindow) -> Result<(), String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn stored_window(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<Option<cog_core::StoredWindow>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn stored_windows(&self, _: &str) -> Result<Vec<cog_core::StoredWindow>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spent_since(&self, _: &str, _: i64) -> Result<u64, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_actor_since(
+        &self,
+        _: i64,
+    ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_upstream_and_actor(
+        &self,
+    ) -> Result<Vec<cog_core::UpstreamActorSpend>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn task_cost_quantile(&self, _: i64, _: f64) -> Result<Option<(u64, u64, i64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn task_has_started(&self, _: &str) -> Result<bool, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_for_session(
+        &self,
+        _: &str,
+    ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn priced_spend_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<cog_core::PricedSpend, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_workspace_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn spend_by_task_since(
+        &self,
+        _: &[String],
+        _: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn task_attribution(&self, _: &str) -> Result<Option<cog_core::TaskAttribution>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn unattributed_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn outcomes_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::contract::usage_ledger::OutcomeCount>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn metering_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::contract::usage_ledger::MeteringCount>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn skips_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::contract::usage_ledger::SkippedWorkLine>, String> {
+        unreachable!("这一格不该被问到")
+    }
+    async fn verdicts_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::contract::usage_ledger::SpendVerdictLine>, String> {
+        unreachable!("这一格不该被问到")
+    }
+}
+
 /// The gateway state the router is built over: every component either absent or
 /// a stand-in, and none of them touched by a request that only has to be routed.
 pub fn stateless() -> Arc<GatewayState> {

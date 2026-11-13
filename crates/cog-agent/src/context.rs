@@ -888,9 +888,9 @@ mod tests {
         let mut ctx = ContextWindow::new(300);
         ctx.add_message(Message::system("系统提示词"));
         ctx.add_message(Message::user("任务输入"));
-        ctx.add_message(Message::assistant_text(&"先解释一段 ".repeat(20)));
-        ctx.add_message(Message::user(&"再问一段 ".repeat(20)));
-        ctx.add_message(Message::assistant_text(&"最后答一段 ".repeat(20)));
+        ctx.add_message(Message::assistant_text("先解释一段 ".repeat(20)));
+        ctx.add_message(Message::user("再问一段 ".repeat(20)));
+        ctx.add_message(Message::assistant_text("最后答一段 ".repeat(20)));
         assert!(
             ctx.token_count() <= 300,
             "这条用例的题目是「裁过」，裁完必须在预算内：{}",
@@ -954,9 +954,9 @@ mod tests {
         let mut ctx = ContextWindow::new(300);
         ctx.add_message(Message::system("系统提示词"));
         ctx.add_message(Message::user("任务输入"));
-        ctx.add_message(Message::assistant_text(&"先解释一段 ".repeat(20)));
-        ctx.add_message(Message::user(&"再问一段 ".repeat(20)));
-        ctx.add_message(Message::assistant_text(&"最后答一段 ".repeat(20)));
+        ctx.add_message(Message::assistant_text("先解释一段 ".repeat(20)));
+        ctx.add_message(Message::user("再问一段 ".repeat(20)));
+        ctx.add_message(Message::assistant_text("最后答一段 ".repeat(20)));
         assert!(ctx.take_compaction().is_some(), "前提：这一段裁过");
         assert_eq!(
             ctx.take_compaction(),

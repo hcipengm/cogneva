@@ -74,6 +74,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         retry_after_secs: None,
         task: task.map(str::to_string),
         owner: None,
+        session: None,
         latency_ms: 12,
         pace: None,
         usage_outcome: None,

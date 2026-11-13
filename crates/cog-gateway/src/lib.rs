@@ -1106,6 +1106,9 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         // 对话里 `/` 打头那一句能点哪些名字。与上面的能力面同一种读法：这份名单
         // 是「这个部署里真有的」技能表读出来的，不是一个写死的列表。
         .route("/api/v1/chat/commands", get(commands::catalogue_handler))
+        // 这一段对话的配额余量：与代理路径执法时读的是同一份判定。没配过上限
+        // 的格子读成「未配置」，读得到的格子给出剩余与日界。
+        .route("/api/v1/chat/quota", get(chat::quota_handler))
         .route(
             "/api/v1/capabilities",
             get(capabilities::capabilities_handler),

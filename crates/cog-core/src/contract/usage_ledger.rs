@@ -400,6 +400,16 @@ pub struct LlmUsageRecord {
     /// empty rather than gathering unattributed calls into one placeholder
     /// person.
     pub owner: Option<String>,
+    /// The conversation this call is part of, as the caller declared it.
+    ///
+    /// 与 `task` 和 `owner` 并列，回答第三件事：哪一件工作、谁付钱、哪一段对话。
+    /// 一个人的花销不是一段对话的花销——同一个人同时开好几段，而「这段对话花了
+    /// 多少」从按人的总数里读不出来。只有对话那一侧知道这个 id，所以它由调用方
+    /// 声明；没有对话的调用（后台任务、评测、进化）留空。
+    ///
+    /// 可空，`NULL` 是「没有归属到任何一段对话」，不是一段名叫 `unknown` 的对话：
+    /// 把所有没归属的调用并进一个占位，那一格就会读成全平台最贵的一段对话。
+    pub session: Option<String>,
     /// 拒掉这一发的是哪一级的上限，`QuotaScope::as_str()` 的取值
     /// （`user` / `ws`）；只在 `result = "refused_by_owner_budget"` 的行上有。
     ///
@@ -718,6 +728,44 @@ pub struct PricedSpend {
     pub rows: Vec<PricedSpendRow>,
 }
 
+/// What one conversation cost, folded from the call rows that named it.
+///
+/// A conversation is not a smaller person: one person runs several at once, and
+/// each is a thing a reader asks the cost of. The rows already say which one
+/// (`LlmUsageRecord::session`), so this is a fold and not a second book.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionSpend {
+    /// Calls that reached an upstream and were metered, successful or failed.
+    ///
+    /// Rows a ceiling turned away are not here: they never reached an upstream,
+    /// so they carry no usage frame and no conversation either. A refused call
+    /// costs nothing, so leaving it out changes no total — what it would answer
+    /// is "how often was this conversation turned away", and that is a fact the
+    /// refusal itself tells the screen, at the moment it happens.
+    pub calls: u64,
+    /// The uncached half of the prompt, the same convention as every other
+    /// token figure on this ledger.
+    pub tokens_input: u64,
+    pub tokens_cached: u64,
+    pub tokens_output: u64,
+    /// 钱按币种分开：两种币种是两个数，不是一次汇率。
+    pub money: Vec<SessionMoney>,
+    /// Calls that ran but carried no price at all. Read beside
+    /// [`Self::money`]: a total whose unpriced count is not zero is a floor,
+    /// not a measurement.
+    pub unpriced_calls: u64,
+}
+
+/// One currency's worth of a conversation's spend.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionMoney {
+    /// `USD` / `CNY`, read off the price books these calls were priced from.
+    pub currency: String,
+    /// In the currency's millionths, over [`Self::priced_calls`] calls.
+    pub cost_micros: i64,
+    pub priced_calls: u64,
+}
+
 /// The writing and window-reading face of the spend ledger.
 ///
 /// Separate from the reporting face ([`crate::LlmUsageReader`]) because the two
@@ -823,6 +871,19 @@ pub trait LlmUsageLedger: Send + Sync {
 
     /// Whether the named task has ever landed a call on this ledger.
     async fn task_has_started(&self, task: &str) -> Result<bool, String>;
+
+    /// What the calls that named `session` cost, or `None` when no row does.
+    ///
+    /// Across the whole record, not a day: a conversation's cost is its own
+    /// history, it ends when the conversation does, and asking it for "today"
+    /// would reset a session that spans midnight to a number that contradicts
+    /// every turn the reader watched go by.
+    ///
+    /// `None` is "this ledger holds no call that named this conversation",
+    /// which is what a deployment whose calls do not carry the header answers
+    /// for every session — never a zero, because a zero reads as "it cost
+    /// nothing" and that would be a measurement nobody took.
+    async fn spend_for_session(&self, session: &str) -> Result<Option<SessionSpend>, String>;
 
     /// Tokens spent by each of the named tasks, `(task_id, tokens)`.
     ///

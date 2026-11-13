@@ -25,6 +25,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use cog_core::contract::usage_ledger::SessionSpend;
 use cog_core::{
     HierarchyDecision, HierarchyManager, LlmUsageLedger, QuotaContext, QuotaLimits, QuotaScope,
     SFResult,
@@ -204,6 +205,9 @@ impl LlmUsageLedger for FakeSpend {
         unimplemented!("只读替身")
     }
     async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+        unimplemented!("只读替身")
+    }
+    async fn spend_for_session(&self, _: &str) -> Result<Option<SessionSpend>, String> {
         unimplemented!("只读替身")
     }
     async fn priced_spend_between(

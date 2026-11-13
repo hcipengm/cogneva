@@ -328,6 +328,13 @@ impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
         self.ledger()?.spend_by_task(task_ids).await
     }
 
+    async fn spend_for_session(
+        &self,
+        session: &str,
+    ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
+        self.ledger()?.spend_for_session(session).await
+    }
+
     async fn priced_spend_between(
         &self,
         since: chrono::DateTime<chrono::Utc>,
@@ -817,6 +824,12 @@ mod tests {
             unimplemented!("这一格只读不写")
         }
         async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_for_session(
+            &self,
+            _: &str,
+        ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
             unimplemented!("这一格只读不写")
         }
         async fn priced_spend_between(

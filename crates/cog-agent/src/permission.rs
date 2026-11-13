@@ -275,7 +275,7 @@ impl PermissionRuleSet {
 
     /// 加一条规则。同一条（内容相同）只留一份；返回是否真的加进去了。
     pub fn insert(&mut self, rule: PermissionRule) -> bool {
-        if self.rules.iter().any(|existing| *existing == rule) {
+        if self.rules.contains(&rule) {
             return false;
         }
         self.rules.push(rule);

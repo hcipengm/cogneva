@@ -96,8 +96,8 @@ pub use cog_core::LLM_ORIGIN_HEADER;
 /// live in the contract layer: the process that fills a row and the process
 /// that owns the table are different crates, and neither may name the other.
 pub use cog_core::contract::usage_ledger::{
-    LlmExchangeRecord, LlmOrigin, LlmUsageRecord, PaceEvidence, PaceUpstreamEvidence, StoredWindow,
-    UpstreamWindowReading,
+    LlmExchangeRecord, LlmOrigin, LlmUsageRecord, PaceEvidence, PaceUpstreamEvidence, SessionMoney,
+    SessionSpend, StoredWindow, UpstreamWindowReading,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,6 +402,14 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS task_id TEXT;
 -- owner was declared" is a state of its own -- the spend counters cannot stand
 -- in for it, since they move only on calls that ran.
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS owner_id TEXT;
+-- The conversation dimension, beside the job and the person ones and answering
+-- the third question they cannot: which conversation this call belongs to. One
+-- person runs several at once, so a session's cost cannot be read off their
+-- daily total. Nullable on the same terms as `task_id` and `owner_id` -- "no
+-- conversation named this call" is a state of its own, and a placeholder would
+-- gather every background call into one conversation that reads as the most
+-- expensive thing on the platform.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS session_id TEXT;
 -- What reading the response found. Nullable with no default: the failure and
 -- refusal paths land rows about attempts that never got a body, and rows
 -- written before this column existed have no reading to report. A default of
@@ -446,6 +454,11 @@ CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ok_upstream
     ON gateway_llm_usage (upstream, ts) WHERE result = '{result:ok}';
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_quota_wall
     ON gateway_llm_usage (upstream, ts) WHERE refusal_kind = '{refusal:quota_cycle}';
+-- 按会话取耗时一次窄查询，而带会话的行是少数（聊天与评测之外没人声明它）。部分
+-- 索引把谓词写进索引，取数只碰这些行；全表扫一遍会把「这段对话花了多少」变成
+-- 一次随账本总量线性变慢的读。
+CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_session
+    ON gateway_llm_usage (session_id) WHERE session_id IS NOT NULL;
 -- One row per upstream **and window length**, not one per measurement: the
 -- pacer only ever acts on the newest window it has an observation for, and a
 -- history of stale boundaries would make "which one is in force" a question the
@@ -640,10 +653,10 @@ impl LlmUsageStore {
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
                  pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
                  usage_outcome, owner_id, refused_scope, cost_micros, price_book,
-                 tokens_reasoning)
+                 tokens_reasoning, session_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                     $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-                    $28)
+                    $28, $29)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -674,6 +687,7 @@ impl LlmUsageStore {
         .bind(r.cost_micros)
         .bind(r.price_book.as_deref())
         .bind(r.tokens_reasoning.map(|n| n as i64))
+        .bind(r.session.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1071,6 +1085,81 @@ impl LlmUsageStore {
                     .map(|n| n.max(0) as u64),
             })
             .collect())
+    }
+
+    /// 一段对话在账上花了多少，`None` 是「这一格里没有任何一行」。
+    ///
+    /// 跨整份账本而不是某一天：一段对话的合计是它自己的历史，跨过午夜也还是同一段
+    /// 对话；按「今天」读会让一段横跨零点的会话在屏幕上从几千掉回几百，而它下面的
+    /// 每一轮还都写着。
+    ///
+    /// 钱按币种分开，币种从价目名里取（`CNY@2026-11-05` → `CNY`）：两本价目是两个
+    /// 数，这里不做汇率。没定价的调用单独计数——`money` 旁边那个不为零，`money`
+    /// 就是下界而不是测量。
+    ///
+    /// 只数真的到了上游的行：被额度拒掉的那一发没有用量帧，也没有落到这里的会话
+    /// 归属；它一个 token 都没花，漏掉它不改变任何合计。那段对话被拒过几次由拒绝
+    /// 本身在发生的那一刻告诉屏幕。
+    pub async fn spend_for_session(&self, session: &str) -> anyhow::Result<Option<SessionSpend>> {
+        let totals = sqlx::query(&format!(
+            "SELECT COUNT(*)::BIGINT AS rows,
+                    COALESCE(SUM(tokens_input), 0)::BIGINT AS tokens_input,
+                    COALESCE(SUM(tokens_cached), 0)::BIGINT AS tokens_cached,
+                    COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output,
+                    COUNT(*) FILTER (WHERE cost_micros IS NULL OR price_book IS NULL
+                                            OR price_book = '')::BIGINT AS unpriced
+               FROM {LEDGER_TABLE}
+              WHERE session_id = $1"
+        ))
+        .bind(session)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows: i64 = totals.get("rows");
+        if rows == 0 {
+            return Ok(None);
+        }
+        let money_rows = sqlx::query(&format!(
+            "SELECT price_book, SUM(cost_micros)::BIGINT AS cost, COUNT(*)::BIGINT AS priced
+               FROM {LEDGER_TABLE}
+              WHERE session_id = $1 AND cost_micros IS NOT NULL
+                AND price_book IS NOT NULL AND price_book <> ''
+              GROUP BY price_book"
+        ))
+        .bind(session)
+        .fetch_all(&self.pool)
+        .await?;
+        // 两条价目可以共用一个币种（同一币种的两次改价），读的人要的是一个币种一个
+        // 数；分开列出来会把「这段对话花了多少人民币」变成一次加法练习。
+        let mut by_currency: std::collections::BTreeMap<String, (i64, u64)> = Default::default();
+        for row in money_rows {
+            let book: String = row.get("price_book");
+            // 价目名是 `币种@版本`；空串进不来（上面两条查询都把空价目本算作
+            // 「没定价」），真进来了也只是原样列出来，不猜一个币种。
+            let currency = match book.split_once('@') {
+                Some((currency, _)) if !currency.is_empty() => currency.to_string(),
+                _ => book.clone(),
+            };
+            let cost: i64 = row.get("cost");
+            let priced: i64 = row.get("priced");
+            let cell = by_currency.entry(currency).or_default();
+            cell.0 = cell.0.saturating_add(cost);
+            cell.1 = cell.1.saturating_add(priced.max(0) as u64);
+        }
+        Ok(Some(SessionSpend {
+            calls: rows.max(0) as u64,
+            tokens_input: totals.get::<i64, _>("tokens_input").max(0) as u64,
+            tokens_cached: totals.get::<i64, _>("tokens_cached").max(0) as u64,
+            tokens_output: totals.get::<i64, _>("tokens_output").max(0) as u64,
+            money: by_currency
+                .into_iter()
+                .map(|(currency, (cost_micros, priced_calls))| SessionMoney {
+                    currency,
+                    cost_micros,
+                    priced_calls,
+                })
+                .collect(),
+            unpriced_calls: totals.get::<i64, _>("unpriced").max(0) as u64,
+        }))
     }
 
     /// 一组任务各自花了多少 token。
@@ -2254,6 +2343,12 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         until: DateTime<Utc>,
     ) -> Result<cog_core::PricedSpend, String> {
         LlmUsageStore::priced_spend_between(self, since, until)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spend_for_session(&self, session: &str) -> Result<Option<SessionSpend>, String> {
+        LlmUsageStore::spend_for_session(self, session)
             .await
             .map_err(|e| e.to_string())
     }

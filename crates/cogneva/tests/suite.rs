@@ -199,8 +199,12 @@ mod change_ledger_read_face;
 mod chart_declared_ports_reach_the_process_test;
 #[path = "chart_template_literals_contract_test.rs"]
 mod chart_template_literals_contract_test;
+#[path = "chat_quota_read_face.rs"]
+mod chat_quota_read_face;
 #[path = "chat_reply_points_at_a_badge_the_client_draws_test.rs"]
 mod chat_reply_points_at_a_badge_the_client_draws_test;
+#[path = "chat_spend_and_quota_on_the_header_test.rs"]
+mod chat_spend_and_quota_on_the_header_test;
 #[path = "chat_turn_is_an_agent_with_control_plane_tools_test.rs"]
 mod chat_turn_is_an_agent_with_control_plane_tools_test;
 #[path = "chat_turn_is_recorded_before_the_end_frame_test.rs"]

@@ -451,6 +451,12 @@ pub struct AgentRuntime {
     /// The environment these calls are made from (interactive, pool, ...).
     /// `None` leaves the upstream default in place.
     call_origin: Option<String>,
+    /// The conversation these calls belong to, when there is one.
+    ///
+    /// 与 `call_owner` 回答两件事：谁付钱，和哪一段对话花掉的。同一个人可以同时
+    /// 开着几段，所以「这段对话花了多少」既不能从按人的总数里读，也不能由运行时
+    /// 在这里算——它只把 id 挂到每一发上，折叠那一步读账本的行。
+    call_session: Option<String>,
     /// Identity of the run in flight, declared on every LLM call it makes.
     ///
     /// The same id the run reports its own token census under: without it the
@@ -1158,6 +1164,7 @@ impl AgentRuntime {
             actor_label: None,
             call_owner: None,
             call_origin: None,
+            call_session: None,
             roster: None,
             display_name: None,
             identity_looked_up: false,
@@ -1276,6 +1283,16 @@ impl AgentRuntime {
     pub fn with_call_identity(mut self, owner: impl Into<String>, origin: &str) -> Self {
         self.call_owner = Some(owner.into());
         self.call_origin = Some(origin.to_string());
+        self
+    }
+
+    /// 把这一轮的调用记到一段对话上。
+    ///
+    /// 与 `with_call_identity` 分开：一段对话可以有主，也可以没有——没有登录身份
+    /// 的连接照样能聊，而那段对话的花销仍然该在它自己的名字下数得出来。两件事
+    /// 捆在一起传，就会逼着调用方为没有主人的对话编一个主人。
+    pub fn with_call_session(mut self, session: impl Into<String>) -> Self {
+        self.call_session = Some(session.into());
         self
     }
 
@@ -1659,6 +1676,12 @@ impl AgentRuntime {
         };
         let options = match self.call_origin.as_deref() {
             Some(origin) => options.with_origin(origin),
+            None => options,
+        };
+        // 哪一段对话。不被判定、只被记录，所以运行时挂在每一发上而不自己折叠：
+        // 一段对话的花销是账本按这一列做的一次投影。
+        let options = match self.call_session.as_deref() {
+            Some(session) => options.with_session(session),
             None => options,
         };
         match self.ledger_task_id(self.run_task_id.as_deref()) {
@@ -4144,6 +4167,32 @@ mod ledger_identity_tests {
         let runtime = AgentRuntime::new(RuntimeConfig::default(), tx);
         let options = runtime.stamp_task(cog_core::ChatOptions::default());
         assert!(!options.headers.contains_key(cog_core::LLM_TASK_HEADER));
+    }
+
+    /// 一段对话的每一发都带着它的 id：这是「这段对话花了多少」在账本上唯一的
+    /// 抓手，漏挂一次，那一次的 token 就只数得进按人 / 按环境的总数里，而屏幕上
+    /// 这一段会话的合计会比它下面的每一轮加起来少。
+    #[test]
+    fn every_call_of_a_conversation_carries_its_session() {
+        let (tx, _rx) = mpsc::channel(1);
+        let runtime = AgentRuntime::new(RuntimeConfig::default(), tx).with_call_session("s-42");
+        let options = runtime.stamp_task(cog_core::ChatOptions::default());
+        assert_eq!(
+            options
+                .headers
+                .get(cog_core::LLM_SESSION_HEADER)
+                .map(String::as_str),
+            Some("s-42")
+        );
+    }
+
+    /// 没有对话的运行不写这一格：占位值会把每一发后台调用并成一段最贵的对话。
+    #[test]
+    fn a_run_outside_a_conversation_names_no_session() {
+        let (tx, _rx) = mpsc::channel(1);
+        let runtime = AgentRuntime::new(RuntimeConfig::default(), tx);
+        let options = runtime.stamp_task(cog_core::ChatOptions::default());
+        assert!(!options.headers.contains_key(cog_core::LLM_SESSION_HEADER));
     }
 }
 
@@ -7465,9 +7514,9 @@ mod tests {
         let history = vec![
             Message::system("系统提示词"),
             Message::user("任务输入"),
-            Message::assistant_text(&"先解释一段 ".repeat(20)),
-            Message::user(&"再问一段 ".repeat(20)),
-            Message::assistant_text(&"最后答一段 ".repeat(20)),
+            Message::assistant_text("先解释一段 ".repeat(20)),
+            Message::user("再问一段 ".repeat(20)),
+            Message::assistant_text("最后答一段 ".repeat(20)),
         ];
         let result = runtime
             .run_conversation(history, &llm)

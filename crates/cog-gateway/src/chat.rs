@@ -1072,6 +1072,7 @@ async fn emit_message_end(out: &mpsc::Sender<String>, session_id: &str, message_
 /// 不出现这一行——发一帧全零的用量，读起来是「这一轮没花钱」，而事实是这一轮
 /// 的账没有读回来。
 async fn emit_turn_usage(
+    ledger: Option<&dyn cog_core::LlmUsageLedger>,
     out: &mpsc::Sender<String>,
     session_id: &str,
     message_id: &str,
@@ -1093,9 +1094,202 @@ async fn emit_turn_usage(
             "duration_ms": count("duration_ms"),
             "model": usage.get("model").and_then(serde_json::Value::as_str),
             "cost_usd": usage.get("cost_usd").and_then(serde_json::Value::as_f64),
+            // 这一段会话到目前为止的合计。单看这一轮的数是看不出一段对话花了多少
+            // 的——每一轮只报自己，而读者要问的往往是「这段聊下来多少钱」。
+            "session": session_spend_frame(ledger, session_id).await,
         }),
     )
     .await;
+}
+
+/// 这一段会话到目前为止花了多少：账本按会话那一列折叠出来的那一份。
+///
+/// 三种答案在屏幕上必须分得开：账本没接（`readable: false`）、这一段还没有行
+/// （读到了，`calls: 0`）、有行。把前两个折成同一个 0，「这一段还没花」与「没
+/// 读账本」就成了同一句话，而后者下一次会静默地一直显示「没花」。
+///
+/// 钱按币种分开列：价目本可能换过，把两种币折成一个和就是编一个汇率。
+async fn session_spend_frame(
+    ledger: Option<&dyn cog_core::LlmUsageLedger>,
+    session: &str,
+) -> serde_json::Value {
+    let Some(ledger) = ledger else {
+        return serde_json::json!({ "readable": false, "reason": "no_ledger" });
+    };
+    match ledger.spend_for_session(session).await {
+        Ok(spend) => {
+            let spend = spend.unwrap_or_default();
+            serde_json::json!({
+                "readable": true,
+                "calls": spend.calls,
+                "input_tokens": spend.tokens_input,
+                "output_tokens": spend.tokens_output,
+                "cached_tokens": spend.tokens_cached,
+                "money": spend.money,
+                "unpriced_calls": spend.unpriced_calls,
+            })
+        }
+        Err(e) => {
+            // 读失败不是一个读数：说「没读到」和说「花了零」是两句话，而这一段
+            // 从下一次起会一直显示「花了零」。
+            serde_json::json!({ "readable": false, "reason": e })
+        }
+    }
+}
+
+/// 额度拒绝的正文 → 一句话。
+///
+/// 上游代理把「哪一级、谁、已经花了多少、上限多少、什么时候恢复」写进了拒绝正文
+/// （`reason` / `scope` / `target` / `spent_today` / `hard_limit` /
+/// `retry_after_seconds`）。在这一条路径上它只会被当成一段错误文本糊进气泡，而
+/// 读者要的正是那几个数：已经花了多少、上限是多少、等多久。
+///
+/// 认不出（不是额度拒绝）时返回 `None`，调用方照原样说「调用失败」——把一次网络
+/// 故障硬翻译成「额度用完了」是最坏的那种误读。
+///
+/// 这句话里**不点时区**：日界是这台进程所在时钟的零点（`cog_core::day` 的约定，
+/// 部署给整个集群设一个时钟），不是 UTC。写成「UTC 零点」在时钟不是 UTC 的部署里
+/// 就是一句错的话，而读者唯一需要的时刻是 `retry_after_seconds` 给的那个等待。
+fn owner_budget_refusal_sentence(error_text: &str) -> Option<String> {
+    let start = error_text.find('{')?;
+    // 拒绝正文可能被别的东西包着（前缀、尾随换行），只认第一段 JSON。
+    let mut stream =
+        serde_json::Deserializer::from_str(&error_text[start..]).into_iter::<serde_json::Value>();
+    let body = stream.next()?.ok()?;
+    if body.get("reason").and_then(serde_json::Value::as_str)
+        != Some(cog_core::REFUSED_BY_OWNER_BUDGET)
+    {
+        return None;
+    }
+    let scope = body.get("scope").and_then(serde_json::Value::as_str)?;
+    let target = body
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let spent = body.get("spent_today").and_then(serde_json::Value::as_u64);
+    let limit = body.get("hard_limit").and_then(serde_json::Value::as_u64);
+    let wait = body
+        .get("retry_after_seconds")
+        .and_then(serde_json::Value::as_u64);
+
+    // 级别认的是执法面写进正文的那几个词（`QuotaScope::as_str`：user / ws /
+    // team / org / global），不是英文全名：自己再拼一套名字，工作区那一级就会
+    // 落进兜底、被说成「整个平台」，读者于是去找属主，而该找的是租户管理员。
+    //
+    // 认不出来的时候也不许说「整个平台」：那是替一个陌生的级别编一个主体。
+    let who = match cog_core::QuotaScope::parse(scope) {
+        Some(cog_core::QuotaScope::User) => format!("本人 {target}"),
+        Some(cog_core::QuotaScope::Workspace) => format!("工作区 {target}"),
+        Some(cog_core::QuotaScope::Team) => format!("团队 {target}"),
+        Some(cog_core::QuotaScope::Organization) => format!("组织 {target}"),
+        Some(cog_core::QuotaScope::Global) => "整个平台".to_string(),
+        None => format!("{scope} 这一级"),
+    };
+    let spent_part = match (spent, limit) {
+        (Some(spent), Some(limit)) => format!("今天已用 {spent} / 上限 {limit} tokens"),
+        (Some(spent), None) => format!("今天已用 {spent} tokens"),
+        _ => "今天的额度已经用完".to_string(),
+    };
+    let recovery = match wait {
+        Some(secs) if secs >= 120 => format!("约 {} 分钟后恢复", secs.div_ceil(60)),
+        Some(secs) => format!("约 {secs} 秒后恢复"),
+        None => "日界之后恢复".to_string(),
+    };
+    Some(format!(
+        "这一轮没有发出去：{who}的当日额度已用完（{spent_part}）。额度按日归零，\
+         {recovery}；要提前恢复只能由属主调高这一级的上限。"
+    ))
+}
+
+/// 一轮失败时屏幕上要说的那句话。
+///
+/// 只对额度拒绝做翻译，其余原样照抄并加上「调用失败」：一次网络故障被硬翻成
+/// 「额度用完了」，读者会去找额度，而真正要修的是别处。
+fn failure_text(error_text: &str) -> String {
+    owner_budget_refusal_sentence(error_text)
+        .unwrap_or_else(|| format!("LLM 调用失败：{error_text}"))
+}
+
+/// 这一段对话的配额余量：与管理面执法时读的是同一份判定。
+///
+/// 三种答案必须分得开（这正是这一格存在的理由）：
+/// - 这个进程没接配额层级 → `503` + `readable: false`：读不到，不是「无限」；
+/// - 接了、没人给这个人配过上限 → `200` + `enforced: false`：**未配置**，
+///   `used_today` 照报（花销是账本的投影，与有没有上限无关）；
+/// - 配过 → `200` + `enforced: true` 带 `remaining`。
+///
+/// 把「未配置」画成「剩余无限」是最坏的一种写法：它把「谁都没给这一格设过界」
+/// 说成「这一格不需要界」，而执法面恰恰是「没配过就不拒」——两句话意思相反。
+pub async fn quota_handler(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let user_id = request
+        .extensions()
+        .get::<String>()
+        .cloned()
+        .unwrap_or_else(|| "anonymous".to_string());
+    let Some(hierarchy) = state.hierarchy_manager.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "readable": false,
+                "reason": "no_hierarchy_manager",
+                "note": "这个进程没有接配额层级，读不到任何一格上限",
+            })),
+        )
+            .into_response();
+    };
+    // 与代理路径同一个读法：这个人能看到的两级是「本人」与「平台」。工作区那一
+    // 级取决于这一发落在哪个租户，对话开始时还不知道——拒绝正文会说出它。
+    let ctx = cog_core::QuotaContext {
+        user_id: Some(user_id.clone()),
+        global_id: Some(crate::GLOBAL_QUOTA_TARGET.to_string()),
+        ..cog_core::QuotaContext::default()
+    };
+    let decision = hierarchy.check(&ctx, 0).await;
+    let now_unix = chrono::Utc::now().timestamp();
+    // 哪一格是「这一轮会撞上的那一格」：已经越线的格子要排在前面，哪怕它比
+    // 另一个还没满的格子更宽。只报「最窄的已声明格」会让头行写着「剩 80k」、
+    // 下一轮照样被平台级拒掉——两个都是执法面自己算的，读的人却看到两个答案。
+    // 与代理路径拒人时读的是同一个 `blocked_by.first()`（由窄到宽）。
+    let effective_cell = decision
+        .blocked_by
+        .first()
+        .or_else(|| decision.scopes.iter().find(|scope| scope.enforced));
+    let effective = effective_cell.map(|scope| {
+        serde_json::json!({
+            "scope": scope.scope.as_str(),
+            "target": scope.target_id,
+            "soft_limit": scope.limits.soft_limit,
+            "hard_limit": scope.limits.hard_limit,
+            "used_today": scope.used_today,
+            "remaining": scope.remaining,
+            "blocking": scope.blocking,
+            "warning": scope.warning,
+        })
+    });
+    let used_today: u64 = decision
+        .scopes
+        .iter()
+        .find(|scope| scope.scope == cog_core::QuotaScope::User)
+        .map(|scope| scope.used_today)
+        .unwrap_or(0);
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "readable": true,
+            "user_id": user_id,
+            // `null` = 没人为这个人（也没有人给平台）配过上限。这是「未配置」，
+            // 不是「无限」：执法面在没配过的格子上不拒，但那是「没设界」。
+            "effective": effective,
+            "used_today": used_today,
+            "resets_at_unix": now_unix + cog_core::day::seconds_to_next_day(now_unix) as i64,
+            "scopes": decision.scopes,
+        })),
+    )
+        .into_response()
 }
 
 /// 上下文被挤掉了一段：模型下一轮不再看得见它，屏幕上得说一声。
@@ -1612,14 +1806,14 @@ pub async fn run_chat_turn(
     match outcome {
         Err(err) => {
             let text = err.to_string();
-            emit_delta(
-                &out,
-                &session_id,
-                &assistant_mid,
-                &format!("LLM 调用失败：{text}"),
-            )
-            .await;
-            failure = Some(text);
+            // 额度拒绝的正文里写着「哪一级、花了多少、上限多少、什么时候恢复」，
+            // 不译成一句话它就是一串 JSON 糊在气泡里；而这句话正是要让人知道
+            // 该找谁、等多久的那一句。
+            let rendered = failure_text(&text);
+            emit_delta(&out, &session_id, &assistant_mid, &rendered).await;
+            // 记下来的也是这一句：刷新之后历史里读到的必须是同一句话，而不是
+            // 刷新前一句人话、刷新后一段 JSON。
+            failure = Some(rendered);
         }
         // 没有流式增量不等于没有回答：上游可能一次把整段话给回来。这时答案在
         // 循环的交付物里，不把它接上就会把一轮有答案的对话记成「模型没有返回任何
@@ -1701,7 +1895,14 @@ pub async fn run_chat_turn(
     //    把它们画在这一条消息下面——收尾帧一到，这一条就定稿了。压缩在前：
     //    它说的是这一轮模型手上少看到了什么，读的人先知道这件事再读花销。
     emit_turn_compaction(&out, &session_id, &assistant_mid, turn_compaction.as_ref()).await;
-    emit_turn_usage(&out, &session_id, &assistant_mid, turn_usage.as_ref()).await;
+    emit_turn_usage(
+        state.llm_usage.as_deref(),
+        &out,
+        &session_id,
+        &assistant_mid,
+        turn_usage.as_ref(),
+    )
+    .await;
 
     // 7. 收尾帧放最后：`message.end` 是「这一轮结束了」的信号，界面收到它就把下
     //    一句发上来，而 `run_chat_turn` 每一轮是各自 spawn 的。记录写在这一帧之后，
@@ -2052,7 +2253,7 @@ mod tests {
             "cost_usd": 0.0123,
         });
 
-        emit_turn_usage(&out_tx, "s1", "m-1", Some(&counted)).await;
+        emit_turn_usage(None, &out_tx, "s1", "m-1", Some(&counted)).await;
 
         let frame = out_rx.recv().await.expect("这一帧要发出去");
         assert!(frame.contains("\"message.usage\""), "{frame}");
@@ -2060,6 +2261,290 @@ mod tests {
         assert!(frame.contains("\"input_tokens\":1234"), "{frame}");
         assert!(frame.contains("\"model\":\"some-model\""), "{frame}");
         assert!(frame.contains("\"cost_usd\":0.0123"), "{frame}");
+    }
+
+    /// 只答「这一段会话花了多少」的账本替身。
+    struct SessionLedger;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmUsageLedger for SessionLedger {
+        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn upstream_window(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<cog_core::UpstreamWindowReading, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn burned_between(&self, _: &str, _: i64, _: i64) -> Result<u64, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn record_window(&self, _: &cog_core::StoredWindow) -> Result<(), String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn stored_window(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<cog_core::StoredWindow>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn stored_windows(&self, _: &str) -> Result<Vec<cog_core::StoredWindow>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spent_since(&self, _: &str, _: i64) -> Result<u64, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_actor_since(
+            &self,
+            _: i64,
+        ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_upstream_and_actor(
+            &self,
+        ) -> Result<Vec<cog_core::UpstreamActorSpend>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn task_cost_quantile(
+            &self,
+            _: i64,
+            _: f64,
+        ) -> Result<Option<(u64, u64, i64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn task_has_started(&self, _: &str) -> Result<bool, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_for_session(
+            &self,
+            session: &str,
+        ) -> Result<Option<cog_core::contract::usage_ledger::SessionSpend>, String> {
+            if session != "s1" {
+                // 另一段会话在账上没有行：读到了「零」，不是「没读到」。
+                return Ok(None);
+            }
+            Ok(Some(cog_core::contract::usage_ledger::SessionSpend {
+                calls: 3,
+                tokens_input: 4_000,
+                tokens_cached: 1_000,
+                tokens_output: 500,
+                money: vec![cog_core::contract::usage_ledger::SessionMoney {
+                    currency: "USD".into(),
+                    cost_micros: 12_300,
+                    priced_calls: 2,
+                }],
+                unpriced_calls: 1,
+            }))
+        }
+        async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn priced_spend_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<cog_core::PricedSpend, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_workspace_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_task_since(
+            &self,
+            _: &[String],
+            _: i64,
+        ) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn task_attribution(
+            &self,
+            _: &str,
+        ) -> Result<Option<cog_core::TaskAttribution>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn unattributed_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<u64, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn outcomes_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::contract::usage_ledger::OutcomeCount>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn metering_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::contract::usage_ledger::MeteringCount>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn skips_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::contract::usage_ledger::SkippedWorkLine>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn verdicts_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::contract::usage_ledger::SpendVerdictLine>, String> {
+            unimplemented!("这一格只读不写")
+        }
+    }
+
+    /// 一帧花销带的是「这一轮」加「这一段会话到目前为止」：只看这一轮，
+    /// 「这段聊下来多少钱」就永远问不出来。
+    #[tokio::test]
+    async fn the_usage_frame_carries_the_conversation_s_total_so_far() {
+        let ledger = SessionLedger;
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let counted = serde_json::json!({ "input_tokens": 100, "output_tokens": 10 });
+
+        emit_turn_usage(Some(&ledger), &out_tx, "s1", "m-1", Some(&counted)).await;
+
+        let frame = out_rx.recv().await.expect("这一帧要发出去");
+        let frame: serde_json::Value = serde_json::from_str(&frame).expect("一帧 JSON");
+        let session = &frame["payload"]["payload"]["session"];
+        assert_eq!(session["readable"], true, "{session}");
+        assert_eq!(session["calls"], 3, "{session}");
+        assert_eq!(session["input_tokens"], 4_000, "{session}");
+        assert_eq!(session["output_tokens"], 500, "{session}");
+        assert_eq!(session["cached_tokens"], 1_000, "{session}");
+        assert_eq!(session["unpriced_calls"], 1, "{session}");
+        // 钱按币种分开列，不折成一个和。
+        assert_eq!(session["money"][0]["currency"], "USD", "{session}");
+        assert_eq!(session["money"][0]["cost_micros"], 12_300, "{session}");
+        assert_eq!(session["money"][0]["priced_calls"], 2, "{session}");
+    }
+
+    /// 账本没接时，「读不到」不能读成「花了零」。
+    #[tokio::test]
+    async fn a_missing_ledger_reads_as_unread_not_as_zero() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let counted = serde_json::json!({ "input_tokens": 100, "output_tokens": 10 });
+
+        emit_turn_usage(None, &out_tx, "s1", "m-1", Some(&counted)).await;
+
+        let frame: serde_json::Value =
+            serde_json::from_str(&out_rx.recv().await.expect("这一帧要发出去")).unwrap();
+        let session = &frame["payload"]["payload"]["session"];
+        assert_eq!(session["readable"], false, "{session}");
+        assert_eq!(session["reason"], "no_ledger", "{session}");
+        assert!(
+            session.get("calls").is_none(),
+            "读不到的时候不许给出一个「0 次调用」：{session}"
+        );
+    }
+
+    /// 额度拒绝的正文要变成一句带数的话：哪一级、花了多少、上限多少、等多久。
+    #[tokio::test]
+    async fn an_owner_budget_refusal_becomes_a_sentence_with_the_numbers() {
+        let raw = r#"API error (HTTP 402 PAYMENT_REQUIRED): {"error":"这个人今天的额度已经用完","reason":"owner_budget_spent","scope":"user","target":"u-1","owner":"u-1","spent_today":12340,"hard_limit":12000,"retry_after_seconds":7200}"#;
+
+        let sentence = owner_budget_refusal_sentence(raw).expect("认得出这是额度拒绝");
+        assert!(sentence.contains("u-1"), "{sentence}");
+        assert!(
+            sentence.contains("12340"),
+            "已经花了多少要在句子里：{sentence}"
+        );
+        assert!(sentence.contains("12000"), "上限要在句子里：{sentence}");
+        assert!(
+            sentence.contains("120 分钟"),
+            "等多久要在句子里：{sentence}"
+        );
+        assert!(
+            !sentence.contains('{'),
+            "原样的 JSON 不该留在人话里：{sentence}"
+        );
+    }
+
+    /// 拒绝正文里的级别词逐级译成人话，一个都不许落进兜底。
+    ///
+    /// 判据是执法面**自己写出去的那几个词**（`QuotaScope::as_str`），不是英文
+    /// 全名：自己再拼一套名字时，`ws` 会落进兜底被说成「整个平台」，读者据此
+    /// 去找属主，而该找的是租户管理员——正文里那个 `target`（工作区 id）也一起
+    /// 丢了。所以每一级都要看它译出来的主体，不是只看「有没有译出什么」。
+    #[test]
+    fn every_scope_the_proxy_names_reads_back_as_that_scope() {
+        let sentence = |scope: &str, target: &str| {
+            let raw = format!(
+                r#"API error (HTTP 402 PAYMENT_REQUIRED): {{"reason":"owner_budget_spent","scope":"{scope}","target":"{target}","spent_today":10,"hard_limit":5,"retry_after_seconds":60}}"#
+            );
+            owner_budget_refusal_sentence(&raw).expect("五级里任何一级都认得出")
+        };
+        for (scope, target, want) in [
+            ("user", "u-1", "本人 u-1"),
+            ("ws", "ws-9", "工作区 ws-9"),
+            ("team", "t-3", "团队 t-3"),
+            ("org", "o-7", "组织 o-7"),
+            ("global", "platform", "整个平台"),
+        ] {
+            let said = sentence(scope, target);
+            assert!(
+                said.contains(want),
+                "{scope} 这一级要译成「{want}」：{said}"
+            );
+        }
+
+        // 认不出来的级别不许替它编一个主体：说成「整个平台」等于让人去找错的人。
+        let unknown = sentence("galaxy", "x-1");
+        assert!(
+            unknown.contains("galaxy 这一级"),
+            "陌生的级别要照原词说出来：{unknown}"
+        );
+        assert!(
+            !unknown.contains("整个平台"),
+            "认不出来的级别不许被说成平台级：{unknown}"
+        );
+    }
+
+    /// 一轮失败时说哪句话：额度拒绝译成人话，其余照抄。
+    ///
+    /// 这一条钉的是**接线**：把翻译函数写好了却没接进失败那一支，等于没做——
+    /// 屏幕上仍然是一段 JSON。
+    #[test]
+    fn a_failed_turn_says_the_quota_sentence_when_the_proxy_refused_on_the_budget() {
+        let refused = r#"API error (HTTP 402 PAYMENT_REQUIRED): {"error":"这个人今天的额度已经用完","reason":"owner_budget_spent","scope":"user","target":"u-1","spent_today":12340,"hard_limit":12000,"retry_after_seconds":60}"#;
+        let said = failure_text(refused);
+        assert!(said.contains("u-1"), "{said}");
+        assert!(said.contains("12340"), "{said}");
+        assert!(
+            !said.starts_with("LLM 调用失败"),
+            "额度拒绝要说出原因，不是一句「调用失败」：{said}"
+        );
+
+        let broke = "connection reset by peer";
+        assert_eq!(
+            failure_text(broke),
+            "LLM 调用失败：connection reset by peer"
+        );
+    }
+
+    /// 不是额度拒绝的错误不许被翻译成额度拒绝。
+    #[tokio::test]
+    async fn a_network_failure_is_not_translated_into_a_quota_refusal() {
+        assert!(owner_budget_refusal_sentence("connection reset by peer").is_none());
+        assert!(
+            owner_budget_refusal_sentence("API error (HTTP 429): {\"reason\":\"refused_by_pace\"}")
+                .is_none(),
+            "配速拒绝是「等一等」，不是「额度用完了」"
+        );
     }
 
     /// 上下文被挤掉一段时，界面收到一帧带着计数与两段开头的现场。
@@ -2112,7 +2597,7 @@ mod tests {
     async fn a_turn_without_a_reading_does_not_get_a_frame_of_zeroes() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
 
-        emit_turn_usage(&out_tx, "s1", "m-1", None).await;
+        emit_turn_usage(None, &out_tx, "s1", "m-1", None).await;
         drop(out_tx);
 
         assert!(
@@ -2321,7 +2806,7 @@ mod tests {
             panic!("第一条不是用户那句：{messages:?}");
         };
         assert_eq!(content.len(), 2, "正文与图没有各占一格：{content:?}");
-        assert_eq!(content[0].as_text().as_deref(), Some("这里错了"));
+        assert_eq!(content[0].as_text(), Some("这里错了"));
         assert!(
             matches!(
                 &content[1],

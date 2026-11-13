@@ -3506,6 +3506,41 @@ export async function getChatCommands(): Promise<ChatCommandList> {
   return api.get<ChatCommandList>('/api/v1/chat/commands');
 }
 
+/** 一段会话的配额读数里，某一级格子的那一半。 */
+export interface ChatQuotaCell {
+  scope: 'user' | 'workspace' | 'team' | 'organization' | 'global' | string;
+  target: string;
+  soft_limit: number;
+  hard_limit: number;
+  used_today: number;
+  remaining: number;
+  blocking: boolean;
+  warning: boolean;
+}
+
+/**
+ * 这一段对话的配额余量：与代理路径执法时读的是同一份判定。
+ *
+ * `effective` 是 `null` 表示**没人给这一格配过上限**——那是「未配置」，不是
+ * 「剩余无限」。`readable: false` 表示这一次根本没读到（没有配额层级），这时
+ * 连 `used_today` 都没有：读不到与花了零是两句话。
+ */
+export interface ChatQuota {
+  readable: boolean;
+  reason?: string;
+  user_id?: string;
+  /** 最窄的那个被声明过的格子；`null` = 没人为这个人 / 平台配过上限。 */
+  effective?: ChatQuotaCell | null;
+  /** 这个人今天已用多少 token（账本投影）。`readable: false` 时没有这一格。 */
+  used_today?: number;
+  resets_at_unix?: number;
+  scopes?: ChatQuotaCell[];
+}
+
+export async function getChatQuota(): Promise<ChatQuota> {
+  return api.get<ChatQuota>('/api/v1/chat/quota');
+}
+
 export async function getWorkspaceTree(
   path = '',
   source: FileSource = 'workspace'

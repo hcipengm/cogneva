@@ -49,6 +49,7 @@ fn row(actor: &str, result: &str, outcome: Option<MeteringOutcome>) -> LlmUsageR
         retry_after_secs: None,
         task: None,
         owner: None,
+        session: None,
         latency_ms: 1,
         pace: None,
     }

@@ -265,6 +265,26 @@ export interface TurnUsage {
   model: string | null;
   /** 按声明价目算出来的美元数。上游没声明价目时 `null`：没算，不是免费。 */
   costUsd: number | null;
+  /**
+   * 这一段会话到目前为止的合计，账本按会话那一列折叠出来的。
+   *
+   * `readable: false` 时其余几格都没有——「没读到」不许画成「花了零」。
+   */
+  session: SessionSpend | null;
+}
+
+/** 一段会话到目前为止花了多少，钱按币种分列（价目本换过，不折汇率）。 */
+export interface SessionSpend {
+  readable: boolean;
+  /** 读不到的原因（`readable: false` 时有）。 */
+  reason: string | null;
+  calls: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedTokens: number | null;
+  money: { currency: string; costMicros: number; pricedCalls: number }[];
+  /** 到过上游但没定价的调用次数：它们的钱不在 `money` 里。 */
+  unpricedCalls: number | null;
 }
 
 /**
@@ -287,6 +307,43 @@ export interface ContextCompaction {
   /** 这一次裁剪的界：窗口预算与低水位。 */
   budgetTokens: number | null;
   targetTokens: number | null;
+}
+
+/**
+ * 帧里「这一段会话花了多少」那一格。
+ *
+ * 形状不对（旧服务端没有这一格、或者字段缺了）返回 `null`：没有这一格与
+ * 「这一段花了零」是两句话，后者要由服务端明说 `calls: 0`。
+ */
+function sessionSpend(value: unknown): SessionSpend | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.readable !== 'boolean') return null;
+  const money = Array.isArray(raw.money)
+    ? raw.money
+        .map((line) => {
+          if (!line || typeof line !== 'object') return null;
+          const cell = line as Record<string, unknown>;
+          const currency = typeof cell.currency === 'string' ? cell.currency : null;
+          const costMicros = frameCount(cell.cost_micros);
+          const pricedCalls = frameCount(cell.priced_calls);
+          if (currency === null || costMicros === null || pricedCalls === null) return null;
+          return { currency, costMicros, pricedCalls };
+        })
+        .filter((line): line is { currency: string; costMicros: number; pricedCalls: number } =>
+          line !== null
+        )
+    : [];
+  return {
+    readable: raw.readable,
+    reason: typeof raw.reason === 'string' ? raw.reason : null,
+    calls: frameCount(raw.calls),
+    inputTokens: frameCount(raw.input_tokens),
+    outputTokens: frameCount(raw.output_tokens),
+    cachedTokens: frameCount(raw.cached_tokens),
+    money,
+    unpricedCalls: frameCount(raw.unpriced_calls),
+  };
 }
 
 /** 帧里的数字转成界面认得的数：不是有限数就是 `null`，不猜 0。 */
@@ -338,6 +395,7 @@ export function normalizeChatFrame(
             durationMs: frameCount(inner.duration_ms),
             model: typeof inner.model === 'string' ? inner.model : null,
             costUsd: frameCount(inner.cost_usd),
+            session: sessionSpend(inner.session),
           }
         : null,
     compaction:

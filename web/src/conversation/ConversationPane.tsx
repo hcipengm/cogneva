@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   getChatCommands,
+  getChatQuota,
   getWorkspaceTree,
   type ChatCommand,
+  type ChatQuota,
   type WorkspaceEntry,
 } from '@/api/client';
 import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch';
@@ -18,7 +20,7 @@ import {
   type PermissionAsk,
 } from '@/store/permissionStore';
 import { useShell } from '@/shell/store';
-import type { ContextCompaction, TurnUsage } from '@/types/events';
+import type { ContextCompaction, SessionSpend, TurnUsage } from '@/types/events';
 import { Note } from '@/ui/Note';
 
 /**
@@ -70,6 +72,66 @@ function usageLine(usage: TurnUsage): string {
   if (usage.model) parts.push(usage.model);
   if (usage.costUsd !== null) parts.push(`$${usage.costUsd.toFixed(4)}`);
   return parts.join(' · ');
+}
+
+/**
+ * 这一段会话的合计读成一行：调用次数、进出 token、各币种的钱。
+ *
+ * 读不到那一格时写「花销读不到」：留白会被读成「这段没花」，而事实是这一格
+ * 没有读数。没定价的调用次数单列，不让它沉默地消失在金额后面。
+ */
+function sessionSpendLine(spend: SessionSpend): string {
+  if (!spend.readable) return '会话花销读不到';
+  const parts: string[] = [];
+  if (spend.calls !== null) parts.push(spend.calls + ' 次调用');
+  if (spend.inputTokens !== null || spend.outputTokens !== null) {
+    const input = spend.inputTokens === null ? '—' : compactCount(spend.inputTokens);
+    const output = spend.outputTokens === null ? '—' : compactCount(spend.outputTokens);
+    parts.push('输入 ' + input + ' · 输出 ' + output);
+  }
+  for (const line of spend.money) {
+    const times = line.pricedCalls > 1 ? '（' + line.pricedCalls + ' 次）' : '';
+    parts.push(moneyText(line.currency, line.costMicros) + times);
+  }
+  if (spend.unpricedCalls !== null && spend.unpricedCalls > 0) {
+    parts.push(spend.unpricedCalls + ' 次未定价');
+  }
+  if (parts.length === 0) return '会话 0 次调用';
+  return '会话 ' + parts.join(' · ');
+}
+
+/**
+ * 钱按币种写：价目本可能换过，把两种币折成一个和就是编一个汇率。
+ *
+ * 微单位是价钱的本体（账本里存的就是它），这里只做一次显示层的除法。
+ */
+function moneyText(currency: string, micros: number): string {
+  const amount = micros / 1_000_000;
+  if (currency === 'USD') return '$' + amount.toFixed(4);
+  if (currency === 'CNY') return '¥' + amount.toFixed(4);
+  return amount.toFixed(4) + ' ' + currency;
+}
+
+/**
+ * 配额那一格读成一行：已用、上限、还剩。
+ *
+ * 「未配置」与「读不到」是两句不同的话，也都不是「无限」：前者是没人设过界
+ * （执法面因此不拒），后者是这次没读到（连已用都没有）。
+ */
+function quotaLine(quota: ChatQuota | null, unreadable: boolean): string {
+  if (unreadable || !quota || !quota.readable) return '配额读不到';
+  const used = quota.used_today ?? null;
+  const effective = quota.effective ?? null;
+  if (effective === null) {
+    return used === null ? '配额未配置' : '今日 ' + compactCount(used) + '（未配置上限）';
+  }
+  const parts: string[] = [];
+  if (used !== null) parts.push('今日 ' + compactCount(used));
+  parts.push('上限 ' + compactCount(effective.hard_limit));
+  parts.push('剩 ' + compactCount(effective.remaining));
+  if (effective.blocking) parts.push('已用完');
+  else if (effective.warning) parts.push('接近上限');
+  return '配额 ' + parts.join(' · ');
 }
 
 /**
@@ -988,6 +1050,55 @@ export function ConversationPane({
   }, [session?.messages]);
 
   /**
+   * 会话头那一格「这一段花了多少」：最近一条带着会话合计的消息。
+   *
+   * 服务端从账本按会话折出来，界面一条都不加——这里再累加一遍就有了两本账，
+   * 而两本账第一次对不上时没人说得出哪一本是对的。刷新读回的历史不带花销，
+   * 那一格因此会消失，而不是留着上一次的数冒充现在。
+   */
+  const sessionSpend = useMemo(() => {
+    const messages = session?.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const seen = messages[i].usage?.session;
+      if (seen) return seen;
+    }
+    return null;
+  }, [session?.messages]);
+
+  /**
+   * 配额余量：这一段的花销变了就重读一次。
+   *
+   * 不按定时器刷：这里要的是「刚花完的那些之后还剩多少」，没有新花销就没有新
+   * 答案，定时器只会把同一个数读第二遍。
+   *
+   * 触发点取会话合计里的那几个数，不取消息条数：一条消息在轮子开始时就挂上去
+   * 了，那时这一轮还没记账，按条数触发读到的是上一轮的余量，而真正记账的那一
+   * 帧不会再触发一次——头行的「剩多少」于是永远晚一轮，且看起来完全正常。
+   */
+  const [quota, setQuota] = useState<ChatQuota | null>(null);
+  const [quotaUnreadable, setQuotaUnreadable] = useState(false);
+  const spendTouched = sessionSpend
+    ? `${sessionSpend.calls}:${sessionSpend.inputTokens}:${sessionSpend.outputTokens}`
+    : '';
+  useEffect(() => {
+    let live = true;
+    getChatQuota()
+      .then((reading) => {
+        if (!live) return;
+        setQuota(reading);
+        setQuotaUnreadable(false);
+      })
+      .catch(() => {
+        if (!live) return;
+        setQuota(null);
+        setQuotaUnreadable(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, [sessionId, spendTouched]);
+
+  /**
    * Esc 与「■ 停止」走同一条路：只在有轮在跑时挂上，停的是这一段上所有在跑的轮。
    *
    * 不避让输入框——Esc 在这里没有第二种含义，而「手还在键盘上、想让它停下」正是
@@ -1099,6 +1210,22 @@ export function ConversationPane({
             text="这一轮结束时模型读进去的提示词长度：这段对话现在背着多重的上下文"
           >
             上下文 {compactCount(contextTokens)}
+          </Note>
+        )}
+        {sessionSpend && (
+          <Note
+            className="mono shrink-0 text-[10px] text-[var(--muted)]"
+            text="账本按这一段会话折出来的合计：它下面每一轮的花销逐条加起来就是它。读不到账本时这一格写「读不到」，不是零"
+          >
+            {sessionSpendLine(sessionSpend)}
+          </Note>
+        )}
+        {(quota !== null || quotaUnreadable) && (
+          <Note
+            className="mono shrink-0 text-[10px] text-[var(--muted)]"
+            text="今天的额度：与管理面执法时读的是同一格。没人配过上限时写「未配置」，那不是「无限」"
+          >
+            {quotaLine(quota, quotaUnreadable)}
           </Note>
         )}
         {/*

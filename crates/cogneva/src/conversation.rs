@@ -735,10 +735,14 @@ impl ConversationTurn for PlatformConversation {
                 runtime = runtime.with_roster(roster.clone());
             }
             // 没有身份的连接不声明人：编一个名字会读成真有人花过这笔钱。
-            let mut runtime = runtime.with_call_identity(
+            let runtime = runtime.with_call_identity(
                 request.owner.clone(),
                 cog_core::LlmOrigin::Interactive.as_str(),
             );
+            // 这一轮的每一发都记在这段对话名下：界面上的「这段会话花了多少」是账本
+            // 按这一列折叠出来的，不挂这一格，那几发的 token 只数得进按人 / 按
+            // 环境的总数，屏幕上一段会话的合计就会比它下面每一轮加起来少。
+            let mut runtime = runtime.with_call_session(request.session_id.clone());
 
             // 开跑前先读收件箱：同事在它不在的时候发来的话，这一轮要看得见。
             // 读完就确认，下一轮只读新的；回信地址跟着消息一起带进来，等这一轮

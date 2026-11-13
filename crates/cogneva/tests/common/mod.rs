@@ -4,6 +4,7 @@ pub mod declared_once;
 pub mod fsio;
 pub mod harness;
 pub mod js_literal;
+pub mod kv;
 pub mod lex;
 pub mod mocks;
 pub mod orchestrator;
