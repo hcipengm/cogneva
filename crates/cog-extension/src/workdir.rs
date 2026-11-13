@@ -192,15 +192,18 @@ const WARM_TREES_SOURCES: [&str; 2] = ["seed", "measured"];
 
 /// The window arrival samples are kept over. Longer than any working day, so a
 /// burst is not averaged away by the quiet hours around it.
+// cap: fixed — 7 天：比任何工作日都长，突发才不会被两旁的安静时段平均掉
 const ARRIVAL_WINDOW_SECS: i64 = 7 * 24 * 3600;
 
 /// How many arrival timestamps to keep. A cap rather than a promise: the window
 /// above already bounds the queue for realistic rates, and this bounds it for
 /// a pathological one.
+// cap: bound — 1024 是给病理速率的兜底（正常速率由上面的窗口兜）：内存代价随它走
 const MAX_ARRIVAL_SAMPLES: usize = 1024;
 
 /// How many checkout durations to keep for the median. Small on purpose: the
 /// cost follows the repository's size, which changes over days, not seconds.
+// cap: fixed — 32 个样本取中位数就够：成本跟着仓库大小走，那是按天变的，不是按秒
 const CHECKOUT_SAMPLES: usize = 32;
 
 /// How many ready trees are worth holding: Little's law over the two costs the

@@ -153,7 +153,7 @@ pub const RETENTION_TABLE_SHARE_PERCENT: u64 = 5;
 /// （[`cog_core::claim_footprint::quantity_bytes`]）：两边各写一份，改了一边之后
 /// 另一边的读数会静默地差一个数量级。
 pub fn database_storage_bytes(raw: Option<&str>) -> Option<u64> {
-    raw.and_then(|text| crate::claim_footprint::quantity_bytes(text))
+    raw.and_then(crate::claim_footprint::quantity_bytes)
         .filter(|bytes| bytes.is_finite() && *bytes >= 1.0)
         .map(|bytes| bytes as u64)
 }

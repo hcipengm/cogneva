@@ -117,24 +117,27 @@ const DEFAULT_MAX_LIST_ENTRIES: usize = 5_000;
 /// A day. This gate is a person reading one plan, and a plan left unread for more than
 /// a working day is no longer the plan about to be read -- approving it then is
 /// approving something nobody looked at.
-// cap: seed — 审批延迟的实测要比它长时，窗口跟着实测走
+// cap: bound — 种子：量不到审批延迟时的退路；生效的窗口取它与窗口内最慢一次实测中较大的那个
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 
 /// How long an approval-latency sample stays in the window the window is
 /// computed from. Thirty days: the pattern this answers to is "how long people
 /// take to read one plan", which has weekly shape (a plan staged on Friday) --
 /// a window shorter than a month would call a quiet fortnight an empty one.
+// cap: fixed — 30 天：批准延迟带周形状（周五排的计划下周才读），更短的窗口会把安静的两周读成空窗口
 const APPROVAL_LATENCY_WINDOW_SECS: u64 = 30 * 86_400;
 
 /// How long a question's measured wire size stays in the window the assist plan
 /// is computed from. Thirty days, the same shape as the approval window: which
 /// folders this station meets changes with the work, and the work has a weekly
 /// shape, so a shorter window would call a quiet fortnight an empty one.
+// cap: fixed — 30 天：与批准窗口同一个周形状的理由，一道问句的尺寸随这一周碰到的工作变
 const QUESTION_WINDOW_SECS: u64 = 30 * 86_400;
 
 /// Headroom over the slowest measured approval. The measurement is one sample
 /// of a person's schedule, so the window gives the next one a quarter more
 /// room than the slowest one already took.
+// cap: fixed — 1.25 是留出的余量（四分之一）：一份样本只是一个人日程的一次读数，不是分布
 const APPROVAL_TTL_MARGIN: f64 = 1.25;
 /// A window shorter than this is not a window: the plan could expire between being
 /// displayed and being clicked.

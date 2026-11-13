@@ -115,13 +115,13 @@ pub(crate) async fn clear_stale_git_lock(lock: &Path, max_age: Duration) -> bool
 ///
 /// 实际生效的界每拍按实测重算（卷还装得下多少棵树 × 新树到达间隔 / 2），并把
 /// 已归还工作树里最长的一趟当地板——量不到卷或到达率时才落回这个数。
-// cap: seed — 量不到卷与到达率时的退路；地板由已归还的若干趟实测重算
+// cap: bound — 种子：量不到卷与到达率时的退路，生效的界每拍按实测重算并以已归还的最长一趟当地板
 pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
 
 /// 孤儿分支存活上限的**种子**：未并入 main、且所属实例已经轮换掉的 `evol/<id>`
 /// 分支留多久。实际生效的界每拍按实测重算（裸仓库还能装下多少条分支的独有
 /// 对象 × 新实例分支到达间隔 / 2）。
-// cap: seed — 量不到仓库容量或分支到达率时的退路
+// cap: bound — 种子：量不到仓库容量或分支到达率时的退路，生效的界每拍按实测重算
 pub const DEFAULT_ORPHAN_BRANCH_TTL: Duration = Duration::from_secs(2_592_000);
 
 /// 临时工作树这一条保留回路在登记表里的 key，与 `evolution.workspaces.ephemeralTtlSecs`
@@ -136,6 +136,7 @@ pub const ORPHAN_BRANCH_TTL_KNOB: &str = "evolution.workspaces.orphanBranchTtlSe
 /// 7 天：实例轮换是件稀疏的事，一个轮询周期里 0 或 1 次是常态；窗口短到一两次
 /// 事件就能翻倍，长到与「这条卷多久会被重新填满」同一量级。窗口内的到达数除以
 /// 窗口，就是这条回路的到达率。
+// cap: fixed — 7 天：到达是稀疏事件，窗口短到一两次事件就能翻倍，长到与卷被重新填满同一量级
 const ARRIVAL_WINDOW_SECS: u64 = 7 * 86_400;
 
 /// 一件东西在这张卷上值得留多久：装得下多少件 × 新件到达间隔 / 2。

@@ -132,8 +132,10 @@ pub fn tail_budget(
 }
 
 /// 时限读数的尾部取哪一分位：几乎每一轮都不超过它，离群值不把界撑开。
+// cap: bound — 99 分位是选定的：让个别离群轮不把界撑开，而不是量出来的一个分位
 pub const TAIL_QUANTILE: f64 = 0.99;
 /// 尾部窗口保留多少个样本。有界是刻意的：界要跟着最近发生的事走。
+// cap: bound — 有界是刻意的（界跟着最近的事走）：64 是窗口新鲜度与内存之间的折中
 pub const TAIL_WINDOW_SAMPLES: usize = 64;
 
 /// 连续第 `attempt` 次失败之后，下一次之前该等多久。

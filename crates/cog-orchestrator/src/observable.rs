@@ -732,8 +732,11 @@ pub struct RowsPerHandoverObservable {
 }
 
 impl RowsPerHandoverObservable {
+    // cap: fixed — 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
     const UNRECORDED: u64 = 0;
+    // cap: fixed — 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
     const DERIVED: u64 = 1;
+    // cap: fixed — 写进读数标签的编号：已经发布出去的序列按这些数字认，改它等于换一个序列
     const OVERRIDE: u64 = 2;
 
     pub fn new() -> Self {
