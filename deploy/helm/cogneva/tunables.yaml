@@ -17,16 +17,24 @@
 # the agreement). A `derived` marker on a constant is refused with that reason,
 # not accepted as a third spelling of "somebody measured it once".
 #
-# A number a deployment ships is one of three things, and the page shows all
-# three as the same number:
+# A number a deployment ships is one of two things, and the page shows both as
+# the same number:
 #
 #   derived   a measurement sets it, so it moves when the input it reads moves.
-#             The row says which input, which reading the number lands on, and
-#             which test shows the value following its input.
-#   override  the deployment names it. It stays where it was pinned, and the row
-#             says why no loop closes over it yet -- that sentence is the debt.
+#             The row says which reading the number lands on, which test shows
+#             the value following its input, and which test shows the loop
+#             computing it again in the same process -- with the reading that
+#             counts the beats.
 #   fixed     it is not a dial: a protocol port, an interface bound, a practice.
 #             No measurement should move it, and the row says which agreement.
+#
+# There is no third word. `override` meant "the deployment pinned this number",
+# and it was where every unfinished row went: the row said why no loop closed
+# over it yet, and the sentence was the debt. On the page it looked exactly like
+# a measured number. The end state removed the word with the rows it described --
+# each one became a loop that measures the value or an agreement that is not a
+# dial -- so a number nobody measures is no longer a registration, it is an
+# unfinished row, and the gate refuses the vocabulary.
 #
 # What the gate checks, and why it is shaped this way:
 #
@@ -35,20 +43,22 @@
 #     missing row, not an absence nobody notices. The set is read from the chart
 #     on every run, so a value that is added to `values.yaml` without a row goes
 #     red, and a row whose key left the chart goes red too.
-#   - every row says something. For `override`/`fixed` that is the reason it is
-#     not derived; for `derived` it is what the value reads.
-#   - a `derived` row has to name a reading and a test that moves its input. A
-#     comment claiming a number tracks the world is not evidence that it does;
-#     the test is the only part of the claim a machine can refuse.
-#   - a row that lands on a reading has to use a word the reading can carry
-#     (`derived`/`override`), and the file it names has to publish that metric
-#     and that label.
+#   - every row says something. For `fixed` that is the reason it is not
+#     derived; for `derived` it is what the value reads.
+#   - a `derived` row names two tests, because one cannot carry both halves of
+#     the claim: the law test shows a different input answering a different
+#     value, and the beat test shows the loop computing that value again in the
+#     same process, with the reading that counts the beats rising even when the
+#     value did not move. A comment claiming a number tracks the world is not
+#     evidence that it does, and a value that is measured once at start-up is a
+#     constant with a loop somewhere else.
+#   - a row that lands on a reading has to use a word the reading can carry,
+#     and the file it names has to publish that metric and that label.
 #
-# The three words are not a maturity ladder. `fixed` is a complete answer for a
-# protocol constant; `override` is the honest answer for a cap whose loop has not
-# been built. What is not allowed is a value that is one of these and a row that
-# says none.
-version: 1
+# `fixed` is not a leftover. It is a complete answer for a protocol constant,
+# and it is the only answer that does not move. What is not allowed is a value
+# that is neither measured nor agreed, or a row that says none.
+version: 2
 rows:
 
   # --- notification / alerting ------------------------------------------------

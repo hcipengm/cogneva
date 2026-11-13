@@ -15,8 +15,8 @@
 //!   without a row is a hole this test names rather than an absence nobody
 //!   notices -- "nobody has looked at this yet" has to be a missing row, not a
 //!   silently unjudged number.
-//! - every row says something. For `override`/`fixed` that is the reason the
-//!   value is not derived; for `derived` it is what the value reads.
+//! - every row says something. For `fixed` that is the reason the value is not
+//!   derived; for `derived` it is what the value reads.
 //! - a `derived` row names the reading its number lands on and a test that shows
 //!   the number following its input. A comment claiming a value tracks the world
 //!   is not evidence that it does; the test is the part of the claim a machine
@@ -76,8 +76,6 @@ const CAP_METRIC: &str = "BUILD_TARGET_CAP_METRIC";
 enum Source {
     /// A measurement loop sets it, so it moves when the input it reads moves.
     Derived,
-    /// The deployment names it, so it stays where it was pinned.
-    Override,
     /// Not a dial: a protocol number or a practice, which no measurement should
     /// move. Registered so that "fixed by agreement" and "nobody has derived
     /// this yet" are told apart by the row rather than by whoever reads it next.
@@ -94,7 +92,6 @@ impl Source {
     fn as_label(self) -> Option<&'static str> {
         match self {
             Source::Derived => Some("derived"),
-            Source::Override => Some("override"),
             Source::Fixed => None,
         }
     }
@@ -151,8 +148,8 @@ fn registry() -> Registry {
     let registry: Registry = serde_yaml::from_str(&text)
         .unwrap_or_else(|e| panic!("{REGISTRY} does not parse as a registry: {e}"));
     assert_eq!(
-        registry.version, 1,
-        "{REGISTRY}: this test reads version 1, and the version is here so that a \
+        registry.version, 2,
+        "{REGISTRY}: this test reads version 2, and the version is here so that a \
          change to the row shape is a version bump rather than a silent reinterpretation"
     );
     registry
@@ -541,9 +538,52 @@ fn the_registrys_words_are_the_labels_words() {
         Source::Derived.as_label(),
         Some(CapSource::Derived.as_str())
     );
+    // `fixed` is not a word a reading can carry: it lands nowhere, which is why
+    // a row that names a reading has to be `derived`.
+    assert_eq!(Source::Fixed.as_label(), None);
+}
+
+/// The third word is gone, and its absence is a rule rather than a count.
+///
+/// `override` used to mean "the deployment pinned this number". Every such row
+/// was either turned into a loop that measures the value or deleted, so the
+/// word now has no meaning a row could carry: a number nothing measures is
+/// either an agreement (`fixed`) or not a dial. Re-adding the word re-opens the
+/// end state one row at a time, and the row itself looks entirely ordinary on
+/// the page -- so the vocabulary refuses it, and this test names the refusal
+/// instead of letting serde report an unknown variant from inside `registry()`.
+#[test]
+fn the_registry_vocabulary_has_no_override() {
     assert_eq!(
-        Source::Override.as_label(),
-        Some(CapSource::Override.as_str())
+        serde_yaml::from_str::<Source>("derived").expect("`derived` is a source"),
+        Source::Derived
+    );
+    assert_eq!(
+        serde_yaml::from_str::<Source>("fixed").expect("`fixed` is a source"),
+        Source::Fixed
+    );
+    assert!(
+        serde_yaml::from_str::<Source>("override").is_err(),
+        "`override` is a source again: the end state has two words, `derived` \
+         (a measurement sets it) and `fixed` (an agreement, not a dial)"
+    );
+
+    let text = read(&repo_root().join(REGISTRY));
+    let offenders: Vec<String> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let line = line.trim_start();
+            line.strip_prefix("source:").is_some_and(|rest| rest.trim() == "override")
+        })
+        .map(|(index, _)| format!("{REGISTRY}:{}", index + 1))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these rows are registered as `override`, a word this registry no longer \
+         carries -- a value either has a loop that measures it (`derived`) or is \
+         an agreement no measurement should move (`fixed`); a number nobody \
+         measures is not a third kind, it is an unfinished row: {offenders:#?}"
     );
 }
 
@@ -1107,310 +1147,6 @@ fn the_registry_endpoints_the_code_reads_are_declared_on_both_paths() {
                 "{STATIC} never passes {env}, so the apply path leaves the deployer \
                  without an endpoint while the chart path has one"
             ));
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-/// Batches of the end state land one group at a time, and a group that has
-/// landed must not carry `override` rows again: `override` is the word the end
-/// state deletes, so a re-added row reopens debt that was closed by measuring
-/// or deleting the value.
-///
-/// A deleted key is absent from the registry and that is the point -- if it
-/// comes back as an override, the row reappears here and this test names it.
-#[test]
-fn a_landed_batch_carries_no_override() {
-    const LANDED_GROUPS: &[(&str, &[&str])] = &[
-        (
-            // Address and platform defaults: one leaf is an address four objects
-            // agree on, and three restated a platform default or upstream default.
-            "B0",
-            &[
-                "clusterRegistry.port",
-                "evolution.progressDeadlineSeconds",
-                "backup.ttlSecondsAfterFinished",
-                "webSearch.safeSearch",
-            ],
-        ),
-        (
-            // Every container's requests and limits on the chart's own workloads,
-            // plus the rollout judgement's Job: one size law measures the draw,
-            // patches the declaration, and publishes it. The postgres hook Job's
-            // three declarations are gone -- it inherits the LimitRange defaults.
-            "B1",
-            &[
-            "backends.meilisearch.resources.requests.cpu",
-            "backends.meilisearch.resources.requests.memory",
-            "backends.meilisearch.resources.limits.cpu",
-            "backends.meilisearch.resources.limits.memory",
-            "backends.nats.resources.requests.cpu",
-            "backends.nats.resources.requests.memory",
-            "backends.nats.resources.limits.cpu",
-            "backends.nats.resources.limits.memory",
-            "backends.postgres.resources.requests.cpu",
-            "backends.postgres.resources.requests.memory",
-            "backends.postgres.resources.limits.cpu",
-            "backends.postgres.resources.limits.memory",
-            "backends.postgres.exporterResources.requests.cpu",
-            "backends.postgres.exporterResources.requests.memory",
-            "backends.postgres.exporterResources.limits.cpu",
-            "backends.postgres.exporterResources.limits.memory",
-            "backends.qdrant.resources.requests.cpu",
-            "backends.qdrant.resources.requests.memory",
-            "backends.qdrant.resources.limits.cpu",
-            "backends.qdrant.resources.limits.memory",
-            "backends.redis.resources.requests.cpu",
-            "backends.redis.resources.requests.memory",
-            "backends.redis.resources.limits.cpu",
-            "backends.redis.resources.limits.memory",
-            "backends.redis.aofRepair.resources.requests.cpu",
-            "backends.redis.aofRepair.resources.requests.memory",
-            "backends.redis.aofRepair.resources.limits.cpu",
-            "backends.redis.aofRepair.resources.limits.memory",
-            "backends.redis.aofReportExporter.resources.requests.cpu",
-            "backends.redis.aofReportExporter.resources.requests.memory",
-            "backends.redis.aofReportExporter.resources.limits.cpu",
-            "backends.redis.aofReportExporter.resources.limits.memory",
-            "backends.redis.infoExporter.resources.requests.cpu",
-            "backends.redis.infoExporter.resources.requests.memory",
-            "backends.redis.infoExporter.resources.limits.cpu",
-            "backends.redis.infoExporter.resources.limits.memory",
-            "backends.seaweedfs.resources.requests.cpu",
-            "backends.seaweedfs.resources.requests.memory",
-            "backends.seaweedfs.resources.limits.cpu",
-            "backends.seaweedfs.resources.limits.memory",
-            "backup.resources.requests.cpu",
-            "backup.resources.requests.memory",
-            "backup.resources.limits.cpu",
-            "backup.resources.limits.memory",
-            "backup.drillResources.requests.cpu",
-            "backup.drillResources.requests.memory",
-            "backup.drillResources.limits.cpu",
-            "backup.drillResources.limits.memory",
-            "buildah.resources.requests.cpu",
-            "buildah.resources.requests.memory",
-            "buildah.resources.limits.cpu",
-            "buildah.resources.limits.memory",
-            "clusterRegistry.resources.requests.cpu",
-            "clusterRegistry.resources.requests.memory",
-            "clusterRegistry.resources.limits.cpu",
-            "clusterRegistry.resources.limits.memory",
-            "clusterRegistry.walkerResources.requests.cpu",
-            "clusterRegistry.walkerResources.requests.memory",
-            "clusterRegistry.walkerResources.limits.cpu",
-            "clusterRegistry.walkerResources.limits.memory",
-            "evolution.resources.requests.cpu",
-            "evolution.resources.requests.memory",
-            "evolution.resources.limits.cpu",
-            "evolution.resources.limits.memory",
-            "gateway.resources.requests.cpu",
-            "gateway.resources.requests.memory",
-            "gateway.resources.limits.cpu",
-            "gateway.resources.limits.memory",
-            "hostLedger.resources.requests.cpu",
-            "hostLedger.resources.requests.memory",
-            "hostLedger.resources.limits.cpu",
-            "hostLedger.resources.limits.memory",
-            "processCensus.resources.requests.cpu",
-            "processCensus.resources.requests.memory",
-            "processCensus.resources.limits.cpu",
-            "processCensus.resources.limits.memory",
-            "claimStore.resources.requests.cpu",
-            "claimStore.resources.requests.memory",
-            "claimStore.resources.limits.cpu",
-            "claimStore.resources.limits.memory",
-            "mainlineDeployer.rolloutJob.cpuRequest",
-            "mainlineDeployer.rolloutJob.cpuLimit",
-            "mainlineDeployer.rolloutJob.memoryRequest",
-            "mainlineDeployer.rolloutJob.memoryLimit",
-            "sandboxExecutor.resources.requests.cpu",
-            "sandboxExecutor.resources.requests.memory",
-            "sandboxExecutor.resources.limits.cpu",
-            "sandboxExecutor.resources.limits.memory",
-            "securityGateway.resources.requests.cpu",
-            "securityGateway.resources.requests.memory",
-            "securityGateway.resources.limits.cpu",
-            "securityGateway.resources.limits.memory",
-            "webSearch.resources.requests.cpu",
-            "webSearch.resources.requests.memory",
-            "webSearch.resources.limits.cpu",
-            "webSearch.resources.limits.memory",
-            "webFetch.resources.requests.cpu",
-            "webFetch.resources.requests.memory",
-            "webFetch.resources.limits.cpu",
-            "webFetch.resources.limits.memory",
-            ],
-        ),
-        (
-            // The volume declarations: the capacity loop reads each claim's used
-            // bytes (walked from inside the process for the claims we mount,
-            // read from the claim-store walker for the backends nothing of ours
-            // runs in), keeps the peak and raises the declaration to peak x
-            // 120%. A PVC cannot shrink, so the loop only ever moves these up.
-            // `webFetch.shmSize` is the tmpfs the same size law patches from the
-            // renderer's measured memory. The per-user workspace cap is gone
-            // from the chart: the gateway owns that bound.
-            "B2",
-            &[
-                "backends.meilisearch.storage",
-                "backends.nats.storage",
-                "backends.postgres.storage",
-                "backends.qdrant.storage",
-                "backends.redis.storage",
-                "backends.seaweedfs.storage",
-                "backup.storage",
-                "clusterRegistry.storage",
-                "evolution.dataStorage",
-                "evolution.gitRemote.storage",
-                "evolution.sandboxStorage",
-                "evolution.sourceStorage",
-                "sandboxExecutor.storage",
-                "securityGateway.gitMirror.storage",
-                "webFetch.shmSize",
-                "workspace.maxBytes",
-            ],
-        ),
-        (
-            // Beats, deadlines, cooldowns and retries. Fourteen of them are the
-            // cadence of a loop that outlives its passes: each pass measures
-            // itself and the next beat is that measurement against the seed,
-            // published with an evaluation count. The rest are not durations of
-            // anything this tree runs -- Job controller windows and retry
-            // policy, git's own transport liveness thresholds inside one-shot
-            // init containers, kubelet's grace field, nginx's edge timeout, the
-            // scrape cadence of a shell poller, and the ledger's bookkeeping
-            // horizon -- so they are `fixed` and say which agreement they are.
-            "B3",
-            &[
-                "backends.redis.infoExporter.intervalSeconds",
-                "backends.redis.infoExporter.walScanIntervalSeconds",
-                "backup.runDeadlineSeconds",
-                "backup.startingDeadlineSeconds",
-                "backup.backoffLimit",
-                "backup.drillBackoffLimit",
-                "evolution.pollIntervalSecs",
-                "evolution.buildGate.waitSecs",
-                "evolution.workspaces.cacheScanIntervalSecs",
-                "claimStore.scanIntervalSecs",
-                "claimStore.imageScanIntervalSecs",
-                "mainlineDeployer.failureCooldownSecs",
-                "mainlineDeployer.observabilityStack.intervalSecs",
-                "mainlineDeployer.pollIntervalSecs",
-                "mainlineDeployer.registryMaintenance.cooldownSecs",
-                "mainlineDeployer.rolloutTimeoutSecs",
-                "mainlineDeployer.soakSecs",
-                "mainlineDeployer.startupTimeoutSecs",
-                "securityGateway.gitMirror.stallSecs",
-                "securityGateway.gitMirror.timeoutSecs",
-                "workspaceFetch.connectTimeoutSecs",
-                "workspaceFetch.lowSpeedLimitBytesPerSec",
-                "workspaceFetch.lowSpeedSecs",
-                "shutdown.drainBudgetMs",
-                "shutdown.terminationGraceSeconds",
-                "ingress.proxyTimeoutSecs",
-            ],
-        ),
-        (
-            // Retention and row counts. Each table's bound is the declared
-            // volume divided by what a row or a package actually costs, measured
-            // by the sweep that enforces it; the two workspace TTLs follow the
-            // arrival rate against the volume's free bytes; the approval window
-            // follows the slowest observed approval. The two backup Job history
-            // limits are `fixed`: no process reads a past Job, so the count is
-            // an inspection agreement rather than a measurement.
-            "B4",
-            &[
-                // Deleted in B0 (the Job TTL is the package retention count);
-                // listed so the group stays a closed statement of what B4 owns.
-                "backup.ttlSecondsAfterFinished",
-                "backup.keepCount",
-                "backup.successfulJobsHistoryLimit",
-                "backup.failedJobsHistoryLimit",
-                "evolution.workspaces.ephemeralTtlSecs",
-                "evolution.workspaces.orphanBranchTtlSecs",
-                "hostDocuments.approvalTtlSecs",
-                "mainlineDeployer.registryMaintenance.retention",
-                "observability.eventLog.maxRows",
-                "observability.eventLog.readWindowSeconds",
-                "checkpointStore.maxRows",
-                "llmExchangeRetention.keepDays",
-                "taskEventRetention.keepDays",
-                "llmUsageRetention.keepDays",
-            ],
-        ),
-        (
-            // Capacity dials that were hand-pinned while nothing measured them:
-            // replicas follow the ready-node count, the build gate follows the
-            // dimension it measured last, the registry wave follows the time the
-            // last wave took, the workspace cache follows the tree it kept, the
-            // startup budget follows the longest measured start, the claim slot
-            // bound follows the pool's own price, the hand-over batch follows
-            // what the generator wrote whole, and the model station's two
-            // numbers follow the largest question the audited channel answered.
-            // The LimitRange defaults are the same size law on the namespace's
-            // typical container; its three floors are the cheap ones' grids
-            // (`fixed`). `maxNamedResources` is gone: the stack derives its own
-            // named-resource ceiling, so a chart number for it was a second
-            // answer to the same question.
-            "B5",
-            &[
-                "changeLedger.rowsPerHandover",
-                "changeVerification.cargoBuildJobs",
-                "gateway.replicas",
-                "healthProbes.appStartup.failureThreshold",
-                "healthProbes.claimStoreStartup.failureThreshold",
-                "hostDocuments.assistBodyBytes",
-                "hostDocuments.assistMaxCandidates",
-                "mainlineDeployer.cargoBuildJobs",
-                "mainlineDeployer.observabilityStack.maxNamedResources",
-                "mainlineDeployer.registryMaintenance.threshold",
-                "resourceGovernance.limitRange.defaultCpu",
-                "resourceGovernance.limitRange.defaultMemory",
-                "resourceGovernance.limitRange.defaultRequestCpu",
-                "resourceGovernance.limitRange.defaultRequestMemory",
-                "resourceGovernance.limitRange.minCpu",
-                "resourceGovernance.limitRange.minMemory",
-                "resourceGovernance.limitRange.pvcMinStorage",
-                "sandboxExecutor.maxTaskWorkspaces",
-                "sandboxExecutor.warmTrees",
-                "securityGateway.replicas",
-                "taskRouter.claimConcurrency",
-            ],
-        ),
-        (
-            // The last two hand-written governance inputs, both now measured or
-            // declared by the party that actually owns them. The node count is
-            // read by the projector from the live cluster at render time and
-            // recorded in the generated header; an offline render must pass the
-            // topology rather than let it guess. The rerun pod's shape is
-            // derived by the host script from the live deployment's own
-            // container resources, and the quota is raised by exactly that
-            // shape before the pod exists. All five keys are deleted from the
-            // chart, so they must stay absent instead of reappearing as pins.
-            "B6",
-            &[
-                "resourceGovernance.clusterNodes",
-                "resourceGovernance.runtimeWorkloads.0.cpuLimit",
-                "resourceGovernance.runtimeWorkloads.0.cpuRequest",
-                "resourceGovernance.runtimeWorkloads.0.memoryLimit",
-                "resourceGovernance.runtimeWorkloads.0.memoryRequest",
-            ],
-        ),
-    ];
-
-    let registry = registry();
-    let mut wrong = Vec::new();
-    for (batch, keys) in LANDED_GROUPS {
-        for key in *keys {
-            if let Some(row) = registry.rows.iter().find(|r| r.key == *key) {
-                if row.source == Source::Override {
-                    wrong.push(format!(
-                        "{batch}: `{key}` is back to `override` -- a landed group \
-                         may only be `derived` or `fixed`, or be gone"
-                    ));
-                }
-            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
