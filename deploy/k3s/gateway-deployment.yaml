@@ -34,7 +34,7 @@ spec:
       annotations:
         # 本 Pod 经 envFrom 取 cogneva-config。env 只在进程启动时读一次，所以
         # 只改配置的那次升级必须换掉这个模板，否则改完地址也不会生效。
-        checksum/config: 56a0dfc65d4b6fb5260ee3330a95161c1ff2cc9886b75510adccdf0d1a7147c6
+        checksum/config: 433905f7b94e73978a357852d60948fe2ac479282e0dd5e10f426186050a3057
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
@@ -85,15 +85,6 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets-oob
                   key: llm-upstreams
-                  optional: true
-            # 面板推送的 Grafana 管理员口令：与上面几条同一条带外路子，凭证不进
-            # 清单也不进 values。缺省即不推送：Grafana 的匿名只读仍在，但推送要
-            # 管理员身份，没有口令就是没有面板，而不是推一半。
-            - name: COGNEVA_GRAFANA_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets-oob
-                  key: grafana-admin-password
                   optional: true
             # 声明的冗余下限（llm-config 里随上游池一起声明的一个整数，空 = 没
             # 声明）。网关拿它当池判定的界：当刻能承接的上游数低于它就按"池不可用"

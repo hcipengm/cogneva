@@ -45,7 +45,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: 56a0dfc65d4b6fb5260ee3330a95161c1ff2cc9886b75510adccdf0d1a7147c6
+        checksum/config: 433905f7b94e73978a357852d60948fe2ac479282e0dd5e10f426186050a3057
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -138,6 +138,16 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: admin-password
+                  optional: true
+            # 面板推送的 Grafana 管理员口令：内部平台凭证，与上面几条同一类
+            # （APP/REDIS/ADMIN 三条也是这条路由）。它不进清单也不进 values，只从
+            # 带外 Secret 挂进来。缺省即不推送——Grafana 的匿名只读仍在，但推送
+            # 要管理员身份，没有口令就是没有面板，而不是推一半。
+            - name: COGNEVA_GRAFANA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets-oob
+                  key: grafana-admin-password
                   optional: true
             # 本部署的名字：样本日志的容量与容量判定是**每个部署自己的声明**，
             # 而它们落在共用表里。不署名时读到的是「最后写的那家」——置 0（不清理）
