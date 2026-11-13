@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use cog_core::contract::metric_help::metric_description;
 use cog_core::metric_names::{MetricName, ALL};
 use cog_core::storage::MetricType;
+use tracing::{info, warn};
 
 use crate::readings::{ReadingSpec, READINGS};
 
@@ -220,6 +221,206 @@ pub fn panels_from_registry() -> Vec<Board> {
     boards.into_values().collect()
 }
 
+/// Where the boards are sent, and what proves they arrived.
+///
+/// Read from the environment rather than from the config file because the
+/// address is a deployment fact (which Grafana this release talks to) and the
+/// password is a credential, which never lives in a config file: it is a
+/// Secret key mounted as an env var, the same path the alert mailer's SMTP
+/// password takes.
+///
+/// Nothing declared is a refusal, not a default. A guessed in-cluster address
+/// fails in the shape this face cannot show: a pushed dashboard and a push
+/// nobody made both look like "no new panels", so a guess that moved with the
+/// release would read exactly like a quiet week.
+pub struct GrafanaEndpoint {
+    /// No trailing slash: every URL below is joined onto it.
+    pub base: String,
+    password: String,
+}
+
+/// The password never reaches a log line or a panic message.
+///
+/// Derived `Debug` would print it into whatever formats the endpoint — an
+/// error path, a `dbg!`, a failing assertion in a future test. There is no
+/// useful debugging value in the bytes and no way to un-print them.
+impl std::fmt::Debug for GrafanaEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrafanaEndpoint")
+            .field("base", &self.base)
+            .field("password", &"[redacted]")
+            .finish()
+    }
+}
+
+impl GrafanaEndpoint {
+    /// The endpoint as the deployment declares it, or why there is none.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_parts(
+            std::env::var("COGNEVA_GRAFANA_URL").ok().as_deref(),
+            std::env::var("COGNEVA_GRAFANA_PASSWORD").ok().as_deref(),
+        )
+    }
+
+    /// [`from_env`] with the declarations handed in, so the rule about what
+    /// counts as declared can be read without an environment to set.
+    fn from_parts(url: Option<&str>, password: Option<&str>) -> Result<Self, String> {
+        let base = url
+            .map(str::trim)
+            .map(|s| s.trim_end_matches('/'))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "没有声明 Grafana 地址（COGNEVA_GRAFANA_URL）：面板生成器不猜集群内的地址，\
+                 猜错与「导出器没跑」在读数面上同形"
+                    .to_string()
+            })?;
+        let password = password
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "没有声明 Grafana 口令（COGNEVA_GRAFANA_PASSWORD）：推送要管理员身份，\
+                 匿名只读推不上去；这个值只从 Secret 挂进来"
+                    .to_string()
+            })?;
+        Ok(Self {
+            base: base.to_string(),
+            password: password.to_string(),
+        })
+    }
+}
+
+/// The body Grafana's dashboard API takes, for one board.
+///
+/// JSON because that is the protocol — the same exception the storage rule
+/// makes for query languages: the boundary speaks JSON, and nothing in this
+/// tree keeps a copy of what it said.
+///
+/// Layout is computed, not chosen: panels fill a 24-column grid three at a
+/// time, in registry order. The point of a stable layout is that a reader who
+/// has learned where to look keeps finding it there after a release.
+pub fn dashboard_body(board: &Board) -> serde_json::Value {
+    let panels: Vec<serde_json::Value> = board
+        .panels
+        .iter()
+        .enumerate()
+        .map(|(i, panel)| {
+            let per_row = 3;
+            let width = 24 / per_row;
+            serde_json::json!({
+                "id": i,
+                "type": if panel.stat { "stat" } else { "timeseries" },
+                "title": panel.title,
+                "gridPos": {
+                    "h": if panel.stat { 6 } else { 8 },
+                    "w": width,
+                    "x": (i % per_row) * width,
+                    "y": (i / per_row) * 8,
+                },
+                "fieldConfig": { "defaults": { "unit": panel.unit }, "overrides": [] },
+                "targets": [{ "refId": "A", "expr": panel.expr, "legendFormat": "__auto" }],
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "uid": board.uid,
+        "title": board.title,
+        "schemaVersion": 39,
+        "refresh": "30s",
+        "time": { "from": "now-6h", "to": "now" },
+        "panels": panels,
+    })
+}
+
+/// How long the first retry waits after a push fails.
+// cap: fixed — 重试的代价与等待的代价同向：推出去了就停，推不出去下一轮再来；
+// 这个数只决定 Grafana 比网关晚起来时面板晚出现多久，没有两侧代价不对称的最优点
+const PUSH_RETRY_SECONDS: u64 = 30;
+
+/// The longest a retry waits, so a Grafana that stays away does not turn into
+/// one attempt per hour that nobody is watching for.
+// cap: fixed — 与上一个同一条理由的另一端；它只是把退避封顶，不是界
+const PUSH_RETRY_CEILING_SECONDS: u64 = 300;
+
+/// Keep pushing until the boards land once.
+///
+/// Once, not periodically: the model is computed from constants compiled into
+/// this binary, so it cannot change while the process runs — a periodic
+/// re-push would be the same bytes at an interval nobody chose. What can
+/// change is whether Grafana is up, which is why a failed push retries with
+/// backoff instead of giving up.
+///
+/// A dashboard that fails to appear is not a decision anybody can make from a
+/// log line alone, so the first failure and the recovery are both logged with
+/// the reason the API gave.
+pub async fn keep_pushing(endpoint: GrafanaEndpoint) {
+    let boards = panels_from_registry();
+    let client = match reqwest::Client::builder()
+        // cap: fixed — 一次推送要么很快回来要么算失败：卡住的推送挡住的是下一次
+        // 推送，而面板晚一分钟出现不影响任何判词
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            warn!("grafana dashboard export off: the HTTP client could not be built: {e}");
+            return;
+        }
+    };
+    let mut wait = PUSH_RETRY_SECONDS;
+    loop {
+        match push_once(&client, &endpoint, &boards).await {
+            Ok(pushed) => {
+                info!(boards = pushed, "grafana dashboards pushed");
+                return;
+            }
+            Err(why) => warn!(%why, retry_in_seconds = wait, "grafana dashboards not pushed"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        wait = (wait * 2).min(PUSH_RETRY_CEILING_SECONDS);
+    }
+}
+
+/// Push every board, and say how many landed.
+///
+/// `POST /api/dashboards/db` with `overwrite` is the API's upsert: the uid is
+/// the identity, so a re-push replaces a board rather than accumulating copies
+/// beside it. A failure names the board it was on, because "the export failed"
+/// with a hundred boards is not a fact anybody can act on.
+pub async fn push_once(
+    client: &reqwest::Client,
+    endpoint: &GrafanaEndpoint,
+    boards: &[Board],
+) -> Result<usize, String> {
+    let url = format!("{}/api/dashboards/db", endpoint.base);
+    let mut pushed = 0;
+    for board in boards {
+        let body = serde_json::json!({
+            "dashboard": dashboard_body(board),
+            "overwrite": true,
+            "message": "written by the gateway from the metric and reading registries",
+        });
+        let response = client
+            .post(&url)
+            .basic_auth("admin", Some(endpoint.password.as_str()))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("推送 {} 失败：{e}", board.uid))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "推送 {} 被 Grafana 拒绝（{status}）：{}",
+                board.uid,
+                text.trim()
+            ));
+        }
+        pushed += 1;
+    }
+    Ok(pushed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +571,85 @@ mod tests {
         // separator: `split` on an empty string yields one empty part, and
         // that part is skipped.
         assert_eq!(board_uid_for_series(""), "cogneva-misc");
+    }
+
+    /// An undeclared address or password is a refusal with a reason, not a
+    /// guess at an in-cluster default.
+    ///
+    /// A guessed address fails silently in the one direction this surface
+    /// cannot show: a dashboard that was never pushed and a Grafana that is
+    /// simply quiet produce the same absence.
+    #[test]
+    fn an_undeclared_endpoint_says_what_is_missing() {
+        let no_url = GrafanaEndpoint::from_parts(None, Some("pw")).unwrap_err();
+        assert!(no_url.contains("COGNEVA_GRAFANA_URL"), "{no_url}");
+        let blank_url = GrafanaEndpoint::from_parts(Some("   "), Some("pw")).unwrap_err();
+        assert!(blank_url.contains("COGNEVA_GRAFANA_URL"), "{blank_url}");
+        let no_password = GrafanaEndpoint::from_parts(Some("http://g"), None).unwrap_err();
+        assert!(
+            no_password.contains("COGNEVA_GRAFANA_PASSWORD"),
+            "{no_password}"
+        );
+    }
+
+    /// A declared address loses its trailing slash, so joining a path onto it
+    /// never produces `//api`.
+    #[test]
+    fn a_declared_address_is_normalised() {
+        let endpoint = GrafanaEndpoint::from_parts(Some(" http://g:3000/ "), Some("pw")).unwrap();
+        assert_eq!(endpoint.base, "http://g:3000");
+    }
+
+    /// The endpoint's `Debug` says the password is there, not what it is.
+    #[test]
+    fn the_password_does_not_reach_the_debug_form() {
+        let endpoint =
+            GrafanaEndpoint::from_parts(Some("http://g"), Some("s3cret")).expect("declared");
+        let printed = format!("{endpoint:?}");
+        assert!(!printed.contains("s3cret"), "{printed}");
+        assert!(printed.contains("redacted"), "{printed}");
+    }
+
+    /// Every panel on a board reaches the body exactly once, with the uid the
+    /// board is addressed by.
+    ///
+    /// A body that drops a panel is a panel that exists in the generator and
+    /// nowhere a person looks — the failure this whole file replaces.
+    #[test]
+    fn a_dashboard_body_carries_every_panel_once() {
+        let boards = panels_from_registry();
+        let readings = boards
+            .iter()
+            .find(|b| b.uid == READINGS_BOARD_UID)
+            .expect("the readings board is there");
+        let body = dashboard_body(readings);
+        assert_eq!(body["uid"], READINGS_BOARD_UID);
+        let panels = body["panels"].as_array().expect("panels is an array");
+        assert_eq!(panels.len(), readings.panels.len());
+        for (i, panel) in panels.iter().enumerate() {
+            assert_eq!(panel["targets"][0]["expr"], readings.panels[i].expr);
+            assert_eq!(panel["title"], readings.panels[i].title);
+        }
+    }
+
+    /// A panel's unit reaches Grafana as Grafana's own id.
+    ///
+    /// The readings write `%`; Grafana's id for it is `percent`. Passing the
+    /// reading's spelling through draws a bare number with a stray symbol
+    /// beside it, which reads as a different quantity.
+    #[test]
+    fn a_panel_carries_the_unit_grafana_knows() {
+        let spec = crate::readings::DISK_FREE;
+        let panel = reading_panel(&spec);
+        assert_eq!(panel.unit, "percent");
+        let body = dashboard_body(&Board {
+            uid: "x".to_string(),
+            title: "x".to_string(),
+            panels: vec![panel],
+        });
+        assert_eq!(
+            body["panels"][0]["fieldConfig"]["defaults"]["unit"],
+            "percent"
+        );
     }
 }

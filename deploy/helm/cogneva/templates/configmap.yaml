@@ -82,6 +82,10 @@ data:
   # 同源——规则求值读的是 cogneva.json 的 infra_watch.prometheus_url，两者问的
   # 是同一台机器，各写一个地址就等于允许它们分开。
   COGNEVA_PROMETHEUS_URL: {{ .Values.observability.infraWatch.prometheusUrl | quote }}
+  # 面板生成器把算出来的面板推给这一台。空值＝这个部署没有 Grafana，导出器不
+  # 启动：面板从注册表算出来，没有 Grafana 就没有投递面，猜一个集群内的地址只会
+  # 让「推不上去」和「本来就没有面板」在读数面上同形。
+  COGNEVA_GRAFANA_URL: {{ .Values.observability.grafana.baseUrl | quote }}
   # 集群内 registry 的两条访问端点：Pod 内 buildah 用 Service DNS，节点上 kubelet
   # 用 localhost:NodePort。两者都是 `clusterRegistry.port` / `nodePort` 的投影，
   # 放在共用 env 里而不是只给进化 Pod：晋级镜像的引用由主应用的拉取端产出，它同样

@@ -442,6 +442,13 @@ observability:
   loki:
     enabled: true
     endpoint: "http://loki.monitoring.svc.cluster.local:3100"
+  # 图形面：面板由网关从指标闭集与读数注册表算出来，运行期推给这一台。
+  # 留空＝这个部署没有 Grafana，导出器不启动——面板是投影，没有投递面就是没有，
+  # 猜一个集群内地址只会把「推不上去」和「本来就没有面板」画成同一个样子。
+  # 管理员口令不在这里：它是凭证，只从 cogneva-secrets-oob 的 grafana-admin-password
+  # 挂进网关。
+  grafana:
+    baseUrl: ""
   clickhouse:
     enabled: true
     baseUrl: "http://clickhouse.monitoring.svc.cluster.local:8123"

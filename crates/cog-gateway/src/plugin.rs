@@ -379,6 +379,17 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                 );
             });
         }
+        // 面板是两张注册表的投影：启动时算一遍推给 Grafana，推不上去就退避重试。
+        // 没声明地址或口令＝这个部署没有 Grafana，导出器不启动——不猜集群内的
+        // 地址，猜错与「导出器没跑」在读数面上同形。
+        match crate::grafana_export::GrafanaEndpoint::from_env() {
+            Ok(endpoint) => {
+                tokio::spawn(async move {
+                    crate::grafana_export::keep_pushing(endpoint).await;
+                });
+            }
+            Err(why) => info!("grafana dashboard export off: {why}"),
+        }
         let app = crate::create_router(state.clone());
         let http_port = ctx.config().gateway.http_port;
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));

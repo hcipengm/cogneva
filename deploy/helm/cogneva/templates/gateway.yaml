@@ -195,6 +195,15 @@ spec:
                   name: cogneva-secrets
                   key: smtp-password
                   optional: true
+            # 面板推送的 Grafana 管理员口令：凭证不进清单也不进 values，只认这个
+            # Secret 键。缺省即不推送——Grafana 对集群内的匿名只读仍在，但推送要
+            # 管理员身份，没有口令就没有面板，而不是推一半。
+            - name: COGNEVA_GRAFANA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets-oob
+                  key: grafana-admin-password
+                  optional: true
             # GitHub/Gitee API 与 git 传输走安全网关透传（凭证网关注入，本 Pod 零 token）。
             # 缺这三个 env 时 Provider 直连公网平台——集群仅网关在 egress 白名单内，直连必败。
             - name: COGNEVA_GITHUB_API_BASE

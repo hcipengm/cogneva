@@ -86,6 +86,15 @@ spec:
                   name: cogneva-secrets-oob
                   key: llm-upstreams
                   optional: true
+            # 面板推送的 Grafana 管理员口令：与上面几条同一条带外路子，凭证不进
+            # 清单也不进 values。缺省即不推送：Grafana 的匿名只读仍在，但推送要
+            # 管理员身份，没有口令就是没有面板，而不是推一半。
+            - name: COGNEVA_GRAFANA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets-oob
+                  key: grafana-admin-password
+                  optional: true
             # 声明的冗余下限（llm-config 里随上游池一起声明的一个整数，空 = 没
             # 声明）。网关拿它当池判定的界：当刻能承接的上游数低于它就按"池不可用"
             # 判。与上游池同一个 Secret、同一次写入——声明池里有哪几家与声明池要
