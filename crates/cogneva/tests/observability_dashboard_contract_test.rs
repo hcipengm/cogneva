@@ -1121,6 +1121,20 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["workload", "volume", "source"],
         "crates/cog-reflection/src/workload_resources.rs",
     ),
+    // The shared pacing surface: every loop whose cadence follows its own last
+    // pass publishes the target it is running at and how many times it has been
+    // evaluated. The evaluation counter is the half of the proof a scrape can
+    // see -- a target that did not move is still a beat that ran.
+    (
+        "cogneva_pacing_target_seconds",
+        &["pacing", "source"],
+        "crates/cog-core/src/pacing.rs",
+    ),
+    (
+        "cogneva_pacing_evaluations_total",
+        &["pacing"],
+        "crates/cog-core/src/pacing.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

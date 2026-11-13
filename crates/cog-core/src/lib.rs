@@ -19,6 +19,7 @@ pub mod git_budget;
 pub mod host;
 pub mod loop_health;
 pub mod observability_text;
+pub mod pacing;
 pub mod paths;
 pub mod progress;
 pub mod reading_cadence;

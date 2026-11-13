@@ -26,6 +26,11 @@ pub const PROMOTION_EVAL_SWEEP_LOOP: &str = "reflection_promotion_eval_sweep";
 pub const PROMOTION_EVAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 /// Loop name reported through the background-loop liveness family.
 pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
+
+/// The tunable this process's build-cache scan cadence belongs to. It is also
+/// the name the loop's pacing reading carries, so a reader can look up the
+/// registry row from the series without a second mapping table.
+pub const CACHE_SCAN_PACING: &str = "evolution.workspaces.cacheScanIntervalSecs";
 /// Loop name reported through the background-loop liveness family.
 ///
 /// 「发现」这个词在本仓还有另一个意思：`cog-github` 的 `discovery_enabled`
@@ -35,6 +40,9 @@ pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
 /// 这条环的属主由 `self_evolution.executor_enabled` 决定，而那个开关管的是
 /// 「谁执行变更」，两者本来是两件事（见 `SELF_DISCOVERY_ROLE`）。
 pub const DISCOVERY_LOOP: &str = "reflection_discovery";
+
+/// 发现循环的节拍读数落在登记表的哪一行。
+pub(crate) const DISCOVERY_POLL_PACING: &str = "evolution.pollIntervalSecs";
 
 /// 这条环在属主仲裁里领的角色名。
 ///
@@ -145,6 +153,9 @@ pub struct ReflectionPlugin {
     /// 进程会起循环，别的进程上这一族序列不存在，读作「没人在看这张卷」，
     /// 与「看了、够用」是两件事。
     volume_capacity: Arc<crate::volume_capacity::VolumeCapacityReadings>,
+    /// 按实测定节拍的回路共用的读数面：目标间隔与求值计数。无条件建——没起的
+    /// 回路在这里是「没有这条序列」，而不是一个看起来在跑的种子值。
+    pacing: Arc<cog_core::pacing::PacingReadings>,
     /// 容器资源请求/上限跟着实测用量走那条闭环的读数。同样无条件建：
     /// 只有跑构建那个进程会起循环，别处读到「没人在量」正是事实。
     workload_resources: Arc<crate::workload_resources::WorkloadResourcesReadings>,
@@ -174,6 +185,7 @@ impl ReflectionPlugin {
             workload_resources: Arc::new(
                 crate::workload_resources::WorkloadResourcesReadings::new(),
             ),
+            pacing: Arc::new(cog_core::pacing::PacingReadings::new()),
         }
     }
 }
@@ -987,6 +999,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // 由跑构建那个进程在 start() 起循环；别处读到的是「没人量」。
                 ctx.publish_observable(self.workload_resources.clone());
 
+                // 按实测定节拍的回路的读数面。发布无条件：没有回路在这格上
+                // 报出自己的名字，正是「这一条没人在跑」。
+                ctx.publish_observable(self.pacing.clone());
+
                 // 自动晋级运行时一键暂停开关：admin API 与 AutoPromoter
                 // 共享同一实例，暂停立即对排队晋级生效。
                 let promotion_switch = Arc::new(crate::PromotionSwitch::new());
@@ -1616,9 +1632,21 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         shutdown.trigger();
                     });
                 }
+                // The scan cadence is a loop of its own: a pass is timed, and
+                // the wait before the next one follows what it cost. The
+                // declared interval is the floor here, not just the seed --
+                // walking this tree more often than the deployment asked buys
+                // nothing, so a measurement may only lengthen the wait, never
+                // shorten it below the declaration.
+                let scan_pacing = std::sync::Arc::new(cog_core::pacing::PacingReadings::new());
+                let seed = std::time::Duration::from_secs(readings.scan_interval_secs());
+                let scan_pacer =
+                    std::sync::Arc::new(scan_pacing.pacer(CACHE_SCAN_PACING, seed, seed, 20.0));
+                ctx.publish_observable(scan_pacing);
                 drop(crate::build_cache_readings::spawn_build_cache_watch(
                     readings.clone(),
                     shutdown,
+                    Some(scan_pacer),
                 ));
             }
             None => info!(
@@ -1869,6 +1897,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     period,
                     self.pool_gate.clone(),
                     self.discovery_outcome_readings.clone(),
+                    Some(self.pacing.clone()),
                 );
                 spawn_skill_effectiveness_loop(engine, skill_registry, period, self.executor_role);
             }
@@ -1913,7 +1942,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces)
                     // 判定 Job 的下一轮尺寸进同一个读数面：同一条律、同一个
                     // source 标签，别让它单独长一套指标名。
-                    .with_workload_resources(self.workload_resources.clone());
+                    .with_workload_resources(self.workload_resources.clone())
+                    // 轮询节拍、启动/滚动/静置的申报界与两处冷却落进同一个读数面：
+                    // 一行一条序列，标签就是登记表的键。
+                    .with_pacing(self.pacing.clone());
                 let deployer = match self.governance_drift.clone() {
                     Some(drift) => deployer.with_governance_drift(drift),
                     // init publishes it under this same guard, so reaching here
@@ -1988,7 +2020,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     interval_secs = ml_config.observability_stack.interval_secs,
                     "observability stack convergence enabled"
                 );
-                tokio::spawn(stack.run(shutdown.clone()));
+                tokio::spawn(stack.run(shutdown.clone(), Some(self.pacing.clone())));
             } else {
                 info!("observability stack convergence disabled by config");
             }
@@ -2002,7 +2034,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     shutdown.clone(),
                 ));
             }
-            tokio::spawn(crate::run_mainline_loop(deployer, shutdown));
+            tokio::spawn(crate::run_mainline_loop(
+                deployer,
+                shutdown,
+                Some(self.pacing.clone()),
+            ));
         } else {
             info!("mainline deployer disabled by config");
         }
@@ -2641,6 +2677,7 @@ fn spawn_discovery_loop(
     period: std::time::Duration,
     pool_gate: Arc<PoolGate>,
     readings: Arc<DiscoveryOutcomeReadings>,
+    pacing: Option<Arc<cog_core::pacing::PacingReadings>>,
 ) {
     // 三样在不在**先问一遍**再解构：`let … else` 的初始化式会把两个 Option 移进那个
     // 元组，else 那一支里就再也问不出它们了（这一句不是风格，是借用检查器的要求）。
@@ -2668,6 +2705,9 @@ fn spawn_discovery_loop(
         period_secs = period.as_secs(),
         "autonomous discovery loop enabled"
     );
+    // 节拍读数与登记行同名。地板是周期：发现跑的是同一批工具与技能，快于配置
+    // 的节拍只会多花 token，没有理由。
+    let pacer = pacing.map(|pacing| pacing.pacer(DISCOVERY_POLL_PACING, period, period, 1.0));
     // 部署有没有发布仲裁者——**与「角色持有」必须同一句印**：`may_act()` 在
     // `lease: None` 时早退返回真，既不调 `try_hold()` 也不在 beat 上记任何东西
     // （`cog-core/src/contract/owner_lease.rs:201-204`），于是「没仲裁者」与
@@ -2702,6 +2742,7 @@ fn spawn_discovery_loop(
             let role_broker = role_broker.clone();
             let shutdown = shutdown.clone();
             let role_beat = beat.clone();
+            let pacer = pacer.clone();
             async move {
                 // 角色不是一个「领了就一直攥在手里」的东西：**池闸关着的那几轮要松手**。
                 //
@@ -2716,7 +2757,8 @@ fn spawn_discovery_loop(
                 // 要过」在租约面上同形，而**到期**是这件事唯一自带时刻的证据。池一恢复，
                 // 下一轮 `RoleHold::start` 就把空着的角色领回来。
                 let mut held: Option<cog_core::RoleHold> = None;
-                let mut interval = tokio::time::interval(period);
+                // 下一拍等多久。首拍不等：一轮发现本该在启动后立刻发生。
+                let mut wait = std::time::Duration::ZERO;
                 // 交出去、结局还没回来的探针。**跨轮**留着，所以声明在 `loop` 外面：
                 // 受理与跑完之间隔着编排器那一整条路，同一拍里收不回来。
                 let mut pending: Vec<PendingProbe> = Vec::new();
@@ -2725,7 +2767,13 @@ fn spawn_discovery_loop(
                 let mut held_rounds: u64 = 0;
                 loop {
                     beat.beat();
-                    interval.tick().await;
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    let started = std::time::Instant::now();
+                    'round: {
 
                     // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
                     // 不是「这一轮没事发生」。松手也在这里——见上。
@@ -2758,7 +2806,7 @@ fn spawn_discovery_loop(
                             period_secs = period.as_secs(),
                             "discovery round held off: the LLM pool gate is closed"
                         );
-                        continue;
+                        break 'round;
                     }
 
                     // 池开着：这一轮手里必须有角色。没有就现领一个（`RoleHold` 自带按契约
@@ -2790,7 +2838,7 @@ fn spawn_discovery_loop(
                             held_rounds,
                             "discovery round skipped: another process holds the self-discovery role"
                         );
-                        continue;
+                        break 'round;
                     }
 
                     // 恢复后的**第一个真跑轮**把计数写回 0 并印一次：状态类读数必须由
@@ -2887,14 +2935,14 @@ fn spawn_discovery_loop(
                             round_width = max_tasks,
                             "discovery round deferred: earlier probes are still unanswered"
                         );
-                        continue;
+                        break 'round;
                     }
                     if round.generated == 0 {
                         debug!(
                             tools = tool_names.len(),
                             "discovery round: every combination in reach has been tried"
                         );
-                        continue;
+                        break 'round;
                     }
 
                     info!(
@@ -2905,10 +2953,29 @@ fn spawn_discovery_loop(
                         deferred = round.deferred,
                         "autonomous discovery round"
                     );
+                    }
+                    let pass = started.elapsed();
+                    wait = discovery_wait(pacer.as_ref(), period, pass);
                 }
             }
         },
     ));
+}
+
+/// 一轮发现之后下一拍等多久。
+///
+/// 目标周期是这一轮实测与种子的较大者（被地板托住），等待是它减去这一轮用掉的
+/// 时间：一轮交出几条探针、收几条结局，比节拍久是常态，那一轮不该再叠一个节拍。
+fn discovery_wait(
+    pacer: Option<&cog_core::pacing::Pacer>,
+    period: std::time::Duration,
+    pass: std::time::Duration,
+) -> std::time::Duration {
+    let target = match pacer {
+        Some(pacer) => pacer.beat(Some(pass)),
+        None => period,
+    };
+    target.saturating_sub(pass)
 }
 
 /// 移植工作分支 `evol/<id>` 的实例 id 解析：显式 env 覆盖最优先，其次
@@ -4746,6 +4813,40 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 发现循环的等待由上一轮实测决定：同一段代码换一次耗时，下一拍就换一个数，
+    /// 并且求值计数在走——回路在跑，不是一次启动时算出来的常量。
+    #[test]
+    fn the_discovery_wait_follows_what_a_round_cost() {
+        let readings = std::sync::Arc::new(cog_core::pacing::PacingReadings::new());
+        let pacer = readings.pacer(
+            DISCOVERY_POLL_PACING,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(300),
+            1.0,
+        );
+        assert_eq!(
+            discovery_wait(
+                Some(&pacer),
+                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(30)
+            ),
+            std::time::Duration::from_secs(270)
+        );
+        // 一轮跑了 700 秒：这一拍已经把节拍用光，等待为零，目标跟到 700。
+        assert_eq!(
+            discovery_wait(
+                Some(&pacer),
+                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(700)
+            ),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            readings.target(DISCOVERY_POLL_PACING),
+            Some((std::time::Duration::from_secs(700), 2, true))
+        );
+    }
 
     /// 探针 → 任务那一跳单独量：目标文本与 payload 里的 `goal` 必须是同一个值
     /// （两处分家时，执行侧读到的问句与提交时写下的目标就不是一回事），工具对

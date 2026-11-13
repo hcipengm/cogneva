@@ -10078,6 +10078,13 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
         Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
         Err(e) => tracing::warn!(error = %e, "project control readings unavailable this scrape"),
     }
+    // 传输时限的两条界会跟着实测自己走：静默判死窗和预期工期都不是钉住的数。
+    // 只在这里渲染它们，运维才分得出「界变宽了」和「这条回路停了」——后者的
+    // 形状恰好是求值计数不再增长。
+    match cog_core::Observable::collect_metrics(state.git_transport.pacing().as_ref(), "").await {
+        Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
+        Err(e) => tracing::warn!(error = %e, "git transport pacing readings unavailable this scrape"),
+    }
     // The volumes this pod writes are readable from nowhere else — the kubelet's
     // per-volume number for a directory-backed volume is the node's filesystem —
     // so a scrape of this process is the only place the deployment can find out

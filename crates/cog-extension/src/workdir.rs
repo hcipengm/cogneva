@@ -349,16 +349,22 @@ fn gc_interval_from(pass_millis: u64, configured: Duration) -> Duration {
 /// below a floor. A fixed period silently spends a growing share as the volume
 /// fills, which is the failure that looks like "the executor got slow" rather
 /// than "the executor is reclaiming".
+///
+/// The arithmetic is `cog_core::pacing`, the one copy every self-paced loop in
+/// the workspace uses; this wrapper only adapts milliseconds and a whole-number
+/// share to it.
 fn paced_interval(
     pass_millis: u64,
     configured: Duration,
     floor_secs: u64,
     multiple: u64,
 ) -> Duration {
-    if pass_millis == 0 {
-        return configured;
-    }
-    scaled(pass_millis, multiple).max(Duration::from_secs(floor_secs))
+    cog_core::pacing::paced_interval(
+        Duration::from_millis(pass_millis),
+        configured,
+        Duration::from_secs(floor_secs),
+        multiple as f64,
+    )
 }
 
 /// The period a pass of `pass_millis` buys at a given share, before any floor.

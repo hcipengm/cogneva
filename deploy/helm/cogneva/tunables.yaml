@@ -803,24 +803,26 @@ rows:
       file: crates/cog-reflection/src/workload_resources.rs
       test: a_request_follows_the_measured_draw
   - key: backends.redis.infoExporter.intervalSeconds
-    source: override
+    source: fixed
     why: >-
-      A scraped reading only has to be newer than the scrape interval to be a
-      reading at all: 30 s matches the PodMonitor's interval, so the poller is
-      never the reason two scrapes carry the same sample. The value is published
-      as cogneva_redis_info_interval_seconds, so the staleness rule derives its
-      bound from it instead of holding a second copy that can drift.
+      The scrape cadence agreement, not a measured size: a scraped reading only
+      has to be newer than the scrape interval to be a reading at all, and the
+      monitoring stack scrapes at 30 s. A faster poll returns the same INFO reply;
+      a slower one makes two consecutive scrapes carry the same sample. The value
+      is published as cogneva_redis_info_interval_seconds, so the staleness rule
+      derives its bound from it instead of holding a second copy that can drift.
   - key: backends.redis.infoExporter.walScanIntervalSeconds
-    source: override
+    source: fixed
     why: >-
-      The WAL census is a full keyspace walk with an LLEN per matching key,
-      which is the one reading here that costs the server work rather than a
-      reply it already has. Five minutes is far slower than the cap it watches:
-      the longest log moves by one append at a time, so the question "is the
-      cap holding" is answered at any cadence well under the time a log takes
-      to grow from the cap to twice it. The value is published as
-      cogneva_redis_wal_scan_interval_seconds, so a staleness rule reads the
-      cadence it was configured with instead of holding a second copy.
+      A cost agreement with the store it reads: the census is one full keyspace
+      walk with an LLEN per matching key, so it runs on its own slower clock
+      rather than with every INFO. Five minutes is far slower than the cap it
+      watches -- the longest log moves one append at a time -- so "is the cap
+      holding" is answered well before a log can grow from the cap to twice it.
+      The poller is a shell loop inside the redis image and dies with the Pod, so
+      no process survives to measure its own pass and feed it back; the value is
+      published as cogneva_redis_wal_scan_interval_seconds so a staleness rule
+      reads the configured cadence instead of a second copy of it.
   - key: backends.redis.infoExporter.resources.requests.cpu
     source: derived
     why: >-
@@ -988,21 +990,26 @@ rows:
       package against the volume; the volume usage is alerted on, not read back.
 
   - key: backup.runDeadlineSeconds
-    source: override
+    source: fixed
     why: >-
-      One hour against runs the ledger measures in tens of seconds. It stops
-      nothing: the container's liveness is judged by the progress probe, and
-      this number only sets the instant at which an open row in backup_runs is
-      concluded abandoned. The flow already records started_at/finished_at per
-      run, so a derived value could be a multiple of the observed run time;
-      nothing computes it.
+      A bookkeeping horizon, not a bound on anything: the container's liveness is
+      judged by its progress probe, and this number is written into the row it
+      opens so a row left open by a killed run can later be concluded abandoned.
+      Each row carries the number it was opened under, so a conclusion about
+      yesterday is judged by yesterday's agreement rather than by today's setting.
+      It is also an operand of the static 26-hour alert bound (schedule +
+      startingDeadlineSeconds + this allowance), computed from the chart at render
+      time; a value that moved at runtime would silently decouple those rules from
+      the runs they watch.
 
   - key: backup.startingDeadlineSeconds
-    source: override
+    source: fixed
     why: >-
-      How late a missed backup or drill run may still be started. A derived value
-      would follow the observed lateness of past runs; the CronJob controller does
-      not record why a run was missed, so there is no reading to close over.
+      The Job controller's missed-schedule window: how late a scheduled run may
+      still be started before the controller records a miss. It is the cluster's
+      own scheduling contract, and an operand of the same static 26-hour alert
+      bound as the schedule and the run deadline. The controller does not record
+      why a run was missed, so there is no observed lateness to close a loop over.
 
   - key: backup.successfulJobsHistoryLimit
     source: override
@@ -1017,16 +1024,22 @@ rows:
       can be compared. Nothing measures how often a failure is looked at.
 
   - key: backup.backoffLimit
-    source: override
+    source: fixed
     why: >-
-      One retry for the backup, none for the drill. A derived value would read how
-      often a retry succeeds; the ledger records outcomes, not retries.
+      The Job controller's retry contract for a daily run: one retry of the same
+      scheduled run, never a retry string that would push into the next day's
+      schedule. concurrencyPolicy: Forbid already makes a second run wait for the
+      first, and a retry is the same run repeating with the same inputs; the
+      ledger records outcomes, not attempts, so there is no retry rate to derive
+      it from.
 
   - key: backup.drillBackoffLimit
-    source: override
+    source: fixed
     why: >-
-      Zero: a failed drill has already written its answer to backup_drills, so a
-      retry produces no new information. Not a reading.
+      Zero: a failed drill has already written its answer to backup_drills, and
+      retrying the same package against the same inputs cannot change the verdict.
+      The controller contract is "attempt once"; there is nothing measured to move
+      it.
 
   - key: backup.storage
     source: derived
@@ -1499,11 +1512,22 @@ rows:
       resource. Not a reading.
 
   - key: evolution.pollIntervalSecs
-    source: override
+    source: derived
     why: >-
-      How often the self-evolution loop looks for new work. It would be derived
-      from the observed arrival interval of changes; nothing records that
-      interval today.
+      How often the self-evolution loop looks for new work. The beat is the larger
+      of the configured seed and the round that just ran: a round stacks probes
+      and waits for their outcomes, so the interval the loop actually keeps is its
+      own cost. The seed is the floor -- polling the same machinery faster than
+      the configured cadence only spends tokens. The pacer publishes its target
+      and evaluation count on the same scrape as the loop's other readings.
+    published:
+      owner: crates/cog-reflection/src/plugin.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/plugin.rs
+      test: the_discovery_wait_follows_what_a_round_cost
 
   - key: evolution.buildGate.maxConcurrent
     source: derived
@@ -1526,11 +1550,21 @@ rows:
       test: the_ceiling_is_the_tightest_dimension
 
   - key: evolution.buildGate.waitSecs
-    source: override
+    source: derived
     why: >-
-      How long one build waits for a slot. A derived wait would follow the
-      measured time a slot is held, which the gate could record on release; it
-      does not record hold times yet.
+      How long one build waits for a slot. The effective wait is the tail of the
+      waits that actually outlasted a poll, doubled and floored at two polls: a
+      gate that queues produces waits, not a number someone picked. A refused wait
+      is deliberately not fed back -- the caller's retry is what the gate is
+      protecting.
+    published:
+      owner: crates/cog-reflection/src/build_gate/mod.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/build_gate/mod.rs
+      test: the_wait_budget_follows_the_waits_that_actually_happened
 
   - key: evolution.dataStorage
     source: derived
@@ -1661,12 +1695,21 @@ rows:
       test: a_claim_target_follows_the_measured_used_bytes
 
   - key: evolution.workspaces.cacheScanIntervalSecs
-    source: override
+    source: derived
     why: >-
-      How often the shared cache's size is re-read. A derived interval would
-      follow the cost of one walk and the write rate between walks; neither is
-      measured back into it. The process has a floor, and a smaller value means
-      the floor.
+      How often the shared cache's size is re-read. The next wait follows what the
+      last walk cost, times a factor that keeps the walk the same proportion of
+      the period, floored at the declared value so scanning never becomes more
+      frequent than the seed. The loop publishes its cadence and evaluation count,
+      and declares PeriodicWithWork because a pass is not a fixed-duration beat.
+    published:
+      owner: crates/cog-reflection/src/plugin.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-core/src/build_cache_readings.rs
+      test: the_wait_between_passes_follows_what_the_last_pass_cost
 
   - key: evolution.workspaces.ephemeralTtlSecs
     source: override
@@ -2275,19 +2318,38 @@ rows:
       test: a_request_follows_the_measured_draw
 
   - key: claimStore.scanIntervalSecs
-    source: override
+    source: derived
     why: >-
-      The claim walk's cadence. Measured cost is about two seconds for the 200 GB
-      this host holds, which would support a faster cadence, but the reading it
-      feeds (a volume's fill level) moves on the scale of builds. claim_scan_stale
-      is three times this number, so the two are read together.
+      The claim walk's cadence. Each pass measures how long the walk took; the
+      next beat is that pass against the seed, floored at the seed because a walk
+      over the same disk should not run more often than declared, and the wait
+      hands back what the pass left of the beat. The pacer is published with the
+      walk's readings on the same scrape.
+    published:
+      owner: crates/cogneva/src/claim_store.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-observability/src/claim_store.rs
+      test: the_wait_after_a_walk_follows_what_the_walk_cost
 
   - key: claimStore.imageScanIntervalSecs
-    source: override
+    source: derived
     why: >-
       The image store walk's cadence, slower than the claim walk because the tree
-      is larger and changes on image pulls rather than on writes. image_store_scan_stale
-      is three times this number; the pair is changed together.
+      is larger and changes on image pulls. Same law: the beat is the larger of
+      the seed and the pass, so a walk that outlasts its seed sets the next
+      cadence instead of stacking a seed on top of it. Published beside the claim
+      walk's pacing on the same scrape.
+    published:
+      owner: crates/cogneva/src/claim_store.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-observability/src/image_store.rs
+      test: the_wait_after_a_walk_follows_what_the_walk_cost
 
   # --- mainline deployer ------------------------------------------------------
   - key: mainlineDeployer.cargoBuildJobs
@@ -2299,18 +2361,37 @@ rows:
       feeds the core count into this number.
 
   - key: mainlineDeployer.failureCooldownSecs
-    source: override
+    source: derived
     why: >-
       How long after a failed rollout the deployer waits before trying the same
-      revision again. A derived cooldown would follow the observed recovery time;
-      the deployer records outcomes but does not turn them into this number.
+      revision again. The number is the seed doubled once per consecutive
+      environment failure and returned to the seed when one converges; the count
+      is measured by the loop, and the published target plus its evaluation count
+      show the beat is recomputed each time, not fixed at start.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: a_second_environment_failure_stretches_the_cooldown
 
   - key: mainlineDeployer.observabilityStack.intervalSecs
-    source: override
+    source: derived
     why: >-
-      How often the manifests are re-applied. A derived interval would follow how
-      quickly the cluster is observed to drift; drift is detected per pass, not
-      measured as a rate.
+      How often the manifests are re-applied. The next wait is the beat minus what
+      the pass actually took, and the beat is the larger of the seed and the pass:
+      a converge pass that outlasts the seed sets the next cadence instead of
+      having a seed stacked on top of it.
+    published:
+      owner: crates/cog-reflection/src/observability_stack.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/observability_stack.rs
+      test: the_convergence_wait_follows_what_a_round_cost
 
   - key: mainlineDeployer.observabilityStack.maxNamedResources
     source: override
@@ -2320,19 +2401,37 @@ rows:
       tolerates; that is a judgement, not a reading.
 
   - key: mainlineDeployer.pollIntervalSecs
-    source: override
+    source: derived
     why: >-
-      How often the bare repository is polled for a new main. A derived interval
-      would follow the observed push rate of the repository, which the repo's own
-      timestamps could tell; nothing reads it.
+      How often the bare repository is polled for a new main. The beat is the
+      larger of the seed and the cycle that just ran: a cycle can include a build
+      and a rollout, so the wait is the remainder of the beat the cycle consumed
+      rather than the seed again.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: the_mainline_wait_follows_what_a_cycle_cost
 
   - key: mainlineDeployer.registryMaintenance.cooldownSecs
-    source: override
+    source: derived
     why: >-
       The wait between two reclamations, so a volume whose resident floor stays
-      above the threshold is not restarted every poll. A derived cooldown would
-      follow the observed cost of a registry restart; that duration is not
-      measured.
+      above the threshold is not restarted every poll. The cooldown follows how
+      long the last reclamation actually held the tag service away, doubled; a
+      zero-length hold is not a sample and leaves the target where it was. No
+      rebuild measured yet means the seed.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: the_reclaim_cooldown_follows_how_long_a_rebuild_held_the_service
 
   - key: mainlineDeployer.registryMaintenance.retention
     source: override
@@ -2426,25 +2525,52 @@ rows:
       test: the_rollout_jobs_sizing_lands_on_the_container_resource_surface
 
   - key: mainlineDeployer.rolloutTimeoutSecs
-    source: override
+    source: derived
     why: >-
-      How long a single deployment gets to converge after init finishes. A
-      derived value would follow the observed convergence time; rollout durations
-      are recorded as outcomes, not turned into the budget.
+      How long a single deployment gets to converge after init finishes. The
+      declared window is twice the rollout phase measured by the judging process
+      on the previous round, from the same rollout-resource reading that sizes the
+      Job; the loop records the durations each round, so the budget follows the
+      deployment it bounds.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: a_measured_wait_turns_the_next_rollouts_declared_window
 
   - key: mainlineDeployer.soakSecs
-    source: override
+    source: derived
     why: >-
-      How long a rolled-out version runs before it is called good. A derived soak
-      would follow how long a defect takes to show up in the outcomes; that is
-      not measured.
+      How long a rolled-out version runs before it is called good. Twice the
+      measured soak phase, floored at the protocol minimum for the host to
+      schedule it, recomputed from each round's reading.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: a_measured_wait_turns_the_next_rollouts_declared_window
 
   - key: mainlineDeployer.startupTimeoutSecs
-    source: override
+    source: derived
     why: >-
       The init-container phase's own budget: the seed is a network clone whose
-      duration follows the link to the upstream. A derived value would read the
-      measured clone time; the seed's duration is not published.
+      duration follows the link to the upstream. Twice the measured startup phase
+      from the previous round; the seed stands until one round has reported its
+      durations.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: a_measured_wait_turns_the_next_rollouts_declared_window
 
   # --- resource governance ----------------------------------------------------
   # The ceiling numbers are not chart values: they are projected from the rendered
@@ -2821,20 +2947,39 @@ rows:
       copies without availability. Load per replica is not measured to derive it.
 
   - key: securityGateway.gitMirror.stallSecs
-    source: override
+    source: derived
     why: >-
       How long the SSH fallback may produce no output before the transfer is
-      declared dead. The floor is 30 in code. A derived value would read the
-      observed inter-output gap; a full mirror clone was measured at about 97
-      seconds and that is what the defaults are ordered around, not what sets
-      them.
+      declared dead. The window starts at the seed, floored by a structural
+      minimum, and each successful transfer feeds its longest measured silence
+      back through a tail window: a link that talks in bursts widens the next
+      window, so a slow-but-alive clone is not killed. Published on the gateway's
+      metrics with its evaluation count.
+    published:
+      owner: crates/cog-gateway/src/git_mirror.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-gateway/src/git_mirror.rs
+      test: a_measured_silence_widens_the_window_the_next_transfer_is_judged_by
 
   - key: securityGateway.gitMirror.timeoutSecs
-    source: override
+    source: derived
     why: >-
       The total bound on one clone/fetch/push, for the case that keeps emitting
-      progress and never finishes. Derived from the measured 97-second clone by a
-      human; nothing re-measures and adjusts.
+      progress and never finishes. The expectation follows the measured total
+      duration of successful transfers (tail times factor) from the seed, so it
+      moves with the repository and the link instead of with a human reading of
+      one clone.
+    published:
+      owner: crates/cog-gateway/src/git_mirror.rs
+      file: crates/cog-core/src/pacing.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-gateway/src/git_mirror.rs
+      test: a_measured_silence_widens_the_window_the_next_transfer_is_judged_by
 
   - key: securityGateway.gitMirror.storage
     source: derived
@@ -2927,24 +3072,32 @@ rows:
 
   # --- workspace quota (WebUI file surface) ---
   - key: workspaceFetch.connectTimeoutSecs
-    source: override
+    source: fixed
     why: >-
-      How long git may wait for the mirror to answer at all, so an unreachable
-      mirror does not sit on a half-open connection. Nothing records the observed
-      connect latency, so no reading closes over it.
+      A property of git's transport protocol, not a size: how long the client
+      waits for the mirror to answer the connection at all. The fetch runs in a
+      one-shot init container that dies when it finishes, so no process survives
+      to measure connect latency and feed it back -- and the value is read at Pod
+      start, before any transfer has happened. Bound to git's own
+      http.connectTimeout, where the behaviour is defined.
 
   - key: workspaceFetch.lowSpeedLimitBytesPerSec
-    source: override
+    source: fixed
     why: >-
-      The throughput floor below which a transfer counts as dead. It would be
-      derived from measured mirror throughput; no reading of bytes per second is
-      recorded today.
+      The transport protocol's own definition of a dead transfer: git aborts when
+      throughput stays below this rate for lowSpeedSecs. The evolution and sandbox
+      init containers pass the same pair so one link cannot be held to a different
+      notion of "still moving". The bound is "is it moving", not "how long": a
+      slow but advancing fetch was measured at fourteen minutes and must not be
+      killed.
 
   - key: workspaceFetch.lowSpeedSecs
-    source: override
+    source: fixed
     why: >-
-      How long a transfer may stay under the floor before git gives up. Same
-      missing reading as the floor: nothing records sustained throughput.
+      The other half of the same protocol threshold: how long throughput may stay
+      under lowSpeedLimitBytesPerSec before git gives up. A liveness window, not a
+      duration budget for the transfer itself; shared by both init containers so
+      the same transfer is judged the same way on either path.
 
   # --- web search (SearXNG) ---------------------------------------------------
   - key: webSearch.replicas
@@ -3140,7 +3293,7 @@ rows:
 
   # --- shutdown ---------------------------------------------------------------
   - key: shutdown.terminationGraceSeconds
-    source: override
+    source: fixed
     why: >-
       The one number in the shutdown face: how long kubelet waits after SIGTERM
       before it kills the process. Both workloads that run agent turns take it,
@@ -3161,7 +3314,9 @@ rows:
       it. Until that evidence exists the number is a policy with no measurement
       to move it -- its two costs (a rollout that waits, a call that is
       interrupted) are the same event on either side of the line, so there is no
-      optimum in it to search for.
+      optimum in it to search for. Disposition `fixed`: the field belongs to
+      kubelet, and what holds it is the structural relation to the computed drain
+      budget and the teardown margin, not a measurement of its own.
 
   - key: shutdown.drainTeardownMarginMs
     source: fixed
@@ -3337,12 +3492,15 @@ rows:
       address.
 
   - key: ingress.proxyTimeoutSecs
-    source: override
+    source: fixed
     why: >-
-      Sized for the long-lived event stream and the WebSocket face, not measured
-      from them: nothing on this side observes how long a connection actually
-      lived, and nginx's 60 s default severs an idle long connection in a way the
-      browser reports only as a reconnect.
+      nginx's proxy-read/send-timeout is a protocol parameter at the edge: how
+      long an idle proxied connection may stay open. The WebSocket face and the
+      live event stream are idle between frames by design, and nginx's 60 s
+      default severs them in a way the browser reports only as a reconnect. The
+      gateway cannot tell the ingress how long its connections live -- the ingress
+      is the one holding them -- so the value is the edge's own contract, set
+      above any legitimate idle gap.
 
   - key: observability.eventLog.maxRows
     source: override

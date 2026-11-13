@@ -1271,6 +1271,46 @@ fn a_landed_batch_carries_no_override() {
                 "workspace.maxBytes",
             ],
         ),
+        (
+            // Beats, deadlines, cooldowns and retries. Fourteen of them are the
+            // cadence of a loop that outlives its passes: each pass measures
+            // itself and the next beat is that measurement against the seed,
+            // published with an evaluation count. The rest are not durations of
+            // anything this tree runs -- Job controller windows and retry
+            // policy, git's own transport liveness thresholds inside one-shot
+            // init containers, kubelet's grace field, nginx's edge timeout, the
+            // scrape cadence of a shell poller, and the ledger's bookkeeping
+            // horizon -- so they are `fixed` and say which agreement they are.
+            "B3",
+            &[
+                "backends.redis.infoExporter.intervalSeconds",
+                "backends.redis.infoExporter.walScanIntervalSeconds",
+                "backup.runDeadlineSeconds",
+                "backup.startingDeadlineSeconds",
+                "backup.backoffLimit",
+                "backup.drillBackoffLimit",
+                "evolution.pollIntervalSecs",
+                "evolution.buildGate.waitSecs",
+                "evolution.workspaces.cacheScanIntervalSecs",
+                "claimStore.scanIntervalSecs",
+                "claimStore.imageScanIntervalSecs",
+                "mainlineDeployer.failureCooldownSecs",
+                "mainlineDeployer.observabilityStack.intervalSecs",
+                "mainlineDeployer.pollIntervalSecs",
+                "mainlineDeployer.registryMaintenance.cooldownSecs",
+                "mainlineDeployer.rolloutTimeoutSecs",
+                "mainlineDeployer.soakSecs",
+                "mainlineDeployer.startupTimeoutSecs",
+                "securityGateway.gitMirror.stallSecs",
+                "securityGateway.gitMirror.timeoutSecs",
+                "workspaceFetch.connectTimeoutSecs",
+                "workspaceFetch.lowSpeedLimitBytesPerSec",
+                "workspaceFetch.lowSpeedSecs",
+                "shutdown.drainBudgetMs",
+                "shutdown.terminationGraceSeconds",
+                "ingress.proxyTimeoutSecs",
+            ],
+        ),
     ];
 
     let registry = registry();

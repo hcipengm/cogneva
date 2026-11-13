@@ -45,6 +45,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -54,6 +55,7 @@ use axum::routing::get;
 use axum::Router;
 use cog_core::contract::observability::METRICS_PATH;
 use cog_core::observability_text::render_raw_metrics;
+use cog_core::pacing::PacingReadings;
 use cog_core::{Observable, ShutdownSignal};
 use cog_observability::claim_store::{self, ClaimStoreObservable, Scan};
 use cog_observability::image_store::{self, ImageStoreObservable};
@@ -214,6 +216,9 @@ fn parse_cadence(raw: Option<&str>, default: u64, floor: u64) -> u64 {
 #[derive(Clone)]
 struct StoreState {
     observable: Arc<ClaimStoreObservable>,
+    /// 两条走查回路按实测定节拍的读数面。与走查读数同一个端点：它们回答的是
+    /// 同一件事——这一拍走了多久、下一拍什么时候来。
+    pacing: Arc<cog_core::pacing::PacingReadings>,
     images: Vec<Arc<ImageStoreObservable>>,
     /// Whether the first sweep has finished *trying*. Kept out of the
     /// observables on purpose: it is a fact about this process's start-up, not
@@ -278,6 +283,10 @@ async fn metrics(State(state): State<StoreState>) -> Response {
         Ok(claims) => readings.extend(claims),
         Err(e) => tracing::warn!(error = %e, "claim readings unavailable this scrape"),
     }
+    match state.pacing.collect_metrics("").await {
+        Ok(paced) => readings.extend(paced),
+        Err(e) => tracing::warn!(error = %e, "pacing readings unavailable this scrape"),
+    }
     for store in &state.images {
         match store.collect_metrics("").await {
             Ok(images) => readings.extend(images),
@@ -301,6 +310,7 @@ pub fn router(
     observable: Arc<ClaimStoreObservable>,
     images: Vec<Arc<ImageStoreObservable>>,
     first_sweep: Arc<AtomicBool>,
+    pacing: Arc<cog_core::pacing::PacingReadings>,
 ) -> Router {
     Router::new()
         .route("/health/live", get(live))
@@ -310,6 +320,7 @@ pub fn router(
             observable,
             images,
             first_sweep,
+            pacing,
         })
 }
 
@@ -325,6 +336,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // 而这里要的那份日志面（Loki 镜像）住在那儿。
 
     let node = node_from_env();
+    let pacing = Arc::new(PacingReadings::new());
     let observable = Arc::new(ClaimStoreObservable::new(root_from_env(), node.clone()));
     let images: Vec<Arc<ImageStoreObservable>> = image_stores_from_env()
         .into_iter()
@@ -350,6 +362,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let sweeping = Arc::clone(&observable);
     let sweeping_images = images.clone();
     let done = Arc::clone(&first_sweep);
+    let pacing_loop = Arc::clone(&pacing);
     tokio::spawn(async move {
         match sweeping.scan_blocking().await {
             Scan::Completed(report) => tracing::info!(
@@ -399,19 +412,36 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         done.store(true, Ordering::Relaxed);
 
         let shutdown = ShutdownSignal::default();
+        // 两条走查各有自己的种子，因此各有一条节拍序列。种子在句柄上，走查本身
+        // 把每轮耗时喂回来；读数上的 `pacing` 标签就是登记表里的那条键。
+        let claim_seed = Duration::from_secs(interval_from_env().max(claim_store::MIN_INTERVAL_SECS));
+        let image_seed =
+            Duration::from_secs(image_interval_from_env().max(image_store::MIN_INTERVAL_SECS));
+        // 地板是各自的种子：走查的是同一块盘上的全部 claim 与镜像层，快于配置的
+        // 节奏没有理由；一轮走不完时下一拍跟着这一轮让开。
+        let claim_pacer =
+            pacing_loop.pacer("claimStore.scanIntervalSecs", claim_seed, claim_seed, 1.0);
+        let image_pacer = pacing_loop.pacer(
+            "claimStore.imageScanIntervalSecs",
+            image_seed,
+            image_seed,
+            1.0,
+        );
         tokio::spawn(claim_store::run_claim_store_scan(
             Arc::clone(&sweeping),
             interval_from_env(),
             shutdown.clone(),
+            Some(claim_pacer),
         ));
         tokio::spawn(image_store::run_image_store_scan(
             sweeping_images.iter().map(Arc::clone).collect(),
             image_interval_from_env(),
             shutdown,
+            Some(image_pacer),
         ));
     });
 
-    axum::serve(listener, router(observable, images, first_sweep)).await?;
+    axum::serve(listener, router(observable, images, first_sweep, pacing)).await?;
     Ok(())
 }
 
@@ -452,7 +482,12 @@ mod tests {
         observable: Arc<ClaimStoreObservable>,
         images: Vec<Arc<ImageStoreObservable>>,
     ) -> Router {
-        router(observable, images, Arc::new(AtomicBool::new(true)))
+        router(
+            observable,
+            images,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(PacingReadings::new()),
+        )
     }
 
     /// A blank root must not resolve to the working directory: the process would
@@ -691,6 +726,7 @@ mod tests {
             Arc::new(ClaimStoreObservable::new(root.path(), "node-a")),
             empty_images(),
             Arc::clone(&first_sweep),
+            Arc::new(PacingReadings::new()),
         );
 
         let (status, body) = scrape(app.clone(), "/health/live").await;

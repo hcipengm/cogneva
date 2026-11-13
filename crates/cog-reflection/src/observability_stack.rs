@@ -38,6 +38,26 @@ use crate::config::ObservabilityStackConfig;
 use crate::governance_drift::{CheckFailure, DriftClass, GovernanceDrift};
 use crate::mainline_deployer::{classify_doc, split_docs, DocFate, MainlineDeployer};
 
+/// 这条收敛回路的节拍读数落在登记表的哪一行。标签值与登记键逐字相同，一处改名
+/// 另一处就跟着改——序列与行对不上时，读的人无法判断这一格在跟哪个声明走。
+pub(crate) const INTERVAL_PACING: &str = "mainlineDeployer.observabilityStack.intervalSecs";
+
+/// 一轮收敛花了 `pass` 之后等比比的下一拍等多久。
+///
+/// 目标周期是这一轮实测与种子的较大者（被地板托住），等待是它减去这一轮已经用掉
+/// 的时间。没有实测时就是种子，一轮都不少。
+pub(crate) fn next_wait(
+    pacer: Option<&cog_core::pacing::Pacer>,
+    seed: Duration,
+    pass: Duration,
+) -> Duration {
+    let target = match pacer {
+        Some(pacer) => pacer.beat(Some(pass)),
+        None => seed,
+    };
+    target.saturating_sub(pass)
+}
+
 /// 收敛面自己拥有的规则名。与配置里的规则集无关：这条判据不能在配置里，
 /// 因为配置没到的时候它正是要说这件事的那一条。
 pub const STACK_NOT_CONVERGED_RULE: &str = "observability_stack_not_converged";
@@ -545,13 +565,29 @@ impl StackConvergence {
     }
 
     /// 后台循环：先跑一轮（把"装完就没再管"这件事立刻显形），之后按间隔跑。
-    pub async fn run(self: Arc<Self>, shutdown: cog_core::ShutdownSignal) {
-        let interval = Duration::from_secs(
+    ///
+    /// 间隔由上一轮实测决定（[`next_wait`]）：一轮收敛走了一遍 bare 仓库与集群
+    /// 的比对，比配置的节拍久是常态，那一轮不该再叠一整个节拍。
+    pub async fn run(
+        self: Arc<Self>,
+        shutdown: cog_core::ShutdownSignal,
+        pacing: Option<Arc<cog_core::pacing::PacingReadings>>,
+    ) {
+        let seed = Duration::from_secs(
             self.cfg
                 .interval_secs
                 .max(ObservabilityStackConfig::MIN_INTERVAL_SECS),
         );
+        // 地板是种子：收敛读的是同一份声明与同一个集群，快于配置的节拍没有理由。
+        let pacer = pacing.map(|pacing| pacing.pacer(INTERVAL_PACING, seed, seed, 1.0));
+        let mut wait = Duration::ZERO;
         loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => break,
+                _ = tokio::time::sleep(wait) => {}
+            }
+            let started = tokio::time::Instant::now();
             let rev = match self.deployer.bare_main_rev().await {
                 Ok(rev) => rev,
                 Err(e) => {
@@ -561,10 +597,8 @@ impl StackConvergence {
             };
             let verdict = self.converge_once(&rev).await;
             self.publish(&verdict, &rev).await;
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = shutdown.wait() => break,
-            }
+            let pass = started.elapsed();
+            wait = next_wait(pacer.as_ref(), seed, pass);
         }
     }
 
@@ -1298,6 +1332,27 @@ mod tests {
         let msg = verdict.message("rev", 6);
         assert!(msg.contains("没有结论"), "{msg}");
         assert!(msg.contains("读不到"), "{msg}");
+    }
+
+    #[test]
+    fn the_convergence_wait_follows_what_a_round_cost() {
+        let readings =
+            Arc::new(cog_core::pacing::PacingReadings::new());
+        let pacer = readings.pacer(INTERVAL_PACING, Duration::from_secs(300), Duration::from_secs(300), 1.0);
+        // 一轮 20 秒：等待是节拍的剩余。
+        assert_eq!(
+            next_wait(Some(&pacer), Duration::from_secs(300), Duration::from_secs(20)),
+            Duration::from_secs(280)
+        );
+        // 一轮 900 秒：这一拍已经把等待用光，下一拍跟着这一轮让开。
+        assert_eq!(
+            next_wait(Some(&pacer), Duration::from_secs(300), Duration::from_secs(900)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            readings.target(INTERVAL_PACING),
+            Some((Duration::from_secs(900), 2, true))
+        );
     }
 
     #[test]

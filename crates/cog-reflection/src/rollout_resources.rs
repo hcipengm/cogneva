@@ -57,11 +57,19 @@ pub struct RolloutResourceReading {
     /// 内存上限与整轮运行的峰值占用，单位字节。上限为 `max` 时缺席。
     pub memory_max_bytes: Option<u64>,
     pub memory_peak_bytes: Option<u64>,
+    /// 三段等待各自**真的花了多久**（微秒）：支撑负载回到就绪、滚动推到新版本、
+    /// 静置窗口里宿主真的排到队的那一刻。三段分开记，因为三段的界是三个不同的键，
+    /// 下一轮各自由自己那一段的尾部定。
+    ///
+    /// 没走完的那一段缺席：判停或失败的那一段是墙，不是这件事要花的时间。
+    pub startup_usec: Option<u64>,
+    pub rollout_usec: Option<u64>,
+    pub soak_usec: Option<u64>,
 }
 
 /// 字段名与它们在结构里的位置，**编码与解码同读这一张表**：两边各拼一遍名字，改一处就
 /// 会静默地少读一个字段。顺序即线上顺序，只影响可读性，解析按 `key=value` 走。
-const FIELDS: [&str; 9] = [
+const FIELDS: [&str; 12] = [
     "at",
     "cpu_quota_us",
     "cpu_period_us",
@@ -71,6 +79,9 @@ const FIELDS: [&str; 9] = [
     "elapsed_usec",
     "memory_max",
     "memory_peak",
+    "startup_usec",
+    "rollout_usec",
+    "soak_usec",
 ];
 
 impl RolloutResourceReading {
@@ -131,6 +142,20 @@ impl RolloutResourceReading {
         self
     }
 
+    /// 补上三段等待各自量到的时长。只有真的走完的那一段才传 `Some`：失败或判停
+    /// 的那一段是墙，把它当成「这件事要花这么久」会让下一轮的界跟着一次事故变宽。
+    pub fn with_wait_durations(
+        mut self,
+        startup_usec: Option<u64>,
+        rollout_usec: Option<u64>,
+        soak_usec: Option<u64>,
+    ) -> Self {
+        self.startup_usec = startup_usec;
+        self.rollout_usec = rollout_usec;
+        self.soak_usec = soak_usec;
+        self
+    }
+
     /// 这次跑的平均 CPU 用量（毫核）。时长缺失或为 0 时没有答案。
     pub fn average_cpu_millicores(&self) -> Option<u64> {
         let used = self.cpu_usage_usec?;
@@ -170,6 +195,9 @@ impl RolloutResourceReading {
             "elapsed_usec" => self.elapsed_usec,
             "memory_max" => self.memory_max_bytes,
             "memory_peak" => self.memory_peak_bytes,
+            "startup_usec" => self.startup_usec,
+            "rollout_usec" => self.rollout_usec,
+            "soak_usec" => self.soak_usec,
             _ => None,
         }
     }
@@ -187,6 +215,9 @@ impl RolloutResourceReading {
             "elapsed_usec" => self.elapsed_usec = Some(value),
             "memory_max" => self.memory_max_bytes = Some(value),
             "memory_peak" => self.memory_peak_bytes = Some(value),
+            "startup_usec" => self.startup_usec = Some(value),
+            "rollout_usec" => self.rollout_usec = Some(value),
+            "soak_usec" => self.soak_usec = Some(value),
             _ => return false,
         }
         true

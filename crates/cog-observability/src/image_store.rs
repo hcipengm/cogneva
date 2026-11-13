@@ -461,30 +461,36 @@ pub async fn run_image_store_scan(
     observables: Vec<Arc<ImageStoreObservable>>,
     interval_secs: u64,
     shutdown: ShutdownSignal,
+    pacer: Option<cog_core::pacing::Pacer>,
 ) {
-    let interval = Duration::from_secs(interval_secs.max(MIN_INTERVAL_SECS));
+    let seed = Duration::from_secs(interval_secs.max(MIN_INTERVAL_SECS));
     let Some(first) = observables.first() else {
         return;
     };
     let loop_name = format!("{SCAN_LOOP}:{}", first.node());
     let _ = cog_core::loop_health::spawn(
         loop_name,
-        cog_core::loop_health::Cadence::Periodic(interval),
+        cog_core::loop_health::Cadence::Periodic(seed),
         shutdown.clone(),
         move |beat| {
             let observables = observables.clone();
             let shutdown = shutdown.clone();
+            let pacer = pacer.clone();
             async move {
                 for observable in &observables {
                     tracing::info!(
                         root = %observable.root().display(),
                         store = observable.name(),
                         node = observable.node(),
-                        interval_secs = interval.as_secs(),
+                        interval_secs = seed.as_secs(),
                         "image store scan started"
                     );
                 }
-                let mut ticker = tokio::time::interval(interval);
+                // One wait for the whole census: the walks of the stores this
+                // node holds are one pass, and the one that outlasts the cadence
+                // is the one the next wait follows. The first pass starts at
+                // once, as the ticker it replaces did.
+                let mut wait = Duration::ZERO;
                 loop {
                     // Stamped whether or not the walk found anything: the age is
                     // a reading of the loop, and a loop that only stamped when it
@@ -494,38 +500,56 @@ pub async fn run_image_store_scan(
                     tokio::select! {
                         biased;
                         _ = shutdown.wait() => break,
-                        _ = ticker.tick() => {
-                            for observable in &observables {
-                                // The first walk is the one a person waits for,
-                                // so it is logged at the level an operator reads;
-                                // every walk after it is a repeat of the same
-                                // line and belongs at debug.
-                                let first = observable.scans() == 0;
-                                match observable.scan_blocking().await {
-                                    Scan::Completed(report) if first => tracing::info!(
-                                        store = observable.name(),
-                                        parts = report.parts,
-                                        readable = report.readable,
-                                        files = report.files,
-                                        "image store walked"
-                                    ),
-                                    Scan::Completed(report) => tracing::debug!(
-                                        store = observable.name(),
-                                        parts = report.parts,
-                                        readable = report.readable,
-                                        files = report.files,
-                                        "image store walked"
-                                    ),
-                                    Scan::RootUnreadable => {}
-                                }
-                            }
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    let started = tokio::time::Instant::now();
+                    for observable in &observables {
+                        // The first walk is the one a person waits for, so it is
+                        // logged at the level an operator reads; every walk after
+                        // it is a repeat of the same line and belongs at debug.
+                        let first = observable.scans() == 0;
+                        match observable.scan_blocking().await {
+                            Scan::Completed(report) if first => tracing::info!(
+                                store = observable.name(),
+                                parts = report.parts,
+                                readable = report.readable,
+                                files = report.files,
+                                "image store walked"
+                            ),
+                            Scan::Completed(report) => tracing::debug!(
+                                store = observable.name(),
+                                parts = report.parts,
+                                readable = report.readable,
+                                files = report.files,
+                                "image store walked"
+                            ),
+                            Scan::RootUnreadable => {}
                         }
                     }
+                    let pass = started.elapsed();
+                    wait = wait_after_pass(pacer.as_ref(), seed, pass);
                 }
             }
         },
     )
     .await;
+}
+
+/// 一轮走了 `pass` 之后等多久。
+///
+/// 与卷走查同一条律：目标周期是上轮耗时与种子的较大者（再被地板托住），等待是
+/// 它减去这一轮已经用掉的时间。一次走查把整个镜像库走完，比种子久是常态——那
+/// 正是它该决定下一拍的时候。
+pub fn wait_after_pass(
+    pacer: Option<&cog_core::pacing::Pacer>,
+    seed: Duration,
+    pass: Duration,
+) -> Duration {
+    let target = match pacer {
+        Some(pacer) => pacer.beat(Some(pass)),
+        None => seed,
+    };
+    target.saturating_sub(pass)
 }
 
 #[cfg(test)]
@@ -535,6 +559,31 @@ mod tests {
     use std::fs;
 
     const NODE: &str = "node-a";
+
+    #[test]
+    fn the_wait_after_a_walk_follows_what_the_walk_cost() {
+        // 一次 12 分钟的走查、种子 15 分钟：等待仍是种子的剩余；
+        // 走查拉到 30 分钟时，等待为零，发布的目标跟到 30 分钟。
+        let readings = Arc::new(cog_core::pacing::PacingReadings::new());
+        let pacer = readings.pacer(
+            "claimStore.imageScanIntervalSecs",
+            Duration::from_secs(900),
+            Duration::from_secs(900),
+            1.0,
+        );
+        assert_eq!(
+            wait_after_pass(Some(&pacer), Duration::from_secs(900), Duration::from_secs(720)),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            wait_after_pass(Some(&pacer), Duration::from_secs(900), Duration::from_secs(1800)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            readings.target("claimStore.imageScanIntervalSecs"),
+            Some((Duration::from_secs(1800), 2, true))
+        );
+    }
     const STORE: &str = "containerd";
 
     fn scratch(name: &str) -> cog_test_support::ScratchDir {

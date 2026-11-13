@@ -485,6 +485,18 @@ impl WalkOutcome {
 // cap: bound — 构建以分钟计，它只决定一个空出来的槽多快被捡走
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The registry key this gate's wait budget is declared under, and the name its
+/// reading is published under.
+pub const WAIT_PACING: &str = "evolution.buildGate.waitSecs";
+
+/// The shortest wait worth handing a caller: two polls. A budget under one poll
+/// never re-asks, which is `try_acquire` under another name, and the gate would
+/// report a refusal it never actually waited for. This is a floor on what a
+/// measurement may derive, not a value anybody configures.
+fn wait_floor() -> Duration {
+    POLL_INTERVAL * 2
+}
+
 /// How many turns in a row an exclusion stands down for someone else's claim on
 /// the next build before it takes the field anyway.
 ///
@@ -2352,6 +2364,13 @@ pub struct BuildGate {
     /// measurement that cannot see the deployment's other users.
     fixed: Option<usize>,
     wait: Duration,
+    /// The waits that actually happened, as the loop's one input. A wait
+    /// shorter than one poll is not recorded: it says a slot was free, which is
+    /// what "no wait" means, and a window full of those would drive the budget
+    /// to its floor and turn every busy moment into an immediate refusal. What
+    /// the budget is sized by is how long a caller had to wait when it did.
+    wait_budget: Arc<cog_core::pacing::TailBudget>,
+    pacing: Arc<cog_core::pacing::PacingReadings>,
     installed: bool,
     /// The bound this process derived last, as the number it is enforcing; 0
     /// before any measurement.
@@ -2532,9 +2551,18 @@ impl BuildGate {
         if cfg.enabled {
             installed = create_slot_dir(&dir).is_ok();
         }
+        let wait = Duration::from_secs(cfg.wait_secs);
+        let pacing = Arc::new(cog_core::pacing::PacingReadings::new());
+        // The seed is the declared budget and nothing else: a gate that has
+        // never made anybody wait has no measurement to overrule it with. The
+        // floor is structural (two polls), so a measured budget can be short
+        // but never a budget that cannot poll.
+        let wait_budget = pacing.tail(WAIT_PACING, wait, wait_floor(), 2.0);
         Self {
             fixed: (cfg.max_concurrent > 0).then_some(cfg.max_concurrent),
-            wait: Duration::from_secs(cfg.wait_secs),
+            wait,
+            wait_budget,
+            pacing,
             installed,
             dir,
             tuning: fit_to_host(Tuning::from_config(cfg)),
@@ -3461,15 +3489,47 @@ impl BuildGate {
     /// force, since nothing is being waited for.
     fn wait_budget_ms(&self) -> u64 {
         if self.in_force() {
-            self.wait.as_millis() as u64
+            self.effective_wait().as_millis() as u64
         } else {
             0
+        }
+    }
+
+    /// The budget this gate hands the next caller.
+    ///
+    /// Before the first measured wait it is the declared value: nothing has
+    /// happened that could overrule it, and a gate that has never waited on
+    /// anybody has no evidence that it should wait less. Afterwards it is the
+    /// tail of the waits that did happen, times two, above a floor of two
+    /// polls -- so a gate whose contention clears in milliseconds stops tying
+    /// a caller up for half an hour, and one whose builders take twenty minutes
+    /// to free a slot stops refusing at a budget that only ever fit the fast
+    /// case.
+    fn effective_wait(&self) -> Duration {
+        if self.wait_budget.samples() == 0 {
+            self.wait
+        } else {
+            self.wait_budget.target()
         }
     }
 
     /// Records a wait that ended in taking a slot, and hands back when the slot
     /// was taken so the hold can be measured when it is released.
     fn slot_taken(&self, waited: Duration) -> Instant {
+        // The measurement the budget is derived from. Recorded at the moment a
+        // slot was actually taken, so the sample is "how long a caller had to
+        // wait to get one", which is the only question a wait budget answers.
+        //
+        // Only waits that outlasted a poll count. A caller that found the slot
+        // on its first pass measured microseconds, and a window full of those
+        // would pull the budget to the floor -- the gate would then refuse at
+        // the first moment of contention, having "learned" from waits that were
+        // not waits. Refusals are not recorded either: a caller that ran out of
+        // budget says the budget was too short *for it*, and feeding that back
+        // would let one unbroken build stretch the budget forever.
+        if waited >= POLL_INTERVAL {
+            self.wait_budget.observe(waited);
+        }
         let waited_ms = waited.as_millis() as u64;
         self.wait_ms_total.fetch_add(waited_ms, Ordering::Relaxed);
         self.wait_ms_max.fetch_max(waited_ms, Ordering::Relaxed);
@@ -3499,7 +3559,11 @@ impl BuildGate {
 
     /// Takes a slot, waiting for one up to the configured budget.
     pub async fn acquire(self: &Arc<Self>, what: &str) -> SFResult<BuildPermit> {
-        self.acquire_within(what, self.wait).await
+        // Read per call, not stored at construction: the budget is a reading of
+        // how long callers have had to wait, and a value frozen at start-up
+        // would be the declaration wearing the measurement's name.
+        let budget = self.effective_wait();
+        self.acquire_within(what, budget).await
     }
 
     /// Takes a slot only if one is free right now.
@@ -4550,6 +4614,12 @@ impl Observable for BuildGate {
             origin,
             HostFacts::read(),
         ));
+        // The wait budget's own loop, on the shared pacing series: its target,
+        // whether that came from the declaration or from a measured wait, and
+        // how many waits have moved it. `wait_budget_ms` above carries the same
+        // number for the panels and rules that already read it; these two are
+        // what say whether the number is still being computed at all.
+        metrics.extend(self.pacing.collect_metrics("").await?);
         Ok(metrics)
     }
 
@@ -7696,6 +7766,77 @@ unevictable 28532736
         drop(next);
         drop(claim_copy);
         drop(slot_copy);
+    }
+
+    /// The wait budget is the tail of the waits that actually happened.
+    ///
+    /// The declared budget is 2s. A wait of 1.5s is recorded the way `acquire`
+    /// records one (the moment a slot is taken), and the next caller is then
+    /// admitted after waiting 2.something seconds -- longer than the declaration,
+    /// which is the half of the loop a pure-function test cannot show: the next
+    /// acquisition is running against the derived budget, not the pinned one.
+    /// The second wait moves the budget again, and the evaluation count says the
+    /// loop is computing rather than the number having been written once.
+    #[tokio::test]
+    async fn the_wait_budget_follows_the_waits_that_actually_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 2);
+        assert_eq!(
+            gate.effective_wait(),
+            Duration::from_secs(2),
+            "with nothing measured, the declaration is the budget"
+        );
+        assert_eq!(gate.wait_budget.evaluations(), 0);
+
+        // The same call `acquire_within` makes when it takes a slot.
+        gate.slot_taken(Duration::from_millis(1500));
+        assert_eq!(
+            gate.wait_budget.evaluations(),
+            1,
+            "one measured wait is one turn of the loop"
+        );
+        assert!(
+            gate.effective_wait() >= Duration::from_secs(3),
+            "a 1.5s wait has to set the next budget at twice that, got {:?}",
+            gate.effective_wait()
+        );
+        assert_eq!(
+            gate.wait_budget_ms(),
+            gate.effective_wait().as_millis() as u64,
+            "the published budget is the one in force"
+        );
+
+        // A wait longer than the declared 2s: only the derived budget admits it.
+        let held = gate.try_acquire("holder").await.unwrap();
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.acquire("queued build").await })
+        };
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        drop(held);
+        let permit = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the caller is admitted by the derived budget, not the 2s declaration")
+            .unwrap()
+            .unwrap();
+        assert!(permit.held());
+        assert_eq!(
+            gate.wait_budget.evaluations(),
+            2,
+            "the caller's own wait is a second sample"
+        );
+        assert!(
+            gate.effective_wait() >= Duration::from_secs(4),
+            "the second wait was at least 2s, so the budget follows it, got {:?}",
+            gate.effective_wait()
+        );
+
+        // And the loop is on the published pacing series, not only in a field.
+        let metrics = gate.collect_metrics("").await.unwrap();
+        assert!(
+            metrics.iter().any(|m| m.name == cog_core::pacing::TARGET_METRIC),
+            "the wait budget's target must be published under the shared pacing series"
+        );
     }
 
     /// A waiting build is a reading of its own: a gate at its bound with nothing

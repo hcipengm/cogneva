@@ -59,6 +59,22 @@ use crate::workload_resources;
 /// 有两个动作——打镜像的那一步和回收它的那一步——两边各拼一次就会漂开。
 /// cargo 的 release 目录名。编译出来的二进制叫 `cog_core::paths::APP_BINARY_NAME`：
 /// 这两段拼成一个路径字面量时，改名只会让某个调用点去找一个没有被写出来的文件。
+/// 主线轮询节拍的读数名（登记键逐字相同）。这一拍的节拍由上一轮真正占用的
+/// 时间决定：一轮里的构建、推送、等判定都可能比种子久，而回路只能在一轮结束
+/// 之后才开始下一轮。
+pub(crate) const POLL_PACING: &str = "mainlineDeployer.pollIntervalSecs";
+/// 启动阶段申报界的读数名（登记键逐字相同）。
+pub(crate) const STARTUP_BUDGET_PACING: &str = "mainlineDeployer.startupTimeoutSecs";
+/// 滚动阶段申报界的读数名。
+pub(crate) const ROLLOUT_BUDGET_PACING: &str = "mainlineDeployer.rolloutTimeoutSecs";
+/// 静置申报界的读数名。
+pub(crate) const SOAK_BUDGET_PACING: &str = "mainlineDeployer.soakSecs";
+/// 环境类失败冷却的读数名。
+pub(crate) const FAILURE_COOLDOWN_PACING: &str = "mainlineDeployer.failureCooldownSecs";
+/// 两轮回收共用冷却的读数名。
+pub(crate) const REGISTRY_COOLDOWN_PACING: &str =
+    "mainlineDeployer.registryMaintenance.cooldownSecs";
+
 const CARGO_RELEASE_SUBDIR: &str = "release";
 
 /// 前端产物的入口文档。缓存里「已经编好」与挂载目录里「已经拷好」判的是同一个
@@ -2851,6 +2867,11 @@ struct MainlineState {
     /// 环境类失败的限速窗：环境类失败本身不含版本结论，它只决定"隔多久再看一眼
     /// 这台集群"。版本类不走这个窗——那类失败没有时间维度可言，见 `failed_repeated`。
     failed_cooldown_until: i64,
+    /// 环境类失败已经连着发生了几次。冷却的输入就是它：第一次是种子，之后每
+    /// 多一次就拉开一档；一次收敛把它清零。落盘，因为进程重启不该让一个还在坏
+    /// 的环境看起来像"刚坏第一次"。
+    #[serde(default)]
+    environment_failures: u32,
     /// `failed_rev` 上**版本类**失败各自坏在哪（签名去重后的集合，`None` = 有一
     /// 次读不出落点）。这是"这个 rev 还让不让再滚"的全部依据：签名重复出现说明
     /// 同一处坏是可复现的确定性失败，重滚只会拿到同一份证据；签名每次都不同说明
@@ -3067,6 +3088,19 @@ pub struct MainlineDeployer {
     /// 存活读数，也就没有该打的点。循环被重启时拿到的是同一登记项的克隆，重装是
     /// 幂等的（第一次赢）。
     loop_beat: std::sync::OnceLock<cog_core::loop_health::Beat>,
+    /// 节拍与时限的读数面。轮询节拍、启动/滚动/静置的申报界、两处冷却都落在
+    /// 这里，一行一条序列，标签就是登记表里的键。
+    pacing: Option<std::sync::Arc<cog_core::pacing::PacingReadings>>,
+    /// 三项时限的句柄。句柄里带着跨轮的实测窗口，所以只能造一次；每轮现造一个
+    /// 等于每轮都从零开始量，读数永远停在种子。
+    startup_budget: std::sync::OnceLock<Option<std::sync::Arc<cog_core::pacing::TailBudget>>>,
+    rollout_budget: std::sync::OnceLock<Option<std::sync::Arc<cog_core::pacing::TailBudget>>>,
+    soak_budget: std::sync::OnceLock<Option<std::sync::Arc<cog_core::pacing::TailBudget>>>,
+    /// 环境类失败的冷却：从实测的「环境连着坏了几次」导出。
+    failure_cooldown_budget: std::sync::OnceLock<Option<std::sync::Arc<cog_core::pacing::Backoff>>>,
+    /// 两轮回收共用的冷却：从一次回收实测花多久导出。
+    registry_cooldown_budget:
+        std::sync::OnceLock<Option<std::sync::Arc<cog_core::pacing::TailBudget>>>,
 }
 
 /// 平台读失败的四支——只有在这一层还分得开。
@@ -3237,7 +3271,248 @@ impl MainlineDeployer {
             buildah_reading_seeded: std::sync::atomic::AtomicBool::new(false),
             registry_reading_seeded: std::sync::atomic::AtomicBool::new(false),
             loop_beat: std::sync::OnceLock::new(),
+            pacing: None,
+            startup_budget: std::sync::OnceLock::new(),
+            rollout_budget: std::sync::OnceLock::new(),
+            soak_budget: std::sync::OnceLock::new(),
+            failure_cooldown_budget: std::sync::OnceLock::new(),
+            registry_cooldown_budget: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 装载节拍与时限的读数面。
+    pub fn with_pacing(
+        mut self,
+        pacing: std::sync::Arc<cog_core::pacing::PacingReadings>,
+    ) -> Self {
+        self.pacing = Some(pacing);
+        self
+    }
+
+    /// 一项时限的句柄；没有读数面时是 `None`，调用方保留配置值。
+    pub(crate) fn budget(
+        &self,
+        slot: &std::sync::OnceLock<Option<std::sync::Arc<cog_core::pacing::TailBudget>>>,
+        name: &str,
+        seed: u64,
+        factor: f64,
+    ) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
+        slot.get_or_init(|| {
+            let budget = self.pacing.as_ref().map(|pacing| {
+                pacing.tail(
+                    name,
+                    std::time::Duration::from_secs(seed),
+                    std::time::Duration::from_secs(
+                        crate::mainline_rollout::ROLLOUT_POLL_SECS,
+                    ),
+                    factor,
+                )
+            });
+            // 这一轮进程里第一次拿到这个界时，把落盘的历史先喂回去：部署器重启
+            // 不该把已经量到过的尾部丢掉，否则一重启就退回种子，而种子正是这
+            // 条回路要离开的那个值。
+            if let Some(budget) = &budget {
+                for secs in self
+                    .load_duration_history()
+                    .get(name)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                {
+                    budget.observe(std::time::Duration::from_secs(*secs));
+                }
+            }
+            budget
+        })
+        .clone()
+    }
+
+    /// 启动阶段申报的界（`mainlineDeployer.startupTimeoutSecs`）。
+    pub(crate) fn startup_budget(&self) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
+        self.budget(
+            &self.startup_budget,
+            STARTUP_BUDGET_PACING,
+            self.cfg.startup_timeout_secs,
+            2.0,
+        )
+    }
+
+    /// 滚动阶段申报的界（`mainlineDeployer.rolloutTimeoutSecs`）。
+    pub(crate) fn rollout_budget(&self) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
+        self.budget(
+            &self.rollout_budget,
+            ROLLOUT_BUDGET_PACING,
+            self.cfg.rollout_timeout_secs,
+            2.0,
+        )
+    }
+
+    /// 静置的申报界（`mainlineDeployer.soakSecs`）。
+    pub(crate) fn soak_budget(&self) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
+        self.budget(
+            &self.soak_budget,
+            SOAK_BUDGET_PACING,
+            self.cfg.soak_secs,
+            2.0,
+        )
+    }
+
+    /// 三段等待各自的实测历史落盘在哪。
+    ///
+    /// 判定 Job 是短命的，它量到的时长只有终止消息这一个通道能带回来；部署器自己
+    /// 也会重启。历史落在状态目录里，于是「量到过」不随任何一个进程的寿命消失。
+    fn duration_history_path(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.cfg.state_dir).join("rollout-duration-history.json")
+    }
+
+    /// 每个界最近量到的若干轮（秒）。读不到或读不懂都当空历史：那表示还没量过，
+    /// 界回到种子上——不是量出来零。
+    fn load_duration_history(&self) -> std::collections::BTreeMap<String, Vec<u64>> {
+        match std::fs::read_to_string(self.duration_history_path()) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// 把一轮实测并进历史，只留窗口能装下的最近若干轮。
+    fn save_duration_sample(&self, name: &str, secs: u64) {
+        let mut history = self.load_duration_history();
+        let samples = history.entry(name.to_string()).or_default();
+        samples.push(secs);
+        let keep = cog_core::pacing::TAIL_WINDOW_SAMPLES;
+        if samples.len() > keep {
+            samples.drain(..samples.len() - keep);
+        }
+        let path = self.duration_history_path();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(path = %parent.display(), error = %e, "could not create the duration history directory; this run's measurement is not persisted");
+                return;
+            }
+        }
+        match serde_json::to_string(&history) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(&path, text) {
+                    warn!(path = %path.display(), error = %e, "could not save the duration history");
+                }
+            }
+            Err(e) => warn!(error = %e, "could not encode the duration history"),
+        }
+    }
+
+    /// 把判定 Job 带回来的三段时长并进三个界。
+    ///
+    /// 每条样本都**先**记进界（这一步就算出了下一轮申报的值），**再**落盘给下一次
+    /// 进程。缺席的那一段不记：没走完的那一段是墙，不是这件事要花的时间。
+    fn record_rollout_durations(&self, reading: &RolloutResourceReading) {
+        for (name, micros) in [
+            (STARTUP_BUDGET_PACING, reading.startup_usec),
+            (ROLLOUT_BUDGET_PACING, reading.rollout_usec),
+            (SOAK_BUDGET_PACING, reading.soak_usec),
+        ] {
+            let Some(usec) = micros else { continue };
+            let sample = std::time::Duration::from_micros(usec);
+            if let Some(budget) = self.duration_budget(name) {
+                budget.observe(sample);
+            }
+            self.save_duration_sample(name, sample.as_secs());
+        }
+    }
+
+    /// 按登记表里的键取一个界。三段共三格，键与读数上的 `pacing` 标签同一个词。
+    fn duration_budget(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
+        match name {
+            STARTUP_BUDGET_PACING => self.startup_budget(),
+            ROLLOUT_BUDGET_PACING => self.rollout_budget(),
+            SOAK_BUDGET_PACING => self.soak_budget(),
+            _ => None,
+        }
+    }
+
+    /// 两轮回收共用冷却的句柄：输入是一次回收重启后 tag 服务重建索引真的花了
+    /// 多久（`REGISTRY_REBUILD_HOLD_SECS_TOTAL` 记的就是这一段）。不花得比那次
+    /// 重启本身更频繁，是这条回路的全部理由。
+    fn registry_cooldown_budget(
+        &self,
+    ) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
+        self.budget(
+            &self.registry_cooldown_budget,
+            REGISTRY_COOLDOWN_PACING,
+            self.cfg.registry_maintenance_cooldown_secs,
+            2.0,
+        )
+    }
+
+    /// 记一次「回收重启真的让 tag 服务缺席了多久」。0 秒不记：那不是「重启不贵」，
+    /// 是这一次没有量到代价。
+    fn note_registry_rebuild_hold(&self, held_secs: i64) {
+        if held_secs <= 0 {
+            return;
+        }
+        if let Some(budget) = self.registry_cooldown_budget() {
+            budget.observe(Duration::from_secs(held_secs as u64));
+        }
+        self.save_duration_sample(REGISTRY_COOLDOWN_PACING, held_secs as u64);
+    }
+
+    /// 这一轮两处回收共用的冷却。
+    fn effective_registry_cooldown_secs(&self) -> u64 {
+        self.registry_cooldown_budget()
+            .map(|budget| budget.target().as_secs())
+            .unwrap_or(self.cfg.registry_maintenance_cooldown_secs)
+    }
+
+    /// 环境类失败冷却的句柄。次数由状态持有，句柄只负责把「第 n 次」换成时长
+    /// 并记到读数面上。
+    fn failure_backoff(&self) -> Option<std::sync::Arc<cog_core::pacing::Backoff>> {
+        self.failure_cooldown_budget
+            .get_or_init(|| {
+                self.pacing.as_ref().map(|pacing| {
+                    pacing.backoff(
+                        FAILURE_COOLDOWN_PACING,
+                        std::time::Duration::from_secs(self.cfg.failure_cooldown_secs),
+                        2.0,
+                    )
+                })
+            })
+            .clone()
+    }
+
+    /// 连续第 `failures` 次环境类失败之后，这一次要冷却多久。
+    fn environment_cooldown_secs(&self, failures: u32) -> u64 {
+        match self.failure_backoff() {
+            Some(backoff) => backoff.evaluate(failures as u64).as_secs(),
+            // 没有读数面时就是种子：这条回路本身不在了，取值仍是那个数。
+            None => self.cfg.failure_cooldown_secs,
+        }
+    }
+
+    /// 这一轮要申报的启动界。还没有实测时是 chart 的种子。
+    fn effective_startup_timeout_secs(&self) -> u64 {
+        self.startup_budget()
+            .map(|budget| budget.target().as_secs())
+            .unwrap_or(self.cfg.startup_timeout_secs)
+    }
+
+    /// 这一轮要申报的滚动界。
+    fn effective_rollout_timeout_secs(&self) -> u64 {
+        self.rollout_budget()
+            .map(|budget| budget.target().as_secs())
+            .unwrap_or(self.cfg.rollout_timeout_secs)
+    }
+
+    /// 这一轮要申报的静置时长。
+    fn effective_soak_secs(&self) -> u64 {
+        self.soak_budget()
+            .map(|budget| budget.target().as_secs())
+            .unwrap_or(self.cfg.soak_secs)
+    }
+
+    /// 部署器愿意为一次判定等多久，按这一轮实际申报的那三段算。
+    fn judgement_wait(&self) -> std::time::Duration {
+        judgement_wait_budget(self.effective_soak_secs(), self.effective_rollout_timeout_secs())
     }
 
     /// 装载本循环的心跳句柄；步与步之间打的点落在这一格上。
@@ -3895,8 +4170,7 @@ impl MainlineDeployer {
             .map(|gap| gap.as_secs())
             .unwrap_or(0)
             .max(cog_core::progress::WATCH_TICK.as_secs());
-        measured
-            .max(judgement_wait_budget(self.cfg.soak_secs, self.cfg.rollout_timeout_secs).as_secs())
+        measured.max(self.judgement_wait().as_secs())
     }
 
     /// 每一条**部署器自己的** kubectl 调用都从这里走，只在一条路上加了东西：
@@ -7147,7 +7421,7 @@ impl MainlineDeployer {
             state.registry_maintenance_unix,
             now,
             self.cfg.registry_maintenance_threshold,
-            self.cfg.registry_maintenance_cooldown_secs,
+            self.effective_registry_cooldown_secs(),
         ) {
             // 不到回收的时候，但**上一轮欠的账还没还**：欠账跟冷却无关——冷却管的是
             // "多久回收一次"，这一笔说的是"上一次回收没做完"。让欠账成立的那个条件
@@ -7289,7 +7563,7 @@ impl MainlineDeployer {
         // 补在冷掉之前：这一轮走不走得完与它无关。
         self.seed_buildah_reading(state.buildah_store_unix).await;
         if now.saturating_sub(state.buildah_store_unix)
-            < self.cfg.registry_maintenance_cooldown_secs as i64
+            < self.effective_registry_cooldown_secs() as i64
         {
             return;
         }
@@ -8022,8 +8296,7 @@ impl MainlineDeployer {
                     job = %job,
                     "rollout images are on the target revision; waiting for the judgement to finish"
                 );
-                let budget =
-                    judgement_wait_budget(self.cfg.soak_secs, self.cfg.rollout_timeout_secs);
+                let budget = self.judgement_wait();
                 if !self
                     .await_judgement(&job, Duration::from_secs(JUDGEMENT_POLL_SECS), budget)
                     .await?
@@ -8075,6 +8348,12 @@ impl MainlineDeployer {
                 state.failed_repeated = false;
                 state.failed_class = FailureClass::default();
                 state.failed_cooldown_until = 0;
+                // 环境连着坏了几次这件事在收敛那一刻清零；读数上也记一拍，
+                // 于是「刚恢复」与「还没坏过」在求值面上都留了痕迹。
+                state.environment_failures = 0;
+                if let Some(backoff) = self.failure_backoff() {
+                    backoff.evaluate(0);
+                }
                 // 这一版滚上去了：「上游一直不给绿」那一段到此为止。红着的版本滚不
                 // 上来，滚上来就是「主线被扣住、推不动」的反证。不清的话，起点会跟着
                 // 后面那些「上游还在跑」的轮一次次按新的时间戳重发，四小时那条规则
@@ -8208,7 +8487,9 @@ impl MainlineDeployer {
                     // 「还要冷却到几点」——读的人以为有一段空转正在发生，实际没有。
                     state.failed_cooldown_until = match class {
                         FailureClass::Environment => {
-                            chrono::Utc::now().timestamp() + self.cfg.failure_cooldown_secs as i64
+                            state.environment_failures = state.environment_failures.saturating_add(1);
+                            chrono::Utc::now().timestamp()
+                                + self.environment_cooldown_secs(state.environment_failures) as i64
                         }
                         FailureClass::Version => 0,
                     };
@@ -8323,6 +8604,10 @@ impl MainlineDeployer {
                         )
                         .await;
                 }
+                // 这一段就是「一次回收重启真实花了多久」：它是两轮回收之间冷却的
+                // 唯一输入。量不到（0 秒：服务根本没缺席）时不记样本——那不是
+                // 「重启不贵」，是这一次没有量到代价。
+                self.note_registry_rebuild_hold(held_secs);
                 state.registry_restart_unix = None;
                 self.save_state(&state)?;
             } else {
@@ -9672,13 +9957,13 @@ impl MainlineDeployer {
             "--ns".into(),
             self.cfg.namespace.clone(),
             "--soak-secs".into(),
-            self.cfg.soak_secs.to_string(),
+            self.effective_soak_secs().to_string(),
             "--restart-threshold".into(),
             self.cfg.restart_threshold.to_string(),
             "--timeout".into(),
-            self.cfg.rollout_timeout_secs.to_string(),
+            self.effective_rollout_timeout_secs().to_string(),
             "--startup-timeout".into(),
-            self.cfg.startup_timeout_secs.to_string(),
+            self.effective_startup_timeout_secs().to_string(),
         ];
         // 上游清单随 Job 一起带过去：这一侧问过一次 CI，但提问到落地之间还隔着
         // 整段构建（构建、推镜像、拉取都在 Job 里），那一段时间足够一条要红的检查
@@ -10773,6 +11058,9 @@ impl MainlineDeployer {
         // 刚读回来的读数决定的。
         self.record_rollout_sizing(&reading);
         self.publish_rollout_sizing();
+        // 同一个读数也带着这一轮三段等待各自的时长：并进三个界，下一次派发就按
+        // 新的尾部申报。没有那一段的样本时三个界原地不动。
+        self.record_rollout_durations(&reading);
 
         let Some(metrics) = &self.metrics else {
             return;
@@ -11482,10 +11770,27 @@ pub const MAINLINE_DEPLOYER_LOOP: &str = "mainline_deployer";
 /// today.
 pub const REVS_SKIPPED_SUPERSEDED_BEFORE_TICK: &str = "superseded_before_tick";
 
+/// 一轮之后要等多久：目标周期从这一轮的起点算，不是「跑完再睡一个种子」。
+///
+/// 拆成函数只为可考：回路体在 `run_mainline_loop` 里、跑一整轮要真构建，
+/// 而这条律只回答「上一轮占用了多久」这一个输入。
+pub(crate) fn wait_after_cycle(
+    pacer: Option<&cog_core::pacing::Pacer>,
+    seed: Duration,
+    pass: Duration,
+) -> Duration {
+    let target = match pacer {
+        Some(pacer) => pacer.beat(Some(pass)),
+        None => seed,
+    };
+    target.saturating_sub(pass)
+}
+
 /// 构建侧后台循环入口（插件 spawn）。
 pub async fn run_mainline_loop(
     deployer: std::sync::Arc<MainlineDeployer>,
     shutdown: ShutdownSignal,
+    pacing: Option<std::sync::Arc<cog_core::pacing::PacingReadings>>,
 ) {
     // 宿主 bare 仓库（/host-git）与工作树属主/挂载场景会撞 git
     // dubious-ownership；safe.directory 只有 global 配置被采信（与
@@ -11532,6 +11837,15 @@ pub async fn run_mainline_loop(
         pull_endpoint = %deployer.pull_endpoint(),
         "Mainline deployer loop started"
     );
+    // 两轮之间的等待不再是这个种子本身：一轮可以比种子久得多（构建、推送、
+    // 等判定），而回路只能在这一轮结束之后才开始下一轮。把上轮耗时喂回同一条
+    // 律，发布的目标节拍就是回路真正跑的节拍——规则拿它做窗口时，不必去猜
+    // 一轮最长能有多久。种子仍是下限：跑得比它快不改变节拍。
+    let pacer = pacing.map(|p| {
+        // 地板就是种子：轮询别人的裸仓库，快于配置的节拍没有理由。种子之上，
+        // 一轮真正占用的时间决定下一拍。
+        p.pacer(POLL_PACING, interval, interval, 1.0)
+    });
     // 空闲心跳：SameRev 路径静默返回，靠周期性 INFO 摘要证明部署器存活。
     let heartbeat_every = Duration::from_secs(deployer.cfg.heartbeat_log_secs);
     // The heartbeat log exists to prove this loop is alive, and a log line is not
@@ -11553,33 +11867,39 @@ pub async fn run_mainline_loop(
         move |beat| {
             let deployer = std::sync::Arc::clone(&deployer);
             let shutdown = shutdown.clone();
+            let pacer = pacer.clone();
             async move {
                 // 心跳句柄装进部署器：一轮里的每一跳由 `buildah` 自己打（步与步之间
                 // 隔着好几层函数，只有它两头都够得着）。
                 deployer.set_loop_beat(beat.clone());
-                let mut ticker = tokio::time::interval(interval);
                 // Last heartbeat is per attempt: a restarted loop re-logs on its
                 // first tick, which is the honest reading of "the loop started".
                 let mut last_heartbeat: Option<tokio::time::Instant> = None;
                 loop {
                     // Stamped every cycle, including the SameRev ones that return silently.
                     beat.beat();
+                    let started = tokio::time::Instant::now();
+                    // 一整轮体在 run_cycle 里，结果读数与这一轮的动作同处
+                    // 一个函数：它若排在某条早退之后，「每轮都记」就变成
+                    // 「只有走到底的那些轮才记」。
+                    deployer.run_cycle().await;
+                    let pass = started.elapsed();
+                    // 这一拍的目标间隔：上轮耗时经同一条律得出，种子托底。
+                    // 发布出去的就是回路真正在跑的周期，规则不必另猜一轮最长多久。
+                    // 等多久也从这一轮的起点算：跑得比种子久时，等待已经被这一轮
+                    // 用掉了，不在它之外再叠一个种子。
+                    let wait = wait_after_cycle(pacer.as_ref(), interval, pass);
+                    let due = last_heartbeat
+                        .map(|t| t.elapsed() >= heartbeat_every)
+                        .unwrap_or(true);
+                    if due {
+                        deployer.log_heartbeat().await;
+                        last_heartbeat = Some(tokio::time::Instant::now());
+                    }
                     tokio::select! {
                         biased;
                         _ = shutdown.wait() => break,
-                        _ = ticker.tick() => {
-                            // 一整轮体在 run_cycle 里，结果读数与这一轮的动作同处
-                            // 一个函数：它若排在某条早退之后，「每轮都记」就变成
-                            // 「只有走到底的那些轮才记」。
-                            deployer.run_cycle().await;
-                            let due = last_heartbeat
-                                .map(|t| t.elapsed() >= heartbeat_every)
-                                .unwrap_or(true);
-                            if due {
-                                deployer.log_heartbeat().await;
-                                last_heartbeat = Some(tokio::time::Instant::now());
-                            }
-                        }
+                        _ = tokio::time::sleep(wait) => {}
                     }
                 }
             }
@@ -14571,6 +14891,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             }),
             failed_rev: Some("112233445566aabb".into()),
             failed_cooldown_until: 1500,
+            environment_failures: 2,
             failed_signatures: vec![
                 Some("version:wait:cogneva-web:observed".into()),
                 Some("version:soak:cogneva-web:observed".into()),
@@ -15650,6 +15971,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             }),
             failed_rev: None,
             failed_cooldown_until: 0,
+            environment_failures: 0,
             failed_signatures: vec![None, Some("version:wait:web:observed".into())],
             failed_repeated: true,
             failed_class: FailureClass::Environment,
@@ -26441,6 +26763,7 @@ echo "||1"
             queued_polls: 9,
             peak: a_queued_host(),
             reader: Some("node worker-1".into()),
+            loaded_secs: 0,
         };
         let err = executor.pods_healthy(&target, &window).await.unwrap_err();
         let msg = err.to_string();
@@ -26482,6 +26805,7 @@ echo "||1"
             queued_polls: 5,
             peak: a_queued_host(),
             reader: Some("node worker-1".into()),
+            loaded_secs: 0,
         };
         let err = executor.pods_healthy(&target, &window).await.unwrap_err();
         let msg = err.to_string();
@@ -32616,7 +32940,169 @@ exit 0
             elapsed_usec: Some(36_300_000),
             memory_max_bytes: Some(2_147_483_648),
             memory_peak_bytes: Some(1_073_741_824),
+            startup_usec: None,
+            rollout_usec: None,
+            soak_usec: None,
         }
+    }
+
+    /// 主线轮询的下一拍跟着这一轮真正占用的时间走：跑得比种子久时等待为零（那一段
+    /// 已经被这一轮用掉了），目标周期与求值计数一起说明回路在跑、而且跟着输入变。
+    #[test]
+    fn the_mainline_wait_follows_what_a_cycle_cost() {
+        let pacing = std::sync::Arc::new(cog_core::pacing::PacingReadings::new());
+        let seed = Duration::from_secs(600);
+        let pacer = pacing.pacer(POLL_PACING, seed, seed, 1.0);
+
+        // 一轮 60 秒：种子仍是目标，等待是剩下的那 540 秒。
+        assert_eq!(
+            wait_after_cycle(Some(&pacer), seed, Duration::from_secs(60)),
+            Duration::from_secs(540)
+        );
+        // 一轮 900 秒：比种子久，下一拍跟着这一轮走，不在它之外再叠一个等待。
+        assert_eq!(
+            wait_after_cycle(Some(&pacer), seed, Duration::from_secs(900)),
+            Duration::ZERO
+        );
+        let (target, evaluations, derived) = pacing.target(POLL_PACING).unwrap();
+        assert_eq!(target, Duration::from_secs(900));
+        assert!(derived, "the beat still says its value is a seed");
+        assert_eq!(evaluations, 2, "the second beat was not evaluated");
+
+        // 一轮 1200 秒：目标再跟一次，求值计数再加一。
+        assert_eq!(
+            wait_after_cycle(Some(&pacer), seed, Duration::from_secs(1200)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            pacing.target(POLL_PACING).unwrap().0,
+            Duration::from_secs(1200)
+        );
+        assert_eq!(pacing.target(POLL_PACING).unwrap().1, 3);
+    }
+
+    /// 环境类失败的冷却由「连着坏了几次」定：第一次是种子，之后每多一次拉开一档，
+    /// 恢复后回到种子。次数是运行时量出来的，不是人钉的。
+    #[test]
+    fn a_second_environment_failure_stretches_the_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bare = root.join("bare");
+        let pacing = std::sync::Arc::new(cog_core::pacing::PacingReadings::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, &bare, "buildah", "kubectl"),
+            test_workspaces(root, &bare),
+        )
+        .with_pacing(pacing.clone());
+
+        assert_eq!(deployer.environment_cooldown_secs(1), 60);
+        assert_eq!(deployer.environment_cooldown_secs(2), 120);
+        assert_eq!(deployer.environment_cooldown_secs(3), 240);
+        let (target, evaluations, derived) = pacing.target(FAILURE_COOLDOWN_PACING).unwrap();
+        assert_eq!(target, Duration::from_secs(240));
+        assert_eq!(evaluations, 3);
+        assert!(derived);
+
+        // 一次收敛（次数清零）把等待带回种子，这一拍照样算过。
+        assert_eq!(deployer.environment_cooldown_secs(0), 60);
+        assert_eq!(pacing.target(FAILURE_COOLDOWN_PACING).unwrap().1, 4);
+    }
+
+    /// 两轮回收之间的冷却由「一次回收重启真实让 tag 服务缺席了多久」定：下次不花得
+    /// 比这次重启更频繁。换一次更长的重建，冷却跟着变。
+    #[test]
+    fn the_reclaim_cooldown_follows_how_long_a_rebuild_held_the_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bare = root.join("bare");
+        let pacing = std::sync::Arc::new(cog_core::pacing::PacingReadings::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, &bare, "buildah", "kubectl"),
+            test_workspaces(root, &bare),
+        )
+        .with_pacing(pacing.clone());
+
+        // 还没有一轮重建过：冷却停在 chart 的种子上。
+        assert_eq!(deployer.effective_registry_cooldown_secs(), 21_600);
+        assert_eq!(pacing.target(REGISTRY_COOLDOWN_PACING), None);
+
+        deployer.note_registry_rebuild_hold(1500);
+        assert_eq!(deployer.effective_registry_cooldown_secs(), 3000);
+        deployer.note_registry_rebuild_hold(2000);
+        assert_eq!(deployer.effective_registry_cooldown_secs(), 4000);
+
+        let (target, evaluations, derived) = pacing.target(REGISTRY_COOLDOWN_PACING).unwrap();
+        assert_eq!(target, Duration::from_secs(4000));
+        assert_eq!(evaluations, 2);
+        assert!(derived, "the cooldown still says its value is a seed");
+
+        // 0 秒不是样本：没量到代价就不动这一格。
+        let before = deployer.effective_registry_cooldown_secs();
+        deployer.note_registry_rebuild_hold(0);
+        assert_eq!(deployer.effective_registry_cooldown_secs(), before);
+    }
+
+    /// 三段等待各自量到的时长跨过短命判定 Job 的边界回到部署器：下一轮派发按新的
+    /// 尾部申报，三段各由自己那一段决定，互不牵连；并且读数面能看出这件事**又被**
+    /// 算过一次——目标跟着输入走、求值次数只增，两半一起才说明回路在跑，而不是一次
+    /// 算完就停的快照。
+    #[test]
+    fn a_measured_wait_turns_the_next_rollouts_declared_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bare = root.join("bare");
+        let cfg = test_config(root, &bare, "buildah", "kubectl");
+        let pacing = std::sync::Arc::new(cog_core::pacing::PacingReadings::new());
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_pacing(pacing.clone());
+
+        // 还没有一轮走完：三个界停在 chart 的种子上，读数面也还没有这几条回路。
+        assert_eq!(deployer.effective_startup_timeout_secs(), 900);
+        assert_eq!(deployer.effective_rollout_timeout_secs(), 60);
+        assert_eq!(deployer.effective_soak_secs(), 5); // 种子 1 秒被协议地板托住
+        assert_eq!(pacing.target(STARTUP_BUDGET_PACING), None);
+        assert_eq!(pacing.target(ROLLOUT_BUDGET_PACING), None);
+        assert_eq!(pacing.target(SOAK_BUDGET_PACING), None);
+
+        // 一轮走完：启动 40 秒、滚动 90 秒、静置里宿主在第 10 秒排到队。
+        let mut reading = a_reading();
+        reading.startup_usec = Some(40_000_000);
+        reading.rollout_usec = Some(90_000_000);
+        reading.soak_usec = Some(10_000_000);
+        deployer.record_rollout_durations(&reading);
+        assert_eq!(deployer.effective_startup_timeout_secs(), 80);
+        assert_eq!(deployer.effective_rollout_timeout_secs(), 180);
+        assert_eq!(deployer.effective_soak_secs(), 20);
+
+        // 第二轮的滚动更长、静置更久，启动没变：三段各自跟着自己的输入。
+        reading.rollout_usec = Some(200_000_000);
+        reading.soak_usec = Some(30_000_000);
+        deployer.record_rollout_durations(&reading);
+        assert_eq!(deployer.effective_startup_timeout_secs(), 80);
+        assert_eq!(deployer.effective_rollout_timeout_secs(), 400);
+        assert_eq!(deployer.effective_soak_secs(), 60);
+
+        // 每一条回路都算过两轮，且来源已经是实测。
+        for name in [
+            STARTUP_BUDGET_PACING,
+            ROLLOUT_BUDGET_PACING,
+            SOAK_BUDGET_PACING,
+        ] {
+            let (_, evaluations, derived) = pacing.target(name).unwrap();
+            assert_eq!(evaluations, 2, "{name} was not re-evaluated on the second round");
+            assert!(derived, "{name} still says its value is a seed");
+        }
+
+        // 换一个进程（新部署器、同一个状态目录）读到的是同一组尾部：重启不该把
+        // 已经量到过的历史丢掉、退回种子。
+        let restarted = MainlineDeployer::new(
+            test_config(root, &bare, "buildah", "kubectl"),
+            test_workspaces(root, &bare),
+        )
+        .with_pacing(std::sync::Arc::new(cog_core::pacing::PacingReadings::new()));
+        assert_eq!(restarted.effective_startup_timeout_secs(), 80);
+        assert_eq!(restarted.effective_rollout_timeout_secs(), 400);
+        assert_eq!(restarted.effective_soak_secs(), 60);
     }
 
     /// 读数与失败落点共用一条终止消息。落点必须还在第一行：读落点的那一端只认第一行
