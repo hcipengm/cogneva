@@ -15,6 +15,59 @@ pub struct ContextWindow {
     history: Vec<Message>,
     max_tokens: usize,
     current_tokens: usize,
+    /// 这一轮从提示词里挤掉了什么。裁剪一次记一次，攒到 [`Self::take_compaction`]
+    /// 取走为止；没有裁剪就一直是 `None`。
+    compaction: Option<Compaction>,
+}
+
+/// 一次（或一轮里几次）提示词裁剪的现场。
+///
+/// 裁剪是长对话的常态，但被挤出去的是**这段对话里已经发生过的事**：模型这一轮
+/// 不再看得见它，而屏幕上什么也没说——读者于是以为模型还记得。这份记录回答三件
+/// 事：挤掉了多少（条数与估算 token）、还在的那一段从哪一条开始、被挤掉那一段的
+/// 开头是什么。它由循环挂在这一轮的交付物上带给网关，界面据此画一行。
+///
+/// 不在这里生成摘要：摘要是第二次生成，读者分不清它是原文还是转述。给一段被挤掉
+/// 内容自己的开头，读者能认出那是哪一轮——与「引用里不带摘要」是同一条取舍。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Compaction {
+    /// 这一轮里被挤出提示词的消息条数（跨多次裁剪累加）。
+    pub dropped_messages: usize,
+    /// 这些消息按估算占了多少 token。
+    pub freed_tokens: usize,
+    /// 裁剪之后提示词里还剩多少条。
+    pub kept_messages: usize,
+    /// 还在的那一段从哪一条开始：`role: 开头几十个字`。
+    pub kept_from: Option<String>,
+    /// 被挤掉的第一条的开头：读者认得出这是哪一段对话。
+    pub dropped_head: Option<String>,
+    /// 这一次裁剪的界：窗口预算与低水位。两个数一起给，读者才看得出挤掉一大段
+    /// 是「窗口太小」还是「本来就这么紧」。
+    pub budget_tokens: usize,
+    pub target_tokens: usize,
+}
+
+/// 一条消息给人看的开头：角色 + 正文第一行，够读者认出是哪一轮。
+///
+/// 按字符截而不是按字节：正文里通常有中文，按字节切会落在字的中间。
+// cap: fixed — 一行摘要的长度，不是资源界；它只决定界面上「保留边界」写多长，
+// 60 个字够认出是哪一句，再长就把这一行挤成正文
+const HEADLINE_CHARS: usize = 60;
+
+fn headline(message: &Message) -> String {
+    let text = message.content();
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let total = first.chars().count();
+    let head: String = first.chars().take(HEADLINE_CHARS).collect();
+    if total > HEADLINE_CHARS {
+        format!("{}: {head}…", message.role())
+    } else {
+        format!("{}: {head}", message.role())
+    }
 }
 
 impl ContextWindow {
@@ -24,6 +77,7 @@ impl ContextWindow {
             history: Vec::new(),
             max_tokens,
             current_tokens: 0,
+            compaction: None,
         }
     }
 
@@ -174,6 +228,23 @@ impl ContextWindow {
         self.messages.clear();
         self.history.clear();
         self.current_tokens = 0;
+        // 裁剪记录属于**这一次运行**：清空窗口就是新的一段对话，上一段挤掉了
+        // 什么都不再是这一段的现场。
+        self.compaction = None;
+    }
+
+    /// 把这一轮累计的裁剪记录取走并清零。
+    ///
+    /// 取走而不是读：这条记录说的是「这一轮从提示词里挤掉了什么」，读到下一次
+    /// 运行里就是一份说错了对象的现场。没有裁剪就是 `None`——界面不发那条线。
+    pub fn take_compaction(&mut self) -> Option<Compaction> {
+        let mut report = self.compaction.take()?;
+        // 保留条数取**交出去这一刻**的投影长度：裁剪之后这一轮还可能追加了几条
+        // （模型的回答、工具结果），读者问的是「现在手上还剩多少」，不是裁剪那
+        // 一拍剩了多少。边界（`kept_from`）不重算——裁剪只从头段删，尾巴从哪一条
+        // 开始不会因为后面追加而改变。
+        report.kept_messages = self.messages.len();
+        Some(report)
     }
 
     /// Replace all messages and recalculate token count.
@@ -277,11 +348,37 @@ impl ContextWindow {
             }
             let mut freed = 0usize;
             let mut dropped = 0usize;
+            let mut dropped_head: Option<String> = None;
             for m in self.messages.drain(idx..end) {
                 freed += estimate_tokens(&m.content());
+                if dropped_head.is_none() {
+                    dropped_head = Some(headline(&m));
+                }
                 dropped += 1;
             }
             self.current_tokens = self.current_tokens.saturating_sub(freed);
+            // 记下这一轮挤掉了什么：模型下一轮就看不见它了，屏幕上必须有一行说
+            // 这件事。跨多次裁剪累加——一次运行里可能裁好几拍，读者要的是「这一轮
+            // 一共少看到多少」，不是最后一拍。
+            let kept_from = self
+                .messages
+                .iter()
+                .find(|m| !matches!(m, Message::System { .. }))
+                .map(headline);
+            let budget_tokens = self.max_tokens;
+            let target_tokens = self.trim_target();
+            let report = self.compaction.get_or_insert_with(|| Compaction {
+                budget_tokens,
+                target_tokens,
+                ..Compaction::default()
+            });
+            report.dropped_messages += dropped;
+            report.freed_tokens += freed;
+            report.kept_messages = self.messages.len();
+            report.kept_from = kept_from;
+            if report.dropped_head.is_none() {
+                report.dropped_head = dropped_head;
+            }
             // 裁剪只作用在投影上，所以这条报的是「模型这一轮少看到多少」，
             // 而不是「丢了什么」——被裁的轮次仍在 history 里，落进 raw 归档。
             // 不另铸指标：压力读数由耐久面自己给（transcript 的估算长度对窗口
@@ -780,6 +877,91 @@ mod tests {
         assert!(
             over_budget.is_empty(),
             "裁得下来的窗口报了超额：{over_budget:?}"
+        );
+    }
+
+    /// 裁过一次，就得留下现场：挤掉几条、多少 token、还在的尾巴从哪一句开始、
+    /// 被挤掉那一段的开头是什么。模型下一轮再也不看见它，这一份是屏幕上唯一
+    /// 说得出口的凭据。
+    #[test]
+    fn a_trim_records_what_fell_out_and_where_the_tail_begins() {
+        let mut ctx = ContextWindow::new(300);
+        ctx.add_message(Message::system("系统提示词"));
+        ctx.add_message(Message::user("任务输入"));
+        ctx.add_message(Message::assistant_text(&"先解释一段 ".repeat(20)));
+        ctx.add_message(Message::user(&"再问一段 ".repeat(20)));
+        ctx.add_message(Message::assistant_text(&"最后答一段 ".repeat(20)));
+        assert!(
+            ctx.token_count() <= 300,
+            "这条用例的题目是「裁过」，裁完必须在预算内：{}",
+            ctx.token_count()
+        );
+
+        let report = ctx.take_compaction().expect("窗口裁过，就必须有这一份现场");
+        assert!(
+            report.dropped_messages >= 1,
+            "裁过至少一条，读数是 {}",
+            report.dropped_messages
+        );
+        assert!(
+            report.freed_tokens > 0,
+            "挤掉的消息按估算总有 token：{}",
+            report.freed_tokens
+        );
+        assert_eq!(report.budget_tokens, 300);
+        assert_eq!(
+            report.target_tokens,
+            ctx.trim_target(),
+            "记录里的低水位必须就是这一次裁剪用的那一条"
+        );
+        assert_eq!(
+            report
+                .kept_from
+                .as_deref()
+                .map(|s| s.starts_with("user: 任务输入")),
+            Some(true),
+            "还在的尾巴从首条 user（地板）开始：{:?}",
+            report.kept_from
+        );
+        assert_eq!(
+            report
+                .dropped_head
+                .as_deref()
+                .map(|s| s.starts_with("assistant:")),
+            Some(true),
+            "被挤掉的第一条是紧随地板之后那条 assistant：{:?}",
+            report.dropped_head
+        );
+        assert_eq!(
+            report.kept_messages,
+            ctx.messages().len(),
+            "保留条数报的就是裁剪之后的投影长度"
+        );
+    }
+
+    /// 没裁过就没有现场，取走后也不留第二份：界面据此不画那一行，同一条记录
+    /// 也不会被下一次运行读成「这一轮挤掉了什么」。
+    #[test]
+    fn an_untouched_window_reports_no_compaction_and_taking_clears_it() {
+        let mut quiet = ContextWindow::new(10_000);
+        quiet.add_message(Message::user("一句短话"));
+        assert_eq!(
+            quiet.take_compaction(),
+            None,
+            "没裁过却报了一份现场：界面上会凭空多一行"
+        );
+
+        let mut ctx = ContextWindow::new(300);
+        ctx.add_message(Message::system("系统提示词"));
+        ctx.add_message(Message::user("任务输入"));
+        ctx.add_message(Message::assistant_text(&"先解释一段 ".repeat(20)));
+        ctx.add_message(Message::user(&"再问一段 ".repeat(20)));
+        ctx.add_message(Message::assistant_text(&"最后答一段 ".repeat(20)));
+        assert!(ctx.take_compaction().is_some(), "前提：这一段裁过");
+        assert_eq!(
+            ctx.take_compaction(),
+            None,
+            "同一份现场被取走两次：下一次运行会读成它自己的"
         );
     }
 

@@ -233,6 +233,8 @@ mod composer_takes_more_than_one_line_test;
 mod config_declaration_delivery_test;
 #[path = "config_section_reader_contract_test.rs"]
 mod config_section_reader_contract_test;
+#[path = "context_compaction_is_visible_test.rs"]
+mod context_compaction_is_visible_test;
 #[path = "contract_default_body_must_not_answer_success_it_did_not_earn.rs"]
 mod contract_default_body_must_not_answer_success_it_did_not_earn;
 #[path = "core_boundary_contract_test.rs"]

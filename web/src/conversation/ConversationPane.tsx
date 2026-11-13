@@ -18,7 +18,7 @@ import {
   type PermissionAsk,
 } from '@/store/permissionStore';
 import { useShell } from '@/shell/store';
-import type { TurnUsage } from '@/types/events';
+import type { ContextCompaction, TurnUsage } from '@/types/events';
 import { Note } from '@/ui/Note';
 
 /**
@@ -69,6 +69,25 @@ function usageLine(usage: TurnUsage): string {
   if (usage.durationMs !== null) parts.push(`${(usage.durationMs / 1000).toFixed(1)} 秒`);
   if (usage.model) parts.push(usage.model);
   if (usage.costUsd !== null) parts.push(`$${usage.costUsd.toFixed(4)}`);
+  return parts.join(' · ');
+}
+
+/**
+ * 一次上下文裁剪读成一行：挤掉多少、留下多少、尾巴从哪一句开始。
+ *
+ * 写的是服务端量出来的数，不在这里估算。「从「…」起」那一段是原文的开头，
+ * 不是模型写的摘要——读者据此认出被挤掉的是哪一轮，而这正是这一行存在的理由：
+ * 让「模型这一轮没看见那段」在屏幕上说得出口，而不是等它答得奇怪时去猜。
+ */
+function compactionLine(compaction: ContextCompaction): string {
+  const parts: string[] = ['上下文压缩'];
+  if (compaction.droppedMessages !== null) {
+    const freed =
+      compaction.freedTokens === null ? '' : `（约 ${compactCount(compaction.freedTokens)} tokens）`;
+    parts.push(`挤掉 ${compaction.droppedMessages} 条${freed}`);
+  }
+  if (compaction.keptMessages !== null) parts.push(`保留最近 ${compaction.keptMessages} 条`);
+  if (compaction.keptFrom) parts.push(`从「${compaction.keptFrom}」起`);
   return parts.join(' · ');
 }
 
@@ -310,6 +329,16 @@ function Turn({ message }: { message: ChatMessage }) {
             </span>
           ))}
         </div>
+      )}
+
+      {/*
+        这一轮把一段早期上下文挤出了提示词。它排在花销上面：先读「模型这一轮
+        少看到了什么」，再读「这一轮花了多少」——两件事都在这一条消息下面。
+      */}
+      {message.role === 'assistant' && message.compaction && (
+        <p className="mono mt-1 text-[10px] text-[var(--brass)]">
+          {compactionLine(message.compaction)}
+        </p>
       )}
 
       {/*

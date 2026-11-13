@@ -153,7 +153,8 @@ export type ChatFrameKind =
   | 'goal'
   | 'change'
   | 'identity'
-  | 'usage';
+  | 'usage'
+  | 'compaction';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -179,6 +180,9 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   // 数字是循环量出来的那一份，网关原样搬来。它排在 `message.end` 之前——收尾帧
   // 一到，这一条就定稿了，还没读到的花销再也没有落点。
   'message.usage': 'usage',
+  // 这一轮把一段早期上下文挤出了提示词：模型下一轮看不见它了。没有裁剪时
+  // 服务端根本不发这一帧，所以它的出现本身就是「这一段对话开始装不下了」。
+  'message.compaction': 'compaction',
 };
 
 /**
@@ -215,6 +219,8 @@ export interface ChatFrame {
   agentId: string | null;
   /** 只有 `usage` 帧带着：这一轮的花销。 */
   usage: TurnUsage | null;
+  /** 只有 `compaction` 帧带着：这一轮从提示词里挤掉了什么。 */
+  compaction: ContextCompaction | null;
   /**
    * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
    *
@@ -259,6 +265,28 @@ export interface TurnUsage {
   model: string | null;
   /** 按声明价目算出来的美元数。上游没声明价目时 `null`：没算，不是免费。 */
   costUsd: number | null;
+}
+
+/**
+ * 这一轮从提示词里挤掉了什么。
+ *
+ * 计数是循环量出来的那一份；两段开头是**原文的开头**，不是模型写的摘要——
+ * 读者据此认出被挤掉的是哪一轮、留下的尾巴从哪一句开始，而不必相信一段转述。
+ */
+export interface ContextCompaction {
+  /** 被挤出提示词的消息条数。 */
+  droppedMessages: number | null;
+  /** 这些消息按估算占了多少 token。 */
+  freedTokens: number | null;
+  /** 裁剪之后提示词里还剩多少条。 */
+  keptMessages: number | null;
+  /** 还在的那一段从哪一条开始（`role: 开头…`）。 */
+  keptFrom: string | null;
+  /** 被挤掉的第一条的开头（`role: 开头…`）。 */
+  droppedHead: string | null;
+  /** 这一次裁剪的界：窗口预算与低水位。 */
+  budgetTokens: number | null;
+  targetTokens: number | null;
 }
 
 /** 帧里的数字转成界面认得的数：不是有限数就是 `null`，不猜 0。 */
@@ -310,6 +338,18 @@ export function normalizeChatFrame(
             durationMs: frameCount(inner.duration_ms),
             model: typeof inner.model === 'string' ? inner.model : null,
             costUsd: frameCount(inner.cost_usd),
+          }
+        : null,
+    compaction:
+      kind === 'compaction'
+        ? {
+            droppedMessages: frameCount(inner.dropped_messages),
+            freedTokens: frameCount(inner.freed_tokens),
+            keptMessages: frameCount(inner.kept_messages),
+            keptFrom: typeof inner.kept_from === 'string' ? inner.kept_from : null,
+            droppedHead: typeof inner.dropped_head === 'string' ? inner.dropped_head : null,
+            budgetTokens: frameCount(inner.budget_tokens),
+            targetTokens: frameCount(inner.target_tokens),
           }
         : null,
     timestamp:

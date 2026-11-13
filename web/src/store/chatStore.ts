@@ -1,6 +1,12 @@
 import { create } from 'zustand';
 import { getSessionMessages } from '@/api/client';
-import type { ChatAttachment, ChatFrame, ChatRole, TurnUsage } from '@/types/events';
+import type {
+  ChatAttachment,
+  ChatFrame,
+  ChatRole,
+  ContextCompaction,
+  TurnUsage,
+} from '@/types/events';
 
 export type { ChatRole };
 
@@ -41,6 +47,14 @@ export interface ChatMessage {
    * 失败与被叫停的那一轮也没有。界面上因此不画这一行，而不是画一排零。
    */
   usage: TurnUsage | null;
+  /**
+   * 这一轮从提示词里挤掉了什么，由服务端的 `compaction` 帧带进来。
+   *
+   * `null` 是「这一轮没有裁剪」，不是「裁了 0 条」：服务端没有裁剪就不发这一帧，
+   * 界面因此不画那一行。读回的历史里也没有这一格——压缩是这一轮发生的事，
+   * 不是这条消息的属性。
+   */
+  compaction: ContextCompaction | null;
   /**
    * 这一句的原文落成的文件。只有超过窗口的那些带它：服务端把原文逐字写进执行器
    * 的一个文件，界面上这一条因此画成附件（带全文长度），而不是把开头当成全部。
@@ -356,6 +370,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 status: 'sending',
                 failure: null,
                 usage: null,
+                compaction: null,
                 attachment: null,
                 files,
                 at,
@@ -413,6 +428,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   status: 'streaming',
                   failure: null,
                   usage: null,
+                  compaction: null,
                   attachment: frame.attachment,
                   files: [],
                   at: frame.timestamp,
@@ -443,6 +459,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   status: 'streaming',
                   failure: null,
                   usage: null,
+                  compaction: null,
                   attachment: null,
                   files: [],
                   at: frame.timestamp,
@@ -510,6 +527,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
         case 'identity': {
           if (!frame.agentId || frame.agentId === session.agentId) break;
           session = { ...session, agentId: frame.agentId };
+          break;
+        }
+
+        case 'compaction': {
+          // 记在说这句话的那一条上，与花销同一种落点：挤掉的是这一轮模型手上
+          // 少看到的那一段，是这条回答的背景，不是一句新的话。
+          if (!frame.compaction) break;
+          const compaction = frame.compaction;
+          session = withMessage(session, frame.messageId, (message) => ({
+            ...message,
+            compaction,
+          }));
           break;
         }
 
@@ -581,6 +610,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             failure: line.failure,
             // 落库的只有正文：这一次读回来的花销没有存放处，于是空着。
             usage: null,
+            // 记录里不存这一格：压缩是那一轮发生的事，不是这条消息的属性。
+            compaction: null,
             // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
             attachment: null,
             // 记录里有名字与类型：刷新之后仍认得出这句话说过一张图。字节数

@@ -1098,6 +1098,41 @@ async fn emit_turn_usage(
     .await;
 }
 
+/// 上下文被挤掉了一段：模型下一轮不再看得见它，屏幕上得说一声。
+///
+/// 只在循环真的报了裁剪时发。没有裁剪也发一帧「0 条」是最省事的写法，但它把
+/// 一次真事件稀释成每轮都有的噪声，读者从此不再看它——「没发生」与「没量到」
+/// 在这一格上本来就该沉默。
+///
+/// 正文由界面拼：这里给的是计数与两段开头（还在的尾巴从哪起、被挤掉那段的
+/// 开头是什么），不在这里写一句人话——同一句话在界面与日志里各写一遍，改一处
+/// 漏一处时两边的说法就开始不一样。
+async fn emit_turn_compaction(
+    out: &mpsc::Sender<String>,
+    session_id: &str,
+    message_id: &str,
+    compaction: Option<&serde_json::Value>,
+) {
+    let Some(compaction) = compaction else { return };
+    let count = |key: &str| compaction.get(key).and_then(serde_json::Value::as_u64);
+    emit(
+        out,
+        session_id,
+        "message.compaction",
+        serde_json::json!({
+            "message_id": message_id,
+            "dropped_messages": count("dropped_messages"),
+            "freed_tokens": count("freed_tokens"),
+            "kept_messages": count("kept_messages"),
+            "kept_from": compaction.get("kept_from").and_then(serde_json::Value::as_str),
+            "dropped_head": compaction.get("dropped_head").and_then(serde_json::Value::as_str),
+            "budget_tokens": count("budget_tokens"),
+            "target_tokens": count("target_tokens"),
+        }),
+    )
+    .await;
+}
+
 /// 这一轮给模型看的历史：最近 [`SESSION_HISTORY_CAP`] 条，旧的最先。
 ///
 /// 读不到就按「没有历史」回答，不按「历史是空的」记一笔：这两种在读数上要分得开，
@@ -1566,6 +1601,12 @@ pub async fn run_chat_turn(
         .ok()
         .and_then(|value| value.get("usage"))
         .cloned();
+    // 这一轮挤掉了哪一段上下文：循环只在真裁过时才挂这一格，没有就是 `None`。
+    let turn_compaction = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("compaction"))
+        .cloned();
     let mut reply = journal.reply;
     let mut failure: Option<String> = None;
     match outcome {
@@ -1656,8 +1697,10 @@ pub async fn run_chat_turn(
         },
     }
 
-    // 6. 这一轮的花销：排在收尾帧之前，因为界面把它画在这一条消息下面——收尾帧
-    //    一到，这一条就定稿了。
+    // 6. 这一轮的现场：上下文挤掉了什么、花了多少。都排在收尾帧之前，因为界面
+    //    把它们画在这一条消息下面——收尾帧一到，这一条就定稿了。压缩在前：
+    //    它说的是这一轮模型手上少看到了什么，读的人先知道这件事再读花销。
+    emit_turn_compaction(&out, &session_id, &assistant_mid, turn_compaction.as_ref()).await;
     emit_turn_usage(&out, &session_id, &assistant_mid, turn_usage.as_ref()).await;
 
     // 7. 收尾帧放最后：`message.end` 是「这一轮结束了」的信号，界面收到它就把下
@@ -2017,6 +2060,51 @@ mod tests {
         assert!(frame.contains("\"input_tokens\":1234"), "{frame}");
         assert!(frame.contains("\"model\":\"some-model\""), "{frame}");
         assert!(frame.contains("\"cost_usd\":0.0123"), "{frame}");
+    }
+
+    /// 上下文被挤掉一段时，界面收到一帧带着计数与两段开头的现场。
+    #[tokio::test]
+    async fn a_turn_that_squeezed_the_context_says_so_in_one_frame() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let squeezed = serde_json::json!({
+            "dropped_messages": 12,
+            "freed_tokens": 3456,
+            "kept_messages": 9,
+            "kept_from": "user: 任务输入",
+            "dropped_head": "assistant: 先解释一段…",
+            "budget_tokens": 64000,
+            "target_tokens": 32000,
+        });
+
+        emit_turn_compaction(&out_tx, "s1", "m-1", Some(&squeezed)).await;
+
+        let frame = out_rx.recv().await.expect("这一帧要发出去");
+        assert!(frame.contains("\"message.compaction\""), "{frame}");
+        assert!(frame.contains("\"dropped_messages\":12"), "{frame}");
+        assert!(frame.contains("\"freed_tokens\":3456"), "{frame}");
+        assert!(
+            frame.contains("\"kept_from\":\"user: 任务输入\""),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("\"dropped_head\":\"assistant: 先解释一段…\""),
+            "{frame}"
+        );
+        assert!(frame.contains("\"budget_tokens\":64000"), "{frame}");
+    }
+
+    /// 没裁过就不发：每轮一帧「挤掉 0 条」，读者很快就不再读它了。
+    #[tokio::test]
+    async fn a_turn_that_did_not_squeeze_anything_says_nothing() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+
+        emit_turn_compaction(&out_tx, "s1", "m-1", None).await;
+        drop(out_tx);
+
+        assert!(
+            out_rx.recv().await.is_none(),
+            "循环没报裁剪时，屏幕上不该出现「挤掉 0 条」"
+        );
     }
 
     /// 没读到就不发：一帧全零的花销，读起来是「这一轮不要钱、没花时间」。

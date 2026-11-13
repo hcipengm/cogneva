@@ -1718,6 +1718,9 @@ impl AgentRuntime {
         let usage = self.run_usage.clone();
         let rounds = self.run_iterations;
         let elapsed_ms = started.elapsed().as_millis() as u64;
+        // 这一轮从提示词里挤掉了什么。取走而不是读：它属于这一跑，下一跑的清空
+        // 会把它抹掉，而错误的那一跑里它也可能存在（跑了一半就裁过）。
+        let compaction = self.context.take_compaction();
         let mut outcome = self.finish_scoped_run(None, started, outcome).await;
         if let Some(object) = outcome
             .as_mut()
@@ -1737,6 +1740,22 @@ impl AgentRuntime {
                     "cost_usd": usage.cost_usd,
                 }),
             );
+            // 只在真裁过时给这一格：没有裁剪就不写，网关也就不会发一帧「0 条」——
+            // 每一轮都报一次「没压缩」是噪声，读者从此不再读它。
+            if let Some(compaction) = compaction {
+                object.insert(
+                    "compaction".to_string(),
+                    serde_json::json!({
+                        "dropped_messages": compaction.dropped_messages,
+                        "freed_tokens": compaction.freed_tokens,
+                        "kept_messages": compaction.kept_messages,
+                        "kept_from": compaction.kept_from,
+                        "dropped_head": compaction.dropped_head,
+                        "budget_tokens": compaction.budget_tokens,
+                        "target_tokens": compaction.target_tokens,
+                    }),
+                );
+            }
         }
         outcome
     }
@@ -7424,6 +7443,86 @@ mod tests {
         assert!(
             usage["cost_usd"].is_null(),
             "没有声明价目时费用是 null：没算不是免费（{usage}）"
+        );
+    }
+
+    /// 这一轮的历史装不进窗口时，交付物上带着「挤掉了什么」；装得下时没有这一格。
+    ///
+    /// 这是界面那一行的唯一来源：模型这一轮少看到的那一段，除了循环没人量得到，
+    /// 而缺了这一格，屏幕上就不会有一条线说「上下文压缩了」。
+    #[tokio::test]
+    async fn a_turn_that_overflows_its_window_says_what_fell_out() {
+        let llm = ScriptedReplyLlm::new(&["好"]);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut runtime = AgentRuntime::new(
+            RuntimeConfig {
+                agent_id: "compaction-reader".into(),
+                context_window_size: 300,
+                ..Default::default()
+            },
+            tx,
+        );
+        let history = vec![
+            Message::system("系统提示词"),
+            Message::user("任务输入"),
+            Message::assistant_text(&"先解释一段 ".repeat(20)),
+            Message::user(&"再问一段 ".repeat(20)),
+            Message::assistant_text(&"最后答一段 ".repeat(20)),
+        ];
+        let result = runtime
+            .run_conversation(history, &llm)
+            .await
+            .expect("一轮对话");
+
+        let compaction = result
+            .get("compaction")
+            .expect("窗口裁过，交付物上就要带着这一份现场");
+        assert!(
+            compaction["dropped_messages"].as_u64().unwrap_or(0) >= 1,
+            "裁过至少一条：{compaction}"
+        );
+        assert!(
+            compaction["freed_tokens"].as_u64().unwrap_or(0) > 0,
+            "挤掉的按估算总有 token：{compaction}"
+        );
+        assert_eq!(
+            compaction["budget_tokens"].as_u64(),
+            Some(300),
+            "报的必须是这一跑真正生效的窗口：{compaction}"
+        );
+        assert!(
+            compaction["kept_from"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("user: 任务输入")),
+            "还在的尾巴从首条 user 开始：{compaction}"
+        );
+
+        // 另一侧：同一份历史放进一个装得下的窗口，交付物上没有这一格。没有裁剪
+        // 却报一格「0 条」，界面每一轮都会多一行，读者从此不再读它。
+        let llm = ScriptedReplyLlm::new(&["好"]);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut wide = AgentRuntime::new(
+            RuntimeConfig {
+                agent_id: "compaction-reader".into(),
+                context_window_size: 60_000,
+                ..Default::default()
+            },
+            tx,
+        );
+        let result = wide
+            .run_conversation(
+                vec![
+                    Message::system("系统提示词"),
+                    Message::user("任务输入"),
+                    Message::assistant_text("答一句"),
+                ],
+                &llm,
+            )
+            .await
+            .expect("一轮对话");
+        assert!(
+            result.get("compaction").is_none(),
+            "没裁过却报了裁剪：{result}"
         );
     }
 
