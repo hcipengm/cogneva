@@ -1329,17 +1329,29 @@ mod tests {
 
     #[test]
     fn the_convergence_wait_follows_what_a_round_cost() {
-        let readings =
-            Arc::new(cog_core::pacing::PacingReadings::new());
-        let pacer = readings.pacer(INTERVAL_PACING, Duration::from_secs(300), Duration::from_secs(300), 1.0);
+        let readings = Arc::new(cog_core::pacing::PacingReadings::new());
+        let pacer = readings.pacer(
+            INTERVAL_PACING,
+            Duration::from_secs(300),
+            Duration::from_secs(300),
+            1.0,
+        );
         // 一轮 20 秒：等待是节拍的剩余。
         assert_eq!(
-            next_wait(Some(&pacer), Duration::from_secs(300), Duration::from_secs(20)),
+            next_wait(
+                Some(&pacer),
+                Duration::from_secs(300),
+                Duration::from_secs(20)
+            ),
             Duration::from_secs(280)
         );
         // 一轮 900 秒：这一拍已经把等待用光，下一拍跟着这一轮让开。
         assert_eq!(
-            next_wait(Some(&pacer), Duration::from_secs(300), Duration::from_secs(900)),
+            next_wait(
+                Some(&pacer),
+                Duration::from_secs(300),
+                Duration::from_secs(900)
+            ),
             Duration::ZERO
         );
         let (target, evaluations, derived) = readings

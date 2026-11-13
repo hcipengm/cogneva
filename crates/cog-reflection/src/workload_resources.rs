@@ -181,12 +181,10 @@ pub const DEFAULT_CPU_METRIC: &str = "cogneva_limit_range_default_cpu_millicores
 pub const DEFAULT_MEMORY_METRIC: &str = "cogneva_limit_range_default_memory_bytes";
 
 /// 同一个容器的 CPU 请求，毫核。
-pub const DEFAULT_REQUEST_CPU_METRIC: &str =
-    "cogneva_limit_range_default_request_cpu_millicores";
+pub const DEFAULT_REQUEST_CPU_METRIC: &str = "cogneva_limit_range_default_request_cpu_millicores";
 
 /// 同一个容器的内存请求，字节。
-pub const DEFAULT_REQUEST_MEMORY_METRIC: &str =
-    "cogneva_limit_range_default_request_memory_bytes";
+pub const DEFAULT_REQUEST_MEMORY_METRIC: &str = "cogneva_limit_range_default_request_memory_bytes";
 
 /// 默认层这一拍算过几次。值不动时它照样走，是「拍子在跑」的那一半读数。
 pub const DEFAULTS_EVALUATIONS_METRIC: &str = "cogneva_limit_range_defaults_evaluations_total";
@@ -405,9 +403,9 @@ pub struct DefaultsReading {
 /// 在上面，替它发明一份等于在这条回路里再声明一次策略的形状。
 pub fn parse_limit_range(json: &Value) -> Option<DefaultsReading> {
     let limits = json.pointer("/spec/limits")?.as_array()?;
-    let container = limits.iter().find(|item| {
-        item.get("type").and_then(Value::as_str) == Some("Container")
-    })?;
+    let container = limits
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("Container"))?;
     let quantity = |block: &str, field: &str, parse: fn(&str) -> Option<u64>| {
         container
             .get(block)
@@ -1324,7 +1322,13 @@ impl WorkloadResourcesReadings {
     }
 
     /// 这一拍的启动失败预算。
-    pub fn observe_startup(&self, workload: &str, container: &str, threshold: u64, source: &'static str) {
+    pub fn observe_startup(
+        &self,
+        workload: &str,
+        container: &str,
+        threshold: u64,
+        source: &'static str,
+    ) {
         let mut rows = self.startups.lock().unwrap();
         let row = rows
             .entry(format!("{workload}/{container}"))
@@ -1402,13 +1406,7 @@ impl WorkloadResourcesReadings {
     }
 
     /// 这一拍这块内存盘的目标。
-    pub fn observe_shm(
-        &self,
-        workload: &str,
-        volume: &str,
-        size_bytes: u64,
-        source: &'static str,
-    ) {
+    pub fn observe_shm(&self, workload: &str, volume: &str, size_bytes: u64, source: &'static str) {
         let mut rows = self.shm.lock().unwrap();
         let row = rows
             .entry(format!("{workload}/{volume}"))
@@ -1421,7 +1419,6 @@ impl WorkloadResourcesReadings {
         row.size_bytes = size_bytes;
         row.source = source;
     }
-
 }
 
 #[async_trait]
@@ -1486,7 +1483,10 @@ impl Observable for WorkloadResourcesReadings {
                 (DEFAULT_CPU_METRIC, row.shape.cpu_limit_millicores),
                 (DEFAULT_MEMORY_METRIC, row.shape.memory_limit_bytes),
                 (DEFAULT_REQUEST_CPU_METRIC, row.shape.cpu_request_millicores),
-                (DEFAULT_REQUEST_MEMORY_METRIC, row.shape.memory_request_bytes),
+                (
+                    DEFAULT_REQUEST_MEMORY_METRIC,
+                    row.shape.memory_request_bytes,
+                ),
                 (DEFAULTS_EVALUATIONS_METRIC, row.evaluations),
             ] {
                 out.push(
@@ -1560,7 +1560,8 @@ pub fn ready_node_count(nodes: &Value) -> usize {
                         .is_some_and(|conditions| {
                             conditions.iter().any(|condition| {
                                 condition.get("type").and_then(Value::as_str) == Some("Ready")
-                                    && condition.get("status").and_then(Value::as_str) == Some("True")
+                                    && condition.get("status").and_then(Value::as_str)
+                                        == Some("True")
                             })
                         })
                 })
@@ -1586,7 +1587,11 @@ pub fn pod_ready_secs(pod: &Value) -> Option<u64> {
         .and_then(Value::as_str)?;
     let start = chrono::DateTime::parse_from_rfc3339(start).ok()?;
     let ready = chrono::DateTime::parse_from_rfc3339(ready).ok()?;
-    ready.signed_duration_since(start).num_seconds().try_into().ok()
+    ready
+        .signed_duration_since(start)
+        .num_seconds()
+        .try_into()
+        .ok()
 }
 
 /// 一拍的工作。
@@ -1618,7 +1623,8 @@ pub async fn round(
     )
     .map_err(|e| format!("workloads: {e}"))?;
     let workloads = parse_workloads(&workload_list);
-    let known: std::collections::BTreeSet<String> = workloads.iter().map(|w| w.name.clone()).collect();
+    let known: std::collections::BTreeSet<String> =
+        workloads.iter().map(|w| w.name.clone()).collect();
 
     let pods: Value =
         serde_json::from_str(&kubectl(&["get", "pods", "-n", ns, "-o", "json"]).await?)
@@ -1658,10 +1664,7 @@ pub async fn round(
             continue;
         };
         for (pod, containers) in parse_summary(&summary, ns) {
-            usage
-                .entry(pod)
-                .or_default()
-                .extend(containers.into_iter());
+            usage.entry(pod).or_default().extend(containers.into_iter());
         }
     }
 
@@ -1699,14 +1702,7 @@ pub async fn round(
         };
         for (container, sample) in containers {
             let key = format!("{kind}/{workload}/{container}");
-            window.push(
-                &key,
-                Sample {
-                    at: now,
-                    ..*sample
-                },
-                now,
-            );
+            window.push(&key, Sample { at: now, ..*sample }, now);
             fed += 1;
         }
     }
@@ -1807,23 +1803,22 @@ pub async fn round(
                         samples,
                     );
                     if wants_write(
-                            declared.cpu_request_millicores,
-                            targets.cpu_request_millicores,
-                            CPU_QUANTUM_MILLICORES,
-                        ) || wants_write(
-                            declared.memory_request_bytes,
-                            targets.memory_request_bytes,
-                            MEMORY_QUANTUM_BYTES,
-                        ) || wants_write(
-                            declared.cpu_limit_millicores,
-                            targets.cpu_limit_millicores,
-                            CPU_QUANTUM_MILLICORES,
-                        ) || wants_write(
-                            declared.memory_limit_bytes,
-                            targets.memory_limit_bytes,
-                            MEMORY_QUANTUM_BYTES,
-                        )
-                    {
+                        declared.cpu_request_millicores,
+                        targets.cpu_request_millicores,
+                        CPU_QUANTUM_MILLICORES,
+                    ) || wants_write(
+                        declared.memory_request_bytes,
+                        targets.memory_request_bytes,
+                        MEMORY_QUANTUM_BYTES,
+                    ) || wants_write(
+                        declared.cpu_limit_millicores,
+                        targets.cpu_limit_millicores,
+                        CPU_QUANTUM_MILLICORES,
+                    ) || wants_write(
+                        declared.memory_limit_bytes,
+                        targets.memory_limit_bytes,
+                        MEMORY_QUANTUM_BYTES,
+                    ) {
                         changes.insert(container.name.clone(), targets);
                     }
                 }
@@ -1864,12 +1859,7 @@ pub async fn round(
                 }
                 None => {
                     if let Some(declared) = volume.declared {
-                        readings.observe_shm(
-                            &workload.name,
-                            &volume.volume,
-                            declared,
-                            SOURCE_SEED,
-                        );
+                        readings.observe_shm(&workload.name, &volume.volume, declared, SOURCE_SEED);
                     }
                 }
             }
@@ -1985,10 +1975,7 @@ pub async fn round(
         ),
     }
 
-    Ok(RoundSummary {
-        evaluated,
-        patched,
-    })
+    Ok(RoundSummary { evaluated, patched })
 }
 
 /// 起这条回路。
@@ -2031,7 +2018,9 @@ pub fn spawn_workload_resources_loop(
                             patched = summary.patched,
                             "workload resources: round complete"
                         ),
-                        Err(e) => warn!(error = %e, "workload resources: round read nothing usable"),
+                        Err(e) => {
+                            warn!(error = %e, "workload resources: round read nothing usable")
+                        }
                     }
                     // 窗口落盘无论这一拍成败：这一拍读到的样本在下一次进程
                     // 重启后仍然算数，而一次读失败不该清空七天的历史。
@@ -2073,7 +2062,18 @@ mod tests {
     fn the_law_uses_the_p95_and_the_peak_not_the_mean() {
         let mib = 1024 * 1024;
         let cpu = [100, 100, 100, 100, 100, 100, 100, 100, 100, 1000];
-        let memory = [100 * mib, 100 * mib, 100 * mib, 100 * mib, 100 * mib, 100 * mib, 100 * mib, 100 * mib, 100 * mib, 900 * mib];
+        let memory = [
+            100 * mib,
+            100 * mib,
+            100 * mib,
+            100 * mib,
+            100 * mib,
+            100 * mib,
+            100 * mib,
+            100 * mib,
+            100 * mib,
+            900 * mib,
+        ];
         let targets = size_targets(&cpu, &memory).unwrap();
         // 10 个样本的第 95 百分位是 10 个里的第 10 个（ceil(9.5)），即 1000。
         assert_eq!(targets.cpu_request_millicores, 1000);
@@ -2101,8 +2101,22 @@ mod tests {
     fn the_window_drops_samples_older_than_seven_days() {
         let now = WINDOW_SECS + 100;
         let mut window = Window::default();
-        window.push("Deployment/a/c", Sample { at: 1, ..sample(1, 1) }, 1);
-        window.push("Deployment/a/c", Sample { at: now, ..sample(2, 2) }, now);
+        window.push(
+            "Deployment/a/c",
+            Sample {
+                at: 1,
+                ..sample(1, 1)
+            },
+            1,
+        );
+        window.push(
+            "Deployment/a/c",
+            Sample {
+                at: now,
+                ..sample(2, 2)
+            },
+            now,
+        );
         assert_eq!(window.samples("Deployment/a/c"), 1);
     }
 
@@ -2125,10 +2139,7 @@ mod tests {
         }
         window.save(&path).unwrap();
         let loaded = Window::load(&path);
-        assert_eq!(
-            loaded.samples("Deployment/a/c"),
-            MIN_SAMPLES
-        );
+        assert_eq!(loaded.samples("Deployment/a/c"), MIN_SAMPLES);
         assert!(loaded.targets("Deployment/a/c").is_some());
     }
 
@@ -2153,8 +2164,14 @@ mod tests {
         let mut spec = workload("Deployment", "gateway");
         spec.replica_policy = true;
         spec.replicas = Some(1);
-        let body = patch_body(&spec, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(), Some(2))
-            .expect("a replica move is a patch");
+        let body = patch_body(
+            &spec,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(2),
+        )
+        .expect("a replica move is a patch");
         assert_eq!(body.pointer("/spec/replicas"), Some(&json!(2)));
         assert!(
             body.pointer("/spec/template").is_none(),
@@ -2289,7 +2306,14 @@ mod tests {
     fn a_deployment_patch_lands_under_the_pod_template() {
         let mut changes = BTreeMap::new();
         changes.insert("c".to_string(), targets(800, 512 * 1024 * 1024));
-        let body = patch_body(&workload("Deployment", "gateway"), &changes, &BTreeMap::new(), &BTreeMap::new(), None).unwrap();
+        let body = patch_body(
+            &workload("Deployment", "gateway"),
+            &changes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             body.pointer("/spec/template/spec/containers/0/name")
                 .and_then(Value::as_str),
@@ -2306,7 +2330,14 @@ mod tests {
     fn a_cronjob_patch_lands_under_the_job_template() {
         let mut changes = BTreeMap::new();
         changes.insert("c".to_string(), targets(800, 512 * 1024 * 1024));
-        let body = patch_body(&workload("CronJob", "cogneva-backup"), &changes, &BTreeMap::new(), &BTreeMap::new(), None).unwrap();
+        let body = patch_body(
+            &workload("CronJob", "cogneva-backup"),
+            &changes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
         assert!(body
             .pointer("/spec/jobTemplate/spec/template/spec/containers/0/resources")
             .is_some());
@@ -2401,7 +2432,10 @@ mod tests {
     #[test]
     fn a_cronjob_pod_resolves_through_its_job() {
         let mut jobs = HashMap::new();
-        jobs.insert("cogneva-backup-123".to_string(), "cogneva-backup".to_string());
+        jobs.insert(
+            "cogneva-backup-123".to_string(),
+            "cogneva-backup".to_string(),
+        );
         let pod = json!({
             "metadata": {"ownerReferences": [{"kind": "Job", "name": "cogneva-backup-123"}]}
         });
@@ -2440,10 +2474,7 @@ mod tests {
         assert_eq!(workload.shm[0].declared, Some(1024 * 1024 * 1024));
 
         let mut containers = BTreeMap::new();
-        containers.insert(
-            "crawl4ai".to_string(),
-            targets(300, 512 * 1024 * 1024),
-        );
+        containers.insert("crawl4ai".to_string(), targets(300, 512 * 1024 * 1024));
         let mut shm = BTreeMap::new();
         shm.insert("shm".to_string(), 1024u64 * 1024 * 1024);
         let body = patch_body(&workload, &containers, &shm, &BTreeMap::new(), None).unwrap();
@@ -2484,7 +2515,14 @@ mod tests {
         // 没有容器挂它，调用方就不会把它放进 `shm_changes`；这里钉住的是解析面
         // 给出的答案：`container` 是空的，所以回路不会替它算。
         assert_eq!(workload.shm[0].container, None);
-        assert!(patch_body(&workload, &containers, &BTreeMap::new(), &BTreeMap::new(), None).is_some());
+        assert!(patch_body(
+            &workload,
+            &containers,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None
+        )
+        .is_some());
     }
 
     /// The namespace default is a function of the same measurement the
@@ -2493,9 +2531,11 @@ mod tests {
     #[test]
     fn the_namespace_default_follows_the_measured_requests() {
         let mib = 1024 * 1024;
-        let quiet =
-            default_shape(&[100, 100, 100, 100], &[64 * mib, 64 * mib, 64 * mib, 64 * mib])
-                .unwrap();
+        let quiet = default_shape(
+            &[100, 100, 100, 100],
+            &[64 * mib, 64 * mib, 64 * mib, 64 * mib],
+        )
+        .unwrap();
         let busy = default_shape(
             &[800, 800, 800, 800],
             &[512 * mib, 512 * mib, 512 * mib, 512 * mib],
@@ -2599,16 +2639,33 @@ mod tests {
             memory_limit_bytes: 512 * mib,
         };
         let body = limit_range_patch_body(&object, &shape).expect("a moved default is a patch");
-        let limits = body.pointer("/spec/limits").and_then(Value::as_array).unwrap();
+        let limits = body
+            .pointer("/spec/limits")
+            .and_then(Value::as_array)
+            .unwrap();
         assert_eq!(limits.len(), 2);
-        assert_eq!(limits[0].pointer("/default/cpu").and_then(Value::as_str), Some("1500m"));
         assert_eq!(
-            limits[0].pointer("/defaultRequest/cpu").and_then(Value::as_str),
+            limits[0].pointer("/default/cpu").and_then(Value::as_str),
+            Some("1500m")
+        );
+        assert_eq!(
+            limits[0]
+                .pointer("/defaultRequest/cpu")
+                .and_then(Value::as_str),
             Some("200m")
         );
-        assert_eq!(limits[0].pointer("/max/cpu").and_then(Value::as_str), Some("4"));
-        assert_eq!(limits[0].pointer("/min/cpu").and_then(Value::as_str), Some("10m"));
-        assert_eq!(limits[1].pointer("/type").and_then(Value::as_str), Some("PersistentVolumeClaim"));
+        assert_eq!(
+            limits[0].pointer("/max/cpu").and_then(Value::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            limits[0].pointer("/min/cpu").and_then(Value::as_str),
+            Some("10m")
+        );
+        assert_eq!(
+            limits[1].pointer("/type").and_then(Value::as_str),
+            Some("PersistentVolumeClaim")
+        );
 
         // 同一个形状第二次不产生 patch：差异小于一格时写回只让对象换个版本号。
         assert!(limit_range_patch_body(&object, &shape).is_some());

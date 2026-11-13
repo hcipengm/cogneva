@@ -290,8 +290,7 @@ pub fn spawn_claim_window_bound(
                     if in_flight >= capacity {
                         ran_full = true;
                     }
-                    let (applied, grew) =
-                        apply_claim_ceiling(&slots, capacity, ceiling, ran_full);
+                    let (applied, grew) = apply_claim_ceiling(&slots, capacity, ceiling, ran_full);
                     if grew {
                         ran_full = false;
                     }
@@ -600,25 +599,23 @@ impl TaskExecutorRouter {
             }
         }
 
-        let loops = streams
-            .into_iter()
-            .map(|ready_stream| {
-                let budget = if ready_stream == stop_the_line {
-                    preempting.clone()
-                } else if ready_stream == local {
-                    own.clone()
-                } else {
-                    claim.clone()
-                };
-                self.run_one_ready_stream(
-                    task_backend.clone(),
-                    result_backend.clone(),
-                    ready_stream,
-                    workspace_id.to_string(),
-                    budget,
-                    shutdown.clone(),
-                )
-            });
+        let loops = streams.into_iter().map(|ready_stream| {
+            let budget = if ready_stream == stop_the_line {
+                preempting.clone()
+            } else if ready_stream == local {
+                own.clone()
+            } else {
+                claim.clone()
+            };
+            self.run_one_ready_stream(
+                task_backend.clone(),
+                result_backend.clone(),
+                ready_stream,
+                workspace_id.to_string(),
+                budget,
+                shutdown.clone(),
+            )
+        });
 
         for outcome in futures::future::join_all(loops).await {
             if let Err(e) = outcome {

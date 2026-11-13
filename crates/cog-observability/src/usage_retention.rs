@@ -233,7 +233,11 @@ impl UsageRetention {
         // retires against this beat's measured cost of a day's writes, not
         // against the number the deployment wrote down at install time.
         let oldest_before = self.oldest_age_secs().await?;
-        let bytes = self.table_bytes().await.ok().map(|bytes| bytes.max(0) as u64);
+        let bytes = self
+            .table_bytes()
+            .await
+            .ok()
+            .map(|bytes| bytes.max(0) as u64);
         let (keep, keep_derived) = self.keep_for(oldest_before, bytes);
         let cutoff = chrono::Utc::now()
             - chrono::Duration::from_std(keep).unwrap_or_else(|_| chrono::Duration::days(30));

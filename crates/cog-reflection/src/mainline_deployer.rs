@@ -904,8 +904,7 @@ fn reclaim_threshold(
         return None;
     }
     let accrued = growth.and_then(|(bytes, elapsed_secs)| {
-        (elapsed_secs > 0)
-            .then(|| bytes as f64 / elapsed_secs as f64 * window_secs as f64)
+        (elapsed_secs > 0).then(|| bytes as f64 / elapsed_secs as f64 * window_secs as f64)
     });
     let reserve = match (accrued, rev_footprint_bytes) {
         (None, None) => return None,
@@ -3106,7 +3105,8 @@ pub struct MainlineDeployer {
     /// 尺寸律的第二个调用点，读数也该落在同一个面、带同一个 `source` 标签——
     /// 另开一套指标名只会让同一个量在两处读起来像两个东西。由部署器在 Job 结束后
     /// 把「下一次会写成什么」写进这里。
-    workload_resources: Option<std::sync::Arc<crate::workload_resources::WorkloadResourcesReadings>>,
+    workload_resources:
+        Option<std::sync::Arc<crate::workload_resources::WorkloadResourcesReadings>>,
     /// The governance declarations read at the tracked revision, kept to compare
     /// against what the cluster is enforcing.
     ///
@@ -3374,10 +3374,7 @@ impl MainlineDeployer {
     }
 
     /// 装载节拍与时限的读数面。
-    pub fn with_pacing(
-        mut self,
-        pacing: std::sync::Arc<cog_core::pacing::PacingReadings>,
-    ) -> Self {
+    pub fn with_pacing(mut self, pacing: std::sync::Arc<cog_core::pacing::PacingReadings>) -> Self {
         self.pacing = Some(pacing);
         self
     }
@@ -3404,9 +3401,7 @@ impl MainlineDeployer {
                 pacing.tail(
                     name,
                     std::time::Duration::from_secs(seed),
-                    std::time::Duration::from_secs(
-                        crate::mainline_rollout::ROLLOUT_POLL_SECS,
-                    ),
+                    std::time::Duration::from_secs(crate::mainline_rollout::ROLLOUT_POLL_SECS),
                     factor,
                 )
             });
@@ -3521,10 +3516,7 @@ impl MainlineDeployer {
     }
 
     /// 按登记表里的键取一个界。三段共三格，键与读数上的 `pacing` 标签同一个词。
-    fn duration_budget(
-        &self,
-        name: &str,
-    ) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
+    fn duration_budget(&self, name: &str) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
         match name {
             STARTUP_BUDGET_PACING => self.startup_budget(),
             ROLLOUT_BUDGET_PACING => self.rollout_budget(),
@@ -3536,9 +3528,7 @@ impl MainlineDeployer {
     /// 两轮回收共用冷却的句柄：输入是一次回收重启后 tag 服务重建索引真的花了
     /// 多久（`REGISTRY_REBUILD_HOLD_SECS_TOTAL` 记的就是这一段）。不花得比那次
     /// 重启本身更频繁，是这条回路的全部理由。
-    fn registry_cooldown_budget(
-        &self,
-    ) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
+    fn registry_cooldown_budget(&self) -> Option<std::sync::Arc<cog_core::pacing::TailBudget>> {
         self.budget(
             &self.registry_cooldown_budget,
             REGISTRY_COOLDOWN_PACING,
@@ -3614,7 +3604,10 @@ impl MainlineDeployer {
 
     /// 部署器愿意为一次判定等多久，按这一轮实际申报的那三段算。
     fn judgement_wait(&self) -> std::time::Duration {
-        judgement_wait_budget(self.effective_soak_secs(), self.effective_rollout_timeout_secs())
+        judgement_wait_budget(
+            self.effective_soak_secs(),
+            self.effective_rollout_timeout_secs(),
+        )
     }
 
     /// 装载本循环的心跳句柄；步与步之间打的点落在这一格上。
@@ -7609,7 +7602,9 @@ impl MainlineDeployer {
         let threshold = self.effective_registry_threshold(
             now,
             used,
-            declared.filter(|bytes| *bytes >= 1.0).map(|bytes| bytes as u64),
+            declared
+                .filter(|bytes| *bytes >= 1.0)
+                .map(|bytes| bytes as u64),
         );
         if state.in_flight.is_some() {
             return;
@@ -7684,7 +7679,9 @@ impl MainlineDeployer {
         // 种子，不是这次删除的天花板。
         let retention = self.effective_registry_retention(
             &tags,
-            declared.filter(|bytes| *bytes >= 1.0).map(|bytes| bytes as u64),
+            declared
+                .filter(|bytes| *bytes >= 1.0)
+                .map(|bytes| bytes as u64),
         );
         let doomed = prunable_tags(&tags, retention, &keep);
         // 这一轮的读数：白名单有多大、里面哪些 rev 是"集群正在跑"读来的、窗外有几个
@@ -8701,7 +8698,8 @@ impl MainlineDeployer {
                     // 「还要冷却到几点」——读的人以为有一段空转正在发生，实际没有。
                     state.failed_cooldown_until = match class {
                         FailureClass::Environment => {
-                            state.environment_failures = state.environment_failures.saturating_add(1);
+                            state.environment_failures =
+                                state.environment_failures.saturating_add(1);
                             chrono::Utc::now().timestamp()
                                 + self.environment_cooldown_secs(state.environment_failures) as i64
                         }
@@ -11175,10 +11173,9 @@ impl MainlineDeployer {
     /// 把一次跑的自量读数并进运行史。写进去的是**这一次跑**的平均核数与内存峰值，
     /// 不是声明的上限：上限是这一轮写进去的输入，拿它当结果等于没有测量。
     fn record_rollout_sizing(&self, reading: &RolloutResourceReading) {
-        let (Some(cpu), Some(memory)) = (
-            reading.average_cpu_millicores(),
-            reading.memory_peak_bytes,
-        ) else {
+        let (Some(cpu), Some(memory)) =
+            (reading.average_cpu_millicores(), reading.memory_peak_bytes)
+        else {
             return;
         };
         let at = reading
@@ -11196,9 +11193,7 @@ impl MainlineDeployer {
     }
 
     /// 下一次判定 Job 的目标资源；运行史不够时 `None`，调用方沿用 chart 的种子。
-    fn next_rollout_job_resources(
-        &self,
-    ) -> Option<(workload_resources::Targets, &'static str)> {
+    fn next_rollout_job_resources(&self) -> Option<(workload_resources::Targets, &'static str)> {
         workload_resources::rollout_job_targets(&self.load_rollout_sizing())
             .map(|targets| (targets, workload_resources::SOURCE_DERIVED))
     }
@@ -11246,9 +11241,7 @@ impl MainlineDeployer {
             cpu_limit_millicores: workload_resources::parse_cpu_millicores(
                 &self.cfg.job_cpu_limit,
             )?,
-            memory_limit_bytes: workload_resources::parse_memory_bytes(
-                &self.cfg.job_memory_limit,
-            )?,
+            memory_limit_bytes: workload_resources::parse_memory_bytes(&self.cfg.job_memory_limit)?,
         })
     }
 
@@ -24265,13 +24258,18 @@ exit 0
         let mut cfg = test_config(root, Path::new("/nonexistent"), "buildah", "kubectl");
         cfg.registry_retention = 20;
         let readings = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
-        let deployer =
-            MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
-                .with_retention(readings.clone());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_retention(readings.clone());
 
         // 1000 字节的卷 ÷ 每 rev 150 字节 = 6 个。
-        assert_eq!(deployer.effective_registry_retention(&tags(), Some(1000)), 6);
-        assert_eq!(readings.reading(REGISTRY_RETENTION_KNOB), Some((6.0, 1, true)));
+        assert_eq!(
+            deployer.effective_registry_retention(&tags(), Some(1000)),
+            6
+        );
+        assert_eq!(
+            readings.reading(REGISTRY_RETENTION_KNOB),
+            Some((6.0, 1, true))
+        );
 
         // 卷减半，下一拍跟着减半（不重启、不改声明）。
         assert_eq!(deployer.effective_registry_retention(&tags(), Some(500)), 3);
@@ -24357,9 +24355,8 @@ exit 0
         cfg.registry_maintenance_threshold = 0.5;
         cfg.registry_maintenance_cooldown_secs = 3_600;
         let readings = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
-        let deployer =
-            MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
-                .with_retention(readings.clone());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_retention(readings.clone());
         let declared = Some(10_000);
         // 第一拍没有上一拍可减：仍是声明的 seed，读数如实标 seed。
         assert_eq!(
@@ -33483,7 +33480,10 @@ exit 0
             SOAK_BUDGET_PACING,
         ] {
             let (_, evaluations, derived) = pacing.target(name).unwrap();
-            assert_eq!(evaluations, 2, "{name} was not re-evaluated on the second round");
+            assert_eq!(
+                evaluations, 2,
+                "{name} was not re-evaluated on the second round"
+            );
             assert!(derived, "{name} still says its value is a seed");
         }
 
@@ -33644,8 +33644,7 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let cfg = test_config(root, Path::new("/nonexistent"), "noop", "kubectl");
-        let readings =
-            std::sync::Arc::new(workload_resources::WorkloadResourcesReadings::new());
+        let readings = std::sync::Arc::new(workload_resources::WorkloadResourcesReadings::new());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_workload_resources(readings.clone());
 
@@ -33658,7 +33657,9 @@ exit 0
                 .into_iter()
                 .find(|m| {
                     m.name == name
-                        && m.labels.get(workload_resources::CONTAINER_LABEL).map(String::as_str)
+                        && m.labels
+                            .get(workload_resources::CONTAINER_LABEL)
+                            .map(String::as_str)
                             == Some(workload_resources::ROLLOUT_JOB_CONTAINER)
                 })
                 .unwrap_or_else(|| panic!("{name} 没有出现在读数面上"))
@@ -33668,7 +33669,9 @@ exit 0
         let seed = published(&readings, workload_resources::REQUEST_CPU_METRIC).await;
         assert_eq!(seed.value, 7.0, "还没量到任何一趟时，读的应是 chart 的种子");
         assert_eq!(
-            seed.labels.get(workload_resources::SOURCE_LABEL).map(String::as_str),
+            seed.labels
+                .get(workload_resources::SOURCE_LABEL)
+                .map(String::as_str),
             Some(workload_resources::SOURCE_SEED)
         );
         assert_eq!(
@@ -33690,7 +33693,10 @@ exit 0
             "请求应取实测均值的 p95 再按 10m 向上取整，而不是任何声明的数"
         );
         assert_eq!(
-            derived.labels.get(workload_resources::SOURCE_LABEL).map(String::as_str),
+            derived
+                .labels
+                .get(workload_resources::SOURCE_LABEL)
+                .map(String::as_str),
             Some(workload_resources::SOURCE_DERIVED)
         );
         let memory = published(&readings, workload_resources::REQUEST_MEMORY_METRIC).await;

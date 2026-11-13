@@ -113,8 +113,7 @@ pub fn question_plan(
     let seed_body = seed_body_bytes.max(1);
     let seed_candidates = seed_candidates.max(1);
     let n = sizes.len().max(1);
-    let seed_window =
-        scaffold_bytes.saturating_add(seed_body.saturating_mul(seed_candidates));
+    let seed_window = scaffold_bytes.saturating_add(seed_body.saturating_mul(seed_candidates));
     // A floor can only be lowered by the channel's own stated bound: evidence
     // about one request is not evidence that the deployment's practice is
     // wrong, and a failure it cannot explain (a blip) must not leave the
@@ -577,7 +576,12 @@ mod tests {
             None,
         );
         assert_eq!(
-            (quiet.body_bytes, quiet.max_candidates, quiet.probe, quiet.derived),
+            (
+                quiet.body_bytes,
+                quiet.max_candidates,
+                quiet.probe,
+                quiet.derived
+            ),
             (100, 2, false, false),
             "with nothing measured the declaration is the plan, and the reading says so"
         );

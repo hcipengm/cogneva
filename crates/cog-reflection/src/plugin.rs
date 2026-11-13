@@ -2786,129 +2786,132 @@ fn spawn_discovery_loop(
                     }
                     let started = std::time::Instant::now();
                     'round: {
-
-                    // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
-                    // 不是「这一轮没事发生」。松手也在这里——见上。
-                    if pool_gate.llm_paused() {
-                        if held.take().is_some() {
+                        // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
+                        // 不是「这一轮没事发生」。松手也在这里——见上。
+                        if pool_gate.llm_paused() {
+                            if held.take().is_some() {
+                                info!(
+                                    role = SELF_DISCOVERY_ROLE,
+                                    broker = broker_present,
+                                    "discovery role released: the LLM pool gate is closed, so the \
+                                 out-of-band writer can take it"
+                                );
+                            }
+                            // 这一轮不是持有者。**必须显式写回**：`may_act()` 这一轮不再问，
+                            // `cogneva_loop_owner_held` 会上一次写的 1 一直留着，那条 gauge
+                            // 于是会一直说「我持着」，直到池恢复——而池恢复可能在几小时之后。
+                            //
+                            // 写的是 `Yielded` 而不是 `Elsewhere`：这条环不是**输了**这个角色
+                            // （没有别人持着它，也没有人告诉过它是别人的），是**自己站开了**。
+                            // 这个区别在告警面上是真金白银——`Yielded` 会把
+                            // `cogneva_loop_role_declared` 写成 0，而「已声明但没人持」那条
+                            // critical 规则要的是 1；塌成 `Elsewhere`（声明仍是 1、持有是 0）
+                            // 会让池一关超过 15 分钟就报一条「这条环没人管了」，而那时恰恰是
+                            // 它按设计把角色让出去的时候。
+                            beat.note_ownership(cog_core::Ownership::Yielded);
+                            held_rounds += 1;
                             info!(
                                 role = SELF_DISCOVERY_ROLE,
                                 broker = broker_present,
-                                "discovery role released: the LLM pool gate is closed, so the \
-                                 out-of-band writer can take it"
+                                held_rounds,
+                                period_secs = period.as_secs(),
+                                "discovery round held off: the LLM pool gate is closed"
                             );
+                            break 'round;
                         }
-                        // 这一轮不是持有者。**必须显式写回**：`may_act()` 这一轮不再问，
-                        // `cogneva_loop_owner_held` 会上一次写的 1 一直留着，那条 gauge
-                        // 于是会一直说「我持着」，直到池恢复——而池恢复可能在几小时之后。
-                        //
-                        // 写的是 `Yielded` 而不是 `Elsewhere`：这条环不是**输了**这个角色
-                        // （没有别人持着它，也没有人告诉过它是别人的），是**自己站开了**。
-                        // 这个区别在告警面上是真金白银——`Yielded` 会把
-                        // `cogneva_loop_role_declared` 写成 0，而「已声明但没人持」那条
-                        // critical 规则要的是 1；塌成 `Elsewhere`（声明仍是 1、持有是 0）
-                        // 会让池一关超过 15 分钟就报一条「这条环没人管了」，而那时恰恰是
-                        // 它按设计把角色让出去的时候。
-                        beat.note_ownership(cog_core::Ownership::Yielded);
-                        held_rounds += 1;
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            broker = broker_present,
-                            held_rounds,
-                            period_secs = period.as_secs(),
-                            "discovery round held off: the LLM pool gate is closed"
-                        );
-                        break 'round;
-                    }
 
-                    // 池开着：这一轮手里必须有角色。没有就现领一个（`RoleHold` 自带按契约
-                    // 节拍续租的续期任务；租约那一刻空着的话，这一领当轮即成）。
-                    // 克隆先落到局部变量，是为了让这次领角色的**实参表里不出现带括号的
-                    // 表达式**——源码判据按第一个 `)` 截实参表，`.clone()` 会让它截在
-                    // `role_broker.clone(` 上，于是「领的是不是这个角色」那一条恒假。
-                    if held.is_none() {
-                        let broker = role_broker.clone();
-                        let beat_for_role = role_beat.clone();
-                        held = Some(cog_core::RoleHold::start(
-                            broker,
-                            SELF_DISCOVERY_ROLE,
-                            beat_for_role,
-                            &shutdown,
-                        ));
-                    }
-                    let hold = held.as_ref().expect("上一行刚保证这里有一个 RoleHold");
+                        // 池开着：这一轮手里必须有角色。没有就现领一个（`RoleHold` 自带按契约
+                        // 节拍续租的续期任务；租约那一刻空着的话，这一领当轮即成）。
+                        // 克隆先落到局部变量，是为了让这次领角色的**实参表里不出现带括号的
+                        // 表达式**——源码判据按第一个 `)` 截实参表，`.clone()` 会让它截在
+                        // `role_broker.clone(` 上，于是「领的是不是这个角色」那一条恒假。
+                        if held.is_none() {
+                            let broker = role_broker.clone();
+                            let beat_for_role = role_beat.clone();
+                            held = Some(cog_core::RoleHold::start(
+                                broker,
+                                SELF_DISCOVERY_ROLE,
+                                beat_for_role,
+                                &shutdown,
+                            ));
+                        }
+                        let hold = held.as_ref().expect("上一行刚保证这里有一个 RoleHold");
 
-                    // 角色在别处：这一轮不动手。跳过的那一答 `may_act()` 已经记在
-                    // beat 上（`cogneva_loop_owner_held` 一族），所以这句是给人看的
-                    // 第二面而不是唯一读数面；级别与同族对齐（`cog-github` 那条环
-                    // 同样的跳过是 `info!`）。
-                    if !hold.may_act().await {
-                        held_rounds += 1;
-                        info!(
+                        // 角色在别处：这一轮不动手。跳过的那一答 `may_act()` 已经记在
+                        // beat 上（`cogneva_loop_owner_held` 一族），所以这句是给人看的
+                        // 第二面而不是唯一读数面；级别与同族对齐（`cog-github` 那条环
+                        // 同样的跳过是 `info!`）。
+                        if !hold.may_act().await {
+                            held_rounds += 1;
+                            info!(
                             role = SELF_DISCOVERY_ROLE,
                             broker = broker_present,
                             held_rounds,
                             "discovery round skipped: another process holds the self-discovery role"
                         );
-                        break 'round;
-                    }
-
-                    // 恢复后的**第一个真跑轮**把计数写回 0 并印一次：状态类读数必须由
-                    // 结束那一轮写回，否则「连续被扣住到某轮为止」永远读不到尾——池一
-                    // 恢复那句就不再出现，读者手上只剩最后一个非零值。
-                    if held_rounds > 0 {
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            broker = broker_present,
-                            held_rounds,
-                            "discovery round resumed after being held off"
-                        );
-                        held_rounds = 0;
-                    }
-
-                    // 先把已经交出去的探针的结局收回来。**在生成之前**：这一拍要不要再
-                    // 生成看的是池子（受理那一刻已过滤），与结局无关；但两件事放在同一拍
-                    // 的日志里，读数才在同一个窗口上。
-                    let waiting_before = pending.len();
-                    let outcomes =
-                        settle_discovery_outcomes(&outcome_engine, &mut pending, &readings, |id| {
-                            let orchestrator = orchestrator.clone();
-                            async move { orchestrator.get_task(&id).await }
-                        })
-                        .await;
-                    if waiting_before > 0 {
-                        // 一处出口、一行读数、每个出口一个数：合并成「收了 N 条」会让
-                        // 「全都读到了判词」与「全都没带判词回来」逐字同形，而后者正是
-                        // 「这条环还没有判官」那条发现本身。
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            waited = waiting_before,
-                            validated = outcomes.validated,
-                            rejected = outcomes.rejected,
-                            inconclusive = outcomes.inconclusive,
-                            unanswered = outcomes.unanswered,
-                            run_ended_without_result = outcomes.run_ended_without_result,
-                            row_missing = outcomes.row_missing,
-                            expired = outcomes.expired,
-                            still_open = outcomes.still_open,
-                            not_recorded = outcomes.not_recorded,
-                            "discovery probe outcomes read back"
-                        );
-                    }
-
-                    let tool_names = tool_registry.names();
-                    // 一轮的宽度以工具面自身的大小为界，不钉一个数：工具面翻倍时
-                    // 这一轮跟着放宽，而生成器自己按组合去重，试过的不再出现——
-                    // 稳态下这一轮生成 0 条，循环的代价就不在生成上。
-                    let max_tasks = tool_names.len().max(1);
-                    let skill_ids: Vec<String> = match skill_registry.as_ref() {
-                        Some(reg) => {
-                            let guard = reg.read().await;
-                            guard.get_all().iter().map(|s| s.id.clone()).collect()
+                            break 'round;
                         }
-                        None => Vec::new(),
-                    };
-                    let round = run_discovery_round(
+
+                        // 恢复后的**第一个真跑轮**把计数写回 0 并印一次：状态类读数必须由
+                        // 结束那一轮写回，否则「连续被扣住到某轮为止」永远读不到尾——池一
+                        // 恢复那句就不再出现，读者手上只剩最后一个非零值。
+                        if held_rounds > 0 {
+                            info!(
+                                role = SELF_DISCOVERY_ROLE,
+                                broker = broker_present,
+                                held_rounds,
+                                "discovery round resumed after being held off"
+                            );
+                            held_rounds = 0;
+                        }
+
+                        // 先把已经交出去的探针的结局收回来。**在生成之前**：这一拍要不要再
+                        // 生成看的是池子（受理那一刻已过滤），与结局无关；但两件事放在同一拍
+                        // 的日志里，读数才在同一个窗口上。
+                        let waiting_before = pending.len();
+                        let outcomes = settle_discovery_outcomes(
+                            &outcome_engine,
+                            &mut pending,
+                            &readings,
+                            |id| {
+                                let orchestrator = orchestrator.clone();
+                                async move { orchestrator.get_task(&id).await }
+                            },
+                        )
+                        .await;
+                        if waiting_before > 0 {
+                            // 一处出口、一行读数、每个出口一个数：合并成「收了 N 条」会让
+                            // 「全都读到了判词」与「全都没带判词回来」逐字同形，而后者正是
+                            // 「这条环还没有判官」那条发现本身。
+                            info!(
+                                role = SELF_DISCOVERY_ROLE,
+                                waited = waiting_before,
+                                validated = outcomes.validated,
+                                rejected = outcomes.rejected,
+                                inconclusive = outcomes.inconclusive,
+                                unanswered = outcomes.unanswered,
+                                run_ended_without_result = outcomes.run_ended_without_result,
+                                row_missing = outcomes.row_missing,
+                                expired = outcomes.expired,
+                                still_open = outcomes.still_open,
+                                not_recorded = outcomes.not_recorded,
+                                "discovery probe outcomes read back"
+                            );
+                        }
+
+                        let tool_names = tool_registry.names();
+                        // 一轮的宽度以工具面自身的大小为界，不钉一个数：工具面翻倍时
+                        // 这一轮跟着放宽，而生成器自己按组合去重，试过的不再出现——
+                        // 稳态下这一轮生成 0 条，循环的代价就不在生成上。
+                        let max_tasks = tool_names.len().max(1);
+                        let skill_ids: Vec<String> = match skill_registry.as_ref() {
+                            Some(reg) => {
+                                let guard = reg.read().await;
+                                guard.get_all().iter().map(|s| s.id.clone()).collect()
+                            }
+                            None => Vec::new(),
+                        };
+                        let round = run_discovery_round(
                         &discovery,
                         |goal, task| {
                             let orchestrator = orchestrator.clone();
@@ -2927,44 +2930,44 @@ fn spawn_discovery_loop(
                         std::time::Instant::now() + discovery_round_wall(period),
                     )
                     .await;
-                    // 受理了就要欠着一条结局——**这一句是回程的入口**。少了它，
-                    // `evaluate_discovery_result` 又一次没有调用者，而这条环会在每一拍
-                    // 重新问同一个问题、没有任何一条证据留下来。
-                    for (task_id, probe, declared_secs) in round.handed_over {
-                        pending.push(PendingProbe {
-                            task_id,
-                            probe,
-                            deadline: outcome_deadline(declared_secs, period),
-                        });
-                    }
-                    if round.held_back > 0 {
-                        // 与下一句分开：这一拍**有**新组合可提，只是上一批还没走完。
-                        // 合成一句「没有新组合」会让「池子消化不动」读成「搜索空间
-                        // 穷尽」，而两者下一拍该做的事相反。
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            waiting = round.held_back,
-                            round_width = max_tasks,
-                            "discovery round deferred: earlier probes are still unanswered"
-                        );
-                        break 'round;
-                    }
-                    if round.generated == 0 {
-                        debug!(
-                            tools = tool_names.len(),
-                            "discovery round: every combination in reach has been tried"
-                        );
-                        break 'round;
-                    }
+                        // 受理了就要欠着一条结局——**这一句是回程的入口**。少了它，
+                        // `evaluate_discovery_result` 又一次没有调用者，而这条环会在每一拍
+                        // 重新问同一个问题、没有任何一条证据留下来。
+                        for (task_id, probe, declared_secs) in round.handed_over {
+                            pending.push(PendingProbe {
+                                task_id,
+                                probe,
+                                deadline: outcome_deadline(declared_secs, period),
+                            });
+                        }
+                        if round.held_back > 0 {
+                            // 与下一句分开：这一拍**有**新组合可提，只是上一批还没走完。
+                            // 合成一句「没有新组合」会让「池子消化不动」读成「搜索空间
+                            // 穷尽」，而两者下一拍该做的事相反。
+                            info!(
+                                role = SELF_DISCOVERY_ROLE,
+                                waiting = round.held_back,
+                                round_width = max_tasks,
+                                "discovery round deferred: earlier probes are still unanswered"
+                            );
+                            break 'round;
+                        }
+                        if round.generated == 0 {
+                            debug!(
+                                tools = tool_names.len(),
+                                "discovery round: every combination in reach has been tried"
+                            );
+                            break 'round;
+                        }
 
-                    info!(
-                        tools = tool_names.len(),
-                        skills = skill_ids.len(),
-                        submitted = round.submitted,
-                        refused = round.refused,
-                        deferred = round.deferred,
-                        "autonomous discovery round"
-                    );
+                        info!(
+                            tools = tool_names.len(),
+                            skills = skill_ids.len(),
+                            submitted = round.submitted,
+                            refused = round.refused,
+                            deferred = round.deferred,
+                            "autonomous discovery round"
+                        );
                     }
                     let pass = started.elapsed();
                     wait = discovery_wait(pacer.as_ref(), period, pass);

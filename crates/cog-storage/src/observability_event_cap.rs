@@ -215,7 +215,10 @@ impl EventLogCap {
 
     /// The floor this beat enforces, and whether a reader's question widened it.
     fn effective_read_window(&self) -> (u64, bool) {
-        read_window_secs(self.read_window.as_secs(), longest_read_span(KNOB_READ_WINDOW))
+        read_window_secs(
+            self.read_window.as_secs(),
+            longest_read_span(KNOB_READ_WINDOW),
+        )
     }
 
     /// The window below which no row is deletable.

@@ -141,11 +141,7 @@ async fn unreferenced_rows_go_oldest_first() {
         .snapshot(&pool, "recent", ChronoDuration::minutes(30))
         .await;
 
-    let outcome = scratch
-        .cap(&pool, 2)
-        .sweep_once()
-        .await
-        .expect("sweep");
+    let outcome = scratch.cap(&pool, 2).sweep_once().await.expect("sweep");
 
     assert_eq!(outcome.removed, 4, "four rows have to go to reach two");
     assert_eq!(outcome.held, 2);
@@ -176,11 +172,7 @@ async fn a_snapshot_a_board_names_survives_at_any_age() {
     }
     scratch.point_at(&pool, "task-resume", "resume").await;
 
-    let outcome = scratch
-        .cap(&pool, 1)
-        .sweep_once()
-        .await
-        .expect("sweep");
+    let outcome = scratch.cap(&pool, 1).sweep_once().await.expect("sweep");
 
     assert_eq!(
         outcome.removed, 4,
@@ -209,7 +201,9 @@ async fn a_store_the_pointers_hold_over_capacity_says_so() {
     // say so rather than report the capacity met.
     for n in 0..3 {
         let id = format!("resume-{n}");
-        scratch.snapshot(&pool, &id, ChronoDuration::days(10 + n)).await;
+        scratch
+            .snapshot(&pool, &id, ChronoDuration::days(10 + n))
+            .await;
         scratch.point_at(&pool, &format!("task-{n}"), &id).await;
     }
 
@@ -280,11 +274,7 @@ async fn a_pass_with_pruning_off_deletes_nothing() {
             .await;
     }
 
-    let outcome = scratch
-        .cap(&pool, 0)
-        .sweep_once()
-        .await
-        .expect("sweep");
+    let outcome = scratch.cap(&pool, 0).sweep_once().await.expect("sweep");
 
     assert_eq!(
         outcome.removed, 0,

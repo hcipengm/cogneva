@@ -1541,8 +1541,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // input was measured, and how many beats it has run. A target that does
         // not move between beats is correct; the beat count is what separates a
         // steady table from a stopped sweep.
-        let retention_readings =
-            std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
+        let retention_readings = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
         ctx.publish_observable(retention_readings.clone());
         let database_volume = cog_core::retention::database_volume_from_env();
         let event_max_rows = crate::observability_event_cap::max_rows_from_env();

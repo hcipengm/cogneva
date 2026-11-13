@@ -416,8 +416,7 @@ fn a_key_with_no_row_is_the_same_hole_as_a_key_with_no_loop() {
         // counter named in the registry and nowhere in the code counts nothing,
         // and the row would read as proof while the reading had no beat cell.
         if let Some(published) = &row.published {
-            let publisher =
-                without_line_comments(&read(&repo_root().join(&published.file)));
+            let publisher = without_line_comments(&read(&repo_root().join(&published.file)));
             if !publisher.contains(&proof.evidence) {
                 wrong.push(format!(
                     "`{}` names `{}` as its beat evidence, and `{}` does not carry \
@@ -685,7 +684,8 @@ fn the_registry_vocabulary_has_no_override() {
         .enumerate()
         .filter(|(_, line)| {
             let line = line.trim_start();
-            line.strip_prefix("source:").is_some_and(|rest| rest.trim() == "override")
+            line.strip_prefix("source:")
+                .is_some_and(|rest| rest.trim() == "override")
         })
         .map(|(index, _)| format!("{REGISTRY}:{}", index + 1))
         .collect();

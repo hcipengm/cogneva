@@ -35,9 +35,8 @@ use std::sync::Arc;
 use crate::hostdocs_assist::{
     build_prompt, question_plan, request_body, scaffold_upper_bound, truncate_to_wire, wire_len,
     AuditedChannel, QuestionPlan, ASSIST_MAX_BODY_BYTES_ENV, ASSIST_MAX_CANDIDATES_ENV,
-    ASSIST_OUTCOMES, AUDIT_BUDGET_ENV,
-    DEFAULT_ASSIST_MAX_BODY_BYTES, DEFAULT_ASSIST_MAX_CANDIDATES,
-    URL_ENV as AUDITED_LLM_URL_ENV,
+    ASSIST_OUTCOMES, AUDIT_BUDGET_ENV, DEFAULT_ASSIST_MAX_BODY_BYTES,
+    DEFAULT_ASSIST_MAX_CANDIDATES, URL_ENV as AUDITED_LLM_URL_ENV,
 };
 use crate::hostdocs_organizer::{
     propose, OrganizeProposal, OrganizeRules, CLASSIFIED_OUTCOMES, DEFAULT_RULES, ORGANIZE_OUTCOMES,
@@ -84,8 +83,7 @@ pub const ASSIST_QUESTION_FILES_METRIC: &str = "sandbox_host_docs_assist_questio
 pub const ASSIST_PLAN_SOURCE_METRIC: &str = "sandbox_host_docs_assist_plan_source";
 /// How many times the assist plan has been recomputed. The value may not move
 /// when nothing was measured; this is what tells a quiet station from a stalled one.
-pub const ASSIST_PLAN_EVALUATIONS_METRIC: &str =
-    "sandbox_host_docs_assist_plan_evaluations_total";
+pub const ASSIST_PLAN_EVALUATIONS_METRIC: &str = "sandbox_host_docs_assist_plan_evaluations_total";
 /// The label that says whether the window in force came from the declaration
 /// (`seed`) or from a measured approval (`derived`).
 pub const SOURCE_LABEL: &str = "source";
@@ -1520,7 +1518,12 @@ impl HostDocs {
                 Ok(read) => {
                     let full_wire = wire_len(&read.content);
                     let (prefix, _) = truncate_to_wire(&read.content, keep);
-                    read_bodies.push((path.clone(), read.bytes as usize, full_wire, prefix.to_string()));
+                    read_bodies.push((
+                        path.clone(),
+                        read.bytes as usize,
+                        full_wire,
+                        prefix.to_string(),
+                    ));
                 }
                 Err(refusal) => {
                     warn!(
@@ -3246,7 +3249,11 @@ mod tests {
     #[test]
     fn the_approval_window_follows_the_measured_latency() {
         let day = 86_400;
-        assert_eq!(approval_ttl_secs(day, None), (day, false), "没有实测，声明生效");
+        assert_eq!(
+            approval_ttl_secs(day, None),
+            (day, false),
+            "没有实测，声明生效"
+        );
         assert_eq!(
             approval_ttl_secs(day, Some(7_200)),
             (day, false),
@@ -3332,7 +3339,8 @@ mod tests {
         let (_d, cfg) = temp_scope();
         let root = scope_root(&cfg);
         std::fs::write(root.join("IMG_0421"), "a photo of a harbour at dusk").unwrap();
-        let (url, seen) = spawn_channel(r#"{"IMG_0421":"images","another":"images","diary":"documents"}"#).await;
+        let (url, seen) =
+            spawn_channel(r#"{"IMG_0421":"images","another":"images","diary":"documents"}"#).await;
         let mut on = reading(&cfg);
         on.audited_llm_url = Some(url);
         // 小到能在断言里读出算法：一份正文 8 wire 字节、一道问句一个文件、
@@ -3361,8 +3369,14 @@ mod tests {
         // 一个文件：计划保留声明的前缀，问句盖住一个文件。
         let first = docs.organize("alice").await.unwrap();
         assert_eq!(first.assist, "answered");
-        assert_eq!(assist_measure(&docs.metrics(), ASSIST_BODY_BYTES_METRIC), 8.0);
-        assert_eq!(assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC), 1.0);
+        assert_eq!(
+            assist_measure(&docs.metrics(), ASSIST_BODY_BYTES_METRIC),
+            8.0
+        );
+        assert_eq!(
+            assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC),
+            1.0
+        );
         assert!(
             docs.metrics()
                 .contains(&format!("{ASSIST_PLAN_SOURCE_METRIC}{{source=\"seed\"}} 1")),
@@ -3376,10 +3390,14 @@ mod tests {
         let second = docs.organize("alice").await.unwrap();
         assert_eq!(second.assist, "answered");
         assert_eq!(second.assist_candidates, 2, "探针问的是整夹");
-        assert_eq!(assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC), 2.0);
+        assert_eq!(
+            assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC),
+            2.0
+        );
         assert!(
-            docs.metrics()
-                .contains(&format!("{ASSIST_PLAN_SOURCE_METRIC}{{source=\"derived\"}} 1")),
+            docs.metrics().contains(&format!(
+                "{ASSIST_PLAN_SOURCE_METRIC}{{source=\"derived\"}} 1"
+            )),
             "有了一次回答，下一拍计划的来源就是实测：{}",
             docs.metrics()
         );
@@ -3388,7 +3406,10 @@ mod tests {
         // 不再探针——计划跟着上一拍的实测走，不需要重启。
         let third = docs.organize("alice").await.unwrap();
         assert_eq!(third.assist_candidates, 2);
-        assert_eq!(assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC), 2.0);
+        assert_eq!(
+            assist_measure(&docs.metrics(), ASSIST_QUESTION_FILES_METRIC),
+            2.0
+        );
 
         // 只剩一个更大的文件：窗口已经是两个正文的份额，它的整块份额高过声明
         // 的前缀，于是前缀跟着走。整条回路是 实测→窗口→前缀。
@@ -3402,7 +3423,10 @@ mod tests {
             "窗口抬起来之后，前缀必须跟着抬: {}",
             docs.metrics()
         );
-        assert_eq!(assist_measure(&docs.metrics(), ASSIST_PLAN_EVALUATIONS_METRIC), 4.0);
+        assert_eq!(
+            assist_measure(&docs.metrics(), ASSIST_PLAN_EVALUATIONS_METRIC),
+            4.0
+        );
 
         // 四次都真的上过线：计数不是唯一的证据。
         assert_eq!(seen.lock().await.len(), 4);

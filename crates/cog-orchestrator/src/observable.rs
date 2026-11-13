@@ -1699,7 +1699,10 @@ mod tests {
         let gauge = metric(&derived, ROWS_PER_HANDOVER_METRIC).unwrap();
         assert_eq!(gauge.value, 5.0);
         assert_eq!(
-            gauge.labels.get(CLAIM_SLOTS_SOURCE_LABEL).map(String::as_str),
+            gauge
+                .labels
+                .get(CLAIM_SLOTS_SOURCE_LABEL)
+                .map(String::as_str),
             Some(SOURCE_DERIVED)
         );
         assert_eq!(
@@ -1713,10 +1716,7 @@ mod tests {
         observer.record(5, SOURCE_DERIVED);
         observer.record_evaluation();
         let again = observer.collect_metrics("D8").await.unwrap();
-        assert_eq!(
-            metric(&again, ROWS_PER_HANDOVER_METRIC).unwrap().value,
-            5.0
-        );
+        assert_eq!(metric(&again, ROWS_PER_HANDOVER_METRIC).unwrap().value, 5.0);
         assert_eq!(
             metric(&again, ROWS_PER_HANDOVER_EVALUATIONS_METRIC)
                 .unwrap()
@@ -1730,7 +1730,10 @@ mod tests {
         let gauge = metric(&pinned, ROWS_PER_HANDOVER_METRIC).unwrap();
         assert_eq!(gauge.value, 8.0);
         assert_eq!(
-            gauge.labels.get(CLAIM_SLOTS_SOURCE_LABEL).map(String::as_str),
+            gauge
+                .labels
+                .get(CLAIM_SLOTS_SOURCE_LABEL)
+                .map(String::as_str),
             Some(SOURCE_OVERRIDE)
         );
         assert_eq!(

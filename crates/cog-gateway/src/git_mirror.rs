@@ -807,8 +807,7 @@ impl GitExec {
     /// 另立一个旋钮——两个独立旋钮必然会出现"窗口 30s、巡检 60s"这种判据比
     /// 被判断的对象还粗的组合；测试里把窗口压到秒级时它也跟着变细。
     fn watchdog_interval(&self) -> std::time::Duration {
-        (self.stall_window() / 4)
-            .clamp(MIRROR_WATCHDOG_MIN_INTERVAL, MIRROR_WATCHDOG_MAX_INTERVAL)
+        (self.stall_window() / 4).clamp(MIRROR_WATCHDOG_MIN_INTERVAL, MIRROR_WATCHDOG_MAX_INTERVAL)
     }
 
     /// 跑一条 git 命令，等到它自己结束。
@@ -844,11 +843,7 @@ impl GitExec {
         // 会把「链路慢」和「链路死」压成同一个结论，而这两种情况该做的事相反。
         let idle_peak = Arc::new(Mutex::new(std::time::Duration::ZERO));
         let out_task = tokio::spawn(read_all(stdout));
-        let err_task = tokio::spawn(read_tail(
-            stderr,
-            last_output.clone(),
-            idle_peak.clone(),
-        ));
+        let err_task = tokio::spawn(read_tail(stderr, last_output.clone(), idle_peak.clone()));
         let mut wait_task = tokio::spawn(async move { child.wait().await });
 
         // 过了预期工期只登一次读数：这条传输还在跑，而一条还在跑的传输不是一条该被
@@ -2043,13 +2038,7 @@ mod tests {
         assert!(err.contains("静默"), "错误应说清是静默判死: {err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
-        let taught = test_transport_with(
-            tmp.path(),
-            fake,
-            DEFAULT_SSH_BASE.into(),
-            seed,
-            budget,
-        );
+        let taught = test_transport_with(tmp.path(), fake, DEFAULT_SSH_BASE.into(), seed, budget);
         taught.exec.note_transfer(
             std::time::Duration::from_millis(1200),
             std::time::Duration::from_millis(1200),

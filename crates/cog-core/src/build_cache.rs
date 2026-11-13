@@ -148,8 +148,7 @@ pub const BUILD_TARGET_SCAN_INTERVAL_EVALUATIONS_METRIC: &str =
 /// The cap is derived once per walk from the peak and the volume's free space;
 /// a cache growing at a steady size derives the same number every time. The
 /// count is the only reading that says the derivation is still running.
-pub const BUILD_TARGET_CAP_EVALUATIONS_METRIC: &str =
-    "cogneva_build_target_cap_evaluations_total";
+pub const BUILD_TARGET_CAP_EVALUATIONS_METRIC: &str = "cogneva_build_target_cap_evaluations_total";
 
 /// The layer label.
 pub const LAYER_LABEL: &str = "layer";

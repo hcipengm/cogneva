@@ -1312,10 +1312,8 @@ pub async fn events_handler(
             .as_deref(),
         cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS,
     );
-    let (floor, _) = cog_core::retention::read_window_secs(
-        seed,
-        cog_core::retention::longest_read_span(knob),
-    );
+    let (floor, _) =
+        cog_core::retention::read_window_secs(seed, cog_core::retention::longest_read_span(knob));
     let asked = filter.window_secs.filter(|secs| *secs > 0).unwrap_or(floor);
     cog_core::retention::record_read_span(knob, asked);
     event_filter.since =

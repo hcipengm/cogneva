@@ -43,8 +43,7 @@ use crate::mainline_deployer::{
     CiNoVerdictReason, ConfigConsumer, FailureClass, FailureLocus, MainlineDeployer, PodSample,
     RolloutTarget, WaitingState, WorkloadKind, CLUSTER_UNREACHABLE_MARKER, FATAL_WAITING_REASONS,
     IMAGE_SOURCE_UNAVAILABLE_MARKER, OBSERVATION_TOOL_MARKER, ROLLOUT_EXIT_ENVIRONMENT,
-    ROLLOUT_PRECHECK_STAGE, SUPPORT_CAUSE_MESSAGE_CHARS, SUPPORT_CAUSE_SEPARATOR,
-    WORKLOAD_KINDS,
+    ROLLOUT_PRECHECK_STAGE, SUPPORT_CAUSE_MESSAGE_CHARS, SUPPORT_CAUSE_SEPARATOR, WORKLOAD_KINDS,
 };
 use crate::rollout_resources::{self, RolloutResourceReading};
 
@@ -6669,7 +6668,11 @@ fn report_termination_message(
     .map(|reading| {
         reading
             .with_elapsed(elapsed.as_micros() as u64)
-            .with_wait_durations(waits.startup_usec(), waits.rollout_usec(), waits.soak_usec())
+            .with_wait_durations(
+                waits.startup_usec(),
+                waits.rollout_usec(),
+                waits.soak_usec(),
+            )
     });
     match reading.as_ref() {
         Some(reading) => tracing::info!(reading = %reading, "rollout resource reading"),

@@ -1766,10 +1766,7 @@ fn measured_batch_sizes(tasks: &[Task], now_unix: i64) -> (Option<usize>, Option
 /// when it equals the last one, and counts the evaluation, because a bound that
 /// only publishes when it changes cannot be told apart from one whose loop
 /// stopped.
-fn batch_size_for_this_pass(
-    tasks: &[Task],
-    now_unix: i64,
-) -> (usize, &'static str) {
+fn batch_size_for_this_pass(tasks: &[Task], now_unix: i64) -> (usize, &'static str) {
     match pinned_rows_per_handover() {
         Some(pinned) => (pinned, crate::observable::SOURCE_OVERRIDE),
         None => {
@@ -5733,8 +5730,7 @@ async fn dispatch_pass(
     // reached the reading face when it changed would leave a stopped loop and a
     // quiet graph as the same flat line.
     let (rows_per_batch, rows_per_batch_source) = batch_size_for_this_pass(&graph_tasks, now);
-    crate::observable::rows_per_handover_observable()
-        .record(rows_per_batch, rows_per_batch_source);
+    crate::observable::rows_per_handover_observable().record(rows_per_batch, rows_per_batch_source);
     // Hand-overs this pass may take back so their rows can be batched, and how
     // many rows each project could still put in a batch -- both read off the
     // snapshot the pass already took, so neither costs a lookup.

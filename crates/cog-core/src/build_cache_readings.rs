@@ -477,7 +477,8 @@ impl BuildCacheReadings {
     /// against it would be comparing against something nothing runs at.
     pub fn set_scan_interval_secs(&self, secs: u64) {
         self.scan_interval_secs.store(secs, Ordering::Release);
-        self.scan_interval_evaluations.fetch_add(1, Ordering::Relaxed);
+        self.scan_interval_evaluations
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Passes that stated the cadence they are keeping.
@@ -1054,10 +1055,7 @@ mod tests {
         assert_eq!(pacer_evaluations(&pacing), 2);
 
         // No handle, no measurement: the cadence does not invent one.
-        assert_eq!(
-            next_scan_wait(None, seed, Duration::from_secs(120)),
-            seed
-        );
+        assert_eq!(next_scan_wait(None, seed, Duration::from_secs(120)), seed);
     }
 
     fn pacer_evaluations(pacing: &crate::pacing::PacingReadings) -> u64 {

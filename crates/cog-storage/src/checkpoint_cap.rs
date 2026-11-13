@@ -692,8 +692,7 @@ mod tests {
             .connect_lazy("postgres://probe:probe@127.0.0.1:1/probe")
             .expect("lazy pool");
         let readings = Arc::new(RetentionReadings::new());
-        let cap = CheckpointCap::new(pool, 40_000)
-            .with_readings(Arc::clone(&readings));
+        let cap = CheckpointCap::new(pool, 40_000).with_readings(Arc::clone(&readings));
 
         cap.report(&CheckpointSweepOutcome {
             held: 1_000,

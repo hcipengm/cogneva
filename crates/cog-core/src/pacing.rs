@@ -192,7 +192,12 @@ impl PacingReadings {
 
     /// 给一条「连续失败之后等多久」的回路发一个句柄。种子是第一拍的等待，之后
     /// 由连续失败的次数决定。
-    pub fn backoff(self: &Arc<Self>, name: impl Into<String>, base: Duration, factor: f64) -> Arc<Backoff> {
+    pub fn backoff(
+        self: &Arc<Self>,
+        name: impl Into<String>,
+        base: Duration,
+        factor: f64,
+    ) -> Arc<Backoff> {
         Arc::new(Backoff {
             readings: Arc::clone(self),
             name: name.into(),
@@ -392,7 +397,11 @@ impl Observable for PacingReadings {
                     .with_label(PACING_LABEL, name.clone())
                     .with_label(
                         SOURCE_LABEL,
-                        if state.derived { SOURCE_DERIVED } else { SOURCE_SEED },
+                        if state.derived {
+                            SOURCE_DERIVED
+                        } else {
+                            SOURCE_SEED
+                        },
                     ),
             );
             out.push(
@@ -423,10 +432,7 @@ mod tests {
     #[test]
     fn a_measured_pass_replaces_the_seed_and_a_longer_one_stretches_the_interval() {
         // 种子 300 秒：一轮 3 秒的实测按倍率 20 得出 60 秒，种子不再是上限。
-        assert_eq!(
-            paced_interval(secs(3), secs(300), secs(30), 20.0),
-            secs(60)
-        );
+        assert_eq!(paced_interval(secs(3), secs(300), secs(30), 20.0), secs(60));
         // 一轮 1000 秒的实测决定下一拍：1000 × 20，远超种子。
         assert_eq!(
             paced_interval(secs(1000), secs(300), secs(30), 20.0),
@@ -442,8 +448,14 @@ mod tests {
     #[test]
     fn the_seed_stands_until_a_pass_is_measured_and_the_floor_holds_below_it() {
         // 没有一轮时，间隔就是种子；种子低于地板时，地板说话。
-        assert_eq!(paced_interval(Duration::ZERO, secs(300), secs(30), 1.0), secs(300));
-        assert_eq!(paced_interval(Duration::ZERO, secs(5), secs(30), 1.0), secs(30));
+        assert_eq!(
+            paced_interval(Duration::ZERO, secs(300), secs(30), 1.0),
+            secs(300)
+        );
+        assert_eq!(
+            paced_interval(Duration::ZERO, secs(5), secs(30), 1.0),
+            secs(30)
+        );
         // 量到一轮之后，一个很短的实测被地板托住；种子不再参与。
         assert_eq!(
             paced_interval(Duration::from_millis(500), secs(300), secs(30), 20.0),
@@ -480,10 +492,7 @@ mod tests {
             Some(secs(20))
         );
         // 地板托住一次很短的实测。
-        assert_eq!(
-            tail_budget(&window, 0.99, secs(5), 2.0),
-            Some(secs(5))
-        );
+        assert_eq!(tail_budget(&window, 0.99, secs(5), 2.0), Some(secs(5)));
     }
 
     #[test]

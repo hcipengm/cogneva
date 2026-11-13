@@ -309,7 +309,9 @@ impl RetentionReadings {
 
     /// 这条回路算过几拍。零是「还没算过」，不是「算出来是零」。
     pub fn evaluations(&self, knob: &str) -> u64 {
-        self.reading(knob).map(|(_, evaluations, _)| evaluations).unwrap_or(0)
+        self.reading(knob)
+            .map(|(_, evaluations, _)| evaluations)
+            .unwrap_or(0)
     }
 }
 
@@ -328,7 +330,11 @@ impl crate::observability::Observable for RetentionReadings {
                     .with_label(UNIT_LABEL, state.unit)
                     .with_label(
                         SOURCE_LABEL,
-                        if state.derived { SOURCE_DERIVED } else { SOURCE_SEED },
+                        if state.derived {
+                            SOURCE_DERIVED
+                        } else {
+                            SOURCE_SEED
+                        },
                     ),
             );
             out.push(
@@ -580,7 +586,11 @@ mod read_windows {
         record_read_span(KNOB, 7_200);
         assert_eq!(longest_read_span(KNOB), Some(7_200));
         record_read_span(KNOB, 0);
-        assert_eq!(longest_read_span(KNOB), Some(7_200), "a zero span is not a question");
+        assert_eq!(
+            longest_read_span(KNOB),
+            Some(7_200),
+            "a zero span is not a question"
+        );
     }
 }
 
@@ -604,8 +614,14 @@ mod fits {
     /// 卷的声明按同一套数量词读；读不出来是 `None`，不是一个猜出来的体积。
     #[test]
     fn the_volume_is_read_in_the_same_units_as_every_other_claim() {
-        assert_eq!(database_storage_bytes(Some("10Gi")), Some(10 * 1024u64.pow(3)));
-        assert_eq!(database_storage_bytes(Some(" 512Mi ")), Some(512 * 1024u64.pow(2)));
+        assert_eq!(
+            database_storage_bytes(Some("10Gi")),
+            Some(10 * 1024u64.pow(3))
+        );
+        assert_eq!(
+            database_storage_bytes(Some(" 512Mi ")),
+            Some(512 * 1024u64.pow(2))
+        );
         assert_eq!(database_storage_bytes(Some("0")), None);
         assert_eq!(database_storage_bytes(Some("")), None);
         assert_eq!(database_storage_bytes(Some("ten")), None);
@@ -657,7 +673,6 @@ mod fits {
         assert_eq!(ttl_for_half_turnover(budget, 10.0, 0.0), Duration::ZERO);
     }
 
-
     /// 行容量是当拍实测的函数：同样是这张卷，每行变大容量就变小；卷变小容量
     /// 也变小。seed 只在量不到的时候顶着（没有卷、表还空、行成本读不出）。
     #[test]
@@ -698,7 +713,6 @@ mod fits {
         );
     }
 
-
     /// 整张卷归一种东西（registry 的 rev）时预算就是整张卷：同一条除法，不乘
     /// 表份额。每件成本的输入是「实测总量 ÷ 实测件数」，两个方向都跟。
     #[test]
@@ -706,12 +720,7 @@ mod fits {
         let volume = 10 * 1024u64.pow(3);
         // 例如 20 个 rev 共占 1 GiB 的独有字节：每 rev 51.2 MiB，整卷买 200 个。
         assert_eq!(
-            budget_against_measured_items(
-                20,
-                Some(volume),
-                20,
-                Some(1024 * 1024 * 1024)
-            ),
+            budget_against_measured_items(20, Some(volume), 20, Some(1024 * 1024 * 1024)),
             (200, SOURCE_DERIVED)
         );
         // 独有字节翻倍，容量减半；持有件数翻倍（同样的字节摊到更多 rev 上），
@@ -770,8 +779,14 @@ mod fits {
             keep_days_against_volume(30, None, 10 * 86_400, Some(512 * 1024 * 1024)),
             (30, false)
         );
-        assert_eq!(keep_days_against_volume(30, Some(volume), 0, Some(512)), (30, false));
-        assert_eq!(keep_days_against_volume(30, Some(volume), 86_400, None), (30, false));
+        assert_eq!(
+            keep_days_against_volume(30, Some(volume), 0, Some(512)),
+            (30, false)
+        );
+        assert_eq!(
+            keep_days_against_volume(30, Some(volume), 86_400, None),
+            (30, false)
+        );
     }
 
     /// 最新的一件永远留下；再往前的按体积装，装不下就停。
@@ -806,15 +821,24 @@ mod readings {
             .find(|m| m.name == TARGET_METRIC)
             .expect("target series");
         assert_eq!(target.value, 40_000.0);
-        assert_eq!(target.labels.get(KNOB_LABEL), Some(&"checkpointStore.maxRows".to_string()));
+        assert_eq!(
+            target.labels.get(KNOB_LABEL),
+            Some(&"checkpointStore.maxRows".to_string())
+        );
         assert_eq!(target.labels.get(UNIT_LABEL), Some(&UNIT_ROWS.to_string()));
-        assert_eq!(target.labels.get(SOURCE_LABEL), Some(&SOURCE_SEED.to_string()));
+        assert_eq!(
+            target.labels.get(SOURCE_LABEL),
+            Some(&SOURCE_SEED.to_string())
+        );
 
         readings.evaluate("checkpointStore.maxRows", 40_000.0, UNIT_ROWS, true);
         let series = readings.collect_metrics("").await.expect("collect");
         let target = series.iter().find(|m| m.name == TARGET_METRIC).unwrap();
         assert_eq!(target.value, 40_000.0, "same input, same target");
-        assert_eq!(target.labels.get(SOURCE_LABEL), Some(&SOURCE_DERIVED.to_string()));
+        assert_eq!(
+            target.labels.get(SOURCE_LABEL),
+            Some(&SOURCE_DERIVED.to_string())
+        );
         let evaluations = series
             .iter()
             .find(|m| m.name == EVALUATIONS_METRIC)
@@ -835,8 +859,12 @@ mod readings {
         let series = readings.collect_metrics("").await.expect("collect");
         let targets: Vec<_> = series.iter().filter(|m| m.name == TARGET_METRIC).collect();
         assert_eq!(targets.len(), 2);
-        assert!(targets.iter().any(|m| m.labels.get(UNIT_LABEL).map(String::as_str) == Some(UNIT_ROWS)));
-        assert!(targets.iter().any(|m| m.labels.get(UNIT_LABEL).map(String::as_str) == Some(UNIT_DAYS)));
+        assert!(targets
+            .iter()
+            .any(|m| m.labels.get(UNIT_LABEL).map(String::as_str) == Some(UNIT_ROWS)));
+        assert!(targets
+            .iter()
+            .any(|m| m.labels.get(UNIT_LABEL).map(String::as_str) == Some(UNIT_DAYS)));
     }
 }
 
@@ -874,8 +902,8 @@ pub fn record_read_span(knob: &'static str, span_secs: u64) {
     if span_secs == 0 {
         return;
     }
-    let spans = LONGEST_READ_SPAN
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let spans =
+        LONGEST_READ_SPAN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut spans = spans.lock().unwrap();
     let seen = spans.entry(knob).or_insert(0);
     *seen = (*seen).max(span_secs);

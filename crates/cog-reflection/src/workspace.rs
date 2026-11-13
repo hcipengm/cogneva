@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cog_core::{SFError, SFResult};
 use cog_core::retention::{ttl_for_half_turnover, RetentionReadings, UNIT_SECONDS};
+use cog_core::{SFError, SFResult};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -364,8 +364,7 @@ impl BranchSightings {
             .as_ref()
             .map(|seen| current.difference(seen).count())
             .unwrap_or(0);
-        self.arrivals
-            .extend(std::iter::repeat_n(now, fresh));
+        self.arrivals.extend(std::iter::repeat_n(now, fresh));
         self.seen = Some(current);
         let since = now.saturating_sub(span_secs);
         self.arrivals.retain(|t| *t >= since);
@@ -639,7 +638,8 @@ impl WorkspaceManager {
 
     /// 进程活了多久与到达窗口里较短的那个，也就是到达率的分母。
     fn arrival_span_secs(&self, now: u64) -> u64 {
-        now.saturating_sub(self.started_unix).clamp(1, ARRIVAL_WINDOW_SECS)
+        now.saturating_sub(self.started_unix)
+            .clamp(1, ARRIVAL_WINDOW_SECS)
     }
 
     /// 就地移动到 `base`：`reset --hard` + `clean -ffdx`。target 目录外置，
@@ -970,7 +970,12 @@ impl WorkspaceManager {
             self.orphan_branch_ttl,
         );
         if let Some(readings) = &self.retention {
-            readings.evaluate(ORPHAN_BRANCH_TTL_KNOB, ttl.as_secs_f64(), UNIT_SECONDS, derived);
+            readings.evaluate(
+                ORPHAN_BRANCH_TTL_KNOB,
+                ttl.as_secs_f64(),
+                UNIT_SECONDS,
+                derived,
+            );
         }
         ttl
     }
@@ -1980,14 +1985,23 @@ mod tests {
         assert!((ttl.as_secs_f64() - days(50)).abs() < 1.0, "{ttl:?}");
 
         let (faster, _) = keep_duration(Some(100 * GIB), GIB, 2, 86_400, Duration::ZERO, seed);
-        assert!((faster.as_secs_f64() - days(25)).abs() < 1.0, "到达快一倍，界减半");
+        assert!(
+            (faster.as_secs_f64() - days(25)).abs() < 1.0,
+            "到达快一倍，界减半"
+        );
 
         let (smaller, _) = keep_duration(Some(50 * GIB), GIB, 1, 86_400, Duration::ZERO, seed);
-        assert!((smaller.as_secs_f64() - days(25)).abs() < 1.0, "卷小一半，界减半");
+        assert!(
+            (smaller.as_secs_f64() - days(25)).abs() < 1.0,
+            "卷小一半，界减半"
+        );
 
         let (bigger_tree, _) =
             keep_duration(Some(100 * GIB), 2 * GIB, 1, 86_400, Duration::ZERO, seed);
-        assert!((bigger_tree.as_secs_f64() - days(25)).abs() < 1.0, "树大一倍，界减半");
+        assert!(
+            (bigger_tree.as_secs_f64() - days(25)).abs() < 1.0,
+            "树大一倍，界减半"
+        );
 
         // 已归还的一趟是最少保留：半周转比它短时，它顶着。
         let (floored, derived) = keep_duration(
@@ -2012,12 +2026,20 @@ mod tests {
             (Some(100 * GIB), GIB, 0, 86_400),
             (Some(100 * GIB), GIB, 1, 0),
         ] {
-            let (ttl, derived) = keep_duration(capacity, item, arrivals, span, Duration::ZERO, seed);
+            let (ttl, derived) =
+                keep_duration(capacity, item, arrivals, span, Duration::ZERO, seed);
             assert_eq!(ttl, seed);
             assert!(!derived, "没有实测就不是 derived");
         }
         // 种子为零是部署关掉这类残留的声明；实测不能把它重新打开。
-        let (ttl, derived) = keep_duration(Some(100 * GIB), GIB, 5, 86_400, Duration::ZERO, Duration::ZERO);
+        let (ttl, derived) = keep_duration(
+            Some(100 * GIB),
+            GIB,
+            5,
+            86_400,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         assert_eq!(ttl, Duration::ZERO);
         assert!(!derived);
     }
@@ -2027,7 +2049,8 @@ mod tests {
     fn the_orphan_branch_ttl_follows_the_measured_repo_and_rotations() {
         let seed = Duration::from_secs(2_592_000);
         let mib = 1024u64 * 1024;
-        let (slow, derived) = keep_duration(Some(10 * GIB), 100 * mib, 1, 86_400, Duration::ZERO, seed);
+        let (slow, derived) =
+            keep_duration(Some(10 * GIB), 100 * mib, 1, 86_400, Duration::ZERO, seed);
         assert!(derived);
         let (fast, _) = keep_duration(Some(10 * GIB), 100 * mib, 2, 86_400, Duration::ZERO, seed);
         assert!(fast < slow, "轮换快，旧的留得短");
@@ -2099,8 +2122,7 @@ mod tests {
         let meta_path = mgr.meta_path(&ws.id);
         let mut meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta["created_at_unix"] =
-            serde_json::json!(unix_now() as i64 - 7_200);
+        meta["created_at_unix"] = serde_json::json!(unix_now() as i64 - 7_200);
         std::fs::write(&meta_path, meta.to_string()).unwrap();
 
         mgr.release(&ws).await.unwrap();
@@ -2325,7 +2347,11 @@ mod tests {
         // 把留下的当成孤儿就会删掉正在被推的那一条。
         let anonymous = manager(tmp.path(), &bare_repo);
         bare(&bare_repo, &["branch", "evol/zed", &rev_a]);
-        assert!(anonymous.gc_orphan_evol_branches().await.unwrap().is_empty());
+        assert!(anonymous
+            .gc_orphan_evol_branches()
+            .await
+            .unwrap()
+            .is_empty());
         assert!(!git_out(&bare_repo, &["branch", "--list", "evol/quinn"]).is_empty());
     }
 

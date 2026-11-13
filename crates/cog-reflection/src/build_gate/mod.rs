@@ -8007,7 +8007,9 @@ unevictable 28532736
         // And the loop is on the published pacing series, not only in a field.
         let metrics = gate.collect_metrics("").await.unwrap();
         assert!(
-            metrics.iter().any(|m| m.name == cog_core::pacing::TARGET_METRIC),
+            metrics
+                .iter()
+                .any(|m| m.name == cog_core::pacing::TARGET_METRIC),
             "the wait budget's target must be published under the shared pacing series"
         );
     }

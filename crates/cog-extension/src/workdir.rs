@@ -121,8 +121,7 @@ const GC_INTERVAL_METRIC: &str = "sandbox_workspace_gc_interval_seconds";
 /// How many times the reclamation interval has been recomputed. A pass that
 /// costs the same every time keeps the interval where it is, so the interval
 /// alone cannot say the loop is still running.
-const GC_INTERVAL_EVALUATIONS_METRIC: &str =
-    "sandbox_workspace_gc_interval_evaluations_total";
+const GC_INTERVAL_EVALUATIONS_METRIC: &str = "sandbox_workspace_gc_interval_evaluations_total";
 
 /// The shortest wait between two upstream fetches. Below this the loop would be
 /// asking the mirror for the same commit faster than a push can arrive, and the
@@ -141,8 +140,7 @@ const FETCH_INTERVAL_METRIC: &str = "sandbox_repo_fetch_interval_seconds";
 /// How many times the fetch wait has been recomputed. An unchanged head keeps
 /// the period where it is; this is what tells a still repository from a loop
 /// that stopped asking.
-const FETCH_INTERVAL_EVALUATIONS_METRIC: &str =
-    "sandbox_repo_fetch_interval_evaluations_total";
+const FETCH_INTERVAL_EVALUATIONS_METRIC: &str = "sandbox_repo_fetch_interval_evaluations_total";
 
 /// The label saying which input set a published period -- configuration, floor
 /// or measurement. Without it the configured number is the only one anyone can
@@ -1216,10 +1214,7 @@ impl WorkdirRouter {
     /// matters is arrivals, not checkouts.
     fn note_arrival(&self) {
         let now = unix_now();
-        let mut arrivals = self
-            .arrivals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut arrivals = self.arrivals.lock().unwrap_or_else(|e| e.into_inner());
         arrivals.push_back(now);
         while arrivals
             .front()
@@ -1251,10 +1246,7 @@ impl WorkdirRouter {
     /// cover. `None` until two arrivals are far enough apart in time to define
     /// an interval.
     fn arrival_rate(&self) -> Option<(usize, u64)> {
-        let arrivals = self
-            .arrivals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let arrivals = self.arrivals.lock().unwrap_or_else(|e| e.into_inner());
         let first = *arrivals.front()?;
         let span = unix_now().saturating_sub(first);
         (arrivals.len() >= 2 && span > 0).then_some((arrivals.len(), span as u64))

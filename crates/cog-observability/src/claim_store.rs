@@ -577,11 +577,19 @@ mod tests {
             1.0,
         );
         assert_eq!(
-            wait_after_pass(Some(&pacer), Duration::from_secs(300), Duration::from_secs(3)),
+            wait_after_pass(
+                Some(&pacer),
+                Duration::from_secs(300),
+                Duration::from_secs(3)
+            ),
             Duration::from_secs(297)
         );
         assert_eq!(
-            wait_after_pass(Some(&pacer), Duration::from_secs(300), Duration::from_secs(900)),
+            wait_after_pass(
+                Some(&pacer),
+                Duration::from_secs(300),
+                Duration::from_secs(900)
+            ),
             Duration::ZERO
         );
         let (target, evaluations, derived) = readings

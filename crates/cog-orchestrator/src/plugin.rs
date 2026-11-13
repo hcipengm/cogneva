@@ -922,9 +922,9 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let exec_loop = exec_loop
                             .as_ref()
                             .clone()
-                            .with_orchestrator(Arc::new(
-                                crate::OrchestratorControlImpl::new(orchestrator),
-                            )
+                            .with_orchestrator(Arc::new(crate::OrchestratorControlImpl::new(
+                                orchestrator,
+                            ))
                                 as Arc<dyn cog_core::OrchestratorControl>)
                             // The pool's window is what the ordinary lane's claim
                             // bound is derived from. Attached here because `start`

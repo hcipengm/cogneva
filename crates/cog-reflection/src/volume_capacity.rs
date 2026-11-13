@@ -1954,7 +1954,11 @@ mod tests {
     #[test]
     fn a_claim_target_follows_the_measured_used_bytes() {
         let declared = 20 * GIB;
-        assert_eq!(growth_target(4 * GIB, declared), None, "4 * 1.2 is inside 20Gi");
+        assert_eq!(
+            growth_target(4 * GIB, declared),
+            None,
+            "4 * 1.2 is inside 20Gi"
+        );
         assert_eq!(
             growth_target(30 * GIB, declared),
             Some(36 * GIB),

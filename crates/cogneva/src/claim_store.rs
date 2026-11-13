@@ -414,7 +414,8 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         let shutdown = ShutdownSignal::default();
         // 两条走查各有自己的种子，因此各有一条节拍序列。种子在句柄上，走查本身
         // 把每轮耗时喂回来；读数上的 `pacing` 标签就是登记表里的那条键。
-        let claim_seed = Duration::from_secs(interval_from_env().max(claim_store::MIN_INTERVAL_SECS));
+        let claim_seed =
+            Duration::from_secs(interval_from_env().max(claim_store::MIN_INTERVAL_SECS));
         let image_seed =
             Duration::from_secs(image_interval_from_env().max(image_store::MIN_INTERVAL_SECS));
         // 地板是各自的种子：走查的是同一块盘上的全部 claim 与镜像层，快于配置的

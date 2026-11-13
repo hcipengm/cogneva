@@ -57,9 +57,7 @@ use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
 use cog_core::metric_names;
-use cog_core::retention::{
-    keep_days_against_volume, RetentionReadings, UNIT_DAYS,
-};
+use cog_core::retention::{keep_days_against_volume, RetentionReadings, UNIT_DAYS};
 use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
 
 /// The registry key this loop's target answers to.
@@ -408,7 +406,12 @@ impl TaskEventRetention {
             oldest_age_secs,
             bytes,
         );
-        (Some(Duration::from_secs((days.max(0) as u64).saturating_mul(86_400))), derived)
+        (
+            Some(Duration::from_secs(
+                (days.max(0) as u64).saturating_mul(86_400),
+            )),
+            derived,
+        )
     }
 
     /// What the archive costs on disk, when it can be read.
