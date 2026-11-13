@@ -316,6 +316,20 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             existing.confidence = entry.confidence;
             store.schema.insert(existing.id.clone(), existing);
         } else {
+            // The map is keyed by the id alone, so this slot can already be
+            // taken by an entry another namespace holds under the same id.
+            // Inserting here would overwrite that entry out of existence; a
+            // namespace is a boundary, so say so instead of replacing it.
+            if let Some(stored) = store
+                .schema
+                .get(&entry.id)
+                .filter(|stored| stored.namespace != namespace)
+            {
+                return Err(SFError::Agent(format!(
+                    "schema id `{}` is held by namespace `{}`",
+                    entry.id, stored.namespace
+                )));
+            }
             store.schema.insert(entry.id.clone(), entry.clone());
         }
         metrics.schema_updated += 1;
