@@ -15,11 +15,17 @@
 //!   grain that separates the things a reader can decide differently about: the
 //!   `deps` and `.fingerprint` halves are the compiled results (dropping them is
 //!   the cold rebuild), while `incremental` and `tmp` are speed and scratch
-//!   space whose cost to lose is a slower next build. A file that cargo hardlinks
-//!   under two names — which is what it does with everything it lifts out of
-//!   `deps` — is counted once, under the first of its names in path order, and
-//!   its pass frees its bytes once, because that is how many times they are on
-//!   the volume.
+//!   space whose cost to lose is a slower next build. The grain is the layer
+//!   name, not the cost: cargo 1.100.0 writes the compiled results under
+//!   `build/<package>/<metadata-hash>/out/` and their fingerprints under
+//!   `.../fingerprint/`, both of which land in the layer `build`, so on that
+//!   layout `build` reads as what `deps` used to. The shape is still one series
+//!   per layer -- what it costs to lose a file is decided by its path, in
+//!   `cost_rank`, and that decision does not move with this label. A file that
+//!   cargo hardlinks under two names — which is what it does with everything it
+//!   lifts out of `deps` — is counted once, under the first of its names in
+//!   path order, and its pass frees its bytes once, because that is how many
+//!   times they are on the volume.
 //! - `cogneva_build_target_bytes_scan_age_seconds` -- how long ago the cache was
 //!   measured. The sizes keep their last reading when a walk fails, which is the
 //!   right thing to publish and is also invisible: a scan loop that died leaves
