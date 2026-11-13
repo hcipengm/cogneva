@@ -411,6 +411,8 @@ mod page_compared_words_are_owned_by_a_writer_test;
 mod page_component_nodes_are_components_the_gateway_reports_test;
 #[path = "page_status_words_are_words_the_status_writes_test.rs"]
 mod page_status_words_are_words_the_status_writes_test;
+#[path = "permission_rules_are_remembered_test.rs"]
+mod permission_rules_are_remembered_test;
 #[path = "plugin_init_dependencies.rs"]
 mod plugin_init_dependencies;
 #[path = "popup_handshake_words_are_the_words_the_other_page_sends_test.rs"]

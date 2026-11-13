@@ -180,13 +180,15 @@ async fn handle_type_message(
             request_id,
             allow,
             reason,
+            remember,
             ..
         } => {
             let answer = if allow {
-                crate::chat::PermissionAnswer::Allow
+                crate::chat::PermissionAnswer::Allow { always: remember }
             } else {
                 crate::chat::PermissionAnswer::Deny {
                     reason: reason.unwrap_or_else(|| "人在对话框里拒绝了这一次执行。".into()),
+                    always: remember,
                 }
             };
             // 没人等这一问（重复的答案、或者那一轮已经被停掉）不是错误：那一问
@@ -198,6 +200,34 @@ async fn handle_type_message(
             session_id, mode, ..
         } => {
             permissions.set_mode(&session_id, &mode);
+        }
+        ClientMessage::PermissionRules { session_id, .. } => {
+            let session = session_id.unwrap_or_else(|| "default".into());
+            if let Some(conversation) = state.conversation.get().cloned() {
+                let rules = conversation.permission_rules(conn.user_id, &session).await;
+                let resp = ServerMessage::PermissionRules {
+                    session_id: session,
+                    rules,
+                };
+                send_server_message(socket, &resp).await?;
+            }
+        }
+        ClientMessage::PermissionRuleRevoke {
+            session_id,
+            rule_id,
+            ..
+        } => {
+            let session = session_id.unwrap_or_else(|| "default".into());
+            if let Some(conversation) = state.conversation.get().cloned() {
+                let rules = conversation
+                    .revoke_permission_rule(conn.user_id, &session, &rule_id)
+                    .await;
+                let resp = ServerMessage::PermissionRules {
+                    session_id: session,
+                    rules,
+                };
+                send_server_message(socket, &resp).await?;
+            }
         }
         ClientMessage::ChatCancel { session_id, .. } => {
             // 没有在跑的那一段上按停止不是错：用户可能刚好在上一轮结束的那一瞬

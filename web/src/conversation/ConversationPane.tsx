@@ -339,6 +339,12 @@ export function ConversationPane({
     [allPermissionAsks, sessionId]
   );
   const permissionMode = usePermissionStore((s) => s.modes[sessionId] ?? DEFAULT_PERMISSION_MODE);
+  /**
+   * 这个人留下来的规则。`null` 是「还没读到」，不是「一条也没有」——两句话在
+   * 这一面写出来就是两句不同的字，见下面那块规则面板。
+   */
+  const permissionRules = usePermissionStore((s) => s.rules);
+  const [rulesOpen, setRulesOpen] = useState(false);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   /** 这一段交出去的目标，按总览折出来的现状。总览里还没有的那几道如实缺席。 */
@@ -517,13 +523,35 @@ export function ConversationPane({
    * 拒绝），所以摘掉不会让一次执行悄悄发生。反过来留着它，屏幕上就一直挂着一个
    * 已经不存在的问。
    */
-  const answerPermission = (ask: PermissionAsk, allow: boolean) => {
+  const answerPermission = (ask: PermissionAsk, allow: boolean, remember = false) => {
     clientRef.current?.send({
       type: 'permission_response',
       request_id: ask.id,
       allow,
+      remember,
     });
     usePermissionStore.getState().answered(ask.id);
+  };
+
+  /**
+   * 规则面板：第一次打开时向服务端要一份名单，之后每一次撤销的回执都是一整份新名单。
+   *
+   * 不在挂载时就问：一个人可能从来不开这块面板，而每一次连上来都问一次名单，是把
+   * 一件没人看的东西算进每一次连接的开销。
+   */
+  const toggleRules = () => {
+    const next = !rulesOpen;
+    setRulesOpen(next);
+    if (next) clientRef.current?.send({ type: 'permission_rules', session_id: sessionId });
+  };
+
+  /** 撤掉一条。回执是撤完之后的整份名单，所以这里不自己改本地那一份。 */
+  const revokeRule = (id: string) => {
+    clientRef.current?.send({
+      type: 'permission_rule_revoke',
+      session_id: sessionId,
+      rule_id: id,
+    });
   };
 
   /** 换这一段对话的模式。名字是闭集里的那一格，服务端不认识时按更严的一格处理。 */
@@ -598,6 +626,20 @@ export function ConversationPane({
           <option value="acceptEdits">acceptEdits · 编辑不问</option>
           <option value="bypass">bypass · 全不问</option>
         </select>
+        {/*
+          留下来的规则：人点过「总是」的那些。入口只有一行字，因为它是设置，不是这一面
+          的主体；列表本身体现在下面那块面板里，撤销就在同一行上。
+        */}
+        <Note
+          as="button"
+          type="button"
+          onClick={toggleRules}
+          className="mono shrink-0 px-1 text-[10px] transition-opacity hover:opacity-70"
+          style={{ color: rulesOpen ? 'var(--brass)' : 'var(--muted)' }}
+          text="看这个人留过哪些「总是允许 / 总是拒绝」，并撤掉其中一条"
+        >
+          规则
+        </Note>
         {/*
           目标与变更都是账上的行，所以每一个都能点进去。这里只是入口：这一面
           不知道那一行在账的第几页，所以它把身份交出去，由账那一面落位。
@@ -687,6 +729,74 @@ export function ConversationPane({
         </div>
       </div>
 
+      {rulesOpen && (
+        <div className="shrink-0 px-4 pb-1">
+          <div className="mb-1 flex items-baseline gap-2">
+            <span className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
+              留下来的规则
+            </span>
+            <Note
+              as="button"
+              type="button"
+              onClick={() =>
+                clientRef.current?.send({ type: 'permission_rules', session_id: sessionId })
+              }
+              className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="重新从服务端读一份名单"
+            >
+              刷新
+            </Note>
+            <Note
+              as="button"
+              type="button"
+              onClick={toggleRules}
+              className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="收起这块面板"
+            >
+              收起
+            </Note>
+          </div>
+          {/*
+            「还在读」与「一条也没有」分开写：前者是这一次还没拿到名单（连接刚起、
+            或者服务端这一侧还没接上），后者是这个人真的干净。合起来写，一次失败的
+            读取会被读成一次干净的家底。
+          */}
+          {permissionRules === null ? (
+            <p className="mono text-[10px] text-[var(--muted)]">还在读这份名单…</p>
+          ) : permissionRules.length === 0 ? (
+            <p className="mono text-[10px] text-[var(--muted)]">这个人名下还没有留下过规则。</p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {permissionRules.map((rule) => (
+                <li key={rule.id} className="flex items-baseline gap-2 text-[11px]">
+                  <span
+                    className="mono"
+                    style={{ color: rule.allow ? 'var(--brass)' : 'var(--danger)' }}
+                  >
+                    {rule.allow ? '允许' : '拒绝'}
+                  </span>
+                  <span className="mono">{rule.tool}</span>
+                  {rule.subject && (
+                    <span className="mono break-all text-[var(--paper-dim)]">{rule.subject}</span>
+                  )}
+                  <span className="mono text-[10px] text-[var(--muted)]">
+                    {rule.scope === 'owner' ? '这个人' : '这一段'}
+                  </span>
+                  <Note
+                    as="button"
+                    type="button"
+                    onClick={() => revokeRule(rule.id)}
+                    className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+                    text="撤掉这条规则；从此同类的调用会重新问你"
+                  >
+                    撤销
+                  </Note>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
       {permissionAsks.length > 0 && (
         <div className="shrink-0 px-4 pb-1">
           {permissionAsks.map((ask) => (
@@ -721,6 +831,26 @@ export function ConversationPane({
                   text="拒绝这一次，并把理由交回模型；同一个调用再发一遍会得到同一个答案"
                 >
                   拒绝
+                </Note>
+                <Note
+                  as="button"
+                  type="button"
+                  onClick={() => answerPermission(ask, true, true)}
+                  className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                  style={{ color: 'var(--brass)' }}
+                  text="允许这一次，并把这个工具碰这个东西的调用记成一条放行规则：下次同类调用不再问，在规则面板里可以撤销"
+                >
+                  总是允许
+                </Note>
+                <Note
+                  as="button"
+                  type="button"
+                  onClick={() => answerPermission(ask, false, true)}
+                  className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                  style={{ color: 'var(--danger)' }}
+                  text="拒绝这一次，并把这个工具碰这个东西的调用记成一条拒绝规则：下次同类调用直接拒绝不再问，在规则面板里可以撤销"
+                >
+                  总是拒绝
                 </Note>
               </div>
             </div>

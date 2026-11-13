@@ -30,6 +30,7 @@ pub mod health_check;
 pub mod host_ledger;
 pub mod hot_reload;
 pub mod mcp_serve;
+pub mod permission_rules;
 pub mod pidfile;
 pub mod pin_census;
 pub mod platform;

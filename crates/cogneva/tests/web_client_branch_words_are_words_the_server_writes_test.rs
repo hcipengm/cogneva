@@ -202,6 +202,11 @@ const CLIENT_ONLY: &[(&str, &str, &str)] = &[
     ("status", "sending", "对话气泡的发送状态，客户端自己写"),
     ("status", "streaming", "对话气泡的流式状态，客户端自己写"),
     ("status", "done", "对话气泡收尾后的状态，客户端自己写自己读"),
+    (
+        "status",
+        "open",
+        "这条连接通没通由客户端自己报（transport 的 onStatusChange），服务端在 connected 帧里说的是 hello，不说这个字",
+    ),
 ];
 
 /// 客户端源码文件数下限。普查面是这条判据的**题目**：读不出来的目录会让文件表

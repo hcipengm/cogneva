@@ -431,10 +431,55 @@ fn permission_summary(arguments: &serde_json::Value) -> String {
 /// 把内核的「问一句」接到这条连接上。
 ///
 /// 内核只知道有人会被问；这一层知道问的是这条 socket，答的是坐在它后面的人。
-/// 两个结局各自原样返回：内核据此决定执行还是把理由交回模型。
+/// 问之前先看这个人留下来的规则——他上一次已经答过的那一类，不该再问第二遍；
+/// 而这一次答完，若他要求记住，规则就写进存储，下一段对话照样算数。
+///
+/// 顺序是：模式先定（勾了 bypass 就是不要问了，这是比一条旧规则更晚、更明确的表态），
+/// 规则其次，都没有才问人。规则与模式的结论都原样返回，内核据此决定执行还是把理由
+/// 交回模型。
 struct ConversationPermissions {
     bridge: Arc<dyn cog_gateway::chat::PermissionBridge>,
     session_id: String,
+    /// 这一段对话属于谁。没有登录身份时是 `None`：那时「总是」只能记成本会话的。
+    owner: Option<String>,
+    /// 规则住在哪儿。没装 KV 时规则只在这一轮里生效，读不回来也撤不掉——界面上那份
+    /// 名单会是空的，而「空名单」正是「没地方存」在这个平台上的样子。
+    store: Option<Arc<dyn cog_core::KeyValueStore>>,
+    /// 这一段对话现在生效的规则：这一轮的，加上这个人的。进来时读一遍，之后在内存里
+    /// 跟着「总是」长，同一个回合里的下一次同类调用就不再问了。
+    rules: std::sync::Mutex<cog_agent::permission::PermissionRuleSet>,
+}
+
+impl ConversationPermissions {
+    /// 记下这次答案。先落内存（同一个回合立即生效），再落存储（跨回合、跨重启）。
+    async fn remember(&self, ask: &cog_agent::permission::PermissionAsk, allow: bool) {
+        let scope = match &self.owner {
+            Some(_) => cog_agent::permission::PermissionScope::Owner,
+            None => cog_agent::permission::PermissionScope::Session {
+                session_id: self.session_id.clone(),
+            },
+        };
+        let rule = cog_agent::permission::PermissionRule {
+            tool: ask.tool.clone(),
+            // 记的是这一次要碰的那个东西：下次同一个工具碰同一个东西不再问，
+            // 碰别的东西照问。「记住这个工具的一切」是另一条规则（不带对象），
+            // 界面不提供它——一次点头不该扩成一张网。
+            subject: cog_agent::permission::ask_subject(&ask.arguments).map(str::to_string),
+            allow,
+            scope,
+        };
+        self.rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(rule.clone());
+        if let Some(kv) = self.store.as_ref() {
+            if let Err(error) =
+                crate::permission_rules::remember(kv, self.owner.as_deref(), rule).await
+            {
+                tracing::warn!(%error, tool = %ask.tool, "这条「总是」没写进存储，重启后不再生效");
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -443,6 +488,14 @@ impl cog_agent::permission::PermissionDecider for ConversationPermissions {
         &self,
         ask: &cog_agent::permission::PermissionAsk,
     ) -> cog_agent::permission::PermissionVerdict {
+        let ruled = self
+            .rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .evaluate(ask, &self.session_id);
+        if let Some(verdict) = ruled {
+            return verdict;
+        }
         let view = cog_gateway::chat::PermissionAskView {
             request_id: format!("perm-{}", uuid::Uuid::new_v4()),
             session_id: self.session_id.clone(),
@@ -451,10 +504,16 @@ impl cog_agent::permission::PermissionDecider for ConversationPermissions {
             mode: ask.mode.as_str().to_string(),
         };
         match self.bridge.ask(view).await {
-            cog_gateway::chat::PermissionAnswer::Allow => {
+            cog_gateway::chat::PermissionAnswer::Allow { always } => {
+                if always {
+                    self.remember(ask, true).await;
+                }
                 cog_agent::permission::PermissionVerdict::Allow
             }
-            cog_gateway::chat::PermissionAnswer::Deny { reason } => {
+            cog_gateway::chat::PermissionAnswer::Deny { reason, always } => {
+                if always {
+                    self.remember(ask, false).await;
+                }
                 cog_agent::permission::PermissionVerdict::Deny { reason }
             }
         }
@@ -612,12 +671,31 @@ impl ConversationTurn for PlatformConversation {
                     .unwrap_or_default();
             let permission_session = request.session_id.clone();
             let decider: Option<Arc<dyn cog_agent::permission::PermissionDecider>> =
-                request.permissions.map(|bridge| {
-                    Arc::new(ConversationPermissions {
-                        bridge,
-                        session_id: permission_session,
-                    }) as Arc<dyn cog_agent::permission::PermissionDecider>
-                });
+                match request.permissions {
+                    Some(bridge) => {
+                        let owner_name = owner.map(str::to_string);
+                        let rules = match self.people.as_ref() {
+                            Some(kv) => {
+                                crate::permission_rules::load(
+                                    kv,
+                                    owner_name.as_deref(),
+                                    &permission_session,
+                                )
+                                .await
+                            }
+                            None => cog_agent::permission::PermissionRuleSet::default(),
+                        };
+                        Some(Arc::new(ConversationPermissions {
+                            bridge,
+                            session_id: permission_session,
+                            owner: owner_name,
+                            store: self.people.clone(),
+                            rules: std::sync::Mutex::new(rules),
+                        })
+                            as Arc<dyn cog_agent::permission::PermissionDecider>)
+                    }
+                    None => None,
+                };
             runtime = runtime.with_permissions(decider, permission_mode);
             // 名册交给运行时：它在每轮开头读到自己那一行的工号与名字，写进系统
             // 前缀。这里不做这件事——构造点不止这一处，漏一处那一种执行体就
@@ -687,6 +765,80 @@ impl ConversationTurn for PlatformConversation {
             }
             answer
         })
+    }
+
+    /// 这个人手上还有哪些留下来的规则，这一段的加上他自己的。
+    ///
+    /// 读不到存储时给一张空名单，与「他名下真的没有规则」在界面上读起来一样——
+    /// 这是这个平台的现状：一条规则的可见性取决于存储接没接上，而不取决于它存不存在。
+    /// 要分清两者得给这一帧加一个「读没读到」的标记，而眼下唯一会读到的是人自己
+    /// 点开的那一眼，多一个标记只是多一格没人会看的字。
+    fn permission_rules<'a>(
+        &'a self,
+        owner: &'a str,
+        session_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<cog_gateway::chat::PermissionRuleView>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let Some(kv) = self.people.as_ref() else {
+                return Vec::new();
+            };
+            let owner = Some(owner).filter(|owner| !owner.trim().is_empty());
+            crate::permission_rules::load(kv, owner, session_id)
+                .await
+                .rules()
+                .iter()
+                .map(permission_rule_view)
+                .collect()
+        })
+    }
+
+    fn revoke_permission_rule<'a>(
+        &'a self,
+        owner: &'a str,
+        session_id: &'a str,
+        rule_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<cog_gateway::chat::PermissionRuleView>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let Some(kv) = self.people.as_ref() else {
+                return Vec::new();
+            };
+            let owner = Some(owner).filter(|owner| !owner.trim().is_empty());
+            crate::permission_rules::revoke(kv, owner, session_id, rule_id)
+                .await
+                .rules()
+                .iter()
+                .map(permission_rule_view)
+                .collect()
+        })
+    }
+}
+
+/// 一条规则递到界面上时的样子：人看得懂的四个字，加一个撤销用的号。
+fn permission_rule_view(
+    rule: &cog_agent::permission::PermissionRule,
+) -> cog_gateway::chat::PermissionRuleView {
+    cog_gateway::chat::PermissionRuleView {
+        id: rule.id(),
+        tool: rule.tool.clone(),
+        subject: rule.subject.clone(),
+        allow: rule.allow,
+        scope: match &rule.scope {
+            cog_agent::permission::PermissionScope::Owner => "owner",
+            cog_agent::permission::PermissionScope::Session { .. } => "session",
+        }
+        .to_string(),
     }
 }
 
@@ -4067,14 +4219,16 @@ mod tests {
 
     /// 把一条连接上的问答记下来，好在问完之后看问的是什么。
     struct ARecordingBridge {
-        answer: cog_gateway::chat::PermissionAnswer,
+        /// 人这一次怎么答。放在可变格里，是因为同一条连接上先后几问可以有不同答案
+        /// （先「总是允许」、后「总是拒绝」），而那正是规则该被证明的路径。
+        answer: std::sync::Mutex<cog_gateway::chat::PermissionAnswer>,
         seen: std::sync::Mutex<Vec<cog_gateway::chat::PermissionAskView>>,
     }
 
     impl ARecordingBridge {
         fn answering(answer: cog_gateway::chat::PermissionAnswer) -> Arc<Self> {
             Arc::new(Self {
-                answer,
+                answer: std::sync::Mutex::new(answer),
                 seen: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -4087,7 +4241,7 @@ mod tests {
             view: cog_gateway::chat::PermissionAskView,
         ) -> cog_gateway::chat::PermissionAnswer {
             self.seen.lock().unwrap().push(view);
-            self.answer.clone()
+            self.answer.lock().unwrap().clone()
         }
     }
 
@@ -4124,10 +4278,13 @@ mod tests {
     /// 「有人说可以」往下跑。
     #[tokio::test]
     async fn the_answer_becomes_the_verdict_the_kernel_acts_on() {
-        let allow = ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::Allow);
+        let allow = ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::allow());
         let decider = ConversationPermissions {
             bridge: allow.clone(),
             session_id: "session-42".into(),
+            owner: Some("alice".into()),
+            store: None,
+            rules: Default::default(),
         };
         let ask = cog_agent::permission::PermissionAsk {
             call_id: "call-1".into(),
@@ -4159,11 +4316,15 @@ mod tests {
         }
 
         let deny = ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::Deny {
+            always: false,
             reason: "这一步先别动这个文件".into(),
         });
         let decider = ConversationPermissions {
             bridge: deny,
             session_id: "session-42".into(),
+            owner: Some("alice".into()),
+            store: None,
+            rules: Default::default(),
         };
         match <ConversationPermissions as cog_agent::permission::PermissionDecider>::decide(
             &decider, &ask,
@@ -4178,5 +4339,184 @@ mod tests {
             }
             other => panic!("人答了拒绝，内核却拿到 {other:?}"),
         }
+    }
+
+    fn a_call(tool: &str, arguments: serde_json::Value) -> cog_agent::permission::PermissionAsk {
+        cog_agent::permission::PermissionAsk {
+            call_id: "call-1".into(),
+            agent_id: "agent-7".into(),
+            tool: tool.into(),
+            arguments,
+            mode: cog_agent::permission::PermissionMode::Default,
+        }
+    }
+
+    /// 这条连接的某一轮：拿着 store 里这一格的规则，问人在不在。
+    async fn decider_over(
+        bridge: Arc<ARecordingBridge>,
+        store: Option<Arc<dyn cog_core::KeyValueStore>>,
+        owner: Option<&str>,
+        session: &str,
+    ) -> ConversationPermissions {
+        let rules = match store.as_ref() {
+            Some(kv) => crate::permission_rules::load(kv, owner, session).await,
+            None => Default::default(),
+        };
+        ConversationPermissions {
+            bridge,
+            session_id: session.into(),
+            owner: owner.map(str::to_string),
+            store,
+            rules: std::sync::Mutex::new(rules),
+        }
+    }
+
+    async fn verdict_of(
+        decider: &ConversationPermissions,
+        ask: &cog_agent::permission::PermissionAsk,
+    ) -> cog_agent::permission::PermissionVerdict {
+        <ConversationPermissions as cog_agent::permission::PermissionDecider>::decide(decider, ask)
+            .await
+    }
+
+    /// 人答过一次「总是允许」之后，同一个工具碰同一个东西不再问；碰别的东西照问。
+    ///
+    /// 这条路径没有规则就整条不存在：每次调用都会重新弹一次窗，人点到第十次时
+    /// 那句「允许」已经不是回答，只是肌肉记忆。
+    #[tokio::test]
+    async fn an_answer_to_always_allow_stops_the_next_lookalike_from_being_asked() {
+        let bridge = ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::Allow {
+            always: true,
+        });
+        let decider = decider_over(bridge.clone(), None, Some("alice"), "session-42").await;
+
+        let command = serde_json::json!({ "command": "cargo test -p cog-agent" });
+        assert!(matches!(
+            verdict_of(&decider, &a_call("run_command", command.clone())).await,
+            cog_agent::permission::PermissionVerdict::Allow
+        ));
+        assert!(matches!(
+            verdict_of(&decider, &a_call("run_command", command.clone())).await,
+            cog_agent::permission::PermissionVerdict::Allow
+        ));
+        assert_eq!(
+            bridge.seen.lock().unwrap().len(),
+            1,
+            "第二次同样的调用不该再问人"
+        );
+
+        // 同一个工具、另一个命令：还是得问。
+        assert!(matches!(
+            verdict_of(
+                &decider,
+                &a_call(
+                    "run_command",
+                    serde_json::json!({ "command": "cargo publish" })
+                )
+            )
+            .await,
+            cog_agent::permission::PermissionVerdict::Allow
+        ));
+        assert_eq!(
+            bridge.seen.lock().unwrap().len(),
+            2,
+            "记住的是这一次碰的那个东西，不是这个工具的全部"
+        );
+    }
+
+    /// 「总是拒绝」写下的是一条拒绝规则，下一次同类调用连问都不问就拒绝——而它的理由
+    /// 说明是被哪条规则拦下的，不是那个「没人回答」的兜底句。
+    #[tokio::test]
+    async fn a_remembered_denial_refuses_without_asking_again() {
+        let bridge = ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::Deny {
+            reason: "别跑这个".into(),
+            always: true,
+        });
+        let store: Arc<dyn cog_core::KeyValueStore> =
+            Arc::new(crate::permission_rules::MemoryKv::default());
+        let decider = decider_over(bridge.clone(), Some(store.clone()), Some("alice"), "s1").await;
+
+        let ask = a_call(
+            "run_command",
+            serde_json::json!({ "command": "rm -rf build" }),
+        );
+        assert!(matches!(
+            verdict_of(&decider, &ask).await,
+            cog_agent::permission::PermissionVerdict::Deny { .. }
+        ));
+        // 下一条连接、另一段对话：规则从存储里读回来，仍然算数。
+        let later = decider_over(
+            ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::allow()),
+            Some(store),
+            Some("alice"),
+            "s2",
+        )
+        .await;
+        match verdict_of(&later, &ask).await {
+            cog_agent::permission::PermissionVerdict::Deny { reason } => {
+                assert!(
+                    reason.contains("规则"),
+                    "拒绝的理由要指向那条规则：{reason}"
+                )
+            }
+            other => panic!("留下来的拒绝规则没有生效：{other:?}"),
+        }
+        assert_eq!(bridge.seen.lock().unwrap().len(), 1, "只问过一次");
+    }
+
+    /// 两条规则同时命中时拒绝说了算，而且撤销之后重新开始问——这是这一整套的门。
+    #[tokio::test]
+    async fn a_deny_rule_wins_over_an_allow_rule_and_revoking_brings_the_question_back() {
+        use cog_agent::permission::{PermissionRule, PermissionScope};
+
+        let store: Arc<dyn cog_core::KeyValueStore> =
+            Arc::new(crate::permission_rules::MemoryKv::default());
+        let rule = |allow: bool| PermissionRule {
+            tool: "run_command".into(),
+            subject: Some("cargo test".into()),
+            allow,
+            scope: PermissionScope::Owner,
+        };
+        crate::permission_rules::remember(&store, Some("alice"), rule(true))
+            .await
+            .unwrap();
+        crate::permission_rules::remember(&store, Some("alice"), rule(false))
+            .await
+            .unwrap();
+
+        let bridge = ARecordingBridge::answering(cog_gateway::chat::PermissionAnswer::allow());
+        let decider = decider_over(bridge.clone(), Some(store.clone()), Some("alice"), "s1").await;
+        let ask = a_call(
+            "run_command",
+            serde_json::json!({ "command": "cargo test -p cogneva" }),
+        );
+        assert!(
+            matches!(
+                verdict_of(&decider, &ask).await,
+                cog_agent::permission::PermissionVerdict::Deny { .. }
+            ),
+            "两条规则都命中时必须是拒绝"
+        );
+        assert!(bridge.seen.lock().unwrap().is_empty(), "有规则就不该再问");
+
+        // 撤掉那条拒绝的，问句回来；剩下那条放行规则照旧生效。
+        crate::permission_rules::revoke(&store, Some("alice"), "s1", &rule(false).id()).await;
+        let after = decider_over(bridge.clone(), Some(store.clone()), Some("alice"), "s1").await;
+        assert!(matches!(
+            verdict_of(&after, &ask).await,
+            cog_agent::permission::PermissionVerdict::Allow
+        ));
+        // 两条都撤掉，问句就真的回来了。
+        crate::permission_rules::revoke(&store, Some("alice"), "s1", &rule(true).id()).await;
+        let bare = decider_over(bridge.clone(), Some(store), Some("alice"), "s1").await;
+        assert!(matches!(
+            verdict_of(&bare, &ask).await,
+            cog_agent::permission::PermissionVerdict::Allow
+        ));
+        assert_eq!(
+            bridge.seen.lock().unwrap().len(),
+            1,
+            "撤掉全部规则之后，同类调用要重新问人"
+        );
     }
 }

@@ -68,12 +68,18 @@ pub enum ClientMessage {
     ///
     /// 按请求号寻址，不按会话号：同一段对话里可能有两问同时在等（用户连发两句），
     /// 按会话答会把答案交给错的那一个。
+    ///
+    /// `remember` 是答案的另一半：人要求把这一次的结论留下来（「总是允许」「总是拒绝」），
+    /// 下次同类调用不再问。它只管「要不要记」，记成什么样的规则由装配层决定——网关
+    /// 不认识工具的参数，也就不该替它定义「同类」。
     #[serde(rename = "permission_response")]
     PermissionResponse {
         request_id: String,
         allow: bool,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        remember: bool,
         #[serde(default)]
         timestamp: Option<String>,
     },
@@ -82,6 +88,26 @@ pub enum ClientMessage {
     PermissionMode {
         session_id: String,
         mode: String,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
+    /// 要一份「总是允许 / 总是拒绝」留下来的规则名单。
+    ///
+    /// 名单属于人，但会话号一起带着：会话范围的规则只在这一段对话里看得见，
+    /// 而界面开着的就是这一段。
+    #[serde(rename = "permission_rules")]
+    PermissionRules {
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
+    /// 撤掉一条留下来的规则。回执是撤完之后的整份名单（见服务端的 `permission_rules`）。
+    #[serde(rename = "permission_rule_revoke")]
+    PermissionRuleRevoke {
+        #[serde(default)]
+        session_id: Option<String>,
+        rule_id: String,
         #[serde(default)]
         timestamp: Option<String>,
     },
@@ -143,6 +169,15 @@ pub enum ServerMessage {
         tool: String,
         summary: String,
         mode: String,
+    },
+    /// 一段对话上留下来的规则：人点过「总是」的那些，带各自的撤销号。
+    ///
+    /// 名单里没有一条规则与「一条都没列出来」是同一件事的两面：前者是这个人手上
+    /// 真的没有规则，后者是这个平台这一侧还没接上。所以这个帧只在读到了的时候发。
+    #[serde(rename = "permission_rules")]
+    PermissionRules {
+        session_id: String,
+        rules: Vec<crate::chat::PermissionRuleView>,
     },
 }
 

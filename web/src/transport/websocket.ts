@@ -14,6 +14,20 @@ export type ConnectionStatus = 'connecting' | 'open' | 'closed' | 'error';
  * 只声明会读的那几格：服务端还带着 `mode`，这一页用它显示「这一问是在哪一格下
  * 发生的」；其余字段不声明，免得在这里长出一份与 Rust 侧悄悄分家的字段表。
  */
+/** 服务端递回来的一条规则，五格都照原样读，见 `permissionStore`。 */
+export interface PermissionRuleWire {
+  id?: string;
+  tool?: string;
+  subject?: string;
+  allow?: boolean;
+  scope?: string;
+}
+
+export interface PermissionRulesWire {
+  session_id?: string;
+  rules?: PermissionRuleWire[];
+}
+
 export interface PermissionAskWire {
   request_id?: string;
   session_id?: string;
@@ -45,6 +59,11 @@ export interface WebSocketOptions {
    * 那一轮会一直等到连接断掉才被拒绝。
    */
   onPermissionRequest?: (ask: PermissionAskWire) => void;
+  /**
+   * 留下来的规则名单。它不走 `onChatFrame`：规则不是这一轮吐出来的东西，而是
+   * 一个人设过一次之后留在平台上的设置——混进聊天流会被当成一句助手说的话。
+   */
+  onPermissionRules?: (rules: PermissionRuleWire[]) => void;
   onStatusChange?: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -220,6 +239,12 @@ export class EventStreamClient {
       const requestId = wire.request_id;
       if (!requestId) return;
       this.options.onPermissionRequest?.(wire);
+      return;
+    } else if (message.type === 'permission_rules') {
+      // 名单为空是真的「一条也没有」：服务端只在读到的时候发这一帧，所以收到它
+      // 就等于读到了。认不出形状的那一份按空名单处理，不拿上次的名单冒充这次。
+      const wire = message as unknown as PermissionRulesWire;
+      this.options.onPermissionRules?.(Array.isArray(wire.rules) ? wire.rules : []);
       return;
     } else if (message.type === 'notification' && message.payload) {
       const notification = normalizeNotification(

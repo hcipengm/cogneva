@@ -351,7 +351,30 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
               mode: wire.mode ?? 'default',
             });
           },
-          onStatusChange: (status) => setConnectionStatus(status),
+          // 规则名单是设置，不进聊天流。少一格（没有号或没有工具名）的那一条不落：
+          // 没有号就撤不掉，画出来只是一个撤不掉的按钮。
+          onPermissionRules: (rules) => {
+            const known = rules.flatMap((rule) =>
+              rule.id && rule.tool
+                ? [
+                    {
+                      id: rule.id,
+                      tool: rule.tool,
+                      subject: rule.subject,
+                      allow: rule.allow === true,
+                      scope: rule.scope ?? 'session',
+                    },
+                  ]
+                : []
+            );
+            usePermissionStore.getState().setRules(known);
+          },
+          onStatusChange: (status) => {
+            setConnectionStatus(status);
+            // 断了就把名单清回「还没读到」：上一条连接读到的规则不该留在屏幕上
+            // 冒充现状，而重连之后那一次请求会把真的名单拿回来。
+            if (status !== 'open') usePermissionStore.getState().forgetRules();
+          },
           onError: (error) => {
             console.error('WebSocket error:', error);
           },

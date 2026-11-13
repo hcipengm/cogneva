@@ -142,6 +142,169 @@ pub fn decided_without_asking(mode: PermissionMode, tool: &str) -> Option<Permis
     }
 }
 
+/// 一条留下来的规则管多大范围。
+///
+/// 只有两格，因为这两格回答的是两个不同的问题：`Session` 是「这一段对话里别再问我」，
+/// `Owner` 是「这个人往后都别再问」。再细分（按项目、按工具组）没有第二个消费者，
+/// 而多一格就要多一条「它什么时候失效」的说明。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionScope {
+    /// 管一段对话：会话号变了就失效。
+    Session { session_id: String },
+    /// 管一个人：他在哪一段对话里都算数，重启后还在。
+    Owner,
+}
+
+impl PermissionScope {
+    /// 这个范围属于谁：`Some(属主名)` 或 `Some(会话号)`。存的时候按它分键，
+    /// 一格里放一个范围的全部规则。
+    pub fn key(&self) -> String {
+        match self {
+            Self::Session { session_id } => format!("session:{session_id}"),
+            Self::Owner => "owner".to_string(),
+        }
+    }
+}
+
+/// 人答过一次「总是这样」之后留下来的一条规则。
+///
+/// 规则的身份就是它自己的内容——工具、对象、放还是拦、管多大范围。没有另外生一个
+/// 随机 id：同一个意思点两次只该有一条规则，撤销时按内容撤销也不会撤错那一条。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRule {
+    pub tool: String,
+    /// 只看这一个工具碰的东西：命令行的第一段、路径。`None` 表示这个工具不带对象。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// `true` = 直接放行，`false` = 直接拒绝。拒绝优先于放行，见
+    /// [`PermissionRuleSet::evaluate`]。
+    pub allow: bool,
+    pub scope: PermissionScope,
+}
+
+impl PermissionRule {
+    /// 规则的可读身份。撤销、去重、界面上那一行都用它；同一个意思只对应一个名字。
+    pub fn id(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            if self.allow { "allow" } else { "deny" },
+            self.tool,
+            self.subject.as_deref().unwrap_or("*"),
+            self.scope.key()
+        )
+    }
+
+    fn covers(&self, ask: &PermissionAsk) -> bool {
+        if self.tool != ask.tool {
+            return false;
+        }
+        let subject = ask_subject(&ask.arguments);
+        match (&self.subject, subject) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(rule), Some(subject)) => subject_covers(rule, subject),
+        }
+    }
+}
+
+/// 一次调用的参数里「它要动什么」的那一格。与问句摘要读的是同一组键，但只用第一个：
+/// 摘要给人看，规则要一个稳定的比较对象。
+pub fn ask_subject(arguments: &serde_json::Value) -> Option<&str> {
+    const LEAD: [&str; 4] = ["command", "path", "file_path", "pattern"];
+    let map = arguments.as_object()?;
+    LEAD.iter()
+        .find_map(|key| map.get(*key).and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+}
+
+/// 规则里的对象能盖住这次调用的对象吗。
+///
+/// 按「整段前缀」算，且前缀必须断在分隔符上：规则 `git push` 盖住 `git push --force`，
+/// 但规则 `git` 不盖 `github`——否则一条看着很窄的规则会悄悄放到一串别的命令。
+fn subject_covers(rule: &str, subject: &str) -> bool {
+    if rule == subject {
+        return true;
+    }
+    let Some(rest) = subject.strip_prefix(rule) else {
+        return false;
+    };
+    matches!(rest.chars().next(), Some(' ' | '/' | ':' | '\t'))
+}
+
+/// 一组规则，按人拿在手上的那一份整体读、整体写。
+///
+/// 评估只有一条路：命中的规则里只要有拒绝，结论就是拒绝。放行是「没有人反对」，
+/// 拒绝是「有人反对」——反过来（先看放行）会让一条后来加的拒绝永远轮不到它说话。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct PermissionRuleSet {
+    rules: Vec<PermissionRule>,
+}
+
+impl PermissionRuleSet {
+    pub fn new(rules: Vec<PermissionRule>) -> Self {
+        let mut set = Self::default();
+        for rule in rules {
+            set.insert(rule);
+        }
+        set
+    }
+
+    /// 加一条规则。同一条（内容相同）只留一份；返回是否真的加进去了。
+    pub fn insert(&mut self, rule: PermissionRule) -> bool {
+        if self.rules.iter().any(|existing| *existing == rule) {
+            return false;
+        }
+        self.rules.push(rule);
+        true
+    }
+
+    /// 按身份撤掉一条。返回是否真的撤掉了。
+    pub fn remove(&mut self, id: &str) -> bool {
+        let before = self.rules.len();
+        self.rules.retain(|rule| rule.id() != id);
+        before != self.rules.len()
+    }
+
+    pub fn rules(&self) -> &[PermissionRule] {
+        &self.rules
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// 这次调用能不能由留下来的规则定下来；`None` = 没有规则管它，照常问人。
+    ///
+    /// `session_id` 用来判断会话范围的规则在这一段对话里算不算数。
+    pub fn evaluate(&self, ask: &PermissionAsk, session_id: &str) -> Option<PermissionVerdict> {
+        let applies = |rule: &&PermissionRule| {
+            let in_scope = match &rule.scope {
+                PermissionScope::Owner => true,
+                PermissionScope::Session { session_id: ruled } => ruled == session_id,
+            };
+            in_scope && rule.covers(ask)
+        };
+        let matched: Vec<&PermissionRule> = self.rules.iter().filter(applies).collect();
+        if let Some(deny) = matched.iter().find(|rule| !rule.allow) {
+            return Some(PermissionVerdict::Deny {
+                reason: format!(
+                    "`{}` 命中一条留下来的人定规则（{}），没有执行。要改主意，把这条规则撤掉。",
+                    ask.tool,
+                    deny.subject.as_deref().unwrap_or("全部")
+                ),
+            });
+        }
+        matched
+            .iter()
+            .any(|rule| rule.allow)
+            .then_some(PermissionVerdict::Allow)
+    }
+}
+
 /// 把一次询问落成结论：先看模式能不能自己定，不能就问人；没有人可问时拒绝，
 /// 而不是放行。放行等于把一个没人做过的决定记成一个做过的决定。
 pub async fn decide(
@@ -229,6 +392,197 @@ mod tests {
         }
         assert_eq!(PermissionMode::parse("defaultt"), None);
         assert_eq!(PermissionMode::parse(""), None);
+    }
+
+    fn ask_for(tool: &str, arguments: serde_json::Value) -> PermissionAsk {
+        PermissionAsk {
+            call_id: "call-1".into(),
+            agent_id: "worker".into(),
+            tool: tool.into(),
+            arguments,
+            mode: PermissionMode::Default,
+        }
+    }
+
+    fn rule(
+        allow: bool,
+        tool: &str,
+        subject: Option<&str>,
+        scope: PermissionScope,
+    ) -> PermissionRule {
+        PermissionRule {
+            tool: tool.into(),
+            subject: subject.map(str::to_string),
+            allow,
+            scope,
+        }
+    }
+
+    /// 两条规则同时命中时，拒绝那条说了算——不管谁先写下来。
+    ///
+    /// 反过来（先看放行）的代价不对称：一条后来加的拒绝会永远轮不到它说话，
+    /// 而界面上它明明躺着。
+    #[test]
+    fn a_deny_rule_wins_over_an_allow_rule_that_also_matches() {
+        let ask = ask_for(
+            "run_command",
+            serde_json::json!({"command": "git push --force"}),
+        );
+        let scope = PermissionScope::Owner;
+        for order in [
+            vec![
+                rule(true, "run_command", Some("git push"), scope.clone()),
+                rule(false, "run_command", Some("git push"), scope.clone()),
+            ],
+            vec![
+                rule(false, "run_command", Some("git push"), scope.clone()),
+                rule(true, "run_command", Some("git push"), scope.clone()),
+            ],
+        ] {
+            let set = PermissionRuleSet::new(order);
+            match set.evaluate(&ask, "s1") {
+                Some(PermissionVerdict::Deny { reason }) => {
+                    assert!(reason.contains("git push"), "{reason}")
+                }
+                other => panic!("两条规则都命中时必须是拒绝，得到 {other:?}"),
+            }
+        }
+    }
+
+    /// 撤销之后重新开始问：撤掉的规则不再给出任何结论，而不是给一个相反的结论。
+    #[test]
+    fn revoking_the_rule_makes_the_ask_come_back() {
+        let ask = ask_for("write_file", serde_json::json!({"path": "src/a.rs"}));
+        let allowed = rule(true, "write_file", Some("src/a.rs"), PermissionScope::Owner);
+        let mut set = PermissionRuleSet::new(vec![allowed.clone()]);
+        assert_eq!(set.evaluate(&ask, "s1"), Some(PermissionVerdict::Allow));
+        assert!(set.remove(&allowed.id()));
+        assert_eq!(set.evaluate(&ask, "s1"), None, "撤掉之后要重新问人");
+        assert!(!set.remove(&allowed.id()), "同一条撤第二次是没撤到");
+    }
+
+    /// 同一个意思点两次只留一条：规则的身份是内容，不是生成的号。
+    #[test]
+    fn the_same_rule_written_twice_is_one_rule() {
+        let mut set = PermissionRuleSet::default();
+        let owned = rule(
+            true,
+            "run_command",
+            Some("git push"),
+            PermissionScope::Owner,
+        );
+        assert!(set.insert(owned.clone()));
+        assert!(!set.insert(owned.clone()));
+        assert_eq!(set.rules().len(), 1);
+    }
+
+    /// 会话范围的规则只在它那一格里算数；人范围的规则在他每一段对话里都算数。
+    #[test]
+    fn a_session_rule_stops_at_its_session_and_an_owner_rule_does_not() {
+        let ask = ask_for("run_command", serde_json::json!({"command": "cargo test"}));
+        let here = PermissionRuleSet::new(vec![rule(
+            true,
+            "run_command",
+            Some("cargo test"),
+            PermissionScope::Session {
+                session_id: "s1".into(),
+            },
+        )]);
+        assert_eq!(here.evaluate(&ask, "s1"), Some(PermissionVerdict::Allow));
+        assert_eq!(here.evaluate(&ask, "s2"), None, "换一段对话就不再算数");
+
+        let everywhere = PermissionRuleSet::new(vec![rule(
+            true,
+            "run_command",
+            Some("cargo test"),
+            PermissionScope::Owner,
+        )]);
+        assert_eq!(
+            everywhere.evaluate(&ask, "s2"),
+            Some(PermissionVerdict::Allow)
+        );
+    }
+
+    /// 对象按整段前缀比，且断在分隔符上：`git push` 盖 `git push --force`，
+    /// 不盖 `git pushx`，`git` 也不盖 `github`。窄的规则不许悄悄放宽。
+    #[test]
+    fn a_subject_covers_a_prefix_that_breaks_on_a_separator() {
+        let push = ask_for(
+            "run_command",
+            serde_json::json!({"command": "git push --force"}),
+        );
+        let allow_push = PermissionRuleSet::new(vec![rule(
+            true,
+            "run_command",
+            Some("git push"),
+            PermissionScope::Owner,
+        )]);
+        assert_eq!(
+            allow_push.evaluate(&push, "s1"),
+            Some(PermissionVerdict::Allow)
+        );
+
+        for (subject, ask) in [
+            (
+                "git push",
+                ask_for("run_command", serde_json::json!({"command": "git pushx"})),
+            ),
+            (
+                "git",
+                ask_for("run_command", serde_json::json!({"command": "github"})).clone(),
+            ),
+        ] {
+            let set = PermissionRuleSet::new(vec![rule(
+                true,
+                "run_command",
+                Some(subject),
+                PermissionScope::Owner,
+            )]);
+            assert_eq!(set.evaluate(&ask, "s1"), None, "{subject} 不该盖住这一段");
+        }
+
+        // 带对象的规则不认没有对象的调用：那个工具要动的东西规则里没写。
+        let bare = ask_for("run_command", serde_json::json!({}));
+        assert_eq!(allow_push.evaluate(&bare, "s1"), None);
+        // 反过来，不带对象的规则盖住这个工具的全部调用。
+        let any_tool_call = PermissionRuleSet::new(vec![rule(
+            true,
+            "run_command",
+            None,
+            PermissionScope::Owner,
+        )]);
+        assert_eq!(
+            any_tool_call.evaluate(&bare, "s1"),
+            Some(PermissionVerdict::Allow)
+        );
+    }
+
+    /// 规则要能原样写成一段字再读回来：它存的是 KV 里的一个字符串，编码丢了
+    /// 字段就等于撤销了一条人写的规则。
+    #[test]
+    fn a_rule_set_survives_a_round_trip_through_json() {
+        let set = PermissionRuleSet::new(vec![
+            rule(
+                true,
+                "run_command",
+                Some("cargo test"),
+                PermissionScope::Owner,
+            ),
+            rule(
+                false,
+                "write_file",
+                None,
+                PermissionScope::Session {
+                    session_id: "s1".into(),
+                },
+            ),
+        ]);
+        let text = serde_json::to_string(&set).expect("规则要能序列化");
+        let back: PermissionRuleSet = serde_json::from_str(&text).expect("规则要能读回来");
+        assert_eq!(back, set);
+        let ids: Vec<String> = back.rules().iter().map(PermissionRule::id).collect();
+        assert_eq!(ids[0], "allow:run_command:cargo test:owner");
+        assert_eq!(ids[1], "deny:write_file:*:session:s1");
     }
 
     /// 没有人可问时，需要问的那一步是拒绝而不是放行；且拒绝里带着「为什么没人」。

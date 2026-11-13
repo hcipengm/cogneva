@@ -53,6 +53,49 @@ pub trait ConversationTurn: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = cog_core::SFResult<serde_json::Value>> + Send + 'a>,
     >;
+
+    /// 这个人手上还有哪些「总是允许 / 总是拒绝」的规则。
+    ///
+    /// 默认是一张空名单：装配层没装规则存储时，界面上就该什么都列不出来，而不是
+    /// 列一份猜的。列出来的是这个人自己的规则加上这一段对话的规则——他能在哪一段
+    /// 对话里被这条规则管住，就该在哪儿看得见它。
+    fn permission_rules<'a>(
+        &'a self,
+        _owner: &'a str,
+        _session_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<PermissionRuleView>> + Send + 'a>>
+    {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// 撤掉一条规则，返回撤完之后的名单。
+    ///
+    /// 返回整份名单而不是一个布尔，是因为界面上唯一要画的就是这份名单：撤掉了哪一条
+    /// 由「新的名单里没有它」表达，多一个回执只是在描述一件已经看得见的事。
+    fn revoke_permission_rule<'a>(
+        &'a self,
+        _owner: &'a str,
+        _session_id: &'a str,
+        _rule_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<PermissionRuleView>> + Send + 'a>>
+    {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+/// 一条留下来的规则在界面上长什么样。
+///
+/// 五格都给人看：哪个工具、碰什么、放还是拦、管这一段还是管这个人、撤的时候按哪个号。
+/// 不把规则本身（内核的类型）递出来——网关与界面都没有理由认识内核的枚举。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PermissionRuleView {
+    pub id: String,
+    pub tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub allow: bool,
+    /// `session` 或 `owner`。
+    pub scope: String,
 }
 
 /// 一次执行前的询问，从装配层递到界面上。
@@ -72,10 +115,36 @@ pub struct PermissionAskView {
 }
 
 /// 人给回来的答案。拒绝要带理由，理由要交回模型。
+///
+/// `always` 是另一半答案：人除了回答这一次，还可以要求「这个工具碰这种东西就别再问了」。
+/// 两个字段上的 `always` 是同一件事的两面——记住的是结论（放行或拒绝），规则由装配层
+/// 写进它那一侧的存储；网关只把人的原话搬过去，不解释「同类」是什么意思。
 #[derive(Debug, Clone)]
 pub enum PermissionAnswer {
-    Allow,
-    Deny { reason: String },
+    Allow { always: bool },
+    Deny { reason: String, always: bool },
+}
+
+impl PermissionAnswer {
+    /// 只放行这一次。
+    pub fn allow() -> Self {
+        Self::Allow { always: false }
+    }
+
+    /// 只拒绝这一次。
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self::Deny {
+            reason: reason.into(),
+            always: false,
+        }
+    }
+
+    /// 人是否要求把这一次的结论记成一条规则。
+    pub fn remembered(&self) -> bool {
+        match self {
+            Self::Allow { always } | Self::Deny { always, .. } => *always,
+        }
+    }
 }
 
 /// 谁把那一问送到人面前。
@@ -204,15 +273,11 @@ impl PermissionBridge for SocketPermissionBridge {
             },
         ) else {
             self.channel.forget(&view.request_id);
-            return PermissionAnswer::Deny {
-                reason: "这一问没能发出去，所以没有执行。".into(),
-            };
+            return PermissionAnswer::deny("这一问没能发出去，所以没有执行。");
         };
         if self.out.send(frame).await.is_err() {
             self.channel.forget(&view.request_id);
-            return PermissionAnswer::Deny {
-                reason: "这条连接已经关闭，没有人回答，所以没有执行。".into(),
-            };
+            return PermissionAnswer::deny("这条连接已经关闭，没有人回答，所以没有执行。");
         }
         // 没有人给这一问上时限：人在读它。但「没人会再读到它」必须立刻结束，否则这一轮
         // 会一直挂在「等我点头」上，而读它的那个人已经不在了——答案永远不会回来，`rx`
@@ -226,9 +291,7 @@ impl PermissionBridge for SocketPermissionBridge {
             Some(answer) => answer,
             None => {
                 self.channel.forget(&view.request_id);
-                PermissionAnswer::Deny {
-                    reason: "这条连接在回答之前关闭了，所以没有执行。".into(),
-                }
+                PermissionAnswer::deny("这条连接在回答之前关闭了，所以没有执行。")
             }
         }
     }
@@ -1068,12 +1131,15 @@ mod tests {
         assert_eq!(parsed["tool"], "write_file");
 
         assert!(
-            channel.answer("perm-1", PermissionAnswer::Allow),
+            channel.answer("perm-1", PermissionAnswer::allow()),
             "这一问正在等，答案必须找得到它"
         );
-        assert!(matches!(waiter.await.unwrap(), PermissionAnswer::Allow));
+        assert!(matches!(
+            waiter.await.unwrap(),
+            PermissionAnswer::Allow { always: false }
+        ));
         assert!(
-            !channel.answer("perm-1", PermissionAnswer::Allow),
+            !channel.answer("perm-1", PermissionAnswer::allow()),
             "同一个请求号答第二次不该再落进任何一问"
         );
     }
@@ -1096,10 +1162,11 @@ mod tests {
         // 出站那一头没了（连接断掉），等的那一头必须立刻得到拒绝。
         drop(out_rx);
         match waiter.await.unwrap() {
-            PermissionAnswer::Deny { reason } => {
-                assert!(reason.contains("没有执行"), "{reason}")
+            PermissionAnswer::Deny { reason, always } => {
+                assert!(reason.contains("没有执行"), "{reason}");
+                assert!(!always, "没人回答的那一问不该被记成一条规则");
             }
-            PermissionAnswer::Allow => panic!("没人回答时不许放行"),
+            PermissionAnswer::Allow { .. } => panic!("没人回答时不许放行"),
         }
     }
 
