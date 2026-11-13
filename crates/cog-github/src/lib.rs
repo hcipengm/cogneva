@@ -28,6 +28,7 @@ pub const LABEL_STAGE: &str = "stage";
 /// 读数带上「为什么是这个结局」时用的标签键。
 pub const LABEL_REASON: &str = "reason";
 
+pub mod board;
 pub mod change_funnel;
 pub mod ci_attribution;
 pub mod ci_refusals;
