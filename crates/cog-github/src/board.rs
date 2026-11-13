@@ -265,7 +265,7 @@ pub fn render(board: &[BoardPr], updated_at: &str) -> String {
         lines.push("| PR | Bot | Env | Eval evidence | Cross-validation |".to_string());
         lines.push("|----|-----|-----|---------------|------------------|".to_string());
         let mut open: Vec<&BoardPr> = board.iter().collect();
-        open.sort_by(|a, b| b.pr.number.cmp(&a.pr.number));
+        open.sort_by_key(|a| std::cmp::Reverse(a.pr.number));
         for entry in open {
             lines.push(format!(
                 "| [#{}]({}) | `{}` | {} | {} | ✅ {} / ❌ {} |",
