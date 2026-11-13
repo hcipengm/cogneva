@@ -82,10 +82,6 @@ pub struct ReadingSpec {
     /// owner instead ("postgres-exporter", "traefik"), because that is who has
     /// to be looked at when the series disappears.
     pub produced_by: &'static str,
-    /// The Grafana dashboard uid this reading deep-links to. `None` means the
-    /// reading is real but has no panel: the WebUI says so rather than showing
-    /// a link that goes nowhere.
-    pub dashboard_uid: Option<&'static str>,
 }
 
 /// Disk headroom, as a fraction of the filesystem the root lives on.
@@ -100,7 +96,6 @@ pub const DISK_FREE: ReadingSpec = ReadingSpec {
     higher_is_worse: false,
     series: "node_filesystem_avail_bytes / node_filesystem_size_bytes",
     produced_by: "node-exporter",
-    dashboard_uid: Some("cogneva-storage"),
 };
 
 /// How much of postgres' connection ceiling is in use.
@@ -115,7 +110,6 @@ pub const PG_CONNECTIONS: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "pg_stat_database_numbackends",
     produced_by: "postgres-exporter（数据库 Pod 内的边车）",
-    dashboard_uid: Some("cogneva-postgres"),
 };
 
 /// The oldest transaction still open. A number that only grows means something
@@ -131,7 +125,6 @@ pub const PG_OLDEST_TX: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "pg_stat_activity_max_tx_duration",
     produced_by: "postgres-exporter（数据库 Pod 内的边车）",
-    dashboard_uid: Some("cogneva-postgres"),
 };
 
 /// Vectors held by the store. Read as a trend, not a limit: a jump means an
@@ -147,7 +140,6 @@ pub const QDRANT_VECTORS: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "collections_vector_total",
     produced_by: "qdrant",
-    dashboard_uid: Some("cogneva-storage"),
 };
 
 /// Ingress 5xx per second. The ratio would be nicer, but a rate of zero when
@@ -164,7 +156,6 @@ pub const INGRESS_5XX: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "traefik_service_requests_total{code=~\"5..\"}",
     produced_by: "traefik（k3s 形态）/ ingress-nginx（标准 k8s 形态）",
-    dashboard_uid: Some("cogneva-reachability"),
 };
 
 /// Probe targets that are currently failing, including the certificate check.
@@ -179,7 +170,6 @@ pub const UNREACHABLE: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "probe_success",
     produced_by: "blackbox-exporter（`19-blackbox-exporter.yaml` + 可达性值域文件）",
-    dashboard_uid: Some("cogneva-reachability"),
 };
 
 /// How long the upstream CI gate has been calling this tree red, in one
@@ -213,7 +203,6 @@ pub const MAINLINE_CI_HOLD: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "cogneva_mainline_ci_hold_seconds",
     produced_by: "crates/cog-reflection/src/mainline_deployer.rs",
-    dashboard_uid: None,
 };
 
 /// Whether anything is working on the rollout the CI gate is holding.
@@ -240,7 +229,6 @@ pub const MAINLINE_CI_HOLD_UNOWNED: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "cogneva_mainline_ci_hold_unowned",
     produced_by: "crates/cog-reflection/src/mainline_deployer.rs",
-    dashboard_uid: None,
 };
 
 /// Whether a hold is on right now.
@@ -265,7 +253,6 @@ pub const MAINLINE_CI_HOLD_ACTIVE: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "cogneva_mainline_ci_hold_active",
     produced_by: "crates/cog-reflection/src/mainline_deployer.rs",
-    dashboard_uid: None,
 };
 
 /// How long the oldest change has been blocked by the model pool.
@@ -290,7 +277,6 @@ pub const CHANGE_POOL_BLOCKED_OLDEST: ReadingSpec = ReadingSpec {
     higher_is_worse: true,
     series: "cogneva_change_dispatch_pool_blocked_oldest_seconds",
     produced_by: "crates/cog-orchestrator/src/change_ledger.rs",
-    dashboard_uid: None,
 };
 
 /// How many model upstreams the pool reports healthy.
@@ -315,7 +301,6 @@ pub const LLM_UPSTREAMS_HEALTHY: ReadingSpec = ReadingSpec {
     higher_is_worse: false,
     series: "llm_upstream_healthy",
     produced_by: "crates/cog-gateway/src/security_gateway.rs",
-    dashboard_uid: None,
 };
 
 pub const READINGS: [&ReadingSpec; 11] = [
@@ -399,6 +384,21 @@ pub struct Reading {
     pub verdict: ReadingVerdict,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_because: Option<String>,
+    /// Where the follow-up question is answered: the board and the cell.
+    ///
+    /// Computed from the registry rather than written per reading. The board is
+    /// the one the generator puts every reading on, and the cell is the
+    /// reading's position in the registry — so a reading cannot point at a
+    /// panel nobody draws, which is what a written uid allowed.
+    pub panel: ReadingPanel,
+}
+
+/// The board and cell a reading's panel occupies.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReadingPanel {
+    pub uid: &'static str,
+    /// Position in [`READINGS`], which is the order the board is built in.
+    pub id: usize,
 }
 
 /// Judge one value against its spec.
@@ -571,7 +571,8 @@ pub async fn observability_readings_handler() -> axum::response::Response {
 
     let readings: Vec<Reading> = READINGS
         .iter()
-        .map(|spec| {
+        .enumerate()
+        .map(|(cell, spec)| {
             let (value, why) = match by_id.remove(spec.id) {
                 Some(Ok(Some(v))) => (Some(v), None),
                 Some(Ok(None)) => (
@@ -589,6 +590,10 @@ pub async fn observability_readings_handler() -> axum::response::Response {
                 value,
                 verdict: verdict_of(spec, value),
                 unavailable_because: why,
+                panel: ReadingPanel {
+                    uid: crate::grafana_export::READINGS_BOARD_UID,
+                    id: cell,
+                },
             }
         })
         .collect();
@@ -763,6 +768,10 @@ mod tests {
             value: None,
             verdict: ReadingVerdict::Unknown,
             unavailable_because: None,
+            panel: ReadingPanel {
+                uid: crate::grafana_export::READINGS_BOARD_UID,
+                id: 0,
+            },
         })
         .unwrap();
         assert!(wire["warn"].is_null());

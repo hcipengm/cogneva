@@ -4,6 +4,7 @@ import { useResource, type Resource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { EventsBoard } from '@/observability/EventsBoard';
+import { GrafanaFrame } from '@/observability/GrafanaFrame';
 import { LogsBoard } from '@/observability/LogsBoard';
 import { MetricsBoard } from '@/observability/MetricsBoard';
 import { ProbesBoard } from '@/observability/ProbesBoard';
@@ -33,7 +34,8 @@ type BoardId =
   | 'logs'
   | 'traces'
   | 'events'
-  | 'probes';
+  | 'probes'
+  | 'grafana';
 
 const BOARDS: { id: BoardId; label: string; what: string }[] = [
   { id: 'overview', label: '概况', what: '集群判词、监管者、工作负载' },
@@ -44,6 +46,7 @@ const BOARDS: { id: BoardId; label: string; what: string }[] = [
   { id: 'traces', label: 'trace', what: '执行轨迹的形状' },
   { id: 'events', label: '事件回放', what: '最近 24 小时的历史事件' },
   { id: 'probes', label: '探测', what: '后端健康矩阵' },
+  { id: 'grafana', label: '图形', what: '判词板与大屏：数怎么随时间变，由 Grafana 渲染，嵌在同一页' },
 ];
 
 export function ObservabilityView() {
@@ -101,6 +104,9 @@ export function ObservabilityView() {
       {board === 'traces' && <TracesBoard />}
       {board === 'events' && <EventsBoard />}
       {board === 'probes' && <ProbesBoard />}
+      {board === 'grafana' && (
+        <GrafanaFrame title="判词板（由注册表生成）" uid="cogneva-readings" height={720} />
+      )}
     </ViewFrame>
   );
 }

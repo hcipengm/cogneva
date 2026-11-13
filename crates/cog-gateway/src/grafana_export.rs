@@ -221,6 +221,12 @@ pub fn panels_from_registry() -> Vec<Board> {
     boards.into_values().collect()
 }
 
+/// The declaration both readers of the address read.
+///
+/// Spelt once: a second literal is a rename that silently leaves one reader
+/// looking for a name nobody sets any more.
+pub const GRAFANA_URL_ENV: &str = "COGNEVA_GRAFANA_URL";
+
 /// Where the boards are sent, and what proves they arrived.
 ///
 /// Read from the environment rather than from the config file because the
@@ -257,7 +263,7 @@ impl GrafanaEndpoint {
     /// The endpoint as the deployment declares it, or why there is none.
     pub fn from_env() -> Result<Self, String> {
         Self::from_parts(
-            std::env::var("COGNEVA_GRAFANA_URL").ok().as_deref(),
+            std::env::var(GRAFANA_URL_ENV).ok().as_deref(),
             std::env::var("COGNEVA_GRAFANA_PASSWORD").ok().as_deref(),
         )
     }
@@ -436,6 +442,80 @@ pub async fn push_once(
         pushed += 1;
     }
     Ok(pushed)
+}
+
+/// The Grafana address the WebUI reaches through this process.
+///
+/// Read from the same declaration the exporter uses, but without demanding the
+/// password: a reader inside the WebUI follows panels that Grafana serves to
+/// anonymous viewers, while pushing needs the administrator. Two reads of one
+/// variable rather than two variables.
+pub fn base_from_env() -> Option<String> {
+    std::env::var(GRAFANA_URL_ENV)
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Forward one read to Grafana, under the gateway's own origin.
+///
+/// Same-origin is what makes the embed work at all: the page is served from this
+/// process, so a panel fetched from another host is a second origin with its own
+/// cookies, its own TLS story and its own CORS answer -- and the address would
+/// have to be baked in at build time, which is what `VITE_GRAFANA_URL` was.
+///
+/// Only reads are forwarded. Grafana's live channel is a WebSocket, which this
+/// path does not carry; a panel renders on its refresh interval instead of
+/// streaming, and that limit is stated rather than hidden.
+pub async fn proxy_get(
+    axum::extract::Path(path): axum::extract::Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(base) = base_from_env() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "没有声明 Grafana 地址（COGNEVA_GRAFANA_URL）：这个部署没有图形面",
+        )
+            .into_response();
+    };
+    let client = match crate::contribution_admin::http_client() {
+        Ok(client) => client,
+        Err(why) => {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, why).into_response();
+        }
+    };
+    let url = match query {
+        Some(q) => format!("{base}/{path}?{q}"),
+        None => format!("{base}/{path}"),
+    };
+    let request = cog_core::HttpRequest::get(url).timeout(PUSH_TIMEOUT_SECS);
+    let response = match client.execute(request).await {
+        Ok(response) => response,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("Grafana 不可达：{e}"),
+            )
+                .into_response();
+        }
+    };
+    let status = axum::http::StatusCode::from_u16(response.status)
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+    let mut reply = axum::response::Response::new(axum::body::Body::from(response.body));
+    *reply.status_mut() = status;
+    if let Ok(value) = axum::http::HeaderValue::from_str(&content_type) {
+        reply
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    reply
 }
 
 #[cfg(test)]

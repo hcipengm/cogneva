@@ -2049,7 +2049,8 @@ export async function getBackendHealth(): Promise<BackendHealthMatrix> {
 
 /**
  * 观测读数。`value` 为空是「问不到 / 没有样本」，与读到 0 不是一回事；
- * `dashboard_uid` 为空是「这条读数没有面板」，界面据此说明为什么点不过去。
+ * `panel` 是后端算出来的面板地址（哪块板、第几格），不是人写的 uid——
+ * 面板由注册表投影生成，写一份 uid 清单迟早与生成物对不上。
  * `group` 是闭集：面板按它分段，读到不认识的词就照原样单列一段，而不是把它
  * 并进某一段——并错段的一行数不算错，但读者会在错的那一分钟去找它。
  */
@@ -2065,7 +2066,8 @@ export interface ObservabilityReading {
   higher_is_worse: boolean;
   series: string;
   produced_by: string;
-  dashboard_uid: string | null;
+  /** 后端算出来的面板地址：板子的 uid 与这条读数在板上的格号。 */
+  panel: { uid: string; id: number };
   value: number | null;
   /**
    * 判词。闭集：`| string` 会把联合类型变成一句装饰——加了它，任何词都合法，

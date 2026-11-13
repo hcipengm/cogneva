@@ -1429,6 +1429,9 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
 
     // Viewer-level protected routes (wiki read/write + user-facing core APIs)
     let viewer_routes = Router::new()
+        // 图形面：Grafana 挂在本进程的同源子路径上，复用这一层的鉴权。地址是相对的，
+        // 所以换了域名不会断，构建期也不再需要注入一个主机名。
+        .route("/grafana/{*path}", get(grafana_export::proxy_get))
         .route("/api/v1/wiki", get(wiki::list_handler))
         .route("/api/v1/wiki", post(wiki::create_handler))
         .route("/api/v1/wiki/info", get(wiki::info_handler))
