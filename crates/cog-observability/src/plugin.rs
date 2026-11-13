@@ -57,6 +57,12 @@ pub struct ObservabilityPlugin {
     /// and the directory it belongs to, so a scan cannot be pointed at a
     /// directory other than the one its series is attributed to.
     data_volume: Vec<Arc<crate::data_volume::DataVolumeObservable>>,
+    /// The retention loops' shared reading face: the target each beat computed,
+    /// the unit it is in, whether its input was measured, and how many beats it
+    /// has run. Created and published in `init` because the scrape snapshot is
+    /// taken there -- a handle published from `start` is held by a live loop and
+    /// read by nobody. The two sweeps attach to it in `start`.
+    retention_readings: Option<Arc<cog_core::retention::RetentionReadings>>,
 }
 
 impl ObservabilityPlugin {
@@ -73,6 +79,7 @@ impl ObservabilityPlugin {
             capabilities: None,
             trace_buffer_max_bytes: crate::config::TraceCollectorConfig::default().buffer_max_bytes,
             data_volume: Vec::new(),
+            retention_readings: None,
         }
     }
 }
@@ -624,6 +631,16 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         info!(declared = capabilities.len(), "capability ledger published");
         self.capabilities = Some(capabilities);
 
+        // The retention loops' reading face, published here rather than beside
+        // the loops in `start`: the scrape snapshot is taken during `init`, so a
+        // handle published after it is carried by a live sweep and read by
+        // nobody. Both the exchange archive sweep and the token ledger sweep
+        // report through this one face -- they share it so the two knobs appear
+        // side by side with a beat count rather than as two unrelated gauges.
+        let retention_readings = Arc::new(cog_core::retention::RetentionReadings::new());
+        ctx.publish_observable(retention_readings.clone());
+        self.retention_readings = Some(retention_readings);
+
         self.initialized = true;
         Ok(())
     }
@@ -703,11 +720,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // same store, and publishes what it retired so the promise is
         // checkable rather than merely declared.
         // Both retention loops recompute their target from the measured cost of
-        // a day's writes against the declared database volume. They share one
-        // reading face, so the two knobs appear side by side with a beat count
-        // rather than as two unrelated gauges.
-        let retention_readings = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
-        ctx.publish_observable(retention_readings.clone());
+        // a day's writes against the declared database volume. They share the
+        // reading face `init` published, so the two knobs appear side by side
+        // with a beat count rather than as two unrelated gauges. The fallback is
+        // a face nobody reads rather than a second publish: `start` runs after
+        // every reader has taken its snapshot, so publishing here reaches no
+        // scrape at all.
+        let retention_readings = self.retention_readings.clone().unwrap_or_default();
         let database_volume = cog_core::retention::database_volume_from_env();
         if let Some(store) = self.usage_store.clone() {
             let shutdown = ctx

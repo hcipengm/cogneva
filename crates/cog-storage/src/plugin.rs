@@ -24,6 +24,12 @@ pub struct StoragePlugin {
     /// that need a lease are not all in this plugin: whoever owns the shared
     /// database owns the arbitration, and everyone else reads it from here.
     lease_broker: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
+    /// The retention loops' shared reading face, created and published in
+    /// `init` because the scrape snapshot is taken there. A handle published
+    /// from `start` is held by a live sweep and read by nobody, which is the
+    /// same silent absence the sweeps exist to make visible. `start` attaches
+    /// the capacity loop to this face.
+    retention_readings: Option<Arc<cog_core::retention::RetentionReadings>>,
 }
 
 impl StoragePlugin {
@@ -33,6 +39,7 @@ impl StoragePlugin {
             initialized: false,
             pg_pool: None,
             lease_broker: None,
+            retention_readings: None,
         }
     }
 }
@@ -1347,6 +1354,16 @@ impl cog_core::SystemPlugin for StoragePlugin {
 
         self.lease_broker = lease_broker;
 
+        // The observability-event capacity loop's reading face: the target
+        // each beat computed, the unit it is in, whether its input was
+        // measured, and how many beats it has run. Published here rather than
+        // where the loop starts, because the scrape snapshot is taken during
+        // `init` -- a face published after it is live on the loop and absent
+        // from every scrape.
+        let retention_readings = Arc::new(cog_core::retention::RetentionReadings::new());
+        ctx.publish_observable(retention_readings.clone());
+        self.retention_readings = Some(retention_readings);
+
         self.initialized = true;
         Ok(())
     }
@@ -1541,8 +1558,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // input was measured, and how many beats it has run. A target that does
         // not move between beats is correct; the beat count is what separates a
         // steady table from a stopped sweep.
-        let retention_readings = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
-        ctx.publish_observable(retention_readings.clone());
+        let retention_readings = self.retention_readings.clone().unwrap_or_default();
         let database_volume = cog_core::retention::database_volume_from_env();
         let event_max_rows = crate::observability_event_cap::max_rows_from_env();
         let event_read_window = crate::observability_event_cap::read_window_from_env();

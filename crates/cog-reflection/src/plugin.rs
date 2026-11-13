@@ -1643,11 +1643,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // walking this tree more often than the deployment asked buys
                 // nothing, so a measurement may only lengthen the wait, never
                 // shorten it below the declaration.
-                let scan_pacing = std::sync::Arc::new(cog_core::pacing::PacingReadings::new());
+                // The shared pacing face `init` published, not a second one: the
+                // family is keyed by loop name, so a local instance would be a
+                // second face for the same series -- and published from `start`
+                // it would reach no scrape anyway, since the readers took their
+                // snapshot during `init`.
                 let seed = std::time::Duration::from_secs(readings.scan_interval_secs());
                 let scan_pacer =
-                    std::sync::Arc::new(scan_pacing.pacer(CACHE_SCAN_PACING, seed, seed, 20.0));
-                ctx.publish_observable(scan_pacing);
+                    std::sync::Arc::new(self.pacing.pacer(CACHE_SCAN_PACING, seed, seed, 20.0));
                 drop(crate::build_cache_readings::spawn_build_cache_watch(
                     readings.clone(),
                     shutdown,
