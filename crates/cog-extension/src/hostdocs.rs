@@ -61,8 +61,15 @@ pub const MAX_DOC_BYTES_ENV: &str = "HOST_DOCS_MAX_WRITE_BYTES";
 pub const MAX_READ_BYTES_ENV: &str = "HOST_DOCS_MAX_READ_BYTES";
 /// Largest listing one call returns. Bounds the output, not the walk.
 pub const MAX_LIST_ENTRIES_ENV: &str = "HOST_DOCS_MAX_LIST_ENTRIES";
-/// How long a staged plan stays approvable.
+/// How long a staged plan stays approvable. This is the **seed**: the window a
+/// deployment declares before any approval has been measured, and the floor the
+/// measured window may not go below.
 pub const APPROVAL_TTL_SECS_ENV: &str = "HOST_DOCS_APPROVAL_TTL_SECS";
+/// The approvability window this gate is actually keeping, in seconds.
+pub const APPROVAL_TTL_METRIC: &str = "sandbox_host_docs_approval_ttl_seconds";
+/// The label that says whether the window in force came from the declaration
+/// (`seed`) or from a measured approval (`derived`).
+pub const SOURCE_LABEL: &str = "source";
 /// Largest plan this module will stage for approval.
 pub const MAX_PLAN_BYTES_ENV: &str = "HOST_DOCS_MAX_PLAN_BYTES";
 
@@ -93,8 +100,19 @@ const DEFAULT_MAX_LIST_ENTRIES: usize = 5_000;
 /// A day. This gate is a person reading one plan, and a plan left unread for more than
 /// a working day is no longer the plan about to be read -- approving it then is
 /// approving something nobody looked at.
-// cap: bound — 放了一整个工作日还没人看的计划，已经不是「马上要读的那份」
+// cap: seed — 审批延迟的实测要比它长时，窗口跟着实测走
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
+
+/// How long an approval-latency sample stays in the window the window is
+/// computed from. Thirty days: the pattern this answers to is "how long people
+/// take to read one plan", which has weekly shape (a plan staged on Friday) --
+/// a window shorter than a month would call a quiet fortnight an empty one.
+const APPROVAL_LATENCY_WINDOW_SECS: u64 = 30 * 86_400;
+
+/// Headroom over the slowest measured approval. The measurement is one sample
+/// of a person's schedule, so the window gives the next one a quarter more
+/// room than the slowest one already took.
+const APPROVAL_TTL_MARGIN: f64 = 1.25;
 /// A window shorter than this is not a window: the plan could expire between being
 /// displayed and being clicked.
 // cap: bound — 比这更短的窗口不算窗口：计划可能在显示与点击之间过期
@@ -767,6 +785,15 @@ impl AskOutcome {
 
 struct HostDocsMetrics {
     registry: Registry,
+    /// 这一拍生效的批准窗口，以及选择它的那一侧（只有一侧为 1）。
+    ///
+    /// 来源用一族 one-hot 而不是目标上的一个标签：Prometheus 客户端会把每个
+    /// label set 留到进程结束，`seed` 与 `derived` 先后写上去就会永久并存，
+    /// 读的人无从判断哪一条是当前生效的。
+    approval_ttl: Gauge,
+    approval_ttl_source: prometheus::GaugeVec,
+    /// 这条回路算过几拍。目标不动时它照样走，是"回路在跑"的那一半读数。
+    approval_ttl_evaluations: prometheus::IntCounter,
     ops: CounterVec,
     rollbacks: CounterVec,
     lists: CounterVec,
@@ -780,6 +807,28 @@ struct HostDocsMetrics {
 impl HostDocsMetrics {
     fn new(scope_count: usize) -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
+        let approval_ttl = Gauge::new(
+            APPROVAL_TTL_METRIC,
+            "How long a staged host document plan stays approvable, from the declaration and the slowest measured approval",
+        )?;
+        let approval_ttl_source = prometheus::GaugeVec::new(
+            Opts::new(
+                "sandbox_host_docs_approval_ttl_source",
+                "Which input chose the approval window: 1 for that one, 0 for the other",
+            ),
+            &[SOURCE_LABEL],
+        )?;
+        registry.register(Box::new(approval_ttl.clone()))?;
+        registry.register(Box::new(approval_ttl_source.clone()))?;
+        // 两族都先以 0 登记：窗口在第一条计划到来之前就有一个值（声明），
+        // 「还没算过」与「算出来是零」必须是两条不同的读数。
+        approval_ttl_source.with_label_values(&["seed"]).set(1.0);
+        approval_ttl_source.with_label_values(&["derived"]).set(0.0);
+        let approval_ttl_evaluations = prometheus::IntCounter::with_opts(Opts::new(
+            "sandbox_host_docs_approval_ttl_evaluations_total",
+            "How many times the approval window has been recomputed",
+        ))?;
+        registry.register(Box::new(approval_ttl_evaluations.clone()))?;
         let scopes = Gauge::new(
             "sandbox_host_docs_scopes",
             "Host document scopes configured on this executor",
@@ -881,6 +930,9 @@ impl HostDocsMetrics {
         }
         Ok(Self {
             registry,
+            approval_ttl,
+            approval_ttl_source,
+            approval_ttl_evaluations,
             ops,
             rollbacks,
             lists,
@@ -937,6 +989,19 @@ impl HostDocsMetrics {
     fn count_assist(&self, outcome: &str) {
         self.assist.with_label_values(&[outcome]).inc();
     }
+
+    /// Record one recompute of the approval window: the number in force, which
+    /// input chose it, and that the recompute happened at all.
+    fn set_approval_ttl(&self, secs: u64, derived: bool) {
+        self.approval_ttl.set(secs as f64);
+        self.approval_ttl_source
+            .with_label_values(&["seed"])
+            .set(if derived { 0.0 } else { 1.0 });
+        self.approval_ttl_source
+            .with_label_values(&["derived"])
+            .set(if derived { 1.0 } else { 0.0 });
+        self.approval_ttl_evaluations.inc();
+    }
 }
 
 pub struct HostDocs {
@@ -951,6 +1016,10 @@ pub struct HostDocs {
     /// A serial shared by the rollback journal and staged records; it exists only to make
     /// two ids in the same millisecond differ.
     id_seq: AtomicU64,
+    /// 已批准的记录从提交到批准用了多久：`(批准时刻, 延迟秒)`。这条回路唯一的
+    /// 实测输入——窗口要盖住人真正花的时间，不是写下的一整天。按
+    /// [`APPROVAL_LATENCY_WINDOW_SECS`] 裁剪。
+    approval_latencies: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
 impl HostDocs {
@@ -971,11 +1040,35 @@ impl HostDocs {
             assist,
             apply_lock: Mutex::new(()),
             id_seq: AtomicU64::new(0),
+            approval_latencies: std::sync::Mutex::new(Vec::new()),
         }))
     }
 
     pub fn metrics(&self) -> String {
         self.metrics.render()
+    }
+
+    /// 这一拍生效的批准窗口：声明与窗口内最慢一次批准中较大的那个（见
+    /// [`approval_ttl_secs`]）。每次需要窗口时重算并记一次读数——目标不动也记，
+    /// 一个安静的部署与一条停摆的回路只能靠计数分开。
+    fn effective_approval_ttl(&self, now: u64) -> u64 {
+        let slowest = {
+            let mut samples = self.approval_latencies.lock().unwrap();
+            let since = now.saturating_sub(APPROVAL_LATENCY_WINDOW_SECS);
+            samples.retain(|(at, _)| *at >= since);
+            samples.iter().map(|(_, latency)| *latency).max()
+        };
+        let (ttl, derived) = approval_ttl_secs(self.cfg.approval_ttl_secs, slowest);
+        self.metrics.set_approval_ttl(ttl, derived);
+        ttl
+    }
+
+    /// 记下一次已完成的批准从提交到批准用了多久。
+    fn note_approval_latency(&self, approved_at: u64, staged_at: u64) {
+        self.approval_latencies
+            .lock()
+            .unwrap()
+            .push((approved_at, approved_at.saturating_sub(staged_at)));
     }
 
     /// Resolve a scope name to its configured root. An unknown name is a hard
@@ -1454,18 +1547,21 @@ impl HostDocs {
             )));
         }
         let now = now_unix();
+        // 这一份计划拿到的窗口就是此刻重算出来的那个：批准延迟的实测比声明长时，
+        // 它已经跟上，不需要重启。
+        let ttl_secs = self.effective_approval_ttl(now);
         let record = StagedPlan {
             staged_id: self.new_record_id(&plan.plan_hash),
             plan,
             staged_at_unix: now,
-            expires_at_unix: now.saturating_add(self.cfg.approval_ttl_secs),
+            expires_at_unix: now.saturating_add(ttl_secs),
             approval: None,
             rejection: None,
             applied: None,
         };
         self.save_staged(&record).await?;
         self.metrics.count("stage", "staged");
-        self.prune_staged(now).await;
+        self.prune_staged(now, ttl_secs).await;
         Ok(record.view(now))
     }
 
@@ -1504,6 +1600,10 @@ impl HostDocs {
         });
         self.save_staged(&record).await?;
         self.metrics.count("approve", "approved");
+        // 这一趟人花了多久：窗口的下一次重算拿它当最慢那一次。批完就重算一次，
+        // 让读数在下一份计划提交之前就已经跟上，而不是等下一次 stage。
+        self.note_approval_latency(now, record.staged_at_unix);
+        let _ = self.effective_approval_ttl(now);
         info!(
             staged_id = %staged_id,
             scope = %record.plan.scope,
@@ -1559,7 +1659,10 @@ impl HostDocs {
     pub async fn staged_plans(&self) -> SFResult<StagedPlanList> {
         let dir = self.staged_dir();
         let now = now_unix();
-        self.prune_staged(now).await;
+        // 清理由当前生效的窗口判：与 stage 用的是同一个重算，读清单的人看到的
+        // 处置与下一份计划拿到的窗口是同一条界。
+        let ttl_secs = self.effective_approval_ttl(now);
+        self.prune_staged(now, ttl_secs).await;
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(entries) => entries,
             // The directory does not exist until something is staged; that is a normal state,
@@ -1676,7 +1779,7 @@ impl HostDocs {
     /// An action that deletes things has to leave its own reading (`prune`/`pruned`):
     /// without it an operator cannot see where a plan they submitted went, and can only
     /// guess.
-    async fn prune_staged(&self, now: u64) {
+    async fn prune_staged(&self, now: u64, ttl_secs: u64) {
         let dir = self.staged_dir();
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(entries) => entries,
@@ -1702,7 +1805,7 @@ impl HostDocs {
             let Ok(record) = self.load_staged(id).await else {
                 continue;
             };
-            if !prune_due(&record, now, self.cfg.approval_ttl_secs) {
+            if !prune_due(&record, now, ttl_secs) {
                 continue;
             }
             if let Err(e) = tokio::fs::remove_file(entry.path()).await {
@@ -2254,6 +2357,31 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// How long a plan stays approvable: the declaration, widened by how long a
+/// person actually took to approve the slowest plan seen.
+///
+/// The window only grows. An approval slower than the current window cannot be
+/// observed -- the plan expires first and the sample never happens -- so reading
+/// that absence as "the window may be shorter" would let it shrink below what
+/// people actually need and never grow back. Widening is the direction the
+/// measurement can support: a plan someone did read after two days says a
+/// one-day window is too short.
+///
+/// Returns the window and whether a measurement is what chose it. A measured
+/// latency that still fits inside the declaration leaves the declaration in
+/// force, and the reading says so.
+fn approval_ttl_secs(seed_secs: u64, slowest_approval_secs: Option<u64>) -> (u64, bool) {
+    let Some(slowest) = slowest_approval_secs.filter(|s| *s > 0) else {
+        return (seed_secs, false);
+    };
+    let widened = (slowest as f64 * APPROVAL_TTL_MARGIN).ceil() as u64;
+    if widened > seed_secs {
+        (widened, true)
+    } else {
+        (seed_secs, false)
+    }
 }
 
 /// Whether this record should be cleaned up now.
@@ -2899,6 +3027,76 @@ mod tests {
             1.0,
             "the cleanup deleted something, so it has to leave its own reading"
         );
+    }
+
+    /// 窗口跟着人实际花的审批时间走：一天的声明装得下就不动，装不下就按最慢那
+    /// 一次加余量放宽；没有实测时声明就是全部。
+    #[test]
+    fn the_approval_window_follows_the_measured_latency() {
+        let day = 86_400;
+        assert_eq!(approval_ttl_secs(day, None), (day, false), "没有实测，声明生效");
+        assert_eq!(
+            approval_ttl_secs(day, Some(7_200)),
+            (day, false),
+            "实测比声明短时，窗口仍是声明——它只往宽的方向跟"
+        );
+        let (wider, derived) = approval_ttl_secs(day, Some(2 * day));
+        assert!(derived, "实测宽过声明时，窗口由实测决定");
+        assert_eq!(wider, 216_000, "两天加四分之一的余量");
+        // 慢的那一次留在窗口里，不会被"最近没人批"抹掉。
+        assert_eq!(approval_ttl_secs(day, Some(0)), (day, false));
+    }
+
+    /// 一次真实的慢批准让下一份计划的窗口变宽，且这条回路每算一次都留下计数。
+    #[tokio::test]
+    async fn a_measured_approval_widens_the_next_window_and_the_beat_counts() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let ops = [write("a.txt", "one")];
+        let first = docs.stage("alice", &ops).await.unwrap();
+        assert_eq!(
+            first.expires_at_unix - first.staged_at_unix,
+            DEFAULT_APPROVAL_TTL_SECS,
+            "没有实测之前，窗口是声明"
+        );
+
+        // 让这一份看起来是两天前提交的：人能等多久只能靠时间过去，测试里改记录。
+        let day = 86_400;
+        let now = now_unix();
+        rewrite_record(&docs, &first.staged_id, |record| {
+            record.staged_at_unix = now - 2 * day;
+            record.expires_at_unix = now + day;
+        });
+        docs.approve(&first.staged_id, "alice").await.unwrap();
+
+        let text = docs.metrics();
+        assert!(
+            text.contains(APPROVAL_TTL_METRIC),
+            "窗口必须作为读数发出去: {text}"
+        );
+        assert!(
+            text.contains(&format!("{APPROVAL_TTL_METRIC} 216000")),
+            "两天最慢一次批准的窗口是两天半: {text}"
+        );
+
+        // 下一份计划拿到的是重算后的窗口，不需要重启。
+        let second = docs.stage("alice", &ops).await.unwrap();
+        assert_eq!(second.expires_at_unix - second.staged_at_unix, 216_000);
+
+        let evaluations = evaluations_count(&docs.metrics());
+        assert!(
+            evaluations >= 3,
+            "stage、approve、再 stage 各算一次，计数要走到: {evaluations}"
+        );
+    }
+
+    fn evaluations_count(metrics: &str) -> u64 {
+        metrics
+            .lines()
+            .find(|line| line.starts_with("sandbox_host_docs_approval_ttl_evaluations_total "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
     }
 
     #[tokio::test]

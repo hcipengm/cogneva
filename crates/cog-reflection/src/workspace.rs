@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cog_core::{SFError, SFResult};
+use cog_core::retention::{ttl_for_half_turnover, RetentionReadings, UNIT_SECONDS};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -109,10 +110,106 @@ pub(crate) async fn clear_stale_git_lock(lock: &Path, max_age: Duration) -> bool
     tokio::fs::remove_file(lock).await.is_ok()
 }
 
-/// 临时工作树默认存活上限。要容得下一整轮演进：属主 pid 是 Pod 进程号，
+/// 临时工作树存活上限的**种子**。要容得下一整轮演进：属主 pid 是 Pod 进程号，
 /// 同一进程内永远"活着"，存活时长才是唯一的兜底判据。
-// cap: bound — 要容得下一整轮演进；属主 pid 在 Pod 内永远活着，存活时长才是唯一兜底判据
+///
+/// 实际生效的界每拍按实测重算（卷还装得下多少棵树 × 新树到达间隔 / 2），并把
+/// 已归还工作树里最长的一趟当地板——量不到卷或到达率时才落回这个数。
+// cap: seed — 量不到卷与到达率时的退路；地板由已归还的若干趟实测重算
 pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
+
+/// 孤儿分支存活上限的**种子**：未并入 main、且所属实例已经轮换掉的 `evol/<id>`
+/// 分支留多久。实际生效的界每拍按实测重算（裸仓库还能装下多少条分支的独有
+/// 对象 × 新实例分支到达间隔 / 2）。
+// cap: seed — 量不到仓库容量或分支到达率时的退路
+pub const DEFAULT_ORPHAN_BRANCH_TTL: Duration = Duration::from_secs(2_592_000);
+
+/// 临时工作树这一条保留回路在登记表里的 key，与 `evolution.workspaces.ephemeralTtlSecs`
+/// 同名：读数按它点名，规则按它选取，两边写错的就不是同一个旋钮。
+pub const EPHEMERAL_TTL_KNOB: &str = "evolution.workspaces.ephemeralTtlSecs";
+
+/// 孤儿分支这一条保留回路在登记表里的 key。
+pub const ORPHAN_BRANCH_TTL_KNOB: &str = "evolution.workspaces.orphanBranchTtlSecs";
+
+/// 到达率按多长的窗口算。
+///
+/// 7 天：实例轮换是件稀疏的事，一个轮询周期里 0 或 1 次是常态；窗口短到一两次
+/// 事件就能翻倍，长到与「这条卷多久会被重新填满」同一量级。窗口内的到达数除以
+/// 窗口，就是这条回路的到达率。
+const ARRIVAL_WINDOW_SECS: u64 = 7 * 86_400;
+
+/// 一件东西在这张卷上值得留多久：装得下多少件 × 新件到达间隔 / 2。
+///
+/// 半周转——到达的东西把这张卷重新填满所需时间的一半。一条律两处调用：临时
+/// 工作树按棵树算，孤儿分支按独有对象算。问的是同一个问题：这件东西再留下去，
+/// 腾出来的是别人要用的空间，还是删掉的是还会被用的东西。
+///
+/// `floor` 只由临时工作树用：已经归还的若干趟里最长的那一趟。正在用的一棵树
+/// 不能短于任何一趟已经跑完的——属主 pid 在 Pod 内永远活着，年龄是唯一会把它
+/// 判成泄漏的东西。回收时量到的年龄不进 `floor`：那个年龄被界自己截断，拿它
+/// 当地板会让这条回路追着自己的输出涨。
+///
+/// 量不到卷、量不到单件字节、窗口内没有到达时落回 `seed`，`derived=false`。
+/// `seed` 为零是「这个部署不要这类残留」的声明，实测不能把它重新打开。
+fn keep_duration(
+    capacity_bytes: Option<u64>,
+    item_bytes: u64,
+    arrivals: usize,
+    span_secs: u64,
+    floor: Duration,
+    seed: Duration,
+) -> (Duration, bool) {
+    if seed.is_zero() {
+        return (seed, false);
+    }
+    let Some(capacity) = capacity_bytes else {
+        return (seed, false);
+    };
+    if item_bytes == 0 || arrivals == 0 || span_secs == 0 {
+        return (seed, false);
+    }
+    let per_day = arrivals as f64 * 86_400.0 / span_secs as f64;
+    let turnover = ttl_for_half_turnover(capacity, per_day, item_bytes as f64);
+    if turnover.is_zero() {
+        return (seed, false);
+    }
+    (turnover.max(floor), true)
+}
+
+fn unix_now() -> u64 {
+    chrono::Utc::now().timestamp().max(0) as u64
+}
+
+/// 窗口内的到达数。`now` 之前的 `span_secs` 里发生的才算——进程刚起来时窗口
+/// 只有它活过的那一段，拿整窗去除会把刚发生的一次到达摊成七天的平均。
+fn arrivals_within(at: &[u64], now: u64, span_secs: u64) -> usize {
+    let since = now.saturating_sub(span_secs);
+    at.iter().filter(|t| **t >= since).count()
+}
+
+/// 这些分支里不属于 main 的对象在盘上一共占多少字节。
+///
+/// 只算独有的那一段：与 main 共有的历史删不删都还在，占空间的是分支自己推上去
+/// 的部分。git 读不出来（老版本没有 `--disk-usage`、refs 已不在）时返回 `None`，
+/// 由调用方落回种子——一个量不出来的每分支成本不能反过来授权更早的回收。
+fn unique_branch_bytes(bare: &Path, names: &[String]) -> Option<u64> {
+    if names.is_empty() {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(bare)
+        .args(["rev-list", "--disk-usage", "--objects"])
+        .args(names)
+        .args(["--not", "main"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
 
 /// 回收"实例身份已轮换"遗留工作树的最小存活时长。滚动更新期间新旧 Pod 可能
 /// 短暂共存、共享同一工作树根，旧 Pod 正在用的树必须活过这个窗口。
@@ -238,6 +335,44 @@ struct WorkspaceMeta {
     task_id: Option<String>,
 }
 
+/// 两次普查之间 `evol/` 分支集合的变化：新出现的名字与它们出现的时刻。
+///
+/// 只记本进程见过什么：一条分支是不是新实例推上来的，仓库里读不出来——ref
+/// 只有最近一次强推的时间，第一次出现的时间没人写。两次普查的差集就是它，
+/// 代价是一次名字集合的比较。
+struct BranchSightings {
+    /// 上一拍见到的名字；`None` 是还没普查过——第一拍是清点，不是到达。
+    seen: Option<std::collections::HashSet<String>>,
+    arrivals: Vec<u64>,
+}
+
+impl BranchSightings {
+    fn new() -> Self {
+        Self {
+            seen: None,
+            arrivals: Vec::new(),
+        }
+    }
+
+    /// 用这一拍看到的分支名更新记录，返回窗口内的到达数。
+    fn observe(&mut self, names: &[String], now: u64, span_secs: u64) -> usize {
+        let current: std::collections::HashSet<String> = names.iter().cloned().collect();
+        // 名字被删掉后又出现也算一次到达：那是两条分支的生命，不是同一条还活着。
+        // 一条还活着的分支不会离开 `seen`，强推只更新它的时间，不换名字。
+        let fresh = self
+            .seen
+            .as_ref()
+            .map(|seen| current.difference(seen).count())
+            .unwrap_or(0);
+        self.arrivals
+            .extend(std::iter::repeat_n(now, fresh));
+        self.seen = Some(current);
+        let since = now.saturating_sub(span_secs);
+        self.arrivals.retain(|t| *t >= since);
+        self.arrivals.len()
+    }
+}
+
 /// 工作树分配器。裸仓库是唯一仓库源，所有工作树共享其对象库与 refs。
 pub struct WorkspaceManager {
     bare_repo: PathBuf,
@@ -245,6 +380,25 @@ pub struct WorkspaceManager {
     target_dir: PathBuf,
     meta_dir: PathBuf,
     ephemeral_ttl: Duration,
+    /// 孤儿分支存活上限的种子；生效值每拍按实测重算，见 [`Self::orphan_branch_ttl`]。
+    orphan_branch_ttl: Duration,
+    /// 本进程的实例身份：`evol/<id>` 里属于当前实例的那一条永不回收。
+    /// 没装身份（分配器只被用来取临时树）时孤儿分支回收整条跳过。
+    current_instance: Option<String>,
+    /// 保留回路的读数面。缺席时两处界线照算，只是没人读得到——一条算给谁看
+    /// 都不影响的回路，不因缺一个上报端点而停。
+    retention: Option<Arc<RetentionReadings>>,
+    /// 本进程见到的临时工作树到达时刻，按 [`ARRIVAL_WINDOW_SECS`] 裁剪。
+    ephemeral_arrivals: std::sync::Mutex<Vec<u64>>,
+    /// 已归还的临时工作树里最长的一趟，秒。回收时量到的年龄不算——见
+    /// [`keep_duration`] 的 `floor`。
+    longest_completed_round_secs: std::sync::Mutex<u64>,
+    /// 分配器第一次见到世界的时刻。到达率的分母从这里起算，进程活了多久就
+    /// 按多久算，不拿一个还没过完的整窗去除。
+    started_unix: u64,
+    /// 上一次普查见到的孤儿分支名。两次普查之间新出现的分支就是到达；据此
+    /// 得到实例轮换的节奏，这个节奏不依赖 TTL 本身，所以这条回路不会追着自己。
+    branch_sightings: std::sync::Mutex<BranchSightings>,
     /// `None` 表示跟着实测静默窗口走，见 [`cog_core::git_budget::stale_lock_age`]。
     stale_lock_age: Option<Duration>,
     /// 索引健康度采样的去处。缺席则只记日志、不上报——丢一个聚合读数不该让
@@ -271,6 +425,13 @@ impl WorkspaceManager {
             target_dir: target_dir.into(),
             meta_dir,
             ephemeral_ttl: DEFAULT_EPHEMERAL_TTL,
+            orphan_branch_ttl: DEFAULT_ORPHAN_BRANCH_TTL,
+            current_instance: None,
+            retention: None,
+            ephemeral_arrivals: std::sync::Mutex::new(Vec::new()),
+            longest_completed_round_secs: std::sync::Mutex::new(0),
+            started_unix: unix_now(),
+            branch_sightings: std::sync::Mutex::new(BranchSightings::new()),
             stale_lock_age: None,
             metrics: None,
             index_sampled_at: std::sync::Mutex::new(HashMap::new()),
@@ -283,10 +444,34 @@ impl WorkspaceManager {
         self
     }
 
-    /// 覆盖临时工作树存活上限（回收策略随分配器走，各子系统用同一个值）。
+    /// 覆盖临时工作树存活上限的种子（回收策略随分配器走，各子系统用同一个值）。
     pub fn with_ephemeral_ttl(mut self, ttl: Duration) -> Self {
         self.ephemeral_ttl = ttl;
         self
+    }
+
+    /// 覆盖孤儿分支存活上限的种子。
+    pub fn with_orphan_branch_ttl(mut self, ttl: Duration) -> Self {
+        self.orphan_branch_ttl = ttl;
+        self
+    }
+
+    /// 本进程的实例身份：`evol/<id>` 里属于当前实例的那一条永不回收。
+    pub fn with_current_instance(mut self, instance: impl Into<String>) -> Self {
+        self.current_instance = Some(instance.into());
+        self
+    }
+
+    /// 两处保留界线的读数面。
+    pub fn with_retention(mut self, readings: Arc<RetentionReadings>) -> Self {
+        self.retention = Some(readings);
+        self
+    }
+
+    /// 这块读数面本身：部署器的 registry 保留回路与这里的工作区 TTL 同用一份，
+    /// `/metrics` 才只看到一条 `cogneva_retention_*` 序列族。
+    pub(crate) fn retention_face(&self) -> Option<Arc<RetentionReadings>> {
+        self.retention.clone()
     }
 
     /// 覆盖陈旧 git 锁的判定年龄（测试用短值触发自愈路径）。
@@ -420,6 +605,9 @@ impl WorkspaceManager {
         };
         let path = self.path_for(&spec.id);
         self.add_worktree(&spec, &path).await?;
+        // 到达率是这条回路唯一的「新东西来得多快」读数：树还在时它的年龄会被
+        // 保留界截断，树被还掉之后连元数据都没了，所以到达只能用在发生时。
+        self.note_ephemeral_arrival();
         Ok(self.workspace_of(&spec, &path))
     }
 
@@ -428,9 +616,30 @@ impl WorkspaceManager {
         if ws.is_persistent() {
             return Ok(());
         }
+        // 一趟跑完的长度由归还那一刻给出——这是唯一不被保留界截断的实测：
+        // 被回收的树的年龄是「界到了」，不是「活完了」。它给临时工作树的界
+        // 当地板，保证这个界不会短于任何一趟已经跑完的。
+        if let Some(meta) = self.read_meta(&ws.id) {
+            let round = unix_now().saturating_sub(meta.created_at_unix.max(0) as u64);
+            let mut longest = self.longest_completed_round_secs.lock().unwrap();
+            *longest = (*longest).max(round);
+        }
         self.force_remove_path(&ws.path).await;
         self.remove_meta(&ws.id);
         Ok(())
+    }
+
+    fn note_ephemeral_arrival(&self) {
+        let now = unix_now();
+        let mut at = self.ephemeral_arrivals.lock().unwrap();
+        at.push(now);
+        let since = now.saturating_sub(ARRIVAL_WINDOW_SECS);
+        at.retain(|t| *t >= since);
+    }
+
+    /// 进程活了多久与到达窗口里较短的那个，也就是到达率的分母。
+    fn arrival_span_secs(&self, now: u64) -> u64 {
+        now.saturating_sub(self.started_unix).clamp(1, ARRIVAL_WINDOW_SECS)
     }
 
     /// 就地移动到 `base`：`reset --hard` + `clean -ffdx`。target 目录外置，
@@ -633,7 +842,9 @@ impl WorkspaceManager {
     /// 崩掉的唯一兜底）。常驻工作树永不回收。
     pub async fn gc_stale(&self) -> SFResult<Vec<PathBuf>> {
         let mut reclaimed = Vec::new();
-        let ttl = self.ephemeral_ttl;
+        // 先算界，再回收：读数记的是这一拍算出的那个数，即便这一拍没有树可回收。
+        // 一个安静的卷与一条停摆的回路在这里分开——前者目标不变、计数仍在走。
+        let ttl = self.effective_ephemeral_ttl().await;
         let now = chrono::Utc::now().timestamp();
         for entry in self.list().await.unwrap_or_default() {
             if !entry.path.starts_with(&self.root) {
@@ -664,6 +875,125 @@ impl WorkspaceManager {
             }
         }
         Ok(reclaimed)
+    }
+
+    /// 一拍维护：按这一拍的实测重算两处保留界线，并用它回收。
+    ///
+    /// 两处界线的输入都在进程活着的时候变——卷被别的写入者占去、实例轮换、
+    /// 工作树变大——「启动时量一次」的那个值迟早与卷上的东西对不上，而这两个
+    /// 界删的东西都是回收不回来的（没提交的改动、没并入的提交）。
+    pub async fn maintain(&self) {
+        if let Err(e) = self.gc_stale().await {
+            warn!(error = %e, "workspace gc failed");
+        }
+        if self.current_instance.is_none() {
+            return;
+        }
+        if let Err(e) = self.gc_orphan_evol_branches().await {
+            warn!(error = %e, "orphan evolution branch gc failed");
+        }
+    }
+
+    /// 这一拍生效的临时工作树上限：卷还剩多少、一棵树多大、新树来得多快。
+    async fn effective_ephemeral_ttl(&self) -> Duration {
+        let now = unix_now();
+        let span = self.arrival_span_secs(now);
+        let arrivals = arrivals_within(&self.ephemeral_arrivals.lock().unwrap(), now, span);
+        let trees = self.list().await.unwrap_or_default();
+        let tree_bytes = self.sampled_tree_bytes(&trees).await;
+        // 这张卷还能装新东西的字节数（`f_bavail`）：容量按它算，卷越满、界越短。
+        let capacity = crate::build_gate::disk_bytes(&self.root);
+        self.evaluate_ephemeral_ttl(capacity, tree_bytes, arrivals, span)
+    }
+
+    /// 把这一拍的输入折算成界并记进读数面，返回同一个界。
+    fn evaluate_ephemeral_ttl(
+        &self,
+        capacity: Option<u64>,
+        tree_bytes: u64,
+        arrivals: usize,
+        span_secs: u64,
+    ) -> Duration {
+        let floor = Duration::from_secs(*self.longest_completed_round_secs.lock().unwrap());
+        let (ttl, derived) = keep_duration(
+            capacity,
+            tree_bytes,
+            arrivals,
+            span_secs,
+            floor,
+            self.ephemeral_ttl,
+        );
+        if let Some(readings) = &self.retention {
+            readings.evaluate(EPHEMERAL_TTL_KNOB, ttl.as_secs_f64(), UNIT_SECONDS, derived);
+        }
+        ttl
+    }
+
+    /// 一棵工作树在这张卷上占多少字节。每棵都是同一个裸仓库的检出，量一棵代表
+    /// 这一类；树有几十万条元数据，走查放进阻塞线程，不占住轮询。
+    async fn sampled_tree_bytes(&self, entries: &[WorktreeEntry]) -> u64 {
+        let deployer = self.deployer_workspace();
+        let path = entries
+            .iter()
+            .map(|e| e.path.clone())
+            .find(|p| *p == deployer)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .find(|p| p.starts_with(&self.root))
+            });
+        let Some(path) = path else {
+            return 0;
+        };
+        tokio::task::spawn_blocking(move || {
+            cog_core::fs_size::dir_size_bytes(&path, &[]).unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
+    }
+
+    /// 把这一拍的分支输入折算成界并记进读数面，返回同一个界。
+    fn evaluate_orphan_branch_ttl(
+        &self,
+        capacity: Option<u64>,
+        branch_bytes: u64,
+        arrivals: usize,
+        span_secs: u64,
+    ) -> Duration {
+        let (ttl, derived) = keep_duration(
+            capacity,
+            branch_bytes,
+            arrivals,
+            span_secs,
+            Duration::ZERO,
+            self.orphan_branch_ttl,
+        );
+        if let Some(readings) = &self.retention {
+            readings.evaluate(ORPHAN_BRANCH_TTL_KNOB, ttl.as_secs_f64(), UNIT_SECONDS, derived);
+        }
+        ttl
+    }
+
+    /// 这一拍生效的孤儿分支上限：裸仓库还能装下多少条分支的独有对象、新实例
+    /// 分支来得多快。`names` 是这一拍看到的孤儿分支名。
+    fn effective_orphan_branch_ttl(&self, names: &[String]) -> Duration {
+        let now = unix_now();
+        let span = self.arrival_span_secs(now);
+        let arrivals = self
+            .branch_sightings
+            .lock()
+            .unwrap()
+            .observe(names, now, span);
+        let branch_bytes = if names.is_empty() {
+            0
+        } else {
+            unique_branch_bytes(&self.bare_repo, names)
+                .map(|bytes| bytes / names.len() as u64)
+                .unwrap_or(0)
+        };
+        let capacity = crate::build_gate::disk_bytes(&self.bare_repo);
+        self.evaluate_orphan_branch_ttl(capacity, branch_bytes, arrivals, span)
     }
 
     /// 回收"实例身份已轮换"遗留的常驻工作树。
@@ -723,16 +1053,18 @@ impl WorkspaceManager {
     /// 二选一，缺一不删：
     ///
     /// - 已完全并入 main：活干完了，删掉不丢任何提交；
-    /// - 末次提交已超过 ttl：所属实例长期不活动（存活实例的分支每次移植都会被
-    ///   强推刷新），留着只占 ref 与可达对象。
+    /// - 末次提交已超过这一拍算出的界：所属实例长期不活动（存活实例的分支每次
+    ///   移植都会被强推刷新），留着只占 ref 与可达对象。界不是写下的那个数，
+    ///   而是裸仓库还能装下多少条分支的独有对象、新实例分支来得多快算出来的，
+    ///   见 [`Self::effective_orphan_branch_ttl`]。
     ///
-    /// 当前实例自己的分支永不删；正被工作树占用的分支由 git 自身拒绝删除，
+    /// 当前实例自己的分支永不删（没装实例身份的分配器整条跳过，免得把"不知道
+    /// 谁是当前实例"读成"谁都不是"）；正被工作树占用的分支由 git 自身拒绝删除，
     /// 记录后跳过。`main` / `master` 之类不带 `evol/` 前缀的 ref 一律不在此列。
-    pub async fn gc_orphan_evol_branches(
-        &self,
-        current_instance: &str,
-        ttl: Duration,
-    ) -> SFResult<Vec<String>> {
+    pub async fn gc_orphan_evol_branches(&self) -> SFResult<Vec<String>> {
+        let Some(current_instance) = self.current_instance.as_deref() else {
+            return Ok(Vec::new());
+        };
         let keep = format!("evol/{current_instance}");
         let out = self
             .git_bare(&[
@@ -741,6 +1073,15 @@ impl WorkspaceManager {
                 "refs/heads/evol/",
             ])
             .await?;
+        // 这一拍看到的所有孤儿分支名先给界用：到达率与每条的独有对象都要它们，
+        // 而回收只要其中过了界的那几条。
+        let names: Vec<String> = out
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|name| *name != keep)
+            .map(str::to_string)
+            .collect();
+        let ttl = self.effective_orphan_branch_ttl(&names);
         let now = chrono::Utc::now().timestamp();
         let mut reclaimed = Vec::new();
         for line in out.lines() {
@@ -1625,6 +1966,147 @@ mod tests {
         assert_eq!(mgr.list().await.unwrap().len(), 1);
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// 临时工作树的界是卷、每棵树、到达率三个实测的函数：到达快一倍或卷小一半，
+    /// 界各减半；量不到任何一项时落回种子。
+    #[test]
+    fn the_ephemeral_ttl_follows_the_measured_volume_and_arrivals() {
+        let seed = Duration::from_secs(21_600);
+        let days = |d: u64| d as f64 * 86_400.0;
+        // 100 GiB、每棵 1 GiB、每天到达一棵：半周转 = 100 × 1 天 / 2 = 50 天。
+        let (ttl, derived) = keep_duration(Some(100 * GIB), GIB, 1, 86_400, Duration::ZERO, seed);
+        assert!(derived);
+        assert!((ttl.as_secs_f64() - days(50)).abs() < 1.0, "{ttl:?}");
+
+        let (faster, _) = keep_duration(Some(100 * GIB), GIB, 2, 86_400, Duration::ZERO, seed);
+        assert!((faster.as_secs_f64() - days(25)).abs() < 1.0, "到达快一倍，界减半");
+
+        let (smaller, _) = keep_duration(Some(50 * GIB), GIB, 1, 86_400, Duration::ZERO, seed);
+        assert!((smaller.as_secs_f64() - days(25)).abs() < 1.0, "卷小一半，界减半");
+
+        let (bigger_tree, _) =
+            keep_duration(Some(100 * GIB), 2 * GIB, 1, 86_400, Duration::ZERO, seed);
+        assert!((bigger_tree.as_secs_f64() - days(25)).abs() < 1.0, "树大一倍，界减半");
+
+        // 已归还的一趟是最少保留：半周转比它短时，它顶着。
+        let (floored, derived) = keep_duration(
+            Some(100 * GIB),
+            GIB,
+            1,
+            86_400,
+            Duration::from_secs(60 * 86_400),
+            seed,
+        );
+        assert!(derived);
+        assert_eq!(floored, Duration::from_secs(60 * 86_400));
+    }
+
+    /// 量不到的那一侧落回种子：没有卷、没有到达、没有单件成本都不是「零」。
+    #[test]
+    fn an_unmeasured_retention_falls_back_to_the_declaration() {
+        let seed = Duration::from_secs(21_600);
+        for (capacity, item, arrivals, span) in [
+            (None, GIB, 1, 86_400),
+            (Some(100 * GIB), 0, 1, 86_400),
+            (Some(100 * GIB), GIB, 0, 86_400),
+            (Some(100 * GIB), GIB, 1, 0),
+        ] {
+            let (ttl, derived) = keep_duration(capacity, item, arrivals, span, Duration::ZERO, seed);
+            assert_eq!(ttl, seed);
+            assert!(!derived, "没有实测就不是 derived");
+        }
+        // 种子为零是部署关掉这类残留的声明；实测不能把它重新打开。
+        let (ttl, derived) = keep_duration(Some(100 * GIB), GIB, 5, 86_400, Duration::ZERO, Duration::ZERO);
+        assert_eq!(ttl, Duration::ZERO);
+        assert!(!derived);
+    }
+
+    /// 孤儿分支用同一条律：新实例分支来得快或仓库空间小，界就短。
+    #[test]
+    fn the_orphan_branch_ttl_follows_the_measured_repo_and_rotations() {
+        let seed = Duration::from_secs(2_592_000);
+        let mib = 1024u64 * 1024;
+        let (slow, derived) = keep_duration(Some(10 * GIB), 100 * mib, 1, 86_400, Duration::ZERO, seed);
+        assert!(derived);
+        let (fast, _) = keep_duration(Some(10 * GIB), 100 * mib, 2, 86_400, Duration::ZERO, seed);
+        assert!(fast < slow, "轮换快，旧的留得短");
+        let (packed, _) = keep_duration(Some(5 * GIB), 100 * mib, 1, 86_400, Duration::ZERO, seed);
+        assert!(packed < slow, "仓库空间小，旧的留得短");
+        let (unmeasured, derived) = keep_duration(None, 100 * mib, 1, 86_400, Duration::ZERO, seed);
+        assert_eq!(unmeasured, seed);
+        assert!(!derived);
+    }
+
+    /// 窗口内计数：窗口外的那次到达不再计入到达率。
+    #[test]
+    fn only_arrivals_inside_the_window_count() {
+        let now = 1_000_000;
+        let at = [now - 10, now - 400_000, now - 900_000];
+        assert_eq!(arrivals_within(&at, now, 86_400), 1);
+        assert_eq!(arrivals_within(&at, now, 500_000), 2);
+        assert_eq!(arrivals_within(&at, now, 1_000_000), 3);
+        assert_eq!(arrivals_within(&at, now, 5), 0);
+    }
+
+    /// 输入不变目标不动是对的，但「这一拍算过」必须读得出来：两拍同一个值，
+    /// 计数仍然走到 2；改输入之后下一拍的目标跟着变。
+    #[tokio::test]
+    async fn a_beat_whose_target_does_not_move_still_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, _b) = seed_bare(tmp.path());
+        let readings = std::sync::Arc::new(RetentionReadings::new());
+        let mgr = manager(tmp.path(), &bare)
+            .with_retention(readings.clone())
+            .with_orphan_branch_ttl(Duration::from_secs(2_592_000));
+
+        let first = mgr.evaluate_ephemeral_ttl(Some(100 * GIB), GIB, 1, 86_400);
+        let second = mgr.evaluate_ephemeral_ttl(Some(100 * GIB), GIB, 1, 86_400);
+        assert_eq!(first, second);
+        let (target, evaluations, derived) = readings.reading(EPHEMERAL_TTL_KNOB).unwrap();
+        assert_eq!(target, first.as_secs_f64());
+        assert_eq!(evaluations, 2, "目标不动，回路仍在算");
+        assert!(derived);
+
+        // 改输入、不重启：下一拍跟上。
+        let changed = mgr.evaluate_ephemeral_ttl(Some(50 * GIB), GIB, 1, 86_400);
+        assert!(changed < first);
+        let (target, evaluations, _) = readings.reading(EPHEMERAL_TTL_KNOB).unwrap();
+        assert_eq!(target, changed.as_secs_f64());
+        assert_eq!(evaluations, 3);
+
+        // 孤儿分支这一条同样每拍走一次，即便仓库里一条分支都没有。
+        let seed_ttl = mgr.effective_orphan_branch_ttl(&[]);
+        assert_eq!(seed_ttl, Duration::from_secs(2_592_000));
+        mgr.effective_orphan_branch_ttl(&[]);
+        let (target, evaluations, derived) = readings.reading(ORPHAN_BRANCH_TTL_KNOB).unwrap();
+        assert_eq!(target, 2_592_000.0);
+        assert_eq!(evaluations, 2);
+        assert!(!derived);
+    }
+
+    /// 一轮跑完的长度是归还那一刻记下的；回收不记（它的年龄被界截断）。
+    #[tokio::test]
+    async fn a_completed_round_sets_the_floor_for_the_ephemeral_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        let ws = mgr
+            .acquire_ephemeral("admin", BaseRef::Commit(rev_b.clone()))
+            .await
+            .unwrap();
+        // 把创建时间往回拨，模拟一趟跑了很久。
+        let meta_path = mgr.meta_path(&ws.id);
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["created_at_unix"] =
+            serde_json::json!(unix_now() as i64 - 7_200);
+        std::fs::write(&meta_path, meta.to_string()).unwrap();
+
+        mgr.release(&ws).await.unwrap();
+        assert_eq!(*mgr.longest_completed_round_secs.lock().unwrap(), 7_200);
+    }
+
     #[tokio::test]
     async fn refresh_moves_worktree_and_keeps_target_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1811,7 +2293,9 @@ mod tests {
     async fn orphan_evol_branches_reclaimed_only_when_merged_or_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let (bare_repo, rev_a, _rev_b) = seed_bare(tmp.path());
-        let mgr = manager(tmp.path(), &bare_repo);
+        let mgr = manager(tmp.path(), &bare_repo)
+            .with_current_instance("quinn")
+            .with_orphan_branch_ttl(Duration::from_secs(3600));
 
         // 当前实例：即使落后于 main 也不许动，下一轮移植还要强推它。
         bare(&bare_repo, &["branch", "evol/quinn", &rev_a]);
@@ -1820,25 +2304,29 @@ mod tests {
         // 旧实例，未并入但刚提交：处在活跃窗口内，这一轮保留。
         branch_with_wip_commit(&bare_repo, "evol/max", &rev_a);
 
-        let reclaimed = mgr
-            .gc_orphan_evol_branches("quinn", Duration::from_secs(3600))
-            .await
-            .unwrap();
+        let reclaimed = mgr.gc_orphan_evol_branches().await.unwrap();
         assert_eq!(reclaimed, vec!["evol/ada"]);
         assert!(git_out(&bare_repo, &["branch", "--list", "evol/ada"]).is_empty());
         assert!(!git_out(&bare_repo, &["branch", "--list", "evol/quinn"]).is_empty());
         assert!(!git_out(&bare_repo, &["branch", "--list", "evol/max"]).is_empty());
 
-        // ttl 归零：未并入的旧分支随即按超期回收。
-        let reclaimed = mgr
-            .gc_orphan_evol_branches("quinn", Duration::ZERO)
-            .await
-            .unwrap();
+        // 种子归零：未并入的旧分支随即按超期回收。
+        let zero = manager(tmp.path(), &bare_repo)
+            .with_current_instance("quinn")
+            .with_orphan_branch_ttl(Duration::ZERO);
+        let reclaimed = zero.gc_orphan_evol_branches().await.unwrap();
         assert_eq!(reclaimed, vec!["evol/max"]);
         assert!(git_out(&bare_repo, &["branch", "--list", "evol/max"]).is_empty());
         assert!(!git_out(&bare_repo, &["branch", "--list", "evol/quinn"]).is_empty());
         // 非 `evol/` 前缀的 ref 不在扫描范围内。
         assert!(!git_out(&bare_repo, &["branch", "--list", "main"]).is_empty());
+
+        // 不知道自己是哪个实例的分配器整条跳过：它连"谁是当前实例"都答不出，
+        // 把留下的当成孤儿就会删掉正在被推的那一条。
+        let anonymous = manager(tmp.path(), &bare_repo);
+        bare(&bare_repo, &["branch", "evol/zed", &rev_a]);
+        assert!(anonymous.gc_orphan_evol_branches().await.unwrap().is_empty());
+        assert!(!git_out(&bare_repo, &["branch", "--list", "evol/quinn"]).is_empty());
     }
 
     #[tokio::test]

@@ -36,7 +36,13 @@ use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
 use cog_core::metric_names;
+use cog_core::retention::{
+    keep_days_against_volume, RetentionReadings, UNIT_DAYS,
+};
 use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
+
+/// The registry key this loop's target answers to.
+pub const KNOB: &str = "llmExchangeRetention.keepDays";
 
 /// The table this loop retires rows from.
 pub const TABLE: &str = "gateway_llm_exchange";
@@ -101,6 +107,9 @@ pub struct RetentionOutcome {
     pub oldest_age_secs: i64,
     /// The retention this pass enforced, in seconds.
     pub keep_secs: i64,
+    /// Whether `keep_secs` came from this beat's measurements rather than from
+    /// the deployment's seed.
+    pub keep_derived: bool,
 }
 
 /// The retention sweep: the archive's table, the pool it lives on, and the age
@@ -108,9 +117,15 @@ pub struct RetentionOutcome {
 #[derive(Clone)]
 pub struct ExchangeRetention {
     pool: PgPool,
+    /// The retention this deployment declared. It is what a process with no
+    /// measured write volume keeps.
     keep: Duration,
+    /// The declared size of the database volume; with it and the measured cost
+    /// of a day's writes, every pass recomputes the retention.
+    volume_bytes: Option<u64>,
     table: String,
     metrics: Option<Arc<dyn MetricsBackend>>,
+    readings: Option<Arc<RetentionReadings>>,
     deployment: String,
 }
 
@@ -119,10 +134,24 @@ impl ExchangeRetention {
         Self {
             pool,
             keep,
+            volume_bytes: None,
             table: TABLE.to_string(),
             metrics: None,
+            readings: None,
             deployment: String::new(),
         }
+    }
+
+    /// The declared size of the volume this archive lives on.
+    pub fn with_database_volume(mut self, bytes: Option<u64>) -> Self {
+        self.volume_bytes = bytes;
+        self
+    }
+
+    /// Attach the reading face that carries this loop's target and beat count.
+    pub fn with_readings(mut self, readings: Arc<RetentionReadings>) -> Self {
+        self.readings = Some(readings);
+        self
     }
 
     /// Point the sweep at another table. Only a test does this, and it is what
@@ -211,8 +240,14 @@ impl ExchangeRetention {
     /// That is exactly the shape that made a working sweep read as a stopped
     /// loop on the event log, so the bound published here is one batch.
     pub async fn retire_once(&self, progress: impl Fn()) -> SFResult<RetentionOutcome> {
+        // The retention is recomputed before the cutoff is chosen: the pass
+        // retires against this beat's measured cost of a day's writes, not
+        // against the number the deployment wrote down at install time.
+        let oldest_before = self.oldest_age_secs().await?;
+        let bytes = self.table_bytes().await.ok().map(|bytes| bytes.max(0) as u64);
+        let (keep, keep_derived) = self.keep_for(oldest_before, bytes);
         let cutoff = chrono::Utc::now()
-            - chrono::Duration::from_std(self.keep).unwrap_or_else(|_| chrono::Duration::days(30));
+            - chrono::Duration::from_std(keep).unwrap_or_else(|_| chrono::Duration::days(30));
         let mut removed = 0u64;
         loop {
             progress();
@@ -240,8 +275,29 @@ impl ExchangeRetention {
             held,
             removed,
             oldest_age_secs,
-            keep_secs: self.keep.as_secs() as i64,
+            keep_secs: keep.as_secs() as i64,
+            keep_derived,
         })
+    }
+
+    /// The retention this beat enforces, and whether it came from a
+    /// measurement.
+    ///
+    /// The archive's own size and the age of its oldest row give the daily
+    /// write volume directly: what survived the last pass over the span it
+    /// covers is what a day costs. The volume's declared share then buys a
+    /// number of days; when any input is missing the deployment's seed stands.
+    fn keep_for(&self, oldest_age_secs: i64, bytes: Option<u64>) -> (Duration, bool) {
+        let (days, derived) = keep_days_against_volume(
+            self.keep.as_secs() as i64 / 86_400,
+            self.volume_bytes,
+            oldest_age_secs,
+            bytes,
+        );
+        (
+            Duration::from_secs((days.max(0) as u64).saturating_mul(86_400)),
+            derived,
+        )
     }
 
     /// Rows in the archive, read with the same statement as the capacity sweeps'
@@ -295,6 +351,14 @@ impl ExchangeRetention {
     /// Publish what the archive holds, how far back it reaches, and what that
     /// costs on disk.
     async fn report(&self, outcome: &RetentionOutcome) {
+        if let Some(ref readings) = self.readings {
+            readings.evaluate(
+                KNOB,
+                outcome.keep_secs as f64 / 86_400.0,
+                UNIT_DAYS,
+                outcome.keep_derived,
+            );
+        }
         let Some(ref mb) = self.metrics else { return };
         let labels = self.labels();
         let mut pairs = vec![
@@ -395,6 +459,57 @@ mod tests {
             MIN_KEEP_DAYS.max(7),
             "a deployment that says seven days means seven"
         );
+    }
+
+    /// 保留天数是当拍实测的函数；量不到时 seed 顶着。
+    #[tokio::test]
+    async fn the_retention_follows_the_measured_daily_write() {
+        let sweep = ExchangeRetention::new(
+            PgPool::connect_lazy("postgres://example").expect("a lazy pool"),
+            Duration::from_secs(30 * 86_400),
+        )
+        .with_database_volume(Some(10 * 1024u64.pow(3)));
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, Some(512 * 1024 * 1024)),
+            (Duration::from_secs(10 * 86_400), true)
+        );
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, Some(1024 * 1024 * 1024)),
+            (Duration::from_secs(5 * 86_400), true)
+        );
+        assert_eq!(
+            sweep.keep_for(0, Some(1024)),
+            (Duration::from_secs(30 * 86_400), false)
+        );
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, None),
+            (Duration::from_secs(30 * 86_400), false)
+        );
+    }
+
+    /// 目标不变的一拍仍然是一拍：求值计数往上走，目标以天为单位登记。
+    #[tokio::test]
+    async fn a_beat_whose_target_does_not_move_still_counts() {
+        let readings = Arc::new(RetentionReadings::new());
+        let sweep = ExchangeRetention::new(
+            PgPool::connect_lazy("postgres://example").expect("a lazy pool"),
+            Duration::from_secs(30 * 86_400),
+        )
+        .with_readings(Arc::clone(&readings));
+        let outcome = RetentionOutcome {
+            held: 100,
+            removed: 0,
+            oldest_age_secs: 86_400,
+            keep_secs: 7 * 86_400,
+            keep_derived: true,
+        };
+        for expected in 1..=2 {
+            sweep.report(&outcome).await;
+            let (target, beats, derived) = readings.reading(KNOB).expect("a beat");
+            assert_eq!(target, 7.0);
+            assert_eq!(beats, expected, "a steady target is still a beat");
+            assert!(derived);
+        }
     }
 
     #[tokio::test]

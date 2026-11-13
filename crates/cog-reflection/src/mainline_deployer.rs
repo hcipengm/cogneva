@@ -659,8 +659,12 @@ struct TagShape {
     digest: String,
     /// 层集（多平台 index 取第一个子 manifest 的）。
     layers: Vec<String>,
+    /// 与层集同序的每层字节数：manifest 自己写的 `size`，不是再量一遍。
+    layer_sizes: Vec<u64>,
     /// config blob digest：rev 标签与创建时间都在里面。
     config: String,
+    /// config blob 与 manifest 本身的字节数：每个 rev 都要付的那份元数据。
+    metadata_bytes: u64,
 }
 
 /// registry 上一个 tag 的读数。
@@ -672,6 +676,10 @@ struct RegistryTag {
     digest: String,
     /// 层集（子 manifest 的层；多平台 index 取第一个子 manifest）。
     layers: Vec<String>,
+    /// 与层集同序的每层字节数。
+    layer_sizes: Vec<u64>,
+    /// config blob 与 manifest 的字节数。
+    metadata_bytes: u64,
 }
 
 /// 裸 tag 名 → rev 片段（只有 `main-<rev>` 是）。
@@ -774,6 +782,41 @@ impl BuildahReading<'_> {
             before.bytes.saturating_sub(after.bytes),
         ))
     }
+}
+
+/// registry 保留回路的旋钮名：登记表里的键，也是读数上点名回路的那一维。
+pub const REGISTRY_RETENTION_KNOB: &str = "mainlineDeployer.registryMaintenance.retention";
+
+/// 每个 rev 的边际字节：删掉一个 rev 能释放多少。
+///
+/// 只算「只有它一个 tag 引用的层」加它自己的元数据：与别的 tag 共用的层是共同
+/// 祖先，删掉任何一个引用者都不释放它，把它平摊进来会让容量随共享基底一起缩水。
+/// 引用计数按**全部** tag 算（`local`、`seed`、`promote-*` 也钉着层），因为回收
+/// 只删 `main-*`，别的名字手里的层不会因为删一个 rev 而释放。没有任何 `main-*`
+/// tag，或者每个 rev 的边际字节都是 0（独有层还没量到）时为 `None`：那是缺证据，
+/// 不是「每 rev 零字节」。
+fn marginal_bytes_per_rev(tags: &[RegistryTag]) -> Option<u64> {
+    let mut references: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for tag in tags {
+        for layer in &tag.layers {
+            *references.entry(layer.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut total = 0u64;
+    let mut revs = 0u64;
+    for tag in tags {
+        if tag_rev(&tag.tag).is_none() {
+            continue;
+        }
+        revs += 1;
+        for (layer, size) in tag.layers.iter().zip(&tag.layer_sizes) {
+            if references.get(layer.as_str()) == Some(&1) {
+                total = total.saturating_add(*size);
+            }
+        }
+        total = total.saturating_add(tag.metadata_bytes);
+    }
+    (revs > 0 && total > 0).then_some(total)
 }
 
 /// 保留策略：这一轮该删哪些 tag。
@@ -3091,6 +3134,11 @@ pub struct MainlineDeployer {
     /// 节拍与时限的读数面。轮询节拍、启动/滚动/静置的申报界、两处冷却都落在
     /// 这里，一行一条序列，标签就是登记表里的键。
     pacing: Option<std::sync::Arc<cog_core::pacing::PacingReadings>>,
+    /// 回收回路的读数面。registry 保留多少个 rev 与工作区的 TTL 是同一张卷上
+    /// 同一条「容量换件数」的律，读数落在同一个面、同一个 `source` 标签下——
+    /// 另开一套指标名会让同一个量在两处读起来像两个东西。插件把同一份句柄交给
+    /// 分配器与本部署器。
+    retention: Option<std::sync::Arc<cog_core::retention::RetentionReadings>>,
     /// 三项时限的句柄。句柄里带着跨轮的实测窗口，所以只能造一次；每轮现造一个
     /// 等于每轮都从零开始量，读数永远停在种子。
     startup_budget: std::sync::OnceLock<Option<std::sync::Arc<cog_core::pacing::TailBudget>>>,
@@ -3272,6 +3320,7 @@ impl MainlineDeployer {
             registry_reading_seeded: std::sync::atomic::AtomicBool::new(false),
             loop_beat: std::sync::OnceLock::new(),
             pacing: None,
+            retention: None,
             startup_budget: std::sync::OnceLock::new(),
             rollout_budget: std::sync::OnceLock::new(),
             soak_budget: std::sync::OnceLock::new(),
@@ -3286,6 +3335,15 @@ impl MainlineDeployer {
         pacing: std::sync::Arc<cog_core::pacing::PacingReadings>,
     ) -> Self {
         self.pacing = Some(pacing);
+        self
+    }
+
+    /// 装载回收回路的读数面（与工作区分配器共用同一份）。
+    pub fn with_retention(
+        mut self,
+        retention: std::sync::Arc<cog_core::retention::RetentionReadings>,
+    ) -> Self {
+        self.retention = Some(retention);
         self
     }
 
@@ -6903,6 +6961,10 @@ impl MainlineDeployer {
     /// `keep_raised_ceilings`），两个动作各自的事件行也随动作落在那边；本文件只
     /// 在每一轮经 `compare_governance` / `poll_once` 触到它们，不复写第二份。
     async fn run_cycle(&self) {
+        // 保留界线每拍重算：两处的输入都是会动的（卷被别的写入者占去、实例轮换、
+        // 工作树变大），启动时那一次的值迟早与卷上的东西对不上。回收删的是没提交
+        // 的改动与没并入的提交，界线宁可慢一拍跟上，也不能留在启动那一刻。
+        self.workspaces.maintain().await;
         // 排在滚动之前：这一轮可能有大半时间在构建，而治理读数答的是此刻集群的
         // 执行力，与这一轮推不推进无关。
         self.compare_governance().await;
@@ -6979,15 +7041,34 @@ impl MainlineDeployer {
         let Some(layers) = source.get("layers").and_then(|l| l.as_array()) else {
             return Ok(None);
         };
-        let layers: Vec<String> = layers
-            .iter()
-            .filter_map(|l| l.get("digest").and_then(|d| d.as_str()))
-            .map(str::to_string)
-            .collect();
+        // 层的体积取 manifest 自己写的 `size`：它描述的就是这一层在 registry 上
+        // 有多少字节，与卷的占用同一本账。读不出 size 的层整条 tag 不参与读数，
+        // 因为「这层多大」缺席时，每 rev 的边际字节会静默少算一截。
+        let mut layer_digests = Vec::with_capacity(layers.len());
+        let mut layer_sizes = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let (Some(digest), Some(size)) = (
+                layer.get("digest").and_then(|d| d.as_str()),
+                layer.get("size").and_then(|s| s.as_u64()),
+            ) else {
+                return Ok(None);
+            };
+            layer_digests.push(digest.to_string());
+            layer_sizes.push(size);
+        }
+        let config_size = source
+            .get("config")
+            .and_then(|c| c.get("size"))
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
         Ok(Some(TagShape {
             digest,
-            layers,
+            layers: layer_digests,
+            layer_sizes,
             config,
+            // 取到的是 tag 自己那份 manifest 的字节数；多平台 index 的子 manifest
+            // 没有随请求带回来，少算的是几 KB 的 JSON——量级不改变容量结论。
+            metadata_bytes: config_size.saturating_add(body.len() as u64),
         }))
     }
 
@@ -7036,6 +7117,8 @@ impl MainlineDeployer {
             created_unix,
             digest: shape.digest,
             layers: shape.layers,
+            layer_sizes: shape.layer_sizes,
+            metadata_bytes: shape.metadata_bytes,
         }))
     }
 
@@ -7199,6 +7282,32 @@ impl MainlineDeployer {
             .await
             .ok()?;
         cog_core::claim_footprint::quantity_bytes(out.trim())
+    }
+
+    /// 这一轮回收该保留多少个 rev：整张卷的字节 ÷ 实测的每 rev 边际字节。
+    ///
+    /// 预算就是整张卷：registry 那张卷只服务这一个仓库，没有别的表来分份额，
+    /// 所以走的是同一条律、只是不乘份额。量不到（没声明卷、还没有 rev、独有层
+    /// 读不出）时落回部署声明的 seed；seed 为 0 表示这台部署不做按容量的保留，
+    /// 实测不会把它重新打开。每一轮都求值一次读数面，即使目标与上一轮相同——
+    /// 「这一轮算过」只有求值计数能答。
+    fn effective_registry_retention(&self, tags: &[RegistryTag], declared: Option<u64>) -> usize {
+        let revs = tags.iter().filter(|t| tag_rev(&t.tag).is_some()).count();
+        let (target, source) = cog_core::retention::budget_against_measured_items(
+            self.cfg.registry_retention as i64,
+            declared,
+            revs as i64,
+            marginal_bytes_per_rev(tags),
+        );
+        if let Some(readings) = &self.retention {
+            readings.evaluate(
+                REGISTRY_RETENTION_KNOB,
+                target as f64,
+                cog_core::retention::UNIT_ITEMS,
+                source == cog_core::retention::SOURCE_DERIVED,
+            );
+        }
+        target.max(0) as usize
     }
 
     /// tag 服务答不答话：`GET /v2/` 通就是能服务。
@@ -7472,7 +7581,13 @@ impl MainlineDeployer {
                 return;
             }
         };
-        let doomed = prunable_tags(&tags, self.cfg.registry_retention, &keep);
+        // 保留窗口这一拍按实测的卷与每 rev 边际字节重算：声明里的数只是量不到时的
+        // 种子，不是这次删除的天花板。
+        let retention = self.effective_registry_retention(
+            &tags,
+            declared.filter(|bytes| *bytes >= 1.0).map(|bytes| bytes as u64),
+        );
+        let doomed = prunable_tags(&tags, retention, &keep);
         // 这一轮的读数：白名单有多大、里面哪些 rev 是"集群正在跑"读来的、窗外有几个
         // 待删。少了它，一次把在跑的 rev 删掉与一次正常的回收在日志上同形。
         info!(
@@ -23957,6 +24072,8 @@ exit 0
             created_unix: created,
             digest: format!("sha256:{name}"),
             layers: vec![format!("L{name}")],
+            layer_sizes: vec![1],
+            metadata_bytes: 0,
         };
         let tags = vec![
             tag("main-000000000001", 100),
@@ -23997,6 +24114,93 @@ exit 0
         assert_eq!(prunable_tags(&tags, 0, &HashSet::new()).len(), 3);
     }
 
+    /// registry 保留窗口是这一拍实测的函数：声明的卷 ÷ 每个 rev 的边际字节。
+    /// 边际字节只算这一个 rev 独有的层与它自己的元数据——共用的基底删掉一个 rev
+    /// 也释放不了，摊进来会让容量随基底一起缩水。每算一拍求值计数都往上走，目标
+    /// 跟着换了的输入在下一拍变，不需要重启。
+    #[test]
+    fn the_registry_retention_follows_the_volume_and_the_measured_rev_footprint() {
+        let tag = |name: &str, layers: &[(&str, u64)], created: i64| RegistryTag {
+            tag: name.into(),
+            created_unix: created,
+            digest: format!("sha256:{name}"),
+            layers: layers.iter().map(|(d, _)| d.to_string()).collect(),
+            layer_sizes: layers.iter().map(|(_, s)| *s).collect(),
+            metadata_bytes: 50,
+        };
+        // 两个 rev 共用 1000 字节的基底，各自 100 字节的叠层，元数据 50：
+        // 每个 rev 的边际字节 = 150，总量 300。
+        let tags = || {
+            vec![
+                tag("main-0000000001", &[("base", 1000), ("l1", 100)], 10),
+                tag("main-0000000002", &[("base", 1000), ("l2", 100)], 20),
+                // 浮动签钉着基底：删掉一个 rev 不会释放它，它不该进边际成本。
+                tag("local", &[("base", 1000)], 30),
+            ]
+        };
+        assert_eq!(marginal_bytes_per_rev(&tags()), Some(300));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "buildah", "kubectl");
+        cfg.registry_retention = 20;
+        let readings = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+                .with_retention(readings.clone());
+
+        // 1000 字节的卷 ÷ 每 rev 150 字节 = 6 个。
+        assert_eq!(deployer.effective_registry_retention(&tags(), Some(1000)), 6);
+        assert_eq!(readings.reading(REGISTRY_RETENTION_KNOB), Some((6.0, 1, true)));
+
+        // 卷减半，下一拍跟着减半（不重启、不改声明）。
+        assert_eq!(deployer.effective_registry_retention(&tags(), Some(500)), 3);
+        // 叠层变大，同一个卷装得更少。
+        let bigger = vec![
+            tag("main-0000000001", &[("base", 1000), ("l1", 400)], 10),
+            tag("main-0000000002", &[("base", 1000), ("l2", 400)], 20),
+        ];
+        assert_eq!(marginal_bytes_per_rev(&bigger), Some(900));
+        assert_eq!(
+            deployer.effective_registry_retention(&bigger, Some(1000)),
+            2
+        );
+        let (target, evaluations, derived) = readings.reading(REGISTRY_RETENTION_KNOB).unwrap();
+        assert_eq!(target, 2.0);
+        assert_eq!(evaluations, 3, "每一拍都算过，哪怕目标没变");
+        assert!(derived);
+
+        // 算出来的窗口就是这一轮真正用来选候选的那个数。
+        let many: Vec<RegistryTag> = (1..=6)
+            .map(|i| {
+                // 每个 rev 的叠层是它自己的一层：共用同一个名字的那六层会被读成
+                // 「别处还钉着」，那正是 `local` 那条断言在查的事。
+                let overlay = format!("overlay-{i}");
+                tag(
+                    &format!("main-{i:010}"),
+                    &[("base", 1000), (overlay.as_str(), 100)],
+                    i as i64,
+                )
+            })
+            .collect();
+        let retention = deployer.effective_registry_retention(&many, Some(500));
+        assert_eq!(retention, 3);
+        assert_eq!(
+            prunable_tags(&many, retention, &HashSet::new()).len(),
+            3,
+            "窗是 3，六个 rev 里最老的三个才是候选"
+        );
+
+        // 量不到就落回 seed：没有 rev、没声明卷，都不凭空发一个容量。
+        assert_eq!(deployer.effective_registry_retention(&[], Some(1000)), 20);
+        assert_eq!(deployer.effective_registry_retention(&tags(), None), 20);
+        // 声明 0 是「这台部署不做按容量的保留」，实测不会把它重新打开。
+        let mut off = test_config(root, Path::new("/nonexistent"), "buildah", "kubectl");
+        off.registry_retention = 0;
+        let off = MainlineDeployer::new(off, test_workspaces(root, Path::new("/nonexistent")));
+        assert_eq!(off.effective_registry_retention(&tags(), Some(1000)), 0);
+    }
+
     #[test]
     fn the_overlay_base_candidate_has_to_be_a_pure_ancestor() {
         let tag = |name: &str, layers: &[&str], created: i64| RegistryTag {
@@ -24004,6 +24208,8 @@ exit 0
             created_unix: created,
             digest: format!("sha256:{name}"),
             layers: layers.iter().map(|l| l.to_string()).collect(),
+            layer_sizes: vec![1; layers.len()],
+            metadata_bytes: 0,
         };
         let deployed: Vec<String> = ["L1", "L2", "L3"].iter().map(|l| l.to_string()).collect();
         let tags = vec![

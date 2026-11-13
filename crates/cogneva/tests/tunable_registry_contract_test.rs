@@ -1311,6 +1311,34 @@ fn a_landed_batch_carries_no_override() {
                 "ingress.proxyTimeoutSecs",
             ],
         ),
+        (
+            // Retention and row counts. Each table's bound is the declared
+            // volume divided by what a row or a package actually costs, measured
+            // by the sweep that enforces it; the two workspace TTLs follow the
+            // arrival rate against the volume's free bytes; the approval window
+            // follows the slowest observed approval. The two backup Job history
+            // limits are `fixed`: no process reads a past Job, so the count is
+            // an inspection agreement rather than a measurement.
+            "B4",
+            &[
+                // Deleted in B0 (the Job TTL is the package retention count);
+                // listed so the group stays a closed statement of what B4 owns.
+                "backup.ttlSecondsAfterFinished",
+                "backup.keepCount",
+                "backup.successfulJobsHistoryLimit",
+                "backup.failedJobsHistoryLimit",
+                "evolution.workspaces.ephemeralTtlSecs",
+                "evolution.workspaces.orphanBranchTtlSecs",
+                "hostDocuments.approvalTtlSecs",
+                "mainlineDeployer.registryMaintenance.retention",
+                "observability.eventLog.maxRows",
+                "observability.eventLog.readWindowSeconds",
+                "checkpointStore.maxRows",
+                "llmExchangeRetention.keepDays",
+                "taskEventRetention.keepDays",
+                "llmUsageRetention.keepDays",
+            ],
+        ),
     ];
 
     let registry = registry();

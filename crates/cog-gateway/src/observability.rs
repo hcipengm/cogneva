@@ -19,6 +19,13 @@ pub struct EventFilterQuery {
     pub squad_id: Option<String>,
     pub event_types: Option<String>,
     pub level: Option<String>,
+    /// How far back the caller asked to read, when it said so.
+    ///
+    /// A question wider than the store's floor widens the floor: the sweep
+    /// refuses to delete rows inside the longest span anyone has asked for,
+    /// so this number is both what this answer covers and the input the next
+    /// sweep beat recomputes against.
+    pub window_secs: Option<u64>,
 }
 
 /// Query parameters for paginated log fetching.
@@ -1293,9 +1300,26 @@ pub async fn events_handler(
         since: None,
     };
 
-    // For historical queries without a "since" parameter, we default to
-    // the last 24 hours to avoid unbounded result sets.
-    event_filter.since = Some(chrono::Utc::now() - chrono::Duration::hours(24));
+    // A query without a window asks for what the store promises: the
+    // deployment's declared floor, widened by the longest question already
+    // asked. A query that asks wider moves that floor, and the next sweep beat
+    // takes the new number — the reader's need is the input, not a constant
+    // copied beside it.
+    let knob = cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_KNOB;
+    let seed = cog_core::retention::read_window_seed(
+        std::env::var(cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_ENV)
+            .ok()
+            .as_deref(),
+        cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS,
+    );
+    let (floor, _) = cog_core::retention::read_window_secs(
+        seed,
+        cog_core::retention::longest_read_span(knob),
+    );
+    let asked = filter.window_secs.filter(|secs| *secs > 0).unwrap_or(floor);
+    cog_core::retention::record_read_span(knob, asked);
+    event_filter.since =
+        Some(chrono::Utc::now() - chrono::Duration::seconds(asked.min(i64::MAX as u64) as i64));
 
     let mut stream = gateway
         .subscribe_events(event_filter)

@@ -235,9 +235,21 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 索引健康度的采样去处。在这里取一次而不是各消费者各取一次：分配器是
         // 单例，采样点在它内部，调用方不该为了上报再去问一遍服务表。
         let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+        // 两处保留界线的读数面。在这里发布而不是等部署器起来：`/metrics` 的采集
+        // 端在插件初始化时取一次已发布的可观测对象，晚发布的那个没人持有。
+        let retention = std::sync::Arc::new(cog_core::retention::RetentionReadings::new());
+        ctx.publish_observable(retention.clone());
+        // 实例身份在分配器建起来之前取：当前实例的 `evol/<id>` 分支永不回收，
+        // 而回收判据要按它来——分配器不知道自己是哪个实例时，宁可整条跳过。
+        let instance_id = resolve_port_instance_id().await;
         let mut workspaces =
             crate::workspace::WorkspaceManager::new(&bare_repo, &ws_cfg.root, &ws_cfg.target_dir)
-                .with_ephemeral_ttl(std::time::Duration::from_secs(ws_cfg.ephemeral_ttl_secs));
+                .with_ephemeral_ttl(std::time::Duration::from_secs(ws_cfg.ephemeral_ttl_secs))
+                .with_orphan_branch_ttl(std::time::Duration::from_secs(
+                    ws_cfg.orphan_branch_ttl_secs,
+                ))
+                .with_current_instance(instance_id.clone())
+                .with_retention(retention);
         if let Some(metrics) = metrics_backend.clone() {
             workspaces = workspaces.with_metrics(metrics);
         }
@@ -246,7 +258,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             bare = %bare_repo,
             root = %ws_cfg.root,
             target_dir = %ws_cfg.target_dir,
-            ttl_secs = ws_cfg.ephemeral_ttl_secs,
+            ttl_seed_secs = ws_cfg.ephemeral_ttl_secs,
             "workspace allocator configured"
         );
         self.workspaces = Some(workspaces);
@@ -267,7 +279,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
 
         // 引擎只把 project_root 用于变更路径校验，给它一棵稳定只读的基线
         // 工作树即可；工作树随沙盒生命周期存在，不再是那棵被大家共用的树。
-        let instance_id = resolve_port_instance_id().await;
         let version = current_version(ctx);
         let mut engine_root = project_root.clone();
         // 引擎基线树与启动期工作树清理都要写裸仓库；控制面进程的 /host-git
@@ -319,13 +330,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 }
                 // 裸仓库里的 `evol/<id>` 分支只有推入、没有删除，身份每轮换一次就
                 // 永久多一条。启动时收一次：只动非本实例、且已并入 main 或超期的。
-                match ws
-                    .gc_orphan_evol_branches(
-                        &instance_id,
-                        std::time::Duration::from_secs(ws_cfg.orphan_branch_ttl_secs),
-                    )
-                    .await
-                {
+                match ws.gc_orphan_evol_branches().await {
                     Ok(reclaimed) if !reclaimed.is_empty() => {
                         info!(
                             count = reclaimed.len(),
@@ -1939,6 +1944,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // process reading them shares its life. The handle itself was
                 // published in init -- see the field's own note for why it cannot
                 // be published from here.
+                // registry 保留回路的读数与工作区 TTL 落在同一份面上：两者是同一条
+                // 「容量换件数」的律，各开一套指标名只会让同一个量读起来像两个东西。
+                let retention_face = workspaces.retention_face();
                 let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces)
                     // 判定 Job 的下一轮尺寸进同一个读数面：同一条律、同一个
                     // source 标签，别让它单独长一套指标名。
@@ -1946,6 +1954,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     // 轮询节拍、启动/滚动/静置的申报界与两处冷却落进同一个读数面：
                     // 一行一条序列，标签就是登记表的键。
                     .with_pacing(self.pacing.clone());
+                let deployer = match retention_face {
+                    Some(readings) => deployer.with_retention(readings),
+                    None => deployer,
+                };
                 let deployer = match self.governance_drift.clone() {
                     Some(drift) => deployer.with_governance_drift(drift),
                     // init publishes it under this same guard, so reaching here

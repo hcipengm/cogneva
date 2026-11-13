@@ -39,6 +39,9 @@ use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
 use cog_core::metric_names;
+use cog_core::retention::{
+    keep_days_against_volume, publish_llm_usage_keep_days, RetentionReadings, UNIT_DAYS,
+};
 use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
 
 use crate::usage_store::{LEDGER_TABLE, ROLLUP_TABLE};
@@ -73,6 +76,9 @@ pub const MIN_KEEP_DAYS: i64 = cog_core::retention::LLM_USAGE_KEEP_DAYS_MIN;
 /// The environment variable that carries the retention.
 pub const KEEP_DAYS_ENV: &str = cog_core::retention::LLM_USAGE_KEEP_DAYS_ENV;
 
+/// The registry key this loop's target answers to.
+pub const KNOB: &str = "llmUsageRetention.keepDays";
+
 /// How often the loop looks for rows past the retention.
 ///
 /// Five minutes, for the same reason the prompt archive uses it: the readings
@@ -100,6 +106,9 @@ pub struct RetentionOutcome {
     pub oldest_age_secs: i64,
     /// The retention this pass enforced, in seconds.
     pub keep_secs: i64,
+    /// Whether `keep_secs` came from this beat's measurements rather than from
+    /// the deployment's seed.
+    pub keep_derived: bool,
     /// Rows older than the fold's own floor, which this pass may not delete
     /// however old they are.
     pub uncovered: i64,
@@ -113,8 +122,14 @@ pub struct RetentionOutcome {
 #[derive(Clone)]
 pub struct UsageRetention {
     pool: PgPool,
+    /// The retention this deployment declared. It is what a process with no
+    /// measured write volume keeps.
     keep: Duration,
+    /// The declared size of the database volume; with it and the measured cost
+    /// of a day's writes, every pass recomputes the retention.
+    volume_bytes: Option<u64>,
     metrics: Option<Arc<dyn MetricsBackend>>,
+    readings: Option<Arc<RetentionReadings>>,
     deployment: String,
 }
 
@@ -123,9 +138,23 @@ impl UsageRetention {
         Self {
             pool,
             keep,
+            volume_bytes: None,
             metrics: None,
+            readings: None,
             deployment: String::new(),
         }
+    }
+
+    /// The declared size of the volume this ledger lives on.
+    pub fn with_database_volume(mut self, bytes: Option<u64>) -> Self {
+        self.volume_bytes = bytes;
+        self
+    }
+
+    /// Attach the reading face that carries this loop's target and beat count.
+    pub fn with_readings(mut self, readings: Arc<RetentionReadings>) -> Self {
+        self.readings = Some(readings);
+        self
     }
 
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsBackend>) -> Self {
@@ -200,8 +229,14 @@ impl UsageRetention {
     /// mid-pass would make two batches of one pass answer the same question
     /// differently.
     pub async fn retire_once(&self, progress: impl Fn()) -> SFResult<RetentionOutcome> {
+        // The retention is recomputed before the cutoff is chosen: the pass
+        // retires against this beat's measured cost of a day's writes, not
+        // against the number the deployment wrote down at install time.
+        let oldest_before = self.oldest_age_secs().await?;
+        let bytes = self.table_bytes().await.ok().map(|bytes| bytes.max(0) as u64);
+        let (keep, keep_derived) = self.keep_for(oldest_before, bytes);
         let cutoff = chrono::Utc::now()
-            - chrono::Duration::from_std(self.keep).unwrap_or_else(|_| chrono::Duration::days(30));
+            - chrono::Duration::from_std(keep).unwrap_or_else(|_| chrono::Duration::days(30));
         let floor = self.fold_floor().await?;
         let mut removed = 0u64;
         if let Some(floor) = floor {
@@ -239,9 +274,42 @@ impl UsageRetention {
             held,
             removed,
             oldest_age_secs,
-            keep_secs: self.keep.as_secs() as i64,
+            keep_secs: keep.as_secs() as i64,
+            keep_derived,
             uncovered,
             uncovered_oldest_age_secs,
+        })
+    }
+
+    /// The retention this beat enforces, and whether it came from a
+    /// measurement.
+    ///
+    /// The ledger's own size and the age of its oldest row give the daily write
+    /// volume directly: what survived the last pass over the span it covers is
+    /// what a day costs. The volume's declared share then buys a number of
+    /// days; when any input is missing the deployment's seed stands.
+    fn keep_for(&self, oldest_age_secs: i64, bytes: Option<u64>) -> (Duration, bool) {
+        let (days, derived) = keep_days_against_volume(
+            self.keep.as_secs() as i64 / 86_400,
+            self.volume_bytes,
+            oldest_age_secs,
+            bytes,
+        );
+        (
+            Duration::from_secs((days.max(0) as u64).saturating_mul(86_400)),
+            derived,
+        )
+    }
+
+    /// What the ledger costs on disk, when it can be read.
+    async fn table_bytes(&self) -> SFResult<i64> {
+        let bytes: Option<i64> = sqlx::query_scalar(cog_core::sql::RELATION_BYTES_SQL)
+            .bind(LEDGER_TABLE)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        bytes.ok_or_else(|| {
+            SFError::Database(format!("relation {LEDGER_TABLE} is not in the database"))
         })
     }
 
@@ -308,6 +376,21 @@ impl UsageRetention {
     /// Publish what the ledger holds, how far back it reaches, the retention
     /// this process enforces, and what it may not retire.
     async fn report(&self, outcome: &RetentionOutcome) {
+        // The spend read's ceiling is the ledger's retention. Publishing this
+        // beat's number into the process makes the sweep and the read one
+        // statement: a read asking wider than this is asking for rows the
+        // sweep has already deleted.
+        if outcome.keep_secs > 0 {
+            publish_llm_usage_keep_days(outcome.keep_secs / 86_400);
+        }
+        if let Some(ref readings) = self.readings {
+            readings.evaluate(
+                KNOB,
+                outcome.keep_secs as f64 / 86_400.0,
+                UNIT_DAYS,
+                outcome.keep_derived,
+            );
+        }
         let Some(ref mb) = self.metrics else { return };
         let labels = self.labels();
         let pairs = [
@@ -372,7 +455,9 @@ impl UsageRetention {
 /// into one that is trivially bounded and the promise to its readers into one
 /// that was never kept.
 pub fn keep_days_from_env() -> i64 {
-    cog_core::retention::llm_usage_keep_days()
+    // The seed, not the published effective value: the loop must not read its
+    // own last output as the next beat's input.
+    cog_core::retention::llm_usage_keep_days_seed()
 }
 
 /// [`keep_days_from_env`] against an explicit value, so the fallback can be
@@ -414,5 +499,65 @@ mod tests {
     #[test]
     fn the_period_is_inside_the_scrape_gap() {
         assert!(PERIOD.as_secs() <= 300);
+    }
+
+    /// 保留天数是当拍实测的函数；量不到时 seed 顶着。
+    #[tokio::test]
+    async fn the_retention_follows_the_measured_daily_write() {
+        let sweep = UsageRetention::new(
+            PgPool::connect_lazy("postgres://example").expect("a lazy pool"),
+            Duration::from_secs(30 * 86_400),
+        )
+        .with_database_volume(Some(10 * 1024u64.pow(3)));
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, Some(512 * 1024 * 1024)),
+            (Duration::from_secs(10 * 86_400), true)
+        );
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, Some(1024 * 1024 * 1024)),
+            (Duration::from_secs(5 * 86_400), true),
+            "a doubling daily write halves the days the same volume buys"
+        );
+        assert_eq!(
+            sweep.keep_for(0, Some(1024)),
+            (Duration::from_secs(30 * 86_400), false)
+        );
+        assert_eq!(
+            sweep.keep_for(10 * 86_400, None),
+            (Duration::from_secs(30 * 86_400), false)
+        );
+    }
+
+    /// 目标不变的一拍仍然是一拍：求值计数往上走，目标以天为单位登记，
+    /// 并且读侧看到的天数跟着这一拍走。
+    #[tokio::test]
+    async fn a_beat_whose_target_does_not_move_still_counts() {
+        let readings = Arc::new(RetentionReadings::new());
+        let sweep = UsageRetention::new(
+            PgPool::connect_lazy("postgres://example").expect("a lazy pool"),
+            Duration::from_secs(30 * 86_400),
+        )
+        .with_readings(Arc::clone(&readings));
+        let outcome = RetentionOutcome {
+            held: 100,
+            removed: 0,
+            oldest_age_secs: 86_400,
+            keep_secs: 7 * 86_400,
+            keep_derived: true,
+            uncovered: 0,
+            uncovered_oldest_age_secs: 0,
+        };
+        for expected in 1..=2 {
+            sweep.report(&outcome).await;
+            let (target, beats, derived) = readings.reading(KNOB).expect("a beat");
+            assert_eq!(target, 7.0);
+            assert_eq!(beats, expected, "a steady target is still a beat");
+            assert!(derived);
+        }
+        assert_eq!(
+            cog_core::retention::llm_usage_keep_days(),
+            7,
+            "the read side asks for the days the sweep actually keeps"
+        );
     }
 }

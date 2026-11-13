@@ -333,17 +333,15 @@ pub struct BackupConfig {
     /// 备份 Pod 把进化卷**只读**挂进来，并靠同节点亲和避开 RWO 跨节点 attach
     /// 失败。名字是清单里的身份，不能重复、不能叫 `app`（主根的名字）。
     pub extra_data_roots: Vec<(String, PathBuf)>,
-    /// 保留几个包：**覆盖位**（`COGNEVA_BACKUP_KEEP`，构造时 `unwrap_or(7)`）。
+    /// 保留几个包的**部署声明**（`COGNEVA_BACKUP_KEEP`，构造时 `unwrap_or(7)`）。
     ///
-    /// 7 的来历量过、不是拍的：备份卷 `cogneva-backup-pvc` 声明 10 GiB，而
-    /// 2026-10-09…10-15 那七个包实测 42–195 MB、合计 788 MB ⇒ 按**最大的那个**
-    /// 外推 7 个包 ≈ 1.4 GiB，约占声明容量的 14%。取「一周」是因为 CronJob 一天
-    /// 一趟，一周覆盖「发现坏了到修好」的窗口。
+    /// 生效值每趟现算：[`effective_keep_count`] 读备份卷的容量和卷上现存包的实测
+    /// 大小，按 [`cog_core::retention::items_that_fit`] 得到「这一卷装得下几个」。
+    /// 这个声明只在量不到卷（statvfs 失败、卷上还没有包）时顶着。
     ///
-    /// 它**不能**建成闭环：留几个包是策略不是测量，按剩余空间算只会让「留多久的
-    /// 账」随磁盘水位漂。生效值由 `cogneva_backup_run_readings{readout="keep_target"}`
-    /// 发出去。**缺判据**：那条读数没有 `source` 标签（界读数该标来源），也没有
-    /// 东西在包体量长期贴住卷容量时报。
+    /// 7 只是声明的来历：2026-10-09…10-15 那七个包实测 42–195 MB、合计 788 MB，
+    /// 而卷声明 10 GiB。声明本身不再是窗口的长度——窗口是卷装得下的包数，卷由
+    /// 容量回路按实测占用抬高。
     pub keep_count: usize,
     /// 这一次运行开出来时的期限，随这一行落进账本的 `run_deadline_seconds`。
     ///
@@ -1441,6 +1439,58 @@ pub fn package_instant(name: &str) -> Option<chrono::DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
+/// 备份卷的容量字节数，或 `None` 当文件系统答不出来。
+///
+/// 容量而不是剩余：包是按定义要占满这块卷的东西，剩余空间里已经算进了「要删的
+/// 那些包」，拿它当预算会让保留数取决于上一次删到哪一步。
+#[cfg(unix)]
+fn volume_capacity_bytes(dir: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `path` 以 NUL 结尾并在调用期间一直有效，`stats` 是可写且由调用填满的结构。
+    let stats = unsafe {
+        let mut stats: libc::statvfs = std::mem::zeroed();
+        (libc::statvfs(path.as_ptr(), &mut stats) == 0).then_some(stats)
+    }?;
+    let unit = if stats.f_frsize > 0 {
+        stats.f_frsize
+    } else {
+        stats.f_bsize
+    } as u64;
+    Some((stats.f_blocks as u64).saturating_mul(unit))
+}
+
+#[cfg(not(unix))]
+fn volume_capacity_bytes(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// 保留几个包：卷容量除以实测包大小；量不到时部署声明顶着。
+///
+/// 实测的是卷上**现存**包的大小——本趟的包还没写出来，但它的量级由上一趟刚写的
+/// 那个给出，而保留裁的是同一批文件。一个包都还没有、或者卷答不出容量时，没有
+/// 可除的数，声明的数生效。
+pub fn keep_count_for_volume(capacity: Option<u64>, sizes: &[u64], seed: usize) -> usize {
+    match capacity {
+        Some(bytes) if !sizes.is_empty() => {
+            cog_core::retention::items_that_fit(bytes, sizes).max(1) as usize
+        }
+        _ => seed,
+    }
+}
+
+/// 本趟生效的保留数：从备份卷的容量和卷上现存包的大小现算。
+fn effective_keep_count(dir: &Path, seed: usize) -> usize {
+    let sizes: Vec<u64> = packages_in(dir)
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .collect();
+    keep_count_for_volume(volume_capacity_bytes(dir), &sizes, seed)
+}
+
 /// 保留策略：包名时间戳字典序即新旧序，留最新 N 份。删除旧包失败只告警——
 /// 保留失败绝不能反过来弄丢新包。
 pub fn enforce_retention(dir: &Path, keep: usize) -> Vec<PathBuf> {
@@ -1758,6 +1808,10 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
         .await
         .adopt();
     std::fs::create_dir_all(&cfg.backup_dir)?;
+    // 保留数是一趟一算，不是一个部署一写：卷上现存的包和卷容量都是这一趟看得到
+    // 的现场。开工时算出的数同时写进账本那一行，于是「这一趟按几个包裁」在账上
+    // 和盘上是同一句话。
+    let keep_count = effective_keep_count(&cfg.backup_dir, cfg.keep_count);
     let now = Utc::now();
     let staging_name = package_name(now)
         .trim_end_matches(PACKAGE_SUFFIX)
@@ -1774,7 +1828,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
             .open_run(&BackupRunOpening {
                 run_id: staging_name.clone(),
                 started_at: now,
-                keep_target: cfg.keep_count as i32,
+                keep_target: keep_count as i32,
                 run_deadline_seconds: cfg.run_deadline_seconds,
             })
             .await
@@ -1833,7 +1887,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
         }
     }
 
-    let result = match finish_backup(cfg, now, &staging, &staging_name).await {
+    let result = match finish_backup(cfg, keep_count, now, &staging, &staging_name).await {
         Ok(left) => {
             record_run(
                 run_store.as_ref(),
@@ -2011,6 +2065,7 @@ fn publish_package(dir: &Path, package: &Path) -> Result<PathBuf, Box<dyn std::e
 /// 真正跑一次备份并收尾：导出、写清单、打包、清 staging、裁保留。
 async fn finish_backup(
     cfg: &BackupConfig,
+    keep_count: usize,
     now: chrono::DateTime<Utc>,
     staging: &Path,
     staging_name: &str,
@@ -2031,10 +2086,10 @@ async fn finish_backup(
             tar_package_with_key(staging, staging_name, &package, key.as_ref())?;
             std::fs::remove_dir_all(staging)?;
             cog_core::progress::beat(BACKUP_PROGRESS_TASK);
-            let deleted = enforce_retention(&cfg.backup_dir, cfg.keep_count);
+            let deleted = enforce_retention(&cfg.backup_dir, keep_count);
             if let Some(dir) = &cfg.offsite_dir {
-                copy_offsite(dir, &package, cfg.keep_count);
-                let backfilled = backfill_offsite(&cfg.backup_dir, dir, cfg.keep_count);
+                copy_offsite(dir, &package, keep_count);
+                let backfilled = backfill_offsite(&cfg.backup_dir, dir, keep_count);
                 if backfilled > 0 {
                     tracing::info!(
                         dir = %dir.display(),
@@ -2049,7 +2104,7 @@ async fn finish_backup(
             let (kept_after, oldest_kept_at) = retained_state(&cfg.backup_dir);
             tracing::info!(
                 package = %package.display(),
-                kept = cfg.keep_count,
+                kept = keep_count,
                 pruned = deleted.len(),
                 "backup package complete"
             );
@@ -6852,6 +6907,48 @@ mod tests {
             assert!(dir.path().join(name).exists(), "{name} 应保留");
         }
         assert!(dir.path().join("notes.txt").exists(), "非包文件不许动");
+    }
+
+    /// 保留数是卷容量与实测包大小的函数：卷更大或包更小就多留几个；量不到卷
+    /// 或一个包都还没有时，部署声明顶着。
+    #[test]
+    fn the_keep_count_follows_the_volume_and_the_measured_package_size() {
+        let gib = 1024u64 * 1024 * 1024;
+        let sizes = [200 * 1024u64 * 1024, 100 * 1024 * 1024];
+        assert_eq!(
+            keep_count_for_volume(Some(2 * gib), &sizes, 7),
+            2,
+            "two gibibytes hold the two measured packages and nothing more"
+        );
+        assert_eq!(
+            keep_count_for_volume(Some(4 * gib), &sizes, 7),
+            2,
+            "the newest always stays; a budget that fits both keeps both"
+        );
+        assert_eq!(
+            keep_count_for_volume(Some(400 * 1024 * 1024), &sizes, 7),
+            2,
+            "the newest is kept even when it alone is over the budget"
+        );
+        assert_eq!(
+            keep_count_for_volume(
+                Some(gib),
+                &[100 * 1024 * 1024, 100 * 1024 * 1024, 100 * 1024 * 1024],
+                7
+            ),
+            3,
+            "three measured packages in a gibibyte"
+        );
+        assert_eq!(
+            keep_count_for_volume(None, &sizes, 7),
+            7,
+            "no volume reading means the declaration stands"
+        );
+        assert_eq!(
+            keep_count_for_volume(Some(gib), &[], 7),
+            7,
+            "no package has been measured yet, so the seed stands"
+        );
     }
 
     #[test]

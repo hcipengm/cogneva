@@ -984,10 +984,25 @@ rows:
       file: crates/cog-reflection/src/volume_capacity.rs
       test: a_claim_target_follows_the_measured_used_bytes
   - key: backup.keepCount
-    source: override
+    source: derived
     why: >-
-      Seven daily packages. A derived count would follow the measured size of one
-      package against the volume; the volume usage is alerted on, not read back.
+      How many packages the volume keeps. Every backup run recomputes it from
+      the volume's capacity (statvfs) divided by the measured sizes of the
+      packages already on it, newest first; the newest package is kept even when
+      it alone exceeds the volume. The declared 7 is only the seed for a run that
+      cannot measure -- no package yet, or a volume that will not answer. The
+      number the run actually used is written to its ledger row as
+      `keep_target`, beside `kept`, and the backup-runs loop publishes that pair
+      as `BACKUP_RUN_READINGS{readout="keep_target"}` and `{readout="kept"}`, so
+      the value in force and the pass that used it are both readable.
+    published:
+      owner: crates/cogneva/src/backup.rs
+      file: crates/cog-orchestrator/src/backup_runs.rs
+      metric: BACKUP_RUN_READINGS
+      label: readout
+    proof:
+      file: crates/cogneva/src/backup.rs
+      test: the_keep_count_follows_the_volume_and_the_measured_package_size
 
   - key: backup.runDeadlineSeconds
     source: fixed
@@ -1012,16 +1027,26 @@ rows:
       why a run was missed, so there is no observed lateness to close a loop over.
 
   - key: backup.successfulJobsHistoryLimit
-    source: override
+    source: fixed
     why: >-
-      How many finished Job objects stay for inspection. It would be derived from
-      how often somebody reads a past Job, and nothing measures that.
+      How many finished Job objects stay for inspection. This is a diagnostic
+      agreement, not a size: no process in the platform reads a past backup Job
+      -- a run's durable account is its `backup_runs` row, and a package's
+      evidence is the file on the volume plus the package index -- so a loop over
+      "who looks at a past Job" would measure zero on every deployment and could
+      never move the number. Two successes are kept because comparing the two
+      most recent runs is the diagnosis the objects exist for, and a success is
+      the baseline a failure is compared against.
 
   - key: backup.failedJobsHistoryLimit
-    source: override
+    source: fixed
     why: >-
-      The same count for failures, kept one higher so that two consecutive nights
-      can be compared. Nothing measures how often a failure is looked at.
+      The same inspection surface for failures, one higher than the successes:
+      two consecutive failed nights must both remain, with the last successful
+      run beside them, so a repeat failure can be told apart from a new one. No
+      process reads these objects; the `backup_runs` ledger and the package
+      index are what the platform reads, and Job-object retention is a human
+      inspection convention rather than a measured need.
 
   - key: backup.backoffLimit
     source: fixed
@@ -1712,19 +1737,51 @@ rows:
       test: the_wait_between_passes_follows_what_the_last_pass_cost
 
   - key: evolution.workspaces.ephemeralTtlSecs
-    source: override
+    source: derived
     why: >-
-      How long an ephemeral worktree may live. It has to outlast one evolution
-      round, and a PID cannot tell whether a task is still alive. A derived TTL
-      would follow the measured round duration; nothing reads it back.
+      How long an ephemeral worktree may live. At every maintenance beat (the
+      deployer's cycle, each poll interval) the manager measures how many trees
+      arrived over the last week, the bytes of the average tree, and the free
+      bytes of the volume they sit on, and takes half the time those arrivals
+      need to fill the volume (`ttl_for_half_turnover`). The result is floored at
+      the longest completed evolution round so a live tree is never collected
+      mid-round; reclaimed trees do not feed that floor, or the loop would chase
+      its own output. The declared 7 days is the seed when something cannot be
+      measured -- no arrivals yet, no tree, a volume that will not answer -- and
+      a zero seed turns derivation off. The published target carries
+      `source=derived` when a measurement was used and `source=seed` when it was
+      not; the evaluations counter shows the beat keeps running.
+    published:
+      owner: crates/cog-reflection/src/workspace.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workspace.rs
+      test: the_ephemeral_ttl_follows_the_measured_volume_and_arrivals
 
   - key: evolution.workspaces.orphanBranchTtlSecs
-    source: override
+    source: derived
     why: >-
       How long an `evol/<old-id>` branch may go untouched before reclamation.
-      A live instance's branch is force-pushed every transplant, so a long idle
-      period means the instance is gone; the TTL is that judgement written as a
-      number rather than a measurement.
+      At every maintenance beat the manager counts how many branch names
+      appeared over the last week (the first census is zero arrivals, not "all
+      of them are new"), measures the bytes unique to those branches with
+      `git rev-list --disk-usage --objects` excluding main, and divides the bare
+      repository's free bytes by the time that arrival rate needs to fill it.
+      A live instance's branch is force-pushed on every transplant, so it keeps
+      arriving and stays outside the window. The declared 30 days is the seed
+      when the repository cannot be measured; a zero seed disables collection.
+      The published target carries `source` and an evaluations counter, so a
+      quiet repository and a stopped loop do not look alike.
+    published:
+      owner: crates/cog-reflection/src/workspace.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/workspace.rs
+      test: the_orphan_branch_ttl_follows_the_measured_repo_and_rotations
 
   - key: evolution.workspaces.targetMaxBytes
     source: derived
@@ -2034,11 +2091,25 @@ rows:
 
   # --- host document organising ----------------------------------------------
   - key: hostDocuments.approvalTtlSecs
-    source: override
+    source: derived
     why: >-
       How long a staged plan stays approvable, which is also the validity of an
-      approval. A derived TTL would follow how long approvals actually sit before
-      being acted on; nothing measures that.
+      approval. Every approval records how long it sat between staging and
+      approval; the window is 1.25x the slowest approval of the last 30 days,
+      never below the declared seed. Only the observed tail can widen it: an
+      approval that never happened is not a measurement, and shrinking on a
+      quiet month would cut off the reader the window exists for. The published
+      gauge `sandbox_host_docs_approval_ttl_seconds` carries `source=derived`
+      once a measured approval sets it and `source=seed` while the declared
+      value is in force; the evaluations counter is the beat evidence.
+    published:
+      owner: crates/cog-extension/src/hostdocs.rs
+      file: crates/cog-extension/src/hostdocs.rs
+      metric: APPROVAL_TTL_METRIC
+      label: source
+    proof:
+      file: crates/cog-extension/src/hostdocs.rs
+      test: the_approval_window_follows_the_measured_latency
 
   - key: hostDocuments.assistBodyBytes
     source: override
@@ -2434,12 +2505,28 @@ rows:
       test: the_reclaim_cooldown_follows_how_long_a_rebuild_held_the_service
 
   - key: mainlineDeployer.registryMaintenance.retention
-    source: override
+    source: derived
     why: >-
-      Twenty revisions: the producer was measured at about one revision per 42
-      minutes, so this spans roughly 14 hours -- enough for "roll back one
-      version" and "look at the last round". The measurement exists and was made
-      once; the number does not re-derive from the current rate.
+      How many revisions the registry keeps, recomputed at every maintenance
+      round: the PVC's declared bytes divided by what one revision actually
+      costs. The cost is measured from the tag manifests -- each revision's
+      layers that no other tag references, plus its config and manifest bytes --
+      so the shared base is not charged to every revision and the computed count
+      follows both a changed volume and a changed image size without a restart.
+      Labels such as `local`, `seed` and `promote-*` count as references: a
+      layer they pin is not freed by deleting a revision. The declared 20 is the
+      seed when the volume is not declared or no revision has a measurable
+      unique layer; `source` on the published target says which side the round
+      used, and the evaluations counter shows a round was evaluated even when
+      the target did not move.
+    published:
+      owner: crates/cog-reflection/src/mainline_deployer.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-reflection/src/mainline_deployer.rs
+      test: the_registry_retention_follows_the_volume_and_the_measured_rev_footprint
 
   - key: mainlineDeployer.registryMaintenance.threshold
     source: override
@@ -3503,127 +3590,133 @@ rows:
       above any legitimate idle gap.
 
   - key: observability.eventLog.maxRows
-    source: override
+    source: derived
     why: >-
-      Rows the observability event log may hold. The table is append-only and
-      nothing ever removed a row from it until this sweep, so its size was the
-      platform's uptime times its event rate: 2.92 M rows / 1.6 GB measured on
-      2026-10-27, growing about 300 k rows a day on an ordinary day and 1.0 M on
-      2026-10-18. Every row of it is in the nightly backup, and the drill
-      restores that whole dump to prove it -- the single pass went 553 s to
-      2271 s over six nights as the database grew, which is what makes this a
-      bound the drill budget depends on rather than housekeeping. One million is
-      about three days at the ordinary rate, so the capacity stays outside the
-      read window on a normal day and inside it during a storm, which is what
-      cogneva_observability_events_over_capacity is for. Nothing measures an
-      arrival rate into a value: the sweep derives its own period from the fill
-      it observes, but the ceiling itself is the operator's call.
+      Rows the observability event log may hold. The sweep measures the table's
+      held rows and bytes on every pass and divides the table's share of the
+      declared database volume by the measured bytes per row; both directions
+      move the answer without a restart -- a wider row buys fewer rows, a larger
+      declared volume buys more. The declared million is the seed while the table
+      is empty or the volume is not declared. The published target carries
+      `source=derived` when the measurement was used and `source=seed` when it
+      was not, and the evaluations counter rises on a pass whose target did not
+      move.
+    published:
+      owner: crates/cog-storage/src/observability_event_cap.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-storage/src/observability_event_cap.rs
+      test: a_beat_whose_target_does_not_move_still_counts
 
   - key: observability.eventLog.readWindowSeconds
-    source: override
+    source: derived
     why: >-
       The window inside which no row may be deleted, whatever the capacity says.
-      Not a second retention knob: it is the floor, and it matches the default
-      window of the historical-events query, so a reader asking for what it asks
-      for by default never sees a gap the sweep made. The alternative -- a single
-      capacity -- answers the historical view with a silent hole during exactly
-      the storm an operator is looking at, and a hole reads like "nothing
-      happened then". Nothing derives it, because the reader's default window is
-      a design decision rather than an observation.
+      Not a second retention knob: it is the floor, and it follows the widest
+      span a historical query actually asked for -- the gateway records each
+      answered span, and the sweep recomputes the floor on its next pass. It can
+      only widen: a narrower question does not shrink a promise already made, and
+      a quiet week must not turn yesterday's answer into a gap. The declared day
+      matches the query's default window, so a reader asking for that default
+      never sees a hole the sweep made; `source` on the published target says
+      whether a measured span widened it.
+    published:
+      owner: crates/cog-storage/src/observability_event_cap.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-storage/src/observability_event_cap.rs
+      test: the_read_window_follows_the_longest_question_asked
 
   - key: checkpointStore.maxRows
-    source: override
+    source: derived
     why: >-
-      Rows the checkpoint store may hold. A checkpoint round writes the new
-      snapshot, points the task board at it, and only then deletes the one it
-      replaced, so the board is the authority on which snapshots are live and
-      everything else is a leftover; nothing retires a board, so every finished
-      task keeps its last checkpoint for good. Measured on 2026-10-27: 54,452
-      rows over 924 MB, of which 39,610 rows (about 580 MB) no board pointed at.
-      All of it travels in the nightly backup whose restore the drill must
-      finish inside its per-pass budget, which is what makes the garbage a cost
-      and not just untidiness. Forty thousand sits above the 14,842 rows that
-      were live that day -- room for the live set to grow several times over --
-      and below the table, so the bound bites on the leftovers first. Nothing
-      derives it: the live set is how many tasks the fleet has run, which is an
-      operator's expectation rather than a measurement of this pass.
+      Rows the checkpoint store may hold. The sweep measures the table's held
+      rows and bytes on every pass and divides the table's share of the declared
+      database volume by the measured bytes per row; a wider snapshot buys fewer
+      rows, a larger declared volume buys more, and both follow the next pass
+      without a restart. The declared forty thousand is the seed while the table
+      is empty or the volume is not declared. The published target carries
+      `source`, and the evaluations counter is what separates "nothing to do"
+      from "the sweep stopped".
+    published:
+      owner: crates/cog-storage/src/checkpoint_cap.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-storage/src/checkpoint_cap.rs
+      test: a_beat_whose_target_does_not_move_still_counts
 
   - key: llmExchangeRetention.keepDays
-    source: override
+    source: derived
     why: >-
-      Days the prompt-and-response archive keeps a body. The table holds what was
-      sent upstream and what came back so a later question about one call is
-      answerable without buying it again; what it costs is set by how large the
-      bodies are rather than by how many calls there were, which is why it is
-      bounded by age rather than by a row count -- 9,680 rows over 30 days came
-      to 307 MB on 2026-10-27, measured on this deployment. Nothing measures how
-      long a reader would want to look back, so the ceiling is the operator's
-      call, and the loop publishes it as gateway_llm_exchange_keep_seconds:
-      llm_exchange_retention_behind compares the archive's oldest row against
-      twice this reading, so shortening it moves the judgement with it instead
-      of leaving a constant in the rules file. The sweep runs in the main
-      application rather than the gateway, because the gateway restarts on every
-      rollout and a delete at its startup is a bound on a row's age only while
-      rollouts are more frequent than the retention is wide.
+      Days the prompt-and-response archive keeps a body. The sweep measures the
+      archive's bytes and its oldest row's age on every pass and divides the
+      table's share of the declared database volume by the measured daily write;
+      the declared 30 days is the seed while the archive is empty or the volume
+      is not declared. The loop still publishes the days in force as
+      gateway_llm_exchange_keep_seconds, so `llm_exchange_retention_behind`
+      judges the archive against the value this pass used rather than a constant
+      in the rules file. The target carries `source` on the shared retention
+      face, and the evaluations counter shows a pass counted even when the
+      target did not move. A deployment that measures but does not retire still
+      expresses that through its seed, not through a pinned day count.
+    published:
+      owner: crates/cog-observability/src/exchange_retention.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-observability/src/exchange_retention.rs
+      test: the_retention_follows_the_measured_daily_write
 
   - key: taskEventRetention.keepDays
-    source: override
+    source: derived
     why: >-
-      Days a task's event stream is kept after it last appended. The table files
-      every iteration of every agent loop so a run that did not converge can be
-      read back afterwards; it had never had a row removed, and on 2026-10-27 it
-      held 130,871 rows over 211 MB, about 3,800 rows a day, all of it in the
-      nightly backup whose restore the drill has to finish inside a budget. The
-      unit is the whole stream and not the row, because both readers replay a
-      task's events from offset zero -- the handover readback and the ralph
-      replay -- so a deleted prefix answers a well-formed read with a gap that
-      looks exactly like the start of the run; a stream a checkpoint names is
-      not deletable at all, for the same reason a board-pointed snapshot is not.
-      Nothing measures how long after a run somebody would want to read it, so
-      the ceiling is the operator's call, and the loop publishes it as
-      cogneva_task_events_keep_seconds: task_event_archive_behind compares the
-      archive's oldest row against twice this reading, which is also the slack a
-      live stream needs -- retirement keeps every event of a stream that is
-      still appending, so the archive legitimately reaches back past the
-      retention by the length of its longest live run. A value of 0 says this
-      deployment measures and does not retire, which is how a second deployment
-      sharing the database stays out of the deletion; negative and unreadable
-      values fall back to 30.
+      Days a task's event stream is kept after it last appended. The sweep
+      measures the table's bytes and its oldest row's age on every pass and
+      divides the table's share of the declared database volume by the measured
+      daily write; the declared 30 days is the seed while the archive is empty
+      or the volume is not declared. The unit stays the whole stream: a stream a
+      checkpoint names is not deletable at all, and a deleted prefix would answer
+      a replay with a gap shaped like the start of the run. The loop publishes
+      the days in force as cogneva_task_events_keep_seconds, so
+      `task_event_archive_behind` compares the archive against what this pass
+      used. The published target carries `source`, and the evaluations counter
+      separates a steady target from a stopped loop.
+    published:
+      owner: crates/cog-storage/src/task_event_retention.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-storage/src/task_event_retention.rs
+      test: the_retention_follows_the_measured_daily_write
 
   - key: llmUsageRetention.keepDays
-    source: override
+    source: derived
     why: >-
-      Days the token ledger keeps its per-call rows. gateway_llm_usage is one row
-      per upstream call -- tokens in and out, the latency, the task it was bought
-      for -- and nothing had ever removed a row from it: on 2026-10-27 it held
-      312,803 rows over 32 days, 80 MB, about 9,800 rows a day, and the count
-      follows call volume, which has no ceiling of its own. Age is the wrong
-      cutoff on its own, because the hourly fold beside it (cog_llm_usage_rollup)
-      is a derivation of this ledger: a row that no window summed is the only
-      copy of that spend, so deleting it would leave the aggregate reporting the
-      hour as quiet forever with nothing to recompute it from. The sweep
-      therefore deletes only what is both past this age and inside the fold's own
-      range, and publishes the rows it cannot touch as
-      cogneva_llm_usage_uncovered_rows with their oldest age beside it; the rule
-      fires when that pair says the fold has stopped reaching back past the
-      retention, which is the state where the table stops being bounded by
-      anything. What the reader loses at this age is the per-call detail -- which
-      task bought which tokens -- while the hourly sums stay indefinitely.
-      Values below 1, and values that cannot be read, fall back to 30: a
-      retention of zero would empty the per-call detail on every pass, which
-      reads as a sweep that works while the table is empty by construction.
+      Days the token ledger keeps its per-call rows. The sweep measures the
+      ledger's bytes and its oldest row's age on every pass and divides the
+      table's share of the declared database volume by the measured daily write;
+      the declared 30 days is the seed while the ledger is empty or the volume is
+      not declared. Age is not the only cutoff: a row that no hourly fold window
+      summed is the only copy of that spend, so the sweep deletes only what is
+      both past the derived age and inside the fold's own range, and publishes
+      the rows it cannot touch as cogneva_llm_usage_uncovered_rows. The days in
+      force are published as gateway_llm_usage_keep_seconds, and the read side
+      asks for the same value. The target carries `source`, and the evaluations
+      counter is the beat evidence.
+    published:
+      owner: crates/cog-observability/src/usage_retention.rs
+      file: crates/cog-core/src/retention.rs
+      metric: TARGET_METRIC
+      label: source
+    proof:
+      file: crates/cog-observability/src/usage_retention.rs
+      test: the_retention_follows_the_measured_daily_write
 
-  - key: checkpointStore.readWindowSeconds
-    source: override
-    why: >-
-      The window inside which no checkpoint may be deleted, whatever the
-      capacity says. The other half of the floor is the task board pointer, and
-      neither is a knob: deleting a row a board names ends a task's ability to
-      resume while the board still points at it, and deleting inside this window
-      answers the snapshots view with "none" while the store is full. One day is
-      four orders of magnitude wider than the view's default page (the newest
-      hundred), so a reader asking for the recent ones never sees a gap the
-      sweep made. When the pointers and the window together hold more rows than
-      the capacity allows, the sweep stops and cogneva_checkpoints_over_capacity
-      says so -- that state is a policy question about how long a finished
-      task's board lives, not a fault in the sweep.

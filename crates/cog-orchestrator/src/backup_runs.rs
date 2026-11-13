@@ -44,6 +44,12 @@ pub const BACKUP_RUNS_LOOP: &str = "backup_runs";
 /// is not changing the other.
 pub const BACKUP_RUNS_ROLE: &str = "backup_runs";
 
+/// 读数上点名这一格的标签名，与 [`crate::LABEL_READOUT`] 同一个词。
+///
+/// 本文件同时发布指标名与这格的名字；登记表要在**一个**文件里读到两者，而把
+/// 标签抄成一个字符串字面量会让它与其他账本的 `readout` 各自漂移。
+pub const READOUT_LABEL: &str = crate::LABEL_READOUT;
+
 /// How long one round waits for the next.
 ///
 /// The account changes at most a few times a day -- a run opens, and it closes
@@ -713,10 +719,7 @@ async fn publish_account_once(
                 continue;
             };
             let mut labels = HashMap::new();
-            labels.insert(
-                crate::LABEL_READOUT.to_string(),
-                readout.as_str().to_string(),
-            );
+            labels.insert(READOUT_LABEL.to_string(), readout.as_str().to_string());
             if let Err(e) = metrics
                 .record_gauge(metric_names::BACKUP_RUN_READINGS, value, labels)
                 .await

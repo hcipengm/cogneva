@@ -834,7 +834,7 @@ struct HostLoad {
 /// the volume a non-root build must not plan on. A filesystem that cannot be
 /// read contributes no reading rather than a zero -- "this volume is full" and
 /// "nothing could be asked about this volume" are different facts.
-fn disk_bytes(dir: &Path) -> Option<u64> {
+pub(crate) fn disk_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     // SAFETY: `statvfs` writes into the `statvfs` it is given and retains
