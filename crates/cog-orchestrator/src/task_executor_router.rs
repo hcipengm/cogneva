@@ -163,9 +163,8 @@ pub fn parse_claim_concurrency(raw: &str) -> Result<usize, String> {
 pub fn pinned_claim_concurrency() -> Option<usize> {
     match std::env::var(CLAIM_CONCURRENCY_ENV) {
         Err(_) => None,
-        Ok(raw) if raw.trim() == "0" || raw.trim().is_empty() => None,
-        Ok(raw) => match parse_claim_concurrency(&raw) {
-            Ok(n) => Some(n),
+        Ok(raw) => match claim_concurrency_override(&raw) {
+            Ok(bound) => bound,
             Err(problem) => {
                 tracing::warn!(
                     variable = CLAIM_CONCURRENCY_ENV,
@@ -177,6 +176,18 @@ pub fn pinned_claim_concurrency() -> Option<usize> {
             }
         },
     }
+}
+
+/// 一个配置值说的是哪件事：`Ok(Some(n))` 是覆盖位，`Ok(None)` 是去量，`Err` 是写坏了。
+///
+/// 生产读法与部署面的判据读同一个函数。判据自己再抄一遍「0 与空串是导出」这两个
+/// 词，会在代码下一次改口径之后仍然判着旧的那个——那就成了一条替旧契约背书的门。
+pub fn claim_concurrency_override(raw: &str) -> Result<Option<usize>, String> {
+    let raw = raw.trim();
+    if raw == "0" || raw.is_empty() {
+        return Ok(None);
+    }
+    parse_claim_concurrency(raw).map(Some)
 }
 
 /// 本进程的在途执行上限：钉死的那个数，或者还没量到窗口时的起点。

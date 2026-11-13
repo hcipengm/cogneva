@@ -331,6 +331,22 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_project_control_coverage_measured_unix",
         Unread::Gap("when the pair above was last measured, and it has no reader either -- so nothing today separates a measured zero from a frozen one; the same estimator-side reader is what will read it"),
     ),
+    // Two counters published beside the build-target scan. Each walk states the
+    // cadence it keeps and the cap it derived, because a number that stopped
+    // changing and a loop that stopped are the same number on the gauge beside
+    // them. Nothing reads either count yet, and the reader owed is one rule for
+    // both: an increase over a multiple of the interval the same family
+    // publishes, so a walk that has not run in that window is told apart from
+    // one whose cap and interval simply did not move. No bound beyond that
+    // comparison is owed -- the counts are pulses, not levels.
+    (
+        "cogneva_build_target_scan_interval_evaluations_total",
+        Unread::Gap("one per walk of the build-cache scan, published so a cadence that stopped changing is distinguishable from a loop that stopped; no rule reads it yet, and the reader owed is an increase over a multiple of the interval beside it"),
+    ),
+    (
+        "cogneva_build_target_cap_evaluations_total",
+        Unread::Gap("one per walk that derived its cap from its own measurement, beside the interval counter for the same reason; unread today, so a derivation that quietly stopped repeats the same cap into a reading nobody sees change"),
+    ),
     // Published on 2026-10-28 by the change that started timing each startup
     // phase instead of only weighing it. Its sibling `cogneva_boot_rss_bytes`
     // has a face -- the rule that fires when a phase grows past its own 3-day
@@ -542,7 +558,14 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// behind its own commentary. The debt is real -- nothing draws those three --
 /// and the reader they are owed is on the producing side rather than in a
 /// rule.
-const GAPS_AT_SCRAPE_CENSUS: usize = 4;
+/// Back to six on 2026-11-14: the build-target scan's two evaluation counters
+/// arrived with the loop that publishes them. They are the pair that makes a
+/// stalled derivation visible -- the cap and the interval hold the same value
+/// whether the walk is still running or not, and these two move only when it
+/// is -- so the debt is a reader rather than a threshold, and it is filed here
+/// instead of exempted because the count is exactly the reading a person would
+/// expect to find drawn.
+const GAPS_AT_SCRAPE_CENSUS: usize = 6;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

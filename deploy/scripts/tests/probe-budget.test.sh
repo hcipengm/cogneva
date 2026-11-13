@@ -37,8 +37,16 @@ def containers(doc):
 
 
 def check_docs(docs, origin):
-    """每个探针都要显式声明完整预算。缺任何一个键 = 依赖 kubelet 默认值。"""
+    """每个探针都要显式声明完整预算。缺任何一个键 = 依赖 kubelet 默认值。
+
+    返回 (问题, 这份文件里是否真的有一个工作负载容器带探针)。后者是覆盖面
+    census 的输入：判的是**清单里的探针**，不是文件里出现过 `livenessProbe`
+    这几个字母——`tunables.yaml` 是一张把探针字段当键名登记的表，它没有工作
+    负载，把它算进 census 会让「新树上多了探针」和「登记表提到了这个字段」
+    变成同一件事。
+    """
     bad = []
+    seen = False
     for d in docs:
         if not d or d.get("kind") not in ("Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"):
             continue
@@ -48,10 +56,11 @@ def check_docs(docs, origin):
                 probe = c.get(key)
                 if probe is None:
                     continue
+                seen = True
                 for field in required:
                     if field not in probe:
                         bad.append(f"{origin} {name}[{c['name']}] {key} 缺少 {field}")
-    return bad
+    return bad, seen
 
 
 yaml = None
@@ -79,8 +88,14 @@ for path in sorted((repo / "deploy").rglob("*.yaml")):
     if not any(key in text for key in probe_keys):
         continue
     rel = str(path.relative_to(repo))
-    checked[rel] = str(path.parent.relative_to(repo / "deploy"))
-    problems += check_docs(list(yaml.safe_load_all(text)), rel)
+    bad, seen = check_docs(list(yaml.safe_load_all(text)), rel)
+    problems += bad
+    # Only a file where a workload container actually declares a probe counts
+    # toward the census. A file that merely spells the field names -- the
+    # tunable registry lists them as keys -- is not a tree this gate covers,
+    # and counting it would let that distinction go unread.
+    if seen:
+        checked[rel] = str(path.parent.relative_to(repo / "deploy"))
 
 # 覆盖面 census：带探针的目录集合必须与声明一致。两个方向都会失败——新目录出现
 # （有人加了一份带探针的清单而没进判据）或目录消失（有人搬了树而声明没跟上）。

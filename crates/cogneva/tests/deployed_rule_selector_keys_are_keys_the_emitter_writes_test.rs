@@ -222,6 +222,10 @@ fn idents_in(line: &str) -> Vec<(&str, usize)> {
 /// 迟早会撞上这种重名，所以这里按名字收全部值。
 fn str_consts(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // `const A: &str = crate::B;`：别名常量。值不在这一行，得顺着引用走到声明它的
+    // 那一行。只认字面量的版本会让 `READOUT_LABEL` 以标识符原样留在键集合里，于是
+    // 规则里 `readout=` 的每一个选择子都对不上一个「从没人写下」的键。
+    let mut aliases: Vec<(String, String)> = Vec::new();
     for path in production_sources(root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
@@ -244,6 +248,12 @@ fn str_consts(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
             };
             let after_eq = rest[eq + 1..].trim_start();
             let Some(after_eq) = after_eq.strip_prefix('"') else {
+                let end = after_eq.find(';').unwrap_or(after_eq.len());
+                let target = after_eq[..end].trim();
+                let target = target.rsplit("::").next().unwrap_or("").trim();
+                if target.starts_with(is_ident_start) && target.chars().all(is_ident_char) {
+                    aliases.push((target.to_string(), name.to_string()));
+                }
                 continue;
             };
             let Some(end) = after_eq.find('"') else {
@@ -276,6 +286,21 @@ fn str_consts(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
             out.entry(name.to_string())
                 .or_default()
                 .insert(value.to_string());
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (target, alias) in &aliases {
+            let Some(values) = out.get(target).cloned() else {
+                continue;
+            };
+            let slot = out.entry(alias.clone()).or_default();
+            for value in values {
+                if slot.insert(value) {
+                    changed = true;
+                }
+            }
         }
     }
     out

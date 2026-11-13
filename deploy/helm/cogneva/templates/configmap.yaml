@@ -29,6 +29,7 @@ data:
   # 多出来的那个 Pod 一上来就会等到 `pool timed out`。`+1` 是滚动影子——同一次
   # 滚动里新 Pod 已经连上、旧 Pod 还没退出，两者都要算。
   {{- /* lit: 1 fixed — 滚动影子：一次滚动里新 Pod 已经连上、旧 Pod 还没退出，两者同时分摊同一个连接上限；它不随任何 profile 的副本数变 */}}
+  {{- /* lit: 2 fixed — 运行时副本数的上限：主应用与安全网关按就绪节点数取副本（一节点一个、最多两个），渲染期读不到节点数，所以按上限算而不是按渲染时的种子副本数算 */}}
   COGNEVA_PG_SHARING_PROCESSES: {{ add (max 2 (int .Values.gateway.replicas)) (int .Values.evolution.replicas) (max 2 (int .Values.securityGateway.replicas)) 1 | quote }}
   # 向量后端的地址直接由代码读 QDRANT_URL；没有第二个 provider 开关要同步。
   QDRANT_URL: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.grpcPort) | quote }}

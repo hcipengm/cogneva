@@ -87,7 +87,7 @@ pub const CONTAINER_LABEL: &str = "container";
 pub const VOLUME_LABEL: &str = "volume";
 
 /// 这个值是怎么来的：`derived`（实测窗口给了目标）或 `seed`（窗口还没够）。
-pub const SOURCE_LABEL: &str = "source";
+pub const SOURCE_LABEL: &str = crate::LABEL_SOURCE;
 
 /// 目标来自实测。
 pub const SOURCE_DERIVED: &str = "derived";
@@ -100,8 +100,8 @@ pub const SOURCE_SEED: &str = "seed";
 /// Job 活不过一轮、名字每轮都不同，主回路看不见它；它由部署器在 Job 结束后把
 /// 「下一次会写成什么」写进来。用一个固定的族名而不是每轮的 Job 名，是因为
 /// 要看的是「这条律在这个调用点上收敛到哪」，不是某一次运行的对象名。
-pub const ROLLOUT_JOB_WORKLOAD: &str = "mainline-rollout";
-pub const ROLLOUT_JOB_CONTAINER: &str = "mainline-rollout";
+pub const ROLLOUT_JOB_WORKLOAD: &str = crate::mainline_deployer::MAINLINE_ROLLOUT_COMPONENT;
+pub const ROLLOUT_JOB_CONTAINER: &str = ROLLOUT_JOB_WORKLOAD;
 
 /// 内存与 CPU 上限相对实测的余量，百分比。与卷容量回路同一条律。
 // cap: fixed — 余量是这条律与卷容量回路共用的一个协议数，不是某次测量的结果；两处各写一份才会有两条说法。
@@ -626,14 +626,15 @@ impl Window {
         }
     }
 
-    /// 写回磁盘。先写同目录的临时文件再改名，读的一方永远看不到半个文件。
+    /// 写回磁盘。整份替换走 `cog_core::atomic_write`：读的一方永远看不到半个文件，
+    /// 而临时名、权限与目录 fsync 只有那一份实现——抄一遍就等于让两处各自漂。
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, self.to_json())?;
-        std::fs::rename(&tmp, path)
+        crate::atomic_write::write_bytes(
+            path,
+            self.to_json().as_bytes(),
+            crate::atomic_write::Durability::SameKernel,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
@@ -885,8 +886,10 @@ pub fn parse_workloads(list: &Value) -> Vec<WorkloadSpec> {
             continue;
         }
         let spec = match kind.as_str() {
-            "CronJob" => item.pointer("/spec/jobTemplate/spec/template/spec"),
-            "Deployment" | "StatefulSet" | "DaemonSet" => item.pointer("/spec/template/spec"),
+            "CronJob" => item.pointer(cog_core::contract::env_supersede::CRONJOB_POD_TEMPLATE),
+            "Deployment" | "StatefulSet" | "DaemonSet" => {
+                item.pointer(cog_core::contract::env_supersede::POD_TEMPLATE)
+            }
             _ => None,
         };
         let Some(spec) = spec else { continue };
@@ -1148,14 +1151,13 @@ pub fn patch_body(
     }
 }
 
-/// patch 用的小写资源名。
+/// patch 用的小写资源名，取自工作负载表。
+///
+/// 这里曾经是一份自己的 `match`，兜底写 `deployment`：表里没有的 kind 会被
+/// 静默地当成 Deployment，按这个名字去 patch——打中的是同名的另一个对象，
+/// 而 kubectl 不报错。词只有一处权威（`WORKLOAD_KINDS`），别的面照它取。
 fn kind_arg(kind: &str) -> &'static str {
-    match kind {
-        "StatefulSet" => "statefulset",
-        "DaemonSet" => "daemonset",
-        "CronJob" => "cronjob",
-        _ => "deployment",
-    }
+    crate::mainline_rollout::workload_resource(kind)
 }
 
 /// 这个回路发布出去的读数。

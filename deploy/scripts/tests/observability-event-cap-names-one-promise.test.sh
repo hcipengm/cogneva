@@ -99,10 +99,34 @@ read -r static_rows static_window <<<"$(check_pair "deploy/k3s 静态清单" "${
 
 # 代码默认值必须与清单同值：容器没拿到 env 时（老清单、手工 create job）进程拿默认值跑，
 # 那时它执行的界与部署清单声明的界就不是同一个数了。
+#
+# 读窗口的数是**一处声明**：`cog_core::retention` 拥有它（容量与另外几张表的保留窗口
+# 在同一个刻度上被读），`cog-storage` 那一格是别名。所以这里取声明处的值，再核一遍
+# 别名真的指着那个声明——别名改指别处时，读数不该还是旧数字。
+code_code="${repo}/crates/cog-core/src/retention.rs"
 code_rows="$(sed -n 's/^pub const DEFAULT_MAX_ROWS: u64 = \([0-9_]*\);$/\1/p' "${cap_code}" | tr -d '_')"
-code_window="$(sed -n 's/^pub const DEFAULT_READ_WINDOW_SECS: u64 = \([0-9_]*\);$/\1/p' "${cap_code}" | tr -d '_')"
+code_window="$(sed -n 's/^pub const OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS: u64 = \([0-9_]*\);$/\1/p' "${code_code}" | tr -d '_')"
 [[ -n "${code_rows}" ]] || fail "${cap_code} 里找不到 DEFAULT_MAX_ROWS"
-[[ -n "${code_window}" ]] || fail "${cap_code} 里找不到 DEFAULT_READ_WINDOW_SECS"
+[[ -n "${code_window}" ]] || fail "${code_code} 里找不到 OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS"
+python3 - "${cap_code}" "${code_code}" <<'PY' || exit 1
+import re, sys
+cap, core = sys.argv[1], sys.argv[2]
+text = open(cap).read()
+if not re.search(
+    r"pub const DEFAULT_READ_WINDOW_SECS: u64 =\s*cog_core::retention::"
+    r"OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS;",
+    text,
+):
+    sys.exit(
+        f"FAIL: {cap} 的 DEFAULT_READ_WINDOW_SECS 不再是 "
+        "cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS 的别名："
+        "读窗口成了两处声明"
+    )
+if not re.search(
+    r"pub const OBSERVABILITY_EVENTS_READ_WINDOW_DEFAULT_SECS: u64 = \d", open(core).read()
+):
+    sys.exit(f"FAIL: {core} 里没有声明读窗口的默认值")
+PY
 [[ "${code_rows}" == "${chart_rows}" ]] \
   || fail "代码默认容量 ${code_rows} 与清单 ${chart_rows} 不同：没注入 env 的那个进程会按另一条界清理"
 [[ "${code_window}" == "${chart_window}" ]] \

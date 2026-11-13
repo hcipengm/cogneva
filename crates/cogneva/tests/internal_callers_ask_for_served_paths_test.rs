@@ -50,6 +50,17 @@ fn asked_paths(text: &str) -> BTreeSet<String> {
     paths
 }
 
+/// 一条路径是不是走 `kubectl get --raw` 打到 apiserver 的。
+///
+/// `/api/v1/nodes/<节点>/proxy/stats/summary` 与网关的 REST 前缀长得一模一样，
+/// 但目标端是集群 API：那是 kubelet 的只读口，经 apiserver 代理读。判定要两样
+/// 一起成立——前缀是集群对象，且这个文件里确实有一条 `--raw` 调用。只按前缀跳
+/// 会替一条未来真的注册在网关上的同名路由背书，只按 `--raw` 跳会漏掉同一文件里
+/// 真的发给网关的请求。
+fn is_cluster_api_call(text: &str, path: &str) -> bool {
+    text.contains("\"--raw\"") && path.starts_with("/api/v1/nodes/")
+}
+
 fn callers(root: &Path, files: &[PathBuf]) -> (BTreeMap<String, BTreeSet<String>>, usize) {
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut scanned = 0;
@@ -59,7 +70,11 @@ fn callers(root: &Path, files: &[PathBuf]) -> (BTreeMap<String, BTreeSet<String>
             continue;
         }
         scanned += 1;
-        let paths = asked_paths(&production_text(&read(path)));
+        let text = production_text(&read(path));
+        let paths: BTreeSet<String> = asked_paths(&text)
+            .into_iter()
+            .filter(|asked| !is_cluster_api_call(&text, asked))
+            .collect();
         if !paths.is_empty() {
             found.insert(label, paths);
         }
