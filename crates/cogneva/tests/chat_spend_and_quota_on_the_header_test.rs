@@ -109,7 +109,7 @@ fn an_unset_ceiling_and_an_unreadable_ledger_are_not_drawn_as_zero() {
         "没人配过上限那一支没有自己的话：{quota_line}"
     );
     assert!(
-        quota_line.contains("(未配置上限)"),
+        quota_line.contains("（未配置上限）"),
         "花着钱但没人配过上限时不再明说「未配置」：剩下的只有「今日 N」，\
          读起来像还有余量：{quota_line}"
     );
