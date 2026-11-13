@@ -160,7 +160,7 @@ impl RolloutResourceReading {
     pub fn average_cpu_millicores(&self) -> Option<u64> {
         let used = self.cpu_usage_usec?;
         let elapsed = self.elapsed_usec?;
-        (elapsed > 0).then(|| (used.saturating_mul(1000) / elapsed) as u64)
+        (elapsed > 0).then(|| used.saturating_mul(1000) / elapsed)
     }
 
     /// 被限流的周期占比。这是"上限咬着这次跑"的**频度**读数。

@@ -1666,7 +1666,7 @@ pub async fn round(
             continue;
         };
         for (pod, containers) in parse_summary(&summary, ns) {
-            usage.entry(pod).or_default().extend(containers.into_iter());
+            usage.entry(pod).or_default().extend(containers);
         }
     }
 

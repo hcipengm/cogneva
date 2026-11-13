@@ -1853,6 +1853,11 @@ fn cargo_jobs_for(cores: f64, demand_cores: f64) -> Option<u64> {
 /// The whole series set, in one place: a reader that has to tell "no bound here"
 /// from "this deployment never reported" cannot do it if the two sources of the
 /// set can drift.
+// One parameter per reading, and each one is read off a different place (the
+// slot census, the gate's own counters, the cargo derivation, the origin). A
+// struct here would only move the same list one level down and make the gate's
+// shape unreadable at the call site.
+#[allow(clippy::too_many_arguments)]
 fn readings(
     slots: usize,
     occupied: usize,
@@ -3038,7 +3043,7 @@ impl BuildGate {
             // window still paces the derivation: an ask is not a beat.
             let due = {
                 let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
-                window.map_or(true, |last| last.elapsed() >= self.tuning.bound_window)
+                window.is_none_or(|last| last.elapsed() >= self.tuning.bound_window)
             };
             if due {
                 self.derive_cargo_jobs(self.host_cores as f64);
