@@ -126,6 +126,9 @@ pub struct Agent {
     guardrail: Option<Arc<dyn cog_core::Guardrail>>,
     /// Where each finished run's token census is written, keyed by task.
     observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    /// Where the loop reports how an attempt started and what the kill left
+    /// unresolved. Passed through to every runtime this agent builds.
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     /// Where the loop sends a tool output too large to fit the context window,
     /// so the bytes it drops stay reachable by the reference in the marker.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
@@ -206,6 +209,7 @@ impl Agent {
             external_skill_registry: None,
             guardrail: None,
             observability: None,
+            metrics: None,
             tool_output_archive: None,
             event_channel_capacity,
             event_bus_sink: None,
@@ -323,6 +327,12 @@ impl Agent {
         self
     }
 
+    /// Hand the loop the series a resumed attempt reports itself on.
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Hand the loop the surface that archives a tool output too large for the
     /// context window. Without it the output is still cut to fit; what is lost
     /// is the reference to the dropped bytes, so a reader of the transcript sees
@@ -406,6 +416,7 @@ impl Agent {
         let external_skill_registry = self.external_skill_registry.clone();
         let event_bus_sink = self.event_bus_sink.clone();
         let observability = self.observability.clone();
+        let metrics = self.metrics.clone();
         let tool_output_archive = self.tool_output_archive.clone();
         // 名册交给运行时的循环：它自己的工号与名字从那一行读。登记在下面
         // 发生，晚于这里——运行时每轮开头才问一次，问到之前不编名字。
@@ -444,6 +455,9 @@ impl Agent {
             }
             if let Some(ref ob) = observability {
                 agent_loop = agent_loop.with_observability(ob.clone());
+            }
+            if let Some(ref m) = metrics {
+                agent_loop = agent_loop.with_metrics(m.clone());
             }
             if let Some(ref ar) = tool_output_archive {
                 agent_loop = agent_loop.with_tool_output_archive(ar.clone());
@@ -1032,6 +1046,7 @@ impl Agent {
         let plugin_registry = self.plugin_registry.clone();
         let event_bus_sink = self.event_bus_sink.clone();
         let observability = self.observability.clone();
+        let metrics = self.metrics.clone();
         let tool_output_archive = self.tool_output_archive.clone();
         // 与 `start` 同一条理由：恢复出来的这个对象也是名册上的同一个人。
         let roster = self.registry.clone();
@@ -1066,6 +1081,9 @@ impl Agent {
             }
             if let Some(ref ob) = observability {
                 agent_loop = agent_loop.with_observability(ob.clone());
+            }
+            if let Some(ref m) = metrics {
+                agent_loop = agent_loop.with_metrics(m.clone());
             }
             if let Some(ref ar) = tool_output_archive {
                 agent_loop = agent_loop.with_tool_output_archive(ar.clone());

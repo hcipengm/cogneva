@@ -441,12 +441,6 @@ rows:
       The same count for failures, kept one higher so that two consecutive nights
       can be compared. Nothing measures how often a failure is looked at.
 
-  - key: backup.ttlSecondsAfterFinished
-    source: override
-    why: >-
-      A day before a finished Job and its Pod are collected: long enough to read
-      the day's failure, short enough not to accumulate objects. Not a reading.
-
   - key: backup.backoffLimit
     source: override
     why: >-
@@ -565,11 +559,13 @@ rows:
       push or pull pressure, so no loop moves this number.
 
   - key: clusterRegistry.port
-    source: override
+    source: fixed
     why: >-
-      The registry's service port, read by the Service, the container port, the
-      deployer's Service DNS and the network policy. A derived value would read the
-      port the registry actually bound; the process reports no such reading.
+      An address, not a size: the Service port, the container port, the deployer's
+      Service DNS and the network policy all name this one number, so it is a
+      protocol fact those four agree on. Nothing measures how large it should be --
+      a derived value would have to read the port the registry bound, and the
+      process reports no such reading.
 
   - key: clusterRegistry.nodePort
     source: fixed
@@ -673,19 +669,6 @@ rows:
       How often the self-evolution loop looks for new work. It would be derived
       from the observed arrival interval of changes; nothing records that
       interval today.
-
-  - key: evolution.progressDeadlineSeconds
-    source: override
-    why: >-
-      The controller's default, written down so it can be read: an undeclared
-      progressDeadlineSeconds is 600 seconds, and a bound nobody can see in the
-      manifest is a bound nobody can audit. It kills nothing: at the deadline the
-      controller only writes a status condition (Progressing=False, reason
-      ProgressDeadlineExceeded) and the pod keeps running; nothing in this repo
-      acts on that condition. The field cannot be removed either -- the API
-      applies the same default when it is absent. Raising the number is not the
-      repair -- reading the pod's own startup
-      progress is.
 
   - key: evolution.buildGate.maxConcurrent
     source: derived
@@ -1831,6 +1814,45 @@ rows:
       gateway's 8082. An address that outside senders are configured against; a
       measurement must not move it.
 
+  # --- shutdown ---------------------------------------------------------------
+  - key: shutdown.terminationGraceSeconds
+    source: override
+    why: >-
+      The one number in the shutdown face: how long kubelet waits after SIGTERM
+      before it kills the process. Both workloads that run agent turns take it,
+      and the process's drain budget is computed from it rather than pinned
+      beside it (`grace - shutdown.drainTeardownMarginMs`), so raising it is one
+      edit and cannot leave half the pair behind. Why not derived: what the
+      reading can say is smaller than what a derivation would need. A drain that
+      was abandoned records the cap it hit -- it is censored at the budget, and
+      only says `at least this long` -- so a high quantile taken over the
+      histogram is a quantile of the drains that were fast enough to finish, and
+      it converges on `as fast as the fast ones are` no matter how many turns
+      the cap is cutting short. Fitting this number to that quantile would size
+      it by the half of the distribution that never needed it. What the reading
+      can do is falsify the policy, and that is the rule it is read by: any
+      `timeout` row on `cogneva_shutdown_drain_milliseconds`, or a non-zero
+      `cogneva_shutdown_drain_abandoned_total`, over a sustained window, is
+      evidence that real turns outlast this number and the repair is to raise
+      it. Until that evidence exists the number is a policy with no measurement
+      to move it -- its two costs (a rollout that waits, a call that is
+      interrupted) are the same event on either side of the line, so there is no
+      optimum in it to search for.
+
+  - key: shutdown.drainTeardownMarginMs
+    source: fixed
+    why: >-
+      The part of the grace that is not the drain: flushing logs, letting the
+      tokio runtime unwind, and the window between the process exiting and
+      kubelet seeing it. It is not a dial -- the cost of stopping does not move
+      with how long the drain took -- and it is subtracted from the grace to give
+      the process its budget, so a larger margin would not buy a longer drain, it
+      would shorten one. Written as a number instead of a code constant because
+      it is arithmetic the chart does (`cogneva.drainBudgetMs`): both the pod
+      field and the process environment are rendered from these two leaves, and a
+      margin living in Rust would leave the chart claiming a budget it had not
+      computed.
+
   # --- listening ports --------------------------------------------------------
   # Every port a workload listens on is an address, not a dial: nothing measures
   # it, and the only thing a measurement could say about it is "the process bound
@@ -1839,29 +1861,6 @@ rows:
   # config file, the env layer that overrides it, the network policy on both
   # sides, the ingress, and the deployment notes -- and a port that moves in one
   # of them reads as a dead backend, not as a half-finished edit.
-  - key: shutdown.drainBudgetMs
-    source: override
-    why: >-
-      How long the process may spend letting in-flight runs reach a turn
-      boundary and stop before it exits. Pinned at 30 s because nothing
-      measures the drain yet: the loop that should set it is "how long does a
-      real drain take", and that reading has no history. It is pinned equal to
-      cogneva.json's shutdown_timeout_ms by a contract test. Debt: once the
-      drain wait has run for a while, this number moves to derived. Top level,
-      not under gateway, because both workloads that run agent turns (the app
-      and the evolution pod) read it.
-
-  - key: shutdown.terminationGraceSeconds
-    source: override
-    why: >-
-      The pod's grace period, for every workload that runs agent turns. It is
-      one half of a pair with drainBudgetMs, not an independent dial: a grace
-      shorter than the budget has kubelet send SIGKILL while the drain hooks
-      are still finishing, which is the drain silently not happening. The
-      pair's relation (grace >= budget + 15 s of margin for log flush and
-      runtime teardown) is asserted by a contract test, since no measurement
-      moves either half yet.
-
   - key: gateway.httpPort
     source: fixed
     why: >-
@@ -2012,15 +2011,6 @@ rows:
     why: >-
       The render backend's port, read the same way as webSearch.port. An
       address.
-
-  - key: webSearch.safeSearch
-    source: override
-    why: >-
-      A policy, not an address: 0/1/2 is the operator's call on how much search
-      filtering this deployment wants. The default is off because a filtered
-      result leaves no trace in the tool's return value, so it reads exactly like
-      "the page does not exist". Nothing measures whether the level is right, so
-      no loop moves it.
 
   - key: ingress.proxyTimeoutSecs
     source: override

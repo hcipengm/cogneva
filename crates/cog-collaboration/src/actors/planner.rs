@@ -4,15 +4,18 @@ use cog_core::{Agent, KnowledgeBackend, Task};
 
 use crate::squad::pge::types::PlannerOutput;
 
-/// The files a refusing gate named, and which way the next attempt has to read
+/// The files a rework hand-off named, and which way the next attempt has to read
 /// them.
 ///
-/// Read from the task payload, where the hand-off writes it, and read here
-/// because this is the actor that turns a request into the paths the change is
-/// held to. An empty list and an absent field are the same case — a gate that
-/// named nothing has not told the planner anything it did not already know, and
-/// a `required_targets` of zero entries would ask the model to name nothing.
-fn refused_files(task: &Task) -> Option<RefusedFiles> {
+/// Read from the payload of the task the submit flow queues when it hands a
+/// refused change back: `hand_off_change_rework` (in `cog-reflection`) builds a
+/// `change_rework` task and writes `named_files` — the paths that gate's verdict
+/// carried — and `rejection_cause` into it. Read here because this is the actor
+/// that turns a request into the paths the change is held to. An empty list and
+/// an absent field are the same case — a hand-off that named nothing has not
+/// told the planner anything it did not already know, and a `required_targets`
+/// of zero entries would ask the model to name nothing.
+fn rework_named_files(task: &Task) -> Option<RefusedFiles> {
     let files: Vec<String> = task
         .input
         .get("named_files")?
@@ -326,7 +329,7 @@ impl PlannerActor {
         //
         // 这份清单整条任务不变，所以它进稳定半边，与其余答案契约一起被缓存；
         // 没有这个字段的任务（每一个不是回流的自进化任务）字节不变。
-        match refused_files(task) {
+        match rework_named_files(task) {
             Some(RefusedFiles::Targets(files)) => {
                 contract["required_targets"] = serde_json::json!(files);
                 if let Some(instructions) = contract["instructions"].as_str() {
@@ -452,5 +455,99 @@ impl PlannerActor {
             }
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A task shaped the way the submit flow queues one: an id, the rework task
+    /// kind, and the fields the gate's verdict left behind.
+    fn rework_task(input: serde_json::Value) -> Task {
+        Task::new(
+            "rework-change-1",
+            cog_core::TaskType::Custom("change_rework".into()),
+            input,
+        )
+    }
+
+    /// A hand-off that named nothing has told the planner nothing: an absent
+    /// field and a list with no paths in it are the same case, and a
+    /// `required_targets` of zero entries would ask the model to name nothing.
+    #[test]
+    fn a_hand_off_that_named_no_files_reads_as_nothing() {
+        assert!(
+            rework_named_files(&rework_task(serde_json::json!({}))).is_none(),
+            "a task with no `named_files` was read as a file list"
+        );
+        assert!(
+            rework_named_files(&rework_task(serde_json::json!({"named_files": []}))).is_none(),
+            "an empty file list was read as a file list"
+        );
+        assert!(
+            rework_named_files(&rework_task(
+                serde_json::json!({"named_files": ["", "   "], "rejection_cause": "apply_failed"})
+            ))
+            .is_none(),
+            "entries that hold no path were read as paths"
+        );
+    }
+
+    /// Every cause but a path refusal names where the defect is, so the plan is
+    /// held to those files.
+    #[test]
+    fn a_defect_refusal_reads_as_targets() {
+        let named = rework_named_files(&rework_task(serde_json::json!({
+            "named_files": ["crates/cogneva/src/main.rs", "", "crates/cog-core/src/lib.rs"],
+            "rejection_cause": cog_core::RejectionCause::LintIntroduced.as_str(),
+        })))
+        .expect("a hand-off that named files was read as naming nothing");
+        match named {
+            RefusedFiles::Targets(files) => assert_eq!(
+                files,
+                vec![
+                    "crates/cogneva/src/main.rs".to_string(),
+                    "crates/cog-core/src/lib.rs".to_string()
+                ],
+                "the named files were not read as the paths the change has to touch"
+            ),
+            RefusedFiles::OutOfReach(files) => {
+                panic!("a defect refusal was read as paths to stay out of: {files:?}")
+            }
+        }
+
+        // The cause is not what makes a list a target list: a hand-off that
+        // carries no cause at all is still a defect refusal.
+        let without_cause =
+            rework_named_files(&rework_task(serde_json::json!({"named_files": ["a/b.rs"]})))
+                .expect("a hand-off that named files was read as naming nothing");
+        match without_cause {
+            RefusedFiles::Targets(files) => assert_eq!(files, vec!["a/b.rs".to_string()]),
+            RefusedFiles::OutOfReach(files) => {
+                panic!("a refusal with no cause was read as a path refusal: {files:?}")
+            }
+        }
+    }
+
+    /// A path refusal inverts its list: those paths are the ones this instance
+    /// may not write, so they must never become `required_targets`.
+    #[test]
+    fn a_path_refusal_reads_as_out_of_reach() {
+        let named = rework_named_files(&rework_task(serde_json::json!({
+            "named_files": ["crates/change_ledger/tests/principle_ledger.rs"],
+            "rejection_cause": cog_core::RejectionCause::ForbiddenPath.as_str(),
+        })))
+        .expect("a hand-off that named files was read as naming nothing");
+        match named {
+            RefusedFiles::OutOfReach(files) => assert_eq!(
+                files,
+                vec!["crates/change_ledger/tests/principle_ledger.rs".to_string()],
+                "the refused paths were not read as the ones to stay out of"
+            ),
+            RefusedFiles::Targets(files) => panic!(
+                "a path this instance may not write was read as a required target: {files:?}"
+            ),
+        }
     }
 }

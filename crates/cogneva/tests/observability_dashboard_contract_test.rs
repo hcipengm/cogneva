@@ -1039,6 +1039,35 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["tool", "outcome"],
         "crates/cog-extension/src/command_server.rs",
     ),
+    // 关停排空与尝试续跑：一句话的两面。排空那一族三个数（等了多久、留下了
+    // 几条、有没有预算）与续跑那一族两个数（这次是续上的还是从头、日志里
+    // 有几个没结果的调用）画在同一块面板上，因为读者问的是同一个问题——
+    // 这次滚动丢了几步。
+    (
+        "cogneva_shutdown_drain_milliseconds",
+        &["outcome"],
+        "crates/cog-agent/src/plugin.rs",
+    ),
+    (
+        "cogneva_shutdown_drain_abandoned_total",
+        &[],
+        "crates/cog-agent/src/plugin.rs",
+    ),
+    (
+        "cogneva_shutdown_drain_undeclared_total",
+        &[],
+        "crates/cog-agent/src/plugin.rs",
+    ),
+    (
+        "cogneva_attempt_resume_total",
+        &["outcome"],
+        "crates/cog-agent/src/agent_kernel/runtime.rs",
+    ),
+    (
+        "cogneva_attempt_unresolved_calls_total",
+        &["effect"],
+        "crates/cog-agent/src/agent_kernel/runtime.rs",
+    ),
     (
         "sandbox_commands_in_flight",
         &["tool"],

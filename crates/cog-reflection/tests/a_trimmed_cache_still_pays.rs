@@ -30,7 +30,7 @@ use cog_reflection::build_cache_readings::{
     BuildCacheReadings, BUILD_TARGET_OVER_CAP_METRIC, BUILD_TARGET_UNMET_METRIC, CACHE_LAYER_DEPTH,
     OUTCOME_LABEL, OUTCOME_RECLAIMED,
 };
-use cog_reflection::build_cache_reclaim::{plan_reclaim, DISCARDABLE_LEAVES, RESULT_LEAVES};
+use cog_reflection::build_cache_reclaim::{cost_rank, plan_reclaim, COMPILED_RESULT, TIME_ONLY};
 use cog_reflection::build_gate::{BuildGate, Exclusion};
 
 /// A two-crate workspace with one path dependency: enough for cargo to hold a
@@ -70,21 +70,6 @@ fn write_fixture(root: &Path) {
         "fn main() {\n    println!(\"{}\", aardvark_lib::add(1, 2));\n}\n",
     )
     .unwrap();
-}
-
-/// The layer a planned path sits in, by its last component, so a claim about
-/// where a plan took its bytes from can be read off the walk.
-fn layer_of(files: &[fs_size::FileEntry], path: &Path) -> String {
-    let entry = files
-        .iter()
-        .find(|f| f.path == path)
-        .expect("a plan may only name files the walk saw");
-    entry
-        .layer
-        .rsplit('/')
-        .next()
-        .unwrap_or(entry.layer.as_str())
-        .to_string()
 }
 
 /// Build the fixture with cargo, in a target directory and an environment of the
@@ -182,13 +167,9 @@ async fn a_pass_that_pays_from_the_speed_layers_leaves_the_workspace_up_to_date(
             .iter()
             .find(|f| f.path == *path)
             .expect("a plan may only name files the walk saw");
-        let leaf = entry
-            .layer
-            .rsplit('/')
-            .next()
-            .unwrap_or(entry.layer.as_str());
-        assert!(
-            DISCARDABLE_LEAVES.contains(&leaf),
+        assert_eq!(
+            cost_rank(entry).0,
+            TIME_ONLY,
             "the file given up came from layer {} ({}), which costs a recompile \
              to lose; the layers that only cost time come first",
             entry.layer,
@@ -249,14 +230,29 @@ async fn a_pass_that_pays_from_the_speed_layers_leaves_the_workspace_up_to_date(
 /// this whole surface exists to make visible.
 ///
 /// This is the shape a small cap has on a real cache, not a corner case: one
-/// file per layer stays whatever the cap says, and in a workspace whose newest
-/// compiled result is also its largest the floor is most of the cache. A cap
-/// under it is therefore a cap that cannot be met, and it has to read that way
-/// instead of reading as a cache that was brought down to it.
+/// file per layer stays whatever the cap says, so a layer whose newest file is
+/// larger than the cap already puts the cap out of reach. A cap under it is
+/// therefore a cap that cannot be met, and it has to read that way instead of
+/// reading as a cache that was brought down to it.
 #[tokio::test]
 async fn a_cap_under_the_floor_is_reported_and_the_cache_still_builds() {
     let root = tempfile::tempdir().unwrap();
-    let (target, files, total) = warm_cache(root.path());
+    let (target, _, built) = warm_cache(root.path());
+
+    // Which file the builds left newest is a fact about the machine, not
+    // something to build an assertion on: write the one the floor has to keep.
+    // Its size is the cache the build just produced, so it is derived from the
+    // tree in front of it: with the held file as large as everything the pass
+    // may delete, a cap at a quarter of the total cannot be met while the floor
+    // keeps it, on any machine.
+    let held = target.join("debug/incremental/hold.bin");
+    std::fs::write(&held, vec![0u8; built as usize]).unwrap();
+    let files = fs_size::dir_files(&target, CACHE_LAYER_DEPTH, &[]).unwrap();
+    let total = fs_size::counted_bytes(&files);
+    assert!(
+        files.iter().any(|f| f.path == held),
+        "the file the floor has to keep is not in the walk"
+    );
 
     let cap = total / 4;
     let plan = plan_reclaim(&files, total, cap);
@@ -319,7 +315,13 @@ async fn a_pass_that_reaches_the_compiled_results_still_leaves_the_workspace_war
     // -- which is also where the floor drops out of the arithmetic, since a
     // group the floor keeps is one the plan never names.
     let drained = plan_reclaim(&files, total, 0);
-    let among_results = |path: &Path| RESULT_LEAVES.contains(&layer_of(&files, path).as_str());
+    let among_results = |path: &Path| {
+        let entry = files
+            .iter()
+            .find(|f| f.path == *path)
+            .expect("a plan may only name files the walk saw");
+        cost_rank(entry).0 == COMPILED_RESULT
+    };
     assert!(
         drained
             .delete
@@ -362,14 +364,14 @@ async fn a_pass_that_reaches_the_compiled_results_still_leaves_the_workspace_war
 
     // Asserted last so that a plan which never reached the compiled results
     // fails above, on what it cost, rather than here on what it was about.
-    let planned: Vec<String> = plan
+    let planned: Vec<(&str, bool)> = plan
         .delete
         .iter()
         .flat_map(|group| group.paths.iter())
-        .map(|path| layer_of(&files, path))
+        .map(|path| (path.to_str().unwrap_or(""), among_results(path)))
         .collect();
     assert!(
-        planned.iter().any(|layer| layer == "deps"),
+        planned.iter().any(|(_, result)| *result),
         "the cut has to land in the compiled results, or nothing above was \
          about them: {planned:?}"
     );

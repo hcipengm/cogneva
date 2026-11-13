@@ -29,7 +29,6 @@ spec:
       # 第二趟只挑一份）。这里曾经是 activeDeadlineSeconds——它杀的是「这一趟跑了
       # 多久」，2026-10-27 实测单包已长到 2271 s，3600 s 的界让第二趟被杀，账上一行
       # 都不留。判停改由存活探针按进度文件做：一步都不推进超过窗口才判死。
-      ttlSecondsAfterFinished: 86400
       template:
         metadata:
           labels:

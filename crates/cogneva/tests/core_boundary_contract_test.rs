@@ -609,11 +609,18 @@ fn lonely_mechanisms(
     (lonely, acts.len())
 }
 
-/// A mechanism in the base has to be reached by more than one crate.
-#[test]
-fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
-    let root = common::root::repo_root();
-    let modules = modules(&root);
+/// The base read once: each module's code, who outside the base reaches it, and
+/// which module declares each item name.
+struct BaseCensus {
+    code: BTreeMap<String, String>,
+    reached_by: BTreeMap<String, BTreeSet<String>>,
+    owners: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Read the base and its consumers off the tree. Two rules below are read from
+/// this one census, so a module is never counted two different ways.
+fn base_census(root: &Path) -> BaseCensus {
+    let modules = modules(root);
     let code: BTreeMap<String, String> = modules
         .iter()
         .map(|(name, files)| (name.clone(), code_of(files)))
@@ -634,15 +641,30 @@ fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
         .keys()
         .map(|name| (name.clone(), BTreeSet::new()))
         .collect();
-    for (crate_dir, text) in consumer_code(&root) {
+    for (crate_dir, text) in consumer_code(root) {
         for module in referenced_modules(&text, &module_names, &owners) {
             if let Some(set) = reached_by.get_mut(&module) {
                 set.insert(crate_dir.clone());
             }
         }
     }
+    BaseCensus {
+        code,
+        reached_by,
+        owners,
+    }
+}
 
-    let (lonely, acting) = lonely_mechanisms(&code, &reached_by);
+/// A mechanism in the base has to be reached by more than one crate.
+#[test]
+fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
+    let root = common::root::repo_root();
+    let census = base_census(&root);
+    let code = &census.code;
+    let reached_by = &census.reached_by;
+    let modules = &census.code;
+
+    let (lonely, acting) = lonely_mechanisms(code, reached_by);
     assert!(
         lonely.is_empty(),
         "modules in the base that do work nothing outside it shares:\n  {}\n\
@@ -660,6 +682,66 @@ fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
     println!(
         "{acting} of {} modules in the base do work; the rest are shapes and names",
         modules.len()
+    );
+}
+
+/// Every module the base declares is reached by something: a crate outside the
+/// base, or another module inside it.
+///
+/// The rule above only reads modules that do work, and a shape nobody calls
+/// compiles just as quietly -- `pub` items are never "unused" to the compiler.
+/// So a definition can sit in the base with no consumer at all: it changes
+/// nothing, ships to every crate that links the base, and looks exactly like a
+/// contract that is about to be wired. That module is either waiting on work
+/// nobody has done (then the caller comes first, in the crate that will call it)
+/// or it is gone already and nobody noticed.
+///
+/// Reach is read the same way the rule above reads it, plus the base's own
+/// callers, because a module this crate's other modules call is at least being
+/// used. A module named only by its own file fails here.
+#[test]
+fn every_module_the_base_declares_is_reached_somewhere() {
+    let root = common::root::repo_root();
+    let census = base_census(&root);
+
+    let mut dead: Vec<String> = Vec::new();
+    for module in census.code.keys() {
+        if census
+            .reached_by
+            .get(module)
+            .is_some_and(|readers| !readers.is_empty())
+        {
+            continue;
+        }
+        let called_inside = census.code.iter().any(|(other, text)| {
+            if other == module {
+                return false;
+            }
+            if names_path(text, &format!("crate::{module}")) {
+                return true;
+            }
+            census.owners.iter().any(|(item, owners)| {
+                owners.contains(module) && names_path(text, &format!("crate::{item}"))
+            })
+        });
+        if !called_inside {
+            dead.push(module.clone());
+        }
+    }
+
+    assert!(
+        dead.is_empty(),
+        "modules the base declares that nothing reaches:\n  {}\n\
+         A module no crate outside the base names and no other module inside it \
+         calls is code that does not run: it costs every crate that links the \
+         base and it is indistinguishable from a contract somebody is about to \
+         use. Either move it to the crate that will call it -- and land it \
+         together with that caller -- or delete it; the history keeps it.",
+        dead.join("\n  ")
+    );
+    println!(
+        "{} modules in the base, all reached from outside or from another module",
+        census.code.len()
     );
 }
 

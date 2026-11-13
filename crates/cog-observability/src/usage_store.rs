@@ -409,6 +409,8 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS owner_id TEXT;
 -- conversation named this call" is a state of its own, and a placeholder would
 -- gather every background call into one conversation that reads as the most
 -- expensive thing on the platform.
+-- That is also why the rows written before this column existed are not
+-- backfilled: the null is the answer this column exists to keep.
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS session_id TEXT;
 -- What reading the response found. Nullable with no default: the failure and
 -- refusal paths land rows about attempts that never got a body, and rows
@@ -2628,5 +2630,31 @@ mod tests {
             "WHERE refusal_kind = '{}'",
             RefusalKind::QuotaCycle.as_str()
         )));
+    }
+
+    /// 会话这一维加的是**列**，不是回填：可空、无默认值。
+    ///
+    /// 历史行与不声明会话的调用方都落在 `NULL` 上，那是「那一笔没记会话」；任何
+    /// `NOT NULL` / `DEFAULT` 都会把这一格改成「记过，且是某个值」。`DEFAULT ''`
+    /// 让没记过的调用与一个空名字的会话并成一格，而回填属主 id 更糟——它把「人 id
+    /// 恰好等于会话 id」这个副作用写成历史，此后按会话看花销只能按人看。所以这条
+    /// 断言钉的是列的形状，也是那一格被读成「没记」的前提。
+    #[test]
+    fn the_session_column_is_nullable_and_unfilled_rather_than_defaulted() {
+        let schema = ddl();
+        assert!(
+            schema.contains(
+                "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS session_id TEXT;"
+            ),
+            "会话列没有落在账本上"
+        );
+        assert!(
+            !schema.contains("ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL"),
+            "会话列不该是 NOT NULL：没记会话的行必须能留空"
+        );
+        assert!(
+            !schema.contains("ADD COLUMN IF NOT EXISTS session_id TEXT DEFAULT"),
+            "会话列不该有默认值：默认值会把「没记」写成一个记过的值"
+        );
     }
 }

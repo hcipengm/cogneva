@@ -1292,6 +1292,49 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          that tool's payload shape, not the budget as a whole.",
     ),
     (
+        crate::metric_names::SHUTDOWN_DRAIN_ABANDONED_TOTAL.as_str(),
+        "Runs still in flight when a shutdown's drain budget ran out, one \
+         increment per abandoned run. The histogram beside it says how long the \
+         wait lasted; this says what the wait bought. A drain that times out \
+         with nothing left lost nothing, and one that times out with three runs \
+         going handed three attempts to their journals -- the two write the \
+         same log line, so without this series a rollout that quietly skips the \
+         drain entirely is indistinguishable from one that finishes it.",
+    ),
+    (
+        crate::metric_names::SHUTDOWN_DRAIN_UNDECLARED_TOTAL.as_str(),
+        "Shutdowns that found no declared drain budget and therefore did not \
+         wait for in-flight runs at all, one increment per shutdown. It is a \
+         counter separate from the drain histogram because a zero-second \
+         observation there would mean the opposite: that a drain ran and \
+         finished at once. A process that never declares a budget is one whose \
+         rollout is paid for out of the attempt journals every time, and the \
+         only other trace it leaves is a log line nobody reads at the moment \
+         it matters.",
+    ),
+    (
+        crate::metric_names::ATTEMPT_RESUME_TOTAL.as_str(),
+        "Attempts that opened by reading the attempt journal, labelled by \
+         `outcome`, one increment per attempt. `resumed` continued an unfinished \
+         conversation from its journal; `fresh` found nothing to continue (no \
+         entries, or the last one closed) and paid for its first turn. The pair \
+         is one reading because either count alone is ambiguous: five resumes \
+         is a healthy rolling deploy out of five attempts and a restart loop out \
+         of five thousand, and the share is what says which.",
+    ),
+    (
+        crate::metric_names::ATTEMPT_UNRESOLVED_CALLS_TOTAL.as_str(),
+        "Tool calls a resumed attempt found without a result, labelled by \
+         `effect` (`read`, `write` or `external`), one increment per call. It is \
+         the measurable form of \"at most one step lost\": zero means the kill \
+         landed on a turn boundary, and each increment names an action whose \
+         outcome the resume could not know. Counted by class because the classes \
+         are what the resume does differently with them -- replay a read, replay \
+         a write that refuses a stale anchor, hand an external effect back to \
+         the model -- so a rollout that cost nothing and one that cost an \
+         external action are the same total with different labels.",
+    ),
+    (
         crate::metric_names::SOP_DISPATCH_TOTAL.as_str(),
         "What the SOP dispatch loop did with one configured face on one tick, \
          labelled by `face` and `result`, one increment per face per tick that \
@@ -1369,6 +1412,26 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
          both carried because a pool fails over between endpoints serving the \
          same model, so 'which model is slow' and 'which endpoint is slow' are \
          different questions",
+    ),
+    (
+        crate::metric_names::SHUTDOWN_DRAIN_MILLISECONDS.as_str(),
+        "How long one shutdown waited for in-flight runs to reach a turn \
+         boundary, in milliseconds, observed once per shutdown and labelled by \
+         `outcome`. `drained` is a wait that reached zero; `timeout` is one that \
+         ran out of its budget with runs still going. A histogram rather than a \
+         mean because the number the grace period must cover is the slow tail -- \
+         one rollout that took thirty seconds is the observation that matters, \
+         and an average over a day is the one that hides it. Milliseconds \
+         because the bucket ladder doubles from the unit its name declares: the \
+         seconds ladder stops at 16.384 s, which is inside the range a drain is \
+         allowed to take, so the slow observations -- the only ones that say the \
+         grace is too small -- would all share one overflow count. The two \
+         outcomes are not interchangeable when read as a distribution: a \
+         `drained` duration is the real wait, while a `timeout` one is censored \
+         at the cap it was given and only says `at least this long`. So a \
+         quantile belongs on the `drained` rows, and the `timeout` rows are read \
+         as a count -- any of them is evidence that the cap was reached, which \
+         is the one fact a quantile of the censored rows would hide.",
     ),
 ];
 

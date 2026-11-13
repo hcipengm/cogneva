@@ -419,8 +419,8 @@ for name in sorted(both):
         if kind == 'CronJob':
             # Pod 模板之外还有两处决定它做什么：调度与 Job 级策略。schedule 是它什么
             # 时候跑，concurrencyPolicy 是上一轮没跑完时这一轮怎么办，suspend 是关掉
-            # 它，backoffLimit 与 ttlSecondsAfterFinished 是失败重试几次、留下的 Job
-            # 多久清掉。只比 Pod 模板，「备份改成每小时一次但只改了一侧」会全绿。
+            # 它，backoffLimit 是失败重试几次，history 上限是留下几个 Job。只比 Pod
+            # 模板，「备份改成每小时一次但只改了一侧」会全绿。
             for level, kd, hd in (
                 ('spec', k[name]['spec'], h[name]['spec']),
                 ('jobTemplate.spec', k[name]['spec'].get('jobTemplate', {}).get('spec', {}),

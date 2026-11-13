@@ -26,6 +26,24 @@
 //!   derived while its publisher never says so reads as a number that tracks the
 //!   world and is not one -- the failure this is here to catch, since a cap that
 //!   stopped tracking its volume is a steady number either way.
+//!
+//! A key with no row is the same hole as a key with no loop. A numeric leaf of
+//! `values.yaml` with no row is a number nobody has said a measurement should
+//! move; a `derived` row whose proof is missing, or names something that is not
+//! a test, is a number that claims a loop and has none. Both read as the same
+//! number on the page, and both are refused by the same test below -- a ledger
+//! that answered them in two voices would let a reader believe the half that
+//! happened to be checked.
+//!
+//! The Rust half is the same hole written the other way: a numeric `const` in
+//! production code with no `// cap:` line above it is a number that never went
+//! through the chart, and `rust_capacity_constants_registry_test.rs` is where
+//! that is judged. What "has a loop" means is a fact about one row rather than a
+//! slogan: `evolution.buildGate.maxConcurrent` is the dial the registry carries
+//! with both ends in place -- `derived`, published as `BUILD_GATE_CEILING`
+//! under the label `dimension`, proven by `the_ceiling_is_the_tightest_dimension`
+//! in `crates/cog-reflection/src/build_gate/mod.rs`, where the gate takes the
+//! tightest of the host's dimensions and names the one that decided it.
 
 use crate::common;
 
@@ -234,8 +252,16 @@ fn numeric_leaves(value: &serde_yaml::Value, path: &mut Vec<String>, out: &mut B
     }
 }
 
+/// A key with no row is the same hole as a key with no loop.
+///
+/// The two ends are read here so that "which end is missing" is answered in one
+/// voice: the census of `values.yaml`'s numeric leaves against the rows
+/// (`missing`, `unknown`), then the `derived` rows against the proof they name
+/// (`wrong`). Each list is asserted on its own, with the words it had when the
+/// two were separate tests -- the population judged is the same either way, and
+/// reading them together is what stops the two ends drifting into two accounts.
 #[test]
-fn every_numeric_leaf_of_the_chart_has_exactly_one_row() {
+fn a_key_with_no_row_is_the_same_hole_as_a_key_with_no_loop() {
     let values: serde_yaml::Value = serde_yaml::from_str(&read(&repo_root().join(VALUES)))
         .unwrap_or_else(|e| panic!("{VALUES} does not parse: {e}"));
     let mut leaves = BTreeSet::new();
@@ -271,6 +297,41 @@ fn every_numeric_leaf_of_the_chart_has_exactly_one_row() {
         unknown.is_empty(),
         "these rows describe something the chart does not ship as a number: \
          {unknown:#?}"
+    );
+
+    let mut wrong = Vec::new();
+    for row in &registry.rows {
+        if row.source != Source::Derived {
+            continue;
+        }
+        if row.published.is_none() {
+            wrong.push(format!(
+                "`{}` is registered as derived and names no reading, so a reader \
+                 cannot see where the number went",
+                row.key
+            ));
+        }
+        let Some(proof) = &row.proof else {
+            wrong.push(format!(
+                "`{}` is registered as derived and names no test, so nothing shows \
+                 the value following the input it claims to read",
+                row.key
+            ));
+            continue;
+        };
+        let text = read(&repo_root().join(&proof.file));
+        if !has_test(&text, &proof.test) {
+            wrong.push(format!(
+                "`{}` is registered as derived and its proof `{}` is not a test in \
+                 `{}`",
+                row.key, proof.test, proof.file
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a value registered as derived without a test that moves its input is a \
+         constant with a comment: {wrong:#?}"
     );
 }
 
@@ -356,44 +417,6 @@ fn every_row_says_why_it_is_not_derived() {
         "these values are registered without a reason, which leaves a reader \
          unable to tell a value fixed by agreement from one nobody has derived \
          yet: {silent:#?}"
-    );
-}
-
-#[test]
-fn a_derived_row_names_the_test_that_moves_its_input() {
-    let mut wrong = Vec::new();
-    for row in &registry().rows {
-        if row.source != Source::Derived {
-            continue;
-        }
-        if row.published.is_none() {
-            wrong.push(format!(
-                "`{}` is registered as derived and names no reading, so a reader \
-                 cannot see where the number went",
-                row.key
-            ));
-        }
-        let Some(proof) = &row.proof else {
-            wrong.push(format!(
-                "`{}` is registered as derived and names no test, so nothing shows \
-                 the value following the input it claims to read",
-                row.key
-            ));
-            continue;
-        };
-        let text = read(&repo_root().join(&proof.file));
-        if !has_test(&text, &proof.test) {
-            wrong.push(format!(
-                "`{}` is registered as derived and its proof `{}` is not a test in \
-                 `{}`",
-                row.key, proof.test, proof.file
-            ));
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "a value registered as derived without a test that moves its input is a \
-         constant with a comment: {wrong:#?}"
     );
 }
 
@@ -1084,6 +1107,44 @@ fn the_registry_endpoints_the_code_reads_are_declared_on_both_paths() {
                 "{STATIC} never passes {env}, so the apply path leaves the deployer \
                  without an endpoint while the chart path has one"
             ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Batches of the end state land one group at a time, and a group that has
+/// landed must not carry `override` rows again: `override` is the word the end
+/// state deletes, so a re-added row reopens debt that was closed by measuring
+/// or deleting the value.
+///
+/// A deleted key is absent from the registry and that is the point -- if it
+/// comes back as an override, the row reappears here and this test names it.
+#[test]
+fn a_landed_batch_carries_no_override() {
+    const LANDED_GROUPS: &[(&str, &[&str])] = &[(
+        // Address and platform defaults: one leaf is an address four objects
+        // agree on, and three restated a platform default or upstream default.
+        "B0",
+        &[
+            "clusterRegistry.port",
+            "evolution.progressDeadlineSeconds",
+            "backup.ttlSecondsAfterFinished",
+            "webSearch.safeSearch",
+        ],
+    )];
+
+    let registry = registry();
+    let mut wrong = Vec::new();
+    for (batch, keys) in LANDED_GROUPS {
+        for key in *keys {
+            if let Some(row) = registry.rows.iter().find(|r| r.key == *key) {
+                if row.source == Source::Override {
+                    wrong.push(format!(
+                        "{batch}: `{key}` is back to `override` -- a landed group \
+                         may only be `derived` or `fixed`, or be gone"
+                    ));
+                }
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

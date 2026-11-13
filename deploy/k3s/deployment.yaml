@@ -45,7 +45,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: eeb0d1599318c78b0d8adf3ba2d01d0c0fea0b91cc20998ccab9e752f9f833ba
+        checksum/config: 433905f7b94e73978a357852d60948fe2ac479282e0dd5e10f426186050a3057
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -53,9 +53,12 @@ spec:
         app.kubernetes.io/version: "0.5.10"
     spec:
       serviceAccountName: cogneva
-      # Wider than core.system.shutdown_timeout_ms (30 s): the process stops its
-      # in-flight runs at a turn boundary before exiting, and kubelet only
-      # SIGKILLs when this expires. Held to the pair by
+      # The only number in the shutdown face: kubelet SIGKILLs when it expires.
+      # The process's drain budget is computed from it minus the teardown margin
+      # (45 s - 15 s = 30 s, injected below as COGNEVA_SHUTDOWN_TIMEOUT_MS), so
+      # "grace shorter than budget" is not an agreement between two values but
+      # two halves of the same cell. This path is not rendered, so the number is
+      # written here and compared with values.shutdown.* by
       # tests/shutdown_budget_contract_test.rs.
       terminationGracePeriodSeconds: 45
       affinity:
@@ -96,6 +99,11 @@ spec:
           env:
             - name: TZ
               value: "Asia/Shanghai"
+            # 排空预算：宽限期 45 s 减去 15 s 收尾余量，与 chart 的
+            # cogneva.drainBudgetEnv 同一个算法。这条路径不经渲染，所以数写在这里；
+            # 它与 values.shutdown.* 的一致性由 tests/shutdown_budget_contract_test.rs 判。
+            - name: COGNEVA_SHUTDOWN_TIMEOUT_MS
+              value: "30000"
             # 槽目录只有一处设置。这个键在 cogneva-evolution-config 里，而本 Pod 的
             # envFrom 只取 cogneva-config——不在这里给一遍，两个 Pod 就各读各的默认值，
             # 定制过路径的部署上页面读的是一个空目录。
@@ -130,6 +138,16 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: admin-password
+                  optional: true
+            # 面板推送的 Grafana 管理员口令：内部平台凭证，与上面几条同一类
+            # （APP/REDIS/ADMIN 三条也是这条路由）。它不进清单也不进 values，只从
+            # 带外 Secret 挂进来。缺省即不推送——Grafana 的匿名只读仍在，但推送
+            # 要管理员身份，没有口令就是没有面板，而不是推一半。
+            - name: COGNEVA_GRAFANA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets-oob
+                  key: grafana-admin-password
                   optional: true
             # 本部署的名字：样本日志的容量与容量判定是**每个部署自己的声明**，
             # 而它们落在共用表里。不署名时读到的是「最后写的那家」——置 0（不清理）

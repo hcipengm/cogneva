@@ -53,6 +53,7 @@ pub mod git_mirror;
 pub mod git_routing;
 pub mod github_app;
 pub mod governance;
+pub mod grafana_export;
 pub mod heartbeat_history;
 pub mod hook_forwarder;
 pub mod hooks;

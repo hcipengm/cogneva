@@ -380,8 +380,6 @@ impl QuotaManager for OpenQuota {
     }
 }
 
-/// The gateway state the router is built over. Everything is absent except the
-/// account under test.
 /// A token ledger that answers one question: what the named task ids spent.
 ///
 /// Every other method panics on purpose. A read route that lands a row or reads
@@ -520,6 +518,8 @@ impl cog_core::LlmUsageLedger for FakeUsage {
     }
 }
 
+/// The gateway state the router is built over. Everything is absent except the
+/// account under test.
 fn state(change_ledger: Option<Arc<FakeLedger>>) -> Arc<GatewayState> {
     state_with(change_ledger, None)
 }

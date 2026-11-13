@@ -16,11 +16,16 @@
 //!    goes first: `tmp`, `incremental` and `build` are scratch space,
 //!    incremental state cargo is designed to discard, and re-runnable build
 //!    scripts, and `examples` holds linked binaries, which a link recreates.
-//!    Then the compiled results themselves, `deps` before `.fingerprint`: an
-//!    artifact is worth nothing to the next build without the fingerprint that
-//!    records how it was made, while a fingerprint without its artifact is a
-//!    rounding error on the volume. Within a layer the same question is
-//!    answered the same way, by `artifact_rank`. Every way of ordering in
+//!    `build` is scratch only in the layout where build-script output lives
+//!    there alone; cargo 1.100.0 also writes every compiled result under
+//!    `build/<package>/<metadata-hash>/out/`, so the leaf cannot price a file
+//!    by itself -- `cost_rank` reads the path first and falls back to the leaf
+//!    ([`RELOCATED_LEAVES`]). Then the compiled results themselves, `deps`
+//!    before `.fingerprint`: an artifact is worth nothing to the next build
+//!    without the fingerprint that records how it was made, while a
+//!    fingerprint without its artifact is a rounding error on the volume.
+//!    Within a layer the same question is answered the same way, by
+//!    `artifact_rank`. Every way of ordering in
 //!    here is a fixed list of costs, never the alphabet -- but a plan must also
 //!    be a function of the tree alone, so the path is what decides between two
 //!    files that nothing else separates.
@@ -84,6 +89,11 @@ use crate::fs_size::{FileEntry, FileId};
 /// has not seen; it goes last. A name in no list is an absence of a reading
 /// rather than a reading, so it prices a file only when nothing else does --
 /// see `group_key`.
+/// `build` is in this list because it holds build-script scratch, but cargo
+/// 1.100.0 also writes every compiled result under it -- see
+/// [`RELOCATED_LEAVES`] -- so this leaf alone does not decide what a file
+/// costs. `cost_rank` asks the path first and falls back to this list, and the
+/// plan prices files through that function rather than through the leaf.
 pub const DISCARDABLE_LEAVES: &[&str] = &["tmp", "incremental", "build", "examples"];
 
 /// Layers holding the compiled results, in the order they are given up.
@@ -96,12 +106,36 @@ pub const DISCARDABLE_LEAVES: &[&str] = &["tmp", "incremental", "build", "exampl
 /// layer weighs less than one of the artifacts in the one before it.
 pub const RESULT_LEAVES: &[&str] = &["deps", ".fingerprint"];
 
+/// The same two layers as [`RESULT_LEAVES`], under the names cargo 1.100.0
+/// writes them with: `debug/build/<package>/<metadata-hash>/out/` holds what
+/// `debug/deps/` used to, and `.../fingerprint/` holds what
+/// `debug/.fingerprint/` did.
+///
+/// This is not a second vocabulary for its own sake. The walk records a layer
+/// as the first two path components and cargo kept the two layouts compatible
+/// in nothing else, so on the new one both halves land in the leaf `build` --
+/// the leaf this list calls free to lose. A cache can hold both layouts at
+/// once (whatever was built before an upgrade stays until it is trimmed), so a
+/// reader has to price each file by where it actually is; the rank still comes
+/// from [`RESULT_LEAVES`], so the order has one home.
+pub const RELOCATED_LEAVES: &[(&str, &str)] = &[("out", "deps"), ("fingerprint", ".fingerprint")];
+
 /// Files kept in every layer, whatever the cap.
 ///
 /// One, and it is the newest file the layer has. See the module docs: this is
 /// what keeps a layer from reading as absent, not what keeps a build warm.
 // cap: bound — 取 1，而它就是这层最新的那个文件：这是为了让一层不读成缺席，不是为了让一次构建还热
 pub const FLOOR_FILES_PER_LAYER: usize = 1;
+
+/// The bucket of files whose loss costs only time -- the layers in
+/// [`DISCARDABLE_LEAVES`].
+// cap: fixed — 桶的编号不是可调的量：它只用来排序，两种代价谁在前由代价本身决定
+pub const TIME_ONLY: usize = 0;
+
+/// The bucket of files a later build reads -- the layers in [`RESULT_LEAVES`],
+/// and the layout shapes that stand in for them in [`RELOCATED_LEAVES`].
+// cap: fixed — 同上：编号是排序用的枚举值，不是界；改它只会让这一种代价排到前面去
+pub const COMPILED_RESULT: usize = 1;
 
 /// The rank of a layer neither list places, which is the last of them.
 ///
@@ -226,8 +260,9 @@ pub fn plan_reclaim(files: &[FileEntry], total: u64, cap: u64) -> ReclaimPlan {
     plan
 }
 
-/// Where a group sits in the order: the layer that places it, the layer name,
-/// what kind of file it is, how old it is, and the path.
+/// Where a group sits in the order: the cost class that places it (a layer, or
+/// the layout shape that stands in for one), the layer name, what kind of file
+/// it is, how old it is, and the path.
 ///
 /// Read over every name the group holds rather than over the one its bytes are
 /// counted under. The names are one file -- same inode, so same size, same age,
@@ -249,17 +284,50 @@ fn group_key<'a>(
 ) -> ((usize, usize), &'a str, usize, Option<SystemTime>, &'a Path) {
     group
         .iter()
-        .filter(|file| placed(&file.layer))
+        .filter(|file| placed(file))
         .map(|file| name_key(file))
         .max()
         .or_else(|| group.iter().map(|file| name_key(file)).max())
         .expect("a group is the names of one file, so at least one name")
 }
 
+/// Where a file sits in the cost order: which class places it, and its rank
+/// inside that class.
+///
+/// Public because the tests that hold this order (and the reader asking "would
+/// a later build have to redo this file") have to ask the question the plan
+/// asks. A second spelling of it would let the plan and its proof disagree.
+pub fn cost_rank(file: &FileEntry) -> (usize, usize) {
+    relocated_rank(&file.path).unwrap_or_else(|| layer_rank(&file.layer))
+}
+
+/// The cost class of a file cargo placed in its artifact-directory layout, in
+/// the rank [`RESULT_LEAVES`] gives the layer it stands in for.
+///
+/// Read off the path rather than off a toolchain version: the same cache can
+/// hold both layouts, and each file is priced by where it actually is. The
+/// shape is `build/<package>/<metadata-hash>/<out|fingerprint>/...`; the older
+/// `build/<package>-<metadata-hash>/out/...` has one directory fewer and is
+/// build-script scratch, which is why the kind is read at the fourth component
+/// after `build` and not by searching for `out` anywhere below it.
+fn relocated_rank(path: &Path) -> Option<(usize, usize)> {
+    let parts: Vec<&std::ffi::OsStr> = path.iter().collect();
+    let build = parts
+        .iter()
+        .rposition(|part| part.to_str() == Some("build"))?;
+    let kind = parts.get(build + 3)?.to_str()?;
+    let leaf = RELOCATED_LEAVES
+        .iter()
+        .find(|(written, _)| *written == kind)?
+        .1;
+    let index = RESULT_LEAVES.iter().position(|known| *known == leaf)?;
+    Some((COMPILED_RESULT, index))
+}
+
 /// Where one name sits in the order, on its own.
 fn name_key(file: &FileEntry) -> ((usize, usize), &str, usize, Option<SystemTime>, &Path) {
     (
-        layer_rank(&file.layer),
+        cost_rank(file),
         file.layer.as_str(),
         artifact_rank(&file.path),
         file.modified,
@@ -267,10 +335,10 @@ fn name_key(file: &FileEntry) -> ((usize, usize), &str, usize, Option<SystemTime
     )
 }
 
-/// Whether either list has anything to say about this layer. Everything they do
+/// Whether either list has anything to say about this file. Everything they do
 /// not is what [`layer_rank`] answers with its last bucket.
-fn placed(layer: &str) -> bool {
-    layer_rank(layer).0 < UNPLACED
+fn placed(file: &FileEntry) -> bool {
+    cost_rank(file).0 < UNPLACED
 }
 
 /// What kind of file this is, in the order it is given up.
@@ -304,10 +372,10 @@ fn artifact_rank(path: &Path) -> usize {
 fn layer_rank(layer: &str) -> (usize, usize) {
     let leaf = layer.rsplit('/').next().unwrap_or(layer);
     if let Some(index) = DISCARDABLE_LEAVES.iter().position(|d| *d == leaf) {
-        return (0, index);
+        return (TIME_ONLY, index);
     }
     match RESULT_LEAVES.iter().position(|d| *d == leaf) {
-        Some(index) => (1, index),
+        Some(index) => (COMPILED_RESULT, index),
         None => (UNPLACED, 0),
     }
 }
@@ -766,5 +834,71 @@ mod tests {
         let plan = plan_reclaim(&files, 900, 0);
         assert!(plan.delete.is_empty(), "{plan:?}");
         assert_eq!(plan.unreachable_bytes, 900);
+    }
+
+    /// The layout cargo 1.100.0 writes is priced like the one it replaced.
+    ///
+    /// Both files below sit in the layer `debug/build` -- the walk records two
+    /// components and the new layout puts them there -- and the leaf alone
+    /// would call them build-script scratch and give them up before any
+    /// `deps` file. `cost_rank` reads the path instead, so the artifact is
+    /// priced where `deps` sits and its fingerprint where `.fingerprint` does.
+    #[test]
+    fn a_result_in_the_artifact_directory_layout_is_priced_where_deps_is() {
+        let artifact = entry(
+            "/c/target/debug/build/aardvark-lib/eccbb5d93e5494ea/out/libaardvark_lib.rlib",
+            "debug/build",
+            100,
+            0,
+        );
+        let fingerprint = entry(
+            "/c/target/debug/build/aardvark-lib/eccbb5d93e5494ea/fingerprint/lib-aardvark_lib",
+            "debug/build",
+            10,
+            0,
+        );
+        let deps = entry(
+            "/c/target/debug/deps/libaardvark_lib.rlib",
+            "debug/deps",
+            1,
+            0,
+        );
+        let record = entry(
+            "/c/target/debug/.fingerprint/lib-aardvark_lib",
+            "debug/.fingerprint",
+            1,
+            0,
+        );
+
+        assert_eq!(cost_rank(&artifact), cost_rank(&deps));
+        assert_eq!(cost_rank(&fingerprint), cost_rank(&record));
+        assert!(
+            cost_rank(&artifact) < cost_rank(&fingerprint),
+            "an artifact has to go before the record of how it was made"
+        );
+    }
+
+    /// The older `build/<package>-<hash>/` directory is still scratch: it is
+    /// one level shallower, so the kind at the fourth component is `out` only
+    /// under the new layout. Reading the layout by searching for `out`
+    /// anywhere below `build` would price a build script's output as a
+    /// compiled result and keep it past the results it could have paid for.
+    #[test]
+    fn a_build_script_directory_stays_in_the_layer_that_costs_time() {
+        let scratch = entry(
+            "/c/target/debug/build/libc-0.2.155-7df2bf28/out/build_script_main",
+            "debug/build",
+            100,
+            0,
+        );
+        assert_eq!(cost_rank(&scratch).0, 0, "{:?}", cost_rank(&scratch));
+
+        let nested = entry(
+            "/c/target/debug/build/libc-0.2.155-7df2bf28/out/sub/build_script_main",
+            "debug/build",
+            100,
+            0,
+        );
+        assert_eq!(cost_rank(&nested).0, 0, "{:?}", cost_rank(&nested));
     }
 }

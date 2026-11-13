@@ -325,10 +325,7 @@ pub fn is_self_pr(
             return true;
         }
     }
-    if meta_bot.is_none() && own_logins.iter().any(|n| !n.is_empty() && pr.author == *n) {
-        return true;
-    }
-    false
+    meta_bot.is_none() && own_logins.iter().any(|n| !n.is_empty() && pr.author == *n)
 }
 
 /// Machine-detectable signature embedded in a verdict comment, also used by

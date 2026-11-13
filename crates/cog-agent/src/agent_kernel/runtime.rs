@@ -390,6 +390,15 @@ pub struct AgentRuntime {
     /// missing gateway is the difference between a per-task reading and none,
     /// so its absence is reported rather than assumed.
     observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    /// Where the attempt's own start is recorded: whether it continued from the
+    /// journal and how many calls the kill left without a result.
+    ///
+    /// Optional like the other injected handles, and for the same reason: a
+    /// loop with no backend still resumes, it just cannot say afterwards that
+    /// it did. The handle is separate from `observability` above because the
+    /// two answer different questions — that one is where a finished run's
+    /// token census goes, this one is the series a scrape reads.
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     /// Where an oversized tool output is written back so its tail stays
     /// reachable by reference. Optional like the other injected handles — the
     /// run completes without it — but its absence is not the same as a result
@@ -1147,6 +1156,7 @@ impl AgentRuntime {
             available_skills_cache: None,
             skills_cache_instant: None,
             observability: None,
+            metrics: None,
             tool_output_archive: None,
             permission: None,
             permission_mode: crate::permission::PermissionMode::Bypass,
@@ -1227,6 +1237,12 @@ impl AgentRuntime {
     /// Hand the loop the gateway its per-task token census is written to.
     pub fn with_observability(mut self, gateway: Arc<dyn cog_core::ObservabilityGateway>) -> Self {
         self.observability = Some(gateway);
+        self
+    }
+
+    /// Hand the loop the series a resumed attempt reports itself on.
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -2413,8 +2429,13 @@ impl AgentRuntime {
             }
         };
         let Some(plan) = crate::agent_kernel::resume::plan(&entries) else {
+            // 日志在、但没有可续的一段：这次尝试从头花一轮。它与「续上了」
+            // 是同一个计数器的两格，缺了这一格，续跑的次数就没有分母。
+            self.record_attempt_start(crate::ATTEMPT_FRESH).await;
             return;
         };
+        self.record_attempt_start(crate::ATTEMPT_RESUMED).await;
+        self.record_unresolved_calls(&plan.doubts).await;
         // 上下文里原本可能还留着上一轮的投影（同一个进程里同一件任务被再派
         // 一次）。日志是耐久的那一份，重建成它，两条路径就只有一份历史。
         self.context.clear();
@@ -2432,6 +2453,65 @@ impl AgentRuntime {
             "resuming an interrupted attempt from its journal"
         );
         self.resolve_doubts(&plan.doubts).await;
+    }
+
+    /// 记一次尝试怎么开头的：续上了，还是从空日志开始。
+    ///
+    /// 写失败只打一行日志。这次尝试已经跑起来了，读数写不进去不该改变它。
+    async fn record_attempt_start(&self, outcome: &'static str) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::ATTEMPT_RESUME_TOTAL, 1.0, labels)
+            .await
+        {
+            tracing::warn!(error = %e, "could not record how this attempt started");
+        }
+    }
+
+    /// 记下这次续跑在日志里找到几个没有结果的调用，按副作用等级分。
+    ///
+    /// 这是「至多丢一步」这句话的可测形式：零意味着那次杀掉落在回合边界上，
+    /// 每一条计数则点名一个结果不可知的动作。按等级分是因为续跑对三种等级的
+    /// 处置不同，而读者要分辨的正是「这次滚动没有代价」与「这次滚动花掉了一个
+    /// 外部效果」。
+    async fn record_unresolved_calls(&self, doubts: &[crate::agent_kernel::resume::Doubt]) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut counts = [
+            (crate::LABEL_EFFECT_READ, 0usize),
+            (crate::LABEL_EFFECT_WRITE, 0),
+            (crate::LABEL_EFFECT_EXTERNAL, 0),
+        ];
+        for doubt in doubts {
+            let index = match cog_core::attempt_journal::effect_of(&doubt.tool) {
+                cog_core::attempt_journal::EffectClass::Read => 0,
+                cog_core::attempt_journal::EffectClass::Write => 1,
+                cog_core::attempt_journal::EffectClass::Effect => 2,
+            };
+            counts[index].1 += 1;
+        }
+        for (effect, count) in counts {
+            if count == 0 {
+                continue;
+            }
+            let mut labels = std::collections::HashMap::new();
+            labels.insert(crate::LABEL_EFFECT.to_string(), effect.to_string());
+            if let Err(e) = metrics
+                .record_counter(
+                    cog_core::metric_names::ATTEMPT_UNRESOLVED_CALLS_TOTAL,
+                    count as f64,
+                    labels,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, effect, "could not record an unresolved tool call");
+            }
+        }
     }
 
     /// 处置没有结果的工具调用。每个都一定会产生一条结果：一个带调用却缺结果的
@@ -8949,5 +9029,112 @@ mod tests {
                 "批准之后这一轮要换成 default：写工具仍然问人，但不是被 plan 直接拒"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attempt_readings_tests {
+    //! 一次尝试怎么开头、日志里留下几个没结果的调用，各自是读得出来的一格。
+    //!
+    //! 「至多丢一步」这句话在读数面上就是这两条计数：续上的与从头开始的互为分母，
+    //! 未决调用按副作用等级分开，因为续跑对三类的处置不同，而读者要分辨的正是
+    //! 「这次滚动没有代价」与「这次滚动花掉了一个外部效果」。
+    //!
+    //! 这里判的是写入的形状（序列、标签、数值），不判续跑本身——那由
+    //! `crates/cogneva/tests/attempt_resume_test.rs` 在真日志上判。
+
+    use super::*;
+    use crate::agent_kernel::resume::Doubt;
+    use crate::recording_metrics::RecordingMetrics;
+    use cog_core::attempt_journal::EffectClass;
+
+    fn runtime_with(spy: Arc<RecordingMetrics>) -> AgentRuntime {
+        let (tx, _rx) = mpsc::channel(1);
+        AgentRuntime::new(RuntimeConfig::default(), tx).with_metrics(spy)
+    }
+
+    fn doubt(tool: &str) -> Doubt {
+        Doubt {
+            call_id: "c1".into(),
+            tool: tool.to_string(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_attempt_is_counted_beside_the_fresh_ones() {
+        let spy = Arc::new(RecordingMetrics::default());
+        let runtime = runtime_with(spy.clone());
+        runtime.record_attempt_start(crate::ATTEMPT_RESUMED).await;
+        runtime.record_attempt_start(crate::ATTEMPT_FRESH).await;
+        let rows = spy.rows_for(cog_core::metric_names::ATTEMPT_RESUME_TOTAL);
+        assert_eq!(rows.len(), 2, "one increment per attempt: {rows:?}");
+        let outcomes: Vec<&str> = rows
+            .iter()
+            .map(|(_, labels, _)| {
+                labels
+                    .get(crate::LABEL_OUTCOME)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            })
+            .collect();
+        assert!(
+            outcomes.contains(&crate::ATTEMPT_RESUMED) && outcomes.contains(&crate::ATTEMPT_FRESH),
+            "both endings must land on the same series, told apart by outcome: {outcomes:?}"
+        );
+        for (_, _, value) in &rows {
+            assert_eq!(*value, 1.0, "each attempt is one event");
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_calls_are_counted_by_the_class_the_resume_decides_them_by() {
+        let spy = Arc::new(RecordingMetrics::default());
+        let runtime = runtime_with(spy.clone());
+        runtime
+            .record_unresolved_calls(&[doubt("read_file"), doubt("write_file"), doubt("bash")])
+            .await;
+        let rows = spy.rows_for(cog_core::metric_names::ATTEMPT_UNRESOLVED_CALLS_TOTAL);
+        let by_effect: std::collections::HashMap<&str, f64> = rows
+            .iter()
+            .map(|(_, labels, value)| {
+                (
+                    labels
+                        .get(crate::LABEL_EFFECT)
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    *value,
+                )
+            })
+            .collect();
+        assert_eq!(by_effect.get(crate::LABEL_EFFECT_READ), Some(&1.0));
+        assert_eq!(by_effect.get(crate::LABEL_EFFECT_WRITE), Some(&1.0));
+        // 名单里没有的工具按最坏情况处置，所以 `bash` 落在「有外部效果」那一格。
+        assert_eq!(by_effect.get(crate::LABEL_EFFECT_EXTERNAL), Some(&1.0));
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_found_no_doubts_writes_nothing_rather_than_three_zeros() {
+        // 零格不写：这一族只记「发生过」。清白的续跑由「续上的次数」那条计数说，
+        // 在这里补三行 0 只会让每次滚动多三行没人读的样点。
+        let spy = Arc::new(RecordingMetrics::default());
+        runtime_with(spy.clone()).record_unresolved_calls(&[]).await;
+        assert!(spy
+            .rows_for(cog_core::metric_names::ATTEMPT_UNRESOLVED_CALLS_TOTAL)
+            .is_empty());
+    }
+
+    #[test]
+    fn the_journal_classes_map_onto_three_labels() {
+        // 闭集：标签取值只有这三个，新增一类必须同时改映射，否则会写成 "external"
+        // 之外的东西而被规则选不中。
+        assert_eq!(
+            match cog_core::attempt_journal::effect_of("read_file") {
+                EffectClass::Read => crate::LABEL_EFFECT_READ,
+                EffectClass::Write => crate::LABEL_EFFECT_WRITE,
+                EffectClass::Effect => crate::LABEL_EFFECT_EXTERNAL,
+            },
+            "read"
+        );
     }
 }

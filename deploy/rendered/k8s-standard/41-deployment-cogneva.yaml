@@ -49,7 +49,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: fc2b0648cb3c36b5ab954b1a02f1564228c18ae3813278c82c62235abb5c2bf7
+        checksum/config: a05112cd9945c4790b4682f93bc5d6d3348e197790d99b1317d084474a756f48
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -94,6 +94,8 @@ spec:
           env:
             - name: TZ
               value: "Asia/Shanghai"
+            - name: COGNEVA_SHUTDOWN_TIMEOUT_MS
+              value: "30000"
             # 槽目录只有一处设置。这个键在 cogneva-evolution-config 里，而本 Pod 的
             # envFrom 只取 cogneva-config——不在这里给一遍，两个 Pod 就各读各的默认值，
             # 定制过路径的部署上页面读的是一个空目录。
@@ -193,6 +195,15 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: smtp-password
+                  optional: true
+            # 面板推送的 Grafana 管理员口令：凭证不进清单也不进 values，只认这个
+            # Secret 键。缺省即不推送——Grafana 对集群内的匿名只读仍在，但推送要
+            # 管理员身份，没有口令就没有面板，而不是推一半。
+            - name: COGNEVA_GRAFANA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets-oob
+                  key: grafana-admin-password
                   optional: true
             # GitHub/Gitee API 与 git 传输走安全网关透传（凭证网关注入，本 Pod 零 token）。
             # 缺这三个 env 时 Provider 直连公网平台——集群仅网关在 egress 白名单内，直连必败。

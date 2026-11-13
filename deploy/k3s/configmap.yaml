@@ -109,6 +109,11 @@ data:
   # 读数面查询的 Prometheus，与 cogneva.json 的 infra_watch.prometheus_url 同指
   # 一台（chart 里来自 observability.infraWatch.prometheusUrl）。
   COGNEVA_PROMETHEUS_URL: "http://cog-observability-prometheus.monitoring:9090"
+  # 面板生成器推送的那一台（chart 里来自 observability.grafana.baseUrl）。空值＝
+  # 这个部署没有 Grafana，导出器不启动；不猜地址，猜错与「本来就没有面板」同形。
+  # 现在留空是**有意的**：手写的那份 06 清单还在，打开它会同时出现两套面板。
+  # 删清单与普查改判的那一笔把它填上，两件事必须同一次发生。
+  COGNEVA_GRAFANA_URL: ""
   # 集群内 registry 的两条访问端点（Pod 内 Service DNS / 节点 localhost:NodePort），
   # 与 chart 的 clusterRegistry.port / nodePort 同源。放共用 env 是因为晋级镜像的
   # 引用由主应用的拉取端产出，那边不挂 evolution-config。

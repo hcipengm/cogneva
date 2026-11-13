@@ -15,6 +15,34 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end -}}
 
 {{/*
+进程在 SIGTERM 之后等在飞的运行停在回合边界的时长。
+
+它不是一个独立的旋钮，而是 Pod 宽限期减去收尾余量：宽限期是 kubelet 会强制执行
+的那一个数，预算必须短于它，否则进程还在排空就被 SIGKILL——那一次排空只发生过在
+日志里，清单上读不出来。两个数分两处写时，改宽限期不会带着预算走，而这种不一致
+只能靠人记得同步（此前就是靠一条契约测试手抄着守）。这里从同一个叶子算出来，
+两个工作负载的字段与进程环境因此不可能分家。
+
+收尾余量不小于宽限期时渲染直接失败：那不是一个紧的预算，而是一个负的等待。
+*/}}
+{{- define "cogneva.drainBudgetMs" -}}
+{{- /* lit: 1000 fixed — a second is a thousand milliseconds: this converts the field kubelet reads (seconds) into the field the process reads (milliseconds), so it is the unit of the same field rather than a size anybody chose */}}
+{{- $grace := int .Values.shutdown.terminationGraceSeconds -}}
+{{- $margin := int .Values.shutdown.drainTeardownMarginMs -}}
+{{- $budget := sub (mul $grace 1000) $margin -}}
+{{- /* lit: 0 fixed — zero is where waiting stops existing, not a size: the comparison below refuses a margin that leaves the drain no time at all, so the number is the boundary of that definition */}}
+{{- if le $budget 0 -}}
+{{- fail (printf "shutdown.drainTeardownMarginMs (%d ms) does not fit inside terminationGraceSeconds (%d s): the drain would have no time at all" $margin $grace) -}}
+{{- end -}}
+{{- $budget -}}
+{{- end -}}
+
+{{- define "cogneva.drainBudgetEnv" -}}
+- name: COGNEVA_SHUTDOWN_TIMEOUT_MS
+  value: {{ include "cogneva.drainBudgetMs" . | quote }}
+{{- end -}}
+
+{{/*
 读配置的 Pod 模板带的指纹（checksum/config）。
 
 必须把两份配置模板一起哈希。`app-config.yaml` 渲染出卷里的 cogneva-json /

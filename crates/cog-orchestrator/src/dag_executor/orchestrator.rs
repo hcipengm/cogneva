@@ -4649,6 +4649,12 @@ impl cog_core::DagExecutor for DagExecutor {
         self.get_all_tasks().await
     }
 
+    /// 委托给同名固有方法（与相邻几格同一形状）：那里的判断分有存储与无存储，
+    /// 把读失败原样交回。控制面经 `Arc<dyn DagExecutor>` 拿到它是外部读的那条腿。
+    async fn all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        self.all_tasks_checked().await
+    }
+
     async fn get_venue_tasks(&self) -> Vec<Task> {
         self.get_venue_tasks().await
     }

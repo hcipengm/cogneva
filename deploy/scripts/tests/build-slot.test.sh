@@ -190,4 +190,12 @@ out="$(
 )" || fail "没设报告文件时应当照样跑完：${out}"
 printf '%s\n' "${out}" | grep -q 'held slot-' || fail "没设报告文件时终端那行照旧要有：${out}"
 
-echo "ok - 没有槽时退到本机的锁并说明；有槽时写持有者记录、被占时等待、等不到退 75、命令的退出码原样传出；等槽与干活分两个数落一份记录"
+# 名字前缀是库加的：`build_slot_run` 把它写成 `gate: <名字>`。调用点自己再写一次，
+# 槽文件与成本表里就是 `gate: gate: 容量登记表` —— 成本表按名字分行，同一格于是
+# 读成一个前缀不同的第二行，而「这一格等了多少」从此要按两个名字去加。
+# 静态扫一眼调用点，因为这一族错的形状只在这里出现：书的前缀对上调用点的前缀。
+if grep -n 'build_slot_run "gate:' "${repo}/deploy/scripts/check-before-push.sh" >/dev/null 2>&1; then
+    fail "调用点不要自己加 gate: 前缀，build_slot_run 已经加了：$(grep -n 'build_slot_run "gate:' "${repo}/deploy/scripts/check-before-push.sh" | tr '\n' ' ')"
+fi
+
+echo "ok - 没有槽时退到本机的锁并说明；有槽时写持有者记录、被占时等待、等不到退 75、命令的退出码原样传出；等槽与干活分两个数落一份记录；名字前缀只在库里加一次"

@@ -25,7 +25,6 @@ pub mod reading_cadence;
 pub mod retention;
 pub mod roles;
 pub mod secrets;
-pub mod self_scheduled_wake;
 pub mod sql;
 pub mod token_estimate;
 pub mod topology;
@@ -104,7 +103,6 @@ pub use secrets::{
     redact_json_secrets, redact_secrets, ChainedSecretProvider, EnvSecretProvider,
     FileSecretProvider, SecretProvider,
 };
-pub use self_scheduled_wake::{announce, is_self_scheduled, SELF_SCHEDULED_WAKE_MARKER};
 pub use token_estimate::estimate_tokens;
 pub use types::*;
 pub use vocabulary::fill_slots;

@@ -76,6 +76,22 @@ pub trait OrchestratorControl: Send + Sync {
     /// Return every task currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
 
+    /// Return every task currently in the graph, and report a read that failed.
+    ///
+    /// [`Self::get_all_tasks`] answers an empty list when the graph cannot be
+    /// read, so a reading fed by it prints "0 tasks" for a store that is down.
+    /// That is the one number a reader cannot question: zero work and an
+    /// unreadable graph are different situations, and the surface built on
+    /// this one shows the second as `unread`.
+    ///
+    /// The default folds [`Self::get_all_tasks`], which is honest for an
+    /// orchestrator holding its tasks in memory -- it has no store to fail at.
+    /// An orchestrator backed by one has to override this; until it does, the
+    /// fold is the same silent zero as before.
+    async fn get_all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_all_tasks().await)
+    }
+
     /// Return the tasks that carry a venue label, and only those.
     ///
     /// The venue board answers three numbers per venue by folding
@@ -393,6 +409,17 @@ pub trait DagExecutor: Send + Sync {
 
     /// All tasks currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
+
+    /// All tasks currently in the graph, with a read that failed reported as
+    /// such. The reason is [`OrchestratorControl::get_all_tasks_checked`]'s:
+    /// [`Self::get_all_tasks`] answers an empty graph when the store is down,
+    /// and a reading built on it prints "0 tasks" -- the one number a reader
+    /// cannot question. The default folds `get_all_tasks`, which is honest for
+    /// an executor holding its graph in memory; one backed by a store has to
+    /// override this, and until it does the fold is the same silent zero.
+    async fn all_tasks_checked(&self) -> SFResult<Vec<Task>> {
+        Ok(self.get_all_tasks().await)
+    }
 
     /// The tasks that carry a venue label, and only those.
     ///
