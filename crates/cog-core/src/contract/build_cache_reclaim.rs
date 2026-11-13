@@ -129,10 +129,12 @@ pub const FLOOR_FILES_PER_LAYER: usize = 1;
 
 /// The bucket of files whose loss costs only time -- the layers in
 /// [`DISCARDABLE_LEAVES`].
+// cap: fixed — 桶的编号不是可调的量：它只用来排序，两种代价谁在前由代价本身决定
 pub const TIME_ONLY: usize = 0;
 
 /// The bucket of files a later build reads -- the layers in [`RESULT_LEAVES`],
 /// and the layout shapes that stand in for them in [`RELOCATED_LEAVES`].
+// cap: fixed — 同上：编号是排序用的枚举值，不是界；改它只会让这一种代价排到前面去
 pub const COMPILED_RESULT: usize = 1;
 
 /// The rank of a layer neither list places, which is the last of them.
