@@ -34,6 +34,8 @@ export interface PermissionAskWire {
   tool?: string;
   summary?: string;
   mode?: string;
+  /** 待批准的计划正文，只有 plan 模式那一问带它。 */
+  plan?: string;
 }
 
 export interface WebSocketOptions {

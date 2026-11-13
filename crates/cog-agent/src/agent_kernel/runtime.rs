@@ -2918,6 +2918,15 @@ impl AgentRuntime {
                     continue;
                 }
 
+                // 人在 plan 模式下批准了这份计划：从这一格起这一轮换成 default。
+                // 换的是模式本身而不是给这个工具开一个例外——批准的意思正是「接下来
+                // 可以动手了」，只放行这一个名字会让模型在下一步照样被拒。
+                if self.permission_mode == crate::permission::PermissionMode::Plan
+                    && tc.name == crate::permission::EXIT_PLAN_TOOL
+                {
+                    self.permission_mode = crate::permission::PermissionMode::Default;
+                }
+
                 self.state = RuntimeState::Acting;
                 let scope = run_task_id.map(|tid| crate::tools::ToolScope {
                     task_id: tid.to_string(),
@@ -8580,5 +8589,172 @@ mod tests {
             seen.contains("permission"),
             "这一条结果要自报是「没被允许」，与一次执行失败分得开: {seen}"
         );
+    }
+
+    /// 计划模式：人批准了计划之后，**同一个回合**就该动手。
+    ///
+    /// 批准之后再开一轮执行，等于把「批准」变成一句被记下来却没生效的话；而只给
+    /// 这一个工具开例外、不换模式，会让人点完头仍然撞在下一道只读墙上。
+    #[tokio::test]
+    async fn a_plan_the_person_approves_lets_the_same_turn_act() {
+        // 计划模式里，人批准了计划之后这一轮就该动手：写工具在「批准之后」才跑，
+        // 而且在同一个回合里跑——重新开一轮再执行，等于把「批准」变成一句被记下来
+        // 却没生效的话。
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            struct ApprovingAsks {
+                asks: std::sync::Mutex<Vec<(String, String)>>,
+            }
+            #[async_trait::async_trait]
+            impl crate::permission::PermissionDecider for ApprovingAsks {
+                async fn decide(
+                    &self,
+                    ask: &crate::permission::PermissionAsk,
+                ) -> crate::permission::PermissionVerdict {
+                    self.asks
+                        .lock()
+                        .unwrap()
+                        .push((ask.tool.clone(), ask.mode.as_str().to_string()));
+                    crate::permission::PermissionVerdict::Allow
+                }
+            }
+
+            /// 先递计划，再写文件，最后交一句话。
+            struct PlansThenWrites {
+                calls: AtomicUsize,
+            }
+            #[async_trait::async_trait]
+            impl cog_core::LlmClient for PlansThenWrites {
+                async fn chat_stream(
+                    &self,
+                    _messages: &[Message],
+                    _options: &cog_core::ChatOptions,
+                ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                    let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+                    let (stream, producer) = cog_core::EventStream::with_capacity(4);
+                    tokio::spawn(async move {
+                        let mut producer = producer;
+                        let mut content = vec![ContentBlock::Text {
+                            text: format!("第 {turn} 轮"),
+                            text_signature: None,
+                        }];
+                        if turn == 0 {
+                            content.push(ContentBlock::tool_call(
+                                "call-plan",
+                                crate::permission::EXIT_PLAN_TOOL,
+                                serde_json::json!({"plan": "先改 a.txt，再跑一遍测试"}),
+                            ));
+                        }
+                        if turn == 1 {
+                            content.push(ContentBlock::tool_call(
+                                "call-write",
+                                "write_file",
+                                serde_json::json!({"path": "a.txt", "content": "x"}),
+                            ));
+                        }
+                        producer.end(cog_core::ChatResponse {
+                            content,
+                            api: "mock".into(),
+                            provider: "mock".into(),
+                            model: "mock".into(),
+                            response_id: None,
+                            usage: cog_core::Usage::default(),
+                            stop_reason: cog_core::StopReason::Stop,
+                            error_message: None,
+                            upstream_failure: None,
+                            retry_after_secs: None,
+                            timestamp: chrono::Utc::now(),
+                        });
+                    });
+                    Ok(stream)
+                }
+
+                async fn complete_stream(
+                    &self,
+                    _prompt: &str,
+                    _options: &cog_core::CompleteOptions,
+                ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                    unimplemented!()
+                }
+
+                async fn chat(
+                    &self,
+                    _messages: &[Message],
+                    _options: &cog_core::ChatOptions,
+                ) -> SFResult<cog_core::ChatResponse> {
+                    unimplemented!()
+                }
+
+                async fn health_check(&self) -> bool {
+                    true
+                }
+            }
+
+            let ran = Arc::new(AtomicUsize::new(0));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, crate::tools::builtins::exit_plan_mode());
+            {
+                let ran = Arc::clone(&ran);
+                cog_core::ToolRegistry::register(
+                    &registry,
+                    cog_core::Tool {
+                        name: "write_file".into(),
+                        description: "writes a file".into(),
+                        parameters: serde_json::json!({"type": "object"}),
+                        implementation: cog_core::ToolImplementation::Native(Arc::new(
+                            move |_args| {
+                                let ran = Arc::clone(&ran);
+                                Box::pin(async move {
+                                    ran.fetch_add(1, Ordering::SeqCst);
+                                    Ok(serde_json::json!({ "written": true }))
+                                })
+                            },
+                        )),
+                    },
+                );
+            }
+
+            let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let config = RuntimeConfig {
+                agent_id: "plans-first".into(),
+                role: "plans-first-test".into(),
+                max_iterations: 6,
+                ..Default::default()
+            };
+            let decider = Arc::new(ApprovingAsks {
+                asks: std::sync::Mutex::new(Vec::new()),
+            });
+            let mut runtime = AgentRuntime::new(config, tx)
+                .with_tools(registry)
+                .with_permissions(
+                    Some(Arc::clone(&decider) as Arc<dyn crate::permission::PermissionDecider>),
+                    crate::permission::PermissionMode::Plan,
+                );
+            let llm = PlansThenWrites {
+                calls: AtomicUsize::new(0),
+            };
+
+            runtime
+                .run(serde_json::json!({"task": "先出计划"}), &llm)
+                .await
+                .expect("批准计划之后这一轮该跑完");
+
+            assert_eq!(
+                ran.load(Ordering::SeqCst),
+                1,
+                "批准之后写工具没有跑：这一轮还停在只读上"
+            );
+            let asks = decider.asks.lock().unwrap().clone();
+            assert_eq!(
+                asks,
+                vec![
+                    (crate::permission::EXIT_PLAN_TOOL.to_string(), "plan".into()),
+                    ("write_file".to_string(), "default".into()),
+                ],
+                "批准之后这一轮要换成 default：写工具仍然问人，但不是被 plan 直接拒"
+            );
+        }
     }
 }

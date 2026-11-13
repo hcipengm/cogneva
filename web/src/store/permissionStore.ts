@@ -17,6 +17,11 @@ export interface PermissionAsk {
   summary: string;
   /** 这一问发生在哪一格模式下。 */
   mode: string;
+  /**
+   * 待批准的计划正文。这一格有东西时，这一问是「这份计划做不做」，不是「这一步
+   * 动不动」——两者的按钮与后果都不同，界面上要分开画。
+   */
+  plan?: string;
 }
 
 /**

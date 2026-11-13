@@ -112,6 +112,11 @@ pub struct PermissionAskView {
     /// 一模一样的「write_file」。
     pub summary: String,
     pub mode: String,
+    /// 待批准的计划正文。只有「把计划递出去」那一问带它，别的询问是 `None`。
+    ///
+    /// 不并进 `summary`：摘要有自己的界（一行字、读一眼就够），而计划是要人读完
+    /// 再点头的东西——截到一百来个字符，批准就变成了闭眼点。
+    pub plan: Option<String>,
 }
 
 /// 人给回来的答案。拒绝要带理由，理由要交回模型。
@@ -270,6 +275,7 @@ impl PermissionBridge for SocketPermissionBridge {
                 tool: view.tool.clone(),
                 summary: view.summary.clone(),
                 mode: view.mode.clone(),
+                plan: view.plan.clone(),
             },
         ) else {
             self.channel.forget(&view.request_id);
@@ -1121,6 +1127,7 @@ mod tests {
             tool: "write_file".into(),
             summary: "path=a.txt".into(),
             mode: "default".into(),
+            plan: None,
         };
         let waiter = tokio::spawn(async move { bridge.ask(ask).await });
 
@@ -1156,6 +1163,7 @@ mod tests {
             tool: "run_command".into(),
             summary: "command=cargo test".into(),
             mode: "default".into(),
+            plan: None,
         };
         let waiter = tokio::spawn(async move { bridge.ask(ask).await });
         let _ = out_rx.recv().await.expect("问句必须出门");

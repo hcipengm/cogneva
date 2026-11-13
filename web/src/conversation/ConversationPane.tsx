@@ -806,12 +806,62 @@ export function ConversationPane({
               style={{ borderColor: 'var(--line-strong)' }}
             >
               <div className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
-                要动手：{ask.tool}（{ask.mode} 模式）
+                {ask.plan ? '计划待批准' : `要动手：${ask.tool}`}（{ask.mode} 模式）
               </div>
-              <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-[12px] text-[var(--paper)]">
-                {ask.summary}
-              </pre>
+              {/*
+                计划正文不截：这一份要在点「批准并执行」之前被读完，截到几行就等于
+                让人闭眼点头。摘要那种一行字只在「要动手」时出现。
+              */}
+              {ask.plan ? (
+                <div
+                  className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words border-l-2 pl-2 text-[12px] text-[var(--paper)]"
+                  style={{ borderColor: 'var(--line-strong)' }}
+                >
+                  {ask.plan}
+                </div>
+              ) : (
+                <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-[12px] text-[var(--paper)]">
+                  {ask.summary}
+                </pre>
+              )}
               <div className="mt-2 flex gap-3">
+                {/*
+                  计划只有两个答案：批准，或者让它继续改。批准不是「允许这一次」——
+                  它换的是这一轮的模式，之后每一步动手照旧按模式与规则问人。
+                */}
+                {ask.plan ? (
+                  <>
+                    <Note
+                      as="button"
+                      type="button"
+                      onClick={() => answerPermission(ask, true)}
+                      className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                      style={{ color: 'var(--brass)' }}
+                      text="批准这份计划：这一轮从此按 default 模式执行，要动手的每一步仍然按模式与规则问你"
+                    >
+                      批准并执行
+                    </Note>
+                    <Note
+                      as="button"
+                      type="button"
+                      onClick={() => {
+                        clientRef.current?.send({
+                          type: 'permission_response',
+                          request_id: ask.id,
+                          allow: false,
+                          reason: '计划没有批准：继续只读调研，把计划改好再来请我批准。',
+                        });
+                        usePermissionStore.getState().answered(ask.id);
+                      }}
+                      className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                      style={{ color: 'var(--muted)' }}
+                      text="不执行这份计划；模型会收到这句话，继续在只读模式下改计划"
+                    >
+                      继续改
+                    </Note>
+                  </>
+                ) : (
+                  <>
                 <Note
                   as="button"
                   type="button"
@@ -852,6 +902,8 @@ export function ConversationPane({
                 >
                   总是拒绝
                 </Note>
+                  </>
+                )}
               </div>
             </div>
           ))}

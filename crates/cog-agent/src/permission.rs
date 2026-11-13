@@ -114,11 +114,31 @@ pub fn is_edit(tool: &str) -> bool {
     EDIT_TOOLS.contains(&tool)
 }
 
+/// 计划模式下唯一一件「不是只读、却要交给人」的事：把计划递出去请人批准。
+///
+/// 它不是工具里的另一样东西，而是模式的一扇门：plan 模式里所有写工具都被直接拒绝，
+/// 模型想动手只有这一条路——把计划写下来，等坐在屏幕前的人点头。名字在这一层定义，
+/// 因为「谁能决定这一格要不要问人」正是在这一层回答的。
+pub const EXIT_PLAN_TOOL: &str = "exit_plan_mode";
+
 /// 不用问就能定的结论；`None` 表示这一问要交给人。
 ///
 /// 四个模式各有一条独立的路，而不是「默认放行、例外再拦」：后者每加一个模式都要
 /// 回头检查前一个模式漏了什么。
 pub fn decided_without_asking(mode: PermissionMode, tool: &str) -> Option<PermissionVerdict> {
+    // 批准计划这一问只有 plan 模式下才有意义：别的模式里没有一张待批的计划，
+    // 放它过去就等于让人「批准」一件没发生过的事。
+    if tool == EXIT_PLAN_TOOL {
+        return match mode {
+            PermissionMode::Plan => None,
+            other => Some(PermissionVerdict::Deny {
+                reason: format!(
+                    "现在不在 plan 模式（{}），没有一张待批准的计划；要动手直接调工具即可。",
+                    other.as_str()
+                ),
+            }),
+        };
+    }
     match mode {
         PermissionMode::Bypass => Some(PermissionVerdict::Allow),
         PermissionMode::Plan => Some(if is_read_only(tool) {
@@ -381,6 +401,36 @@ mod tests {
             decided_without_asking(PermissionMode::Plan, "read_file"),
             Some(PermissionVerdict::Allow)
         );
+    }
+
+    /// 计划模式里唯一被交给人问的一句，就是「批准这份计划吗」。
+    ///
+    /// 别的写工具在 plan 模式下连问都不问（直接拒绝），所以这一只必须是例外：
+    /// 不例外的话，模型在只读模式里连「请你批准」都说不出口，人想放行也无从放行。
+    #[test]
+    fn the_only_question_plan_mode_asks_is_whether_to_approve_the_plan() {
+        assert_eq!(
+            decided_without_asking(PermissionMode::Plan, EXIT_PLAN_TOOL),
+            None,
+            "批准计划这一问必须交给人"
+        );
+        assert!(matches!(
+            decided_without_asking(PermissionMode::Plan, "write_file"),
+            Some(PermissionVerdict::Deny { .. })
+        ));
+        // 别的模式里没有待批的计划：放它过去等于让人批准一件没发生过的事。
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Bypass,
+        ] {
+            match decided_without_asking(mode, EXIT_PLAN_TOOL) {
+                Some(PermissionVerdict::Deny { reason }) => {
+                    assert!(reason.contains("plan"), "{reason}")
+                }
+                other => panic!("{} 模式下不该放它过去：{other:?}", mode.as_str()),
+            }
+        }
     }
 
     /// 模式名是可读的一面：解析与打印必须互逆，拼错的名字不许落进默认。

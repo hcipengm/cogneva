@@ -502,6 +502,15 @@ impl cog_agent::permission::PermissionDecider for ConversationPermissions {
             tool: ask.tool.clone(),
             summary: permission_summary(&ask.arguments),
             mode: ask.mode.as_str().to_string(),
+            // 计划正文原样递出去：这是人要在点「批准」之前读完的那一份，不是摘要。
+            plan: (ask.tool == cog_agent::permission::EXIT_PLAN_TOOL)
+                .then(|| {
+                    ask.arguments
+                        .get("plan")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .flatten(),
         };
         match self.bridge.ask(view).await {
             cog_gateway::chat::PermissionAnswer::Allow { always } => {
@@ -660,8 +669,6 @@ impl ConversationTurn for PlatformConversation {
             // 看到的是「mira 的能力是 mira」，按能力找人的那一步什么也筛不出来。
             // 员工是通用智能体：它没有预设，有的只是这个进程给它的工具；具体
             // 做哪件活，由拿到的那句话决定。
-            let capabilities = tools.names();
-            let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
             // 动手之前先问人。通道来自这条连接（网页），模式来自这一段对话当前
             // 那一格；名字不认识时落到 `default`——比「不问」严、比「只读」松，
             // 一次手误不该让这一轮问得更少。没有通道的连接不是「不问」，而是
@@ -669,6 +676,13 @@ impl ConversationTurn for PlatformConversation {
             let permission_mode =
                 cog_agent::permission::PermissionMode::parse(&request.permission_mode)
                     .unwrap_or_default();
+            // plan 模式下多一只「把计划递出去请人批准」：它是这个模式的唯一出口，
+            // 而别的模式里没有待批的计划，挂上去只会让模型多试一次拿不到结果的调用。
+            if permission_mode == cog_agent::permission::PermissionMode::Plan {
+                tools.register(cog_agent::tools::builtins::exit_plan_mode());
+            }
+            let capabilities = tools.names();
+            let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
             let permission_session = request.session_id.clone();
             let decider: Option<Arc<dyn cog_agent::permission::PermissionDecider>> =
                 match request.permissions {

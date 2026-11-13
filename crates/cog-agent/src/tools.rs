@@ -4802,6 +4802,58 @@ pub mod builtins {
         BOOK.get_or_init(Default::default)
     }
 
+    /// 把一份计划递给人批准。只在 plan 模式下注册：别的模式里它没有可批准的东西，
+    /// 挂在工具表上只会让模型多试一次拿不到结果的调用。
+    ///
+    /// 工具本身不做事——它被调用就说明人已经点了头（问人那一步在循环里），这里只是
+    /// 把「批准了」这句话交回模型，并告诉它这一轮已经从只读换成了动手。
+    pub fn exit_plan_mode() -> Tool {
+        Tool {
+            name: crate::permission::EXIT_PLAN_TOOL.into(),
+            description: "Hand the plan to the person for approval and, once they approve, \
+                          carry it out. Call this with the plan you would execute, in plain \
+                          prose: what you will change, in which files, and how you will know \
+                          it worked. It does nothing by itself -- while the plan is unapproved \
+                          every tool that writes or runs anything is refused, so this is the \
+                          only way forward. If the person answers with a reason instead, treat \
+                          it as more research to do and call this again when the plan is better."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "string",
+                        "description": "The plan, in the person's language, as the steps you \
+                                        will take and the check that will show they worked."
+                    }
+                },
+                "required": ["plan"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(|args| {
+                Box::pin(async move {
+                    let plan = args["plan"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|plan| !plan.is_empty())
+                        .ok_or_else(|| {
+                            SFError::Validation(
+                                "plan required: the person is asked to approve what you write here"
+                                    .into(),
+                            )
+                        })?;
+                    Ok(serde_json::json!({
+                        "approved": true,
+                        "mode": "default",
+                        "note": "The person approved this plan. This turn may now change \
+                                 things; tools that do so still ask unless they are already \
+                                 covered by a rule.",
+                        "plan": plan,
+                    }))
+                })
+            })),
+        }
+    }
+
     pub fn todo() -> Tool {
         Tool {
             name: "todo".into(),

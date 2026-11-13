@@ -169,6 +169,9 @@ pub enum ServerMessage {
         tool: String,
         summary: String,
         mode: String,
+        /// 待批准的计划正文，只有 plan 模式的那一问带它。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
     },
     /// 一段对话上留下来的规则：人点过「总是」的那些，带各自的撤销号。
     ///

@@ -413,6 +413,8 @@ mod page_component_nodes_are_components_the_gateway_reports_test;
 mod page_status_words_are_words_the_status_writes_test;
 #[path = "permission_rules_are_remembered_test.rs"]
 mod permission_rules_are_remembered_test;
+#[path = "plan_is_approved_before_anything_changes_test.rs"]
+mod plan_is_approved_before_anything_changes_test;
 #[path = "plugin_init_dependencies.rs"]
 mod plugin_init_dependencies;
 #[path = "popup_handshake_words_are_the_words_the_other_page_sends_test.rs"]
