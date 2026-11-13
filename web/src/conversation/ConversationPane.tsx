@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch';
+import { TodoPanel, todoListsIn } from '@/conversation/TodoPanel';
 import type { StreamClient } from '@/hooks/useEventStream';
 import { sessionKind, useChatStore, type ChatMessage, type ChatSession } from '@/store/chatStore';
 import { useStreamStore, type ToolCallRecord } from '@/store/streamStore';
@@ -411,6 +412,14 @@ export function ConversationPane({
     }
     return out;
   }, [agentMessages, goalLive, session?.goals]);
+  /**
+   * 这一段手上那张待办单，按写者分开，一位一张。
+   *
+   * 模型每一步都把整张单子重写一遍，所以多次 `todo` 调用是同一张单子的几个版本。
+   * 折成一块面板之后，下面时间线里那些调用本身不再各占一行——画五遍同一份清单，
+   * 读者还得自己找哪份最新。
+   */
+  const todoLists = useMemo(() => todoListsIn(tools), [tools]);
   /** 说与做并成一条时间线。时刻读不出来的排在最前——宁可前也不能藏。 */
   const timeline = useMemo(() => {
     type Item =
@@ -423,6 +432,9 @@ export function ConversationPane({
       message,
     }));
     for (const call of tools) {
+      // 待办不进时间线：它的现况画在下面那块面板里，一次调用一行原文只会重复。
+      // 认不出来的（没有结果、也没有可读入参）那一次仍然照常出现，见 TodoPanel。
+      if (call.name === 'todo') continue;
       items.push({ kind: 'tool' as const, at: Date.parse(call.startedAt), call });
     }
     for (const turn of agentTurns) {
@@ -728,6 +740,18 @@ export function ConversationPane({
           )}
         </div>
       </div>
+
+      {/*
+        这张单子贴在输入框上方，不跟着历史滚走：它回答的是「这件事走到哪了」，
+        是现况，不是某一次执行的记录。两位写者就两块，谁的活谁的单。
+      */}
+      {todoLists.length > 0 && (
+        <div className="shrink-0 px-4 pb-1">
+          {todoLists.map((list) => (
+            <TodoPanel key={list.agent ?? 'unattributed'} list={list} />
+          ))}
+        </div>
+      )}
 
       {rulesOpen && (
         <div className="shrink-0 px-4 pb-1">

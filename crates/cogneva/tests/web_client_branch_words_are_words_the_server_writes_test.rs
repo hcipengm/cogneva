@@ -145,6 +145,32 @@ const SERVER_WORDS: &[ServerWord] = &[
         server_file: "crates/cog-gateway/src/hook_forwarder.rs",
         server_needle: "status: \"hook_event\"",
     },
+    // 待办面板按一项的状态画符号与颜色。这三个词是 `todo` 这只工具回答里的
+    // `status`，由它在同一段答案里写出（每个词都在 `items[].status` 与计数那一行
+    // 上各写一次，针取带计数的那个，改名时两个地方一起改）。面板若把其中一个
+    // 拼错，那一项就落进 `marker` 的兜底分支——画成一个问号，看上去像服务端写
+    // 了一种没人认识的状态，而不是像客户端拼错了。
+    ServerWord {
+        field: "status",
+        word: "pending",
+        client_file: "web/src/conversation/TodoPanel.tsx",
+        server_file: "crates/cog-agent/src/tools.rs",
+        server_needle: "\"pending\": counts(\"pending\")",
+    },
+    ServerWord {
+        field: "status",
+        word: "in_progress",
+        client_file: "web/src/conversation/TodoPanel.tsx",
+        server_file: "crates/cog-agent/src/tools.rs",
+        server_needle: "\"in_progress\": counts(\"in_progress\")",
+    },
+    ServerWord {
+        field: "status",
+        word: "done",
+        client_file: "web/src/conversation/TodoPanel.tsx",
+        server_file: "crates/cog-agent/src/tools.rs",
+        server_needle: "\"done\": counts(\"done\")",
+    },
     ServerWord {
         field: "status",
         word: "slow_down",
@@ -199,6 +225,11 @@ const SERVER_WORDS: &[ServerWord] = &[
 /// a census of the panel's own words.
 const CLIENT_ONLY: &[(&str, &str, &str)] = &[
     ("status", "running", "工具调用的行内状态，面板自己写自己读"),
+    (
+        "status",
+        "ok",
+        "工具调用收尾后的行内状态：客户端按帧上的 `is_error` 自己折成 ok/error，服务端不发这两个字",
+    ),
     ("status", "sending", "对话气泡的发送状态，客户端自己写"),
     ("status", "streaming", "对话气泡的流式状态，客户端自己写"),
     ("status", "done", "对话气泡收尾后的状态，客户端自己写自己读"),

@@ -519,6 +519,8 @@ mod the_quota_cells_are_written_by_a_projection_test;
 mod the_repo_root_is_computed_in_one_place_test;
 #[path = "the_token_counters_are_a_projection_of_the_ledger_test.rs"]
 mod the_token_counters_are_a_projection_of_the_ledger_test;
+#[path = "todo_panel_shows_one_list_test.rs"]
+mod todo_panel_shows_one_list_test;
 #[path = "trace_header_names_contract_test.rs"]
 mod trace_header_names_contract_test;
 #[path = "treatment_is_decided_without_the_label_test.rs"]
