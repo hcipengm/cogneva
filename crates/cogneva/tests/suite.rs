@@ -165,6 +165,8 @@ mod app_config_substitutions_contract_test;
 mod assistant_event_tags_compared_are_tags_the_enum_writes_test;
 #[path = "atomic_replace_is_written_once_test.rs"]
 mod atomic_replace_is_written_once_test;
+#[path = "attachments_reach_the_model_test.rs"]
+mod attachments_reach_the_model_test;
 #[path = "attempt_resume_test.rs"]
 mod attempt_resume_test;
 #[path = "auth_error_codes_are_one_vocabulary_test.rs"]
@@ -225,6 +227,8 @@ mod collaboration_roundtable_test;
 mod collaboration_self_review_test;
 #[path = "complete_options_are_mapped_once_test.rs"]
 mod complete_options_are_mapped_once_test;
+#[path = "composer_takes_more_than_one_line_test.rs"]
+mod composer_takes_more_than_one_line_test;
 #[path = "config_declaration_delivery_test.rs"]
 mod config_declaration_delivery_test;
 #[path = "config_section_reader_contract_test.rs"]
@@ -361,6 +365,8 @@ mod memory_observability_gateway_test;
 mod memory_search_all_test;
 #[path = "memory_vector_backend_test.rs"]
 mod memory_vector_backend_test;
+#[path = "mentions_complete_paths_test.rs"]
+mod mentions_complete_paths_test;
 #[path = "message_backend_multi_instance_test.rs"]
 mod message_backend_multi_instance_test;
 #[path = "metric_help_reports_the_wait_the_code_does_test.rs"]

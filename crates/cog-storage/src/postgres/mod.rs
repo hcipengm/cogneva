@@ -42,8 +42,8 @@ pub use audit_recorder::PostgresAuditRecorder;
 pub use backup_run_store::PostgresBackupRunStore;
 pub use change_ledger_store::PostgresChangeLedgerStore;
 pub use chat_turn_store::{
-    ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore, PostgresChatTurnStore,
-    ROWS_KEPT_PER_SESSION,
+    ChatAttachment, ChatAttachmentInfo, ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore,
+    PostgresChatTurnStore, ROWS_KEPT_PER_SESSION,
 };
 pub use database_health::PgDatabaseHealth;
 pub use dataset_catalog::{

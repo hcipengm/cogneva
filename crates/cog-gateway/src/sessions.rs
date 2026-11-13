@@ -216,6 +216,11 @@ pub async fn list_messages_handler(
                         // 「这条是能关掉的问答，还是一条还在服务器上跑的目标」
                         // 只能从这一格读——实时流在页面关掉时就断了。
                         "goal_id": turn.goal,
+                        // 名字与类型，不带字节：重开页面要能把「这条话说过一张图」
+                        // 画出来，而那张图本身不在这一趟返回里——它随记录落库，
+                        // 由下一轮装进提示词。把 base64 也发给浏览器，是让每一次
+                        // 重开都把整段对话的附件重新下载一遍。
+                        "attachments": turn.attachments,
                         "created_at": turn.created_at,
                     })
                 })

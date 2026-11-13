@@ -172,9 +172,13 @@ fn the_loop_reads_the_reference_while_the_record_keeps_the_body() {
         chat.contains("emit_delta(&out, &session_id, &user_mid, &content)"),
         "{CHAT} 的回声不是原文：界面读回的不是用户说过的那段东西"
     );
+    let at = chat
+        .find("record_turn(\n                    &state.chat_turns,")
+        .unwrap_or_else(|| panic!("{CHAT} 里找不到写成功那一轮的那个调用"));
+    let call = &chat[at..(at + 260).min(chat.len())];
     assert!(
-        chat.contains("record_turn(&state.chat_turns, &session_id, &content, &reply)"),
-        "{CHAT} 的记录不是原文：刷新之后这条消息只剩开头"
+        call.contains("&content,") && call.contains("&attachments,") && call.contains("&reply,"),
+        "{CHAT} 的记录不是原文与随它的附件：刷新之后这条消息只剩开头：{call}"
     );
     assert!(
         chat.contains("estimate_tokens(&text) <= threshold_tokens"),

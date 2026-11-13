@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { getWorkspaceTree, type WorkspaceEntry } from '@/api/client';
 import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch';
 import { Markdown } from '@/conversation/Markdown';
 import { TodoPanel, todoListsIn } from '@/conversation/TodoPanel';
@@ -67,6 +68,56 @@ function usageLine(usage: TurnUsage): string {
 }
 
 /**
+ * 一条附件最多多大。
+ *
+ * override — 一帧的上限是 64 MiB（传输层），而附件在这条路上要以 base64 走，
+ * 体积先涨三分之一。留在这个量级是因为它下面装得下手机原图与常规 PDF；真需要
+ * 更大的东西，那一份该用 `read_file` 去读，而不是塞进一句话里。
+ */
+const MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024;
+
+/** 还没发出去、正随草稿走的附件。数据（base64）只活到这一句发出去为止。 */
+interface PendingAttachment {
+  name: string;
+  mimeType: string;
+  bytes: number;
+  data: string;
+}
+
+/** 字节数按人的读法写：一屏几十条里，`1.4 MB` 比 `1468006` 有用。 */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * 读一个文件成一个附件。类型取浏览器认出来的那个（`file.type`）；它认不出时退到
+ * 数据 URL 自己的 `data:` 前缀，最后才落到 `application/octet-stream`——猜成
+ * `image/png` 会让一张不是图的东西被当成图交给模型。
+ */
+function readAsAttachment(file: File): Promise<PendingAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(file.name));
+    reader.onload = () => {
+      const result = String(reader.result ?? '');
+      const comma = result.indexOf(',');
+      const fromUrl = result.startsWith('data:')
+        ? result.slice(5, result.indexOf(';'))
+        : '';
+      resolve({
+        name: file.name || '附件',
+        mimeType: file.type || fromUrl || 'application/octet-stream',
+        bytes: file.size,
+        data: comma >= 0 ? result.slice(comma + 1) : '',
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
  * 一条长消息画成附件时，正文先折起来的那条线（字符）。
  *
  * override — 屏幕上的折叠线，人按「一眼就知道这不是一句话」的量级挑的，不随窗口
@@ -74,6 +125,48 @@ function usageLine(usage: TurnUsage): string {
  * 服务端已经按它自己量出来的阈值把原文落成了文件。
  */
 const LONG_MESSAGE_CHARS = 2000;
+
+/**
+ * `@` 之后一份文件列表一次画几行。
+ *
+ * override — 一个下拉的高度。人是在一屏可见的名字里挑，不是在翻页；多出来的行
+ * 只会把输入框挤出屏幕。缩窄成「挑不到就继续打字」，下一层目录再按同一个数列。
+ */
+const MENTION_ROWS = 8;
+
+/**
+ * 光标前面那个还没说完的 `@` 名字。
+ *
+ * 只有「词的起头」才算：邮箱里的那个 `@`（前面紧贴一个字）不该弹出文件列表；
+ * 名字里带空白就是这句话已经说到下一词了，也不该再补。返回 `start` 是为了替换
+ * 时能把 `@` 连同打了一半的路径一起换掉，而不是只接在光标后面。
+ */
+export function mentionAt(
+  text: string,
+  caret: number
+): { start: number; dir: string; leaf: string } | null {
+  const head = text.slice(0, caret);
+  const at = head.lastIndexOf('@');
+  if (at < 0) return null;
+  if (at > 0 && !/\s/.test(head[at - 1])) return null;
+  const partial = head.slice(at + 1);
+  if (/\s/.test(partial)) return null;
+  const slash = partial.lastIndexOf('/');
+  return {
+    start: at,
+    dir: slash >= 0 ? partial.slice(0, slash + 1) : '',
+    leaf: slash >= 0 ? partial.slice(slash + 1) : partial,
+  };
+}
+
+/**
+ * 把一条路径接进草稿：目录补到 `/` 上继续往下打，文件补一个空格收尾。
+ *
+ * 收尾的空格不是好看——没有它，下一句会连在这条路径后面，成了一条不存在的路径。
+ */
+export function mentionedPath(entry: { path: string; dir: boolean }): string {
+  return `@${entry.path}${entry.dir ? '/' : ' '}`;
+}
 
 /**
  * 一条长消息：长度、原文落在哪，正文折起来。
@@ -171,6 +264,20 @@ function Turn({ message }: { message: ChatMessage }) {
         */
         <div style={{ color: message.role === 'user' ? 'var(--paper)' : 'var(--paper-dim)' }}>
           <Markdown text={message.text} streaming={streaming} />
+        </div>
+      )}
+
+      {/* 随这一句发上去的附件。它们不是正文的一部分，但少了这一行，事后没人
+          分得清「问了这么一句」与「问了这么一句、还带了一张图」。 */}
+      {message.files.length > 0 && (
+        <div className="mono mt-1 flex flex-wrap gap-2 text-[10px] text-[var(--muted)]">
+          {message.files.map((file, index) => (
+            <span key={`${file.name}-${index}`}>
+              〔{file.mimeType.split('/')[0]}〕{file.name}
+              {/* 读回的历史里没有字节数：这一条只写名字，不写一个零。 */}
+              {file.bytes !== null && <> · {formatBytes(file.bytes)}</>}
+            </span>
+          ))}
         </div>
       )}
 
@@ -413,6 +520,129 @@ export function ConversationPane({
   /** 把账上的某一行打开。这一面只知道身份，落到哪一行由账那一面决定。 */
   const focusRecord = useShell((s) => s.focusRecord);
   const [draft, setDraft] = useState('');
+  /** 草稿那一格。它要按内容长高，而长高只能问它自己滚出来的高度。 */
+  const draftRef = useRef<HTMLTextAreaElement | null>(null);
+  // 一行高固定住的话，第二行会藏进框里、光标跑到看不见的地方。每次改动先清成
+  // 自动再收到实际高度，删字时框要跟着缩回去，不能只长不缩。
+  useEffect(() => {
+    const el = draftRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, [draft]);
+  /** 正随草稿走的附件，以及认不出来的那一个为什么不进来。 */
+  const [pendingFiles, setPendingFiles] = useState<PendingAttachment[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  /**
+   * 正在补的那个 `@`：替换从哪儿开始、列的是哪一层的文件、挑到第几行。
+   *
+   * `null` 是「没有在补」。列表本身跟着目录走：同一层里继续打字只筛已有的那几
+   * 行，换一层才再问一次服务端——一个字一个请求，是把文件树当成输入法在用。
+   */
+  const [mention, setMention] = useState<{
+    query: { start: number; dir: string; leaf: string };
+    entries: WorkspaceEntry[];
+    index: number;
+    error: string | null;
+  } | null>(null);
+  const mentionDir = mention?.query.dir;
+
+  /**
+   * 把选来 / 贴进来的文件收成附件。
+   *
+   * 太大的那一个不进队列，也不再静默丢掉：一句「带不动」当场写在输入框上方，
+   * 而不是让用户以为它跟着消息走了。
+   */
+  const attach = useCallback(async (files: FileList | File[] | null) => {
+    if (!files || files.length === 0) return;
+    const accepted: PendingAttachment[] = [];
+    let error: string | null = null;
+    for (const file of Array.from(files)) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        error = `「${file.name}」有 ${formatBytes(file.size)}，一帧带不动：单个附件上限是 ${formatBytes(MAX_ATTACHMENT_BYTES)}`;
+        continue;
+      }
+      try {
+        accepted.push(await readAsAttachment(file));
+      } catch {
+        error = `「${file.name}」读不出来`;
+      }
+    }
+    if (accepted.length > 0) {
+      setPendingFiles((prev) => [...prev, ...accepted]);
+      setAttachError(null);
+    }
+    if (error) setAttachError(error);
+  }, []);
+
+  /**
+   * 列一层目录给 `@` 用。走的是项目源码面那棵树：和员工自己读的是同一份仓库。
+   *
+   * 读不到就把原因写在列表里，不画成「没有匹配的文件」——那个部署可能只是没挂
+   * 项目仓库，这时「没有文件」是一句假话，而用户会以为自己的路径打错了。
+   */
+  useEffect(() => {
+    if (mentionDir === undefined) return;
+    let live = true;
+    getWorkspaceTree(mentionDir.replace(/\/$/, ''), 'project')
+      .then((tree) => {
+        if (!live) return;
+        setMention((prev) =>
+          prev && prev.query.dir === mentionDir
+            ? { ...prev, entries: tree.entries, index: 0, error: null }
+            : prev
+        );
+      })
+      .catch((e: unknown) => {
+        if (!live) return;
+        setMention((prev) =>
+          prev && prev.query.dir === mentionDir
+            ? {
+                ...prev,
+                entries: [],
+                index: 0,
+                error: (e as { message?: string })?.message ?? '读不到文件列表',
+              }
+            : prev
+        );
+      });
+    return () => {
+      live = false;
+    };
+  }, [mentionDir]);
+
+  /** 把挑中的那一条接进草稿，光标放到它后面。 */
+  const acceptMention = useCallback(
+    (entry: WorkspaceEntry) => {
+      if (!mention) return;
+      const caret = draftRef.current?.selectionStart ?? draft.length;
+      const insert = mentionedPath(entry);
+      setDraft(
+        draft.slice(0, mention.query.start) + insert + draft.slice(caret)
+      );
+      setMention(null);
+      // 光标落在这条路径之后：接着往下打时，补全还能从这一层继续。
+      const at = mention.query.start + insert.length;
+      requestAnimationFrame(() => {
+        const el = draftRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(at, at);
+      });
+    },
+    [draft, mention]
+  );
+
+  /** 这一层里以打了一半的名字起头的那几行。目录与文件一起列：先打得进去，再挑内容。 */
+  const mentionCandidates = useMemo(() => {
+    if (!mention) return [];
+    const leaf = mention.query.leaf.toLowerCase();
+    return mention.entries
+      .filter((entry) => entry.name.toLowerCase().startsWith(leaf))
+      .slice(0, MENTION_ROWS);
+  }, [mention]);
+
   /**
    * 等着这一段答的「要不要动手」。
    *
@@ -551,11 +781,19 @@ export function ConversationPane({
 
   const send = useCallback(() => {
     const text = draft.trim();
-    if (!text) return;
+    // 带附件的一句可以没有正文：一张截图本身就是那半句话。两样都空才是没说话。
+    if (!text && pendingFiles.length === 0) return;
     setDraft('');
+    const files = pendingFiles;
+    setPendingFiles([]);
+    setAttachError(null);
     // 先入账，再出门。顺序反过来时，网络慢一拍、或者这个部署的回声路径断了，
     // 用户看到的就是「我说话了，但这里什么都没发生」。
-    appendUserTurn(sessionId, text);
+    appendUserTurn(
+      sessionId,
+      text,
+      files.map((file) => ({ name: file.name, mimeType: file.mimeType, bytes: file.bytes }))
+    );
     stickRef.current = true;
 
     const client = clientRef.current;
@@ -564,9 +802,19 @@ export function ConversationPane({
       client.setSession?.(sessionId);
       client.simulateUserMessage(text);
     } else {
-      client.send({ type: 'chat_message', session_id: sessionId, content: text });
+      client.send({
+        type: 'chat_message',
+        session_id: sessionId,
+        content: text,
+        // 线上形状按服务端那一边的名字写：`mime_type` 是那条协议的语言，不是这里的。
+        attachments: files.map((file) => ({
+          name: file.name,
+          mime_type: file.mimeType,
+          data: file.data,
+        })),
+      });
     }
-  }, [appendUserTurn, clientRef, draft, sessionId]);
+  }, [appendUserTurn, clientRef, draft, pendingFiles, sessionId]);
 
   /**
    * 停下这一段上正在跑的那一轮。
@@ -1026,25 +1274,176 @@ export function ConversationPane({
           读者会以为在填一格东西。这里是一句话的起头——一个提示符，一句还没说出口
           的话，右边是「怎么送出去」。分隔靠上方那一条发丝线，焦点在它上面时才亮。
         */}
+        {/* 正随这句走的附件：贴进来或选进来的那几张，发之前认得出、拿得掉。 */}
+        {pendingFiles.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 pb-1">
+            {pendingFiles.map((file, index) => (
+              <span
+                key={`${file.name}-${index}`}
+                className="mono flex items-center gap-2 border px-2 py-0.5 text-[10px]"
+                style={{ borderColor: 'var(--line)', color: 'var(--muted)' }}
+              >
+                {file.name} · {formatBytes(file.bytes)}
+                <button
+                  type="button"
+                  aria-label={`去掉 ${file.name}`}
+                  onClick={() => setPendingFiles((prev) => prev.filter((_, at) => at !== index))}
+                  className="transition-colors hover:text-[var(--paper)]"
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        {attachError && (
+          <div className="mono pb-1 text-[10px]" style={{ color: 'var(--danger)' }}>
+            {attachError}
+          </div>
+        )}
+        {/*
+          打 `@` 列出来的那一层文件。挑中的是一条路径，不是「这一句」——它接在
+          光标处，接着往下打时列表跟着下一层走。
+        */}
+        {mention && (
+          <div
+            className="mono mb-1 max-h-48 overflow-auto border text-[11px]"
+            style={{ borderColor: 'var(--line)' }}
+          >
+            {mention.error ? (
+              <div className="px-2 py-1 text-[10px]" style={{ color: 'var(--danger)' }}>
+                {mention.error}
+              </div>
+            ) : mentionCandidates.length === 0 ? (
+              <div className="px-2 py-1 text-[10px]" style={{ color: 'var(--muted)' }}>
+                这一层没有以「{mention.query.leaf}」起头的文件
+              </div>
+            ) : (
+              mentionCandidates.map((entry, index) => (
+                <button
+                  key={entry.path}
+                  type="button"
+                  // 按下时不许输入框失焦：失焦就先把这份列表收掉了，点空。
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    acceptMention(entry);
+                  }}
+                  onMouseEnter={() =>
+                    setMention((prev) => (prev ? { ...prev, index } : prev))
+                  }
+                  className="block w-full truncate px-2 py-0.5 text-left"
+                  style={{
+                    background: index === mention.index ? 'var(--line)' : 'transparent',
+                    color: 'var(--paper-dim)',
+                  }}
+                >
+                  {entry.path}
+                  {entry.dir ? '/' : ''}
+                </button>
+              ))
+            )}
+          </div>
+        )}
         <div
           className="flex items-stretch gap-2 border-t pt-2 transition-colors"
-          style={{ borderColor: draft ? 'var(--line-strong)' : 'var(--line)' }}
+          style={{ borderColor: draft || pendingFiles.length > 0 ? 'var(--line-strong)' : 'var(--line)' }}
         >
           <span className="mono flex items-center pl-0.5 text-[12px] text-[var(--brass)]">›</span>
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            aria-label="附上文件"
+            title="附一张图、一份 PDF 或一段音视频；也可以直接把它们贴进这一格"
+            className="mono shrink-0 px-1 text-[13px] transition-opacity hover:opacity-70"
+            style={{ color: 'var(--muted)' }}
+          >
+            ＋
+          </button>
           <input
-            type="text"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onFocus={onFocus}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept="image/*,application/pdf,audio/*,video/*"
+            className="hidden"
+            onChange={(e) => {
+              void attach(e.target.files);
+              // 清掉，同一份文件选第二次也要再进一次队列。
+              e.target.value = '';
             }}
-            placeholder="要它做什么…"
+          />
+          <textarea
+            ref={draftRef}
+            rows={1}
+            value={draft}
+            onChange={(e) => {
+              const value = e.target.value;
+              setDraft(value);
+              const caret = e.target.selectionStart ?? value.length;
+              const query = mentionAt(value, caret);
+              setMention((prev) => {
+                if (!query) return null;
+                // 同一层里继续打字：列表不重取，只换「以什么起头」。
+                if (prev && prev.query.dir === query.dir) {
+                  return { ...prev, query, index: 0 };
+                }
+                return { query, entries: [], index: 0, error: null };
+              });
+            }}
+            onFocus={onFocus}
+            onBlur={() => setMention(null)}
+            onPaste={(e) => {
+              // 截图直接贴进来：剪贴板里带文件时，文件才是这一次要说的东西。
+              const files = Array.from(e.clipboardData?.items ?? [])
+                .filter((item) => item.kind === 'file')
+                .map((item) => item.getAsFile())
+                .filter((file): file is File => Boolean(file));
+              if (files.length === 0) return;
+              e.preventDefault();
+              void attach(files);
+            }}
+            onKeyDown={(e) => {
+              // 文件列表开着时，上下键与回车/Tab 归列表：这一下挑的是一条路径，
+              // 不是把半句话发出去。Esc 收掉列表，回车回到「发出去」。
+              if (mention) {
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setMention(null);
+                  return;
+                }
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  const step = e.key === 'ArrowDown' ? 1 : -1;
+                  const size = Math.max(mentionCandidates.length, 1);
+                  setMention((prev) =>
+                    prev ? { ...prev, index: (prev.index + step + size) % size } : prev
+                  );
+                  return;
+                }
+                if (
+                  (e.key === 'Enter' || e.key === 'Tab') &&
+                  !e.nativeEvent.isComposing &&
+                  e.nativeEvent.keyCode !== 229
+                ) {
+                  const pick = mentionCandidates[mention.index] ?? mentionCandidates[0];
+                  if (pick) {
+                    e.preventDefault();
+                    acceptMention(pick);
+                    return;
+                  }
+                }
+              }
+              // 回车是「发出去」，Shift+Enter 是「换一行」——多行的一句话（贴一段
+              // 报错、写一份步骤）不该逼人先去别处拼好再贴进来。
+              if (e.key !== 'Enter' || e.shiftKey) return;
+              // 输入法正在选词时，回车是「确认这个词」。在这里发出去的话，一段中文
+              // 会在打到一半时被当作一句话送走，而且那一句缺了刚选的那个词。
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+              e.preventDefault();
+              send();
+            }}
+            placeholder="要它做什么…（Shift+Enter 换行）"
             aria-label="说一句话"
-            className="min-w-0 flex-1 bg-transparent px-0.5 py-1 text-[13px] text-[var(--paper)] outline-none placeholder:text-[var(--muted)]"
+            className="min-w-0 flex-1 resize-none bg-transparent px-0.5 py-1 text-[13px] leading-[1.6] text-[var(--paper)] outline-none placeholder:text-[var(--muted)]"
           />
           {streaming && (
             <Note
@@ -1061,7 +1460,7 @@ export function ConversationPane({
           <button
             type="button"
             onClick={send}
-            disabled={!draft.trim()}
+            disabled={!draft.trim() && pendingFiles.length === 0}
             className="mono px-2 text-[10px] transition-opacity disabled:cursor-not-allowed disabled:opacity-0"
             style={{ color: 'var(--brass)' }}
           >

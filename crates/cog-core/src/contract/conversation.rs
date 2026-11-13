@@ -47,12 +47,43 @@ impl ChatTurnRole {
     }
 }
 
+/// 一条随用户消息上来的附件（图片 / PDF / 音频 / 视频）。
+///
+/// 字节按 base64 存：它就是媒体块在上下文里的形状（`ContentBlock::Media`），
+/// 在这里解码只会多一份中间物，而解出来的字节下一步又要在协议边缘被编回去。
+///
+/// 它随那一行记录一起落库，因为「历史装配带上媒体」要求的正是这件事：重开一段
+/// 对话，后面几轮问的还是同一张图，那张图必须还在模型看得见的地方。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatAttachment {
+    /// 文件名，只用来让人认出这一条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 例如 `image/png`、`application/pdf`。
+    pub mime_type: String,
+    /// base64 编码的字节。
+    pub data: String,
+}
+
 /// One line of the transcript, oldest first when returned by
 /// [`ChatTurnStore::history`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatTurn {
     pub role: ChatTurnRole,
     pub content: String,
+    /// 随这一句上来的附件。assistant 那一行永远是空的：回答里的图是模型写的，
+    /// 不是人递进来的。
+    pub attachments: Vec<ChatAttachment>,
+}
+
+/// A transcript line as a reader reopens it, with the attachments' identity but
+/// not their bytes: the page names what was sent, and the bytes stay where the
+/// prompt reads them from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatAttachmentInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub mime_type: String,
 }
 
 /// One line of the transcript as a reader shows it: with the row's identity, its
@@ -77,6 +108,9 @@ pub struct ChatTurnRecord {
     /// see the goal on the live frame loses that distinction exactly when it is
     /// being relied on -- on reopen.
     pub goal: Option<String>,
+    /// What came up with this line, by name and type. Empty for the answer's
+    /// half, and empty for rows written before attachments existed.
+    pub attachments: Vec<ChatAttachmentInfo>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -94,7 +128,16 @@ pub trait ChatTurnStore: Send + Sync {
     /// Written as one turn rather than two appends so a reader never sees a
     /// question whose answer is still in flight -- half a turn reads as an
     /// answer that never came.
-    async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()>;
+    ///
+    /// `attachments` 与这一句同写一行：它们是这句话的一部分，分开写就有一瞬间
+    /// 「这句话带不带那张图」没有答案。
+    async fn record_turn(
+        &self,
+        session_id: &str,
+        user: &str,
+        attachments: &[ChatAttachment],
+        assistant: &str,
+    ) -> SFResult<()>;
 
     /// Record one exchange whose reply handed the work to the orchestrator, and
     /// the goal it created.
@@ -107,6 +150,7 @@ pub trait ChatTurnStore: Send + Sync {
         &self,
         session_id: &str,
         user: &str,
+        attachments: &[ChatAttachment],
         assistant: &str,
         goal_id: &str,
     ) -> SFResult<()>;
@@ -119,8 +163,13 @@ pub trait ChatTurnStore: Send + Sync {
     /// earlier one had happened. The answer's absence is a fact about the turn,
     /// not a reason to forget the turn -- so the question is kept, and the row
     /// carries the reason instead of an answer.
-    async fn record_failed_turn(&self, session_id: &str, user: &str, failure: &str)
-        -> SFResult<()>;
+    async fn record_failed_turn(
+        &self,
+        session_id: &str,
+        user: &str,
+        attachments: &[ChatAttachment],
+        failure: &str,
+    ) -> SFResult<()>;
 
     /// The last `limit` lines of a session, oldest first.
     ///

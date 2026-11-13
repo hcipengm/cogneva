@@ -324,7 +324,20 @@ export interface ChatTranscriptLine {
    * 它还在跑）；空＝问答，回复只走当前这条连接。
    */
   goal_id?: string | null;
+  /**
+   * 随这一句发上去的附件，只有认人的那几格：名字与类型。
+   *
+   * 字节不在这里：附件体随记录落库、由服务端装进下一轮提示词，重开页面不需要
+   * 把整段对话的图重新下载一遍。
+   */
+  attachments?: ChatAttachmentInfo[] | null;
   created_at: string;
+}
+
+/** 记录里一条附件的身份。 */
+export interface ChatAttachmentInfo {
+  name?: string | null;
+  mime_type: string;
 }
 
 /**

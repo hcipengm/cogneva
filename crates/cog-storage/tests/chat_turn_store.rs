@@ -61,6 +61,7 @@ fn turn(role: ChatTurnRole, content: &str) -> ChatTurn {
     ChatTurn {
         role,
         content: content.to_string(),
+        attachments: Vec::new(),
     }
 }
 
@@ -70,12 +71,12 @@ async fn a_turn_reads_back_in_the_order_it_was_said_and_from_another_handle() {
     let probe = probe().await;
     probe
         .store
-        .record_turn(&probe.session, "第一问", "第一答")
+        .record_turn(&probe.session, "第一问", &[], "第一答")
         .await
         .expect("record the first turn");
     probe
         .store
-        .record_turn(&probe.session, "第二问", "第二答")
+        .record_turn(&probe.session, "第二问", &[], "第二答")
         .await
         .expect("record the second turn");
 
@@ -128,7 +129,7 @@ async fn a_session_that_was_never_recorded_reads_empty_and_a_limit_of_zero_asks_
 
     probe
         .store
-        .record_turn(&probe.session, "问", "答")
+        .record_turn(&probe.session, "问", &[], "答")
         .await
         .expect("record a turn");
     // limit 0 是「一条也不要」，不是「不限」——读成后者会把整段对话塞进一次请求。
@@ -152,7 +153,7 @@ async fn the_bound_trims_one_session_and_leaves_another_alone() {
     let quiet = format!("{}-quiet", probe.session);
     probe
         .store
-        .record_turn(&quiet, "安静的一问", "安静的一答")
+        .record_turn(&quiet, "安静的一问", &[], "安静的一答")
         .await
         .expect("record the quiet session");
 
@@ -161,7 +162,7 @@ async fn the_bound_trims_one_session_and_leaves_another_alone() {
     for i in 0..over {
         probe
             .store
-            .record_turn(&busy, &format!("问{i}"), &format!("答{i}"))
+            .record_turn(&busy, &format!("问{i}"), &[], &format!("答{i}"))
             .await
             .expect("record a turn of the busy session");
     }
@@ -219,7 +220,7 @@ async fn an_unanswered_turn_is_kept_out_of_the_history_but_not_out_of_the_table(
     let probe = probe().await;
     probe
         .store
-        .record_failed_turn(&probe.session, "上游坏了的时候问的话", "API error 503")
+        .record_failed_turn(&probe.session, "上游坏了的时候问的话", &[], "API error 503")
         .await
         .expect("record an unanswered turn");
 
@@ -260,7 +261,7 @@ async fn an_unanswered_turn_is_kept_out_of_the_history_but_not_out_of_the_table(
     // 之后正常的一轮不能被它挡住，也不该把它顶出上下文窗口。
     probe
         .store
-        .record_turn(&probe.session, "恢复之后问的话", "答")
+        .record_turn(&probe.session, "恢复之后问的话", &[], "答")
         .await
         .expect("record an answered turn");
     let history = probe
@@ -296,12 +297,12 @@ async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
     let probe = probe().await;
     probe
         .store
-        .record_dispatched_turn(&probe.session, "把这件事做了", "已受理", "goal-7788")
+        .record_dispatched_turn(&probe.session, "把这件事做了", &[], "已受理", "goal-7788")
         .await
         .expect("record a dispatched turn");
     probe
         .store
-        .record_turn(&probe.session, "那这个呢", "这个直接答")
+        .record_turn(&probe.session, "那这个呢", &[], "这个直接答")
         .await
         .expect("record an answered turn");
 
@@ -349,10 +350,64 @@ async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_turn_without_a_session_is_refused_rather_than_filed_under_nothing() {
     let probe = probe().await;
-    let refused = probe.store.record_turn("   ", "问", "答").await;
+    let refused = probe.store.record_turn("   ", "问", &[], "答").await;
     assert!(
         refused.is_err(),
         "没有会话的一轮必须被拒：它落进一段谁也问不到的记录里"
     );
+    cleanup(&probe).await;
+}
+
+/// 随一句话上来的图，随那一行一起回来。
+///
+/// 这一格量的是列的存在与它装得下的东西：历史要读到同一个 base64（下一轮把它
+/// 装回媒体块，模型才看得见那张图），读者的记录只拿名字与类型（重开页面认得出
+/// 「说过一张图」，不必把图本身再下载一遍）。两边的差别正是这两条读法的差别。
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn an_attachment_rides_with_its_row_and_keeps_its_bytes() {
+    let probe = probe().await;
+    let shot = cog_storage::ChatAttachment {
+        name: Some("shot.png".into()),
+        mime_type: "image/png".into(),
+        data: "QUJD".into(),
+    };
+    probe
+        .store
+        .record_turn(&probe.session, "这里错了", &[shot.clone()], "看到了")
+        .await
+        .expect("record a turn that carried a picture");
+
+    let history = probe
+        .store
+        .history(&probe.session, 40)
+        .await
+        .expect("read the history");
+    assert_eq!(
+        history[0].attachments,
+        vec![shot.clone()],
+        "字节在历史里丢了"
+    );
+    assert!(
+        history[1].attachments.is_empty(),
+        "回答那一半不该带附件：{:?}",
+        history[1].attachments
+    );
+
+    let transcript = probe
+        .store
+        .transcript(&probe.session, 40)
+        .await
+        .expect("read the transcript");
+    assert_eq!(
+        transcript[0].attachments,
+        vec![cog_storage::ChatAttachmentInfo {
+            name: Some("shot.png".into()),
+            mime_type: "image/png".into(),
+        }],
+        "读者的记录里少了这条附件：{:?}",
+        transcript[0].attachments
+    );
+
     cleanup(&probe).await;
 }

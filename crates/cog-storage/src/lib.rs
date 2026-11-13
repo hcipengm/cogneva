@@ -72,17 +72,17 @@ pub use mem::{
 
 #[cfg(feature = "postgres")]
 pub use postgres::{
-    gauge_latest_sql, sha256_of, venue_tasks_sql, AgentMessage, AgentMessageStore, ChatTurn,
-    ChatTurnRecord, ChatTurnRole, ChatTurnStore, DatasetCatalog, HookArchiveRow, NewAgentMessage,
-    NewDataset, PostgresAgentMessageStore, PostgresAttemptJournal, PostgresAuditRecorder,
-    PostgresBackupRunStore, PostgresChangeLedgerStore, PostgresChatTurnStore,
-    PostgresDatasetCatalog, PostgresDecisionStatsStore, PostgresGovernanceStore,
-    PostgresHookArchive, PostgresMetricsBackend, PostgresNotificationStore,
-    PostgresObservabilityGateway, PostgresPgeStageStore, PostgresPrincipleLedgerStore,
-    PostgresRawLogIndexStore, PostgresResourceEventStore, PostgresRuntimePrincipleStore,
-    PostgresSnapshotStore, PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore,
-    SendOutcome, DAG_LOCK_WORKSPACE_SQL, EVENTS_PAGE_SQL, LOG_LINES_PER_TASK, ROWS_KEPT_PER_PEER,
-    ROWS_KEPT_PER_SESSION,
+    gauge_latest_sql, sha256_of, venue_tasks_sql, AgentMessage, AgentMessageStore, ChatAttachment,
+    ChatAttachmentInfo, ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore, DatasetCatalog,
+    HookArchiveRow, NewAgentMessage, NewDataset, PostgresAgentMessageStore, PostgresAttemptJournal,
+    PostgresAuditRecorder, PostgresBackupRunStore, PostgresChangeLedgerStore,
+    PostgresChatTurnStore, PostgresDatasetCatalog, PostgresDecisionStatsStore,
+    PostgresGovernanceStore, PostgresHookArchive, PostgresMetricsBackend,
+    PostgresNotificationStore, PostgresObservabilityGateway, PostgresPgeStageStore,
+    PostgresPrincipleLedgerStore, PostgresRawLogIndexStore, PostgresResourceEventStore,
+    PostgresRuntimePrincipleStore, PostgresSnapshotStore, PostgresStateBackend,
+    PostgresTasteIntentStore, PostgresUserStore, SendOutcome, DAG_LOCK_WORKSPACE_SQL,
+    EVENTS_PAGE_SQL, LOG_LINES_PER_TASK, ROWS_KEPT_PER_PEER, ROWS_KEPT_PER_SESSION,
 };
 
 #[cfg(feature = "redis")]

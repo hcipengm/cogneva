@@ -132,10 +132,13 @@ async fn handle_type_message(
         ClientMessage::ChatMessage {
             session_id,
             content,
+            attachments,
             ..
         } => {
             let content = content.trim().to_string();
-            if content.is_empty() {
+            // 带附件的这一句可以没有正文：一张截图配一句「这里错了」，图才是要说的
+            // 那部分。两样都空才是没说话。
+            if content.is_empty() && attachments.is_empty() {
                 return Ok(());
             }
             // The LLM call can take tens of seconds — never block the socket
@@ -167,6 +170,7 @@ async fn handle_type_message(
                     out,
                     session,
                     content,
+                    attachments,
                     owner,
                     origin,
                     running,

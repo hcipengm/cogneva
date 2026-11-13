@@ -201,6 +201,156 @@ async fn archive_if_oversized(
     .map(Some)
 }
 
+/// 这一句交给循环的消息：正文（或长消息的引用）在前，附件块在后。
+///
+/// 顺序有含义：先说字，再看图。图排在前面时，模型会先描述图、再回答那句话，
+/// 而人是拿图补充自己的话的。
+///
+/// 媒体块原样带上去，判「这个模型收不收」是协议边缘的事（`cog_llm::provider::media`
+/// 按模型能力降级并留下说明）——网关在这里筛一遍，等于把「模型看不见这张图」变成
+/// 一个静默的丢弃。
+pub fn user_message(text: &str, attachments: &[cog_core::ChatAttachment]) -> cog_core::Message {
+    user_message_with_mentions(text, &[], attachments)
+}
+
+/// 一句话，加上它点名的那几份文件，再加上随它上来的媒体。
+///
+/// 顺序与理由同 [`user_message`]：先是人说的字，然后是他点名的文件的内容，最后
+/// 是图。文件排在媒体前面，因为一句话里「@ 的那份代码」与「这张截图」是两件事，
+/// 前者要能顺着句子读下去。
+pub fn user_message_with_mentions(
+    text: &str,
+    mentions: &[FileMention],
+    attachments: &[cog_core::ChatAttachment],
+) -> cog_core::Message {
+    let mut blocks: Vec<cog_core::ContentBlock> =
+        Vec::with_capacity(attachments.len() + mentions.len() + 1);
+    if !text.is_empty() {
+        blocks.push(cog_core::ContentBlock::text(text));
+    }
+    blocks.extend(
+        mentions
+            .iter()
+            .map(|mention| cog_core::ContentBlock::text(&mention.block)),
+    );
+    blocks.extend(
+        attachments
+            .iter()
+            .map(|attachment| cog_core::ContentBlock::Media {
+                data: attachment.data.clone(),
+                mime_type: attachment.mime_type.clone(),
+            }),
+    );
+    // 全空在这里没有意义（调用方已经拦掉），但留一条比返回一条没有内容的消息好。
+    if blocks.is_empty() {
+        return cog_core::Message::user("");
+    }
+    cog_core::Message::user_blocks(blocks)
+}
+
+/// 一句话里点名了的文件：`@` 后面跟一串像路径的字。
+///
+/// 只认「词的起头」，且这一串里只有路径会有的字（字母数字、`._/-\`）——邮箱里
+/// 那个 `@` 不该被当成点名。称呼与文件名在这里分不开（`@张三` 也可能真是一份
+/// 中文名文件），所以它照样被当成一个名字去读：读不到就不铺开，模型手上仍是
+/// 那句话本身。末尾的标点不属于路径：「看看 @src/main.rs。」里的句号是这句话的。
+///
+/// 重复的点名只读一次，顺序按第一次出现。
+pub fn mentioned_paths(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (at, ch) in text.char_indices() {
+        if ch != '@' {
+            continue;
+        }
+        // 只认词的起头：邮箱里那个 `@` 前面紧贴着一个字，不算点名。
+        if text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|before| !before.is_whitespace())
+        {
+            continue;
+        }
+        let path: String = text[at + 1..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '\\'))
+            .collect();
+        // 句末的句号属于这句话，不属于路径。
+        let path = path.trim_end_matches('.');
+        if path.is_empty() {
+            continue;
+        }
+        if out.iter().any(|seen| seen == path) {
+            continue;
+        }
+        out.push(path.to_string());
+    }
+    out
+}
+
+/// 一份被 `@` 点名的文件，已经读成要交给模型的那一段字。
+#[derive(Debug)]
+pub struct FileMention {
+    pub path: String,
+    /// 正文本身，或一句「太长，去 read_file 它」。
+    pub block: String,
+}
+
+/// 把点名的文件读上来。
+///
+/// 走的是员工自己 `read_file` 用的那个后端：读不到的路（文件不存在、二进制、
+/// 后端没装）就跳过——这一句里 `@` 那条路径还在，模型仍然可以自己读它，跳过
+/// 只是少了一次顺手的铺开，不是把话改掉。
+///
+/// 铺开的正文合计超过这一轮能直接带进来的量就不再铺开，改成一句「去读它」：
+/// 一条消息点名五十个文件时，全铺进去的结果是整轮答不了，而铺开本来只省一次
+/// `read_file`。
+async fn read_mentions(
+    backend: Option<&Arc<dyn cog_core::SandboxBackend>>,
+    paths: &[String],
+    threshold_tokens: usize,
+) -> Vec<FileMention> {
+    let Some(backend) = backend else {
+        return Vec::new();
+    };
+    let mut mentions: Vec<FileMention> = Vec::new();
+    let mut inlined = 0usize;
+    for path in paths {
+        let request = cog_core::SandboxRequest {
+            task_id: format!("chat-mention-{path}"),
+            agent_id: String::new(),
+            payload: cog_core::SandboxPayload::ReadFile { path: path.clone() },
+            input: serde_json::Value::Null,
+            limits: cog_core::ResourceLimits::default(),
+        };
+        let Ok(result) = backend.execute(&request).await else {
+            continue;
+        };
+        if result.exit_code != 0 {
+            continue;
+        }
+        let tokens = cog_core::estimate_tokens(&result.stdout);
+        if inlined.saturating_add(tokens) > threshold_tokens {
+            mentions.push(FileMention {
+                path: path.clone(),
+                block: format!(
+                    "[这些文件加起来超过这一轮能直接带进来的量（约 {threshold_tokens} token）；\
+                     「{path}」的全文没有铺在这里，要看就用 read_file 读它。]"
+                ),
+            });
+            continue;
+        }
+        inlined += tokens;
+        mentions.push(FileMention {
+            path: path.clone(),
+            block: format!(
+                "[用户在这句话里点名了这个文件：{path}，下面是它的全文]\n\n{}",
+                result.stdout
+            ),
+        });
+    }
+    mentions
+}
+
 /// 装配层在启动时用这同一个句柄填进来的执行器。
 ///
 /// 先发布空句柄、等插件都起来之后再填：这段对话要的编排器由某个插件在 `init`
@@ -985,11 +1135,29 @@ async fn load_history(
         if cog_core::estimate_tokens(&text) <= threshold_tokens {
             continue;
         }
+        // 折叠的是「太长的那段字」，不是这一句话：随它上来的图与附件照样在这一条
+        // 消息里。把它们连同正文一起换成一条引用，等于让后面几轮再也看不见那张图。
+        let media: Vec<cog_core::ChatAttachment> = match message {
+            cog_core::Message::User { content, .. } => content
+                .iter()
+                .filter_map(|block| match block {
+                    cog_core::ContentBlock::Media { data, mime_type } => {
+                        Some(cog_core::ChatAttachment {
+                            name: None,
+                            mime_type: mime_type.clone(),
+                            data: data.clone(),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         // 每个用户自己的话都先写一遍文件：执行器的 `/tmp` 会随它的重启消失，
         // 而记录里的原文还在。写一次就写一次——读到一条引用却打不开它，比读到
         // 一段被截断的正文更糟。
         match archive_oversized(backend, session_id, &text, threshold_tokens).await {
-            Ok(archived) => *message = cog_core::Message::user(archived.reference),
+            Ok(archived) => *message = user_message(&archived.reference, &media),
             Err(reason) => tracing::warn!(
                 session = %session_id,
                 error = %reason,
@@ -1005,7 +1173,9 @@ fn turns_to_messages(turns: Vec<cog_core::ChatTurn>) -> Vec<cog_core::Message> {
     turns
         .into_iter()
         .map(|turn| match turn.role {
-            cog_core::ChatTurnRole::User => cog_core::Message::user(turn.content),
+            // 附件随这一行一起回来：后面几轮问的还是同一张图，那张图必须还在
+            // 模型看得见的地方，而不是只在发它的那一轮里出现过一次。
+            cog_core::ChatTurnRole::User => user_message(&turn.content, &turn.attachments),
             cog_core::ChatTurnRole::Assistant => cog_core::Message::assistant_text(turn.content),
         })
         .collect()
@@ -1013,7 +1183,13 @@ fn turns_to_messages(turns: Vec<cog_core::ChatTurn>) -> Vec<cog_core::Message> {
 
 /// 把这一轮写进记录。写不进去只留一条 warn：用户已经在等一个回答，拿「记不下来」
 /// 把回答吞掉，比丢一行历史更糟。
-async fn record_turn(store: &crate::ChatTurnHandle, session_id: &str, user: &str, assistant: &str) {
+async fn record_turn(
+    store: &crate::ChatTurnHandle,
+    session_id: &str,
+    user: &str,
+    attachments: &[cog_core::ChatAttachment],
+    assistant: &str,
+) {
     let Some(store) = store else {
         tracing::warn!(
             session = %session_id,
@@ -1021,7 +1197,10 @@ async fn record_turn(store: &crate::ChatTurnHandle, session_id: &str, user: &str
         );
         return;
     };
-    if let Err(e) = store.record_turn(session_id, user, assistant).await {
+    if let Err(e) = store
+        .record_turn(session_id, user, attachments, assistant)
+        .await
+    {
         tracing::warn!(
             error = %e,
             session = %session_id,
@@ -1040,6 +1219,7 @@ async fn record_dispatched_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
     user: &str,
+    attachments: &[cog_core::ChatAttachment],
     assistant: &str,
     goal_id: &str,
 ) {
@@ -1051,7 +1231,7 @@ async fn record_dispatched_turn(
         return;
     };
     if let Err(e) = store
-        .record_dispatched_turn(session_id, user, assistant, goal_id)
+        .record_dispatched_turn(session_id, user, attachments, assistant, goal_id)
         .await
     {
         tracing::warn!(
@@ -1072,6 +1252,7 @@ async fn record_failed_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
     user: &str,
+    attachments: &[cog_core::ChatAttachment],
     failure: &str,
 ) {
     let Some(store) = store else {
@@ -1081,7 +1262,10 @@ async fn record_failed_turn(
         );
         return;
     };
-    if let Err(e) = store.record_failed_turn(session_id, user, failure).await {
+    if let Err(e) = store
+        .record_failed_turn(session_id, user, attachments, failure)
+        .await
+    {
         tracing::warn!(
             error = %e,
             session = %session_id,
@@ -1106,6 +1290,9 @@ pub async fn run_chat_turn(
     out: mpsc::Sender<String>,
     session_id: String,
     content: String,
+    // 随这一句上来的图片 / PDF / 音频。数据保持 base64：交给循环的媒体块就是
+    // 这个形状，网关不拆包也不重编。
+    attachments: Vec<cog_core::ChatAttachment>,
     // 这次对话属于谁。空串是「这条连接没有身份」——那时调用方不声明人，账落在
     // 没有人的那一格，与「声明了某个人」分开。
     owner: String,
@@ -1138,7 +1325,14 @@ pub async fn run_chat_turn(
                  发出去只会被窗口截掉一半，所以这一轮没有发。"
             );
             emit_delta(&out, &session_id, &assistant_mid, &text).await;
-            record_failed_turn(&state.chat_turns, &session_id, &content, &text).await;
+            record_failed_turn(
+                &state.chat_turns,
+                &session_id,
+                &content,
+                &attachments,
+                &text,
+            )
+            .await;
             emit_message_end(&out, &session_id, &user_mid).await;
             emit_message_end(&out, &session_id, &assistant_mid).await;
             return;
@@ -1177,7 +1371,14 @@ pub async fn run_chat_turn(
         emit_delta(&out, &session_id, &assistant_mid, reason).await;
         // 没答出来也要落库，且落在收尾帧之前：用户看到这一轮结束就立刻追问时，
         // 这一句若还没进记录，下一轮的上下文里就没有它。
-        record_failed_turn(&state.chat_turns, &session_id, &content, reason).await;
+        record_failed_turn(
+            &state.chat_turns,
+            &session_id,
+            &content,
+            &attachments,
+            reason,
+        )
+        .await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
         return;
     };
@@ -1191,7 +1392,14 @@ pub async fn run_chat_turn(
     let Some(llm) = llm else {
         let reason = "LLM 未配置或未就绪，无法处理聊天消息。请先在右上角完成 LLM 设置。";
         emit_delta(&out, &session_id, &assistant_mid, reason).await;
-        record_failed_turn(&state.chat_turns, &session_id, &content, reason).await;
+        record_failed_turn(
+            &state.chat_turns,
+            &session_id,
+            &content,
+            &attachments,
+            reason,
+        )
+        .await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
         return;
     };
@@ -1213,10 +1421,19 @@ pub async fn run_chat_turn(
         state.sandbox_backend.as_ref(),
     )
     .await;
-    messages.push(cog_core::Message::user(match &archived {
+    let text = match &archived {
         Some(archived) => archived.reference.clone(),
         None => content.clone(),
-    }));
+    };
+    // `@` 点名的文件在这一轮就铺进上下文：人是拿它补充这句话的，等模型自己
+    // 想起来再读一遍，是把一句已经给了材料的话当成一个调研任务。
+    let mentions = read_mentions(
+        state.sandbox_backend.as_ref(),
+        &mentioned_paths(&content),
+        threshold,
+    )
+    .await;
+    messages.push(user_message_with_mentions(&text, &mentions, &attachments));
 
     // 3. Hand it over. 事件由另一个任务读：循环要能一直往管道里写，不因为这一头
     //    在等它返回而互相卡住。
@@ -1277,7 +1494,14 @@ pub async fn run_chat_turn(
         .await;
         // 记录先落，再发收尾帧：界面上收到上面那一帧会立刻允许追问，而下一轮读
         // 历史就在这之后——不先落库，被停掉的那一句在下一轮的上下文里不存在。
-        record_failed_turn(&state.chat_turns, &session_id, &content, reason).await;
+        record_failed_turn(
+            &state.chat_turns,
+            &session_id,
+            &content,
+            &attachments,
+            reason,
+        )
+        .await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
         return;
     }
@@ -1347,23 +1571,40 @@ pub async fn run_chat_turn(
     //    什么都没有。
     match (&failure, reply.is_empty()) {
         (Some(err), _) => {
-            record_failed_turn(&state.chat_turns, &session_id, &content, err).await;
+            record_failed_turn(&state.chat_turns, &session_id, &content, &attachments, err).await;
         }
         (None, true) => {
             record_failed_turn(
                 &state.chat_turns,
                 &session_id,
                 &content,
+                &attachments,
                 "模型没有返回任何内容",
             )
             .await;
         }
         (None, false) => match journal.goals.first() {
             Some(goal_id) => {
-                record_dispatched_turn(&state.chat_turns, &session_id, &content, &reply, goal_id)
-                    .await
+                record_dispatched_turn(
+                    &state.chat_turns,
+                    &session_id,
+                    &content,
+                    &attachments,
+                    &reply,
+                    goal_id,
+                )
+                .await
             }
-            None => record_turn(&state.chat_turns, &session_id, &content, &reply).await,
+            None => {
+                record_turn(
+                    &state.chat_turns,
+                    &session_id,
+                    &content,
+                    &attachments,
+                    &reply,
+                )
+                .await
+            }
         },
     }
 
@@ -1752,7 +1993,7 @@ mod tests {
     async fn the_history_the_model_sees_comes_from_the_store() {
         let store = std::sync::Arc::new(FakeTurns::default());
         store
-            .record_turn("s1", "上一问", "上一答")
+            .record_turn("s1", "上一问", &[], "上一答")
             .await
             .expect("seed the fake transcript");
         let handle: crate::ChatTurnHandle = Some(store.clone());
@@ -1768,23 +2009,291 @@ mod tests {
         assert_eq!(*store.last_limit.lock().await, Some(SESSION_HISTORY_CAP));
     }
 
+    /// `@` 后面那串是路径，不是称呼。
+    ///
+    /// 只认词的起头，且这一串只能是路径会有的字：一条「早上好 @张三」或一句
+    /// 「写邮件到 a@b.com」都不该让网关去读一个文件，而「看看 @src/main.rs。」
+    /// 里的句号属于这句话，不属于路径。
+    #[test]
+    fn an_at_sign_names_a_path_not_a_greeting() {
+        assert_eq!(
+            mentioned_paths("看看 @src/main.rs，还有 @crates/cog-core/src/lib.rs。"),
+            vec!["src/main.rs", "crates/cog-core/src/lib.rs"]
+        );
+        assert!(
+            mentioned_paths("写邮件到 a@b.com").is_empty(),
+            "邮箱里那个 @ 不是点名"
+        );
+        assert_eq!(
+            mentioned_paths("看看 @docs/README.md。"),
+            vec!["docs/README.md"],
+            "句号被当成了路径的一部分"
+        );
+        assert_eq!(
+            mentioned_paths("@src/main.rs 和再提一次 @src/main.rs"),
+            vec!["src/main.rs"],
+            "同一份文件读一次就够"
+        );
+    }
+
+    /// 点名的文件铺在正文之后、媒体之前：先读字，再读那份代码，最后看图。
+    #[tokio::test]
+    async fn a_mentioned_file_arrives_before_the_picture() {
+        let backend: std::sync::Arc<dyn cog_core::SandboxBackend> =
+            std::sync::Arc::new(FileBackend::with("src/main.rs", "fn main() {}\n"));
+        let mentions = read_mentions(
+            Some(&backend),
+            &mentioned_paths("这里为什么编译不过 @src/main.rs"),
+            NEVER_OVERSIZED,
+        )
+        .await;
+        assert_eq!(mentions.len(), 1, "点名的那一份没有读上来");
+        let message = user_message_with_mentions(
+            "这里为什么编译不过 @src/main.rs",
+            &mentions,
+            &[cog_core::ChatAttachment {
+                name: Some("err.png".into()),
+                mime_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+        );
+        let cog_core::Message::User { content, .. } = message else {
+            panic!("交给循环的不是一条用户消息");
+        };
+        assert_eq!(content.len(), 3, "三样没有各占一格：{content:?}");
+        assert!(
+            content[1]
+                .as_text()
+                .is_some_and(|text| text.contains("fn main() {}\n")),
+            "第二格不是那份文件的正文：{content:?}"
+        );
+        assert!(
+            matches!(&content[2], cog_core::ContentBlock::Media { .. }),
+            "图没有排在最后：{content:?}"
+        );
+    }
+
+    /// 点名的文件太多时，铺开的只是「去哪儿读」，不是把这一轮撑破。
+    #[tokio::test]
+    async fn too_much_mentioned_text_becomes_a_note_to_read_it_yourself() {
+        let long = "x".repeat(4_000);
+        let backend: std::sync::Arc<dyn cog_core::SandboxBackend> =
+            std::sync::Arc::new(FileBackend::with("big.txt", &long));
+        let mentions = read_mentions(Some(&backend), &["big.txt".to_string()], 10).await;
+        assert_eq!(mentions.len(), 1);
+        assert!(
+            mentions[0].block.contains("read_file"),
+            "太长的那份没有说「去读它」：{}",
+            mentions[0].block
+        );
+        assert!(
+            !mentions[0].block.contains(&long),
+            "太长的那份仍然整份铺了进来"
+        );
+    }
+
+    /// 读不到的点名不冒充读过：没有这一份，就没有这一格。
+    #[tokio::test]
+    async fn a_mention_that_cannot_be_read_adds_nothing() {
+        let backend: std::sync::Arc<dyn cog_core::SandboxBackend> =
+            std::sync::Arc::new(FileBackend::default());
+        let mentions = read_mentions(Some(&backend), &["missing.rs".to_string()], 10).await;
+        assert!(
+            mentions.is_empty(),
+            "读不到的文件点出了一格内容：{mentions:?}"
+        );
+    }
+
+    /// 一份只认得几个路径的沙箱：这一条量的是「点名读上来了没有」。
+    #[derive(Default)]
+    struct FileBackend {
+        files: std::collections::HashMap<String, String>,
+    }
+
+    impl FileBackend {
+        fn with(path: &str, content: &str) -> Self {
+            let mut files = std::collections::HashMap::new();
+            files.insert(path.to_string(), content.to_string());
+            Self { files }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::SandboxBackend for FileBackend {
+        async fn execute(
+            &self,
+            req: &cog_core::SandboxRequest,
+        ) -> cog_core::SFResult<cog_core::SandboxResult> {
+            let cog_core::SandboxPayload::ReadFile { path } = &req.payload else {
+                return Ok(cog_core::SandboxResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 1,
+                    output: None,
+                    duration_ms: 0,
+                    resource_usage: cog_core::ResourceUsage::default(),
+                    workdir: None,
+                });
+            };
+            let found = self.files.get(path);
+            Ok(cog_core::SandboxResult {
+                stdout: found.cloned().unwrap_or_default(),
+                stderr: if found.is_some() {
+                    String::new()
+                } else {
+                    format!("no such file: {path}")
+                },
+                exit_code: if found.is_some() { 0 } else { 1 },
+                output: None,
+                duration_ms: 0,
+                resource_usage: cog_core::ResourceUsage::default(),
+                workdir: None,
+            })
+        }
+
+        async fn precompile(&self, _bytes: &[u8]) -> cog_core::SFResult<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// 记录里带着的图，装回提示词时仍然是媒体块。
+    ///
+    /// 「发出去时带了图」是另一条门的事；这一条量的是下一轮：用户接着问「那这里
+    /// 呢」时，模型手上要有上一句说的那张图。图只在发它的那一轮出现过一次，等于
+    /// 后面几轮都在对着一张看不见的画说话。
+    #[tokio::test]
+    async fn the_history_carries_the_picture_that_came_with_the_question() {
+        let store = std::sync::Arc::new(FakeTurns::default());
+        store
+            .record_turn(
+                "s1",
+                "这里错了",
+                &[cog_core::ChatAttachment {
+                    name: Some("shot.png".into()),
+                    mime_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+                "看到了",
+            )
+            .await
+            .expect("seed the fake transcript");
+        let handle: crate::ChatTurnHandle = Some(store.clone());
+
+        let messages = load_history(&handle, "s1", NEVER_OVERSIZED, None).await;
+        let cog_core::Message::User { content, .. } = &messages[0] else {
+            panic!("第一条不是用户那句：{messages:?}");
+        };
+        assert_eq!(content.len(), 2, "正文与图没有各占一格：{content:?}");
+        assert_eq!(content[0].as_text().as_deref(), Some("这里错了"));
+        assert!(
+            matches!(
+                &content[1],
+                cog_core::ContentBlock::Media { data, mime_type }
+                    if data == "QUJD" && mime_type == "image/png"
+            ),
+            "记录里的图没有装回提示词：{content:?}"
+        );
+        // 回答那一半不替模型带图：它说的话里没有附件。
+        assert!(matches!(&messages[1], cog_core::Message::Assistant { .. }));
+    }
+
+    /// 长消息折成引用时，折掉的是字，不是随它上来的图。
+    ///
+    /// 折叠把整条消息换成一句「原文在文件里」——顺手把媒体块也换掉，是在这一条
+    /// 最容易写错的地方让图静默消失：屏幕上有引用、模型看不见图，而两边都不报错。
+    #[tokio::test]
+    async fn folding_a_long_message_keeps_the_picture_that_came_with_it() {
+        let store = std::sync::Arc::new(FakeTurns::default());
+        let long = "很长的一段话".repeat(200);
+        store
+            .record_turn(
+                "s1",
+                &long,
+                &[cog_core::ChatAttachment {
+                    name: Some("shot.png".into()),
+                    mime_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+                "读完了",
+            )
+            .await
+            .expect("seed the fake transcript");
+        let handle: crate::ChatTurnHandle = Some(store.clone());
+        let backend: std::sync::Arc<dyn cog_core::SandboxBackend> =
+            std::sync::Arc::new(AcceptingBackend);
+
+        let messages = load_history(&handle, "s1", 10, Some(&backend)).await;
+        let cog_core::Message::User { content, .. } = &messages[0] else {
+            panic!("第一条不是用户那句：{messages:?}");
+        };
+        assert_eq!(
+            content.len(),
+            2,
+            "折叠之后只剩一段话，图不见了：{content:?}"
+        );
+        let folded = content[0].as_text().expect("第一格要是那句引用");
+        assert!(
+            folded.contains("read_file"),
+            "第一格不是「原文在哪」的引用：{folded}"
+        );
+        assert!(
+            !folded.contains(&long),
+            "第一格还是原文本身：这一轮等于没有折叠"
+        );
+        assert!(
+            matches!(
+                &content[1],
+                cog_core::ContentBlock::Media { data, mime_type }
+                    if data == "QUJD" && mime_type == "image/png"
+            ),
+            "折叠把随这一句上来的图一起换掉了：{content:?}"
+        );
+    }
+
+    /// 一个只回答「写成功了」的沙箱：这一条量的是折叠，不是文件怎么写。
+    struct AcceptingBackend;
+
+    #[async_trait::async_trait]
+    impl cog_core::SandboxBackend for AcceptingBackend {
+        async fn execute(
+            &self,
+            _req: &cog_core::SandboxRequest,
+        ) -> cog_core::SFResult<cog_core::SandboxResult> {
+            Ok(cog_core::SandboxResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                output: None,
+                duration_ms: 0,
+                resource_usage: cog_core::ResourceUsage::default(),
+                workdir: None,
+            })
+        }
+
+        async fn precompile(&self, _bytes: &[u8]) -> cog_core::SFResult<String> {
+            Ok(String::new())
+        }
+    }
+
     /// 回答出来的这一轮必须写进记录，且是作为一问一答一起写。
     #[tokio::test]
     async fn an_answered_turn_is_written_down_as_a_pair() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_turn(&handle, "s1", "问", "答").await;
+        record_turn(&handle, "s1", "问", &[], "答").await;
         let held = store.turns.lock().await.clone();
         assert_eq!(
             held,
             vec![
                 cog_core::ChatTurn {
                     role: cog_core::ChatTurnRole::User,
-                    content: "问".into()
+                    content: "问".into(),
+                    attachments: Vec::new(),
                 },
                 cog_core::ChatTurn {
                     role: cog_core::ChatTurnRole::Assistant,
-                    content: "答".into()
+                    content: "答".into(),
+                    attachments: Vec::new(),
                 },
             ]
         );
@@ -1799,7 +2308,7 @@ mod tests {
     async fn a_dispatched_turn_keeps_its_goal_where_the_history_can_read_it() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_dispatched_turn(&handle, "s1", "把这件事做了", "已受理", "goal-7").await;
+        record_dispatched_turn(&handle, "s1", "把这件事做了", &[], "已受理", "goal-7").await;
 
         // 问句与答复照样成对进上下文：交出去不等于这一轮就不用记。
         let held = store.turns.lock().await.clone();
@@ -1823,7 +2332,7 @@ mod tests {
     async fn an_unanswered_turn_still_keeps_what_the_user_said() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_failed_turn(&handle, "s1", "问", "upstream 503").await;
+        record_failed_turn(&handle, "s1", "问", &[], "upstream 503").await;
 
         let held = store.unanswered.lock().await.clone();
         assert_eq!(
@@ -1843,8 +2352,8 @@ mod tests {
             .await
             .is_empty());
         // 不发散：这里只要求「不写进任何东西」——没有第二个家可写。
-        record_turn(&handle, "s1", "问", "答").await;
-        record_failed_turn(&handle, "s1", "问", "答不出来").await;
+        record_turn(&handle, "s1", "问", &[], "答").await;
+        record_failed_turn(&handle, "s1", "问", &[], "答不出来").await;
     }
 
     /// 读记录失败按「没有历史」回答，而不是按「历史是空的」记一笔。
@@ -1852,7 +2361,7 @@ mod tests {
     async fn a_transcript_that_cannot_be_read_answers_without_context() {
         let store = std::sync::Arc::new(FakeTurns::default());
         store
-            .record_turn("s1", "问", "答")
+            .record_turn("s1", "问", &[], "答")
             .await
             .expect("seed the fake transcript");
         store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1861,7 +2370,7 @@ mod tests {
             .await
             .is_empty());
         // 写也失败时不许把这一轮的回答吞掉：record_turn 只留 warn。
-        record_turn(&handle, "s1", "问", "答").await;
+        record_turn(&handle, "s1", "问", &[], "答").await;
     }
 
     /// 一份内存里的记录，只作测试替身。生产里没有它的对应物——这次改动拆掉的
@@ -1883,6 +2392,7 @@ mod tests {
             &self,
             session_id: &str,
             user: &str,
+            attachments: &[cog_core::ChatAttachment],
             assistant: &str,
         ) -> cog_core::SFResult<()> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1895,10 +2405,12 @@ mod tests {
             held.push(cog_core::ChatTurn {
                 role: cog_core::ChatTurnRole::User,
                 content: user.to_string(),
+                attachments: attachments.to_vec(),
             });
             held.push(cog_core::ChatTurn {
                 role: cog_core::ChatTurnRole::Assistant,
                 content: assistant.to_string(),
+                attachments: Vec::new(),
             });
             Ok(())
         }
@@ -1907,6 +2419,7 @@ mod tests {
             &self,
             session_id: &str,
             user: &str,
+            attachments: &[cog_core::ChatAttachment],
             assistant: &str,
             goal_id: &str,
         ) -> cog_core::SFResult<()> {
@@ -1920,10 +2433,12 @@ mod tests {
             held.push(cog_core::ChatTurn {
                 role: cog_core::ChatTurnRole::User,
                 content: user.to_string(),
+                attachments: attachments.to_vec(),
             });
             held.push(cog_core::ChatTurn {
                 role: cog_core::ChatTurnRole::Assistant,
                 content: assistant.to_string(),
+                attachments: Vec::new(),
             });
             self.dispatched
                 .lock()
@@ -1936,6 +2451,7 @@ mod tests {
             &self,
             session_id: &str,
             user: &str,
+            _attachments: &[cog_core::ChatAttachment],
             failure: &str,
         ) -> cog_core::SFResult<()> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1988,6 +2504,16 @@ mod tests {
                     content: turn.content.clone(),
                     failure: None,
                     goal: None,
+                    // 记录里只留认人的那两格，与真正的存储面一致：重开页面要认
+                    // 得出这一条带过一张图，不需要把那幅图再下载一遍。
+                    attachments: turn
+                        .attachments
+                        .iter()
+                        .map(|attachment| cog_core::ChatAttachmentInfo {
+                            name: attachment.name.clone(),
+                            mime_type: attachment.mime_type.clone(),
+                        })
+                        .collect(),
                     created_at: chrono::Utc::now(),
                 })
                 .collect())

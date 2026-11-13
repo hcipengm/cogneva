@@ -41,11 +41,16 @@ pub enum ClientMessage {
     /// Web UI chat input — routed to the LLM; the reply is streamed back to
     /// the requesting connection as `agent_event` envelopes
     /// (message.start / message.text_delta / message.end).
+    ///
+    /// `attachments` 与正文同路上来：一张图、一份 PDF 都是这句话的一部分，
+    /// 分两次发会让「这句话带不带它」在中间那一瞬没有答案。
     #[serde(rename = "chat_message")]
     ChatMessage {
         #[serde(default)]
         session_id: Option<String>,
         content: String,
+        #[serde(default)]
+        attachments: Vec<cog_core::ChatAttachment>,
         #[serde(default)]
         timestamp: Option<String>,
     },

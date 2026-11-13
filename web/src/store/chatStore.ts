@@ -48,7 +48,24 @@ export interface ChatMessage {
    * 读回的历史里没有这一格（记录只存正文），界面按正文长度把它画成同一类附件。
    */
   attachment: ChatAttachment | null;
+  /**
+   * 随这一句发上去的附件（图片 / PDF / 音频 / 视频）。
+   *
+   * 只存认人的那几格：名字、类型、字节数。数据本身（base64）只在发出之前活一
+   * 小会儿，账上不留——一屏几十张图的内存不该由「刷新之后还认得它」来换。
+   * 记录里存着名字与类型，所以刷新之后这一行还在；字节数没跟着回来，那一格
+   * 是 `null`，界面上不写大小，而不是写一个零。
+   */
+  files: ChatFile[];
   at: string;
+}
+
+/** 一条附件的身份：够在消息上认出来、说得清多大，不带数据本身。 */
+export interface ChatFile {
+  name: string;
+  mimeType: string;
+  /** 读回的历史里没有这一格：记录只存名字与类型。 */
+  bytes: number | null;
 }
 
 export interface ChatSession {
@@ -130,7 +147,7 @@ interface ChatState {
   closeSession: (id: string) => void;
   renameSession: (id: string, title: string) => void;
   /** 本地先入账。返回本地那一条的 id。 */
-  appendUserTurn: (sessionId: string, text: string) => string;
+  appendUserTurn: (sessionId: string, text: string, files?: ChatFile[]) => string;
   ingestFrame: (frame: ChatFrame) => void;
   /** 从服务端读回历史。已读过时直接返回。 */
   hydrate: (sessionId: string) => Promise<void>;
@@ -314,7 +331,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     saveDock(get());
   },
 
-  appendUserTurn: (sessionId, text) => {
+  appendUserTurn: (sessionId, text, files = []) => {
     const id = localId();
     const at = new Date().toISOString();
     set((state) => {
@@ -340,6 +357,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 failure: null,
                 usage: null,
                 attachment: null,
+                files,
                 at,
               },
             ],
@@ -396,6 +414,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   failure: null,
                   usage: null,
                   attachment: frame.attachment,
+                  files: [],
                   at: frame.timestamp,
                 },
               ],
@@ -425,6 +444,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   failure: null,
                   usage: null,
                   attachment: null,
+                  files: [],
                   at: frame.timestamp,
                 },
               ],
@@ -563,6 +583,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
             usage: null,
             // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
             attachment: null,
+            // 记录里有名字与类型：刷新之后仍认得出这句话说过一张图。字节数
+            // 只在发出去那一刻量过，这里没有，于是留空而不是记成 0。
+            files: (line.attachments ?? []).map((file, index) => ({
+              name: file.name ?? `附件 ${index + 1}`,
+              mimeType: file.mime_type,
+              bytes: null,
+            })),
             at: line.created_at,
           }));
           // 读回的历史排在前，本地还没落定的排在后面。已经落定、且历史里

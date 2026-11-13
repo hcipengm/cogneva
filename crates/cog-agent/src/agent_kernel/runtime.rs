@@ -6223,6 +6223,51 @@ mod tests {
         );
     }
 
+    /// 一段对话里带的那张图，在循环里仍然是媒体块。
+    ///
+    /// 与材料那一条是两条入口：那条从任务文档里取 `media`，这条从调用方给的历史
+    /// 里取块。只测前一条时，把对话的媒体在这里压成文本——例如按 `content()`
+    /// 重排一遍消息——照样全绿，而用户在输入框里贴的那张图到不了模型面前。
+    #[tokio::test]
+    async fn a_conversation_attachment_reaches_the_model_as_a_media_block() {
+        let llm = RecordingLlm::default();
+        let mut runtime = census_runtime("conversation-media");
+        runtime
+            .run_conversation(
+                vec![Message::user_blocks(vec![
+                    ContentBlock::text("这里错了"),
+                    ContentBlock::Media {
+                        data: "QUJD".into(),
+                        mime_type: "image/png".into(),
+                    },
+                ])],
+                &llm,
+            )
+            .await
+            .expect("一轮对话");
+
+        let calls = llm.calls();
+        let user = calls[0]
+            .iter()
+            .rev()
+            .find(|m| matches!(m, Message::User { .. }))
+            .expect("a user message");
+        let Message::User { content, .. } = user else {
+            unreachable!("the message was matched as a user message")
+        };
+        assert!(
+            content.iter().any(
+                |block| matches!(block, ContentBlock::Media { data, mime_type }
+                    if data == "QUJD" && mime_type == "image/png")
+            ),
+            "对话里的那张图没有走到模型面前：{content:?}"
+        );
+        assert!(
+            !user.content().contains("QUJD"),
+            "字节以文本的形式又出现了一次：同一张图被付了两次钱"
+        );
+    }
+
     /// 材料里带的截图要作为媒体块递到模型面前，而不是当作 base64 文本。
     ///
     /// 判据看的是模型这一侧真正收到了什么：一个 `Media` 块带着原样的字节与

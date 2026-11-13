@@ -1,0 +1,11 @@
+-- Migration: 094_chat_turn_attachments
+-- See the Postgres migration of the same name for why an exchange keeps what
+-- came up with it.
+--
+-- LONGTEXT, not TEXT: TEXT holds 64 KiB, and one attachment is up to 16 MiB of
+-- bytes - about 22 MiB once base64-encoded. A TEXT column here would accept the
+-- row and truncate it, which reads back as a file that was sent and a file that
+-- arrives broken being the same thing.
+--
+-- Null for the assistant half and for rows written before this column existed.
+ALTER TABLE chat_turns ADD COLUMN attachments LONGTEXT NULL;
