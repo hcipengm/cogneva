@@ -202,6 +202,43 @@ function taskStatusWord(word: string | undefined): string {
 }
 
 /**
+ * 一条边界的四个状态词。
+ *
+ * 四个词分开写，是因为把「部署声明了」画成「管住了」是这一面最容易犯的错：
+ * `enforced` 是这一层真的会拒；`declared` 是部署声明了那条边界、这一层读不到它
+ * 执行与否；`none` 是这一层根本不设边界；`unknown` 是这一层答不出来。后两个都在
+ * 说「现在没人替人拦着」，所以用危险色，而不是把一行声明画成绿色。
+ */
+function boundaryWord(state: string): string {
+  switch (state) {
+    case 'enforced':
+      return '管住';
+    case 'declared':
+      return '部署声明';
+    case 'none':
+      return '不设界';
+    case 'unknown':
+      return '答不出';
+    default:
+      return state;
+  }
+}
+
+function boundaryColor(state: string): string {
+  switch (state) {
+    case 'enforced':
+      return 'var(--brass)';
+    case 'declared':
+      return 'var(--paper-dim)';
+    case 'none':
+    case 'unknown':
+      return 'var(--danger)';
+    default:
+      return 'var(--muted)';
+  }
+}
+
+/**
  * 这一轮挂上共享任务图的活，画成一份列表：哪一行、什么活、谁在做、做到哪。
  *
  * 帧里只有派活那一刻就已经确定的事实（哪一行、什么活、派给谁）；状态从任务图那
@@ -1099,6 +1136,12 @@ export function ConversationPane({
    * 文件变了。
    */
   const [rewindAsk, setRewindAsk] = useState<number | null>(null);
+  /**
+   * 这一段里的命令跑在什么样的环境里。`undefined` 是「还没问过」，与「问到了，
+   * 这个部署答不出来」不是同一句话——后者要人去看部署，前者只要等一下。
+   */
+  const boundaryState = useChatStore((s) => s.boundaries[sessionId]);
+  const [boundaryOpen, setBoundaryOpen] = useState(false);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   /** 这一段交出去的目标，按总览折出来的现状。总览里还没有的那几道如实缺席。 */
@@ -1422,6 +1465,18 @@ export function ConversationPane({
     if (next) askCheckpoints();
   };
 
+  /**
+   * 沙箱边界面板：打开时向服务端问一次。它是部署读数，不是这一轮说的话——
+   * 不开就不问，与规则、约定同一个理由。
+   */
+  const askBoundary = () =>
+    clientRef.current?.send({ type: 'chat_sandbox_boundary', session_id: sessionId });
+  const toggleBoundary = () => {
+    const next = !boundaryOpen;
+    setBoundaryOpen(next);
+    if (next) askBoundary();
+  };
+
   /** 第一步：只问会改什么，一个字节都不碰。 */
   const previewRewind = (turn: number) => {
     setRewindAsk(turn);
@@ -1625,6 +1680,21 @@ export function ConversationPane({
           text="看这一段每一轮结束时的树，并把文件状态退回到某一轮之前（退回前会先给你看会改哪些文件）"
         >
           检查点
+        </Note>
+        {/*
+          沙箱：命令与写盘被什么管住。这一格存在的理由是默认部署里「沙箱」可以
+          等于不隔离，而屏幕上以前看不出是哪一种——把读数摆在标题行上，人才知道
+          自己刚才让谁跑了什么。
+        */}
+        <Note
+          as="button"
+          type="button"
+          onClick={toggleBoundary}
+          className="mono shrink-0 px-1 text-[10px] transition-opacity hover:opacity-70"
+          style={{ color: boundaryOpen ? 'var(--brass)' : 'var(--muted)' }}
+          text="看这一段里的命令跑在什么样的环境里：可写路径、网络、资源、超时各被什么管住"
+        >
+          沙箱
         </Note>
         {/*
           目标与变更都是账上的行，所以每一个都能点进去。这里只是入口：这一面
@@ -2005,6 +2075,68 @@ export function ConversationPane({
                 </>
               )}
             </div>
+          )}
+        </div>
+      )}
+      {/*
+        沙箱边界面板。四个状态词各说各的话，而不是把「部署声明」和「管住」画成
+        同一行：前者这一层读不到执行与否，把两者画成一样，人就会以为越界已经有人
+        拦了。`reason` 是「这个部署答不出来」，与「一份空边界」不是一句话。
+      */}
+      {boundaryOpen && (
+        <div className="shrink-0 px-4 pb-1">
+          <div className="mb-1 flex items-baseline gap-2">
+            <span className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
+              沙箱
+            </span>
+            <Note
+              as="button"
+              type="button"
+              onClick={askBoundary}
+              className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="重新问一次这一段里的命令跑在哪儿"
+            >
+              刷新
+            </Note>
+            <Note
+              as="button"
+              type="button"
+              onClick={toggleBoundary}
+              className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="收起这块面板"
+            >
+              收起
+            </Note>
+          </div>
+          {boundaryState === undefined ? (
+            <p className="mono text-[10px] text-[var(--muted)]">还在问执行器…</p>
+          ) : boundaryState.reason ? (
+            <p className="mono text-[10px] text-[var(--danger)]">{boundaryState.reason}</p>
+          ) : !boundaryState.boundary ? (
+            <p className="mono text-[10px] text-[var(--muted)]">
+              服务端没有给出边界读数。
+            </p>
+          ) : (
+            <>
+              <p className="mono text-[10px]" style={{ color: 'var(--paper-dim)' }}>
+                {boundaryState.boundary.isolated
+                  ? `命令跑在独立的执行器里（${boundaryState.boundary.kind}）`
+                  : `命令就在这个进程里跑（${boundaryState.boundary.kind}）：没有容器边界`}
+                {boundaryState.boundary.workdir
+                  ? `，工作树 ${boundaryState.boundary.workdir}`
+                  : ''}
+              </p>
+              <ul className="mt-1 flex flex-col gap-0">
+                {boundaryState.boundary.lines.map((line) => (
+                  <li key={line.dimension} className="mono text-[10px] break-all">
+                    <span style={{ color: boundaryColor(line.state) }}>
+                      {boundaryWord(line.state)}
+                    </span>{' '}
+                    {line.dimension}：{line.detail}
+                  </li>
+                ))}
+              </ul>
+            </>
           )}
         </div>
       )}

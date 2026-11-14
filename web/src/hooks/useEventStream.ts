@@ -3,6 +3,7 @@ import {
   EventStreamClient,
   type ChatCheckpointWire,
   type ChatModelWire,
+  type ChatSandboxBoundaryWire,
   type ResumedMessageWire,
 } from '@/transport/websocket';
 import { MockEventStreamClient } from '@/transport/mockStream';
@@ -99,6 +100,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const applyChatResume = useChatStore((state) => state.applyResume);
   const applyModel = useChatStore((state) => state.applyModel);
   const applyCheckpoints = useChatStore((state) => state.applyCheckpoints);
+  const applyBoundary = useChatStore((state) => state.applyBoundary);
   const noteAgentFrame = useLiveAgentStore((state) => state.noteFrame);
   const noteAlertFrame = useLiveAlertStore((state) => state.noteFrame);
   const noteCommsFrame = useLiveCommsStore((state) => state.noteFrame);
@@ -406,11 +408,37 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       });
     };
 
+    /**
+     * 命令跑在什么样的环境里。按会话落，与检查点同一个理由——它是部署的读数，
+     * 不是这一轮说出来的话。认不出形状的那一份按「读不到」落：把一行边界读丢了
+     * 比整份不画更糟，因为读丢的恰好可能是那个「不设边界」的词。
+     */
+    const ingestChatSandboxBoundary = (wire: ChatSandboxBoundaryWire) => {
+      const session = wire.session_id || FIRST_SESSION;
+      const boundary = wire.boundary;
+      applyBoundary(session, {
+        boundary: boundary
+          ? {
+              kind: boundary.kind ?? '',
+              isolated: boundary.isolated === true,
+              workdir: boundary.workdir ?? null,
+              lines: (boundary.lines ?? []).flatMap((line) =>
+                line.dimension && line.state
+                  ? [{ dimension: line.dimension, state: line.state, detail: line.detail ?? '' }]
+                  : []
+              ),
+            }
+          : null,
+        reason: wire.reason ?? null,
+      });
+    };
+
     const channels = channelKey ? channelKey.split(',') : [];
     const client = options.mock
       ? new MockEventStreamClient({
           onEvent: handleEvent,
           onChatFrame: ingestChatFrame,
+          onChatSandboxBoundary: ingestChatSandboxBoundary,
           onStatusChange: (status) => {
             setConnectionStatus(status);
             // 演示流也会断：接上时同样要把这一段续上。
@@ -461,6 +489,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           onChatResume: (resume) => ingestChatResume(resume.session_id, resume.messages ?? []),
           onChatModel: ingestChatModel,
           onChatCheckpoint: ingestChatCheckpoint,
+          onChatSandboxBoundary: ingestChatSandboxBoundary,
           onOpen: resumeOpenSession,
           onOwnerMemory: (entries) => {
             const known = entries.flatMap((entry) =>
@@ -477,6 +506,9 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
               useMemoryStore.getState().clearEntries();
               // 检查点同理：上一条连接读到的那几份不该留在屏幕上冒充现状。
               useChatStore.getState().forgetCheckpoints();
+              // 边界同理，而且更甚：它是「命令跑在哪里」的读数，断开之后没人能
+              // 保证执行器还是那一副。
+              useChatStore.getState().forgetBoundaries();
             }
           },
           onError: (error) => {

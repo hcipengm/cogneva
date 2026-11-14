@@ -1,9 +1,12 @@
 import type { AgentEvent, ChatFrame } from '@/types/events';
+import type { ChatSandboxBoundaryWire } from '@/transport/websocket';
 
 export interface MockStreamOptions {
   onEvent: (event: AgentEvent) => void;
   /** 聊天帧走自己那一路，与真后端一致：它们不是 agent 事件的变体。 */
   onChatFrame?: (frame: ChatFrame) => void;
+  /** 边界读数同理：它是部署的读数，不是这一轮说出来的话。 */
+  onChatSandboxBoundary?: (boundary: ChatSandboxBoundaryWire) => void;
   onStatusChange?: (status: 'connecting' | 'open' | 'closed' | 'error') => void;
 }
 
@@ -44,8 +47,31 @@ export class MockEventStreamClient {
    * 的停止按钮就是一个按下去什么都不发生的按钮——而它与真后端上的那个长得一样。
    */
   send(message: unknown): void {
-    const type = (message as { type?: string } | null)?.type;
+    const type = (message as { type?: string | null } | null)?.type;
     if (type === 'chat_cancel') this.cancelStream();
+    if (type === 'chat_sandbox_boundary') this.reportBoundary();
+  }
+
+  /**
+   * 演示流里的边界：这里一条命令都不跑，所以四行全是「不设界」。这不是占位，
+   * 是演示的真实处境——把它答成一份「已隔离」的读数，演示就会替真部署说话。
+   */
+  private reportBoundary(): void {
+    this.options.onChatSandboxBoundary?.({
+      session_id: this.sessionId,
+      boundary: {
+        kind: 'demo',
+        isolated: false,
+        workdir: null,
+        lines: [
+          { dimension: '可写路径', state: 'none', detail: '演示流不跑命令：没有执行器，也没有文件' },
+          { dimension: '网络', state: 'none', detail: '演示流不跑命令：没有出口' },
+          { dimension: '资源', state: 'none', detail: '演示流不跑命令：没有可量的容器' },
+          { dimension: '超时', state: 'none', detail: '演示流不跑命令：没有要停的东西' },
+        ],
+      },
+      reason: null,
+    });
   }
 
   /** 正在流的那一条。停止要停的是它，不是随便哪一条。 */

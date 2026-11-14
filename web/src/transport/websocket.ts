@@ -100,6 +100,26 @@ export interface RewindReportWire {
   truncated?: boolean;
 }
 
+/**
+ * 命令跑在什么样的环境里：一条边界一行。
+ *
+ * `state` 是三个词：`enforced` 这一层真的会拒、`declared` 部署声明了边界而这一层
+ * 读不到它执行与否、`none` 这一层不设边界、`unknown` 这一层答不出来。界面按这四个
+ * 词分别说话——把 `declared` 画成 `enforced`，人就会以为越界已经有人拦了。
+ */
+export interface ChatSandboxBoundaryWire {
+  session_id?: string;
+  boundary?: SandboxBoundaryWire | null;
+  reason?: string | null;
+}
+
+export interface SandboxBoundaryWire {
+  kind?: string;
+  isolated?: boolean;
+  workdir?: string | null;
+  lines?: { dimension?: string; state?: string; detail?: string }[];
+}
+
 export interface PermissionAskWire {
   request_id?: string;
   session_id?: string;
@@ -158,6 +178,11 @@ export interface WebSocketOptions {
    * 这一段的状态，不是这一轮吐出来的产出，混进聊天流会被当成一句助手说的话。
    */
   onChatCheckpoint?: (checkpoint: ChatCheckpointWire) => void;
+  /**
+   * 这一段对话里的命令跑在什么样的环境里。与检查点同一个理由——它是部署的读数，
+   * 不是这一轮说的话。
+   */
+  onChatSandboxBoundary?: (boundary: ChatSandboxBoundaryWire) => void;
   /**
    * 每一次连上（含重连）之后叫一声。
    *
@@ -381,6 +406,16 @@ export class EventStreamClient {
         rows: Array.isArray(wire.rows) ? wire.rows : [],
         hidden: typeof wire.hidden === 'number' ? wire.hidden : 0,
         rewind: wire.rewind ?? null,
+        reason: typeof wire.reason === 'string' ? wire.reason : null,
+      });
+      return;
+    } else if (message.type === 'chat_sandbox_boundary') {
+      // 认不出形状的那一份按「读不到」处理，不拿上一次的边界冒充这一次：边界是一份
+      // 部署读数，画成旧的那一刻的读数比空着更糟。
+      const wire = message as unknown as ChatSandboxBoundaryWire;
+      this.options.onChatSandboxBoundary?.({
+        session_id: wire.session_id,
+        boundary: wire.boundary ?? null,
         reason: typeof wire.reason === 'string' ? wire.reason : null,
       });
       return;

@@ -457,6 +457,31 @@ fn local_root() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
+/// 停住判据这一行。
+///
+/// 本地后端与执行器读的是同一条，因为停住同一条命令的就是同一段代码
+/// （[`spawn_command`] 的看门狗）：两处各答一份，其中一份迟早会说另一份的话。
+pub(crate) fn silence_line() -> cog_core::BoundaryLine {
+    let window = cog_core::progress::silence_window();
+    let detail = match window {
+        Some(window) => format!(
+            "不按墙钟计时：没有输出、CPU 时间也不涨超过 {} ms 就被停（窗口是这台机器实测的分位数）；持续有动静的命令不受它约束",
+            window.as_millis()
+        ),
+        None => "沉默窗口还没量够样本：现在停不下一条没有动静的命令".to_string(),
+    };
+    cog_core::BoundaryLine {
+        dimension: "超时".to_string(),
+        state: if window.is_some() {
+            "enforced"
+        } else {
+            "unknown"
+        }
+        .to_string(),
+        detail,
+    }
+}
+
 /// A file operation as a two-event stream: content (or error) then exit.
 fn file_stream(result: std::io::Result<String>) -> CommandEventStream {
     let events = match result {
@@ -504,6 +529,34 @@ pub(crate) async fn collect_stream(mut stream: CommandEventStream) -> SandboxRes
 impl SandboxBackend for LocalExecutor {
     async fn execute(&self, req: &SandboxRequest) -> SFResult<SandboxResult> {
         Ok(collect_stream(self.execute_stream(req).await?).await)
+    }
+
+    /// 进程内执行就是进程内执行：这里如实说「没有容器边界」，而不是借宿主的
+    /// cgroup 与网络把这一层写成隔离的。三条 `none` 是这次调用真实的处境，界面
+    /// 据此把人话写出来；把它们省掉，默认部署看起来就和执行器 Pod 一样。
+    async fn boundary(&self) -> SFResult<cog_core::SandboxBoundary> {
+        let line = |dimension: &str, detail: &str| cog_core::BoundaryLine {
+            dimension: dimension.to_string(),
+            state: "none".to_string(),
+            detail: detail.to_string(),
+        };
+        Ok(cog_core::SandboxBoundary {
+            kind: "local".to_string(),
+            isolated: false,
+            workdir: Some(local_root().display().to_string()),
+            lines: vec![
+                line(
+                    "可写路径",
+                    "进程内执行：文件路径原样交给文件系统，越界不拦（部署独立执行器后这一行才变成 enforced）",
+                ),
+                line("网络", "进程内执行：命令用的是这个进程自己的网络，没有出口策略"),
+                line(
+                    "资源",
+                    "进程内执行：宿主容器的 cgroup 不是这条命令的界，命令与平台抢同一份内存与 CPU",
+                ),
+                silence_line(),
+            ],
+        })
     }
 
     async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {

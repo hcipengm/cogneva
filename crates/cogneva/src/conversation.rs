@@ -818,6 +818,29 @@ impl ConversationTurn for PlatformConversation {
         })
     }
 
+    fn sandbox_boundary<'a>(
+        &'a self,
+        _owner: &'a str,
+        _session_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<cog_core::SandboxBoundary, String>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            // 边界由跑命令的那一层自报：独立执行器就答执行器的，进程内就答进程内
+            // 的。装配层不替任何一层拼一份「安全」描述——那会是一句由没跑过这条
+            // 命令的人写下的话，改部署时也不会跟着变。
+            let Some(sandbox) = self.sandbox.as_ref() else {
+                return Err("这个部署没有接执行器，说不清命令跑在哪里。".into());
+            };
+            sandbox
+                .boundary()
+                .await
+                .map_err(|error| format!("执行器没有答出自己的边界：{error}"))
+        })
+    }
+
     fn turn<'a>(
         &'a self,
         request: ConversationRequest,

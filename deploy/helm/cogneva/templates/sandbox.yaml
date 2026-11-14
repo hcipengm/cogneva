@@ -155,6 +155,12 @@ spec:
               value: sandbox
             - name: SANDBOX_EXECUTOR_PORT
               value: {{ .Values.sandboxExecutor.metricsPort | int | quote }}
+            # 哪条网络策略管着这个 Pod 的出口。本轮进程读不到策略本体（那是 API
+            # 服务器那边的事），能报的是**部署声明的是哪一条**：把名字说出来，
+            # 对话里的边界面板就能把「部署声明」与「这一层管住」分成两句话，而审计
+            # 的人有据可查。名字与 templates/network-policy.yaml 里那条同名。
+            - name: SANDBOX_EGRESS_POLICY
+              value: cogneva-sandbox-executor-egress
             # 每任务工作树路由：真实 task id 锚定命令 cwd 与相对文件路径。
             - name: SANDBOX_WORKSPACES_ROOT
               value: /opt/cogneva/sandbox/workspaces

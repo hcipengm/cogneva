@@ -117,6 +117,30 @@ export interface CheckpointState {
   reason: string | null;
 }
 
+/** 一条边界：哪个维度、这一层管没管住、读数是什么。 */
+export interface BoundaryLine {
+  dimension: string;
+  /** `enforced` / `declared` / `none` / `unknown` 四个词，见传输层的注释。 */
+  state: string;
+  detail: string;
+}
+
+/**
+ * 这一段对话里的命令跑在什么样的环境里。
+ *
+ * `reason` 有值时 `boundary` 不可信：那是「这个部署答不出来」的一句话，不是一份
+ * 空边界。把它画成「什么都不限制」，人会把「没人回答」当成「没有边界」。
+ */
+export interface SandboxBoundaryState {
+  boundary: {
+    kind: string;
+    isolated: boolean;
+    workdir: string | null;
+    lines: BoundaryLine[];
+  } | null;
+  reason: string | null;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -296,6 +320,11 @@ interface ChatState {
    * 一份也没有）不是同一件事。
    */
   checkpoints: Record<string, CheckpointState>;
+  /**
+   * 命令跑在什么样的环境里，按会话分。`undefined` 是「还没问过」——与一份读不到
+   * 的边界（问到了，答不出来）不是同一件事。
+   */
+  boundaries: Record<string, SandboxBoundaryState>;
 
   createSession: (title?: string) => string;
   /**
@@ -338,6 +367,10 @@ interface ChatState {
   applyCheckpoints: (sessionId: string, checkpoint: CheckpointState) => void;
   /** 断开时清掉：上一条连接读到的不该留在屏幕上冒充现状。 */
   forgetCheckpoints: () => void;
+  /** 服务端答回来的边界读数。它是一份部署读数，按会话存，换一段就问一次。 */
+  applyBoundary: (sessionId: string, boundary: SandboxBoundaryState) => void;
+  /** 断开时清掉：上一条连接读到的边界不该留在屏幕上冒充现状。 */
+  forgetBoundaries: () => void;
   /** 从服务端读回历史。已读过时直接返回。 */
   hydrate: (sessionId: string) => Promise<void>;
   /** 读服务端那份会话名单，可带一个搜索词。 */
@@ -480,6 +513,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
    * 一份也没有）不是同一件事，画成同一句会让人在连上之前就以为退不回去。
    */
   checkpoints: {},
+  boundaries: {},
 
   /**
    * 读名单。空结果与读失败分开：空名单是「你确实没有别的会话」，读失败是
@@ -952,6 +986,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   forgetCheckpoints: () => {
     set({ checkpoints: {} });
+  },
+
+  applyBoundary: (sessionId, boundary) => {
+    set((state) => ({
+      boundaries: { ...state.boundaries, [sessionId]: boundary },
+    }));
+  },
+
+  forgetBoundaries: () => {
+    set({ boundaries: {} });
   },
 
   hydrate: async (sessionId) => {

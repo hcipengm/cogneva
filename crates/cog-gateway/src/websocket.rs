@@ -516,6 +516,31 @@ async fn handle_type_message(
             };
             send_server_message(socket, &resp).await?;
         }
+        ClientMessage::ChatSandboxBoundary { session_id, .. } => {
+            let session = session_id.unwrap_or_else(|| "default".into());
+            let reply = |boundary: Option<cog_core::SandboxBoundary>, reason: Option<String>| {
+                ServerMessage::ChatSandboxBoundary {
+                    session_id: session.clone(),
+                    boundary,
+                    reason,
+                }
+            };
+            // 边界里有工作树路径，属于这一段对话的家底：与说话、列检查点同一把尺子。
+            if let Err(reason) = crate::sessions::speaks_here(state, &session, conn.user_id).await {
+                send_server_message(socket, &reply(None, Some(reason))).await?;
+                return Ok(());
+            }
+            let Some(conversation) = state.conversation.get().cloned() else {
+                let reason = "这套部署没有接上对话面，说不清命令跑在哪里。".to_string();
+                send_server_message(socket, &reply(None, Some(reason))).await?;
+                return Ok(());
+            };
+            let resp = match conversation.sandbox_boundary(conn.user_id, &session).await {
+                Ok(boundary) => reply(Some(boundary), None),
+                Err(reason) => reply(None, Some(reason)),
+            };
+            send_server_message(socket, &resp).await?;
+        }
         ClientMessage::ChatResume { session_id, .. } => {
             let session = session_id.unwrap_or_else(|| "default".into());
             // 续的是一段对话的流，所以先判这一段能不能给这个人看：不能就不接，

@@ -464,6 +464,25 @@ pub trait ConversationTurn: Send + Sync {
         Box::pin(async { Err("这个部署没有接检查点存储，退不回去。".into()) })
     }
 
+    /// 这一段对话里的命令跑在什么样的环境里：四个维度各一行。
+    ///
+    /// 默认是「说不出来」。装配层没接执行器时，界面要读到的是这一句，而不是一张
+    /// 空的边界表——空表读起来像「什么都不限制」，而真实情况是「这个部署里没有
+    /// 人或东西能回答命令跑在哪」。
+    fn sandbox_boundary<'a>(
+        &'a self,
+        _owner: &'a str,
+        _session_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<cog_core::SandboxBoundary, String>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err("这个部署没有接执行器，说不清命令跑在哪里。".into())
+        })
+    }
+
     /// 这个人手上还有哪些「总是允许 / 总是拒绝」的规则。
     ///
     /// 默认是一张空名单：装配层没装规则存储时，界面上就该什么都列不出来，而不是

@@ -2780,6 +2780,48 @@ pub fn anchor_path(base: Option<&Path>, path: &str) -> PathBuf {
     }
 }
 
+/// 把调用方给的路径落到这棵树上；走出这棵树就拒绝，并把范围说出来。
+///
+/// 归一化按字面做（`.` 与 `..` 只当路径段），不跟符号链接：要写的新文件可能还
+/// 不存在，跟链接就没有可解的目标。所以这一层拦的是**写偏了的路径**——模型给的
+/// `../../etc/passwd`、手滑多写一层的绝对路径；恶意构造的链接仍由容器边界管。
+/// 这两个边界分开答，谁都不冒充谁。
+pub fn anchor_inside(base: &Path, path: &str) -> Result<PathBuf, String> {
+    let base = lexically_normal(base);
+    let candidate = Path::new(path);
+    let anchored = if candidate.is_absolute() {
+        lexically_normal(candidate)
+    } else {
+        lexically_normal(&base.join(candidate))
+    };
+    if !anchored.starts_with(&base) {
+        return Err(format!(
+            "{path} 越界：可写范围是 {}（相对路径挂在这棵树上；走出它的路径被拒，没有替它改道）",
+            base.display()
+        ));
+    }
+    Ok(anchored)
+}
+
+/// 逐段消掉 `.` 与 `..`，不碰文件系统。
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // 退到根之上就没有可退的了：把 `..` 原样留下，让调用方的
+                // `starts_with` 判它越界，而不是悄悄把它变成根。
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Visible to the crate because the executor server has to drive a real router:
 /// whether a running command claims its tree is decided there, and a claim that
 /// is never taken looks exactly like one that is.

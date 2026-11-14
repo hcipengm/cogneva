@@ -199,6 +199,16 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// 这一段对话里的命令跑在什么样的环境里：问一次，答一份读数。
+    ///
+    /// 只读：边界由跑命令的那一层自报（独立执行器 / 进程内），网关不替它拼一份。
+    #[serde(rename = "chat_sandbox_boundary")]
+    ChatSandboxBoundary {
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
     /// 重连之后接着看这一段：把「说到哪儿了」取回来。
     ///
     /// 断线期间这一轮还在跑，帧没有人收。重连时不重放每一帧，只取一份快照——
@@ -317,6 +327,18 @@ pub enum ServerMessage {
         hidden: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         rewind: Option<crate::chat::RewindReport>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// 这一段对话里的命令跑在什么样的环境里。
+    ///
+    /// `boundary` 与 `reason` 不会同时有东西：后者是「这个部署答不出来」的那一句，
+    /// 不是一份空边界——空边界读起来像「什么都不限制」，而事实是没人能回答。
+    #[serde(rename = "chat_sandbox_boundary")]
+    ChatSandboxBoundary {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        boundary: Option<cog_core::SandboxBoundary>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },

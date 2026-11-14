@@ -193,6 +193,97 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// 执行器这一层管得住什么，四个维度各一行。
+///
+/// 状态词分开写，因为把「部署声明了」读成「这一层会拒」是这张表最容易犯的错：
+/// `enforced` 是这一层在请求上真的会拒，拒绝时说得出一句话；`declared` 是部署声明
+/// 了这条边界、这一层读不到它执行与否；`none` 是这一层根本不设边界；`unknown` 是
+/// 这一层答不出来——「量不到」与「量到就是不设界」必须分得开，否则一条没人声明的
+/// 边界会读起来和一条不存在的边界一样。
+pub fn boundary_reading(workdir: Option<&WorkdirRouter>) -> cog_core::SandboxBoundary {
+    use cog_core::{BoundaryLine, SandboxBoundary};
+
+    let line = |dimension: &str, state: &str, detail: String| BoundaryLine {
+        dimension: dimension.to_string(),
+        state: state.to_string(),
+        detail,
+    };
+    let facts = crate::runtime::cgroup::read();
+
+    let writable = match workdir {
+        Some(router) => {
+            let cfg = router.config();
+            line(
+                "可写路径",
+                "enforced",
+                format!(
+                    "相对路径挂在这棵树上（工作树根 {}，构建写入 {}）；走出这棵树的路径被拒并说出范围",
+                    cfg.workspaces_root.display(),
+                    cfg.target_dir.display()
+                ),
+            )
+        }
+        None => line(
+            "可写路径",
+            "none",
+            "这个执行器没有车道：命令在进程自己的工作目录里跑，文件路径不做限制".to_string(),
+        ),
+    };
+
+    let network = match std::env::var("SANDBOX_EGRESS_POLICY") {
+        Ok(name) if !name.trim().is_empty() => line(
+            "网络",
+            "declared",
+            format!(
+                "出口由集群网络策略 {name} 管（审计网关联的模型端口、DNS、443、观测栈）；这一层读不到策略本体"
+            ),
+        ),
+        _ => line(
+            "网络",
+            "unknown",
+            "没有声明这一层该读哪条网络策略：出口是否被集群策略管，这里答不出来".to_string(),
+        ),
+    };
+
+    let resources = if facts.limit_bytes.is_none() && facts.throttled_usec.is_none() {
+        line(
+            "资源",
+            "unknown",
+            "读不到 cgroup（宿主没有挂 memory.max / cpu.stat）".to_string(),
+        )
+    } else {
+        let memory = match facts.limit_bytes {
+            Some(bytes) => format!("内存上限 {} MiB", bytes / (1024 * 1024)),
+            None => "内存不限（memory.max 是 max）".to_string(),
+        };
+        let cpu = match facts.throttled_usec {
+            Some(usec) => format!("CPU 配额累计压住 {} ms", usec / 1000),
+            None => "cpu.stat 读不到".to_string(),
+        };
+        line(
+            "资源",
+            "enforced",
+            format!("容器 cgroup：{memory}；{cpu}（都是这一层量的）"),
+        )
+    };
+
+    SandboxBoundary {
+        kind: "executor".to_string(),
+        isolated: true,
+        workdir: workdir.map(|router| router.config().workspaces_root.display().to_string()),
+        lines: vec![
+            writable,
+            network,
+            resources,
+            crate::runtime::local::silence_line(),
+        ],
+    }
+}
+
+async fn boundary(State(state): State<AppState>) -> Json<cog_core::SandboxBoundary> {
+    Json(boundary_reading(state.workdir.as_deref()))
+}
+
 fn error_response(status: StatusCode, message: String) -> Response {
     Response::builder()
         .status(status)
@@ -673,7 +764,21 @@ async fn execute_handler(
             }
         }
         SandboxPayload::ReadFile { ref path } => {
-            let anchored = workdir::anchor_path(workdir.as_deref(), path);
+            // 有一棵树才有可越的界：路径走出这棵树就拒绝，并说出范围。没有车道
+            // 的请求本来就没有界（见 `boundary_reading` 里那一行 `none`），
+            // 这里只能原样交给文件系统。
+            let anchored = match workdir.as_deref() {
+                Some(base) => match workdir::anchor_inside(base, path) {
+                    Ok(path) => path,
+                    Err(reason) => {
+                        return watch.end(
+                            error_response(StatusCode::BAD_REQUEST, reason),
+                            Outcome::Refused,
+                        );
+                    }
+                },
+                None => workdir::anchor_path(None, path),
+            };
             let result = tokio::fs::read_to_string(&anchored).await;
             // A file operation's own result is already known here, so the
             // watch is closed now rather than through the buffered stream.
@@ -684,7 +789,21 @@ async fn execute_handler(
             ref path,
             ref content,
         } => {
-            let anchored = workdir::anchor_path(workdir.as_deref(), path);
+            // 有一棵树才有可越的界：路径走出这棵树就拒绝，并说出范围。没有车道
+            // 的请求本来就没有界（见 `boundary_reading` 里那一行 `none`），
+            // 这里只能原样交给文件系统。
+            let anchored = match workdir.as_deref() {
+                Some(base) => match workdir::anchor_inside(base, path) {
+                    Ok(path) => path,
+                    Err(reason) => {
+                        return watch.end(
+                            error_response(StatusCode::BAD_REQUEST, reason),
+                            Outcome::Refused,
+                        );
+                    }
+                },
+                None => workdir::anchor_path(None, path),
+            };
             if let Some(parent) = anchored.parent() {
                 if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -707,7 +826,21 @@ async fn execute_handler(
             ref new_string,
             replace_all,
         } => {
-            let anchored = workdir::anchor_path(workdir.as_deref(), path);
+            // 有一棵树才有可越的界：路径走出这棵树就拒绝，并说出范围。没有车道
+            // 的请求本来就没有界（见 `boundary_reading` 里那一行 `none`），
+            // 这里只能原样交给文件系统。
+            let anchored = match workdir.as_deref() {
+                Some(base) => match workdir::anchor_inside(base, path) {
+                    Ok(path) => path,
+                    Err(reason) => {
+                        return watch.end(
+                            error_response(StatusCode::BAD_REQUEST, reason),
+                            Outcome::Refused,
+                        );
+                    }
+                },
+                None => workdir::anchor_path(None, path),
+            };
             // The reply names the path the caller gave, not the anchored one:
             // an agent that asked for `src/main.rs` should not have to strip a
             // worktree prefix off its own answer to recognise it.
@@ -956,6 +1089,7 @@ fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(health))
         .route("/health/ready", get(health))
+        .route("/boundary", get(boundary))
         .route(METRICS_PATH, get(metrics_handler))
         .route("/execute", post(execute_handler))
         .route("/documents/list", post(documents_list_handler))
@@ -2366,6 +2500,155 @@ mod tests {
                 entry: String::new()
             }),
             "wasm"
+        );
+    }
+
+    /// The variable is process-global; the test that plants a policy name is the
+    /// only one reading it while it does.
+    static EGRESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 一条声明过的出口策略不是一条被这一层执行的边界：前者是 `declared`，后者
+    /// 只有这一层真的会拒时才配叫 `enforced`。没有声明时也不是 `none`——那是
+    /// 「这一层不设界」，而这里只是答不出集群里有哪条策略。
+    #[test]
+    fn a_declared_egress_policy_is_not_read_as_an_enforced_one() {
+        let _guard = EGRESS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SANDBOX_EGRESS_POLICY");
+        let unset = boundary_reading(None);
+        let network = unset
+            .lines
+            .iter()
+            .find(|line| line.dimension == "网络")
+            .expect("four dimensions include the network");
+        assert_eq!(network.state, "unknown", "{}", network.detail);
+
+        std::env::set_var("SANDBOX_EGRESS_POLICY", "cogneva-sandbox-executor-egress");
+        let declared = boundary_reading(None);
+        let network = declared
+            .lines
+            .iter()
+            .find(|line| line.dimension == "网络")
+            .expect("four dimensions include the network");
+        assert_eq!(network.state, "declared", "{}", network.detail);
+        assert!(
+            network.detail.contains("cogneva-sandbox-executor-egress"),
+            "the reading names the policy the deployment declared: {}",
+            network.detail
+        );
+        std::env::remove_var("SANDBOX_EGRESS_POLICY");
+    }
+
+    /// 一条走出一棵树的文件请求在这一层被拒，拒绝里说得出那棵树的根；同一棵树上
+    /// 树里的路径照常读。走路由把这条路径真的发出去，而不是只调那个纯函数——这
+    /// 一层若不接上它，四行里那句 `enforced` 就是一句没人执行过的话。
+    #[tokio::test]
+    async fn a_file_request_out_of_the_tree_is_refused_over_the_wire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = crate::workdir::tests::seed_bare(tmp.path());
+        let workdir = crate::workdir::tests::router(
+            tmp.path(),
+            &bare,
+            2,
+            std::time::Duration::from_secs(21600),
+        );
+        let workspaces_root = workdir.config().workspaces_root.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = Arc::clone(&workdir);
+        tokio::spawn(async move {
+            axum::serve(listener, app_router_with_workdir(serving))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        let refused = client
+            .post(format!("http://{addr}/execute"))
+            .json(&serde_json::json!({
+                "payload": {"type": "read_file", "path": "../../etc/passwd"},
+                "task_id": "escape",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+        let reason = refused.text().await.unwrap();
+        let tree = workspaces_root.join("escape");
+        assert!(
+            reason.contains(&tree.display().to_string()),
+            "the refusal names the writable range: {reason}"
+        );
+
+        // 同一棵树上，树里的路径照常落到树上：拒绝只对着走出去的那一步。
+        let inside = client
+            .post(format!("http://{addr}/execute"))
+            .json(&serde_json::json!({
+                "payload": {"type": "write_file", "path": "notes/inside.txt", "content": "ok"},
+                "task_id": "escape",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(inside.status(), reqwest::StatusCode::OK);
+        let written = tree.join("notes").join("inside.txt");
+        assert!(written.exists(), "a path inside the tree still lands on it");
+    }
+
+    /// 执行器答得出自己的边界：四行，且可写路径那一行在有条车道时是 `enforced`
+    /// 并说出范围——面板上那句「管住」靠的就是这条读数。
+    #[tokio::test]
+    async fn the_boundary_route_names_the_writable_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = crate::workdir::tests::seed_bare(tmp.path());
+        let workdir = crate::workdir::tests::router(
+            tmp.path(),
+            &bare,
+            2,
+            std::time::Duration::from_secs(21600),
+        );
+        let workspaces_root = workdir.config().workspaces_root.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = Arc::clone(&workdir);
+        tokio::spawn(async move {
+            axum::serve(listener, app_router_with_workdir(serving))
+                .await
+                .unwrap();
+        });
+
+        let reading: cog_core::SandboxBoundary = reqwest::Client::new()
+            .get(format!("http://{addr}/boundary"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .expect("the executor answers its boundary as JSON");
+        assert_eq!(reading.kind, "executor");
+        assert!(reading.isolated);
+        assert_eq!(
+            reading.workdir.as_deref(),
+            Some(workspaces_root.display().to_string().as_str())
+        );
+        let writable = reading
+            .lines
+            .iter()
+            .find(|line| line.dimension == "可写路径")
+            .expect("four dimensions include the writable path");
+        assert_eq!(writable.state, "enforced");
+        assert!(
+            writable
+                .detail
+                .contains(&workspaces_root.display().to_string()),
+            "the writable range names the root a caller is held to: {}",
+            writable.detail
+        );
+        assert_eq!(
+            reading.lines.len(),
+            4,
+            "a missing dimension would read as a boundary that is not there"
         );
     }
 }

@@ -160,9 +160,43 @@ pub struct ResourceUsage {
     pub disk_mb_written: u32,
 }
 
+/// 命令与写盘实际被什么管住：一个维度一行。
+///
+/// `state` 的三种回答分得开三件事，因为把它们写成一件事是这张表最容易犯的错：
+/// `enforced` 是这一层真的会拒，拒绝时说得出范围；`declared` 是**部署**声明了这条
+/// 边界、这一层读不到它执行与否；`none` 是这一层根本不设边界。默认部署里没有独立
+/// 执行器时，网络与资源两行就该是 `none`——把它写成 `enforced` 会让不隔离的部署
+/// 读起来和隔离部署一样。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundaryLine {
+    pub dimension: String,
+    pub state: String,
+    pub detail: String,
+}
+
+/// 对话里的命令跑在什么样的环境里，由跑它的那一层自己回答。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxBoundary {
+    /// 执行环境的名字，对端自报：`executor`（独立执行器）或 `local`（进程内）。
+    pub kind: String,
+    /// 是否隔着一次进程/容器边界。`false` 时「沙箱」只是同一个进程里跑命令。
+    pub isolated: bool,
+    /// 这条命令落在哪棵树上；没有车道或进程内运行时没有这一格。
+    pub workdir: Option<String>,
+    pub lines: Vec<BoundaryLine>,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn execute(&self, req: &SandboxRequest) -> crate::SFResult<SandboxResult>;
+
+    /// 这次调用落在什么样的环境里。
+    ///
+    /// 默认回答「说不出来」，而不是给一份空边界：说不出边界的后端与边界为空的后端
+    /// 是两件事，前者不该被读成后者，更不该被读成「哪里都能写」。
+    async fn boundary(&self) -> crate::SFResult<SandboxBoundary> {
+        Err(crate::SFError::Agent("这个后端说不出自己的边界".into()))
+    }
     /// Pre-compile WASM module and cache, reducing repeated compilation cost.
     async fn precompile(&self, bytes: &[u8]) -> crate::SFResult<String>;
 
