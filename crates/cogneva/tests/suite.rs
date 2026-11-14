@@ -299,6 +299,7 @@ mod e2e_integration;
 mod enumerations_name_every_variant_the_enum_declares_test;
 #[path = "env_names_are_declared_once_test.rs"]
 mod env_names_are_declared_once_test;
+
 #[path = "eval_report_is_readable_after_a_run.rs"]
 mod eval_report_is_readable_after_a_run;
 #[path = "eval_table_determinism.rs"]
@@ -323,6 +324,8 @@ mod every_first_party_container_prints_time_in_the_clusters_timezone_test;
 mod every_reflection_row_states_what_closes_it_test;
 #[path = "every_rendered_profile_is_a_tree_the_deployer_delivers_test.rs"]
 mod every_rendered_profile_is_a_tree_the_deployer_delivers_test;
+#[path = "every_served_route_is_a_face_or_says_who_it_serves_test.rs"]
+mod every_served_route_is_a_face_or_says_who_it_serves_test;
 #[path = "export_package_names_test.rs"]
 mod export_package_names_test;
 #[path = "gateway_answers_a_waited_prompt.rs"]
