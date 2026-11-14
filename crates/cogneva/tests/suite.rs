@@ -111,6 +111,8 @@ mod a_retired_row_carries_the_measurement_that_falsified_it_test;
 mod a_retry_loop_that_pipes_its_command_judges_the_last_stage_test;
 #[path = "a_roster_entry_is_removed_by_identity_and_a_dead_one_is_never_handed_back_test.rs"]
 mod a_roster_entry_is_removed_by_identity_and_a_dead_one_is_never_handed_back_test;
+#[path = "a_shared_index_makes_every_writer_carry_every_memory_test.rs"]
+mod a_shared_index_makes_every_writer_carry_every_memory_test;
 #[path = "a_shared_query_is_spelt_once_test.rs"]
 mod a_shared_query_is_spelt_once_test;
 #[path = "a_successful_write_rings_the_bell.rs"]
