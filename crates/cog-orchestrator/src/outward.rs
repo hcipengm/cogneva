@@ -1399,29 +1399,55 @@ mod tests {
         census.record_items("rust", "failed", 1).await;
 
         let metrics = census.collect_metrics("").await.expect("a reading");
-        let find = |name: &str, source: Option<&str>, result: Option<&str>| -> Option<f64> {
-            metrics
-                .iter()
-                .find(|m| {
-                    m.name == name
-                        && source.is_none_or(|s| {
-                            m.labels.get(LABEL_SOURCE).map(String::as_str) == Some(s)
-                        })
-                        && result.is_none_or(|r| {
-                            m.labels.get(crate::LABEL_RESULT).map(String::as_str) == Some(r)
-                        })
-                })
-                .map(|m| m.value)
-        };
-        assert_eq!(find(PASSES_METRIC, Some("rust"), Some("ok")), Some(1.0));
         assert_eq!(
-            find(PASSES_METRIC, Some("rust"), Some("http_error")),
+            metric_value(&metrics, PASSES_METRIC, Some("rust"), Some("ok")),
             Some(1.0)
         );
-        assert_eq!(find(ITEMS_METRIC, Some("rust"), Some("handed")), Some(2.0));
-        assert_eq!(find(ITEMS_METRIC, Some("rust"), Some("already_held")), None);
-        assert_eq!(find(CONFIG_METRIC, None, Some("ok")), Some(1.0));
-        assert_eq!(find(SOURCES_METRIC, None, None), Some(2.0));
+        assert_eq!(
+            metric_value(&metrics, PASSES_METRIC, Some("rust"), Some("http_error")),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric_value(&metrics, ITEMS_METRIC, Some("rust"), Some("handed")),
+            Some(2.0)
+        );
+        assert_eq!(
+            metric_value(&metrics, ITEMS_METRIC, Some("rust"), Some("already_held")),
+            None
+        );
+        assert_eq!(
+            metric_value(&metrics, CONFIG_METRIC, None, Some("ok")),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric_value(&metrics, SOURCES_METRIC, None, None),
+            Some(2.0)
+        );
+    }
+
+    /// The value of the one series a reader is asking about.
+    ///
+    /// `source` and `result` are optional because two of the four readings are
+    /// published without them. `None` there means "do not constrain on this
+    /// label", not "match an empty value": a call that omits one must not be
+    /// satisfied by a series that happens to carry an empty label.
+    fn metric_value(
+        metrics: &[RawMetric],
+        name: &str,
+        source: Option<&str>,
+        result: Option<&str>,
+    ) -> Option<f64> {
+        metrics
+            .iter()
+            .find(|m| {
+                m.name == name
+                    && source
+                        .is_none_or(|s| m.labels.get(LABEL_SOURCE).map(String::as_str) == Some(s))
+                    && result.is_none_or(|r| {
+                        m.labels.get(crate::LABEL_RESULT).map(String::as_str) == Some(r)
+                    })
+            })
+            .map(|m| m.value)
     }
 
     #[test]
