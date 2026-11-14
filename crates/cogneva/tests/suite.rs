@@ -75,6 +75,8 @@ mod a2a_rpc_round_trip;
 mod a_cache_share_is_a_share_not_a_difference_test;
 #[path = "a_claim_the_capacity_loop_raises_is_one_it_was_told_about_test.rs"]
 mod a_claim_the_capacity_loop_raises_is_one_it_was_told_about_test;
+#[path = "a_committer_run_twice_does_not_overlap_its_own_shared_artifacts_test.rs"]
+mod a_committer_run_twice_does_not_overlap_its_own_shared_artifacts_test;
 #[path = "a_crate_is_a_component_not_a_bridge_test.rs"]
 mod a_crate_is_a_component_not_a_bridge_test;
 #[path = "a_day_is_named_by_one_clock_test.rs"]
