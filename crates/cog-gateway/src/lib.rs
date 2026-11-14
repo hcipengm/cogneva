@@ -2354,14 +2354,61 @@ async fn readiness_check(State(state): State<Arc<GatewayState>>) -> Response {
 }
 
 /// Parse query string into a HashMap of key-value pairs.
+///
+/// The values are handed to callers that use them as credentials and as
+/// identifiers (`?token=` on the WebSocket upgrade is one), so `%XX` escapes
+/// are decoded here: a client that percent-encodes its token, as RFC 3986
+/// says it may, would otherwise have it verified percent-encoded, and that
+/// fails as a bad token rather than as a bad encoding.
+///
+/// `+` is left as written: it is a literal in a JWT and in every other
+/// value this is called with, not the space it means in a form body.
 fn parse_query_params(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            params.insert(k.to_string(), v.to_string());
+            params.insert(percent_decode(k), percent_decode(v));
         }
     }
     params
+}
+
+/// Decode the `%XX` escapes in one query-string component.
+///
+/// A malformed escape (`%` with no two hexadecimal digits behind it) is kept
+/// as written rather than dropped or truncated: the answer a caller gives
+/// about a bad credential has to be about the credential it was handed.
+fn percent_decode(component: &str) -> String {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Some(byte) = percent_decode_escape(bytes[index + 1], bytes[index + 2]) {
+                decoded.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// The byte two hexadecimal digits spell, or `None` when either is not one.
+fn percent_decode_escape(high: u8, low: u8) -> Option<u8> {
+    Some((percent_decode_digit(high)? << 4) | percent_decode_digit(low)?)
+}
+
+/// The value of one hexadecimal digit, or `None` when the byte is not one.
+fn percent_decode_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn ws_handler(
