@@ -349,6 +349,23 @@ pub fn with_quota_stores(
     Arc::new(state)
 }
 
+/// The same state, with a transcript behind it.
+///
+/// The suites that judge who may read a conversation need `owner_of` to answer
+/// something other than "this deployment keeps no transcript": with no handle
+/// the read face answers an empty list, which is a truthful answer to a
+/// different question.
+pub fn with_chat_turns(turns: cog_gateway::ChatTurnHandle) -> Arc<GatewayState> {
+    // `GatewayState` is not `Debug`, so `expect` cannot report the handle it
+    // failed to take apart; the message is the whole diagnosis anyway.
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.chat_turns = turns;
+    Arc::new(state)
+}
+
 fn build(
     datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,

@@ -137,6 +137,72 @@ fn start_chat_turn(
     });
 }
 
+/// 这一句能不能落进 `session_id` 那段对话。不能时把原因作为一条回答发回这条
+/// 连接——静默丢掉会让人以为说过了。
+async fn refuses_session(
+    state: &Arc<GatewayState>,
+    out_tx: &tokio::sync::mpsc::Sender<String>,
+    conn: Connection<'_>,
+    session_id: Option<&str>,
+    content: &str,
+) -> bool {
+    let Some(session) = session_id.filter(|s| !s.trim().is_empty()) else {
+        // 没有会话号的那一句落进 `default`，与 `start_chat_turn` 用的是同一个默认。
+        return false;
+    };
+    let Err(reason) = crate::sessions::speaks_here(state, session, conn.user_id).await else {
+        return false;
+    };
+    // 回声与回答都发在这一段会话上：界面已经把这句画在屏幕上了，答在这里，
+    // 读的人才知道它为什么没有下文。
+    let user_mid = format!("user-{}", uuid::Uuid::new_v4());
+    let assistant_mid = format!("assistant-{}", uuid::Uuid::new_v4());
+    for (kind, inner) in [
+        (
+            "message.start",
+            serde_json::json!({ "message_id": user_mid, "role": "user", "attachment": serde_json::Value::Null }),
+        ),
+        (
+            "message.text_delta",
+            serde_json::json!({ "message_id": user_mid, "delta": content }),
+        ),
+        ("message.end", serde_json::json!({ "message_id": user_mid })),
+        (
+            "message.start",
+            serde_json::json!({ "message_id": assistant_mid, "role": "assistant", "attachment": serde_json::Value::Null }),
+        ),
+        (
+            "message.text_delta",
+            serde_json::json!({ "message_id": assistant_mid, "delta": reason }),
+        ),
+        (
+            "message.end",
+            serde_json::json!({ "message_id": assistant_mid }),
+        ),
+    ] {
+        let frame = crate::websocket_protocol::ServerMessage::AgentEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            session_id: Some(session.to_string()),
+            task_id: None,
+            payload: serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "type": kind,
+                "timestamp": now_iso(),
+                "payload": inner,
+            }),
+            server_time: now_iso(),
+        };
+        let _ = out_tx
+            .send(serde_json::to_string(&frame).unwrap_or_default())
+            .await;
+    }
+    true
+}
+
+/// 把这条 socket 接上这一段对话的流（第一次接时顺带收一份快照）。
+///
+/// 没给会话号的那一句落进 `default`，与 [`start_chat_turn`] 用的是同一个默认——
+/// 两处各算一遍，接上的那一段与跑起来的那一段就有可能不是一个。
 fn watch_session(
     state: &Arc<GatewayState>,
     watched: &mut std::collections::HashSet<String>,
@@ -210,6 +276,10 @@ async fn handle_type_message(
             if content.is_empty() && attachments.is_empty() {
                 return Ok(());
             }
+            // 别人的对话不进：这一句连循环都不交出去，只在屏幕上说明原因。
+            if refuses_session(state, out_tx, conn, session_id.as_deref(), &content).await {
+                return Ok(());
+            }
             watch_session(state, watched, session_id.as_deref(), out_tx);
             start_chat_turn(
                 state,
@@ -232,6 +302,17 @@ async fn handle_type_message(
             let invocation = crate::commands::Invocation { name, arguments };
             // 空名字不是一条命令，也不是一句话：什么都不说就是不说话。
             if invocation.line().trim() == "/" {
+                return Ok(());
+            }
+            if refuses_session(
+                state,
+                out_tx,
+                conn,
+                session_id.as_deref(),
+                &invocation.line(),
+            )
+            .await
+            {
                 return Ok(());
             }
             watch_session(state, watched, session_id.as_deref(), out_tx);
@@ -348,6 +429,13 @@ async fn handle_type_message(
                 return Ok(());
             };
 
+            // 换的是这一段对话的属性，所以先判这一段能不能由这个人改。
+            if let Err(reason) = crate::sessions::speaks_here(state, &session, conn.user_id).await {
+                let resp = answer(None, Some(reason));
+                send_server_message(socket, &resp).await?;
+                return Ok(());
+            }
+
             // 空串是「改回默认」：清单列不出来的那一只不该靠它恢复，所以这一支
             // 不看清单。真要挑一只时，清单外的一律不收——收下来，下一轮就会用
             // 一只平台根本没配的模型发请求。
@@ -400,8 +488,17 @@ async fn handle_type_message(
             // 没有在跑的那一段上按停止不是错：用户可能刚好在上一轮结束的那一瞬
             // 按下去。这时什么都不发生，也不该有一条「取消失败」的帧——他真正
             // 关心的是屏幕上那一轮停了没有，而它已经停了。
-            let stopped = state.chat_stream.running().cancel(&session_id);
-            tracing::debug!(session = %session_id, stopped, "chat cancel");
+            // 别人的对话停不了：停按会话寻址，而名册是整台部署共用的（见 E3），
+            // 没有这一步，猜一个会话号就能掐掉别人正在跑的那一轮。
+            match crate::sessions::speaks_here(state, &session_id, conn.user_id).await {
+                Ok(()) => {
+                    let stopped = state.chat_stream.running().cancel(&session_id);
+                    tracing::debug!(session = %session_id, stopped, "chat cancel");
+                }
+                Err(reason) => {
+                    tracing::debug!(session = %session_id, %reason, "chat cancel refused");
+                }
+            }
         }
     }
 

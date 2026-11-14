@@ -6,7 +6,9 @@
 //! reply never came is kept but kept out of the prompt's history, that the bound
 //! applies per session rather than to the table as a whole, and that the
 //! transcript survives a new store handle -- which is the whole point, since the
-//! store this replaced lived in one process and died with it.
+//! store this replaced lived in one process and died with it. A fifth is the
+//! claim itself: which of the rows that named an owner owns the session, and
+//! that speaking in it later does not hand it over.
 //!
 //! It is ignored by default and needs `COGNEVA_TEST_DATABASE_URL` pointing at a
 //! throwaway database:
@@ -773,6 +775,88 @@ async fn a_listing_is_one_persons_conversations_newest_first_and_search_is_liter
         .await
         .expect("list with an empty identity");
     assert!(unowned.is_empty(), "空身份拿到了会话名单");
+
+    cleanup(&probe).await;
+}
+
+/// 一段对话归谁，是这个库说的话，不是调用方记忆里的东西。
+///
+/// 三件事在这里才有意义：没有人写过字的段子什么人都认领不了；写的都是匿名行时
+/// 它仍然不属于谁（那些话在哪一次改动之前就存在，没有谁是能替它挡住别人的）；
+/// 第一个写下名字的人认领之后，后来的人再说话也不改归属——否则第二个人在这里
+/// 说一句就把第一个人那一段变成自己的。
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn the_first_row_that_named_an_owner_claims_the_session_for_good() {
+    let probe = probe().await;
+    let session = format!("{}-claim", probe.session);
+    let first = format!("{}-first", probe.owner);
+    let second = format!("{}-second", probe.owner);
+
+    assert_eq!(
+        probe
+            .store
+            .owner_of(&session)
+            .await
+            .expect("a name nobody ever wrote asks nothing of the database"),
+        None,
+        "一段从来没有写过的对话被认成了有主"
+    );
+
+    probe
+        .store
+        .record_turn(
+            &session,
+            "",
+            "匿名的一问",
+            None,
+            &[],
+            "匿名的一答",
+            &[],
+            None,
+        )
+        .await
+        .expect("record a turn from a connection with no identity");
+    assert_eq!(
+        probe
+            .store
+            .owner_of(&session)
+            .await
+            .expect("read the owner of a session of anonymous rows"),
+        None,
+        "只有匿名行的一段被认成了有主：读的人会把老记录当成自己的"
+    );
+
+    probe
+        .store
+        .record_turn(&session, &first, "第一问", None, &[], "第一答", &[], None)
+        .await
+        .expect("record the first named turn");
+    assert_eq!(
+        probe
+            .store
+            .owner_of(&session)
+            .await
+            .expect("read the claim"),
+        Some(first.clone()),
+        "第一个写下名字的人没有认领到这一段"
+    );
+
+    // 存储不替网关判「能不能在这里说话」：网关会拒，但万一有行进来了，认领也不改。
+    probe
+        .store
+        .record_turn(&session, &second, "第二问", None, &[], "第二答", &[], None)
+        .await
+        .expect("record a turn from another person");
+    assert_eq!(
+        probe
+            .store
+            .owner_of(&session)
+            .await
+            .expect("read the claim again"),
+        Some(first.clone()),
+        "第二个人在这里说了一句就接手了这段对话"
+    );
 
     cleanup(&probe).await;
 }

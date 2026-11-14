@@ -298,6 +298,22 @@ pub trait ChatTurnStore: Send + Sync {
     /// person most needs to find again.
     async fn transcript(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurnRecord>>;
 
+    /// Who this conversation belongs to, when a row ever named an owner.
+    ///
+    /// `None` is not "nobody owns it" in the sense of a policy; it is the
+    /// measured fact that no row of this session carries a name. Sessions
+    /// recorded before the owner column existed and sessions spoken in by a
+    /// connection without a login identity both read `None` — and that is the
+    /// honest answer for both, because there is no person whose access to it
+    /// could be defended. A caller deciding whether to hand the transcript to
+    /// someone reads this and decides; the store does not decide for it.
+    ///
+    /// The first row that names an owner claims the session: a conversation
+    /// does not change hands because a later turn was written by another
+    /// person, and answering with the newest name would let the second speaker
+    /// take the first one's conversation by speaking in it.
+    async fn owner_of(&self, session_id: &str) -> SFResult<Option<String>>;
+
     /// One person's conversations, newest activity first.
     ///
     /// Scoped by `owner` rather than answered from every row: the transcript

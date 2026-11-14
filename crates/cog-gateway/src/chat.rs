@@ -3933,6 +3933,18 @@ mod tests {
 
         /// 名单按人过滤、最近说话的在前。与真实实现同一套判据：别人的行不出现，
         /// 搜索只在同一个人的行里找，空身份一条都不给。
+        async fn owner_of(&self, session_id: &str) -> cog_core::SFResult<Option<String>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(cog_core::SFError::Database("unreachable".into()));
+            }
+            // 与 SQL 同一个读法：最早一条写了名字的行认领这一段。
+            let lines = self.lines.lock().await;
+            Ok(lines
+                .iter()
+                .find(|(session, owner, _)| session == session_id && !owner.is_empty())
+                .map(|(_, owner, _)| owner.clone()))
+        }
+
         async fn sessions(
             &self,
             owner: &str,

@@ -427,6 +427,23 @@ impl ChatTurnStore for PostgresChatTurnStore {
             .collect()
     }
 
+    async fn owner_of(&self, session_id: &str) -> SFResult<Option<String>> {
+        // The first named row claims the session: an empty owner means "written
+        // before anyone was identified", and skipping those rows is what makes
+        // the answer stable once a name is on the session. `LIMIT 1` over the
+        // id order, not `MIN(owner)` -- the claim belongs to the earliest row.
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT owner FROM chat_turns \
+             WHERE session_id = $1 AND owner <> '' \
+             ORDER BY id ASC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read who a chat session belongs to: {e}")))?;
+        Ok(row.map(|(owner,)| owner))
+    }
+
     async fn sessions(
         &self,
         owner: &str,
