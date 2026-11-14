@@ -708,7 +708,14 @@ impl TaskExecutorRouter {
             // same shutdown signal.
             drop(cog_core::loop_health::spawn(
                 reclaim_loop_name,
-                cog_core::loop_health::Cadence::Periodic(CLAIM_INTERVAL),
+                // The cycle awaits an execution permit inside `sweep_stalled_ready`,
+                // and that wait's duration is owned by the task holding the permit,
+                // bounded by this file's invariant that PENDING_IDLE_MS exceeds the
+                // longest running execution -- so the work bound is that same number.
+                cog_core::loop_health::Cadence::PeriodicWithWork {
+                    period: CLAIM_INTERVAL,
+                    work: Duration::from_millis(PENDING_IDLE_MS),
+                },
                 sweep_shutdown.clone(),
                 // Rebuilt per attempt, so everything the body consumes is cloned here.
                 move |beat| {
