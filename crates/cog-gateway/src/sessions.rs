@@ -292,6 +292,11 @@ pub async fn list_messages_handler(
                         // 由下一轮装进提示词。把 base64 也发给浏览器，是让每一次
                         // 重开都把整段对话的附件重新下载一遍。
                         "attachments": turn.attachments,
+                        // 这一轮调过什么、谁答的。实时帧只活在连接里，页面关掉
+                        // 之后「这一段对话的待办清单」与「回答是谁写的」都只剩这一
+                        // 格还写着；不带回去，重开就是一段只剩一问一答的对话。
+                        "tool_calls": turn.tool_calls,
+                        "agent_id": turn.agent,
                         "created_at": turn.created_at,
                     })
                 })

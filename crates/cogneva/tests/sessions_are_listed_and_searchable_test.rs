@@ -117,7 +117,7 @@ fn only_my_own_conversations_are_listed_and_no_identity_is_refused() {
     );
     let chat = read_repo(CHAT);
     assert!(
-        chat.contains(".record_turn(session_id, owner, user, model, attachments, assistant)"),
+        chat.contains(".record_turn(\n            session_id,\n            owner,"),
         "{CHAT} 写记录时不带身份：会话名下的每一行都成了「不属于任何人」"
     );
 

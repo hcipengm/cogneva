@@ -75,12 +75,30 @@ async fn a_turn_reads_back_in_the_order_it_was_said_and_from_another_handle() {
     let probe = probe().await;
     probe
         .store
-        .record_turn(&probe.session, &probe.owner, "第一问", None, &[], "第一答")
+        .record_turn(
+            &probe.session,
+            &probe.owner,
+            "第一问",
+            None,
+            &[],
+            "第一答",
+            &[],
+            None,
+        )
         .await
         .expect("record the first turn");
     probe
         .store
-        .record_turn(&probe.session, &probe.owner, "第二问", None, &[], "第二答")
+        .record_turn(
+            &probe.session,
+            &probe.owner,
+            "第二问",
+            None,
+            &[],
+            "第二答",
+            &[],
+            None,
+        )
         .await
         .expect("record the second turn");
 
@@ -133,7 +151,16 @@ async fn a_session_that_was_never_recorded_reads_empty_and_a_limit_of_zero_asks_
 
     probe
         .store
-        .record_turn(&probe.session, &probe.owner, "问", None, &[], "答")
+        .record_turn(
+            &probe.session,
+            &probe.owner,
+            "问",
+            None,
+            &[],
+            "答",
+            &[],
+            None,
+        )
         .await
         .expect("record a turn");
     // limit 0 是「一条也不要」，不是「不限」——读成后者会把整段对话塞进一次请求。
@@ -157,7 +184,16 @@ async fn the_bound_trims_one_session_and_leaves_another_alone() {
     let quiet = format!("{}-quiet", probe.session);
     probe
         .store
-        .record_turn(&quiet, &probe.owner, "安静的一问", None, &[], "安静的一答")
+        .record_turn(
+            &quiet,
+            &probe.owner,
+            "安静的一问",
+            None,
+            &[],
+            "安静的一答",
+            &[],
+            None,
+        )
         .await
         .expect("record the quiet session");
 
@@ -173,6 +209,8 @@ async fn the_bound_trims_one_session_and_leaves_another_alone() {
                 None,
                 &[],
                 &format!("答{i}"),
+                &[],
+                None,
             )
             .await
             .expect("record a turn of the busy session");
@@ -237,6 +275,8 @@ async fn an_unanswered_turn_is_kept_out_of_the_history_but_not_out_of_the_table(
             "上游坏了的时候问的话",
             &[],
             "API error 503",
+            &[],
+            None,
         )
         .await
         .expect("record an unanswered turn");
@@ -285,6 +325,8 @@ async fn an_unanswered_turn_is_kept_out_of_the_history_but_not_out_of_the_table(
             None,
             &[],
             "答",
+            &[],
+            None,
         )
         .await
         .expect("record an answered turn");
@@ -329,6 +371,8 @@ async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
             &[],
             "已受理",
             "goal-7788",
+            &[],
+            None,
         )
         .await
         .expect("record a dispatched turn");
@@ -341,6 +385,8 @@ async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
             None,
             &[],
             "这个直接答",
+            &[],
+            None,
         )
         .await
         .expect("record an answered turn");
@@ -385,13 +431,109 @@ async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
     cleanup(&probe).await;
 }
 
+/// 这一轮调过的工具与回答者，随助手那一行一起回来。
+///
+/// 重开页面时那张待办面板只从记录里画得出来：实时帧在页面关掉那一刻就断了。
+/// 所以这里读的不是「写进去了没有」，而是「读回来还是不是那一笔」——名字、入参、
+/// 结果、结局、两头的时刻，以及谁答的。少任何一格，面板要么空着，要么把跑到
+/// 一半的调用画成已经返回。
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn the_tools_a_turn_ran_and_its_answerer_read_back_with_the_row() {
+    let probe = probe().await;
+    let started = chrono::Utc::now();
+    let finished = started + chrono::Duration::seconds(3);
+    let calls = vec![
+        cog_storage::ChatToolCall {
+            tool_call_id: "call-write".into(),
+            tool_name: "write_file".into(),
+            args: "{\"path\":\"src/main.rs\"}".into(),
+            result: Some("{\"ok\":true}".into()),
+            status: cog_storage::ChatToolCallStatus::Ok,
+            started_at: started,
+            finished_at: Some(finished),
+        },
+        cog_storage::ChatToolCall {
+            tool_call_id: "call-hung".into(),
+            tool_name: "run_command".into(),
+            args: "{\"command\":\"sleep 600\"}".into(),
+            result: None,
+            status: cog_storage::ChatToolCallStatus::Running,
+            started_at: started,
+            finished_at: None,
+        },
+    ];
+    probe
+        .store
+        .record_turn(
+            &probe.session,
+            &probe.owner,
+            "把这件事做了",
+            None,
+            &[],
+            "做完了",
+            &calls,
+            Some("kai-a9ab11fc"),
+        )
+        .await
+        .expect("record a turn that ran tools");
+
+    let transcript = probe
+        .store
+        .transcript(&probe.session, 40)
+        .await
+        .expect("read the transcript");
+    assert_eq!(transcript.len(), 2, "{transcript:?}");
+    // 调用是助手那一行做的事，不是问句的：问的人一个工具也没跑。
+    assert!(
+        transcript[0].tool_calls.is_empty() && transcript[0].agent.is_none(),
+        "问句那一行被写上了别人的工具调用：{transcript:?}"
+    );
+    assert_eq!(
+        transcript[1].tool_calls, calls,
+        "读回来的调用与写进去的不是同一笔"
+    );
+    assert_eq!(
+        transcript[1].agent.as_deref(),
+        Some("kai-a9ab11fc"),
+        "回答者没跟着回来：重开之后这一段是谁答的认不出来"
+    );
+
+    // 没调工具的轮不因此带上一个空数组之外的东西，也没被弄成失败。
+    probe
+        .store
+        .record_turn(
+            &probe.session,
+            &probe.owner,
+            "再问一句",
+            None,
+            &[],
+            "答",
+            &[],
+            None,
+        )
+        .await
+        .expect("record a plain turn");
+    let transcript = probe
+        .store
+        .transcript(&probe.session, 40)
+        .await
+        .expect("read the transcript again");
+    assert!(
+        transcript[3].tool_calls.is_empty() && transcript[3].agent.is_none(),
+        "没调工具的一轮被写上了上一轮的调用：{transcript:?}"
+    );
+
+    cleanup(&probe).await;
+}
+
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_turn_without_a_session_is_refused_rather_than_filed_under_nothing() {
     let probe = probe().await;
     let refused = probe
         .store
-        .record_turn("   ", &probe.owner, "问", None, &[], "答")
+        .record_turn("   ", &probe.owner, "问", None, &[], "答", &[], None)
         .await;
     assert!(
         refused.is_err(),
@@ -423,6 +565,8 @@ async fn an_attachment_rides_with_its_row_and_keeps_its_bytes() {
             None,
             std::slice::from_ref(&shot),
             "看到了",
+            &[],
+            None,
         )
         .await
         .expect("record a turn that carried a picture");
@@ -480,6 +624,8 @@ async fn a_command_keeps_both_the_line_typed_and_the_instructions_the_model_read
             Some(instructions),
             &[],
             "查到了",
+            &[],
+            None,
         )
         .await
         .expect("record a command turn");
@@ -531,17 +677,37 @@ async fn a_listing_is_one_persons_conversations_newest_first_and_search_is_liter
             None,
             &[],
             "第一答",
+            &[],
+            None,
         )
         .await
         .expect("record the first conversation");
     probe
         .store
-        .record_turn(&theirs, &stranger, "别人的会话", None, &[], "别人的答")
+        .record_turn(
+            &theirs,
+            &stranger,
+            "别人的会话",
+            None,
+            &[],
+            "别人的答",
+            &[],
+            None,
+        )
         .await
         .expect("record someone else's conversation");
     probe
         .store
-        .record_turn(&mine_second, &probe.owner, "第二段", None, &[], "第二答")
+        .record_turn(
+            &mine_second,
+            &probe.owner,
+            "第二段",
+            None,
+            &[],
+            "第二答",
+            &[],
+            None,
+        )
         .await
         .expect("record the second conversation");
 

@@ -90,6 +90,41 @@ pub struct ChatAttachmentInfo {
     pub mime_type: String,
 }
 
+/// How one tool call ended. `Running` is a call the answer was written before it
+/// came back -- the turn is recorded when the reply is, not when the last tool
+/// settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatToolCallStatus {
+    Running,
+    Ok,
+    Error,
+}
+
+/// One tool call that ran while an answer was being written.
+///
+/// Kept with the transcript because the panel that shows it -- the todo list a
+/// conversation maintains -- is part of the conversation, not of the connection:
+/// close the page and reopen it, and the list must still be there. `args` and
+/// `result` are the JSON text the live frames carried rather than values: they
+/// are compared against what the page drew live, and re-encoding a value on the
+/// way out would let the two differ in spacing or key order while claiming to be
+/// the same call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatToolCall {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub args: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    pub status: ChatToolCallStatus,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When it came back, when it did before the turn was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// One line of the transcript as a reader shows it: with the row's identity, its
 /// time, and the reason it has no answer when it has none.
 ///
@@ -115,6 +150,16 @@ pub struct ChatTurnRecord {
     /// What came up with this line, by name and type. Empty for the answer's
     /// half, and empty for rows written before attachments existed.
     pub attachments: Vec<ChatAttachmentInfo>,
+    /// What the answer ran on its way to being written. Empty for the question's
+    /// half, for failed turns, and for rows written before this was kept.
+    pub tool_calls: Vec<ChatToolCall>,
+    /// The employee that answered, when the turn named one.
+    ///
+    /// The live page learns this from an `agent.identity` frame, which exists
+    /// only while the socket is open; a reopened page has no way to compute the
+    /// id (it carries a process fingerprint), so the record is the only place
+    /// that still knows who wrote the answer.
+    pub agent: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -161,6 +206,11 @@ pub trait ChatTurnStore: Send + Sync {
     /// `owner` 是这段对话属于谁，取套接字握手时认出来的那个人。空串是「这条连接
     /// 没有身份」：那时候写下的行不属于任何人，按人列出的名单里也不会出现它们——
     /// 凭空补一个名字，是给一件没有测过的事记一笔账。
+    // One argument per column the row carries -- and the two new ones are the
+    // columns that make a reopened conversation look like the one that was left:
+    // what the answer ran (the tool calls), and who ran it (the agent). A struct
+    // would only move the same list one level down.
+    #[allow(clippy::too_many_arguments)]
     async fn record_turn(
         &self,
         session_id: &str,
@@ -169,6 +219,8 @@ pub trait ChatTurnStore: Send + Sync {
         model_content: Option<&str>,
         attachments: &[ChatAttachment],
         assistant: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()>;
 
     /// Record one exchange whose reply handed the work to the orchestrator, and
@@ -192,9 +244,16 @@ pub trait ChatTurnStore: Send + Sync {
         attachments: &[ChatAttachment],
         assistant: &str,
         goal_id: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()>;
 
     /// Record one exchange whose reply never arrived, and why.
+    ///
+    /// The tool calls this turn ran are kept even though the answer did not
+    /// arrive: they are work that happened, and a person reopening the
+    /// conversation is looking for exactly that -- what it did before it failed.
+    /// The reply's half stays empty; a call is not an answer.
     ///
     /// A failed model call used to leave nothing behind: the words the user
     /// said to this platform existed only in the response they had just
@@ -202,6 +261,10 @@ pub trait ChatTurnStore: Send + Sync {
     /// earlier one had happened. The answer's absence is a fact about the turn,
     /// not a reason to forget the turn -- so the question is kept, and the row
     /// carries the reason instead of an answer.
+    // One argument per column the row carries: the session, the person, the words,
+    // the attachments, why no answer came, what the turn ran before it failed, and
+    // who ran it. A struct would only move the same list one level down.
+    #[allow(clippy::too_many_arguments)]
     async fn record_failed_turn(
         &self,
         session_id: &str,
@@ -209,6 +272,8 @@ pub trait ChatTurnStore: Send + Sync {
         user: &str,
         attachments: &[ChatAttachment],
         failure: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()>;
 
     /// The last `limit` lines of a session, oldest first.

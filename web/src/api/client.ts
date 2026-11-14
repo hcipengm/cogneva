@@ -331,7 +331,32 @@ export interface ChatTranscriptLine {
    * 把整段对话的图重新下载一遍。
    */
   attachments?: ChatAttachmentInfo[] | null;
+  /**
+   * 这一轮调过的工具，按调用顺序。
+   *
+   * 实时帧只活在连接里：页面关掉之后，「这段对话的待办清单」只剩这一格还写着。
+   * `result` / `finished_at` 空着表示那一笔在记录时还没收尾（这一轮被停了）。
+   */
+  tool_calls?: ChatToolCallLine[] | null;
+  /**
+   * 回答这一轮的是哪个执行者。名字里带进程指纹，页面自己算不出来——没有这一格，
+   * 重开之后工具调用归不到这一段下面。
+   */
+  agent_id?: string | null;
   created_at: string;
+}
+
+/** 记录里的一笔工具调用。 */
+export interface ChatToolCallLine {
+  tool_call_id: string;
+  tool_name: string;
+  /** 入参原文（JSON 文本）；没有入参时是空串。 */
+  args?: string;
+  /** 返回原文；还没收尾时不在这一格上。 */
+  result?: string | null;
+  status: 'running' | 'ok' | 'error';
+  started_at: string;
+  finished_at?: string | null;
 }
 
 /** 记录里一条附件的身份。 */

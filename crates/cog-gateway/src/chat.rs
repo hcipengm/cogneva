@@ -688,12 +688,21 @@ const EVENT_CHANNEL_CAP: usize = 512;
 // cap: bound — 停止之后等读回管道关闭的上限，界的是停止按钮的响应时间
 const STOPPED_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// 这一轮从循环里读回来的东西：回复正文，它派出去的目标号，它翻开过的变更。
+/// 这一轮从循环里读回来的东西：回复正文，它派出去的目标号，它翻开过的变更，
+/// 以及它调过的工具。
+///
+/// 工具调用记在这里而不是只转给界面：帧活在连接里，页面一关就断了，而重开时要
+/// 重画的那张待办面板只有这些调用能画出来。记的是**调用的结果**，不是「调用发生
+/// 过」——面板要的是最后一次写进去的清单。
 #[derive(Default)]
 struct TurnJournal {
     reply: String,
     goals: Vec<String>,
     changes: Vec<String>,
+    tool_calls: Vec<cog_core::ChatToolCall>,
+    /// 这一轮是谁在说。实时那句身份由 `agent.identity` 帧带给界面；页面关掉之后
+    /// 没有帧可读，记录是唯一还写着答案作者的地方。
+    agent: Option<String>,
 }
 
 /// 这一条连接上正在跑的轮，按会话号索引。
@@ -842,6 +851,10 @@ async fn pump_events(
     // 接起来——猜「是不是 dispatch_goal」只能看返回里有没有 goal_id，而别的工具也
     // 可以回一个目标号，那时界面会多出一条它并不负责的目标帧。
     let mut in_flight: HashMap<String, String> = HashMap::new();
+    // 调用号 → 这一笔在 `journal.tool_calls` 里的位置。结束那一帧只带调用号，
+    // 结果要补回到开始那一帧记下的那一笔上，而不是另起一笔——另起一笔会让面板
+    // 看到两次调用，其中一次永远没有结果。
+    let mut call_at: HashMap<String, usize> = HashMap::new();
     // 这一轮是谁在说，说过没有。名字从事件自己身上取：网关不重算一遍，两份
     // 名字算法迟早会有一个字母不一样，而那时界面按名字认人，认不出来也不报错。
     let mut told: Option<String> = None;
@@ -857,6 +870,11 @@ async fn pump_events(
             _ => None,
         };
         if let Some(agent_id) = speaker {
+            // 第一个开口的就是这一轮的回答者：之后要是有别的执行者在同一程度上
+            // 出声（派出去的活），那几句说的是那道目标的进展，不是这一问的回答。
+            if journal.agent.is_none() {
+                journal.agent = Some(agent_id.to_string());
+            }
             if told.as_deref() != Some(agent_id) {
                 told = Some(agent_id.to_string());
                 emit(
@@ -900,9 +918,21 @@ async fn pump_events(
             AgentEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
+                args,
+                timestamp,
                 ..
             } => {
-                in_flight.insert(tool_call_id, tool_name);
+                in_flight.insert(tool_call_id.clone(), tool_name.clone());
+                call_at.insert(tool_call_id.clone(), journal.tool_calls.len());
+                journal.tool_calls.push(cog_core::ChatToolCall {
+                    tool_call_id,
+                    tool_name,
+                    args: json_text(&args),
+                    result: None,
+                    status: cog_core::ChatToolCallStatus::Running,
+                    started_at: timestamp,
+                    finished_at: None,
+                });
             }
             // 目标身份单独发一帧：界面要拿它去接「这个目标下的执行者在做什么」，
             // 而不是去解析回复正文里的一个 id。值与工具回给模型的同一份。
@@ -913,49 +943,75 @@ async fn pump_events(
             AgentEvent::ToolExecutionEnd {
                 tool_call_id,
                 result,
+                is_error,
+                timestamp,
                 ..
-            } => match in_flight.remove(&tool_call_id).as_deref() {
-                Some("dispatch_goal") => {
-                    if let Some(goal_id) = result.get("goal_id").and_then(|v| v.as_str()) {
-                        if !journal.goals.iter().any(|g| g == goal_id) {
-                            journal.goals.push(goal_id.to_string());
-                            emit(
+            } => {
+                // 先把这一笔收尾，再读它的名字去派发目标／变更那两帧：两件事用
+                // 同一个调用号，但一件是「记下来给重开页面看」，另一件是「此刻
+                // 发给界面的一帧」。
+                if let Some(at) = call_at.remove(&tool_call_id) {
+                    if let Some(call) = journal.tool_calls.get_mut(at) {
+                        call.result = Some(json_text(&result));
+                        call.status = if is_error {
+                            cog_core::ChatToolCallStatus::Error
+                        } else {
+                            cog_core::ChatToolCallStatus::Ok
+                        };
+                        call.finished_at = Some(timestamp);
+                    }
+                }
+                match in_flight.remove(&tool_call_id).as_deref() {
+                    Some("dispatch_goal") => {
+                        if let Some(goal_id) = result.get("goal_id").and_then(|v| v.as_str()) {
+                            if !journal.goals.iter().any(|g| g == goal_id) {
+                                journal.goals.push(goal_id.to_string());
+                                emit(
                                 &out,
                                 &session_id,
                                 "message.goal",
                                 serde_json::json!({ "message_id": message_id, "goal_id": goal_id }),
                             )
                             .await;
+                            }
                         }
                     }
-                }
-                Some("get_change") => {
-                    let change_id = result
-                        .get("change")
-                        .and_then(|change| change.get("identity"))
-                        .and_then(|v| v.as_str());
-                    if let Some(change_id) = change_id {
-                        if !journal.changes.iter().any(|c| c == change_id) {
-                            journal.changes.push(change_id.to_string());
-                            emit(
-                                &out,
-                                &session_id,
-                                "message.change",
-                                serde_json::json!({
-                                    "message_id": message_id,
-                                    "change_id": change_id,
-                                }),
-                            )
-                            .await;
+                    Some("get_change") => {
+                        let change_id = result
+                            .get("change")
+                            .and_then(|change| change.get("identity"))
+                            .and_then(|v| v.as_str());
+                        if let Some(change_id) = change_id {
+                            if !journal.changes.iter().any(|c| c == change_id) {
+                                journal.changes.push(change_id.to_string());
+                                emit(
+                                    &out,
+                                    &session_id,
+                                    "message.change",
+                                    serde_json::json!({
+                                        "message_id": message_id,
+                                        "change_id": change_id,
+                                    }),
+                                )
+                                .await;
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
     journal
+}
+
+/// 一帧上的 JSON 值折成记录里的那一列。
+///
+/// 存文本而不是值：页面拿记录与它实时画过的那一笔对照，重新编码一个值会在空格
+/// 与键序上产生差别，而两笔看上去会是「同一次调用」。
+fn json_text(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 fn envelope(session_id: &str, event_type: &str, inner: serde_json::Value) -> String {
     let msg = ServerMessage::AgentEvent {
@@ -1412,6 +1468,7 @@ fn turns_to_messages(turns: Vec<cog_core::ChatTurn>) -> Vec<cog_core::Message> {
 
 /// 把这一轮写进记录。写不进去只留一条 warn：用户已经在等一个回答，拿「记不下来」
 /// 把回答吞掉，比丢一行历史更糟。
+#[allow(clippy::too_many_arguments)]
 async fn record_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
@@ -1420,6 +1477,8 @@ async fn record_turn(
     model: Option<&str>,
     attachments: &[cog_core::ChatAttachment],
     assistant: &str,
+    tool_calls: &[cog_core::ChatToolCall],
+    agent: Option<&str>,
 ) {
     let Some(store) = store else {
         tracing::warn!(
@@ -1429,7 +1488,16 @@ async fn record_turn(
         return;
     };
     if let Err(e) = store
-        .record_turn(session_id, owner, user, model, attachments, assistant)
+        .record_turn(
+            session_id,
+            owner,
+            user,
+            model,
+            attachments,
+            assistant,
+            tool_calls,
+            agent,
+        )
         .await
     {
         tracing::warn!(
@@ -1458,6 +1526,8 @@ async fn record_dispatched_turn(
     attachments: &[cog_core::ChatAttachment],
     assistant: &str,
     goal_id: &str,
+    tool_calls: &[cog_core::ChatToolCall],
+    agent: Option<&str>,
 ) {
     let Some(store) = store else {
         tracing::warn!(
@@ -1475,6 +1545,8 @@ async fn record_dispatched_turn(
             attachments,
             assistant,
             goal_id,
+            tool_calls,
+            agent,
         )
         .await
     {
@@ -1492,6 +1564,9 @@ async fn record_dispatched_turn(
 /// 就只活在他刚收到的那个响应里，下一次提问的上下文里也没有它——一段对话在最
 /// 需要留下证据的时候（上游坏了）反而是空的。原因写在同一行上，读者才知道这一
 /// 轮为什么有问无答；将来构建提示词时它不会当成模型说过的话被回放。
+// 每一格都是这一行上独立的一样东西，与 `ChatTurnStore` 那条方法一一对应：打包成
+// 一个结构体只是把同一个形状换个地方写一遍，调用点上就少了一格看得见的东西。
+#[allow(clippy::too_many_arguments)]
 async fn record_failed_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
@@ -1499,6 +1574,8 @@ async fn record_failed_turn(
     user: &str,
     attachments: &[cog_core::ChatAttachment],
     failure: &str,
+    tool_calls: &[cog_core::ChatToolCall],
+    agent: Option<&str>,
 ) {
     let Some(store) = store else {
         tracing::warn!(
@@ -1508,7 +1585,15 @@ async fn record_failed_turn(
         return;
     };
     if let Err(e) = store
-        .record_failed_turn(session_id, owner, user, attachments, failure)
+        .record_failed_turn(
+            session_id,
+            owner,
+            user,
+            attachments,
+            failure,
+            tool_calls,
+            agent,
+        )
         .await
     {
         tracing::warn!(
@@ -1573,6 +1658,7 @@ pub async fn run_chat_turn(
                  发出去只会被窗口截掉一半，所以这一轮没有发。"
             );
             emit_delta(&out, &session_id, &assistant_mid, &text).await;
+            // 这一句还没交给循环，工具一个都没跑过：工具那两格空空如也。
             record_failed_turn(
                 &state.chat_turns,
                 &session_id,
@@ -1580,6 +1666,8 @@ pub async fn run_chat_turn(
                 &content,
                 &attachments,
                 &text,
+                &[],
+                None,
             )
             .await;
             emit_message_end(&out, &session_id, &user_mid).await;
@@ -1620,6 +1708,7 @@ pub async fn run_chat_turn(
         emit_delta(&out, &session_id, &assistant_mid, reason).await;
         // 没答出来也要落库，且落在收尾帧之前：用户看到这一轮结束就立刻追问时，
         // 这一句若还没进记录，下一轮的上下文里就没有它。
+        // 这一段还没接到循环上，工具一个都没跑过。
         record_failed_turn(
             &state.chat_turns,
             &session_id,
@@ -1627,6 +1716,8 @@ pub async fn run_chat_turn(
             &content,
             &attachments,
             reason,
+            &[],
+            None,
         )
         .await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
@@ -1642,6 +1733,7 @@ pub async fn run_chat_turn(
     let Some(llm) = llm else {
         let reason = "LLM 未配置或未就绪，无法处理聊天消息。请先在右上角完成 LLM 设置。";
         emit_delta(&out, &session_id, &assistant_mid, reason).await;
+        // 循环没起来，工具一个都没跑过。
         record_failed_turn(
             &state.chat_turns,
             &session_id,
@@ -1649,6 +1741,8 @@ pub async fn run_chat_turn(
             &content,
             &attachments,
             reason,
+            &[],
+            None,
         )
         .await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
@@ -1684,6 +1778,7 @@ pub async fn run_chat_turn(
                     // 记成没答的那一轮：这句话确实对这个平台说过，认不出命令也是
                     // 这一轮的事实。没答的那一轮不进模型的历史（见 `history`），
                     // 所以模型不会把一句平台提示当成自己说过的话。
+                    // 命令没认出来，这一轮还没交给循环，工具一个都没跑过。
                     record_failed_turn(
                         &state.chat_turns,
                         &session_id,
@@ -1691,6 +1786,8 @@ pub async fn run_chat_turn(
                         &content,
                         &attachments,
                         &reason,
+                        &[],
+                        None,
                     )
                     .await;
                     emit_message_end(&out, &session_id, &assistant_mid).await;
@@ -1788,6 +1885,8 @@ pub async fn run_chat_turn(
         .await;
         // 记录先落，再发收尾帧：界面上收到上面那一帧会立刻允许追问，而下一轮读
         // 历史就在这之后——不先落库，被停掉的那一句在下一轮的上下文里不存在。
+        // 被叫停之前跑过的工具仍跟着这一轮记下来：它们确实跑过，而「停的时候
+        // 它已经在做什么」正是重开这段对话时最该看得见的那一半。
         record_failed_turn(
             &state.chat_turns,
             &session_id,
@@ -1795,6 +1894,8 @@ pub async fn run_chat_turn(
             &content,
             &attachments,
             reason,
+            &journal.tool_calls,
+            journal.agent.as_deref(),
         )
         .await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
@@ -1879,6 +1980,8 @@ pub async fn run_chat_turn(
                 &content,
                 &attachments,
                 err,
+                &journal.tool_calls,
+                journal.agent.as_deref(),
             )
             .await;
         }
@@ -1890,6 +1993,8 @@ pub async fn run_chat_turn(
                 &content,
                 &attachments,
                 "模型没有返回任何内容",
+                &journal.tool_calls,
+                journal.agent.as_deref(),
             )
             .await;
         }
@@ -1904,6 +2009,8 @@ pub async fn run_chat_turn(
                     &attachments,
                     &reply,
                     goal_id,
+                    &journal.tool_calls,
+                    journal.agent.as_deref(),
                 )
                 .await
             }
@@ -1916,6 +2023,8 @@ pub async fn run_chat_turn(
                     expansion.as_deref(),
                     &attachments,
                     &reply,
+                    &journal.tool_calls,
+                    journal.agent.as_deref(),
                 )
                 .await
             }
@@ -2267,6 +2376,98 @@ mod tests {
         assert!(frames[0].contains("agent.identity"), "{frames:?}");
         assert!(frames[1].contains("message.goal") && frames[1].contains("goal-1"));
         assert!(frames[2].contains("goal-2"));
+    }
+
+    /// 这一轮调过的工具要留在记录那一侧，而不是只发了帧。
+    ///
+    /// 帧活在连接里：页面一关，这段对话的待办面板就只剩一问一答。这里读的是
+    /// 那一轮结束之后还留着的东西——每一笔调用的名字、入参、结果、结局与两头的
+    /// 时刻，以及回答者是谁。少任何一格，重开时面板要么空着，要么把「跑到一半」
+    /// 画成「已经返回」。
+    #[tokio::test]
+    async fn the_tools_a_turn_ran_are_kept_where_a_reopened_page_reads_them() {
+        use cog_core::AgentEvent;
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (out_tx, _out_rx) = mpsc::channel(32);
+        let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
+        let pump = tokio::spawn(pump_events(
+            events_rx,
+            out_tx,
+            bus,
+            "s1".into(),
+            "m-1".into(),
+        ));
+
+        let started_at = chrono::Utc::now();
+        events_tx
+            .send(AgentEvent::ToolExecutionStart {
+                agent_id: "kai-a9ab11fc".into(),
+                tool_call_id: "call-write".into(),
+                tool_name: "write_file".into(),
+                args: serde_json::json!({ "path": "src/main.rs" }),
+                timestamp: started_at,
+            })
+            .await
+            .unwrap();
+        // 中途那一帧只带调用号与增量：它既不该另起一笔，也不该把这一笔收尾。
+        events_tx
+            .send(AgentEvent::ToolExecutionUpdate {
+                agent_id: "kai-a9ab11fc".into(),
+                tool_call_id: "call-write".into(),
+                partial_result: serde_json::json!("写了一半"),
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        // 没跑完的那一笔：被停掉的一轮里它是真的发生过，但没有结果。
+        events_tx
+            .send(AgentEvent::ToolExecutionStart {
+                agent_id: "kai-a9ab11fc".into(),
+                tool_call_id: "call-hung".into(),
+                tool_name: "run_command".into(),
+                args: serde_json::json!({ "command": "sleep 600" }),
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let finished_at = chrono::Utc::now();
+        events_tx
+            .send(AgentEvent::ToolExecutionEnd {
+                agent_id: "kai-a9ab11fc".into(),
+                tool_call_id: "call-write".into(),
+                result: serde_json::json!({ "ok": true }),
+                is_error: false,
+                timestamp: finished_at,
+            })
+            .await
+            .unwrap();
+        drop(events_tx);
+
+        let journal = pump.await.expect("pump finished");
+        assert_eq!(
+            journal.agent.as_deref(),
+            Some("kai-a9ab11fc"),
+            "回答者没留在记录里：重开之后这一段是谁答的、这些调用归给谁都不知道"
+        );
+        assert_eq!(journal.tool_calls.len(), 2, "{:?}", journal.tool_calls);
+
+        let write = &journal.tool_calls[0];
+        assert_eq!(write.tool_call_id, "call-write");
+        assert_eq!(write.tool_name, "write_file");
+        assert_eq!(write.args, "{\"path\":\"src/main.rs\"}");
+        assert_eq!(write.result.as_deref(), Some("{\"ok\":true}"));
+        assert_eq!(write.status, cog_core::ChatToolCallStatus::Ok);
+        assert_eq!(write.started_at, started_at);
+        assert_eq!(write.finished_at, Some(finished_at));
+
+        let hung = &journal.tool_calls[1];
+        assert_eq!(hung.tool_call_id, "call-hung");
+        assert_eq!(
+            hung.status,
+            cog_core::ChatToolCallStatus::Running,
+            "没收尾的一笔被记成了一个有结局的调用：重开之后它看起来像是跑完了"
+        );
+        assert!(hung.result.is_none() && hung.finished_at.is_none());
     }
 
     /// 这一轮的花销原样交给界面：网关不重算，只搬循环量出来的那一份。
@@ -2645,7 +2846,7 @@ mod tests {
     async fn the_history_the_model_sees_comes_from_the_store() {
         let store = std::sync::Arc::new(FakeTurns::default());
         store
-            .record_turn("s1", "u-1", "上一问", None, &[], "上一答")
+            .record_turn("s1", "u-1", "上一问", None, &[], "上一答", &[], None)
             .await
             .expect("seed the fake transcript");
         let handle: crate::ChatTurnHandle = Some(store.clone());
@@ -2675,7 +2876,7 @@ mod tests {
             ("s-new", "u-1", "新的一问"),
         ] {
             store
-                .record_turn(session, owner, line, None, &[], "答")
+                .record_turn(session, owner, line, None, &[], "答", &[], None)
                 .await
                 .expect("seed the fake transcript");
         }
@@ -2876,6 +3077,8 @@ mod tests {
                     data: "QUJD".into(),
                 }],
                 "看到了",
+                &[],
+                None,
             )
             .await
             .expect("seed the fake transcript");
@@ -2919,6 +3122,8 @@ mod tests {
                     data: "QUJD".into(),
                 }],
                 "读完了",
+                &[],
+                None,
             )
             .await
             .expect("seed the fake transcript");
@@ -2971,6 +3176,8 @@ mod tests {
             Some("先搜，再读。"),
             &[],
             "查到了",
+            &[],
+            None,
         )
         .await;
 
@@ -3019,7 +3226,7 @@ mod tests {
     async fn an_answered_turn_is_written_down_as_a_pair() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_turn(&handle, "s1", "u-1", "问", None, &[], "答").await;
+        record_turn(&handle, "s1", "u-1", "问", None, &[], "答", &[], None).await;
         let held = store.turns.lock().await.clone();
         assert_eq!(
             held,
@@ -3056,6 +3263,8 @@ mod tests {
             &[],
             "已受理",
             "goal-7",
+            &[],
+            None,
         )
         .await;
 
@@ -3081,7 +3290,7 @@ mod tests {
     async fn an_unanswered_turn_still_keeps_what_the_user_said() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_failed_turn(&handle, "s1", "u-1", "问", &[], "upstream 503").await;
+        record_failed_turn(&handle, "s1", "u-1", "问", &[], "upstream 503", &[], None).await;
 
         let held = store.unanswered.lock().await.clone();
         assert_eq!(
@@ -3101,8 +3310,8 @@ mod tests {
             .await
             .is_empty());
         // 不发散：这里只要求「不写进任何东西」——没有第二个家可写。
-        record_turn(&handle, "s1", "u-1", "问", None, &[], "答").await;
-        record_failed_turn(&handle, "s1", "u-1", "问", &[], "答不出来").await;
+        record_turn(&handle, "s1", "u-1", "问", None, &[], "答", &[], None).await;
+        record_failed_turn(&handle, "s1", "u-1", "问", &[], "答不出来", &[], None).await;
     }
 
     /// 读记录失败按「没有历史」回答，而不是按「历史是空的」记一笔。
@@ -3110,7 +3319,7 @@ mod tests {
     async fn a_transcript_that_cannot_be_read_answers_without_context() {
         let store = std::sync::Arc::new(FakeTurns::default());
         store
-            .record_turn("s1", "u-1", "问", None, &[], "答")
+            .record_turn("s1", "u-1", "问", None, &[], "答", &[], None)
             .await
             .expect("seed the fake transcript");
         store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3119,7 +3328,7 @@ mod tests {
             .await
             .is_empty());
         // 写也失败时不许把这一轮的回答吞掉：record_turn 只留 warn。
-        record_turn(&handle, "s1", "u-1", "问", None, &[], "答").await;
+        record_turn(&handle, "s1", "u-1", "问", None, &[], "答", &[], None).await;
     }
 
     /// 一份内存里的记录，只作测试替身。生产里没有它的对应物——这次改动拆掉的
@@ -3127,6 +3336,10 @@ mod tests {
     #[derive(Default)]
     struct FakeTurns {
         turns: tokio::sync::Mutex<Vec<cog_core::ChatTurn>>,
+        /// 每条助手行带回来的工具调用与回答者，按写入顺序与 `turns` 里的助手行
+        /// 一一对应。真实实现把这两样写在助手那一行上，替身分开存，`transcript`
+        /// 读的时候按同一个序号接回去。
+        calls: tokio::sync::Mutex<Vec<(Vec<cog_core::ChatToolCall>, Option<String>)>>,
         /// 有问无答的那几轮：留在记录里，但不进上下文（`history` 不返回它们）。
         unanswered: tokio::sync::Mutex<Vec<(String, String)>>,
         /// 交出去的那几轮与它们的目标：(问句, goal_id)。
@@ -3150,6 +3363,8 @@ mod tests {
             model: Option<&str>,
             attachments: &[cog_core::ChatAttachment],
             assistant: &str,
+            tool_calls: &[cog_core::ChatToolCall],
+            agent: Option<&str>,
         ) -> cog_core::SFResult<()> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(cog_core::SFError::Database("unreachable".into()));
@@ -3176,6 +3391,10 @@ mod tests {
                 content: assistant.to_string(),
                 attachments: Vec::new(),
             });
+            self.calls
+                .lock()
+                .await
+                .push((tool_calls.to_vec(), agent.map(str::to_string)));
             Ok(())
         }
 
@@ -3188,6 +3407,8 @@ mod tests {
             attachments: &[cog_core::ChatAttachment],
             assistant: &str,
             goal_id: &str,
+            tool_calls: &[cog_core::ChatToolCall],
+            agent: Option<&str>,
         ) -> cog_core::SFResult<()> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(cog_core::SFError::Database("unreachable".into()));
@@ -3211,6 +3432,10 @@ mod tests {
                 content: assistant.to_string(),
                 attachments: Vec::new(),
             });
+            self.calls
+                .lock()
+                .await
+                .push((tool_calls.to_vec(), agent.map(str::to_string)));
             self.dispatched
                 .lock()
                 .await
@@ -3225,6 +3450,8 @@ mod tests {
             user: &str,
             _attachments: &[cog_core::ChatAttachment],
             failure: &str,
+            _tool_calls: &[cog_core::ChatToolCall],
+            _agent: Option<&str>,
         ) -> cog_core::SFResult<()> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(cog_core::SFError::Database("unreachable".into()));
@@ -3271,27 +3498,42 @@ mod tests {
                 return Ok(Vec::new());
             }
             let turns = self.turns.lock().await;
+            let calls = self.calls.lock().await;
             let start = turns.len().saturating_sub(limit);
+            // 助手行与 `calls` 一一对应：问句那几行没有工具调用，也不占一格。
+            let mut assistant_at = 0usize;
             Ok(turns[start..]
                 .iter()
                 .enumerate()
-                .map(|(offset, turn)| cog_core::ChatTurnRecord {
-                    id: (start + offset) as i64 + 1,
-                    role: turn.role,
-                    content: turn.content.clone(),
-                    failure: None,
-                    goal: None,
-                    // 记录里只留认人的那两格，与真正的存储面一致：重开页面要认
-                    // 得出这一条带过一张图，不需要把那幅图再下载一遍。
-                    attachments: turn
-                        .attachments
-                        .iter()
-                        .map(|attachment| cog_core::ChatAttachmentInfo {
-                            name: attachment.name.clone(),
-                            mime_type: attachment.mime_type.clone(),
-                        })
-                        .collect(),
-                    created_at: chrono::Utc::now(),
+                .map(|(offset, turn)| {
+                    let (tool_calls, agent) = match turn.role {
+                        cog_core::ChatTurnRole::Assistant => {
+                            let held = calls.get(assistant_at).cloned().unwrap_or_default();
+                            assistant_at += 1;
+                            held
+                        }
+                        cog_core::ChatTurnRole::User => (Vec::new(), None),
+                    };
+                    cog_core::ChatTurnRecord {
+                        id: (start + offset) as i64 + 1,
+                        role: turn.role,
+                        content: turn.content.clone(),
+                        failure: None,
+                        goal: None,
+                        // 记录里只留认人的那两格，与真正的存储面一致：重开页面要认
+                        // 得出这一条带过一张图，不需要把那幅图再下载一遍。
+                        attachments: turn
+                            .attachments
+                            .iter()
+                            .map(|attachment| cog_core::ChatAttachmentInfo {
+                                name: attachment.name.clone(),
+                                mime_type: attachment.mime_type.clone(),
+                            })
+                            .collect(),
+                        tool_calls,
+                        agent,
+                        created_at: chrono::Utc::now(),
+                    }
                 })
                 .collect())
         }

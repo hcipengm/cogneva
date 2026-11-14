@@ -882,13 +882,16 @@ export function ConversationPane({
     // 活）它是自己在调工具的——那些帧带着它的 `agent_id` 落在同一条总线上，却
     // 一条都没有进过这一面：屏幕上只有一问一答，看起来像它一个工具都没用。
     // 身份由服务端的 `agent.identity` 帧带进来，前端算不出这个 id（名字里带进程
-    // 指纹），所以没有那一帧时这里什么也接不回来，而不是接错。
+    // 指纹），所以没有那一帧时这里什么也接不回来，而不是接错；重开页面时那一帧
+    // 不会重发，回答者改由记录里的 `agent_id` 补回来（见 `hydrate`）。
+    //
+    // 另一条路是会话号：从记录里重放回来的调用带着自己在哪一段，回答者那一格
+    // 空着的老轮也能靠它放回这一段下面——否则重开之后待办面板就空了。
     const own = session?.agentId;
-    if (own) {
-      for (const call of toolCalls) {
-        if (call.agent !== own) continue;
-        if (!collected.some((seen) => seen.id === call.id)) collected.push(call);
-      }
+    for (const call of toolCalls) {
+      const mine = (own && call.agent === own) || (call.session && call.session === sessionId);
+      if (!mine) continue;
+      if (!collected.some((seen) => seen.id === call.id)) collected.push(call);
     }
     for (const goal of goals) {
       for (const call of callsForGoal(toolCalls, goalLive?.[goal.id], goal.at)) {
@@ -896,7 +899,7 @@ export function ConversationPane({
       }
     }
     return collected.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
-  }, [goalLive, session?.agentId, session?.goals, toolCalls]);
+  }, [goalLive, session?.agentId, session?.goals, sessionId, toolCalls]);
   /**
    * 这道目标名下的执行者自己说的话。
    *

@@ -26,8 +26,8 @@ use sqlx::PgPool;
 use cog_core::{SFError, SFResult};
 
 pub use cog_core::contract::conversation::{
-    ChatAttachment, ChatAttachmentInfo, ChatSessionSummary, ChatTurn, ChatTurnRecord, ChatTurnRole,
-    ChatTurnStore, ROWS_KEPT_PER_SESSION,
+    ChatAttachment, ChatAttachmentInfo, ChatSessionSummary, ChatToolCall, ChatToolCallStatus,
+    ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore, ROWS_KEPT_PER_SESSION,
 };
 
 /// PostgreSQL chat transcript.
@@ -64,6 +64,8 @@ impl PostgresChatTurnStore {
         assistant: Option<&str>,
         failure: Option<&str>,
         goal: Option<&str>,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()> {
         if session_id.trim().is_empty() {
             return Err(SFError::Validation(
@@ -80,6 +82,17 @@ impl PostgresChatTurnStore {
         // 的东西——拆成表只会让「这一行带了几张图」变成一次 join。
         let attachments = serde_json::to_string(attachments)
             .map_err(|e| SFError::Validation(format!("attachments cannot be serialised: {e}")))?;
+        // 没有工具调用时写 `NULL` 而不是 `[]`：老行也是 `NULL`，两者对读者是同一
+        // 件事，写空数组只会让「这一行走过这条路径」与「这一行比这个列老」看起来
+        // 不同。
+        let tool_calls = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(tool_calls).map_err(|e| {
+                SFError::Validation(format!("tool calls cannot be serialised: {e}"))
+            })?)
+        };
+        let agent = agent.filter(|name| !name.trim().is_empty());
         let mut query = sqlx::query(match (assistant, goal) {
             (Some(_), Some(_)) => INSERT_DISPATCHED_TURN_SQL,
             (Some(_), None) => INSERT_TURN_SQL,
@@ -93,9 +106,20 @@ impl PostgresChatTurnStore {
                 .bind(attachments)
                 .bind(model)
                 .bind(reply)
-                .bind(goal_id),
-            (Some(reply), None) => query.bind(attachments).bind(model).bind(reply),
-            (None, _) => query.bind(failure.unwrap_or("")).bind(attachments),
+                .bind(goal_id)
+                .bind(tool_calls)
+                .bind(agent),
+            (Some(reply), None) => query
+                .bind(attachments)
+                .bind(model)
+                .bind(reply)
+                .bind(tool_calls)
+                .bind(agent),
+            (None, _) => query
+                .bind(failure.unwrap_or(""))
+                .bind(attachments)
+                .bind(tool_calls)
+                .bind(agent),
         };
         query
             .execute(&mut *tx)
@@ -120,23 +144,27 @@ impl PostgresChatTurnStore {
 /// One statement for the pair, so the transcript never holds a question whose
 /// answer is missing.
 const INSERT_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, owner, role, content, attachments, model_content) \
-VALUES ($1, $2, 'user', $3, $4, $5), ($1, $2, 'assistant', $6, NULL, NULL)";
+INSERT INTO chat_turns (session_id, owner, role, content, attachments, model_content, tool_calls, agent_id) \
+VALUES ($1, $2, 'user', $3, $4, $5, NULL, NULL), ($1, $2, 'assistant', $6, NULL, NULL, $7, $8)";
 
 /// The same pair for a turn that handed its work to the orchestrator. The goal
 /// goes on the assistant row only: the reply is where the platform said what it
 /// did with the message, and the question is not what carries a goal.
 const INSERT_DISPATCHED_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, owner, role, content, attachments, model_content, goal_id) \
-VALUES ($1, $2, 'user', $3, $4, $5), ($1, $2, 'assistant', $6, NULL, NULL, $7)";
+INSERT INTO chat_turns (session_id, owner, role, content, attachments, model_content, goal_id, tool_calls, agent_id) \
+VALUES ($1, $2, 'user', $3, $4, $5, NULL, NULL, NULL), ($1, $2, 'assistant', $6, NULL, NULL, $7, $8, $9)";
 
 /// The same pair for an exchange that never got an answer: the reply's content
 /// is empty because nothing was said, and `failure` carries why. Both rows get
 /// the reason so a reader that finds either half knows what happened to the
 /// turn.
+///
+/// The assistant row still carries the tool calls: a turn that ran tools and
+/// then failed to answer did that work, and "what it was doing when it broke" is
+/// the question a reopened conversation is read for.
 const INSERT_FAILED_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, owner, role, content, failure, attachments) \
-VALUES ($1, $2, 'user', $3, $4, $5), ($1, $2, 'assistant', '', $4, NULL)";
+INSERT INTO chat_turns (session_id, owner, role, content, failure, attachments, tool_calls, agent_id) \
+VALUES ($1, $2, 'user', $3, $4, $5, NULL, NULL), ($1, $2, 'assistant', '', $4, NULL, $6, $7)";
 
 /// Drop what fell out of the window. `NOT IN` over the newest rows keeps the
 /// bound per session rather than global: one busy session must not push another
@@ -165,8 +193,8 @@ ORDER BY id";
 /// of the `failure IS NULL` filter: the unanswered half is exactly what a
 /// reopened conversation has to show.
 const TRANSCRIPT_SQL: &str = "\
-SELECT id, role, content, failure, goal_id, attachments, created_at FROM ( \
-    SELECT id, role, content, failure, goal_id, attachments, created_at FROM chat_turns \
+SELECT id, role, content, failure, goal_id, attachments, tool_calls, agent_id, created_at FROM ( \
+    SELECT id, role, content, failure, goal_id, attachments, tool_calls, agent_id, created_at FROM chat_turns \
     WHERE session_id = $1 \
     ORDER BY id DESC LIMIT $2 \
 ) newest \
@@ -217,6 +245,21 @@ fn parse_attachments(raw: Option<&str>) -> SFResult<Vec<ChatAttachment>> {
     })
 }
 
+/// 一行的工具调用列。与附件同一种读法：`NULL` 与空串都是「这一行没有」。
+fn parse_tool_calls(raw: Option<&str>) -> SFResult<Vec<ChatToolCall>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(raw).map_err(|e| {
+        SFError::Database(format!(
+            "chat transcript holds tool calls this build cannot read: {e}"
+        ))
+    })
+}
+
 #[async_trait]
 impl ChatTurnStore for PostgresChatTurnStore {
     async fn record_turn(
@@ -227,6 +270,8 @@ impl ChatTurnStore for PostgresChatTurnStore {
         model_content: Option<&str>,
         attachments: &[ChatAttachment],
         assistant: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()> {
         self.write(
             session_id,
@@ -237,6 +282,8 @@ impl ChatTurnStore for PostgresChatTurnStore {
             Some(assistant),
             None,
             None,
+            tool_calls,
+            agent,
         )
         .await
     }
@@ -250,6 +297,8 @@ impl ChatTurnStore for PostgresChatTurnStore {
         attachments: &[ChatAttachment],
         assistant: &str,
         goal_id: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()> {
         if goal_id.trim().is_empty() {
             return Err(SFError::Validation(
@@ -267,6 +316,8 @@ impl ChatTurnStore for PostgresChatTurnStore {
             Some(assistant),
             None,
             Some(goal_id),
+            tool_calls,
+            agent,
         )
         .await
     }
@@ -278,6 +329,8 @@ impl ChatTurnStore for PostgresChatTurnStore {
         user: &str,
         attachments: &[ChatAttachment],
         failure: &str,
+        tool_calls: &[ChatToolCall],
+        agent: Option<&str>,
     ) -> SFResult<()> {
         self.write(
             session_id,
@@ -288,6 +341,8 @@ impl ChatTurnStore for PostgresChatTurnStore {
             None,
             Some(failure),
             None,
+            tool_calls,
+            agent,
         )
         .await
     }
@@ -329,6 +384,8 @@ impl ChatTurnStore for PostgresChatTurnStore {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
+            Option<String>,
             chrono::DateTime<chrono::Utc>,
         )> = sqlx::query_as(TRANSCRIPT_SQL)
             .bind(session_id)
@@ -338,7 +395,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
             .map_err(|e| SFError::Database(format!("read the chat transcript: {e}")))?;
         rows.into_iter()
             .map(
-                |(id, role, content, failure, goal, attachments, created_at)| {
+                |(id, role, content, failure, goal, attachments, tool_calls, agent, created_at)| {
                     let role = ChatTurnRole::parse(&role).ok_or_else(|| {
                         SFError::Database(format!(
                             "chat transcript holds a role this build cannot name: {role:?}"
@@ -359,6 +416,10 @@ impl ChatTurnStore for PostgresChatTurnStore {
                                 mime_type: attachment.mime_type,
                             })
                             .collect(),
+                        // 工具调用原样交回去：它们是重开页面时要重画的那张待办面板
+                        // 的唯一来源，实时帧在页面关掉那一刻就断了。
+                        tool_calls: parse_tool_calls(tool_calls.as_deref())?,
+                        agent: agent.filter(|name| !name.trim().is_empty()),
                         created_at,
                     })
                 },

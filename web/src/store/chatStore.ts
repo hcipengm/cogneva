@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { getSessionMessages, listChatSessions } from '@/api/client';
+import { useStreamStore } from '@/store/streamStore';
 import type { ChatSessionSummary } from '@/api/client';
 import type {
   ChatAttachment,
@@ -635,6 +636,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     try {
       const lines = await getSessionMessages(sessionId);
+      // 这一轮调过的工具放回同一本账：待办面板是从这本账里折出来的，而实时
+      // 帧在页面关掉那一刻就断了。不放回去，重开之后这段对话只剩一问一答，
+      // 它刚才做过的那些事一件都看不见。
+      //
+      // 每一笔都带着会话号：实时帧按 `agent_id` 归人，而记录读回来时我们正好
+      // 知道自己在读哪一段——回答者没被记下的老轮也能靠这一格放回正确的位置。
+      //
+      // 放在 `set` 外面：往另一本账里写是这一趟读回来的副作用，不是这一段
+      // 状态的一部分，塞进 updater 会让「算新状态」这件事顺带改了别处。
+      const replay = useStreamStore.getState().noteToolCall;
+      const rememberedAgent =
+        lines.map((line) => line.agent_id).find((id) => typeof id === 'string' && id) ?? null;
+      for (const line of lines) {
+        for (const call of line.tool_calls ?? []) {
+          replay({
+            id: call.tool_call_id,
+            agent: line.agent_id ?? rememberedAgent ?? null,
+            session: sessionId,
+            name: call.tool_name,
+            args: call.args || undefined,
+            result: call.result ?? undefined,
+            status: call.status,
+            at: call.finished_at ?? call.started_at,
+            startedAt: call.started_at,
+          });
+        }
+      }
       set((state) =>
         withSession(state, sessionId, (session) => {
           const remote: ChatMessage[] = lines.map((line) => ({
@@ -665,6 +693,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const live = session.messages.filter(
             (m) => m.status !== 'done' || !settled.has(`${m.role}\u0000${m.text}`)
           );
+          // 回答者从记录里补回来：`agent.identity` 帧只在连接里出现过一次，
+          // 页面重开时它不会重发。少了这一格，下面那段「谁答的」与工具调用
+          // 的归属都认不出来。
+          const agentId = session.agentId ?? rememberedAgent;
           // 交出去的目标从记录里读回来，不从内存里读：刷新之后，这段对话是
           // 「能关掉的问答」还是「还在服务器上跑的目标」，答案只有历史里有。
           // 本地已经收到的那些排后面去重，同一道目标不重复记。
@@ -676,6 +708,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           }
           return {
             ...session,
+            agentId,
             goals,
             messages: [...remote, ...live],
             hydrated: true,
