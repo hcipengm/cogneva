@@ -41,11 +41,6 @@ pub struct Kind {
 /// it; a kind nobody reads would be a place to file a hole where no one looks.
 pub const KINDS: &[Kind] = &[
     Kind {
-        name: "append-only-exception",
-        columns: &["path", "key", "reason"],
-        claims: 2,
-    },
-    Kind {
         name: "label-key-excuse",
         columns: &["layer", "rule", "metric", "key", "code", "why"],
         claims: 4,
@@ -431,9 +426,9 @@ mod tests {
 
     const ROSTER: &str = "\
 # the tables this replaced
-append-only-exception\tscripts/data/host-readings.tsv\t*\tThe whole table retired; the roster is read from the units now.\t2026-11-30
 label-key-excuse\tprometheus\tCognevaDown\tup\tcontainer\tknown_defect\tThe exporter drops the label while the pod restarts.\t2027-01-15
 carrier\t可评估\tNo alert rule names this face yet; the benchmark arm publishes no series.\t2027-02-01
+face-links-gap\t可评估\tThe four-ring table has no row for this face yet.\t2027-01-31
 ";
 
     #[test]
@@ -443,9 +438,9 @@ carrier\t可评估\tNo alert rule names this face yet; the benchmark arm publish
         let rendered = render(&rows);
         let again = parse_roster(&rendered).expect("parses");
         assert_eq!(render(&again), rendered);
-        // Sorted by kind, so the two carriers sort by the two kinds' names.
-        assert!(rendered.starts_with("append-only-exception\t"));
-        assert_eq!(rows[2].cell("face"), Some("可评估"));
+        // Sorted by kind: carrier, face-links-gap, label-key-excuse.
+        assert!(rendered.starts_with("carrier\t"));
+        assert_eq!(rows[1].cell("face"), Some("可评估"));
     }
 
     #[test]
@@ -458,7 +453,7 @@ carrier\t可评估\tNo alert rule names this face yet; the benchmark arm publish
     #[test]
     fn an_unknown_kind_is_refused_with_the_closed_set() {
         let why = parse_roster("nonsense\ta\tb\t2026-12-01\n").expect_err("refused");
-        assert!(why.contains("append-only-exception"), "{why}");
+        assert!(why.contains("label-key-excuse"), "{why}");
     }
 
     #[test]
