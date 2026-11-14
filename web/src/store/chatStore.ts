@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { getSessionMessages } from '@/api/client';
+import { getSessionMessages, listChatSessions } from '@/api/client';
+import type { ChatSessionSummary } from '@/api/client';
 import type {
   ChatAttachment,
   ChatFrame,
@@ -147,6 +148,17 @@ interface ChatState {
   /** 拨号条上的顺序，最新的在前。 */
   order: string[];
   active: string;
+  /**
+   * 服务端那份会话名单，最近说话的在前。
+   *
+   * 与 `sessions` 不是同一份账：`sessions` 是这一页开着的那几段（存在浏览器
+   * 里），这份是这个人在服务端有过的全部会话。换一台机器、清掉浏览器存储之后，
+   * 找回来的路只有这一份。
+   */
+  history: ChatSessionSummary[];
+  historyLoading: boolean;
+  /** 读名单失败的原因；读成功时是 `null`。空名单与读失败不合成一句。 */
+  historyError: string | null;
 
   createSession: (title?: string) => string;
   /**
@@ -165,6 +177,8 @@ interface ChatState {
   ingestFrame: (frame: ChatFrame) => void;
   /** 从服务端读回历史。已读过时直接返回。 */
   hydrate: (sessionId: string) => Promise<void>;
+  /** 读服务端那份会话名单，可带一个搜索词。 */
+  listSessions: (search?: string) => Promise<void>;
 }
 
 /**
@@ -293,6 +307,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessions: boot.sessions,
   order: boot.order,
   active: boot.active,
+  history: [],
+  historyLoading: false,
+  historyError: null,
+
+  /**
+   * 读名单。空结果与读失败分开：空名单是「你确实没有别的会话」，读失败是
+   * 「这一页不知道你有没有」，把后者画成前者，人就会以为自己丢了东西。
+   */
+  listSessions: async (search) => {
+    set({ historyLoading: true, historyError: null });
+    try {
+      const items = await listChatSessions(search);
+      set({ history: items, historyLoading: false });
+    } catch (error) {
+      set({
+        history: [],
+        historyLoading: false,
+        historyError:
+          (error as { message?: string })?.message ?? '读不到会话名单',
+      });
+    }
+  },
 
   createSession: (title) => {
     const id = `conv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;

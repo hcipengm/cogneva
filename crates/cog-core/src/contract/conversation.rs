@@ -118,6 +118,23 @@ pub struct ChatTurnRecord {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One conversation as a listing shows it: which one, what it opened with, and
+/// when it was last spoken in.
+///
+/// The listing groups rows by session, so everything here is read off a group:
+/// `title` is the first thing the person said (not the last), `last_activity_at`
+/// is the newest row (that is what orders the list), and `turns` counts the
+/// exchanges kept -- one per question, whether or not an answer arrived. The
+/// transcript is bounded, so a long conversation reports the window the platform
+/// still holds rather than everything ever said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatSessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub last_activity_at: chrono::DateTime<chrono::Utc>,
+    pub turns: i64,
+}
+
 /// The transcript's operations.
 ///
 /// A trait rather than the concrete store because the gateway must keep
@@ -140,9 +157,14 @@ pub trait ChatTurnStore: Send + Sync {
     /// 给：一条 `/名字` 命令展开成技能说明之后，人打的那一行与模型读到的不是同一段
     /// 字。`None` 是「两者是同一句」——不是「模型什么都没看到」。后面几轮读历史
     /// 用的是它，否则一段用技能开的对话在第二轮就不再带着那份规程。
+    ///
+    /// `owner` 是这段对话属于谁，取套接字握手时认出来的那个人。空串是「这条连接
+    /// 没有身份」：那时候写下的行不属于任何人，按人列出的名单里也不会出现它们——
+    /// 凭空补一个名字，是给一件没有测过的事记一笔账。
     async fn record_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
         model_content: Option<&str>,
         attachments: &[ChatAttachment],
@@ -156,9 +178,15 @@ pub trait ChatTurnStore: Send + Sync {
     /// different shapes, and an implementation that answered this one by
     /// forwarding to `record_turn` would keep the words and drop the goal --
     /// which reads, on reopen, as a conversation that never dispatched anything.
+    // One argument per column the row carries, and every one of them is read off a
+    // different place: the session, the person, the line typed, the line the model
+    // read, the attachments, the answer, the goal. A struct here would only move the
+    // same list one level down and hide the row's shape from the call site.
+    #[allow(clippy::too_many_arguments)]
     async fn record_dispatched_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
         model_content: Option<&str>,
         attachments: &[ChatAttachment],
@@ -177,6 +205,7 @@ pub trait ChatTurnStore: Send + Sync {
     async fn record_failed_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
         attachments: &[ChatAttachment],
         failure: &str,
@@ -203,6 +232,26 @@ pub trait ChatTurnStore: Send + Sync {
     /// including the turns whose answer never arrived -- those are the ones a
     /// person most needs to find again.
     async fn transcript(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurnRecord>>;
+
+    /// One person's conversations, newest activity first.
+    ///
+    /// Scoped by `owner` rather than answered from every row: the transcript
+    /// holds conversations from every person who used this deployment, and a
+    /// listing without that filter is a list of other people's questions.
+    ///
+    /// `search`, when given, keeps sessions where any line contains it (case
+    /// insensitive). It filters sessions, not lines: a session that matched on
+    /// its third turn is returned whole, because reopening it is the point.
+    ///
+    /// Sessions with no owner (recorded when the socket was not authenticated)
+    /// are not listed for `""`: nobody declared them, so no person can be shown
+    /// them as theirs.
+    async fn sessions(
+        &self,
+        owner: &str,
+        limit: usize,
+        search: Option<&str>,
+    ) -> SFResult<Vec<ChatSessionSummary>>;
 }
 
 /// Rows kept per receiving peer, so a chatty sender cannot grow the table

@@ -31,6 +31,9 @@ pub mod simple_code {
     pub const SERVICE_UNAVAILABLE: &str = "service_unavailable";
     /// 平台自己出的错；细标识在 `error` 格里。
     pub const INTERNAL_ERROR: &str = "internal_error";
+    /// 这条请求没有认出来的人；细标识在 `error` 格里。与 `bad_request` 分开：
+    /// 「谁在问」没答上来时，返回一个空结果是在替对方断言「你没有东西」。
+    pub const UNAUTHORIZED: &str = "unauthorized";
 }
 
 /// 统一 API 错误响应体。

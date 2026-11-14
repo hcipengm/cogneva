@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import { conversationNames } from '@/conversation/callsign';
+import { SessionHistory } from '@/conversation/SessionHistory';
 import type { StreamClient } from '@/hooks/useEventStream';
 import { useChatStore } from '@/store/chatStore';
 import { Note } from '@/ui/Note';
@@ -24,6 +26,10 @@ export function SessionDock({
   const setActive = useChatStore((s) => s.setActive);
   const createSession = useChatStore((s) => s.createSession);
   const closeSession = useChatStore((s) => s.closeSession);
+  const listSessions = useChatStore((s) => s.listSessions);
+  // 过去的会话不是一个面板的开关，是一条找回的路：打开它就去服务端读一次名单，
+  // 浏览器里那几段丢了之后，路只有这一条。
+  const [historyOpen, setHistoryOpen] = useState(false);
   const names = conversationNames(order);
 
   /**
@@ -42,6 +48,7 @@ export function SessionDock({
   };
 
   return (
+    <>
     <div
       className="flex shrink-0 items-stretch gap-1 overflow-x-auto border-b border-[var(--line)] px-2 py-1"
       aria-label="开着的对话"
@@ -106,6 +113,22 @@ export function SessionDock({
       >
         ＋ 新对话
       </Note>
+      <Note
+        as="button"
+        type="button"
+        onClick={() => {
+          const next = !historyOpen;
+          setHistoryOpen(next);
+          if (next) void listSessions();
+        }}
+        aria-expanded={historyOpen}
+        className="mono shrink-0 px-1.5 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--brass)]"
+        text="在这个人的过去会话里找，找到就接上那一段"
+      >
+        历史
+      </Note>
     </div>
+    {historyOpen && <SessionHistory onClose={() => setHistoryOpen(false)} />}
+    </>
   );
 }

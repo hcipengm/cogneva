@@ -1415,6 +1415,7 @@ fn turns_to_messages(turns: Vec<cog_core::ChatTurn>) -> Vec<cog_core::Message> {
 async fn record_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
+    owner: &str,
     user: &str,
     model: Option<&str>,
     attachments: &[cog_core::ChatAttachment],
@@ -1428,7 +1429,7 @@ async fn record_turn(
         return;
     };
     if let Err(e) = store
-        .record_turn(session_id, user, model, attachments, assistant)
+        .record_turn(session_id, owner, user, model, attachments, assistant)
         .await
     {
         tracing::warn!(
@@ -1445,9 +1446,13 @@ async fn record_turn(
 /// 关掉页面再打开，这段对话在记录里就成了一段纯问答——「这条能不能关掉」问的
 /// 正是它的反面，而刷新恰好是这个问题最需要答对的时候。帧是「此刻正在发生」的
 /// 视图，记录才是关掉之后仍然成立的那一份。
+// 每一格都是这一行上独立的一样东西，与 `ChatTurnStore` 那条方法的参数一一对应：
+// 打包成一个结构体只是把同一个形状换个地方写一遍，调用点上就少了一格看得见的东西。
+#[allow(clippy::too_many_arguments)]
 async fn record_dispatched_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
+    owner: &str,
     user: &str,
     model: Option<&str>,
     attachments: &[cog_core::ChatAttachment],
@@ -1462,7 +1467,15 @@ async fn record_dispatched_turn(
         return;
     };
     if let Err(e) = store
-        .record_dispatched_turn(session_id, user, model, attachments, assistant, goal_id)
+        .record_dispatched_turn(
+            session_id,
+            owner,
+            user,
+            model,
+            attachments,
+            assistant,
+            goal_id,
+        )
         .await
     {
         tracing::warn!(
@@ -1482,6 +1495,7 @@ async fn record_dispatched_turn(
 async fn record_failed_turn(
     store: &crate::ChatTurnHandle,
     session_id: &str,
+    owner: &str,
     user: &str,
     attachments: &[cog_core::ChatAttachment],
     failure: &str,
@@ -1494,7 +1508,7 @@ async fn record_failed_turn(
         return;
     };
     if let Err(e) = store
-        .record_failed_turn(session_id, user, attachments, failure)
+        .record_failed_turn(session_id, owner, user, attachments, failure)
         .await
     {
         tracing::warn!(
@@ -1562,6 +1576,7 @@ pub async fn run_chat_turn(
             record_failed_turn(
                 &state.chat_turns,
                 &session_id,
+                &owner,
                 &content,
                 &attachments,
                 &text,
@@ -1608,6 +1623,7 @@ pub async fn run_chat_turn(
         record_failed_turn(
             &state.chat_turns,
             &session_id,
+            &owner,
             &content,
             &attachments,
             reason,
@@ -1629,6 +1645,7 @@ pub async fn run_chat_turn(
         record_failed_turn(
             &state.chat_turns,
             &session_id,
+            &owner,
             &content,
             &attachments,
             reason,
@@ -1670,6 +1687,7 @@ pub async fn run_chat_turn(
                     record_failed_turn(
                         &state.chat_turns,
                         &session_id,
+                        &owner,
                         &content,
                         &attachments,
                         &reason,
@@ -1724,7 +1742,8 @@ pub async fn run_chat_turn(
         conversation.turn(
             ConversationRequest {
                 session_id: session_id.clone(),
-                owner,
+                // 记录在下面几步还要用这个身份：这一轮属于谁，写的是同一件事。
+                owner: owner.clone(),
                 messages,
                 llm,
                 platform: origin.platform.map(str::to_string),
@@ -1772,6 +1791,7 @@ pub async fn run_chat_turn(
         record_failed_turn(
             &state.chat_turns,
             &session_id,
+            &owner,
             &content,
             &attachments,
             reason,
@@ -1852,12 +1872,21 @@ pub async fn run_chat_turn(
     //    什么都没有。
     match (&failure, reply.is_empty()) {
         (Some(err), _) => {
-            record_failed_turn(&state.chat_turns, &session_id, &content, &attachments, err).await;
+            record_failed_turn(
+                &state.chat_turns,
+                &session_id,
+                &owner,
+                &content,
+                &attachments,
+                err,
+            )
+            .await;
         }
         (None, true) => {
             record_failed_turn(
                 &state.chat_turns,
                 &session_id,
+                &owner,
                 &content,
                 &attachments,
                 "模型没有返回任何内容",
@@ -1869,6 +1898,7 @@ pub async fn run_chat_turn(
                 record_dispatched_turn(
                     &state.chat_turns,
                     &session_id,
+                    &owner,
                     &content,
                     expansion.as_deref(),
                     &attachments,
@@ -1881,6 +1911,7 @@ pub async fn run_chat_turn(
                 record_turn(
                     &state.chat_turns,
                     &session_id,
+                    &owner,
                     &content,
                     expansion.as_deref(),
                     &attachments,
@@ -2614,7 +2645,7 @@ mod tests {
     async fn the_history_the_model_sees_comes_from_the_store() {
         let store = std::sync::Arc::new(FakeTurns::default());
         store
-            .record_turn("s1", "上一问", None, &[], "上一答")
+            .record_turn("s1", "u-1", "上一问", None, &[], "上一答")
             .await
             .expect("seed the fake transcript");
         let handle: crate::ChatTurnHandle = Some(store.clone());
@@ -2628,6 +2659,54 @@ mod tests {
         assert_eq!(messages[1].content(), "上一答");
         // 上下文窗口的界要有人传给存储面，否则「最近 40 条」只是这里的一句注释。
         assert_eq!(*store.last_limit.lock().await, Some(SESSION_HISTORY_CAP));
+    }
+
+    /// 名单是「一个人的会话，最近说话的在前，搜索只在他自己的行里找」。
+    ///
+    /// 真库上那条查询另有一条用例（`cog-storage/tests/chat_turn_store.rs`）；这一条
+    /// 钉的是替身与它同一套判据——替身偏离了，用它的那几条测试就不再说明生产里的
+    /// 行为，而它们看起来仍然全绿。
+    #[tokio::test]
+    async fn the_listing_is_one_persons_conversations_newest_first() {
+        let store = FakeTurns::default();
+        for (session, owner, line) in [
+            ("s-old", "u-1", "旧的一问"),
+            ("s-theirs", "u-2", "别人的一问"),
+            ("s-new", "u-1", "新的一问"),
+        ] {
+            store
+                .record_turn(session, owner, line, None, &[], "答")
+                .await
+                .expect("seed the fake transcript");
+        }
+
+        let mine = store.sessions("u-1", 10, None).await.expect("list");
+        let ids: Vec<&str> = mine.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["s-new", "s-old"],
+            "名单没有把最近说话的排在前面，或者把别人的会话也列了出来"
+        );
+        assert_eq!(mine[1].title, "旧的一问", "标题不是这一段开口的第一句");
+
+        let searched = store.sessions("u-1", 10, Some("旧")).await.expect("search");
+        assert_eq!(searched.len(), 1, "搜索没有在自己的一段话里找到这几个字");
+        assert!(
+            store
+                .sessions("u-1", 10, Some("别人"))
+                .await
+                .expect("search")
+                .is_empty(),
+            "搜索翻到了别人的会话里"
+        );
+        assert!(
+            store
+                .sessions("", 10, None)
+                .await
+                .expect("list with an empty identity")
+                .is_empty(),
+            "空身份拿到了名单"
+        );
     }
 
     /// `@` 后面那串是路径，不是称呼。
@@ -2788,6 +2867,7 @@ mod tests {
         store
             .record_turn(
                 "s1",
+                "u-1",
                 "这里错了",
                 None,
                 &[cog_core::ChatAttachment {
@@ -2830,6 +2910,7 @@ mod tests {
         store
             .record_turn(
                 "s1",
+                "u-1",
                 &long,
                 None,
                 &[cog_core::ChatAttachment {
@@ -2885,6 +2966,7 @@ mod tests {
         record_turn(
             &handle,
             "s1",
+            "u-1",
             "/web-research 查一下 1.90",
             Some("先搜，再读。"),
             &[],
@@ -2937,7 +3019,7 @@ mod tests {
     async fn an_answered_turn_is_written_down_as_a_pair() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_turn(&handle, "s1", "问", None, &[], "答").await;
+        record_turn(&handle, "s1", "u-1", "问", None, &[], "答").await;
         let held = store.turns.lock().await.clone();
         assert_eq!(
             held,
@@ -2965,7 +3047,17 @@ mod tests {
     async fn a_dispatched_turn_keeps_its_goal_where_the_history_can_read_it() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_dispatched_turn(&handle, "s1", "把这件事做了", None, &[], "已受理", "goal-7").await;
+        record_dispatched_turn(
+            &handle,
+            "s1",
+            "u-1",
+            "把这件事做了",
+            None,
+            &[],
+            "已受理",
+            "goal-7",
+        )
+        .await;
 
         // 问句与答复照样成对进上下文：交出去不等于这一轮就不用记。
         let held = store.turns.lock().await.clone();
@@ -2989,7 +3081,7 @@ mod tests {
     async fn an_unanswered_turn_still_keeps_what_the_user_said() {
         let store = std::sync::Arc::new(FakeTurns::default());
         let handle: crate::ChatTurnHandle = Some(store.clone());
-        record_failed_turn(&handle, "s1", "问", &[], "upstream 503").await;
+        record_failed_turn(&handle, "s1", "u-1", "问", &[], "upstream 503").await;
 
         let held = store.unanswered.lock().await.clone();
         assert_eq!(
@@ -3009,8 +3101,8 @@ mod tests {
             .await
             .is_empty());
         // 不发散：这里只要求「不写进任何东西」——没有第二个家可写。
-        record_turn(&handle, "s1", "问", None, &[], "答").await;
-        record_failed_turn(&handle, "s1", "问", &[], "答不出来").await;
+        record_turn(&handle, "s1", "u-1", "问", None, &[], "答").await;
+        record_failed_turn(&handle, "s1", "u-1", "问", &[], "答不出来").await;
     }
 
     /// 读记录失败按「没有历史」回答，而不是按「历史是空的」记一笔。
@@ -3018,7 +3110,7 @@ mod tests {
     async fn a_transcript_that_cannot_be_read_answers_without_context() {
         let store = std::sync::Arc::new(FakeTurns::default());
         store
-            .record_turn("s1", "问", None, &[], "答")
+            .record_turn("s1", "u-1", "问", None, &[], "答")
             .await
             .expect("seed the fake transcript");
         store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3027,7 +3119,7 @@ mod tests {
             .await
             .is_empty());
         // 写也失败时不许把这一轮的回答吞掉：record_turn 只留 warn。
-        record_turn(&handle, "s1", "问", None, &[], "答").await;
+        record_turn(&handle, "s1", "u-1", "问", None, &[], "答").await;
     }
 
     /// 一份内存里的记录，只作测试替身。生产里没有它的对应物——这次改动拆掉的
@@ -3043,6 +3135,8 @@ mod tests {
         /// 这里分成两格，测的才是「两者不是同一份」。
         typed: tokio::sync::Mutex<Vec<String>>,
         last_limit: tokio::sync::Mutex<Option<usize>>,
+        /// 每一次写入：(会话, 属于谁, 人打的那一行)。会话名单就是从这几条读出来的。
+        lines: tokio::sync::Mutex<Vec<(String, String, String)>>,
         fail: std::sync::atomic::AtomicBool,
     }
 
@@ -3051,6 +3145,7 @@ mod tests {
         async fn record_turn(
             &self,
             session_id: &str,
+            owner: &str,
             user: &str,
             model: Option<&str>,
             attachments: &[cog_core::ChatAttachment],
@@ -3059,6 +3154,11 @@ mod tests {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(cog_core::SFError::Database("unreachable".into()));
             }
+            self.lines.lock().await.push((
+                session_id.to_string(),
+                owner.to_string(),
+                user.to_string(),
+            ));
             let mut held = self.turns.lock().await;
             if session_id != "s1" {
                 return Ok(());
@@ -3082,6 +3182,7 @@ mod tests {
         async fn record_dispatched_turn(
             &self,
             session_id: &str,
+            owner: &str,
             user: &str,
             model: Option<&str>,
             attachments: &[cog_core::ChatAttachment],
@@ -3091,6 +3192,11 @@ mod tests {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(cog_core::SFError::Database("unreachable".into()));
             }
+            self.lines.lock().await.push((
+                session_id.to_string(),
+                owner.to_string(),
+                user.to_string(),
+            ));
             if session_id != "s1" {
                 return Ok(());
             }
@@ -3115,6 +3221,7 @@ mod tests {
         async fn record_failed_turn(
             &self,
             session_id: &str,
+            owner: &str,
             user: &str,
             _attachments: &[cog_core::ChatAttachment],
             failure: &str,
@@ -3122,6 +3229,11 @@ mod tests {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(cog_core::SFError::Database("unreachable".into()));
             }
+            self.lines.lock().await.push((
+                session_id.to_string(),
+                owner.to_string(),
+                user.to_string(),
+            ));
             if session_id != "s1" {
                 return Ok(());
             }
@@ -3181,6 +3293,53 @@ mod tests {
                         .collect(),
                     created_at: chrono::Utc::now(),
                 })
+                .collect())
+        }
+
+        /// 名单按人过滤、最近说话的在前。与真实实现同一套判据：别人的行不出现，
+        /// 搜索只在同一个人的行里找，空身份一条都不给。
+        async fn sessions(
+            &self,
+            owner: &str,
+            limit: usize,
+            search: Option<&str>,
+        ) -> cog_core::SFResult<Vec<cog_core::ChatSessionSummary>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(cog_core::SFError::Database("unreachable".into()));
+            }
+            if owner.trim().is_empty() || limit == 0 {
+                return Ok(Vec::new());
+            }
+            let needle = search.unwrap_or("").trim().to_lowercase();
+            let lines = self.lines.lock().await;
+            let mut found: Vec<cog_core::ChatSessionSummary> = Vec::new();
+            for (session_id, line_owner, user) in lines.iter() {
+                if line_owner != owner {
+                    continue;
+                }
+                match found.iter_mut().find(|s| &s.session_id == session_id) {
+                    Some(entry) => entry.turns += 1,
+                    None => found.push(cog_core::ChatSessionSummary {
+                        session_id: session_id.clone(),
+                        title: user.clone(),
+                        last_activity_at: chrono::Utc::now(),
+                        turns: 1,
+                    }),
+                }
+            }
+            // 插入顺序是写入顺序：翻过来就是最近说话的在前。
+            found.reverse();
+            Ok(found
+                .into_iter()
+                .filter(|summary| {
+                    needle.is_empty()
+                        || lines.iter().any(|(session_id, line_owner, user)| {
+                            session_id == &summary.session_id
+                                && line_owner == owner
+                                && user.to_lowercase().contains(&needle)
+                        })
+                })
+                .take(limit)
                 .collect())
         }
     }

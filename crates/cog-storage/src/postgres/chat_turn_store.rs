@@ -26,8 +26,8 @@ use sqlx::PgPool;
 use cog_core::{SFError, SFResult};
 
 pub use cog_core::contract::conversation::{
-    ChatAttachment, ChatAttachmentInfo, ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore,
-    ROWS_KEPT_PER_SESSION,
+    ChatAttachment, ChatAttachmentInfo, ChatSessionSummary, ChatTurn, ChatTurnRecord, ChatTurnRole,
+    ChatTurnStore, ROWS_KEPT_PER_SESSION,
 };
 
 /// PostgreSQL chat transcript.
@@ -57,6 +57,7 @@ impl PostgresChatTurnStore {
     async fn write(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
         model: Option<&str>,
         attachments: &[ChatAttachment],
@@ -85,6 +86,7 @@ impl PostgresChatTurnStore {
             (None, _) => INSERT_FAILED_TURN_SQL,
         })
         .bind(session_id)
+        .bind(owner)
         .bind(user);
         query = match (assistant, goal) {
             (Some(reply), Some(goal_id)) => query
@@ -118,23 +120,23 @@ impl PostgresChatTurnStore {
 /// One statement for the pair, so the transcript never holds a question whose
 /// answer is missing.
 const INSERT_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content, attachments, model_content) \
-VALUES ($1, 'user', $2, $3, $4), ($1, 'assistant', $5, NULL, NULL)";
+INSERT INTO chat_turns (session_id, owner, role, content, attachments, model_content) \
+VALUES ($1, $2, 'user', $3, $4, $5), ($1, $2, 'assistant', $6, NULL, NULL)";
 
 /// The same pair for a turn that handed its work to the orchestrator. The goal
 /// goes on the assistant row only: the reply is where the platform said what it
 /// did with the message, and the question is not what carries a goal.
 const INSERT_DISPATCHED_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content, attachments, model_content, goal_id) \
-VALUES ($1, 'user', $2, $3, $4), ($1, 'assistant', $5, NULL, NULL, $6)";
+INSERT INTO chat_turns (session_id, owner, role, content, attachments, model_content, goal_id) \
+VALUES ($1, $2, 'user', $3, $4, $5), ($1, $2, 'assistant', $6, NULL, NULL, $7)";
 
 /// The same pair for an exchange that never got an answer: the reply's content
 /// is empty because nothing was said, and `failure` carries why. Both rows get
 /// the reason so a reader that finds either half knows what happened to the
 /// turn.
 const INSERT_FAILED_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content, failure, attachments) \
-VALUES ($1, 'user', $2, $3, $4), ($1, 'assistant', '', $3, NULL)";
+INSERT INTO chat_turns (session_id, owner, role, content, failure, attachments) \
+VALUES ($1, $2, 'user', $3, $4, $5), ($1, $2, 'assistant', '', $4, NULL)";
 
 /// Drop what fell out of the window. `NOT IN` over the newest rows keeps the
 /// bound per session rather than global: one busy session must not push another
@@ -170,6 +172,35 @@ SELECT id, role, content, failure, goal_id, attachments, created_at FROM ( \
 ) newest \
 ORDER BY id";
 
+/// One person's sessions, newest activity first, with the line that opened each.
+///
+/// `strpos(lower(..))` rather than `ILIKE '%' || $2 || '%'`: the search text
+/// comes from a person, and `%` or `_` typed into a search box is a character
+/// being looked for, not a wildcard. Grouped by session with `MAX(created_at)`
+/// as the order key, because "most recently spoken in" is what a reader means
+/// when they expect the conversation they just left at the top.
+///
+/// `turns` counts the question rows, not the table's rows: a turn is written as
+/// a pair, so counting rows would report two per exchange and the same
+/// conversation would show twice as long a list of turns as it had turns.
+const SESSIONS_SQL: &str = "\
+SELECT s.session_id, \
+       (SELECT t.content FROM chat_turns t \
+         WHERE t.session_id = s.session_id AND t.role = 'user' \
+         ORDER BY t.id LIMIT 1) AS first_line, \
+       MAX(s.created_at) AS last_activity_at, \
+       COUNT(*) FILTER (WHERE s.role = 'user') AS turns \
+FROM chat_turns s \
+WHERE s.owner = $1 \
+GROUP BY s.session_id \
+HAVING $2 = '' OR EXISTS ( \
+    SELECT 1 FROM chat_turns m \
+     WHERE m.session_id = s.session_id \
+       AND strpos(lower(m.content), lower($2)) > 0 \
+) \
+ORDER BY MAX(s.created_at) DESC \
+LIMIT $3";
+
 /// 一行的附件列。`NULL` 是「这一行没有附件」——老行与助手那一行都是它，
 /// 空数组与它在这里不区分：两者对读者、对提示词都是同一个意思。
 fn parse_attachments(raw: Option<&str>) -> SFResult<Vec<ChatAttachment>> {
@@ -191,6 +222,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
     async fn record_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
         model_content: Option<&str>,
         attachments: &[ChatAttachment],
@@ -198,6 +230,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
     ) -> SFResult<()> {
         self.write(
             session_id,
+            owner,
             user,
             model_content,
             attachments,
@@ -211,6 +244,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
     async fn record_dispatched_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
         model_content: Option<&str>,
         attachments: &[ChatAttachment],
@@ -226,6 +260,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
         }
         self.write(
             session_id,
+            owner,
             user,
             model_content,
             attachments,
@@ -239,12 +274,14 @@ impl ChatTurnStore for PostgresChatTurnStore {
     async fn record_failed_turn(
         &self,
         session_id: &str,
+        owner: &str,
         user: &str,
         attachments: &[ChatAttachment],
         failure: &str,
     ) -> SFResult<()> {
         self.write(
             session_id,
+            owner,
             user,
             None,
             attachments,
@@ -328,4 +365,62 @@ impl ChatTurnStore for PostgresChatTurnStore {
             )
             .collect()
     }
+
+    async fn sessions(
+        &self,
+        owner: &str,
+        limit: usize,
+        search: Option<&str>,
+    ) -> SFResult<Vec<ChatSessionSummary>> {
+        // Nobody's conversations are not listed for anyone: `""` is the owner of
+        // rows written before the column existed and of connections that never
+        // named a person, and answering that with every unowned conversation
+        // would put them all in front of whoever asked with an empty identity.
+        if owner.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let probe = search.unwrap_or("").trim().to_string();
+        let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>, i64)> =
+            sqlx::query_as(SESSIONS_SQL)
+                .bind(owner)
+                .bind(&probe)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| SFError::Database(format!("list the chat sessions: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(session_id, first_line, last_activity_at, turns)| ChatSessionSummary {
+                    session_id,
+                    title: title_of(&first_line),
+                    last_activity_at,
+                    turns,
+                },
+            )
+            .collect())
+    }
+}
+
+/// The first thing said in a session, cut to something a list row can hold.
+///
+/// A title is a pointer, not the message: the whole first line lives in the
+/// transcript and is one click away. Cutting at a character boundary matters
+/// here because the first line is often Chinese, where a byte cut would split a
+/// character and produce text that no longer says what it said.
+fn title_of(first_line: &str) -> String {
+    // cap: fixed — a list row's width, not a resource bound: the whole first line
+    // stays in the transcript and is one click away.
+    const MAX_CHARS: usize = 60;
+    let mut title: String = first_line
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(MAX_CHARS)
+        .collect();
+    if first_line.chars().count() > MAX_CHARS {
+        title.push('…');
+    }
+    title.trim().to_string()
 }

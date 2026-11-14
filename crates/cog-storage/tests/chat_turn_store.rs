@@ -33,6 +33,8 @@ struct Probe {
     pool: PgPool,
     /// A session id no other run and no other test shares.
     session: String,
+    /// 这段对话属于谁。每次跑一个独占的值，名单那一格才不会读到别人写下的行。
+    owner: String,
 }
 
 async fn probe() -> Probe {
@@ -42,10 +44,12 @@ async fn probe() -> Probe {
         .await
         .expect("connect to the throwaway database");
     let session = format!("probe-chat-turns-{}", uuid::Uuid::new_v4());
+    let owner = format!("probe-owner-{}", uuid::Uuid::new_v4());
     Probe {
         store: PostgresChatTurnStore::new(pool.clone()),
         pool,
         session,
+        owner,
     }
 }
 
@@ -71,12 +75,12 @@ async fn a_turn_reads_back_in_the_order_it_was_said_and_from_another_handle() {
     let probe = probe().await;
     probe
         .store
-        .record_turn(&probe.session, "第一问", None, &[], "第一答")
+        .record_turn(&probe.session, &probe.owner, "第一问", None, &[], "第一答")
         .await
         .expect("record the first turn");
     probe
         .store
-        .record_turn(&probe.session, "第二问", None, &[], "第二答")
+        .record_turn(&probe.session, &probe.owner, "第二问", None, &[], "第二答")
         .await
         .expect("record the second turn");
 
@@ -129,7 +133,7 @@ async fn a_session_that_was_never_recorded_reads_empty_and_a_limit_of_zero_asks_
 
     probe
         .store
-        .record_turn(&probe.session, "问", None, &[], "答")
+        .record_turn(&probe.session, &probe.owner, "问", None, &[], "答")
         .await
         .expect("record a turn");
     // limit 0 是「一条也不要」，不是「不限」——读成后者会把整段对话塞进一次请求。
@@ -153,7 +157,7 @@ async fn the_bound_trims_one_session_and_leaves_another_alone() {
     let quiet = format!("{}-quiet", probe.session);
     probe
         .store
-        .record_turn(&quiet, "安静的一问", None, &[], "安静的一答")
+        .record_turn(&quiet, &probe.owner, "安静的一问", None, &[], "安静的一答")
         .await
         .expect("record the quiet session");
 
@@ -162,7 +166,14 @@ async fn the_bound_trims_one_session_and_leaves_another_alone() {
     for i in 0..over {
         probe
             .store
-            .record_turn(&busy, &format!("问{i}"), None, &[], &format!("答{i}"))
+            .record_turn(
+                &busy,
+                &probe.owner,
+                &format!("问{i}"),
+                None,
+                &[],
+                &format!("答{i}"),
+            )
             .await
             .expect("record a turn of the busy session");
     }
@@ -220,7 +231,13 @@ async fn an_unanswered_turn_is_kept_out_of_the_history_but_not_out_of_the_table(
     let probe = probe().await;
     probe
         .store
-        .record_failed_turn(&probe.session, "上游坏了的时候问的话", &[], "API error 503")
+        .record_failed_turn(
+            &probe.session,
+            &probe.owner,
+            "上游坏了的时候问的话",
+            &[],
+            "API error 503",
+        )
         .await
         .expect("record an unanswered turn");
 
@@ -261,7 +278,14 @@ async fn an_unanswered_turn_is_kept_out_of_the_history_but_not_out_of_the_table(
     // 之后正常的一轮不能被它挡住，也不该把它顶出上下文窗口。
     probe
         .store
-        .record_turn(&probe.session, "恢复之后问的话", None, &[], "答")
+        .record_turn(
+            &probe.session,
+            &probe.owner,
+            "恢复之后问的话",
+            None,
+            &[],
+            "答",
+        )
         .await
         .expect("record an answered turn");
     let history = probe
@@ -299,6 +323,7 @@ async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
         .store
         .record_dispatched_turn(
             &probe.session,
+            &probe.owner,
             "把这件事做了",
             None,
             &[],
@@ -309,7 +334,14 @@ async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
         .expect("record a dispatched turn");
     probe
         .store
-        .record_turn(&probe.session, "那这个呢", None, &[], "这个直接答")
+        .record_turn(
+            &probe.session,
+            &probe.owner,
+            "那这个呢",
+            None,
+            &[],
+            "这个直接答",
+        )
         .await
         .expect("record an answered turn");
 
@@ -357,7 +389,10 @@ async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_turn_without_a_session_is_refused_rather_than_filed_under_nothing() {
     let probe = probe().await;
-    let refused = probe.store.record_turn("   ", "问", None, &[], "答").await;
+    let refused = probe
+        .store
+        .record_turn("   ", &probe.owner, "问", None, &[], "答")
+        .await;
     assert!(
         refused.is_err(),
         "没有会话的一轮必须被拒：它落进一段谁也问不到的记录里"
@@ -383,6 +418,7 @@ async fn an_attachment_rides_with_its_row_and_keeps_its_bytes() {
         .store
         .record_turn(
             &probe.session,
+            &probe.owner,
             "这里错了",
             None,
             std::slice::from_ref(&shot),
@@ -439,6 +475,7 @@ async fn a_command_keeps_both_the_line_typed_and_the_instructions_the_model_read
         .store
         .record_turn(
             &probe.session,
+            &probe.owner,
             "/web-research 查一下 1.90",
             Some(instructions),
             &[],
@@ -468,6 +505,108 @@ async fn a_command_keeps_both_the_line_typed_and_the_instructions_the_model_read
         "读记录的人看到的是展开后的说明，不是自己打的那一行：{}",
         transcript[0].content
     );
+
+    cleanup(&probe).await;
+}
+
+/// 名单是「一个人的会话，最近说话的在前，搜索只在他自己的会话里找」。
+///
+/// 这三件事都是那条 SQL 的后果，替身按同一个意图又写了一遍：两边一起错的
+/// 时候只有真库上这一条会红。所以这里要的是数据库自己的答案，不是调用方的。
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_listing_is_one_persons_conversations_newest_first_and_search_is_literal() {
+    let probe = probe().await;
+    let mine_first = format!("{}-first", probe.session);
+    let mine_second = format!("{}-second", probe.session);
+    let theirs = format!("{}-theirs", probe.session);
+    let stranger = format!("stranger-{}", probe.owner);
+
+    probe
+        .store
+        .record_turn(
+            &mine_first,
+            &probe.owner,
+            "第一段 百分之百",
+            None,
+            &[],
+            "第一答",
+        )
+        .await
+        .expect("record the first conversation");
+    probe
+        .store
+        .record_turn(&theirs, &stranger, "别人的会话", None, &[], "别人的答")
+        .await
+        .expect("record someone else's conversation");
+    probe
+        .store
+        .record_turn(&mine_second, &probe.owner, "第二段", None, &[], "第二答")
+        .await
+        .expect("record the second conversation");
+
+    let listed = probe
+        .store
+        .sessions(&probe.owner, 50, None)
+        .await
+        .expect("list the sessions");
+    let ids: Vec<&str> = listed.iter().map(|s| s.session_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![mine_second.as_str(), mine_first.as_str()],
+        "名单没有把最近说话的排在前面，或者把别人的会话也列了出来"
+    );
+    assert_eq!(
+        listed[1].title, "第一段 百分之百",
+        "标题不是这一段开口的第一句：{}",
+        listed[1].title
+    );
+    assert_eq!(
+        listed[1].turns, 1,
+        "一段一问答被数成了两轮：turns 数的是问句，不是这一对的两行"
+    );
+
+    // 搜索是字面的：`%` 是人在找这个字，不是「什么都算」。
+    let literal = probe
+        .store
+        .sessions(&probe.owner, 50, Some("百"))
+        .await
+        .expect("search a character that is there");
+    assert_eq!(
+        literal
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![mine_first.as_str()],
+        "搜索没有在自己的一段话里找到这几个字"
+    );
+    let wildcard = probe
+        .store
+        .sessions(&probe.owner, 50, Some("%"))
+        .await
+        .expect("search a percent sign");
+    assert!(
+        wildcard.is_empty(),
+        "`%` 被当成了通配符：{} 段会话被它全捞了出来",
+        wildcard.len()
+    );
+    let other_persons_word = probe
+        .store
+        .sessions(&probe.owner, 50, Some("别人的会话"))
+        .await
+        .expect("search a line someone else wrote");
+    assert!(
+        other_persons_word.is_empty(),
+        "搜索翻到了别人的会话里：名单的边界只挡了不过滤的那一次"
+    );
+
+    // 空身份一条都不给：那不是一个「没有会话的人」，是「不知道是谁」。
+    let unowned = probe
+        .store
+        .sessions("", 50, None)
+        .await
+        .expect("list with an empty identity");
+    assert!(unowned.is_empty(), "空身份拿到了会话名单");
 
     cleanup(&probe).await;
 }

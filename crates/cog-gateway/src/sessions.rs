@@ -36,6 +36,10 @@ pub struct ListSessionsQuery {
     pub cursor: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// 只在某一段话里找过某几个字时给。给的是字面，不是通配符：搜索框里打的
+    /// `%` 是用户在找 `%`，不是「什么都算」。
+    #[serde(default)]
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,22 +80,89 @@ pub struct SendMessagePayload {
     pub options: Option<serde_json::Value>,
 }
 
+/// One person's conversations, newest activity first.
+///
+/// This used to answer `items: []` unconditionally while the transcript held
+/// every session the platform had ever recorded: the one endpoint named "list
+/// sessions" could not name a single one, so a page that lost its dock (a new
+/// browser, cleared storage) had no way back to a conversation -- the record was
+/// kept and unreachable.
+///
+/// The listing is scoped to the caller. The transcript holds every person's
+/// conversations, so an unscoped list would be a list of other people's
+/// questions; a caller with no established identity gets a refusal instead of an
+/// empty page, because "you have no conversations" and "we do not know who you
+/// are" are different answers and only one of them is true.
 pub async fn list_sessions_handler(
-    State(_state): State<Arc<GatewayState>>,
-    Query(_q): Query<ListSessionsQuery>,
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Query(q): Query<ListSessionsQuery>,
 ) -> Response {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "code": crate::error::simple_code::OK,
-            "data": {
-                "items": [],
-                "next_cursor": null,
-                "has_more": false,
-            }
-        })),
-    )
-        .into_response()
+    let Some(owner) = claims
+        .as_ref()
+        .map(|axum::Extension(c)| c.sub.trim())
+        .filter(|sub| !sub.is_empty())
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "code": crate::error::simple_code::UNAUTHORIZED,
+                "error": "需要先登录才能列出自己的会话",
+            })),
+        )
+            .into_response();
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let Some(store) = state.chat_turns.as_ref() else {
+        // 这套部署没有聊天记录库：空名单是真话，与 `list_messages` 同一种答法。
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "code": crate::error::simple_code::OK,
+                "data": {
+                    "items": [],
+                    "next_cursor": null,
+                    "has_more": false,
+                }
+            })),
+        )
+            .into_response();
+    };
+    match store.sessions(owner, limit, q.search.as_deref()).await {
+        Ok(sessions) => {
+            let items: Vec<serde_json::Value> = sessions
+                .into_iter()
+                .map(|session| {
+                    json!({
+                        "session_id": session.session_id,
+                        "title": session.title,
+                        "last_activity_at": session.last_activity_at,
+                        "turns": session.turns,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "code": crate::error::simple_code::OK,
+                    "data": {
+                        "items": items,
+                        "next_cursor": null,
+                        "has_more": false,
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "code": "error",
+                "message": format!("读不到会话名单：{e}"),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn create_session_handler(

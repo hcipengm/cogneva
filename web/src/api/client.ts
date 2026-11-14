@@ -357,6 +357,36 @@ export async function getSessionMessages(
   return res.data?.items ?? [];
 }
 
+/** 名单上的一段会话：哪一个、开头说了什么、最后一次说话在什么时候。 */
+export interface ChatSessionSummary {
+  session_id: string;
+  title: string;
+  last_activity_at: string;
+  turns: number;
+}
+
+/**
+ * 这个人的会话名单，最近说话的在前。
+ *
+ * 关掉页面、换一台机器、清掉浏览器存储之后，这是唯一还能找回那段对话的路：
+ * 本地那份开着的名单已经没了，而记录还在服务端。名单只含自己的会话，搜索是
+ * 字面匹配——搜索框里打进来的字是用户在找的字，不是通配符。
+ */
+export async function listChatSessions(
+  search?: string
+): Promise<ChatSessionSummary[]> {
+  const query = search?.trim();
+  const path = query
+    ? `/api/v1/sessions?search=${encodeURIComponent(query)}`
+    : '/api/v1/sessions';
+  const res = await api.get<{
+    code: string;
+    data?: { items?: ChatSessionSummary[] };
+    message?: string;
+  }>(path);
+  return res.data?.items ?? [];
+}
+
 export interface LlmBackend {
   provider: string;
   base_url: string;

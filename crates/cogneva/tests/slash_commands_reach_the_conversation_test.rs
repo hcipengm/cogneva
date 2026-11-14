@@ -189,7 +189,7 @@ fn what_the_person_typed_and_what_the_model_read_are_stored_apart() {
         "{CHAT} 不把展开后的那一份交给记录：第二轮起模型手上只剩 `/web-research`"
     );
     assert!(
-        chat.contains("record_turn(\n                    &state.chat_turns,\n                    &session_id,\n                    &content,"),
+        chat.contains("record_turn(\n                    &state.chat_turns,\n                    &session_id,\n                    &owner,\n                    &content,"),
         "{CHAT} 记录里没把「人打的那一行」与「模型读到的那一份」分开传"
     );
 

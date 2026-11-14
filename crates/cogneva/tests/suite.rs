@@ -485,6 +485,8 @@ mod scrape_targets_name_a_port_the_workload_provides_test;
 mod self_alert_rule_names_are_declared_once_test;
 #[path = "service_account_mount_literals_contract_test.rs"]
 mod service_account_mount_literals_contract_test;
+#[path = "sessions_are_listed_and_searchable_test.rs"]
+mod sessions_are_listed_and_searchable_test;
 #[path = "shutdown_budget_contract_test.rs"]
 mod shutdown_budget_contract_test;
 #[path = "skill_directories_contract_test.rs"]
