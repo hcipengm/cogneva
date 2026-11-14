@@ -417,23 +417,20 @@ mod tests {
 
     #[test]
     fn a_roster_survives_parse_and_render_unchanged() {
-        let rows = parse_roster(ROSTER).expect("parses");
-        let expected: String = ROSTER
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .map(|line| format!("{line}\n"))
-            .collect();
-        assert_eq!(render(&rows), expected);
-        // Fixed point: a second trip moves no byte, so a reader cannot tell an
-        // imported row from a re-rendered one.
-        let again = parse_roster(&render(&rows)).expect("parses");
-        assert_eq!(render(&again), render(&rows));
+        crate::roster_test_support::a_round_trip_moves_no_byte(
+            "driver roster",
+            ROSTER,
+            parse_roster,
+            render,
+        );
     }
 
     #[test]
     fn comments_and_blank_lines_are_not_rows() {
-        let rows = parse_roster("\n# only a comment\n\n").expect("parses");
-        assert!(rows.is_empty());
+        crate::roster_test_support::comments_and_blank_lines_are_not_rows(
+            "driver roster",
+            parse_roster,
+        );
     }
 
     // Two rows for one (front, unit) would leave the import to pick one and the
@@ -532,10 +529,12 @@ mod tests {
 
     #[test]
     fn the_rendering_is_sorted_so_two_reads_compare_byte_for_byte() {
-        let rows = parse_roster(ROSTER).expect("parses");
-        let mut reversed = rows.clone();
-        reversed.reverse();
-        assert_eq!(render(&rows), render(&reversed));
+        crate::roster_test_support::a_reordered_roster_renders_the_same_bytes(
+            "driver roster",
+            ROSTER,
+            parse_roster,
+            render,
+        );
     }
 
     // An empty reading is the gate's third state, not something the import may

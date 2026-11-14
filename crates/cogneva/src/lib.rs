@@ -42,6 +42,8 @@ pub mod principles;
 pub mod principles_cli;
 pub mod process_census;
 pub mod process_report;
+#[cfg(test)]
+pub(crate) mod roster_test_support;
 pub mod schema_bundle;
 pub mod scraper_endpoint;
 pub mod self_change;
