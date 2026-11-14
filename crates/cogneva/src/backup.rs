@@ -6262,6 +6262,29 @@ mod tests {
         cog_core::progress::reset_for_tests();
     }
 
+    /// 等到判词真的出现为止。
+    ///
+    /// 界读的是**进程级**样本水库（[`cog_core::progress::longest_gap`]），而同一个测试
+    /// 二进制里别的用例正在真跑备份、真在打拍：它们留下的长间隔会把界抬到这几条用例
+    /// 等的那道界之上，于是「静默 30 毫秒」在一个忙碌的进程里时红时绿——2026-11-14
+    /// 全量跑 520 条时实测两跑一红（单独跑必绿）。静默每过一刻都在变长，界只可能被
+    /// 别人抬高，等下去必然收敛；十秒还不收敛，说明不是并发样本的问题，是判据没接上
+    /// 读数——两种原因在这里当场分开。
+    fn verdict_once_silence_exceeds(tasks: &[&str]) -> (Duration, Duration) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(verdict) = cog_core::declared_wall::stall_any(tasks) {
+                return verdict;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "十秒内没有出现判词：不是并发样本把界抬高（那样静默迟早越过它），\
+                 而是判据没有接上读数"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// 采纳一条实测界之后，同一组通道立刻可以判停——判据跟着读数走，不是反过来。
     #[test]
     fn an_adopted_bound_is_what_the_pass_is_judged_against() {
@@ -6270,11 +6293,20 @@ mod tests {
         cog_core::progress::reset_for_tests();
         cog_core::progress::beat(DRILL_PROGRESS_TASK);
         Bound::Measured(Duration::from_millis(5)).adopt();
-        std::thread::sleep(Duration::from_millis(30));
+        // 采纳有没有接上读数，先在这一刻问一次：别处留下的样本只会让界变大，不会让
+        // 一条没装进去的界变出来。这一句就是「采纳生效」的判据，下面等的只是静默。
+        assert!(
+            Bound::now()
+                .value()
+                .is_some_and(|bound| bound >= Duration::from_millis(5)),
+            "采纳的界没有进判据：静默再久也不会改判"
+        );
 
-        let (silent, bound) = cog_core::declared_wall::stall_any(&WATCHED_TASKS)
-            .expect("静默超过采纳的界，就该有判词");
-        assert_eq!(bound, Duration::from_millis(5));
+        let (silent, bound) = verdict_once_silence_exceeds(&WATCHED_TASKS);
+        assert!(
+            bound >= Duration::from_millis(5),
+            "判据用的界比采纳的那道还窄：采纳被一个更小的样本顶掉了"
+        );
         assert!(silent > bound);
         cog_core::progress::reset_for_tests();
     }
@@ -6296,9 +6328,18 @@ mod tests {
         assert_eq!(Bound::now(), Bound::Unmeasured);
         assert!(cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_none());
 
-        // 持久面写的是一条实测：装进去，同一组通道立刻判停。
+        // 持久面写的是一条实测：装进去，同一组通道立刻判停。采纳先在这一刻问一次
+        // （见上一条用例：样本只会把界抬高，不会让没装进去的界凭空出现），静默本身
+        // 则等它真的越过这道界——别处并发打拍抬高的界，等下去同样会被越过。
         Bound::from_stored(Some(0.005)).adopt();
-        assert!(cog_core::declared_wall::stall_any(&WATCHED_TASKS).is_some());
+        assert!(
+            Bound::now()
+                .value()
+                .is_some_and(|bound| bound >= Duration::from_millis(5)),
+            "持久面读回来的实测没有进判据"
+        );
+        let (silent, bound) = verdict_once_silence_exceeds(&WATCHED_TASKS);
+        assert!(silent > bound);
 
         // 写回持久面的那个数是这一跑自己量到的，不是采纳进来的那个。这里比的是
         // 「没有被采纳值顶替」，不是「一定量不到」：同一进程里别的用例也在打拍，
