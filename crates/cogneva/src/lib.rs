@@ -25,6 +25,7 @@ pub mod eval_toolathlon_local;
 pub mod gateway_observability;
 pub mod governance;
 pub mod governance_acts;
+pub mod governance_declarations;
 pub mod governance_drivers;
 pub mod governance_exemptions;
 pub mod governance_fronts;

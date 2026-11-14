@@ -70,9 +70,10 @@ SUBCOMMANDS:
     drift [--json]         Print the current verdict of every face. Reads the
                            workers' heartbeats too; an owner nobody can see
                            reads unread, never green.
-    project --out <dir>    Write faces.tsv, drift.tsv, decisions.tsv and
-                           tasks.tsv into <dir>, each with its generated_at and
-                           the graph's largest revision. This is the write a
+    project --out <dir>    Write faces.tsv, drift.tsv, decisions.tsv,
+                           tasks.tsv and one <kind>.tsv per declaration kind
+                           into <dir>, each with its generated_at and the
+                           graph's largest revision. This is the write a
                            freshness gate reads.
     import-faces --from <file> [--keep-ownership]
                            Put each roster row into the graph. Columns:
@@ -149,6 +150,17 @@ SUBCOMMANDS:
                            is how one exemption is granted without restating the
                            rest. `--from -` reads stdin for the same reason as
                            the other imports.
+    declarations --kind <kind>
+                           Print one declaration table from the graph: the rows
+                           a host reading judges against, in the kind's own
+                           columns and no header. Kinds:
+                           face-reading-criteria, principle-face-map.
+    import-declarations --kind <kind> --from <file> [--upsert]
+                           Put a declaration table into the graph. Without
+                           --upsert the input is the whole table: rows it no
+                           longer states are withdrawn from the kind's node.
+                           Row contracts and closed sets are enforced here, so
+                           a row the reader cannot use is refused on import.
     progress [--json]
                            One reading of three ledgers at the same instant: the
                            task graph by the unit it names, the change account,
@@ -235,6 +247,16 @@ pub enum Action {
         /// silently withdraw the others that were in force.
         upsert: bool,
     },
+    /// One declaration table, straight from the graph: the rows a host reading
+    /// judges against.
+    Declarations {
+        kind: String,
+    },
+    ImportDeclarations {
+        from: PathBuf,
+        kind: String,
+        upsert: bool,
+    },
     // Boxed: a handover carries a spec whose text fields make it the widest
     // variant, and every other action would pay for that width. One CLI
     // process builds exactly one of these, so the extra allocation costs
@@ -289,6 +311,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut from: Option<PathBuf> = None;
     let mut face: Option<String> = None;
     let mut workspace: Option<String> = None;
+    let mut kind: Option<String> = None;
 
     let mut subcommand: Option<&str> = None;
     let mut iter = args.iter();
@@ -315,6 +338,9 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             }
             "--workspace" => {
                 workspace = Some(iter.next().ok_or("--workspace needs an id")?.clone());
+            }
+            "--kind" => {
+                kind = Some(iter.next().ok_or("--kind needs a name")?.clone());
             }
             other if other.starts_with('-') => return Err(format!("unknown option {other}")),
             other => {
@@ -354,6 +380,14 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         Some("exemptions") => Action::Exemptions,
         Some("import-exemptions") => Action::ImportExemptions {
             from: from.ok_or("import-exemptions needs --from <file>")?,
+            upsert,
+        },
+        Some("declarations") => Action::Declarations {
+            kind: known_kind(kind)?,
+        },
+        Some("import-declarations") => Action::ImportDeclarations {
+            from: from.ok_or("import-declarations needs --from <file>")?,
+            kind: known_kind(kind)?,
             upsert,
         },
         Some(other) => return Err(format!("unknown governance subcommand {other}")),
@@ -486,6 +520,10 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         Action::Exemptions => exemptions_roster(&*store).await?,
         Action::ImportExemptions { from, upsert } => {
             import_exemptions(&*store, &from, upsert).await?
+        }
+        Action::Declarations { kind } => declarations_table(&*store, &kind).await?,
+        Action::ImportDeclarations { from, kind, upsert } => {
+            import_declarations(&*store, &from, &kind, upsert).await?
         }
         Action::Act(act) => {
             // The heartbeat store is what an exit handover's apply step
@@ -683,6 +721,52 @@ async fn import_fronts(
         crate::governance_fronts::upsert_from_text(store, &text).await?
     } else {
         crate::governance_fronts::import_from_text(store, &text).await?
+    };
+    println!("{}", summary.line());
+    Ok(())
+}
+
+/// The kind a `--kind` named, checked against the closed set here rather than
+/// inside the import: an unknown kind would otherwise write a node nobody
+/// reads, which looks exactly like a table with no rows.
+fn known_kind(kind: Option<String>) -> Result<String, String> {
+    let name = kind.ok_or("--kind <name> is required")?;
+    if crate::governance_declarations::kind_by_name(&name).is_none() {
+        return Err(format!(
+            "`{name}` is not one of {}",
+            crate::governance_declarations::kind_names()
+        ));
+    }
+    Ok(name)
+}
+
+fn declaration_kind(name: &str) -> &'static crate::governance_declarations::Kind {
+    crate::governance_declarations::kind_by_name(name)
+        .expect("parse_args only accepts declared kinds")
+}
+
+/// One declaration table, printed from the graph on every call: a consumer that
+/// judged a cached copy would be judging rows somebody already withdrew.
+async fn declarations_table(store: &dyn GovernanceStore, kind: &str) -> Result<(), Box<dyn Error>> {
+    print!(
+        "{}",
+        crate::governance_declarations::table(store, declaration_kind(kind)).await?
+    );
+    Ok(())
+}
+
+async fn import_declarations(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    kind: &str,
+    upsert: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
+    let kind = declaration_kind(kind);
+    let summary = if upsert {
+        crate::governance_declarations::upsert_from_text(store, kind, &text).await?
+    } else {
+        crate::governance_declarations::import_from_text(store, kind, &text).await?
     };
     println!("{}", summary.line());
     Ok(())
@@ -1012,18 +1096,36 @@ async fn project(
         ));
     }
 
+    // The declaration tables are contracts the host readings judge against: a
+    // criteria row says how a face's owed reading fails, a principle-face row
+    // says which face a theme belongs to. They are declarations, not
+    // measurements, so this projection is their only copy on a host that has no
+    // repository to read them from.
+    let mut declaration_rows = 0usize;
+    let mut declaration_files: Vec<(String, String)> = Vec::new();
+    for kind in crate::governance_declarations::KINDS {
+        let table = crate::governance_declarations::table(store, kind).await?;
+        declaration_rows += table.lines().count();
+        declaration_files.push((format!("{}.tsv", kind.name), format!("{stamp}{table}")));
+    }
+
     std::fs::write(out.join("faces.tsv"), faces_tsv)?;
     std::fs::write(out.join("drift.tsv"), drift_tsv)?;
     std::fs::write(out.join("decisions.tsv"), decisions_tsv)?;
     std::fs::write(out.join("tasks.tsv"), tasks_tsv)?;
+    for (name, body) in &declaration_files {
+        std::fs::write(out.join(name), body)?;
+    }
     println!(
-        "wrote faces.tsv, drift.tsv, decisions.tsv and tasks.tsv at {} \
-         (faces={}, decisions={}, open_tasks={}, source_revision={}, \
-         owners_no_act_explains={})",
+        "wrote faces.tsv, drift.tsv, decisions.tsv, tasks.tsv and {} declaration \
+         tables at {} (faces={}, decisions={}, open_tasks={}, declaration_rows={}, \
+         source_revision={}, owners_no_act_explains={})",
+        declaration_files.len(),
         now.to_rfc3339(),
         faces.len(),
         decisions.len(),
         open_tasks.len(),
+        declaration_rows,
         revision,
         unexplained.len()
     );
@@ -1812,6 +1914,31 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&args(&["declarations", "--kind", "principle-face-map"]))
+                .unwrap()
+                .action,
+            Action::Declarations {
+                kind: "principle-face-map".into()
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "import-declarations",
+                "--kind",
+                "face-reading-criteria",
+                "--from",
+                "-",
+                "--upsert"
+            ]))
+            .unwrap()
+            .action,
+            Action::ImportDeclarations {
+                from: PathBuf::from("-"),
+                kind: "face-reading-criteria".into(),
+                upsert: true,
+            }
+        );
+        assert_eq!(
             parse_args(&args(&["assign"])).unwrap().action,
             Action::Assign {
                 face: None,
@@ -1835,6 +1962,14 @@ mod tests {
         assert!(parse_args(&args(&["import-faces"])).is_err());
         assert!(parse_args(&args(&["import-fronts"])).is_err());
         assert!(parse_args(&args(&["import-exemptions"])).is_err());
+        assert!(parse_args(&args(&["declarations"])).is_err());
+        assert!(parse_args(&args(&["import-declarations", "--kind", "nope"])).is_err());
+        assert!(parse_args(&args(&[
+            "import-declarations",
+            "--kind",
+            "principle-face-map"
+        ]))
+        .is_err());
         assert!(parse_args(&args(&["faces", "--out"])).is_err());
         assert!(parse_args(&args(&[])).is_err());
         assert!(parse_args(&args(&["no-such-face"])).is_err());
