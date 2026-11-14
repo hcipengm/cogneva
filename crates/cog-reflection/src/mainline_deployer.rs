@@ -26250,14 +26250,21 @@ exit 0
         let script = format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
-echo ok
+case "$*" in
+  *observedGeneration*) echo "2|2|1|1|1|0|" ;;
+  *"get pods"*)
+    echo "cogneva-evolution-abc-1|Running|true|||2026-11-13T15:00:00Z||" ;;
+  *) echo ok ;;
+esac
 exit 0
 "#,
             log = log.display()
         );
         write_fake_bin(&bin_dir, "fake-kubectl", &script);
-        // 就绪预算 0：回滚里那次"等它收敛"首轮即过期，只 warn 不拖时间——这个测试
-        // 问的是发出了哪几条命令，不是等它收敛。
+        // 回滚里那次“等它收敛”要能结束：假集群给一份收敛读数和一个就绪 Pod，
+        // 第一拍就判 Done。全答 `ok` 时探针每拍读到同一个“未收敛”，而判停界来自
+        // 进程里量到的拍间隔，单跑这条用例时没有样本——等待就永不结束。
+        // 这个测试问的是发出了哪几条命令，不是等它收敛。
         let executor = RolloutExecutor::new(
             bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
             "cogneva",
@@ -26365,8 +26372,9 @@ case "$*" in
     printf '%s\n' 'seed-source=localhost:30500/cogneva:main-seedold' 'cogneva=localhost:30500/cogneva:main-stale' ;;
   *"get statefulset redis -o jsonpath={{range"*)
     printf '%s\n' 'aof-repair=localhost:30500/cogneva:main-aofold' ;;
-  *generation*) echo "1|1|1|1|0|" ;;
-  *"get pods"*) echo "0 true " ;;
+  *observedGeneration*) echo "2|2|1|1|1|0|" ;;
+  *"get pods"*)
+    echo "cogneva-evolution-abc-1|Running|true|||2026-11-13T15:00:00Z||" ;;
   *) echo ok ;;
 esac
 exit 0
@@ -26442,6 +26450,10 @@ exit 0
 
     /// 反方向：镜像都回读到了快照那一份时，判词不许报"没落地"——误报会让人去
     /// 追一个不存在的失败，而这时返回给调用方的错误必须保持原文。
+    ///
+    /// 假集群要给出**收敛的**读数和一个就绪的 Pod：其余查询答 `ok` 时，探针每一拍
+    /// 都读到同一个「未收敛」，而判停界在单条用例的进程里没有样本可量，等待只能靠
+    /// 别的用例打过的拍才结束——那让这条用例单跑即挂，也让结果取决于跑的顺序。
     #[tokio::test]
     async fn a_rollback_that_landed_carries_no_note() {
         let tmp = tempfile::tempdir().unwrap();
@@ -26453,6 +26465,9 @@ printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment cogneva-evolution -o jsonpath={{range"*)
     printf '%s\n' 'seed-source=localhost:30500/cogneva:main-seedold' 'cogneva=localhost:30500/cogneva:main-old' ;;
+  *observedGeneration*) echo "2|2|1|1|1|0|" ;;
+  *"get pods"*)
+    echo "cogneva-evolution-abc-1|Running|true|||2026-11-13T15:00:00Z||" ;;
   *) echo ok ;;
 esac
 exit 0
