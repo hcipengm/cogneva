@@ -1067,11 +1067,85 @@ pub async fn create_task_handler(
     ))
 }
 
+/// 一次阻塞读最多等多久。
+///
+/// `override`：人定的窗口，与智能体那一侧 `await_task` 的上限取同一个决定——
+/// 超过它的等待方早就不在了（它自己那一轮有停滞超时），连接只是挂在那里。
+/// 门这一侧再钳一次，是因为这个读口不问调用方是谁：一个任意长的 `wait_ms`
+/// 就是一条能被外面拿住的连接。
+// cap: bound — 人定的（override）：与 await_task 的上限同一个决定，超过它等待方早已不在
+pub const MAX_TASK_WAIT_MS: u64 = 600_000;
+
+/// `GET /api/v1/tasks/{id}` 的等待参数。
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct TaskWaitQuery {
+    /// 最多等这条任务走到终局多少毫秒；缺省是「读当下这一眼」。
+    pub wait_ms: Option<u64>,
+}
+
+/// 一条任务是不是走到了终局。
+fn task_reached_an_end(status: Option<cog_core::TaskStatus>) -> bool {
+    matches!(
+        status,
+        Some(cog_core::TaskStatus::Completed)
+            | Some(cog_core::TaskStatus::Failed)
+            | Some(cog_core::TaskStatus::Cancelled)
+    )
+}
+
+/// 等这条任务走到终局，或者到点。
+///
+/// 订阅编排器广播的那一份任务事件，不在读口里反复读库：一次等 = 一次订阅。
+/// 掉队（`Lagged`）时立刻返回让调用方重读一行，而不是在这里一直等到点——
+/// 掉队说明的是读者跟不上，这一行的终局可能就在掉队的那几条里；重读一次状态
+/// 比「等一个已经发生过的终局」便宜。
+async fn wait_for_task_end(state: &GatewayState, id: &str, wait_ms: u64) {
+    let Some(task) = state.orchestrator.get_task(id).await else {
+        return;
+    };
+    if task_reached_an_end(Some(task.status)) {
+        return;
+    }
+    let mut events = state.subscribe_task_events();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    let waited = tokio::time::timeout_at(deadline, async {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let arrived = match &event {
+                        cog_core::TaskEvent::TaskCompleted { task_id, .. }
+                        | cog_core::TaskEvent::TaskFailed { task_id, .. }
+                        | cog_core::TaskEvent::TaskCancelled { task_id, .. } => task_id,
+                        _ => continue,
+                    };
+                    if arrived == id {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+    .await;
+    if waited.is_err() {
+        tracing::debug!(
+            task_id = id,
+            wait_ms,
+            "no end arrived for this task within the wait; the caller reads the row as it stands"
+        );
+    }
+}
+
 pub async fn get_task_handler(
     State(state): State<Arc<GatewayState>>,
     claims: Option<axum::Extension<cog_core::Claims>>,
     Path(id): Path<String>,
+    Query(wait): Query<TaskWaitQuery>,
 ) -> Result<Json<TaskView>, ApiError> {
+    if let Some(wait_ms) = wait.wait_ms.filter(|ms| *ms > 0) {
+        wait_for_task_end(&state, &id, wait_ms.min(MAX_TASK_WAIT_MS)).await;
+    }
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     match state.orchestrator.get_task(&id).await {
         Some(task) if !visible_to_claims(claims, &task) => {

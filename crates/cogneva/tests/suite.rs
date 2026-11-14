@@ -539,6 +539,8 @@ mod supervisor_task_rebalancer_test;
 mod supervisor_udp_heartbeat_test;
 #[path = "task_claim_concurrency_wiring_test.rs"]
 mod task_claim_concurrency_wiring_test;
+#[path = "task_completion_events_and_timeout_semantics_test.rs"]
+mod task_completion_events_and_timeout_semantics_test;
 #[path = "task_resume_wiring_contract_test.rs"]
 mod task_resume_wiring_contract_test;
 #[path = "the_ceiling_follows_the_work_not_the_label_test.rs"]

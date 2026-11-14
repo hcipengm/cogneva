@@ -64,6 +64,7 @@ async fn the_binary_lists_its_tools_and_reads_a_file_on_request() {
         names,
         vec![
             "apply_patch",
+            "await_task",
             "command_output",
             "edit_file",
             "git_commit",

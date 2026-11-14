@@ -47,8 +47,9 @@ use cog_storage::MemoryAgentRegistry;
 use cog_stream::MemoryMessageBackend;
 
 /// The names the whole built-in set answers to. Written out, not derived.
-const WHOLE_SET: [&str; 23] = [
+const WHOLE_SET: [&str; 24] = [
     "apply_patch",
+    "await_task",
     "command_output",
     "edit_file",
     "git_commit",
@@ -135,7 +136,7 @@ fn the_whole_builtin_set_is_registered_by_one_constructor() {
     let expected: Vec<String> = WHOLE_SET.iter().map(|n| (*n).to_string()).collect();
     assert_eq!(
         names, expected,
-        "the built-in set is the twenty-three named tools; a tool added or dropped here is \
+        "the built-in set is the twenty-four named tools; a tool added or dropped here is \
          a change to what every caller of this process is offered"
     );
 }

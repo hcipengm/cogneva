@@ -36,6 +36,10 @@ const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 // cap: bound — the cap that keeps a peer's silence from becoming an unbounded wait
 const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 
+/// 毫秒与秒之间的换算。
+/// 不是一个可调的界：等待窗口从工具一路传到服务端都是毫秒，只有 HTTP 客户端
+/// 按秒记超时。换算本身没有第三个答案。
+const MILLIS_PER_SECOND: u64 = 1_000;
 /// How long a filed work item declares it will take when the submitter names no
 /// budget.
 ///
@@ -3185,6 +3189,13 @@ pub mod builtins {
             registry,
             read_task_ledger(inputs.http_client.clone(), inputs.memory_api_base.clone()),
         );
+        // 派活之后要答案：`start_task` 的回执只有「已排队」，没有结局。没有这
+        // 一只，调用方要么再派一件、要么自己反复读账——两件都是在拿「没等到」
+        // 当答案。它读的是服务端那一刻的终局，不是客户端里的轮询。
+        cog_core::ToolRegistry::register(
+            registry,
+            await_task(inputs.http_client.clone(), inputs.memory_api_base.clone()),
+        );
     }
 
     /// Names the live agents, so a caller has something to address.
@@ -3791,6 +3802,135 @@ pub mod builtins {
         }
     }
 
+    /// 等一件已经派出去的活走到终局。
+    ///
+    /// 与 `start_task` 成对：派活的回执里只有「已排队」，没有答案。要答案就得
+    /// 等，而「等」不该是调用方自己反复读——那是调用方把一份服务端已经在维护的
+    /// 状态再轮询一遍，每一次轮询之间它什么也没做成。这里发一次请求，服务端订
+    /// 阅同一份任务事件流（`TaskEvent`），走到终态（完成 / 失败 / 取消）才回答；
+    /// 到点也回答，但说的是「没在时限内等到」。
+    ///
+    /// 到点不等于对方没做完：那一行可能还在跑，也可能排在一长串活后面。所以超时
+    /// 的回执里 `task_completed` 是假、`reason` 是 `timeout`，还带着此刻读到的
+    /// 状态；把「没等到」读成「没做完」，等的人就会去重派一件已经在做的事。
+    ///
+    /// 回执不替调用方判断成败：`status` 原样交回（完成的拼法由服务端那一列定），
+    /// `task_completed` 只在真走完时才真——一条失败的行不是「完成了」。
+    pub fn await_task(client: Option<Arc<dyn HttpClient>>, api_base: Option<String>) -> Tool {
+        Tool {
+            name: "await_task".into(),
+            description: "Wait for a task you filed to reach its end, and return what it \
+                          ended with. The call blocks this turn for up to timeout_ms; the \
+                          server subscribes to the task's lifecycle rather than being polled, \
+                          so one call is enough. On timeout `task_completed` is false and \
+                          `reason` is `timeout`: that means no end arrived within the limit, \
+                          not that the work failed or is not being done. Tasks are filed with \
+                          `start_task`; its receipt carries the `task_id` this needs."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The `task_id` from start_task's receipt"
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "How long to wait when the task has not ended yet \
+                                        (default 120000, capped at 600000)"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let client = client.clone();
+                let api_base = api_base.clone();
+                Box::pin(async move {
+                    let base = memory_base(api_base.as_deref())?;
+                    let client = memory_client(client)?;
+                    let task_id = args["task_id"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| {
+                            SFError::Validation(
+                                "await_task needs the `task_id` from start_task's receipt; \
+                                 without it there is no row to wait on"
+                                    .into(),
+                            )
+                        })?;
+                    let wait_ms = args
+                        .get("timeout_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(ASK_DEFAULT_TIMEOUT_MS)
+                        .clamp(1, ASK_MAX_TIMEOUT_MS);
+                    let url = format!(
+                        "{base}/api/v1/tasks/{}?wait_ms={wait_ms}",
+                        encode_url_component(task_id)
+                    );
+                    let mut request = cog_core::HttpRequest::new("GET", &url);
+                    // 客户端自己的超时跟服务端等的窗口一样长：到点时先由服务端回答
+                    // 「没等到」，客户端这边跟着断开只会把同一句话读成一次网络失败。
+                    request.timeout_secs = Some(wait_ms.div_ceil(MILLIS_PER_SECOND));
+                    let response = client.execute(request).await?;
+                    let text = String::from_utf8_lossy(&response.body).to_string();
+                    if !response.is_success() {
+                        return Err(SFError::Validation(format!(
+                            "the task read refused this wait (HTTP {}): {}",
+                            response.status,
+                            text.trim()
+                        )));
+                    }
+                    let view: serde_json::Value =
+                        serde_json::from_str(&text).map_err(SFError::Serialization)?;
+                    let status_word = view.get("status").and_then(serde_json::Value::as_str);
+                    let status = status_word.and_then(cog_core::TaskStatus::parse);
+                    let completed = task_completed(status);
+                    let ended = completed || task_reached_an_end(status);
+                    let mut receipt = serde_json::json!({
+                        "task_id": task_id,
+                        "status": status_word,
+                        "task_completed": completed,
+                        "result": view.get("result").cloned().unwrap_or(serde_json::Value::Null),
+                        "error": view.get("error").cloned().unwrap_or(serde_json::Value::Null),
+                        "agent_id": view.get("agent_id").cloned().unwrap_or(serde_json::Value::Null),
+                        "waited_ms": wait_ms,
+                    });
+                    if !ended {
+                        receipt["reason"] = serde_json::json!("timeout");
+                        receipt["hint"] = serde_json::json!(
+                            "no end arrived within the limit; the row may still be running \
+                             or still queued. Ask again, or read the ledger, rather than \
+                             filing the same work a second time"
+                        );
+                    }
+                    Ok(receipt)
+                })
+            })),
+        }
+    }
+
+    /// 这一行走完了吗。失败与取消也是终局，但它们不是「完成」——两句话分开，
+    /// 因为等的人拿到之后要做的事不同：完成是去用结果，失败是去看原因。
+    fn task_completed(status: Option<cog_core::TaskStatus>) -> bool {
+        status == Some(cog_core::TaskStatus::Completed)
+    }
+
+    /// 这一行还有没有可能再变：完成、失败、取消都不会再变。
+    fn task_reached_an_end(status: Option<cog_core::TaskStatus>) -> bool {
+        matches!(
+            status,
+            Some(cog_core::TaskStatus::Completed)
+                | Some(cog_core::TaskStatus::Failed)
+                | Some(cog_core::TaskStatus::Cancelled)
+        )
+    }
+
+    /// 子任务要用的那一组东西：模型、配置、工具表、权限、名册、身份与账。
+    ///
+    /// 打成一条结构而不是七个参数：这七样是同一个决定——「这条分解在谁名下、
+    /// 按什么规矩跑」。分行传的话，某一个构造点漏掉其中一样也不会报错，它只是
+    /// 让子任务的花销记不进这段会话、或者让它在一个名册上没有的 id 下动手。
     /// What a `start_task` call turns into, decided without an HTTP client.
     ///
     /// Kept apart from the tool body so the shape of a filing is assertable:
@@ -5334,6 +5474,83 @@ pub mod builtins {
 
         fn filing(args: serde_json::Value) -> SFResult<StartTaskFiling> {
             start_task_filing(&args, Some("agent-caller"))
+        }
+
+        /// 任务读口的替身：每一条等待都回同一个状态词。
+        ///
+        /// 与顶层的 `StubHttp` 分开写：那一只回答的是「请求到了没有」，这一只
+        /// 回答的是「那一行走到了哪」——两种替身回答的是不同的问题，共用一个
+        /// 只会让两边的判据都变松。
+        #[derive(Debug)]
+        struct TaskReading(&'static str);
+
+        #[async_trait::async_trait]
+        impl cog_core::HttpClient for TaskReading {
+            async fn execute(
+                &self,
+                _req: cog_core::HttpRequest,
+            ) -> SFResult<cog_core::HttpResponse> {
+                let body = serde_json::json!({
+                    "id": "task-1",
+                    "status": self.0,
+                    "result": { "said": "the work is done" },
+                    "agent_id": "agent-b",
+                });
+                Ok(cog_core::HttpResponse {
+                    status: 200,
+                    headers: Default::default(),
+                    body: serde_json::to_vec(&body).map_err(SFError::Serialization)?,
+                })
+            }
+        }
+
+        async fn wait_on(status: &'static str) -> serde_json::Value {
+            let tool = await_task(
+                Some(Arc::new(TaskReading(status))),
+                Some("http://gateway:8081".into()),
+            );
+            let ToolImplementation::Native(run) = &tool.implementation else {
+                panic!("await_task is native");
+            };
+            run(serde_json::json!({ "task_id": "task-1", "timeout_ms": 1_000 }))
+                .await
+                .expect("the read door answered")
+        }
+
+        /// 等到了头、没等到头、到了头但是失败——三种答案三句话。
+        ///
+        /// 「没在时限内答」与「对方没做完」是两件事：把前者说成后者，等的人会
+        /// 把活再派一遍；把后者说成前者，等的人会一直等一条已经不会再动的行。
+        #[tokio::test]
+        async fn an_ended_wait_and_a_timed_out_wait_are_different_answers() {
+            let done = wait_on("completed").await;
+            assert_eq!(done["task_completed"], serde_json::json!(true));
+            assert_eq!(done["status"], serde_json::json!("completed"));
+            assert!(
+                done.get("reason").is_none(),
+                "走到了头的等待没有「没等到」这一说：{done}"
+            );
+
+            let running = wait_on("running").await;
+            assert_eq!(running["task_completed"], serde_json::json!(false));
+            assert_eq!(
+                running["reason"],
+                serde_json::json!("timeout"),
+                "没在时限内答必须明说自己是超时：{running}"
+            );
+            let hint = running["hint"].as_str().unwrap_or_default();
+            assert!(
+                hint.contains("still"),
+                "超时那一句要说明这一行可能还在跑，而不是没做完：{hint}"
+            );
+            assert_eq!(running["status"], serde_json::json!("running"));
+
+            let failed = wait_on("failed").await;
+            assert_eq!(failed["task_completed"], serde_json::json!(false));
+            assert!(
+                failed.get("reason").is_none(),
+                "失败是走到了头，不是没等到：{failed}"
+            );
         }
 
         /// The shape the door reads: one row, filed as already decided, with the
