@@ -298,6 +298,34 @@ found_key="$(HOME="${fakehome}" PATH="${fakehome}/.cargo/bin:${stripped_path}" \
 [ "${bare_key}" = "${found_key}" ] ||
     fail "同一个工具、两条发现路径算出了两个键（兜底 ${bare_key:0:12}，PATH ${found_key:0:12}）：工具解析必须在子命令分派之前"
 
+# 15b) node 是同一类，2026-11-14 实测到的是它的形状：跑绿的那一跑在一个 `export PATH=
+#      <nvm>/bin:$PATH` 的壳里起跑，键里记着 `node=v22.…`；推送时钩子从没带 nvm 的 PATH
+#      里被拉起来，同一棵树算出 `node=absent`——刚判绿的字节在推送口报「没验过」，而两把
+#      内容键之间根本没有分歧。node 装在版本目录下，兜底要按版本挑，所以这一格用一份自己
+#      的 HOME 造出两个版本目录，钉的是「哪条发现路径都落到同一个版本上」。
+mkdir -p "${fakehome}/.nvm/versions/node/v22.0.0/bin" "${fakehome}/.nvm/versions/node/v9.9.9/bin"
+for v in v22.0.0 v9.9.9; do
+    printf '#!/usr/bin/env bash\necho %s\n' "$v" >"${fakehome}/.nvm/versions/node/${v}/bin/node"
+    chmod +x "${fakehome}/.nvm/versions/node/${v}/bin/node"
+done
+node_stripped=()
+for d in "${path_dirs[@]}"; do
+    [ -n "$d" ] || continue
+    # 与上面同一套摘法：只摘「只装着 node」的目录，系统目录留着（门要 git/sha256sum）。
+    if [ -x "$d/node" ] && [ "$d" != /usr/bin ] && [ "$d" != /bin ]; then continue; fi
+    node_stripped+=("$d")
+done
+node_stripped_path="$(IFS=:; printf '%s' "${node_stripped[*]}")"
+node_bare_key="$(HOME="${fakehome}" PATH="${node_stripped_path}" \
+    bash deploy/scripts/check-before-push.sh --key-content)" ||
+    fail "--key-content 在 PATH 里没有 node 时退非零"
+node_found_key="$(HOME="${fakehome}" PATH="${fakehome}/.nvm/versions/node/v22.0.0/bin:${node_stripped_path}" \
+    bash deploy/scripts/check-before-push.sh --key-content)" ||
+    fail "--key-content 在 PATH 里带着 node 时退非零"
+[ -n "${node_bare_key}" ] || fail "PATH 里没有 node 时 --key-content 什么都没印"
+[ "${node_bare_key}" = "${node_found_key}" ] ||
+    fail "node 的两条发现路径算出了两个键（兜底 ${node_bare_key:0:12}，PATH ${node_found_key:0:12}）：跑绿的一跑与推送的钩子会各算一个，刚验过的字节在推送口报没验过；兜底还得挑版本最高的那份，否则这条也不会等"
+
 # 16) 跑的途中这棵树变过 ⇒ 这一跑的判词不属于现在这份字节，两把键都不记。
 #
 # 整门一两个小时，期间树上多出来的任何一格都没被判过。以前指纹只在收尾时取，于是跑完
@@ -884,4 +912,4 @@ if ( cd "${itree}" && bash deploy/scripts/check-before-push.sh --status-patch "$
     fail "整门的输入变了（ci.yml）、这批改动逐字没变，旧账仍说验过：那一跑判的是旧输入下的结论"
 fi
 
-echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效、整门输入变了就失效，远端在跑期间追上了这一支时按新基底重记而不是作废、并且变基之后照样命中；远端已经含了这一支时说的是「没有改动可判」而不是「算不出」；键不取决于调用方的 PATH 里有没有 cargo"
+echo "ok - before-push 的戳：没验过 / 验过 / 新提交 三种结局分得开，未提交改动不进键；提交前那一问按工作树字节记，改字节或改判据都失效；改动键在干净的变基后仍命中、解冲突后失效、整门输入变了就失效，远端在跑期间追上了这一支时按新基底重记而不是作废、并且变基之后照样命中；远端已经含了这一支时说的是「没有改动可判」而不是「算不出」；键不取决于调用方的 PATH 里有没有 cargo，或 node（后者按版本目录兜底、挑最高的那份）"

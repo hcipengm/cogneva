@@ -295,11 +295,22 @@ print_cost_table() { # [段日志]
 # 有；父进程用兜底找到了它，孩子（`check-format.sh` 的 `command -v cargo`、各条夹具自己的
 # 自检）却按 PATH 找、找不到，于是同一台机器上「这一格判得了」而「这一格里那条用例说这
 # 机器没有 cargo」。找到的那一份交给孩子，两处就只有一个来源。
+#
+# node 是同一类，2026-11-14 实测到的是它的形状：那一跑在一个 `export PATH=<nvm>/bin:$PATH`
+# 的壳里起跑，gate_inputs 记下 `node=v22.…`；推送时钩子从没带 nvm 的 PATH 里被拉起来，
+# 同一棵树算出的是 `node=absent`——刚判绿的字节在推送口报「没验过」，人只能去查两把根本
+# 没有分歧的内容键。node 的兜底与 cargo 不同的是它按版本目录装（`~/.nvm/versions/node/
+# vX.Y.Z/bin/node`），所以取版本号最高的那一个，而不是写死一个版本。
 gate_rustc="$(command -v rustc || true)"
 [ -n "${gate_rustc}" ] || [ ! -x "${HOME}/.cargo/bin/rustc" ] || gate_rustc="${HOME}/.cargo/bin/rustc"
 gate_cargo="$(command -v cargo || true)"
 [ -n "${gate_cargo}" ] || [ ! -x "${HOME}/.cargo/bin/cargo" ] || gate_cargo="${HOME}/.cargo/bin/cargo"
-for gate_tool in "${gate_rustc}" "${gate_cargo}"; do
+gate_node="$(command -v node || true)"
+if [ -z "${gate_node}" ]; then
+    # cap: fixed — nvm 的安装位是约定，不是可调的量；版本号由目录名给出，不在这里写。
+    gate_node="$(ls -1d "${HOME}/.nvm/versions/node/"*/bin/node 2>/dev/null | sort -V | tail -n 1)"
+fi
+for gate_tool in "${gate_rustc}" "${gate_cargo}" "${gate_node}"; do
     [ -n "${gate_tool}" ] || continue
     gate_tool_dir="$(dirname "${gate_tool}")"
     case ":${PATH}:" in
