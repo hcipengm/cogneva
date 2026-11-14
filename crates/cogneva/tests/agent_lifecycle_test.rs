@@ -415,3 +415,137 @@ async fn two_inbox_prompts_on_one_employee_do_not_share_a_window() {
     );
     agent.retire().await;
 }
+
+/// 常驻员工收到同事的消息时，那一轮的请求里写着是谁发的；没留名就写没留名。
+///
+/// 收件人手里只有这一条消息，发信人不在任何别处可查。所以「谁在说话」必须由
+/// 消息自己带进提示词——它接下来要做的事（回一句、往下追、把话转给第三个人）
+/// 全看这句话是谁说的。两条投递路（常驻员工、对话员工）共用同一种渲染，
+/// 这一条钉的是常驻那一侧：它从前用 `..` 把发信人扔掉了。
+#[tokio::test]
+async fn a_resident_employee_reads_who_sent_the_message() {
+    #[derive(Default)]
+    struct SenderRecordingLlm {
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for SenderRecordingLlm {
+        async fn chat_stream(
+            &self,
+            messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            self.prompts.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(cog_core::Message::content)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let text = r#"{"content":"收到","artifacts":[]}"#.to_string();
+                let _ = producer
+                    .push(cog_core::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: text.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![cog_core::ContentBlock::text(text)],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("a resident employee's loop streams")
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            unimplemented!("a resident employee's loop streams")
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    let llm = Arc::new(SenderRecordingLlm::default());
+    let agent = cog_agent::Agent::new(
+        cog_core::RuntimeConfig {
+            agent_id: "a-sender".into(),
+            max_iterations: 1,
+            ..Default::default()
+        },
+        llm.clone(),
+    );
+    agent.start().await;
+
+    agent
+        .handle_inbox(cog_core::InboxMessage::Prompt {
+            goal: serde_json::json!({ "task": "查一下昨晚那次发布为什么红了" }),
+            reply_stream: None,
+            from_agent: Some("mira".into()),
+        })
+        .await
+        .expect("这一条要真的跑起来");
+    let named = llm
+        .prompts
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("第一件活发出了它的请求");
+    assert!(
+        named.contains("[同事 mira 发来的消息]"),
+        "常驻员工那一轮的请求里没有发信人：{named}"
+    );
+
+    agent
+        .handle_inbox(cog_core::InboxMessage::Prompt {
+            goal: serde_json::json!({ "task": "再看一下另一件事" }),
+            reply_stream: None,
+            from_agent: None,
+        })
+        .await
+        .expect("这一条也要真的跑起来");
+    let anonymous = llm
+        .prompts
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("第二件活发出了它的请求");
+    assert!(
+        anonymous.contains("[没留名的同事发来的消息]"),
+        "没留名的消息在常驻那一侧读起来像是一句没有出处的话：{anonymous}"
+    );
+    assert!(
+        !anonymous.contains("mira"),
+        "没留名的那一条把上一位同事的名字带了过来：{anonymous}"
+    );
+
+    agent.retire().await;
+}

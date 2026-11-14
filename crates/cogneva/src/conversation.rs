@@ -1276,26 +1276,92 @@ fn push_or_log(out: &mut Vec<cog_core::InboxMessage>, bytes: &[u8], agent_id: &s
 
 /// 收件箱里的一条怎么进这一轮的历史：一行抬头说明出处，下面是它说的话。
 ///
-/// 消息带发信人就写出是谁——收件人手里只有这一条消息，而它接下来要做的事
-/// （回一句、往下追、把话转给第三个人）全看这句话是谁说的。没留名（平台命令、
-/// 加这一列之前写下的老消息）就只说「同事发来的」，不编一个名字。
+/// 措辞不在这里定：常驻员工那条路读的是同一份消息，两条路必须说成同一句话
+/// （见 `cog_agent::inbox`）。这里只负责「这一段对话的收件箱消息要不要进历史」。
 fn inbox_as_message(msg: &cog_core::InboxMessage) -> Option<String> {
-    use cog_core::InboxMessage;
-    let text = match msg {
-        InboxMessage::Prompt { goal, .. } => match goal {
-            serde_json::Value::String(text) => text.clone(),
-            other => other.to_string(),
-        },
-        InboxMessage::Continue { instruction, .. } | InboxMessage::Steering { instruction, .. } => {
-            instruction.clone()
-        }
-        // 撤停与重置是给正在跑的那一轮的指令，不是一条要说的话。
-        InboxMessage::Abort | InboxMessage::Reset => return None,
-    };
-    Some(match msg.from_agent() {
-        Some(sender) => format!("[同事 {sender} 发来的消息]\n{text}"),
-        None => format!("[同事发来的消息]\n{text}"),
-    })
+    cog_agent::inbox::as_turn_text(msg)
+}
+
+/// 工具路径（`send_to_agent`）发出去的一条，写成界面上那一行要的全部事实：
+/// 发给谁、用什么方式、说了什么、结局如何。
+///
+/// 结局取自回执而不是工具名字：`delivered` 是「已经发布进收件人的收件箱」，
+/// `replied` 是「等到了回信」，`reason` 是没等到时的那一句。等不到回信不等于
+/// 对方没做完——`timeout` 只说「没在时限内答」，这两件事在界面上必须是两句不
+/// 同的话，所以回执里已有的 `hint` 也一起带上，不在网关或界面另编一句。
+///
+/// 被拒的那一次没有回执，只有错误：收件人不存在、名册读不出来，这些话要说给
+/// 发信的人，而不是记成一条「发过了」。
+fn colleague_message(
+    arguments: &serde_json::Value,
+    result: &SFResult<serde_json::Value>,
+) -> serde_json::Value {
+    let to = arguments
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let kind = arguments
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("prompt");
+    let content = arguments
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match result {
+        Ok(receipt) => serde_json::json!({
+            "to": to,
+            "kind": kind,
+            "content": content,
+            "delivered": receipt
+                .get("delivered")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            "replied": receipt.get("replied").cloned(),
+            "reply": receipt.get("reply").cloned(),
+            "reason": receipt.get("reason").cloned(),
+            "hint": receipt.get("hint").cloned(),
+        }),
+        Err(e) => serde_json::json!({
+            "to": to,
+            "kind": kind,
+            "content": content,
+            "delivered": false,
+            "error": e.to_string(),
+        }),
+    }
+}
+
+/// 工具路径（`start_task`）挂上任务图的一行，写成对话里那份列表要的事实：哪一行、
+/// 是什么活、派给谁、属于哪个 goal。
+///
+/// 不在这里写状态：这一刻只有「已经进队」，而「谁在做、做到哪」是任务图随时间的
+/// 读数，得从同一张表里读回来（`GET /api/v1/tasks/list`）。把入队那一刻的状态抄进
+/// 对话，等于给任务图另开一份副本——一份只在派活那一瞬正确的副本。
+///
+/// 被拒的那一次（没写验收标准、指派的人不存在）不产出一行：任务图上根本没有这条
+/// 记录，列表里出现一条查不到的活比少一条更糟。拒绝的原因在工具回执里，模型看得见。
+fn task_list(
+    arguments: &serde_json::Value,
+    result: &SFResult<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let receipt = result.as_ref().ok()?;
+    let task_id = receipt.get("task_id")?.as_str()?;
+    // 第一行当标题：派活的人写 goal 时第一行就是一句话的活名，整段是给接手人看的
+    // 说明。列表里一行放不下整段，而截断整段的第一个 60 字会把条件截掉一半。
+    let title = arguments
+        .get("goal")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|goal| goal.lines().next())
+        .unwrap_or("")
+        .trim();
+    Some(serde_json::json!({
+        "task_id": task_id,
+        "goal": title,
+        "goal_id": receipt.get("goal_id").cloned(),
+        "venue": receipt.get("venue").cloned(),
+        "assigned_to": receipt.get("assigned_to").cloned(),
+    }))
 }
 
 /// 这段对话能用的操作：**只读台账、只派活、不执行**。
@@ -3335,7 +3401,7 @@ mod tests {
                 from_agent: None,
             })
             .as_deref(),
-            Some("[同事发来的消息]\n把首页配色改一下")
+            Some("[没留名的同事发来的消息]\n把首页配色改一下")
         );
         assert_eq!(
             inbox_as_message(&InboxMessage::Prompt {
@@ -3344,7 +3410,7 @@ mod tests {
                 from_agent: None,
             })
             .as_deref(),
-            Some("[同事发来的消息]\n{\"step\":2}")
+            Some("[没留名的同事发来的消息]\n{\"step\":2}")
         );
         assert_eq!(
             inbox_as_message(&InboxMessage::Continue {
@@ -3352,7 +3418,7 @@ mod tests {
                 from_agent: None
             })
             .as_deref(),
-            Some("[同事发来的消息]\n接着做")
+            Some("[没留名的同事发来的消息]\n接着做")
         );
         assert_eq!(
             inbox_as_message(&InboxMessage::Steering {
@@ -3360,7 +3426,7 @@ mod tests {
                 from_agent: None
             })
             .as_deref(),
-            Some("[同事发来的消息]\n换个方向")
+            Some("[没留名的同事发来的消息]\n换个方向")
         );
         assert_eq!(inbox_as_message(&InboxMessage::Abort), None);
         assert_eq!(inbox_as_message(&InboxMessage::Reset), None);
@@ -3389,7 +3455,7 @@ mod tests {
         .expect("a message written before the sender column existed still parses");
         assert_eq!(
             inbox_as_message(&older).as_deref(),
-            Some("[同事发来的消息]\n等下再合，构建还红着"),
+            Some("[没留名的同事发来的消息]\n等下再合，构建还红着"),
             "没留名就说没留名，不编名字"
         );
     }

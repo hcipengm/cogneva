@@ -8,6 +8,7 @@ pub mod context;
 pub mod event_bus_sink;
 pub mod hooks;
 pub mod identity;
+pub mod inbox;
 pub mod lifecycle;
 pub mod memory;
 pub mod observable;

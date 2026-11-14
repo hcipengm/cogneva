@@ -1336,7 +1336,9 @@ impl Agent {
     pub async fn handle_inbox(&self, msg: InboxMessage) -> SFResult<()> {
         match msg {
             InboxMessage::Prompt {
-                goal, reply_stream, ..
+                goal,
+                reply_stream,
+                from_agent,
             } => {
                 // 一条 Prompt 是「开始一次新的运行」，不是「接着说」——后者是
                 // `Continue`，下面那一条。员工无状态：上一轮留在窗口里的对话
@@ -1349,14 +1351,31 @@ impl Agent {
                 // 上一件活的请求与它工具的结果，并把那些当成这一件的前提——它不
                 // 报错，它只是照着别人的活说。
                 self.reset().await?;
-                let out = self.prompt(goal).await?;
+                // 这一轮的第一句话是这条消息，出处由消息自己带着走：收件人手里
+                // 只有它，查不到第二处。渲染与对话员工那一条路共用一份（见
+                // `crate::inbox`），两条路上的同一条消息因此读起来一模一样。
+                let spoken = match &goal {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                let input = serde_json::Value::String(crate::inbox::with_sender(
+                    from_agent.as_deref(),
+                    &spoken,
+                ));
+                let out = self.prompt(input).await?;
                 if let Some(stream) = reply_stream {
                     publish_inbox_reply(self.message_backend.as_ref(), &stream, &out).await?;
                 }
                 Ok(())
             }
-            InboxMessage::Continue { instruction, .. } => {
-                let input = serde_json::Value::String(instruction);
+            InboxMessage::Continue {
+                instruction,
+                from_agent,
+            } => {
+                let input = serde_json::Value::String(crate::inbox::with_sender(
+                    from_agent.as_deref(),
+                    &instruction,
+                ));
                 self.continue_(input).await.map(|_| ())
             }
             InboxMessage::Abort => self.abort().await,
