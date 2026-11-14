@@ -222,5 +222,48 @@ esac
     fail "量不出作用域的一格仍然记了账：$(find "${unit}" -name verdict -print -quit)"
 note "量不出作用域的一格不记账，并且说得出这一跑为什么没记"
 
+# ---- 6. 格的键只对「装置」失效，不对别人那一格的措辞失效 ----
+# 原先 `gate_inputs` 哈希的是整份门脚本：改一个只影响日志的槽标签，137 格的键同时变，
+# 一次 105 格只沿用 2 格。格子自己的命令进了 `cell_id`，所以真正该全体作废的是装置——
+# 函数体与顶层赋值。这一节把这两半分开验：
+#   改别格的一行说明 -> 装置哈希不变；
+#   改一个函数体     -> 装置哈希变。
+machinery_hash() { # <脚本内容>
+    printf '%s' "$1" | awk '
+        /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { in_fn = 1 }
+        in_fn { print; if ($0 ~ /^\}/) { in_fn = 0; print "" }; next }
+        /^[A-Za-z_][A-Za-z0-9_]*=/ { print; next }
+        /^set / { print; next }
+    ' | sha256sum
+}
+
+base_script='set -uo pipefail
+helper() {
+    echo one
+}
+run_step "格子甲" true
+run_step "格子乙" true
+'
+relabelled='set -uo pipefail
+helper() {
+    echo one
+}
+run_step "格子甲（改了措辞）" true
+run_step "格子乙" true
+'
+helper_changed='set -uo pipefail
+helper() {
+    echo two
+}
+run_step "格子甲" true
+run_step "格子乙" true
+'
+
+[ "$(machinery_hash "${base_script}")" = "$(machinery_hash "${relabelled}")" ] ||
+    fail "只改了某一格的措辞，装置哈希也变了：整门 137 格会一起作废"
+[ "$(machinery_hash "${base_script}")" != "$(machinery_hash "${helper_changed}")" ] ||
+    fail "改了装置（函数体），装置哈希没变：所有格会沿用一份已经不对的判词"
+note "格戳只对装置失效：改措辞不动哈希，改函数体才动"
+
 echo "cell-stamps.test: all checks passed"
 

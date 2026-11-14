@@ -155,8 +155,23 @@ work_tree_oid() {
 
 # 判据自己的输入：门脚本的字节、`ci.yml` 的字节、工具的版本、测试库设没设。
 # 三把键都要带上它——判据变了，上一次的结论就不再作数。
+# 这道门里「装置」的那一半：函数体与顶层变量，一格都不含具体判据。
+#
+# 原先这里哈希的是整份脚本，于是改一个只影响日志的槽标签、改一句某一个格子的说明，
+# 都会让 137 格的键同时变、一格也沿用不了——实测一次 105 格只沿用 2 格。而格子自己的
+# 命令本来就进了 `cell_id`（名字＋argv），改哪一格只有那一格该重判。真正该全体作废的
+# 是装置：调度、记录、槽、判词口径，它们在这份文件里全写成函数体与顶层赋值。
+gate_machinery() {
+    awk '
+        /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { in_fn = 1 }
+        in_fn { print; if ($0 ~ /^\}/) { in_fn = 0; print "" }; next }
+        /^[A-Za-z_][A-Za-z0-9_]*=/ { print; next }
+        /^set / { print; next }
+    ' "${here}/check-before-push.sh"
+}
+
 gate_inputs() {
-    [ -f "${here}/check-before-push.sh" ] && sha256sum "${here}/check-before-push.sh"
+    [ -f "${here}/check-before-push.sh" ] && gate_machinery | sha256sum
     [ -f "$root/.github/workflows/ci.yml" ] && sha256sum "$root/.github/workflows/ci.yml"
     tool_sig cargo cargo --version
     tool_sig rustc rustc --version
