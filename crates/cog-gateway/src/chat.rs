@@ -1177,9 +1177,10 @@ async fn pump_events(
                     // 自己曾经起过一条。
                     Some("run_command_background") if !is_error => {
                         if let Some(handle) = result.get("handle").and_then(|v| v.as_str()) {
-                            publish_background_card(
+                            emit(
                                 &out,
                                 &session_id,
+                                "message.background",
                                 serde_json::json!({
                                     "message_id": message_id,
                                     "handle": handle,
@@ -1187,7 +1188,8 @@ async fn pump_events(
                                     "exit_code": serde_json::Value::Null,
                                     "error": serde_json::Value::Null,
                                 }),
-                            );
+                            )
+                            .await;
                         }
                     }
                     Some("get_change") => {
@@ -1260,26 +1262,12 @@ async fn emit(
     );
 }
 
-/// 一条后台命令的卡片：哪一条、现在什么状态。起与完各发一次。
-pub fn publish_background_card(
-    out: &crate::chat_stream::ChatStream,
-    session_id: &str,
-    card: serde_json::Value,
-) {
-    out.publish(
-        session_id,
-        "message.background",
-        &card,
-        envelope(session_id, "message.background", &card),
-    );
-}
-
 /// 一条后台命令跑完了：它回到当初起它的那一段对话，作为一条消息加一张卡片。
 ///
 /// 说话的是这一段对话里的执行者（`assistant`）：这不是第三个人插进来的一句系统
 /// 提示，而是「你让我放到后台的那件事，我回来告诉你结果」。消息号由句柄推出，
 /// 同一个句柄落地两次也是同一条消息——`finish` 已经只投一次，这是第二道闸。
-pub fn publish_background_finished(
+pub async fn publish_background_finished(
     out: &crate::chat_stream::ChatStream,
     session_id: &str,
     notice: &serde_json::Value,
@@ -1319,9 +1307,30 @@ pub fn publish_background_finished(
         );
     }
     // 卡片挂在刚刚说的那一句上：同一个消息号，界面才知道这张卡说的是谁。
-    let mut card = notice.clone();
-    card["message_id"] = serde_json::json!(message_id);
-    publish_background_card(out, session_id, card);
+    //
+    // 帧的键写在这里，不把通知原样搬上去：通知是另一侧（句柄簿）拼的，它的键
+    // 变了这条帧就跟着变，而读它的页面只会读到 `undefined`，看上去和「这一轮没有
+    // 内容」一样。键列在这里，两边对不上的那一天由普查的判据点名。
+    let field = |key: &str| notice.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    emit(
+        out,
+        session_id,
+        "message.background",
+        serde_json::json!({
+            "message_id": message_id,
+            "handle": field("handle"),
+            "state": field("state"),
+            "exit_code": field("exit_code"),
+            "error": field("error"),
+            "elapsed_ms": field("elapsed_ms"),
+            "stdout_bytes": field("stdout_bytes"),
+            "tail": field("tail"),
+            "tail_truncated": field("tail_truncated"),
+            "stderr_tail": field("stderr_tail"),
+            "summary": field("summary"),
+        }),
+    )
+    .await;
 }
 
 async fn emit_message_start(

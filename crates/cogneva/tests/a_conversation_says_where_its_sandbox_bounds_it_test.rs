@@ -14,16 +14,12 @@
 
 use std::sync::Arc;
 
+use crate::common::routes::read_repo;
 use cog_core::{
     BoundaryLine, SFError, SFResult, SandboxBackend, SandboxBoundary, SandboxRequest, SandboxResult,
 };
 use cog_gateway::chat::ConversationTurn;
 use cogneva::conversation::{Ledgers, PlatformConversation};
-
-fn source(relative: &str) -> String {
-    let path = crate::common::root::repo_root().join(relative);
-    crate::common::fsio::read(&path)
-}
 
 fn line<'a>(reading: &'a SandboxBoundary, dimension: &str) -> &'a BoundaryLine {
     reading
@@ -223,7 +219,7 @@ async fn the_conversation_hands_the_boundary_the_backend_reports() {
 /// 面板里各自成句，`declared` 不能被显示成 `enforced`。
 #[test]
 fn the_page_shows_which_kind_of_sandbox_it_is() {
-    let pane = source("web/src/conversation/ConversationPane.tsx");
+    let pane = read_repo("web/src/conversation/ConversationPane.tsx");
     for wanted in [
         "chat_sandbox_boundary",
         "boundaryWord",
@@ -238,13 +234,13 @@ fn the_page_shows_which_kind_of_sandbox_it_is() {
         );
     }
 
-    let transport = source("web/src/transport/websocket.ts");
+    let transport = read_repo("web/src/transport/websocket.ts");
     assert!(
         transport.contains("chat_sandbox_boundary"),
         "传输层没有这条要读数的消息"
     );
 
-    let protocol = source("crates/cog-gateway/src/websocket_protocol.rs");
+    let protocol = read_repo("crates/cog-gateway/src/websocket_protocol.rs");
     for wanted in ["chat_sandbox_boundary", "ChatSandboxBoundary"] {
         assert!(
             protocol.contains(wanted),
@@ -252,7 +248,7 @@ fn the_page_shows_which_kind_of_sandbox_it_is() {
         );
     }
 
-    let socket = source("crates/cog-gateway/src/websocket.rs");
+    let socket = read_repo("crates/cog-gateway/src/websocket.rs");
     assert!(
         socket.contains("sandbox_boundary"),
         "套接字上没有把这条请求接到对话上"
@@ -261,7 +257,7 @@ fn the_page_shows_which_kind_of_sandbox_it_is() {
     // 部署里那一条策略名要与执行器读的变量对上：面板上「部署声明」那一行说
     // 的就是这个名字；改了一处没改另一处，它说的就是另一条策略。
     const EGRESS_POLICY: &str = "cogneva-sandbox-executor-egress";
-    let chart = source("deploy/helm/cogneva/templates/sandbox.yaml");
+    let chart = read_repo("deploy/helm/cogneva/templates/sandbox.yaml");
     assert!(
         chart.contains("SANDBOX_EGRESS_POLICY"),
         "chart 没有声明执行器该读哪条网络策略：网络那一行会永远读成 unknown"
@@ -270,7 +266,7 @@ fn the_page_shows_which_kind_of_sandbox_it_is() {
         chart.contains(EGRESS_POLICY),
         "执行器读的策略名不是部署里那条：面板上的「部署声明」说的是另一条策略"
     );
-    let policy = source("deploy/helm/cogneva/templates/network-policy.yaml");
+    let policy = read_repo("deploy/helm/cogneva/templates/network-policy.yaml");
     assert!(
         policy.contains(EGRESS_POLICY),
         "chart 里没有叫 {EGRESS_POLICY} 的网络策略：执行器报的是一个不存在的名字"

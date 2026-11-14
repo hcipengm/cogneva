@@ -18,16 +18,12 @@
 //! 规格里那一行 check 是 `grep web/src/conversation/ConversationPane.tsx :: diff_accept`：
 //! 那个词就是下面这一对动作名（接受 / 拒绝），页面按它们把答案发回去。
 
+use crate::common::routes::read_repo;
 use cog_core::contract::permission::{PermissionDiff, PermissionDiffKind};
 use cog_gateway::chat::{
     PermissionAnswer, PermissionAskView, PermissionBridge, PermissionChannel,
     SocketPermissionBridge,
 };
-
-fn source(relative: &str) -> String {
-    let path = crate::common::root::repo_root().join(relative);
-    crate::common::fsio::read(&path)
-}
 
 fn a_change() -> PermissionDiff {
     PermissionDiff {
@@ -46,7 +42,7 @@ fn a_change() -> PermissionDiff {
 /// 原样搬上线、页面按它画。任一处少写一格，「这个工具动手」那一步就又变回盲的。
 #[test]
 fn the_question_carries_the_change_it_would_make() {
-    let kernel = source("crates/cog-agent/src/permission.rs");
+    let kernel = read_repo("crates/cog-agent/src/permission.rs");
     assert!(
         kernel.contains("pub fn edit_preview("),
         "内核不折那次改动了：问句里只剩工具名"
@@ -57,19 +53,19 @@ fn the_question_carries_the_change_it_would_make() {
         "改动类工具的名单要与「哪些工具要问」那张名单同源"
     );
 
-    let shape = source("crates/cog-core/src/contract/permission.rs");
+    let shape = read_repo("crates/cog-core/src/contract/permission.rs");
     assert!(
         shape.contains("pub struct PermissionDiff"),
         "三层共用的形状要在 core 里只有一份"
     );
 
-    let assembly = source("crates/cogneva/src/conversation.rs");
+    let assembly = read_repo("crates/cogneva/src/conversation.rs");
     assert!(
         assembly.contains("cog_agent::permission::edit_preview(&ask.tool, &ask.arguments)"),
         "装配层不往问句里填那次改动：界面上收不到 diff"
     );
 
-    let gateway = source("crates/cog-gateway/src/chat.rs");
+    let gateway = read_repo("crates/cog-gateway/src/chat.rs");
     assert!(
         gateway.contains("pub diff: Option<cog_core::contract::permission::PermissionDiff>"),
         "问句视图里没有这一格：改动到不了连接上"
@@ -78,27 +74,27 @@ fn the_question_carries_the_change_it_would_make() {
         gateway.contains("diff: view.diff.clone()"),
         "问句出门时不带改动：界面上收不到 diff"
     );
-    let protocol = source("crates/cog-gateway/src/websocket_protocol.rs");
+    let protocol = read_repo("crates/cog-gateway/src/websocket_protocol.rs");
     assert!(
         protocol.contains("diff: Option<cog_core::contract::permission::PermissionDiff>"),
         "线路上没有这一格"
     );
 
-    let wire = source("web/src/transport/websocket.ts");
+    let wire = read_repo("web/src/transport/websocket.ts");
     assert!(wire.contains("diff?: PermissionDiff | null"));
-    let store = source("web/src/store/permissionStore.ts");
+    let store = read_repo("web/src/store/permissionStore.ts");
     assert!(
         store.contains("diff?: PermissionDiff | null"),
         "等答案的那一页不存改动：画不出那份 diff"
     );
-    let types = source("web/src/types/events.ts");
+    let types = read_repo("web/src/types/events.ts");
     assert!(types.contains("export interface PermissionDiff"));
 }
 
 /// 页面上画的是改动本身，两个答案各自有名：接受放行，拒绝不动树。
 #[test]
 fn the_page_draws_the_change_and_names_the_two_answers() {
-    let pane = source("web/src/conversation/ConversationPane.tsx");
+    let pane = read_repo("web/src/conversation/ConversationPane.tsx");
     assert!(
         pane.contains("diffForPreview(ask.diff)"),
         "问句有改动却不折它：弹窗里还是那行工具名"
@@ -116,7 +112,7 @@ fn the_page_draws_the_change_and_names_the_two_answers() {
         pane.contains("拒绝这份改动：工作树一个字节都不动"),
         "拒绝按钮要说出后果：树不动"
     );
-    let diff = source("web/src/conversation/toolDiff.ts");
+    let diff = read_repo("web/src/conversation/toolDiff.ts");
     assert!(
         diff.contains("export function diffForPreview("),
         "问句与流里要共用同一套画法：两套算法会画出两种笔迹"

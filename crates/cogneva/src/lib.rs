@@ -400,7 +400,8 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             &stream,
                             session,
                             &done.notice,
-                        );
+                        )
+                        .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         // 慢到被环挤掉：那几条命令的通知不再补发。它们的输出仍

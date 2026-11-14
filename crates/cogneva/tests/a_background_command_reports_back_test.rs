@@ -17,16 +17,12 @@
 
 use std::time::Duration;
 
+use crate::common::routes::read_repo;
 use cog_agent::background::{self, Ending, Finished};
 use cog_core::CommandEvent;
 use cog_gateway::chat::publish_background_finished;
 use cog_gateway::chat_stream::ChatStream;
 use tokio::sync::broadcast;
-
-fn source(relative: &str) -> String {
-    let path = crate::common::root::repo_root().join(relative);
-    crate::common::fsio::read(&path)
-}
 
 /// 收下属于 `handle` 的那几条通知，直到安静满 `quiet`。
 ///
@@ -178,7 +174,7 @@ async fn the_notice_lands_in_its_own_conversation() {
         "stderr_tail": "",
         "summary": summary,
     });
-    publish_background_finished(&out, "s-20", &notice);
+    publish_background_finished(&out, "s-20", &notice).await;
 
     // 重连的人拿到的是「这一段现在说到哪儿」：那条消息带着摘要，已经收尾。
     let snapshot = out.snapshot("s-20");
@@ -231,34 +227,34 @@ async fn the_notice_lands_in_its_own_conversation() {
 /// 通知不让流式光标以为新一轮开始了，也没有谁把卡片画成一条用户消息。
 #[test]
 fn the_page_shows_the_command_coming_back() {
-    let pane = source("web/src/conversation/ConversationPane.tsx");
+    let pane = read_repo("web/src/conversation/ConversationPane.tsx");
     assert!(pane.contains("BackgroundCardView"), "页面上要有这张卡片");
     assert!(
         pane.contains("message.background && <BackgroundCardView"),
         "卡片挂在它那一句消息上"
     );
-    let types = source("web/src/types/events.ts");
+    let types = read_repo("web/src/types/events.ts");
     assert!(types.contains("export interface BackgroundCard"));
     assert!(
         types.contains("'message.background': 'background'"),
         "帧的类型名要在客户端的普查表里"
     );
     assert!(types.contains("NOTICE_MESSAGE_ID_PREFIX"));
-    let store = source("web/src/store/chatStore.ts");
+    let store = read_repo("web/src/store/chatStore.ts");
     assert!(store.contains("case 'background'"), "store 要认得这一帧");
     assert!(
         store.contains("startsWith(NOTICE_MESSAGE_ID_PREFIX)"),
         "通知的那条消息不该抢走正在流的那一句的光标"
     );
 
-    let gateway = source("crates/cog-gateway/src/chat.rs");
+    let gateway = read_repo("crates/cog-gateway/src/chat.rs");
     assert!(
         gateway.contains("Some(\"run_command_background\") if !is_error"),
         "句柄一交出去就该有一张「在跑」的卡片"
     );
-    assert!(gateway.contains("pub fn publish_background_finished"));
-    assert!(source("crates/cog-agent/src/background.rs").contains("pub fn completion_notice"));
-    let assembly = source("crates/cogneva/src/lib.rs");
+    assert!(gateway.contains("pub async fn publish_background_finished"));
+    assert!(read_repo("crates/cog-agent/src/background.rs").contains("pub fn completion_notice"));
+    let assembly = read_repo("crates/cogneva/src/lib.rs");
     assert!(
         assembly.contains("cog_agent::background::subscribe()"),
         "装配层是这本书与那段对话之间唯一的持有者"
