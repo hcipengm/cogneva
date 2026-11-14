@@ -25959,6 +25959,18 @@ exit 0
     /// 预算（五分钟）长，把它算进来，每次和一次正常看护撞上都会判成超时。
     #[tokio::test]
     async fn waiting_out_a_live_canary_does_not_spend_the_rollout_budget() {
+        // 这条等待故意让前两眼「没有移动」（金丝雀暂停中）。判停的界来自进程级水库里
+        // 最长的一次拍间隔——测试二进制里那座水库量的是别的活的节奏，拿它判，这条等待
+        // 会在自己的第二眼就被判停并退出。窗口由本用例自己落，与同文件里另外两条等待
+        // 用例共用同一把锁：两个写同一份测量的用例并发跑，一方的 reset 会落在另一方的
+        // 窗口里，断言描述的就不是任何一个用例铺出来的样本。
+        let _serial = cog_core::progress::async_test_lock().await;
+        cog_core::progress::reset_for_tests();
+        cog_core::progress::seed_gaps_for_tests(
+            Duration::from_secs(60),
+            cog_core::progress::SAMPLE_FLOOR,
+        );
+
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         let log = bin_dir.join("kubectl.log");
@@ -26025,6 +26037,7 @@ exit 0
             !calls.contains("rollout resume"),
             "the canary clears its own pause: {calls}"
         );
+        cog_core::progress::reset_for_tests();
     }
 
     /// 清单里"会被这次 apply 改写的引用"要按工作负载种类的真实深度取全：Deployment 的
