@@ -36,10 +36,20 @@ const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 // cap: bound — the cap that keeps a peer's silence from becoming an unbounded wait
 const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 
+/// 子任务的事件管道有多深。
+///
+/// 这一侧不读子任务的进度，只雇了一个任务把它排空；所以深度只需要盖住「循环
+/// 已经写了、排空的还在被调度」那一个间隙，与子任务跑多久、说多少无关。
+// cap: fixed — 有人排空，深度只盖一个调度间隙；深浅都不改变行为，取一个够用的值
+const SUBAGENT_EVENT_BUFFER: usize = 64;
+
 /// 毫秒与秒之间的换算。
+///
 /// 不是一个可调的界：等待窗口从工具一路传到服务端都是毫秒，只有 HTTP 客户端
 /// 按秒记超时。换算本身没有第三个答案。
+// cap: fixed — 单位换算；等待窗口一路是毫秒，只有 HTTP 客户端按秒
 const MILLIS_PER_SECOND: u64 = 1_000;
+
 /// How long a filed work item declares it will take when the submitter names no
 /// budget.
 ///
@@ -3931,6 +3941,143 @@ pub mod builtins {
     /// 打成一条结构而不是七个参数：这七样是同一个决定——「这条分解在谁名下、
     /// 按什么规矩跑」。分行传的话，某一个构造点漏掉其中一样也不会报错，它只是
     /// 让子任务的花销记不进这段会话、或者让它在一个名册上没有的 id 下动手。
+    pub struct SubagentWiring {
+        /// 子任务答话用的模型。`None` 是「这个部署没有可交给子任务的客户端」。
+        pub llm: Option<Arc<dyn cog_core::LlmClient>>,
+        /// 父这一轮的配置（窗口、轮次天花板）：一对父子在同一个窗口上想事。
+        pub template: cog_core::RuntimeConfig,
+        /// 父表在这只工具装进来**之前**的那一份副本。
+        pub tools: Option<Arc<ToolRegistry>>,
+        /// 父这一轮的权限判定者。
+        pub decider: Option<Arc<dyn crate::permission::PermissionDecider>>,
+        /// 父这一轮的权限模式。
+        pub mode: crate::permission::PermissionMode,
+        /// 父这一轮的名册：子任务读到的是父那一行，不是新的人。
+        pub roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+        /// 这一轮记在谁头上；空串是「这条连接没有身份」。
+        pub owner: String,
+        /// 这一段会话的号：子任务的花销按它折叠进会话合计。
+        pub session: String,
+    }
+
+    /// 一个独立上下文的子任务：把一句话交给一条新的循环，拿回它的最终产出。
+    ///
+    /// 与另外两条路分开：
+    ///
+    /// - `send_to_agent` 是给**平级同事**发消息：对方是另一个人，有自己的收件箱与
+    ///   生命周期，回不回、什么时候回都不由这一次调用决定；
+    /// - `start_task` 是往**共享任务图**上挂活：那一行从此属于所有人，结果落在图
+    ///   上，要等就得等那条边；
+    /// - `spawn_subagent` 是**这一次调用的内部分解**：子任务只看见你交给它那一句
+    ///   话（父会话的历史一条也不进去），它的产出以这一次工具调用的结果直接回来。
+    ///   父与子的上下文因此是隔离的：子任务读了几十万 token 的中间过程不会挤占
+    ///   父会话的窗口，父会话只收到最后那一份。
+    ///
+    /// 子任务的工具表是**父表在这一刻的副本**（`fork`：沙箱后端、护栏、插件源都
+    /// 跟着走），而且是在装上这只工具**之前**复制的——子任务手上没有
+    /// `spawn_subagent`，所以父子深度就是一。这是刻意的界：没有它，一层写错的
+    /// 递归就能把一个进程的所有并发与预算都吃进去，而失败的那一侧只会看见「很慢」。
+    ///
+    /// 配置（窗口、轮次天花板）取自父这一轮的配置，不在这里另写一组数：一对父子
+    /// 在同一个窗口上想事，读的人不需要再问「子任务为什么只看到一半」。
+    pub fn spawn_subagent(wiring: SubagentWiring) -> Tool {
+        Tool {
+            name: "spawn_subagent".into(),
+            description: "Hand one self-contained piece of work to a fresh context and get its \
+                          answer back as this call's result. The child sees only the task text \
+                          you pass here -- none of this conversation's history, none of what \
+                          you have read so far -- so use it when the work would otherwise fill \
+                          this conversation with material you do not need again (searching a \
+                          wide tree, reading many files, trying several approaches). The child \
+                          answers once, and that answer is what comes back. It cannot spawn \
+                          children of its own. If the work has to outlive this turn or needs \
+                          someone else, use start_task instead; if it is a question for a peer, \
+                          use send_to_agent."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Everything the child needs to know, stated in full: it \
+                                        cannot see what you have seen. End it with what to \
+                                        return -- the answer, the finding, the file and lines."
+                    }
+                },
+                "required": ["task"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let llm = wiring.llm.clone();
+                let template = wiring.template.clone();
+                let tools = wiring.tools.clone();
+                let decider = wiring.decider.clone();
+                let roster = wiring.roster.clone();
+                let owner = wiring.owner.clone();
+                let session = wiring.session.clone();
+                let mode = wiring.mode;
+                Box::pin(async move {
+                    let task = args
+                        .get("task")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if task.is_empty() {
+                        return Err(SFError::Validation(
+                            "a subagent needs the task stated in full; it sees nothing else".into(),
+                        ));
+                    }
+                    let Some(llm) = llm else {
+                        return Err(SFError::Agent(
+                            "this deployment has no model client for a child run".into(),
+                        ));
+                    };
+                    let Some(tools) = tools else {
+                        return Err(SFError::Agent(
+                            "this run has no tool table to hand a child".into(),
+                        ));
+                    };
+                    // 子任务的事件这一侧不读：它说的是子任务内部的进度，父会话要的
+                    // 是最后那一份。管道仍要有人排空——循环往一条没人读的管道里写，
+                    // 写满之后就会停在那里，而屏幕上只会显示「很慢」。
+                    let (events, mut received) = tokio::sync::mpsc::channel(SUBAGENT_EVENT_BUFFER);
+                    let drain =
+                        tokio::spawn(async move { while received.recv().await.is_some() {} });
+                    // 权限跟父这一轮同一个判定者、同一个模式：子任务动手之前问的
+                    // 是同一个人、同一段对话的规则。父子不共享的是上下文，不是
+                    // 谁有权点头——那两份分开，等于用一次分解绕开了人的决定。
+                    let mut child = crate::AgentRuntime::new(template.clone(), events)
+                        .with_tools(tools.fork())
+                        .with_permissions(decider, mode)
+                        // 这一发的钱记在同一段会话名下：会话合计是按这一列折叠出来
+                        // 的，子任务不挂这一格，那几发只数得进按人 / 按环境的总数，
+                        // 屏幕上「这段会话花了多少」就会比它下面每一轮加起来少。
+                        .with_call_session(session)
+                        // 没有身份的连接不声明人：编一个名字会读成真有人花过这笔钱。
+                        .with_call_identity(owner, cog_core::LlmOrigin::Interactive.as_str());
+                    // 名册交给子任务：它要读到自己那一行（工号与名字）才答得出
+                    // 「我是谁」，而这一行属于父这一轮持有的租约，不是新的人。
+                    if let Some(roster) = roster {
+                        child = child.with_roster(roster);
+                    }
+                    let outcome = child
+                        .run_conversation(vec![cog_core::Message::user(task)], llm.as_ref())
+                        .await;
+                    drain.abort();
+                    let value = outcome?;
+                    // 子任务的交付物与父的一轮同形：`reply` 是它说出口的那一句。
+                    // 拿不到 `reply` 时整份交回去——一个有结构的答案比丢掉它好。
+                    let answer = value.get("reply").cloned().unwrap_or_else(|| value.clone());
+                    Ok(serde_json::json!({
+                        "subagent": true,
+                        "result": answer,
+                        "usage": value.get("usage").cloned().unwrap_or(serde_json::Value::Null),
+                    }))
+                })
+            })),
+        }
+    }
+
     /// What a `start_task` call turns into, decided without an HTTP client.
     ///
     /// Kept apart from the tool body so the shape of a filing is assertable:
@@ -5551,6 +5698,164 @@ pub mod builtins {
                 failed.get("reason").is_none(),
                 "失败是走到了头，不是没等到：{failed}"
             );
+        }
+
+        /// 一个只会说一句话的模型：记住它看见的提示词，回一句固定的答案。
+        #[derive(Debug, Default)]
+        struct Says {
+            seen: std::sync::Mutex<Vec<Vec<cog_core::Message>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::LlmClient for Says {
+            async fn chat_stream(
+                &self,
+                messages: &[cog_core::Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                self.seen.lock().unwrap().push(messages.to_vec());
+                let (stream, producer) = cog_core::EventStream::with_capacity(4);
+                tokio::spawn(async move {
+                    let mut producer = producer;
+                    // 对话里模型的正文就是答案本身，不是一道协议信封：子任务
+                    // 交回来的那一份也只该是这句话。
+                    let said = "child answer";
+                    let _ = producer
+                        .push(cog_core::AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: said.into(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                    producer.end(cog_core::ChatResponse {
+                        content: vec![cog_core::ContentBlock::Text {
+                            text: said.into(),
+                            text_signature: None,
+                        }],
+                        api: "mock".into(),
+                        provider: "mock".into(),
+                        model: "mock".into(),
+                        response_id: None,
+                        usage: cog_core::Usage::default(),
+                        stop_reason: cog_core::StopReason::Stop,
+                        error_message: None,
+                        upstream_failure: None,
+                        retry_after_secs: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                });
+                Ok(stream)
+            }
+
+            async fn complete_stream(
+                &self,
+                _prompt: &str,
+                _options: &cog_core::CompleteOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                unimplemented!()
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[cog_core::Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::ChatResponse> {
+                unimplemented!()
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        /// 子任务只看见交给它的那一句、只答一次、结果以这一次调用回来；而它手上
+        /// 的那张工具表是父表**在装上它自己之前**的副本——父子深度就是一。
+        #[tokio::test]
+        async fn a_subagent_sees_only_its_task_and_answers_once() {
+            let says = Arc::new(Says::default());
+            let llm: Arc<dyn cog_core::LlmClient> =
+                Arc::clone(&says) as Arc<dyn cog_core::LlmClient>;
+            let parent = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&parent, read_file());
+            // 复制发生在装 `spawn_subagent` 之前：子任务拿不到它自己。
+            let exported = Arc::new(parent.fork());
+            cog_core::ToolRegistry::register(
+                &parent,
+                spawn_subagent(SubagentWiring {
+                    llm: Some(Arc::clone(&llm)),
+                    template: cog_core::RuntimeConfig {
+                        agent_id: "agent-parent".into(),
+                        ..Default::default()
+                    },
+                    tools: Some(Arc::clone(&exported)),
+                    decider: None,
+                    mode: crate::permission::PermissionMode::Default,
+                    roster: None,
+                    owner: "alice".into(),
+                    session: "session-42".into(),
+                }),
+            );
+            assert!(
+                exported.get("read_file").is_some(),
+                "副本要带着父表的工具走"
+            );
+            assert!(
+                exported.get("spawn_subagent").is_none(),
+                "子任务手上不该有它自己：一层写错的递归能吃掉整台机器的预算"
+            );
+
+            let tool = parent.get("spawn_subagent").expect("装进了父表");
+            let ToolImplementation::Native(run) = &tool.implementation else {
+                panic!("spawn_subagent is native");
+            };
+            let out = run(serde_json::json!({
+                "task": "count the files under /data and say how many"
+            }))
+            .await
+            .expect("the child answered");
+            assert_eq!(out["subagent"], serde_json::json!(true));
+            assert_eq!(
+                out["result"],
+                serde_json::json!("child answer"),
+                "子任务的最终产出就是这一次调用的结果：{out}"
+            );
+
+            let seen = says.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "子任务答一次就结束，不该有多轮");
+            let prompt: String = seen[0]
+                .iter()
+                .map(|message| format!("{message:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                prompt.contains("count the files under /data"),
+                "交给子任务的那一句没有进它的提示词：{prompt}"
+            );
+        }
+
+        /// 没给任务、没有模型客户端的部署：两种都当场说出来，而不是起一个空循环。
+        #[tokio::test]
+        async fn a_subagent_without_a_task_is_refused_before_anything_starts() {
+            let tool = spawn_subagent(SubagentWiring {
+                llm: None,
+                template: cog_core::RuntimeConfig {
+                    agent_id: "agent-parent".into(),
+                    ..Default::default()
+                },
+                tools: None,
+                decider: None,
+                mode: crate::permission::PermissionMode::Default,
+                roster: None,
+                owner: String::new(),
+                session: "session-42".into(),
+            });
+            let ToolImplementation::Native(run) = &tool.implementation else {
+                panic!("spawn_subagent is native");
+            };
+            let empty = run(serde_json::json!({ "task": "   " })).await;
+            assert!(matches!(empty, Err(SFError::Validation(_))), "{empty:?}");
+            let no_model = run(serde_json::json!({ "task": "do one thing" })).await;
+            assert!(matches!(no_model, Err(SFError::Agent(_))), "{no_model:?}");
         }
 
         /// The shape the door reads: one row, filed as already decided, with the

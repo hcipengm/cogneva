@@ -718,11 +718,59 @@ impl ConversationTurn for PlatformConversation {
             let permission_mode =
                 cog_agent::permission::PermissionMode::parse(&request.permission_mode)
                     .unwrap_or_default();
+            // 判定者先于工具表装好：子任务要用同一个判定者，而工具得在
+            // `with_tools` 之前进表。晚一步建出来，子任务就只能自己造一个
+            // 「不问」的判定者——那等于用一次分解绕开了人的决定。
+            let permission_session = request.session_id.clone();
+            let decider: Option<Arc<dyn cog_agent::permission::PermissionDecider>> =
+                match request.permissions {
+                    Some(bridge) => {
+                        let owner_name = owner.map(str::to_string);
+                        let rules = match self.people.as_ref() {
+                            Some(kv) => {
+                                crate::permission_rules::load(
+                                    kv,
+                                    owner_name.as_deref(),
+                                    &permission_session,
+                                )
+                                .await
+                            }
+                            None => cog_agent::permission::PermissionRuleSet::default(),
+                        };
+                        Some(Arc::new(ConversationPermissions {
+                            bridge,
+                            session_id: permission_session,
+                            owner: owner_name,
+                            store: self.people.clone(),
+                            rules: std::sync::Mutex::new(rules),
+                        })
+                            as Arc<dyn cog_agent::permission::PermissionDecider>)
+                    }
+                    None => None,
+                };
             // plan 模式下多一只「把计划递出去请人批准」：它是这个模式的唯一出口，
             // 而别的模式里没有待批的计划，挂上去只会让模型多试一次拿不到结果的调用。
             if permission_mode == cog_agent::permission::PermissionMode::Plan {
                 tools.register(cog_agent::tools::builtins::exit_plan_mode());
             }
+            // 子智能体：这一次调用内部分解出去的一条独立上下文。工具表在**这一刻**
+            // 复制一份给子任务，然后才把这只会派子任务的工具装进父表——子任务手上
+            // 没有它自己，所以父子深度就是一。配置与权限都跟这一轮走：同一个窗口、
+            // 同一个判定者、同一个模式。
+            let child_tools = tools.fork();
+            tools.register(cog_agent::tools::builtins::spawn_subagent(
+                cog_agent::tools::builtins::SubagentWiring {
+                    llm: Some(Arc::clone(&request.llm)),
+                    template: config.clone(),
+                    tools: Some(Arc::new(child_tools)),
+                    decider: decider.clone(),
+                    mode: permission_mode,
+                    // 子任务不是新的人：它读到的是父这一行，花销记在同一段会话名下。
+                    roster: self.roster.clone(),
+                    owner: request.owner.clone(),
+                    session: request.session_id.clone(),
+                },
+            ));
             let capabilities = tools.names();
             let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
             // 属主写下的约定：只在这条连接既是某个登录身份、又接上了键值存储时
@@ -815,33 +863,6 @@ impl ConversationTurn for PlatformConversation {
                     transform_context: None,
                 });
             }
-            let permission_session = request.session_id.clone();
-            let decider: Option<Arc<dyn cog_agent::permission::PermissionDecider>> =
-                match request.permissions {
-                    Some(bridge) => {
-                        let owner_name = owner.map(str::to_string);
-                        let rules = match self.people.as_ref() {
-                            Some(kv) => {
-                                crate::permission_rules::load(
-                                    kv,
-                                    owner_name.as_deref(),
-                                    &permission_session,
-                                )
-                                .await
-                            }
-                            None => cog_agent::permission::PermissionRuleSet::default(),
-                        };
-                        Some(Arc::new(ConversationPermissions {
-                            bridge,
-                            session_id: permission_session,
-                            owner: owner_name,
-                            store: self.people.clone(),
-                            rules: std::sync::Mutex::new(rules),
-                        })
-                            as Arc<dyn cog_agent::permission::PermissionDecider>)
-                    }
-                    None => None,
-                };
             runtime = runtime.with_permissions(decider, permission_mode);
             // 名册交给运行时：它在每轮开头读到自己那一行的工号与名字，写进系统
             // 前缀。这里不做这件事——构造点不止这一处，漏一处那一种执行体就

@@ -515,6 +515,8 @@ mod store_counter_window_contract_test;
 mod store_tables_are_in_the_restore_bundle_test;
 #[path = "stress_message_backend_test.rs"]
 mod stress_message_backend_test;
+#[path = "subagent_runs_in_a_fresh_context_test.rs"]
+mod subagent_runs_in_a_fresh_context_test;
 #[path = "supervisor_alert_words_are_words_the_face_map_knows_test.rs"]
 mod supervisor_alert_words_are_words_the_face_map_knows_test;
 #[path = "supervisor_control_plane_test.rs"]

@@ -102,6 +102,11 @@ fn the_roster_has_exactly_one_write_point() {
     let known: BTreeSet<&str> = [
         "crates/cog-agent/src/agent.rs",
         "crates/cog-agent/src/plugin.rs",
+        // 子智能体（`spawn_subagent`）在这里起一条循环，但它不是新的员工：子任务
+        // 用父这一轮的工号与父手上那条租约，父的租约在整轮期间有效，所以「在没有
+        // 名册行的情况下跑起来」这一条对它不成立。它花的钱记在同一段会话名下
+        // （`with_call_session`），账读得出是谁花的。
+        "crates/cog-agent/src/tools.rs",
         "crates/cogneva/src/conversation.rs",
     ]
     .into_iter()
