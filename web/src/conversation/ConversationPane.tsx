@@ -758,20 +758,38 @@ function DiffBlock({ diff, note }: { diff: ToolDiff; note?: string }) {
  * 因为一次运行能调几十次，全展开就把回复挤到屏幕外面去了。
  */
 /**
+ * 收起的那一行上露几个字。
+ *
+ * override — 那一行由「工具 / 名字 / 执行者 / 状态 / 时刻」挤出来，宽度与窗口无关；
+ * 这一截只决定行上露多少，整句仍然在注释面板里，选中就能抄走（读数出问题时人要
+ * 把它贴进工单），所以截短不丢东西。
+ */
+const LATEST_WORDS_IN_ROW = 60;
+
+/** 中途输出里最近的一句非空的话：`shown` 是行上露出的那一截，`full` 是整句。 */
+interface LatestWords {
+  shown: string;
+  full: string;
+}
+
+/**
  * 中途输出里最近的一句非空的话。
  *
  * 中途输出是执行器流过来的原文，一次可以是几十行；收起的那一行只留最后一句——
  * 它回答「它现在在干什么」。没有就返回 `null`：一行空的占位读起来像「它什么都
  * 没说」，而事实是它还没说。
  */
-function lastProgressLine(progress: string): string | null {
+function lastProgressLine(progress: string): LatestWords | null {
   const lines = progress
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
-  const last = lines[lines.length - 1];
-  if (!last) return null;
-  return last.length > 60 ? `${last.slice(0, 60)}…` : last;
+  const full = lines[lines.length - 1];
+  if (!full) return null;
+  return {
+    shown: full.length > LATEST_WORDS_IN_ROW ? `${full.slice(0, LATEST_WORDS_IN_ROW)}…` : full,
+    full,
+  };
 }
 
 function ToolTurn({ call }: { call: ToolCallRecord }) {
@@ -797,7 +815,21 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="flex w-full items-baseline gap-2 text-left"
-        text="展开这次调用的入参与返回"
+        /*
+          注释面板带上最近一句的原文：收起那一行上只有一截，而人在读数不对劲时要
+          把整句抄走。原生的 `title=` 画在页面之外，选不中、复制不了。
+        */
+        text={
+          latest ? (
+            <>
+              展开这次调用的入参与返回
+              <br />
+              最近一句：<span className="mono">{latest.full}</span>
+            </>
+          ) : (
+            '展开这次调用的入参与返回'
+          )
+        }
       >
         <span className="mono text-[11px]" style={{ color: 'var(--paper-dim)' }}>
           工具
@@ -812,12 +844,8 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
           {label}
         </span>
         {latest && (
-          <span
-            className="mono max-w-[28ch] truncate text-[10px]"
-            style={{ color: 'var(--brass)' }}
-            title={latest}
-          >
-            {latest}
+          <span className="mono max-w-[28ch] truncate text-[10px]" style={{ color: 'var(--brass)' }}>
+            {latest.shown}
           </span>
         )}
         <span className="mono ml-auto text-[10px] text-[var(--muted)]">{stamp(call.startedAt)}</span>

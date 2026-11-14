@@ -167,11 +167,15 @@ async fn a_backend_without_a_lane_says_it_cannot_say_and_the_tool_stays_quiet() 
 }
 
 /// 界上看得见：收起的那一行显示最近一句中途输出，于是「在等执行槽」不必展开就看得见。
+///
+/// 整句必须在行上那一段之外还读得到：行上只有一截（`latest.shown`），而读数不对劲
+/// 时人要把整句抄走，所以注释面板里放的是原文（`latest.full`）。原生 `title=` 画在
+/// 页面之外，选不中、复制不了——这条同时判「没有退回原生提示框」。
 #[test]
 fn the_collapsed_tool_row_shows_what_a_running_call_last_said() {
     let page = crate::common::routes::read_repo("web/src/conversation/ConversationPane.tsx");
     assert!(
-        page.contains("function lastProgressLine(progress: string): string | null"),
+        page.contains("function lastProgressLine(progress: string): LatestWords | null"),
         "页面没有从那一串中途输出里挑出最近一句"
     );
     assert!(
@@ -181,5 +185,13 @@ fn the_collapsed_tool_row_shows_what_a_running_call_last_said() {
     assert!(
         page.contains("{latest && ("),
         "取到了却没有画在收起的那一行上"
+    );
+    assert!(
+        page.contains("{latest.shown}") && page.contains("最近一句："),
+        "行上那一截有了，整句没处可抄：注释面板里要放 `latest.full`"
+    );
+    assert!(
+        !page.contains("title={latest}"),
+        "整句退回成了原生提示框：它画在页面之外，选不中、复制不了"
     );
 }
