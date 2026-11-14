@@ -64,7 +64,6 @@ use common::routes::{read_repo, repo_root};
 use common::rust_production::{all_crate_files, production_sources, production_text};
 use common::service_topology;
 
-use crate::dashboard;
 use crate::promql;
 use crate::unread;
 
@@ -105,6 +104,14 @@ const DASHBOARD_TABLE_OPENS: &str = "const PRODUCED: &[(&str, &[&str], &str)] = 
 /// exempted from a census that would otherwise have demanded a verdict, and
 /// nothing can tell such an entry apart from a real table name.
 const NOT_A_SERIES: &[(&str, &str)] = &[
+    (
+        "cogneva_clippy_last_green_timestamp_seconds",
+        "a timestamp the clippy gate publishes from its own run; the name in this tree is a fixture of that verdict, not a production write point",
+    ),
+    (
+        "cogneva_clippy_verdict_observed_timestamp_seconds",
+        "the same family: the moment a clippy verdict was observed, published by the run that judged it",
+    ),
     (
         "cogneva_owner_leases",
         "the Postgres table the owner-lease rows live in, declared as LEASE_TABLE in cog-storage/src/owner_lease.rs; the live scrape carries no series of that name",
@@ -634,7 +641,17 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 6;
 /// produced tables; this series came off the alert-rule table with its rule, so
 /// it is owed a face rather than a reader, and `UNREGISTERED` carries that debt
 /// with its own count.
-const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 7;
+/// Published series that no decided surface consumes.
+///
+/// A panel is not a reader. The catalogue draws every series the exposition
+/// holds, by construction, so counting drawing as reading would make the
+/// question true about everything and worth nothing. What is counted here is
+/// the population whose only surface is that drawing: 97 after the hand-written
+/// dashboard stopped being a reader (it was 7 while that file was one).
+///
+/// The ceiling only falls. A change that raises it has to say, in the same
+/// commit, why the new series can only be drawn and never decided.
+const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 97;
 
 #[test]
 fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
@@ -754,11 +771,10 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
         .iter()
         .map(|n| n.as_str().to_string())
         .collect();
-    let mut read: BTreeSet<String> = rule_expressions()
+    let read: BTreeSet<String> = rule_expressions()
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
-    read.extend(dashboard::series());
     let mut registered = table_names(ALERT_RULE_CONTRACT, ALERT_TABLE_OPENS);
     registered.extend(table_names(DASHBOARD_CONTRACT, DASHBOARD_TABLE_OPENS));
     let excluded: BTreeSet<&str> = NOT_A_SERIES.iter().map(|(n, _)| *n).collect();
@@ -843,7 +859,11 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
 /// replaced it. Counting it here is what says so out loud rather than leaving
 /// the loss of a reader to be discovered by whoever next asks why the row is
 /// still published.
-const STORE_BACKED_WITHOUT_A_READER: usize = 41;
+/// Store-backed series nothing in the tree reads.
+///
+/// Same change, same reason: the panels used to be counted as readers, so this
+/// population read 41; without them it is 68. It only falls.
+const STORE_BACKED_WITHOUT_A_READER: usize = 68;
 
 #[test]
 fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
@@ -855,7 +875,6 @@ fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
-    read.extend(dashboard::series());
     let shipped = production_query_reads();
     read.extend(shipped.iter().cloned());
 
@@ -1139,11 +1158,10 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
     // The names a face reads. Same two sources as the registered-but-unread
     // count, read once from the same extractors rather than twice from two
     // spellings of "what does a face read".
-    let mut read_by_a_face: BTreeSet<String> = rule_expressions()
+    let read_by_a_face: BTreeSet<String> = rule_expressions()
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
-    read_by_a_face.extend(dashboard::series());
     let unexplained: Vec<&str> = literals
         .iter()
         .map(String::as_str)
@@ -1178,7 +1196,6 @@ fn faces() -> Vec<(&'static str, BTreeSet<String>)> {
     vec![
         ("cog_core::metric_names::ALL（闭集）", registry),
         ("chart 里的告警规则 promql", rules),
-        ("Grafana 面板", dashboard::series()),
         (
             "告警规则契约测试的 PRODUCED 表",
             table_names(ALERT_RULE_CONTRACT, ALERT_TABLE_OPENS),
