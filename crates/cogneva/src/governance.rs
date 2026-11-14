@@ -26,8 +26,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use cog_core::{
-    Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, Handover, StateBackend, Task,
-    TaskStatus, HANDOVER_TASK_TYPE,
+    Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, Handover, PrincipleState,
+    StateBackend, Task, TaskStatus, HANDOVER_TASK_TYPE,
 };
 use cog_orchestrator::face_drift::UnexplainedOwner;
 use cog_storage::{
@@ -1015,6 +1015,45 @@ pub struct RosterRow {
     pub face: Face,
 }
 
+/// The first underscore-separated word of a `first_reading` cell decides
+/// whether the cell is a state list at all. Only then is the whole cell read
+/// as states: ordinary reading names (`tasks_rows_read`,
+/// `principle_ledger_enforced`) pass through untouched. This is the same
+/// boundary the commit-time vocabulary gate used while the roster was a file;
+/// the rule moves to the declaration point because the file is going away.
+///
+/// `never_measured` is the one word that is not a contract state:
+/// `Verdict::Unsettled` writes no state, so a row judged unsettled is read as
+/// never measured. It is a reading name, not a promise the platform produces.
+fn a_state_list_names_only_producible_states(cell: &str) -> Result<(), String> {
+    let states: Vec<&str> = PrincipleState::ALL.iter().map(|s| s.as_str()).collect();
+    let head = cell.split('_').next().unwrap_or("");
+    if !states.contains(&head) {
+        return Ok(());
+    }
+    let mut vocabulary: Vec<&str> = states;
+    vocabulary.push("never_measured");
+    // Longest first: `enforced` and `unenforced` share a suffix, and a short
+    // match taken at the wrong offset would leave a piece of a real word
+    // behind and report it as an unknown state.
+    vocabulary.sort_by_key(|w| std::cmp::Reverse(w.len()));
+    let mut rest = cell;
+    while !rest.is_empty() {
+        let Some(word) = vocabulary.iter().copied().find(|w| rest.starts_with(*w)) else {
+            return Err(rest.split('_').next().unwrap_or(rest).to_string());
+        };
+        rest = &rest[word.len()..];
+        if rest.is_empty() {
+            break;
+        }
+        match rest.strip_prefix('_') {
+            Some(tail) => rest = tail,
+            None => return Err(rest.split('_').next().unwrap_or(rest).to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// Parse the roster file.
 ///
 /// Comment and blank lines are skipped. A row with the wrong width is an error
@@ -1055,6 +1094,21 @@ pub fn parse_roster(text: &str) -> Result<Vec<RosterRow>, String> {
         if face_id.is_empty() {
             return Err(format!("line {}: no face name", index + 1));
         }
+        let first_reading = field(9);
+        // A `first_reading` that names a state list has to name states the
+        // contract really publishes. A reader waiting for a state like
+        // `unsettled` waits forever -- `Verdict::Unsettled` writes no state at
+        // all -- and that failure is invisible until somebody reads the row.
+        // Refusing it here answers at declaration time, before the graph
+        // carries a promise nothing can keep.
+        if let Some(cell) = &first_reading {
+            if let Err(unknown) = a_state_list_names_only_producible_states(cell) {
+                return Err(format!(
+                    "line {}: first_reading {cell:?} names {unknown:?}, which the principle contract cannot produce",
+                    index + 1
+                ));
+            }
+        }
         rows.push(RosterRow {
             face: Face {
                 spec: FaceSpec {
@@ -1066,7 +1120,7 @@ pub fn parse_roster(text: &str) -> Result<Vec<RosterRow>, String> {
                     vacancy_until,
                     vacancy_assigner: field(7),
                     gap_task_id: field(8),
-                    first_reading: field(9),
+                    first_reading,
                     entry_path: field(10),
                     legacy_front_id: None,
                     source_fronts: field(12),
@@ -2124,6 +2178,40 @@ mod tests {
         let line = ["-"; 11].join("\t");
         let text = format!("某面\tline\t{line}\n");
         assert!(parse_roster(&text).is_err());
+    }
+
+    fn face_line(first_reading: &str) -> String {
+        let mut columns = ["-"; 13];
+        columns[0] = "某面";
+        columns[1] = "face";
+        columns[9] = first_reading;
+        columns.join("\t") + "\n"
+    }
+
+    /// A reader waiting for a state the contract cannot produce waits forever,
+    /// and no reading says so. The import is the last place that still holds
+    /// the bytes before they become a graph node, so it refuses them there.
+    #[test]
+    fn a_first_reading_naming_an_unproducible_state_is_refused() {
+        let err = parse_roster(&face_line("enforced_unenforced_unsettled_retired")).unwrap_err();
+        assert!(err.contains("unsettled"), "{err}");
+    }
+
+    #[test]
+    fn a_first_reading_naming_published_states_is_accepted() {
+        let cell = "enforced_unenforced_never_measured";
+        let rows = parse_roster(&face_line(cell)).unwrap();
+        assert_eq!(rows[0].face.spec.first_reading.as_deref(), Some(cell));
+    }
+
+    /// The state check only starts when the first segment is a state word.
+    /// A reading name that merely ends in one -- `principle_ledger_enforced`
+    /// -- is a reading, not a promise about states.
+    #[test]
+    fn an_ordinary_reading_name_is_not_mistaken_for_a_state_list() {
+        for cell in ["principle_ledger_enforced", "tasks_rows_read", "reading_enforced"] {
+            assert!(parse_roster(&face_line(cell)).is_ok(), "{cell}");
+        }
     }
 
     /// 没有在岗账时的形状必须是「读不到」而不是「没人」：调用方拿 None 就说不出
