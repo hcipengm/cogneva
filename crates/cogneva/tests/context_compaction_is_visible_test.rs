@@ -69,10 +69,26 @@ fn the_turn_carries_the_record_only_when_something_was_squeezed() {
     let at = runtime
         .find("take_compaction()")
         .expect("这一轮不再取裁剪现场");
-    let after: String = runtime[at..].chars().take(1600).collect();
+    // 条件句而不是「取现场之后若干字符内」：交付物上还会增加别的格（这一轮读进
+    // 的约定、跑过的钩子），它们都排在压缩这一格前面，一个按距离量出来的窗口会
+    // 被无关的加法挤破——那正是这个判据红过的原因。真正要钉的是两件事：取现场
+    // 在先，挂点只有一个且包在 `Some` 里。
+    let conditional = runtime
+        .find("if let Some(compaction) = compaction")
+        .expect("runtime.rs 无条件挂这一格：没裁过的轮次也会报一份空的，界面每轮多一行");
     assert!(
-        after.contains("if let Some(compaction) = compaction"),
-        "{RUNTIME} 无条件挂这一格：没裁过的轮次也会报一份空的，界面每轮多一行"
+        at < conditional,
+        "{RUNTIME} 先挂后取：挂上去的那份现场还是上一次的"
+    );
+    let arm: String = runtime[conditional..].chars().take(400).collect();
+    assert!(
+        arm.contains("\"compaction\".to_string()"),
+        "{RUNTIME} 取到现场却没在 `Some` 里挂上：有裁剪的轮次反而看不到它"
+    );
+    assert_eq!(
+        runtime.matches("\"compaction\".to_string()").count(),
+        1,
+        "{RUNTIME} 不止一处挂压缩：条件以外的那一处每轮都会报一份空的"
     );
 }
 

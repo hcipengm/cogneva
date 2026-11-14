@@ -24,11 +24,13 @@ use cog_core::{KeyValueStore, SFError, SFResult};
 pub const MEMORY_KEY_PREFIX: &str = "owner_memory";
 
 /// 一条约定的上限（字符）。`override`：见文件头。
+// cap: bound — 人定的（override，见文件头）：一句约定是一句话，不是一篇文章；它进的是每一轮的系统前缀，所以放长一段就放大每一次调用
 pub const MEMORY_ENTRY_LIMIT_CHARS: usize = 2_000;
 
 /// 一个人全部约定的上限（字符）。`override`：见文件头。桶满之后再记一条会被
 /// 拒绝并说明，而不是悄悄挤掉最早的那条——被挤掉的那句不会再有人读到，而写的
 /// 人以为它还在。
+// cap: bound — 人定的（override，见文件头）：一个人合计八千字，按一条满额算是四条；满之后再记被拒并要求先撤旧的，所以这个界就是「一个人手上能同时持有多少字」的答案
 pub const MEMORY_BUCKET_LIMIT_CHARS: usize = 8_000;
 
 /// 存进桶里的一行。`at` 是写下这一刻，界面上按时间排、也让人认出哪句是老的。
