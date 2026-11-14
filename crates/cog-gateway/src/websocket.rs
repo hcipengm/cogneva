@@ -286,6 +286,26 @@ async fn handle_type_message(
                 send_server_message(socket, &resp).await?;
             }
         }
+        ClientMessage::OwnerMemory { .. } => {
+            if let Some(conversation) = state.conversation.get().cloned() {
+                let entries = conversation.owner_memory(conn.user_id).await;
+                send_server_message(socket, &ServerMessage::OwnerMemory { entries }).await?;
+            }
+        }
+        ClientMessage::OwnerMemoryWrite { text, .. } => {
+            if let Some(conversation) = state.conversation.get().cloned() {
+                let entries = conversation
+                    .remember_owner_memory(conn.user_id, &text)
+                    .await;
+                send_server_message(socket, &ServerMessage::OwnerMemory { entries }).await?;
+            }
+        }
+        ClientMessage::OwnerMemoryForget { id, .. } => {
+            if let Some(conversation) = state.conversation.get().cloned() {
+                let entries = conversation.forget_owner_memory(conn.user_id, &id).await;
+                send_server_message(socket, &ServerMessage::OwnerMemory { entries }).await?;
+            }
+        }
         ClientMessage::ChatCancel { session_id, .. } => {
             // 没有在跑的那一段上按停止不是错：用户可能刚好在上一轮结束的那一瞬
             // 按下去。这时什么都不发生，也不该有一条「取消失败」的帧——他真正

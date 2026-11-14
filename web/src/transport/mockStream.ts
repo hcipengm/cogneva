@@ -102,6 +102,8 @@ export class MockEventStreamClient {
       usage: null,
       // 假流不压缩：演示的对话永远装得下，没有裁剪这回事。
       compaction: null,
+      // 假流不读约定：演示里没有谁写过一句要跨轮生效的话。
+      memory: null,
       // 假流不落文件：演示里的每一句都远在窗口之内，没有附件这回事。
       attachment: null,
       timestamp: new Date().toISOString(),

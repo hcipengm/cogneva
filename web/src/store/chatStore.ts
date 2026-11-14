@@ -7,6 +7,7 @@ import type {
   ChatFrame,
   ChatRole,
   ContextCompaction,
+  LoadedMemory,
   TurnUsage,
 } from '@/types/events';
 
@@ -57,6 +58,13 @@ export interface ChatMessage {
    * 不是这条消息的属性。
    */
   compaction: ContextCompaction | null;
+  /**
+   * 这一轮读进了哪几句属主约定，由服务端的 `memory` 帧带进来。
+   *
+   * `null` 是「这一轮没有这一帧」——平台没接读面，或者这一轮在发帧之前就结束了；
+   * 界面上因此不画这一行，而不是写「加载了 0 条」。
+   */
+  memory: LoadedMemory[] | null;
   /**
    * 这一句的原文落成的文件。只有超过窗口的那些带它：服务端把原文逐字写进执行器
    * 的一个文件，界面上这一条因此画成附件（带全文长度），而不是把开头当成全部。
@@ -408,6 +416,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 failure: null,
                 usage: null,
                 compaction: null,
+                memory: null,
                 attachment: null,
                 files,
                 at,
@@ -466,6 +475,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   failure: null,
                   usage: null,
                   compaction: null,
+                  memory: null,
                   attachment: frame.attachment,
                   files: [],
                   at: frame.timestamp,
@@ -497,6 +507,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   failure: null,
                   usage: null,
                   compaction: null,
+                  memory: null,
                   attachment: null,
                   files: [],
                   at: frame.timestamp,
@@ -575,6 +586,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           session = withMessage(session, frame.messageId, (message) => ({
             ...message,
             compaction,
+          }));
+          break;
+        }
+
+        case 'memory': {
+          // 与花销同一处落点：它是这条回答的前提，不是一句新的话。
+          if (!frame.memory) break;
+          const memory = frame.memory;
+          session = withMessage(session, frame.messageId, (message) => ({
+            ...message,
+            memory,
           }));
           break;
         }
@@ -676,6 +698,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             usage: null,
             // 记录里不存这一格：压缩是那一轮发生的事，不是这条消息的属性。
             compaction: null,
+            // 读回的历史里也没有这一格：约定是那一轮开头读的，不是这条消息的属性。
+            memory: null,
             // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
             attachment: null,
             // 记录里有名字与类型：刷新之后仍认得出这句话说过一张图。字节数

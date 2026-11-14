@@ -139,6 +139,29 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// 要一份「这个人写下的约定」的名单：下一轮开头会自动进提示词的那几句。
+    ///
+    /// 名单属于人，不属于某一段对话，所以这里不带会话号：同一个人换一段对话，
+    /// 读到的还是这几句。
+    #[serde(rename = "owner_memory")]
+    OwnerMemory {
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
+    /// 记下一句约定。回执是记完之后的整份名单（见服务端的 `owner_memory`）。
+    #[serde(rename = "owner_memory_write")]
+    OwnerMemoryWrite {
+        text: String,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
+    /// 撤掉一句约定。回执是撤完之后的整份名单。
+    #[serde(rename = "owner_memory_forget")]
+    OwnerMemoryForget {
+        id: String,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
 }
 
 /// Server → Client WebSocket messages.
@@ -209,6 +232,14 @@ pub enum ServerMessage {
     PermissionRules {
         session_id: String,
         rules: Vec<crate::chat::PermissionRuleView>,
+    },
+    /// 这个人写下的约定：下一轮开头自动进提示词的那几句。
+    ///
+    /// 空名单是真的「一句都没写」：服务端只在读到了的时候发这一帧。写与撤的回执
+    /// 也是这一帧——界面上唯一要画的就是这份名单。
+    #[serde(rename = "owner_memory")]
+    OwnerMemory {
+        entries: Vec<crate::chat::MemoryEntryView>,
     },
 }
 

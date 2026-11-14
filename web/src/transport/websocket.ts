@@ -28,6 +28,16 @@ export interface PermissionRulesWire {
   rules?: PermissionRuleWire[];
 }
 
+/** 服务端递回来的一句约定：号与原文，见 `memoryStore`。 */
+export interface OwnerMemoryEntryWire {
+  id?: string;
+  text?: string;
+}
+
+export interface OwnerMemoryWire {
+  entries?: OwnerMemoryEntryWire[];
+}
+
 export interface PermissionAskWire {
   request_id?: string;
   session_id?: string;
@@ -66,6 +76,11 @@ export interface WebSocketOptions {
    * 一个人设过一次之后留在平台上的设置——混进聊天流会被当成一句助手说的话。
    */
   onPermissionRules?: (rules: PermissionRuleWire[]) => void;
+  /**
+   * 这个人写下的约定。与规则同一个理由：它是设置，不是这一轮的产出，混进聊天流
+   * 会被当成一句助手说的话。
+   */
+  onOwnerMemory?: (entries: OwnerMemoryEntryWire[]) => void;
   onStatusChange?: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -247,6 +262,12 @@ export class EventStreamClient {
       // 就等于读到了。认不出形状的那一份按空名单处理，不拿上次的名单冒充这次。
       const wire = message as unknown as PermissionRulesWire;
       this.options.onPermissionRules?.(Array.isArray(wire.rules) ? wire.rules : []);
+      return;
+    } else if (message.type === 'owner_memory') {
+      // 名单为空是真的「一句也没写」：服务端只在读到的时候发这一帧。认不出形状
+      // 的那一份按空名单处理，不拿上次的名单冒充这一次。
+      const wire = message as unknown as OwnerMemoryWire;
+      this.options.onOwnerMemory?.(Array.isArray(wire.entries) ? wire.entries : []);
       return;
     } else if (message.type === 'notification' && message.payload) {
       const notification = normalizeNotification(

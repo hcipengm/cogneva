@@ -19,6 +19,7 @@ import {
   usePermissionStore,
   type PermissionAsk,
 } from '@/store/permissionStore';
+import { useMemoryStore } from '@/store/memoryStore';
 import { useShell } from '@/shell/store';
 import type { ContextCompaction, SessionSpend, TurnUsage } from '@/types/events';
 import { Note } from '@/ui/Note';
@@ -400,6 +401,22 @@ function Turn({ message }: { message: ChatMessage }) {
       {message.role === 'assistant' && message.compaction && (
         <p className="mono mt-1 text-[10px] text-[var(--brass)]">
           {compactionLine(message.compaction)}
+        </p>
+      )}
+
+      {/*
+        这一轮开头读进了哪几句属主约定。排在花销上面：约定的原文是这条回答的
+        前提，读的人先看到它，才看得懂回答为什么长这样。一句也没读到时写
+        「一句约定都没读到」而不是不画——「没写过」与「平台不读」要分得开，
+        后者根本不会有这一帧。
+      */}
+      {message.role === 'assistant' && message.memory && (
+        <p className="mono mt-1 text-[10px] text-[var(--muted)]">
+          {message.memory.length === 0
+            ? '这一轮没有读进属主约定'
+            : `读进 ${message.memory.length} 句属主约定：${message.memory
+                .map((entry) => entry.text)
+                .join('；')}`}
         </p>
       )}
 
@@ -857,6 +874,15 @@ export function ConversationPane({
    */
   const permissionRules = usePermissionStore((s) => s.rules);
   const [rulesOpen, setRulesOpen] = useState(false);
+  /**
+   * 这个人写下的约定：下一轮开头自动进提示词的那几句。
+   *
+   * `null` 是「还没读到」，空数组是「读到了，一句也没写」，与规则那份名单同一个
+   * 规矩。草稿另存一格：写到一半的句子不该进任何一份账。
+   */
+  const memoryEntries = useMemoryStore((s) => s.entries);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryDraft, setMemoryDraft] = useState('');
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   /** 这一段交出去的目标，按总览折出来的现状。总览里还没有的那几道如实缺席。 */
@@ -1150,6 +1176,29 @@ export function ConversationPane({
     if (next) clientRef.current?.send({ type: 'permission_rules', session_id: sessionId });
   };
 
+  /**
+   * 约定面板：第一次打开时向服务端要一份名单。与规则面板同一个理由——不开就
+   * 不问，别把没人看的东西算进每一次连接的开销。
+   */
+  const toggleMemory = () => {
+    const next = !memoryOpen;
+    setMemoryOpen(next);
+    if (next) clientRef.current?.send({ type: 'owner_memory' });
+  };
+
+  /** 记下一句。回执是记完之后的整份名单，所以这里不自己改本地那一份。 */
+  const writeMemory = () => {
+    const text = memoryDraft.trim();
+    if (!text) return;
+    clientRef.current?.send({ type: 'owner_memory_write', text });
+    setMemoryDraft('');
+  };
+
+  /** 撤掉一句。回执同样是整份名单。 */
+  const forgetMemory = (id: string) => {
+    clientRef.current?.send({ type: 'owner_memory_forget', id });
+  };
+
   /** 撤掉一条。回执是撤完之后的整份名单，所以这里不自己改本地那一份。 */
   const revokeRule = (id: string) => {
     clientRef.current?.send({
@@ -1260,6 +1309,20 @@ export function ConversationPane({
           text="看这个人留过哪些「总是允许 / 总是拒绝」，并撤掉其中一条"
         >
           规则
+        </Note>
+        {/*
+          约定：这个人写下的、之后每一轮都加载的那几句。与规则同一处入口——
+          两者都是设置，不是这一面的主体。
+        */}
+        <Note
+          as="button"
+          type="button"
+          onClick={toggleMemory}
+          className="mono shrink-0 px-1 text-[10px] transition-opacity hover:opacity-70"
+          style={{ color: memoryOpen ? 'var(--brass)' : 'var(--muted)' }}
+          text="写一句跨会话生效的约定，之后每一轮开头都会读到；也可以撤掉其中一句"
+        >
+          约定
         </Note>
         {/*
           目标与变更都是账上的行，所以每一个都能点进去。这里只是入口：这一面
@@ -1428,6 +1491,84 @@ export function ConversationPane({
               ))}
             </ul>
           )}
+        </div>
+      )}
+      {memoryOpen && (
+        <div className="shrink-0 px-4 pb-1">
+          <div className="mb-1 flex items-baseline gap-2">
+            <span className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
+              写下的约定
+            </span>
+            <Note
+              as="button"
+              type="button"
+              onClick={() => clientRef.current?.send({ type: 'owner_memory' })}
+              className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="重新从服务端读一份名单"
+            >
+              刷新
+            </Note>
+            <Note
+              as="button"
+              type="button"
+              onClick={toggleMemory}
+              className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="收起这块面板"
+            >
+              收起
+            </Note>
+          </div>
+          {/*
+            「还在读」与「一句也没写」分开写，与规则面板同一条理由：合起来写，
+            一次失败的读取会被读成一次干净的家底。
+          */}
+          {memoryEntries === null ? (
+            <p className="mono text-[10px] text-[var(--muted)]">还在读这份名单…</p>
+          ) : memoryEntries.length === 0 ? (
+            <p className="mono text-[10px] text-[var(--muted)]">
+              这个人还没有写下过约定。
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {memoryEntries.map((entry) => (
+                <li key={entry.id} className="flex items-baseline gap-2 text-[11px]">
+                  <span className="break-all text-[var(--paper-dim)]">{entry.text}</span>
+                  <Note
+                    as="button"
+                    type="button"
+                    onClick={() => forgetMemory(entry.id)}
+                    className="mono shrink-0 px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+                    text="撤掉这一句约定：从下一轮起不再加载它"
+                  >
+                    撤销
+                  </Note>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="mt-1 flex items-baseline gap-2">
+            <input
+              value={memoryDraft}
+              onChange={(e) => setMemoryDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  writeMemory();
+                }
+              }}
+              placeholder="写一句之后每一轮都要读到的约定…"
+              className="mono min-w-0 flex-1 bg-transparent text-[11px] outline-none placeholder:text-[var(--muted)]"
+            />
+            <Note
+              as="button"
+              type="button"
+              onClick={writeMemory}
+              className="mono shrink-0 px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="记下这一句：从下一轮起它会被自动读进提示词"
+            >
+              记住
+            </Note>
+          </div>
         </div>
       )}
       {permissionAsks.length > 0 && (

@@ -154,7 +154,8 @@ export type ChatFrameKind =
   | 'change'
   | 'identity'
   | 'usage'
-  | 'compaction';
+  | 'compaction'
+  | 'memory';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -183,6 +184,10 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   // 这一轮把一段早期上下文挤出了提示词：模型下一轮看不见它了。没有裁剪时
   // 服务端根本不发这一帧，所以它的出现本身就是「这一段对话开始装不下了」。
   'message.compaction': 'compaction',
+  // 这一轮读进了哪几句属主约定。与花销同一处落点：它说的是「这条回答是在什么
+  // 前提下说出来的」，不是一句新的话。没有读面的部署根本不发这一帧，所以它的
+  // 出现本身就说明这个平台在读约定。
+  'message.memory': 'memory',
 };
 
 /**
@@ -221,6 +226,8 @@ export interface ChatFrame {
   usage: TurnUsage | null;
   /** 只有 `compaction` 帧带着：这一轮从提示词里挤掉了什么。 */
   compaction: ContextCompaction | null;
+  /** 只有 `memory` 帧带着：这一轮读进了哪几句属主约定。 */
+  memory: LoadedMemory[] | null;
   /**
    * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
    *
@@ -229,6 +236,12 @@ export interface ChatFrame {
    */
   attachment: ChatAttachment | null;
   timestamp: string;
+}
+
+/** 这一轮真的进了提示词的一句约定。`id` 是撤销用的号，`text` 是原文。 */
+export interface LoadedMemory {
+  id: string;
+  text: string;
 }
 
 /** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
@@ -397,6 +410,16 @@ export function normalizeChatFrame(
             costUsd: frameCount(inner.cost_usd),
             session: sessionSpend(inner.session),
           }
+        : null,
+    memory:
+      kind === 'memory'
+        ? Array.isArray(inner.loaded)
+          ? (inner.loaded as Array<Record<string, unknown>>).flatMap((row) =>
+              typeof row?.id === 'string' && typeof row?.text === 'string'
+                ? [{ id: row.id, text: row.text }]
+                : []
+            )
+          : []
         : null,
     compaction:
       kind === 'compaction'

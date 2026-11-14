@@ -22,6 +22,7 @@ import { resourceKey } from '@/store/frameTick';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 import { usePermissionStore } from '@/store/permissionStore';
+import { useMemoryStore } from '@/store/memoryStore';
 
 /**
  * 一条消息里的纯文本。
@@ -370,11 +371,22 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
             );
             usePermissionStore.getState().setRules(known);
           },
+          // 约定名单同理：少一格（没有号或没有原文）的那一条不落——没有号就撤
+          // 不掉，没有原文就画不出一句人写的话。
+          onOwnerMemory: (entries) => {
+            const known = entries.flatMap((entry) =>
+              entry.id && entry.text ? [{ id: entry.id, text: entry.text }] : []
+            );
+            useMemoryStore.getState().setEntries(known);
+          },
           onStatusChange: (status) => {
             setConnectionStatus(status);
             // 断了就把名单清回「还没读到」：上一条连接读到的规则不该留在屏幕上
             // 冒充现状，而重连之后那一次请求会把真的名单拿回来。
-            if (status !== 'open') usePermissionStore.getState().forgetRules();
+            if (status !== 'open') {
+              usePermissionStore.getState().forgetRules();
+              useMemoryStore.getState().clearEntries();
+            }
           },
           onError: (error) => {
             console.error('WebSocket error:', error);

@@ -418,6 +418,51 @@ pub trait ConversationTurn: Send + Sync {
     {
         Box::pin(async { Vec::new() })
     }
+
+    /// 这个人在过去的对话里写下的约定：下一轮开头自动进提示词的那几句。
+    ///
+    /// 名单属于人，不属于某一段对话：同一个人换一段对话读到的还是这几句。
+    /// 默认是一张空名单——装配层没接存储时，界面上就该列不出来，而不是列一份猜的。
+    fn owner_memory<'a>(
+        &'a self,
+        _owner: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<MemoryEntryView>> + Send + 'a>>
+    {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// 记下一句约定，返回记完之后的整份名单。
+    ///
+    /// 返回名单而不是新那条：界面上唯一要画的就是这份名单，写没写进去由「新的
+    /// 名单里多了它」表达。
+    fn remember_owner_memory<'a>(
+        &'a self,
+        _owner: &'a str,
+        _text: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<MemoryEntryView>> + Send + 'a>>
+    {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// 撤掉一句约定，返回撤完之后的整份名单。
+    fn forget_owner_memory<'a>(
+        &'a self,
+        _owner: &'a str,
+        _id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<MemoryEntryView>> + Send + 'a>>
+    {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+/// 一句约定递到界面上时的样子。
+///
+/// 只有号与原文：它写的是什么，就是模型读到的那一句，这里不改写、不摘要——
+/// 界面上显示的和提示词里载入的必须是同一句话，否则人没法核对「它到底读到了什么」。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryEntryView {
+    pub id: String,
+    pub text: String,
 }
 
 /// 一条留下来的规则在界面上长什么样。
@@ -1153,6 +1198,43 @@ async fn emit_turn_usage(
             // 这一段会话到目前为止的合计。单看这一轮的数是看不出一段对话花了多少
             // 的——每一轮只报自己，而读者要问的往往是「这段聊下来多少钱」。
             "session": session_spend_frame(ledger, session_id).await,
+        }),
+    )
+    .await;
+}
+
+/// 这一轮读进了哪几句属主约定。
+///
+/// 与用量同一处分：数字来自循环的交付物，网关一个也不编。没有读面的部署根本
+/// 不会有 `memory` 这一格，于是也不会有这一帧——「这一轮没有约定」与「这个平台
+/// 不读约定」在屏幕上必须分得开：后者是配置还没接上，前者是这个人还没写。
+async fn emit_turn_memory(
+    out: &mpsc::Sender<String>,
+    session_id: &str,
+    message_id: &str,
+    memory: Option<&serde_json::Value>,
+) {
+    let Some(memory) = memory else { return };
+    let loaded: Vec<serde_json::Value> = memory
+        .get("loaded")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let id = row.get("id").and_then(serde_json::Value::as_str)?;
+                    let text = row.get("text").and_then(serde_json::Value::as_str)?;
+                    Some(serde_json::json!({ "id": id, "text": text }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    emit(
+        out,
+        session_id,
+        "message.memory",
+        serde_json::json!({
+            "message_id": message_id,
+            "loaded": loaded,
         }),
     )
     .await;
@@ -1916,6 +1998,12 @@ pub async fn run_chat_turn(
         .ok()
         .and_then(|value| value.get("usage"))
         .cloned();
+    // 这一轮读进了哪几句属主约定：只有这一轮挂了读面才有这一格。
+    let turn_memory = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("memory"))
+        .cloned();
     // 这一轮挤掉了哪一段上下文：循环只在真裁过时才挂这一格，没有就是 `None`。
     let turn_compaction = outcome
         .as_ref()
@@ -2034,6 +2122,7 @@ pub async fn run_chat_turn(
     // 6. 这一轮的现场：上下文挤掉了什么、花了多少。都排在收尾帧之前，因为界面
     //    把它们画在这一条消息下面——收尾帧一到，这一条就定稿了。压缩在前：
     //    它说的是这一轮模型手上少看到了什么，读的人先知道这件事再读花销。
+    emit_turn_memory(&out, &session_id, &assistant_mid, turn_memory.as_ref()).await;
     emit_turn_compaction(&out, &session_id, &assistant_mid, turn_compaction.as_ref()).await;
     emit_turn_usage(
         state.llm_usage.as_deref(),

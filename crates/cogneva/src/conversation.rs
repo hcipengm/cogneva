@@ -27,7 +27,7 @@ use cog_core::{
     AgentEvent, AuditKind, AuditStream, HierarchyManager, OrchestratorControl, QuotaContext,
     RuntimeConfig, SFError, SFResult,
 };
-use cog_gateway::chat::{ConversationRequest, ConversationTurn};
+use cog_gateway::chat::{ConversationRequest, ConversationTurn, MemoryEntryView};
 
 /// 这一段对话在名册里属于哪个分组。
 ///
@@ -700,6 +700,15 @@ impl ConversationTurn for PlatformConversation {
             }
             let capabilities = tools.names();
             let mut runtime = cog_agent::AgentRuntime::new(config, events).with_tools(tools);
+            // 属主写下的约定：只在这条连接既是某个登录身份、又接上了键值存储时
+            // 才挂读面。没有身份就没有「属主」，读不到任何一个人的话——不挂，
+            // 而不是挂一个空桶：后者会让界面上出现一行「加载了 0 条」，读起来
+            // 像「这个人还没写过」，而事实是这条连接问不出「这个人」是谁。
+            if let (Some(kv), Some(owner)) = (self.people.as_ref(), owner) {
+                runtime = runtime.with_memory_source(Arc::new(
+                    crate::owner_memory::OwnerMemoryBucket::new(Arc::clone(kv), owner),
+                ));
+            }
             let permission_session = request.session_id.clone();
             let decider: Option<Arc<dyn cog_agent::permission::PermissionDecider>> =
                 match request.permissions {
@@ -858,6 +867,80 @@ impl ConversationTurn for PlatformConversation {
                 .collect()
         })
     }
+
+    /// 这个人写下的约定：下一轮开头会自动进提示词的那几句。
+    ///
+    /// 读不到存储时给一张空名单，与「这个人还没写过」在界面上读起来一样——
+    /// 与规则那一面同一个现状，也同一个取舍：眼下唯一的读者是人自己点开的那
+    /// 一眼，多一格「读没读到」只是多一格没人看的字。
+    fn owner_memory<'a>(
+        &'a self,
+        owner: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<MemoryEntryView>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(kv) = self.people.as_ref() else {
+                return Vec::new();
+            };
+            let owner = Some(owner).filter(|owner| !owner.trim().is_empty());
+            owner_memory_view(crate::owner_memory::list(kv, owner).await)
+        })
+    }
+
+    fn remember_owner_memory<'a>(
+        &'a self,
+        owner: &'a str,
+        text: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<MemoryEntryView>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(kv) = self.people.as_ref() else {
+                return Vec::new();
+            };
+            let owner = Some(owner).filter(|owner| !owner.trim().is_empty());
+            match crate::owner_memory::remember(kv, owner, text, chrono::Utc::now()).await {
+                Ok(entries) => owner_memory_view(entries),
+                Err(error) => {
+                    // 写不进去要把理由说给写的人：空名单读起来会像「写完就没了」，
+                    // 而实际是这一句没有被记下。
+                    tracing::warn!(%error, "属主写的这一句约定没有记下来");
+                    Vec::new()
+                }
+            }
+        })
+    }
+
+    fn forget_owner_memory<'a>(
+        &'a self,
+        owner: &'a str,
+        id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<MemoryEntryView>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(kv) = self.people.as_ref() else {
+                return Vec::new();
+            };
+            let owner = Some(owner).filter(|owner| !owner.trim().is_empty());
+            match crate::owner_memory::forget(kv, owner, id).await {
+                Ok(entries) => owner_memory_view(entries),
+                Err(error) => {
+                    tracing::warn!(%error, id, "撤掉这一句约定没写回去");
+                    owner_memory_view(crate::owner_memory::list(kv, owner).await)
+                }
+            }
+        })
+    }
+}
+
+/// 一个人写下的约定，按写下的顺序。
+fn owner_memory_view(entries: Vec<cog_agent::memory::MemoryEntry>) -> Vec<MemoryEntryView> {
+    entries
+        .into_iter()
+        .map(|entry| MemoryEntryView {
+            id: entry.id,
+            text: entry.text,
+        })
+        .collect()
 }
 
 /// 一条规则递到界面上时的样子：人看得懂的四个字，加一个撤销用的号。

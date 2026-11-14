@@ -506,6 +506,15 @@ pub struct AgentRuntime {
     principles_note: Option<String>,
     /// 这一条循环自己的规则账。空着时用进程的那一本（见 `absorb_principles`）。
     principle_source: Option<Arc<dyn crate::principles::PrincipleSource>>,
+    /// 上一轮并进系统前缀的那一段属主约定。与规则那一段同一个理由：约定改了之
+    /// 后先把旧的拿掉（见 `absorb_owner_memory`）。
+    memory_note: Option<String>,
+    /// 这一位自己的属主约定读面。空着时这一轮没有任何属主约定——进程级的那一
+    /// 本属于「对每个人都一样」的规则，不是这个人的话。
+    memory_source: Option<Arc<dyn crate::memory::OwnerMemory>>,
+    /// 这一轮真的读进提示词的那几条。交给网关发一帧，让「加载了什么」在对话
+    /// 里看得见，而不只是「配了」。
+    memory_loaded: Vec<crate::memory::MemoryEntry>,
 }
 
 /// The token census of one run: every billed LLM call the run made, folded into
@@ -1181,6 +1190,9 @@ impl AgentRuntime {
             identity_note: None,
             principles_note: None,
             principle_source: None,
+            memory_note: None,
+            memory_source: None,
+            memory_loaded: Vec::new(),
         }
     }
 
@@ -1215,6 +1227,17 @@ impl AgentRuntime {
         source: Arc<dyn crate::principles::PrincipleSource>,
     ) -> Self {
         self.principle_source = Some(source);
+        self
+    }
+
+    /// Hand this loop the conventions its owner wrote down.
+    ///
+    /// The source is per person, not per process: the same platform serves many
+    /// owners, and one owner's sentences must never reach another owner's turn.
+    /// That is why there is no process-wide install for this one — the caller
+    /// that knows whose conversation this is hands it over.
+    pub fn with_memory_source(mut self, source: Arc<dyn crate::memory::OwnerMemory>) -> Self {
+        self.memory_source = Some(source);
         self
     }
 
@@ -1779,6 +1802,25 @@ impl AgentRuntime {
                     "cost_usd": usage.cost_usd,
                 }),
             );
+            // 这一轮真读进提示词的属主约定。只在有读面时给这一格：没有读面
+            // 的部署（测试、独立跑的运行时）不该在界面上多一行「加载了 0 条」，
+            // 那是在描述一件这一轮根本不会发生的事。有读面时即使是空的也报：
+            // 「这个人还没写过」与「平台没读」在读数面上必须分得开。
+            if self.memory_source.is_some() {
+                object.insert(
+                    "memory".to_string(),
+                    serde_json::json!({
+                        "loaded": self
+                            .memory_loaded
+                            .iter()
+                            .map(|entry| serde_json::json!({
+                                "id": entry.id,
+                                "text": entry.text,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+            }
             // 只在真裁过时给这一格：没有裁剪就不写，网关也就不会发一帧「0 条」——
             // 每一轮都报一次「没压缩」是噪声，读者从此不再读它。
             if let Some(compaction) = compaction {
@@ -1834,6 +1876,7 @@ impl AgentRuntime {
             self.context.merge_head_system(&text);
         }
         self.absorb_principles().await;
+        self.absorb_owner_memory().await;
         self.look_up_own_name().await;
         let workspace = self.workspace_lane();
         if let Some(note) = crate::agent_kernel::base_instruction::identity_note(
@@ -1863,6 +1906,47 @@ impl AgentRuntime {
     ///
     /// 分成两步是为了让「换掉」本身可测：不必先装一本真账，也能证明同一段
     /// 前缀里不会同时留着撤销前的规则与撤销后的规则。
+    /// 这一轮属主写下的那几句进系统前缀。
+    ///
+    /// 与规则那一段同一条规矩：拿上一轮那一段与这一轮比，不一样就先把旧的拿
+    /// 掉再放新的——约定是可以改、可以撤的，留着旧的那一段，模型会照着一条已
+    /// 经被撤掉的约定做，而它现在的替代者就并排在同一段前缀里。
+    ///
+    /// 读到的条目同时留一份给这一轮的交付物：界面上「加载了什么」要能指名道
+    /// 姓，不能只说「已加载」。
+    async fn absorb_owner_memory(&mut self) {
+        let entries = match self.memory_source.clone() {
+            Some(source) => match source.entries().await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "the owner's memory could not be read; this run carries only its base instruction"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let section = crate::memory::section(&entries);
+        self.apply_memory_section(section);
+        self.memory_loaded = entries;
+    }
+
+    /// 把这一轮的属主约定放进系统前缀，换掉上一轮那一段。
+    fn apply_memory_section(&mut self, section: Option<String>) {
+        if self.memory_note.as_deref() == section.as_deref() {
+            return;
+        }
+        if let Some(old) = self.memory_note.take() {
+            self.context.drop_from_head_system(&old);
+        }
+        if let Some(section) = section {
+            self.context.merge_head_system(&section);
+            self.memory_note = Some(section);
+        }
+    }
+
     fn apply_principles_section(&mut self, section: Option<String>) {
         if self.principles_note.as_deref() == section.as_deref() {
             return;
@@ -1957,6 +2041,7 @@ impl AgentRuntime {
             // 记录也要跟着清：不清的话规则那一段会被认为还在里面，这一次运行
             // 读到的规则一条都没有。
             self.principles_note = None;
+            self.memory_note = None;
             self.identity_note = None;
             // 下面这一位还会让这一次运行不接日志续跑：日志的键是这一位自己的
             // 名字，里面是另一件活走到一半的对话——续上就等于把它从账上搬了
@@ -4611,6 +4696,96 @@ mod tests {
             head.matches("steady-rule").count(),
             1,
             "the same section was prepended twice: {head}"
+        );
+    }
+
+    /// 属主写下的一句约定要在这一轮的提示词里，而且这一轮要能指名道姓地说出
+    /// 读到了哪一条——界面上「加载了什么」靠的就是这一份。
+    #[tokio::test]
+    async fn a_convention_written_by_the_owner_reaches_the_prompt_and_is_named() {
+        struct Written;
+        #[async_trait::async_trait]
+        impl crate::memory::OwnerMemory for Written {
+            async fn entries(&self) -> cog_core::SFResult<Vec<crate::memory::MemoryEntry>> {
+                Ok(vec![crate::memory::MemoryEntry {
+                    id: "5e11".into(),
+                    text: "这个仓不用 tab，缩进一律两个空格".into(),
+                }])
+            }
+        }
+
+        let config = RuntimeConfig {
+            agent_id: "kai-a9ab11fc".into(),
+            role: "kai-a9ab11fc".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let mut agent_loop = AgentRuntime::new(config, tx).with_memory_source(Arc::new(Written));
+
+        agent_loop.absorb_owner_memory().await;
+
+        let head = agent_loop
+            .context
+            .messages()
+            .first()
+            .expect("a convention alone is worth a prefix")
+            .content()
+            .to_string();
+        assert!(
+            head.contains("这个仓不用 tab，缩进一律两个空格"),
+            "the convention is not in the prompt: {head}"
+        );
+        assert_eq!(
+            agent_loop.memory_loaded,
+            vec![crate::memory::MemoryEntry {
+                id: "5e11".into(),
+                text: "这个仓不用 tab，缩进一律两个空格".into(),
+            }],
+            "the turn cannot name what it loaded"
+        );
+    }
+
+    /// 约定被改过之后，旧的那一句必须离开前缀；没改时同一段不再并一次。
+    #[tokio::test]
+    async fn a_convention_rewritten_between_turns_replaces_the_old_one() {
+        let config = RuntimeConfig {
+            agent_id: "kai-a9ab11fc".into(),
+            role: "kai-a9ab11fc".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let mut agent_loop = AgentRuntime::new(config, tx);
+
+        let before = crate::memory::section(&[crate::memory::MemoryEntry {
+            id: "old".into(),
+            text: "用四个空格缩进".into(),
+        }])
+        .expect("one entry is a section");
+        let after = crate::memory::section(&[crate::memory::MemoryEntry {
+            id: "new".into(),
+            text: "缩进一律两个空格".into(),
+        }])
+        .expect("one entry is a section");
+
+        agent_loop.apply_memory_section(Some(before));
+        agent_loop.apply_memory_section(Some(after.clone()));
+        agent_loop.apply_memory_section(Some(after));
+
+        let head = agent_loop
+            .context
+            .messages()
+            .first()
+            .expect("a section alone is worth a prefix")
+            .content()
+            .to_string();
+        assert!(
+            !head.contains("用四个空格缩进"),
+            "the rewritten convention is still being read: {head}"
+        );
+        assert_eq!(
+            head.matches("属主在之前的对话里写下的约定").count(),
+            1,
+            "the section was appended instead of replaced: {head}"
         );
     }
 

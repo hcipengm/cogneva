@@ -9,6 +9,7 @@ pub mod event_bus_sink;
 pub mod hooks;
 pub mod identity;
 pub mod lifecycle;
+pub mod memory;
 pub mod observable;
 pub mod permission;
 pub mod pool_sizing;
