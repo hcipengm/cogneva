@@ -26,15 +26,31 @@ impl FileObjectBackend {
         }
     }
 
-    fn object_path(&self, key: &str) -> std::path::PathBuf {
-        self.base_dir.join(key)
+    /// Resolve an object key to a path inside the object-store root.
+    ///
+    /// A key is a plain relative path — no empty key, no NUL, no root, no `.` or
+    /// `..`. The gateway builds keys out of URL segments, so a key that reaches
+    /// the filesystem unchecked decides where the file lands; refusing the shape
+    /// here is what makes every caller safe, present and future.
+    fn object_path(&self, key: &str) -> SFResult<std::path::PathBuf> {
+        let path = self.base_dir.join(key);
+        let plain = std::path::Path::new(key)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if key.is_empty() || key.contains('\0') || !plain || !path.starts_with(&self.base_dir) {
+            return Err(SFError::IO(format!(
+                "object key {:?} refused: bad key shape",
+                key
+            )));
+        }
+        Ok(path)
     }
 }
 
 #[async_trait]
 impl ObjectBackend for FileObjectBackend {
     async fn put(&self, key: &str, data: &[u8]) -> SFResult<String> {
-        let path = self.object_path(key);
+        let path = self.object_path(key)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -47,7 +63,7 @@ impl ObjectBackend for FileObjectBackend {
     }
 
     async fn get(&self, key: &str) -> SFResult<Option<Vec<u8>>> {
-        let path = self.object_path(key);
+        let path = self.object_path(key)?;
         match tokio::fs::read(&path).await {
             Ok(data) => Ok(Some(data)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -56,7 +72,7 @@ impl ObjectBackend for FileObjectBackend {
     }
 
     async fn delete(&self, key: &str) -> SFResult<()> {
-        let path = self.object_path(key);
+        let path = self.object_path(key)?;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -65,19 +81,19 @@ impl ObjectBackend for FileObjectBackend {
     }
 
     async fn presign_url(&self, key: &str, _expiry_secs: u64) -> SFResult<String> {
-        let path = self.object_path(key);
+        let path = self.object_path(key)?;
         Ok(format!("file://{}", path.display()))
     }
 
     async fn exists(&self, key: &str) -> SFResult<bool> {
-        let path = self.object_path(key);
+        let path = self.object_path(key)?;
         Ok(tokio::fs::metadata(&path).await.is_ok())
     }
 
     async fn list(&self, prefix: Option<&str>) -> SFResult<Vec<String>> {
         let mut keys = Vec::new();
         let dir = match prefix {
-            Some(p) => self.base_dir.join(p),
+            Some(p) => self.object_path(p)?,
             None => self.base_dir.clone(),
         };
         if tokio::fs::metadata(&dir).await.is_err() {
@@ -760,5 +776,40 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    /// A file backend rooted in a directory nobody else in this test run uses.
+    fn file_backend(label: &str) -> (FileObjectBackend, std::path::PathBuf) {
+        let unique = format!("cogneva-object-keys-{}-{}", label, std::process::id());
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        (FileObjectBackend::new(dir.clone()), dir)
+    }
+
+    #[tokio::test]
+    async fn file_backend_refuses_keys_that_escape_its_root() {
+        let (objects, dir) = file_backend("escape");
+        for key in ["../x", "files/../../x", "/etc/passwd", "", "a/../../b"] {
+            assert!(objects.put(key, b"x").await.is_err());
+            assert!(objects.get(key).await.is_err());
+            assert!(objects.exists(key).await.is_err());
+            assert!(objects.delete(key).await.is_err());
+            assert!(objects.presign_url(key, 60).await.is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn file_backend_round_trips_a_nested_key() {
+        let (objects, dir) = file_backend("round-trip");
+        objects.put("files/abc", b"payload").await.unwrap();
+        let stored = objects.get("files/abc").await.unwrap();
+        assert_eq!(stored, Some(b"payload".to_vec()));
+        assert!(objects.exists("files/abc").await.unwrap());
+        let listed = objects.list(Some("files")).await.unwrap();
+        assert_eq!(listed, vec!["files/abc".to_string()]);
+        objects.delete("files/abc").await.unwrap();
+        assert!(objects.get("files/abc").await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
