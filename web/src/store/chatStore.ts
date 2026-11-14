@@ -3,6 +3,7 @@ import { getSessionMessages, listChatSessions } from '@/api/client';
 import { useStreamStore } from '@/store/streamStore';
 import type { ChatSessionSummary } from '@/api/client';
 import type {
+  BackgroundCard,
   ChatAttachment,
   ChatFrame,
   ChatRole,
@@ -14,6 +15,7 @@ import type {
   TurnTaskRow,
   TurnUsage,
 } from '@/types/events';
+import { NOTICE_MESSAGE_ID_PREFIX } from '@/types/events';
 
 export type { ChatRole };
 
@@ -196,6 +198,13 @@ export interface ChatMessage {
    * 去任务图那同一张表里读回，所以这里不存状态。
    */
   tasks: TurnTaskRow[] | null;
+  /**
+   * 这一条消息上的后台命令卡片，由服务端的 `background` 帧带进来。
+   *
+   * `null` 是「这条消息上没有后台命令」。同一张卡片先到的是「在跑」，跑完时
+   * 被结局那一版盖掉——不是两张卡片：一条命令只有一个句柄，也就只有一张卡。
+   */
+  background: BackgroundCard | null;
   /**
    * 这一句的原文落成的文件。只有超过窗口的那些带它：服务端把原文逐字写进执行器
    * 的一个文件，界面上这一条因此画成附件（带全文长度），而不是把开头当成全部。
@@ -616,6 +625,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 hooks: null,
                 colleagues: null,
                 tasks: null,
+                background: null,
                 attachment: null,
                 files,
                 at,
@@ -679,6 +689,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   hooks: null,
                   colleagues: null,
                   tasks: null,
+                  background: null,
                   attachment: frame.attachment,
                   files: [],
                   at: frame.timestamp,
@@ -686,7 +697,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
               ],
             };
           }
-          if ((frame.role ?? 'assistant') === 'assistant') {
+          // 平台自己说的那条通知（后台命令跑完）同样是一段 assistant 正文，但它
+          // 不在任何一轮里：它不收这一轮的光标，收尾时也就不清别人的。否则一条
+          // 后台命令恰好在回答流到一半时跑完，屏幕上的光标会跟着它提前熄灭。
+          if (
+            (frame.role ?? 'assistant') === 'assistant' &&
+            !frame.messageId.startsWith(NOTICE_MESSAGE_ID_PREFIX)
+          ) {
             session = { ...session, streaming: frame.messageId };
           }
           break;
@@ -715,6 +732,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   hooks: null,
                   colleagues: null,
                   tasks: null,
+                  background: null,
                   attachment: null,
                   files: [],
                   at: frame.timestamp,
@@ -852,6 +870,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           break;
         }
 
+        case 'background': {
+          // 同一张卡片先「在跑」后「结局」：按句柄找现有的那张，再整张换掉。
+          // message_id 是卡片挂在哪一条消息上，不同命令各有各的一条。
+          if (!frame.background) break;
+          session = withMessage(session, frame.messageId, (message) => ({
+            ...message,
+            background: frame.background,
+          }));
+          break;
+        }
+
         case 'usage': {
           // 记在说这句话的那一条上，不另开一行：这一轮花了多少是这条消息的
           // 属性，不是一句新的话。帧排在 `end` 之前，所以它到的时候这一条还
@@ -937,6 +966,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 hooks: null,
                 colleagues: null,
                 tasks: null,
+                background: null,
                 attachment: line.attachment,
                 files: [],
                 at: new Date().toISOString(),
@@ -1056,6 +1086,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             // 读回的历史里也没有这一格：同事消息属于那一轮，不在记录的列里。
             colleagues: null,
             tasks: null,
+            background: null,
             // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
             attachment: null,
             // 记录里有名字与类型：刷新之后仍认得出这句话说过一张图。字节数

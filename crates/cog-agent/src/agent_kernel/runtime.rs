@@ -3194,13 +3194,20 @@ impl AgentRuntime {
                 // says so. It is named around the await rather than passed in:
                 // the handler signature is the same for every native tool, and
                 // only the addressing tools need a caller.
-                let mut call = Box::pin(crate::tools::CALLER_AGENT_ID.scope(
-                    self.config.agent_id.clone(),
-                    self.tools.execute_scoped_streaming(
-                        &tc.name,
-                        tc.arguments.clone(),
-                        scope.as_ref(),
-                        Some(&sink),
+                //
+                // 会话号也一并宣告：后台命令跑完时要用它把通知送回那一段对话，
+                // 而那时这次调用早就结束了。没有会话号的一轮宣告空串——工具那边
+                // 读到的就是「没人说这是哪一段」，不会拿到上一轮的号。
+                let mut call = Box::pin(crate::tools::CALLER_SESSION.scope(
+                    self.call_session.clone().unwrap_or_default(),
+                    crate::tools::CALLER_AGENT_ID.scope(
+                        self.config.agent_id.clone(),
+                        self.tools.execute_scoped_streaming(
+                            &tc.name,
+                            tc.arguments.clone(),
+                            scope.as_ref(),
+                            Some(&sink),
+                        ),
                     ),
                 ));
                 let checked = loop {

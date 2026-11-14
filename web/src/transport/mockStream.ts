@@ -139,6 +139,8 @@ export class MockEventStreamClient {
       // 假流不跟同事说话：演示里没有第二个账号，也没有共享任务图。
       colleague: null,
       tasks: null,
+      // 假流不进后台：演示里的命令都是当场跑完的，没有要回来报的那一条。
+      background: null,
       timestamp: new Date().toISOString(),
     });
   }

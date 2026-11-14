@@ -159,6 +159,7 @@ export type ChatFrameKind =
   | 'mcp'
   | 'hooks'
   | 'tasks'
+  | 'background'
   | 'colleague';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
@@ -205,7 +206,21 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   // 各自的结局。帧里只有派活那一刻就能确定的事；状态由页面拿 id 去任务图那张
   // 同一张表里读回，所以列表上的「谁在做、做到哪」跟着任务图走。
   'message.tasks': 'tasks',
+  // 一条后台命令：交出句柄时是「在跑」，跑完时是结局。它不是这条命令的输出
+  // （输出在 command_output 里按页读），是「你放到后台的那件事现在怎么样了」。
+  'message.background': 'background',
 };
+
+/**
+ * 平台自己说的一句话的消息号前缀：后台命令跑完时那条通知。
+ *
+ * 它同样是一段 assistant 正文，但它不属于任何一轮：写入方是网关的
+ * `publish_background_finished`，那里同样按这个前缀起号。对话账靠它认出
+ * 「这一条不是某一轮正在流的那一份回答」，于是不会把正在流的那一轮的光标
+ * 交给它、再在它收尾时把别人的光标清掉——后台命令跑完的那一刻，往往正是
+ * 人刚问了下一句、回答正在流的时候。
+ */
+export const NOTICE_MESSAGE_ID_PREFIX = 'background-';
 
 /**
  * 一句话是谁说的。
@@ -253,6 +268,8 @@ export interface ChatFrame {
   colleague: ColleagueMessage | null;
   /** 只有 `tasks` 帧带着：这一轮挂上共享任务图的活。 */
   tasks: TurnTaskRow[] | null;
+  /** 只有 `background` 帧带着：一条后台命令的句柄与状态。 */
+  background: BackgroundCard | null;
   /**
    * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
    *
@@ -341,6 +358,25 @@ export interface TurnTaskRow {
   goalId: string | null;
   venue: string | null;
   assignedTo: string | null;
+}
+
+/**
+ * 一条后台命令的卡片。
+ *
+ * 交出句柄那一刻只有 `handle` 与 `state: 'running'`；跑完时同一张卡片带上结局、
+ * 用时与输出末尾。`tail` 是末尾一截，不是全文——全文仍由 `command_output` 分页读，
+ * 把全文塞进帧等于把一份内容发两遍，而屏幕上那张卡片也不需要它。
+ */
+export interface BackgroundCard {
+  handle: string;
+  state: string;
+  exitCode: number | null;
+  error: string | null;
+  elapsedMs: number | null;
+  stdoutBytes: number | null;
+  tail: string;
+  tailTruncated: boolean;
+  summary: string | null;
 }
 
 /** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
@@ -559,6 +595,20 @@ export function normalizeChatFrame(
                     : []
                 )
               : [],
+          }
+        : null,
+    background:
+      kind === 'background' && typeof inner.handle === 'string' && inner.handle
+        ? {
+            handle: inner.handle,
+            state: typeof inner.state === 'string' ? inner.state : 'unknown',
+            exitCode: frameCount(inner.exit_code) ?? null,
+            error: typeof inner.error === 'string' ? inner.error : null,
+            elapsedMs: frameCount(inner.elapsed_ms) ?? null,
+            stdoutBytes: frameCount(inner.stdout_bytes) ?? null,
+            tail: typeof inner.tail === 'string' ? inner.tail : '',
+            tailTruncated: inner.tail_truncated === true,
+            summary: typeof inner.summary === 'string' ? inner.summary : null,
           }
         : null,
     tasks:

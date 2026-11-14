@@ -101,6 +101,26 @@ pub fn caller_agent_id() -> Option<String> {
     CALLER_AGENT_ID.try_with(|id| id.clone()).ok()
 }
 
+tokio::task_local! {
+    /// 这一轮属于哪一段对话。
+    ///
+    /// 与 [`CALLER_AGENT_ID`] 同一个理由、同一个宣告者（运行循环）。工具要它是因为
+    /// 有些事在这一次调用结束之后才有结论：后台命令跑完时，那条通知得找得到当初
+    /// 把它放到后台的那一段对话，而那时工具调用早就不在了。
+    ///
+    /// 空的时候是「没人说这是哪一段」——嵌进别的进程里的运行、或没有会话号的那
+    /// 一轮。不编一个会话号：编出来的那一段对话不存在，通知会落进一个空处。
+    pub static CALLER_SESSION: String;
+}
+
+/// 这一轮所属的对话号，运行时宣告过才有。
+pub fn caller_session() -> Option<String> {
+    CALLER_SESSION
+        .try_with(|id| id.clone())
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// The task id a tool call carries: the scoped task when there is one, and
 /// otherwise the caller's own lane.
 ///
@@ -2023,6 +2043,15 @@ mod tests {
                 }
                 SandboxPayload::Wasm { .. } => {
                     return Err(cog_core::SFError::Agent("unsupported payload".into()));
+                }
+                // 检查点是「那棵工作树」的属性：它由持有文件的那一侧（执行器）
+                // 拍下来，这个进程内的双人替身没有树可拍，说出来而不是答成功。
+                SandboxPayload::CaptureCheckpoint { .. }
+                | SandboxPayload::PlanCheckpoint { .. }
+                | SandboxPayload::RestoreCheckpoint { .. } => {
+                    return Err(cog_core::SFError::Agent(
+                        "LocalShellBackend has no worktree to check point".into(),
+                    ));
                 }
             };
             Ok(result)

@@ -1165,6 +1165,24 @@ async fn pump_events(
                             }
                         }
                     }
+                    // 后台命令的句柄一交出去就发一张卡片：这一刻起它还在跑，
+                    // 而页面要能看见「有这么一条在做」，而不是等它跑完才知道
+                    // 自己曾经起过一条。
+                    Some("run_command_background") if !is_error => {
+                        if let Some(handle) = result.get("handle").and_then(|v| v.as_str()) {
+                            publish_background_card(
+                                &out,
+                                &session_id,
+                                serde_json::json!({
+                                    "message_id": message_id,
+                                    "handle": handle,
+                                    "state": "running",
+                                    "exit_code": serde_json::Value::Null,
+                                    "error": serde_json::Value::Null,
+                                }),
+                            );
+                        }
+                    }
                     Some("get_change") => {
                         let change_id = result
                             .get("change")
@@ -1233,6 +1251,70 @@ async fn emit(
         &inner,
         envelope(session_id, event_type, &inner),
     );
+}
+
+/// 一条后台命令的卡片：哪一条、现在什么状态。起与完各发一次。
+pub fn publish_background_card(
+    out: &crate::chat_stream::ChatStream,
+    session_id: &str,
+    card: serde_json::Value,
+) {
+    out.publish(
+        session_id,
+        "message.background",
+        &card,
+        envelope(session_id, "message.background", &card),
+    );
+}
+
+/// 一条后台命令跑完了：它回到当初起它的那一段对话，作为一条消息加一张卡片。
+///
+/// 说话的是这一段对话里的执行者（`assistant`）：这不是第三个人插进来的一句系统
+/// 提示，而是「你让我放到后台的那件事，我回来告诉你结果」。消息号由句柄推出，
+/// 同一个句柄落地两次也是同一条消息——`finish` 已经只投一次，这是第二道闸。
+pub fn publish_background_finished(
+    out: &crate::chat_stream::ChatStream,
+    session_id: &str,
+    notice: &serde_json::Value,
+) {
+    let handle = notice
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let message_id = format!("background-{handle}");
+    let summary = notice
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("后台命令跑完了。");
+    for (event_type, inner) in [
+        (
+            "message.start",
+            serde_json::json!({
+                "message_id": message_id,
+                "role": "assistant",
+                "attachment": serde_json::Value::Null,
+            }),
+        ),
+        (
+            "message.text_delta",
+            serde_json::json!({ "message_id": message_id, "delta": summary }),
+        ),
+        (
+            "message.end",
+            serde_json::json!({ "message_id": message_id }),
+        ),
+    ] {
+        out.publish(
+            session_id,
+            event_type,
+            &inner,
+            envelope(session_id, event_type, &inner),
+        );
+    }
+    // 卡片挂在刚刚说的那一句上：同一个消息号，界面才知道这张卡说的是谁。
+    let mut card = notice.clone();
+    card["message_id"] = serde_json::json!(message_id);
+    publish_background_card(out, session_id, card);
 }
 
 async fn emit_message_start(

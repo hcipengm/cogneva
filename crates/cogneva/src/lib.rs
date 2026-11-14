@@ -381,6 +381,42 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|e| e.into_inner()) = llm;
     }
 
+    // 后台命令跑完时要回到它那一段对话。句柄簿在 cog-agent 里（工具自己那一侧），
+    // 帧的投递在网关里（哪一条连接在看哪一段）；装配层是唯一同时握着两样的地方，
+    // 所以这条转发只写在这里——写进任何一侧都要让那一侧去够另一侧的东西。
+    if let Some(gateway_state) = ctx.consume::<cog_gateway::GatewayState>() {
+        let mut finished = cog_agent::background::subscribe();
+        let stream = gateway_state.chat_stream.clone();
+        tokio::spawn(async move {
+            loop {
+                match finished.recv().await {
+                    Ok(done) => {
+                        // 不知道属于哪一段的命令（嵌进别的进程里的运行）不投给
+                        // 任何一段：猜一段等于把一条通知发给不相关的人。
+                        let Some(session) = done.session.as_deref() else {
+                            continue;
+                        };
+                        cog_gateway::chat::publish_background_finished(
+                            &stream,
+                            session,
+                            &done.notice,
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // 慢到被环挤掉：那几条命令的通知不再补发。它们的输出仍
+                        // 在句柄簿里，用 command_output 读得到；这里说出来，是
+                        // 因为「少了一条消息」与「那条命令没跑完」在屏幕上同形。
+                        tracing::warn!(
+                            skipped,
+                            "background completion notices fell behind; those commands' notices are not re-sent"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
     daemon.ready();
 
     // Spawn config hot-reload consumer (direct orchestration, not a plugin)

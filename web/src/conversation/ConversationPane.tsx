@@ -23,6 +23,7 @@ import {
 import { useMemoryStore } from '@/store/memoryStore';
 import { useShell } from '@/shell/store';
 import type {
+  BackgroundCard,
   ColleagueMessage,
   ContextCompaction,
   HookReading,
@@ -236,6 +237,53 @@ function boundaryColor(state: string): string {
     default:
       return 'var(--muted)';
   }
+}
+
+/**
+ * 一条后台命令的卡片：在跑、结束了、还是没跑成。
+ *
+ * 它画的不是命令的输出——输出在 `command_output` 里按页读，全文放进这条消息
+ * 只会把对话挤走。卡片回答的是另一件事：你放到后台的那条现在怎么样了，落在
+ * 哪一根句柄上，结束了多久、退出码是多少，末尾印了什么。
+ */
+function BackgroundCardView({ card }: { card: BackgroundCard }) {
+  const tone =
+    card.state === 'running'
+      ? 'var(--brass)'
+      : card.state === 'failed'
+        ? 'var(--danger)'
+        : 'var(--ok)';
+  const word =
+    card.state === 'running'
+      ? '在跑'
+      : card.state === 'exited'
+        ? `结束（退出码 ${card.exitCode ?? '?'}）`
+        : card.state === 'failed'
+          ? `没跑成${card.error ? `：${card.error}` : ''}`
+          : card.state;
+  const spent =
+    card.elapsedMs !== null && card.state !== 'running'
+      ? `，用时 ${(card.elapsedMs / 1000).toFixed(1)} 秒`
+      : '';
+  const readBack =
+    card.state === 'running'
+      ? '；用 command_output 看已有输出'
+      : `；输出 ${card.stdoutBytes ?? 0} 字节，用 command_output 读全文`;
+  return (
+    <div className="mt-1 border-l pl-2 text-[11px]" style={{ borderColor: tone }}>
+      <p className="mono">
+        后台命令 <span style={{ color: 'var(--paper)' }}>{card.handle}</span> ——{' '}
+        <span style={{ color: tone }}>{word}</span>
+        {spent}
+        {readBack}
+      </p>
+      {card.tail && (
+        <pre className="mono mt-1 max-h-32 overflow-auto whitespace-pre-wrap text-[10px] text-[var(--muted)]">
+          {card.tailTruncated ? `…${card.tail}` : card.tail}
+        </pre>
+      )}
+    </div>
+  );
 }
 
 /**
@@ -650,6 +698,12 @@ function Turn({ message }: { message: ChatMessage }) {
       {message.role === 'assistant' && message.tasks && message.tasks.length > 0 && (
         <TurnTasks rows={message.tasks} />
       )}
+
+      {/*
+        一条后台命令现在怎么样了。先到的是「在跑」，跑完时同一张卡片换成结局：
+        这两个时刻读的人想知道的事不一样，画成两句话而不是一张卡片的两次出现。
+      */}
+      {message.background && <BackgroundCardView card={message.background} />}
 
       {/*
         这一轮花了多少。只有服务端真的量到了才有一行：读回的历史与被叫停的那
