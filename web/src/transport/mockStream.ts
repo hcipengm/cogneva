@@ -104,6 +104,8 @@ export class MockEventStreamClient {
       compaction: null,
       // 假流不读约定：演示里没有谁写过一句要跨轮生效的话。
       memory: null,
+      // 假流不挂外部服务：演示里的工具表就是这个进程里那一张。
+      mcp: null,
       // 假流不落文件：演示里的每一句都远在窗口之内，没有附件这回事。
       attachment: null,
       timestamp: new Date().toISOString(),

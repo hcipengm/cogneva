@@ -155,7 +155,8 @@ export type ChatFrameKind =
   | 'identity'
   | 'usage'
   | 'compaction'
-  | 'memory';
+  | 'memory'
+  | 'mcp';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -188,6 +189,9 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   // 前提下说出来的」，不是一句新的话。没有读面的部署根本不发这一帧，所以它的
   // 出现本身就说明这个平台在读约定。
   'message.memory': 'memory',
+  // 这一轮的外部 MCP 服务：挂了没有、连上没有、问到几只工具。没有端点的部署
+  // 不发这一帧；它的出现说明这个平台挂了外部服务。
+  'message.mcp': 'mcp',
 };
 
 /**
@@ -228,6 +232,8 @@ export interface ChatFrame {
   compaction: ContextCompaction | null;
   /** 只有 `memory` 帧带着：这一轮读进了哪几句属主约定。 */
   memory: LoadedMemory[] | null;
+  /** 只有 `mcp` 帧带着：这一轮的外部 MCP 服务与它提供了几只工具。 */
+  mcp: McpListing | null;
   /**
    * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
    *
@@ -242,6 +248,13 @@ export interface ChatFrame {
 export interface LoadedMemory {
   id: string;
   text: string;
+}
+
+/** 这一轮的外部 MCP 服务：连上没有、问到哪些工具、连不上时为什么。 */
+export interface McpListing {
+  reachable: boolean;
+  tools: string[];
+  error: string | null;
 }
 
 /** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
@@ -420,6 +433,18 @@ export function normalizeChatFrame(
                 : []
             )
           : []
+        : null,
+    mcp:
+      kind === 'mcp'
+        ? {
+            reachable: inner.reachable === true,
+            tools: Array.isArray(inner.tools)
+              ? (inner.tools as unknown[]).flatMap((name) =>
+                  typeof name === 'string' ? [name] : []
+                )
+              : [],
+            error: typeof inner.error === 'string' ? inner.error : null,
+          }
         : null,
     compaction:
       kind === 'compaction'

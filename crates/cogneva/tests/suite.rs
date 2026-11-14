@@ -159,6 +159,8 @@ mod agent_wrapper_test;
 mod an_employee_can_search_and_commit_test;
 #[path = "an_employee_works_in_its_own_checkout_test.rs"]
 mod an_employee_works_in_its_own_checkout_test;
+#[path = "an_external_mcp_server_s_tools_reach_the_turn_test.rs"]
+mod an_external_mcp_server_s_tools_reach_the_turn_test;
 #[path = "an_identifier_is_quoted_in_one_place_test.rs"]
 mod an_identifier_is_quoted_in_one_place_test;
 #[path = "an_occupied_id_is_not_work_in_hand_test.rs"]

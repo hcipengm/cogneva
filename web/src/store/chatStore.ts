@@ -8,6 +8,7 @@ import type {
   ChatRole,
   ContextCompaction,
   LoadedMemory,
+  McpListing,
   TurnUsage,
 } from '@/types/events';
 
@@ -65,6 +66,8 @@ export interface ChatMessage {
    * 界面上因此不画这一行，而不是写「加载了 0 条」。
    */
   memory: LoadedMemory[] | null;
+  /** 这一轮的外部 MCP 服务，由服务端的 `mcp` 帧带进来；`null` 是没挂外部服务。 */
+  mcp: McpListing | null;
   /**
    * 这一句的原文落成的文件。只有超过窗口的那些带它：服务端把原文逐字写进执行器
    * 的一个文件，界面上这一条因此画成附件（带全文长度），而不是把开头当成全部。
@@ -417,6 +420,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 usage: null,
                 compaction: null,
                 memory: null,
+                mcp: null,
                 attachment: null,
                 files,
                 at,
@@ -476,6 +480,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   usage: null,
                   compaction: null,
                   memory: null,
+                  mcp: null,
                   attachment: frame.attachment,
                   files: [],
                   at: frame.timestamp,
@@ -508,6 +513,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   usage: null,
                   compaction: null,
                   memory: null,
+                  mcp: null,
                   attachment: null,
                   files: [],
                   at: frame.timestamp,
@@ -597,6 +603,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
           session = withMessage(session, frame.messageId, (message) => ({
             ...message,
             memory,
+          }));
+          break;
+        }
+
+        case 'mcp': {
+          if (!frame.mcp) break;
+          const mcp = frame.mcp;
+          session = withMessage(session, frame.messageId, (message) => ({
+            ...message,
+            mcp,
           }));
           break;
         }
@@ -700,6 +716,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             compaction: null,
             // 读回的历史里也没有这一格：约定是那一轮开头读的，不是这条消息的属性。
             memory: null,
+            // 外部服务那一格同理：它说的是那一轮开头问了什么，不是这句话的属性。
+            mcp: null,
             // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
             attachment: null,
             // 记录里有名字与类型：刷新之后仍认得出这句话说过一张图。字节数

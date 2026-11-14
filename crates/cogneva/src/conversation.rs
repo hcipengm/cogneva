@@ -298,6 +298,9 @@ pub struct PlatformConversation {
     /// 发布；没装的进程照实缺席，而不是把「这里没有能拍板的东西」说成「没有
     /// 待批的变更」——那两个读数要做的事相反。
     evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
+    /// 外部 MCP 服务：它的工具还没进过任何一张工具表，这一轮把它们装进来。
+    /// 没有端点的部署就是 `None`，界面据此如实说「没挂外部服务」。
+    mcp: Option<Arc<dyn cog_core::McpClient>>,
     /// 外部价值判定的落盘面：属主就「什么算好」说的一句话，原样记进账。
     ///
     /// 与上面那几件同一类可选能力——没有装的进程照实缺席，工具会说「记不下来」，
@@ -323,6 +326,7 @@ impl PlatformConversation {
         principles: Option<Arc<dyn cog_core::RuntimePrincipleStore>>,
         evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
         taste: Option<Arc<dyn cog_core::TasteIntentSink>>,
+        mcp: Option<Arc<dyn cog_core::McpClient>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -336,6 +340,7 @@ impl PlatformConversation {
             principles,
             evolution,
             taste,
+            mcp,
         }
     }
 }
@@ -681,6 +686,20 @@ impl ConversationTurn for PlatformConversation {
             ) {
                 tools.register(tool);
             }
+            // 外部 MCP 服务：这一轮问一次它有哪些工具，逐只装进来。每轮问一次
+            // 而不是启动时缓存：远端那张表是会变的，缓存一份等于把「今天有
+            // 什么」钉在进程启动的那一刻。问不到时就一只也没有——这一轮如实
+            // 少掉它们，而不是拿昨天的表冒充今天的。
+            let mcp_report = match self.mcp.as_ref() {
+                Some(client) => {
+                    let listed = crate::mcp_tools::tools(Arc::clone(client)).await;
+                    for tool in &listed.tools {
+                        tools.register(tool.clone());
+                    }
+                    Some(listed.report())
+                }
+                None => None,
+            };
             // 名册上「它能做什么」就是这一轮手上真有的工具，不是一段标签。
             // 这里曾经填的是它自己的 id：能力字段里装着一个名字，读名册的人
             // 看到的是「mira 的能力是 mira」，按能力找人的那一步什么也筛不出来。
@@ -783,9 +802,17 @@ impl ConversationTurn for PlatformConversation {
                 None => None,
             };
 
-            let answer = runtime
+            let mut answer = runtime
                 .run_conversation(history, request.llm.as_ref())
                 .await;
+            // 挂没挂外部服务、这一次连上没有、问到了几只工具：随这一轮的交付物
+            // 一起回去。没有端点的部署没有这一格，界面上也就没有这一行——「没挂」
+            // 与「挂了但连不上」是两句不同的话。
+            if let (Some(report), Ok(value)) = (mcp_report, answer.as_mut()) {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("mcp".to_string(), report);
+                }
+            }
 
             // 说完就下线：名下没有常驻进程，名册上留着一条过期的记录只会让同事
             // 以为它还醒着。

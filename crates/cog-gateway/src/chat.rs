@@ -1240,6 +1240,41 @@ async fn emit_turn_memory(
     .await;
 }
 
+/// 这一轮的外部 MCP 服务：挂了没有、连上没有、问到几只工具。
+///
+/// 没有端点的部署根本不会有 `mcp` 这一格，于是也不会有这一帧——「没挂外部服务」
+/// 与「挂了但连不上」在屏幕上必须分得开，后者的下一步是去查那台服务，前者是去
+/// 配一个端点。
+async fn emit_turn_mcp(
+    out: &mpsc::Sender<String>,
+    session_id: &str,
+    message_id: &str,
+    mcp: Option<&serde_json::Value>,
+) {
+    let Some(mcp) = mcp else { return };
+    let tools: Vec<String> = mcp
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    emit(
+        out,
+        session_id,
+        "message.mcp",
+        serde_json::json!({
+            "message_id": message_id,
+            "reachable": mcp.get("reachable").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            "tools": tools,
+            "error": mcp.get("error").and_then(serde_json::Value::as_str),
+        }),
+    )
+    .await;
+}
+
 /// 这一段会话到目前为止花了多少：账本按会话那一列折叠出来的那一份。
 ///
 /// 三种答案在屏幕上必须分得开：账本没接（`readable: false`）、这一段还没有行
@@ -1998,6 +2033,12 @@ pub async fn run_chat_turn(
         .ok()
         .and_then(|value| value.get("usage"))
         .cloned();
+    // 这一轮的外部 MCP 服务：只有这一轮挂了客户端才有这一格。
+    let turn_mcp = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("mcp"))
+        .cloned();
     // 这一轮读进了哪几句属主约定：只有这一轮挂了读面才有这一格。
     let turn_memory = outcome
         .as_ref()
@@ -2122,6 +2163,7 @@ pub async fn run_chat_turn(
     // 6. 这一轮的现场：上下文挤掉了什么、花了多少。都排在收尾帧之前，因为界面
     //    把它们画在这一条消息下面——收尾帧一到，这一条就定稿了。压缩在前：
     //    它说的是这一轮模型手上少看到了什么，读的人先知道这件事再读花销。
+    emit_turn_mcp(&out, &session_id, &assistant_mid, turn_mcp.as_ref()).await;
     emit_turn_memory(&out, &session_id, &assistant_mid, turn_memory.as_ref()).await;
     emit_turn_compaction(&out, &session_id, &assistant_mid, turn_compaction.as_ref()).await;
     emit_turn_usage(

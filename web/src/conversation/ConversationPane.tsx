@@ -421,6 +421,20 @@ function Turn({ message }: { message: ChatMessage }) {
       )}
 
       {/*
+        这一轮的外部 MCP 服务。连不上时把原因写出来：那一步的动作是去查那台
+        服务，而屏幕上只留「没有这一帧」的话，读的人分不出「没挂」与「断了」。
+      */}
+      {message.role === 'assistant' && message.mcp && (
+        <p className="mono mt-1 text-[10px] text-[var(--muted)]">
+          {message.mcp.reachable
+            ? `外部 MCP 提供 ${message.mcp.tools.length} 只工具${
+                message.mcp.tools.length > 0 ? `：${message.mcp.tools.join('、')}` : ''
+              }`
+            : `外部 MCP 连不上${message.mcp.error ? `：${message.mcp.error}` : ''}`}
+        </p>
+      )}
+
+      {/*
         这一轮花了多少。只有服务端真的量到了才有一行：读回的历史与被叫停的那
         一轮没有这一格，那时屏幕上什么也不写，而不是写一排零。
       */}
