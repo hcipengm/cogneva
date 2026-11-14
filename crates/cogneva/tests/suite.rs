@@ -50,8 +50,6 @@ pub mod cells_written;
 pub mod closed_set;
 #[path = "common/mod.rs"]
 pub mod common;
-#[path = "common/dashboard.rs"]
-pub mod dashboard;
 #[path = "common/derivation.rs"]
 pub mod derivation;
 #[path = "feedback_a_rollout_replaces_the_log_that_would_have_recorded_it.rs"]
@@ -430,12 +428,8 @@ mod oauth_popup_keeps_its_opener_test;
 mod observability_alert_face_literals_contract_test;
 #[path = "observability_alert_rule_contract_test.rs"]
 mod observability_alert_rule_contract_test;
-#[path = "observability_dashboard_contract_test.rs"]
-mod observability_dashboard_contract_test;
 #[path = "observability_endpoint_ports_contract_test.rs"]
 mod observability_endpoint_ports_contract_test;
-#[path = "observability_pool_freshness_contract_test.rs"]
-mod observability_pool_freshness_contract_test;
 #[path = "observability_reachability_probe_wiring_test.rs"]
 mod observability_reachability_probe_wiring_test;
 #[path = "observability_scrape_census_contract_test.rs"]

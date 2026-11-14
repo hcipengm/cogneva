@@ -46,7 +46,6 @@ use cog_gateway::security_gateway::{RangeReadBaseline, RANGE_READ_BASELINES};
 
 use crate::cells_written;
 use crate::closed_set;
-use crate::dashboard;
 use crate::derivation;
 use crate::producer;
 use crate::promql;
@@ -5461,7 +5460,6 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         .iter()
         .flat_map(|(_, promql)| metric_names_in(promql))
         .collect();
-    let panel_read = dashboard::series();
 
     // A histogram is published under its base name and read under one of the
     // recording suffixes, and the closed set holds the base name -- so a reader
@@ -5529,7 +5527,7 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
     let read_but_listed: Vec<&str> = UNREAD
         .iter()
         .map(|(n, _)| *n)
-        .filter(|n| read(&rule_read, n) || read(&panel_read, n))
+        .filter(|n| read(&rule_read, n))
         .collect();
     assert!(
         read_but_listed.is_empty(),
@@ -5562,7 +5560,7 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
     // whose reason named a rule that reads neither series they exempted. A
     // series name is either one a face reads or it is not, so the same claim
     // written this way cannot be made without being true.
-    let any_read: BTreeSet<String> = rule_read.union(&panel_read).cloned().collect();
+    let any_read: BTreeSet<String> = rule_read.clone();
     let unresolved: Vec<String> = UNREAD
         .iter()
         .flat_map(|(name, verdict)| match verdict {
@@ -5603,7 +5601,6 @@ fn an_elsewhere_entry_that_names_a_reader_no_rule_has_is_reported() {
     let any_read: BTreeSet<String> = shipped_rules()
         .iter()
         .flat_map(|(_, promql)| metric_names_in(promql))
-        .chain(dashboard::series())
         .collect();
 
     // A published name nothing reads: the claim the false entries made, in the
