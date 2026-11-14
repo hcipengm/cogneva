@@ -743,7 +743,19 @@ impl ConversationTurn for PlatformConversation {
                 None => Vec::new(),
             };
             let hook_runs = Arc::new(cog_agent::hooks::guard::Runs::default());
-            if let Some(engine) = self.hooks.as_ref() {
+            // 这一轮真的发给了哪些同事、每一条的结局。工具路径（`send_to_agent`）
+            // 发出去的话在发起方这一侧只剩一行日志，人翻不到；收在这里随交付物
+            // 回去，界面上才有「谁发给谁、说了什么、结局如何」这一行。
+            //
+            // 挂在 `after_tool_call` 而不是工具自己身上：工具拿不到「这一段对话」
+            // 这个概念——它只知道收件人地址；而这一轮把哪只工具跑成什么样，循环
+            // 已经在这里交出来了，包括被拒的那一次（`Err`）。
+            let colleague_messages: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            // 人就只能离开这段对话去工作台找「我刚让它办的那件事」，而两处读的本来
+            // 就是同一张表（`get_all_tasks`），没有第二个出处可言。
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+            {
                 let rules = cog_agent::hooks::guard::rules(&hook_defs);
                 let guard = if rules.is_empty() {
                     None
@@ -753,21 +765,24 @@ impl ConversationTurn for PlatformConversation {
                         Arc::clone(&hook_runs),
                     ))
                 };
-                let before_engine = Arc::clone(engine);
-                let after_engine = Arc::clone(engine);
+                let before_engine = self.hooks.clone();
+                let after_engine = self.hooks.clone();
+                let after_log = Arc::clone(&colleague_messages);
                 runtime = runtime.with_hooks(cog_agent::AgentHooks {
                     before_tool_call: Some(Arc::new(
                         move |tool: &str, arguments: &mut serde_json::Value| {
                             // 观测型钩子（log / notify / webhook）也要看见这次
                             // 调用：事件先发出去，判定再回答。两件事的顺序不
                             // 影响结果，但先发出去意味着被拒的调用也在账上。
-                            before_engine.emit_detached(
-                                cog_core::HookEvent::new(cog_core::HookTrigger::OnToolBefore)
-                                    .with_payload(serde_json::json!({
-                                        "tool": tool,
-                                        "arguments": arguments.clone(),
-                                    })),
-                            );
+                            if let Some(engine) = before_engine.as_ref() {
+                                engine.emit_detached(
+                                    cog_core::HookEvent::new(cog_core::HookTrigger::OnToolBefore)
+                                        .with_payload(serde_json::json!({
+                                            "tool": tool,
+                                            "arguments": arguments.clone(),
+                                        })),
+                                );
+                            }
                             match guard.as_ref() {
                                 Some(guard) => guard(tool, arguments),
                                 None => Ok(()),
@@ -778,14 +793,23 @@ impl ConversationTurn for PlatformConversation {
                         move |tool: &str,
                               arguments: &serde_json::Value,
                               result: &SFResult<serde_json::Value>| {
-                            after_engine.emit_detached(
-                                cog_core::HookEvent::new(cog_core::HookTrigger::OnToolAfter)
-                                    .with_payload(serde_json::json!({
-                                        "tool": tool,
-                                        "arguments": arguments,
-                                        "ok": result.is_ok(),
-                                    })),
-                            );
+                            if let Some(engine) = after_engine.as_ref() {
+                                engine.emit_detached(
+                                    cog_core::HookEvent::new(cog_core::HookTrigger::OnToolAfter)
+                                        .with_payload(serde_json::json!({
+                                            "tool": tool,
+                                            "arguments": arguments,
+                                            "ok": result.is_ok(),
+                                        })),
+                                );
+                            }
+                            if tool == "send_to_agent" {
+                                let record = colleague_message(arguments, result);
+                                match after_log.lock() {
+                                    Ok(mut log) => log.push(record),
+                                    Err(poisoned) => poisoned.into_inner().push(record),
+                                }
+                            }
                         },
                     )),
                     transform_context: None,
@@ -890,6 +914,19 @@ impl ConversationTurn for PlatformConversation {
                         "hooks".to_string(),
                         cog_agent::hooks::guard::report(&hook_defs, &hook_runs),
                     );
+                }
+            }
+            // 这一轮发给同事的每一条。只在真发过时挂这一格：没有它，界面上就是
+            // 「这一轮没跟同事说过话」，而不是「这个平台不做这件事」。
+            if let Ok(value) = answer.as_mut() {
+                if let Some(object) = value.as_object_mut() {
+                    let sent = match colleague_messages.lock() {
+                        Ok(mut log) => std::mem::take(&mut *log),
+                        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+                    };
+                    if !sent.is_empty() {
+                        object.insert("colleagues".to_string(), serde_json::Value::Array(sent));
+                    }
                 }
             }
 
@@ -3386,6 +3423,66 @@ mod tests {
         );
     }
 
+    /// 发给同事的一条话，写成界面上那一行要的全部事实。
+    ///
+    /// 三种结局必须分得开：等到了回信（`replied` 真、`reply` 有）、发出去了
+    /// 但没等/没等到（`reason` 说明为什么不等于做完了）、根本没发出去
+    /// （`delivered` 假、`error` 有原因）。把缺席读成假值，界面上就会把
+    /// 「没问」画成「问了没答」。
+    #[test]
+    fn a_message_sent_to_a_colleague_carries_its_outcome() {
+        let args = serde_json::json!({
+            "agent_id": "mira",
+            "kind": "prompt",
+            "message": "查一下昨晚那次发布为什么红了",
+        });
+
+        let replied = colleague_message(
+            &args,
+            &Ok(serde_json::json!({
+                "delivered": true,
+                "replied": true,
+                "reply": "是配置少了一行",
+            })),
+        );
+        assert_eq!(replied["to"], "mira");
+        assert_eq!(replied["kind"], "prompt");
+        assert_eq!(replied["content"], "查一下昨晚那次发布为什么红了");
+        assert_eq!(replied["delivered"], true);
+        assert_eq!(replied["replied"], true);
+        assert_eq!(replied["reply"], "是配置少了一行");
+
+        let timed_out = colleague_message(
+            &args,
+            &Ok(serde_json::json!({
+                "delivered": true,
+                "replied": false,
+                "reason": "timeout",
+                "hint": "它可能还在跑",
+            })),
+        );
+        assert_eq!(timed_out["replied"], false);
+        assert_eq!(timed_out["reason"], "timeout");
+        assert_eq!(timed_out["hint"], "它可能还在跑");
+
+        let refused = colleague_message(
+            &args,
+            &Err(cog_core::SFError::Agent(
+                "no live agent named \"mira\"".to_string(),
+            )),
+        );
+        assert_eq!(refused["delivered"], false);
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("no live agent")),
+            "没发出去的那一条要有原因：{refused}"
+        );
+    }
+
+    /// 挂上任务图的一行，只写那一刻就已确定的事实：哪一行、什么活（第一行）、
+    /// 派给谁、属于哪个 goal。状态不在这里——它是任务图随时间的读数。
+    #[test]
     /// 同事发来的话怎么进这一轮的历史。
     ///
     /// 一条 prompt 就是一句话；continue 与 steering 是同一件事的两种口吻，都

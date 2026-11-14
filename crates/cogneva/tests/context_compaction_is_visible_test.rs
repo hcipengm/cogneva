@@ -109,9 +109,11 @@ fn the_gateway_sends_the_record_as_its_own_frame() {
     let compaction_at = chat
         .find("emit_turn_compaction(&out,")
         .expect("不再在一轮里发送压缩帧");
-    let tail: String = chat[compaction_at..].chars().take(600).collect();
+    // 下一个收尾帧就是这一条的收尾：两者之间还能夹几条别的读数（同事消息、
+    // 任务列表），只要排在那之前就行。
+    let tail = &chat[compaction_at..];
     assert!(
-        tail.contains("emit_message_end("),
+        tail.find("emit_message_end(").is_some(),
         "{CHAT} 这一帧排在收尾帧之后：界面收到时这一条已经定稿，画不上去了"
     );
 }

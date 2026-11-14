@@ -241,6 +241,8 @@ mod collaboration_roundtable_integration_test;
 mod collaboration_roundtable_test;
 #[path = "collaboration_self_review_test.rs"]
 mod collaboration_self_review_test;
+#[path = "colleague_messages_are_visible_in_the_turn_test.rs"]
+mod colleague_messages_are_visible_in_the_turn_test;
 #[path = "complete_options_are_mapped_once_test.rs"]
 mod complete_options_are_mapped_once_test;
 #[path = "composer_takes_more_than_one_line_test.rs"]

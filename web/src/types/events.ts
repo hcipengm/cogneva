@@ -157,7 +157,8 @@ export type ChatFrameKind =
   | 'compaction'
   | 'memory'
   | 'mcp'
-  | 'hooks';
+  | 'hooks'
+  | 'colleague';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -196,6 +197,9 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   // 这一轮属主配了哪些钩子、哪几条真的跑过。没有钩子表的部署不发这一帧；
   // 它出现说明这个平台在按配置判定与通知，而不只是把配置存着。
   'message.hooks': 'hooks',
+  // 这一轮里模型往某个同事的收件箱发了一条话。一条消息一帧，各自带收件人与
+  // 结局：合计数回答不了「发给他那条到底回没回」。只有真发过才有这一帧。
+  'message.colleague': 'colleague',
 };
 
 /**
@@ -240,6 +244,8 @@ export interface ChatFrame {
   mcp: McpListing | null;
   /** 只有 `hooks` 帧带着：这一轮配了哪些钩子、哪几条跑过。 */
   hooks: HookReading | null;
+  /** 只有 `colleague` 帧带着：这一轮发给某位同事的一条话。 */
+  colleague: ColleagueMessage | null;
   /**
    * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
    *
@@ -292,6 +298,28 @@ export interface HookReading {
   ran: HookRun[];
 }
 
+/**
+ * 这一轮发给某位同事的一条话，以及它的结局。
+ *
+ * `delivered` 是「已经发布进收件人的收件箱」，`replied` 是「等到了回信」——
+ * 两件事分开：发出去了不保证回了。`reason` 是没等到回信时的那一句，
+ * `timeout` 只说「没在时限内答」，不是「对方没做完」；`hint` 是服务端对这一句
+ * 的解释，界面照搬，不另编。`error` 有值时这条根本没发出去（收件人不在名册上、
+ * 名册读不出来），它的动作是去查那个名字，不是再发一遍。
+ */
+export interface ColleagueMessage {
+  to: string;
+  /** `prompt` / `steering` / `continue`。 */
+  sentAs: string;
+  content: string;
+  delivered: boolean;
+  /** `null` 是「没等回信」，不是「等了没回」。 */
+  replied: boolean | null;
+  reply: string | null;
+  reason: string | null;
+  hint: string | null;
+  error: string | null;
+}
 /** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
 export interface ChatAttachment {
   path: string;
@@ -508,6 +536,20 @@ export function normalizeChatFrame(
                     : []
                 )
               : [],
+          }
+        : null,
+    colleague:
+      kind === 'colleague'
+        ? {
+            to: typeof inner.to === 'string' ? inner.to : '',
+            sentAs: typeof inner.sent_as === 'string' ? inner.sent_as : '',
+            content: typeof inner.content === 'string' ? inner.content : '',
+            delivered: inner.delivered === true,
+            replied: typeof inner.replied === 'boolean' ? inner.replied : null,
+            reply: typeof inner.reply === 'string' ? inner.reply : null,
+            reason: typeof inner.reason === 'string' ? inner.reason : null,
+            hint: typeof inner.hint === 'string' ? inner.hint : null,
+            error: typeof inner.error === 'string' ? inner.error : null,
           }
         : null,
     compaction:

@@ -1275,6 +1275,54 @@ async fn emit_turn_mcp(
     .await;
 }
 
+/// 这一轮发给同事的每一条消息：谁发给谁、说了什么、结局如何。
+///
+/// 一条消息一帧，不折成一行汇总：每一条有自己的收件人与结局，「发了三条、两条
+/// 等到回信」这样的合计数回答不了「发给他那条到底回没回」。只有这一轮真的往某个
+/// 同事的收件箱里写过东西时装配层才挂这一格，所以帧的出现本身就说明这一段对话
+/// 跟别的智能体说过话——不必去翻通信面板或日志。
+async fn emit_turn_colleagues(
+    out: &mpsc::Sender<String>,
+    session_id: &str,
+    message_id: &str,
+    colleagues: Option<&serde_json::Value>,
+) {
+    let Some(rows) = colleagues.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for row in rows {
+        let at = |key: &str| row.get(key).cloned().unwrap_or(serde_json::Value::Null);
+        // 回信是对方那一轮的结果，形状由对方定（一句话，也可能是一段结构）。
+        // 界面上这一行要读的是一句话，所以在帧上先摊平；结构与原文都还在
+        // 收件方那边，这里抄一份它不是这一帧的职责。
+        let reply = match at("reply") {
+            serde_json::Value::Null => serde_json::Value::Null,
+            serde_json::Value::String(text) => serde_json::Value::String(text),
+            other => serde_json::Value::String(other.to_string()),
+        };
+        emit(
+            out,
+            session_id,
+            "message.colleague",
+            serde_json::json!({
+                "message_id": message_id,
+                "to": at("to"),
+                // 发出去的方式（prompt / steering / continue）。不叫 `kind`：
+                // 那一格已经被帧类型占着，同名会让读帧的一侧把它当帧类型。
+                "sent_as": at("kind"),
+                "content": at("content"),
+                "delivered": at("delivered"),
+                "replied": at("replied"),
+                "reply": reply,
+                "reason": at("reason"),
+                "hint": at("hint"),
+                "error": at("error"),
+            }),
+        )
+        .await;
+    }
+}
+
 /// 属主配了哪些钩子、这一轮哪几条真的跑过。
 ///
 /// 「配了」与「跑过」在同一帧里：只有配置清单的时候，一条从没命中的钩子与
@@ -2089,6 +2137,12 @@ pub async fn run_chat_turn(
         .ok()
         .and_then(|value| value.get("compaction"))
         .cloned();
+    // 这一轮发给同事的每一条：装配层只在真发过时挂这一格。
+    let turn_colleagues = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("colleagues"))
+        .cloned();
     let mut reply = journal.reply;
     let mut failure: Option<String> = None;
     match outcome {
@@ -2205,6 +2259,7 @@ pub async fn run_chat_turn(
     emit_turn_memory(&out, &session_id, &assistant_mid, turn_memory.as_ref()).await;
     emit_turn_hooks(&out, &session_id, &assistant_mid, turn_hooks.as_ref()).await;
     emit_turn_compaction(&out, &session_id, &assistant_mid, turn_compaction.as_ref()).await;
+    emit_turn_colleagues(&out, &session_id, &assistant_mid, turn_colleagues.as_ref()).await;
     emit_turn_usage(
         state.llm_usage.as_deref(),
         &out,
@@ -3929,5 +3984,79 @@ mod tests {
             TurnOutcome::Finished(value) => assert_eq!(value, 7),
             TurnOutcome::Stopped => panic!("已经答完的一轮被读成了被停"),
         }
+    }
+
+    /// 发给同事的每一条消息各自一帧，各自带收件人与结局。
+    ///
+    /// 一条消息一帧而不是一行汇总：合计数回答不了「发给他那条到底回没回」。
+    /// 「发了但没等回信」「等了但超时」「根本没发出去」是三种不同的结局，
+    /// 帧上必须分得开——第一种没有 `replied`，第二种有 `reason`，第三种有
+    /// `error` 且 `delivered` 是假。
+    #[tokio::test]
+    async fn each_message_to_a_colleague_is_one_frame_with_its_own_outcome() {
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let sent = serde_json::json!([
+            {
+                "to": "mira", "kind": "prompt", "content": "查一下构建",
+                "delivered": true, "replied": true, "reply": "绿了",
+                "reason": serde_json::Value::Null, "hint": serde_json::Value::Null
+            },
+            {
+                "to": "sol", "kind": "steering", "content": "换个方向",
+                "delivered": true, "replied": false, "reply": serde_json::Value::Null,
+                "reason": "timeout", "hint": "它可能还在跑"
+            },
+            {
+                "to": "nobody", "kind": "prompt", "content": "发不出去",
+                "delivered": false, "error": "no live agent named \"nobody\""
+            }
+        ]);
+
+        emit_turn_colleagues(&out_tx, "s1", "m-1", Some(&sent)).await;
+
+        let mut frames = Vec::new();
+        while let Ok(frame) = out_rx.try_recv() {
+            frames.push(frame);
+        }
+        assert_eq!(
+            frames.len(),
+            3,
+            "三条消息要发三帧（合起来一帧读不出每一条的结局）：{frames:?}"
+        );
+        assert!(frames[0].contains("\"message.colleague\""), "{}", frames[0]);
+        assert!(frames[0].contains("\"to\":\"mira\""), "{}", frames[0]);
+        assert!(
+            frames[0].contains("\"sent_as\":\"prompt\""),
+            "{}",
+            frames[0]
+        );
+        assert!(frames[0].contains("\"replied\":true"), "{}", frames[0]);
+        assert!(
+            frames[1].contains("\"reason\":\"timeout\""),
+            "{}",
+            frames[1]
+        );
+        assert!(
+            frames[1].contains("\"hint\":\"它可能还在跑\""),
+            "{}",
+            frames[1]
+        );
+        assert!(frames[2].contains("\"delivered\":false"), "{}", frames[2]);
+        assert!(
+            frames[2].contains("\"error\":\"no live agent named"),
+            "{}",
+            frames[2]
+        );
+    }
+
+    /// 这一轮没跟同事说过话：一帧也不发，而不是发一帧空的。
+    #[tokio::test]
+    async fn a_turn_with_no_message_to_a_colleague_sends_no_frame() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        emit_turn_colleagues(&out_tx, "s1", "m-1", None).await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "没有同事消息的一轮发了一帧：界面上会出现一行空话"
+        );
     }
 }

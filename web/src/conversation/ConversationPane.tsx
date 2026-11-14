@@ -21,7 +21,13 @@ import {
 } from '@/store/permissionStore';
 import { useMemoryStore } from '@/store/memoryStore';
 import { useShell } from '@/shell/store';
-import type { ContextCompaction, HookReading, SessionSpend, TurnUsage } from '@/types/events';
+import type {
+  ColleagueMessage,
+  ContextCompaction,
+  HookReading,
+  SessionSpend,
+  TurnUsage,
+} from '@/types/events';
 import { Note } from '@/ui/Note';
 
 /**
@@ -142,6 +148,30 @@ function quotaLine(quota: ChatQuota | null, unreadable: boolean): string {
  * 不是模型写的摘要——读者据此认出被挤掉的是哪一轮，而这正是这一行存在的理由：
  * 让「模型这一轮没看见那段」在屏幕上说得出口，而不是等它答得奇怪时去猜。
  */
+/**
+ * 这一轮发给某位同事的那一条：发给谁、用什么方式、说了什么、结局如何。
+ *
+ * 结局分三种写法而不是一个布尔：等到了回信、发出去了但没等到（超时时写「没在
+ * 时限内答」，因为「对方可能还在跑」与「对方没做完」是两件事）、根本没发出去
+ * （带原因）。把缺席读成假值，屏幕上就会把「没问」画成「问了没答」。
+ */
+function colleaguesLine(sent: ColleagueMessage): string {
+  const said = sent.content.length > 60 ? `${sent.content.slice(0, 60)}…` : sent.content;
+  const head = `发给 ${sent.to || '未留名的收件人'}（${sent.sentAs || 'prompt'}）：${said}`;
+  if (sent.error) return `${head} —— 没发出去：${sent.error}`;
+  if (!sent.delivered) return `${head} —— 没发出去`;
+  if (sent.replied === null) return `${head} —— 已投进收件箱，没有等回信`;
+  if (sent.replied) {
+    const reply = sent.reply ?? '';
+    const shown = reply.length > 60 ? `${reply.slice(0, 60)}…` : reply;
+    return `${head} —— 回了：${shown}`;
+  }
+  if (sent.reason === 'timeout') {
+    return `${head} —— 没在时限内答${sent.hint ? `：${sent.hint}` : ''}`;
+  }
+  return `${head} —— 没等到回信（${sent.reason ?? '原因未报'}）`;
+}
+
 /**
  * 钩子那一行：配了几条，这一轮哪几条跑过。
  *
@@ -466,6 +496,20 @@ function Turn({ message }: { message: ChatMessage }) {
           {hooksLine(message.hooks)}
         </p>
       )}
+
+      {/*
+        这一轮发给同事的每一条。一条消息一行：每一条有自己的收件人与结局，
+        「发了几条、几条回了」这样的合计数回答不了「发给他那条到底回没回」。
+      */}
+      {message.role === 'assistant' &&
+        message.colleagues?.map((sent, index) => (
+          <p
+            key={`${sent.to}-${index}`}
+            className="mono mt-1 text-[10px] text-[var(--muted)]"
+          >
+            {colleaguesLine(sent)}
+          </p>
+        ))}
 
       {/*
         这一轮花了多少。只有服务端真的量到了才有一行：读回的历史与被叫停的那

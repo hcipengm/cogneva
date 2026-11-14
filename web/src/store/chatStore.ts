@@ -7,6 +7,7 @@ import type {
   ChatFrame,
   ChatRole,
   ContextCompaction,
+  ColleagueMessage,
   HookReading,
   LoadedMemory,
   McpListing,
@@ -76,6 +77,13 @@ export interface ChatMessage {
    * 一份有 `configured`、`ran` 为空的读数——那正好是「配了、没生效」的样子。
    */
   hooks: HookReading | null;
+  /**
+   * 这一轮发给同事的每一条消息，由服务端的 `colleague` 帧带进来（一条一帧）。
+   *
+   * `null` 是「这一轮没跟同事说过话」，不是「平台不做这件事」：能发消息的部署
+   * 在真发过时才发这一帧。数组按到达顺序累计。
+   */
+  colleagues: ColleagueMessage[] | null;
   /**
    * 这一句的原文落成的文件。只有超过窗口的那些带它：服务端把原文逐字写进执行器
    * 的一个文件，界面上这一条因此画成附件（带全文长度），而不是把开头当成全部。
@@ -430,6 +438,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 memory: null,
                 mcp: null,
                 hooks: null,
+                colleagues: null,
                 attachment: null,
                 files,
                 at,
@@ -491,6 +500,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   memory: null,
                   mcp: null,
                   hooks: null,
+                  colleagues: null,
                   attachment: frame.attachment,
                   files: [],
                   at: frame.timestamp,
@@ -525,6 +535,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   memory: null,
                   mcp: null,
                   hooks: null,
+                  colleagues: null,
                   attachment: null,
                   files: [],
                   at: frame.timestamp,
@@ -639,6 +650,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           break;
         }
 
+        case 'colleague': {
+          // 一条消息一帧，同一条回答下按到达顺序累计：一次发好几条时，最后那条
+          // 不能把前面的盖掉。
+          if (!frame.colleague) break;
+          const colleague = frame.colleague;
+          session = withMessage(session, frame.messageId, (message) => ({
+            ...message,
+            colleagues: [...(message.colleagues ?? []), colleague],
+          }));
+          break;
+        }
         case 'usage': {
           // 记在说这句话的那一条上，不另开一行：这一轮花了多少是这条消息的
           // 属性，不是一句新的话。帧排在 `end` 之前，所以它到的时候这一条还
@@ -741,6 +763,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             // 外部服务那一格同理：它说的是那一轮开头问了什么，不是这句话的属性。
             mcp: null,
             hooks: null,
+            // 读回的历史里也没有这一格：同事消息属于那一轮，不在记录的列里。
+            colleagues: null,
             // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
             attachment: null,
             // 记录里有名字与类型：刷新之后仍认得出这句话说过一张图。字节数
