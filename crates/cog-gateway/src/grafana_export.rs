@@ -221,6 +221,76 @@ pub fn panels_from_registry() -> Vec<Board> {
     boards.into_values().collect()
 }
 
+/// Ask Prometheus which series names exist right now.
+///
+/// `label/__name__/values` is the inventory the store itself keeps; asking it is
+/// what makes the catalog derived rather than declared. A failure is reported
+/// and the catalog simply has nothing from this source -- pushing the rest is
+/// still worth doing, and the log line says which half is missing.
+async fn live_series_names() -> Result<Vec<String>, String> {
+    let base = crate::readings::prometheus_base()?;
+    let client = crate::contribution_admin::http_client()?;
+    let url = format!("{base}/api/v1/label/__name__/values");
+    let request = cog_core::HttpRequest::get(url).timeout(PUSH_TIMEOUT_SECS);
+    let response = client.execute(request).await.map_err(|e| e.to_string())?;
+    if !response.is_success() {
+        return Err(format!("prometheus answered {}", response.status));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
+    let names = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(names)
+}
+
+/// The board that lists what the exposition publishes but the closed set does
+/// not name.
+pub const CATALOG_BOARD_UID: &str = "cogneva-catalog";
+
+/// Panels for the series only the scrape can enumerate.
+///
+/// The closed set is the registry a build writes through, so it cannot cover
+/// names a process renders as free strings -- those are published by whoever
+/// collects them and cannot be listed from the source tree. Enumerating them
+/// here instead of declaring them is the point: the list comes from what
+/// Prometheus can actually see, so a series that exists is drawn and one that
+/// stopped existing disappears on its own, with nobody keeping a second list.
+///
+/// These panels carry no help sentence and no kind, so they are drawn as the
+/// raw value with the wire name as the title. That is the honest shape: a name
+/// the registry does not describe is a number whose meaning is written where
+/// it is produced, not here.
+pub fn catalog_from_exposition(live: &[String]) -> Vec<Panel> {
+    let known: std::collections::BTreeSet<&str> = ALL.iter().map(|n| n.as_str()).collect();
+    let mut names: Vec<&str> = live
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !name.is_empty() && !known.contains(name))
+        .filter(|name| {
+            !name.ends_with("_bucket") && !name.ends_with("_sum") && !name.ends_with("_count")
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|name| Panel {
+            title: format!("{name}（未登记：按原值画）"),
+            expr: name.to_string(),
+            unit: unit_from_name(name).to_string(),
+            stat: false,
+            series: vec![name.to_string()],
+        })
+        .collect()
+}
+
 /// The declaration both readers of the address read.
 ///
 /// Spelt once: a second literal is a rename that silently leaves one reader
@@ -372,7 +442,21 @@ const PUSH_RETRY_CEILING_SECONDS: u64 = 300;
 /// log line alone, so the first failure and the recovery are both logged with
 /// the reason the API gave.
 pub async fn keep_pushing(endpoint: GrafanaEndpoint) {
-    let boards = panels_from_registry();
+    let mut boards = panels_from_registry();
+    match live_series_names().await {
+        Ok(live) => {
+            let panels = catalog_from_exposition(&live);
+            info!(series = panels.len(), "catalog drawn from the exposition");
+            if !panels.is_empty() {
+                boards.push(Board {
+                    uid: CATALOG_BOARD_UID.to_string(),
+                    title: "序列目录：暴露面（未登记的名字）".to_string(),
+                    panels,
+                });
+            }
+        }
+        Err(why) => warn!(%why, "catalog not drawn: the exposition could not be listed"),
+    }
     // 装配层注入的那一个，不是在这里现造：超时、连接池、代理只有一处定义，
     // 第二份设置只会在别处改了参数而这条路没跟上时被发现。
     let client = match crate::contribution_admin::http_client() {
@@ -650,6 +734,82 @@ mod tests {
                 .collect()
         }
         assert_eq!(boards(), boards());
+    }
+
+    /// Names the closed set does not name are drawn; names it does are not
+    /// drawn twice, and a histogram's suffixes collapse to nothing because the
+    /// family is already drawn once.
+    ///
+    /// The catalog's whole reason to exist is the series the registry cannot
+    /// list; drawing the registry's own names a second time would put two
+    /// panels on one series and make "which one is the truth" a question.
+    #[test]
+    fn the_catalog_draws_only_what_the_registry_does_not_name() {
+        let live = vec![
+            "cogneva_build_gate_waiting".to_string(),
+            cog_core::metric_names::MEMORY_OPERATIONS_TOTAL
+                .as_str()
+                .to_string(),
+            "unregistered_latency_ms_bucket".to_string(),
+            "unregistered_latency_ms_sum".to_string(),
+            "unregistered_latency_ms_count".to_string(),
+            "unregistered_latency_ms".to_string(),
+            String::new(),
+        ];
+        let panels = catalog_from_exposition(&live);
+        let titled: Vec<&str> = panels.iter().map(|p| p.title.as_str()).collect();
+        assert!(
+            titled
+                .iter()
+                .any(|t| t.starts_with("cogneva_build_gate_waiting")),
+            "登记的闭集外的名字没有被画出来：{titled:?}"
+        );
+        assert!(
+            titled
+                .iter()
+                .any(|t| t.starts_with("unregistered_latency_ms（")),
+            "家族名本身没有被画出来：{titled:?}"
+        );
+        assert!(
+            !titled
+                .iter()
+                .any(|t| t.starts_with("memory_operations_total")),
+            "闭集里的名字被画了两遍：{titled:?}"
+        );
+        assert!(
+            !titled
+                .iter()
+                .any(|t| t.contains("_bucket") || t.contains("_sum") || t.contains("_count")),
+            "直方图的后缀被当成三条独立序列画了：{titled:?}"
+        );
+    }
+
+    /// A series the registry does not describe is drawn as its raw value, not
+    /// as a rate: the kind is unknown, and a rate over a gauge reports jitter
+    /// as throughput.
+    #[test]
+    fn an_unnamed_series_is_drawn_as_its_value() {
+        let panels = catalog_from_exposition(&["cogneva_build_gate_waiting".to_string()]);
+        assert_eq!(panels.len(), 1);
+        assert_eq!(panels[0].expr, "cogneva_build_gate_waiting");
+    }
+
+    /// The catalog is ordered, so two pushes with the same live set produce the
+    /// same board and nothing rewrites itself.
+    #[test]
+    fn the_catalog_is_ordered() {
+        let live = vec![
+            "zebra_total".to_string(),
+            "alpha_total".to_string(),
+            "zebra_total".to_string(),
+        ];
+        let titles: Vec<String> = catalog_from_exposition(&live)
+            .into_iter()
+            .map(|p| p.title)
+            .collect();
+        assert_eq!(titles.len(), 2);
+        assert!(titles[0].starts_with("alpha_total"));
+        assert!(titles[1].starts_with("zebra_total"));
     }
 
     /// A series is filed under the segment its name carries, and two series
