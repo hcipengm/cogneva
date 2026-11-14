@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 
+import type { PermissionDiff } from '@/types/events';
+
 /**
  * 等着人答的「要不要动手」。
  *
@@ -22,6 +24,11 @@ export interface PermissionAsk {
    * 动不动」——两者的按钮与后果都不同，界面上要分开画。
    */
   plan?: string;
+  /**
+   * 这一次要做的那个改动。有它时人答的是「这份 diff 落不落盘」，弹窗里画的是
+   * 改动本身，而不是一行「edit_file」。
+   */
+  diff?: PermissionDiff | null;
 }
 
 /**

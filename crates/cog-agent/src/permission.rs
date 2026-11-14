@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 
+use cog_core::contract::permission::{PermissionDiff, PermissionDiffKind};
+
 /// 这一轮处在哪种模式下。闭集：不认识的模式不猜一个默认值，交回给调用方拒绝。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionMode {
@@ -112,6 +114,106 @@ pub fn is_read_only(tool: &str) -> bool {
 
 pub fn is_edit(tool: &str) -> bool {
     EDIT_TOOLS.contains(&tool)
+}
+
+/// 这一问里放得下多少改动（按字符算）。
+///
+/// 弹窗是给人读几秒就点头的东西：更大的改动在流里那一份（E4 的行级 diff）与
+/// 文件视图里看全文，这里只放读得完的一段。截断过就说出来（`truncated`），
+/// 被截断的那一份读起来才不像整个改动。
+// cap: bound — 弹窗要在人读它的那几秒里画完；8k 字约两屏，更大的改动由流里那一份与文件视图看全文
+const PREVIEW_CHARS: usize = 8_000;
+
+/// 工具要做的那个改动，折成一份能画给人看的东西；不是改动类工具时是 `None`。
+///
+/// 入参名是各自的约定（`path` / `old_string` / `content` / `patch`），在这一层
+/// 读：它就是排「哪些工具要问」的那张名单所在的地方，工具的入参形状不该由界面
+/// 再猜一遍。读不出必要的格子就当没有改动可画——一张说错形状的预览比没有更糟，
+/// 人要照着它点头。
+pub fn edit_preview(tool: &str, arguments: &serde_json::Value) -> Option<PermissionDiff> {
+    let field = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    };
+    let cut = |text: &str| -> (String, bool) {
+        (
+            text.chars().take(PREVIEW_CHARS).collect(),
+            text.chars().count() > PREVIEW_CHARS,
+        )
+    };
+    match tool {
+        "edit_file" => {
+            let before = field("old_string");
+            let after = field("new_string");
+            if before.is_empty() && after.is_empty() {
+                return None;
+            }
+            let (before, cut_before) = cut(before);
+            let (after, cut_after) = cut(after);
+            Some(PermissionDiff {
+                path: field("path").to_string(),
+                kind: PermissionDiffKind::Edit,
+                label: "这一处替换".to_string(),
+                before,
+                after,
+                truncated: cut_before || cut_after,
+            })
+        }
+        "write_file" => {
+            let content = field("content");
+            if content.is_empty() {
+                return None;
+            }
+            let (after, truncated) = cut(content);
+            Some(PermissionDiff {
+                path: field("path").to_string(),
+                kind: PermissionDiffKind::Overwrite,
+                // 改动前的内容不在这一问里：拿不到就说拿不到，不把整份新文件画成
+                // 满屏的 `+` 行、让人以为这个文件原来不存在。
+                label: "整份写进去的文件（改动前的内容不在这一问里）".to_string(),
+                before: String::new(),
+                after,
+                truncated,
+            })
+        }
+        "apply_patch" => {
+            let patch = field("patch");
+            if patch.trim().is_empty() {
+                return None;
+            }
+            let (after, truncated) = cut(patch);
+            Some(PermissionDiff {
+                // 补丁自己写着要改哪些文件，以它为准；入参里那一格只是补充。
+                path: patch_path(patch).unwrap_or_else(|| field("path").to_string()),
+                kind: PermissionDiffKind::Patch,
+                label: "这份补丁".to_string(),
+                before: String::new(),
+                after,
+                truncated,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 补丁要改的第一个文件：取第一个 `+++` 之后那一段，去掉 `b/` 前缀。
+///
+/// 新建文件的那一半是 `/dev/null`，那不是路径。
+fn patch_path(patch: &str) -> Option<String> {
+    patch
+        .lines()
+        .find_map(|line| line.strip_prefix("+++ "))
+        .map(|header| {
+            header
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("b/")
+                .to_string()
+        })
+        .filter(|name| !name.is_empty() && name != "/dev/null")
 }
 
 /// 计划模式下唯一一件「不是只读、却要交给人」的事：把计划递出去请人批准。
@@ -652,5 +754,112 @@ mod tests {
             }
             PermissionVerdict::Allow => panic!("没有人可问时必须拒绝"),
         }
+    }
+
+    /// 一次替换：两边都摆出来，文件是哪一份也说得清。
+    #[test]
+    fn an_edit_names_both_sides_of_its_one_replacement() {
+        let preview = edit_preview(
+            "edit_file",
+            &serde_json::json!({
+                "path": "crates/x.rs",
+                "old_string": "let a = 1;",
+                "new_string": "let a = 2;",
+            }),
+        )
+        .expect("改文件的那一问要带上这次改动");
+        assert_eq!(preview.path, "crates/x.rs");
+        assert_eq!(preview.kind, PermissionDiffKind::Edit);
+        assert_eq!(preview.before, "let a = 1;");
+        assert_eq!(preview.after, "let a = 2;");
+        assert!(!preview.truncated);
+
+        // 两边都是空的：没有改动可画，就不画一张空的。
+        assert_eq!(
+            edit_preview(
+                "edit_file",
+                &serde_json::json!({"path": "a", "old_string": "", "new_string": ""})
+            ),
+            None
+        );
+    }
+
+    /// `write_file` 没有改动前的内容：它明说这一点，不假装自己是一份 diff。
+    #[test]
+    fn a_whole_file_write_is_not_passed_off_as_a_diff() {
+        let preview = edit_preview(
+            "write_file",
+            &serde_json::json!({"path": "notes.md", "content": "第一行\n第二行\n"}),
+        )
+        .expect("写整份文件也要能给人看");
+        assert_eq!(preview.kind, PermissionDiffKind::Overwrite);
+        assert_eq!(preview.before, "");
+        assert_eq!(preview.after, "第一行\n第二行\n");
+        assert!(
+            preview.label.contains("改动前的内容不在"),
+            "写整份文件时要说清看不清它原来是什么：{}",
+            preview.label
+        );
+    }
+
+    /// 补丁以它自己写的路径为准，`/dev/null` 不算路径。
+    #[test]
+    fn a_patch_is_shown_as_the_patch_and_names_the_file_it_touches() {
+        let patch = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let preview = edit_preview("apply_patch", &serde_json::json!({ "patch": patch }))
+            .expect("补丁也要能给人看");
+        assert_eq!(preview.kind, PermissionDiffKind::Patch);
+        assert_eq!(preview.path, "src/lib.rs");
+        assert_eq!(preview.after, patch, "补丁原文原样摆出去");
+        assert!(!preview.truncated);
+
+        // 新建文件的那一半是 /dev/null：那不是路径，别把它画成文件名。
+        let created = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n";
+        assert_eq!(
+            edit_preview("apply_patch", &serde_json::json!({ "patch": created }))
+                .map(|preview| preview.path)
+                .as_deref(),
+            Some("new.txt")
+        );
+        assert_eq!(
+            edit_preview("apply_patch", &serde_json::json!({ "patch": "  \n" })),
+            None,
+            "空补丁没有改动可画"
+        );
+    }
+
+    /// 只读工具没有改动可画：它前面本来就不该有这一问，问句里也不该多一张图。
+    #[test]
+    fn a_tool_that_does_not_change_a_file_has_nothing_to_show() {
+        assert_eq!(
+            edit_preview("read_file", &serde_json::json!({"path": "a"})),
+            None
+        );
+        assert_eq!(
+            edit_preview("run_command", &serde_json::json!({"command": "rm -rf /"})),
+            None
+        );
+    }
+
+    /// 大到读不完的改动截断，并且说自己截断过：截断而不说，与整个改动看起来一样。
+    #[test]
+    fn an_enormous_change_is_cut_and_says_so() {
+        let huge = "x".repeat(PREVIEW_CHARS + 10);
+        let preview = edit_preview(
+            "write_file",
+            &serde_json::json!({"path": "big.txt", "content": huge}),
+        )
+        .expect("大文件也是一次改动");
+        assert!(preview.truncated, "超长的那份要说明自己截断过");
+        assert_eq!(preview.after.chars().count(), PREVIEW_CHARS);
+
+        // 刚好放得下：不算截断。
+        let exact = "y".repeat(PREVIEW_CHARS);
+        let preview = edit_preview(
+            "write_file",
+            &serde_json::json!({"path": "exact.txt", "content": exact}),
+        )
+        .expect("一次改动");
+        assert!(!preview.truncated, "刚好放得下不是截断");
     }
 }

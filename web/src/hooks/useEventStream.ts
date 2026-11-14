@@ -464,6 +464,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
               summary: wire.summary ?? '',
               mode: wire.mode ?? 'default',
               plan: wire.plan,
+              diff: wire.diff ?? null,
             });
           },
           // 规则名单是设置，不进聊天流。少一格（没有号或没有工具名）的那一条不落：

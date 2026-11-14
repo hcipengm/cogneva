@@ -622,6 +622,10 @@ impl cog_agent::permission::PermissionDecider for ConversationPermissions {
                         .map(str::to_string)
                 })
                 .flatten(),
+            // 改动类工具把那一次改动一起递出去：人要答的是「这份 diff 落不落盘」。
+            // 折它的是内核那一层（它认识工具的入参），这一层只转手；认不出改动
+            // 形状时是 `None`，界面上退回一行摘要而不是一张空白的 diff。
+            diff: cog_agent::permission::edit_preview(&ask.tool, &ask.arguments),
         };
         match self.bridge.ask(view).await {
             cog_gateway::chat::PermissionAnswer::Allow { always } => {

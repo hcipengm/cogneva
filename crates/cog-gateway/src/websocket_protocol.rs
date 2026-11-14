@@ -281,6 +281,10 @@ pub enum ServerMessage {
         /// 待批准的计划正文，只有 plan 模式的那一问带它。
         #[serde(skip_serializing_if = "Option::is_none")]
         plan: Option<String>,
+        /// 这一次要做的那个改动。改动类工具才带它；别的询问上这一格不出现，
+        /// 与「带了一份空的」分得开。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff: Option<cog_core::contract::permission::PermissionDiff>,
     },
     /// 一段对话上留下来的规则：人点过「总是」的那些，带各自的撤销号。
     ///

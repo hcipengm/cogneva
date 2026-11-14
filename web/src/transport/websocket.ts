@@ -3,6 +3,7 @@ import {
   normalizeChatFrame,
   type AgentEvent,
   type ChatFrame,
+  type PermissionDiff,
 } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
@@ -128,6 +129,8 @@ export interface PermissionAskWire {
   mode?: string;
   /** 待批准的计划正文，只有 plan 模式那一问带它。 */
   plan?: string;
+  /** 这一次要做的那个改动；改动类工具才带它（见 `PermissionDiff`）。 */
+  diff?: PermissionDiff | null;
 }
 
 export interface WebSocketOptions {

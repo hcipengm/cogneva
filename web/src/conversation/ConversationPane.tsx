@@ -11,7 +11,7 @@ import {
 import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch';
 import { Markdown } from '@/conversation/Markdown';
 import { TodoPanel, todoListsIn } from '@/conversation/TodoPanel';
-import { toolDiff } from '@/conversation/toolDiff';
+import { diffForPreview, toolDiff, type ToolDiff } from '@/conversation/toolDiff';
 import type { StreamClient } from '@/hooks/useEventStream';
 import { sessionKind, useChatStore, type ChatMessage, type ChatSession } from '@/store/chatStore';
 import { useStreamStore, type ToolCallRecord } from '@/store/streamStore';
@@ -717,6 +717,40 @@ function Turn({ message }: { message: ChatMessage }) {
 }
 
 /**
+ * 一份行级 diff。
+ *
+ * 两处画它，画的必须是同一份东西：问它落不落盘的时候（执行前那一问），与它已经
+ * 落地之后（对话流里的那次调用）。两处各写一份画法，人在点头前后会看到两种笔迹，
+ * 而他要凭前者决定后者。
+ */
+function DiffBlock({ diff, note }: { diff: ToolDiff; note?: string }) {
+  return (
+    <div className="tool-diff mt-1 border-l border-[var(--line)] pl-2">
+      <div className="mono flex flex-wrap items-baseline gap-2 text-[10px] text-[var(--muted)]">
+        {diff.path && (
+          <span className="break-all" style={{ color: 'var(--paper-dim)' }}>
+            {diff.path}
+          </span>
+        )}
+        <span>{diff.label}</span>
+        <span style={{ color: 'var(--ok)' }}>+{diff.added}</span>
+        <span style={{ color: 'var(--danger)' }}>−{diff.removed}</span>
+        {note && <span>{note}</span>}
+      </div>
+      <pre className="mono mt-1 max-h-64 overflow-auto text-[11px] leading-[1.5]">
+        {diff.lines.map((line, index) => (
+          <span key={index} className={`diff-${line.kind}`}>
+            {line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : ' '}
+            {line.text || ' '}
+            {'\n'}
+          </span>
+        ))}
+      </pre>
+    </div>
+  );
+}
+
+/**
  * 一次工具调用在对话流里的样子。
  *
  * 不是一行日志：它是这一段对话里真的发生过的一件事，要能展开看它传了什么、回了
@@ -759,30 +793,7 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
         哪几行」，而它在入参与返回那两份 JSON 里只有自己找。展开仍然是原文——diff
         是给眼睛的，原文是给核对的。
       */}
-      {diff && (
-        <div className="tool-diff mt-1 border-l border-[var(--line)] pl-2">
-          <div className="mono flex flex-wrap items-baseline gap-2 text-[10px] text-[var(--muted)]">
-            {diff.path && (
-              <span className="break-all" style={{ color: 'var(--paper-dim)' }}>
-                {diff.path}
-              </span>
-            )}
-            <span>{diff.label}</span>
-            <span style={{ color: 'var(--ok)' }}>+{diff.added}</span>
-            <span style={{ color: 'var(--danger)' }}>−{diff.removed}</span>
-            {call.status === 'running' && <span>调用还没回来</span>}
-          </div>
-          <pre className="mono mt-1 max-h-64 overflow-auto text-[11px] leading-[1.5]">
-            {diff.lines.map((line, index) => (
-              <span key={index} className={`diff-${line.kind}`}>
-                {line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : ' '}
-                {line.text || ' '}
-                {'\n'}
-              </span>
-            ))}
-          </pre>
-        </div>
-      )}
+      {diff && <DiffBlock diff={diff} note={call.status === 'running' ? '调用还没回来' : undefined} />}
       {open && (
         <div className="mt-1 flex flex-col gap-1 border-l border-[var(--line)] pl-2">
           <div>
@@ -2196,114 +2207,146 @@ export function ConversationPane({
       )}
       {permissionAsks.length > 0 && (
         <div className="shrink-0 px-4 pb-1">
-          {permissionAsks.map((ask) => (
-            <div
-              key={ask.id}
-              className="mb-2 border-t pt-2"
-              style={{ borderColor: 'var(--line-strong)' }}
-            >
-              <div className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
-                {ask.plan ? '计划待批准' : `要动手：${ask.tool}`}（{ask.mode} 模式）
-              </div>
-              {/*
-                计划正文不截：这一份要在点「批准并执行」之前被读完，截到几行就等于
-                让人闭眼点头。摘要那种一行字只在「要动手」时出现。
-              */}
-              {ask.plan ? (
-                <div
-                  className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words border-l-2 pl-2 text-[12px] text-[var(--paper)]"
-                  style={{ borderColor: 'var(--line-strong)' }}
-                >
-                  {ask.plan}
+          {permissionAsks.map((ask) => {
+            // 改动类工具的那一问画的是改动本身：人答的是「这份 diff 落不落盘」，
+            // 不是「一个叫 edit_file 的工具动不动」。
+            const preview = diffForPreview(ask.diff);
+            return (
+              <div
+                key={ask.id}
+                className="mb-2 border-t pt-2"
+                style={{ borderColor: 'var(--line-strong)' }}
+              >
+                <div className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
+                  {ask.plan
+                    ? '计划待批准'
+                    : preview
+                      ? `要改：${preview.path ?? ask.tool}`
+                      : `要动手：${ask.tool}`}
+                  （{ask.mode} 模式）
                 </div>
-              ) : (
-                <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-[12px] text-[var(--paper)]">
-                  {ask.summary}
-                </pre>
-              )}
-              <div className="mt-2 flex gap-3">
                 {/*
-                  计划只有两个答案：批准，或者让它继续改。批准不是「允许这一次」——
-                  它换的是这一轮的模式，之后每一步动手照旧按模式与规则问人。
+                  计划正文不截：这一份要在点「批准并执行」之前被读完，截到几行就等于
+                  让人闭眼点头。摘要那种一行字只在「要动手」时出现。
                 */}
                 {ask.plan ? (
-                  <>
-                    <Note
-                      as="button"
-                      type="button"
-                      onClick={() => answerPermission(ask, true)}
-                      className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
-                      style={{ color: 'var(--brass)' }}
-                      text="批准这份计划：这一轮从此按 default 模式执行，要动手的每一步仍然按模式与规则问你"
-                    >
-                      批准并执行
-                    </Note>
-                    <Note
-                      as="button"
-                      type="button"
-                      onClick={() => {
-                        clientRef.current?.send({
-                          type: 'permission_response',
-                          request_id: ask.id,
-                          allow: false,
-                          reason: '计划没有批准：继续只读调研，把计划改好再来请我批准。',
-                        });
-                        usePermissionStore.getState().answered(ask.id);
-                      }}
-                      className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
-                      style={{ color: 'var(--muted)' }}
-                      text="不执行这份计划；模型会收到这句话，继续在只读模式下改计划"
-                    >
-                      继续改
-                    </Note>
-                  </>
+                  <div
+                    className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words border-l-2 pl-2 text-[12px] text-[var(--paper)]"
+                    style={{ borderColor: 'var(--line-strong)' }}
+                  >
+                    {ask.plan}
+                  </div>
+                ) : preview ? (
+                  <div className="mt-1 max-h-64 overflow-auto">
+                    <DiffBlock
+                      diff={preview}
+                      note={ask.diff?.truncated ? '改动太长，这里只画了前一段' : undefined}
+                    />
+                  </div>
                 ) : (
-                  <>
-                <Note
-                  as="button"
-                  type="button"
-                  onClick={() => answerPermission(ask, true)}
-                  className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
-                  style={{ color: 'var(--brass)' }}
-                  text="允许这一次执行；下一次同类调用仍然会问"
-                >
-                  允许
-                </Note>
-                <Note
-                  as="button"
-                  type="button"
-                  onClick={() => answerPermission(ask, false)}
-                  className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
-                  style={{ color: 'var(--danger)' }}
-                  text="拒绝这一次，并把理由交回模型；同一个调用再发一遍会得到同一个答案"
-                >
-                  拒绝
-                </Note>
-                <Note
-                  as="button"
-                  type="button"
-                  onClick={() => answerPermission(ask, true, true)}
-                  className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
-                  style={{ color: 'var(--brass)' }}
-                  text="允许这一次，并把这个工具碰这个东西的调用记成一条放行规则：下次同类调用不再问，在规则面板里可以撤销"
-                >
-                  总是允许
-                </Note>
-                <Note
-                  as="button"
-                  type="button"
-                  onClick={() => answerPermission(ask, false, true)}
-                  className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
-                  style={{ color: 'var(--danger)' }}
-                  text="拒绝这一次，并把这个工具碰这个东西的调用记成一条拒绝规则：下次同类调用直接拒绝不再问，在规则面板里可以撤销"
-                >
-                  总是拒绝
-                </Note>
-                  </>
+                  <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-[12px] text-[var(--paper)]">
+                    {ask.summary}
+                  </pre>
                 )}
+                <div className="mt-2 flex gap-3">
+                  {/*
+                    计划只有两个答案：批准，或者让它继续改。批准不是「允许这一次」——
+                    它换的是这一轮的模式，之后每一步动手照旧按模式与规则问人。
+                  */}
+                  {ask.plan ? (
+                    <>
+                      <Note
+                        as="button"
+                        type="button"
+                        onClick={() => answerPermission(ask, true)}
+                        className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                        style={{ color: 'var(--brass)' }}
+                        text="批准这份计划：这一轮从此按 default 模式执行，要动手的每一步仍然按模式与规则问你"
+                      >
+                        批准并执行
+                      </Note>
+                      <Note
+                        as="button"
+                        type="button"
+                        onClick={() => {
+                          clientRef.current?.send({
+                            type: 'permission_response',
+                            request_id: ask.id,
+                            allow: false,
+                            reason: '计划没有批准：继续只读调研，把计划改好再来请我批准。',
+                          });
+                          usePermissionStore.getState().answered(ask.id);
+                        }}
+                        className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                        style={{ color: 'var(--muted)' }}
+                        text="不执行这份计划；模型会收到这句话，继续在只读模式下改计划"
+                      >
+                        继续改
+                      </Note>
+                    </>
+                  ) : (
+                    <>
+                      {/*
+                        一次改动两个答案，动作名写在按钮上：`diff_accept` 放行这一次
+                        写工具（字节照上面画的那样落盘），`diff_refuse` 把理由交回模型、
+                        工作树一个字节不动——拒绝之后树没变正是这一步的判据。
+                      */}
+                      <Note
+                        as="button"
+                        type="button"
+                        onClick={() => answerPermission(ask, true)}
+                        data-action={preview ? 'diff_accept' : undefined}
+                        className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                        style={{ color: 'var(--brass)' }}
+                        text={
+                          preview
+                            ? '接受这份改动：这一次写工具放行，文件按上面画的那样改'
+                            : '允许这一次执行；下一次同类调用仍然会问'
+                        }
+                      >
+                        {preview ? '接受' : '允许'}
+                      </Note>
+                      <Note
+                        as="button"
+                        type="button"
+                        onClick={() => answerPermission(ask, false)}
+                        data-action={preview ? 'diff_refuse' : undefined}
+                        className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                        style={{ color: 'var(--danger)' }}
+                        text={
+                          preview
+                            ? '拒绝这份改动：工作树一个字节都不动，这个理由交回模型换一条路'
+                            : '拒绝这一次，并把理由交回模型；同一个调用再发一遍会得到同一个答案'
+                        }
+                      >
+                        拒绝
+                      </Note>
+                      <Note
+                        as="button"
+                        type="button"
+                        onClick={() => answerPermission(ask, true, true)}
+                        className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                        style={{ color: 'var(--brass)' }}
+                        text="允许这一次，并把这个工具碰这个东西的调用记成一条放行规则：下次同类调用不再问，在规则面板里可以撤销"
+                      >
+                        总是允许
+                      </Note>
+                      <Note
+                        as="button"
+                        type="button"
+                        onClick={() => answerPermission(ask, false, true)}
+                        className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                        style={{ color: 'var(--danger)' }}
+                        text="拒绝这一次，并把这个工具碰这个东西的调用记成一条拒绝规则：下次同类调用直接拒绝不再问，在规则面板里可以撤销"
+                      >
+                        总是拒绝
+                      </Note>
+                    </>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
       <div className="shrink-0 px-4 pb-4 pt-1">

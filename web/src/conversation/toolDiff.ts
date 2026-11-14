@@ -1,4 +1,5 @@
 import type { ToolCallRecord } from '@/store/streamStore';
+import type { PermissionDiff } from '@/types/events';
 
 /**
  * 改动类工具在对话流里该怎么画。
@@ -181,4 +182,35 @@ export function toolDiff(call: ToolCallRecord): ToolDiff | null {
   }
 
   return null;
+}
+
+/**
+ * 问句里那一份改动折成对话里同一个形状；没有改动时返回 `null`。
+ *
+ * 与 [`toolDiff`] 共用同一套画法：问句里画的是「这份 diff 落不落盘」，批准之后
+ * 流里画的是同一份东西落地之后的样子——两处用两套算法，人就会在两次之间看到
+ * 两种笔迹。
+ */
+export function diffForPreview(preview: PermissionDiff | null | undefined): ToolDiff | null {
+  if (!preview) return null;
+  const path = preview.path || null;
+
+  if (preview.kind === 'patch') {
+    if (!preview.after.trim()) return null;
+    const lines = patchLines(preview.after);
+    return { path, label: preview.label, lines, ...count(lines) };
+  }
+
+  if (preview.kind === 'overwrite') {
+    if (!preview.after) return null;
+    // 与 `toolDiff` 里 write_file 那一支同一句话：没有改动前的内容，画的是整份
+    // 被写进去的文件，并以此为标签（标签由服务端给，见 `PermissionDiff.label`）。
+    const lines: DiffLine[] = preview.after
+      .split('\n')
+      .map((line) => ({ kind: 'add' as const, text: line }));
+    return { path, label: preview.label, lines, ...count(lines) };
+  }
+
+  const lines = lineDiff(preview.before, preview.after);
+  return { path, label: preview.label, lines, ...count(lines) };
 }

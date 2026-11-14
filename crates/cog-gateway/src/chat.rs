@@ -638,6 +638,12 @@ pub struct PermissionAskView {
     /// 不并进 `summary`：摘要有自己的界（一行字、读一眼就够），而计划是要人读完
     /// 再点头的东西——截到一百来个字符，批准就变成了闭眼点。
     pub plan: Option<String>,
+    /// 这一次要做的那个改动，折成能画给人看的一份东西。
+    ///
+    /// 改动类工具在问句里带它：人要答的是「这份 diff 落不落盘」，不是「一个叫
+    /// edit_file 的工具动不动」。网关不解释它的形状——形状由产出它的那一层
+    /// 定义（[`cog_core::contract::permission::PermissionDiff`]），这里只原样搬。
+    pub diff: Option<cog_core::contract::permission::PermissionDiff>,
 }
 
 /// 人给回来的答案。拒绝要带理由，理由要交回模型。
@@ -797,6 +803,7 @@ impl PermissionBridge for SocketPermissionBridge {
                 summary: view.summary.clone(),
                 mode: view.mode.clone(),
                 plan: view.plan.clone(),
+                diff: view.diff.clone(),
             },
         ) else {
             self.channel.forget(&view.request_id);
@@ -2625,6 +2632,14 @@ mod tests {
             summary: "path=a.txt".into(),
             mode: "default".into(),
             plan: None,
+            diff: Some(cog_core::contract::permission::PermissionDiff {
+                path: "a.txt".into(),
+                kind: cog_core::contract::permission::PermissionDiffKind::Edit,
+                label: "这一处替换".into(),
+                before: "old".into(),
+                after: "new".into(),
+                truncated: false,
+            }),
         };
         let waiter = tokio::spawn(async move { bridge.ask(ask).await });
 
@@ -2633,6 +2648,11 @@ mod tests {
         assert_eq!(parsed["type"], "permission_request");
         assert_eq!(parsed["request_id"], "perm-1");
         assert_eq!(parsed["tool"], "write_file");
+        // 人要答的是「这份改动落不落盘」：改动本身要随问句出去。
+        assert_eq!(parsed["diff"]["path"], "a.txt");
+        assert_eq!(parsed["diff"]["kind"], "edit");
+        assert_eq!(parsed["diff"]["before"], "old");
+        assert_eq!(parsed["diff"]["after"], "new");
 
         assert!(
             channel.answer("perm-1", PermissionAnswer::allow()),
@@ -2661,6 +2681,7 @@ mod tests {
             summary: "command=cargo test".into(),
             mode: "default".into(),
             plan: None,
+            diff: None,
         };
         let waiter = tokio::spawn(async move { bridge.ask(ask).await });
         let _ = out_rx.recv().await.expect("问句必须出门");

@@ -379,6 +379,24 @@ export interface BackgroundCard {
   summary: string | null;
 }
 
+/**
+ * 一次执行前询问里，那次改动长什么样（形状与 `cog_core::contract::permission`
+ * 同一份）。
+ *
+ * `kind` 决定画法：`edit` 是 `before` 换成 `after` 的一处替换；`overwrite` 是整份
+ * 被写进去的文件——它的 `before` 是空串，因为这一次请求里没有去读树，界面上就该
+ * 明说「看不清原来是什么」；`patch` 的 `after` 是补丁原文。`truncated` 是「有一边
+ * 被截断了」：被截断的一份不加这句话，读起来就像整个改动。
+ */
+export interface PermissionDiff {
+  path: string;
+  kind: 'edit' | 'overwrite' | 'patch';
+  label: string;
+  before: string;
+  after: string;
+  truncated: boolean;
+}
+
 /** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
 export interface ChatAttachment {
   path: string;

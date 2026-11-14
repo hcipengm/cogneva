@@ -9078,6 +9078,151 @@ mod tests {
         );
     }
 
+    /// 拒绝之后，工作树一个字节都不动。
+    ///
+    /// 这一条不数「工具跑没跑」：它真的把一次写盘的机会递给工具（实现会改写那个
+    /// 文件），而人拒绝之后文件里仍是原来那几个字节——被拒的调用不是「跑了但没
+    /// 落盘」，而是根本没跑。把判定挪到工具动手之后，这条当场红。
+    #[tokio::test]
+    async fn a_refused_change_leaves_every_byte_as_it_was() {
+        struct Refusing;
+        #[async_trait::async_trait]
+        impl crate::permission::PermissionDecider for Refusing {
+            async fn decide(
+                &self,
+                _ask: &crate::permission::PermissionAsk,
+            ) -> crate::permission::PermissionVerdict {
+                crate::permission::PermissionVerdict::Deny {
+                    reason: "这一次改动先别落盘".into(),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("main.rs");
+        std::fs::write(&target, "let original = 1;\n").expect("原来的文件");
+
+        let registry = ToolRegistry::new();
+        {
+            let target = target.clone();
+            cog_core::ToolRegistry::register(
+                &registry,
+                cog_core::Tool {
+                    name: "edit_file".into(),
+                    description: "改写那个文件".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    implementation: cog_core::ToolImplementation::Native(Arc::new(move |_args| {
+                        let target = target.clone();
+                        Box::pin(async move {
+                            std::fs::write(&target, "let changed = 2;\n")
+                                .map_err(|e| SFError::Agent(e.to_string()))?;
+                            Ok(serde_json::json!({ "changed": true }))
+                        })
+                    })),
+                },
+            );
+        }
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "refused-change".into(),
+            role: "refused-change-test".into(),
+            max_iterations: 4,
+            ..Default::default()
+        };
+        let decider: Arc<dyn crate::permission::PermissionDecider> = Arc::new(Refusing);
+        let mut runtime = AgentRuntime::new(config, tx)
+            .with_tools(registry)
+            .with_permissions(Some(decider), crate::permission::PermissionMode::Default);
+        /// 第一次要改一个文件，之后每次只交一句话。
+        struct CallsEditOnce;
+        #[async_trait::async_trait]
+        impl cog_core::LlmClient for CallsEditOnce {
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                let answered = messages
+                    .iter()
+                    .any(|m| matches!(m, Message::ToolResult { .. }));
+                let (stream, producer) = cog_core::EventStream::with_capacity(4);
+                tokio::spawn(async move {
+                    let mut producer = producer;
+                    let content = if answered {
+                        vec![ContentBlock::Text {
+                            text: r#"{"done":true}"#.into(),
+                            text_signature: None,
+                        }]
+                    } else {
+                        vec![ContentBlock::tool_call(
+                            "call-change",
+                            "edit_file",
+                            serde_json::json!({
+                                "path": "main.rs",
+                                "old_string": "let original = 1;",
+                                "new_string": "let changed = 2;",
+                            }),
+                        )]
+                    };
+                    let _ = producer
+                        .push(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: String::new(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                    producer.end(cog_core::ChatResponse {
+                        content,
+                        api: "mock".into(),
+                        provider: "mock".into(),
+                        model: "mock".into(),
+                        response_id: None,
+                        usage: cog_core::Usage::default(),
+                        stop_reason: cog_core::StopReason::Stop,
+                        error_message: None,
+                        upstream_failure: None,
+                        retry_after_secs: None,
+                        timestamp: chrono::Utc::now(),
+                    })
+                });
+                Ok(stream)
+            }
+
+            async fn complete_stream(
+                &self,
+                _prompt: &str,
+                _options: &cog_core::CompleteOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                unimplemented!()
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::ChatResponse> {
+                unimplemented!()
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        runtime
+            .run(serde_json::json!({"task": "改一个文件"}), &CallsEditOnce)
+            .await
+            .expect("人拒绝是一次结论，不是运行时的一次失败");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("文件还在"),
+            "let original = 1;\n",
+            "拒绝之后文件被动过：这一次改动不该落盘"
+        );
+    }
+
     /// 计划模式：人批准了计划之后，**同一个回合**就该动手。
     ///
     /// 批准之后再开一轮执行，等于把「批准」变成一句被记下来却没生效的话；而只给
