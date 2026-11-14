@@ -359,7 +359,10 @@ async fn import(
         wanted
     };
     next.sort();
-    if prior.is_none() && next.is_empty() {
+    // A full import always writes its kind's node, even with no rows: stating
+    // that a table has nothing in it is a declaration, and it is the only way
+    // to tell it apart from a platform that never received the table at all.
+    if upsert_only && prior.is_none() && next.is_empty() {
         return Ok(summary);
     }
     let changed = prior
@@ -394,16 +397,29 @@ async fn import(
 
 /// One kind's table, every row, one line each. Order is `render`'s.
 pub async fn table(store: &dyn GovernanceStore, kind: &Kind) -> Result<String, Box<dyn Error>> {
+    Ok(declared_table(store, kind).await?.unwrap_or_default())
+}
+
+/// The kind's table and whether the graph states one at all.
+///
+/// `None` is not the same answer as an empty table: "nobody declared a row" and
+/// "this platform never received the declaration" are two different things to
+/// the reader, and a projection that wrote a header over no rows would merge
+/// them. A kind that was never imported therefore has no file beside the faces,
+/// which a reader reports as unread rather than as a table with nothing in it.
+pub async fn declared_table(
+    store: &dyn GovernanceStore,
+    kind: &Kind,
+) -> Result<Option<String>, Box<dyn Error>> {
     let node = store
         .governance_nodes(DECLARATION_TASK_TYPE)
         .await?
         .into_iter()
         .find(|node| node.id == node_id(kind.name));
-    let rows = match node {
-        Some(node) if node.status == TaskStatus::Pending => from_task(kind, &node),
-        _ => Vec::new(),
-    };
-    Ok(render(&rows))
+    Ok(match node {
+        Some(node) if node.status == TaskStatus::Pending => Some(render(&from_task(kind, &node))),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -687,9 +703,26 @@ token 管理\tllm_pool_available == 0\tllm_pool_available == 0\t2
     }
 
     #[tokio::test]
-    async fn a_kind_that_was_never_imported_reads_empty() {
+    async fn a_kind_that_was_never_imported_reads_empty_and_is_not_declared() {
         let store = Nodes::default();
         assert_eq!(table(&store, criteria()).await.expect("reads"), "");
+        assert_eq!(
+            declared_table(&store, criteria()).await.expect("reads"),
+            None,
+            "a platform that never received the kind must not look like an empty table"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kind_that_was_imported_empty_is_declared_and_empty() {
+        let store = Nodes::default();
+        import_from_text(&store, criteria(), "# nobody wrote a criterion yet\n")
+            .await
+            .expect("imports");
+        assert_eq!(
+            declared_table(&store, criteria()).await.expect("reads"),
+            Some(String::new())
+        );
     }
 
     #[tokio::test]

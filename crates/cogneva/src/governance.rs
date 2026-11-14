@@ -1101,10 +1101,15 @@ async fn project(
     // says which face a theme belongs to. They are declarations, not
     // measurements, so this projection is their only copy on a host that has no
     // repository to read them from.
+    // A kind the graph does not state writes no file at all: a header over no
+    // rows would read as "the table is empty" to a reader, which is a different
+    // answer from "this platform never received the table".
     let mut declaration_rows = 0usize;
     let mut declaration_files: Vec<(String, String)> = Vec::new();
     for kind in crate::governance_declarations::KINDS {
-        let table = crate::governance_declarations::table(store, kind).await?;
+        let Some(table) = crate::governance_declarations::declared_table(store, kind).await? else {
+            continue;
+        };
         declaration_rows += table.lines().count();
         declaration_files.push((format!("{}.tsv", kind.name), format!("{stamp}{table}")));
     }
