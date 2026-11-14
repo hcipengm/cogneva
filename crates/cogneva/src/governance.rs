@@ -104,6 +104,23 @@ SUBCOMMANDS:
                            act that removes it. `--from -` reads stdin, which is
                            how a host with no database credentials feeds it in:
                            `kubectl exec -i ... import-readings --from -`.
+    drivers                Print the driver roster, five columns:
+                           front kind unit stopped-reading host. One unit is one
+                           node; a unit that drives several fronts states its
+                           stopped-reading once per front. The self-sufficiency
+                           gate parses this exactly as it parsed the declaration
+                           file, which no longer exists.
+    import-drivers --from <file> [--upsert]
+                           Put a five-column roster into the graph. Without
+                           --upsert it replaces the roster: units the input no
+                           longer names are cancelled, which is the shape of the
+                           one-time move of the legacy declaration table.
+                           --upsert only writes the units the input names: the
+                           host re-reads the unit files that exist, and a unit
+                           that is not installed is a red the gate must keep
+                           seeing, not a row to drop. `--from -` reads stdin for
+                           the same reason as import-readings — the host that
+                           owns the units holds no database credentials.
     progress [--json]
                            One reading of three ledgers at the same instant: the
                            task graph by the unit it names, the change account,
@@ -166,6 +183,14 @@ pub enum Action {
     ImportReadings {
         from: PathBuf,
     },
+    /// The driver roster, five columns, straight from the graph.
+    Drivers,
+    ImportDrivers {
+        from: PathBuf,
+        /// Only write the units the input names. The host's reconciliation uses
+        /// this; the one-time replacement of the legacy table does not.
+        upsert: bool,
+    },
     // Boxed: a handover carries a spec whose text fields make it the widest
     // variant, and every other action would pay for that width. One CLI
     // process builds exactly one of these, so the extra allocation costs
@@ -215,6 +240,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut brief = false;
     let mut json = false;
     let mut keep_ownership = false;
+    let mut upsert = false;
     let mut out: Option<PathBuf> = None;
     let mut from: Option<PathBuf> = None;
     let mut face: Option<String> = None;
@@ -233,6 +259,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             "--brief" => brief = true,
             "--json" => json = true,
             "--keep-ownership" => keep_ownership = true,
+            "--upsert" => upsert = true,
             "--out" => {
                 out = Some(PathBuf::from(iter.next().ok_or("--out needs a directory")?));
             }
@@ -269,6 +296,11 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         Some("readings") => Action::Readings,
         Some("import-readings") => Action::ImportReadings {
             from: from.ok_or("import-readings needs --from <file>")?,
+        },
+        Some("drivers") => Action::Drivers,
+        Some("import-drivers") => Action::ImportDrivers {
+            from: from.ok_or("import-drivers needs --from <file>")?,
+            upsert,
         },
         Some(other) => return Err(format!("unknown governance subcommand {other}")),
         None => return Err("governance needs a subcommand".into()),
@@ -393,6 +425,8 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         }
         Action::Readings => readings_roster(&*store).await?,
         Action::ImportReadings { from } => import_readings(&*store, &from).await?,
+        Action::Drivers => drivers_roster(&*store).await?,
+        Action::ImportDrivers { from, upsert } => import_drivers(&*store, &from, upsert).await?,
         Action::Act(act) => {
             // The heartbeat store is what an exit handover's apply step
             // re-reads. Without it the command still works for every handover
@@ -525,20 +559,50 @@ async fn readings_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-async fn import_readings(store: &dyn GovernanceStore, from: &Path) -> Result<(), Box<dyn Error>> {
-    // `-` reads stdin. The roster has to get into the graph from a host that holds
-    // no database credentials, so the route is `kubectl exec -i ... import-readings
-    // --from -`: piped in, nothing staged on the pod's disk and nothing left there.
-    let text = if from == Path::new("-") {
+/// A roster import's input. `-` reads stdin: the roster has to get into the graph
+/// from a host that holds no database credentials, so the route is
+/// `kubectl exec -i ... import-<roster> --from -`: piped in, nothing staged on
+/// the pod's disk and nothing left there.
+fn read_roster_input(from: &Path) -> Result<String, Box<dyn Error>> {
+    if from == Path::new("-") {
         let mut text = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
             .map_err(|why| format!("cannot read stdin: {why}"))?;
-        text
+        Ok(text)
     } else {
         std::fs::read_to_string(from)
-            .map_err(|why| format!("cannot read {}: {why}", from.display()))?
-    };
+            .map_err(|why| format!("cannot read {}: {why}", from.display()).into())
+    }
+}
+
+async fn import_readings(store: &dyn GovernanceStore, from: &Path) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
     let summary = crate::governance_readings::import_from_text(store, &text).await?;
+    println!("{}", summary.line());
+    Ok(())
+}
+
+/// The driver roster, exactly the five columns the self-sufficiency gate parses.
+///
+/// Printed from the graph on every call: the gate has to judge the same rows the
+/// platform holds, and a cached copy on the host would be a second account of
+/// which units drive what — the thing the declaration file already was.
+async fn drivers_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Error>> {
+    print!("{}", crate::governance_drivers::roster(store).await?);
+    Ok(())
+}
+
+async fn import_drivers(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    upsert: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
+    let summary = if upsert {
+        crate::governance_drivers::upsert_from_text(store, &text).await?
+    } else {
+        crate::governance_drivers::import_from_text(store, &text).await?
+    };
     println!("{}", summary.line());
     Ok(())
 }
