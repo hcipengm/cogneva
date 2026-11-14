@@ -38,6 +38,27 @@ export interface OwnerMemoryWire {
   entries?: OwnerMemoryEntryWire[];
 }
 
+/**
+ * 一段对话现在说到哪儿了：服务端在重连时发来的快照。
+ *
+ * 语义是替换：按 `message_id` 把这一条消息的正文与思考整段换成这里的样子，之后
+ * 到的增量接着往上写。所以重连几次都不会把同一句话叠两遍。
+ */
+export interface ResumedMessageWire {
+  message_id?: string;
+  role?: string;
+  text?: string;
+  thinking?: string;
+  attachment?: unknown;
+  ended?: boolean;
+}
+
+export interface ChatResumeWire {
+  session_id?: string;
+  messages?: ResumedMessageWire[];
+}
+
+/**
 export interface PermissionAskWire {
   request_id?: string;
   session_id?: string;
@@ -81,6 +102,12 @@ export interface WebSocketOptions {
    * 会被当成一句助手说的话。
    */
   onOwnerMemory?: (entries: OwnerMemoryEntryWire[]) => void;
+  /**
+   * 一段对话的续流快照。它不走 `onChatFrame`：那一族是这一轮吐出来的每一帧，
+   * 而这是「刚才没看着的那一段现在是什么样」——按消息整段替换，不是增量。
+   */
+  onChatResume?: (resume: ChatResumeWire) => void;
+  /**
   onStatusChange?: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -140,6 +167,7 @@ export class EventStreamClient {
       this.setStatus('open');
       this.subscribe();
       this.startHeartbeat();
+      this.options.onOpen?.();
     };
 
     this.ws.onmessage = (event) => {
@@ -268,6 +296,13 @@ export class EventStreamClient {
       // 的那一份按空名单处理，不拿上次的名单冒充这一次。
       const wire = message as unknown as OwnerMemoryWire;
       this.options.onOwnerMemory?.(Array.isArray(wire.entries) ? wire.entries : []);
+      return;
+    } else if (message.type === 'chat_resume') {
+      // 认不出形状的那一份按「这一段没有话在流」处理，不拿上次的内容冒充这次。
+      const wire = message as unknown as ChatResumeWire;
+      this.options.onChatResume?.(
+        Array.isArray(wire.messages) ? wire : { session_id: wire.session_id, messages: [] }
+      );
       return;
     } else if (message.type === 'notification' && message.payload) {
       const notification = normalizeNotification(

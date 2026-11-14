@@ -93,7 +93,6 @@ fn start_chat_turn(
     state: &Arc<GatewayState>,
     out_tx: &tokio::sync::mpsc::Sender<String>,
     conn: Connection<'_>,
-    running: &crate::chat::RunningTurns,
     permissions: &Arc<crate::chat::PermissionChannel>,
     session_id: Option<String>,
     content: String,
@@ -101,13 +100,13 @@ fn start_chat_turn(
     attachments: Vec<cog_core::ChatAttachment>,
 ) {
     let state = state.clone();
-    let out = out_tx.clone();
     let session = session_id.unwrap_or_else(|| "default".into());
     let owner = conn.user_id.to_string();
     // 借用版活不过 spawn：来历里那两格先拷成自己的字符串，闭包里再借回去。
     let platform = conn.origin.platform.map(str::to_string);
     let device_id = conn.origin.device_id.map(str::to_string);
-    let running = running.clone();
+    // 这一轮说的是这一段对话的流；停止与续流都按会话找它（见 `chat_stream`）。
+    let stream = state.chat_stream.clone();
     // 这一轮的问人通道就是这条连接：问句从这里出去，答案从 `permission_response`
     // 回来。模式取这一段对话当前那一格。
     let mode = permissions.mode(&session);
@@ -124,19 +123,32 @@ fn start_chat_turn(
         };
         crate::chat::run_chat_turn(
             state,
-            out,
+            stream,
             session,
             content,
             command,
             attachments,
             owner,
             origin,
-            running,
             mode,
             Some(bridge),
         )
         .await;
     });
+}
+
+fn watch_session(
+    state: &Arc<GatewayState>,
+    watched: &mut std::collections::HashSet<String>,
+    session_id: Option<&str>,
+    out_tx: &tokio::sync::mpsc::Sender<String>,
+) {
+    let session = session_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("default");
+    if watched.insert(session.to_string()) {
+        state.chat_stream.watch(session, out_tx.clone());
+    }
 }
 
 async fn handle_type_message(
@@ -145,8 +157,9 @@ async fn handle_type_message(
     conn: Connection<'_>,
     text: &str,
     out_tx: &tokio::sync::mpsc::Sender<String>,
-    // 这条连接上正在跑的轮：`chat_cancel` 按会话找它们。
-    running: &crate::chat::RunningTurns,
+    // 这条连接已经接上哪几段对话的流。接上就是「这一段的帧发到这条 socket」；
+    // 同一条连接重复接同一段会多一条转发，每一帧都到两次，所以按会话去重。
+    watched: &mut std::collections::HashSet<String>,
     // 这条连接上的权限通道：问句出去、答案回来都走它，模式按会话记在这里。
     permissions: &Arc<crate::chat::PermissionChannel>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -197,11 +210,11 @@ async fn handle_type_message(
             if content.is_empty() && attachments.is_empty() {
                 return Ok(());
             }
+            watch_session(state, watched, session_id.as_deref(), out_tx);
             start_chat_turn(
                 state,
                 out_tx,
                 conn,
-                running,
                 permissions,
                 session_id,
                 content,
@@ -221,11 +234,11 @@ async fn handle_type_message(
             if invocation.line().trim() == "/" {
                 return Ok(());
             }
+            watch_session(state, watched, session_id.as_deref(), out_tx);
             start_chat_turn(
                 state,
                 out_tx,
                 conn,
-                running,
                 permissions,
                 session_id,
                 invocation.line(),
@@ -310,7 +323,7 @@ async fn handle_type_message(
             // 没有在跑的那一段上按停止不是错：用户可能刚好在上一轮结束的那一瞬
             // 按下去。这时什么都不发生，也不该有一条「取消失败」的帧——他真正
             // 关心的是屏幕上那一轮停了没有，而它已经停了。
-            let stopped = running.cancel(&session_id);
+            let stopped = state.chat_stream.running().cancel(&session_id);
             tracing::debug!(session = %session_id, stopped, "chat cancel");
         }
     }
@@ -387,9 +400,9 @@ pub async fn handle_socket(
     // Outbound queue for messages produced outside the event broadcast (e.g.
     // chat replies from spawned LLM tasks).
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
-    // 这一条连接上正在跑的轮。按连接分，不放进 `GatewayState`：一段对话的停止是
-    // 「这一次连接里跑着的那几轮」，从别的标签页发出的停止不该停掉这一页上的回答。
-    let running = crate::chat::RunningTurns::new();
+    // 这条连接接上了哪几段对话的流。断线重连上来的是一条新连接，它的这一格是
+    // 空的——所以它会重新接一次，并且先收到一份快照（见 `chat_stream`）。
+    let mut watched: std::collections::HashSet<String> = std::collections::HashSet::new();
     // 这条连接上的权限通道：一段对话一格模式，一行问题一个等待位。
     let permissions = Arc::new(crate::chat::PermissionChannel::new());
 
@@ -523,7 +536,7 @@ pub async fn handle_socket(
                                 },
                                 &text,
                                 &out_tx,
-                                &running,
+                                &mut watched,
                                 &permissions,
                             )
                             .await

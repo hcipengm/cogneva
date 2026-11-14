@@ -1,13 +1,16 @@
 import { useEffect, useRef } from 'react';
-import { EventStreamClient } from '@/transport/websocket';
+import {
+  EventStreamClient,
+  type ResumedMessageWire,
+} from '@/transport/websocket';
 import { MockEventStreamClient } from '@/transport/mockStream';
 import {
   describeEvent,
   useStreamStore,
   type FrameSink,
 } from '@/store/streamStore';
-import type { ChatRole } from '@/types/events';
-import { useChatStore } from '@/store/chatStore';
+import { chatAttachment, type ChatRole } from '@/types/events';
+import { FIRST_SESSION, useChatStore } from '@/store/chatStore';
 import { agentFrame } from '@/store/liveAgents';
 import { alertFrame } from '@/store/liveAlerts';
 import { commsFrame } from '@/store/liveComms';
@@ -91,6 +94,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const noteFrame = useStreamStore((state) => state.noteFrame);
   const noteUnrecorded = useStreamStore((state) => state.noteUnrecorded);
   const ingestChatFrame = useChatStore((state) => state.ingestFrame);
+  const applyChatResume = useChatStore((state) => state.applyResume);
   const noteAgentFrame = useLiveAgentStore((state) => state.noteFrame);
   const noteAlertFrame = useLiveAlertStore((state) => state.noteFrame);
   const noteCommsFrame = useLiveCommsStore((state) => state.noteFrame);
@@ -325,12 +329,49 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       for (const kind of touched) noteFaceTick(kind);
     };
 
+    /**
+     * 每一次连上（含重连）第一件事：把「我正在看的那一段」重新接上。
+     *
+     * 不接的话，断线时那一轮还在说，而这一页再也收不到它的下文——人看到的
+     * 是「网一抖，回答停在那儿了」。接上之后服务端先回一份快照，那一句接着写。
+     */
+    const resumeOpenSession = () => {
+      const active = useChatStore.getState().active;
+      if (active) clientRef.current?.send({ type: 'chat_resume', session_id: active });
+    };
+
+    const ingestChatResume = (sessionId: string | undefined, messages: ResumedMessageWire[]) => {
+      const session = sessionId || FIRST_SESSION;
+      applyChatResume(
+        session,
+        messages.flatMap((line) =>
+          line.message_id && typeof line.text === 'string'
+            ? [
+                {
+                  messageId: line.message_id,
+                  role: (line.role === 'user' ? 'user' : 'assistant') as ChatRole,
+                  text: line.text,
+                  thinking: typeof line.thinking === 'string' ? line.thinking : '',
+                  attachment: chatAttachment(line.attachment),
+                  ended: line.ended === true,
+                },
+              ]
+            : []
+        )
+      );
+    };
+
+    /**
     const channels = channelKey ? channelKey.split(',') : [];
     const client = options.mock
       ? new MockEventStreamClient({
           onEvent: handleEvent,
           onChatFrame: ingestChatFrame,
-          onStatusChange: (status) => setConnectionStatus(status),
+          onStatusChange: (status) => {
+            setConnectionStatus(status);
+            // 演示流也会断：接上时同样要把这一段续上。
+            if (status === 'open') resumeOpenSession();
+          },
         })
       : new EventStreamClient({
           url: options.url ?? '',
@@ -373,6 +414,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           },
           // 约定名单同理：少一格（没有号或没有原文）的那一条不落——没有号就撤
           // 不掉，没有原文就画不出一句人写的话。
+          onChatResume: (resume) => ingestChatResume(resume.session_id, resume.messages ?? []),
+          onOpen: resumeOpenSession,
           onOwnerMemory: (entries) => {
             const known = entries.flatMap((entry) =>
               entry.id && entry.text ? [{ id: entry.id, text: entry.text }] : []
@@ -396,7 +439,19 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     clientRef.current = client;
     client.connect();
 
+    // 换到另一段对话时，把这一段的现场接上。连上的那一刻接的是当时正在看的那一段；
+    // 之后人再切走、切回来，那一段可能还在说——不接的话，切回来看到的是切换前的
+    // 旧字，而回答已经往后写了。切走时不必退订：广播一直留着这一段的帧，再一次
+    // `chat_resume` 就是一份新快照，重复接同一条不会多出字。
+    let watching = useChatStore.getState().active;
+    const stopWatching = useChatStore.subscribe((state) => {
+      if (state.active === watching) return;
+      watching = state.active;
+      resumeOpenSession();
+    });
+
     return () => {
+      stopWatching();
       client.disconnect();
       clientRef.current = null;
     };
@@ -414,6 +469,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     noteFrame,
     noteUnrecorded,
     ingestChatFrame,
+    applyChatResume,
     noteAgentFrame,
     noteAlertFrame,
     noteCommsFrame,

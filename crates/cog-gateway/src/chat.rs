@@ -882,7 +882,7 @@ where
 /// 路可以得到它们。
 async fn pump_events(
     mut events: mpsc::Receiver<cog_core::AgentEvent>,
-    out: mpsc::Sender<String>,
+    out: crate::chat_stream::ChatStream,
     // 同一帧也落在这条总线上。界面（员工那一面、活动流）读的是总线上的
     // `agent:<id>`，不是这一条连接：只在连接里发，页面上什么都不会动。
     bus: tokio::sync::broadcast::Sender<cog_core::AgentEvent>,
@@ -1058,7 +1058,7 @@ async fn pump_events(
 fn json_text(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
-fn envelope(session_id: &str, event_type: &str, inner: serde_json::Value) -> String {
+fn envelope(session_id: &str, event_type: &str, inner: &serde_json::Value) -> String {
     let msg = ServerMessage::AgentEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         session_id: Some(session_id.to_string()),
@@ -1075,17 +1075,24 @@ fn envelope(session_id: &str, event_type: &str, inner: serde_json::Value) -> Str
 }
 
 async fn emit(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     event_type: &str,
     inner: serde_json::Value,
 ) {
-    // Receiver only disappears when the socket loop ended — nothing to do then.
-    let _ = out.send(envelope(session_id, event_type, inner)).await;
+    // 交给这一段的流：此刻在看它的每一条连接各收一份，同时记进快照——断线的那
+    // 一头重连时拿到的就是这里记下的字。没有人在看不是错误，是这件事本身要处理
+    // 的情形（见 `chat_stream`）。
+    out.publish(
+        session_id,
+        event_type,
+        &inner,
+        envelope(session_id, event_type, &inner),
+    );
 }
 
 async fn emit_message_start(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     role: &str,
@@ -1108,7 +1115,12 @@ async fn emit_message_start(
     .await;
 }
 
-async fn emit_delta(out: &mpsc::Sender<String>, session_id: &str, message_id: &str, delta: &str) {
+async fn emit_delta(
+    out: &crate::chat_stream::ChatStream,
+    session_id: &str,
+    message_id: &str,
+    delta: &str,
+) {
     emit(
         out,
         session_id,
@@ -1118,7 +1130,11 @@ async fn emit_delta(out: &mpsc::Sender<String>, session_id: &str, message_id: &s
     .await;
 }
 
-async fn emit_thinking_start(out: &mpsc::Sender<String>, session_id: &str, message_id: &str) {
+async fn emit_thinking_start(
+    out: &crate::chat_stream::ChatStream,
+    session_id: &str,
+    message_id: &str,
+) {
     emit(
         out,
         session_id,
@@ -1129,7 +1145,7 @@ async fn emit_thinking_start(out: &mpsc::Sender<String>, session_id: &str, messa
 }
 
 async fn emit_thinking_delta(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     delta: &str,
@@ -1143,7 +1159,11 @@ async fn emit_thinking_delta(
     .await;
 }
 
-async fn emit_thinking_end(out: &mpsc::Sender<String>, session_id: &str, message_id: &str) {
+async fn emit_thinking_end(
+    out: &crate::chat_stream::ChatStream,
+    session_id: &str,
+    message_id: &str,
+) {
     emit(
         out,
         session_id,
@@ -1153,7 +1173,11 @@ async fn emit_thinking_end(out: &mpsc::Sender<String>, session_id: &str, message
     .await;
 }
 
-async fn emit_message_end(out: &mpsc::Sender<String>, session_id: &str, message_id: &str) {
+async fn emit_message_end(
+    out: &crate::chat_stream::ChatStream,
+    session_id: &str,
+    message_id: &str,
+) {
     emit(
         out,
         session_id,
@@ -1174,7 +1198,7 @@ async fn emit_message_end(out: &mpsc::Sender<String>, session_id: &str, message_
 /// 的账没有读回来。
 async fn emit_turn_usage(
     ledger: Option<&dyn cog_core::LlmUsageLedger>,
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     usage: Option<&serde_json::Value>,
@@ -1209,7 +1233,7 @@ async fn emit_turn_usage(
 /// 不会有 `memory` 这一格，于是也不会有这一帧——「这一轮没有约定」与「这个平台
 /// 不读约定」在屏幕上必须分得开：后者是配置还没接上，前者是这个人还没写。
 async fn emit_turn_memory(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     memory: Option<&serde_json::Value>,
@@ -1246,7 +1270,7 @@ async fn emit_turn_memory(
 /// 与「挂了但连不上」在屏幕上必须分得开，后者的下一步是去查那台服务，前者是去
 /// 配一个端点。
 async fn emit_turn_mcp(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     mcp: Option<&serde_json::Value>,
@@ -1282,7 +1306,7 @@ async fn emit_turn_mcp(
 /// 同事的收件箱里写过东西时装配层才挂这一格，所以帧的出现本身就说明这一段对话
 /// 跟别的智能体说过话——不必去翻通信面板或日志。
 async fn emit_turn_colleagues(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     colleagues: Option<&serde_json::Value>,
@@ -1330,7 +1354,7 @@ async fn emit_turn_colleagues(
 /// 属于哪个 goal）；状态由页面拿这些 id 去任务图那同一张表里读回，所以列表上的
 /// 「谁在做、做到哪」跟着任务图走，而不是跟着派活那一刻冻结。
 async fn emit_turn_tasks(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     tasks: Option<&serde_json::Value>,
@@ -1372,7 +1396,7 @@ async fn emit_turn_tasks(
 /// 一条已生效的钩子看起来一样；只有运行记录的时候，一条被配错模式的钩子看起
 /// 来像没配。把两份并排发，读的人第一眼就知道该去调配置还是去查那一轮。
 async fn emit_turn_hooks(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     hooks: Option<&serde_json::Value>,
@@ -1598,7 +1622,7 @@ pub async fn quota_handler(
 /// 开头是什么），不在这里写一句人话——同一句话在界面与日志里各写一遍，改一处
 /// 漏一处时两边的说法就开始不一样。
 async fn emit_turn_compaction(
-    out: &mpsc::Sender<String>,
+    out: &crate::chat_stream::ChatStream,
     session_id: &str,
     message_id: &str,
     compaction: Option<&serde_json::Value>,
@@ -1857,7 +1881,7 @@ async fn record_failed_turn(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chat_turn(
     state: Arc<GatewayState>,
-    out: mpsc::Sender<String>,
+    out: crate::chat_stream::ChatStream,
     session_id: String,
     content: String,
     // 这一句点的哪一条命令（`/名字`），`None` 是普通的一句话。命令不是发给模型的
@@ -1872,13 +1896,14 @@ pub async fn run_chat_turn(
     // 这条连接握手时自报的平台与设备，原样带进这一轮。见 [`ConversationRequest`]。
     // 两格一起走：它们回答同一个问题，分开传只是把参数个数往上加一个。
     origin: ClientOrigin<'_>,
-    // 这条连接上正在跑的轮。这一轮登记进去，客户端的停止才找得到它。
-    running: RunningTurns,
     // 这一轮处在哪种权限模式下（闭集里的名字），以及问人的那条路。两格一起走：
     // 模式决定问不问，通道决定问得到谁。
     permission_mode: String,
     permissions: Option<Arc<dyn PermissionBridge>>,
 ) {
+    // 这一段上正在跑的轮都在这一台上的名册里：连接断掉、换一条重连上来，停止
+    // 按钮仍按得动——名册跟着对话走，不跟着 socket 走。
+    let running = out.running().clone();
     // 一条太长、整条进不了上下文的消息，先在执行器那边落成文件：原文一个字节都
     // 不丢，循环看到的只是引用与开头。这一步排在回声之前，因为回声那一帧就要把
     // 「这条消息是附件」带给界面。
@@ -2334,6 +2359,16 @@ mod tests {
     /// 一个把每一句都放过去的阈值：下面这几条量的是历史本身，不是「多长算长」。
     const NEVER_OVERSIZED: usize = usize::MAX / 2;
 
+    /// 这一小段里不该再来帧。
+    ///
+    /// 帧先落进这一段的流，再由转发的那一头写进这条管道：`try_recv` 在帧还在路上
+    /// 时就报空，所以「没有第二帧」要等一小会儿再读，而不是立刻读。
+    async fn no_more_frames(out_rx: &mut mpsc::Receiver<String>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(50), out_rx.recv())
+            .await
+            .is_err()
+    }
+
     /// 一次询问要走到人面前，答案要回到正好问出它的那一问上。
     ///
     /// 三条一起成立才算通：问句真的出了这条连接（屏幕上没有它，那一轮就一直等
@@ -2411,7 +2446,7 @@ mod tests {
         let raw = envelope(
             "s1",
             "message.goal",
-            serde_json::json!({ "message_id": "m-1", "goal_id": "goal-9" }),
+            &serde_json::json!({ "message_id": "m-1", "goal_id": "goal-9" }),
         );
         let value: serde_json::Value = serde_json::from_str(&raw).expect("frame is JSON");
         let event = &value["payload"];
@@ -2433,13 +2468,13 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel(8);
         let (out_tx, mut out_rx) = mpsc::channel(32);
         let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
-        let pump = tokio::spawn(pump_events(
-            events_rx,
-            out_tx,
-            bus,
-            "s1".into(),
-            "m-1".into(),
-        ));
+        // 帧走这一段的流：接上看，和一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(64);
+        live.watch("s1", out_tx);
+        // 接上先收到一份快照（这一段现在没有话在流），之后才是这一轮的帧。
+        let resume = out_rx.recv().await.expect("resume frame");
+        assert!(resume.contains("chat_resume"), "{resume}");
+        let pump = tokio::spawn(pump_events(events_rx, live, bus, "s1".into(), "m-1".into()));
 
         let update = |event| AgentEvent::MessageUpdate {
             agent_id: "a".into(),
@@ -2469,9 +2504,13 @@ mod tests {
         assert!(journal.goals.is_empty());
 
         let mut lines = Vec::new();
-        while let Some(line) = out_rx.recv().await {
-            lines.push(line);
+        for _ in 0..4 {
+            lines.push(out_rx.recv().await.expect("这一帧要发出去"));
         }
+        assert!(
+            out_rx.try_recv().is_err(),
+            "一轮里说的字都发过了，不该有余下的帧"
+        );
         let joined = lines.join("\n");
         // 三段文字是三帧，前面还有一帧说明这一轮是谁在说。
         assert_eq!(lines.len(), 4, "一段话三帧，加上身份那一帧：{joined}");
@@ -2492,13 +2531,13 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel(8);
         let (out_tx, mut out_rx) = mpsc::channel(32);
         let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
-        let pump = tokio::spawn(pump_events(
-            events_rx,
-            out_tx,
-            bus,
-            "s1".into(),
-            "m-1".into(),
-        ));
+        // 帧走这一段的流：接上看，和一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(64);
+        live.watch("s1", out_tx);
+        // 接上先收到一份快照（这一段现在没有话在流），之后才是这一轮的帧。
+        let resume = out_rx.recv().await.expect("resume frame");
+        assert!(resume.contains("chat_resume"), "{resume}");
+        let pump = tokio::spawn(pump_events(events_rx, live, bus, "s1".into(), "m-1".into()));
 
         for _ in 0..2 {
             events_tx
@@ -2516,12 +2555,18 @@ mod tests {
         let _ = pump.await;
 
         let mut identity = Vec::new();
-        while let Some(line) = out_rx.recv().await {
+        // 这一轮只有身份那一帧：同一个人重复开口也只报一次，所以后面不该再来。
+        for _ in 0..1 {
+            let line = out_rx.recv().await.expect("身份那一帧要发出去");
             let value: serde_json::Value = serde_json::from_str(&line).expect("frame is JSON");
             if value["payload"]["type"] == "agent.identity" {
                 identity.push(value);
             }
         }
+        assert!(
+            no_more_frames(&mut out_rx).await,
+            "同一个人一轮里只报一次，重复报就是重复的条目"
+        );
         assert_eq!(
             identity.len(),
             1,
@@ -2546,13 +2591,9 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel(8);
         let (out_tx, _out_rx) = mpsc::channel(32);
         let (bus, mut bus_rx) = tokio::sync::broadcast::channel(8);
-        let pump = tokio::spawn(pump_events(
-            events_rx,
-            out_tx,
-            bus,
-            "s1".into(),
-            "m-1".into(),
-        ));
+        let live = crate::chat_stream::ChatStream::new(64);
+        live.watch("s1", out_tx);
+        let pump = tokio::spawn(pump_events(events_rx, live, bus, "s1".into(), "m-1".into()));
 
         events_tx
             .send(AgentEvent::ToolExecutionStart {
@@ -2594,13 +2635,13 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel(8);
         let (out_tx, mut out_rx) = mpsc::channel(32);
         let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
-        let pump = tokio::spawn(pump_events(
-            events_rx,
-            out_tx,
-            bus,
-            "s1".into(),
-            "m-1".into(),
-        ));
+        // 帧走这一段的流：接上看，和一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(64);
+        live.watch("s1", out_tx);
+        // 接上先收到一份快照（这一段现在没有话在流），之后才是这一轮的帧。
+        let resume = out_rx.recv().await.expect("resume frame");
+        assert!(resume.contains("chat_resume"), "{resume}");
+        let pump = tokio::spawn(pump_events(events_rx, live, bus, "s1".into(), "m-1".into()));
 
         // 真事件流是「开始 → 结局」成对的：结局只带调用号，名字在开始那一帧上。
         let started = |id: &str, tool: &str| AgentEvent::ToolExecutionStart {
@@ -2643,9 +2684,13 @@ mod tests {
         );
 
         let mut frames = Vec::new();
-        while let Some(line) = out_rx.recv().await {
-            frames.push(line);
+        for _ in 0..3 {
+            frames.push(out_rx.recv().await.expect("这一帧要发出去"));
         }
+        assert!(
+            out_rx.try_recv().is_err(),
+            "同一个目标不报第二遍：不该有第四帧"
+        );
         // 身份那一帧 + 两个不同的目标各一帧（goal-1 重复，不报第二遍）。
         assert_eq!(frames.len(), 3, "{frames:?}");
         assert!(frames[0].contains("agent.identity"), "{frames:?}");
@@ -2665,13 +2710,9 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel(8);
         let (out_tx, _out_rx) = mpsc::channel(32);
         let (bus, _bus_rx) = tokio::sync::broadcast::channel(8);
-        let pump = tokio::spawn(pump_events(
-            events_rx,
-            out_tx,
-            bus,
-            "s1".into(),
-            "m-1".into(),
-        ));
+        let live = crate::chat_stream::ChatStream::new(64);
+        live.watch("s1", out_tx);
+        let pump = tokio::spawn(pump_events(events_rx, live, bus, "s1".into(), "m-1".into()));
 
         let started_at = chrono::Utc::now();
         events_tx
@@ -2749,6 +2790,10 @@ mod tests {
     #[tokio::test]
     async fn the_turn_s_usage_reaches_the_interface_as_one_frame() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
         let counted = serde_json::json!({
             "input_tokens": 1234,
             "output_tokens": 56,
@@ -2760,7 +2805,7 @@ mod tests {
             "cost_usd": 0.0123,
         });
 
-        emit_turn_usage(None, &out_tx, "s1", "m-1", Some(&counted)).await;
+        emit_turn_usage(None, &live, "s1", "m-1", Some(&counted)).await;
 
         let frame = out_rx.recv().await.expect("这一帧要发出去");
         assert!(frame.contains("\"message.usage\""), "{frame}");
@@ -2921,9 +2966,13 @@ mod tests {
     async fn the_usage_frame_carries_the_conversation_s_total_so_far() {
         let ledger = SessionLedger;
         let (out_tx, mut out_rx) = mpsc::channel(4);
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
         let counted = serde_json::json!({ "input_tokens": 100, "output_tokens": 10 });
 
-        emit_turn_usage(Some(&ledger), &out_tx, "s1", "m-1", Some(&counted)).await;
+        emit_turn_usage(Some(&ledger), &live, "s1", "m-1", Some(&counted)).await;
 
         let frame = out_rx.recv().await.expect("这一帧要发出去");
         let frame: serde_json::Value = serde_json::from_str(&frame).expect("一帧 JSON");
@@ -2944,9 +2993,13 @@ mod tests {
     #[tokio::test]
     async fn a_missing_ledger_reads_as_unread_not_as_zero() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
         let counted = serde_json::json!({ "input_tokens": 100, "output_tokens": 10 });
 
-        emit_turn_usage(None, &out_tx, "s1", "m-1", Some(&counted)).await;
+        emit_turn_usage(None, &live, "s1", "m-1", Some(&counted)).await;
 
         let frame: serde_json::Value =
             serde_json::from_str(&out_rx.recv().await.expect("这一帧要发出去")).unwrap();
@@ -3058,6 +3111,10 @@ mod tests {
     #[tokio::test]
     async fn a_turn_that_squeezed_the_context_says_so_in_one_frame() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
         let squeezed = serde_json::json!({
             "dropped_messages": 12,
             "freed_tokens": 3456,
@@ -3068,7 +3125,7 @@ mod tests {
             "target_tokens": 32000,
         });
 
-        emit_turn_compaction(&out_tx, "s1", "m-1", Some(&squeezed)).await;
+        emit_turn_compaction(&live, "s1", "m-1", Some(&squeezed)).await;
 
         let frame = out_rx.recv().await.expect("这一帧要发出去");
         assert!(frame.contains("\"message.compaction\""), "{frame}");
@@ -3089,12 +3146,17 @@ mod tests {
     #[tokio::test]
     async fn a_turn_that_did_not_squeeze_anything_says_nothing() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
 
-        emit_turn_compaction(&out_tx, "s1", "m-1", None).await;
-        drop(out_tx);
+        emit_turn_compaction(&live, "s1", "m-1", None).await;
 
+        // 这一帧压根没有产生：快照里因此也没有它（有的话，重连的人会看到一行
+        // 「这一轮挤掉了 0 条」）。
         assert!(
-            out_rx.recv().await.is_none(),
+            live.snapshot("s1").is_empty(),
             "循环没报裁剪时，屏幕上不该出现「挤掉 0 条」"
         );
     }
@@ -3103,12 +3165,15 @@ mod tests {
     #[tokio::test]
     async fn a_turn_without_a_reading_does_not_get_a_frame_of_zeroes() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
 
-        emit_turn_usage(None, &out_tx, "s1", "m-1", None).await;
-        drop(out_tx);
+        emit_turn_usage(None, &live, "s1", "m-1", None).await;
 
         assert!(
-            out_rx.recv().await.is_none(),
+            live.snapshot("s1").is_empty(),
             "循环没交出用量时，屏幕上不该出现一行零"
         );
     }
@@ -3866,7 +3931,7 @@ mod tests {
         let raw = envelope(
             "s1",
             "message.start",
-            serde_json::json!({"message_id": "m1", "role": "assistant"}),
+            &serde_json::json!({"message_id": "m1", "role": "assistant"}),
         );
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["type"], "agent_event");
@@ -4045,6 +4110,10 @@ mod tests {
     #[tokio::test]
     async fn each_message_to_a_colleague_is_one_frame_with_its_own_outcome() {
         let (out_tx, mut out_rx) = mpsc::channel(8);
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
         let sent = serde_json::json!([
             {
                 "to": "mira", "kind": "prompt", "content": "查一下构建",
@@ -4062,16 +4131,15 @@ mod tests {
             }
         ]);
 
-        emit_turn_colleagues(&out_tx, "s1", "m-1", Some(&sent)).await;
+        emit_turn_colleagues(&live, "s1", "m-1", Some(&sent)).await;
 
         let mut frames = Vec::new();
-        while let Ok(frame) = out_rx.try_recv() {
-            frames.push(frame);
+        for _ in 0..3 {
+            frames.push(out_rx.recv().await.expect("三帧都要发出去"));
         }
-        assert_eq!(
-            frames.len(),
-            3,
-            "三条消息要发三帧（合起来一帧读不出每一条的结局）：{frames:?}"
+        assert!(
+            no_more_frames(&mut out_rx).await,
+            "三条消息只该有三帧（合起来一帧读不出每一条的结局）：{frames:?}"
         );
         assert!(frames[0].contains("\"message.colleague\""), "{}", frames[0]);
         assert!(frames[0].contains("\"to\":\"mira\""), "{}", frames[0]);
@@ -4103,7 +4171,11 @@ mod tests {
     #[tokio::test]
     async fn a_turn_with_no_message_to_a_colleague_sends_no_frame() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
-        emit_turn_colleagues(&out_tx, "s1", "m-1", None).await;
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
+        emit_turn_colleagues(&live, "s1", "m-1", None).await;
         assert!(
             out_rx.try_recv().is_err(),
             "没有同事消息的一轮发了一帧：界面上会出现一行空话"
@@ -4117,6 +4189,10 @@ mod tests {
     #[tokio::test]
     async fn the_work_a_turn_filed_is_one_list_frame_without_frozen_state() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
         let filed = serde_json::json!([
             {
                 "task_id": "task-1",
@@ -4134,9 +4210,9 @@ mod tests {
             }
         ]);
 
-        emit_turn_tasks(&out_tx, "s1", "m-1", Some(&filed)).await;
+        emit_turn_tasks(&live, "s1", "m-1", Some(&filed)).await;
 
-        let frame = out_rx.try_recv().expect("派了活就该有这一帧");
+        let frame = out_rx.recv().await.expect("派了活就该有这一帧");
         assert!(frame.contains("\"message.tasks\""), "{frame}");
         assert!(frame.contains("\"task-1\""), "{frame}");
         assert!(frame.contains("\"task-2\""), "{frame}");
@@ -4146,7 +4222,7 @@ mod tests {
             "帧上带着派活那一刻的状态：任务图从此有一份永远停在入队的副本：{frame}"
         );
         assert!(
-            out_rx.try_recv().is_err(),
+            no_more_frames(&mut out_rx).await,
             "整份列表发了两帧：第二帧会把第一帧盖掉一部分"
         );
     }
@@ -4155,8 +4231,12 @@ mod tests {
     #[tokio::test]
     async fn a_turn_that_filed_nothing_sends_no_task_frame() {
         let (out_tx, mut out_rx) = mpsc::channel(4);
-        emit_turn_tasks(&out_tx, "s1", "m-1", None).await;
-        emit_turn_tasks(&out_tx, "s1", "m-1", Some(&serde_json::json!([]))).await;
+        // 帧走这一段的流：接上看，与一条真 socket 走的是同一条路。
+        let live = crate::chat_stream::ChatStream::new(8);
+        live.watch("s1", out_tx);
+        let _resume = out_rx.recv().await.expect("resume frame");
+        emit_turn_tasks(&live, "s1", "m-1", None).await;
+        emit_turn_tasks(&live, "s1", "m-1", Some(&serde_json::json!([]))).await;
         assert!(
             out_rx.try_recv().is_err(),
             "没派活的一轮发了一帧：界面上会出现一片空列表"

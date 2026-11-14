@@ -35,6 +35,7 @@ pub mod backup_admin;
 pub mod buildgate;
 pub mod capabilities;
 pub mod chat;
+pub mod chat_stream;
 pub mod cluster;
 pub mod collaboration;
 pub mod commands;
@@ -432,6 +433,11 @@ pub struct GatewayState {
     /// empty at construction and the chat says the wiring is missing rather
     /// than quietly answering with half the capability.
     pub conversation: chat::ConversationHandle,
+    /// 每一段对话的实时流与正在跑的轮（见 [`chat_stream::ChatStream`]）。
+    ///
+    /// 不在连接上：断线之后那一轮还在说，重连的是一条新连接，它要接得上；停止
+    /// 也按会话寻址，名册跟着对话走，不跟着某一条 socket 走。
+    pub chat_stream: chat_stream::ChatStream,
     /// Every command sent to an agent, with what came back. Written by the
     /// send route, read by the conversation view.
     pub agent_messages: AgentMessageHandle,

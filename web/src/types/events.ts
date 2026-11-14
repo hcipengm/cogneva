@@ -351,7 +351,7 @@ export interface ChatAttachment {
 }
 
 /** 帧里的附件格。没有路径就不认它：一个打不开的附件只能让人以为全文在那里。 */
-function chatAttachment(value: unknown): ChatAttachment | null {
+export function chatAttachment(value: unknown): ChatAttachment | null {
   if (!value || typeof value !== 'object') return null;
   const raw = value as { path?: unknown; chars?: unknown };
   if (typeof raw.path !== 'string' || !raw.path.trim()) return null;

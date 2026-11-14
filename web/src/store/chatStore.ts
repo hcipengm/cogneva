@@ -38,6 +38,25 @@ export type { ChatRole };
  */
 export type ChatStatus = 'sending' | 'streaming' | 'done' | 'failed';
 
+/**
+ * 重连时服务端交回的一条消息：这一段现在说到哪儿了。
+ *
+ * 它来自 `chat_resume` 那一帧，语义是**替换**：正文与思考按这里的样子整段换掉，
+ * 之后到的增量接着往上写。所以「重连两次也不会把同一句话叠两遍」是这条语义
+ * 直接给的，而不是靠客户端去记每一帧有没有见过。
+ */
+export interface ResumedMessage {
+  messageId: string;
+  role: ChatRole;
+  text: string;
+  thinking: string;
+  /** 落成文件的那条长消息（`message.start` 上带的那一格）。 */
+  attachment: ChatAttachment | null;
+  /** 这一句已经收尾。没收尾的就是「它还在说」。 */
+  ended: boolean;
+}
+
+/**
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -212,6 +231,15 @@ interface ChatState {
   /** 本地先入账。返回本地那一条的 id。 */
   appendUserTurn: (sessionId: string, text: string, files?: ChatFile[]) => string;
   ingestFrame: (frame: ChatFrame) => void;
+  /**
+   * 重连之后的续流：把这一段现在说到哪儿了接上。
+   *
+   * 断线时那一轮没有停，字也没有丢——它们记在这一段的服务端快照里。这一帧到达
+   * 时按消息整段替换正文与思考，之后到的增量接着往上写；所以这一趟既补上了断线
+   * 期间说的字，也不会把重连之前已经画出来的字再写一遍。
+   */
+  applyResume: (sessionId: string, messages: ResumedMessage[]) => void;
+  /**
   /** 从服务端读回历史。已读过时直接返回。 */
   hydrate: (sessionId: string) => Promise<void>;
   /** 读服务端那份会话名单，可带一个搜索词。 */
@@ -239,7 +267,7 @@ function titleFrom(text: string): string {
  * 默认那段对话的身份。与服务端此前的默认值保持一致：改一个字母，之前存下的
  * 对话就再也读不回来了，而它们看起来只是「不见了」。
  */
-const FIRST = 'default';
+export const FIRST_SESSION = 'default';
 
 function emptySession(id: string, title = '新的对话'): ChatSession {
   return {
@@ -271,7 +299,7 @@ interface DockEntry {
 }
 
 function bootDock(): { sessions: Record<string, ChatSession>; order: string[]; active: string } {
-  let entries: DockEntry[] = [{ id: FIRST, title: '新的对话' }];
+  let entries: DockEntry[] = [{ id: FIRST_SESSION, title: '新的对话' }];
   try {
     const raw = window.localStorage.getItem(DOCK_STORAGE_KEY);
     const parsed: unknown = raw ? JSON.parse(raw) : null;
@@ -729,6 +757,78 @@ export const useChatStore = create<ChatState>((set, get) => ({
       };
     });
     // 帧带来了一段新的对话：它现在开在拨号条上，刷新之后也应该还在。
+    if (!known) saveDock(get());
+  },
+
+  applyResume: (sessionId, messages) => {
+    const known = Boolean(get().sessions[sessionId]);
+    set((state) => {
+      let session = state.sessions[sessionId] ?? emptySession(sessionId);
+      for (const line of messages) {
+        // 用户那一句永远是说完的：它不是「还在流」的那一条。
+        const status: ChatStatus =
+          line.ended || line.role === 'user' ? 'done' : 'streaming';
+        if (session.messages.some((message) => message.id === line.messageId)) {
+          session = withMessage(session, line.messageId, (message) => ({
+            ...message,
+            // 整段替换：这就是续流的语义。
+            text: line.text,
+            thinking: line.thinking,
+            // 已经判成失败的那一条不被快照改写：失败原因是那一轮的事实，
+            // 而快照只说「说到哪儿了」。
+            status: message.status === 'failed' ? 'failed' : status,
+            attachment: line.attachment ?? message.attachment,
+          }));
+        } else {
+          session = {
+            ...session,
+            messages: [
+              ...session.messages,
+              {
+                id: line.messageId,
+                role: line.role,
+                text: line.text,
+                thinking: line.thinking,
+                status,
+                failure: null,
+                usage: null,
+                compaction: null,
+                memory: null,
+                mcp: null,
+                hooks: null,
+                colleagues: null,
+                tasks: null,
+                attachment: line.attachment,
+                files: [],
+                at: new Date().toISOString(),
+              },
+            ],
+          };
+        }
+      }
+      // 「正在流」只有一条：快照里没收尾的那一句。一条都没有时，还停在流上的
+      // 那些是断了的那一头留下的残影——那一轮已经不在跑了，不该永远转圈。
+      const inFlight = messages.filter(
+        (line) => !line.ended && line.role !== 'user'
+      );
+      const streaming = inFlight.length > 0 ? inFlight[inFlight.length - 1].messageId : null;
+      session =
+        streaming === null
+          ? {
+              ...session,
+              streaming: null,
+              messages: session.messages.map((message) =>
+                message.status === 'streaming' || message.status === 'sending'
+                  ? { ...message, status: 'done' as ChatStatus }
+                  : message
+              ),
+            }
+          : { ...session, streaming };
+      return {
+        sessions: { ...state.sessions, [sessionId]: session },
+        order: known ? state.order : [sessionId, ...state.order],
+      };
+    });
     if (!known) saveDock(get());
   },
 

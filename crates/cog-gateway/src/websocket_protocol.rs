@@ -162,6 +162,17 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// 重连之后接着看这一段：把「说到哪儿了」取回来。
+    ///
+    /// 断线期间这一轮还在跑，帧没有人收。重连时不重放每一帧，只取一份快照——
+    /// 客户端整段替换那条消息的正文，之后收到的增量接着往上写。
+    #[serde(rename = "chat_resume")]
+    ChatResume {
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
 }
 
 /// Server → Client WebSocket messages.
@@ -240,6 +251,19 @@ pub enum ServerMessage {
     #[serde(rename = "owner_memory")]
     OwnerMemory {
         entries: Vec<crate::chat::MemoryEntryView>,
+    },
+    /// 这一段现在说到哪儿了。重连时先收到它，再收到之后的每一帧。
+    ///
+    /// 语义是**替换**不是追加：客户端按 `message_id` 把正文与思考整段换成这里
+    /// 的样子，之后收到的 `message.text_delta` 接着往上写。所以重连几次都不会
+    /// 把同一句话叠两遍，服务端也不必为此记一份「每帧发到哪儿」的账。
+    ///
+    /// 空名单是真的「这一段现在没有话在流」：一分钟前答完的那一句在记录里，
+    /// 重开页面按 REST 读回来。
+    #[serde(rename = "chat_resume")]
+    ChatResume {
+        session_id: String,
+        messages: Vec<crate::chat_stream::MessageSnapshot>,
     },
 }
 

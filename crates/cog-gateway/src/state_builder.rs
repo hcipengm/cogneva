@@ -202,6 +202,11 @@ pub async fn build_gateway_state(
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_turns: chat_turns.clone(),
         conversation,
+        // 每一段对话的帧流与在跑的轮：跟着对话走，不跟着某一条连接走——连接断开
+        // 之后那一轮还在说，重连上来的人要接得上（见 `chat_stream`）。
+        chat_stream: crate::chat_stream::ChatStream::new(
+            config.system.websocket_event_cache_capacity,
+        ),
         agent_messages: agent_messages.clone(),
         datasets: datasets.clone(),
     });
