@@ -186,6 +186,34 @@ pub struct SandboxBoundary {
     pub lines: Vec<BoundaryLine>,
 }
 
+/// 编译队此刻的名单：几个位子、谁占着、谁在等（按轮到它的顺序）。
+///
+/// 它不只是执行器的内部状态，也是界面上「在等执行槽」那句话的唯一出处：等的人排在
+/// 第几只有队知道，编排侧自己不排这条队。`capacity: None` 是「说不出来」——没有编译队
+/// 的后端答不出容量，这与「容量是一」是两件事，读的人不能把前者读成后者。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildLaneReading {
+    pub capacity: Option<usize>,
+    pub holding: Vec<LaneHolder>,
+    pub waiting: Vec<LaneWaiter>,
+}
+
+/// 一个正占着编译位子的人。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneHolder {
+    pub agent: String,
+    pub held_ms: u64,
+}
+
+/// 一个在队里等的人，与它此刻的名次（从 1 数）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneWaiter {
+    pub place: usize,
+    pub agent: String,
+    pub tool: String,
+    pub waited_ms: u64,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn execute(&self, req: &SandboxRequest) -> crate::SFResult<SandboxResult>;
@@ -196,6 +224,13 @@ pub trait SandboxBackend: Send + Sync {
     /// 是两件事，前者不该被读成后者，更不该被读成「哪里都能写」。
     async fn boundary(&self) -> crate::SFResult<SandboxBoundary> {
         Err(crate::SFError::Agent("这个后端说不出自己的边界".into()))
+    }
+    /// 这条后端此刻的编译队。
+    ///
+    /// 默认回答「说不出来」，与 `boundary` 同一个理由：说不出队列的后端与队列是空的
+    /// 后端是两件事，前者不该被读成「没有人等」。
+    async fn lane(&self) -> crate::SFResult<BuildLaneReading> {
+        Err(crate::SFError::Agent("这个后端说不出自己的编译队".into()))
     }
     /// Pre-compile WASM module and cache, reducing repeated compilation cost.
     async fn precompile(&self, bytes: &[u8]) -> crate::SFResult<String>;

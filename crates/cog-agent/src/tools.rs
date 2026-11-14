@@ -43,6 +43,24 @@ const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 // cap: fixed — 有人排空，深度只盖一个调度间隙；深浅都不改变行为，取一个够用的值
 const SUBAGENT_EVENT_BUFFER: usize = 64;
 
+/// 命令还没开跑时，隔多久问一次执行器「我在编译队里排第几」。
+///
+/// 队只在执行器那一侧排，编排侧不问就不知道；一次编译的等待以秒计，半秒的粒度
+/// 够人看见「它在等」，又不至于让每一条排列着的编译多出几十次一问一答。
+// cap: bound — 问的间隔；它只决定界面上那一行「在等执行槽」多快出现，不决定谁等多久
+const LANE_PROBE: Duration = Duration::from_millis(500);
+
+/// 这一问自己的上限：执行器不应答时，一句「在等」不能把调用拖住。
+// cap: bound — 一次读数的超时；比它短会让读数常常读不到，比它长会让一个不应答的执行器拖慢这一轮
+const LANE_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// 同一个名次最多多久重复说一次。
+///
+/// 这一句是给还在等的人看的一行字，不是日志：每半秒把同一句话再说一遍，工具的中途
+/// 输出就会被同一条消息刷满。名次变了立刻再说——变了才是新的事实。
+// cap: fixed — 同一名次的重复间隔；重复与否不改变排队，只改变这一行多久刷新一次
+const LANE_NOTICE_EVERY: Duration = Duration::from_secs(5);
+
 /// 毫秒与秒之间的换算。
 ///
 /// 不是一个可调的界：等待窗口从工具一路传到服务端都是毫秒，只有 HTTP 客户端
@@ -61,6 +79,40 @@ const MILLIS_PER_SECOND: u64 = 1_000;
 /// is what the executor's own row default covers.
 // cap: bound — 一件活声明自己会花多久：不再按它砍行，按一轮接活的形状（想、调工具、等同伴）定这个声明
 const DEFAULT_WORK_ITEM_DECLARED_SECS: u64 = 3600;
+
+/// 问执行器一句「我的编译排在第几」，问到了就说给人听。
+///
+/// 这一句只来自执行器：队在那儿排，编排侧自己没有这条队可读。问不到就不说——
+/// 屏幕上少一行「在等」比多一行猜出来的位次好。
+async fn announce_lane_wait(
+    backend: &dyn cog_core::SandboxBackend,
+    agent_id: &str,
+    told: &mut Option<(usize, std::time::Instant)>,
+    sink: &ToolUpdateSink,
+) {
+    let Ok(Ok(reading)) = tokio::time::timeout(LANE_PROBE_TIMEOUT, backend.lane()).await else {
+        return;
+    };
+    let Some(waiting) = reading
+        .waiting
+        .iter()
+        .find(|waiter| waiter.agent == agent_id)
+    else {
+        return;
+    };
+    let said_recently = told
+        .as_ref()
+        .is_some_and(|(place, at)| *place == waiting.place && at.elapsed() < LANE_NOTICE_EVERY);
+    if said_recently {
+        return;
+    }
+    *told = Some((waiting.place, std::time::Instant::now()));
+    sink(&format!(
+        "在等执行槽：排第 {} 位，已等 {}s\n",
+        waiting.place,
+        waiting.waited_ms / MILLIS_PER_SECOND
+    ));
+}
 
 /// Real execution identity of one agent run. Carried explicitly from the
 /// actor (which knows the DAG task) through the runtime into sandbox requests,
@@ -811,7 +863,32 @@ impl ToolRegistry {
                         "state": "running",
                     }));
                 }
-                let mut stream = backend.execute_stream(&req).await?;
+                // 一条命令在跑的时候，它的话已经在往外走了：执行器每读到一段就
+                // 交一段出来。这一段同时去两个地方——攒进最终结果，和交给派发器
+                // 让还在等的人先看见。只有 `Command` 往外说：`read_file` 的正文
+                // 本来就是结果本身，提前发一遍等于把同一份内容在总线上放两份。
+                let updates = updates.filter(|_| matches!(op, cog_core::ShellOp::Command));
+                // 流开出来之前这段空档是「排队」：编译类命令先在执行器的队里等位子，
+                // 那一刻还没有孩子进程、也没有输出。不在这段空档里问一句，一次排队
+                // 与一次正在跑的调用在界面上同形——都只是一行「进行中」。
+                let mut told: Option<(usize, std::time::Instant)> = None;
+                let mut opening = Box::pin(backend.execute_stream(&req));
+                let mut stream = loop {
+                    tokio::select! {
+                        opened = &mut opening => break opened?,
+                        _ = tokio::time::sleep(LANE_PROBE), if updates.is_some() => {
+                            if let Some(sink) = updates {
+                                announce_lane_wait(
+                                    backend.as_ref(),
+                                    &req.agent_id,
+                                    &mut told,
+                                    sink,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                };
                 let mut stdout = String::new();
                 let mut stderr = String::new();
                 let mut code = 0;
@@ -819,11 +896,6 @@ impl ToolRegistry {
                 // 它不在提示词里，因为只有执行器那台机器知道车道名对应哪条路径；
                 // 不回给模型，模型就得再跑一条 `pwd` 才知道自己在哪。
                 let mut workdir = None;
-                // 一条命令在跑的时候，它的话已经在往外走了：执行器每读到一段就
-                // 交一段出来。这一段同时去两个地方——攒进最终结果，和交给派发器
-                // 让还在等的人先看见。只有 `Command` 往外说：`read_file` 的正文
-                // 本来就是结果本身，提前发一遍等于把同一份内容在总线上放两份。
-                let updates = updates.filter(|_| matches!(op, cog_core::ShellOp::Command));
                 while let Some(event) = stream.next().await {
                     match event {
                         CommandEvent::Workdir { path } => workdir = Some(path),

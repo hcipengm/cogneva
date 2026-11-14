@@ -142,6 +142,26 @@ impl SandboxBackend for RemoteExecutor {
             })
     }
 
+    /// 编译队由对端自报，本侧不排这条队：问它谁占着、谁排第几。
+    async fn lane(&self) -> SFResult<cog_core::BuildLaneReading> {
+        let url = format!("{}/lane", self.base_url.trim_end_matches('/'));
+        let response = self.http.get(&url).send().await.map_err(|e| {
+            cog_core::SFError::Agent(format!("sandbox executor lane unreachable: {e}"))
+        })?;
+        if !response.status().is_success() {
+            return Err(cog_core::SFError::Agent(format!(
+                "sandbox executor answered {} for its build lane",
+                response.status()
+            )));
+        }
+        response
+            .json::<cog_core::BuildLaneReading>()
+            .await
+            .map_err(|e| {
+                cog_core::SFError::Agent(format!("sandbox executor build lane unreadable: {e}"))
+            })
+    }
+
     async fn execute_stream(&self, req: &SandboxRequest) -> SFResult<CommandEventStream> {
         if matches!(req.payload, SandboxPayload::Wasm { .. }) {
             return Err(cog_core::SFError::Agent(

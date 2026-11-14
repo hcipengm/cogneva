@@ -173,6 +173,8 @@ mod agent_wrapper_test;
 mod an_employee_can_search_and_commit_test;
 #[path = "an_employee_works_in_its_own_checkout_test.rs"]
 mod an_employee_works_in_its_own_checkout_test;
+#[path = "an_executor_says_who_is_waiting_for_a_slot_test.rs"]
+mod an_executor_says_who_is_waiting_for_a_slot_test;
 #[path = "an_external_mcp_server_s_tools_reach_the_turn_test.rs"]
 mod an_external_mcp_server_s_tools_reach_the_turn_test;
 #[path = "an_identifier_is_quoted_in_one_place_test.rs"]

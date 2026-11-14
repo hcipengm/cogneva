@@ -262,7 +262,7 @@ pub(crate) fn spawn_command(
     workdir: Option<&Path>,
     cargo_target: Option<&Path>,
     hold: Option<crate::workdir::CommandHold>,
-    build_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    build_slot: Option<crate::command_server::BuildSlot>,
 ) -> SFResult<tokio::sync::mpsc::Receiver<CommandEvent>> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")

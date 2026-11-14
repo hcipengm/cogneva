@@ -38,10 +38,11 @@ struct AppState {
     /// keeps the capability off by default rather than one bad path away from
     /// a writable root.
     hostdocs: Option<Arc<HostDocs>>,
-    /// How many commands may compile into the shared target directory at once.
-    /// See [`crate::runtime::local::builds_the_tree`] for what this bounds and
-    /// why a bound is owed at all.
-    build_slots: Arc<tokio::sync::Semaphore>,
+    /// Who gets to compile into the shared target directory, and who is
+    /// waiting. See [`crate::runtime::local::builds_the_tree`] for what this
+    /// bounds, [`BuildLane`] for why the queue turns by agent rather than by
+    /// arrival.
+    build_lane: Arc<BuildLane>,
     /// What each request cost the executor. Owned by the state rather than by
     /// the workdir router, because a deployment without one still runs file
     /// operations, and a latency reading that existed only on some deployments
@@ -284,6 +285,11 @@ async fn boundary(State(state): State<AppState>) -> Json<cog_core::SandboxBounda
     Json(boundary_reading(state.workdir.as_deref()))
 }
 
+/// 这一刻的编译队：谁占着位子、谁排在第几位。只读，不改变任何人等的顺序。
+async fn lane(State(state): State<AppState>) -> Json<cog_core::BuildLaneReading> {
+    Json(build_lane_fairness(&state.build_lane))
+}
+
 fn error_response(status: StatusCode, message: String) -> Response {
     Response::builder()
         .status(status)
@@ -316,6 +322,9 @@ pub struct CommandMetrics {
     seconds: HistogramVec,
     in_flight: IntGaugeVec,
     build_wait: HistogramVec,
+    lane_waiting: IntGaugeVec,
+    lane_holding: IntGaugeVec,
+    lane_position: HistogramVec,
 }
 
 /// Buckets spanning a file write to a build that runs to its wall.
@@ -385,14 +394,52 @@ impl CommandMetrics {
         // slowly land in the same latency bucket, and they want different
         // fixes. `outcome` separates the queue that admitted the command from
         // the one that turned it away without starting anything.
+        // `agent` is the caller the request names: two agents queueing behind
+        // the same lane are two different waits, and a single histogram would
+        // report their sum as if one of them had been slow. The label is an
+        // employee id, not a free-form name -- the executor only ever sees the
+        // ids the kernel stamps on requests.
         let build_wait = HistogramVec::new(
             HistogramOpts::new(
                 "sandbox_build_slot_wait_seconds",
                 "How long a compiling command waited for the shared build lane, \
-                 by payload kind and whether that lane admitted it",
+                 by payload kind, agent and whether that lane admitted it",
             )
             .buckets(COMMAND_LATENCY_BUCKETS.to_vec()),
-            &["tool", "outcome"],
+            &["agent", "tool", "outcome"],
+        )
+        .expect("static metric name and labels");
+        // The queue itself: how many requests each agent has waiting, and how
+        // many slots each agent is holding. One says who is being kept out,
+        // the other says who is keeping them out -- a single depth number
+        // cannot be read as either.
+        let lane_waiting = IntGaugeVec::new(
+            Opts::new(
+                "sandbox_build_lane_waiting",
+                "Compiling requests currently queued for the shared build lane, by agent",
+            ),
+            &["agent"],
+        )
+        .expect("static metric name and labels");
+        let lane_holding = IntGaugeVec::new(
+            Opts::new(
+                "sandbox_build_lane_holding",
+                "Compiling requests currently holding a shared build lane slot, by agent",
+            ),
+            &["agent"],
+        )
+        .expect("static metric name and labels");
+        // Where in line a caller stood when its wait ended. A refusal at
+        // position 1 and one at position 12 are the same sentence and
+        // different facts: the first says the lane never moved, the second
+        // says it moved without this caller.
+        let lane_position = HistogramVec::new(
+            HistogramOpts::new(
+                "sandbox_build_lane_position",
+                "The place in line a compiling request occupied when its wait ended, by agent",
+            )
+            .buckets(vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 100.0]),
+            &["agent", "outcome"],
         )
         .expect("static metric name and labels");
         registry
@@ -404,11 +451,23 @@ impl CommandMetrics {
         registry
             .register(Box::new(build_wait.clone()))
             .expect("metric registered once");
+        registry
+            .register(Box::new(lane_waiting.clone()))
+            .expect("metric registered once");
+        registry
+            .register(Box::new(lane_holding.clone()))
+            .expect("metric registered once");
+        registry
+            .register(Box::new(lane_position.clone()))
+            .expect("metric registered once");
         Self {
             registry,
             seconds,
             in_flight,
             build_wait,
+            lane_waiting,
+            lane_holding,
+            lane_position,
         }
     }
 
@@ -433,10 +492,28 @@ impl CommandMetrics {
     /// How long a compiling command waited for the lane, and what that wait
     /// ended in. Read beside `sandbox_command_seconds`: this one says the
     /// machine made the command queue, that one says the command was slow.
-    fn observe_build_wait(&self, tool: &str, ended: LaneWait, seconds: f64) {
+    fn observe_build_wait(&self, agent: &str, tool: &str, ended: LaneWait, seconds: f64) {
         self.build_wait
-            .with_label_values(&[tool, ended.as_str()])
+            .with_label_values(&[agent, tool, ended.as_str()])
             .observe(seconds);
+    }
+
+    fn set_lane_waiting(&self, agent: &str, count: usize) {
+        self.lane_waiting
+            .with_label_values(&[agent])
+            .set(count as i64);
+    }
+
+    fn set_lane_holding(&self, agent: &str, count: usize) {
+        self.lane_holding
+            .with_label_values(&[agent])
+            .set(count as i64);
+    }
+
+    fn observe_lane_position(&self, agent: &str, ended: LaneWait, place: usize) {
+        self.lane_position
+            .with_label_values(&[agent, ended.as_str()])
+            .observe(place as f64);
     }
 }
 
@@ -726,7 +803,14 @@ async fn execute_handler(
             // so time spent queued is not time spent compiling: without this,
             // every extra build started beside it shortened the wall the others
             // had left, and each of them timed out having read nothing.
-            let build_slot = match build_slot_for(&state, tool_label(&req.payload), command).await {
+            let build_slot = match build_slot_for(
+                &state,
+                req.agent_id.as_deref(),
+                tool_label(&req.payload),
+                command,
+            )
+            .await
+            {
                 Ok(slot) => slot,
                 // A lane that stays full past the command's own budget is a
                 // refusal, not a failure of the executor: 503 says try again,
@@ -953,69 +1037,374 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
         .expect("static response")
 }
 
-/// Router without per-task worktrees (tests and any no-volume deployment).
+/// A request that named no agent. It still queues, and its readings are filed
+/// here rather than under somebody else's name: an unattributed wait is a
+/// fact about the lane, not a fact about a passers-by.
+const UNATTRIBUTED: &str = "unattributed";
+
+/// 一条按 agent 轮转的编译队：谁在等、谁占着，都按人归属。
+///
+/// 一条先进先出的队看不出「谁在等」：一个 agent 连发十条编译，另一个就排在
+/// 十条之后，而两条等待在读数上合成一个数——分不出「我慢」与「有人一直占着」。
+/// 这里把**位子**与**等的人**分开记：位子仍是共享 target 允许的那几条，等的人
+/// 按 agent 轮转，刚被放行的 agent 回到自己队的队尾，于是任何一个 agent 连发
+/// 都占不满别人的机会。
+pub struct BuildLane {
+    capacity: usize,
+    inner: std::sync::Mutex<LaneState>,
+    wake: tokio::sync::Notify,
+    commands: Arc<CommandMetrics>,
+}
+
+struct LaneState {
+    waiting: Vec<Waiting>,
+    holding: Vec<HeldSlot>,
+    /// 每个 agent 最近一次被放行的票号。轮转的依据：票号越小越先轮到它。
+    last_served: std::collections::HashMap<String, u64>,
+    /// 来过这条队的 agent：读数要能把它们的深度退回 0，而不是停在最后一个
+    /// 读数上——一个早就走掉的 agent 的「还在等 3 个」与真的在等同形。
+    seen_agents: std::collections::HashSet<String>,
+    next_ticket: u64,
+}
+
+struct Waiting {
+    ticket: u64,
+    agent: String,
+    tool: String,
+    arrived: std::time::Instant,
+}
+
+struct HeldSlot {
+    agent: String,
+    ticket: u64,
+    since: std::time::Instant,
+}
+
+impl LaneState {
+    /// 下一个该被放行的人：按「谁的 agent 最久没被服务」排，同一次服务里
+    /// 按到达先后。这就是轮转——刚放过谁，谁就排到自己的队尾。
+    fn fair_head(&self) -> Option<usize> {
+        let mut best: Option<((u64, u64), usize)> = None;
+        for (at, waiter) in self.waiting.iter().enumerate() {
+            let served = self.last_served.get(&waiter.agent).copied().unwrap_or(0);
+            let key = (served, waiter.ticket);
+            if best.is_none_or(|(best_key, _)| key < best_key) {
+                best = Some((key, at));
+            }
+        }
+        best.map(|(_, at)| at)
+    }
+
+    /// 排队里这个人的名次（从 1 数）：在它前面按轮转顺序还排着几个。
+    fn place_of(&self, ticket: u64) -> Option<usize> {
+        let mut order: Vec<(u64, u64, &Waiting)> = self
+            .waiting
+            .iter()
+            .map(|w| {
+                let served = self.last_served.get(&w.agent).copied().unwrap_or(0);
+                (served, w.ticket, w)
+            })
+            .collect();
+        order.sort_by_key(|(served, ticket, _)| (*served, *ticket));
+        order
+            .iter()
+            .position(|(_, t, _)| *t == ticket)
+            .map(|at| at + 1)
+    }
+}
+
+impl BuildLane {
+    fn new(capacity: usize, commands: Arc<CommandMetrics>) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            inner: std::sync::Mutex::new(LaneState {
+                waiting: Vec::new(),
+                holding: Vec::new(),
+                last_served: std::collections::HashMap::new(),
+                seen_agents: std::collections::HashSet::new(),
+                next_ticket: 0,
+            }),
+            wake: tokio::sync::Notify::new(),
+            commands,
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LaneState> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 把两条读数重新发布一遍：每个来过这条队的 agent 的等待数与占槽数。
+    fn republish(&self, state: &LaneState) {
+        let mut waiting: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for w in &state.waiting {
+            *waiting.entry(w.agent.as_str()).or_default() += 1;
+        }
+        let mut holding: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for h in &state.holding {
+            *holding.entry(h.agent.as_str()).or_default() += 1;
+        }
+        for agent in &state.seen_agents {
+            self.commands
+                .set_lane_waiting(agent, waiting.get(agent.as_str()).copied().unwrap_or(0));
+            self.commands
+                .set_lane_holding(agent, holding.get(agent.as_str()).copied().unwrap_or(0));
+        }
+    }
+
+    /// 排进队，直到拿到位子、被拒，或等的人自己走了。
+    ///
+    /// 没有窗口（这台机器还没量出正常队列多长）就一直等：把人拒在一个没人
+    /// 量过的数上，与「这台机器就是慢」在读数上分不开。
+    async fn acquire(
+        self: &Arc<Self>,
+        agent: Option<&str>,
+        tool: &str,
+        window: Option<std::time::Duration>,
+    ) -> Result<(BuildSlot, std::time::Duration), LaneRefusal> {
+        let agent = agent
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or(UNATTRIBUTED)
+            .to_string();
+        let arrived = std::time::Instant::now();
+        let ticket = {
+            let mut state = self.lock();
+            state.next_ticket += 1;
+            let ticket = state.next_ticket;
+            state.seen_agents.insert(agent.clone());
+            state.waiting.push(Waiting {
+                ticket,
+                agent: agent.clone(),
+                tool: tool.to_string(),
+                arrived,
+            });
+            self.republish(&state);
+            ticket
+        };
+        let mut queue = QueueGuard {
+            lane: Arc::clone(self),
+            ticket,
+            armed: true,
+        };
+        let deadline = window.map(|w| tokio::time::Instant::now() + w);
+        loop {
+            // 先登记的唤醒再查状态：反过来会漏掉「查完、还没 await」之间
+            // 别人放出的那一次。
+            let notified = self.wake.notified();
+            {
+                let mut state = self.lock();
+                if let Some(at) = state.waiting.iter().position(|w| w.ticket == ticket) {
+                    if state.holding.len() < self.capacity && state.fair_head() == Some(at) {
+                        let place = state.place_of(ticket).unwrap_or(at + 1);
+                        state.waiting.remove(at);
+                        state.holding.push(HeldSlot {
+                            agent: agent.clone(),
+                            ticket,
+                            since: std::time::Instant::now(),
+                        });
+                        state.last_served.insert(agent.clone(), ticket);
+                        self.republish(&state);
+                        queue.armed = false;
+                        drop(state);
+                        self.commands
+                            .observe_lane_position(&agent, LaneWait::Admitted, place);
+                        // 队头换人了：轮转的顺序要重新争一次。
+                        self.wake.notify_waiters();
+                        return Ok((
+                            BuildSlot {
+                                lane: Arc::clone(self),
+                                ticket,
+                            },
+                            arrived.elapsed(),
+                        ));
+                    }
+                } else {
+                    // 不在队里了：只可能是这条 future 正在被丢掉。两种都不
+                    // 该再等。
+                    break;
+                }
+            }
+            match deadline {
+                Some(deadline) => {
+                    if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                        let place = self.leave(ticket, &agent, &mut queue);
+                        return Err(LaneRefusal::Full {
+                            waited: arrived.elapsed(),
+                            window: window.unwrap_or_default(),
+                            place,
+                        });
+                    }
+                }
+                None => notified.await,
+            }
+        }
+        Err(LaneRefusal::Closed("the lane dropped this waiter".into()))
+    }
+
+    /// 把票号从队里拿掉并说出它走时排第几；队变了，让后面的人重新争。
+    fn leave(&self, ticket: u64, agent: &str, queue: &mut QueueGuard) -> usize {
+        let place = {
+            let mut state = self.lock();
+            let place = state.place_of(ticket).unwrap_or(1);
+            state.waiting.retain(|w| w.ticket != ticket);
+            self.republish(&state);
+            place
+        };
+        queue.armed = false;
+        self.commands
+            .observe_lane_position(agent, LaneWait::Full, place);
+        // 走的那个人可能正是队头：它的离开会把空出来的机会让给下一个。
+        self.wake.notify_waiters();
+        place
+    }
+}
+
+/// 等的人走了（调用方放弃了这次请求）：票号从队里拿掉，让后面的人重新争。
+struct QueueGuard {
+    lane: Arc<BuildLane>,
+    ticket: u64,
+    armed: bool,
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut state = self.lane.lock();
+            state.waiting.retain(|w| w.ticket != self.ticket);
+            self.lane.republish(&state);
+        }
+        self.lane.wake.notify_waiters();
+    }
+}
+
+/// 一个被放行的人占着的位子。孩子走完才 drop 它，于是下一条编译开始写 target
+/// 时目录前一个人已经放开。
+pub struct BuildSlot {
+    lane: Arc<BuildLane>,
+    ticket: u64,
+}
+
+impl Drop for BuildSlot {
+    fn drop(&mut self) {
+        {
+            let mut state = self.lane.lock();
+            if let Some(at) = state.holding.iter().position(|h| h.ticket == self.ticket) {
+                state.holding.remove(at);
+            }
+            self.lane.republish(&state);
+        }
+        // 空出一个位子：刚才没轮到的、排在后面的人都该再看一眼。
+        self.lane.wake.notify_waiters();
+    }
+}
+
+/// 这一刻的编译队：容量、谁占着、谁在等（按轮转顺序）。
+///
+/// 与 `/metrics` 的差别是它给的是**此刻的名单**，不是累计分布：一个 agent 在
+/// 队里排第几名，只能从这份名单上读。
+pub fn build_lane_fairness(lane: &BuildLane) -> cog_core::BuildLaneReading {
+    let state = lane.lock();
+    let mut order: Vec<(u64, u64, &Waiting)> = state
+        .waiting
+        .iter()
+        .map(|w| {
+            let served = state.last_served.get(&w.agent).copied().unwrap_or(0);
+            (served, w.ticket, w)
+        })
+        .collect();
+    order.sort_by_key(|(served, ticket, _)| (*served, *ticket));
+    cog_core::BuildLaneReading {
+        capacity: Some(lane.capacity),
+        holding: state
+            .holding
+            .iter()
+            .map(|h| cog_core::LaneHolder {
+                agent: h.agent.clone(),
+                held_ms: h.since.elapsed().as_millis() as u64,
+            })
+            .collect(),
+        waiting: order
+            .iter()
+            .enumerate()
+            .map(|(at, (_, _, w))| cog_core::LaneWaiter {
+                place: at + 1,
+                agent: w.agent.clone(),
+                tool: w.tool.clone(),
+                waited_ms: w.arrived.elapsed().as_millis() as u64,
+            })
+            .collect(),
+    }
+}
+
 /// The place this command holds among the builds allowed to compile at once.
 ///
 /// `Ok(None)` is a command that compiles nothing: it takes no slot, because
 /// holding one for a search would put every search behind a build.
 async fn build_slot_for(
     state: &AppState,
+    agent: Option<&str>,
     tool: &str,
     command: &str,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, LaneRefusal> {
+) -> Result<Option<BuildSlot>, LaneRefusal> {
     if !crate::runtime::local::builds_the_tree(command) {
         return Ok(None);
     }
-    let queued_at = std::time::Instant::now();
-    // A wait that is never bounded is not a wait but a hang: measured on this
-    // host 2026-11-08, compiles queued 190 to 1145 seconds behind one held
-    // slot, and the caller learned nothing until its own tool call expired --
-    // it could not tell a busy machine from a slow compiler, so it retried into
-    // the same queue. Refused with the number, it can see the command never ran.
-    //
-    // What bounds it is this machine's own queue history, not the wall of the
-    // command that is waiting. A queue emits no progress, so it is the one
-    // place here a duration is still the right reading -- and it is a measured
-    // one. With too few samples there is no window and the waiter waits.
     let window = state.queue_waits.window();
-    let acquired = match window {
-        Some(window) => {
-            tokio::time::timeout(window, Arc::clone(&state.build_slots).acquire_owned())
-                .await
-                .map_err(|_| ())
-        }
-        None => Ok(Arc::clone(&state.build_slots).acquire_owned().await),
-    };
-    let waited = queued_at.elapsed();
-    let ended = match &acquired {
-        Ok(Ok(_)) => {
+    let agent_label = agent
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or(UNATTRIBUTED);
+    match state.build_lane.acquire(agent, tool, window).await {
+        Ok((slot, waited)) => {
+            // 放行的等待是这台机器队列长度的样本：窗口就是从这些数里量的。
             state.queue_waits.record(waited);
-            LaneWait::Admitted
+            state.commands.observe_build_wait(
+                agent_label,
+                tool,
+                LaneWait::Admitted,
+                waited.as_secs_f64(),
+            );
+            // It is still a wait somebody pays for, so it is said out loud as
+            // well: a round that spent its whole wait queued and one that
+            // compiled slowly read the same on the latency histogram alone.
+            if waited >= BUILD_QUEUE_NOTEWORTHY {
+                tracing::info!(
+                    command = %command,
+                    agent = agent_label,
+                    waited_secs = waited.as_secs(),
+                    waited_ended = LaneWait::Admitted.as_str(),
+                    "a build waited its turn for the shared target directory"
+                );
+            }
+            Ok(Some(slot))
         }
-        Ok(Err(_)) => LaneWait::Closed,
-        Err(()) => LaneWait::Full,
-    };
-    state
-        .commands
-        .observe_build_wait(tool, ended, waited.as_secs_f64());
-    // It is still a wait somebody pays for, so it is said out loud as well: a
-    // round that spent its whole wait queued and one that compiled slowly read
-    // the same on the latency histogram alone.
-    if waited >= BUILD_QUEUE_NOTEWORTHY {
-        tracing::info!(
-            command = %command,
-            waited_secs = waited.as_secs(),
-            waited_ended = ended.as_str(),
-            "a build waited its turn for the shared target directory"
-        );
-    }
-    match acquired {
-        Ok(Ok(permit)) => Ok(Some(permit)),
-        Ok(Err(e)) => Err(LaneRefusal::Closed(e.to_string())),
-        Err(()) => Err(LaneRefusal::Full {
-            waited,
-            window: window.unwrap_or_default(),
-        }),
+        Err(refusal @ LaneRefusal::Full { waited, .. }) => {
+            state.commands.observe_build_wait(
+                agent_label,
+                tool,
+                LaneWait::Full,
+                waited.as_secs_f64(),
+            );
+            if waited >= BUILD_QUEUE_NOTEWORTHY {
+                tracing::info!(
+                    command = %command,
+                    agent = agent_label,
+                    waited_secs = waited.as_secs(),
+                    waited_ended = LaneWait::Full.as_str(),
+                    "a build waited its turn for the shared target directory"
+                );
+            }
+            Err(refusal)
+        }
+        Err(refusal @ LaneRefusal::Closed(_)) => {
+            state
+                .commands
+                .observe_build_wait(agent_label, tool, LaneWait::Closed, 0.0);
+            Err(refusal)
+        }
     }
 }
 
@@ -1027,22 +1416,30 @@ enum LaneRefusal {
     Full {
         waited: std::time::Duration,
         window: std::time::Duration,
+        /// 走时排第几。同一个「没拿到」在不同的名次上是两种事实：第 1 名是
+        /// 队根本没动，第 12 名是队动了但没轮到它。
+        place: usize,
     },
-    /// The semaphore is closed; no amount of waiting admits this command.
+    /// The lane is gone; no amount of waiting admits this command.
     Closed(String),
 }
 
 impl std::fmt::Display for LaneRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LaneRefusal::Full { waited, window } => write!(
+            LaneRefusal::Full {
+                waited,
+                window,
+                place,
+            } => write!(
                 f,
-                "build lane busy: this command never started. It waited {}s for a slot \
-                 among the commands compiling into the shared target directory, past the \
-                 {}s this executor has measured its queue to take at p99.9, and did not \
-                 get one. Nothing was compiled and nothing was left behind; ask again \
-                 later.",
+                "build lane busy: this command never started. It waited {}s at place {} \
+                 in line for a slot among the commands compiling into the shared target \
+                 directory, past the {}s this executor has measured its queue to take at \
+                 p99.9, and did not get one. Nothing was compiled and nothing was left \
+                 behind; ask again later.",
                 waited.as_secs(),
+                place,
                 window.as_secs()
             ),
             LaneRefusal::Closed(e) => write!(f, "build slot unavailable: {e}"),
@@ -1051,22 +1448,24 @@ impl std::fmt::Display for LaneRefusal {
 }
 
 pub fn router() -> Router {
+    let commands = Arc::new(CommandMetrics::new());
     app_router(AppState {
         workdir: None,
         hostdocs: None,
-        build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
-        commands: Arc::new(CommandMetrics::new()),
+        build_lane: BuildLane::new(build_concurrency(), Arc::clone(&commands)),
+        commands,
         queue_waits: Arc::new(BuildQueueWindow::new()),
     })
 }
 
 /// Full router wiring a provisioned workdir router.
 pub fn app_router_with_workdir(workdir: Arc<WorkdirRouter>) -> Router {
+    let commands = Arc::new(CommandMetrics::new());
     app_router(AppState {
         workdir: Some(workdir),
         hostdocs: None,
-        build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
-        commands: Arc::new(CommandMetrics::new()),
+        build_lane: BuildLane::new(build_concurrency(), Arc::clone(&commands)),
+        commands,
         queue_waits: Arc::new(BuildQueueWindow::new()),
     })
 }
@@ -1076,11 +1475,12 @@ pub fn app_router_with_hostdocs(
     workdir: Option<Arc<WorkdirRouter>>,
     hostdocs: Arc<HostDocs>,
 ) -> Router {
+    let commands = Arc::new(CommandMetrics::new());
     app_router(AppState {
         workdir,
         hostdocs: Some(hostdocs),
-        build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
-        commands: Arc::new(CommandMetrics::new()),
+        build_lane: BuildLane::new(build_concurrency(), Arc::clone(&commands)),
+        commands,
         queue_waits: Arc::new(BuildQueueWindow::new()),
     })
 }
@@ -1090,6 +1490,7 @@ fn app_router(state: AppState) -> Router {
         .route("/health/live", get(health))
         .route("/health/ready", get(health))
         .route("/boundary", get(boundary))
+        .route("/lane", get(lane))
         .route(METRICS_PATH, get(metrics_handler))
         .route("/execute", post(execute_handler))
         .route("/documents/list", post(documents_list_handler))
@@ -1420,11 +1821,12 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    let commands = Arc::new(CommandMetrics::new());
     let app = app_router(AppState {
         workdir,
         hostdocs,
-        build_slots: Arc::new(tokio::sync::Semaphore::new(build_concurrency())),
-        commands: Arc::new(CommandMetrics::new()),
+        build_lane: BuildLane::new(build_concurrency(), Arc::clone(&commands)),
+        commands,
         queue_waits: Arc::new(BuildQueueWindow::new()),
     });
 
@@ -1481,11 +1883,12 @@ mod tests {
     }
 
     fn state_with_build_slots(n: usize) -> AppState {
+        let commands = Arc::new(CommandMetrics::new());
         AppState {
             workdir: None,
             hostdocs: None,
-            build_slots: Arc::new(tokio::sync::Semaphore::new(n)),
-            commands: Arc::new(CommandMetrics::new()),
+            build_lane: BuildLane::new(n, Arc::clone(&commands)),
+            commands,
             queue_waits: Arc::new(BuildQueueWindow::new()),
         }
     }
@@ -1511,13 +1914,24 @@ mod tests {
             "the window is the planted p99.9, not a number of its own"
         );
 
-        let held = build_slot_for(&state, "run_command", "cargo test -p cogneva --lib")
-            .await
-            .expect("the semaphore is open")
-            .expect("a build takes a slot");
+        let held = build_slot_for(
+            &state,
+            Some("a"),
+            "run_command",
+            "cargo test -p cogneva --lib",
+        )
+        .await
+        .expect("the semaphore is open")
+        .expect("a build takes a slot");
 
         let queued = tokio::time::timeout(std::time::Duration::from_millis(20), async {
-            build_slot_for(&state, "run_command", "cargo clippy --all-targets").await
+            build_slot_for(
+                &state,
+                Some("a"),
+                "run_command",
+                "cargo clippy --all-targets",
+            )
+            .await
         })
         .await;
         assert!(
@@ -1529,7 +1943,7 @@ mod tests {
         // queue behind a build to do so.
         let search = tokio::time::timeout(
             std::time::Duration::from_millis(20),
-            build_slot_for(&state, "run_command", "grep -rn cargo crates/"),
+            build_slot_for(&state, Some("a"), "run_command", "grep -rn cargo crates/"),
         )
         .await
         .expect("a search never queues")
@@ -1540,7 +1954,12 @@ mod tests {
         // asked to do something that writes nothing into the target directory.
         let formatting = tokio::time::timeout(
             std::time::Duration::from_millis(20),
-            build_slot_for(&state, "run_command", "cargo fmt --all -- --check"),
+            build_slot_for(
+                &state,
+                Some("a"),
+                "run_command",
+                "cargo fmt --all -- --check",
+            ),
         )
         .await
         .expect("formatting never queues")
@@ -1549,14 +1968,24 @@ mod tests {
 
         // A wait past the measured window is a refusal that names both numbers,
         // not a command started only to be killed.
-        let refused = build_slot_for(&state, "run_command", "cargo clippy --all-targets").await;
+        let refused = build_slot_for(
+            &state,
+            Some("a"),
+            "run_command",
+            "cargo clippy --all-targets",
+        )
+        .await;
         match refused {
-            Err(LaneRefusal::Full { waited, window }) => {
+            Err(LaneRefusal::Full { waited, window, .. }) => {
                 assert!(waited >= window, "the wait outlasted the measured window");
                 assert!(
-                    LaneRefusal::Full { waited, window }
-                        .to_string()
-                        .contains("never started"),
+                    LaneRefusal::Full {
+                        waited,
+                        window,
+                        place: 1
+                    }
+                    .to_string()
+                    .contains("never started"),
                     "the refusal says the command did not run"
                 );
             }
@@ -1567,7 +1996,12 @@ mod tests {
         drop(held);
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            build_slot_for(&state, "run_command", "cargo clippy --all-targets"),
+            build_slot_for(
+                &state,
+                Some("a"),
+                "run_command",
+                "cargo clippy --all-targets",
+            ),
         )
         .await
         .expect("the released slot admits the waiting build")
@@ -1578,14 +2012,24 @@ mod tests {
         // than being refused on a number nobody measured.
         let unmeasured = state_with_build_slots(1);
         assert_eq!(unmeasured.queue_waits.window(), None);
-        let _held_again = build_slot_for(&unmeasured, "run_command", "cargo test -p cogneva")
-            .await
-            .unwrap()
-            .expect("a build takes a slot");
+        let _held_again = build_slot_for(
+            &unmeasured,
+            Some("a"),
+            "run_command",
+            "cargo test -p cogneva",
+        )
+        .await
+        .unwrap()
+        .expect("a build takes a slot");
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(60),
-                build_slot_for(&unmeasured, "run_command", "cargo clippy --all-targets"),
+                build_slot_for(
+                    &unmeasured,
+                    Some("a"),
+                    "run_command",
+                    "cargo clippy --all-targets"
+                ),
             )
             .await
             .is_err(),
@@ -1597,16 +2041,318 @@ mod tests {
         let rendered = state.commands.render();
         assert!(
             rendered.contains(
-                "sandbox_build_slot_wait_seconds_count{outcome=\"admitted\",tool=\"run_command\"}"
+                "sandbox_build_slot_wait_seconds_count{agent=\"a\",outcome=\"admitted\",tool=\"run_command\"}"
             ),
             "the wait is a reading of its own: {rendered}"
         );
         assert!(
             rendered.contains(
-                "sandbox_build_slot_wait_seconds_count{outcome=\"full\",tool=\"run_command\"}"
+                "sandbox_build_slot_wait_seconds_count{agent=\"a\",outcome=\"full\",tool=\"run_command\"}"
             ),
             "the reading separates the lane admitting a command from refusing one: {rendered}"
         );
+    }
+
+    /// 等到队里排着 `n` 个人：票号按入队先后发，只有所有人都进了队，
+    /// 名次才说明问题。
+    async fn wait_until_queued(lane: &Arc<BuildLane>, n: usize) {
+        for _ in 0..2_000 {
+            let queued = build_lane_fairness(lane).waiting.len();
+            if queued == n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("the lane never reached {n} waiters");
+    }
+
+    /// 一个 agent 先占着位子、又连排两条，另一个 agent 才排一条：放行的顺序
+    /// 是「另一个、这个、这个」——队按 agent 轮转，不按到达先后。
+    ///
+    /// 消融：把 `LaneState::fair_head` 换回先进先出，放行顺序变成 a、a、b，
+    /// 这条当场红。
+    #[tokio::test]
+    async fn the_lane_turns_by_agent_not_by_arrival() {
+        let commands = Arc::new(CommandMetrics::new());
+        let lane = BuildLane::new(1, Arc::clone(&commands));
+        let held = lane
+            .acquire(Some("a"), "run_command", None)
+            .await
+            .expect("an empty lane admits at once")
+            .0;
+
+        let (tx, mut admitted) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let mut waiters = Vec::new();
+        for who in ["a", "a", "b"] {
+            let lane = Arc::clone(&lane);
+            let tx = tx.clone();
+            waiters.push(tokio::spawn(async move {
+                let (slot, _) = lane
+                    .acquire(Some(who), "run_command", None)
+                    .await
+                    .expect("the lane admits everyone eventually");
+                tx.send(who).expect("the test still reads");
+                drop(slot);
+            }));
+        }
+        drop(tx);
+        wait_until_queued(&lane, 3).await;
+
+        // b 在 a 的两条之后入队，却排在第一：轮到的是最久没被放行的 agent。
+        let reading = build_lane_fairness(&lane);
+        assert_eq!(reading.capacity, Some(1));
+        let places: Vec<(&str, usize)> = reading
+            .waiting
+            .iter()
+            .map(|waiter| (waiter.agent.as_str(), waiter.place))
+            .collect();
+        assert_eq!(
+            places,
+            vec![("b", 1), ("a", 2), ("a", 3)],
+            "轮转：b 排在 a 的两条之前"
+        );
+
+        drop(held);
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            let who = tokio::time::timeout(std::time::Duration::from_secs(1), admitted.recv())
+                .await
+                .expect("the lane admits all three")
+                .expect("a waiter is still alive");
+            order.push(who);
+        }
+        assert_eq!(
+            order,
+            vec!["b", "a", "a"],
+            "a 被放行一次之后才轮到自己剩下的一条"
+        );
+        for waiter in waiters {
+            waiter.abort();
+        }
+    }
+
+    /// 一个 agent 一口气排十条、另一个只排一条：后者排第一而不是第十一。
+    ///
+    /// 消融：先进先出的队里 b 排第十一，这条当场红。
+    #[tokio::test]
+    async fn ten_builds_from_one_agent_do_not_bury_the_other() {
+        let commands = Arc::new(CommandMetrics::new());
+        let lane = BuildLane::new(1, Arc::clone(&commands));
+        let held = lane
+            .acquire(Some("a"), "run_command", None)
+            .await
+            .expect("an empty lane admits at once")
+            .0;
+
+        let (tx, mut admitted) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let mut waiters = Vec::new();
+        let mut queue: Vec<&'static str> = vec!["a"; 10];
+        queue.push("b");
+        for who in queue {
+            let lane = Arc::clone(&lane);
+            let tx = tx.clone();
+            waiters.push(tokio::spawn(async move {
+                let (slot, _) = lane
+                    .acquire(Some(who), "run_command", None)
+                    .await
+                    .expect("the lane admits everyone eventually");
+                tx.send(who).expect("the test still reads");
+                drop(slot);
+            }));
+        }
+        drop(tx);
+        wait_until_queued(&lane, 11).await;
+
+        let reading = build_lane_fairness(&lane);
+        let first = reading.waiting.first().expect("b is in line");
+        assert_eq!(first.agent, "b", "b 排第一：{reading:?}");
+        assert_eq!(first.place, 1, "b 是第一名：{reading:?}");
+
+        drop(held);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), admitted.recv())
+            .await
+            .expect("the lane admits someone")
+            .expect("a waiter is still alive");
+        assert_eq!(first, "b", "十条 a 挡不住 b 的一条");
+        for waiter in waiters {
+            waiter.abort();
+        }
+    }
+
+    /// 队把此刻的名单摆出来：谁占着、谁在等、等的人排第几；按 agent 的占用数
+    /// 与名次分布进 `/metrics`，被拒的话说出自己被拒在第几名。
+    #[tokio::test]
+    async fn the_lane_says_who_is_waiting_and_where() {
+        let state = state_with_build_slots(1);
+        for _ in 0..cog_core::progress::SAMPLE_FLOOR {
+            state
+                .queue_waits
+                .record(std::time::Duration::from_millis(50));
+        }
+        let _held = build_slot_for(
+            &state,
+            Some("a"),
+            "run_command",
+            "cargo test -p cogneva --lib",
+        )
+        .await
+        .expect("the lane is open")
+        .expect("a build takes a slot");
+
+        // b 没有窗口，一直等；c 有这台机器的窗口，等在 b 后面。
+        let mut b_wait = Box::pin(state.build_lane.acquire(Some("b"), "run_command", None));
+        assert!(
+            futures::poll!(b_wait.as_mut()).is_pending(),
+            "b waits while a holds the only slot"
+        );
+
+        let reading = build_lane_fairness(&state.build_lane);
+        assert_eq!(reading.capacity, Some(1));
+        assert_eq!(
+            reading.holding.first().map(|h| h.agent.as_str()),
+            Some("a"),
+            "谁占着：{reading:?}"
+        );
+        let waiting = reading.waiting.first().expect("b is in line");
+        assert_eq!(waiting.agent, "b", "谁在等：{reading:?}");
+        assert_eq!(waiting.place, 1, "等的人排第几：{reading:?}");
+
+        let rendered = state.commands.render();
+        assert!(
+            rendered.contains("sandbox_build_lane_waiting{agent=\"b\"} 1"),
+            "在等的人数按 agent 归属：{rendered}"
+        );
+        assert!(
+            rendered.contains("sandbox_build_lane_holding{agent=\"a\"} 1"),
+            "占槽者也按 agent 归属：{rendered}"
+        );
+
+        match build_slot_for(
+            &state,
+            Some("c"),
+            "run_command",
+            "cargo clippy --all-targets",
+        )
+        .await
+        {
+            Err(refusal @ LaneRefusal::Full { place, .. }) => {
+                assert_eq!(place, 2, "c 等在 b 之后");
+                assert!(
+                    refusal.to_string().contains("at place 2"),
+                    "被拒的话说出名次：{refusal}"
+                );
+            }
+            Err(LaneRefusal::Closed(e)) => panic!("the lane closed: {e}"),
+            Ok(_) => panic!("a full lane past the measured window must refuse"),
+        }
+        let rendered = state.commands.render();
+        assert!(
+            rendered.contains("sandbox_build_lane_position_count{agent=\"c\",outcome=\"full\"} 1"),
+            "被拒时的名次是一条读数：{rendered}"
+        );
+        drop(b_wait);
+    }
+
+    /// `/lane` 是执行器把队摆出来的那一面：编排侧与界面读的是这一份，而不是自己排一条队
+    /// 再猜自己在第几位。
+    #[tokio::test]
+    async fn an_http_reader_can_see_the_lane_the_executor_holds() {
+        let state = state_with_build_slots(1);
+        let _held = build_slot_for(
+            &state,
+            Some("alice"),
+            "run_command",
+            "cargo test -p cogneva",
+        )
+        .await
+        .expect("the lane is open")
+        .expect("a build takes a slot");
+        let lane = Arc::clone(&state.build_lane);
+        let mut bob = Box::pin(lane.acquire(Some("bob"), "run_command", None));
+        assert!(futures::poll!(bob.as_mut()).is_pending());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app_router(state)).await.unwrap();
+        });
+
+        let reading: cog_core::BuildLaneReading = reqwest::Client::new()
+            .get(format!("http://{addr}/lane"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reading.capacity, Some(1));
+        assert_eq!(
+            reading.holding.first().map(|h| h.agent.as_str()),
+            Some("alice"),
+            "占着位子的人是谁：{reading:?}"
+        );
+        let waiting = reading.waiting.first().expect("bob is in line");
+        assert_eq!(waiting.agent, "bob", "在等的人是谁：{reading:?}");
+        assert_eq!(waiting.place, 1, "在等的人排第几：{reading:?}");
+        drop(bob);
+    }
+
+    /// 等在队里的人自己走了（调用方断开）：票号拿掉，读数退回 0，队不卡在
+    /// 一个已经不在了的人后面。
+    #[tokio::test]
+    async fn a_caller_that_leaves_the_line_stops_being_counted() {
+        let state = state_with_build_slots(1);
+        let held = build_slot_for(
+            &state,
+            Some("a"),
+            "run_command",
+            "cargo test -p cogneva --lib",
+        )
+        .await
+        .expect("the lane is open")
+        .expect("a build takes a slot");
+        let mut b_wait = Box::pin(build_slot_for(
+            &state,
+            Some("b"),
+            "run_command",
+            "cargo clippy --all-targets",
+        ));
+        assert!(futures::poll!(b_wait.as_mut()).is_pending());
+        assert!(
+            state
+                .commands
+                .render()
+                .contains("sandbox_build_lane_waiting{agent=\"b\"} 1"),
+            "b 在队里：{}",
+            state.commands.render()
+        );
+
+        drop(b_wait);
+        let rendered = state.commands.render();
+        assert!(
+            rendered.contains("sandbox_build_lane_waiting{agent=\"b\"} 0"),
+            "走掉的人不该留下一个「还在等」：{rendered}"
+        );
+        assert_eq!(
+            build_lane_fairness(&state.build_lane).waiting.len(),
+            0,
+            "队里不留走掉的人"
+        );
+
+        drop(held);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            build_slot_for(
+                &state,
+                Some("b"),
+                "run_command",
+                "cargo clippy --all-targets",
+            ),
+        )
+        .await
+        .expect("the lane is not stuck behind a caller that left")
+        .expect("the lane is open");
+        assert!(next.is_some(), "下一个人立刻拿到位子");
     }
 
     #[test]

@@ -757,6 +757,23 @@ function DiffBlock({ diff, note }: { diff: ToolDiff; note?: string }) {
  * 什么。收起来时只留一行——工具名、哪个执行者、成没成；展开时给原文。默认收起是
  * 因为一次运行能调几十次，全展开就把回复挤到屏幕外面去了。
  */
+/**
+ * 中途输出里最近的一句非空的话。
+ *
+ * 中途输出是执行器流过来的原文，一次可以是几十行；收起的那一行只留最后一句——
+ * 它回答「它现在在干什么」。没有就返回 `null`：一行空的占位读起来像「它什么都
+ * 没说」，而事实是它还没说。
+ */
+function lastProgressLine(progress: string): string | null {
+  const lines = progress
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const last = lines[lines.length - 1];
+  if (!last) return null;
+  return last.length > 60 ? `${last.slice(0, 60)}…` : last;
+}
+
 function ToolTurn({ call }: { call: ToolCallRecord }) {
   const [open, setOpen] = useState(false);
   /** 改动类工具折成的那份 diff；别的调用是 `null`（见 `toolDiff`）。 */
@@ -764,6 +781,14 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
   const tone =
     call.status === 'error' ? 'var(--danger)' : call.status === 'running' ? 'var(--brass)' : 'var(--ok)';
   const label = call.status === 'error' ? '失败' : call.status === 'running' ? '进行中' : '返回';
+  /**
+   * 还在跑的调用最近说的一句话。
+   *
+   * 命令排队等编译位子的时候，执行器那一侧知道它排第几，工具把这句话当中途输出发
+   * 回来；收到这里的这一行就是「在等执行槽」。收起时也放它：一次排队与一次正在
+   * 编译在收起的一行上必须看得出区别，否则「它卡住了没有」只能靠展开去猜。
+   */
+  const latest = call.status === 'running' ? lastProgressLine(call.progress) : null;
   return (
     <article className="group relative pl-4">
       <span aria-hidden className="absolute left-0 top-1 bottom-1 w-px" style={{ background: 'var(--line)' }} />
@@ -786,6 +811,15 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
         <span className="mono text-[10px]" style={{ color: tone }}>
           {label}
         </span>
+        {latest && (
+          <span
+            className="mono max-w-[28ch] truncate text-[10px]"
+            style={{ color: 'var(--brass)' }}
+            title={latest}
+          >
+            {latest}
+          </span>
+        )}
         <span className="mono ml-auto text-[10px] text-[var(--muted)]">{stamp(call.startedAt)}</span>
       </Note>
       {/*
