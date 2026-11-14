@@ -423,6 +423,11 @@ pub struct TaskQuery {
     pub goal_id: Option<String>,
     /// 只看这个执行者手上的（或声明给它的）任务。
     pub agent_id: Option<String>,
+    /// 只看这几行，逗号分隔的 id。对话里那份任务列表带的就是这一轮挂上去的几个 id：
+    /// 它要的是自己派的那几行，不是整张表——整张表今天九千多行，读过之后只会截掉。
+    /// 不认的 id 静默略过：列表上的行可能已经被清理，一个已经不存在的 id 不该让整次
+    /// 读取被拒。
+    pub ids: Option<String>,
     /// 只看这一类任务：一个状态词，或就绪队列（`ready`，队列本身，不是某行携带的状态）。
     /// 大小写不敏感，取值就是 [`TaskFilter::ALL`] 印出来的那些词。
     pub status: Option<String>,
@@ -459,6 +464,17 @@ fn matches_query(query: &TaskQuery, task: &Task) -> bool {
             .agent_id
             .as_deref()
             .is_none_or(|want| task.agent_id.as_deref() == Some(want))
+        && in_ids(query, task)
+}
+
+/// 一条任务是否在被点名的这一组里。不给 id 就一律留下。
+///
+/// 一次调用读了几个 id，就只读这几个 id 的行——列表要的是它自己派的那几行。
+fn in_ids(query: &TaskQuery, task: &Task) -> bool {
+    match query.ids.as_deref() {
+        None => true,
+        Some(want) => want.split(',').map(str::trim).any(|id| id == task.id),
+    }
 }
 
 /// The state half of the filter, read out of [`TaskFilter`] rather than out of
@@ -2486,6 +2502,33 @@ mod tests {
             !view.is_executable,
             "a re-injected placeholder is not schedulable work"
         );
+    }
+
+    /// 点名一组 id 就只读这几行，其余一律不出现；不给就与从前逐字相同。
+    ///
+    /// 对话里那份任务列表拿的是这一轮自己派的几个 id——整张表读过来只会再截掉，
+    /// 而网络上一个字节都省不下。
+    #[test]
+    fn an_id_filter_keeps_exactly_the_rows_it_names() {
+        let wanted = task("wanted-1", cog_core::TaskStatus::Running, "t", 0);
+        let also = task("wanted-2", cog_core::TaskStatus::Pending, "t", 0);
+        let other = task("someone-else", cog_core::TaskStatus::Pending, "t", 0);
+
+        let named = TaskQuery {
+            ids: Some("wanted-1, wanted-2".into()),
+            ..Default::default()
+        };
+        assert!(in_ids(&named, &wanted) && in_ids(&named, &also));
+        assert!(
+            !in_ids(&named, &other),
+            "an id that was not named must not appear in the list"
+        );
+        assert!(
+            in_ids(&TaskQuery::default(), &other),
+            "no id filter keeps every task, exactly as before"
+        );
+        // 一个已经不存在的 id 静默略过：列表上的一行可能已经被清理，那不是读取失败。
+        assert!(!in_ids(&named, &other));
     }
 
     #[test]

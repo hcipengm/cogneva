@@ -3,6 +3,7 @@ import {
   getChatCommands,
   getChatQuota,
   getWorkspaceTree,
+  listTasks,
   type ChatCommand,
   type ChatQuota,
   type WorkspaceEntry,
@@ -26,6 +27,7 @@ import type {
   ContextCompaction,
   HookReading,
   SessionSpend,
+  TurnTaskRow,
   TurnUsage,
 } from '@/types/events';
 import { Note } from '@/ui/Note';
@@ -170,6 +172,97 @@ function colleaguesLine(sent: ColleagueMessage): string {
     return `${head} —— 没在时限内答${sent.hint ? `：${sent.hint}` : ''}`;
   }
   return `${head} —— 没等到回信（${sent.reason ?? '原因未报'}）`;
+}
+
+/**
+ * 任务图上的一行状态词，读成一句话。
+ *
+ * 状态词本身就是行走的、读面印的、客户端比的那一个（`TaskStatus::as_str`）；这里
+ * 只把它翻成人话。
+ */
+function taskStatusWord(word: string | undefined): string {
+  switch (word) {
+    case 'pending':
+      return '待办';
+    case 'scheduled':
+      return '已排期';
+    case 'running':
+      return '在做';
+    case 'completed':
+      return '做完了';
+    case 'failed':
+      return '失败了';
+    case 'cancelled':
+      return '已取消';
+    case undefined:
+      return '';
+    default:
+      return word;
+  }
+}
+
+/**
+ * 这一轮挂上共享任务图的活，画成一份列表：哪一行、什么活、谁在做、做到哪。
+ *
+ * 帧里只有派活那一刻就已经确定的事实（哪一行、什么活、派给谁）；状态从任务图那
+ * 同一张表读回来（`GET /api/v1/tasks/list?ids=`，与工作台同一个 `get_all_tasks`
+ * 出处），再叠上总线上已经到过的 `task_status_change`——两处写的是同一个状态词，
+ * 所以对话里的列表与工作台不会各说各的。
+ *
+ * 「还没读到」与「读失败了」写成两句不同的话：前者是还没到，后者要人去查那个
+ * 读口；把两者都画成「待办」会把一条已经在跑的活说成没人接。
+ */
+function TurnTasks({ rows }: { rows: TurnTaskRow[] }) {
+  const liveTasks = useStreamStore((s) => s.liveTasks);
+  const ids = rows.map((row) => row.taskId).join(',');
+  const [status, setStatus] = useState<Record<string, string>>({});
+  const [readable, setReadable] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setReadable(null);
+    listTasks({ ids })
+      .then((read) => {
+        if (!alive) return;
+        const next: Record<string, string> = {};
+        for (const task of read) next[task.id] = task.status;
+        setStatus(next);
+        setReadable(true);
+      })
+      .catch(() => {
+        if (alive) setReadable(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [ids]);
+  const live = useMemo(
+    () => new Map(liveTasks.map((entry) => [entry.taskId, entry.status])),
+    [liveTasks]
+  );
+  return (
+    <div className="mono mt-1 text-[10px] text-[var(--muted)]">
+      <p>这一轮挂到任务图上的活：</p>
+      {rows.map((row) => {
+        // 总线上的状态比读回来的新：它是一次真实的变迁，读口那一份是上一次拉取的。
+        const word = live.get(row.taskId) ?? status[row.taskId];
+        const state =
+          word !== undefined
+            ? taskStatusWord(word)
+            : readable === false
+              ? '状态没读到'
+              : readable === null
+                ? '状态读取中'
+                : '任务图上没有这一行';
+        const who = row.assignedTo ? `派给 ${row.assignedTo}` : '等人接';
+        const where = row.venue ? `，场地 ${row.venue}` : '';
+        return (
+          <p key={row.taskId}>
+            {row.goal || row.taskId} —— {who}{where}，{state}
+          </p>
+        );
+      })}
+    </div>
+  );
 }
 
 /**
@@ -510,6 +603,16 @@ function Turn({ message }: { message: ChatMessage }) {
             {colleaguesLine(sent)}
           </p>
         ))}
+
+      {/*
+        这一轮挂上共享任务图的活。与工作台读的是同一张表，所以在这里列出来不是
+        另抄一份账，而是同一份账在对话里的读面——人不必离开这段对话去找「我刚让
+        它办的那件事」。这是「这一轮派了什么活」，与上面那一份「这一轮自己要
+        做的待办」分开画。
+      */}
+      {message.role === 'assistant' && message.tasks && message.tasks.length > 0 && (
+        <TurnTasks rows={message.tasks} />
+      )}
 
       {/*
         这一轮花了多少。只有服务端真的量到了才有一行：读回的历史与被叫停的那

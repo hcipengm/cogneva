@@ -11,6 +11,7 @@ import type {
   HookReading,
   LoadedMemory,
   McpListing,
+  TurnTaskRow,
   TurnUsage,
 } from '@/types/events';
 
@@ -84,6 +85,14 @@ export interface ChatMessage {
    * 在真发过时才发这一帧。数组按到达顺序累计。
    */
   colleagues: ColleagueMessage[] | null;
+  /**
+   * 这一轮挂上共享任务图的活，由服务端的 `tasks` 帧带进来（一帧带整份列表）。
+   *
+   * `null` 是「这一轮没派活」，不是「平台没有任务图」：真派过活才发这一帧。
+   * 帧里只有派活那一刻的事实（哪一行、什么活、派给谁）；状态由面板拿这些 id
+   * 去任务图那同一张表里读回，所以这里不存状态。
+   */
+  tasks: TurnTaskRow[] | null;
   /**
    * 这一句的原文落成的文件。只有超过窗口的那些带它：服务端把原文逐字写进执行器
    * 的一个文件，界面上这一条因此画成附件（带全文长度），而不是把开头当成全部。
@@ -439,6 +448,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 mcp: null,
                 hooks: null,
                 colleagues: null,
+                tasks: null,
                 attachment: null,
                 files,
                 at,
@@ -501,6 +511,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   mcp: null,
                   hooks: null,
                   colleagues: null,
+                  tasks: null,
                   attachment: frame.attachment,
                   files: [],
                   at: frame.timestamp,
@@ -536,6 +547,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   mcp: null,
                   hooks: null,
                   colleagues: null,
+                  tasks: null,
                   attachment: null,
                   files: [],
                   at: frame.timestamp,
@@ -661,6 +673,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
           }));
           break;
         }
+
+        case 'tasks': {
+          // 一帧就是整份列表：它说的是「这一轮挂上了哪几行」，不按行累计。
+          if (!frame.tasks) break;
+          const tasks = frame.tasks;
+          session = withMessage(session, frame.messageId, (message) => ({
+            ...message,
+            tasks,
+          }));
+          break;
+        }
+
         case 'usage': {
           // 记在说这句话的那一条上，不另开一行：这一轮花了多少是这条消息的
           // 属性，不是一句新的话。帧排在 `end` 之前，所以它到的时候这一条还
@@ -765,6 +789,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             hooks: null,
             // 读回的历史里也没有这一格：同事消息属于那一轮，不在记录的列里。
             colleagues: null,
+            tasks: null,
             // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
             attachment: null,
             // 记录里有名字与类型：刷新之后仍认得出这句话说过一张图。字节数

@@ -1323,6 +1323,49 @@ async fn emit_turn_colleagues(
     }
 }
 
+/// 这一轮挂上共享任务图的活。
+///
+/// 一帧带整份列表，不按行发：这是一份列表，行与行之间没有各自的结局，页面要的是
+/// 一次画出来的几行。帧里只带派活那一刻就等于确定的事（哪一行、什么活、派给谁、
+/// 属于哪个 goal）；状态由页面拿这些 id 去任务图那同一张表里读回，所以列表上的
+/// 「谁在做、做到哪」跟着任务图走，而不是跟着派活那一刻冻结。
+async fn emit_turn_tasks(
+    out: &mpsc::Sender<String>,
+    session_id: &str,
+    message_id: &str,
+    tasks: Option<&serde_json::Value>,
+) {
+    let Some(rows) = tasks.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let rows: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|row| {
+            let task_id = row.get("task_id").and_then(serde_json::Value::as_str)?;
+            Some(serde_json::json!({
+                "task_id": task_id,
+                "goal": row.get("goal").cloned().unwrap_or(serde_json::Value::Null),
+                "goal_id": row.get("goal_id").cloned().unwrap_or(serde_json::Value::Null),
+                "venue": row.get("venue").cloned().unwrap_or(serde_json::Value::Null),
+                "assigned_to": row.get("assigned_to").cloned().unwrap_or(serde_json::Value::Null),
+            }))
+        })
+        .collect();
+    emit(
+        out,
+        session_id,
+        "message.tasks",
+        serde_json::json!({
+            "message_id": message_id,
+            "tasks": rows,
+        }),
+    )
+    .await;
+}
+
 /// 属主配了哪些钩子、这一轮哪几条真的跑过。
 ///
 /// 「配了」与「跑过」在同一帧里：只有配置清单的时候，一条从没命中的钩子与
@@ -2143,6 +2186,12 @@ pub async fn run_chat_turn(
         .ok()
         .and_then(|value| value.get("colleagues"))
         .cloned();
+    // 这一轮挂上任务图的活，同一个道理：没派活就没有这一帧。
+    let turn_tasks = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("tasks"))
+        .cloned();
     let mut reply = journal.reply;
     let mut failure: Option<String> = None;
     match outcome {
@@ -2260,6 +2309,7 @@ pub async fn run_chat_turn(
     emit_turn_hooks(&out, &session_id, &assistant_mid, turn_hooks.as_ref()).await;
     emit_turn_compaction(&out, &session_id, &assistant_mid, turn_compaction.as_ref()).await;
     emit_turn_colleagues(&out, &session_id, &assistant_mid, turn_colleagues.as_ref()).await;
+    emit_turn_tasks(&out, &session_id, &assistant_mid, turn_tasks.as_ref()).await;
     emit_turn_usage(
         state.llm_usage.as_deref(),
         &out,
@@ -4057,6 +4107,59 @@ mod tests {
         assert!(
             out_rx.try_recv().is_err(),
             "没有同事消息的一轮发了一帧：界面上会出现一行空话"
+        );
+    }
+
+    /// 这一轮挂上任务图的活：一帧带整份列表，行上只有派活那一刻的事实。
+    ///
+    /// 一帧而不是一行一帧：它是一份列表，行与行之间没有各自的结局。状态不在帧
+    /// 上——那是任务图随时间的读数，页面拿 id 去同一张表读回。
+    #[tokio::test]
+    async fn the_work_a_turn_filed_is_one_list_frame_without_frozen_state() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let filed = serde_json::json!([
+            {
+                "task_id": "task-1",
+                "goal": "把上周的记忆写入读一遍",
+                "goal_id": "goal-9",
+                "venue": "memory",
+                "assigned_to": "mira"
+            },
+            {
+                "task_id": "task-2",
+                "goal": "补齐验收标准",
+                "goal_id": serde_json::Value::Null,
+                "venue": serde_json::Value::Null,
+                "assigned_to": serde_json::Value::Null
+            }
+        ]);
+
+        emit_turn_tasks(&out_tx, "s1", "m-1", Some(&filed)).await;
+
+        let frame = out_rx.try_recv().expect("派了活就该有这一帧");
+        assert!(frame.contains("\"message.tasks\""), "{frame}");
+        assert!(frame.contains("\"task-1\""), "{frame}");
+        assert!(frame.contains("\"task-2\""), "{frame}");
+        assert!(frame.contains("\"assigned_to\":\"mira\""), "{frame}");
+        assert!(
+            !frame.contains("\"status\""),
+            "帧上带着派活那一刻的状态：任务图从此有一份永远停在入队的副本：{frame}"
+        );
+        assert!(
+            out_rx.try_recv().is_err(),
+            "整份列表发了两帧：第二帧会把第一帧盖掉一部分"
+        );
+    }
+
+    /// 这一轮没派活：一帧也不发，而不是发一帧空的。
+    #[tokio::test]
+    async fn a_turn_that_filed_nothing_sends_no_task_frame() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        emit_turn_tasks(&out_tx, "s1", "m-1", None).await;
+        emit_turn_tasks(&out_tx, "s1", "m-1", Some(&serde_json::json!([]))).await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "没派活的一轮发了一帧：界面上会出现一片空列表"
         );
     }
 }

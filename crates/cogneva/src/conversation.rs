@@ -800,9 +800,11 @@ impl ConversationTurn for PlatformConversation {
             // 已经在这里交出来了，包括被拒的那一次（`Err`）。
             let colleague_messages: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
+            // 这一轮挂到共享任务图上的活。任务图是账本，对话是一种读面：没有这一格，
             // 人就只能离开这段对话去工作台找「我刚让它办的那件事」，而两处读的本来
             // 就是同一张表（`get_all_tasks`），没有第二个出处可言。
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+            let filed_tasks: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
             {
                 let rules = cog_agent::hooks::guard::rules(&hook_defs);
                 let guard = if rules.is_empty() {
@@ -816,6 +818,7 @@ impl ConversationTurn for PlatformConversation {
                 let before_engine = self.hooks.clone();
                 let after_engine = self.hooks.clone();
                 let after_log = Arc::clone(&colleague_messages);
+                let filed_log = Arc::clone(&filed_tasks);
                 runtime = runtime.with_hooks(cog_agent::AgentHooks {
                     before_tool_call: Some(Arc::new(
                         move |tool: &str, arguments: &mut serde_json::Value| {
@@ -856,6 +859,14 @@ impl ConversationTurn for PlatformConversation {
                                 match after_log.lock() {
                                     Ok(mut log) => log.push(record),
                                     Err(poisoned) => poisoned.into_inner().push(record),
+                                }
+                            }
+                            if tool == "start_task" {
+                                if let Some(row) = task_list(arguments, result) {
+                                    match filed_log.lock() {
+                                        Ok(mut log) => log.push(row),
+                                        Err(poisoned) => poisoned.into_inner().push(row),
+                                    }
                                 }
                             }
                         },
@@ -947,6 +958,19 @@ impl ConversationTurn for PlatformConversation {
                     };
                     if !sent.is_empty() {
                         object.insert("colleagues".to_string(), serde_json::Value::Array(sent));
+                    }
+                }
+            }
+            // 这一轮挂上任务图的活。与同事消息同一个道理：只在真挂过时出现，
+            // 「这一轮没派活」与「这个平台不在对话里显示任务」因此分得开。
+            if let Ok(value) = answer.as_mut() {
+                if let Some(object) = value.as_object_mut() {
+                    let filed = match filed_tasks.lock() {
+                        Ok(mut log) => std::mem::take(&mut *log),
+                        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+                    };
+                    if !filed.is_empty() {
+                        object.insert("tasks".to_string(), serde_json::Value::Array(filed));
                     }
                 }
             }
@@ -3504,6 +3528,47 @@ mod tests {
     /// 挂上任务图的一行，只写那一刻就已确定的事实：哪一行、什么活（第一行）、
     /// 派给谁、属于哪个 goal。状态不在这里——它是任务图随时间的读数。
     #[test]
+    fn a_filed_row_carries_the_title_and_no_state() {
+        let args = serde_json::json!({
+            "goal": "把上周的记忆写入读一遍\n验收：每一条都有一到十的评分",
+            "acceptance": ["每一条都有一到十的评分"],
+        });
+        let row = task_list(
+            &args,
+            &Ok(serde_json::json!({
+                "filed": true,
+                "task_id": "task-1",
+                "goal_id": "goal-9",
+                "venue": "memory",
+                "assigned_to": "mira",
+            })),
+        )
+        .expect("挂上去的一行要进列表");
+        assert_eq!(row["task_id"], "task-1");
+        assert_eq!(
+            row["goal"], "把上周的记忆写入读一遍",
+            "活名取的是 goal 的第一行：整段说明挤不进列表的一行"
+        );
+        assert_eq!(row["goal_id"], "goal-9");
+        assert_eq!(row["venue"], "memory");
+        assert_eq!(row["assigned_to"], "mira");
+        assert!(
+            row.get("status").is_none(),
+            "状态被抄进了对话：任务图从此有一份停在入队的副本"
+        );
+
+        // 被拒的那一次任务图上没有这一行：列表里出现一条查不到的活比少一条更糟。
+        let refused = task_list(
+            &args,
+            &Err(cog_core::SFError::Validation(
+                "a filing without a criterion is refused".to_string(),
+            )),
+        );
+        assert!(refused.is_none(), "被拒的派活不该在列表里占一行");
+        let no_id = task_list(&args, &Ok(serde_json::json!({ "filed": true })));
+        assert!(no_id.is_none(), "没有 task_id 就指不到任务图上任何一行");
+    }
+
     /// 同事发来的话怎么进这一轮的历史。
     ///
     /// 一条 prompt 就是一句话；continue 与 steering 是同一件事的两种口吻，都

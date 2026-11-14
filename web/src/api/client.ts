@@ -1918,12 +1918,15 @@ export async function listTasks(params: {
   status?: string;
   goal_id?: string;
   agent_id?: string;
+  /** 只看这几行，逗号分隔。对话里的任务列表带的是这一轮派的那几个 id。 */
+  ids?: string;
   limit?: number;
 } = {}): Promise<TaskRow[]> {
   const query = new URLSearchParams();
   if (params.status) query.set('status', params.status);
   if (params.goal_id) query.set('goal_id', params.goal_id);
   if (params.agent_id) query.set('agent_id', params.agent_id);
+  if (params.ids) query.set('ids', params.ids);
   if (params.limit) query.set('limit', String(params.limit));
   const suffix = query.toString() ? `?${query.toString()}` : '';
   return api.get<TaskRow[]>(`/api/v1/tasks/list${suffix}`);

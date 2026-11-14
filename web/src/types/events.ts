@@ -158,6 +158,7 @@ export type ChatFrameKind =
   | 'memory'
   | 'mcp'
   | 'hooks'
+  | 'tasks'
   | 'colleague';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
@@ -200,6 +201,10 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   // 这一轮里模型往某个同事的收件箱发了一条话。一条消息一帧，各自带收件人与
   // 结局：合计数回答不了「发给他那条到底回没回」。只有真发过才有这一帧。
   'message.colleague': 'colleague',
+  // 这一轮挂上共享任务图的活。一帧带整份列表——它是一份列表，行与行之间没有
+  // 各自的结局。帧里只有派活那一刻就能确定的事；状态由页面拿 id 去任务图那张
+  // 同一张表里读回，所以列表上的「谁在做、做到哪」跟着任务图走。
+  'message.tasks': 'tasks',
 };
 
 /**
@@ -246,6 +251,8 @@ export interface ChatFrame {
   hooks: HookReading | null;
   /** 只有 `colleague` 帧带着：这一轮发给某位同事的一条话。 */
   colleague: ColleagueMessage | null;
+  /** 只有 `tasks` 帧带着：这一轮挂上共享任务图的活。 */
+  tasks: TurnTaskRow[] | null;
   /**
    * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
    *
@@ -320,6 +327,22 @@ export interface ColleagueMessage {
   hint: string | null;
   error: string | null;
 }
+
+/**
+ * 这一轮挂上任务图的一行，只写派活那一刻就已确定的事实。
+ *
+ * 状态不在这里：任务图随时间的读数要拿 `taskId` 去 `/api/v1/tasks/list?ids=` 读，
+ * 而列表跟着那一份走。派活那一刻的「已入队」抄进这一帧，就成了永远停在入队的副本。
+ */
+export interface TurnTaskRow {
+  taskId: string;
+  /** 派活时那句 goal 的第一行，读作活名。 */
+  goal: string;
+  goalId: string | null;
+  venue: string | null;
+  assignedTo: string | null;
+}
+
 /** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
 export interface ChatAttachment {
   path: string;
@@ -537,6 +560,23 @@ export function normalizeChatFrame(
                 )
               : [],
           }
+        : null,
+    tasks:
+      kind === 'tasks'
+        ? Array.isArray(inner.tasks)
+          ? (inner.tasks as Array<Record<string, unknown>>).flatMap((row) =>
+              typeof row?.task_id === 'string' && row.task_id
+                ? [{
+                    taskId: row.task_id,
+                    goal: typeof row.goal === 'string' ? row.goal : '',
+                    goalId: typeof row.goal_id === 'string' ? row.goal_id : null,
+                    venue: typeof row.venue === 'string' ? row.venue : null,
+                    assignedTo:
+                      typeof row.assigned_to === 'string' ? row.assigned_to : null,
+                  }]
+                : []
+            )
+          : []
         : null,
     colleague:
       kind === 'colleague'

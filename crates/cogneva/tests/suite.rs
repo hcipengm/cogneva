@@ -499,6 +499,8 @@ mod self_alert_rule_names_are_declared_once_test;
 mod service_account_mount_literals_contract_test;
 #[path = "sessions_are_listed_and_searchable_test.rs"]
 mod sessions_are_listed_and_searchable_test;
+#[path = "shared_task_list_in_the_conversation_test.rs"]
+mod shared_task_list_in_the_conversation_test;
 #[path = "shutdown_budget_contract_test.rs"]
 mod shutdown_budget_contract_test;
 #[path = "skill_directories_contract_test.rs"]
