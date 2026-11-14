@@ -137,6 +137,18 @@ SUBCOMMANDS:
                            are cancelled); --upsert only writes the fronts it
                            names. `--from -` reads stdin, so the one-time move
                            of the deleted file needs nothing staged on the pod.
+    exemptions             Print every exemption in force, one line per row:
+                           kind, the kind's columns, then its expiry date. A
+                           row states why it exists and the last day it is in
+                           force; a reader judges the date, not a prose memory.
+    import-exemptions --from <file> [--upsert]
+                           Put exemption rows into the graph. Without --upsert
+                           the input is the whole set in force: rows it no
+                           longer states are withdrawn from their kind's node.
+                           --upsert only adds or renews the rows it names, which
+                           is how one exemption is granted without restating the
+                           rest. `--from -` reads stdin for the same reason as
+                           the other imports.
     progress [--json]
                            One reading of three ledgers at the same instant: the
                            task graph by the unit it names, the change account,
@@ -213,6 +225,14 @@ pub enum Action {
         from: PathBuf,
         /// Only write the fronts the input names, so a declaration of one new
         /// front cannot narrow the gate's scope to that one.
+        upsert: bool,
+    },
+    /// Every exemption in force, one row per line, straight from the graph.
+    Exemptions,
+    ImportExemptions {
+        from: PathBuf,
+        /// Only state the rows the input names: granting one exemption must not
+        /// silently withdraw the others that were in force.
         upsert: bool,
     },
     // Boxed: a handover carries a spec whose text fields make it the widest
@@ -329,6 +349,11 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         Some("fronts") => Action::Fronts,
         Some("import-fronts") => Action::ImportFronts {
             from: from.ok_or("import-fronts needs --from <file>")?,
+            upsert,
+        },
+        Some("exemptions") => Action::Exemptions,
+        Some("import-exemptions") => Action::ImportExemptions {
+            from: from.ok_or("import-exemptions needs --from <file>")?,
             upsert,
         },
         Some(other) => return Err(format!("unknown governance subcommand {other}")),
@@ -458,6 +483,10 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         Action::ImportDrivers { from, upsert } => import_drivers(&*store, &from, upsert).await?,
         Action::Fronts => fronts_roster(&*store).await?,
         Action::ImportFronts { from, upsert } => import_fronts(&*store, &from, upsert).await?,
+        Action::Exemptions => exemptions_roster(&*store).await?,
+        Action::ImportExemptions { from, upsert } => {
+            import_exemptions(&*store, &from, upsert).await?
+        }
         Action::Act(act) => {
             // The heartbeat store is what an exit handover's apply step
             // re-reads. Without it the command still works for every handover
@@ -654,6 +683,29 @@ async fn import_fronts(
         crate::governance_fronts::upsert_from_text(store, &text).await?
     } else {
         crate::governance_fronts::import_from_text(store, &text).await?
+    };
+    println!("{}", summary.line());
+    Ok(())
+}
+
+/// Every exemption in force, printed from the graph on every call: a consumer
+/// that judged a cached copy would be judging exemptions somebody already
+/// withdrew.
+async fn exemptions_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Error>> {
+    print!("{}", crate::governance_exemptions::exemptions(store).await?);
+    Ok(())
+}
+
+async fn import_exemptions(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    upsert: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
+    let summary = if upsert {
+        crate::governance_exemptions::upsert_from_text(store, &text).await?
+    } else {
+        crate::governance_exemptions::import_from_text(store, &text).await?
     };
     println!("{}", summary.line());
     Ok(())
@@ -1747,6 +1799,19 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&args(&["exemptions"])).unwrap().action,
+            Action::Exemptions
+        );
+        assert_eq!(
+            parse_args(&args(&["import-exemptions", "--from", "-", "--upsert"]))
+                .unwrap()
+                .action,
+            Action::ImportExemptions {
+                from: PathBuf::from("-"),
+                upsert: true,
+            }
+        );
+        assert_eq!(
             parse_args(&args(&["assign"])).unwrap().action,
             Action::Assign {
                 face: None,
@@ -1769,6 +1834,7 @@ mod tests {
         assert!(parse_args(&args(&["project"])).is_err());
         assert!(parse_args(&args(&["import-faces"])).is_err());
         assert!(parse_args(&args(&["import-fronts"])).is_err());
+        assert!(parse_args(&args(&["import-exemptions"])).is_err());
         assert!(parse_args(&args(&["faces", "--out"])).is_err());
         assert!(parse_args(&args(&[])).is_err());
         assert!(parse_args(&args(&["no-such-face"])).is_err());
@@ -2209,7 +2275,11 @@ mod tests {
     /// -- is a reading, not a promise about states.
     #[test]
     fn an_ordinary_reading_name_is_not_mistaken_for_a_state_list() {
-        for cell in ["principle_ledger_enforced", "tasks_rows_read", "reading_enforced"] {
+        for cell in [
+            "principle_ledger_enforced",
+            "tasks_rows_read",
+            "reading_enforced",
+        ] {
             assert!(parse_roster(&face_line(cell)).is_ok(), "{cell}");
         }
     }
