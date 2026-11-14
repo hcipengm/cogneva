@@ -470,6 +470,13 @@ pub struct AgentRuntime {
     /// 开着几段，所以「这段对话花了多少」既不能从按人的总数里读，也不能由运行时
     /// 在这里算——它只把 id 挂到每一发上，折叠那一步读账本的行。
     call_session: Option<String>,
+    /// 这一轮用哪只模型，由人在这段对话里选的那一格给出；`None` 是没选过，
+    /// 由上游自己配置的那一只（见 `ChatOptions::model` 的读法）。
+    ///
+    /// 挂在运行时上而不是每次调用传：一段对话的模型是这段对话的属性，选一次
+    /// 管到下一次改选；逐次传只会让每一个调用点各自决定用哪只，而其中漏掉的那
+    /// 一个会静默退回默认。
+    call_model: Option<String>,
     /// Identity of the run in flight, declared on every LLM call it makes.
     ///
     /// The same id the run reports its own token census under: without it the
@@ -1188,6 +1195,7 @@ impl AgentRuntime {
             call_owner: None,
             call_origin: None,
             call_session: None,
+            call_model: None,
             roster: None,
             display_name: None,
             identity_looked_up: false,
@@ -1336,6 +1344,16 @@ impl AgentRuntime {
     /// 捆在一起传，就会逼着调用方为没有主人的对话编一个主人。
     pub fn with_call_session(mut self, session: impl Into<String>) -> Self {
         self.call_session = Some(session.into());
+        self
+    }
+
+    /// 这一段对话用哪只模型。`None` 是不指定，走上游配置的那一只。
+    ///
+    /// 只挂在这一轮发出去的请求上（`ChatOptions::model`），不改客户端自己的配置：
+    /// 同一个人可以同时开着两段对话，一段要快、一段要深，换模型是这一段的属性，
+    /// 不是这台部署的属性。
+    pub fn with_model(mut self, model: Option<String>) -> Self {
+        self.call_model = model.filter(|m| !m.trim().is_empty());
         self
     }
 
@@ -1668,6 +1686,7 @@ impl AgentRuntime {
         let options = cog_core::ChatOptions {
             tools: tool_defs,
             cache_retention: cog_core::CacheRetention::Short,
+            model: self.call_model.clone(),
             ..Default::default()
         }
         .with_actor(&self.actor_label());
@@ -3759,6 +3778,7 @@ impl AgentRuntime {
         let options = cog_core::ChatOptions {
             tools: tool_defs,
             cache_retention: cog_core::CacheRetention::Short,
+            model: self.call_model.clone(),
             ..Default::default()
         }
         .with_actor(&self.actor_label());

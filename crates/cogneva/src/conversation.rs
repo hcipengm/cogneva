@@ -555,6 +555,43 @@ impl ConversationTurn for PlatformConversation {
         conversation_context_window_tokens()
     }
 
+    /// 这一段选过哪只模型。没接键值存储时读作「没选过」——那个部署上确实没有
+    /// 选择可以留下来，答一个默认名字就是在替人做决定。键值存储接了但读失败是
+    /// `Err`：那是另一件事，界面要说得出来。
+    fn chosen_model<'a>(
+        &'a self,
+        owner: &'a str,
+        session_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let Some(kv) = self.people.as_ref() else {
+                return Ok(None);
+            };
+            crate::session_model::load(kv, owner, session_id).await
+        })
+    }
+
+    fn choose_model<'a>(
+        &'a self,
+        owner: &'a str,
+        session_id: &'a str,
+        model: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let Some(kv) = self.people.as_ref() else {
+                return Err(
+                    "这个部署没有接键值存储，选不了模型：选择没地方记下来，下一轮就会读不到它。"
+                        .into(),
+                );
+            };
+            crate::session_model::save(kv, owner, session_id, model).await
+        })
+    }
+
     fn turn<'a>(
         &'a self,
         request: ConversationRequest,
@@ -889,7 +926,10 @@ impl ConversationTurn for PlatformConversation {
             // 这一轮的每一发都记在这段对话名下：界面上的「这段会话花了多少」是账本
             // 按这一列折叠出来的，不挂这一格，那几发的 token 只数得进按人 / 按
             // 环境的总数，屏幕上一段会话的合计就会比它下面每一轮加起来少。
-            let mut runtime = runtime.with_call_session(request.session_id.clone());
+            let runtime = runtime.with_call_session(request.session_id.clone());
+            // 这一段选的模型：只挂在这一轮的每一发上。没选过时是 `None`，走上游
+            // 配置的那一只——不是在这里另写一个默认名。
+            let mut runtime = runtime.with_model(request.model.clone());
 
             // 开跑前先读收件箱：同事在它不在的时候发来的话，这一轮要看得见。
             // 读完就确认，下一轮只读新的；回信地址跟着消息一起带进来，等这一轮

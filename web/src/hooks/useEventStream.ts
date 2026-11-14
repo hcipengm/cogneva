@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import {
   EventStreamClient,
+  type ChatModelWire,
   type ResumedMessageWire,
 } from '@/transport/websocket';
 import { MockEventStreamClient } from '@/transport/mockStream';
@@ -95,6 +96,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const noteUnrecorded = useStreamStore((state) => state.noteUnrecorded);
   const ingestChatFrame = useChatStore((state) => state.ingestFrame);
   const applyChatResume = useChatStore((state) => state.applyResume);
+  const applyModel = useChatStore((state) => state.applyModel);
   const noteAgentFrame = useLiveAgentStore((state) => state.noteFrame);
   const noteAlertFrame = useLiveAlertStore((state) => state.noteFrame);
   const noteCommsFrame = useLiveCommsStore((state) => state.noteFrame);
@@ -362,6 +364,18 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     };
 
     /**
+     * 这一段用哪只模型、还能选哪些。一次往返办两件事，所以两件事一起落：换完之后
+     * 手上立刻要有「现在用的是哪只」与「还能选哪些」。
+     */
+    const ingestChatModel = (wire: ChatModelWire) => {
+      const session = wire.session_id || FIRST_SESSION;
+      applyModel(session, wire.model ?? null, {
+        models: wire.models ?? [],
+        configured: wire.configured === true,
+        reason: wire.reason ?? null,
+      });
+    };
+
     const channels = channelKey ? channelKey.split(',') : [];
     const client = options.mock
       ? new MockEventStreamClient({
@@ -415,6 +429,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           // 约定名单同理：少一格（没有号或没有原文）的那一条不落——没有号就撤
           // 不掉，没有原文就画不出一句人写的话。
           onChatResume: (resume) => ingestChatResume(resume.session_id, resume.messages ?? []),
+          onChatModel: ingestChatModel,
           onOpen: resumeOpenSession,
           onOwnerMemory: (entries) => {
             const known = entries.flatMap((entry) =>
@@ -470,6 +485,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     noteUnrecorded,
     ingestChatFrame,
     applyChatResume,
+    applyModel,
     noteAgentFrame,
     noteAlertFrame,
     noteCommsFrame,

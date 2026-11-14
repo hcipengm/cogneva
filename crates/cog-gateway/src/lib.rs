@@ -35,6 +35,7 @@ pub mod backup_admin;
 pub mod buildgate;
 pub mod capabilities;
 pub mod chat;
+pub mod chat_models;
 pub mod chat_stream;
 pub mod cluster;
 pub mod collaboration;

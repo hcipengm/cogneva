@@ -391,6 +391,41 @@ pub trait ConversationTurn: Send + Sync {
     /// 本来读得下的话被提前推到文件里。
     fn context_window_tokens(&self) -> usize;
 
+    /// 这段对话现在用哪只模型；`Ok(None)` 是没选过。
+    ///
+    /// 三种结局分开：「选过这只」「没选过」「读不到选择」。前两种这一轮都跑得下去
+    /// （后者走平台上配置的那一只），第三种要能让界面说出来——把读失败画成
+    /// 「没选过」，人会在下拉框里看不到自己选过的那只，以为选择没生效。
+    ///
+    /// 默认是没选过：装配层没接选择存储时，这一轮走上游配置的那一只，而不是
+    /// 由网关替它猜一个。
+    fn chosen_model<'a>(
+        &'a self,
+        _owner: &'a str,
+        _session_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// 把这一段对话的模型换成 `model`。返回换完之后这一格的值。
+    ///
+    /// 返回 `Err` 的时候什么都没变：选择没落下去时，界面要读到的是「没换成」，
+    /// 而不是下一次发话时才发现用的还是旧的那只。
+    fn choose_model<'a>(
+        &'a self,
+        _owner: &'a str,
+        _session_id: &'a str,
+        _model: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err("这个部署没有接模型选择的存储，换不了；这一轮仍用平台上配置的那一只。".into())
+        })
+    }
+
     /// 这个人手上还有哪些「总是允许 / 总是拒绝」的规则。
     ///
     /// 默认是一张空名单：装配层没装规则存储时，界面上就该什么都列不出来，而不是
@@ -699,6 +734,11 @@ pub struct ConversationRequest {
     pub platform: Option<String>,
     /// 同一台设备的同一个客户端，同样来自握手。
     pub device_id: Option<String>,
+    /// 这一段对话选的那只模型；`None` 是没选过，走上游配置的那一只。
+    ///
+    /// 由网关从会话上读出来再带进来，因为「这一段用哪只」是会话的属性，而运行时
+    /// 每轮重建：把选择留在网关的内存里，进程重启或换一条连接就会读不回它。
+    pub model: Option<String>,
     /// 这一轮处在哪种权限模式下，取的是闭集里的名字。不认识的由装配层按更严的
     /// 那一格处理——一次拼错的模式名不该让这一轮问得更少。
     pub permission_mode: String,
@@ -1989,6 +2029,18 @@ pub async fn run_chat_turn(
         return;
     };
 
+    // 这一段选过模型就用它，没选过走平台上配置的那一只。读在拿模型客户端之前：
+    // 选择的存储读不到时这一轮照旧跑，只是用配置的那一只——一次读失败不该让
+    // 一句要人等着的话发不出去。读不出来这件事不吞掉：日志里留着，界面上读
+    // 下拉框时还会再读到同一次失败。
+    let chosen_model = match conversation.chosen_model(&owner, &session_id).await {
+        Ok(chosen) => chosen,
+        Err(error) => {
+            tracing::warn!(session = %session_id, %error, "read chosen model; using the configured one");
+            None
+        }
+    };
+
     let llm = state
         .llm_client
         .read()
@@ -2110,6 +2162,7 @@ pub async fn run_chat_turn(
                 llm,
                 platform: origin.platform.map(str::to_string),
                 device_id: origin.device_id.map(str::to_string),
+                model: chosen_model.clone(),
                 permission_mode,
                 permissions,
             },

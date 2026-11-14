@@ -59,6 +59,19 @@ export interface ChatResumeWire {
 }
 
 /**
+ * 服务端答回来的「这一段用哪只模型、还能选哪些」。
+ *
+ * `model` 缺省是「没选过」（走上游配置的那一只），不是一只默认型号；`models` 为空
+ * 时 `reason` 说明为什么——界面要画的是那句话，不是一个空下拉框。
+ */
+export interface ChatModelWire {
+  session_id?: string;
+  model?: string | null;
+  models?: string[];
+  configured?: boolean;
+  reason?: string | null;
+}
+
 export interface PermissionAskWire {
   request_id?: string;
   session_id?: string;
@@ -108,6 +121,17 @@ export interface WebSocketOptions {
    */
   onChatResume?: (resume: ChatResumeWire) => void;
   /**
+   * 这一段对话的模型选择与可选项。它是设置，不是这一轮的产出：混进聊天流会被
+   * 当成一句助手说的话。
+   */
+  onChatModel?: (catalogue: ChatModelWire) => void;
+  /**
+   * 每一次连上（含重连）之后叫一声。
+   *
+   * 重连之后，这一页需要第一件事就是把「我正在看的那一段」重新接上——不然那一轮
+   * 还在说，而屏幕上再也不会有下文。
+   */
+  onOpen?: () => void;
   onStatusChange?: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -303,6 +327,17 @@ export class EventStreamClient {
       this.options.onChatResume?.(
         Array.isArray(wire.messages) ? wire : { session_id: wire.session_id, messages: [] }
       );
+      return;
+    } else if (message.type === 'chat_model') {
+      // 认不出形状的那一份按「一只都选不了」处理，不拿上次的清单冒充这次。
+      const wire = message as unknown as ChatModelWire;
+      this.options.onChatModel?.({
+        session_id: wire.session_id,
+        model: typeof wire.model === 'string' ? wire.model : null,
+        models: Array.isArray(wire.models) ? wire.models : [],
+        configured: wire.configured === true,
+        reason: typeof wire.reason === 'string' ? wire.reason : null,
+      });
       return;
     } else if (message.type === 'notification' && message.payload) {
       const notification = normalizeNotification(

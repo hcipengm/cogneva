@@ -319,6 +319,83 @@ async fn handle_type_message(
                 send_server_message(socket, &ServerMessage::OwnerMemory { entries }).await?;
             }
         }
+        ClientMessage::ChatModel {
+            session_id, model, ..
+        } => {
+            let session = session_id.unwrap_or_else(|| "default".into());
+            let catalogue = crate::chat_models::catalogue().await;
+            let answer = |model: Option<String>, reason: Option<String>| ServerMessage::ChatModel {
+                session_id: session.clone(),
+                model,
+                models: catalogue.models.clone(),
+                configured: catalogue.configured,
+                reason,
+            };
+            let Some(conversation) = state.conversation.get().cloned() else {
+                let resp = answer(None, Some("这套部署没有接上对话面，换不了模型。".into()));
+                send_server_message(socket, &resp).await?;
+                return Ok(());
+            };
+
+            // 不带 `model` 是只读：界面上打开下拉框先问一次「现在用哪只、能选
+            // 哪些」。读失败要说出来——画成「没选过」等于替人换了一只。
+            let Some(wanted) = model.as_deref().map(str::trim) else {
+                let resp = match conversation.chosen_model(conn.user_id, &session).await {
+                    Ok(chosen) => answer(chosen, catalogue.reason.clone()),
+                    Err(error) => answer(None, Some(format!("读不到这一段选的模型：{error}"))),
+                };
+                send_server_message(socket, &resp).await?;
+                return Ok(());
+            };
+
+            // 空串是「改回默认」：清单列不出来的那一只不该靠它恢复，所以这一支
+            // 不看清单。真要挑一只时，清单外的一律不收——收下来，下一轮就会用
+            // 一只平台根本没配的模型发请求。
+            let target = (!wanted.is_empty()).then_some(wanted);
+            if let Some(target) = target {
+                if !catalogue.offers(target) {
+                    let reason = if catalogue.configured {
+                        format!(
+                            "清单里没有 `{target}` 这只模型，能选的是：{}。",
+                            if catalogue.models.is_empty() {
+                                "（清单是空的）".to_string()
+                            } else {
+                                catalogue.models.join("、")
+                            }
+                        )
+                    } else {
+                        catalogue
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "平台还没有配置任何模型。".into())
+                    };
+                    let resp = answer(None, Some(reason));
+                    send_server_message(socket, &resp).await?;
+                    return Ok(());
+                }
+            }
+
+            let resp = match conversation
+                .choose_model(conn.user_id, &session, target)
+                .await
+            {
+                Ok(chosen) => answer(chosen, catalogue.reason.clone()),
+                Err(error) => answer(None, Some(error)),
+            };
+            send_server_message(socket, &resp).await?;
+        }
+        ClientMessage::ChatResume { session_id, .. } => {
+            let session = session_id.unwrap_or_else(|| "default".into());
+            // 续的是一段对话的流，所以先判这一段能不能给这个人看：不能就不接，
+            // 也不回快照——别人的对话里在说什么，与他无关。
+            if let Err(reason) = crate::sessions::speaks_here(state, &session, conn.user_id).await {
+                tracing::debug!(session = %session, %reason, "chat resume refused");
+                return Ok(());
+            }
+            // 这一条连接可能已经接在这一段上了（重发一次 resume 不是错）：
+            // `watch_session` 按会话去重，避免同一条 socket 收到两份帧。
+            watch_session(state, watched, Some(&session), out_tx);
+        }
         ClientMessage::ChatCancel { session_id, .. } => {
             // 没有在跑的那一段上按停止不是错：用户可能刚好在上一轮结束的那一瞬
             // 按下去。这时什么都不发生，也不该有一条「取消失败」的帧——他真正

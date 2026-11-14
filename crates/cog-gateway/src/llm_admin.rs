@@ -364,7 +364,7 @@ pub(crate) async fn merge_pool_edit_into_fields(
 
 /// Backends declared in the local cogneva.json (informational only — after
 /// credential narrowing the primary backend points at the security gateway).
-fn local_backends() -> Vec<serde_json::Value> {
+pub(crate) fn local_backends() -> Vec<serde_json::Value> {
     let path = cog_core::paths::config_file();
     match std::fs::read_to_string(&path)
         .ok()

@@ -50,6 +50,7 @@ pub(crate) mod roster_test_support;
 pub mod schema_bundle;
 pub mod scraper_endpoint;
 pub mod self_change;
+pub mod session_model;
 pub mod shutdown_coordinator;
 pub mod startup_guard;
 pub mod validate_config;

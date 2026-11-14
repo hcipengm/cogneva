@@ -57,6 +57,19 @@ export interface ResumedMessage {
 }
 
 /**
+ * 一段对话能选的那几只模型，以及为什么一只都没有。
+ *
+ * `reason` 与空清单同时出现才对得上：清单非空时它讲的是「只读到一半」的原因，可以
+ * 不显示；清单为空时它就是界面上要画的那句话——「平台还没配上游」与「安全网关说不
+ * 出模型」是两句不同的话，只有前一句在告诉人去哪儿修。
+ */
+export interface ModelCatalogue {
+  models: string[];
+  /** 平台说「有东西被配了」。空清单 + `false` = 还没配；空清单 + `true` = 配了但读不出名字。 */
+  configured: boolean;
+  reason: string | null;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -167,6 +180,12 @@ export interface ChatSession {
    */
   agentId: string | null;
   /**
+   * 这一段对话现在选的那只模型。`null` 是「没选过」——走上游配置的那一只，不是
+   * 一只被这一页替人挑好的模型。选择存在服务端、按「这个人 + 这一段」记，所以
+   * 同一段对话换一台机器打开，看到的还是它。
+   */
+  model: string | null;
+  /**
    * 这一段对话翻开过的变更，带翻开的时间。
    *
    * 与目标同一类东西：它们是这段对话在账上真读过的那几行，而正文里提到的「那条
@@ -215,6 +234,16 @@ interface ChatState {
   historyLoading: boolean;
   /** 读名单失败的原因；读成功时是 `null`。空名单与读失败不合成一句。 */
   historyError: string | null;
+  /**
+   * 平台上配着的那几只模型，与「为什么一只都没有」。
+   *
+   * 部署级的一份，不是每段对话一份：清单来自平台已经配置好的那几处，同一台部署上
+   * 各段对话看到的是同一张表。逐段记会在两段对话之间出现两份可能不一致的清单。
+   *
+   * `null` 是「还没问过」——不是「一只都没有」。两者画成同一句，界面上就会在连上
+   * 之前先说「平台没配模型」。
+   */
+  modelCatalogue: ModelCatalogue | null;
 
   createSession: (title?: string) => string;
   /**
@@ -240,6 +269,13 @@ interface ChatState {
    */
   applyResume: (sessionId: string, messages: ResumedMessage[]) => void;
   /**
+   * 服务端答回来的「这一段用哪只模型、还能选哪些」。
+   *
+   * 一次往返办两件事，所以两件事一起落：`model` 是这一段现在的那一只（`null` =
+   * 没选过），`catalogue` 是能选的那一份（空清单带一句为什么——「还没配」与
+   * 「配了但没模型」都要说得出来，而一只默认型号会让下一轮失败）。
+   */
+  applyModel: (sessionId: string, model: string | null, catalogue: ModelCatalogue) => void;
   /** 从服务端读回历史。已读过时直接返回。 */
   hydrate: (sessionId: string) => Promise<void>;
   /** 读服务端那份会话名单，可带一个搜索词。 */
@@ -280,6 +316,7 @@ function emptySession(id: string, title = '新的对话'): ChatSession {
     streaming: null,
     goals: [],
     agentId: null,
+    model: null,
     changes: [],
   };
 }
@@ -375,6 +412,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   history: [],
   historyLoading: false,
   historyError: null,
+  modelCatalogue: null,
 
   /**
    * 读名单。空结果与读失败分开：空名单是「你确实没有别的会话」，读失败是
@@ -830,6 +868,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       };
     });
     if (!known) saveDock(get());
+  },
+
+  applyModel: (sessionId, model, catalogue) => {
+    set((state) => ({
+      modelCatalogue: catalogue,
+      ...withSession(state, sessionId, (session) => ({ ...session, model })),
+    }));
   },
 
   hydrate: async (sessionId) => {

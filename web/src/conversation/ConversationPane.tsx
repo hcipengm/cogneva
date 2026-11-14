@@ -1062,6 +1062,14 @@ export function ConversationPane({
     [allPermissionAsks, sessionId]
   );
   const permissionMode = usePermissionStore((s) => s.modes[sessionId] ?? DEFAULT_PERMISSION_MODE);
+  const modelCatalogue = useChatStore((s) => s.modelCatalogue);
+  /**
+   * 换这一段的模型。空串是「改回默认」——走上游配置的那一只；服务端把这两种选择
+   * 分开记，界面这里只发它收到的那个值，不自己判「空 = 没选」。
+   */
+  const chooseModel = (model: string) => {
+    clientRef.current?.send({ type: 'chat_model', session_id: sessionId, model });
+  };
   /**
    * 这个人留下来的规则。`null` 是「还没读到」，不是「一条也没有」——两句话在
    * 这一面写出来就是两句不同的字，见下面那块规则面板。
@@ -1177,6 +1185,13 @@ export function ConversationPane({
     const rank = (at: number) => (Number.isFinite(at) ? at : 0);
     return items.sort((a, b) => rank(a.at) - rank(b.at));
   }, [session?.messages, tools, agentTurns]);
+
+  // 这一段用哪只模型：换到这一段时问一次（连上时由 `useEventStream` 按当前那一
+  // 段问）。答回来的一帧同时带「现在用的是哪只」与「还能选哪些」，所以换完之后
+  // 手上立刻有这两样，不必再问一次。
+  useEffect(() => {
+    clientRef.current?.send({ type: 'chat_model', session_id: sessionId });
+  }, [clientRef, sessionId]);
 
   // 打开就先把历史读回来。读过的不再读：重读会把刚流出来的这一段冲掉。
   useEffect(() => {
@@ -1474,6 +1489,36 @@ export function ConversationPane({
             {quotaLine(quota, quotaUnreadable)}
           </Note>
         )}
+        {/*
+          这一段用哪只模型。清单来自平台已经配置好的那一份：只列出真调得通的那几只，
+          而不是一张内置的型号表——后者在配置换掉之后会继续列出一只已经调不通的模型。
+          清单为空时写的那句话也是服务端给的：空是因为还没配，还是因为配了却读不出
+          名字，只有那一头说得清。
+        */}
+        {modelCatalogue !== null &&
+          (modelCatalogue.models.length > 0 ? (
+            <select
+              value={session?.model ?? ''}
+              onChange={(e) => chooseModel(e.target.value)}
+              aria-label="这一段对话的模型"
+              className="mono max-w-[160px] shrink-0 bg-transparent text-[10px] outline-none"
+              style={{ color: 'var(--muted)' }}
+            >
+              <option value="">默认模型</option>
+              {modelCatalogue.models.map((model) => (
+                <option key={model} value={model}>
+                  {model}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <Note
+              className="mono max-w-[38%] shrink-0 truncate text-[10px]"
+              text="没有可选的模型时这里写的是那一边给的原因：还没配上游，或者配了却读不出名字——两者的修法不同"
+            >
+              {modelCatalogue.reason ?? '这一段没有可选的模型'}
+            </Note>
+          ))}
         {/*
           这一段处在哪一格模式：问两句还是一句不问，是这一面唯一一处能改的东西。
           放在标题行上，因为它是这一段对话的属性，不是某一条消息的。

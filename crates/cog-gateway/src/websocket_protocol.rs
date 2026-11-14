@@ -162,6 +162,24 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// 这一段对话用哪只模型：读（不带 `model`）或换（带上）。
+    ///
+    /// 一次往返办两件事，因为界面要的就是这两件事一起到达：换完之后手上立刻要有
+    /// 「现在用的是哪只」和「还能选哪些」，分两帧发，中间那一瞬下拉框里的选中
+    /// 项与服务端认为的可以不一样。
+    ///
+    /// 清单来自平台已经配置好的那一份（见 `chat_models`），不在这里另写一份。
+    #[serde(rename = "chat_model")]
+    ChatModel {
+        #[serde(default)]
+        session_id: Option<String>,
+        /// 要换成的那只；不带（`null`）就是只读，空串是改回默认（平台配置的
+        /// 那一只）。
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
     /// 重连之后接着看这一段：把「说到哪儿了」取回来。
     ///
     /// 断线期间这一轮还在跑，帧没有人收。重连时不重放每一帧，只取一份快照——
@@ -251,6 +269,21 @@ pub enum ServerMessage {
     #[serde(rename = "owner_memory")]
     OwnerMemory {
         entries: Vec<crate::chat::MemoryEntryView>,
+    },
+    /// 这一段对话用哪只模型，以及能选的那一份清单。
+    ///
+    /// `configured: false` 是「平台还没配置任何模型」，不是一个空的下拉框：
+    /// 这时 `reason` 说明为什么空，`model` 是 `None`——没选过与选了空的在界面上
+    /// 是同一句话，而在服务端它们是同一个事实。
+    #[serde(rename = "chat_model")]
+    ChatModel {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        models: Vec<String>,
+        configured: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// 这一段现在说到哪儿了。重连时先收到它，再收到之后的每一帧。
     ///
