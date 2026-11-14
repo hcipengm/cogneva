@@ -7,6 +7,7 @@ import type {
   ChatFrame,
   ChatRole,
   ContextCompaction,
+  HookReading,
   LoadedMemory,
   McpListing,
   TurnUsage,
@@ -68,6 +69,13 @@ export interface ChatMessage {
   memory: LoadedMemory[] | null;
   /** 这一轮的外部 MCP 服务，由服务端的 `mcp` 帧带进来；`null` 是没挂外部服务。 */
   mcp: McpListing | null;
+  /**
+   * 这一轮配了哪些钩子、哪几条跑过，由服务端的 `hooks` 帧带进来。
+   *
+   * `null` 是「这一轮没有这一帧」：平台没接钩子表。配了但一条都没跑过时它是
+   * 一份有 `configured`、`ran` 为空的读数——那正好是「配了、没生效」的样子。
+   */
+  hooks: HookReading | null;
   /**
    * 这一句的原文落成的文件。只有超过窗口的那些带它：服务端把原文逐字写进执行器
    * 的一个文件，界面上这一条因此画成附件（带全文长度），而不是把开头当成全部。
@@ -421,6 +429,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 compaction: null,
                 memory: null,
                 mcp: null,
+                hooks: null,
                 attachment: null,
                 files,
                 at,
@@ -481,6 +490,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   compaction: null,
                   memory: null,
                   mcp: null,
+                  hooks: null,
                   attachment: frame.attachment,
                   files: [],
                   at: frame.timestamp,
@@ -514,6 +524,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   compaction: null,
                   memory: null,
                   mcp: null,
+                  hooks: null,
                   attachment: null,
                   files: [],
                   at: frame.timestamp,
@@ -613,6 +624,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           session = withMessage(session, frame.messageId, (message) => ({
             ...message,
             mcp,
+          }));
+          break;
+        }
+
+        case 'hooks': {
+          // 与花销同一处落点：它说的是这条回答是在什么规则下说出来的。
+          if (!frame.hooks) break;
+          const hooks = frame.hooks;
+          session = withMessage(session, frame.messageId, (message) => ({
+            ...message,
+            hooks,
           }));
           break;
         }
@@ -718,6 +740,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             memory: null,
             // 外部服务那一格同理：它说的是那一轮开头问了什么，不是这句话的属性。
             mcp: null,
+            hooks: null,
             // 记录里没有附件那一格；长消息由界面按正文长度画成同一种附件。
             attachment: null,
             // 记录里有名字与类型：刷新之后仍认得出这句话说过一张图。字节数

@@ -16,6 +16,13 @@ pub enum HookTrigger {
     OnRalphPass,
     OnRalphUnrecoverable,
     OnSquadRetry,
+    /// A tool is about to run. This is the one trigger that can decide: a hook
+    /// on it may refuse the call ([`HookAction::Block`]) or replace its
+    /// arguments ([`HookAction::Rewrite`]).
+    OnToolBefore,
+    /// A tool finished. Observational only — the call has already happened, so
+    /// nothing here can change it.
+    OnToolAfter,
 }
 
 /// Runtime hook event — what is dispatched when a trigger fires.
@@ -167,6 +174,33 @@ pub enum HookAction {
     Notify {
         user_id: String,
     },
+    /// Refuse the tool call this hook governs. Enforced before the tool runs,
+    /// so it is only meaningful on [`HookTrigger::OnToolBefore`]; the model
+    /// receives the reason as the tool's result and can route around it.
+    Block {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Replace the arguments the tool will run with before it runs. Same
+    /// trigger restriction as [`HookAction::Block`]: both decide, and a
+    /// decision can only be taken before the call.
+    Rewrite {
+        /// The arguments that run instead of the model's.
+        arguments: Value,
+    },
+}
+
+impl HookAction {
+    /// Whether this action decides the call rather than reporting it.
+    ///
+    /// A deciding action is not something a publisher can carry out: it has to
+    /// be consulted at the call site and answer before the tool runs. The
+    /// publisher engine therefore skips these, and the tool guard is the only
+    /// thing that runs them — one executor per action, no path where a hook
+    /// silently reports success without having decided anything.
+    pub fn is_guard(&self) -> bool {
+        matches!(self, HookAction::Block { .. } | HookAction::Rewrite { .. })
+    }
 }
 
 /// Static hook definition.
@@ -180,6 +214,12 @@ pub struct HookDef {
     pub crew_id_filter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub squad_id_filter: Option<String>,
+    /// Which tools this hook governs, as a name or a `*`-wildcard pattern
+    /// (`bash`, `mcp__*`, `*_write`). Absent means every tool — right for an
+    /// observational hook, too broad for one that decides, so a deciding hook
+    /// without a pattern is not consulted for anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
     pub action: HookAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<crate::RateLimitConfig>,

@@ -58,6 +58,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action: HookAction::Log {
                 level: cog_agent::hooks::LogLevel::Info,
             },
@@ -70,6 +71,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action: HookAction::Log {
                 level: cog_agent::hooks::LogLevel::Info,
             },
@@ -82,6 +84,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action: HookAction::Log {
                 level: cog_agent::hooks::LogLevel::Info,
             },

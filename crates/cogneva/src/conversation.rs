@@ -301,6 +301,10 @@ pub struct PlatformConversation {
     /// 外部 MCP 服务：它的工具还没进过任何一张工具表，这一轮把它们装进来。
     /// 没有端点的部署就是 `None`，界面据此如实说「没挂外部服务」。
     mcp: Option<Arc<dyn cog_core::McpClient>>,
+    /// 属主配的钩子。同一张配置表里两类动作、两个执行者：判定（阻断 / 改写）
+    /// 在工具动手之前由这一侧回答，通知（webhook / redis / log / notify）交给
+    /// 发布引擎。没装引擎的进程照实缺席，界面上没有这一行。
+    hooks: Option<Arc<dyn cog_core::HookEngine>>,
     /// 外部价值判定的落盘面：属主就「什么算好」说的一句话，原样记进账。
     ///
     /// 与上面那几件同一类可选能力——没有装的进程照实缺席，工具会说「记不下来」，
@@ -327,6 +331,7 @@ impl PlatformConversation {
         evolution: Option<Arc<dyn cog_core::EvolutionAdmin>>,
         taste: Option<Arc<dyn cog_core::TasteIntentSink>>,
         mcp: Option<Arc<dyn cog_core::McpClient>>,
+        hooks: Option<Arc<dyn cog_core::HookEngine>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -341,6 +346,7 @@ impl PlatformConversation {
             evolution,
             taste,
             mcp,
+            hooks,
         }
     }
 }
@@ -728,6 +734,63 @@ impl ConversationTurn for PlatformConversation {
                     crate::owner_memory::OwnerMemoryBucket::new(Arc::clone(kv), owner),
                 ));
             }
+            // 属主配的钩子。同一张配置表分两路：判定型（阻断 / 改写）挂在工具
+            // 动手之前由这一侧回答，通知型交给发布引擎。发布引擎自己会跳过判定
+            // 型（`HookAction::is_guard`）——一个动作只有一个执行者，否则一次
+            // 调用会被拒两次，读数里出现两条只实际发生了一条的记录。
+            let hook_defs: Vec<cog_core::HookDef> = match self.hooks.as_ref() {
+                Some(engine) => engine.list_hooks().await,
+                None => Vec::new(),
+            };
+            let hook_runs = Arc::new(cog_agent::hooks::guard::Runs::default());
+            if let Some(engine) = self.hooks.as_ref() {
+                let rules = cog_agent::hooks::guard::rules(&hook_defs);
+                let guard = if rules.is_empty() {
+                    None
+                } else {
+                    Some(cog_agent::hooks::guard::before_tool_call(
+                        rules,
+                        Arc::clone(&hook_runs),
+                    ))
+                };
+                let before_engine = Arc::clone(engine);
+                let after_engine = Arc::clone(engine);
+                runtime = runtime.with_hooks(cog_agent::AgentHooks {
+                    before_tool_call: Some(Arc::new(
+                        move |tool: &str, arguments: &mut serde_json::Value| {
+                            // 观测型钩子（log / notify / webhook）也要看见这次
+                            // 调用：事件先发出去，判定再回答。两件事的顺序不
+                            // 影响结果，但先发出去意味着被拒的调用也在账上。
+                            before_engine.emit_detached(
+                                cog_core::HookEvent::new(cog_core::HookTrigger::OnToolBefore)
+                                    .with_payload(serde_json::json!({
+                                        "tool": tool,
+                                        "arguments": arguments.clone(),
+                                    })),
+                            );
+                            match guard.as_ref() {
+                                Some(guard) => guard(tool, arguments),
+                                None => Ok(()),
+                            }
+                        },
+                    )),
+                    after_tool_call: Some(Arc::new(
+                        move |tool: &str,
+                              arguments: &serde_json::Value,
+                              result: &SFResult<serde_json::Value>| {
+                            after_engine.emit_detached(
+                                cog_core::HookEvent::new(cog_core::HookTrigger::OnToolAfter)
+                                    .with_payload(serde_json::json!({
+                                        "tool": tool,
+                                        "arguments": arguments,
+                                        "ok": result.is_ok(),
+                                    })),
+                            );
+                        },
+                    )),
+                    transform_context: None,
+                });
+            }
             let permission_session = request.session_id.clone();
             let decider: Option<Arc<dyn cog_agent::permission::PermissionDecider>> =
                 match request.permissions {
@@ -811,6 +874,22 @@ impl ConversationTurn for PlatformConversation {
             if let (Some(report), Ok(value)) = (mcp_report, answer.as_mut()) {
                 if let Some(object) = value.as_object_mut() {
                     object.insert("mcp".to_string(), report);
+                }
+            }
+            // 钩子的读数：配了哪些、这一轮哪几条真的跑过。一轮结束也是「停止」
+            // 那个触发点——这一轮不会再有下一次工具调用，也不会有下一次模型
+            // 调用，此刻发出去的通知就是这一轮的收尾。
+            if let (Some(engine), Ok(value)) = (self.hooks.as_ref(), answer.as_mut()) {
+                engine.emit_detached(
+                    cog_core::HookEvent::new(cog_core::HookTrigger::OnAgentEnd)
+                        .with_agent_id(employee.id.clone())
+                        .with_payload(serde_json::json!({ "session_id": request.session_id })),
+                );
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "hooks".to_string(),
+                        cog_agent::hooks::guard::report(&hook_defs, &hook_runs),
+                    );
                 }
             }
 

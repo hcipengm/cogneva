@@ -156,7 +156,8 @@ export type ChatFrameKind =
   | 'usage'
   | 'compaction'
   | 'memory'
-  | 'mcp';
+  | 'mcp'
+  | 'hooks';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -192,6 +193,9 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   // 这一轮的外部 MCP 服务：挂了没有、连上没有、问到几只工具。没有端点的部署
   // 不发这一帧；它的出现说明这个平台挂了外部服务。
   'message.mcp': 'mcp',
+  // 这一轮属主配了哪些钩子、哪几条真的跑过。没有钩子表的部署不发这一帧；
+  // 它出现说明这个平台在按配置判定与通知，而不只是把配置存着。
+  'message.hooks': 'hooks',
 };
 
 /**
@@ -234,6 +238,8 @@ export interface ChatFrame {
   memory: LoadedMemory[] | null;
   /** 只有 `mcp` 帧带着：这一轮的外部 MCP 服务与它提供了几只工具。 */
   mcp: McpListing | null;
+  /** 只有 `hooks` 帧带着：这一轮配了哪些钩子、哪几条跑过。 */
+  hooks: HookReading | null;
   /**
    * 只有超过窗口的 `start` 带着：这一句的原文落成了哪个文件、有多长。
    *
@@ -255,6 +261,35 @@ export interface McpListing {
   reachable: boolean;
   tools: string[];
   error: string | null;
+}
+
+/** 钩子表里的一条：它看着哪个触发点、管哪些工具、做什么。 */
+export interface ConfiguredHook {
+  id: string;
+  trigger: string;
+  tool: string | null;
+  /** `block` / `rewrite` / `log` / `notify` / `webhook` / `redis_stream`。 */
+  action: string;
+}
+
+/** 这一轮里被一条钩子处理过的一次调用。 */
+export interface HookRun {
+  hookId: string;
+  tool: string;
+  /** `block` 或 `rewrite`：这次调用被拒了，或被换了参数。 */
+  decision: string;
+  reason: string | null;
+}
+
+/**
+ * 配了什么与跑过什么。
+ *
+ * 两半必须一起画：只画配置，一条从没命中的钩子与一条已生效的钩子看起来一样；
+ * 只画运行记录，一条把工具模式写错的钩子看起来像根本没配。
+ */
+export interface HookReading {
+  configured: ConfiguredHook[];
+  ran: HookRun[];
 }
 
 /** 一条长消息落成的文件。`path` 是执行器上的路径，界面只拿来显示与回溯。 */
@@ -444,6 +479,35 @@ export function normalizeChatFrame(
                 )
               : [],
             error: typeof inner.error === 'string' ? inner.error : null,
+          }
+        : null,
+    hooks:
+      kind === 'hooks'
+        ? {
+            configured: Array.isArray(inner.configured)
+              ? (inner.configured as Array<Record<string, unknown>>).flatMap((row) =>
+                  typeof row?.id === 'string'
+                    ? [{
+                        id: row.id,
+                        trigger: typeof row.trigger === 'string' ? row.trigger : '',
+                        tool: typeof row.tool === 'string' ? row.tool : null,
+                        action: typeof row.action === 'string' ? row.action : '',
+                      }]
+                    : []
+                )
+              : [],
+            ran: Array.isArray(inner.ran)
+              ? (inner.ran as Array<Record<string, unknown>>).flatMap((row) =>
+                  typeof row?.hook_id === 'string' && typeof row?.tool === 'string'
+                    ? [{
+                        hookId: row.hook_id,
+                        tool: row.tool,
+                        decision: typeof row.decision === 'string' ? row.decision : '',
+                        reason: typeof row.reason === 'string' ? row.reason : null,
+                      }]
+                    : []
+                )
+              : [],
           }
         : null,
     compaction:

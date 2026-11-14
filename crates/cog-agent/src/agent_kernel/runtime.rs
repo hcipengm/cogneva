@@ -291,9 +291,13 @@ use cog_core::RuntimeConfig;
 #[derive(Clone, Default)]
 #[allow(clippy::type_complexity)]
 pub struct AgentHooks {
-    /// Called before each tool call. Return Err to skip the tool call.
+    /// Called before each tool call, with the arguments the tool is about to
+    /// receive. Return Err to skip the call; the error text becomes the
+    /// result the model sees. The arguments are mutable on purpose: a hook
+    /// that narrows or normalises them has to change what runs, not add a
+    /// second copy of the call somewhere else.
     pub before_tool_call:
-        Option<Arc<dyn Fn(&str, &serde_json::Value) -> SFResult<()> + Send + Sync>>,
+        Option<Arc<dyn Fn(&str, &mut serde_json::Value) -> SFResult<()> + Send + Sync>>,
     /// Called after each tool call with the result.
     pub after_tool_call:
         Option<Arc<dyn Fn(&str, &serde_json::Value, &SFResult<serde_json::Value>) + Send + Sync>>,
@@ -2843,7 +2847,7 @@ impl AgentRuntime {
 
             let thought_text = assistant_text(&assistant_msg);
 
-            let tool_calls = assistant_msg.tool_calls();
+            let mut tool_calls = assistant_msg.tool_calls();
 
             // Record step
             self.steps.push(RuntimeStep {
@@ -3048,7 +3052,18 @@ impl AgentRuntime {
             let mut observations: Vec<serde_json::Value> = Vec::new();
             let mut tool_result_messages: Vec<Message> = Vec::new();
 
-            for (frame, tc) in tool_calls.iter().enumerate() {
+            for (frame, tc) in tool_calls.iter_mut().enumerate() {
+                // before_tool_call hook — asked *before* the start frame, so
+                // the frame carries the arguments the tool is actually given.
+                // A rewrite that landed after the frame would leave the bus
+                // showing a call that never ran.
+                let mut refusal: Option<SFError> = None;
+                if let Some(hook) = self.hooks.before_tool_call.clone() {
+                    if let Err(e) = hook(&tc.name, &mut tc.arguments) {
+                        refusal = Some(e);
+                    }
+                }
+
                 self.emit_event(AgentEvent::ToolExecutionStart {
                     agent_id: self.config.agent_id.clone(),
                     tool_call_id: tc.id.clone(),
@@ -3058,31 +3073,28 @@ impl AgentRuntime {
                 })
                 .await?;
 
-                // before_tool_call hook
-                if let Some(ref hook) = self.hooks.before_tool_call {
-                    if let Err(e) = hook(&tc.name, &tc.arguments) {
-                        let err_result = serde_json::json!({ "error": e.to_string() });
-                        observations.push(err_result.clone());
-                        tool_result_messages.push(Message::tool_result_text(
-                            &tc.id,
-                            &tc.name,
-                            err_result.to_string(),
-                        ));
+                if let Some(e) = refusal {
+                    let err_result = serde_json::json!({ "error": e.to_string() });
+                    observations.push(err_result.clone());
+                    tool_result_messages.push(Message::tool_result_text(
+                        &tc.id,
+                        &tc.name,
+                        err_result.to_string(),
+                    ));
 
-                        self.emit_event(AgentEvent::ToolExecutionEnd {
-                            agent_id: self.config.agent_id.clone(),
-                            tool_call_id: tc.id.clone(),
-                            result: err_result.clone(),
-                            is_error: true,
-                            timestamp: chrono::Utc::now(),
-                        })
-                        .await?;
+                    self.emit_event(AgentEvent::ToolExecutionEnd {
+                        agent_id: self.config.agent_id.clone(),
+                        tool_call_id: tc.id.clone(),
+                        result: err_result.clone(),
+                        is_error: true,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await?;
 
-                        if let Some(ref after) = self.hooks.after_tool_call {
-                            after(&tc.name, &tc.arguments, &Err(e));
-                        }
-                        continue;
+                    if let Some(ref after) = self.hooks.after_tool_call {
+                        after(&tc.name, &tc.arguments, &Err(e));
                     }
+                    continue;
                 }
 
                 // 动手之前先问。模式能自己定的就不出门；要问的，答案决定这一格是
@@ -9297,6 +9309,210 @@ mod attempt_readings_tests {
         assert!(spy
             .rows_for(cog_core::metric_names::ATTEMPT_UNRESOLVED_CALLS_TOTAL)
             .is_empty());
+    }
+
+    /// 一个只发一次工具调用的假模型：判据要看的是调用前后发生了什么。
+    struct CallsOnce(&'static str);
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for CallsOnce {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let answered = messages
+                .iter()
+                .any(|m| matches!(m, Message::ToolResult { .. }));
+            let tool = self.0;
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let content = if answered {
+                    vec![ContentBlock::Text {
+                        text: r#"{"done":true}"#.into(),
+                        text_signature: None,
+                    }]
+                } else {
+                    vec![ContentBlock::tool_call(
+                        "call-hooked",
+                        tool,
+                        serde_json::json!({ "path": "/tmp/model-said" }),
+                    )]
+                };
+                let _ = producer
+                    .push(AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: String::new(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content,
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// 一只记得自己被以什么参数调用的工具。
+    fn watched_tool(name: &str) -> (ToolRegistry, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ToolRegistry::new();
+        let recorder = Arc::clone(&seen);
+        cog_core::ToolRegistry::register(
+            &registry,
+            cog_core::Tool {
+                name: name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+                implementation: cog_core::ToolImplementation::Native(Arc::new(
+                    move |arguments: serde_json::Value| {
+                        let recorder = Arc::clone(&recorder);
+                        Box::pin(async move {
+                            recorder.lock().unwrap().push(arguments);
+                            Ok(serde_json::json!({ "ok": true }))
+                        })
+                    },
+                )),
+            },
+        );
+        (registry, seen)
+    }
+
+    /// 被钩子拒掉的调用一次都没跑：工具没有收到参数，模型拿到的结果是理由。
+    #[tokio::test]
+    async fn a_blocking_hook_stops_the_call_before_it_runs() {
+        let (registry, seen) = watched_tool("file_write");
+        let hooks = AgentHooks {
+            before_tool_call: Some(Arc::new(
+                |tool: &str, _arguments: &mut serde_json::Value| {
+                    Err(SFError::Agent(format!("钩子 no-write 不许调用 {tool}")))
+                },
+            )),
+            ..Default::default()
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "hooked-0001".into(),
+            max_iterations: 3,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx)
+            .with_tools(registry)
+            .with_hooks(hooks);
+        runtime
+            .run_scoped(
+                serde_json::json!({ "task": "write" }),
+                &CallsOnce("file_write"),
+                None,
+            )
+            .await
+            .expect("被拒不是运行失败：这一轮照样收敛");
+        drop(runtime);
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "钩子拒掉的调用还是跑到了工具里：阻断发生在工具动手之后"
+        );
+
+        let mut ends = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::ToolExecutionEnd {
+                result, is_error, ..
+            } = event
+            {
+                ends.push((result, is_error));
+            }
+        }
+        let (result, is_error) = ends.first().expect("这次调用要有结束帧");
+        assert!(is_error, "被拒的调用是错误结果");
+        assert!(
+            result.to_string().contains("no-write"),
+            "模型读不到是哪条钩子拒的：{result}"
+        );
+    }
+
+    /// 改写后的参数才是工具收到的、也是总线上开始帧写着的：帧里不能留一份没跑
+    /// 过的参数。
+    #[tokio::test]
+    async fn a_rewriting_hook_changes_what_the_tool_and_the_bus_see() {
+        let (registry, seen) = watched_tool("file_write");
+        let hooks = AgentHooks {
+            before_tool_call: Some(Arc::new(
+                |_tool: &str, arguments: &mut serde_json::Value| {
+                    *arguments = serde_json::json!({ "path": "/tmp/hook-said" });
+                    Ok(())
+                },
+            )),
+            ..Default::default()
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "hooked-0002".into(),
+            max_iterations: 3,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx)
+            .with_tools(registry)
+            .with_hooks(hooks);
+        runtime
+            .run_scoped(
+                serde_json::json!({ "task": "write" }),
+                &CallsOnce("file_write"),
+                None,
+            )
+            .await
+            .expect("改写不是失败");
+        drop(runtime);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["path"], "/tmp/hook-said");
+
+        let mut starts = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::ToolExecutionStart { args, .. } = event {
+                starts.push(args);
+            }
+        }
+        assert_eq!(
+            starts.first().expect("这次调用要有开始帧")["path"],
+            "/tmp/hook-said",
+            "开始帧里留着模型原来的参数：读的人看到的是一个没跑过的调用"
+        );
     }
 
     #[test]

@@ -280,6 +280,10 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 侧拿它每轮问一次工具表——没接上的时候界面上是「没挂外部服务」，不是
             // 「挂了但一只工具都没有」。
             let mcp = ctx.consume_service::<dyn cog_core::McpClient>();
+            // 属主配的钩子：智能体插件把引擎发布出来，配置从变更目录与进程的
+            // 钩子文件两处载入。对话这一侧拿到的是同一份注册表——属主在哪一
+            // 处写的钩子，这一轮读到的就是哪一处，不存在第二份要同步的表。
+            let hooks = ctx.consume_service::<dyn cog_core::HookEngine>();
             // 平台上每个智能体开头读到的那段话是部署声明的，不是编译进二进制的
             // 一句。声明在 `prompts/` 里，随 ConfigMap 挂进进程；这里把本子交给
             // 内核，任务尝试与界面上的对话都从同一处取。没装提示词插件的进程
@@ -301,6 +305,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     evolution_admin,
                     taste_sink,
                     mcp,
+                    hooks,
                 )))
                 .is_err()
             {

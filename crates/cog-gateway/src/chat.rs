@@ -1275,6 +1275,38 @@ async fn emit_turn_mcp(
     .await;
 }
 
+/// 属主配了哪些钩子、这一轮哪几条真的跑过。
+///
+/// 「配了」与「跑过」在同一帧里：只有配置清单的时候，一条从没命中的钩子与
+/// 一条已生效的钩子看起来一样；只有运行记录的时候，一条被配错模式的钩子看起
+/// 来像没配。把两份并排发，读的人第一眼就知道该去调配置还是去查那一轮。
+async fn emit_turn_hooks(
+    out: &mpsc::Sender<String>,
+    session_id: &str,
+    message_id: &str,
+    hooks: Option<&serde_json::Value>,
+) {
+    let Some(hooks) = hooks else { return };
+    let as_rows = |key: &str| -> Vec<serde_json::Value> {
+        hooks
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    emit(
+        out,
+        session_id,
+        "message.hooks",
+        serde_json::json!({
+            "message_id": message_id,
+            "configured": as_rows("configured"),
+            "ran": as_rows("ran"),
+        }),
+    )
+    .await;
+}
+
 /// 这一段会话到目前为止花了多少：账本按会话那一列折叠出来的那一份。
 ///
 /// 三种答案在屏幕上必须分得开：账本没接（`readable: false`）、这一段还没有行
@@ -2039,6 +2071,12 @@ pub async fn run_chat_turn(
         .ok()
         .and_then(|value| value.get("mcp"))
         .cloned();
+    // 这一轮配了哪些钩子、哪几条跑过：只有这一轮挂上了钩子表才有这一格。
+    let turn_hooks = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("hooks"))
+        .cloned();
     // 这一轮读进了哪几句属主约定：只有这一轮挂了读面才有这一格。
     let turn_memory = outcome
         .as_ref()
@@ -2165,6 +2203,7 @@ pub async fn run_chat_turn(
     //    它说的是这一轮模型手上少看到了什么，读的人先知道这件事再读花销。
     emit_turn_mcp(&out, &session_id, &assistant_mid, turn_mcp.as_ref()).await;
     emit_turn_memory(&out, &session_id, &assistant_mid, turn_memory.as_ref()).await;
+    emit_turn_hooks(&out, &session_id, &assistant_mid, turn_hooks.as_ref()).await;
     emit_turn_compaction(&out, &session_id, &assistant_mid, turn_compaction.as_ref()).await;
     emit_turn_usage(
         state.llm_usage.as_deref(),

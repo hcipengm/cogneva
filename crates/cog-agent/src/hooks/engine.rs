@@ -296,6 +296,9 @@ pub fn trigger_scope(trigger: HookTrigger) -> HookScope {
         HookTrigger::OnRalphPass
         | HookTrigger::OnRalphUnrecoverable
         | HookTrigger::OnSquadRetry => HookScope::Squad,
+        // 工具前后是这一轮自己的事：它没有 Crew / Squad 可广播给，判定也只在
+        // 这一次调用上生效。
+        HookTrigger::OnToolBefore | HookTrigger::OnToolAfter => HookScope::Global,
     }
 }
 
@@ -342,6 +345,11 @@ impl HookEngine {
                 .iter()
                 .filter(|h| h.trigger == event.trigger)
                 .filter(|h| hook_matches_scope(h, &event))
+                // A deciding action is answered at the call site, before the
+                // tool runs. Publishing it from here would report a decision
+                // that was never taken, and would take it twice when a tool
+                // guard is also attached.
+                .filter(|h| !h.action.is_guard())
                 .cloned()
                 .collect()
         };
@@ -480,6 +488,13 @@ async fn execute_action(
             Ok(())
         }
         HookAction::Notify { user_id } => publisher.notify_user(user_id, payload).await,
+        // Unreachable through `emit`, which filters deciding actions out: they
+        // are answered where the tool runs. Reaching this arm means something
+        // dispatched a decision as if it were a notification, and reporting
+        // success would hide that.
+        HookAction::Block { .. } | HookAction::Rewrite { .. } => Err(cog_core::SFError::Config(
+            "a block/rewrite hook decides the call and cannot be published".into(),
+        )),
     }
 }
 
@@ -589,6 +604,7 @@ mod tests {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action,
             rate_limit: None,
             timeout_ms: None,

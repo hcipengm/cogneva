@@ -61,6 +61,7 @@ mod tests {
             scope: HookScope::Global,
             crew_id_filter: None,
             squad_id_filter: None,
+            tool: None,
             action: HookAction::Log {
                 level: LogLevel::Info,
             },

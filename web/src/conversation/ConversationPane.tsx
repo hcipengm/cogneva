@@ -21,7 +21,7 @@ import {
 } from '@/store/permissionStore';
 import { useMemoryStore } from '@/store/memoryStore';
 import { useShell } from '@/shell/store';
-import type { ContextCompaction, SessionSpend, TurnUsage } from '@/types/events';
+import type { ContextCompaction, HookReading, SessionSpend, TurnUsage } from '@/types/events';
 import { Note } from '@/ui/Note';
 
 /**
@@ -142,6 +142,27 @@ function quotaLine(quota: ChatQuota | null, unreadable: boolean): string {
  * 不是模型写的摘要——读者据此认出被挤掉的是哪一轮，而这正是这一行存在的理由：
  * 让「模型这一轮没看见那段」在屏幕上说得出口，而不是等它答得奇怪时去猜。
  */
+/**
+ * 钩子那一行：配了几条，这一轮哪几条跑过。
+ *
+ * 一条都没配时写「没有配钩子」——那是平台接上了钩子表、而属主一条也没写；
+ * 配了却没跑过时写「一条都没跑」，那才是「配了不生效」的样子。三种状态写
+ * 成三种句子，读的人才知道下一步该去写配置还是去查模式写错了没有。
+ */
+function hooksLine(hooks: HookReading): string {
+  if (hooks.configured.length === 0) return '没有配钩子';
+  const configured = `配了 ${hooks.configured.length} 条钩子`;
+  if (hooks.ran.length === 0) return `${configured}，这一轮一条都没跑`;
+  const ran = hooks.ran
+    .map((run) => {
+      const action = run.decision === 'block' ? '阻断' : run.decision === 'rewrite' ? '改参数' : run.decision;
+      const reason = run.reason ? `（${run.reason}）` : '';
+      return `${run.hookId} ${action} ${run.tool}${reason}`;
+    })
+    .join('；');
+  return `${configured}，跑过 ${hooks.ran.length} 条：${ran}`;
+}
+
 function compactionLine(compaction: ContextCompaction): string {
   const parts: string[] = ['上下文压缩'];
   if (compaction.droppedMessages !== null) {
@@ -431,6 +452,18 @@ function Turn({ message }: { message: ChatMessage }) {
                 message.mcp.tools.length > 0 ? `：${message.mcp.tools.join('、')}` : ''
               }`
             : `外部 MCP 连不上${message.mcp.error ? `：${message.mcp.error}` : ''}`}
+        </p>
+      )}
+
+      {/*
+        这一轮配了哪些钩子、哪几条跑过。两半必须一起画：只画条数的话，一条
+        从没命中的钩子与一条已生效的钩子看起来一样；只画运行记录的话，一条把
+        工具模式写错的钩子看起来像根本没配。跑过的那几条把动作写出来——「被
+        拒」和「被换参数」是两句不同的话，读的人下一步做的事也不同。
+      */}
+      {message.role === 'assistant' && message.hooks && (
+        <p className="mono mt-1 text-[10px] text-[var(--muted)]">
+          {hooksLine(message.hooks)}
         </p>
       )}
 
