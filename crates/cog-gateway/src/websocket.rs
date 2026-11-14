@@ -472,6 +472,50 @@ async fn handle_type_message(
             };
             send_server_message(socket, &resp).await?;
         }
+        ClientMessage::ChatCheckpoint {
+            session_id,
+            turn,
+            apply,
+            ..
+        } => {
+            let session = session_id.unwrap_or_else(|| "default".into());
+            let reply =
+                |rows: Vec<crate::chat::CheckpointView>,
+                 hidden: usize,
+                 rewind: Option<crate::chat::RewindReport>,
+                 reason: Option<String>| ServerMessage::ChatCheckpoint {
+                    session_id: session.clone(),
+                    rows,
+                    hidden,
+                    rewind,
+                    reason,
+                };
+            // 读的人得是这一段的读者：检查点的清单里有路径，退回改的是那棵树。
+            // 与说话、换模型、续流同一把尺子。
+            if let Err(reason) = crate::sessions::speaks_here(state, &session, conn.user_id).await {
+                send_server_message(socket, &reply(Vec::new(), 0, None, Some(reason))).await?;
+                return Ok(());
+            }
+            let Some(conversation) = state.conversation.get().cloned() else {
+                let reason = "这套部署没有接上对话面，看不见检查点。".to_string();
+                send_server_message(socket, &reply(Vec::new(), 0, None, Some(reason))).await?;
+                return Ok(());
+            };
+            let resp = match turn {
+                None => match conversation.checkpoints(conn.user_id, &session).await {
+                    Ok(list) => reply(list.rows, list.hidden, None, None),
+                    Err(reason) => reply(Vec::new(), 0, None, Some(reason)),
+                },
+                Some(turn) => match conversation
+                    .rewind(conn.user_id, &session, turn, apply)
+                    .await
+                {
+                    Ok(report) => reply(Vec::new(), 0, Some(report), None),
+                    Err(reason) => reply(Vec::new(), 0, None, Some(reason)),
+                },
+            };
+            send_server_message(socket, &resp).await?;
+        }
         ClientMessage::ChatResume { session_id, .. } => {
             let session = session_id.unwrap_or_else(|| "default".into());
             // 续的是一段对话的流，所以先判这一段能不能给这个人看：不能就不接，

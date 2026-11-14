@@ -27,7 +27,10 @@ use cog_core::{
     AgentEvent, AuditKind, AuditStream, HierarchyManager, OrchestratorControl, QuotaContext,
     RuntimeConfig, SFError, SFResult,
 };
-use cog_gateway::chat::{ConversationRequest, ConversationTurn, MemoryEntryView};
+use cog_gateway::chat::{
+    CheckpointFile, CheckpointList, CheckpointView, ConversationRequest, ConversationTurn,
+    MemoryEntryView, RewindReport,
+};
 
 /// 这一段对话在名册里属于哪个分组。
 ///
@@ -310,6 +313,9 @@ pub struct PlatformConversation {
     /// 与上面那几件同一类可选能力——没有装的进程照实缺席，工具会说「记不下来」，
     /// 而不是回一句「已记录」把一句没落盘的话说成落盘了。
     taste: Option<Arc<dyn cog_core::TasteIntentSink>>,
+    /// 执行器那一侧。检查点拍的是**那棵树**，所以这件事只能问它；没有接执行器
+    /// 的进程照实缺席，界面读到的是「这个部署做不了检查点」，而不是一张空列表。
+    sandbox: Option<Arc<dyn cog_core::SandboxBackend>>,
 }
 
 impl PlatformConversation {
@@ -332,6 +338,7 @@ impl PlatformConversation {
         taste: Option<Arc<dyn cog_core::TasteIntentSink>>,
         mcp: Option<Arc<dyn cog_core::McpClient>>,
         hooks: Option<Arc<dyn cog_core::HookEngine>>,
+        sandbox: Option<Arc<dyn cog_core::SandboxBackend>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -347,6 +354,99 @@ impl PlatformConversation {
             taste,
             mcp,
             hooks,
+            sandbox,
+        }
+    }
+
+    /// 这一段对话是谁在说话：绑在登录身份上的那个人，与 `turn()` 用的是同一个。
+    ///
+    /// 抽出来是因为检查点要按**同一棵树的同一个车道**去拍：车道由这里的 `id`
+    /// 决定，两处各算一次名字，快照就可能落在另一棵树上——而读数是「拍到了」。
+    async fn employee_here(
+        &self,
+        owner: Option<&str>,
+        session_id: &str,
+    ) -> cog_agent::identity::AgentName {
+        match self.people.as_ref() {
+            Some(kv) => bound_employee(kv, fingerprint().as_deref(), owner, session_id).await,
+            None => employee_for(session_id),
+        }
+    }
+}
+
+/// 会话开头的那一份快照，只在这个会话还没有任何一份的时候拍。
+///
+/// 拍不下来不算这一轮的失败：检查点是附加能力，树不是检出（或者执行器这一跳
+/// 没通）时那一轮照样要能说话。但「为什么拍不下来」要落下来——停在一张空列表
+/// 上分不出「还没跑过」与「这个部署做不了」。
+async fn open_checkpoints(
+    sandbox: Arc<dyn cog_core::SandboxBackend>,
+    kv: Arc<dyn cog_core::KeyValueStore>,
+    owner: String,
+    session_id: String,
+    agent_id: String,
+) {
+    let existing = match crate::checkpoints::load(&kv, &owner, &session_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!(session_id, error = %e, "这一段会话的检查点读不到，这一轮不拍");
+            return;
+        }
+    };
+    if existing.rows.iter().any(|row| row.turn == 0) {
+        return;
+    }
+    let key = crate::checkpoints::key(&session_id, 0);
+    match crate::checkpoints::capture(&sandbox, &agent_id, &session_id, &key).await {
+        Ok(_) => {
+            let row = crate::checkpoints::Row {
+                key,
+                turn: 0,
+                at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = crate::checkpoints::remember(&kv, &owner, &session_id, row).await {
+                tracing::warn!(session_id, error = %e, "会话开头的检查点没记下来");
+            }
+        }
+        Err(reason) => {
+            tracing::debug!(session_id, %reason, "会话开头的检查点拍不下来");
+            let _ = crate::checkpoints::mark_unavailable(&kv, &owner, &session_id, reason).await;
+        }
+    }
+}
+
+/// 这一轮结束时的快照。
+///
+/// 记在跑完之后派出去：快照要走一趟执行器读一遍树，放在开跑之前会变成「说完话
+/// 以后它先愣一下」，放在交付之后同步等，人看到最后一行字要多等这一趟。代价是
+/// 名字上的差一轮——退回到第 N 轮之前要的是第 N−1 轮的快照，这条规则在
+/// [`crate::checkpoints::rewind_target`] 一处写着。
+async fn close_checkpoints(
+    sandbox: Arc<dyn cog_core::SandboxBackend>,
+    kv: Arc<dyn cog_core::KeyValueStore>,
+    owner: String,
+    session_id: String,
+    agent_id: String,
+) {
+    let existing = match crate::checkpoints::load(&kv, &owner, &session_id).await {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    let turn = existing.rows.iter().map(|row| row.turn).max().unwrap_or(0) + 1;
+    let key = crate::checkpoints::key(&session_id, turn);
+    match crate::checkpoints::capture(&sandbox, &agent_id, &session_id, &key).await {
+        Ok(_) => {
+            let row = crate::checkpoints::Row {
+                key,
+                turn,
+                at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = crate::checkpoints::remember(&kv, &owner, &session_id, row).await {
+                tracing::warn!(session_id, turn, error = %e, "这一轮的检查点没记下来");
+            }
+        }
+        Err(reason) => {
+            tracing::debug!(session_id, turn, %reason, "这一轮的检查点拍不下来");
         }
     }
 }
@@ -546,6 +646,50 @@ impl cog_agent::permission::PermissionDecider for ConversationPermissions {
 /// 之一。网关判「这条消息是不是太大了」读的就是这个数（见
 /// [`cog_gateway::chat::oversized_threshold_tokens`]），所以两处必须同源：在这里
 /// 另写一个数，界面上落成文件的那条线就会与循环真正被撑破的那条线错开。
+/// 执行器答回来的那份清单，读成界面上要说的话。
+///
+/// 读不懂就是失败，不是「没有文件要改」：把一份残缺的答复画成「什么都不用改」，
+/// 人会点下那一下确认，而树其实会被改。`applied` 报的是**这次调用要不要改树**，
+/// 不是「改成功了没有」——没改成功的那一次会走 `Err`，界面不会看到这一份。
+fn rewind_report(
+    turn: usize,
+    target: usize,
+    apply: bool,
+    value: &serde_json::Value,
+) -> Result<RewindReport, String> {
+    let malformed = || format!("执行器答回来的退回清单读不懂：{value}");
+    let mut files = Vec::new();
+    for file in value
+        .get("files")
+        .and_then(|files| files.as_array())
+        .ok_or_else(malformed)?
+    {
+        let path = file
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(malformed)?;
+        let change = file
+            .get("change")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(malformed)?;
+        files.push(CheckpointFile {
+            path: path.to_string(),
+            change: change.to_string(),
+        });
+    }
+    let truncated = value
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(RewindReport {
+        turn,
+        target,
+        applied: apply,
+        files,
+        truncated,
+    })
+}
+
 fn conversation_context_window_tokens() -> usize {
     cog_core::RuntimeConfig::default().context_window_size
 }
@@ -592,6 +736,88 @@ impl ConversationTurn for PlatformConversation {
         })
     }
 
+    fn checkpoints<'a>(
+        &'a self,
+        owner: &'a str,
+        session_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CheckpointList, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let Some(kv) = self.people.as_ref() else {
+                return Err("这个部署没有接检查点存储，列不出检查点。".into());
+            };
+            let rows = crate::checkpoints::load(kv, owner, session_id).await?;
+            if rows.rows.is_empty() {
+                // 一份都没有：要么还没跑完一轮，要么当时的树拍不下来。后者的
+                // 理由存在 `unavailable` 里——两句话分开说，人才知道自己该
+                // 再跑一轮还是换一个部署。
+                if let Some(reason) = rows.unavailable {
+                    return Err(reason);
+                }
+                return Ok(CheckpointList::default());
+            }
+            let hidden = rows
+                .rows
+                .len()
+                .saturating_sub(crate::checkpoints::MAX_LISTED_CHECKPOINTS);
+            let rows = rows
+                .rows
+                .into_iter()
+                .skip(hidden)
+                .map(|row| CheckpointView {
+                    key: row.key,
+                    turn: row.turn,
+                    at: row.at,
+                })
+                .collect();
+            Ok(CheckpointList { rows, hidden })
+        })
+    }
+
+    fn rewind<'a>(
+        &'a self,
+        owner: &'a str,
+        session_id: &'a str,
+        turn: usize,
+        apply: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RewindReport, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let Some(sandbox) = self.sandbox.as_ref() else {
+                return Err("这个部署没有接执行器，读不到这棵树，退不回去。".into());
+            };
+            let Some(kv) = self.people.as_ref() else {
+                return Err("这个部署没有接检查点存储，退不回去。".into());
+            };
+            let Some(target) = crate::checkpoints::rewind_target(turn) else {
+                return Err("会话开头之前没有可退的地方。".into());
+            };
+            let rows = crate::checkpoints::load(kv, owner, session_id).await?;
+            if !rows.rows.iter().any(|row| row.turn == target) {
+                return Err(format!(
+                    "这一段对话没有第 {target} 轮的检查点（退回到第 {turn} 轮之前要的就是它），退不回去。"
+                ));
+            }
+            let key = crate::checkpoints::key(session_id, target);
+            let employee = self.employee_here(Some(owner), session_id).await;
+            let value = if apply {
+                crate::checkpoints::restore(sandbox, &employee.id, session_id, &key).await?
+            } else {
+                crate::checkpoints::plan(sandbox, &employee.id, session_id, &key).await?
+            };
+            let report = rewind_report(turn, target, apply, &value)?;
+            if apply {
+                // 退回去之后，后面那几轮的快照不再对应这棵树：它们的改动已经被
+                // 丢掉了。留着名字，下一次退回时会有人挑到一份「退到这里也一样」，
+                // 而它其实指向一段已经不存在的历史。
+                crate::checkpoints::forget_after(kv, owner, session_id, target).await?;
+            }
+            Ok(report)
+        })
+    }
+
     fn turn<'a>(
         &'a self,
         request: ConversationRequest,
@@ -602,12 +828,7 @@ impl ConversationTurn for PlatformConversation {
             // 派活与记账都按这个名字。没有绑定表（进程没装 KV）时退回按会话
             // 算出来的那个名字。
             let owner = Some(request.owner.as_str()).filter(|owner| !owner.trim().is_empty());
-            let employee = match self.people.as_ref() {
-                Some(kv) => {
-                    bound_employee(kv, fingerprint().as_deref(), owner, &request.session_id).await
-                }
-                None => employee_for(&request.session_id),
-            };
+            let employee = self.employee_here(owner, &request.session_id).await;
             // 先把他记进「说过话的人」名册：注册表上的心跳在他闭嘴几十秒后就
             // 过期，而人要找的是「那个跟我聊过的人」。写不进去不是这一轮的
             // 失败——他照样能说话，只是名单上从此少一个人；这一句是那个差别的
@@ -666,6 +887,21 @@ impl ConversationTurn for PlatformConversation {
                 context_window_size: conversation_context_window_tokens(),
                 ..Default::default()
             };
+            // 会话开头的那棵树：只在第一次进到这里时真的拍（之后读一行 KV 就
+            // 知道已经有了）。这一句要等，是因为它必须落在动手之前——放到开跑
+            // 之后，拍到的就是这一轮改了一半的树，而读数上它叫「会话开头」。
+            if let (Some(owner_name), Some(sandbox), Some(kv)) =
+                (owner, self.sandbox.as_ref(), self.people.as_ref())
+            {
+                open_checkpoints(
+                    Arc::clone(sandbox),
+                    Arc::clone(kv),
+                    owner_name.to_string(),
+                    request.session_id.clone(),
+                    employee.id.clone(),
+                )
+                .await;
+            }
             // 工具面 = 这个进程装配好的那一份 ＋ 控制面五只。
             //
             // 复制的是**整张注册表**（`fork`），不是工具清单：哪些工具存在只是
@@ -1019,6 +1255,20 @@ impl ConversationTurn for PlatformConversation {
             // 以为它还醒着。
             if let Some(lease) = lease {
                 lease.release().await;
+            }
+
+            // 这一轮的树：派出去拍，不在这里等。它是附加的一趟远程读盘，等在
+            // 交付之前，人看到最后一行字要多等这一趟；而快照宁可晚几秒到，
+            // 也不该让回答慢下来。失败已经在这一侧记过日志，这里不再重试。
+            if let Some(owner_name) = owner {
+                if let (Some(sandbox), Some(kv)) = (self.sandbox.clone(), self.people.clone()) {
+                    let session = request.session_id.clone();
+                    let agent = employee.id.clone();
+                    let who = owner_name.to_string();
+                    tokio::spawn(async move {
+                        close_checkpoints(sandbox, kv, who, session, agent).await;
+                    });
+                }
             }
 
             // 问它的人要的是答案。等这一轮跑完，把结果投给每一个带回来的回信地址；

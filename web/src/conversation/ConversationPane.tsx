@@ -1085,6 +1085,20 @@ export function ConversationPane({
   const memoryEntries = useMemoryStore((s) => s.entries);
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [memoryDraft, setMemoryDraft] = useState('');
+  /**
+   * 这一段记下的检查点。`undefined` 是「还没问过」，不是「一份也没有」——两句话
+   * 在这一面写出来是两句不同的字。
+   */
+  const checkpointState = useChatStore((s) => s.checkpoints[sessionId]);
+  const [checkpointsOpen, setCheckpointsOpen] = useState(false);
+  /**
+   * 正在等确认的那一次退回：要退到第几轮**之前**。`null` = 没有待确认的。
+   *
+   * 退回分两步：先问「会改什么」，再由人点一下确认。原因只有一个——它改的是
+   * 那棵树，而这一轮之后的改动会被丢掉；不问就改，屏幕上会先没有提示，然后
+   * 文件变了。
+   */
+  const [rewindAsk, setRewindAsk] = useState<number | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   /** 这一段交出去的目标，按总览折出来的现状。总览里还没有的那几道如实缺席。 */
@@ -1395,6 +1409,40 @@ export function ConversationPane({
     if (next) clientRef.current?.send({ type: 'owner_memory' });
   };
 
+  /**
+   * 检查点面板：第一次打开时向服务端要一份清单。与规则、约定同一个理由——
+   * 不开就不问。
+   */
+  const askCheckpoints = () =>
+    clientRef.current?.send({ type: 'chat_checkpoint', session_id: sessionId });
+  const toggleCheckpoints = () => {
+    const next = !checkpointsOpen;
+    setCheckpointsOpen(next);
+    setRewindAsk(null);
+    if (next) askCheckpoints();
+  };
+
+  /** 第一步：只问会改什么，一个字节都不碰。 */
+  const previewRewind = (turn: number) => {
+    setRewindAsk(turn);
+    clientRef.current?.send({
+      type: 'chat_checkpoint',
+      session_id: sessionId,
+      turn,
+      apply: false,
+    });
+  };
+
+  /** 第二步：人点下确认之后才真的改树。 */
+  const confirmRewind = (turn: number) => {
+    clientRef.current?.send({
+      type: 'chat_checkpoint',
+      session_id: sessionId,
+      turn,
+      apply: true,
+    });
+  };
+
   /** 记下一句。回执是记完之后的整份名单，所以这里不自己改本地那一份。 */
   const writeMemory = () => {
     const text = memoryDraft.trim();
@@ -1562,6 +1610,21 @@ export function ConversationPane({
           text="写一句跨会话生效的约定，之后每一轮开头都会读到；也可以撤掉其中一句"
         >
           约定
+        </Note>
+        {/*
+          检查点：这一段对话每一轮结束时那棵树的样子。退回是显式动作——先看会改
+          什么，再点确认；入口只在标题行上，因为它是一次性的操作，不是这一面的
+          主体。
+        */}
+        <Note
+          as="button"
+          type="button"
+          onClick={toggleCheckpoints}
+          className="mono shrink-0 px-1 text-[10px] transition-opacity hover:opacity-70"
+          style={{ color: checkpointsOpen ? 'var(--brass)' : 'var(--muted)' }}
+          text="看这一段每一轮结束时的树，并把文件状态退回到某一轮之前（退回前会先给你看会改哪些文件）"
+        >
+          检查点
         </Note>
         {/*
           目标与变更都是账上的行，所以每一个都能点进去。这里只是入口：这一面
@@ -1808,6 +1871,141 @@ export function ConversationPane({
               记住
             </Note>
           </div>
+        </div>
+      )}
+      {/*
+        检查点面板。三件事各有各的那一句话：读不到（`reason`）、还没跑过一轮
+        （空清单）、以及清单本身。合成一句「没有检查点」，人分不清自己该再跑
+        一轮还是去换部署。
+      */}
+      {checkpointsOpen && (
+        <div className="shrink-0 px-4 pb-1">
+          <div className="mb-1 flex items-baseline gap-2">
+            <span className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
+              检查点
+            </span>
+            <Note
+              as="button"
+              type="button"
+              onClick={askCheckpoints}
+              className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="重新从服务端读一份清单"
+            >
+              刷新
+            </Note>
+            <Note
+              as="button"
+              type="button"
+              onClick={toggleCheckpoints}
+              className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+              text="收起这块面板"
+            >
+              收起
+            </Note>
+          </div>
+          {checkpointState === undefined ? (
+            <p className="mono text-[10px] text-[var(--muted)]">还在读这份清单…</p>
+          ) : checkpointState.reason ? (
+            <p className="mono text-[10px] text-[var(--danger)]">{checkpointState.reason}</p>
+          ) : checkpointState.rows.length === 0 ? (
+            <p className="mono text-[10px] text-[var(--muted)]">
+              这一段还没有跑完一轮，没有可退的地方。
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {checkpointState.rows.map((row) => (
+                <li key={row.key || row.turn} className="flex items-baseline gap-2 text-[11px]">
+                  <span className="mono text-[var(--paper-dim)]">
+                    {row.turn === 0 ? '会话开头时的树' : `第 ${row.turn} 轮结束时的树`}
+                  </span>
+                  <span className="mono text-[10px] text-[var(--muted)]">{row.at}</span>
+                  <Note
+                    as="button"
+                    type="button"
+                    onClick={() => previewRewind(row.turn + 1)}
+                    className="mono shrink-0 px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+                    text={`先看退回到第 ${row.turn + 1} 轮之前会改哪些文件；这一步一个字节都不碰`}
+                  >
+                    退回到第 {row.turn + 1} 轮之前
+                  </Note>
+                </li>
+              ))}
+            </ul>
+          )}
+          {checkpointState?.hidden ? (
+            <p className="mono mt-1 text-[10px] text-[var(--muted)]">
+              更早的还有 {checkpointState.hidden} 份没列出来。
+            </p>
+          ) : null}
+          {/*
+            第二步：清单 + 确认。清单只在这一步出现，而且只说「会做什么」，不预判
+            结果。确认按钮上的那句话把后果写出来：这一轮之后的改动会被丢掉。
+          */}
+          {rewindAsk !== null && checkpointState?.rewind?.turn === rewindAsk && (
+            <div
+              className="mt-1 border-t pt-1"
+              style={{ borderColor: 'var(--line-strong)' }}
+            >
+              {checkpointState.rewind.applied ? (
+                <p className="mono text-[10px]" style={{ color: 'var(--brass)' }}>
+                  已退回：{checkpointState.rewind.files.length} 个文件按第{' '}
+                  {checkpointState.rewind.target} 轮结束时的快照改回。点「刷新」看剩下的清单。
+                </p>
+              ) : checkpointState.rewind.files.length === 0 ? (
+                <p className="mono text-[10px] text-[var(--muted)]">
+                  这棵树和第 {checkpointState.rewind.target} 轮结束时已经一样，退回不会改动任何文件。
+                </p>
+              ) : (
+                <>
+                  <p className="mono text-[10px] text-[var(--paper-dim)]">
+                    退回到第 {rewindAsk} 轮之前会改动这 {checkpointState.rewind.files.length}{' '}
+                    个文件（这一轮之后的改动会被丢掉）：
+                  </p>
+                  <ul className="mt-1 flex max-h-32 flex-col gap-0 overflow-auto">
+                    {checkpointState.rewind.files.map((file) => (
+                      <li key={file.path} className="mono text-[10px] break-all">
+                        <span
+                          style={{
+                            color:
+                              file.change === 'added' ? 'var(--danger)' : 'var(--brass)',
+                          }}
+                        >
+                          {file.change === 'added' ? '删掉' : file.change === 'removed' ? '写回' : '改回'}
+                        </span>{' '}
+                        {file.path}
+                      </li>
+                    ))}
+                  </ul>
+                  {checkpointState.rewind.truncated && (
+                    <p className="mono mt-1 text-[10px] text-[var(--muted)]">
+                      清单还有更多没列完；退回本身不受这个清单影响。
+                    </p>
+                  )}
+                  <div className="mt-1 flex items-baseline gap-2">
+                    <Note
+                      as="button"
+                      type="button"
+                      onClick={() => confirmRewind(rewindAsk)}
+                      className="mono px-1 text-[10px] transition-opacity hover:opacity-70"
+                      style={{ color: 'var(--danger)' }}
+                      text="真的改树：把文件状态带回那一份快照。点之前请确认没有别人正在这棵树上干活"
+                    >
+                      确认退回
+                    </Note>
+                    <Note
+                      as="button"
+                      type="button"
+                      onClick={() => setRewindAsk(null)}
+                      className="mono px-1 text-[10px] text-[var(--muted)] transition-opacity hover:opacity-70"
+                      text="不改任何东西"
+                    >
+                      取消
+                    </Note>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
         </div>
       )}
       {permissionAsks.length > 0 && (

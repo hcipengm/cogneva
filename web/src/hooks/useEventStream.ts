@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import {
   EventStreamClient,
+  type ChatCheckpointWire,
   type ChatModelWire,
   type ResumedMessageWire,
 } from '@/transport/websocket';
@@ -97,6 +98,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const ingestChatFrame = useChatStore((state) => state.ingestFrame);
   const applyChatResume = useChatStore((state) => state.applyResume);
   const applyModel = useChatStore((state) => state.applyModel);
+  const applyCheckpoints = useChatStore((state) => state.applyCheckpoints);
   const noteAgentFrame = useLiveAgentStore((state) => state.noteFrame);
   const noteAlertFrame = useLiveAlertStore((state) => state.noteFrame);
   const noteCommsFrame = useLiveCommsStore((state) => state.noteFrame);
@@ -376,6 +378,34 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       });
     };
 
+    /**
+     * 这一段对话的检查点：清单，或者一次退回的结局。按会话落，与模型选择同一个
+     * 理由——它是这一段的状态，不是这一轮说出来的话。
+     */
+    const ingestChatCheckpoint = (wire: ChatCheckpointWire) => {
+      const session = wire.session_id || FIRST_SESSION;
+      applyCheckpoints(session, {
+        rows: (wire.rows ?? []).flatMap((row) =>
+          typeof row.turn === 'number'
+            ? [{ key: row.key ?? '', turn: row.turn, at: row.at ?? '' }]
+            : []
+        ),
+        hidden: wire.hidden ?? 0,
+        rewind: wire.rewind
+          ? {
+              turn: wire.rewind.turn ?? 0,
+              target: wire.rewind.target ?? 0,
+              applied: wire.rewind.applied === true,
+              files: (wire.rewind.files ?? []).flatMap((file) =>
+                file.path ? [{ path: file.path, change: file.change ?? 'modified' }] : []
+              ),
+              truncated: wire.rewind.truncated === true,
+            }
+          : null,
+        reason: wire.reason ?? null,
+      });
+    };
+
     const channels = channelKey ? channelKey.split(',') : [];
     const client = options.mock
       ? new MockEventStreamClient({
@@ -430,6 +460,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           // 不掉，没有原文就画不出一句人写的话。
           onChatResume: (resume) => ingestChatResume(resume.session_id, resume.messages ?? []),
           onChatModel: ingestChatModel,
+          onChatCheckpoint: ingestChatCheckpoint,
           onOpen: resumeOpenSession,
           onOwnerMemory: (entries) => {
             const known = entries.flatMap((entry) =>
@@ -444,6 +475,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
             if (status !== 'open') {
               usePermissionStore.getState().forgetRules();
               useMemoryStore.getState().clearEntries();
+              // 检查点同理：上一条连接读到的那几份不该留在屏幕上冒充现状。
+              useChatStore.getState().forgetCheckpoints();
             }
           },
           onError: (error) => {

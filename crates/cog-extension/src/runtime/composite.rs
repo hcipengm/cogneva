@@ -24,7 +24,10 @@ impl CompositeSandbox {
             SandboxPayload::Command { .. }
             | SandboxPayload::ReadFile { .. }
             | SandboxPayload::WriteFile { .. }
-            | SandboxPayload::EditFile { .. } => &self.executor,
+            | SandboxPayload::EditFile { .. }
+            | SandboxPayload::CaptureCheckpoint { .. }
+            | SandboxPayload::PlanCheckpoint { .. }
+            | SandboxPayload::RestoreCheckpoint { .. } => &self.executor,
         }
     }
 }

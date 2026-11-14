@@ -426,6 +426,44 @@ pub trait ConversationTurn: Send + Sync {
         })
     }
 
+    /// 这一段对话记下的检查点：每一轮结束时那棵树的样子。
+    ///
+    /// 读不到时返回 `Err`，而不是一张空名单。「这个部署不记检查点」与「这段对话
+    /// 还没跑完一轮」在界面上是两句不同的话：前者要人去换部署，后者只要再跑一轮。
+    /// 把两者画成同一张空列表，人分不出自己该做什么。
+    fn checkpoints<'a>(
+        &'a self,
+        _owner: &'a str,
+        _session_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CheckpointList, String>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err("这个部署没有接检查点存储，列不出检查点。".into())
+        })
+    }
+
+    /// 退回到第 `turn` 轮之前：`apply == false` 只算会改什么，`apply == true` 才真的改树。
+    ///
+    /// 分两步而不是一次调用改完，是因为后果落在树上：退回会把这一轮之后的改动
+    /// 全部丢掉——那些改动里可能有别人刚写的东西，也可能有人在同一棵树上干活。
+    /// 先给出清单、再由人点一下，「退回是显式动作，不会静默改树」才是这句话的
+    /// 全部意思：只读的那一步一个字节都不碰。
+    ///
+    /// 默认拒绝：装配层没接检查点存储时，「退不回去」要能读出来，而不是回一句
+    /// 成功让界面画成已经退了。
+    fn rewind<'a>(
+        &'a self,
+        _owner: &'a str,
+        _session_id: &'a str,
+        _turn: usize,
+        _apply: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RewindReport, String>> + Send + 'a>,
+    > {
+        Box::pin(async { Err("这个部署没有接检查点存储，退不回去。".into()) })
+    }
+
     /// 这个人手上还有哪些「总是允许 / 总是拒绝」的规则。
     ///
     /// 默认是一张空名单：装配层没装规则存储时，界面上就该什么都列不出来，而不是
@@ -513,6 +551,53 @@ pub struct PermissionRuleView {
     pub allow: bool,
     /// `session` 或 `owner`。
     pub scope: String,
+}
+
+/// 一个检查点在界面上长什么样。
+///
+/// 三格都给人看：哪一轮结束时的树（`turn`）、什么时候记下的（`at`）、退的时候
+/// 按哪个名字找（`key`）。`key` 不让人自己拼——界面原样送回来，装配层认它。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointView {
+    pub key: String,
+    /// 这份快照是哪一轮**结束时**的样子。`0` 是会话开头。
+    pub turn: usize,
+    pub at: String,
+}
+
+/// 一段对话的检查点名单。
+///
+/// `hidden` 是「更早的还有几份没列出来」：列出来的是给人挑的入口，不是存储的
+/// 全部；省掉这一格，人会把「只列了最近这些」读成「只记了这些」。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointList {
+    pub rows: Vec<CheckpointView>,
+    #[serde(default)]
+    pub hidden: usize,
+}
+
+/// 一次退回会碰到的一个文件。
+///
+/// `change` 是 `added` / `removed` / `modified`——说的是**退回要做什么**：`added`
+/// 是现在有、快照里没有，退回就是删掉；`removed` 反过来，退回要写回来。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointFile {
+    pub path: String,
+    pub change: String,
+}
+
+/// 一次退回的结局：问到的那一份、会碰的文件、以及到底改没改。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RewindReport {
+    /// 人点的那一轮。
+    pub turn: usize,
+    /// 实际用上的那份快照：第 `turn` 轮**之前**，也就是第 `turn - 1` 轮结束时的树。
+    pub target: usize,
+    /// 树到底动没动。只读那一步是 `false`——清单在，字节一个没变。
+    pub applied: bool,
+    pub files: Vec<CheckpointFile>,
+    /// 清单被预览界截断了；退回本身不受影响。
+    pub truncated: bool,
 }
 
 /// 一次执行前的询问，从装配层递到界面上。

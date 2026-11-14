@@ -8,6 +8,7 @@
 //! | `rhai`  | Rhai     | Trusted inline scripting (prompt logic, glue) |
 
 pub mod build_cache;
+pub mod checkpoints;
 pub mod command_server;
 pub mod edit;
 pub mod executor;

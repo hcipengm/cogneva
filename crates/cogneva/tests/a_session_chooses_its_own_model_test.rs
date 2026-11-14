@@ -52,6 +52,7 @@ fn conversation(people: Option<Arc<dyn KeyValueStore>>) -> PlatformConversation 
         None,
         None,
         None,
+        None,
     )
 }
 

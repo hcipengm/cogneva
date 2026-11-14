@@ -448,6 +448,15 @@ fn kill_group(pid: u32) {
     }
 }
 
+/// 进程自己所在的那棵树。
+///
+/// 就地执行没有 lane 路由：命令就在调用方的当前目录里跑，所以检查点记的也只能是
+/// 那一棵。取不到就说出来，而不是退回一个相对路径——相对路径会随别的调用的 cwd
+/// 指到另一棵树上去。
+fn local_root() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
 /// A file operation as a two-event stream: content (or error) then exit.
 fn file_stream(result: std::io::Result<String>) -> CommandEventStream {
     let events = match result {
@@ -538,6 +547,24 @@ impl SandboxBackend for LocalExecutor {
                 .map_err(std::io::Error::other);
                 Ok(file_stream(result))
             }
+            SandboxPayload::CaptureCheckpoint { key } => Ok(file_stream(
+                crate::checkpoints::capture(&local_root(), key)
+                    .await
+                    .map(|plan| plan.to_json().to_string())
+                    .map_err(std::io::Error::other),
+            )),
+            SandboxPayload::PlanCheckpoint { key } => Ok(file_stream(
+                crate::checkpoints::plan(&local_root(), key)
+                    .await
+                    .map(|plan| plan.to_json().to_string())
+                    .map_err(std::io::Error::other),
+            )),
+            SandboxPayload::RestoreCheckpoint { key } => Ok(file_stream(
+                crate::checkpoints::restore(&local_root(), key)
+                    .await
+                    .map(|plan| plan.to_json().to_string())
+                    .map_err(std::io::Error::other),
+            )),
             SandboxPayload::Wasm { .. } => Err(cog_core::SFError::Agent(
                 "LocalExecutor only executes environment payloads".into(),
             )),

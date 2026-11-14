@@ -435,6 +435,9 @@ fn tool_label(payload: &SandboxPayload) -> &'static str {
         SandboxPayload::ReadFile { .. } => "read_file",
         SandboxPayload::WriteFile { .. } => "write_file",
         SandboxPayload::EditFile { .. } => "edit_file",
+        SandboxPayload::CaptureCheckpoint { .. } => "capture_checkpoint",
+        SandboxPayload::PlanCheckpoint { .. } => "plan_checkpoint",
+        SandboxPayload::RestoreCheckpoint { .. } => "restore_checkpoint",
         SandboxPayload::Wasm { .. } => "wasm",
     }
 }
@@ -712,6 +715,47 @@ async fn execute_handler(
                 .await
                 .map(|report| report.describe(path))
                 .map_err(std::io::Error::other);
+            let outcome = outcome_of(&result);
+            watch.end(stream_response(single_shot(result), announce), outcome)
+        }
+        SandboxPayload::CaptureCheckpoint { ref key }
+        | SandboxPayload::PlanCheckpoint { ref key }
+        | SandboxPayload::RestoreCheckpoint { ref key } => {
+            // 检查点是「这棵工作树」的属性，没有一个检出就没有可记的东西：在一个
+            // 没落在任何 lane 上的请求里假装成功，会让调用方以为已经拍下了。
+            let Some(root) = workdir.as_deref() else {
+                return watch.end(
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        "这个请求没有落在任何一棵检出上，拍不了检查点".into(),
+                    ),
+                    Outcome::Refused,
+                );
+            };
+            let (label, result) = match req.payload {
+                SandboxPayload::CaptureCheckpoint { .. } => (
+                    "capture",
+                    crate::checkpoints::capture(root, key)
+                        .await
+                        .map(|plan| plan.to_json().to_string()),
+                ),
+                SandboxPayload::PlanCheckpoint { .. } => (
+                    "plan",
+                    crate::checkpoints::plan(root, key)
+                        .await
+                        .map(|plan| plan.to_json().to_string()),
+                ),
+                _ => (
+                    "restore",
+                    crate::checkpoints::restore(root, key)
+                        .await
+                        .map(|plan| plan.to_json().to_string()),
+                ),
+            };
+            let result = result.map_err(std::io::Error::other);
+            if let Err(error) = &result {
+                tracing::warn!(checkpoint = %key, op = label, %error, "check point operation failed");
+            }
             let outcome = outcome_of(&result);
             watch.end(stream_response(single_shot(result), announce), outcome)
         }

@@ -180,6 +180,25 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// 这一段对话的检查点：列清单、问一次退回会改什么、或者真的退。
+    ///
+    /// 三个动作一条消息，由两个字段分开：`turn` 为空是列清单；`turn` 有值、
+    /// `apply` 为假是**只算不改**；`turn` 有值、`apply` 为真才真的改树。
+    /// 两段式是这句话的全部意思——退回的后果在树上，先给清单再由人点一下，
+    /// 它就不是一次静默发生的改动。只读的那一次一个字节都不碰。
+    #[serde(rename = "chat_checkpoint")]
+    ChatCheckpoint {
+        #[serde(default)]
+        session_id: Option<String>,
+        /// 要退回到**哪一轮之前**。为空就是只列清单。
+        #[serde(default)]
+        turn: Option<usize>,
+        /// 真的改树。只在 `turn` 有值时有意义。
+        #[serde(default)]
+        apply: bool,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
     /// 重连之后接着看这一段：把「说到哪儿了」取回来。
     ///
     /// 断线期间这一轮还在跑，帧没有人收。重连时不重放每一帧，只取一份快照——
@@ -282,6 +301,22 @@ pub enum ServerMessage {
         model: Option<String>,
         models: Vec<String>,
         configured: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// 这一段对话的检查点：清单，或者一次退回的结局。
+    ///
+    /// `rows` 与 `rewind` 不会同时有东西：列清单时是前者，退回时是后者。
+    /// `reason` 有值时前两格都空——那是「做不了」的那一句话，不是「没有」。
+    /// 把两者画成同一张空列表，人分不出自己该再跑一轮还是去换一个部署。
+    #[serde(rename = "chat_checkpoint")]
+    ChatCheckpoint {
+        session_id: String,
+        rows: Vec<crate::chat::CheckpointView>,
+        /// 更早的还有几份没列出来。列的是给人挑的入口，不是存储的全部。
+        hidden: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rewind: Option<crate::chat::RewindReport>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },

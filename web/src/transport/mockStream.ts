@@ -110,6 +110,9 @@ export class MockEventStreamClient {
       hooks: null,
       // 假流不落文件：演示里的每一句都远在窗口之内，没有附件这回事。
       attachment: null,
+      // 假流不跟同事说话：演示里没有第二个账号，也没有共享任务图。
+      colleague: null,
+      tasks: null,
       timestamp: new Date().toISOString(),
     });
   }

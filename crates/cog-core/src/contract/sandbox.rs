@@ -62,6 +62,27 @@ pub enum SandboxPayload {
         #[serde(default)]
         replace_all: bool,
     },
+    /// Remember the worktree as it is now, under `key`.
+    ///
+    /// The copy is taken on the side that holds the files, not by shipping
+    /// them here: a conversation's tree is shared with whatever else that
+    /// employee is doing, and a check point that only existed in the caller's
+    /// memory would be gone the moment the caller restarted.
+    CaptureCheckpoint {
+        key: String,
+    },
+    /// What returning to `key` would change, asked before anything is touched.
+    PlanCheckpoint {
+        key: String,
+    },
+    /// Put the worktree back the way it was at `key`.
+    ///
+    /// Only ever sent because a person asked for it: a caller that could roll
+    /// the tree back as a side effect of something else would be able to undo
+    /// somebody's work without anybody seeing it happen.
+    RestoreCheckpoint {
+        key: String,
+    },
 }
 
 /// One chunk of streaming command output. Also serves as the wire format

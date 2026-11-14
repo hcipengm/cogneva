@@ -72,6 +72,34 @@ export interface ChatModelWire {
   reason?: string | null;
 }
 
+/**
+ * 这一段对话的检查点：一份清单，或者一次退回的结局。
+ *
+ * `rows` 与 `rewind` 不会同时有东西；`reason` 有值时前两格都空——那是「做不了」
+ * 的那一句话，不是「没有」。把它画成一张空列表，人分不清该再跑一轮还是去换部署。
+ */
+export interface ChatCheckpointWire {
+  session_id?: string;
+  rows?: CheckpointRowWire[];
+  hidden?: number;
+  rewind?: RewindReportWire | null;
+  reason?: string | null;
+}
+
+export interface CheckpointRowWire {
+  key?: string;
+  turn?: number;
+  at?: string;
+}
+
+export interface RewindReportWire {
+  turn?: number;
+  target?: number;
+  applied?: boolean;
+  files?: { path?: string; change?: string }[];
+  truncated?: boolean;
+}
+
 export interface PermissionAskWire {
   request_id?: string;
   session_id?: string;
@@ -125,6 +153,11 @@ export interface WebSocketOptions {
    * 当成一句助手说的话。
    */
   onChatModel?: (catalogue: ChatModelWire) => void;
+  /**
+   * 这一段对话的检查点：清单，或者一次退回的结局。与模型选择同一个理由——它是
+   * 这一段的状态，不是这一轮吐出来的产出，混进聊天流会被当成一句助手说的话。
+   */
+  onChatCheckpoint?: (checkpoint: ChatCheckpointWire) => void;
   /**
    * 每一次连上（含重连）之后叫一声。
    *
@@ -336,6 +369,18 @@ export class EventStreamClient {
         model: typeof wire.model === 'string' ? wire.model : null,
         models: Array.isArray(wire.models) ? wire.models : [],
         configured: wire.configured === true,
+        reason: typeof wire.reason === 'string' ? wire.reason : null,
+      });
+      return;
+    } else if (message.type === 'chat_checkpoint') {
+      // 认不出形状的那一份按「读不到」处理，不拿上次的清单冒充这次：检查点不是
+      // 这一轮说的话，画错一行不比少画一行安全。
+      const wire = message as unknown as ChatCheckpointWire;
+      this.options.onChatCheckpoint?.({
+        session_id: wire.session_id,
+        rows: Array.isArray(wire.rows) ? wire.rows : [],
+        hidden: typeof wire.hidden === 'number' ? wire.hidden : 0,
+        rewind: wire.rewind ?? null,
         reason: typeof wire.reason === 'string' ? wire.reason : null,
       });
       return;

@@ -83,6 +83,8 @@ mod a_configured_hook_that_blocks_a_tool_does_block_it_test;
 mod a_convention_written_once_is_read_every_turn_test;
 #[path = "a_conversation_belongs_to_whoever_opened_it_test.rs"]
 mod a_conversation_belongs_to_whoever_opened_it_test;
+#[path = "a_conversation_can_go_back_to_before_a_turn_test.rs"]
+mod a_conversation_can_go_back_to_before_a_turn_test;
 #[path = "a_crate_is_a_component_not_a_bridge_test.rs"]
 mod a_crate_is_a_component_not_a_bridge_test;
 #[path = "a_day_is_named_by_one_clock_test.rs"]

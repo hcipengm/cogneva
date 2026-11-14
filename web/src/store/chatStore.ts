@@ -70,6 +70,53 @@ export interface ModelCatalogue {
   reason: string | null;
 }
 
+/**
+ * 这一段对话记下的一个检查点：哪一轮**结束**时的树。
+ *
+ * `turn === 0` 是会话开头——第一轮之前没有「上一轮结束」，退回到第一轮之前靠的
+ * 就是它。
+ */
+export interface CheckpointRow {
+  key: string;
+  turn: number;
+  at: string;
+}
+
+/**
+ * 一次退回会碰到的一个文件。
+ *
+ * `change` 说的是**退回要做什么**：`added` 是现在有、快照里没有，退回就是删掉；
+ * `removed` 反过来，退回要写回来。
+ */
+export interface CheckpointFile {
+  path: string;
+  change: string;
+}
+
+/** 一次退回的结局：问到的那一份、会碰的文件、以及树到底动没动。 */
+export interface RewindReport {
+  turn: number;
+  target: number;
+  applied: boolean;
+  files: CheckpointFile[];
+  truncated: boolean;
+}
+
+/**
+ * 一段对话的检查点读面。
+ *
+ * `reason` 有值时 `rows` 与 `rewind` 都不可信：那是「做不了」的一句话，不是
+ * 「没有」。两句话分开存，界面上才分得清该再跑一轮还是去换一个部署。
+ */
+export interface CheckpointState {
+  rows: CheckpointRow[];
+  /** 更早的还有几份没列出来。 */
+  hidden: number;
+  /** 最近一次问到会改什么 / 退成什么样；`null` = 还没问过。 */
+  rewind: RewindReport | null;
+  reason: string | null;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -244,6 +291,11 @@ interface ChatState {
    * 之前先说「平台没配模型」。
    */
   modelCatalogue: ModelCatalogue | null;
+  /**
+   * 检查点，按会话分。`undefined` 是「还没问过」——与一张空清单（问到了，
+   * 一份也没有）不是同一件事。
+   */
+  checkpoints: Record<string, CheckpointState>;
 
   createSession: (title?: string) => string;
   /**
@@ -276,6 +328,16 @@ interface ChatState {
    * 「配了但没模型」都要说得出来，而一只默认型号会让下一轮失败）。
    */
   applyModel: (sessionId: string, model: string | null, catalogue: ModelCatalogue) => void;
+  /**
+   * 这一段对话的检查点：清单，或者一次退回的结局。
+   *
+   * 不走消息流：它是这一段的状态，不是这一轮说出来的话。按会话存，因为退回
+   * 就是把**这一段**的树带回某一刻——两段对话的检查点混在一格里，点错一行
+   * 改的就是另一段对话的树。
+   */
+  applyCheckpoints: (sessionId: string, checkpoint: CheckpointState) => void;
+  /** 断开时清掉：上一条连接读到的不该留在屏幕上冒充现状。 */
+  forgetCheckpoints: () => void;
   /** 从服务端读回历史。已读过时直接返回。 */
   hydrate: (sessionId: string) => Promise<void>;
   /** 读服务端那份会话名单，可带一个搜索词。 */
@@ -413,6 +475,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   historyLoading: false,
   historyError: null,
   modelCatalogue: null,
+  /**
+   * 检查点按会话分。`undefined` 是「还没问过」——与 `{rows: []}`（问到了，
+   * 一份也没有）不是同一件事，画成同一句会让人在连上之前就以为退不回去。
+   */
+  checkpoints: {},
 
   /**
    * 读名单。空结果与读失败分开：空名单是「你确实没有别的会话」，读失败是
@@ -875,6 +942,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       modelCatalogue: catalogue,
       ...withSession(state, sessionId, (session) => ({ ...session, model })),
     }));
+  },
+
+  applyCheckpoints: (sessionId, checkpoint) => {
+    set((state) => ({
+      checkpoints: { ...state.checkpoints, [sessionId]: checkpoint },
+    }));
+  },
+
+  forgetCheckpoints: () => {
+    set({ checkpoints: {} });
   },
 
   hydrate: async (sessionId) => {

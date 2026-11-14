@@ -248,9 +248,16 @@ fn the_turn_carries_the_process_tool_table_instead_of_a_short_one() {
 #[test]
 fn a_turn_runs_as_the_employee_of_its_session() {
     let text = source(ASSEMBLY);
+    // 按会话取员工这一步收在 `employee_here` 里，检查点也要走同一处——两处各算
+    // 一次名字，快照就可能落在另一个车道上。判的是「这一轮从会话取人」，不是
+    // 它写在哪个函数里。
     assert!(
-        text.contains("employee_for(&request.session_id)"),
+        text.contains("self.employee_here(owner, &request.session_id)"),
         "这一轮没有按会话取员工：同一个会话的两轮在账上会变成两个人"
+    );
+    assert!(
+        text.contains("None => employee_for(session_id)"),
+        "没有绑定表时退回按会话算的名字这一条不在了：进程没装 KV 时这一段对话就没有员工"
     );
     assert!(
         text.contains("agent_id: employee.id.clone()"),
