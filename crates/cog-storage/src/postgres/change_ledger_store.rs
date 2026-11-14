@@ -2520,4 +2520,34 @@ mod templates {
             );
         }
     }
+
+    /// The wait reading counts the rows the stamp marked, and only those.
+    ///
+    /// The stamp is deliberately narrow -- a block somebody set for a reason of
+    /// their own is not this pass's to relabel -- so the reading that says how
+    /// long the queue has been stuck has to be narrow the same way. A count that
+    /// took every blocked row would report a row waiting on an owner as waiting
+    /// on the pool, and the age that comes with it would be that row's: the
+    /// figure a person acts on would be wrong in the one direction that sends
+    /// them looking at a pool that is fine.
+    ///
+    /// The state half is the same argument from the other side: a block left on
+    /// a row that has since landed is the clear's business, and counting it here
+    /// would report work waiting that nobody is owed.
+    #[test]
+    fn the_pool_wait_counts_only_the_rows_the_stamp_marked() {
+        let pool = BlockedReason::PoolUnavailable.as_str();
+        let pending = ChangeState::Pending.as_str();
+        let wait = fill_vocabulary(POOL_WAIT_SQL_TEMPLATE);
+        assert!(
+            wait.contains(&format!("blocked_reason = '{pool}'")),
+            "the wait reading stopped selecting on the reason the stamp writes, so a row blocked \
+             for a reason of its own is counted as waiting on the pool: {wait}"
+        );
+        assert!(
+            wait.contains(&format!("state = '{pending}'")),
+            "the wait reading stopped holding itself to the queued rows, so a block left on a row \
+             that has moved on reads as work still waiting: {wait}"
+        );
+    }
 }
