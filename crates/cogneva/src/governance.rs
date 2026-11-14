@@ -85,6 +85,8 @@ SUBCOMMANDS:
                            it, because a clock re-reading a file is not a
                            decision to hand a face over, and only a signed
                            handover carries the work bound to the face.
+                           `--from -` reads stdin, so the one-time move of a
+                           deleted roster file needs nothing staged on the pod.
     handover <SUB>         Open, sign, apply, withdraw or list a move of a face
                            from one unit to another. A move counts only when
                            every required unit signed and it was applied.
@@ -121,6 +123,20 @@ SUBCOMMANDS:
                            seeing, not a row to drop. `--from -` reads stdin for
                            the same reason as import-readings — the host that
                            owns the units holds no database credentials.
+    fronts                 Print the closed set of fronts the self-sufficiency
+                           gate judges, two columns: front what-it-covers. The
+                           gate pairs the first column with the driver roster's
+                           first column; ownership is not here, because the face
+                           node owns it and a signed handover moves it.
+    import-fronts --from <file> [--upsert]
+                           Put a front roster into the graph. Columns past the
+                           second are ignored and counted: the legacy file
+                           carried owner and deputy there, and importing them
+                           would be a second ownership truth. Without --upsert
+                           the input replaces the set (fronts it no longer names
+                           are cancelled); --upsert only writes the fronts it
+                           names. `--from -` reads stdin, so the one-time move
+                           of the deleted file needs nothing staged on the pod.
     progress [--json]
                            One reading of three ledgers at the same instant: the
                            task graph by the unit it names, the change account,
@@ -189,6 +205,14 @@ pub enum Action {
         from: PathBuf,
         /// Only write the units the input names. The host's reconciliation uses
         /// this; the one-time replacement of the legacy table does not.
+        upsert: bool,
+    },
+    /// The closed set of fronts, two columns, straight from the graph.
+    Fronts,
+    ImportFronts {
+        from: PathBuf,
+        /// Only write the fronts the input names, so a declaration of one new
+        /// front cannot narrow the gate's scope to that one.
         upsert: bool,
     },
     // Boxed: a handover carries a spec whose text fields make it the widest
@@ -300,6 +324,11 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         Some("drivers") => Action::Drivers,
         Some("import-drivers") => Action::ImportDrivers {
             from: from.ok_or("import-drivers needs --from <file>")?,
+            upsert,
+        },
+        Some("fronts") => Action::Fronts,
+        Some("import-fronts") => Action::ImportFronts {
+            from: from.ok_or("import-fronts needs --from <file>")?,
             upsert,
         },
         Some(other) => return Err(format!("unknown governance subcommand {other}")),
@@ -427,6 +456,8 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         Action::ImportReadings { from } => import_readings(&*store, &from).await?,
         Action::Drivers => drivers_roster(&*store).await?,
         Action::ImportDrivers { from, upsert } => import_drivers(&*store, &from, upsert).await?,
+        Action::Fronts => fronts_roster(&*store).await?,
+        Action::ImportFronts { from, upsert } => import_fronts(&*store, &from, upsert).await?,
         Action::Act(act) => {
             // The heartbeat store is what an exit handover's apply step
             // re-reads. Without it the command still works for every handover
@@ -602,6 +633,27 @@ async fn import_drivers(
         crate::governance_drivers::upsert_from_text(store, &text).await?
     } else {
         crate::governance_drivers::import_from_text(store, &text).await?
+    };
+    println!("{}", summary.line());
+    Ok(())
+}
+
+/// The closed set, exactly the two columns the self-sufficiency gate parses.
+async fn fronts_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Error>> {
+    print!("{}", crate::governance_fronts::fronts(store).await?);
+    Ok(())
+}
+
+async fn import_fronts(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    upsert: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_roster_input(from)?;
+    let summary = if upsert {
+        crate::governance_fronts::upsert_from_text(store, &text).await?
+    } else {
+        crate::governance_fronts::import_from_text(store, &text).await?
     };
     println!("{}", summary.line());
     Ok(())
@@ -1534,8 +1586,7 @@ async fn import_faces(
     keep_ownership: bool,
     workspace: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let text = std::fs::read_to_string(from)
-        .map_err(|e| format!("cannot read {}: {e}", from.display()))?;
+    let text = read_roster_input(from)?;
     let summary = import_faces_from_roster(store, &text, keep_ownership).await?;
     println!("{}", summary.line());
     // Before the refusal below: an import that erased a binding still wrote the
@@ -1620,6 +1671,28 @@ mod tests {
             "the continuous writer refreshes descriptions and never moves a face"
         );
         assert_eq!(
+            parse_args(&args(&["fronts"])).unwrap().action,
+            Action::Fronts
+        );
+        assert_eq!(
+            parse_args(&args(&["import-fronts", "--from", "-", "--upsert"]))
+                .unwrap()
+                .action,
+            Action::ImportFronts {
+                from: PathBuf::from("-"),
+                upsert: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["import-fronts", "--from", "fronts.tsv"]))
+                .unwrap()
+                .action,
+            Action::ImportFronts {
+                from: PathBuf::from("fronts.tsv"),
+                upsert: false,
+            }
+        );
+        assert_eq!(
             parse_args(&args(&["assign"])).unwrap().action,
             Action::Assign {
                 face: None,
@@ -1641,6 +1714,7 @@ mod tests {
     fn a_subcommand_missing_its_operand_is_refused_rather_than_defaulted() {
         assert!(parse_args(&args(&["project"])).is_err());
         assert!(parse_args(&args(&["import-faces"])).is_err());
+        assert!(parse_args(&args(&["import-fronts"])).is_err());
         assert!(parse_args(&args(&["faces", "--out"])).is_err());
         assert!(parse_args(&args(&[])).is_err());
         assert!(parse_args(&args(&["no-such-face"])).is_err());

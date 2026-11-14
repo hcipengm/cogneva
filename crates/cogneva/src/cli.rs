@@ -143,8 +143,9 @@ COMMANDS:
                            2 the ask could not be made, 3 no arbiter reading, 4 no pool
                            reading
     governance <SUB>       Read the face graph, print its verdict, write its projection,
-                           or import the roster; <SUB> is one of faces, drift,
-                           project, import-faces, progress
+                           or import a roster; <SUB> is one of faces, drift,
+                           project, import-faces, readings, drivers, fronts,
+                           progress and their import-* forms
     work <SUB> --unit <u>  Act on the tasks the graph assigns to one unit; <SUB> is one
                            of queue, claim, start, heartbeat, complete, fail, release,
                            inbox

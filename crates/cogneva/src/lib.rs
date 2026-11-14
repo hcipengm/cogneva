@@ -26,6 +26,7 @@ pub mod gateway_observability;
 pub mod governance;
 pub mod governance_acts;
 pub mod governance_drivers;
+pub mod governance_fronts;
 pub mod governance_readings;
 pub mod health_check;
 pub mod host_ledger;
