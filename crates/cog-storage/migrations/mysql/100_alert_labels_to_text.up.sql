@@ -1,0 +1,3 @@
+ALTER TABLE alerts ADD COLUMN source VARCHAR(128);
+UPDATE alerts SET source = JSON_UNQUOTE(JSON_EXTRACT(labels, '$.source')) WHERE source IS NULL;
+ALTER TABLE alerts MODIFY labels TEXT NOT NULL;

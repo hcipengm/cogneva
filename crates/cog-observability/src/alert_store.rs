@@ -40,11 +40,14 @@ CREATE TABLE IF NOT EXISTS alerts (
                 severity    TEXT        NOT NULL,
                 state       TEXT        NOT NULL,
                 message     TEXT        NOT NULL,
-                labels      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+                labels      TEXT        NOT NULL DEFAULT '{}',
                 fired_at    TIMESTAMPTZ NOT NULL,
                 resolved_at TIMESTAMPTZ,
                 updated_at  TIMESTAMPTZ NOT NULL
             )
+;
+-- `source` 是 labels 里唯一被按值查的键，升成真列；其余部分只整块读，存 text。
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source TEXT
 ;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
 ;
@@ -168,6 +171,12 @@ fn decide(condition: bool, stored: Option<&StoredAlert>) -> AlertTransition {
 /// passed, a usage value that has since grown. Consumers cannot tell a stale
 /// snapshot from a fresh one, so the refresh happens here rather than at each
 /// reader.
+/// 读出 labels 列再解析一次。列存的是 `text`（库只存列，开集载荷不进 jsonb），
+/// 解析失败退回空对象：一条坏行不该让整张告警面读不出来。
+fn parse_labels(raw: String) -> Value {
+    serde_json::from_str(&raw).unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
 fn payload_differs(stored: &StoredAlert, alert: &NewAlert) -> bool {
     stored.severity != alert.severity
         || stored.message != alert.message
@@ -462,7 +471,7 @@ impl PostgresAlertStore {
                     state: row.get("state"),
                     severity: row.get("severity"),
                     message: row.get("message"),
-                    labels: row.get("labels"),
+                    labels: parse_labels(row.get::<String, _>("labels")),
                 });
 
         match decide(condition, stored.as_ref()) {
@@ -502,7 +511,7 @@ impl PostgresAlertStore {
                 .bind(&alert.dedup_key)
                 .bind(&alert.severity)
                 .bind(&alert.message)
-                .bind(&alert.labels)
+                .bind(alert.labels.to_string())
                 .bind(now)
                 .bind(&self.writer)
                 .execute(&self.pool)
@@ -553,7 +562,7 @@ impl PostgresAlertStore {
                         .bind(&alert.dedup_key)
                         .bind(&alert.severity)
                         .bind(&alert.message)
-                        .bind(&alert.labels)
+                        .bind(alert.labels.to_string())
                         .bind(now)
                         .execute(&self.pool)
                         .await?;
@@ -805,7 +814,7 @@ impl PostgresAlertStore {
                 dedup_key: row.get("dedup_key"),
                 severity: row.get("severity"),
                 message: row.get("message"),
-                labels: row.get("labels"),
+                labels: parse_labels(row.get::<String, _>("labels")),
             })
             .collect())
     }
@@ -842,7 +851,7 @@ impl PostgresAlertStore {
     pub async fn firing_keys_from_source(&self, source: &str) -> anyhow::Result<Vec<String>> {
         let rows = sqlx::query(&alert_sql(
             "SELECT dedup_key FROM alerts \
-             WHERE state = '{state:firing}' AND labels->>'source' = $1",
+             WHERE state = '{state:firing}' AND source = $1",
         ))
         .bind(source)
         .fetch_all(&self.pool)

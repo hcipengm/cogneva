@@ -50,7 +50,6 @@ const BASELINE: &[&str] = &[
     "crates/cog-memory/src/postgres_entry_store.rs:summary_entries.related_schema_ids",
     "crates/cog-memory/src/postgres_entry_store.rs:summary_entries.sparse_embedding",
     "crates/cog-memory/src/postgres_schema.rs:schema_entries.properties",
-    "crates/cog-observability/src/alert_store.rs:alerts.labels",
     "crates/cog-observability/src/analytics.rs:{table}.properties",
     "crates/cog-observability/src/usage_store.rs:gateway_llm_usage.pace_upstreams",
     "crates/cog-storage/migrations/mysql/002_user_auth_methods.up.sql:user_auth_methods.extra",
