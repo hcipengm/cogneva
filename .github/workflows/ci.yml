@@ -252,6 +252,17 @@ jobs:
       # 是个死指针。判的是反引号括起来、带扩展名的串（口径见脚本头部）。
       - name: Check README paths exist
         run: bash deploy/scripts/check-readme-paths.sh
+      # 被判词脚本读的表必须有生产者，或者有一个验它的门。一张手写的分类表改一格就改
+      # 判词，而树上没有一句话说那一格该不该在——tunables.yaml 的每行 derived/fixed 就是
+      # 这种表。登记表 `deploy/scripts/judgment-inputs.pin` 三档：机器生成的（点名生产者，
+      # 生产者的正文必须提到这张表）、读它是为了验它（点名一个能变红的判词脚本）、欠账
+      # （带理由与到期，过期那天红）。没人读的表不判；量不出来（没有数据文件、没有判词
+      # 脚本、没有登记表）退 3——不是绿。测试文件钉住它判红的那些格，否则这扇门自己
+      # 静默答「没意见」也没人看得出来。
+      - name: Check every table a gate reads names its producer
+        run: bash deploy/scripts/check-judgment-inputs.sh
+      - name: Check the judgment-input census rejects what it should
+        run: bash deploy/scripts/tests/judgment-inputs.test.sh
       # 编译期内嵌的文件必须真的在镜像构建上下文里。这条失败只在 tag 发版的镜像
       # job 上现形：从开发树（以及本机发布脚本）编永远看得见那些文件，
       # `.dockerignore` 却把它们挡在上下文之外。2026-10-19 实测它静默红了一个多月，

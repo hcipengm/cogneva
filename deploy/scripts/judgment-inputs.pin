@@ -1,0 +1,23 @@
+# 判词脚本读的表在这里登记。本仓的判词是 shell 门与 Rust 测试；这份登记跟着
+# `deploy/scripts/check-judgment-inputs.sh` 一起跑，在本仓每一次推送的 CI 里判。
+# 每行 <path><TAB><class><TAB><detail>[<TAB><到期日>]，路径相对仓库根。
+# 第一列可以是通配，`*` 只在一段里匹配（不跨 `/`）。
+#
+# 本仓被读的 yaml 几乎都是「读它是为了验它」：chart 模板、values、静态清单、渲染
+# 产物、告警规则、promtool 夹具。它们不是判据表——改它们，点名读它们的那些门会红。
+# 真正的判据表只有一张：tunables.yaml 的每行分类（derived／fixed）决定契约测试的判词。
+deploy/rendered/*/*	generated	deploy/scripts/render-deploy.sh
+deploy/k3s/*.yaml	subject	deploy/scripts/check-deploy-parity.sh
+deploy/k3s/observability/manifests/*.yaml	subject	deploy/scripts/check-alert-rule-faces.sh
+deploy/k3s/observability/tests/*.yaml	subject	deploy/scripts/check-alert-rule-proof.sh
+deploy/k3s/observability/helm/*.yaml	subject	crates/cogneva/tests/observability_alert_rule_contract_test.rs
+deploy/helm/cogneva/templates/*.yaml	subject	deploy/scripts/tests/deploy-parity.test.sh
+deploy/helm/cogneva/profiles/*.yaml	subject	deploy/scripts/render-deploy.sh
+deploy/helm/cogneva/values*.yaml	subject	crates/cogneva/tests/tunable_registry_contract_test.rs
+deploy/helm/cogneva/Chart.yaml	subject	deploy/scripts/check-release-version-consistency.sh
+deploy/helm/cogneva/tunables.yaml	debt	247 行手写分类被 tunable_registry_contract_test 读成判词；终态是 chart 与 Rust 常量两处都搬进平台声明，仓里只留机器写的投影	2027-03-31
+.github/workflows/*.yml	subject	deploy/scripts/check-before-push.sh
+prompts/*.yaml	subject	crates/cogneva/tests/declared_prompts_match_code_fallbacks.rs
+deploy/images/*.yaml	subject	crates/cogneva/tests/reading_series_have_a_producer_test.rs
+deploy/k8s/*.yaml	subject	crates/cogneva/tests/deployment_namespace_literals_contract_test.rs
+deploy/runtime-pods.yaml	subject	deploy/scripts/check-control-plane-reachability.sh
