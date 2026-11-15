@@ -714,7 +714,102 @@ pub const SOP_DISPATCH: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-orchestrator/src/sop_dispatch.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 32] = [
+/// How many times in a row the pool's probes for an upstream have failed.
+///
+/// The backoff is computed from this number: a count that keeps climbing while
+/// `llm_upstreams_healthy` reads one says the last healthy upstream is failing
+/// probes and the pool is holding it up with retries rather than with a working
+/// upstream. Read as the maximum over upstreams -- the worst one is the one that
+/// decides when the pool reports itself unavailable.
+pub const LLM_UPSTREAM_FAILURE_RUN: ReadingSpec = ReadingSpec {
+    id: "llm_upstream_failure_run",
+    title: "上游连续失败次数",
+    group: ReadingGroup::Delivery,
+    query: "max(llm_upstream_consecutive_failures)",
+    unit: "次",
+    warn: Some(3.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "llm_upstream_consecutive_failures / llm_upstream_position / llm_upstream_quota_window_secs / llm_upstream_shape_errored / llm_pool_quota_window_secs / llm_pool_reserve_since_unix / llm_pool_evidenced_recovery_unix / llm_request_param_clamped_total",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+/// Resource events waiting for the loop that carries them.
+///
+/// A depth that keeps rising is the fan-out loop falling behind the build gate;
+/// the events are still there, so nothing is lost yet, but every reading that
+/// depends on them is describing a moment that has already passed.
+pub const RESOURCE_EVENTS_BACKLOG: ReadingSpec = ReadingSpec {
+    id: "resource_events_pending",
+    title: "等待转发的资源事件",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_resource_events_pending)",
+    unit: "条",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_resource_events_pending / cogneva_resource_events / cogneva_resource_events_dropped_total",
+    produced_by: "crates/cog-extension/src/resource_events.rs",
+};
+
+/// Raw sources parked in the dead-letter store.
+///
+/// A dead letter is a source that failed for its own content: re-driving it
+/// would produce the same failure, so it sits there until a person decides.
+/// The backlog above is work the loop still owes; this one is work it has
+/// given up on, and the two must not be added together.
+pub const MEMORY_DEAD_LETTERS: ReadingSpec = ReadingSpec {
+    id: "memory_dead_letters",
+    title: "记忆死信",
+    group: ReadingGroup::Delivery,
+    query: "max(memory_dead_letter_raw)",
+    unit: "条",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "memory_dead_letter_raw / memory_unextracted_raw",
+    produced_by: "crates/cog-memory/src/plugin.rs",
+};
+
+/// How close the judge Job came to its memory limit.
+///
+/// The size law sets the limit from the peak it measured; a ratio that reaches
+/// one means the next run was killed by the kernel before it could report, and
+/// the reading that would have raised the limit never arrives. Read beside the
+/// throttling ratio: throttled is slow, near-the-limit is about to be killed.
+pub const ROLLOUT_JOB_NEAR_LIMIT: ReadingSpec = ReadingSpec {
+    id: "rollout_job_memory_ratio",
+    title: "判据 Job 内存接近上限的比例",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_rollout_job_memory_peak_ratio)",
+    unit: "0-1",
+    warn: Some(0.85),
+    crit: Some(1.0),
+    higher_is_worse: true,
+    series: "cogneva_rollout_job_memory_peak_ratio / cogneva_rollout_job_reading_unix / cogneva_rollout_job_cpu_throttled_ratio",
+    produced_by: "crates/cog-reflection/src/mainline_rollout.rs",
+};
+
+/// Tool fetches that ran out of budget before they finished.
+///
+/// Different from a truncation: a truncation hands the model what it could read,
+/// this hands it a failure. A rate that climbs means the budget is sizing the
+/// wrong thing -- a fetch that needs two more seconds or a few more kilobytes --
+/// and the agent is working around missing evidence instead of reading it.
+pub const TOOL_FETCH_BUDGET_EXHAUSTED: ReadingSpec = ReadingSpec {
+    id: "tool_fetch_budget_exhausted",
+    title: "取数预算用尽的工具调用",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_tool_output_fetch_budget_exhausted_total[30m]))",
+    unit: "次",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_tool_output_fetch_budget_exhausted_total / cogneva_tool_output_truncated_chars_total",
+    produced_by: "crates/cog-agent/src/tool_output.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 37] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -747,6 +842,11 @@ pub const READINGS: [&ReadingSpec; 32] = [
     &HTTP_LATENCY,
     &LLM_EXCHANGE_VOLUME,
     &SOP_DISPATCH,
+    &LLM_UPSTREAM_FAILURE_RUN,
+    &RESOURCE_EVENTS_BACKLOG,
+    &MEMORY_DEAD_LETTERS,
+    &ROLLOUT_JOB_NEAR_LIMIT,
+    &TOOL_FETCH_BUDGET_EXHAUSTED,
 ];
 
 /// The word a reading carries about its own value.
