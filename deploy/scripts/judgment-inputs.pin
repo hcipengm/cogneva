@@ -1,11 +1,14 @@
 # 判词脚本读的表在这里登记。本仓的判词是 shell 门与 Rust 测试；这份登记跟着
 # `deploy/scripts/check-judgment-inputs.sh` 一起跑，在本仓每一次推送的 CI 里判。
 # 每行 <path><TAB><class><TAB><detail>[<TAB><到期日>]，路径相对仓库根。
-# 第一列可以是通配，`*` 只在一段里匹配（不跨 `/`）。
+# 第一列可以是通配，`*` 只在一段里匹配（不跨 `/`）；debt 不许通配。这张表自己也在
+# 数据面里，并给自己写一行 debt——它是最后一张手写的决定表，终态是图里的声明＋机器
+# 投影，所以它每次跑都被印出来，到期即红。
 #
 # 本仓被读的 yaml 几乎都是「读它是为了验它」：chart 模板、values、静态清单、渲染
 # 产物、告警规则、promtool 夹具。它们不是判据表——改它们，点名读它们的那些门会红。
 # 真正的判据表只有一张：tunables.yaml 的每行分类（derived／fixed）决定契约测试的判词。
+deploy/scripts/judgment-inputs.pin	debt	本门的登记表自己：每个文件的分类是手写的决定，终态搬进图（judgment-input 声明），仓里只留机器投影；导入前它是欠账	2027-03-31
 deploy/rendered/*/*	generated	deploy/scripts/render-deploy.sh
 deploy/k3s/*.yaml	subject	deploy/scripts/check-deploy-parity.sh
 deploy/k3s/observability/manifests/*.yaml	subject	deploy/scripts/check-alert-rule-faces.sh

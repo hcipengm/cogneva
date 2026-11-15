@@ -31,21 +31,31 @@
 #   subject    判词脚本    —— 读它是为了**验它**，不是为了从里面取判据：chart 模板、
 #                            values、渲染产物、静态清单、告警规则、promtool 夹具。
 #                            改它那些点名的门会红，所以它不是暗中决定判词的表。
-#                            判词脚本必须在判词面里，且提到这张表。
+#                            判词脚本必须在判词面里，且提到这张表（整行表提到路径；
+#                            通配行提到静态前缀——按目录整读的门正文里只有目录）。
 #   debt       理由   到期日 —— 已知违规，带理由与到期，到期那天这门就红。它不是豁免，
 #                            是欠账记录；只许减，不许再添新的（添一笔是树上看得见的
 #                            一行，不添就落不了）。
+# 登记表自己也在数据面里：它是一张手写的、决定别的文件判词的表，所以它给自己写一行
+# debt 并每次印出来——门不给自己的账开后门。
 # 第一列可以是通配：`*` 只在一段里匹配（不跨 `/`），`**` 不支持（写出来是让人以为
-# 跨目录、实际不跨，宁可拒掉）。同一份表被两行匹配＝红：一份表两个身份，是有人没想清。
+# 跨目录、实际不跨，宁可拒掉）；`debt` 不许通配（一份文件一行，理由与到期要对得上
+# 那一份）。同一份表被两行匹配＝红：一份表两个身份，是有人没想清。
 # 没有行＝红。登记了但文件没了／已经没人读＝印 `stale`，不红——清账是表主人的事，
 # 而 stale 每跑一次印一次，忘不掉。
+#
+# 登记表从哪来，两代：终态是**图里的声明**（平台动作导入、`governance project` 写出
+# `<layout>/judgment-input.tsv`，头两行是生成戳与图的版本），门读那份机器投影；导入
+# 之前，同一套行写在手写的 `judgment-inputs.pin` 里，它自己登记成欠账。两种落点按
+# 布局发现；**同时存在就是红**——一份分类两个答案，读哪份都是在猜。手写表没了的那
+# 一天，这份门一行都不用改：投影那条路它一直在读。
 #
 # 为什么「有没有生产者」要人登记而不是自动识破：写文件的方式有几十种，判「手写」没有
 # 可靠判法；判「登记的生产者存不存在、提没提到这张表」是二值的。于是登记是声明，链是
 # 被验的声明——要骗过它得写一个真的提到这张表的生产者，那是看得见的一笔。
 #
-# 退出码：0 全部登记；1 有未登记／链断／欠账过期的表；3 量不出来（根不在、没有判词
-# 脚本、没有数据文件）——「量不出来」不是绿。
+# 退出码：0 全部登记；1 有未登记／链断／欠账过期／登记表本身不合规的表；3 量不出来
+# （根不在、没有登记表、没有判词脚本、没有数据文件）——「量不出来」不是绿。
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -59,23 +69,44 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$ROOT" ] && [ -d "$ROOT" ] || { printf 'exit 3：根不在：%s\n' "${ROOT:-<空>}" >&2; exit 3; }
-# 登记表按布局发现，不按一台机器写死：两种布局各一处候选，都没有就是「量不出来」。
-if [ -z "$PIN" ]; then
-    for cand in scripts/data/judgment-inputs.pin deploy/scripts/judgment-inputs.pin; do
-        if [ -f "$ROOT/$cand" ]; then PIN="$ROOT/$cand"; break; fi
-    done
-fi
-[ -n "$PIN" ] || { printf 'exit 3：%s 下找不到登记表（找过 scripts/data/ 与 deploy/scripts/）——这不是绿，是量法失效\n' "$ROOT" >&2; exit 3; }
-
-# 登记表自己若在这棵树里，它不是谁读的判据，是这门自己的账。
-PIN_REL=""
-case "$PIN" in "$ROOT"/*) PIN_REL="${PIN#"$ROOT"/}" ;; esac
-
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
 
 fail=0
 red() { printf 'FAIL  %s\n' "$1" >&2; fail=$((fail + 1)); }
+
+# 登记表按布局发现，不按一台机器写死：机器投影与手写表各两处候选。发现的是**唯一
+# 一份**才算发现：两份并排＝红（分类有两个答案，读哪份都是猜），一份都没有＝量不出来。
+PROJECTION=0
+if [ -z "$PIN" ]; then
+    found=()
+    for cand in scripts/data/judgment-input.tsv deploy/scripts/judgment-input.tsv \
+                scripts/data/judgment-input-host.tsv deploy/scripts/judgment-input-host.tsv \
+                scripts/data/judgment-inputs.pin deploy/scripts/judgment-inputs.pin; do
+        [ -f "$ROOT/$cand" ] && found+=("$cand")
+    done
+    if [ "${#found[@]}" -gt 1 ]; then
+        red "登记表有两份：$(printf '%s ' "${found[@]}")——一份分类只能有一个答案；导入那一刻删掉手写表，别让两份并排"
+        exit 1
+    elif [ "${#found[@]}" -eq 1 ]; then
+        PIN="$ROOT/${found[0]}"
+    fi
+fi
+[ -n "$PIN" ] || { printf 'exit 3：%s 下找不到登记表（找过 scripts/data/ 与 deploy/scripts/ 下的 judgment-input.tsv 与 judgment-inputs.pin）——这不是绿，是量法失效\n' "$ROOT" >&2; exit 3; }
+case "$PIN" in
+    *.pin) PROJECTION=0 ;;
+    *.tsv) PROJECTION=1 ;;
+    *) PROJECTION=0 ;;
+esac
+# 投影是机器写的，但「机器写的」要有据可查：没有生成戳的投影与手写表同形——分不出它
+# 是哪一版图写的，也就分不出它是否还记得昨天那次改判。
+if [ "$PROJECTION" = 1 ]; then
+    if ! grep -q '^# generated_at: ' "$PIN" || ! grep -q '^# source_revision: ' "$PIN"; then
+        red "投影没有生成戳：${PIN#"$ROOT/"}——头两行要 # generated_at: 与 # source_revision:；没有戳的投影与手写表同形"
+    fi
+fi
+
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 
 # 名单从哪来：提交车道给的是私有索引（`GIT_INDEX_FILE` 指向这一笔的字节），那时只能判
 # **这一笔**——工作树里此刻躺着隔壁会话还没落的表，判它等于替别人判旧账。没有索引时
@@ -97,10 +128,8 @@ list_paths() {
 while IFS= read -r -d '' p; do
     case "$p" in
         *.tsv|*.pin|*.csv)
-            if [ -z "$PIN_REL" ] || [ "$p" != "$PIN_REL" ]; then
-                printf '%s\n' "$p" >> "$tmp/data"
-                basename "$p" >> "$tmp/keys"
-            fi ;;
+            printf '%s\n' "$p" >> "$tmp/data"
+            basename "$p" >> "$tmp/keys" ;;
         *.yaml|*.yml)
             printf '%s\n' "$p" >> "$tmp/data"
             printf '%s\n' "$p" >> "$tmp/keys" ;;
@@ -163,6 +192,13 @@ if [ -f "$PIN" ]; then
             red "登记行没有静态前缀：$p——通配要从一个具体的名字开始，否则整棵树一个身份"
             continue
         fi
+        # 欠账是一份文件的事：一行欠账盖住一个目录，等于把一个目录列成「有理由的违规」，
+        # 而理由是对着哪一份写的、到期该修哪一份，都读不出来了。
+        case "$p:$c" in
+            *'*'*:debt)
+                red "欠账行不能通配：$p——一份文件一行，理由和到期要对得上那一份"
+                continue ;;
+        esac
         P_CLASS["$p"]="$c"
         P_DETAIL["$p"]="${d:-}"
         P_EXP["$p"]="${e:-}"
@@ -200,7 +236,8 @@ while IFS= read -r rel; do
     P_HIT["$pat"]=$((${P_HIT[$pat]} + 1))
     cls="${P_CLASS[$pat]}"
     detail="${P_DETAIL[$pat]}"
-    # 链要验的字符串就是这张表被认出来的那把键：通配行验静态前缀，整行表验
+    # 链要验的字符串就是这张表被认出来的那把键：通配行验静态前缀（读者按目录整读时
+    # 正文里只有目录，没有这一份的名字——要求逐份点名等于逼它把目录抄一遍），整行表验
     # tsv 的文件名／yaml 的路径——读者就是那样写它的。
     case "$pat" in
         *'*'*) needle="${P_PREFIX[$pat]}" ;;
@@ -249,8 +286,10 @@ LC_ALL=C sort "$tmp/stale"
 stale_n="$(grep -c . "$tmp/stale" 2>/dev/null || true)"
 [ -n "$stale_n" ] || stale_n=0
 
-printf 'judgment-inputs: %d 张数据文件，%d 张被判词脚本读（generated %d，subject %d，debt %d），%d 张没人读，stale %d\n' \
-    "$total" "$read_n" "$generated_n" "$subject_n" "$debt_n" "$unread_n" "$stale_n"
+rel_pin="${PIN#"$ROOT/"}"; [ "$rel_pin" = "$PIN" ] && rel_pin="$PIN"
+if [ "$PROJECTION" = 1 ]; then src="图投影 ${rel_pin}"; else src="手写登记表 ${rel_pin}（导入前是欠账）"; fi
+printf 'judgment-inputs: %d 张数据文件，%d 张被判词脚本读（generated %d，subject %d，debt %d），%d 张没人读，stale %d；登记表：%s\n' \
+    "$total" "$read_n" "$generated_n" "$subject_n" "$debt_n" "$unread_n" "$stale_n" "$src"
 if [ "$fail" -gt 0 ]; then
     printf 'judgment-inputs: %d 条红——被门读的表必须有生产者或验它的门；欠账要带理由与到期，且只能减\n' "$fail" >&2
     exit 1
