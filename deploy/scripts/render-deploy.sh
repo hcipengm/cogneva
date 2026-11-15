@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# reads: deploy/helm/cogneva/profiles/*.yaml subject
+# writes: deploy/rendered/*/* generated
+# writes: deploy/helm/cogneva/values.resource-governance.*.yaml generated
+# writes: deploy/k3s/resource-quota.yaml generated
 # 预渲染部署 profile：Helm chart 为拓扑唯一权威源，本脚本把 chart + profile
 # values 渲染成 standalone YAML（deploy/rendered/<profile>/），供元启动
 # "读目录 -> kubectl apply" 消费——引导链零 helm 依赖。

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# reads: deploy/helm/cogneva/Chart.yaml subject
 # 发布版本一致性门禁：交付物里写着版本号的每一处，都要等于 Cargo.toml 声明的那一个。
 #
 # 这条判据原先住在 build-release-image.sh 里，判的是一份写死的四文件名单

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# reads: deploy/k3s/*.yaml subject
 # 部署拓扑 parity 校验：Helm chart 是应用拓扑的唯一权威源，deploy/k3s/ 静态清单
 # （bootstrap 消费）必须与 chart 的 k3s profile 渲染结果能力对齐。任何一侧改动后
 # 跑本脚本，差异即失败。

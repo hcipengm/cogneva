@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# reads: .github/workflows/*.yml subject
 # 推之前跑一遍 CI 里那些**只靠 shell 就能跑**的作业。
 #
 # 为什么要有这个调用点：2026-10-18 的一串提交里，连着十几个 commit 推上去之后红在

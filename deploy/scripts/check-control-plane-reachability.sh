@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# reads: deploy/runtime-pods.yaml subject
 # 自伤检测：这份渲染产物描述出来的控制面，还到得了吗。
 #
 # 渲染新鲜度与 parity 判的是「三份清单说的是不是同一件事」，判不了「这件事本身还能不能

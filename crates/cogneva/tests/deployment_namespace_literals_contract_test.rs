@@ -1,3 +1,4 @@
+// reads: deploy/k8s/*.yaml subject
 //! principle: feedback_no_hardcoding_config_surface
 //! The namespace is the deployment's to declare: `deploy/helm/cogneva/values.yaml`
 //! carries `global.namespace`, the chart renders every object into it, and

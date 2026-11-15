@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# writes: deploy/images/*.yaml generated
 # 量 postgres-exporter 的产出面：这个镜像实际发哪些 `pg_*` 序列、认哪些
 # `--[no-]collector.x` 旗标，然后把两张名单写回
 # `deploy/images/postgres-exporter.series.yaml`。
