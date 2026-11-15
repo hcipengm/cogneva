@@ -13,6 +13,7 @@
 #   - `**`、绝对路径、没有静态前缀的模式 ⇒ 红（写出来像是能跨目录的，宁可拒掉）
 #   - yaml 按路径认（只提到文件名不算被读）；tsv 按文件名认
 #   - 文件头认领：欠账带理由与到期，过期红；载体要点名消费它的导入动作
+#   - 欠账不是身份，是倒计时：基线里已有的不红，基线里没有的新欠账红，读不到基线记 unjudged
 #   - 一份文件两种认领（欠账头＋注解、欠账头＋载体头）⇒ 红
 #   - 写者优先：机器写的表被门读来验仍是 generated，两个身份只在文件自己的认领与注解
 #     冲突时成立
@@ -372,6 +373,51 @@ if [ "$rc" = 0 ] && grep -qF 'debt  deploy/helm/cogneva/tunables.yaml' < <(print
     ok "本仓判绿，欠账行被印出"
 else
     bad "本仓应为绿并印出欠账（rc=$rc）：$out"
+fi
+
+# 30. 欠账是倒计时，不是身份：基线那棵树里已经带着的头 ⇒ 留下可以（印 outstanding），
+#     并报出棘轮判成的那一格。
+t="$work/30"; probe "$t" 'X="$ROOT/data/x.tsv"'; mkdir -p "$t/data"
+printf '# debt: 迁移要有平台库; expires: 2099-01-01\n' > "$t/data/x.tsv"
+if git -C "$t" init -q 2>/dev/null; then
+    git -C "$t" -c user.email=t@example.invalid -c user.name=t add -A 2>/dev/null
+    git -C "$t" -c user.email=t@example.invalid -c user.name=t commit -q -m base 2>/dev/null
+    out="$(run "$t")"; rc=$?
+    if [ "$rc" = 0 ] && grep -qF 'debt_ratchet=ok baseline=HEAD outstanding=1' < <(printf '%s' "$out"); then
+        ok "基线里已有的欠账头不红，棘轮报出存量"
+    else
+        bad "已有欠账应绿并报 outstanding（rc=$rc）：$out"
+    fi
+else
+    printf 'check 夹具建仓失败——棘轮这一臂没判成，不是绿\n'
+fi
+
+# 31. 基线里没有的欠账头 ⇒ 红。人写的判据不是一种身份：已有的只许减，新的一个也不许
+#     长出来——否则「记一笔欠账、到期再续」就成了保留手写的路。
+t="$work/31"; probe "$t" 'X="$ROOT/data/x.tsv"'; mkdir -p "$t/data"; : > "$t/data/x.tsv"
+if git -C "$t" init -q 2>/dev/null; then
+    git -C "$t" -c user.email=t@example.invalid -c user.name=t add -A 2>/dev/null
+    git -C "$t" -c user.email=t@example.invalid -c user.name=t commit -q -m base 2>/dev/null
+    printf '# debt: 新欠一笔; expires: 2099-01-01\n' > "$t/data/new.tsv"
+    out="$(run "$t")"; rc=$?
+    if [ "$rc" = 1 ] && grep -qF '新欠账：data/new.tsv' < <(printf '%s' "$out"); then
+        ok "基线里没有的新欠账头判红"
+    else
+        bad "新欠账头应红（rc=$rc）：$out"
+    fi
+else
+    printf 'check 夹具建仓失败——棘轮这一臂没判成，不是绿\n'
+fi
+
+# 32. 读不到基线（夹具不是 git 仓）⇒ 棘轮那一格印 unjudged，不记绿也不因此红：没判成
+#     不是判过。其余判据照跑。
+t="$work/32"; probe "$t" 'X="$ROOT/data/x.tsv"'; mkdir -p "$t/data"
+printf '# debt: 迁移要有平台库; expires: 2099-01-01\n' > "$t/data/x.tsv"
+out="$(run "$t")"; rc=$?
+if [ "$rc" = 0 ] && grep -qF 'debt_ratchet=unjudged' < <(printf '%s' "$out"); then
+    ok "基线读不到时印 unjudged，不冒充绿"
+else
+    bad "无仓时应印 unjudged 且不红（rc=$rc）：$out"
 fi
 
 printf 'check-judgment-inputs.test: %d passed, %d failed\n' "$pass" "$fail"
