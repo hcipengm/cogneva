@@ -6,6 +6,7 @@ pub mod harness;
 pub mod js_literal;
 pub mod kv;
 pub mod lex;
+pub mod migrations;
 pub mod mocks;
 pub mod orchestrator;
 pub mod redis;

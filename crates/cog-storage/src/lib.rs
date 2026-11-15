@@ -38,6 +38,7 @@ pub mod inbox_orphan_readings;
 pub mod inbox_retirement;
 pub mod pool_readings;
 pub mod pools;
+pub mod projection_readers;
 pub mod raw;
 #[cfg(feature = "s3")]
 pub mod s3;

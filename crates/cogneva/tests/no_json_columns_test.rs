@@ -30,11 +30,11 @@
 //! 这棵树想去的终态。
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::common;
 
-use common::routes::{repo_root, walk};
+use common::routes::repo_root;
 use common::rust_production::production_sources;
 
 /// 这张账的终态：一列都没有。
@@ -66,7 +66,10 @@ fn a_json_column_in_the_tree_is_a_storage_decision() {
 /// 有几百份源文件与上百份迁移。清到零的那天这条门仍然该绿，而且绿得有意义：
 /// 走错树会让它红，而不是让「全清完了」替我红一次。
 fn inputs_read(root: &Path) -> (usize, usize) {
-    (production_sources(root).len(), migration_files(root).len())
+    (
+        production_sources(root).len(),
+        common::migrations::up_migrations(root).len(),
+    )
 }
 
 #[test]
@@ -89,7 +92,7 @@ fn census(root: &Path) -> BTreeSet<String> {
         };
         scan(&rel(root, &path), &text, &mut out);
     }
-    for path in migration_files(root) {
+    for path in common::migrations::up_migrations(root) {
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         scan(&rel(root, &path), &text, &mut out);
@@ -119,7 +122,7 @@ fn census(root: &Path) -> BTreeSet<String> {
 /// 的列与删掉的列在「它已经不是 jsonb 了」这件事上是同一件事。
 fn retyped_columns(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for path in migration_files(root) {
+    for path in common::migrations::up_migrations(root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -191,7 +194,7 @@ fn statements(text: &str) -> Vec<String> {
 /// 迁移里被 `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <c>` 掉的那些列，`表.列`。
 fn dropped_columns(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for path in migration_files(root) {
+    for path in common::migrations::up_migrations(root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -238,7 +241,7 @@ fn dropped_columns(root: &Path) -> BTreeSet<String> {
 /// 形状了。
 fn dropped_tables(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for path in migration_files(root) {
+    for path in common::migrations::up_migrations(root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -271,32 +274,6 @@ fn rel(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
-}
-
-/// `crates/*/migrations/**/*.up.sql`：重放时会建表的那些。
-fn migration_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let crates = root.join("crates");
-    let Ok(entries) = std::fs::read_dir(&crates) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let migrations = entry.path().join("migrations");
-        if migrations.is_dir() {
-            // 递归只该有一份（`common::fsio` 里那一份）。`walk` 按 `Path::extension`
-            // 收，而这里要的是 `*.up.sql`——扩展名是 `sql`，`.up` 是名字的一部分，
-            // 所以先按 `sql` 收齐再按后缀过滤，而不是把 `"up.sql"` 当扩展名传进去
-            // （那样一份也收不到，空着与「全清完了」同形）。
-            let mut sql = Vec::new();
-            walk(&migrations, &["sql"], &mut sql);
-            out.extend(sql.into_iter().filter(|path| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(".up.sql"))
-            }));
-        }
-    }
-    out
 }
 
 /// 一份 DDL 文本里的 json/jsonb 列。
