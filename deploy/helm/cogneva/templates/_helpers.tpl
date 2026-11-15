@@ -10,8 +10,13 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{ .Values.global.namespace }}
 {{- end -}}
 
+{{/*
+镜像引用。tag 留空时取 .Chart.AppVersion——那是 Cargo.toml 声明版本在交付物里的
+那一处，镜像 tag 与它同源就不再是第二个需要人记得同步的版本号。空串按
+`default` 的判据当未设置，所以 values 里写 `tag: ""` 与删掉这一行同义。
+*/}}
 {{- define "cogneva.image" -}}
-{{ .Values.image.repository }}:{{ .Values.image.tag }}
+{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}
 {{- end -}}
 
 {{/*

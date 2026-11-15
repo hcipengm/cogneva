@@ -37,7 +37,7 @@ spec:
       # like a clean pass.
       initContainers:
         - name: aof-repair
-          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          image: {{ include "cogneva.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - sh
