@@ -388,7 +388,129 @@ pub const DISCOVERY_PROBES_UNANSWERED: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-reflection/src/discovery_outcome_readings.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 15] = [
+/// How long until the pool probes again, and when an upstream said it would be back.
+///
+/// Backoff is the pool's own answer to a bad window, and it is invisible from
+/// every other number: `llm_upstreams_healthy` reads zero both while the pool is
+/// waiting out a backoff and while every upstream is broken, and the two call
+/// for different actions. These two timestamps are what separates them -- the
+/// probe's next attempt says the pool is still trying on a schedule, and an
+/// upstream that reported its own recovery instant says somebody told us when.
+///
+/// `consecutive_failures` rides along because it is the count behind the wait:
+/// a backoff that grows while failures stop is a pool that never got a probe
+/// through.
+pub const LLM_POOL_BACKOFF: ReadingSpec = ReadingSpec {
+    id: "llm_pool_backoff_seconds",
+    title: "池子下一次探测还要等多久",
+    group: ReadingGroup::Delivery,
+    query: "max(llm_pool_next_attempt_unix) - time()",
+    unit: "秒",
+    warn: Some(600.0),
+    crit: Some(3600.0),
+    higher_is_worse: true,
+    series: "llm_pool_next_attempt_unix / llm_pool_evidenced_recovery_unix / llm_upstream_consecutive_failures",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+/// How much of the pool is reserve: upstreams known but not in the rotation.
+///
+/// A pool whose reserve population is empty has no headroom left: the next
+/// upstream failure is a full outage rather than a reorder. `reserve_since_unix`
+/// is the age of the newest reserve entry, so a reserve that stopped being
+/// refilled reads the same as one that was never filled unless this is read
+/// beside it.
+pub const LLM_POOL_RESERVE: ReadingSpec = ReadingSpec {
+    id: "llm_pool_reserve",
+    title: "池子的储备上游",
+    group: ReadingGroup::Delivery,
+    query: "max(llm_pool_reserve_population)",
+    unit: "个",
+    warn: Some(1.0),
+    crit: Some(0.0),
+    higher_is_worse: false,
+    series: "llm_pool_reserve_population / llm_pool_reserve_since_unix / llm_pool_quota_window_secs / llm_upstream_position / llm_upstream_quota_window_secs / llm_upstream_shape_errored / llm_request_param_clamped_total",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+/// Attempts a shutdown had to leave behind, and the ones it resumed later.
+///
+/// Two numbers that only mean something together: an abandoned attempt says the
+/// drain ran out of budget with work in flight, and a resumed one says the
+/// journal brought it back. Reading only the first makes every rollout look
+/// lossy; reading only the second makes the loss look free.
+pub const SHUTDOWN_DRAIN_LOSS: ReadingSpec = ReadingSpec {
+    id: "shutdown_drain_loss",
+    title: "关停时被硬切的尝试",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_shutdown_drain_undeclared_total[30m]))",
+    unit: "条",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_shutdown_drain_undeclared_total / cogneva_attempt_resume_total / cogneva_shutdown_drain_milliseconds",
+    produced_by: "crates/cog-agent/src/plugin.rs",
+};
+
+/// Images and layers the registry's reclaim removed, and what it kept.
+///
+/// The registry is the one volume that grows without a reader noticing: a prune
+/// that stops running and a registry with nothing to prune look identical until
+/// the bytes are read. These four are the pass's own account -- what it freed,
+/// what it kept, and how much it pruned.
+pub const REGISTRY_RECLAIM: ReadingSpec = ReadingSpec {
+    id: "registry_reclaim",
+    title: "镜像仓库回收掉的镜像与层",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_buildah_store_freed_bytes_total[24h]))",
+    unit: "字节",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_buildah_store_freed_bytes_total / cogneva_buildah_store_kept_images / cogneva_buildah_store_pruned_images_total / cogneva_buildah_store_pruned_layers_total",
+    produced_by: "crates/cog-reflection/src/registry_maintenance.rs",
+};
+
+/// Tool output that had to be truncated before an agent could read it.
+///
+/// A truncation is not an error: it is the budget doing its job. What is worth
+/// a reading is the rate -- an agent whose every call returns truncated output
+/// is working from summaries it did not ask for, and the character count says
+/// how much of the evidence never reached the model.
+pub const TOOL_OUTPUT_TRUNCATED: ReadingSpec = ReadingSpec {
+    id: "tool_output_truncated",
+    title: "被截断的工具输出",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_tool_output_truncated_total[30m]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_tool_output_truncated_total / cogneva_tool_output_truncated_chars_total / cogneva_tool_output_fetch_budget_exhausted_total",
+    produced_by: "crates/cog-agent/src/tool_output.rs",
+};
+
+/// Rows and bytes the two append-only stores are holding.
+///
+/// The storage face's own size: every one of these tables keeps rows that no
+/// retention pass has removed, and "the table is big" is not a reading until it
+/// is compared with the retention bound that is supposed to cap it. Read
+/// together so a table that stopped being trimmed is visible next to the ones
+/// that are still moving.
+pub const STORE_GROWTH: ReadingSpec = ReadingSpec {
+    id: "store_growth",
+    title: "追加表的行与字节",
+    group: ReadingGroup::Infra,
+    query: "sum(cogneva_metrics_samples_bytes) + sum(cogneva_checkpoints_bytes) + sum(cogneva_observability_events_bytes)",
+    unit: "字节",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_metrics_samples_bytes / cogneva_checkpoints_bytes / cogneva_observability_events_bytes / cogneva_task_events_rows / cogneva_task_events_tasks / cogneva_llm_usage_rows",
+    produced_by: "crates/cog-storage/src/plugin.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 21] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -404,6 +526,12 @@ pub const READINGS: [&ReadingSpec; 15] = [
     &BUILD_GATE_WAIT_MAX,
     &BUILD_CACHE_OVER_CAP,
     &DISCOVERY_PROBES_UNANSWERED,
+    &LLM_POOL_BACKOFF,
+    &LLM_POOL_RESERVE,
+    &SHUTDOWN_DRAIN_LOSS,
+    &REGISTRY_RECLAIM,
+    &TOOL_OUTPUT_TRUNCATED,
+    &STORE_GROWTH,
 ];
 
 /// The word a reading carries about its own value.
