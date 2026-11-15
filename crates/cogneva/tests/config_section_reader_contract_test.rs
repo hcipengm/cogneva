@@ -129,14 +129,11 @@ fn every_key_a_shipped_document_writes_is_read_by_something() {
     let mut docs = 0usize;
     for (file, doc) in shipped_configs(&root) {
         docs += 1;
-        // Sections the document leaves out. Not asserted: a document may be a
-        // sample rather than a declaration, and writing every section into a
-        // sample would make it a second carrier of every default. The documents
+        // Sections the document leaves out. Not asserted here: the documents
         // the cluster receives are held to completeness elsewhere — the binary
         // refuses to ship a declaration the table does not classify in full,
         // and the embedders are held identical to the chart's. Printed so a
-        // section that goes missing from a sample is a reading rather than a
-        // silence.
+        // section that goes missing is a reading rather than a silence.
         let missing = cog_core::config_sections::sections_missing_from_document(&doc);
         if !missing.is_empty() {
             omitted.push(format!("{file} leaves out {}", missing.join(", ")));

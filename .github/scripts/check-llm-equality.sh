@@ -21,7 +21,7 @@
 #   3. 厂商域名：闭集（见下面的 VENDOR_DOMAINS）。
 #   4. 厂商身份词：闭集（见下面的 VENDOR_TOKENS），只收**不会与英文常用词撞**的那些。
 #
-# 扫的是**产物**：渲染产物 + chart + GitOps 静态清单 + 示例配置。不扫 `crates/`——
+# 扫的是**产物**：渲染产物 + chart + GitOps 静态清单。不扫 `crates/`——
 # 网关自己那侧合法地提到上游（协议探测、池条目 schema），那条线划在网关的进程边界上，
 # 不划在树的位置上。
 #
@@ -31,7 +31,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ "${1:-}" = "" ] || ROOT="$1"
 
-# 扫的是整棵 `deploy/` 加示例配置，不列具体的投递路径。
+# 扫的是整棵 `deploy/`（除执行面），不列具体的投递路径。
 #
 # 列出来的名单漏起来没有症状：新增一条投递路径（`deploy/airgap/`、某天多出来的一份
 # 离线包清单）不在名单里就永远不被扫，而「没扫到」与「扫过且干净」在读数上完全一样。
@@ -41,7 +41,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # 唯一排除的是 `deploy/scripts`，理由是结构性的而不是图省事：那一侧是**执行面**，
 # 它必须点名自己要禁的身份（提交署名门里就有 Claude/Anthropic 这两个词），正如网关
 # 侧合法地提到上游——这里划的线是「装配进集群的字节」，不是「树上的位置」。
-SCAN_PATHS=('deploy' ':(exclude)deploy/scripts' 'cogneva.example.json')
+SCAN_PATHS=('deploy' ':(exclude)deploy/scripts')
 
 # 唯一允许被业务侧点名的 LLM 端点宿主。
 #
@@ -98,7 +98,7 @@ main() {
   local scanned
   scanned="$(git -C "$ROOT" ls-files -- "${SCAN_PATHS[@]}" 2>/dev/null | wc -l)" || scanned=0
   if [ "${scanned}" -lt 1 ]; then
-    log "LLM 平等门：扫描面（deploy/ 除 deploy/scripts、cogneva.example.json）里一个文件都没有读到——"
+    log "LLM 平等门：扫描面（deploy/ 除 deploy/scripts）里一个文件都没有读到——"
     log "零个文件与「全都干净」在输出上同形，这一跑什么都没证明"
     return 3
   fi

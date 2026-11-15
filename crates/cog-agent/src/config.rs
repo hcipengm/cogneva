@@ -302,10 +302,7 @@ mod tests {
     #[test]
     fn the_shipped_config_writes_no_iteration_ceiling() {
         let root = crate::checkout::repo_root();
-        for rel in [
-            "deploy/helm/cogneva/files/cogneva.json",
-            "cogneva.example.json",
-        ] {
+        for rel in ["deploy/helm/cogneva/files/cogneva.json"] {
             let path = root.join(rel);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));

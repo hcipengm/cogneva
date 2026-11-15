@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-# writes: cogneva.example.json generated
-"""从 chart 的配置文档生成 `cogneva.example.json`。
+"""从 chart 的配置文档生成一份可直接放置的示例配置，写到标准输出。
 
-chart 的 `files/cogneva.json` 是交付配置**唯一**手改的一份；示例是它的投影，
-不是第二份手改源。投影只做三件事，其余逐字照抄（键序也照抄）：
+chart 的 `files/cogneva.json` 是交付配置**唯一**手改的一份。仓库里不再提交示例
+副本：副本与源只会在「重跑生成器」这一件事上分家，而读它的人本来就够得着源。
+需要一份能放到 `/etc/cogneva/cogneva.json` 的独立文件时，在消费点现场生成它
+（重定向到临时文件或直接传下去），不要把结果提交回树里。
+
+投影只做三件事，其余逐字照抄（键序也照抄）：
 
   * 首行的说明改成「这是生成物、源在哪」；
   * `github_integration.repo` 换成占位符，示例不能指向这次安装的真实仓库；
   * 告警规则列表只留 `EXAMPLE_RULES` 点名的十条，展示规则长什么样；
     chart 里那份才是这个部署的完整告警策略。
 
-新增一条规则、改一个键，重跑本脚本，示例会跟着变；不跑，`--check` 判红。
-手改 `cogneva.example.json` 同样判红——它不是源。
-
 用法：
-  python3 deploy/scripts/gen-example-config.py           # 写回 cogneva.example.json
-  python3 deploy/scripts/gen-example-config.py --check   # 只判：已提交的示例是否等于投影
+  python3 deploy/scripts/gen-example-config.py > /tmp/cogneva.json
+  python3 deploy/scripts/gen-example-config.py | less
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE = REPO_ROOT / "deploy/helm/cogneva/files/cogneva.json"
-TARGET = REPO_ROOT / "cogneva.example.json"
 
 # 示例里保留的告警规则名。选的是通用基础设施告警与自进化产出告警各几条，
 # 让人看见 promql / condition / severity / face 的搭配；具体阈值属于部署策略，
@@ -117,9 +117,8 @@ def rendered(document: dict) -> str:
 
 
 def main(argv: list) -> int:
-    check = argv[1:] == ["--check"]
-    if argv[1:] and not check:
-        print("usage: gen-example-config.py [--check]", file=sys.stderr)
+    if argv[1:]:
+        print("usage: gen-example-config.py", file=sys.stderr)
         return 2
 
     try:
@@ -129,44 +128,13 @@ def main(argv: list) -> int:
     except json.JSONDecodeError as error:
         fail(f"{SOURCE} is not valid JSON: {error}")
 
-    expected = rendered(project(source))
-
-    if check:
-        try:
-            actual = TARGET.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            fail(f"{TARGET.relative_to(REPO_ROOT)} does not exist; run this script without --check")
-        if actual != expected:
-            print(
-                f"FAIL: {TARGET.relative_to(REPO_ROOT)} is not the projection of "
-                f"{SOURCE.relative_to(REPO_ROOT)}.",
-                file=sys.stderr,
-            )
-            for number, (want, got) in enumerate(
-                zip(expected.splitlines(), actual.splitlines()), start=1
-            ):
-                if want != got:
-                    print(f"  first difference at line {number}:", file=sys.stderr)
-                    print(f"    generated: {want}", file=sys.stderr)
-                    print(f"    committed: {got}", file=sys.stderr)
-                    break
-            else:
-                print("  the two files differ in length only.", file=sys.stderr)
-            print(
-                "  Run `python3 deploy/scripts/gen-example-config.py` and commit the "
-                "result; edit the chart, never the example.",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"ok: {TARGET.relative_to(REPO_ROOT)} is the projection of the chart")
-        return 0
-
-    current = TARGET.read_text(encoding="utf-8") if TARGET.exists() else None
-    if current == expected:
-        print(f"{TARGET.relative_to(REPO_ROOT)} already up to date")
-        return 0
-    TARGET.write_text(expected, encoding="utf-8")
-    print(f"wrote {TARGET.relative_to(REPO_ROOT)} from {SOURCE.relative_to(REPO_ROOT)}")
+    try:
+        sys.stdout.write(rendered(project(source)))
+    except BrokenPipeError:
+        # `| less` quitting early is the documented use, not a failure of the
+        # projection. Point stdout at devnull so the interpreter's final flush
+        # does not report the same closed pipe again.
+        sys.stdout = open(os.devnull, "w")
     return 0
 
 

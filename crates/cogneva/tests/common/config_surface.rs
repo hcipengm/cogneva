@@ -1642,13 +1642,15 @@ fn rename_case(name: &str, rename_all: Option<&str>) -> String {
     }
 }
 
-/// The config where it is shipped: the chart's file, the static manifest the
-/// cluster pulls, the rendered profiles, and the example template.
+/// The config where it ships: the chart's file, the static manifest the
+/// cluster pulls, and the rendered profiles.
+///
+/// A sample copy at the repository root used to be read here too. It was a
+/// projection of the chart's file, so it could only agree or drift -- and the
+/// check that it agreed ran in CI against the chart, which is the source. A
+/// reader who needs the shipped configuration reads the chart's file.
 pub fn shipped_configs(root: &Path) -> Vec<(String, Value)> {
-    let mut out = vec![(
-        "cogneva.example.json".to_string(),
-        read_config(&root.join("cogneva.example.json")),
-    )];
+    let mut out = Vec::new();
     for relative in [
         "deploy/helm/cogneva/files/cogneva.json",
         "deploy/k3s/cogneva-json-configmap.yaml",
@@ -1669,8 +1671,8 @@ pub fn shipped_configs(root: &Path) -> Vec<(String, Value)> {
     out
 }
 
-/// Read the config wherever it is shipped: the chart and the example keep it as
-/// a file of its own, a ConfigMap manifest keeps it as a block scalar.
+/// Read the config wherever it is shipped: the chart keeps it as a file of its
+/// own, a ConfigMap manifest keeps it as a block scalar.
 pub fn read_config(path: &Path) -> Value {
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => read_json(path),

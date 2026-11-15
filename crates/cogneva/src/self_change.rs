@@ -369,7 +369,7 @@ mod tests {
     fn its_own_runtime_configuration_is_accepted() {
         for path in [
             "deploy/helm/cogneva/files/cogneva.json",
-            "./cogneva.example.json",
+            "./cogneva.json",
             "crates/cog-agent/src/config.rs",
         ] {
             let reading = proposal(path, "max_iterations")
@@ -382,11 +382,11 @@ mod tests {
     /// 缺项的、说空话的不进账。
     #[test]
     fn a_blank_field_does_not_enter_the_ledger() {
-        let mut p = proposal("cogneva.example.json", "\"a\": 1");
+        let mut p = proposal("cogneva.json", "\"a\": 1");
         p.why = "   ".into();
         assert_eq!(p.reading("employee-7"), Err(Refusal::Blank("why")));
 
-        let mut p = proposal("cogneva.example.json", "");
+        let mut p = proposal("cogneva.json", "");
         p.why = "因为".into();
         assert_eq!(p.reading("employee-7"), Err(Refusal::Blank("literal")));
 
@@ -402,7 +402,7 @@ mod tests {
     /// 的代价是一条谁也还不了的欠债。
     #[test]
     fn a_literal_that_is_a_finding_written_out_is_refused() {
-        let refusal = proposal("cogneva.example.json", "grep crates/ :: fn a()")
+        let refusal = proposal("cogneva.json", "grep crates/ :: fn a()")
             .reading("employee-7")
             .expect_err("判词不是片段");
         assert!(matches!(refusal, Refusal::Rendering(_)), "{refusal:?}");

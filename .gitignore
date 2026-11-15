@@ -8,7 +8,8 @@ target
 node_modules
 dist
 
-# Local runtime config (template: cogneva.example.json)
+# Local runtime config (shipped source: deploy/helm/cogneva/files/cogneva.json;
+# generate a standalone copy with deploy/scripts/gen-example-config.py)
 cogneva.json
 # Exception: the Helm chart ships its default cogneva.json via .Files.Get
 !deploy/helm/cogneva/files/cogneva.json

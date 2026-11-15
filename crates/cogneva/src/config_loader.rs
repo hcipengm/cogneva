@@ -52,8 +52,9 @@ impl Deref for AppConfig {
 /// dead in the mode it does not cover — a manifest that sets
 /// `COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED=false` against a table that never
 /// heard of it changes nothing, and "the switch is off" reads exactly like
-/// "the switch does nothing". The tests below hold the three spellings (this
-/// one, the chart document, the published example) to one account of each name.
+/// "the switch does nothing". The tests below hold every shipped spelling (this
+/// one, the chart document, the ConfigMap blob that carries it) to one account
+/// of each name.
 fn default_env_mappings() -> HashMap<String, String> {
     let mut m = HashMap::new();
     // app
@@ -1067,18 +1068,14 @@ mod tests {
     /// path rebuilt here: what the cluster receives is the ConfigMap blob, and
     /// the chart's copy is only assumed to be the same document — a gate that
     /// reads the assumption instead of the blob checks something no pod may
-    /// ever see. The example is in the set because it is the document an
-    /// operator copies to start a deployment, so a mapping nothing reads there
-    /// is the same dead knob one step earlier.
+    /// ever see.
+    ///
+    /// A sample copy at the repository root used to be read here as well, on
+    /// the argument that it is the document an operator copies. It was a
+    /// projection of the chart's file with no independent content, so it could
+    /// only agree or drift; the operator reads the chart's file now.
     fn documents_with_an_env_map() -> Vec<(&'static str, serde_json::Value)> {
-        let mut docs = shipped_documents();
-        let example_path = repo_root().join("cogneva.example.json");
-        let raw = std::fs::read_to_string(&example_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", example_path.display()));
-        let example = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", example_path.display()));
-        docs.push(("example", example));
-        docs
+        shipped_documents()
     }
 
     /// A loaded config file supplies its own override map, and `apply_env_overrides`
@@ -1104,7 +1101,7 @@ mod tests {
         let documents = documents_with_an_env_map();
         // Named rather than counted: a count still passes when one form drops
         // out and another takes its place, and the forms carry different maps.
-        for required in ["chart", "k3s configmap", "example"] {
+        for required in ["chart", "k3s configmap"] {
             assert!(
                 documents.iter().any(|(tag, _)| *tag == required),
                 "the `{required}` config document is not reaching this gate, so \
@@ -1270,13 +1267,12 @@ mod tests {
 
     /// The table is spelled more than once, and nothing joined the spellings.
     ///
-    /// The built-in table, the `env` map inside the delivered document (the
-    /// chart's copy and the ConfigMap blob that carries it), and the map in the
-    /// example an operator copies are three hand-kept lists of the same fact.
-    /// They drifted: 126 entries against 113 against 95, and a name only one
-    /// copy knew did nothing in whichever mode read the other. The loader reads
-    /// both now; what still cannot stand is one name meaning two places, because
-    /// then where a variable writes is decided by which copy won.
+    /// The built-in table and the `env` map inside the delivered document (the
+    /// chart's copy and the ConfigMap blob that carries it) are hand-kept lists
+    /// of the same fact. They drifted: 126 entries against 113, and a name only
+    /// one copy knew did nothing in whichever mode read the other. The loader
+    /// reads both now; what still cannot stand is one name meaning two places,
+    /// because then where a variable writes is decided by which copy won.
     ///
     /// The floor on each copy is what keeps this from passing over an empty set:
     /// a reader that stops seeing entries makes every comparison below agree.
@@ -1317,20 +1313,15 @@ mod tests {
             "one variable, two config paths — which one it writes becomes luck: {conflicts:?}"
         );
 
-        // The example is the document an operator copies to start an install, so
-        // a name it carries and the delivered document does not is a setting
-        // that reads as configured and reaches nothing.
-        let env_of = |tag: &str| -> &serde_json::Map<String, serde_json::Value> {
-            documents
-                .iter()
-                .find(|(candidate, _)| *candidate == tag)
-                .and_then(|(_, document)| document["env"].as_object())
-                .unwrap_or_else(|| panic!("{tag} carries no `env` map"))
-        };
-        let delivered = env_of("chart");
-        // A join over nothing always agrees. The two tables share most of their
-        // names, so seeing far fewer than that means the comparison is reading
-        // an empty overlap rather than two copies of one table.
+        // A join over nothing always agrees. The built-in table and the
+        // delivered document share most of their names, so seeing far fewer
+        // than that means the comparison is reading an empty overlap rather
+        // than two copies of one table.
+        let delivered = documents
+            .iter()
+            .find(|(tag, _)| *tag == "chart")
+            .and_then(|(_, document)| document["env"].as_object())
+            .unwrap_or_else(|| panic!("chart carries no `env` map"));
         let shared = builtin
             .keys()
             .filter(|name| delivered.contains_key(*name))
@@ -1338,14 +1329,6 @@ mod tests {
         assert!(
             shared >= 80,
             "只有 {shared} 个名字同时出现在内置表与交付文档里——比较没看到东西"
-        );
-        let invented: Vec<&String> = env_of("example")
-            .keys()
-            .filter(|name| name.starts_with("COGNEVA_") && !delivered.contains_key(*name))
-            .collect();
-        assert!(
-            invented.is_empty(),
-            "the example invents variables the delivered document does not know: {invented:?}"
         );
     }
 

@@ -3991,10 +3991,7 @@ mod tests {
     /// missed to a restart still finds its record.
     #[test]
     fn the_store_outlives_the_re_drive_window_it_gates() {
-        let shipped = [
-            ("chart", "deploy/helm/cogneva/files/cogneva.json"),
-            ("example", "cogneva.example.json"),
-        ];
+        let shipped = [("chart", "deploy/helm/cogneva/files/cogneva.json")];
         let mut cases: Vec<(String, bool, u64, i64)> = shipped
             .iter()
             .map(|(name, path)| {

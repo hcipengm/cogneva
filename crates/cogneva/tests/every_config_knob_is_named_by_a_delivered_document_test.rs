@@ -44,7 +44,7 @@ use common::routes::repo_root;
 /// because an empty set satisfies every "nothing is missing" statement.
 const PRODUCED_FLOOR: usize = 300;
 
-/// At least this many documents must be shipped: example, chart, static
+/// At least this many documents must be shipped: the chart's file, the static
 /// manifest and the rendered profiles.
 const DOCUMENT_FLOOR: usize = 5;
 
@@ -306,7 +306,7 @@ fn every_knob_a_reader_produces_is_named_by_a_delivered_document() {
     let (named, produced, docs) = surfaces(&root);
     assert!(
         docs >= DOCUMENT_FLOOR,
-        "只读到 {docs} 份交付文档（下限 {DOCUMENT_FLOOR}）：样例、chart、静态清单或\
+        "只读到 {docs} 份交付文档（下限 {DOCUMENT_FLOOR}）：chart、静态清单或\
          渲染 profile 少了一份，「文档没写」是在一叠缺页的文档上说的"
     );
     assert!(

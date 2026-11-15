@@ -374,11 +374,11 @@ mod tests {
     /// Three places embed it: the chart's file, the static manifest the cluster
     /// pulls, and the rendered profiles. They have to agree, so the comparison
     /// is over all of them rather than over the one that happens to be edited.
+    /// A sample copy at the repository root was a fourth entry here; it was a
+    /// projection of the chart's file, so agreement with it proved nothing
+    /// about what a deployment reads.
     fn shipped_configs(root: &Path) -> Vec<(String, serde_json::Value)> {
-        let mut out = vec![(
-            "cogneva.example.json".to_string(),
-            read_config(&root.join("cogneva.example.json")),
-        )];
+        let mut out = Vec::new();
         let k3s_configmap = format!(
             "deploy/k3s/{}-configmap.yaml",
             cog_core::topology::CONFIG_CONFIGMAP
@@ -403,8 +403,8 @@ mod tests {
         out
     }
 
-    /// Read the config wherever it is shipped: the chart and the example keep it
-    /// as a file of its own, a ConfigMap manifest keeps it as a block scalar.
+    /// Read the config wherever it is shipped: the chart keeps it as a file of
+    /// its own, a ConfigMap manifest keeps it as a block scalar.
     fn read_config(path: &Path) -> serde_json::Value {
         match path.extension().and_then(|e| e.to_str()) {
             Some("json") => read_json(path),
@@ -536,9 +536,7 @@ mod tests {
     #[test]
     fn the_embedders_ship_one_and_the_same_config() {
         let root = repo_root();
-        let mut configs = shipped_configs(&root)
-            .into_iter()
-            .filter(|(file, _)| !file.ends_with("cogneva.example.json"));
+        let mut configs = shipped_configs(&root).into_iter();
         let (reference_file, reference) = configs.next().expect("a chart source config");
         for (file, doc) in configs {
             assert_eq!(

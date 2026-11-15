@@ -2485,10 +2485,10 @@ mod tests {
     /// exceed, otherwise the rule is evaluated on every decomposition and can
     /// never fire — which reads exactly like a plan that never broke it.
     ///
-    /// All three carriers of the same declaration are walked, because a
-    /// threshold lowered in one and left unreachable in another is the drift
-    /// this is here to catch. The k3s carrier is YAML, so its embedded document
-    /// is extracted the way the delivery check extracts it.
+    /// Both carriers of the same declaration are walked, because a threshold
+    /// lowered in one and left unreachable in another is the drift this is here
+    /// to catch. The k3s carrier is YAML, so its embedded document is extracted
+    /// the way the delivery check extracts it.
     #[test]
     fn the_estimator_reaches_every_token_budget_the_shipped_configs_declare() {
         let root = repo_root();
@@ -2497,7 +2497,6 @@ mod tests {
             cog_core::topology::CONFIG_CONFIGMAP
         );
         let carriers = [
-            "cogneva.example.json",
             "deploy/helm/cogneva/files/cogneva.json",
             k3s_configmap.as_str(),
         ];

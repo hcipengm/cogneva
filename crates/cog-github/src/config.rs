@@ -791,12 +791,14 @@ mod tests {
     #[test]
     fn shipped_config_templates_track_the_field_surface() {
         let root = repo_root();
-        assert_surface_matches(&root.join("cogneva.example.json"));
+        // The chart's file is the only shipped document. A sample copy at the
+        // repository root used to be checked here too; it was generated from
+        // this file, so it could not say anything this check does not.
         assert_surface_matches(&root.join("deploy/helm/cogneva/files/cogneva.json"));
     }
 
-    /// 部署族由准入条件判，不由路径判：默认策略与两份交付模板都不能再禁止
-    /// `deploy/`。三个写点必须一起动——只改代码默认，部署里那份配置照旧把
+    /// 部署族由准入条件判，不由路径判：默认策略与交付模板都不能再禁止
+    /// `deploy/`。两个写点必须一起动——只改代码默认，部署里那份配置照旧把
     /// 每一笔部署变更挡在落地之外，部署准入门（渲染、parity、回滚、dry-run）
     /// 根本没有机会跑，读者看到的是「部署变更永远落不了地」而没有一句原因。
     #[test]
@@ -821,10 +823,7 @@ mod tests {
             );
         }
 
-        for template in [
-            "cogneva.example.json",
-            "deploy/helm/cogneva/files/cogneva.json",
-        ] {
+        for template in ["deploy/helm/cogneva/files/cogneva.json"] {
             let raw = std::fs::read_to_string(repo_root().join(template))
                 .unwrap_or_else(|e| panic!("读不到 {template}：{e}"));
             let doc: serde_json::Value = serde_json::from_str(&raw)

@@ -3926,7 +3926,7 @@ test a::b ... FAILED\n\
         // The reference document is configuration the deployment ships, so it
         // has to read as configuration. A rule that went by how a file looks —
         // "an example, so documentation" — would put it in the prose row.
-        assert!(is_config_path("cogneva.example.json"));
+        assert!(is_config_path("cogneva.json"));
     }
 
     #[test]

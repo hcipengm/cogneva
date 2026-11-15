@@ -4402,24 +4402,20 @@ impl ChangePipeline {
     /// The refusal this change earns for writing only defaults nothing reads,
     /// `None` when it has an effect somewhere.
     ///
-    /// Two documents stand for the deployment's configuration here:
-    /// `cogneva.example.json` and the chart's own `cogneva.json`. Those are the
-    /// pair the configuration surface is already judged on, and `deploy/k3s` /
-    /// `deploy/rendered` are held to the chart by the parity gate rather than
-    /// carrying keys of their own. A document that cannot be read or parsed, or
-    /// a written file that cannot be read back, answers `None`: the criterion
-    /// is "every document writes the key", and an unread document has not been
-    /// shown to. Reading no documents is not the same finding as reading them
-    /// and not finding the key, and only the second one refuses a change.
+    /// The chart's `cogneva.json` stands for the deployment's configuration
+    /// here: `deploy/k3s` and `deploy/rendered` are held to it by the parity and
+    /// freshness gates rather than carrying keys of their own. A document that
+    /// cannot be read or parsed, or a written file that cannot be read back,
+    /// answers `None`: the criterion is "every document writes the key", and an
+    /// unread document has not been shown to. Reading no documents is not the
+    /// same finding as reading them and not finding the key, and only the
+    /// second one refuses a change.
     async fn unreachable_default_reason(
         &self,
         workdir: &Path,
         change_content: &str,
     ) -> Option<String> {
-        const DOCUMENTS: &[&str] = &[
-            "cogneva.example.json",
-            "deploy/helm/cogneva/files/cogneva.json",
-        ];
+        const DOCUMENTS: &[&str] = &["deploy/helm/cogneva/files/cogneva.json"];
         let mut documents = Vec::with_capacity(DOCUMENTS.len());
         for path in DOCUMENTS {
             let text = tokio::fs::read_to_string(workdir.join(path)).await.ok()?;
@@ -5174,10 +5170,7 @@ mod tests {
         let document = serde_json::json!({
             "metrics": { "sample_max_rows": 200000, "log_at_floor": false },
         });
-        let documents = [
-            workdir.join("cogneva.example.json"),
-            workdir.join("deploy/helm/cogneva/files/cogneva.json"),
-        ];
+        let documents = [workdir.join("deploy/helm/cogneva/files/cogneva.json")];
         for path in &documents {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
@@ -5230,7 +5223,7 @@ impl Default for MetricsConfig {
             "拒因要点名读不到的键：{reason}"
         );
         assert!(
-            reason.contains("cogneva.example.json"),
+            reason.contains("deploy/helm/cogneva/files/cogneva.json"),
             "拒因要点名它据以判定的文档：{reason}"
         );
 
