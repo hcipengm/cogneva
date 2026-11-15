@@ -13,9 +13,7 @@ export type ActivityId =
   | 'search'
   | 'hooks'
   | 'plugins'
-  | 'dlq'
   | 'workspaces'
-  | 'squads'
   | 'action-plan'
   | 'datasets'
   | 'snapshots'
@@ -73,9 +71,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   search: '搜索',
   hooks: '钩子',
   plugins: '插件',
-  dlq: '死信',
   workspaces: '工作区',
-  squads: '编队',
   'action-plan': '动作计划',
   datasets: '数据集',
   snapshots: '快照',

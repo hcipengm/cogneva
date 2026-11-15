@@ -4132,7 +4132,8 @@ export async function searchKnowledge(query: string, limit = 20): Promise<unknow
   return api.post('/api/v1/knowledge/search', { query, limit });
 }
 
-/** 平台搜索：把一次查询同时问向几个面。 */
+/** 平台搜索：把一次查询同时问向几个面。路由只答 GET，查询条件走查询串。 */
 export async function searchPlatform(query: string, limit = 20): Promise<unknown> {
-  return api.post('/api/v1/search', { query, limit });
+  const params = new URLSearchParams({ q: query, limit: String(limit) });
+  return api.get(`/api/v1/search?${params.toString()}`);
 }
