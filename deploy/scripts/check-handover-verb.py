@@ -15,7 +15,8 @@ README 的「真自治」就被人读成一句口号；2026-10-23 前后两版�
 合起来写会让这道门在有人改标题那天安静地什么都不判。
 
 退出码：0 两段都干净；1 至少一处升降词与操作者同句（逐处点名行号）；
-        3 判不了（文件不在、段找不到、段里零处提到操作者）。
+        0 并打印「未判」——两份 README 都不在本仓，没有可判的东西；
+        3 判不了（只少一份文件、段找不到、段里零处提到操作者）。
 
 用法：check-handover-verb.py [仓库根]
 """
@@ -60,15 +61,18 @@ def main(argv):
     violations = []
     judged = 0
     actor_lines = 0
+    missing = []
 
     for name, marker in SECTIONS:
         path = f"{root}/{name}"
         try:
             with open(path, encoding="utf-8") as fh:
                 lines = fh.read().splitlines()
-        except OSError as exc:
-            print(f"check-handover-verb: 读不到 {name}：{exc}", file=sys.stderr)
-            return 3
+        except OSError:
+            # 本仓不跟踪这两份 README：干净的检出里它们都不在，那是「没有可判的
+            # 东西」；只少一份则是有人删掉了一半，仍按读不到处理。
+            missing.append(name)
+            continue
 
         found = section(lines, marker)
         if found is None:
@@ -100,6 +104,16 @@ def main(argv):
             )
             return 3
         print(f"ok    - {name}：{title}，{here} 行提到操作者")
+
+    if missing:
+        if judged == 0 and len(missing) == len(SECTIONS):
+            print(f"check-handover-verb: 未判：{', '.join(missing)} 不在本仓")
+            return 0
+        print(
+            f"check-handover-verb: 读不到 {', '.join(missing)}——只判了一半，不是干净",
+            file=sys.stderr,
+        )
+        return 3
 
     for name, lineno, verb, text in violations:
         print(f"RED   - {name}:{lineno}「{verb}」与操作者同句：{text}")

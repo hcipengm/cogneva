@@ -1,3 +1,14 @@
+# The two root READMEs are kept out of the repository but stay on disk: the
+# checks that read them (`check-readme-paths.sh`,
+# `check-readme-trait-members.sh`, `check-handover-verb.py`,
+# `bootstrap-entry.test.sh`) read the filesystem, so a working copy that still
+# has them keeps judging them, while a fresh clone -- and therefore CI, and the
+# two published remotes -- has neither the files nor anything to judge: those
+# checks say `未判` and exit 0 there. Anything that ignores the rule (`git add
+# -f`) puts them back, and then CI judges them again.
+/README.md
+/README.zh-CN.md
+
 # Build output. No trailing slash on these three: a trailing slash matches only a
 # directory, and in a git worktree `web/node_modules` is typically a symlink to the
 # main checkout's copy -- which then reads as an untracked file, enters `git add -A`

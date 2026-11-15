@@ -92,15 +92,18 @@ run_gate 1 '名字或路径已经漂了'
 # 两份 README 都缺时那个 for 循环一次也不进；README 在而一处 Trait 成员表都没有时
 # 那个 while 循环一次也不进。两种情况下 fail 都还是 0，门会印出与「每一块都对得上」
 # 完全相同的那句绿。
+#
+# 两种缺法要分开：两份都不在（干净的检出，这两份文件不跟踪）是「没有可判的东西」，
+# 说一句未判并退出 0；文件在而认不出表，才是有人把标签写坏了，仍退 3。
 no_readme="${work}/no-readme"
 mkdir -p "${no_readme}/crates/x/src"
 cp "${fixture}/crates/x/src/lib.rs" "${no_readme}/crates/x/src/lib.rs"
 rc=0
 out="$(bash "${gate}" "${no_readme}" 2>&1)" || rc=$?
-[ "${rc}" -eq 3 ] || fail "没有 README 时 rc=${rc}，应为 3 —— ${out}"
+[ "${rc}" -eq 0 ] || fail "两份 README 都不在时 rc=${rc}，应为 0 —— ${out}"
 case "${out}" in
-    *'一份都没读到'*) ;;
-    *) fail "没有 README 时没说清是没读到 —— ${out}" ;;
+    *'未判'*) ;;
+    *) fail "两份 README 都不在时没说未判 —— ${out}" ;;
 esac
 
 no_blocks="${work}/no-blocks"

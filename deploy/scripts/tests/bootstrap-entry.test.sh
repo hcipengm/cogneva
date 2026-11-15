@@ -256,10 +256,19 @@ rm -f "$ENTRY/gitee.raw"
 # 载体清单。标签格式 `<来源>:<型号>:<首选腿>`。
 # 分母按**来源**给（两个 README 各两处安装片段、ps1 两个字符串、bootstrap.sh 两个
 # 常量）：只断言总数的话，删掉一处、别处加一处，总数照样对得上。
+#
+# 两份 README 不在本仓的检出里（它们不跟踪）：那份检出就少这两个来源，分母跟着少，
+# 而不是把「没有可数的」读成「少了两处」。有文件时照旧要求各两处。
+readme_sources=0
+for f in README.md README.zh-CN.md; do
+    if [ -f "$ROOT/$f" ]; then readme_sources=$((readme_sources + 1)); fi
+done
+
 entry_carriers() {
     printf 'bootstrap.sh:INTL:github\t%s\n' "$ENTRY_CMD_INTL"
     printf 'bootstrap.sh:CN:gitee\t%s\n' "$ENTRY_CMD_CN"
     for f in README.md README.zh-CN.md; do
+        [ -f "$ROOT/$f" ] || continue
         grep -nF 'src="$(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh' "$ROOT/$f" |
             while IFS=: read -r ln text; do
                 printf '%s:%s:github\t%s\n' "$f" "$ln" "$text"
@@ -315,9 +324,13 @@ while IFS=$'\t' read -r label cmd; do
 done < <(entry_carriers)
 
 for src in bootstrap.sh bootstrap.ps1 README.md README.zh-CN.md; do
+    case "$src" in
+        README.md | README.zh-CN.md) [ -f "$ROOT/$src" ] || continue ;;
+    esac
     check "载体清单：$src 的入口命令处数" 2 "${seen[$src]:-0}"
 done
-check "载体清单：载体总数（4 个来源 × 2 处）" 8 "$n_carriers"
+sources=$((2 + readme_sources))
+check "载体清单：载体总数（$sources 个来源 × 2 处）" $((sources * 2)) "$n_carriers"
 
 # 同侧载体必须逐字相同。一条命令散在 4 个文件 8 个地方、没有判据盯着，就一定会漂：
 # 单改 README 的 `-m 15`、单改 ps1 的腿序，都不会有任何东西变红。

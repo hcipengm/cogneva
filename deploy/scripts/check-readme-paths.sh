@@ -33,6 +33,18 @@ defaulted=0
 if [ "${#files[@]}" -eq 0 ]; then
   files=("${repo}/README.md" "${repo}/README.zh-CN.md")
   defaulted=1
+  # 两份 README 不在本仓时没有可判的东西：它们留在这台机器上的副本仍会被下面这段
+  # 逐行判，而一份干净的检出（CI、别人 clone 的那份）里没有它们。这时唯一的正确
+  # 回答是「未判」，不是红——红会说「文档里的路径错了」，而文档根本不在。
+  missing=()
+  for f in "${files[@]}"; do
+    [ -f "${f}" ] || missing+=("${f#"${repo}/"}")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    joined="$(printf '%s,' "${missing[@]}")"
+    echo "check-readme-paths: 未判：${joined%,} 不在本仓"
+    exit 0
+  fi
 fi
 
 # 判过多少处「像路径」的串。自己选人口时（两份 README），零处与「每一处都还在」
