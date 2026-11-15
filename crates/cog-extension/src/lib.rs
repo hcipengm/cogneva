@@ -95,15 +95,54 @@ pub fn build_extension_backend() -> Arc<dyn cog_core::SandboxBackend> {
 /// 环境类工具（shell 命令、文件读写）落在哪个后端上，由配置里的那一个地址决定：
 /// 配了地址就发给独立的执行器 Pod（生产形态），没配就在本进程里跑（嵌入式/开发）。
 ///
+/// 地址可以用逗号分成多个，一个执行器副本一个：那时一条 lane 钉在一副副本上
+/// （见 [`executor_lease`]），因为同一副工作树只在一副副本的卷上。一个地址的
+/// 部署与从前完全一样，钉与不钉都落到它身上。
+///
 /// 只有这一处做这个判断。第二个调用点各写一份三元判断的下场是两边对「没配地址」
 /// 给出不同答案——而它们都自称在跑环境工具。
 pub fn executor_backend(
     url: Option<String>,
 ) -> cog_core::SFResult<Arc<dyn cog_core::SandboxBackend>> {
     Ok(match url {
-        Some(url) => Arc::new(RemoteExecutor::new(url)?),
+        Some(url) => {
+            let endpoints: Vec<String> = url
+                .split(',')
+                .map(str::trim)
+                .filter(|one| !one.is_empty())
+                .map(str::to_string)
+                .collect();
+            match endpoints.len() {
+                0 => Arc::new(LocalExecutor::new()),
+                1 => Arc::new(RemoteExecutor::new(
+                    endpoints.into_iter().next().unwrap_or_default(),
+                )?),
+                _ => Arc::new(RemoteExecutor::with_endpoints(endpoints)?),
+            }
+        }
         None => Arc::new(LocalExecutor::new()),
     })
 }
 
 pub use executor::TaskSandboxExecutor;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_address_and_an_empty_address_both_mean_the_local_backend() {
+        assert!(executor_backend(None).is_ok());
+        assert!(executor_backend(Some(String::new())).is_ok());
+        // 一个逗号、两边都是空的：与不配地址同义，不该被当成「配了一个空地址」。
+        assert!(executor_backend(Some(" , ".into())).is_ok());
+    }
+
+    #[test]
+    fn a_comma_separated_list_is_one_endpoint_per_replica() {
+        let backend = executor_backend(Some("http://a:9090, http://b:9090".into()));
+        assert!(backend.is_ok(), "多个地址应当被接受");
+        let single = executor_backend(Some("http://a:9090".into()));
+        assert!(single.is_ok(), "一个地址仍然是生产形态的远端执行器");
+    }
+}
