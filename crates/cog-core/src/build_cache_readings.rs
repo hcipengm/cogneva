@@ -811,7 +811,7 @@ pub fn unix_now() -> u64 {
 /// than from the deployment: it is the one bound nothing in this process set,
 /// and the one that moves without anything here changing.
 #[cfg(unix)]
-fn volume_free_bytes(path: &Path) -> Option<u64> {
+pub fn volume_free_bytes(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -833,7 +833,7 @@ fn volume_free_bytes(path: &Path) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn volume_free_bytes(_path: &Path) -> Option<u64> {
+pub fn volume_free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 

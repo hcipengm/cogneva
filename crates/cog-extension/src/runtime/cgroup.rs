@@ -34,6 +34,14 @@ pub struct CgroupFacts {
     /// the evidence for whether the limit is large enough, which is otherwise
     /// guesswork.
     pub peak_bytes: Option<u64>,
+    /// `memory.current` as it stands. A sample rather than a high-water mark:
+    /// what a build costs is measured by watching this while it runs, and a
+    /// lifetime maximum cannot answer "what did that one build rise by".
+    pub current_bytes: Option<u64>,
+    /// `inactive_file` from `memory.stat`: page cache the kernel would drop
+    /// under pressure. Counted out of the working set, because a container
+    /// that read a file is not a container holding it.
+    pub inactive_file_bytes: Option<u64>,
     /// The `oom_kill` count from `memory.events`, cumulative for this cgroup.
     pub oom_kills: Option<u64>,
     /// `throttled_usec` from `cpu.stat`: microseconds this container spent held
@@ -50,6 +58,14 @@ impl CgroupFacts {
     /// around the same command. Both readings have to have succeeded: a
     /// missing counter is no evidence in either direction, so it never reads
     /// as "not an OOM".
+    /// `memory.current` less the page cache the kernel would drop anyway, or
+    /// `None` when the current reading could not be taken -- an unreadable
+    /// container stays unreadable rather than reading as an empty one.
+    pub fn working_set_bytes(&self) -> Option<u64> {
+        self.current_bytes
+            .map(|current| current.saturating_sub(self.inactive_file_bytes.unwrap_or(0)))
+    }
+
     pub fn oom_kill_between(before: &Self, after: &Self) -> bool {
         match (before.oom_kills, after.oom_kills) {
             (Some(before), Some(after)) => after > before,
@@ -71,6 +87,8 @@ pub fn read_at(root: &Path) -> CgroupFacts {
     CgroupFacts {
         limit_bytes: read_limit(root),
         peak_bytes: read_u64(root.join("memory.peak")),
+        current_bytes: read_u64(root.join("memory.current")),
+        inactive_file_bytes: read_memory_stat(root, "inactive_file"),
         oom_kills: read_oom_kills(root),
         throttled_usec: cpu.map(|(throttled_usec, _)| throttled_usec),
         nr_throttled: cpu.map(|(_, nr_throttled)| nr_throttled),
@@ -104,6 +122,17 @@ fn read_limit(root: &Path) -> Option<u64> {
         "max" => None,
         text => text.parse().ok(),
     }
+}
+
+/// One field of `memory.stat`, which is a flat list of `name value` lines.
+fn read_memory_stat(root: &Path, field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(root.join("memory.stat")).ok()?;
+    text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        (parts.next()? == field)
+            .then(|| parts.next()?.parse::<u64>().ok())
+            .flatten()
+    })
 }
 
 fn read_oom_kills(root: &Path) -> Option<u64> {
@@ -233,6 +262,22 @@ mod tests {
     }
 
     const EVENTS: &str = "low 0\nhigh 0\nmax 0\noom 3\noom_kill 2\noom_group_kill 0\n";
+
+    /// The working set is what a build is charged for, so the page cache the
+    /// kernel would drop is counted out of it -- and a container whose current
+    /// reading cannot be taken has no working set at all, rather than an empty
+    /// one.
+    #[test]
+    fn the_working_set_leaves_out_the_cache_the_kernel_would_drop() {
+        let dir = fixture(&[
+            ("memory.current", "1000\n"),
+            ("memory.stat", "anon 700\nfile 300\ninactive_file 250\n"),
+        ]);
+        assert_eq!(read_at(dir.path()).working_set_bytes(), Some(750));
+
+        let dir = fixture(&[("memory.stat", "inactive_file 250\n")]);
+        assert_eq!(read_at(dir.path()).working_set_bytes(), None);
+    }
 
     #[test]
     fn reads_a_finite_limit_peak_and_kill_count() {

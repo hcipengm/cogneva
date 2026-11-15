@@ -15,6 +15,7 @@ pub mod executor;
 pub mod hostdocs;
 pub mod hostdocs_assist;
 pub mod hostdocs_organizer;
+pub mod lane_sizing;
 pub mod plugin;
 pub mod registry;
 pub mod runtime;

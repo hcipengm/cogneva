@@ -27,6 +27,8 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::hostdocs::{HostDocOp, HostDocPlan, HostDocs};
+use crate::lane_sizing::{self, BuildCost, BuildEnd, BuildSample, LanePlan, LaneSource};
+use crate::runtime::cgroup::CgroupFacts;
 use crate::workdir::{self, CommandHold, WorkdirRouter};
 
 #[derive(Clone)]
@@ -54,36 +56,20 @@ struct AppState {
     queue_waits: Arc<BuildQueueWindow>,
 }
 
-/// How many commands may compile at once when the deployment names none.
+/// The concurrency the deployment declared, from
+/// `COGNEVA_SANDBOX_BUILD_CONCURRENCY`.
 ///
-/// One, and the reason is no longer a shared lock: each lane writes its own
-/// target directory (see [`lane_target_dir`]), so two lanes are two compilers.
-/// What a second lane costs now is what the second lane actually spends --
-/// a duplicated build of every dependency, and that build's peak memory beside
-/// the first one's -- inside a container whose limit was measured when one
-/// build ran at a time. Nothing here has measured either number, so one is the
-/// count the executor can defend; the deployment can name another with
-/// `COGNEVA_SANDBOX_BUILD_CONCURRENCY` when it has.
-///
-/// Before the lanes had directories of their own, one slot was also protecting
-/// against cargo's exclusive lock on the single directory: a second command was
-/// started, given its wall clock, and then parked inside cargo's lockfile wait
-/// -- `locks_lock_inode_wait`, no CPU, wall running down -- until it was killed
-/// having compiled nothing. Measured on the cluster: a clippy parked this way
-/// reached its entire 600 s wall while the build in front of it did all the
-/// work. That failure is what a lane count without its own directories buys,
-/// and it is why the two changes travel together.
-// cap: bound — 不是容量读数：一条新位子的真实价格（重复编依赖＋一份峰值内存）还没量过，
-// 量到之前只能是 1；部署要别的数就经 COGNEVA_SANDBOX_BUILD_CONCURRENCY 明确覆盖
-const DEFAULT_BUILD_CONCURRENCY: usize = 1;
-
-/// The concurrency in force, from `COGNEVA_SANDBOX_BUILD_CONCURRENCY`.
-fn build_concurrency() -> usize {
-    std::env::var("COGNEVA_SANDBOX_BUILD_CONCURRENCY")
+/// `None` is a deployment that named no count, which is not the same as naming
+/// one: with none, the count comes from what this container measures (see
+/// [`crate::lane_sizing::plan_lanes`]), and it reads as one only until a build
+/// has been priced -- one is the count that ran before anything was measured.
+/// A written zero is how a config spells "I wrote none", so it reads as none
+/// too.
+fn build_concurrency() -> Option<usize> {
+    std::env::var(crate::lane_sizing::BUILD_CONCURRENCY_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_BUILD_CONCURRENCY)
 }
 
 /// A build that waited at least this long for its turn is worth a line.
@@ -328,6 +314,8 @@ pub struct CommandMetrics {
     lane_waiting: IntGaugeVec,
     lane_holding: IntGaugeVec,
     lane_position: HistogramVec,
+    lane_capacity: IntGaugeVec,
+    build_wall: HistogramVec,
 }
 
 /// Buckets spanning a file write to a build that runs to its wall.
@@ -460,8 +448,37 @@ impl CommandMetrics {
         registry
             .register(Box::new(lane_holding.clone()))
             .expect("metric registered once");
+        // 这一刻能同时编译几条，以及这个数是量出来的还是没人量过。两个标签一起
+        // 才有意义：`source="measured", reading="memory"` 的一条「1」是内存只够
+        // 一条，`source="unmeasured"` 的一条「1」是还没量到任何代价——同一个数，
+        // 两件不同的事。
+        let lane_capacity = IntGaugeVec::new(
+            Opts::new(
+                "sandbox_build_lane_capacity",
+                "How many builds this executor will run at once, and which reading decided it",
+            ),
+            &["source", "reading"],
+        )
+        .expect("static metric name and labels");
+        // 一条编译从占到放开了多久，按当时几条位子并行分组。它是「多一条位子
+        // 值不值」的证据：两条并行时每条比独占时慢多少，只有这个读数说得出。
+        let build_wall = HistogramVec::new(
+            HistogramOpts::new(
+                "sandbox_build_wall_seconds",
+                "Wall clock a compiling command held its lane, by how many builds shared the container",
+            )
+            .buckets(COMMAND_LATENCY_BUCKETS.to_vec()),
+            &["beside"],
+        )
+        .expect("static metric name and labels");
         registry
             .register(Box::new(lane_position.clone()))
+            .expect("metric registered once");
+        registry
+            .register(Box::new(lane_capacity.clone()))
+            .expect("metric registered once");
+        registry
+            .register(Box::new(build_wall.clone()))
             .expect("metric registered once");
         Self {
             registry,
@@ -471,6 +488,8 @@ impl CommandMetrics {
             lane_waiting,
             lane_holding,
             lane_position,
+            lane_capacity,
+            build_wall,
         }
     }
 
@@ -517,6 +536,32 @@ impl CommandMetrics {
         self.lane_position
             .with_label_values(&[agent, ended.as_str()])
             .observe(place as f64);
+    }
+
+    /// 发布这一刻的条数与它的出处。先清空再生一条：两个来源同时为 1 会被
+    /// 求和读成 2，而「量不到」与「量到 1」正是要靠这两条分开的两件事。
+    fn set_lane_capacity(&self, plan: LanePlan) {
+        let (source, reading) = lane_labels(plan.source);
+        self.lane_capacity.reset();
+        self.lane_capacity
+            .with_label_values(&[source, reading])
+            .set(plan.lanes as i64);
+    }
+
+    fn observe_build_wall(&self, beside: usize, seconds: f64) {
+        self.build_wall
+            .with_label_values(&[&beside.to_string()])
+            .observe(seconds);
+    }
+}
+
+/// 条数出处在读数面上的两个标签。取值都是闭集：一个读数名一种取值，不拼句子。
+fn lane_labels(source: LaneSource) -> (&'static str, &'static str) {
+    match source {
+        LaneSource::Measured(bound) => ("measured", bound),
+        LaneSource::Unmeasured(reading) => ("unmeasured", reading),
+        LaneSource::OomKilled => ("oom-killed", "none"),
+        LaneSource::Overridden(_) => ("overridden", "declared"),
     }
 }
 
@@ -834,6 +879,14 @@ async fn execute_handler(
                 }
             };
             let build_target = build_target_dir(cargo_target.as_deref(), build_slot.as_ref());
+            // 位子自己不知道 target 卷在哪：装配这一步按位子算出了目录，就把
+            // 它和卷的根一并告诉队——卷根用于量余量，目录用于量这一条编译写了多少。
+            if let Some(base) = cargo_target.as_deref() {
+                state.build_lane.note_target_base(base);
+            }
+            if let (Some(slot), Some(dir)) = (build_slot.as_ref(), build_target.as_deref()) {
+                slot.note_target(dir.to_path_buf());
+            }
             match crate::runtime::local::spawn_command(
                 command,
                 &progress_id,
@@ -1054,10 +1107,18 @@ const UNATTRIBUTED: &str = "unattributed";
 /// target 目录，见 [`lane_target_dir`]），等的人按 agent 轮转，刚被放行的
 /// agent 回到自己队的队尾，于是任何一个 agent 连发都占不满别人的机会。
 pub struct BuildLane {
-    capacity: usize,
+    /// The count the deployment wrote down, if it wrote one. When it did, the
+    /// count is theirs; when it did not, [`BuildLane::capacity_now`] derives it.
+    declared: Option<usize>,
     inner: std::sync::Mutex<LaneState>,
     wake: tokio::sync::Notify,
     commands: Arc<CommandMetrics>,
+    /// What finished builds have been measured to cost this container.
+    cost: std::sync::Mutex<BuildCost>,
+    /// The volume the lanes' target directories live on, learned from the
+    /// first compiling command. Free bytes are read off it at planning time;
+    /// until it is known, the disk bound is unmeasured.
+    target_base: std::sync::Mutex<Option<PathBuf>>,
 }
 
 struct LaneState {
@@ -1085,6 +1146,9 @@ struct HeldSlot {
     /// 占的是第几条位子。位子不再只是「还有没有空」，而是「空的是哪一条」：
     /// 每条编译写自己的 target 目录，两条同时编译才不会卡在 cargo 的同一把锁上。
     index: usize,
+    /// 这条位子上的编译期间容器工作集到过的最高点。采样器只在这一条位子
+    /// 独占容器时填它：两条编译并行时升高分不清是谁的，分不清就不算给谁。
+    peak_bytes: u64,
 }
 
 impl LaneState {
@@ -1120,10 +1184,20 @@ impl LaneState {
     }
 }
 
+/// How often the container's working set is read while builds run.
+///
+/// The reading answers "what did this build rise by", so it has to be finer
+/// than the build: a cargo build's resident set moves over seconds, and a
+/// sample a second catches the plateau without reading allocation noise as a
+/// second build.
+// cap: bound — 采样间隔按「编译的常驻集在秒级移动」定；更密只是同一平台期的重复
+// 读数，更疏会漏掉整条编译的峰
+const LANE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl BuildLane {
-    fn new(capacity: usize, commands: Arc<CommandMetrics>) -> Arc<Self> {
-        Arc::new(Self {
-            capacity,
+    fn new(declared: Option<usize>, commands: Arc<CommandMetrics>) -> Arc<Self> {
+        let lane = Arc::new(Self {
+            declared,
             inner: std::sync::Mutex::new(LaneState {
                 waiting: Vec::new(),
                 holding: Vec::new(),
@@ -1133,7 +1207,136 @@ impl BuildLane {
             }),
             wake: tokio::sync::Notify::new(),
             commands,
-        })
+            cost: std::sync::Mutex::new(BuildCost::default()),
+            target_base: std::sync::Mutex::new(None),
+        });
+        // 没有运行时就没人采样：单元测试里成本保持「没量到」，规划因此给 1，
+        // 与树上没人量过时的答案一致。
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let weak = Arc::downgrade(&lane);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(LANE_SAMPLE_INTERVAL).await;
+                    let Some(lane) = weak.upgrade() else { break };
+                    lane.sample_once();
+                }
+            });
+        }
+        lane
+    }
+
+    /// 采一次容器工作集：没有编译占位时它是空闲基线，恰好一条时它进那一条
+    /// 的峰值。两条以上时谁都不是——升高分不清归属，就不算给任何人。
+    fn sample_once(&self) {
+        let facts = crate::runtime::cgroup::read();
+        let Some(working_set) = facts.working_set_bytes() else {
+            return;
+        };
+        let build = {
+            let mut state = self.lock();
+            match state.holding.len() {
+                0 => None,
+                1 => {
+                    let held = &mut state.holding[0];
+                    held.peak_bytes = held.peak_bytes.max(working_set);
+                    Some(false)
+                }
+                _ => Some(true),
+            }
+        };
+        match build {
+            // 没有编译在跑：这是空闲工作集。
+            None => self.cost().observe(working_set, 0),
+            // 恰好一条：采样器自己填过了，这里不重复记。
+            Some(false) => {}
+            // 多条：基线仍然只在没有编译时才有意义，这里什么都不做。
+            Some(true) => {}
+        }
+    }
+
+    fn cost(&self) -> std::sync::MutexGuard<'_, BuildCost> {
+        self.cost.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 编译写 target 的那块卷。第一条编译类命令告诉它一次。
+    fn note_target_base(&self, base: &std::path::Path) {
+        let mut slot = self.target_base.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(base.to_path_buf());
+        }
+    }
+
+    fn free_bytes(&self) -> Option<u64> {
+        let base = self
+            .target_base
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        cog_core::build_cache_readings::volume_free_bytes(&base)
+    }
+
+    /// 这一刻的条数：部署写了就是它写的，没写就是量出来的。
+    fn plan(&self) -> LanePlan {
+        let facts = crate::runtime::cgroup::read();
+        self.plan_with(&facts, self.free_bytes())
+    }
+
+    /// 同一套算术，读数由调用方给：判据用夹具喂它，不用这台机器的 cgroup。
+    fn plan_with(&self, facts: &CgroupFacts, free_bytes: Option<u64>) -> LanePlan {
+        let cost = self.cost();
+        let plan = lane_sizing::plan_lanes(facts.limit_bytes, free_bytes, &cost, self.declared);
+        drop(cost);
+        self.commands.set_lane_capacity(plan);
+        plan
+    }
+
+    fn capacity_now(&self) -> usize {
+        self.plan().lanes
+    }
+
+    /// 一条编译结束了：量它的代价、记它的结局，再把条数重算一次。
+    ///
+    /// 代价是「容器工作集比空闲基线高多少」与「这块 target 目录占多少字节」；
+    /// 结局是「进队到出队之间 oom_kill 涨没涨」。前者是下一条位子的价格，后者
+    /// 是这条位子太多的证据。墙钟按占位时长记，并按当时几条位子在一起分组——
+    /// 它是「多一条位子值不值」的证据，但两次不同的编译比墙钟是在比两个问题，
+    /// 所以它只发布、不参与算条数。
+    fn finish_build(
+        &self,
+        started: CgroupFacts,
+        peak_water: u64,
+        beside: usize,
+        since: std::time::Instant,
+        target: Option<PathBuf>,
+    ) {
+        let after = crate::runtime::cgroup::read();
+        let end = if CgroupFacts::oom_kill_between(&started, &after) {
+            BuildEnd::OomKilled
+        } else {
+            BuildEnd::Completed
+        };
+        let wall = since.elapsed();
+        let target_bytes = target
+            .as_deref()
+            .and_then(|dir| cog_core::fs_size::dir_size_bytes(dir, &[]).ok());
+        let sample = {
+            let cost = self.cost();
+            let peak_bytes = cost
+                .baseline_bytes()
+                .filter(|baseline| peak_water > *baseline)
+                .map(|baseline| peak_water - baseline);
+            BuildSample {
+                peak_bytes,
+                target_bytes,
+                wall,
+                beside,
+            }
+        };
+        self.cost().record(sample, end);
+        self.commands.observe_build_wall(beside, wall.as_secs_f64());
+        // 条数可能因此变了（第一次量到价格，或刚吃了 OOM）：重算并发布，
+        // 让「量不到」与「量到就是 1」在读数面上分得开。
+        self.plan();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LaneState> {
@@ -1198,23 +1401,29 @@ impl BuildLane {
             // 先登记的唤醒再查状态：反过来会漏掉「查完、还没 await」之间
             // 别人放出的那一次。
             let notified = self.wake.notified();
+            // 条数每次放人前重算：编译的代价随机器与工作负载变，一个只算一次的
+            // 数会停在「第一次编译时的容器」上。
+            let capacity = self.capacity_now();
             {
                 let mut state = self.lock();
                 if let Some(at) = state.waiting.iter().position(|w| w.ticket == ticket) {
-                    if state.holding.len() < self.capacity && state.fair_head() == Some(at) {
+                    if state.holding.len() < capacity && state.fair_head() == Some(at) {
                         let place = state.place_of(ticket).unwrap_or(at + 1);
                         // 空着的第一条位子：位子数与容量相等，所以「还有空位」
                         // 保证找得到一条；找不到只可能是容量刚被改小，此时退回
                         // 队尾，不抢别人写着的那条目录。
-                        let index = (0..self.capacity)
+                        let index = (0..capacity)
                             .find(|i| !state.holding.iter().any(|h| h.index == *i))
                             .unwrap_or(state.holding.len());
                         state.waiting.remove(at);
+                        let started = crate::runtime::cgroup::read();
+                        let since = std::time::Instant::now();
                         state.holding.push(HeldSlot {
                             agent: agent.clone(),
                             ticket,
-                            since: std::time::Instant::now(),
+                            since,
                             index,
+                            peak_bytes: 0,
                         });
                         state.last_served.insert(agent.clone(), ticket);
                         self.republish(&state);
@@ -1229,6 +1438,9 @@ impl BuildLane {
                                 lane: Arc::clone(self),
                                 ticket,
                                 index,
+                                since,
+                                started,
+                                target: std::sync::Mutex::new(None),
                             },
                             arrived.elapsed(),
                         ));
@@ -1301,6 +1513,12 @@ pub struct BuildSlot {
     lane: Arc<BuildLane>,
     ticket: u64,
     index: usize,
+    /// 拿到位子的时刻：墙钟从这一刻起，不是从命令拿到墙时起。
+    since: std::time::Instant,
+    /// 进队时的 cgroup 读数，结局靠它和出队时比。
+    started: CgroupFacts,
+    /// 这条编译最终写的那块目录，装配时才定下来（非编译命令没有）。
+    target: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl BuildSlot {
@@ -1310,17 +1528,34 @@ impl BuildSlot {
     pub fn index(&self) -> usize {
         self.index
     }
+
+    /// 这条编译写哪块目录。装配这一步知道（它按位子算），位子本身不知道，
+    /// 所以由外部告诉它；没有编译的命令永远不会有。
+    pub fn note_target(&self, dir: PathBuf) {
+        *self.target.lock().unwrap_or_else(|p| p.into_inner()) = Some(dir);
+    }
 }
 
 impl Drop for BuildSlot {
     fn drop(&mut self) {
-        {
+        let (beside, peak_bytes) = {
             let mut state = self.lane.lock();
+            let beside = state.holding.len();
+            let mut peak = 0;
             if let Some(at) = state.holding.iter().position(|h| h.ticket == self.ticket) {
+                peak = state.holding[at].peak_bytes;
                 state.holding.remove(at);
             }
             self.lane.republish(&state);
-        }
+            (beside, peak)
+        };
+        let target = self
+            .target
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        self.lane
+            .finish_build(self.started, peak_bytes, beside, self.since, target);
         // 空出一个位子：刚才没轮到的、排在后面的人都该再看一眼。
         self.lane.wake.notify_waiters();
     }
@@ -1331,6 +1566,7 @@ impl Drop for BuildSlot {
 /// 与 `/metrics` 的差别是它给的是**此刻的名单**，不是累计分布：一个 agent 在
 /// 队里排第几名，只能从这份名单上读。
 pub fn build_lane_fairness(lane: &BuildLane) -> cog_core::BuildLaneReading {
+    let capacity = lane.plan().lanes;
     let state = lane.lock();
     let mut order: Vec<(u64, u64, &Waiting)> = state
         .waiting
@@ -1342,7 +1578,7 @@ pub fn build_lane_fairness(lane: &BuildLane) -> cog_core::BuildLaneReading {
         .collect();
     order.sort_by_key(|(served, ticket, _)| (*served, *ticket));
     cog_core::BuildLaneReading {
-        capacity: Some(lane.capacity),
+        capacity: Some(capacity),
         holding: state
             .holding
             .iter()
@@ -1919,20 +2155,117 @@ mod tests {
         assert!(serde_json::from_value::<ExecuteRequest>(legacy).is_ok());
     }
 
-    /// The default has to be the number of writers the target directory admits,
-    /// and that number is one: cargo takes an exclusive lock on it. A second
-    /// slot does not start a second compiler -- it starts a command whose wall
-    /// clock runs while it waits inside cargo for a lock it cannot get, and
-    /// that command is killed at its wall having compiled nothing.
+    /// 部署没写条数时，条数是量出来的，不是代码里写死的一个数。
+    ///
+    /// 量到之前它读作 1——1 是还没量过任何东西时跑的那条——但读数的出处说
+    /// 得出这是「还没量到」，不是「量到只有一条」。
     #[test]
-    fn the_default_is_one_lane_until_the_second_lane_has_been_priced() {
+    fn with_no_declared_count_the_lane_count_is_measured_not_written() {
         let _guard = BUILD_ENV_LOCK.lock().unwrap();
         std::env::remove_var("COGNEVA_SANDBOX_BUILD_CONCURRENCY");
         assert_eq!(
             build_concurrency(),
-            1,
-            "一条新位子的价格（重复编依赖＋一份峰值内存）没人量过，默认只能是一条"
+            None,
+            "没写条数不是写了一条：写了一条就压过测量"
         );
+        std::env::set_var("COGNEVA_SANDBOX_BUILD_CONCURRENCY", "3");
+        assert_eq!(build_concurrency(), Some(3));
+        std::env::set_var("COGNEVA_SANDBOX_BUILD_CONCURRENCY", "0");
+        assert_eq!(build_concurrency(), None, "写 0 是「没写」的另一种拼法");
+        std::env::remove_var("COGNEVA_SANDBOX_BUILD_CONCURRENCY");
+    }
+
+    /// 同一个 1，两个出处：一个来自「这个容器只够一条」，一个来自「一条都
+    /// 没量过」。读数面必须分得开——分不开的话，内存真的紧和闭环根本没读到
+    /// 数是同一个读数。
+    #[test]
+    fn a_measured_one_and_an_unmeasured_one_read_differently() {
+        let commands = Arc::new(CommandMetrics::new());
+        let lane = BuildLane::new(None, Arc::clone(&commands));
+        let gib = 1u64 << 30;
+
+        let blind = lane.plan_with(&CgroupFacts::default(), None);
+        assert_eq!(blind.lanes, 1);
+        assert!(matches!(blind.source, LaneSource::Unmeasured(_)));
+        let rendered = commands.render();
+        assert!(
+            rendered.contains(
+                r#"sandbox_build_lane_capacity{reading="memory limit",source="unmeasured"} 1"#
+            ),
+            "{rendered}"
+        );
+
+        {
+            let mut cost = lane.cost();
+            cost.observe(gib / 2, 0);
+            cost.record(
+                BuildSample {
+                    peak_bytes: Some(4 * gib),
+                    target_bytes: Some(gib),
+                    wall: std::time::Duration::from_secs(60),
+                    beside: 1,
+                },
+                BuildEnd::Completed,
+            );
+        }
+        let facts = CgroupFacts {
+            limit_bytes: Some(8 * gib),
+            ..Default::default()
+        };
+        let measured = lane.plan_with(&facts, Some(100 * gib));
+        assert_eq!(measured.lanes, 1);
+        assert_eq!(measured.source, LaneSource::Measured("memory"));
+        let rendered = commands.render();
+        assert!(
+            rendered
+                .contains(r#"sandbox_build_lane_capacity{reading="memory",source="measured"} 1"#),
+            "{rendered}"
+        );
+        // 两个来源不会同时挂着：一条是「此刻」的答案，不是另一条的补充。
+        assert!(!rendered.contains("unmeasured"), "{rendered}");
+
+        // 同样的容器、更便宜的一条编译：同一次算术给出 6 条，而不是停在 1。
+        // （另一条队而不是往同一个窗口里再记一条：代价取的是窗口里的最大值，
+        // 例如一条 4 GiB 的编译还在窗口里时，新记一条小的不会把价格压下来。）
+        let cheaper = BuildLane::new(None, Arc::clone(&commands));
+        {
+            let mut cost = cheaper.cost();
+            cost.observe(gib / 2, 0);
+            cost.record(
+                BuildSample {
+                    peak_bytes: Some(gib),
+                    target_bytes: Some(gib),
+                    wall: std::time::Duration::from_secs(60),
+                    beside: 1,
+                },
+                BuildEnd::Completed,
+            );
+        }
+        assert_eq!(cheaper.plan_with(&facts, Some(100 * gib)).lanes, 6);
+    }
+
+    /// 一条编译放下位子时就被记了价：它的 target 目录有多大、它占了多久。
+    /// 这两个数就是下一条位子的价格，没有它们，条数永远不会离开 1。
+    #[test]
+    fn a_finished_build_is_priced_when_it_releases_its_lane() {
+        let commands = Arc::new(CommandMetrics::new());
+        let lane = BuildLane::new(Some(1), Arc::clone(&commands));
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("artifact"), vec![0u8; 123]).expect("write");
+        let slot = BuildSlot {
+            lane: Arc::clone(&lane),
+            ticket: 0,
+            index: 0,
+            since: std::time::Instant::now(),
+            started: CgroupFacts::default(),
+            target: std::sync::Mutex::new(None),
+        };
+        slot.note_target(dir.path().to_path_buf());
+        drop(slot);
+
+        let cost = lane.cost();
+        assert_eq!(cost.target_bytes(), Some(123));
+        assert_eq!(cost.walls().count(), 1, "这条编译的墙钟记了一次");
     }
 
     fn state_with_build_slots(n: usize) -> AppState {
@@ -1940,7 +2273,7 @@ mod tests {
         AppState {
             workdir: None,
             hostdocs: None,
-            build_lane: BuildLane::new(n, Arc::clone(&commands)),
+            build_lane: BuildLane::new(Some(n), Arc::clone(&commands)),
             commands,
             queue_waits: Arc::new(BuildQueueWindow::new()),
         }
@@ -2127,7 +2460,7 @@ mod tests {
     #[tokio::test]
     async fn the_lane_turns_by_agent_not_by_arrival() {
         let commands = Arc::new(CommandMetrics::new());
-        let lane = BuildLane::new(1, Arc::clone(&commands));
+        let lane = BuildLane::new(Some(1), Arc::clone(&commands));
         let held = lane
             .acquire(Some("a"), "run_command", None)
             .await
@@ -2266,7 +2599,7 @@ mod tests {
     #[tokio::test]
     async fn ten_builds_from_one_agent_do_not_bury_the_other() {
         let commands = Arc::new(CommandMetrics::new());
-        let lane = BuildLane::new(1, Arc::clone(&commands));
+        let lane = BuildLane::new(Some(1), Arc::clone(&commands));
         let held = lane
             .acquire(Some("a"), "run_command", None)
             .await
