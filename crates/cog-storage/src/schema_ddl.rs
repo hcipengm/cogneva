@@ -525,6 +525,16 @@ enum Check {
         table: String,
         column: String,
     },
+    /// `ALTER TABLE … ALTER COLUMN … TYPE <type>`: the statement is done when
+    /// the column already holds that type. A store reaching this shape is one
+    /// moving a column off `jsonb` onto `text` -- the conversion the storage
+    /// end state asks for -- and on the second start the `USING` clause has
+    /// nothing left to convert.
+    ColumnHasType {
+        table: String,
+        column: String,
+        ty: String,
+    },
 }
 
 /// The checks a schema text reduces to, or `None` when it holds anything this
@@ -614,6 +624,15 @@ fn classify(statement: &str) -> Option<Check> {
                 }
                 if word(6) == Some("drop") && word(7) == Some("default") {
                     return Some(Check::ColumnHasNoDefault { table, column });
+                }
+                if word(6) == Some("type") {
+                    // Only a bare type word: `varchar(64)` or an array is a
+                    // name this cannot hand the catalog, and those stay run.
+                    return Some(Check::ColumnHasType {
+                        table,
+                        column,
+                        ty: name(7)?,
+                    });
                 }
             }
             None
@@ -776,6 +795,7 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
     let mut must_be_not_null: Vec<(String, String)> = Vec::new();
     let mut must_be_nullable: Vec<(String, String)> = Vec::new();
     let mut must_have_no_default: Vec<(String, String)> = Vec::new();
+    let mut must_have_type: Vec<(String, String, String)> = Vec::new();
     for check in checks {
         match check {
             Check::ColumnExists { table, column } => wanted.push((table.clone(), column.clone())),
@@ -791,6 +811,10 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
                 wanted.push((table.clone(), column.clone()));
                 must_have_no_default.push((table.clone(), column.clone()));
             }
+            Check::ColumnHasType { table, column, ty } => {
+                wanted.push((table.clone(), column.clone()));
+                must_have_type.push((table.clone(), column.clone(), ty.clone()));
+            }
             _ => {}
         }
     }
@@ -800,8 +824,13 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
         // row rather than reads that could disagree.
         let tables: Vec<String> = wanted.iter().map(|(table, _)| table.clone()).collect();
         let columns: Vec<String> = wanted.iter().map(|(_, column)| column.clone()).collect();
-        let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
-            "SELECT c.relname, a.attname, a.attnotnull, a.atthasdef
+        // `format_type` is asked for in the same row as the other three
+        // answers: a type read from a second query could disagree with the
+        // nullability read here, and this guard's whole job is to be right
+        // about "already done".
+        let rows: Vec<(String, String, bool, bool, String)> = sqlx::query_as(
+            "SELECT c.relname, a.attname, a.attnotnull, a.atthasdef,
+                    format_type(a.atttypid, a.atttypmod)
                FROM unnest($1::text[], $2::text[]) AS want(tbl, col)
                JOIN pg_class c ON c.relname = want.tbl
                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = current_schema()
@@ -818,11 +847,22 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
         }
         let field = |table: &String, column: &String| {
             rows.iter()
-                .find(|(found_table, found_column, _, _)| {
+                .find(|(found_table, found_column, _, _, _)| {
                     found_table == table && found_column == column
                 })
-                .map(|(_, _, not_null, has_default)| (*not_null, *has_default))
+                .map(|(_, _, not_null, has_default, _)| (*not_null, *has_default))
         };
+        for (table, column, ty) in &must_have_type {
+            let found = rows
+                .iter()
+                .find(|(found_table, found_column, _, _, _)| {
+                    found_table == table && found_column == column
+                })
+                .map(|(_, _, _, _, found_type)| found_type.to_ascii_lowercase());
+            if found.as_deref() != Some(ty.as_str()) {
+                return Ok(false);
+            }
+        }
         for (table, column) in &must_be_not_null {
             if field(table, column).is_none_or(|(not_null, _)| !not_null) {
                 return Ok(false);
@@ -1007,6 +1047,16 @@ mod tests {
                 column: "seen".into()
             })
         );
+        // 把一列从 jsonb 搬到 text 是存储终态要求的那一步，而它的第二句在第二次
+        // 启动时已经没有东西可搬：列已经是 text。
+        assert_eq!(
+            read("ALTER TABLE entries ALTER COLUMN seen TYPE TEXT USING seen::text"),
+            Some(Check::ColumnHasType {
+                table: "entries".into(),
+                column: "seen".into(),
+                ty: "text".into()
+            })
+        );
     }
 
     /// Everything else makes the whole text run. The cases here are the ones
@@ -1028,6 +1078,8 @@ mod tests {
             // Not a shape this knows at all.
             "DROP TABLE IF EXISTS entries",
             "ALTER TABLE entries DROP COLUMN IF EXISTS seen",
+            // A type name the catalog would not answer with verbatim.
+            "ALTER TABLE entries ALTER COLUMN seen TYPE varchar(64)",
         ] {
             assert_eq!(
                 classify(statement),

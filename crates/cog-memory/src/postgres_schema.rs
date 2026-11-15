@@ -48,7 +48,10 @@ CREATE TABLE IF NOT EXISTS schema_entries (
     name              TEXT        NOT NULL,
     key               TEXT        NOT NULL,
     -- 开集载荷存 text：它整块写、整块读，没有被按名索引进去的形状。
-    properties        TEXT        NOT NULL DEFAULT '{}',
+    -- 没有默认值：两台机器（新装的与升上来的）形状要一样，而 `SET DEFAULT` 是
+    -- 一条从目录里答不出来的语句——它会被每一次启动重发，每发一次取一次
+    -- ACCESS EXCLUSIVE。写这一列的两条语句都带值。
+    properties        TEXT        NOT NULL,
     -- 三个按键读的键升成列。关系查询按值筛这三格，索引也在这三格上。
     rel_from          TEXT,
     rel_to            TEXT,
@@ -80,7 +83,6 @@ ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS rel_to TEXT;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS rel_relation_type TEXT;
 ALTER TABLE schema_entries ALTER COLUMN properties DROP DEFAULT;
 ALTER TABLE schema_entries ALTER COLUMN properties TYPE TEXT USING properties::text;
-ALTER TABLE schema_entries ALTER COLUMN properties SET DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_schema_entries_rel_from ON schema_entries(namespace, rel_from);
 CREATE INDEX IF NOT EXISTS idx_schema_entries_rel_to   ON schema_entries(namespace, rel_to);
 "#;

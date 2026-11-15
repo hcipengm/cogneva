@@ -461,7 +461,9 @@ pub fn postgres_table_ddl(table: &str) -> String {
             session_id VARCHAR(64),
             task_id VARCHAR(64),
             agent_id VARCHAR(64),
-            properties TEXT NOT NULL DEFAULT '{{}}',
+            -- 没有默认值：见 `ALTER` 那一句，写下默认值是一条从目录里答不出来的
+            -- 语句，每一次启动都会重发并取一次锁。写这一列的语句带着值。
+            properties TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_{table}_type_time ON {table}(event_type, timestamp DESC);
@@ -471,7 +473,6 @@ pub fn postgres_table_ddl(table: &str) -> String {
         -- 两条语句一起保证：新建的是 text，早就建好的也变成 text。
         ALTER TABLE {table} ALTER COLUMN properties DROP DEFAULT;
         ALTER TABLE {table} ALTER COLUMN properties TYPE TEXT USING properties::text;
-        ALTER TABLE {table} ALTER COLUMN properties SET DEFAULT '{{}}';
         "#
     )
 }
