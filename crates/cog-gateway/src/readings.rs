@@ -885,7 +885,103 @@ pub const TIER_MIGRATIONS: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-storage/src/plugin.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 41] = [
+/// Where the pool currently sits in its rotation.
+///
+/// Position is how far down the candidate list the pool has walked; a position
+/// that stays high while health is fine says the earlier upstreams are being
+/// skipped for a reason nobody has written down.
+pub const LLM_UPSTREAM_POSITION: ReadingSpec = ReadingSpec {
+    id: "llm_upstream_position",
+    title: "上游在轮换里的位置",
+    group: ReadingGroup::Delivery,
+    query: "max(llm_upstream_position)",
+    unit: "位",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "llm_upstream_position",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+/// How long the quota window is, as the pace measured it.
+///
+/// The window is what every token bound is a fraction of: a window that shrinks
+/// makes the same spend look like an overspend, and a window nobody measured
+/// reads as zero, which is the state that turns "nobody paced" into "the budget
+/// is spent". Both the pool's and the upstream's own declaration are read here
+/// because a pool that reports one and an upstream that reports another is a
+/// disagreement the operator has to settle.
+pub const LLM_QUOTA_WINDOW: ReadingSpec = ReadingSpec {
+    id: "llm_quota_window_seconds",
+    title: "配额窗口长度",
+    group: ReadingGroup::Delivery,
+    query: "max(llm_pool_quota_window_secs or llm_upstream_quota_window_secs)",
+    unit: "秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "llm_pool_quota_window_secs / llm_upstream_quota_window_secs",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+/// When an upstream said it would be back, as an age.
+///
+/// An upstream that reports its own recovery instant is telling us something no
+/// probe can: the wait is not ours to guess. An age that runs past it means the
+/// upstream said it was back and the pool has not tried again.
+pub const LLM_EVIDENCED_RECOVERY: ReadingSpec = ReadingSpec {
+    id: "llm_evidenced_recovery_age_seconds",
+    title: "上游自报的恢复时刻（距今）",
+    group: ReadingGroup::Delivery,
+    query: "time() - max(llm_pool_evidenced_recovery_unix)",
+    unit: "秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "llm_pool_evidenced_recovery_unix",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+/// How long the newest reserve entry has been sitting there.
+///
+/// A reserve that was filled once and never again looks the same as a full one
+/// from the population alone; the age says which. Beyond a window it is a
+/// reserve nobody is refreshing, which is a pool that cannot absorb a failure.
+pub const LLM_RESERVE_AGE: ReadingSpec = ReadingSpec {
+    id: "llm_reserve_age_seconds",
+    title: "储备上游存在的时长",
+    group: ReadingGroup::Delivery,
+    query: "time() - max(llm_pool_reserve_since_unix)",
+    unit: "秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "llm_pool_reserve_since_unix",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+/// Upstream answers whose shape the pool could not read, and parameters it had
+/// to clamp before sending.
+///
+/// Both are the pool meeting a contract it does not fully match: a shape error
+/// is an upstream answering something the parser did not expect, a clamp is our
+/// own request corrected before it left. Either rate climbing is the pool and
+/// an upstream disagreeing, which no health count shows because the call
+/// eventually answers.
+pub const LLM_CONTRACT_MISMATCH: ReadingSpec = ReadingSpec {
+    id: "llm_contract_mismatch",
+    title: "上游响应形态错误与参数夹紧",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(llm_upstream_shape_errored[24h])) + sum(increase(llm_request_param_clamped_total[24h]))",
+    unit: "次",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "llm_upstream_shape_errored / llm_request_param_clamped_total",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 46] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -927,6 +1023,11 @@ pub const READINGS: [&ReadingSpec; 41] = [
     &BOARD_COLUMN_HELD,
     &EVAL_GATE_OUTCOMES,
     &TIER_MIGRATIONS,
+    &LLM_UPSTREAM_POSITION,
+    &LLM_QUOTA_WINDOW,
+    &LLM_EVIDENCED_RECOVERY,
+    &LLM_RESERVE_AGE,
+    &LLM_CONTRACT_MISMATCH,
 ];
 
 /// The word a reading carries about its own value.
