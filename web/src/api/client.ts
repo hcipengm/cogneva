@@ -4095,3 +4095,21 @@ export async function downloadBackupPackage(name: string): Promise<void> {
   // 拿到一个已经失效的 URL，表现是「下载了 0 字节」。
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
+
+/** 知识面的文档列表。这一面此前只有接口没有入口，界面看不到它。 */
+export async function listWikiDocuments(params: { limit?: number } = {}): Promise<{
+  documents: { id: string; path: string; title: string; kind?: string }[];
+}> {
+  const suffix = params.limit ? `?limit=${params.limit}` : '';
+  return api.get(`/api/v1/wiki${suffix}`);
+}
+
+/** 一份文档的正文，按相对路径取。 */
+export async function getWikiDocument(path: string): Promise<{
+  id: string;
+  path: string;
+  title: string;
+  content: string;
+}> {
+  return api.get(`/api/v1/wiki/document?path=${encodeURIComponent(path)}`);
+}

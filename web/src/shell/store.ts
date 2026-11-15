@@ -10,6 +10,7 @@ import { create } from 'zustand';
 
 /** 左栏的活动项。每一项对应侧栏里的一个面板，与编辑器里的页不是一回事。 */
 export type ActivityId =
+  | 'wiki'
   | 'workspace'
   | 'people'
   | 'venues'
@@ -60,6 +61,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   token: 'Token',
   resources: '资源',
   storage: '存储',
+  wiki: '知识',
   eval: '评测',
   timeline: '时间轴',
   delivery: '构建与部署',

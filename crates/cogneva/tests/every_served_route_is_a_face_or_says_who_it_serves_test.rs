@@ -69,7 +69,6 @@ const NOT_A_FACE: &[(&str, &str)] = &[
 /// person cannot reach. Recording one here is a decision with a number, not a
 /// pass — the ceiling only comes down, and a new one has to say why.
 const NO_FACE_YET: &[(&str, &str)] = &[
-    ("wiki", "知识面的读写接口齐了，WebUI 上还没有它的面"),
     ("knowledge", "检索接口在，页面走的是别的搜索框"),
     ("hooks", "钩子的增删查在，界面上只有状态展示、没有编辑面"),
     ("datasets", "数据集列表与校验在，界面上没有入口"),
@@ -85,11 +84,10 @@ const NO_FACE_YET: &[(&str, &str)] = &[
     ("raw_logs", "原始日志接口在，日志板读的是另一条流"),
     ("dlq", "死信重投在，界面上没有入口"),
     ("search", "搜索接口在，页面走的是 knowledge/search"),
-    ("files", "文件上传与下载在，界面上没有入口"),
 ];
 
 /// How many prefixes are served with no reader anywhere (measured 2026-11-15).
-const NO_FACE_AT_CENSUS: usize = 14;
+const NO_FACE_AT_CENSUS: usize = 12;
 
 /// The first path segment of a route shape, or `None` when the route is not
 /// under a `/api/` or `/v1/` style root.
@@ -220,6 +218,19 @@ fn every_served_route_is_a_face_or_says_who_it_serves() {
         NO_FACE_AT_CENSUS,
         "没有面的前缀数变了（现在 {} 条，常数 {NO_FACE_AT_CENSUS}）。多一条要说明为什么这个能力只能停在 API 上；少一条这个数跟着降",
         NO_FACE_YET.len()
+    );
+
+    // 表里每一行还得**真的没人读**：单向检查（只问「路由还在不在」）会让补齐了
+    // 界面的行永远留在表里，于是这张表从「欠账」变成「一份过时的自述」。
+    // 实测过：`raw_logs` 与 `files` 都已经有了界面读者，却还挂在表上。
+    let now_read: Vec<&str> = NO_FACE_YET
+        .iter()
+        .map(|(prefix, _)| *prefix)
+        .filter(|prefix| client.contains(*prefix))
+        .collect();
+    assert!(
+        now_read.is_empty(),
+        "这些前缀已经有界面读者了，不能再算「没有入口」——把行删掉：{now_read:?}"
     );
 
     // 表里每一行都得还被路由服务着：一条指向已经不存在的路由的登记，是替

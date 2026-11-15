@@ -37,6 +37,7 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'token', label: 'Token', icon: 'token' },
   { id: 'resources', label: '资源', icon: 'resources' },
   { id: 'storage', label: '存储', icon: 'storage' },
+  { id: 'wiki', label: '知识', icon: 'wiki' },
   { id: 'eval', label: '评测', icon: 'eval' },
   { id: 'timeline', label: '时间轴', icon: 'timeline' },
   { id: 'delivery', label: '构建与部署', icon: 'delivery' },

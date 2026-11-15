@@ -11,6 +11,7 @@ import { FlowView } from '@/views/FlowView';
 import { GovernanceView } from '@/views/GovernanceView';
 import { InboxView } from '@/views/InboxView';
 import { ObservabilityView } from '@/views/ObservabilityView';
+import { WikiView } from '@/views/WikiView';
 import { OutputView } from '@/views/OutputView';
 import { ProgressView } from '@/views/ProgressView';
 import { PeopleView } from '@/views/PeopleView';
@@ -77,6 +78,8 @@ export function ViewFor({ view }: { view: string }) {
       return <CapabilitiesView />;
     case 'output':
       return <OutputView />;
+    case 'wiki':
+      return <WikiView />;
     case 'observability':
       return <ObservabilityView />;
     case 'token':
