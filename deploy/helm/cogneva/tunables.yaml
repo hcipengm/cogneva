@@ -1,5 +1,11 @@
 # The tunable registry: one row per numeric leaf `values.yaml` carries.
-# debt: 247 行手写分类被 tunable_registry_contract_test 读成判词；终态是 chart 与 Rust 常量两处都搬进平台声明，仓里只留机器写的投影; expires: 2027-03-31
+#
+# This table is red under `deploy/scripts/check-judgment-inputs.py` until the
+# classification stops being written here: a key is derived exactly when a
+# behaviour test connects its input to its reading, and fixed exactly when its
+# value equals the platform default. There is no debt header and no expiry date
+# -- the red is the contract saying this hand-written table should not exist,
+# not a countdown that a new date could renew.
 #
 # The Rust half of the same account lives on the constants themselves, as a
 # `// cap: bound` or `// cap: fixed` line in the comment block above each one,
