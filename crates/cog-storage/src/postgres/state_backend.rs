@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS cog_events (
                 id SERIAL PRIMARY KEY,
                 task_id TEXT NOT NULL,
                 event_type TEXT NOT NULL,
-                payload JSONB NOT NULL,
+                payload TEXT  NOT NULL,
                 offset_num BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
@@ -149,7 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_cog_context_boards_field_value
 ;
 CREATE TABLE IF NOT EXISTS cog_dag_state (
                 workspace_id TEXT PRIMARY KEY,
-                state JSONB NOT NULL,
+                state TEXT  NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
 ;
@@ -846,7 +846,7 @@ impl StateBackend for PostgresStateBackend {
     }
 
     async fn append_event(&self, task_id: &str, event: &Event) -> SFResult<u64> {
-        let payload = serde_json::to_value(event)?;
+        let payload = serde_json::to_string(event)?;
         let event_type = event.event_type.clone();
 
         // The next position is one past the last the task holds, and a task's
@@ -894,7 +894,7 @@ impl StateBackend for PostgresStateBackend {
     }
 
     async fn get_events(&self, task_id: &str, offset: u64, limit: usize) -> SFResult<Vec<Event>> {
-        let rows: Vec<(String, serde_json::Value, i64, chrono::DateTime<Utc>)> = self
+        let rows: Vec<(String, String, i64, chrono::DateTime<Utc>)> = self
             .retry(|| async {
                 sqlx::query_as(EVENTS_PAGE_SQL)
                     .bind(task_id)
@@ -924,9 +924,12 @@ impl StateBackend for PostgresStateBackend {
             // rather than as NULL, because appending is the only way this column
             // is ever written -- such a row is a defect elsewhere, not a shape
             // for this read to invent.
-            let payload = match payload.get("payload") {
+            // 列存的是 text：先解析回信封，再取它自己的载荷。
+            let envelope: serde_json::Value =
+                serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+            let payload = match envelope.get("payload") {
                 Some(inner) => inner.clone(),
-                None => payload,
+                None => envelope,
             };
             events.push(Event {
                 offset: offset_num as u64,
@@ -1031,7 +1034,7 @@ impl StateBackend for PostgresStateBackend {
                 "#,
             )
             .bind(workspace_id)
-            .bind(state.clone())
+            .bind(state.to_string())
             .execute(&self.pool)
             .await
         })
@@ -1040,7 +1043,7 @@ impl StateBackend for PostgresStateBackend {
     }
 
     async fn load_dag_state(&self, workspace_id: &str) -> SFResult<Option<serde_json::Value>> {
-        let row: Option<(serde_json::Value,)> = self
+        let row: Option<(String,)> = self
             .retry(|| async {
                 sqlx::query_as("SELECT state FROM cog_dag_state WHERE workspace_id = $1")
                     .bind(workspace_id)
@@ -1049,7 +1052,7 @@ impl StateBackend for PostgresStateBackend {
             })
             .await?;
 
-        Ok(row.map(|r| r.0))
+        Ok(row.map(|r| serde_json::from_str::<serde_json::Value>(&r.0).unwrap_or_default()))
     }
 
     fn dag_supports_fine_grained(&self) -> bool {

@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS cog_observability_events (
     task_id     TEXT,
     crew_id     TEXT,
     squad_id    TEXT,
-    payload     JSONB       NOT NULL,
+    payload     TEXT        NOT NULL,
     timestamp   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_cog_obs_events_agent_id  ON cog_observability_events(agent_id);
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS cog_observability_logs (
     level       TEXT        NOT NULL,
     source      TEXT        NOT NULL,
     message     TEXT        NOT NULL,
-    metadata    JSONB       NOT NULL DEFAULT '{}'
+    metadata    TEXT        NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_cog_obs_logs_task_id     ON cog_observability_logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_cog_obs_logs_timestamp   ON cog_observability_logs(timestamp);
@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS cog_observability_squads (
     squad_id        TEXT PRIMARY KEY,
     task_id         TEXT        NOT NULL,
     status          TEXT        NOT NULL,
-    agents          JSONB       NOT NULL,
+    agents          TEXT        NOT NULL,
     completion_pct  REAL        NOT NULL,
     retry_count     INTEGER     NOT NULL,
     snapshot_id     TEXT,
@@ -289,7 +289,7 @@ impl PostgresObservabilityGateway {
         .bind(&entry.level)
         .bind(&entry.source)
         .bind(&entry.message)
-        .bind(&entry.metadata)
+        .bind(entry.metadata.to_string())
         .execute(&self.pool)
         .await
         .map_err(|e| SFError::Database(format!("record_log failed: {}", e)))?;
@@ -418,7 +418,7 @@ impl PostgresObservabilityGateway {
         .bind(squad_id)
         .bind(&state.task_id)
         .bind(squad_status_str(state.status))
-        .bind(serde_json::to_value(&state.agents).map_err(SFError::Serialization)?)
+        .bind(serde_json::to_string(&state.agents).map_err(SFError::Serialization)?)
         .bind(state.completion_pct)
         .bind(state.retry_count as i32)
         .bind(&state.snapshot_id)
@@ -452,7 +452,7 @@ impl PostgresObservabilityGateway {
         for event in events {
             let (event_type, agent_id, task_id, crew_id, squad_id, timestamp) =
                 extract_event_meta(event);
-            let payload = serde_json::to_value(event).map_err(SFError::Serialization)?;
+            let payload = serde_json::to_string(event).map_err(SFError::Serialization)?;
             rows.push((
                 event_type, agent_id, task_id, crew_id, squad_id, payload, timestamp,
             ));
@@ -496,7 +496,7 @@ impl PostgresObservabilityGateway {
                 - Duration::seconds(crate::observability_event_cap::DEFAULT_READ_WINDOW_SECS as i64)
         });
 
-        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+        let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT payload FROM cog_observability_events WHERE timestamp >= $1 ORDER BY timestamp ASC LIMIT 10000",
         )
         .bind(since)
@@ -506,7 +506,7 @@ impl PostgresObservabilityGateway {
 
         let mut events = Vec::with_capacity(rows.len());
         for (payload,) in rows {
-            match serde_json::from_value::<AgentEvent>(payload) {
+            match serde_json::from_str::<AgentEvent>(&payload) {
                 Ok(ev) => {
                     if crate::event_filter::event_matches(filter, &ev) {
                         events.push(ev);
@@ -617,7 +617,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     }
 
     async fn get_task_logs(&self, task_id: &str, limit: usize) -> SFResult<Vec<LogEntry>> {
-        let rows: Vec<(DateTime<Utc>, String, String, String, serde_json::Value)> = sqlx::query_as(
+        let rows: Vec<(DateTime<Utc>, String, String, String, String)> = sqlx::query_as(
             r#"
             SELECT timestamp, level, source, message, metadata
             FROM cog_observability_logs
@@ -639,7 +639,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
                 level,
                 source,
                 message,
-                metadata,
+                metadata: serde_json::from_str(&metadata).unwrap_or_default(),
             });
         }
         logs.reverse();
@@ -752,7 +752,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     }
 
     async fn get_squad_state(&self, squad_id: &str) -> SFResult<SquadState> {
-        let row: Option<(String, String, serde_json::Value, f32, i32, Option<String>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+        let row: Option<(String, String, String, f32, i32, Option<String>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
             "SELECT task_id, status, agents, completion_pct, retry_count, snapshot_id, created_at, updated_at
              FROM cog_observability_squads WHERE squad_id = $1",
         )
@@ -773,7 +773,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
                 updated_at,
             )) => {
                 let agents: Vec<cog_core::AgentSummary> =
-                    serde_json::from_value(agents_json).map_err(SFError::Serialization)?;
+                    serde_json::from_str(&agents_json).map_err(SFError::Serialization)?;
                 Ok(SquadState {
                     squad_id: squad_id.into(),
                     task_id,
