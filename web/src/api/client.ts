@@ -4113,3 +4113,26 @@ export async function getWikiDocument(path: string): Promise<{
 }> {
   return api.get(`/api/v1/wiki/document?path=${encodeURIComponent(path)}`);
 }
+
+/** 任务的快照列表：每条是事件流上的一个可回来的点。 */
+export async function listSnapshots(params: { limit?: number } = {}): Promise<{
+  snapshots: { snapshot_id: string; task_id: string; event_offset: number; timestamp: string }[];
+}> {
+  const suffix = params.limit ? `?limit=${params.limit}` : '';
+  return api.get(`/api/v1/snapshots${suffix}`);
+}
+
+/** 按路径原样读一份 JSON。给「有接口没入口」的面用：它不解释结构，只把读到的东西列出来。 */
+export async function getJson(path: string): Promise<unknown> {
+  return api.get(path);
+}
+
+/** 知识检索：跨库按语义找。此前只有接口，界面上没有入口。 */
+export async function searchKnowledge(query: string, limit = 20): Promise<unknown> {
+  return api.post('/api/v1/knowledge/search', { query, limit });
+}
+
+/** 平台搜索：把一次查询同时问向几个面。 */
+export async function searchPlatform(query: string, limit = 20): Promise<unknown> {
+  return api.post('/api/v1/search', { query, limit });
+}

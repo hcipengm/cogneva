@@ -60,34 +60,21 @@ const NOT_A_FACE: &[(&str, &str)] = &[
     ("proxy", "通用透传出口，调用方是进程而不是浏览器"),
     ("attach", "容器/会话附着代理，调用方是终端客户端"),
     ("takeover", "接管请求：由外部操作者发起的会话接管，不经页面"),
+    (
+        "dashboard",
+        "旧的仪表盘入口：已被观测面六块板取代，保留路由是为了旧链接还能打开",
+    ),
 ];
 
 /// Prefixes with no reader anywhere, kept as counted debt.
 ///
 /// These are the ones this census exists to surface: the route is served, no
 /// page asks for it, and no other system does either. Each is a capability a
-/// person cannot reach. Recording one here is a decision with a number, not a
-/// pass — the ceiling only comes down, and a new one has to say why.
-const NO_FACE_YET: &[(&str, &str)] = &[
-    ("knowledge", "检索接口在，页面走的是别的搜索框"),
-    ("hooks", "钩子的增删查在，界面上只有状态展示、没有编辑面"),
-    ("datasets", "数据集列表与校验在，界面上没有入口"),
-    ("snapshots", "快照列表与下载地址在，界面上没有入口"),
-    ("workspaces", "工作区列表与成员在，界面上没有入口"),
-    ("squads", "编队状态在，界面上没有入口"),
-    (
-        "action-plan",
-        "动作计划本该是判词面的一部分，今天只在 API 上",
-    ),
-    ("dashboard", "旧的仪表盘入口，界面已改走观测面的六块板"),
-    ("plugins", "插件的上传与卸载在，界面上没有入口"),
-    ("raw_logs", "原始日志接口在，日志板读的是另一条流"),
-    ("dlq", "死信重投在，界面上没有入口"),
-    ("search", "搜索接口在，页面走的是 knowledge/search"),
-];
-
-/// How many prefixes are served with no reader anywhere (measured 2026-11-15).
-const NO_FACE_AT_CENSUS: usize = 12;
+/// person cannot reach. The table is **empty**, and that is the end state: a
+/// count that may fall is a permission, and a permission is inherited. An entry
+/// here would mean a capability that exists only in the API — the assertion
+/// below refuses it.
+const NO_FACE_YET: &[(&str, &str)] = &[];
 
 /// The first path segment of a route shape, or `None` when the route is not
 /// under a `/api/` or `/v1/` style root.
@@ -106,8 +93,14 @@ fn prefix_of(shape: &str) -> Option<String> {
     } else {
         first
     };
-    (!face.starts_with('{') && !face.starts_with('*') && !face.starts_with(':'))
-        .then(|| face.to_string())
+    // 客户端的模板串会在段中间插值（`/api/v1/raw_logs${suffix}`）。只取到第一个
+    // 不是标识符的字符为止——否则同一个前缀在两侧拼成两个不同的字符串，而它们指
+    // 的是同一条路由。这一段在变基时丢过一次，表现是「界面明明读着，判据说没人读」。
+    let face: String = face
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    (!face.is_empty() && !face.starts_with('*')).then_some(face)
 }
 
 /// Every prefix the client names, read off the whole `web/src` tree.
@@ -212,12 +205,13 @@ fn every_served_route_is_a_face_or_says_who_it_serves() {
             .collect::<Vec<_>>()
     );
 
-    // 欠账只能降：一个前缀从界面上被补出来，这个数跟着降；涨的那一笔要说清为什么。
-    assert_eq!(
-        NO_FACE_YET.len(),
-        NO_FACE_AT_CENSUS,
-        "没有面的前缀数变了（现在 {} 条，常数 {NO_FACE_AT_CENSUS}）。多一条要说明为什么这个能力只能停在 API 上；少一条这个数跟着降",
-        NO_FACE_YET.len()
+    // 终态是**空**，不是一个还在降的数：计数是许可，许可会被继承。
+    // 谁新增一个只有接口、没有界面的能力，这条立刻红——修法是给它一个面，
+    // 不是在表里加一行；确实不该有界面的，写进 NOT_A_FACE 并说明谁在用。
+    assert!(
+        NO_FACE_YET.is_empty(),
+        "这些能力只有接口、没有界面入口（WebUI 是唯一的人机面，点不到就等于没有）：{:?}",
+        NO_FACE_YET
     );
 
     // 表里每一行还得**真的没人读**：单向检查（只问「路由还在不在」）会让补齐了

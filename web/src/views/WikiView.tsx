@@ -8,6 +8,8 @@ import { Empty, Loading, ReadError, Table, ViewFrame } from '@/ui/primitives';
  *
  * 这一面在此之前只有接口、没有入口——能力在 API 上存在，人却看不到，等于不存在。
  * 它读的两条路径（列表与正文）由网关的 wiki 路由提供，与草拟、检索共用同一份存储。
+ * 画面：这一面的内容就是文档本身——标题、类型、正文。读者要读的是字，把正文排成条形图没有意义；列表的排序已经按更新时间给出。
+ *
  */
 export function WikiView() {
   const page = useResource('知识文档', () => listWikiDocuments({ limit: 100 }), 60_000);

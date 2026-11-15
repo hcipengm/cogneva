@@ -10,6 +10,15 @@ import { create } from 'zustand';
 
 /** 左栏的活动项。每一项对应侧栏里的一个面板，与编辑器里的页不是一回事。 */
 export type ActivityId =
+  | 'search'
+  | 'hooks'
+  | 'plugins'
+  | 'dlq'
+  | 'workspaces'
+  | 'squads'
+  | 'action-plan'
+  | 'datasets'
+  | 'snapshots'
   | 'wiki'
   | 'workspace'
   | 'people'
@@ -61,6 +70,15 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   token: 'Token',
   resources: '资源',
   storage: '存储',
+  search: '搜索',
+  hooks: '钩子',
+  plugins: '插件',
+  dlq: '死信',
+  workspaces: '工作区',
+  squads: '编队',
+  'action-plan': '动作计划',
+  datasets: '数据集',
+  snapshots: '快照',
   wiki: '知识',
   eval: '评测',
   timeline: '时间轴',
