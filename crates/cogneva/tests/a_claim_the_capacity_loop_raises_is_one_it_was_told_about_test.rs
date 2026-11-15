@@ -212,6 +212,55 @@ fn claim_of_volume(pod_spec: &serde_yaml::Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Volume name → (the claim that volume is at runtime, how a declaration spells
+/// that claim) for the claims a StatefulSet creates from `volumeClaimTemplates`.
+///
+/// A template claim has no pod-level `volumes` entry: the controller injects one
+/// per replica, named `<template>-<workload>-<ordinal>`. A manifest spelling that
+/// name cannot know the ordinal, so it writes `$(POD_NAME)` for the pod part —
+/// that substitution is the kubelet's, not a wildcard this test grants. Leaving
+/// these out would not fail anything: every template mount would find no volume
+/// and be skipped, which reads as "this pod declares nothing to raise".
+fn claim_templates_of_workload(workload: &serde_yaml::Value) -> Vec<(String, String, String)> {
+    let workload_name = workload
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("<unnamed>");
+    let Some(spec) = workload.get("spec") else {
+        return Vec::new();
+    };
+    let replicas = spec
+        .get("replicas")
+        .and_then(|r| r.as_u64())
+        .unwrap_or(1)
+        .max(1);
+    let Some(templates) = spec
+        .get("volumeClaimTemplates")
+        .and_then(|v| v.as_sequence())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for template in templates {
+        let Some(name) = template
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+        else {
+            continue;
+        };
+        for ordinal in 0..replicas {
+            out.push((
+                name.to_string(),
+                format!("{name}-{workload_name}-{ordinal}"),
+                format!("{name}-$(POD_NAME)"),
+            ));
+        }
+    }
+    out
+}
+
 fn container_name(container: &serde_yaml::Value) -> String {
     container
         .get("name")
@@ -258,7 +307,14 @@ fn every_claim_a_pod_mounts_is_one_its_mounts_variable_names() {
         }
         pods_judged += 1;
 
-        let volumes = claim_of_volume(pod_spec);
+        // 卷可以来自 Pod 里声明的 PVC，也可以来自 StatefulSet 的卷模板；后者的
+        // 运行期名字与声明里的写法不同（前者 `claim`，后者 `<模板>-$(POD_NAME)`），
+        // 所以两样一起带着走。
+        let mut volumes: Vec<(String, String, String)> = claim_of_volume(pod_spec)
+            .into_iter()
+            .map(|(volume, claim)| (volume, claim.clone(), claim))
+            .collect();
+        volumes.extend(claim_templates_of_workload(workload));
         for container in containers {
             let Some(mounts) = container.get("volumeMounts").and_then(|m| m.as_sequence()) else {
                 continue;
@@ -267,14 +323,15 @@ fn every_claim_a_pod_mounts_is_one_its_mounts_variable_names() {
                 let Some(volume) = mount.get("name").and_then(|n| n.as_str()) else {
                     continue;
                 };
-                let Some((_, claim)) = volumes.iter().find(|(v, _)| v == volume) else {
+                let Some((_, claim, spelling)) = volumes.iter().find(|(v, _, _)| v == volume)
+                else {
                     continue;
                 };
                 let Some(path) = mount.get("mountPath").and_then(|p| p.as_str()) else {
                     continue;
                 };
                 claims_judged += 1;
-                if !declared.contains(&(claim.clone(), path.to_string())) {
+                if !declared.contains(&(spelling.clone(), path.to_string())) {
                     complaints.push(format!(
                         "{name}/{} 挂着卷 {claim} 在 {path}，而 {MOUNTS_ENV} 里没有这一条：\
                          这条卷只被量、没有抬声明的人，涨到头来要靠人改 values",

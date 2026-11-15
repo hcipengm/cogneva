@@ -1,32 +1,16 @@
 {{- if .Values.sandboxExecutor.enabled }}
-# 沙箱执行器专属卷：执行器自有的裸仓库、每任务工作树与共享编译缓存都在这里，
-# 与进化侧卷物理分离，两边不共享工作树。
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: cogneva-sandbox-pvc
-  namespace: {{ include "cogneva.namespace" . }}
-  labels:
-    {{- include "cogneva.labels" . | nindent 4 }}
-    app.kubernetes.io/component: sandbox-executor
-  annotations:
-    # 卸载不销毁：工作树与裸仓库跨重装继续可用。
-    helm.sh/resource-policy: keep
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: {{ .Values.sandboxExecutor.storage }}
-  {{- with .Values.sandboxExecutor.storageClass }}
-  storageClassName: {{ . }}
-  {{- end }}
----
 # 沙箱执行器：主应用与进化 Pod 共用的零凭证工具执行面（run_command/read_file/
-# write_file）统一路由到本 Pod，命令与文件 IO 不发生在持有凭证的业务 Pod 内。
+# write_file）统一路由到执行器 Pod，命令与文件 IO 不发生在持有凭证的业务 Pod 内。
 # 不挂载任何 Secret、不自动挂载 ServiceAccount token——Pod 边界即隔离边界。
+#
+# **一副副本一块卷。** 工作树只长在某一副副本的卷上，所以「谁持有这棵树」以前靠
+# 「只有一个副本」保证，副本数因此写死 1。现在客户端按 agent 把一条 lane 钉在一副
+# 副本上（`cog-extension` 的 `executor_lease`），归属跟着 lane 走，副本数于是回到
+# 它本来该是的东西：部署里的一个数。每加一副，就多一块卷、一份内存界、一条编译队
+# ——扩的是容量，拓扑不变；每副副本自己从公开仓库 seed 裸仓，副本之间不共享状态，
+# 所以任何一副都能被删掉重来。
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: cogneva-sandbox-executor
   namespace: {{ include "cogneva.namespace" . }}
@@ -35,16 +19,15 @@ metadata:
     app.kubernetes.io/component: sandbox-executor
 spec:
   replicas: {{ .Values.sandboxExecutor.replicas }}
-  # No surge: every profile runs a single replica on a single node, so a surging
-  # pod has nowhere to be scheduled and the rollout times out. Terminating the
-  # old pod first frees its request, at the cost of a brief restart window.
-  strategy:
+  # 序号是身份：同一个序号的 Pod 重建后拿到同一块卷，那块卷上「哪棵树属于哪个
+  # 任务」因此跨重启仍然成立。DNS 由下面的无头 Service 给出，客户端按序号拼地址。
+  serviceName: cogneva-sandbox-executor-pods
+  # 并行起停：副本之间不共享任何状态，让 0 号就绪才起 1 号只会把扩容变成一条链。
+  podManagementPolicy: Parallel
+  # 一次换一副，旧 Pod 先走：StatefulSet 不会让同号的两份 Pod 并存，所以
+  # 「一块卷不会被两份 Pod 同时写」由对象本身保证，不靠策略参数凑。
+  updateStrategy:
     type: RollingUpdate
-    rollingUpdate:
-      {{- /* lit: 0 fixed — maxSurge 0: a sandbox pod holds a workspace and must not be doubled during a rollout */}}
-      maxSurge: 0
-      {{- /* lit: 1 fixed — maxUnavailable 1 with maxSurge 0: the rollout shape that keeps a sandbox pod from ever being doubled */}}
-      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: cogneva
@@ -101,6 +84,7 @@ spec:
                 # 自己那两条界判。
                 for m in $(echo "$mirrors" | tr ',' ' '); do
                   echo "sandbox volume empty; seeding bare repo from $m ..."
+                  {{- /* lit: 0 fixed — the shell's own success status: `rc=0` and `[ "$rc" = 0 ]` are how this seed script asks whether git exited cleanly, which no deployment configures */}}
                   rc=0
                   git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} clone --bare "$m" /tmp/seed.git || rc=$?
                   if [ "$rc" = 0 ]; then
@@ -155,6 +139,13 @@ spec:
               value: sandbox
             - name: SANDBOX_EXECUTOR_PORT
               value: {{ .Values.sandboxExecutor.metricsPort | int | quote }}
+            # 卷名是 `<模板名>-<StatefulSet 名>-<序号>`，序号只在本 Pod 里知道；
+            # 下面的 claim 变量靠 `$(POD_NAME)` 展开拼出自己那块。K8s 只展开
+            # **本列表里排在前面**的变量，所以这一条必须留在使用它的两条之前。
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             # 哪条网络策略管着这个 Pod 的出口。本轮进程读不到策略本体（那是 API
             # 服务器那边的事），能报的是**部署声明的是哪一条**：把名字说出来，
             # 对话里的边界面板就能把「部署声明」与「这一层管住」分成两句话，而审计
@@ -194,7 +185,7 @@ spec:
             # 界只在给路径的那一侧成立。声明量本身是部署的输入，所以由这里传下去，
             # 不是让 Pod 去猜（目录型卷的 `statvfs` 报的是宿主盘，不是这张 claim）。
             - name: SANDBOX_VOLUME_CLAIM
-              value: "cogneva-sandbox-pvc={{ .Values.sandboxExecutor.storage }}"
+              value: "sandbox-data-$(POD_NAME)={{ .Values.sandboxExecutor.storage }}"
             {{- if hasKey .Values.sandboxExecutor "buildCacheMaxBytes" }}
             # 钉死时要显式给（`0` = 只量不封顶）。`hasKey` 而不是 `with`：模板里
             # `0` 是零值，`with` 会把「只量不封顶」这个选择读成「没配」。
@@ -209,7 +200,7 @@ spec:
             # 挂载表排除，不在这里重复声明。
             - name: COGNEVA_DATA_VOLUME_MOUNTS
               value: |
-                cogneva-sandbox-pvc=/opt/cogneva/sandbox
+                sandbox-data-$(POD_NAME)=/opt/cogneva/sandbox
             {{- if .Values.hostDocuments.scopes }}
             {{- $mount := required "hostDocuments.mountPath is required when hostDocuments.scopes is set" .Values.hostDocuments.mountPath }}
             {{- $pairs := list }}
@@ -300,11 +291,8 @@ spec:
               mountPath: {{ $mount }}/{{ $name }}
             {{- end }}
             {{- end }}
+      {{- if .Values.hostDocuments.scopes }}
       volumes:
-        - name: sandbox-data
-          persistentVolumeClaim:
-            claimName: cogneva-sandbox-pvc
-        {{- if .Values.hostDocuments.scopes }}
         {{- range $name, $path := .Values.hostDocuments.scopes }}
         # type: Directory（非 DirectoryOrCreate）：宿主上路径不对就让 Pod 起不来，
         # 而不是替运维在宿主上建一个空目录——那会把"配置写错了"变成"整理出了
@@ -315,6 +303,46 @@ spec:
             type: Directory
         {{- end }}
         {{- end }}
+  # 每副副本自己的卷：卷名是 `<模板名>-<StatefulSet 名>-<序号>`，容器按 POD_NAME
+  # 拼出自己那块（见 SANDBOX_VOLUME_CLAIM）。裸仓库、每任务工作树与编译缓存在
+  # 同一块卷上——它们一起构成「这副副本能干什么」，分开反而要两张卷去对齐归属。
+  volumeClaimTemplates:
+    - metadata:
+        name: sandbox-data
+        labels:
+          {{- include "cogneva.labels" . | nindent 10 }}
+          app.kubernetes.io/component: sandbox-executor
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.sandboxExecutor.storage }}
+        {{- with .Values.sandboxExecutor.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+---
+# 每副副本一个 DNS 名：`<sts>-<序号>.<本服务>.<ns>.svc`。客户端把它拼成
+# `sandbox_executor_url` 的逗号表（见 app-config），一条 lane 钉一个名字。没有
+# 这一条，Service 的负载均衡会把同一个 agent 的两条命令送到两副副本、两棵树。
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-sandbox-executor-pods
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-executor
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: sandbox-executor
+  ports:
+    - name: executor
+      port: {{ .Values.sandboxExecutor.metricsPort }}
+      targetPort: executor
+      protocol: TCP
 ---
 apiVersion: v1
 kind: Service

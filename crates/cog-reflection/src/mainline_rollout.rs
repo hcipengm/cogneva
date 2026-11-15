@@ -36,7 +36,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{MainlineDeployerConfig, RolloutTargetConfig};
 use crate::mainline_deployer::{
-    bounded, carries_deployment, config_consumer_jsonpath, exit_code, failure_signature, field,
+    bounded, carries_workload, config_consumer_jsonpath, exit_code, failure_signature, field,
     is_admission_policy_denied, is_authorization_denied, is_cluster_unreachable,
     is_observation_tool_failure, namespace_docs, primary_message, render_docs, sample_fields,
     split_docs, target_manifest_key, workload_kind, workload_kind_of_resource, CancelledCheck,
@@ -1779,12 +1779,14 @@ pub(crate) struct RefSnapshots {
     pub(crate) targets: Vec<RewrittenRef>,
 }
 
-/// 一次 apply 之前某个 deployment 的 Pod 模板（`.spec.template.spec` 的原样），回滚
+/// 一次 apply 之前某个工作负载的 Pod 模板（`.spec.template.spec` 的原样），回滚
 /// 在「镜像换回去了、Pod 还是起不来」时用它把整个模板换回去。
 ///
-/// 只对 deployment：这一轮 apply 的目标清单就是 deployment（`RolloutTarget` 的
-/// `deployment` 字段），留一个资源词字段只是给 `get`/`patch` 的 argv 多一个可变来源，
-/// 而资源词一旦是算出来的，谁能读它就得靠猜。
+/// 资源词跟着快照走，取自同一个目标（`RolloutTarget::resource`）：目标可以是
+/// Deployment 也可以是 StatefulSet（沙箱执行器一副副本一块卷，只能是后者），还模板
+/// 的 patch 必须打到同一个 kind 上。打到错的那个上是 NotFound，而这条路径只在回滚
+/// 时走——失败与「模板本来就在」在日志里长得一样，等发现时工作负载已经停在起不来的
+/// 清单上了。
 ///
 /// 只有一个镜像是不够的：apply 换的是整份清单，新版本可以把 env、卷、`secretKeyRef`
 /// 一起改掉，而 `kubectl set image` 一个都换不回来。2026-10-30 实测：新清单要求
@@ -1792,6 +1794,7 @@ pub(crate) struct RefSnapshots {
 /// 回滚把镜像换回旧版，模板里那条引用还在，旧镜像配新模板同样起不来，网关 0/1
 /// 挂了几分钟，最后是人对 `deployment` 做 `rollout undo` 才恢复。
 pub(crate) struct TemplateSnapshot {
+    pub(crate) resource: String,
     pub(crate) name: String,
     /// `spec.template.spec` 的 JSON 原文：合并补丁把这一整块换回去，不在 Rust 里
     /// 重新拼字段——拼出来的那一份与集群里那一份差一个字段，就是另一个模板。
@@ -1995,6 +1998,7 @@ impl RolloutPlan {
             .iter()
             .map(|t: &RolloutTargetConfig| RolloutTarget {
                 deployment: t.deployment.clone(),
+                resource: t.resource.clone(),
                 container: t.container.clone(),
                 component: t.component.clone(),
                 name: t.name.clone(),
@@ -2412,7 +2416,7 @@ pub(crate) async fn manifest_carried_targets(plan: &RolloutPlan) -> Vec<String> 
         let Ok(text) = tokio::fs::read_to_string(&path).await else {
             continue;
         };
-        if carries_deployment(&text, &key, &t.deployment).unwrap_or(false) {
+        if carries_workload(&text, &key, &t.resource, &t.deployment).unwrap_or(false) {
             carried.push(t.deployment.clone());
         }
     }
@@ -2637,7 +2641,7 @@ impl cog_core::declared_wall::SettleProbe for RolloutWait<'_> {
         let out = match exec
             .run_kubectl(&[
                 "get",
-                "deployment",
+                &t.resource,
                 &t.deployment,
                 "-o",
                 ROLLOUT_STATUS_JSONPATH,
@@ -2679,11 +2683,11 @@ impl cog_core::declared_wall::SettleProbe for RolloutWait<'_> {
             if now.duration_since(since) >= exec.pause_hold {
                 if self.pause_resumes > 0 {
                     return Ok(Step::Failed(format!(
-                        "{NEW_REVISION_NEVER_RAN_MARKER}: rollout of deployment/{} is paused again \
+                        "{NEW_REVISION_NEVER_RAN_MARKER}: rollout of {}/{} is paused again \
                          right after this rollout resumed it, so the pause is not leftover state \
                          from a writer that is gone — someone else is holding it paused, and no pod \
                          of the new revision can be created until they let go (last: {out})",
-                        t.deployment
+                        t.resource, t.deployment
                     )));
                 }
                 warn!(
@@ -2692,15 +2696,12 @@ impl cog_core::declared_wall::SettleProbe for RolloutWait<'_> {
                     "the deployment has stayed paused longer than any live canary could hold it, \
                      so the pause is leftover state from a writer that is gone; resuming it"
                 );
-                if let Err(e) = exec
-                    .run_kubectl(&["rollout", "resume", &format!("deployment/{}", t.deployment)])
-                    .await
-                {
+                if let Err(e) = exec.run_kubectl(&["rollout", "resume", &t.object()]).await {
                     return Ok(Step::Failed(format!(
-                        "{NEW_REVISION_NEVER_RAN_MARKER}: rollout of deployment/{} is paused and the \
+                        "{NEW_REVISION_NEVER_RAN_MARKER}: rollout of {}/{} is paused and the \
                          pause could not be cleared ({e}), so no pod of the new revision can be \
                          created until someone resumes it",
-                        t.deployment
+                        t.resource, t.deployment
                     )));
                 }
                 self.pause_resumes += 1;
@@ -2729,8 +2730,8 @@ impl cog_core::declared_wall::SettleProbe for RolloutWait<'_> {
                 Some(false) => {
                     if let Some(fatal) = rollout_pods_fatal(&samples) {
                         return Ok(Step::Failed(format!(
-                            "pod of deployment/{} in fatal waiting state {fatal}",
-                            t.deployment
+                            "pod of {}/{} in fatal waiting state {fatal}",
+                            t.resource, t.deployment
                         )));
                     }
                     if let Err(e) = exec.fatal_pod_state(t).await {
@@ -3584,13 +3585,8 @@ impl RolloutExecutor {
 
     async fn set_image(&self, t: &RolloutTarget, image: &str) -> SFResult<()> {
         let image_arg = format!("{}={}", t.container, image);
-        self.run_kubectl(&[
-            "set",
-            "image",
-            &format!("deployment/{}", t.deployment),
-            &image_arg,
-        ])
-        .await?;
+        self.run_kubectl(&["set", "image", &t.object(), &image_arg])
+            .await?;
         Ok(())
     }
 
@@ -3640,7 +3636,7 @@ impl RolloutExecutor {
         let new_limits = docs.iter().find_map(pod_template_limits)?;
 
         let live_text = self
-            .run_kubectl(&["get", "deployment", &t.deployment, "-o", "json"])
+            .run_kubectl(&["get", &t.resource, &t.deployment, "-o", "json"])
             .await
             .ok()?;
         let live_json: serde_json::Value = serde_json::from_str(&live_text).ok()?;
@@ -4439,7 +4435,7 @@ impl RolloutExecutor {
     async fn current_image(&self, t: &RolloutTarget) -> SFResult<String> {
         let jsonpath = crate::deployment_image::container_image_query(&t.container);
         let img = self
-            .run_kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath])
+            .run_kubectl(&["get", &t.resource, &t.deployment, "-o", &jsonpath])
             .await?;
         crate::deployment_image::container_image(&img, &t.deployment, &t.container)
     }
@@ -4508,7 +4504,7 @@ impl RolloutExecutor {
         let out = self
             .run_kubectl(&[
                 "get",
-                "deployment",
+                &t.resource,
                 &t.deployment,
                 "-o",
                 "jsonpath={.spec.template.spec.initContainers[*].name}",
@@ -4539,7 +4535,7 @@ impl RolloutExecutor {
         // 那一段与滚动那一段各有各的界，等的时候合起来看。
         let declared = Duration::from_secs(self.startup_timeout_secs)
             .saturating_add(Duration::from_secs(self.rollout_timeout_secs));
-        let what = format!("rollout of deployment/{}", t.deployment);
+        let what = format!("rollout of {}/{}", t.resource, t.deployment);
         let mut wait = RolloutWait::new(self, t, prev_shape, declared);
         let verdict = cog_core::declared_wall::wait_for_settled_with(
             declared,
@@ -4598,10 +4594,10 @@ impl RolloutExecutor {
             why.clone()
         } else {
             format!(
-                "rollout of deployment/{} was declared failed by the platform \
+                "rollout of {}/{} was declared failed by the platform \
                  ({PROGRESS_DEADLINE_EXCEEDED}): its controller saw no progress for its own \
                  progress deadline",
-                t.deployment
+                t.resource, t.deployment
             )
         };
 
@@ -4701,8 +4697,8 @@ impl RolloutExecutor {
                 continue;
             }
             let mut text = format!(
-                "pod of deployment/{} in fatal waiting state {}",
-                t.deployment, state.reason
+                "pod of {}/{} in fatal waiting state {}",
+                t.resource, t.deployment, state.reason
             );
             if !state.cause.is_empty() {
                 text.push_str(SUPPORT_CAUSE_SEPARATOR);
@@ -4751,7 +4747,7 @@ impl RolloutExecutor {
         let out = self
             .run_kubectl(&[
                 "get",
-                "deployment",
+                &t.resource,
                 &t.deployment,
                 "-o",
                 "jsonpath={.spec.template.spec.containers[0].readinessProbe.initialDelaySeconds}|\
@@ -4772,10 +4768,10 @@ impl RolloutExecutor {
     /// 就绪门禁判败的错误：说明判败依据是探针自己的判定周期用完了，并带上现场。
     async fn readiness_gate_error(&self, t: &RolloutTarget, budget_secs: u64) -> SFError {
         let msg = format!(
-            "rollout of deployment/{} converged but its own pod(s) are still not ready after the \
+            "rollout of {}/{} converged but its own pod(s) are still not ready after the \
              readiness probe's own budget ({}s = initialDelay + failureThreshold x (period + \
              timeout) + container startup)",
-            t.deployment, budget_secs
+            t.resource, t.deployment, budget_secs
         );
         self.with_scene(t, msg).await
     }
@@ -4891,7 +4887,7 @@ impl RolloutExecutor {
     /// requests：能把 Pod 顶出节点的字段远不止 requests。
     async fn current_placement_shape(&self, t: &RolloutTarget) -> SFResult<String> {
         let out = self
-            .run_kubectl(&["get", "deployment", &t.deployment, "-o", "jsonpath={.spec}"])
+            .run_kubectl(&["get", &t.resource, &t.deployment, "-o", "jsonpath={.spec}"])
             .await?;
         Ok(normalize_placement_shape(&out))
     }
@@ -4993,8 +4989,8 @@ impl RolloutExecutor {
                 let running_since = parts.next().unwrap_or("").trim();
                 if FATAL_WAITING_REASONS.contains(&waiting_reason) {
                     let msg = format!(
-                        "pod of deployment/{} in fatal waiting state {waiting_reason}: {line}",
-                        t.deployment
+                        "pod of {}/{} in fatal waiting state {waiting_reason}: {line}",
+                        t.resource, t.deployment
                     );
                     return Err(self.with_scene(t, msg).await);
                 }
@@ -5004,9 +5000,9 @@ impl RolloutExecutor {
                     // 「按每一次运行的起点算预算」就会让重启循环永远够不到界。
                     if restarts > self.restart_threshold {
                         let msg = format!(
-                            "pod of deployment/{} restarted {} times (threshold {}) and is still \
+                            "pod of {}/{} restarted {} times (threshold {}) and is still \
                              not ready, so it is not merely slow to start: {line}",
-                            t.deployment, restarts, self.restart_threshold
+                            t.resource, t.deployment, restarts, self.restart_threshold
                         );
                         return Err(self.with_scene(t, msg).await);
                     }
@@ -5022,11 +5018,11 @@ impl RolloutExecutor {
                     }
                     let msg = match ran {
                         Some(secs) => format!(
-                            "pod of deployment/{} is still not ready {secs}s into this run, past \
+                            "pod of {}/{} is still not ready {secs}s into this run, past \
                              its startup budget of {}s: {line}",
-                            t.deployment, self.startup_timeout_secs
+                            t.resource, t.deployment, self.startup_timeout_secs
                         ),
-                        None => format!("pod of deployment/{} not ready: {line}", t.deployment),
+                        None => format!("pod of {}/{} not ready: {line}", t.resource, t.deployment),
                     };
                     return Err(self.with_scene(t, msg).await);
                 }
@@ -5054,13 +5050,14 @@ impl RolloutExecutor {
                         // 不回滚，宿主松下来它自己会稳；判词带上读数来自哪台机器。
                         if let (true, Some(peak)) = (window.was_queued(), window.peak) {
                             let msg = format!(
-                                "{HOST_LOADED_MARKER}: pod of deployment/{} restarted {} times \
+                                "{HOST_LOADED_MARKER}: pod of {}/{} restarted {} times \
                                  (threshold {}) but was ready when the soak ended, and the \
                                  host's run queue was past one task per core on {} of {} \
                                  samples taken during that soak, peaking at load1 {:.2} \
                                  against {} cores (read on {}), so the restarts happened while \
                                  this machine was giving its time to work that is not part of \
                                  this revision rather than to a fault in it: {line}",
+                                t.resource,
                                 t.deployment,
                                 restarts,
                                 self.restart_threshold,
@@ -5080,9 +5077,9 @@ impl RolloutExecutor {
                             None => "start time not readable".to_string(),
                         };
                         let msg = format!(
-                            "pod of deployment/{} restarting ({} restarts, threshold {}, \
+                            "pod of {}/{} restarting ({} restarts, threshold {}, \
                              {run_note}): {line}",
-                            t.deployment, restarts, self.restart_threshold
+                            t.resource, t.deployment, restarts, self.restart_threshold
                         );
                         return Err(self.with_scene(t, msg).await);
                     }
@@ -5094,9 +5091,9 @@ impl RolloutExecutor {
             let ends = budget_ends.expect("a starting replica records when its budget ends");
             if std::time::Instant::now() >= ends {
                 let msg = format!(
-                    "pod of deployment/{} was still not ready when its own startup budget \
+                    "pod of {}/{} was still not ready when its own startup budget \
                      ({}s) ran out, so this is not a replica that is merely slow to start: {out}",
-                    t.deployment, self.startup_timeout_secs
+                    t.resource, t.deployment, self.startup_timeout_secs
                 );
                 return Err(self.with_scene(t, msg).await);
             }
@@ -5260,13 +5257,17 @@ impl RolloutExecutor {
     /// 读不到、读回来不是 JSON、或者里面没有 Pod 模板，都是这一轮**一处也不许动**的理由
     /// （与镜像快照同一条），而不是"跳过这一处"：少一处快照的那一轮，回滚会以为自己
     /// 有模板可还。
-    pub(crate) async fn snapshot_pod_template(&self, name: &str) -> SFResult<TemplateSnapshot> {
+    pub(crate) async fn snapshot_pod_template(
+        &self,
+        t: &RolloutTarget,
+    ) -> SFResult<TemplateSnapshot> {
         let out = self
-            .run_kubectl(&["get", "deployment", name, "-o", "json"])
+            .run_kubectl(&["get", &t.resource, &t.deployment, "-o", "json"])
             .await?;
         let doc: serde_json::Value = serde_json::from_str(&out).map_err(|e| {
             SFError::IO(format!(
-                "reading the pod template of deployment/{name}: the object did not come back as JSON: {e}"
+                "reading the pod template of {}: the object did not come back as JSON: {e}",
+                t.object()
             ))
         })?;
         let spec = doc
@@ -5276,11 +5277,13 @@ impl RolloutExecutor {
             .cloned()
             .ok_or_else(|| {
                 SFError::Config(format!(
-                    "deployment/{name} carries no spec.template.spec; there is no template to put back"
+                    "{} carries no spec.template.spec; there is no template to put back",
+                    t.object()
                 ))
             })?;
         Ok(TemplateSnapshot {
-            name: name.to_string(),
+            resource: t.resource.clone(),
+            name: t.deployment.clone(),
             spec,
         })
     }
@@ -5295,11 +5298,11 @@ impl RolloutExecutor {
             "spec": { "template": { "spec": snap.spec } }
         })
         .to_string();
-        let target = format!("deployment/{}", snap.name);
+        let target = format!("{}/{}", snap.resource, snap.name);
         match self
             .run_kubectl(&[
                 "patch",
-                "deployment",
+                &snap.resource,
                 &snap.name,
                 "--type=merge",
                 "-p",
@@ -5863,7 +5866,7 @@ impl RolloutExecutor {
             // 模板读不到不拦这一轮，只丢掉这一处的兜底：回滚的主路径是 `set image`，
             // 模板是它落地了却没起来时的那一手。为一次 `get` 抖动扣住一次已经全绿的
             // 上线，代价比"回滚少一种手段"大得多——而少掉的那一种当场有一行点名。
-            match self.snapshot_pod_template(&t.deployment).await {
+            match self.snapshot_pod_template(t).await {
                 Ok(template) => templates.push(template),
                 Err(e) => warn!(
                     deployment = %t.deployment,
@@ -6263,7 +6266,7 @@ impl RolloutExecutor {
             // `seed-sandbox` 各自停在某一版失败 rev 上，回滚了主容器它们不动。
             // 分成两条命令会让同一个 pod 模板改两次、滚两次。
             let mut here: Vec<RewrittenRef> = vec![RewrittenRef {
-                resource: "deployment".to_string(),
+                resource: t.resource.clone(),
                 name: t.deployment.clone(),
                 container: t.container.clone(),
                 image: prev.to_string(),
@@ -6274,7 +6277,7 @@ impl RolloutExecutor {
             here.extend(
                 refs.targets
                     .iter()
-                    .filter(|r| r.resource == "deployment" && r.name == t.deployment)
+                    .filter(|r| r.resource == t.resource && r.name == t.deployment)
                     .filter(|r| r.container != t.container)
                     .cloned(),
             );
@@ -6282,8 +6285,8 @@ impl RolloutExecutor {
                 // 命令没发出去，读回来也只会是失败版本；这一处已经由上面那条
                 // warn 点名，不再当成"落地了但没收敛"重复记一遍。
                 verdict.not_landed.push(format!(
-                    "deployment/{}: restore command failed",
-                    t.deployment
+                    "{}/{}: restore command failed",
+                    t.resource, t.deployment
                 ));
                 continue;
             }

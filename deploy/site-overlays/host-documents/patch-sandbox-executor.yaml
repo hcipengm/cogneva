@@ -23,7 +23,7 @@
 # 与网关读到同一个值（只翻一侧＝功能整体不工作而两边读数各自自洽）。要放正文出
 # 集群时，两处一起改。
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: cogneva-sandbox-executor
   namespace: cogneva

@@ -1583,8 +1583,13 @@ mod tests {
     /// the older document, and "this knob is set" reads exactly like "this knob is
     /// set on the other topology".
     ///
-    /// They are equal today. What was missing is anything that says so, which is
-    /// also the only thing that would notice the day they stop being equal.
+    /// They are equal today, apart from the leaves the chart projects at render
+    /// time -- a value the source document cannot spell, such as an executor
+    /// address with one entry per replica. Those are registered once, in the
+    /// chart, and the difference is required to be exactly them: an
+    /// unregistered difference is a copy that has drifted, and a registered one
+    /// the chart no longer produces is a registration that has stopped meaning
+    /// anything. What was missing before was anything that said either.
     #[test]
     fn the_two_shipped_config_documents_are_one_document() {
         let docs = shipped_documents();
@@ -1610,15 +1615,43 @@ mod tests {
 
         let mut diffs = Vec::new();
         json_differences(chart, baseline, "", &mut diffs);
-        let shown = &diffs[..diffs.len().min(20)];
+        // 差值必须**正好**落在登记过的投影路径上：多一条是抄歪了，少一条是登记
+        // 成了一句空话（chart 不再改写它，判据却还以为这里可以不同）。两侧都判，
+        // 因为「只判一侧」的写法里，登记表变成一张谁都可以往上加的免死金牌。
+        let registered: Vec<String> = cog_core::config_sections::projected_config_paths()
+            .iter()
+            .map(|path| format!(".{}", path.join(".")))
+            .collect();
         assert!(
-            diffs.is_empty(),
+            !registered.is_empty(),
+            "no projection path is registered, so this test's exemption list is empty; \
+             the comparison below would then be the plain equality it always was -- \
+             and the first chart projection would make it red without saying why"
+        );
+        let path_of = |diff: &String| -> String {
+            diff.split_once(": ")
+                .map_or_else(|| diff.clone(), |(p, _)| p.to_string())
+        };
+        let unregistered: Vec<&String> = diffs
+            .iter()
+            .filter(|diff| !registered.iter().any(|r| r == &path_of(diff)))
+            .collect();
+        let stale: Vec<&String> = registered
+            .iter()
+            .filter(|r| !diffs.iter().any(|diff| path_of(diff) == **r))
+            .collect();
+        assert!(
+            unregistered.is_empty() && stale.is_empty(),
             "the chart document and the ConfigMap blob are not the same document \
-             (chart -> k3s configmap); {} difference(s), first {}: {shown:#?}\n\
+             (chart -> k3s configmap) outside the registered projections.\n\
+             {} difference(s) nobody registered: {unregistered:#?}\n\
+             {} registration(s) chart no longer projects: {stale:#?}\n\
              这两个文件是同一份文档的两个载体：抄歪一节，apply 路径的集群就继续跑旧的\
-             那一节，而「这一项配了」与「只在另一套拓扑上配了」在读数上分不开",
-            diffs.len(),
-            shown.len()
+             那一节，而「这一项配了」与「只在另一套拓扑上配了」在读数上分不开。\
+             登记表在 deploy/helm/cogneva/projected-config-paths.txt，chart 在渲染时\
+             真的改写了哪几片叶子，就只登记哪几片",
+            unregistered.len(),
+            stale.len()
         );
     }
 

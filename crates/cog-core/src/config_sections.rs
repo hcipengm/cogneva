@@ -343,10 +343,63 @@ impl ConfigDeclaration {
     }
 }
 
+/// The leaves the chart rewrites at render time, one dotted path per line.
+///
+/// The source document cannot spell these: a per-replica executor address is
+/// known only once the deployment says how many replicas it runs. They are
+/// declared once, in the chart, and both sides read that one declaration — the
+/// static-baseline sync checks that its copy differs from the source exactly
+/// here, and the comparison below drops them from both documents before
+/// comparing, so a projection cannot read as "the deployed document is not the
+/// one this revision declares".
+pub const PROJECTED_CONFIG_PATHS: &str =
+    include_str!("../../../deploy/helm/cogneva/projected-config-paths.txt");
+
+/// The registered projection paths, parsed: comments and blank lines skipped.
+pub fn projected_config_paths() -> Vec<Vec<&'static str>> {
+    PROJECTED_CONFIG_PATHS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.split('.').collect())
+        .collect()
+}
+
+/// The document with every registered projection leaf removed.
+///
+/// Removed from both sides rather than from one: the leaf's value is a property
+/// of the deployment the chart renders, not of the document a revision declares
+/// or of the one a cluster was handed, so neither side is the reference for it.
+fn without_projected_paths(doc: Value, paths: &[Vec<&'static str>]) -> Value {
+    let mut doc = doc;
+    for path in paths {
+        remove_leaf(&mut doc, path);
+    }
+    doc
+}
+
+/// Removes one dotted path from `doc`, descending only through objects. A path
+/// the document does not carry is a no-op: the source document may simply not
+/// spell the section the projection writes into.
+fn remove_leaf(doc: &mut Value, path: &[&str]) {
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
+    let Some(object) = doc.as_object_mut() else {
+        return;
+    };
+    if rest.is_empty() {
+        object.remove(*first);
+    } else if let Some(next) = object.get_mut(*first) {
+        remove_leaf(next, rest);
+    }
+}
+
 /// Compare a delivered document against the one this revision declares.
 pub fn compare_declaration(delivered: &Value, declared: &Value) -> ConfigDeclaration {
-    let delivered = without_comment_keys(delivered);
-    let declared = without_comment_keys(declared);
+    let projected = projected_config_paths();
+    let delivered = without_projected_paths(without_comment_keys(delivered), &projected);
+    let declared = without_projected_paths(without_comment_keys(declared), &projected);
     let mut out = ConfigDeclaration::default();
     for name in declared.as_object().map(|m| m.keys()).into_iter().flatten() {
         match delivered.get(name) {
@@ -677,6 +730,83 @@ mod tests {
             json!("the delivered copy explains the interval differently");
         delivered["_comment"] = json!("another revision's prose");
         assert_eq!(delivery_of(&delivered), DocumentDelivery::Matches);
+    }
+
+    /// Writes `value` at a dotted path, creating the intermediate objects.
+    fn with_leaf(doc: &mut Value, path: &[&str], value: Value) {
+        let mut cursor = doc;
+        let mut segments = path.iter().peekable();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                cursor[*segment] = value;
+                return;
+            }
+            if cursor.get(*segment).is_none() {
+                cursor[*segment] = json!({});
+            }
+            cursor = cursor
+                .get_mut(*segment)
+                .expect("just created; cannot be missing");
+        }
+    }
+
+    /// A registered projection leaf is not a difference: the source document
+    /// cannot spell a value the deployment renders (the executor's address has
+    /// one entry per replica), so the delivered copy always carries a different
+    /// one. If that counted, every apply-path deployment would report "the
+    /// deployed document is not the one this revision declares" while being
+    /// exactly the document this revision renders.
+    #[test]
+    fn a_projected_leaf_is_not_a_difference() {
+        let path = projected_config_paths()
+            .into_iter()
+            .next()
+            .expect("no projection path is registered; this test would prove nothing");
+        let mut declared = json!({});
+        let mut delivered = json!({});
+        with_leaf(&mut declared, &path, json!("http://as-declared:9090"));
+        with_leaf(
+            &mut delivered,
+            &path,
+            json!("http://rendered-by-the-deployment:9090"),
+        );
+        assert_eq!(
+            judge_delivery(Some(&delivered.to_string()), &declared.to_string()),
+            DocumentDelivery::Matches
+        );
+    }
+
+    /// The other half: the exemption is the leaf, not the section. Anything
+    /// beside it that moved is still reported — otherwise one projection would
+    /// have bought silence for every other setting in that section.
+    #[test]
+    fn a_difference_beside_a_projected_leaf_is_still_reported() {
+        let path = projected_config_paths()
+            .into_iter()
+            .next()
+            .expect("no projection path is registered; this test would prove nothing");
+        let leaf = *path.last().expect("a registered path is never empty");
+        let neighbour = if leaf == "log_level" {
+            "mode"
+        } else {
+            "log_level"
+        };
+        let mut declared = json!({});
+        let mut delivered = json!({});
+        with_leaf(&mut declared, &path, json!("http://as-declared:9090"));
+        with_leaf(
+            &mut delivered,
+            &path,
+            json!("http://rendered-by-the-deployment:9090"),
+        );
+        let mut beside = path.clone();
+        *beside.last_mut().expect("non-empty") = neighbour;
+        with_leaf(&mut declared, &beside, json!("info"));
+        with_leaf(&mut delivered, &beside, json!("debug"));
+        match judge_delivery(Some(&delivered.to_string()), &declared.to_string()) {
+            DocumentDelivery::Differs(d) => assert_eq!(d.changed, vec![path[0].to_string()]),
+            other => panic!("a changed leaf beside a projection was not reported: {other:?}"),
+        }
     }
 
     /// The documented incident: the delivered document predates the revision,

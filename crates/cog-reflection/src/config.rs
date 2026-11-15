@@ -653,12 +653,26 @@ impl Default for GitOpsConfig {
     }
 }
 
+/// 一个滚动目标没写 `resource` 时的取值：滚动目标一开始全是 Deployment。
+fn deployment_resource() -> String {
+    "deployment".to_string()
+}
+
 /// 主线跟踪自动部署器的单个滚动目标。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RolloutTargetConfig {
-    /// Deployment 名（`kubectl set image deployment/<name>` 中的 name）。
+    /// 工作负载名（`kubectl set image <resource>/<name>` 中的 name）。
     pub deployment: String,
-    /// Deployment 内容器名。
+    /// 这个目标是什么工作负载，用 kubectl 认的资源词写（`deployment` /
+    /// `statefulset`）。以前这里是隐含的 `deployment`，直到沙箱执行器需要每副
+    /// 副本自己的卷：卷模板只有 StatefulSet 会建，而那一个词必须跟着目标走，
+    /// 不能由调用处各自拼——拼错的那一处不会报错，它只会 `NotFound`，读起来
+    /// 与「集群里没有这个对象」同形。
+    ///
+    /// 缺省是 `deployment`：配置文件里没写这一格的旧部署照旧能滚。
+    #[serde(default = "deployment_resource")]
+    pub resource: String,
+    /// 目标内容器名。
     pub container: String,
     /// Pod 标签 app.kubernetes.io/component（健康检查选择器用）。
     pub component: String,
@@ -878,20 +892,26 @@ impl Default for MainlineDeployerConfig {
             targets: vec![
                 RolloutTargetConfig {
                     deployment: cog_core::topology::SECURITY_GATEWAY.into(),
+                    resource: deployment_resource(),
                     container: "security-gateway".into(),
                     component: cog_core::topology::COMPONENT_SECURITY_GATEWAY.into(),
                     name: cog_core::topology::WORKLOAD_NAME.into(),
                     manifest: Some("gateway-deployment.yaml".into()),
                 },
+                // 执行器是 StatefulSet：每副副本一块自己的卷，而卷模板只有
+                // StatefulSet 会建。它仍然是一个滚动目标——发布面按目标下发的
+                // 那份清单里就是 StatefulSet，`set image` 的回落路径也认这个词。
                 RolloutTargetConfig {
                     deployment: cog_core::topology::SANDBOX_EXECUTOR.into(),
+                    resource: "statefulset".into(),
                     container: "sandbox-executor".into(),
                     component: cog_core::topology::COMPONENT_SANDBOX_EXECUTOR.into(),
                     name: cog_core::topology::WORKLOAD_NAME.into(),
-                    manifest: Some("sandbox-executor-deployment.yaml".into()),
+                    manifest: Some("sandbox-executor-statefulset.yaml".into()),
                 },
                 RolloutTargetConfig {
                     deployment: cog_core::topology::MAIN_DEPLOYMENT.into(),
+                    resource: deployment_resource(),
                     container: cog_core::topology::MAIN_CONTAINER.into(),
                     component: cog_core::topology::COMPONENT_GATEWAY.into(),
                     name: cog_core::topology::WORKLOAD_NAME.into(),
@@ -899,6 +919,7 @@ impl Default for MainlineDeployerConfig {
                 },
                 RolloutTargetConfig {
                     deployment: cog_core::topology::EVOLUTION.into(),
+                    resource: deployment_resource(),
                     container: cog_core::topology::MAIN_CONTAINER.into(),
                     component: cog_core::topology::COMPONENT_EVOLUTION.into(),
                     name: cog_core::topology::EVOLUTION.into(),

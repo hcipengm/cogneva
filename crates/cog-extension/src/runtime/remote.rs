@@ -10,10 +10,10 @@ use async_trait::async_trait;
 // cap: bound — 连沙盒执行器的墙
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// 执行器换一次版要多久没有后端：这副部署只有一副副本，且
-/// `maxSurge: 0` / `maxUnavailable: 1`——单节点上第二副没有地方调度，所以换版是
-/// 先删后建，中间有一段服务没有就绪后端（取舍写在
-/// `deploy/k3s/sandbox-executor-deployment.yaml`）。
+/// 执行器换一次版要多久没有后端：它是 StatefulSet，按序号替换，同一序号的两份 Pod
+/// 不并存，所以**一副副本**的换版是先删后建——单节点上也没有第二副可调度的位置
+/// （取舍写在 `deploy/k3s/sandbox-executor-statefulset.yaml`）。副本多于一副时，
+/// 这段没有就绪后端的窗口只属于被换的那一副，其余副本照常应答。
 ///
 /// 实测 2026-11-06：新 Pod 的 init 在 06:09:37 起来，主容器 06:12:03 才开始跑，
 /// 两分半里连 `echo alive` 都拿不到连接。而在飞的那一轮 Agent 正是靠这个执行器

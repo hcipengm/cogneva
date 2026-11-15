@@ -444,13 +444,13 @@ mod tests {
         let parsed = parse_claim_paths(
             "cogneva-evolution-pvc = /opt/cogneva/sandbox\n\
              \n\
-             cogneva-sandbox-pvc=/opt/cogneva/sandbox/\n",
+             sandbox-data-cogneva-sandbox-executor-0=/opt/cogneva/sandbox/\n",
         )
         .unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].claim, "cogneva-evolution-pvc");
         assert_eq!(parsed[0].path, "/opt/cogneva/sandbox");
-        assert_eq!(parsed[1].claim, "cogneva-sandbox-pvc");
+        assert_eq!(parsed[1].claim, "sandbox-data-cogneva-sandbox-executor-0");
         // A trailing slash must not reach a consumer: two spellings of one mount
         // point differ wherever the text is compared by path.
         assert_eq!(parsed[1].path, "/opt/cogneva/sandbox");

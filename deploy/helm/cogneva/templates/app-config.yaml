@@ -73,6 +73,18 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
       "localhost:8080/metrics" (printf "localhost:%d%s" (int .Values.gateway.httpPort) .Values.observability.metricsPath)
 -}}
 {{- range $from, $to := $portage }}{{ if not (contains $from $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so this replacement would silently keep the old port -- update the pattern here to the file's new form" $from) }}{{ end }}{{ $json = replace $from $to $json }}{{ end }}
+{{- /* 执行器地址不是一个名字而是一串：每副副本各有自己的 DNS 名，客户端按 agent
+       把一条 lane 钉在其中一副上（同一个 agent 的两条命令必须落在同一块卷上，
+       否则它建的树下一次命令就找不到了）。走 ClusterIP 服务名的话，负载均衡会把
+       同一 agent 的两条命令分到两副副本，lane 钉定的意义就被抹掉了。所以这里把
+       主机名字面量换成按序号展开的逗号表——副本数是部署里的数，表跟着变。 */ -}}
+{{- $sandboxBase := printf "http://cogneva-sandbox-executor:%d" (int .Values.sandboxExecutor.metricsPort) }}
+{{- if not (contains $sandboxBase $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so the per-replica endpoint list would never be built -- the file's sandbox_executor_url has a new form" $sandboxBase) }}{{ end }}
+{{- $sandboxEndpoints := list }}
+{{- range $ordinal := until (int .Values.sandboxExecutor.replicas) }}
+{{- $sandboxEndpoints = append $sandboxEndpoints (printf "http://cogneva-sandbox-executor-%d.cogneva-sandbox-executor-pods:%d" (int $ordinal) (int $.Values.sandboxExecutor.metricsPort)) }}
+{{- end }}
+{{- $json = replace $sandboxBase (join "," $sandboxEndpoints) $json }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

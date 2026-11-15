@@ -161,6 +161,10 @@ COPY deploy/overlay-assets.json ./deploy/
 # deploy/scripts/check-docker-context.sh 判。
 COPY deploy/helm/cogneva/files/cogneva.json ./deploy/helm/cogneva/files/
 
+# 同一类：chart 渲染期改写的配置叶子登记表，被 cog-core 的 include_str! 编进二进制
+# （投递判据据此把投影叶子从两侧去掉再比）。它不在依赖预热层里，理由同上。
+COPY deploy/helm/cogneva/projected-config-paths.txt ./deploy/helm/cogneva/
+
 # Touch source files to invalidate cached object files only
 RUN touch crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null || true
 

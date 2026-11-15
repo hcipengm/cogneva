@@ -745,6 +745,37 @@ const COMPUTED: &[Computed] = &[
     // second copy of a filter that drops Roles and Secrets; two copies can
     // disagree while both stay green, which is the shape this file exists to
     // refuse.
+    // The rollout target's own word, on every call that touches the target:
+    // the sandbox executor is a StatefulSet, so the word travels with the
+    // target instead of each call site assuming `deployment`. The reachable
+    // population is this crate's workload table -- a target whose word is not
+    // in it is refused while the bundle is assembled and again when the
+    // manifest is claimed ("is not a workload kind this crate can address"),
+    // so no word outside the table can reach kubectl through a target. The
+    // guard is that this file still resolves words through that table; both
+    // files that address a target do.
+    Computed {
+        expr: "&t.resource",
+        words: Words::WorkloadRows,
+        guard: Guard::Text("workload_kind_of_resource("),
+    },
+    // The same word in `TYPE/NAME` form, which is what `rollout` takes. It is
+    // `format!("{}/{}", self.resource, self.deployment)` and nothing else, so
+    // the population is the row above, read once more.
+    Computed {
+        expr: "&t.object()",
+        words: Words::WorkloadRows,
+        guard: Guard::Text("workload_kind_of_resource("),
+    },
+    // A rollback writes back the template it snapshotted, and the snapshot
+    // carries the target's word rather than the caller's assumption: restoring
+    // a StatefulSet through `deployment/...` would replace nothing and still
+    // report a successful restart.
+    Computed {
+        expr: "&snap.resource",
+        words: Words::WorkloadRows,
+        guard: Guard::Text("workload_kind_of_resource("),
+    },
     Computed {
         expr: "&r.resource",
         words: Words::Delegated {
@@ -1323,26 +1354,6 @@ fn const_str_value(src: &str, name: &str) -> Option<String> {
     declared_name(&src[start..end])
 }
 
-/// `const NAME: [&str; N] = ["a", "b", …];` 里的那些字符串，引用声明的按名字解析。
-fn const_string_list(src: &str, name: &str) -> Vec<String> {
-    let needle = format!("const {name}: ");
-    let Some(start) = src.find(&needle) else {
-        return Vec::new();
-    };
-    let rest = &src[start + needle.len()..];
-    let Some(open) = rest.find("= [") else {
-        return Vec::new();
-    };
-    let body = &rest[open + 3..];
-    let Some(close) = body.find(']') else {
-        return Vec::new();
-    };
-    body[..close]
-        .split(',')
-        .filter_map(|element| literal(element).or_else(|| declared_name(element)))
-        .collect()
-}
-
 /// `- name: KEY` 之后、下一个 env 条目之前那段里的 `value: "…"`。
 fn env_value(src: &str, key: &str) -> Option<String> {
     let needle = format!("- name: {key}\n");
@@ -1372,14 +1383,17 @@ fn quoted(src: &str, needle: &str) -> Option<String> {
 #[test]
 fn every_identity_that_can_publish_can_read_the_canary_base_names() {
     let revision = read_repo("crates/cog-reflection/src/live_revision.rs");
-    let names = const_string_list(&revision, "BASE_DEPLOYMENTS");
+    // 名单是一串 `(资源词, 名字)`：执行器是 StatefulSet，其余是 Deployment。
+    // 从这里读而不是从源码里抠字面量，是因为名字是拓扑常量而不是字符串——抠字面量
+    // 只会抠到资源词，四个名字一个都读不到。
+    let base = cog_reflection::live_revision::BASE_DEPLOYMENTS;
     assert_eq!(
-        names.len(),
+        base.len(),
         4,
-        "现役 rev 的四个主负载名单读出来是 {names:?}：这条判据靠它才算有内容"
+        "现役 rev 的四个主负载名单读出来是 {base:?}：这条判据靠它才算有内容"
     );
     assert!(
-        revision.contains("\"deployment/{name}\""),
+        revision.contains("\"{resource}/{name}\""),
         "这份读法不再按名读：resourceNames 授权下集合级 list 必被拒，而读不到只静默退回浮动 tag"
     );
 
@@ -1438,12 +1452,13 @@ fn every_identity_that_can_publish_can_read_the_canary_base_names() {
             .flat_map(|r| r.rules)
             .collect();
         assert!(!rules.is_empty(), "{who} 一条规则都没读到");
-        for name in &names {
+        for (resource, name) in base {
+            let plural = format!("{resource}s");
             assert!(
                 rules
                     .iter()
-                    .any(|r| r.grants_named("apps", "deployments", "get", name)),
-                "{who} 读不到 deployment/{name}：推送端会把它当成浮动 tag 的基底"
+                    .any(|r| r.grants_named("apps", &plural, "get", name)),
+                "{who} 读不到 {resource}/{name}：推送端会把它当成浮动 tag 的基底"
             );
         }
     }

@@ -170,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
-        // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-deployment.yaml 的启动命令）。
+        // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-statefulset.yaml 的启动命令）。
         Command::SandboxExecutor => cog_extension::command_server::run_from_env().await,
         // 卷占用走查：挂在只由第三方进程写入的卷上的边车，把该卷的盘上字节发布成
         // 卷族序列（deploy/k3s/cluster-registry.yaml 的 volume-walker 容器）。

@@ -3362,9 +3362,13 @@ rows:
   - key: sandboxExecutor.replicas
     source: fixed
     why: >-
-      One executor: each task's worktree lives on this pod's volume, so a
-      second copy would see a different volume and "who owns this worktree"
-      would stop meaning anything. Not a reading.
+      How many executor replicas carry the sandbox. It is a capacity number,
+      not a topology constraint: each replica owns its own claim, and a lane is
+      pinned to one replica, so a second copy no longer splits "who owns this
+      worktree". Nothing measures it yet -- queue depth and wait time are
+      already published, and wiring them into this number is the next step --
+      so it stays a pinned deployment value rather than a derived one, and the
+      total the sandbox can carry is per-replica concurrency times this.
 
   - key: sandboxExecutor.buildCacheScanIntervalSecs
     source: derived

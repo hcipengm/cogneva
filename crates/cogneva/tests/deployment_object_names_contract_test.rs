@@ -43,7 +43,7 @@ fn declared() -> Vec<(&'static str, &'static str)> {
     vec![
         ("Deployment", cog_core::topology::MAIN_DEPLOYMENT),
         ("Deployment", cog_core::topology::SECURITY_GATEWAY),
-        ("Deployment", cog_core::topology::SANDBOX_EXECUTOR),
+        ("StatefulSet", cog_core::topology::SANDBOX_EXECUTOR),
         ("Deployment", cog_core::topology::EVOLUTION),
         ("Deployment", cog_core::topology::IMAGE_SERVER),
         ("DaemonSet", cog_core::topology::IMAGE_DISTRIBUTOR),
@@ -330,23 +330,24 @@ fn the_scanner_recognises_the_shapes_and_only_those() {
 /// comparison read "not all on the same revision" -- a false negative that
 /// looks exactly like a roll in progress.
 #[test]
-fn the_base_workload_set_is_four_deployments_the_chart_creates() {
+fn the_base_workload_set_is_four_workloads_the_chart_creates() {
     let base = cog_reflection::live_revision::BASE_DEPLOYMENTS;
     assert_eq!(base.len(), 4);
-    let mut created: Vec<String> = Vec::new();
+    let mut created: Vec<(String, String)> = Vec::new();
     for path in workload_manifests() {
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        for (kind, name) in workloads_in(&text) {
-            if kind == "Deployment" {
-                created.push(name);
-            }
-        }
+        created.extend(workloads_in(&text));
     }
-    for name in base {
+    for (resource, name) in base {
+        let kind = match resource {
+            "deployment" => "Deployment",
+            "statefulset" => "StatefulSet",
+            other => panic!("主负载名单里出现了一个这份判据不认识的工作负载种类：{other}"),
+        };
         assert!(
-            created.iter().any(|n| n == name),
-            "主负载名单里的 {name} 没有对应的 Deployment：这一格读数会把它读成「不可读」\
+            created.iter().any(|(k, n)| k == kind && n == name),
+            "主负载名单里的 {resource}/{name} 没有对应的 {kind}：这一格读数会把它读成「不可读」\
              或「没在同一版上」，两种都不是真的"
         );
     }

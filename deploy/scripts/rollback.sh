@@ -30,11 +30,14 @@
 #     the directories under deploy/rendered/ in that revision, not a list kept
 #     here;
 #   - a profile name outside [a-z0-9-] — it is pasted into a path;
-#   - --wait against a tree that declares no Deployment: there is nothing to
-#     wait for, and reporting ready would be a claim about nothing. The set of
-#     Deployments comes from that revision's own manifests, not from a list
-#     kept here — a renamed or added workload has to be waited for, and a list
-#     would either wait on a name that no longer exists or skip the new one.
+#   - --wait against a tree that declares no Deployment or StatefulSet: there
+#     is nothing to wait for, and reporting ready would be a claim about
+#     nothing. The set comes from that revision's own manifests, not from a
+#     list kept here — a renamed, added or kind-changed workload has to be
+#     waited for, and a list would either wait on something that no longer
+#     exists or skip the new one. Both kinds are read: the executor is a
+#     StatefulSet (one claim per replica), and "Deployment only" would apply it
+#     and then report ready without ever looking at it.
 #
 # Usage:
 #   bash deploy/scripts/rollback.sh --to <rev> [--profile k3s-single] [--apply] [--wait]
@@ -133,20 +136,23 @@ if ! git -C "$repo" archive "$full_rev" "$rendered_rel" | tar -x -C "$work"; the
 fi
 manifest_dir="$work/$rendered_rel"
 
-# 要等哪些 Deployment 从**这一版清单**里读，不在这里列名字。写死的那份名单在工作
-# 负载改名或多出第四个时，`--wait` 会去等一个不存在的东西（rollout status 对它报错，
-# 于是这一趟报回滚失败，而集群其实已经退回去了），或者漏掉新增的那一个，在它还没
-# 起来时就报 ready。判在 apply 之前：判不了的那一版不该先动集群再说不算数。
-deployments=()
+# 要等哪些工作负载从**这一版清单**里读，不在这里列名字。写死的那份名单在工作
+# 负载改名、多出第四个、或者换了一种（执行器是 StatefulSet）时，`--wait` 会去等
+# 一个不存在的东西（rollout status 对它报错，于是这一趟报回滚失败，而集群其实
+# 已经退回去了），或者漏掉没被数到的那个，在它还没起来时就报 ready。判在 apply
+# 之前：判不了的那一版不该先动集群再说不算数。
+workloads=()
 if [ "$wait" -eq 1 ]; then
-    while read -r name; do
-        [ -n "$name" ] && deployments+=("$name")
+    while read -r kind name; do
+        [ -n "$name" ] && workloads+=("$kind/$name")
     done < <(awk '
-        /^kind: Deployment$/ { want = 1; next }
-        want && /^  name: / { print $2; want = 0 }
+        /^kind: (Deployment|StatefulSet)$/ {
+            split($0, kv, ": "); kind = tolower(kv[2]); want = 1; next
+        }
+        want && /^  name: / { print kind, $2; want = 0 }
     ' "$manifest_dir"/*.yaml 2>/dev/null)
-    if [ "${#deployments[@]}" -eq 0 ]; then
-        printf 'rollback: %s 的 %s/ 里一个 Deployment 都没有——等不了 rollout，这不等于就绪\n' \
+    if [ "${#workloads[@]}" -eq 0 ]; then
+        printf 'rollback: %s 的 %s/ 里没有 Deployment 或 StatefulSet——等不了 rollout，这不等于就绪\n' \
             "${full_rev:0:12}" "$rendered_rel" >&2
         exit 2
     fi
@@ -166,16 +172,16 @@ fi
 
 if [ "$wait" -eq 1 ]; then
     failed=""
-    for d in "${deployments[@]}"; do
-        if ! $kubectl -n "$namespace" rollout status "deployment/$d" --timeout="${wait_secs}s" >/dev/null 2>&1; then
-            failed="$failed $d"
+    for w in "${workloads[@]}"; do
+        if ! $kubectl -n "$namespace" rollout status "$w" --timeout="${wait_secs}s" >/dev/null 2>&1; then
+            failed="$failed $w"
         fi
     done
     if [ -n "$failed" ]; then
-        printf 'rollback_failed stage=rollout to=%s deployments=%s\n' "${full_rev:0:12}" "${failed# }" >&2
+        printf 'rollback_failed stage=rollout to=%s workloads=%s\n' "${full_rev:0:12}" "${failed# }" >&2
         exit 1
     fi
-    printf 'rollback_rollout=ready deployments=%s\n' "${#deployments[@]}"
+    printf 'rollback_rollout=ready workloads=%s\n' "${#workloads[@]}"
 fi
 
 printf 'rollback_applied to=%s profile=%s\n' "${full_rev:0:12}" "$profile"

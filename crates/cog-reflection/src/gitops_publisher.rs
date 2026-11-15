@@ -721,7 +721,7 @@ mod tests {
     /// 空间。落日志用 printf 而不是 echo —— dash 的 echo 会解释参数里的 `\n`，
     /// jsonpath 那一段会散成多行，读出来的行数就不再是读的条数（这条曾把一次
     /// 正确的实现读成 5 条读）。
-    const FAKE_KUBECTL_BASE: &str = "#!/bin/sh\nverb=''\ntarget=''\nfor a in \"$@\"; do case \"$a\" in get|list|patch|apply|delete|rollout) verb=\"$a\";; deployment/*) target=\"$a\";; esac; done\nprintf '%s %s\\n' \"$verb\" \"$target\" >> \"$(dirname \"$0\")/argv.log\"\nname=$(printf '%s' \"$target\" | sed 's|^deployment/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
+    const FAKE_KUBECTL_BASE: &str = "#!/bin/sh\nverb=''\ntarget=''\nfor a in \"$@\"; do case \"$a\" in get|list|patch|apply|delete|rollout) verb=\"$a\";; deployment/*|statefulset/*) target=\"$a\";; esac; done\nprintf '%s %s\\n' \"$verb\" \"$target\" >> \"$(dirname \"$0\")/argv.log\"\nname=$(printf '%s' \"$target\" | sed 's|^[a-z]*/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
 
     #[tokio::test]
     async fn canary_overlay_uses_deployed_main_tag_as_base() {
@@ -760,12 +760,12 @@ mod tests {
             crate::live_revision::BASE_DEPLOYMENTS.len(),
             "基底要一个名字一条读，不是列一遍命名空间：{argv}"
         );
-        for name in crate::live_revision::BASE_DEPLOYMENTS {
+        for (resource, name) in crate::live_revision::BASE_DEPLOYMENTS {
             assert!(
                 reads
                     .iter()
-                    .any(|l| l.contains(&format!("get deployment/{name}"))),
-                "没有按名读 {name}：{argv}"
+                    .any(|l| l.contains(&format!("get {resource}/{name}"))),
+                "没有按名读 {resource}/{name}：{argv}"
             );
         }
     }
@@ -776,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_canary_base_is_a_fallback_not_a_partial_claim() {
         let (central, work) = setup_repo().await;
-        let refused = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in deployment/cogneva-sandbox-executor) echo 'Error from server (Forbidden): deployments.apps is forbidden' >&2; exit 1;; esac; done\nname=$(for a in \"$@\"; do case \"$a\" in deployment/*) echo \"$a\";; esac; done | sed 's|^deployment/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
+        let refused = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in statefulset/cogneva-sandbox-executor) echo 'Error from server (Forbidden): statefulsets.apps is forbidden' >&2; exit 1;; esac; done\nname=$(for a in \"$@\"; do case \"$a\" in deployment/*|statefulset/*) echo \"$a\";; esac; done | sed 's|^[a-z]*/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
         let kubectl = crate::test_support::write_executable(work.path(), "fake-kubectl", refused);
 
         std::fs::write(work.path().join("cogneva"), b"staged-binary").unwrap();

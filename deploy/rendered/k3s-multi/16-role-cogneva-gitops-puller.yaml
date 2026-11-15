@@ -44,7 +44,14 @@ rules:
   # tag —— 拿不到授权与"集群里确实还是浮动 tag"就再也分不出来了。
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    resourceNames: ["cogneva", "cogneva-security-gateway", "cogneva-sandbox-executor", "cogneva-evolution"]
+    resourceNames: ["cogneva", "cogneva-security-gateway", "cogneva-evolution"]
+    verbs: ["get"]
+  # 执行器是 StatefulSet（每副副本一块自己的卷），所以它在那份名单里，但落在
+  # 另一个资源词上。授给 `deployments` 的那一条读不到它：同一组名词分属两个
+  # 资源集合，而读不到只会静默退回浮动 tag。
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: ["cogneva-sandbox-executor"]
     verbs: ["get"]
   # 金丝雀看护：readiness 与 restart count。
   - apiGroups: [""]

@@ -21,8 +21,7 @@ resources:
   - gateway-service.yaml
   - gateway-audited-service.yaml
   - git-mirror-pvc.yaml
-  - sandbox-pvc.yaml
-  - sandbox-executor-deployment.yaml
+  - sandbox-executor-statefulset.yaml
   - sandbox-executor-service.yaml
   - evolution-configmap.yaml
   - evolution-deployment.yaml

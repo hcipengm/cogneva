@@ -73,7 +73,7 @@ const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_BYTES: u64 = cog_core::build_cache_readings::DEFAULT_CACHE_MAX_BYTES;
 
 /// Deployment variable naming the claim this cache sits on and its declared
-/// size, as `claim=size` -- 例如 `cogneva-sandbox-pvc=5Gi`, which is this
+/// size, as `claim=size` -- 例如 `sandbox-data-cogneva-sandbox-executor-0=5Gi`, which is this
 /// chart's own default rather than a capacity this code assumes.
 ///
 /// The declared size is the one input no walk inside the pod can produce: a
@@ -327,11 +327,14 @@ mod tests {
     #[test]
     fn the_ceiling_is_the_claim_minus_what_its_cotenants_hold() {
         let config = BuildCacheConfig {
-            volume_claim: Some(("cogneva-sandbox-pvc".into(), 5 * (1 << 30))),
+            volume_claim: Some((
+                "sandbox-data-cogneva-sandbox-executor-0".into(),
+                5 * (1 << 30),
+            )),
             ..BuildCacheConfig::default()
         };
         let footprint = ClaimFootprint::new(
-            "cogneva-sandbox-pvc",
+            "sandbox-data-cogneva-sandbox-executor-0",
             std::path::PathBuf::from("/opt/cogneva/sandbox"),
             vec![],
         );
@@ -381,7 +384,7 @@ mod tests {
         // Nothing measured yet: no ceiling rather than one computed from half
         // a fact.
         let unmeasured = ClaimFootprint::new(
-            "cogneva-sandbox-pvc",
+            "sandbox-data-cogneva-sandbox-executor-0",
             std::path::PathBuf::from("/opt/cogneva/sandbox"),
             vec![],
         );

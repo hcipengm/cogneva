@@ -4886,7 +4886,7 @@ impl MainlineDeployer {
         for t in &self.cfg.targets {
             let jsonpath = crate::deployment_image::container_image_query(&t.container);
             let img = self
-                .kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath])
+                .kubectl(&["get", &t.resource, &t.deployment, "-o", &jsonpath])
                 .await?;
             images.push(crate::deployment_image::container_image(
                 &img,
@@ -12775,10 +12775,18 @@ fn patch_container_image(
 fn patch_deployment_image(
     yaml_text: &str,
     origin: &str,
+    expect_resource: &str,
     expect_deployment: &str,
     container: &str,
     image: &str,
 ) -> SFResult<String> {
+    let expect_kind = workload_kind_of_resource(expect_resource)
+        .ok_or_else(|| {
+            SFError::Config(format!(
+                "{origin}: `{expect_resource}` is not a workload kind this crate can address"
+            ))
+        })?
+        .kind;
     let mut out_docs: Vec<serde_yaml::Value> = Vec::new();
     let mut deployments = 0usize;
     for doc in serde_yaml::Deserializer::from_str(yaml_text) {
@@ -12805,7 +12813,7 @@ fn patch_deployment_image(
             warn!(origin = %origin, kind = %kind, "manifest bundle: skipping volume claim; a bound claim's spec is immutable and is created at install time, not by the loop");
             continue;
         }
-        if kind == "Deployment" {
+        if kind == expect_kind {
             let name = v
                 .get("metadata")
                 .and_then(|m| m.get("name"))
@@ -12813,7 +12821,8 @@ fn patch_deployment_image(
                 .unwrap_or("");
             if name != expect_deployment {
                 return Err(SFError::Config(format!(
-                    "{origin}: deployment name {name} does not match rollout target {expect_deployment}"
+                    "{origin}: {expect_resource} name {name} does not match rollout target \
+                     {expect_deployment}"
                 )));
             }
             patch_container_image(&mut v, origin, container, image)?;
@@ -12833,7 +12842,8 @@ fn patch_deployment_image(
     }
     if deployments != 1 {
         return Err(SFError::Config(format!(
-            "{origin}: expected exactly one Deployment named {expect_deployment}, found {deployments}"
+            "{origin}: expected exactly one {expect_kind} named {expect_deployment}, found \
+             {deployments}"
         )));
     }
     let mut out = String::new();
@@ -12992,8 +13002,14 @@ pub fn build_rollout_bundle(
         )?);
         match claims.iter().find(|(_, r)| r == res) {
             Some((t, _)) => {
-                let yaml =
-                    patch_deployment_image(content, res, &t.deployment, &t.container, image)?;
+                let yaml = patch_deployment_image(
+                    content,
+                    res,
+                    &t.resource,
+                    &t.deployment,
+                    &t.container,
+                    image,
+                )?;
                 patched.insert(res.clone(), yaml);
             }
             None => {
@@ -13102,39 +13118,51 @@ fn resolve_target_manifest(
     }
     let mut delivers: Vec<String> = Vec::new();
     for res in &set.resources {
-        if carries_deployment(set.content(res)?, res, &target.deployment)? {
+        if carries_workload(set.content(res)?, res, &target.resource, &target.deployment)? {
             delivers.push(res.clone());
         }
     }
     match delivers.len() {
         1 => Ok(Some(delivers.remove(0))),
         0 => Err(SFError::Config(format!(
-            "no manifest in the release set delivers Deployment {}: target declared \
-             {declared}, and none of the {} resources is a Deployment by that name",
+            "no manifest in the release set delivers {}/{}: target declared \
+             {declared}, and none of the {} resources is a {} by that name",
+            target.resource,
             target.deployment,
-            set.resources.len()
+            set.resources.len(),
+            target.resource
         ))),
         n => Err(SFError::Config(format!(
-            "{n} manifests in the release set deliver Deployment {} ({delivers:?}); \
+            "{n} manifests in the release set deliver {}/{} ({delivers:?}); \
              a rollout target must be delivered by exactly one",
-            target.deployment
+            target.resource, target.deployment
         ))),
     }
 }
 
-/// 这份清单里是否有一个名为 `deployment` 的 Deployment 文档。多文档文件按
+/// 这份清单里是否有一个名为 `name` 的、`resource` 那一种工作负载。多文档文件按
 /// 文档逐个判：预渲染目录里一个文件一份清单，但发布集目录形态没有这个约束。
-pub(crate) fn carries_deployment(
+///
+/// 判的是**这一种**，不是"任意工作负载"：发布集里一个同名对象换了种（Deployment
+/// 改成 StatefulSet）时，按名字认会把它当成既有目标的那一份，而 apply 与 `set
+/// image` 用的是另一种词——两侧对不上，滚的还是一个不存在的对象。
+pub(crate) fn carries_workload(
     yaml_text: &str,
     origin: &str,
-    deployment: &str,
+    resource: &str,
+    name: &str,
 ) -> SFResult<bool> {
+    let Some(kind) = workload_kind_of_resource(resource) else {
+        return Err(SFError::Config(format!(
+            "{origin}: `{resource}` is not a workload kind this crate can address"
+        )));
+    };
     Ok(split_docs(yaml_text, origin)?.iter().any(|v| {
-        v.get("kind").and_then(|k| k.as_str()) == Some("Deployment")
+        v.get("kind").and_then(|k| k.as_str()) == Some(kind.kind)
             && v.get("metadata")
                 .and_then(|m| m.get("name"))
                 .and_then(|n| n.as_str())
-                == Some(deployment)
+                == Some(name)
     }))
 }
 
@@ -13324,9 +13352,20 @@ fn duplicate_resources(resources: &[String]) -> Option<&str> {
 
 pub struct RolloutTarget {
     pub deployment: String,
+    /// kubectl 认的资源词（`deployment` / `statefulset`）。每个读这个目标的
+    /// kubectl 调用都从这里取词：写死一个词的地方只会在换种工作负载的那一天
+    /// `NotFound`，而 `NotFound` 与「对象真的不在」在读数上同形。
+    pub resource: String,
     pub container: String,
     pub component: String,
     pub name: String,
+}
+
+impl RolloutTarget {
+    /// 目标的对象名，形如 `deployment/cogneva`：日志与 `kubectl rollout` 用同一份。
+    pub(crate) fn object(&self) -> String {
+        format!("{}/{}", self.resource, self.deployment)
+    }
 }
 
 pub(crate) fn field<'a>(value: &'a serde_json::Value, key: &str, absent: &'a str) -> &'a str {
@@ -14628,6 +14667,7 @@ exit 0
         );
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "cogneva".into(),
             name: "cogneva".into(),
@@ -14680,6 +14720,7 @@ exit 0
         );
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "cogneva".into(),
             name: "cogneva".into(),
@@ -14722,6 +14763,7 @@ exit 0
         );
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "cogneva".into(),
             name: "cogneva".into(),
@@ -16454,7 +16496,7 @@ for a in "$@"; do
   prev="$a"
 done
 case "$*" in
-  *"get deployment"*) echo "{deployed_image}" ;;
+  *"get deployment"*|*"get statefulset"*) echo "{deployed_image}" ;;
   *"get job"*) echo "Error: jobs.batch \"x\" not found" >&2; exit 1 ;;
   *"get pods"*) echo "0 true " ;;
   *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
@@ -16485,7 +16527,7 @@ exit 0
 printf '%s\n' "$*" >> '{log}'
 git --git-dir '{bare}' update-ref refs/heads/main {rev}
 case "$*" in
-  *"get deployment"*) echo "{deployed_image}" ;;
+  *"get deployment"*|*"get statefulset"*) echo "{deployed_image}" ;;
   *"get job"*) echo "Error: jobs.batch \"x\" not found" >&2; exit 1 ;;
   *"get pods"*) echo "0 true " ;;
   *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
@@ -24681,7 +24723,7 @@ exit 0
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
-  *"get deployment"*) echo "{deployed_image}" ;;
+  *"get deployment"*|*"get statefulset"*) echo "{deployed_image}" ;;
   *"job-name="*) printf '{message}' ;;
   *"get job"*) echo "{job_fields}" ;;
   *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
@@ -25121,7 +25163,7 @@ for a in "$@"; do
   prev="$a"
 done
 case "$*" in
-  *"get deployment"*) echo "localhost:30500/cogneva:local" ;;
+  *"get deployment"*|*"get statefulset"*) echo "localhost:30500/cogneva:local" ;;
   *"get job"*) echo "1||" ;;
   *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
   *"delete"*) echo "job.batch \"x\" deleted" ;;
@@ -25181,7 +25223,7 @@ printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"job-name="*) echo "{pod_state}" ;;
   *"get job"*) echo "|1|" ;;
-  *"get deployment"*) echo "{old_image}" ;;
+  *"get deployment"*|*"get statefulset"*) echo "{old_image}" ;;
   *"delete"*) echo 'job.batch "x" deleted' ;;
   *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
   *) echo ok ;;
@@ -26288,12 +26330,14 @@ exit 0
         );
         let target = RolloutTarget {
             deployment: "cogneva-evolution".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "evolution".into(),
             name: "cogneva".into(),
         };
         let other = RolloutTarget {
             deployment: "cogneva-sandbox-executor".into(),
+            resource: "statefulset".into(),
             container: "sandbox-executor".into(),
             component: "sandbox-executor".into(),
             name: "cogneva".into(),
@@ -26405,6 +26449,7 @@ exit 0
         );
         let target = RolloutTarget {
             deployment: "cogneva-evolution".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "evolution".into(),
             name: "cogneva".into(),
@@ -26498,6 +26543,7 @@ exit 0
         );
         let target = RolloutTarget {
             deployment: "cogneva-evolution".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "evolution".into(),
             name: "cogneva".into(),
@@ -26590,11 +26636,13 @@ exit 0
         );
         let target = RolloutTarget {
             deployment: "cogneva-evolution".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "evolution".into(),
             name: "cogneva".into(),
         };
         let templates = vec![TemplateSnapshot {
+            resource: "deployment".into(),
             name: "cogneva-evolution".into(),
             spec: serde_json::json!({
                 "containers": [{"name": "cogneva", "image": "localhost:30500/cogneva:main-old"}]
@@ -26676,11 +26724,13 @@ exit 0
         );
         let target = RolloutTarget {
             deployment: "cogneva-evolution".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "evolution".into(),
             name: "cogneva".into(),
         };
         let templates = vec![TemplateSnapshot {
+            resource: "deployment".into(),
             name: "cogneva-evolution".into(),
             spec: serde_json::json!({"containers": [{"name": "cogneva"}]}),
         }];
@@ -26736,7 +26786,7 @@ exit 0
         .unwrap();
         std::fs::write(
             manifests.join("deploy-cogneva-sandbox-executor.yaml"),
-            "kind: Deployment\nmetadata:\n  name: cogneva-sandbox-executor\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: seed-sandbox\n          image: localhost:30500/cogneva:main-new\n      containers:\n        - name: sandbox-executor\n          image: localhost:30500/cogneva:main-new\n",
+            "kind: StatefulSet\nmetadata:\n  name: cogneva-sandbox-executor\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: seed-sandbox\n          image: localhost:30500/cogneva:main-new\n      containers:\n        - name: sandbox-executor\n          image: localhost:30500/cogneva:main-new\n",
         )
         .unwrap();
         let log = bin_dir.join("kubectl.log");
@@ -26753,7 +26803,7 @@ printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"get deployment cogneva-registry --ignore-not-found"*)
     printf '%s\n' 'volume-walker=localhost:30500/cogneva:main-walkerold' ;;
-  *"get deployment cogneva-sandbox-executor --ignore-not-found"*)
+  *"get statefulset cogneva-sandbox-executor --ignore-not-found"*)
     printf '%s\n' 'sandbox-executor=localhost:30500/cogneva:main-old' 'seed-sandbox=localhost:30500/cogneva:main-seedold' ;;
   *"get deployment -o"*) echo "cogneva-registry 1" ;;
   *"get statefulset -o"*) ;;
@@ -26786,6 +26836,7 @@ exit 0
             tag: "localhost:30500/cogneva:main-new".into(),
             targets: vec![RolloutTarget {
                 deployment: "cogneva-sandbox-executor".into(),
+                resource: "statefulset".into(),
                 container: "sandbox-executor".into(),
                 component: "sandbox-executor".into(),
                 name: "cogneva".into(),
@@ -26804,7 +26855,7 @@ exit 0
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
             calls.contains(
-                "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old seed-sandbox=localhost:30500/cogneva:main-seedold"
+                "set image statefulset/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old seed-sandbox=localhost:30500/cogneva:main-seedold"
             ),
             "the rolled target must go back as one group: {calls}"
         );
@@ -27007,6 +27058,7 @@ echo "||1"
         let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "gateway".into(),
             name: "cogneva".into(),
@@ -27056,6 +27108,7 @@ echo "||1"
         let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "gateway".into(),
             name: "cogneva".into(),
@@ -27083,6 +27136,7 @@ echo "||1"
         let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "gateway".into(),
             name: "cogneva".into(),
@@ -27115,6 +27169,7 @@ echo "||1"
         let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "gateway".into(),
             name: "cogneva".into(),
@@ -27139,6 +27194,7 @@ echo "||1"
         let executor = RolloutExecutor::new(kubectl, "cogneva", 60, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "gateway".into(),
             name: "cogneva".into(),
@@ -27170,6 +27226,7 @@ echo "||1"
         let executor = RolloutExecutor::new(kubectl, "cogneva", 60, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "gateway".into(),
             name: "cogneva".into(),
@@ -27212,6 +27269,7 @@ echo "||1"
         let executor = RolloutExecutor::new(kubectl, "cogneva", 60, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "gateway".into(),
             name: "cogneva".into(),
@@ -27243,6 +27301,7 @@ echo "||1"
         let executor = RolloutExecutor::new(kubectl, "cogneva", 60, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "gateway".into(),
             name: "cogneva".into(),
@@ -27348,6 +27407,7 @@ echo "||1"
         ];
         let targets = vec![RolloutTarget {
             deployment: "cogneva-security-gateway".into(),
+            resource: "deployment".into(),
             container: "security-gateway".into(),
             component: "security-gateway".into(),
             name: "cogneva".into(),
@@ -27372,6 +27432,7 @@ echo "||1"
     fn a_statefulset_sharing_a_targets_name_is_not_that_target() {
         let targets = vec![RolloutTarget {
             deployment: "postgres".into(),
+            resource: "deployment".into(),
             container: "postgres".into(),
             component: "postgres".into(),
             name: "postgres".into(),
@@ -27955,6 +28016,7 @@ echo "||1"
         plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
         plan.targets = vec![RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "cogneva".into(),
             name: "cogneva".into(),
@@ -28010,6 +28072,7 @@ echo "||1"
         plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
         plan.targets = vec![RolloutTarget {
             deployment: "cogneva".into(),
+            resource: "deployment".into(),
             container: "cogneva".into(),
             component: "cogneva".into(),
             name: "cogneva".into(),
@@ -28387,7 +28450,7 @@ case "$*" in
     if [ -f '{applied}' ]; then echo "cogneva-registry 2"; else echo "cogneva-registry 1"; fi
     echo "meilisearch 1"
     ;;
-  *"get statefulset -o"*) ;;
+  *"get statefulset"*) echo "1|1|1|1|1|" ;;
   # 判死读数：工作负载对象给出它自己的选择器，Pod 列表给出逐容器的病因。模式尾不
   # 带通配：`-o json` 是等就绪那次读的 `-o jsonpath=...` 的前缀，带着通配会把两次
   # 读混成一次。
@@ -28637,7 +28700,7 @@ case "$*" in
   *"get deployment -o"*)
     if [ -f '{patched}' ]; then echo "cogneva-patcher 2"; else echo "cogneva-patcher 1"; fi
     echo "meilisearch 1" ;;
-  *"get statefulset -o"*) ;;
+  *"get statefulset"*) echo "1|1|1|1|1|" ;;
   # 被 patch 过之后代数才算前进，等它就绪才是"等这次 apply 动过的工作负载"。
   *"get deployment cogneva-patcher -o"*)
     if [ -f '{patched}' ]; then touch '{settled}'; echo "2|2|1|1|1|1|"; else echo "1|1|1|1|0|1|"; fi
@@ -29313,6 +29376,7 @@ exit 0
             tag: tag.to_string(),
             targets: vec![RolloutTarget {
                 deployment: "cogneva-sandbox-executor".into(),
+                resource: "statefulset".into(),
                 container: "sandbox-executor".into(),
                 component: "sandbox-executor".into(),
                 name: "cogneva".into(),
@@ -29338,7 +29402,7 @@ exit 0
 
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert!(
-            !calls.contains("set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"),
+            !calls.contains("set image statefulset/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"),
             "no rollback should happen: {calls}"
         );
     }
@@ -29376,7 +29440,7 @@ exit 0
 
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert!(
-            !calls.contains("set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"),
+            !calls.contains("set image statefulset/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"),
             "no rollback may be issued while the init container is still running: {calls}"
         );
         // 过了墙还在读：两轮轮询说明等待没有在第一眼就收尾。
@@ -29393,6 +29457,7 @@ exit 0
             tag: tag.to_string(),
             targets: vec![RolloutTarget {
                 deployment: "cogneva".into(),
+                resource: "deployment".into(),
                 container: "cogneva".into(),
                 component: "cogneva".into(),
                 name: "cogneva".into(),
@@ -29548,7 +29613,7 @@ exit 0
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert!(
             !calls.contains(
-                "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
+                "set image statefulset/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
             ),
             "no rollback should happen: {calls}"
         );
@@ -29962,7 +30027,7 @@ exit 0
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert!(
             calls.contains(
-                "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
+                "set image statefulset/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
             ),
             "a replica that never readies is a revision failure and must roll back: {calls}"
         );
@@ -30042,7 +30107,7 @@ exit 0
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert!(
             !calls.contains(
-                "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
+                "set image statefulset/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
             ),
             "an admission rejection must not roll the revision back: {calls}"
         );
@@ -30261,7 +30326,7 @@ exit 0
             "no rollback command may be issued when nothing was observed: {calls}"
         );
         assert!(
-            calls.contains("set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-new"),
+            calls.contains("set image statefulset/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-new"),
             "the revision must still have been pushed before the blackout: {calls}"
         );
     }
@@ -31031,7 +31096,8 @@ metadata:
     #[test]
     fn patch_deployment_image_rewrites_named_container() {
         let yaml = "kind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    spec:\n      containers:\n        - name: sidecar\n          image: old-side\n        - name: cogneva\n          image: old\n";
-        let out = patch_deployment_image(yaml, "d.yaml", "cogneva", "cogneva", "new").unwrap();
+        let out = patch_deployment_image(yaml, "d.yaml", "deployment", "cogneva", "cogneva", "new")
+            .unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         let containers = v
             .get("spec")
@@ -31058,6 +31124,7 @@ metadata:
         assert!(patch_deployment_image(
             "kind: Service\nmetadata:\n  name: cogneva\n",
             "s",
+            "deployment",
             "cogneva",
             "cogneva",
             "i"
@@ -31065,16 +31132,21 @@ metadata:
         .is_err());
         // 名字对不上。
         let d = "kind: Deployment\nmetadata:\n  name: other\nspec:\n  template:\n    spec:\n      containers:\n        - name: cogneva\n          image: old\n";
-        assert!(patch_deployment_image(d, "d", "cogneva", "cogneva", "i").is_err());
+        assert!(patch_deployment_image(d, "d", "deployment", "cogneva", "cogneva", "i").is_err());
         // 容器名不存在（命中 0 个）。
         let no_container = "kind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    spec:\n      containers:\n        - name: zzz\n          image: old\n";
-        assert!(patch_deployment_image(no_container, "d", "cogneva", "cogneva", "i").is_err());
+        assert!(
+            patch_deployment_image(no_container, "d", "deployment", "cogneva", "cogneva", "i")
+                .is_err()
+        );
         // 同名容器两个（命中 2 个，歧义拒绝）。
         let dup = "kind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    spec:\n      containers:\n        - name: cogneva\n          image: a\n        - name: cogneva\n          image: b\n";
-        assert!(patch_deployment_image(dup, "d", "cogneva", "cogneva", "i").is_err());
+        assert!(patch_deployment_image(dup, "d", "deployment", "cogneva", "cogneva", "i").is_err());
         // containers 结构缺失。
         let no_spec = "kind: Deployment\nmetadata:\n  name: cogneva\nspec: {}\n";
-        assert!(patch_deployment_image(no_spec, "d", "cogneva", "cogneva", "i").is_err());
+        assert!(
+            patch_deployment_image(no_spec, "d", "deployment", "cogneva", "cogneva", "i").is_err()
+        );
     }
 
     /// The tag separator is not "the last colon": a registry host carries a
@@ -31410,6 +31482,7 @@ spec:
         vec![
             RolloutTargetConfig {
                 deployment: "cogneva".into(),
+                resource: "deployment".into(),
                 container: "cogneva".into(),
                 component: "gateway".into(),
                 name: "cogneva".into(),
@@ -31417,6 +31490,7 @@ spec:
             },
             RolloutTargetConfig {
                 deployment: "cogneva-evolution".into(),
+                resource: "deployment".into(),
                 container: "cogneva".into(),
                 component: "evolution".into(),
                 name: "cogneva".into(),
@@ -31437,6 +31511,14 @@ spec:
     fn deployment_yaml(name: &str, container: &str) -> String {
         format!(
             "kind: Deployment\nmetadata:\n  name: {name}\nspec:\n  template:\n    spec:\n      containers:\n        - name: {container}\n          image: placeholder\n"
+        )
+    }
+
+    /// 一副副本一块卷的那种工作负载：Pod 模板与 Deployment 同形，另有无头 Service
+    /// 名与卷模板。发布集里它要么是目标（`statefulset`），要么随支撑面一起走。
+    fn statefulset_yaml(name: &str, container: &str) -> String {
+        format!(
+            "kind: StatefulSet\nmetadata:\n  name: {name}\nspec:\n  serviceName: {name}-pods\n  template:\n    spec:\n      containers:\n        - name: {container}\n          image: placeholder\n"
         )
     }
 
@@ -31501,7 +31583,7 @@ spec:
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("no manifest in the release set delivers Deployment cogneva-evolution"),
+                .contains("no manifest in the release set delivers deployment/cogneva-evolution"),
             "{err}"
         );
         // kustomization 引用了 files 里不存在的资源：硬错误。
@@ -31598,6 +31680,7 @@ spec:
         let err = patch_deployment_image(
             &with_secret,
             "evolution-deployment.yaml",
+            "deployment",
             "cogneva-evolution",
             "cogneva",
             "img",
@@ -31614,6 +31697,7 @@ spec:
         let err = patch_deployment_image(
             &wrong_name,
             "evolution-deployment.yaml",
+            "deployment",
             "cogneva-evolution",
             "cogneva",
             "img",
@@ -31629,6 +31713,7 @@ spec:
         let err = patch_deployment_image(
             no_deploy,
             "evolution-deployment.yaml",
+            "deployment",
             "cogneva-evolution",
             "cogneva",
             "img",
@@ -31652,7 +31737,7 @@ spec:
         std::fs::create_dir_all(&k3s).unwrap();
         std::fs::write(
             k3s.join("kustomization.yaml"),
-            "resources:\n  - namespace.yaml\n  - configmap.yaml\n  - gateway-deployment.yaml\n  - sandbox-executor-deployment.yaml\n  - deployment.yaml\n  - evolution-deployment.yaml\n",
+            "resources:\n  - namespace.yaml\n  - configmap.yaml\n  - gateway-deployment.yaml\n  - sandbox-executor-statefulset.yaml\n  - deployment.yaml\n  - evolution-deployment.yaml\n",
         )
         .unwrap();
         std::fs::write(
@@ -31671,8 +31756,8 @@ spec:
         )
         .unwrap();
         std::fs::write(
-            k3s.join("sandbox-executor-deployment.yaml"),
-            deployment_yaml("cogneva-sandbox-executor", "sandbox-executor"),
+            k3s.join("sandbox-executor-statefulset.yaml"),
+            statefulset_yaml("cogneva-sandbox-executor", "sandbox-executor"),
         )
         .unwrap();
         std::fs::write(
@@ -32066,7 +32151,7 @@ exit 0
         let err = build_rollout_bundle(&set, &targets, "img").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("no manifest in the release set delivers Deployment cogneva-evolution"),
+            msg.contains("no manifest in the release set delivers deployment/cogneva-evolution"),
             "{msg}"
         );
         assert!(msg.contains("evolution-deployment.yaml"), "{msg}");
@@ -32093,7 +32178,7 @@ exit 0
         let err = build_rollout_bundle(&set, &bundle_targets(), "img").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("2 manifests in the release set deliver Deployment cogneva"),
+            msg.contains("2 manifests in the release set deliver deployment/cogneva"),
             "{msg}"
         );
     }
