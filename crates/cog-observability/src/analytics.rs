@@ -461,11 +461,17 @@ pub fn postgres_table_ddl(table: &str) -> String {
             session_id VARCHAR(64),
             task_id VARCHAR(64),
             agent_id VARCHAR(64),
-            properties JSONB NOT NULL DEFAULT '{{}}',
+            properties TEXT NOT NULL DEFAULT '{{}}',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_{table}_type_time ON {table}(event_type, timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_{table}_time ON {table}(timestamp DESC);
+        -- 这张表的名字是运行期给的（每个 sink 一张），迁移链写不出它，所以
+        -- 把「已经存在的那张表」的形状补齐放在这里——与 CREATE 同一个出处，
+        -- 两条语句一起保证：新建的是 text，早就建好的也变成 text。
+        ALTER TABLE {table} ALTER COLUMN properties DROP DEFAULT;
+        ALTER TABLE {table} ALTER COLUMN properties TYPE TEXT USING properties::text;
+        ALTER TABLE {table} ALTER COLUMN properties SET DEFAULT '{{}}';
         "#
     )
 }
@@ -530,7 +536,8 @@ impl AnalyticsBackend for PostgresAnalyticsBackend {
             .bind(&ev.session_id)
             .bind(&ev.task_id)
             .bind(&ev.agent_id)
-            .bind(serde_json::to_value(&ev.properties)?)
+            // 载荷整块读、整块写：存 JSON 文本，不存一个可以被 `->>` 索引进去的形状。
+            .bind(serde_json::to_string(&ev.properties)?)
             .execute(&self.pool)
             .await?;
         }
@@ -647,7 +654,7 @@ struct AnalyticsRow {
     session_id: Option<String>,
     task_id: Option<String>,
     agent_id: Option<String>,
-    properties: Value,
+    properties: String,
 }
 
 impl AnalyticsRow {
@@ -660,10 +667,12 @@ impl AnalyticsRow {
             session_id: self.session_id,
             task_id: self.task_id,
             agent_id: self.agent_id,
-            properties: self
-                .properties
-                .as_object()
-                .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            properties: serde_json::from_str::<Value>(&self.properties)
+                .ok()
+                .and_then(|v| {
+                    v.as_object()
+                        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                })
                 .unwrap_or_default(),
         }
     }

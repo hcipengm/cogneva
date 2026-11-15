@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS summary_entries (
     namespace         TEXT        NOT NULL DEFAULT 'default',
     text              TEXT        NOT NULL,
     embedding         REAL[]      NOT NULL,
-    sparse_embedding  JSONB,
+    -- 稀疏向量整块读、整块写：它是一段载荷，不是可以按键查的东西。
+    sparse_embedding  TEXT,
     embedding_model   TEXT        NOT NULL DEFAULT '',
     raw_uri           TEXT        NOT NULL,
     range_spec        TEXT,
@@ -39,13 +40,17 @@ CREATE TABLE IF NOT EXISTS summary_entries (
     extracted_at      TIMESTAMPTZ NOT NULL,
     confidence        REAL        NOT NULL DEFAULT 1.0,
     importance        REAL        NOT NULL DEFAULT 0.5,
-    related_schema_ids JSONB,
+    related_schema_ids TEXT,
     retrieval_count   BIGINT      NOT NULL DEFAULT 0,
     last_retrieved_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_summary_entries_ns_raw_uri ON summary_entries(namespace, raw_uri);
 ALTER TABLE summary_entries ADD COLUMN IF NOT EXISTS retrieval_count BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE summary_entries ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ;
+-- 已经在库里的那两列搬过来。改成 text 不必丢数据，也不必换列名：
+-- `USING c::text` 就是把 JSON 文档原样存成文本，读的一端解析一次。
+ALTER TABLE summary_entries ALTER COLUMN sparse_embedding TYPE TEXT USING sparse_embedding::text;
+ALTER TABLE summary_entries ALTER COLUMN related_schema_ids TYPE TEXT USING related_schema_ids::text;
 "#;
 
 /// A one-time correction, not a schema change, applied after
@@ -128,11 +133,13 @@ impl PostgresEntryStore {
         let embedding: Vec<f32> = row
             .try_get("embedding")
             .map_err(|e| SFError::Agent(format!("decode embedding: {}", e)))?;
+        // 存的是 JSON 文本：坏行读成「没有稀疏向量」而不是让整批读失败——
+        // 这一条的稠密向量和正文仍然是真的。
         let sparse_embedding: Option<cog_core::SparseEmbedding> = row
-            .try_get::<Option<serde_json::Value>, _>("sparse_embedding")
+            .try_get::<Option<String>, _>("sparse_embedding")
             .ok()
             .flatten()
-            .and_then(|v| serde_json::from_value(v).ok());
+            .and_then(|text| serde_json::from_str(&text).ok());
         let embedding_model: String = row
             .try_get("embedding_model")
             .map_err(|e| SFError::Agent(format!("decode embedding_model: {}", e)))?;
@@ -155,10 +162,10 @@ impl PostgresEntryStore {
             .try_get("importance")
             .map_err(|e| SFError::Agent(format!("decode importance: {}", e)))?;
         let related_schema_ids: Vec<String> = row
-            .try_get::<Option<serde_json::Value>, _>("related_schema_ids")
+            .try_get::<Option<String>, _>("related_schema_ids")
             .ok()
             .flatten()
-            .and_then(|v| serde_json::from_value(v).ok())
+            .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
         let retrieval_count: i64 = row
             .try_get("retrieval_count")
@@ -274,9 +281,8 @@ impl SummaryEntryStore for PostgresEntryStore {
         let sparse_json = entry
             .sparse_embedding
             .as_ref()
-            .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null));
-        let related_json =
-            serde_json::to_value(&entry.related_schema_ids).unwrap_or(serde_json::Value::Null);
+            .and_then(|s| serde_json::to_string(s).ok());
+        let related_json = serde_json::to_string(&entry.related_schema_ids).unwrap_or_default();
 
         sqlx::query(
             r#"

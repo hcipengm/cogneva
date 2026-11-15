@@ -100,7 +100,7 @@ async fn seed(pool: &PgPool, table: &str, rows: i64) {
     sqlx::query(&format!(
         "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
          SELECT 'histogram', 'probe_operation_ms', g::float8,
-                jsonb_build_object('bucket', (g % 20)::text),
+                jsonb_build_object('bucket', (g % 20)::text)::text,
                 NOW() - make_interval(secs => 600000 + g::float8)
          FROM generate_series(0, 299) AS g"
     ))
@@ -110,7 +110,7 @@ async fn seed(pool: &PgPool, table: &str, rows: i64) {
     sqlx::query(&format!(
         "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
          SELECT 'counter', 'probe_writes_total', g::float8,
-                jsonb_build_object('object', (g % 50)::text),
+                jsonb_build_object('object', (g % 50)::text)::text,
                 NOW() - make_interval(secs => 550000 + g::float8)
          FROM generate_series(0, 1999) AS g"
     ))
@@ -121,7 +121,7 @@ async fn seed(pool: &PgPool, table: &str, rows: i64) {
     // are history, not the name.
     sqlx::query(&format!(
         "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
-         SELECT 'counter', 'probe_shared', g::float8, '{{}}'::jsonb,
+         SELECT 'counter', 'probe_shared', g::float8, '{{}}',
                 NOW() - make_interval(secs => 500000 + g::float8)
          FROM generate_series(0, 4) AS g"
     ))
@@ -130,7 +130,7 @@ async fn seed(pool: &PgPool, table: &str, rows: i64) {
     .unwrap();
     sqlx::query(&format!(
         "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
-         SELECT 'gauge', 'probe_shared', 1.0, '{{}}'::jsonb,
+         SELECT 'gauge', 'probe_shared', 1.0, '{{}}',
                 NOW() - make_interval(secs => 490000)
          FROM generate_series(0, 0) AS g"
     ))
@@ -140,7 +140,7 @@ async fn seed(pool: &PgPool, table: &str, rows: i64) {
     sqlx::query(&format!(
         "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
          SELECT 'gauge', 'probe_stopped', g::float8,
-                jsonb_build_object('series', (g % 3)::text),
+                jsonb_build_object('series', (g % 3)::text)::text,
                 NOW() - make_interval(secs => 400000 + g::float8)
          FROM generate_series(0, 59) AS g"
     ))
@@ -150,7 +150,7 @@ async fn seed(pool: &PgPool, table: &str, rows: i64) {
     sqlx::query(&format!(
         "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
          SELECT 'gauge', 'probe_busy', g::float8,
-                jsonb_build_object('series', (g % 40)::text),
+                jsonb_build_object('series', (g % 40)::text)::text,
                 NOW() - make_interval(secs => ($1 - g)::float8 / 1.7)
          FROM generate_series(0, $1 - 1) AS g"
     ))

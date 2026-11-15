@@ -45,7 +45,7 @@ async fn fresh_probe(pool: &PgPool, table: &str) {
              metric_type TEXT NOT NULL,
              name TEXT NOT NULL,
              value DOUBLE PRECISION NOT NULL,
-             labels JSONB NOT NULL DEFAULT '{{}}',
+             labels TEXT NOT NULL DEFAULT '{{}}',
              timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
          )"
     ))
@@ -73,7 +73,7 @@ async fn insert_series(pool: &PgPool, table: &str, series: i64, rows: i64) {
     sqlx::query(&format!(
         "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
          SELECT 'gauge', 'probe_gauge', 1.0,
-                jsonb_build_object('series', g % $1),
+                jsonb_build_object('series', g % $1)::text,
                 NOW() - make_interval(secs => g)
          FROM generate_series(0, $2 - 1) AS g"
     ))
@@ -90,7 +90,7 @@ async fn insert_counter_series(pool: &PgPool, table: &str, series: i64, rows: i6
     sqlx::query(&format!(
         "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
          SELECT 'counter', 'probe_total', 1.0,
-                jsonb_build_object('object', g % $1),
+                jsonb_build_object('object', g % $1)::text,
                 NOW() - make_interval(secs => g)
          FROM generate_series(0, $2 - 1) AS g"
     ))

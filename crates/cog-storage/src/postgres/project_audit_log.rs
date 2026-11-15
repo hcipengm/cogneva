@@ -29,11 +29,12 @@ fn is_uuid(s: &str) -> bool {
 /// 这张表需要的额外索引。
 ///
 /// 表自己的三条索引是给「某个用户做过什么」「某类动作发生过什么」用的；项目面问的是
-/// 「这个项目的改动」，而那要看 `details->>'project_id'`。表达式索引是这唯一一种查询
-/// 形状的代价；没有它，每打开一个项目的时间线就扫一遍整张审计表。
+/// 「这个项目的改动」，而那要按 `project_id` 取行。它曾经是一条表达式索引
+/// （`(details->>'project_id')`）——那是这一列还不是列的时候，唯一一种能按值筛的
+/// 写法；现在它是一个真列，索引也就退化成普通的一种。
 pub const DDL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_audit_logs_project
-        ON audit_logs ((details->>'project_id'));
+        ON audit_logs (project_id);
 "#;
 
 /// Postgres 实现。
@@ -63,21 +64,24 @@ impl ProjectAuditLog for PgProjectAuditLog {
         } else {
             None
         };
-        let details = serde_json::json!({
-            "actor": entry.actor,
-            "project_id": entry.project_id,
+        // 谁做的、哪个项目——这两样有各自的查询和各自的读者，是列。
+        // 改前改后是这一行的载荷，整块读，所以留在文档里，而文档存 text。
+        let payload = serde_json::json!({
             "before": entry.before,
             "after": entry.after,
         });
         sqlx::query(
-            "INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details) \
-             VALUES ((SELECT id FROM users WHERE id = $1::uuid), $2, $3, $4, $5)",
+            "INSERT INTO audit_logs \
+                 (user_id, action, resource_type, resource_id, actor, project_id, details) \
+             VALUES ((SELECT id FROM users WHERE id = $1::uuid), $2, $3, $4, $5, $6, $7)",
         )
         .bind(user_id)
         .bind(&entry.action)
         .bind(&entry.resource_type)
         .bind(&entry.resource_id)
-        .bind(&details)
+        .bind(&entry.actor)
+        .bind(&entry.project_id)
+        .bind(payload.to_string())
         .execute(&self.pool)
         .await
         .map_err(|e| cog_core::SFError::Database(format!("audit_logs insert failed: {e}")))?;
@@ -85,37 +89,50 @@ impl ProjectAuditLog for PgProjectAuditLog {
     }
 
     async fn recent(&self, project_id: &str, limit: i64) -> cog_core::SFResult<Vec<AuditRow>> {
-        let rows: Vec<(i64, Option<String>, String, String, String, serde_json::Value, chrono::DateTime<chrono::Utc>)> =
-            sqlx::query_as(
-                "SELECT id, details->>'actor', action, resource_type, resource_id, details, created_at \
+        let rows: Vec<(
+            i64,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            "SELECT id, actor, action, resource_type, resource_id, details, created_at \
                    FROM audit_logs \
-                  WHERE details->>'project_id' = $1 \
+                  WHERE project_id = $1 \
                   ORDER BY created_at DESC, id DESC \
                   LIMIT $2",
-            )
-            .bind(project_id)
-            .bind(limit.clamp(1, 500))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| cog_core::SFError::Database(format!("audit_logs read failed: {e}")))?;
+        )
+        .bind(project_id)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| cog_core::SFError::Database(format!("audit_logs read failed: {e}")))?;
         Ok(rows
             .into_iter()
             .map(
-                |(id, actor, action, resource_type, resource_id, details, created_at)| AuditRow {
-                    id,
-                    actor: actor.unwrap_or_else(|| "unknown".to_string()),
-                    action,
-                    resource_type,
-                    resource_id,
-                    before: details
-                        .get("before")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    after: details
-                        .get("after")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    created_at,
+                |(id, actor, action, resource_type, resource_id, details, created_at)| {
+                    // 文档是 JSON 文本：坏行读成空对象，这一行仍然按「改了什么没记下」
+                    // 出现在时间线上，而不是整条时间线读不出来。
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&details).unwrap_or(serde_json::Value::Null);
+                    AuditRow {
+                        id,
+                        actor: actor.unwrap_or_else(|| "unknown".to_string()),
+                        action,
+                        resource_type,
+                        resource_id,
+                        before: payload
+                            .get("before")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        after: payload
+                            .get("after")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        created_at,
+                    }
                 },
             )
             .collect())

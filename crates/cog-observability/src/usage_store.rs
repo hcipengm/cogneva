@@ -432,7 +432,11 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_allowance_tokens BIG
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_spent_tokens BIGINT;
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_reserve_tokens BIGINT;
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_window_start_unix BIGINT;
-ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_upstreams JSONB;
+-- 候选上游的名单：整块证据，没有一条 SQL 按里面的键筛过行，所以存 text。
+-- 先 ADD（老库上是 JSONB）再 TYPE：`ADD COLUMN IF NOT EXISTS` 对已经存在的列
+-- 什么也不做，只改类型那一句才是把这列搬到 text 的那一步。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_upstreams TEXT;
+ALTER TABLE gateway_llm_usage ALTER COLUMN pace_upstreams TYPE TEXT USING pace_upstreams::text;
 -- 熔断拒绝让调用方等多久。加这一列而不是复用 `refusal_kind`：那一格答的是
 -- "上游为什么拒"（熔断时一个上游都没试，永远是 `NULL`），这一格答的是"熔断器
 -- 说下次几点再来"。两种拒绝在账上都叫 `refused_by_circuit`，能把它们分开的只有
@@ -645,7 +649,7 @@ impl LlmUsageStore {
         let pace_upstreams = r
             .pace
             .as_ref()
-            .and_then(|p| serde_json::to_value(&p.upstreams).ok());
+            .and_then(|p| serde_json::to_string(&p.upstreams).ok());
         sqlx::query(
             r#"
             INSERT INTO gateway_llm_usage

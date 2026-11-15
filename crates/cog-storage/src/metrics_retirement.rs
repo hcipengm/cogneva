@@ -504,7 +504,8 @@ impl MetricsRetirement {
     /// 名册那一步：把 [`ROSTERED_LABEL_SERIES`] 里不在当前名册上的取值，从一张表里
     /// 删掉。
     ///
-    /// 三条腿：这行带 [`ROSTER_LABEL`]、它的取值不在**新鲜**的名册上、它自己安静够久。
+    /// 三条腿：这行的 [`ROSTER_LABEL`] 列有值、那个值不在**新鲜**的名册上、它自己
+    /// 安静够久。这个键在样本表上是一列（`upstream`），不是标签集里的一个键。
     /// 第四条腿在语句外面：名册一条新鲜行都没有时整条语句不执行——名册缺席不是「池空
     /// 了」，而是写者停了或进程刚起，那时按缺席删会把还活着的一族整族删掉。
     ///
@@ -530,7 +531,6 @@ impl MetricsRetirement {
         match batch_by {
             None => Ok(sqlx::query(&sql)
                 .bind(&names)
-                .bind(ROSTER_LABEL)
                 .bind(ROSTER_SERIES.as_str())
                 .bind(fresh)
                 .bind(quiet)
@@ -543,7 +543,6 @@ impl MetricsRetirement {
                 loop {
                     let deleted = sqlx::query(&sql)
                         .bind(&names)
-                        .bind(ROSTER_LABEL)
                         .bind(ROSTER_SERIES.as_str())
                         .bind(fresh)
                         .bind(quiet)
@@ -580,22 +579,26 @@ impl MetricsRetirement {
         // `NOT IN` 的两边都先剔掉 NULL：子查询里一条不带该标签的名册行会让整个 `NOT
         // IN` 变成 NULL，那会把**每一条**候选都判成「不能删」——一个形状守卫最坏的
         // 失效方向是静默不删，比删错好，但它会让这一整条通道看起来在工作其实没有。
+        // 名册那个键是一个真列。这一句问的是「这一行的上游在不在新鲜的名单上」，
+        // 要的是那个键的**值**——所以它的形状是列的比较，不再是按标签名索引进去。
+        // 标签集本身已经只是指纹（`text`），按名索引的那一下在新形状里没有对应物，
+        // 留着它只会在类型改完之后报「operator does not exist」。
         let legs = format!(
             "t.name = ANY($1)
-               AND t.labels ? $2
-               AND t.labels ->> $2 NOT IN (
-                     SELECT r.labels ->> $2 FROM {roster} r
-                      WHERE r.name = $3
-                        AND r.labels ? $2
-                        AND r.timestamp > NOW() - ($4::double precision * INTERVAL '1 second')
+               AND t.upstream IS NOT NULL
+               AND t.upstream NOT IN (
+                     SELECT r.upstream FROM {roster} r
+                      WHERE r.name = $2
+                        AND r.upstream IS NOT NULL
+                        AND r.timestamp > NOW() - ($3::double precision * INTERVAL '1 second')
                    )
-               AND {mine} < NOW() - ($5::double precision * INTERVAL '1 second')"
+               AND {mine} < NOW() - ($4::double precision * INTERVAL '1 second')"
         );
         let fresh_roster = format!(
             "EXISTS (
                    SELECT 1 FROM {roster} r2
-                    WHERE r2.name = $3
-                      AND r2.timestamp > NOW() - ($4::double precision * INTERVAL '1 second')
+                    WHERE r2.name = $2
+                      AND r2.timestamp > NOW() - ($3::double precision * INTERVAL '1 second')
                  )"
         );
         match batch_by {

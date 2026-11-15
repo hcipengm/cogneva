@@ -475,9 +475,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         "the boundary has to land with the other three numbers: allowance alone cannot \
          tell a window that has not opened yet from one burned down to nothing"
     );
-    let upstreams = row
-        .get::<Option<serde_json::Value>, _>("pace_upstreams")
-        .expect("a paced refusal names the candidates it was refused on");
+    // 这一列存的是 JSON 文本：整块写、整块读，没有哪条 SQL 按里面的键筛行。
+    let upstreams: serde_json::Value = serde_json::from_str(
+        &row.get::<Option<String>, _>("pace_upstreams")
+            .expect("a paced refusal names the candidates it was refused on"),
+    )
+    .expect("the candidates are stored as JSON text");
     let first = &upstreams[0];
     assert_eq!(first["upstream"], "https://a.example.com|m1");
     assert_eq!(first["wait_secs"], 120);
@@ -504,10 +507,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     assert_eq!(row.get::<Option<i64>, _>("pace_spent_tokens"), None);
     assert_eq!(row.get::<Option<i64>, _>("pace_reserve_tokens"), None);
     assert_eq!(row.get::<Option<i64>, _>("pace_window_start_unix"), None);
-    assert_eq!(
-        row.get::<Option<serde_json::Value>, _>("pace_upstreams"),
-        None
-    );
+    assert_eq!(row.get::<Option<String>, _>("pace_upstreams"), None);
     let pace_shape = sqlx::query(
         "SELECT is_nullable, column_default FROM information_schema.columns \
          WHERE table_name = 'gateway_llm_usage' AND column_name = 'pace_allowance_tokens'",

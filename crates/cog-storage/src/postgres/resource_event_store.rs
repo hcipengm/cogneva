@@ -151,7 +151,12 @@ fn event_from_row(row: &sqlx::postgres::PgRow) -> Result<ResourceEvent, SFError>
         from_value: row.try_get("from_value").map_err(|e| db(e, "from_value"))?,
         to_value: row.try_get("to_value").map_err(|e| db(e, "to_value"))?,
         outcome,
-        detail: row.try_get("detail").map_err(|e| db(e, "detail"))?,
+        // `detail` 是自由字段：整块写、整块读，筛选靠它旁边的 subject / reading /
+        // outcome。存 text，坏行读成空文档——一条事件的其他列仍然是真的。
+        detail: {
+            let text: String = row.try_get("detail").map_err(|e| db(e, "detail"))?;
+            serde_json::from_str(&text).unwrap_or_default()
+        },
         count: row.try_get("count").map_err(|e| db(e, "count"))?,
     })
 }
@@ -200,7 +205,7 @@ impl ResourceEventStore for PostgresResourceEventStore {
                 .bind(event.from_value)
                 .bind(event.to_value)
                 .bind(event.outcome.as_str())
-                .bind(&event.detail)
+                .bind(event.detail.to_string())
                 .bind(event.count)
                 .fetch_one(&self.pool)
                 .await

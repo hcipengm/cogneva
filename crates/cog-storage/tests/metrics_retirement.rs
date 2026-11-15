@@ -59,7 +59,8 @@ impl Probe {
                      metric_type TEXT NOT NULL,
                      name TEXT NOT NULL,
                      value DOUBLE PRECISION NOT NULL,
-                     labels JSONB NOT NULL DEFAULT '{{}}',
+                     labels TEXT NOT NULL DEFAULT '{{}}',
+                     upstream TEXT,
                      timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
                  )",
                 self.samples
@@ -67,7 +68,8 @@ impl Probe {
             format!(
                 "CREATE TABLE {} (
                      name TEXT NOT NULL,
-                     labels JSONB NOT NULL DEFAULT '{{}}',
+                     labels TEXT NOT NULL DEFAULT '{{}}',
+                     upstream TEXT,
                      value DOUBLE PRECISION NOT NULL,
                      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                      PRIMARY KEY (name, labels)
@@ -77,7 +79,8 @@ impl Probe {
             format!(
                 "CREATE TABLE {} (
                      name TEXT NOT NULL,
-                     labels JSONB NOT NULL DEFAULT '{{}}',
+                     labels TEXT NOT NULL DEFAULT '{{}}',
+                     upstream TEXT,
                      bucket INTEGER NOT NULL,
                      observations BIGINT NOT NULL,
                      PRIMARY KEY (name, labels, bucket)
@@ -87,7 +90,8 @@ impl Probe {
             format!(
                 "CREATE TABLE {} (
                      name TEXT NOT NULL,
-                     labels JSONB NOT NULL DEFAULT '{{}}',
+                     labels TEXT NOT NULL DEFAULT '{{}}',
+                     upstream TEXT,
                      sum DOUBLE PRECISION NOT NULL,
                      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                      PRIMARY KEY (name, labels)
@@ -332,8 +336,9 @@ fn long_quiet() -> f64 {
 
 async fn insert_aged_counter(pool: &PgPool, table: &str, name: &str, labels: &str, age_hours: f64) {
     sqlx::query(&format!(
-        "INSERT INTO {table} (name, labels, value, updated_at)
-         VALUES ($1, $2::jsonb, 0, NOW() - ($3::double precision * INTERVAL '1 hour'))"
+        "INSERT INTO {table} (name, labels, upstream, value, updated_at)
+         VALUES ($1, $2, $2::jsonb ->> 'upstream', 0,
+                 NOW() - ($3::double precision * INTERVAL '1 hour'))"
     ))
     .bind(name)
     .bind(labels)
@@ -345,7 +350,8 @@ async fn insert_aged_counter(pool: &PgPool, table: &str, name: &str, labels: &st
 
 async fn insert_bucket(pool: &PgPool, table: &str, name: &str, labels: &str) {
     sqlx::query(&format!(
-        "INSERT INTO {table} (name, labels, bucket, observations) VALUES ($1, $2::jsonb, 0, 1)"
+        "INSERT INTO {table} (name, labels, upstream, bucket, observations)
+         VALUES ($1, $2, $2::jsonb ->> 'upstream', 0, 1)"
     ))
     .bind(name)
     .bind(labels)
@@ -356,8 +362,9 @@ async fn insert_bucket(pool: &PgPool, table: &str, name: &str, labels: &str) {
 
 async fn insert_aged_sum(pool: &PgPool, table: &str, name: &str, labels: &str, age_hours: f64) {
     sqlx::query(&format!(
-        "INSERT INTO {table} (name, labels, sum, updated_at)
-         VALUES ($1, $2::jsonb, 0.5, NOW() - ($3::double precision * INTERVAL '1 hour'))"
+        "INSERT INTO {table} (name, labels, upstream, sum, updated_at)
+         VALUES ($1, $2, $2::jsonb ->> 'upstream', 0.5,
+                 NOW() - ($3::double precision * INTERVAL '1 hour'))"
     ))
     .bind(name)
     .bind(labels)
@@ -376,8 +383,11 @@ async fn insert_aged_samples(
     rows: i64,
 ) {
     sqlx::query(&format!(
-        "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
-         SELECT 'counter', $1, 0, $2::jsonb, NOW() - ($3::double precision * INTERVAL '1 hour')
+        // `upstream` 跟着标签集一起写，与真实的写入端同一条腿：名册那一步读的
+        // 是这一列，种子只填标签集会让它在测试里永远看不见上游。
+        "INSERT INTO {table} (metric_type, name, value, labels, upstream, timestamp)
+         SELECT 'counter', $1, 0, $2, $2::jsonb ->> 'upstream',
+                NOW() - ($3::double precision * INTERVAL '1 hour')
          FROM generate_series(1, $4)"
     ))
     .bind(name)
@@ -391,13 +401,11 @@ async fn insert_aged_samples(
 
 /// Rows still in the probe log under one `upstream` label value.
 async fn count_upstream(pool: &PgPool, table: &str, upstream: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
-        "SELECT count(*) FROM {table} WHERE labels ->> 'upstream' = $1"
-    ))
-    .bind(upstream)
-    .fetch_one(pool)
-    .await
-    .unwrap()
+    sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table} WHERE upstream = $1"))
+        .bind(upstream)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// A shape is released on its own, with no name retired at all.

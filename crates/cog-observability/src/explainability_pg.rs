@@ -63,7 +63,8 @@ impl ExplainabilityBackend for PostgresExplainabilityBackend {
         .bind(&record.model)
         .bind(record.input_tokens as i64)
         .bind(record.output_tokens as i64)
-        .bind(data)
+        // 载荷整块读、整块写：存 text，让这一列在类型上就不再声称可查询。
+        .bind(serde_json::to_string(&data)?)
         .execute(&self.pool)
         .await?;
 
@@ -219,7 +220,13 @@ impl ExplainabilityBackend for PostgresExplainabilityBackend {
 }
 
 fn row_to_record(row: sqlx::postgres::PgRow) -> ExplainabilityRecord {
-    let data: serde_json::Value = row.try_get("data").unwrap_or_default();
+    // 存的是 JSON 文本：坏行读成空文档而不是让整批读失败——这条记录已经落了库，
+    // 丢掉它的代价是「这一条解释没了」，不是「解释面没了」。
+    let data: serde_json::Value = row
+        .try_get::<String, _>("data")
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
     let reasoning_chain = data
         .get("reasoning_chain")
         .and_then(|v| v.as_array())

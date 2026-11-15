@@ -4129,7 +4129,9 @@ export async function getJson(path: string): Promise<unknown> {
 
 /** 知识检索：跨库按语义找。此前只有接口，界面上没有入口。 */
 export async function searchKnowledge(query: string, limit = 20): Promise<unknown> {
-  return api.post('/api/v1/knowledge/search', { query, limit });
+  // 处理函数读的是 `query` 与 `top_k`：发一个它不认的键（`limit`）不会报错，
+  // serde 只会丢掉它，服务端拿到默认值——界面上这次搜索「成功」返回，条数却不是你选的。
+  return api.post('/api/v1/knowledge/search', { query, top_k: limit });
 }
 
 /** 平台搜索：把一次查询同时问向几个面。路由只答 GET，查询条件走查询串。 */

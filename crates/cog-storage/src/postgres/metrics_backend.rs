@@ -37,9 +37,10 @@ fn series_key(labels: &HashMap<String, String>) -> String {
 /// exact, `ORDER BY timestamp DESC LIMIT 1`). The recursion stops on the row
 /// the walk returns past the last label set, whose NULL the outer query drops,
 /// so the walk costs one descent per series and the answer costs one row per
-/// series. `jsonb` defines an ordering but no `min()`/`max()` aggregate, hence
-/// the `ORDER BY labels LIMIT 1` probes rather than an aggregate: an aggregate
-/// over the label sets would also have to read every sample behind them.
+/// series. The label set is `text` -- it has a total order, and `labels >` walks
+/// it -- and the probes stay `ORDER BY labels LIMIT 1` rather than an aggregate:
+/// an aggregate over the label sets would also have to read every sample behind
+/// them, which is the cost this shape exists to avoid.
 ///
 /// A single `DISTINCT ON (labels) ... ORDER BY labels, timestamp DESC` asks for
 /// the same rows and reads the same index, but it reaches its bound only if the
@@ -95,7 +96,13 @@ CREATE TABLE IF NOT EXISTS cog_metrics_samples (
                 metric_type TEXT NOT NULL,
                 name TEXT NOT NULL,
                 value DOUBLE PRECISION NOT NULL,
-                labels JSONB NOT NULL DEFAULT '{}',
+                -- 标签集是指纹：只被比较是否相等、被排序。存 text，不存一个能被
+                -- `->>` 索引进去的形状。写法由写入端交给服务端规整（见
+                -- SAMPLE_INSERT_SQL），与历史行的 `labels::text` 逐字节相同。
+                labels TEXT NOT NULL DEFAULT '{}',
+                -- 名册那一步按这一个键的**值**筛行，它不是一个整块读的载荷，
+                -- 所以它有列。
+                upstream TEXT,
                 timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
 ;
@@ -109,7 +116,10 @@ CREATE INDEX IF NOT EXISTS idx_cog_metrics_latest_series
 ;
 CREATE TABLE IF NOT EXISTS cog_metric_counter_totals (
                 name TEXT NOT NULL,
-                labels JSONB NOT NULL DEFAULT '{}',
+                labels TEXT NOT NULL DEFAULT '{}',
+                -- 名册那一步对四张表问同一个问题（「这行的上游还在新鲜名册上吗」），
+                -- 所以四张表都带这一列；它只是标签集里那一个键的投影。
+                upstream TEXT,
                 value DOUBLE PRECISION NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (name, labels)
@@ -117,7 +127,8 @@ CREATE TABLE IF NOT EXISTS cog_metric_counter_totals (
 ;
 CREATE TABLE IF NOT EXISTS cog_metric_histogram_buckets (
                 name TEXT NOT NULL,
-                labels JSONB NOT NULL DEFAULT '{}',
+                labels TEXT NOT NULL DEFAULT '{}',
+                upstream TEXT,
                 bucket INTEGER NOT NULL,
                 observations BIGINT NOT NULL,
                 PRIMARY KEY (name, labels, bucket)
@@ -125,7 +136,8 @@ CREATE TABLE IF NOT EXISTS cog_metric_histogram_buckets (
 ;
 CREATE TABLE IF NOT EXISTS cog_metric_histogram_sums (
                 name TEXT NOT NULL,
-                labels JSONB NOT NULL DEFAULT '{}',
+                labels TEXT NOT NULL DEFAULT '{}',
+                upstream TEXT,
                 sum DOUBLE PRECISION NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (name, labels)
@@ -348,7 +360,7 @@ impl PostgresMetricsBackend {
         end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>> {
         self.flush_pending().await?;
-        let rows: Vec<(f64, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+        let rows: Vec<(f64, String, DateTime<Utc>)> = sqlx::query_as(
             r#"
             SELECT value, labels, timestamp
             FROM cog_metrics_samples
@@ -367,7 +379,7 @@ impl PostgresMetricsBackend {
         let mut samples = Vec::with_capacity(rows.len());
         for (value, labels_json, timestamp) in rows {
             let labels: HashMap<String, String> =
-                serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
+                serde_json::from_str(&labels_json).map_err(SFError::Serialization)?;
             samples.push(MetricSample {
                 timestamp,
                 value,
@@ -454,37 +466,46 @@ impl BucketAccumulated {
 /// The arrays arrive as `text[]` and are cast on the way in: the driver sends
 /// both a JSON text and a `jsonb` the same way, and casting on the server keeps
 /// the client side to types every caller already has.
+///
+/// `::jsonb::text` is not a round trip for its own sake. The label set is a
+/// row's identity -- `ON CONFLICT (name, labels)` and every `labels =` compare by
+/// it -- so there can be exactly one spelling of it in the column. The client
+/// sends compact JSON; `::jsonb::text` hands back PostgreSQL's own spelling, the
+/// same one `labels::text` wrote into the rows that were already there when the
+/// column was still `jsonb`. A writer that spelled it itself would split every
+/// pre-existing series into two rows, one holding each half of its count.
 const SAMPLE_INSERT_SQL: &str = r#"
-    INSERT INTO cog_metrics_samples (metric_type, name, value, labels, timestamp)
-    SELECT t.kind, t.name, t.value, t.labels::jsonb, NOW()
+    INSERT INTO cog_metrics_samples (metric_type, name, value, labels, upstream, timestamp)
+    SELECT t.kind, t.name, t.value, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', NOW()
     FROM unnest($1::text[], $2::text[], $3::float8[], $4::text[]) AS t(kind, name, value, labels)
 "#;
 
 /// `SUM` over the batch, so one series is one row for the upsert to touch.
 const COUNTER_TOTAL_UPSERT_SQL: &str = r#"
-    INSERT INTO cog_metric_counter_totals (name, labels, value)
-    SELECT t.name, t.labels::jsonb, SUM(t.value)
+    INSERT INTO cog_metric_counter_totals (name, labels, upstream, value)
+    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', SUM(t.value)
     FROM unnest($1::text[], $2::text[], $3::float8[]) AS t(name, labels, value)
-    GROUP BY t.name, t.labels
+    GROUP BY t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream'
     ON CONFLICT (name, labels)
     DO UPDATE SET value = cog_metric_counter_totals.value + EXCLUDED.value,
                   updated_at = NOW()
 "#;
 
 const HISTOGRAM_BUCKET_UPSERT_SQL: &str = r#"
-    INSERT INTO cog_metric_histogram_buckets (name, labels, bucket, observations)
-    SELECT t.name, t.labels::jsonb, t.bucket, SUM(t.observations)
+    INSERT INTO cog_metric_histogram_buckets (name, labels, upstream, bucket, observations)
+    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', t.bucket,
+           SUM(t.observations)
     FROM unnest($1::text[], $2::text[], $3::int4[], $4::int8[]) AS t(name, labels, bucket, observations)
-    GROUP BY t.name, t.labels, t.bucket
+    GROUP BY t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', t.bucket
     ON CONFLICT (name, labels, bucket)
     DO UPDATE SET observations = cog_metric_histogram_buckets.observations + EXCLUDED.observations
 "#;
 
 const HISTOGRAM_SUM_UPSERT_SQL: &str = r#"
-    INSERT INTO cog_metric_histogram_sums (name, labels, sum)
-    SELECT t.name, t.labels::jsonb, SUM(t.value)
+    INSERT INTO cog_metric_histogram_sums (name, labels, upstream, sum)
+    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', SUM(t.value)
     FROM unnest($1::text[], $2::text[], $3::float8[]) AS t(name, labels, value)
-    GROUP BY t.name, t.labels
+    GROUP BY t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream'
     ON CONFLICT (name, labels)
     DO UPDATE SET sum = cog_metric_histogram_sums.sum + EXCLUDED.sum,
                   updated_at = NOW()
@@ -707,17 +728,16 @@ impl MetricsBackend for PostgresMetricsBackend {
         // is one row per series rather than the history behind it. The index
         // that carries both probes is created in `init_schema`, and
         // [`gauge_latest_sql`] is the statement the two are held together by.
-        let rows: Vec<(f64, serde_json::Value, DateTime<Utc>)> =
-            sqlx::query_as(&gauge_latest_sql())
-                .bind(name)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| SFError::Database(e.to_string()))?;
+        let rows: Vec<(f64, String, DateTime<Utc>)> = sqlx::query_as(&gauge_latest_sql())
+            .bind(name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
 
         let mut samples = Vec::with_capacity(rows.len());
         for (value, labels_json, timestamp) in rows {
             let labels: HashMap<String, String> =
-                serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
+                serde_json::from_str(&labels_json).map_err(SFError::Serialization)?;
             samples.push(MetricSample {
                 timestamp,
                 value,
@@ -748,7 +768,7 @@ impl MetricsBackend for PostgresMetricsBackend {
 
     async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>> {
         self.flush_pending().await?;
-        let rows: Vec<(serde_json::Value, f64, DateTime<Utc>)> = sqlx::query_as(
+        let rows: Vec<(String, f64, DateTime<Utc>)> = sqlx::query_as(
             r#"
             SELECT labels, value, updated_at
             FROM cog_metric_counter_totals
@@ -763,7 +783,7 @@ impl MetricsBackend for PostgresMetricsBackend {
         let mut samples = Vec::with_capacity(rows.len());
         for (labels_json, value, timestamp) in rows {
             let labels: HashMap<String, String> =
-                serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
+                serde_json::from_str(&labels_json).map_err(SFError::Serialization)?;
             samples.push(MetricSample {
                 timestamp,
                 value,
@@ -777,7 +797,7 @@ impl MetricsBackend for PostgresMetricsBackend {
         self.flush_pending().await?;
         let bounds = histogram_bucket_bounds(name);
 
-        let bucket_rows: Vec<(serde_json::Value, i32, i64)> = sqlx::query_as(
+        let bucket_rows: Vec<(String, i32, i64)> = sqlx::query_as(
             r#"
             SELECT labels, bucket, observations
             FROM cog_metric_histogram_buckets
@@ -789,7 +809,7 @@ impl MetricsBackend for PostgresMetricsBackend {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
 
-        let sum_rows: Vec<(serde_json::Value, f64, DateTime<Utc>)> = sqlx::query_as(
+        let sum_rows: Vec<(String, f64, DateTime<Utc>)> = sqlx::query_as(
             r#"
             SELECT labels, sum, updated_at
             FROM cog_metric_histogram_sums
@@ -805,7 +825,7 @@ impl MetricsBackend for PostgresMetricsBackend {
 
         for (labels_json, sum, updated_at) in sum_rows {
             let labels: HashMap<String, String> =
-                serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
+                serde_json::from_str(&labels_json).map_err(SFError::Serialization)?;
             let key = series_key(&labels);
             series.insert(
                 key,
@@ -822,7 +842,7 @@ impl MetricsBackend for PostgresMetricsBackend {
 
         for (labels_json, bucket, observations) in bucket_rows {
             let labels: HashMap<String, String> =
-                serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
+                serde_json::from_str(&labels_json).map_err(SFError::Serialization)?;
             let key = series_key(&labels);
             let observations = observations.max(0) as u64;
             let totals = series.entry(key).or_insert_with(|| HistogramTotals {

@@ -67,7 +67,27 @@ fn read_sql(rest: &str) -> String {
 
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
-const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
+/// The citations as the row's readers receive them: one array, ordered by the
+/// document that made it.
+///
+/// `sources` was a jsonb array on the row. An array of objects with keys is a
+/// second table written into a cell: the four keys were read by name
+/// (`->>'block'` counted, `->>'doc'` filtered), nothing could be indexed, and
+/// two writers citing the same change rewrote the whole array. As a table each
+/// citation is a row, the doc is part of its key, and the queries above are
+/// `WHERE`s rather than key lookups into a document.
+///
+/// The array is built here, per read, so there is no second stored copy to
+/// drift: the state a reader sees is computed from `change_ledger_sources` at
+/// the moment it is asked for. `l` is the row source at every call site.
+const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, \
+                           COALESCE((SELECT jsonb_agg(jsonb_build_object( \
+                                            'doc', s.doc, 'verdict', s.verdict, \
+                                            'priority', s.priority, 'block', s.block) \
+                                        ORDER BY s.doc) \
+                                       FROM change_ledger_sources s \
+                                      WHERE s.kind = l.kind AND s.scope = l.scope \
+                                        AND s.literal = l.literal), '[]'::jsonb) AS sources, \
                            first_seen_at, measured_at, measured_rev, delivered_rev, landed_at, \
                            unsettled_reason, retire_reason, retired_at";
 
@@ -291,34 +311,22 @@ impl PostgresChangeLedgerStore {
 /// live database reading the row back could tell. The parameter list is written
 /// here, next to the statement, because the numbering is not the column order.
 const RECORD_READING_SQL_TEMPLATE: &str = "\
-INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, sources, first_seen_rev)
-VALUES ($1, $2, $3, '{state:pending}', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8, 'block', $9)), $10)
-ON CONFLICT (kind, scope, literal) DO UPDATE SET
-    title = COALESCE(EXCLUDED.title, change_ledger.title),
-    assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion),
-    sources = CASE
-        WHEN NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
-            WHERE cited.entry->>'doc' = $6
-        ) THEN change_ledger.sources || EXCLUDED.sources
-        WHEN EXISTS (
-            SELECT 1 FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
-            WHERE cited.entry->>'doc' = $6
-              AND (cited.entry->>'verdict' IS DISTINCT FROM $7
-                   OR cited.entry->>'priority' IS DISTINCT FROM $8
-                   OR COALESCE(cited.entry->>'block', 'none') IS DISTINCT FROM $9)
-        ) THEN (
-            SELECT jsonb_agg(
-                CASE
-                    WHEN cited.entry->>'doc' = $6
-                    THEN jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8, 'block', $9)
-                    ELSE cited.entry
-                END
-            )
-            FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
-        )
-        ELSE change_ledger.sources
-    END";
+WITH ledger_row AS (\
+    INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, first_seen_rev)
+    VALUES ($1, $2, $3, '{state:pending}', $4, $5, $10)
+    ON CONFLICT (kind, scope, literal) DO UPDATE SET
+        title = COALESCE(EXCLUDED.title, change_ledger.title),
+        assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion)
+    RETURNING kind, scope, literal\
+)
+INSERT INTO change_ledger_sources (kind, scope, literal, doc, verdict, priority, block)
+SELECT ledger_row.kind, ledger_row.scope, ledger_row.literal, $6, $7, $8, $9 FROM ledger_row
+ON CONFLICT (kind, scope, literal, doc) DO UPDATE SET
+    verdict = EXCLUDED.verdict,
+    priority = EXCLUDED.priority,
+    block = EXCLUDED.block
+ WHERE (change_ledger_sources.verdict, change_ledger_sources.priority, change_ledger_sources.block)
+       IS DISTINCT FROM (EXCLUDED.verdict, EXCLUDED.priority, EXCLUDED.block)";
 
 /// Write one measurement, with every time taken from the database clock.
 ///
@@ -493,10 +501,10 @@ SELECT (SELECT count(*) FROM holder) AS holders, \
        (SELECT count(*) FROM held) AS held_landings, \
        (SELECT count(*) FROM change_ledger l \
          WHERE l.state NOT IN ('{state:landed}', '{state:retired}') \
-           AND (SELECT count(DISTINCT entry->>'block') \
-                  FROM jsonb_array_elements(l.sources) AS entry \
-                 WHERE entry->>'block' IS NOT NULL \
-                   AND entry->>'block' <> 'none') > 1) \
+           AND (SELECT count(DISTINCT s.block) \
+                  FROM change_ledger_sources s \
+                 WHERE s.kind = l.kind AND s.scope = l.scope AND s.literal = l.literal \
+                   AND s.block <> 'none') > 1) \
            AS block_conflicts";
 
 /// The owed set and the landed set, grouped by the face the documents named.
@@ -784,9 +792,9 @@ WITH known AS (
       FROM change_ledger
      WHERE delivered_rev IS NOT NULL AND delivered_rev <> ''
     UNION
-    SELECT left(substr(src->>'doc', 5), 12) AS rev
-      FROM change_ledger, jsonb_array_elements(sources) AS src
-     WHERE src->>'doc' LIKE 'git:%'
+    SELECT left(substr(s.doc, 5), 12) AS rev
+      FROM change_ledger_sources s
+     WHERE s.doc LIKE 'git:%'
 )
 SELECT DISTINCT rev FROM known WHERE rev = ANY($1::text[])";
 
@@ -1249,10 +1257,10 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                                FROM change_ledger l \
                               WHERE l.state NOT IN ('{state:landed}', '{state:retired}')\
                        ) ranked \
-                 ) t \
-                 WHERE t.by_age <= $2::bigint \
-                    OR t.of_rest <= $1::bigint - $2::bigint \
-                 ORDER BY t.by_band",
+                 ) l \
+                 WHERE l.by_age <= $2::bigint \
+                    OR l.of_rest <= $1::bigint - $2::bigint \
+                 ORDER BY l.by_band",
             ))
             .bind(limit as i64)
             .bind((limit / 2) as i64)
@@ -1374,8 +1382,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // day-old landed row at the head of this one.
         Self::entries(
             sqlx::query(&read_sql(
-                "FROM change_ledger \
-                 WHERE state = '{state:landed}' \
+                "FROM change_ledger l \
+                 WHERE l.state = '{state:landed}' \
                  ORDER BY measured_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1",
             ))
@@ -1454,17 +1462,17 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // statement's parameter count depend on the tree.
         Self::entries(
             sqlx::query(&read_sql(
-                "FROM change_ledger c \
+                "FROM change_ledger l \
                  CROSS JOIN LATERAL ( \
-                     SELECT rtrim(regexp_replace(c.scope, '^\\./', ''), '/') AS s \
+                     SELECT rtrim(regexp_replace(l.scope, '^\\./', ''), '/') AS s \
                  ) n \
-                 WHERE c.state = '{state:landed}' AND ( \
+                 WHERE l.state = '{state:landed}' AND ( \
                      n.s = '' OR n.s = '.' OR EXISTS ( \
                          SELECT 1 FROM unnest($1::text[]) AS p(path) \
                          WHERE p.path = n.s OR p.path LIKE n.s || '/%' \
                      ) \
                  ) \
-                 ORDER BY c.measured_at ASC NULLS FIRST, c.first_seen_at ASC \
+                 ORDER BY l.measured_at ASC NULLS FIRST, l.first_seen_at ASC \
                  LIMIT $2",
             ))
             .bind(paths.to_vec())
@@ -1563,8 +1571,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // re-reading the same head of the set.
         Self::entries(
             sqlx::query(&read_sql(
-                "FROM change_ledger \
-                 WHERE state = '{state:retired}' AND retire_reason = '{reason:surface_moved}' \
+                "FROM change_ledger l \
+                 WHERE l.state = '{state:retired}' AND l.retire_reason = '{reason:surface_moved}' \
                  ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1",
             ))
@@ -1585,8 +1593,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // measurement to advance, so nothing else in this order moves.
         Self::entries(
             sqlx::query(&read_sql(
-                "FROM change_ledger \
-                 WHERE state = '{state:retired}' AND retire_reason = '{reason:answered_elsewhere}' \
+                "FROM change_ledger l \
+                 WHERE l.state = '{state:retired}' AND l.retire_reason = '{reason:answered_elsewhere}' \
                  ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1",
             ))
@@ -1730,8 +1738,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
 
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {
         let row = sqlx::query(&format!(
-            "SELECT {ROW_COLUMNS} FROM change_ledger \
-             WHERE kind = $1 AND scope = $2 AND literal = $3"
+            "SELECT {ROW_COLUMNS} FROM change_ledger l \
+             WHERE l.kind = $1 AND l.scope = $2 AND l.literal = $3"
         ))
         .bind(&identity.kind)
         .bind(&identity.scope)
