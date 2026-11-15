@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# writes: cogneva.example.json generated
 """从 chart 的配置文档生成 `cogneva.example.json`。
 
 chart 的 `files/cogneva.json` 是交付配置**唯一**手改的一份；示例是它的投影，

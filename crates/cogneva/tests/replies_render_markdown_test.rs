@@ -1,3 +1,4 @@
+// reads: web/package.json subject
 //! 回复的正文按 Markdown 画：列表、代码块、表格、diff，而不是一排 `**` 与两排 ```。
 //!
 //! 这条链很短，断在哪儿都很难看出来：

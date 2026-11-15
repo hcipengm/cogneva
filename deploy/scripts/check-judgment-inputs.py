@@ -26,10 +26,12 @@
 判据。身份写在动作旁边，文件挪走、读者改行、写者换名时，注解跟着那一笔一起动或一起
 变 stale；没有一处需要「记得同步」。
 
-判的是**读法**，不是扩展名：tsv 是表，yaml 也是表。所以数据面两种读法分开：
+判的是**读法**，不是扩展名：tsv 是表，yaml 是表，交付配置与清单也是。所以数据面两种
+读法分开：
   * `*.tsv *.pin *.csv` —— 按**文件名**认。脚本本来就是按名字找表的。
-  * `*.yaml *.yml`      —— 按**相对路径**认。同名 yaml 太多，按名字认会把一份被读、
-                          其余跟着过关；路径才是读者真正写下的那一份。
+  * `*.yaml *.yml *.json` —— 按**相对路径**认。同名的那几类太多（`package.json`、
+                          `cogneva.json` 各树都有），按名字认会把一份被读、其余跟着
+                          过关；路径才是读者真正写下的那一份。
 
 判词脚本＝这一族里能让提交变红的东西：`scripts/` 下的 `*.test.sh`、`gates/`、
 `principles/` 与任意一层目录的测试，公开仓的 `deploy/scripts/*.sh|*.py` 与
@@ -56,7 +58,7 @@ import re
 import subprocess
 import sys
 
-DATA_SUFFIXES = (".tsv", ".pin", ".csv", ".yaml", ".yml")
+DATA_SUFFIXES = (".tsv", ".pin", ".csv", ".yaml", ".yml", ".json")
 CODE_SUFFIXES = (".sh", ".py", ".bash", ".mk")
 CODE_NAMES = {"Makefile", "GNUmakefile"}
 PRUNE = {".git", "target", "node_modules", "__pycache__", "vendor"}

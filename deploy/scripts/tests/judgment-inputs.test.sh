@@ -11,7 +11,7 @@
 #   - 注解写不成／类写错／reads 写在非判词脚本里 ⇒ 红
 #   - 通配只在一段里匹配：`data/*.yaml` 不把 `data/sub/x.yaml` 一起放行
 #   - `**`、绝对路径、没有静态前缀的模式 ⇒ 红（写出来像是能跨目录的，宁可拒掉）
-#   - yaml 按路径认（只提到文件名不算被读）；tsv 按文件名认
+#   - yaml／json 按路径认（只提到文件名不算被读）；tsv 按文件名认
 #   - 文件头不是身份：写着 `debt:`／`carrier:` 的手写表照样判红（没有欠账、没有到期、
 #     没有棘轮这种中间态——中间态就是允许继续手写）
 #   - 写者优先：机器写的表被门读来验仍是 generated，文件头只是一行注释
@@ -206,6 +206,25 @@ if [ "$rc" = 1 ] && grep -qF 'data/x.yaml' < <(printf '%s' "$out"); then
     ok "被判词脚本按路径读的 yaml 没有身份时判红"
 else
     bad "没有身份的 yaml 应红（rc=$rc）：$out"
+fi
+
+# 14b. json 与 yaml 同一条读法：交付配置与清单按相对路径认。被读、没身份 ⇒ 红；
+#      读者认领「只验它」⇒ 绿。
+t="$work/14b"; probe "$t" 'X="$ROOT/chart/files/app.json"'
+mkdir -p "$t/chart/files"; printf '{}\n' > "$t/chart/files/app.json"
+out="$(run "$t")"; rc=$?
+if [ "$rc" = 1 ] && grep -qF '没有身份：chart/files/app.json' < <(printf '%s' "$out"); then
+    ok "被判词读的 json 没有身份时判红"
+else
+    bad "没有身份的 json 应红（rc=$rc）：$out"
+fi
+t="$work/14c"; probe "$t" '# reads: chart/files/app.json subject' 'X="$ROOT/chart/files/app.json"'
+mkdir -p "$t/chart/files"; printf '{}\n' > "$t/chart/files/app.json"
+out="$(run "$t")"; rc=$?
+if [ "$rc" = 0 ] && grep -qF 'subject 1' < <(printf '%s' "$out"); then
+    ok "读来验它的 json 认领 subject 后判绿"
+else
+    bad "认领 subject 的 json 应绿（rc=$rc）：$out"
 fi
 
 # 15. tsv 按文件名认：路径藏得更深也照样是同一张表
