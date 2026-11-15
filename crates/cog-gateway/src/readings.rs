@@ -809,7 +809,83 @@ pub const TOOL_FETCH_BUDGET_EXHAUSTED: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-agent/src/tool_output.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 37] = [
+/// Changes dispatched by the built-in recipe instead of a declared one.
+///
+/// The landing recipe can come from the project's own configuration or from
+/// the built-in fallback, and the two dispatch identically. What separates them
+/// is this label: a project that never declared a kind and one that declared
+/// the built-in look the same in every other number, and only the second is a
+/// declaration doing its job.
+pub const PROJECT_KIND_DECLARED: ReadingSpec = ReadingSpec {
+    id: "project_kind_declared_share",
+    title: "走声明 recipe 的变更",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_project_kind_total{source=\"declared\"}[24h]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_project_kind_total",
+    produced_by: "crates/cog-reflection/src/change_execution.rs",
+};
+
+/// Tasks held back because their project's board column was at its limit.
+///
+/// The only number that separates "the column limit is doing its job" from "the
+/// publisher had nothing to do": both leave the same trace, no dispatch. Read
+/// per project because a single project's column being full is a stall for that
+/// goal and is invisible in a fleet-wide total.
+pub const BOARD_COLUMN_HELD: ReadingSpec = ReadingSpec {
+    id: "board_column_held",
+    title: "被看板列上限挡住的任务",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_board_column_held_total[24h]))",
+    unit: "条",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_board_column_held_total",
+    produced_by: "crates/cog-orchestrator/src/task_board.rs",
+};
+
+/// How each run of the eval gate ended, at both sites.
+///
+/// The gate blocks a change whose eval suite regressed; a run that ends in the
+/// same outcome every time says the gate is not discriminating, and a site that
+/// never reports says the gate is not running there at all. Both look like "no
+/// regressions" from any other number.
+pub const EVAL_GATE_OUTCOMES: ReadingSpec = ReadingSpec {
+    id: "eval_gate_outcomes",
+    title: "eval 门的判定结果",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_eval_gate_outcomes_total[24h]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_eval_gate_outcomes_total",
+    produced_by: "crates/cog-eval/src/plugin.rs",
+};
+
+/// Storage tier migrations the background pass has run.
+///
+/// A migration pass that stops shows nothing: the rows it should have moved sit
+/// where they were, every read still answers, and only the absence of this
+/// counter's growth says the tiering stopped doing anything.
+pub const TIER_MIGRATIONS: ReadingSpec = ReadingSpec {
+    id: "tier_migrations",
+    title: "存储分层迁移的次数",
+    group: ReadingGroup::Infra,
+    query: "sum(increase(tier_migration_total[24h]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "tier_migration_total",
+    produced_by: "crates/cog-storage/src/plugin.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 41] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -847,6 +923,10 @@ pub const READINGS: [&ReadingSpec; 37] = [
     &MEMORY_DEAD_LETTERS,
     &ROLLOUT_JOB_NEAR_LIMIT,
     &TOOL_FETCH_BUDGET_EXHAUSTED,
+    &PROJECT_KIND_DECLARED,
+    &BOARD_COLUMN_HELD,
+    &EVAL_GATE_OUTCOMES,
+    &TIER_MIGRATIONS,
 ];
 
 /// The word a reading carries about its own value.
