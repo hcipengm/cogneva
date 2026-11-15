@@ -96,7 +96,7 @@ export function ViewFor({ view }: { view: string }) {
     case 'action-plan':
       return <RecordsView path="/api/v1/action-plan" what="动作计划只在 API 上" />;
     case 'datasets':
-      return <RecordsView path="/api/v1/datasets" what="数据集列表与校验在，界面上没有入口" />;
+      return <RecordsView path="/api/v1/eval/datasets" what="数据集列表与校验在，界面上没有入口" />;
     case 'search':
       return <SearchView />;
     case 'wiki':
