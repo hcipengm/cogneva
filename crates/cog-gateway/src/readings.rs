@@ -501,16 +501,92 @@ pub const STORE_GROWTH: ReadingSpec = ReadingSpec {
     id: "store_growth",
     title: "追加表的行与字节",
     group: ReadingGroup::Infra,
-    query: "sum(cogneva_metrics_samples_bytes) + sum(cogneva_checkpoints_bytes) + sum(cogneva_observability_events_bytes)",
+    query: "sum(metrics_samples_bytes) + sum(cogneva_checkpoints_bytes) + sum(cogneva_observability_events_bytes)",
     unit: "字节",
     warn: None,
     crit: None,
     higher_is_worse: true,
-    series: "cogneva_metrics_samples_bytes / cogneva_checkpoints_bytes / cogneva_observability_events_bytes / cogneva_task_events_rows / cogneva_task_events_tasks / cogneva_llm_usage_rows",
+    series: "metrics_samples_bytes / cogneva_checkpoints_bytes / cogneva_observability_events_bytes / cogneva_task_events_rows / cogneva_task_events_tasks / cogneva_llm_usage_rows",
     produced_by: "crates/cog-storage/src/plugin.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 21] = [
+/// Mainline work that was deferred, superseded or skipped instead of landing.
+///
+/// The delivery chain's counterweight: every number that says work is moving has
+/// a sibling here that says why it did not. A deferral is the gate telling a
+/// change to come back, a superseded rollout is a second change overtaking the
+/// first, and a skipped rev is the deployer deciding not to build at all --
+/// three different reasons the same change never arrived, and none of them
+/// visible from the counts of what did.
+pub const MAINLINE_SETBACKS: ReadingSpec = ReadingSpec {
+    id: "mainline_setbacks",
+    title: "主线被打回与越过的次数",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_mainline_advance_deferrals[24h])) + sum(increase(cogneva_mainline_superseded_rollout_total[24h])) + sum(increase(cogneva_deployer_revs_skipped_total[24h]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_mainline_advance_deferrals / cogneva_mainline_superseded_rollout_total / cogneva_deployer_revs_skipped_total / cogneva_mainline_ci_check_excluded_total / cogneva_landing_ci_failure_inherited_total",
+    produced_by: "crates/cog-reflection/src/mainline_rollout.rs",
+};
+
+/// Resource events the bus could not deliver.
+///
+/// Dropping one is the resource face going blind for that change: the pending
+/// queue keeps its depth and nothing on any board says an event never arrived.
+pub const RESOURCE_EVENTS_DROPPED: ReadingSpec = ReadingSpec {
+    id: "resource_events_dropped",
+    title: "被丢弃的资源事件",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_resource_events_dropped_total[30m]))",
+    unit: "条",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_resource_events_dropped_total / cogneva_resource_events_pending / cogneva_resource_events",
+    produced_by: "crates/cog-extension/src/resource_events.rs",
+};
+
+/// How hard the judge Job is being throttled against its own limits.
+///
+/// The bound the size law sets is only right if the Job is not being throttled
+/// underneath it: a ratio near one means the container spent its period on the
+/// run queue, and the reading it reports is then about the host, not the work.
+pub const ROLLOUT_JOB_THROTTLED: ReadingSpec = ReadingSpec {
+    id: "rollout_job_throttled_ratio",
+    title: "判据 Job 被限流的比例",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_rollout_job_cpu_throttled_ratio)",
+    unit: "0-1",
+    warn: Some(0.2),
+    crit: Some(0.5),
+    higher_is_worse: true,
+    series: "cogneva_rollout_job_cpu_throttled_ratio / cogneva_rollout_job_memory_peak_ratio / cogneva_rollout_job_reading_unix",
+    produced_by: "crates/cog-reflection/src/mainline_rollout.rs",
+};
+
+/// Memory the extraction and dead-letter paths left behind.
+///
+/// Two populations that both mean "the loop is behind": raw sources whose
+/// summary is still owed, and entries that failed for their own content and
+/// will not be retried. A backlog that only grows is the extraction loop
+/// failing quietly, because every other memory number keeps moving.
+pub const MEMORY_BACKLOG: ReadingSpec = ReadingSpec {
+    id: "memory_backlog",
+    title: "记忆萃取积压与死信",
+    group: ReadingGroup::Delivery,
+    query: "max(memory_unextracted_raw)",
+    unit: "条",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series:
+        "memory_unextracted_raw / memory_dead_letter_raw / cogneva_memory_dropped_entries_total",
+    produced_by: "crates/cog-memory/src/plugin.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 25] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -532,6 +608,10 @@ pub const READINGS: [&ReadingSpec; 21] = [
     &REGISTRY_RECLAIM,
     &TOOL_OUTPUT_TRUNCATED,
     &STORE_GROWTH,
+    &MAINLINE_SETBACKS,
+    &RESOURCE_EVENTS_DROPPED,
+    &ROLLOUT_JOB_THROTTLED,
+    &MEMORY_BACKLOG,
 ];
 
 /// The word a reading carries about its own value.
