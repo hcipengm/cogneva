@@ -38,10 +38,10 @@ struct AppState {
     /// keeps the capability off by default rather than one bad path away from
     /// a writable root.
     hostdocs: Option<Arc<HostDocs>>,
-    /// Who gets to compile into the shared target directory, and who is
-    /// waiting. See [`crate::runtime::local::builds_the_tree`] for what this
-    /// bounds, [`BuildLane`] for why the queue turns by agent rather than by
-    /// arrival.
+    /// Who gets to compile, and who is waiting. See
+    /// [`crate::runtime::local::builds_the_tree`] for what this bounds,
+    /// [`BuildLane`] for why the queue turns by agent rather than by arrival,
+    /// and [`lane_target_dir`] for why a lane is more than a count.
     build_lane: Arc<BuildLane>,
     /// What each request cost the executor. Owned by the state rather than by
     /// the workdir router, because a deployment without one still runs file
@@ -56,22 +56,25 @@ struct AppState {
 
 /// How many commands may compile at once when the deployment names none.
 ///
-/// One, because there is one target directory. Cargo takes an exclusive lock on
-/// it, so a second slot does not buy a second compiler: it buys a command that
-/// is started, is given its wall clock, and then blocks inside cargo's own
-/// lockfile wait -- `locks_lock_inode_wait`, no CPU, wall running down --
-/// until it is killed having compiled nothing. Measured on the cluster: a
-/// clippy parked this way reached its entire 600 s wall while the build in
-/// front of it did all the work, and every round queued behind it repeated the
-/// same death.
+/// One, and the reason is no longer a shared lock: each lane writes its own
+/// target directory (see [`lane_target_dir`]), so two lanes are two compilers.
+/// What a second lane costs now is what the second lane actually spends --
+/// a duplicated build of every dependency, and that build's peak memory beside
+/// the first one's -- inside a container whose limit was measured when one
+/// build ran at a time. Nothing here has measured either number, so one is the
+/// count the executor can defend; the deployment can name another with
+/// `COGNEVA_SANDBOX_BUILD_CONCURRENCY` when it has.
 ///
-/// One slot moves that wait to this semaphore, which is the one place it is
-/// free: the wall handed to a command starts when its child starts, and a
-/// command waiting for a slot has no child. The commands this bounds all take
-/// the same lock, so a single slot costs nothing in throughput -- the twelve
-/// commands that once timed out together did so because none of them held a
-/// slot at all, not because there was only one slot to hold.
-// cap: bound — 排队策略不是容量读数：容量由宿主的装载决定，这个数只决定几条一起等
+/// Before the lanes had directories of their own, one slot was also protecting
+/// against cargo's exclusive lock on the single directory: a second command was
+/// started, given its wall clock, and then parked inside cargo's lockfile wait
+/// -- `locks_lock_inode_wait`, no CPU, wall running down -- until it was killed
+/// having compiled nothing. Measured on the cluster: a clippy parked this way
+/// reached its entire 600 s wall while the build in front of it did all the
+/// work. That failure is what a lane count without its own directories buys,
+/// and it is why the two changes travel together.
+// cap: bound — 不是容量读数：一条新位子的真实价格（重复编依赖＋一份峰值内存）还没量过，
+// 量到之前只能是 1；部署要别的数就经 COGNEVA_SANDBOX_BUILD_CONCURRENCY 明确覆盖
 const DEFAULT_BUILD_CONCURRENCY: usize = 1;
 
 /// The concurrency in force, from `COGNEVA_SANDBOX_BUILD_CONCURRENCY`.
@@ -90,7 +93,7 @@ fn build_concurrency() -> usize {
 // cap: bound — 记一笔的阈值，不是容量：它只决定哪些等待值得读，不决定谁等多久
 const BUILD_QUEUE_NOTEWORTHY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long a build may queue for the shared target directory before the
+/// How long a build may queue for a lane before the
 /// executor refuses it, as a measurement rather than a number.
 ///
 /// The window is the [`cog_core::progress::SILENCE_QUANTILE`] quantile of the
@@ -830,11 +833,12 @@ async fn execute_handler(
                     )
                 }
             };
+            let build_target = build_target_dir(cargo_target.as_deref(), build_slot.as_ref());
             match crate::runtime::local::spawn_command(
                 command,
                 &progress_id,
                 workdir.as_deref(),
-                cargo_target.as_deref(),
+                build_target.as_deref(),
                 worktree_claim,
                 build_slot,
             ) {
@@ -1046,9 +1050,9 @@ const UNATTRIBUTED: &str = "unattributed";
 ///
 /// 一条先进先出的队看不出「谁在等」：一个 agent 连发十条编译，另一个就排在
 /// 十条之后，而两条等待在读数上合成一个数——分不出「我慢」与「有人一直占着」。
-/// 这里把**位子**与**等的人**分开记：位子仍是共享 target 允许的那几条，等的人
-/// 按 agent 轮转，刚被放行的 agent 回到自己队的队尾，于是任何一个 agent 连发
-/// 都占不满别人的机会。
+/// 这里把**位子**与**等的人**分开记：位子有几条由容量决定（每条写自己的
+/// target 目录，见 [`lane_target_dir`]），等的人按 agent 轮转，刚被放行的
+/// agent 回到自己队的队尾，于是任何一个 agent 连发都占不满别人的机会。
 pub struct BuildLane {
     capacity: usize,
     inner: std::sync::Mutex<LaneState>,
@@ -1078,6 +1082,9 @@ struct HeldSlot {
     agent: String,
     ticket: u64,
     since: std::time::Instant,
+    /// 占的是第几条位子。位子不再只是「还有没有空」，而是「空的是哪一条」：
+    /// 每条编译写自己的 target 目录，两条同时编译才不会卡在 cargo 的同一把锁上。
+    index: usize,
 }
 
 impl LaneState {
@@ -1196,11 +1203,18 @@ impl BuildLane {
                 if let Some(at) = state.waiting.iter().position(|w| w.ticket == ticket) {
                     if state.holding.len() < self.capacity && state.fair_head() == Some(at) {
                         let place = state.place_of(ticket).unwrap_or(at + 1);
+                        // 空着的第一条位子：位子数与容量相等，所以「还有空位」
+                        // 保证找得到一条；找不到只可能是容量刚被改小，此时退回
+                        // 队尾，不抢别人写着的那条目录。
+                        let index = (0..self.capacity)
+                            .find(|i| !state.holding.iter().any(|h| h.index == *i))
+                            .unwrap_or(state.holding.len());
                         state.waiting.remove(at);
                         state.holding.push(HeldSlot {
                             agent: agent.clone(),
                             ticket,
                             since: std::time::Instant::now(),
+                            index,
                         });
                         state.last_served.insert(agent.clone(), ticket);
                         self.republish(&state);
@@ -1214,6 +1228,7 @@ impl BuildLane {
                             BuildSlot {
                                 lane: Arc::clone(self),
                                 ticket,
+                                index,
                             },
                             arrived.elapsed(),
                         ));
@@ -1285,6 +1300,16 @@ impl Drop for QueueGuard {
 pub struct BuildSlot {
     lane: Arc<BuildLane>,
     ticket: u64,
+    index: usize,
+}
+
+impl BuildSlot {
+    /// 这条编译占的是第几条位子，从 0 数。它决定这条编译写哪个 target
+    /// 目录：同一条位子上的两次编译必须先后写同一个目录，不同位子上的
+    /// 两次编译不该互相等 cargo 的锁。
+    pub fn index(&self) -> usize {
+        self.index
+    }
 }
 
 impl Drop for BuildSlot {
@@ -1343,6 +1368,34 @@ pub fn build_lane_fairness(lane: &BuildLane) -> cog_core::BuildLaneReading {
 ///
 /// `Ok(None)` is a command that compiles nothing: it takes no slot, because
 /// holding one for a search would put every search behind a build.
+/// 这条编译写哪个 target 目录。
+///
+/// 第 0 条位子写共享缓存本体——那是这份部署原本唯一的目录，也是热的那一份；
+/// 其余位子各写自己的子目录。两条编译同时写同一个目录不会更快：cargo 先把后
+/// 一条挡在自己的锁上，等前一条写完，于是并发的第一条编译拿到的是「等待记在
+/// 编译时间里」，不是第二条编译的产出。分开目录之后，代价从锁换成了重复编一
+/// 遍依赖——那才是第二条位子真实的价格。
+fn lane_target_dir(base: &std::path::Path, index: usize) -> std::path::PathBuf {
+    if index == 0 {
+        base.to_path_buf()
+    } else {
+        base.join(format!("lane-{index}"))
+    }
+}
+
+/// 装配这一步：编译类的命令按自己占的位子选目录，不编译的命令仍写共享缓存
+/// （它不排队，也就不该被分到一个只属于某条位子的目录）。
+fn build_target_dir(
+    base: Option<&std::path::Path>,
+    slot: Option<&BuildSlot>,
+) -> Option<std::path::PathBuf> {
+    let base = base?;
+    Some(lane_target_dir(
+        base,
+        slot.map(BuildSlot::index).unwrap_or(0),
+    ))
+}
+
 async fn build_slot_for(
     state: &AppState,
     agent: Option<&str>,
@@ -1376,7 +1429,7 @@ async fn build_slot_for(
                     agent = agent_label,
                     waited_secs = waited.as_secs(),
                     waited_ended = LaneWait::Admitted.as_str(),
-                    "a build waited its turn for the shared target directory"
+                    "a build waited its turn for a lane"
                 );
             }
             Ok(Some(slot))
@@ -1394,7 +1447,7 @@ async fn build_slot_for(
                     agent = agent_label,
                     waited_secs = waited.as_secs(),
                     waited_ended = LaneWait::Full.as_str(),
-                    "a build waited its turn for the shared target directory"
+                    "a build waited its turn for a lane"
                 );
             }
             Err(refusal)
@@ -1872,13 +1925,13 @@ mod tests {
     /// clock runs while it waits inside cargo for a lock it cannot get, and
     /// that command is killed at its wall having compiled nothing.
     #[test]
-    fn the_default_leaves_one_writer_for_the_one_target_directory() {
+    fn the_default_is_one_lane_until_the_second_lane_has_been_priced() {
         let _guard = BUILD_ENV_LOCK.lock().unwrap();
         std::env::remove_var("COGNEVA_SANDBOX_BUILD_CONCURRENCY");
         assert_eq!(
             build_concurrency(),
             1,
-            "a second slot is a command started only to be killed"
+            "一条新位子的价格（重复编依赖＋一份峰值内存）没人量过，默认只能是一条"
         );
     }
 
@@ -2129,6 +2182,82 @@ mod tests {
         for waiter in waiters {
             waiter.abort();
         }
+    }
+
+    /// 位子不再只是「还有没有空」，而是「空的是哪一条」：同时被放行的两条编译
+    /// 拿到的位子序号必须不同，否则它们写的还是同一个 target 目录，第二条只是
+    /// 排到 cargo 的锁上——两条位子在读数上成了「两条一起等」。
+    ///
+    /// 消融：放行时把 `index` 写死成 0，这条红。
+    #[tokio::test]
+    async fn two_builds_at_once_take_different_lane_indices() {
+        let state = state_with_build_slots(2);
+        let first = build_slot_for(&state, Some("alice"), "run_command", "cargo build")
+            .await
+            .expect("the lane is open")
+            .expect("a build takes a slot");
+        let second = build_slot_for(&state, Some("bob"), "run_command", "cargo build")
+            .await
+            .expect("a second slot is open")
+            .expect("a build takes a slot");
+        assert_eq!(first.index(), 0);
+        assert_eq!(second.index(), 1, "两条位子分到了同一个 target 目录");
+
+        // 两条都占着的时候第三条等：位子数是容量，不是「谁先到谁进」。
+        let mut third = Box::pin(build_slot_for(
+            &state,
+            Some("carol"),
+            "run_command",
+            "cargo build",
+        ));
+        assert!(
+            futures::poll!(third.as_mut()).is_pending(),
+            "两条位子都被占着，第三条不该被放行"
+        );
+
+        drop(first);
+        let third = third
+            .await
+            .expect("the lane is open")
+            .expect("a build takes a slot");
+        assert_eq!(third.index(), 0, "空出来的那条位子被下一个人接着用");
+    }
+
+    /// 位子决定写哪个目录：第 0 条写共享缓存本体（已经在里面的依赖是热的），
+    /// 其余各写自己的子目录；不编译的命令没有位子，仍写共享缓存。
+    ///
+    /// 消融：让 `lane_target_dir` 永远返回本体，第二条断言红；让
+    /// `build_target_dir` 忽略位子，两条「按位子分目录」的断言红。
+    #[tokio::test]
+    async fn the_lane_index_decides_the_target_directory() {
+        let base = std::path::Path::new("/opt/cogneva/sandbox/target");
+        assert_eq!(lane_target_dir(base, 0), base, "第 0 条位子写共享缓存本体");
+        assert_eq!(lane_target_dir(base, 1), base.join("lane-1"));
+        assert_eq!(lane_target_dir(base, 3), base.join("lane-3"));
+
+        let state = state_with_build_slots(2);
+        let first = build_slot_for(&state, Some("alice"), "run_command", "cargo build")
+            .await
+            .expect("the lane is open")
+            .expect("a build takes a slot");
+        let second = build_slot_for(&state, Some("bob"), "run_command", "cargo build")
+            .await
+            .expect("a second slot is open")
+            .expect("a build takes a slot");
+        assert_eq!(
+            build_target_dir(Some(base), Some(&first)).as_deref(),
+            Some(base)
+        );
+        assert_eq!(
+            build_target_dir(Some(base), Some(&second)).as_deref(),
+            Some(base.join("lane-1").as_path())
+        );
+        assert_eq!(
+            build_target_dir(Some(base), None).as_deref(),
+            Some(base),
+            "不编译的命令不占位子，也就没有只属于某条位子的目录"
+        );
+        assert_eq!(build_target_dir(None, None), None);
     }
 
     /// 一个 agent 一口气排十条、另一个只排一条：后者排第一而不是第十一。
