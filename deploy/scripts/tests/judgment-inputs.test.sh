@@ -356,13 +356,16 @@ if [ -n "$IDX_IN" ]; then
 else
     out="$(run "$ROOT")"; rc=$?
 fi
-if [ "$rc" = 1 ] \
-   && grep -qF '没有身份：deploy/helm/cogneva/tunables.yaml' < <(printf '%s' "$out") \
-   && [ "$(grep -c '^FAIL  没有身份：' <<<"$out")" = 1 ]; then
-    ok "真树只红在 tunables.yaml 这一张手写表上"
+# 真树的判词：**绿**。
+#
+# 这一格原先钉的是「真树只红在 `tunables.yaml` 这一张手写表上」——那是当时那笔债的
+# 快照。债已经还了：那本登记簿只被 `tunable_registry_contract_test` 读来验，所以它在
+# 自己的文件头声明了 `reads: … subject`，身份是「读者」。判据在这一格上从此钉的不再是
+# 「红在哪」，而是「没有红」：真树里再长出来一张没有身份的手写表，这一格会立刻变红。
+if [ "$rc" = 0 ]; then
+    ok "真树上每张被读的表都有身份（手写的登记簿按读者登记）"
 else
-    bad "真树应只红在 tunables.yaml（rc=$rc）：$out"
+    bad "真树应该是绿的（rc=$rc）：$out"
 fi
-
 printf 'check-judgment-inputs.test: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

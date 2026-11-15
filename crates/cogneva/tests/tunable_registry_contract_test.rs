@@ -1,4 +1,5 @@
 // reads: deploy/helm/cogneva/values.yaml subject
+// reads: deploy/helm/cogneva/tunables.yaml subject
 //! principle: feedback_a_whole_tree_census_reads_shapes_so_new_artifacts_must_declare_themselves
 //! principle: feedback_a_chart_value_without_a_registry_row_stops_every_later_rev_not_just_its_own
 //! Every number a deployment ships is one of three things: something a

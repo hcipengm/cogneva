@@ -395,6 +395,12 @@ fn the_selector_parser_reads_exact_values_and_skips_patterns() {
         label: "namespace".into(),
         value: "cogneva".into(),
     }));
+    // 带外前缀的序列不是本仓库的词汇：判据按前缀认，不看它有没有在树里出现过。
+    assert!(!ours(&Selection {
+        metric: "kube_pod_container_status_restarts_total".into(),
+        label: "scope".into(),
+        value: "selected".into(),
+    }));
 
     // 扫描器读的是 `"key": "value"`，值里的引号是转义过的 `\"`。
     let plain = expressions_under(

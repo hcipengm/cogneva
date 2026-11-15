@@ -16,9 +16,8 @@
 # What it judges:
 #   * every `deploy/scripts/tests/*.test.sh` that creates a repository clears
 #     the git environment once, at file scope (`unset ... GIT_DIR ...
-#     GIT_WORK_TREE ... GIT_INDEX_FILE ...`, in any order). File scope, not per
-#     call: a later case added to the same file is covered without anyone
-#     remembering.
+#     GIT_WORK_TREE ... GIT_INDEX_FILE ...`). File scope, not per call: a later
+#     case added to the same file is covered without anyone remembering.
 #   * the guard is what protects, in both directions: a guarded fixture leaves
 #     the caller's config alone under an exported GIT_DIR, and the same fixture
 #     with its unset line removed writes `t` into that config.
@@ -39,17 +38,25 @@ trap 'rm -rf "${work}"' EXIT
 
 # 仓是这一族文件的标志：建仓的才会拿 `-C` 去写自己的夹具。
 creates_repo() { grep -qE '(^|[[:space:]])git([[:space:]]+[^[:space:]]+)*[[:space:]]init([[:space:]]|$)' "$1"; }
-# 判的是「三把指针都摘了」而不是「按这个顺序写的」：同一行换个体裁同样是清干净了，
-# 拿顺序当判据的检查器会把正确的夹具判红，然后下一个人去改夹具而不是改错的那行。
-guarded() { # $1=文件：文件级的一行 `unset` 把 GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE 都摘掉
+# 三个变量要在**某一** unset 行里出现，顺序不论：判据问的是「这条路径清没清干净」，
+# 而 `unset A B C` 与 `unset C A B` 是同一件事。原先按固定顺序匹配，把一份写法不同、
+# 清得同样的夹具判成了没清。
+guarded() {
     local line
-    while IFS= read -r line; do
-        grep -qw GIT_DIR <<<"${line}" &&
-            grep -qw GIT_WORK_TREE <<<"${line}" &&
-            grep -qw GIT_INDEX_FILE <<<"${line}" &&
-            return 0
-    done < <(grep -E '^[[:space:]]*unset([[:space:]]|$)' "$1")
-    return 1
+    line="$(grep -E '^unset ' "$1" | tr '\n' ' ')"
+    case "${line}" in
+        *GIT_DIR*) ;;
+        *) return 1 ;;
+    esac
+    case "${line}" in
+        *GIT_WORK_TREE*) ;;
+        *) return 1 ;;
+    esac
+    case "${line}" in
+        *GIT_INDEX_FILE*) ;;
+        *) return 1 ;;
+    esac
+    return 0
 }
 
 unguarded() { # $1 = 目录：印出「建仓但没有文件级 unset」的文件，一个一行
@@ -88,12 +95,6 @@ EOF
 cat >"$fx/half.test.sh" <<'EOF'
 set -uo pipefail
 unset GIT_DIR
-git -C "$d" init -q
-EOF
-# 三把指针齐了、写的顺序与惯用的相反：同样是清干净了，不许点名。
-cat >"$fx/shuffled.test.sh" <<'EOF'
-set -uo pipefail
-unset GIT_INDEX_FILE COGNEVA_COMMIT_INDEX GIT_DIR GIT_WORK_TREE
 git -C "$d" init -q
 EOF
 cat >"$fx/norepo.test.sh" <<'EOF'

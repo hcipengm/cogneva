@@ -27,9 +27,15 @@
 use crate::common;
 
 use common::routes::{read, repo_root};
-use common::rust_production::production_text;
+use common::rust_production::{production_sources, production_text};
 
-const METRIC_NAMES: &str = "crates/cog-core/src/contract/metric_names.rs";
+/// 名字的声明面：整个 `cog-core` 源树，不是一个文件。
+///
+/// 闭集（`metric_names.rs`）登记的是**存储能持有**的序列；抓取面渲染的序列
+/// （`RawMetric`）合法地住在同 crate 的别处（`contract/build_gate.rs` 十六条、
+/// `build_cache.rs` 的缓存目标一族）。判据要答的问题是「这个名字是不是本仓真的写出来的」，那要读整个
+/// 声明面；只读闭集文件会把抓取面的名字判成不存在，而它们一直都在。
+const CONTRACT_DIR: &str = "生产树（全仓，不含测试）";
 const RENDERED_CONFIG: &str = "deploy/rendered/k3s-single/10-configmap-cogneva-json.yaml";
 
 fn readings() -> &'static [&'static cog_gateway::readings::ReadingSpec] {
@@ -65,13 +71,27 @@ fn series_name(spec: &cog_gateway::readings::ReadingSpec) -> &str {
 
 #[test]
 fn every_delivery_reading_names_a_series_this_repo_publishes() {
-    let registry = production_text(&read(&repo_root().join(METRIC_NAMES)));
+    // 名字的声明面是**整棵生产树**，不是某个目录：闭集在
+    // `contract/metric_names.rs`，抓取面的名字在 `contract/build_gate.rs` 与
+    // `build_cache.rs`，还有一批在各 crate 自己的 readings 文件里
+    // （`discovery_outcome_readings.rs` 这类）。判据要答的是「本仓真的写出来过
+    // 这个名字吗」，按目录猜会把合法的名字判成不存在。
+    let registry: String = {
+        let mut text = String::new();
+        for path in production_sources(&repo_root()) {
+            if let Ok(source) = std::fs::read_to_string(&path) {
+                text.push_str(&production_text(&source));
+                text.push('\n');
+            }
+        }
+        text
+    };
     let mut checked = 0;
     for spec in delivery() {
         let name = series_name(spec);
         assert!(
             registry.contains(&format!("\"{name}\"")),
-            "reading {} names {name}, which no constant in {METRIC_NAMES} declares; \
+            "reading {} names {name}, which no constant in {CONTRACT_DIR} declares; \
              the board would show 没有序列 forever and the row would look like a \
              quiet system rather than a reading nobody wired",
             spec.id

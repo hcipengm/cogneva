@@ -303,49 +303,6 @@ pub const LLM_UPSTREAMS_HEALTHY: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-gateway/src/security_gateway.rs",
 };
 
-/// How many builds are queued for a slot right now.
-///
-/// The delivery chain's first joint, and the one nobody could see: every other
-/// number on the build gate describes what it did with the slots it handed out
-/// — wait times, hold times, refusals — and all of them read healthy while the
-/// queue in front of the gate grows. A queued build is the host saying the
-/// bound is the constraint at this instant, so zero is the only quiet value and
-/// the warning is "somebody is waiting", not some invented number of waiters.
-pub const BUILD_QUEUE_DEPTH: ReadingSpec = ReadingSpec {
-    id: "build_queue_depth",
-    title: "排在建槽外的构建",
-    group: ReadingGroup::Delivery,
-    query: "sum(cogneva_build_gate_waiting)",
-    unit: "条",
-    warn: Some(0.0),
-    crit: None,
-    higher_is_worse: true,
-    series: "cogneva_build_gate_waiting",
-    produced_by: "crates/cog-reflection/src/build_gate/mod.rs",
-};
-
-/// The longest a single build has waited for a slot, in this process's life.
-///
-/// The queue's depth says the bound is tight now; this says how tight it has
-/// been. Both are needed because a queue that clears in seconds and one that
-/// clears in twenty minutes look the same at the instant it is sampled, and
-/// only the second one is a reason to raise the bound.
-///
-/// No threshold: the number it should be judged against is the gate's own wait
-/// budget, and a bound written here would be a second copy of that decision.
-pub const BUILD_GATE_WAIT_MAX: ReadingSpec = ReadingSpec {
-    id: "build_gate_wait_max_ms",
-    title: "最长的一次等槽",
-    group: ReadingGroup::Delivery,
-    query: "max(cogneva_build_gate_wait_ms_max)",
-    unit: "毫秒",
-    warn: None,
-    crit: None,
-    higher_is_worse: true,
-    series: "cogneva_build_gate_wait_ms_max",
-    produced_by: "crates/cog-reflection/src/build_gate/mod.rs",
-};
-
 /// How far the build cache sits above the cap it was given.
 ///
 /// The cap is derived from the volume and the reclaim pass trims to it; this is
@@ -362,7 +319,7 @@ pub const BUILD_CACHE_OVER_CAP: ReadingSpec = ReadingSpec {
     warn: None,
     crit: None,
     higher_is_worse: true,
-    series: "cogneva_build_target_over_limit_bytes",
+    series: cog_core::build_cache::BUILD_TARGET_OVER_LIMIT_METRIC,
     produced_by: "crates/cog-core/src/build_cache.rs",
 };
 
@@ -468,7 +425,7 @@ pub const REGISTRY_RECLAIM: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: false,
     series: "cogneva_buildah_store_freed_bytes_total / cogneva_buildah_store_kept_images / cogneva_buildah_store_pruned_images_total / cogneva_buildah_store_pruned_layers_total",
-    produced_by: "crates/cog-reflection/src/registry_maintenance.rs",
+    produced_by: "crates/cog-reflection/src/mainline_rollout.rs",
 };
 
 /// Tool output that had to be truncated before an agent could read it.
@@ -487,7 +444,7 @@ pub const TOOL_OUTPUT_TRUNCATED: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_tool_output_truncated_total / cogneva_tool_output_truncated_chars_total / cogneva_tool_output_fetch_budget_exhausted_total",
-    produced_by: "crates/cog-agent/src/tool_output.rs",
+    produced_by: "crates/cog-agent/src/archive.rs",
 };
 
 /// Rows and bytes the two append-only stores are holding.
@@ -545,7 +502,7 @@ pub const RESOURCE_EVENTS_DROPPED: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_resource_events_dropped_total / cogneva_resource_events_pending / cogneva_resource_events",
-    produced_by: "crates/cog-extension/src/resource_events.rs",
+    produced_by: "crates/cog-orchestrator/src/resource_ledger.rs",
 };
 
 /// How hard the judge Job is being throttled against its own limits.
@@ -619,7 +576,7 @@ pub const EVENT_BUS_HANDOFFS: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_event_bus_handoff_total",
-    produced_by: "crates/cog-core/src/event_bus.rs",
+    produced_by: "crates/cog-supervisor/src/consumer_lag.rs",
 };
 
 /// Rows and tasks the event store is holding.
@@ -711,7 +668,7 @@ pub const SOP_DISPATCH: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "sop_unmapped_role_total / sop_dispatch_total / sop_tasks_injected_total",
-    produced_by: "crates/cog-orchestrator/src/sop_dispatch.rs",
+    produced_by: "crates/cog-orchestrator/src/sop/dispatch.rs",
 };
 
 /// How many times in a row the pool's probes for an upstream have failed.
@@ -749,7 +706,7 @@ pub const RESOURCE_EVENTS_BACKLOG: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_resource_events_pending / cogneva_resource_events / cogneva_resource_events_dropped_total",
-    produced_by: "crates/cog-extension/src/resource_events.rs",
+    produced_by: "crates/cog-orchestrator/src/resource_ledger.rs",
 };
 
 /// Raw sources parked in the dead-letter store.
@@ -806,7 +763,7 @@ pub const TOOL_FETCH_BUDGET_EXHAUSTED: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_tool_output_fetch_budget_exhausted_total / cogneva_tool_output_truncated_chars_total",
-    produced_by: "crates/cog-agent/src/tool_output.rs",
+    produced_by: "crates/cog-agent/src/archive.rs",
 };
 
 /// Changes dispatched by the built-in recipe instead of a declared one.
@@ -845,7 +802,7 @@ pub const BOARD_COLUMN_HELD: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_board_column_held_total",
-    produced_by: "crates/cog-orchestrator/src/task_board.rs",
+    produced_by: "crates/cog-orchestrator/src/dag_executor/mod.rs",
 };
 
 /// How each run of the eval gate ended, at both sites.
@@ -997,7 +954,7 @@ pub const REGISTRY_PRUNE_COUNTS: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: false,
     series: "cogneva_buildah_store_pruned_images_total / cogneva_buildah_store_pruned_layers_total / cogneva_buildah_store_kept_images / cogneva_registry_pruned_tags_total / cogneva_registry_rebuild_hold_secs_total",
-    produced_by: "crates/cog-reflection/src/registry_maintenance.rs",
+    produced_by: "crates/cog-reflection/src/mainline_rollout.rs",
 };
 
 /// How deep the change queue is stuck, and for what reason.
@@ -1052,7 +1009,7 @@ pub const PROMOTION_CANDIDATES: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: false,
     series: "cogneva_promotion_week_changes",
-    produced_by: "crates/cog-reflection/src/promotion.rs",
+    produced_by: "crates/cog-reflection/src/promotion_trend.rs",
 };
 
 /// Tasks held at ready-admission because the lane was full.
@@ -1089,7 +1046,7 @@ pub const ALERT_CHANNELS: ReadingSpec = ReadingSpec {
     crit: Some(0.0),
     higher_is_worse: false,
     series: "cogneva_alert_channels_configured",
-    produced_by: "crates/cog-observability/src/alerting.rs",
+    produced_by: "crates/cog-observability/src/plugin.rs",
 };
 
 /// Observability events the store refused to persist.
@@ -1106,7 +1063,7 @@ pub const OBSERVABILITY_EVENT_WRITE_FAILURES: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_observability_event_persist_failed_total",
-    produced_by: "crates/cog-observability/src/event_store.rs",
+    produced_by: "crates/cog-supervisor/src/consumer_lag.rs",
 };
 
 /// Rows the principle ledger holds, by check kind.
@@ -1124,7 +1081,7 @@ pub const PRINCIPLE_LEDGER_ROWS: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: false,
     series: "cogneva_principle_ledger_check_kind_rows",
-    produced_by: "crates/cog-reflection/src/principles.rs",
+    produced_by: "crates/cog-orchestrator/src/principle_ledger.rs",
 };
 
 /// What the size law set the CPU request to for the busiest workload.
@@ -1239,7 +1196,7 @@ pub const PLUGIN_PIN_AUDIT: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_plugin_pin_multi_published / cogneva_plugin_pin_multi_published_count / cogneva_plugin_pin_unconsumed / cogneva_plugin_pin_unconsumed_count / cogneva_plugin_pin_unordered_init_read / cogneva_plugin_pin_unordered_init_read_count / cogneva_plugin_pin_unsatisfied / cogneva_plugin_pin_unsatisfied_count / cogneva_plugin_publishes / cogneva_plugin_publishes_count",
-    produced_by: "crates/cog-core/src/plugin_context.rs",
+    produced_by: "crates/cogneva/src/pin_census.rs",
 };
 
 /// The outward loop's passes, by source.
@@ -1257,7 +1214,44 @@ pub const OUTWARD_PASSES: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: false,
     series: "cogneva_outward_passes_total / cogneva_outward_items_total / cogneva_outward_sources_configured / cogneva_outward_config",
-    produced_by: "crates/cog-reflection/src/outward.rs",
+    produced_by: "crates/cog-orchestrator/src/outward.rs",
+};
+
+/// How many builds are queued for a slot right now.
+///
+/// Every other number on the build gate describes what it did with the slots it
+/// handed out -- waits, holds, refusals -- and all of them read healthy while
+/// the queue in front of the gate grows. A queued build is the host saying the
+/// bound is the constraint at this instant, so zero is the only quiet value.
+pub const BUILD_QUEUE_DEPTH: ReadingSpec = ReadingSpec {
+    id: "build_queue_depth",
+    title: "排在建槽外的构建",
+    group: ReadingGroup::Delivery,
+    query: "sum(cogneva_build_gate_waiting)",
+    unit: "条",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: cog_core::contract::build_gate::BUILD_GATE_WAITING,
+    produced_by: "crates/cog-core/src/contract/build_gate.rs",
+};
+
+/// The longest a single build has waited for a slot, in this process's life.
+///
+/// The queue's depth says the bound is tight now; this says how tight it has
+/// been. No threshold: the number it should be judged against is the gate's own
+/// wait budget, and a bound written here would be a second copy of that.
+pub const BUILD_GATE_WAIT_MAX: ReadingSpec = ReadingSpec {
+    id: "build_gate_wait_max_ms",
+    title: "最长的一次等槽",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_build_gate_wait_ms_max)",
+    unit: "毫秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: cog_core::contract::build_gate::BUILD_GATE_WAIT_MS_MAX,
+    produced_by: "crates/cog-core/src/contract/build_gate.rs",
 };
 
 pub const READINGS: [&ReadingSpec; 61] = [
@@ -1272,8 +1266,6 @@ pub const READINGS: [&ReadingSpec; 61] = [
     &MAINLINE_CI_HOLD_ACTIVE,
     &CHANGE_POOL_BLOCKED_OLDEST,
     &LLM_UPSTREAMS_HEALTHY,
-    &BUILD_QUEUE_DEPTH,
-    &BUILD_GATE_WAIT_MAX,
     &BUILD_CACHE_OVER_CAP,
     &DISCOVERY_PROBES_UNANSWERED,
     &LLM_POOL_BACKOFF,
@@ -1322,6 +1314,8 @@ pub const READINGS: [&ReadingSpec; 61] = [
     &RETENTION_TARGET_ROWS,
     &PLUGIN_PIN_AUDIT,
     &OUTWARD_PASSES,
+    &BUILD_QUEUE_DEPTH,
+    &BUILD_GATE_WAIT_MAX,
 ];
 
 /// The word a reading carries about its own value.
