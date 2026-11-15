@@ -12,6 +12,7 @@ pub mod checkpoints;
 pub mod command_server;
 pub mod edit;
 pub mod executor;
+pub mod executor_lease;
 pub mod hostdocs;
 pub mod hostdocs_assist;
 pub mod hostdocs_organizer;

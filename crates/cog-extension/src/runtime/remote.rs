@@ -37,6 +37,28 @@ const RETRY_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 // cap: bound — 退避的粗粒度上界，再长就少试几次而已
 const RETRY_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The lane a request belongs to: the working tree it will run in.
+///
+/// The same two names, in the same order, that the executor uses to pick a
+/// checkout: an employee first, a task only for a request that named none.
+/// A request that names neither runs outside any checkout, so it has no tree
+/// to keep in one place and therefore no lane.
+fn lane_of(req: &SandboxRequest) -> Option<String> {
+    let named = |value: Option<&str>| {
+        value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    named(Some(req.agent_id.as_str())).or_else(|| named(Some(req.task_id.as_str())))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// 端口被明确拒绝与包被丢掉是两件事。前者说「服务现在没有就绪后端」，也就是
 /// 一次换版的窗口，自己会好；后者多是网络策略挡住，等多久都不会好，等它只是把
 /// 失败推后。所以只认前者。
@@ -72,7 +94,14 @@ use futures::StreamExt;
 
 /// HTTP client for the cluster sandbox executor (`cogneva sandbox-executor`).
 pub struct RemoteExecutor {
-    base_url: String,
+    /// One address per executor replica. With a single address this is the
+    /// whole deployment and every call goes to it; with more, a lane is pinned
+    /// to one of them for the life of its pin (see
+    /// [`crate::executor_lease`]).
+    endpoints: Vec<String>,
+    /// Which replica each lane sits on. Short critical sections holding a
+    /// `std::sync::Mutex`: nothing is awaited under it.
+    lanes: std::sync::Mutex<crate::executor_lease::LeaseBook>,
     http: reqwest::Client,
     /// 端口被拒之后还等多久。见 [`REPLACEMENT_WINDOW`]。
     replacement_window: std::time::Duration,
@@ -83,6 +112,78 @@ impl RemoteExecutor {
         Self::with_replacement_window(base_url, REPLACEMENT_WINDOW)
     }
 
+    /// One client, several executor replicas.
+    ///
+    /// The first address also answers the questions that are about the
+    /// deployment rather than about one lane (`/boundary`, `/lane`); the
+    /// others only take commands.
+    pub fn with_endpoints(endpoints: Vec<String>) -> SFResult<Self> {
+        let first = endpoints.first().cloned().ok_or_else(|| {
+            cog_core::SFError::Agent("sandbox executor client was given no address".into())
+        })?;
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| {
+                cog_core::SFError::Agent(format!("sandbox executor client init failed: {}", e))
+            })?;
+        Ok(Self {
+            endpoints: std::iter::once(first)
+                .chain(endpoints.into_iter().skip(1))
+                .collect(),
+            lanes: std::sync::Mutex::default(),
+            replacement_window: REPLACEMENT_WINDOW,
+            http,
+        })
+    }
+
+    /// The address the deployment-level questions go to.
+    fn primary(&self) -> &str {
+        &self.endpoints[0]
+    }
+
+    /// The address a command goes to, and the replica it is pinned to (none
+    /// when there is only one replica and pinning says nothing).
+    fn endpoint_for(&self, lane: Option<&str>) -> (String, Option<usize>) {
+        let Some(lane) = lane.filter(|_| self.endpoints.len() > 1) else {
+            return (self.primary().to_string(), None);
+        };
+        let pinned = {
+            let mut book = self
+                .lanes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            book.pin(
+                lane,
+                self.endpoints.len(),
+                now_secs(),
+                crate::executor_lease::LANE_LEASE_SECS,
+            )
+        };
+        if let crate::executor_lease::Grant::Moved { from, lapsed_secs } = pinned.grant {
+            tracing::warn!(
+                lane,
+                from_replica = from,
+                to_replica = pinned.replica,
+                lapsed_secs,
+                "this lane is moving to another executor replica: what the previous one \
+                 wrote after its pin lapsed may not be in the tree this command runs on"
+            );
+        }
+        (self.endpoints[pinned.replica].clone(), Some(pinned.replica))
+    }
+
+    fn release_lane(&self, lane: Option<&str>, replica: Option<usize>) {
+        let (Some(lane), Some(replica)) = (lane, replica) else {
+            return;
+        };
+        let mut book = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        book.release(lane, replica);
+    }
+
     /// 同一个客户端，换一段等待上界。生产的窗口是
     /// [`REPLACEMENT_WINDOW`]；这里开一个口子是为了让"窗口内会重试""窗口过了
     /// 要说出等了多久"这两条判据能在测试里按秒验证，而不是按两分半验证。
@@ -91,7 +192,8 @@ impl RemoteExecutor {
         replacement_window: std::time::Duration,
     ) -> SFResult<Self> {
         Ok(Self {
-            base_url: base_url.into(),
+            endpoints: vec![base_url.into()],
+            lanes: std::sync::Mutex::default(),
             replacement_window,
             // No total timeout: a long-running command is stopped by the
             // executor when it stops moving, and the client must not cut the
@@ -124,7 +226,7 @@ impl SandboxBackend for RemoteExecutor {
     /// 边界由对端自报。这里不替它说话：一个在这里拼出来的「安全」描述，
     /// 改执行器的部署时不会跟着变，而读的人以为它是量出来的。
     async fn boundary(&self) -> SFResult<cog_core::SandboxBoundary> {
-        let url = format!("{}/boundary", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/boundary", self.primary().trim_end_matches('/'));
         let response = self.http.get(&url).send().await.map_err(|e| {
             cog_core::SFError::Agent(format!("sandbox executor boundary unreachable: {e}"))
         })?;
@@ -144,7 +246,7 @@ impl SandboxBackend for RemoteExecutor {
 
     /// 编译队由对端自报，本侧不排这条队：问它谁占着、谁排第几。
     async fn lane(&self) -> SFResult<cog_core::BuildLaneReading> {
-        let url = format!("{}/lane", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/lane", self.primary().trim_end_matches('/'));
         let response = self.http.get(&url).send().await.map_err(|e| {
             cog_core::SFError::Agent(format!("sandbox executor lane unreachable: {e}"))
         })?;
@@ -168,7 +270,9 @@ impl SandboxBackend for RemoteExecutor {
                 "RemoteExecutor only executes environment payloads".into(),
             ));
         }
-        let url = format!("{}/execute", self.base_url.trim_end_matches('/'));
+        let lane = lane_of(req);
+        let (endpoint, pinned_to) = self.endpoint_for(lane.as_deref());
+        let url = format!("{}/execute", endpoint.trim_end_matches('/'));
         let body = serde_json::json!({
             "payload": req.payload,
             "task_id": req.task_id,
@@ -204,6 +308,12 @@ impl SandboxBackend for RemoteExecutor {
                     } else {
                         String::new()
                     };
+                    // The replica this lane sits on is not answering and the
+                    // replacement window is over: it is gone, not restarting.
+                    // Give the lane up so the next command picks a replica
+                    // that answers -- and says, through `Grant::Moved`, that
+                    // the tree may not carry what the gone replica wrote.
+                    self.release_lane(lane.as_deref(), pinned_to);
                     return Err(cog_core::SFError::Agent(format!(
                         "sandbox executor unreachable: {e}{note}"
                     )));
@@ -255,6 +365,103 @@ impl SandboxBackend for RemoteExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An executor that answers `requests` commands, counting how many it was
+    /// asked. Two of these stand in for two replicas behind one Service.
+    async fn serve_counting(
+        requests: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..requests {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(&CommandEvent::Stdout { data: "ok".into() }).unwrap(),
+                    serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{}", addr), hits)
+    }
+
+    fn for_agent(agent: &str) -> SandboxRequest {
+        SandboxRequest {
+            task_id: "t".into(),
+            agent_id: agent.into(),
+            payload: SandboxPayload::Command {
+                command: "echo hi".into(),
+            },
+            input: serde_json::json!({}),
+            limits: Default::default(),
+        }
+    }
+
+    /// Two commands from one agent answer from the same replica, because they
+    /// run in the same checkout and the checkout lives on one replica. Two
+    /// agents may be on two.
+    #[tokio::test]
+    async fn an_agents_commands_stay_on_one_executor_replica() {
+        use std::sync::atomic::Ordering;
+        let (first, first_hits) = serve_counting(3).await;
+        let (second, second_hits) = serve_counting(3).await;
+        let executor = RemoteExecutor::with_endpoints(vec![first, second]).unwrap();
+
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        executor.execute(&for_agent("agent-b")).await.unwrap();
+
+        let hits = [
+            first_hits.load(Ordering::SeqCst),
+            second_hits.load(Ordering::SeqCst),
+        ];
+        assert_eq!(
+            hits,
+            [2, 1],
+            "一副 agent 的两条命令分到了两副副本上：{hits:?}"
+        );
+    }
+
+    /// A replica that is gone does not keep its lanes: the unreachable error
+    /// releases the pin, and the next command for that agent lands on the
+    /// replica that answers.
+    #[tokio::test]
+    async fn a_dead_replicas_lane_moves_on_the_next_command() {
+        use std::sync::atomic::Ordering;
+        let dead = a_port_nothing_listens_on().await;
+        let (live, live_hits) = serve_counting(2).await;
+        // A short window: the production one is a rollout's length, and no
+        // test should wait it out to prove what a release does.
+        let executor = RemoteExecutor::with_replacement_window(
+            format!("http://{}", dead),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        let executor = RemoteExecutor {
+            endpoints: vec![format!("http://{}", dead), live],
+            ..executor
+        };
+
+        let first = executor.execute(&for_agent("agent-a")).await;
+        assert!(first.is_err(), "第一副副本没人监听，这一条必须失败");
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+    }
 
     /// Minimal NDJSON server on an ephemeral port speaking the executor
     /// wire protocol; no HTTP framework needed for a canned response.
