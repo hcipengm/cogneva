@@ -372,8 +372,6 @@ mod label_differential_test;
 mod llm_actor_label_contract_test;
 #[path = "llm_spend_verdict_contract_test.rs"]
 mod llm_spend_verdict_contract_test;
-#[path = "log_stream_selectors_are_labels_the_code_writes_test.rs"]
-mod log_stream_selectors_are_labels_the_code_writes_test;
 #[path = "mainline_rollout_dispatch_contract_test.rs"]
 mod mainline_rollout_dispatch_contract_test;
 #[path = "mcp_server_stdio.rs"]

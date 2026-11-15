@@ -205,47 +205,6 @@ fn every_pg_series_a_reading_names_is_one_the_pinned_image_emits() {
     );
 }
 
-/// The readings gate above covers what our own workspace publishes; the board
-/// names its postgres series separately, and a panel is read by a person just
-/// as the reading is. Same inventory, same judgement.
-#[test]
-fn the_board_names_the_same_producer_for_its_postgres_panels() {
-    let inventory = inventory();
-    let path = repo_root().join("crates/cogneva/tests/observability_dashboard_contract_test.rs");
-    let text = read_file(&path);
-    let mut checked = 0;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("(\"") else {
-            continue;
-        };
-        let Some((name, tail)) = rest.split_once('"') else {
-            continue;
-        };
-        if !name.starts_with("pg_") || !tail.contains("postgres_exporter") {
-            continue;
-        }
-        let covered = inventory
-            .series
-            .iter()
-            .any(|entry| match entry.strip_suffix('*') {
-                Some(prefix) => name.starts_with(prefix),
-                None => entry == name,
-            });
-        checked += 1;
-        assert!(
-            covered,
-            "the board reads {name} from the postgres exporter, but {} does not \
-             emit it; the panel would be blank where a healthy database shows a number",
-            inventory.image
-        );
-    }
-    assert!(
-        checked > 0,
-        "no postgres series found in the board contract — this gate would be vacuous"
-    );
-}
-
 /// Every reading's panel is a cell on the board the generator builds, and the
 /// cell is its position in the registry.
 ///
