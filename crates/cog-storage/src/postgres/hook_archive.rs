@@ -15,7 +15,7 @@ pub const DDL: &str = r#"
                 task_id TEXT,
                 crew_id TEXT,
                 squad_id TEXT,
-                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                payload TEXT  NOT NULL DEFAULT '{}',
                 timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_cog_hook_events_agent_id ON cog_hook_events(agent_id);
@@ -64,7 +64,7 @@ impl PostgresHookArchive {
         .bind(task_id)
         .bind(crew_id)
         .bind(squad_id)
-        .bind(payload)
+        .bind(payload.to_string())
         .execute(&self.pool)
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;

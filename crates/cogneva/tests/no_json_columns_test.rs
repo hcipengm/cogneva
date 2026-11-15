@@ -89,19 +89,10 @@ const BASELINE: &[&str] = &[
     "crates/cog-storage/migrations/postgres/028_change_ledger.up.sql:change_ledger.sources",
     "crates/cog-storage/migrations/postgres/050_resource_events.up.sql:resource_events.detail",
     "crates/cog-storage/migrations/postgres/056_token_face_beat.up.sql:token_face_beat.measures",
-    "crates/cog-storage/src/postgres/audit_recorder.rs:cog_guard_audit_log.messages",
-    "crates/cog-storage/src/postgres/audit_recorder.rs:cog_guard_audit_log.tool_call",
-    "crates/cog-storage/src/postgres/hook_archive.rs:cog_hook_events.payload",
     "crates/cog-storage/src/postgres/metrics_backend.rs:cog_metric_counter_totals.labels",
     "crates/cog-storage/src/postgres/metrics_backend.rs:cog_metric_histogram_buckets.labels",
     "crates/cog-storage/src/postgres/metrics_backend.rs:cog_metric_histogram_sums.labels",
     "crates/cog-storage/src/postgres/metrics_backend.rs:cog_metrics_samples.labels",
-    "crates/cog-storage/src/postgres/pge_stage_store.rs:pge_stage_product.change_identity",
-    "crates/cog-storage/src/postgres/pge_stage_store.rs:pge_stage_product.product",
-    "crates/cog-storage/src/postgres/snapshot_store.rs:cog_snapshots.agent_state",
-    "crates/cog-storage/src/postgres/snapshot_store.rs:cog_snapshots.context_window",
-    "crates/cog-storage/src/postgres/taste_intent_store.rs:cog_taste_intents.evidence_refs",
-    "crates/cog-storage/src/postgres/taste_intent_store.rs:cog_taste_intents.payload",
 ];
 
 #[test]

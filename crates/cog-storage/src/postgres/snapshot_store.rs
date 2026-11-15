@@ -19,8 +19,8 @@ pub const DDL: &str = r#"
             CREATE TABLE IF NOT EXISTS cog_snapshots (
                 snapshot_id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
-                agent_state JSONB NOT NULL,
-                context_window JSONB NOT NULL,
+                agent_state TEXT NOT NULL,
+                context_window TEXT NOT NULL,
                 event_offset BIGINT NOT NULL,
                 timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -48,8 +48,8 @@ impl PostgresSnapshotStore {
 #[async_trait]
 impl CheckpointStore for PostgresSnapshotStore {
     async fn save(&self, checkpoint: &AgentCheckpoint) -> SFResult<String> {
-        let agent_state = serde_json::to_value(&checkpoint.agent_state)?;
-        let context_window = serde_json::to_value(&checkpoint.context_window)?;
+        let agent_state = serde_json::to_string(&checkpoint.agent_state)?;
+        let context_window = serde_json::to_string(&checkpoint.context_window)?;
 
         sqlx::query(
             r#"
@@ -77,27 +77,18 @@ impl CheckpointStore for PostgresSnapshotStore {
     }
 
     async fn load(&self, checkpoint_id: &str) -> SFResult<Option<AgentCheckpoint>> {
-        let row = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                serde_json::Value,
-                serde_json::Value,
-                i64,
-                chrono::DateTime<Utc>,
-            ),
-        >(
-            r#"
+        let row =
+            sqlx::query_as::<_, (String, String, String, String, i64, chrono::DateTime<Utc>)>(
+                r#"
             SELECT snapshot_id, task_id, agent_state, context_window, event_offset, timestamp
             FROM cog_snapshots
             WHERE snapshot_id = $1
             "#,
-        )
-        .bind(checkpoint_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
+            )
+            .bind(checkpoint_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
 
         match row {
             Some((
@@ -109,11 +100,11 @@ impl CheckpointStore for PostgresSnapshotStore {
                 timestamp,
             )) => {
                 let context_window: Vec<cog_core::Message> =
-                    serde_json::from_value(context_window).map_err(SFError::Serialization)?;
+                    serde_json::from_str(&context_window).map_err(SFError::Serialization)?;
                 Ok(Some(AgentCheckpoint {
                     checkpoint_id,
                     task_id,
-                    agent_state,
+                    agent_state: serde_json::from_str(&agent_state).unwrap_or_default(),
                     context_window,
                     event_offset: event_offset as u64,
                     timestamp,
@@ -133,37 +124,28 @@ impl CheckpointStore for PostgresSnapshotStore {
     }
 
     async fn list(&self, limit: usize) -> SFResult<Vec<AgentCheckpoint>> {
-        let rows = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                serde_json::Value,
-                serde_json::Value,
-                i64,
-                chrono::DateTime<Utc>,
-            ),
-        >(
-            r#"
+        let rows =
+            sqlx::query_as::<_, (String, String, String, String, i64, chrono::DateTime<Utc>)>(
+                r#"
             SELECT snapshot_id, task_id, agent_state, context_window, event_offset, timestamp
             FROM cog_snapshots
             ORDER BY timestamp DESC
             LIMIT $1
             "#,
-        )
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
+            )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
 
         let mut cps = Vec::new();
         for (checkpoint_id, task_id, agent_state, context_window, event_offset, timestamp) in rows {
             let context_window: Vec<cog_core::Message> =
-                serde_json::from_value(context_window).map_err(SFError::Serialization)?;
+                serde_json::from_str(&context_window).map_err(SFError::Serialization)?;
             cps.push(AgentCheckpoint {
                 checkpoint_id,
                 task_id,
-                agent_state,
+                agent_state: serde_json::from_str(&agent_state).unwrap_or_default(),
                 context_window,
                 event_offset: event_offset as u64,
                 timestamp,
