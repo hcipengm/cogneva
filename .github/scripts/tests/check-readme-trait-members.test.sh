@@ -120,11 +120,22 @@ esac
 
 # --- 真文件：这棵仓库今天必须绿
 # 夹具全绿而真树红，说明这条门在测自己；两边都绿，才说明它今天在守东西。
-out="$(bash "${gate}" "${repo}" 2>&1)" || fail "真树红了 —— 判为 Trait 定义的成员表与源不一致：
+# 干净的检出里这两份 README 不跟踪，真树那一格就是「没有可判的东西」：退出 0、
+# 输出一句未判。仍要跑，因为「文件不在」也必须是这个门的答案，而不是它崩掉。
+if [ -f "${repo}/README.md" ] || [ -f "${repo}/README.zh-CN.md" ]; then
+    out="$(bash "${gate}" "${repo}" 2>&1)" || fail "真树红了 —— 判为 Trait 定义的成员表与源不一致：
 ${out}"
-case "${out}" in
-    *'与源一致'*) ;;
-    *) fail "真树没有给出通过判词：${out}" ;;
-esac
+    case "${out}" in
+        *'与源一致'*) ;;
+        *) fail "真树没有给出通过判词：${out}" ;;
+    esac
+else
+    out="$(bash "${gate}" "${repo}" 2>&1)" || fail "真树没有这两份 README 时应退出 0：
+${out}"
+    case "${out}" in
+        *'未判'*) ;;
+        *) fail "真树没有这两份 README 时没说未判：${out}" ;;
+    esac
+fi
 
 echo "check-readme-trait-members.test: all checks passed"

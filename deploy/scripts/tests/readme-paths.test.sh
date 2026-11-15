@@ -124,14 +124,27 @@ out="$(bash "${checker}" "${work}/plain.md" 2>&1)" || got=$?
 [ "${got}" -eq 0 ] || fail "plain_doc: exit ${got}, wanted 0 —— ${out}"
 
 # 真文件：仓库根的两份 README 今天必须绿——给文件与不给文件两条路都走一遍，
-# 后者走的就是带下限的那条。
-for f in "${repo}/README.md" "${repo}/README.zh-CN.md"; do
-  got=0
-  out="$(bash "${checker}" "${f}" 2>&1)" || got=$?
-  [ "${got}" -eq 0 ] || fail "$(basename "${f}") 里有死指针：${out}"
-done
+# 后者走的就是带下限的那条。干净的检出里这两份不跟踪，那就只剩「文件不在」这条路：
+# 真树要答未判、退出 0，与上面那个小树夹具同一个答案。
+if [ -f "${repo}/README.md" ] && [ -f "${repo}/README.zh-CN.md" ]; then
+  for f in "${repo}/README.md" "${repo}/README.zh-CN.md"; do
+    got=0
+    out="$(bash "${checker}" "${f}" 2>&1)" || got=$?
+    [ "${got}" -eq 0 ] || fail "$(basename "${f}") 里有死指针：${out}"
+  done
+fi
 got=0
 out="$(bash "${checker}" 2>&1)" || got=$?
 [ "${got}" -eq 0 ] || fail "no-arg run on the real tree: exit ${got} —— ${out}"
+if [ -f "${repo}/README.md" ] || [ -f "${repo}/README.zh-CN.md" ]; then
+  case "${out}" in
+    *"未判"*) fail "真树有 README 却答未判：${out}" ;;
+  esac
+else
+  case "${out}" in
+    *"未判"*) ;;
+    *) fail "真树没有 README 时没说未判：${out}" ;;
+  esac
+fi
 
 echo "readme-paths.test: all checks passed"
