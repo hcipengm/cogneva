@@ -303,7 +303,92 @@ pub const LLM_UPSTREAMS_HEALTHY: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-gateway/src/security_gateway.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 11] = [
+/// How many builds are queued for a slot right now.
+///
+/// The delivery chain's first joint, and the one nobody could see: every other
+/// number on the build gate describes what it did with the slots it handed out
+/// — wait times, hold times, refusals — and all of them read healthy while the
+/// queue in front of the gate grows. A queued build is the host saying the
+/// bound is the constraint at this instant, so zero is the only quiet value and
+/// the warning is "somebody is waiting", not some invented number of waiters.
+pub const BUILD_QUEUE_DEPTH: ReadingSpec = ReadingSpec {
+    id: "build_queue_depth",
+    title: "排在建槽外的构建",
+    group: ReadingGroup::Delivery,
+    query: "sum(cogneva_build_gate_waiting)",
+    unit: "条",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_build_gate_waiting",
+    produced_by: "crates/cog-reflection/src/build_gate/mod.rs",
+};
+
+/// The longest a single build has waited for a slot, in this process's life.
+///
+/// The queue's depth says the bound is tight now; this says how tight it has
+/// been. Both are needed because a queue that clears in seconds and one that
+/// clears in twenty minutes look the same at the instant it is sampled, and
+/// only the second one is a reason to raise the bound.
+///
+/// No threshold: the number it should be judged against is the gate's own wait
+/// budget, and a bound written here would be a second copy of that decision.
+pub const BUILD_GATE_WAIT_MAX: ReadingSpec = ReadingSpec {
+    id: "build_gate_wait_max_ms",
+    title: "最长的一次等槽",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_build_gate_wait_ms_max)",
+    unit: "毫秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_build_gate_wait_ms_max",
+    produced_by: "crates/cog-reflection/src/build_gate/mod.rs",
+};
+
+/// How far the build cache sits above the cap it was given.
+///
+/// The cap is derived from the volume and the reclaim pass trims to it; this is
+/// the gap the pass has not closed yet. A cap that is merely being approached
+/// and a cap that is exceeded by more than the pass can remove in one turn are
+/// different problems, and only the second one means the volume keeps filling
+/// between passes — so the reading is the excess, in bytes, and zero is quiet.
+pub const BUILD_CACHE_OVER_CAP: ReadingSpec = ReadingSpec {
+    id: "build_cache_over_cap_bytes",
+    title: "构建缓存超出上限的量",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_build_target_over_limit_bytes)",
+    unit: "字节",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_build_target_over_limit_bytes",
+    produced_by: "crates/cog-core/src/build_cache.rs",
+};
+
+/// Discovery probes that ended without a usable answer.
+///
+/// A probe answers one question about a candidate and is supposed to end in a
+/// verdict. Expired, rejected, inconclusive and unanswered are the four ways it
+/// ends with nothing, and each was a silent outcome: the loop keeps starting
+/// probes, the face keeps showing the candidates, and the only reader was a
+/// panel. Summed over the four because the decision is the same for all of
+/// them — the probe machinery is failing to answer — while the split between
+/// them stays on the per-cause series for whoever asks why.
+pub const DISCOVERY_PROBES_UNANSWERED: ReadingSpec = ReadingSpec {
+    id: "discovery_probes_unanswered",
+    title: "没有给出结论的探测",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_discovery_probe_expired[30m])) + sum(increase(cogneva_discovery_probe_rejected[30m])) + sum(increase(cogneva_discovery_probe_inconclusive[30m])) + sum(increase(cogneva_discovery_probe_unanswered[30m]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_discovery_probe_rejected / expired / inconclusive / unanswered",
+    produced_by: "crates/cog-reflection/src/discovery_outcome_readings.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 15] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -315,6 +400,10 @@ pub const READINGS: [&ReadingSpec; 11] = [
     &MAINLINE_CI_HOLD_ACTIVE,
     &CHANGE_POOL_BLOCKED_OLDEST,
     &LLM_UPSTREAMS_HEALTHY,
+    &BUILD_QUEUE_DEPTH,
+    &BUILD_GATE_WAIT_MAX,
+    &BUILD_CACHE_OVER_CAP,
+    &DISCOVERY_PROBES_UNANSWERED,
 ];
 
 /// The word a reading carries about its own value.

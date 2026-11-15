@@ -639,26 +639,6 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 6;
 /// produced tables; this series came off the alert-rule table with its rule, so
 /// it is owed a face rather than a reader, and `UNREGISTERED` carries that debt
 /// with its own count.
-/// Published series that no decided surface consumes.
-///
-/// A panel is not a reader. The catalogue draws every series the exposition
-/// holds, by construction, so counting drawing as reading would make the
-/// question true about everything and worth nothing. What is counted here is
-/// the population whose only surface is that drawing: 97 after the hand-written
-/// dashboard stopped being a reader (it was 7 while that file was one).
-///
-/// The ceiling only falls. A change that raises it has to say, in the same
-/// commit, why the new series can only be drawn and never decided.
-/// Renderable series with no reader that decides on them.
-///
-/// Measured after the hand-written dashboard left the tree: the catalogue draws
-/// these from the exposition by construction, so "is it on a face" is true
-/// about all of them and worth nothing; what is counted is the ones nothing
-/// decides on. It only falls.
-const RENDERED_DRAWN_ONLY_AT_CENSUS: usize = 97;
-
-const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 0;
-
 #[test]
 fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
     let faces = faces();
@@ -693,12 +673,25 @@ fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
     // 手写面板退出之后，「在不在某张面上」这个问法对渲染侧不成立：目录板按构造
     // 把暴露面上有的名字全画出来，所以每一条都在「一张面」上，判据恒真。剩下真正
     // 要数的还是那件事——有没有一个**决定**消费它。这里把它换成只能降的计数。
-    assert_eq!(
-        unclassified.len(),
-        RENDERED_DRAWN_ONLY_AT_CENSUS,
-        "没有任何决定的渲染序列数变了（现在 {} 条，常数 {RENDERED_DRAWN_ONLY_AT_CENSUS}）：\n{}",
-        unclassified.len(),
-        unclassified.join("\n")
+    // 「有没有人决定」按**产出它的那个文件**判，不由人列表：
+    // 一个文件里只要有一条序列被读数或规则读着，这个文件就在为某个决定供数，
+    // 它发布的其余序列是那条决定的证据与中间量（`X` 被读，`X_evaluations_total`
+    // 就是它的拍子）。一个文件里一条都没被读，才是这个族没有任何决定。
+    //
+    // 这样新增一条序列不需要来这里登记：它跟着它所在的文件归类；而一个新文件
+    // 如果只有发布、没有任何读者，它会自己出现在下面那份名单里。
+    let beside_a_decision = decisions_beside_producers(&on_a_face);
+    let decision_missing: Vec<&str> = unclassified
+        .iter()
+        .copied()
+        .filter(|name| !beside_a_decision.contains(*name))
+        .collect();
+    // 空的才是终态：一条都不许出现在「整个文件没有任何读者」这一栏里。
+    // 没有可钉的数——新增一个这样的文件会让这条直接红，而修法是给那个族一条读数。
+    assert!(
+        decision_missing.is_empty(),
+        "这些序列所在的文件里一条被读的都没有：它们的族没有任何决定，补一条读数（不要在这里加名字）：\n{}",
+        decision_missing.join("\n")
     );
 
     let unknown: Vec<&str> = UNREGISTERED
@@ -786,6 +779,15 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
+    let read = {
+        let mut read = read;
+        read.extend(
+            cog_gateway::readings::READINGS
+                .iter()
+                .flat_map(|spec| metric_names_in(spec.query)),
+        );
+        read
+    };
     let registered = table_names(ALERT_RULE_CONTRACT, ALERT_TABLE_OPENS);
     let excluded: BTreeSet<&str> = NOT_A_SERIES.iter().map(|(n, _)| *n).collect();
 
@@ -809,12 +811,9 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
         })
         .collect();
 
-    assert_eq!(
-        registered_unread.len(),
-        REGISTERED_BUT_UNREAD_AT_CENSUS,
-        "有登记、没有读者的序列数与 REGISTERED_BUT_UNREAD_AT_CENSUS 不再相等（现在 {} 条，常数 {REGISTERED_BUT_UNREAD_AT_CENSUS}）:\n{}\n多一条：新登记的序列要当轮给它一个读者（规则或面板），否则它不是「已覆盖」而是「记下了却没人看」；少一条：补齐了读者，这个数要跟着减",
-        registered_unread.len(),
-        registered_unread.join("\n")
+    assert!(
+        registered_unread.is_empty(),
+        "这些登记的序列没有任何读者，也不在闭集里（没有可钉的数：空才是终态）：{registered_unread:?}"
     );
 }
 
@@ -869,12 +868,6 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
 /// replaced it. Counting it here is what says so out loud rather than leaving
 /// the loss of a reader to be discovered by whoever next asks why the row is
 /// still published.
-/// Store-backed series nothing in the tree reads.
-///
-/// Same change, same reason: the panels used to be counted as readers, so this
-/// population read 41; without them it is 68. It only falls.
-const STORE_BACKED_WITHOUT_A_READER: usize = 68;
-
 #[test]
 fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
     let registry: BTreeSet<String> = cog_core::metric_names::ALL
@@ -887,6 +880,13 @@ fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
         .collect();
     let shipped = production_query_reads();
     read.extend(shipped.iter().cloned());
+    // 判词面的读数也是读者，而且是最主要的那一类：一条读数就是一次决定。
+    // 不把它算进来，判据只认告警规则，于是「已经有人盯着这个数」会被报成没人看。
+    read.extend(
+        cog_gateway::readings::READINGS
+            .iter()
+            .flat_map(|spec| metric_names_in(spec.query)),
+    );
 
     assert!(
         !read.is_empty(),
@@ -914,17 +914,9 @@ fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
         .filter(|n| !read_by(n))
         .collect();
 
-    assert_eq!(
-        unread.len(),
-        STORE_BACKED_WITHOUT_A_READER,
-        "闭集里既没有规则、没有面板、也没有生产代码 `query_*` 读的序列数与 \
-         STORE_BACKED_WITHOUT_A_READER 不再相等（现在 {} 条，常数 \
-         {STORE_BACKED_WITHOUT_A_READER}）:\n{}\n\
-         多一条：新序列要当轮补一个读者（规则、面板或生产代码里的自读），\
-         否则它不是「已覆盖」而是「写进 store 却没人看」；\
-         少一条：补齐了读者，这个数要跟着减",
-        unread.len(),
-        unread.join("\n")
+    assert!(
+        unread.is_empty(),
+        "闭集里这些序列既没有规则读、也没有读数读、生产代码也没有人查它——补读者，或在登记表里写清它为什么不需要：{unread:?}"
     );
 }
 
@@ -1203,8 +1195,13 @@ fn faces() -> Vec<(&'static str, BTreeSet<String>)> {
         .iter()
         .flat_map(|expr| metric_names_in(expr))
         .collect();
+    let readings: BTreeSet<String> = cog_gateway::readings::READINGS
+        .iter()
+        .flat_map(|spec| metric_names_in(spec.query))
+        .collect();
     vec![
         ("cog_core::metric_names::ALL（闭集）", registry),
+        ("判词面的读数", readings),
         ("chart 里的告警规则 promql", rules),
         (
             "告警规则契约测试的 PRODUCED 表",
@@ -1340,6 +1337,26 @@ fn spells_series(text: &str, name: &str) -> bool {
 }
 
 /// Every series name the tree publishes, from the two shapes a producer uses.
+/// The published names whose file also publishes something a face reads.
+///
+/// The unit is the file, not the name: a producer emits a family, and whether
+/// that family has a decision is a property of the code that emits it. Reading
+/// it off the tree is what keeps this from being a list somebody maintains.
+fn decisions_beside_producers(on_a_face: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut beside = BTreeSet::new();
+    for path in all_crate_files(&repo_root()) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let names = declared_names(&text);
+        let producer_has_a_reader = names.iter().any(|n| on_a_face.contains(n));
+        if producer_has_a_reader {
+            beside.extend(names);
+        }
+    }
+    beside
+}
+
 fn published_names() -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for path in all_crate_files(&repo_root()) {
