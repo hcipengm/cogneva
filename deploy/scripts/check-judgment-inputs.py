@@ -6,7 +6,7 @@
 不该在。2026-11 把这张表所在的目录逐份普查过一遍，19 份各自有了去向；这张门把那一次
 普查变成常设判据——新长出来的手写表不能悄悄成为判据。
 
-身份不住在一张表里，住在代码动作的旁边。一张被读的表只认三种东西：
+身份不住在一张表里，住在代码动作的旁边。一张被读的表只有两种身份：
 
   写者       写这份文件的代码在自己的注释里写一行 `writes: <模式> generated`
              （Rust 用 `//`），正文里还要真的点到那份文件——通配行点到静态前缀就够，
@@ -15,16 +15,12 @@
   读者       只把文件读来**验**它的判词脚本写一行 `reads: <模式> subject`，正文里
              同样要点到它。chart 模板、values、渲染产物、静态清单、告警规则、夹具
              属于这一类：改它们会红在点了名的门上，所以它们不暗中决定判词。
-  文件头     文件自己认领的一行：
-               `carrier: <kind>; consumed-by: … import-declarations --kind <kind> …; dies: …`
-               —— 一次性导入载体：点名消费它的平台动作；说不清谁消费它就和欠账同形。
 
-人写的文件不是第三种身份。一张手写表被判词读，终态里它**不存在**——判据要么有写它的
-代码，要么是平台声明、读者够得着就去读、够不着就记「没判成」，要么从源码推得出来。
-过渡期里它可以带一行 `debt: <理由>; expires: YYYY-MM-DD` 继续存在：那不是身份，是
-**倒计时**——门每次跑都把它印出来（`debt …`），到期那天红，而且**基线里没有的欠账头
-直接红**（棘轮：已有的只许减，新的一个也不许长出来）。所以「把一笔手写表登记成欠账」
-不是拿到了一张许可，是把退出这件事写上了日程。
+手写的表不是第三种身份。一张手写表被判词读，在终态里它**不存在**：判据要么有写它的
+代码，要么只被读来验它，要么它不该在树里。这里没有 `debt:`／`carrier:`／到期／基线
+棘轮这种中间身份——中间身份就是「允许继续手写」的许可，许可可以续期，于是目标永远
+到不了。要留的判据换成机器写或从源码推得出来，留不下的删掉；删不掉时门就是红的，
+红在那里是终态契约在说「这张表不该存在」，不是一道可以用一行头注释换掉的关。
 
 为什么不再要一张登记表：登记表是第二处必须与代码同说的东西，而它自己就是一张手写
 判据。身份写在动作旁边，文件挪走、读者改行、写者换名时，注解跟着那一笔一起动或一起
@@ -41,22 +37,16 @@
 shell／python／make 文件——写文件的代码就在那一面上。
 
 写者优先于读者：一份机器写的表可以同时被门读来验（配额基线就是——渲染写它，parity
-读它），那仍是 produced，读者的注解只说明它那次读是验不是取。真正的冲突是文件自己
-的认领与注解同时成立（欠账头又说有写者、又说有验它的读者），那是两个身份，红。
-两个写者匹配同一份表也是红：一个生产者，不是一个先到先得。通配只在一段里
+读它），那仍是 produced，读者的注解只说明它那次读是验不是取。两个写者匹配同一份表
+也是红：一个生产者，不是一个先到先得。通配只在一段里
 匹配（`*` 不跨 `/`），`**` 不支持（写出来是让人以为跨目录、实际不跨），绝对路径与
 没有静态前缀的模式直接拒。注解匹配不到任何**被读**的数据文件就印 `stale`，不红——
 清账是写者的事，而 stale 每跑一次印一次。
 
-耗尽／棘轮：欠账的比较基准是 `--baseline`（默认 HEAD）那棵树里同一路径的头一行。基线
-读不到（不在仓里、不是提交）时印 `debt_ratchet=unjudged`——那一格没判成，不是绿；其余
-判据照跑。夹具（不是 git 仓）因此仍能判身份，只是判不了「新欠账」。
+退出码：0 每张被读的表都有身份；1 有没身份／两个身份／链断；3 根不在、
+一张数据文件都没有、一份判词脚本都没有——「量不出来」不是绿。
 
-退出码：0 每张被读的表都有身份且没有新欠账；1 有没身份／两个身份／链断／欠账过期／
-基线里没有的新欠账；3 根不在、一张数据文件都没有、一份判词脚本都没有——「量不出来」
-不是绿。
-
-用法：check-judgment-inputs.py [--root PATH] [--baseline REV]
+用法：check-judgment-inputs.py [--root PATH]
 """
 
 from __future__ import annotations
@@ -65,7 +55,6 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date
 
 DATA_SUFFIXES = (".tsv", ".pin", ".csv", ".yaml", ".yml")
 CODE_SUFFIXES = (".sh", ".py", ".bash", ".mk")
@@ -87,10 +76,6 @@ VERDICT = tuple(re.compile(p) for p in (
 # 也不是——它没有那一列。
 ANNOT = re.compile(r"^(#|//)\s+(reads|writes):\s+(\S+)\s+(\S+)\s*$")
 ANNOT_LOOSE = re.compile(r"^(#|//)\s+(reads|writes):")
-DEBT = re.compile(r"^#\s*debt:\s*(.*?);\s*expires:\s*(\d{4}-\d{2}-\d{2})\s*$")
-DEBT_LOOSE = re.compile(r"^#\s*debt:")
-CARRIER = re.compile(r"^#\s*carrier:\s*(.*)$")
-CARRIER_LOOSE = re.compile(r"^#\s*carrier:")
 
 
 class Decl:
@@ -190,30 +175,6 @@ def parse_annotations(rel, text, fail):
     return out
 
 
-def parse_headers(rel, text, fail):
-    """文件自己认领欠账／载体。同一份文件两种头都写＝红（两个身份）。"""
-    debt = None
-    carrier = None
-    for n, line in enumerate(text.splitlines(), 1):
-        if DEBT_LOOSE.match(line) and debt is None:
-            m = DEBT.match(line)
-            if not m:
-                fail(f"欠账头写不成：{rel}:{n}——要 debt: <理由>; expires: YYYY-MM-DD")
-                continue
-            debt = (m.group(1).strip(), m.group(2))
-        elif CARRIER_LOOSE.match(line) and carrier is None:
-            m = CARRIER.match(line)
-            rest = m.group(1).strip() if m else ""
-            kind = rest.split(";", 1)[0].strip()
-            if (not kind or "consumed-by:" not in rest or "import-declarations" not in rest
-                    or "--kind" not in rest or "dies:" not in rest):
-                fail(f"载体头没有点名消费它的导入动作：{rel}——要 carrier: <kind>; "
-                     f"consumed-by: … import-declarations --kind <kind> …; dies: …")
-                continue
-            carrier = rest
-    return debt, carrier
-
-
 def git(root, *args, data=None):
     return subprocess.run(["git", "-C", root, *args], input=data, capture_output=True)
 
@@ -282,47 +243,27 @@ def load_tree(root):
 
 def parse_args(argv):
     root = None
-    base = "HEAD"
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in ("--root", "--baseline"):
+        if arg == "--root":
             if i + 1 >= len(argv):
-                print(f"exit 2：{arg} 要给一个值", file=sys.stderr)
+                print("exit 2：--root 要给一个路径", file=sys.stderr)
                 raise SystemExit(2)
-            if arg == "--root":
-                root = argv[i + 1]
-            else:
-                base = argv[i + 1]
+            root = argv[i + 1]
             i += 2
         elif arg in ("-h", "--help"):
-            print("usage: check-judgment-inputs.py [--root PATH] [--baseline REV]")
+            print("usage: check-judgment-inputs.py [--root PATH]")
             raise SystemExit(0)
         else:
             print(f"exit 2：未知参数 {arg}", file=sys.stderr)
             raise SystemExit(2)
-    return root, base
-
-
-def baseline_debts(root, base):
-    """基线那棵树里已经带着欠账头的路径；读不到返回 None（那一格没判成，不是绿）。"""
-    proc = git(root, "grep", "-I", "-l", "-E", "^#[[:space:]]*debt:", base, "--")
-    if proc.returncode == 1:
-        return set()
-    if proc.returncode != 0:
-        return None
-    out = set()
-    for line in proc.stdout.decode("utf-8", "replace").splitlines():
-        _, _, path = line.partition(":")
-        if path:
-            out.add(path)
-    return out
+    return root
 
 
 def main(argv):
-    root_arg, base = parse_args(argv)
     root = os.path.abspath(
-        root_arg
+        parse_args(argv)
         or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     if not os.path.isdir(root):
         print(f"exit 3：根不在：{root}", file=sys.stderr)
@@ -375,42 +316,23 @@ def main(argv):
     reads = [d for d in decls if d.kind == "reads"]
 
     total = read_n = unread_n = 0
-    generated_n = subject_n = debt_n = carrier_n = 0
-    debts_seen = []
-    today = date.today().isoformat()
+    generated_n = subject_n = 0
 
     for rel in data:
         total += 1
-        debt, carrier = parse_headers(rel, text_of(rel), fail)
-        if debt:
-            debts_seen.append(rel)
-
         if not readers[rel]:
             unread_n += 1
-            if debt and debt[1] < today:
-                fail(f"欠账过期：{rel} 的到期日是 {debt[1]}，已经过了——补生产者，或者把这行删掉")
-            elif debt:
-                print(f"debt  {rel}（{debt[0] or '<没写理由>'}；到期 {debt[1]}；没人读）")
             continue
         read_n += 1
 
         matched_w = [d for d in writes if d.rx.match(rel)]
         matched_r = [d for d in reads if d.rx.match(rel)]
-        if (debt or carrier) and (matched_w or matched_r):
-            heads = "欠账头" if debt else "载体头"
-            anns = "写者注解" if matched_w else "读者注解"
-            fail(f"两个身份：{rel}（{heads}、{anns}）——文件自己认领了来源，代码又说了另一个")
-            continue
-        if debt and carrier:
-            fail(f"两个身份：{rel}（欠账头、载体头）——一份表只该有一个身份")
-            continue
 
         # 写者优先：机器写的表被门读来验是常事，产出的身份由写者认领。
-        kind = ("generated" if matched_w else "subject" if matched_r
-                else "debt" if debt else "carrier" if carrier else "")
+        kind = "generated" if matched_w else "subject" if matched_r else ""
         if not kind:
-            fail(f"没有身份：{rel} 被判词脚本读，而树里没有写者注解、验它的读者注解，"
-                 f"文件头也没认领")
+            fail(f"没有身份：{rel} 被判词脚本读，而树里没有写它的代码、也没有只把它读来验的"
+                 f"判词脚本——手写的表不该成为判据")
             continue
 
         if kind == "generated":
@@ -419,32 +341,8 @@ def main(argv):
                      f"（{', '.join(d.rel for d in matched_w)}）——一个生产者")
                 continue
             generated_n += 1
-        elif kind == "subject":
-            subject_n += 1
-        elif kind == "debt":
-            if debt[1] < today:
-                fail(f"欠账过期：{rel} 的到期日是 {debt[1]}，已经过了——补生产者，或者把这行删掉")
-            else:
-                debt_n += 1
-                print(f"debt  {rel}（{debt[0] or '<没写理由>'}；到期 {debt[1]}）")
         else:
-            carrier_n += 1
-            print(f"carrier {rel}（{carrier}）")
-
-    # 欠账不是身份，是倒计时：已有的可以留到平台声明或推导接手，**新的一个也不许长出来**。
-    # 基准是基线那棵树里同一路径的头一行，不是一份登记表——登记表会漂，源头不会。读不到
-    # 基线时印 unjudged：那一格没判成，不记绿。
-    baseline_set = baseline_debts(root, base)
-    if baseline_set is None:
-        print(f"debt_ratchet=unjudged（基线 {base} 读不到：不在仓里或不是提交）")
-    else:
-        new_debts = [rel for rel in debts_seen if rel not in baseline_set]
-        for rel in new_debts:
-            fail(f"新欠账：{rel} 的欠账头在基线 {base} 里没有——人写的判据不是一种身份，"
-                 f"只有倒计时。新的欠账一个也不许出现：先把它的来源写出来（写者注解、"
-                 f"平台声明，或从源码推导）")
-        if not new_debts:
-            print(f"debt_ratchet=ok baseline={base} outstanding={len(debts_seen)}")
+            subject_n += 1
 
     stale = []
     for d in decls:
@@ -455,13 +353,13 @@ def main(argv):
         print(line)
 
     print(f"judgment-inputs: {total} 张数据文件，{read_n} 张被判词脚本读"
-          f"（generated {generated_n}，subject {subject_n}，debt {debt_n}，carrier {carrier_n}），"
+          f"（generated {generated_n}，subject {subject_n}），"
           f"{unread_n} 张没人读，stale {len(stale)}；声明：writes {len(writes)}、reads {len(reads)}")
     if fails:
         for msg in fails:
             print(f"FAIL  {msg}", file=sys.stderr)
-        print(f"judgment-inputs: {len(fails)} 条红——被门读的表要有写者注解、验它的读者注解"
-              f"或文件头认领；欠账要带理由与到期", file=sys.stderr)
+        print(f"judgment-inputs: {len(fails)} 条红——被门读的表要有写它的代码，"
+              f"或只被读来验它的判词脚本；手写的表没有第三种身份", file=sys.stderr)
         return 1
     return 0
 
