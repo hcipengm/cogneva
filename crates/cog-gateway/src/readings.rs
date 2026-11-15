@@ -586,7 +586,135 @@ pub const MEMORY_BACKLOG: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-memory/src/plugin.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 25] = [
+/// How long a drain actually took, at its slow tail.
+///
+/// The budget is a policy; this is what the policy is being spent on. Read at
+/// p95 rather than the mean because one drain that waited out the whole budget
+/// is the case that sizes it, and a mean over many fast ones hides exactly那一条.
+pub const SHUTDOWN_DRAIN_DURATION: ReadingSpec = ReadingSpec {
+    id: "shutdown_drain_duration_seconds",
+    title: "排空耗时（p95）",
+    group: ReadingGroup::Delivery,
+    query: "histogram_quantile(0.95, sum by (le) (rate(cogneva_shutdown_drain_milliseconds_bucket[30m]))) / 1000",
+    unit: "秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_shutdown_drain_milliseconds",
+    produced_by: "crates/cog-agent/src/plugin.rs",
+};
+
+/// Event-bus handoffs that had to be rebuilt rather than delivered directly.
+///
+/// A handoff is the bus telling a consumer to catch up from the store. It is
+/// the recovery path, so a rate that climbs while the direct path looks quiet
+/// says the bus is dropping frames that nobody counts elsewhere.
+pub const EVENT_BUS_HANDOFFS: ReadingSpec = ReadingSpec {
+    id: "event_bus_handoffs",
+    title: "事件总线的交接次数",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_event_bus_handoff_total[30m]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_event_bus_handoff_total",
+    produced_by: "crates/cog-core/src/event_bus.rs",
+};
+
+/// Rows and tasks the event store is holding.
+///
+/// The event board reads the last day from this table, and its retention is a
+/// row count: a store that stops being trimmed shows up here first, as a row
+/// count that keeps climbing while every board it feeds still looks normal.
+pub const TASK_EVENT_STORE: ReadingSpec = ReadingSpec {
+    id: "task_event_store_rows",
+    title: "事件表的行数",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_task_events_rows)",
+    unit: "行",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_task_events_rows / cogneva_task_events_tasks",
+    produced_by: "crates/cog-storage/src/task_event_retention.rs",
+};
+
+/// How far the running build sits behind the newest release.
+///
+/// The version contract compares the binary's declared version with the tag it
+/// was built from; a commit count that keeps climbing means releases stopped
+/// while the tree kept moving, and every other delivery number keeps looking
+/// healthy because the loop that would notice is the one that stopped.
+pub const VERSION_LAG: ReadingSpec = ReadingSpec {
+    id: "version_lag_commits",
+    title: "离最近一次发布还有多少提交",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_version_commits_since_release)",
+    unit: "提交",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_version_commits_since_release / cogneva_version_declared_info / cogneva_promotion_week_changes",
+    produced_by: "crates/cog-reflection/src/version_contract.rs",
+};
+
+/// Requests the gateway served, and how slow its slow tail was.
+///
+/// The one pair that answers "is the platform itself healthy" without any
+/// judgement layered on it: the rate says traffic, the p95 says whether the
+/// process is keeping up. Neither has a threshold here -- the bound belongs to
+/// whoever sets the SLO, and inventing one would be a second copy of it.
+pub const HTTP_LATENCY: ReadingSpec = ReadingSpec {
+    id: "http_latency_p95_ms",
+    title: "网关请求 p95",
+    group: ReadingGroup::Infra,
+    query: "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_ms_bucket[5m])))",
+    unit: "毫秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "http_request_duration_ms / http_requests_total",
+    produced_by: "crates/cog-gateway/src/lib.rs",
+};
+
+/// Exchanges and the latency the model calls inside them took.
+///
+/// The LLM account's own volume next to its own latency: an exchange count that
+/// climbs while latency does too is the pool serving more work per second than
+/// it can answer, which is the state right before the gate starts deferring.
+pub const LLM_EXCHANGE_VOLUME: ReadingSpec = ReadingSpec {
+    id: "llm_exchange_volume",
+    title: "LLM 交换量与调用延迟",
+    group: ReadingGroup::Delivery,
+    query: "max(llm_call_latency_ms)",
+    unit: "毫秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "llm_call_latency_ms / gateway_llm_exchange_rows / gateway_llm_exchange_bytes",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+};
+
+/// Tasks the SOP dispatcher injected, and roles it could not map.
+///
+/// The dispatcher's own account: an unmapped role is a task that was looked at
+/// and not handed to anybody, and it is invisible from the injection count
+/// alone because the loop keeps running either way.
+pub const SOP_DISPATCH: ReadingSpec = ReadingSpec {
+    id: "sop_unmapped_roles",
+    title: "SOP 派发时对不上的角色",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(sop_unmapped_role_total[24h]))",
+    unit: "次",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "sop_unmapped_role_total / sop_dispatch_total / sop_tasks_injected_total",
+    produced_by: "crates/cog-orchestrator/src/sop_dispatch.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 32] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -612,6 +740,13 @@ pub const READINGS: [&ReadingSpec; 25] = [
     &RESOURCE_EVENTS_DROPPED,
     &ROLLOUT_JOB_THROTTLED,
     &MEMORY_BACKLOG,
+    &SHUTDOWN_DRAIN_DURATION,
+    &EVENT_BUS_HANDOFFS,
+    &TASK_EVENT_STORE,
+    &VERSION_LAG,
+    &HTTP_LATENCY,
+    &LLM_EXCHANGE_VOLUME,
+    &SOP_DISPATCH,
 ];
 
 /// The word a reading carries about its own value.
