@@ -65,9 +65,7 @@ const BASELINE: &[&str] = &[
     "crates/cog-storage/migrations/mysql/006_memory.up.sql:memory_schema_entries.properties",
     "crates/cog-storage/migrations/mysql/006_memory.up.sql:memory_summary_entries.related_schema_ids",
     "crates/cog-storage/migrations/mysql/008_chat_sessions.up.sql:chat_sessions.context",
-    "crates/cog-storage/migrations/mysql/009_messages.up.sql:messages.file_attachments",
     "crates/cog-storage/migrations/mysql/009_messages.up.sql:messages.tool_calls",
-    "crates/cog-storage/migrations/mysql/016_notifications.up.sql:notifications.data",
     "crates/cog-storage/migrations/mysql/017_audit_logs.up.sql:audit_logs.details",
     "crates/cog-storage/migrations/mysql/021_explainability.up.sql:explainability.data",
     "crates/cog-storage/migrations/mysql/028_change_ledger.up.sql:change_ledger.sources",
@@ -85,9 +83,7 @@ const BASELINE: &[&str] = &[
     "crates/cog-storage/migrations/postgres/006_memory.up.sql:memory_schema_entries.properties",
     "crates/cog-storage/migrations/postgres/006_memory.up.sql:memory_summary_entries.related_schema_ids",
     "crates/cog-storage/migrations/postgres/008_chat_sessions.up.sql:chat_sessions.context",
-    "crates/cog-storage/migrations/postgres/009_messages.up.sql:messages.file_attachments",
     "crates/cog-storage/migrations/postgres/009_messages.up.sql:messages.tool_calls",
-    "crates/cog-storage/migrations/postgres/016_notifications.up.sql:notifications.data",
     "crates/cog-storage/migrations/postgres/017_audit_logs.up.sql:audit_logs.details",
     "crates/cog-storage/migrations/postgres/021_explainability.up.sql:explainability.data",
     "crates/cog-storage/migrations/postgres/023_explainability_partition.up.sql:explainability_part.data",
@@ -101,7 +97,6 @@ const BASELINE: &[&str] = &[
     "crates/cog-storage/src/postgres/metrics_backend.rs:cog_metric_histogram_buckets.labels",
     "crates/cog-storage/src/postgres/metrics_backend.rs:cog_metric_histogram_sums.labels",
     "crates/cog-storage/src/postgres/metrics_backend.rs:cog_metrics_samples.labels",
-    "crates/cog-storage/src/postgres/notification_store.rs:notifications.data",
     "crates/cog-storage/src/postgres/observability_gateway.rs:cog_observability_events.payload",
     "crates/cog-storage/src/postgres/observability_gateway.rs:cog_observability_logs.metadata",
     "crates/cog-storage/src/postgres/observability_gateway.rs:cog_observability_squads.agents",
@@ -176,6 +171,50 @@ fn census(root: &Path) -> BTreeSet<String> {
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         scan(&rel(root, &path), &text, &mut out);
+    }
+    // 迁移是一条时间线：后面的 `DROP COLUMN` 之后，那一列已经不是 jsonj 了。
+    // 不折这一刀，这份账只能靠改写历史迁移来减少——而历史是被应用到库上的，
+    // 不该为了判据好看去改。
+    let dropped = dropped_columns(root);
+    out.retain(|entry| {
+        let Some((_, table_col)) = entry.split_once(':') else {
+            return true;
+        };
+        !dropped.contains(table_col)
+    });
+    out
+}
+
+/// 迁移里被 `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <c>` 掉的那些列，`表.列`。
+fn dropped_columns(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for path in migration_files(root) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lower = text.to_ascii_lowercase();
+        for piece in lower.split("alter table ").skip(1) {
+            let mut words = piece.split_whitespace();
+            let Some(table) = words.next() else {
+                continue;
+            };
+            let rest: String = words.collect::<Vec<_>>().join(" ");
+            let Some(at) = rest.find("drop column ") else {
+                continue;
+            };
+            let after = rest[at + "drop column ".len()..].trim_start();
+            let after = after.strip_prefix("if exists ").unwrap_or(after);
+            let column = after
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("");
+            if !column.is_empty() {
+                out.insert(format!(
+                    "{}.{column}",
+                    table.trim_matches(|c: char| c == '"' || c == '`')
+                ));
+            }
+        }
     }
     out
 }

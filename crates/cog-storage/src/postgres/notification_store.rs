@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS notifications (
     ntype VARCHAR(32) NOT NULL CHECK (ntype IN ('{ntype:task_completed}', '{ntype:quota_warning}', '{ntype:mention}', '{ntype:system}')),
     title VARCHAR(256) NOT NULL,
     body TEXT,
-    data JSONB NOT NULL DEFAULT '{}',
     is_read BOOLEAN NOT NULL DEFAULT false,
     read_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -62,10 +61,6 @@ pub const CREATE_INDEX_SQL: &[&str] = &[
 ];
 
 const NOTIFICATION_COLS: &str = "id, user_id, ntype, title, body, is_read, read_at, created_at";
-
-// The table also carries a `data` column this build never writes or reads.
-// Rows it did not write get the column's default (`{}`), which is why the
-// insert below can leave it out.
 
 type NotificationRow = (
     Uuid,
