@@ -112,7 +112,7 @@ const KIND_MAX: usize = 32;
 const SCOPE_MAX: usize = 191;
 // cap: bound — the identity's literal column width, a schema limit shared by both dialects
 const LITERAL_MAX: usize = 512;
-// cap: bound — a writer-side cap on the source document; the row itself keeps the sources in JSONB
+// cap: bound — a writer-side cap on one citation's document; the citations live in change_ledger_sources
 const DOC_MAX: usize = 512;
 
 /// PostgreSQL change ledger store.

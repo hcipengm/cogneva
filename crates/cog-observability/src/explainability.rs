@@ -1,6 +1,6 @@
 /// Explainability (AI decision tracking).
 /// - Stores AI decision chains, confidence scores, reasoning
-/// - Persisted in PostgreSQL JSONB (via pg.factory)
+/// - Persisted in PostgreSQL as JSON text (via pg.factory)
 /// - Supports querying by session/task/agent/decision_type/time
 ///   **Human layer**: Explainability Service API for debugging AI behavior.
 ///   **Agent layer**: Decision records embedded in Snapshot for replay.
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 /// Explainability storage backend trait.
 /// Phase 1: in-memory implementation.
-/// Phase 2: PostgreSQL JSONB backend via pg.factory.
+/// Phase 2: PostgreSQL backend via pg.factory.
 #[async_trait::async_trait]
 pub trait ExplainabilityBackend: Send + Sync {
     async fn insert(&self, record: ExplainabilityRecord) -> anyhow::Result<()>;

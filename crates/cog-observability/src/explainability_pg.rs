@@ -1,5 +1,5 @@
 /// PostgreSQL-backed explainability storage.
-/// Uses sqlx + JSONB for structured AI decision records.
+/// Uses sqlx; the decision payload is JSON text beside the columns it is read by.
 /// All trait methods map to indexed SQL queries.
 use crate::explainability::ExplainabilityBackend;
 use crate::ExplainabilityRecord;

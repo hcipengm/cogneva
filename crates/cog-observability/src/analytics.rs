@@ -1,5 +1,5 @@
 /// Analytics backend for event tracking and OLAP queries.
-/// - Phase 1: PostgreSQL(JSONB) fallback available
+/// - Phase 1: PostgreSQL fallback available
 /// - Phase 2: ClickHouse for high-volume analytics (>100M events/month)
 ///   **Machine layer**: Structured event ingestion for downstream dashboards.
 ///   **Human layer**: Analytics API for user behavior and system metrics.
@@ -477,7 +477,7 @@ pub fn postgres_table_ddl(table: &str) -> String {
 }
 
 /// PostgreSQL-backed analytics backend for Phase 1.
-/// Stores events in a JSONB table, suitable for moderate volumes
+/// Stores events in a flat table whose payload column is JSON text, suitable for moderate volumes
 /// (< 100M events/month).  The design doc recommends ClickHouse
 /// for higher volumes.
 pub struct PostgresAnalyticsBackend {
