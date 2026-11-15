@@ -443,7 +443,7 @@ pub const SHUTDOWN_DRAIN_LOSS: ReadingSpec = ReadingSpec {
     id: "shutdown_drain_loss",
     title: "关停时被硬切的尝试",
     group: ReadingGroup::Delivery,
-    query: "sum(increase(cogneva_shutdown_drain_undeclared_total[30m]))",
+    query: "sum(increase(cogneva_shutdown_drain_undeclared_total[30m])) + sum(increase(cogneva_attempt_resume_total[30m]))",
     unit: "条",
     warn: Some(0.0),
     crit: None,
@@ -481,7 +481,7 @@ pub const TOOL_OUTPUT_TRUNCATED: ReadingSpec = ReadingSpec {
     id: "tool_output_truncated",
     title: "被截断的工具输出",
     group: ReadingGroup::Delivery,
-    query: "sum(increase(cogneva_tool_output_truncated_total[30m]))",
+    query: "sum(increase(cogneva_tool_output_truncated_total[30m])) + sum(increase(cogneva_tool_output_truncated_chars_total[30m]))",
     unit: "次",
     warn: None,
     crit: None,
@@ -522,7 +522,7 @@ pub const MAINLINE_SETBACKS: ReadingSpec = ReadingSpec {
     id: "mainline_setbacks",
     title: "主线被打回与越过的次数",
     group: ReadingGroup::Delivery,
-    query: "sum(increase(cogneva_mainline_advance_deferrals[24h])) + sum(increase(cogneva_mainline_superseded_rollout_total[24h])) + sum(increase(cogneva_deployer_revs_skipped_total[24h]))",
+    query: "sum(increase(cogneva_mainline_advance_deferrals[24h])) + sum(increase(cogneva_mainline_superseded_rollout_total[24h])) + sum(increase(cogneva_deployer_revs_skipped_total[24h])) + sum(increase(cogneva_mainline_ci_check_excluded_total[24h])) + sum(increase(cogneva_landing_ci_failure_inherited_total[24h]))",
     unit: "次",
     warn: None,
     crit: None,
@@ -631,7 +631,7 @@ pub const TASK_EVENT_STORE: ReadingSpec = ReadingSpec {
     id: "task_event_store_rows",
     title: "事件表的行数",
     group: ReadingGroup::Infra,
-    query: "max(cogneva_task_events_rows)",
+    query: "max(cogneva_task_events_rows) or on() max(cogneva_task_events_tasks) or on() max(cogneva_llm_usage_rows)",
     unit: "行",
     warn: None,
     crit: None,
@@ -650,7 +650,7 @@ pub const VERSION_LAG: ReadingSpec = ReadingSpec {
     id: "version_lag_commits",
     title: "离最近一次发布还有多少提交",
     group: ReadingGroup::Delivery,
-    query: "max(cogneva_version_commits_since_release)",
+    query: "max(cogneva_version_commits_since_release) or on() max(cogneva_version_declared_info)",
     unit: "提交",
     warn: None,
     crit: None,
@@ -669,7 +669,7 @@ pub const HTTP_LATENCY: ReadingSpec = ReadingSpec {
     id: "http_latency_p95_ms",
     title: "网关请求 p95",
     group: ReadingGroup::Infra,
-    query: "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_ms_bucket[5m])))",
+    query: "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_ms_bucket[5m]))) or on() sum(rate(http_requests_total[5m]))",
     unit: "毫秒",
     warn: None,
     crit: None,
@@ -687,7 +687,7 @@ pub const LLM_EXCHANGE_VOLUME: ReadingSpec = ReadingSpec {
     id: "llm_exchange_volume",
     title: "LLM 交换量与调用延迟",
     group: ReadingGroup::Delivery,
-    query: "max(llm_call_latency_ms)",
+    query: "max(llm_call_latency_ms) or on() max(gateway_llm_exchange_rows) or on() max(gateway_llm_exchange_bytes)",
     unit: "毫秒",
     warn: None,
     crit: None,
@@ -705,7 +705,7 @@ pub const SOP_DISPATCH: ReadingSpec = ReadingSpec {
     id: "sop_unmapped_roles",
     title: "SOP 派发时对不上的角色",
     group: ReadingGroup::Delivery,
-    query: "sum(increase(sop_unmapped_role_total[24h]))",
+    query: "sum(increase(sop_unmapped_role_total[24h])) or on() sum(increase(sop_dispatch_total[24h])) or on() sum(increase(sop_tasks_injected_total[24h]))",
     unit: "次",
     warn: Some(0.0),
     crit: None,
@@ -743,7 +743,7 @@ pub const RESOURCE_EVENTS_BACKLOG: ReadingSpec = ReadingSpec {
     id: "resource_events_pending",
     title: "等待转发的资源事件",
     group: ReadingGroup::Delivery,
-    query: "max(cogneva_resource_events_pending)",
+    query: "max(cogneva_resource_events_pending) or on() max(cogneva_resource_events)",
     unit: "条",
     warn: None,
     crit: None,
@@ -762,7 +762,7 @@ pub const MEMORY_DEAD_LETTERS: ReadingSpec = ReadingSpec {
     id: "memory_dead_letters",
     title: "记忆死信",
     group: ReadingGroup::Delivery,
-    query: "max(memory_dead_letter_raw)",
+    query: "max(memory_dead_letter_raw) or on() max(memory_unextracted_raw) or on() max(cogneva_memory_dropped_entries_total)",
     unit: "条",
     warn: None,
     crit: None,
@@ -781,7 +781,7 @@ pub const ROLLOUT_JOB_NEAR_LIMIT: ReadingSpec = ReadingSpec {
     id: "rollout_job_memory_ratio",
     title: "判据 Job 内存接近上限的比例",
     group: ReadingGroup::Delivery,
-    query: "max(cogneva_rollout_job_memory_peak_ratio)",
+    query: "max(cogneva_rollout_job_memory_peak_ratio) or on() max(cogneva_rollout_job_reading_unix)",
     unit: "0-1",
     warn: Some(0.85),
     crit: Some(1.0),
@@ -981,7 +981,286 @@ pub const LLM_CONTRACT_MISMATCH: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-gateway/src/security_gateway.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 46] = [
+/// Registry reclaim, counted rather than weighed.
+///
+/// The byte reading says how much was freed; this says how many objects went.
+/// A pass that frees kilobytes from one huge image and a pass that frees the
+/// same kilobytes from two hundred small ones are different problems, and the
+/// counters are also where a prune that stopped entirely shows up first.
+pub const REGISTRY_PRUNE_COUNTS: ReadingSpec = ReadingSpec {
+    id: "registry_prune_counts",
+    title: "镜像仓库回收的对象数",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_buildah_store_pruned_images_total[24h])) + sum(increase(cogneva_buildah_store_pruned_layers_total[24h])) + sum(increase(cogneva_registry_pruned_tags_total[24h])) + max(cogneva_buildah_store_kept_images) + sum(increase(cogneva_registry_rebuild_hold_secs_total[24h]))",
+    unit: "个",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_buildah_store_pruned_images_total / cogneva_buildah_store_pruned_layers_total / cogneva_buildah_store_kept_images / cogneva_registry_pruned_tags_total / cogneva_registry_rebuild_hold_secs_total",
+    produced_by: "crates/cog-reflection/src/registry_maintenance.rs",
+};
+
+/// How deep the change queue is stuck, and for what reason.
+///
+/// The ledger's own account of a jam: a block census by cause, rows waiting on
+/// the model pool, remeasures owed, and the windows the writer had to wait for.
+/// Read together because "the queue is long" is not actionable and "the queue is
+/// long because these forty rows are blocked on the pool" is.
+pub const CHANGE_QUEUE_JAM: ReadingSpec = ReadingSpec {
+    id: "change_queue_jam",
+    title: "变更队列卡住的行与原因",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_change_dispatch_pool_blocked_rows) or on() max(cogneva_change_block_census) or on() max(cogneva_change_ledger_remeasure_pending) or on() max(cogneva_change_write_windows)",
+    unit: "行",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_change_dispatch_pool_blocked_rows / cogneva_change_block_census / cogneva_change_ledger_remeasure_pending / cogneva_change_write_windows",
+    produced_by: "crates/cog-orchestrator/src/change_ledger.rs",
+};
+
+/// Ready work the dispatcher deferred because a backlog was already in flight.
+///
+/// A deferral is not a failure; a deferral rate that keeps climbing is the lane
+/// running behind by design and never catching up, which every "in flight" count
+/// reads as healthy activity.
+pub const DISPATCH_DEFERRED: ReadingSpec = ReadingSpec {
+    id: "dispatch_deferred",
+    title: "因积压被推迟的派发",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_dag_stalled_scheduled_deferred_for_backlog_total[24h]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
+    produced_by: "crates/cog-orchestrator/src/plugin.rs",
+};
+
+/// Promotion candidates the week's window produced.
+///
+/// The promotion loop's own count: a week with none is a loop that either had
+/// nothing to promote or stopped looking, and the difference is whether the
+/// count is zero because the tree is quiet or because the pass did not run.
+pub const PROMOTION_CANDIDATES: ReadingSpec = ReadingSpec {
+    id: "promotion_candidates",
+    title: "本周的晋升候选",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_promotion_week_changes)",
+    unit: "条",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_promotion_week_changes",
+    produced_by: "crates/cog-reflection/src/promotion.rs",
+};
+
+/// Tasks held at ready-admission because the lane was full.
+///
+/// The admission gate's own count: work that passed every check and then waited
+/// for capacity. It is the number that separates "the queue is empty because
+/// there is nothing to do" from "the queue is empty because nothing could get
+/// in".
+pub const READY_ADMISSION_HELD: ReadingSpec = ReadingSpec {
+    id: "ready_admission_held",
+    title: "在准入处被挡住的就绪任务",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_ready_admission_held_total[24h]))",
+    unit: "条",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_ready_admission_held_total",
+    produced_by: "crates/cog-orchestrator/src/plugin.rs",
+};
+
+/// Alert channels the deployment configured.
+///
+/// Zero channels is a deployment where every alert fires into nothing: the
+/// rules evaluate, the states change, and no message leaves the process. That
+/// is indistinguishable from "nothing is wrong" on every alert board.
+pub const ALERT_CHANNELS: ReadingSpec = ReadingSpec {
+    id: "alert_channels_configured",
+    title: "配置的告警通道数",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_alert_channels_configured)",
+    unit: "条",
+    warn: Some(1.0),
+    crit: Some(0.0),
+    higher_is_worse: false,
+    series: "cogneva_alert_channels_configured",
+    produced_by: "crates/cog-observability/src/alerting.rs",
+};
+
+/// Observability events the store refused to persist.
+///
+/// The event board reads this store, so a write failure is a hole in the
+/// history that the board draws as a quiet period rather than as a gap.
+pub const OBSERVABILITY_EVENT_WRITE_FAILURES: ReadingSpec = ReadingSpec {
+    id: "observability_event_write_failures",
+    title: "观测事件写失败的次数",
+    group: ReadingGroup::Infra,
+    query: "sum(increase(cogneva_observability_event_persist_failed_total[30m]))",
+    unit: "次",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_observability_event_persist_failed_total",
+    produced_by: "crates/cog-observability/src/event_store.rs",
+};
+
+/// Rows the principle ledger holds, by check kind.
+///
+/// The register's own census: a kind that disappears is a check whose rows were
+/// retired, which is a decision the tree should be able to show rather than a
+/// silent shrink.
+pub const PRINCIPLE_LEDGER_ROWS: ReadingSpec = ReadingSpec {
+    id: "principle_ledger_rows",
+    title: "原则账的登记行数",
+    group: ReadingGroup::Infra,
+    query: "sum(cogneva_principle_ledger_check_kind_rows)",
+    unit: "行",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_principle_ledger_check_kind_rows",
+    produced_by: "crates/cog-reflection/src/principles.rs",
+};
+
+/// What the size law set the CPU request to for the busiest workload.
+///
+/// The law computes a request per container from the measured p95; this is the
+/// largest one it wrote. A number that jumps is a workload whose usage changed
+/// shape, and a number that sits still while the workload's usage climbs is the
+/// law not running -- both are invisible from the objects themselves.
+pub const WORKLOAD_CPU_DERIVED: ReadingSpec = ReadingSpec {
+    id: "workload_cpu_request_millicores",
+    title: "尺寸律定下的 CPU 请求（最大）",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_workload_request_cpu_millicores) or on() max(cogneva_workload_limit_cpu_millicores) or on() max(cogneva_workload_replicas)",
+    unit: "毫核",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_workload_request_cpu_millicores / cogneva_workload_limit_cpu_millicores / cogneva_workload_replicas",
+    produced_by: "crates/cog-reflection/src/workload_resources.rs",
+};
+
+/// What the size law set the memory request to for the busiest workload.
+///
+/// Memory is the half that kills rather than throttles: a request below what a
+/// workload actually uses is an eviction waiting for a busy minute, and the
+/// derivation is the only thing that can see it coming.
+pub const WORKLOAD_MEMORY_DERIVED: ReadingSpec = ReadingSpec {
+    id: "workload_memory_request_bytes",
+    title: "尺寸律定下的内存请求（最大）",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_workload_request_memory_bytes) or on() max(cogneva_workload_limit_memory_bytes) or on() max(cogneva_workload_resources_evaluations_total) or on() max(cogneva_workload_replicas_evaluations_total)",
+    unit: "字节",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_workload_request_memory_bytes / cogneva_workload_limit_memory_bytes / cogneva_workload_resources_evaluations_total / cogneva_workload_replicas_evaluations_total",
+    produced_by: "crates/cog-reflection/src/workload_resources.rs",
+};
+
+/// The default resources the namespace's LimitRange hands to containers that
+/// declare none.
+///
+/// B1 removed every pinned resource, so this default is what runs the workloads
+/// that declare nothing -- a hook Job, an init container. A default that is too
+/// small shows up as a Job killed mid-run, and this is the only place the number
+/// it was given is visible.
+pub const LIMIT_RANGE_DEFAULTS: ReadingSpec = ReadingSpec {
+    id: "limit_range_default_memory_bytes",
+    title: "LimitRange 默认内存",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_limit_range_default_memory_bytes) or on() max(cogneva_limit_range_default_request_memory_bytes) or on() max(cogneva_limit_range_default_cpu_millicores) or on() max(cogneva_limit_range_default_request_cpu_millicores) or on() max(cogneva_limit_range_defaults_evaluations_total)",
+    unit: "字节",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_limit_range_default_memory_bytes / cogneva_limit_range_default_request_memory_bytes / cogneva_limit_range_default_cpu_millicores / cogneva_limit_range_default_request_cpu_millicores / cogneva_limit_range_defaults_evaluations_total",
+    produced_by: "crates/cog-reflection/src/workload_resources.rs",
+};
+
+/// The wait the pacing law computed for the build-cache scan.
+///
+/// The declared interval is the floor; a target that sits at the floor means the
+/// scan is finishing faster than the floor allows and the law is doing nothing.
+/// A target that climbs past it is a scan getting slower -- which is the reading
+/// that justifies the cadence moving.
+pub const PACING_TARGET: ReadingSpec = ReadingSpec {
+    id: "pacing_target_seconds",
+    title: "节拍律定下的扫描间隔",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_pacing_target_seconds) or on() max(cogneva_pacing_evaluations_total)",
+    unit: "秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_pacing_target_seconds / cogneva_pacing_evaluations_total",
+    produced_by: "crates/cog-core/src/pacing.rs",
+};
+
+/// The retention target the loop computed from the measured write rate.
+///
+/// The rows a table is allowed to keep is derived from how fast it is written
+/// and how many bytes a row costs; a target that keeps climbing while writes
+/// stay flat means rows got bigger, and a target that stops moving means the
+/// measurement stopped.
+pub const RETENTION_TARGET_ROWS: ReadingSpec = ReadingSpec {
+    id: "retention_target_rows",
+    title: "保留目标行数",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_retention_target) or on() max(cogneva_retention_evaluations_total)",
+    unit: "行",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_retention_target / cogneva_retention_evaluations_total",
+    produced_by: "crates/cog-core/src/retention.rs",
+};
+
+/// Obeservables pinned by more than one plugin, or read before init finished.
+///
+/// These are the startup audit's findings: a handle published twice means two
+/// plugins believe they own it, a handle nobody consumed is a service built for
+/// no reader, and an unordered read is a plugin reading a pin another plugin has
+/// not published yet. All three are silent at runtime and fatal in the right
+/// order of events.
+pub const PLUGIN_PIN_AUDIT: ReadingSpec = ReadingSpec {
+    id: "plugin_pin_audit",
+    title: "启动期发布审计",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_plugin_pin_multi_published) + max(cogneva_plugin_pin_unconsumed) + max(cogneva_plugin_pin_unordered_init_read) + max(cogneva_plugin_pin_unsatisfied) + max(cogneva_plugin_publishes)",
+    unit: "个",
+    warn: Some(0.0),
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_plugin_pin_multi_published / cogneva_plugin_pin_multi_published_count / cogneva_plugin_pin_unconsumed / cogneva_plugin_pin_unconsumed_count / cogneva_plugin_pin_unordered_init_read / cogneva_plugin_pin_unordered_init_read_count / cogneva_plugin_pin_unsatisfied / cogneva_plugin_pin_unsatisfied_count / cogneva_plugin_publishes / cogneva_plugin_publishes_count",
+    produced_by: "crates/cog-core/src/plugin_context.rs",
+};
+
+/// The outward loop's passes, by source.
+///
+/// An outward pass is the platform telling another system what changed. A source
+/// that stops producing passes is a system that silently stopped being told --
+/// and unlike a failed call, it leaves no error anywhere.
+pub const OUTWARD_PASSES: ReadingSpec = ReadingSpec {
+    id: "outward_passes",
+    title: "外发回路的轮次",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_outward_passes_total[24h])) or on() sum(increase(cogneva_outward_items_total[24h])) or on() max(cogneva_outward_sources_configured) or on() max(cogneva_outward_config)",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_outward_passes_total / cogneva_outward_items_total / cogneva_outward_sources_configured / cogneva_outward_config",
+    produced_by: "crates/cog-reflection/src/outward.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 61] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -1028,6 +1307,21 @@ pub const READINGS: [&ReadingSpec; 46] = [
     &LLM_EVIDENCED_RECOVERY,
     &LLM_RESERVE_AGE,
     &LLM_CONTRACT_MISMATCH,
+    &REGISTRY_PRUNE_COUNTS,
+    &CHANGE_QUEUE_JAM,
+    &DISPATCH_DEFERRED,
+    &PROMOTION_CANDIDATES,
+    &READY_ADMISSION_HELD,
+    &ALERT_CHANNELS,
+    &OBSERVABILITY_EVENT_WRITE_FAILURES,
+    &PRINCIPLE_LEDGER_ROWS,
+    &WORKLOAD_CPU_DERIVED,
+    &WORKLOAD_MEMORY_DERIVED,
+    &LIMIT_RANGE_DEFAULTS,
+    &PACING_TARGET,
+    &RETENTION_TARGET_ROWS,
+    &PLUGIN_PIN_AUDIT,
+    &OUTWARD_PASSES,
 ];
 
 /// The word a reading carries about its own value.
