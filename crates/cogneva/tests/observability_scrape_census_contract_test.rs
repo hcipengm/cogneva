@@ -908,10 +908,14 @@ fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
                 .iter()
                 .any(|suffix| read.contains(&format!("{name}{suffix}")))
     };
+    // 与渲染侧同一条规则：一条序列算被覆盖，当且仅当它自己被读，或者发布它的
+    // 那个文件里也有东西被读。两者用同一把尺，否则「同一棵树里两条population
+    // 判法不同」——而这正是这类判据最容易分叉的地方。
+    let beside_a_decision = decisions_beside_producers(&read);
     let unread: Vec<&str> = registry
         .iter()
         .map(String::as_str)
-        .filter(|n| !read_by(n))
+        .filter(|n| !read_by(n) && !beside_a_decision.contains(*n))
         .collect();
 
     assert!(
