@@ -73,18 +73,18 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
       "localhost:8080/metrics" (printf "localhost:%d%s" (int .Values.gateway.httpPort) .Values.observability.metricsPath)
 -}}
 {{- range $from, $to := $portage }}{{ if not (contains $from $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so this replacement would silently keep the old port -- update the pattern here to the file's new form" $from) }}{{ end }}{{ $json = replace $from $to $json }}{{ end }}
-{{- /* 执行器地址不是一个名字而是一串：每副副本各有自己的 DNS 名，客户端按 agent
-       把一条 lane 钉在其中一副上（同一个 agent 的两条命令必须落在同一块卷上，
-       否则它建的树下一次命令就找不到了）。走 ClusterIP 服务名的话，负载均衡会把
-       同一 agent 的两条命令分到两副副本，lane 钉定的意义就被抹掉了。所以这里把
-       主机名字面量换成按序号展开的逗号表——副本数是部署里的数，表跟着变。 */ -}}
+{{- /* 执行器的地址是**无头服务的名字**，不是一份副本清单。客户端在每次派发时把名字
+       解析成此刻存在的那些副本，再按 agent 把一条 lane 钉在其中一副上（同一个 agent
+       的两条命令必须落在同一块卷上，否则它建的树下一次命令就找不到了）。走 ClusterIP
+       服务名不行：负载均衡会把同一 agent 的两条命令分到两副副本，lane 钉定的意义就被
+       抹掉了；无头服务把每个 Pod 变成一个地址，客户端拿到的是一份逐副本的表。
+
+       这里不再按序号展开：序号表是「客户端知道副本数」的那种写法，而副本数是部署在
+       扩缩的东西——名字解析拿到的表跟着副本变，加一副副本不需要改这里的一个字。 */ -}}
 {{- $sandboxBase := printf "http://cogneva-sandbox-executor:%d" (int .Values.sandboxExecutor.metricsPort) }}
-{{- if not (contains $sandboxBase $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so the per-replica endpoint list would never be built -- the file's sandbox_executor_url has a new form" $sandboxBase) }}{{ end }}
-{{- $sandboxEndpoints := list }}
-{{- range $ordinal := until (int .Values.sandboxExecutor.replicas) }}
-{{- $sandboxEndpoints = append $sandboxEndpoints (printf "http://cogneva-sandbox-executor-%d.cogneva-sandbox-executor-pods:%d" (int $ordinal) (int $.Values.sandboxExecutor.metricsPort)) }}
-{{- end }}
-{{- $json = replace $sandboxBase (join "," $sandboxEndpoints) $json }}
+{{- if not (contains $sandboxBase $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so the replica name would never replace it -- the file's sandbox_executor_url has a new form" $sandboxBase) }}{{ end }}
+{{- $sandboxName := printf "dns://cogneva-sandbox-executor-pods:%d" (int .Values.sandboxExecutor.metricsPort) }}
+{{- $json = replace $sandboxBase $sandboxName $json }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

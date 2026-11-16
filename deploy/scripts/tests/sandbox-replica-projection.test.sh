@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # 沙箱执行器的副本数是**部署里的一个数**，不是模板里的一处硬编码：加一副副本，
-# 就多一块卷、多一条客户端能钉上去的地址。这两件事都由 chart 从
-# `sandboxExecutor.replicas` 投影出来：
+# 就多一块卷，客户端下一次解析名字时就多一条能钉上去的地址。这两件事的形状不同，
+# 判据也不同：
 #
 #   1. 卷：StatefulSet 的 `volumeClaimTemplates`——一副副本一块，卷名是
-#      `<模板>-<StatefulSet>-<序号>`，容器按 `$(POD_NAME)` 拼出自己那块；
-#   2. 地址：`cogneva.json` 的 `system.sandbox_executor_url`，一条副本一个无头
-#      Service 下的稳定 DNS 名。客户端按 agent 把 lane 钉在一条地址上。
+#      `<模板>-<StatefulSet>-<序号>`，容器按 `$(POD_NAME)` 拼出自己那块。换副本数
+#      ⇒ 这个模板跟着变；
+#   2. 地址：`cogneva.json` 的 `system.sandbox_executor_url` 是**无头服务的名字**，
+#      不是一个逗号表。换副本数 ⇒ 这个叶子一个字节都不变——客户端在运行时解析名字，
+#      副本增减只让它下一次解析看到不同的表。名字与副本数脱钩，才叫「加副本不需要
+#      改任何配置」。
 #
-# 判据是「换输入 ⇒ 值跟着变」：把 replicas 从 1 改成 3 再渲染一遍，卷与地址两条
-# 都必须变成 3 条。少了任何一条，故障读起来仍然是绿的——一个地址照样能跑，只是
-# 所有 lane 挤在同一副副本上，而那块卷写在每一副 Pod 的同一个路径上。
+# 判据因此是两条相反的：卷随输入变，地址不随输入变。只测前者，一份写死的地址表
+# 会把副本数锁回渲染时的那一个；只测后者，卷可能悄悄退回共享的一块。
 #
 # 需要的工具与 check-deploy-parity.sh 同一套：helm、python3-yaml。
 # 用法：bash deploy/scripts/tests/sandbox-replica-projection.test.sh
@@ -60,12 +62,15 @@ def one(docs, kind, name, path):
     return hits[0]
 
 
-def check(path, replicas):
+def executor_url(path):
+    docs = objects(path)
+    config = one(docs, "ConfigMap", "cogneva-json", path)
+    return json.loads(config["data"]["cogneva.json"])["system"]["sandbox_executor_url"]
+
+
+def check_volumes(path, replicas):
     docs = objects(path)
     sts = one(docs, "StatefulSet", "cogneva-sandbox-executor", path)
-    headless = one(docs, "Service", sts["spec"]["serviceName"], path)
-    config = one(docs, "ConfigMap", "cogneva-json", path)
-    body = json.loads(config["data"]["cogneva.json"])
 
     # 1. 副本数就是传进去的那一个数。
     assert sts["spec"]["replicas"] == replicas, (
@@ -95,20 +100,32 @@ def check(path, replicas):
     for name in names:
         assert name in mounted, f"{path}: 卷模板 {name} 没有被任何容器挂载"
 
-    # 4. 地址表：一条副本一个 DNS 名，序号从 0 起，端口是无头 Service 的那个。
-    port = headless["spec"]["ports"][0]["port"]
+
+def check_name_form(path):
+    docs = objects(path)
+    sts = one(docs, "StatefulSet", "cogneva-sandbox-executor", path)
+    headless = one(docs, "Service", sts["spec"]["serviceName"], path)
     assert headless["spec"].get("clusterIP") == "None", (
-        f"{path}: {sts['spec']['serviceName']} 不是无头 Service，每副副本就没有稳定 DNS"
+        f"{path}: {sts['spec']['serviceName']} 不是无头 Service，解析名字拿不到逐副本地址"
     )
-    expected = [
-        f"http://cogneva-sandbox-executor-{i}.{sts['spec']['serviceName']}:{port}"
-        for i in range(replicas)
-    ]
-    got = [e.strip() for e in body["system"]["sandbox_executor_url"].split(",")]
-    assert got == expected, f"{path}: 地址表是 {got}，期望 {expected}"
+    port = headless["spec"]["ports"][0]["port"]
+    url = executor_url(path)
+    expected = f"dns://{sts['spec']['serviceName']}:{port}"
+    assert url == expected, (
+        f"{path}: sandbox_executor_url 是 {url!r}，期望一个名字 {expected!r}——"
+        "写成逗号表就把副本数锁回渲染时的那一个数了"
+    )
 
 
-check(sys.argv[1], 1)
-check(sys.argv[2], 3)
-print("SANDBOX REPLICA PROJECTION OK：副本数 1→3，卷模板与地址表都跟着变")
+check_volumes(sys.argv[1], 1)
+check_volumes(sys.argv[2], 3)
+check_name_form(sys.argv[1])
+check_name_form(sys.argv[2])
+one_url = executor_url(sys.argv[1])
+three_url = executor_url(sys.argv[2])
+assert one_url == three_url, (
+    f"副本数 1→3 时 sandbox_executor_url 变了（{one_url!r} → {three_url!r}）："
+    "加副本又变成一次配置改动了"
+)
+print("SANDBOX REPLICA PROJECTION OK：副本数 1→3 时卷模板跟着变，地址是一个不随它变的名字")
 PY

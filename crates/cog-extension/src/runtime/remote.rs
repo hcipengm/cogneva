@@ -92,13 +92,116 @@ use cog_core::{
 };
 use futures::StreamExt;
 
+/// How long a resolved replica list is reused before it is asked for again.
+///
+/// The list is what lets a replica added for capacity take new lanes, and what
+/// lets a removed one stop being handed commands. Resolving on every command
+/// would ask DNS per tool call for a set that changes on the scale of a rollout;
+/// holding it forever would keep sending commands to a replica that is gone.
+/// Five seconds is short against a scale-out and long against a command, and it
+/// bounds how long an address that has already vanished may still be tried.
+// cap: bound — 副本表的保鲜期：新副本最迟这么久之后会被用上
+const ENDPOINT_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Where the executor replicas' addresses come from.
+#[derive(Clone)]
+pub enum EndpointSource {
+    /// Addresses written into the config. One entry is the whole deployment.
+    Fixed(Vec<String>),
+    /// A name that resolves to the replicas that exist at this moment. A
+    /// deployment that adds a replica does not rewrite this client's config:
+    /// the next refresh is enough.
+    Discovered(std::sync::Arc<dyn Discovery>),
+}
+
+/// The replicas behind a name, right now.
+///
+/// The trait exists so the rules about pins and moves can be tested against a
+/// list the test changes between calls -- which is exactly what a scale-out is
+/// -- without a cluster or a DNS server.
+#[async_trait::async_trait]
+pub trait Discovery: Send + Sync {
+    /// Every replica address (`http://host:port`), in any order. An empty list
+    /// is "the name resolves to nothing", which is not the same as a failure
+    /// to resolve and is reported as such by the caller.
+    async fn addresses(&self) -> std::io::Result<Vec<String>>;
+}
+
+/// `dns://host:port`: the headless service in front of the executor replicas.
+pub struct DnsDiscovery {
+    host: String,
+    port: u16,
+    scheme: String,
+}
+
+impl DnsDiscovery {
+    /// Parse the config form. A port is required: a headless service name
+    /// without one resolves to addresses that have nothing to listen on.
+    pub fn parse(spec: &str) -> SFResult<Self> {
+        let rest = spec.strip_prefix("dns://").ok_or_else(|| {
+            cog_core::SFError::Agent(format!(
+                "sandbox executor address {spec:?} is not dns://host:port"
+            ))
+        })?;
+        let (host, port) = rest.rsplit_once(':').ok_or_else(|| {
+            cog_core::SFError::Agent(format!(
+                "sandbox executor address {spec:?} names no port; a name alone has \
+                 nothing to connect to"
+            ))
+        })?;
+        let port: u16 = port.parse().map_err(|_| {
+            cog_core::SFError::Agent(format!(
+                "sandbox executor address {spec:?} does not end in a port number"
+            ))
+        })?;
+        if host.is_empty() {
+            return Err(cog_core::SFError::Agent(format!(
+                "sandbox executor address {spec:?} names no host"
+            )));
+        }
+        Ok(Self {
+            host: host.to_string(),
+            port,
+            scheme: "http".to_string(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Discovery for DnsDiscovery {
+    async fn addresses(&self) -> std::io::Result<Vec<String>> {
+        let resolved = tokio::net::lookup_host((self.host.as_str(), self.port)).await?;
+        let mut out: Vec<String> = resolved
+            .map(|addr| format!("{}://{}", self.scheme, addr))
+            .collect();
+        // A stable order makes the round-robin predictable; the pins themselves
+        // do not depend on it (they name an address, not a position).
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+}
+
+/// A resolved list and when it was asked for.
+#[derive(Clone)]
+struct Resolved {
+    addrs: Vec<String>,
+    at: std::time::Instant,
+}
+
 /// HTTP client for the cluster sandbox executor (`cogneva sandbox-executor`).
 pub struct RemoteExecutor {
-    /// One address per executor replica. With a single address this is the
-    /// whole deployment and every call goes to it; with more, a lane is pinned
-    /// to one of them for the life of its pin (see
-    /// [`crate::executor_lease`]).
-    endpoints: Vec<String>,
+    /// Where the addresses come from: a list in the config, or a name that is
+    /// resolved while the client runs. With a single address this is the whole
+    /// deployment and every call goes to it; with more, a lane is pinned to one
+    /// of them for the life of its pin (see [`crate::executor_lease`]).
+    endpoints: EndpointSource,
+    /// The last list a name resolved to, kept so that a resolution failure does
+    /// not turn into "no backend" while the replicas are still answering.
+    resolved: std::sync::Mutex<Option<Resolved>>,
+    /// How long a resolved list is reused. [`ENDPOINT_REFRESH`] in production;
+    /// tests set it small to exercise what a refresh picks up.
+    endpoint_refresh: std::time::Duration,
     /// Which replica each lane sits on. Short critical sections holding a
     /// `std::sync::Mutex`: nothing is awaited under it.
     lanes: std::sync::Mutex<crate::executor_lease::LeaseBook>,
@@ -112,87 +215,42 @@ impl RemoteExecutor {
         Self::with_replacement_window(base_url, REPLACEMENT_WINDOW)
     }
 
-    /// One client, several executor replicas.
+    /// One client, several executor replicas named by the config.
     ///
     /// The first address also answers the questions that are about the
     /// deployment rather than about one lane (`/boundary`, `/lane`); the
     /// others only take commands.
     pub fn with_endpoints(endpoints: Vec<String>) -> SFResult<Self> {
-        let first = endpoints.first().cloned().ok_or_else(|| {
-            cog_core::SFError::Agent("sandbox executor client was given no address".into())
-        })?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| {
-                cog_core::SFError::Agent(format!("sandbox executor client init failed: {}", e))
-            })?;
-        Ok(Self {
-            endpoints: std::iter::once(first)
-                .chain(endpoints.into_iter().skip(1))
-                .collect(),
-            lanes: std::sync::Mutex::default(),
-            replacement_window: REPLACEMENT_WINDOW,
-            http,
-        })
+        Self::from_source(EndpointSource::Fixed(endpoints), REPLACEMENT_WINDOW)
     }
 
-    /// The address the deployment-level questions go to.
-    fn primary(&self) -> &str {
-        &self.endpoints[0]
+    /// A client whose replicas are whichever ones the name resolves to now.
+    ///
+    /// This is what makes adding a replica a deployment action rather than a
+    /// configuration change: the address written into the config is the
+    /// service's name, and the replicas behind it are read while the client
+    /// runs. A replica that appears is handed new lanes by the next refresh; no
+    /// file is rewritten, no process is restarted.
+    pub fn discovering(spec: &str) -> SFResult<Self> {
+        let discovery = std::sync::Arc::new(DnsDiscovery::parse(spec)?);
+        Self::from_source(EndpointSource::Discovered(discovery), REPLACEMENT_WINDOW)
     }
 
-    /// The address a command goes to, and the replica it is pinned to (none
-    /// when there is only one replica and pinning says nothing).
-    fn endpoint_for(&self, lane: Option<&str>) -> (String, Option<usize>) {
-        let Some(lane) = lane.filter(|_| self.endpoints.len() > 1) else {
-            return (self.primary().to_string(), None);
-        };
-        let pinned = {
-            let mut book = self
-                .lanes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            book.pin(
-                lane,
-                self.endpoints.len(),
-                now_secs(),
-                crate::executor_lease::LANE_LEASE_SECS,
-            )
-        };
-        if let crate::executor_lease::Grant::Moved { from, lapsed_secs } = pinned.grant {
-            tracing::warn!(
-                lane,
-                from_replica = from,
-                to_replica = pinned.replica,
-                lapsed_secs,
-                "this lane is moving to another executor replica: what the previous one \
-                 wrote after its pin lapsed may not be in the tree this command runs on"
-            );
-        }
-        (self.endpoints[pinned.replica].clone(), Some(pinned.replica))
-    }
-
-    fn release_lane(&self, lane: Option<&str>, replica: Option<usize>) {
-        let (Some(lane), Some(replica)) = (lane, replica) else {
-            return;
-        };
-        let mut book = self
-            .lanes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        book.release(lane, replica);
-    }
-
-    /// 同一个客户端，换一段等待上界。生产的窗口是
-    /// [`REPLACEMENT_WINDOW`]；这里开一个口子是为了让"窗口内会重试""窗口过了
-    /// 要说出等了多久"这两条判据能在测试里按秒验证，而不是按两分半验证。
-    pub fn with_replacement_window(
-        base_url: impl Into<String>,
+    fn from_source(
+        endpoints: EndpointSource,
         replacement_window: std::time::Duration,
     ) -> SFResult<Self> {
+        if let EndpointSource::Fixed(list) = &endpoints {
+            if list.is_empty() {
+                return Err(cog_core::SFError::Agent(
+                    "sandbox executor client was given no address".into(),
+                ));
+            }
+        }
         Ok(Self {
-            endpoints: vec![base_url.into()],
+            endpoints,
+            resolved: std::sync::Mutex::default(),
+            endpoint_refresh: ENDPOINT_REFRESH,
             lanes: std::sync::Mutex::default(),
             replacement_window,
             // No total timeout: a long-running command is stopped by the
@@ -208,6 +266,139 @@ impl RemoteExecutor {
                     cog_core::SFError::Agent(format!("sandbox executor client init failed: {}", e))
                 })?,
         })
+    }
+
+    /// The replicas behind this client right now.
+    ///
+    /// A name that stops resolving keeps the list it last resolved to: the
+    /// replicas are usually still answering, and a DNS hiccup is not a reason
+    /// to fail every command. Answering "no replica" is reserved for a name
+    /// that has never resolved -- falling back to the local executor instead
+    /// would run the command in the application's own pod.
+    async fn endpoints_now(&self) -> SFResult<Vec<String>> {
+        let discovery = match &self.endpoints {
+            EndpointSource::Fixed(list) => return Ok(list.clone()),
+            EndpointSource::Discovered(discovery) => discovery.clone(),
+        };
+        let cached = {
+            let cache = self
+                .resolved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.clone()
+        };
+        if let Some(resolved) = cached.as_ref() {
+            if resolved.at.elapsed() < self.endpoint_refresh {
+                return Ok(resolved.addrs.clone());
+            }
+        }
+        match discovery.addresses().await {
+            Ok(addrs) if !addrs.is_empty() => {
+                let mut cache = self
+                    .resolved
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *cache = Some(Resolved {
+                    addrs: addrs.clone(),
+                    at: std::time::Instant::now(),
+                });
+                Ok(addrs)
+            }
+            Ok(_) => self.last_resolved("the name resolved to no address"),
+            Err(e) => self.last_resolved(&format!("resolving the replicas failed: {e}")),
+        }
+    }
+
+    fn last_resolved(&self, why: &str) -> SFResult<Vec<String>> {
+        let cached = {
+            let cache = self
+                .resolved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.clone()
+        };
+        match cached {
+            Some(resolved) if !resolved.addrs.is_empty() => {
+                tracing::warn!(
+                    why,
+                    replicas = resolved.addrs.len(),
+                    "keeping the executor replicas this client resolved earlier"
+                );
+                Ok(resolved.addrs)
+            }
+            _ => Err(cog_core::SFError::Agent(format!(
+                "no sandbox executor replica is known: {why}"
+            ))),
+        }
+    }
+
+    /// The address the deployment-level questions go to.
+    async fn primary(&self) -> SFResult<String> {
+        self.endpoints_now()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| cog_core::SFError::Agent("no sandbox executor replica is known".into()))
+    }
+
+    /// The address a command goes to, and the replica it is pinned to (none
+    /// when there is only one replica and pinning says nothing).
+    fn endpoint_for(
+        &self,
+        lane: Option<&str>,
+        endpoints: &[String],
+    ) -> Option<(String, Option<String>)> {
+        let first = endpoints.first()?.clone();
+        let Some(lane) = lane.filter(|_| endpoints.len() > 1) else {
+            return Some((first, None));
+        };
+        let pinned = {
+            let mut book = self
+                .lanes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            book.pin(
+                lane,
+                endpoints,
+                now_secs(),
+                crate::executor_lease::LANE_LEASE_SECS,
+            )
+        }?;
+        if let crate::executor_lease::Grant::Moved { from, lapsed_secs } = &pinned.grant {
+            tracing::warn!(
+                lane,
+                from_replica = %from,
+                to_replica = %pinned.replica,
+                lapsed_secs,
+                "this lane is moving to another executor replica: what the previous one \
+                 wrote after its pin lapsed may not be in the tree this command runs on"
+            );
+        }
+        Some((pinned.replica.clone(), Some(pinned.replica)))
+    }
+
+    fn release_lane(&self, lane: Option<&str>, replica: Option<String>) {
+        let (Some(lane), Some(replica)) = (lane, replica) else {
+            return;
+        };
+        let mut book = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        book.release(lane, &replica);
+    }
+
+    /// 同一个客户端，换一段等待上界。生产的窗口是
+    /// [`REPLACEMENT_WINDOW`]；这里开一个口子是为了让"窗口内会重试""窗口过了
+    /// 要说出等了多久"这两条判据能在测试里按秒验证，而不是按两分半验证。
+    pub fn with_replacement_window(
+        base_url: impl Into<String>,
+        replacement_window: std::time::Duration,
+    ) -> SFResult<Self> {
+        Self::from_source(
+            EndpointSource::Fixed(vec![base_url.into()]),
+            replacement_window,
+        )
     }
 }
 
@@ -226,7 +417,8 @@ impl SandboxBackend for RemoteExecutor {
     /// 边界由对端自报。这里不替它说话：一个在这里拼出来的「安全」描述，
     /// 改执行器的部署时不会跟着变，而读的人以为它是量出来的。
     async fn boundary(&self) -> SFResult<cog_core::SandboxBoundary> {
-        let url = format!("{}/boundary", self.primary().trim_end_matches('/'));
+        let primary = self.primary().await?;
+        let url = format!("{}/boundary", primary.trim_end_matches('/'));
         let response = self.http.get(&url).send().await.map_err(|e| {
             cog_core::SFError::Agent(format!("sandbox executor boundary unreachable: {e}"))
         })?;
@@ -246,7 +438,8 @@ impl SandboxBackend for RemoteExecutor {
 
     /// 编译队由对端自报，本侧不排这条队：问它谁占着、谁排第几。
     async fn lane(&self) -> SFResult<cog_core::BuildLaneReading> {
-        let url = format!("{}/lane", self.primary().trim_end_matches('/'));
+        let primary = self.primary().await?;
+        let url = format!("{}/lane", primary.trim_end_matches('/'));
         let response = self.http.get(&url).send().await.map_err(|e| {
             cog_core::SFError::Agent(format!("sandbox executor lane unreachable: {e}"))
         })?;
@@ -271,7 +464,14 @@ impl SandboxBackend for RemoteExecutor {
             ));
         }
         let lane = lane_of(req);
-        let (endpoint, pinned_to) = self.endpoint_for(lane.as_deref());
+        let endpoints = self.endpoints_now().await?;
+        let (endpoint, pinned_to) =
+            self.endpoint_for(lane.as_deref(), &endpoints)
+                .ok_or_else(|| {
+                    cog_core::SFError::Agent(
+                        "no sandbox executor replica is known; the command was not sent".into(),
+                    )
+                })?;
         let url = format!("{}/execute", endpoint.trim_end_matches('/'));
         let body = serde_json::json!({
             "payload": req.payload,
@@ -447,20 +647,137 @@ mod tests {
         let (live, live_hits) = serve_counting(2).await;
         // A short window: the production one is a rollout's length, and no
         // test should wait it out to prove what a release does.
-        let executor = RemoteExecutor::with_replacement_window(
-            format!("http://{}", dead),
+        let executor = RemoteExecutor::from_source(
+            EndpointSource::Fixed(vec![format!("http://{}", dead), live]),
             std::time::Duration::from_millis(50),
         )
         .unwrap();
-        let executor = RemoteExecutor {
-            endpoints: vec![format!("http://{}", dead), live],
-            ..executor
-        };
 
         let first = executor.execute(&for_agent("agent-a")).await;
         assert!(first.is_err(), "第一副副本没人监听，这一条必须失败");
         executor.execute(&for_agent("agent-a")).await.unwrap();
         assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A replica list the test changes between calls: what a scale-out and a
+    /// scale-down look like from the client's side.
+    struct ChangingReplicas {
+        addrs: std::sync::Mutex<Vec<String>>,
+        resolutions: std::sync::atomic::AtomicUsize,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl ChangingReplicas {
+        fn new(addrs: Vec<String>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                addrs: std::sync::Mutex::new(addrs),
+                resolutions: std::sync::atomic::AtomicUsize::new(0),
+                failing: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn add(&self, addr: String) {
+            self.addrs.lock().unwrap().push(addr);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Discovery for ChangingReplicas {
+        async fn addresses(&self) -> std::io::Result<Vec<String>> {
+            use std::sync::atomic::Ordering;
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("the name does not resolve right now"));
+            }
+            Ok(self.addrs.lock().unwrap().clone())
+        }
+    }
+
+    fn discovering(
+        replicas: std::sync::Arc<ChangingReplicas>,
+        refresh: std::time::Duration,
+    ) -> RemoteExecutor {
+        let mut executor =
+            RemoteExecutor::from_source(EndpointSource::Discovered(replicas), REPLACEMENT_WINDOW)
+                .unwrap();
+        executor.endpoint_refresh = refresh;
+        executor
+    }
+
+    /// A replica added for capacity takes the next lane without the client
+    /// restarting, and it does not move the lanes already placed: those name
+    /// their address, and their address did not go anywhere.
+    #[tokio::test]
+    async fn a_replica_added_while_the_client_runs_takes_new_lanes() {
+        use std::sync::atomic::Ordering;
+        let (first, first_hits) = serve_counting(2).await;
+        let (second, second_hits) = serve_counting(2).await;
+        let replicas = ChangingReplicas::new(vec![first.clone()]);
+        let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
+
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+
+        replicas.add(second.clone());
+        // The lane that is already placed stays where its tree is ...
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert_eq!(first_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+        // ... and a lane nobody placed yet is spread onto the new replica.
+        executor.execute(&for_agent("agent-b")).await.unwrap();
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A resolved list is reused for a while: every command asking DNS would
+    /// buy nothing, since replicas do not appear per tool call.
+    #[tokio::test]
+    async fn the_replica_list_is_not_asked_for_on_every_command() {
+        use std::sync::atomic::Ordering;
+        let (first, _hits) = serve_counting(2).await;
+        let replicas = ChangingReplicas::new(vec![first]);
+        let executor = discovering(replicas.clone(), std::time::Duration::from_secs(60));
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        executor.execute(&for_agent("agent-b")).await.unwrap();
+        assert_eq!(
+            replicas.resolutions.load(Ordering::SeqCst),
+            1,
+            "两条命令之间副本表不该被重新问一遍"
+        );
+    }
+
+    /// A name that resolves to nothing is an error, never a quiet fall back to
+    /// running the command locally: the local executor is the application's own
+    /// pod, and a tool that was meant for the sandbox must not land there.
+    #[tokio::test]
+    async fn a_name_with_no_replica_behind_it_fails_instead_of_running_locally() {
+        let replicas = ChangingReplicas::new(Vec::new());
+        let executor = discovering(replicas, std::time::Duration::ZERO);
+        let error = executor
+            .execute(&for_agent("agent-a"))
+            .await
+            .expect_err("没有副本时这一条必须失败");
+        let text = error.to_string();
+        assert!(
+            text.contains("no sandbox executor replica is known"),
+            "判词没有说清是没有副本：{text}"
+        );
+    }
+
+    /// A resolution failure is not the same as "the replicas are gone": the
+    /// ones this client last saw are still answering, so commands keep going
+    /// there while the name is unreadable.
+    #[tokio::test]
+    async fn a_resolution_failure_keeps_the_replicas_last_seen() {
+        use std::sync::atomic::Ordering;
+        let (first, first_hits) = serve_counting(2).await;
+        let replicas = ChangingReplicas::new(vec![first]);
+        let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        replicas
+            .failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        executor.execute(&for_agent("agent-b")).await.unwrap();
+        assert_eq!(first_hits.load(Ordering::SeqCst), 2);
     }
 
     /// Minimal NDJSON server on an ephemeral port speaking the executor

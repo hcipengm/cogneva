@@ -114,10 +114,29 @@ pub fn executor_backend(
                 .collect();
             match endpoints.len() {
                 0 => Arc::new(LocalExecutor::new()),
-                1 => Arc::new(RemoteExecutor::new(
-                    endpoints.into_iter().next().unwrap_or_default(),
-                )?),
-                _ => Arc::new(RemoteExecutor::with_endpoints(endpoints)?),
+                1 => {
+                    let only = endpoints.into_iter().next().unwrap_or_default();
+                    if only.starts_with("dns://") {
+                        // A name, resolved while the client runs: replicas may
+                        // come and go behind it without the config changing.
+                        Arc::new(RemoteExecutor::discovering(&only)?)
+                    } else {
+                        Arc::new(RemoteExecutor::new(only)?)
+                    }
+                }
+                _ => {
+                    if endpoints.iter().any(|one| one.starts_with("dns://")) {
+                        // A name in a list of addresses has no meaning: which
+                        // replicas it stands for is exactly what the other
+                        // entries claim to say. Refusing beats picking one.
+                        return Err(cog_core::SFError::Agent(
+                            "sandbox executor address list mixes dns:// with plain addresses; \
+                             the name has to be the only entry"
+                                .into(),
+                        ));
+                    }
+                    Arc::new(RemoteExecutor::with_endpoints(endpoints)?)
+                }
             }
         }
         None => Arc::new(LocalExecutor::new()),
@@ -144,5 +163,22 @@ mod tests {
         assert!(backend.is_ok(), "多个地址应当被接受");
         let single = executor_backend(Some("http://a:9090".into()));
         assert!(single.is_ok(), "一个地址仍然是生产形态的远端执行器");
+    }
+
+    #[test]
+    fn a_name_is_a_remote_executor_that_resolves_it_later() {
+        // 不在构造时解析：配置读进来的那一刻 DNS 可能还没好，而那时失败会把
+        // 整个进程堵在一个本来会自己好的问题上。
+        let backend = executor_backend(Some("dns://cogneva-sandbox-executor-pods:9090".into()));
+        assert!(backend.is_ok(), "单条 dns:// 地址是远端执行器的另一种写法");
+    }
+
+    #[test]
+    fn a_name_mixed_into_a_list_of_addresses_is_refused() {
+        let mixed = executor_backend(Some("dns://executor-pods:9090, http://a:9090".into()));
+        assert!(
+            mixed.is_err(),
+            "一个名字与一串地址并列时，那份列表要么多余要么说谎，不能被当成没看见"
+        );
     }
 }
