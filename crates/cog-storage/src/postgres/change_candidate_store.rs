@@ -167,15 +167,32 @@ fn candidate_from_events(
     decision_attributes: &str,
     origin_attributes: &str,
 ) -> SFResult<ChangeCandidate> {
-    let origin: serde_json::Value =
-        serde_json::from_str(origin_attributes).map_err(SFError::Serialization)?;
-    let decision: serde_json::Value =
-        serde_json::from_str(decision_attributes).map_err(SFError::Serialization)?;
-
     let status = match kind {
         ACCEPTED_KIND => "accepted",
         REJECTED_KIND => "rejected",
         _ => "candidate",
+    };
+
+    // 读不懂的载荷不是错误，也不是空行：它是「这一行说过什么，而这一版代码读不懂」。
+    // 丢掉整行会让一条被拒绝的变更重新出现在待办里——那比读不懂更坏。所以正文留空、
+    // 状态标 `undecodable`，状态词照常从事件种类读出来。
+    let (Ok(origin), Ok(decision)) = (
+        serde_json::from_str::<serde_json::Value>(origin_attributes),
+        serde_json::from_str::<serde_json::Value>(decision_attributes),
+    ) else {
+        return Ok(ChangeCandidate {
+            artifact_id: subject_id.to_string(),
+            kind: String::new(),
+            description: String::new(),
+            content: String::new(),
+            created_at: DateTime::<Utc>::MIN_UTC,
+            eval_summary: None,
+            tiering: None,
+            recorded_status: "undecodable".to_string(),
+            status: status.to_string(),
+            decision_reason: None,
+            event_id: event_id.to_string(),
+        });
     };
     let text = |value: &serde_json::Value, key: &str| -> Option<String> {
         value.get(key).and_then(|v| v.as_str()).map(str::to_string)
@@ -327,6 +344,20 @@ mod tests {
         assert_eq!(rejected.status, "rejected");
         assert_eq!(rejected.decision_reason.as_deref(), Some("tests failed"));
         assert_eq!(rejected.content, "--- a\n+++ b\n");
+    }
+
+    /// 载荷读不懂时，这一行仍然读得出来，并标明它读不懂。
+    ///
+    /// 这正是「不猜不丢」：丢掉整行会让一条被拒绝的变更重新出现在待办里，而把它读成
+    /// 一条空候选会让「这一版代码读不懂」看起来像「这条变更没有内容」。
+    #[test]
+    fn an_undecodable_payload_keeps_its_row_and_says_so() {
+        let row = candidate_from_events("c9", "e9", "change_rejected", "not json", "not json")
+            .expect("an unreadable payload is not an unreadable row");
+        assert_eq!(row.status, "rejected");
+        assert_eq!(row.recorded_status, "undecodable");
+        assert!(row.content.is_empty());
+        assert_eq!(row.event_id, "e9");
     }
 
     /// 正文里的时间读不懂时，这一行仍然读得出来：丢掉整行会让一条被拒绝的变更
