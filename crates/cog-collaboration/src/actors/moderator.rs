@@ -118,16 +118,13 @@ impl ModeratorActor {
         // `accept_partial`, `escalate`. A contract naming `ChangeStrategy` would
         // be naming a spelling the parse reads as none of the four, and the round
         // would continue by default — a decision taken by a word nobody wrote.
+        //
+        // The words are all that is here, together with the shape they arrive
+        // in. What each one commits the round to is the platform's own reading of
+        // them, and the debate they are a judgement on travels in the document
+        // below; a paragraph here defining them would be the platform making the
+        // judgement it just asked for.
         let mut contract = serde_json::json!({
-            "instructions": "Each agent \
-             proposed a plan and a generation, and a judge has ruled on the round. Read the \
-             debate so far and decide what happens next: you are not asked whether the round \
-             passed — that verdict is already in the history — you are asked what to do about \
-             a debate that has not confirmed. `decision` is exactly one of: \
-             `continue` — another round with the current strategy; \
-             `change_strategy` — same goal, a different angle, named in `suggestions`; \
-             `accept_partial` — the current best result stands even though consensus was not \
-             reached; `escalate` — this needs an external review or a human.",
             "output_schema": {
                 "decision": "string: continue | change_strategy | accept_partial | escalate",
                 "reasoning": "string: why this is the right call",

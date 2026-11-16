@@ -13,8 +13,10 @@
 //! 只声明了 5 条。分布是工具描述 24 条、评测 harness 17 条，其余约 62 条是
 //! 任务与工件契约：规划指令、diff 语法与验证契约、告警修复 goal、面漂移 goal。
 //! 改 `prompts/` 的任何一个字都不影响它们，而没有一道门看见它们。
-//! 本门按承载形状普查到的**点**比文本多：183 个载体点、14 个函数（一条文本可以
-//! 在几处出现，一个函数里的每行字面量各算一点——门要报的是「哪一行没表态」）。
+//! 本门按承载形状普查到的**点**比文本多（一条文本可以在几处出现，一个函数里的每
+//! 行字面量各算一点——门要报的是「哪一行没表态」）：这一天量到 240 个载体点、17
+//! 个函数。读数由测试自己印出来，`cargo test … -- --nocapture` 就是重新量一次；
+//! 别的地方不要手抄这两个数。
 //!
 //! 为什么门判的是「就地表明身份」而不是「必须搬进 prompts/」：这两类东西的
 //! 寿命不一样。系统提示词是策略，运维改了就该生效，所以它有一条声明、一份
@@ -99,9 +101,11 @@ const CONTRACT_FIELDS: [&str; 3] = ["goal", "instructions", "acceptance"];
 /// 这些键只在「写给模型读的契约」里出现，别的地方不会用它们当字段名。一个函数
 /// 里出现其中任何一个，就把它当成提示词面：函数里的每个字符串字面量都要表态。
 ///
-/// 为什么要这条，而不只认 `goal`/`instructions` 三个词：`change_generation_contract()`
-/// 的 13 KB 散文全挂在 `grounding`、`diff_grammar`、`verification` 这些键上，
-/// 三个词的形状一个都认不出来——最大的那份提示词恰好是门看不见的那一份。
+/// 为什么要这条，而不只认 `goal`/`instructions` 三个词：删掉之前
+/// `change_generation_contract()` 的 13 KB 散文全挂在 `grounding`、`diff_grammar`、
+/// `verification` 这些键上，三个词的形状一个都认不出来——最大的那份提示词恰好是
+/// 门看不见的那一份。这些键如今只剩 `artifact_instructions` 一处还在用，但清单
+/// 留着：这是这类形状的清单，不是当前树上的形状清单。
 const DECISIVE_KEYS: [&str; 9] = [
     "artifact_instructions",
     "diff_grammar",
@@ -508,6 +512,17 @@ fn every_model_facing_instruction_declares_its_source() {
     assert!(
         !sites.is_empty(),
         "普查一个载体点都没读到——扫描器坏了，不是树上没有提示词"
+    );
+    // 读数从这儿印，不要手抄到别处：`cargo test … -- --nocapture` 就是重新量一次。
+    // 文件头那句「183 个载体点、14 个函数」是这一行在某一天的输出。
+    let functions: std::collections::BTreeSet<(&str, &str)> = sites
+        .iter()
+        .map(|s| (s.file.as_str(), s.function.as_str()))
+        .collect();
+    eprintln!(
+        "prompt census: {} carrier points in {} functions",
+        sites.len(),
+        functions.len()
     );
     let declared = declarations(&root);
     let keys = declared_keys(&root);

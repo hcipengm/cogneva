@@ -329,6 +329,38 @@ async fn every_stable_half_names_the_answers_its_own_parser_reads() {
     }
 }
 
+/// 圆桌的两个控制角色只要一个答案，不要一套判断标准。
+///
+/// 两者决定的都是平台自己没决定的事：主持人定这一轮往下怎么走，仲裁者定交付哪一
+/// 条分支。交给它们的文档就是那个案子——分支带着各自的计划、生成物与判词，辩论
+/// 记录带着已发生的一切。稳定半段里再写一段「该怎么权衡」，等于平台把它刚问出去
+/// 的决定自己做了：模型照抄一遍，判断却没有发生。需要它们知道的只有答案的形状与
+/// 解析器认的拼写，所以稳定半段就只有这两样。
+#[tokio::test]
+async fn the_control_actors_state_the_answer_shape_and_nothing_else() {
+    let roles = two_prompts_from_every_actor().await;
+    for role in ["moderator", "merger"] {
+        let agent = roles
+            .iter()
+            .find(|(r, _, _)| *r == role)
+            .map(|(_, agent, _)| agent)
+            .unwrap_or_else(|| panic!("{role} sent no document to read"));
+        let contract: serde_json::Value = serde_json::from_str(&stable_half(agent.inputs()[0].clone()))
+            .unwrap_or_else(|e| panic!("{role}'s stable half is not JSON: {e}"));
+        let keys: std::collections::BTreeSet<&str> = contract
+            .as_object()
+            .unwrap_or_else(|| panic!("{role}'s stable half is not an object: {contract}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["output_schema", "response_format"].into_iter().collect(),
+            "{role}'s stable half carries more than the answer shape: {contract}"
+        );
+    }
+}
+
 /// 分解被要求在每一片上说清交什么，并且明确不许从座位名反推。
 ///
 /// 计划是平台自己的生产者：它比外部提交者更清楚每一片要交出哪种产物。字段一旦
