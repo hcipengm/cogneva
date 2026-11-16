@@ -210,6 +210,19 @@ pub struct RemoteExecutor {
     replacement_window: std::time::Duration,
 }
 
+/// Where one command goes, and whether the lane had to leave a replica to get
+/// there.
+struct Placement {
+    endpoint: String,
+    /// The replica this lane is pinned to (none when there is one replica and
+    /// pinning says nothing).
+    pinned_to: Option<String>,
+    /// The replica the lane came from when its pin lapsed and the command
+    /// landed somewhere else. The tree under this command is then not the one
+    /// the previous commands worked in, and the caller is told so.
+    moved_from: Option<String>,
+}
+
 impl RemoteExecutor {
     pub fn new(base_url: impl Into<String>) -> SFResult<Self> {
         Self::with_replacement_window(base_url, REPLACEMENT_WINDOW)
@@ -343,14 +356,14 @@ impl RemoteExecutor {
 
     /// The address a command goes to, and the replica it is pinned to (none
     /// when there is only one replica and pinning says nothing).
-    fn endpoint_for(
-        &self,
-        lane: Option<&str>,
-        endpoints: &[String],
-    ) -> Option<(String, Option<String>)> {
+    fn endpoint_for(&self, lane: Option<&str>, endpoints: &[String]) -> Option<Placement> {
         let first = endpoints.first()?.clone();
         let Some(lane) = lane.filter(|_| endpoints.len() > 1) else {
-            return Some((first, None));
+            return Some(Placement {
+                endpoint: first,
+                pinned_to: None,
+                moved_from: None,
+            });
         };
         let pinned = {
             let mut book = self
@@ -364,17 +377,31 @@ impl RemoteExecutor {
                 crate::executor_lease::LANE_LEASE_SECS,
             )
         }?;
-        if let crate::executor_lease::Grant::Moved { from, lapsed_secs } = &pinned.grant {
-            tracing::warn!(
-                lane,
-                from_replica = %from,
-                to_replica = %pinned.replica,
-                lapsed_secs,
-                "this lane is moving to another executor replica: what the previous one \
-                 wrote after its pin lapsed may not be in the tree this command runs on"
-            );
-        }
-        Some((pinned.replica.clone(), Some(pinned.replica)))
+        // A lapsed pin that lands on the replica it already pointed at costs
+        // nothing: the tree is still there. Only a pin that lands on a
+        // *different* replica means the tree under this command is not the one
+        // the previous commands worked in, and that is the move worth saying.
+        let moved_from = match &pinned.grant {
+            crate::executor_lease::Grant::Moved { from, lapsed_secs }
+                if from != &pinned.replica =>
+            {
+                tracing::warn!(
+                    lane,
+                    from_replica = %from,
+                    to_replica = %pinned.replica,
+                    lapsed_secs,
+                    "this lane is moving to another executor replica: what the previous one \
+                     wrote after its pin lapsed may not be in the tree this command runs on"
+                );
+                Some(from.clone())
+            }
+            _ => None,
+        };
+        Some(Placement {
+            endpoint: pinned.replica.clone(),
+            pinned_to: Some(pinned.replica),
+            moved_from,
+        })
     }
 
     fn release_lane(&self, lane: Option<&str>, replica: Option<String>) {
@@ -465,13 +492,15 @@ impl SandboxBackend for RemoteExecutor {
         }
         let lane = lane_of(req);
         let endpoints = self.endpoints_now().await?;
-        let (endpoint, pinned_to) =
-            self.endpoint_for(lane.as_deref(), &endpoints)
-                .ok_or_else(|| {
-                    cog_core::SFError::Agent(
-                        "no sandbox executor replica is known; the command was not sent".into(),
-                    )
-                })?;
+        let placement = self
+            .endpoint_for(lane.as_deref(), &endpoints)
+            .ok_or_else(|| {
+                cog_core::SFError::Agent(
+                    "no sandbox executor replica is known; the command was not sent".into(),
+                )
+            })?;
+        let endpoint = placement.endpoint.clone();
+        let pinned_to = placement.pinned_to.clone();
         let url = format!("{}/execute", endpoint.trim_end_matches('/'));
         let body = serde_json::json!({
             "payload": req.payload,
@@ -558,7 +587,28 @@ impl SandboxBackend for RemoteExecutor {
                 }
             }
         });
-        Ok(Box::pin(stream))
+        // A command that changed replica may be running in a tree the previous
+        // commands did not work in: the replicas do not share a volume, so
+        // whatever the old one had that was not pushed to a remote --
+        // uncommitted edits, commits that live only on its disk -- is not here.
+        // The address cannot tell a lane that really moved from a pod that was
+        // replaced under the same volume, so the line names the move and the
+        // condition rather than asserting the loss. The stream is the one
+        // channel the agent reads, so the fact travels as its first line
+        // instead of only in this process's log.
+        let Some(from) = placement.moved_from else {
+            return Ok(Box::pin(stream));
+        };
+        let notice = CommandEvent::Stderr {
+            data: format!(
+                "这条命令换了一副执行器（从 {from} 到 {endpoint}）。每副副本有自己的卷：\
+                 如果这不是同一副的重建，上一副上未推送到远端的工作（未提交的改动、\
+                 只在那台机器上的提交）不在这棵树上。\n"
+            ),
+        };
+        Ok(Box::pin(
+            futures::stream::once(std::future::ready(notice)).chain(stream),
+        ))
     }
 }
 
@@ -659,6 +709,71 @@ mod tests {
         assert_eq!(live_hits.load(Ordering::SeqCst), 1);
     }
 
+    /// 搬过家的那条命令要把「上一副卷上的东西没跟过来」交给智能体读。
+    ///
+    /// 两副副本各有自己的卷：换到另一副之后，那条 lane 的树只可能是那副卷上
+    /// 本来就有的那棵，上一副上未推送的工作不在里面。这句话以前只进进程日志，
+    /// 而读日志的人不是正在用这棵树干活的智能体。
+    #[tokio::test]
+    async fn a_command_that_changed_replica_says_what_did_not_come_along() {
+        let (first, _) = serve_counting(2).await;
+        let (second, _) = serve_counting(2).await;
+        let (third, _) = serve_counting(2).await;
+        // 两副从第一刻起就在：一副地址时这条客户端根本不钉，也就没有「搬家」。
+        let replicas = ChangingReplicas::new(vec![first.clone(), second.clone()]);
+        let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
+
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        // 那副副本从列表里消失（缩容或换了 Pod），lane 的钉还在它上面；
+        // 列表里仍得有别的副本可去，一副地址时这条客户端根本不钉。
+        *replicas.addrs.lock().unwrap() = vec![second.clone(), third.clone()];
+
+        let moved = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert_eq!(moved.exit_code, 0);
+        assert!(
+            moved.stderr.contains("换了一副执行器"),
+            "搬家那句没说出来：{:?}",
+            moved.stderr
+        );
+        assert!(
+            moved.stderr.contains(&first),
+            "搬家那句没说清从哪副来：{:?}",
+            moved.stderr
+        );
+
+        // 下一条已经在同一副上，树里有刚写下的改动：再说一遍只是噪声。
+        let next = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            !next.stderr.contains("换了一副执行器"),
+            "只搬一次家，却说成了两条：{:?}",
+            next.stderr
+        );
+    }
+
+    /// 那句话是流出来的第一件事：智能体先知道自己站在哪棵树上，再读输出。
+    #[tokio::test]
+    async fn the_move_notice_is_the_first_event_of_the_stream() {
+        use futures::StreamExt;
+        let (first, _) = serve_counting(2).await;
+        let (second, _) = serve_counting(2).await;
+        let (third, _) = serve_counting(2).await;
+        let replicas = ChangingReplicas::new(vec![first, second.clone()]);
+        let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        *replicas.addrs.lock().unwrap() = vec![second, third];
+
+        let mut stream = executor
+            .execute_stream(&for_agent("agent-a"))
+            .await
+            .unwrap();
+        match stream.next().await {
+            Some(CommandEvent::Stderr { data }) => {
+                assert!(data.contains("换了一副执行器"), "{data}")
+            }
+            other => panic!("第一件事应该是那句搬家说明，实际是 {other:?}"),
+        }
+    }
+
     /// A replica list the test changes between calls: what a scale-out and a
     /// scale-down look like from the client's side.
     struct ChangingReplicas {
@@ -712,7 +827,8 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (first, first_hits) = serve_counting(2).await;
         let (second, second_hits) = serve_counting(2).await;
-        let replicas = ChangingReplicas::new(vec![first.clone()]);
+        // 两副从第一刻起就在：一副地址时这条客户端根本不钉，也就没有「搬家」。
+        let replicas = ChangingReplicas::new(vec![first.clone(), second.clone()]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
 
         executor.execute(&for_agent("agent-a")).await.unwrap();
