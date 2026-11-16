@@ -70,9 +70,7 @@ use crate::common;
 
 use common::lex::{strip, Dialect};
 use common::routes::repo_root;
-use common::rust_production::{
-    production_numbered_lines_keeping_comments, production_sources,
-};
+use common::rust_production::{production_numbered_lines_keeping_comments, production_sources};
 
 /// 承载形状：模型可见指令在源码里的两种落点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,21 +91,17 @@ struct Site {
     function: String,
 }
 
-const MESSAGE_CALLS: [&str; 3] = [
-    "Message::system(",
-    "Message::user(",
-    "Message::assistant(",
-];
+const MESSAGE_CALLS: [&str; 3] = ["Message::system(", "Message::user(", "Message::assistant("];
 const CONTRACT_FIELDS: [&str; 3] = ["goal", "instructions", "acceptance"];
 
 /// 这些键只在「写给模型读的契约」里出现，别的地方不会用它们当字段名。一个函数
 /// 里出现其中任何一个，就把它当成提示词面：函数里的每个字符串字面量都要表态。
 ///
 /// 为什么要这条，而不只认 `goal`/`instructions` 三个词：删掉之前
-/// `change_generation_contract()` 的 13 KB 散文全挂在 `grounding`、`diff_grammar`、
-/// `verification` 这些键上，三个词的形状一个都认不出来——最大的那份提示词恰好是
-/// 门看不见的那一份。这些键如今只剩 `artifact_instructions` 一处还在用，但清单
-/// 留着：这是这类形状的清单，不是当前树上的形状清单。
+/// `change_generation_contract()` 的散文（实测 2026-11-17：13 KB）全挂在 `grounding`、
+/// `diff_grammar`、`verification` 这些键上，三个词的形状一个都认不出来——最大的那份
+/// 提示词恰好是门看不见的那一份。这些键如今只剩 `artifact_instructions` 一处还在用，
+/// 但清单留着：这是这类形状的清单，不是当前树上的形状清单。
 const DECISIVE_KEYS: [&str; 9] = [
     "artifact_instructions",
     "diff_grammar",
@@ -289,10 +283,11 @@ fn declares_something(text: &str) -> bool {
 /// 点不出会红的东西，诚实的话就该写 `consumed by`：那类声明明说没有东西会红，
 /// 自己就成了待补检查的清单。
 fn can_fail(path: &str, text: &str) -> bool {
+    // 「产出面在哪里」只有一份答案（`common::rust_production`）：这里问的是
+    // 「这个文件有没有测试那一半」，不是自己再切一次——切法两份时，一份认
+    // `#[cfg(test)]`、另一份不认，两份判词就关于两棵不同的树。
     path.contains("/tests/")
-        || text.contains("#[test]")
-        || text.contains("#[cfg(test)]")
-        || text.contains("#[tokio::test]")
+        || crate::common::rust_production::production_text(text).len() != text.trim_end().len()
 }
 
 /// 这一行声明的函数名（`fn name(`）。
@@ -518,8 +513,14 @@ fn the_words_are_read_the_way_the_header_says() {
     // 生产代码里的普通函数不会因为这句话被违反而红。
     assert!(can_fail("crates/x/tests/y.rs", "whatever"));
     assert!(can_fail("crates/x/src/y.rs", "#[cfg(test)]\nmod tests {"));
-    assert!(can_fail("crates/x/src/y.rs", "    #[tokio::test]\n    async fn f()"));
-    assert!(!can_fail("crates/x/src/y.rs", "pub fn parse(s: &str) -> Result<()>"));
+    assert!(can_fail(
+        "crates/x/src/y.rs",
+        "    #[tokio::test]\n    async fn f()"
+    ));
+    assert!(!can_fail(
+        "crates/x/src/y.rs",
+        "pub fn parse(s: &str) -> Result<()>"
+    ));
 
     // 三种承载形状各认一次；同尾字段（subgoal）与不跟字面量的实参都不算。
     assert_eq!(
@@ -579,9 +580,9 @@ fn every_model_facing_instruction_declares_its_source() {
     for ((file, function), note) in &declared {
         let at = format!("{file} 的 `{function}`");
         match parse_declaration(note) {
-            Some(Declaration::Declared(key)) if !keys.contains(&key) => {
-                bogus.push(format!("{at} 说 `declared {key}`，但 prompts/ 里没有这条 key"))
-            }
+            Some(Declaration::Declared(key)) if !keys.contains(&key) => bogus.push(format!(
+                "{at} 说 `declared {key}`，但 prompts/ 里没有这条 key"
+            )),
             Some(Declaration::EnforcedBy(path, symbol))
             | Some(Declaration::ConsumedBy(path, symbol)) => {
                 let enforced = matches!(parse_declaration(note), Some(Declaration::EnforcedBy(..)));
