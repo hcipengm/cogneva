@@ -16,8 +16,10 @@
 # 待应用的迁移，带着 `ON_ERROR_STOP` 跑一遍，然后删掉临时库。只读真库（`-s` 导出
 # 不带行），不改它。
 #
-# 需要集群可达（`sudo -n kubectl` 默认，可用 `COGNEVA_KUBECTL` 覆盖），所以它不进
-# `check-before-push.sh`：那道门在没有集群的机器上也要能跑。**推之前手动跑**。
+# carrier: 人 —— 推之前手动跑，不进整门。它要集群可达（`sudo -n kubectl` 默认，
+#   可用 `COGNEVA_KUBECTL` 覆盖），而 `check-before-push.sh` 在没有集群的机器上也要
+#   能跑：把这一步挂进去，那台机器上的整门会卡在等集群而不是判字节。
+#   `check-gate-carriers.py` 认这一行。
 set -euo pipefail
 
 namespace="${COGNEVA_NAMESPACE:-cogneva}"
