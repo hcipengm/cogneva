@@ -208,6 +208,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::RebuildMetricProjections => {
             cogneva::metric_projection_rebuild::run_from_env().await
         }
+        // 历史记录文件的导入：这一步之后盘上那份 `<id>.json` 就没有读者了，
+        // 队列的正本是事件流。
+        Command::ImportChangeRecords => cogneva::import_change_records::run_from_env().await,
         // Torn AOF tail repair: runs in the redis Pod's init container, which is
         // what moves "a host that died uncleanly means truncating the AOF by
         // hand" onto the startup path.

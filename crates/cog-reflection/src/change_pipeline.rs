@@ -9820,4 +9820,204 @@ index 1111111..2222222 100644\n\
         );
         assert!(ChangePipeline::web_targets(&targets(&["crates/x/src/lib.rs"])).is_empty());
     }
+    /// 历史记录文件导进队列：在队的落成候选、在读的落成已定案，文件都删掉。
+    #[tokio::test]
+    async fn legacy_record_files_become_queue_rows_and_the_files_go() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        let retired = change_dir.join("retired");
+        tokio::fs::create_dir_all(&retired).await.unwrap();
+        let store = crate::change_pipeline::test_candidates();
+
+        let waiting = written_record(
+            "waiting",
+            EvolutionStatus::CompileChecked,
+            chrono::Utc::now(),
+        );
+        tokio::fs::write(
+            change_dir.join("waiting.json"),
+            serde_json::to_string(&waiting).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut landed = written_record("landed", EvolutionStatus::Active, chrono::Utc::now());
+        landed.description = "the change that landed".to_string();
+        tokio::fs::write(
+            retired.join("landed.json"),
+            serde_json::to_string(&landed).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let report = crate::change_pipeline::import_legacy_records(&change_dir, &store).await;
+        assert_eq!(report.pending, 1);
+        assert_eq!(report.retired, 1);
+        assert!(report.unreadable.is_empty());
+
+        assert!(
+            !change_dir.join("waiting.json").exists() && !retired.join("landed.json").exists(),
+            "导入之后那份文件没有读者了，留着只会让下一个人以为它还是正本"
+        );
+        let pending = store.pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].artifact_id, "waiting");
+        let decided = store.read("landed").await.unwrap().expect("the row reads");
+        assert_eq!(decided.status, "accepted");
+        assert_eq!(
+            decided.description, "the change that landed",
+            "导入不该改写记录说过的话"
+        );
+    }
+
+    /// 读不懂的记录留在原地并被点名：删掉它就是删掉唯一那份它说过的东西。
+    #[tokio::test]
+    async fn an_unreadable_legacy_record_stays_where_it_is() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        tokio::fs::write(change_dir.join("broken.json"), "{ not a record")
+            .await
+            .unwrap();
+        let store = crate::change_pipeline::test_candidates();
+
+        let report = crate::change_pipeline::import_legacy_records(&change_dir, &store).await;
+        assert_eq!(report.unreadable.len(), 1);
+        assert!(change_dir.join("broken.json").exists());
+    }
+
+    /// 跑两遍是空操作：第二遍没有文件可导，队列不变。
+    #[tokio::test]
+    async fn importing_twice_changes_nothing_the_second_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let store = crate::change_pipeline::test_candidates();
+        let record = written_record("once", EvolutionStatus::Generated, chrono::Utc::now());
+        tokio::fs::write(
+            change_dir.join("once.json"),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        crate::change_pipeline::import_legacy_records(&change_dir, &store).await;
+        let again = crate::change_pipeline::import_legacy_records(&change_dir, &store).await;
+        assert_eq!(again.pending, 0);
+        assert_eq!(again.retired, 0);
+        assert_eq!(store.pending().await.unwrap().len(), 1);
+    }
+}
+
+/// 历史遗留的记录文件导进队列之后的结果读数。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyImportReport {
+    /// 导进来、并已从盘上删掉的候选（在队里的）。
+    pub pending: usize,
+    /// 导进来、并已从盘上删掉的已定案变更（`retired/` 里的）。
+    pub retired: usize,
+    /// 读不懂的记录：留在原地，点名出来。
+    pub unreadable: Vec<PathBuf>,
+}
+
+/// 把 `<id>.json` 记录文件导进队列，然后删掉文件。
+///
+/// 这一步是 S25 的顺序里唯一还需要盘上那份字节的一步：旧模型把它当唯一的那份事实，
+/// 新模型只认事件。导入之后那份文件就没有读者了，留着只会让下一个人以为它还是正本。
+///
+/// 三条纪律：
+///
+/// * **先落库、后删文件**：反过来，一次写库失败就永久丢掉了那条变更唯一的描述；
+/// * **在队与已退役分开落**：`retired/` 里的记录说的是「这条变更已经离开队列」，
+///   所以导入时补一条定案事件——否则它们会在待办里重新出现，而那正是这次要治的病。
+///   定案方向按记录自己的状态词判：被拒的那几个词落 `Rejected`，其余落 `Accepted`；
+/// * **读不懂的不删**：一份解不出来的记录留在原地并被点名，因为删掉它就是删掉唯一
+///   那份它说过的东西。
+pub async fn import_legacy_records(
+    change_dir: &Path,
+    store: &Arc<dyn ChangeCandidateStore>,
+) -> LegacyImportReport {
+    let mut report = LegacyImportReport::default();
+    for (dir, retired) in [
+        (change_dir.to_path_buf(), false),
+        (retired_dir(change_dir), true),
+    ] {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let text = match tokio::fs::read_to_string(&path).await {
+                Ok(text) => text,
+                Err(_) => {
+                    report.unreadable.push(path);
+                    continue;
+                }
+            };
+            let Ok(record) = serde_json::from_str::<EvolutionResult>(&text) else {
+                report.unreadable.push(path);
+                continue;
+            };
+            if let Err(e) = record_change(store, &record).await {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not import a legacy change record; the file stays where it is"
+                );
+                report.unreadable.push(path);
+                continue;
+            }
+            if retired {
+                let outcome = landed_outcome(record.status);
+                if let Err(e) = store
+                    .decide(
+                        &record.artifact_id,
+                        outcome,
+                        "imported from a retired record: it had already left the queue",
+                    )
+                    .await
+                {
+                    warn!(
+                        artifact_id = %record.artifact_id,
+                        error = %e,
+                        "imported the candidate but could not mark it as retired; it stays as a pending candidate"
+                    );
+                    report.unreadable.push(path);
+                    continue;
+                }
+                report.retired += 1;
+            } else {
+                report.pending += 1;
+            }
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "imported the record but could not remove the file; it is now a duplicate, not a source"
+                );
+            }
+        }
+    }
+    info!(
+        pending = report.pending,
+        retired = report.retired,
+        unreadable = report.unreadable.len(),
+        "legacy change records imported into the queue"
+    );
+    report
+}
+
+/// 一条已经离开队列的记录，当初是落地了还是被拒了。
+///
+/// 只按记录自己的状态词判：三个「没成」的词落 `Rejected`，其余落 `Accepted`。这不是
+/// 猜——退役当时只有这两条路，而记录里的状态词就是当时那条路的判词。
+fn landed_outcome(status: EvolutionStatus) -> CandidateOutcome {
+    match status {
+        EvolutionStatus::Rejected
+        | EvolutionStatus::CompileError
+        | EvolutionStatus::ValidationFailed => CandidateOutcome::Rejected,
+        _ => CandidateOutcome::Accepted,
+    }
 }

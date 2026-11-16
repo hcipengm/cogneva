@@ -34,6 +34,7 @@ pub mod governance_readings;
 pub mod health_check;
 pub mod host_ledger;
 pub mod hot_reload;
+pub mod import_change_records;
 pub mod mcp_serve;
 pub mod mcp_tools;
 pub mod metric_projection_rebuild;
