@@ -27,7 +27,7 @@ use cog_storage::table_shapes::{TableShape, MUTABLE_TABLES};
 
 use common::migrations::{tables_in, up_migrations};
 use common::routes::repo_root;
-use common::rust_production::production_sources;
+use common::rust_production::{production_sources, production_text};
 
 #[test]
 fn every_updated_table_declares_its_shape() {
@@ -166,11 +166,10 @@ fn updated_tables(root: &Path) -> BTreeSet<String> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let production = match text.find("#[cfg(test)]") {
-            Some(at) => &text[..at],
-            None => text.as_str(),
-        };
-        let lower = production.to_ascii_lowercase();
+        // 产出面的边界只有一份（`common::rust_production`）：自己按
+        // `#[cfg(test)]` 切会把文件中间 test-only 项之后的产出整段丢掉，而
+        // 「那里没有」与「那里没读」在判词上是同一句话。
+        let lower = production_text(&text).to_ascii_lowercase();
         let mut rest = lower.as_str();
         while let Some(at) = rest.find("update ") {
             rest = &rest[at + "update ".len()..];
