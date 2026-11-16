@@ -283,11 +283,9 @@ fn declares_something(text: &str) -> bool {
 /// 点不出会红的东西，诚实的话就该写 `consumed by`：那类声明明说没有东西会红，
 /// 自己就成了待补检查的清单。
 fn can_fail(path: &str, text: &str) -> bool {
-    // 「产出面在哪里」只有一份答案（`common::rust_production`）：这里问的是
-    // 「这个文件有没有测试那一半」，不是自己再切一次——切法两份时，一份认
-    // `#[cfg(test)]`、另一份不认，两份判词就关于两棵不同的树。
-    path.contains("/tests/")
-        || crate::common::rust_production::production_text(text).len() != text.trim_end().len()
+    // 「有没有测试标记」问的不是「产出面在哪里」：切法只有一份（`common::rust_production`），
+    // 而标记表也放在那里，调用点不再各写一遍。
+    path.contains("/tests/") || crate::common::rust_production::mentions_tests(text)
 }
 
 /// 这一行声明的函数名（`fn name(`）。

@@ -689,3 +689,13 @@ pub fn real_work_after_the_module() {
         );
     }
 }
+
+/// 这段字里有没有测试标记（`#[test]`、`#[cfg(test)]`、`#[tokio::test]`）。
+///
+/// 与「产出面在哪里」不是同一个问题：那个问的是「切在哪里」，这个问的是「有没有测试
+/// 那一半」。两者都关于测试，但只有一个需要一份切法；把「有没有」也放进这份共享模块，
+/// 是为了让调用点不再各写一遍标记表——写过三份，下一类测试框架只会在其中一份里被加上。
+pub fn mentions_tests(text: &str) -> bool {
+    const MARKERS: [&str; 3] = ["#[test]", "#[cfg(test)]", "#[tokio::test]"];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
