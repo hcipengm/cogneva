@@ -1190,18 +1190,21 @@ impl WorkdirRouter {
     /// reaches its own decision, and the only moment a claim can protect a tree
     /// is before anything starts using it. Invalid lanes and add failures
     /// surface as errors instead of silently collapsing onto a shared directory.
-    pub async fn route(self: &Arc<Self>, lane: &str) -> SFResult<(PathBuf, WorktreeUse)> {
+    pub async fn route(
+        self: &Arc<Self>,
+        lane: &str,
+    ) -> SFResult<(PathBuf, WorktreeUse, cog_core::WorktreeOrigin)> {
         validate_task_id(lane)?;
         let use_guard = self.claim(lane);
-        let (path, took_warm) = self.route_validated(lane, true).await?;
+        let (path, origin) = self.route_validated(lane, true).await?;
         // Refill after the answer, never before it: the caller is waiting for
         // a directory to run in, and the tree that replaces the one just taken
         // is for a task that has not arrived yet.
-        if took_warm {
+        if origin == cog_core::WorktreeOrigin::Warm {
             let router = Arc::clone(self);
             tokio::spawn(async move { router.warm_pool_once().await });
         }
-        Ok((path, use_guard))
+        Ok((path, use_guard, origin))
     }
 
     /// The pool directory. Sits inside the workspaces root so it lands on the
@@ -1501,16 +1504,20 @@ impl WorkdirRouter {
     /// The tree on its own, without a claim: a caller that will run something in
     /// it must go through [`Self::route`], which is the only thing that keeps a
     /// reclamation pass from deleting it while the command runs.
-    async fn route_validated(&self, lane: &str, own_claim: bool) -> SFResult<(PathBuf, bool)> {
+    async fn route_validated(
+        &self,
+        lane: &str,
+        own_claim: bool,
+    ) -> SFResult<(PathBuf, cog_core::WorktreeOrigin)> {
         let path = self.cfg.workspaces_root.join(lane);
         if self.is_healthy(&path).await {
             self.touch(lane).await;
-            return Ok((path, false));
+            return Ok((path, cog_core::WorktreeOrigin::Existing));
         }
         let _g = self.create_lock.lock().await;
         if self.is_healthy(&path).await {
             self.touch(lane).await;
-            return Ok((path, false));
+            return Ok((path, cog_core::WorktreeOrigin::Existing));
         }
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             if self.commands_running(lane, own_claim) > 0 {
@@ -1531,7 +1538,7 @@ impl WorkdirRouter {
         if self.take_warm(lane, &path).await {
             self.note_arrival();
             self.refresh_count_metric().await;
-            return Ok((path, true));
+            return Ok((path, cog_core::WorktreeOrigin::Warm));
         }
         self.enforce_cap(1).await;
         if let Err(e) = self.add_worktree(lane, &path).await {
@@ -1540,7 +1547,7 @@ impl WorkdirRouter {
         }
         self.note_arrival();
         self.refresh_count_metric().await;
-        Ok((path, false))
+        Ok((path, cog_core::WorktreeOrigin::Created))
     }
 
     async fn add_worktree(&self, lane: &str, path: &Path) -> SFResult<()> {
@@ -2846,7 +2853,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, _) = r.route(&lane("squad:DSC-1A2B-generator")).await.unwrap();
+        let (path, _, _) = r.route(&lane("squad:DSC-1A2B-generator")).await.unwrap();
 
         let head = tokio::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -2876,11 +2883,15 @@ pub(crate) mod tests {
             "the pool is meant to be cut ahead of demand"
         );
 
-        let (path, took_warm) = r
+        let (path, origin) = r
             .route_validated(&lane("squad:DSC-1A2B-planner"), true)
             .await
             .unwrap();
-        assert!(took_warm, "the slot was there and had to be handed out");
+        assert_eq!(
+            origin,
+            cog_core::WorktreeOrigin::Warm,
+            "the slot was there and had to be handed out"
+        );
         let head = tokio::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(&path)
@@ -2891,6 +2902,42 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&head.stdout).trim(),
             lane_branch(&lane("squad:DSC-1A2B-planner")),
             "暖池交出去的树也必须站在车道的分支上"
+        );
+    }
+
+    /// 三种来处在盘上读起来一样，都是一棵健康的树；只有路由器分得清这一棵是
+    /// 刚切的、提前切好的，还是这条车道本来就在用的。这个区别只在一件事上
+    /// 有用：车道换到另一副执行器之后，能不能说死「先前的改动不在这棵树上」。
+    #[tokio::test]
+    async fn the_router_says_where_the_tree_it_handed_out_came_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router_with_warm(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK, 1);
+
+        // 池子还空着：这棵树是为这次调用现切的。
+        let (_, _, origin) = r.route("cold-task").await.unwrap();
+        assert_eq!(
+            origin,
+            cog_core::WorktreeOrigin::Created,
+            "现切的树被报成了别的来处"
+        );
+
+        // 同一条车道再来一次：树本来就在。
+        let (_, _, origin) = r.route("cold-task").await.unwrap();
+        assert_eq!(
+            origin,
+            cog_core::WorktreeOrigin::Existing,
+            "本来就在的树被报成了刚切的"
+        );
+
+        // 提前切好的槽交出去：树在盘上已有一阵，但没有任务用过它。
+        r.warm_pool_once().await;
+        assert!(!r.warm_slots().await.is_empty(), "池子该有槽了");
+        let (_, _, origin) = r.route("warm-task").await.unwrap();
+        assert_eq!(
+            origin,
+            cog_core::WorktreeOrigin::Warm,
+            "暖池交出去的树被报成了现切的"
         );
     }
 
@@ -2906,8 +2953,8 @@ pub(crate) mod tests {
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
         let generator = lane("squad:DSC-1A2B-generator");
         let planner = lane("squad:DSC-1A2B-planner");
-        let (g, _) = r.route(&generator).await.unwrap();
-        let (p, _) = r.route(&planner).await.unwrap();
+        let (g, _, _) = r.route(&generator).await.unwrap();
+        let (p, _, _) = r.route(&planner).await.unwrap();
         assert_ne!(g, p, "同一个任务里的两个执行者挤进了一棵树");
         assert!(g.ends_with(&generator) && p.ends_with(&planner));
         assert!(
@@ -3457,12 +3504,12 @@ pub(crate) mod tests {
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
 
-        let (path, _) = r.route("task-1").await.unwrap();
+        let (path, _, _) = r.route("task-1").await.unwrap();
         assert_eq!(path, tmp.path().join("workspaces").join("task-1"));
         assert!(path.join("README").exists());
         assert!(tmp.path().join("workspaces/.meta/task-1.json").exists());
 
-        let (again, _) = r.route("task-1").await.unwrap();
+        let (again, _, _) = r.route("task-1").await.unwrap();
         assert_eq!(again, path);
         assert_eq!(r.list_task_trees().await.len(), 1);
     }
@@ -3481,7 +3528,7 @@ pub(crate) mod tests {
         assert_eq!(slots.len(), 2, "the pool fills ahead of demand");
         let taken = slots[0].clone();
 
-        let (path, _) = r.route("warm-task").await.unwrap();
+        let (path, _, _) = r.route("warm-task").await.unwrap();
         assert!(
             path.join("README").exists(),
             "the handed tree is a real checkout"
@@ -3523,7 +3570,7 @@ pub(crate) mod tests {
         // Two tasks and an empty pool, so the ceiling is full with task trees
         // and no claim is holding either of them.
         for id in ["first", "second"] {
-            let (_path, guard) = r.route(id).await.unwrap();
+            let (_path, guard, _) = r.route(id).await.unwrap();
             drop(guard);
         }
         assert_eq!(
@@ -3558,7 +3605,7 @@ pub(crate) mod tests {
 
         // The task first, while the pool is still empty, so this tree is cut
         // rather than handed out and no refill is queued behind it.
-        let (_path, guard) = r.route("a").await.unwrap();
+        let (_path, guard, _) = r.route("a").await.unwrap();
         drop(guard);
         r.warm_pool_once().await;
         assert_eq!(r.warm_slots().await.len(), 1);
@@ -3592,7 +3639,7 @@ pub(crate) mod tests {
         assert_eq!(r.warm_slots().await.len(), 1);
         let moved_to = advance_bare(&bare, &tmp.path().join("advance-work"));
 
-        let (path, _) = r.route("late-task").await.unwrap();
+        let (path, _, _) = r.route("late-task").await.unwrap();
         assert_eq!(
             git_out(&path, &["rev-parse", "HEAD"]),
             moved_to,
@@ -3629,7 +3676,7 @@ pub(crate) mod tests {
             "a slot with no finished checkout is not a tree to hand out"
         );
 
-        let (path, _) = r.route("racing-task").await.unwrap();
+        let (path, _, _) = r.route("racing-task").await.unwrap();
         assert!(path.join("README").exists(), "the task got a whole tree");
         assert!(
             slot.exists(),
@@ -3647,8 +3694,8 @@ pub(crate) mod tests {
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
 
-        let (a, _) = r.route("task-a").await.unwrap();
-        let (b, _) = r.route("task-b").await.unwrap();
+        let (a, _, _) = r.route("task-a").await.unwrap();
+        let (b, _, _) = r.route("task-b").await.unwrap();
         std::fs::write(a.join("out.txt"), "from-a").unwrap();
         std::fs::write(b.join("out.txt"), "from-b").unwrap();
 
@@ -3680,7 +3727,7 @@ pub(crate) mod tests {
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
         // No command is running, so the claim `route` returns is dropped at
         // once — an idle tree, which is the only kind this reaps.
-        let (path, _) = r.route("stale-task").await.unwrap();
+        let (path, _, _) = r.route("stale-task").await.unwrap();
         let meta = tmp.path().join("workspaces/.meta/stale-task.json");
         assert!(meta.exists());
 
@@ -3718,7 +3765,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK);
-        let (running, in_use) = r.route("running").await.unwrap();
+        let (running, in_use, _) = r.route("running").await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
         r.route("idle").await.unwrap();
 
@@ -3811,8 +3858,8 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
-        let (shell, _) = r.route(&lane("vera-82191e4a")).await.unwrap();
-        let (round, _) = r.route("round-a").await.unwrap();
+        let (shell, _, _) = r.route(&lane("vera-82191e4a")).await.unwrap();
+        let (round, _, _) = r.route("round-a").await.unwrap();
         // Stamped together so the arrival span is zero and the configured TTL
         // stands; the derived one is floored at an hour and would hide the rule.
         let together = unix_now();
@@ -3898,7 +3945,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 1, DEFAULT_TTL_SECS_FALLBACK);
-        let (old, claim) = r.route("locked-old").await.unwrap();
+        let (old, claim, _) = r.route("locked-old").await.unwrap();
         drop(claim);
         git(
             &[
@@ -3937,7 +3984,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, claim) = r.route("killed-add").await.unwrap();
+        let (path, claim, _) = r.route("killed-add").await.unwrap();
         drop(claim);
         git(
             &[
@@ -3997,8 +4044,8 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
-        let (running, _in_use) = r.route("running").await.unwrap();
-        let (idle, _) = r.route("idle").await.unwrap();
+        let (running, _in_use, _) = r.route("running").await.unwrap();
+        let (idle, _, _) = r.route("idle").await.unwrap();
         let arriving_together = unix_now();
         // Older than every TTL a pass can pick, so neither branch can spare an
         // idle tree and the assertion measures the exception rather than the
@@ -4079,7 +4126,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (_, in_use) = r.route("built").await.unwrap();
+        let (_, in_use, _) = r.route("built").await.unwrap();
         let before = r.read_meta("built").unwrap().last_used_unix;
 
         // The stamp has second granularity, so a command has to outlive the
@@ -4112,7 +4159,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, _in_use) = r.route("busy").await.unwrap();
+        let (path, _in_use, _) = r.route("busy").await.unwrap();
 
         // The tree stops looking like a worktree while a command runs in it.
         std::fs::remove_file(path.join(WORKTREE_LINK)).unwrap();
@@ -4133,7 +4180,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r1 = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, _) = r1.route("task-survive").await.unwrap();
+        let (path, _, _) = r1.route("task-survive").await.unwrap();
 
         // Simulate a lost sidecar (tree still registered): recover adopts it.
         std::fs::remove_file(tmp.path().join("workspaces/.meta/task-survive.json")).unwrap();
@@ -4171,7 +4218,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let (path, _) = r.route("lock-task").await.unwrap();
+        let (path, _, _) = r.route("lock-task").await.unwrap();
         let gitdir = PathBuf::from(git_out(&path, &["rev-parse", "--absolute-git-dir"]));
         let lock = gitdir.join("index.lock");
         std::fs::write(&lock, "").unwrap();

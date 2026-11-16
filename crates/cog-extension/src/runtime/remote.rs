@@ -214,9 +214,6 @@ pub struct RemoteExecutor {
 /// there.
 struct Placement {
     endpoint: String,
-    /// The replica this lane is pinned to (none when there is one replica and
-    /// pinning says nothing).
-    pinned_to: Option<String>,
     /// The replica the lane came from when its pin lapsed and the command
     /// landed somewhere else. The tree under this command is then not the one
     /// the previous commands worked in, and the caller is told so.
@@ -354,14 +351,18 @@ impl RemoteExecutor {
             .ok_or_else(|| cog_core::SFError::Agent("no sandbox executor replica is known".into()))
     }
 
-    /// The address a command goes to, and the replica it is pinned to (none
-    /// when there is only one replica and pinning says nothing).
+    /// The address a command goes to, and the replica it is pinned to.
+    ///
+    /// A lane is pinned even when only one replica is known: the list having
+    /// one entry now says nothing about what it held one command ago, and a
+    /// single replica that was replaced under a new address is exactly a move
+    /// worth reporting. Pinning a lane that has nowhere else to go is a
+    /// comparison against a previous address, not a choice between replicas.
     fn endpoint_for(&self, lane: Option<&str>, endpoints: &[String]) -> Option<Placement> {
         let first = endpoints.first()?.clone();
-        let Some(lane) = lane.filter(|_| endpoints.len() > 1) else {
+        let Some(lane) = lane else {
             return Some(Placement {
                 endpoint: first,
-                pinned_to: None,
                 moved_from: None,
             });
         };
@@ -398,21 +399,22 @@ impl RemoteExecutor {
             _ => None,
         };
         Some(Placement {
-            endpoint: pinned.replica.clone(),
-            pinned_to: Some(pinned.replica),
+            endpoint: pinned.replica,
             moved_from,
         })
     }
 
-    fn release_lane(&self, lane: Option<&str>, replica: Option<String>) {
-        let (Some(lane), Some(replica)) = (lane, replica) else {
+    /// Say that the replica a lane sits on stopped answering. Not a release:
+    /// see [`crate::executor_lease::LeaseBook::abandon`].
+    fn abandon_lane(&self, lane: Option<&str>, replica: &str) {
+        let Some(lane) = lane else {
             return;
         };
         let mut book = self
             .lanes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        book.release(lane, &replica);
+        book.abandon(lane, replica);
     }
 
     /// 同一个客户端，换一段等待上界。生产的窗口是
@@ -500,7 +502,6 @@ impl SandboxBackend for RemoteExecutor {
                 )
             })?;
         let endpoint = placement.endpoint.clone();
-        let pinned_to = placement.pinned_to.clone();
         let url = format!("{}/execute", endpoint.trim_end_matches('/'));
         let body = serde_json::json!({
             "payload": req.payload,
@@ -539,10 +540,12 @@ impl SandboxBackend for RemoteExecutor {
                     };
                     // The replica this lane sits on is not answering and the
                     // replacement window is over: it is gone, not restarting.
-                    // Give the lane up so the next command picks a replica
-                    // that answers -- and says, through `Grant::Moved`, that
-                    // the tree may not carry what the gone replica wrote.
-                    self.release_lane(lane.as_deref(), pinned_to);
+                    // The hold is marked abandoned rather than released: the
+                    // next command is free to go to a replica that answers,
+                    // and its pin reports `Grant::Moved`, which puts the move
+                    // line on that command. A released pin would come back as
+                    // `Fresh`, and the lane would land in a tree nobody named.
+                    self.abandon_lane(lane.as_deref(), &endpoint);
                     return Err(cog_core::SFError::Agent(format!(
                         "sandbox executor unreachable: {e}{note}"
                     )));
@@ -591,24 +594,74 @@ impl SandboxBackend for RemoteExecutor {
         // commands did not work in: the replicas do not share a volume, so
         // whatever the old one had that was not pushed to a remote --
         // uncommitted edits, commits that live only on its disk -- is not here.
-        // The address cannot tell a lane that really moved from a pod that was
-        // replaced under the same volume, so the line names the move and the
-        // condition rather than asserting the loss. The stream is the one
-        // channel the agent reads, so the fact travels as its first line
-        // instead of only in this process's log.
+        // The stream is the one channel the agent reads, so the fact travels as
+        // its first line instead of only in this process's log.
+        //
+        // How much of that can be asserted depends on where the tree came
+        // from, which the executor says on the same stream just after. The
+        // notice is therefore composed when the first frame arrives rather
+        // than in front of the stream; `unfold` keeps the call itself from
+        // waiting, and the first frame is what the executor sends before the
+        // command has even started.
         let Some(from) = placement.moved_from else {
             return Ok(Box::pin(stream));
         };
-        let notice = CommandEvent::Stderr {
-            data: format!(
-                "这条命令换了一副执行器（从 {from} 到 {endpoint}）。每副副本有自己的卷：\
-                 如果这不是同一副的重建，上一副上未推送到远端的工作（未提交的改动、\
-                 只在那台机器上的提交）不在这棵树上。\n"
-            ),
-        };
-        Ok(Box::pin(
-            futures::stream::once(std::future::ready(notice)).chain(stream),
-        ))
+        enum Step {
+            Head,
+            First(Option<CommandEvent>),
+            Tail,
+        }
+        // The decoded stream is not `Unpin`; boxed it is, which is what lets
+        // this wrapper pull the first frame and hold the rest.
+        let state = (Box::pin(stream), Step::Head, from, endpoint);
+        let stream =
+            futures::stream::unfold(state, |(mut inner, step, from, endpoint)| async move {
+                match step {
+                    Step::Head => {
+                        let first = inner.next().await;
+                        let origin = match &first {
+                            Some(CommandEvent::Workdir { origin, .. }) => *origin,
+                            _ => cog_core::WorktreeOrigin::Unknown,
+                        };
+                        let notice = CommandEvent::Stderr {
+                            data: moved_line(&from, &endpoint, origin),
+                        };
+                        Some((notice, (inner, Step::First(first), from, endpoint)))
+                    }
+                    Step::First(Some(event)) => Some((event, (inner, Step::Tail, from, endpoint))),
+                    Step::First(None) => None,
+                    Step::Tail => inner
+                        .next()
+                        .await
+                        .map(|event| (event, (inner, Step::Tail, from, endpoint))),
+                }
+            });
+        Ok(Box::pin(stream))
+    }
+}
+
+/// What the agent is told when its command landed on a different replica.
+///
+/// A tree that already existed on the replica it landed on may be the same
+/// volume the pod was rebuilt on, so the loss is stated as a condition. A tree
+/// cut for this call, or handed out of that replica's pool, is one nothing has
+/// run in: there the loss is a fact.
+fn moved_line(from: &str, to: &str, origin: cog_core::WorktreeOrigin) -> String {
+    use cog_core::WorktreeOrigin;
+    let opening = format!("这条命令换了一副执行器（从 {from} 到 {to}）。");
+    match origin {
+        WorktreeOrigin::Created => format!(
+            "{opening}这副上刚为这个任务切了一棵新树：上一副上未推送到远端的工作\
+             （未提交的改动、只在那台机器上的提交）不在这棵树上。\n"
+        ),
+        WorktreeOrigin::Warm => format!(
+            "{opening}这副上交给这次调用的是一棵提前切好、没跑过任务的树：上一副上\
+             未推送到远端的工作（未提交的改动、只在那台机器上的提交）不在这棵树上。\n"
+        ),
+        WorktreeOrigin::Existing | WorktreeOrigin::Unknown => format!(
+            "{opening}每副副本有自己的卷：如果这不是同一副的重建，上一副上未推送到\
+             远端的工作（未提交的改动、只在那台机器上的提交）不在这棵树上。\n"
+        ),
     }
 }
 
@@ -650,6 +703,48 @@ mod tests {
         (format!("http://{}", addr), hits)
     }
 
+    /// A replica that, like the executor, says which tree the command got
+    /// before it answers -- or, with `None`, one whose version does not know
+    /// to say it.
+    async fn serve_announcing(requests: usize, origin: Option<cog_core::WorktreeOrigin>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..requests {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let mut body = String::new();
+                if let Some(origin) = origin {
+                    body.push_str(
+                        &serde_json::to_string(&CommandEvent::Workdir {
+                            path: "/srv/workspaces/employee-a".into(),
+                            origin,
+                        })
+                        .unwrap(),
+                    );
+                    body.push('\n');
+                }
+                body.push_str(
+                    &serde_json::to_string(&CommandEvent::Stdout { data: "ok".into() }).unwrap(),
+                );
+                body.push('\n');
+                body.push_str(&serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap());
+                body.push('\n');
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{}", addr)
+    }
+
     fn for_agent(agent: &str) -> SandboxRequest {
         SandboxRequest {
             task_id: "t".into(),
@@ -687,9 +782,10 @@ mod tests {
         );
     }
 
-    /// A replica that is gone does not keep its lanes: the unreachable error
-    /// releases the pin, and the next command for that agent lands on the
-    /// replica that answers.
+    /// A replica that is gone does not keep its lanes, and the lane is not
+    /// forgotten either: the next command lands on a replica that answers and
+    /// says which one it left. A pin given up at the error would move the lane
+    /// silently, in a tree nobody announced.
     #[tokio::test]
     async fn a_dead_replicas_lane_moves_on_the_next_command() {
         use std::sync::atomic::Ordering;
@@ -705,8 +801,14 @@ mod tests {
 
         let first = executor.execute(&for_agent("agent-a")).await;
         assert!(first.is_err(), "第一副副本没人监听，这一条必须失败");
-        executor.execute(&for_agent("agent-a")).await.unwrap();
+        let next = executor.execute(&for_agent("agent-a")).await.unwrap();
         assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            next.stderr.contains("换了一副执行器")
+                && next.stderr.contains(&format!("http://{dead}")),
+            "换了副本的那条命令没说它从哪副来：{:?}",
+            next.stderr
+        );
     }
 
     /// 搬过家的那条命令要把「上一副卷上的东西没跟过来」交给智能体读。
@@ -719,13 +821,11 @@ mod tests {
         let (first, _) = serve_counting(2).await;
         let (second, _) = serve_counting(2).await;
         let (third, _) = serve_counting(2).await;
-        // 两副从第一刻起就在：一副地址时这条客户端根本不钉，也就没有「搬家」。
         let replicas = ChangingReplicas::new(vec![first.clone(), second.clone()]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
 
         executor.execute(&for_agent("agent-a")).await.unwrap();
-        // 那副副本从列表里消失（缩容或换了 Pod），lane 的钉还在它上面；
-        // 列表里仍得有别的副本可去，一副地址时这条客户端根本不钉。
+        // 那副副本从列表里消失（缩容或换了 Pod），lane 的钉还在它上面。
         *replicas.addrs.lock().unwrap() = vec![second.clone(), third.clone()];
 
         let moved = executor.execute(&for_agent("agent-a")).await.unwrap();
@@ -772,6 +872,83 @@ mod tests {
             }
             other => panic!("第一件事应该是那句搬家说明，实际是 {other:?}"),
         }
+    }
+
+    /// 一副地址时也要钉：单副本被换掉（Pod 换名换了地址、缩容后在别处重建）
+    /// 同样是搬家。以前只在两副以上才钉，于是「缩到一副」之后那次换地址一声
+    /// 不吭，车道在一棵没人说过的树上接着写。
+    #[tokio::test]
+    async fn a_replica_replaced_under_a_single_address_is_still_a_move() {
+        let before = serve_counting(2).await.0;
+        let after = serve_counting(2).await.0;
+        let replicas = ChangingReplicas::new(vec![before.clone()]);
+        let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
+
+        let first = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            !first.stderr.contains("换了一副执行器"),
+            "第一次落点没有搬家可说：{:?}",
+            first.stderr
+        );
+
+        *replicas.addrs.lock().unwrap() = vec![after];
+        let moved = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            moved.stderr.contains("换了一副执行器") && moved.stderr.contains(&before),
+            "单副地址从一个换成另一个，也是一次搬家：{:?}",
+            moved.stderr
+        );
+    }
+
+    /// 换到的这副报「树是刚为这次调用切的」，那句话就能说死：先前的改动不在
+    /// 这棵树上。执行器报的来处让这句从条件句变成结论。
+    #[tokio::test]
+    async fn the_move_notice_is_definite_when_the_tree_was_cut_for_this_call() {
+        let first = serve_counting(2).await.0;
+        let second = serve_counting(2).await.0;
+        let third = serve_announcing(2, Some(cog_core::WorktreeOrigin::Created)).await;
+        let replicas = ChangingReplicas::new(vec![first, second.clone()]);
+        let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        *replicas.addrs.lock().unwrap() = vec![second, third];
+
+        let moved = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            moved.stderr.contains("刚为这个任务切了一棵新树")
+                && moved.stderr.contains("不在这棵树上"),
+            "报告了刚切的树，那句话还是条件句：{:?}",
+            moved.stderr
+        );
+        assert!(
+            !moved.stderr.contains("如果这不是同一副的重建"),
+            "树是刚切的，就没什么可「如果」的：{:?}",
+            moved.stderr
+        );
+    }
+
+    /// 换到的那副说不出树从哪来（旧版执行器），那句话退回条件句：宁可少说，
+    /// 不把「同一副重建」的现场说成丢了工作。
+    #[tokio::test]
+    async fn the_move_notice_stays_conditional_when_the_replica_cannot_say() {
+        let first = serve_counting(2).await.0;
+        let second = serve_counting(2).await.0;
+        let third = serve_announcing(2, None).await;
+        let replicas = ChangingReplicas::new(vec![first, second.clone()]);
+        let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        *replicas.addrs.lock().unwrap() = vec![second, third];
+
+        let moved = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            moved.stderr.contains("如果这不是同一副的重建"),
+            "说不出树从哪来，就不该把丢工作说成事实：{:?}",
+            moved.stderr
+        );
+        assert!(
+            !moved.stderr.contains("刚为这个任务切了一棵新树"),
+            "旧版执行器没报来处，客户端不能替它断言树是刚切的：{:?}",
+            moved.stderr
+        );
     }
 
     /// A replica list the test changes between calls: what a scale-out and a
@@ -827,7 +1004,6 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (first, first_hits) = serve_counting(2).await;
         let (second, second_hits) = serve_counting(2).await;
-        // 两副从第一刻起就在：一副地址时这条客户端根本不钉，也就没有「搬家」。
         let replicas = ChangingReplicas::new(vec![first.clone(), second.clone()]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
 

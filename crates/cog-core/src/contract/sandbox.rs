@@ -85,6 +85,29 @@ pub enum SandboxPayload {
     },
 }
 
+/// How the tree a command is running in came to exist on that replica.
+///
+/// The executor resolves this while routing the command, so it costs nothing
+/// to say. It is what lets a caller distinguish a tree that carries the lane's
+/// earlier work from one cut for this call: the two read identically on disk,
+/// and the difference only matters after a move, when the question is whether
+/// anything the previous replica wrote is in this tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeOrigin {
+    /// The lane's tree was already on this replica and healthy, so it carries
+    /// whatever earlier commands on this replica left in it.
+    Existing,
+    /// This replica cut the tree ahead of demand and handed it out now. It was
+    /// never run in before this call.
+    Warm,
+    /// This replica cut the tree for this call.
+    Created,
+    /// An executor that does not report where the tree came from.
+    #[default]
+    Unknown,
+}
+
 /// One chunk of streaming command output. Also serves as the wire format
 /// between executor server and client (NDJSON, one event per line).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +123,16 @@ pub enum CommandEvent {
     /// reply already knew.
     Workdir {
         path: String,
+        /// How this tree came to exist on the replica the command landed on.
+        ///
+        /// Only the executor knows this, and it is what separates "this tree
+        /// has the lane's earlier work" from "this tree was cut for this
+        /// call". A caller that can only guess ends up unable to say whether
+        /// unpushed work survived a move between replicas; with this it can.
+        /// An executor that predates the field sends nothing, hence the
+        /// default -- less said, never a claim guessed.
+        #[serde(default)]
+        origin: WorktreeOrigin,
     },
     Stdout {
         data: String,

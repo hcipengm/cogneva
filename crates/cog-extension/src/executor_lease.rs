@@ -32,8 +32,9 @@ use std::collections::HashMap;
 ///
 /// A pin costs nothing to keep and a lot to lose: the next command on a moved
 /// lane sees a tree without the previous commands' edits. So this is long, and
-/// the cheap releases (the holder completing, a refused connection) carry the
-/// precision that would otherwise have to come from a short clock here.
+/// the precise events (the holder completing, a replica that stopped
+/// answering) carry the precision that would otherwise have to come from a
+/// short clock here.
 // cap: bound — 后台兜底：一个消失了、没说再见的调用方最多把一条 lane 占到这么久
 pub const LANE_LEASE_SECS: u64 = 600;
 
@@ -55,6 +56,11 @@ pub enum Grant {
 struct Hold {
     replica: String,
     until: u64,
+    /// The replica stopped answering and the caller said so. The lane is not
+    /// held any more -- the next command must be free to go somewhere that
+    /// answers -- but the address is remembered so that command says which
+    /// tree it left behind instead of arriving as if this were a new lane.
+    abandoned: bool,
 }
 
 /// The lanes this caller is driving and the replica each one sits on.
@@ -87,6 +93,33 @@ impl LeaseBook {
         let existing = self.live.get(lane).cloned();
         let holds = existing.as_ref().is_some_and(|hold| hold.until > now);
         let (replica, grant) = match existing {
+            // The replica stopped answering: the lane moves somewhere else, and
+            // the move is what the command has to hear about even though no
+            // clock ran out. The rotation must skip the replica that stopped
+            // answering -- landing back on it fails the command again, and the
+            // move reads the same at both ends, so it also loses the line that
+            // says what was left behind. With nowhere else to go (one replica
+            // known), the lane stays where it was: there is no move to report,
+            // and the command's failure says the replica is unreachable.
+            Some(hold) if hold.abandoned => {
+                let elsewhere: Vec<String> = replicas
+                    .iter()
+                    .filter(|replica| **replica != hold.replica)
+                    .cloned()
+                    .collect();
+                let destination = if elsewhere.is_empty() {
+                    replicas
+                } else {
+                    &elsewhere
+                };
+                (
+                    self.take_turn(destination)?,
+                    Grant::Moved {
+                        from: hold.replica,
+                        lapsed_secs: 0,
+                    },
+                )
+            }
             // Still live and the replica is still there: extend in place.
             Some(hold) if holds && replicas.contains(&hold.replica) => {
                 (hold.replica, Grant::Extended)
@@ -115,6 +148,7 @@ impl LeaseBook {
             Hold {
                 replica: replica.clone(),
                 until,
+                abandoned: false,
             },
         );
         Some(Pinned { replica, grant })
@@ -141,9 +175,28 @@ impl LeaseBook {
         }
     }
 
+    /// Mark a lane's replica as gone. Only the replica holding it can; a wrong
+    /// replica's word would move a lane it never drove, and the next command on
+    /// that lane would land in a tree without this caller's edits.
+    ///
+    /// This is not [`Self::release`]: releasing forgets where the lane was, and
+    /// the next command then arrives as [`Grant::Fresh`] -- silently, in
+    /// whatever tree the rotation picks. A lane whose replica died still had a
+    /// tree there, and the command that lands elsewhere must say so.
+    pub fn abandon(&mut self, lane: &str, replica: &str) -> bool {
+        match self.live.get_mut(lane) {
+            Some(hold) if hold.replica == replica => {
+                hold.abandoned = true;
+                hold.until = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// How many lanes are pinned right now (live or lapsed-but-unused).
     pub fn pinned_lanes(&self) -> usize {
-        self.live.len()
+        self.live.values().filter(|hold| !hold.abandoned).count()
     }
 
     fn take_turn(&mut self, replicas: &[String]) -> Option<String> {
@@ -258,6 +311,94 @@ mod tests {
         let again = book.pin("agent-b", &after, 1_005, TTL).unwrap();
         assert_eq!(again.replica, pinned.replica);
         assert_eq!(again.grant, Grant::Extended);
+    }
+
+    /// 一副副本不再应答时，那条 lane 不是「从没钉过」：它在那副卷上有一棵树。
+    /// 下一条命令要去一副会应答的副本，并且必须说出它离开了哪一副——这正是
+    /// 放掉钉子做不到的事（放掉之后下一条读成 Fresh，落进一棵没人说过的树）。
+    #[test]
+    fn a_lane_whose_replica_stopped_answering_moves_and_says_where_it_left() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let first = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        assert!(book.abandon("agent-a", &first.replica));
+        assert_eq!(
+            book.holder("agent-a", 1_000),
+            None,
+            "不再应答的副本不是持有人"
+        );
+        assert_eq!(book.pinned_lanes(), 0, "被弃的钉子不算还钉着的 lane");
+        let next = book.pin("agent-a", &replicas, 1_001, TTL).unwrap();
+        assert_eq!(
+            next.grant,
+            Grant::Moved {
+                from: first.replica.clone(),
+                lapsed_secs: 0
+            },
+            "弃掉的钉子要读成搬家，不是一条新 lane"
+        );
+        assert_ne!(next.replica, first.replica, "不能回到不再应答的那副");
+    }
+
+    /// 排除必须是真的排除，不是「这一圈刚好转不到它」：别的 lane 的钉会把
+    /// 轮转的指针推走，回到那副不应答的副本上时，命令再白失败一次，而且
+    /// 搬家那句因为两端相同被压掉——既没跑成也没说清。
+    #[test]
+    fn an_abandoned_lane_does_not_go_back_to_the_replica_that_stopped_answering() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let first = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        assert_eq!(first.replica, replicas[0]);
+        assert!(book.abandon("agent-a", &first.replica));
+
+        // 另一条 lane 的钉把轮转指针推到「下一次正好回到 replicas[0]」。
+        let other = book.pin("agent-b", &replicas, 1_001, TTL).unwrap();
+        assert_eq!(other.replica, replicas[1]);
+
+        let next = book.pin("agent-a", &replicas, 1_002, TTL).unwrap();
+        assert_ne!(next.replica, first.replica, "又落回不应答的那副副本");
+        assert_eq!(
+            next.grant,
+            Grant::Moved {
+                from: first.replica,
+                lapsed_secs: 0
+            }
+        );
+    }
+
+    /// 只有一副副本时没有别处可去：留在原地，不报「搬家」，那副副本自己的
+    /// 不可达错误就是这条命令的答案。
+    #[test]
+    fn an_abandoned_lane_stays_when_there_is_nowhere_else_to_go() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let first = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        book.abandon("agent-a", &first.replica);
+        let same = book
+            .pin("agent-a", &replicas[..1], 1_001, TTL)
+            .expect("还有一副副本可去，即使它刚失联");
+        assert_eq!(same.replica, first.replica);
+    }
+
+    #[test]
+    fn only_the_holding_replica_can_abandon_a_lane() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let pinned = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        let other = replicas
+            .iter()
+            .find(|one| **one != pinned.replica)
+            .expect("another replica exists");
+        assert!(!book.abandon("agent-a", other));
+        assert_eq!(
+            book.holder("agent-a", 1_000),
+            Some(pinned.replica.as_str()),
+            "别人说一句「它不应答了」不该把这条 lane 挪走"
+        );
+        assert_eq!(
+            book.pin("agent-a", &replicas, 1_001, TTL).unwrap().grant,
+            Grant::Extended
+        );
     }
 
     #[test]

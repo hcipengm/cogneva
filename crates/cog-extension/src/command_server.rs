@@ -741,9 +741,17 @@ async fn resolve_workdir(
     state: &AppState,
     task_id: Option<&str>,
     agent_id: Option<&str>,
-) -> Result<(Option<PathBuf>, Option<PathBuf>, Option<CommandHold>), Box<Response>> {
+) -> Result<
+    (
+        Option<PathBuf>,
+        Option<PathBuf>,
+        Option<CommandHold>,
+        cog_core::WorktreeOrigin,
+    ),
+    Box<Response>,
+> {
     let Some(router) = state.workdir.as_ref() else {
-        return Ok((None, None, None));
+        return Ok((None, None, None, cog_core::WorktreeOrigin::Unknown));
     };
     let from_employee = agent_id.and_then(workdir::worktree_for_agent);
     let lane = from_employee.or_else(|| {
@@ -758,10 +766,11 @@ async fn resolve_workdir(
         // a reclamation pass that only knows `last_used_unix` cannot tell the
         // difference on its own.
         Some(lane) => match router.route(&lane).await {
-            Ok((dir, claim)) => Ok((
+            Ok((dir, claim, origin)) => Ok((
                 Some(dir),
                 Some(router.target_dir().to_path_buf()),
                 Some(router.command_hold(Some(claim)).await),
+                origin,
             )),
             Err(e) => {
                 router.metrics().inc_error("route");
@@ -786,6 +795,7 @@ async fn resolve_workdir(
                 None,
                 Some(router.target_dir().to_path_buf()),
                 Some(router.command_hold(None).await),
+                cog_core::WorktreeOrigin::Unknown,
             ))
         }
     }
@@ -819,7 +829,7 @@ async fn execute_handler(
     // began after it would have reported that call as fast.
     let watch = CommandWatch::start(Arc::clone(&state.commands), tool_label(&req.payload));
     let progress_id = command_progress_id(req.task_id.as_deref());
-    let (workdir, cargo_target, worktree_claim) =
+    let (workdir, cargo_target, worktree_claim, origin) =
         match resolve_workdir(&state, req.task_id.as_deref(), req.agent_id.as_deref()).await {
             Ok(resolved) => resolved,
             Err(resp) => return watch.end(*resp, Outcome::Refused),
@@ -830,6 +840,7 @@ async fn execute_handler(
     // would read as "somewhere real".
     let announce = workdir.as_ref().map(|dir| CommandEvent::Workdir {
         path: dir.display().to_string(),
+        origin,
     });
     match req.payload {
         SandboxPayload::Command { ref command } => {
@@ -3043,7 +3054,7 @@ mod tests {
         let lane = cog_core::worktree_lane("kai-a9ab11fc");
         let expected = tmp.path().join("workspaces").join(&lane);
         match events.first() {
-            Some(CommandEvent::Workdir { path }) => assert_eq!(
+            Some(CommandEvent::Workdir { path, .. }) => assert_eq!(
                 std::path::Path::new(path),
                 expected.as_path(),
                 "执行器报的目录不是这条车道的那棵树"

@@ -898,7 +898,7 @@ impl ToolRegistry {
                 let mut workdir = None;
                 while let Some(event) = stream.next().await {
                     match event {
-                        CommandEvent::Workdir { path } => workdir = Some(path),
+                        CommandEvent::Workdir { path, .. } => workdir = Some(path),
                         CommandEvent::Stdout { data } => {
                             stdout.push_str(&data);
                             if let Some(sink) = updates {
@@ -2176,6 +2176,7 @@ mod tests {
 
         tx.send(CommandEvent::Workdir {
             path: "/srv/workspaces/employee-kai-a9ab11fc".into(),
+            origin: cog_core::WorktreeOrigin::Created,
         })
         .unwrap();
         tx.send(CommandEvent::Stdout {
@@ -2603,6 +2604,7 @@ mod tests {
         // 命令还在跑，已经写出来的那一截读得到。
         tx.send(CommandEvent::Workdir {
             path: "/srv/worktrees/employee-kai-a9ab11fc".into(),
+            origin: cog_core::WorktreeOrigin::Created,
         })
         .unwrap();
         tx.send(CommandEvent::Stdout {

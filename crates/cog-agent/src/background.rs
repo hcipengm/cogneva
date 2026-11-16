@@ -119,7 +119,7 @@ impl Command {
                 self.stderr.lock().unwrap().push_str(&data);
                 None
             }
-            CommandEvent::Workdir { path } => {
+            CommandEvent::Workdir { path, .. } => {
                 *self.workdir.lock().unwrap() = Some(path);
                 None
             }
