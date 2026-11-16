@@ -146,9 +146,14 @@ async fn unreferenced_rows_go_oldest_first() {
     assert_eq!(outcome.held, 2);
     assert!(!outcome.held_above, "the capacity was reachable");
     // Four of the six go, oldest first: what survives is the two youngest.
+    //
+    // The helper inserts `now - age`, so `old-4` is the oldest of the five and
+    // `old-0` is the youngest; the survivors are therefore `old-0` and the row
+    // written half an hour ago. The earlier expectation named `old-4`, which is
+    // the row this sweep is supposed to delete first.
     assert_eq!(
         scratch.ids(&pool).await,
-        vec!["old-4".to_string(), "recent".to_string()],
+        vec!["old-0".to_string(), "recent".to_string()],
         "the oldest go first, and nothing but a board pointer is exempt"
     );
 
