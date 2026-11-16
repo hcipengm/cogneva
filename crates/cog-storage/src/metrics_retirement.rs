@@ -148,7 +148,7 @@ pub const ROSTERED_LABEL_SERIES: &[&str] = &[
 /// 一遍就是第二个写者——改名只落到一处时，读旧拼写的那一侧照旧去找一个再也不会
 /// 出现的东西，而「没找到」与「本来就没有」在读数上同形。
 pub use cog_core::metric_names::LLM_UPSTREAM_POSITION as ROSTER_SERIES;
-pub const ROSTER_LABEL: &str = "upstream";
+pub const ROSTER_LABEL: &str = cog_core::observability_text::UPSTREAM_LABEL;
 
 /// 名册的一行要有多新，才算「写者这一拍确实在说话」。
 ///

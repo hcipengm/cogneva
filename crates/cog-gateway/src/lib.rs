@@ -1957,7 +1957,7 @@ pub const LABEL_SERVICE: &str = "service";
 pub const LABEL_KIND: &str = "kind";
 
 /// 读数按「哪个上游」归属时用的标签键。
-pub const LABEL_UPSTREAM: &str = "upstream";
+pub const LABEL_UPSTREAM: &str = cog_core::observability_text::UPSTREAM_LABEL;
 
 /// 读数按「哪个出口」归属时用的标签键。
 pub const LABEL_OUTLET: &str = "outlet";

@@ -18,10 +18,10 @@ use cog_core::HttpClient;
 
 /// 读环境、建连接、重建、印一行。
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let database = std::env::var("COGNEVA_DATABASE_URL").map_err(|_| {
+    let database = std::env::var(cog_core::env::DATABASE_URL).map_err(|_| {
         "COGNEVA_DATABASE_URL 没有设置：不知道要重建哪个库，这一跑没有去处".to_string()
     })?;
-    let prometheus = std::env::var("COGNEVA_PROMETHEUS_URL").map_err(|_| {
+    let prometheus = std::env::var(cog_core::env::PROMETHEUS_URL).map_err(|_| {
         "COGNEVA_PROMETHEUS_URL 没有设置：这三张表的真源是 Prometheus，没有它就没有答案可写"
             .to_string()
     })?;

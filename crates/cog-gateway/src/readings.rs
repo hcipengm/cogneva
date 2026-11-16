@@ -1448,7 +1448,7 @@ pub fn parse_scalar(body: &serde_json::Value) -> Option<f64> {
 /// reading", so a guess that moved with the release reads exactly like a quiet
 /// week.
 pub fn prometheus_base() -> Result<String, String> {
-    let declared = std::env::var("COGNEVA_PROMETHEUS_URL").ok();
+    let declared = std::env::var(cog_core::env::PROMETHEUS_URL).ok();
     prometheus_base_from(declared.as_deref())
 }
 

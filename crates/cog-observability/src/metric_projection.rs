@@ -82,7 +82,9 @@ pub fn rows_from_vector(name: &str, family: Family, samples: &[SeriesSample]) ->
             }
             ProjectedRow {
                 name: name.to_string(),
-                upstream: labels.get("upstream").cloned(),
+                upstream: labels
+                    .get(cog_core::observability_text::UPSTREAM_LABEL)
+                    .cloned(),
                 labels: serde_json::to_string(&labels).unwrap_or_else(|_| "{}".to_string()),
                 bucket,
                 value: sample.value,
@@ -270,7 +272,7 @@ mod tests {
     #[test]
     fn a_rebuilt_row_carries_the_canonical_label_spelling() {
         let rows = rows_from_vector(
-            "cogneva_ready_admission_held_total",
+            cog_core::metric_names::READY_ADMISSION_HELD_TOTAL.as_str(),
             Family::Counter,
             &[sample(
                 &[("__name__", "x"), ("stream", "local"), ("reason", "pool")],
@@ -288,9 +290,12 @@ mod tests {
     #[test]
     fn a_rebuilt_row_keeps_the_upstream_column() {
         let rows = rows_from_vector(
-            "cogneva_gateway_tokens_total",
+            cog_core::metric_names::READY_ADMISSION_HELD_TOTAL.as_str(),
             Family::Counter,
-            &[sample(&[("upstream", "a.example")], 1.0)],
+            &[sample(
+                &[(cog_core::observability_text::UPSTREAM_LABEL, "a.example")],
+                1.0,
+            )],
         );
         assert_eq!(rows[0].upstream.as_deref(), Some("a.example"));
     }
