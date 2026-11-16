@@ -43,7 +43,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
-command -v node >/dev/null || { echo "缺少依赖：node" >&2; exit 2; }
+# node 只给第 4 段用（把 `frameTick.ts` 编出来实跑调度）。它的检查放在文本那半之后：
+# 这半段的判据全是读文本，一台没有 node 的机器今天仍然判得出「哪个面没接帧」，而
+# 放在最前面时，一条依赖缺失会把**所有**文本判词换成同一句「缺少依赖」，夹具判据
+# 也就跟着看不到自己的判词了。
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -195,26 +198,89 @@ for path in ("views/ProjectsView.tsx", "hooks/useStreamDrivenRefresh.ts"):
             "往后推，连续的信号会让它永远到不了点——忙的时候这一面比轮询还旧"
         )
 
-# 每一个读 REST 的面都要订帧。这一条是这张门禁的全部意义：不是六个面做到了，
-# 是**所有**面都做到。按「有值导入 api/client」认面——只导类型的那几个面不直接读
-# 服务端，它们读的是 shell 里那几份共用读数，接线在那几个 hook 里。
+# 每一个读 REST 的面都要动在帧上，而不是动在自己那个定时器上。这一条是这张门禁
+# 的全部意义：不是六个面做到了，是**所有**面都做到。按「有值导入 api/client」认面
+# ——只导类型的那几个面不直接读服务端，它们读的是 shell 里那几份共用读数，接线在
+# 那几个 hook 里。
+#
+# 一类面不在此列，判据不是名字而是它的读法：**每一次读都由人触发、时限为 0**。
+# 那种面没有会变旧的东西——屏幕上是上一次查询的答案，只要人不问，它就还是那个
+# 问题在那个时刻的答案；替它订阅反而会在人眼前换掉正文（搜索结果、打开的文档）。
+# 一个面只要还有一份带时限的读，它就又有了「帧到了却不重读」的那块，必须订。
 SUBSCRIBE = re.compile(r"useKindTickedRefresh\(|useStreamDrivenRefresh\(|useFrameDrivenRefresh\(")
+
+def call_args(src, call):
+    """`call(` 之后那些顶层实参，按括号深度切；字符串里的括号不算。"""
+    start = call.end()
+    depth = 1
+    quote = None
+    escape = False
+    args, current = [], []
+    for ch in src[start:]:
+        if quote is not None:
+            current.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in "'\"`":
+            quote = ch
+            current.append(ch)
+        elif ch in "([{":
+            depth += 1
+            current.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(current))
+                return args
+            current.append(ch)
+        elif ch == "," and depth == 1:
+            args.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    return None
+
+def timed_reads(src):
+    """这个面里带时限的读有几份（`useResource` 的第三个实参不是字面量 0）。"""
+    timed = 0
+    for m in re.finditer(r"useResource\(", src):
+        args = call_args(src, m)
+        if args is None:
+            timed += 1
+            continue
+        args = [a.strip() for a in args if a.strip()]
+        if len(args) < 3 or args[2] != "0":
+            timed += 1
+    return timed
+
 faces = sorted(glob.glob(os.path.join(WEB, "views", "*.tsx")))
 if not faces:
     sys.exit("找不到 web/src/views/*.tsx：这一条判据数不出面来")
 unwired = []
+on_demand = []
 for face in faces:
     src = open(face, encoding="utf-8").read()
     m = re.search(r"import\s+(type\s+)?\{[^}]*\}\s*from\s*'@/api/client'", src, re.S)
     if not m or m.group(1):
         continue
-    if not SUBSCRIBE.search(src):
-        unwired.append(os.path.basename(face))
+    if SUBSCRIBE.search(src):
+        continue
+    if timed_reads(src) == 0:
+        on_demand.append(os.path.basename(face))
+        continue
+    unwired.append(os.path.basename(face))
 if unwired:
     sys.exit(
         "这几面读了服务端的快照却没订任何帧：" + "、".join(unwired)
         + "。它们什么时候动取决于自己那个定时器——把间隔调成十分钟，帧到了也不动"
     )
+if on_demand:
+    print("ok   - 只由人触发的面（每一次读时限为 0，不会在人背后变旧）：" + "、".join(on_demand))
 
 # 服务端那一半：REST 侧一次成功的写要在总线上落一帧，否则前端订什么都等不到。
 CORE = os.path.join(ROOT, "crates/cog-core/src/types/event.rs")
@@ -237,6 +303,9 @@ if "publish_resource_frame" not in router:
 
 print("ok   - 调度是纯的、总线按面报到、每一个读服务端的面都订了帧、服务端也真的在发这帧")
 PYEOF
+
+# 第 4 段要 node 与它编出来的那份调度：文本判词已经落地，这一段缺工具链就说缺。
+command -v node >/dev/null || { echo "缺少依赖：node" >&2; exit 2; }
 
 TSC="$ROOT/web/node_modules/.bin/tsc"
 [ -x "$TSC" ] || {

@@ -97,6 +97,14 @@ export function SideBar() {
 }
 
 const TITLES: Record<ActivityId, string> = {
+  search: '搜索',
+  hooks: '钩子',
+  plugins: '插件',
+  workspaces: '工作区',
+  'action-plan': '动作计划',
+  datasets: '数据集',
+  snapshots: '快照',
+  wiki: '知识',
   workspace: '工作台',
   people: '员工',
   venues: '场地',

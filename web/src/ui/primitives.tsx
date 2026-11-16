@@ -250,7 +250,10 @@ export function Table<T>({
 }: {
   columns: Column<T>[];
   rows: T[];
-  rowKey: (row: T) => string;
+  // 行身份由调用方命名；位置也交出去，因为有一类面列的是「接口原样答的什么」，
+  // 它不知道这些记录的身份，也不该编一个。这样的面按位置定身份，
+  // 由调用方明写成 `(_, index) => String(index)`，而不是让表格在背后默默这么做。
+  rowKey: (row: T, index: number) => string;
 }) {
   return (
     <table className="grid-table">
@@ -264,8 +267,8 @@ export function Table<T>({
         </tr>
       </thead>
       <tbody>
-        {rows.map((row) => (
-          <tr key={rowKey(row)}>
+        {rows.map((row, index) => (
+          <tr key={rowKey(row, index)}>
             {columns.map((c) => (
               <td key={c.key}>{c.render(row)}</td>
             ))}

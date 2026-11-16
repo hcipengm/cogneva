@@ -55,6 +55,50 @@ grep -qF "account.refresh, overview.refresh]" "${work}/web/src/views/TokenView.t
   && fail "改动没落到 TokenView.tsx：overview.refresh 还挂在订阅上"
 expect_red "额度窗不跟帧" "没把池子的那份读数跟花销几读一起交给"
 
+# 2. 带时限的读等于「帧到了也不动」的那一块：一个只由 30 秒定时器驱动的面，
+#    不许因为「没有订阅钩子」而混进「只由人触发」那一类。
+fixture
+cat > "${work}/web/src/views/ProbeView.tsx" <<'TSX'
+import { getJson } from '@/api/client';
+import { useResource } from '@/hooks/useResource';
+
+export function ProbeView() {
+  const page = useResource('探针', () => getJson('/api/v1/probe'), 30_000);
+  return <pre>{JSON.stringify(page.data)}</pre>;
+}
+TSX
+expect_red "带时限的读却没人订帧" "没订任何帧：ProbeView.tsx"
+
+# 3. 「只由人触发」是判出来的，不是一张名字表：把搜索面那份读的时限从 0 改成 30 秒，
+#    它立刻变成「帧到了也不动」的面，必须红。
+fixture
+python3 - "${work}/web/src/views/SearchView.tsx" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+before = "        : null,\n    0,\n  );"
+after = "        : null,\n    30_000,\n  );"
+if before not in src:
+    sys.exit("fixture: SearchView.tsx 里找不到那份时限为 0 的读")
+open(path, "w", encoding="utf-8").write(src.replace(before, after))
+PY
+expect_red "只由人触发的面被加上了定时器" "没订任何帧：SearchView.tsx"
+
+# 4. 接好的三面里少一行订阅，那一条就得红：面名由路径算出来的那几处也一样。
+fixture
+python3 - "${work}/web/src/views/WikiView.tsx" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+before = "  useKindTickedRefresh([resourceKey('wiki')], page.refresh);\n"
+if before not in src:
+    sys.exit("fixture: WikiView.tsx 里找不到订阅知识那一族的那一行")
+open(path, "w", encoding="utf-8").write(src.replace(before, ""))
+PY
+expect_red "知识面又退回定时器" "没订任何帧：WikiView.tsx"
+
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 #
 # 这道门要 `web/node_modules/.bin/tsc`（它把 `frameTick` 编译出来在 node 里实跑），

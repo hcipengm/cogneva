@@ -26,7 +26,7 @@ export function SearchView() {
   );
 
   return (
-    <ViewFrame title="搜索" what="知识库检索与平台检索，两条接口的入口">
+    <ViewFrame title="搜索" meta="知识库检索与平台检索，两条接口的入口">
       <div className="flex items-center gap-2 px-1 py-2">
         <input
           className="rounded border px-2 py-1 text-[12px]"

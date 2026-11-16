@@ -1,5 +1,6 @@
 import { listSnapshots } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { Empty, Loading, ReadError, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -12,11 +13,14 @@ import { Empty, Loading, ReadError, Table, ViewFrame } from '@/ui/primitives';
  */
 export function SnapshotsView() {
   const page = useResource('快照', () => listSnapshots({ limit: 100 }), 30_000);
+  // 快照不是谁写出来的，是任务跑到某一步留下的点：读它该订任务那一族帧，而不是
+  // 等 30 秒一拍。任务在跑的时候，新落点跟着任务帧一起到。
+  useKindTickedRefresh(['tasks'], page.refresh);
   if (page.error) return <ReadError what="快照" error={page.error} onRetry={page.refresh} />;
   if (!page.data) return <Loading what="快照" />;
   const rows = page.data.snapshots ?? [];
   return (
-    <ViewFrame title="快照" what="任务在事件流上的检查点；回到某一步从这里取">
+    <ViewFrame title="快照" meta="任务在事件流上的检查点；回到某一步从这里取">
       {rows.length === 0 ? (
         <Empty>没有任何快照。这一面只读检查点表——没有行说明没有任务留下过可回的点。</Empty>
       ) : (
@@ -28,6 +32,7 @@ export function SnapshotsView() {
             { key: 'at', title: '时间', width: '190px', render: (r) => r.timestamp },
           ]}
           rows={rows}
+          rowKey={(r) => r.snapshot_id}
         />
       )}
     </ViewFrame>

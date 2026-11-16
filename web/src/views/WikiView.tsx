@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { getWikiDocument, listWikiDocuments } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, ReadError, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -13,6 +15,9 @@ import { Empty, Loading, ReadError, Table, ViewFrame } from '@/ui/primitives';
  */
 export function WikiView() {
   const page = useResource('知识文档', () => listWikiDocuments({ limit: 100 }), 60_000);
+  // 文档由 `/api/v1/wiki` 下的写进来（草拟、收录），一次成功写就报一次这个前缀。
+  // 正文那一份读是由点击触发的（时限 0），不会在读者背后变，不必订帧。
+  useKindTickedRefresh([resourceKey('wiki')], page.refresh);
   const [open, setOpen] = useState<string | null>(null);
   const r0 = (id: string) => id;
   const doc = useResource(
@@ -26,7 +31,7 @@ export function WikiView() {
   const rows = page.data.documents ?? [];
 
   return (
-    <ViewFrame title="知识" what="库里的文档与正文；草拟与检索走同一份存储">
+    <ViewFrame title="知识" meta="库里的文档与正文；草拟与检索走同一份存储">
       {rows.length === 0 ? (
         <Empty>
           知识库里没有任何文档。这不是「没有知识」——这一面只读索引，草拟的那一侧还没写过，
@@ -53,6 +58,7 @@ export function WikiView() {
             },
           ]}
           rows={rows}
+          rowKey={(r) => r.id}
         />
       )}
       {open !== null && (
