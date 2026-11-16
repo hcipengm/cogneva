@@ -39,13 +39,15 @@ CREATE TABLE IF NOT EXISTS cogneva_event (
     payload_version INTEGER     NOT NULL DEFAULT 1,
     -- 该 kind 自己的字段（第 9.1~9.4 节逐列映射的那些），存 text。
     attributes      TEXT        NOT NULL DEFAULT '{}',
-    PRIMARY KEY (at, event_id)
+    PRIMARY KEY (event_id)
 );
 
--- 同一件事的事件按时间读：续跑、因果链、UI 按主体订阅。
-CREATE INDEX IF NOT EXISTS idx_cogneva_event_unit ON cogneva_event(unit_of_work, at, event_id);
-CREATE INDEX IF NOT EXISTS idx_cogneva_event_subject ON cogneva_event(subject_kind, subject_id, at);
+-- 同一件事的事件按**顺序身份**读：续跑、因果链都按 `event_id` 走，不按 `at`。
+CREATE INDEX IF NOT EXISTS idx_cogneva_event_unit ON cogneva_event(unit_of_work, event_id);
+CREATE INDEX IF NOT EXISTS idx_cogneva_event_subject ON cogneva_event(subject_kind, subject_id, event_id);
 -- 每 kind 一个部分索引：读某一面时只碰自己那个。
-CREATE INDEX IF NOT EXISTS idx_cogneva_event_kind ON cogneva_event(kind, at);
+CREATE INDEX IF NOT EXISTS idx_cogneva_event_kind ON cogneva_event(kind, event_id);
+-- 时间只作可读与按窗口切分：单独一条索引，不参与排序。
+CREATE INDEX IF NOT EXISTS idx_cogneva_event_at ON cogneva_event(at);
 -- 幂等：同一写者的同一条事件只能有一条。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cogneva_event_idem ON cogneva_event(writer, idempotency_key);
