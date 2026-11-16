@@ -1680,6 +1680,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             // 那个进程有这套 kubectl 与 RBAC；别处起这条循环改不了对象。
             drop(crate::workload_resources::spawn_workload_resources_loop(
                 self.workload_resources.clone(),
+                ctx.consume_service::<dyn cog_core::HttpClient>(),
                 shutdown.clone(),
             ));
             drop(crate::volume_capacity::spawn_volume_capacity_loop(

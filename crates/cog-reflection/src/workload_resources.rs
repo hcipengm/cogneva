@@ -1792,12 +1792,17 @@ fn lane_address(pod: &Value) -> Option<String> {
 
 /// 问一副副本的队。读不到就是读不到：`None`，不拿一个空队顶替——空队会让这一副
 /// 副本看起来闲着，而它可能只是没答上话。
-async fn read_lane(http: &reqwest::Client, address: &str) -> Option<LaneQueue> {
-    let response = http.get(address).send().await.ok()?;
-    if !response.status().is_success() {
+///
+/// 走进程里发布的那一个出站客户端：超时、连接池、代理是进程的设置，这里只在请求
+/// 上把期限调短（`HttpRequest::timeout` 只能下调），因为读一副副本的队不该把一拍
+/// 拖到进程级期限那么久。
+async fn read_lane(http: &dyn cog_core::HttpClient, address: &str) -> Option<LaneQueue> {
+    let request = cog_core::HttpRequest::get(address).timeout(LANE_READ_TIMEOUT_SECS);
+    let response = http.execute(request).await.ok()?;
+    if !response.is_success() {
         return None;
     }
-    let reading = response.json::<cog_core::BuildLaneReading>().await.ok()?;
+    let reading: cog_core::BuildLaneReading = response.json().ok()?;
     Some(LaneQueue {
         lanes: reading.capacity,
         holding: reading.holding.len(),
@@ -1820,6 +1825,7 @@ pub async fn round(
     readings: &WorkloadResourcesReadings,
     ns: &str,
     now: u64,
+    lane_http: Option<&dyn cog_core::HttpClient>,
 ) -> Result<RoundSummary, String> {
     let workload_list: Value = serde_json::from_str(
         &kubectl(&[
@@ -1946,11 +1952,6 @@ pub async fn round(
             lane_addresses.entry(workload).or_default().push(address);
         }
     }
-    let lane_http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(LANE_READ_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("a lane reading client could not be built: {e}"))?;
-
     let mut evaluated = 0usize;
     let mut patched = 0usize;
     // 这一拍给每个声明了资源的容器算出的请求。默认层问的是同一份测量的
@@ -1986,9 +1987,11 @@ pub async fn round(
             Some(ReplicaPolicy::Queue) => {
                 readings.note_replicas_evaluated(&workload.name);
                 let mut queues = Vec::new();
-                for address in lane_addresses.get(&workload.name).into_iter().flatten() {
-                    if let Some(queue) = read_lane(&lane_http, address).await {
-                        queues.push(queue);
+                if let Some(http) = lane_http {
+                    for address in lane_addresses.get(&workload.name).into_iter().flatten() {
+                        if let Some(queue) = read_lane(http, address).await {
+                            queues.push(queue);
+                        }
                     }
                 }
                 // 现值是这一拍对象上的数；它是「上一拍写下的目标」，不是种子。
@@ -2250,8 +2253,13 @@ pub async fn round(
 /// 只在跑构建那个进程上起（与卷容量回路同一条角色前提）：它既是进程里唯一
 /// 有 `kubectl` 与这套 RBAC 的那一个，也是唯一一个 patch 自己 Deployment
 /// 不会把另一个人踢下去的进程。
+///
+/// `lane_http` 是装配层发布的那一个出站客户端：本回路要问每副执行器副本
+/// 自己的 `/lane`，而「出站客户端只由一条路造」这条约束对它是同一句话。
+/// 装配层没发布时队列那条法拿不到读数，回路其余部分照跑。
 pub fn spawn_workload_resources_loop(
     readings: std::sync::Arc<WorkloadResourcesReadings>,
+    lane_http: Option<std::sync::Arc<dyn cog_core::HttpClient>>,
     shutdown: ShutdownSignal,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval = std::env::var(INTERVAL_ENV)
@@ -2267,6 +2275,7 @@ pub fn spawn_workload_resources_loop(
         move |beat| {
             let shutdown = shutdown.clone();
             let readings = readings.clone();
+            let lane_http = lane_http.clone();
             let path = path.clone();
             async move {
                 let mut window = Window::load(&path);
@@ -2279,7 +2288,7 @@ pub fn spawn_workload_resources_loop(
                     }
                     let ns = namespace();
                     let now = now_unix();
-                    match round(&mut window, &readings, &ns, now).await {
+                    match round(&mut window, &readings, &ns, now, lane_http.as_deref()).await {
                         Ok(summary) => info!(
                             evaluated = summary.evaluated,
                             patched = summary.patched,
