@@ -1334,3 +1334,78 @@ fn below_the_module() -> Duration {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// 界形的常量不许标成 `fixed`。
+///
+/// 常量的词表只有两个词：`bound`（被某个事实钉住，理由说明是什么钉的）与
+/// `fixed`（不是旋钮，是一项约定，比如协议端口）。而一个名字就是界形的常量
+/// ——`MAX_*`、`MIN_*`、`*_LIMIT`、`*_RETRY`、`*_TIMEOUT`、`*_CAP`——既不是协议常数，
+/// 也不是"量出来的"：它是一条把未发生的事拦在外面的规则。
+///
+/// 这种数的合法归宿与图里那张表一样：**被一条读数导出，或者不存在**。名单是
+/// 2026-11-16 的读数，**只减不增**：新提出一条界形常量标 `fixed` 就是红。
+const BOUND_SHAPED_FIXED_AT_CENSUS: &[&str] = &[
+    "MAX_RECOVERED_RETRY_AFTER_SECS",
+    "DEFAULT_MAX_CONTEXT_TOKENS",
+    "MAX_KEY_LEN",
+    "MAX_INBOUND_FRAME_BYTES",
+    "MAX_UTF8_BYTES_PER_CHAR",
+    "PUSH_RETRY_CEILING_SECONDS",
+    "PUSH_RETRY_SECONDS",
+    "PUSH_TIMEOUT_SECS",
+    "EXCHANGE_BODY_CAP",
+    "SUSPECT_BACKOFF_CAP_SECS",
+    "MAX_ATTACHMENT_BYTES",
+    "MAX_LENGTH",
+    "MIN_INTERVAL_SECS",
+    "MIN_REPLICAS",
+    "MAX_CHARS",
+];
+
+/// 名字里出现这些片段，就算界形。
+const BOUND_SHAPED_NAME_PARTS: &[&str] = &[
+    "MAX",
+    "MIN",
+    "CAP",
+    "LIMIT",
+    "RETRY",
+    "RETRIES",
+    "TIMEOUT",
+    "CEILING",
+    "THRESHOLD",
+];
+
+#[test]
+fn a_bound_shaped_constant_is_never_fixed() {
+    let root = repo_root();
+    let scanned = scan(&root, &production_sources(&root));
+    let flagged: Vec<String> = scanned
+        .iter()
+        .filter(|row| row.source == "fixed")
+        .filter(|row| {
+            BOUND_SHAPED_NAME_PARTS
+                .iter()
+                .any(|part| row.name.contains(part))
+        })
+        .map(|row| format!("{} {} = {}", row.file, row.name, row.value))
+        .collect();
+    let known: std::collections::BTreeSet<&str> =
+        BOUND_SHAPED_FIXED_AT_CENSUS.iter().copied().collect();
+    let new: Vec<&String> = flagged
+        .iter()
+        .filter(|line| {
+            let name = line.split_whitespace().nth(1).unwrap_or_default();
+            !known.contains(name)
+        })
+        .collect();
+    assert!(
+        new.is_empty(),
+        "这几条名字就是界形的常量却标着 `fixed`：\n{}\n\
+         界不是约定：它要么由一条读数导出（`bound` + 理由写明是什么钉的），\
+         要么删掉，改用进度检测与事实反馈。",
+        new.iter()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
