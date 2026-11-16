@@ -108,11 +108,10 @@ impl GeneratorActor {
             },
         );
 
-        // The stable half: the answer contract. The change-format contract is the
-        // heaviest part of it here (it spells out how the gate will judge the
-        // diff), and it is identical byte for byte across attempts and across
-        // tasks — yet flattened into the same map as `attempt` it never reached
-        // the cacheable prefix. See `actor_input`.
+        // The stable half: the answer contract. What it carries is the plug — the
+        // field the answer goes in, where the content comes from, which surfaces
+        // may be touched — not a rule book: the gate judges the rules and prints
+        // its own verdict, so restating them here would only say them twice.
         let mut contract = serde_json::json!({});
 
         // Inject self-evolution change-generation instructions when requested.
@@ -575,8 +574,16 @@ fn principles_block(input: &serde_json::Value) -> Option<serde_json::Value> {
     }))
 }
 
-// prompt: contract — enforced by crates/cog-collaboration/src/actors/generator.rs::the_change_contract_answers_every_refusal_cause
+// prompt: contract — enforced by crates/cog-collaboration/src/actors/generator.rs::the_contract_states_the_plug_and_leaves_the_judging_to_the_gate
 fn change_generation_contract() -> serde_json::Value {
+    // 只剩插头：答案放在哪个字段、内容从哪儿取、这次能在哪个面上动手。
+    //
+    // 规则一条都不写——不是压缩，是不写。门判完会把自己说的话原样交回去，两条通道都
+    // 在：同一轮内的重试走 `context.repair_feedback`（evaluator 把 `change_validation`
+    // 的正文照抄成 feedback），跨任务返工走返工目标的 `Evidence:`（`cog-reflection` 的
+    // `details` 就是门的原文），受保护的路径也由那条通道点名。我们再用中文说一遍「fmt
+    // 怎么跑、clippy 怎么跑、哪些路径不许碰」，是同一件事说两遍：第一遍机器说，永远是
+    // 准的；第二遍我们说，只在它过期之前是准的。
     serde_json::json!({
         "output_format": "unified_diff",
         "response_format": "json",
@@ -586,40 +593,12 @@ fn change_generation_contract() -> serde_json::Value {
                 {
                     "artifact_type": "change",
                     "name": "changes.diff",
-                    "content": "valid git unified diff starting with 'diff --git'"
+                    "content": "the unified diff git prints for your checkout"
                 }
             ]
         },
-        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content being the raw unified diff whose first line is 'diff --git a/<path> b/<path>'. Produce that content by making the edit in the checkout and then pasting what `git --no-pager diff` prints there, verbatim: the diff is read off the files, not reconstructed from memory. Retyping it by hand is accepted only when the checkout cannot be read at all, and a hand-written diff is the shape the apply gate rejects. The change is read back from the checkout's own diff, so put nothing in the checkout that is not part of the change. No markdown fences, no commentary inside content.",
-        "grounding": "Your diff is validated with `git apply --check` against a checkout of this repository, then applied to it and compiled. It must therefore describe the files as they actually are, not as you remember them. You have file tools in this run — use them before writing: list the directories you intend to touch, then read every file you change in full (read_file takes several paths in one call, up to eight, so read the files together rather than one call per file; or a shell command such as `sed -n '1,400p' <path>`). Then make the edit in the checkout itself (write_file, or a shell command) and take this artifact's content from `git --no-pager diff`, so the headers, the context lines and the hunk counts are the ones git derives from the files. Address files by repository-relative path (for example crates/cog-core/src/lib.rs) — the same path that appears in the '+++ b/' line — and those paths resolve against the checkout. Never guess a path: a path that is not in the checkout is rejected unless the diff itself declares it as created.",
-        "diff_grammar": "Every hunk header '@@ -<start>,<count> +<start>,<count> @@' must declare exactly the number of lines its body carries, and the diff must end with a newline. Every context line and every removed line has to match the file byte for byte, including indentation and trailing whitespace, and the start line numbers must be the real line numbers in the file you read. Keep hunks narrow and anchor them on context that is unique in the file: one hunk whose context cannot be located fails the entire change.",
-        "creating_a_file": "To add a file, declare it as a creation: 'diff --git a/<path> b/<path>', then 'new file mode 100644', '--- /dev/null', '+++ b/<path>', and a hunk header '@@ -0,0 +1,<n> @@' whose body is n '+' lines. Creating a file that already exists fails, and so does rewriting a file that does not exist without declaring it as a creation.",
-        "scope": format!("The surface this instance may contribute to is exactly {surfaces}, and that list is exhaustive rather than a preference. A path outside it is refused by the privacy gate at push time, after the whole round has been paid for: a file under scripts/, .github/, or a root document that is not README or CHANGELOG cannot be part of any change that lands here, however right the edit would be, so meet the goal from inside the surface instead of editing one of those. The WebUI is inside it, but only its source directory: web/src/**. A file under web/ but outside src — package.json, package-lock.json, the vite and tsc configs, index.html — is not, because adding a dependency is a supply-chain decision no diff review here makes; a build that needs one is a change to raise outside this loop. Inside it, a crate's integration tests are a first-class place for this work: a missing check is often repaired by writing the check, and cargo builds and the suite runs crates/<member>/tests/*.rs exactly as it does src. The gate rejects changes to build and deployment manifests (Cargo.toml, Cargo.lock, Dockerfile, Containerfile, docker-compose.yml, setup.sh), to configuration or credential files (cogneva.json, .env, .envrc, *.pem, *.key, *.crt, *.p12), and to anything inside a directory named `eval` — that directory holds the suite the change is measured against, so a change that edits it would be moving its own exam; deletions are judged by the same rules as edits. A diff far larger than the change it makes is refused as too large to review, so keep the change to the lines it needs. The applied change is compiled and tested (a WebUI change is type-checked and bundled instead), so it must be complete and self-consistent — no placeholder or unimplemented bodies.", surfaces = cog_core::CONTRIBUTABLE_SURFACES),
-        "plan_targets": "The plan you are handed may name the repository-relative paths the change must touch. Every path it names has to be a target of your diff: the change may touch more files than the plan lists, but a path the plan names and your diff never touches is refused. If the plan names a file that already exists, change that file — do not create a new one beside it and leave the named file alone.",
-        "formatting": "Before anything is compiled, the applied tree is checked the way CI checks it: `cargo fmt --all -- --check`. Your change has to be exactly what the workspace's formatter (plain rustfmt) produces — do not hand-format, and do not reflow or realign lines you did not need to touch, because the formatter's version of them is not the one that is in the file. A hunk whose result differs from the formatter's is refused (formatting_differs) no matter how good the code is.",
-        "lint": "The applied tree is then linted the way CI lints it: `cargo clippy --workspace --all-targets` with warnings denied (`-D warnings`). Test targets are part of that scope, so code you write under `tests/` or in a `#[cfg(test)]` module is judged by the same rules as code under `src/`. Only the lines your diff writes are judged — a clippy diagnostic whose span lands on a line you added refuses the change (lint_introduced). Lints the tree already carried are not counted against you, so do not fix unrelated warnings: copy neither them nor the style of the line they report on. Write the new line so clippy has nothing to say about it.",
-        "verification": "The applied change is compiled and the workspace test suite is run. A test that passed on the tree before your change and fails after it refuses the change (tests_failed). A suite that could not be run to a verdict at all (test_run_unavailable) is not your diff's fault and is not held against it, though it does cost the round. The suite is wider than the tests that sit beside the code you edit: this repository also carries contract tests that pin conventions a diff cannot state, and they are ordinary tests, so nothing in your diff announces that one of them judges it. Look for them before you write -- grep the test directories for every symbol you add or change (repo_contracts names the ones this path has already lost a round to) -- and satisfy what you find. That search is finished when every symbol your diff adds or changes has been looked up once: it is a lookup, not an exploration, and running it again with different arguments does not turn up anything the first pass did not, so a search that keeps going is a turn spent finding out nothing.",
-        "reproduction": "A change raised to fix an upstream CI failure owes a reproduction, and it is judged on a pair of readings from the same command rather than on one: with the change taken back off the tree that command has to fail, and with the change on the tree the same command has to pass. A green run on its own is refused (not_reproduced) — a change that turns the tree green without touching what was red is precisely the round an upstream CI pays for and does not get back. So before you write the diff, run the failing check in this checkout and note which test names it reports; after the diff, run that same command again over the changed tree. The command is the project's own suite at full scope (`cargo test --workspace --no-fail-fast` here), never narrowed to the crates you edited: the red may live in a crate your diff never touches, and a narrowed run is green for exactly that reason. If the red does not reproduce here at all, say so and change nothing — a change pushed against a red this machine cannot show is a guess, and it is refused before it costs an upstream round.",
-        "effect": "The change has to reach a running process. A configuration document is deserialized into the type that reads it, and the type's `impl Default for *Config` is only reached for a key the document leaves out — so a change whose every line is a literal in such an `impl`, for a key every shipped document already writes, is refused as no change at all (unreachable_default): the value it moves is one nothing reads. Change what the document carries, or the code that consumes the value, not a fallback no deployment falls back to.",
-        "repo_contracts": "Conventions this repository's own tests enforce, and the half a diff that ignores them forgets. The metric name set (cog_core::metric_names::ALL) is closed: a contract test walks it against the alert rules and the dashboard panels and fails for any name that is read by neither and is not registered in that test's census with its own written verdict. A diff that adds a metric name and stops there is therefore incomplete by construction -- it has added the publishing half without the reading half. Add both: the reader (a rule or a panel that consumes the series) or the census entry, and whatever count the test holds against its own census. Treat the same shape as general wherever this repository pins a closed set: the entry you add is judged together with the evidence that reads it.",
-        "refusal_causes": {
-            "malformed_diff": "diff_grammar",
-            "promotion_gate_refused": "scope",
-            "forbidden_path": "scope",
-            "intent_mismatch": "plan_targets",
-            "context_does_not_apply": "diff_grammar",
-            "apply_failed": "grounding",
-            "formatting_differs": "formatting",
-            "test_run_unavailable": "no_diff_can_avoid_it: the verification suite needs the host's build slot; when it cannot be had the change is refused without being judged, which no wording of a diff can change",
-            "tests_failed": "verification",
-            "not_reproduced": "reproduction",
-            "lint_introduced": "lint",
-            "lint_refused": "no_diff_can_avoid_it: the linter this deployment declares reports in a form the gate cannot compare against the lines a diff writes, so no diff can be shown not to have caused its findings; the deployment's declaration is what decides this, not the wording of a change",
-            "unreachable_default": "effect",
-            "web_admission_failed": "no_diff_can_avoid_it: a change that reaches web/src/** is admitted only when the judging deployment declares an executable frontend build (install, type check, bundle) in self_evolution.web_admission, and a deployment without one refuses the family rather than admitting a change nothing can build; what the diff contains cannot supply that declaration, though the build itself judges the diff on its own merits once it is declared",
-            "deploy_admission_failed": "no_diff_can_avoid_it: a change that reaches deploy/** is admitted only when the project declares executable admission conditions (render, parity, server-side dry-run) in its own configuration document, and that declaration is read from the tree the change lands on — no wording of a diff can supply it, and a family with no conditions is refused as the strictest tier rather than sent to a person; the declared commands themselves, and a rollback round-trip that must leave the tree byte-identical, decide whether the diff is admitted",
-            "project_kind_unusable": "no_diff_can_avoid_it: the landing recipe a project is dispatched under is declared by the project itself, in its own configuration document, and that document is read from the tree the change is applied to before the change is applied — so nothing a diff contains or writes can decide this, and a project whose declaration cannot be read is refused before its diff is looked at"
-        }
+        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content = what `git --no-pager diff` prints in your checkout, verbatim. Make the edit in the checkout and paste the diff; do not retype it from memory and do not wrap it in markdown fences.",
+        "surface": format!("Your checkout is {surfaces}.", surfaces = cog_core::CONTRIBUTABLE_SURFACES),
     })
 }
 
@@ -627,255 +606,84 @@ fn change_generation_contract() -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// Every rule here is one the gate enforces, so dropping any of them costs a
-    /// whole paid round for nothing. The prose is free to change; these claims
-    /// are not.
+    /// The stable contract carries the plug, not the rule book.
+    ///
+    /// What the model cannot infer belongs here: which artifact, where its content
+    /// comes from, which surfaces may be touched, which plan paths must be hit.
+    /// What it *can* infer — or read off the gate's own message when a round is
+    /// refused — does not: those nine sections were sent on every round,
+    /// including the ones nothing refused, and every sentence in them was a
+    /// verdict some gate prints for itself.
     #[test]
-    fn the_change_contract_states_the_rules_the_gate_judges() {
+    fn the_contract_states_the_plug_and_leaves_the_judging_to_the_gate() {
         let contract = change_generation_contract();
         let text = contract.to_string();
 
         for (claim, needle) in [
             (
-                "the diff is checked against a checkout",
-                "git apply --check",
+                "the answer is one change artifact named changes.diff",
+                "name='changes.diff'",
             ),
             (
-                "the model must read before writing",
-                "read every file you change in full",
-            ),
-            ("paths are repository-relative", "repository-relative path"),
-            ("a guessed path is rejected", "Never guess a path"),
-            (
-                "hunk counts must equal the body",
-                "number of lines its body carries",
-            ),
-            ("the diff must be terminated", "must end with a newline"),
-            (
-                "context must match byte for byte",
-                "match the file byte for byte",
-            ),
-            ("creating a file has its own shape", "--- /dev/null"),
-            (
-                "the creation shape names the mode line",
-                "new file mode 100644",
+                "its content is the checkout's own diff, not a retyped one",
+                "git --no-pager diff",
             ),
             (
-                "the creation shape names its hunk header",
-                "@@ -0,0 +1,<n> @@",
-            ),
-            (
-                "an existing file may not be recreated",
-                "Creating a file that already exists fails",
-            ),
-            (
-                "an absent file may not be rewritten silently",
-                "rewriting a file that does not exist without declaring it as a creation",
-            ),
-            (
-                "the protected-file set is named",
-                "configuration or credential files",
-            ),
-            (
-                "the build manifests are named",
-                "build and deployment manifests",
-            ),
-            (
-                "the deploy manifests are named",
-                "Dockerfile, Containerfile",
-            ),
-            ("the deploy manifests are named", "setup.sh"),
-            (
-                "the surface a change may be written in is named, so a change outside it is not attempted at all",
+                "the checkout a change is written in is named",
                 cog_core::CONTRIBUTABLE_SURFACES,
-            ),
-            (
-                "line numbers must be the file's real ones",
-                "must be the real line numbers in the file you read",
-            ),
-            (
-                "hunks must be narrow and uniquely anchored",
-                "narrow and anchor them on context that is unique in the file",
-            ),
-            (
-                "deletions are judged as edits are",
-                "deletions are judged by the same rules as edits",
-            ),
-            (
-                "the directories must be listed before reading",
-                "list the directories you intend to touch",
-            ),
-            (
-                "every path the plan names must be a target of the diff",
-                "has to be a target of your diff",
-            ),
-            (
-                "a named existing file is changed, not bypassed",
-                "do not create a new one beside it",
-            ),
-            (
-                "an oversized diff is refused before it is applied",
-                "too large to review",
-            ),
-            (
-                "formatting is judged by the formatter's own output",
-                "cargo fmt --all -- --check",
-            ),
-            (
-                "the formatting rule forbids reflowing untouched lines",
-                "do not reflow or realign lines you did not need to touch",
-            ),
-            (
-                "linting runs with warnings denied",
-                "cargo clippy --workspace --all-targets",
-            ),
-            (
-                "the lint rule is scoped to the lines the change writes",
-                "Only the lines your diff writes are judged",
-            ),
-            (
-                "tests that passed before the change are the criterion",
-                "passed on the tree before your change and fails after it",
-            ),
-            (
-                "the suite is wider than the tests beside the file",
-                "contract tests that pin conventions a diff cannot state",
-            ),
-            (
-                "the writer is told to look for those tests itself",
-                "grep the test directories for every symbol you add or change",
-            ),
-            (
-                "the search for those tests is told where it ends",
-                "That search is finished when every symbol your diff adds or changes has been looked up once",
-            ),
-            (
-                "the closed metric name set is named",
-                "The metric name set (cog_core::metric_names::ALL) is closed",
-            ),
-            (
-                "adding a metric is stated to need its reader",
-                "added the publishing half without the reading half",
-            ),
-            (
-                "the census ratchet is stated",
-                "whatever count the test holds against its own census",
             ),
         ] {
             assert!(
                 text.contains(needle),
-                "contract no longer says {claim}: {needle}"
+                "the contract no longer says {claim}: {needle}"
             );
         }
 
-        // The old wording told the model to only ever edit existing sources
-        // under src/, which is narrower than the gate: creations are allowed and
-        // so is anything else inside the checkout.
-        assert!(
-            !text.contains("include only source file modifications"),
-            "the contract is back to forbidding everything the gate allows"
-        );
-    }
-
-    /// The contract names every file the gate refuses, derived from the policy
-    /// rather than restated here.
-    ///
-    /// The test above pins the wording the model reads; this one pins the list
-    /// against the gate it is a promise about. They fail in different
-    /// directions and neither replaces the other: a name added to the policy
-    /// without a word in the contract is a change the generator is invited to
-    /// write and the gate then refuses — a round paid for nothing, and the
-    /// exact divergence that let a contract-legal change die at evaluation.
-    #[test]
-    fn the_change_contract_names_every_file_the_policy_refuses() {
-        let text = change_generation_contract().to_string();
-
-        // A needle that is a prefix of another entry (`.env` inside `.envrc`)
-        // must be followed by something other than a name character, or `.envrc`
-        // alone would satisfy the check for `.env` and hide the omission.
-        let names = |needle: &str| {
-            text.match_indices(needle).any(|(start, _)| {
-                match text[start + needle.len()..].chars().next() {
-                    Some(c) => !c.is_ascii_alphanumeric(),
-                    None => true,
-                }
-            })
-        };
-
-        for name in cog_core::PROTECTED_FILE_NAMES {
+        // The other direction, and the one that keeps the deletion from growing
+        // back: the checks the gate runs are named by the gate, not by the
+        // contract. A round that is never refused pays for none of them.
+        for (claim, needle) in [
+            ("the formatter's command", "cargo fmt --all"),
+            ("the linter's command", "cargo clippy --workspace"),
+            ("the apply check", "git apply --check"),
+            ("the suite's pre/post criterion", "passed on the tree before your change"),
+            ("the metric-name convention", "The metric name set"),
+            ("the reproduction pair", "not_reproduced"),
+        ] {
             assert!(
-                names(name),
-                "the contract never names protected file {name}"
+                !text.contains(needle),
+                "the contract is restating what a gate prints ({claim}: {needle}) — that \
+                 sentence costs every round and is already in the refusal it is about"
             );
         }
-        for ext in cog_core::PROTECTED_FILE_EXTENSIONS {
-            assert!(
-                names(ext),
-                "the contract never names protected extension .{ext}"
-            );
-        }
-        // The directory axis is the one a reader misses by pattern: the two
-        // lists above are read as file names, so an entry that is a directory
-        // looks like a name that happens to be short. It is checked here for
-        // the same reason as the others — a change the contract invites and the
-        // gate refuses costs a round and buys nothing.
-        for segment in cog_core::PROTECTED_DIR_SEGMENTS {
-            assert!(
-                names(segment),
-                "the contract never names protected directory {segment}/"
-            );
-        }
-    }
 
-    /// The marker a cause carries when no wording of a diff can avoid it.
-    ///
-    /// Such a cause still gets an entry and still gets words: an omission and
-    /// an unthought-about cause read the same from here, and the model is owed
-    /// the reason either way.
-    const NOT_WRITABLE: &str = "no_diff_can_avoid_it: ";
-
-    /// The contract answers the gate's whole axis, and the axis it is held to
-    /// is the gate's own — not a list restated here that could drift beside it.
-    ///
-    /// The two tests above pin the wording and the protected-file names; this
-    /// one pins coverage. Without it the expensive direction of the drift is
-    /// silent: a cause added to the gate leaves the generator writing diffs the
-    /// gate refuses, and nothing goes red until a round has already been paid
-    /// for — which is how a lint criterion added on 10-01 cost seven days of
-    /// landings before anyone could see it.
-    #[test]
-    fn the_change_contract_answers_every_refusal_cause() {
-        let contract = change_generation_contract();
-        let answers = contract["refusal_causes"]
-            .as_object()
-            .expect("the contract carries no refusal_causes map");
+        // Nor by another route: a table keyed by refusal cause is the same prose
+        // with a smaller blast radius, and it is the shape this deletion first
+        // grew back into. The gate's answer reaches the model as the gate's own
+        // text (`context.repair_feedback`, or the rework goal's `Evidence:`),
+        // so the contract never needs to spell a cause.
+        // Nor the protected paths. They were once enumerated here so a round
+        // would not be spent learning them; the refusal names the path it
+        // refused (`related_files` carries into the rework goal), so the
+        // enumeration is a second copy of the same fact, in prose that goes
+        // stale the moment the policy list changes.
+        for name in cog_core::PROTECTED_FILE_NAMES
+            .iter()
+            .chain(cog_core::PROTECTED_FILE_EXTENSIONS.iter())
+        {
+            assert!(
+                !text.contains(name),
+                "the contract names protected {name} — the refusal already names \
+                 the path it refused, and this copy outlives the policy it copies"
+            );
+        }
 
         for cause in cog_core::RejectionCause::ALL {
-            let key = cause.as_str();
-            let answer = answers
-                .get(key)
-                .and_then(|value| value.as_str())
-                .unwrap_or_else(|| panic!("the contract answers no refusal cause {key}"));
-            match answer.strip_prefix(NOT_WRITABLE) {
-                Some(reason) => assert!(
-                    !reason.trim().is_empty(),
-                    "refusal cause {key} is declared unavoidable with no reason"
-                ),
-                None => assert!(
-                    contract.get(answer).is_some(),
-                    "refusal cause {key} points at contract field {answer}, which the contract does not carry"
-                ),
-            }
-        }
-
-        // The other direction: a key left behind by a renamed variant would
-        // read as coverage for a cause the gate can no longer reach.
-        for key in answers.keys() {
             assert!(
-                cog_core::RejectionCause::ALL
-                    .iter()
-                    .any(|cause| cause.as_str() == key),
-                "the contract answers {key}, which is not a cause the gate can reach"
+                !text.contains(cause.as_str()),
+                "the contract names the refusal cause {} — the refusal it describes \
+                 already carries that word, in the gate's own sentence",
+                cause.as_str()
             );
         }
     }

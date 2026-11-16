@@ -52,8 +52,9 @@
 //!   的 goal 正是这种形状，它的函数仍要求表态，因为骨架就在那个函数里；
 //! * 用了 `DECISIVE_KEYS` 之外、又不在三个契约字段上的 JSON 键的契约：门把一个含
 //!   决定性键的函数整段当提示词面（`grounding`、`diff_grammar` 这些键只会出现在
-//!   写给模型的契约里），但一份另起了键名的契约仍然看不见。这是本门已知的缺口，
-//!   登记在台账里；补它的办法是把新键加进 `DECISIVE_KEYS`，而不是放宽判词；
+//!   写给模型的契约里），**也**把一个已经被声明成契约的函数整段算进去（`refusal_guidance`
+//!   这类按 cause 返回整段文字的函数就是这种形状）——所以一份另起键名、还没被声明的
+//!   契约仍然看不见。补它的办法是把新键加进 `DECISIVE_KEYS`，而不是放宽判词；
 //! * 工具结果的文案（`"note": "…"` 这类回给模型读的说明）、YAML/TS/JSON 资产
 //!   里的文本、`skills/` 下的技能文件；
 //! * 由数据拼出来的文本：门判的是写在源码里的字面量，不是运行时才出现的字符串。
@@ -287,6 +288,10 @@ fn production(root: &Path) -> Vec<(String, Vec<Row>)> {
 }
 
 fn census(root: &Path) -> Vec<Site> {
+    // 一个函数被声明成契约，它自己就是提示词面：`refusal_guidance` 这种按 cause 返回
+    // 一整段的函数，里面没有一个决定性键，靠键去认它就会漏掉——而漏掉的恰好是「被拒时
+    // 才发出去的那份规则」，正是本门最该看见的地方。
+    let declared: BTreeSet<(String, String)> = declarations(root).into_keys().collect();
     let mut sites = Vec::new();
     for (rel, rows) in production(root) {
         // 函数归属：一个 `fn name(` 行到下一个 `fn` 行算一个函数段。这比括号归属
@@ -308,9 +313,10 @@ fn census(root: &Path) -> Vec<Site> {
                 .map(|(next, _)| *next)
                 .unwrap_or(rows.len());
             let span = &rows[*begin..end];
-            let contract = span
-                .iter()
-                .any(|(_, _, code)| DECISIVE_KEYS.iter().any(|key| code.contains(key)));
+            let contract = declared.contains(&(rel.clone(), function.clone()))
+                || span
+                    .iter()
+                    .any(|(_, _, code)| DECISIVE_KEYS.iter().any(|key| code.contains(key)));
             if contract {
                 // 契约函数：函数里的每个字符串字面量都是写给模型读的，全部计入。
                 // 不计长度门槛——表态是按函数给的，门槛只改变报出来的行数，不改变
