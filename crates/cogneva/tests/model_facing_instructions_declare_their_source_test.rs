@@ -14,7 +14,7 @@
 //! 任务与工件契约：规划指令、diff 语法与验证契约、告警修复 goal、面漂移 goal。
 //! 改 `prompts/` 的任何一个字都不影响它们，而没有一道门看见它们。
 //! 本门按承载形状普查到的**点**比文本多（一条文本可以在几处出现，一个函数里的每
-//! 行字面量各算一点——门要报的是「哪一行没表态」）：这一天量到 240 个载体点、17
+//! 行字面量各算一点——门要报的是「哪一行没表态」）：这一天量到 276 个载体点、19
 //! 个函数。读数由测试自己印出来，`cargo test … -- --nocapture` 就是重新量一次；
 //! 别的地方不要手抄这两个数。
 //!
@@ -55,8 +55,10 @@
 //! * 用了 `DECISIVE_KEYS` 之外、又不在三个契约字段上的 JSON 键的契约：门把一个含
 //!   决定性键的函数整段当提示词面（`grounding`、`diff_grammar` 这些键只会出现在
 //!   写给模型的契约里），**也**把一个已经被声明成契约的函数整段算进去（`refusal_guidance`
-//!   这类按 cause 返回整段文字的函数就是这种形状）——所以一份另起键名、还没被声明的
-//!   契约仍然看不见。补它的办法是把新键加进 `DECISIVE_KEYS`，而不是放宽判词；
+//!   这类按 cause 返回整段文字的函数就是这种形状），**也**把往契约 `instructions`
+//!   里放文字的函数（直接下标赋值，或交给 `append_instruction` 拼）整段算进去——
+//!   所以一份另起键名、还没被声明的契约仍然看不见。补它的办法是把新键加进
+//!   `DECISIVE_KEYS`、或让它写进 `instructions`，而不是放宽判词；
 //! * 工具结果的文案（`"note": "…"` 这类回给模型读的说明）、YAML/TS/JSON 资产
 //!   里的文本、`skills/` 下的技能文件；
 //! * 由数据拼出来的文本：门判的是写在源码里的字面量，不是运行时才出现的字符串。
@@ -139,6 +141,24 @@ fn message_arg(code: &str) -> Option<&str> {
     best.map(|(at, len)| &code[at + len..])
 }
 
+/// 这一行是不是在往契约的 `instructions` 里放东西：`contract["instructions"] = …`。
+///
+/// 契约常常是一段一段拼出来的，键既不在结构体里、也不在 `json!({…})` 的字面量
+/// 里——规划器与评估器那两份最大的散文正是这样写进去的，而按点判的两条形状都看
+/// 不见它。认这一种形状的函数，整段算提示词面。
+///
+/// 只认 `instructions`：`input["goal"]`、`input["acceptance"]` 这种下标赋值在循环
+/// 里到处都是，写进去的是这一轮的数据，不是写给模型的规则。
+fn assigns_contract_field(code: &str) -> bool {
+    let form = "[\"instructions\"]";
+    code.find(form)
+        .map(|at| code[at + form.len()..].trim_start().starts_with('='))
+        .unwrap_or(false)
+        // 文字不是直接放进去、而是交给拼接函数的调用方也算：`append_instruction`
+        // 只做拼接，说明本身写在调用它的函数里。
+        || code.contains("append_instruction(")
+}
+
 /// 这一行是不是一个载体点。
 fn carrier_of(code: &str) -> Option<Carrier> {
     if let Some(rest) = message_arg(code) {
@@ -165,6 +185,23 @@ fn carrier_of(code: &str) -> Option<Carrier> {
         if let Some(at) = code.find(&json_form) {
             if starts_literal(&code[at + json_form.len()..]) {
                 return Some(Carrier::ContractField);
+            }
+        }
+        // 下标赋值：`contract["instructions"] = serde_json::json!("…")`。契约常常是
+        // 一段一段拼起来的，键既不在结构体里、也不在 `json!({…})` 的字面量里——前
+        // 两种形状都看不见它，而规划器与评估器那两份最大的散文正是这样写的。
+        let index_form = format!("[\"{field}\"]");
+        if let Some(at) = code.find(&index_form) {
+            let rest = code[at + index_form.len()..].trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim_start();
+                let rest = rest
+                    .strip_prefix("serde_json::json!(")
+                    .or_else(|| rest.strip_prefix("json!("))
+                    .unwrap_or(rest);
+                if starts_literal(rest) {
+                    return Some(Carrier::ContractField);
+                }
             }
         }
     }
@@ -318,9 +355,10 @@ fn census(root: &Path) -> Vec<Site> {
                 .unwrap_or(rows.len());
             let span = &rows[*begin..end];
             let contract = declared.contains(&(rel.clone(), function.clone()))
-                || span
-                    .iter()
-                    .any(|(_, _, code)| DECISIVE_KEYS.iter().any(|key| code.contains(key)));
+                || span.iter().any(|(_, _, code)| {
+                    DECISIVE_KEYS.iter().any(|key| code.contains(key))
+                        || assigns_contract_field(code)
+                });
             if contract {
                 // 契约函数：函数里的每个字符串字面量都是写给模型读的，全部计入。
                 // 不计长度门槛——表态是按函数给的，门槛只改变报出来的行数，不改变
@@ -503,6 +541,17 @@ fn the_words_are_read_the_way_the_header_says() {
     );
     assert_eq!(carrier_of("subgoal: \"x\""), None);
     assert_eq!(carrier_of("goal: computed()"), None);
+
+    // 契约按字段名拼起来的形状：直接往 `instructions` 里放、或交给拼接函数，两种
+    // 都让整个函数成为提示词面；`input["goal"]` 这种写数据的不算。
+    assert!(assigns_contract_field(
+        "contract[\"instructions\"] = serde_json::json!("
+    ));
+    assert!(assigns_contract_field("    append_instruction(&mut contract, note);"));
+    assert!(!assigns_contract_field("input[\"goal\"] = serde_json::json!(goal);"));
+    assert!(!assigns_contract_field(
+        "let seen = contract[\"instructions\"].as_str();"
+    ));
 }
 
 #[test]

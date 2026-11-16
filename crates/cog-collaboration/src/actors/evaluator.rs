@@ -141,6 +141,11 @@ impl EvaluatorActor {
 
         // Built-in contract for standard evaluation. Lowest precedence:
         // operator schema > prompt skill > built-in.
+        //
+        // Only the answer's shape: the standard the judgement is held to comes
+        // from the task (`review_spec`), and how the work measures up against it
+        // is the judgement this actor was called for. A paragraph here fixing the
+        // bands would be the platform scoring its own case before reading it.
         if self.output_schema.is_none() && self.prompt_skill.is_none() {
             contract["response_format"] = serde_json::json!("json");
             contract["output_schema"] = serde_json::json!({
@@ -149,17 +154,6 @@ impl EvaluatorActor {
                 "score": "integer 0-100",
                 "criteria": [{"name": "string", "score": "integer 0-100", "comment": "string"}]
             });
-            contract["instructions"] = serde_json::json!(
-                "Judge whether context.generation correctly and completely accomplishes context.goal \
-                 following context.plan. Score 80-100 for correct and complete results, \
-                 60-79 for partially correct, below 60 for wrong or missing results. \
-                 verdict: pass when score >= 80, partial when 60-79, fail otherwise. \
-                 When context.criteria lists acceptance criteria, you MUST judge every criterion \
-                 individually: emit one entry in criteria per acceptance criterion, using the criterion \
-                 text as name and setting score 100 only when the generation verifiably satisfies it. \
-                 In that case verdict may be pass ONLY if every acceptance criterion scores 100. \
-                 Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."
-            );
         }
 
         // A configured output schema takes precedence over built-in prompt

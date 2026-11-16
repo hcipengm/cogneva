@@ -4,6 +4,19 @@ use cog_core::{Agent, KnowledgeBackend, Task};
 
 use crate::squad::pge::types::PlannerOutput;
 
+/// 把一句随数据走的说明接到契约上：已经有了就接在后面，没有就自成一段。
+///
+/// 接而不是替，是因为这段说明与 operator 的 schema、prompt skill 各自独立：
+/// 它们说的是答案的形状，这一句说的是这一份数据是什么。
+// prompt: not-an-instruction — 本体只是拼接：文字全部由调用方给，这里没有一个字是写给模型的
+fn append_instruction(contract: &mut serde_json::Value, note: &str) {
+    let text = match contract["instructions"].as_str() {
+        Some(existing) => format!("{existing} {note}"),
+        None => note.to_string(),
+    };
+    contract["instructions"] = serde_json::json!(text);
+}
+
 /// The files a rework hand-off named, and which way the next attempt has to read
 /// them.
 ///
@@ -192,6 +205,7 @@ impl PlannerActor {
     // public entry points that forward them; a struct here would split the same
     // set into a type whose only job is to be taken apart again one line later.
     #[allow(clippy::too_many_arguments)]
+    // prompt: contract — enforced by crates/cog-collaboration/tests/actor_prompt_contract_test.rs::every_stable_half_carries_the_answer_shape_and_nothing_else
     async fn plan_inner(
         &self,
         task: &Task,
@@ -234,10 +248,14 @@ impl PlannerActor {
         // prefix. See `actor_input`.
         let mut contract = serde_json::json!({});
 
-        // For self-evolution tasks, the planner must emit a JSON plan that the
-        // downstream PGE pipeline can parse. Change artifacts are produced by the
-        // Generator later, so we explicitly tell the planner not to emit XML or
-        // change content here.
+        // The stable half carries the answer's shape, not a rulebook for arriving
+        // at it. What the plan has to satisfy structurally — a leaf that says how
+        // it is done, one end the whole goal converges on, dependencies that name
+        // sub-tasks of this plan, unique ids — is judged by `squad::plan::check_plan`
+        // and the defects come back named in the next attempt; what coverage the
+        // targets get is judged on the change and comes back as per-target
+        // criteria. Restating either here would be a second copy of the judge,
+        // one that cannot go red and drifts from it.
         let is_self_evolution = task.is_self_evolution();
 
         if is_self_evolution {
@@ -250,23 +268,6 @@ impl PlannerActor {
                 "sub_tasks": "array: empty for self-evolution execution, otherwise TaskSpec objects",
                 "targets": "array of strings: repository-relative paths the change must touch, read from the checkout before you name them"
             });
-            contract["example"] = serde_json::json!({
-                "summary": "Print the Cogneva version at startup by reading the version from Cargo.toml in main.rs",
-                "plan": { "approach": "add a version log line in the binary entry point" },
-                "sub_tasks": [],
-                "targets": ["crates/cogneva/src/main.rs"]
-            });
-            contract["instructions"] = serde_json::json!(
-                "Produce a plan, NOT the change. \
-                 Emit ONLY a single JSON object matching the output_schema. No markdown, no XML, no code fences, no change content. \
-                 Do not output artifact tags or unified diffs; the change itself is produced in a later step. \
-                 Also produce targets: the repository-relative paths the change must touch. Read the checkout before you name them \
-                 (read_file takes several paths at once, up to eight, so read the files you need in one call instead of one \
-                 call per file) — the change's diff is judged against this list, and a change that never touches a path you \
-                 named is refused. Name the files the work actually needs, not every file you looked at: an entry you name and the \
-                 change does not touch is a failure, while the change touching files beyond your list is allowed. If the intent names \
-                 an existing file, that file belongs in targets."
-            );
         } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
             // Built-in contract for standard goal decomposition. Lowest
             // precedence: operator schema > prompt skill > built-in.
@@ -285,24 +286,6 @@ impl PlannerActor {
                 }],
                 "acceptance_criteria": ["string: one verifiable criterion per entry; each must be checkable as true/false against the final output"]
             });
-            contract["instructions"] = serde_json::json!(
-                "Read context.goal and decompose it into a small set of atomic, independently executable sub_tasks. \
-                 Every sub-task must be self-contained: its input.query carries everything the executor needs. \
-                 If the goal is trivially simple (e.g. a single question), return exactly ONE sub-task that directly addresses it. \
-                 When the goal needs several sub-tasks, exactly one of them must be the one that carries the goal's answer: \
-                 every other sub-task has to feed into it, nothing may depend on it, and it has to be the only such sub-task. \
-                 If the work naturally branches into several independent results, add one closing sub-task that combines them \
-                 into that single answer instead of leaving the branches as separate ends. \
-                 Every sub_task also carries its own acceptance list: the conditions that say whether THAT \
-                 sub-task is finished (e.g. 'the file names the exact version number', 'the test covers both branches'). \
-                 A sub-task whose work nobody hangs under it needs at least one such criterion — a plan whose leaves \
-                 cannot say how they are judged done is refused before it is ever scheduled. \
-                 Also produce acceptance_criteria: concrete, verifiable conditions the final output must satisfy \
-                 (e.g. 'the answer states the exact version number', 'the summary covers every sub-task'). \
-                 Each criterion must be checkable as true or false; do NOT write vague ones like 'implementation is complete'. \
-                 Do NOT answer the goal yourself — this step produces the plan, and the plan is executed later. \
-                 Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."
-            );
         }
 
         // A configured output schema takes precedence over the built-in
@@ -321,7 +304,8 @@ impl PlannerActor {
         // 带在载荷里（`named_files`，由 `hand_off_change_rework` 写入）。此前没有任何
         // 读者：plan 又从检出里重新找了一遍文件，而答案就在请求里。把它交给 plan，
         // targets 就是那张表——生成侧的契约已经写着「你点名的路径而 diff 没碰，判退」，
-        // 所以这一条不需要新判据，只是把已有的那一条接上。
+        // 所以这一条不需要新判据，只是把已有的那一条接上。这一句说明是随数据走的
+        // 插头：字段名自己说不出「必须碰它」，而这条要求是这道门唯一会判的东西。
         //
         // 路径判退要反过来读：它点名的正是这一实例碰不得的路径（见 [`RefusedFiles`]）。
         // 那里的清单不进 `required_targets`，而是写成一段禁令——照着原样交给 plan，
@@ -332,28 +316,26 @@ impl PlannerActor {
         match rework_named_files(task) {
             Some(RefusedFiles::Targets(files)) => {
                 contract["required_targets"] = serde_json::json!(files);
-                if let Some(instructions) = contract["instructions"].as_str() {
-                    contract["instructions"] = serde_json::json!(format!(
-                        "{instructions} required_targets names the repository-relative paths the \
-                         check that refused the previous attempt objected to. Every one of them \
-                         must appear in your targets: the defect is in those files, so the change \
-                         has to touch them. Do not re-derive the list by searching the checkout -- \
-                         it is given."
-                    ));
-                }
+                let note = "required_targets names the repository-relative paths the check that \
+                            refused the previous attempt objected to. Every one of them must \
+                            appear in your targets: the defect is in those files, so the change \
+                            has to touch them. Do not re-derive the list by searching the \
+                            checkout -- it is given.";
+                append_instruction(&mut contract, note);
             }
             Some(RefusedFiles::OutOfReach(files)) => {
-                if let Some(instructions) = contract["instructions"].as_str() {
-                    contract["instructions"] = serde_json::json!(format!(
-                        "{instructions} The check that refused the previous attempt named {named}. \
-                         Those paths are outside the surface this instance may contribute to at \
-                         all ({surfaces}), so a change that touches any of them is refused before \
-                         it is compiled. Meet the goal from inside that surface, and leave those \
+                append_instruction(
+                    &mut contract,
+                    &format!(
+                        "The check that refused the previous attempt named {named}. Those paths \
+                         are outside the surface this instance may contribute to at all \
+                         ({surfaces}), so a change that touches any of them is refused before it \
+                         is compiled. Meet the goal from inside that surface, and leave those \
                          paths out of your targets entirely.",
                         named = files.join(", "),
                         surfaces = cog_core::CONTRIBUTABLE_SURFACES,
-                    ));
-                }
+                    ),
+                );
             }
             None => {}
         }

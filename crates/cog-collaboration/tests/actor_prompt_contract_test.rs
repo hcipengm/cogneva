@@ -329,17 +329,20 @@ async fn every_stable_half_names_the_answers_its_own_parser_reads() {
     }
 }
 
-/// 圆桌的两个控制角色只要一个答案，不要一套判断标准。
+/// 每个角色的稳定半段只交答案的形状，不交一套判断标准。
 ///
-/// 两者决定的都是平台自己没决定的事：主持人定这一轮往下怎么走，仲裁者定交付哪一
-/// 条分支。交给它们的文档就是那个案子——分支带着各自的计划、生成物与判词，辩论
-/// 记录带着已发生的一切。稳定半段里再写一段「该怎么权衡」，等于平台把它刚问出去
-/// 的决定自己做了：模型照抄一遍，判断却没有发生。需要它们知道的只有答案的形状与
-/// 解析器认的拼写，所以稳定半段就只有这两样。
+/// 五个角色决定的都是平台自己没决定的事：分解成什么、交出什么、这活干得怎么样、
+/// 这一轮往哪走、交付哪一条分支。交给它们的文档就是那个案子。稳定半段里再写一段
+/// 「该怎么做」，等于平台把它刚问出去的决定自己做了：模型照抄一遍，判断却没有发
+/// 生；而平台上真能判的那些（计划结构、变更形状、验收覆盖）都有各自的判据，判词
+/// 会自己回到下一轮——写在这里的那一份既不会红，也不会跟着判据改。
+///
+/// 需要它们知道的只有答案的形状与解析器认的拼写。所以稳定半段就只有这两样，多出
+/// 任何一个键都说明规则又以提示词的形式长回来了。
 #[tokio::test]
-async fn the_control_actors_state_the_answer_shape_and_nothing_else() {
+async fn every_stable_half_carries_the_answer_shape_and_nothing_else() {
     let roles = two_prompts_from_every_actor().await;
-    for role in ["moderator", "merger"] {
+    for role in ["planner", "generator", "evaluator", "moderator", "merger"] {
         let agent = roles
             .iter()
             .find(|(r, _, _)| *r == role)
