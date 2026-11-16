@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::routes::walk;
@@ -57,4 +58,57 @@ pub fn statements(text: &str) -> Vec<String> {
         .split(';')
         .map(|statement| statement.trim().to_string())
         .collect()
+}
+
+/// 一份 DDL/源码文本里的 `CREATE TABLE` 与它们的列名。
+///
+/// 口径是声明点：迁移的 `.up.sql`（重放时建表）与 store 自己的 `CREATE TABLE IF
+/// NOT EXISTS` 常量（首启时建表）都算。两条普查读同一张表就必须用同一个扫描器——
+/// 两份扫描器分开长的时候，一份认 `if not exists`、另一份不认，两份判词就关于两棵
+/// 不同的树，而两份都绿。
+pub fn tables_in(text: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut in_table: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if in_table.is_none() {
+            for opening in ["create table if not exists ", "create table "] {
+                if let Some(rest) = lower.strip_prefix(opening) {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        out.entry(name.clone()).or_default();
+                        in_table = Some(name);
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with(')') {
+            in_table = None;
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        let first = trimmed
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            first.as_str(),
+            "primary" | "unique" | "foreign" | "check" | "constraint" | "exclude" | "like"
+        ) {
+            continue;
+        }
+        if let Some(table) = &in_table {
+            out.entry(table.clone()).or_default().insert(first);
+        }
+    }
+    out
 }

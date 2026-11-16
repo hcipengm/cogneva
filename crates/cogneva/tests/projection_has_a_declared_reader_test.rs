@@ -97,13 +97,17 @@ fn projection_tables(root: &Path) -> BTreeSet<String> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        collect_tables(&text, &mut tables);
+        for (table, columns) in common::migrations::tables_in(&text) {
+            tables.entry(table).or_default().extend(columns);
+        }
     }
     for path in common::migrations::up_migrations(root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        collect_tables(&text, &mut tables);
+        for (table, columns) in common::migrations::tables_in(&text) {
+            tables.entry(table).or_default().extend(columns);
+        }
     }
     tables
         .into_iter()
@@ -114,51 +118,4 @@ fn projection_tables(root: &Path) -> BTreeSet<String> {
         })
         .map(|(table, _)| table)
         .collect()
-}
-
-/// 一份 DDL/源码文本里的 `CREATE TABLE` 与它们的列名。
-fn collect_tables(text: &str, out: &mut BTreeMap<String, BTreeSet<String>>) {
-    let mut in_table: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if in_table.is_none() {
-            for opening in ["create table if not exists ", "create table "] {
-                if let Some(rest) = lower.strip_prefix(opening) {
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    if !name.is_empty() {
-                        out.entry(name.clone()).or_default();
-                        in_table = Some(name);
-                    }
-                    break;
-                }
-            }
-            continue;
-        }
-        if trimmed.starts_with(')') {
-            in_table = None;
-            continue;
-        }
-        if trimmed.is_empty() || trimmed.starts_with("--") {
-            continue;
-        }
-        // 约束行不是列：`PRIMARY KEY (...)`、`UNIQUE (...)`、`FOREIGN KEY` 等。
-        let first = trimmed
-            .split(|c: char| c.is_whitespace() || c == '(')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if matches!(
-            first.as_str(),
-            "primary" | "unique" | "foreign" | "check" | "constraint" | "exclude" | "like"
-        ) {
-            continue;
-        }
-        if let Some(table) = &in_table {
-            out.entry(table.clone()).or_default().insert(first);
-        }
-    }
 }

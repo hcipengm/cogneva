@@ -42,6 +42,7 @@ pub mod projection_readers;
 pub mod raw;
 #[cfg(feature = "s3")]
 pub mod s3;
+pub mod table_shapes;
 pub mod tier;
 pub mod wal;
 

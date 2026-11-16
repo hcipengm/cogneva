@@ -340,6 +340,8 @@ mod every_reflection_row_states_what_closes_it_test;
 mod every_rendered_profile_is_a_tree_the_deployer_delivers_test;
 #[path = "every_served_route_is_a_face_or_says_who_it_serves_test.rs"]
 mod every_served_route_is_a_face_or_says_who_it_serves_test;
+#[path = "every_updated_table_declares_its_shape_test.rs"]
+mod every_updated_table_declares_its_shape_test;
 #[path = "export_package_names_test.rs"]
 mod export_package_names_test;
 #[path = "gateway_answers_a_waited_prompt.rs"]
