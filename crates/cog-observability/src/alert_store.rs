@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS alerts (
             )
 ;
 -- 标签集只整块读，所以它从 jsonb 降成 text（与库只存列那条线一致）。老库上这一列
--- 还是 jsonb，而 `CREATE TABLE IF NOT EXISTS` 不会改已有列，所以降类型是显式两步：
+-- 还是 jsonb，而建表语句带 IF NOT EXISTS 时不会改已有列，所以降类型是显式两步：
 -- 先摘掉 jsonb 的默认值（它的类型没法自动转），再降类型。两步都是「catalog 已经
 -- 是那个形状就别再跑」的语句，因而第二次启动不会为它们去要锁。
 ALTER TABLE alerts ALTER COLUMN labels DROP DEFAULT;
