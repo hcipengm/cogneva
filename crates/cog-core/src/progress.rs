@@ -574,6 +574,7 @@ pub async fn watch_child(
                 if let Some((silent, window)) = crate::declared_wall::stall(id) {
                     stalled = Some((silent, window));
                     // 判停之后才动手：在这之前它的每一下产出与每一段 CPU 都被读到了。
+                    #[cfg(unix)]
                     if let Some(pid) = child.id() {
                         // SAFETY: one pid and one signal constant; no pointers.
                         //
@@ -587,6 +588,8 @@ pub async fn watch_child(
                             libc::kill(target, libc::SIGKILL);
                         }
                     }
+                    // 非 unix 上没有进程组这个概念：收的就是那一个子进程，由下面的
+                    // `start_kill` 做。判据本身（沉默窗口 + 没有动作）三平台同一句。
                     let _ = child.start_kill();
                     break child.wait().await?;
                 }
