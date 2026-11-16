@@ -122,7 +122,7 @@ async fn spend(store: &LlmUsageStore, actor: &str, tokens_input: u64, tokens_out
             price_book: None,
             refusal_kind: None,
             retry_after_secs: None,
-            task: None,
+            task: Some("fixture-task".to_string()),
             owner: None,
             session: None,
             latency_ms: 1,

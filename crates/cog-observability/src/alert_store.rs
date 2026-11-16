@@ -46,8 +46,29 @@ CREATE TABLE IF NOT EXISTS alerts (
                 updated_at  TIMESTAMPTZ NOT NULL
             )
 ;
+-- 标签集只整块读，所以它从 jsonb 降成 text（与库只存列那条线一致）。老库上这一列
+-- 还是 jsonb：`CREATE TABLE IF NOT EXISTS` 不会改已有列，所以降类型必须是显式一步，
+-- 且只在还是 jsonb 时做——已经降过的库上重复降一次是错误。
+DO $labels$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'alerts'
+           AND column_name = 'labels'
+           AND data_type = 'jsonb'
+    ) THEN
+        ALTER TABLE alerts ALTER COLUMN labels DROP DEFAULT;
+        ALTER TABLE alerts ALTER COLUMN labels TYPE TEXT USING labels::text;
+        ALTER TABLE alerts ALTER COLUMN labels SET DEFAULT '{}';
+    END IF;
+END
+$labels$;
 -- `source` 是 labels 里唯一被按值查的键，升成真列；其余部分只整块读，存 text。
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source TEXT
+;
+-- 这一列加上之前的行只有标签集：把来源回填一次，否则它们永远不进任何来源的读数。
+UPDATE alerts SET source = labels::jsonb ->> 'source'
+ WHERE source IS NULL AND (labels::jsonb ? 'source')
 ;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
 ;
@@ -126,6 +147,18 @@ pub struct NewAlert {
     pub severity: String,
     pub message: String,
     pub labels: Value,
+}
+
+/// 这一条告警声明的来源标签：`source` 是标签集里唯一被按值查的键，升成了真列。
+///
+/// 写入时同时落列与标签集：只落标签集，按来源读的那条查询（镜子的收口）永远读到
+/// 空——空集在它那里读作「没有一条是我该关的」，于是别人写的行会被它关掉，或者
+/// 自己的行永远关不掉，两种都不报错。
+fn source_of(labels: &Value) -> Option<String> {
+    labels
+        .get("source")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 /// What a `set_alert` call changed. Declared in the contract layer, because
@@ -480,14 +513,15 @@ impl PostgresAlertStore {
                 sqlx::query(&alert_sql(
                     r#"
                     INSERT INTO alerts
-                        (id, rule, dedup_key, severity, state, message, labels,
+                        (id, rule, dedup_key, severity, state, message, labels, source,
                          fired_at, resolved_at, updated_at, last_seen_at, writer)
-                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $7, NULL, $7, $7, $8)
+                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $9, $7, NULL, $7, $7, $8)
                     ON CONFLICT (dedup_key) DO UPDATE SET
                         severity   = EXCLUDED.severity,
                         state      = '{state:firing}',
                         message    = EXCLUDED.message,
                         labels     = EXCLUDED.labels,
+                        source     = EXCLUDED.source,
                         fired_at   = EXCLUDED.fired_at,
                         resolved_at = NULL,
                         updated_at = EXCLUDED.updated_at,
@@ -514,6 +548,7 @@ impl PostgresAlertStore {
                 .bind(alert.labels.to_string())
                 .bind(now)
                 .bind(&self.writer)
+                .bind(source_of(&alert.labels))
                 .execute(&self.pool)
                 .await?;
                 self.record_assertion_best_effort(&alert.dedup_key, AlertState::Firing)
@@ -927,7 +962,12 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> AlertRecord {
         severity: row.get("severity"),
         state: row.get("state"),
         message: row.get("message"),
-        labels: row.get("labels"),
+        // 标签集在库里是 text（只整块读），契约面是一个 JSON 对象：解析放在这一处，
+        // 读不懂的字节不编一个空对象出来——空对象会读成「这条告警没有标签」。
+        labels: row
+            .get::<Option<String>, _>("labels")
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(serde_json::Value::Null),
         fired_at: row.get("fired_at"),
         resolved_at: row.get("resolved_at"),
         updated_at: row.get("updated_at"),

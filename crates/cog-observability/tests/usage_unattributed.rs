@@ -28,7 +28,7 @@ use chrono::{TimeZone, Utc};
 use cog_observability::usage_store::LlmUsageStore;
 use sqlx::{Executor, PgPool};
 
-use cog_test_support::database_url;
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 /// 一行账。身份由调用方给：`None` 是没声明，`Some` 是声明了。
 async fn ledger_row(pool: &PgPool, task: Option<&str>, tokens: i64) {
@@ -50,12 +50,13 @@ async fn ledger_row(pool: &PgPool, task: Option<&str>, tokens: i64) {
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_row_naming_a_run_is_no_more_traceable_than_a_row_naming_nothing() {
     let url = database_url();
-    let pool = PgPool::connect(&url)
-        .await
-        .expect("connect to the test database");
-    let store = LlmUsageStore::connect(&url)
-        .await
-        .expect("connect the store");
+    // 这个用例要的是**约束之前写下的行**：没挂任务却花了 token，正是库内不变式
+    // （`usage_that_spent_names_its_task`，NOT VALID）为历史保留、为今天禁掉的形状。
+    // 所以它自己建一个 schema，并在那里面把约束摘掉再写——摘的是这一格的约束，
+    // 不是全库的；别的用例读不到这里。
+    let schema = own_schema(&url, "usage_unattributed").await;
+    let pool = schema_pool(&url, &schema).await;
+    let store = LlmUsageStore::from_pool(pool.clone());
     let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
     store
         .init_schema(&schema_runner)
@@ -68,6 +69,12 @@ async fn a_row_naming_a_run_is_no_more_traceable_than_a_row_naming_nothing() {
     ))
     .await
     .expect("create the task ledger");
+    // 历史行：摘掉约束才写得进去（见上面那段注释）。
+    pool.execute(
+        "ALTER TABLE gateway_llm_usage DROP CONSTRAINT IF EXISTS usage_that_spent_names_its_task",
+    )
+    .await
+    .expect("write the era before the invariant");
     sqlx::query(
         "INSERT INTO task_defined
              (task_id, rev, workspace_id, kind, input, created_at)
@@ -106,4 +113,5 @@ async fn a_row_naming_a_run_is_no_more_traceable_than_a_row_naming_nothing() {
         .execute(&pool)
         .await
         .expect("leave the graph as it was found");
+    drop_schema(&url, &schema).await;
 }
