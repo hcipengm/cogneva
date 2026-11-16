@@ -40,3 +40,21 @@ pub fn up_migrations(root: &Path) -> Vec<PathBuf> {
     }
     out
 }
+
+/// 一份迁移文本里的一条条语句。
+///
+/// 先去掉整行注释再按 `;` 断：迁移文件的头是一段说明，第一行从来不是 SQL，
+/// 直接 `trim_start().strip_prefix("drop table ")` 会一条也认不出来——账就会
+/// 停在历史迁移那一行上，看起来像「这张表还在」。行内字符串里出现 `--` 的情形
+/// 在迁移里没有用到；真用到的那天，这里会被读成一条更短的语句，而不是被读错。
+pub fn statements(text: &str) -> Vec<String> {
+    let cleaned: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    cleaned
+        .split(';')
+        .map(|statement| statement.trim().to_string())
+        .collect()
+}

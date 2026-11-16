@@ -328,6 +328,23 @@ ON CONFLICT (kind, scope, literal, doc) DO UPDATE SET
  WHERE (change_ledger_sources.verdict, change_ledger_sources.priority, change_ledger_sources.block)
        IS DISTINCT FROM (EXCLUDED.verdict, EXCLUDED.priority, EXCLUDED.block)";
 
+/// 重算一行台账的两个排序值，从它的引用表读。
+///
+/// 069 的 `priority_rank` 与 087 的 `block` 原本是**生成列**，表达式读 `sources`。
+/// 生成列不能引用别的表，所以引用搬走之后它们变成普通列，由这一条语句在写引用的
+/// 同一条事务里重算。计算本身没有第二份：两个 `change_ledger_*(jsonb)` 函数原样
+/// 复用，这里只是把引用表的行拼回它们认得的数组。
+const RECOUNT_SQL: &str = "\
+UPDATE change_ledger c \
+   SET priority_rank = change_ledger_priority_rank(sub.citations), \
+       block = change_ledger_block(sub.citations) \
+  FROM (SELECT COALESCE(jsonb_agg(jsonb_build_object('priority', s.priority, \
+                                                   'block', s.block)), '[]'::jsonb) \
+               AS citations \
+          FROM change_ledger_sources s \
+         WHERE s.kind = $1 AND s.scope = $2 AND s.literal = $3) sub \
+ WHERE c.kind = $1 AND c.scope = $2 AND c.literal = $3";
+
 /// Write one measurement, with every time taken from the database clock.
 ///
 /// `landed_at` is kept from the first measurement that found it landed and
@@ -894,14 +911,11 @@ WHERE folded_at IS NULL";
 /// transaction that claimed the declaration: a version bound to the pool could
 /// only be called outside it, and the claim is worth nothing if the write it
 /// guards has already been committed or has yet to start.
-async fn write_reading<'e, E>(
-    exec: E,
+async fn write_reading(
+    conn: &mut sqlx::PgConnection,
     reading: &ChangeReading,
     first_seen_rev: Option<&str>,
-) -> SFResult<()>
-where
-    E: sqlx::PgExecutor<'e>,
-{
+) -> SFResult<()> {
     sqlx::query(&fill_vocabulary(RECORD_READING_SQL_TEMPLATE))
         .bind(&reading.identity.kind)
         .bind(&reading.identity.scope)
@@ -913,11 +927,26 @@ where
         .bind(reading.source.priority.as_str())
         .bind(reading.source.block.as_str())
         .bind(first_seen_rev)
-        .execute(exec)
+        .execute(&mut *conn)
         .await
         .map_err(|e| {
             SFError::Database(format!(
                 "record reading for {}: {e}",
+                reading.identity.as_key()
+            ))
+        })?;
+    // 两列排序值在同一条事务里重算：它们是 069／087 的生成列，表达式读的是
+    // `sources`，而那一列已经搬进引用表——生成列不能引用别的表，所以这一次
+    // 重算必须有人写。写引用的路径只有这一条，所以「有人」只有这一个地方。
+    sqlx::query(RECOUNT_SQL)
+        .bind(&reading.identity.kind)
+        .bind(&reading.identity.scope)
+        .bind(&reading.identity.literal)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            SFError::Database(format!(
+                "recount the citations of {}: {e}",
                 reading.identity.as_key()
             ))
         })?;
@@ -934,7 +963,18 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         let mut stored = 0usize;
         for reading in readings {
             check_reading(reading).map_err(SFError::Validation)?;
-            write_reading(&self.pool, reading, first_seen_rev).await?;
+            // 台账行、它的引用、以及从引用重算出的两个排序值，要么一起进库，要么
+            // 一起不进：分开提交会留下一行「引用已写、排序值还是默认」的台账，而
+            // 那正是取批次的顺序所读的两格。
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| SFError::Database(format!("begin a reading: {e}")))?;
+            write_reading(&mut tx, reading, first_seen_rev).await?;
+            tx.commit()
+                .await
+                .map_err(|e| SFError::Database(format!("commit a reading: {e}")))?;
             stored += 1;
         }
         Ok(stored)
@@ -1000,7 +1040,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // other order would drop the change instead, and nothing would say so.
         for reading in &readings {
             check_reading(reading).map_err(SFError::Validation)?;
-            write_reading(&mut *tx, reading, first_seen_rev).await?;
+            write_reading(&mut tx, reading, first_seen_rev).await?;
         }
 
         let mut folded = 0usize;

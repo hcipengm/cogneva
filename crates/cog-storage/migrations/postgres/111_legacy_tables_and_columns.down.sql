@@ -1,20 +1,9 @@
--- 撤回 111：三张表与一列按原样建回来。
+-- 撤回 111：两张表与一列按原样建回来。`workspaces` 没被动过（只把 `settings`
+-- 转成了 text），所以这里也不重建它；`settings` 的 jsonb 形状是回滚这一面时
+-- 唯一要换回去的东西。
 --
 -- agents 这一张在 005 里还带了一张 agent_performance；那张表 085 已经删过，
 -- 这里不重建——down 的职责是把 111 自己的决定撤回，不是把更早的决定一起翻回来。
-CREATE TABLE IF NOT EXISTS workspaces (
-    id VARCHAR(64) PRIMARY KEY,
-    name VARCHAR(128) NOT NULL,
-    description TEXT,
-    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'deleted')),
-    settings JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_workspaces_owner_id ON workspaces(owner_id);
-CREATE INDEX IF NOT EXISTS idx_workspaces_status ON workspaces(status);
-
 CREATE TABLE IF NOT EXISTS tasks (
     id VARCHAR(64) PRIMARY KEY,
     task_type VARCHAR(32) NOT NULL,
@@ -58,3 +47,5 @@ CREATE INDEX IF NOT EXISTS idx_agents_role ON agents(role);
 CREATE INDEX IF NOT EXISTS idx_agents_last_heartbeat ON agents(last_heartbeat_at);
 
 ALTER TABLE user_auth_methods ADD COLUMN IF NOT EXISTS extra JSONB;
+
+ALTER TABLE IF EXISTS workspaces ALTER COLUMN settings TYPE JSONB USING settings::jsonb;

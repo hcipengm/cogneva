@@ -410,6 +410,8 @@ mod metric_help_reports_the_wait_the_code_does_test;
 mod metrics_path_is_declared_once_test;
 #[path = "metrics_path_matches_deploy_test.rs"]
 mod metrics_path_matches_deploy_test;
+#[path = "migrations_replay_on_an_empty_database_test.rs"]
+mod migrations_replay_on_an_empty_database_test;
 #[path = "multi_backend_consumer_reads_its_group_from_config_test.rs"]
 mod multi_backend_consumer_reads_its_group_from_config_test;
 #[path = "network_policy_subjects_name_a_component_the_code_writes_test.rs"]

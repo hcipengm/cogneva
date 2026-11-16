@@ -33,4 +33,34 @@ SELECT c.kind, c.scope, c.literal,
  WHERE entry ->> 'doc' IS NOT NULL
 ON CONFLICT (kind, scope, literal, doc) DO NOTHING;
 
+-- `priority_rank` 与 `block` 是两列**生成列**，表达式读的正是 `sources`
+-- （069 与 087）。生成列不能引用别的表，所以它们不能跟着搬到引用表上：要先把
+-- 它们换成普通列，再让写引用的人在同一条事务里重算——那句话现在只有一处
+-- （`change_ledger_store` 的 `recount_sql`），任何写引用的路径都在那里过一遍。
+--
+-- 两列的计算本身不重写：`change_ledger_priority_rank(sources jsonb)` 与
+-- `change_ledger_block(sources jsonb)` 原样留着，重算时把引用表的行拼回它们认得
+-- 的那个数组——一个映射只有一份。
+DROP INDEX IF EXISTS change_ledger_outstanding_order_idx;
+ALTER TABLE change_ledger DROP COLUMN IF EXISTS priority_rank;
+ALTER TABLE change_ledger ADD COLUMN priority_rank SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE change_ledger DROP COLUMN IF EXISTS block;
+ALTER TABLE change_ledger ADD COLUMN block TEXT NOT NULL DEFAULT 'none';
+
+UPDATE change_ledger c
+   SET priority_rank = change_ledger_priority_rank(sub.citations),
+       block = change_ledger_block(sub.citations)
+  FROM (
+        SELECT s.kind, s.scope, s.literal,
+               COALESCE(jsonb_agg(jsonb_build_object('priority', s.priority, 'block', s.block)),
+                        '[]'::jsonb) AS citations
+          FROM change_ledger_sources s
+         GROUP BY s.kind, s.scope, s.literal
+       ) sub
+ WHERE c.kind = sub.kind AND c.scope = sub.scope AND c.literal = sub.literal;
+
+CREATE INDEX IF NOT EXISTS change_ledger_outstanding_order_idx
+    ON change_ledger (priority_rank DESC, measured_at ASC NULLS FIRST, first_seen_at ASC)
+    WHERE state NOT IN ('landed', 'retired');
+
 ALTER TABLE change_ledger DROP COLUMN sources;

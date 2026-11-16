@@ -126,7 +126,7 @@ fn retyped_columns(root: &Path) -> BTreeSet<String> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        for statement in statements(&text) {
+        for statement in common::migrations::statements(&text) {
             let Some(rest) = statement
                 .to_ascii_lowercase()
                 .strip_prefix("alter table ")
@@ -173,24 +173,6 @@ fn retyped_columns(root: &Path) -> BTreeSet<String> {
     out
 }
 
-/// 一份迁移文本里的一条条语句。
-///
-/// 先去掉整行注释再按 `;` 断：迁移文件的头是一段说明，第一行从来不是 SQL，
-/// 直接 `trim_start().strip_prefix("drop table ")` 会一条也认不出来——账就会
-/// 停在历史迁移那一行上，看起来像「这张表还在」。行内字符串里出现 `--` 的情形
-/// 在迁移里没有用到；真用到的那天，这里会被读成一条更短的语句，而不是被读错。
-fn statements(text: &str) -> Vec<String> {
-    let cleaned: String = text
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    cleaned
-        .split(';')
-        .map(|statement| statement.trim().to_string())
-        .collect()
-}
-
 /// 迁移里被 `ALTER TABLE <t> DROP COLUMN [IF EXISTS] <c>` 掉的那些列，`表.列`。
 fn dropped_columns(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -200,7 +182,7 @@ fn dropped_columns(root: &Path) -> BTreeSet<String> {
         };
         // 一条语句一个分号：不先按 `;` 断开，第一条不带 `DROP COLUMN` 的
         // `ALTER TABLE` 会认领文件里后面任意一张表的 `DROP COLUMN`。
-        for statement in statements(&text) {
+        for statement in common::migrations::statements(&text) {
             let Some(rest) = statement
                 .to_ascii_lowercase()
                 .strip_prefix("alter table ")
@@ -245,7 +227,7 @@ fn dropped_tables(root: &Path) -> BTreeSet<String> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        for statement in statements(&text) {
+        for statement in common::migrations::statements(&text) {
             let Some(rest) = statement
                 .to_ascii_lowercase()
                 .strip_prefix("drop table ")
