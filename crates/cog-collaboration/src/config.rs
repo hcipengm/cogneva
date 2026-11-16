@@ -538,12 +538,46 @@ mod tests {
         let root = repo_root();
         let mut configs = shipped_configs(&root).into_iter();
         let (reference_file, reference) = configs.next().expect("a chart source config");
+        let reference = without_projected_leaves(reference);
         for (file, doc) in configs {
             assert_eq!(
-                doc, reference,
+                without_projected_leaves(doc),
+                reference,
                 "{file} ships a different config than {reference_file}"
             );
         }
+    }
+
+    /// 把**按部署形态投影**的那几个叶子抹平，再比其余部分。
+    ///
+    /// chart 的源文件里 `system.sandbox_executor_url` 是一条服务地址，渲染之后是每副
+    /// 副本一条的地址表——这是同一个键在两个阶段的两个形状，不是两份不一致的配置。
+    /// 投影本身由渲染链与 parity 门判（`sync-static-manifests.sh --check` 逐字节比对
+    /// 静态清单与渲染产物），这条测试判的是**别的键**有没有在某个载体里被漏掉或改掉。
+    /// 不认这条差，每次改投影都会把这条测试判红，而红的原因与它要防的事无关。
+    fn without_projected_leaves(mut doc: serde_json::Value) -> serde_json::Value {
+        const PROJECTED: [&str; 1] = ["sandbox_executor_url"];
+        fn walk(value: &mut serde_json::Value, projected: &[&str]) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map.iter_mut() {
+                        if projected.contains(&key.as_str()) {
+                            *child = serde_json::Value::String("<projected>".to_string());
+                        } else {
+                            walk(child, projected);
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items.iter_mut() {
+                        walk(item, projected);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&mut doc, &PROJECTED);
+        doc
     }
 
     #[test]
