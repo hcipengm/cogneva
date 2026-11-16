@@ -765,6 +765,7 @@ fn a_bound_shaped_number_is_never_fixed() {
     );
 }
 
+#[test]
 fn the_registry_vocabulary_has_no_override() {
     assert_eq!(
         serde_yaml::from_str::<Source>("derived").expect("`derived` is a source"),
