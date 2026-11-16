@@ -152,10 +152,16 @@ const INTERVAL_ENV: &str = "COGNEVA_WORKLOAD_RESOURCES_INTERVAL_SECS";
 /// 本回路在 `cogneva_loop_tick_age_seconds{loop=...}` 里的名字。
 pub const LOOP: &str = "workload_resources";
 
-/// 工作负载选择「副本跟集群节点数走」这件事的标记。由 chart 写在对象上，
-/// 本回路只改带这个标记的 Deployment：其余工作负载的单/多副本是各自的结构
-/// 事实（单写者、单卷），不是这份部署能按节点数翻倍的东西。
+/// 工作负载选择「副本由什么决定」这件事的标记。由 chart 写在对象上，值是下面
+/// 两条律之一；没有这个标记的对象，副本数是它自己的结构事实（单写者、单卷），
+/// 本回路不动。
 pub const REPLICA_POLICY_ANNOTATION: &str = "cogneva.io/replica-policy";
+
+/// 副本跟集群节点数走：一副副本落一个失败域。凭证持有者（网关、安全网关）用这条。
+pub const REPLICA_POLICY_TOPOLOGY: &str = "topology";
+
+/// 副本跟执行器自报的编译队走：几位子、谁占着、谁在等。沙箱执行器用这条。
+pub const REPLICA_POLICY_QUEUE: &str = "queue";
 
 /// 工作负载选择「启动预算跟实测启动时长走」这件事的标记。只有带它的工作负载
 /// 的 startupProbe.failureThreshold 会被改写：其余探针的预算是探针契约。
@@ -166,6 +172,18 @@ pub const REPLICAS_METRIC: &str = "cogneva_workload_replicas";
 
 /// 副本目标的求值次数。值不变是合法结果，拍子停没停靠这个数分辨。
 pub const REPLICAS_EVALUATIONS_METRIC: &str = "cogneva_workload_replicas_evaluations_total";
+
+/// 这一拍问到了几副副本的队。0 是「没量到」，不是「没有人用这个执行面」。
+///
+/// 它与 [`REPLICAS_METRIC`] 一起读：目标停在种子上，可能是队真的空了，也可能是
+/// 一副副本都没答上话；没有这个数，两件事在读数面上一模一样。
+pub const REPLICA_LANE_READINGS_METRIC: &str = "cogneva_workload_replica_lane_readings";
+
+/// 问到的这些副本上一共几个人在等位子。
+pub const LANE_WAITING_METRIC: &str = "cogneva_workload_lane_waiting";
+
+/// 问到的这些副本上一共几个人占着位子。
+pub const LANE_HOLDING_METRIC: &str = "cogneva_workload_lane_holding";
 
 /// 启动探针的失败预算（次数）。
 pub const STARTUP_THRESHOLD_METRIC: &str = "cogneva_workload_startup_failure_threshold";
@@ -202,6 +220,83 @@ pub const LIMIT_RANGE_LABEL: &str = "limitrange";
 /// 只决定「一还是二」，不决定「几」。
 pub fn replicas_for_ready_nodes(ready_nodes: usize) -> Option<u64> {
     (ready_nodes > 0).then(|| ready_nodes.min(2) as u64)
+}
+
+/// 一副副本自报的队：几位子、几个人占着、几个人在等。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaneQueue {
+    /// `None` 是「说不出几位子」，与「位子是零」是两件事：说不出的副本进不了除数。
+    pub lanes: Option<usize>,
+    pub holding: usize,
+    pub waiting: usize,
+}
+
+/// 队列这条律这一拍读到的东西，以及由此算出的目标。
+///
+/// 读到的东西与目标分开摆：`answered` 是 0 而 `waiting` 也是 0 时，读者要能看出
+/// 这一条律根本没读到队，而不是读到一个空队；`replicas: None` 同义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueReading {
+    /// 这一拍答得上话（说得出位子数）的副本数。
+    pub answered: usize,
+    pub holding: usize,
+    pub waiting: usize,
+    /// 目标副本数；一副副本都说不出位子数时为 `None`。
+    pub replicas: Option<u64>,
+}
+
+/// 一副副本：「这个面开着」的最小集合。
+// cap: fixed — 「至少有一副」这句话本身；零副不是一条扩容结论，是把执行面关掉（`sandboxExecutor.enabled`），那件事不该由一次队列读数决定。
+const MIN_REPLICAS: u64 = 1;
+
+/// 一拍最多收几副。
+// cap: fixed — 收缩按步走：一次把四副收回去，会让每一阵浪的尾巴都变成一次滚动换 Pod，而下一阵浪又要重新起。
+const SHRINK_STEP_REPLICAS: u64 = 1;
+
+/// 读一副副本的队最多等多久。
+// cap: bound — 读不到的执行器不该把一拍拖长：这条读是拍子的一个子步骤，拍子本身是分钟级。
+const LANE_READ_TIMEOUT_SECS: u64 = 2;
+
+/// 副本目标：让在跑和在等的每一份工作都落到一条位子上。
+///
+/// 需求是所有副本的「占着 + 在等」，除数是一副副本最多能同时跑几条（所以它按副本
+/// 算，不按集群算）。涨是即时的——队排起来就是现在需要；收是一拍一步
+/// （[`SHRINK_STEP_REPLICAS`]），下限是 [`MIN_REPLICAS`]。
+///
+/// 下限不是种子：种子是安装时写下的那个数，之后这个数由队回答。写回把新值放回
+/// 对象上，下一拍读到的「现值」就是它，所以拿现值当下限会让副本数只增不减。
+///
+/// `replicas` 为 `None` 是「这一拍没有答案」：一副副本都没答、或者答不出位子数。
+/// 那时任何目标都是编的，写回留给下一拍，读数把现值标成种子——「量不到」与「量到
+/// 零」必须分得开，两者在页面上不能是同一个数。
+pub fn replicas_for_the_queue(readings: &[LaneQueue], declared: u64) -> QueueReading {
+    let lanes_per_replica = readings
+        .iter()
+        .filter_map(|reading| reading.lanes)
+        .filter(|lanes| *lanes > 0)
+        .max();
+    let answered = readings
+        .iter()
+        .filter(|reading| reading.lanes.is_some_and(|lanes| lanes > 0))
+        .count();
+    let holding: usize = readings.iter().map(|reading| reading.holding).sum();
+    let waiting: usize = readings.iter().map(|reading| reading.waiting).sum();
+    let replicas = lanes_per_replica.map(|lanes| {
+        let wanted = ((holding + waiting) as u64)
+            .div_ceil(lanes as u64)
+            .max(MIN_REPLICAS);
+        if wanted >= declared {
+            wanted
+        } else {
+            wanted.max(declared.saturating_sub(SHRINK_STEP_REPLICAS))
+        }
+    });
+    QueueReading {
+        answered,
+        holding,
+        waiting,
+        replicas,
+    }
 }
 
 /// 启动探针的失败预算：最长的实测成功启动 × 余量，除以探针周期。
@@ -669,6 +764,15 @@ pub struct StartupProbe {
     pub failure_threshold: u64,
 }
 
+/// 副本数由哪条律决定（见 [`REPLICA_POLICY_ANNOTATION`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaPolicy {
+    /// 一副副本落一个失败域，节点的数决定它。
+    Topology,
+    /// 一副副本落一条编译队，队里的人数决定它。
+    Queue,
+}
+
 /// 一个可 patch 的工作负载对象。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadSpec {
@@ -679,8 +783,8 @@ pub struct WorkloadSpec {
     pub shm: Vec<ShmVolume>,
     /// 当前声明的副本数。DaemonSet/CronJob 没有这个数。
     pub replicas: Option<u64>,
-    /// 这个对象的副本数由节点数决定（见 [`REPLICA_POLICY_ANNOTATION`]）。
-    pub replica_policy: bool,
+    /// 这个对象的副本数跟什么走。没有标记就是没有律：副本数是它自己的结构事实。
+    pub replica_policy: Option<ReplicaPolicy>,
     /// 这个对象的启动预算由实测启动时长决定（见 [`STARTUP_POLICY_ANNOTATION`]）。
     pub startup_policy: bool,
 }
@@ -907,13 +1011,22 @@ pub fn parse_workloads(list: &Value) -> Vec<WorkloadSpec> {
             "Deployment" | "StatefulSet" => item.pointer("/spec/replicas").and_then(Value::as_u64),
             _ => None,
         };
+        // 标记说的是「哪条律」，不是一个布尔：两种副本律的输入完全不同（节点数
+        // 对队列深度），把第二种塞进同一个布尔里只能靠另外再加一个布尔。
+        let replica_policy = if annotated(REPLICA_POLICY_ANNOTATION, REPLICA_POLICY_TOPOLOGY) {
+            Some(ReplicaPolicy::Topology)
+        } else if annotated(REPLICA_POLICY_ANNOTATION, REPLICA_POLICY_QUEUE) {
+            Some(ReplicaPolicy::Queue)
+        } else {
+            None
+        };
         out.push(WorkloadSpec {
             kind,
             name,
             containers,
             shm: shm_from(spec),
             replicas,
-            replica_policy: annotated(REPLICA_POLICY_ANNOTATION, "topology"),
+            replica_policy,
             startup_policy: annotated(STARTUP_POLICY_ANNOTATION, "measured"),
         });
     }
@@ -1186,6 +1299,8 @@ struct ReplicaRow {
     replicas: u64,
     source: &'static str,
     evaluations: u64,
+    /// 队列这条律这一拍读到了什么。拓扑那条律没有这一格：它读的是节点，不是队。
+    queue: Option<QueueReading>,
 }
 
 /// 一个容器的启动失败预算。
@@ -1289,6 +1404,7 @@ impl WorkloadResourcesReadings {
                 replicas: 0,
                 source: SOURCE_SEED,
                 evaluations: 0,
+                queue: None,
             });
         row.evaluations = row.evaluations.saturating_add(1);
     }
@@ -1303,9 +1419,26 @@ impl WorkloadResourcesReadings {
                 replicas,
                 source,
                 evaluations: 0,
+                queue: None,
             });
         row.replicas = replicas;
         row.source = source;
+    }
+
+    /// 这一拍从队里读到的数。目标由 [`replicas_for_the_queue`] 算，这里只把
+    /// 「读到了什么」摆到读数面上：目标停着时，是队空了还是没人答，靠它分辨。
+    pub fn observe_queue(&self, workload: &str, reading: QueueReading) {
+        let mut rows = self.replicas.lock().unwrap();
+        let row = rows
+            .entry(workload.to_string())
+            .or_insert_with(|| ReplicaRow {
+                workload: workload.to_string(),
+                replicas: reading.replicas.unwrap_or(0),
+                source: SOURCE_SEED,
+                evaluations: 0,
+                queue: Some(reading),
+            });
+        row.queue = Some(reading);
     }
 
     /// 这一拍对某个容器的启动预算求过值。
@@ -1456,6 +1589,20 @@ impl Observable for WorkloadResourcesReadings {
                         .with_label(SOURCE_LABEL, row.source),
                 );
             }
+            // 队这条律读到的三个数只在有队的那条律上发布：给拓扑那条律写三个零，
+            // 读起来会像「读到了，没人在等」，而它根本没有读过队。
+            if let Some(queue) = row.queue {
+                for (metric, value) in [
+                    (REPLICA_LANE_READINGS_METRIC, queue.answered as u64),
+                    (LANE_WAITING_METRIC, queue.waiting as u64),
+                    (LANE_HOLDING_METRIC, queue.holding as u64),
+                ] {
+                    out.push(
+                        RawMetric::new(metric, value as f64)
+                            .with_label(WORKLOAD_LABEL, row.workload.clone()),
+                    );
+                }
+            }
         }
         for row in self.startups.lock().unwrap().values() {
             for (metric, value) in [
@@ -1596,6 +1743,68 @@ pub fn pod_ready_secs(pod: &Value) -> Option<u64> {
         .ok()
 }
 
+/// Pod 的这一副副本此刻能接活。
+fn pod_is_ready(pod: &Value) -> bool {
+    pod.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(Value::as_str) == Some("Ready")
+                    && condition.get("status").and_then(Value::as_str) == Some("True")
+            })
+        })
+}
+
+/// 一副副本的 `/lane` 地址，从就绪 Pod 自己的 IP 与它声明的容器端口拼出来。
+///
+/// 地址不取自配置：配置说的是「这份部署该有几副副本」，这里要问的是「哪一个进程
+/// 现在在跑、它自己说几位子」。所以读的是 Pod 而不是 Service——Service 会把四副
+/// 副本的队负载均衡成一副的回答，而除数要的正是单副的位子数。
+fn lane_address(pod: &Value) -> Option<String> {
+    if !pod_is_ready(pod) {
+        return None;
+    }
+    let ip = pod.pointer("/status/podIP").and_then(Value::as_str)?;
+    let mut port = None;
+    for container in pod
+        .pointer("/spec/containers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for entry in container
+            .get("ports")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(number) = entry.get("containerPort").and_then(Value::as_u64) {
+                port = Some(number);
+                break;
+            }
+        }
+        if port.is_some() {
+            break;
+        }
+    }
+    Some(format!("http://{ip}:{}/lane", port?))
+}
+
+/// 问一副副本的队。读不到就是读不到：`None`，不拿一个空队顶替——空队会让这一副
+/// 副本看起来闲着，而它可能只是没答上话。
+async fn read_lane(http: &reqwest::Client, address: &str) -> Option<LaneQueue> {
+    let response = http.get(address).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let reading = response.json::<cog_core::BuildLaneReading>().await.ok()?;
+    Some(LaneQueue {
+        lanes: reading.capacity,
+        holding: reading.holding.len(),
+        waiting: reading.waiting.len(),
+    })
+}
+
 /// 一拍的工作。
 pub struct RoundSummary {
     pub evaluated: usize,
@@ -1715,6 +1924,33 @@ pub async fn round(
         return Err("no container usage was readable this round; nothing was written".to_string());
     }
 
+    // 队列这条律要问的地址：按工作负载归组，只收就绪的 Pod。地址在这一拍开始时
+    // 定下，后面每个对象的判断读同一份——同一拍里读两次 Pods 会看到两份名单。
+    let mut lane_addresses: HashMap<String, Vec<String>> = HashMap::new();
+    for pod in pods
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some((_, workload)) = pod_workload(pod, &replicasets, &jobs) else {
+            continue;
+        };
+        let Some(spec) = workloads.iter().find(|spec| spec.name == workload) else {
+            continue;
+        };
+        if spec.replica_policy != Some(ReplicaPolicy::Queue) {
+            continue;
+        }
+        if let Some(address) = lane_address(pod) {
+            lane_addresses.entry(workload).or_default().push(address);
+        }
+    }
+    let lane_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(LANE_READ_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("a lane reading client could not be built: {e}"))?;
+
     let mut evaluated = 0usize;
     let mut patched = 0usize;
     // 这一拍给每个声明了资源的容器算出的请求。默认层问的是同一份测量的
@@ -1728,21 +1964,50 @@ pub async fn round(
         // survive one node going away, and the number of failure domains is
         // read from the cluster every round.
         let mut replica_change = None;
-        if workload.replica_policy {
-            readings.note_replicas_evaluated(&workload.name);
-            match replicas_for_ready_nodes(ready_nodes) {
-                Some(target) => {
-                    readings.observe_replicas(&workload.name, target, SOURCE_DERIVED);
-                    if workload.replicas != Some(target) {
-                        replica_change = Some(target);
+        match workload.replica_policy {
+            Some(ReplicaPolicy::Topology) => {
+                readings.note_replicas_evaluated(&workload.name);
+                match replicas_for_ready_nodes(ready_nodes) {
+                    Some(target) => {
+                        readings.observe_replicas(&workload.name, target, SOURCE_DERIVED);
+                        if workload.replicas != Some(target) {
+                            replica_change = Some(target);
+                        }
                     }
-                }
-                None => {
-                    if let Some(declared) = workload.replicas {
-                        readings.observe_replicas(&workload.name, declared, SOURCE_SEED);
+                    None => {
+                        if let Some(declared) = workload.replicas {
+                            readings.observe_replicas(&workload.name, declared, SOURCE_SEED);
+                        }
                     }
                 }
             }
+            // 队列这条律的输入是每副副本自己报的队，不是集群的节点数：一副副本
+            // 几位子、谁占着、谁在等，只有那一副答得出。
+            Some(ReplicaPolicy::Queue) => {
+                readings.note_replicas_evaluated(&workload.name);
+                let mut queues = Vec::new();
+                for address in lane_addresses.get(&workload.name).into_iter().flatten() {
+                    if let Some(queue) = read_lane(&lane_http, address).await {
+                        queues.push(queue);
+                    }
+                }
+                // 现值是这一拍对象上的数；它是「上一拍写下的目标」，不是种子。
+                let declared = workload.replicas.unwrap_or(MIN_REPLICAS);
+                let reading = replicas_for_the_queue(&queues, declared);
+                readings.observe_queue(&workload.name, reading);
+                match reading.replicas {
+                    Some(target) => {
+                        readings.observe_replicas(&workload.name, target, SOURCE_DERIVED);
+                        if workload.replicas != Some(target) {
+                            replica_change = Some(target);
+                        }
+                    }
+                    // 一副副本都没答上话：把现值按种子发布，写回留给下一拍。拿
+                    // 「没人答」当「没人用」会把执行面缩到一副，而队可能正排着。
+                    None => readings.observe_replicas(&workload.name, declared, SOURCE_SEED),
+                }
+            }
+            None => {}
         }
         // Startup budgets follow the longest successful start in the window,
         // never below the budget already declared. A start too slow for the
@@ -2164,7 +2429,7 @@ mod tests {
         assert_eq!(ready_node_count(&nodes), 1);
 
         let mut spec = workload("Deployment", "gateway");
-        spec.replica_policy = true;
+        spec.replica_policy = Some(ReplicaPolicy::Topology);
         spec.replicas = Some(1);
         let body = patch_body(
             &spec,
@@ -2178,6 +2443,78 @@ mod tests {
         assert!(
             body.pointer("/spec/template").is_none(),
             "a scale must not carry an empty pod template: {body}"
+        );
+    }
+
+    /// 一副副本自报的队，写成测试用的那个形状。
+    fn queue(lanes: Option<usize>, holding: usize, waiting: usize) -> LaneQueue {
+        LaneQueue {
+            lanes,
+            holding,
+            waiting,
+        }
+    }
+
+    /// 执行器的副本数跟队走：需求是一副副本一条位子，涨是即时的。
+    ///
+    /// 这是登记表里 `sandboxExecutor.replicas` 那条 `derived` 的判据：把队的输入
+    /// 换掉，目标必须跟着换。两副副本各两条位子、各占两个人的时候一共四条位子，
+    /// 四条位子上四个人正好装得下；再多两个人在等，就需要第三副。
+    #[test]
+    fn a_workload_replicas_follow_the_executor_queue() {
+        let busy = [queue(Some(2), 2, 0), queue(Some(2), 2, 0)];
+        let target = replicas_for_the_queue(&busy, 1);
+        assert_eq!(target.replicas, Some(2), "四条位子四个人：两副够");
+        assert_eq!(target.answered, 2);
+        assert_eq!(target.holding, 4);
+        assert_eq!(target.waiting, 0);
+
+        let swamped = [queue(Some(2), 2, 2), queue(Some(2), 2, 2)];
+        let target = replicas_for_the_queue(&swamped, 2);
+        assert_eq!(target.replicas, Some(4), "八个人、每副两条位子：四副");
+        assert_eq!(target.waiting, 4);
+
+        // 一副副本的位子数变了，目标跟着变：同样八个人，每条三位的副本要三副。
+        let wider = [queue(Some(3), 4, 4)];
+        assert_eq!(replicas_for_the_queue(&wider, 1).replicas, Some(3));
+
+        // 没有人用执行面：一副副本，不是零副——零副是把面关掉，不是扩容结论。
+        let idle = [queue(Some(2), 0, 0)];
+        assert_eq!(
+            replicas_for_the_queue(&idle, 1).replicas,
+            Some(1),
+            "空队停在一副副本"
+        );
+    }
+
+    /// 队空了不一次收回：每一阵浪的尾巴都收一次，就是每一阵浪都滚一次 Pod。
+    #[test]
+    fn a_queue_that_empties_loses_one_replica_a_beat() {
+        let empty = [queue(Some(2), 0, 0)];
+        assert_eq!(
+            replicas_for_the_queue(&empty, 4).replicas,
+            Some(3),
+            "四副收到一副要四拍，不是一拍"
+        );
+        assert_eq!(replicas_for_the_queue(&empty, 1).replicas, Some(1));
+        // 涨没有同样的一拍一步：队排起来就是现在需要。
+        let swamped = [queue(Some(2), 3, 9)];
+        assert_eq!(replicas_for_the_queue(&swamped, 1).replicas, Some(6));
+    }
+
+    /// 一副副本都没答、或者答不出位子数：没有目标，读数里只有失败。
+    #[test]
+    fn a_queue_nobody_could_read_has_no_target() {
+        let nothing = replicas_for_the_queue(&[], 3);
+        assert_eq!(nothing.replicas, None);
+        assert_eq!(nothing.answered, 0);
+        let silent = replicas_for_the_queue(&[queue(None, 5, 5)], 3);
+        assert_eq!(silent.replicas, None);
+        assert_eq!(silent.answered, 0);
+        assert_eq!(
+            (silent.holding, silent.waiting),
+            (5, 5),
+            "答不出位子数不代表它的队不存在：读到的仍然摆出来，只是不算目标"
         );
     }
 
@@ -2273,6 +2610,37 @@ mod tests {
         assert_eq!(memory_quantity(1024 * 1024 * 1024), "1Gi");
     }
 
+    /// 标记上的词决定哪条律：`topology` 读节点，`queue` 读每副副本的队，没有标记
+    /// 就是没有律。写错了词不会响亮失败，只会让那个对象不动——所以两个词都在这里。
+    #[test]
+    fn the_replica_policy_annotation_names_the_law() {
+        let policy = |annotation: &str| {
+            let list = json!({
+                "items": [{
+                    "kind": "StatefulSet",
+                    "metadata": {
+                        "name": "cogneva-sandbox-executor",
+                        "annotations": {REPLICA_POLICY_ANNOTATION: annotation},
+                    },
+                    "spec": {
+                        "replicas": 1,
+                        "template": {"spec": {"containers": [{"name": "c"}]}},
+                    },
+                }]
+            });
+            parse_workloads(&list)
+                .into_iter()
+                .next()
+                .and_then(|spec| spec.replica_policy)
+        };
+        assert_eq!(
+            policy(REPLICA_POLICY_TOPOLOGY),
+            Some(ReplicaPolicy::Topology)
+        );
+        assert_eq!(policy(REPLICA_POLICY_QUEUE), Some(ReplicaPolicy::Queue));
+        assert_eq!(policy("something-else"), None);
+    }
+
     fn workload(kind: &str, name: &str) -> WorkloadSpec {
         WorkloadSpec {
             kind: kind.to_string(),
@@ -2290,7 +2658,7 @@ mod tests {
             }],
             shm: Vec::new(),
             replicas: Some(1),
-            replica_policy: false,
+            replica_policy: None,
             startup_policy: false,
         }
     }

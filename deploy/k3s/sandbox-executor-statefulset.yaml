@@ -20,6 +20,11 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: sandbox-executor
     app.kubernetes.io/version: "0.5.10"
+  annotations:
+    # 副本数跟**队**走：workload-resources 回路问每副副本的 `GET /lane`（几位子、
+    # 谁占着、谁在等），按「在跑 + 在等」除以单副位子数改 `spec.replicas`。下面那个
+    # 1 是安装时的种子，第一拍之后由队回答——执行器扩的是容量，不是失败域。
+    cogneva.io/replica-policy: queue
 spec:
   replicas: 1
   # 序号是身份：同一个序号的 Pod 重建后拿到同一块卷，那块卷上「哪棵树属于

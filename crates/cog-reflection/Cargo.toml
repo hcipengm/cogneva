@@ -18,6 +18,9 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = "0.1"
+# The replica law reads each executor replica's own `GET /lane`, from inside the
+# cluster: no credential, no new cluster right, one HTTP GET per replica.
+reqwest = { workspace = true }
 # The build gate is a set of flock'd files under `libc`; it moved here from
 # cog-core, and this is the crate that now needs the syscalls.
 libc = "0.2"

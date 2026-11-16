@@ -1832,6 +1832,7 @@ dependencies = [
  "cog-core",
  "cog-test-support",
  "libc",
+ "reqwest 0.12.28",
  "schemars",
  "serde",
  "serde_json",

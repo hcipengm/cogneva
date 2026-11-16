@@ -23,6 +23,12 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.5.10"
     app.kubernetes.io/component: sandbox-executor
+  annotations:
+    # 副本数跟**队**走，不跟节点数走：每副副本自己答 `GET /lane`（几位子、谁占着、
+    # 谁在等），workload-resources 回路按「在跑 + 在等」除以单副位子数改
+    # `spec.replicas`。下面那个数是安装时的种子，第一拍之后由队回答——执行器扩的是
+    # 容量，不是失败域，所以拓扑那条律不适用。
+    cogneva.io/replica-policy: queue
 spec:
   replicas: 1
   # 序号是身份：同一个序号的 Pod 重建后拿到同一块卷，那块卷上「哪棵树属于哪个

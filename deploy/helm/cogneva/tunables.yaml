@@ -3360,15 +3360,35 @@ rows:
   # `cogneva_build_target_bytes_cap{source}` 上，读得出来源是 override。
 
   - key: sandboxExecutor.replicas
-    source: fixed
+    source: derived
     why: >-
-      How many executor replicas carry the sandbox. It is a capacity number,
-      not a topology constraint: each replica owns its own claim, and a lane is
-      pinned to one replica, so a second copy no longer splits "who owns this
-      worktree". Nothing measures it yet -- queue depth and wait time are
-      already published, and wiring them into this number is the next step --
-      so it stays a pinned deployment value rather than a derived one, and the
-      total the sandbox can carry is per-replica concurrency times this.
+      The number of executor replicas carries the sandbox's capacity, not its
+      topology: each replica owns its own claim and a lane is pinned to one
+      replica, so a second copy adds slots rather than splitting "who owns this
+      worktree". The workload-resources loop asks every Ready executor pod for
+      its own `GET /lane` -- how many lane slots it has, who holds them, who is
+      waiting -- divides the lanes held plus the lanes waiting by the largest
+      per-replica slot count any of them reported, and patches `spec.replicas`
+      on the StatefulSet carrying `cogneva.io/replica-policy: queue`. Growth is
+      immediate; a shrink is one replica per round, because taking four back
+      the moment a burst ends turns every burst into a roll. The floor is one
+      replica -- zero is this surface switched off, which `sandboxExecutor.enabled`
+      owns. A round in which no replica answers has no target: the reading keeps
+      the count in place under `source=seed`, and `cogneva_workload_replica_lane_readings`
+      says how many replicas answered, so "nobody answered" and "nobody is
+      waiting" are two different numbers on the page. This value is what the
+      install starts from; from the first round on it follows the queue.
+    published:
+      owner: crates/cog-reflection/src/workload_resources.rs
+      file: crates/cog-reflection/src/workload_resources.rs
+      metric: REPLICAS_METRIC
+      label: source
+      cadence: periodic
+    proof:
+      file: crates/cog-reflection/src/workload_resources.rs
+      test: a_workload_replicas_follow_the_executor_queue
+      beat: the_replica_beat_counts_even_when_the_node_count_does_not_move
+      evidence: replica_evaluations
 
   - key: sandboxExecutor.buildCacheScanIntervalSecs
     source: derived
