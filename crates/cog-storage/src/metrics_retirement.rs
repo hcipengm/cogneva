@@ -446,12 +446,12 @@ impl MetricsRetirement {
         let sibling = self.clock_expr("s", clock);
         let legs = format!(
             "t.name = d.name
-               AND NOT (t.labels ? d.label)
+               AND NOT (t.labels::jsonb ? d.label)
                AND {mine} < NOW() - ($3::double precision * INTERVAL '1 second')
                AND EXISTS (
                      SELECT 1 FROM {table} s
                       WHERE s.name = t.name
-                        AND s.labels ? d.label
+                        AND s.labels::jsonb ? d.label
                         AND {sibling} > {mine}
                    )"
         );
@@ -607,7 +607,7 @@ impl MetricsRetirement {
                 "DELETE FROM {table} WHERE {id} IN (
                      SELECT t.{id} FROM {table} t
                       WHERE {legs} AND {fresh_roster}
-                      LIMIT $6
+                      LIMIT $5
                  )"
             ),
         }

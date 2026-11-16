@@ -15,7 +15,9 @@ BEGIN
         RETURN;
     END IF;
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'usage_that_spent_names_its_task'
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'usage_that_spent_names_its_task'
+           AND conrelid = 'gateway_llm_usage'::regclass
     ) THEN
         ALTER TABLE gateway_llm_usage ADD CONSTRAINT usage_that_spent_names_its_task
             CHECK (tokens_input + tokens_output <= 0 OR task_id IS NOT NULL) NOT VALID;

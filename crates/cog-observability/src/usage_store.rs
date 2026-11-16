@@ -457,8 +457,21 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS refused_scope TEXT;
 -- afterwards, so the constraint is NOT VALID -- it checks every row inserted
 -- from here on and leaves history as the history it is. Refusals may spend
 -- nothing and name no task; the condition says exactly that.
-ALTER TABLE gateway_llm_usage ADD CONSTRAINT usage_that_spent_names_its_task
-    CHECK (tokens_input + tokens_output <= 0 OR task_id IS NOT NULL) NOT VALID;
+-- 同一条约束在迁移链里也有一份（老库由它补上），所以这里必须可重入：一条
+-- `ALTER TABLE ... ADD CONSTRAINT` 跑第二遍就是错误，而这张表的 `init_schema`
+-- 每次启动都跑一遍。
+DO $invariant$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'usage_that_spent_names_its_task'
+           AND conrelid = 'gateway_llm_usage'::regclass
+    ) THEN
+        ALTER TABLE gateway_llm_usage ADD CONSTRAINT usage_that_spent_names_its_task
+            CHECK (tokens_input + tokens_output <= 0 OR task_id IS NOT NULL) NOT VALID;
+    END IF;
+END
+$invariant$;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
 -- 窗口配速那一次读按 `(upstream, result)` 与 `(upstream, refusal_kind)` 各取一
 -- 小撮，而表里绝大多数行是熔断拒绝（`upstream = '-'`，与任何一家都不匹配）。没有

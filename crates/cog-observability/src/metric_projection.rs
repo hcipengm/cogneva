@@ -194,7 +194,7 @@ pub async fn rebuild(
     for row in &counters {
         sqlx::query(
             "INSERT INTO cog_metric_counter_totals (name, labels, upstream, as_of, value) \
-             VALUES ($1, $2, $3, NOW(), $4)",
+             VALUES ($1, $2::jsonb::text, $3, NOW(), $4)",
         )
         .bind(&row.name)
         .bind(&row.labels)
@@ -208,7 +208,7 @@ pub async fn rebuild(
         sqlx::query(
             "INSERT INTO cog_metric_histogram_buckets \
                  (name, labels, upstream, as_of, bucket, observations) \
-             VALUES ($1, $2, $3, NOW(), $4, $5)",
+             VALUES ($1, $2::jsonb::text, $3, NOW(), $4, $5)",
         )
         .bind(&row.name)
         .bind(&row.labels)
@@ -222,7 +222,7 @@ pub async fn rebuild(
     for row in &sums {
         sqlx::query(
             "INSERT INTO cog_metric_histogram_sums (name, labels, upstream, as_of, sum) \
-             VALUES ($1, $2, $3, NOW(), $4) \
+             VALUES ($1, $2::jsonb::text, $3, NOW(), $4) \
              ON CONFLICT (name, labels) DO UPDATE SET sum = EXCLUDED.sum, as_of = EXCLUDED.as_of",
         )
         .bind(&row.name)

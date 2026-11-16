@@ -173,12 +173,13 @@ async fn a_persons_day_is_what_the_ledger_charges_them_by_either_evidence() {
         task_rev(&pool, &format!("ws-{run}"), task_id, 1, submitted_by).await;
     }
 
-    // 声明了属主的一行：直接算这个人的。
+    // 声明了属主的一行：直接算这个人的。花了 token 就要挂一件活（库内不变式），
+    // 这里挂的是一件没有提交人的活——它不往任何人的格子里添数，被算的只有属主。
     ledger_row(
         &pool,
         day + chrono::Duration::hours(1),
         Some(&yes),
-        None,
+        Some(&nameless),
         100,
     )
     .await;
@@ -200,8 +201,9 @@ async fn a_persons_day_is_what_the_ledger_charges_them_by_either_evidence() {
         7,
     )
     .await;
-    // 两处都没有：谁的格子都不写。
-    ledger_row(&pool, day + chrono::Duration::hours(4), None, None, 11).await;
+    // 两处都没有、而且一个 token 都没花（花了就必须挂任务的库内不变式，见
+    // `usage_that_spent_names_its_task`）：谁的格子都不写。
+    ledger_row(&pool, day + chrono::Duration::hours(4), None, None, 0).await;
     // 所指的活没有提交人：同样不进任何人的格子。
     ledger_row(
         &pool,
@@ -303,8 +305,8 @@ async fn a_workspaces_day_is_the_calls_made_for_the_tasks_it_runs() {
         7,
     )
     .await;
-    // 没有任务身份的行：不属于任何租户，不许被编进一个占位工作区。
-    ledger_row(&pool, day + chrono::Duration::hours(4), None, None, 11).await;
+    // 没有任务身份、也没有花 token 的行：不属于任何租户，不许被编进一个占位工作区。
+    ledger_row(&pool, day + chrono::Duration::hours(4), None, None, 0).await;
 
     let rows = store
         .spend_by_workspace_since(since)
@@ -415,12 +417,13 @@ async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belon
         Some(&task_a),
     )
     .await;
-    // 花掉钱的一发不是拒绝，不许进这一列。
+    // 花掉钱的一发不是拒绝，不许进这一列。花了就挂一件活（库内不变式）：挂的是
+    // task_a，它不改变「这一列只数拒绝」这条判据。
     ledger_row(
         &pool,
         day + chrono::Duration::hours(5),
         Some(&person_a),
-        None,
+        Some(&task_a),
         90,
     )
     .await;
