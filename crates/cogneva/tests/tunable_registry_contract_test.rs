@@ -664,7 +664,107 @@ fn the_registrys_words_are_the_labels_words() {
 /// end state one row at a time, and the row itself looks entirely ordinary on
 /// the page -- so the vocabulary refuses it, and this test names the refusal
 /// instead of letting serde report an unknown variant from inside `registry()`.
+/// 界形的数字，不许标成 `fixed`。
+///
+/// 词表里只有两个词：`derived`（一条实测让它动）与 `fixed`（一项约定，不是旋钮）。
+/// 一个**界**——副本数、重试上限、历史保留条数、失败阈值——既不是「实测让它动」，
+/// 也不是「约定不动的协议常数」；它是一条把未发生的事拦在外面的规则。这种数只有
+/// 两种合法归宿：被一条读数导出（`derived`，带「换输入值就变」的证明），或者
+/// **不存在**（那个界被删掉，改用进度检测与事实反馈）。
+///
+/// 下面这份名单是 2026-11-16 的读数：18 行界形数字仍标着 `fixed`。名单**只减不增**
+/// ——新提出一条界形数字而标成 `fixed` 就是红，而那正是这条门要拦的那一笔。
+const BOUND_SHAPED_FIXED_AT_CENSUS: &[&str] = &[
+    "backends.meilisearch.replicas",
+    "backends.postgres.replicas",
+    "backends.redis.replicas",
+    "backends.qdrant.replicas",
+    "backends.nats.replicas",
+    "backends.seaweedfs.replicas",
+    "backup.successfulJobsHistoryLimit",
+    "backup.failedJobsHistoryLimit",
+    "backup.backoffLimit",
+    "backup.drillBackoffLimit",
+    "clusterRegistry.replicas",
+    "evolution.replicas",
+    "healthProbes.liveness.failureThreshold",
+    "healthProbes.readiness.failureThreshold",
+    "healthProbes.startup.failureThreshold",
+    "healthProbes.progressFile.failureThreshold",
+    "webSearch.replicas",
+    "webFetch.replicas",
+];
+
+/// 界形的最后一段名字。
+const BOUND_SHAPED_SEGMENTS: &[&str] = &[
+    "replicas",
+    "backofflimit",
+    "successfuljobshistorylimit",
+    "failedjobshistorylimit",
+    "failurethreshold",
+    "succthreshold",
+    "max",
+    "min",
+    "cap",
+    "limit",
+    "retries",
+    "timeout",
+];
+
 #[test]
+fn a_bound_shaped_number_is_never_fixed() {
+    let text = read(&repo_root().join(REGISTRY));
+    let mut flagged: Vec<String> = Vec::new();
+    let mut key: Option<String> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("- key: ") {
+            key = Some(rest.trim().to_string());
+            continue;
+        }
+        let Some(source) = line.trim_start().strip_prefix("source: ") else {
+            continue;
+        };
+        let Some(key) = key.take() else { continue };
+        let segment = key.rsplit('.').next().unwrap_or(&key).to_ascii_lowercase();
+        if source.trim() == "fixed"
+            && BOUND_SHAPED_SEGMENTS
+                .iter()
+                .any(|bound| segment.ends_with(bound))
+        {
+            flagged.push(key);
+        }
+    }
+    let known: BTreeSet<&str> = BOUND_SHAPED_FIXED_AT_CENSUS.iter().copied().collect();
+    let new: Vec<&String> = flagged
+        .iter()
+        .filter(|key| !known.contains(key.as_str()))
+        .collect();
+    assert!(
+        new.is_empty(),
+        "这几条是界形的数字（副本数 / 重试上限 / 失败阈值 / 历史条数），却标着 `fixed`：\n{}\n\
+         界不是约定：它要么由一条读数导出（`derived`，带「换输入值就变」的证明），\
+         要么被删掉，改用进度检测与事实反馈。",
+        new.iter()
+            .map(|key| format!("  {key}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let stale: Vec<&&str> = known
+        .iter()
+        .filter(|key| !flagged.iter().any(|found| found == **key))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "名单里这几条已经不再是界形 `fixed` 了（改成 derived 或删掉了），把名单里的行也删掉：\
+         \n{}",
+        stale
+            .iter()
+            .map(|key| format!("  {key}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 fn the_registry_vocabulary_has_no_override() {
     assert_eq!(
         serde_yaml::from_str::<Source>("derived").expect("`derived` is a source"),
