@@ -1768,6 +1768,25 @@ mod tests {
         );
     }
 
+    /// 上限只声明一次：schema 的 `maxItems` 带着那个数，拒绝时的判词也带着那个数，
+    /// 描述里再抄一份字面量，改常量那一天它就成了假话，而不会有任何东西变红。
+    #[test]
+    fn a_batch_limit_is_stated_where_it_is_enforced_not_in_the_prose() {
+        let tool = builtins::read_file();
+        let described = tool.description.to_lowercase();
+        assert!(
+            !described.contains("at most")
+                && !described.contains(&READ_FILE_MAX_BATCH.to_string()),
+            "the description restates the batch limit the schema and the refusal already carry: {}",
+            tool.description
+        );
+        assert_eq!(
+            tool.parameters["properties"]["paths"]["maxItems"],
+            serde_json::json!(READ_FILE_MAX_BATCH),
+            "the schema stopped carrying the batch limit, so nothing states it before the call"
+        );
+    }
+
     /// 带行范围读时只回那一段，但必须同时说清文件有多长、后面还有没有：
     /// 只回切片，读到的人会以为文件到那里就结束了；不回这一段，整份正文就
     /// 要进上下文，并且之后每一轮都跟着重发。
@@ -2956,7 +2975,7 @@ pub mod builtins {
                         "type": "array",
                         "items": { "type": "string" },
                         "maxItems": READ_FILE_MAX_BATCH,
-                        "description": "Several file paths to read in this one call; the result is an array of entries in the same order, each with path and either content or error. Give either path or paths, not both. At most 8 files per call"
+                        "description": "Several file paths to read in this one call; the result is an array of entries in the same order, each with path and either content or error"
                     },
                     "offset": {
                         "type": "integer",
