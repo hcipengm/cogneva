@@ -127,7 +127,7 @@ fn message_arg(code: &str) -> Option<&str> {
     let mut best: Option<(usize, usize)> = None; // (位置, 调用长度)
     for call in MESSAGE_CALLS {
         if let Some(at) = code.find(call) {
-            if best.map_or(true, |(earliest, _)| at < earliest) {
+            if best.is_none_or(|(earliest, _)| at < earliest) {
                 best = Some((at, call.len()));
             }
         }
