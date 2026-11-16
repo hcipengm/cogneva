@@ -19,7 +19,7 @@
 //! 上（`messages` 已被 081 删掉、`alerts` 与四张指标表由 store 建）。当时链上没有任何
 //! 一条判据看这件事，红只在演练里出现——也就是只在一个已经装不下的时候出现。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::common;
