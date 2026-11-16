@@ -47,28 +47,13 @@ CREATE TABLE IF NOT EXISTS alerts (
             )
 ;
 -- 标签集只整块读，所以它从 jsonb 降成 text（与库只存列那条线一致）。老库上这一列
--- 还是 jsonb：`CREATE TABLE IF NOT EXISTS` 不会改已有列，所以降类型必须是显式一步，
--- 且只在还是 jsonb 时做——已经降过的库上重复降一次是错误。
-DO $labels$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'alerts'
-           AND column_name = 'labels'
-           AND data_type = 'jsonb'
-    ) THEN
-        ALTER TABLE alerts ALTER COLUMN labels DROP DEFAULT;
-        ALTER TABLE alerts ALTER COLUMN labels TYPE TEXT USING labels::text;
-        ALTER TABLE alerts ALTER COLUMN labels SET DEFAULT '{}';
-    END IF;
-END
-$labels$;
+-- 还是 jsonb，而 `CREATE TABLE IF NOT EXISTS` 不会改已有列，所以降类型是显式两步：
+-- 先摘掉 jsonb 的默认值（它的类型没法自动转），再降类型。两步都是「catalog 已经
+-- 是那个形状就别再跑」的语句，因而第二次启动不会为它们去要锁。
+ALTER TABLE alerts ALTER COLUMN labels DROP DEFAULT;
+ALTER TABLE alerts ALTER COLUMN labels TYPE TEXT USING labels::text;
 -- `source` 是 labels 里唯一被按值查的键，升成真列；其余部分只整块读，存 text。
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source TEXT
-;
--- 这一列加上之前的行只有标签集：把来源回填一次，否则它们永远不进任何来源的读数。
-UPDATE alerts SET source = labels::jsonb ->> 'source'
- WHERE source IS NULL AND (labels::jsonb ? 'source')
 ;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
 ;
