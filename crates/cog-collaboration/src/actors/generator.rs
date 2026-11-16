@@ -642,7 +642,10 @@ mod tests {
             ("the formatter's command", "cargo fmt --all"),
             ("the linter's command", "cargo clippy --workspace"),
             ("the apply check", "git apply --check"),
-            ("the suite's pre/post criterion", "passed on the tree before your change"),
+            (
+                "the suite's pre/post criterion",
+                "passed on the tree before your change",
+            ),
             ("the metric-name convention", "The metric name set"),
             ("the reproduction pair", "not_reproduced"),
         ] {

@@ -348,8 +348,9 @@ async fn every_stable_half_carries_the_answer_shape_and_nothing_else() {
             .find(|(r, _, _)| *r == role)
             .map(|(_, agent, _)| agent)
             .unwrap_or_else(|| panic!("{role} sent no document to read"));
-        let contract: serde_json::Value = serde_json::from_str(&stable_half(agent.inputs()[0].clone()))
-            .unwrap_or_else(|e| panic!("{role}'s stable half is not JSON: {e}"));
+        let contract: serde_json::Value =
+            serde_json::from_str(&stable_half(agent.inputs()[0].clone()))
+                .unwrap_or_else(|e| panic!("{role}'s stable half is not JSON: {e}"));
         let keys: std::collections::BTreeSet<&str> = contract
             .as_object()
             .unwrap_or_else(|| panic!("{role}'s stable half is not an object: {contract}"))
