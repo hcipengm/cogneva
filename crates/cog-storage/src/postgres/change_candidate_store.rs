@@ -50,20 +50,40 @@ ON CONFLICT (writer, idempotency_key) DO NOTHING";
 /// 「后来怎么了」。按身份各取最后一条再拼起来，是「这一行现在长什么样」的最小查询。
 const LAST_EVENT_SQL: &str = "\
 WITH latest AS (\
-    SELECT DISTINCT ON (subject_id) subject_id, event_id, kind, attributes\
+    SELECT DISTINCT ON (subject_id) subject_id, event_id, kind, attributes, payload_version\
       FROM cogneva_event\
      WHERE kind = ANY($1)\
      ORDER BY subject_id, event_id DESC\
 ), origin AS (\
-    SELECT DISTINCT ON (subject_id) subject_id, attributes\
+    SELECT DISTINCT ON (subject_id) subject_id, attributes, payload_version\
       FROM cogneva_event\
      WHERE kind = $2\
      ORDER BY subject_id, event_id DESC\
 ) \
-SELECT latest.subject_id, latest.event_id, latest.kind, latest.attributes, origin.attributes \
+SELECT latest.subject_id, latest.event_id, latest.kind, latest.attributes, latest.payload_version, \
+       origin.attributes, origin.payload_version \
   FROM latest JOIN origin USING (subject_id)";
 
-type RowSnapshot = (String, String, String, String, String);
+type RowSnapshot = (String, String, String, String, i32, String, i32);
+
+/// 这一版代码读得懂的载荷版本，按 kind 一张表。
+///
+/// 表里没有的 (kind, version) 组合**不是错误**：它是「这条事件是后来的版本写的」。
+/// 不猜、不丢——行照样读出来，标 `undecodable`，原文仍在库里（事件只追加，没人改它）。
+/// 把读不懂的行按当前格式硬解释，得到的是一组静默的错误值；那比缺一行更坏。
+const READABLE_PAYLOAD_VERSIONS: [(&str, i32); 4] = [
+    (CANDIDATE_KIND, 1),
+    (MEASURED_KIND, 1),
+    (ACCEPTED_KIND, 1),
+    (REJECTED_KIND, 1),
+];
+
+/// 这一版代码读不读得懂这一条事件的载荷。
+fn payload_is_readable(kind: &str, version: i32) -> bool {
+    READABLE_PAYLOAD_VERSIONS
+        .iter()
+        .any(|(known_kind, known_version)| *known_kind == kind && *known_version == version)
+}
 
 fn to_sf(err: sqlx::Error) -> SFError {
     SFError::Database(err.to_string())
@@ -148,9 +168,19 @@ impl PgChangeCandidateStore {
             .await
             .map_err(to_sf)?;
         rows.into_iter()
-            .map(|(subject_id, event_id, kind, attributes, origin)| {
-                candidate_from_events(&subject_id, &event_id, &kind, &attributes, &origin)
-            })
+            .map(
+                |(subject_id, event_id, kind, attributes, version, origin, origin_version)| {
+                    candidate_from_events(&RowInput {
+                        subject_id: &subject_id,
+                        event_id: &event_id,
+                        kind: &kind,
+                        decision_attributes: &attributes,
+                        decision_version: version,
+                        origin_attributes: &origin,
+                        origin_version,
+                    })
+                },
+            )
             .collect()
     }
 }
@@ -160,13 +190,44 @@ impl PgChangeCandidateStore {
 /// 读不懂的载荷不是错误也不是空行：它是「这一行说过什么，而这一版代码读不懂」——
 /// 于是正文留空、描述说清楚，状态照常从事件种类读出来。丢掉整行会让一条被拒绝的
 /// 变更重新出现在待办里，那比读不懂更坏。
-fn candidate_from_events(
-    subject_id: &str,
-    event_id: &str,
-    kind: &str,
-    decision_attributes: &str,
-    origin_attributes: &str,
-) -> SFResult<ChangeCandidate> {
+/// 拼一行要的那几条事件字段。参数多于七个时按名字分组，读的人不必数位置。
+struct RowInput<'a> {
+    subject_id: &'a str,
+    event_id: &'a str,
+    kind: &'a str,
+    decision_attributes: &'a str,
+    decision_version: i32,
+    origin_attributes: &'a str,
+    origin_version: i32,
+}
+
+/// 读不懂的一行：状态照常从事件种类读出来，内容留空，并标明这一版读不懂。
+fn undecodable_row(subject_id: &str, event_id: &str, status: &str) -> ChangeCandidate {
+    ChangeCandidate {
+        artifact_id: subject_id.to_string(),
+        kind: String::new(),
+        description: String::new(),
+        content: String::new(),
+        created_at: DateTime::<Utc>::MIN_UTC,
+        eval_summary: None,
+        tiering: None,
+        recorded_status: "undecodable".to_string(),
+        status: status.to_string(),
+        decision_reason: None,
+        event_id: event_id.to_string(),
+    }
+}
+
+fn candidate_from_events(input: &RowInput<'_>) -> SFResult<ChangeCandidate> {
+    let RowInput {
+        subject_id,
+        event_id,
+        kind,
+        decision_attributes,
+        decision_version,
+        origin_attributes,
+        origin_version,
+    } = *input;
     let status = match kind {
         ACCEPTED_KIND => "accepted",
         REJECTED_KIND => "rejected",
@@ -174,26 +235,21 @@ fn candidate_from_events(
     };
 
     // 读不懂的载荷不是错误，也不是空行：它是「这一行说过什么，而这一版代码读不懂」。
-    // 丢掉整行会让一条被拒绝的变更重新出现在待办里——那比读不懂更坏。所以正文留空、
-    // 状态标 `undecodable`，状态词照常从事件种类读出来。
-    let (Ok(origin), Ok(decision)) = (
+    // 两件事都算读不懂：载荷解不出来，或者它是这一版没有解码器的版本。丢掉整行会让
+    // 一条被拒绝的变更重新出现在待办里——那比读不懂更坏。所以正文留空、状态标
+    // `undecodable`，状态词照常从事件种类读出来，原文仍在库里。
+    let readable = payload_is_readable(CANDIDATE_KIND, origin_version)
+        && payload_is_readable(kind, decision_version);
+    let parsed = (
         serde_json::from_str::<serde_json::Value>(origin_attributes),
         serde_json::from_str::<serde_json::Value>(decision_attributes),
-    ) else {
-        return Ok(ChangeCandidate {
-            artifact_id: subject_id.to_string(),
-            kind: String::new(),
-            description: String::new(),
-            content: String::new(),
-            created_at: DateTime::<Utc>::MIN_UTC,
-            eval_summary: None,
-            tiering: None,
-            recorded_status: "undecodable".to_string(),
-            status: status.to_string(),
-            decision_reason: None,
-            event_id: event_id.to_string(),
-        });
+    );
+    let (Ok(origin), Ok(decision)) = parsed else {
+        return Ok(undecodable_row(subject_id, event_id, status));
     };
+    if !readable {
+        return Ok(undecodable_row(subject_id, event_id, status));
+    }
     let text = |value: &serde_json::Value, key: &str| -> Option<String> {
         value.get(key).and_then(|v| v.as_str()).map(str::to_string)
     };
@@ -327,19 +383,30 @@ mod tests {
         })
         .to_string();
 
-        let pending = candidate_from_events("c1", "e1", "change_candidate", &origin, &origin)
-            .expect("a candidate row reads");
+        let pending = candidate_from_events(&RowInput {
+            subject_id: "c1",
+            event_id: "e1",
+            kind: CANDIDATE_KIND,
+            decision_attributes: &origin,
+            decision_version: 1,
+            origin_attributes: &origin,
+            origin_version: 1,
+        })
+        .expect("a candidate row reads");
         assert_eq!(pending.status, "candidate");
         assert!(pending.is_pending());
         assert_eq!(pending.decision_reason, None);
 
-        let rejected = candidate_from_events(
-            "c1",
-            "e2",
-            "change_rejected",
-            &serde_json::json!({ "reason": "tests failed" }).to_string(),
-            &origin,
-        )
+        let decision = serde_json::json!({ "reason": "tests failed" }).to_string();
+        let rejected = candidate_from_events(&RowInput {
+            subject_id: "c1",
+            event_id: "e2",
+            kind: REJECTED_KIND,
+            decision_attributes: &decision,
+            decision_version: 1,
+            origin_attributes: &origin,
+            origin_version: 1,
+        })
         .expect("a rejected row reads");
         assert_eq!(rejected.status, "rejected");
         assert_eq!(rejected.decision_reason.as_deref(), Some("tests failed"));
@@ -352,12 +419,43 @@ mod tests {
     /// 一条空候选会让「这一版代码读不懂」看起来像「这条变更没有内容」。
     #[test]
     fn an_undecodable_payload_keeps_its_row_and_says_so() {
-        let row = candidate_from_events("c9", "e9", "change_rejected", "not json", "not json")
-            .expect("an unreadable payload is not an unreadable row");
+        let row = candidate_from_events(&RowInput {
+            subject_id: "c9",
+            event_id: "e9",
+            kind: REJECTED_KIND,
+            decision_attributes: "not json",
+            decision_version: 1,
+            origin_attributes: "not json",
+            origin_version: 1,
+        })
+        .expect("an unreadable payload is not an unreadable row");
         assert_eq!(row.status, "rejected");
         assert_eq!(row.recorded_status, "undecodable");
         assert!(row.content.is_empty());
         assert_eq!(row.event_id, "e9");
+    }
+
+    /// 版本 99 的载荷：这一版没有它的解码器。行照样读出来、标 `undecodable`，
+    /// 原文仍在库里——不猜、不丢。
+    #[test]
+    fn a_payload_from_a_later_version_is_kept_and_marked_undecodable() {
+        let attributes = serde_json::json!({ "kind": "code_change", "content": "x" }).to_string();
+        let row = candidate_from_events(&RowInput {
+            subject_id: "c8",
+            event_id: "e8",
+            kind: CANDIDATE_KIND,
+            decision_attributes: &attributes,
+            decision_version: 99,
+            origin_attributes: &attributes,
+            origin_version: 99,
+        })
+        .expect("a later version is not an error");
+        assert_eq!(row.recorded_status, "undecodable");
+        assert_eq!(row.status, "candidate");
+        assert!(
+            row.content.is_empty(),
+            "reading a version this build has no decoder for would be guessing"
+        );
     }
 
     /// 正文里的时间读不懂时，这一行仍然读得出来：丢掉整行会让一条被拒绝的变更
@@ -371,8 +469,16 @@ mod tests {
             "created_at": "not a time",
         })
         .to_string();
-        let row = candidate_from_events("c1", "e1", "change_candidate", &origin, &origin)
-            .expect("an unreadable time is not an unreadable row");
+        let row = candidate_from_events(&RowInput {
+            subject_id: "c1",
+            event_id: "e1",
+            kind: CANDIDATE_KIND,
+            decision_attributes: &origin,
+            decision_version: 1,
+            origin_attributes: &origin,
+            origin_version: 1,
+        })
+        .expect("an unreadable time is not an unreadable row");
         assert_eq!(row.created_at, DateTime::<Utc>::MIN_UTC);
         assert_eq!(row.content, "x");
     }
