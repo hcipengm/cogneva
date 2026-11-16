@@ -115,6 +115,38 @@ async fn a_decided_candidate_stays_readable_without_a_file() {
     );
 }
 
+/// 把盘上那份 `.diff` 删掉，同一段正文仍然读得回来——它已经在流里。
+///
+/// `.diff` 从「正本」降为「导出工件」，判据就是这一条：盘丢了，事实还在。
+#[tokio::test]
+async fn a_diff_deleted_from_disk_is_still_readable_from_the_stream() {
+    let temp = tempfile::tempdir().unwrap();
+    let change_dir = temp.path().join("changes");
+    tokio::fs::create_dir_all(&change_dir).await.unwrap();
+    let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+    tokio::fs::write(change_dir.join("chg-3.diff"), diff)
+        .await
+        .unwrap();
+
+    let store: Arc<dyn ChangeCandidateStore> =
+        Arc::new(cog_test_support::MemoryCandidateStore::new());
+    let mut row = candidate("chg-3");
+    row.content = diff.to_string();
+    store.record(&row).await.unwrap();
+    let pipeline = cog_reflection::ChangePipeline::new(temp.path(), &change_dir, true)
+        .with_candidates(store.clone());
+
+    tokio::fs::remove_file(change_dir.join("chg-3.diff"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pipeline.read_change_content("chg-3").await.as_deref(),
+        Some(diff),
+        "the diff text travels with the candidate; the file on disk is an export"
+    );
+}
+
 /// 写队列的那个模块里没有任何一处拼出 `.json` 路径。
 ///
 /// 这是「不会再长回来」的那一半：行为测试只说得出现在这条路上没有文件，说不出一份

@@ -271,7 +271,9 @@ impl ChangeCandidateStore for PgChangeCandidateStore {
     }
 
     async fn pending(&self) -> SFResult<Vec<ChangeCandidate>> {
-        let mut rows = self.rows(&[CANDIDATE_KIND]).await?;
+        // 状态事件也算「最后一条」：读待办的人要的是这一行**此刻**的状态词，
+        // 不是它生成时的那一个。
+        let mut rows = self.rows(&CHANGE_KINDS).await?;
         rows.retain(ChangeCandidate::is_pending);
         rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
         Ok(rows)
