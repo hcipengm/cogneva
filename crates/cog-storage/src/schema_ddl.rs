@@ -525,6 +525,15 @@ enum Check {
         table: String,
         column: String,
     },
+    /// `ALTER TABLE … ADD CONSTRAINT <name> …`: done when a constraint of that
+    /// name is on the table. Added for the one check the usage ledger carries —
+    /// "a row that spent tokens names its task" — because a store that states it
+    /// in its startup batch would otherwise have an opaque statement in a batch
+    /// that is otherwise catalog-only.
+    ConstraintExists {
+        table: String,
+        constraint: String,
+    },
     /// `ALTER TABLE … ALTER COLUMN … TYPE <type>`: the statement is done when
     /// the column already holds that type. A store reaching this shape is one
     /// moving a column off `jsonb` onto `text` -- the conversion the storage
@@ -612,6 +621,12 @@ fn classify(statement: &str) -> Option<Check> {
                 return Some(Check::ColumnExists {
                     table,
                     column: name(8)?,
+                });
+            }
+            if word(3) == Some("add") && word(4) == Some("constraint") {
+                return Some(Check::ConstraintExists {
+                    table,
+                    constraint: name(5)?,
                 });
             }
             if word(3) == Some("alter") && word(4) == Some("column") {
@@ -787,6 +802,35 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
         .await
         .map_err(|e| SFError::Database(format!("read the catalog's indexes: {e}")))?;
         if present.len() != indexes.len() {
+            return Ok(false);
+        }
+    }
+
+    let constraints: Vec<(String, String)> = checks
+        .iter()
+        .filter_map(|check| match check {
+            Check::ConstraintExists { table, constraint } => {
+                Some((table.clone(), constraint.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if !constraints.is_empty() {
+        let tables: Vec<String> = constraints.iter().map(|(table, _)| table.clone()).collect();
+        let names: Vec<String> = constraints.iter().map(|(_, name)| name.clone()).collect();
+        let present: Vec<String> = sqlx::query_scalar(
+            "SELECT con.conname
+               FROM unnest($1::text[], $2::text[]) AS want(tbl, name)
+               JOIN pg_class c ON c.relname = want.tbl
+               JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = current_schema()
+               JOIN pg_constraint con ON con.conrelid = c.oid AND con.conname = want.name",
+        )
+        .bind(&tables)
+        .bind(&names)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read the catalog's constraints: {e}")))?;
+        if present.len() != constraints.len() {
             return Ok(false);
         }
     }
@@ -1045,6 +1089,13 @@ mod tests {
             Some(Check::ColumnHasNoDefault {
                 table: "entries".into(),
                 column: "seen".into()
+            })
+        );
+        assert_eq!(
+            read("ALTER TABLE entries ADD CONSTRAINT entries_has_owner CHECK (owner IS NOT NULL) NOT VALID"),
+            Some(Check::ConstraintExists {
+                table: "entries".into(),
+                constraint: "entries_has_owner".into()
             })
         );
         // 把一列从 jsonb 搬到 text 是存储终态要求的那一步，而它的第二句在第二次

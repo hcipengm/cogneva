@@ -451,6 +451,14 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS retry_after_secs BIGINT;
 -- 行也是 `NULL`（没有记录），那些行不进任何一份计数——发布当天宁可少算，
 -- 不把同一笔数两遍。
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS refused_scope TEXT;
+-- A row that spent tokens has to name the task it spent them on. Storage's
+-- third invariant, in the only form that does not invent a fact: the rows
+-- written before the gateway started passing a task cannot be given one
+-- afterwards, so the constraint is NOT VALID -- it checks every row inserted
+-- from here on and leaves history as the history it is. Refusals may spend
+-- nothing and name no task; the condition says exactly that.
+ALTER TABLE gateway_llm_usage ADD CONSTRAINT usage_that_spent_names_its_task
+    CHECK (tokens_input + tokens_output <= 0 OR task_id IS NOT NULL) NOT VALID;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
 -- 窗口配速那一次读按 `(upstream, result)` 与 `(upstream, refusal_kind)` 各取一
 -- 小撮，而表里绝大多数行是熔断拒绝（`upstream = '-'`，与任何一家都不匹配）。没有
