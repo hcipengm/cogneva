@@ -2538,6 +2538,7 @@ fn evidence_refs_arg(args: &serde_json::Value) -> Result<Vec<String>, serde_json
     }
 }
 
+// prompt: consumed by crates/cog-core/src/contract/change_ledger.rs::ChangeState
 fn dispatch_change_tool(
     changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
     orchestrator: Arc<dyn OrchestratorControl>,

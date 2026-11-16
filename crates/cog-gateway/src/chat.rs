@@ -218,6 +218,7 @@ pub fn user_message(text: &str, attachments: &[cog_core::ChatAttachment]) -> cog
 /// 顺序与理由同 [`user_message`]：先是人说的字，然后是他点名的文件的内容，最后
 /// 是图。文件排在媒体前面，因为一句话里「@ 的那份代码」与「这张截图」是两件事，
 /// 前者要能顺着句子读下去。
+// prompt: not-an-instruction — 全空时返回的空消息占位；调用方已拦掉没有内容的请求
 pub fn user_message_with_mentions(
     text: &str,
     mentions: &[FileMention],

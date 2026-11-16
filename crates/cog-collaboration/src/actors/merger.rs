@@ -56,6 +56,7 @@ impl MergerActor {
 
     /// Ask the underlying agent to pick the best branch or synthesize a merged
     /// result from the provided branch outputs.
+    // prompt: consumed by crates/cog-collaboration/src/actors/merger.rs::parse_merge_result
     pub async fn merge(
         &self,
         task: &cog_core::Task,

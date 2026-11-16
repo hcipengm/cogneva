@@ -646,6 +646,7 @@ impl LLMProvider for GoogleProvider {
         Ok(stream.result().await)
     }
 
+    // prompt: not-an-instruction — 探活请求，模型看不到它
     async fn health_check(&self) -> bool {
         match self
             .chat(

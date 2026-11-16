@@ -280,6 +280,15 @@ pub fn production_lines_keeping_comments(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The production half with its comments left in, still numbered.
+///
+/// A gate that reports `file:line` **and** reads a marker out of a comment needs
+/// both halves of the same boundary: dropping the comments loses the marker,
+/// renumbering after a filter points at the wrong statement.
+pub fn production_numbered_lines_keeping_comments(text: &str) -> Vec<(usize, &str)> {
+    production_numbered_impl(text, true)
+}
+
 /// One flag per line: true when that line is production.
 ///
 /// The projection for a caller that blanks the test half in place instead of

@@ -43,6 +43,7 @@ struct TaskConfig {
 }
 
 impl ToolathlonCaseSource {
+    // prompt: not-an-instruction — 只组装用例元数据与路径；系统提示词来自该用例目录里的 docs/agent_system_prompt.md
     fn dir_to_case(dir: &Path) -> anyhow::Result<EvalCase> {
         let name = dir
             .file_name()

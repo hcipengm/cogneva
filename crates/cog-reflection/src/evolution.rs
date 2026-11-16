@@ -494,6 +494,7 @@ impl EvolutionEngine {
 
     /// Refine an existing skill by feeding its accumulated learnings and
     /// errors into the LLM and generating an improved `SkillConfig`.
+    // prompt: declared reflection:evolution_refinement
     pub async fn refine_skill(&self, skill_id: &str) -> SFResult<Option<EvolutionResult>> {
         let existing = {
             let reg = self.skill_registry.read().await;
@@ -601,6 +602,7 @@ impl EvolutionEngine {
     /// Synthesize a [`cog_core::HookDef`] from a recurring event pattern using the LLM.
     /// The generated hook is written to `change_dir/hooks/{id}.json` and can be
     /// loaded by the caller into a hook engine.
+    // prompt: consumed by crates/cog-core/src/contract/hook.rs::HookDef
     pub async fn synthesize_hook(
         &self,
         event_pattern: &str,
@@ -764,6 +766,7 @@ impl EvolutionEngine {
     /// Suggest an improved tool variant based on error patterns using the LLM.
     /// The generated tool schema is written to `change_dir/tools/{name}.json` and
     /// can be registered by the caller into a tool registry.
+    // prompt: declared reflection:evolution_tool
     pub async fn suggest_tool_variant(
         &self,
         tool_name: &str,

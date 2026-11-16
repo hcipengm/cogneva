@@ -91,6 +91,7 @@ impl ModeratorActor {
     /// owns: the debate applies it to every round's own score before asking, so
     /// what it is being asked is what to do about a debate that did not confirm
     /// — never whether it did.
+    // prompt: consumed by crates/cog-collaboration/src/actors/moderator.rs::parse_moderator_output
     pub async fn moderate(
         &self,
         task: &cog_core::Task,

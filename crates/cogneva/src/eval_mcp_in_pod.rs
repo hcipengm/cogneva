@@ -539,6 +539,7 @@ impl ToolFace {
     /// 里逐字是 `seen_names` ＋ 一条 warning）。这不是可以随手改成报错的地方——上游撞名
     /// 时照样跑完，报错会让某些题从「有分」变成「没跑成」，而这道题的分数并不因为撞名
     /// 而失去意义，只是少了一件工具。丢掉的那几件在这里留一条告警，别静默。
+    // prompt: not-an-instruction — 逐字转发 server 自己声明的工具描述与参数 schema
     pub fn build(servers: &[ConnectedServer]) -> Self {
         let mut definitions = Vec::new();
         let mut routes = HashMap::new();

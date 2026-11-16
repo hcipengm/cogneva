@@ -885,6 +885,7 @@ impl SelfReviewLoop {
     }
 
     /// Step 5: Revise — ask the LLM to improve the output.
+    // prompt: consumed by crates/cog-agent/src/self_review.rs::extract_text
     pub async fn revise(
         result: &SelfReviewResult,
         original: &str,

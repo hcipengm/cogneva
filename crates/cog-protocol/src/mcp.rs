@@ -119,6 +119,7 @@ impl McpServer {
     }
 
     /// 执行 MCP tool 调用。
+    // prompt: fixed — MCP JSON-RPC 的字段名与 content 块形状
     pub async fn call_tool(&self, call: McpToolCall) -> anyhow::Result<McpToolResult> {
         let tool = self
             .tools

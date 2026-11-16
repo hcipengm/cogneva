@@ -575,6 +575,7 @@ fn principles_block(input: &serde_json::Value) -> Option<serde_json::Value> {
     }))
 }
 
+// prompt: contract — enforced by crates/cog-collaboration/src/actors/generator.rs::the_change_contract_answers_every_refusal_cause
 fn change_generation_contract() -> serde_json::Value {
     serde_json::json!({
         "output_format": "unified_diff",
