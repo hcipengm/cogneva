@@ -36,6 +36,7 @@ pub mod host_ledger;
 pub mod hot_reload;
 pub mod mcp_serve;
 pub mod mcp_tools;
+pub mod metric_projection_rebuild;
 pub mod owner_memory;
 pub mod permission_rules;
 pub mod pidfile;

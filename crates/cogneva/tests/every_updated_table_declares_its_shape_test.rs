@@ -185,6 +185,24 @@ fn updated_tables(root: &Path) -> BTreeSet<String> {
                 out.insert(name);
             }
         }
+        // 一次 upsert 也是原地改：`INSERT … ON CONFLICT … DO UPDATE SET` 改的是已经
+        // 在库里的那一行。只认 `UPDATE <t> SET` 会把这类表读成「从不更新」——而它们
+        // 恰恰是最需要说清形状的那一批（累加表就是这么写的）。
+        let mut rest = lower.as_str();
+        while let Some(at) = rest.find("insert into ") {
+            rest = &rest[at + "insert into ".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let rest_of_statement = rest.split(';').next().unwrap_or_default();
+            if rest_of_statement.contains("do update set") {
+                out.insert(name);
+            }
+        }
     }
     out
 }

@@ -120,6 +120,9 @@ CREATE TABLE IF NOT EXISTS cog_metric_counter_totals (
                 -- 名册那一步对四张表问同一个问题（「这行的上游还在新鲜名册上吗」），
                 -- 所以四张表都带这一列；它只是标签集里那一个键的投影。
                 upstream TEXT,
+                -- 水位：这一行是**哪一刻**的读数。写入端写 NOW()，重建命令把整个表按
+                -- Prometheus 的当前值重写并把它写成那一次查询的时刻。
+                as_of TIMESTAMPTZ,
                 value DOUBLE PRECISION NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (name, labels)
@@ -129,6 +132,7 @@ CREATE TABLE IF NOT EXISTS cog_metric_histogram_buckets (
                 name TEXT NOT NULL,
                 labels TEXT NOT NULL DEFAULT '{}',
                 upstream TEXT,
+                as_of TIMESTAMPTZ,
                 bucket INTEGER NOT NULL,
                 observations BIGINT NOT NULL,
                 PRIMARY KEY (name, labels, bucket)
@@ -138,6 +142,7 @@ CREATE TABLE IF NOT EXISTS cog_metric_histogram_sums (
                 name TEXT NOT NULL,
                 labels TEXT NOT NULL DEFAULT '{}',
                 upstream TEXT,
+                as_of TIMESTAMPTZ,
                 sum DOUBLE PRECISION NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (name, labels)
@@ -482,8 +487,8 @@ const SAMPLE_INSERT_SQL: &str = r#"
 
 /// `SUM` over the batch, so one series is one row for the upsert to touch.
 const COUNTER_TOTAL_UPSERT_SQL: &str = r#"
-    INSERT INTO cog_metric_counter_totals (name, labels, upstream, value)
-    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', SUM(t.value)
+    INSERT INTO cog_metric_counter_totals (name, labels, upstream, as_of, value)
+    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', NOW(), SUM(t.value)
     FROM unnest($1::text[], $2::text[], $3::float8[]) AS t(name, labels, value)
     GROUP BY t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream'
     ON CONFLICT (name, labels)
@@ -492,8 +497,8 @@ const COUNTER_TOTAL_UPSERT_SQL: &str = r#"
 "#;
 
 const HISTOGRAM_BUCKET_UPSERT_SQL: &str = r#"
-    INSERT INTO cog_metric_histogram_buckets (name, labels, upstream, bucket, observations)
-    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', t.bucket,
+    INSERT INTO cog_metric_histogram_buckets (name, labels, upstream, as_of, bucket, observations)
+    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', NOW(), t.bucket,
            SUM(t.observations)
     FROM unnest($1::text[], $2::text[], $3::int4[], $4::int8[]) AS t(name, labels, bucket, observations)
     GROUP BY t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', t.bucket
@@ -502,8 +507,8 @@ const HISTOGRAM_BUCKET_UPSERT_SQL: &str = r#"
 "#;
 
 const HISTOGRAM_SUM_UPSERT_SQL: &str = r#"
-    INSERT INTO cog_metric_histogram_sums (name, labels, upstream, sum)
-    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', SUM(t.value)
+    INSERT INTO cog_metric_histogram_sums (name, labels, upstream, as_of, sum)
+    SELECT t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream', NOW(), SUM(t.value)
     FROM unnest($1::text[], $2::text[], $3::float8[]) AS t(name, labels, value)
     GROUP BY t.name, t.labels::jsonb::text, t.labels::jsonb ->> 'upstream'
     ON CONFLICT (name, labels)

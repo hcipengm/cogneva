@@ -73,8 +73,13 @@ pub fn tables_in(text: &str) -> BTreeMap<String, BTreeSet<String>> {
         let trimmed = line.trim();
         let lower = trimmed.to_ascii_lowercase();
         if in_table.is_none() {
+            // 一个 `CREATE TABLE` 不必从行首开始：`pub const DDL: &str = "CREATE TABLE
+            // IF NOT EXISTS cogneva_owner_leases (` 就是这样写的。只认行首会把这类
+            // 表读成「树上没有」，而那条判据的方向是「没有声明就红」——它不红，它
+            // 一句也不说。
             for opening in ["create table if not exists ", "create table "] {
-                if let Some(rest) = lower.strip_prefix(opening) {
+                if let Some(at) = lower.find(opening) {
+                    let rest = &lower[at + opening.len()..];
                     let name: String = rest
                         .chars()
                         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')

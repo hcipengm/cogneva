@@ -55,6 +55,124 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
         },
     },
     DeclaredTable {
+        table: "cog_metric_counter_totals",
+        shape: TableShape::Projection {
+            reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
+            watermark: "as_of",
+            rebuild: "crates/cog-observability/src/metric_projection.rs",
+        },
+    },
+    DeclaredTable {
+        table: "cog_metric_histogram_buckets",
+        shape: TableShape::Projection {
+            reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
+            watermark: "as_of",
+            rebuild: "crates/cog-observability/src/metric_projection.rs",
+        },
+    },
+    DeclaredTable {
+        table: "cog_metric_histogram_sums",
+        shape: TableShape::Projection {
+            reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
+            watermark: "as_of",
+            rebuild: "crates/cog-observability/src/metric_projection.rs",
+        },
+    },
+    DeclaredTable {
+        table: "alert_assertions",
+        shape: TableShape::Document {
+            why: "一条断言是「这次评估里这一条规则说了什么」：同一个断言键被下一轮评估覆盖，而不是每轮追加一行——读者问的是「现在这条规则怎么说」。",
+        },
+    },
+    DeclaredTable {
+        table: "change_ledger_sources",
+        shape: TableShape::Document {
+            why: "一份变更的引用按 `doc` 唯一：同一份文档改口时更新那一行，而不是再记一条；引用集就是这一张表的当前内容。",
+        },
+    },
+    DeclaredTable {
+        table: "cog_checkpoints",
+        shape: TableShape::Document {
+            why: "一个检查点是「这里能恢复」的当前值：同一个 id 再写一次就覆盖，恢复要读的是最新那一份。",
+        },
+    },
+    DeclaredTable {
+        table: "cog_context_boards",
+        shape: TableShape::Document {
+            why: "一块上下文板是这一轮装配出来的当前内容：再装配一次就覆盖掉同一块板。\
+                  它不是历史——读者要的是「这一轮喂给模型的是什么」，而上一轮的板子\
+                  已经被下一轮取代，留下来只会让两个版本都被当成当前值。",
+        },
+    },
+    DeclaredTable {
+        table: "cog_dag_state",
+        shape: TableShape::Document {
+            why: "一个 DAG 的当前状态：`state` 是它的当前值，而它怎么走到这里的在事件里。\
+                  这张表存在的理由是「这一个 DAG 现在能不能继续推进」要一次读出，\
+                  不从事件流折——折一次要读完整条历史，而调度每轮都问。",
+        },
+    },
+    DeclaredTable {
+        table: "cog_observability_metrics",
+        shape: TableShape::Document {
+            why: "上报的读数按 (名字, 标签) 唯一：同一序列再报一次就覆盖成新值，行就是那条序列的当前读数。",
+        },
+    },
+    DeclaredTable {
+        table: "cog_observability_snapshots",
+        shape: TableShape::Document {
+            why: "一次观测的快照按身份唯一：同一个快照再写一次就覆盖成新的那一次结果。\
+                  它描述的是「最近一次观测看到了什么」，而不是每次观测各留一行。",
+        },
+    },
+    DeclaredTable {
+        table: "cog_observability_squads",
+        shape: TableShape::Document {
+            why: "一个 squad 的当前成员与状态：再上报一次就覆盖同一行。\
+                  成员进出的历史不在库里，这一行回答的是「这个 squad 现在有谁」。",
+        },
+    },
+    DeclaredTable {
+        table: "cog_snapshots",
+        shape: TableShape::Document {
+            why: "一个执行快照：同一个 `snapshot_id` 再存一次就覆盖，恢复读的是最新那一份。",
+        },
+    },
+    DeclaredTable {
+        table: "cogneva_owner_leases",
+        shape: TableShape::Document {
+            why: "一把租约的当前持有者与到期时刻：续约改的就是同一行，历史不在库里。\
+                  换手必须先赢下这一行的条件更新——那正是一个追加表做不到的地方：\
+                  「谁现在持有」要一个能被独占的当前值，而不是一串候选。",
+        },
+    },
+    DeclaredTable {
+        table: "explainability",
+        shape: TableShape::Document {
+            why: "一条决策解释按 `record_id` 唯一：同一条再写一次就覆盖，它描述的是那一次决策。",
+        },
+    },
+    DeclaredTable {
+        table: "progress_bounds",
+        shape: TableShape::Document {
+            why: "一条进度轴的当前边界：跑的过程中边界会被推高，行是那个边界的当前值。\
+                  读者问的是「这条轴现在到哪了」，历史每一跳对它没有意义。",
+        },
+    },
+    DeclaredTable {
+        table: "raw_log_index",
+        shape: TableShape::Document {
+            why: "一份原始日志文件的索引按 (流, 日期, 格式) 唯一：同一天同一流换了格式只是多一行，同一个文件再扫一次就覆盖它自己那一行。",
+        },
+    },
+    DeclaredTable {
+        table: "task_plan",
+        shape: TableShape::Document {
+            why: "一个任务的当前计划：重规划覆盖它，而计划的历史在台账里、不在这张表。\
+                  这一行只为「派发时读到的计划是哪一版」服务，版本号由台账给。",
+        },
+    },
+    DeclaredTable {
         table: "alerts",
         shape: TableShape::Document {
             why: "一条告警的生命周期（firing → resolved）就是这一行本身：没有事件日志，\

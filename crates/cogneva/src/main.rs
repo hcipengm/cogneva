@@ -203,6 +203,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 逐格比，然后删库。跑在独立的 CronJob 里，所以源库哪怕连不上也不影响
         // 主应用——但它必须连得上才谈得上演练。
         Command::BackupDrill => cogneva::backup::run_drill_from_env().await,
+        // 指标三张累加表的重建：它们是投影，真源是 Prometheus。样本日志不是来源——
+        // 保留窗口会把旧样本清掉，实测 500 条累加里 469 条已经对不上日志。
+        Command::RebuildMetricProjections => {
+            cogneva::metric_projection_rebuild::run_from_env().await
+        }
         // Torn AOF tail repair: runs in the redis Pod's init container, which is
         // what moves "a host that died uncleanly means truncating the AOF by
         // hand" onto the startup path.

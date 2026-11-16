@@ -25,8 +25,24 @@ pub struct ProjectionReader {
 ///
 /// 「投影表」的判据是水位列（`as_of` 开头的那一列），不是名字：有水位说明这张表
 /// 自报「我读到哪了」，而那是重建得出的表才需要说的话。
-pub const PROJECTION_READERS: &[ProjectionReader] = &[ProjectionReader {
-    table: "task_current",
+pub const PROJECTION_READERS: &[ProjectionReader] = &[
+    ProjectionReader {
+        table: "cog_metric_counter_totals",
+        reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
+        why_not_the_source: "这一行是被观测的进程自己累加的数，真源是 Prometheus 里那条序列；从真源读一次要走一趟网络、并且 Prometheus 不在时读不到，而屏上的每一次刷新都在问它。库里的这一份是投影，用 `cogneva rebuild-metric-projections` 可以按真源整表重写。",
+    },
+    ProjectionReader {
+        table: "cog_metric_histogram_buckets",
+        reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
+        why_not_the_source: "直方图的每档观测数由进程累加、由 Prometheus 保存，从真源算一次 `histogram_quantile` 要读整条序列的历史；库里这一份是那一次累加的投影，重建命令按真源整表重写。",
+    },
+    ProjectionReader {
+        table: "cog_metric_histogram_sums",
+        reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
+        why_not_the_source: "观测值之和与每档计数同源：真源是 Prometheus 的 `<name>_sum`。库里这一份是投影，重建命令按真源整表重写。",
+    },
+    ProjectionReader {
+        table: "task_current",
     reader: "crates/cog-storage/src/postgres/task_ledger.rs",
     why_not_the_source: "台账是一串永不改写的转移行，「现在哪些任务还能动」要读每条任务的全部历史再折一次，而派发每一轮都问这一个问题；投影把那次折叠放在写时做掉，读时是一行一次索引。",
 }];

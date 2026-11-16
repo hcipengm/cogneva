@@ -17,6 +17,7 @@ pub mod infra_watch;
 pub mod jaeger;
 pub mod llm_usage_rollup;
 pub mod logs;
+pub mod metric_projection;
 pub mod metrics;
 pub mod observable;
 pub mod plugin;
