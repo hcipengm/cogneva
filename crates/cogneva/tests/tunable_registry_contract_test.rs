@@ -952,8 +952,7 @@ fn a_port_the_gateway_listens_on_is_told_to_the_process_and_not_only_opened() {
 /// board reports `not_configured` in production while every gate stays green.
 const REQUIRED_ENDPOINTS: &[(&str, &str, &str)] = &[
     (
-        // 名字声明在 core 的 env 表里，读它的两处（读数面与投影重建）都读那个常量。
-        "crates/cog-core/src/env.rs",
+        "crates/cog-gateway/src/readings.rs",
         "COGNEVA_PROMETHEUS_URL",
         "observability.infraWatch.prometheusUrl",
     ),
@@ -991,7 +990,17 @@ fn an_endpoint_the_code_requires_is_filled_by_the_chart() {
     let mut wrong = Vec::new();
     for (code_path, env, leaf) in REQUIRED_ENDPOINTS {
         let code = read(&repo_root().join(code_path));
-        if !code.contains(&format!("env::var(\"{env}\")")) {
+        // 读名字有两种合法写法：拼一个字面量，或者读 `cog_core::env` 里声明过的常量
+        // ——后者是「一个名字只写一处」那条门要求的那一种。判据认两种，否则它会把
+        // 一件被另一个门要求的事报成「这一行过期了」。
+        let declared_as_constant = read(&repo_root().join("crates/cog-core/src/env.rs"))
+            .lines()
+            .find(|line| line.contains(&format!(": &str = \"{env}\"")))
+            .and_then(|line| line.split("pub const ").nth(1))
+            .and_then(|rest| rest.split(':').next())
+            .map(|name| code.contains(&format!("env::var(cog_core::env::{name}")))
+            .unwrap_or(false);
+        if !(code.contains(&format!("env::var(\"{env}\")")) || declared_as_constant) {
             wrong.push(format!(
                 "{code_path} no longer reads {env}, so this row is stale -- either the \
                  endpoint is declared somewhere else now (point this table at it) or the \
