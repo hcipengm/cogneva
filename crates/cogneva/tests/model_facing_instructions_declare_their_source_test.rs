@@ -546,8 +546,12 @@ fn the_words_are_read_the_way_the_header_says() {
     assert!(assigns_contract_field(
         "contract[\"instructions\"] = serde_json::json!("
     ));
-    assert!(assigns_contract_field("    append_instruction(&mut contract, note);"));
-    assert!(!assigns_contract_field("input[\"goal\"] = serde_json::json!(goal);"));
+    assert!(assigns_contract_field(
+        "    append_instruction(&mut contract, note);"
+    ));
+    assert!(!assigns_contract_field(
+        "input[\"goal\"] = serde_json::json!(goal);"
+    ));
     assert!(!assigns_contract_field(
         "let seen = contract[\"instructions\"].as_str();"
     ));

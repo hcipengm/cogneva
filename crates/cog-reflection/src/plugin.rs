@@ -1697,6 +1697,26 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             ));
         }
 
+        // 待落地队列的写者：事件流。挂在这里而不是 init，理由与决策统计表相同
+        // ——发布方（storage 插件）可能与本插件在同一层并行初始化。挂不上不是
+        // 「队列是空的」，是「这份进程没有队列」：生成侧会拒绝一条没有去处可去的
+        // 变更，而不是让它落成一份没人能说出状态的 `.diff`。
+        match ctx.consume_service::<dyn cog_core::ChangeCandidateStore>() {
+            Some(store) => {
+                let attached = crate::change_pipeline::attach_process_candidates(store);
+                if attached {
+                    info!("the change candidate queue is attached to the event stream");
+                } else {
+                    info!("the change candidate queue was already attached by an earlier start");
+                }
+            }
+            None => warn!(
+                "no change candidate store published; generated changes have no queue to be \
+                 recorded in and a generated change will be refused rather than left as an \
+                 unrecorded diff"
+            ),
+        }
+
         // 决策统计的运行时作者从卷上的快照换成共享表。这一步放在 start 而不是
         // init：发布方（storage 插件）可能在 init 期间与本插件并行初始化，那时
         // 读服务表只在运气好时能读到；start 时所有插件的 init 都已完成。挂不上
@@ -3705,7 +3725,10 @@ async fn retire_change_everywhere(
     change_id: &str,
     reason: &str,
 ) {
-    if let Err(e) = pipeline.retire_change(change_id, reason).await {
+    if let Err(e) = pipeline
+        .retire_change(change_id, cog_core::CandidateOutcome::Rejected, reason)
+        .await
+    {
         warn!(
             change_id = %change_id,
             error = %e,
@@ -3750,7 +3773,11 @@ async fn retire_landed_change(
     change_id: &str,
 ) {
     if let Err(e) = pipeline
-        .retire_change(change_id, "landed on the base branch")
+        .retire_change(
+            change_id,
+            cog_core::CandidateOutcome::Accepted,
+            "landed on the base branch",
+        )
         .await
     {
         warn!(
@@ -5310,7 +5337,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
+        pipeline
+            .write_change_record(&crate::types::EvolutionResult {
+                kind: crate::types::EvolutionKind::CodeChange,
+                artifact_id: "chg-1".to_string(),
+                description: "goal".to_string(),
+                content: String::new(),
+                status: crate::types::EvolutionStatus::CompileChecked,
+                created_at: chrono::Utc::now(),
+                eval_summary: None,
+                tiering: None,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(
             pipeline.pending_changes(None).await.unwrap().len(),
@@ -5387,8 +5427,11 @@ mod tests {
         }
     }
 
-    /// 一份同时摆上两份载体的变更：队列里的 `.diff` 与记录里的那条。
-    fn queued_and_recorded() -> (tempfile::TempDir, crate::ChangePipeline, RecordingLanding) {
+    /// 一份同时摆上两份载体的变更：队列里的候选事件与落地记录里的那条。
+    ///
+    /// 队列那一侧要先**记下候选**：一条只在盘上有 `.diff` 的变更是历史遗留的
+    /// 孤儿，队列不认识它，也就没有东西可以退役。
+    async fn queued_and_recorded() -> (tempfile::TempDir, crate::ChangePipeline, RecordingLanding) {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         std::fs::create_dir_all(&change_dir).unwrap();
@@ -5397,7 +5440,20 @@ mod tests {
             "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
         )
         .unwrap();
-        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
+        pipeline
+            .write_change_record(&crate::types::EvolutionResult {
+                kind: crate::types::EvolutionKind::CodeChange,
+                artifact_id: "chg-1".to_string(),
+                description: "goal from the record".to_string(),
+                content: String::new(),
+                status: crate::types::EvolutionStatus::CompileChecked,
+                created_at: chrono::Utc::now(),
+                eval_summary: None,
+                tiering: None,
+            })
+            .await
+            .unwrap();
         let landing = RecordingLanding {
             unverified: std::sync::Mutex::new(vec![generated("chg-1", "goal from the record")]),
             retired: std::sync::Mutex::new(Vec::new()),
@@ -5417,7 +5473,7 @@ mod tests {
     /// 载体里都找不到它。
     #[tokio::test]
     async fn a_refused_change_leaves_both_channels() {
-        let (_temp, pipeline, landing) = queued_and_recorded();
+        let (_temp, pipeline, landing) = queued_and_recorded().await;
 
         assert_eq!(
             pipeline.pending_changes(None).await.unwrap().len(),
@@ -5467,10 +5523,14 @@ mod tests {
     /// 仍把同一条变更交给下一轮。
     #[tokio::test]
     async fn one_channel_alone_brings_a_retired_change_back() {
-        let (_temp, pipeline, landing) = queued_and_recorded();
+        let (_temp, pipeline, landing) = queued_and_recorded().await;
 
         pipeline
-            .retire_change("chg-1", "landing refused the change")
+            .retire_change(
+                "chg-1",
+                cog_core::CandidateOutcome::Rejected,
+                "landing refused the change",
+            )
             .await
             .unwrap();
         assert!(

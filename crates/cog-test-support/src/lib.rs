@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use sqlx::Connection as _;
 
 mod backends;
+mod change_candidates;
 mod literals;
 mod message;
 mod metrics;
@@ -22,6 +23,7 @@ mod state;
 mod task_ledger;
 
 pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
+pub use change_candidates::MemoryCandidateStore;
 pub use literals::{literal_values, literals_in, Literal};
 pub use message::MemoryMessageBackend;
 pub use metrics::MemoryMetricsBackend;

@@ -69,7 +69,11 @@ async fn a_committer_run_twice_does_not_overlap_its_own_shared_artifacts() {
     let temp = tempfile::tempdir().expect("temp dir");
     let queue = temp.path().join("changes");
     tokio::fs::create_dir_all(&queue).await.expect("queue dir");
-    let pipeline = ChangePipeline::new(temp.path(), queue.to_path_buf(), false);
+    // 队列的写者：夹具用一份内存实现，两个并发跑的任务共用它——这正是这条测试
+    // 要证的东西（同一条共享目录上两个写者互不覆盖）。
+    let pipeline = ChangePipeline::new(temp.path(), queue.to_path_buf(), false).with_candidates(
+        std::sync::Arc::new(cog_test_support::MemoryCandidateStore::new()),
+    );
 
     let first = run("chg-first", EvolutionStatus::CompileChecked);
     let second = run("chg-second", EvolutionStatus::AwaitingReview);

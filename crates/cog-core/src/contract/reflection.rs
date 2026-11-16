@@ -2635,6 +2635,117 @@ fn take_tail(text: &str, budget: usize) -> String {
     text.chars().skip(total.saturating_sub(budget)).collect()
 }
 
+/// 待落地队列里的一条候选变更。
+///
+/// 这一行是**投影**：正本是事件流里的 `change_candidate` 与随后的
+/// `change_accepted` / `change_rejected`。为什么不是一份自己写的记录文件：文件在不在
+/// 被当成了「变更在不在」，于是一次重启把「已经判过的」和「刚生成的」读成同一种东西，
+/// 一条永远不可能应用的变更每轮都被重试，而记录只有那一个写者、没有重放、也没人核过它
+/// 与真相是否一致。事件流给它三样文件给不了的东西：身份（同一候选只能被接受一次）、
+/// 因果（谁触发了它）、重放（投影坏了可以从头算）。
+///
+/// `content` 是 diff 正文。它进事件还是进内容寻址存储由读数决定；这一层只约定
+/// 「读回来的是同一串字节」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeCandidate {
+    /// 候选身份：投影按它去重，接受/拒绝事件按它指向候选。
+    pub artifact_id: String,
+    /// 产物种类（`code_change` / `skill_refinement` …）。词表由产生它的那面定，
+    /// 这一层只存词。
+    pub kind: String,
+    pub description: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    /// 产生这一面的那一侧自己的状态词（`compile_checked` / `awaiting_review` …）。
+    ///
+    /// 与 [`Self::status`] 是两个轴：那个是队列里的位置（候选 / 接受 / 拒绝），
+    /// 这个是变更自己走到了哪一步。词表由产生它的那面定，这一层只存词。
+    #[serde(default)]
+    pub recorded_status: String,
+    /// 评估门结论。散文只给人看，判定读 `verdict`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_summary: Option<crate::EvalReport>,
+    /// 路由档位，JSON：档位类型住在产生它的 crate，这一层不解释它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiering: Option<String>,
+    /// 这一行此刻的状态：`candidate` / `accepted` / `rejected`。
+    ///
+    /// 它**不是**一个可写字段：写入路径永远只追加事件，状态是「哪条事件最后发生」
+    /// 读出来的结果。改它等于改历史。
+    pub status: String,
+    /// 定案那一条的结局说明（拒绝原因 / 接受附注）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
+    /// 这一行由哪条事件算出：投影水位。
+    pub event_id: String,
+}
+
+impl ChangeCandidate {
+    /// 还在队列里（没有接受也没有拒绝）。
+    pub fn is_pending(&self) -> bool {
+        self.status == "candidate"
+    }
+}
+
+/// 候选的定案。接受与拒绝都是**又一条事件**，不是改一个字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateOutcome {
+    Accepted,
+    Rejected,
+}
+
+impl CandidateOutcome {
+    /// 落库时用的 `kind` 词。
+    pub fn kind(self) -> &'static str {
+        match self {
+            CandidateOutcome::Accepted => "change_accepted",
+            CandidateOutcome::Rejected => "change_rejected",
+        }
+    }
+}
+
+/// 待落地队列的读写口。
+///
+/// 三个问题，三种回答：**这条候选记下来了吗**（`record`）、**它此刻在队列里吗**
+/// （`pending` / `read`）、**它被定案了吗**（`decide`）。没有任何一个方法是「改状态」：
+/// 定案是追加一条事件，投影因此可以随时从流里重算。
+///
+/// 实现住在一个带库的 crate 里（`cog-storage`）；`cog-reflection` 只认这个 trait，
+/// 因而产生变更的代码不知道它落在 PG 还是别处。
+#[async_trait::async_trait]
+pub trait ChangeCandidateStore: Send + Sync + std::fmt::Debug {
+    /// 记下一条候选。同一个 `artifact_id` 记两次只留一条（写者给幂等键）。
+    async fn record(&self, candidate: &ChangeCandidate) -> crate::SFResult<()>;
+
+    /// 记下候选自己走到了哪一步（验证通过、等待复核……）。
+    ///
+    /// 它不是「改一个字段」：写者追加一条带状态的 `change_measured` 事件，投影取
+    /// 最新那条的读法。同一个 `(候选, 状态词)` 记两次只留一条——重试不会让状态
+    /// 在时间线上来回摆动。
+    async fn transition(&self, artifact_id: &str, status: &str, note: &str) -> crate::SFResult<()>;
+
+    /// 给候选定案：追加 `change_accepted` / `change_rejected`，带原因。
+    ///
+    /// 同一条候选被定案两次是调用方的错，不是写者的错——写者用候选身份当幂等键，
+    /// 第二次写成同一条事件的重复，投影仍只有一行。
+    async fn decide(
+        &self,
+        artifact_id: &str,
+        outcome: CandidateOutcome,
+        reason: &str,
+    ) -> crate::SFResult<()>;
+
+    /// 还在队列里的候选，最新的在前。
+    async fn pending(&self) -> crate::SFResult<Vec<ChangeCandidate>>;
+
+    /// 队列里与已定案的全部候选，最新的在前。
+    async fn all(&self) -> crate::SFResult<Vec<ChangeCandidate>>;
+
+    /// 按身份读一条；读不到与读出错分开。
+    async fn read(&self, artifact_id: &str) -> crate::SFResult<Option<ChangeCandidate>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

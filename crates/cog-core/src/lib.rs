@@ -48,6 +48,7 @@ pub use contract::dlq::*;
 pub use contract::embedding::*;
 pub use contract::eval::*;
 pub use contract::event::*;
+pub use contract::event_id::*;
 pub use contract::evolution_admin::*;
 pub use contract::face_registry::*;
 pub use contract::fault::*;

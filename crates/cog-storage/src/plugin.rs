@@ -388,6 +388,31 @@ impl cog_core::SystemPlugin for StoragePlugin {
         ctx.publish_service(metrics_backend.clone());
         info!("StoragePlugin metrics backend published");
 
+        // 待落地队列的写者：正本是事件流，候选是它的读数。没库的部署不挂——
+        // 挂一份内存实现会让「重启后候选还在」变成一句没人在验的话，而队列的
+        // 整个价值就是它活得过写它的进程。缺席在消费侧是一条具名日志。
+        if let Some(pool) = self.pg_pool.clone() {
+            let writer = format!(
+                "{}@{}",
+                cog_core::env::process_identity(|name| std::env::var(name).ok()),
+                env!("CARGO_PKG_VERSION")
+            );
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let mut seed = [0u8; 10];
+            seed.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..10]);
+            let store = crate::postgres::change_candidate_store::PgChangeCandidateStore::new(
+                pool,
+                "agent:reflection",
+                writer,
+                "",
+                cog_core::EventIdFactory::seeded(now_ms, seed),
+            );
+            ctx.publish_service::<dyn cog_core::ChangeCandidateStore>(std::sync::Arc::new(store));
+            info!("StoragePlugin change candidate store published");
+        } else {
+            info!("no PostgreSQL pool: the change candidate queue has no writer in this process");
+        }
+
         // Publish the ceiling each pool was actually given, once per pool.
         // The startup log line says the same thing to whoever is watching the
         // process start; this says it to whoever reads the store later, and

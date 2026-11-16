@@ -956,8 +956,8 @@ mod tests {
         let backup_dir =
             std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
 
-        let pipeline =
-            crate::ChangePipeline::new(&project_root, &change_dir, false).with_auto_apply(true);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false)
+            .with_auto_apply(true);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
 
         let admin =
@@ -999,7 +999,7 @@ mod tests {
             std::env::temp_dir().join(format!("cogneva-test-bin-{}", uuid::Uuid::new_v4()));
         let backup_dir =
             std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
         let admin =
             crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, None, None);
@@ -1035,7 +1035,7 @@ mod tests {
 
         let bare = crate::EvolutionAdminService::new(
             Arc::new(engine()),
-            crate::ChangePipeline::new(&project_root, &change_dir, false),
+            crate::change_pipeline::test_pipeline(&project_root, &change_dir, false),
             crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir),
             None,
             None,
@@ -1053,7 +1053,7 @@ mod tests {
         );
         let wired = crate::EvolutionAdminService::new(
             Arc::new(engine()),
-            crate::ChangePipeline::new(&project_root, &change_dir, false),
+            crate::change_pipeline::test_pipeline(&project_root, &change_dir, false),
             crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir)
                 .with_build_readings(readings),
             None,
@@ -1100,11 +1100,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         pipeline.write_change_record(&record).await.unwrap();
         evo.register_result(record).await;
 
-        pipeline.retire_change(id, "landed").await.unwrap();
+        pipeline
+            .retire_change(id, cog_core::CandidateOutcome::Accepted, "landed")
+            .await
+            .unwrap();
         assert!(
             evo.retire_result(&pipeline, id).await,
             "the change has to be retired and recorded before the index may drop it"
@@ -1158,7 +1161,7 @@ mod tests {
         let backup_dir =
             std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
 
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
         let queue = Arc::new(
             crate::evolution_queue_readings::EvolutionQueueReadings::new(
@@ -1235,7 +1238,7 @@ mod tests {
         let binary_dir = std::env::temp_dir().join(format!("cogneva-test-bin-{}", unique));
         let backup_dir = std::env::temp_dir().join(format!("cogneva-test-backup-{}", unique));
 
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
 
         crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, switcher, None)
@@ -1287,7 +1290,7 @@ mod tests {
         .await
         .unwrap();
 
-        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(
             &project_root,
             std::env::temp_dir().join(format!("cogneva-test-bin-{}", unique)),
@@ -1384,7 +1387,7 @@ mod tests {
         // 工作树指向临时目录：接线若断了，这条测试会走到本地构建那条路上，
         // 那也必须落在临时目录里而不是真的仓库里。
         let scratch = tempfile::tempdir().unwrap();
-        let pipeline = crate::ChangePipeline::new(scratch.path(), &change_dir, false);
+        let pipeline = crate::change_pipeline::test_pipeline(scratch.path(), &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(
             scratch.path(),
             scratch.path().join("bin"),

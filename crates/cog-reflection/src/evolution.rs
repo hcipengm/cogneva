@@ -20,7 +20,6 @@ use cog_core::{SFResult, SkillConfig, SkillRegistry};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::change_pipeline::{read_record_beside, write_record_file};
 use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 
 /// What each prompt says when no prompt manager is wired into the engine.
@@ -130,6 +129,9 @@ pub struct EvolutionEngine {
     /// （[`crate::GenerationLimits`]），在这里先在写盘前用一次：超限的变更不该
     /// 走完构建与沙盒验证、到落地时才被拦下，那时每一次重跑都是白跑的。
     max_changed_lines: Option<usize>,
+    /// 待落地队列的写者。夹具用 [`Self::with_candidates`] 挂一份内存实现，
+    /// 部署里这份进程的写者由插件在 `start` 时挂到进程级的那一格上。
+    candidates: Option<Arc<dyn cog_core::ChangeCandidateStore>>,
 }
 
 /// Move a produced result into the shape the resident index stores.
@@ -191,7 +193,14 @@ impl EvolutionEngine {
             project_root: None,
             results: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             max_changed_lines: crate::GenerationLimits::default().max_changed_lines,
+            candidates: None,
         }
+    }
+
+    /// 挂上这个引擎自己的队列写者（夹具用）。
+    pub fn with_candidates(mut self, candidates: Arc<dyn cog_core::ChangeCandidateStore>) -> Self {
+        self.candidates = Some(candidates);
+        self
     }
 
     /// 把判断交给名册的那个入口接上。
@@ -354,10 +363,10 @@ impl EvolutionEngine {
             }
             Some(_) => true,
             None => {
-                // Not in the index. A code change whose `.diff` is still in the
-                // queue has a state worth recording even though this process
-                // never generated it -- that is exactly the change whose record
-                // is missing, and the verification's conclusion is what fills it.
+                // 不在索引里，但 `.diff` 还在队列里：这条变更的状态值得记下来，
+                // 而索引从没承载过它。这正是「重启之后每一条都是这个形状」的那一半，
+                // 所以这里追加的是一条**状态事件**，不是重写一份记录——候选的身份、
+                // 描述、正文与生成时刻是发生过的一次，重写会把它们抹掉。
                 let path = self.change_dir.join(format!("{artifact_id}.diff"));
                 if !path.exists() {
                     warn!(
@@ -366,40 +375,35 @@ impl EvolutionEngine {
                     );
                     return false;
                 }
-                // 盘上可能已经有一份记录，只是本进程的索引里没有它——重启之后
-                // 每一条都是这个形状。那份记录是这条变更的说明与生成时刻唯一的
-                // 载体，所以这里改的是**状态一格**，不是整份重写：用一份空壳
-                // 覆盖它，description 与 created_at 当场丢失，此后谁也读不出这条
-                // 变更当初要做什么。2026-11-01 的 retired/ 里有两条这样被覆盖过的
-                // 记录（status=active、description 空、时刻是哨兵），它们各自的
-                // diff 是上百行的真实改动。
-                let record = match read_record_beside(&self.change_dir, artifact_id).await {
-                    Ok(Some(mut record)) => {
-                        record.status = status;
-                        record
-                    }
-                    Ok(None) => EvolutionResult {
-                        kind: EvolutionKind::CodeChange,
-                        artifact_id: artifact_id.to_string(),
-                        description: String::new(),
-                        content: String::new(),
-                        status,
-                        created_at: crate::change_pipeline::UNKNOWN_CREATED_AT,
-                        eval_summary: None,
-                        tiering: None,
-                    },
-                    // 读不出来的记录不能被当成没有记录：覆盖它等于把读不出来的
-                    // 原因一并抹掉，而那份字节是本进程唯一没有的那份事实。
-                    Err(e) => {
-                        warn!(
-                            artifact_id = %artifact_id,
-                            error = %e,
-                            "the record beside this change cannot be read; leaving it as it stands rather than overwriting it"
-                        );
-                        return false;
-                    }
+                let Some(store) = self.candidate_store() else {
+                    warn!(
+                        artifact_id = %artifact_id,
+                        "no change candidate store is attached; the status of this change is not recorded anywhere a restart can read"
+                    );
+                    return false;
                 };
-                self.persist_record(&record).await;
+                // 队列里已经有这条候选时，`record` 是空操作：它的身份、描述、
+                // 正文与生成时刻是发生过的一次，这里补不上也不该改。还没有候选
+                // 时，这一步把它补成一条：结论落在一个连候选都没有的 `.diff` 上，
+                // 那份 `.diff` 就永远说不清自己是什么。
+                let stub = EvolutionResult {
+                    kind: EvolutionKind::CodeChange,
+                    artifact_id: artifact_id.to_string(),
+                    description: String::new(),
+                    content: String::new(),
+                    status,
+                    created_at: crate::change_pipeline::UNKNOWN_CREATED_AT,
+                    eval_summary: None,
+                    tiering: None,
+                };
+                if let Err(e) = crate::change_pipeline::record_change(&store, &stub).await {
+                    warn!(
+                        artifact_id = %artifact_id,
+                        error = %e,
+                        "the status update could not be recorded in the queue"
+                    );
+                    return false;
+                }
                 true
             }
         }
@@ -413,13 +417,27 @@ impl EvolutionEngine {
     /// reads the older status, which is the status the record had -- not a
     /// wrong one.
     async fn persist_record(&self, record: &EvolutionResult) {
-        if let Err(e) = write_record_file(&self.change_dir, record).await {
+        let Some(store) = self.candidate_store() else {
+            warn!(
+                artifact_id = %record.artifact_id,
+                "no change candidate store is attached; the status update is not recorded anywhere a restart can read"
+            );
+            return;
+        };
+        if let Err(e) = crate::change_pipeline::record_change(&store, record).await {
             warn!(
                 artifact_id = %record.artifact_id,
                 error = %e,
-                "could not write the change record; the resident status stands alone until the next update"
+                "could not record the change in the queue; the resident status stands alone until the next update"
             );
         }
+    }
+
+    /// 这个进程的队列写者：引擎自己挂的那份，或者进程级的那份。
+    fn candidate_store(&self) -> Option<Arc<dyn cog_core::ChangeCandidateStore>> {
+        self.candidates
+            .clone()
+            .or_else(crate::change_pipeline::process_candidates)
     }
 
     /// How many *code changes* the resident index holds.
@@ -449,7 +467,7 @@ impl EvolutionEngine {
     /// a caller that forgot it would lose the record in silence, and a record
     /// that never moves is a leak this method exists to end.
     pub async fn retire_result(&self, pipeline: &crate::ChangePipeline, artifact_id: &str) -> bool {
-        if !pipeline.artifact_is_retired(artifact_id) {
+        if !pipeline.artifact_is_retired(artifact_id).await {
             warn!(
                 artifact_id = %artifact_id,
                 "refusing to drop the resident record: the change is not retired yet"
@@ -1088,12 +1106,22 @@ impl EvolutionEngine {
             tiering: None,
         };
 
-        // The record goes down with the change, or the change does not go down
-        // at all. A `.diff` whose record is missing is the state the queue
-        // cannot describe, so a generation that leaves one has produced an
-        // orphan rather than a change -- and the caller is better served by the
-        // error than by a file nothing can say the state of.
-        if let Err(e) = write_record_file(&self.change_dir, &result).await {
+        // 候选落进队列，或者这条变更根本不落地。一条没有候选事件的 `.diff`
+        // 正是队列说不清的状态：一次生成留下一份孤儿工件，而调用方拿到错误
+        // 比拿到一份没人能说出状态的文件更有用。
+        let Some(store) = self.candidate_store() else {
+            if let Err(remove) = tokio::fs::remove_file(&filename).await {
+                warn!(
+                    path = %filename.display(),
+                    error = %remove,
+                    "could not remove a change whose candidate could not be recorded; it stays as an unrecorded diff"
+                );
+            }
+            return Err(cog_core::SFError::Config(
+                "no change candidate store is attached to this process: a generated change has no queue to be recorded in".to_string(),
+            ));
+        };
+        if let Err(e) = crate::change_pipeline::record_change(&store, &result).await {
             if let Err(remove) = tokio::fs::remove_file(&filename).await {
                 warn!(
                     path = %filename.display(),
@@ -1331,7 +1359,9 @@ mod tests {
 
     fn engine_on(dir: &std::path::Path) -> EvolutionEngine {
         let registry = Arc::new(RwLock::new(cog_core::SkillRegistry::new()));
-        EvolutionEngine::new(registry, None).with_change_dir(dir)
+        EvolutionEngine::new(registry, None)
+            .with_change_dir(dir)
+            .with_candidates(crate::change_pipeline::test_candidates())
     }
 
     fn code_change(id: &str, status: EvolutionStatus) -> EvolutionResult {
@@ -1356,7 +1386,7 @@ mod tests {
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
         let engine = engine_on(&change_dir);
-        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true);
 
         tokio::fs::write(change_dir.join("chg-1.diff"), "not a real diff\n")
             .await
@@ -1378,7 +1408,10 @@ mod tests {
             "a refused drop must not have dropped anything"
         );
 
-        pipeline.retire_change("chg-1", "landed").await.unwrap();
+        pipeline
+            .retire_change("chg-1", cog_core::CandidateOutcome::Accepted, "landed")
+            .await
+            .unwrap();
 
         assert!(engine.retire_result(&pipeline, "chg-1").await);
         assert!(
@@ -1395,8 +1428,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let engine = engine_on(&change_dir);
-        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let candidates = crate::change_pipeline::test_candidates();
+        let engine = engine_on(&change_dir).with_candidates(candidates.clone());
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true)
+            .with_candidates(candidates);
         tokio::fs::write(change_dir.join("legacy.diff"), "not a real diff\n")
             .await
             .unwrap();
@@ -1431,13 +1466,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let engine = engine_on(&change_dir);
-        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let candidates = crate::change_pipeline::test_candidates();
+        let engine = engine_on(&change_dir).with_candidates(candidates.clone());
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true)
+            .with_candidates(candidates.clone());
         tokio::fs::write(change_dir.join("kept.diff"), "not a real diff\n")
             .await
             .unwrap();
         let original = code_change("kept", EvolutionStatus::CompileChecked);
-        crate::change_pipeline::write_record_file(&change_dir, &original)
+        crate::change_pipeline::record_change(&candidates, &original)
             .await
             .unwrap();
 
@@ -1463,13 +1500,18 @@ mod tests {
         );
     }
 
-    /// 读不出来的记录不被当成没有记录：覆盖它等于把读不出来的那份事实一起抹掉。
+    /// 盘上留着一份读不懂的 `.json` 不再改变任何判断。
+    ///
+    /// 这正是换掉文件记录的代价与收获：旧模型里「记录读不懂」必须被当成「不许覆盖」，
+    /// 因为覆盖就等于毁掉那份唯一的字节；新模型里盘上那份根本不是队列，写者只追加
+    /// 事件，所以一条状态更新照常落库，旧文件既不参与也不被改。
     #[tokio::test]
-    async fn a_status_update_leaves_an_unreadable_record_alone() {
+    async fn an_unreadable_file_beside_a_change_no_longer_decides_anything() {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let engine = engine_on(&change_dir);
+        let candidates = crate::change_pipeline::test_candidates();
+        let engine = engine_on(&change_dir).with_candidates(candidates);
         tokio::fs::write(change_dir.join("broken.diff"), "not a real diff\n")
             .await
             .unwrap();
@@ -1479,17 +1521,17 @@ mod tests {
             .unwrap();
 
         assert!(
-            !engine
+            engine
                 .update_status("broken", EvolutionStatus::AwaitingReview)
                 .await,
-            "a record it cannot read is not a record it may replace"
+            "the queue records the conclusion as an event; a stale file cannot refuse it"
         );
         assert_eq!(
             tokio::fs::read_to_string(change_dir.join("broken.json"))
                 .await
                 .unwrap(),
             garbage,
-            "the bytes that would not parse are still the only copy of that fact"
+            "nothing rewrites that file any more: it is not the queue"
         );
     }
 
@@ -1519,8 +1561,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let change_dir = temp.path().join("changes");
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        let engine = engine_on(&change_dir);
-        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let candidates = crate::change_pipeline::test_candidates();
+        let engine = engine_on(&change_dir).with_candidates(candidates.clone());
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true)
+            .with_candidates(candidates);
         tokio::fs::write(change_dir.join("chg-2.diff"), "not a real diff\n")
             .await
             .unwrap();
