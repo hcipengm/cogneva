@@ -4,7 +4,8 @@
 //! agent can land on two pods whose checkouts are two different trees. The tree
 //! is the agent's work, not a cache: a read answered by the other pod answers
 //! about a tree that never had this agent's edits, and nothing in the answer
-//! says so. So a lane stays on one replica until its pin lapses.
+//! says so. So a lane stays on one replica for as long as that replica is
+//! there.
 //!
 //! A pin names the replica's **address**, not its position in the list. The
 //! list is not a deployment fact the client owns any more: it is resolved from
@@ -16,26 +17,32 @@
 //!
 //! The pin lapses on a clock, not on a goodbye. A replica that dies never says
 //! it is done, and a pin that waited for a goodbye would hold its lanes for as
-//! long as the client lived. On the other side a live caller does say goodbye
-//! to a replica it cannot reach: a refused connection releases the lane at
+//! long as the client lived. A lapse only refreshes the right to the lane; it
+//! does not move the lane, because the tree it is working in is still on that
+//! replica's volume. On the other side a live caller does say goodbye
+//! to a replica it cannot reach: a refused connection gives the lane up at
 //! once, so the clock below is only the backstop for a caller that vanished
 //! without saying anything.
 //!
 //! What a moved pin costs is said out loud: [`Grant::Moved`] carries where the
 //! lane was and how long its pin had been lapsed, because a lane that changes
 //! replica changes tree, and the caller is the only layer that can decide
-//! whether that is acceptable for the command it is about to run.
+//! whether that is acceptable for the command it is about to run. A pin whose
+//! clock ran out does not move anything by itself -- [`Grant::Resumed`] says
+//! the lane is back on the same replica, and whatever the replica itself says
+//! about the tree is the only fact about the work.
 
 use std::collections::HashMap;
 
-/// How long a pin holds without being used again.
+/// How long a pin counts as live without being used again.
 ///
-/// A pin costs nothing to keep and a lot to lose: the next command on a moved
-/// lane sees a tree without the previous commands' edits. So this is long, and
-/// the precise events (the holder completing, a replica that stopped
-/// answering) carry the precision that would otherwise have to come from a
-/// short clock here.
-// cap: bound — 后台兜底：一个消失了、没说再见的调用方最多把一条 lane 占到这么久
+/// The clock is not what keeps a lane on its replica -- being on that replica
+/// is, because the tree is on its volume. What the clock decides is whether
+/// the next command can say "this session never stopped" or has to say "nobody
+/// asked for this lane for a while": the second one is still sent to the same
+/// replica, but the replica may have reclaimed the tree in the meantime, and
+/// its own first frame is what settles that.
+// cap: bound — 一条钉子多久算「还活着」：超过它，下一次只能读成「隔了一段时间才回来」
 pub const LANE_LEASE_SECS: u64 = 600;
 
 /// What happened when a lane was pinned.
@@ -45,10 +52,16 @@ pub enum Grant {
     Fresh,
     /// This replica already held the lane and the hold was extended.
     Extended,
-    /// The pin had lapsed before this request: the lane was still pointed at
-    /// the named replica, and any work that replica did after that moment is
-    /// not necessarily in the tree this request will run against.
+    /// The pin had lapsed before this request and the lane's replica is not
+    /// one this request could reach: the lane was still pointed at the named
+    /// replica, and any work that replica did after that moment is not
+    /// necessarily in the tree this request will run against.
     Moved { from: String, lapsed_secs: u64 },
+    /// The pin's clock had run out, and the lane is going back to the same
+    /// replica. Nothing moved: that replica's volume is where the lane's tree
+    /// is, so a lapse is not a reason to leave it. Whether the tree survived
+    /// is the replica's own answer, on the first frame of the command.
+    Resumed { lapsed_secs: u64 },
 }
 
 /// One lane's pin.
@@ -82,7 +95,10 @@ impl LeaseBook {
     ///
     /// A lane nobody holds goes to the next replica in turn, so a fresh set of
     /// lanes spreads over the replicas instead of stacking on the first one.
-    /// A lane that is held stays where it is; a lane whose hold has lapsed is
+    /// A lane that is held stays where it is, and so does a lane whose clock
+    /// ran out while its replica is still there: the tree lives on that
+    /// replica's volume, and leaving it would throw away work for nothing but
+    /// the amount of time nobody asked. Only a lane whose replica is gone is
     /// reported as [`Grant::Moved`] and lands wherever the rotation is now.
     ///
     /// `None` when there is no replica to name. The caller has to turn that
@@ -120,13 +136,26 @@ impl LeaseBook {
                     },
                 )
             }
-            // Still live and the replica is still there: extend in place.
-            Some(hold) if holds && replicas.contains(&hold.replica) => {
-                (hold.replica, Grant::Extended)
-            }
-            // Still live but the replica is gone (a scale-down or a rollback
-            // that replaced the pod): the hold has to move even though its
-            // clock has not run out.
+            // The replica is still there: stay, whether the clock ran out or
+            // not. Its volume is where the lane's tree is; rotating a lapsed
+            // lane to another replica would trade the tree for nothing. A
+            // lapsed hold is reported as its own kind of grant so that a
+            // reader can tell "kept" from "kept after nobody asked for a
+            // while" -- the replica's first frame says whether the tree under
+            // it survived, and there is nothing else to say here.
+            Some(hold) if replicas.contains(&hold.replica) => (
+                hold.replica,
+                if holds {
+                    Grant::Extended
+                } else {
+                    Grant::Resumed {
+                        lapsed_secs: now.saturating_sub(hold.until),
+                    }
+                },
+            ),
+            // The replica is gone (a scale-down or a rollback that replaced
+            // the pod): the hold has to move even though its clock has not
+            // run out.
             Some(hold) if holds => (
                 self.take_turn(replicas)?,
                 Grant::Moved {
@@ -250,10 +279,10 @@ mod tests {
         assert!(seen.values().all(|count| *count == 2));
     }
 
-    /// A pin that lapses while nobody asks says so when it is taken again —
-    /// the caller has to know the tree may have moved under it.
+    /// 时钟走完了不等于要换副本：那棵树立在这副副本的卷上。回到同一副，
+    /// 读成「续上」而不是「搬家」，树在不在由这副副本的第一帧回答。
     #[test]
-    fn a_lane_whose_pin_lapsed_is_reported_as_having_moved() {
+    fn a_lane_whose_clock_ran_out_stays_where_its_tree_lives() {
         let mut book = LeaseBook::default();
         let replicas = two();
         let first = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
@@ -265,11 +294,44 @@ mod tests {
         let again = book
             .pin("agent-a", &replicas, 1_000 + TTL + 45, TTL)
             .unwrap();
+        assert_eq!(again.replica, first.replica, "过期不是离开那棵树的理由");
+        assert_eq!(again.grant, Grant::Resumed { lapsed_secs: 45 });
+    }
+
+    /// 过期之后别的 lane 把轮转指针推走也没关系：这条 lane 不去轮转。
+    #[test]
+    fn a_lapsed_lane_is_not_carried_away_by_other_lanes_rotating() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let first = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        assert_eq!(first.replica, replicas[0]);
+        // 两条新 lane 的钉把下一次轮转推到第二副。
+        book.pin("agent-b", &replicas, 1_001, TTL).unwrap();
+        book.pin("agent-c", &replicas, 1_002, TTL).unwrap();
+        let again = book
+            .pin("agent-a", &replicas, 1_000 + TTL + 5, TTL)
+            .unwrap();
+        assert_eq!(again.replica, first.replica);
+        assert_eq!(again.grant, Grant::Resumed { lapsed_secs: 5 });
+    }
+
+    /// 过期且那副副本已经不在：没有树可回，读成搬家，并说出过了多久。
+    #[test]
+    fn a_lane_that_lapsed_and_lost_its_replica_still_moves() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        book.pin("agent-b", &replicas, 1_000, TTL).unwrap();
+        let on_second = book.pin("agent-a", &replicas, 1_000, TTL).unwrap().replica;
+        assert_eq!(on_second, replicas[1]);
+        let moved = book
+            .pin("agent-a", &replicas[..1], 1_000 + TTL + 60, TTL)
+            .unwrap();
+        assert_eq!(moved.replica, replicas[0]);
         assert_eq!(
-            again.grant,
+            moved.grant,
             Grant::Moved {
-                from: first.replica,
-                lapsed_secs: 45
+                from: on_second,
+                lapsed_secs: 60
             }
         );
     }

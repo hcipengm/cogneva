@@ -205,6 +205,16 @@ pub struct RemoteExecutor {
     /// Which replica each lane sits on. Short critical sections holding a
     /// `std::sync::Mutex`: nothing is awaited under it.
     lanes: std::sync::Mutex<crate::executor_lease::LeaseBook>,
+    /// The replica that last handed this lane a worktree -- told by the
+    /// executor's own first frame, not inferred from a pin. A pin is placed
+    /// before the command is even sent, so a command that failed before the
+    /// executor got to cut a tree leaves a pin and no tree; only a `Workdir`
+    /// frame proves a tree exists on that replica's volume.
+    seen_tree: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Where "now" comes from. The lease's rules are about clocks, and a rule
+    /// proven by sleeping proves the sleep; tests replace this with one they
+    /// can advance.
+    clock: fn() -> u64,
     http: reqwest::Client,
     /// 端口被拒之后还等多久。见 [`REPLACEMENT_WINDOW`]。
     replacement_window: std::time::Duration,
@@ -214,10 +224,15 @@ pub struct RemoteExecutor {
 /// there.
 struct Placement {
     endpoint: String,
-    /// The replica the lane came from when its pin lapsed and the command
-    /// landed somewhere else. The tree under this command is then not the one
-    /// the previous commands worked in, and the caller is told so.
+    /// The replica the lane came from when its replica vanished and the
+    /// command landed somewhere else. The tree under this command is then not
+    /// the one the previous commands worked in, and the caller is told so.
     moved_from: Option<String>,
+    /// This lane had a tree on this same replica before this request. If the
+    /// executor answers with a tree that was just cut or handed out of its
+    /// pool, the one the lane worked in was reclaimed in between -- the pin
+    /// surviving is not the tree surviving -- and that is said out loud.
+    tree_here_before: bool,
 }
 
 impl RemoteExecutor {
@@ -262,6 +277,8 @@ impl RemoteExecutor {
             resolved: std::sync::Mutex::default(),
             endpoint_refresh: ENDPOINT_REFRESH,
             lanes: std::sync::Mutex::default(),
+            seen_tree: std::sync::Arc::default(),
+            clock: now_secs,
             replacement_window,
             // No total timeout: a long-running command is stopped by the
             // executor when it stops moving, and the client must not cut the
@@ -364,6 +381,7 @@ impl RemoteExecutor {
             return Some(Placement {
                 endpoint: first,
                 moved_from: None,
+                tree_here_before: false,
             });
         };
         let pinned = {
@@ -374,14 +392,35 @@ impl RemoteExecutor {
             book.pin(
                 lane,
                 endpoints,
-                now_secs(),
+                (self.clock)(),
                 crate::executor_lease::LANE_LEASE_SECS,
             )
         }?;
-        // A lapsed pin that lands on the replica it already pointed at costs
-        // nothing: the tree is still there. Only a pin that lands on a
-        // *different* replica means the tree under this command is not the one
-        // the previous commands worked in, and that is the move worth saying.
+        if let crate::executor_lease::Grant::Resumed { lapsed_secs } = &pinned.grant {
+            tracing::info!(
+                lane,
+                replica = %pinned.replica,
+                lapsed_secs,
+                "this lane came back after its pin ran out and stays on the replica that has \
+                 its tree; whether the tree itself survived is the executor's answer"
+            );
+        }
+        // A pin that lands on the replica it already pointed at is not a move:
+        // that is where the lane's tree is, and staying is what keeps it. Only
+        // a pin that lands on a *different* replica means the tree under this
+        // command is not the one the previous commands worked in.
+        //
+        // A tree existed only if a command on this lane was actually handed
+        // one, which the executor said on that command's first frame; the pin
+        // alone proves nothing, because it is placed before the request goes
+        // out and a request that failed before the executor cut anything
+        // leaves a pin and no tree.
+        let tree_here_before = self
+            .seen_tree
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(lane)
+            .is_some_and(|replica| replica == &pinned.replica);
         let moved_from = match &pinned.grant {
             crate::executor_lease::Grant::Moved { from, lapsed_secs }
                 if from != &pinned.replica =>
@@ -401,6 +440,7 @@ impl RemoteExecutor {
         Some(Placement {
             endpoint: pinned.replica,
             moved_from,
+            tree_here_before,
         })
     }
 
@@ -603,9 +643,23 @@ impl SandboxBackend for RemoteExecutor {
         // than in front of the stream; `unfold` keeps the call itself from
         // waiting, and the first frame is what the executor sends before the
         // command has even started.
-        let Some(from) = placement.moved_from else {
+        // Two ways a command can be running in a tree without the work the
+        // lane had: it moved to another replica, or it came back to the same
+        // one and the tree had been reclaimed in the meantime. The first is
+        // known here; the second is only known once the executor's first frame
+        // says where the tree came from, and a tree cut for this call or handed
+        // out of the pool is one nothing has run in.
+        //
+        // That first frame is also the only proof that a tree exists for this
+        // lane on this replica, which is what the next command will be judged
+        // against -- so the wrapper is used for every command that belongs to
+        // a lane, not only for the ones with something to say.
+        let Some(lane) = lane else {
             return Ok(Box::pin(stream));
         };
+        let from = placement.moved_from;
+        let tree_here_before = placement.tree_here_before;
+        let seen_tree = self.seen_tree.clone();
         enum Step {
             Head,
             First(Option<CommandEvent>),
@@ -614,8 +668,10 @@ impl SandboxBackend for RemoteExecutor {
         // The decoded stream is not `Unpin`; boxed it is, which is what lets
         // this wrapper pull the first frame and hold the rest.
         let state = (Box::pin(stream), Step::Head, from, endpoint);
-        let stream =
-            futures::stream::unfold(state, |(mut inner, step, from, endpoint)| async move {
+        let stream = futures::stream::unfold(state, move |(mut inner, step, from, endpoint)| {
+            let lane = lane.clone();
+            let seen_tree = seen_tree.clone();
+            async move {
                 match step {
                     Step::Head => {
                         let first = inner.next().await;
@@ -623,10 +679,31 @@ impl SandboxBackend for RemoteExecutor {
                             Some(CommandEvent::Workdir { origin, .. }) => *origin,
                             _ => cog_core::WorktreeOrigin::Unknown,
                         };
-                        let notice = CommandEvent::Stderr {
-                            data: moved_line(&from, &endpoint, origin),
+                        if matches!(first, Some(CommandEvent::Workdir { .. })) {
+                            seen_tree
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .insert(lane.clone(), endpoint.clone());
+                        }
+                        let notice = match &from {
+                            Some(from) => Some(moved_line(from, &endpoint, origin)),
+                            // 回来的是同一副：树在不在只有执行器的第一帧说得清。
+                            None if tree_here_before => match origin {
+                                cog_core::WorktreeOrigin::Created
+                                | cog_core::WorktreeOrigin::Warm => Some(reclaimed_line()),
+                                cog_core::WorktreeOrigin::Existing
+                                | cog_core::WorktreeOrigin::Unknown => None,
+                            },
+                            None => None,
                         };
-                        Some((notice, (inner, Step::First(first), from, endpoint)))
+                        match notice {
+                            Some(data) => Some((
+                                CommandEvent::Stderr { data },
+                                (inner, Step::First(first), from, endpoint),
+                            )),
+                            // 树还在：没有什么要说的，第一帧就是全部。
+                            None => first.map(|event| (event, (inner, Step::Tail, from, endpoint))),
+                        }
                     }
                     Step::First(Some(event)) => Some((event, (inner, Step::Tail, from, endpoint))),
                     Step::First(None) => None,
@@ -635,7 +712,8 @@ impl SandboxBackend for RemoteExecutor {
                         .await
                         .map(|event| (event, (inner, Step::Tail, from, endpoint))),
                 }
-            });
+            }
+        });
         Ok(Box::pin(stream))
     }
 }
@@ -663,6 +741,19 @@ fn moved_line(from: &str, to: &str, origin: cog_core::WorktreeOrigin) -> String 
              远端的工作（未提交的改动、只在那台机器上的提交）不在这棵树上。\n"
         ),
     }
+}
+
+/// What the agent is told when the lane came back to the same replica and the
+/// executor there handed it a tree nobody had worked in.
+///
+/// Staying on the replica is what keeps a tree; it cannot promise the replica
+/// kept it. The executor reclaims idle trees on its own clock, so the pin
+/// surviving and the tree surviving are two different facts, and only the
+/// second one is about the work.
+fn reclaimed_line() -> String {
+    "这副副本上原先那棵树已经被回收：这次交给你的是一棵没人跑过的树，先前在那棵树上\
+     未推送到远端的工作（未提交的改动、只在那台机器上的提交）不在这棵树上。\n"
+        .to_string()
 }
 
 #[cfg(test)]
@@ -741,6 +832,42 @@ mod tests {
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
             }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// 第一次请求在执行器切树之前就失败（比如编译位满了），第二次才交出一棵
+    /// 刚切的树：一条钉子已经存在，但从来没有任何一棵树存在过。
+    async fn serve_failing_once_then_announcing(origin: cog_core::WorktreeOrigin) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = first.read(&mut buf).await;
+            let _ = first
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let _ = second.read(&mut buf).await;
+            let body = format!(
+                "{}\n{}\n",
+                serde_json::to_string(&CommandEvent::Workdir {
+                    path: "/srv/workspaces/employee-a".into(),
+                    origin,
+                })
+                .unwrap(),
+                serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap(),
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                body
+            );
+            let _ = second.write_all(response.as_bytes()).await;
         });
         format!("http://{}", addr)
     }
@@ -948,6 +1075,114 @@ mod tests {
             !moved.stderr.contains("刚为这个任务切了一棵新树"),
             "旧版执行器没报来处，客户端不能替它断言树是刚切的：{:?}",
             moved.stderr
+        );
+    }
+
+    /// 回到同一副副本，但那棵树立在它卷上的树已经被回收：钉还在不等于树还在。
+    /// 这条命令必须说清楚，否则模型会以为先前的改动还在这棵树上。
+    #[tokio::test]
+    async fn a_lane_that_came_back_to_a_reclaimed_tree_is_told_so() {
+        let replica = serve_announcing(2, Some(cog_core::WorktreeOrigin::Created)).await;
+        let executor = RemoteExecutor::with_endpoints(vec![replica]).unwrap();
+
+        let first = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            !first.stderr.contains("已经被回收"),
+            "第一次落点没有先前的工作可说：{:?}",
+            first.stderr
+        );
+
+        let again = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            again.stderr.contains("已经被回收") && again.stderr.contains("不在这棵树上"),
+            "树没了却一声不吭，模型会在一棵空树上接着改：{:?}",
+            again.stderr
+        );
+        assert!(
+            !again.stderr.contains("换了一副执行器"),
+            "没有换副本，不能说成搬家：{:?}",
+            again.stderr
+        );
+    }
+
+    /// 回到同一副、树还是那棵树：没有什么要说的。多说一句「也许丢了」是把
+    /// 一次正常的续上读成一次事故。
+    #[tokio::test]
+    async fn a_lane_that_came_back_to_its_own_tree_hears_nothing() {
+        let replica = serve_announcing(2, Some(cog_core::WorktreeOrigin::Existing)).await;
+        let executor = RemoteExecutor::with_endpoints(vec![replica]).unwrap();
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        let again = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            !again.stderr.contains("已经被回收") && !again.stderr.contains("换了一副执行器"),
+            "树还在，不该有丢工作的说明：{:?}",
+            again.stderr
+        );
+    }
+
+    /// 暖池交给的树同样没跑过任务：回到同一副却拿到它，等于原来那棵没了。
+    #[tokio::test]
+    async fn a_lane_that_came_back_to_a_warm_tree_is_told_it_lost_the_one_it_had() {
+        let replica = serve_announcing(2, Some(cog_core::WorktreeOrigin::Warm)).await;
+        let executor = RemoteExecutor::with_endpoints(vec![replica]).unwrap();
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        let again = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            again.stderr.contains("已经被回收"),
+            "暖池的树没跑过任何任务，先前那棵已经不在了：{:?}",
+            again.stderr
+        );
+    }
+
+    /// 第一条命令在 HTTP 层就失败了，执行器根本没切过树：钉子有，树没有。
+    /// 下一条命令拿到一棵刚切的树，不能说成「以前那棵被回收了」。
+    #[tokio::test]
+    async fn a_lane_that_never_got_a_tree_is_not_told_it_lost_one() {
+        let replica = serve_failing_once_then_announcing(cog_core::WorktreeOrigin::Created).await;
+        let executor = RemoteExecutor::with_endpoints(vec![replica]).unwrap();
+        let failed = executor.execute(&for_agent("agent-a")).await;
+        assert!(failed.is_err(), "第一次请求本来就该失败");
+        let second = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            !second.stderr.contains("已经被回收"),
+            "从来没有过树，就没有什么被回收：{:?}",
+            second.stderr
+        );
+    }
+
+    /// 钉子过期之后回到同一副副本：不报搬家，树没了才说树没了。这条走的是
+    /// `Resumed`，背靠背的两条命令走的是 `Extended`，两条路都要有判据。
+    #[tokio::test]
+    async fn a_lane_that_came_back_after_its_pin_ran_out_stays_where_its_tree_is() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NOW: AtomicU64 = AtomicU64::new(0);
+
+        let first = serve_announcing(2, Some(cog_core::WorktreeOrigin::Created)).await;
+        let (second, second_hits) = serve_counting(1).await;
+        let mut executor = RemoteExecutor::with_endpoints(vec![first, second]).unwrap();
+        executor.clock = || NOW.load(Ordering::SeqCst);
+
+        NOW.store(1_000, Ordering::SeqCst);
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        NOW.store(
+            1_000 + crate::executor_lease::LANE_LEASE_SECS + 5,
+            Ordering::SeqCst,
+        );
+        let again = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert_eq!(
+            second_hits.load(Ordering::SeqCst),
+            0,
+            "过期之后被送到了另一副副本"
+        );
+        assert!(
+            !again.stderr.contains("换了一副执行器"),
+            "过期不是搬家：树还立在原来那副上：{:?}",
+            again.stderr
+        );
+        assert!(
+            again.stderr.contains("已经被回收"),
+            "留在同一副、树却是刚切的：这棵树没有先前的改动：{:?}",
+            again.stderr
         );
     }
 
