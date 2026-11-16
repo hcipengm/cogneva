@@ -952,7 +952,8 @@ fn a_port_the_gateway_listens_on_is_told_to_the_process_and_not_only_opened() {
 /// board reports `not_configured` in production while every gate stays green.
 const REQUIRED_ENDPOINTS: &[(&str, &str, &str)] = &[
     (
-        "crates/cog-gateway/src/readings.rs",
+        // 名字声明在 core 的 env 表里，读它的两处（读数面与投影重建）都读那个常量。
+        "crates/cog-core/src/env.rs",
         "COGNEVA_PROMETHEUS_URL",
         "observability.infraWatch.prometheusUrl",
     ),

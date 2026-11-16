@@ -89,6 +89,14 @@ pub fn gauge_latest_sql() -> String {
     )
 }
 
+/// 三张累加表的表名，声明在这里：SQL 在本文件里，别处（重建命令）读这些常量。
+///
+/// 表名写两遍不会报错，只会让重建去重写一张别的表——而那一步在真库上就是一次
+/// 静默的清空。
+pub const COUNTER_TOTALS_TABLE: &str = "cog_metric_counter_totals";
+pub const HISTOGRAM_BUCKETS_TABLE: &str = "cog_metric_histogram_buckets";
+pub const HISTOGRAM_SUMS_TABLE: &str = "cog_metric_histogram_sums";
+
 /// This store's schema, and the one a restore replays.
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS cog_metrics_samples (

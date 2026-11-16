@@ -39,14 +39,6 @@ impl Family {
             Family::HistogramSums => format!("{name}_sum"),
         }
     }
-
-    pub fn table(self) -> &'static str {
-        match self {
-            Family::Counter => "cog_metric_counter_totals",
-            Family::HistogramBuckets => "cog_metric_histogram_buckets",
-            Family::HistogramSums => "cog_metric_histogram_sums",
-        }
-    }
 }
 
 /// 一行，落库之前的样子。
@@ -133,6 +125,15 @@ pub fn bucket_observations(rows: &[ProjectedRow]) -> Vec<ProjectedRow> {
     out
 }
 
+/// 要重写的三张表，由调用方给：表名在 `cog-storage` 里声明（SQL 住在那里），
+/// 而这个 crate 不依赖它——依赖方向是「读数不依赖存储实现」。
+#[derive(Debug, Clone, Copy)]
+pub struct Tables<'a> {
+    pub counters: &'a str,
+    pub buckets: &'a str,
+    pub sums: &'a str,
+}
+
 /// 重建报告：每一族重写了多少行，水位是什么。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RebuildReport {
@@ -149,6 +150,7 @@ pub async fn rebuild(
     pool: &PgPool,
     http: &Arc<dyn cog_core::HttpClient>,
     prometheus: &str,
+    tables: Tables<'_>,
 ) -> Result<RebuildReport, String> {
     let counter_names: Vec<String> =
         sqlx::query_scalar("SELECT DISTINCT name FROM cog_metric_counter_totals ORDER BY name")
@@ -183,11 +185,7 @@ pub async fn rebuild(
         .begin()
         .await
         .map_err(|e| format!("begin the rebuild: {e}"))?;
-    for table in [
-        Family::Counter.table(),
-        Family::HistogramBuckets.table(),
-        Family::HistogramSums.table(),
-    ] {
+    for table in [tables.counters, tables.buckets, tables.sums] {
         sqlx::query(&format!("DELETE FROM {table}"))
             .execute(&mut *tx)
             .await
@@ -256,16 +254,6 @@ pub async fn rebuild(
 mod tests {
     use super::*;
 
-    fn sample(pairs: &[(&str, &str)], value: f64) -> SeriesSample {
-        SeriesSample {
-            labels: pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            value,
-        }
-    }
-
     /// 标签集的拼写只能是写入端与服务端规整出来的那一份：键排序、紧凑 JSON。
     /// 拼错一次，同一个序列在重建之后就成了新的一行——`ON CONFLICT` 认不出它，
     /// 计数从此分成两半。
@@ -274,10 +262,15 @@ mod tests {
         let rows = rows_from_vector(
             cog_core::metric_names::READY_ADMISSION_HELD_TOTAL.as_str(),
             Family::Counter,
-            &[sample(
-                &[("__name__", "x"), ("stream", "local"), ("reason", "pool")],
-                7.0,
-            )],
+            &[SeriesSample {
+                labels: [
+                    ("__name__".to_string(), "x".to_string()),
+                    ("stream".to_string(), "local".to_string()),
+                    ("reason".to_string(), "pool".to_string()),
+                ]
+                .into(),
+                value: 7.0,
+            }],
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].labels, r#"{"reason":"pool","stream":"local"}"#);
@@ -292,10 +285,14 @@ mod tests {
         let rows = rows_from_vector(
             cog_core::metric_names::READY_ADMISSION_HELD_TOTAL.as_str(),
             Family::Counter,
-            &[sample(
-                &[(cog_core::observability_text::UPSTREAM_LABEL, "a.example")],
-                1.0,
-            )],
+            &[SeriesSample {
+                labels: [(
+                    cog_core::observability_text::UPSTREAM_LABEL.to_string(),
+                    "a.example".to_string(),
+                )]
+                .into(),
+                value: 1.0,
+            }],
         );
         assert_eq!(rows[0].upstream.as_deref(), Some("a.example"));
     }

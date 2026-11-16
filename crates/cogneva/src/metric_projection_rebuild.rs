@@ -33,7 +33,12 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("HTTP 客户端造不出来: {e}"))?;
     let http: Arc<dyn HttpClient> = Arc::new(client);
 
-    let report = cog_observability::metric_projection::rebuild(&pool, &http, &prometheus)
+    let tables = cog_observability::metric_projection::Tables {
+        counters: cog_storage::postgres::metrics_backend::COUNTER_TOTALS_TABLE,
+        buckets: cog_storage::postgres::metrics_backend::HISTOGRAM_BUCKETS_TABLE,
+        sums: cog_storage::postgres::metrics_backend::HISTOGRAM_SUMS_TABLE,
+    };
+    let report = cog_observability::metric_projection::rebuild(&pool, &http, &prometheus, tables)
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     println!(
