@@ -552,10 +552,7 @@ pub fn web_search_with_fallback(
     Tool {
         name: "web_search".into(),
         description: "Search the open web and return ranked results with title, URL and \
-                      excerpt. Runs against this deployment's self-hosted metasearch \
-                      backend, so it costs no per-request vendor fee. Use it before \
-                      guessing at a current fact or an unfamiliar API; follow it with \
-                      web_fetch to read a result that matters."
+                      excerpt."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -566,7 +563,10 @@ pub fn web_search_with_fallback(
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "How many results to return (default 10, max 50)"
+                    "description": format!(
+                        "How many results to return (default {DEFAULT_SEARCH_RESULTS}, \
+                         max {MAX_SEARCH_RESULTS})"
+                    )
                 },
                 "language": {
                     "type": "string",
@@ -1281,12 +1281,10 @@ pub fn web_fetch_with_fallback(
         description: "Fetch one public web page and return its readable text, with the \
                       page title. When this deployment runs a rendering backend the page \
                       is rendered in a real browser first and returned as filtered \
-                      Markdown, so client-side-rendered pages come back with the text \
-                      their scripts produced; otherwise HTML is reduced to its article \
-                      content in process. Plain text and JSON come back as they are. \
-                      Binary files, including PDFs, are reported rather than returned: \
-                      the backend renders pages, it does not extract documents. Private, \
-                      loopback and cluster-internal addresses are refused."
+                      Markdown; otherwise HTML is reduced to its article content in \
+                      process. Plain text and JSON come back as they are. Binary files, \
+                      including PDFs, are reported rather than returned. Private, loopback \
+                      and cluster-internal addresses are refused."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -1297,7 +1295,10 @@ pub fn web_fetch_with_fallback(
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Cap on returned characters (default 20000, max 200000)"
+                    "description": format!(
+                        "Cap on returned characters (default {DEFAULT_FETCH_CHARS}, \
+                         max {MAX_FETCH_CHARS})"
+                    )
                 }
             },
             "required": ["url"]
@@ -1439,6 +1440,71 @@ mod tests {
 
     fn client_of(scripted: &Arc<Scripted>) -> Option<Arc<dyn HttpClient>> {
         Some(scripted.clone() as Arc<dyn HttpClient>)
+    }
+
+    /// 界只声明一次：`limit` / `max_chars` 的默认值与上限由常量给，描述里抄一份
+    /// 字面量，改常量那天它就是假话。这里按独立数字判，`UTF-8` 里的 8 不算。
+    #[test]
+    fn the_two_bounds_are_carried_by_the_fields_that_enforce_them() {
+        let search = web_search(None, Some("http://searx".into()));
+        let fetch = web_fetch(None, Some("http://render".into()));
+        let bounds = [
+            ("DEFAULT_SEARCH_RESULTS", DEFAULT_SEARCH_RESULTS),
+            ("MAX_SEARCH_RESULTS", MAX_SEARCH_RESULTS),
+            ("DEFAULT_FETCH_CHARS", DEFAULT_FETCH_CHARS),
+            ("MAX_FETCH_CHARS", MAX_FETCH_CHARS),
+        ];
+        for tool in [&search, &fetch] {
+            let numbers = standalone_numbers(&tool.description);
+            for (name, value) in bounds {
+                assert!(
+                    !numbers.contains(&value),
+                    "{} copies {name} ({value}) into its description: {}",
+                    tool.name,
+                    tool.description
+                );
+            }
+        }
+        assert!(
+            search.parameters["properties"]["limit"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&MAX_SEARCH_RESULTS.to_string()),
+            "the search cap is no longer published by the field that enforces it"
+        );
+        assert!(
+            fetch.parameters["properties"]["max_chars"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&MAX_FETCH_CHARS.to_string()),
+            "the fetch cap is no longer published by the field that enforces it"
+        );
+    }
+
+    /// 描述里独立出现的数字；粘在词上的不算。
+    fn standalone_numbers(text: &str) -> Vec<u64> {
+        let bytes = text.as_bytes();
+        let glued = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/' | b'.');
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !bytes[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let before = if start == 0 { b' ' } else { bytes[start - 1] };
+            let after = if i == bytes.len() { b' ' } else { bytes[i] };
+            if !glued(before) && !glued(after) {
+                if let Ok(value) = text[start..i].parse() {
+                    out.push(value);
+                }
+            }
+        }
+        out
     }
 
     #[tokio::test]

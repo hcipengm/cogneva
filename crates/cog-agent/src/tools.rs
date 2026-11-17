@@ -1787,6 +1787,83 @@ mod tests {
         );
     }
 
+    /// 描述里独立出现的数字。粘在词上的不算：`UTF-8`、`base64`、`v1.2` 里的数字
+    /// 是名字的一部分，把它们当成界的副本就会让这条门按拼写判、而不是按意思判。
+    fn standalone_numbers(text: &str) -> Vec<u64> {
+        let bytes = text.as_bytes();
+        let glued = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/' | b'.');
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !bytes[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let before = if start == 0 { b' ' } else { bytes[start - 1] };
+            let after = if i == bytes.len() { b' ' } else { bytes[i] };
+            if !glued(before) && !glued(after) {
+                if let Ok(value) = text[start..i].parse() {
+                    out.push(value);
+                }
+            }
+        }
+        out
+    }
+
+    /// 同一个界不许有两份数字：一份在这一回合真正生效的地方（schema 字段、拒绝判词），
+    /// 一份抄在描述里。抄的那份在改常量那天就成了假话，而不会有任何东西变红——除了这条。
+    ///
+    /// 判据按数字的独立出现判，不按裸子串：`600` 是 `600000` 的一部分，前者命中
+    /// 后者也要命中，但 `8` 不该在 `28` 里被算成一次命中。
+    #[test]
+    fn no_tool_description_restates_a_bound_that_is_enforced_somewhere_else() {
+        let registry = ToolRegistry::new();
+        builtins::register_builtins(
+            &registry,
+            builtins::BuiltinInputs {
+                http_client: None,
+                metrics: None,
+                memory_api_base: None,
+                external_archive_threshold_chars: 4096,
+                message_backend: None,
+                agent_registry: None,
+                web_search_base: None,
+                web_search_fallback_base: None,
+                web_fetch_base: None,
+                sandbox_backend: None,
+            },
+        );
+        let bounds = [
+            ("READ_FILE_MAX_BATCH", READ_FILE_MAX_BATCH as u64),
+            (
+                "READ_FILE_DEFAULT_WINDOW_LINES",
+                READ_FILE_DEFAULT_WINDOW_LINES as u64,
+            ),
+            ("ASK_DEFAULT_TIMEOUT_MS", ASK_DEFAULT_TIMEOUT_MS),
+            ("ASK_MAX_TIMEOUT_MS", ASK_MAX_TIMEOUT_MS),
+            (
+                "DEFAULT_RAW_FETCH_BUDGET_BYTES",
+                DEFAULT_RAW_FETCH_BUDGET_BYTES,
+            ),
+        ];
+        for tool in registry.list() {
+            let numbers = standalone_numbers(&tool.description);
+            for (name, value) in bounds {
+                assert!(
+                    !numbers.contains(&value),
+                    "{} copies {name} ({value}) into its description; the field that \
+                     enforces it already publishes the number: {}",
+                    tool.name,
+                    tool.description
+                );
+            }
+        }
+    }
+
     /// 带行范围读时只回那一段，但必须同时说清文件有多长、后面还有没有：
     /// 只回切片，读到的人会以为文件到那里就结束了；不回这一段，整份正文就
     /// 要进上下文，并且之后每一轮都跟着重发。
@@ -2960,12 +3037,10 @@ pub mod builtins {
             name: "read_file".into(),
             description: "Read the contents of a file. Relative paths resolve against \
                           the task's working directory, which is the repository root \
-                          when a checkout is provisioned. Pass offset and/or limit \
-                          to read one line range of a long file instead of the whole \
-                          thing; the result then also reports the file's total line \
-                          count and whether more remains. To read several files, \
-                          pass paths instead of path: one call returns them all, \
-                          which costs far less than one call per file."
+                          when a checkout is provisioned. Pass offset and/or limit to \
+                          read one line range; the result then also reports the file's \
+                          total line count and whether more remains. To read several \
+                          files, pass paths instead of path."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -2985,7 +3060,7 @@ pub mod builtins {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "How many lines to return; omit to read one page (600 lines) or the rest of the file if shorter. The reply carries total_lines, has_more and next_offset, so a long file is read page by page instead of in one piece"
+                        "description": "How many lines to return; omit to read one page or the rest of the file if shorter. The reply carries total_lines, has_more and next_offset"
                     }
                 },
                 "anyOf": [{ "required": ["path"] }, { "required": ["paths"] }]
@@ -2998,9 +3073,7 @@ pub mod builtins {
         Tool {
             name: "write_file".into(),
             description: "Write content to a file, replacing whatever it held. Relative paths \
-                          resolve against the task's working directory. To change part of an \
-                          existing file, use edit_file: rewriting the whole thing to change a \
-                          line carries every other line again."
+                          resolve against the task's working directory."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3019,13 +3092,8 @@ pub mod builtins {
             name: "edit_file".into(),
             description: "Replace an exact string in a file with new text, without rewriting \
                           the whole file. `old_string` is the text to find, copied exactly \
-                          from the file including indentation; `new_string` replaces it. When \
-                          the text appears more than once the call is refused and the \
-                          occurrences' line numbers are named, so include enough surrounding \
-                          text to pick one site -- or set `replace_all` to change all of \
-                          them. The reply says how many replacements were made and at which \
-                          lines. Read the file first: an anchor that does not match the bytes \
-                          on disk is refused, never guessed at."
+                          from the file including indentation; `new_string` replaces it. The \
+                          reply says how many replacements were made and at which lines."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3056,11 +3124,7 @@ pub mod builtins {
             description: "Run a shell command with full shell syntax: pipes, redirects, \
                           variable expansion, and scripts written via write_file are all \
                           supported. The command runs in the task's working directory; when \
-                          a repository checkout is provisioned it is already rooted there, \
-                          so work on the repo in place instead of cloning it again. For a \
-                          build or a test suite that takes minutes, use \
-                          run_command_background instead: it answers with a handle at once \
-                          and the turn goes on while the command runs."
+                          a repository checkout is provisioned it is already rooted there."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3076,11 +3140,9 @@ pub mod builtins {
     pub fn run_command_background() -> Tool {
         Tool {
             name: "run_command_background".into(),
-            description: "Start a shell command and answer at once with a handle, instead of \
-                          waiting for it to finish. Use it for builds and test suites that take \
-                          minutes: a foreground run holds the whole turn until it ends, while \
-                          this one keeps running in the task's working directory and the turn \
-                          goes on. Read its output and exit status with command_output."
+            description: "Start a shell command in the task's working directory and answer at \
+                          once with a handle, instead of waiting for it to finish. Read its \
+                          output and exit status with command_output."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3344,12 +3406,10 @@ pub mod builtins {
         Tool {
             name: "list_agents".into(),
             description: "List the live agents this platform has registered, optionally \
-                          filtered by role or capability. Use it to find the exact \
-                          agent_id to pass to send_to_agent. Only live agents appear: a \
+                          filtered by role or capability. Only live agents appear: a \
                           registration that has expired is not listed. Every entry \
                           carries the agent's `display_name` -- the name the workbench \
-                          shows, derived from the id -- so a colleague is addressed by \
-                          the same name a person sees. When the run established an \
+                          shows, derived from the id. When the run established an \
                           identity, your own entry carries `is_me: true` and the result \
                           repeats your id as `caller`."
                 .into(),
@@ -3474,16 +3534,14 @@ pub mod builtins {
             name: "send_to_agent".into(),
             description: "Send an instruction to another live agent's inbox. Delivery is \
                           at-least-once and the target acks only after it has run the \
-                          command, so write instructions that survive being applied twice. \
-                          With expect_reply the call waits for the target's answer and \
-                          returns it under `reply`; without it the call returns as soon as \
-                          the instruction is queued and nothing comes back. The result \
-                          repeats your own agent id as `from` when the run established \
-                          one, and `null` when it did not. kind=prompt starts a run on the \
+                          command. With expect_reply the call waits for the target's answer \
+                          and returns it under `reply`; without it the call returns as soon \
+                          as the instruction is queued and nothing comes back. The result \
+                          repeats your own agent id as `from` when the run established one, \
+                          and `null` when it did not. kind=prompt starts a run on the \
                           target, kind=steering injects into a run already in progress, \
                           kind=continue appends to the target's conversation; only \
-                          kind=prompt can carry expect_reply, because only a run produces \
-                          an answer."
+                          kind=prompt can carry expect_reply."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3509,8 +3567,11 @@ pub mod builtins {
                     },
                     "timeout_ms": {
                         "type": "integer",
-                        "description": "How long to wait when expect_reply is set (default \
-                                        120000, capped at 600000)"
+                        "description": format!(
+                            "How long to wait when expect_reply is set (default {}, \
+                             capped at {})",
+                            ASK_DEFAULT_TIMEOUT_MS, ASK_MAX_TIMEOUT_MS
+                        )
                     }
                 },
                 "required": ["agent_id", "message"]
@@ -3723,12 +3784,9 @@ pub mod builtins {
             description: "File a piece of work on the shared task graph, optionally naming the \
                           person who should carry it. The row appears on the workbench under the \
                           venue you give it, and its acceptance criteria are what the answer is \
-                          judged by. Use it when the work outlives this turn, needs someone \
-                          else, or should be on the board where the owner can see it. The call \
-                          returns as soon as the row is queued; the answer comes back in the \
-                          task's result, not in this turn. Call it again with the returned \
-                          goal_id to add more items to the same goal — that is how a squad is \
-                          formed around one goal."
+                          judged by. The call returns as soon as the row is queued; the answer \
+                          comes back in the task's result, not in this turn. Call it again with \
+                          the returned goal_id to add more items to the same goal."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3867,14 +3925,12 @@ pub mod builtins {
         Tool {
             name: "read_task_ledger".into(),
             description: "Read the shared task ledger: how much work is on the board, in what \
-                          states, in which venues, and on whose hands. Use it before starting \
-                          something new, to find out whether it is already queued or already \
-                          done, and after filing work, to find out whether anyone picked it up. \
-                          The reading is folded: counts plus the oldest open rows, never the \
-                          whole table. Narrow it with any of the filters; leave them out to read \
-                          the whole board. `open` rows that were never taken are queue depth, \
-                          rows with a `started_at` are work in flight, and `truncated` says the \
-                          row list was cut to `limit` rather than being complete."
+                          states, in which venues, and on whose hands. The reading is folded: \
+                          counts plus the oldest open rows, never the whole table. Narrow it \
+                          with any of the filters; leave them out to read the whole board. \
+                          `open` rows that were never taken are queue depth, rows with a \
+                          `started_at` are work in flight, and `truncated` says the row list \
+                          was cut to `limit` rather than being complete."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3901,8 +3957,7 @@ pub mod builtins {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "How many of the oldest open rows to bring back (default \
-                                        20, capped at 50 regardless of what is asked for)."
+                        "description": "How many of the oldest open rows to bring back"
                     }
                 }
             }),
@@ -3953,11 +4008,9 @@ pub mod builtins {
             name: "await_task".into(),
             description: "Wait for a task you filed to reach its end, and return what it \
                           ended with. The call blocks this turn for up to timeout_ms; the \
-                          server subscribes to the task's lifecycle rather than being polled, \
-                          so one call is enough. On timeout `task_completed` is false and \
-                          `reason` is `timeout`: that means no end arrived within the limit, \
-                          not that the work failed or is not being done. Tasks are filed with \
-                          `start_task`; its receipt carries the `task_id` this needs."
+                          server subscribes to the task's lifecycle rather than being polled. \
+                          On timeout `task_completed` is false and `reason` is `timeout`: no \
+                          end arrived within the limit, not that the work failed."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -3968,8 +4021,11 @@ pub mod builtins {
                     },
                     "timeout_ms": {
                         "type": "integer",
-                        "description": "How long to wait when the task has not ended yet \
-                                        (default 120000, capped at 600000)"
+                        "description": format!(
+                            "How long to wait when the task has not ended yet (default {}, \
+                             capped at {})",
+                            ASK_DEFAULT_TIMEOUT_MS, ASK_MAX_TIMEOUT_MS
+                        )
                     }
                 },
                 "required": ["task_id"]
@@ -4108,13 +4164,8 @@ pub mod builtins {
             description: "Hand one self-contained piece of work to a fresh context and get its \
                           answer back as this call's result. The child sees only the task text \
                           you pass here -- none of this conversation's history, none of what \
-                          you have read so far -- so use it when the work would otherwise fill \
-                          this conversation with material you do not need again (searching a \
-                          wide tree, reading many files, trying several approaches). The child \
-                          answers once, and that answer is what comes back. It cannot spawn \
-                          children of its own. If the work has to outlive this turn or needs \
-                          someone else, use start_task instead; if it is a question for a peer, \
-                          use send_to_agent."
+                          you have read so far. The child answers once, and that answer is what \
+                          comes back. It cannot spawn children of its own."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -4711,10 +4762,9 @@ pub mod builtins {
         Tool {
             name: "grep".into(),
             description: "Search the files under the checkout for a regular expression and get \
-                          the matching lines back as `path:line:text`, the same shape you would \
-                          see from `grep -rn`. Use search_code instead when you want the matches \
-                          already grouped per file. Binary files and `.git` are skipped. Long \
-                          result sets stop at the cap and say `truncated: true`."
+                          the matching lines back as `path:line:text`, the shape `grep -rn` \
+                          prints. Binary files and `.git` are skipped. Long result sets stop at \
+                          the cap and say `truncated: true`."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -4782,10 +4832,8 @@ pub mod builtins {
             name: "search_code".into(),
             description: "Search the checkout for a regular expression and get the matches as \
                           structured entries: one per match, each with the file, the line number \
-                          and the line's text. Use it to find where something lives before \
-                          reading the file; use grep when you want the matching lines as plain \
-                          text. Files are searched from the checkout root; binary files and \
-                          `.git` are skipped."
+                          and the line's text. Files are searched from the checkout root; binary \
+                          files and `.git` are skipped."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -4963,8 +5011,7 @@ pub mod builtins {
             name: "git_status".into(),
             description: "Show the checkout's branch and what has changed in it, in the short \
                           form: one line per changed path, `??` for files git is not tracking, \
-                          and the first line names the branch. Read it before committing to see \
-                          what the commit would include."
+                          and the first line names the branch."
                 .into(),
             parameters: serde_json::json!({ "type": "object", "properties": {} }),
             implementation: ToolImplementation::Native(Arc::new(move |_args| {
@@ -5067,8 +5114,7 @@ pub mod builtins {
                           stage them first; without paths, what is already staged is committed. \
                           The commit is signed by you -- your employee name and id are the \
                           author -- so the history says who made the change. It answers with the \
-                          new commit's id. Use git_status first: committing an empty change is \
-                          refused by git, and the refusal is reported rather than retried."
+                          new commit's id."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -5150,9 +5196,8 @@ pub mod builtins {
             name: "apply_patch".into(),
             description: "Apply a unified diff to the checkout, the way `git apply` does: the \
                           patch has to name the files it changes with `---`/`+++` headers and \
-                          apply cleanly to what is on disk. Use it for changes that touch many \
-                          places at once; for one exact replacement edit_file is cheaper. A \
-                          patch that does not apply is refused whole -- nothing is half-applied."
+                          apply cleanly to what is on disk. A patch that does not apply is \
+                          refused whole -- nothing is half-applied."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -5220,12 +5265,8 @@ pub mod builtins {
         Tool {
             name: crate::permission::EXIT_PLAN_TOOL.into(),
             description: "Hand the plan to the person for approval and, once they approve, \
-                          carry it out. Call this with the plan you would execute, in plain \
-                          prose: what you will change, in which files, and how you will know \
-                          it worked. It does nothing by itself -- while the plan is unapproved \
-                          every tool that writes or runs anything is refused, so this is the \
-                          only way forward. If the person answers with a reason instead, treat \
-                          it as more research to do and call this again when the plan is better."
+                          carry it out. It does nothing by itself -- while the plan is \
+                          unapproved every tool that writes or runs anything is refused."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -5268,11 +5309,9 @@ pub mod builtins {
             name: "todo".into(),
             description: "Record the plan for this piece of work as a list of items with a \
                           status each (`pending`, `in_progress`, `done`), replacing the list \
-                          wholesale. Use it when the work has several steps: writing the steps \
-                          down keeps the next call aimed at the right one. The answer repeats \
-                          the list with the counts, so the state is read back rather than \
-                          remembered. It lives with this process, not in the checkout -- a \
-                          restart forgets it, and nothing is committed."
+                          wholesale. The answer repeats the list with the counts, so the state \
+                          is read back rather than remembered. It lives with this process, not \
+                          in the checkout -- a restart forgets it, and nothing is committed."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -5441,9 +5480,8 @@ pub mod builtins {
             name: "raw_list".into(),
             description: "List archived raw sources in the shared memory namespace, \
                           optionally filtered by content-type prefix. Each item carries its \
-                          content type, payload length and creation time so a caller can \
-                          choose what to read within its budget; call raw_fetch for the \
-                          bytes. Fails with an error when no memory API base is configured."
+                          content type, payload length and creation time. Fails with an error \
+                          when no memory API base is configured."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -5530,7 +5568,10 @@ pub mod builtins {
                     "id": { "type": "string", "description": "Raw source id" },
                     "budget": {
                         "type": "integer",
-                        "description": "Maximum payload bytes to move (default 262144)"
+                        "description": format!(
+                            "Maximum payload bytes to move (default {})",
+                            DEFAULT_RAW_FETCH_BUDGET_BYTES
+                        )
                     }
                 },
                 "required": ["id"]
