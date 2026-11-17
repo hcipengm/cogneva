@@ -676,22 +676,97 @@ impl Activity {
 }
 
 /// 读一个进程的活动计数。进程已退出、没有 procfs、读 `stat` 没权限，都是 `None`。
+/// 这个进程**和它启动的每一个进程**的读数。
+///
+/// 只看那一个 pid 是不够的：`cargo build` 自己的 CPU 几乎全在等 rustc 子进程，
+/// 链接与代码生成的时候它能连着好几秒只做等待——于是「没有 CPU、没有输出」这条
+/// 判据会把一次正在全速干活的构建判成停住。2026-11-17 实测：主线部署器的一次
+/// release 构建在 3.003 秒的静默窗口上被判停，rustc 留在那里成了僵尸。
+///
+/// 所以这三个数按**进程树**求和：被启动的子进程烧的 CPU 也是这件事在动。
 pub fn process_activity(pid: u32) -> Option<Activity> {
-    let (utime, stime) = cpu_ticks(pid)?;
-    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok();
-    let field = |name: &str| -> Option<u64> {
-        io.as_deref()?
-            .lines()
-            .find_map(|line| line.strip_prefix(name))?
-            .trim()
-            .parse()
-            .ok()
+    // pid 0 不是一条命令：它是内核调度器，`/proc/0` 永远不存在。而且它的 ppid 关系会
+    // 把一整批内核线程连进来——照着那批数会得出「读得到读数」，于是「量不到」被读成
+    // 「在动」，判据会替一个根本不存在的进程说话。
+    if pid == 0 {
+        return None;
+    }
+    let tree = process_tree(pid);
+    let mut cpu = 0u64;
+    let mut readable = false;
+    let mut read_bytes: Option<u64> = Some(0);
+    let mut written_bytes: Option<u64> = Some(0);
+    for pid in &tree {
+        if let Some((utime, stime)) = cpu_ticks(*pid) {
+            cpu = cpu.saturating_add(utime.saturating_add(stime));
+            readable = true;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/io")) {
+            Ok(io) => {
+                let field = |name: &str| -> Option<u64> {
+                    io.lines()
+                        .find_map(|line| line.strip_prefix(name))?
+                        .trim()
+                        .parse()
+                        .ok()
+                };
+                read_bytes = read_bytes
+                    .zip(field("rchar:"))
+                    .map(|(total, now)| total.saturating_add(now));
+                written_bytes = written_bytes
+                    .zip(field("wchar:"))
+                    .map(|(total, now)| total.saturating_add(now));
+            }
+            // 树里有一个读不到，就整列按「量不到」报——那一列是求和，缺一项就不是和。
+            Err(_) => {
+                read_bytes = None;
+                written_bytes = None;
+            }
+        }
+    }
+    if !readable {
+        return None;
+    }
+    Some(Activity::new(cpu, read_bytes, written_bytes))
+}
+
+/// `pid` 以及它启动的全部后代（广度优先，按 `/proc` 里的 ppid 关系找）。
+///
+/// 平台没有 `/proc` 时返回的只有它自己：那不是错误，是「这一层读不到」，读数仍按
+/// 它自己的那一份算。
+fn process_tree(pid: u32) -> Vec<u32> {
+    let mut tree = vec![pid];
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return tree;
     };
-    Some(Activity::new(
-        utime.saturating_add(stime),
-        field("rchar:"),
-        field("wchar:"),
-    ))
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(child) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if let Some(parent) = parent_pid(child) {
+            children.entry(parent).or_default().push(child);
+        }
+    }
+    let mut index = 0;
+    while index < tree.len() {
+        if let Some(kids) = children.get(&tree[index]) {
+            let kids = kids.clone();
+            tree.extend(kids);
+        }
+        index += 1;
+    }
+    tree
+}
+
+/// `/proc/<pid>/stat` 里的 ppid（第 4 个字段，切过带括号的进程名之后从 state 起算）。
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit(')').next()?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // rest 从 state 起（整份 stat 的第 3 个字段），于是 ppid（第 4 个）是它里面的第 2 个。
+    fields.get(1)?.parse().ok()
 }
 
 async fn read_beating<R>(
@@ -794,6 +869,33 @@ mod tests {
     use super::*;
     // 判据与界住在 `declared_wall`：这里的用例仍然读它们，因为它们量的是同一批样本。
     use crate::declared_wall::{stall, stall_any, Bound};
+
+    /// 一个自己不怎么烧 CPU、由子进程烧的父进程，也算在动。
+    ///
+    /// 这条的形状是 `cargo build`：父进程在等 rustc，它自己的 utime 长时间不动，
+    /// 而整件事一直在干活。只读那一个 pid 的读数会把最忙的一段判成停住。
+    #[test]
+    fn a_parent_waiting_on_a_busy_child_is_still_moving() {
+        use std::process::{Command, Stdio};
+        // 父进程自己 sleep（几乎不吃 CPU），子进程烧 CPU。
+        let mut child = Command::new("sh")
+            .arg("-c")
+            // 非交互 sh 没有作业控制，`kill %1` 找不到那个后台进程；用 `$!` 记下它的 pid。
+            .arg("(while :; do :; done) & child=$!; sleep 3; kill $child 2>/dev/null; wait")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a shell that waits on a busy child");
+        let pid = child.id();
+        let before = super::process_activity(pid).expect("the tree is readable");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let after = super::process_activity(pid).expect("the tree is readable");
+        let _ = child.wait();
+        assert!(
+            after.moved_since(before),
+            "the child's CPU has to count as this command moving"
+        );
+    }
 
     /// The sample floor is the number of quantile points, not a number anybody
     /// picked: `1 / (1 - q)`. A floor that stopped following the quantile would
