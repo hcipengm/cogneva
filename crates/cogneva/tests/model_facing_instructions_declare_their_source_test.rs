@@ -14,9 +14,15 @@
 //! 任务与工件契约：规划指令、diff 语法与验证契约、告警修复 goal、面漂移 goal。
 //! 改 `prompts/` 的任何一个字都不影响它们，而没有一道门看见它们。
 //! 本门按承载形状普查到的**点**比文本多（一条文本可以在几处出现，一个函数里的每
-//! 行字面量各算一点——门要报的是「哪一行没表态」）：这一天量到 276 个载体点、19
-//! 个函数。读数由测试自己印出来，`cargo test … -- --nocapture` 就是重新量一次；
-//! 别的地方不要手抄这两个数。
+//! 行字面量各算一点——门要报的是「哪一行没表态」）：2026-11-17 量到 276 个载体点、
+//! 19 个函数、7160 字节。读数由测试自己印出来，`cargo test … -- --nocapture` 就是
+//! 重新量一次；别的地方不要手抄这三个数。
+//!
+//! 字节数有一道只降不升的预算（`the_prompt_surface_only_shrinks`）：普查回答「每一行
+//! 表态了吗」，预算回答「一共还剩多少」。没有它，删掉的字会一段一段长回来——每一段
+//! 都能给出一个像样的理由，而没有任何一次改动会红。工具描述那一面不在本门的普查里
+//! （形状是工具签名，不是契约字段），它的预算在 `crates/cog-agent/src/tools.rs` 里，
+//! 同样只降不升。
 //!
 //! 为什么门判的是「就地表明身份」而不是「必须搬进 prompts/」：这两类东西的
 //! 寿命不一样。系统提示词是策略，运维改了就该生效，所以它有一条声明、一份
@@ -557,6 +563,97 @@ fn the_words_are_read_the_way_the_header_says() {
     ));
 }
 
+/// 门看见的这些点，一共有多少字节的字面量。这是模型每一回合都要付的固定成本，
+/// 所以它只降不升：删掉一段散文，这个数跟着降；要往上抬，得先说清新增的那段
+/// 凭什么非有不可。
+fn carried_bytes(root: &Path) -> usize {
+    carried_over(production(root), &census(root))
+}
+
+fn carried_over(rows: Vec<(String, Vec<Row>)>, sites: &[Site]) -> usize {
+    let points: BTreeSet<(String, usize)> = sites
+        .iter()
+        .map(|site| (site.file.clone(), site.line))
+        .collect();
+    let mut total = 0;
+    for (rel, lines) in rows {
+        for (number, raw, _) in lines {
+            if points.contains(&(rel.clone(), number)) {
+                total += literal_bytes(&raw);
+            }
+        }
+    }
+    total
+}
+
+/// 一行里引号之间的字节数。量的是读的人看到的那份文本，不是源码形状：
+/// 转义与引号本身不算，标点与空格算。
+fn literal_bytes(line: &str) -> usize {
+    let mut total = 0;
+    let mut inside = false;
+    let mut escaped = false;
+    for ch in line.chars() {
+        if inside {
+            if escaped {
+                escaped = false;
+                total += ch.len_utf8();
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                inside = false;
+            } else {
+                total += ch.len_utf8();
+            }
+        } else if ch == '"' {
+            inside = true;
+        }
+    }
+    total
+}
+
+#[test]
+fn the_prompt_surface_only_shrinks() {
+    let root = repo_root();
+    let measured = carried_bytes(&root);
+    // cap: derived — 由树上的这些点现算（2026-11-17 实测 7160）；删字时跟着降，
+    // 往上抬要在提交信息里说清新增的是哪一段、凭什么非有不可
+    const BUDGET: usize = 7_160;
+    assert!(
+        measured <= BUDGET,
+        "模型每回合要为这些点付 {measured} 字节，预算是 {BUDGET}：要么删掉长出来的那段，\
+         要么抬预算并说清理由"
+    );
+    eprintln!(
+        "prompt payload: {measured} bytes at {} carrier points",
+        census(&root).len()
+    );
+}
+
+/// 读数确实来自树，不是写死的：换一段更长的字面量，读数跟着变。
+#[test]
+fn the_payload_reading_follows_the_text_on_the_tree() {
+    let measure = |body: &str| {
+        let rows: Vec<(String, Vec<Row>)> = vec![(
+            "crates/x/src/y.rs".to_string(),
+            production_numbered_lines_keeping_comments(body)
+                .into_iter()
+                .map(|(number, raw)| (number, raw.to_string(), strip(&raw, Dialect::Rust)))
+                .collect(),
+        )];
+        let sites = vec![Site {
+            file: "crates/x/src/y.rs".to_string(),
+            line: 1,
+            carrier: Carrier::Message,
+            function: "f".to_string(),
+        }];
+        carried_over(rows, &sites)
+    };
+    let short = measure("fn f() { Message::system(\"short\") }");
+    let long = measure("fn f() { Message::system(\"a much longer instruction text\") }");
+    assert!(short > 0, "扫描器没在这个夹具上读到任何字面量");
+    assert!(long > short, "读数没跟着树上的文本走：{short} -> {long}");
+}
+
 #[test]
 fn every_model_facing_instruction_declares_its_source() {
     let root = repo_root();
@@ -566,7 +663,7 @@ fn every_model_facing_instruction_declares_its_source() {
         "普查一个载体点都没读到——扫描器坏了，不是树上没有提示词"
     );
     // 读数从这儿印，不要手抄到别处：`cargo test … -- --nocapture` 就是重新量一次。
-    // 文件头那句「183 个载体点、14 个函数」是这一行在某一天的输出。
+    // 文件头那句「276 个载体点、19 个函数」是这一行在某一天的输出。
     let functions: std::collections::BTreeSet<(&str, &str)> = sites
         .iter()
         .map(|s| (s.file.as_str(), s.function.as_str()))
