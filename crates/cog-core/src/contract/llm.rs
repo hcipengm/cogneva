@@ -805,7 +805,10 @@ fn parse_answer(text: &str) -> SFResult<serde_json::Value> {
     let trimmed = text.trim();
     if let Some(rest) = trimmed.strip_prefix("```") {
         if let Some(body) = rest.strip_suffix("```") {
-            let body = body.split_once('\n').map(|(_, inner)| inner).unwrap_or(body);
+            let body = body
+                .split_once('\n')
+                .map(|(_, inner)| inner)
+                .unwrap_or(body);
             return serde_json::from_str(body).map_err(SFError::Serialization);
         }
     }
