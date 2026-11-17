@@ -185,13 +185,38 @@ pub struct CommandCage {
 /// against a number nobody measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CageReading {
-    /// The cage existed and reported the peak the kernel charged to it.
-    Peak(u64),
+    /// The cage existed and reported the peak the kernel charged to it, plus
+    /// how many of this cage's own processes the memory killer took.
+    Peak { bytes: u64, oom_kills: Option<u64> },
     /// The cage existed but the memory controller does not reach it, so there
     /// is no peak to report.
     Unaccounted,
     /// No cage could be made here; the cgroup tree is not writable.
     Unavailable,
+}
+
+impl CageReading {
+    /// Whether this command was killed for memory.
+    ///
+    /// `None` when the cage cannot say: an unreadable counter is no evidence in
+    /// either direction, and the caller has to fall back to the container-wide
+    /// count -- which only says something was killed around the same time. The
+    /// cage's own count is the difference between "this command ran out of
+    /// memory" and "another command did, while this one was killed".
+    pub fn oom_killed(&self) -> Option<bool> {
+        match self {
+            CageReading::Peak { oom_kills, .. } => oom_kills.map(|n| n > 0),
+            CageReading::Unaccounted | CageReading::Unavailable => None,
+        }
+    }
+
+    /// The peak, when there is one.
+    pub fn peak(&self) -> Option<u64> {
+        match self {
+            CageReading::Peak { bytes, .. } => Some(*bytes),
+            CageReading::Unaccounted | CageReading::Unavailable => None,
+        }
+    }
 }
 
 impl CommandCage {
@@ -235,19 +260,34 @@ impl CommandCage {
         read_u64(self.dir.join(MEMORY_PEAK))
     }
 
-    /// Read the peak and take the cage down. A process still running in it
-    /// keeps the directory alive -- the kernel refuses to drop a populated
-    /// cgroup -- which is the honest outcome, and the only trace it leaves is
-    /// this line.
-    pub fn finish(self) -> CageReading {
-        let peak = self.peak_bytes();
+    /// Everything this cage can say about the command it held.
+    ///
+    /// Separate from closing because the death of the command is decided before
+    /// the cage is taken down, and that decision needs the cage's own OOM count.
+    pub fn reading(&self) -> CageReading {
+        match self.peak_bytes() {
+            Some(bytes) => CageReading::Peak {
+                bytes,
+                oom_kills: read_oom_kills(&self.dir),
+            },
+            None => CageReading::Unaccounted,
+        }
+    }
+
+    /// Take the cage down. A process still running in it keeps the directory
+    /// alive -- the kernel refuses to drop a populated cgroup -- which is the
+    /// honest outcome, and the only trace it leaves is this line.
+    pub fn close(self) {
         if let Err(e) = std::fs::remove_dir(&self.dir) {
             tracing::debug!(dir = %self.dir.display(), error = %e, "cage left behind");
         }
-        match peak {
-            Some(peak) => CageReading::Peak(peak),
-            None => CageReading::Unaccounted,
-        }
+    }
+
+    /// Read and take down in one step, for callers with nothing left to decide.
+    pub fn finish(self) -> CageReading {
+        let reading = self.reading();
+        self.close();
+        reading
     }
 }
 
@@ -274,9 +314,16 @@ fn cage_name(pid: u32) -> String {
 /// the same from the histogram alone.
 pub fn record_cage(reading: CageReading) {
     match reading {
-        CageReading::Peak(peak) => {
-            metrics().command_peak.observe(peak as f64);
+        CageReading::Peak { bytes, oom_kills } => {
+            metrics().command_peak.observe(bytes as f64);
             metrics().cages.with_label_values(&["measured"]).inc();
+            // A kill charged to this command's own cage is this command's,
+            // not a guess from the container-wide counter moving while it
+            // ran, so it is counted on its own line.
+            if oom_kills.is_some_and(|n| n > 0) {
+                metrics().command_oom_kills.inc();
+                warn!(bytes, oom_kills = ?oom_kills, "command's cage was OOM-killed");
+            }
         }
         CageReading::Unaccounted => metrics().cages.with_label_values(&["unaccounted"]).inc(),
         CageReading::Unavailable => metrics().cages.with_label_values(&["unavailable"]).inc(),
@@ -299,6 +346,10 @@ struct MemoryMetrics {
     /// watched using, and anything above it counts as that bucket, which is
     /// what tells the shape apart from a mis-set top edge.
     command_peak: prometheus::Histogram,
+    /// `sandbox_command_oom_kills_total`: kills the OOM killer charged to a
+    /// command's own cage, so the count names the command instead of the
+    /// container.
+    command_oom_kills: Counter,
 }
 
 static METRICS: OnceLock<MemoryMetrics> = OnceLock::new();
@@ -330,6 +381,11 @@ fn metrics() -> &'static MemoryMetrics {
             ),
         )
         .expect("static histogram");
+        let command_oom_kills = Counter::new(
+            "sandbox_command_oom_kills_total",
+            "Sandbox commands the memory killer took inside their own cgroup",
+        )
+        .expect("static counter");
         // Every state is on the scrape surface from the first one: a zero that
         // was never incremented says "this has not happened here", while a
         // missing series cannot be told apart from a build without the reading.
@@ -340,6 +396,7 @@ fn metrics() -> &'static MemoryMetrics {
             Box::new(oom_kills.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(cages.clone()),
             Box::new(command_peak.clone()),
+            Box::new(command_oom_kills.clone()),
         ] {
             registry
                 .register(collector)
@@ -350,6 +407,7 @@ fn metrics() -> &'static MemoryMetrics {
             oom_kills,
             cages,
             command_peak,
+            command_oom_kills,
         }
     })
 }
@@ -487,7 +545,14 @@ mod tests {
         );
         std::fs::write(cage.path().join("memory.peak"), "53687091\n").unwrap();
 
-        assert_eq!(cage.finish(), CageReading::Peak(53687091));
+        assert_eq!(
+            cage.finish(),
+            CageReading::Peak {
+                bytes: 53687091,
+                oom_kills: None,
+            },
+            "a cage with no memory.events has no kill count, which is not a count of zero"
+        );
     }
 
     /// Taking the cage down is part of reading it, so the next command does not
@@ -518,7 +583,42 @@ mod tests {
 
         let measured = CommandCage::for_pid_at(root.path(), 2).unwrap();
         std::fs::write(measured.path().join("memory.peak"), "0\n").unwrap();
-        assert_eq!(measured.finish(), CageReading::Peak(0));
+        assert_eq!(
+            measured.finish(),
+            CageReading::Peak {
+                bytes: 0,
+                oom_kills: None,
+            }
+        );
+    }
+
+    /// The container's kill counter only says something was killed while the
+    /// command ran; the cage's own says this command was. A cage that cannot
+    /// read the file has to stay silent rather than answer "not this one".
+    #[test]
+    fn only_the_cages_own_counter_can_name_the_command_it_killed() {
+        let root = tempfile::tempdir().unwrap();
+
+        let killed = CommandCage::for_pid_at(root.path(), 1).unwrap();
+        std::fs::write(killed.path().join("memory.peak"), "900\n").unwrap();
+        std::fs::write(
+            killed.path().join("memory.events"),
+            "low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\n",
+        )
+        .unwrap();
+        assert_eq!(killed.finish().oom_killed(), Some(true));
+
+        let spared = CommandCage::for_pid_at(root.path(), 2).unwrap();
+        std::fs::write(spared.path().join("memory.peak"), "900\n").unwrap();
+        std::fs::write(
+            spared.path().join("memory.events"),
+            "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+        )
+        .unwrap();
+        assert_eq!(spared.finish().oom_killed(), Some(false));
+
+        let unreachable = CommandCage::for_pid_at(root.path(), 3).unwrap();
+        assert_eq!(unreachable.finish().oom_killed(), None);
     }
 
     #[test]

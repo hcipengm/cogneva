@@ -404,6 +404,15 @@ pub(crate) fn spawn_command(
             Some(_) => None,
             None => Some(status),
         };
+        // Read the cage before naming the death: its own `memory.events` says
+        // whether *this* command was killed for memory, where the container's
+        // counter only says something was killed while it ran. Read after
+        // `wait`, when the charge is final, and after the kill has landed, when
+        // the kernel has had the chance to record it.
+        let reading = match cage.as_ref() {
+            Some(cage) => cage.reading(),
+            None => super::cgroup::CageReading::Unavailable,
+        };
         let code = match exited {
             // `code()` is only set on a normal exit: a signal-terminated child
             // (the cgroup OOM killer, a crash, an external kill) reports None,
@@ -417,7 +426,14 @@ pub(crate) fn spawn_command(
                 (Some(c), _) => c,
                 (None, Some(sig)) => {
                     let facts = super::cgroup::read();
-                    let oom = super::cgroup::CgroupFacts::oom_kill_between(&memory_before, &facts);
+                    // The cage names this command; the container count names
+                    // the neighbourhood. Where the cage can speak it decides,
+                    // and where it cannot the container reading stands as the
+                    // weaker answer, so neither is reported as certain when it
+                    // is not.
+                    let oom = reading.oom_killed().unwrap_or_else(|| {
+                        super::cgroup::CgroupFacts::oom_kill_between(&memory_before, &facts)
+                    });
                     if oom {
                         super::cgroup::record_oom_kill(facts.limit_bytes, facts.peak_bytes);
                     }
@@ -444,13 +460,11 @@ pub(crate) fn spawn_command(
                 -1
             }
         };
-        // Read after the child is gone: the peak is a high-water mark for the
-        // cage's lifetime, and taking the cage down before this would discard
-        // the only reading it will ever have.
-        let reading = match cage {
-            Some(cage) => cage.finish(),
-            None => super::cgroup::CageReading::Unavailable,
-        };
+        // Taken down only now: the peak is a high-water mark for the cage's
+        // lifetime, and the reading above is the only one it will ever give.
+        if let Some(cage) = cage {
+            cage.close();
+        }
         super::cgroup::record_cage(reading);
         let _ = tx.send(CommandEvent::Exit { code }).await;
     });
