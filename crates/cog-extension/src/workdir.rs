@@ -1308,9 +1308,15 @@ impl WorkdirRouter {
     /// 「没有」是一个答案，不是失败：一个刚起来的客户端手上没有钉子，它就是
     /// 拿这个问题决定这条 lane 落在哪副副本上；把「没有」写成错误，会让每一次
     /// 普通的首次落点都带一条错误，而真正该报错的只有名字不能用和读不出来。
+    ///
+    /// 判的是 route 判复用的那一个凭据（树自己的 `.git` 链接与边车），不是仓里的
+    /// 登记：问「有没有」要的是「下一条命令会不会在这棵树上跑」，而仓读不出来时
+    /// 树还在、命令也跑得起来——按登记答「没有」会让客户端去别的副上另切一棵，
+    /// 丢掉这棵树上的工作。它也不起 git 进程：一副副本上来一次「问树」会按 lane
+    /// 数打过来，而每条 lane 的答案是一次 stat 就够的事。
     pub async fn holds_tree(&self, lane: &str) -> Result<bool, CarryError> {
         validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
-        Ok(self.tree_of(lane).await.is_some())
+        Ok(self.is_healthy(&self.cfg.workspaces_root.join(lane)).await)
     }
 
     /// The tree this lane already has on this volume, if it is still there.
@@ -3677,6 +3683,28 @@ pub(crate) mod tests {
         let (again, _, _) = r.route("task-1").await.unwrap();
         assert_eq!(again, path);
         assert_eq!(r.list_task_trees().await.len(), 1);
+    }
+
+    /// 问树答的是「下一条命令会不会在这棵树上跑」，所以它读树自己的凭据，不读
+    /// 仓里的登记：仓读不出来时那棵树还在、命令也跑得起来，答「没有」会让客户端
+    /// 去别的副上另切一棵，把这棵树上的工作留在原地。
+    #[tokio::test]
+    async fn the_tree_question_reads_the_tree_itself_not_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let (path, _, _) = r.route("task-1").await.unwrap();
+        assert_eq!(path, tmp.path().join("workspaces").join("task-1"));
+        assert!(r.holds_tree("task-1").await.unwrap());
+        assert!(!r.holds_tree("task-2").await.unwrap());
+
+        // 把仓整个拿走：登记读不出来了，树还在。
+        std::fs::rename(&bare, tmp.path().join("repo-gone")).unwrap();
+        assert!(
+            r.holds_tree("task-1").await.unwrap(),
+            "仓读不出来时把一棵还在的树说成没有"
+        );
+        assert!(!r.holds_tree("task-2").await.unwrap());
     }
 
     /// A new task takes a tree that was cut before it arrived. Without the
