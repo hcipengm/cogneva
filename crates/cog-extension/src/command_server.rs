@@ -281,7 +281,45 @@ async fn boundary(State(state): State<AppState>) -> Json<cog_core::SandboxBounda
 
 /// 这一刻的编译队：谁占着位子、谁排在第几位。只读，不改变任何人等的顺序。
 async fn lane(State(state): State<AppState>) -> Json<cog_core::BuildLaneReading> {
+    publish_shape_cost(&state);
     Json(build_lane_fairness(&state.build_lane))
+}
+
+/// 两种沙箱形态的价格表，从这台执行器量得到的东西算。
+///
+/// 每一格都在它自己该在的地方量：起停是本进程入口到监听，切树与搬树是
+/// workdir 窗口里的中位，卷是最近一次卷走查的字节，等位子是编译队窗口的分位，
+/// 一副副本能跑几份是压力除以实测单价。量不到的格子是 `None`，判决停在
+/// 「没答案」并点名缺哪条——不拿一个偏好顶上。
+fn shape_readings(state: &AppState) -> pressure::ShapeReadings {
+    let demand = pressure::Demand::from_samples(&crate::runtime::cgroup::recent_peaks());
+    let room = Pressure::from_facts(
+        &crate::runtime::cgroup::read(),
+        state.pressure.reserved_bytes(),
+    );
+    pressure::ShapeReadings {
+        startup: pressure::startup_seconds(),
+        checkout: state
+            .workdir
+            .as_ref()
+            .and_then(|workdir| workdir.checkout_seconds()),
+        queue_wait: state.queue_waits.window().map(|wait| wait.as_secs_f64()),
+        idle_bytes: state.build_lane.idle_working_set(),
+        tree_bytes: state
+            .workdir
+            .as_ref()
+            .and_then(|workdir| workdir.tree_bytes()),
+        tasks_per_replica: room.fits(&demand),
+        carry: state
+            .workdir
+            .as_ref()
+            .and_then(|workdir| workdir.carry_reading())
+            .map(|(seconds, _bytes)| seconds),
+    }
+}
+
+fn publish_shape_cost(state: &AppState) {
+    pressure::publish_shape_cost(&pressure::sandbox_shape_cost(&shape_readings(state)));
 }
 
 fn error_response(status: StatusCode, message: String) -> Response {
@@ -1191,6 +1229,10 @@ fn outcome_of<T>(result: &std::io::Result<T>) -> Outcome {
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> Response {
+    // Price both sandbox shapes against what this executor has measured before
+    // rendering, so the gauge belongs to the same momentary reading as the rest
+    // of the page rather than to whenever `/lane` was last polled.
+    publish_shape_cost(&state);
     // The memory ceiling belongs on the same surface as the worktree counters:
     // it is the other half of "why did this build die", and it applies even
     // where no workdir router was provisioned.
@@ -1407,6 +1449,12 @@ impl BuildLane {
 
     fn cost(&self) -> std::sync::MutexGuard<'_, BuildCost> {
         self.cost.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 一条编译都不跑时这块容器占着的内存。两种沙箱形态的价格都要算上它：
+    /// 一任务一沙箱每个任务付一整份，一副多任务把这一笔摊在任务之间。
+    pub fn idle_working_set(&self) -> Option<u64> {
+        self.cost().baseline_bytes()
     }
 
     /// 编译写 target 的那块卷。第一条编译类命令告诉它一次。
@@ -2275,6 +2323,9 @@ async fn documents_rollback_handler(
 /// [`executor_port_from_env`]: a missing or unusable value falls back to
 /// [`DEFAULT_EXECUTOR_PORT`], the port the executor's Service targets.
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    // 沙箱「起来多快」是它自己的价格，不是某个任务的：从这一行进来到监听这一段
+    // 付一次，之后每个任务都不再重付。记在进程上，形态价格表要用。
+    let booted = Instant::now();
     // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
     // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
     // 靠的正是那边装上的 Loki 镜像。
@@ -2336,8 +2387,11 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         pressure,
     });
 
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(addr = %addr, "sandbox executor listening");
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    // 绑上端口才算「起来了」：在这之前它接不了任务，之后才付得出价格。
+    pressure::record_startup(booted.elapsed().as_millis() as u64);
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

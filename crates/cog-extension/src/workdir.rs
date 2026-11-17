@@ -478,6 +478,21 @@ fn scaled(pass_millis: u64, multiple: u64) -> Duration {
     Duration::from_secs((pass_millis / 1000).saturating_mul(multiple))
 }
 
+/// 一个样本窗口的中位数；窗口空着时是 `None`。
+fn median_of(samples: &std::sync::Mutex<VecDeque<u64>>) -> Option<u64> {
+    let mut values: Vec<u64> = samples
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[values.len() / 2])
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkdirConfig {
     pub workspaces_root: PathBuf,
@@ -1076,6 +1091,18 @@ pub struct WorkdirRouter {
     /// is the cost the pool removes from the request path, and it is what the
     /// rate is multiplied by.
     checkout_millis: std::sync::Mutex<VecDeque<u64>>,
+    /// The last few carries of a lane's tree: how long the pack or unpack took
+    /// and how many bytes travelled. It is the shared shape's extra cost -- a
+    /// tree only moves when its replica goes away -- so it is a reading, not an
+    /// assumption. Same window width as a checkout: both follow how big a tree
+    /// is, which changes over days.
+    carry_millis: std::sync::Mutex<VecDeque<u64>>,
+    carry_bytes: std::sync::Mutex<VecDeque<u64>>,
+    /// The bytes and the count of the trees the last volume walk measured. The
+    /// quotient is what one task occupies on this volume, which is the volume
+    /// half of what a sandbox shape costs a task.
+    last_tree_bytes: AtomicU64,
+    last_tree_count: AtomicU64,
 }
 
 /// Why a tree was removed. The two passes answer different questions -- the
@@ -1138,6 +1165,10 @@ impl WorkdirRouter {
             warm_target: AtomicUsize::new(warm_seed),
             arrivals: std::sync::Mutex::new(VecDeque::new()),
             checkout_millis: std::sync::Mutex::new(VecDeque::new()),
+            carry_millis: std::sync::Mutex::new(VecDeque::new()),
+            carry_bytes: std::sync::Mutex::new(VecDeque::new()),
+            last_tree_bytes: AtomicU64::new(0),
+            last_tree_count: AtomicU64::new(0),
         }))
     }
 
@@ -1169,6 +1200,29 @@ impl WorkdirRouter {
 
     pub fn config(&self) -> &WorkdirConfig {
         &self.cfg
+    }
+
+    /// 切一棵任务树最近花掉的墙钟（中位，秒）。`None` 是一条都没切完：一个零
+    /// 会读成「免费」，而免费的树不存在。
+    pub fn checkout_seconds(&self) -> Option<f64> {
+        self.checkout_secs()
+    }
+
+    /// 一棵任务树占的字节：最近一次卷走查量到的总字节除以树数。走查还没量到
+    /// 两边时是 `None`。
+    pub fn tree_bytes(&self) -> Option<u64> {
+        let bytes = self.last_tree_bytes.load(Ordering::Relaxed);
+        let count = self.last_tree_count.load(Ordering::Relaxed);
+        (bytes > 0 && count > 0).then(|| bytes / count)
+    }
+
+    /// 这副副本自己那半段搬树代价：中位墙钟（秒）与中位字节。搬一次要打包、
+    /// 传输、解包，这里量得到的是它的这一头；一次都没搬过时是 `None`。
+    pub fn carry_reading(&self) -> Option<(f64, u64)> {
+        Some((
+            median_of(&self.carry_millis)? as f64 / 1000.0,
+            median_of(&self.carry_bytes)?,
+        ))
     }
 
     pub fn target_dir(&self) -> &Path {
@@ -1282,6 +1336,7 @@ impl WorkdirRouter {
     /// 一条 lane 上还有命令在跑时不打包：那棵树正在被写，打出来的包说不出它是
     /// 哪一刻的样子。没有树则没什么可搬——那是 [`CarryError::NoTree`]，不是失败。
     pub async fn pack_lane(&self, lane: &str) -> Result<Vec<u8>, CarryError> {
+        let started = std::time::Instant::now();
         validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
         let tree = self.tree_of(lane).await.ok_or_else(|| {
             CarryError::NoTree(format!("lane {lane} has no tree on this replica"))
@@ -1310,6 +1365,7 @@ impl WorkdirRouter {
         });
         let _ = tokio::fs::remove_file(&path).await;
         let bytes = bytes?;
+        self.note_carry(started.elapsed().as_millis() as u64, bytes.len() as u64);
         info!(
             lane,
             bytes = bytes.len(),
@@ -1328,6 +1384,7 @@ impl WorkdirRouter {
         lane: &str,
         bundle: &[u8],
     ) -> Result<usize, CarryError> {
+        let started = std::time::Instant::now();
         validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
         let (tree, _in_use, _origin) = self
             .route(lane)
@@ -1351,6 +1408,7 @@ impl WorkdirRouter {
         let plan = checkpoints::restore(&tree, &key)
             .await
             .map_err(CarryError::Failed)?;
+        self.note_carry(started.elapsed().as_millis() as u64, bundle.len() as u64);
         info!(
             lane,
             files = plan.files.len(),
@@ -1441,6 +1499,23 @@ impl WorkdirRouter {
         }
     }
 
+    /// Record what this replica's half of moving a lane's tree cost: the wall
+    /// and the bytes. A lane only moves when its replica goes away, so this is
+    /// a sample of a rare event; the window is the same width as a checkout's
+    /// because both follow how big a tree is, which changes over days.
+    fn note_carry(&self, millis: u64, bytes: u64) {
+        let mut times = self.carry_millis.lock().unwrap_or_else(|e| e.into_inner());
+        times.push_back(millis);
+        while times.len() > CHECKOUT_SAMPLES {
+            times.pop_front();
+        }
+        let mut sizes = self.carry_bytes.lock().unwrap_or_else(|e| e.into_inner());
+        sizes.push_back(bytes);
+        while sizes.len() > CHECKOUT_SAMPLES {
+            sizes.pop_front();
+        }
+    }
+
     /// How fast lanes arrive: how many got a tree, over the span the samples
     /// cover. `None` until two arrivals are far enough apart in time to define
     /// an interval.
@@ -1453,19 +1528,7 @@ impl WorkdirRouter {
 
     /// The checkout cost in force, as seconds.
     fn checkout_secs(&self) -> Option<f64> {
-        let mut samples: Vec<u64> = self
-            .checkout_millis
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .collect();
-        if samples.is_empty() {
-            return None;
-        }
-        samples.sort_unstable();
-        let median = samples[samples.len() / 2];
-        Some(median as f64 / 1000.0)
+        median_of(&self.checkout_millis).map(|millis| millis as f64 / 1000.0)
     }
 
     /// Recompute the pool's target from this pass's capacity, the arrival rate
@@ -2854,6 +2917,12 @@ impl WorkdirRouter {
             tokio::task::spawn_blocking(move || cog_core::fs_size::dir_size_bytes(&root, &[]).ok())
                 .await
                 .ok()??;
+        // Kept for the shape price: what one task occupies is this walk's bytes
+        // over its tree count, and it is the same figure the cap is computed
+        // from -- one measurement answering both questions.
+        self.last_tree_bytes.store(bytes, Ordering::Relaxed);
+        self.last_tree_count
+            .store(trees.len() as u64, Ordering::Relaxed);
         workspace_cap(disk, bytes, trees.len())
     }
 
@@ -5329,6 +5398,41 @@ pub(crate) mod tests {
             Err(CarryError::Refused(_)) => {}
             other => panic!("越界的名字该当场拒，实际是 {other:?}"),
         }
+    }
+
+    /// 形态价格要的三条读数都从已经存在的事件里借：切树的中位、卷走查的每树字节、
+    /// 搬树的中位。一条都还没发生过时它们是 `None`，不是一个免费的 0；样本换了，
+    /// 读数跟着换。
+    #[tokio::test]
+    async fn the_shape_readings_are_none_until_the_thing_they_price_has_happened() {
+        let a = tempfile::tempdir().unwrap();
+        let bare = seed_bare(a.path());
+        let r = router(a.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        assert_eq!(r.checkout_seconds(), None);
+        assert_eq!(r.tree_bytes(), None);
+        assert_eq!(r.carry_reading(), None);
+
+        r.note_checkout(1_000);
+        r.note_checkout(3_000);
+        r.note_checkout(2_000);
+        assert_eq!(r.checkout_seconds(), Some(2.0));
+
+        // 走查量到字节与树数两样才有一棵树的体积；只量到一边时不成形。
+        r.last_tree_bytes.store(10_000, Ordering::Relaxed);
+        r.last_tree_count.store(4, Ordering::Relaxed);
+        assert_eq!(r.tree_bytes(), Some(2_500));
+        r.last_tree_count.store(0, Ordering::Relaxed);
+        assert_eq!(r.tree_bytes(), None);
+
+        r.note_carry(100, 1_000);
+        r.note_carry(2_000, 9_000);
+        r.note_carry(300, 4_000);
+        assert_eq!(r.carry_reading(), Some((0.3, 4_000)));
+        // 窗口里换成更大的样本，读数跟着变大：它是量出来的，不是钉住的。
+        for _ in 0..3 {
+            r.note_carry(5_000, 20_000);
+        }
+        assert_eq!(r.carry_reading(), Some((5.0, 20_000)));
     }
 
     #[test]
