@@ -154,13 +154,6 @@ data:
                 "why": "声明不是判据：agent 提交一件活时没写声明才用这个数，它只落在任务行上喂 `outcome_deadline` 那种「按经验该有结局了」的读数；执行侧不按它收任何还在跑的活（回收只看租约与实测步间隔）。"
               },
               {
-                "id": "agent-ask-timeout",
-                "file": "crates/cog-agent/src/tools.rs",
-                "symbol": "ASK_MAX_TIMEOUT_MS",
-                "value": "600s",
-                "why": "声明不是判据，而且是**提问方自己**的耐心：一次「问另一个 agent」最多让提问方这一回合等多久，超了只把结果记成 timeout 并回给模型——被问的那条运行不受影响，它照常跑。等不去杀别人，也不被别人的钟杀。"
-              },
-              {
                 "id": "agent-think-stall-window",
                 "file": "crates/cog-agent/src/config.rs",
                 "symbol": "think_stall_timeout_secs",

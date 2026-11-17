@@ -92,6 +92,13 @@ const WRITE_POINTS: &[(&str, &str, &str)] = &[
         "stated_directions",
         "declared",
     ),
+    // 工具表服务哪个窗口：部署配置里写着的那一个（`agent_loop.context_window_size`）。
+    // 同一份部署里每位员工拿到的是同一个数，与名字无关——它随部署变，不随人变。
+    (
+        "crates/cog-agent/src/tools.rs",
+        "context_window_size",
+        "override",
+    ),
 ];
 
 /// 一行里作为一个词出现的 `word`（前后不是标识符字符）。
