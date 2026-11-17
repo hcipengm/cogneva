@@ -24,7 +24,7 @@ mod task_ledger;
 
 pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
 pub use change_candidates::MemoryCandidateStore;
-pub use literals::{literal_values, literals_in, Literal};
+pub use literals::{literal_values, literals_in, standalone_numbers, Literal};
 pub use message::MemoryMessageBackend;
 pub use metrics::MemoryMetricsBackend;
 pub use orchestrator::TaskGraphStub;

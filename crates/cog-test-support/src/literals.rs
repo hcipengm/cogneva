@@ -80,6 +80,36 @@ pub fn literal_values(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// 描述文本里**独立出现**的数字。
+///
+/// 粘在词上的不算：`UTF-8`、`base64`、`v1.2` 里的数字是名字的一部分，把它们当成界
+/// 的副本会让判据按拼写判、而不是按意思判。两个地方（工具描述与网页抓取描述）都要
+/// 问同一个问题——「这句话里有没有把界再说一遍」——所以读法只有这一份。
+pub fn standalone_numbers(text: &str) -> Vec<u64> {
+    let bytes = text.as_bytes();
+    let glued = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/' | b'.');
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let before = if start == 0 { b' ' } else { bytes[start - 1] };
+        let after = if i == bytes.len() { b' ' } else { bytes[i] };
+        if !glued(before) && !glued(after) {
+            if let Ok(value) = text[start..i].parse() {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

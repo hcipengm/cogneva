@@ -579,33 +579,13 @@ fn carried_over(rows: Vec<(String, Vec<Row>)>, sites: &[Site]) -> usize {
     for (rel, lines) in rows {
         for (number, raw, _) in lines {
             if points.contains(&(rel.clone(), number)) {
-                total += literal_bytes(&raw);
+                // 一行里每个完整字面量占多少字节：起止由共享读法给出，这里只做减法。
+                // 自己再写一遍词法扫描，就等于让「哪些字节算提示词」有两个答案。
+                total += cog_test_support::literals_in(&raw)
+                    .iter()
+                    .map(|literal| literal.end - literal.start)
+                    .sum::<usize>();
             }
-        }
-    }
-    total
-}
-
-/// 一行里引号之间的字节数。量的是读的人看到的那份文本，不是源码形状：
-/// 转义与引号本身不算，标点与空格算。
-fn literal_bytes(line: &str) -> usize {
-    let mut total = 0;
-    let mut inside = false;
-    let mut escaped = false;
-    for ch in line.chars() {
-        if inside {
-            if escaped {
-                escaped = false;
-                total += ch.len_utf8();
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                inside = false;
-            } else {
-                total += ch.len_utf8();
-            }
-        } else if ch == '"' {
-            inside = true;
         }
     }
     total

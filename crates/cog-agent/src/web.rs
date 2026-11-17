@@ -1355,6 +1355,7 @@ pub fn web_fetch_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_test_support::standalone_numbers;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1479,32 +1480,6 @@ mod tests {
                 .contains(&MAX_FETCH_CHARS.to_string()),
             "the fetch cap is no longer published by the field that enforces it"
         );
-    }
-
-    /// 描述里独立出现的数字；粘在词上的不算。
-    fn standalone_numbers(text: &str) -> Vec<u64> {
-        let bytes = text.as_bytes();
-        let glued = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/' | b'.');
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if !bytes[i].is_ascii_digit() {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            let before = if start == 0 { b' ' } else { bytes[start - 1] };
-            let after = if i == bytes.len() { b' ' } else { bytes[i] };
-            if !glued(before) && !glued(after) {
-                if let Ok(value) = text[start..i].parse() {
-                    out.push(value);
-                }
-            }
-        }
-        out
     }
 
     #[tokio::test]

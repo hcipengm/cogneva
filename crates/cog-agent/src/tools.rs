@@ -1015,6 +1015,7 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use cog_test_support::standalone_numbers;
 
     #[derive(Debug)]
     struct StubHttp;
@@ -1784,33 +1785,6 @@ mod tests {
             serde_json::json!(READ_FILE_MAX_BATCH),
             "the schema stopped carrying the batch limit, so nothing states it before the call"
         );
-    }
-
-    /// 描述里独立出现的数字。粘在词上的不算：`UTF-8`、`base64`、`v1.2` 里的数字
-    /// 是名字的一部分，把它们当成界的副本就会让这条门按拼写判、而不是按意思判。
-    fn standalone_numbers(text: &str) -> Vec<u64> {
-        let bytes = text.as_bytes();
-        let glued = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/' | b'.');
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if !bytes[i].is_ascii_digit() {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            let before = if start == 0 { b' ' } else { bytes[start - 1] };
-            let after = if i == bytes.len() { b' ' } else { bytes[i] };
-            if !glued(before) && !glued(after) {
-                if let Ok(value) = text[start..i].parse() {
-                    out.push(value);
-                }
-            }
-        }
-        out
     }
 
     /// 工具面发给模型的字节数。这是模型每一回合都要付的固定成本，所以它只降不升：
