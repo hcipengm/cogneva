@@ -180,32 +180,6 @@ fn sandbox_task_id(scope: Option<&ToolScope>) -> String {
     }
 }
 
-/// `read_file` 在调用方没说要看多少行时给出的一页。
-///
-/// 一页按行数计，不按字节：行数读起来能对上编辑器，也能直接当 `offset`
-/// 用。取值让常见源码文件一次读完，而整文件倾倒型的读（几千行、几十万
-/// 字符）自动变成可分页的几段。
-// cap: bound — 让常见源码文件一次读完，而整文件倾倒型（几千行、几十万字符）自动变成可分页的几段
-const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
-
-/// 一页最多带多少个字符，行数没到也停下来。
-///
-/// 行数不是字节：一份压缩过的 JSON、一张宽表、一行几十万字符的日志，600 行
-/// 可以轻松超过一次对话里任何一段的体量。这一页之后每一轮都要重发，所以
-/// 两道界取更紧的那道；被这道界停下来的页面照样带 `has_more` 与
-/// `next_offset`，翻页不会漏行。
-// cap: bound — 两道界取更紧的那道；被它停下的页面照样带 has_more 与 next_offset，翻页不漏行
-const READ_FILE_PAGE_MAX_CHARS: usize = 32 * 1024;
-
-/// `read_file` 一次批量读最多带几个文件。
-///
-/// 批量读省的是往返次数，不是正文：读进来的字节与逐个读一样多。但一次带回
-/// 几十个文件就是把这几十页一起钉进上下文，之后每一轮都要重发，省下的往返
-/// 又按轮数赔回去。八份是一屏常见的「这一次改动要碰的文件」，再多的调用方
-/// 应当先缩小范围再读。
-// cap: bound — 一次带回几十份会把它们一起钉进上下文，之后每轮重发，省下的往返按轮数赔回去
-const READ_FILE_MAX_BATCH: usize = 8;
-
 /// `read_file` 调用方给的是哪几个文件。
 ///
 /// `paths` 与 `path` 都认：前者一次读多份，后者是原有的一次一份。两个一起给
@@ -227,13 +201,6 @@ fn batch_paths(arguments: &serde_json::Value) -> Result<Option<Vec<String>>, cog
     if list.is_empty() {
         return Err(cog_core::SFError::Validation("paths is empty".into()));
     }
-    if list.len() > READ_FILE_MAX_BATCH {
-        return Err(cog_core::SFError::Validation(format!(
-            "paths has {} entries; at most {} files per call, read the rest in another call",
-            list.len(),
-            READ_FILE_MAX_BATCH
-        )));
-    }
     list.iter()
         .map(|p| {
             p.as_str().map(str::to_string).ok_or_else(|| {
@@ -251,7 +218,18 @@ fn batch_paths(arguments: &serde_json::Value) -> Result<Option<Vec<String>>, cog
 /// 只想要一段（某个函数、报错所在的那几行）。`offset` 与 `limit` 都不给时
 /// 原样返回整份，老调用方与老断言不受影响；给了就带上文件的总行数与「后面
 /// 还有没有」，只回切片不回总行数，读的人会以为文件到那里就结束了。
-fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_json::Value {
+///
+/// `page_chars` 是一页的字符预算。它不在这里取值：一页多大由读的人所在的
+/// 上下文窗口导出（[`ToolRegistry::page_chars`]），与窗口进入同一条
+/// [`cog_core` 的裁剪路径](crate::context::tool_result_budget_chars) 的是
+/// 同一个数。工具这边另有一个「一页多少行」的常量时，同一件事就有两份来源，
+/// 改窗口不会让页跟着变。
+fn read_window(
+    text: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    page_chars: usize,
+) -> serde_json::Value {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     // 调用方没说要看多少行，而这份文件又比一页长：给一页。
@@ -259,12 +237,8 @@ fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_jso
     // 缓存命中率的分母就是每一轮新追加的字节，一次整文件读能把接下来
     // 整段对话的命中去掉一大块。`has_more` 与 `next_offset` 让读的人
     // 知道后面还有、从哪继续，而不是把「到这儿就结束了」当成结论。
-    let limit = limit.or_else(|| {
-        let too_long = total > READ_FILE_DEFAULT_WINDOW_LINES
-            || text.chars().count() > READ_FILE_PAGE_MAX_CHARS;
-        too_long.then_some(READ_FILE_DEFAULT_WINDOW_LINES as u64)
-    });
-    if offset.is_none() && limit.is_none() {
+    let too_long = text.chars().count() > page_chars;
+    if offset.is_none() && limit.is_none() && !too_long {
         return serde_json::json!({ "content": text });
     }
     let start = offset.unwrap_or(1).max(1) as usize;
@@ -275,13 +249,13 @@ fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_jso
             .min(total),
         None => total,
     };
-    // 行数与字符两道界取更紧的那道。至少给一行：一行就超预算时如果不给，
+    // 只有一道界：字符预算。至少给一行——一行就超预算时如果不给，
     // `next_offset` 永远停在同一个位置，翻页就成了死循环。
     let mut end = start.saturating_sub(1).min(total);
     let mut chars = 0usize;
     while end < wanted {
-        let line = lines[end].len();
-        if end > start.saturating_sub(1) && chars + line + 1 > READ_FILE_PAGE_MAX_CHARS {
+        let line = lines[end].chars().count();
+        if end > start.saturating_sub(1) && chars + line + 1 > page_chars {
             break;
         }
         chars += line + 1;
@@ -355,6 +329,15 @@ pub struct ToolRegistry {
     /// this on so no command can reach the executor under a synthetic identity;
     /// default off keeps embedded/main-app behavior.
     require_identity: bool,
+    /// 这张表服务的对话窗口有多大，`read_file` 一页的字符预算从这里导出。
+    ///
+    /// 页大小不是工具自己拍的数：它走
+    /// [`crate::context::tool_result_budget_chars`]，与运行时把一条工具结果
+    /// 裁进上下文用的是同一个函数。工具这边另存一个页大小，窗口调大时页不跟
+    /// 着变，同一件事就在树里有了两份答案。这里放的是部署配置的那个窗口
+    /// （`agent_loop.context_window_size`）；某一轮自己配了更窄的窗口，最终
+    /// 仍由运行时的逐轮裁剪兜住。
+    context_window_size: usize,
     /// 每个工具在本进程里被点过几次。
     ///
     /// `fork()` 共用同一个 `Arc`，不各拿一份：这个数答的是
@@ -372,8 +355,23 @@ impl ToolRegistry {
             guardrail: None,
             plugin_registry: None,
             require_identity: false,
+            context_window_size: crate::AgentLoopConfig::default().context_window_size,
             calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// 说明这张表服务的对话窗口，一页工具结果的预算由它导出。
+    ///
+    /// 不设时取 `agent_loop` 配置节的缺省窗口：嵌入运行与测试没有一份进程级
+    /// 配置可读，缺省窗口正是它们实际在用的那个。
+    pub fn with_context_window_size(mut self, tokens: usize) -> Self {
+        self.context_window_size = tokens;
+        self
+    }
+
+    /// 一条工具结果能占多少字符，与运行时裁剪用的是同一个函数。
+    fn page_chars(&self) -> usize {
+        crate::context::tool_result_budget_chars(self.context_window_size)
     }
 
     pub fn with_require_identity(mut self, require: bool) -> Self {
@@ -432,6 +430,7 @@ impl ToolRegistry {
             guardrail: self.guardrail.clone(),
             plugin_registry: self.plugin_registry.clone(),
             require_identity: self.require_identity,
+            context_window_size: self.context_window_size,
             calls: self.calls.clone(),
         }
     }
@@ -668,8 +667,27 @@ impl ToolRegistry {
                             .map(|s| s.agent_id.clone())
                             .or_else(caller_agent_id)
                             .unwrap_or_else(|| format!("unscoped-tool-{}", name));
+                        // 整批共用一页的预算，不是每份文件各一页。进上下文的是
+                        // 一条 tool_result，之后每一轮重发的也只有这一条：每份
+                        // 文件各给一整页，十几份就把这一条推到几十万字符，运行时
+                        // 只好按预算截断它，而截断的是 JSON 字符串的中间。预算
+                        // 花完之后还没读的文件不猜、也不硬塞，在它自己那一项里
+                        // 说清没读，调用方单独再要一次。
+                        let page_chars = self.page_chars();
+                        let mut spent = 0usize;
                         let mut files = Vec::with_capacity(paths.len());
                         for path in &paths {
+                            // 预算已经花完：不再读这一份。读回来也装不下，只会
+                            // 让执行器白跑一趟。
+                            if spent >= page_chars {
+                                files.push(serde_json::json!({
+                                    "path": path,
+                                    "error": "not read: this batch already used the turn's \
+                                              tool-result budget; ask for this file in its \
+                                              own call",
+                                }));
+                                continue;
+                            }
                             let req = SandboxRequest {
                                 task_id: task_id.clone(),
                                 agent_id: agent_id.clone(),
@@ -701,7 +719,12 @@ impl ToolRegistry {
                                 }
                             }
                             if code == 0 {
-                                let window = read_window(&stdout, offset, limit);
+                                let window =
+                                    read_window(&stdout, offset, limit, page_chars - spent);
+                                spent += window["content"]
+                                    .as_str()
+                                    .map(|content| content.chars().count())
+                                    .unwrap_or(0);
                                 let mut entry = serde_json::Map::new();
                                 entry.insert("path".into(), serde_json::json!(path));
                                 if let Some(fields) = window.as_object() {
@@ -907,7 +930,12 @@ impl ToolRegistry {
                     }
                     cog_core::ShellOp::ReadFile => {
                         if code == 0 {
-                            Ok(read_window(&stdout, read_offset, read_limit))
+                            Ok(read_window(
+                                &stdout,
+                                read_offset,
+                                read_limit,
+                                self.page_chars(),
+                            ))
                         } else {
                             Err(cog_core::SFError::IO(stderr).into())
                         }
@@ -994,7 +1022,6 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use cog_test_support::standalone_numbers;
 
     #[derive(Debug)]
     struct StubHttp;
@@ -1716,11 +1743,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 批量的两道界都报错而不是猜：`path` 与 `paths` 同时给是没说清要读什么，
-    /// 超过八份则是一次把太多页钉进上下文，之后每轮都要重发。猜一个都能省
-    /// 一轮往返，但猜错了那一轮要付整份上下文的重发钱。
+    /// 整批共用一页的预算：进上下文的是一条 tool_result，之后每轮重发的也是
+    /// 这一条。每份文件各给一整页，十几份就是几十万字符挤在一条结果里，运行
+    /// 时只好按预算把它截断——截的是 JSON 字符串的中间。预算花完后还没读的
+    /// 文件不硬塞，在自己那一项里说清没读，调用方单独再要一次。
     #[tokio::test]
-    async fn read_file_refuses_an_ambiguous_or_oversized_batch() {
+    async fn a_batch_spends_only_one_page_of_the_budget() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-batch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+        cog_core::ToolRegistry::register(&registry, builtins::write_file());
+        let page_chars = registry.page_chars();
+        // 每份约 40KB，一行 200 字符：三份加起来远超一页。
+        let body: String = (0..200)
+            .map(|i| format!("{} {i}\n", "y".repeat(190)))
+            .collect();
+        let paths: Vec<String> = (0..3)
+            .map(|i| {
+                let path = dir.join(format!("f{i}.txt"));
+                std::fs::write(&path, &body).unwrap();
+                path.to_str().unwrap().to_string()
+            })
+            .collect();
+
+        let out = registry
+            .execute("read_file", serde_json::json!({ "paths": paths }))
+            .await
+            .unwrap();
+        let files = out["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 3, "每一份都要有一项: {out}");
+        assert!(files[0]["content"].is_string(), "第一份必须读出来: {out}");
+        let used: usize = files
+            .iter()
+            .filter_map(|file| file["content"].as_str())
+            .map(|content| content.chars().count())
+            .sum();
+        assert!(
+            used <= page_chars + 256,
+            "整批正文 {used} 字符超过了一页 {page_chars}：多出来的部分会被运行时截在 JSON 中间"
+        );
+        assert!(
+            files[2]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("not read")),
+            "预算花完后剩下的文件必须说清没读，不能悄悄给半页: {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `path` 与 `paths` 同时给是没说清要读什么：猜一个能省一轮往返，但猜错
+    /// 那一轮要付整份上下文的重发钱。这里没有条数上限——条数不花上下文，花
+    /// 上下文的是正文，而正文由整批共用的那一页预算管。
+    #[tokio::test]
+    async fn read_file_refuses_an_ambiguous_batch() {
         let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
 
@@ -1733,37 +1810,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(both.contains("not both"), "unexpected message: {both}");
-
-        let too_many: Vec<String> = (0..READ_FILE_MAX_BATCH + 1)
-            .map(|i| format!("f{i}.txt"))
-            .collect();
-        let over = registry
-            .execute("read_file", serde_json::json!({ "paths": too_many }))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            over.contains(&READ_FILE_MAX_BATCH.to_string()) && over.contains("at most"),
-            "unexpected message: {over}"
-        );
-    }
-
-    /// 上限只声明一次：schema 的 `maxItems` 带着那个数，拒绝时的判词也带着那个数，
-    /// 描述里再抄一份字面量，改常量那一天它就成了假话，而不会有任何东西变红。
-    #[test]
-    fn a_batch_limit_is_stated_where_it_is_enforced_not_in_the_prose() {
-        let tool = builtins::read_file();
-        let described = tool.description.to_lowercase();
-        assert!(
-            !described.contains("at most") && !described.contains(&READ_FILE_MAX_BATCH.to_string()),
-            "the description restates the batch limit the schema and the refusal already carry: {}",
-            tool.description
-        );
-        assert_eq!(
-            tool.parameters["properties"]["paths"]["maxItems"],
-            serde_json::json!(READ_FILE_MAX_BATCH),
-            "the schema stopped carrying the batch limit, so nothing states it before the call"
-        );
     }
 
     /// 工具面发给模型的字节数。这是模型每一回合都要付的固定成本，所以它只降不升：
@@ -1788,11 +1834,11 @@ mod tests {
             },
         );
         let measured = tool_payload_bytes(&registry.list());
-        // cap: derived — 由树上的工具面现算（2026-11-17 实测 13729）；删除时跟着降，
+        // cap: derived — 由树上的工具面现算（2026-11-17 实测 13716）；删除时跟着降，
         // 往上抬要在提交信息里说明新增的是哪一段、凭什么非有不可。13767 → 13729
         // 是删掉了搜索、抓取、raw_fetch、await_task 在本地的默认值和上限（四句话里
-        // 各有一个数）。
-        const BUDGET: usize = 13_729;
+        // 各有一个数）；13729 → 13716 是批量读的条数上限随 `maxItems` 一起消失。
+        const BUDGET: usize = 13_716;
         assert!(
             measured <= BUDGET,
             "the model now pays {measured} bytes per turn for tool signatures; the budget \
@@ -1832,50 +1878,6 @@ mod tests {
                 tool.name.len() + tool.description.len() + tool.parameters.to_string().len()
             })
             .sum()
-    }
-
-    /// 同一个界不许有两份数字：一份在这一回合真正生效的地方（schema 字段、拒绝判词），
-    /// 一份抄在描述里。抄的那份在改常量那天就成了假话，而不会有任何东西变红——除了这条。
-    ///
-    /// 判据按数字的独立出现判，不按裸子串：`600` 是 `600000` 的一部分，前者命中
-    /// 后者也要命中，但 `8` 不该在 `28` 里被算成一次命中。
-    #[test]
-    fn no_tool_description_restates_a_bound_that_is_enforced_somewhere_else() {
-        let registry = ToolRegistry::new();
-        builtins::register_builtins(
-            &registry,
-            builtins::BuiltinInputs {
-                http_client: None,
-                metrics: None,
-                memory_api_base: None,
-                external_archive_threshold_chars: 4096,
-                message_backend: None,
-                agent_registry: None,
-                web_search_base: None,
-                web_search_fallback_base: None,
-                web_fetch_base: None,
-                sandbox_backend: None,
-            },
-        );
-        let bounds = [
-            ("READ_FILE_MAX_BATCH", READ_FILE_MAX_BATCH as u64),
-            (
-                "READ_FILE_DEFAULT_WINDOW_LINES",
-                READ_FILE_DEFAULT_WINDOW_LINES as u64,
-            ),
-        ];
-        for tool in registry.list() {
-            let numbers = standalone_numbers(&tool.description);
-            for (name, value) in bounds {
-                assert!(
-                    !numbers.contains(&value),
-                    "{} copies {name} ({value}) into its description; the field that \
-                     enforces it already publishes the number: {}",
-                    tool.name,
-                    tool.description
-                );
-            }
-        }
     }
 
     /// 带行范围读时只回那一段，但必须同时说清文件有多长、后面还有没有：
@@ -1943,9 +1945,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("long.txt");
         let path = path.to_str().unwrap();
-        let body: String = (1..=2000).map(|i| format!("line {i}\n")).collect();
-
         let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        // 一页多大由这张表服务的窗口导出，测试不另抄一个数。
+        let page_chars = registry.page_chars();
+        let body: String = (1..=8000).map(|i| format!("line {i}\n")).collect();
+        assert!(
+            body.chars().count() > page_chars,
+            "这份文件必须比一页长，否则读不出分页：{} 字符对一页 {page_chars}",
+            body.chars().count()
+        );
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         registry
@@ -1960,12 +1968,12 @@ mod tests {
             .execute("read_file", serde_json::json!({"path": path}))
             .await
             .unwrap();
-        assert_eq!(first["total_lines"], 2000);
+        assert_eq!(first["total_lines"], 8000);
         assert_eq!(first["start_line"], 1);
         assert_eq!(first["has_more"], true);
-        assert_eq!(
-            first["content"].as_str().unwrap().lines().count(),
-            READ_FILE_DEFAULT_WINDOW_LINES
+        assert!(
+            first["content"].as_str().unwrap().chars().count() <= page_chars,
+            "一页超过了窗口导出的预算 {page_chars}: {first}"
         );
         assert!(
             first["content"]
@@ -1995,18 +2003,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 行数没到也不是无限给：超长行照样要分页。
+    /// 一页多大只有窗口一个来源：换窗口，页跟着变。
     ///
-    /// 一页是给上下文的一笔预算，行数只是它的一半口径。压缩过的 JSON、一行
-    /// 几十万字符的日志，600 行能有几兆——那样一页和整份读没有区别，翻页
-    /// 也就白加了。
+    /// 同一份文件，宽窗口一次读完，窄窗口要分页。页大小若还是工具里写死的
+    /// 一个数，这条会在窄窗口那一半红——而树里那两份答案正是这么来的。
+    #[tokio::test]
+    async fn the_page_size_follows_the_window_the_registry_serves() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-derive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("medium.txt");
+        let path = path.to_str().unwrap();
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+
+        for (window, paged) in [(32_000usize, false), (50, true)] {
+            let registry = ToolRegistry::new()
+                .with_context_window_size(window)
+                .with_sandbox_backend(Arc::new(LocalShellBackend));
+            cog_core::ToolRegistry::register(&registry, builtins::read_file());
+            cog_core::ToolRegistry::register(&registry, builtins::write_file());
+            registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": path, "content": body }),
+                )
+                .await
+                .unwrap();
+
+            let got = registry
+                .execute("read_file", serde_json::json!({ "path": path }))
+                .await
+                .unwrap();
+            if paged {
+                assert_eq!(
+                    got["has_more"],
+                    true,
+                    "窗口 {window} token 只要 {} 字符一页，这份文件必须分页: {got}",
+                    registry.page_chars()
+                );
+                assert!(
+                    got["content"].as_str().unwrap().chars().count() <= registry.page_chars(),
+                    "一页超过了窗口 {window} 导出的预算: {got}"
+                );
+            } else {
+                assert_eq!(got["content"], body.as_str(), "宽窗口里这份文件一页装得下");
+                assert!(got.get("total_lines").is_none(), "装得下就不该切: {got}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一页的界是字符，不是行数：超长行照样要分页。
+    ///
+    /// 一页是给上下文的一笔预算，只按字符算。压缩过的 JSON、一行几十万字符
+    /// 的日志，行数再少也能有几兆——那样一页和整份读没有区别，翻页也就白加了。
     #[tokio::test]
     async fn a_page_stops_on_characters_even_when_the_line_count_is_small() {
         let dir = std::env::temp_dir().join(format!("cog-tools-chars-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide.txt");
         let path = path.to_str().unwrap();
-        // 8 行、每行 10000 字符：行数远没到 600，字节数是 80000。
+        // 8 行、每行 10000 字符：行数很少，字符数是 80000。
         let body: String = (1..=8)
             .map(|i| format!("{}{i}\n", "x".repeat(9999)))
             .collect();
@@ -2055,21 +2112,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide.txt");
         let path = path.to_str().unwrap();
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        let page_chars = registry.page_chars();
         // 六行，每行都比一页的字符预算还长：一页装不下一行，翻页只能靠「至少给
         // 一行」这条兜底往前走——走不动是死循环，走快了是漏行。
         const LINES: usize = 6;
         let body: String = (1..=LINES)
-            .map(|i| {
-                format!(
-                    "line {i} {} {i}\n",
-                    "x".repeat(READ_FILE_PAGE_MAX_CHARS + 1024)
-                )
-            })
+            .map(|i| format!("line {i} {} {i}\n", "x".repeat(page_chars + 1024)))
             .collect();
         let expected: Vec<String> = body.lines().map(str::to_string).collect();
         assert_eq!(expected.len(), LINES);
 
-        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         registry
@@ -3069,7 +3122,6 @@ pub mod builtins {
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "maxItems": READ_FILE_MAX_BATCH,
                         "description": "Several file paths to read in this one call; the result is an array of entries in the same order, each with path and either content or error"
                     },
                     "offset": {
@@ -4082,10 +4134,7 @@ pub mod builtins {
                         .get("timeout_ms")
                         .and_then(serde_json::Value::as_u64)
                         .filter(|ms| *ms > 0);
-                    let mut url = format!(
-                        "{base}/api/v1/tasks/{}",
-                        encode_url_component(task_id)
-                    );
+                    let mut url = format!("{base}/api/v1/tasks/{}", encode_url_component(task_id));
                     if let Some(wait_ms) = wait_ms {
                         url.push_str(&format!("?wait_ms={wait_ms}"));
                     }

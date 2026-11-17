@@ -475,12 +475,21 @@ impl cog_core::SystemPlugin for AgentPlugin {
         self.lifecycle_client = lifecycle_client;
 
         // ── ToolRegistry ──
+        // `agent_loop` is a cog-agent-owned config section, read once here for
+        // the memory API base the archiving tools borrow, for the fetched-body
+        // threshold, for the evaluator's budgets below, and for the window the
+        // registry derives one page of a tool result from; changing a value
+        // needs no new image.
+        let agent_loop_config = crate::AgentLoopConfig::load()?;
         let tool_registry = Arc::new(
             crate::ToolRegistry::new()
                 .with_sandbox_backend(sandbox_backend.clone())
                 .with_guardrail(guardrail)
                 .with_plugin_registry(plugin_registry)
-                .with_require_identity(require_tool_identity),
+                .with_require_identity(require_tool_identity)
+                // 一页工具结果的大小由这张表服务的窗口导出，与运行时裁进
+                // 上下文的是同一个函数（`context::tool_result_budget_chars`）。
+                .with_context_window_size(agent_loop_config.context_window_size),
         );
         // Built-in execution tools. Without these the registry advertises zero
         // tool definitions and squads can plan but never act on the
@@ -490,11 +499,6 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // than laid out here, because this process is not the only caller: the
         // MCP server serves the same built-ins to an external client, and a
         // second list here would be a second answer to which tools exist.
-        // `agent_loop` is a cog-agent-owned config section, read once here for
-        // the memory API base the archiving tools borrow, for the fetched-body
-        // threshold, and for the evaluator's budgets below; changing a value
-        // needs no new image.
-        let agent_loop_config = crate::AgentLoopConfig::load()?;
         let memory_api_base = agent_loop_config.memory_api_base.clone();
         // Memory tools read through the platform memory API over HTTP rather
         // than an in-process backend: the process that runs the loops holds no

@@ -32,12 +32,16 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let system = &config.system;
 
     let backend = cog_extension::executor_backend(system.sandbox_executor_url.clone())?;
+    let agent_loop = cog_agent::AgentLoopConfig::load()?;
     let registry = cog_agent::ToolRegistry::new()
         .with_sandbox_backend(backend.clone())
         .with_guardrail(cog_guardrail::build_default_guardrail(Arc::new(
             cog_guardrail::InMemoryAuditRecorder::new(),
         )))
-        .with_require_identity(system.require_tool_identity);
+        .with_require_identity(system.require_tool_identity)
+        // 一页工具结果的大小由同一个窗口导出：MCP 客户端读文件拿到的页，与
+        // 主进程里的员工拿到的是同一个函数算出来的。
+        .with_context_window_size(agent_loop.context_window_size);
 
     // 内建工具**整批**取自与主应用同一个构造函数（`register_builtins`），不在这里
     // 另列一份。列一份更短的表曾经就写在下面这一行：它看起来完成度更高（少三个
@@ -58,7 +62,6 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let agent_loop = cog_agent::AgentLoopConfig::load()?;
     cog_agent::tools::builtins::register_builtins(
         &registry,
         cog_agent::tools::builtins::BuiltinInputs {
