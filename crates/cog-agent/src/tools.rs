@@ -1759,7 +1759,7 @@ mod tests {
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         let page_chars = registry.page_chars();
-        // 每份约 40KB，一行 200 字符：三份加起来远超一页。
+        // 例如一份 40KB 的样本、一行约 200 字符：这样三份加起来远超一页。
         let body: String = (0..200)
             .map(|i| format!("{} {i}\n", "y".repeat(190)))
             .collect();

@@ -60,6 +60,14 @@ const LABELS: &[&str] = &["role", "role_type", "skill_id", "actor", "label"];
 /// （`declared`）、接手人的实测交卷（`measured`）、操作者的显式覆盖（`override`）。
 const WRITE_POINTS: &[(&str, &str, &str)] = &[
     // 任务上的声明，管理器建 agent 时抄进运行时。
+    // 工具表拿到的窗口来自部署配置（`agent_loop.context_window_size`）：这是操作者的
+    // 显式选择，不是哪件活声明的、也不是谁实测出来的。某一轮配了更窄的窗口不在这里
+    // 写——那是运行时把结果裁进上下文，同一个窗口只由这一处决定。
+    (
+        "crates/cog-agent/src/tools.rs",
+        "context_window_size",
+        "override",
+    ),
     (
         "crates/cog-agent/src/runtime/manager.rs",
         "deliverable",
