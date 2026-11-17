@@ -291,6 +291,20 @@ pub(crate) fn spawn_command(
         .map_err(|e| cog_core::SFError::IO(format!("spawn sh: {}", e)))?;
     // The group id is the leader's pid once the child has run `process_group(0)`.
     let group = child.id();
+    // A cgroup of this command's own, so the peak read when it finishes is
+    // this command's rather than the container's lifetime maximum. No cage is
+    // not a failure of the command: it is counted as an unavailable reading,
+    // and the command runs exactly the same either way.
+    let cage = match group {
+        Some(pid) => match super::cgroup::CommandCage::for_pid(pid) {
+            Ok(cage) => Some(cage),
+            Err(e) => {
+                tracing::debug!(pid, error = %e, "no cage for this command");
+                None
+            }
+        },
+        None => None,
+    };
 
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
@@ -430,6 +444,14 @@ pub(crate) fn spawn_command(
                 -1
             }
         };
+        // Read after the child is gone: the peak is a high-water mark for the
+        // cage's lifetime, and taking the cage down before this would discard
+        // the only reading it will ever have.
+        let reading = match cage {
+            Some(cage) => cage.finish(),
+            None => super::cgroup::CageReading::Unavailable,
+        };
+        super::cgroup::record_cage(reading);
         let _ = tx.send(CommandEvent::Exit { code }).await;
     });
 

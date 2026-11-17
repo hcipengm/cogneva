@@ -22,6 +22,11 @@ use tracing::warn;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
+/// The kernel file holding the high-water mark. Both the container reading and
+/// one command's own cage read it, and a second spelling would go on reading a
+/// path that no longer exists the day one of the two was renamed.
+const MEMORY_PEAK: &str = "memory.peak";
+
 /// What the container's cgroup reports about itself. Every field is
 /// independent because every file is: a kernel that does not expose one leaves
 /// it `None`, and an unmeasured quantity has to stay unmeasured rather than
@@ -86,7 +91,7 @@ pub fn read_at(root: &Path) -> CgroupFacts {
     let cpu = read_cpu_stat(root);
     CgroupFacts {
         limit_bytes: read_limit(root),
-        peak_bytes: read_u64(root.join("memory.peak")),
+        peak_bytes: read_u64(root.join(MEMORY_PEAK)),
         current_bytes: read_u64(root.join("memory.current")),
         inactive_file_bytes: read_memory_stat(root, "inactive_file"),
         oom_kills: read_oom_kills(root),
@@ -151,12 +156,149 @@ fn read_u64(path: std::path::PathBuf) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// One command's own cgroup, so the high-water mark it reports is that
+/// command's and not the container's lifetime maximum.
+///
+/// The container-wide `memory.peak` never comes back down, so after the first
+/// large build it answers "what has this container ever needed" and nothing
+/// about the command in front of you -- a constant, except that a restart
+/// measures it again. A child cgroup is made per command, the command is moved
+/// into it, and `memory.peak` there is read once the command is gone.
+///
+/// A child that was made is not the same as accounting inside it: the memory
+/// controller only reaches a cgroup whose parent delegates it, and where it
+/// does not, the directory exists and holds no `memory.peak`. A container
+/// cgroup that still holds the processes of its own subtree is the usual place
+/// this happens -- a cgroup with processes in it cannot hand controllers down
+/// to its children -- so on a plain container the expected reading is a cage
+/// that exists and accounts nothing. That case is counted apart from the one
+/// where no cage could be made at all, because the two are fixed by different
+/// things (delegating `memory` to this process versus write access to the
+/// tree), and a blank histogram cannot tell them apart.
+pub struct CommandCage {
+    dir: std::path::PathBuf,
+}
+
+/// What one command's cage could say about it. The three are separate because
+/// a peak of zero, no accounting and no cage at all are three different
+/// situations, and a reader that cannot tell them apart will size something
+/// against a number nobody measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CageReading {
+    /// The cage existed and reported the peak the kernel charged to it.
+    Peak(u64),
+    /// The cage existed but the memory controller does not reach it, so there
+    /// is no peak to report.
+    Unaccounted,
+    /// No cage could be made here; the cgroup tree is not writable.
+    Unavailable,
+}
+
+impl CommandCage {
+    /// Make a cage under `root` and put `pid` in it.
+    ///
+    /// `root` is a parameter so a test can cage against a plain directory and
+    /// check what gets written, the same way `read_at` is read against one.
+    ///
+    /// The pid is attached after the spawn, which leaves a window: anything
+    /// the command forks before the attach is charged to the parent cgroup
+    /// instead. Closing that window would mean joining the cgroup from inside
+    /// the child before `exec`, and that costs an allocation in a place where
+    /// the language only allows async-signal-safe calls. The window can make a
+    /// reading low and never high; a limit, once one is set here, will have to
+    /// close it.
+    pub fn for_pid_at(root: &Path, pid: u32) -> std::io::Result<Self> {
+        let cage = Self {
+            dir: root.join(cage_name(pid)),
+        };
+        std::fs::create_dir(&cage.dir)?;
+        if let Err(e) = std::fs::write(cage.dir.join("cgroup.procs"), pid.to_string()) {
+            let _ = std::fs::remove_dir(&cage.dir);
+            return Err(e);
+        }
+        Ok(cage)
+    }
+
+    /// The same, in the container's own cgroup tree.
+    pub fn for_pid(pid: u32) -> std::io::Result<Self> {
+        Self::for_pid_at(Path::new(CGROUP_ROOT), pid)
+    }
+
+    /// Where this cage sits, for logs and for tests that need to look inside it.
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The peak charged to this command, or `None` when the memory controller
+    /// does not reach the cage.
+    pub fn peak_bytes(&self) -> Option<u64> {
+        read_u64(self.dir.join(MEMORY_PEAK))
+    }
+
+    /// Read the peak and take the cage down. A process still running in it
+    /// keeps the directory alive -- the kernel refuses to drop a populated
+    /// cgroup -- which is the honest outcome, and the only trace it leaves is
+    /// this line.
+    pub fn finish(self) -> CageReading {
+        let peak = self.peak_bytes();
+        if let Err(e) = std::fs::remove_dir(&self.dir) {
+            tracing::debug!(dir = %self.dir.display(), error = %e, "cage left behind");
+        }
+        match peak {
+            Some(peak) => CageReading::Peak(peak),
+            None => CageReading::Unaccounted,
+        }
+    }
+}
+
+/// A name nothing else in this container holds. The pid and the counter alone
+/// would repeat after a restart once the kernel reuses a pid, so the clock
+/// goes in as well; the counter keeps two commands of the same instant apart.
+fn cage_name(pid: u32) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("cog-cmd-{pid}-{n}-{nanos}")
+}
+
+/// Publish what one command's cage saw.
+///
+/// The peak goes into a histogram rather than straight onto a gauge: a bound
+/// for one command has to be read off the distribution of many, and a single
+/// last value is the maximum of one sample. The outcome is counted separately
+/// because an empty histogram and a deployment where no cage can be made look
+/// the same from the histogram alone.
+pub fn record_cage(reading: CageReading) {
+    match reading {
+        CageReading::Peak(peak) => {
+            metrics().command_peak.observe(peak as f64);
+            metrics().cages.with_label_values(&["measured"]).inc();
+        }
+        CageReading::Unaccounted => metrics().cages.with_label_values(&["unaccounted"]).inc(),
+        CageReading::Unavailable => metrics().cages.with_label_values(&["unavailable"]).inc(),
+    }
+}
+
 /// Counter for commands the cgroup OOM killer took. The limit and the peak are
 /// readings of live state rather than events, so they are rendered straight
 /// from the kernel on each scrape instead of being held here.
 struct MemoryMetrics {
     registry: Registry,
     oom_kills: Counter,
+    /// `sandbox_command_cages_total{state}`: how many commands got a cage, and
+    /// for the ones that did, whether it could report a peak.
+    cages: prometheus::CounterVec,
+    /// `sandbox_command_memory_peak_bytes`: one observation per command whose
+    /// own cage could report a peak. Buckets start at a quarter of a MiB and
+    /// double, so a small tool call and a full build land in different ones;
+    /// the top bucket is far past what one command of this deployment has been
+    /// watched using, and anything above it counts as that bucket, which is
+    /// what tells the shape apart from a mis-set top edge.
+    command_peak: prometheus::Histogram,
 }
 
 static METRICS: OnceLock<MemoryMetrics> = OnceLock::new();
@@ -169,12 +311,45 @@ fn metrics() -> &'static MemoryMetrics {
             "Sandbox commands the container memory limit killed",
         )
         .expect("static counter");
-        registry
-            .register(Box::new(oom_kills.clone()))
-            .expect("static counter registration");
+        let cages = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sandbox_command_cages_total",
+                "Sandbox commands by what their own cgroup could report: a measured peak, \
+                 a cage the memory controller does not reach, or no cage at all",
+            ),
+            &["state"],
+        )
+        .expect("static counter");
+        let command_peak = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "sandbox_command_memory_peak_bytes",
+                "Peak memory the kernel charged to each sandbox command's own cgroup",
+            )
+            .buckets(
+                prometheus::exponential_buckets(256.0 * 1024.0, 2.0, 18).expect("static buckets"),
+            ),
+        )
+        .expect("static histogram");
+        // Every state is on the scrape surface from the first one: a zero that
+        // was never incremented says "this has not happened here", while a
+        // missing series cannot be told apart from a build without the reading.
+        for state in ["measured", "unaccounted", "unavailable"] {
+            let _ = cages.with_label_values(&[state]);
+        }
+        for collector in [
+            Box::new(oom_kills.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(cages.clone()),
+            Box::new(command_peak.clone()),
+        ] {
+            registry
+                .register(collector)
+                .expect("static counter registration");
+        }
         MemoryMetrics {
             registry,
             oom_kills,
+            cages,
+            command_peak,
         }
     })
 }
@@ -296,6 +471,90 @@ mod tests {
     fn an_unlimited_cgroup_reports_no_limit_rather_than_a_number() {
         let dir = fixture(&[("memory.max", "max\n")]);
         assert_eq!(read_at(dir.path()).limit_bytes, None);
+    }
+
+    /// A cage is the command's own cgroup: the pid that is put in it is the one
+    /// the kernel charges, and the peak that comes back out is what it charged
+    /// -- not the container's lifetime maximum, which never comes down and so
+    /// would answer the same for every command after the first big one.
+    #[test]
+    fn a_command_is_charged_to_the_cage_it_was_put_in() {
+        let root = tempfile::tempdir().unwrap();
+        let cage = CommandCage::for_pid_at(root.path(), 4242).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cage.path().join("cgroup.procs")).unwrap(),
+            "4242"
+        );
+        std::fs::write(cage.path().join("memory.peak"), "53687091\n").unwrap();
+
+        assert_eq!(cage.finish(), CageReading::Peak(53687091));
+    }
+
+    /// Taking the cage down is part of reading it, so the next command does not
+    /// inherit this one's accounting. In a plain directory the file the attach
+    /// wrote is a real file and keeps the directory alive, where a cgroup's
+    /// kernel-provided files leave with it; removing it here is what the kernel
+    /// does, and the directory is what the test is about.
+    #[test]
+    fn the_cage_is_taken_down_once_it_has_been_read() {
+        let root = tempfile::tempdir().unwrap();
+        let cage = CommandCage::for_pid_at(root.path(), 9).unwrap();
+        let dir = cage.path().to_path_buf();
+        std::fs::remove_file(dir.join("cgroup.procs")).unwrap();
+
+        assert_eq!(cage.finish(), CageReading::Unaccounted);
+        assert!(!dir.exists(), "the cage outlived the command it held");
+    }
+
+    /// The memory controller only reaches a cgroup whose parent delegates it.
+    /// Where it does not, the cage is real and the reading is missing; that is
+    /// not a peak of zero, and a reader that conflated them would size
+    /// something against a number nobody measured.
+    #[test]
+    fn a_cage_the_controller_does_not_reach_reads_unaccounted_not_zero() {
+        let root = tempfile::tempdir().unwrap();
+        let unaccounted = CommandCage::for_pid_at(root.path(), 1).unwrap();
+        assert_eq!(unaccounted.finish(), CageReading::Unaccounted);
+
+        let measured = CommandCage::for_pid_at(root.path(), 2).unwrap();
+        std::fs::write(measured.path().join("memory.peak"), "0\n").unwrap();
+        assert_eq!(measured.finish(), CageReading::Peak(0));
+    }
+
+    #[test]
+    fn a_cage_that_cannot_be_made_says_so_instead_of_pretending() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-there");
+        assert!(CommandCage::for_pid_at(&missing, 3).is_err());
+    }
+
+    /// Two commands of one executor must not share a cage: the second one's
+    /// pid would land in the first one's accounting and the peak would be the
+    /// sum of both, which is a number about nobody.
+    #[test]
+    fn two_commands_get_two_cages_even_for_the_same_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let first = CommandCage::for_pid_at(root.path(), 7).unwrap();
+        let second = CommandCage::for_pid_at(root.path(), 7).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().is_dir() && second.path().is_dir());
+    }
+
+    /// The point of separating unaccounted from unavailable is that an
+    /// operator can see which of the two is happening; neither is visible if
+    /// it never reaches the scrape surface.
+    #[test]
+    fn the_cage_outcomes_and_the_peak_are_on_the_scrape_surface() {
+        let names: Vec<String> = metrics()
+            .registry
+            .gather()
+            .into_iter()
+            .map(|family| family.get_name().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "sandbox_command_cages_total"));
+        assert!(names
+            .iter()
+            .any(|n| n == "sandbox_command_memory_peak_bytes"));
     }
 
     #[test]
