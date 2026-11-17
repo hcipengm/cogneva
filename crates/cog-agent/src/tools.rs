@@ -1843,7 +1843,10 @@ mod tests {
             "the model now pays {measured} bytes per turn for tool signatures; the budget \
              was {BUDGET}. Either delete what grew or raise BUDGET with the reason"
         );
-        eprintln!("tool payload: {measured} bytes in {} tools", registry.list().len());
+        eprintln!(
+            "tool payload: {measured} bytes in {} tools",
+            registry.list().len()
+        );
     }
 
     /// 这个数确实来自树，不是写死的：换一份工具，读数跟着变。
