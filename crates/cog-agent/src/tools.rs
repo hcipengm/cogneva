@@ -1814,6 +1814,69 @@ mod tests {
         out
     }
 
+    /// 工具面发给模型的字节数。这是模型每一回合都要付的固定成本，所以它只降不升：
+    /// 删掉一段散文，这个数跟着降，把它写进预算；要往上抬，得先说清新增的这段
+    /// 凭什么非有不可——而那句话在这里比在评审里更难糊弄过去。
+    #[test]
+    fn the_tool_payload_only_grows_when_someone_says_why() {
+        let registry = ToolRegistry::new();
+        builtins::register_builtins(
+            &registry,
+            builtins::BuiltinInputs {
+                http_client: None,
+                metrics: None,
+                memory_api_base: None,
+                external_archive_threshold_chars: 4096,
+                message_backend: None,
+                agent_registry: None,
+                web_search_base: None,
+                web_search_fallback_base: None,
+                web_fetch_base: None,
+                sandbox_backend: None,
+            },
+        );
+        let measured = tool_payload_bytes(&registry.list());
+        // cap: derived — 由树上的工具面现算（2026-11-17 实测 13767）；删除时跟着降，
+        // 往上抬要在提交信息里说明新增的是哪一段、凭什么非有不可
+        const BUDGET: usize = 13_767;
+        assert!(
+            measured <= BUDGET,
+            "the model now pays {measured} bytes per turn for tool signatures; the budget \
+             was {BUDGET}. Either delete what grew or raise BUDGET with the reason"
+        );
+        eprintln!("tool payload: {measured} bytes in {} tools", registry.list().len());
+    }
+
+    /// 这个数确实来自树，不是写死的：换一份工具，读数跟着变。
+    #[test]
+    fn the_payload_reading_follows_what_the_tools_actually_carry() {
+        fn tool(name: &str, description: &str) -> Tool {
+            Tool {
+                name: name.into(),
+                description: description.into(),
+                parameters: serde_json::json!({ "type": "object" }),
+                implementation: ToolImplementation::Native(Arc::new(|_| {
+                    Box::pin(async { Ok(serde_json::json!({})) })
+                })),
+            }
+        }
+        let short = tool_payload_bytes(&[tool("a", "reads a file")]);
+        let long = tool_payload_bytes(&[tool("a", "reads a file, and says what it left out")]);
+        assert!(long > short, "the reading ignored the description text");
+        let two = tool_payload_bytes(&[tool("a", "reads a file"), tool("b", "writes a file")]);
+        assert!(two > short, "the reading ignored a second tool");
+    }
+
+    /// 名字、描述、参数 schema 的字节和——就是模型看到的那份东西。
+    fn tool_payload_bytes(tools: &[Tool]) -> usize {
+        tools
+            .iter()
+            .map(|tool| {
+                tool.name.len() + tool.description.len() + tool.parameters.to_string().len()
+            })
+            .sum()
+    }
+
     /// 同一个界不许有两份数字：一份在这一回合真正生效的地方（schema 字段、拒绝判词），
     /// 一份抄在描述里。抄的那份在改常量那天就成了假话，而不会有任何东西变红——除了这条。
     ///
