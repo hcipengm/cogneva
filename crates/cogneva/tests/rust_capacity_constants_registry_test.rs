@@ -524,36 +524,364 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
     );
 }
 
-/// How many constants may still answer `bound`.
+/// One row per file: how many constants there answered `bound` on 2026-11-17.
 ///
 /// `bound` is the one word in the vocabulary nothing can check. The reason says
 /// what pins the value, and no rule reads that reason well enough to tell a pin
 /// from a preference — so it is the shape a hand-picked number arrives in: an
-/// override wearing a justification. The other two shapes are checkable: `fixed`
-/// names an agreement, and a value that should follow a reading belongs on the
-/// value that moves at run time, computed from the setting or the reading it
-/// follows (the read-file page is the worked example: it derives from the
-/// window the tools serve instead of a constant page size).
+/// override wearing a justification. The two shapes that can be checked are
+/// `fixed` (it names an agreement) and a value computed at run time from the
+/// setting or the reading it follows (the read-file page is the worked example:
+/// it derives from the window the tools serve instead of a constant page size).
 ///
-/// The number is the measured population, not a budget somebody chose, and it
-/// only comes down. A new capacity number that would have said `bound` has to
-/// say `fixed` with the agreement, or not be a constant at all. Deleting one
-/// does not force this line to be lowered in the same commit; when you touch
-/// these constants, read the printed count and take the lower number.
-const BOUND_CEILING: u64 = 736; // 2026-11-17 实测
+/// Recorded per path, not as a total: with a total, fixing fifteen in one file
+/// and writing fifteen in another leaves the number unchanged and the gate
+/// silent — a green that covers a new one. A file may come in under its row;
+/// that is a repaid debt, printed as STALE so the row gets lowered. Going over
+/// a row is red, and a file that is not here has a row of zero.
+///
+/// The rows are the measured population, not a budget somebody chose.
+const BOUND_AT_CENSUS: &[(&str, u64)] = &[
+    ("crates/bootstrap/src/apt.rs", 1),
+    ("crates/bootstrap/src/kubespray.rs", 1),
+    ("crates/bootstrap/src/lib.rs", 6),
+    ("crates/bootstrap/src/main.rs", 11),
+    ("crates/cog-agent/src/agent.rs", 2),
+    ("crates/cog-agent/src/agent_kernel/replay_guard.rs", 1),
+    ("crates/cog-agent/src/agent_kernel/runtime.rs", 5),
+    ("crates/cog-agent/src/archive.rs", 1),
+    ("crates/cog-agent/src/background.rs", 3),
+    ("crates/cog-agent/src/consumer.rs", 3),
+    ("crates/cog-agent/src/context.rs", 3),
+    ("crates/cog-agent/src/drain.rs", 1),
+    ("crates/cog-agent/src/hooks/lifecycle.rs", 1),
+    ("crates/cog-agent/src/hooks/types.rs", 2),
+    ("crates/cog-agent/src/observable.rs", 1),
+    ("crates/cog-agent/src/permission.rs", 1),
+    ("crates/cog-agent/src/plugin.rs", 4),
+    ("crates/cog-agent/src/tools.rs", 7),
+    ("crates/cog-agent/src/web.rs", 2),
+    ("crates/cog-auth/src/keycloak.rs", 2),
+    ("crates/cog-auth/src/session.rs", 1),
+    ("crates/cog-collaboration/src/collaboration_executor.rs", 2),
+    ("crates/cog-collaboration/src/config.rs", 1),
+    ("crates/cog-collaboration/src/profile.rs", 5),
+    ("crates/cog-collaboration/src/squad/executor.rs", 2),
+    ("crates/cog-collaboration/src/squad/ralph/ralph_loop.rs", 1),
+    ("crates/cog-core/src/build_cache.rs", 5),
+    ("crates/cog-core/src/build_cache_readings.rs", 2),
+    ("crates/cog-core/src/claim_footprint.rs", 2),
+    ("crates/cog-core/src/config.rs", 12),
+    ("crates/cog-core/src/config_sections.rs", 2),
+    ("crates/cog-core/src/contract/alerts.rs", 1),
+    ("crates/cog-core/src/contract/build_cache_reclaim.rs", 2),
+    ("crates/cog-core/src/contract/conversation.rs", 2),
+    ("crates/cog-core/src/contract/event.rs", 1),
+    ("crates/cog-core/src/contract/face_registry.rs", 1),
+    ("crates/cog-core/src/contract/governance_acts.rs", 1),
+    ("crates/cog-core/src/contract/hook.rs", 1),
+    ("crates/cog-core/src/contract/loop_health.rs", 1),
+    ("crates/cog-core/src/contract/memory.rs", 2),
+    ("crates/cog-core/src/contract/owner_lease.rs", 2),
+    ("crates/cog-core/src/contract/reflection.rs", 4),
+    ("crates/cog-core/src/contract/resilience.rs", 2),
+    ("crates/cog-core/src/contract/storage.rs", 4),
+    ("crates/cog-core/src/contract/taste.rs", 4),
+    ("crates/cog-core/src/contract/work_item.rs", 1),
+    ("crates/cog-core/src/day.rs", 1),
+    ("crates/cog-core/src/declared_wall.rs", 2),
+    ("crates/cog-core/src/pacing.rs", 2),
+    ("crates/cog-core/src/progress.rs", 7),
+    ("crates/cog-core/src/reading_cadence.rs", 1),
+    ("crates/cog-core/src/retention.rs", 4),
+    ("crates/cog-core/src/token_estimate.rs", 2),
+    ("crates/cog-core/src/types/agent_state.rs", 2),
+    ("crates/cog-eval/src/adapters/swe_pro.rs", 1),
+    ("crates/cog-eval/src/admission.rs", 9),
+    ("crates/cog-eval/src/backoff.rs", 4),
+    ("crates/cog-eval/src/exec_seam.rs", 2),
+    ("crates/cog-eval/src/long_run.rs", 2),
+    ("crates/cog-eval/src/rig.rs", 1),
+    ("crates/cog-eval/src/scaffolds/mod.rs", 1),
+    ("crates/cog-eval/src/trend.rs", 3),
+    ("crates/cog-extension/src/build_cache.rs", 1),
+    ("crates/cog-extension/src/checkpoints.rs", 1),
+    ("crates/cog-extension/src/command_server.rs", 3),
+    ("crates/cog-extension/src/executor_lease.rs", 1),
+    ("crates/cog-extension/src/hostdocs.rs", 5),
+    ("crates/cog-extension/src/hostdocs_assist.rs", 3),
+    ("crates/cog-extension/src/lane_sizing.rs", 1),
+    ("crates/cog-extension/src/runtime/remote.rs", 6),
+    ("crates/cog-extension/src/workdir.rs", 10),
+    ("crates/cog-gateway/src/a2a.rs", 1),
+    ("crates/cog-gateway/src/agents.rs", 5),
+    ("crates/cog-gateway/src/auth/mod.rs", 2),
+    ("crates/cog-gateway/src/backup_admin.rs", 2),
+    ("crates/cog-gateway/src/buildgate.rs", 2),
+    ("crates/cog-gateway/src/chat.rs", 5),
+    ("crates/cog-gateway/src/cluster.rs", 2),
+    ("crates/cog-gateway/src/contribution_admin.rs", 1),
+    ("crates/cog-gateway/src/document_egress.rs", 1),
+    ("crates/cog-gateway/src/eval_reports.rs", 1),
+    ("crates/cog-gateway/src/evolution.rs", 2),
+    ("crates/cog-gateway/src/git_identity.rs", 2),
+    ("crates/cog-gateway/src/git_mirror.rs", 14),
+    ("crates/cog-gateway/src/git_routing.rs", 3),
+    ("crates/cog-gateway/src/github_app.rs", 2),
+    ("crates/cog-gateway/src/governance.rs", 5),
+    ("crates/cog-gateway/src/ide.rs", 10),
+    ("crates/cog-gateway/src/knowledge.rs", 1),
+    ("crates/cog-gateway/src/lib.rs", 2),
+    ("crates/cog-gateway/src/llm_admin.rs", 2),
+    ("crates/cog-gateway/src/memory.rs", 2),
+    ("crates/cog-gateway/src/observability.rs", 2),
+    ("crates/cog-gateway/src/output.rs", 2),
+    ("crates/cog-gateway/src/pace_reservations.rs", 2),
+    ("crates/cog-gateway/src/plugin.rs", 2),
+    ("crates/cog-gateway/src/process_reports.rs", 4),
+    ("crates/cog-gateway/src/project_control.rs", 1),
+    ("crates/cog-gateway/src/project_rate_limit.rs", 2),
+    ("crates/cog-gateway/src/projects.rs", 5),
+    ("crates/cog-gateway/src/readings.rs", 1),
+    ("crates/cog-gateway/src/scm.rs", 7),
+    ("crates/cog-gateway/src/security_gateway.rs", 17),
+    ("crates/cog-gateway/src/source_line.rs", 1),
+    ("crates/cog-gateway/src/task_ledger.rs", 2),
+    ("crates/cog-gateway/src/tasks.rs", 2),
+    ("crates/cog-gateway/src/usage_landing.rs", 2),
+    ("crates/cog-gateway/src/venues.rs", 1),
+    ("crates/cog-github/src/ci_refusals.rs", 1),
+    ("crates/cog-github/src/conversation.rs", 1),
+    ("crates/cog-github/src/cross_validation.rs", 1),
+    ("crates/cog-github/src/discovery_loop.rs", 10),
+    ("crates/cog-github/src/landing.rs", 1),
+    ("crates/cog-github/src/plugin.rs", 1),
+    ("crates/cog-github/src/provider/github.rs", 3),
+    ("crates/cog-llm/src/provider/mod.rs", 2),
+    ("crates/cog-llm/src/routing.rs", 1),
+    ("crates/cog-memory/src/bge_m3_sparse_linear.rs", 1),
+    ("crates/cog-memory/src/config.rs", 1),
+    ("crates/cog-memory/src/extractor.rs", 7),
+    ("crates/cog-memory/src/ingestor.rs", 1),
+    ("crates/cog-memory/src/maintenance.rs", 2),
+    ("crates/cog-memory/src/pg_summary_pool.rs", 2),
+    ("crates/cog-memory/src/vector_summary_backend.rs", 3),
+    ("crates/cog-observability/src/alert_store.rs", 1),
+    ("crates/cog-observability/src/capability.rs", 3),
+    ("crates/cog-observability/src/claim_store.rs", 2),
+    ("crates/cog-observability/src/config.rs", 4),
+    ("crates/cog-observability/src/config_delivery.rs", 1),
+    ("crates/cog-observability/src/exchange_retention.rs", 4),
+    ("crates/cog-observability/src/host_ledger.rs", 1),
+    ("crates/cog-observability/src/image_store.rs", 2),
+    ("crates/cog-observability/src/infra_watch.rs", 2),
+    ("crates/cog-observability/src/llm_usage_rollup.rs", 5),
+    ("crates/cog-observability/src/logs.rs", 1),
+    ("crates/cog-observability/src/plugin.rs", 3),
+    ("crates/cog-observability/src/probes.rs", 1),
+    ("crates/cog-observability/src/process_zombies.rs", 1),
+    ("crates/cog-observability/src/raw_stream.rs", 1),
+    ("crates/cog-observability/src/spend_verdict.rs", 4),
+    ("crates/cog-observability/src/usage_retention.rs", 2),
+    (
+        "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs",
+        3,
+    ),
+    ("crates/cog-orchestrator/src/backup_runs.rs", 1),
+    ("crates/cog-orchestrator/src/change_ledger.rs", 25),
+    ("crates/cog-orchestrator/src/dag_executor/mod.rs", 5),
+    (
+        "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
+        3,
+    ),
+    (
+        "crates/cog-orchestrator/src/dag_executor/task_checkpoint.rs",
+        1,
+    ),
+    ("crates/cog-orchestrator/src/face_drift.rs", 1),
+    ("crates/cog-orchestrator/src/face_lifecycle.rs", 1),
+    ("crates/cog-orchestrator/src/face_staffing.rs", 1),
+    ("crates/cog-orchestrator/src/governance_acts.rs", 1),
+    ("crates/cog-orchestrator/src/lane_memory.rs", 2),
+    ("crates/cog-orchestrator/src/outward.rs", 6),
+    ("crates/cog-orchestrator/src/plugin.rs", 3),
+    ("crates/cog-orchestrator/src/principle_ledger.rs", 8),
+    ("crates/cog-orchestrator/src/ready_queue.rs", 2),
+    ("crates/cog-orchestrator/src/resource_ledger.rs", 4),
+    ("crates/cog-orchestrator/src/subscribe_backoff.rs", 1),
+    ("crates/cog-orchestrator/src/task_executor_router.rs", 6),
+    ("crates/cog-prompt/src/loader.rs", 1),
+    ("crates/cog-protocol/src/convert.rs", 1),
+    ("crates/cog-protocol/src/plugin.rs", 1),
+    ("crates/cog-quota/src/hierarchy.rs", 1),
+    ("crates/cog-reflection/src/auto_promoter.rs", 2),
+    ("crates/cog-reflection/src/baseline_port.rs", 1),
+    ("crates/cog-reflection/src/build_gate/mod.rs", 16),
+    ("crates/cog-reflection/src/build_rss_peak.rs", 3),
+    ("crates/cog-reflection/src/change_execution.rs", 3),
+    ("crates/cog-reflection/src/change_pipeline.rs", 10),
+    ("crates/cog-reflection/src/config.rs", 3),
+    ("crates/cog-reflection/src/evolution_build_readings.rs", 1),
+    ("crates/cog-reflection/src/firecracker.rs", 1),
+    ("crates/cog-reflection/src/gitops_puller.rs", 1),
+    ("crates/cog-reflection/src/image_rollout.rs", 1),
+    ("crates/cog-reflection/src/lib.rs", 2),
+    ("crates/cog-reflection/src/mainline_deployer.rs", 20),
+    ("crates/cog-reflection/src/mainline_rollout.rs", 11),
+    ("crates/cog-reflection/src/meta_learning.rs", 1),
+    ("crates/cog-reflection/src/observability_stack.rs", 2),
+    ("crates/cog-reflection/src/platform_http.rs", 2),
+    ("crates/cog-reflection/src/plugin.rs", 3),
+    ("crates/cog-reflection/src/promotion_eval.rs", 3),
+    ("crates/cog-reflection/src/promotion_trend.rs", 4),
+    ("crates/cog-reflection/src/registry_footprint.rs", 2),
+    ("crates/cog-reflection/src/signal_watcher.rs", 3),
+    ("crates/cog-reflection/src/store_readouts.rs", 2),
+    ("crates/cog-reflection/src/volume_capacity.rs", 7),
+    ("crates/cog-reflection/src/workload_resources.rs", 5),
+    ("crates/cog-reflection/src/workspace.rs", 3),
+    ("crates/cog-storage/src/backends/file_trace_store.rs", 1),
+    ("crates/cog-storage/src/backends/object_backends.rs", 2),
+    ("crates/cog-storage/src/checkpoint_cap.rs", 4),
+    ("crates/cog-storage/src/metrics_retirement.rs", 2),
+    ("crates/cog-storage/src/metrics_sample_cap.rs", 2),
+    ("crates/cog-storage/src/observability_event_cap.rs", 4),
+    ("crates/cog-storage/src/partition_maintainer.rs", 2),
+    ("crates/cog-storage/src/plugin.rs", 3),
+    (
+        "crates/cog-storage/src/postgres/attempt_journal_store.rs",
+        2,
+    ),
+    ("crates/cog-storage/src/postgres/change_ledger_store.rs", 4),
+    ("crates/cog-storage/src/postgres/decision_stats_store.rs", 3),
+    ("crates/cog-storage/src/postgres/metrics_backend.rs", 4),
+    (
+        "crates/cog-storage/src/postgres/observability_gateway.rs",
+        5,
+    ),
+    (
+        "crates/cog-storage/src/postgres/principle_ledger_store.rs",
+        6,
+    ),
+    ("crates/cog-storage/src/postgres/resource_event_store.rs", 3),
+    ("crates/cog-storage/src/schema_ddl.rs", 4),
+    ("crates/cog-storage/src/task_event_retention.rs", 4),
+    ("crates/cog-storage/src/wal/mod.rs", 3),
+    ("crates/cog-stream/src/redis.rs", 2),
+    ("crates/cog-supervisor/src/alert_store.rs", 1),
+    ("crates/cog-supervisor/src/autonomous.rs", 1),
+    ("crates/cog-supervisor/src/behavior_monitor.rs", 1),
+    ("crates/cog-supervisor/src/event_aggregator.rs", 1),
+    ("crates/cog-supervisor/src/health_checker.rs", 3),
+    ("crates/cog-supervisor/src/multi_backend_consumer.rs", 1),
+    ("crates/cog-supervisor/src/registry.rs", 3),
+    ("crates/cog-supervisor/src/supervisor.rs", 7),
+    ("crates/cog-supervisor/src/udp_heartbeat.rs", 2),
+    ("crates/cog-wiki/src/bounds.rs", 1),
+    ("crates/cog-wiki/src/distiller.rs", 3),
+    ("crates/cog-wiki/src/indexer.rs", 2),
+    ("crates/cog-wiki/src/unified_knowledge_backend.rs", 1),
+    ("crates/cogneva/src/aof_repair.rs", 2),
+    ("crates/cogneva/src/backup.rs", 7),
+    ("crates/cogneva/src/backup_crypto.rs", 4),
+    ("crates/cogneva/src/checkpoints.rs", 1),
+    ("crates/cogneva/src/conversation.rs", 15),
+    ("crates/cogneva/src/eval_container.rs", 1),
+    ("crates/cogneva/src/eval_mcp_in_pod.rs", 1),
+    ("crates/cogneva/src/eval_platform.rs", 4),
+    ("crates/cogneva/src/eval_table.rs", 3),
+    ("crates/cogneva/src/eval_toolathlon.rs", 3),
+    ("crates/cogneva/src/eval_toolathlon_local.rs", 2),
+    ("crates/cogneva/src/gateway_observability.rs", 2),
+    ("crates/cogneva/src/health_check.rs", 2),
+    ("crates/cogneva/src/owner_memory.rs", 2),
+    ("crates/cogneva/src/process_census.rs", 2),
+    ("crates/cogneva/src/process_report.rs", 2),
+    ("crates/cogneva/src/scraper_endpoint.rs", 1),
+    ("crates/cogneva/src/startup_guard.rs", 1),
+    ("crates/cogneva/src/work.rs", 6),
+    ("crates/cogneva/src/write_role.rs", 5),
+];
+
+/// Compare the tree against the rows: files over their row, and rows above what
+/// the file now carries.
+///
+/// Separate from the test so the refusal can be pinned on a handful of rows: a
+/// rule that only reads the real tree cannot show that it would catch one file
+/// growing while another shrinks by the same amount, which is exactly the shape
+/// a total would call green.
+fn judge_bound_census(
+    by_file: &BTreeMap<String, u64>,
+    pinned: &[(&str, u64)],
+) -> (Vec<String>, Vec<String>) {
+    let pinned: BTreeMap<&str, u64> = pinned.iter().copied().collect();
+    let over: Vec<String> = by_file
+        .iter()
+        .filter_map(|(file, count)| {
+            let allowed = pinned.get(file.as_str()).copied().unwrap_or(0);
+            (*count > allowed).then(|| format!("{file}: {count} > {allowed}"))
+        })
+        .collect();
+    let stale: Vec<String> = pinned
+        .iter()
+        .filter_map(|(file, allowed)| {
+            let now = by_file.get(*file).copied().unwrap_or(0);
+            (now < *allowed).then(|| format!("{file}: {now} < {allowed}"))
+        })
+        .collect();
+    (over, stale)
+}
 
 #[test]
 fn the_uncheckable_bound_answer_only_comes_down() {
     let root = repo_root();
     let scanned = scan(&root, &production_sources(&root));
-    let total = scanned.iter().filter(|row| row.source == "bound").count() as u64;
-    eprintln!("cap bound: {total} constants");
+    let mut by_file: BTreeMap<String, u64> = BTreeMap::new();
+    for row in scanned.iter().filter(|row| row.source == "bound") {
+        *by_file.entry(row.file.clone()).or_default() += 1;
+    }
+
+    let (over, stale) = judge_bound_census(&by_file, BOUND_AT_CENSUS);
+
     assert!(
-        total <= BOUND_CEILING,
-        "{total} constants answer `bound` and the ceiling is {BOUND_CEILING}. `bound` \
-         is the one answer nothing checks, so the debt only comes down: name the \
-         agreement in a `fixed` line, or compute the value at run time from the \
-         setting or the reading it follows"
+        over.is_empty(),
+        "these files carry more `bound` constants than their row in BOUND_AT_CENSUS. \
+         `bound` is the one answer nothing checks, so the debt only comes down: name \
+         the agreement in a `fixed` line, or compute the value at run time from the \
+         setting or the reading it follows:\n{}",
+        over.join("\n")
+    );
+    if !stale.is_empty() {
+        eprintln!(
+            "STALE: these files carry fewer `bound` constants than their row; lower the \
+             row to the number shown:\n{}",
+            stale.join("\n")
+        );
+    }
+}
+
+/// A file that grows while another shrinks is red, even when the two cancel out.
+///
+/// This is the shape a total would read as green, and the reason the rows are
+/// per file. The shrinking file is also the half that must not red: a repaid
+/// debt prints STALE -- the row is a reading, not a quota.
+#[test]
+fn the_bound_ratchet_counts_per_file_not_in_total() {
+    let by_file = BTreeMap::from([
+        ("crates/a/src/one.rs".to_string(), 1),
+        ("crates/b/src/two.rs".to_string(), 1),
+    ]);
+    let pinned = [("crates/a/src/one.rs", 2), ("crates/b/src/two.rs", 0)];
+    let (over, stale) = judge_bound_census(&by_file, &pinned);
+    assert_eq!(
+        over,
+        vec!["crates/b/src/two.rs: 1 > 0".to_string()],
+        "the growth in two.rs must be red on its own file even though one.rs shrank by one"
+    );
+    assert_eq!(
+        stale,
+        vec!["crates/a/src/one.rs: 1 < 2".to_string()],
+        "a repaid debt is a stale row to lower, not a refusal"
     );
 }
 
