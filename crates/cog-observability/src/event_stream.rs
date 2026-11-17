@@ -73,6 +73,10 @@ pub fn resume_point(events: &[EventFacts]) -> Option<ResumePoint> {
     None
 }
 
+/// 载荷字段目录住在 `cog-core`：写者（存储层）与读者（解码器）分属两个 crate，
+/// 「这一版载荷有什么」是它们之间的契约。这里只是转出去，调用点不必知道它住哪。
+pub use cog_core::{payload_fields, PayloadField, PAYLOAD_CATALOG};
+
 #[cfg(test)]
 mod tests {
     use super::*;

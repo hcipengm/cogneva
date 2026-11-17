@@ -201,6 +201,33 @@ struct RowInput<'a> {
     origin_version: i32,
 }
 
+/// 一条候选写进载荷的字段。目录在 `cog_observability::event_stream::PAYLOAD_CATALOG`，
+/// 由测试对账：这里多一个键或少一个键都会红——载荷存 text，没有类型能替人记住它有什么。
+fn candidate_attributes(candidate: &ChangeCandidate) -> serde_json::Value {
+    serde_json::json!({
+        "kind": candidate.kind,
+        "status": candidate.recorded_status,
+        "description": candidate.description,
+        "content": candidate.content,
+        "created_at": candidate.created_at.to_rfc3339(),
+        "eval_summary": candidate.eval_summary,
+        "tiering": candidate
+            .tiering
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok()),
+    })
+}
+
+/// 一条状态事件的载荷。
+fn measured_attributes(status: &str, note: &str) -> serde_json::Value {
+    serde_json::json!({ "status": status, "note": note })
+}
+
+/// 一条定案事件的载荷（接受与拒绝同形，只有原因）。
+fn decision_attributes(reason: &str) -> serde_json::Value {
+    serde_json::json!({ "reason": reason })
+}
+
 /// 读不懂的一行：状态照常从事件种类读出来，内容留空，并标明这一版读不懂。
 fn undecodable_row(subject_id: &str, event_id: &str, status: &str) -> ChangeCandidate {
     ChangeCandidate {
@@ -288,19 +315,7 @@ fn candidate_from_events(input: &RowInput<'_>) -> SFResult<ChangeCandidate> {
 #[async_trait]
 impl ChangeCandidateStore for PgChangeCandidateStore {
     async fn record(&self, candidate: &ChangeCandidate) -> SFResult<()> {
-        let attributes = serde_json::json!({
-            "kind": candidate.kind,
-            "status": candidate.recorded_status,
-            "description": candidate.description,
-            "content": candidate.content,
-            "created_at": candidate.created_at.to_rfc3339(),
-            "eval_summary": candidate.eval_summary,
-            "tiering": candidate
-                .tiering
-                .as_deref()
-                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok()),
-        })
-        .to_string();
+        let attributes = candidate_attributes(candidate).to_string();
         self.append(
             &candidate.artifact_id,
             (CANDIDATE_KIND, "generated", "ok"),
@@ -317,7 +332,7 @@ impl ChangeCandidateStore for PgChangeCandidateStore {
             (MEASURED_KIND, "verified", "ok"),
             &format!("{MEASURED_KIND}:{artifact_id}:{status}"),
             None,
-            &serde_json::json!({ "status": status, "note": note }).to_string(),
+            &measured_attributes(status, note).to_string(),
         )
         .await
     }
@@ -338,7 +353,7 @@ impl ChangeCandidateStore for PgChangeCandidateStore {
             (kind, step, resolution),
             &format!("{kind}:{artifact_id}"),
             None,
-            &serde_json::json!({ "reason": reason }).to_string(),
+            &decision_attributes(reason).to_string(),
         )
         .await
     }
@@ -411,6 +426,57 @@ mod tests {
         assert_eq!(rejected.status, "rejected");
         assert_eq!(rejected.decision_reason.as_deref(), Some("tests failed"));
         assert_eq!(rejected.content, "--- a\n+++ b\n");
+    }
+
+    /// 写者写出去的键与目录逐个对得上：载荷存 text，没有类型能替人记住它有什么。
+    #[test]
+    fn the_writer_and_the_catalog_name_the_same_fields() {
+        use cog_core::ChangeCandidate;
+        let candidate = ChangeCandidate {
+            artifact_id: "c1".into(),
+            kind: "code_change".into(),
+            description: "d".into(),
+            content: "x".into(),
+            created_at: Utc::now(),
+            eval_summary: None,
+            tiering: None,
+            recorded_status: "compile_checked".into(),
+            status: "candidate".into(),
+            decision_reason: None,
+            event_id: String::new(),
+        };
+        let written = |value: &serde_json::Value| -> std::collections::BTreeSet<String> {
+            value
+                .as_object()
+                .expect("a payload is an object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let catalogue = |kind: &str| -> std::collections::BTreeSet<String> {
+            cog_core::payload_fields(kind, 1)
+                .unwrap_or_else(|| panic!("{kind} v1 is not catalogued"))
+                .iter()
+                .map(|(field, _)| (*field).to_string())
+                .collect()
+        };
+
+        assert_eq!(
+            written(&candidate_attributes(&candidate)),
+            catalogue("change_candidate")
+        );
+        assert_eq!(
+            written(&measured_attributes("verified", "")),
+            catalogue("change_measured")
+        );
+        assert_eq!(
+            written(&decision_attributes("why")),
+            catalogue("change_accepted")
+        );
+        assert_eq!(
+            written(&decision_attributes("why")),
+            catalogue("change_rejected")
+        );
     }
 
     /// 载荷读不懂时，这一行仍然读得出来，并标明它读不懂。

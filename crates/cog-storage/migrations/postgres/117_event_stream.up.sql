@@ -38,7 +38,14 @@ CREATE TABLE IF NOT EXISTS cogneva_event (
     -- 这个 kind 的载荷格式版本：旧事件重放时按它解释。
     payload_version INTEGER     NOT NULL DEFAULT 1,
     -- 该 kind 自己的字段（第 9.1~9.4 节逐列映射的那些），存 text。
-    attributes      TEXT        NOT NULL DEFAULT '{}',
+    --
+    -- 为什么是 text 而不是 jsonb：正文与哈希相关的那部分要**逐字节**保留，jsonb 会
+    -- 重排键、改空白，把它规范化掉（内容寻址与「擦除后仍能证明原字节」都靠这份字节）。
+    -- 校验不靠类型，靠下面两条约束：半截 JSON 与不是对象的载荷在写入期就被拒。
+    attributes      TEXT        NOT NULL DEFAULT '{}'
+                    CONSTRAINT cogneva_event_attributes_is_json CHECK (attributes IS JSON)
+                    CONSTRAINT cogneva_event_attributes_is_object
+                        CHECK (jsonb_typeof(attributes::jsonb) = 'object'),
     PRIMARY KEY (event_id)
 );
 
