@@ -565,7 +565,10 @@ fn principles_block(input: &serde_json::Value) -> Option<serde_json::Value> {
         return None;
     }
     Some(serde_json::json!({
-        "binding": "These are this project's own recorded principles for the work you are about to do. They are binding: a change that violates one is refused by a gate that names it, and the refusal cites the principle rather than a style rule. Read every one of them before you write code, and treat a conflict between one of them and your own judgement as a reason to look again at the code, not at the principle.",
+        // 只报这一块是什么，不报该怎么对待它：哪些原则真的挂着门、挂在哪些路径上，
+        // 是逐条不同的事实（`collaboration_executor` 才知道这一次带进来的哪几条有门），
+        // 一句「违反了会被门拒绝」在这里是把逐条事实压成一句总话，说错了没人会红。
+        "binding": "This project's own recorded principles, and they are binding for this work.",
         "rows": rows,
     }))
 }
@@ -593,7 +596,7 @@ fn change_generation_contract() -> serde_json::Value {
                 }
             ]
         },
-        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content = what `git --no-pager diff` prints in your checkout, verbatim. Make the edit in the checkout and paste the diff; do not retype it from memory and do not wrap it in markdown fences.",
+        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content = what `git --no-pager diff` prints in your checkout, verbatim.",
         "surface": format!("Your checkout is {surfaces}.", surfaces = cog_core::CONTRIBUTABLE_SURFACES),
     })
 }
@@ -648,6 +651,10 @@ mod tests {
             ),
             ("the metric-name convention", "The metric name set"),
             ("the reproduction pair", "not_reproduced"),
+            (
+                "how to paste a diff",
+                "do not wrap it in markdown fences",
+            ),
         ] {
             assert!(
                 !text.contains(needle),

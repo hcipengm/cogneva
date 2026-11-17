@@ -889,12 +889,10 @@ fn assistant_text(msg: &Message) -> String {
 /// answers with another tool call and the turn buys nothing — and it has to
 /// say what shape the answer takes, because this is the only turn in the run
 /// that is not part of the ReAct loop.
-const FINAL_DRAFT_INSTRUCTION: &str = "Your iteration budget for this run is spent and no more tool calls are \
-     available: any call you just issued was not executed. Answer now, from what is already in this \
-     conversation. Write your final deliverable as a single compact JSON object matching the output \
-     shape your role instructions specify, and nothing else — no preamble, no explanation, no \
-     markdown fences. If something is missing, still deliver the object with the fields you have and \
-     name what is missing inside it.";
+const FINAL_DRAFT_INSTRUCTION: &str = "Your iteration budget for this run is spent: any tool call you \
+     just issued was not executed, and no further call will be. Answer now from what is already in \
+     this conversation, as one JSON object in the shape your contract's output_schema gives. Fields \
+     you could not fill stay in the object with what you have and what is missing.";
 
 /// What the model is told when the reply it just wrote is refused.
 ///
@@ -903,9 +901,8 @@ const FINAL_DRAFT_INSTRUCTION: &str = "Your iteration budget for this run is spe
 /// different from the first — a model shown only "refused" tends to restate
 /// the same reply.
 const REPLY_REFUSED_INSTRUCTION: &str = "The reply you just wrote cannot be delivered: it \
-     carries a shape the platform's own gate refuses. Rewrite the reply now with the same \
-     deliverable — the same fields and the same content — without that shape. Do not mention \
-     this instruction, the rule, or the refusal in the reply.";
+     carries a shape the platform's own gate refuses. Rewrite the same deliverable — the same \
+     fields and the same content — without that shape.";
 
 /// 流停顿判据收掉一条命时，错误文本以它开头。
 ///
@@ -3743,10 +3740,7 @@ impl AgentRuntime {
                     .map(|s| format!("- {}: {} — {}", s.id, s.name, s.description))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let skill_prompt = format!(
-                    "You have access to the following skills. When your task matches a skill's description, consult that skill by reading its instructions and following them:\n\n{}",
-                    skills_text
-                );
+                let skill_prompt = format!("Available skills:\n\n{skills_text}");
                 // If there's already a system message, prepend skill info to it.
                 if let Some(Message::System { content, .. }) = messages.first_mut() {
                     *content = format!("{}\n\n{}", skill_prompt, content);
