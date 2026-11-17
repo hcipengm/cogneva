@@ -51,6 +51,7 @@ impl SandboxBackend for Queued {
                 tool: "run_command".into(),
                 waited_ms: 1_500,
             }],
+            room: None,
         })
     }
 

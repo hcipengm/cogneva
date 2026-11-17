@@ -229,6 +229,23 @@ pub struct BuildLaneReading {
     pub capacity: Option<usize>,
     pub holding: Vec<LaneHolder>,
     pub waiting: Vec<LaneWaiter>,
+    /// 正按本副本的内存余量在跑、与被余量挡在门外的命令。
+    ///
+    /// 与编译位子的 `holding`/`waiting` 分开，因为它们等的是两样东西：位子，和
+    /// 余量。扩缩要的是「这一副上还有多少工作没跑」，两份都得算；少了这一格，
+    /// 一副命令全在等余量的副本会被读成闲着。
+    ///
+    /// `None` 是「答话的这版执行器不报这一格」，不是「零」：滚动升级期间两种
+    /// 执行器同时在跑，把没报读成零会让新旧两版在同一张表上给出不同的答案。
+    #[serde(default)]
+    pub room: Option<RoomQueue>,
+}
+
+/// 按内存余量记的队：在跑几条、在等几条。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomQueue {
+    pub running: usize,
+    pub waiting: usize,
 }
 
 /// 一个正占着编译位子的人。
@@ -318,4 +335,30 @@ pub trait ScriptEngine: Send + Sync {
     async fn eval(&self, req: &ScriptRequest) -> crate::SFResult<ScriptResult>;
     /// Compile a script for repeated execution (optional optimisation).
     async fn compile(&self, source: &str) -> crate::SFResult<String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧一版执行器不报余量这一格：它答的话照样读得出来，而「没报」与
+    /// 「报了零」是两件事——前者不能读成「没有人在等」。
+    #[test]
+    fn a_lane_reading_without_room_is_unreported_not_zero() {
+        let old: BuildLaneReading =
+            serde_json::from_str(r#"{"capacity":2,"holding":[],"waiting":[]}"#)
+                .expect("an older executor's answer still reads");
+        assert_eq!(old.room, None);
+        let new: BuildLaneReading = serde_json::from_str(
+            r#"{"capacity":2,"holding":[],"waiting":[],"room":{"running":1,"waiting":3}}"#,
+        )
+        .expect("a reading with room reads");
+        assert_eq!(
+            new.room,
+            Some(RoomQueue {
+                running: 1,
+                waiting: 3
+            })
+        );
+    }
 }

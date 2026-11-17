@@ -1803,11 +1803,21 @@ async fn read_lane(http: &dyn cog_core::HttpClient, address: &str) -> Option<Lan
         return None;
     }
     let reading: cog_core::BuildLaneReading = response.json().ok()?;
-    Some(LaneQueue {
+    Some(lane_queue(&reading))
+}
+
+/// 一副副本自报的读数变成扩缩用的队：编译位子上的和在内存余量上的都要算。
+///
+/// 只数编译位子，一副命令全在等余量的副本就会看着闲着——它把工作挡住了，而
+/// 挡住了正是「需要更多副本」的读数，不是「没事做」。旧一版执行器不报余量这
+/// 一格（`None`），那就只数编译位子，不把没报读成零。
+fn lane_queue(reading: &cog_core::BuildLaneReading) -> LaneQueue {
+    let room = reading.room.unwrap_or_default();
+    LaneQueue {
         lanes: reading.capacity,
-        holding: reading.holding.len(),
-        waiting: reading.waiting.len(),
-    })
+        holding: reading.holding.len() + room.running,
+        waiting: reading.waiting.len() + room.waiting,
+    }
 }
 
 /// 一拍的工作。
@@ -2493,6 +2503,46 @@ mod tests {
             replicas_for_the_queue(&idle, 1).replicas,
             Some(1),
             "空队停在一副副本"
+        );
+    }
+
+    /// 一副副本的对外读数里，按余量算的队与编译位子的队一样算数：只数位子，
+    /// 命令全在等余量的副本就会读成闲着，而它正把工作挡住——挡住正是要加副本
+    /// 的读数。旧一版执行器不报这一格时只数位子，不把没报读成零。
+    #[test]
+    fn commands_waiting_for_room_count_in_the_queue_the_scaler_reads() {
+        let with_room = cog_core::BuildLaneReading {
+            capacity: Some(2),
+            holding: vec![cog_core::LaneHolder {
+                agent: "builder".into(),
+                held_ms: 10,
+            }],
+            waiting: Vec::new(),
+            room: Some(cog_core::RoomQueue {
+                running: 2,
+                waiting: 4,
+            }),
+        };
+        assert_eq!(
+            lane_queue(&with_room),
+            queue(Some(2), 3, 4),
+            "编译位子上的一位与余量上的两位是同一副副本上在跑的工作"
+        );
+        // 七份工作、一副两条位子：四副。
+        assert_eq!(
+            replicas_for_the_queue(&[lane_queue(&with_room)], 1).replicas,
+            Some(4)
+        );
+
+        // 同一副副本，旧一版不报余量：读出来只有一个人在跑，目标一副。
+        let silent = cog_core::BuildLaneReading {
+            room: None,
+            ..with_room
+        };
+        assert_eq!(lane_queue(&silent), queue(Some(2), 1, 0));
+        assert_eq!(
+            replicas_for_the_queue(&[lane_queue(&silent)], 1).replicas,
+            Some(1)
         );
     }
 

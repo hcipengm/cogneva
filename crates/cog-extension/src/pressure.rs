@@ -258,6 +258,11 @@ pub fn record_placement(placement: &Placement) {
 pub struct Ledger {
     open_bytes: AtomicU64,
     open_count: AtomicU64,
+    /// Work parked until room frees, right now. It is part of the queue this
+    /// replica reports outward: a replica whose commands are all waiting for
+    /// room is not idle, and a scaler that could not see them would read a
+    /// full replica as an empty one.
+    waiting: AtomicU64,
     notify: tokio::sync::Notify,
 }
 
@@ -266,9 +271,11 @@ impl Ledger {
         let ledger = Arc::new(Self {
             open_bytes: AtomicU64::new(0),
             open_count: AtomicU64::new(0),
+            waiting: AtomicU64::new(0),
             notify: tokio::sync::Notify::new(),
         });
         metrics().reservations_open.set(0);
+        metrics().waiting.set(0);
         ledger
     }
 
@@ -278,6 +285,24 @@ impl Ledger {
 
     pub fn open_count(&self) -> u64 {
         self.open_count.load(Ordering::Relaxed)
+    }
+
+    /// How many callers are parked waiting for room on this replica.
+    pub fn waiting_count(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed) as usize
+    }
+
+    fn begin_wait(self: &Arc<Self>) -> Waiting {
+        let count = self.waiting.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics().waiting.set(count as i64);
+        Waiting {
+            ledger: Arc::clone(self),
+        }
+    }
+
+    fn end_wait(&self) {
+        let left = self.waiting.fetch_sub(1, Ordering::Relaxed) - 1;
+        metrics().waiting.set(left as i64);
     }
 
     /// Claim `bytes` of room until the returned reservation is dropped.
@@ -298,6 +323,19 @@ impl Ledger {
         // Room just became free: whoever is queued for it should look again,
         // and whoever is about to plan should plan against the smaller figure.
         self.notify.notify_waiters();
+    }
+}
+
+/// One caller parked until room frees. Dropped on every way out of the wait --
+/// admitted, refused, or answered unmeasured -- so the count can only move
+/// while a caller is actually parked.
+struct Waiting {
+    ledger: Arc<Ledger>,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.ledger.end_wait();
     }
 }
 
@@ -370,6 +408,10 @@ where
     F: Fn() -> bool,
 {
     let started = std::time::Instant::now();
+    // Registered on the first verdict that finds no room, and dropped on the
+    // way out whichever way that is: this replica's outward queue has to count
+    // work parked here, or a scaler reads "all of it waiting" as "nothing to do".
+    let mut waiting: Option<Waiting> = None;
     loop {
         let here = pressure(ledger.reserved_bytes());
         publish_pressure(&here, demand);
@@ -390,6 +432,7 @@ where
                 });
             }
             Admission::Queued => {
+                waiting.get_or_insert_with(|| ledger.begin_wait());
                 let until_the_window =
                     window.map(|window| window.saturating_sub(started.elapsed()));
                 if matches!(until_the_window, Some(left) if left.is_zero()) {
@@ -438,6 +481,7 @@ struct Metrics {
     admission: IntCounterVec,
     placement: IntCounterVec,
     reservations_open: IntGauge,
+    waiting: IntGauge,
     headroom: IntGauge,
     demand: IntGauge,
 }
@@ -468,6 +512,11 @@ fn metrics() -> &'static Metrics {
             "Pieces of work holding room they claimed when they were admitted",
         )
         .expect("static metric name");
+        let waiting = IntGauge::new(
+            "sandbox_command_waiting",
+            "Commands parked on this replica because the room they are priced at is not free",
+        )
+        .expect("static metric name");
         let headroom = IntGauge::new(
             "sandbox_pressure_headroom_bytes",
             "Room left on this replica after its working set and the reservations held against it",
@@ -493,6 +542,7 @@ fn metrics() -> &'static Metrics {
             Box::new(admission.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(placement.clone()),
             Box::new(reservations_open.clone()),
+            Box::new(waiting.clone()),
             Box::new(headroom.clone()),
             Box::new(demand.clone()),
         ] {
@@ -505,6 +555,7 @@ fn metrics() -> &'static Metrics {
             admission,
             placement,
             reservations_open,
+            waiting,
             headroom,
             demand,
         }
@@ -686,10 +737,16 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!waiting.is_finished(), "started while the room was taken");
+        assert_eq!(
+            ledger.waiting_count(),
+            1,
+            "一条被余量挡住的命令必须出现在这副副本对外的队里，否则扩缩读不懂「在看它等」"
+        );
 
         drop(held);
         let admitted = waiting.await.unwrap().expect("the room came back");
         assert!(matches!(admitted.state(), Admission::Admitted { .. }));
+        assert_eq!(ledger.waiting_count(), 0, "放行之后不再是等待者");
         assert_eq!(
             ledger.reserved_bytes(),
             2 * GIB,
@@ -747,6 +804,7 @@ mod tests {
             text.contains("sandbox_command_reservation_open 1"),
             "{text}"
         );
+        assert!(text.contains("sandbox_command_waiting 0"), "{text}");
         drop(held);
         assert!(render().contains("sandbox_command_reservation_open 0"));
     }

@@ -1745,6 +1745,12 @@ pub fn build_lane_fairness(lane: &BuildLane) -> cog_core::BuildLaneReading {
     order.sort_by_key(|(served, ticket, _)| (*served, *ticket));
     cog_core::BuildLaneReading {
         capacity: Some(capacity),
+        // 同一个对外读数里既有编译位子的队，也有按余量算的队：扩缩、界面都读
+        // 这一份，不另开第二个「这副副本忙不忙」的信号。
+        room: Some(cog_core::RoomQueue {
+            running: lane.pressure_ledger.open_count() as usize,
+            waiting: lane.pressure_ledger.waiting_count(),
+        }),
         holding: state
             .holding
             .iter()
@@ -2926,6 +2932,57 @@ mod tests {
             "被拒时的名次是一条读数：{rendered}"
         );
         drop(b_wait);
+    }
+
+    /// 一副副本对外的读数里既有编译位子的队，也有按余量算的队：在跑的命令与
+    /// 在等余量的命令各算一份。只报编译位子，一副挡着命令的副本会被扩缩读成
+    /// 闲着——而它把工作挡住，正是「该加副本」的读数。
+    #[tokio::test]
+    async fn the_lane_reading_carries_commands_waiting_for_room() {
+        const GIB: u64 = 1 << 30;
+        let ledger = pressure::Ledger::new();
+        let lane = BuildLane::new(None, Arc::new(CommandMetrics::new()), Arc::clone(&ledger));
+        let demand = pressure::Demand::from_samples(&[8 * GIB]);
+        let parked = {
+            let ledger = Arc::clone(&ledger);
+            tokio::spawn(async move {
+                pressure::wait_for_admission(
+                    &ledger,
+                    |reserved| Pressure::new(Some(8 * GIB), Some(GIB), reserved),
+                    &demand,
+                    || true,
+                    None,
+                )
+                .await
+            })
+        };
+        for _ in 0..200 {
+            if ledger.waiting_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let held = ledger.reserve(GIB);
+        let reading = build_lane_fairness(&lane);
+        assert_eq!(
+            reading.room,
+            Some(cog_core::RoomQueue {
+                running: 1,
+                waiting: 1
+            }),
+            "在跑一位、在等一位：{reading:?}"
+        );
+        drop(held);
+        parked.abort();
+        let _ = parked.await;
+        assert_eq!(
+            build_lane_fairness(&lane).room,
+            Some(cog_core::RoomQueue {
+                running: 0,
+                waiting: 0
+            }),
+            "没人跑也没人等时这一格是量到的零"
+        );
     }
 
     /// `/lane` 是执行器把队摆出来的那一面：编排侧与界面读的是这一份，而不是自己排一条队
