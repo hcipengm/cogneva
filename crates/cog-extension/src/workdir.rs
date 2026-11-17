@@ -654,6 +654,15 @@ pub struct WorkdirMetrics {
     registry: Registry,
     workspaces: Gauge,
     gc_reclaimed: Counter,
+    /// The same removals, split by why they happened. The total alone reads
+    /// "the volume is losing trees" and nothing about the reason: a TTL reap is
+    /// the pass doing its job on a tree nobody needs, while a cap reap is the
+    /// volume forcing the pass to choose -- and choosing is where work gets
+    /// lost. Both kinds are also counted separately where they are decided
+    /// (kept, deferred, took-uncommitted), and those counters answer different
+    /// questions; this pair is the one that says which path removed the tree.
+    ttl_reclaimed: Counter,
+    cap_reclaimed: Counter,
     /// Idle trees a pass walked past because they still hold uncommitted work.
     /// Without it, "the pass finds nothing to do" and "the pass finds trees it
     /// must not touch" read the same on the volume-usage series, and the second
@@ -721,6 +730,14 @@ impl WorkdirMetrics {
             "sandbox_workspace_gc_reclaimed_total",
             "Task worktrees removed by TTL/LRU garbage collection",
         )?;
+        let ttl_reclaimed = Counter::new(
+            "sandbox_workspace_ttl_reclaimed_total",
+            "Task worktrees removed because nothing had touched them past the TTL",
+        )?;
+        let cap_reclaimed = Counter::new(
+            "sandbox_workspace_cap_reclaimed_total",
+            "Task worktrees removed to hold the volume cap",
+        )?;
         let gc_kept = Counter::new(
             "sandbox_workspace_gc_kept_total",
             "Idle task worktrees left in place because they hold uncommitted work",
@@ -769,6 +786,8 @@ impl WorkdirMetrics {
         )?;
         registry.register(Box::new(workspaces.clone()))?;
         registry.register(Box::new(gc_reclaimed.clone()))?;
+        registry.register(Box::new(ttl_reclaimed.clone()))?;
+        registry.register(Box::new(cap_reclaimed.clone()))?;
         registry.register(Box::new(gc_kept.clone()))?;
         registry.register(Box::new(cap_deferred.clone()))?;
         registry.register(Box::new(cap_took_uncommitted.clone()))?;
@@ -872,6 +891,8 @@ impl WorkdirMetrics {
             registry,
             workspaces,
             gc_reclaimed,
+            ttl_reclaimed,
+            cap_reclaimed,
             gc_kept,
             cap_deferred,
             cap_took_uncommitted,
@@ -1055,6 +1076,16 @@ pub struct WorkdirRouter {
     /// is the cost the pool removes from the request path, and it is what the
     /// rate is multiplied by.
     checkout_millis: std::sync::Mutex<VecDeque<u64>>,
+}
+
+/// Why a tree was removed. The two passes answer different questions -- the
+/// TTL asks whether anybody still needs the tree, the cap asks whether the
+/// volume can hold it -- and a removal that cannot say which one it was reads
+/// the same either way, so the next pass cannot be tuned from the reading.
+#[derive(Clone, Copy)]
+enum Reap {
+    Ttl,
+    Cap,
 }
 
 impl WorkdirRouter {
@@ -1959,7 +1990,7 @@ impl WorkdirRouter {
                 info!(task_id = %id, "reclaiming idle task worktree (TTL expired)");
                 self.force_remove(path).await;
                 self.remove_meta(id);
-                self.metrics.gc_reclaimed.inc();
+                self.record_reap(Reap::Ttl);
                 reclaimed += 1;
             }
         }
@@ -1983,6 +2014,17 @@ impl WorkdirRouter {
     /// the next arrivals would spend it twice. That is also what gives the pool
     /// its reservation -- a task creation at the ceiling reclaims enough to
     /// leave the pool's slots standing.
+    /// One tree is gone, and the reading says which pass removed it. The total
+    /// and the reason move together here, so one of them cannot be right while
+    /// the other is wrong.
+    fn record_reap(&self, why: Reap) {
+        self.metrics.gc_reclaimed.inc();
+        match why {
+            Reap::Ttl => self.metrics.ttl_reclaimed.inc(),
+            Reap::Cap => self.metrics.cap_reclaimed.inc(),
+        }
+    }
+
     async fn enforce_cap(&self, incoming: usize) {
         let mut trees = self.list_task_trees().await;
         let warm = self.warm_slots().await.len();
@@ -2046,7 +2088,7 @@ impl WorkdirRouter {
             warn!(task_id = %id, cap = max, "reclaiming task worktree (LRU cap)");
             self.force_remove(&path).await;
             self.remove_meta(&id);
-            self.metrics.gc_reclaimed.inc();
+            self.record_reap(Reap::Cap);
             remaining -= 1;
         }
         for (id, path) in holding_work {
@@ -2060,7 +2102,7 @@ impl WorkdirRouter {
             );
             self.force_remove(&path).await;
             self.remove_meta(&id);
-            self.metrics.gc_reclaimed.inc();
+            self.record_reap(Reap::Cap);
             self.metrics.cap_took_uncommitted.inc();
             took_uncommitted += 1;
             remaining -= 1;
@@ -4028,6 +4070,12 @@ pub(crate) mod tests {
         assert!(!path.exists());
         assert!(!meta.exists());
         assert_eq!(r.list_task_trees().await.len(), 0);
+        assert_eq!(
+            r.metrics.ttl_reclaimed.get(),
+            1.0,
+            "the removal did not say it was the TTL that did it"
+        );
+        assert_eq!(r.metrics.cap_reclaimed.get(), 0.0, "the cap did not run");
     }
 
     #[tokio::test]
@@ -4046,6 +4094,8 @@ pub(crate) mod tests {
         assert!(ids.contains(&"mid".to_string()), "{ids:?}");
         assert!(ids.contains(&"new".to_string()), "{ids:?}");
         assert!(!ids.contains(&"old".to_string()));
+        assert_eq!(r.metrics.cap_reclaimed.get(), 1.0, "{ids:?}");
+        assert_eq!(r.metrics.ttl_reclaimed.get(), 0.0, "{ids:?}");
     }
 
     /// A tree with a command running in it is in use, and the cap's own policy
@@ -4148,6 +4198,7 @@ pub(crate) mod tests {
 
         assert!(!only.exists(), "the cap did not hold");
         assert_eq!(r.metrics.gc_reclaimed.get(), 1.0);
+        assert_eq!(r.metrics.cap_reclaimed.get(), 1.0);
         assert_eq!(
             r.metrics.cap_took_uncommitted.get(),
             1.0,
