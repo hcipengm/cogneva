@@ -930,9 +930,7 @@ impl SelfReviewLoop {
         // the only part an upstream's prefix cache can reuse.
         let instruction = Message::system(
             "Rewrite the original text so that it answers every point in the critique and \
-             the suggestions, keeping every part the critique does not object to. Answer with \
-             the revised text only: no preamble, no markdown fences, no commentary about the \
-             change.",
+             the suggestions, keeping every part the critique does not object to.",
         );
 
         let response = llm.chat(&[instruction, user_msg], &options).await?;
@@ -943,7 +941,7 @@ impl SelfReviewLoop {
         if let Some(reason) = response.error_message.as_deref() {
             return Err(SFError::LLM(format!("self-review revise failed: {reason}")));
         }
-        let revised = extract_text(&response);
+        let revised = unwrap_fence_added_by_the_rewrite(&extract_text(&response), original);
         // The same guarantee for a provider that succeeded without producing
         // anything: no revision is not an empty revision.
         if revised.trim().is_empty() {
@@ -970,12 +968,73 @@ fn stamp(options: ChatOptions, actor: &str, task: Option<&str>) -> ChatOptions {
 
 /// Extract plain text from a ChatResponse.
 fn extract_text(response: &ChatResponse) -> String {
-    response
+    let text = response
         .content
         .iter()
         .filter_map(|b| b.as_text())
         .collect::<Vec<_>>()
-        .join("")
+        .join("");
+    text
+}
+
+/// 改写自己加上去的围栏拆掉；原文本本来就有的围栏留着。
+fn unwrap_fence_added_by_the_rewrite(revised: &str, original: &str) -> String {
+    if original.trim_start().starts_with("```") {
+        // 原文就是一段代码，改写把它再包一层是它在引用，不是在交付。
+        return revised.to_string();
+    }
+    unwrap_fence(revised)
+}
+
+/// 整段被一条围栏包着时把它拆掉。
+///
+/// 拆在这里而不是要求模型别写围栏：那条要求没有任何东西检查，模型照写时调用方
+/// 拿到的是「```……```」而不是正文，而两者都是非空字符串——把围栏当正文应用下去，
+/// 坏掉的是被改写的那份东西。只在整段就是一条围栏时拆，正文里本来就有的围栏不动。
+fn unwrap_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return text.to_string();
+    };
+    let Some(body) = rest.strip_suffix("```") else {
+        return text.to_string();
+    };
+    match body.split_once('\n') {
+        // 第一行是语言标注，或什么都没有；正文从换行之后开始。
+        Some((tag, inner)) if !tag.contains('`') => inner.trim_end().to_string(),
+        _ => text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::{unwrap_fence, unwrap_fence_added_by_the_rewrite};
+
+    /// 围栏当正文交回去，改写的调用方会把「```」写进被改的那份东西里。
+    #[test]
+    fn a_body_wrapped_in_one_fence_is_unwrapped() {
+        assert_eq!(unwrap_fence("```\nfn main() {}\n```"), "fn main() {}");
+        assert_eq!(unwrap_fence("```rust\nlet a = 1;\n```"), "let a = 1;");
+        assert_eq!(unwrap_fence("plain text"), "plain text");
+        // 只开不关的不是一段被包起来的正文，不动。
+        assert_eq!(unwrap_fence("```\na\n```\nb"), "```\na\n```\nb");
+        assert_eq!(unwrap_fence("```a```"), "```a```");
+        assert_eq!(unwrap_fence("```\n```rust\nlet a = 1;\n```\n```"), "```rust\nlet a = 1;\n```");
+    }
+
+    /// 原文本身就是一段代码时，围栏是原文的一部分。
+    #[test]
+    fn a_fence_the_original_already_had_is_left_alone() {
+        let original = "```rust\nlet a = 1;\n```";
+        assert_eq!(
+            unwrap_fence_added_by_the_rewrite("```rust\nlet a = 2;\n```", original),
+            "```rust\nlet a = 2;\n```"
+        );
+        assert_eq!(
+            unwrap_fence_added_by_the_rewrite("```\nlet a = 2;\n```", "let a = 1;"),
+            "let a = 2;"
+        );
+    }
 }
 
 #[cfg(test)]
