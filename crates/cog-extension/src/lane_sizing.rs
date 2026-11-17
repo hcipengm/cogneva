@@ -34,16 +34,21 @@ use std::time::Duration;
 
 use crate::pressure::{Demand, Pressure};
 
-/// How many finished builds the cost figures are read from.
+/// How many finished events the price of the next one is read from.
 ///
-/// In builds rather than in seconds: a build is the event being priced, and
-/// builds arrive with the work, not with the clock. A figure read from a window
-/// this wide is current; one kept as a running maximum since the process
-/// started stops moving after the first large build and is a constant with a
-/// measurement's reputation.
-// cap: bound — 窗口宽度按编译次数定而不是按墙钟：一次编译是一个事件，编译随任务
-// 到达；更老的样本由新样本挤出去，所以「第一次大编译」不会永久定住这个数
-const WINDOW: usize = 32;
+/// In events rather than in seconds: a build, or a command, is the thing being
+/// priced, and both arrive with the work, not with the clock. A figure read
+/// from a window this wide is current; one kept as a running maximum since the
+/// process started stops moving after the first large event and is a constant
+/// with a measurement's reputation.
+///
+/// One width for both streams: the build lane's cost window and the command
+/// admission price answer the same shape of question -- "what was the worst of
+/// the recent few" -- and two copies of that answer drift the day one of them
+/// is widened. The stream being read is the caller's; the width is not.
+// cap: bound — 窗口宽度按事件次数定而不是按墙钟：一次编译、一条命令都是一个事件，
+// 都随任务到达；更老的样本由新样本挤出去，所以「第一次大事件」不会永久定住这个数
+pub(crate) const WINDOW: usize = 32;
 
 /// The name the deployment writes a lane count under.
 pub const BUILD_CONCURRENCY_ENV: &str = "COGNEVA_SANDBOX_BUILD_CONCURRENCY";

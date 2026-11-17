@@ -24,23 +24,16 @@ use prometheus::{Encoder, IntCounterVec, IntGauge, Registry, TextEncoder};
 
 use crate::runtime::cgroup::CgroupFacts;
 
-/// How often a waiter re-reads the container while it waits.
-///
-/// The same cadence the build lane samples the working set at, held once: a
-/// reading that moves over seconds does not need a tighter loop, and one loop
-/// running tighter than the other would only make the two disagree about the
-/// same container.
-// cap: bound — 采样间隔按「容器工作集在秒级移动」定
-pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-
 /// How many finished commands the price of one command is read from.
 ///
 /// In commands rather than in seconds: a command is the event being priced, and
 /// commands arrive with the work. A window rather than a running maximum, so a
 /// single heavy command stops pricing the container once it ages out; a maximum
 /// kept since the process started is a constant with a measurement's reputation.
-// cap: bound — 窗口宽度按命令次数定而不是按墙钟：更老的样本由新样本挤出去
-pub const DEMAND_WINDOW: usize = 32;
+///
+/// The width itself is the build lane's: one definition of "the recent few",
+/// read over two streams. See [`crate::lane_sizing`].
+pub(crate) use crate::lane_sizing::WINDOW as DEMAND_WINDOW;
 
 /// How much room one replica still has.
 ///
@@ -364,15 +357,21 @@ where
                         reservation: None,
                     });
                 }
-                // Wait for a reservation to be given back, or for the next
-                // look at the container -- whichever comes first, and never
-                // past the measured window when there is one.
-                let nap = until_the_window
-                    .map(|left| SAMPLE_INTERVAL.min(left))
-                    .unwrap_or(SAMPLE_INTERVAL);
-                tokio::select! {
-                    _ = ledger.notify.notified() => {}
-                    _ = tokio::time::sleep(nap) => {}
+                // Wait for a reservation to be given back, or until the
+                // measured window runs out -- whichever comes first. There is
+                // no separate sampling cadence: only two things can change the
+                // answer, and both already have a wake-up. Room comes back by
+                // a reservation being dropped, which notifies; the deadline is
+                // the window the caller measured. A number for "how often to
+                // look" would be a third wake-up source with nothing behind it.
+                match until_the_window {
+                    Some(left) => {
+                        tokio::select! {
+                            _ = ledger.notify.notified() => {}
+                            _ = tokio::time::sleep(left) => {}
+                        }
+                    }
+                    None => ledger.notify.notified().await,
                 }
             }
         }
