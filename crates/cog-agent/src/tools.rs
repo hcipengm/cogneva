@@ -371,10 +371,10 @@ impl ToolRegistry {
 
     /// 一条工具结果能占多少字符，与运行时裁剪用的是同一个函数。
     ///
-    /// 也是工具自己往回复里装东西时的一页：`read_file` 的一页、`grep` /
-    /// `glob` / `git_diff` 一次回多少，都由这一个数导出。工具那边另有一个
-    /// 「最多几行」「最多多少字节」的界时，同一件事就在树里有两份来源。
-    pub fn page_chars(&self) -> usize {
+    /// 只有 `read_file` 用它：分页是给调用方的把手（`offset` / `limit` /
+    /// `has_more`），不是一次截断。搜索、glob、diff 不在工具里截，整份答案
+    /// 交给运行时——那里会把超出的一页归档成引用再裁。
+    fn page_chars(&self) -> usize {
         crate::context::tool_result_budget_chars(self.context_window_size)
     }
 
@@ -1118,7 +1118,6 @@ mod tests {
                 web_search_fallback_base: Some("http://gateway:8081/search-fallback".into()),
                 web_fetch_base: Some("http://render:11235".into()),
                 sandbox_backend: None,
-                page_chars: registry.page_chars(),
             },
         );
         let tool = registry.get("web_fetch").expect("web_fetch is a built-in");
@@ -1836,17 +1835,17 @@ mod tests {
                 web_search_fallback_base: None,
                 web_fetch_base: None,
                 sandbox_backend: None,
-                page_chars: registry.page_chars(),
             },
         );
         let measured = tool_payload_bytes(&registry.list());
-        // cap: derived — 由树上的工具面现算（2026-11-17 实测 13713）；删除时跟着降，
+        // cap: derived — 由树上的工具面现算（2026-11-17 实测 13647）；删除时跟着降，
         // 往上抬要在提交信息里说明新增的是哪一段、凭什么非有不可。13767 → 13729
         // 是删掉了搜索、抓取、raw_fetch、await_task 在本地的默认值和上限（四句话里
         // 各有一个数）；13729 → 13716 是批量读的条数上限随 `maxItems` 一起消失；
         // 13716 → 13713 是搜索与 diff 的截断改由「一页」导出，说明里那句
-        // 「the cap」换成了它实际是哪个界。
-        const BUDGET: usize = 13_713;
+        // 「the cap」换成了它实际是哪个界；13713 → 13647 是工具侧不再截断，
+        // 搜索与 diff 说明里那两句「一页装不下就回 truncated」随之一并删掉。
+        const BUDGET: usize = 13_647;
         assert!(
             measured <= BUDGET,
             "the model now pays {measured} bytes per turn for tool signatures; the budget \
@@ -3332,10 +3331,6 @@ pub mod builtins {
         /// because "this process has no checkout" and "there is no search"
         /// call for different repairs.
         pub sandbox_backend: Option<Arc<dyn SandboxBackend>>,
-        /// 一页工具结果的字符预算，供树读工具（search、grep、glob、git_diff）
-        /// 把答案收进一页。调用方从 `ToolRegistry::page_chars()` 取——那是
-        /// 运行时裁进上下文用的同一个函数算出来的数，不在这里再拍一个。
-        pub page_chars: usize,
     }
 
     /// Register every built-in tool into `registry`.
@@ -3358,8 +3353,7 @@ pub mod builtins {
         // 读树与改树的工具：它们与 `run_command` 共用同一个执行器与同一份身份
         // （agent id 选树），所以答案来自调用者自己那棵树，而不是本进程脚下的
         // 一份源码。后端缺席时照常注册、调用时报出缺的那一层。
-        let sandbox =
-            SandboxTools::new(inputs.sandbox_backend.clone()).with_page_chars(inputs.page_chars);
+        let sandbox = SandboxTools::new(inputs.sandbox_backend.clone());
         cog_core::ToolRegistry::register(registry, search_code(sandbox.clone()));
         cog_core::ToolRegistry::register(registry, grep(sandbox.clone()));
         cog_core::ToolRegistry::register(registry, glob(sandbox.clone()));
@@ -4713,28 +4707,11 @@ pub mod builtins {
     #[derive(Clone)]
     pub struct SandboxTools {
         backend: Option<Arc<dyn SandboxBackend>>,
-        /// 这些工具一次能回多少字符的一页，与 `read_file` 的一页同源
-        /// （[`crate::context::tool_result_budget_chars`]）：工具这边另存一个
-        /// 「一次最多几行」的界时，同一件事就有两份来源，窗口调大它不跟着动。
-        page_chars: usize,
     }
 
     impl SandboxTools {
         pub fn new(backend: Option<Arc<dyn SandboxBackend>>) -> Self {
-            Self {
-                backend,
-                // 与 `ToolRegistry::new()` 同一个缺省：嵌入运行与测试没有一份
-                // 进程级配置可读，缺省窗口正是它们实际在用的那个。
-                page_chars: crate::context::tool_result_budget_chars(
-                    crate::AgentLoopConfig::default().context_window_size,
-                ),
-            }
-        }
-
-        /// 一页的字符预算由服务这张表的窗口导出，不在这里另拍一个数。
-        pub fn with_page_chars(mut self, page_chars: usize) -> Self {
-            self.page_chars = page_chars;
-            self
+            Self { backend }
         }
     }
 
@@ -4803,99 +4780,26 @@ pub mod builtins {
 
     /// 调用方自己说的一次要几条；没说就是不设条数界。
     ///
-    /// 平台不替它拍一个条数上限：能回多少由一页装得下多少决定
-    /// （[`fit_entries`]），再往上由运行时把整条结果裁进窗口。调用方说
-    /// 「只要这么多」时照办——那是一个具体的请求，不是平台替它做的决定。
+    /// 平台不替它拍一个条数上限：能回多少由运行时把整条结果裁进窗口那一步
+    /// 决定（并归档全文、给出引用）。调用方说「只要这么多」时照办——那是一个
+    /// 具体的请求，不是平台替它做的决定。
     fn asked_entries(args: &serde_json::Value) -> Option<usize> {
         args.get("max_results")
             .and_then(|v| v.as_u64())
             .map(|n| (n as usize).max(1))
     }
 
-    /// 把一串条目装进一页，返回「还有没装下的」。
+    /// 拼一条 `grep -rnI` 命令。
     ///
-    /// 一页多大由 [`SandboxTools::page_chars`] 给出，与 `read_file` 的一页、
-    /// 运行时把一条结果裁进上下文的预算是同一个数
-    /// （[`crate::context::tool_result_budget_chars`]）。量的是真正要发出去的
-    /// 那条 JSON：信封（字段名、标点、`workdir`、stderr）先扣掉，剩下的按条目
-    /// 逐个扣——转义算在里面，所以读的人不会收到一条被运行时从中间砍断的
-    /// JSON。条目按原序留；第一条就装不下也留它一条，空列表读起来是
-    /// 「没有匹配」，与「有，但一页放不下」是两件相反的事——那种一条就超页的
-    /// 极端情形仍由运行时再裁一次（并归档全文），`truncated` 两处都说得出。
-    fn fit_entries(
-        out: &mut serde_json::Value,
-        field: &str,
-        entries: Vec<serde_json::Value>,
-        page_chars: usize,
-    ) -> bool {
-        let total = entries.len();
-        out[field] = serde_json::json!([]);
-        let envelope = serde_json::to_string(&*out)
-            .map(|s| s.chars().count())
-            .unwrap_or(0);
-        let mut budget = page_chars.saturating_sub(envelope);
-        let mut kept = Vec::with_capacity(total);
-        for entry in entries {
-            // 条目之间的那个逗号也算进它的开销，最后一条多算一个，安全的一侧。
-            let cost = serde_json::to_string(&entry)
-                .map(|s| s.chars().count())
-                .unwrap_or(0)
-                + 1;
-            if !kept.is_empty() && cost > budget {
-                break;
-            }
-            budget = budget.saturating_sub(cost);
-            kept.push(entry);
-        }
-        let cut = kept.len() < total;
-        out[field] = serde_json::Value::Array(kept);
-        cut
-    }
-
-    /// 把一个文本字段收到一页以内，返回有没有收。
-    ///
-    /// 与 [`fit_entries`] 同源，只是字段是一段原文。不按「原文长度减信封」
-    /// 直接切：发出去的是转义后的 JSON，换行与引号各占两个字符，按前缀猜
-    /// 比例会估小，结果仍要由运行时再砍一次——而那次砍是切字符串，切完不是
-    /// 合法 JSON。所以每收一次就按答案的真实大小再量一次；每次至少少一个
-    /// 字符，循环一定停。
-    fn fit_text_field(out: &mut serde_json::Value, field: &str, page_chars: usize) -> bool {
-        let mut cut = false;
-        loop {
-            let size = match serde_json::to_string(&*out) {
-                Ok(s) => s.chars().count(),
-                Err(_) => return cut,
-            };
-            if size <= page_chars {
-                return cut;
-            }
-            let Some(text) = out.get(field).and_then(|v| v.as_str()) else {
-                return cut;
-            };
-            let len = text.chars().count();
-            if len == 0 {
-                return cut;
-            }
-            let keep = (len.saturating_mul(page_chars) / size).min(len - 1);
-            let shorter: String = text.chars().take(keep).collect();
-            out[field] = serde_json::json!(shorter);
-            cut = true;
-        }
-    }
-
-    /// 拼一条 `grep -rnI` 命令，在原文这一侧截到 `max_chars`。
-    ///
-    /// 这一截不是「条数界」，是一页的字节上界：匹配再多，回来的也不会超过
-    /// 一页，进程内存与下面那条 JSON 的大小都跟着一页走。截断本身仍然要说
-    /// 出来——原文被截与「只有这么多匹配」是两件事，回复里的 `truncated`
-    /// 分得开。
+    /// 命令里不接 `head`：截断只有一个地方做——运行时把结果裁进上下文那一
+    /// 步，它同时把全文归档成一条引用。工具这边先截一刀，被截掉的尾部就
+    /// 再也没人见过，归档到的也只是截过的那份。
     fn grep_command(
         pattern: &str,
         path: &str,
         include: Option<&str>,
         fixed: bool,
         ignore_case: bool,
-        max_chars: usize,
     ) -> String {
         // `.git` 是仓库自己的账本，不是这棵树的内容：搜进去只会把配置、日志
         // 与最近一次提交说明混进结果里。
@@ -4910,7 +4814,6 @@ pub mod builtins {
             command.push_str(&format!(" --include={}", sh_quote(include)));
         }
         command.push_str(&format!(" -e {} -- {}", sh_quote(pattern), sh_quote(path)));
-        command.push_str(&format!(" | head -c {max_chars}"));
         command
     }
 
@@ -4944,8 +4847,8 @@ pub mod builtins {
             name: "grep".into(),
             description: "Search the files under the checkout for a regular expression and get \
                           the matching lines back as `path:line:text`, the shape `grep -rn` \
-                          prints. Binary files and `.git` are skipped. Long result sets stop at \
-                          one page and say `truncated: true`."
+                          prints. Binary files and `.git` are skipped. `max_results` caps the \
+                          lines; without it the whole result comes back."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -4988,36 +4891,29 @@ pub mod builtins {
                     let include = args["include"].as_str();
                     let fixed = args["fixed"].as_bool().unwrap_or(false);
                     let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
-                    let page_chars = tools.page_chars;
-                    let command =
-                        grep_command(pattern, path, include, fixed, ignore_case, page_chars);
+                    let command = grep_command(pattern, path, include, fixed, ignore_case);
                     let reply = run_in_checkout(&tools, "grep", command).await?;
-                    // `head -c` 截在原文这一侧，最后一次可能停在一行中间。那
-                    // 不是一条匹配，是一行被截断的原文，丢掉；丢掉的这件事由
-                    // `truncated` 说。收在换行上时没有半行可丢。
-                    let cut_at_source = reply.stdout.len() >= page_chars;
                     let mut lines: Vec<&str> = reply.stdout.lines().collect();
-                    if cut_at_source && !reply.stdout.ends_with('\n') && !lines.is_empty() {
-                        lines.pop();
-                    }
-                    let mut truncated = cut_at_source;
+                    // 工具不截：整份答案原样交出去。超出一页的部分由运行时
+                    // 裁进上下文，先把全文归档、再在标记里给出引用——在工具这
+                    // 里先截一刀，被截掉的尾部就再也没人见过。
+                    let mut truncated = false;
                     if let Some(asked) = asked_entries(&args) {
                         if lines.len() > asked {
                             lines.truncate(asked);
                             truncated = true;
                         }
                     }
-                    let mut out = serde_json::json!({ "matches": [], "truncated": truncated });
+                    let mut out = serde_json::json!({
+                        "matches": lines,
+                        "truncated": truncated,
+                    });
                     if !reply.stderr.trim().is_empty() {
                         out["stderr"] = serde_json::json!(reply.stderr);
                     }
                     if let Some(workdir) = reply.workdir {
                         out["workdir"] = serde_json::json!(workdir);
                     }
-                    let entries: Vec<serde_json::Value> =
-                        lines.iter().map(|line| serde_json::json!(line)).collect();
-                    let cut = fit_entries(&mut out, "matches", entries, page_chars);
-                    out["truncated"] = serde_json::json!(truncated || cut);
                     Ok(out)
                 })
             })),
@@ -5063,16 +4959,11 @@ pub mod builtins {
                         .ok_or_else(|| SFError::Validation("query required".into()))?;
                     let path = args["path"].as_str().unwrap_or(".");
                     let include = args["include"].as_str();
-                    let page_chars = tools.page_chars;
-                    let command = grep_command(query, path, include, false, false, page_chars);
+                    let command = grep_command(query, path, include, false, false);
                     let reply = run_in_checkout(&tools, "search_code", command).await?;
-                    // 同上：截在原文这一侧，最后一次可能停在一行中间。
-                    let cut_at_source = reply.stdout.len() >= page_chars;
-                    let mut lines: Vec<&str> = reply.stdout.lines().collect();
-                    if cut_at_source && !reply.stdout.ends_with('\n') && !lines.is_empty() {
-                        lines.pop();
-                    }
-                    let mut truncated = cut_at_source;
+                    let lines: Vec<&str> = reply.stdout.lines().collect();
+                    // 同上：整份答案原样交出去，截断只由运行时那一步做。
+                    let mut truncated = false;
                     let mut matches: Vec<serde_json::Value> = lines
                         .iter()
                         .filter_map(|line| {
@@ -5090,15 +4981,16 @@ pub mod builtins {
                             truncated = true;
                         }
                     }
-                    let mut out = serde_json::json!({ "matches": [], "truncated": truncated });
+                    let mut out = serde_json::json!({
+                        "matches": matches,
+                        "truncated": truncated,
+                    });
                     if !reply.stderr.trim().is_empty() {
                         out["stderr"] = serde_json::json!(reply.stderr);
                     }
                     if let Some(workdir) = reply.workdir {
                         out["workdir"] = serde_json::json!(workdir);
                     }
-                    let cut = fit_entries(&mut out, "matches", matches, page_chars);
-                    out["truncated"] = serde_json::json!(truncated || cut);
                     Ok(out)
                 })
             })),
@@ -5208,14 +5100,13 @@ pub mod builtins {
                             truncated = true;
                         }
                     }
-                    let mut out = serde_json::json!({ "paths": [], "truncated": truncated });
+                    let mut out = serde_json::json!({
+                        "paths": paths,
+                        "truncated": truncated,
+                    });
                     if let Some(workdir) = reply.workdir {
                         out["workdir"] = serde_json::json!(workdir);
                     }
-                    let entries: Vec<serde_json::Value> =
-                        paths.iter().map(|path| serde_json::json!(path)).collect();
-                    let cut = fit_entries(&mut out, "paths", entries, tools.page_chars);
-                    out["truncated"] = serde_json::json!(truncated || cut);
                     Ok(out)
                 })
             })),
@@ -5261,8 +5152,7 @@ pub mod builtins {
             description: "Show what changed in the checkout as a unified diff. By default it \
                           compares the working tree to the last commit; set staged to show \
                           what a commit would record instead, and stat for the one-line-per-file \
-                          summary. A diff longer than one page comes back cut off and says \
-                          `truncated: true`."
+                          summary."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -5301,17 +5191,13 @@ pub mod builtins {
                             reply.stderr.trim()
                         )));
                     }
-                    // 先按一页收一次原文：`fit_text_field` 收完留下的原文本来
-                    // 就不会超过一页（转义后的 JSON 只会更长），所以这一刀不改变
-                    // 结果，只让上面那份输出不必先整份搬进 JSON 再收——一份很大的
-                    // diff 进来时，省下的是同样很大的一份拷贝。
-                    let diff: String = reply.stdout.chars().take(tools.page_chars).collect();
-                    let mut out = serde_json::json!({ "diff": diff, "truncated": false });
+                    // 整份 diff 原样交出去，不在工具里截：运行时会把超出一页
+                    // 的部分先归档成一条引用，再裁进上下文。工具先截一刀，被
+                    // 截掉的尾部就没有第二个人见过。
+                    let mut out = serde_json::json!({ "diff": reply.stdout });
                     if let Some(workdir) = reply.workdir {
                         out["workdir"] = serde_json::json!(workdir);
                     }
-                    let cut = fit_text_field(&mut out, "diff", tools.page_chars);
-                    out["truncated"] = serde_json::json!(cut);
                     Ok(out)
                 })
             })),
@@ -6395,79 +6281,64 @@ pub mod builtins {
             SandboxTools::new(Some(backend as Arc<dyn SandboxBackend>))
         }
 
-        /// `SandboxTools::new` 用的那一页：缺省窗口导出，与运行时裁剪同源。
-        fn tools_page_chars() -> usize {
-            crate::context::tool_result_budget_chars(
-                crate::AgentLoopConfig::default().context_window_size,
-            )
-        }
-
-        /// 一页装得下多少条，跟着页预算走：同一份结果集，页小回来的少、页大
-        /// 回来的多——这个数不是平台拍的，换输入它就跟着变。而且回来那条
-        /// JSON 自己就装得下一页，运行时不必再砍一次（再砍是切字符串，切完
-        /// 不是合法 JSON）。
+        /// 工具不替运行时截：整份答案原样交出去。
+        ///
+        /// 截断只有一个地方做——运行时把结果裁进上下文那一步，它先把全文归档
+        /// 成一条引用，再在标记里给出它。工具这边先截一刀，被截掉的尾部就再
+        /// 也没有人见过，归档到的也只是截过的那份。所以这条测试要的是「一条
+        /// 都不少」，以及命令拼出来的时候没有接 `head`。
         #[tokio::test]
-        async fn a_search_returns_as_much_as_one_page_holds() {
-            let script: String = (0..40)
-                .map(|i| format!("a.rs:{i}:{}\n", "x".repeat(60)))
+        async fn the_tree_tools_hand_the_whole_answer_to_the_runtime() {
+            let script: String = (0..500)
+                .map(|i| format!("a.rs:{i}:{}\n", "x".repeat(200)))
                 .collect();
-            async fn matches_for(page_chars: usize, script: &str) -> serde_json::Value {
-                let backend = Arc::new(Scripted::answering(script));
-                let registry = ToolRegistry::new();
-                cog_core::ToolRegistry::register(
-                    &registry,
-                    grep(tools(backend).with_page_chars(page_chars)),
-                );
-                registry
-                    .execute("grep", serde_json::json!({"pattern": "x"}))
-                    .await
-                    .expect("a scripted search answers")
-            }
-            let narrow = matches_for(400, &script).await;
-            let wide = matches_for(1000, &script).await;
-            let narrow_count = narrow["matches"].as_array().expect("a list").len();
-            let wide_count = wide["matches"].as_array().expect("a list").len();
-            assert!(narrow_count > 0, "{narrow}");
-            assert!(
-                wide_count > narrow_count,
-                "页大了回来的条数没跟着变：窄 {narrow_count}、宽 {wide_count}"
-            );
-            assert!(wide_count < 40, "40 条装不进一页：{wide}");
-            assert_eq!(narrow["truncated"], serde_json::json!(true));
-            for (page, reply) in [(400, &narrow), (1000, &wide)] {
-                assert!(
-                    serde_json::to_string(reply).unwrap().chars().count() <= page,
-                    "答案自己超过一页（{page}）：{reply}"
-                );
-            }
+            let backend = Arc::new(Scripted::answering(&script));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, grep(tools(backend.clone())));
+            let reply = registry
+                .execute("grep", serde_json::json!({"pattern": "x"}))
+                .await
+                .expect("a scripted search answers");
+            let matches = reply["matches"].as_array().expect("a list");
+            assert_eq!(matches.len(), 500, "工具把尾部截掉了");
+            assert_eq!(reply["truncated"], serde_json::json!(false));
+            let seen = backend.requests();
+            let (_, _, command) = &seen[0];
+            assert!(!command.contains("head"), "命令里不许接 head：{command}");
         }
 
-        /// 一份 diff 也收进同一页：从头部收，收掉的由 `truncated` 说，答案
-        /// 仍是能被解析的 JSON。
+        /// 调用方自己说要几条时才截：那是它提的请求，不是平台替它拍的界。
         #[tokio::test]
-        async fn a_diff_is_cut_to_one_page_and_stays_json() {
-            let diff: String = (0..80)
+        async fn only_the_caller_stated_count_cuts_the_answer() {
+            let script: String = (0..10).map(|i| format!("a.rs:{i}:x\n")).collect();
+            let backend = Arc::new(Scripted::answering(&script));
+            let registry = ToolRegistry::new();
+            cog_core::ToolRegistry::register(&registry, grep(tools(backend)));
+            let reply = registry
+                .execute(
+                    "grep",
+                    serde_json::json!({"pattern": "x", "max_results": 3}),
+                )
+                .await
+                .expect("a scripted search answers");
+            assert_eq!(reply["matches"].as_array().expect("a list").len(), 3);
+            assert_eq!(reply["truncated"], serde_json::json!(true));
+        }
+
+        /// 一份 diff 也整份回来：工具不切字符串，答案始终是能被解析的 JSON。
+        #[tokio::test]
+        async fn a_diff_comes_back_whole() {
+            let diff: String = (0..800)
                 .map(|i| format!("+line {i} {}\n", "y".repeat(50)))
                 .collect();
             let backend = Arc::new(Scripted::answering(&diff));
-            let page = 500;
             let registry = ToolRegistry::new();
-            cog_core::ToolRegistry::register(
-                &registry,
-                git_diff(tools(backend).with_page_chars(page)),
-            );
+            cog_core::ToolRegistry::register(&registry, git_diff(tools(backend)));
             let reply = registry
                 .execute("git_diff", serde_json::json!({}))
                 .await
                 .expect("a scripted diff answers");
-            assert_eq!(reply["truncated"], serde_json::json!(true));
-            let text = reply["diff"].as_str().expect("diff is a string");
-            assert!(text.len() < diff.len(), "{reply}");
-            assert!(text.starts_with("+line 0 "), "从头部收：{text}");
-            assert!(
-                serde_json::to_string(&reply).unwrap().chars().count() <= page,
-                "{reply}"
-            );
+            assert_eq!(reply["diff"].as_str().expect("diff is a string"), diff);
         }
 
         /// 一条匹配回成一个条目：文件、行号、那一行。三样都在，读的人才不必
@@ -6508,9 +6379,8 @@ pub mod builtins {
             assert_eq!(agent, "kai-a9ab11fc");
             assert!(command.contains("--include='*.rs'"), "{command}");
             assert!(command.contains("'fn search_code'"), "{command}");
-            // 命令这一侧截的是一页的字符预算，不是平台拍的条数。
-            let page = tools_page_chars();
-            assert!(command.contains(&format!("head -c {page}")), "{command}");
+            // 命令这一侧也不截：截断只由运行时那一步做，它同时归档全文。
+            assert!(!command.contains("head"), "{command}");
         }
 
         /// 树由执行者决定，任务号只做归属。

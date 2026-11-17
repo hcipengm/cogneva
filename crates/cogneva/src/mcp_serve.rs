@@ -83,8 +83,6 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
             // 树读工具在这个进程里也走执行器：MCP 客户端调 `grep`，读的是它自己
             // 那棵树（请求里带 agent id 时），而不是这个进程脚下的源码。
             sandbox_backend: Some(backend),
-            // 一页的预算与主进程同源：同一个窗口、同一个函数。
-            page_chars: registry.page_chars(),
         },
     );
 

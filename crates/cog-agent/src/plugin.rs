@@ -529,9 +529,6 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 // 的答案取决于调用者自己那棵树，在本进程跑就等于读一份与调用者
                 // 无关的源码。后端在交给注册表时克隆了一份，这里再拿一份。
                 sandbox_backend: Some(sandbox_backend.clone()),
-                // 树读工具（search、grep、glob、git_diff）把答案收进一页时用的
-                // 预算，与运行时裁进上下文的是同一个数。
-                page_chars: tool_registry.page_chars(),
             },
         );
         info!(
