@@ -119,6 +119,17 @@ rows:
       second copy would ingest the same rows again. Nothing measures query
       load on this store, so no loop moves this number.
 
+  - key: backends.postgres.maxConnections
+    source: fixed
+    why: >-
+      这一格是 PostgreSQL 服务端自己的上限，不是本平台施加给工作的界：它的唯一作用
+      是当分母，让存储插件按「同时在跑的进程数 × 每进程池数」分出每一池的额度。
+      今天的值来自一次实测（滚动期间 pg_stat_activity 到 100 就打满，新 Pod 连建表
+      都连不上），取峰值的一倍以盖住新旧两代同时在池里。它**还没有闭环**：闭环的
+      输入是「同时在跑的最大进程数」，那是一条进程普查读数，尚未接进这一格的计算，
+      所以现在标 fixed 而不是 derived——等那条读数接上，这一行改成 derived 并补一条
+      「换输入 ⇒ 值跟着变」的证明。
+
   - key: backends.postgres.replicas
     source: fixed
     why: >-

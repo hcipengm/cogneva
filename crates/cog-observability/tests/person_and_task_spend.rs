@@ -417,13 +417,16 @@ async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belon
         Some(&task_a),
     )
     .await;
-    // 花掉钱的一发不是拒绝，不许进这一列。花了就挂一件活（库内不变式）：挂的是
-    // task_a，它不改变「这一列只数拒绝」这条判据。
+    // 花掉钱的一发不是拒绝，不许进这一列。花了就挂一件活（库内不变式），但那件活
+    // 不能是这一族里的任何一件：工作区那条读只按 since 筛、不限上界，挂到 task_a
+    // 上会让这 90 个 token 落进 tenant_a 的当日格子，把它从 157 读成 247。所以挂一个
+    // 任务图里不存在的 id——它满足不变式，也不归属任何租户。
+    let unowned = format!("refusal-unowned-{run}");
     ledger_row(
         &pool,
         day + chrono::Duration::hours(5),
         Some(&person_a),
-        Some(&task_a),
+        Some(&unowned),
         90,
     )
     .await;
