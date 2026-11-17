@@ -52,6 +52,11 @@ spec:
             - timezone=Asia/Shanghai
             - -c
             - log_timezone=Asia/Shanghai
+            # 服务端连接上限：存储插件把它按进程与池数分出每一池的额度。滚动时新旧
+            # 两代 Pod 同时在池里，太小会让新 Pod 连建表都连不上（实测 2026-11-17：
+            # 100 打满，超级用户也进不去）。
+            - -c
+            - max_connections=200
           startupProbe:
             exec:
               command:

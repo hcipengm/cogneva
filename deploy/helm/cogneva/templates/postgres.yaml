@@ -50,6 +50,11 @@ spec:
             - timezone={{ .Values.global.timezone }}
             - -c
             - log_timezone={{ .Values.global.timezone }}
+            # 服务端连接上限：存储插件把它按进程与池数分出每一池的额度，所以它是那条
+            # 分配式的分母。滚动时新旧两代 Pod 同时在池里，值太小会让新 Pod 连建表都
+            # 连不上（实测 2026-11-17：100 打满，连超级用户也进不去）。
+            - -c
+            - max_connections={{ .Values.backends.postgres.maxConnections }}
           # timeoutSeconds 必须显式给：Kubernetes 默认 1 秒，而 pg_isready 在
           # checkpoint 或复制压力下会超过 1 秒——默认值下探针连续失败会判活失败
           # 并重启数据库，重启期间全部写入方（进化、triage、告警落盘）一起断。
