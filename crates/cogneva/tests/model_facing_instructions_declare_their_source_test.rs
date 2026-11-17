@@ -617,7 +617,7 @@ fn the_payload_reading_follows_the_text_on_the_tree() {
             "crates/x/src/y.rs".to_string(),
             production_numbered_lines_keeping_comments(body)
                 .into_iter()
-                .map(|(number, raw)| (number, raw.to_string(), strip(&raw, Dialect::Rust)))
+                .map(|(number, raw)| (number, raw.to_string(), strip(raw, Dialect::Rust)))
                 .collect(),
         )];
         let sites = vec![Site {
