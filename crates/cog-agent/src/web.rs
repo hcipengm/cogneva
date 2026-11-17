@@ -92,16 +92,6 @@ const RENDER_TIMEOUT_SECS: u64 = 60;
 /// one would keep an answer alive past the budget that produced it.
 const RENDER_CACHE_SECS: u64 = RENDER_TIMEOUT_SECS;
 
-/// How many times a page the backend failed on is asked for again.
-///
-/// A renderer answers 5xx when its own page budget ran out mid-render, which is
-/// what a cold browser on a heavy page looks like; the second attempt starts
-/// from a warm one and usually returns the page. Only a 5xx is repeated: a 4xx
-/// is a verdict about this URL and repeating it costs the caller the same wait
-/// for the same answer.
-// cap: bound — 同样是对这个 URL 的判断，重复它只让调用方为同一个答案再等一遍
-const RENDER_ATTEMPTS: u32 = 2;
-
 fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
@@ -934,36 +924,28 @@ async fn fetch_rendered(
         "c": render_cache_revision(SystemTime::now()),
     }))
     .map_err(SFError::Serialization)?;
-    let mut attempt = 0;
-    let resp = loop {
-        attempt += 1;
-        let mut req = HttpRequest::new("POST", endpoint.clone());
-        req.headers
-            .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
-        req.timeout_secs = Some(RENDER_TIMEOUT_SECS);
-        req.body = Some(body.clone());
-        let resp = client.execute(req).await.map_err(|e| {
-            SFError::Agent(format!(
-                "the rendering backend at {base} did not answer ({e}); the page was not read \
-                 in process instead, because this deployment asked for rendering"
-            ))
-        })?;
-        if (200..300).contains(&resp.status) {
-            break resp;
-        }
+    // 一次请求，不在工具里重问。上一版对 5xx 再问一次（浏览器冷启动、页面重时
+    // 常见），但那个「再问一次」是平台替调用方拍的一个数：调用方看到的是
+    // 「后端在 {base} 上以 HTTP 500 拒绝了这个 URL: …」，分清得出是渲染器自己
+    // 没跑完还是这一页读不到；要再试，是它再要一次，不是工具替它决定。
+    let mut req = HttpRequest::new("POST", endpoint.clone());
+    req.headers
+        .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
+    req.timeout_secs = Some(RENDER_TIMEOUT_SECS);
+    req.body = Some(body);
+    let resp = client.execute(req).await.map_err(|e| {
+        SFError::Agent(format!(
+            "the rendering backend at {base} did not answer ({e}); the page was not read \
+             in process instead, because this deployment asked for rendering"
+        ))
+    })?;
+    if !(200..300).contains(&resp.status) {
         let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), Some(300)).0;
-        if !(500..600).contains(&resp.status) || attempt >= RENDER_ATTEMPTS {
-            let tries = if attempt == 1 {
-                String::new()
-            } else {
-                format!(" on {attempt} attempts")
-            };
-            return Err(SFError::Agent(format!(
-                "the rendering backend at {base} refused {url} with HTTP {}{tries}: {detail}",
-                resp.status
-            )));
-        }
-    };
+        return Err(SFError::Agent(format!(
+            "the rendering backend at {base} refused {url} with HTTP {}: {detail}",
+            resp.status
+        )));
+    }
     let mut parsed: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
         SFError::Agent(format!(
             "the rendering backend at {base} answered non-JSON: {e}"
@@ -1473,9 +1455,12 @@ mod tests {
 
         let scripted = Scripted::answering(200, cog_core::CONTENT_TYPE_JSON, body);
         let tool = web_search(client_of(&scripted), Some("http://searx".into()));
-        call(&tool, serde_json::json!({"query": "rust 2024", "limit": 100}))
-            .await
-            .expect("a healthy backend answers");
+        call(
+            &tool,
+            serde_json::json!({"query": "rust 2024", "limit": 100}),
+        )
+        .await
+        .expect("a healthy backend answers");
         assert!(
             scripted.asked()[0].url.contains("limit=100"),
             "the caller's number is asked for as given, not clamped: {}",
@@ -2302,13 +2287,13 @@ mod tests {
         );
     }
 
-    /// A 5xx is the renderer failing on its own budget, and one more ask gets the
-    /// page. Without the retry the caller sees the failure the backend had
-    /// while its browser was cold and reads it as a page that cannot be fetched.
+    /// 渲染器答 5xx 就是它自己那一趟没跑完；工具问一次，把后端的话原样交给
+    /// 调用方，由它决定要不要再要一次。工具里存一个重试次数，就是替调用方拍
+    /// 了一个「几次算够」的数。
     #[tokio::test]
-    async fn a_render_the_backend_failed_on_is_asked_for_again() {
+    async fn a_render_the_backend_refused_is_reported_without_a_second_ask() {
         let scripted = Scripted::answering_in_order(vec![
-            (500, "text/plain", "render budget exhausted".into()),
+            (500u16, "text/plain", "render budget exhausted".to_string()),
             (
                 200,
                 cog_core::CONTENT_TYPE_JSON,
@@ -2324,44 +2309,20 @@ mod tests {
             client_of(&scripted),
             Some("http://render.invalid:11235".into()),
         );
-        let out = call(
-            &tool,
-            serde_json::json!({"url":"https://example.com/heavy"}),
-        )
-        .await
-        .expect("a page the backend failed on once is asked for again");
-        assert_eq!(
-            scripted.asked().len(),
-            2,
-            "the failure is repeated once, then the page comes back"
-        );
-        assert!(out["text"]
-            .as_str()
-            .unwrap()
-            .contains("rendered the second time"));
-    }
-
-    /// A page the backend keeps failing on carries how many times it was asked,
-    /// so a reader can tell a flaky renderer from a page that never renders.
-    #[tokio::test]
-    async fn a_render_that_keeps_failing_says_how_many_attempts_it_took() {
-        let failing = || (500u16, "text/plain", "render budget exhausted".to_string());
-        let scripted = Scripted::answering_in_order(vec![failing(), failing()]);
-        let tool = web_fetch(
-            client_of(&scripted),
-            Some("http://render.invalid:11235".into()),
-        );
         let err = call(
             &tool,
             serde_json::json!({"url":"https://example.com/heavy"}),
         )
         .await
-        .expect_err("two failures are still a failure");
+        .expect_err("a refused render comes back as a refusal");
+        assert_eq!(scripted.asked().len(), 1, "the tool asks once");
         let msg = err.to_string();
-        assert_eq!(scripted.asked().len(), 2, "the retry is bounded at two");
         assert!(
-            msg.contains("on 2 attempts") && msg.contains("render budget exhausted"),
-            "the error names the attempt count and the backend's own words: {msg}"
+            msg.contains("http://render.invalid:11235")
+                && msg.contains("HTTP 500")
+                && msg.contains("render budget exhausted"),
+            "the error names the backend, the status and the backend's own words, so a \
+             caller can tell a flaky renderer from a page that cannot be fetched: {msg}"
         );
     }
 
