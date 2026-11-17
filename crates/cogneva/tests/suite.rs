@@ -508,6 +508,8 @@ mod runtime_database_role_is_not_the_instance_superuser_test;
 mod runtime_roots_literals_contract_test;
 #[path = "rust_capacity_constants_registry_test.rs"]
 mod rust_capacity_constants_registry_test;
+#[path = "scale_is_a_reading_not_a_constant_test.rs"]
+mod scale_is_a_reading_not_a_constant_test;
 #[path = "scenes_hand_work_to_the_roster_test.rs"]
 mod scenes_hand_work_to_the_roster_test;
 #[path = "scrape_targets_name_a_port_the_workload_provides_test.rs"]
