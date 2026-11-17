@@ -11,9 +11,9 @@
 
 use std::path::Path;
 
-use common::rust_production::production_sources;
+use crate::common;
 
-mod common;
+use common::rust_production::production_sources;
 
 #[test]
 fn no_production_query_reads_into_the_payload() {
