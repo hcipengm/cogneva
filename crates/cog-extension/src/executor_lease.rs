@@ -191,6 +191,41 @@ impl LeaseBook {
             .map(|hold| hold.replica.as_str())
     }
 
+    /// Whether this book has ever placed the lane, whether or not its clock
+    /// has run out.
+    ///
+    /// A lapsed pin still names the replica whose volume the tree is on, so a
+    /// caller that has one must not go looking for the tree elsewhere; only a
+    /// book with no entry at all belongs to a driver that has not seen this
+    /// lane yet.
+    pub fn knows(&self, lane: &str) -> bool {
+        self.live.contains_key(lane)
+    }
+
+    /// Put a lane on a replica that has just said it holds the lane's tree.
+    ///
+    /// This is what a driver that has just started does with its empty book:
+    /// the tree outlives the process, and the replica that kept it answers for
+    /// it. Adopting is not a move -- nothing was left behind and nothing is
+    /// announced as missing; the replica's first frame still says whether the
+    /// tree it hands over is the existing one.
+    ///
+    /// A lane this book already placed keeps its pin: the existing answer is
+    /// about time and rotation, which this call has no business overriding.
+    pub fn adopt(&mut self, lane: &str, replica: &str, now: u64, ttl: u64) {
+        if self.live.contains_key(lane) {
+            return;
+        }
+        self.live.insert(
+            lane.to_string(),
+            Hold {
+                replica: replica.to_string(),
+                until: now.saturating_add(ttl),
+                abandoned: false,
+            },
+        );
+    }
+
     /// Give a lane up. Only the replica holding it can; a wrong replica's
     /// release would otherwise free a lane it never drove, and the next command
     /// on that lane would land on a tree without this caller's edits.
@@ -263,6 +298,32 @@ mod tests {
         assert_eq!(first.grant, Grant::Fresh);
         assert_eq!(second.grant, Grant::Extended);
         assert_eq!(first.replica, second.replica);
+    }
+
+    /// 客户端重启、这副账是空的：那副答「树在我这」的副本先被记下，之后这条
+    /// lane 的每次放置都回到它身上，而不是按轮转另找一副。
+    #[test]
+    fn an_adopted_lane_stays_on_the_replica_that_answered_for_it() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        assert!(!book.knows("agent-a"));
+        book.adopt("agent-a", &replicas[1], 1_000, TTL);
+        assert!(book.knows("agent-a"));
+        let first = book.pin("agent-a", &replicas, 1_010, TTL).unwrap();
+        assert_eq!(first.replica, replicas[1]);
+        assert_eq!(first.grant, Grant::Extended);
+    }
+
+    /// 已经记过一条 lane 的账不会被一次答话改写：那条 lane 的树在哪副，是
+    /// 时间与轮转算出来的，不是一次读目录说了算。
+    #[test]
+    fn adopting_a_lane_this_book_already_placed_changes_nothing() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let placed = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        book.adopt("agent-a", &replicas[0], 1_000, TTL);
+        let again = book.pin("agent-a", &replicas, 1_010, TTL).unwrap();
+        assert_eq!(again.replica, placed.replica);
     }
 
     #[test]

@@ -42,6 +42,15 @@ const RETRY_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 // cap: bound — 退避的粗粒度上界，再长就少试几次而已
 const RETRY_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 问「这副副本上有没有这条 lane 的树」最多等多久。
+///
+/// 这一问只发生在客户端刚起来、第一次碰到某条 lane 的时候：它手上没有钉子，
+/// 而树不随进程消失。问不到就当「没有」，按轮转落点——等得比这更久，等于把重启
+/// 后的第一条命令挂在一次读目录上；而问错一次的代价只是那条命令落在一棵新树上，
+/// 那副副本的第一帧会如实说出树是从哪来的。
+// cap: bound — 这一问是一次读目录，正常在毫秒级；2s 分的是「答得慢」与「答不上」，再长只是让重启后的第一条命令陪着等
+const TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The lane a request belongs to: the working tree it will run in.
 ///
 /// The same two names, in the same order, that the executor uses to pick a
@@ -471,6 +480,89 @@ impl RemoteExecutor {
     ///
     /// 返回是否搬成。没搬成不是这次命令该失败的理由：原副本连不上、已经没树、
     /// 树还在用，命令都照发，只是流里第一句要如实说没搬成。
+    /// A driver that has just started holds no pin for anything, but the tree
+    /// it was driving does not go away with the process: it lives on one
+    /// replica's volume, and that replica can still answer for it. Ask every
+    /// replica once for a lane this book has never placed and adopt the one
+    /// that says yes, so a restart lands on the tree instead of cutting a new
+    /// one and quietly leaving the work behind.
+    ///
+    /// Nothing is asked for a lane the book already has: a lapsed or abandoned
+    /// pin still names the replica whose volume the tree is on, and that is a
+    /// better answer than a directory read.
+    ///
+    /// Two replicas claiming the same lane is a state this design does not
+    /// produce (a lane is pinned by one caller); if it happens anyway, the
+    /// first by address is taken and the disagreement is logged rather than
+    /// silently resolved, because either choice leaves a tree behind.
+    async fn adopt_held_tree(&self, lane: &str, endpoints: &[String]) {
+        let already = {
+            let book = self
+                .lanes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            book.knows(lane)
+        };
+        if already {
+            return;
+        }
+        let answers = futures::future::join_all(endpoints.iter().map(|endpoint| async move {
+            (endpoint.clone(), self.tree_is_here(endpoint, lane).await)
+        }))
+        .await;
+        let mut holders: Vec<String> = answers
+            .into_iter()
+            .filter(|(_, answer)| *answer == Some(true))
+            .map(|(endpoint, _)| endpoint)
+            .collect();
+        holders.sort();
+        let Some(holder) = holders.first() else {
+            return;
+        };
+        if holders.len() > 1 {
+            tracing::warn!(
+                lane,
+                holders = ?holders,
+                "more than one replica says it holds this lane's tree; the first by address is \
+                 taken and the others keep a tree nobody will read"
+            );
+        }
+        let mut book = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        book.adopt(
+            lane,
+            holder,
+            (self.clock)(),
+            crate::executor_lease::LANE_LEASE_SECS,
+        );
+        tracing::info!(
+            lane,
+            replica = %holder,
+            "found the lane's tree on this replica and placed the lane there"
+        );
+    }
+
+    /// 这副副本有没有这条 lane 的树：`Some(true)` 有，`Some(false)` 没有，
+    /// `None` 问不到——问不到与「没有」是两件事，前者不能当成后者去改写落点。
+    async fn tree_is_here(&self, endpoint: &str, lane: &str) -> Option<bool> {
+        let url = format!("{}/worktree/has", endpoint.trim_end_matches('/'));
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("lane", lane)])
+            .timeout(TREE_PROBE_TIMEOUT)
+            .send()
+            .await
+            .ok()?;
+        match response.status().as_u16() {
+            200 => Some(true),
+            404 => Some(false),
+            _ => None,
+        }
+    }
+
     async fn carry_lane(&self, lane: &str, from: &str, to: &str) -> bool {
         let export = self
             .http
@@ -639,6 +731,11 @@ impl SandboxBackend for RemoteExecutor {
         }
         let lane = lane_of(req);
         let endpoints = self.endpoints_now().await?;
+        // 刚起来的客户端手上没有钉子：先问哪副副本上还有这条 lane 的树，
+        // 落到那副上，而不是轮转出一副、在那里另切一棵。
+        if let Some(lane) = lane.as_deref() {
+            self.adopt_held_tree(lane, &endpoints).await;
+        }
         let placement = self
             .endpoint_for(lane.as_deref(), &endpoints)
             .ok_or_else(|| {
@@ -916,18 +1013,22 @@ mod tests {
         let counter = hits.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            for _ in 0..requests {
+            let mut served = 0;
+            while served < requests {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let mut buf = vec![0u8; 4096];
                 let read = socket.read(&mut buf).await.unwrap_or(0);
                 if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    // 问树的问题不占命令额度：客户端刚起来时会先问一遍，
+                    // 假副本要像真副本那样答，而且这一问不是一条命令。
                     let _ = socket
                         .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
                         .await;
                     continue;
                 }
+                served += 1;
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let body = format!(
                     "{}\n{}\n",
@@ -945,6 +1046,101 @@ mod tests {
         (format!("http://{}", addr), hits)
     }
 
+    /// 这副副本对有树的 lane 怎么答。三种答案在客户端眼里是三件事：有、没有、
+    /// 问不出来；「问不出来」不能被读成「没有」。
+    #[derive(Clone, Copy)]
+    enum TreeAnswer {
+        Holds,
+        Empty,
+        Broken,
+    }
+
+    /// 一副会答「树在不在这副上」的副本，以及两条计数：跑了几条命令、被问了几次树。
+    ///
+    /// 问树的那几次不进命令额度：真副本上它是一次读目录，不是一条命令。
+    async fn serve_trees(
+        answer: TreeAnswer,
+        commands: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        serve_trees_on(listener, answer, commands)
+    }
+
+    /// 同 [`serve_trees`]，但监听器由调用方先建好：几条测试要先知道地址排序、
+    /// 再决定哪一副答哪种话，而「两个副本都说是自己」这类并列是按地址断的。
+    fn serve_trees_on(
+        listener: tokio::net::TcpListener,
+        answer: TreeAnswer,
+        commands: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let looks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let asked = looks.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut served = 0;
+            while served < commands {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                if asked_path(&buf[..read]).starts_with("/worktree/has") {
+                    asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = match answer {
+                        TreeAnswer::Holds => socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                  content-length: 30\r\n\r\n{\"lane\":\"agent-a\",\"tree\":true}",
+                            )
+                            .await,
+                        TreeAnswer::Empty => socket
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!",
+                            )
+                            .await,
+                        TreeAnswer::Broken => socket
+                            .write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 3\r\n\r\nbad",
+                            )
+                            .await,
+                    };
+                    continue;
+                }
+                if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .await;
+                    continue;
+                }
+                served += 1;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(&CommandEvent::Stdout { data: "ok".into() }).unwrap(),
+                    serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{}", addr), hits, looks)
+    }
+
     /// A replica that, like the executor, says which tree the command got
     /// before it answers -- or, with `None`, one whose version does not know
     /// to say it.
@@ -953,18 +1149,21 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            for _ in 0..requests {
+            let mut served = 0;
+            while served < requests {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let mut buf = vec![0u8; 4096];
                 let read = socket.read(&mut buf).await.unwrap_or(0);
                 if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    // 问树的问题不占命令额度，答法与真副本一致：没有就是 404。
                     let _ = socket
                         .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
                         .await;
                     continue;
                 }
+                served += 1;
                 let mut body = String::new();
                 if let Some(origin) = origin {
                     body.push_str(
@@ -1047,12 +1246,21 @@ mod tests {
         let seen = log.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            for _ in 0..requests {
+            let mut served = 0;
+            while served < requests {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let (head, body) = read_request(&mut socket).await;
                 let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                if path.starts_with("/worktree/has") {
+                    // 找树那一问不占额度：它问的不是「搬」，答法与真副本一致。
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .await;
+                    continue;
+                }
+                served += 1;
                 let response: Vec<u8> = if path.starts_with("/worktree/export") {
                     seen.lock().unwrap().handed_out = BUNDLE.to_vec();
                     let mut out = format!(
@@ -1107,12 +1315,21 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 4096];
-            let (mut first, _) = listener.accept().await.unwrap();
-            let _ = first.read(&mut buf).await;
-            let _ = first
-                .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
-                .await;
-            drop(first);
+            // 客户端刚起来时会先问树在哪副；这一问不是那次失败的尝试。
+            loop {
+                let (mut probe, _) = listener.accept().await.unwrap();
+                let read = probe.read(&mut buf).await.unwrap_or(0);
+                if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    let _ = probe
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .await;
+                    continue;
+                }
+                let _ = probe
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                break;
+            }
 
             let (mut second, _) = listener.accept().await.unwrap();
             let _ = second.read(&mut buf).await;
@@ -1170,6 +1387,96 @@ mod tests {
             [2, 1],
             "一副 agent 的两条命令分到了两副副本上：{hits:?}"
         );
+    }
+
+    /// 客户端重启后手上没有钉子，但树还在某副卷上：它问一遍、落在那副，
+    /// 而不是按轮转另切一棵、把原先那棵树上的工作留在原地。
+    ///
+    /// 轮转会把这条 lane 放到第一副（那副没有树），所以这一条判的正是「问过之后
+    /// 换了落点」：没问，命令就落在空树上。
+    #[tokio::test]
+    async fn a_client_that_restarts_lands_on_the_replica_that_still_holds_the_lane() {
+        use std::sync::atomic::Ordering;
+        let (empty, empty_hits, _) = serve_trees(TreeAnswer::Empty, 1).await;
+        let (holder, holder_hits, _) = serve_trees(TreeAnswer::Holds, 2).await;
+        let executor = RemoteExecutor::with_endpoints(vec![empty, holder]).unwrap();
+
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+
+        assert_eq!(
+            holder_hits.load(Ordering::SeqCst),
+            1,
+            "命令没有落在还端着那棵树的那副上"
+        );
+        assert_eq!(
+            empty_hits.load(Ordering::SeqCst),
+            0,
+            "命令落到了没有树的那副上，原先树上的工作就留在原地了"
+        );
+    }
+
+    /// 问树只发生在客户端第一次碰到这条 lane 时：钉子在手上之后，再问一遍
+    /// 只会给每条命令加一次读目录。
+    #[tokio::test]
+    async fn a_client_with_a_pin_does_not_look_for_the_tree_again() {
+        use std::sync::atomic::Ordering;
+        let (replica, hits, looks) = serve_trees(TreeAnswer::Empty, 2).await;
+        let executor = RemoteExecutor::with_endpoints(vec![replica]).unwrap();
+
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            looks.load(Ordering::SeqCst),
+            1,
+            "同一条 lane 被问了不止一次"
+        );
+    }
+
+    /// 问不出来不是「有」：副本身回 500 时，它不能算一处落点——把非 404 都当成
+    /// 「树在我这」的实现会挑中它，把命令送到一棵空树上。
+    ///
+    /// 两副按地址排，答 500 的那副排在前面，所以「取第一个说有树的」若把 500 读成
+    /// 「有」，落点就是它。
+    #[tokio::test]
+    async fn a_replica_that_cannot_answer_is_not_taken_for_a_holder() {
+        use std::sync::atomic::Ordering;
+        let one = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let two = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (broken, holder) = if one.local_addr().unwrap() < two.local_addr().unwrap() {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        let (broken, broken_hits, _) = serve_trees_on(broken, TreeAnswer::Broken, 1);
+        let (holder, holder_hits, _) = serve_trees_on(holder, TreeAnswer::Holds, 2);
+        let executor = RemoteExecutor::with_endpoints(vec![broken, holder]).unwrap();
+
+        let result = executor.execute(&for_agent("agent-a")).await.unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            broken_hits.load(Ordering::SeqCst),
+            0,
+            "答不上话的副本被当成端着树的那个"
+        );
+        assert_eq!(holder_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// 问树问不出结果也不拦命令：唯一的副本答 500，命令照轮转发到它，
+    /// 客户端手上什么也没记下——下一次还会再问。
+    #[tokio::test]
+    async fn a_question_that_gets_no_answer_does_not_hold_the_command_back() {
+        use std::sync::atomic::Ordering;
+        let (replica, hits, looks) = serve_trees(TreeAnswer::Broken, 1).await;
+        let executor = RemoteExecutor::with_endpoints(vec![replica]).unwrap();
+
+        let result = executor.execute(&for_agent("agent-a")).await.unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(looks.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "命令没有发出去");
     }
 
     /// A replica that is gone does not keep its lanes, and the lane is not
@@ -1615,12 +1922,21 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            // Drain request headers.
-            let mut buf = vec![0u8; 4096];
-            let _ = socket.read(&mut buf).await;
             let body = lines.join("\n") + "\n";
+            // 客户端先问树在哪副；这一问的答案是 404，命令才是下面那条。
+            let mut socket = loop {
+                let (mut candidate, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let read = candidate.read(&mut buf).await.unwrap_or(0);
+                if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    let _ = candidate
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .await;
+                    continue;
+                }
+                break candidate;
+            };
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
                 body.len(),
@@ -1664,10 +1980,19 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf = vec![0u8; 4096];
-            let _ = socket.read(&mut buf).await;
+            let mut socket = loop {
+                let (mut candidate, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let read = candidate.read(&mut buf).await.unwrap_or(0);
+                if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    let _ = candidate
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .await;
+                    continue;
+                }
+                break candidate;
+            };
             socket
                 .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 3\r\n\r\nbad")
                 .await

@@ -1303,6 +1303,16 @@ impl WorkdirRouter {
         Ok(plan.files.len())
     }
 
+    /// 这副副本上这条 lane 有没有树。
+    ///
+    /// 「没有」是一个答案，不是失败：一个刚起来的客户端手上没有钉子，它就是
+    /// 拿这个问题决定这条 lane 落在哪副副本上；把「没有」写成错误，会让每一次
+    /// 普通的首次落点都带一条错误，而真正该报错的只有名字不能用和读不出来。
+    pub async fn holds_tree(&self, lane: &str) -> Result<bool, CarryError> {
+        validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
+        Ok(self.tree_of(lane).await.is_some())
+    }
+
     /// The tree this lane already has on this volume, if it is still there.
     async fn tree_of(&self, lane: &str) -> Option<PathBuf> {
         let (_, path) = self

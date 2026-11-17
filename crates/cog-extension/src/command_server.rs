@@ -325,6 +325,32 @@ async fn worktree_export_handler(
     }
 }
 
+/// 这副副本上有没有这条 lane 的树。
+///
+/// 问这个的是**刚起来的客户端**：钉子在它进程里，它重启之后手上一条都没有，
+/// 而树不随进程消失——它长在某副副本的卷上，那副副本事后仍答得出。404 是
+/// 「没有」，与 200 一样是答案；名字不能用是 400，读不出来是 500，只有这两种
+/// 值得让调用方停下来。
+async fn worktree_has_handler(
+    State(state): State<AppState>,
+    Query(q): Query<WorktreeHasQuery>,
+) -> Response {
+    let Some(workdir) = state.workdir.as_ref() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "this executor has no worktree router, so it holds no tree".to_string(),
+        );
+    };
+    match workdir.holds_tree(&q.lane).await {
+        Ok(true) => Json(serde_json::json!({"lane": q.lane, "tree": true})).into_response(),
+        Ok(false) => error_response(
+            StatusCode::NOT_FOUND,
+            format!("lane {} has no tree on this replica", q.lane),
+        ),
+        Err(e) => carry_error_response(e),
+    }
+}
+
 /// 把带过来的包放进这条 lane 的树里：没有树就先切一棵，然后把树的内容写回工作区。
 ///
 /// 包是任意大的（一棵真实的工作区），而 axum 默认的 2 MiB 请求体上限会把它们
@@ -1864,6 +1890,7 @@ fn app_router(state: AppState) -> Router {
         .route("/documents/review", post(documents_review_handler))
         .route("/documents/apply", post(documents_apply_handler))
         .route("/documents/rollback", post(documents_rollback_handler))
+        .route("/worktree/has", get(worktree_has_handler))
         .route("/worktree/export", post(worktree_export_handler))
         .route(
             "/worktree/import",
@@ -1879,6 +1906,11 @@ struct WorktreeExportRequest {
 
 #[derive(Deserialize)]
 struct WorktreeImportQuery {
+    lane: String,
+}
+
+#[derive(Deserialize)]
+struct WorktreeHasQuery {
     lane: String,
 }
 
@@ -3991,6 +4023,29 @@ mod tests {
         let to = serve(rb.clone()).await;
 
         let client = reqwest::Client::new();
+        // 找树那一问的三种答案各认一次：有（200）、没有（404）、名字不能用（400）。
+        // 刚起来的客户端靠它决定落在哪副上，三种答案在它眼里是三件事。
+        let has_here = client
+            .get(format!("{from}/worktree/has"))
+            .query(&[("lane", "lane-carry")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(has_here.status(), reqwest::StatusCode::OK);
+        let has_there = client
+            .get(format!("{to}/worktree/has"))
+            .query(&[("lane", "lane-carry")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(has_there.status(), reqwest::StatusCode::NOT_FOUND);
+        let refused = client
+            .get(format!("{from}/worktree/has"))
+            .query(&[("lane", "../escape")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
         let exported = client
             .post(format!("{from}/worktree/export"))
             .json(&serde_json::json!({"lane": "lane-carry"}))
