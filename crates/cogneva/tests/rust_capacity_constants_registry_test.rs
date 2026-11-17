@@ -524,6 +524,39 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
     );
 }
 
+/// How many constants may still answer `bound`.
+///
+/// `bound` is the one word in the vocabulary nothing can check. The reason says
+/// what pins the value, and no rule reads that reason well enough to tell a pin
+/// from a preference — so it is the shape a hand-picked number arrives in: an
+/// override wearing a justification. The other two shapes are checkable: `fixed`
+/// names an agreement, and a value that should follow a reading belongs on the
+/// value that moves at run time, computed from the setting or the reading it
+/// follows (the read-file page is the worked example: it derives from the
+/// window the tools serve instead of a constant page size).
+///
+/// The number is the measured population, not a budget somebody chose, and it
+/// only comes down. A new capacity number that would have said `bound` has to
+/// say `fixed` with the agreement, or not be a constant at all. Deleting one
+/// does not force this line to be lowered in the same commit; when you touch
+/// these constants, read the printed count and take the lower number.
+const BOUND_CEILING: u64 = 736; // 2026-11-17 实测
+
+#[test]
+fn the_uncheckable_bound_answer_only_comes_down() {
+    let root = repo_root();
+    let scanned = scan(&root, &production_sources(&root));
+    let total = scanned.iter().filter(|row| row.source == "bound").count() as u64;
+    eprintln!("cap bound: {total} constants");
+    assert!(
+        total <= BOUND_CEILING,
+        "{total} constants answer `bound` and the ceiling is {BOUND_CEILING}. `bound` \
+         is the one answer nothing checks, so the debt only comes down: name the \
+         agreement in a `fixed` line, or compute the value at run time from the \
+         setting or the reading it follows"
+    );
+}
+
 /// The refusal this census exists for, pinned on a tree written for the purpose.
 ///
 /// It is a tree of its own rather than `crates/` because the population is at
