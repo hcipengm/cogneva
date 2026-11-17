@@ -45,7 +45,7 @@ use cog_core::{SFError, SFResult};
 use prometheus::{Counter, CounterVec, Encoder, Gauge, GaugeVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use cog_core::build_cache_readings::{BuildCacheReadings, CacheSlot};
 
@@ -654,6 +654,11 @@ pub struct WorkdirMetrics {
     registry: Registry,
     workspaces: Gauge,
     gc_reclaimed: Counter,
+    /// Idle trees a pass walked past because they still hold uncommitted work.
+    /// Without it, "the pass finds nothing to do" and "the pass finds trees it
+    /// must not touch" read the same on the volume-usage series, and the second
+    /// is the one worth knowing about: it is what fills the disk.
+    gc_kept: Counter,
     /// Cap passes that could not be met without deleting a tree a command is
     /// running in. A pass that defers is otherwise invisible: the cap holding
     /// and the cap being unreachable both read as "nothing happened", and only
@@ -709,6 +714,10 @@ impl WorkdirMetrics {
             "sandbox_workspace_gc_reclaimed_total",
             "Task worktrees removed by TTL/LRU garbage collection",
         )?;
+        let gc_kept = Counter::new(
+            "sandbox_workspace_gc_kept_total",
+            "Idle task worktrees left in place because they hold uncommitted work",
+        )?;
         let cap_deferred = Counter::new(
             "sandbox_workspace_cap_deferred_total",
             "Task worktrees kept above the LRU cap because a command was running in them",
@@ -749,6 +758,7 @@ impl WorkdirMetrics {
         )?;
         registry.register(Box::new(workspaces.clone()))?;
         registry.register(Box::new(gc_reclaimed.clone()))?;
+        registry.register(Box::new(gc_kept.clone()))?;
         registry.register(Box::new(cap_deferred.clone()))?;
         registry.register(Box::new(fetch_failures.clone()))?;
         registry.register(Box::new(unscoped_requests.clone()))?;
@@ -850,6 +860,7 @@ impl WorkdirMetrics {
             registry,
             workspaces,
             gc_reclaimed,
+            gc_kept,
             cap_deferred,
             fetch_failures,
             unscoped_requests,
@@ -1190,9 +1201,10 @@ impl WorkdirRouter {
     /// Resolve the working directory for a lane and claim it for the command
     /// about to run there, lazily creating the tree on first sight.
     ///
-    /// A lane is an employee's checkout (see [`worktree_for_agent`]); a bare
-    /// task id still routes, for a caller that named no employee, so an old
-    /// entry point keeps landing somewhere rather than nowhere.
+    /// A lane is whatever [`cog_core::checkout_lane`] named for the request: the
+    /// task's tree when the request named a task, the employee's own otherwise.
+    /// The router does not derive it -- a second derivation here would be the
+    /// one that drifts from what the run's system prefix says.
     ///
     /// The claim is taken before the first filesystem call: a reclamation pass
     /// that has already listed this tree must still see it in use when it
@@ -1808,6 +1820,25 @@ impl WorkdirRouter {
         Ok(())
     }
 
+    /// Whether a tree still holds work nobody has committed.
+    ///
+    /// A tree can be rebuilt from the bare repository in seconds; what cannot be
+    /// rebuilt is what was never committed. Once the unit of isolation is the
+    /// task, a task's tree outlives the round that cut it and is touched only
+    /// while that task is moving, so an idle tree is not evidence that the task
+    /// is done -- an empty `git status` is evidence that deleting it loses
+    /// nothing. A status that cannot be read counts as work: being wrong the
+    /// other way costs somebody's uncommitted files.
+    ///
+    /// Paid only by trees already past the TTL, and the pass times itself so a
+    /// pass made slow by many such trees pushes its own interval out.
+    async fn holds_uncommitted_work(&self, path: &Path) -> bool {
+        match self.run_git(&["status", "--porcelain"], Some(path)).await {
+            Ok(out) => !out.is_empty(),
+            Err(_) => true,
+        }
+    }
+
     /// Reap trees idle past the TTL, then enforce the LRU cap. Returns the
     /// number of reclaimed trees.
     ///
@@ -1878,7 +1909,14 @@ impl WorkdirRouter {
             // delete the user's files between two conversations rather than
             // after one. The cap still reclaims it when a slot is needed -- see
             // [`is_employee_lane`].
-            let reap = match self.read_meta(id) {
+            //
+            // A task's tree is idle for a different reason: the task is waiting
+            // on something. Deleting it would lose whatever its roles wrote and
+            // have not committed, and rebuilding it from the bare repository
+            // brings back the committed state only. So the TTL is only half the
+            // question for a task -- the other half is whether the tree still
+            // holds work, which is what `git status` answers.
+            let idle = match self.read_meta(id) {
                 Some(meta) => {
                     !is_employee_lane(id) && now.saturating_sub(meta.last_used_unix) >= ttl
                 }
@@ -1896,7 +1934,15 @@ impl WorkdirRouter {
                     false
                 }
             };
-            if reap {
+            if idle && self.holds_uncommitted_work(path).await {
+                debug!(
+                    task_id = %id,
+                    "keeping an idle task worktree: it holds work nobody committed"
+                );
+                self.metrics.gc_kept.inc();
+                continue;
+            }
+            if idle {
                 info!(task_id = %id, "reclaiming idle task worktree (TTL expired)");
                 self.force_remove(path).await;
                 self.remove_meta(id);
@@ -2847,16 +2893,18 @@ pub(crate) fn validate_task_id(id: &str) -> SFResult<()> {
 /// same spelling this router reads: two spellings leave the model told about one
 /// tree and the executor routing to another.
 ///
-/// The distinction is what the cap and the TTL are told apart by. The cap evicts
-/// by least-recently-used, and that rule rests on an assumption: a tree nobody
-/// touched recently is a tree nobody will ask for again. It holds for a task's
-/// tree, whose id is spent by the round that created it, and it fails for an
-/// employee's, whose lane is handed back verbatim on the next turn. Measured on
-/// the deployed chat lane (2026-11-06): a squad pipeline creating a tree roughly
-/// every minute churned an eight-slot pool, `unscoped-shell-vera-82191e4a` was
-/// reclaimed 144 s after the turn that used it, and the files written in that
-/// turn went with it -- the next turn was routed to a fresh checkout and could
-/// not see its own work.
+/// The distinction is what the TTL and the cap are told apart by. The TTL asks
+/// whether a tree has gone idle; for an employee's tree the answer never means
+/// "done", because the lane comes back on the next turn, so the rule does not
+/// apply to it at all. For a task's tree an idle pass is not evidence either --
+/// the task may be waiting on something -- which is why the TTL is only half
+/// the decision there and [`WorkdirRouter::holds_uncommitted_work`] is the other
+/// half. The cap evicts by least-recently-used, and that assumption also fails
+/// for an employee's tree: measured on the deployed chat lane (2026-11-06), a
+/// squad pipeline creating a tree roughly every minute churned an eight-slot
+/// pool, `unscoped-shell-vera-82191e4a` was reclaimed 144 s after the turn that
+/// used it, and the files written in that turn went with it -- the next turn was
+/// routed to a fresh checkout and could not see its own work.
 fn is_employee_lane(lane: &str) -> bool {
     lane.starts_with(cog_core::WORKTREE_LANE_PREFIX)
 }
@@ -2872,10 +2920,11 @@ fn lane_branch(lane: &str) -> String {
 
 /// The checkout an employee works in, from the employee's own id.
 ///
-/// The one answer to "which tree is this request's", for a request that named
-/// its caller. `None` when the request named nobody: a caller with no identity
-/// is routed by the task id it carried, which is where such a call landed
-/// before lanes existed.
+/// The employee's own tree, not the request's answer: a request that carries a
+/// task works in that task's tree, and [`cog_core::checkout_lane`] is the one
+/// place that decides which of the two applies. Kept as the employee half of
+/// that decision, and as the name the run writes into its system prefix when it
+/// is not working on a task.
 pub fn worktree_for_agent(agent_id: &str) -> Option<String> {
     if agent_id.trim().is_empty() {
         return None;

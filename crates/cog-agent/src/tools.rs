@@ -186,17 +186,22 @@ pub fn caller_session() -> Option<String> {
 /// into a tree the next call never sees — which is exactly the "one call at a
 /// time" ceiling the tools were meant to lift.
 ///
-/// The id is attribution, not routing: the tree a request lands in is chosen by
-/// the agent id (see [`cog_core::worktree_lane`]), so a call that names its
-/// caller lands in that caller's checkout whichever task it says it is for. A
-/// caller nobody announced still gets the random id: two unknown callers
-/// sharing one directory would be worse than the churn.
+/// The id is routing now: [`cog_core::checkout_lane`] gives a call that names a
+/// task that task's tree, and only a call that names none its caller's own. So
+/// the placeholder below only has to be *stable within a conversation* for the
+/// callers that have no task and no announcement; two unknown callers sharing
+/// one directory would be worse than the churn.
 fn sandbox_task_id(scope: Option<&ToolScope>) -> String {
     if let Some(scope) = scope {
         return scope.task_id.clone();
     }
+    // A call with a caller and no task carries no task id: naming the caller's
+    // own lane here would be a task id that reads "employee-...", and the
+    // routing would pin the whole conversation into a tree called
+    // `task-employee-...` that nobody asked for. The agent id alone is the
+    // lane in this case.
     match caller_agent_id() {
-        Some(caller) => cog_core::worktree_lane(&caller),
+        Some(_) => String::new(),
         None => format!("unscoped-shell-{}", uuid::Uuid::new_v4()),
     }
 }
@@ -2885,9 +2890,14 @@ mod tests {
 
         let seen = backend.seen.lock().await.clone();
         assert_eq!(seen.len(), 3, "{seen:?}");
+        // The call names no task and its caller is announced, so routing falls
+        // back to the agent id: the lane is the caller's own checkout. The tool
+        // does not spell that lane itself — naming it here would be a task id
+        // reading `employee-...`, and the call would be pinned into a tree
+        // called `task-employee-...` that nobody asked for.
         assert_eq!(
-            seen[0].0,
-            cog_core::worktree_lane("ralph-3be244e0"),
+            cog_core::checkout_lane(Some(seen[0].0.as_str()), Some(seen[0].1.as_str())),
+            Some(cog_core::worktree_lane("ralph-3be244e0")),
             "an unscoped call lands in the calling agent's own checkout: {seen:?}"
         );
         assert!(
@@ -2961,8 +2971,9 @@ mod tests {
             "an announced caller is not refused: {seen:?}"
         );
         assert_eq!(
-            seen[0].0,
-            cog_core::worktree_lane("squad:DSC-1A2B-generator")
+            cog_core::checkout_lane(Some(seen[0].0.as_str()), Some(seen[0].1.as_str())),
+            Some(cog_core::worktree_lane("squad:DSC-1A2B-generator")),
+            "an announced caller with no task keeps one checkout: {seen:?}"
         );
         assert_eq!(
             seen[1].0, seen[0].0,
@@ -4652,8 +4663,8 @@ pub mod builtins {
     ///
     /// 搜索、`git status/diff`、打补丁若在本进程跑，读到的是一份与调用者无关的
     /// 源码，而结果看起来完全正常——这是最坏的一种错：它对得上问题，只是对不上
-    /// 那棵树。所以它们与 `run_command` 走同一个后端、同一份身份：agent id 选树，
-    /// 任务号做归属（见 [`cog_core::worktree_lane`]）。
+    /// 那棵树。所以它们与 `run_command` 走同一个后端、同一份身份：这一轮接的活
+    /// 选树，没有活时才是 agent id 自己那棵（见 [`cog_core::checkout_lane`]）。
     ///
     /// 后端缺席时工具照常注册、调用时报出缺的那一层。把工具从表里拿掉，「这个
     /// 进程没有执行器」就会读成「没有搜索」——两者该做的补救完全不同。
@@ -6291,8 +6302,8 @@ pub mod builtins {
             assert_eq!(seen.len(), 1);
             assert_eq!(seen[0].0, "squad:DSC-1-generator", "选树的是 agent id");
             assert_eq!(
-                seen[0].1,
-                cog_core::worktree_lane("squad:DSC-1-generator"),
+                cog_core::checkout_lane(Some(seen[0].1.as_str()), Some(seen[0].0.as_str())),
+                Some(cog_core::worktree_lane("squad:DSC-1-generator")),
                 "归属写的是这条车道，不是别处"
             );
             assert_eq!(seen[0].2, "git status --short --branch");

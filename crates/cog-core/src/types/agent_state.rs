@@ -73,10 +73,20 @@ pub fn agent_id_for(task_id: &str, role: &str) -> String {
 
 /// The prefix every employee's checkout is named with.
 ///
-/// The prefix is also how the executor tells an employee's tree from a task's
-/// leftover one: an employee's tree comes back on the next turn and must not be
-/// reaped for idleness, while a task's tree is spent by the round that made it.
+/// The prefix is also how the executor tells an employee's tree from a task's:
+/// an employee's tree comes back on the next turn and is never reaped for
+/// idleness, while a task's is reaped once that task's work is over -- see
+/// [`WORKTREE_TASK_PREFIX`] for the other half.
 pub const WORKTREE_LANE_PREFIX: &str = "employee-";
+
+/// The prefix every task's checkout is named with.
+///
+/// The prefix is how the executor tells a task's tree from an employee's, and
+/// that distinction decides which trees may be reaped for idleness: an
+/// employee's comes back on the next turn, while a task's is spent when the
+/// task is. Keeping it a prefix rather than a separate namespace is what makes
+/// the two kinds of lane one flat map everywhere else.
+pub const WORKTREE_TASK_PREFIX: &str = "task-";
 
 /// The longest a checkout's name may be.
 ///
@@ -89,13 +99,6 @@ pub const WORKTREE_LANE_PREFIX: &str = "employee-";
 /// failing anywhere a reader could see.
 // cap: bound — Linux NAME_MAX (255 bytes per path component) less the `work/` a branch name adds; a platform ceiling, not a capacity reading of this deployment, so no reading moves it
 pub const MAX_CHECKOUT_NAME_CHARS: usize = 255 - "work/".len();
-
-/// How much of an agent id the lane name keeps.
-///
-/// Subtracted from [`MAX_CHECKOUT_NAME_CHARS`] rather than written as a round
-/// number, because the prefix is what consumes the budget: a lane whose prefix
-/// grew must shorten by exactly that much.
-const LANE_NAME_MAX_CHARS: usize = MAX_CHECKOUT_NAME_CHARS - WORKTREE_LANE_PREFIX.len();
 
 /// `-` plus the eight hex digits that end a truncated lane.
 // cap: bound — 一个 `-` 和八位十六进制；它数的是指纹的写法，不是这台机器能承受多少
@@ -135,7 +138,50 @@ fn lane_fingerprint(text: &str) -> u32 {
 /// characters would land in one tree, and nothing downstream could tell that
 /// two people were writing there.
 pub fn worktree_lane(agent_id: &str) -> String {
-    let folded: String = agent_id
+    fold_lane_name(WORKTREE_LANE_PREFIX, agent_id)
+}
+
+/// The checkout a task's work is done in.
+///
+/// A task is the unit of isolation: a planner reading, a generator writing and
+/// an evaluator running the same task all see one tree, and it is the task's
+/// tree rather than any one person's. The id is folded the same way an
+/// employee's is, so a task id carrying characters a path should not still
+/// names a directory -- and a shortened one ends with a fingerprint, so two
+/// ids sharing a prefix cannot alias onto one tree.
+pub fn worktree_task_lane(task_id: &str) -> String {
+    fold_lane_name(WORKTREE_TASK_PREFIX, task_id)
+}
+
+/// The checkout a call works in.
+///
+/// A call that names a task works in that task's tree; one that names only an
+/// employee works in the employee's own. The task wins because the task is
+/// what the work is: all the roles working on it must see the same files, and
+/// a tree named after the person would put one task's planner and generator in
+/// different checkouts while both believe they are looking at the task.
+///
+/// Both readers of this -- the executor that routes a call and the run that
+/// names the tree in its system prefix -- call this one function. Two
+/// derivations do not fail loudly; they leave the model told about one tree
+/// while its calls land in another.
+///
+/// `None` when neither id names anything: a call with no identity works outside
+/// any checkout rather than in a tree shared with everyone.
+pub fn checkout_lane(task_id: Option<&str>, agent_id: Option<&str>) -> Option<String> {
+    if let Some(task) = task_id.map(str::trim).filter(|id| !id.is_empty()) {
+        return Some(worktree_task_lane(task));
+    }
+    agent_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(worktree_lane)
+}
+
+/// Fold an id to the byte set a checkout name accepts, under the given prefix.
+fn fold_lane_name(prefix: &str, id: &str) -> String {
+    let budget = MAX_CHECKOUT_NAME_CHARS - prefix.len();
+    let folded: String = id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
@@ -149,17 +195,14 @@ pub fn worktree_lane(agent_id: &str) -> String {
     // it off here means the refusal never has to be discovered as a failed
     // call, and the prompt still names the tree that will be used.
     let folded = folded.trim_start_matches('.').to_string();
-    if folded.chars().count() <= LANE_NAME_MAX_CHARS {
-        return format!("{WORKTREE_LANE_PREFIX}{folded}");
+    if folded.chars().count() <= budget {
+        return format!("{prefix}{folded}");
     }
     let kept: String = folded
         .chars()
-        .take(LANE_NAME_MAX_CHARS - TRUNCATION_TAIL_CHARS)
+        .take(budget - TRUNCATION_TAIL_CHARS)
         .collect();
-    format!(
-        "{WORKTREE_LANE_PREFIX}{kept}-{:08x}",
-        lane_fingerprint(&folded)
-    )
+    format!("{prefix}{kept}-{:08x}", lane_fingerprint(&folded))
 }
 
 /// 数字员工名册：人名的唯一来源。
@@ -297,6 +340,65 @@ mod naming_tests {
         assert_ne!(one, two, "两条长 id 落进了同一棵树：{one}");
         // 同一个 id 永远同一个名字：系统前缀与路由各算一次，不能算出两个结果。
         assert_eq!(worktree_lane("squad:t-role"), worktree_lane("squad:t-role"));
+    }
+
+    /// 一件活的树属于这件活，不属于接它的人。
+    ///
+    /// 同一个任务上的规划、生成、评审必须落在同一棵树里；一个人先后接两件
+    /// 活，那是两棵树。这两句是同一条规则的两半，缺任何一半都会让「隔离粒度
+    /// 等于并行粒度」变成一句只在单人单活时成立的话。
+    #[test]
+    fn a_task_decides_the_tree_and_the_person_only_stands_in_when_it_does_not() {
+        assert_eq!(
+            checkout_lane(Some("DSC-1A2B"), Some("squad:DSC-1A2B-generator")),
+            Some("task-DSC-1A2B".to_string()),
+            "点了任务的调用必须落在这件活那棵树上，不是执行者自己的树上"
+        );
+        assert_eq!(
+            checkout_lane(Some("DSC-1A2B"), Some("squad:DSC-1A2B-evaluator")),
+            Some("task-DSC-1A2B".to_string()),
+            "同一件活的两副角色落进了两棵树：评审看不到生成写的文件"
+        );
+        assert_ne!(
+            checkout_lane(Some("DSC-1A2B"), Some("kai-a9ab11fc")),
+            checkout_lane(Some("DSC-1A2C"), Some("kai-a9ab11fc")),
+            "同一个人接了两件活却只有一棵树：两件活的改动会互相覆盖"
+        );
+        assert_eq!(
+            checkout_lane(None, Some("kai-a9ab11fc")),
+            Some(worktree_lane("kai-a9ab11fc")),
+            "没点名任务的调用仍然落在执行者自己的树上"
+        );
+        assert_eq!(
+            checkout_lane(Some("   "), Some("kai-a9ab11fc")),
+            Some(worktree_lane("kai-a9ab11fc")),
+            "空白任务号等于没点名任务"
+        );
+        assert_eq!(checkout_lane(None, None), None, "没有身份的调用没有树");
+        assert_eq!(
+            checkout_lane(Some("DSC-1A2B"), None),
+            Some("task-DSC-1A2B".to_string()),
+            "点了任务、没点执行者，仍然是这件活那棵树"
+        );
+    }
+
+    /// 任务号里不该出现的字节也要折掉，且截断不许让两件活落进一棵树。
+    #[test]
+    fn a_task_lane_name_is_folded_and_never_aliases() {
+        assert_eq!(worktree_task_lane("DSC:1A2B/3"), "task-DSC-1A2B-3");
+        assert_eq!(worktree_task_lane(".hidden"), "task-hidden");
+        let long = worktree_task_lane(&"z".repeat(400));
+        assert!(
+            long.len() + "work/".len() <= 255,
+            "任务车道 {} 字节，加分支前缀就超过单名上限了",
+            long.len()
+        );
+        let shared = "q".repeat(300);
+        assert_ne!(
+            worktree_task_lane(&format!("{shared}-a")),
+            worktree_task_lane(&format!("{shared}-b"))
+        );
+        assert_eq!(worktree_task_lane("DSC-1"), worktree_task_lane("DSC-1"));
     }
 
     /// 工号唯一 ⇒ 展示名唯一。这是「员工不要重名」这条要求在代码里的判据：

@@ -1904,6 +1904,13 @@ impl AgentRuntime {
             self.display_name.as_deref(),
             Some(workspace.as_str()),
         ) {
+            // 换了一棵树就把上一句拿掉：这一句说的是「你的文件落在哪」，留着旧
+            // 的那一句，模型读到的两棵树都像自己的，而其中一棵是别人的活。
+            if let Some(previous) = self.identity_note.as_deref() {
+                if previous != note {
+                    self.context.drop_from_head_system(previous);
+                }
+            }
             self.context.merge_head_system(&note);
             self.identity_note = Some(note);
         }
@@ -2009,12 +2016,13 @@ impl AgentRuntime {
 
     /// 这一轮的命令与文件落在哪条工作树车道上。
     ///
-    /// 车道由执行者自己决定，不由这一轮接的是哪件活决定：树是员工的，同一件活
-    /// 换了个人接就换一棵树，而一件活做完之后那棵树还在。与执行器那边算的是
-    /// 同一个名字（`cog_core::worktree_lane`），两边各拼一遍的话，模型会在前缀
-    /// 里读到一棵树、在文件里改到另一棵——系统前缀里说错一棵树，比不说更坏。
+    /// 车道由「这一轮接的是哪件活」决定：树是任务的，同一件活的规划、生成、评审
+    /// 落同一棵树，而一座员工自己的树只在没接活时用。与执行器那边算的是同一个
+    /// 名字（`cog_core::checkout_lane`），两边各拼一遍的话，模型会在前缀里读到
+    /// 一棵树、在文件里改到另一棵——系统前缀里说错一棵树，比不说更坏。
     fn workspace_lane(&self) -> String {
-        cog_core::worktree_lane(&self.config.agent_id)
+        cog_core::checkout_lane(self.run_task_id.as_deref(), Some(&self.config.agent_id))
+            .unwrap_or_else(|| cog_core::worktree_lane(&self.config.agent_id))
     }
 
     /// The prologue every run shares, whichever way its input arrives.

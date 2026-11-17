@@ -53,17 +53,14 @@ const TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 
 /// The lane a request belongs to: the working tree it will run in.
 ///
-/// The same two names, in the same order, that the executor uses to pick a
-/// checkout: an employee first, a task only for a request that named none.
-/// A request that names neither runs outside any checkout, so it has no tree
-/// to keep in one place and therefore no lane.
+/// The same derivation the executor routes by ([`cog_core::checkout_lane`]):
+/// the task's tree when the request named a task, the employee's own otherwise.
+/// Deriving it here a second time is what would let the client pin one lane
+/// while the command runs in another -- the pin, the tree probe and the carry
+/// would all be talking about a tree the command is not in. A request that
+/// names neither runs outside any checkout, so it has no lane.
 fn lane_of(req: &SandboxRequest) -> Option<String> {
-    let named = |value: Option<&str>| {
-        value
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
-    named(Some(req.agent_id.as_str())).or_else(|| named(Some(req.task_id.as_str())))
+    cog_core::checkout_lane(Some(req.task_id.as_str()), Some(req.agent_id.as_str()))
 }
 
 fn now_secs() -> u64 {
@@ -1353,8 +1350,14 @@ mod tests {
     }
 
     fn for_agent(agent: &str) -> SandboxRequest {
+        for_task("t", agent)
+    }
+
+    /// One command on `task`, run by `agent`. The lane is the task's — two
+    /// agents on one task share one checkout, and two tasks are two.
+    fn for_task(task: &str, agent: &str) -> SandboxRequest {
         SandboxRequest {
-            task_id: "t".into(),
+            task_id: task.into(),
             agent_id: agent.into(),
             payload: SandboxPayload::Command {
                 command: "echo hi".into(),
@@ -1364,29 +1367,27 @@ mod tests {
         }
     }
 
-    /// Two commands from one agent answer from the same replica, because they
-    /// run in the same checkout and the checkout lives on one replica. Two
-    /// agents may be on two.
+    /// Two commands on one task answer from the same replica — they run in the
+    /// same checkout, and the checkout lives on one replica — even when two
+    /// different agents carry them, because an agent who takes over a task has
+    /// to find the work where the agent before it left it. A second task is
+    /// its own checkout, and its own replica is fine.
     #[tokio::test]
-    async fn an_agents_commands_stay_on_one_executor_replica() {
+    async fn one_tasks_commands_stay_on_one_executor_replica() {
         use std::sync::atomic::Ordering;
         let (first, first_hits) = serve_counting(3).await;
         let (second, second_hits) = serve_counting(3).await;
         let executor = RemoteExecutor::with_endpoints(vec![first, second]).unwrap();
 
-        executor.execute(&for_agent("agent-a")).await.unwrap();
-        executor.execute(&for_agent("agent-a")).await.unwrap();
-        executor.execute(&for_agent("agent-b")).await.unwrap();
+        executor.execute(&for_task("t", "agent-a")).await.unwrap();
+        executor.execute(&for_task("t", "agent-a")).await.unwrap();
+        executor.execute(&for_task("u", "agent-b")).await.unwrap();
 
         let hits = [
             first_hits.load(Ordering::SeqCst),
             second_hits.load(Ordering::SeqCst),
         ];
-        assert_eq!(
-            hits,
-            [2, 1],
-            "一副 agent 的两条命令分到了两副副本上：{hits:?}"
-        );
+        assert_eq!(hits, [2, 1], "同一任务的命令分到了两副副本上：{hits:?}");
     }
 
     /// 客户端重启后手上没有钉子，但树还在某副卷上：它问一遍、落在那副，
@@ -1851,16 +1852,17 @@ mod tests {
         let replicas = ChangingReplicas::new(vec![first.clone(), second.clone()]);
         let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
 
-        executor.execute(&for_agent("agent-a")).await.unwrap();
+        executor.execute(&for_task("t", "agent-a")).await.unwrap();
         assert_eq!(first_hits.load(Ordering::SeqCst), 1);
 
         replicas.add(second.clone());
         // The lane that is already placed stays where its tree is ...
-        executor.execute(&for_agent("agent-a")).await.unwrap();
+        executor.execute(&for_task("t", "agent-a")).await.unwrap();
         assert_eq!(first_hits.load(Ordering::SeqCst), 2);
         assert_eq!(second_hits.load(Ordering::SeqCst), 0);
-        // ... and a lane nobody placed yet is spread onto the new replica.
-        executor.execute(&for_agent("agent-b")).await.unwrap();
+        // ... and a lane nobody placed yet — a task nobody has worked on — is
+        // spread onto the new replica.
+        executor.execute(&for_task("u", "agent-b")).await.unwrap();
         assert_eq!(second_hits.load(Ordering::SeqCst), 1);
     }
 

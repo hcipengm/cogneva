@@ -816,13 +816,14 @@ fn single_shot(result: std::io::Result<String>) -> tokio::sync::mpsc::Receiver<C
 /// falling back to a shared directory. When the router is enabled, every
 /// command additionally receives the shared CARGO_TARGET_DIR.
 ///
-/// The tree belongs to the employee, so the agent id decides it and the task id
-/// does not. Routing by task id put every role of one task in one checkout --
-/// a planner's reads, a generator's writes and an evaluator's runs sharing one
-/// working tree -- and it made the tree's lifetime the task's, so a finished
-/// task took the files with it while the person was still here. The task id is
-/// still read, but only for a request that named no employee: that call has no
-/// lane of its own and something has to name it.
+/// The tree belongs to the task. The unit of isolation is the task, so a
+/// request that names one works in that task's tree and a request that names
+/// only an employee works in the employee's own: a planner's reads, a
+/// generator's writes and an evaluator's runs on one task are looking at one
+/// set of files, which is the whole point of the tree. Naming the lane is
+/// [`cog_core::checkout_lane`]'s job and nobody else's -- the run writes the
+/// same function's answer into its system prefix, so the tree the model is told
+/// about and the tree its calls land in cannot drift apart.
 async fn resolve_workdir(
     state: &AppState,
     task_id: Option<&str>,
@@ -839,13 +840,7 @@ async fn resolve_workdir(
     let Some(router) = state.workdir.as_ref() else {
         return Ok((None, None, None, cog_core::WorktreeOrigin::Unknown));
     };
-    let from_employee = agent_id.and_then(workdir::worktree_for_agent);
-    let lane = from_employee.or_else(|| {
-        task_id
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-    });
+    let lane = cog_core::checkout_lane(task_id, agent_id);
     match lane {
         // The claim travels with the request and is handed to whatever runs the
         // command: the tree is in use from here until that command is over, and
@@ -3027,13 +3022,22 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let bare = crate::workdir::tests::seed_bare(tmp.path());
+        // A cap of one, so that the tree under the command is the only tree
+        // the cap can reach: whether it is reached then does not depend on
+        // which tree the LRU happened to look at first. With room for another
+        // idle tree the cap meets itself by taking that one, and the reading
+        // this test is about (`cap_deferred`) stays at zero for a reason that
+        // has nothing to do with the claim — readdir order decided it.
         let workdir = crate::workdir::tests::router(
             tmp.path(),
             &bare,
-            2,
+            1,
             std::time::Duration::from_secs(21600),
         );
-        let tree = tmp.path().join("workspaces").join("held");
+        let tree = tmp
+            .path()
+            .join("workspaces")
+            .join(cog_core::worktree_task_lane("held"));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3079,13 +3083,17 @@ mod tests {
         }
         assert!(tree.join("started").exists(), "the command never started");
 
-        // Two more tasks against a cap of two: the cap has to take a tree, and
-        // the one with a command running in it is not a candidate.
+        // Another task against a cap of one: the cap has to take a tree, and
+        // the one with a command running in it is not a candidate — so the cap
+        // is not met, and the task it could not make room for still runs.
         workdir.route("second").await.unwrap();
-        workdir.route("third").await.unwrap();
         assert!(
             tree.join("started").exists(),
             "the tree a command runs in was reclaimed underneath it"
+        );
+        assert!(
+            tmp.path().join("workspaces").join("second").is_dir(),
+            "the cap turned into a refusal: work that does not fit is still work"
         );
         let body = reqwest::Client::new()
             .get(format!("http://{addr}/metrics"))
@@ -3106,6 +3114,13 @@ mod tests {
         std::fs::write(tree.join("release"), b"").unwrap();
         let streamed = running.await.unwrap();
         assert!(streamed.contains("done"), "{streamed}");
+        // Nothing is deferred any more — the reading says what the cap had to
+        // walk past, not what it once did — and the two trees are now ordinary
+        // idle trees, so the cap takes both of them. The markers come out first
+        // because a tree holding files nobody committed is kept: this test is
+        // about the claim, not about that.
+        std::fs::remove_file(tree.join("started")).unwrap();
+        std::fs::remove_file(tree.join("release")).unwrap();
         workdir.route("fourth").await.unwrap();
         let body = reqwest::Client::new()
             .get(format!("http://{addr}/metrics"))
@@ -3118,6 +3133,10 @@ mod tests {
         assert!(
             body.contains("sandbox_workspace_cap_deferred_total 1"),
             "a finished command leaves nothing to defer: {body}"
+        );
+        assert!(
+            body.contains("sandbox_workspace_gc_reclaimed_total 2"),
+            "the cap did not take the two trees nothing was holding: {body}"
         );
         cog_core::progress::reset_for_tests();
     }
@@ -3900,7 +3919,7 @@ mod tests {
             .unwrap();
         assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
         let reason = refused.text().await.unwrap();
-        let tree = workspaces_root.join("escape");
+        let tree = workspaces_root.join(cog_core::worktree_task_lane("escape"));
         assert!(
             reason.contains(&tree.display().to_string()),
             "the refusal names the writable range: {reason}"
