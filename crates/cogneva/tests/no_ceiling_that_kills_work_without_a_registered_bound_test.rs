@@ -16,37 +16,13 @@ use crate::bounds_registry_test::{kept, read_registry};
 use crate::common;
 
 use common::root::repo_root;
+use common::rust_production::{production_sources, production_text, sources_of_tree};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// cgroup v2 里真正会切断一个进程的文件。`memory.current`、`memory.peak` 这些
 /// 只是读数，读数不在这条门的题目里。
 const LIMIT_FILES: [&str; 4] = ["memory.max", "memory.high", "cpu.max", "pids.max"];
-
-/// 一份源文件里生产代码的那一段。
-///
-/// 门只判生产代码：夹具里写一个限值文件是为了验解析，不是为了切断谁。切点是
-/// `#[cfg(test)]`——本仓的单元测试都在文件末尾的这一个模块里，所以它之后的内容不算。
-fn production_part(text: &str) -> &str {
-    match text.find("#[cfg(test)]") {
-        Some(cut) => &text[..cut],
-        None => text,
-    }
-}
-
-fn rust_files_in(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rust_files_in(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
 
 /// 一个字符串常量如果就是限值文件名，它写出去的时候和字面量一样会切断进程，
 /// 所以扫描要把这类名字也当成针：`const MEMORY_MAX_FILE: &str = "memory.max";`
@@ -84,31 +60,23 @@ fn const_needles(production: &str) -> Vec<(String, String)> {
 /// 读是一条读数，写是一次切断：`read_to_string(root.join("memory.max"))` 不该在这条
 /// 门的题目里，`fs::write(dir.join("memory.max"), ..)` 必须。判据是同一行里既有某个
 /// 写调用、又有那个名字——把读、常量声明与注释都留在门外。
-fn ceiling_sites(root: &Path) -> Vec<(String, String)> {
-    let mut files = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates")).into_iter().flatten() {
-        rust_files_in(
-            &crate_dir
-                .ok()
-                .map(|e| e.path().join("src"))
-                .unwrap_or_default(),
-            &mut files,
-        );
-    }
+fn ceiling_sites(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
     let mut sites = Vec::new();
     for path in files {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
-        let production = production_part(&text);
+        // 门只判生产代码：夹具里写一个限值文件是为了验解析，不是为了切断谁。
+        // 切在哪里的那一份算法住在 `common::rust_production`，调用点只挑投影。
+        let production = production_text(&text);
         let mut needles: Vec<(String, String)> = LIMIT_FILES
             .iter()
             .map(|limit| (format!("\"{limit}\""), limit.to_string()))
             .collect();
-        needles.extend(const_needles(production));
+        needles.extend(const_needles(&production));
         let rel = path
             .strip_prefix(root)
-            .unwrap_or(&path)
+            .unwrap_or(path)
             .display()
             .to_string();
         for line in production.lines() {
@@ -129,13 +97,13 @@ fn ceiling_sites(root: &Path) -> Vec<(String, String)> {
 }
 
 /// 有落点、却没有一条点名它的登记。这就是这条门的红。
-fn unregistered(root: &Path, registry: &Value) -> Vec<String> {
+fn unregistered(root: &Path, files: &[PathBuf], registry: &Value) -> Vec<String> {
     let registered: Vec<String> = kept(registry)
         .iter()
         .filter_map(|entry| entry.get("file").and_then(Value::as_str))
         .map(str::to_string)
         .collect();
-    ceiling_sites(root)
+    ceiling_sites(root, files)
         .into_iter()
         .filter(|(file, _)| !registered.contains(file))
         .map(|(file, limit)| format!("{file}：写了 {limit}，bounds.kept 里没有这一份文件的登记"))
@@ -146,7 +114,7 @@ fn unregistered(root: &Path, registry: &Value) -> Vec<String> {
 #[test]
 fn nothing_in_production_cuts_a_process_off_without_a_registered_bound() {
     let root = repo_root();
-    let violations = unregistered(&root, &read_registry());
+    let violations = unregistered(&root, &production_sources(&root), &read_registry());
     assert!(
         violations.is_empty(),
         "这些地方会给一个正在干活的进程设界，而登记簿里没有它们。\
@@ -168,7 +136,7 @@ fn the_scan_reports_a_site_it_is_given() {
     )
     .unwrap();
 
-    let sites = ceiling_sites(dir.path());
+    let sites = ceiling_sites(dir.path(), &sources_of_tree(dir.path()));
     assert_eq!(
         sites,
         vec![(
@@ -180,7 +148,7 @@ fn the_scan_reports_a_site_it_is_given() {
 
     let empty = serde_json::json!({ "kept": [] });
     assert_eq!(
-        unregistered(dir.path(), &empty).len(),
+        unregistered(dir.path(), &sources_of_tree(dir.path()), &empty).len(),
         1,
         "没有登记的界必须判红"
     );
@@ -193,7 +161,7 @@ fn the_scan_reports_a_site_it_is_given() {
          std::fs::write(dir.join(MEMORY_MAX_FILE), \"1\").unwrap();\n}\n",
     )
     .unwrap();
-    let through_a_constant = ceiling_sites(dir.path());
+    let through_a_constant = ceiling_sites(dir.path(), &sources_of_tree(dir.path()));
     assert!(
         through_a_constant
             .iter()
@@ -216,7 +184,7 @@ fn a_limit_file_named_only_in_a_test_module_is_not_a_site() {
     .unwrap();
 
     assert!(
-        ceiling_sites(dir.path()).is_empty(),
+        ceiling_sites(dir.path(), &sources_of_tree(dir.path())).is_empty(),
         "夹具里的限值文件被当成了生产代码里的界"
     );
 }
