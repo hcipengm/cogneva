@@ -18,24 +18,6 @@ use std::time::Duration;
 // cap: bound — 短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
 const MEMORY_READ_TIMEOUT_SECS: u64 = 30;
 
-/// The payload size a read moves without being told otherwise. A quarter
-/// megabyte is what a tool result that already fit an agent's context roughly
-/// holds; a caller that wants a larger source names its own budget.
-// cap: bound — 一兆是「本来就装得进 agent 上下文的一条工具结果」的量级；要更大来源的调用方自己报名额
-const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
-
-/// How long an ask waits for its answer when the caller does not say, and the
-/// longest a caller may ask for.
-///
-/// The wait happens inside the caller's turn, holding it: long enough for a
-/// peer's run to finish, short enough that an unanswering peer costs one turn
-/// rather than the run. The cap exists because the bound is the only thing
-/// standing between "ask a peer" and "wait for it forever".
-// cap: bound — 这个界是「问一个同伴」与「永远等下去」之间唯一拦着的东西
-const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
-// cap: bound — the cap that keeps a peer's silence from becoming an unbounded wait
-const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
-
 /// 子任务的事件管道有多深。
 ///
 /// 这一侧不读子任务的进度，只雇了一个任务把它排空；所以深度只需要盖住「循环
@@ -1814,9 +1796,11 @@ mod tests {
             },
         );
         let measured = tool_payload_bytes(&registry.list());
-        // cap: derived — 由树上的工具面现算（2026-11-17 实测 13767）；删除时跟着降，
-        // 往上抬要在提交信息里说明新增的是哪一段、凭什么非有不可
-        const BUDGET: usize = 13_767;
+        // cap: derived — 由树上的工具面现算（2026-11-17 实测 13729）；删除时跟着降，
+        // 往上抬要在提交信息里说明新增的是哪一段、凭什么非有不可。13767 → 13729
+        // 是删掉了搜索、抓取、raw_fetch、await_task 在本地的默认值和上限（四句话里
+        // 各有一个数）。
+        const BUDGET: usize = 13_729;
         assert!(
             measured <= BUDGET,
             "the model now pays {measured} bytes per turn for tool signatures; the budget \
@@ -1886,12 +1870,6 @@ mod tests {
             (
                 "READ_FILE_DEFAULT_WINDOW_LINES",
                 READ_FILE_DEFAULT_WINDOW_LINES as u64,
-            ),
-            ("ASK_DEFAULT_TIMEOUT_MS", ASK_DEFAULT_TIMEOUT_MS),
-            ("ASK_MAX_TIMEOUT_MS", ASK_MAX_TIMEOUT_MS),
-            (
-                "DEFAULT_RAW_FETCH_BUDGET_BYTES",
-                DEFAULT_RAW_FETCH_BUDGET_BYTES,
             ),
         ];
         for tool in registry.list() {
@@ -3617,11 +3595,7 @@ pub mod builtins {
                     },
                     "timeout_ms": {
                         "type": "integer",
-                        "description": format!(
-                            "How long to wait when expect_reply is set (default {}, \
-                             capped at {})",
-                            ASK_DEFAULT_TIMEOUT_MS, ASK_MAX_TIMEOUT_MS
-                        )
+                        "description": "Wait limit when expect_reply is set; required with it"
                     }
                 },
                 "required": ["agent_id", "message"]
@@ -3641,6 +3615,7 @@ pub mod builtins {
                         .ok_or_else(|| SFError::Validation("message required".into()))?;
                     let kind = args["kind"].as_str().unwrap_or("prompt");
                     let expect_reply = args["expect_reply"].as_bool().unwrap_or(false);
+                    let timeout_ms = args["timeout_ms"].as_u64().filter(|ms| *ms > 0);
                     // Refused before anything is written: the other two commands
                     // do not start a run, so there is no answer to wait for and
                     // a wait would spend the whole timeout learning that.
@@ -3649,6 +3624,15 @@ pub mod builtins {
                             "expect_reply needs kind=prompt; a {kind} command runs nothing, \
                              so no answer can come back"
                         )));
+                    }
+                    // 等多久是调用方自己的决定：不说等多久就不等，没有替它挑的
+                    // 默认值，也没有替它封的顶。
+                    if expect_reply && timeout_ms.is_none() {
+                        return Err(SFError::Validation(
+                            "expect_reply needs timeout_ms: how long this turn will hold \
+                             for the answer"
+                                .into(),
+                        ));
                     }
                     // The stream this call will read, named before the request
                     // exists so the target can be told where to answer.
@@ -3768,7 +3752,13 @@ pub mod builtins {
                         if let Some(guard) = reply_guard.as_mut() {
                             guard.begin_wait();
                         }
-                        let waited = wait_for_reply(backend.as_ref(), stream, reader, &args).await;
+                        let waited = wait_for_reply(
+                            backend.as_ref(),
+                            stream,
+                            reader,
+                            timeout_ms.unwrap_or_default(),
+                        )
+                        .await;
                         // The wait deletes the stream on every path it reaches,
                         // so from here on the guard has nothing left to clean.
                         if let Some(guard) = reply_guard.as_mut() {
@@ -4071,11 +4061,8 @@ pub mod builtins {
                     },
                     "timeout_ms": {
                         "type": "integer",
-                        "description": format!(
-                            "How long to wait when the task has not ended yet (default {}, \
-                             capped at {})",
-                            ASK_DEFAULT_TIMEOUT_MS, ASK_MAX_TIMEOUT_MS
-                        )
+                        "description": "Wait limit while the task runs; without it reads \
+                                        the status now"
                     }
                 },
                 "required": ["task_id"]
@@ -4097,19 +4084,26 @@ pub mod builtins {
                                     .into(),
                             )
                         })?;
+                    // 不说等多久就不等：请求里没有 `wait_ms`，服务端据它自己的
+                    // 约定立刻回当前状态。客户端不替调用方挑默认值，也不封顶——
+                    // 服务端那侧本来就有自己的上限。
                     let wait_ms = args
                         .get("timeout_ms")
                         .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(ASK_DEFAULT_TIMEOUT_MS)
-                        .clamp(1, ASK_MAX_TIMEOUT_MS);
-                    let url = format!(
-                        "{base}/api/v1/tasks/{}?wait_ms={wait_ms}",
+                        .filter(|ms| *ms > 0);
+                    let mut url = format!(
+                        "{base}/api/v1/tasks/{}",
                         encode_url_component(task_id)
                     );
+                    if let Some(wait_ms) = wait_ms {
+                        url.push_str(&format!("?wait_ms={wait_ms}"));
+                    }
                     let mut request = cog_core::HttpRequest::new("GET", &url);
-                    // 客户端自己的超时跟服务端等的窗口一样长：到点时先由服务端回答
-                    // 「没等到」，客户端这边跟着断开只会把同一句话读成一次网络失败。
-                    request.timeout_secs = Some(wait_ms.div_ceil(MILLIS_PER_SECOND));
+                    // 客户端自己的超时跟调用方给的等待窗口一样长：到点时先由服务端
+                    // 回答「没等到」，客户端这边跟着断开只会把同一句话读成一次网络
+                    // 失败。没说等多久时，请求按普通读的时限走。
+                    request.timeout_secs =
+                        wait_ms.map(|wait_ms| wait_ms.div_ceil(MILLIS_PER_SECOND));
                     let response = client.execute(request).await?;
                     let text = String::from_utf8_lossy(&response.body).to_string();
                     if !response.is_success() {
@@ -4591,15 +4585,10 @@ pub mod builtins {
         backend: &dyn cog_core::MessageBackend,
         stream: &str,
         reader: &mut cog_core::MessageStream,
-        args: &serde_json::Value,
+        timeout_ms: u64,
     ) -> Waited {
         let started = std::time::Instant::now();
-        let timeout = Duration::from_millis(
-            args["timeout_ms"]
-                .as_u64()
-                .unwrap_or(ASK_DEFAULT_TIMEOUT_MS)
-                .clamp(1, ASK_MAX_TIMEOUT_MS),
-        );
+        let timeout = Duration::from_millis(timeout_ms);
         let first = tokio::time::timeout(timeout, reader.next()).await;
         let waited = started.elapsed();
 
@@ -5618,10 +5607,7 @@ pub mod builtins {
                     "id": { "type": "string", "description": "Raw source id" },
                     "budget": {
                         "type": "integer",
-                        "description": format!(
-                            "Maximum payload bytes to move (default {})",
-                            DEFAULT_RAW_FETCH_BUDGET_BYTES
-                        )
+                        "description": "Max payload bytes; whole segment if omitted"
                     }
                 },
                 "required": ["id"]
@@ -5643,15 +5629,15 @@ pub mod builtins {
                     let base = memory_base(base.as_deref())?;
                     let client = memory_client(client)?;
                     let segment = encode_url_component(id);
-                    let budget = args["budget"]
-                        .as_u64()
-                        .unwrap_or(DEFAULT_RAW_FETCH_BUDGET_BYTES);
+                    // 不设默认：调用方没报名额就整段搬。传送量本身由存储那边的
+                    // 分段决定，这里不再替它挑一个数。
+                    let budget = args["budget"].as_u64();
 
                     let item_url =
                         format!("{base}{}", MEMORY_RAW_ITEM_PATH.replace("{id}", &segment));
                     let meta = get_json(&client, &item_url).await?;
                     let payload_length = meta["payload_length"].as_u64().unwrap_or(0);
-                    if payload_length > budget {
+                    if let Some(budget) = budget.filter(|budget| payload_length > *budget) {
                         // The budget did its job: hand back an outcome a caller
                         // cannot mistake for the bytes, and count it so the
                         // bounded read is visible outside the tool result.

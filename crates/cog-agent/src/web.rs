@@ -32,30 +32,6 @@ use cog_core::{HttpClient, HttpRequest, SFError, SFResult, Tool, ToolImplementat
 use futures::StreamExt;
 use url::Url;
 
-/// Hits returned when the caller does not say how many it wants. Ten is one
-/// screen of titles and excerpts: enough to choose a page to read, small enough
-/// that a turn is not spent on links it will not follow.
-// cap: bound — 一屏标题与摘录：够挑出要读的那页，又小到这一回合不会花在不会跟的链接上
-const DEFAULT_SEARCH_RESULTS: u64 = 10;
-
-/// The most hits one call may ask for. Every hit is context the run pays for on
-/// every later turn, so a caller that wants more pages should read the ones it
-/// has rather than page through a result list it cannot use.
-// cap: bound — 结果会进入之后每一回合，所以想要更多的调用方该去读已有的那些
-const MAX_SEARCH_RESULTS: u64 = 50;
-
-/// Characters of extracted text returned when the caller does not ask for a
-/// size. Roughly one long article; the caller can raise it for a document it
-/// means to read whole.
-// cap: bound — 大约一篇长文；对打算整篇读完的文档，调用方可以自己抬高
-const DEFAULT_FETCH_CHARS: u64 = 20_000;
-
-/// The most text one fetch may return. Above this the answer stops being a turn
-/// and becomes a document, and a document belongs in the archive rather than in
-/// the conversation.
-// cap: bound — 过了这个数它就不是一段摘录而是整份文档，那份文档该进归档而不是进对话
-const MAX_FETCH_CHARS: u64 = 200_000;
-
 /// Bytes one page may transfer. Below the point where a single turn is worth
 /// anything, the page cannot be read anyway; above it, an accidental video or
 /// an infinite stream costs the pod's memory before extraction ever runs.
@@ -518,8 +494,8 @@ fn decode_entities(text: &str) -> String {
     out
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
-    match text.char_indices().nth(max_chars) {
+fn truncate_chars(text: &str, max_chars: Option<usize>) -> (String, bool) {
+    match max_chars.and_then(|max| text.char_indices().nth(max)) {
         Some((cut, _)) => (text[..cut].to_string(), true),
         None => (text.to_string(), false),
     }
@@ -563,10 +539,7 @@ pub fn web_search_with_fallback(
                 },
                 "limit": {
                     "type": "integer",
-                    "description": format!(
-                        "How many results to return (default {DEFAULT_SEARCH_RESULTS}, \
-                         max {MAX_SEARCH_RESULTS})"
-                    )
+                    "description": "Result count; the backend's default if omitted"
                 },
                 "language": {
                     "type": "string",
@@ -590,16 +563,19 @@ pub fn web_search_with_fallback(
                     .filter(|q| !q.is_empty())
                     .ok_or_else(|| SFError::Validation("query required".into()))?
                     .to_string();
-                let limit = args["limit"]
-                    .as_u64()
-                    .unwrap_or(DEFAULT_SEARCH_RESULTS)
-                    .clamp(1, MAX_SEARCH_RESULTS);
+                // 调用方说多少就是多少：没有上限，也不替它挑一个默认值。不说就
+                // 不在请求里带 `limit`，由后端自己的默认回答——那是后端的协议，
+                // 不是这里替它拍的一个数。
+                let limit = args["limit"].as_u64().filter(|n| *n > 0);
                 let base = search_base(base.as_deref())?;
                 let client = http_client(client)?;
                 let mut url = format!(
-                    "{base}/search?q={}&format=json&limit={limit}&safesearch=1",
+                    "{base}/search?q={}&format=json&safesearch=1",
                     encode_component(&query)
                 );
+                if let Some(limit) = limit {
+                    url.push_str(&format!("&limit={limit}"));
+                }
                 if let Some(language) = args["language"].as_str().filter(|l| !l.trim().is_empty()) {
                     url.push_str(&format!("&language={}", encode_component(language.trim())));
                 }
@@ -791,7 +767,7 @@ async fn fallback_search(
     client: &dyn HttpClient,
     base: &str,
     query: &str,
-    limit: u64,
+    limit: Option<u64>,
 ) -> SFResult<Vec<serde_json::Value>> {
     let url = format!("{}/search", base.trim_end_matches('/'));
     let mut req = HttpRequest::new("POST", url.clone());
@@ -800,15 +776,14 @@ async fn fallback_search(
         .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
     req.headers
         .insert("Accept".into(), cog_core::CONTENT_TYPE_JSON.into());
-    req.body = Some(
-        serde_json::json!({
-            "query": query,
-            "max_results": limit,
-            "search_depth": "basic",
-        })
-        .to_string()
-        .into_bytes(),
-    );
+    let mut payload = serde_json::json!({
+        "query": query,
+        "search_depth": "basic",
+    });
+    if let Some(limit) = limit {
+        payload["max_results"] = serde_json::json!(limit);
+    }
+    req.body = Some(payload.to_string().into_bytes());
     let resp = client.execute(req).await.map_err(|e| {
         SFError::Agent(format!(
             "fallback search backend at {base} is unreachable: {e}"
@@ -832,7 +807,7 @@ async fn fallback_search(
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
-        .take(limit as usize)
+        .take(limit.map_or(usize::MAX, |n| n as usize))
         .map(|hit| {
             serde_json::json!({
                 "title": hit["title"],
@@ -857,7 +832,11 @@ struct SearchAnswer {
     extras: Vec<(String, serde_json::Value)>,
 }
 
-fn search_answer(resp: &cog_core::HttpResponse, base: &str, limit: u64) -> SFResult<SearchAnswer> {
+fn search_answer(
+    resp: &cog_core::HttpResponse,
+    base: &str,
+    limit: Option<u64>,
+) -> SFResult<SearchAnswer> {
     if !resp.is_success() {
         let body = String::from_utf8_lossy(&resp.body);
         let hint = if resp.status == 403 || body.contains("format") {
@@ -882,7 +861,7 @@ fn search_answer(resp: &cog_core::HttpResponse, base: &str, limit: u64) -> SFRes
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
-        .take(limit as usize)
+        .take(limit.map_or(usize::MAX, |n| n as usize))
         .map(|hit| {
             serde_json::json!({
                 "title": hit["title"],
@@ -993,7 +972,7 @@ async fn fetch_rendered(
     client: &Arc<dyn HttpClient>,
     base: &str,
     url: &Url,
-    max_chars: usize,
+    max_chars: Option<usize>,
 ) -> SFResult<serde_json::Value> {
     let endpoint = format!("{base}/md");
     let body = serde_json::to_vec(&serde_json::json!({
@@ -1019,7 +998,7 @@ async fn fetch_rendered(
         if (200..300).contains(&resp.status) {
             break resp;
         }
-        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), 300).0;
+        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), Some(300)).0;
         if !(500..600).contains(&resp.status) || attempt >= RENDER_ATTEMPTS {
             let tries = if attempt == 1 {
                 String::new()
@@ -1105,7 +1084,7 @@ async fn fetch_locally(
     client: &Arc<dyn HttpClient>,
     base: Option<&str>,
     url: &Url,
-    max_chars: usize,
+    max_chars: Option<usize>,
 ) -> SFResult<serde_json::Value> {
     // Rendering is a property of the deployment, not of the call: a run that
     // could ask for it would ask for it every time, and the deployment that has
@@ -1198,7 +1177,7 @@ async fn fallback_fetch(
     client: &Arc<dyn HttpClient>,
     base: &str,
     url: &Url,
-    max_chars: usize,
+    max_chars: Option<usize>,
 ) -> SFResult<serde_json::Value> {
     let endpoint = format!("{base}/fetch");
     let body = serde_json::to_vec(&serde_json::json!({ "url": url.as_str() }))
@@ -1212,7 +1191,7 @@ async fn fallback_fetch(
         SFError::Agent(format!("the fallback outlet at {base} is unreachable: {e}"))
     })?;
     if !(200..300).contains(&resp.status) {
-        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), 300).0;
+        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), Some(300)).0;
         return Err(SFError::Agent(format!(
             "the fallback outlet at {base} answered HTTP {}: {detail}",
             resp.status
@@ -1295,10 +1274,7 @@ pub fn web_fetch_with_fallback(
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": format!(
-                        "Cap on returned characters (default {DEFAULT_FETCH_CHARS}, \
-                         max {MAX_FETCH_CHARS})"
-                    )
+                    "description": "Character cap; the whole page if omitted"
                 }
             },
             "required": ["url"]
@@ -1318,10 +1294,9 @@ pub fn web_fetch_with_fallback(
                     }
                 };
                 let client = http_client(client)?;
-                let max_chars = args["max_chars"]
-                    .as_u64()
-                    .unwrap_or(DEFAULT_FETCH_CHARS)
-                    .clamp(1, MAX_FETCH_CHARS) as usize;
+                // 调用方说要多少就多少：不说就整页给，说了也不夹到一个更小的数上。
+                // 传输量的界在抓取那一层，与这里要显示多少字无关。
+                let max_chars = args["max_chars"].as_u64().map(|n| n as usize);
                 // The address guard runs before either layer, so no layer can be
                 // pointed at loopback or at a cluster-internal service: the
                 // fallback outlet is handed only addresses this process already
@@ -1443,43 +1418,35 @@ mod tests {
         Some(scripted.clone() as Arc<dyn HttpClient>)
     }
 
-    /// 界只声明一次：`limit` / `max_chars` 的默认值与上限由常量给，描述里抄一份
-    /// 字面量，改常量那天它就是假话。这里按独立数字判，`UTF-8` 里的 8 不算。
+    /// 搜索与抓取都没有本地的默认值和上限：不说就交给后端 / 整页给，说了就
+    /// 照说的给。删掉这两个常量之后它们最容易以别的方式长回来——在描述里写
+    /// 「default 10」「max 200000」——所以这里按独立数字判两个工具的每一个
+    /// 字段描述，`UTF-8` 里的 8 不算。
     #[test]
-    fn the_two_bounds_are_carried_by_the_fields_that_enforce_them() {
-        let search = web_search(None, Some("http://searx".into()));
-        let fetch = web_fetch(None, Some("http://render".into()));
-        let bounds = [
-            ("DEFAULT_SEARCH_RESULTS", DEFAULT_SEARCH_RESULTS),
-            ("MAX_SEARCH_RESULTS", MAX_SEARCH_RESULTS),
-            ("DEFAULT_FETCH_CHARS", DEFAULT_FETCH_CHARS),
-            ("MAX_FETCH_CHARS", MAX_FETCH_CHARS),
-        ];
-        for tool in [&search, &fetch] {
-            let numbers = standalone_numbers(&tool.description);
-            for (name, value) in bounds {
+    fn neither_the_tool_nor_its_fields_invent_a_bound() {
+        for tool in [
+            web_search(None, Some("http://searx".into())),
+            web_fetch(None, Some("http://render".into())),
+        ] {
+            assert!(
+                standalone_numbers(&tool.description).is_empty(),
+                "{} 的描述里出现了一个数：上限与默认值属于执行它的代码，不属于描述: {}",
+                tool.name,
+                tool.description
+            );
+            for (field, schema) in tool.parameters["properties"]
+                .as_object()
+                .into_iter()
+                .flatten()
+            {
+                let text = schema["description"].as_str().unwrap_or_default();
                 assert!(
-                    !numbers.contains(&value),
-                    "{} copies {name} ({value}) into its description: {}",
-                    tool.name,
-                    tool.description
+                    standalone_numbers(text).is_empty(),
+                    "{} 的 {field} 字段又开始自己声明一个数了：不设默认、不设上限: {text}",
+                    tool.name
                 );
             }
         }
-        assert!(
-            search.parameters["properties"]["limit"]["description"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(&MAX_SEARCH_RESULTS.to_string()),
-            "the search cap is no longer published by the field that enforces it"
-        );
-        assert!(
-            fetch.parameters["properties"]["max_chars"]["description"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(&MAX_FETCH_CHARS.to_string()),
-            "the fetch cap is no longer published by the field that enforces it"
-        );
     }
 
     #[tokio::test]
@@ -1525,6 +1492,42 @@ mod tests {
         assert!(
             out.get("answers").is_none(),
             "an empty list is left out rather than shown as an empty answer: {out}"
+        );
+    }
+
+    /// 不设默认、不设上限：调用方不说，请求里就没有 `limit`，由后端自己的
+    /// 默认回答；说了，就照它说的要，不再夹到一个人挑的数上。
+    #[tokio::test]
+    async fn a_search_carries_only_the_limit_the_caller_asked_for() {
+        let body = r#"{"results":[
+             {"title":"Rust","url":"https://example.com/rust","content":"notes"}],
+           "answers":[]}"#;
+
+        let scripted = Scripted::answering(200, cog_core::CONTENT_TYPE_JSON, body);
+        let tool = web_search(client_of(&scripted), Some("http://searx".into()));
+        let out = call(&tool, serde_json::json!({"query": "rust 2024"}))
+            .await
+            .expect("a healthy backend answers");
+        let asked = scripted.asked();
+        assert!(
+            !asked[0].url.contains("limit="),
+            "no default is invented when the caller stays silent: {}",
+            asked[0].url
+        );
+        assert!(
+            out["limit"].is_null(),
+            "the answer says no limit was asked for rather than naming one: {out}"
+        );
+
+        let scripted = Scripted::answering(200, cog_core::CONTENT_TYPE_JSON, body);
+        let tool = web_search(client_of(&scripted), Some("http://searx".into()));
+        call(&tool, serde_json::json!({"query": "rust 2024", "limit": 100}))
+            .await
+            .expect("a healthy backend answers");
+        assert!(
+            scripted.asked()[0].url.contains("limit=100"),
+            "the caller's number is asked for as given, not clamped: {}",
+            scripted.asked()[0].url
         );
     }
 
