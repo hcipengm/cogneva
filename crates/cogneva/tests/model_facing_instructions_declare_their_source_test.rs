@@ -15,7 +15,7 @@
 //! 改 `prompts/` 的任何一个字都不影响它们，而没有一道门看见它们。
 //! 本门按承载形状普查到的**点**比文本多（一条文本可以在几处出现，一个函数里的每
 //! 行字面量各算一点——门要报的是「哪一行没表态」）：2026-11-17 量到 330 个载体点、
-//! 27 个函数、7484 字节。读数由测试自己印出来，`cargo test … -- --nocapture` 就是
+//! 27 个函数、7342 字节。读数由测试自己印出来，`cargo test … -- --nocapture` 就是
 //! 重新量一次；别的地方不要手抄这三个数。
 //!
 //! 字节数有一道只降不升的预算（`the_prompt_surface_only_shrinks`）：普查回答「每一行
@@ -607,11 +607,11 @@ fn carried_over(rows: Vec<(String, Vec<Row>)>, sites: &[Site]) -> usize {
 fn the_prompt_surface_only_shrinks() {
     let root = repo_root();
     let measured = carried_bytes(&root);
-    // cap: derived — 由树上的这些点现算（2026-11-17 实测 7484）；删字时跟着降，
+    // cap: derived — 由树上的这些点现算（2026-11-17 实测 7342）；删字时跟着降，
     // 往上抬要在提交信息里说清新增的是哪一段、凭什么非有不可。2026-11-17 从 7042
     // 抬到 7484 不是字变多了，是普查面变宽了：系统消息按调用点算之后，参数写在
     // 常量或 format! 里的那一半也进了这份读数（此前 54 个点看不见）。
-    const BUDGET: usize = 7_484;
+    const BUDGET: usize = 7_342;
     assert!(
         measured <= BUDGET,
         "模型每回合要为这些点付 {measured} 字节，预算是 {BUDGET}：要么删掉长出来的那段，\

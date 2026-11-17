@@ -365,11 +365,16 @@ async fn every_stable_half_carries_the_answer_shape_and_nothing_else() {
     }
 }
 
-/// 分解被要求在每一片上说清交什么，并且明确不许从座位名反推。
+/// 分解被要求在每一片上说清交什么，且说出的词就是任务行认的那个闭集。
 ///
 /// 计划是平台自己的生产者：它比外部提交者更清楚每一片要交出哪种产物。字段一旦
 /// 从契约里掉出去，模型就不会再答，任务行从此回到「没人说」——差分与判据那一侧
 /// 全绿，因为问题不在读的那一端。
+///
+/// 判据是 `Deliverable::as_str` 的每个词都在契约里，不是某一句劝告在不在：
+/// 「别从座位名反推」是一句话，没有东西检查它，契约里留着它只是每轮多付一句；
+/// 词表才是任务行读得懂的那一半，缺一个词，生产者就会写出一个 `Deliverable::parse`
+/// 不认的拼法，行上于是回到「说了一个认不出的词」。
 #[tokio::test]
 async fn the_planner_asks_each_sub_task_what_it_delivers() {
     let roles = two_prompts_from_every_actor().await;
@@ -383,10 +388,19 @@ async fn the_planner_asks_each_sub_task_what_it_delivers() {
         contract.contains("\"delivers\""),
         "分解契约不再问每一片交什么，任务行会退回「没人说」：{contract}"
     );
-    assert!(
-        contract.contains("never from the executor's name"),
-        "契约没有说清交付物不能从座位名反推：{contract}"
-    );
+    for kind in [
+        cog_core::Deliverable::Plan,
+        cog_core::Deliverable::Change,
+        cog_core::Deliverable::Judgement,
+        cog_core::Deliverable::Answer,
+        cog_core::Deliverable::WorkProduct,
+    ] {
+        assert!(
+            contract.contains(kind.as_str()),
+            "分解契约没有点名 `{}`，生产者写出的这个词任务行不认识：{contract}",
+            kind.as_str()
+        );
+    }
 }
 
 /// No actor hands the model a role to play.

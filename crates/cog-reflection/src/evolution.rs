@@ -58,8 +58,7 @@ pub mod fallback {
              - name: tool name (suggest a new name like {}_v2 or {}_improved)\n\
              - description: concise description of what the tool does\n\
              - parameters: valid JSON Schema object describing input parameters\n\
-             - implementation_hint: string describing implementation approach (e.g., \"native\", \"wasm\", \"rhai\")\n\n\
-             Respond with ONLY the JSON object.",
+             - implementation_hint: string describing implementation approach (e.g., \"native\", \"wasm\", \"rhai\")",
             tool_name, error_patterns, tool_name, tool_name
         )
     }

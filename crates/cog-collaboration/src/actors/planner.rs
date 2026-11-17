@@ -266,7 +266,7 @@ impl PlannerActor {
                 "summary": "string: concise plan summary",
                 "plan": "object: structured plan details (may be empty for self-evolution execution)",
                 "sub_tasks": "array: empty for self-evolution execution, otherwise TaskSpec objects",
-                "targets": "array of strings: repository-relative paths the change must touch, read from the checkout before you name them"
+                "targets": "array of strings: repository-relative paths the change must touch"
             });
         } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
             // Built-in contract for standard goal decomposition. Lowest
@@ -281,8 +281,8 @@ impl PlannerActor {
                     "task_type": "string: the id of the executor this sub-task should be handed to, from task.input.executors, or a generic executor type if none of them fits",
                     "input": {"query": "string: everything the executor needs to accomplish this task"},
                     "blocked_by": ["string: ids of tasks that must finish first, empty if none"],
-                    "acceptance": ["string: this sub-task's own criteria; at least one per entry, each checkable true/false"],
-                    "delivers": "string: what this sub-task hands back, one of plan|change|judgement|answer|work_product — read it from the work itself, never from the executor's name or type"
+                    "acceptance": ["string: this sub-task's own criteria, each checkable true/false"],
+                    "delivers": "string: what this sub-task hands back, one of plan|change|judgement|answer|work_product"
                 }],
                 "acceptance_criteria": ["string: one verifiable criterion per entry; each must be checkable as true/false against the final output"]
             });
