@@ -651,10 +651,7 @@ mod tests {
             ),
             ("the metric-name convention", "The metric name set"),
             ("the reproduction pair", "not_reproduced"),
-            (
-                "how to paste a diff",
-                "do not wrap it in markdown fences",
-            ),
+            ("how to paste a diff", "do not wrap it in markdown fences"),
         ] {
             assert!(
                 !text.contains(needle),

@@ -1019,7 +1019,10 @@ mod fence_tests {
         // 只开不关的不是一段被包起来的正文，不动。
         assert_eq!(unwrap_fence("```\na\n```\nb"), "```\na\n```\nb");
         assert_eq!(unwrap_fence("```a```"), "```a```");
-        assert_eq!(unwrap_fence("```\n```rust\nlet a = 1;\n```\n```"), "```rust\nlet a = 1;\n```");
+        assert_eq!(
+            unwrap_fence("```\n```rust\nlet a = 1;\n```\n```"),
+            "```rust\nlet a = 1;\n```"
+        );
     }
 
     /// 原文本身就是一段代码时，围栏是原文的一部分。
