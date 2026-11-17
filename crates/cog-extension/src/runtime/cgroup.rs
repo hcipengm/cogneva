@@ -316,6 +316,10 @@ pub fn record_cage(reading: CageReading) {
     match reading {
         CageReading::Peak { bytes, oom_kills } => {
             metrics().command_peak.observe(bytes as f64);
+            // Kept as a value beside the histogram: the price one command is
+            // planned against has to be readable, and a histogram cannot be
+            // asked what its samples were.
+            record_peak(bytes);
             metrics().cages.with_label_values(&["measured"]).inc();
             // A kill charged to this command's own cage is this command's,
             // not a guess from the container-wide counter moving while it
@@ -328,6 +332,36 @@ pub fn record_cage(reading: CageReading) {
         CageReading::Unaccounted => metrics().cages.with_label_values(&["unaccounted"]).inc(),
         CageReading::Unavailable => metrics().cages.with_label_values(&["unavailable"]).inc(),
     }
+}
+
+/// The peaks of the last commands that could report one, oldest first.
+///
+/// The histogram answers "what does a command cost on this deployment"; a
+/// price to plan against needs the same reading as a value, and a lifetime
+/// maximum would stop moving after the first heavy command. The window is the
+/// same one the build lane prices builds from, so a reader comparing the two
+/// is comparing like with like.
+static RECENT_PEAKS: std::sync::Mutex<std::collections::VecDeque<u64>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn record_peak(bytes: u64) {
+    let mut peaks = RECENT_PEAKS.lock().unwrap_or_else(|p| p.into_inner());
+    if peaks.len() == crate::pressure::DEMAND_WINDOW {
+        peaks.pop_front();
+    }
+    peaks.push_back(bytes);
+}
+
+/// The peaks of the last commands that could report one, oldest first. Empty
+/// until a command's cage has been read, which is the reading `Demand` names as
+/// missing rather than pricing the work at nothing.
+pub fn recent_peaks() -> Vec<u64> {
+    RECENT_PEAKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .copied()
+        .collect()
 }
 
 /// Counter for commands the cgroup OOM killer took. The limit and the peak are
@@ -655,6 +689,27 @@ mod tests {
         assert!(names
             .iter()
             .any(|n| n == "sandbox_command_memory_peak_bytes"));
+    }
+
+    /// What one command is planned to cost is read from a window of finished
+    /// commands, not from a lifetime maximum: a heavy command ages out once
+    /// enough others have finished behind it.
+    #[test]
+    fn the_price_window_follows_the_commands_that_finish() {
+        let width = crate::pressure::DEMAND_WINDOW as u64;
+        for peak in 0..width + 3 {
+            record_cage(CageReading::Peak {
+                bytes: peak + 1,
+                oom_kills: None,
+            });
+        }
+        let peaks = recent_peaks();
+        assert_eq!(peaks.len(), crate::pressure::DEMAND_WINDOW);
+        assert_eq!(peaks.last().copied(), Some(width + 3));
+        assert!(
+            !peaks.contains(&1),
+            "the oldest sample outlived the window: {peaks:?}"
+        );
     }
 
     #[test]

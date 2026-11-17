@@ -28,6 +28,7 @@ use tracing::warn;
 
 use crate::hostdocs::{HostDocOp, HostDocPlan, HostDocs};
 use crate::lane_sizing::{self, BuildCost, BuildEnd, BuildSample, LanePlan, LaneSource};
+use crate::pressure::{self, Pressure};
 use crate::runtime::cgroup::CgroupFacts;
 use crate::workdir::{self, CarryError, CommandHold, WorkdirRouter};
 
@@ -54,6 +55,10 @@ struct AppState {
     /// one thing on this side that emits no progress, so it is the one thing
     /// still judged by a duration — measured, not declared.
     queue_waits: Arc<BuildQueueWindow>,
+    /// The room running commands have claimed on this replica. One ledger for
+    /// both paths that admit work, so a command admitted on the tool path is
+    /// part of what the build lane plans against.
+    pressure: Arc<pressure::Ledger>,
 }
 
 /// The concurrency the deployment declared, from
@@ -938,6 +943,46 @@ async fn execute_handler(
                 command = %command,
                 "sandbox executor running command"
             );
+            // A command that compiles nothing takes no build slot, and it
+            // still asks the question the build lane asks: is there room for
+            // it here? One verdict answers both -- see
+            // [`crate::pressure::admits`] -- and the place in line belongs to
+            // the build queue, not to this path.
+            //
+            // What it is priced at comes from the commands that have already
+            // finished, so a deployment that has priced nothing yet admits
+            // without a reservation and says so on the scrape surface.
+            let reservation = if crate::runtime::local::builds_the_tree(command) {
+                None
+            } else {
+                let demand =
+                    pressure::Demand::from_samples(&crate::runtime::cgroup::recent_peaks());
+                match pressure::wait_for_admission(
+                    &state.pressure,
+                    |reserved| Pressure::from_facts(&crate::runtime::cgroup::read(), reserved),
+                    &demand,
+                    || state.pressure.open_count() > 0 || state.build_lane.holding() > 0,
+                    state.queue_waits.window(),
+                )
+                .await
+                {
+                    Ok(admitted) => admitted.into_reservation(),
+                    // A wait that outlived this executor's measured queue is a
+                    // refusal, not a failure: 503 says ask again, 500 would say
+                    // the request was broken.
+                    Err(refusal) => {
+                        let message = format!(
+                            "the container had no room for this command for {}s                              (this executor's queue is normally {}s); ask again later",
+                            refusal.waited.as_secs(),
+                            refusal.window.as_secs()
+                        );
+                        return watch.end(
+                            error_response(StatusCode::SERVICE_UNAVAILABLE, message),
+                            Outcome::Refused,
+                        );
+                    }
+                }
+            };
             // A command that compiles waits its turn here, before its child
             // exists. The wall handed to the child starts when the child does,
             // so time spent queued is not time spent compiling: without this,
@@ -986,6 +1031,7 @@ async fn execute_handler(
                 build_target.as_deref(),
                 worktree_claim,
                 build_slot,
+                reservation,
             ) {
                 // The command's outcome is its own exit code, which arrives as
                 // the last event; the watch reads it there.
@@ -1161,6 +1207,10 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
         body.push_str(&crate::build_cache::render(router.build_cache()).await);
     }
     body.push_str(&crate::runtime::cgroup::render());
+    // Whether work may start, and what it is priced at: the other half of the
+    // memory reading above, and the only place the three verdicts are told
+    // apart.
+    body.push_str(&crate::pressure::render());
     // What each payload cost, at the boundary that owns the wait. Rendered
     // unconditionally: a deployment without a workdir router still runs file
     // operations, and a latency reading that only existed on some deployments
@@ -1211,6 +1261,10 @@ pub struct BuildLane {
     /// first compiling command. Free bytes are read off it at planning time;
     /// until it is known, the disk bound is unmeasured.
     target_base: std::sync::Mutex<Option<PathBuf>>,
+    /// The room running commands have claimed, as the command path records it.
+    /// Planning against the smaller figure is what makes the two paths share
+    /// one account instead of each believing it has the container to itself.
+    pressure_ledger: Arc<pressure::Ledger>,
 }
 
 struct LaneState {
@@ -1287,7 +1341,11 @@ impl LaneState {
 const LANE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl BuildLane {
-    fn new(declared: Option<usize>, commands: Arc<CommandMetrics>) -> Arc<Self> {
+    fn new(
+        declared: Option<usize>,
+        commands: Arc<CommandMetrics>,
+        pressure_ledger: Arc<pressure::Ledger>,
+    ) -> Arc<Self> {
         let lane = Arc::new(Self {
             declared,
             inner: std::sync::Mutex::new(LaneState {
@@ -1301,6 +1359,7 @@ impl BuildLane {
             commands,
             cost: std::sync::Mutex::new(BuildCost::default()),
             target_base: std::sync::Mutex::new(None),
+            pressure_ledger,
         });
         // 没有运行时就没人采样：单元测试里成本保持「没量到」，规划因此给 1，
         // 与树上没人量过时的答案一致。
@@ -1376,7 +1435,15 @@ impl BuildLane {
     /// 同一套算术，读数由调用方给：判据用夹具喂它，不用这台机器的 cgroup。
     fn plan_with(&self, facts: &CgroupFacts, free_bytes: Option<u64>) -> LanePlan {
         let cost = self.cost();
-        let plan = lane_sizing::plan_lanes(facts.limit_bytes, free_bytes, &cost, self.declared);
+        // The three figures the command path is judged on, read the same way:
+        // the container's limit, what is resident with no build running, and
+        // what running commands have reserved.
+        let pressure = Pressure::new(
+            facts.limit_bytes,
+            cost.baseline_bytes(),
+            self.pressure_ledger.reserved_bytes(),
+        );
+        let plan = lane_sizing::plan_lanes(&pressure, free_bytes, &cost, self.declared);
         drop(cost);
         self.commands.set_lane_capacity(plan);
         plan
@@ -1384,6 +1451,13 @@ impl BuildLane {
 
     fn capacity_now(&self) -> usize {
         self.plan().lanes
+    }
+
+    /// How many builds hold a lane right now. Asked by the command path when it
+    /// decides whether waiting for room could end: a running build is the most
+    /// likely thing to give that room back.
+    fn holding(&self) -> usize {
+        self.lock().holding.len()
     }
 
     /// 一条编译结束了：量它的代价、记它的结局，再把条数重算一次。
@@ -1830,24 +1904,36 @@ impl std::fmt::Display for LaneRefusal {
 
 pub fn router() -> Router {
     let commands = Arc::new(CommandMetrics::new());
+    let pressure = pressure::Ledger::new();
     app_router(AppState {
         workdir: None,
         hostdocs: None,
-        build_lane: BuildLane::new(build_concurrency(), Arc::clone(&commands)),
+        build_lane: BuildLane::new(
+            build_concurrency(),
+            Arc::clone(&commands),
+            Arc::clone(&pressure),
+        ),
         commands,
         queue_waits: Arc::new(BuildQueueWindow::new()),
+        pressure,
     })
 }
 
 /// Full router wiring a provisioned workdir router.
 pub fn app_router_with_workdir(workdir: Arc<WorkdirRouter>) -> Router {
     let commands = Arc::new(CommandMetrics::new());
+    let pressure = pressure::Ledger::new();
     app_router(AppState {
         workdir: Some(workdir),
         hostdocs: None,
-        build_lane: BuildLane::new(build_concurrency(), Arc::clone(&commands)),
+        build_lane: BuildLane::new(
+            build_concurrency(),
+            Arc::clone(&commands),
+            Arc::clone(&pressure),
+        ),
         commands,
         queue_waits: Arc::new(BuildQueueWindow::new()),
+        pressure,
     })
 }
 
@@ -1857,12 +1943,18 @@ pub fn app_router_with_hostdocs(
     hostdocs: Arc<HostDocs>,
 ) -> Router {
     let commands = Arc::new(CommandMetrics::new());
+    let pressure = pressure::Ledger::new();
     app_router(AppState {
         workdir,
         hostdocs: Some(hostdocs),
-        build_lane: BuildLane::new(build_concurrency(), Arc::clone(&commands)),
+        build_lane: BuildLane::new(
+            build_concurrency(),
+            Arc::clone(&commands),
+            Arc::clone(&pressure),
+        ),
         commands,
         queue_waits: Arc::new(BuildQueueWindow::new()),
+        pressure,
     })
 }
 
@@ -2224,12 +2316,18 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let commands = Arc::new(CommandMetrics::new());
+    let pressure = pressure::Ledger::new();
     let app = app_router(AppState {
         workdir,
         hostdocs,
-        build_lane: BuildLane::new(build_concurrency(), Arc::clone(&commands)),
+        build_lane: BuildLane::new(
+            build_concurrency(),
+            Arc::clone(&commands),
+            Arc::clone(&pressure),
+        ),
         commands,
         queue_waits: Arc::new(BuildQueueWindow::new()),
+        pressure,
     });
 
     tracing::info!(addr = %addr, "sandbox executor listening");
@@ -2294,7 +2392,7 @@ mod tests {
     #[test]
     fn a_measured_one_and_an_unmeasured_one_read_differently() {
         let commands = Arc::new(CommandMetrics::new());
-        let lane = BuildLane::new(None, Arc::clone(&commands));
+        let lane = BuildLane::new(None, Arc::clone(&commands), pressure::Ledger::new());
         let gib = 1u64 << 30;
 
         let blind = lane.plan_with(&CgroupFacts::default(), None);
@@ -2340,7 +2438,7 @@ mod tests {
         // 同样的容器、更便宜的一条编译：同一次算术给出 6 条，而不是停在 1。
         // （另一条队而不是往同一个窗口里再记一条：代价取的是窗口里的最大值，
         // 例如一条 4 GiB 的编译还在窗口里时，新记一条小的不会把价格压下来。）
-        let cheaper = BuildLane::new(None, Arc::clone(&commands));
+        let cheaper = BuildLane::new(None, Arc::clone(&commands), pressure::Ledger::new());
         {
             let mut cost = cheaper.cost();
             cost.observe(gib / 2, 0);
@@ -2362,7 +2460,7 @@ mod tests {
     #[test]
     fn a_finished_build_is_priced_when_it_releases_its_lane() {
         let commands = Arc::new(CommandMetrics::new());
-        let lane = BuildLane::new(Some(1), Arc::clone(&commands));
+        let lane = BuildLane::new(Some(1), Arc::clone(&commands), pressure::Ledger::new());
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("artifact"), vec![0u8; 123]).expect("write");
         let slot = BuildSlot {
@@ -2383,12 +2481,14 @@ mod tests {
 
     fn state_with_build_slots(n: usize) -> AppState {
         let commands = Arc::new(CommandMetrics::new());
+        let pressure = pressure::Ledger::new();
         AppState {
             workdir: None,
             hostdocs: None,
-            build_lane: BuildLane::new(Some(n), Arc::clone(&commands)),
+            build_lane: BuildLane::new(Some(n), Arc::clone(&commands), Arc::clone(&pressure)),
             commands,
             queue_waits: Arc::new(BuildQueueWindow::new()),
+            pressure,
         }
     }
 
@@ -2573,7 +2673,7 @@ mod tests {
     #[tokio::test]
     async fn the_lane_turns_by_agent_not_by_arrival() {
         let commands = Arc::new(CommandMetrics::new());
-        let lane = BuildLane::new(Some(1), Arc::clone(&commands));
+        let lane = BuildLane::new(Some(1), Arc::clone(&commands), pressure::Ledger::new());
         let held = lane
             .acquire(Some("a"), "run_command", None)
             .await
@@ -2712,7 +2812,7 @@ mod tests {
     #[tokio::test]
     async fn ten_builds_from_one_agent_do_not_bury_the_other() {
         let commands = Arc::new(CommandMetrics::new());
-        let lane = BuildLane::new(Some(1), Arc::clone(&commands));
+        let lane = BuildLane::new(Some(1), Arc::clone(&commands), pressure::Ledger::new());
         let held = lane
             .acquire(Some("a"), "run_command", None)
             .await
@@ -4102,5 +4202,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(nothing.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+    /// The two paths share one account: room a running command has reserved
+    /// shrinks what the build lane plans, and releasing it gives the lane back.
+    /// With a ledger of its own on each side, both would plan against an empty
+    /// container and together over-subscribe it.
+    #[test]
+    fn room_reserved_by_a_running_command_shrinks_what_the_build_lane_plans() {
+        const GIB: u64 = 1 << 30;
+        let state = state_with_build_slots(4);
+        // No declared count: a written one wins over every reading, and this
+        // test is about the reading.
+        let lane = BuildLane::new(
+            None,
+            Arc::clone(&state.commands),
+            Arc::clone(&state.pressure),
+        );
+        {
+            let mut cost = lane.cost();
+            cost.observe(GIB, 0);
+            cost.record(
+                BuildSample {
+                    peak_bytes: Some(2 * GIB),
+                    target_bytes: Some(GIB),
+                    wall: std::time::Duration::from_secs(60),
+                    beside: 1,
+                },
+                BuildEnd::Completed,
+            );
+        }
+        let facts = CgroupFacts {
+            limit_bytes: Some(8 * GIB),
+            ..Default::default()
+        };
+        // 例如：8 GiB 限额、1 GiB 常驻、一条编译 2 GiB——装得下三条，留一条。
+        assert_eq!(lane.plan_with(&facts, None).lanes, 2);
+
+        let held = state.pressure.reserve(4 * GIB);
+        assert_eq!(
+            lane.plan_with(&facts, None).lanes,
+            1,
+            "the lane planned as if the reserved room were free"
+        );
+        drop(held);
+        assert_eq!(lane.plan_with(&facts, None).lanes, 2);
     }
 }

@@ -256,6 +256,10 @@ fn looks_like_duration(word: &str) -> bool {
 /// holds among the builds allowed to compile into the shared target directory.
 /// It is released when the child is gone, not when the request is answered, so
 /// the next build starts against a directory nobody is writing.
+///
+/// `reservation` is the room this command claimed when it was admitted, and it
+/// is held under the same rule: the memory is free when the child is gone, so
+/// that is when the next planner may count it.
 pub(crate) fn spawn_command(
     command: &str,
     task_id: &str,
@@ -263,6 +267,7 @@ pub(crate) fn spawn_command(
     cargo_target: Option<&Path>,
     hold: Option<crate::workdir::CommandHold>,
     build_slot: Option<crate::command_server::BuildSlot>,
+    reservation: Option<crate::pressure::Reservation>,
 ) -> SFResult<tokio::sync::mpsc::Receiver<CommandEvent>> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
@@ -317,6 +322,7 @@ pub(crate) fn spawn_command(
         // Dropped when this task ends, i.e. after the child was waited for.
         let _hold = hold;
         let _build_slot = build_slot;
+        let _reservation = reservation;
         use tokio::io::AsyncReadExt;
         let tx_out = tx.clone();
         let tx_err = tx.clone();
@@ -608,7 +614,7 @@ impl SandboxBackend for LocalExecutor {
                 // Embedded use has no shared target directory to serialise:
                 // the command runs in whatever tree the caller's cwd names, so
                 // there is no slot to take here.
-                let rx = spawn_command(command, &req.task_id, None, None, None, None)?;
+                let rx = spawn_command(command, &req.task_id, None, None, None, None, None)?;
                 Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|event| (event, rx))
                 })))

@@ -32,6 +32,8 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use crate::pressure::{Demand, Pressure};
+
 /// How many finished builds the cost figures are read from.
 ///
 /// In builds rather than in seconds: a build is the event being priced, and
@@ -169,7 +171,7 @@ impl BuildCost {
 /// and never below one -- a lane count of zero stops compiling, and nothing
 /// would be left running to notice the pressure had cleared.
 pub fn plan_lanes(
-    limit_bytes: Option<u64>,
+    pressure: &Pressure,
     free_bytes: Option<u64>,
     cost: &BuildCost,
     declared: Option<usize>,
@@ -186,13 +188,15 @@ pub fn plan_lanes(
             source: LaneSource::OomKilled,
         };
     }
-    let memory = match (limit_bytes, cost.baseline_bytes(), cost.peak_bytes()) {
-        (Some(limit), Some(baseline), Some(peak)) if peak > 0 => {
-            let room = limit.saturating_sub(baseline);
-            Some(((room / peak).saturating_sub(1) as usize).max(1))
-        }
-        _ => None,
-    };
+    // The memory bound is the shared answer, not a second version of it: the
+    // room comes from [`Pressure`] and the price from [`Demand`], and one
+    // build's worth is kept back because a build that has not finished has not
+    // yet peaked -- planning up to the limit means the step that reaches the
+    // plan is the step the kernel kills.
+    let demand = Demand::from_peak(cost.peak_bytes());
+    let memory = pressure
+        .fits(&demand)
+        .map(|fit| fit.saturating_sub(1).max(1));
     let disk = match (free_bytes, cost.target_bytes()) {
         (Some(free), Some(target)) if target > 0 => Some((1 + free / target) as usize),
         _ => None,
@@ -216,16 +220,16 @@ pub fn plan_lanes(
         },
         (None, None) => LanePlan {
             lanes: 1,
-            source: LaneSource::Unmeasured(missing_reading(limit_bytes, free_bytes, cost)),
+            source: LaneSource::Unmeasured(missing_reading(pressure, free_bytes, cost)),
         },
     }
 }
 
 /// Which reading a reader should go and look at first.
-fn missing_reading(limit: Option<u64>, free: Option<u64>, cost: &BuildCost) -> &'static str {
-    if limit.is_none() {
+fn missing_reading(pressure: &Pressure, free: Option<u64>, cost: &BuildCost) -> &'static str {
+    if pressure.limit_bytes().is_none() {
         "memory limit"
-    } else if cost.baseline_bytes().is_none() {
+    } else if pressure.working_set_bytes().is_none() {
         "idle working set"
     } else if cost.peak_bytes().is_none() {
         "cost of one build"
@@ -264,11 +268,21 @@ mod tests {
         cost
     }
 
+    /// The room as the build lane holds it: the container's limit, and what was
+    /// resident with no build running as the working set to measure from.
+    fn room(limit: Option<u64>, baseline: Option<u64>) -> Pressure {
+        Pressure::new(limit, baseline, 0)
+    }
+
+    fn priced_room(limit: u64) -> Pressure {
+        room(Some(limit), Some(512 * 1024 * 1024))
+    }
+
     /// The distinction the whole module exists for: a count of one that was
     /// measured and a count of one nobody could measure are the same count.
     #[test]
     fn no_reading_is_not_a_calm_container() {
-        let plan = plan_lanes(None, None, &BuildCost::default(), None);
+        let plan = plan_lanes(&room(None, None), None, &BuildCost::default(), None);
         assert_eq!(plan.lanes, 1);
         assert!(matches!(
             plan.source,
@@ -276,7 +290,7 @@ mod tests {
         ));
 
         let cost = BuildCost::default();
-        let plan = plan_lanes(Some(8 * GIB), Some(100 * GIB), &cost, None);
+        let plan = plan_lanes(&room(Some(8 * GIB), None), Some(100 * GIB), &cost, None);
         assert_eq!(plan.lanes, 1);
         assert!(matches!(
             plan.source,
@@ -290,7 +304,7 @@ mod tests {
         // 例如：8 GiB 限额、0.5 GiB 空闲、一条编译峰 4 GiB——余地装得下一条半，
         // 最后一个位子留着。
         let cost = priced(&[sample(4 * GIB, 3 * GIB)]);
-        let plan = plan_lanes(Some(8 * GIB), Some(100 * GIB), &cost, None);
+        let plan = plan_lanes(&priced_room(8 * GIB), Some(100 * GIB), &cost, None);
         assert_eq!(plan.lanes, 1);
         assert_eq!(plan.source, LaneSource::Measured("memory"));
     }
@@ -299,12 +313,12 @@ mod tests {
     fn the_memory_bound_and_the_disk_bound_are_read_against_each_other() {
         // 例如：余地 7.5 GiB、一条编译峰 2 GiB——装三条，留一条。
         let cost = priced(&[sample(2 * GIB, 20 * GIB)]);
-        let plan = plan_lanes(Some(8 * GIB), Some(100 * GIB), &cost, None);
+        let plan = plan_lanes(&priced_room(8 * GIB), Some(100 * GIB), &cost, None);
         assert_eq!(plan.lanes, 2, "{plan:?}");
         assert_eq!(plan.source, LaneSource::Measured("memory"));
 
         // Same container, a volume with room for no second target directory.
-        let plan = plan_lanes(Some(8 * GIB), Some(10 * GIB), &cost, None);
+        let plan = plan_lanes(&priced_room(8 * GIB), Some(10 * GIB), &cost, None);
         assert_eq!(plan.lanes, 1, "{plan:?}");
         assert_eq!(plan.source, LaneSource::Measured("disk"));
     }
@@ -315,7 +329,7 @@ mod tests {
     fn a_build_that_has_aged_out_of_the_window_stops_setting_the_price() {
         let mut cost = priced(&[sample(6 * GIB, GIB)]);
         assert_eq!(
-            plan_lanes(Some(8 * GIB), Some(100 * GIB), &cost, None).lanes,
+            plan_lanes(&priced_room(8 * GIB), Some(100 * GIB), &cost, None).lanes,
             1
         );
         for _ in 0..WINDOW {
@@ -323,7 +337,7 @@ mod tests {
         }
         assert_eq!(cost.peak_bytes(), Some(GIB));
         assert_eq!(
-            plan_lanes(Some(8 * GIB), Some(100 * GIB), &cost, None).lanes,
+            plan_lanes(&priced_room(8 * GIB), Some(100 * GIB), &cost, None).lanes,
             6
         );
     }
@@ -335,7 +349,7 @@ mod tests {
     fn an_oom_holds_the_count_until_a_build_finishes_again() {
         let mut cost = priced(&[sample(GIB, GIB)]);
         cost.record(sample(GIB, GIB), BuildEnd::OomKilled);
-        let plan = plan_lanes(Some(8 * GIB), Some(100 * GIB), &cost, None);
+        let plan = plan_lanes(&priced_room(8 * GIB), Some(100 * GIB), &cost, None);
         assert_eq!(plan.lanes, 1);
         assert_eq!(plan.source, LaneSource::OomKilled);
         // The killed build was not priced: its target directory was half
@@ -344,7 +358,7 @@ mod tests {
 
         cost.record(sample(GIB, GIB), BuildEnd::Completed);
         assert_eq!(
-            plan_lanes(Some(8 * GIB), Some(100 * GIB), &cost, None).lanes,
+            plan_lanes(&priced_room(8 * GIB), Some(100 * GIB), &cost, None).lanes,
             6
         );
     }
@@ -352,12 +366,12 @@ mod tests {
     /// A count written down by the deployment wins, and says so.
     #[test]
     fn a_declared_count_is_taken_as_written() {
-        let plan = plan_lanes(None, None, &BuildCost::default(), Some(4));
+        let plan = plan_lanes(&room(None, None), None, &BuildCost::default(), Some(4));
         assert_eq!(plan.lanes, 4);
         assert!(matches!(plan.source, LaneSource::Overridden(_)));
         // Zero is how a config spells "I did not write one".
         let plan = plan_lanes(
-            Some(8 * GIB),
+            &priced_room(8 * GIB),
             Some(100 * GIB),
             &priced(&[sample(GIB, GIB)]),
             Some(0),
