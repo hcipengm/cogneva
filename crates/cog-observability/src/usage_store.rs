@@ -457,12 +457,23 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS refused_scope TEXT;
 -- afterwards, so the constraint is NOT VALID -- it checks every row inserted
 -- from here on and leaves history as the history it is. Refusals may spend
 -- nothing and name no task; the condition says exactly that.
--- 同一条约束在迁移链里也有一份（老库由它补上）。这里写成一条平语句而不是
--- `DO` 块：启动批次里的语句要能被「库的 catalog 已满足」读出来（`schema_ddl` 的
--- 守卫），读过之后就不必在每次启动时再向一张有写入的表要 ACCESS EXCLUSIVE；
--- `DO` 块是读不懂的形状，它会让整批每次启动都照跑。
-ALTER TABLE gateway_llm_usage ADD CONSTRAINT usage_that_spent_names_its_task
-    CHECK (tokens_input + tokens_output <= 0 OR task_id IS NOT NULL) NOT VALID;
+-- 同一条约束在迁移链里也有一份（老库由它补上）。这里必须可重入：这张表的
+-- `init_schema` 每个进程启动都跑一遍，而这一批里另有两条 `DO` 块（窗口主键与
+-- rollup 的 origin），整批因此本来就不受 catalog 守卫保护——一条平写的
+-- `ADD CONSTRAINT` 在第二个进程启动时就是 "already exists"，而那条错误发生在
+-- 建表这一步，测试与部署都在这里停下。
+DO $invariant$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'usage_that_spent_names_its_task'
+           AND conrelid = 'gateway_llm_usage'::regclass
+    ) THEN
+        ALTER TABLE gateway_llm_usage ADD CONSTRAINT usage_that_spent_names_its_task
+            CHECK (tokens_input + tokens_output <= 0 OR task_id IS NOT NULL) NOT VALID;
+    END IF;
+END
+$invariant$;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
 -- 窗口配速那一次读按 `(upstream, result)` 与 `(upstream, refusal_kind)` 各取一
 -- 小撮，而表里绝大多数行是熔断拒绝（`upstream = '-'`，与任何一家都不匹配）。没有

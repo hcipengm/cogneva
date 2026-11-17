@@ -463,9 +463,14 @@ jobs:
           fetch-depth: 0
       # detached HEAD 的检出里没有 `refs/heads/main`，判据会以「trunk 不在」退出 3——
       # 那是「判不了」，不是合格。先把 trunk 建成一个本地头再判。
+      #
+      # 有的 checkout 形态会把 main 直接检出（那时 `git branch -f main` 报
+      # `cannot force update the branch 'main' used by worktree`）；两种形态都要能跑，
+      # 所以「没有才建」。
       - name: Check the repository carries one branch, main
         run: |
-          git branch -f main origin/main
+          git rev-parse --verify --quiet refs/heads/main >/dev/null ||
+            git branch -f main origin/main
           bash deploy/scripts/check-branch-convergence.sh . --trunk main --remote origin --single
 
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读

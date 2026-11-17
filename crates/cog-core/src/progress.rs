@@ -512,6 +512,10 @@ where
     // 自己的进程组：`sh -c "cargo build"`、`docker exec …` 都不是一个进程。只杀
     // 领头的那一个，它启动的编译器还活着、还占着共享构建目录的锁——集群上实测过
     // 这一幕：外壳被砍了，cargo 继续攥着锁，后面每一轮都在自己的墙前编译了零个文件。
+    //
+    // 进程组是 unix 的概念，`process_group` 也只有 unix 上有：三平台都要编得过，
+    // 所以这一步按平台门控；收进程本身（`start_kill`）三平台同一句。
+    #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd.spawn()?;
     if let Some(pid) = child.id() {

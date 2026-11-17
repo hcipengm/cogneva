@@ -265,9 +265,13 @@ mod tests {
             &cog_observability::usage_store::ddl(),
         )
         .expect("the runner splits this text with the same splitter");
+        // 三条：窗口主键、rollup 的 origin 列，以及「花了 token 就得挂任务」那条
+        // 不变式。第三条必须是 `DO` 块而不是平写的 `ADD CONSTRAINT`——这一批里的
+        // 每条语句都会重跑，而约束建第二遍是错误；建不起来的代价落在「建表」这一步，
+        // 部署与夹具都在那里停下。
         assert_eq!(
             opaque.len(),
-            2,
+            3,
             "a start re-sends every statement the guard cannot read: {opaque:#?}"
         );
         for statement in &opaque {

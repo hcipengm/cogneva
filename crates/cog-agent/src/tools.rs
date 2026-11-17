@@ -1775,8 +1775,7 @@ mod tests {
         let tool = builtins::read_file();
         let described = tool.description.to_lowercase();
         assert!(
-            !described.contains("at most")
-                && !described.contains(&READ_FILE_MAX_BATCH.to_string()),
+            !described.contains("at most") && !described.contains(&READ_FILE_MAX_BATCH.to_string()),
             "the description restates the batch limit the schema and the refusal already carry: {}",
             tool.description
         );
