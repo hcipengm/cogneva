@@ -32,7 +32,9 @@
 //! the lane is back on the same replica, and whatever the replica itself says
 //! about the tree is the only fact about the work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use crate::pressure::Placement;
 
 /// How long a pin counts as live without being used again.
 ///
@@ -81,6 +83,11 @@ struct Hold {
 pub struct LeaseBook {
     live: HashMap<String, Hold>,
     next: usize,
+    /// The replicas this book was offered at its previous placement. A replica
+    /// that is not among them has appeared since -- that is capacity the
+    /// deployment added, and saying so is different from saying this lane
+    /// happened to take an emptier replica.
+    fleet: HashSet<String>,
 }
 
 /// Where a lane went and how it got there.
@@ -88,6 +95,8 @@ pub struct LeaseBook {
 pub struct Pinned {
     pub replica: String,
     pub grant: Grant,
+    /// Why this replica, in the four shapes the scrape surface can tell apart.
+    pub placement: Placement,
 }
 
 impl LeaseBook {
@@ -129,7 +138,7 @@ impl LeaseBook {
                     &elsewhere
                 };
                 (
-                    self.take_turn(destination)?,
+                    self.take_turn(lane, destination)?,
                     Grant::Moved {
                         from: hold.replica,
                         lapsed_secs: 0,
@@ -157,21 +166,42 @@ impl LeaseBook {
             // the pod): the hold has to move even though its clock has not
             // run out.
             Some(hold) if holds => (
-                self.take_turn(replicas)?,
+                self.take_turn(lane, replicas)?,
                 Grant::Moved {
                     from: hold.replica,
                     lapsed_secs: 0,
                 },
             ),
             Some(hold) => (
-                self.take_turn(replicas)?,
+                self.take_turn(lane, replicas)?,
                 Grant::Moved {
                     from: hold.replica,
                     lapsed_secs: now.saturating_sub(hold.until),
                 },
             ),
-            None => (self.take_turn(replicas)?, Grant::Fresh),
+            None => (self.take_turn(lane, replicas)?, Grant::Fresh),
         };
+        let placement = match &grant {
+            // The tree is here; staying is not a choice between replicas.
+            Grant::Extended | Grant::Resumed { .. } => Placement::Nailed {
+                replica: replica.clone(),
+            },
+            _ if replicas.len() == 1 => Placement::OnlyOne {
+                replica: replica.clone(),
+            },
+            // The fleet this book was last offered did not contain this
+            // replica: the placement used capacity that was added since, which
+            // is a different fact from picking the emptier of two.
+            _ if !self.fleet.is_empty() && !self.fleet.contains(&replica) => {
+                Placement::AddedReplica {
+                    replica: replica.clone(),
+                }
+            }
+            _ => Placement::Headroom {
+                replica: replica.clone(),
+            },
+        };
+        self.fleet = replicas.iter().cloned().collect();
         self.live.insert(
             lane.to_string(),
             Hold {
@@ -180,7 +210,11 @@ impl LeaseBook {
                 abandoned: false,
             },
         );
-        Some(Pinned { replica, grant })
+        Some(Pinned {
+            replica,
+            grant,
+            placement,
+        })
     }
 
     /// The replica a lane sits on, or `None` when nothing (live) holds it.
@@ -263,13 +297,38 @@ impl LeaseBook {
         self.live.values().filter(|hold| !hold.abandoned).count()
     }
 
-    fn take_turn(&mut self, replicas: &[String]) -> Option<String> {
+    /// The replica with the fewest of this book's lanes on it.
+    ///
+    /// The count is the caller's own: how many lanes this book holds on each
+    /// replica, which is a fact about this client. What a replica knows about
+    /// its own load is not readable from here, and inventing it would make
+    /// "spread by what I can see" and "spread by what it is doing" read the
+    /// same. Ties are broken by the rotation, so a fresh set of lanes still
+    /// spreads evenly instead of stacking on the first replica. A lane being
+    /// placed is not counted against its old replica: it is leaving.
+    fn take_turn(&mut self, lane: &str, replicas: &[String]) -> Option<String> {
         if replicas.is_empty() {
             return None;
         }
-        let replica = replicas[self.next % replicas.len()].clone();
-        self.next = self.next.wrapping_add(1);
-        Some(replica)
+        let start = self.next % replicas.len();
+        let mut best = start;
+        for offset in 1..replicas.len() {
+            let at = (start + offset) % replicas.len();
+            if self.held_on(&replicas[at], lane) < self.held_on(&replicas[best], lane) {
+                best = at;
+            }
+        }
+        self.next = (best + 1) % replicas.len();
+        Some(replicas[best].clone())
+    }
+
+    fn held_on(&self, replica: &str, except_lane: &str) -> usize {
+        self.live
+            .iter()
+            .filter(|(lane, hold)| {
+                hold.replica == replica && !hold.abandoned && lane.as_str() != except_lane
+            })
+            .count()
     }
 }
 
@@ -324,6 +383,93 @@ mod tests {
         book.adopt("agent-a", &replicas[0], 1_000, TTL);
         let again = book.pin("agent-a", &replicas, 1_010, TTL).unwrap();
         assert_eq!(again.replica, placed.replica);
+    }
+
+    /// 一副副本时说不出「平衡」：`OnlyOne` 与「挑中了最少的那副」是两件事，
+    /// 混在一起会让「只有一副可去」看起来像是导向的结果。
+    #[test]
+    fn a_single_replica_is_not_a_choice_between_replicas() {
+        let mut book = LeaseBook::default();
+        let replicas = vec!["http://executor-0:9090".to_string()];
+        let pinned = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        assert_eq!(
+            pinned.placement,
+            Placement::OnlyOne {
+                replica: replicas[0].clone()
+            }
+        );
+        assert_eq!(pinned.placement.reason(), "only_one");
+    }
+
+    /// 第一次放置没有「上一次的副本集合」可比较：读成余量，不读成「副本是
+    /// 新加的」——后者说的是部署加过容量，而这里什么也没加。
+    #[test]
+    fn the_first_placement_of_a_book_is_not_an_added_replica() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let first = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        assert_eq!(
+            first.placement,
+            Placement::Headroom {
+                replica: replicas[0].clone()
+            }
+        );
+    }
+
+    /// 留在原地的 lane 说的是「树在这副」，不是「这副最空」：它不参与平衡。
+    #[test]
+    fn a_lane_kept_on_its_tree_is_nailed_not_balanced() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let first = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        book.pin("agent-b", &replicas, 1_000, TTL).unwrap();
+        let again = book.pin("agent-a", &replicas, 1_010, TTL).unwrap();
+        assert_eq!(again.replica, first.replica);
+        assert_eq!(
+            again.placement,
+            Placement::Nailed {
+                replica: first.replica.clone()
+            }
+        );
+    }
+
+    /// 重活导向与 lane 路由是同一个判决：去向是这本簿在各副上持有的 lane 数
+    /// 最少的那副。放掉一条之后那一副重新变空，下一条新 lane 就去那里。
+    #[test]
+    fn a_lane_goes_to_the_replica_this_book_has_fewest_lanes_on() {
+        let mut book = LeaseBook::default();
+        let replicas = two();
+        let a = book.pin("agent-a", &replicas, 1_000, TTL).unwrap();
+        let b = book.pin("agent-b", &replicas, 1_000, TTL).unwrap();
+        assert_ne!(a.replica, b.replica);
+        assert!(book.release("agent-a", &a.replica));
+        let c = book.pin("agent-c", &replicas, 1_010, TTL).unwrap();
+        assert_eq!(c.replica, a.replica, "最空的那副没被挑中");
+        assert_eq!(
+            c.placement,
+            Placement::Headroom {
+                replica: a.replica.clone()
+            }
+        );
+    }
+
+    /// 上次放置之后才出现的副本：那是部署加进来的容量，不是这本簿挑中的余量。
+    #[test]
+    fn a_replica_that_appeared_since_the_last_placement_is_named_as_added() {
+        let mut book = LeaseBook::default();
+        let before = two();
+        book.pin("agent-a", &before, 1_000, TTL).unwrap();
+        book.pin("agent-b", &before, 1_000, TTL).unwrap();
+        let mut after = before.clone();
+        after.push("http://executor-2:9090".to_string());
+        let placed = book.pin("agent-c", &after, 1_001, TTL).unwrap();
+        assert_eq!(placed.replica, after[2]);
+        assert_eq!(
+            placed.placement,
+            Placement::AddedReplica {
+                replica: after[2].clone()
+            }
+        );
     }
 
     #[test]

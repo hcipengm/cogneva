@@ -198,6 +198,56 @@ pub fn admits(pressure: &Pressure, demand: &Demand) -> Admission {
     }
 }
 
+/// Where a lane landed, and why that replica.
+///
+/// Each reason is a number the client counted itself. `Nailed` is a pin this
+/// caller already holds: the tree is on that replica's volume and moving would
+/// trade it for nothing. `Headroom` is the replica carrying the fewest of this
+/// caller's lanes -- fewest, not fewest per the replica's own load, which this
+/// client cannot read; writing a preference for an unread figure here would be
+/// dressing an assumption up as a measurement. `AddedReplica` is a replica that
+/// was not in the fleet at the previous placement: the capacity was bought, not
+/// found. `OnlyOne` is no choice at all, and is kept apart from the others
+/// because a placement with one candidate says nothing about balance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    Nailed { replica: String },
+    Headroom { replica: String },
+    AddedReplica { replica: String },
+    OnlyOne { replica: String },
+}
+
+impl Placement {
+    pub fn replica(&self) -> &str {
+        match self {
+            Placement::Nailed { replica }
+            | Placement::Headroom { replica }
+            | Placement::AddedReplica { replica }
+            | Placement::OnlyOne { replica } => replica,
+        }
+    }
+
+    /// The reason as it appears on the scrape surface.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Placement::Nailed { .. } => "nailed",
+            Placement::Headroom { .. } => "headroom",
+            Placement::AddedReplica { .. } => "added_replica",
+            Placement::OnlyOne { .. } => "only_one",
+        }
+    }
+}
+
+/// Publish where a lane was placed and why. The replica itself is in the log
+/// line for the lane; the counter answers "is the fleet being steered, pinned,
+/// or outgrown", which is the question a reader of the scrape has.
+pub fn record_placement(placement: &Placement) {
+    metrics()
+        .placement
+        .with_label_values(&[placement.reason()])
+        .inc();
+}
+
 /// The room running work has claimed on this replica.
 ///
 /// One ledger per executor, shared by every path that admits work, so a command
@@ -386,6 +436,7 @@ where
 struct Metrics {
     registry: Registry,
     admission: IntCounterVec,
+    placement: IntCounterVec,
     reservations_open: IntGauge,
     headroom: IntGauge,
     demand: IntGauge,
@@ -402,6 +453,14 @@ fn metrics() -> &'static Metrics {
                 "Times work asked whether it could start, by the verdict and where the price came from",
             ),
             &["state", "source"],
+        )
+        .expect("static metric name and labels");
+        let placement = IntCounterVec::new(
+            prometheus::Opts::new(
+                "sandbox_lane_placement_total",
+                "Times a lane was placed on a replica, by why that replica",
+            ),
+            &["reason"],
         )
         .expect("static metric name and labels");
         let reservations_open = IntGauge::new(
@@ -427,8 +486,12 @@ fn metrics() -> &'static Metrics {
                 let _ = admission.with_label_values(&[state, source]);
             }
         }
+        for reason in ["nailed", "headroom", "added_replica", "only_one"] {
+            let _ = placement.with_label_values(&[reason]);
+        }
         for collector in [
             Box::new(admission.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(placement.clone()),
             Box::new(reservations_open.clone()),
             Box::new(headroom.clone()),
             Box::new(demand.clone()),
@@ -440,6 +503,7 @@ fn metrics() -> &'static Metrics {
         Metrics {
             registry,
             admission,
+            placement,
             reservations_open,
             headroom,
             demand,
@@ -685,5 +749,34 @@ mod tests {
         );
         drop(held);
         assert!(render().contains("sandbox_command_reservation_open 0"));
+    }
+
+    /// 四个落点原因从第一次抓取起就是四条各自为 0 的序列，记一次只推它自己
+    /// 那一条：读者能把「用钉子留住的」「被导向的」「靠加副本接住的」分开。
+    #[test]
+    fn each_placement_reason_is_its_own_series() {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let before = render();
+        for reason in ["nailed", "headroom", "added_replica", "only_one"] {
+            assert!(
+                before.contains(&format!(
+                    "sandbox_lane_placement_total{{reason=\"{reason}\"}} 0"
+                )),
+                "{before}"
+            );
+        }
+        record_placement(&Placement::Headroom {
+            replica: "http://executor-1:9090".into(),
+        });
+        let text = render();
+        assert!(
+            text.contains("sandbox_lane_placement_total{reason=\"headroom\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sandbox_lane_placement_total{reason=\"nailed\"} 0"),
+            "{text}"
+        );
     }
 }

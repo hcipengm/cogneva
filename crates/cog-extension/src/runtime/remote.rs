@@ -407,6 +407,10 @@ impl RemoteExecutor {
                 crate::executor_lease::LANE_LEASE_SECS,
             )
         }?;
+        // 每一次真正的放置都说出理由：「树在这副」「挑的是这本簿上最少的」
+        // 「这副是上次之后才出现的」「根本没有可挑的」——读者从计数上分得清
+        // 是用钉子留住的、被导向的，还是靠加副本接住的。
+        crate::pressure::record_placement(&pinned.placement);
         if let crate::executor_lease::Grant::Resumed { lapsed_secs } = &pinned.grant {
             tracing::info!(
                 lane,
