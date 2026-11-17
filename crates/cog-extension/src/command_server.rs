@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    body::Body,
-    extract::State,
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -29,7 +29,7 @@ use tracing::warn;
 use crate::hostdocs::{HostDocOp, HostDocPlan, HostDocs};
 use crate::lane_sizing::{self, BuildCost, BuildEnd, BuildSample, LanePlan, LaneSource};
 use crate::runtime::cgroup::CgroupFacts;
-use crate::workdir::{self, CommandHold, WorkdirRouter};
+use crate::workdir::{self, CarryError, CommandHold, WorkdirRouter};
 
 #[derive(Clone)]
 struct AppState {
@@ -284,6 +284,66 @@ fn error_response(status: StatusCode, message: String) -> Response {
         .status(status)
         .body(Body::from(message))
         .expect("static response")
+}
+
+/// 「没搬成」是哪一种，落成调用方能分辨的状态码。
+///
+/// 三件事在上层各有各的下文：没有树（404）不是故障，调用方身上本来就没东西可搬；
+/// 树在用（409）等一下再问；名字不能用（400）是调用方的错；其余（500）才是这副
+/// 副本自己没做到。折成一个 500 会让「换一副重试」和「改请求」看起来一样。
+fn carry_error_response(e: CarryError) -> Response {
+    let (status, message) = match e {
+        CarryError::NoTree(m) => (StatusCode::NOT_FOUND, m),
+        CarryError::Busy(m) => (StatusCode::CONFLICT, m),
+        CarryError::Refused(m) => (StatusCode::BAD_REQUEST, m),
+        CarryError::Failed(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+    };
+    error_response(status, message)
+}
+
+/// 把这条 lane 的树打成包交出去，让工作能跟着任务到另一副副本上。
+///
+/// 幂等：同一棵没变的树打两次包，得到的是同样内容的包；且打包不改变树
+/// （快照走临时索引），所以这边被打完包之后照常继续跑命令。
+async fn worktree_export_handler(
+    State(state): State<AppState>,
+    Json(req): Json<WorktreeExportRequest>,
+) -> Response {
+    let Some(workdir) = state.workdir.as_ref() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "this executor has no worktree router, so there is no tree to export".to_string(),
+        );
+    };
+    match workdir.pack_lane(&req.lane).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/x-git-bundle")
+            .body(Body::from(bytes))
+            .expect("static response"),
+        Err(e) => carry_error_response(e),
+    }
+}
+
+/// 把带过来的包放进这条 lane 的树里：没有树就先切一棵，然后把树的内容写回工作区。
+///
+/// 包是任意大的（一棵真实的工作区），而 axum 默认的 2 MiB 请求体上限会把它们
+/// 全挡在门外——这条路由自己关掉那个上限；调用方与这里之间是集群内的地址。
+async fn worktree_import_handler(
+    State(state): State<AppState>,
+    Query(q): Query<WorktreeImportQuery>,
+    body: Bytes,
+) -> Response {
+    let Some(workdir) = state.workdir.as_ref() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "this executor has no worktree router, so there is nowhere to put a tree".to_string(),
+        );
+    };
+    match workdir.unpack_lane(&q.lane, &body).await {
+        Ok(files) => Json(serde_json::json!({"lane": q.lane, "files": files})).into_response(),
+        Err(e) => carry_error_response(e),
+    }
 }
 
 /// The executor's own timing of what it was asked to do.
@@ -1804,7 +1864,22 @@ fn app_router(state: AppState) -> Router {
         .route("/documents/review", post(documents_review_handler))
         .route("/documents/apply", post(documents_apply_handler))
         .route("/documents/rollback", post(documents_rollback_handler))
+        .route("/worktree/export", post(worktree_export_handler))
+        .route(
+            "/worktree/import",
+            post(worktree_import_handler).layer(DefaultBodyLimit::disable()),
+        )
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct WorktreeExportRequest {
+    lane: String,
+}
+
+#[derive(Deserialize)]
+struct WorktreeImportQuery {
+    lane: String,
 }
 
 #[derive(Deserialize)]
@@ -3869,5 +3944,89 @@ mod tests {
             4,
             "a missing dimension would read as a boundary that is not there"
         );
+    }
+    /// 搬运走真路由的两个端点：导出的就是那棵树的内容，导进去以后另一副上
+    /// 读得到同一份东西。
+    ///
+    /// 这条同时钉住请求体上限：一棵真实的工作区远大于 axum 默认的 2 MiB，而那个
+    /// 默认值会把每一份像样的包挡成 413——包里装的是三兆的不可压缩字节，能到岸
+    /// 就说明这条路由自己把上限关掉了。
+    #[tokio::test]
+    async fn a_tree_can_be_exported_and_imported_over_http() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let bare_a = crate::workdir::tests::seed_bare(a.path());
+        let bare_b = crate::workdir::tests::seed_bare(b.path());
+        let ttl = std::time::Duration::from_secs(21600);
+        let ra = crate::workdir::tests::router(a.path(), &bare_a, 8, ttl);
+        let rb = crate::workdir::tests::router(b.path(), &bare_b, 8, ttl);
+
+        let (tree_a, use_a, _) = ra.route("lane-carry").await.unwrap();
+        std::fs::write(tree_a.join("carried.txt"), "hello\n").unwrap();
+        // 不可压缩的三兆（xorshift 的字节序列，git 压不动它）：压缩后的包仍在
+        // axum 默认的 2 MiB 之上，能到岸就说明这条路由自己把上限关掉了。
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let big: Vec<u8> = (0..3 * 1024 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        std::fs::write(tree_a.join("big.bin"), &big).unwrap();
+        drop(use_a);
+
+        let serve = |router: Arc<WorkdirRouter>| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app_router_with_workdir(router))
+                    .await
+                    .unwrap();
+            });
+            format!("http://{addr}")
+        };
+        let from = serve(ra.clone()).await;
+        let to = serve(rb.clone()).await;
+
+        let client = reqwest::Client::new();
+        let exported = client
+            .post(format!("{from}/worktree/export"))
+            .json(&serde_json::json!({"lane": "lane-carry"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exported.status(), reqwest::StatusCode::OK);
+        let bundle = exported.bytes().await.unwrap();
+        assert!(!bundle.is_empty(), "导出的包是空的");
+
+        let imported = client
+            .post(format!("{to}/worktree/import"))
+            .query(&[("lane", "lane-carry")])
+            .body(bundle)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), reqwest::StatusCode::OK);
+        let answer: serde_json::Value = imported.json().await.unwrap();
+        assert_eq!(answer["files"], 2, "写回的是这两处：{answer}");
+
+        let (tree_b, use_b, _) = rb.route("lane-carry").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_b.join("carried.txt")).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(std::fs::read(tree_b.join("big.bin")).unwrap(), big);
+        drop(use_b);
+
+        // 那副上没有这条 lane 的树：404，而不是「搬失败了」。
+        let nothing = client
+            .post(format!("{from}/worktree/export"))
+            .json(&serde_json::json!({"lane": "never-routed"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(nothing.status(), reqwest::StatusCode::NOT_FOUND);
     }
 }

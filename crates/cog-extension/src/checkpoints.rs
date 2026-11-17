@@ -87,7 +87,7 @@ pub fn key_is_well_formed(key: &str) -> bool {
 /// 不直接拼 key：git 的 ref 名不允许 `:`（而「哪一段会话、第几轮」这个 key 里
 /// 就有它），也不喜欢会话号里可能出现的别的字符。折成一个定长串，ref 名就只由
 /// 本模块的这些字符构成，而同一个 key 每次都落到同一个 ref 上。
-fn refname(key: &str) -> String {
+pub(crate) fn refname(key: &str) -> String {
     // FNV-1a：只求稳定与分布，不求密码学性质——它算的是一个本地名字，不是
     // 一道校验。两段不同的 key 撞在一起的代价是「同一棵树上少了一个检查点」，
     // 而每段会话的轮次本来就少。

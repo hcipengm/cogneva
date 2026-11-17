@@ -1,5 +1,10 @@
 //! Remote sandbox executor client: routes `Command` payloads to the executor
 //! pod over HTTP and streams output back as NDJSON [`CommandEvent`] lines.
+//!
+//! A lane stays on the replica whose volume holds its tree, and when it has to
+//! land on a different one the work is carried ahead of the command (see
+//! `carry_lane`). The agent is told which of the two happened on the stream's
+//! first line, because that line is the only channel it reads.
 
 use async_trait::async_trait;
 
@@ -457,6 +462,106 @@ impl RemoteExecutor {
         book.abandon(lane, replica);
     }
 
+    /// 把一条 lane 的工作从它原先那副副本搬到这一副上。
+    ///
+    /// 两副副本各有各的卷：钉子换了副本只说命令要去哪，不说上一副上的树跟着走。
+    /// 搬法是一份包——向原副本要它那棵树的**内容**，交给新副本放进这条 lane 的树
+    /// 里。搬成了，未提交的改动就在新树里，以未提交的样子；只在那台机器上的提交
+    /// 不跟过来，历史留在原卷上，`git status` 会把搬来的东西如实报成改动。
+    ///
+    /// 返回是否搬成。没搬成不是这次命令该失败的理由：原副本连不上、已经没树、
+    /// 树还在用，命令都照发，只是流里第一句要如实说没搬成。
+    async fn carry_lane(&self, lane: &str, from: &str, to: &str) -> bool {
+        let export = self
+            .http
+            .post(format!("{}/worktree/export", from.trim_end_matches('/')))
+            .json(&serde_json::json!({ "lane": lane }))
+            .send()
+            .await;
+        let bundle = match export {
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        lane,
+                        from,
+                        error = %e,
+                        "the move's bundle stopped arriving; the command runs without the work \
+                         being carried"
+                    );
+                    return false;
+                }
+            },
+            Ok(response) => {
+                // 404：那副上没有这条 lane 的树——没有东西可搬，不是故障。
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::info!(
+                    lane,
+                    from,
+                    %status,
+                    body = %body,
+                    "the previous replica had nothing to hand over for this lane"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lane,
+                    from,
+                    error = %e,
+                    "the previous replica did not answer the export; the command runs without \
+                     the work being carried"
+                );
+                return false;
+            }
+        };
+        let arrived = self
+            .http
+            .post(format!("{}/worktree/import", to.trim_end_matches('/')))
+            .query(&[("lane", lane)])
+            .body(bundle)
+            .send()
+            .await;
+        match arrived {
+            Ok(response) if response.status().is_success() => {
+                let answer = response.text().await.unwrap_or_default();
+                tracing::info!(
+                    lane,
+                    from,
+                    to,
+                    answer = %answer,
+                    "the lane's tree was carried to the replica that will run this command"
+                );
+                true
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::warn!(
+                    lane,
+                    from,
+                    to,
+                    %status,
+                    body = %body,
+                    "the new replica refused the carried tree; the command runs in whatever tree \
+                     it has"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lane,
+                    from,
+                    to,
+                    error = %e,
+                    "the carried tree never reached the new replica"
+                );
+                false
+            }
+        }
+    }
+
     /// 同一个客户端，换一段等待上界。生产的窗口是
     /// [`REPLACEMENT_WINDOW`]；这里开一个口子是为了让"窗口内会重试""窗口过了
     /// 要说出等了多久"这两条判据能在测试里按秒验证，而不是按两分半验证。
@@ -542,6 +647,15 @@ impl SandboxBackend for RemoteExecutor {
                 )
             })?;
         let endpoint = placement.endpoint.clone();
+        // 换了副本、而原来那副还在：先把那副上的树要过来，再让命令在带着它的
+        // 树上跑。这是「工作跟着任务走」的唯一一步——不去要，命令只是在另一副
+        // 上从一棵没有它的树开始。
+        let carried = match (&placement.moved_from, lane.as_deref()) {
+            (Some(from), Some(lane)) if from != &endpoint => {
+                self.carry_lane(lane, from, &endpoint).await
+            }
+            _ => false,
+        };
         let url = format!("{}/execute", endpoint.trim_end_matches('/'));
         let body = serde_json::json!({
             "payload": req.payload,
@@ -667,53 +781,58 @@ impl SandboxBackend for RemoteExecutor {
         }
         // The decoded stream is not `Unpin`; boxed it is, which is what lets
         // this wrapper pull the first frame and hold the rest.
-        let state = (Box::pin(stream), Step::Head, from, endpoint);
-        let stream = futures::stream::unfold(state, move |(mut inner, step, from, endpoint)| {
-            let lane = lane.clone();
-            let seen_tree = seen_tree.clone();
-            async move {
-                match step {
-                    Step::Head => {
-                        let first = inner.next().await;
-                        let origin = match &first {
-                            Some(CommandEvent::Workdir { origin, .. }) => *origin,
-                            _ => cog_core::WorktreeOrigin::Unknown,
-                        };
-                        if matches!(first, Some(CommandEvent::Workdir { .. })) {
-                            seen_tree
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .insert(lane.clone(), endpoint.clone());
+        let state = (Box::pin(stream), Step::Head, from, endpoint, carried);
+        let stream =
+            futures::stream::unfold(state, move |(mut inner, step, from, endpoint, carried)| {
+                let lane = lane.clone();
+                let seen_tree = seen_tree.clone();
+                async move {
+                    match step {
+                        Step::Head => {
+                            let first = inner.next().await;
+                            let origin = match &first {
+                                Some(CommandEvent::Workdir { origin, .. }) => *origin,
+                                _ => cog_core::WorktreeOrigin::Unknown,
+                            };
+                            if matches!(first, Some(CommandEvent::Workdir { .. })) {
+                                seen_tree
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(lane.clone(), endpoint.clone());
+                            }
+                            let notice = match &from {
+                                Some(from) => Some(moved_line(from, &endpoint, origin, carried)),
+                                // 回来的是同一副：树在不在只有执行器的第一帧说得清。
+                                None if tree_here_before => match origin {
+                                    cog_core::WorktreeOrigin::Created
+                                    | cog_core::WorktreeOrigin::Warm => Some(reclaimed_line()),
+                                    cog_core::WorktreeOrigin::Existing
+                                    | cog_core::WorktreeOrigin::Unknown => None,
+                                },
+                                None => None,
+                            };
+                            match notice {
+                                Some(data) => Some((
+                                    CommandEvent::Stderr { data },
+                                    (inner, Step::First(first), from, endpoint, carried),
+                                )),
+                                // 树还在：没有什么要说的，第一帧就是全部。
+                                None => first.map(|event| {
+                                    (event, (inner, Step::Tail, from, endpoint, carried))
+                                }),
+                            }
                         }
-                        let notice = match &from {
-                            Some(from) => Some(moved_line(from, &endpoint, origin)),
-                            // 回来的是同一副：树在不在只有执行器的第一帧说得清。
-                            None if tree_here_before => match origin {
-                                cog_core::WorktreeOrigin::Created
-                                | cog_core::WorktreeOrigin::Warm => Some(reclaimed_line()),
-                                cog_core::WorktreeOrigin::Existing
-                                | cog_core::WorktreeOrigin::Unknown => None,
-                            },
-                            None => None,
-                        };
-                        match notice {
-                            Some(data) => Some((
-                                CommandEvent::Stderr { data },
-                                (inner, Step::First(first), from, endpoint),
-                            )),
-                            // 树还在：没有什么要说的，第一帧就是全部。
-                            None => first.map(|event| (event, (inner, Step::Tail, from, endpoint))),
+                        Step::First(Some(event)) => {
+                            Some((event, (inner, Step::Tail, from, endpoint, carried)))
                         }
+                        Step::First(None) => None,
+                        Step::Tail => inner
+                            .next()
+                            .await
+                            .map(|event| (event, (inner, Step::Tail, from, endpoint, carried))),
                     }
-                    Step::First(Some(event)) => Some((event, (inner, Step::Tail, from, endpoint))),
-                    Step::First(None) => None,
-                    Step::Tail => inner
-                        .next()
-                        .await
-                        .map(|event| (event, (inner, Step::Tail, from, endpoint))),
                 }
-            }
-        });
+            });
         Ok(Box::pin(stream))
     }
 }
@@ -724,9 +843,21 @@ impl SandboxBackend for RemoteExecutor {
 /// volume the pod was rebuilt on, so the loss is stated as a condition. A tree
 /// cut for this call, or handed out of that replica's pool, is one nothing has
 /// run in: there the loss is a fact.
-fn moved_line(from: &str, to: &str, origin: cog_core::WorktreeOrigin) -> String {
+///
+/// When the tree was carried (`carried`), the loss is neither: the content came
+/// over as uncommitted changes, and what did not come over is the history that
+/// lived only on the old volume. The agent then looks at `git status`, not at a
+/// tree it has to rebuild.
+fn moved_line(from: &str, to: &str, origin: cog_core::WorktreeOrigin, carried: bool) -> String {
     use cog_core::WorktreeOrigin;
     let opening = format!("这条命令换了一副执行器（从 {from} 到 {to}）。");
+    if carried {
+        return format!(
+            "{opening}上一副上那棵树已经跟着任务搬过来了：树里的内容在这棵树上，未提交的\
+             改动在 `git status` 里如实可见；只在那台机器上的提交没有跟过来——搬过来的是\
+             内容，历史还在原来那副的卷上。\n"
+        );
+    }
     match origin {
         WorktreeOrigin::Created => format!(
             "{opening}这副上刚为这个任务切了一棵新树：上一副上未推送到远端的工作\
@@ -760,6 +891,20 @@ fn reclaimed_line() -> String {
 mod tests {
     use super::*;
 
+    /// 这条请求问的是哪条路。
+    ///
+    /// 换副本的客户端会先向原副本要那棵树（`/worktree/export`），再发起命令。
+    /// 下面这几个假副本没有 worktree 路由，所以照真执行器在没树时的样子答 404
+    /// ——「没搬成」这条路在测试里行走的是与部署相同的那一段，而不是被蒙混过去。
+    fn asked_path(head: &[u8]) -> String {
+        String::from_utf8_lossy(head)
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string()
+    }
+
     /// An executor that answers `requests` commands, counting how many it was
     /// asked. Two of these stand in for two replicas behind one Service.
     async fn serve_counting(
@@ -776,7 +921,13 @@ mod tests {
                     break;
                 };
                 let mut buf = vec![0u8; 4096];
-                let _ = socket.read(&mut buf).await;
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .await;
+                    continue;
+                }
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let body = format!(
                     "{}\n{}\n",
@@ -807,7 +958,13 @@ mod tests {
                     break;
                 };
                 let mut buf = vec![0u8; 4096];
-                let _ = socket.read(&mut buf).await;
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                if asked_path(&buf[..read]).starts_with("/worktree/") {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nno tree!!")
+                        .await;
+                    continue;
+                }
                 let mut body = String::new();
                 if let Some(origin) = origin {
                     body.push_str(
@@ -834,6 +991,112 @@ mod tests {
             }
         });
         format!("http://{}", addr)
+    }
+
+    /// 一副副本题下发生过什么：交出去的包，和收进来的包。
+    #[derive(Default)]
+    struct CarryLog {
+        handed_out: Vec<u8>,
+        received: Vec<Vec<u8>>,
+    }
+
+    /// 一份请求的请求头与请求体。
+    ///
+    /// 搬运的两个端点上请求体就是全部内容（一棵树装在一个包里），所以假副本
+    /// 必须把体读全再答，否则「搬过去的是不是原样那一份」在测试里无从谈起。
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..n]);
+            let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let want: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if raw.len() >= head_end + 4 + want {
+                return (head, raw[head_end + 4..head_end + 4 + want].to_vec());
+            }
+        }
+        (String::new(), Vec::new())
+    }
+
+    /// A replica that really does hand over a tree and take one in: `/worktree/export`
+    /// answers with a fixed bundle, `/worktree/import` records the body it was
+    /// given. What the client carries is therefore checkable byte for byte.
+    async fn serve_carrying(
+        requests: usize,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<CarryLog>>) {
+        const BUNDLE: &[u8] = b"the bytes of a carried tree";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(CarryLog::default()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            for _ in 0..requests {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let (head, body) = read_request(&mut socket).await;
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let response: Vec<u8> = if path.starts_with("/worktree/export") {
+                    seen.lock().unwrap().handed_out = BUNDLE.to_vec();
+                    let mut out = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-git-bundle\r\n\
+                         content-length: {}\r\n\r\n",
+                        BUNDLE.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(BUNDLE);
+                    out
+                } else if path.starts_with("/worktree/import") {
+                    seen.lock().unwrap().received.push(body);
+                    let payload = br#"{"lane":"agent-a","files":3}"#;
+                    let mut out = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\n\r\n",
+                        payload.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(payload);
+                    out
+                } else {
+                    let ndjson = format!(
+                        "{}\n{}\n{}\n",
+                        serde_json::to_string(&CommandEvent::Workdir {
+                            path: "/srv/workspaces/agent-a".into(),
+                            origin: cog_core::WorktreeOrigin::Existing,
+                        })
+                        .unwrap(),
+                        serde_json::to_string(&CommandEvent::Stdout { data: "ok".into() }).unwrap(),
+                        serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap()
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                         transfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                        ndjson.len(),
+                        ndjson
+                    )
+                    .into_bytes()
+                };
+                let _ = socket.write_all(&response).await;
+            }
+        });
+        (format!("http://{}", addr), log)
     }
 
     /// 第一次请求在执行器切树之前就失败（比如编译位满了），第二次才交出一棵
@@ -975,6 +1238,45 @@ mod tests {
             "只搬一次家，却说成了两条：{:?}",
             next.stderr
         );
+    }
+
+    /// 换到另一副时，客户端先把原副本上的树要过来再发命令：搬过去的就是原样
+    /// 那一份，而智能体读到的第一句是「跟过来了」，不是「不在这棵树上」。
+    ///
+    /// 这是「工作跟着任务走」在客户端这一侧的判据。少掉搬运那一步，两副副本
+    /// 各有各的卷，搬到新副上的命令会在一棵没有那份工作的树上接着写，而上面
+    /// 那句「不在这棵树上」就是当时的全部交代。
+    #[tokio::test]
+    async fn a_lane_that_moves_has_its_tree_carried_to_the_replica_that_runs_it() {
+        let (from, from_log) = serve_carrying(2).await;
+        let (to, to_log) = serve_carrying(2).await;
+        let replicas = ChangingReplicas::new(vec![from.clone(), "http://127.0.0.1:1".to_string()]);
+        let executor = discovering(replicas.clone(), std::time::Duration::ZERO);
+
+        // 第一条在原副上跑：那一副上因此有这条 lane 的树。
+        executor.execute(&for_agent("agent-a")).await.unwrap();
+        // 原副从地址表里消失，只剩新的那副。
+        *replicas.addrs.lock().unwrap() = vec![to.clone()];
+
+        let moved = executor.execute(&for_agent("agent-a")).await.unwrap();
+        assert!(
+            moved.stderr.contains("已经跟着任务搬过来"),
+            "搬成了就要这么说：{:?}",
+            moved.stderr
+        );
+        assert!(
+            !moved.stderr.contains("不在这棵树上"),
+            "搬成了还说东西没跟过来：{:?}",
+            moved.stderr
+        );
+        let handed_out = from_log.lock().unwrap().handed_out.clone();
+        let received = to_log.lock().unwrap().received.clone();
+        assert_eq!(
+            received.len(),
+            1,
+            "新副本没有收到搬运的包；一次搬家只该送一份"
+        );
+        assert_eq!(received[0], handed_out, "搬过去的不是原样那一份");
     }
 
     /// 那句话是流出来的第一件事：智能体先知道自己站在哪棵树上，再读输出。

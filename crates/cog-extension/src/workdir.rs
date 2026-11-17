@@ -21,6 +21,14 @@
 //! with this process, so a restart cannot leave a stale claim behind, and
 //! everything a restart must reconcile is still on the volume.
 //!
+//! A tree belongs to one volume, but the work in it belongs to the task. When
+//! the replica holding a lane's tree is gone, [`WorkdirRouter::pack_lane`]
+//! turns that tree into a bundle the task can carry and
+//! [`WorkdirRouter::unpack_lane`] writes it back into a tree on another
+//! replica — content as uncommitted changes, history staying on the old
+//! volume. Without that step "the work follows the task" would only be true
+//! for work already pushed to a remote.
+//!
 //! The bare-repo + worktree + out-of-tree sidecar + external target dir +
 //! stale-lock self-heal pattern is deliberately copied from the evolution
 //! WorkspaceManager: cog-extension must not depend on upper crates, and only
@@ -42,6 +50,7 @@ use tracing::{error, info, warn};
 use cog_core::build_cache_readings::{BuildCacheReadings, CacheSlot};
 
 use crate::build_cache::{BuildCacheConfig, CommandSlot, SANDBOX_BUILD_CACHE_LOOP};
+use crate::checkpoints;
 
 /// Loop name reported through the background-loop liveness family.
 pub const WORKTREE_GC_LOOP: &str = "extension_worktree_gc";
@@ -1205,6 +1214,118 @@ impl WorkdirRouter {
             tokio::spawn(async move { router.warm_pool_once().await });
         }
         Ok((path, use_guard, origin))
+    }
+
+    /// 这棵树连同它身上未推送到远端的东西，打成一份能带走的包。
+    ///
+    /// 搬的是**内容**，不是历史：包里的那个提交是本模块拍的一张快照（临时索引、
+    /// 不碰真正的索引与 HEAD），落到另一副副本上时写回工作区——于是搬过来的改动
+    /// 在 `git status` 里如实可见，和它在原来那副上时一样。只在那副副本上存在过
+    /// 的分支提交不会以提交的身份跟过来；它们的效果在树里，历史在原来那副卷上。
+    ///
+    /// 一条 lane 上还有命令在跑时不打包：那棵树正在被写，打出来的包说不出它是
+    /// 哪一刻的样子。没有树则没什么可搬——那是 [`CarryError::NoTree`]，不是失败。
+    pub async fn pack_lane(&self, lane: &str) -> Result<Vec<u8>, CarryError> {
+        validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
+        let tree = self.tree_of(lane).await.ok_or_else(|| {
+            CarryError::NoTree(format!("lane {lane} has no tree on this replica"))
+        })?;
+        if lock_claims(&self.in_use).get(lane).copied().unwrap_or(0) > 0 {
+            return Err(CarryError::Busy(format!(
+                "a command is running in lane {lane}'s tree right now"
+            )));
+        }
+        let key = carry_key(lane);
+        checkpoints::capture(&tree, &key)
+            .await
+            .map_err(CarryError::Failed)?;
+        let path = self.carry_path(lane);
+        let path_text = path.to_string_lossy().into_owned();
+        let refname = checkpoints::refname(&key);
+        let packed = self
+            .run_git(&["bundle", "create", &path_text, &refname], Some(&tree))
+            .await;
+        if let Err(e) = packed {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(CarryError::Failed(e.to_string()));
+        }
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            CarryError::Failed(format!("the bundle just written cannot be read: {e}"))
+        });
+        let _ = tokio::fs::remove_file(&path).await;
+        let bytes = bytes?;
+        info!(
+            lane,
+            bytes = bytes.len(),
+            "packed a lane's tree so it can travel with the task"
+        );
+        Ok(bytes)
+    }
+
+    /// 把一份带过来的包放回这条 lane 的树里，返回写回了多少个文件。
+    ///
+    /// 没有树就先切一棵（这条路和第一次到达是同一条：暖池、卷上已有的都算），
+    /// 然后把包里的快照写回工作区。写回只动工作区：落到这棵树上的是一组未提交
+    /// 的改动，正如它在原来那副上时那样。
+    pub async fn unpack_lane(
+        self: &Arc<Self>,
+        lane: &str,
+        bundle: &[u8],
+    ) -> Result<usize, CarryError> {
+        validate_task_id(lane).map_err(|e| CarryError::Refused(e.to_string()))?;
+        let (tree, _in_use, _origin) = self
+            .route(lane)
+            .await
+            .map_err(|e| CarryError::Failed(e.to_string()))?;
+        let path = self.carry_path(lane);
+        let path_text = path.to_string_lossy().into_owned();
+        tokio::fs::write(&path, bundle)
+            .await
+            .map_err(|e| CarryError::Failed(format!("the carried bundle cannot be saved: {e}")))?;
+        let key = carry_key(lane);
+        let refname = checkpoints::refname(&key);
+        // 这个 ref 只是运输用的名字，不带历史含义：一条 lane 来回搬过几次时，
+        // 后一份快照与这一副上先前那份没有祖孙关系，而这里要的正是「换上这一份」。
+        let spec = format!("+{refname}:{refname}");
+        let fetched = self
+            .run_git(&["fetch", &path_text, &spec], Some(&tree))
+            .await;
+        let _ = tokio::fs::remove_file(&path).await;
+        fetched.map_err(|e| CarryError::Failed(e.to_string()))?;
+        let plan = checkpoints::restore(&tree, &key)
+            .await
+            .map_err(CarryError::Failed)?;
+        info!(
+            lane,
+            files = plan.files.len(),
+            "unpacked a carried tree into this lane; the changes are uncommitted here"
+        );
+        Ok(plan.files.len())
+    }
+
+    /// The tree this lane already has on this volume, if it is still there.
+    async fn tree_of(&self, lane: &str) -> Option<PathBuf> {
+        let (_, path) = self
+            .list_task_trees()
+            .await
+            .into_iter()
+            .find(|(id, _)| id == lane)?;
+        tokio::fs::try_exists(&path).await.ok().filter(|yes| *yes)?;
+        Some(path)
+    }
+
+    /// Where a carry bundle is written on the way through. Inside the
+    /// workspaces root so it lands on the volume the trees are on, and named
+    /// apart from the trees so the cap's own listing never mistakes it for one.
+    fn carry_path(&self, lane: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let hash = checkpoints::refname(&carry_key(lane));
+        let hash = hash.rsplit('/').next().unwrap_or("0");
+        self.cfg.workspaces_root.join(format!(
+            ".carry-{}-{}-{hash}.bundle",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// The pool directory. Sits inside the workspaces root so it lands on the
@@ -2649,6 +2770,40 @@ impl WorkdirRouter {
         full.extend_from_slice(args);
         self.run_git(&full, None).await
     }
+}
+
+/// 一条 lane 的工作没能被打包或放回来时，是哪一种没成。
+///
+/// 三种分开是为了让调用方分别对待：「这副上没有这条 lane 的树」不是故障，
+/// 是本来就没东西可搬；「还有命令在树里跑」是等一等再来；「打包本身失败了」
+/// 才是要报出去的错。
+#[derive(Debug)]
+pub enum CarryError {
+    /// 这副副本上没有这条 lane 的树——没有工作可搬。
+    NoTree(String),
+    /// 树还在用：一条命令正在里面跑，此刻打出来的包说不出是哪一刻的样子。
+    Busy(String),
+    /// lane 名不能用。
+    Refused(String),
+    /// 打包、保存、取回或写回失败了。
+    Failed(String),
+}
+
+impl std::fmt::Display for CarryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarryError::NoTree(m) | CarryError::Busy(m) | CarryError::Refused(m) => f.write_str(m),
+            CarryError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for CarryError {}
+
+/// 搬运用的检查点名。由 lane 定，所以同一棵树的两次搬运落在同一个 ref 上，
+/// 不会在树上越堆越多。
+fn carry_key(lane: &str) -> String {
+    format!("carry:{lane}")
 }
 
 /// Strict task id validation: the id is a client-supplied filesystem name, so
@@ -4771,6 +4926,144 @@ pub(crate) mod tests {
         );
         assert_eq!(ttl_from(20, 1, 10 * 3600), None);
         assert_eq!(ttl_from(20, 10, 0), None);
+    }
+
+    /// 两副副本各有各的卷。在一副上做下的工作，搬到另一副上仍在：内容在，
+    /// 而且以未提交改动的样子在——`git status` 读得出来，接着干的人看得见。
+    ///
+    /// 搬的是内容不是历史：只在那副上的提交不以提交的身份跟过来，但它的效果在
+    /// 树里。这条测试同时钉住打包不改变原树：原副上那棵树还是原样。
+    #[tokio::test]
+    async fn work_made_on_one_replica_arrives_on_another() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let bare_a = seed_bare(a.path());
+        let bare_b = seed_bare(b.path());
+        let ra = router(a.path(), &bare_a, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let rb = router(b.path(), &bare_b, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let name = lane("squad:DSC-CARRY");
+
+        let (tree_a, use_a, _) = ra.route(&name).await.unwrap();
+        std::fs::write(tree_a.join("new.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(tree_a.join("sub").join("dir")).unwrap();
+        std::fs::write(tree_a.join("sub").join("dir").join("deep.txt"), "deep\n").unwrap();
+        std::fs::remove_file(tree_a.join("README")).unwrap();
+        drop(use_a);
+
+        let bundle = ra.pack_lane(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_a.join("new.rs")).unwrap(),
+            "fn main() {}\n",
+            "打包不该动原树：这边打完包还要接着干活"
+        );
+
+        let files = rb.unpack_lane(&name, &bundle).await.unwrap();
+        assert_eq!(files, 3, "删了一个、添了两个：写回的就是这三处");
+        let (tree_b, use_b, _) = rb.route(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_b.join("new.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree_b.join("sub").join("dir").join("deep.txt")).unwrap(),
+            "deep\n"
+        );
+        assert!(
+            !tree_b.join("README").exists(),
+            "原树上删掉的文件不该在这一副上留下"
+        );
+        let status = git_out(&tree_b, &["status", "--porcelain"]);
+        assert!(
+            status.contains("new.rs"),
+            "搬来的东西该是未提交的改动：{status}"
+        );
+        assert!(
+            status.contains("README"),
+            "删掉的那处在 status 里也要有：{status}"
+        );
+        drop(use_b);
+    }
+
+    /// 一条 lane 来回搬：第二趟的包和第一趟的包在两副上都没有祖孙关系（两副的
+    /// HEAD 各是各的），运输用的那个 ref 要能被换掉，而不是被 fetch 当成
+    /// non-fast-forward 拒收——拒了，第二次搬家就悄悄什么都没带。
+    #[tokio::test]
+    async fn a_lane_carried_back_and_forth_takes_the_latest_content_each_time() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let bare_a = seed_bare(a.path());
+        let bare_b = seed_bare(b.path());
+        let ra = router(a.path(), &bare_a, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let rb = router(b.path(), &bare_b, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let name = lane("squad:DSC-ROUNDTRIP");
+
+        let (tree_a, use_a, _) = ra.route(&name).await.unwrap();
+        std::fs::write(tree_a.join("note.txt"), "first\n").unwrap();
+        drop(use_a);
+        let over = ra.pack_lane(&name).await.unwrap();
+        rb.unpack_lane(&name, &over).await.unwrap();
+
+        let (tree_b, use_b, _) = rb.route(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_b.join("note.txt")).unwrap(),
+            "first\n"
+        );
+        std::fs::write(tree_b.join("note.txt"), "second\n").unwrap();
+        drop(use_b);
+        let back = rb.pack_lane(&name).await.unwrap();
+        ra.unpack_lane(&name, &back)
+            .await
+            .expect("第二趟搬家该把这一副上的 ref 换掉，而不是被拒收");
+
+        let (tree_a, use_a, _) = ra.route(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree_a.join("note.txt")).unwrap(),
+            "second\n",
+            "来回搬两次之后，树上该是最后动过的那一份"
+        );
+        drop(use_a);
+    }
+
+    /// 一副上没有这条 lane 的树时，没有什么可搬：这不是失败，是空手而来。
+    #[tokio::test]
+    async fn a_lane_with_no_tree_has_nothing_to_carry() {
+        let a = tempfile::tempdir().unwrap();
+        let bare = seed_bare(a.path());
+        let r = router(a.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        match r.pack_lane(&lane("squad:DSC-NOTHING")).await {
+            Err(CarryError::NoTree(_)) => {}
+            other => panic!("没有树的 lane 该答「没有东西可搬」，实际是 {other:?}"),
+        }
+    }
+
+    /// 树里还有命令在跑时不打包：那一刻打出来的包说不出它是哪一刻的样子。
+    #[tokio::test]
+    async fn a_lane_whose_tree_is_in_use_is_not_packed() {
+        let a = tempfile::tempdir().unwrap();
+        let bare = seed_bare(a.path());
+        let r = router(a.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let name = lane("squad:DSC-BUSY");
+        let (tree, use_guard, _) = r.route(&name).await.unwrap();
+        std::fs::write(tree.join("wip.txt"), "half written\n").unwrap();
+
+        match r.pack_lane(&name).await {
+            Err(CarryError::Busy(_)) => {}
+            other => panic!("树在用的时候该答「忙」，实际是 {other:?}"),
+        }
+        drop(use_guard);
+        assert!(r.pack_lane(&name).await.is_ok(), "命令跑完了就该能搬");
+    }
+
+    /// 名字过不了路由的字面检查的，一开始就不该进这条路。
+    #[tokio::test]
+    async fn a_lane_name_that_cannot_be_a_tree_is_refused_before_any_git() {
+        let a = tempfile::tempdir().unwrap();
+        let bare = seed_bare(a.path());
+        let r = router(a.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        match r.pack_lane("../escape").await {
+            Err(CarryError::Refused(_)) => {}
+            other => panic!("越界的名字该当场拒，实际是 {other:?}"),
+        }
     }
 
     #[test]
