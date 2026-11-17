@@ -14,8 +14,8 @@
 //! 任务与工件契约：规划指令、diff 语法与验证契约、告警修复 goal、面漂移 goal。
 //! 改 `prompts/` 的任何一个字都不影响它们，而没有一道门看见它们。
 //! 本门按承载形状普查到的**点**比文本多（一条文本可以在几处出现，一个函数里的每
-//! 行字面量各算一点——门要报的是「哪一行没表态」）：2026-11-17 量到 276 个载体点、
-//! 19 个函数、7042 字节。读数由测试自己印出来，`cargo test … -- --nocapture` 就是
+//! 行字面量各算一点——门要报的是「哪一行没表态」）：2026-11-17 量到 330 个载体点、
+//! 27 个函数、7484 字节。读数由测试自己印出来，`cargo test … -- --nocapture` 就是
 //! 重新量一次；别的地方不要手抄这三个数。
 //!
 //! 字节数有一道只降不升的预算（`the_prompt_surface_only_shrinks`）：普查回答「每一行
@@ -67,7 +67,11 @@
 //!   `DECISIVE_KEYS`、或让它写进 `instructions`，而不是放宽判词；
 //! * 工具结果的文案（`"note": "…"` 这类回给模型读的说明）、YAML/TS/JSON 资产
 //!   里的文本、`skills/` 下的技能文件；
-//! * 由数据拼出来的文本：门判的是写在源码里的字面量，不是运行时才出现的字符串。
+//! * 由数据拼出来的文本：门判的是写在源码里的字面量，不是运行时才出现的字符串；
+//! * `Message::user` / `Message::assistant` 里参数不是字面量的那些：那一侧绝大多数
+//!   是把数据递进去（模型自己的答复、工具结果、任务正文），按调用点算会把普查变成
+//!   数 `Message::user(`。系统消息相反——参数写成常量或 `format!` 也照算，否则把
+//!   散文挪进一个常量名就能让它从普查里消失。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -161,8 +165,16 @@ fn assigns_contract_field(code: &str) -> bool {
 
 /// 这一行是不是一个载体点。
 fn carrier_of(code: &str) -> Option<Carrier> {
+    // 系统消息的参数是不是字面量都算：`Message::system(SOME_CONST)` 与 `format!`
+    // 拼出来的那一段同样是写给模型的话，只是话写在别处。只认字面量，等于「把散文
+    // 挪进一个常量名」就能让它从普查里消失——那不是把话说短了，是让门看不见。
+    //
+    // 用户与助手消息不这样放宽：那一侧绝大多数是把数据递进去（模型自己的答复、
+    // 工具结果、任务正文本来的样子），按调用点算会把普查变成数 `Message::user(`。
+    // 它们只在实参就是字面量时算——那时候它是写死在源码里的一句话。
     if let Some(rest) = message_arg(code) {
-        if rest.trim_start().is_empty() || starts_literal(rest) {
+        let system = MESSAGE_CALLS[..1].iter().any(|call| code.contains(call));
+        if system || rest.trim_start().is_empty() || starts_literal(rest) {
             return Some(Carrier::Message);
         }
     }
@@ -595,9 +607,11 @@ fn carried_over(rows: Vec<(String, Vec<Row>)>, sites: &[Site]) -> usize {
 fn the_prompt_surface_only_shrinks() {
     let root = repo_root();
     let measured = carried_bytes(&root);
-    // cap: derived — 由树上的这些点现算（2026-11-17 实测 7042）；删字时跟着降，
-    // 往上抬要在提交信息里说清新增的是哪一段、凭什么非有不可
-    const BUDGET: usize = 7_042;
+    // cap: derived — 由树上的这些点现算（2026-11-17 实测 7484）；删字时跟着降，
+    // 往上抬要在提交信息里说清新增的是哪一段、凭什么非有不可。2026-11-17 从 7042
+    // 抬到 7484 不是字变多了，是普查面变宽了：系统消息按调用点算之后，参数写在
+    // 常量或 format! 里的那一半也进了这份读数（此前 54 个点看不见）。
+    const BUDGET: usize = 7_484;
     assert!(
         measured <= BUDGET,
         "模型每回合要为这些点付 {measured} 字节，预算是 {BUDGET}：要么删掉长出来的那段，\
@@ -643,7 +657,7 @@ fn every_model_facing_instruction_declares_its_source() {
         "普查一个载体点都没读到——扫描器坏了，不是树上没有提示词"
     );
     // 读数从这儿印，不要手抄到别处：`cargo test … -- --nocapture` 就是重新量一次。
-    // 文件头那句「276 个载体点、19 个函数」是这一行在某一天的输出。
+    // 文件头那句「330 个载体点、27 个函数」是这一行在某一天的输出。
     let functions: std::collections::BTreeSet<(&str, &str)> = sites
         .iter()
         .map(|s| (s.file.as_str(), s.function.as_str()))

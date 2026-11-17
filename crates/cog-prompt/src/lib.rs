@@ -108,6 +108,7 @@ impl PromptManager {
     }
 
     /// Get a system message ready for LLM consumption (synchronous).
+    // prompt: not-an-instruction — 正文来自 prompts/ 里声明的 key，这里只渲染模板
     pub fn system_message(
         &self,
         key: &str,

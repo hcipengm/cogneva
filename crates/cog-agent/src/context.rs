@@ -123,6 +123,7 @@ impl ContextWindow {
     ///
     /// 已经有这段就什么都不做：同一个智能体跨轮复用，重复并进去等于同一条
     /// 指示按轮数计费。
+    // prompt: not-an-instruction — 把已有的几条系统消息并进第一条，本函数不新写一个字
     pub fn merge_head_system(&mut self, text: &str) {
         let text = text.trim();
         if text.is_empty() {

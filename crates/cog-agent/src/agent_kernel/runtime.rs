@@ -3685,6 +3685,7 @@ impl AgentRuntime {
         self.think_stream_with(llm, true).await
     }
 
+    // prompt: not-an-instruction — 前缀一行是技能列表的标题，条目是技能自己声明的名字与描述
     async fn think_stream_with(
         &mut self,
         llm: &dyn cog_core::LlmClient,

@@ -793,6 +793,26 @@ pub trait LlmClient: Send + Sync {
 /// # Ok(())
 /// # }
 /// ```
+/// 答案的 JSON，允许整段被一条围栏包着。
+///
+/// 拆在这里而不是在提示词里要求「不要写围栏」：那条要求没有检查，模型照写时
+/// 这里报的是「第 0 行语法错误」——读起来像模型答坏了，其实是它能读懂的一份
+/// 答案被格式判词挡下。只拆整段是一条围栏的那种，正文里本来有的围栏不动。
+fn parse_answer(text: &str) -> SFResult<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str(text) {
+        return Ok(value);
+    }
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        if let Some(body) = rest.strip_suffix("```") {
+            let body = body.split_once('\n').map(|(_, inner)| inner).unwrap_or(body);
+            return serde_json::from_str(body).map_err(SFError::Serialization);
+        }
+    }
+    serde_json::from_str(text).map_err(SFError::Serialization)
+}
+
+// prompt: fixed — 结构化回答的线格式：schema 由调用方类型生成，这里只说「按它回」
 pub async fn execute_structured<T>(
     provider: &dyn LlmClient,
     messages: &[Message],
@@ -805,8 +825,7 @@ where
     let schema_json = serde_json::to_string_pretty(&root_schema).map_err(SFError::Serialization)?;
 
     let system_msg = Message::system(format!(
-        "Respond with valid JSON conforming to this JSON Schema. \
-         Do not output markdown fences or explanatory text.\n\n{schema_json}"
+        "Respond with valid JSON conforming to this JSON Schema.\n\n{schema_json}"
     ));
 
     let mut msgs = vec![system_msg];
@@ -846,7 +865,7 @@ where
         )));
     }
 
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(SFError::Serialization)?;
+    let value: serde_json::Value = parse_answer(&text)?;
 
     let schema_value = serde_json::to_value(&root_schema).map_err(SFError::Serialization)?;
     let validator = jsonschema::validator_for(&schema_value)
@@ -1501,5 +1520,27 @@ mod owner_header_tests {
             REFUSED_BY_OWNER_BUDGET, REFUSED_BY_BUDGET,
             "两种拒绝的响应成因同值的话，调用侧只能得出一个处置，而它们要问的不是同一个人"
         );
+    }
+
+    /// 整段被一条围栏包着的答案，是能读懂的答案，不是答坏了。
+    #[test]
+    fn an_answer_in_one_fence_is_still_the_answer() {
+        assert_eq!(
+            parse_answer("{\"a\": 1}").unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            parse_answer("```json\n{\"a\": 1}\n```").unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            parse_answer("```\n{\"a\": 1}\n```").unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert!(
+            parse_answer("```\nnot json\n```").is_err(),
+            "拆了围栏也得还是 JSON：这条兜底不能把坏答案读成好答案"
+        );
+        assert!(parse_answer("plain text").is_err());
     }
 }

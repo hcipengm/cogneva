@@ -98,6 +98,7 @@ struct Attempt {
 }
 
 impl Gepa {
+    // prompt: fixed — 评测 scaffold 的基线提示词：对照实验的方法本身，改了就换了题目
     async fn rollout(
         &self,
         case: &EvalCase,
@@ -148,6 +149,7 @@ impl Gepa {
     }
 
     /// 一段反思：给这次尝试的自然语言评价与分数。
+    // prompt: fixed — 评测 scaffold 的基线提示词：对照实验的方法本身，改了就换了题目
     async fn critique(
         &self,
         case: &EvalCase,
@@ -165,6 +167,7 @@ impl Gepa {
     }
 
     /// 从前沿变异出下一代的一份提示词。
+    // prompt: fixed — 评测 scaffold 的基线提示词：对照实验的方法本身，改了就换了题目
     async fn mutate(
         &self,
         ctx: &SolveContext,

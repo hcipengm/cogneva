@@ -76,6 +76,7 @@ impl PromptBuilder {
 
     /// 构建消息列表：system 块（规则 + meta-instruction）在最前，
     /// 其余消息按追加顺序排列。
+    // prompt: not-an-instruction — 分节文字由调用方给，这里只按顺序拼起来
     pub fn build(self) -> Vec<Message> {
         let mut out = Vec::with_capacity(self.messages.len() + 1);
         if !self.system_rules.is_empty() {
