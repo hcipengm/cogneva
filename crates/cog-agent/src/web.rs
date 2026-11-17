@@ -38,26 +38,6 @@ use url::Url;
 // cap: bound — 不到这个数页面本来就读不了，过了它就是一段误抓的视频或一条无限流，在抽取开始之前先吃掉 Pod 的内存
 const MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
 
-/// How long one fetch may take, headers included. A page that has not started
-/// answering in this window is not going to make the turn useful.
-// cap: bound — 含头部在内的抓取上限：在这个窗里还没开始应答的页面，不会让这一回合变得有用
-const FETCH_TIMEOUT_SECS: u64 = 30;
-
-/// How long one search may take. The metasearch fan-out answers from several
-/// engines at once and waits for the slowest; this is the point past which the
-/// slowest is not worth the turn.
-// cap: bound — 同时问几个引擎、等最慢的那个；过了这一点最慢的那个就不值这一回合了
-const SEARCH_TIMEOUT_SECS: u64 = 20;
-
-/// How many times a search whose engines all stayed silent is asked again.
-///
-/// Only that one outcome is repeated: an engine that timed out once often
-/// answers the next request, while a non-200 or a body that is not JSON is a
-/// verdict about the request itself and asking again returns the same verdict
-/// for the same wait.
-// cap: bound — 再问一次是对请求本身的判断，重复一次换来同样的判断和同样的等待
-const SEARCH_ATTEMPTS: u32 = 2;
-
 /// The environment variable that names the SearXNG base URL.
 ///
 /// Declared in the contract crate because the orchestrator's outward loop reads
@@ -239,7 +219,6 @@ struct Body {
 
 async fn fetch_capped(client: &Arc<dyn HttpClient>, url: &Url, cap: usize) -> SFResult<Body> {
     let mut req = HttpRequest::new("GET", url.as_str());
-    req.timeout_secs = Some(FETCH_TIMEOUT_SECS);
     req.headers.insert(
         "Accept".into(),
         "text/html,application/xhtml+xml,text/plain;q=0.9,application/json;q=0.8,*/*;q=0.5".into(),
@@ -585,33 +564,18 @@ pub fn web_search_with_fallback(
                     .unwrap_or("general");
                 url.push_str(&format!("&categories={}", encode_component(categories)));
 
-                // A search that came back empty because the engines were
-                // silent is asked again, because that is the one failure here
-                // with a good chance of not repeating: measured on this
-                // deployment, one query returned zero hits with the engine
-                // timing out and the very next query answered normally. One
-                // extra request buys the caller an answer instead of a "the web
-                // has nothing on this" that is wrong. Everything else -- a
-                // non-200, a body that is not JSON -- is a verdict about the
-                // request and is not repeated.
-                let mut attempt = 0;
-                let answer = loop {
-                    attempt += 1;
-                    let mut req = HttpRequest::new("GET", url.clone());
-                    req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
-                    req.headers
-                        .insert("Accept".into(), cog_core::CONTENT_TYPE_JSON.into());
-                    let resp = client.execute(req).await.map_err(|e| {
-                        SFError::Agent(format!("web search backend at {base} is unreachable: {e}"))
-                    })?;
-                    let answer = search_answer(&resp, &base, limit)?;
-                    if !answer.results.is_empty()
-                        || answer.broken.is_empty()
-                        || attempt >= SEARCH_ATTEMPTS
-                    {
-                        break answer;
-                    }
-                };
+                // 一次请求一次判断。引擎哑掉时这里不再自己重问：零命中的两种
+                // 含义已经分得开（引擎答了没匹配 vs 引擎没答），后者返回的错误
+                // 里点了哪些引擎哑了并请调用方原样再问——重问是调用方的决定，
+                // 不是这个工具替它连着问两次。请求时限走客户端的配置，这里不
+                // 另写一个秒数。
+                let mut req = HttpRequest::new("GET", url.clone());
+                req.headers
+                    .insert("Accept".into(), cog_core::CONTENT_TYPE_JSON.into());
+                let resp = client.execute(req).await.map_err(|e| {
+                    SFError::Agent(format!("web search backend at {base} is unreachable: {e}"))
+                })?;
+                let answer = search_answer(&resp, &base, limit)?;
                 // Zero hits means two different things depending on who is
                 // reporting it. From an engine that answered, it says the query
                 // was asked and nothing matched -- paraphrasing is the right
@@ -665,14 +629,11 @@ pub fn web_search_with_fallback(
                 // what the engines know -- so that case stays local too.
                 if answer.results.is_empty() && answer.extras.is_empty() {
                     let because = if names.is_empty() {
-                        format!(
-                            "the self-hosted engines answered and matched nothing in \
-                             {attempt} attempt(s)"
-                        )
+                        "the self-hosted engines answered and matched nothing".to_string()
                     } else {
                         format!(
-                            "the self-hosted backend answered nothing in {attempt} \
-                             attempt(s); engines that stayed silent: {}",
+                            "the self-hosted backend answered nothing; engines that stayed \
+                             silent: {}",
                             names.join(", ")
                         )
                     };
@@ -686,12 +647,6 @@ pub fn web_search_with_fallback(
                                     "count": hits.len(),
                                     "results": hits,
                                     "source": "fallback",
-                                    // The attempt count is read off the loop
-                                    // rather than written as "twice": the two
-                                    // have to agree after someone changes
-                                    // SEARCH_ATTEMPTS, and a spelled-out number
-                                    // is the copy that goes stale without
-                                    // failing anything.
                                     "fallback_because": because,
                                 }));
                             }
@@ -725,11 +680,10 @@ pub fn web_search_with_fallback(
                     }
                     if !names.is_empty() {
                         return Err(SFError::Agent(format!(
-                            "web search came back empty after {attempt} attempt(s) because \
-                             no engine answered, which is not the same answer as 'nothing \
-                             matched': the query was never put to anything. Engines that \
-                             stayed silent: {}. Retry the same query rather than rephrasing \
-                             it",
+                            "web search came back empty because no engine answered, which is \
+                             not the same answer as 'nothing matched': the query was never put \
+                             to anything. Engines that stayed silent: {}. Retry the same query \
+                             rather than rephrasing it",
                             names.join(", ")
                         )));
                     }
@@ -771,7 +725,6 @@ async fn fallback_search(
 ) -> SFResult<Vec<serde_json::Value>> {
     let url = format!("{}/search", base.trim_end_matches('/'));
     let mut req = HttpRequest::new("POST", url.clone());
-    req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
     req.headers
         .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
     req.headers
@@ -1185,7 +1138,6 @@ async fn fallback_fetch(
     let mut req = HttpRequest::new("POST", endpoint.clone());
     req.headers
         .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
-    req.timeout_secs = Some(FETCH_TIMEOUT_SECS);
     req.body = Some(body);
     let resp = client.execute(req).await.map_err(|e| {
         SFError::Agent(format!("the fallback outlet at {base} is unreachable: {e}"))
@@ -1545,10 +1497,7 @@ mod tests {
         let silent = r#"{"query":"rust lang","results":[],"answers":[],"suggestions":[],
                "unresponsive_engines":[["bing","timeout"]]}"#
             .to_string();
-        let scripted = Scripted::answering_in_order(vec![
-            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
-            (200, cog_core::CONTENT_TYPE_JSON, silent),
-        ]);
+        let scripted = Scripted::answering(200, cog_core::CONTENT_TYPE_JSON, silent);
         let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
         let err = call(&tool, serde_json::json!({"query":"rust lang"}))
             .await
@@ -1566,21 +1515,21 @@ mod tests {
         );
         assert_eq!(
             scripted.asked().len(),
-            SEARCH_ATTEMPTS as usize,
-            "the silence has to be re-asked before it is reported: one timed-out engine \
-             often answers the next request, and this deployment has only one engine"
+            1,
+            "one call asks once: whether to ask again is the caller's decision, and the \
+             error tells it which one comes next"
         );
     }
 
-    /// Silence that clears on the second ask is an answer, not an error.
+    /// The retry the error asks for works: a second call to the same query,
+    /// after the engine's silence has cleared, returns the hits.
     ///
-    /// This is the case the retry exists for and the one measured on the
-    /// deployment: the first query came back empty with the engine timing out,
-    /// and the request right after it returned the hits. Reporting the first
-    /// one would hand the caller an outage it would then have to retry itself,
-    /// through a model turn, at the cost of a whole turn.
+    /// This is the case measured on the deployment: one query came back empty
+    /// with the engine timing out, and the request right after it answered
+    /// normally. The tool asks once and says which engine stayed silent; the
+    /// caller's next call is the retry, and it is answerable.
     #[tokio::test]
-    async fn search_asks_again_when_the_first_ask_found_nothing_and_nobody_answered() {
+    async fn a_retry_from_the_caller_answers_once_the_silence_clears() {
         let scripted = Scripted::answering_in_order(vec![
             (
                 200,
@@ -1596,15 +1545,17 @@ mod tests {
             ),
         ]);
         let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
+        let first = call(&tool, serde_json::json!({"query":"rust"})).await;
+        assert!(first.is_err(), "silence is reported, not retried in place");
         let out = call(&tool, serde_json::json!({"query":"rust"}))
             .await
-            .expect("the second ask answered, so this is a hit and not an outage");
+            .expect("the caller's own retry answered, so this is a hit and not an outage");
         assert_eq!(out["count"], 1);
         assert_eq!(out["results"][0]["url"], "https://rust-lang.org/");
         assert_eq!(
             scripted.asked().len(),
             2,
-            "exactly one extra ask: the retry is not a loop that keeps the caller waiting"
+            "one request per call: the tool does not ask twice behind one call"
         );
     }
 
@@ -1811,10 +1762,12 @@ mod tests {
     /// （和事后读日志的人）要能从答案本身分辨这一点。
     #[tokio::test]
     async fn the_fallback_answers_a_query_the_self_hosted_backend_never_asked() {
-        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
-            (200, cog_core::CONTENT_TYPE_JSON, silent),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string(),
+            ),
             (
                 200,
                 cog_core::CONTENT_TYPE_JSON,
@@ -1849,12 +1802,12 @@ mod tests {
         let asked = scripted.asked();
         assert_eq!(
             asked.len(),
-            3,
-            "two asks of the self-hosted layer, then one of the fallback"
+            2,
+            "one ask of the self-hosted layer, then one of the fallback"
         );
-        assert_eq!(asked[2].method, "POST");
-        assert_eq!(asked[2].url, "http://gateway:8081/search-fallback/search");
-        let sent = String::from_utf8(asked[2].body.clone().unwrap_or_default()).unwrap();
+        assert_eq!(asked[1].method, "POST");
+        assert_eq!(asked[1].url, "http://gateway:8081/search-fallback/search");
+        let sent = String::from_utf8(asked[1].body.clone().unwrap_or_default()).unwrap();
         assert!(
             sent.contains("rust lang"),
             "the query travels in the body, not in a URL the caller can point elsewhere: {sent}"
@@ -1867,10 +1820,12 @@ mod tests {
     /// 那层的沉默藏起来，而沉默才是下一次该先修的东西。
     #[tokio::test]
     async fn two_failed_backends_are_both_named_in_the_error() {
-        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
-            (200, cog_core::CONTENT_TYPE_JSON, silent),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string(),
+            ),
             (
                 503,
                 cog_core::CONTENT_TYPE_JSON,
@@ -1898,10 +1853,12 @@ mod tests {
     /// `count: 0`——正是这次要防的那个混淆，绕一圈又回来了。
     #[tokio::test]
     async fn an_empty_fallback_answer_does_not_become_an_empty_web() {
-        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
-            (200, cog_core::CONTENT_TYPE_JSON, silent),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string(),
+            ),
             (
                 200,
                 cog_core::CONTENT_TYPE_JSON,

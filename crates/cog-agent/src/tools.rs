@@ -10,14 +10,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How long one memory-read call may take before it is abandoned. The call sits
-/// on an agent turn, so its budget is a share of a turn rather than a background
-/// job's: long enough for a healthy API to return a bounded payload, short
-/// enough that an API which stopped answering delays the turn instead of
-/// wedging it.
-// cap: bound — 短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
-const MEMORY_READ_TIMEOUT_SECS: u64 = 30;
-
 /// 子任务的事件管道有多深。
 ///
 /// 这一侧不读子任务的进度，只雇了一个任务把它排空；所以深度只需要盖住「循环
@@ -3903,7 +3895,6 @@ pub mod builtins {
 
                     let url = format!("{base}/api/v1/tasks");
                     let mut request = cog_core::HttpRequest::new("POST", &url);
-                    request.timeout_secs = Some(MEMORY_READ_TIMEOUT_SECS);
                     request.headers.insert(
                         "content-type".into(),
                         cog_core::contract::net::CONTENT_TYPE_JSON.into(),
@@ -5491,8 +5482,7 @@ pub mod builtins {
     /// carrying the status and the API's own body, so a caller sees the refusal
     /// rather than an empty object.
     async fn get_json(client: &Arc<dyn HttpClient>, url: &str) -> SFResult<serde_json::Value> {
-        let mut req = HttpRequest::new("GET", url);
-        req.timeout_secs = Some(MEMORY_READ_TIMEOUT_SECS);
+        let req = HttpRequest::new("GET", url);
         let resp = client.execute(req).await?;
         if !resp.is_success() {
             return Err(SFError::Agent(format!(
@@ -5726,8 +5716,8 @@ pub mod builtins {
                         .as_str()
                         .unwrap_or("GET")
                         .to_ascii_uppercase();
+                    // 时限走客户端配置：这里不另写一个秒数，那个数属于部署。
                     let mut req = cog_core::HttpRequest::new(method, url);
-                    req.timeout_secs = Some(30);
                     if let Some(headers) = args["headers"].as_object() {
                         for (k, v) in headers {
                             if let Some(v) = v.as_str() {
