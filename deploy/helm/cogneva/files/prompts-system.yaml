@@ -54,7 +54,6 @@ prompts:
       - parameters: valid JSON Schema object describing input parameters
       - implementation_hint: string describing implementation approach (e.g., "native", "wasm", "rhai")
 
-      Respond with ONLY the JSON object.
     version: "1.0.0"
     description: "EvolutionEngine tool variant prompt"
     tags: ["reflection", "evolution"]
