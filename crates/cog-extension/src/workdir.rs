@@ -664,6 +664,13 @@ pub struct WorkdirMetrics {
     /// and the cap being unreachable both read as "nothing happened", and only
     /// this series says which trees are keeping the count above the cap.
     cap_deferred: Counter,
+    /// Trees the cap took although they held work nobody committed. The cap is
+    /// a hard bound on the volume, so this can happen -- but it is the one way
+    /// this router destroys something it cannot rebuild from the bare
+    /// repository, and the loss has no other trace: the tree is gone, the
+    /// files with it, and the next command in that lane gets a fresh checkout
+    /// that looks exactly like the one it expected.
+    cap_took_uncommitted: Counter,
     fetch_failures: Counter,
     unscoped_requests: Counter,
     errors: CounterVec,
@@ -722,6 +729,10 @@ impl WorkdirMetrics {
             "sandbox_workspace_cap_deferred_total",
             "Task worktrees kept above the LRU cap because a command was running in them",
         )?;
+        let cap_took_uncommitted = Counter::new(
+            "sandbox_workspace_cap_took_uncommitted_total",
+            "Task worktrees removed by the LRU cap although they held uncommitted work",
+        )?;
         let fetch_failures = Counter::new(
             "sandbox_workspace_fetch_failures_total",
             "Failures of the background bare-repo upstream fetch",
@@ -760,6 +771,7 @@ impl WorkdirMetrics {
         registry.register(Box::new(gc_reclaimed.clone()))?;
         registry.register(Box::new(gc_kept.clone()))?;
         registry.register(Box::new(cap_deferred.clone()))?;
+        registry.register(Box::new(cap_took_uncommitted.clone()))?;
         registry.register(Box::new(fetch_failures.clone()))?;
         registry.register(Box::new(unscoped_requests.clone()))?;
         registry.register(Box::new(errors.clone()))?;
@@ -862,6 +874,7 @@ impl WorkdirMetrics {
             gc_reclaimed,
             gc_kept,
             cap_deferred,
+            cap_took_uncommitted,
             fetch_failures,
             unscoped_requests,
             errors,
@@ -2003,6 +2016,16 @@ impl WorkdirRouter {
         // through the loop below: a pool tree is never the one reclaimed.
         let mut remaining = trees.len() + warm + incoming;
         let mut deferred = 0u64;
+        // Two kinds of idle tree, and the cap prefers the empty one: a tree can
+        // be rebuilt from the bare repository in seconds, and what was never
+        // committed cannot be rebuilt at all. So an idle tree is not skipped
+        // for holding work, it is merely moved behind every tree that holds
+        // none — and only taken, with a reading that says so, when the bare
+        // trees ran out and the cap still is not met. Taking one is real: the
+        // files are gone and the next command in that lane gets a checkout that
+        // looks like the one it expected.
+        let mut holding_work = Vec::new();
+        let mut took_uncommitted = 0u64;
         for (id, path) in trees {
             if remaining <= max {
                 break;
@@ -2016,10 +2039,30 @@ impl WorkdirRouter {
                 deferred += 1;
                 continue;
             }
+            if self.holds_uncommitted_work(&path).await {
+                holding_work.push((id, path));
+                continue;
+            }
             warn!(task_id = %id, cap = max, "reclaiming task worktree (LRU cap)");
             self.force_remove(&path).await;
             self.remove_meta(&id);
             self.metrics.gc_reclaimed.inc();
+            remaining -= 1;
+        }
+        for (id, path) in holding_work {
+            if remaining <= max {
+                break;
+            }
+            warn!(
+                task_id = %id,
+                cap = max,
+                "reclaiming a task worktree that holds uncommitted work: every tree without work is already gone"
+            );
+            self.force_remove(&path).await;
+            self.remove_meta(&id);
+            self.metrics.gc_reclaimed.inc();
+            self.metrics.cap_took_uncommitted.inc();
+            took_uncommitted += 1;
             remaining -= 1;
         }
         if deferred > 0 {
@@ -2028,6 +2071,13 @@ impl WorkdirRouter {
                 deferred,
                 cap = max,
                 "task worktree cap not met: the trees left to reclaim have commands running in them"
+            );
+        }
+        if took_uncommitted > 0 {
+            warn!(
+                took_uncommitted,
+                cap = max,
+                "the cap removed trees that held uncommitted work: that work is gone and cannot be rebuilt"
             );
         }
     }
@@ -4040,6 +4090,68 @@ pub(crate) mod tests {
             r.metrics.cap_deferred.get(),
             1.0,
             "a finished command leaves nothing to defer"
+        );
+    }
+
+    /// The cap prefers the tree it can put back.
+    ///
+    /// A tree is rebuilt from the bare repository in seconds; what was never
+    /// committed is gone for good. So among idle trees the cap takes the empty
+    /// one first, even when that is the newer one: LRU is the order within each
+    /// kind of tree, not across them.
+    #[tokio::test]
+    async fn the_cap_takes_the_tree_nothing_is_holding_before_the_one_with_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK);
+        let (older, _, _) = r.route("older").await.unwrap();
+        std::fs::write(older.join("notes.txt"), b"nobody committed me\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (newer, _, _) = r.route("newer").await.unwrap();
+        assert!(newer.exists());
+
+        // A third tree does not fit under a cap of two, and the only tree the
+        // cap may take without losing anything is the empty one -- even though
+        // the tree with work in it is the older of the two.
+        r.route("third").await.unwrap();
+
+        assert!(
+            older.exists(),
+            "the cap took the tree that held work while an empty one was there to take"
+        );
+        assert!(
+            !newer.exists(),
+            "the empty tree survived a cap that had to take one"
+        );
+        assert_eq!(r.metrics.gc_reclaimed.get(), 1.0);
+        assert_eq!(
+            r.metrics.cap_took_uncommitted.get(),
+            0.0,
+            "an empty tree was available and a tree with work was taken instead"
+        );
+    }
+
+    /// When every tree holds work the cap still holds: the bound is the volume,
+    /// and a tree that can be rebuilt is cheaper than a full disk. What it took
+    /// has to reach the scraped surface, because the loss has no other trace —
+    /// the files are gone and the next command in that lane gets a checkout
+    /// that looks exactly like the one it expected.
+    #[tokio::test]
+    async fn a_cap_that_had_to_take_uncommitted_work_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 1, DEFAULT_TTL_SECS_FALLBACK);
+        let (only, _, _) = r.route("only").await.unwrap();
+        std::fs::write(only.join("notes.txt"), b"nobody committed me\n").unwrap();
+
+        r.route("second").await.unwrap();
+
+        assert!(!only.exists(), "the cap did not hold");
+        assert_eq!(r.metrics.gc_reclaimed.get(), 1.0);
+        assert_eq!(
+            r.metrics.cap_took_uncommitted.get(),
+            1.0,
+            "the cap destroyed uncommitted work and nothing said so"
         );
     }
 
