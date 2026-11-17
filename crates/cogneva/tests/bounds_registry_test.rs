@@ -31,7 +31,7 @@ use crate::common;
 use common::root::repo_root;
 use serde_json::Value;
 
-fn read_registry() -> Value {
+pub(crate) fn read_registry() -> Value {
     let path = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
@@ -42,7 +42,7 @@ fn read_registry() -> Value {
         .expect("cogneva.json 里没有 bounds 段：界没有登记处了")
 }
 
-fn kept(registry: &Value) -> &Vec<Value> {
+pub(crate) fn kept(registry: &Value) -> &Vec<Value> {
     registry
         .get("kept")
         .and_then(Value::as_array)

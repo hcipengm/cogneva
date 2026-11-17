@@ -214,6 +214,7 @@ mod board_wip_limit_wiring_test;
 mod boot_phase_marks_contract_test;
 #[path = "bounds_registry_test.rs"]
 mod bounds_registry_test;
+
 #[path = "builtin_tools_have_one_list.rs"]
 mod builtin_tools_have_one_list;
 #[path = "capability_declarations_are_enumerated.rs"]
@@ -316,6 +317,8 @@ mod e2e_integration;
 mod enumerations_name_every_variant_the_enum_declares_test;
 #[path = "env_names_are_declared_once_test.rs"]
 mod env_names_are_declared_once_test;
+#[path = "no_ceiling_that_kills_work_without_a_registered_bound_test.rs"]
+mod no_ceiling_that_kills_work_without_a_registered_bound_test;
 
 #[path = "eval_report_is_readable_after_a_run.rs"]
 mod eval_report_is_readable_after_a_run;
