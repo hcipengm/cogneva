@@ -73,6 +73,9 @@ mod a2a_rpc_round_trip;
 mod a_background_command_reports_back_test;
 #[path = "a_cache_share_is_a_share_not_a_difference_test.rs"]
 mod a_cache_share_is_a_share_not_a_difference_test;
+#[path = "a_payload_field_becomes_a_column_not_a_query_test.rs"]
+mod a_payload_field_becomes_a_column_not_a_query_test;
+
 #[path = "a_change_is_accepted_or_refused_before_it_lands_test.rs"]
 mod a_change_is_accepted_or_refused_before_it_lands_test;
 #[path = "a_claim_the_capacity_loop_raises_is_one_it_was_told_about_test.rs"]
