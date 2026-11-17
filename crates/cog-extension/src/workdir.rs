@@ -3668,7 +3668,22 @@ pub(crate) mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// 给这一支的产物一次身份：检查点会跑 `git commit-tree`，而 commit-tree 在没有
+    /// 名字与邮箱时直接失败（CI 的 runner 上没有全局 git 身份，本机有，于是这条
+    /// 只在 CI 红）。设的是**本进程的环境**：被测代码起的子进程会继承它，而值对每
+    /// 一条用例都一样，并发跑不会互相干扰。
+    pub(crate) fn git_identity() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            std::env::set_var("GIT_AUTHOR_NAME", "cogneva-test");
+            std::env::set_var("GIT_AUTHOR_EMAIL", "cogneva-test@example.invalid");
+            std::env::set_var("GIT_COMMITTER_NAME", "cogneva-test");
+            std::env::set_var("GIT_COMMITTER_EMAIL", "cogneva-test@example.invalid");
+        });
+    }
+
     pub(crate) fn seed_bare(root: &Path) -> PathBuf {
+        git_identity();
         let work = root.join("seed");
         std::fs::create_dir_all(&work).unwrap();
         git(&["init", "-q", "-b", "main"], &work);
