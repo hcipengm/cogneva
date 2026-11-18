@@ -84,7 +84,9 @@ pub enum AgentCommand {
 ///         agent_id: "my-agent".into(),
 ///         role: AgentRole::Planner,
 ///         max_iterations: 10,
-///         context_window_size: 32000,
+///         // 0 = 没人说过：起点取自 LLM 配置里这只型号公布的窗口
+///         // （`cog_core::model_windows`），实测再往两个方向校正。
+///         context_window_size: 0,
 ///     },
 ///     Arc::new(my_llm_provider),
 /// );

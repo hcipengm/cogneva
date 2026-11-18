@@ -24,9 +24,13 @@ const EVENTS: &str = "web/src/types/events.ts";
 const PANE: &str = "web/src/conversation/ConversationPane.tsx";
 const STORE: &str = "web/src/store/chatStore.ts";
 
-/// 这一段对话的窗口（token），取内核默认的那一档——与实现读的是同一个出处。
+/// 这一段对话的窗口（token）。夹具用一只主流型号公布的档位，不是实现的口径：
+/// 真实链路上这个数来自设置页里那只模型的规格（随上游池一起落进配置面，见
+/// `cog_core::model_windows`），这里只需要一个正的窗口。
+const WINDOW_TOKENS: usize = 1_000_000;
+
 fn window() -> usize {
-    cog_core::RuntimeConfig::default().context_window_size
+    WINDOW_TOKENS
 }
 
 /// 一帧的上限（字节），取网关钉下的那一个。
@@ -134,18 +138,24 @@ fn the_path_is_the_same_for_the_same_message() {
 /// 参考文说清了三件事：原文多长、在哪、这一段只是开头；它自己不带全文。
 #[test]
 fn the_reference_says_what_is_missing_and_where_the_rest_is() {
-    let content = "字".repeat(50_000);
+    // 原文按阈值算，不写死一个长度：这一条判的是「引用比原文短」，而阈值随窗口走
+    // （窗口的八分之一）。写死 50,000 的话，窗口抬到 1M 之后这条消息比阈值还短，
+    // 归档根本不会发生，测试却还在断言归档之后的形状。
+    let threshold = window() / 8;
+    let content = "字".repeat(threshold.saturating_mul(2));
+    let total = content.chars().count();
+    let total_text = total.to_string();
     let path = "/tmp/cogneva-chat-attachments/s/a.txt";
-    let reference = cog_gateway::chat::oversized_reference(&content, path, window() / 8);
+    let reference = cog_gateway::chat::oversized_reference(&content, path, threshold);
 
     assert!(reference.contains(path), "参考文没有说原文在哪");
-    assert!(reference.contains("50000"), "参考文没有说原文有多长");
+    assert!(reference.contains(&total_text), "参考文没有说原文有多长");
     assert!(
         reference.contains("不是全文"),
         "参考文没有说明这一段只是开头：模型会把它当成全文"
     );
     assert!(
-        reference.chars().count() < content.chars().count(),
+        reference.chars().count() < total,
         "参考文与原文一样长：它自己就把窗口再撑破一次"
     );
     assert!(

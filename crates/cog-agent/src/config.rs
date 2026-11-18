@@ -113,6 +113,8 @@ pub struct AgentLoopConfig {
     /// （判一份交上来的结果用不了那么多轮），但同样是一个断言而不是一条度量，
     /// 所以同样交给部署去写。
     pub eval_max_iterations: Option<u32>,
+    /// 上下文窗口的声明值；0 = 没人说过（见 [`cog_core::RuntimeConfig::context_window_size`]）。
+    /// 起点取自 LLM 配置里那只型号公布的规格（[`cog_core::model_windows`]），实测校正它。
     pub context_window_size: usize,
     /// TTL for the available_skills cache in AgentRuntime (seconds).
     pub skill_cache_ttl_secs: u64,
@@ -178,7 +180,7 @@ impl Default for AgentLoopConfig {
             role: cog_core::roles::PLANNER.into(),
             max_iterations: None,
             eval_max_iterations: None,
-            context_window_size: 32000,
+            context_window_size: 0,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             memory_api_base: None,

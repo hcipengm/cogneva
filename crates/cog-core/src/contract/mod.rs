@@ -34,6 +34,7 @@ pub mod media;
 pub mod memory;
 pub mod metric_help;
 pub mod metric_names;
+pub mod model_windows;
 pub mod net;
 pub mod notification;
 pub mod observability;

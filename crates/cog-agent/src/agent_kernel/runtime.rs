@@ -1162,11 +1162,12 @@ impl AgentRuntime {
             observable.iteration_budget_decision_for(config.max_iterations, &config.agent_id);
         config.max_iterations = ceiling;
 
-        // 窗口同一条处置：配置里那个数是没有读数时的起点，不是事实——这棵树里
-        // 没有任何文件知道上游的窗口有多大。量到过就按量到的走（见
-        // [`crate::observable::ContextWindowProbe`]），`config` 里的那个数跟着换，
-        // 于是 `note_context_overrun`、工具结果预算这些读 `config` 的地方看的是
-        // 同一个窗口，不会一个按声明、一个按实测。
+        // 窗口同一条处置：起点来自上游回报的型号在厂商规格里公布的那个数
+        // （`cog_core::model_windows`：设置页里那只模型公布的窗口），配置里那个数只在没人说过
+        // 型号时兜底（写 0 就是「没人说过」，不是零个 token 的窗口）。量到过
+        // 就按量到的走（见 [`crate::observable::ContextWindowProbe`]），
+        // `config` 里的那个数跟着换，于是 `note_context_overrun`、工具结果预算
+        // 这些读 `config` 的地方看的是同一个窗口，不会一个按声明、一个按实测。
         let declared_context_window = config.context_window_size;
         let (window, window_source) =
             observable.context_window_decision_for(declared_context_window);
@@ -3967,7 +3968,11 @@ impl AgentRuntime {
                 // 建流就被拒是一种「上游直接说了话、我们一个字都没收到」的形态：
                 // 有些协议面把超窗的拒绝原样以错误返回，正文里就带着它的界。
                 let wording = e.to_string();
-                self.note_context_measurement(None, Some(&wording)).await;
+                // 这次没拿到响应，手里最新的型号是上一次响应回报的那一个；
+                // 没有就不用型号定起点。
+                let model = self.run_usage.model.clone();
+                self.note_context_measurement(model.as_deref(), None, Some(&wording))
+                    .await;
                 return Err(e);
             }
             Err(_) => {
@@ -4057,8 +4062,13 @@ impl AgentRuntime {
         // 当成收下过的证据——那是它明确拒收的大小。两个读数都在把 `stream_error`
         // 移走之前取，移走之后这句拒绝的原文就没了。
         let accepted_prompt_tokens = stream_error.is_none().then_some(response.usage.input);
-        self.note_context_measurement(accepted_prompt_tokens, stream_error.as_deref())
-            .await;
+        let answering_model = response.model.as_str();
+        self.note_context_measurement(
+            Some(answering_model),
+            accepted_prompt_tokens,
+            stream_error.as_deref(),
+        )
+        .await;
 
         if let Some(error) = stream_error {
             // A provider that classified the refusal (HTTP status -> a typed
@@ -4230,9 +4240,31 @@ impl AgentRuntime {
     /// 实测同一份 179,595 字节的请求连发 1,563 次）。
     async fn note_context_measurement(
         &mut self,
+        model: Option<&str>,
         accepted_prompt_tokens: Option<u32>,
         refusal: Option<&str>,
     ) {
+        // 谁在答话决定了窗口该从哪里起步。部署配置里那一条是指向网关的座位名
+        // （`via-security-gateway`），真正在答的型号由上上游回报、网关透传；
+        // 拿到型号之后查厂商公布的规格，那才是这一轮的起点。查不到不编数：
+        // 留着声明值，由下面的实测补上。
+        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+            if let Some(window) = cog_core::model_windows::configured(model) {
+                if self.context_probe.published() != Some(window) {
+                    tracing::info!(
+                        agent_id = %self.config.agent_id,
+                        model,
+                        window,
+                        // 不叫 llm-config：那个拼写已经是「冗余下限由设置声明」那条读数的
+                        // 来源标签（`MIN_HEALTHY_SOURCE_DECLARED`）。这一格说的是另一件事——
+                        // 窗口来自设置页里那只型号公布的规格。
+                        source = "llm_model_spec",
+                        "按设置页里这只模型公布的窗口定起点"
+                    );
+                    self.context_probe.note_published(window);
+                }
+            }
+        }
         if let Some(tokens) = accepted_prompt_tokens.filter(|t| *t > 0) {
             self.context_probe.note_accepted(u64::from(tokens));
         }
@@ -4273,9 +4305,14 @@ impl AgentRuntime {
         if window == before {
             return;
         }
+        // 0 是「没人说过」，在比较里是「没有界」而不是「零个 token 的界」：
+        // 起点从 0 变成任何一个有限的数都是收窄，方向不能读反。
+        let before_effective = if before == 0 { usize::MAX } else { before };
         self.context.set_max_tokens(window);
         self.config.context_window_size = window;
-        if window < before {
+        if source == crate::observable::ContextWindowSource::MeasuredLimit
+            && window < before_effective
+        {
             tracing::warn!(
                 agent_id = %self.config.agent_id,
                 before,
@@ -4307,7 +4344,7 @@ impl AgentRuntime {
                 window,
                 declared = self.declared_context_window,
                 source = source.as_str(),
-                "上游收下过比声明窗口更大的 prompt；预算抬到它确实收得下的大小"
+                "上下文窗口换了：型号的公布规格或上游收下过的 prompt 给出的大小"
             );
         }
     }
@@ -6666,6 +6703,7 @@ mod tests {
         runtime
             .note_context_measurement(
                 None,
+                None,
                 Some("This model's maximum context length is 1000 tokens."),
             )
             .await;
@@ -6697,6 +6735,7 @@ mod tests {
         runtime
             .note_context_measurement(
                 None,
+                None,
                 Some("This model's maximum context length is 1000 tokens."),
             )
             .await;
@@ -6724,7 +6763,9 @@ mod tests {
         let observable = crate::observable::AgentObservable::new();
         let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
 
-        runtime.note_context_measurement(Some(9_000), None).await;
+        runtime
+            .note_context_measurement(None, Some(9_000), None)
+            .await;
 
         assert_eq!(runtime.context.max_tokens(), 9_000);
         assert_eq!(runtime.config.context_window_size, 9_000);
@@ -6753,12 +6794,76 @@ mod tests {
         let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
 
         runtime
-            .note_context_measurement(None, Some("the prompt is too long"))
+            .note_context_measurement(None, None, Some("the prompt is too long"))
             .await;
 
         assert_eq!(runtime.context.max_tokens(), 5_000);
         assert_eq!(runtime.config.context_window_size, 5_000);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// 起点是「谁在答话」×「它公布了多少」，不是配置里拍的一个数。
+    ///
+    /// 部署配置里那一条 `model` 是网关的座位名；真正在答的型号由上游在响应里
+    /// 回报。拿到型号就去查厂商公布的规格——那是可核对的数，写死一个 1M 或 64k
+    /// 都不是。查不到的型号（这里是网关座位名）什么都不改：起点留着「没人说过」，
+    /// 由实测补上。
+    #[tokio::test]
+    async fn the_model_that_answered_lends_its_published_window() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "spec".into(),
+            // 0 = 部署没有声明窗口，起点本来就没人说过。
+            context_window_size: 0,
+            max_iterations: 1,
+            ..Default::default()
+        };
+        let observable = crate::observable::AgentObservable::new();
+        let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
+        assert_eq!(
+            runtime.context.max_tokens(),
+            0,
+            "no model named yet: no budget stated, not a window of zero tokens"
+        );
+
+        // 座位名不是型号：查到什么都算不上。
+        runtime
+            .note_context_measurement(Some("via-security-gateway"), None, None)
+            .await;
+        assert_eq!(runtime.context.max_tokens(), 0);
+
+        // 配置面（设置页那一份）说这只模型公布的窗口是 1M。真实链路上这一行由
+        // 网关的池状态读进来（`cog_gateway::llm_admin`），这里直接放表里。
+        cog_core::model_windows::replace([("claude-opus-5-5".to_string(), 1_000_000)]);
+        runtime
+            .note_context_measurement(Some("claude-opus-5-5"), Some(1_000), None)
+            .await;
+        assert_eq!(
+            runtime.context.max_tokens(),
+            1_000_000,
+            "the window is the one Anthropic publishes for this model"
+        );
+        assert_eq!(runtime.config.context_window_size, 1_000_000);
+        assert!(
+            rx.try_recv().is_err(),
+            "starting from a published spec is not a resource alert"
+        );
+
+        // 规格是起点，不是事实：上游自述的界压在它上面。
+        runtime
+            .note_context_measurement(
+                Some("claude-opus-5-5"),
+                None,
+                Some("prompt is too long: 300000 tokens > 150000 maximum"),
+            )
+            .await;
+        assert_eq!(runtime.context.max_tokens(), 150_000);
+        assert!(matches!(
+            rx.try_recv().expect("the shrink has to be announced"),
+            AgentEvent::ResourceAlert { .. }
+        ));
+        // 那张表是进程级的：这一条用例写进去的型号，别的用例不该继承。
+        cog_core::model_windows::clear();
     }
 
     /// The fold itself: the total never falls below its own parts, whichever
@@ -8955,7 +9060,10 @@ mod tests {
     async fn a_tool_result_the_run_already_carried_is_not_paid_for_twice() {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let mut runtime = AgentRuntime::new(RuntimeConfig::default(), tx);
+        // 这条判据管的是「同一条结果不会付两次」，与窗口无关：给它自己的观测面，
+        // 别人量到的窗口（这个进程级的读数是全局的）就不会决定这里一页能放多少。
+        let observable = crate::observable::AgentObservable::new();
+        let mut runtime = AgentRuntime::with_observable(RuntimeConfig::default(), tx, &observable);
 
         let big = serde_json::json!({ "content": "x".repeat(REPEATED_TOOL_RESULT_MIN_CHARS) });
         let big_text = big.to_string();

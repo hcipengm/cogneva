@@ -49,6 +49,12 @@ pub struct RuntimeConfig {
     /// decision for this deployment, and it reaches here through the config
     /// surface or the role's skill, never as a default nobody measured.
     pub max_iterations: u32,
+    /// 这一段对话的上下文窗口（token）。**0 表示没人说过**，不是零个 token 的
+    /// 窗口：起点的正身是上游回报的型号在 LLM 配置里公布的那个数
+    /// （[`crate::model_windows`]：设置页的预设带着厂商规格，随池状态报进来），
+    /// 实测（收下过多大的 prompt、拒收时自述过多大的界）把它往两个方向校正。这里
+    /// 放一个数只用于「型号查不到、也还没量到过」的部署——那种情况宁可不裁，也不
+    /// 拿一个没人量过的数去裁掉本来装得下的历史。
     pub context_window_size: usize,
     /// TTL for the available_skills cache in seconds.
     pub skill_cache_ttl_secs: u64,
@@ -127,10 +133,11 @@ impl Default for RuntimeConfig {
             // was cut off with a tool call still pending, and the round after
             // it started the same work over from the top.
             max_iterations: u32::MAX,
-            // 32k fallback: 4k windows amputate tool-call history so badly that
-            // CJK task prompts alone trigger trimming, leaving the model with
-            // only the task text each iteration (amnesia → repeated work).
-            context_window_size: 32000,
+            // 0 = 没人说过。写一个数（32k、64k、1M）都是替上游拍一个它没公布过
+            // 的窗口：写小了裁掉装得下的历史，写大了第一次调用就被拒。起点由
+            // 型号 × 厂商公布规格给出，实测再把它校正到准确值；两个都没有时
+            // 不裁，第一次拒收自述的界就是那个准确的数。
+            context_window_size: 0,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             // Measured against the recoveries that kept a run alive: the

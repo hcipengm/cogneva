@@ -51,6 +51,14 @@ pub struct LlmUpstreamRequest {
     pub api_key: String,
     /// 协议面首猜（openai/anthropic）：探测按此顺序优先，失败自动换另一种。
     pub api_style: Option<String>,
+    /// 这只模型公布的上下文窗口（token），随条目落盘。
+    ///
+    /// 与 `pricing` 同一条理由跟着条目走：同一家不同型号不同窗口，挂在厂商名上
+    /// 迟早把 A 型号的窗口算到 B 型号头上。值来自设置页那一项预设旁边的厂商规格
+    /// 注释，不是这一层拍的。缺省 = 这台的上游没有公开规格，运行时就按实测走
+    /// （收下过多大的 prompt、拒收时自述多大的界）。
+    #[serde(default)]
+    pub context_window: Option<u64>,
     /// 这台上游自己的价目（币种、单位、分时档、出处、抄自哪一天）。
     ///
     /// 价目**跟着条目走**，不跟着厂商名走：同一家不同型号不同价，挂在厂商上
@@ -74,6 +82,9 @@ pub struct LlmConfigRequest {
     pub extra_upstreams: Option<Vec<LlmUpstreamRequest>>,
     /// 主上游的价目，形状同 [`LlmUpstreamRequest::pricing`]。
     pub pricing: Option<serde_json::Value>,
+    /// 主上游这只模型公布的上下文窗口，形状同
+    /// [`LlmUpstreamRequest::context_window`]：随条目落盘，缺省 = 没说过。
+    pub context_window: Option<u64>,
     /// 声明的冗余下限：池里至少要有几家上游能承接请求，低于它就按"池不可用"
     /// 判（告警 + 暂停 LLM 依赖型派活）。缺省 = 不声明，判定回落到"一家都不供
     /// 才算不可用"。
@@ -104,6 +115,17 @@ pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) 
                 "backends": local_backends(),
                 "pool": pool.policy,
                 "upstream_names": pool.names,
+                // 各条目自报的公布窗口，就是运行时拿到的起点。列在这里是因为
+                // 它决定了循环裁剪：一页上看不见「这只型号的窗口是多少」，就
+                // 分不出一次裁剪是规格给的还是那个部署根本没人说过。
+                "model_windows": pool
+                    .windows
+                    .into_iter()
+                    .map(|(model, context_window)| json!({
+                        "model": model,
+                        "context_window": context_window,
+                    }))
+                    .collect::<Vec<_>>(),
                 "source": "security-gateway",
             })),
         )
@@ -138,12 +160,26 @@ pub(crate) fn pool_policy_json(upstreams: usize, declared: Option<usize>) -> ser
     })
 }
 
-/// 池的转发读数：家数与声明下限，加上池里每一家的名字。
+/// 池的转发读数：家数与声明下限，加上池里每一家的名字，以及各条目自报的公布窗口。
 pub(crate) struct ForwardedPool {
     pub configured: bool,
     pub policy: serde_json::Value,
     /// 池里每一家的 `base_url|model`——与网关指标上的标签同形，不含 key。
     pub names: Vec<String>,
+    /// `(model, context_window)`，只有自报了窗口的条目才有。
+    ///
+    /// 同一只模型在多家上游上、窗口不一样时两张都在：取最小值的决定在
+    /// [`cog_core::model_windows::replace`] 一处做，这一层不替它挑。
+    pub windows: Vec<(String, u64)>,
+}
+
+/// 用配置面刷新进程里那张「型号 → 公布窗口」的表（`cog_core::model_windows`）。
+///
+/// 会话开头问一次：配置可能在上一轮之后被改过，而窗口正是循环裁剪的依据。问不到
+/// 不是失败——读数保持上一份，第一次超窗时由实测补上；这里只是把「配置此刻说什
+/// 么」变成一次尽量新的读数，调用方不必等它。
+pub async fn refresh_model_windows() -> Result<(), String> {
+    forwarded_llm_status().await.map(|_| ())
 }
 
 /// 主应用侧：问安全网关要池的状态。
@@ -176,18 +212,60 @@ pub(crate) async fn forwarded_llm_status() -> Result<ForwardedPool, String> {
                 .collect()
         })
         .unwrap_or_default();
+    // 键不在（对面是还没滚到的旧网关）与键在但为空（池里没人报过窗口）是两件事：
+    // 前者是「这次没读到这一格」，不能拿它去清掉本进程现有的起点；后者是配置面
+    // 刚说完「一只都没公布」。所以只有读到数组才替换。
+    let windows = match body.get("windows").and_then(|v| v.as_array()) {
+        Some(list) => {
+            let pairs: Vec<(String, u64)> = list
+                .iter()
+                .filter_map(|e| {
+                    let model = e.get("model")?.as_str()?.trim().to_string();
+                    let window = e.get("context_window")?.as_u64()?;
+                    (!model.is_empty() && window > 0).then_some((model, window))
+                })
+                .collect();
+            let before = cog_core::model_windows::all();
+            cog_core::model_windows::replace(pairs.iter().cloned());
+            let after = cog_core::model_windows::all();
+            if before != after {
+                tracing::info!(
+                    windows = ?after,
+                    "LLM 配置里各型号公布的上下文窗口换了，循环裁剪的起点跟着换"
+                );
+            }
+            pairs
+        }
+        None => cog_core::model_windows::all(),
+    };
     Ok(ForwardedPool {
         configured,
         policy: pool_policy_json(upstreams, declared),
         names,
+        windows,
     })
 }
 
-/// 落盘那一份池的读数：家数、声明下限，以及成员名字。
+/// 落盘那一份池的读数：家数、声明下限、成员名字，以及各条目自报的公布窗口。
 pub(crate) struct PoolSnapshot {
     pub upstreams: usize,
     pub min_healthy: Option<usize>,
     pub names: Vec<String>,
+    /// `(model, context_window)`：条目的 `context_window` 键存在且为正数时才有。
+    ///
+    /// 没有这一格 = 这一家没说过窗口有多大，不是 0 个 token；调用方靠「键缺失」
+    /// 与「值是几」分开，所以这里不塞默认值。
+    pub windows: Vec<(String, u64)>,
+}
+
+/// 池条目自报的公布窗口：型号 + 正数窗口。键缺失、0、负数一律读成「没说过」。
+fn pool_member_window(entry: &serde_json::Value) -> Option<(String, u64)> {
+    let model = entry.get("model")?.as_str()?.trim();
+    let window = entry.get("context_window")?.as_u64()?;
+    if model.is_empty() || window == 0 {
+        return None;
+    }
+    Some((model.to_string(), window))
 }
 
 /// 池里一条的名字：`base_url|model`。与网关指标的 `upstream` 标签同形，读账的
@@ -416,6 +494,7 @@ pub async fn llm_config_handler(
         model: req.model.clone(),
         api_key: req.api_key.clone(),
         api_style: req.api_style.clone(),
+        context_window: req.context_window,
         pricing: req.pricing.clone(),
     };
     let mut requests = vec![primary];
@@ -775,6 +854,11 @@ async fn resolve_upstream(
     });
     if let Some(pricing) = pricing {
         entry["pricing"] = pricing;
+    }
+    // 窗口随条目落盘，缺省不写：写 0 会让下游读成「说过，是零」，而不写是
+    // 「没人说过」，两者在运行时的处置不同。
+    if let Some(window) = item.context_window.filter(|w| *w > 0) {
+        entry["context_window"] = json!(window);
     }
     if cog_core::is_openai_family(api_style) && !skip_verify {
         match detect_tool_call_support(base_url, model, api_key).await {
@@ -1429,6 +1513,7 @@ impl KubeClient {
             serde_json::from_str::<Vec<serde_json::Value>>(upstreams_raw).unwrap_or_default();
         let upstreams = entries.len();
         let names = entries.iter().filter_map(pool_member_name).collect();
+        let windows = entries.iter().filter_map(pool_member_window).collect();
         // 同一条语法由判定那一路定义：这一面若自己再写一遍"trim、非空、大于 0"，
         // 两处就会漂——配置面读得出一个界、判定面读不出，而两边都自报成功。
         let declared = fields
@@ -1439,6 +1524,7 @@ impl KubeClient {
             upstreams,
             min_healthy: declared,
             names,
+            windows,
         }))
     }
 
@@ -1523,8 +1609,8 @@ mod tests {
     use super::{
         api_base_from, apiserver_denies_ownership, classify_probe, classify_temperature_probe,
         classify_usage_probe, detect_api_style, merge_pool, pool_change_detail, pool_member_name,
-        protocol_probe_url, resolve_upstream, union_size, ApiStyleProbe, LlmUpstreamRequest,
-        ProbeOutcome,
+        pool_member_window, protocol_probe_url, resolve_upstream, union_size, ApiStyleProbe,
+        LlmUpstreamRequest, ProbeOutcome,
     };
 
     /// apiserver 的地址来自这个 Pod 拿到的两个变量，而不是一个写死的服务名。
@@ -1989,6 +2075,7 @@ mod tests {
             model: "deepseek-flash".into(),
             api_key: "sk-test".into(),
             api_style: Some("openai".into()),
+            context_window: None,
             pricing: Some(serde_json::json!({
                 "currency": "CNY",
                 "unit_tokens": 1_000_000,
@@ -2010,6 +2097,71 @@ mod tests {
         assert_eq!(entry["pricing"]["checked_at"], "2026-11-05");
     }
 
+    /// 池条目里那一格窗口，读出来是「型号 + 正数」，读不出就是没说过。
+    ///
+    /// 这一条读的是落盘之后的状态面（`secret_pool_policy` 用它拼 `windows`）：
+    /// 键不在与键在但为 0 在运行时是两件事——前者「没人说过」，后者若被当成
+    /// 窗口，就是零个 token 的窗口。两者在这里都读成 `None`。
+    #[test]
+    fn a_pool_entry_reports_its_window_only_when_it_states_one() {
+        let with_window = serde_json::json!({"model": "k3", "context_window": 1_048_576});
+        assert_eq!(
+            pool_member_window(&with_window),
+            Some(("k3".to_string(), 1_048_576))
+        );
+        assert_eq!(
+            pool_member_window(&serde_json::json!({"model": "k3"})),
+            None
+        );
+        assert_eq!(
+            pool_member_window(&serde_json::json!({"model": "k3", "context_window": 0})),
+            None
+        );
+        assert_eq!(
+            pool_member_window(&serde_json::json!({"model": " ", "context_window": 7})),
+            None,
+            "没有型号就没有下行可挂"
+        );
+    }
+
+    /// 窗口跟着条目落库：设置页发来的那个数写进池条目，缺省与 0 都不写键。
+    ///
+    /// 主应用读回这条池状态才能把「型号 → 窗口」报给运行时。少了这一步，设置页
+    /// 上每个型号旁边都写着厂商规格，而运行时那边一个都没收到——两边都自报成功，
+    /// 只有第一次超窗被拒时才看得出来。缺省不写键（而不是写 0）是因为下游把 0
+    /// 读作「说过，是零个 token 的窗口」。
+    #[tokio::test]
+    async fn an_upstream_carries_the_window_that_was_saved_with_it() {
+        let item = LlmUpstreamRequest {
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-flash".into(),
+            api_key: "sk-test".into(),
+            api_style: Some("openai".into()),
+            context_window: Some(1_048_576),
+            pricing: None,
+        };
+        let (entry, _) = resolve_upstream(&item, true)
+            .await
+            .expect("skip_verify 下不该需要网络");
+        assert_eq!(entry["context_window"], 1_048_576);
+
+        for unstated in [None, Some(0)] {
+            let item = LlmUpstreamRequest {
+                base_url: "https://api.deepseek.com".into(),
+                model: "deepseek-flash".into(),
+                api_key: "sk-test".into(),
+                api_style: Some("openai".into()),
+                context_window: unstated,
+                pricing: None,
+            };
+            let (entry, _) = resolve_upstream(&item, true).await.expect("不该需要网络");
+            assert!(
+                entry.get("context_window").is_none(),
+                "{unstated:?} 不该写进条目：键缺失才是「没人说过」"
+            );
+        }
+    }
+
     /// 坏价目在写入时拒单，不留到读取时才降级成「没有价目」。
     ///
     /// 读取侧为了保住故障转移候选会把坏价目悄悄置空——那是对的，运行中不能
@@ -2022,6 +2174,7 @@ mod tests {
             model: "deepseek-flash".into(),
             api_key: "sk-test".into(),
             api_style: Some("openai".into()),
+            context_window: None,
             pricing: Some(serde_json::json!({
                 "currency": "CNY",
                 "unit_tokens": 1_000_000,

@@ -694,8 +694,24 @@ fn rewind_report(
     })
 }
 
+/// 这一段对话真跑在多大的窗口里；`None` = 没人说过（不是零个 token）。
+///
+/// 读的是进程里那份实测/规格读数——与循环自己裁剪用的是同一个（`AgentRuntime`
+/// 也挂在同一个全局观测面上），而不是部署配置里那个声明值：声明值只是型号查不到
+/// 时的兜底，而这个部署写的就是 0（没人说过）。
+fn conversation_window_tokens() -> Option<usize> {
+    let declared = cog_core::RuntimeConfig::default().context_window_size;
+    let (window, _) =
+        cog_agent::observable::global_observable().context_window_decision_for(declared);
+    (window != 0).then_some(window)
+}
+
+/// 窗口那条界：`usize::MAX` 在 `oversized_threshold_tokens` 里等于「这条线不设」。
+///
+/// 没人说过窗口时只能这样答——这时唯一真实的界是一帧能带多少字节，拿一个替上游
+/// 拍出来的窗口去判「这句话要不要落成文件」，判的是没人量过的数。
 fn conversation_context_window_tokens() -> usize {
-    cog_core::RuntimeConfig::default().context_window_size
+    conversation_window_tokens().unwrap_or(usize::MAX)
 }
 
 impl ConversationTurn for PlatformConversation {
@@ -895,6 +911,16 @@ impl ConversationTurn for PlatformConversation {
                     }
                 }
             }
+            // 窗口的起点取自 LLM 配置里那只型号公布的规格，而配置可以在两轮之间
+            // 被改：开场先问一次池状态，`cog_core::model_windows` 由那条读数刷新，
+            // 下面那句读数才是这一轮真正跑的窗口。问不到不是失败——沿用上一份，
+            // 第一次超窗时由实测补上。
+            if let Err(e) = cog_gateway::llm_admin::refresh_model_windows().await {
+                tracing::debug!(
+                    error = %e,
+                    "这一轮没读到 LLM 配置里的型号窗口，沿用上一份读数"
+                );
+            }
             let config = RuntimeConfig {
                 agent_id: employee.id.clone(),
                 // 没有角色：这一段对话就是这位员工本人。role 取它的 id，内核因此
@@ -910,8 +936,10 @@ impl ConversationTurn for PlatformConversation {
                 // 花销记在使用账上。轮数是这三样缺位时的替代品，这里不再拿它当尺。
                 max_iterations: u32::MAX,
                 // 窗口由上面那个读数给出，不在这里另写一次：网关拿它判「这条消息
-                // 是不是太大了」，判的必须是这一轮真正跑在的那个窗口。
-                context_window_size: conversation_context_window_tokens(),
+                // 是不是太大了」，判的必须是这一轮真正跑在的那个窗口。没人说过时
+                // 写 0（「没人说过」），不写 `usize::MAX`——后者会在账上、日志里
+                // 读成一个 1.8e19 的窗口。
+                context_window_size: conversation_window_tokens().unwrap_or(0),
                 ..Default::default()
             };
             // 会话开头的那棵树：只在第一次进到这里时真的拍（之后读一行 KV 就

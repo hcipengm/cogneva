@@ -584,7 +584,10 @@ impl cog_core::SystemPlugin for AgentPlugin {
             agent_id: eval_employee.id.clone(),
             role: cog_core::roles::EVALUATOR.into(),
             max_iterations: agent_loop_config.eval_max_iterations.unwrap_or(u32::MAX),
-            context_window_size: 32000,
+            // 与主循环同一个数：窗口是部署配置里说的那一个起点，评测这一份
+            // 没有理由自己再写一个——两个数各写各的，改一处就会有一边静默地
+            // 用旧值裁剪。
+            context_window_size: agent_loop_config.context_window_size,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             skill_config: None,

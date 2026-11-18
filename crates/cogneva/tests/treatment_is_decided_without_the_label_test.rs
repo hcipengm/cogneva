@@ -59,22 +59,22 @@ const LABELS: &[&str] = &["role", "role_type", "skill_id", "actor", "label"];
 /// 写待遇的地方必须在这张表上。名字决定了它只能是这三样之一——活自己声明了什么
 /// （`declared`）、接手人的实测交卷（`measured`）、操作者的显式覆盖（`override`）。
 const WRITE_POINTS: &[(&str, &str, &str)] = &[
-    // 任务上的声明，管理器建 agent 时抄进运行时。
-    // 工具表拿到的窗口来自部署配置（`agent_loop.context_window_size`）：这是操作者的
-    // 显式选择，不是哪件活声明的、也不是谁实测出来的。
+    // 工具表拿到的那一格：循环把本轮的窗口交给它，页大小由窗口导出。这个数不是
+    // 操作者拍的，是循环声明的那一个（起点来自型号的公布规格，实测校正）。
     (
         "crates/cog-agent/src/tools.rs",
         "context_window_size",
-        "override",
+        "declared",
     ),
-    // 运行时自己写的那一格，两个写点同一个判定：配置里那个数是还没量到任何东西时的
-    // 起点（覆盖），量到之后按量到的走（实测）——上游收下过多大的 prompt、或者拒收
-    // 时自述过多大的界。这是 `max_iterations` 同一条处置：判定函数把值与来源一起
-    // 交出来，写回去的是它返回的那个值，于是「谁给的」在读数面上分得开。
+    // 运行时自己写的那一格：起点是上游回报的型号在厂商规格里公布的那个数（那是
+    // 上游自己的声明，`declared`），实测再把它往两个方向校正——收下过多大的
+    // prompt、拒收时自述过多大的界（`measured`）。这是 `max_iterations` 同一条
+    // 处置：判定函数把值与来源一起交出来，写回去的是它返回的那个值，于是
+    // 「谁给的」在读数面上分得开（`ContextWindowSource`）。
     (
         "crates/cog-agent/src/agent_kernel/runtime.rs",
         "context_window_size",
-        "measured+override",
+        "measured+declared",
     ),
     (
         "crates/cog-agent/src/runtime/manager.rs",
@@ -107,13 +107,6 @@ const WRITE_POINTS: &[(&str, &str, &str)] = &[
         "crates/cog-agent/src/self_review.rs",
         "stated_directions",
         "declared",
-    ),
-    // 工具表服务哪个窗口：部署配置里写着的那一个（`agent_loop.context_window_size`）。
-    // 同一份部署里每位员工拿到的是同一个数，与名字无关——它随部署变，不随人变。
-    (
-        "crates/cog-agent/src/tools.rs",
-        "context_window_size",
-        "override",
     ),
 ];
 

@@ -340,6 +340,8 @@ mod every_declared_once_gate_shares_the_one_reader_test;
 mod every_file_in_the_static_tree_is_delivered_or_declared_test;
 #[path = "every_first_party_container_prints_time_in_the_clusters_timezone_test.rs"]
 mod every_first_party_container_prints_time_in_the_clusters_timezone_test;
+#[path = "every_preset_model_has_its_published_window_test.rs"]
+mod every_preset_model_has_its_published_window_test;
 #[path = "every_reflection_row_states_what_closes_it_test.rs"]
 mod every_reflection_row_states_what_closes_it_test;
 #[path = "every_rendered_profile_is_a_tree_the_deployer_delivers_test.rs"]

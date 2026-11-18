@@ -82,6 +82,17 @@ pub struct LlmUpstream {
     /// 落在哪一档算出一个数写进同一行；没声明的写 `NULL`——「没算」与「算出来
     /// 是零」在账单上是两句话，见 [`crate::pricing::PriceBook::cost`]。
     pub pricing: Option<crate::pricing::PriceBook>,
+    /// 这只模型**对外公布**的上下文窗口（token），随条目落盘。
+    ///
+    /// 与 `pricing` 同一条理由跟着条目走：窗口是型号的属性，而池里可以同时有几
+    /// 只不同型号——按厂商名挂一张表，迟早把 A 型号的窗口算到 B 型号头上。值来自
+    /// 设置页那一项预设（`web/src/overlay/LlmSetupOverlay.tsx` 的 `PRESETS`，出处
+    /// 写在同一项的注释里），不是网关拍的。
+    ///
+    /// `None` = 这台没有公开规格，不是 0 个 token 的窗口：运行时按实测走（收下过
+    /// 多大的 prompt、拒收时自述多大的界）。这一格要报给主应用——循环裁剪的起点
+    /// 就在那里（`cog_core::model_windows`）——所以它随状态读数出去，但从不带 key。
+    pub context_window: Option<u64>,
 }
 
 impl std::fmt::Debug for LlmUpstream {
@@ -462,6 +473,14 @@ fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
                 supports_usage_in_streaming: v
                     .get("supports_usage_in_streaming")
                     .and_then(|x| x.as_bool()),
+                // 公布窗口与价目同一处置：解析不出来时**整条目照收、窗口置空**，
+                // 而不是把条目丢掉——丢掉一条上游是拿「少一个起点」去换「少一家
+                // 可故障转移的候选」，代价不对等。代价是这台要等第一次超窗才说得出
+                // 自己的界，所以 0 与负数按「没说过」读，不当作一个界。
+                context_window: v
+                    .get("context_window")
+                    .and_then(|x| x.as_u64())
+                    .filter(|w| *w > 0),
                 // 价目是这一条的可选声明。解析不出来时**整条目照收、价目置空**，
                 // 而不是把条目丢掉：丢掉一条上游会从池里少一家可供故障转移的
                 // 候选，那是拿「记不了钱」去换「跑不了活」，两件事的代价不对等。
@@ -10830,8 +10849,8 @@ async fn internal_llm_status_handler(
         Ok(kube) => kube.secret_pool_policy().await.ok().flatten(),
         Err(_) => None,
     };
-    let (upstreams, declared, names) = match from_file {
-        Some(pool) => (pool.upstreams, pool.min_healthy, pool.names),
+    let (upstreams, declared, names, windows) = match from_file {
+        Some(pool) => (pool.upstreams, pool.min_healthy, pool.names, pool.windows),
         // 读不到文件就报本进程正在用的那份：那不是「没配」，那是「正在用的」。
         None => (
             state.config.llm_upstreams.len(),
@@ -10841,6 +10860,12 @@ async fn internal_llm_status_handler(
                 .llm_upstreams
                 .iter()
                 .map(|u| format!("{}|{}", u.base_url, u.model))
+                .collect(),
+            state
+                .config
+                .llm_upstreams
+                .iter()
+                .filter_map(|u| Some((u.model.clone(), u.context_window?)))
                 .collect(),
         ),
     };
@@ -10853,6 +10878,15 @@ async fn internal_llm_status_handler(
             // 名字不带 key：主应用要用它把「改前是哪几家」写进审计，而凭证只留在
             // 这个进程里。指标的 `upstream` 标签本来就是同一串。
             "names": names,
+            // 各条目自报的公布窗口，主应用拿它定循环裁剪的起点。没有公布规格的
+            // 条目不出现在这里——「没说过」不是「0 个 token」。
+            "windows": windows
+                .into_iter()
+                .map(|(model, context_window)| serde_json::json!({
+                    "model": model,
+                    "context_window": context_window,
+                }))
+                .collect::<Vec<_>>(),
         })),
     )
         .into_response()
@@ -11553,6 +11587,7 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         }
     }
 
@@ -11588,6 +11623,36 @@ mod tests {
         let cost = book.cost(1_000, 0, 1_000, 0, 4).expect("应当算得出");
         assert_eq!(cost.micros, 5_000); // ¥1/M × 1,000 + ¥4/M × 1,000 = ¥0.005
         assert_eq!(cost.book, "CNY@2026-11-05");
+    }
+
+    /// 上游条目自报的公布窗口随池一起解析出来，0 与缺失都读成「没说过」。
+    ///
+    /// 这一格是循环裁剪的起点（主应用把它报进 `cog_core::model_windows`）。少了
+    /// 它，运行时就说不出「这只型号的窗口有多大」，只能等第一次超窗被上游拒——
+    /// 而那次拒绝是真金白银的一发。把 0 读成一个窗口更糟：那是零个 token 的
+    /// 窗口，第一次调用就会把历史裁到只剩一句。
+    #[test]
+    fn an_upstream_entry_carries_the_window_it_was_saved_with() {
+        let raw = r#"[{
+            "base_url": "https://api.example.com",
+            "model": "claude-opus-5-5",
+            "api_key": "k",
+            "context_window": 1000000
+        },{
+            "base_url": "https://api.example.com",
+            "model": "unstated",
+            "api_key": "k"
+        },{
+            "base_url": "https://api.example.com",
+            "model": "zero",
+            "api_key": "k",
+            "context_window": 0
+        }]"#;
+        let pool = super::parse_upstreams(raw);
+        assert_eq!(pool.len(), 3, "窗口那一格读不出来不该丢掉整条目");
+        assert_eq!(pool[0].context_window, Some(1_000_000));
+        assert_eq!(pool[1].context_window, None, "缺失 = 没说过");
+        assert_eq!(pool[2].context_window, None, "0 = 没说过，不是零个 token");
     }
 
     /// 一次被定价的调用，落进账本的那一行要带着钱和它依据的那本价目。
@@ -12906,6 +12971,7 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         config.llm_upstreams = vec![
             llm("https://api.deepseek.com/v1", "sk-live"),
@@ -13522,6 +13588,7 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         assert!(!table.is_suspect(&u));
         // 首次失败开新窗：返回计数供调用方打 WARN。
@@ -13599,6 +13666,7 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         assert_eq!(table.last_success_unix(), 0, "还没送出过活");
         assert_eq!(
@@ -13713,6 +13781,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         let pool = vec![u.clone()];
         assert_eq!(
@@ -14131,6 +14200,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         let a = mk("https://a");
         let b = mk("https://b");
@@ -16318,6 +16388,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         };
         let a = mk("https://a");
         let b = mk("https://b");
@@ -17917,6 +17988,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
             pricing: None,
+            context_window: None,
         }
     }
 

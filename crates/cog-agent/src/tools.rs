@@ -335,8 +335,9 @@ pub struct ToolRegistry {
     /// [`crate::context::tool_result_budget_chars`]，与运行时把一条工具结果
     /// 裁进上下文用的是同一个函数。工具这边另存一个页大小，窗口调大时页不跟
     /// 着变，同一件事就在树里有了两份答案。这里放的是部署配置的那个窗口
-    /// （`agent_loop.context_window_size`）；某一轮自己配了更窄的窗口，最终
-    /// 仍由运行时的逐轮裁剪兜住。
+    /// （`agent_loop.context_window_size`），0 = 没人说过，此时一页的大小按
+    /// 设置页里各型号公布的规格导出（见 [`Self::page_chars`]）。某一轮自己学到
+    /// 更窄的窗口，最终仍由运行时的逐轮裁剪兜住。
     context_window_size: usize,
     /// 每个工具在本进程里被点过几次。
     ///
@@ -374,8 +375,22 @@ impl ToolRegistry {
     /// 只有 `read_file` 用它：分页是给调用方的把手（`offset` / `limit` /
     /// `has_more`），不是一次截断。搜索、glob、diff 不在工具里截，整份答案
     /// 交给运行时——那里会把超出的一页归档成引用再裁。
+    ///
+    /// 配置没声明窗口（写 0）时，窗口取自设置页里那些型号公布的规格
+    /// （`cog_core::model_windows`）：池里最小的一只说了算，因为一发可能落到任何
+    /// 一家。两边都没说时返回「不设界」——那个进程里没人说过窗口，替它猜一个
+    /// 页大小就是替上游拍数；那条结果进上下文时仍由运行时的裁剪与归档兜住。
     fn page_chars(&self) -> usize {
-        crate::context::tool_result_budget_chars(self.context_window_size)
+        let window = if self.context_window_size != 0 {
+            self.context_window_size
+        } else {
+            cog_core::model_windows::all()
+                .into_iter()
+                .map(|(_, window)| window as usize)
+                .min()
+                .unwrap_or(0)
+        };
+        crate::context::tool_result_budget_chars(window)
     }
 
     pub fn with_require_identity(mut self, require: bool) -> Self {

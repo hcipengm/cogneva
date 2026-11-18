@@ -68,6 +68,7 @@ pub use contract::memory::*;
 pub use contract::metric_help::{documented_metric_names, metric_description, metric_help_text};
 pub use contract::metric_names;
 pub use contract::metric_names::{is_registered_metric, metric_name_of_ident, MetricName};
+pub use contract::model_windows;
 pub use contract::net::*;
 pub use contract::notification::*;
 pub use contract::observability::*;

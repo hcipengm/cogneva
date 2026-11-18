@@ -71,6 +71,12 @@ fn headline(message: &Message) -> String {
 }
 
 impl ContextWindow {
+    /// `max_tokens` 为零表示**没人说过这个窗口有多大**——不是零个 token 的窗口。
+    ///
+    /// 这两个状态必须分开：部署配置里的窗口是一个起点，实测之前它可能根本不存在
+    /// （配置写 0 / 上游还没回报型号）。把「没说过」读成 0，第一条消息进来就会被
+    /// 裁到地板，模型每一轮看到的都是同一份空上下文；读成「暂时不裁」，由第一次
+    /// 拒收自述的界把窗口定下来，才是这两个状态本来的区别。
     pub fn new(max_tokens: usize) -> Self {
         Self {
             messages: Vec::new(),
@@ -78,6 +84,15 @@ impl ContextWindow {
             max_tokens,
             current_tokens: 0,
             compaction: None,
+        }
+    }
+
+    /// 真正生效的预算：`max_tokens` 为零时是「没有界」。
+    fn budget(&self) -> usize {
+        if self.max_tokens == 0 {
+            usize::MAX
+        } else {
+            self.max_tokens
         }
     }
 
@@ -313,7 +328,7 @@ impl ContextWindow {
     /// 2026-11-06 实测：一件自进化任务的窗口占用 66,368 token、窗口 64,000，
     /// 同一个 179,595 字节的请求体被原样发了 1,563 次，一小时零产出。
     pub fn floor_exceeds_budget(&self) -> bool {
-        self.messages.len() <= 2 && self.current_tokens > self.max_tokens
+        self.messages.len() <= 2 && self.current_tokens > self.budget()
     }
 
     /// The character budget one tool result may occupy in this window.
@@ -334,14 +349,14 @@ impl ContextWindow {
     /// （system 与首条 user）那几百 token，窗口一旦填满就再也涨不回去。
     /// 裁到一半，同样的事隔一整个半窗才发生一次，中间每一轮都是纯追加。
     fn trim_target(&self) -> usize {
-        self.max_tokens / TRIM_LOW_WATER_DIVISOR
+        self.budget() / TRIM_LOW_WATER_DIVISOR
     }
 
     fn trim_if_needed(&mut self) {
         // 只有真过界才裁；一旦裁就裁到低水位，而不是裁到刚好不超。
         // 判据是「这一次入队把窗口顶过了预算」——没过界就不裁，过界之后
         // 的循环由低水位收尾。
-        let over_budget = self.current_tokens > self.max_tokens;
+        let over_budget = self.current_tokens > self.budget();
         while over_budget && self.current_tokens > self.trim_target() && self.messages.len() > 2 {
             // 保留 system message 与首条 user（任务输入）：丢掉首条 user 后，
             // 后续轮次会变成 assistant/tool 起头的无目标对话，模型答非所问。
@@ -444,11 +459,11 @@ impl ContextWindow {
         // 出站」在读数上同形，而两种情况的处置相反：前者调估算，后者调预算或
         // 地板。上面那条逐次裁剪留在 debug（常态，按窗口预算反复发生），
         // 这一条是**例外**，所以报在被采集的那一级。
-        if self.current_tokens > self.max_tokens {
+        if self.current_tokens > self.budget() {
             tracing::warn!(
-                budget = self.max_tokens,
+                budget = self.budget(),
                 estimated = self.current_tokens,
-                excess = self.current_tokens - self.max_tokens,
+                excess = self.current_tokens - self.budget(),
                 kept_messages = self.messages.len(),
                 "the context window goes out over budget: the floor of system plus the first user message does not fit, so trimming ran out of messages to drop"
             );
@@ -493,6 +508,12 @@ pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
     // 2026-11-18：它把一页卡在 32 KiB，而那天的工具结果最大 33.9 KB），
     // 它没有量过任何东西——它存在只是为了让「一条结果占满一轮新增」这件事不发生，
     // 而那件事该由窗口自己回答：装不下就由裁剪去处理，装得下就不该有人替它设一个更小的数。
+    if max_tokens == 0 {
+        // 但「没人说过窗口」不是窗口很小：份额的一半无从导出（0 的一半是 0，
+        // 不是「很小的份额」）。这里答「不设界」，与运行时对同一种状态的处置
+        // 是同一条——由第一次拒收把界说出来，而不是由这里替上游猜一个。
+        return usize::MAX;
+    }
     (max_tokens / TOOL_RESULT_WINDOW_SHARE_DIVISOR)
         .max(1)
         .saturating_mul(cog_core::token_estimate::CHARS_PER_TOKEN)
@@ -1273,6 +1294,87 @@ mod tests {
         assert!(
             big > 32 * 1024,
             "固定上限若还在，这条会立刻红：窗口大时它必须跟着长大"
+        );
+    }
+
+    /// 窗口是 0 表示「没人说过」，不是「零个 token 的窗口」。
+    ///
+    /// 读成后者的话，第一条消息进来就把整段对话裁到地板，模型每一轮看到的都是
+    /// 同一份空上下文；工具结果也会被压在「0 的一半」上。读成前者，内容照常进，
+    /// 单条工具结果不设份额界，等第一次拒收把真正的界说出来（见
+    /// `AgentRuntime::note_context_measurement`）。
+    #[test]
+    fn an_unstated_window_trims_nothing_and_states_no_share() {
+        let mut ctx = ContextWindow::new(0);
+        ctx.add_message(Message::system("sys"));
+        ctx.add_message(Message::user("q"));
+        for i in 0..50 {
+            ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::text(
+                format!("turn {i}: {}", "x".repeat(400)),
+            )]));
+        }
+        assert_eq!(ctx.messages().len(), 52, "没人说过窗口时不该裁掉任何一条");
+        assert!(!ctx.floor_exceeds_budget());
+        assert_eq!(
+            tool_result_budget_chars(0),
+            usize::MAX,
+            "没有窗口就没有「窗口的一半」：0 的一半不是很小的份额，是没有份额"
+        );
+    }
+
+    #[test]
+    fn a_tool_result_that_fits_is_untouched() {
+        let mut ctx = ContextWindow::new(400);
+        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "call_ok",
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+        )]));
+        let text = "编译通过，3 个测试用例全部通过";
+        ctx.add_message(Message::tool_result_text("call_ok", "run_command", text));
+        assert_eq!(ctx.messages().last().unwrap().content(), text);
+    }
+
+    #[test]
+    fn the_task_input_is_never_truncated_by_the_tool_result_bound() {
+        // 首条 user 是任务输入，由调用方决定内容；这里的界只针对外部输出。
+        let mut ctx = ContextWindow::new(200);
+        let input = "目标 ".repeat(200);
+        ctx.add_message(Message::user(input.clone()));
+        assert_eq!(ctx.messages()[0].content(), input);
+    }
+
+    #[test]
+    fn a_truncated_result_reports_its_archived_reference_within_budget() {
+        let text = "x".repeat(5000);
+        let out = truncate_to_chars(&text, 400, Some("artifact://default/t-0001-0002"));
+        assert!(
+            out.text.contains("tool output truncated"),
+            "被砍过要说出来: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("artifact://default/t-0001-0002"),
+            "归档了就要给得回引用，否则砍掉的字节没人拿得到: {}",
+            out.text
+        );
+        assert!(
+            out.text.chars().count() <= 400,
+            "标记本身也算预算，否则进窗口会被二次裁剪: {}",
+            out.text.chars().count()
+        );
+        // 丢掉的字符数要和文本里的标记讲同一件事：标记左边就是保留的头部，
+        // 两者差一个字符就说明读数与模型看到的不是同一个量。
+        let kept = out
+            .text
+            .find("\n[tool output truncated: ")
+            .expect("标记在尾部")
+            .min(out.text.len());
+        let kept = out.text[..kept].chars().count();
+        assert_eq!(
+            out.dropped_chars,
+            text.chars().count() - kept,
+            "丢弃量必须等于原文长度减去标记左边保留的头部"
         );
     }
 

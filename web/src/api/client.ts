@@ -472,6 +472,15 @@ export interface LlmConfigPayload {
   api_style?: string;
   /** 探测失败后的"仍然保存"：跳过连通验证直接落库 */
   skip_verify?: boolean;
+  /**
+   * 这只模型公布的上下文窗口（token），随上游条目一起落盘。
+   *
+   * 它不是这一页的旋钮：值来自预设旁边那条厂商规格（哪一页、哪一天写在注释里），
+   * 跟着条目走——同一家不同型号不同窗口，挂在厂商名上迟早把 A 型号的窗口算到
+   * B 型号头上。缺省 / 0 = 没说过，运行时走实测（收下过多大的 prompt、拒收时
+   * 自述多大的界）。
+   */
+  context_window?: number;
 }
 
 export async function getLlmStatus(): Promise<LlmStatus> {
