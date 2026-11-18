@@ -183,10 +183,7 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
     ("cogneva_skill_hot_reload_total", MetricDerivation::Store),
     ("cogneva_supervisor_pass_total", MetricDerivation::Store),
     ("cogneva_task_checkpoint_total", MetricDerivation::Store),
-    (
-        "cogneva_tool_call_archived_total",
-        MetricDerivation::Store,
-    ),
+    ("cogneva_tool_call_archived_total", MetricDerivation::Store),
     (
         "cogneva_tool_output_archive_failed_total",
         MetricDerivation::Store,

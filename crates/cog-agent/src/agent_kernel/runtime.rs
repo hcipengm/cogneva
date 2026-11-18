@@ -8451,10 +8451,7 @@ mod tests {
         assert_eq!(record["turn"], serde_json::json!(0));
         assert_eq!(record["frame"], serde_json::json!(0));
         assert_eq!(record["arguments"], serde_json::json!({}));
-        assert_eq!(
-            record["result"], payload,
-            "归档的是全文，不是截断后的那段"
-        );
+        assert_eq!(record["result"], payload, "归档的是全文，不是截断后的那段");
         let expected_id = format!("artifact://default/{}", archived[0].1);
 
         let joined = runtime
@@ -8681,14 +8678,34 @@ mod tests {
         let args = serde_json::json!({ "path": "crates/a.rs" });
         let mut delivered = DeliveredResults::default();
         let first = runtime
-            .tool_result_message(None, 0, 0, "call-1", "read_file", &args, &big, false, &mut delivered)
+            .tool_result_message(
+                None,
+                0,
+                0,
+                "call-1",
+                "read_file",
+                &args,
+                &big,
+                false,
+                &mut delivered,
+            )
             .await;
         assert_eq!(first.content(), big_text, "第一次读到的东西要原样交给模型");
         runtime.context.add_message(asks_for("call-1"));
         runtime.context.add_message(first);
 
         let second = runtime
-            .tool_result_message(None, 0, 1, "call-2", "read_file", &args, &big, false, &mut delivered)
+            .tool_result_message(
+                None,
+                0,
+                1,
+                "call-2",
+                "read_file",
+                &args,
+                &big,
+                false,
+                &mut delivered,
+            )
             .await;
         assert_ne!(
             second.content(),
@@ -8708,7 +8725,17 @@ mod tests {
         let other = serde_json::json!({ "content": "y".repeat(REPEATED_TOOL_RESULT_MIN_CHARS) });
         let other_text = other.to_string();
         let third = runtime
-            .tool_result_message(None, 0, 2, "call-3", "read_file", &args, &other, false, &mut delivered)
+            .tool_result_message(
+                None,
+                0,
+                2,
+                "call-3",
+                "read_file",
+                &args,
+                &other,
+                false,
+                &mut delivered,
+            )
             .await;
         assert_eq!(third.content(), other_text, "没重复的输出不许被当成重复");
     }
@@ -8833,7 +8860,17 @@ mod tests {
         let huge_text = huge.to_string();
         let args = serde_json::json!({ "command": "cat big" });
         let first = runtime
-            .tool_result_message(None, 0, 0, "call-1", "run_command", &args, &huge, false, &mut delivered)
+            .tool_result_message(
+                None,
+                0,
+                0,
+                "call-1",
+                "run_command",
+                &args,
+                &huge,
+                false,
+                &mut delivered,
+            )
             .await;
         assert!(
             first.content().len() < huge_text.len(),
@@ -8843,7 +8880,17 @@ mod tests {
         runtime.context.add_message(first);
 
         let second = runtime
-            .tool_result_message(None, 1, 0, "call-2", "run_command", &args, &huge, false, &mut delivered)
+            .tool_result_message(
+                None,
+                1,
+                0,
+                "call-2",
+                "run_command",
+                &args,
+                &huge,
+                false,
+                &mut delivered,
+            )
             .await;
         let stub: serde_json::Value =
             serde_json::from_str(&second.content()).expect("指针仍然是一份工具结果");
