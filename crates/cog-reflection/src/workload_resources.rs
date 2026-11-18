@@ -185,6 +185,19 @@ pub const LANE_WAITING_METRIC: &str = "cogneva_workload_lane_waiting";
 /// 问到的这些副本上一共几个人占着位子。
 pub const LANE_HOLDING_METRIC: &str = "cogneva_workload_lane_holding";
 
+/// 答上话的这几副副本一共几位子——此刻真能同时跑几份工作。
+///
+/// 与 [`REPLICA_LANE_READINGS_METRIC`] 一起读：那位是 0 时这条不发，因为「一副都
+/// 没答」与「答了，位子是零」在页面上必须是两个样子，而不是同一个零。
+pub const LANE_SLOTS_METRIC: &str = "cogneva_workload_lane_slots";
+
+/// 承载量：一副副本实测的位子数乘目标副本数。
+///
+/// 它是扩缩律算出来的那个数，不是另一处算的：目标副本数正是按「在跑 + 在等」除以
+/// 每副位数取整得来的，所以 `capacity ≥ holding + waiting` 是一条能从读数面直接判
+/// 的式子，不需要读者去翻代码或估一份配置。
+pub const LANE_CAPACITY_METRIC: &str = "cogneva_workload_lane_capacity";
+
 /// 启动探针的失败预算（次数）。
 pub const STARTUP_THRESHOLD_METRIC: &str = "cogneva_workload_startup_failure_threshold";
 
@@ -243,6 +256,14 @@ pub struct QueueReading {
     pub waiting: usize,
     /// 目标副本数；一副副本都说不出位子数时为 `None`。
     pub replicas: Option<u64>,
+    /// 答上话的这几副一共几位子：此刻真能同时跑几份工作。
+    ///
+    /// 它按副本逐个相加，而不按除数相乘——一副报 4 条、另一副报 8 条时，此刻
+    /// 的容量是 12，不是 16。没有一副答得上话时它是 0，但那条读数不发零：
+    /// 见 [`LANE_SLOTS_METRIC`]。
+    pub slots: usize,
+    /// 扩缩用的除数：一副副本最多能同时跑几条。答不上话时为 `None`。
+    pub lanes_per_replica: Option<usize>,
 }
 
 /// 一副副本：「这个面开着」的最小集合。
@@ -281,6 +302,11 @@ pub fn replicas_for_the_queue(readings: &[LaneQueue], declared: u64) -> QueueRea
         .count();
     let holding: usize = readings.iter().map(|reading| reading.holding).sum();
     let waiting: usize = readings.iter().map(|reading| reading.waiting).sum();
+    let slots: usize = readings
+        .iter()
+        .filter_map(|reading| reading.lanes)
+        .filter(|lanes| *lanes > 0)
+        .sum();
     let replicas = lanes_per_replica.map(|lanes| {
         let wanted = ((holding + waiting) as u64)
             .div_ceil(lanes as u64)
@@ -296,6 +322,8 @@ pub fn replicas_for_the_queue(readings: &[LaneQueue], declared: u64) -> QueueRea
         holding,
         waiting,
         replicas,
+        slots,
+        lanes_per_replica,
     }
 }
 
@@ -1602,6 +1630,23 @@ impl Observable for WorkloadResourcesReadings {
                             .with_label(WORKLOAD_LABEL, row.workload.clone()),
                     );
                 }
+                // 一副都没答上话时这两条不发：一个零会被读成「容量是 0」，而这一拍
+                // 的事实是「没有人量过」。读者靠上面那条 answered = 0 分辨。
+                if queue.answered > 0 {
+                    out.push(
+                        RawMetric::new(LANE_SLOTS_METRIC, queue.slots as f64)
+                            .with_label(WORKLOAD_LABEL, row.workload.clone()),
+                    );
+                }
+                if let (Some(lanes), Some(target)) = (queue.lanes_per_replica, queue.replicas) {
+                    out.push(
+                        RawMetric::new(
+                            LANE_CAPACITY_METRIC,
+                            (lanes as u64).saturating_mul(target) as f64,
+                        )
+                        .with_label(WORKLOAD_LABEL, row.workload.clone()),
+                    );
+                }
             }
         }
         for row in self.startups.lock().unwrap().values() {
@@ -2543,6 +2588,87 @@ mod tests {
         assert_eq!(
             replicas_for_the_queue(&[lane_queue(&silent)], 1).replicas,
             Some(1)
+        );
+    }
+
+    /// 读数面上的一个系列：名字、标签里的工作负载与值。
+    async fn series(readings: &WorkloadResourcesReadings, name: &str) -> Vec<(String, f64)> {
+        readings
+            .collect_metrics("D?")
+            .await
+            .expect("the replica readings are collected")
+            .into_iter()
+            .filter(|metric| metric.name == name)
+            .map(|metric| {
+                let workload = metric
+                    .labels
+                    .get(WORKLOAD_LABEL)
+                    .cloned()
+                    .unwrap_or_default();
+                (workload, metric.value)
+            })
+            .collect()
+    }
+
+    /// 承载量是读数：每副本实测量出来的位子数乘目标副本数，扩出来盖得住这一拍的需求。
+    ///
+    /// 判据是「换输入，值跟着变」：同一千份活，一副八条位子与一副十六条位子读出两个
+    /// 不同的承载量，而两个都不小于在跑加在等。谁把它换成一个人拍的数，这条当场红。
+    #[tokio::test]
+    async fn the_capacity_is_the_measured_slots_times_the_target() {
+        let readings = WorkloadResourcesReadings::new();
+        let narrow = replicas_for_the_queue(&[queue(Some(8), 600, 400)], 1);
+        assert_eq!(narrow.replicas, Some(125), "一千份活，每副八条位子");
+        readings.observe_queue("sandbox-executor", narrow);
+        let published = series(&readings, LANE_CAPACITY_METRIC).await;
+        assert_eq!(
+            published,
+            vec![("sandbox-executor".to_string(), 1_000.0)],
+            "8 条位子 × 125 副"
+        );
+        assert!(
+            published[0].1 >= (narrow.holding + narrow.waiting) as f64,
+            "扩出来的承载量盖不住这一拍在跑加在等，就是把活留在了队里"
+        );
+
+        let wide = replicas_for_the_queue(&[queue(Some(16), 600, 400)], 1);
+        assert_eq!(wide.replicas, Some(63), "同样的活，一副十六条位子进一位");
+        readings.observe_queue("sandbox-executor", wide);
+        let published = series(&readings, LANE_CAPACITY_METRIC).await;
+        assert_eq!(published[0].1, 16.0 * 63.0, "16 条位子 × 63 副");
+        assert!(
+            published[0].1 >= (wide.holding + wide.waiting) as f64,
+            "除不尽时进的那一位要出现在承载量上"
+        );
+    }
+
+    /// 此刻的位子按副逐个相加；没有一副答得上话时，容量不发零。
+    ///
+    /// 「一份都没量到」与「量到就是零」在页面上不能是同一个数：前者靠 answered 为 0
+    /// 说，后者只能在真读到零位子时说——而零位子的副本本来就不进除数。
+    #[tokio::test]
+    async fn slots_add_up_across_replicas_and_an_unanswered_round_publishes_no_capacity() {
+        let readings = WorkloadResourcesReadings::new();
+        let mixed = replicas_for_the_queue(&[queue(Some(4), 1, 0), queue(Some(8), 1, 0)], 2);
+        assert_eq!(mixed.slots, 12, "4 + 8：此刻的容量是两副之和");
+        assert_eq!(mixed.lanes_per_replica, Some(8), "除数是更宽的那一副");
+        readings.observe_queue("sandbox-executor", mixed);
+        assert_eq!(
+            series(&readings, LANE_SLOTS_METRIC).await,
+            vec![("sandbox-executor".to_string(), 12.0)]
+        );
+
+        let silent = replicas_for_the_queue(&[queue(None, 5, 5)], 3);
+        readings.observe_queue("sandbox-executor", silent);
+        assert!(
+            series(&readings, LANE_CAPACITY_METRIC).await.is_empty(),
+            "一副都没答上话时承载量不是一个数，更不是零"
+        );
+        assert!(series(&readings, LANE_SLOTS_METRIC).await.is_empty());
+        assert_eq!(
+            series(&readings, REPLICA_LANE_READINGS_METRIC).await,
+            vec![("sandbox-executor".to_string(), 0.0)],
+            "读者靠 answered = 0 看出这一拍没读到队"
         );
     }
 
