@@ -4463,9 +4463,10 @@ struct UsageScanner {
     raw: Vec<u8>,
     /// 这一跳一共看到多少字节，无论有没有留下来。
     ///
-    /// 与 `raw.len()` 是两个问题：后者是副本有多长，前者是上游发了多少。副本抄到部署
-    /// 声明的默认上限就不再抄原文（上限在 `feed` 里，防异常响应把内存顶爆），而字节照样
-    /// 转发，所以两者的差就是那截没有副本的尾巴——留底行靠它把「正文短」与「副本短」分开。
+    /// 与 `raw.len()` 是两个问题：后者是副本有多长，前者是上游发了多少。两者现在相等
+    /// ——副本不再有截断（见 `feed`）。这一格仍旧单独记着：它是「上游到底发了多少」的
+    /// 唯一读数，将来若那条路真的出了岔子（写不进去、读不回来），差就出在这里，而不是
+    /// 让读者从「正文短」去猜。
     seen: u64,
     tokens_input: u64,
     tokens_output: u64,
@@ -4504,14 +4505,13 @@ impl UsageScanner {
     fn feed(&mut self, chunk: &[u8]) {
         self.line_buf.extend_from_slice(chunk);
         self.seen += chunk.len() as u64;
-        // 非 SSE body 的兜底解析需要原文；上限 1MiB 防内存被异常响应顶爆。
+        // 整条响应原样留下：没有窗口、没有阈值、没有截断。
         //
-        // 这条界也就是留底副本的长度上限：写进 Raw 层的是这一段，不是整条响应。
-        // 所以越过它的部分**没有副本**，而这件事只能靠 `seen` 与副本长度不等看出来
-        // ——`raw` 停在这里，转发照旧，读的人否则看到的就是一条"本来就短"的答复。
-        if self.raw.len() < 1024 * 1024 {
-            self.raw.extend_from_slice(chunk);
-        }
+        // 从前这里有一道写死的字节数做上限（`if raw.len() < 1024 * 1024`），越过的部分没有副本，而落库那一行
+        // 看起来是完整的——只有把 `seen` 与副本长度摆在一起才看得出少了一截。正文
+        // 是这次调用唯一的现场，现场不许被安静地切掉；大小由上游自己决定（受它自己的
+        // 输出上限约束），不由我们拍一个数。
+        self.raw.extend_from_slice(chunk);
         while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
             let text = String::from_utf8_lossy(&line);
@@ -4724,7 +4724,7 @@ impl UsageRecorder {
         self.claimed = true;
         let mut s = self.scanner.lock().unwrap();
         s.finish();
-        // 响应原文在这里一并取走：扫描器本来就留着（上限 1 MiB，见 `feed`），
+        // 响应原文在这里一并取走：扫描器本来就留着整条（见 `feed`），
         // 留底要的就是它，不必再从流里抄第二份。`seen` 跟它一起走：副本有多长与
         // 上游一共发了多少必须同一次读出，分开读会让两个数说不上同一笔。
         let captured = CapturedBody {
@@ -12334,6 +12334,35 @@ mod tests {
         assert_eq!(
             extract_usage(&nested),
             (Some(2627), Some(189), Some(17920), None, None)
+        );
+    }
+
+    /// 正文没有截断：越过原来那道写死的上限的响应仍然整条留下。
+    ///
+    /// 从前 `feed` 在那个写死的字节数处停手（那一版代码里的裸字面量，没有出处），越过的字节没有副本，而落库那一行看起来是完整的
+    /// ——只有把 `seen` 与副本长度摆在一起才看得出少了一截。这条用例逐块喂过那道旧上限，
+    /// 判「留下的字节与喂进去的逐字节相等」。
+    #[test]
+    fn a_body_past_a_megabyte_is_kept_whole() {
+        let mut s = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        let chunk = vec![b'x'; 64 * 1024];
+        let chunks = 17; // 16 块整只是旧上限，第 17 块才跨过它
+        for _ in 0..chunks {
+            s.feed(&chunk);
+        }
+        s.finish();
+        assert_eq!(
+            s.raw.len(),
+            chunk.len() * chunks,
+            "正文被截断了：留下的字节比上游发的少"
+        );
+        assert_eq!(
+            s.seen as usize,
+            s.raw.len(),
+            "副本长度与上游发出的字节数不再相等，说明中间还有一处截断"
         );
     }
 
