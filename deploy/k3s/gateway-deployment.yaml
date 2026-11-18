@@ -146,6 +146,10 @@ spec:
             # 路径写死在这里而不是配置项：它同时是卷的挂载点，两处分开配就会漂移。
             # 缺私钥时网关自己检测到文件不存在、兜底保持关闭（HTTPS 单通道），
             # 所以可以先部署、后补凭证。
+            # 内存 Raw 层的面：每次工具调用的参数与整份结果归档到这里，取引用也从
+            # 这里读回。本进程走回环进内部端口，不经安全网关（那一面只代持外网凭证）。
+            - name: COGNEVA_MEMORY_API_BASE
+              value: "http://cogneva:8085"
             - name: COGNEVA_GATEWAY_GIT_MIRROR_ROOT
               value: /var/lib/cogneva-git-mirror
             - name: COGNEVA_GATEWAY_GIT_MIRROR_ENABLED
