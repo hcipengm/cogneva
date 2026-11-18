@@ -23,6 +23,7 @@ pub mod eval_subset;
 pub mod eval_table;
 pub mod eval_toolathlon;
 pub mod eval_toolathlon_local;
+pub mod export_change_diff;
 pub mod gateway_observability;
 pub mod governance;
 pub mod governance_acts;

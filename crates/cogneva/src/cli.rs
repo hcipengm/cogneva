@@ -34,6 +34,7 @@ pub enum Command {
     BackupDrill,
     RebuildMetricProjections,
     ImportChangeRecords,
+    ExportChangeDiff,
     RepairAof,
     EvalTable,
     EvalCaseSubset,
@@ -47,7 +48,7 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 23] = [
+const SUBCOMMANDS: [(&str, Command); 24] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -66,6 +67,7 @@ const SUBCOMMANDS: [(&str, Command); 23] = [
         Command::RebuildMetricProjections,
     ),
     ("import-change-records", Command::ImportChangeRecords),
+    ("export-change-diff", Command::ExportChangeDiff),
     ("repair-aof", Command::RepairAof),
     ("eval-table", Command::EvalTable),
     ("eval-case-subset", Command::EvalCaseSubset),
@@ -143,6 +145,9 @@ COMMANDS:
                            which is their source of truth; sets each row's `as_of` to the
                            moment of the query. Needs COGNEVA_DATABASE_URL and
                            COGNEVA_PROMETHEUS_URL
+    export-change-diff <id>
+                           Write one change's diff out of the queue, headed by the
+                           `event_id` it was exported from; needs COGNEVA_DATABASE_URL
     import-change-records  Import the legacy <id>.json change records into the queue (the
                            event stream) and delete the files; needs COGNEVA_DATABASE_URL
                            and reads COGNEVA_EVOLUTION_CHANGE_DIR (default

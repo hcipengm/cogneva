@@ -211,6 +211,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 历史记录文件的导入：这一步之后盘上那份 `<id>.json` 就没有读者了，
         // 队列的正本是事件流。
         Command::ImportChangeRecords => cogneva::import_change_records::run_from_env().await,
+        // 一条变更的 diff 从队列导出：盘上那份只是工件，导出要带得出水位。
+        Command::ExportChangeDiff => {
+            let argv: Vec<String> = std::env::args().collect();
+            cogneva::export_change_diff::run_from_args(&argv).await
+        }
         // Torn AOF tail repair: runs in the redis Pod's init container, which is
         // what moves "a host that died uncleanly means truncating the AOF by
         // hand" onto the startup path.

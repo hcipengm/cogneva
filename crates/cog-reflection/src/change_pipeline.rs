@@ -9820,6 +9820,77 @@ index 1111111..2222222 100644\n\
         );
         assert!(ChangePipeline::web_targets(&targets(&["crates/x/src/lib.rs"])).is_empty());
     }
+    /// 导出带水位、并能原样还原：同一条变更两次导出是同一串字节，去掉水位后
+    /// 与正本逐字节相等。
+    #[tokio::test]
+    async fn an_exported_diff_carries_its_watermark_and_comes_back_byte_for_byte() {
+        let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let mut row = candidate_with("chg-export", diff);
+        row.event_id = "01J8Z0000000000000000000AB".to_string();
+        let exported = crate::change_pipeline::export_diff(&row);
+        assert!(
+            exported.starts_with("# event_id: 01J8Z0000000000000000000AB\n"),
+            "the export has to say which event it came from: {exported}"
+        );
+        assert_eq!(
+            crate::change_pipeline::imported_diff(&exported),
+            diff,
+            "everything below the watermark is the diff, byte for byte"
+        );
+        // 正文里碰巧有形似水位的行，不算水位：只有第一行那个前缀才算。
+        let body = "# event_id: not-a-watermark\nx\n";
+        assert_eq!(crate::change_pipeline::imported_diff(body), body);
+    }
+
+    /// 一份可以塞进队列的候选：给定正文与 id。
+    fn candidate_with(id: &str, content: &str) -> ChangeCandidate {
+        ChangeCandidate {
+            artifact_id: id.to_string(),
+            kind: "code_change".to_string(),
+            description: "why".to_string(),
+            content: content.to_string(),
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+            recorded_status: "compile_checked".to_string(),
+            status: "candidate".to_string(),
+            decision_reason: None,
+            event_id: String::new(),
+        }
+    }
+
+    /// 把盘上那份 `.diff` 删掉之后，同一串字节仍然导得出来——它本来就在流里。
+    #[tokio::test]
+    async fn a_deleted_diff_is_exported_from_the_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let store = crate::change_pipeline::test_candidates();
+        let mut row = candidate_with("chg-kept", diff);
+        row.event_id = "01J8Z0000000000000000000CD".to_string();
+        store.record(&row).await.unwrap();
+        let pipeline = crate::change_pipeline::test_pipeline(temp.path(), &change_dir, true)
+            .with_candidates(store.clone());
+
+        let exported = crate::change_pipeline::export_diff(
+            &store
+                .read("chg-kept")
+                .await
+                .unwrap()
+                .expect("the row reads"),
+        );
+        assert_eq!(
+            crate::change_pipeline::imported_diff(&exported),
+            diff,
+            "the diff text travels with the candidate; the file on disk was never the source"
+        );
+        assert_eq!(
+            pipeline.read_change_content("chg-kept").await.as_deref(),
+            Some(diff)
+        );
+    }
+
     /// 历史记录文件导进队列：在队的落成候选、在读的落成已定案，文件都删掉。
     #[tokio::test]
     async fn legacy_record_files_become_queue_rows_and_the_files_go() {
@@ -10019,5 +10090,40 @@ fn landed_outcome(status: EvolutionStatus) -> CandidateOutcome {
         | EvolutionStatus::CompileError
         | EvolutionStatus::ValidationFailed => CandidateOutcome::Rejected,
         _ => CandidateOutcome::Accepted,
+    }
+}
+
+/// 一条变更的 diff 导出：字节与水位。
+///
+/// `.diff` 在盘上只是**导出工件**，正本是事件流里的候选事件。所以「导出」这件事要
+/// 说得出它是从哪一条事件导出来的：同一条变更两次导出得到同一串字节，且那串字节
+/// 头顶写着产出它的 `event_id`——没有这个水位，一份 `.diff` 是谁、什么时候导的，
+/// 事后只能猜。
+///
+/// 头的形状是一行注释：`# event_id: <ULID>`。注释而不是 JSON 包装，是因为消费者
+/// （`git apply`）读的是 diff 正文；多一行以 `#` 开头的说明，patch 仍按原文应用。
+pub fn export_diff(candidate: &ChangeCandidate) -> String {
+    format!("# event_id: {}\n{}", candidate.event_id, candidate.content)
+}
+
+/// 把导出的字节还原成正文：去掉那一行水位，其余一个字节不动。
+///
+/// 只吃**自己写的那一行**：正文里如果碰巧有 `# event_id:` 开头的行（一个 shell 脚本
+/// 的注释），它不是水位。判据是那一行的值必须是一个身份的形状——26 位 Crockford
+/// base32（ULID 的字母表），其余一律当正文。只认前缀会让一份以这种注释开头的脚本
+/// 在第一次往返里丢掉第一行。
+pub fn imported_diff(exported: &str) -> &str {
+    const ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let Some((first, body)) = exported.split_once('\n') else {
+        return exported;
+    };
+    let Some(id) = first.strip_prefix("# event_id: ") else {
+        return exported;
+    };
+    let is_identity = id.len() == 26 && id.chars().all(|character| ALPHABET.contains(character));
+    if is_identity {
+        body
+    } else {
+        exported
     }
 }
