@@ -230,6 +230,14 @@ jobs:
       # 新写的一条要么说清是谁的数（实测／本机／默认／例如），要么写机制与比例。
       - name: Check comments state whose capacity they quote
         run: bash deploy/scripts/check-comment-capacity-figures.sh
+      # 同一份清单里一个键出现两次，apply 会以 `duplicate entries` 拒收整份，整轮滚动
+      # 失败并把所有工作负载回滚到旧镜像——两笔改动各自都对，合起来才知道。2026-11-18
+      # 现场：网关 env 里的 `COGNEVA_MEMORY_API_BASE`。parity 比的是「有没有这个字段」，
+      # 不比「出现了几次」，这一族一条都拦不住。
+      - name: Check manifests do not repeat a key inside one list
+        run: python3 deploy/scripts/check-manifest-duplicate-keys.py
+      - name: Check the duplicate-key gate rejects what it should
+        run: bash deploy/scripts/tests/manifest-duplicate-keys.test.sh
       # 跑在共享测试库上的测试，不许把整张表数一遍。`COGNEVA_TEST_DATABASE_URL`
       # 把整个套件指向同一份库，整表数行数等于断言「别的测试此刻有没有行」；
       # 而且踩中的那一跑常常 panic 在自己的 cleanup 之前，把它写的行留在库里，
