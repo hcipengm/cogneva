@@ -3463,6 +3463,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 读不进准入判决：命令把余量占满时，读照样立刻答，也不占一份预留。
+    ///
+    /// 这条钉住的是「读与写/编译分开计量」的另一半，也是「读改读 agent 侧快照」
+    /// 那条路没有走的原因：本机实测（2026-11-18）一条复用的 HTTP 连接上一次
+    /// `read_file` 本机实测 0.76 ms，而一份 50 MB 的树打包成 bundle 实测 1.46 s、25 MB——
+    /// 快照要比它替代的读贵三个数量级。有人把读塞进 `wait_for_admission`，这里
+    /// 就会红：读要么排到窗口尽头，要么留下一份预留。
+    #[tokio::test]
+    async fn a_read_answers_while_every_byte_of_room_is_reserved() {
+        let commands = Arc::new(CommandMetrics::new());
+        let pressure = pressure::Ledger::new();
+        let held = pressure.reserve(u64::MAX / 4);
+        let state = AppState {
+            workdir: None,
+            hostdocs: None,
+            build_lane: BuildLane::new(
+                build_concurrency(),
+                Arc::clone(&commands),
+                Arc::clone(&pressure),
+            ),
+            commands,
+            queue_waits: Arc::new(BuildQueueWindow::new()),
+            pressure: Arc::clone(&pressure),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app_router(state)).await.unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("cog-exec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.txt").to_string_lossy().into_owned();
+        std::fs::write(&path, "answer").unwrap();
+
+        let events = events_of(
+            post(
+                addr,
+                serde_json::json!({"payload": {"type": "read_file", "path": path}}),
+            )
+            .await,
+        )
+        .await;
+        let content: String = events
+            .iter()
+            .filter_map(|e| match e {
+                CommandEvent::Stdout { data } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "answer");
+        assert_eq!(pressure.open_count(), 1, "读占了一份预留：读不该进准入判决");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 编辑走的是和读写同一条服务：文件在哪个树上，就在哪里改。
     ///
     /// 两种结局都在这里读：对上了就改一处并说出行号；对上多处就当场拒绝，
