@@ -370,6 +370,20 @@ impl ToolRegistry {
         self
     }
 
+    /// 循环学到本轮的窗口之后交给这张表：一页的大小跟着同一个数走。
+    ///
+    /// 启动时给的是部署声明的那一个数（往往是 0，= 没人说过）；第一份响应回来
+    /// 之后，窗口是型号公布的规格或实测的界，页大小应当按那个走，而不是停在
+    /// 启动时那一格。
+    pub fn set_context_window_size(&mut self, tokens: usize) {
+        self.context_window_size = tokens;
+    }
+
+    /// 这张表眼下按多大的窗口导出一页（0 = 没人说过）。
+    pub fn context_window_size(&self) -> usize {
+        self.context_window_size
+    }
+
     /// 一条工具结果能占多少字符，与运行时裁剪用的是同一个函数。
     ///
     /// 只有 `read_file` 用它：分页是给调用方的把手（`offset` / `limit` /
@@ -1055,6 +1069,15 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    /// 分页用例自己声明的窗口。
+    ///
+    /// 页大小由一个窗口导出，而「没人说过窗口」时它是**不设界**（`usize::MAX`，
+    /// 见 [`crate::context::tool_result_budget_chars`]）：拿它当份量去造正文，就是
+    /// 按无穷大分配——2026-11-19 00:53 实测正是这一条把 3.3 GB 吃满、
+    /// 内核 OOM 杀掉了整个测试二进制。用例量的是分页行为，窗口就该由用例自己说，
+    /// 而不是继承进程里别的用例留下的那张全局表。
+    const TEST_WINDOW_TOKENS: usize = 8_000;
 
     #[derive(Debug)]
     struct StubHttp;
@@ -1784,7 +1807,9 @@ mod tests {
     async fn a_batch_spends_only_one_page_of_the_budget() {
         let dir = std::env::temp_dir().join(format!("cog-tools-batch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        let registry = ToolRegistry::new()
+            .with_context_window_size(TEST_WINDOW_TOKENS)
+            .with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         let page_chars = registry.page_chars();
@@ -1985,7 +2010,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("long.txt");
         let path = path.to_str().unwrap();
-        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        let registry = ToolRegistry::new()
+            .with_context_window_size(TEST_WINDOW_TOKENS)
+            .with_sandbox_backend(Arc::new(LocalShellBackend));
         // 一页多大由这张表服务的窗口导出，测试不另抄一个数。
         let page_chars = registry.page_chars();
         let body: String = (1..=8000).map(|i| format!("line {i}\n")).collect();
@@ -2108,7 +2135,9 @@ mod tests {
             .map(|i| format!("{}{i}\n", "x".repeat(9999)))
             .collect();
 
-        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        let registry = ToolRegistry::new()
+            .with_context_window_size(TEST_WINDOW_TOKENS)
+            .with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         registry
@@ -2161,7 +2190,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide.txt");
         let path = path.to_str().unwrap();
-        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        let registry = ToolRegistry::new()
+            .with_context_window_size(TEST_WINDOW_TOKENS)
+            .with_sandbox_backend(Arc::new(LocalShellBackend));
         let page_chars = registry.page_chars();
         // 六行，每行都比一页的字符预算还长：一页装不下一行，翻页只能靠「至少给
         // 一行」这条兜底往前走——走不动是死循环，走快了是漏行。

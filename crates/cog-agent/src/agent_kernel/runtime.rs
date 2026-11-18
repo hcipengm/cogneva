@@ -1182,12 +1182,16 @@ impl AgentRuntime {
             );
         }
         let context = ContextWindow::new(window);
+        // 工具表也从同一个窗口起步：在这一轮学到新窗口之前，`read_file` 的一页
+        // 按的就是构造时定下的这个数，而不是注册表自己的缺省值。
+        let mut tools = ToolRegistry::new();
+        tools.set_context_window_size(window);
 
         Self {
             config,
             state: RuntimeState::Idle,
             context,
-            tools: ToolRegistry::new(),
+            tools,
             refusal_policy: RefusalPolicy::default(),
             event_tx,
             hook_engine: None,
@@ -4310,6 +4314,9 @@ impl AgentRuntime {
         let before_effective = if before == 0 { usize::MAX } else { before };
         self.context.set_max_tokens(window);
         self.config.context_window_size = window;
+        // 工具表那一格同一轮就跟上：`read_file` 的一页由窗口导出，停在启动时
+        // 那个声明值上，大窗口下每页都白读一截、小窗口下的分页又比需要的碎。
+        self.tools.set_context_window_size(window);
         if source == crate::observable::ContextWindowSource::MeasuredLimit
             && window < before_effective
         {
@@ -6699,6 +6706,11 @@ mod tests {
         // （它们共用一份读数），而读数是「这个进程量到的」，测试之间不该互相作证。
         let observable = crate::observable::AgentObservable::new();
         let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
+        assert_eq!(
+            runtime.tools.context_window_size(),
+            5_000,
+            "构造时工具表就按同一个窗口起步，不能等第一轮量到再说"
+        );
 
         runtime
             .note_context_measurement(
@@ -6716,6 +6728,11 @@ mod tests {
         assert_eq!(
             runtime.config.context_window_size, 1_000,
             "the reading every other part of the loop reads has to move with it"
+        );
+        assert_eq!(
+            runtime.tools.context_window_size(),
+            1_000,
+            "read_file 的页跟着同一个数收窄，否则下一轮还会按旧窗口一页读一大截"
         );
         match rx.try_recv().expect("the shrink has to be announced") {
             AgentEvent::ResourceAlert {
@@ -6844,6 +6861,11 @@ mod tests {
             "the window is the one Anthropic publishes for this model"
         );
         assert_eq!(runtime.config.context_window_size, 1_000_000);
+        assert_eq!(
+            runtime.tools.context_window_size(),
+            1_000_000,
+            "read_file 的一页也按同一个数导出，不能停在启动时那一格"
+        );
         assert!(
             rx.try_recv().is_err(),
             "starting from a published spec is not a resource alert"

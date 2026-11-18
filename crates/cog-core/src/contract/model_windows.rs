@@ -94,7 +94,9 @@ mod tests {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 一个进程级的全局表：测试之间会互相看见，所以每个用例自己收拾。
