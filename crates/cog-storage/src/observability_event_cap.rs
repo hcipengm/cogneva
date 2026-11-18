@@ -720,6 +720,32 @@ mod tests {
         );
     }
 
+    /// 同一批事件重新导出必须得到同一串字节：读回来逐字节比对那条校验全靠它。
+    #[test]
+    fn the_same_batch_serialises_to_the_same_bytes() {
+        let events = vec![ArchivedEvent {
+            id: 1,
+            event_type: "MessageUpdate".into(),
+            agent_id: Some("a".into()),
+            task_id: None,
+            crew_id: None,
+            squad_id: None,
+            payload: "{\"k\":1}".into(),
+            timestamp: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+        }];
+        let once = ndjson_of(&events).expect("serialises");
+        let twice = ndjson_of(&events).expect("serialises");
+        assert_eq!(once, twice);
+        assert!(once.ends_with(b"\n"), "one line per event");
+    }
+
+    /// 键里带首尾 id 与摘要前八位：对象自己能对上「它是不是那份字节」。
+    #[test]
+    fn the_key_names_the_span_and_the_digest() {
+        let key = archive_key("events/archive", 7, 42, "0123456789abcdef");
+        assert_eq!(key, "events/archive/7-42-01234567.ndjson");
+    }
+
     /// A table the window holds over capacity waits the longest period instead
     /// of retrying sooner: deleting sooner is not allowed, so a short period
     /// would only be a loop spinning on the same refusal.
@@ -768,4 +794,141 @@ mod tests {
         }
         assert_eq!(read_window_from(Some(" 3600 ")), Duration::from_secs(3_600));
     }
+}
+
+// ── 归档：唯一允许删的那条路 ────────────────────────────────────────────────
+//
+// 删一行的前提是「它已经在别处、而且那一份校验过」。所以这条路的顺序是死的：
+// 读一批 → 写成一份对象 → **读回来逐字节比对** → 才删这一批的行。任何一步不成立，
+// 那一批一行都不删；失败原因进返回值，调用方据此报读数，而不是安静地继续。
+
+/// 一批老事件在对象存储里的样子：一行一条事件，字段顺序固定，字节可复现。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArchivedEvent {
+    pub id: i32,
+    pub event_type: String,
+    pub agent_id: Option<String>,
+    pub task_id: Option<String>,
+    pub crew_id: Option<String>,
+    pub squad_id: Option<String>,
+    pub payload: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// 把一批事件写成 NDJSON：一行一条，行内字段顺序由结构体固定。
+///
+/// 顺序固定是判据的一部分：同一批行重新导出必须得到同一串字节，否则「读回来逐字节
+/// 相等」这条校验就永远只能靠运气。
+pub fn ndjson_of(events: &[ArchivedEvent]) -> SFResult<Vec<u8>> {
+    let mut out = Vec::new();
+    for event in events {
+        let line = serde_json::to_vec(event).map_err(cog_core::SFError::Serialization)?;
+        out.extend_from_slice(&line);
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+/// 这一批在对象存储里的键：前缀 / 年月 / 表名 / 首尾 id / 摘要前 8 位。
+///
+/// 摘要进名字而不是只进元数据：拿回来的对象能自己对上「它是不是那份字节」，
+/// 不必再问一次库。
+pub fn archive_key(prefix: &str, first: i32, last: i32, digest: &str) -> String {
+    let short = &digest[..8.min(digest.len())];
+    format!("{prefix}/{first}-{last}-{short}.ndjson")
+}
+
+/// 归档一批老事件，校验通过后删掉它们。
+///
+/// `cutoff` 之外（更老）的行才可归档；批大小由调用方给，一次一批，删一行一批地推进。
+/// 返回 `Ok(None)` 表示没有可归档的行。
+pub async fn archive_batch(
+    pool: &PgPool,
+    table: &str,
+    backend: &Arc<dyn cog_core::ObjectBackend>,
+    prefix: &str,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    batch: i64,
+) -> SFResult<Option<ArchiveOutcome>> {
+    let table = cog_core::sql::quote_relation(table);
+    // 一行的原始列：id、种类、四个归属列、正文、时刻。宽是这张表的形状；拆成结构体
+    // 只是把同一条 SELECT 再抄一遍，所以这里就按那八列写。
+    #[allow(clippy::type_complexity)]
+    type EventRow = (
+        i32,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let rows: Vec<EventRow> = sqlx::query_as(&format!(
+        "SELECT id, event_type, agent_id, task_id, crew_id, squad_id, payload, timestamp \
+             FROM {table} WHERE timestamp < $1 ORDER BY timestamp, id LIMIT $2"
+    ))
+    .bind(cutoff)
+    .bind(batch.max(1))
+    .fetch_all(pool)
+    .await
+    .map_err(|e| cog_core::SFError::Database(e.to_string()))?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let events: Vec<ArchivedEvent> = rows
+        .into_iter()
+        .map(
+            |(id, event_type, agent_id, task_id, crew_id, squad_id, payload, timestamp)| {
+                ArchivedEvent {
+                    id,
+                    event_type,
+                    agent_id,
+                    task_id,
+                    crew_id,
+                    squad_id,
+                    payload,
+                    timestamp,
+                }
+            },
+        )
+        .collect();
+    let bytes = ndjson_of(&events)?;
+    let digest = blake3::hash(&bytes).to_hex().to_string();
+    let key = archive_key(prefix, events[0].id, events[events.len() - 1].id, &digest);
+    backend.put(&key, &bytes).await?;
+    // 读回来逐字节比对：写成功不等于写得对，而这一批马上要被删掉。
+    let back = backend
+        .get(&key)
+        .await?
+        .ok_or_else(|| cog_core::SFError::IO(format!("{key} 写进去之后读不回来：这一批不删")))?;
+    if back != bytes {
+        return Err(cog_core::SFError::IO(format!(
+            "{key} 读回来的字节与写进去的不一样（写了 {} 字节、读回 {} 字节）：这一批不删",
+            bytes.len(),
+            back.len()
+        )));
+    }
+    let ids: Vec<i32> = events.iter().map(|event| event.id).collect();
+    let deleted = sqlx::query(&format!("DELETE FROM {table} WHERE id = ANY($1)"))
+        .bind(&ids)
+        .execute(pool)
+        .await
+        .map_err(|e| cog_core::SFError::Database(e.to_string()))?
+        .rows_affected();
+    Ok(Some(ArchiveOutcome {
+        key,
+        digest,
+        archived: events.len(),
+        deleted,
+    }))
+}
+
+/// 一批归档的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveOutcome {
+    pub key: String,
+    pub digest: String,
+    pub archived: usize,
+    pub deleted: u64,
 }
