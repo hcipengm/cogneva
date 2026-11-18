@@ -250,15 +250,17 @@ mod tests {
     }
 
     /// The usage ledger's batch is the other text with statements a start
-    /// cannot be talked out of: its two key swaps, both `DO` blocks, because
-    /// no catalog read answers "is this constraint's definition the one I
-    /// want".
+    /// cannot be talked out of: the key swaps and column additions that have
+    /// to be conditional, because no catalog read answers "is this
+    /// constraint's definition the one I want" and the column additions have
+    /// no `IF NOT EXISTS`. Each is a `DO` block.
     ///
     /// Being opaque, they are re-sent on every start, which is why the count
-    /// is pinned here: the two blocks cost a catalog read each once the key is
-    /// right, but a *third* opaque statement would be a DDL shape nobody
-    /// taught the guard -- and that one takes ACCESS EXCLUSIVE on every start,
-    /// on a ledger that takes a write a second.
+    /// is pinned here: once the schema is right each block is catalog lookups
+    /// and runs no DDL, so it takes no table lock. A further opaque statement
+    /// would be a DDL shape nobody taught the guard -- and if that shape is a
+    /// DDL rather than a lookup, it takes ACCESS EXCLUSIVE on every start, on
+    /// a ledger that takes a write a second.
     #[test]
     fn the_usage_ledgers_startup_batch_is_opaque_only_where_it_must_be() {
         let opaque = cog_storage::schema_ddl::statements_the_guard_cannot_read(
