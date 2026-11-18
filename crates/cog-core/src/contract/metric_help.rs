@@ -1084,6 +1084,20 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          is read with it.",
     ),
     (
+        crate::metric_names::TOOL_CALL_ARCHIVED_TOTAL.as_str(),
+        "Tool call records written to the permanent Raw layer, labelled by \
+         `tool`, one increment per call whose record landed. The record holds \
+         what the call was given and what it returned, written before the result \
+         is handed to the model, so it is the copy that survives the event log's \
+         row cap and the context window both. Read it as the numerator of the \
+         record landed share against `cogneva_tool_output_archive_failed_total`: \
+         the two are the fates of the same call and every call the process can \
+         key reaches exactly one of them. It is also the volume reading for that \
+         layer -- how many records this deployment is writing and for which \
+         tools -- which the failure counter cannot give, since a deployment \
+         whose writes all fail increments only the failure side.",
+    ),
+    (
         crate::metric_names::TOOL_OUTPUT_TRUNCATED_TOTAL.as_str(),
         "Tool outputs whose tail was dropped from the conversation because the \
          whole result did not fit the context, labelled by `tool`, one increment \
@@ -1091,14 +1105,15 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the same fact outside the conversation, so a run that spends its budget \
          on oversized tool results is countable rather than silent. Read per \
          `tool`: a series climbing for one tool names that tool's output shape, \
-         not the context budget as a whole. It is the denominator of the landed \
-         share: every cut ends either with its tail stored or with an increment \
-         on `cogneva_tool_output_archive_failed_total`, so the share of cuts \
-         whose tail stayed reachable is this counter minus that one over this \
-         one, and the residue is what the reading cannot account for. Read it \
-         with `cogneva_tool_output_truncated_chars_total` for the size of what \
-         was withheld: this counter says how many results were cut and that one \
-         says how much of them the model never saw.",
+         not the context budget as a whole. It is not a loss reading: the call's \
+         whole result was written to the Raw layer before this cut was made, so \
+         what the model did not see is still reachable by the reference the marker \
+         carries. Whether that write landed is `cogneva_tool_call_archived_total` \
+         against `cogneva_tool_output_archive_failed_total`, which are counted \
+         over calls rather than cuts. Read it with \
+         `cogneva_tool_output_truncated_chars_total` for the size of what was \
+         withheld: this counter says how many results were cut and that one says \
+         how much of them the model never saw.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL.as_str(),
@@ -1117,21 +1132,22 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         crate::metric_names::TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL.as_str(),
-        "Archives of a truncated tool output's full text that did not land, \
-         labelled by `tool` and by `cause`, one increment per cut whose tail was \
-         not stored. A truncation marker carries an `artifact://` reference only \
-         when the full text was stored, so this counts the times a caller \
-         following such a reference would find nothing. The causes are a closed \
-         set and every cut ends in one of them: `unconfigured` (no base URL was \
-         handed to this deployment, so nothing was attempted), `unreachable` \
-         (the API did not answer), `refused` (it answered and rejected the \
-         write), and `unkeyed` (the run carried no task id, so there was no \
-         source to file the tail under and no attempt was made). That closure is \
-         the point of the series: `cogneva_tool_output_truncated_total` minus \
-         this one is the number of cuts whose tail landed, and the subtraction \
-         only names a share while every unlanded cut is counted here. Read it \
-         beside the truncation counter, where a share of the two moving together \
-         names the archive endpoint rather than ordinary truncation.",
+        "Tool call records that did not land in the permanent Raw layer, \
+         labelled by `tool` and by `cause`, one increment per call whose record \
+         was not stored. A record that does not land is the call's only permanent \
+         copy missing: the event log is a bounded ring that sweeps by row count, \
+         and the copy the model was shown lives in a context that is trimmed. A \
+         truncation marker carries an `artifact://` reference only when the \
+         record was stored, so this also counts the times a caller following such \
+         a reference would find nothing. The causes are a closed set and every \
+         attempt ends in one of them: `unconfigured` (no base URL was handed to \
+         this deployment, so nothing was attempted), `unreachable` (the API did \
+         not answer), and `refused` (it answered and rejected the write). That \
+         closure is the point of the series: `cogneva_tool_call_archived_total` \
+         against this one is the share of calls whose record landed, and the \
+         share only names something while every unlanded call is counted here. \
+         Read it against the archived counter, where the two moving apart names \
+         the archive endpoint rather than ordinary traffic.",
     ),
     (
         crate::metric_names::EVENT_BUS_DROPPED_TOTAL.as_str(),

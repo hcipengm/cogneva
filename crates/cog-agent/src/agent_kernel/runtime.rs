@@ -1278,12 +1278,15 @@ impl AgentRuntime {
         self
     }
 
-    /// Hand the loop the surface that archives an oversized tool output.
+    /// Hand the loop the surface that gives every tool call a permanent copy.
     ///
-    /// The loop uses it at the tool-return point, where both the full output
-    /// and the window budget are in hand: an output that does not fit is
-    /// written back there and its truncation marker carries the reference, so
-    /// the tail the model never saw can still be fetched.
+    /// The loop uses it at the tool-return point, where the call's arguments,
+    /// its whole result and the window budget are all in hand: each call is
+    /// written as one record before the result is handed over, and a result
+    /// that does not fit carries the record's reference in its truncation
+    /// marker, so the tail the model never saw can still be fetched. Without
+    /// the surface the loop still runs and still cuts — it just has nowhere to
+    /// put the copy, and the marker says only that bytes were dropped.
     pub fn with_tool_output_archive(
         mut self,
         archive: Arc<dyn crate::archive::ToolOutputArchive>,
@@ -2302,24 +2305,34 @@ impl AgentRuntime {
         }
     }
 
-    /// The tool-result message for one call, archiving the output when it will
-    /// not fit the window.
+    /// The tool-result message for one call.
     ///
-    /// This is the only place that holds both the full text and the window
-    /// budget, so it is the only place that can decide a result is oversized and
-    /// still save the part the model will not see. A run with no archive surface
-    /// (embedded use, tests) still cuts the output — it just cannot offer a
-    /// reference to the tail, and the marker says only that bytes were dropped.
+    /// Two things happen here, in this order, and the order is the point: the
+    /// call's whole record — arguments and result, not the model's copy of it —
+    /// is written to the permanent Raw layer, and only then is the result handed
+    /// over, cut to the window budget if it does not fit. The record is written
+    /// for *every* call, not only oversized ones: a result that fits the window
+    /// still has no other permanent home, because the event log is a bounded
+    /// ring and the context is trimmed. The reference the write returns is what
+    /// the truncation marker names, so the bytes the model does not see are one
+    /// fetch away.
+    ///
+    /// A run with no archive surface (embedded use, tests) still cuts the output
+    /// — it just cannot offer a reference to the tail, and the marker says only
+    /// that bytes were dropped.
     ///
     /// `delivered` carries what this run has already handed over; a repeat is
     /// answered with a pointer instead of the payload, so the tool_use /
     /// tool_result pairing the provider requires is kept and the bytes are paid
-    /// for once.
+    /// for once. The archive is written before that check, so a repeated call
+    /// still gets its own record: the pointer saves the model's tokens, not the
+    /// record of what the tool said.
     ///
     /// Every argument is an independent coordinate of the one call being
     /// answered (which task, which turn and frame of it, which call id and tool,
-    /// what it returned, and what this run has already handed over); bundling
-    /// them into a carrier would move the same count behind a name.
+    /// what it was given and what it returned, and what this run has already
+    /// handed over); bundling them into a carrier would move the same count
+    /// behind a name.
     #[allow(clippy::too_many_arguments)]
     async fn tool_result_message(
         &self,
@@ -2328,75 +2341,118 @@ impl AgentRuntime {
         frame: u32,
         tool_call_id: &str,
         tool_name: &str,
-        text: &str,
+        arguments: &serde_json::Value,
+        result: &serde_json::Value,
+        is_error: bool,
         delivered: &mut DeliveredResults,
     ) -> Message {
-        if let Some(stub) = delivered.repeat_note(tool_name, text, turn) {
+        let text = result.to_string();
+        let reference = self
+            .archive_tool_call(
+                task_id,
+                turn,
+                frame,
+                tool_call_id,
+                tool_name,
+                arguments,
+                result,
+                is_error,
+            )
+            .await;
+        if let Some(stub) = delivered.repeat_note(tool_name, &text, turn) {
             return Message::tool_result_text(tool_call_id, tool_name, &stub);
         }
         let budget = self.context.tool_result_budget_chars();
         if text.chars().count() <= budget {
-            return Message::tool_result_text(tool_call_id, tool_name, text);
+            return Message::tool_result_text(tool_call_id, tool_name, &text);
         }
-        // Oversized: the tail is about to be cut, and those bytes exist nowhere
-        // else. Write the full output back where the read side can fetch it and
-        // name it in the marker, so the loss is addressable rather than silent.
-        //
-        // The archive is attempted before the cut is made, because the reference
-        // it returns changes the marker's length and the marker is charged to the
-        // same budget: a cut made without it would keep characters the model will
-        // not actually be shown. So the cut has to be made once, with whatever
-        // reference came back, and counted from that one result -- two calls
-        // would report a size the text does not carry.
-        let reference = match &self.tool_output_archive {
-            Some(archive) => match task_id {
-                Some(task_id) => {
-                    let id = cog_core::tool_output_raw_id(task_id, turn, frame);
-                    match archive
-                        .archive(tool_name, &id, cog_core::CONTENT_TYPE_JSON, text)
-                        .await
-                    {
-                        Ok(uri) => Some(uri),
-                        Err(e) => {
-                            tracing::warn!(
-                                tool = tool_name,
-                                id = %id,
-                                error = %e,
-                                "tool output does not fit the window and could not be archived; \
-                                 the marker carries no reference"
-                            );
-                            None
-                        }
-                    }
-                }
-                // No task id to key a source by: nothing to fetch it back
-                // under, so the marker stays reference-free. That is a fate of
-                // this cut, not a reason to pass over it -- nothing counts the
-                // tail as lost otherwise, and it is exactly as lost as one whose
-                // write was refused.
-                None => {
-                    tracing::warn!(
-                        tool = tool_name,
-                        "tool output does not fit the window and the run carries no task id \
-                         to archive it under; the marker carries no reference"
-                    );
-                    archive.record_unkeyed(tool_name).await;
-                    None
-                }
-            },
-            None => None,
-        };
-        let cut = truncate_to_chars(text, budget, reference.as_deref());
-        // Counted after the archive is attempted, so the size is the size of the
-        // text actually handed over. Every path above reaches here -- a failed
-        // archive and an unkeyed run included -- so a run whose archive never
-        // works is still a run that truncates, and its cuts are still counted.
+        // Oversized: the model gets a prefix and a marker. The cut is made once,
+        // with whatever reference the archive returned, because the reference
+        // changes the marker's length and the marker is charged to the same
+        // budget -- a cut made without it would keep characters the model will
+        // not actually be shown.
+        let cut = truncate_to_chars(&text, budget, reference.as_deref());
         if let Some(archive) = &self.tool_output_archive {
             archive
                 .record_truncation(tool_name, cut.dropped_chars)
                 .await;
         }
         Message::tool_result_text(tool_call_id, tool_name, cut.text)
+    }
+
+    /// Write one tool call's record to the permanent Raw layer and return the
+    /// reference the truncation marker names.
+    ///
+    /// The record is the whole call — the arguments it was given and the result
+    /// it returned, plus the coordinates that place it in the run — so a reader
+    /// who fetches it has everything about the call without needing the event
+    /// log (which sweeps) or the conversation (which is trimmed). `None` means
+    /// no reference is available: no archive surface is configured, or the write
+    /// failed. Either way the run continues and the failure is already counted
+    /// where the cause is known.
+    #[allow(clippy::too_many_arguments)]
+    async fn archive_tool_call(
+        &self,
+        task_id: Option<&str>,
+        turn: u32,
+        frame: u32,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        result: &serde_json::Value,
+        is_error: bool,
+    ) -> Option<String> {
+        let archive = self.tool_output_archive.as_ref()?;
+        let owner = self.tool_call_owner(task_id);
+        let started = self.start_time.unwrap_or_else(chrono::Utc::now);
+        let id = cog_core::tool_call_raw_id(&owner, started.timestamp_millis(), turn, frame);
+        let record = serde_json::json!({
+            "agent_id": self.config.agent_id,
+            "owner": owner,
+            "turn": turn,
+            "frame": frame,
+            "tool": tool_name,
+            "tool_call_id": tool_call_id,
+            "arguments": arguments,
+            "result": result,
+            "is_error": is_error,
+            "at": chrono::Utc::now().to_rfc3339(),
+        });
+        match archive
+            .archive(
+                tool_name,
+                &id,
+                cog_core::CONTENT_TYPE_JSON,
+                &record.to_string(),
+            )
+            .await
+        {
+            Ok(uri) => Some(uri),
+            Err(e) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    id = %id,
+                    error = %e,
+                    "this tool call could not be archived; its only copy is the event log, \
+                     which sweeps by row count"
+                );
+                None
+            }
+        }
+    }
+
+    /// The name one call's record is filed under: the task the run belongs to,
+    /// the conversation's session when it has no task, and the agent after that.
+    ///
+    /// A conversation has no task, and every run that reaches a tool call has an
+    /// agent id (`begin_run` refuses an empty one), so this always yields a key.
+    /// It has to: a record nobody can name is never listed and never fetched,
+    /// which is the same as never written.
+    fn tool_call_owner(&self, task_id: Option<&str>) -> String {
+        self.ledger_task_id(task_id)
+            .map(str::to_string)
+            .or_else(|| self.call_session.clone())
+            .unwrap_or_else(|| self.config.agent_id.clone())
     }
 
     /// 一次运行的开头：清空这次运行的状态，并在总线上宣布开跑。
@@ -3100,11 +3156,23 @@ impl AgentRuntime {
                 if let Some(e) = refusal {
                     let err_result = serde_json::json!({ "error": e.to_string() });
                     observations.push(err_result.clone());
-                    tool_result_messages.push(Message::tool_result_text(
-                        &tc.id,
-                        &tc.name,
-                        err_result.to_string(),
-                    ));
+                    // A refused call is still a call: its arguments and the
+                    // refusal are part of what this run was told, and the record
+                    // is the only permanent copy.
+                    tool_result_messages.push(
+                        self.tool_result_message(
+                            run_task_id,
+                            iteration,
+                            frame as u32,
+                            &tc.id,
+                            &tc.name,
+                            &tc.arguments,
+                            &err_result,
+                            true,
+                            &mut delivered,
+                        )
+                        .await,
+                    );
 
                     self.emit_event(AgentEvent::ToolExecutionEnd {
                         agent_id: self.config.agent_id.clone(),
@@ -3142,11 +3210,23 @@ impl AgentRuntime {
                         "mode": self.permission_mode.as_str(),
                     });
                     observations.push(denied.clone());
-                    tool_result_messages.push(Message::tool_result_text(
-                        &tc.id,
-                        &tc.name,
-                        denied.to_string(),
-                    ));
+                    // Denied before it ran, still a call this run made: the
+                    // arguments are what the model asked for, and the refusal is
+                    // all it got back. Both belong in the record.
+                    tool_result_messages.push(
+                        self.tool_result_message(
+                            run_task_id,
+                            iteration,
+                            frame as u32,
+                            &tc.id,
+                            &tc.name,
+                            &tc.arguments,
+                            &denied,
+                            true,
+                            &mut delivered,
+                        )
+                        .await,
+                    );
                     self.emit_event(AgentEvent::ToolExecutionEnd {
                         agent_id: self.config.agent_id.clone(),
                         tool_call_id: tc.id.clone(),
@@ -3307,7 +3387,9 @@ impl AgentRuntime {
                         frame as u32,
                         &tc.id,
                         &tc.name,
-                        &observation.to_string(),
+                        &tc.arguments,
+                        &observation,
+                        is_error,
                         &mut delivered,
                     )
                     .await,
@@ -7987,15 +8069,15 @@ mod tests {
         );
     }
 
-    /// A tool output too large for the window is archived at the return point and
-    /// the marker carries the reference. Only that point holds both the full text
-    /// and the budget, so a bound that did not fire here would leave the dropped
-    /// tail with no second reader anywhere.
+    /// Every tool call is archived at the return point — its arguments and its
+    /// whole result — and a result too large for the window carries that
+    /// reference in its marker. Only that point holds the arguments, the result
+    /// and the budget together, so a write that did not happen here would leave
+    /// the call with no permanent copy anywhere.
     #[derive(Debug, Default)]
     struct RecordingArchive {
         archived: std::sync::Mutex<Vec<(String, String, String)>>,
         truncations: std::sync::Mutex<Vec<(String, usize)>>,
-        unkeyed: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -8022,10 +8104,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((tool.into(), dropped_chars));
-        }
-
-        async fn record_unkeyed(&self, tool: &str) {
-            self.unkeyed.lock().unwrap().push(tool.into());
         }
     }
 
@@ -8357,13 +8435,27 @@ mod tests {
             .await;
 
         let archived = archive.archived.lock().unwrap().clone();
-        assert_eq!(archived.len(), 1, "一次超大输出，正好归档一次");
+        assert_eq!(archived.len(), 1, "一次工具调用，正好归档一次");
         assert_eq!(archived[0].0, "bigdump");
-        assert_eq!(
-            archived[0].1, "taskseam-0000-0000",
-            "id 把任务与 (turn, frame) 编进去，零填充"
+        // id 把归属、这次运行的起点与 (turn, frame) 编进去：前两段让同一件活的
+        // 第二次尝试不覆盖第一次，后两段让一次列表读回时间顺序。
+        let id_prefix = "taskseam-";
+        assert!(
+            archived[0].1.starts_with(id_prefix) && archived[0].1.ends_with("-0000-0000"),
+            "id 要带归属、运行起点与零填充的 (turn, frame)：{}",
+            archived[0].1
         );
-        assert_eq!(archived[0].2, expected, "归档的是全文，不是截断后的那段");
+        let record: serde_json::Value =
+            serde_json::from_str(&archived[0].2).expect("归档的是一条 JSON 记录");
+        assert_eq!(record["tool"], serde_json::json!("bigdump"));
+        assert_eq!(record["turn"], serde_json::json!(0));
+        assert_eq!(record["frame"], serde_json::json!(0));
+        assert_eq!(record["arguments"], serde_json::json!({}));
+        assert_eq!(
+            record["result"], payload,
+            "归档的是全文，不是截断后的那段"
+        );
+        let expected_id = format!("artifact://default/{}", archived[0].1);
 
         let joined = runtime
             .get_context()
@@ -8373,7 +8465,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n---\n");
         assert!(
-            joined.contains("artifact://default/taskseam-0000-0000"),
+            joined.contains(&expected_id),
             "标记里必须带得回引用，否则砍掉的尾巴没人拿得到: {joined}"
         );
         assert!(
@@ -8397,9 +8489,61 @@ mod tests {
             "记录的丢弃量必须是原文长度减去标记里报的保留数；带引用时标记更长，\
              保留数因此更小，这个数不能按不带引用的标记算"
         );
+    }
+
+    /// 小到不需要裁的结果同样要落盘。
+    ///
+    /// 这是这次改动的那一格：从前只有超出窗口的结果才写进 Raw 层，装得下的
+    /// 那些只活在上下文与事件流里——事件流按行数封顶、上下文会被裁，于是它们
+    /// 一份永久副本都没有。判据读的是「没有任何一次调用被跳过」。
+    #[tokio::test]
+    async fn a_small_result_is_archived_too() {
+        let registry = ToolRegistry::new();
+        let blob = serde_json::json!({ "ok": true });
+        cog_core::ToolRegistry::register(
+            &registry,
+            cog_core::Tool {
+                // 与 `OneToolThenAnswerLlm` 叫的那个名字一致：这份替身先要工具，
+                // 第二问才交卷。
+                name: "bigdump".into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+                implementation: cog_core::ToolImplementation::Native(Arc::new(move |_args| {
+                    let v = blob.clone();
+                    Box::pin(async move { Ok(v) })
+                })),
+            },
+        );
+        let archive = Arc::new(RecordingArchive::default());
+        let config = RuntimeConfig {
+            agent_id: "archivist-0002".into(),
+            context_window_size: 32000,
+            max_iterations: 4,
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut runtime = AgentRuntime::new(config, tx)
+            .with_tools(registry)
+            .with_tool_output_archive(archive.clone());
+        let llm = OneToolThenAnswerLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let _ = runtime
+            .run_scoped(serde_json::json!({"goal": "read"}), &llm, Some("tasksmall"))
+            .await;
+
+        let archived = archive.archived.lock().unwrap().clone();
+        assert_eq!(
+            archived.len(),
+            1,
+            "结果装得下窗口也要有一条记录：窗口和事件流都不是永久的"
+        );
+        let record: serde_json::Value = serde_json::from_str(&archived[0].2).unwrap();
+        assert_eq!(record["result"], serde_json::json!({"ok": true}));
         assert!(
-            archive.unkeyed.lock().unwrap().is_empty(),
-            "有 task id 的运行不该走无键那条结局"
+            archive.truncations.lock().unwrap().is_empty(),
+            "装得下的结果不该被记成一次裁剪"
         );
     }
 
@@ -8532,44 +8676,41 @@ mod tests {
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let mut runtime = AgentRuntime::new(RuntimeConfig::default(), tx);
 
-        let big = format!(
-            "{{\"content\":\"{}\"}}",
-            "x".repeat(REPEATED_TOOL_RESULT_MIN_CHARS)
-        );
+        let big = serde_json::json!({ "content": "x".repeat(REPEATED_TOOL_RESULT_MIN_CHARS) });
+        let big_text = big.to_string();
+        let args = serde_json::json!({ "path": "crates/a.rs" });
         let mut delivered = DeliveredResults::default();
         let first = runtime
-            .tool_result_message(None, 0, 0, "call-1", "read_file", &big, &mut delivered)
+            .tool_result_message(None, 0, 0, "call-1", "read_file", &args, &big, false, &mut delivered)
             .await;
-        assert_eq!(first.content(), big, "第一次读到的东西要原样交给模型");
+        assert_eq!(first.content(), big_text, "第一次读到的东西要原样交给模型");
         runtime.context.add_message(asks_for("call-1"));
         runtime.context.add_message(first);
 
         let second = runtime
-            .tool_result_message(None, 0, 1, "call-2", "read_file", &big, &mut delivered)
+            .tool_result_message(None, 0, 1, "call-2", "read_file", &args, &big, false, &mut delivered)
             .await;
         assert_ne!(
             second.content(),
-            big,
+            big_text,
             "同一份输出第二次出现时不该再发一遍：那 {} 个字节已经在上一轮里了",
-            big.len()
+            big_text.len()
         );
         let stub: serde_json::Value =
             serde_json::from_str(&second.content()).expect("指针仍然是一份工具结果");
         assert_eq!(stub["deduplicated"], serde_json::json!(true));
         assert!(
-            second.content().len() * 2 < big.len(),
+            second.content().len() * 2 < big_text.len(),
             "指针要是指得比它替代的那份的一半还长，就等于没省"
         );
 
         // 反向对照：换一份内容，它照原样发出去。
-        let other = format!(
-            "{{\"content\":\"{}\"}}",
-            "y".repeat(REPEATED_TOOL_RESULT_MIN_CHARS)
-        );
+        let other = serde_json::json!({ "content": "y".repeat(REPEATED_TOOL_RESULT_MIN_CHARS) });
+        let other_text = other.to_string();
         let third = runtime
-            .tool_result_message(None, 0, 2, "call-3", "read_file", &other, &mut delivered)
+            .tool_result_message(None, 0, 2, "call-3", "read_file", &args, &other, false, &mut delivered)
             .await;
-        assert_eq!(third.content(), other, "没重复的输出不许被当成重复");
+        assert_eq!(third.content(), other_text, "没重复的输出不许被当成重复");
     }
 
     /// 记录挂在运行上，不挂在窗口上：窗口把它裁掉之后，重问一次仍然是重复。
@@ -8591,19 +8732,26 @@ mod tests {
         let mut runtime = AgentRuntime::new(config, tx);
         let mut delivered = DeliveredResults::default();
 
-        let read = format!(
-            "{{\"content\":\"{}\"}}",
-            "x".repeat(REPEATED_TOOL_RESULT_MIN_CHARS)
-        );
+        let read = serde_json::json!({ "content": "x".repeat(REPEATED_TOOL_RESULT_MIN_CHARS) });
         let first = runtime
-            .tool_result_message(None, 0, 0, "call-1", "read_file", &read, &mut delivered)
+            .tool_result_message(
+                None,
+                0,
+                0,
+                "call-1",
+                "read_file",
+                &serde_json::json!({ "path": "crates/a.rs" }),
+                &read,
+                false,
+                &mut delivered,
+            )
             .await;
         runtime.context.add_message(asks_for("call-1"));
         runtime.context.add_message(first);
 
         // 把它挤出投影：再灌几轮别的大结果，直到原文已经不在窗口里。
         for round in 1..40u32 {
-            let filler = format!("{{\"content\":\"{}-{round}\"}}", "z".repeat(3_000));
+            let filler = serde_json::json!({ "content": format!("{}-{round}", "z".repeat(3_000)) });
             let msg = runtime
                 .tool_result_message(
                     None,
@@ -8611,7 +8759,9 @@ mod tests {
                     0,
                     &format!("filler-{round}"),
                     "run_command",
+                    &serde_json::json!({ "command": "seq 1 3000" }),
                     &filler,
+                    false,
                     &mut delivered,
                 )
                 .await;
@@ -8638,7 +8788,17 @@ mod tests {
         );
 
         let again = runtime
-            .tool_result_message(None, 40, 0, "call-2", "read_file", &read, &mut delivered)
+            .tool_result_message(
+                None,
+                40,
+                0,
+                "call-2",
+                "read_file",
+                &serde_json::json!({ "path": "crates/a.rs" }),
+                &read,
+                false,
+                &mut delivered,
+            )
             .await;
         let stub: serde_json::Value =
             serde_json::from_str(&again.content()).expect("指针仍然是一份工具结果");
@@ -8667,22 +8827,23 @@ mod tests {
         let mut runtime = AgentRuntime::new(config, tx);
         let mut delivered = DeliveredResults::default();
 
-        let huge = format!(
-            "{{\"content\":\"{}\"}}",
-            "q".repeat(REPEATED_TOOL_RESULT_MIN_CHARS * 4)
-        );
+        let huge = serde_json::json!({
+            "content": "q".repeat(REPEATED_TOOL_RESULT_MIN_CHARS * 4)
+        });
+        let huge_text = huge.to_string();
+        let args = serde_json::json!({ "command": "cat big" });
         let first = runtime
-            .tool_result_message(None, 0, 0, "call-1", "run_command", &huge, &mut delivered)
+            .tool_result_message(None, 0, 0, "call-1", "run_command", &args, &huge, false, &mut delivered)
             .await;
         assert!(
-            first.content().len() < huge.len(),
+            first.content().len() < huge_text.len(),
             "这一条要的是「原文被裁过」这个前提，没裁就测不到它"
         );
         runtime.context.add_message(asks_for("call-1"));
         runtime.context.add_message(first);
 
         let second = runtime
-            .tool_result_message(None, 1, 0, "call-2", "run_command", &huge, &mut delivered)
+            .tool_result_message(None, 1, 0, "call-2", "run_command", &args, &huge, false, &mut delivered)
             .await;
         let stub: serde_json::Value =
             serde_json::from_str(&second.content()).expect("指针仍然是一份工具结果");

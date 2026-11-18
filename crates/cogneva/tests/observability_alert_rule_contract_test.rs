@@ -4750,6 +4750,19 @@ const UNREAD: &[(&str, Unread)] = &[
             reason: "the starvation this counted is now read in seconds, and the rule reads that series; this row is still written only because the control law compares the same number inside the process, so nothing on the reading faces consumes it",
         },
     ),
+    // 工具调用记录「落地了」是预期结局，不是故障：一条规则若读它，只会在没活干
+    // 的时候响（零条落地既可能是闲，也可能是归档面根本没装上，而它一个数分不开
+    // 这两种）。要决定的那一格是它失败的那一半，规则的判据在那儿，这一条是那条
+    // 规则的余数——归零与失败并存才说明问题。它另有自己的读数
+    // （`tool_call_records_archived`，画在交付面上），所以它并非没人看，只是没有
+    // 一条该读它的规则。
+    (
+        "cogneva_tool_call_archived_total",
+        Unread::Elsewhere {
+            readers: &["cogneva_tool_output_archive_failed_total"],
+            reason: "a record landing is the expected outcome, so a rule on it would fire on idleness; the decision is taken on the failure series, where one increment is already a loss, and this counter is the denominator that rule names plus a reading of its own on the delivery board",
+        },
+    ),
     // An eval A/B gate ends in "did not measure" more often than not right now:
     // the repository ships no fixed eval task set, so the sandbox agent reports
     // `applicable=false` on every run. What would make a run of those skips a

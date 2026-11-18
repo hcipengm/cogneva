@@ -428,6 +428,28 @@ pub const REGISTRY_RECLAIM: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-reflection/src/mainline_rollout.rs",
 };
 
+/// Tool call records that reached the permanent Raw layer.
+///
+/// Every call is written whole when the tool returns, so this is the volume the
+/// archive is taking and, read against `cogneva_tool_output_archive_failed_total`,
+/// the share of calls whose permanent copy landed. It has no threshold of its
+/// own: a record landed is the expected outcome, so a number moving here says
+/// how much traffic the layer is carrying, not whether anything is wrong. The
+/// decision lives on the failure counter's alert rule, where one increment is
+/// already a loss.
+pub const TOOL_CALL_RECORDS_ARCHIVED: ReadingSpec = ReadingSpec {
+    id: "tool_call_records_archived",
+    title: "工具调用记录落地",
+    group: ReadingGroup::Delivery,
+    query: "sum(increase(cogneva_tool_call_archived_total[30m]))",
+    unit: "次",
+    warn: None,
+    crit: None,
+    higher_is_worse: false,
+    series: "cogneva_tool_call_archived_total / cogneva_tool_output_archive_failed_total",
+    produced_by: "crates/cog-agent/src/archive.rs",
+};
+
 /// Tool output that had to be truncated before an agent could read it.
 ///
 /// A truncation is not an error: it is the budget doing its job. What is worth
@@ -1254,7 +1276,7 @@ pub const BUILD_GATE_WAIT_MAX: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-core/src/contract/build_gate.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 61] = [
+pub const READINGS: [&ReadingSpec; 62] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -1272,6 +1294,7 @@ pub const READINGS: [&ReadingSpec; 61] = [
     &LLM_POOL_RESERVE,
     &SHUTDOWN_DRAIN_LOSS,
     &REGISTRY_RECLAIM,
+    &TOOL_CALL_RECORDS_ARCHIVED,
     &TOOL_OUTPUT_TRUNCATED,
     &STORE_GROWTH,
     &MAINLINE_SETBACKS,

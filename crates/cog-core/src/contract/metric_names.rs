@@ -2099,11 +2099,10 @@ metric_names! {
     // not fit and its tail was dropped from the model's view; without it the
     // drop is visible only inside the text the model receives, so nothing
     // outside the conversation can count how much was withheld. `archive_failed`
-    // says the tail was meant to stay reachable by reference and does not, so a
-    // reference in a truncation marker points at a source that never landed and
-    // a caller following it finds nothing. Kept as separate series by `tool`
-    // because the first is expected traffic and the second is a defect: folding
-    // them would let a failing archive read as ordinary truncation.
+    // says the call's record was meant to land in the permanent Raw layer and
+    // did not. Kept as separate series by `tool` because the first is expected
+    // traffic and the second is a defect: folding them would let a failing
+    // archive read as ordinary truncation.
     //
     // The count of cuts says nothing about how much was withheld, and one cut
     // that dropped ten characters and one that dropped a hundred thousand are
@@ -2113,7 +2112,7 @@ metric_names! {
     // two are written from one place and one computation, so the count is
     // always the number of increments and the characters the sum of them.
     //
-    // The third is the read side's own fate: a read found the source but its
+    // The fourth is the read side's own fate: a read found the source but its
     // payload outgrew the byte budget the caller set, so no bytes came back.
     // Without it, "the source is bigger than you asked for" is indistinguishable
     // from "the read failed" and, worse, from an empty answer -- a bounded read
@@ -2121,12 +2120,16 @@ metric_names! {
     // same reason the pair is: one tool's reads blowing past the budget names
     // that tool's payload shape rather than reads as a whole.
     //
-    // Every cut ends in exactly one of two fates -- the tail was stored, or it
-    // was not and `archive_failed` says why -- so a cut that reaches neither is
-    // one the reading cannot see. The two fates have to add up to the count for
-    // the landed share to be a share rather than a ceiling, which is why the
-    // causes are a closed set and why a run that had no key to archive under
-    // gets a cause of its own instead of being skipped.
+    // `archived` and `archive_failed` are the two fates of one call record, and
+    // they are about calls rather than cuts: the record holds the arguments and
+    // the whole result of every call, written before the result is handed over,
+    // so a call that lands has its full text stored whether or not the copy
+    // shown to the model was cut. That is why the landed share is this pair and
+    // not a subtraction from the truncation count -- a call whose output fit the
+    // window has no cut to subtract from, and it is still a call whose only
+    // permanent copy is this record. Every call the process can key reaches
+    // exactly one of the two, which is why the causes are a closed set.
+    TOOL_CALL_ARCHIVED_TOTAL => "cogneva_tool_call_archived_total",
     TOOL_OUTPUT_TRUNCATED_TOTAL => "cogneva_tool_output_truncated_total",
     TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL => "cogneva_tool_output_truncated_chars_total",
     TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL => "cogneva_tool_output_archive_failed_total",
