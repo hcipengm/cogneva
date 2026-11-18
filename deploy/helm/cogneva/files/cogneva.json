@@ -3996,6 +3996,16 @@
           "severity": "warning",
           "summary": "{value} tool call(s) were found with no result when a resumed attempt read its journal, and their side-effect class is external -- the one class the resume will not replay. A hard kill in the middle of such a call leaves its outcome unknowable from inside the platform: the journal proves the call started and nothing proves whether it finished, so the resume hands the doubt to the model instead of running it twice. That is the design working, which is why this is a warning and not a page -- but it is also the only reading that prices a kill at anything above a retried call, and a rollout that keeps landing here is a workload whose external calls outlast its grace period. Only the external cell is alerted because the other two are replayed automatically and their cost is one extra call; they are on the panel beside this rule. A raise here with no shutdown in the window names a SIGKILL rather than a drain -- an OOM, a node eviction -- and the pod's own log is the only place that case is still visible. No threshold above zero is declared: one unresolved external call is already an outcome nobody knows.",
           "face": "任务管理"
+        },
+        {
+          "name": "agent_context_limit_refused",
+          "promql": "sum by (outcome) (increase(cogneva_agent_context_limit_refusals_total[1h])) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "A call this process made was refused by an upstream for exceeding its context window. The window belongs to the upstream deployment and no file in this tree carries it, so the loop trims to a configured bootstrap until a call measures the real one -- and a refusal is that measurement, not only a failure. `limit_named` cells are refusals whose text states the limit (\"maximum context length is 128000 tokens\", \"prompt is too long: 214401 tokens > 200000 maximum\"); the loop reads that number and lowers its budget to it in the same turn, so these should arrive in ones and twos and then stop -- a `limit_named` cell that keeps climbing means the number was read and the budget still exceeded it, which is a fault in the decision rather than a missing measurement. `limit_unnamed` cells say the prompt was too long and name no number: the budget is still wrong and nothing was learned, so the repair is to teach `context_limit_from_refusal` that vendor's wording. Either way the spend is real: a refused call was billed for the prompt it carried, and the same oversized prompt is what the loop would send again if the refusal had taught it nothing.",
+          "face": "资源管理"
         }
       ]
     },

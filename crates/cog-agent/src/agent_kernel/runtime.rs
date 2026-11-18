@@ -443,6 +443,18 @@ pub struct AgentRuntime {
     /// signal into a hum, and the reader would stop seeing the first one — which
     /// is the only one that says when it started.
     context_overrun_reported: bool,
+    /// 这个进程从上游调用里量到的窗口：它接受过多大的 prompt、它自述过多大的界。
+    ///
+    /// 与 `config.context_window_size` 是「读数」与「起点」的关系：配置值是还没
+    /// 量到任何东西时的起点，量到之后按量到的走。两侧都只读同一次调用顺带回来的
+    /// 数字，不额外花钱。
+    context_probe: crate::observable::ContextWindowProbe,
+    /// 构造时 `context_window_size` 是多少，作为量不到读数时的起点。
+    ///
+    /// 单独存一份而不是每次读 `self.config`：配置里的那个数会被下面换成量到的
+    /// 值，换掉之后就再也回答不了「原本声明的窗口是多大」——而这正是读者要区分
+    /// 「量到的」与「声明的」时唯一能对照的东西。
+    declared_context_window: usize,
     /// Whether this run's deliverable is the reply text itself.
     ///
     /// A task run answers with a document the downstream steps read fields out
@@ -1150,7 +1162,25 @@ impl AgentRuntime {
             observable.iteration_budget_decision_for(config.max_iterations, &config.agent_id);
         config.max_iterations = ceiling;
 
-        let context = ContextWindow::new(config.context_window_size);
+        // 窗口同一条处置：配置里那个数是没有读数时的起点，不是事实——这棵树里
+        // 没有任何文件知道上游的窗口有多大。量到过就按量到的走（见
+        // [`crate::observable::ContextWindowProbe`]），`config` 里的那个数跟着换，
+        // 于是 `note_context_overrun`、工具结果预算这些读 `config` 的地方看的是
+        // 同一个窗口，不会一个按声明、一个按实测。
+        let declared_context_window = config.context_window_size;
+        let (window, window_source) =
+            observable.context_window_decision_for(declared_context_window);
+        config.context_window_size = window;
+        if window_source != crate::observable::ContextWindowSource::Declared {
+            tracing::info!(
+                agent_id = %config.agent_id,
+                window,
+                declared = declared_context_window,
+                source = window_source.as_str(),
+                "上下文窗口用这个进程量到的值，不是配置里声明的那个"
+            );
+        }
+        let context = ContextWindow::new(window);
 
         Self {
             config,
@@ -1187,6 +1217,8 @@ impl AgentRuntime {
             run_outcome: None,
             ceiling_source,
             context_overrun_reported: false,
+            context_probe: observable.context_probe(),
+            declared_context_window,
             reply_is_the_result: false,
             actor_label: None,
             call_owner: None,
@@ -3919,6 +3951,10 @@ impl AgentRuntime {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 self.remember_refusal(&request, &e);
+                // 建流就被拒是一种「上游直接说了话、我们一个字都没收到」的形态：
+                // 有些协议面把超窗的拒绝原样以错误返回，正文里就带着它的界。
+                let wording = e.to_string();
+                self.note_context_measurement(None, Some(&wording)).await;
                 return Err(e);
             }
             Err(_) => {
@@ -3999,7 +4035,17 @@ impl AgentRuntime {
         if !response.model.trim().is_empty() {
             self.run_usage.model = Some(response.model.clone());
         }
+        // 超窗判在量到之前：它判的是「发出去的那一份比我们当时允许的多」，用这次
+        // 调用自己的读数当证据。若先量再判，一次顶破起点的成功调用会顺手把窗口
+        // 抬到它自己那么大，于是超窗一声不响——而「裁剪没有兑现」正是这一面唯一
+        // 能说话的地方。量到之后预算跟着改，下一次就不会再超，两种事实各说一次。
         self.note_context_overrun(response.usage.input).await;
+        // 这一次调用量到的窗口。被拒的那一路只读它自述的界，不把 `usage.input`
+        // 当成收下过的证据——那是它明确拒收的大小。两个读数都在把 `stream_error`
+        // 移走之前取，移走之后这句拒绝的原文就没了。
+        let accepted_prompt_tokens = stream_error.is_none().then_some(response.usage.input);
+        self.note_context_measurement(accepted_prompt_tokens, stream_error.as_deref())
+            .await;
 
         if let Some(error) = stream_error {
             // A provider that classified the refusal (HTTP status -> a typed
@@ -4150,6 +4196,105 @@ impl AgentRuntime {
                 agent_id = %self.config.agent_id,
                 error = %e,
                 "context overrun alert could not be emitted"
+            );
+        }
+    }
+
+    /// 把这一次调用顺带量到的窗口记下来，并按量到的值改这一轮之后用的预算。
+    ///
+    /// 量到的两件事都不额外花钱：上游自己报了这次 prompt 有多大（`usage.input`），
+    /// 或者在拒绝的那句话里报了自己能收多大。前者是下界——它收下了这么多，窗口
+    /// 就不会比这更小；后者是那个数本身。配置里的 `context_window_size` 只是还
+    /// 没量到任何东西时的起点，量到之后按量到的走，来源由
+    /// [`crate::observable::ContextWindowSource`] 分得出来：读者要能区分「量不到，
+    /// 所以还在用声明的那个」与「量到了，就是这个值」。
+    ///
+    /// 被拒的那次只算量到、不算收下：`usage.input` 是它明确拒收的那个大小，把它
+    /// 当成窗口的下界正好把方向弄反。所以被拒的那一路传 `None`。
+    ///
+    /// 窗口改小之后同一轮里立刻按新预算裁剪：下一问发出去的就是上游收得下的
+    /// 大小。不改的话，同一份超长 prompt 会一次次重买同一个拒绝（2026-11-06
+    /// 实测同一份 179,595 字节的请求连发 1,563 次）。
+    async fn note_context_measurement(
+        &mut self,
+        accepted_prompt_tokens: Option<u32>,
+        refusal: Option<&str>,
+    ) {
+        if let Some(tokens) = accepted_prompt_tokens.filter(|t| *t > 0) {
+            self.context_probe.note_accepted(u64::from(tokens));
+        }
+        let mut named_limit = None;
+        if let Some(text) = refusal {
+            if cog_core::is_context_limit_refusal(text) {
+                named_limit = cog_core::context_limit_from_refusal(text);
+                let outcome = if named_limit.is_some() {
+                    "limit_named"
+                } else {
+                    "limit_unnamed"
+                };
+                if let Some(metrics) = self.metrics.as_ref() {
+                    let mut labels = std::collections::HashMap::new();
+                    labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
+                    if let Err(e) = metrics
+                        .record_counter(
+                            cog_core::metric_names::AGENT_CONTEXT_LIMIT_REFUSALS_TOTAL,
+                            1.0,
+                            labels,
+                        )
+                        .await
+                    {
+                        // 这次被拒已经发生了，读数写不进去不改这件事；告警面会
+                        // 少一格，日志里有理由。
+                        tracing::warn!(error = %e, "could not record the context limit refusal");
+                    }
+                }
+            }
+        }
+        if let Some(limit) = named_limit {
+            self.context_probe.note_limit(limit);
+        }
+        let before = self.context.max_tokens();
+        let (window, source) = self
+            .context_probe
+            .decision_for(self.declared_context_window);
+        if window == before {
+            return;
+        }
+        self.context.set_max_tokens(window);
+        self.config.context_window_size = window;
+        if window < before {
+            tracing::warn!(
+                agent_id = %self.config.agent_id,
+                before,
+                window,
+                declared = self.declared_context_window,
+                source = source.as_str(),
+                "上游拒了这份 prompt；这一轮之后按量到的窗口走"
+            );
+            let event = AgentEvent::ResourceAlert {
+                agent_id: self.config.agent_id.clone(),
+                metric: "context_window_limit".into(),
+                threshold: before as f64,
+                current: window as f64,
+                crew_id: self.config.crew_id.clone(),
+                squad_id: self.config.squad_id.clone(),
+                timestamp: chrono::Utc::now(),
+            };
+            if let Err(e) = self.emit_event(event).await {
+                tracing::warn!(
+                    agent_id = %self.config.agent_id,
+                    error = %e,
+                    "context window alert could not be emitted"
+                );
+            }
+        } else {
+            tracing::info!(
+                agent_id = %self.config.agent_id,
+                before,
+                window,
+                declared = self.declared_context_window,
+                source = source.as_str(),
+                "上游收下过比声明窗口更大的 prompt；预算抬到它确实收得下的大小"
             );
         }
     }
@@ -6425,7 +6570,10 @@ mod tests {
             think_stall_timeout_secs: 5,
             ..Default::default()
         };
-        let mut runtime = AgentRuntime::new(config, tx);
+        // 自己的观测面：窗口读数是这个进程量到的，全局那一份会被同进程里别的
+        // 测试报回来的 prompt 大小抬高，而这条测试断言的是声明值本身。
+        let observable = crate::observable::AgentObservable::new();
+        let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
 
         // 刚好等于窗口不算越界：窗口说的是「能送多少」，不是「必须少送一个」。
         runtime.note_context_overrun(100).await;
@@ -6479,6 +6627,125 @@ mod tests {
             announced, 1,
             "a new run over the same window reports it again; a carried-over flag would hide it"
         );
+    }
+
+    /// 被拒的那句话里点名的界，就是这一轮之后真正用的界。
+    ///
+    /// 配置值只是还没量到任何东西时的起点。上游拒了这份 prompt 并说出自己的界
+    /// 之后，同一轮里就按它裁剪：下一问发的就是上游收得下的大小。不改的话，同一
+    /// 份超长 prompt 会一次次重买同一个拒绝——2026-11-06 实测同一份 179,595 字节
+    /// 的请求连发 1,563 次，每一问的预算都还是那个太大、且没人量过的数。
+    #[tokio::test]
+    async fn a_refusal_that_names_its_limit_becomes_the_window_this_loop_uses() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "measured".into(),
+            context_window_size: 5_000,
+            max_iterations: 1,
+            ..Default::default()
+        };
+        // 量到的东西挂在这个进程的观测面上，所以这里给这个 runtime 一个自己的
+        // 观测面：拿全局那个的话，这里量到的界会漏进同一进程里所有别的 runtime
+        // （它们共用一份读数），而读数是「这个进程量到的」，测试之间不该互相作证。
+        let observable = crate::observable::AgentObservable::new();
+        let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
+
+        runtime
+            .note_context_measurement(
+                None,
+                Some("This model's maximum context length is 1000 tokens."),
+            )
+            .await;
+
+        assert_eq!(
+            runtime.context.max_tokens(),
+            1_000,
+            "the loop trims to what the upstream said it takes, not to what the config declared"
+        );
+        assert_eq!(
+            runtime.config.context_window_size, 1_000,
+            "the reading every other part of the loop reads has to move with it"
+        );
+        match rx.try_recv().expect("the shrink has to be announced") {
+            AgentEvent::ResourceAlert {
+                metric,
+                threshold,
+                current,
+                ..
+            } => {
+                assert_eq!(metric, "context_window_limit");
+                assert_eq!(threshold, 5_000.0, "the window that was in force");
+                assert_eq!(current, 1_000.0, "the window the upstream named");
+            }
+            other => panic!("the shrink was announced as something else: {other:?}"),
+        }
+
+        // 同一个界再说一遍不改任何东西，也不再报：界已经是最小的那个说法。
+        runtime
+            .note_context_measurement(
+                None,
+                Some("This model's maximum context length is 1000 tokens."),
+            )
+            .await;
+        assert_eq!(runtime.context.max_tokens(), 1_000);
+        assert!(
+            rx.try_recv().is_err(),
+            "a refusal that changed nothing must not repeat the alert"
+        );
+    }
+
+    /// 上游收下过比声明更大的 prompt，说明声明的那个数比上游小——预算抬到它
+    /// 确实收得下的大小。
+    ///
+    /// 这是同一个闭环的另一半：只往下调的话，一个保守的配置会把窗口永远钉在
+    /// 下面，而每次调用都在多花一次裁剪。抬价不是资源告警，只留日志。
+    #[tokio::test]
+    async fn an_accepted_prompt_wider_than_the_declared_window_raises_it() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "measured".into(),
+            context_window_size: 5_000,
+            max_iterations: 1,
+            ..Default::default()
+        };
+        let observable = crate::observable::AgentObservable::new();
+        let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
+
+        runtime.note_context_measurement(Some(9_000), None).await;
+
+        assert_eq!(runtime.context.max_tokens(), 9_000);
+        assert_eq!(runtime.config.context_window_size, 9_000);
+        assert!(
+            rx.try_recv().is_err(),
+            "a budget that grew to what was demonstrated is not a resource alert"
+        );
+    }
+
+    /// 点不出数的拒绝不改界，但要让读数面上有名有姓。
+    ///
+    /// 「prompt 太长」而没说是多长，手里就没有任何可用来重算的数：把界按一个
+    /// 比例缩小是凭空造一个值，而这条树的规矩是可调的量要么由实测导出、要么不是
+    /// 旋钮。所以这里不动界，只记一格 `limit_unnamed`——那一格在涨，说明该教
+    /// `context_limit_from_refusal` 认得这家上游的措辞了。
+    #[tokio::test]
+    async fn a_refusal_that_names_no_limit_moves_no_bound() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "measured".into(),
+            context_window_size: 5_000,
+            max_iterations: 1,
+            ..Default::default()
+        };
+        let observable = crate::observable::AgentObservable::new();
+        let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
+
+        runtime
+            .note_context_measurement(None, Some("the prompt is too long"))
+            .await;
+
+        assert_eq!(runtime.context.max_tokens(), 5_000);
+        assert_eq!(runtime.config.context_window_size, 5_000);
+        assert!(rx.try_recv().is_err());
     }
 
     /// The fold itself: the total never falls below its own parts, whichever
@@ -7412,7 +7679,10 @@ mod tests {
             context_window_size: 40,
             ..Default::default()
         };
-        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        // 同上：这一轮判的是「窗口 40 装不下地板」，量到过的大 prompt 不属于它。
+        let observable = crate::observable::AgentObservable::new();
+        let mut runtime =
+            AgentRuntime::with_observable(config, tx, &observable).with_tools(registry);
         let llm = RepeatingCallLlm {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };

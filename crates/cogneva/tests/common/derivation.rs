@@ -272,6 +272,12 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
         "cogneva_attempt_unresolved_calls_total",
         MetricDerivation::Process,
     ),
+    // 数在这个进程自己的调用路径上：一次被拒只发生在一个进程里，两台各自的 2 与
+    // 3 加起来是 5 次被拒的调用，不是同一件事的两次渲染。所以 `sum` 是对的。
+    (
+        "cogneva_agent_context_limit_refusals_total",
+        MetricDerivation::Process,
+    ),
     (
         "cogneva_registry_prune_failures_total",
         MetricDerivation::Process,

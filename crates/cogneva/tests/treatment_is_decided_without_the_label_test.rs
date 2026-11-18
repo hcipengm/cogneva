@@ -61,12 +61,20 @@ const LABELS: &[&str] = &["role", "role_type", "skill_id", "actor", "label"];
 const WRITE_POINTS: &[(&str, &str, &str)] = &[
     // 任务上的声明，管理器建 agent 时抄进运行时。
     // 工具表拿到的窗口来自部署配置（`agent_loop.context_window_size`）：这是操作者的
-    // 显式选择，不是哪件活声明的、也不是谁实测出来的。某一轮配了更窄的窗口不在这里
-    // 写——那是运行时把结果裁进上下文，同一个窗口只由这一处决定。
+    // 显式选择，不是哪件活声明的、也不是谁实测出来的。
     (
         "crates/cog-agent/src/tools.rs",
         "context_window_size",
         "override",
+    ),
+    // 运行时自己写的那一格，两个写点同一个判定：配置里那个数是还没量到任何东西时的
+    // 起点（覆盖），量到之后按量到的走（实测）——上游收下过多大的 prompt、或者拒收
+    // 时自述过多大的界。这是 `max_iterations` 同一条处置：判定函数把值与来源一起
+    // 交出来，写回去的是它返回的那个值，于是「谁给的」在读数面上分得开。
+    (
+        "crates/cog-agent/src/agent_kernel/runtime.rs",
+        "context_window_size",
+        "measured+override",
     ),
     (
         "crates/cog-agent/src/runtime/manager.rs",

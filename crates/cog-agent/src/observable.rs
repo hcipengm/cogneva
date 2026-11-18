@@ -161,6 +161,76 @@ pub struct AgentObservable {
     /// "not measured" and writes no series: a zero here would read as a
     /// container with nothing in it.
     pool_memory_fraction: Mutex<Option<f64>>,
+    /// What this process's calls have measured about the upstream's window.
+    ///
+    /// The window is a property of the upstream deployment, not of this tree:
+    /// no file here carries it, and the value in `agent_loop` is a bootstrap
+    /// rather than a fact. Two things measure it, and both are free — they are
+    /// sides of calls that were being made anyway:
+    ///
+    /// - a served call reports the prompt tokens it took, so the window is at
+    ///   least that large;
+    /// - a refusal that says the prompt was too long and names the limit says
+    ///   exactly how large the window is.
+    ///
+    /// Kept in the process and not per agent or per role: the upstream is a
+    /// property of the deployment, so every employee talking to it is talking
+    /// to the same window.
+    ///
+    /// An `Arc` rather than a plain `Mutex` because the runtime holds the same
+    /// cell: the call that measures the window happens inside a runtime that
+    /// was built from this observable, and handing it the cell keeps the
+    /// measurement and the decision looking at one number.
+    context_measurements: Arc<Mutex<ContextMeasurements>>,
+}
+
+/// One runtime's handle on the process's window measurements.
+///
+/// Cloneable and cheap: the observable owns one, and every runtime built from
+/// it takes a clone. The state behind it is shared, so a measurement made by
+/// one employee's call is the number the next employee's window is decided by
+/// — which is what it should be, since the upstream is the same.
+#[derive(Clone, Default)]
+pub struct ContextWindowProbe {
+    measurements: Arc<Mutex<ContextMeasurements>>,
+}
+
+/// The two measurements, in the units the upstream reports them: tokens.
+#[derive(Debug, Clone, Copy, Default)]
+struct ContextMeasurements {
+    /// The largest prompt any upstream accepted here; zero for none yet.
+    accepted_max: u64,
+    /// The smallest limit any refusal named. `None` is "not measured", which
+    /// is a different fact from any number: a refusal that names no number
+    /// teaches nothing, and reading it as zero would collapse the budget.
+    limit_min: Option<u64>,
+}
+
+/// Which of the three inputs decided the window this process trims to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextWindowSource {
+    /// No call has measured anything: the configured bootstrap is in force.
+    /// This is the "not measured" case, and it must stay distinguishable from
+    /// a measured window that happens to equal the bootstrap.
+    Declared,
+    /// A served call reported a prompt larger than the bootstrap, so the
+    /// window is at least that large; the window was raised to it.
+    MeasuredAccepted,
+    /// A refusal named the upstream's limit; the window was lowered to it.
+    /// This one is authoritative: it is the upstream stating its own bound.
+    MeasuredLimit,
+}
+
+impl ContextWindowSource {
+    /// The word this source is stored and read under. A reader taking its
+    /// predicate from here cannot drift from the writer.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::MeasuredAccepted => "measured_accepted",
+            Self::MeasuredLimit => "measured_limit",
+        }
+    }
 }
 
 /// Every kind of inbox command this build can execute.
@@ -769,6 +839,126 @@ impl AgentObservable {
         }
         let sample: Vec<u32> = sample.iter().copied().collect();
         (calibrated_ceiling(sample), CeilingSource::MeasuredProcess)
+    }
+
+    /// This process's window measurements, for a runtime to hold.
+    pub fn context_probe(&self) -> ContextWindowProbe {
+        ContextWindowProbe {
+            measurements: Arc::clone(&self.context_measurements),
+        }
+    }
+
+    /// The measurements as they stand: `(accepted_max, limit_min)`.
+    ///
+    /// For the reading surface: a zero accepted size and a `None` limit are
+    /// "not measured yet", and a series that shows the numbers as they are is
+    /// what keeps the bootstrap readable as a bootstrap.
+    pub fn context_measurements(&self) -> (u64, Option<u64>) {
+        self.context_probe().measurements()
+    }
+
+    /// Note that a refusal named the upstream's limit.
+    pub fn note_context_limit(&self, limit_tokens: u64) {
+        self.context_probe().note_limit(limit_tokens);
+    }
+
+    /// Note that a served call's prompt was this many tokens.
+    pub fn note_context_accepted(&self, prompt_tokens: u64) {
+        self.context_probe().note_accepted(prompt_tokens);
+    }
+
+    /// The window this process should trim to, and which input decided it.
+    pub fn context_window_decision_for(&self, declared: usize) -> (usize, ContextWindowSource) {
+        self.context_probe().decision_for(declared)
+    }
+}
+
+impl ContextWindowProbe {
+    /// Note that a served call's prompt was this many tokens.
+    ///
+    /// The upstream answered, so its window is at least this large — that is a
+    /// measurement, and the only one available on the successful side. Zero
+    /// means the upstream reported no count (some faces do not fill
+    /// `usage.input`), and then nothing is learned: a zero prompt is not
+    /// evidence of a small window.
+    pub fn note_accepted(&self, prompt_tokens: u64) {
+        if prompt_tokens == 0 {
+            return;
+        }
+        let mut held = self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.accepted_max = held.accepted_max.max(prompt_tokens);
+    }
+
+    /// Note that a refusal named the upstream's limit.
+    ///
+    /// The smallest stated limit is kept rather than the newest: each limit
+    /// belongs to one upstream in the pool, and a prompt that fits the largest
+    /// of them is still refused by the smallest — so the number that keeps the
+    /// budget usable without being refused is the minimum.
+    pub fn note_limit(&self, limit_tokens: u64) {
+        if limit_tokens == 0 {
+            return;
+        }
+        let mut held = self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.limit_min = Some(match held.limit_min {
+            Some(held) => held.min(limit_tokens),
+            None => limit_tokens,
+        });
+    }
+
+    /// The window this process should trim to, and which input decided it.
+    ///
+    /// The configured value is a bootstrap, not an authority: nothing in this
+    /// tree knows the upstream's window, so the number in the config is where
+    /// a process starts before it has measured anything. Once a measurement
+    /// exists, the measurement wins in both directions — the accepted size
+    /// raises the bootstrap that was too small, and a stated limit lowers it
+    /// when the bootstrap was too large. The two cannot disagree about
+    /// direction without disagreeing about the upstream: if a stated limit is
+    /// below a prompt some other upstream accepted, the pool holds models with
+    /// different windows, and the smaller one binds because any call may land
+    /// on it.
+    ///
+    /// `declared` of zero means the caller stated no window at all; the
+    /// measurements then answer alone, and with no measurement the answer is
+    /// zero, which callers treat as "no budget stated" exactly as before.
+    pub fn decision_for(&self, declared: usize) -> (usize, ContextWindowSource) {
+        let held = *self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut window = declared as u64;
+        let mut source = ContextWindowSource::Declared;
+        if held.accepted_max > window {
+            window = held.accepted_max;
+            source = ContextWindowSource::MeasuredAccepted;
+        }
+        if let Some(limit) = held.limit_min {
+            if limit < window {
+                window = limit;
+                source = ContextWindowSource::MeasuredLimit;
+            }
+        }
+        (window.min(usize::MAX as u64) as usize, source)
+    }
+
+    /// The measurements as they stand: `(accepted_max, limit_min)`.
+    ///
+    /// For the reading surface: a zero accepted size and a `None` limit are
+    /// "not measured yet", and a series that shows the numbers as they are is
+    /// what keeps the bootstrap readable as a bootstrap.
+    pub fn measurements(&self) -> (u64, Option<u64>) {
+        let held = *self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (held.accepted_max, held.limit_min)
     }
 }
 
@@ -2345,5 +2535,81 @@ mod tests {
         let mut listed = INBOX_KINDS.to_vec();
         listed.sort_unstable();
         assert_eq!(kinds, listed);
+    }
+
+    /// Before anything is measured the bootstrap is in force, and the reading
+    /// says so. The two must stay distinguishable: a `measured_*` label on the
+    /// configured number would claim a measurement that never happened.
+    #[test]
+    fn with_no_measurement_the_bootstrap_stands_and_says_it_is_the_bootstrap() {
+        let o = AgentObservable::new();
+        assert_eq!(
+            o.context_window_decision_for(64_000),
+            (64_000, ContextWindowSource::Declared)
+        );
+        assert_eq!(o.context_measurements(), (0, None));
+    }
+
+    /// A prompt the upstream accepted proves the window is at least that
+    /// large. The bootstrap rises to it — that is the direction in which the
+    /// 1,563-repeated-request livelock is broken: the floor that exceeded the
+    /// configured window stops being over budget on the very next round.
+    #[test]
+    fn an_accepted_prompt_raises_a_bootstrap_that_was_too_small() {
+        let o = AgentObservable::new();
+        o.note_context_accepted(66_368);
+        assert_eq!(
+            o.context_window_decision_for(64_000),
+            (66_368, ContextWindowSource::MeasuredAccepted)
+        );
+        // A smaller accepted prompt later does not undo it: the largest one is
+        // the evidence, and it does not expire because the next call was small.
+        o.note_context_accepted(1_000);
+        assert_eq!(o.context_window_decision_for(64_000).0, 66_368);
+        // An upstream that reports no count teaches nothing.
+        o.note_context_accepted(0);
+        assert_eq!(o.context_measurements().0, 66_368);
+    }
+
+    /// A refusal that names the limit is the upstream stating its own bound;
+    /// it lowers the budget, and the smallest statement is the one kept
+    /// because the pool may hold upstreams with different windows.
+    #[test]
+    fn a_named_limit_lowers_the_budget_and_the_smallest_statement_binds() {
+        let o = AgentObservable::new();
+        o.note_context_limit(200_000);
+        assert_eq!(
+            o.context_window_decision_for(64_000),
+            (64_000, ContextWindowSource::Declared),
+            "a limit above the bootstrap does not bind"
+        );
+        o.note_context_limit(32_000);
+        assert_eq!(
+            o.context_window_decision_for(64_000),
+            (32_000, ContextWindowSource::MeasuredLimit)
+        );
+        // A later, larger statement does not raise it back: the pool still
+        // contains the smaller upstream.
+        o.note_context_limit(200_000);
+        assert_eq!(o.context_window_decision_for(64_000).0, 32_000);
+        // Even a bootstrap smaller than the limit is not raised by the limit;
+        // the limit is a ceiling, not a target.
+        let fresh = AgentObservable::new();
+        fresh.note_context_limit(200_000);
+        assert_eq!(fresh.context_window_decision_for(16_000).0, 16_000);
+    }
+
+    /// The measured limit wins over the accepted size when the two disagree:
+    /// the accepted size came from an upstream with more room, and every call
+    /// may land on the one that stated less.
+    #[test]
+    fn a_limit_below_an_accepted_size_still_binds() {
+        let o = AgentObservable::new();
+        o.note_context_accepted(66_368);
+        o.note_context_limit(50_000);
+        assert_eq!(
+            o.context_window_decision_for(64_000),
+            (50_000, ContextWindowSource::MeasuredLimit)
+        );
     }
 }

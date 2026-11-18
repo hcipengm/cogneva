@@ -751,6 +751,253 @@ impl std::str::FromStr for RefusalKind {
     }
 }
 
+/// The token limit an upstream named when it refused a prompt for being too
+/// long.
+///
+/// This is the one measurement of the window that exists inside this system.
+/// A model's context window is a property of the upstream deployment, not of
+/// this tree: it is in no file here, it is not in the caller's configuration,
+/// and the gateway forwards a vendor's refusal body verbatim. When that body
+/// says *why* — "maximum context length is 128000 tokens", "prompt is too long:
+/// 214401 tokens > 200000 maximum" — it also says *how much*, and that number
+/// is a measurement rather than a guess. A budget derived from it moves when
+/// the upstream moves; a constant does not.
+///
+/// `None` means the body named no limit — an empty body, a quota refusal, a
+/// bare `context_length_exceeded` with no number. That is "not measured", and
+/// it is a different fact from "measured, and the limit is N": a reader that
+/// turns the second into the first keeps a stale constant alive, and one that
+/// turns the first into the second asserts a number nobody observed.
+///
+/// The anchor list is the vendors' own wording, one entry per shape that has
+/// been seen in the wild; a body is matched against all of them and the first
+/// hit wins. Numbers are read as the first integer after the anchor, which is
+/// why every anchor ends where the limit starts: `... allowed (1048576)` takes
+/// the number inside the bracket, and `... tokens > 200000 maximum` is matched
+/// by its own pattern because the number precedes the word `maximum` there.
+pub fn context_limit_from_refusal(body: &str) -> Option<u64> {
+    let lowered = body.to_ascii_lowercase();
+    // "prompt is too long: 214401 tokens > 200000 maximum" — the limit is the
+    // number right before the word, so this shape is read backwards.
+    if let Some(at) = lowered.find(" maximum") {
+        let before = &lowered[..at];
+        if let Some(n) = trailing_integer(before) {
+            return Some(n);
+        }
+    }
+    for anchor in [
+        "maximum context length is",
+        "maximum context window is",
+        "context length is",
+        "context window is",
+        "maximum number of tokens allowed",
+        "maximum number of tokens is",
+        "model token limit:",
+        "model token limit is",
+        "token limit:",
+        "token limit is",
+        "limited to",
+    ] {
+        if let Some(at) = lowered.find(anchor) {
+            if let Some(n) = first_integer_after(&lowered[at + anchor.len()..]) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Whether a refusal says the prompt was too long at all.
+///
+/// Separate from [`context_limit_from_refusal`] because the two answers are
+/// different facts and both are worth counting: a refusal that says *too long*
+/// and names the limit teaches the number, and one that says *too long* without
+/// naming it teaches only that some prompt was over — which is still a
+/// measurement of the caller's budget being wrong, and is the case a counter
+/// that only counted named limits would silently drop.
+///
+/// The needles are the vendors' own words for this refusal and nothing else:
+/// a quota refusal that happens to mention "tokens" is not this, and counting it
+/// here would point the repair at the context budget.
+pub fn is_context_limit_refusal(body: &str) -> bool {
+    let lowered = body.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "context_length_exceeded",
+        "maximum context length",
+        "maximum context window",
+        "context length exceeded",
+        "context window exceeded",
+        "exceeds the maximum number of tokens",
+        "exceeded model token limit",
+        "reduce the length of the messages",
+        "input is too long",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+/// The first integer in `text`, with commas and underscores allowed inside the
+/// number (`128,000` and `1_048_576` are how vendors print large limits).
+///
+/// Capped at the first non-digit run: an anchor followed by a stray digit in a
+/// request id must not become a limit. A run longer than ten digits is not a
+/// token count any deployment has, and reading it as one would put a number in
+/// the budget that no upstream ever stated.
+fn first_integer_after(text: &str) -> Option<u64> {
+    let mut digits = String::new();
+    let mut started = false;
+    for ch in text.chars() {
+        match ch {
+            c if c.is_ascii_digit() => {
+                started = true;
+                digits.push(c);
+            }
+            ',' | '_' if started && !digits.is_empty() => {}
+            _ if started && !digits.is_empty() => break,
+            _ => started = false,
+        }
+        if digits.len() > 10 {
+            return None;
+        }
+    }
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+/// The integer ending `text`, read the same way [`first_integer_after`] reads
+/// one forwards.
+fn trailing_integer(text: &str) -> Option<u64> {
+    let trimmed = text.trim_end();
+    let end = trimmed.len();
+    let mut start = end;
+    for (offset, ch) in trimmed.char_indices().rev() {
+        match ch {
+            c if c.is_ascii_digit() => start = offset,
+            ',' | '_' => {}
+            _ => break,
+        }
+    }
+    if start == end {
+        return None;
+    }
+    trimmed[start..end]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+        .filter(|n: &u64| *n > 0)
+}
+
+#[cfg(test)]
+mod context_limit_tests {
+    use super::*;
+
+    /// The bodies below are the shapes upstreams actually return, kept as they
+    /// arrive (a JSON envelope around the message) rather than trimmed to the
+    /// sentence: the parser reads whatever the transport hands over, and a
+    /// fixture that is already clean proves less than the real thing.
+    #[test]
+    fn every_vendor_shape_in_the_wild_names_its_limit() {
+        // OpenAI and every OpenAI-compatible server (vLLM, DeepSeek, ...).
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 150000 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#
+            ),
+            Some(128_000)
+        );
+        // Anthropic puts the limit after the arrow and the prompt size before it.
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 214401 tokens > 200000 maximum"}}"#
+            ),
+            Some(200_000)
+        );
+        // Google states the input size first and the limit inside brackets.
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"code":400,"message":"The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."}}"#
+            ),
+            Some(1_048_576)
+        );
+        // Moonshot says it as a limit on the model.
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"message":"Invalid request: Your request exceeded model token limit: 131072","type":"invalid_request_error"}}"#
+            ),
+            Some(131_072)
+        );
+        // A limit printed with separators is still one number.
+        assert_eq!(
+            context_limit_from_refusal("maximum context length is 1,000,000 tokens"),
+            Some(1_000_000)
+        );
+    }
+
+    /// The two absences have to stay apart: a refusal that names no number is
+    /// not a measurement, and reading it as zero (or as the prompt size it
+    /// happens to quote) would hand the budget a number nobody stated.
+    #[test]
+    fn a_refusal_without_a_number_measures_nothing() {
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            context_limit_from_refusal(
+                r#"{"error":{"message":"Rate limit exceeded, retry after 30 seconds"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            context_limit_from_refusal(r#"{"error":{"message":"Your subscription has expired"}}"#),
+            None
+        );
+        assert_eq!(context_limit_from_refusal(""), None);
+    }
+
+    /// "Too long" and "too long, and here is the number" are two facts, and the
+    /// predicate has to hold for both — the first is what tells the reader a
+    /// budget is wrong even when nothing was measured.
+    #[test]
+    fn a_refusal_is_recognised_as_over_the_window_whether_or_not_it_names_one() {
+        assert!(is_context_limit_refusal(
+            "prompt is too long: 214401 tokens > 200000 maximum"
+        ));
+        assert!(is_context_limit_refusal(
+            r#"{"error":{"code":"context_length_exceeded"}}"#
+        ));
+        assert!(is_context_limit_refusal(
+            "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+        ));
+        // The repairs point in different directions, so these must not match:
+        // a rate limit and an expired subscription are not context budgets.
+        assert!(!is_context_limit_refusal(
+            "Rate limit exceeded, retry after 30 seconds"
+        ));
+        assert!(!is_context_limit_refusal("Your subscription has expired"));
+        assert!(!is_context_limit_refusal(""));
+    }
+
+    /// The prompt's own size is never read as the limit: both numbers appear in
+    /// the same sentence, and taking the first would shrink the budget below
+    /// what the upstream had just accepted.
+    #[test]
+    fn the_prompt_size_quoted_beside_the_limit_is_not_mistaken_for_it() {
+        assert_eq!(
+            context_limit_from_refusal("prompt is too long: 214401 tokens > 200000 maximum"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_limit_from_refusal("Your messages resulted in 150000 tokens"),
+            None
+        );
+    }
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn chat_stream(

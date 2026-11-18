@@ -189,6 +189,23 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "Total LLM upstream calls rejected as malformed requests",
     ),
     (
+        crate::metric_names::AGENT_CONTEXT_LIMIT_REFUSALS_TOTAL.as_str(),
+        "Calls this process made that an upstream refused for exceeding its \
+         context window, by `outcome`. The window belongs to the upstream \
+         deployment and no file in this tree carries it, so the loop's budget \
+         is a bootstrap until a call measures it -- and a refusal is the \
+         measurement. `limit_named` cells are refusals whose text states the \
+         limit (\"maximum context length is 128000 tokens\", \"prompt is too \
+         long: 214401 tokens > 200000 maximum\"); the loop reads that number, \
+         lowers its budget to it in the same turn and reports it, so these \
+         cells should arrive in ones and twos and then stop. `limit_unnamed` \
+         cells are refusals that say the prompt was too long and name no \
+         number: the budget is still wrong, but nothing was learned, and the \
+         repair is to teach `context_limit_from_refusal` that vendor's wording. \
+         A cell that keeps climbing after its named sibling moved means the \
+         number was learned and the budget still exceeds it",
+    ),
+    (
         "llm_upstream_failures_total",
         "Total LLM upstream failures this process recorded against an upstream, \
          split by which side observed them. `source=\"caller\"` is a call this \

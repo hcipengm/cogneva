@@ -2207,6 +2207,18 @@ metric_names! {
     // class is what tells a rollout that cost nothing from one that cost an
     // external action.
     ATTEMPT_UNRESOLVED_CALLS_TOTAL => "cogneva_attempt_unresolved_calls_total",
+    // Calls an upstream refused for exceeding its context window, by whether
+    // the refusal named the limit.
+    //
+    // The window is a property of the upstream deployment: no file in this
+    // tree carries it, so the only number the loop can have is one it measured.
+    // A refusal is the measurement — `limit_named` cells teach the number
+    // exactly, because the vendor's own message states it, and `limit_unnamed`
+    // cells still say the budget was wrong even though nothing was learned.
+    // The two are kept apart because the repairs differ: a named limit is
+    // applied by the loop that read it, while an unnamed one needs the vendor's
+    // wording taught to `context_limit_from_refusal`.
+    AGENT_CONTEXT_LIMIT_REFUSALS_TOTAL => "cogneva_agent_context_limit_refusals_total",
 
     // cog-orchestrator -- what the backup account holds, folded into one series
     // by `readout`.

@@ -278,6 +278,33 @@ impl ContextWindow {
         self.current_tokens
     }
 
+    /// The budget this window trims to, in estimated tokens.
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
+    /// Move the budget, and trim to the new one in the same step.
+    ///
+    /// The budget is not a constant of the object: the only place the
+    /// upstream's window is measured is a call's own usage and its refusals,
+    /// and both arrive while this window holds a conversation. A budget that
+    /// could only be set at construction would leave every measurement
+    /// unactable until the next process — which is the whole shape of the bug
+    /// this is for: a run that keeps re-sending a prompt sized for a window it
+    /// does not have.
+    ///
+    /// Trimming here rather than at the next `add_message` is what makes the
+    /// next call different from the one that was just refused: the over-budget
+    /// messages are dropped now, so the very next request is smaller whether
+    /// or not another message arrives first.
+    pub fn set_max_tokens(&mut self, max_tokens: usize) {
+        if self.max_tokens == max_tokens {
+            return;
+        }
+        self.max_tokens = max_tokens;
+        self.trim_if_needed();
+    }
+
     /// 只剩地板（system 与首条 user）却仍然超预算。
     ///
     /// 这个状态一旦成立，之后每一条消息加进来都会在同一拍被裁掉：模型每一轮
