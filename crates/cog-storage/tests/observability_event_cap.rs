@@ -89,7 +89,7 @@ impl Scratch {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_table_over_capacity_is_pruned_oldest_first() {
+async fn a_table_over_capacity_is_reported_and_nothing_is_deleted() {
     let pool = PgPool::connect(&database_url())
         .await
         .expect("connect to the test database");
@@ -103,22 +103,22 @@ async fn a_table_over_capacity_is_pruned_oldest_first() {
     let outcome = cap.sweep_once().await.expect("sweep");
 
     assert_eq!(
-        outcome.removed, 200,
-        "the two hundred old rows are the ones that go"
+        outcome.removed, 0,
+        "a pass deletes nothing: the repair is to move the rows out, not to drop them"
     );
-    assert_eq!(outcome.held, 100, "the table comes back to its budget");
+    assert_eq!(outcome.held, 300, "every row written is still there");
     assert!(
-        !outcome.window_held,
-        "nothing was refused: the capacity was reachable"
+        outcome.window_held,
+        "the pass has to say the table is over its reading, or the excess is invisible"
     );
-    assert_eq!(scratch.count(&pool).await, 100);
+    assert_eq!(scratch.count(&pool).await, 300);
 
     scratch.drop(&pool).await;
 }
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_window_that_alone_exceeds_the_budget_is_reported_and_not_crossed() {
+async fn a_window_that_alone_exceeds_the_reading_is_reported() {
     let pool = PgPool::connect(&database_url())
         .await
         .expect("connect to the test database");
@@ -135,18 +135,18 @@ async fn a_window_that_alone_exceeds_the_budget_is_reported_and_not_crossed() {
     let outcome = cap.sweep_once().await.expect("sweep");
 
     assert_eq!(
-        outcome.removed, 200,
-        "every row outside the window is still deletable"
+        outcome.removed, 0,
+        "no row is deletable at any capacity: the log is the fact, and a fact cannot be trimmed"
     );
-    assert_eq!(outcome.held, 100, "the window's rows are all still there");
+    assert_eq!(outcome.held, 300, "every row written is still there");
     assert!(
         outcome.window_held,
         "a table the window holds over budget must say so, not report the capacity met"
     );
     assert_eq!(
         scratch.count(&pool).await,
-        100,
-        "the window is the floor: not one row inside it may go"
+        300,
+        "not one row goes, inside the window or outside it"
     );
 
     scratch.drop(&pool).await;
@@ -154,7 +154,7 @@ async fn a_window_that_alone_exceeds_the_budget_is_reported_and_not_crossed() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_row_exactly_at_the_window_edge_survives() {
+async fn every_row_survives_whatever_the_capacity_says() {
     let pool = PgPool::connect(&database_url())
         .await
         .expect("connect to the test database");
@@ -168,37 +168,32 @@ async fn a_row_exactly_at_the_window_edge_survives() {
         .with_read_window(Duration::from_secs(3_600));
     let outcome = cap.sweep_once().await.expect("sweep");
 
-    assert_eq!(outcome.removed, 1, "only the row outside the window goes");
-    assert_eq!(outcome.held, 1);
+    assert_eq!(
+        outcome.removed, 0,
+        "nothing is deleted, inside the window or out"
+    );
+    assert_eq!(outcome.held, 2);
     assert!(
-        !outcome.window_held,
-        "one row at the capacity is not a table held over it"
+        outcome.window_held,
+        "two rows over a capacity of one is a table over its reading"
     );
 
     scratch.drop(&pool).await;
 }
 
-/// A pass that needs more than one batch reports progress between them.
-///
-/// The loop stamps its own beat from that callback, so a pass that is working
-/// keeps its published age at one batch while a batch wedged on a lock still
-/// shows. Without a beat between batches the age of a pass over a log far over
-/// its capacity is the length of the whole pass, and that length is whatever the
-/// surplus is — the number of batches grows with it, so the loop can never
-/// declare a wall that covers it.
+/// 一趟不做删除，只看一眼，因此它也只打一拍——这一拍让「这趟还在跑」在读数面
+/// 看得见，而不用等它跑完。
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_pass_that_needs_more_than_one_batch_reports_progress_between_them() {
+async fn a_pass_reports_progress_and_deletes_nothing() {
     let pool = PgPool::connect(&database_url())
         .await
         .expect("connect to the test database");
     let scratch = Scratch::new(&pool).await;
-    // 40,001 rows against a capacity of one, all of them outside the read
-    // window: 40,000 deletions in batches of 20,000 is two batches.
     sqlx::query(&format!(
         "INSERT INTO {name} (timestamp) \
          SELECT NOW() - (g || ' minutes')::interval \
-         FROM generate_series(1, 40001) AS g",
+         FROM generate_series(1, 200) AS g",
         name = scratch.name
     ))
     .execute(&pool)
@@ -217,12 +212,18 @@ async fn a_pass_that_needs_more_than_one_batch_reports_progress_between_them() {
         .await
         .expect("sweep");
 
-    assert_eq!(outcome.removed, 40_000, "the whole surplus goes");
     assert_eq!(
-        beats.load(Ordering::Relaxed),
-        2,
-        "40,000 rows in batches of 20,000 is two batches, and both have to report \
-         progress: the loop beats its heartbeat from this callback"
+        outcome.removed, 0,
+        "nothing is deleted, whatever the capacity says"
+    );
+    assert_eq!(outcome.held, 200);
+    assert!(
+        outcome.window_held,
+        "the pass says the table is over its reading"
+    );
+    assert!(
+        beats.load(Ordering::Relaxed) >= 1,
+        "the pass beats while it works"
     );
 
     scratch.drop(&pool).await;

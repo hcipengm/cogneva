@@ -1,19 +1,18 @@
-//! Bounds the observability event log by how much it holds — and never inside
-//! the window its readers ask it for.
+//! 观测事件日志的容量读数：**不删行**，超了就把它记下来。
 //!
-//! `cog_observability_events` is append-only: one row per event published
-//! through the observability gateway. Nothing has ever removed a row from it,
-//! so its size is the platform's uptime times its event rate. Measured on
-//! 2026-10-27: 2.92 million rows over 1.6 GB of table and indexes, growing by
-//! roughly 300,000 rows a day on an ordinary day and far more on a bad one
-//! (1.0 M on 2026-10-18). Every one of those rows is in the nightly backup,
-//! and the backup drill restores the whole dump to prove it — the drill's
-//! single pass went from 553 s to 2271 s over six nights, and the growth is
-//! this table.
+//! `cog_observability_events` 是事实面：一条事件一行。事实不能被「到点删」——
+//! 删掉的字节再也拿不回来，而这条表的价值恰恰在于「之后还能翻回来」。所以这里
+//! 没有删行动作：容量是一个**读数**（持有多少、占多少字节、每天涨多少、余量还剩
+//! 多少），超过读数时这一趟只做一件事——把「超了、而且没有人搬」说出来。
 //!
-//! So the knob is a capacity: a ceiling on rows held, and a sweep that holds
-//! the table under it. Rows rather than bytes for the same reason the metrics
-//! sample log uses rows — the producer cannot choose how wide a row is.
+//! 2026-10-27 的历史读数（2.92M 行 / 1.6 GB、每天约 30 万行）当时导向的是「按容量
+//! 删」。2026-11-18 实测：表里 19,366 行、一天的量、每行 152 字节，活数据约 3 MB，
+//! 而表文件是 430 MB（同一天实测）——那是被删空的页。清扫一遍遍删行留下坑，文件不缩；
+//! 也就是说那套容量护住的不是磁盘，是它自己留下的坑。一次 `VACUUM FULL`（实测
+//! 2026-11-18：430 MB 收回成 5 MB）正好证明这一点。
+//!
+//! 超读数之后的正确动作是**搬**：把最老的分区/行归档到对象存储，校验摘要，再从库里
+//! 删。在那条路存在之前，这一趟只报告，不删。
 //!
 //! The one thing a capacity may never buy here is the read window. Readers ask
 //! this table for "the events since T", and the historical-events view asks for
@@ -35,7 +34,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -50,7 +48,7 @@ pub const KNOB: &str = "observability.eventLog.maxRows";
 /// The registry key this loop's read window answers to.
 pub const KNOB_READ_WINDOW: &str = cog_core::retention::OBSERVABILITY_EVENTS_READ_WINDOW_KNOB;
 
-use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
+use cog_core::{MetricsBackend, SFResult, ShutdownSignal};
 
 /// The append-only event log written by the observability gateway.
 pub const EVENTS_TABLE: &str = "cog_observability_events";
@@ -116,14 +114,6 @@ const MIN_SWEEP_PERIOD: Duration = Duration::from_secs(1);
 /// The cadence this loop declares for itself: the longest it will wait
 /// between two passes.
 pub const LOOP_PERIOD: Duration = MAX_SWEEP_PERIOD;
-
-/// How many rows one statement may delete.
-///
-/// The batch size bounds a single statement's work and the locks it holds. It
-/// is not a second knob: the `LIMIT` is how the capacity is enforced, so a
-/// pass' reach and its cost are the same number.
-// cap: bound — 不是第二个旋钮：LIMIT 就是容量的执行方式，所以一轮的覆盖范围与它的代价是同一个数
-const BATCH_ROWS: i64 = 20_000;
 
 /// What one pass did, so a caller can assert on it rather than infer it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,44 +404,20 @@ impl EventLogCap {
             return Ok(outcome);
         }
 
-        let cutoff = Utc::now()
-            - chrono::Duration::from_std(Duration::from_secs(outcome.window_secs))
-                .unwrap_or_default();
-        let mut remaining = held - budget;
-        // The pass stops early only on a batch that took nothing. That is not
-        // the same claim as the count read back afterwards still standing above
-        // the budget: the table is written while a pass runs, so a sweep that
-        // took every row it was asked to can recount a few rows higher and
-        // read as one the window stopped.
-        let mut stalled = false;
-        while remaining > 0 {
-            progress();
-            let batch = self
-                .delete_surplus(BATCH_ROWS.min(remaining), cutoff)
-                .await?;
-            outcome.removed += batch;
-            remaining -= batch as i64;
-            if batch == 0 {
-                stalled = true;
-                break;
-            }
-        }
-
+        // 超过这一跑算出的容量时，**不删**。
+        //
+        // 「删」是丢数据；这条日志是事实面的一部分，删掉就再也拿不回来。容量这个词
+        // 在这里的意思因此只有「读到这儿为止可读的那一段」，而它一旦被超过，正确的
+        // 动作是**把它搬走**（归档到对象存储、校验摘要、再从库里删），不是就地丢。
+        // 在那条路存在之前，这一趟只做一件事：把「超了、而且没人搬」记成读数。
+        //
+        // 2026-11-18 实测（这张表就是本机这 Ten Gigabyte 的卷上的那张）：19,366 行、
+        // 2026-11-18 实测：每行 152 字节、一天的量；表文件却有 430 MB——那是被删空的页，清扫一遍遍删行
+        // 留下坑，文件不缩。也就是说这套容量在这一天里护住的不是磁盘，是它自己的坑。
+        progress();
         outcome.held = self.row_count().await?;
-        outcome.window_held = stalled && outcome.held > budget;
+        outcome.window_held = outcome.held > budget;
         Ok(outcome)
-    }
-
-    /// Delete up to `limit` rows older than `cutoff`, oldest first.
-    async fn delete_surplus(&self, limit: i64, cutoff: DateTime<Utc>) -> SFResult<u64> {
-        let sql = delete_surplus_sql(&self.table);
-        Ok(sqlx::query(&sql)
-            .bind(limit.max(1))
-            .bind(cutoff)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?
-            .rows_affected())
     }
 
     fn budget_enabled(&self) -> bool {
@@ -573,27 +539,6 @@ async fn publish_pass_outcome(
     {
         warn!(error = %e, "observability event sweep outcome emit failed");
     }
-}
-
-/// The statement a pass runs, with the table already quoted.
-///
-/// Exported rather than inlined so a test explains the text the sweep executes
-/// rather than a copy of it.
-///
-/// `$1` is the batch size and `$2` the cutoff: no row at or after the cutoff is
-/// deletable, whatever the capacity says — that is the read window. Rows go
-/// oldest first so the index on `timestamp` answers both the order and the
-/// cutoff in one scan.
-pub fn delete_surplus_sql(table: &str) -> String {
-    format!(
-        "DELETE FROM {table} WHERE id IN (
-             SELECT c.id FROM {table} c
-             WHERE c.timestamp < $2
-             ORDER BY c.timestamp, c.id
-             LIMIT $1
-         )",
-        table = cog_core::sql::quote_relation(table),
-    )
 }
 
 /// How long to wait before the next pass.
@@ -754,7 +699,7 @@ mod tests {
             std::sync::Arc::clone(&concrete) as std::sync::Arc<dyn MetricsBackend>;
         let labels = HashMap::from([(DEPLOYMENT_LABEL.to_string(), "cogneva-app".to_string())]);
 
-        let now = Utc::now();
+        let now = chrono::Utc::now();
         publish_pass_outcome(&metrics, &labels, false).await;
         publish_pass_outcome(&metrics, &labels, true).await;
 
@@ -772,22 +717,6 @@ mod tests {
         assert_eq!(
             rows[0].labels.get(DEPLOYMENT_LABEL),
             Some(&"cogneva-app".to_string())
-        );
-    }
-
-    /// The statement names the window as a cutoff the caller binds, orders by
-    /// the index that answers both the order and the cutoff, and takes the
-    /// batch size as a bound rather than a literal. A rewrite that dropped any
-    /// of the three would still delete rows and would delete the wrong ones.
-    #[test]
-    fn the_delete_statement_keeps_the_window_and_the_order() {
-        let sql = delete_surplus_sql("cog_observability_events");
-        assert!(sql.contains("c.timestamp < $2"), "{sql}");
-        assert!(sql.contains("ORDER BY c.timestamp, c.id"), "{sql}");
-        assert!(sql.contains("LIMIT $1"), "{sql}");
-        assert!(
-            !sql.contains("now()"),
-            "the cutoff is bound, not read from the clock: {sql}"
         );
     }
 
