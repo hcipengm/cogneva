@@ -1425,7 +1425,9 @@ impl cog_core::SystemPlugin for StoragePlugin {
                     ));
                     info!(
                         keep_days = keep,
-                        "attempt journal installed; an interrupted attempt resumes from its last recorded step"
+                        "attempt journal installed; an interrupted attempt resumes from its last \
+                         recorded step, and closed journals past the window are counted rather \
+                         than deleted"
                     );
                 }
                 Err(e) => warn!(

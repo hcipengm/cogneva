@@ -7,8 +7,9 @@
 //! 同一件任务再派一次还是同一个名字，续跑才找得回上一次那一段。列名就叫
 //! `agent_id`——叫 `task_id` 会让下一个人以为这里存的是任务 id，而它从来不是。
 //!
-//! 不设保留期清扫在这里：**已关闭**的尝试永远不再被读，它们唯一的读者是事后
-//! 查一件事的人。清扫按「关闭时间早于保留窗口」删，见 [`SWEEP_SQL`]。
+//! **已关闭**的尝试永远不再被续跑读，它们唯一的读者是事后查一件事的人——正因为它
+//! 们是「模型当时到底看到了什么」的唯一一份，这里不删。过窗口的那些被数出来
+//! （见 [`CLOSED_OLDER_THAN_SQL`]），搬走并校验通过之前一行不动。
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -51,18 +52,19 @@ WHERE agent_id = $1
 ORDER BY seq ASC
 "#;
 
-/// 已关闭且关闭时间早于 `now - keep` 的整个 agent，连同日志一起删。
+/// 已关闭、且关闭得早于 `now - keep` 的那几个 agent，**数一数**有几个。
+///
+/// 这里是读数，不是删除：日志是「模型当时到底看到了什么」的唯一一份，删掉就再也
+/// 补不回来。过窗口的那些只说明「该搬了」，说明不了「该丢」——搬的那条路与事件流
+/// 同形：先落一份可读回来的副本，校验通过，才允许删。
 ///
 /// 判据落在**关闭那一刻**，不是最后一条消息那一刻：一个 agent 开着的时候，
 /// 无论它多久没动，它都有可能被下一次派发接着跑。
-pub const SWEEP_SQL: &str = r#"
-DELETE FROM cog_attempt_journal
-WHERE agent_id IN (
-    SELECT agent_id FROM cog_attempt_journal
-    WHERE kind = 'closed' AND created_at < NOW() - make_interval(secs => $1)
-      AND seq = (SELECT MAX(seq) FROM cog_attempt_journal j
-                 WHERE j.agent_id = cog_attempt_journal.agent_id)
-)
+pub const CLOSED_OLDER_THAN_SQL: &str = r#"
+SELECT count(DISTINCT agent_id) FROM cog_attempt_journal
+WHERE kind = 'closed' AND created_at < NOW() - make_interval(secs => $1)
+  AND seq = (SELECT MAX(seq) FROM cog_attempt_journal j
+             WHERE j.agent_id = cog_attempt_journal.agent_id)
 "#;
 
 /// 已关闭的日志留多久。
@@ -99,14 +101,13 @@ impl PostgresAttemptJournal {
         crate::schema_ddl::apply(&self.pool, DDL).await
     }
 
-    /// 删掉已关闭且过了保留窗口的整个 agent，返回删掉的行数。
-    pub async fn sweep_closed_older_than(&self, keep_seconds: i64) -> SFResult<u64> {
-        let done = sqlx::query(SWEEP_SQL)
+    /// 已关闭、且过了保留窗口的 agent 有几个。**只读**。
+    pub async fn closed_older_than(&self, keep_seconds: i64) -> SFResult<i64> {
+        sqlx::query_scalar(CLOSED_OLDER_THAN_SQL)
             .bind(keep_seconds as f64)
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| SFError::Database(format!("attempt journal sweep failed: {e}")))?;
-        Ok(done.rows_affected())
+            .map_err(|e| SFError::Database(format!("attempt journal reading failed: {e}")))
     }
 }
 
@@ -125,14 +126,15 @@ pub fn spawn_sweeper(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match journal.sweep_closed_older_than(keep_seconds).await {
+            match journal.closed_older_than(keep_seconds).await {
                 Ok(0) => {}
-                Ok(rows) => tracing::info!(
-                    rows,
-                    "attempt journal: retired closed attempts past the retention"
+                Ok(agents) => tracing::warn!(
+                    agents,
+                    "attempt journal: closed journals past the retention are still here; \
+                     nothing is deleted until a copy has been archived and read back"
                 ),
                 Err(e) => {
-                    tracing::warn!(error = %e, "attempt journal sweep failed; the next pass retries")
+                    tracing::warn!(error = %e, "attempt journal reading failed; the next pass retries")
                 }
             }
             tokio::select! {
