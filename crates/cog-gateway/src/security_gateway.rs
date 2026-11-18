@@ -4249,6 +4249,15 @@ async fn record_exchange(
         (Some(bytes), Some(sha)) => archive_exchange_body(state, "response", sha, bytes).await,
         _ => None,
     };
+    // 归档没成时，正文落在这一行里。少了这一步，「归档没配」就等于「这次调用说了
+    // 什么，从此没人知道」——而这一行的存在意义正是留下它说了什么。
+    let request_inline = request_raw
+        .is_none()
+        .then(|| String::from_utf8_lossy(body).into_owned());
+    let response_inline = match (response, &response_raw) {
+        (Some(bytes), None) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    };
     let record = LlmExchangeRecord {
         upstream: LlmHealthTable::key(upstream),
         api_style: upstream.api_style.clone(),
@@ -4265,6 +4274,8 @@ async fn record_exchange(
         response_bytes: response.map(|b| b.len() as u64).unwrap_or(0),
         request_raw,
         response_raw,
+        request_inline,
+        response_inline,
     };
     // 与用量行同一条写法：spawn 出去。留底挂在响应流的尾巴上，而调用方的流要到
     // 这里返回才真正结束——为一次诊断写入多等一个往返，等于让每个用户替观测买单。

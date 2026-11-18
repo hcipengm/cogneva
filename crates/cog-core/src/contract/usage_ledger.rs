@@ -493,6 +493,14 @@ pub struct LlmExchangeRecord {
     pub request_raw: Option<String>,
     /// The permanent copy of the response bytes `response_bytes` counts.
     pub response_raw: Option<String>,
+    /// 没有归档副本时，正文**原样**写在这一格。
+    ///
+    /// 这一格存在只为一件事：正文不能因为「归档没配 / 归档拒绝 / 归档不可达」就
+    /// 消失。有副本时它是 `None`（正文在归档里，行只存键）；没有副本时它是那份字节
+    /// 本身——宁可这一行大，也不要这一行说了「有一次调用」却拿不出它说了什么。
+    pub request_inline: Option<String>,
+    /// 同上，响应那一侧。
+    pub response_inline: Option<String>,
 }
 
 /// One upstream's quota window as the ledger tells it.

@@ -768,8 +768,10 @@ impl LlmUsageStore {
             INSERT INTO gateway_llm_exchange
                 (id, upstream, api_style, model, actor, origin, task_id, result,
                  latency_ms, request_sha256, response_sha256, request_bytes,
-                 response_seen_bytes, response_bytes, request_raw, response_raw)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                 response_seen_bytes, response_bytes, request_raw, response_raw,
+                 request_body, response_body)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                    $17, $18)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -788,6 +790,9 @@ impl LlmUsageStore {
         .bind(r.response_bytes as i64)
         .bind(r.request_raw.as_deref())
         .bind(r.response_raw.as_deref())
+        // 没有归档副本时的正文：老行用的是同样两列，读者不必分两种形状。
+        .bind(r.request_inline.as_deref())
+        .bind(r.response_inline.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())

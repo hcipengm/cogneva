@@ -47,11 +47,27 @@ impl Scratch {
         )
         .await;
         sqlx::query(&format!(
+            // 与真表同形状：写入口的 INSERT 点的是这些列，少一列就不是同一个问题。
             "CREATE TABLE \"{schema}\".gateway_llm_exchange (
-                 id BIGSERIAL PRIMARY KEY,
-                 ts TIMESTAMPTZ NOT NULL,
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 upstream TEXT NOT NULL DEFAULT 'test-upstream',
+                 api_style TEXT NOT NULL DEFAULT 'openai',
+                 model TEXT NOT NULL DEFAULT 'm',
+                 actor TEXT NOT NULL DEFAULT 'a',
+                 origin TEXT NOT NULL DEFAULT 'gateway_pool',
+                 task_id TEXT,
+                 result TEXT NOT NULL DEFAULT 'ok',
+                 latency_ms BIGINT NOT NULL DEFAULT 0,
+                 request_sha256 TEXT NOT NULL DEFAULT '',
+                 response_sha256 TEXT,
+                 request_bytes BIGINT NOT NULL DEFAULT 0,
+                 response_seen_bytes BIGINT NOT NULL DEFAULT 0,
+                 response_bytes BIGINT NOT NULL DEFAULT 0,
                  request_raw  TEXT,
-                 response_raw TEXT
+                 response_raw TEXT,
+                 request_body TEXT,
+                 response_body TEXT
              )"
         ))
         .execute(&pool)
@@ -188,6 +204,85 @@ async fn an_empty_archive_answers_zero_rather_than_nothing() {
         "an empty archive is a clean one: the age rule compares this to the \
          retention and zero is what has to arrive"
     );
+
+    scratch.done().await;
+}
+
+/// 归档没成时正文落在行里：这一行说了「有一次调用」，就必须拿得出它说了什么。
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_body_with_no_archive_copy_is_kept_in_the_row() {
+    use cog_core::LlmExchangeRecord;
+    let url = cog_test_support::database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("database must be reachable");
+    let scratch = Scratch::new(pool.clone()).await;
+    let table = format!("\"{}\".gateway_llm_exchange", scratch.schema);
+    // 写入口的表名是拼进 SQL 的，没有「换一张表」的参数；于是给它一个把 search_path
+    // 钉在这台用例自己的 schema 上的池——测的是写入口本身，不是这里另抄的一份 INSERT。
+    let schema = scratch.schema.clone();
+    let scoped = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _meta| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO \"{schema}\""))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("a pool scoped to this case's schema");
+    let store = cog_observability::usage_store::LlmUsageStore::from_pool(scoped);
+
+    let mut record = LlmExchangeRecord {
+        upstream: "test-upstream".into(),
+        api_style: "openai".into(),
+        model: "m".into(),
+        actor: "a".into(),
+        origin: "gateway_pool".into(),
+        task: None,
+        result: "ok".into(),
+        latency_ms: 1,
+        request_sha256: "00".into(),
+        response_sha256: Some("11".into()),
+        request_bytes: 5,
+        response_seen_bytes: 3,
+        response_bytes: 0,
+        request_raw: None,
+        response_raw: None,
+        request_inline: Some("hello".into()),
+        response_inline: Some("bye".into()),
+    };
+    store
+        .record_exchange(&record)
+        .await
+        .expect("record the exchange");
+    let (req, resp): (Option<String>, Option<String>) =
+        sqlx::query_as(&format!("SELECT request_body, response_body FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .expect("read the row back");
+    assert_eq!(req.as_deref(), Some("hello"));
+    assert_eq!(resp.as_deref(), Some("bye"));
+
+    // 有归档副本时行里不抄第二份：正文在归档里，行只存键。
+    record.request_raw = Some("bodies/req".into());
+    record.request_inline = None;
+    record.response_inline = None;
+    record.request_sha256 = "22".into();
+    store.record_exchange(&record).await.expect("record again");
+    let (req, resp): (Option<String>, Option<String>) = sqlx::query_as(&format!(
+        "SELECT request_body, response_body FROM {table} WHERE request_sha256 = '22'"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read the second row back");
+    assert_eq!(req, None, "the copy lives in the archive; the row names it");
+    assert_eq!(resp, None);
 
     scratch.done().await;
 }

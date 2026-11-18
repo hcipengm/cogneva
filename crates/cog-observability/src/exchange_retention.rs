@@ -272,13 +272,13 @@ impl ExchangeRetention {
         // 来换页；翻到底的那些既没被删、也没被漏数。
         let mut removed = 0u64;
         let mut kept_unarchived = 0u64;
-        let mut cursor: Option<(chrono::DateTime<chrono::Utc>, i64)> = None;
+        let mut cursor: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)> = None;
         loop {
             progress();
             // 一行：id、时刻、两份正文的归档键。宽是这一行的形状，不是这里的毛病。
             #[allow(clippy::type_complexity)]
             type PagedRow = (
-                i64,
+                uuid::Uuid,
                 chrono::DateTime<chrono::Utc>,
                 Option<String>,
                 Option<String>,
@@ -298,7 +298,7 @@ impl ExchangeRetention {
             .map_err(|e| SFError::Database(e.to_string()))?;
             let Some(last) = rows.last() else { break };
             cursor = Some((last.1, last.0));
-            let mut deletable: Vec<i64> = Vec::new();
+            let mut deletable: Vec<uuid::Uuid> = Vec::new();
             for (id, _ts, request_raw, response_raw) in &rows {
                 // `None`（读不到）与 `Some(false)`（没有副本）都不删。
                 if self
