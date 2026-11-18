@@ -49,6 +49,10 @@ path = "tests/store_derived_reading.rs"
 name = "swe_pro_container"
 path = "tests/swe_pro_container.rs"
 
+[[test]]
+name = "scale_capacity_reading"
+path = "tests/scale_capacity_reading.rs"
+
 [dependencies]
 cog-core = { workspace = true }
 cog-llm = { workspace = true }

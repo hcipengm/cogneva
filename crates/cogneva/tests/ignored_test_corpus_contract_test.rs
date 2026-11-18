@@ -148,6 +148,16 @@ const UNNAMED: &[(&str, &str)] = &[
          cargo test -p cogneva --test store_derived_reading -- --ignored --nocapture`.",
     ),
     (
+        "crates/cogneva/tests/scale_capacity_reading.rs",
+        "The probe judges whether a live deployment scales wide enough to cover \
+         its queue: it scrapes the capacity, slot, holding and waiting series the \
+         workload loop publishes and fails when capacity does not cover demand. \
+         CI has no cluster, so the tree side of the same numbers lives in \
+         `cog_reflection::workload_resources` tests. Manual reading: \
+         `COGNEVA_METRICS_URLS=<app-pod>/metrics cargo test -p cogneva --test \
+         scale_capacity_reading -- --ignored --nocapture`.",
+    ),
+    (
         "crates/cogneva/src/eval_mcp_in_pod.rs",
         "Same shape as the local-tools entry above it: read a real pack pod's \
          server config, start the server, list its tools and call one. What it \
