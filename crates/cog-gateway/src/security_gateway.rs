@@ -153,6 +153,12 @@ pub struct SecurityGatewayConfig {
     /// 即 fail-closed，授权码通道不可用——设备流不需要应用凭证，不受影响。
     pub github_oauth_client_id: Option<String>,
     pub github_oauth_client_secret: Option<String>,
+    /// 内存 Raw 层的写入面：留底正文整份存在那里，留底表只留索引。
+    ///
+    /// 与业务 Pod 用的是同一个环境变量、同一个地址（主应用的内部端口，零凭证）：
+    /// 正文的存放处只有一个，两边各配一个地址就会出现「写入落在 A、读取去 B」。
+    /// `None` = 这个部署没给地址，正文没有永久副本，读数里带 `unconfigured`。
+    pub memory_api_base: Option<String>,
     /// Webhook 入口通道监听端口（第三通道，面向集群外平台回调）。
     pub webhook_port: u16,
     /// 观测通道监听端口（第四通道，只挂 /health/* 与 /metrics）。
@@ -297,6 +303,7 @@ impl SecurityGatewayConfig {
             gitee_oauth_client_id: token("COGNEVA_GITEE_OAUTH_CLIENT_ID"),
             gitee_oauth_client_secret: token("COGNEVA_GITEE_OAUTH_CLIENT_SECRET"),
             github_oauth_client_id: token(GITHUB_OAUTH_CLIENT_ID_ENV),
+            memory_api_base: token(cog_core::MEMORY_API_BASE_ENV),
             github_oauth_client_secret: token("COGNEVA_GITHUB_OAUTH_CLIENT_SECRET"),
             webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
             metrics_port: env_u16("COGNEVA_SG_METRICS_PORT", 9090),
@@ -3951,11 +3958,13 @@ const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 // cap: bound — 连不上的上游要快报「连不上」，不能跟「上游慢」混成同一个现象
 const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// 留底表的单边上限。流式响应的原文扫描本来就只留 1 MiB（见 [`UsageScanner::feed`]），
-/// 请求侧对齐同一个界：两边都是"一次调用的规模"，而把它调大只会让一张诊断表变成
-/// 库里最大的一张。
-// cap: fixed — 与请求侧对齐同一个界：两边都是「一次调用的规模」；调大只会让诊断表变成库里最大的一张
-const EXCHANGE_BODY_CAP: usize = 1024 * 1024;
+/// 留底正文的存放面：内存 Raw 层的写入端点（见 [`archive_exchange_body`]）。
+///
+/// 正文不落在留底表里。那张表按部署的保留期清扫、又被每晚的备份整表拷走，正文放在
+/// 那里能活多久取决于这两件事；Raw 层没有清扫，正文在那里才是永久的，表只做索引。
+fn exchange_raw_id(side: &str, sha256: &str) -> String {
+    format!("llm-{side}-{sha256}")
+}
 
 /// 留底开关。默认开，`COGNEVA_GATEWAY_EXCHANGE_STORE=0` 关——关掉之后台账照写，
 /// 只是正文不落库；这是给"这台部署不该把提示词写进数据库"的准备，而不是故障开关。
@@ -3968,44 +3977,85 @@ fn exchange_store_enabled() -> bool {
     })
 }
 
-/// 留底正文里不该出现的凭证形状。上游的 key 在请求头里，正常不会进 body；但调用方
-/// 可能把自家的 token 写进提示词（贴代码、贴配置），而这张表的读者比请求路径多得多。
+/// Write one side of an exchange into the memory Raw layer, and answer the
+/// reference a reader fetches it by.
 ///
-/// 只抹看起来像密钥的那一段，不整段丢弃：丢掉整条正文等于把这一次调用从留底里删掉，
-/// 而"这里有一处密钥"本身是值得知道的事。
-fn redact_exchange(text: &str) -> String {
-    use std::sync::OnceLock;
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        [
-            r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}",
-            r"\bsk-[A-Za-z0-9_\-]{16,}",
-            r#"(?i)("(?:api_key|apikey|authorization|access_token|refresh_token|secret)"\s*:\s*")[^"]{8,}(")"#,
-            r"(?i)(\b(?:api[_-]?key|access[_-]?token|secret)\s*[=:]\s*)[A-Za-z0-9._\-]{16,}",
-        ]
-        .iter()
-        .filter_map(|p| regex::Regex::new(p).ok())
-        .collect()
+/// The id is the hash of the bytes, so the copy is content-addressed: one
+/// prompt sent a thousand times is one object, and the exchange rows that point
+/// at it are still one per call. The bytes go in whole -- nothing here redacts,
+/// cuts or re-encodes them, because the point of the copy is that a later
+/// reader can see exactly what crossed the wire.
+///
+/// Redaction belongs to the read face. Scrubbing this copy would not protect
+/// anything: the same bytes land unchanged in the tool-call records and in the
+/// event stream's tool payloads, so a credential removed here is still readable
+/// one table over -- and the only thing a partial scrub buys is that the copy
+/// no longer says what was sent.
+///
+/// The failures are counted where they are classified, since only this function
+/// knows which one happened: no base configured, the API refused, the API did
+/// not answer, or the bytes are not text (a request body is JSON and a response
+/// body is JSON or SSE, so this last one is the protocol telling us it is not
+/// one of the two shapes this path handles -- counted rather than assumed
+/// away).
+async fn archive_exchange_body(
+    state: &AppState,
+    side: &str,
+    sha256: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    let unarchived = |cause: &'static str| async move {
+        record_counter(
+            state,
+            cog_core::metric_names::LLM_EXCHANGE_BODY_UNARCHIVED_TOTAL,
+            &[("cause", cause)],
+        )
+        .await;
+        None::<String>
+    };
+    let Some(base) = state
+        .config
+        .memory_api_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    else {
+        return unarchived("unconfigured").await;
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return unarchived("not_text").await;
+    };
+    let id = exchange_raw_id(side, sha256);
+    let url = format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        cog_core::MEMORY_INGEST_PATH
+    );
+    let payload = serde_json::json!({
+        "id": id,
+        "content_type": "application/octet-stream",
+        "text": text,
+        "purpose": "archive",
     });
-    let mut out = text.to_string();
-    for re in patterns.iter() {
-        out = re.replace_all(&out, "${1}[redacted]${2}").into_owned();
+    // 沿用本进程已有的出站客户端：它带着自我标识，墙钟也是这份配置声明的那个。
+    match state.client.post(&url).json(&payload).send().await {
+        Ok(resp) if resp.status().is_success() => Some(cog_core::artifact_uri(
+            cog_core::DEFAULT_MEMORY_NAMESPACE,
+            &id,
+        )),
+        Ok(resp) => {
+            tracing::warn!(
+                side,
+                status = resp.status().as_u16(),
+                "LLM exchange body: the memory API refused the write"
+            );
+            unarchived("refused").await
+        }
+        Err(e) => {
+            tracing::warn!(side, error = %e, "LLM exchange body: the memory API did not answer");
+            unarchived("unreachable").await
+        }
     }
-    out
-}
-
-/// 把一段字节切成"能存的那一份 + 有没有被切"。按字符边界切，否则 PostgreSQL 的
-/// `TEXT` 会拒掉半截 UTF-8，而一次 1 MiB 的截断正好会切在中文中间。
-fn capped_body(raw: &[u8], cap: usize) -> (String, bool) {
-    let text = String::from_utf8_lossy(raw);
-    if text.len() <= cap {
-        return (text.into_owned(), false);
-    }
-    let mut cut = cap;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    (text[..cut].to_string(), true)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -4158,14 +4208,21 @@ async fn record_llm_tokens(
 /// 才去读的宽行。写失败只 WARN——留底是观测，不是请求路径的一部分，和记账同一条
 /// 降级约定。
 ///
+/// 两件事在这里发生，顺序就是重点：两边各自的字节先整份写进内存 Raw 层，再把索引
+/// 行写进留底表。写在前面的是永久的那份，写在后面的是会被清扫的那份——反过来的话，
+/// 一行索引有而正文没有的记录，读起来正是「查得到、取不到」。
+///
 /// `response` 是**上游回来的原始字节**（流式就是整段 SSE 转录），不是重新拼的
 /// 正文：重拼要经过一层协议解释，而解释会随上游习惯变；留底的价值正在于它不经解释。
+/// 它可能只是前缀（见 [`UsageScanner`] 的采集上限），所以 `response_seen_bytes` 单独
+/// 记上游到底发了多少：两者不等就说明有一截谁也没有副本，而不是这条正文本身就短。
 async fn record_exchange(
     state: &AppState,
     upstream: &LlmUpstream,
     request: &RequestSide,
     result: &str,
     response: Option<&[u8]>,
+    response_seen_bytes: u64,
     latency_ms: u64,
 ) {
     if !exchange_store_enabled() {
@@ -4180,26 +4237,18 @@ async fn record_exchange(
         return;
     };
     let request_sha256 = sha256_hex(body);
-    let (request_body, request_cut) = capped_body(body, EXCHANGE_BODY_CAP);
-    let (response_body, response_cut) = match response {
-        Some(bytes) => {
-            let (text, cut) = capped_body(bytes, EXCHANGE_BODY_CAP);
-            (Some(text), cut)
-        }
-        None => (None, false),
-    };
-    let truncated = match (request_cut, response_cut) {
-        (true, true) => "both",
-        (true, false) => "request",
-        (false, true) => "response",
-        (false, false) => "",
-    };
+    let response_sha256 = response.map(sha256_hex);
     // 模型名从请求体里读：上游条目的 `model` 是被改写之后的真相，但调用方声明的
     // 那个名字在改写中丢了；两个都留着才回答得了"哪一边的模型在花钱"。
     let model = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
         .unwrap_or_else(|| upstream.model.clone());
+    let request_raw = archive_exchange_body(state, "request", &request_sha256, body).await;
+    let response_raw = match (response, response_sha256.as_deref()) {
+        (Some(bytes), Some(sha)) => archive_exchange_body(state, "response", sha, bytes).await,
+        _ => None,
+    };
     let record = LlmExchangeRecord {
         upstream: LlmHealthTable::key(upstream),
         api_style: upstream.api_style.clone(),
@@ -4210,12 +4259,12 @@ async fn record_exchange(
         result: result.to_string(),
         latency_ms,
         request_sha256,
-        response_sha256: response.map(sha256_hex),
+        response_sha256,
         request_bytes: body.len() as u64,
+        response_seen_bytes,
         response_bytes: response.map(|b| b.len() as u64).unwrap_or(0),
-        request_body: Some(redact_exchange(&request_body)),
-        response_body: response_body.map(|t| redact_exchange(&t)),
-        truncated: truncated.to_string(),
+        request_raw,
+        response_raw,
     };
     // 与用量行同一条写法：spawn 出去。留底挂在响应流的尾巴上，而调用方的流要到
     // 这里返回才真正结束——为一次诊断写入多等一个往返，等于让每个用户替观测买单。
@@ -4389,6 +4438,12 @@ fn extract_usage(json: &serde_json::Value) -> ReportedUsage {
 struct UsageScanner {
     line_buf: Vec<u8>,
     raw: Vec<u8>,
+    /// 这一跳一共看到多少字节，无论有没有留下来。
+    ///
+    /// 与 `raw.len()` 是两个问题：后者是副本有多长，前者是上游发了多少。1 MiB 之后
+    /// 不再抄原文（防异常响应把内存顶爆），而字节照样转发，所以两者的差就是那截没
+    /// 有副本的尾巴——留底行靠它把「正文短」与「副本短」分开。
+    seen: u64,
     tokens_input: u64,
     tokens_output: u64,
     /// 上游自报的缓存命中量。与另两个计数同样只在真拿到正数时改写：中间帧常带一个
@@ -4425,7 +4480,12 @@ struct UsageScanner {
 impl UsageScanner {
     fn feed(&mut self, chunk: &[u8]) {
         self.line_buf.extend_from_slice(chunk);
+        self.seen += chunk.len() as u64;
         // 非 SSE body 的兜底解析需要原文；上限 1MiB 防内存被异常响应顶爆。
+        //
+        // 这条界也就是留底副本的长度上限：写进 Raw 层的是这一段，不是整条响应。
+        // 所以越过它的部分**没有副本**，而这件事只能靠 `seen` 与副本长度不等看出来
+        // ——`raw` 停在这里，转发照旧，读的人否则看到的就是一条"本来就短"的答复。
         if self.raw.len() < 1024 * 1024 {
             self.raw.extend_from_slice(chunk);
         }
@@ -4601,6 +4661,16 @@ impl UsageScanner {
 /// incremented from the same place, no existing reading showed the loss. Tying
 /// the write to a value the stream owns makes both paths the same write:
 /// normally from the tail, and on the way out from [`Drop`].
+/// 上游回来的那一段原文，以及这一跳总共看到多少字节。
+///
+/// 两者绑在一起走，因为它们回答的是同一笔调用的两个问题，而分开取会让「副本短」
+/// 与「正文短」在读者那里又变成同一个形状：`bytes` 是留下来、要写进 Raw 层的那
+/// 一份，`seen` 是上游实际发了多少。
+struct CapturedBody {
+    bytes: Vec<u8>,
+    seen: u64,
+}
+
 struct UsageRecorder {
     scanner: Arc<Mutex<UsageScanner>>,
     state: AppState,
@@ -4627,13 +4697,17 @@ impl UsageRecorder {
     /// Claiming here rather than after the write is deliberate: a stream
     /// dropped mid-write has still had its reading taken, and writing it twice
     /// would be worse than writing it once.
-    fn reading(&mut self, abandoned: bool) -> (UsageReading, Vec<u8>) {
+    fn reading(&mut self, abandoned: bool) -> (UsageReading, CapturedBody) {
         self.claimed = true;
         let mut s = self.scanner.lock().unwrap();
         s.finish();
         // 响应原文在这里一并取走：扫描器本来就留着（上限 1 MiB，见 `feed`），
-        // 留底要的就是它，不必再从流里抄第二份。
-        let raw = s.raw.clone();
+        // 留底要的就是它，不必再从流里抄第二份。`seen` 跟它一起走：副本有多长与
+        // 上游一共发了多少必须同一次读出，分开读会让两个数说不上同一笔。
+        let captured = CapturedBody {
+            bytes: s.raw.clone(),
+            seen: s.seen,
+        };
         (
             UsageReading {
                 input: s.tokens_input,
@@ -4647,7 +4721,7 @@ impl UsageRecorder {
                     s.outcome()
                 },
             },
-            raw,
+            captured,
         )
     }
 }
@@ -4658,7 +4732,7 @@ impl Drop for UsageRecorder {
             return;
         }
         let completed = self.scanner.lock().is_ok_and(|s| s.dropped_completed());
-        let (reading, raw) = self.reading(true);
+        let (reading, captured) = self.reading(true);
         let state = self.state.clone();
         let upstream = self.upstream.clone();
         // Cloned, not taken: an empty request side is a shape this type exists to
@@ -4688,7 +4762,8 @@ impl Drop for UsageRecorder {
                     &upstream,
                     &request,
                     if completed { "ok" } else { "abandoned" },
-                    Some(&raw),
+                    Some(&captured.bytes),
+                    captured.seen,
                     latency_ms,
                 )
                 .await;
@@ -4738,7 +4813,7 @@ fn wrap_usage_scan(
         claimed: false,
     };
     let finalize = futures::stream::once(async move {
-        let (reading, raw) = recorder.reading(false);
+        let (reading, captured) = recorder.reading(false);
         let latency_ms = recorder.start.elapsed().as_millis() as u64;
         record_llm_tokens(
             &recorder.state,
@@ -4754,7 +4829,8 @@ fn wrap_usage_scan(
             &recorder.upstream,
             &recorder.request,
             "ok",
-            Some(&raw),
+            Some(&captured.bytes),
+            captured.seen,
             latency_ms,
         )
         .await;
@@ -7770,6 +7846,7 @@ async fn stream_forward(
                 },
                 "error",
                 Some(text.as_bytes()),
+                text.len() as u64,
                 start.elapsed().as_millis() as u64,
             )
             .await;
@@ -11741,37 +11818,29 @@ mod tests {
         );
     }
 
-    /// 留底正文里抹掉的是密钥那一段，不是整条正文：整条丢掉等于把这次调用从留底里
-    /// 删掉，而"这里有一处密钥"本身是值得知道的事。
+    /// 副本的名字只由「内容 + 哪一侧」决定，所以同一份提示词重发一千次还是一个
+    /// 对象，而两侧即使字节完全相同也不会互相覆盖。
+    ///
+    /// 三条各挡一种写法：去掉内容哈希，重发就多一个对象；去掉侧别，一次请求与
+    /// 它的响应在字节恰好相同时共用一个名字；名字里再掺别的东西（时间、uuid），
+    /// 内容寻址就不成立了。
     #[test]
-    fn an_exchange_body_drops_the_credential_and_keeps_the_prompt() {
-        let raw = r#"{"api_key":"sk-abcdefghijklmnopqrstuvwx","text":"keep me"}"#;
-        let redacted = redact_exchange(raw);
-        assert!(redacted.contains("keep me"), "{redacted}");
-        assert!(!redacted.contains("abcdefghijklmnopqrstuvwx"), "{redacted}");
-        assert!(redacted.contains("[redacted]"), "{redacted}");
-        // 反方向：一句没有密钥的正文原样留下。少了这格，抹掉一切也能让上面全绿。
-        let plain = r#"{"messages":[{"role":"user","content":"hello"}]}"#;
-        assert_eq!(redact_exchange(plain), plain);
-    }
-
-    /// 上限要到**字符边界**上切：PostgreSQL 的 TEXT 拒半截 UTF-8，而 1 MiB 的截断
-    /// 正好会切在中文中间。
-    #[test]
-    fn a_capped_body_is_cut_on_a_character_boundary_and_flagged() {
-        let raw = "中".repeat(10).into_bytes();
-        let (text, cut) = capped_body(&raw, 4);
-        assert!(cut, "超过上限必须标出来");
-        assert_eq!(text, "中");
-        // 恰好等于上限：不截断、也不标记。少了这格，`>` 写成 `>=` 也全绿。
-        let exact = "abcd".as_bytes().to_vec();
-        let (text, cut) = capped_body(&exact, 4);
-        assert!(!cut);
-        assert_eq!(text, "abcd");
-        // 空 body 与"没有 body"是两回事：前者留一行空正文，后者才是不写。
-        let (text, cut) = capped_body(b"", 4);
-        assert!(!cut);
-        assert_eq!(text, "");
+    fn an_exchange_body_is_named_by_its_content_and_its_side() {
+        let sha = "a".repeat(64);
+        assert_eq!(
+            exchange_raw_id("request", &sha),
+            exchange_raw_id("request", &sha)
+        );
+        assert_ne!(
+            exchange_raw_id("request", &sha),
+            exchange_raw_id("response", &sha)
+        );
+        assert_ne!(
+            exchange_raw_id("request", &sha),
+            exchange_raw_id("request", &"b".repeat(64))
+        );
+        // 名字里不许出现路径分隔符：那会变成对象存储里的目录，下一次列表就数不到它。
+        assert!(!exchange_raw_id("request", &sha).contains('/'));
     }
 
     /// 上游自述过何时恢复时，任何"已成定论"的状态码都降级成一次等待；没自述过
@@ -13034,6 +13103,7 @@ mod tests {
             gitee_oauth_client_secret: None,
             github_oauth_client_id: None,
             github_oauth_client_secret: None,
+            memory_api_base: None,
             webhook_port: 8082,
             metrics_port: 9090,
             github_webhook_secret: None,

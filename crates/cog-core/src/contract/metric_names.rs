@@ -262,6 +262,17 @@ metric_names! {
     LLM_EXCHANGE_BYTES => "gateway_llm_exchange_bytes",
     LLM_EXCHANGE_SWEEP_FAILED => "gateway_llm_exchange_sweep_failed",
 
+    // The other half of that archive: the bodies themselves.
+    //
+    // `gateway_llm_exchange` is an index -- hash, byte counts and a reference --
+    // and the bytes it names live in the memory Raw layer, which no sweep
+    // touches. A write that fails leaves the row pointing at nothing, and the
+    // row alone cannot say so to anybody who was not already looking at it: the
+    // column is NULL for a call that had no body at all, exactly as it is for
+    // one whose body could not be stored. This counter is the difference, and
+    // it carries the cause because each one has a different repair.
+    LLM_EXCHANGE_BODY_UNARCHIVED_TOTAL => "cogneva_llm_exchange_body_unarchived_total",
+
     // cog-observability — the token ledger's retention, and what it may not
     // retire.
     //

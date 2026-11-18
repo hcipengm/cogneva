@@ -102,6 +102,13 @@ spec:
                   name: cogneva-secrets-oob
                   key: search-fallback-upstreams
                   optional: true
+            # 内存 Raw 层的面：每次 LLM 调用的请求字节与回来的字节整份归档到这里，
+            # 留底表只留索引（哈希、字节数、指针）。指向主应用的**内部端口**，
+            # 与业务 Pod 那一份同源——正文的存放处只有一个，两边各配一个地址就会
+            # 出现「写入落在 A、读取去 B」。缺这个值＝正文没有永久副本，读数里带
+            # unconfigured 的原因。
+            - name: COGNEVA_MEMORY_API_BASE
+              value: {{ printf "http://cogneva:%d" (int .Values.gateway.internalPort) | quote }}
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:

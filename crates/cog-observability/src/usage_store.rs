@@ -590,33 +590,63 @@ BEGIN
     END IF;
 END
 $mig$;
--- The exchange itself: the bytes we sent and the bytes that came back. The
--- usage row above answers "how much did this call cost"; it cannot answer
--- "what was asked", so a re-run, a duplicate count, a context breakdown or a
--- regression against an old prompt all had to be re-bought from the upstream.
--- Kept in its own table rather than in the ledger row because the ledger is
--- read by the pacing pass on every window boundary and must stay narrow; the
--- bodies are read rarely and only by a person asking a question about a
--- specific call.
+-- The exchange itself: the index of the bytes we sent and the bytes that came
+-- back. The usage row above answers "how much did this call cost"; it cannot
+-- answer "what was asked", so a re-run, a duplicate count, a context breakdown
+-- or a regression against an old prompt all had to be re-bought from the
+-- upstream. Kept in its own table rather than in the ledger row because the
+-- ledger is read by the pacing pass on every window boundary and must stay
+-- narrow; the exchanges are read rarely and only by a person asking a question
+-- about a specific call.
+--
+-- The bodies are not here. This row is swept at the deployment's retention and
+-- sits in the table the nightly backup copies, so text kept here lasts only as
+-- long as both allow; the copies live in the memory Raw layer, which no sweep
+-- touches, and these two columns name them. What stays is what a reader needs
+-- without fetching: the hash of each side, how many bytes each side was, and
+-- how many the copy holds.
 CREATE TABLE IF NOT EXISTS gateway_llm_exchange (
-    id              UUID PRIMARY KEY,
-    ts              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    upstream        TEXT NOT NULL,
-    api_style       TEXT NOT NULL,
-    model           TEXT NOT NULL,
-    actor           TEXT NOT NULL DEFAULT 'unknown',
-    origin          TEXT NOT NULL DEFAULT 'unknown',
-    task_id         TEXT,
-    result          TEXT NOT NULL,
-    latency_ms      BIGINT NOT NULL DEFAULT 0,
-    request_sha256  TEXT NOT NULL,
-    response_sha256 TEXT,
-    request_bytes   BIGINT NOT NULL DEFAULT 0,
-    response_bytes  BIGINT NOT NULL DEFAULT 0,
-    request_body    TEXT,
-    response_body   TEXT,
-    truncated       TEXT NOT NULL DEFAULT ''
+    id                  UUID PRIMARY KEY,
+    ts                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    upstream            TEXT NOT NULL,
+    api_style           TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    actor               TEXT NOT NULL DEFAULT 'unknown',
+    origin              TEXT NOT NULL DEFAULT 'unknown',
+    task_id             TEXT,
+    result              TEXT NOT NULL,
+    latency_ms          BIGINT NOT NULL DEFAULT 0,
+    request_sha256      TEXT NOT NULL,
+    response_sha256     TEXT,
+    request_bytes       BIGINT NOT NULL DEFAULT 0,
+    response_seen_bytes BIGINT NOT NULL DEFAULT 0,
+    response_bytes      BIGINT NOT NULL DEFAULT 0,
+    request_raw         TEXT,
+    response_raw        TEXT
 );
+-- The table predates the split, and its older rows hold the only copy of their
+-- bodies: `request_body`, `response_body` and `truncated` are left in place on
+-- every database that already has them rather than dropped, because dropping
+-- the column would destroy the copy a sweep had not reached yet. New rows leave
+-- them NULL and name their copy in `request_raw`/`response_raw`.
+DO $mig$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'gateway_llm_exchange' AND column_name = 'request_raw'
+    ) THEN
+        ALTER TABLE gateway_llm_exchange ADD COLUMN request_raw TEXT;
+        ALTER TABLE gateway_llm_exchange ADD COLUMN response_raw TEXT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'gateway_llm_exchange' AND column_name = 'response_seen_bytes'
+    ) THEN
+        ALTER TABLE gateway_llm_exchange
+            ADD COLUMN response_seen_bytes BIGINT NOT NULL DEFAULT 0;
+    END IF;
+END
+$mig$;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_ts ON gateway_llm_exchange (ts);
 -- The hash index is what turns "did we already buy this exact prompt" from a
 -- full scan into a lookup; without it the question is only answerable for a
@@ -722,21 +752,23 @@ impl LlmUsageStore {
         Ok(())
     }
 
-    /// One exchange: the request bytes that went upstream and the response
+    /// One exchange: the index row for the bytes that went upstream and the
     /// bytes that came back.
     ///
-    /// The two hashes are over the **raw** bytes, before any redaction, so a
-    /// duplicate is a duplicate of what was actually sent. The bodies are the
-    /// redacted text, capped by the caller; `truncated` names which side was
-    /// cut, because a body that ends early and a body that ended at the
-    /// upstream look the same once stored.
+    /// The two hashes are over the **raw** bytes, so a duplicate is a
+    /// duplicate of what was actually sent. The bytes themselves are in the
+    /// memory Raw layer under the names in `request_raw`/`response_raw`; this
+    /// row is what outlives nothing but its own retention, and it is enough to
+    /// find the copy, to tell the two sides apart, and to see when a copy is
+    /// shorter than what came back (`response_seen_bytes` against
+    /// `response_bytes`).
     pub async fn record_exchange(&self, r: &LlmExchangeRecord) -> anyhow::Result<()> {
         sqlx::query(
             r#"
             INSERT INTO gateway_llm_exchange
                 (id, upstream, api_style, model, actor, origin, task_id, result,
                  latency_ms, request_sha256, response_sha256, request_bytes,
-                 response_bytes, request_body, response_body, truncated)
+                 response_seen_bytes, response_bytes, request_raw, response_raw)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             "#,
         )
@@ -752,10 +784,10 @@ impl LlmUsageStore {
         .bind(&r.request_sha256)
         .bind(r.response_sha256.as_deref())
         .bind(r.request_bytes as i64)
+        .bind(r.response_seen_bytes as i64)
         .bind(r.response_bytes as i64)
-        .bind(r.request_body.as_deref())
-        .bind(r.response_body.as_deref())
-        .bind(r.truncated.as_str())
+        .bind(r.request_raw.as_deref())
+        .bind(r.response_raw.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())

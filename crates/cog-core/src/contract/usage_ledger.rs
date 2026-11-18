@@ -437,7 +437,8 @@ pub struct LlmUsageRecord {
     pub pace: Option<PaceEvidence>,
 }
 
-/// One LLM exchange, bodies included.
+/// One LLM exchange: what was asked, what came back, and where the permanent
+/// copy of each sits.
 ///
 /// The usage record beside it answers "how much"; this answers "what was
 /// asked and what came back". They are separate rows in separate tables
@@ -445,6 +446,14 @@ pub struct LlmUsageRecord {
 /// consumers: pacing and billing read the usage row on every window boundary
 /// and must not pay for text they never look at, while a person asking why a
 /// run burned 850k tokens reads one exchange and nothing else.
+///
+/// The bytes themselves do not live in this row. The row is swept at the
+/// deployment's retention and the table is read by the nightly backup, so a
+/// body here lasts as long as both allow; the copies are written to the memory
+/// Raw layer, which outlives every sweep, and this row is the index that names
+/// them. That split is also what makes the two sides comparable: the sizes and
+/// hashes stay here, so a reader can tell a short body from one this process
+/// could not hold without fetching either.
 #[derive(Debug, Clone)]
 pub struct LlmExchangeRecord {
     pub upstream: String,
@@ -457,22 +466,33 @@ pub struct LlmExchangeRecord {
     /// `error` (the upstream answered with a non-2xx body).
     pub result: String,
     pub latency_ms: u64,
-    /// SHA-256 of the exact bytes sent upstream, before redaction.
+    /// SHA-256 of the exact bytes sent upstream.
     pub request_sha256: String,
     /// SHA-256 of the response bytes; `None` when no response body existed.
     pub response_sha256: Option<String>,
+    /// How many bytes went upstream.
     pub request_bytes: u64,
+    /// How many response bytes this process **saw**. Separate from
+    /// [`Self::response_bytes`] because the two answer different questions:
+    /// the captured count says how much the copy holds, and this one says how
+    /// much came back. A stream the gateway stops holding after a prefix leaves
+    /// the two unequal, and that inequality is the only trace of the bytes no
+    /// copy has.
+    pub response_seen_bytes: u64,
+    /// How many response bytes the permanent copy holds. Equal to
+    /// [`Self::response_seen_bytes`] unless the capture was cut, and `0` when
+    /// there was no body at all.
     pub response_bytes: u64,
-    /// Redacted text, capped by the caller and marked in `truncated` when it
-    /// was cut. `None` is the shape a caller uses when there were no bytes at
-    /// all -- a request path that builds no body of its own, for instance --
-    /// and is therefore distinct from `Some("")`, which is a body that was
-    /// empty. Both the size and the hash are taken before the cut, so a reader
-    /// can tell a short body from a long one that was clipped.
-    pub request_body: Option<String>,
-    pub response_body: Option<String>,
-    /// Which side was dropped for size: `""`, `request`, `response`, `both`.
-    pub truncated: String,
+    /// The permanent copy of the bytes sent upstream, as the reference a reader
+    /// fetches it back by. `None` means no copy was made -- nothing is stored
+    /// under a name nobody can name.
+    ///
+    /// The id is the hash of the bytes, so one prompt sent a thousand times is
+    /// one object; the row still records each call, because which call sent it
+    /// is what the row is for.
+    pub request_raw: Option<String>,
+    /// The permanent copy of the response bytes `response_bytes` counts.
+    pub response_raw: Option<String>,
 }
 
 /// One upstream's quota window as the ledger tells it.

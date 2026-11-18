@@ -426,7 +426,7 @@ spec:
               value: {{ printf "http://cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort) | quote }}
             - name: COGNEVA_GIT_PROXY_BASE
               value: {{ printf "http://cogneva-security-gateway:%d/git" (int .Values.securityGateway.llmProxyPort) | quote }}
-            # 内存 Raw 层的面（归档工具的巨量输出 + 取引用读回），零凭证。指向主应用
+            # 内存 Raw 层的面（每次工具调用整份归档 + 取引用读回），零凭证。指向主应用
             # 的**内部端口** 8085，不是主 API 的 8080：8080 上那几条按角色判，本 Pod
             # 零凭证恒吃 401。本 Pod 的 egress 是白名单，少了 network-policy 里那一条
             # 端口放行，归档请求会被静默丢弃。与主应用那份同源。

@@ -26,7 +26,7 @@ spec:
       annotations:
         # 同主应用：这个 Pod 也挂 cogneva-json、也经 envFrom 取 cogneva-config，
         # 两份配置里任何一份变了它都得跟着重启，否则进程读到的仍是启动时那份。
-        checksum/config: 9d8802bf4795b0f4cf4906a68d4c78e584a7f88e4e0835e1b5ccc91531a22421
+        checksum/config: af3e155e1f015be2bc568fa87edb38b78222d6a33e2dc3bbc59f422688cd6ffe
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
@@ -255,7 +255,7 @@ spec:
               value: "http://cogneva-security-gateway:8081"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
-            # 内存 Raw 层的面（归档工具的巨量输出 + 取引用读回），零凭证。指向主应用
+            # 内存 Raw 层的面（每次工具调用整份归档 + 取引用读回），零凭证。指向主应用
             # 的**内部端口** 8085，不是主 API 的 8080：8080 上那几条按角色判，本 Pod
             # 零凭证恒吃 401。本 Pod 的 egress 是白名单，少了 network-policy 里那一条
             # 端口放行，归档请求会被静默丢弃。与主应用那份同源。
