@@ -1122,18 +1122,20 @@ mod tests {
     async fn a_child_that_goes_quiet_is_stopped_at_the_measured_window() {
         let _serial = async_test_lock().await;
         reset_for_tests();
-        seed_gaps_for_tests(Duration::from_millis(500), SAMPLE_FLOOR);
+        // 窗口必须宽于读数能分辨的两拍，否则判据把它抬到两拍（见
+        // [`crate::declared_wall::MIN_DISCERNIBLE_SILENCE`]），这条量到的就不是它自己播的种子。
+        seed_gaps_for_tests(Duration::from_millis(2500), SAMPLE_FLOOR);
 
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", "sleep 30"]);
         let started = std::time::Instant::now();
         match run_child_watched(cmd, "silent").await.expect("spawn") {
             ChildOutcome::Stalled { silent, window } => {
-                assert_eq!(window, Duration::from_millis(500));
+                assert_eq!(window, Duration::from_millis(2500));
                 assert!(silent > window, "a stop is silence past the window");
             }
             ChildOutcome::Exited(out) => panic!(
-                "a child silent for 30 s against a 500 ms window was not stopped: {:?}",
+                "a child silent for 30 s against a 2.5 s window was not stopped: {:?}",
                 out.status
             ),
         }
@@ -1263,13 +1265,14 @@ mod tests {
     fn the_youngest_channel_is_this_steps_age() {
         let _serial = test_lock();
         reset_for_tests();
-        seed_gaps_for_tests(Duration::from_millis(200), SAMPLE_FLOOR);
+        // 同一条下限：种子的宽度要够读数分辨（两拍），量到的才是这条用例想量的东西。
+        seed_gaps_for_tests(Duration::from_millis(2500), SAMPLE_FLOOR);
         beat("step");
 
         assert!(stall_any(&["step"]).is_none(), "刚记过的一拍不该被判停");
-        std::thread::sleep(Duration::from_millis(260));
+        std::thread::sleep(Duration::from_millis(2600));
         let (silent, bound) = stall_any(&["step"]).expect("静默超过实测界就该有判词");
-        assert_eq!(bound, Duration::from_millis(200));
+        assert_eq!(bound, Duration::from_millis(2500));
         assert!(silent > bound);
 
         // 对端报一次活，即使它不产生间隔样本，这一步也不再静默。

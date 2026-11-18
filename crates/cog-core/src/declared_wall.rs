@@ -44,6 +44,14 @@
 //! is the narrowest true statement available: nothing this system can observe
 //! has moved, for longer than anything it has ever observed while working.
 //!
+//! The bound a run judges against is never narrower than the reading that
+//! produces it can resolve ([`MIN_DISCERNIBLE_SILENCE`]: two ticks of
+//! [`cog_core::progress::WATCH_TICK`]). A measured extreme below that is the
+//! sampling grid itself, not a fact about the work — a deployment that recorded
+//! 1.0006 s while reading once a second killed a build that had missed a single
+//! tick. The raw measurement is still recorded and handed back unchanged; only
+//! the window a verdict is drawn at is lifted.
+//!
 //! The evidence clause is a closed loop, not a constant: a run adopts the bound
 //! the previous run measured ([`Bound::adopt`]), judges against it, and hands
 //! back its own extreme when it ends ([`Bound::observed`]). "Not measured yet"
@@ -80,10 +88,29 @@ pub enum Bound {
     Unmeasured,
 }
 
+/// 判停能分辨的最短静默：**两拍**。
+///
+/// 静默是每 [`crate::progress::WATCH_TICK`] 读一次读出来的。一拍之内，「这一拍没
+/// 看见动作」与「两次动作之间正好落在这一拍里」是同一幅样子，读数分辨不出来；要
+/// 分辨，至少得看满两拍都没有动作。所以界不许窄于两拍——窄于它，判的就不是进程停
+/// 没停，而是自己的采样格。
+///
+/// 这不是一个挑出来的数，是从读数节奏导出的：拍子变细，它可以跟着变细；拍子变粗，
+/// 它必须跟着变粗。
+pub const MIN_DISCERNIBLE_SILENCE: Duration =
+    Duration::from_secs(crate::progress::WATCH_TICK.as_secs() * 2);
+
 impl Bound {
     /// 这一跑现在能用的界：自己量到的，或者开工时采纳的上一次运行。
+    ///
+    /// 量到的极值可能小于读数能分辨的一拍（实测：一处部署记下过 1.0006 秒，而拍子
+    /// 是 1 秒——那正是采样格本身）。判据用这个数，所以这里把它抬到
+    /// [`MIN_DISCERNIBLE_SILENCE`]：量到的原始值仍然按原样记着、写回持久面，抬起来
+    /// 的只是**判停用的那个窗口**。
     pub fn now() -> Self {
-        longest_gap().map_or(Self::Unmeasured, Self::Measured)
+        longest_gap().map_or(Self::Unmeasured, |gap| {
+            Self::Measured(gap.max(MIN_DISCERNIBLE_SILENCE))
+        })
     }
 
     /// 这一跑**自己**量到的最长间隔——写回持久面的那个数，不含采纳值。
@@ -788,16 +815,58 @@ mod tests {
             "没有任何实测界时第二入口给出了判词：界是被人替测量挑出来的"
         );
 
-        Bound::Measured(Duration::from_millis(5)).adopt();
+        // 装上的界至少要是读数分辨得出来的那一个：五毫秒的界在一秒一读的表上
+        // 什么也证明不了，判据会把它抬到两拍（见 [`MIN_DISCERNIBLE_SILENCE`]）。
+        Bound::Measured(MIN_DISCERNIBLE_SILENCE).adopt();
         let (silent, bound) = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(6),
             wait_until_stalled(&["watched-by-law"]),
         )
         .await
         .expect("装上实测界之后就应当判停");
-        assert_eq!(bound, Duration::from_millis(5));
+        assert_eq!(bound, MIN_DISCERNIBLE_SILENCE);
         assert!(silent > bound);
         progress::reset_for_tests();
+    }
+
+    /// 一拍没看见动作不是停。
+    ///
+    /// 现网实测的形状：界是 1.0006 秒（正是采样格），构建在静默 1.0019 秒时被杀——
+    /// 它只不过有一拍没烧掉一个时钟滴答。这条用例把那个形状钉住：界量到 1.0006 秒、
+    /// 静默 1.2 秒，判词必须是「不停」。
+    #[tokio::test]
+    async fn one_quiet_reading_does_not_end_a_run() {
+        let _serial = crate::progress::async_test_lock().await;
+        crate::progress::reset_for_tests();
+        Bound::adopt(Bound::Measured(Duration::from_secs_f64(1.000_608_441)));
+        crate::progress::mark("quiet-for-one-tick");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            stall("quiet-for-one-tick"),
+            None,
+            "静默只有一拍多一点，判据却杀了一个还在跑的进程：界窄于读数能分辨的拍子"
+        );
+        crate::progress::reset_for_tests();
+    }
+
+    /// 判停窗口的下限是两拍，上限仍由实测值给：更长的实测值原样保留。
+    #[test]
+    fn the_window_is_never_narrower_than_the_reader_can_tell() {
+        let _serial = crate::progress::test_lock();
+        crate::progress::reset_for_tests();
+        crate::progress::adopt_longest_gap(Duration::from_secs_f64(1.000_608_441));
+        assert_eq!(
+            Bound::now().value(),
+            Some(MIN_DISCERNIBLE_SILENCE),
+            "量到的 1.0006 秒就是采样格本身，它不能成为判停窗口"
+        );
+        crate::progress::adopt_longest_gap(Duration::from_secs(42));
+        assert_eq!(
+            Bound::now().value(),
+            Some(Duration::from_secs(42)),
+            "更长的实测值不许被这条下限抹平"
+        );
+        crate::progress::reset_for_tests();
     }
 
     /// 读不到读数时不主张「没在动」。
