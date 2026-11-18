@@ -1716,9 +1716,9 @@ pub struct PoolObservability {
     pub alerts: Option<Arc<dyn PersistentAlertSink>>,
     /// 逐调用 token 计量明细（PG）。未配置数据库时 None，计量退化为指标+时序。
     pub usage: Option<Arc<dyn LlmUsageLedger>>,
-    /// 这本账最近是不是写不进去。落账是前台不等、后台 spawn 的写，所以它
-    /// 失败时请求路径上没有任何东西会红——只有这一格记着「连续失败到第几笔」，
-    /// 让告警只在进入/离开故障的那一刻各动一次。
+    /// 这本账最近是不是写不进去。落账在请求路径上写完才返回，失败在返回值里
+    /// 也看得见；但连续失败与恢复对读者是一件事（不是每一次），所以这一格记着
+    /// 「连续失败到第几笔」，让告警只在进入/离开故障的那一刻各动一次。
     pub usage_write_health: Arc<crate::usage_landing::WriteHealth>,
     /// 池读数的耐久面（共享 metrics store）。未配置数据库时为 None。
     durable: Option<Arc<DurableGauges>>,
@@ -2510,7 +2510,7 @@ async fn record_llm_call(
         owner,
         refusal_kind,
     ) {
-        land_usage_record(state, record);
+        land_usage_record(state, record).await;
     }
 }
 
@@ -2966,7 +2966,8 @@ async fn refuse_on_pace(
     land_usage_record(
         state,
         paced_refusal_usage(style, actor, origin, task, owner, evidence),
-    );
+    )
+    .await;
     Some(PaceRefusal {
         wait_secs,
         blocked_upstreams,
@@ -3054,7 +3055,8 @@ async fn task_budget_refusal(
                     owner,
                     refusal.wait_secs,
                 ),
-            );
+            )
+            .await;
             Some(refusal)
         }
         Err(e) => {
@@ -3319,7 +3321,8 @@ async fn owner_budget_refusal(
     land_usage_record(
         state,
         owner_budget_refusal_usage(style, actor, origin, task, &refusal),
-    );
+    )
+    .await;
     Some(refusal)
 }
 
@@ -3450,7 +3453,7 @@ fn owner_budget_refusal_usage(
 ///
 /// 调用点仍可以是新的，但**不许再直接调 `pool_circuit_break`**：那样绕开的是这一行，
 /// 而池全灭的窗口就会退回与"没有流量"同形。
-fn pooled_refusal(
+async fn pooled_refusal(
     state: &AppState,
     candidates: &[&LlmUpstream],
     style: &str,
@@ -3464,68 +3467,70 @@ fn pooled_refusal(
         land_usage_record(
             state,
             pooled_refusal_usage(style, actor, origin, task, owner, retry_after),
-        );
+        )
+        .await;
     }
     verdict
 }
 
-/// 台账写入异步化：流结束的调用方不该等一次 PG insert。
+/// 台账在请求路径上写完再返回：这一笔账是折叠面的正本，丢一行就是一段永远
+/// 读不出来的花销，而且它读起来与「那一段没人调用」完全同形。
 ///
-/// 异步的代价是这一笔的成败不在请求路径上——可这本账是折叠面的正本，丢一行
-/// 就是一段永远读不出来的花销，而且它读起来与「那一段没人调用」完全同形。
-/// 所以写在这里的不只是一次 insert：几笔之内重试（PG 重启与连接重置都在一秒
-/// 内自愈），失败连续到要放弃时经耐久告警面喊一次、恢复时关掉——见
-/// [`crate::usage_landing`]。
-fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
+/// 写在这里的不只是一次 insert：几笔之内重试（PG 重启与连接重置都在一秒内
+/// 自愈），失败连续到要放弃时经耐久告警面喊一次、恢复时关掉——见
+/// [`crate::usage_landing`]。每一次失败都在读数上留痕（`write_failed` /
+/// `no_ledger`），所以「答复已经发出而账没进库」不会只剩下一句日志。
+async fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
     let Some(store) = state.pool_obs.usage.clone() else {
         // 这一格只在部署里根本没配账本时走到（`database_url` 为空）：配了但连不上
         // 的部署拿到的是一个会自己接上的槽，那期间的失败走下面的 write_failed。
         // 这一种没有可等的下一次尝试——配置在启动时读，只有换一个 Pod 才会变——
         // 所以它自己成一条原因，而不是混进「写失败」里。
-        let state = state.clone();
-        tokio::spawn(async move {
-            record_counter(
-                &state,
-                cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
-                &[("reason", crate::usage_landing::NO_LEDGER_REASON)],
-            )
-            .await;
-        });
+        record_counter(
+            state,
+            cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+            &[("reason", crate::usage_landing::NO_LEDGER_REASON)],
+        )
+        .await;
         return;
     };
     let health = state.pool_obs.usage_write_health.clone();
     let alerts = state.pool_obs.alerts.clone();
-    let state = state.clone();
-    tokio::spawn(async move {
-        let outcome =
-            crate::usage_landing::persist_with_retry(crate::usage_landing::WRITE_ATTEMPTS, || {
-                store.record(&record)
-            })
-            .await;
-        match outcome {
-            Ok(_) => {
-                if health.note_landed() {
-                    resolve_ledger_write_alert(alerts).await;
-                }
-            }
-            Err((error, attempts)) => {
-                tracing::error!(
-                    error = %error,
-                    attempts,
-                    "LLM 计量明细落库失败：这一笔的花销不会进任何窗口"
-                );
-                record_counter(
-                    &state,
-                    cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
-                    &[("reason", crate::usage_landing::WRITE_FAILED_REASON)],
-                )
-                .await;
-                if health.note_lost() {
-                    fire_ledger_write_alert(alerts, attempts, &error.to_string()).await;
-                }
+    // **在请求路径上写完再返回**，不 spawn。
+    //
+    // 这一行是「这次调用花了多少」的唯一凭据；spawn 出去等于「答复发了，账在队列里
+    // 等写」。进程在两者之间死掉（滚动、OOM、节点回收），这笔花销就永远不进任何窗口
+    // ——而窗口正是限额、配速与告警的依据，缺一笔就是所有读数一起偏一点，偏得没有
+    // 痕迹。重试仍在这里：写不进去就把「丢了」记成读数与告警，而不是把「可能丢」
+    // 藏在成功路径里。
+    let outcome =
+        crate::usage_landing::persist_with_retry(crate::usage_landing::WRITE_ATTEMPTS, || {
+            store.record(&record)
+        })
+        .await;
+    match outcome {
+        Ok(_) => {
+            if health.note_landed() {
+                resolve_ledger_write_alert(alerts).await;
             }
         }
-    });
+        Err((error, attempts)) => {
+            tracing::error!(
+                error = %error,
+                attempts,
+                "LLM 计量明细落库失败：这一笔的花销不会进任何窗口"
+            );
+            record_counter(
+                state,
+                cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+                &[("reason", crate::usage_landing::WRITE_FAILED_REASON)],
+            )
+            .await;
+            if health.note_lost() {
+                fire_ledger_write_alert(alerts, attempts, &error.to_string()).await;
+            }
+        }
+    }
 }
 
 /// 计量写不进去时，在耐久告警面上开一行。
@@ -4199,7 +4204,8 @@ async fn record_llm_tokens(
             // 真实调用的一行：配速没参与这一次的判定。
             pace: None,
         },
-    );
+    )
+    .await;
 }
 
 /// 把这次调用的两边字节落进留底表。
@@ -4277,13 +4283,19 @@ async fn record_exchange(
         request_inline,
         response_inline,
     };
-    // 与用量行同一条写法：spawn 出去。留底挂在响应流的尾巴上，而调用方的流要到
-    // 这里返回才真正结束——为一次诊断写入多等一个往返，等于让每个用户替观测买单。
-    tokio::spawn(async move {
-        if let Err(e) = store.record_exchange(&record).await {
-            tracing::warn!(error = %e, "LLM 调用留底写入失败（用量台账不受影响）");
-        }
-    });
+    // **在请求路径上写完再返回**，不 spawn。
+    //
+    // spawn 出去的意思是：调用方已经拿到答复，而那一行还在队列里等写。进程在这之间
+    // 死掉（滚动、OOM、节点回收），这一次调用的账与它指向的正文引用就一起消失——
+    // 正文在归档里还有一份，但「谁在什么时候花了多少」再也对不上。留下这一行是这
+    // 条路径存在的全部理由，它不能是「大概率会写成」。
+    //
+    // 代价是一行 INSERT 的往返（本机库、毫秒级），而它换的是「答复发出 ⇒ 账已落地」。
+    // 真到了这一毫秒也付不起的时候，正确的改法是本地只追加暂存 + 搬运器（读一次
+    // 不丢），不是继续 spawn——那是把「可能丢」藏在成功路径里。
+    if let Err(e) = store.record_exchange(&record).await {
+        tracing::warn!(error = %e, "LLM 调用留底写入失败（用量台账不受影响）");
+    }
 }
 
 /// 从一条 SSE `data:` 负载或非流式 JSON body 里提取 token usage。
@@ -7325,7 +7337,8 @@ async fn stream_forward(
                     task.as_deref(),
                     owner.as_deref(),
                 ),
-            );
+            )
+            .await;
             record_counter(
                 &state,
                 cog_core::metric_names::LLM_CALLS_TOTAL,
@@ -7429,7 +7442,9 @@ async fn stream_forward(
         &origin,
         task.as_deref(),
         owner.as_deref(),
-    ) {
+    )
+    .await
+    {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
             // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
@@ -8641,7 +8656,9 @@ async fn call_llm(
         None,
         // 网关自己的意图判定不发在任何人名下：它没有请求方声明的人。
         None,
-    ) {
+    )
+    .await
+    {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
             // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
@@ -14349,7 +14366,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "interactive",
             None,
             None,
-        );
+        )
+        .await;
         let (wait, _) = verdict.expect("全灭时判定仍为真：落账不许改判定");
         assert!(wait >= 60, "重试窗下界照旧，落账没有把它挪走");
     }
@@ -19814,8 +19832,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         /// 任务图上这件活的归属。`None` 是「图里没有这件活」。
         attribution: Option<cog_core::TaskAttribution>,
         failing: bool,
-        /// 落进来的用量行，按到达顺序。`record` 在别的任务上跑，所以这格必须
-        /// 是可共享的；读它的人在测试里轮询到第一行为止。
+        /// 落进来的用量行，按到达顺序。`record` 在请求路径上跑（不 spawn），所以
+        /// 读它的人返回后立刻就能读到；读不到就是「答复早于账」。
         records: std::sync::Mutex<Vec<cog_core::LlmUsageRecord>>,
     }
 
@@ -20181,18 +20199,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         land_usage_record(
             &state,
             pooled_refusal_usage("openai", "a", "cli", None, None, 5),
-        );
+        )
+        .await;
 
-        // 计数写在派生的任务里（落库那条路本来就不在请求路径上等），等它落地。
-        let mut samples = Vec::new();
-        for _ in 0..100 {
-            samples =
-                metrics.matching(cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL.as_str());
-            if !samples.is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        // 一次 yield 都不让：这条读数与落账在同一条路径上，返回时就该在。
+        let samples =
+            metrics.matching(cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL.as_str());
         assert_eq!(
             samples.len(),
             1,
@@ -20203,6 +20215,40 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             samples[0].labels.get("reason").map(String::as_str),
             Some("no_ledger"),
             "原因要分开：没有账本与写不进去，修法相反"
+        );
+    }
+
+    /// 答复发出时，这一笔账已经在库里。
+    ///
+    /// 账本这条写在请求路径上，不 spawn：spawn 出去等于「答复发了，账在队列里等写」，
+    /// 进程在两者之间死掉（滚动、OOM、节点回收），这笔花销就永远不进任何窗口——而
+    /// 窗口正是限额、配速与告警的依据。这条用例判的是**次序**，不是「最终会写成」：
+    /// 读完立刻读账本，读到零行说明答复早于账。
+    #[tokio::test]
+    async fn the_usage_row_is_landed_before_the_answer_leaves() {
+        let ledger = Arc::new(StubLedger::with(&[], &[]));
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let metrics = state.pool_obs.metrics.clone();
+        let write_health = state.pool_obs.usage_write_health.clone();
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics,
+            analytics: None,
+            alerts: None,
+            usage: Some(ledger.clone() as Arc<dyn cog_core::LlmUsageLedger>),
+            usage_write_health: write_health,
+            durable: None,
+        });
+
+        land_usage_record(
+            &state,
+            pooled_refusal_usage("openai", "a", "cli", None, None, 5),
+        )
+        .await;
+
+        assert_eq!(
+            ledger.records().len(),
+            1,
+            "答复返回时这一笔账应当已经在库里；零行说明它被派到别的任务上去了"
         );
     }
 

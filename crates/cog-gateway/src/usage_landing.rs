@@ -1,17 +1,18 @@
 //! What happens when the token ledger cannot be written.
 //!
-//! The insert is spawned rather than awaited: a caller whose stream has already
-//! finished must not wait on PostgreSQL. The price of that is the one failure in
-//! this pipeline that leaves no reading of its own. The hourly fold is computed
-//! from these rows, so a row that never landed is not a late number — it is
-//! spend that no window will ever count, and the hour reads exactly like an hour
-//! with that many fewer calls. Nothing downstream can tell the difference, which
-//! is why the loss has to be answered for at the write itself.
+//! The insert is awaited on the request path, not spawned: a spawned write means
+//! the answer has already left while the row is still queued, and a process that
+//! dies in between (roll, OOM, node drain) loses that call's spend for good. The
+//! hourly fold is computed from these rows, so a row that never landed is not a
+//! late number — it is spend that no window will ever count, and the hour reads
+//! exactly like an hour with that many fewer calls. Nothing downstream can tell
+//! the difference, which is why the loss has to be answered for at the write
+//! itself.
 //!
 //! Two things do that. The write is retried a few times with backoff, because
 //! what fails here in practice is a restart or a connection reset, and those
-//! clear within a second; a spawn that gives up on the first error turns a
-//! sub-second PG hiccup into permanently missing spend. And a streak of failures
+//! clear within a second; giving up on the first error turns a sub-second PG
+//! hiccup into permanently missing spend. And a streak of failures
 //! drives a durable alert through the same sink the pool alert uses, resolved by
 //! the first write that lands — a metering outage is a thing someone has to be
 //! told about while it is happening, not something to be inferred later from an
