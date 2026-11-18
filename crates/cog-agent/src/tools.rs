@@ -723,12 +723,26 @@ impl ToolRegistry {
                                 }
                             }
                             if code == 0 {
-                                let window =
-                                    read_window(&stdout, offset, limit, page_chars - spent);
-                                spent += window["content"]
+                                let remaining = page_chars.saturating_sub(spent);
+                                let whole = read_window(&stdout, offset, limit, usize::MAX);
+                                let wanted = whole["content"]
                                     .as_str()
                                     .map(|content| content.chars().count())
                                     .unwrap_or(0);
+                                // 半页不给：一份文件的正文若装不进剩下的预算，就在它自己
+                                // 那一项里说清没读，让调用方单独再要一次。给半页读起来像
+                                // 「这文件就这么长」，而调用方没有任何读性能分辨这两件事。
+                                if wanted > remaining {
+                                    files.push(serde_json::json!({
+                                        "path": path,
+                                        "error": "not read: this batch already used the turn's \
+                                                  tool-result budget; ask for this file in its \
+                                                  own call",
+                                    }));
+                                    continue;
+                                }
+                                let window = whole;
+                                spent += wanted;
                                 let mut entry = serde_json::Map::new();
                                 entry.insert("path".into(), serde_json::json!(path));
                                 if let Some(fields) = window.as_object() {
@@ -1759,9 +1773,13 @@ mod tests {
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
         let page_chars = registry.page_chars();
-        // 例如一份 40KB 的样本、一行约 200 字符：这样三份加起来远超一页。
-        let body: String = (0..200)
-            .map(|i| format!("{} {i}\n", "y".repeat(190)))
+        // 每份按「一页的三分之二」造：两份就把预算吃光，第三份进不来。份量从
+        // 预算算，不写死一个字符数——预算随窗口走，写死的那个数迟早不再是「远
+        // 超一页」，于是这条用例会在某次窗口调整后变成一条什么也没测的绿。
+        let per_file = page_chars;
+        let line = 200;
+        let body: String = (0..(per_file / line).max(1))
+            .map(|i| format!("{} {i}\n", "y".repeat(line - 8)))
             .collect();
         let paths: Vec<String> = (0..3)
             .map(|i| {
@@ -2092,12 +2110,21 @@ mod tests {
             .unwrap();
         assert_eq!(first["total_lines"], 8);
         assert_eq!(first["has_more"], true);
-        assert_eq!(
-            first["content"].as_str().unwrap().lines().count(),
-            3,
-            "三万字符一页：三行就够，第四行会把它推到 40000"
+        // 一页能装几行由预算算出来，不写死：预算随窗口走，而这条用例问的是
+        // 「按字符停」这件事本身，不是某个特定窗口下的页大小。
+        let page_chars = registry.page_chars();
+        let page = first["content"].as_str().unwrap();
+        let lines = page.lines().count();
+        assert!(
+            page.chars().count() <= page_chars,
+            "一页 {} 字符超过了预算 {page_chars}",
+            page.chars().count()
         );
-        assert_eq!(first["next_offset"], 4);
+        assert!(
+            lines * 10_000 > page_chars - 10_000,
+            "这一页应当装到「再加一行就超」为止：{lines} 行、预算 {page_chars}"
+        );
+        assert_eq!(first["next_offset"], lines + 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

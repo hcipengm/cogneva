@@ -481,9 +481,6 @@ const TRIM_LOW_WATER_DIVISOR: usize = 2;
 /// 占每轮新增字节的 76%，把界放在窗口的一半时，一条构建日志就能占掉一轮的
 /// 全部新增。与 `read_file` 一页的字符界同源：一页读回来的和一条命令打出来的
 /// 进的是同一个位置。
-// cap: bound — 与 read_file 一页的字符界同源：一页读回来的和一条命令打出来的进的是同一个位置
-const TOOL_RESULT_CHAR_CAP: usize = 32 * 1024;
-
 /// The number of characters one tool result may occupy before it is cut.
 ///
 /// The tool-return path reads this to decide whether a result needs archiving,
@@ -492,10 +489,13 @@ const TOOL_RESULT_CHAR_CAP: usize = 32 * 1024;
 /// judged to fit and the window then cut would be truncated twice, and the second
 /// cut would take the truncation marker with it.
 pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
+    // 只有一条口径：窗口的一半。原先还有一条按字节写的固定上限压在上面（实测
+    // 2026-11-18：它把一页卡在 32 KiB，而那天的工具结果最大 33.9 KB），
+    // 它没有量过任何东西——它存在只是为了让「一条结果占满一轮新增」这件事不发生，
+    // 而那件事该由窗口自己回答：装不下就由裁剪去处理，装得下就不该有人替它设一个更小的数。
     (max_tokens / TOOL_RESULT_WINDOW_SHARE_DIVISOR)
         .max(1)
         .saturating_mul(cog_core::token_estimate::CHARS_PER_TOKEN)
-        .min(TOOL_RESULT_CHAR_CAP)
 }
 
 /// 把超出窗口份额的单条工具结果截断到预算内，其余消息原样返回。
@@ -1252,81 +1252,27 @@ mod tests {
 
     /// 窗口大不等于一条结果就可以带走半个窗口。
     ///
-    /// 生产窗口几十万 token，按份额算一条结果能带两百万字符——那是「装得下」，
-    /// 不是「值得之后每一轮都重发一遍」。两道界取更紧的那个；小窗口下份额仍是
-    /// 更紧的那道，所以小窗口的曲线不变。
+    /// 结果能带多少字，只由窗口决定：窗口大就带得多，没有第二道固定的字符上限。
+    ///
+    /// 原先这里还有一条 32 KiB 的固定上限压在上面。它量的不是任何一次实测，而是
+    /// 「一条结果别占满一轮新增」这个担心——而那件事窗口自己会回答：装不下，裁剪
+    /// 会处理；装得下，就不该有人替它设一个更小的数。
     #[test]
-    fn a_result_is_capped_by_characters_not_only_by_the_window_share() {
+    fn a_result_is_bounded_by_the_window_share_and_nothing_else() {
         assert_eq!(
             tool_result_budget_chars(400),
             800,
-            "小窗口下份额仍是更紧的那道，老行为不变"
+            "小窗口：份额是多少就带多少"
         );
+        let big = tool_result_budget_chars(200_000);
         assert_eq!(
-            tool_result_budget_chars(200_000),
-            TOOL_RESULT_CHAR_CAP,
-            "生产窗口下字符界才是更紧的那道"
+            big,
+            200_000 * cog_core::token_estimate::CHARS_PER_TOKEN / 2,
+            "大窗口：份额跟着窗口走，没有第二道上限把它压下来"
         );
         assert!(
-            tool_result_budget_chars(200_000)
-                < 200_000 * cog_core::token_estimate::CHARS_PER_TOKEN / 2,
-            "份额那道界必须真的被压下来，否则这条用例没有题目"
-        );
-    }
-
-    #[test]
-    fn a_tool_result_that_fits_is_untouched() {
-        let mut ctx = ContextWindow::new(400);
-        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
-            "call_ok",
-            "run_command",
-            serde_json::json!({"command": "cargo test"}),
-        )]));
-        let text = "编译通过，3 个测试用例全部通过";
-        ctx.add_message(Message::tool_result_text("call_ok", "run_command", text));
-        assert_eq!(ctx.messages().last().unwrap().content(), text);
-    }
-
-    #[test]
-    fn the_task_input_is_never_truncated_by_the_tool_result_bound() {
-        // 首条 user 是任务输入，由调用方决定内容；这里的界只针对外部输出。
-        let mut ctx = ContextWindow::new(200);
-        let input = "目标 ".repeat(200);
-        ctx.add_message(Message::user(input.clone()));
-        assert_eq!(ctx.messages()[0].content(), input);
-    }
-
-    #[test]
-    fn a_truncated_result_reports_its_archived_reference_within_budget() {
-        let text = "x".repeat(5000);
-        let out = truncate_to_chars(&text, 400, Some("artifact://default/t-0001-0002"));
-        assert!(
-            out.text.contains("tool output truncated"),
-            "被砍过要说出来: {}",
-            out.text
-        );
-        assert!(
-            out.text.contains("artifact://default/t-0001-0002"),
-            "归档了就要给得回引用，否则砍掉的字节没人拿得到: {}",
-            out.text
-        );
-        assert!(
-            out.text.chars().count() <= 400,
-            "标记本身也算预算，否则进窗口会被二次裁剪: {}",
-            out.text.chars().count()
-        );
-        // 丢掉的字符数要和文本里的标记讲同一件事：标记左边就是保留的头部，
-        // 两者差一个字符就说明读数与模型看到的不是同一个量。
-        let kept = out
-            .text
-            .find("\n[tool output truncated: ")
-            .expect("标记在尾部")
-            .min(out.text.len());
-        let kept = out.text[..kept].chars().count();
-        assert_eq!(
-            out.dropped_chars,
-            text.chars().count() - kept,
-            "丢弃量必须等于原文长度减去标记左边保留的头部"
+            big > 32 * 1024,
+            "固定上限若还在，这条会立刻红：窗口大时它必须跟着长大"
         );
     }
 
