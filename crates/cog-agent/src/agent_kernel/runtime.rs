@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::context::{truncate_to_chars, ContextWindow};
+use crate::context::ContextWindow;
 use crate::hooks::LifecycleHookEvent;
 use crate::tools::{ToolRegistry, ToolRunError};
 
@@ -2395,21 +2395,34 @@ impl AgentRuntime {
             return Message::tool_result_text(tool_call_id, tool_name, &stub);
         }
         let budget = self.context.tool_result_budget_chars();
-        if text.chars().count() <= budget {
+        let size = text.chars().count();
+        if size <= budget {
             return Message::tool_result_text(tool_call_id, tool_name, &text);
         }
-        // Oversized: the model gets a prefix and a marker. The cut is made once,
-        // with whatever reference the archive returned, because the reference
-        // changes the marker's length and the marker is charged to the same
-        // budget -- a cut made without it would keep characters the model will
-        // not actually be shown.
-        let cut = truncate_to_chars(&text, budget, reference.as_deref());
+        // 装不下：**不给半份**，明确拒绝，并说清怎么缩小。
+        //
+        // 半个结果读起来像「这份文件就这么长」：模型不会知道自己少看了一截，于是
+        // 基于半份信息下判断。而给一个引用让它再取一次，等于让每一条大结果都多花一
+        // 轮往返与 token，且它仍然要自己意识到「我看的是摘录」。两种都比「明说没给、
+        // 请按范围重取」贵。这里因此只返回一条拒绝：尺寸、预算、可用的缩小办法。
+        //
+        // 拒绝不丢信息：这次调用的参数与完整结果已经归档（`archive_tool_call`），
+        // 事后读的人拿得到整份；拒绝只影响这一轮给模型看到什么。
         if let Some(archive) = &self.tool_output_archive {
-            archive
-                .record_truncation(tool_name, cut.dropped_chars)
-                .await;
+            // 计数沿用「被截掉多少字符」这一族：这里的含义是「整份都没给」。
+            archive.record_truncation(tool_name, size).await;
         }
-        Message::tool_result_text(tool_call_id, tool_name, cut.text)
+        let refusal = format!(
+            "not delivered: this result is {size} characters and this turn's tool-result \
+             budget is {budget}. Nothing was cut and nothing was shown, so a decision must not \
+             be made from this call. Narrow the request instead: read_file takes offset/limit, \
+             and run_command can use head/tail/grep/sed -n. The whole result is archived{}.",
+            reference
+                .as_deref()
+                .map(|uri| format!(" under {uri}"))
+                .unwrap_or_default()
+        );
+        Message::tool_result_text(tool_call_id, tool_name, &refusal)
     }
 
     /// Write one tool call's record to the permanent Raw layer and return the
@@ -8731,30 +8744,31 @@ mod tests {
             .map(|m| m.content())
             .collect::<Vec<_>>()
             .join("\n---\n");
+        // 装不下的结果是**明说没给**，不是给半份：文本里既要有拒绝，也要有缩小办法。
         assert!(
-            joined.contains(&expected_id),
-            "标记里必须带得回引用，否则砍掉的尾巴没人拿得到: {joined}"
+            joined.contains("not delivered"),
+            "装不下的结果必须明说没给，而不是悄悄变成半份: {joined}"
         );
         assert!(
-            joined.contains("tool output truncated"),
-            "被砍过必须在文本里自己说出来: {joined}"
+            joined.contains("offset/limit") && joined.contains("head/tail/grep"),
+            "拒绝里要给出缩小请求的办法: {joined}"
+        );
+        assert!(
+            !joined.contains("tool output truncated"),
+            "不再有「截断后给出前缀」这条路: {joined}"
+        );
+        assert!(
+            joined.contains(&expected_id),
+            "整份结果仍在归档里，拒绝只是说这一轮没给: {joined}"
         );
 
         let truncations = archive.truncations.lock().unwrap().clone();
-        assert_eq!(truncations.len(), 1, "一次超大输出，正好记一次截断");
+        assert_eq!(truncations.len(), 1, "一次装不下的结果，正好记一次");
         assert_eq!(truncations[0].0, "bigdump");
-        // 记下的字符量要和标记里报的是同一件事：标记左边就是保留下来的头部。
-        let shown: usize = joined
-            .split("[tool output truncated: showing ")
-            .nth(1)
-            .and_then(|rest| rest.split(" of ").next())
-            .and_then(|n| n.parse().ok())
-            .expect("标记里写着保留了多少字符");
         assert_eq!(
             truncations[0].1,
-            expected.chars().count() - shown,
-            "记录的丢弃量必须是原文长度减去标记里报的保留数；带引用时标记更长，\
-             保留数因此更小，这个数不能按不带引用的标记算"
+            expected.chars().count(),
+            "记的是「整份都没给」，不是「砍掉了尾巴多少」"
         );
     }
 
