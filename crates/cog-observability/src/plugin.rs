@@ -744,6 +744,16 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 sweep = sweep.with_metrics(mb);
             }
+            // 归档层：只有它能证明「这一行的正文在别处还有一份」。挂不上时这一遍
+            // 一行也不删（`kept_unarchived` 会把它记出来），而不是把唯一的副本删掉。
+            if let Some(archive) = ctx.consume_service::<dyn cog_core::ObjectBackend>() {
+                sweep = sweep.with_archive(archive);
+            } else {
+                tracing::warn!(
+                    "no object archive published; the exchange retention will keep every row \
+                     rather than delete the only copy of a body"
+                );
+            }
             drop(Arc::new(sweep).spawn(shutdown));
         }
 

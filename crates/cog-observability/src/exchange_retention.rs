@@ -108,6 +108,9 @@ pub struct RetentionOutcome {
     /// Whether `keep_secs` came from this beat's measurements rather than from
     /// the deployment's seed.
     pub keep_derived: bool,
+    /// Rows the pass did **not** retire because no copy of their body was
+    /// verified in the archive. Each one is the only copy of what it holds.
+    pub kept_unarchived: u64,
 }
 
 /// The retention sweep: the archive's table, the pool it lives on, and the age
@@ -125,6 +128,9 @@ pub struct ExchangeRetention {
     metrics: Option<Arc<dyn MetricsBackend>>,
     readings: Option<Arc<RetentionReadings>>,
     deployment: String,
+    /// 正文的归档层。没有它就没有「已归档」这回事，于是这一遍**一行也不删**：
+    /// 删一份只有本表持有、别处没有副本的正文，就是把那次调用从留底里抹掉。
+    archive: Option<Arc<dyn cog_core::ObjectBackend>>,
 }
 
 impl ExchangeRetention {
@@ -137,6 +143,7 @@ impl ExchangeRetention {
             metrics: None,
             readings: None,
             deployment: String::new(),
+            archive: None,
         }
     }
 
@@ -149,6 +156,12 @@ impl ExchangeRetention {
     /// Attach the reading face that carries this loop's target and beat count.
     pub fn with_readings(mut self, readings: Arc<RetentionReadings>) -> Self {
         self.readings = Some(readings);
+        self
+    }
+
+    /// 正文归档层：这一遍只删「副本已在归档里、且能读到」的行。
+    pub fn with_archive(mut self, archive: Arc<dyn cog_core::ObjectBackend>) -> Self {
+        self.archive = Some(archive);
         self
     }
 
@@ -250,27 +263,69 @@ impl ExchangeRetention {
         let (keep, keep_derived) = self.keep_for(oldest_before, bytes);
         let cutoff = chrono::Utc::now()
             - chrono::Duration::from_std(keep).unwrap_or_else(|_| chrono::Duration::days(30));
+        // 这一遍的删除有条件：那一行的正文必须已经在归档里、而且读得到。
+        //
+        // 没有归档层就没有「已归档」这回事——那时一行也不删，并把它们计进
+        // `kept_unarchived`：本表是那几次调用正文的唯一一份，删掉就是抹掉。
+        //
+        // 读的行按 `(ts, id)` 游标一页页翻：删除是有条件的，所以不能靠「删掉就前移」
+        // 来换页；翻到底的那些既没被删、也没被漏数。
         let mut removed = 0u64;
+        let mut kept_unarchived = 0u64;
+        let mut cursor: Option<(chrono::DateTime<chrono::Utc>, i64)> = None;
         loop {
             progress();
-            let batch = sqlx::query(&format!(
-                "DELETE FROM {table} WHERE id IN (
-                     SELECT id FROM {table} WHERE ts < $2 ORDER BY ts LIMIT $1
-                 )",
+            // 一行：id、时刻、两份正文的归档键。宽是这一行的形状，不是这里的毛病。
+            #[allow(clippy::type_complexity)]
+            type PagedRow = (
+                i64,
+                chrono::DateTime<chrono::Utc>,
+                Option<String>,
+                Option<String>,
+            );
+            let rows: Vec<PagedRow> = sqlx::query_as(&format!(
+                "SELECT id, ts, request_raw, response_raw FROM {table} \
+                     WHERE ts < $1 AND ($2::timestamptz IS NULL OR (ts, id) > ($2, $3)) \
+                     ORDER BY ts, id LIMIT $4",
                 table = cog_core::sql::quote_relation(&self.table),
             ))
-            .bind(BATCH_ROWS)
             .bind(cutoff)
-            .execute(&self.pool)
+            .bind(cursor.map(|(ts, _)| ts))
+            .bind(cursor.map(|(_, id)| id))
+            .bind(BATCH_ROWS)
+            .fetch_all(&self.pool)
             .await
-            .map_err(|e| SFError::Database(e.to_string()))?
-            .rows_affected();
-            removed += batch;
-            if batch == 0 {
+            .map_err(|e| SFError::Database(e.to_string()))?;
+            let Some(last) = rows.last() else { break };
+            cursor = Some((last.1, last.0));
+            let mut deletable: Vec<i64> = Vec::new();
+            for (id, _ts, request_raw, response_raw) in &rows {
+                // `None`（读不到）与 `Some(false)`（没有副本）都不删。
+                if self
+                    .copies_are_archived(request_raw.as_deref(), response_raw.as_deref())
+                    .await
+                    == Some(true)
+                {
+                    deletable.push(*id);
+                } else {
+                    kept_unarchived += 1;
+                }
+            }
+            if !deletable.is_empty() {
+                removed += sqlx::query(&format!(
+                    "DELETE FROM {table} WHERE id = ANY($1)",
+                    table = cog_core::sql::quote_relation(&self.table),
+                ))
+                .bind(&deletable)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| SFError::Database(e.to_string()))?
+                .rows_affected();
+            }
+            if rows.len() < BATCH_ROWS as usize {
                 break;
             }
         }
-
         let held = self.row_count().await?;
         let oldest_age_secs = self.oldest_age_secs().await?;
         Ok(RetentionOutcome {
@@ -279,7 +334,32 @@ impl ExchangeRetention {
             oldest_age_secs,
             keep_secs: keep.as_secs() as i64,
             keep_derived,
+            kept_unarchived,
         })
+    }
+
+    /// 这一行的副本是不是都在归档里、而且读得到。
+    ///
+    /// `None` 表示**不知道该不该删**：没有归档层、或者某一处读失败。两种都不删，
+    /// 因为删掉之后本表就是那几次调用正文的唯一一份，而「读不到」正是那种时刻。
+    async fn copies_are_archived(
+        &self,
+        request_raw: Option<&str>,
+        response_raw: Option<&str>,
+    ) -> Option<bool> {
+        let archive = self.archive.as_ref()?;
+        // 老行还没有 `*_raw`：它们的正文只在这张表里，别处没有副本，于是不算已归档。
+        if request_raw.is_none() && response_raw.is_none() {
+            return Some(false);
+        }
+        for key in [request_raw, response_raw].into_iter().flatten() {
+            match archive.exists(key).await {
+                Ok(true) => {}
+                Ok(false) => return Some(false),
+                Err(_) => return None,
+            }
+        }
+        Some(true)
     }
 
     /// The retention this beat enforces, and whether it came from a
@@ -504,6 +584,7 @@ mod tests {
             oldest_age_secs: 86_400,
             keep_secs: 7 * 86_400,
             keep_derived: true,
+            kept_unarchived: 0,
         };
         for expected in 1..=2 {
             sweep.report(&outcome).await;

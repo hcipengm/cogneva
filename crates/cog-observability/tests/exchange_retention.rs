@@ -26,7 +26,6 @@
 //!   cargo test -p cog-observability --test exchange_retention -- --ignored
 //! ```
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +49,9 @@ impl Scratch {
         sqlx::query(&format!(
             "CREATE TABLE \"{schema}\".gateway_llm_exchange (
                  id BIGSERIAL PRIMARY KEY,
-                 ts TIMESTAMPTZ NOT NULL
+                 ts TIMESTAMPTZ NOT NULL,
+                 request_raw  TEXT,
+                 response_raw TEXT
              )"
         ))
         .execute(&pool)
@@ -74,7 +75,7 @@ impl Scratch {
 
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
-async fn a_pass_retires_every_row_past_the_retention_and_only_those() {
+async fn without_an_archive_a_pass_retires_nothing() {
     let url = cog_test_support::database_url();
     let pool = PgPool::connect(&url)
         .await
@@ -82,10 +83,7 @@ async fn a_pass_retires_every_row_past_the_retention_and_only_those() {
     let scratch = Scratch::new(pool.clone()).await;
     let table = format!("\"{}\".gateway_llm_exchange", scratch.schema);
 
-    // 3,001 rows past a one-day retention and 2,001 inside it. The extra row on
-    // each side is what makes the batch arithmetic below say "one more than the
-    // batch size" rather than a round number that a single statement would
-    // satisfy either way.
+    // 3,001 rows past a one-day retention and 2,001 inside it.
     sqlx::query(&format!(
         "INSERT INTO {table} (ts)
          SELECT NOW() - interval '30 days' - (g || ' seconds')::interval
@@ -103,48 +101,67 @@ async fn a_pass_retires_every_row_past_the_retention_and_only_those() {
     .await
     .expect("fill the live half");
 
-    let beats = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&beats);
     let outcome = scratch
         .cap(Duration::from_secs(86_400))
-        .retire_once(move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        })
+        .retire_once(|| {})
         .await
         .expect("sweep");
 
     assert_eq!(
-        outcome.removed, 3_001,
-        "every expired row goes, and no other"
-    );
-    assert_eq!(outcome.held, 2_001, "the rows inside the retention stay");
-    assert_eq!(
-        outcome.keep_secs, 86_400,
-        "the pass reports what it enforced"
-    );
-    assert!(
-        outcome.oldest_age_secs < 3_600,
-        "the oldest surviving row has to be one of the ones inside the \
-         retention, not the month-old half: {}",
-        outcome.oldest_age_secs
+        outcome.removed, 0,
+        "no archive means no verified copy, and a row without one is the only copy of its body"
     );
     assert_eq!(
-        beats.load(Ordering::Relaxed),
-        3,
-        "two full batches and the empty one that ends the pass: the callback \
-         fires per batch, not once per pass"
+        outcome.kept_unarchived, 3_001,
+        "the expired rows are counted as kept, not silently reported as retired"
     );
+    assert_eq!(outcome.held, 5_002, "nothing left the table");
 
-    let again = scratch
+    scratch.done().await;
+}
+
+/// 归档里有这几行的副本时，这一遍才删它们。
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn rows_whose_copies_are_archived_are_the_only_ones_retired() {
+    use cog_core::ObjectBackend;
+    let url = cog_test_support::database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("database must be reachable");
+    let scratch = Scratch::new(pool.clone()).await;
+    let table = format!("\"{}\".gateway_llm_exchange", scratch.schema);
+
+    let archive: Arc<dyn ObjectBackend> = Arc::new(cog_test_support::MemoryObjectBackend::new());
+    for object in ["bodies/req-archived", "bodies/resp-archived"] {
+        archive.put(object, b"{}").await.expect("seed the archive");
+    }
+    sqlx::query(&format!(
+        "INSERT INTO {table} (ts, request_raw, response_raw) VALUES
+             (NOW() - interval '30 days', 'bodies/req-archived', 'bodies/resp-archived'),
+             (NOW() - interval '30 days', 'bodies/req-missing', NULL),
+             (NOW() - interval '30 days', NULL, NULL)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("fill three expired rows");
+
+    let outcome = scratch
         .cap(Duration::from_secs(86_400))
+        .with_archive(archive)
         .retire_once(|| {})
         .await
-        .expect("second sweep");
+        .expect("sweep");
+
     assert_eq!(
-        again.removed, 0,
-        "a second pass over the same cutoff finds nothing"
+        outcome.removed, 1,
+        "only the row whose copies are archived goes"
     );
-    assert_eq!(again.held, 2_001);
+    assert_eq!(
+        outcome.kept_unarchived, 2,
+        "a missing copy and an unnamed copy are both 'not archived', and both stay"
+    );
+    assert_eq!(outcome.held, 2);
 
     scratch.done().await;
 }
