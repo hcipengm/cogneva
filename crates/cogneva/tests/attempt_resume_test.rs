@@ -217,7 +217,7 @@ fn runtime(
             agent_id: agent_id.into(),
             role: "worker".to_string(),
             max_iterations: 4,
-            context_window_size: 60_000,
+            context_window_size: Some(60_000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             skill_config: None,

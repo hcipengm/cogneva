@@ -703,7 +703,7 @@ fn conversation_window_tokens() -> Option<usize> {
     let declared = cog_core::RuntimeConfig::default().context_window_size;
     let (window, _) =
         cog_agent::observable::global_observable().context_window_decision_for(declared);
-    (window != 0).then_some(window)
+    window
 }
 
 /// 窗口那条界：`usize::MAX` 在 `oversized_threshold_tokens` 里等于「这条线不设」。
@@ -937,9 +937,9 @@ impl ConversationTurn for PlatformConversation {
                 max_iterations: u32::MAX,
                 // 窗口由上面那个读数给出，不在这里另写一次：网关拿它判「这条消息
                 // 是不是太大了」，判的必须是这一轮真正跑在的那个窗口。没人说过时
-                // 写 0（「没人说过」），不写 `usize::MAX`——后者会在账上、日志里
-                // 读成一个 1.8e19 的窗口。
-                context_window_size: conversation_window_tokens().unwrap_or(0),
+                // 就是 `None`，不写一个假的数——`usize::MAX` 会在账上、日志里读成
+                // 一个 1.8e19 的窗口，0 会被读成「零个 token 的窗口」。
+                context_window_size: conversation_window_tokens(),
                 ..Default::default()
             };
             // 会话开头的那棵树：只在第一次进到这里时真的拍（之后读一行 KV 就

@@ -891,7 +891,10 @@ impl AgentObservable {
     }
 
     /// The window this process should trim to, and which input decided it.
-    pub fn context_window_decision_for(&self, declared: usize) -> (usize, ContextWindowSource) {
+    pub fn context_window_decision_for(
+        &self,
+        declared: Option<usize>,
+    ) -> (Option<usize>, ContextWindowSource) {
         self.context_probe().decision_for(declared)
     }
 }
@@ -971,33 +974,39 @@ impl ContextWindowProbe {
     /// holds models with different windows, and the smaller one binds because
     /// any call may land on it.
     ///
-    /// `declared` of zero means the caller stated no window at all; with no
-    /// published spec either, the answer is zero, which callers read as "no
+    /// `declared` of `None` means the caller stated no window at all; with no
+    /// published spec either, the answer is `None`, which callers read as "no
     /// budget stated" (the unscoped context grows and the first refusal — which
     /// names the real limit for every vendor shape in
-    /// [`cog_core::context_limit_from_refusal`] — closes the loop). Zero is
+    /// [`cog_core::context_limit_from_refusal`] — closes the loop). `None` is
     /// never a window of zero tokens.
-    pub fn decision_for(&self, declared: usize) -> (usize, ContextWindowSource) {
+    pub fn decision_for(&self, declared: Option<usize>) -> (Option<usize>, ContextWindowSource) {
         let held = *self
             .measurements
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (mut window, mut source) = match held.published {
-            Some(published) => (published, ContextWindowSource::PublishedSpec),
-            None => (declared as u64, ContextWindowSource::Declared),
+            Some(published) => (Some(published), ContextWindowSource::PublishedSpec),
+            None => (
+                declared.map(|declared| declared as u64),
+                ContextWindowSource::Declared,
+            ),
         };
-        if held.accepted_max > window {
-            window = held.accepted_max;
+        if held.accepted_max > window.unwrap_or(0) {
+            window = Some(held.accepted_max);
             source = ContextWindowSource::MeasuredAccepted;
         }
         if let Some(limit) = held.limit_min {
-            // 起点为 0 是「没人说过」，任何具名的界都比它更贴近事实。
-            if window == 0 || limit < window {
-                window = limit;
+            // 还没说过窗口时，任何具名的界都比「没说」更贴近事实。
+            if window.is_none_or(|window| limit < window) {
+                window = Some(limit);
                 source = ContextWindowSource::MeasuredLimit;
             }
         }
-        (window.min(usize::MAX as u64) as usize, source)
+        (
+            window.map(|window| window.min(usize::MAX as u64) as usize),
+            source,
+        )
     }
 
     /// The measurements as they stand: `(accepted_max, limit_min)`.
@@ -2596,8 +2605,8 @@ mod tests {
     fn with_no_measurement_the_bootstrap_stands_and_says_it_is_the_bootstrap() {
         let o = AgentObservable::new();
         assert_eq!(
-            o.context_window_decision_for(64_000),
-            (64_000, ContextWindowSource::Declared)
+            o.context_window_decision_for(Some(64_000)),
+            (Some(64_000), ContextWindowSource::Declared)
         );
         assert_eq!(o.context_measurements(), (0, None));
     }
@@ -2611,13 +2620,13 @@ mod tests {
         let o = AgentObservable::new();
         o.note_context_accepted(66_368);
         assert_eq!(
-            o.context_window_decision_for(64_000),
-            (66_368, ContextWindowSource::MeasuredAccepted)
+            o.context_window_decision_for(Some(64_000)),
+            (Some(66_368), ContextWindowSource::MeasuredAccepted)
         );
         // A smaller accepted prompt later does not undo it: the largest one is
         // the evidence, and it does not expire because the next call was small.
         o.note_context_accepted(1_000);
-        assert_eq!(o.context_window_decision_for(64_000).0, 66_368);
+        assert_eq!(o.context_window_decision_for(Some(64_000)).0, Some(66_368));
         // An upstream that reports no count teaches nothing.
         o.note_context_accepted(0);
         assert_eq!(o.context_measurements().0, 66_368);
@@ -2631,24 +2640,27 @@ mod tests {
         let o = AgentObservable::new();
         o.note_context_limit(200_000);
         assert_eq!(
-            o.context_window_decision_for(64_000),
-            (64_000, ContextWindowSource::Declared),
+            o.context_window_decision_for(Some(64_000)),
+            (Some(64_000), ContextWindowSource::Declared),
             "a limit above the bootstrap does not bind"
         );
         o.note_context_limit(32_000);
         assert_eq!(
-            o.context_window_decision_for(64_000),
-            (32_000, ContextWindowSource::MeasuredLimit)
+            o.context_window_decision_for(Some(64_000)),
+            (Some(32_000), ContextWindowSource::MeasuredLimit)
         );
         // A later, larger statement does not raise it back: the pool still
         // contains the smaller upstream.
         o.note_context_limit(200_000);
-        assert_eq!(o.context_window_decision_for(64_000).0, 32_000);
+        assert_eq!(o.context_window_decision_for(Some(64_000)).0, Some(32_000));
         // Even a bootstrap smaller than the limit is not raised by the limit;
         // the limit is a ceiling, not a target.
         let fresh = AgentObservable::new();
         fresh.note_context_limit(200_000);
-        assert_eq!(fresh.context_window_decision_for(16_000).0, 16_000);
+        assert_eq!(
+            fresh.context_window_decision_for(Some(16_000)).0,
+            Some(16_000)
+        );
     }
 
     /// The measured limit wins over the accepted size when the two disagree:
@@ -2660,8 +2672,8 @@ mod tests {
         o.note_context_accepted(66_368);
         o.note_context_limit(50_000);
         assert_eq!(
-            o.context_window_decision_for(64_000),
-            (50_000, ContextWindowSource::MeasuredLimit)
+            o.context_window_decision_for(Some(64_000)),
+            (Some(50_000), ContextWindowSource::MeasuredLimit)
         );
     }
 
@@ -2675,39 +2687,39 @@ mod tests {
         let o = AgentObservable::new();
         o.note_context_published(200_000);
         assert_eq!(
-            o.context_window_decision_for(0),
-            (200_000, ContextWindowSource::PublishedSpec)
+            o.context_window_decision_for(None),
+            (Some(200_000), ContextWindowSource::PublishedSpec)
         );
         // 规格说了就不再靠声明的那个数；声明值只兜底。
         assert_eq!(
-            o.context_window_decision_for(64_000),
-            (200_000, ContextWindowSource::PublishedSpec)
+            o.context_window_decision_for(Some(64_000)),
+            (Some(200_000), ContextWindowSource::PublishedSpec)
         );
         // 上游自述的界压过规格。
         o.note_context_limit(150_000);
         assert_eq!(
-            o.context_window_decision_for(0),
-            (150_000, ContextWindowSource::MeasuredLimit)
+            o.context_window_decision_for(None),
+            (Some(150_000), ContextWindowSource::MeasuredLimit)
         );
         // 换了型号，起点跟着换；实测的界仍然说了算。
         o.note_context_published(1_048_576);
-        assert_eq!(o.context_window_decision_for(0).0, 150_000);
+        assert_eq!(o.context_window_decision_for(None).0, Some(150_000));
         assert_eq!(o.context_published(), Some(1_048_576));
     }
 
     /// 什么都没有时窗口是「没人说过」，不是 0：任何具名的界都比它更贴近事实，
-    /// 而不是被 0 挡在比较之外。
+    /// 而不是被一个假的 0 挡在比较之外。
     #[test]
     fn an_unstated_window_is_not_a_window_of_zero_tokens() {
         let o = AgentObservable::new();
         assert_eq!(
-            o.context_window_decision_for(0),
-            (0, ContextWindowSource::Declared)
+            o.context_window_decision_for(None),
+            (None, ContextWindowSource::Declared)
         );
         o.note_context_limit(128_000);
         assert_eq!(
-            o.context_window_decision_for(0),
-            (128_000, ContextWindowSource::MeasuredLimit)
+            o.context_window_decision_for(None),
+            (Some(128_000), ContextWindowSource::MeasuredLimit)
         );
     }
 }

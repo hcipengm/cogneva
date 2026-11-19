@@ -421,7 +421,7 @@ async fn test_agent_loop_with_wal_persists_events() {
         agent_id: "test-agent".into(),
         role: "planner".to_string(),
         max_iterations: 1,
-        context_window_size: 4000,
+        context_window_size: Some(4000),
         skill_cache_ttl_secs: 30,
         think_stall_timeout_secs: 240,
         skill_config: None,

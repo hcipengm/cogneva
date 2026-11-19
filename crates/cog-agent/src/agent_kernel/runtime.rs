@@ -453,8 +453,8 @@ pub struct AgentRuntime {
     ///
     /// 单独存一份而不是每次读 `self.config`：配置里的那个数会被下面换成量到的
     /// 值，换掉之后就再也回答不了「原本声明的窗口是多大」——而这正是读者要区分
-    /// 「量到的」与「声明的」时唯一能对照的东西。
-    declared_context_window: usize,
+    /// 「量到的」与「声明的」时唯一能对照的东西。`None` = 没人说过。
+    declared_context_window: Option<usize>,
     /// Whether this run's deliverable is the reply text itself.
     ///
     /// A task run answers with a document the downstream steps read fields out
@@ -1164,7 +1164,7 @@ impl AgentRuntime {
 
         // 窗口同一条处置：起点来自上游回报的型号在厂商规格里公布的那个数
         // （`cog_core::model_windows`：设置页里那只模型公布的窗口），配置里那个数只在没人说过
-        // 型号时兜底（写 0 就是「没人说过」，不是零个 token 的窗口）。量到过
+        // 型号时兜底（`null` 就是「没人说过」，不是零个 token 的窗口）。量到过
         // 就按量到的走（见 [`crate::observable::ContextWindowProbe`]），
         // `config` 里的那个数跟着换，于是 `note_context_overrun`、工具结果预算
         // 这些读 `config` 的地方看的是同一个窗口，不会一个按声明、一个按实测。
@@ -4195,14 +4195,18 @@ impl AgentRuntime {
     /// 那一种读数——没有它，那一面接得再对也永远是空的。
     ///
     /// 一次运行只报一次。每调用一次都报的话，读者很快就会把它当背景噪声，而真正
-    /// 有用的恰恰是第一次：它说明从什么时候开始超的。窗口配成 0 当作没配，不判。
+    /// 有用的恰恰是第一次：它说明从什么时候开始超的。没人说过窗口时不判。
     async fn note_context_overrun(&mut self, prompt_tokens: u32) {
         if self.context_overrun_reported {
             return;
         }
-        let window = self.config.context_window_size as u64;
+        let Some(window) = self.config.context_window_size else {
+            // 没人说过窗口，就没有「比窗口大」这件事可判。
+            return;
+        };
+        let window = window as u64;
         let prompt = u64::from(prompt_tokens);
-        if window == 0 || prompt <= window {
+        if prompt <= window {
             return;
         }
         self.context_overrun_reported = true;
@@ -4309,16 +4313,17 @@ impl AgentRuntime {
         if window == before {
             return;
         }
-        // 0 是「没人说过」，在比较里是「没有界」而不是「零个 token 的界」：
-        // 起点从 0 变成任何一个有限的数都是收窄，方向不能读反。
-        let before_effective = if before == 0 { usize::MAX } else { before };
+        // `None` 是「没人说过」，在比较里是「没有界」而不是「零个 token 的界」：
+        // 起点从「没说」变成任何一个有限的数都是收窄，方向不能读反。
+        let before_effective = before.unwrap_or(usize::MAX);
+        let window_effective = window.unwrap_or(usize::MAX);
         self.context.set_max_tokens(window);
         self.config.context_window_size = window;
         // 工具表那一格同一轮就跟上：`read_file` 的一页由窗口导出，停在启动时
         // 那个声明值上，大窗口下每页都白读一截、小窗口下的分页又比需要的碎。
         self.tools.set_context_window_size(window);
         if source == crate::observable::ContextWindowSource::MeasuredLimit
-            && window < before_effective
+            && window_effective < before_effective
         {
             tracing::warn!(
                 agent_id = %self.config.agent_id,
@@ -4328,11 +4333,14 @@ impl AgentRuntime {
                 source = source.as_str(),
                 "上游拒了这份 prompt；这一轮之后按量到的窗口走"
             );
+            // 「之前没有界」这一格记成 `usize::MAX`（没有界），不记 0：0 在读数面
+            // 会被读成「从零个 token 缩到 N」，而这一条说的正好相反——之前没有界，
+            // 是上游第一次把界说出来。
             let event = AgentEvent::ResourceAlert {
                 agent_id: self.config.agent_id.clone(),
                 metric: "context_window_limit".into(),
-                threshold: before as f64,
-                current: window as f64,
+                threshold: before_effective as f64,
+                current: window_effective as f64,
                 crew_id: self.config.crew_id.clone(),
                 squad_id: self.config.squad_id.clone(),
                 timestamp: chrono::Utc::now(),
@@ -6622,7 +6630,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         let config = RuntimeConfig {
             agent_id: "overrun".into(),
-            context_window_size: 100,
+            context_window_size: Some(100),
             max_iterations: 1,
             think_stall_timeout_secs: 5,
             ..Default::default()
@@ -6697,7 +6705,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         let config = RuntimeConfig {
             agent_id: "measured".into(),
-            context_window_size: 5_000,
+            context_window_size: Some(5_000),
             max_iterations: 1,
             ..Default::default()
         };
@@ -6708,7 +6716,7 @@ mod tests {
         let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
         assert_eq!(
             runtime.tools.context_window_size(),
-            5_000,
+            Some(5_000),
             "构造时工具表就按同一个窗口起步，不能等第一轮量到再说"
         );
 
@@ -6722,16 +6730,17 @@ mod tests {
 
         assert_eq!(
             runtime.context.max_tokens(),
-            1_000,
+            Some(1_000),
             "the loop trims to what the upstream said it takes, not to what the config declared"
         );
         assert_eq!(
-            runtime.config.context_window_size, 1_000,
+            runtime.config.context_window_size,
+            Some(1_000),
             "the reading every other part of the loop reads has to move with it"
         );
         assert_eq!(
             runtime.tools.context_window_size(),
-            1_000,
+            Some(1_000),
             "read_file 的页跟着同一个数收窄，否则下一轮还会按旧窗口一页读一大截"
         );
         match rx.try_recv().expect("the shrink has to be announced") {
@@ -6756,7 +6765,7 @@ mod tests {
                 Some("This model's maximum context length is 1000 tokens."),
             )
             .await;
-        assert_eq!(runtime.context.max_tokens(), 1_000);
+        assert_eq!(runtime.context.max_tokens(), Some(1_000));
         assert!(
             rx.try_recv().is_err(),
             "a refusal that changed nothing must not repeat the alert"
@@ -6773,7 +6782,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         let config = RuntimeConfig {
             agent_id: "measured".into(),
-            context_window_size: 5_000,
+            context_window_size: Some(5_000),
             max_iterations: 1,
             ..Default::default()
         };
@@ -6784,8 +6793,8 @@ mod tests {
             .note_context_measurement(None, Some(9_000), None)
             .await;
 
-        assert_eq!(runtime.context.max_tokens(), 9_000);
-        assert_eq!(runtime.config.context_window_size, 9_000);
+        assert_eq!(runtime.context.max_tokens(), Some(9_000));
+        assert_eq!(runtime.config.context_window_size, Some(9_000));
         assert!(
             rx.try_recv().is_err(),
             "a budget that grew to what was demonstrated is not a resource alert"
@@ -6803,7 +6812,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         let config = RuntimeConfig {
             agent_id: "measured".into(),
-            context_window_size: 5_000,
+            context_window_size: Some(5_000),
             max_iterations: 1,
             ..Default::default()
         };
@@ -6814,8 +6823,8 @@ mod tests {
             .note_context_measurement(None, None, Some("the prompt is too long"))
             .await;
 
-        assert_eq!(runtime.context.max_tokens(), 5_000);
-        assert_eq!(runtime.config.context_window_size, 5_000);
+        assert_eq!(runtime.context.max_tokens(), Some(5_000));
+        assert_eq!(runtime.config.context_window_size, Some(5_000));
         assert!(rx.try_recv().is_err());
     }
 
@@ -6830,8 +6839,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         let config = RuntimeConfig {
             agent_id: "spec".into(),
-            // 0 = 部署没有声明窗口，起点本来就没人说过。
-            context_window_size: 0,
+            // None = 部署没有声明窗口，起点本来就没人说过。
+            context_window_size: None,
             max_iterations: 1,
             ..Default::default()
         };
@@ -6839,7 +6848,7 @@ mod tests {
         let mut runtime = AgentRuntime::with_observable(config, tx, &observable);
         assert_eq!(
             runtime.context.max_tokens(),
-            0,
+            None,
             "no model named yet: no budget stated, not a window of zero tokens"
         );
 
@@ -6847,7 +6856,7 @@ mod tests {
         runtime
             .note_context_measurement(Some("via-security-gateway"), None, None)
             .await;
-        assert_eq!(runtime.context.max_tokens(), 0);
+        assert_eq!(runtime.context.max_tokens(), None);
 
         // 配置面（设置页那一份）说这只模型公布的窗口是 1M。真实链路上这一行由
         // 网关的池状态读进来（`cog_gateway::llm_admin`），这里直接放表里。
@@ -6857,13 +6866,13 @@ mod tests {
             .await;
         assert_eq!(
             runtime.context.max_tokens(),
-            1_000_000,
+            Some(1_000_000),
             "the window is the one Anthropic publishes for this model"
         );
-        assert_eq!(runtime.config.context_window_size, 1_000_000);
+        assert_eq!(runtime.config.context_window_size, Some(1_000_000));
         assert_eq!(
             runtime.tools.context_window_size(),
-            1_000_000,
+            Some(1_000_000),
             "read_file 的一页也按同一个数导出，不能停在启动时那一格"
         );
         assert!(
@@ -6879,7 +6888,7 @@ mod tests {
                 Some("prompt is too long: 300000 tokens > 150000 maximum"),
             )
             .await;
-        assert_eq!(runtime.context.max_tokens(), 150_000);
+        assert_eq!(runtime.context.max_tokens(), Some(150_000));
         assert!(matches!(
             rx.try_recv().expect("the shrink has to be announced"),
             AgentEvent::ResourceAlert { .. }
@@ -7816,7 +7825,7 @@ mod tests {
             role: "floor-exceeds-window-test".into(),
             max_iterations: 10,
             // 窗口比任务输入还小：地板自己就放不下。
-            context_window_size: 40,
+            context_window_size: Some(40),
             ..Default::default()
         };
         // 同上：这一轮判的是「窗口 40 装不下地板」，量到过的大 prompt 不属于它。
@@ -8295,7 +8304,7 @@ mod tests {
         let mut runtime = AgentRuntime::new(
             RuntimeConfig {
                 agent_id: "compaction-reader".into(),
-                context_window_size: 300,
+                context_window_size: Some(300),
                 ..Default::default()
             },
             tx,
@@ -8342,7 +8351,7 @@ mod tests {
         let mut wide = AgentRuntime::new(
             RuntimeConfig {
                 agent_id: "compaction-reader".into(),
-                context_window_size: 60_000,
+                context_window_size: Some(60_000),
                 ..Default::default()
             },
             tx,
@@ -8828,7 +8837,7 @@ mod tests {
         let config = RuntimeConfig {
             // 跑这一趟的是一个人，有名有姓：没有 id 的运行在入口就拒绝。
             agent_id: "archivist-0001".into(),
-            context_window_size: 400,
+            context_window_size: Some(400),
             max_iterations: 4,
             ..Default::default()
         };
@@ -8925,7 +8934,7 @@ mod tests {
         let archive = Arc::new(RecordingArchive::default());
         let config = RuntimeConfig {
             agent_id: "archivist-0002".into(),
-            context_window_size: 32000,
+            context_window_size: Some(32000),
             max_iterations: 4,
             ..Default::default()
         };
@@ -9167,7 +9176,7 @@ mod tests {
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         // 小窗口：几轮之后第一份结果必然被裁出投影。
         let config = RuntimeConfig {
-            context_window_size: 600,
+            context_window_size: Some(600),
             ..RuntimeConfig::default()
         };
         let mut runtime = AgentRuntime::new(config, tx);
@@ -9262,7 +9271,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let config = RuntimeConfig {
-            context_window_size: 600,
+            context_window_size: Some(600),
             ..RuntimeConfig::default()
         };
         let mut runtime = AgentRuntime::new(config, tx);

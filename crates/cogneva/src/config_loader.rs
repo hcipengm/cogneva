@@ -2026,7 +2026,7 @@ mod tests {
             // 评估器预算只服务 cog-agent 自己的 eval runtime，没有 RuntimeConfig 对应字段，
             // 所以下面只断言 max_iterations。
             eval_max_iterations: Some(5),
-            context_window_size: 8192,
+            context_window_size: Some(8192),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             memory_api_base: None,
@@ -2041,7 +2041,7 @@ mod tests {
         assert_eq!(business.agent_id, "agent-42");
         assert_eq!(business.role, "generator");
         assert_eq!(business.max_iterations, 7);
-        assert_eq!(business.context_window_size, 8192);
+        assert_eq!(business.context_window_size, Some(8192));
     }
 
     #[test]

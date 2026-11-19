@@ -676,7 +676,7 @@ async fn test_agent_loop_runs_correctly() {
         agent_id: "test-agent".into(),
         role: "planner".to_string(),
         max_iterations: 1,
-        context_window_size: 4000,
+        context_window_size: Some(4000),
         skill_config: None,
         crew_id: None,
         squad_id: None,

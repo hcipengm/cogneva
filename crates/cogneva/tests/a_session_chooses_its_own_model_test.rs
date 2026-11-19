@@ -208,7 +208,7 @@ fn runtime(name: &str) -> (AgentRuntime, tokio::sync::mpsc::Receiver<AgentEvent>
             agent_id: name.into(),
             role: "worker".to_string(),
             max_iterations: 2,
-            context_window_size: 60_000,
+            context_window_size: Some(60_000),
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             skill_config: None,

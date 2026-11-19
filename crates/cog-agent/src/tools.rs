@@ -335,10 +335,10 @@ pub struct ToolRegistry {
     /// [`crate::context::tool_result_budget_chars`]，与运行时把一条工具结果
     /// 裁进上下文用的是同一个函数。工具这边另存一个页大小，窗口调大时页不跟
     /// 着变，同一件事就在树里有了两份答案。这里放的是部署配置的那个窗口
-    /// （`agent_loop.context_window_size`），0 = 没人说过，此时一页的大小按
+    /// （`agent_loop.context_window_size`），`None` = 没人说过，此时一页的大小按
     /// 设置页里各型号公布的规格导出（见 [`Self::page_chars`]）。某一轮自己学到
     /// 更窄的窗口，最终仍由运行时的逐轮裁剪兜住。
-    context_window_size: usize,
+    context_window_size: Option<usize>,
     /// 每个工具在本进程里被点过几次。
     ///
     /// `fork()` 共用同一个 `Arc`，不各拿一份：这个数答的是
@@ -365,22 +365,22 @@ impl ToolRegistry {
     ///
     /// 不设时取 `agent_loop` 配置节的缺省窗口：嵌入运行与测试没有一份进程级
     /// 配置可读，缺省窗口正是它们实际在用的那个。
-    pub fn with_context_window_size(mut self, tokens: usize) -> Self {
+    pub fn with_context_window_size(mut self, tokens: Option<usize>) -> Self {
         self.context_window_size = tokens;
         self
     }
 
     /// 循环学到本轮的窗口之后交给这张表：一页的大小跟着同一个数走。
     ///
-    /// 启动时给的是部署声明的那一个数（往往是 0，= 没人说过）；第一份响应回来
-    /// 之后，窗口是型号公布的规格或实测的界，页大小应当按那个走，而不是停在
+    /// 启动时给的是部署声明的那一个数（往往是 `None`，= 没人说过）；第一份响应
+    /// 回来之后，窗口是型号公布的规格或实测的界，页大小应当按那个走，而不是停在
     /// 启动时那一格。
-    pub fn set_context_window_size(&mut self, tokens: usize) {
+    pub fn set_context_window_size(&mut self, tokens: Option<usize>) {
         self.context_window_size = tokens;
     }
 
-    /// 这张表眼下按多大的窗口导出一页（0 = 没人说过）。
-    pub fn context_window_size(&self) -> usize {
+    /// 这张表眼下按多大的窗口导出一页（`None` = 没人说过）。
+    pub fn context_window_size(&self) -> Option<usize> {
         self.context_window_size
     }
 
@@ -390,20 +390,17 @@ impl ToolRegistry {
     /// `has_more`），不是一次截断。搜索、glob、diff 不在工具里截，整份答案
     /// 交给运行时——那里会把超出的一页归档成引用再裁。
     ///
-    /// 配置没声明窗口（写 0）时，窗口取自设置页里那些型号公布的规格
+    /// 配置没声明窗口（`None`）时，窗口取自设置页里那些型号公布的规格
     /// （`cog_core::model_windows`）：池里最小的一只说了算，因为一发可能落到任何
     /// 一家。两边都没说时返回「不设界」——那个进程里没人说过窗口，替它猜一个
     /// 页大小就是替上游拍数；那条结果进上下文时仍由运行时的裁剪与归档兜住。
     fn page_chars(&self) -> usize {
-        let window = if self.context_window_size != 0 {
-            self.context_window_size
-        } else {
+        let window = self.context_window_size.or_else(|| {
             cog_core::model_windows::all()
                 .into_iter()
                 .map(|(_, window)| window as usize)
                 .min()
-                .unwrap_or(0)
-        };
+        });
         crate::context::tool_result_budget_chars(window)
     }
 
@@ -1808,7 +1805,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cog-tools-batch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let registry = ToolRegistry::new()
-            .with_context_window_size(TEST_WINDOW_TOKENS)
+            .with_context_window_size(Some(TEST_WINDOW_TOKENS))
             .with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
@@ -2011,7 +2008,7 @@ mod tests {
         let path = dir.join("long.txt");
         let path = path.to_str().unwrap();
         let registry = ToolRegistry::new()
-            .with_context_window_size(TEST_WINDOW_TOKENS)
+            .with_context_window_size(Some(TEST_WINDOW_TOKENS))
             .with_sandbox_backend(Arc::new(LocalShellBackend));
         // 一页多大由这张表服务的窗口导出，测试不另抄一个数。
         let page_chars = registry.page_chars();
@@ -2084,7 +2081,7 @@ mod tests {
 
         for (window, paged) in [(32_000usize, false), (50, true)] {
             let registry = ToolRegistry::new()
-                .with_context_window_size(window)
+                .with_context_window_size(Some(window))
                 .with_sandbox_backend(Arc::new(LocalShellBackend));
             cog_core::ToolRegistry::register(&registry, builtins::read_file());
             cog_core::ToolRegistry::register(&registry, builtins::write_file());
@@ -2136,7 +2133,7 @@ mod tests {
             .collect();
 
         let registry = ToolRegistry::new()
-            .with_context_window_size(TEST_WINDOW_TOKENS)
+            .with_context_window_size(Some(TEST_WINDOW_TOKENS))
             .with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
@@ -2191,7 +2188,7 @@ mod tests {
         let path = dir.join("wide.txt");
         let path = path.to_str().unwrap();
         let registry = ToolRegistry::new()
-            .with_context_window_size(TEST_WINDOW_TOKENS)
+            .with_context_window_size(Some(TEST_WINDOW_TOKENS))
             .with_sandbox_backend(Arc::new(LocalShellBackend));
         let page_chars = registry.page_chars();
         // 六行，每行都比一页的字符预算还长：一页装不下一行，翻页只能靠「至少给
