@@ -7,6 +7,7 @@ use cog_core::{
 use cog_core::{Tool, ToolImplementation};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -339,6 +340,13 @@ pub struct ToolRegistry {
     /// 设置页里各型号公布的规格导出（见 [`Self::page_chars`]）。某一轮自己学到
     /// 更窄的窗口，最终仍由运行时的逐轮裁剪兜住。
     context_window_size: Option<usize>,
+    /// 上一次量出来的页大小是不是「不设界」。
+    ///
+    /// 读数面要把「量不到」与「量到就是这个值」分开：两边都没说窗口时一页是
+    /// `usize::MAX`，那条读数不写出来，读的人看见整份文件回来只会以为窗口很大。
+    /// 按状态翻转报一次，不是每读一页都报——同一条读数重复印不增加信息，而翻转
+    /// 本身是事件。
+    paging_unbounded: Arc<AtomicBool>,
     /// 每个工具在本进程里被点过几次。
     ///
     /// `fork()` 共用同一个 `Arc`，不各拿一份：这个数答的是
@@ -346,6 +354,19 @@ pub struct ToolRegistry {
     /// 实。每一轮各记一份的话，读的人只会看到最后一轮点过什么，而一个只在启动时
     /// 派过活的工具会读成「没人用」。
     calls: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+}
+
+/// 一页多大，以及这个数背后有没有一条读数。
+///
+/// 第二项是判据面的东西：两边都没说窗口时页大小是「不设界」，但「量不到」与
+/// 「量到一个很大的值」必须是两件事——前者没有读数，后者有。把它并进返回值，
+/// 调用点就不必各自再猜一次，报告也才有东西可报。
+fn page_budget(declared: Option<usize>, pooled_min: Option<u64>) -> (usize, bool) {
+    let window = declared.or_else(|| pooled_min.map(|tokens| tokens as usize));
+    (
+        crate::context::tool_result_budget_chars(window),
+        window.is_some(),
+    )
 }
 
 impl ToolRegistry {
@@ -357,6 +378,7 @@ impl ToolRegistry {
             plugin_registry: None,
             require_identity: false,
             context_window_size: crate::AgentLoopConfig::default().context_window_size,
+            paging_unbounded: Arc::new(AtomicBool::new(false)),
             calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -395,13 +417,22 @@ impl ToolRegistry {
     /// 一家。两边都没说时返回「不设界」——那个进程里没人说过窗口，替它猜一个
     /// 页大小就是替上游拍数；那条结果进上下文时仍由运行时的裁剪与归档兜住。
     fn page_chars(&self) -> usize {
-        let window = self.context_window_size.or_else(|| {
-            cog_core::model_windows::all()
-                .into_iter()
-                .map(|(_, window)| window as usize)
-                .min()
-        });
-        crate::context::tool_result_budget_chars(window)
+        let pooled_min = cog_core::model_windows::all()
+            .into_iter()
+            .map(|(_, window)| window)
+            .min();
+        let (chars, measured) = page_budget(self.context_window_size, pooled_min);
+        let was_unbounded = self.paging_unbounded.swap(!measured, Ordering::Relaxed);
+        match (was_unbounded, measured) {
+            (false, false) => tracing::warn!(
+                "no context window is known — neither the deployment nor any pooled model states \
+                 one — so a read_file page is unbounded; the runtime's trimming still bounds what \
+                 reaches the context"
+            ),
+            (true, true) => tracing::info!(chars, "read_file pages are bounded again"),
+            _ => {}
+        }
+        chars
     }
 
     pub fn with_require_identity(mut self, require: bool) -> Self {
@@ -461,6 +492,8 @@ impl ToolRegistry {
             plugin_registry: self.plugin_registry.clone(),
             require_identity: self.require_identity,
             context_window_size: self.context_window_size,
+            // 同一件事只报一次：复制出来这张表说的是一行同样的读数。
+            paging_unbounded: self.paging_unbounded.clone(),
             calls: self.calls.clone(),
         }
     }
@@ -1993,6 +2026,30 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 页大小要么背后有一条读数，要么就不是一个数——两种状态分得开。
+    ///
+    /// 不设界的页与「窗口很大」的页在结果上长得一样（整份文件都回来了），
+    /// 所以「这个数是量不出来」必须在决定的地方就是单独一个事实，不能等读的人
+    /// 从 `usize::MAX` 里倒推。
+    #[test]
+    fn a_page_nobody_measured_is_not_a_page_of_max_chars() {
+        assert_eq!(
+            page_budget(None, None),
+            (usize::MAX, false),
+            "两边都没说窗口：不设界，并且这个数没有读数"
+        );
+        let (chars, measured) = page_budget(None, Some(8_000));
+        assert!(
+            measured && chars == crate::context::tool_result_budget_chars(Some(8_000)),
+            "池里的型号说了窗口：按最小的一只导出，这是量出来的"
+        );
+        let (chars, measured) = page_budget(Some(32_000), None);
+        assert!(
+            measured && chars < usize::MAX,
+            "部署自己声明了窗口：同样是量出来的"
+        );
     }
 
     /// 不带范围地读一份长文件，拿到的是一页，不是整份。
