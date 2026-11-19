@@ -432,7 +432,8 @@
     "base_dir": "/var/lib/cogneva-data/raw-logs",
     "max_buffer_size": 1000,
     "format": "proto",
-    "zstd_level": null
+    "zstd_level": null,
+    "_comment_max_buffer_size": "落盘缓冲的条数上界：攒满这么多条就先落盘一次。它由「一次落盘的开销」与「进程挂掉时最多丢多少条记录」两头定，与 `_comment_flush_interval_secs` 那条时间上界是同一件事的两个触发条件。"
   },
   "memory": {
     "_comment": "Memory backend — composite puts Raw on the shared ObjectBackend, Schema and the Summary entry store on PostgreSQL, and the summary vectors on the shared VectorBackend, so the dataset survives a restart. This applies to the processes that enable it: the evolution worker overrides COGNEVA_MEMORY_ENABLED to false, so it holds no memory dataset at all and any state it must keep across a restart lives in its own app.data_dir instead.",
@@ -3926,7 +3927,11 @@
           "face": "资源管理"
         }
       ],
-      "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧把 0 夹到 1 秒。"
+      "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧把 0 夹到 1 秒。",
+      "_comment_greater_than": "`greater_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。",
+      "_comment_less_than": "`less_than` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。方向相反：低于这条线就报。",
+      "_comment_greater_than_or_equal": "`greater_than_or_equal` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。边界包含：等于这条线就报。",
+      "_comment_equal": "`equal` 里的数是这条告警的判定线本身：同一规则里的 `summary` 把它复述给看告警的人，两处说的是同一件事。线定在哪由这条规则要抓的问题定（例如根分区用到 75% 就该有人看），这一族不共用一条实测——每条规则的线各自对应它自己的判据。判等：只有取到这个值才报。"
     },
     "trace_collector": {
       "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。"
@@ -4040,7 +4045,9 @@
         0.15,
         0.2,
         0.3
-      ]
+      ],
+      "_comment_min_samples_grid": "搜索的候选样本量：每一轮把记录的判定结果在这几个量下重放，取 z 检验能显著的那一档；下限由检验本身的功效定——样本太少时检验不可能显著，那一轮什么也不写（见本节的 `_comment`）。",
+      "_comment_margin_grid": "搜索的候选间隔：与 `min_samples_grid` 在同一轮里重放，两者组合成候选表（见本节的 `_comment`）。"
     }
   },
   "multi_backend_consumer": {

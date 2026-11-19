@@ -9,6 +9,11 @@
 //!
 //! 这个文件判的正是这一半：**文档里的数不许等于应用自己对它的答案**。
 //!
+//! 另一半是同一个病的反面：一个数既不是应用给的默认值、旁边又没人写过它凭什么取这个值。
+//! 那种数就是属主口径里的 `override`——人拍的一个数，答不出该由哪条实测导出，也点不出
+//! 是哪条协议约定。判据是「这个键在这一节的某个块里有没有一条 `_comment_<键>`」：判的是
+//! **有没有人写过一句话**，不是散文写得好不好——后者机器判不了，硬判只会奖励贴标签。
+//!
 //! 判据从读这一节的那个类型取，不从名单取。把那个叶子从文档里删掉，按该节的读取器
 //! 类型解析一遍再序列化回来，读同一个路径——值不变，说明这个叶子什么都没决定。用解析
 //! 往返而不是 `Default::default()`：`#[serde(default = "…")]` 与 `impl Default` 会给出
@@ -16,17 +21,23 @@
 //! 只有 `common::config_surface::readers` 说了算：那道表与 `config_section_reader_contract_test`
 //! 共用，抄第二份就会有两份对同一节给出不同答案、而两份都各自绿。
 //!
-//! 不判什么，说清楚：
-//! - **既非默认值、又没有来源说明**的数（「无主」）不在下面那条「抄件」判据里清零，
-//!   它在走查里数出来、点名，并在走查里断言为零：一个不是代码默认值、旁边又没人写过
-//!   一句话的数，就是属主口径里的 `override`——人拍的一个数，答不出该由哪条实测导出，
-//!   也点不出是哪条协议约定。它的三种去向：删掉（本来就不决定任何事的，比如功能关着时
-//!   那两个不起作用的批参数）、搬出文档由闭环算（`derived`）、或在值旁边写一句点名约定。
+//! 「有没有人写过一句话」这一问，走查对每一个叶子都问；「是不是抄件」那一问只对其中
+//! 一类叶子问得出来。分清楚：
+//! - **判到类型答案**的叶子（类型能把这个路径读回来、又有个默认值可比）才判抄件，也判
+//!   无主。一个不是代码默认值、旁边又没人写过一句话的数，就是属主口径里的 `override`
+//!   ——人拍的一个数，答不出该由哪条实测导出，也点不出是哪条协议约定。它的三种去向：
+//!   删掉（本来就不决定任何事的，比如功能关着时那两个不起作用的批参数）、搬出文档由
+//!   闭环算（`derived`）、或在值旁边写一句点名约定（`fixed`）。走查把这一类里的无主
+//!   数点名并断言为零。
+//! - **删了就读不进来**的（「块里必需」）与**是数组元素、不是声明**的两类判不了抄件：
+//!   前者没有默认值可比——删掉它，整节读不进来，无从问「值变没变」；后者的问题不是
+//!   值，是这一格在搜什么。这两类不属于「本门没看」，它们照样被走查点名并要求各自带
+//!   一句来源说明（数组元素的说明挂在数组自己的键上），所以「无主」在这里同样为零。
 //! - 删一个叶子会不会改变行为：不会。上面那个往返就是这个断言的机器版本；删掉的叶子
 //!   全部是「删了读到同一个数」的那一类。
 //! - **返回里没有这个叶子**的（动态键、`Value` 块、被 `skip_serializing_if` 省掉的）不判
-//!   抄件：没有默认值可比。它们各自有门——「文档写的键有字段接着」是
-//!   `config_section_reader_contract_test`，「类型能读的键有文档写出来」是
+//!   抄件：没有默认值可比，也没有一个键能让说明挂上去。它们各自有门——「文档写的键有
+//!   字段接着」是 `config_section_reader_contract_test`，「类型能读的键有文档写出来」是
 //!   `every_config_knob_is_named_by_a_delivered_document_test`。这里只把它们数出来、
 //!   按节点名，免得「本门没看这里」被读成「这里看过、没问题」。
 //! - 没有一个读取器的节不判，同样数出来、点名。
@@ -228,8 +239,14 @@ fn same_place_declaration(doc: &Value, steps: &[Step]) -> bool {
     let Some((last, parents)) = steps.split_last() else {
         return false;
     };
-    let Step::Key(key) = last else {
-        return false; // 数组元素不是一句话，也谈不上「旁边有人说明」
+    // 数组里的一个数说明的是它所在的那一格（`min_samples_grid: [2, 3, 5, 8]` 是
+    // 「这一格搜哪些候选」），所以它的说明挂在数组自己的键上，不挂在元素下标上。
+    let key = match last {
+        Step::Key(key) => key.clone(),
+        Step::Index(_) => match parents.last() {
+            Some(Step::Key(key)) => key.clone(),
+            _ => return false, // 顶层数组：连「哪一格」都没有
+        },
     };
     let comment = format!("_comment_{key}");
     (1..=parents.len()).rev().any(|depth| {
@@ -299,6 +316,10 @@ fn the_walk_reads_the_document_the_app_reads() {
     // 不是抄件的那些叶子，旁边有没有一句话说它的来源。
     let mut declared = 0;
     let mut no_declaration: Vec<String> = Vec::new();
+    // 「块里必需」与「数组元素」这两类不判抄件，但它们一样是数：有多少带着来源
+    // 说明、多少个没有。这是本门不判的那部分人口的读数，不判不等于干净。
+    let mut load_bearing_declared = 0;
+    let mut elements_declared = 0;
     for (path, steps, _) in &leaves {
         let section_name = match &steps[0] {
             Step::Key(key) => key.clone(),
@@ -321,8 +342,18 @@ fn the_walk_reads_the_document_the_app_reads() {
                 }
             }
             Answer::Absent => *absent.entry(section_name).or_default() += 1,
-            Answer::LoadBearing => *load_bearing.entry(section_name).or_default() += 1,
-            Answer::NotADeclaration => elements += 1,
+            Answer::LoadBearing => {
+                *load_bearing.entry(section_name).or_default() += 1;
+                if same_place_declaration(&doc, steps) {
+                    load_bearing_declared += 1;
+                }
+            }
+            Answer::NotADeclaration => {
+                elements += 1;
+                if same_place_declaration(&doc, steps) {
+                    elements_declared += 1;
+                }
+            }
         }
     }
     assert!(
@@ -357,6 +388,30 @@ fn the_walk_reads_the_document_the_app_reads() {
         typed,
         declared,
         no_declaration.len()
+    );
+    println!(
+        "本门不判的两类里带来源说明的：块里必需 {}/{}、数组元素 {}/{}",
+        load_bearing_declared,
+        total(&load_bearing),
+        elements_declared,
+        elements
+    );
+    // 这两类不判抄件（删了是把配置删坏），但它们一样是数：不判「是不是抄件」不等于
+    // 不判「有没有来源」。缺一句话的，和「无主」是同一个病。
+    assert_eq!(
+        load_bearing_declared,
+        total(&load_bearing),
+        "有「块里必需」的数旁边没有一句话说它的来源（{} 个）：{}\n\
+         它们的说明通常写在这群同名键的上一层块里（`_comment_<键>`），或者写在这条规则\
+         自己的对象里。",
+        total(&load_bearing) - load_bearing_declared,
+        named(&load_bearing)
+    );
+    assert_eq!(
+        elements_declared, elements,
+        "有数组元素没有一句话说这一格在搜什么（{} 个）：数组的说明挂在数组自己的键上\
+         （`_comment_<键>`）。",
+        elements - elements_declared
     );
     assert!(
         declared >= 1,
