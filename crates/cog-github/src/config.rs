@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use cog_core::{SFError, SFResult};
 
+/// 一拍扫描读多少条 issue。GitHub 与 Gitee 两个集成的同一条事实。
+///
+/// 一次扫描是一趟 API 往返加上下游的逐条处理：这个数给那一趟的处理时长上界，
+/// 没扫到的留给下一拍，水位线保证不会漏。平台之间的差别（限流额度、账号数）
+/// 不改变「一拍读多少条」这件事，所以它不是两个旋钮——两个字段各写一个 50
+/// 就是同一条界的两处声明，改一处的下一次只会改一处。
+// cap: bound — 一趟往返读得完、又不把一拍的处理时长长的条数；只往下调
+pub const ISSUES_PER_SCAN: usize = 50;
+
 /// A registered GitHub account used by Cogneva to interact with GitHub.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -265,7 +274,7 @@ impl Default for GitHubIntegrationConfig {
                 GitHubAccount::Human(HumanAccount::default()),
             ],
             poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
-            max_issues_per_scan: 50,
+            max_issues_per_scan: ISSUES_PER_SCAN,
             auto_submit_fixes: true,
             landing_policy: LandingPolicy::default(),
             human_required_labels: vec!["security".into(), "breaking-change".into()],
@@ -599,7 +608,7 @@ impl Default for GiteeIntegrationConfig {
             base_branch: "main".into(),
             api_base: None,
             poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
-            max_issues_per_scan: 50,
+            max_issues_per_scan: ISSUES_PER_SCAN,
             token_env: None,
         }
     }
@@ -642,6 +651,34 @@ impl GiteeIntegrationConfig {
 mod tests {
     use super::*;
     use crate::checkout::repo_root;
+
+    /// 两个平台的一拍扫描条数是同一条界：谁把其中一个改回字面量，这条就红。
+    ///
+    /// 只断言「两个默认值相等」等于没判——今天它们都等于 50，写死一个 50
+    /// 也照样相等。这里判的是赋值那一侧：`max_issues_per_scan:` 后面跟着的
+    /// 必须是一个名字，不是一个数。
+    #[test]
+    fn both_forges_scan_one_page_of_the_same_size() {
+        let source = include_str!("config.rs");
+        let inlined: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.split_once("max_issues_per_scan:"))
+            .map(|(_, value)| value.trim().trim_end_matches(',').trim())
+            .filter(|value| value.starts_with(|c: char| c.is_ascii_digit()))
+            .collect();
+        assert!(
+            inlined.is_empty(),
+            "一拍扫描条数只留一个声明（`ISSUES_PER_SCAN`），这些地方又写死了数：{inlined:?}"
+        );
+        assert_eq!(
+            GitHubIntegrationConfig::default().max_issues_per_scan,
+            ISSUES_PER_SCAN
+        );
+        assert_eq!(
+            GiteeIntegrationConfig::default().max_issues_per_scan,
+            ISSUES_PER_SCAN
+        );
+    }
 
     /// 发现循环属主开关：默认必须是开的。默认若跟成关，单部署安装升级后会静默
     /// 失去发现能力——这正是新增开关最容易造成的退化。置位的是部署（进化 Pod
