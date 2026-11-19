@@ -113,7 +113,7 @@ impl Default for PromotionGateConfig {
             quota_per_day: 3,
             rollback_breaker_threshold: 2,
             failure_breaker_threshold: 3,
-            soak_secs: 600,
+            soak_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             awaiting_review_timeout_secs: cog_core::day::SECONDS_PER_DAY as u64,
             // 白名单故意收窄（宁严勿宽）：只有纯工具实现、前端、文档。
             // 未列出的路径一律按 L2 转人工。
@@ -642,7 +642,7 @@ impl Default for GitOpsConfig {
             enabled: false,
             repo_url: String::new(),
             branch: "evolution-release".into(),
-            poll_interval_secs: 120,
+            poll_interval_secs: (2 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             registry: None,
             local_registry: String::new(),
             work_dir: cog_core::paths::app_path_str("gitops"),
@@ -856,11 +856,16 @@ pub struct MainlineDeployerConfig {
     pub registry_maintenance_cooldown_secs: u64,
 }
 
+/// registry 走查读取器监听的端口：node exporter 的约定口，走查按它抓同一个
+/// 读数，换端口等于换一个抓取方。
+// cap: fixed — node exporter 约定端口 9100
+const REGISTRY_WALKER_PORT: u16 = 9100;
+
 impl Default for MainlineDeployerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            poll_interval_secs: 600,
+            poll_interval_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             bare_repo: cog_core::paths::TREE_REPO.into(),
             branch: "main".into(),
             upstreams: Vec::new(),
@@ -873,11 +878,11 @@ impl Default for MainlineDeployerConfig {
             kubectl_host_path: String::new(),
             state_dir: cog_core::paths::app_path_str("sandbox/mainline"),
             cargo_build_jobs: 2,
-            soak_secs: 120,
+            soak_secs: (2 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             restart_threshold: 1,
             failure_cooldown_secs: cog_core::day::SECONDS_PER_HOUR as u64,
-            rollout_timeout_secs: 300,
-            startup_timeout_secs: 900,
+            rollout_timeout_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            startup_timeout_secs: (15 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             job_cpu_request: "200m".into(),
             job_memory_request: "64Mi".into(),
             job_cpu_limit: "2".into(),
@@ -886,7 +891,7 @@ impl Default for MainlineDeployerConfig {
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
             observability_stack: ObservabilityStackConfig::default(),
-            registry_walker_port: 9100,
+            registry_walker_port: REGISTRY_WALKER_PORT,
             // 由 `COGNEVA_REGISTRY_CLAIM` 填（走查边车那条声明）；没声明就是不回收。
             registry_claim: String::new(),
             // 20 个 rev ≈ 20 次滚动的回退面，按每 rev 一层的叠层增量算约
@@ -978,7 +983,7 @@ impl Default for ObservabilityStackConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_secs: 300,
+            interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             manifest_dir: "deploy/k3s/observability/manifests".into(),
             namespace: "monitoring".into(),
             backends: true,
