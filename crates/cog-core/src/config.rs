@@ -1198,6 +1198,45 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// `AgentEvent` 广播通道的缓冲深度：慢订阅者能落后多少条。
+// cap: bound — 由订阅者的处理时长 × 事件到达率定：落后超过这个深度就是丢事件
+const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// `TaskEvent` 广播通道的缓冲深度（同上；任务事件的到达率比代理事件低一档）。
+// cap: bound — 由订阅者的处理时长 × 事件到达率定：落后超过这个深度就是丢事件
+const DEFAULT_TASK_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// 动作规划器模式库的容量上限：检索只在一拍扫得完的范围里有意义。
+// cap: bound — 由一拍的检索预算与命中率的拐点定：再深只是把旧模式堆在库里
+const DEFAULT_PATTERN_DB_MAX_SIZE: usize = 256;
+
+/// PG 连接池上限。
+///
+/// 这不是本仓能单方面定的数：服务端的 `max_connections` 除以副本数才是天花板，
+/// `cog-storage` 起池时已经在读那个上限并取两者的小值；这里的默认只是没读到
+/// 服务端时的起点。
+// cap: bound — 由服务端 max_connections / 副本数 与一次查询的时延定
+const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
+
+// cap: bound — 由稳态查询速率 × 一条查询的时延定：保住热连接，又不多占服务端的槽
+const DEFAULT_PG_MIN_CONNECTIONS: u32 = 2;
+
+/// 等一条连接的时间上限：超过就是这一请求失败了，等更久只是把失败推后。
+// cap: bound — 由一条请求的预算定：等连接的时间要短于整条请求的超时
+const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+
+/// 记忆消息后端广播通道的缓冲深度（同 `AgentEvent`）。
+// cap: bound — 由订阅者的处理时长 × 事件到达率定：落后超过这个深度就是丢事件
+const DEFAULT_MEMORY_MESSAGE_BROADCAST_CAPACITY: usize = 1024;
+
+/// 观测网关事件通道的缓冲深度（同 `TaskEvent`）。
+// cap: bound — 由订阅者的处理时长 × 事件到达率定：落后超过这个深度就是丢事件
+const DEFAULT_OBSERVABILITY_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// WebSocket 连接管理器的事件缓存：一次重连要补回多少条。
+// cap: bound — 由一次重连的补发量与它的时长定：缓存短于补发量，重连就丢事件
+const DEFAULT_WEBSOCKET_EVENT_CACHE_CAPACITY: usize = 1000;
+
 /// System-wide runtime tunables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1279,8 +1318,8 @@ pub const ANTHROPIC_OUTPUT_TOKEN_DEFAULT: u32 = 4096;
 impl Default for SystemConfig {
     fn default() -> Self {
         Self {
-            event_channel_capacity: 1024,
-            task_event_channel_capacity: 256,
+            event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
+            task_event_channel_capacity: DEFAULT_TASK_EVENT_CHANNEL_CAPACITY,
             shutdown_timeout_ms: (30 * crate::day::MILLIS_PER_SECOND) as u64,
             timeout_checker_interval_secs: (crate::day::SECONDS_PER_MINUTE / 2) as u64,
             loop_restart_max_consecutive: crate::contract::loop_health::RestartSettings::default()
@@ -1290,15 +1329,15 @@ impl Default for SystemConfig {
             partition_maintenance_interval_secs: crate::day::SECONDS_PER_HOUR as u64,
             sandbox_executor_url: None,
             require_tool_identity: false,
-            pattern_db_max_size: 256,
+            pattern_db_max_size: DEFAULT_PATTERN_DB_MAX_SIZE,
             pattern_max_age_days: crate::day::DAYS_PER_MONTH,
-            pg_max_connections: 50,
-            pg_min_connections: 2,
-            pg_acquire_timeout_secs: 10,
+            pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
+            pg_min_connections: DEFAULT_PG_MIN_CONNECTIONS,
+            pg_acquire_timeout_secs: DEFAULT_PG_ACQUIRE_TIMEOUT_SECS,
             pg_idle_timeout_secs: (10 * crate::day::SECONDS_PER_MINUTE) as u64,
-            memory_message_broadcast_capacity: 1024,
-            observability_event_channel_capacity: 256,
-            websocket_event_cache_capacity: 1000,
+            memory_message_broadcast_capacity: DEFAULT_MEMORY_MESSAGE_BROADCAST_CAPACITY,
+            observability_event_channel_capacity: DEFAULT_OBSERVABILITY_EVENT_CHANNEL_CAPACITY,
+            websocket_event_cache_capacity: DEFAULT_WEBSOCKET_EVENT_CACHE_CAPACITY,
             skill_hot_reload_interval_secs: SKILL_HOT_RELOAD_INTERVAL_SECS,
             anthropic_default_max_tokens: ANTHROPIC_OUTPUT_TOKEN_DEFAULT,
             strict_persistence: true,
@@ -2839,5 +2878,71 @@ mod tests {
             unusable.response_timeout(),
             std::time::Duration::from_millis(DEFAULT_REDIS_RESPONSE_TIMEOUT_MS)
         );
+    }
+}
+
+#[cfg(test)]
+mod system_config_reads_its_names {
+    use super::*;
+
+    /// 九条容量／超时默认值都读具名常量：改常量就改默认，改回裸写就红。
+    #[test]
+    fn every_system_capacity_reads_its_constant() {
+        let cfg = SystemConfig::default();
+        assert_eq!(cfg.event_channel_capacity, DEFAULT_EVENT_CHANNEL_CAPACITY);
+        assert_eq!(
+            cfg.task_event_channel_capacity,
+            DEFAULT_TASK_EVENT_CHANNEL_CAPACITY
+        );
+        assert_eq!(cfg.pattern_db_max_size, DEFAULT_PATTERN_DB_MAX_SIZE);
+        assert_eq!(cfg.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
+        assert_eq!(cfg.pg_min_connections, DEFAULT_PG_MIN_CONNECTIONS);
+        assert_eq!(
+            cfg.pg_acquire_timeout_secs,
+            DEFAULT_PG_ACQUIRE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            cfg.memory_message_broadcast_capacity,
+            DEFAULT_MEMORY_MESSAGE_BROADCAST_CAPACITY
+        );
+        assert_eq!(
+            cfg.observability_event_channel_capacity,
+            DEFAULT_OBSERVABILITY_EVENT_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            cfg.websocket_event_cache_capacity,
+            DEFAULT_WEBSOCKET_EVENT_CACHE_CAPACITY
+        );
+
+        let source = include_str!("config.rs");
+        let body = source
+            .split("impl Default for SystemConfig")
+            .nth(1)
+            .and_then(|rest| rest.split("\n#[cfg(test)]").next())
+            .expect("SystemConfig 的默认值在这份文件里");
+        let names = [
+            "event_channel_capacity",
+            "task_event_channel_capacity",
+            "pattern_db_max_size",
+            "pg_max_connections",
+            "pg_min_connections",
+            "pg_acquire_timeout_secs",
+            "memory_message_broadcast_capacity",
+            "observability_event_channel_capacity",
+            "websocket_event_cache_capacity",
+        ];
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                names.iter().any(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "这些默认值要读常量：{bare:?}");
     }
 }
