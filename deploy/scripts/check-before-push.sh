@@ -806,8 +806,21 @@ if [ -n "${cargo_bin}" ]; then
         build_slot_run "名字契约（告警规则契约）" "${cargo_bin}" test -p cogneva --test suite
     run_suite_file "名字契约（观测面普查）" observability_scrape_census_contract_test \
         build_slot_run "名字契约（观测面普查）" "${cargo_bin}" test -p cogneva --test suite
+    # 交付文档的数字走查：`crates/cogneva/tests/shipped_config_numbers_are_registered_test.rs`
+    # 是唯一会在「交付文档抄了一个数」或「新增了一个没人说来源的数」时红的门，而它此前
+    # 同样只住在 CI 的 Test 里——新增一个数值叶子，要等下一次全量套件才可能被发现。
+    #
+    # 这一格**不带触发条件**，与上面那张 crate 骨架表不同。它判的是「文档里这个数是不是
+    # 应用自己会给出的答案」，答案来自各个 crate 的默认值：改任何一处 `impl Default` 都
+    # 可能让文档里某个叶子从「有来源」变成「抄件」，而那一笔往往不碰文档。按「这次动没
+    # 动 `cogneva.json`」开触发条件，正好漏掉这一半——而它漏掉的样子与判过了一模一样。
+    #
+    # 价格：判定不到 1 秒；编译与名字契约同一份 `cogneva` test target，轮到这一格时已经
+    # 热了。排在它们之后就是为这个。
+    run_suite_file "交付文档的数字走查（抄件 / 无主 / 每个叶子的来源）" shipped_config_numbers_are_registered_test \
+        build_slot_run "交付文档的数字走查" "${cargo_bin}" test -p cogneva --test suite
 else
-    skip_step "名字契约" "本机没有可用的 cargo（CI 的 Code Coverage 会跑这两步）"
+    skip_step "名字契约与交付文档走查" "本机没有可用的 cargo（CI 的 Code Coverage 会跑这几步）"
 fi
 
 # 工作区的骨架，两面都由树自己推、没有手工表：依赖方向、仅测试 crate 的豁免、crate 有没有
