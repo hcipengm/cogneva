@@ -187,6 +187,7 @@ cell_run() { # cell_run <说明> <命令…>
     local what="$1"
     shift
     local id key stored verdict t0 status trace="" capped=0 strace_pid="" trace_cap_bytes=""
+    local trace_poll_secs="" trace_kill_grace_secs=""
 
     id="$(cell_id "${what}" "$@")"
     if [ "${COGNEVA_CELL_STAMPS:-on}" = on ] && [ -n "$(cell_stamp_root)" ]; then
@@ -233,6 +234,14 @@ cell_run() { # cell_run <说明> <命令…>
         # 整棵树全开一遍远不到 1 MiB；留 16 倍给夹具与重试，取本机 16 MiB 这个上限。
         # 超过它的轨迹不再可能是一个格子的作用域，只可能是放大。
         trace_cap_bytes="${COGNEVA_CELL_TRACE_MAX_BYTES:-16777216}"
+        # 采样间隔由那次的实测涨速导出，不是随手拍的：2026-11-19 那次 5 分钟写了
+        # 256 MiB ⇒ 约 0.85 MiB/s。间隔内最多再长 0.85 MiB/s × 0.2 s ≈ 174 KiB，
+        # 不到 16 MiB 上限的 1.1%：超限量小到可以让「停下」与「刚好到线」同义。
+        # 再密只是空转 `stat`，再疏则超限量按比例放大。
+        trace_poll_secs="0.2"
+        # TERM 之后给它的时间：一次信号处理的工夫。它只是礼貌，KILL 才是兜底，
+        # 所以它按拍长的整数倍给，换宿主时跟着拍长走。
+        trace_kill_grace_secs="$(awk -v p="${trace_poll_secs}" 'BEGIN { printf "%d", (p * 5) + 0.5 }')"
         capped=0
         setsid strace -f -qq -y -e trace=openat -o "${trace}" "$@" &
         strace_pid=$!
@@ -240,12 +249,12 @@ cell_run() { # cell_run <说明> <命令…>
             if [ "$(stat -c %s "${trace}" 2>/dev/null || echo 0)" -gt "${trace_cap_bytes}" ]; then
                 printf '%s\n' "（轨迹超过 ${trace_cap_bytes} 字节：停下追踪，改在不带追踪的条件下判一次）"
                 kill -TERM -- "-${strace_pid}" 2>/dev/null || kill -TERM "${strace_pid}" 2>/dev/null
-                sleep 1
+                sleep "${trace_kill_grace_secs}"
                 kill -KILL -- "-${strace_pid}" 2>/dev/null || true
                 capped=1
                 break
             fi
-            sleep 0.2
+            sleep "${trace_poll_secs}"
         done
         wait "${strace_pid}" 2>/dev/null
         status=$?
