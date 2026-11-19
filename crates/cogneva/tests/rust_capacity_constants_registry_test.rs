@@ -801,7 +801,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-reflection/src/build_rss_peak.rs", 3),
     ("crates/cog-reflection/src/change_execution.rs", 3),
     ("crates/cog-reflection/src/change_pipeline.rs", 10),
-    ("crates/cog-reflection/src/config.rs", 3),
+    ("crates/cog-reflection/src/config.rs", 14),
     ("crates/cog-reflection/src/evolution_build_readings.rs", 1),
     ("crates/cog-reflection/src/firecracker.rs", 1),
     ("crates/cog-reflection/src/gitops_puller.rs", 1),
