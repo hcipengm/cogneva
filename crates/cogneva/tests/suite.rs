@@ -188,6 +188,8 @@ mod an_occupied_id_is_not_work_in_hand_test;
 mod an_optimization_proves_the_output_identical_test;
 #[path = "anonymous_requests_cannot_tell_paths_apart.rs"]
 mod anonymous_requests_cannot_tell_paths_apart;
+#[path = "app_config_numbers_are_registered_test.rs"]
+mod app_config_numbers_are_registered_test;
 #[path = "app_config_substitutions_contract_test.rs"]
 mod app_config_substitutions_contract_test;
 #[path = "assistant_event_tags_compared_are_tags_the_enum_writes_test.rs"]

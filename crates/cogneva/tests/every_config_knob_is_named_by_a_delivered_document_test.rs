@@ -8,7 +8,15 @@
 //!
 //! 判据是「名字出现过」，不是「每份文档都写全」：样例、chart、静态清单与渲染
 //! 出来的 profile 各承担一部分，合起来才是运维手上那一叠文档。一份文档漏掉某个
-//! 键、另一份写了，就有人能发现它。所有交付文档都没写的键，才落在 [`CODE_ONLY`]：
+//! 键、另一份写了，就有人能发现它。
+//!
+//! 「写过」有两种形态，都算：「文档树里写着这个键」，与「文档自己的 `env` 表把
+//! 某个环境变量指向这个点分路径」——后者由加载器真的应用，运维有一条不碰文件的
+//! 改法。只认前一种时，一个值由代码默认给、环境变量可调的旋钮会被读成「文档没
+//! 写」，于是有人把那个默认值抄进样例来让这道门变绿（2026-11-19 实际发生过：
+//! 69 个叶子是默认值的逐字副本）。
+//!
+//! 所有交付文档都没写的键，才落在 [`CODE_ONLY`]：
 //! 每一条都要写明它为什么只能由代码给值。登记了却已经被某份文档写出来的，按过期
 //! 报出来——许可留在已经没人走的路口，下一个真把旋钮写死的人就没有判据拦。
 //!
@@ -62,11 +70,12 @@ const fn code_only(path: &'static str, why: &'static str) -> CodeOnly {
 /// Knobs no delivered document writes.
 ///
 /// An entry is a claim someone looked at. Three kinds are legitimate, and each
-/// entry says which one it is:
+/// entry says which of them it is:
 ///
-/// * the knob has an environment entry of its own, so the document sample is
-///   not its only delivery surface (`AGENT_LOOP_ENV`, `OBS_ENV`, the
-///   `COGNEVA_*` dot-path table);
+/// * the knob has an environment entry in its owning crate (`AGENT_LOOP_ENV`,
+///   `OBS_ENV`, `MEMORY_ENV`), so the sample is not its only delivery surface.
+///   The document's own `env` table needs no entry here: [`surfaces`] reads it
+///   as a naming form, and an entry for one of its paths is stale by design;
 /// * the default *is* the decision — an empty optional (`None` means this
 ///   family has no executable condition), a block that is off by default and
 ///   would read as a recommendation if a sample carried it, or a value derived
@@ -80,22 +89,9 @@ const CODE_ONLY: &[CodeOnly] = &[
          把某个名字写进样例，读配置的人会以为平台上有这么一位",
     ),
     code_only(
-        "agent_loop.max_iterations",
-        "`None` = 不设轮数天花板；由 `COGNEVA_AGENT_LOOP_MAX_ITERATIONS` 覆盖，\
-         写进样例等于替部署下一个轮数断言",
-    ),
-    code_only(
-        "agent_loop.eval_max_iterations",
-        "同上：`None` = 不设天花板；由 `COGNEVA_AGENT_LOOP_EVAL_MAX_ITERATIONS` 覆盖",
-    ),
-    code_only(
         "agent_loop.think_stall_timeout_secs",
         "由 `COGNEVA_AGENT_LOOP_THINK_STALL_TIMEOUT_SECS` 覆盖；默认值是「多久没动静\
          算停了」的判据，随部署的模型延迟走",
-    ),
-    code_only(
-        "agent_loop.memory_api_base",
-        "由 `COGNEVA_MEMORY_API_BASE` 覆盖；指向平台自己的 HTTP 面，地址随部署走",
     ),
     code_only(
         "agent_loop.external_archive_threshold_chars",
@@ -106,31 +102,6 @@ const CODE_ONLY: &[CodeOnly] = &[
         "agent_loop.web_search_fallback_base",
         "由 `COGNEVA_WEB_SEARCH_FALLBACK_BASE` 覆盖；不设就是让查询不出自己这棵树——\
          那不是一个缺省值，而是部署的选择，样例不替部署写一个后备端点",
-    ),
-    code_only(
-        "dag_executor.decomposition_max_attempts",
-        "由 `COGNEVA_DECOMPOSITION_MAX_ATTEMPTS` 覆盖；重试次数是部署对分解质量的\
-         容忍度，不是平台该替它定的值",
-    ),
-    code_only(
-        "dag_executor.decomposition_orphan_watch_enabled",
-        "由 `COGNEVA_DECOMPOSITION_ORPHAN_WATCH_ENABLED` 覆盖；回收孤儿占位任务是\
-         一项运维决定（开着会终止别人眼里还在排队的行）",
-    ),
-    code_only(
-        "dag_executor.decomposition_orphan_poll_interval_secs",
-        "由 `COGNEVA_DECOMPOSITION_ORPHAN_POLL_INTERVAL_SECS` 覆盖；扫描周期随部署\
-         的规模走",
-    ),
-    code_only(
-        "dag_executor.decomposition_orphan_stall_after_secs",
-        "由 `COGNEVA_DECOMPOSITION_ORPHAN_STALL_AFTER_SECS` 覆盖；多久算卡住是部署\
-         对自身负载的判断",
-    ),
-    code_only(
-        "dag_executor.decomposition_orphan_alert_dwell_secs",
-        "由 `COGNEVA_DECOMPOSITION_ORPHAN_ALERT_DWELL_SECS` 覆盖；默认值是扫描/观察\
-         周期的两倍（见字段注释），推导关系写在代码里比抄进样例更可靠",
     ),
     code_only(
         "dag_executor.redis_read_block_ms",
@@ -157,13 +128,6 @@ const CODE_ONLY: &[CodeOnly] = &[
         "gateway.demo_login_enabled",
         "由 `COGNEVA_DEMO_LOGIN_ENABLED` 覆盖；样例把它写成 false 会把一个一次性\
          演示开关当成部署建议",
-    ),
-    code_only(
-        "gateway.notification_webhook_url",
-        "由 `COGNEVA_NOTIFICATION_WEBHOOK_URL` 覆盖，值由 chart 的\
-         `notification.webhookUrl` 送出；默认空 = 这个部署没有配通知出口。样例里写\
-         null 是把「没选」写成一个选择，而 chart 已经说了这个部署选的是什么——两处\
-         各说一遍时，样例那句还会被 env 层盖掉（values_leaves_have_one_source_test）",
     ),
     code_only(
         "gitee_integration.api_base",
@@ -199,30 +163,6 @@ const CODE_ONLY: &[CodeOnly] = &[
          导出器——写它会读成「这个部署有它」，而部署要启用时直接写这个键",
     ),
     code_only(
-        "self_evolution.build_gate.enabled",
-        "由 `COGNEVA_BUILD_GATE_ENABLED` 覆盖，值由 chart 的 `evolution.buildGate.enabled`\
-         送出；样例再写一遍 true 是同一件事的第二次声明，改 chart 的人不会想到样例里\
-         还压着一份",
-    ),
-    code_only(
-        "self_evolution.build_gate.lock_dir",
-        "由 `COGNEVA_BUILD_GATE_LOCK_DIR` 覆盖，值由 chart 的\
-         `evolution.buildGate.lockDir` 送出；锁目录是宿主上的路径约定（同一 dev:ino\
-         才互相设界），随部署的卷布局走，样例不复制一条宿主路径",
-    ),
-    code_only(
-        "self_evolution.build_gate.max_concurrent",
-        "由 `COGNEVA_BUILD_GATE_MAX_CONCURRENT` 覆盖，值由 chart 的\
-         `evolution.buildGate.maxConcurrent` 送出；`0` = 按宿主实测导出，正数才是\
-         钉死——样例里写 0 会被读成一个数，而它是一条闭环",
-    ),
-    code_only(
-        "self_evolution.build_gate.wait_secs",
-        "由 `COGNEVA_BUILD_GATE_WAIT_SECS` 覆盖，值由 chart 的\
-         `evolution.buildGate.waitSecs` 送出；等构建槽多久算超时随宿主负载走，样例\
-         不替部署定一个等待上限",
-    ),
-    code_only(
         "self_evolution.executor_enabled",
         "由 `COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED` 覆盖；默认关闭是安全方向，\
          样例不替部署开启进化执行",
@@ -243,13 +183,6 @@ const CODE_ONLY: &[CodeOnly] = &[
     code_only(
         "self_evolution.microvm",
         "整块默认关闭；路径与内核镜像随宿主走（见默认值），样例不替部署写宿主路径",
-    ),
-    code_only(
-        "self_evolution.poll_interval_secs",
-        "由 `COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS` 覆盖，值由 chart 的\
-         `evolution.pollIntervalSecs` 送出（300 秒的种子，运行期由上一轮实际耗时\
-         抬上去）。样例里写的那个数会被 env 层整个盖掉，读样例的人却会以为部署每\
-         60 秒扫一次新活——同一件事写两遍的两个数，一个生效、一个只是让人读错",
     ),
     code_only(
         "self_evolution.workspaces",
@@ -297,6 +230,174 @@ const CODE_ONLY: &[CodeOnly] = &[
          argv 会读成检查已开启，而判据进程可能根本连不上自己的 API server",
     ),
     code_only(
+        "dag_executor.archive_after_secs",
+        "48 h = 两次最长信号冷却（24 h）加一次重启余量：重试前提要读得到那行失败\
+         记录，行被清掉，重试就静默变成一次新提交（见字段注释）。样例写 172800 是\
+         把推导结果钉成一个数，改冷却的人看不到另一半",
+    ),
+    code_only(
+        "dag_executor.archive_poll_interval_secs",
+        "归档节奏由保留期（`archive_after_secs`）决定，本值只是多久看一次；样例写\
+         一个扫描周期会把「多久看一次」读成部署的选择",
+    ),
+    code_only(
+        "dag_executor.max_retries",
+        "重试次数是部署对任务成功的容忍度；平台默认 3 是没人决定时的答案，样例不\
+         替部署定（与 `decomposition_max_attempts` 同理，后者有环境入口，这个没有）",
+    ),
+    code_only(
+        "dag_executor.nats.consumer_ack_wait_secs",
+        "必须大于最坏单条处理时延（归档 + 两次 LLM + 重试，分钟级），900 秒覆盖\
+         它；样例写死一个数会让改处理链路的人看不到这个下界",
+    ),
+    code_only(
+        "dag_executor.nats.consumer_max_deliver",
+        "毒药消息的投递上限，是写 DLQ 的判据：协议消费语义，不是部署的选择",
+    ),
+    code_only(
+        "dag_executor.nats.consumer_max_ack_pending",
+        "背压闸门：积压留在流里而不是堆进进程内存（见字段注释）；样例写 1024 会\
+         读成部署对消费者容量的决定",
+    ),
+    code_only(
+        "hook_engine.default_rate_limit",
+        "整块是内建 hook 的缺省令牌桶；每个部署的 hook 有它自己的限速，样例写一块\
+         默认桶会读成部署替所有 hook 定了速率",
+    ),
+    code_only(
+        "hook_engine.hook_timeout_secs",
+        "hook 延迟的容忍度随部署的 hook 实现走；样例不替部署定一个超时",
+    ),
+    code_only(
+        "multi_backend_consumer.publish_buffer_capacity",
+        "总线故障窗的异步缓冲上限，排满即丢事件（见字段注释）：是「宁可丢也不无\
+         界」的语义，不是容量选择",
+    ),
+    code_only(
+        "multi_backend_consumer.publish_retry_base_delay_ms",
+        "指数退避基数，随总线故障的恢复时间走；样例写 1000 会把它读成一个调过的值",
+    ),
+    code_only(
+        "multi_backend_consumer.retry_interval_secs",
+        "消费重试周期，随部署的消息面负载走",
+    ),
+    code_only(
+        "self_evolution.build_gate.build_demand_cores",
+        "一次构建实测要几个核；由 `cogneva_build_gate_tuning{input,source}` 以\
+         `calibrated` 发布，运行期实测到新值才转 `derived`。样例写一个数会把它变\
+         成 `configured`——读的人会以为有人选过它",
+    ),
+    code_only(
+        "self_evolution.build_gate.build_peak_rss_mib",
+        "实测构建峰值 RSS；同上由读数发布，运行期跟着实测走，样例不复制一次测量",
+    ),
+    code_only(
+        "self_evolution.build_gate.mem_floor_mib",
+        "这个进程要留住的内存地板，按宿主付得起的内存量裁过（`fitted`）；样例写\
+         24576 会读成有人选过",
+    ),
+    code_only(
+        "self_evolution.build_gate.cpu_calm_pct",
+        "「安静」的 CPU 判据，本机标定；样例写 5.0 会把它读成一个调好的阈值",
+    ),
+    code_only(
+        "self_evolution.build_gate.io_calm_pct",
+        "「安静」的 IO 判据，与 CPU 判据一起标定；样例不复制标定值",
+    ),
+    code_only(
+        "self_evolution.build_gate.mem_calm_pct",
+        "「安静」的内存判据，同上",
+    ),
+    code_only(
+        "self_evolution.build_gate.io_stall_budget_pct",
+        "每次构建可分到的 IO 停顿预算，按构建峰值与磁盘实测推出；样例不复制推导值",
+    ),
+    code_only(
+        "self_evolution.build_gate.bound_window_secs",
+        "构建门回看多久算「忙」：判据的时间尺度，随本机负载标定；`Tuning::shipped()`\
+         从配置默认读、不再写第二份（见该处注释），样例也不写",
+    ),
+    code_only(
+        "self_evolution.build_gate.cpu_sample_gap_ms",
+        "两次 CPU 采样的间隔：与 `bound_window` 一起标定的时间尺度",
+    ),
+    code_only(
+        "self_evolution.build_gate.reserve_fresh_secs",
+        "构建槽预约的新鲜期，过期即丢弃（见 `reserve_fresh` 的注释），随一轮构建\
+         的时长走",
+    ),
+    code_only(
+        "self_evolution.health_check_grace_period_secs",
+        "滚动替换后给新进程的启动宽限期，随部署的启动耗时走；样例不替部署定",
+    ),
+    code_only(
+        "self_evolution.health_check_interval_secs",
+        "宽限期内的探测间隔，与宽限期一起定",
+    ),
+    code_only(
+        "self_evolution.health_check_max_retries",
+        "宽限期内允许的不健康探测次数",
+    ),
+    code_only(
+        "supervisor.alert_history_max",
+        "进程内告警历史的保留条数：内存预算的一部分，随部署的内存上限走",
+    ),
+    code_only(
+        "supervisor.behavior_history_max",
+        "每位 agent 的行为历史条数，随部署的 agent 数走",
+    ),
+    code_only(
+        "supervisor.broadcast_capacity",
+        "监督面广播通道容量：内存预算的一部分",
+    ),
+    code_only(
+        "supervisor.event_window_secs",
+        "监督面滑动统计窗口：判据的时间尺度",
+    ),
+    code_only(
+        "supervisor.health_checker",
+        "整块是三类判据（suspect / dead / stuck）的时长；阈值随部署的 agent 心跳\
+         节奏走，样例写一块默认值会读成部署的判断题",
+    ),
+    code_only(
+        "supervisor.heartbeat_history_max",
+        "心跳历史保留条数，与 agent 数一起定",
+    ),
+    code_only(
+        "supervisor.quota_threshold",
+        "配额告警阈值：量纲随部署的配额面走，样例不替部署定",
+    ),
+    code_only(
+        "supervisor.rebalance_interval_secs",
+        "任务再平衡周期，随部署的任务积压节奏走",
+    ),
+    code_only(
+        "supervisor.task_rebalancer",
+        "整块是每轮再平衡的上限（每位 agent 几个任务、每轮几次分配），随部署的\
+         agent 池规模走",
+    ),
+    code_only(
+        "system.event_channel_capacity",
+        "`AgentEvent` 广播通道容量：内存预算的一部分，随部署的事件速率走",
+    ),
+    code_only(
+        "system.task_event_channel_capacity",
+        "`TaskEvent` 广播通道容量：同上",
+    ),
+    code_only(
+        "system.timeout_checker_interval_secs",
+        "超时回收的检查周期：一条 `Running` 任务能被发现停摆的延迟上界就是这个值",
+    ),
+    code_only(
+        "tier_migrator.cold_compression_level",
+        "zstd 级别 9 是「冷层才值得多花 CPU」的约定值（3 是同一条约定的另一半）；\
+         样例写它会读成部署的压缩选择",
+    ),
+    code_only(
+        "tier_migrator.warm_compression_level",
+        "同上：3 是热→温的默认代价，与冷层的 9 成对",
+    ),
+    code_only(
         "system.enabled_plugins",
         "`None` = 加载全部插件；写进样例即变成白名单，把插件面收窄成一个选择。\
          黑名单是 `disabled_plugins`，样例写的是它",
@@ -307,8 +408,30 @@ fn registered(path: &str) -> Option<&'static CodeOnly> {
     CODE_ONLY.iter().find(|entry| entry.path == path)
 }
 
+/// The dot paths a delivered document's own `env` table points at.
+///
+/// The table is `env var name -> dot path inside this document`, and the loader
+/// applies it: a name written here is a way for an operator to set that knob
+/// without touching the file. So the table is a naming surface, and a knob it
+/// points at is delivered even when the document writes no value for that leaf.
+///
+/// `_comment` keys are prose. Values that are not strings are not mappings.
+fn env_named_paths(doc: &serde_json::Value) -> Vec<String> {
+    let Some(env) = doc.get("env").and_then(|env| env.as_object()) else {
+        return Vec::new();
+    };
+    env.iter()
+        .filter(|(name, _)| !name.starts_with("_comment"))
+        .filter_map(|(_, target)| target.as_str().map(str::to_string))
+        .collect()
+}
+
 /// Every knob path a reader produces and every one a delivered document names,
 /// both as `section.key` / `section.nested.key`, plus the document count.
+///
+/// Two naming forms count, because both are in the delivered document:
+/// the leaf written in the document's tree, and the `env` table entry that
+/// points at it (see [`env_named_paths`]).
 fn surfaces(root: &std::path::Path) -> (BTreeSet<String>, BTreeSet<String>, usize) {
     let mut named = BTreeSet::new();
     let mut produced = BTreeSet::new();
@@ -316,6 +439,7 @@ fn surfaces(root: &std::path::Path) -> (BTreeSet<String>, BTreeSet<String>, usiz
     let docs = documents.len();
     let graph = TypeGraph::new(root);
     for (file, doc) in documents {
+        named.extend(env_named_paths(&doc));
         for reader in readers() {
             if reader.section == "_comment" {
                 continue;
@@ -379,6 +503,64 @@ fn every_knob_a_reader_produces_is_named_by_a_delivered_document() {
             .map(|path| format!("  {path}"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// 文档里有没有在这个路径上写着一个值。
+fn the_tree_holds(doc: &serde_json::Value, path: &str) -> bool {
+    let mut cur = doc;
+    for step in path.split('.') {
+        match cur.get(step) {
+            Some(child) => cur = child,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// `env` 表那一条分支得真的在起作用，而且它带来的不止重复。
+///
+/// 两个断言：表里点到的每个旋钮都算「被点名」；至少有一个旋钮**只**被 env 表
+/// 点名——文档树里没有写它的值。后者是这条分支存在的理由：少了它，环境入口就
+/// 不算交付面，那些只能用环境变量调的旋钮会被读成「文档没写」，而它们的值本来
+/// 就该由代码默认给，写进样例反而成了第二个声明。
+#[test]
+fn an_env_entry_names_the_knob_it_points_at() {
+    let root = repo_root();
+    let (named, produced, _) = surfaces(&root);
+    let documents = shipped_configs(&root);
+    let mut only_by_env = BTreeSet::new();
+    let mut checked = 0;
+    for (file, doc) in &documents {
+        for path in env_named_paths(doc) {
+            if !produced.contains(&path) {
+                continue; // 指向的键不归这些读取器：别的门判它
+            }
+            checked += 1;
+            assert!(
+                named.contains(&path),
+                "{file}: env 表指向 {path}，但「交付文档点名」的集合里没有它——\
+                 读 env 那一段坏了"
+            );
+            if !the_tree_holds(doc, &path) {
+                only_by_env.insert(format!("{path}（{file}）"));
+            }
+        }
+    }
+    assert!(
+        checked >= 1,
+        "env 表一条都没点到一个真旋钮：这张表的读法坏了，上面那条判据会因此\
+         把只能用环境变量调的旋钮全读成「文档没写」"
+    );
+    assert!(
+        !only_by_env.is_empty(),
+        "每个 env 指向的旋钮在文档树里都写了值——这条分支没有带来任何一条新的\
+         点名，它要么退化成重复，要么读 env 那一段停了"
+    );
+    println!(
+        "env 表点名 {checked} 次（跨 {} 份文档），其中 {} 个旋钮只在 env 表里被点名",
+        documents.len(),
+        only_by_env.len()
     );
 }
 
