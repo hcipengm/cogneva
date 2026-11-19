@@ -3967,9 +3967,12 @@ mod tests {
         let enabled = document["dag_executor"]["archive_enabled"]
             .as_bool()
             .expect("dag_executor.archive_enabled");
-        let retention = document["dag_executor"]["archive_after_secs"]
-            .as_u64()
-            .expect("dag_executor.archive_after_secs");
+        // 没有写这个叶子就是「按内置值」，和 cooldown 一样：文档不再抄一遍
+        // 代码里已经有的数，读的人不能把「没写」当成缺字段。
+        let retention = document
+            .pointer("/dag_executor/archive_after_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| cog_core::Config::default().dag_executor.archive_after_secs);
         let wait = document
             .pointer("/self_evolution/signal_watcher/report_cooldown_secs")
             .and_then(|v| v.as_i64())
