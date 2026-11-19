@@ -361,26 +361,15 @@ fn hold_back_message(admitted: u64) -> &'static str {
 }
 
 impl DagExecutorRuntime {
+    /// 具体后端类型的入口：与 [`Self::new_with_dyn_backend`] 同一套装配。
+    ///
+    /// 装配走同一条路，不是两段各写一遍的构造——两段会分家，第二段少配一样
+    /// 东西的那天，用哪个人口构造出来的执行器就是两个行为。
     pub fn new_with_backend(
         config: DagExecutorConfig,
         backend: impl MessageBackend + 'static,
     ) -> Self {
-        let orchestrator = DagExecutor::new(config.workspace_id.clone());
-        Self {
-            config,
-            backend: Arc::new(backend),
-            orchestrator: Arc::new(orchestrator),
-            action_planner: None,
-            skill_registry: None,
-            pool_source: Arc::new(tokio::sync::OnceCell::new()),
-            observability: Arc::new(tokio::sync::OnceCell::new()),
-            change_ledger: Arc::new(tokio::sync::OnceCell::new()),
-            gate_share: Arc::new(std::sync::Mutex::new(None)),
-            gate_last_admitted_unix: Arc::new(std::sync::atomic::AtomicI64::new(
-                chrono::Utc::now().timestamp(),
-            )),
-            board_wip_limits: load_board_wip_limits(),
-        }
+        Self::new_with_dyn_backend(config, Arc::new(backend))
     }
 
     pub fn new_with_dyn_backend(
