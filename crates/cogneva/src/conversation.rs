@@ -42,8 +42,9 @@ const CHAT_GROUP: &str = "web";
 ///
 /// 名册的过期是 30 秒：一轮对话动不动就超过它，不续的话它会在自己还在说话的
 /// 时候从名册上消失——同事这时候发给它的消息就投进一个没人认领的收件箱。
-// cap: bound — 名册过期 30 秒，续约间隔取它的三分之一
-const REGISTRATION_HEARTBEAT_SECS: u64 = 10;
+/// 取的是 agent 续约的同一个拍子（`AGENT_REGISTRATION_TTL_SECS` ÷ 拍数）：会话员工
+/// 与常驻 worker 在同一本名册上，续约节奏不同就会一边活一边被判死。
+const REGISTRATION_HEARTBEAT_SECS: u64 = cog_core::config::AGENT_HEARTBEAT_INTERVAL_SECS;
 
 /// 一次开跑最多读几条积压消息。
 ///

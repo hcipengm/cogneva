@@ -33,8 +33,21 @@
 //! gateway owns the request path.
 
 /// Seconds in a day.
-// cap: bound — 一日的秒数，定义值，不是这台机器量的
+// cap: fixed — 一日的秒数：日历的定义值，不是这台机器量的
 pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// Seconds in an hour.
+///
+/// 一小时是一小时的秒数，不是谁挑的档位：凡是「几小时」的量都乘它，别在调用点
+/// 各写一个 3600。
+// cap: fixed — 一小时的秒数：定义值
+pub const SECONDS_PER_HOUR: i64 = 3_600;
+
+/// Seconds in a week.
+///
+/// 同上：七天是一周的秒数。
+// cap: fixed — 一周的秒数：定义值
+pub const SECONDS_PER_WEEK: i64 = SECONDS_PER_DAY * 7;
 
 /// How far east of UTC this process's clock is at `now_unix`, in seconds.
 ///

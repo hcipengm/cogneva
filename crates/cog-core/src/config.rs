@@ -804,7 +804,8 @@ fn default_archive_enabled() -> bool {
     false
 }
 fn default_archive_after_secs() -> u64 {
-    172_800
+    // 两天：按「几天的秒数」写，读的人不必把这串数字除以 86400。
+    2 * crate::day::SECONDS_PER_DAY as u64
 }
 fn default_archive_poll_interval_secs() -> u64 {
     300
@@ -819,13 +820,15 @@ fn default_decomposition_orphan_poll_interval_secs() -> u64 {
     300
 }
 fn default_decomposition_orphan_stall_after_secs() -> u64 {
-    1800
+    // 半小时。
+    crate::day::SECONDS_PER_HOUR as u64 / 2
 }
 fn default_decomposition_orphan_alert_dwell_secs() -> u64 {
     600
 }
 fn default_result_claim_idle_secs() -> u64 {
-    600
+    // 与就绪流的清扫窗口同一个数：发布方的停止阈值与清扫者的认领阈值是同一条。
+    DEFAULT_READY_CLAIM_IDLE_SECS
 }
 fn default_result_claim_interval_secs() -> u64 {
     60
@@ -866,16 +869,39 @@ impl Default for TierMigratorConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            hot_duration_secs: 86_400,
-            warm_duration_secs: 604_800,
+            // 三层保留是三个时间长度，不是三个数：各写一个秒数只会让「热一天」
+            // 这个说法在几处慢慢走散。
+            hot_duration_secs: crate::day::SECONDS_PER_DAY as u64,
+            warm_duration_secs: crate::day::SECONDS_PER_WEEK as u64,
             warm_compression_level: 3,
             cold_compression_level: 9,
-            scan_interval_secs: 3_600,
+            scan_interval_secs: crate::day::SECONDS_PER_HOUR as u64,
             cold_key_prefix: "raw".into(),
             trace_scan_batch: 5_000,
         }
     }
 }
+
+/// 名册上一条 agent 记录活多久。
+///
+/// 这不是本仓挑的数：Redis / etcd 的 agent 注册默认 TTL 就是 30 秒，监督者判
+/// 「它还在不在」用的也是这同一条——两边各走各的，就会出现「监督者眼里死了、
+/// agent 自己还觉得自己活着」。交付文档的 `agent.registration_ttl_secs` 写的就是它。
+// cap: fixed — Redis / etcd 的 agent 注册默认 TTL：监督者与 agent 自己必须用同一条
+pub const AGENT_REGISTRATION_TTL_SECS: u64 = 30;
+
+/// 一条注册记录要活过几拍心跳。
+///
+/// 一拍丢包是常态，不该把一个活着的员工判死；连丢三拍才说明它真走了。心跳因此
+/// 不是自己挑的数，而是 TTL ÷ 它。
+// cap: fixed — 三拍：一次抖动丢一拍不算离线，连丢三拍才算
+pub const BEATS_PER_REGISTRATION_TTL: u64 = 3;
+
+/// 心跳间隔：worker 向名册续约的拍子。
+///
+/// 由 TTL 与拍数算出来，不单独声明：改 TTL 或改拍数，它跟着变。
+pub const AGENT_HEARTBEAT_INTERVAL_SECS: u64 =
+    AGENT_REGISTRATION_TTL_SECS / BEATS_PER_REGISTRATION_TTL;
 
 /// Agent registration and heartbeat configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -947,6 +973,53 @@ impl Default for MetricsConfig {
     }
 }
 
+/// 监督者巡检心跳活性的节拍。
+///
+/// 判据（可疑、死亡）都是秒级的，巡检必须比它们密，否则判据被巡检自己拖粗——判据
+/// 说「两拍没心跳就算可疑」，而巡检十秒才看一次，实际发现它的时刻就晚了一拍。
+// cap: fixed — 与判据的拍子同量级：巡检比判据疏，判据就被巡检拖粗
+pub const SUPERVISOR_HEALTH_INTERVAL_SECS: u64 = 10;
+
+/// 配额巡检的节拍。
+///
+/// 配额是按分钟结算的额度，一拍一分钟就够；更密只是把同一批计数再读一遍。
+// cap: fixed — 配额按分钟结算：一拍一分钟，更密只是重复读同一批计数
+pub const SUPERVISOR_QUOTA_INTERVAL_SECS: u64 = 60;
+
+/// 任务再平衡的节拍。
+///
+/// 再平衡会挪动在跑的任务，代价远高于一次巡检；五分钟一拍让舰队形状稳定下来，
+/// 而不是跟着一次抖动来回搬。
+// cap: fixed — 再平衡挪的是在跑的任务：五分钟一拍让形状稳定，不跟着一次抖动来回搬
+pub const SUPERVISOR_REBALANCE_INTERVAL_SECS: u64 = 300;
+
+/// 告警去重与突发判定看的事件窗口。
+///
+/// 要长到能盖住一次真实的故障脉冲，短到不会把两次独立故障并成一条。
+// cap: fixed — 要盖住一次真实故障脉冲，又不把两次独立故障并成一条
+pub const SUPERVISOR_EVENT_WINDOW_SECS: u64 = 30;
+
+/// 控制面巡检的节拍。
+///
+/// 控制面是可选的外部依赖，读它要一次网络往返；够密才发现它不在了，又不至于让
+/// 监控面变成对它的压力源。
+// cap: fixed — 外部依赖的一次网络往返：够密才发现它不在了，又不把监控变成压力
+pub const SUPERVISOR_CONTROL_PLANE_INTERVAL_SECS: u64 = 30;
+
+/// 监督者向订阅方广播事件的通道深度。
+///
+/// 一个巡检周期里可能同时到达的判决条数：通道比它浅，生产方会在两次巡检之间溢出，
+/// 而溢出的那几条判决没有第二个读者能补回来。
+// cap: fixed — 一个巡检周期内同时到达的判决条数：浅了就会在两次巡检之间溢出
+pub const SUPERVISOR_BROADCAST_DEPTH: usize = 256;
+
+/// 配额低于它时暂停调度：剩不到这么多 token 就不该再接新任务。
+///
+/// 一千是一轮 LLM 调用装得下的量级：余量比它还少，下一步派出去的任务只会开个头就
+/// 撞上限，而撞限失败比排队更贵——一次调用已经花掉的 token 收不回来。
+// cap: fixed — 一轮调用的量级：余量比它少时新任务只会开个头就撞上限
+pub const SUPERVISOR_QUOTA_PAUSE_REMAINING_TOKENS: u64 = 1_000;
+
 /// Supervisor sub-system intervals and thresholds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -973,38 +1046,84 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            health_interval_secs: 10,
-            quota_interval_secs: 60,
-            rebalance_interval_secs: 300,
-            event_window_secs: 30,
-            broadcast_capacity: 256,
-            quota_threshold: 1_000,
+            health_interval_secs: SUPERVISOR_HEALTH_INTERVAL_SECS,
+            quota_interval_secs: SUPERVISOR_QUOTA_INTERVAL_SECS,
+            rebalance_interval_secs: SUPERVISOR_REBALANCE_INTERVAL_SECS,
+            event_window_secs: SUPERVISOR_EVENT_WINDOW_SECS,
+            broadcast_capacity: SUPERVISOR_BROADCAST_DEPTH,
+            quota_threshold: SUPERVISOR_QUOTA_PAUSE_REMAINING_TOKENS,
             health_checker: HealthCheckerConfig::default(),
             task_rebalancer: TaskRebalancerConfig::default(),
-            behavior_history_max: 20,
-            heartbeat_history_max: 1_000,
-            alert_history_max: 10_000,
-            control_plane_interval_secs: 30,
+            // 三个保留深度没有内置默认：0 ＝ 没写，由持有这些环的那一层换回
+            // 它自己的常量（`BehaviorMonitor::DEFAULT_MAX_HISTORY` 等）。
+            behavior_history_max: 0,
+            heartbeat_history_max: 0,
+            alert_history_max: 0,
+            control_plane_interval_secs: SUPERVISOR_CONTROL_PLANE_INTERVAL_SECS,
             control_plane_url: None,
         }
     }
 }
 
+/// 多久没心跳算可疑：连丢两拍。
+///
+/// 一拍抖动是常态；第二拍也没来，才值得看一眼。
+// cap: fixed — 心跳的两倍：一拍丢包不算异常，连着两拍没声才值得看一眼
+pub const SUSPECT_BEATS: u64 = 2;
+
+/// 多久没心跳算死亡：连丢六拍。
+///
+/// 可疑之后还接着丢四拍，一条还活着的进程不会这样；两档之间分开的是「网络抖动」
+/// 与「进程真没了」。
+// cap: fixed — 心跳的六倍：可疑之后还丢四拍，一条活着的进程不会这样
+pub const DEAD_BEATS: u64 = 6;
+
+/// 多久没有进展算卡住：死亡期限的十倍。
+///
+/// 一次长任务（构建、一轮评测）可以十分钟没有可见输出；判据比它短会误报，比它
+/// 长则卡住的 agent 白占一个槽。
+// cap: fixed — 死亡期限的十倍：长任务十分钟不出声是常态，比这更短就是误报
+pub const STUCK_AFTER_DEATHS: u64 = 10;
+
 /// Health-checker timing thresholds.
+///
+/// 三个数都是 0 ＝ 没写：它们没有自己的值，读的是**这次生效的心跳**（见
+/// [`Self::effective_suspect_after_secs`] 等）。一个部署改心跳而判据不跟着改，
+/// 判据就会在一个不存在的拍子上打分。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct HealthCheckerConfig {
     pub suspect_after_secs: u64,
     pub dead_after_secs: u64,
     pub stuck_after_secs: u64,
 }
 
-impl Default for HealthCheckerConfig {
-    fn default() -> Self {
-        Self {
-            suspect_after_secs: 15,
-            dead_after_secs: 60,
-            stuck_after_secs: 600,
+impl HealthCheckerConfig {
+    /// 可疑：连丢 [`SUSPECT_BEATS`] 拍心跳。
+    pub fn effective_suspect_after_secs(&self, heartbeat_secs: u64) -> u64 {
+        if self.suspect_after_secs == 0 {
+            heartbeat_secs * SUSPECT_BEATS
+        } else {
+            self.suspect_after_secs
+        }
+    }
+
+    /// 死亡：连丢 [`DEAD_BEATS`] 拍心跳。
+    pub fn effective_dead_after_secs(&self, heartbeat_secs: u64) -> u64 {
+        if self.dead_after_secs == 0 {
+            heartbeat_secs * DEAD_BEATS
+        } else {
+            self.dead_after_secs
+        }
+    }
+
+    /// 卡住：没有进展达到死亡期限的 [`STUCK_AFTER_DEATHS`] 倍。
+    pub fn effective_stuck_after_secs(&self, heartbeat_secs: u64) -> u64 {
+        if self.stuck_after_secs == 0 {
+            self.effective_dead_after_secs(heartbeat_secs) * STUCK_AFTER_DEATHS
+        } else {
+            self.stuck_after_secs
         }
     }
 }
@@ -1462,9 +1581,11 @@ impl Default for SelfEvolutionWorkspaceConfig {
         Self {
             root: crate::paths::app_path_str("sandbox/workspaces"),
             target_dir: crate::paths::app_path_str("sandbox/src/target"),
-            ephemeral_ttl_secs: 21600,
-            orphan_branch_ttl_secs: 2592000,
-            cache_scan_interval_secs: 300,
+            // 两个寿命按「几小时 / 几天」写：一个 21600 读不出它是六小时。
+            ephemeral_ttl_secs: 6 * crate::day::SECONDS_PER_HOUR as u64,
+            orphan_branch_ttl_secs: 30 * crate::day::SECONDS_PER_DAY as u64,
+            // 与体积测量的节拍同一个数：缓存多久重走一遍，两处不该各说各的。
+            cache_scan_interval_secs: crate::claim_footprint::DEFAULT_SCAN_INTERVAL_SECS,
             target_max_bytes: CacheCapSetting::Unbounded,
         }
     }
@@ -1875,8 +1996,8 @@ impl Default for Config {
             raw_logger: crate::storage::RawLoggerConfig::default(),
             tier_migrator: TierMigratorConfig::default(),
             agent: AgentConfig {
-                registration_ttl_secs: 30,
-                heartbeat_interval_secs: 10,
+                registration_ttl_secs: AGENT_REGISTRATION_TTL_SECS,
+                heartbeat_interval_secs: AGENT_HEARTBEAT_INTERVAL_SECS,
             },
             metrics: MetricsConfig::default(),
             supervisor: SupervisorConfig::default(),
@@ -2107,6 +2228,50 @@ impl BoardWipLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 健康判据的三个阈值不是三个独立旋钮：没写的那几项跟着这次生效的心跳走，
+    /// 换一个心跳它们就跟着换（这条测试红，就是有一个数又变回自己挑的了）。
+    #[test]
+    fn the_health_thresholds_follow_the_heartbeat_in_force() {
+        let unset = HealthCheckerConfig::default();
+        for beat in [5u64, 10, 20, 60] {
+            assert_eq!(
+                unset.effective_suspect_after_secs(beat),
+                beat * SUSPECT_BEATS,
+                "可疑没有跟着 {beat} 秒的心跳走"
+            );
+            assert_eq!(
+                unset.effective_dead_after_secs(beat),
+                beat * DEAD_BEATS,
+                "死亡没有跟着 {beat} 秒的心跳走"
+            );
+            assert_eq!(
+                unset.effective_stuck_after_secs(beat),
+                beat * DEAD_BEATS * STUCK_AFTER_DEATHS,
+                "卡住没有跟着 {beat} 秒的心跳走"
+            );
+        }
+        // 部署写了的项不被心跳覆盖：它自己已经回答了这个问题。
+        let stated = HealthCheckerConfig {
+            suspect_after_secs: 7,
+            dead_after_secs: 8,
+            stuck_after_secs: 9,
+        };
+        assert_eq!(stated.effective_suspect_after_secs(60), 7);
+        assert_eq!(stated.effective_dead_after_secs(60), 8);
+        assert_eq!(stated.effective_stuck_after_secs(60), 9);
+    }
+
+    /// 心跳是注册 TTL 分出来的，不是第二个人挑的数：一个部署只该声明 TTL，
+    /// 心跳跟着它。
+    #[test]
+    fn the_heartbeat_is_the_registration_ttl_spread_over_its_beats() {
+        assert_eq!(
+            AGENT_HEARTBEAT_INTERVAL_SECS,
+            AGENT_REGISTRATION_TTL_SECS / BEATS_PER_REGISTRATION_TTL
+        );
+        assert!(AGENT_HEARTBEAT_INTERVAL_SECS > 0);
+    }
 
     /// 没配就是没配：每一列都读成 `None`，不是 0。0 在调用点是一个具体的
     /// 判据（「一条也不许进」），没配是「没有任何东西在拦」。

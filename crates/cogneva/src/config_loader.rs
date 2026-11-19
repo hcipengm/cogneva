@@ -1996,7 +1996,8 @@ mod tests {
             control_plane_interval_secs: 30,
             control_plane_url: None,
         };
-        let business: cog_supervisor::SupervisorConfig = cfg.into();
+        let business =
+            cog_supervisor::SupervisorConfig::from_core(cfg, cog_core::config::AGENT_HEARTBEAT_INTERVAL_SECS);
         assert_eq!(business.health_interval, std::time::Duration::from_secs(7));
         assert_eq!(business.broadcast_capacity, 512);
         assert_eq!(business.quota_threshold, 2000);

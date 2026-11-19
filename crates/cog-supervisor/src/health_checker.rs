@@ -86,42 +86,27 @@ pub struct HealthCheckerConfig {
     pub stuck_after: Duration,
 }
 
-/// 多久没心跳算可疑：15s。
-///
-/// 心跳是秒级的，15s 是「丢了两三拍」的量级；一到两拍的抖动不该被报成可疑。
-// cap: bound — 心跳是秒级的，15s 是「丢了两三拍」的量级；一到两拍的抖动不该被报成可疑
-const SUSPECT_AFTER: Duration = Duration::from_secs(15);
-
-/// 多久没心跳算死亡：60s。
-///
-/// 与可疑是同一把尺子的两档：进程真没了与网络抖动在这两个数之间分开。
-// cap: bound — 与可疑是同一把尺子的两档：进程真没了与网络抖动在这两个数之间分开
-const DEAD_AFTER: Duration = Duration::from_secs(60);
-
-/// 多久没有进展算卡住：10 分钟。
-///
-/// 一次长任务（构建、一轮评测）可以十分钟没有可见输出；判据比它短会误报，
-/// 比它长则卡住的 agent 白占一个槽。
-// cap: bound — 一次长任务（构建、一轮评测）可以十分钟没有可见输出；判据比它短会误报，比它长则卡住的 agent 白占一个槽
-const STUCK_AFTER: Duration = Duration::from_secs(600);
-
-impl Default for HealthCheckerConfig {
-    fn default() -> Self {
+impl HealthCheckerConfig {
+    /// 从交付配置取三项判据。
+    ///
+    /// 没写的项跟着**这次生效的心跳**走（拍数在 `cog_core::config` 里各有一个
+    /// 名字）：一个部署把心跳调成 5 秒，判据就跟着变成 10 / 30 / 300 秒，而不是
+    /// 继续按 10 秒的心跳打分。三个数因此不是三个独立旋钮，是同一个拍子的倍数。
+    pub fn from_core(c: &cog_core::HealthCheckerConfig, heartbeat_secs: u64) -> Self {
         Self {
-            suspect_after: SUSPECT_AFTER,
-            dead_after: DEAD_AFTER,
-            stuck_after: STUCK_AFTER,
+            suspect_after: Duration::from_secs(c.effective_suspect_after_secs(heartbeat_secs)),
+            dead_after: Duration::from_secs(c.effective_dead_after_secs(heartbeat_secs)),
+            stuck_after: Duration::from_secs(c.effective_stuck_after_secs(heartbeat_secs)),
         }
     }
 }
 
-impl From<cog_core::HealthCheckerConfig> for HealthCheckerConfig {
-    fn from(c: cog_core::HealthCheckerConfig) -> Self {
-        Self {
-            suspect_after: Duration::from_secs(c.suspect_after_secs),
-            dead_after: Duration::from_secs(c.dead_after_secs),
-            stuck_after: Duration::from_secs(c.stuck_after_secs),
-        }
+impl Default for HealthCheckerConfig {
+    fn default() -> Self {
+        Self::from_core(
+            &cog_core::HealthCheckerConfig::default(),
+            cog_core::config::AGENT_HEARTBEAT_INTERVAL_SECS,
+        )
     }
 }
 
