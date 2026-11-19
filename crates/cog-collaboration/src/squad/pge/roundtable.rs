@@ -98,11 +98,21 @@ impl std::fmt::Debug for PgeRoundtableConfig {
     }
 }
 
+// 五轮：每一轮所有分支都出一份方案并互相打分，五轮之后新的一轮已经不再改变
+// 排序，再跑只是多花一轮的分支开销。
+// cap: bound — 五轮：轮次再多不再改变排序，只是多花一轮的分支开销
+const ROUNDTABLE_MAX_ROUNDS: u32 = 5;
+
+// 八成以上分支同意才收口。阈值定在多数而非全体：五五开说明这一轮没有形成
+// 结论，而要求全体一致会让任何一条少数意见把桌子永远钉在原地。
+// cap: bound — 0.8：多数即收口；五五开没结论，全体一致则被少数意见钉死
+const ROUNDTABLE_CONSENSUS: f64 = 0.8;
+
 impl Default for PgeRoundtableConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 5,
-            consensus_threshold: 0.8,
+            max_iterations: ROUNDTABLE_MAX_ROUNDS,
+            consensus_threshold: ROUNDTABLE_CONSENSUS,
             skill_ids: Vec::new(),
             context_board: None,
             board_store: None,
@@ -1503,6 +1513,38 @@ fn board_mirror_trim(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 轮次上限与共识线各只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_roundtable_default_reads_its_rounds_and_consensus_line() {
+        let cfg = PgeRoundtableConfig::default();
+        assert_eq!(cfg.max_iterations, ROUNDTABLE_MAX_ROUNDS);
+        assert_eq!(cfg.consensus_threshold, ROUNDTABLE_CONSENSUS);
+
+        let source = include_str!("roundtable.rs");
+        let body = source
+            .split("impl Default for PgeRoundtableConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.trim().starts_with(|c: char| c.is_ascii_digit())
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     struct MockAgent {
         responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,

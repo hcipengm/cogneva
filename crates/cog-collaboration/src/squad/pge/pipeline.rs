@@ -48,10 +48,15 @@ pub struct PgePipelineConfig {
     pub independent_review: bool,
 }
 
+// 三次完整重跑：一次重跑是重规划、重生成、重评审，评审还带一遍独立复核；
+// 第三次仍然不过，说明问题不在一次生成的抖动里。
+// cap: bound — 三次：每次重跑都带独立复核，第三次不过就不是抖动了
+const PGE_FULL_PASSES: u32 = 3;
+
 impl Default for PgePipelineConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            max_retries: PGE_FULL_PASSES,
             timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
             local_repair_max: 0,
             stall_threshold: STALL_THRESHOLD,
@@ -1011,6 +1016,40 @@ mod tests {
     use cog_core::contract::outcome::{
         is_deterministic_failure, DEGENERATE_LOOP_PREFIX, EMPTY_GENERATION_PREFIX,
     };
+
+    /// 整链重跑的次数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_pipeline_default_reads_its_full_pass_count() {
+        assert_eq!(PgePipelineConfig::default().max_retries, PGE_FULL_PASSES);
+
+        let source = include_str!("pipeline.rs");
+        let body = source
+            .split("impl Default for PgePipelineConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 不是旋钮，是「没写」：`local_repair_max` 的 0 关掉
+                        // 本地修复，它没有第二个取值要命名。
+                        && value != "0"
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     /// Test-only mock implementing the object-level [`cog_core::Agent`] trait.
     /// All methods except [`prompt`] are no-op stubs.
