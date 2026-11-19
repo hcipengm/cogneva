@@ -114,7 +114,7 @@ impl Default for PromotionGateConfig {
             rollback_breaker_threshold: 2,
             failure_breaker_threshold: 3,
             soak_secs: 600,
-            awaiting_review_timeout_secs: 86_400,
+            awaiting_review_timeout_secs: cog_core::day::SECONDS_PER_DAY as u64,
             // 白名单故意收窄（宁严勿宽）：只有纯工具实现、前端、文档。
             // 未列出的路径一律按 L2 转人工。
             // `docs/` 是仓库内的外部/产品文档目录（可入库）；内部文档
@@ -163,7 +163,7 @@ impl Default for PromotionGateConfig {
                 .map(|s| s.to_string())
                 .collect(),
             trend_report_enabled: true,
-            trend_report_interval_secs: 604_800,
+            trend_report_interval_secs: cog_core::day::SECONDS_PER_WEEK as u64,
             gitops: GitOpsConfig::default(),
         }
     }
@@ -345,13 +345,22 @@ pub struct ChangeJobConfig {
     pub kubectl_bin: String,
 }
 
+/// 派发方在 Job 结束之后还留给自己的收尾时间：读日志、记终止消息、清对象。
+// cap: fixed — 收尾那几步是分钟级的：十分钟够它跑完，再长只是白等
+const CHANGE_JOB_TEARDOWN_SECS: u64 = 600;
+
 impl Default for ChangeJobConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             max_parallel: 1,
-            deadline_secs: 9600,
-            ttl_secs_after_finished: 86400,
+            // 算出来的，不是挑的：验证预算 ＋ 构建预算 ＋ 构建闸门排队 ＋ 收尾。
+            // 四段里改任何一段，这个上界跟着改（见字段上的注释）。
+            deadline_secs: crate::promotion_eval::DEFAULT_EVAL_TIMEOUT_SECS
+                + crate::build_gate::SWITCH_FIELD_WAIT.as_secs()
+                + cog_core::config::BuildGateConfig::default().wait_secs
+                + CHANGE_JOB_TEARDOWN_SECS,
+            ttl_secs_after_finished: cog_core::day::SECONDS_PER_DAY as u64,
             poll_interval_secs: 10,
             job_cpu_request: "500m".into(),
             job_memory_request: "2Gi".into(),
@@ -517,8 +526,8 @@ impl Default for BaselinePortConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_secs: 3600,
-            retry_cooldown_secs: 86_400,
+            poll_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64,
+            retry_cooldown_secs: cog_core::day::SECONDS_PER_DAY as u64,
         }
     }
 }
@@ -866,14 +875,14 @@ impl Default for MainlineDeployerConfig {
             cargo_build_jobs: 2,
             soak_secs: 120,
             restart_threshold: 1,
-            failure_cooldown_secs: 3600,
+            failure_cooldown_secs: cog_core::day::SECONDS_PER_HOUR as u64,
             rollout_timeout_secs: 300,
             startup_timeout_secs: 900,
             job_cpu_request: "200m".into(),
             job_memory_request: "64Mi".into(),
             job_cpu_limit: "2".into(),
             job_memory_limit: "512Mi".into(),
-            heartbeat_log_secs: 3600,
+            heartbeat_log_secs: cog_core::day::SECONDS_PER_HOUR as u64,
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
             observability_stack: ObservabilityStackConfig::default(),
@@ -888,7 +897,7 @@ impl Default for MainlineDeployerConfig {
             // 声明量的一半：规则 data_volume_over_declared_size 在 1.0 开火，
             // 回收在它之前把占用压回叠层基底的大小，中间留出一倍余量。
             registry_maintenance_threshold: 0.5,
-            registry_maintenance_cooldown_secs: 21600,
+            registry_maintenance_cooldown_secs: 6 * cog_core::day::SECONDS_PER_HOUR as u64,
             targets: vec![
                 RolloutTargetConfig {
                     deployment: cog_core::topology::SECURITY_GATEWAY.into(),

@@ -104,11 +104,12 @@ pub struct MaintenanceConfig {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
-            decay_interval_secs: 3600,
-            decay_age_threshold_secs: 7 * 24 * 3600,
+            // 两个时间长度按「几小时 / 几天」写：一个 3600 读不出它是几小时。
+            decay_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64,
+            decay_age_threshold_secs: cog_core::day::SECONDS_PER_WEEK as u64,
             decay_importance_threshold: 0.5,
             decay_namespaces: vec!["default".into()],
-            refusal_sweep_interval_secs: 1800,
+            refusal_sweep_interval_secs: cog_core::day::SECONDS_PER_HOUR as u64 / 2,
             refusal_sweep_namespaces: vec!["reflection".into()],
         }
     }
@@ -212,24 +213,26 @@ impl Default for IngestConfig {
     fn default() -> Self {
         Self {
             max_retries: 3,
-            retry_base_delay_ms: 1000,
+            retry_base_delay_ms: cog_core::day::MILLIS_PER_SECOND as u64,
             enable_dlq: true,
             dlq_namespace: "dlq".into(),
             extraction_concurrency: 4,
             extraction_input_budget_tokens: DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
             startup_reconcile: true,
-            reconcile_lookback_hours: 24,
+            reconcile_lookback_hours: cog_core::day::HOURS_PER_DAY as u64,
             aged_out_redrive_batch: 32,
-            reconcile_interval_secs: 600,
+            reconcile_interval_secs: (10 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             pull_pause_after_failures: 3,
-            pull_pause_initial_secs: 60,
-            pull_pause_max_secs: 1800,
-            pool_check_secs: 30,
-            pull_resume_observation_secs: 300,
+            pull_pause_initial_secs: cog_core::day::SECONDS_PER_MINUTE as u64,
+            pull_pause_max_secs: (30 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            pool_check_secs: (cog_core::day::SECONDS_PER_MINUTE / 2) as u64,
+            pull_resume_observation_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             backlog_warn_at: 64,
             bus_group: "memory-ingestor".into(),
-            bus_claim_interval_secs: 30,
-            bus_claim_min_idle_ms: 900_000,
+            bus_claim_interval_secs: (cog_core::day::SECONDS_PER_MINUTE / 2) as u64,
+            bus_claim_min_idle_ms: (15
+                * cog_core::day::SECONDS_PER_MINUTE
+                * cog_core::day::MILLIS_PER_SECOND) as u64,
             bus_claim_batch: 32,
             benchmark_namespaces: Vec::new(),
             benchmark_canary_markers: Vec::new(),

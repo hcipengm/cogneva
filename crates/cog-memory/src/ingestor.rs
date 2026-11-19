@@ -347,30 +347,13 @@ pub struct MemoryIngestorConfig {
 
 impl Default for MemoryIngestorConfig {
     fn default() -> Self {
+        // 每个数都取自 `IngestConfig` 的那一份声明——这里再写一遍就是同一件
+        // 事的第二个说法，改一处忘一处的那天，两处会各自以为是对方在管。
+        // 唯一例外是读侧命名空间：兜底构造不设闸（它只出现在单测里，测的是
+        // 抽取本身），装配路径一律走 `From<&IngestConfig>` 并把读侧声明带上。
         Self {
-            max_retries: 3,
-            retry_base_delay_ms: 1000,
-            enable_dlq: true,
-            dlq_namespace: "dlq".into(),
-            extraction_concurrency: 4,
-            startup_reconcile: true,
-            reconcile_lookback_hours: 24,
-            aged_out_redrive_batch: 32,
-            reconcile_interval_secs: 600,
-            pull_pause_after_failures: 3,
-            pull_pause_initial_secs: 60,
-            pull_pause_max_secs: 1800,
-            pool_check_secs: 30,
-            pull_resume_observation_secs: 300,
-            backlog_warn_at: 64,
-            // 兜底构造不设闸：它只出现在单测里（测的是抽取本身），
-            // 装配路径一律走 `From<&IngestConfig>` 并把读侧声明带上。
             read_namespaces: Vec::new(),
-            bus_group: "memory-ingestor".into(),
-            bus_claim_interval_secs: 30,
-            bus_claim_min_idle_ms: 900_000,
-            bus_claim_batch: 32,
-            benchmark_isolation: BenchmarkIsolation::default(),
+            ..Self::from(&IngestConfig::default())
         }
     }
 }
