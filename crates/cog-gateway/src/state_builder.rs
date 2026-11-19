@@ -124,7 +124,9 @@ pub async fn build_gateway_state(
         // 存生效值而不是原始字段：0 在这里会被建成一条 0 秒的期限，每个请求立刻 408，
         // 而「没写」与「不限」在 0 上是同一个数。
         request_timeout_secs: std::sync::atomic::AtomicU64::new(
-            config.gateway.effective_request_timeout_secs(),
+            config
+                .gateway
+                .effective_request_timeout_secs(config.system.shutdown_timeout_ms),
         ),
         event_tx: event_tx.clone(),
         task_event_tx: task_event_tx.clone(),

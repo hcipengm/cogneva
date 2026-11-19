@@ -593,19 +593,24 @@ pub struct GatewayConfig {
     /// [`GatewayConfig::effective_websocket_heartbeat_secs`]）。
     #[serde(default = "default_websocket_timeout_secs")]
     pub websocket_timeout_secs: u64,
-    /// 客户端多久不发消息就断开。0 ＝ 没写，取
-    /// [`DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS`]。
+    /// 客户端多久不发消息就断开。0 ＝ 没写，取心跳的
+    /// [`WEBSOCKET_BEATS_BEFORE_DROPPING`] 倍（读侧走
+    /// [`GatewayConfig::effective_websocket_inactivity_timeout_secs`]）。
     #[serde(default = "default_websocket_inactivity_timeout_secs")]
     pub websocket_inactivity_timeout_secs: u64,
     /// 没有任何运行期读取；留着只为兼容旧文档里的这个键（`git log` 有它的来历）。
     #[serde(default = "default_websocket_tick_secs")]
     pub websocket_tick_secs: u64,
-    /// 通知列表的默认页大小。0 ＝ 没写，取
-    /// [`DEFAULT_NOTIFICATION_PAGE_LIMIT`]。
+    /// 通知列表的默认页大小。0 ＝ 没写，取列表面共用的
+    /// [`A2A_LIST_PAGE_SIZE`]。
     #[serde(default = "default_notification_limit")]
     pub notification_limit: u32,
-    /// 一次 HTTP 请求的应答期限。0 ＝ 没写，取
-    /// [`DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS`]。
+    /// 一次 HTTP 请求的应答期限。
+    ///
+    /// 0 ＝ 没写，取本次停机的排空时长（`system.shutdown_timeout_ms`，
+    /// 由 [`GatewayConfig::effective_request_timeout_secs`] 读进来）：排空愿意为
+    /// 一条在飞请求等多久，请求自己就可以占这条连接多久。这个数没有内置常数——
+    /// 它要么由部署给，要么跟着排空走。
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     /// How often the contribution OAuth refresher wakes up. 0 = built-in
@@ -678,9 +683,12 @@ impl GatewayConfig {
 
     /// Effective client inactivity timeout; never zero. Zero would disconnect
     /// every client the moment it connects.
+    ///
+    /// 没写时不是取一个常数，而是跟着**这次生效的心跳**走：三拍。心跳被部署改了，
+    /// 掉线期限跟着改，两处不会各说各的。
     pub fn effective_websocket_inactivity_timeout_secs(&self) -> u64 {
         if self.websocket_inactivity_timeout_secs == 0 {
-            DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS
+            self.effective_websocket_heartbeat_secs() * WEBSOCKET_BEATS_BEFORE_DROPPING
         } else {
             self.websocket_inactivity_timeout_secs
         }
@@ -690,7 +698,7 @@ impl GatewayConfig {
     /// list response empty, which reads as "you have no notifications".
     pub fn effective_notification_limit(&self) -> u32 {
         if self.notification_limit == 0 {
-            DEFAULT_NOTIFICATION_PAGE_LIMIT
+            A2A_LIST_PAGE_SIZE
         } else {
             self.notification_limit
         }
@@ -698,9 +706,13 @@ impl GatewayConfig {
 
     /// Effective per-request answer deadline; never zero. Zero would build a
     /// zero-second timeout and answer every request with 408 immediately.
-    pub fn effective_request_timeout_secs(&self) -> u64 {
+    ///
+    /// 没写时取这次停机的排空时长（`system.shutdown_timeout_ms`）：排空愿意为一条
+    /// 在飞请求等多久，请求自己就可以占这条连接多久。排空不是常数而是一个配置项，
+    /// 所以这里要读它，而不是回落到一个写死的数。
+    pub fn effective_request_timeout_secs(&self, shutdown_timeout_ms: u64) -> u64 {
         if self.request_timeout_secs == 0 {
-            DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS
+            (shutdown_timeout_ms / 1000).max(1)
         } else {
             self.request_timeout_secs
         }
@@ -716,46 +728,54 @@ pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS: u64 = 3600;
 // cap: bound — 剩不到 4h 就换：够令牌交换、Secret 改写与网关滚动都在到期前落完
 pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS: u64 = 4 * 3600;
 
-/// 网关一个请求的应答期限。
-///
-/// 它量的是「客户端还愿意等多久」，不是某件活的预算：那件活在期限之后仍会自己走完，
-/// 只是这一头没有人在等它的回应了。「这件活该不该停」由
-/// [`crate::declared_wall`] 按实测的动静判。0 曾是这个字段的默认值，读侧把它当成
-/// 「不限」——而超时中间件照样会建一条 0 秒的期限，于是每个请求立刻 408。
-// cap: bound — 量的是客户端愿意等的时长；再长只会多留一条不会回话的连接
-pub const DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS: u64 = 30;
-
 /// WebSocket 心跳间隔：半开连接靠自己发现不了，一次 ping 让对端在下一次心跳里
 /// 暴露自己已经走了。
-// cap: bound — 与不活跃期限成 1:3：连续两次心跳缺席，才判这条连接死了
+///
+/// 控制台的 `EventStreamClient.HEARTBEAT_INTERVAL_MS`（`web/src/transport/websocket.ts`）
+/// 是同一个拍子：同一条 socket 的两端，一边换了拍另一边要跟着换，
+/// `the_console_and_the_gateway_beat_at_one_cadence` 判这处一致。
+// cap: fixed — 控制台的 `HEARTBEAT_INTERVAL_MS = 30000`：同一条 socket 的两端共用一个拍子
 pub const DEFAULT_WEBSOCKET_HEARTBEAT_SECS: u64 = 30;
 
-/// WebSocket 客户端不活跃期限：这么久没有一条消息就断开。
-// cap: bound — 心跳的 3 倍，允许连续两次心跳缺席再断，避免一次抖动踢掉活人
-pub const DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS: u64 = 90;
+/// 一条连接连丢几拍心跳才算死。
+///
+/// 这是两端约定本身，不是界：不活跃期限 = 心跳 × 它。必须是 3 而不是 1——一次
+/// 抖动的丢包不该踢掉一个活着的人；也不能再大，控制台自己 2 拍 ＋ 5 秒就放弃并
+/// 重连了，服务端排在它后面才轮得到客户端先发现掉线。
+// cap: fixed — 心跳约定：连续丢三拍才断（一次抖动不算离线）
+pub const WEBSOCKET_BEATS_BEFORE_DROPPING: u64 = 3;
 
-/// 通知列表的默认页大小：一屏滚动能读完的量，其余由游标翻页。
-// cap: bound — 一页要能在一屏里读完；更大的页只让每条响应更贵
-pub const DEFAULT_NOTIFICATION_PAGE_LIMIT: u32 = 50;
+/// 列表端点的默认页大小：一屏滚动能读完的量，其余由游标翻页。
+///
+/// 数出自 A2A 规范对 `page_size` 的说明——不写就按 50（见
+/// `crates/cog-gateway/src/a2a.rs` 的 `LIST_PAGE_DEFAULT`，它读的就是这里）。
+/// 治理面的 `REFUSED_PAGE` / `TIMELINE_PAGE` 也是这一屏：通知、拒绝、时间线
+/// 各写一个 50 只会让「一屏」在几个面上慢慢走散。
+// cap: fixed — A2A 规范对 `page_size` 的默认值：不写就按 50，本仓列表面都按这一屏取
+pub const A2A_LIST_PAGE_SIZE: u32 = 50;
 
 /// 就绪任务的轮询节拍：任务就绪后最多等一拍被发现。
-// cap: bound — 再密是空转烧 CPU，再疏是让已就绪的任务白等
-pub const DEFAULT_READY_TASK_POLL_INTERVAL_SECS: u64 = 5;
+///
+/// 取的是消费者的阻塞读预算：等待就绪任务的 executor 以
+/// `redis_read_block_ms` 阻塞读一次，拍长等于它，一条新就绪的任务最多等到
+/// 下一次读超时；再长，下一次读超时之后还要再等一拍才有人回来。
+// cap: fixed — 一拍＝一个消费者阻塞读预算（`DEFAULT_REDIS_READ_BLOCK_MS`），两处不各走各的
+pub const DEFAULT_READY_TASK_POLL_INTERVAL_SECS: u64 = DEFAULT_REDIS_READ_BLOCK_MS / 1000;
 
 fn default_websocket_timeout_secs() -> u64 {
     DEFAULT_WEBSOCKET_HEARTBEAT_SECS
 }
 fn default_websocket_inactivity_timeout_secs() -> u64 {
-    DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS
+    0
 }
 fn default_websocket_tick_secs() -> u64 {
     0
 }
 fn default_notification_limit() -> u32 {
-    DEFAULT_NOTIFICATION_PAGE_LIMIT
+    0
 }
 fn default_request_timeout_secs() -> u64 {
-    DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS
+    0
 }
 fn default_ready_task_poll_interval_secs() -> u64 {
     DEFAULT_READY_TASK_POLL_INTERVAL_SECS
@@ -2272,23 +2292,24 @@ mod tests {
     /// 读侧不是「不限」：`request_timeout_secs` 0 建一条 0 秒的超时期限（每个请求立刻
     /// 408），`websocket_timeout_secs` 0 让零周期的定时器构造即 panic，
     /// `websocket_inactivity_timeout_secs` 0 一连上就断，`notification_limit` 0 让每页
-    /// 都是空的，`ready_task_poll_interval_secs` 0 被读侧夹到 1 秒成了忙轮询。现在默认
-    /// 值就是内置常量；文档里显式写 0 的那一半由 `effective_*` 换回同一个常量。
+    /// 都是空的，`ready_task_poll_interval_secs` 0 被读侧夹到 1 秒成了忙轮询。现在
+    /// 每个 0 都在读侧换成它的合法来源，没有一个是 0 秒的期限。
     #[test]
     fn an_unwritten_or_zero_gateway_bound_reads_the_built_in_value() {
+        let drain_ms = SystemConfig::default().shutdown_timeout_ms;
         let absent: GatewayConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(
-            absent.websocket_timeout_secs,
+            absent.effective_websocket_heartbeat_secs(),
             DEFAULT_WEBSOCKET_HEARTBEAT_SECS
         );
         assert_eq!(
-            absent.websocket_inactivity_timeout_secs,
-            DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS
+            absent.effective_websocket_inactivity_timeout_secs(),
+            WEBSOCKET_BEATS_BEFORE_DROPPING * DEFAULT_WEBSOCKET_HEARTBEAT_SECS
         );
-        assert_eq!(absent.notification_limit, DEFAULT_NOTIFICATION_PAGE_LIMIT);
+        assert_eq!(absent.effective_notification_limit(), A2A_LIST_PAGE_SIZE);
         assert_eq!(
-            absent.request_timeout_secs,
-            DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS
+            absent.effective_request_timeout_secs(drain_ms),
+            drain_ms / 1000
         );
 
         let zeroed: GatewayConfig = serde_json::from_str(
@@ -2296,7 +2317,7 @@ mod tests {
                 "notification_limit": 0, "request_timeout_secs": 0}"#,
         )
         .unwrap();
-        // 原始字段照文档说的存 0；读到界的地方拿到的是常量，不是 0。
+        // 原始字段照文档说的存 0；读到界的地方换回它的来源，不是 0。
         assert_eq!(zeroed.request_timeout_secs, 0);
         assert_eq!(
             zeroed.effective_websocket_heartbeat_secs(),
@@ -2304,18 +2325,15 @@ mod tests {
         );
         assert_eq!(
             zeroed.effective_websocket_inactivity_timeout_secs(),
-            DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS
+            WEBSOCKET_BEATS_BEFORE_DROPPING * DEFAULT_WEBSOCKET_HEARTBEAT_SECS
         );
+        assert_eq!(zeroed.effective_notification_limit(), A2A_LIST_PAGE_SIZE);
         assert_eq!(
-            zeroed.effective_notification_limit(),
-            DEFAULT_NOTIFICATION_PAGE_LIMIT
-        );
-        assert_eq!(
-            zeroed.effective_request_timeout_secs(),
-            DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS
+            zeroed.effective_request_timeout_secs(drain_ms),
+            drain_ms / 1000
         );
 
-        // 写了一个正数就照它来：生效值不是「总是常量」。
+        // 写了一个正数就照它来：生效值不是「总是那个兜底」。
         let set: GatewayConfig = serde_json::from_str(
             r#"{"websocket_timeout_secs": 7, "websocket_inactivity_timeout_secs": 21,
                 "notification_limit": 9, "request_timeout_secs": 45}"#,
@@ -2324,17 +2342,24 @@ mod tests {
         assert_eq!(set.effective_websocket_heartbeat_secs(), 7);
         assert_eq!(set.effective_websocket_inactivity_timeout_secs(), 21);
         assert_eq!(set.effective_notification_limit(), 9);
-        assert_eq!(set.effective_request_timeout_secs(), 45);
+        assert_eq!(set.effective_request_timeout_secs(drain_ms), 45);
     }
 
-    /// 不活跃期限是心跳的三倍——这就是「丢一拍不算离线、连丢三拍才断」那条约定的
-    /// 机器形态。改心跳而不改它，读者会从注释里读到一个不再成立的倍数。
+    /// 不活跃期限跟的是**这次生效的心跳**，不是一条写死的倍数：心跳被部署改成
+    /// 10 秒时，掉线期限跟着变 30 秒，而不是还停在按默认心跳算出来的 90 秒。
     #[test]
-    fn the_inactivity_timeout_stays_three_heartbeats() {
+    fn the_inactivity_timeout_follows_the_effective_heartbeat() {
+        let set: GatewayConfig = serde_json::from_str(r#"{"websocket_timeout_secs": 10}"#).unwrap();
         assert_eq!(
-            DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS,
-            3 * DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+            set.effective_websocket_inactivity_timeout_secs(),
+            WEBSOCKET_BEATS_BEFORE_DROPPING * 10
         );
+        // 两边都写了就各按各的：跟着心跳只发生在「没写」这一半。
+        let both: GatewayConfig = serde_json::from_str(
+            r#"{"websocket_timeout_secs": 10, "websocket_inactivity_timeout_secs": 90}"#,
+        )
+        .unwrap();
+        assert_eq!(both.effective_websocket_inactivity_timeout_secs(), 90);
     }
 
     /// 就绪轮询的 0 同样读作「没写」：读侧曾经把 0 夹到 1 秒，那是把「空转」当成
@@ -2355,6 +2380,78 @@ mod tests {
         let set: DagExecutorConfig =
             serde_json::from_str(r#"{"ready_task_poll_interval_secs": 12}"#).unwrap();
         assert_eq!(set.effective_ready_task_poll_interval_secs(), 12);
+    }
+
+    /// 没写请求期限时，它取的就是**这次停机的排空时长**——部署把排空改成 60 秒，
+    /// 没写期限的网关就等 60 秒，而不是回到一个写死的 30。
+    #[test]
+    fn an_unwritten_request_deadline_is_the_shutdown_drain() {
+        let absent: GatewayConfig = serde_json::from_str("{}").unwrap();
+        for drain_ms in [15_000u64, 30_000, 60_000] {
+            assert_eq!(
+                absent.effective_request_timeout_secs(drain_ms),
+                drain_ms / 1000,
+                "排空 {drain_ms} ms 时，没写的请求期限没有跟着它走"
+            );
+        }
+        // 排空短到不足一秒时仍给一秒：0 秒的期限会让每个请求立刻 408。
+        assert_eq!(absent.effective_request_timeout_secs(400), 1);
+    }
+
+    /// 控制台与服务端是同一条 socket 的两端：拍子、判死的先后都在这两份源码里。
+    ///
+    /// 控制台的 `HEARTBEAT_INTERVAL_MS` 与服务端心跳是同一个数；它的 `PONG_TIMEOUT_MS`
+    /// （2 拍 ＋ 5 秒）必须**先于**服务端的不活跃期限触发，这样掉线由浏览器自己发现并
+    /// 重连；反过来则是服务端先断一条浏览器还以为是活的会话，用户看到的是「连着但没反应」。
+    #[test]
+    fn the_console_and_the_gateway_beat_at_one_cadence() {
+        let console = include_str!("../../../web/src/transport/websocket.ts");
+
+        let marker = "HEARTBEAT_INTERVAL_MS =";
+        let at = console
+            .find(marker)
+            .unwrap_or_else(|| panic!("控制台里找不到 `{marker}`：这条判据的锚点搬走了"));
+        let digits: String = console[at + marker.len()..]
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let console_heartbeat_ms: u64 = digits
+            .parse()
+            .unwrap_or_else(|_| panic!("`{marker}` 后面不是一个数：{digits:?}"));
+        assert_eq!(
+            console_heartbeat_ms,
+            DEFAULT_WEBSOCKET_HEARTBEAT_SECS * 1000,
+            "控制台心跳与服务端心跳不是同一个拍子"
+        );
+
+        // 控制台的放弃公式必须是「两拍 ＋ 5 秒」，服务端期限必须排在它后面。
+        assert!(
+            console.contains("EventStreamClient.HEARTBEAT_INTERVAL_MS * 2 + 5000"),
+            "控制台的 `PONG_TIMEOUT_MS` 公式变了：这条判据要跟着重算"
+        );
+        let console_gives_up_ms = console_heartbeat_ms * 2 + 5000;
+        let server_drops_ms =
+            WEBSOCKET_BEATS_BEFORE_DROPPING * DEFAULT_WEBSOCKET_HEARTBEAT_SECS * 1000;
+        assert!(
+            server_drops_ms > console_gives_up_ms,
+            "服务端不活跃期限 {server_drops_ms} ms 不晚于控制台放弃的 {console_gives_up_ms} ms：\
+             掉线会由服务端先发现，浏览器看到的是「连着但没反应」"
+        );
+    }
+
+    /// 就绪轮询的拍长就是消费者阻塞读一次的预算：一条新就绪的任务最多等到下一次读超时。
+    ///
+    /// 拍比它长时，读超时之后还要再等一拍才有人回来，那段空窗没人说得出为什么是
+    /// 这么长；拍比它短则每一拍都写一条消费者还没读完的消息。
+    #[test]
+    fn the_ready_poll_is_one_blocking_read_budget() {
+        assert_eq!(
+            DEFAULT_READY_TASK_POLL_INTERVAL_SECS * 1000,
+            DEFAULT_REDIS_READ_BLOCK_MS,
+            "就绪轮询拍长与消费者阻塞读预算不再同值：这两处一个决定「多久看一眼」，\
+             一个决定「一眼看多久」"
+        );
     }
 
     /// The synthesizer and the startup loader must agree on where hooks live,

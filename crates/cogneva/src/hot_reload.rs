@@ -10,6 +10,7 @@ pub fn apply_gateway_config_update(
     current: &std::sync::RwLock<cog_core::GatewayConfig>,
     new_gateway: &cog_core::GatewayConfig,
     request_timeout_secs: &std::sync::atomic::AtomicU64,
+    shutdown_timeout_ms: u64,
 ) -> (Vec<String>, Vec<String>) {
     let mut applied = Vec::new();
     let mut need_restart = Vec::new();
@@ -53,9 +54,9 @@ pub fn apply_gateway_config_update(
         // NOTE: http_port / ws_port / metrics_port / internal_port are intentionally
         // preserved so the already-bound sockets remain valid.
     }
-    // 与启动时同一口径：原子里存生效值，0 在这里等于内置期限。
+    // 与启动时同一口径：原子里存生效值，没写时取这次停机的排空时长。
     request_timeout_secs.store(
-        new_gateway.effective_request_timeout_secs(),
+        new_gateway.effective_request_timeout_secs(shutdown_timeout_ms),
         std::sync::atomic::Ordering::Relaxed,
     );
     applied.push("gateway_timeouts_updated".to_string());
@@ -99,7 +100,7 @@ mod tests {
 
         let request_timeout = std::sync::atomic::AtomicU64::new(30);
         let (applied, need_restart) =
-            apply_gateway_config_update(&current, &new_config, &request_timeout);
+            apply_gateway_config_update(&current, &new_config, &request_timeout, 30_000);
 
         assert!(
             need_restart.iter().any(|s| s.contains("ports_changed")),
@@ -159,7 +160,7 @@ mod tests {
 
         let request_timeout = std::sync::atomic::AtomicU64::new(30);
         let (applied, need_restart) =
-            apply_gateway_config_update(&current, &new_config, &request_timeout);
+            apply_gateway_config_update(&current, &new_config, &request_timeout, 30_000);
 
         assert!(
             need_restart.is_empty(),
