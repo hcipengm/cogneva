@@ -142,7 +142,7 @@ impl Default for NatsConfig {
             urls: Vec::new(),
             auth: NatsAuthConfig::default(),
             tls: NatsTlsConfig::default(),
-            consumer_ack_wait_secs: 900,
+            consumer_ack_wait_secs: (15 * crate::day::SECONDS_PER_MINUTE) as u64,
             consumer_max_deliver: 5,
             consumer_max_ack_pending: 1024,
             stream_retention: "workqueue".into(),
@@ -786,7 +786,7 @@ fn default_ready_task_poll_interval_secs() -> u64 {
 /// 取舍，而重跑的上界由任务自己的预算决定——30s 意味着一次换版最多让每个在跑
 /// 任务白跑半分钟，代价小于更密的快照对 agent 命令通道的占用。
 fn default_task_checkpoint_interval_secs() -> u64 {
-    30
+    (crate::day::SECONDS_PER_MINUTE / 2) as u64
 }
 fn default_scheduled_task_stall_secs() -> u64 {
     DEFAULT_READY_CLAIM_IDLE_SECS
@@ -808,7 +808,7 @@ fn default_archive_after_secs() -> u64 {
     2 * crate::day::SECONDS_PER_DAY as u64
 }
 fn default_archive_poll_interval_secs() -> u64 {
-    300
+    (5 * crate::day::SECONDS_PER_MINUTE) as u64
 }
 fn default_decomposition_max_attempts() -> u32 {
     2
@@ -817,21 +817,21 @@ fn default_decomposition_orphan_watch_enabled() -> bool {
     true
 }
 fn default_decomposition_orphan_poll_interval_secs() -> u64 {
-    300
+    (5 * crate::day::SECONDS_PER_MINUTE) as u64
 }
 fn default_decomposition_orphan_stall_after_secs() -> u64 {
     // 半小时。
     crate::day::SECONDS_PER_HOUR as u64 / 2
 }
 fn default_decomposition_orphan_alert_dwell_secs() -> u64 {
-    600
+    (10 * crate::day::SECONDS_PER_MINUTE) as u64
 }
 fn default_result_claim_idle_secs() -> u64 {
     // 与就绪流的清扫窗口同一个数：发布方的停止阈值与清扫者的认领阈值是同一条。
     DEFAULT_READY_CLAIM_IDLE_SECS
 }
 fn default_result_claim_interval_secs() -> u64 {
-    60
+    crate::day::SECONDS_PER_MINUTE as u64
 }
 fn default_result_claim_batch() -> usize {
     16
@@ -1160,7 +1160,7 @@ impl Default for HookEngineConfig {
         Self {
             dedup_window_secs: 1,
             default_rate_limit: RateLimitConfig::default(),
-            hook_timeout_secs: 30,
+            hook_timeout_secs: (crate::day::SECONDS_PER_MINUTE / 2) as u64,
         }
     }
 }
@@ -1258,23 +1258,23 @@ impl Default for SystemConfig {
         Self {
             event_channel_capacity: 1024,
             task_event_channel_capacity: 256,
-            shutdown_timeout_ms: 30_000,
-            timeout_checker_interval_secs: 30,
+            shutdown_timeout_ms: (30 * crate::day::MILLIS_PER_SECOND) as u64,
+            timeout_checker_interval_secs: (crate::day::SECONDS_PER_MINUTE / 2) as u64,
             loop_restart_max_consecutive: 3,
             loop_restart_backoff_floor_secs: 5,
-            partition_maintenance_interval_secs: 3600,
+            partition_maintenance_interval_secs: crate::day::SECONDS_PER_HOUR as u64,
             sandbox_executor_url: None,
             require_tool_identity: false,
             pattern_db_max_size: 256,
-            pattern_max_age_days: 30,
+            pattern_max_age_days: crate::day::DAYS_PER_MONTH,
             pg_max_connections: 50,
             pg_min_connections: 2,
             pg_acquire_timeout_secs: 10,
-            pg_idle_timeout_secs: 600,
+            pg_idle_timeout_secs: (10 * crate::day::SECONDS_PER_MINUTE) as u64,
             memory_message_broadcast_capacity: 1024,
             observability_event_channel_capacity: 256,
             websocket_event_cache_capacity: 1000,
-            skill_hot_reload_interval_secs: 30,
+            skill_hot_reload_interval_secs: (crate::day::SECONDS_PER_MINUTE / 2) as u64,
             anthropic_default_max_tokens: 4096,
             strict_persistence: true,
             enabled_plugins: None,
@@ -1323,7 +1323,7 @@ impl Default for MultiBackendConsumerConfig {
             events_on_bus: false,
             nats_urls: Vec::new(),
             publish_buffer_capacity: 256,
-            publish_retry_base_delay_ms: 1000,
+            publish_retry_base_delay_ms: crate::day::MILLIS_PER_SECOND as u64,
             events_stream_retention: "limits".into(),
         }
     }
@@ -1372,7 +1372,7 @@ impl Default for ImageRolloutConfig {
             namespace: crate::topology::namespace(),
             deployment: crate::topology::MAIN_DEPLOYMENT.into(),
             container: crate::topology::MAIN_CONTAINER.into(),
-            rollout_timeout_secs: 300,
+            rollout_timeout_secs: (5 * crate::day::SECONDS_PER_MINUTE) as u64,
         }
     }
 }
@@ -1702,7 +1702,7 @@ impl Default for BuildGateConfig {
             enabled: true,
             // 不覆盖：装机时不认识这台机器，而"1"是一个跟宿主容量无关的常量。
             max_concurrent: 0,
-            wait_secs: 1800,
+            wait_secs: (30 * crate::day::SECONDS_PER_MINUTE) as u64,
             // 与部署清单挂的那条 hostPath 同名：哪一层（配置文件、环境变量、
             // 默认值）最后说话，落点都是同一个字符串。默认值本身不保证共享——
             // 目录只有在部署真的把它挂出来时才是同一块。
@@ -1728,9 +1728,9 @@ impl Default for BuildGateConfig {
             cpu_calm_pct: 5.0,
             io_calm_pct: 1.0,
             mem_calm_pct: 1.0,
-            bound_window_secs: 60,
+            bound_window_secs: crate::day::SECONDS_PER_MINUTE as u64,
             cpu_sample_gap_ms: 200,
-            reserve_fresh_secs: 900,
+            reserve_fresh_secs: (15 * crate::day::SECONDS_PER_MINUTE) as u64,
         }
     }
 }
@@ -1973,8 +1973,8 @@ impl Default for SelfEvolutionConfig {
             lint_command: None,
             deploy_admission: None,
             web_admission: None,
-            poll_interval_secs: 60,
-            schema_repair_interval_secs: 600,
+            poll_interval_secs: crate::day::SECONDS_PER_MINUTE as u64,
+            schema_repair_interval_secs: (10 * crate::day::SECONDS_PER_MINUTE) as u64,
             notify_on_failure: true,
             image_rollout: ImageRolloutConfig::default(),
             microvm: MicroVmConfig::default(),

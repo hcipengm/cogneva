@@ -75,6 +75,13 @@ pub const MILLIS_PER_SECOND: i64 = 1_000;
 // cap: fixed — 一周的天数：定义值
 pub const DAYS_PER_WEEK: i64 = 7;
 
+/// Days in a month as the retention policies count it.
+///
+/// 一个月没有定长（28～31 天）：保留期要的是量级，按 30 天取，别让调用点
+/// 各自挑一个 30 或 31。
+// cap: fixed — 保留期口径的一个月：30 天
+pub const DAYS_PER_MONTH: i64 = 30;
+
 /// Days in a quarter.
 ///
 /// 季度是历法档位而不是精确长度（90 或 91 天）：按 90 天取，保留期只需要它的
