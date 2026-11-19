@@ -31,6 +31,7 @@ use crate::common::routes::{matching_brace, repo_root};
 use crate::common::rust_production::{
     production_numbered_lines, production_sources, relative_name,
 };
+use crate::common::rust_text::{bare_number, struct_fields};
 
 /// One bare number a default invents, and where it is written.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -167,95 +168,6 @@ fn function_name(head: &str) -> String {
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect()
-}
-
-/// 体里所有 `字段: 值`，按字节偏移给出位置。
-///
-/// 不像按逗号切块那样读：默认值里的行是可能嵌套的
-/// （`breaker: Some(CircuitBreakerConfig { failure_threshold: 5 })`），按逗号切
-/// 会把里面那几个字段留在外层的值里，数就漏了。这里逐个词找「小写标识符 + 冒号」，
-/// 值读到下一个逗号或右花括号为止。
-fn struct_fields(body: &str) -> Vec<(usize, String, String)> {
-    let bytes = body.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_lowercase() || bytes[i] == b'_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let name = &body[start..i];
-            let mut j = i;
-            while j < bytes.len() && bytes[j] == b' ' {
-                j += 1;
-            }
-            // `::` 是路径分隔符，不是字段赋值。
-            if j < bytes.len() && bytes[j] == b':' && bytes.get(j + 1) != Some(&b':') {
-                let mut k = j + 1;
-                while k < bytes.len() && bytes[k] == b' ' {
-                    k += 1;
-                }
-                let value_start = k;
-                while k < bytes.len() && !matches!(bytes[k], b',' | b'}' | b'\n') {
-                    k += 1;
-                }
-                out.push((
-                    start,
-                    name.to_string(),
-                    body[value_start..k].trim().to_string(),
-                ));
-                // 停在冒号后面而不是值的末尾：值是嵌套结构时，里面的字段还在这个
-                // 值里，跳过整个值就再也看不见它们了。
-                i = j + 1;
-                continue;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
-/// 哨兵：`0` 不是谁挑的数，是「没写」这件事本身。`0`、`0.0`、`0.0f64` 都算。
-fn is_sentinel_zero(value: &str) -> bool {
-    let trimmed = value.trim();
-    let digits: String = trimmed
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '_' || *c == '.')
-        .filter(|c| *c != '_')
-        .collect();
-    !digits.is_empty() && digits.parse::<f64>() == Ok(0.0)
-}
-
-/// 一个只由数字组成的值：`30`、`1_000`、`4.1`、`24 * 1024`、`3600u64`。
-///
-/// 只要有一个部分不是以数字开头（`MILLIS_PER_SECOND`、`per_second`），它就是一条由
-/// 名字组成的表达式——那个名字的来源归它自己的声明管。
-fn bare_number(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() || is_sentinel_zero(value) {
-        return None;
-    }
-    let mut any = false;
-    for part in value.split(['*', '+', '/']) {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let first = part.chars().next()?;
-        if !first.is_ascii_digit() {
-            return None;
-        }
-        if !part
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '_' || c == '.' || c.is_ascii_lowercase())
-        {
-            return None;
-        }
-        any = true;
-    }
-    any.then(|| value.to_string())
 }
 
 // ---------------------------------------------------------------------------
