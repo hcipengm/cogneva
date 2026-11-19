@@ -890,6 +890,205 @@ pub fn governance_documents(files: &[(String, String)]) -> Result<String, String
     Ok(out)
 }
 
+/// 一份常驻工作负载要的调度额度：一个副本的 request × 副本数。
+///
+/// 装机器要用它回答一个问题：这份渲染产物的 request 合计，这台机器装不装得下。
+/// 2026-11-19 真机实测：网关的 request 是 6Gi（按带模型权重时的稳态定的），而那台
+/// 机器的 allocatable 实测只有 5.5Gi——清单照样下发，新副本排在 Pending，十分钟后平台在自己的
+/// 进度死线上写下 ProgressDeadlineExceeded，安装以「部署未就绪」收尾，而真正的
+/// 病因（这台机器装不下这个 profile）一次都没被说出来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadDemand {
+    /// 形如 `Deployment/cogneva`。
+    pub workload: String,
+    /// 副本数。DaemonSet 按节点数展开：它每个节点都要一份。
+    pub replicas: u64,
+    /// 单个副本的 request，未乘副本数。
+    pub cpu_millicores: u64,
+    pub memory_bytes: u64,
+}
+
+impl WorkloadDemand {
+    pub fn total_cpu_millicores(&self) -> u64 {
+        self.cpu_millicores.saturating_mul(self.replicas)
+    }
+
+    pub fn total_memory_bytes(&self) -> u64 {
+        self.memory_bytes.saturating_mul(self.replicas)
+    }
+}
+
+/// 读出这份清单里**常驻**工作负载的 request。
+///
+/// 只算会一直占着调度额度的：Deployment / StatefulSet / DaemonSet / 裸 Pod。
+/// Job 与 CronJob 不算——它们有起有停，把它们钉在账上会把「装得下常驻负载」判成
+/// 装不下，而判据要回答的正是那个问题。
+///
+/// 副本数读对象自己的 `spec.replicas`：为 0 的（profile 里关掉的组件）不占额度，
+/// 不读这一格就会把没打算运行的组件算进账里。
+pub fn workload_requests(
+    files: &[(String, String)],
+    nodes: u64,
+) -> Result<Vec<WorkloadDemand>, String> {
+    let mut out = Vec::new();
+    for (name, text) in files {
+        for chunk in split_yaml_documents(text) {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            let value: serde_yaml::Value =
+                serde_yaml::from_str(chunk).map_err(|e| format!("{name}: 解析 YAML 失败：{e}"))?;
+            let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+            let object = value
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("?");
+            let (spec, replicas) = match kind {
+                "Deployment" | "StatefulSet" | "ReplicaSet" => {
+                    let replicas = value
+                        .get("spec")
+                        .and_then(|s| s.get("replicas"))
+                        .and_then(|r| r.as_u64())
+                        .unwrap_or(1);
+                    (
+                        value
+                            .get("spec")
+                            .and_then(|s| s.get("template"))
+                            .and_then(|t| t.get("spec")),
+                        replicas,
+                    )
+                }
+                "DaemonSet" => (
+                    value
+                        .get("spec")
+                        .and_then(|s| s.get("template"))
+                        .and_then(|t| t.get("spec")),
+                    nodes,
+                ),
+                "Pod" => (value.get("spec"), 1),
+                _ => continue,
+            };
+            let Some(spec) = spec else { continue };
+            let (cpu_millicores, memory_bytes) = pod_requests(spec);
+            if replicas == 0 || (cpu_millicores == 0 && memory_bytes == 0) {
+                continue;
+            }
+            out.push(WorkloadDemand {
+                workload: format!("{kind}/{object}"),
+                replicas,
+                cpu_millicores,
+                memory_bytes,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// 一个 Pod 的 request。
+///
+/// 平台按资源各取一个数：`max(sum(containers), max(initContainers))`——init 容器
+/// 与业务容器不会同时跑，把它们相加是凭空多算一份，而只取业务容器那一侧会在
+/// init 更重（灌数据、拉权重）时少算。
+fn pod_requests(spec: &serde_yaml::Value) -> (u64, u64) {
+    let sum = spec
+        .get("containers")
+        .and_then(|c| c.as_sequence())
+        .map(|containers| {
+            containers
+                .iter()
+                .map(container_requests)
+                .fold((0u64, 0u64), |acc, r| (acc.0 + r.0, acc.1 + r.1))
+        })
+        .unwrap_or((0, 0));
+    let heaviest_init = spec
+        .get("initContainers")
+        .and_then(|c| c.as_sequence())
+        .map(|containers| {
+            containers
+                .iter()
+                .map(container_requests)
+                .fold((0u64, 0u64), |acc, r| (acc.0.max(r.0), acc.1.max(r.1)))
+        })
+        .unwrap_or((0, 0));
+    (sum.0.max(heaviest_init.0), sum.1.max(heaviest_init.1))
+}
+
+fn container_requests(container: &serde_yaml::Value) -> (u64, u64) {
+    let requests = container.get("resources").and_then(|r| r.get("requests"));
+    let Some(requests) = requests else {
+        return (0, 0);
+    };
+    (
+        requests
+            .get("cpu")
+            .and_then(quantity_string)
+            .and_then(|v| quantity_millicores(&v))
+            .unwrap_or(0),
+        requests
+            .get("memory")
+            .and_then(quantity_string)
+            .and_then(|v| quantity_bytes(&v))
+            .unwrap_or(0),
+    )
+}
+
+/// YAML 里的数量可能被解析成数字（例如 `500`、`1.5`）也可能是字符串（例如 `500m`、`6Gi`）：
+/// 两种写法在清单里都合法，按一种读会安静地漏掉另一种。
+fn quantity_string(value: &serde_yaml::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    value.as_f64().map(|v| v.to_string())
+}
+
+/// CPU 数量换毫核：`500m` → 500，`4` → 4000，`0.5` → 500。
+///
+/// 向上取整：这一格是拿来做「装不装得下」的判据的，少算一份就会把装不下判成装得下。
+pub fn quantity_millicores(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Some(milli) = value.strip_suffix('m') {
+        return milli.parse::<f64>().ok().map(|v| v.ceil() as u64);
+    }
+    if value.contains('e') || value.contains('E') {
+        return value
+            .parse::<f64>()
+            .ok()
+            .map(|v| (v * 1000.0).ceil() as u64);
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .map(|v| (v * 1000.0).ceil() as u64)
+}
+
+/// 内存数量换字节：清单里常见的写法（例如 `6Gi`、`512Mi`、`100M`）与纯数字都认。
+///
+/// 只认 Kubernetes 定义的单位；不认识的单位返回 `None`——一个读不出来的数按 0 计
+/// 会把「装不下」判成「装得下」，而这条判据的全部价值就在于它只在真的装不下时开口。
+pub fn quantity_bytes(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (digits, unit) = value.split_at(
+        value
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(value.len()),
+    );
+    let number: f64 = digits.parse().ok()?;
+    let multiplier: u64 = match unit {
+        "" => 1,
+        "Ki" => 1024,
+        "Mi" => 1024 * 1024,
+        "Gi" => 1024 * 1024 * 1024,
+        "Ti" => 1024 * 1024 * 1024 * 1024,
+        "k" | "K" => 1_000,
+        "M" => 1_000_000,
+        "G" => 1_000_000_000,
+        "T" => 1_000_000_000_000,
+        _ => return None,
+    };
+    Some((number * multiplier as f64).ceil() as u64)
+}
+
 /// Split a manifest file on `---` separator lines. A separator carries nothing
 /// of its own, so an empty leading chunk (files that start with `---`) is
 /// dropped by the caller for the same reason an empty trailing one is.
@@ -1448,6 +1647,76 @@ mod tests {
         assert!(out.contains("runtime-pods-limits-cpu"));
         assert!(!out.contains("not-governance"));
         assert!(!out.contains("Deployment"));
+    }
+
+    /// 装不装得下这条判据的现场读数（本机 2026-11-19 实测）：网关 6Gi × 1、
+    /// 演进 2Gi × 1，而节点实测只给得出 5.5Gi。照着清单算出来的合计必须与手算一致，
+    /// 否则判据会在一个数上安静地偏。
+    #[test]
+    fn workload_requests_read_the_rendered_deployments() {
+        let files = vec![
+            (
+                "41-deployment-cogneva.yaml".to_string(),
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  replicas: 1\n  template:\n    spec:\n      containers:\n        - name: gateway\n          resources:\n            requests:\n              cpu: 500m\n              memory: 6Gi\n".to_string(),
+            ),
+            (
+                "41-deployment-cogneva-evolution.yaml".to_string(),
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: cogneva-evolution\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: fetch\n          resources:\n            requests:\n              cpu: 2\n              memory: 3Gi\n      containers:\n        - name: evolution\n          resources:\n            requests:\n              cpu: 500m\n              memory: 2Gi\n".to_string(),
+            ),
+            (
+                "41-deployment-disabled.yaml".to_string(),
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: crawl4ai\nspec:\n  replicas: 0\n  template:\n    spec:\n      containers:\n        - name: crawl4ai\n          resources:\n            requests:\n              cpu: 200m\n              memory: 512Mi\n".to_string(),
+            ),
+            (
+                "31-cronjob.yaml".to_string(),
+                "apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: backup\nspec:\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers:\n            - name: backup\n              resources:\n                requests:\n                  cpu: 100m\n                  memory: 1Gi\n".to_string(),
+            ),
+        ];
+        let demands = workload_requests(&files, 1).unwrap();
+        // CronJob 不是常驻占用；replicas: 0 的组件不占额度。
+        assert_eq!(demands.len(), 2);
+        let gateway = demands
+            .iter()
+            .find(|d| d.workload == "Deployment/cogneva")
+            .unwrap();
+        assert_eq!(gateway.replicas, 1);
+        assert_eq!(gateway.total_cpu_millicores(), 500);
+        assert_eq!(gateway.total_memory_bytes(), 6 * 1024 * 1024 * 1024);
+        let evolution = demands
+            .iter()
+            .find(|d| d.workload == "Deployment/cogneva-evolution")
+            .unwrap();
+        // init 容器取最大而不是相加：两者不同时跑，相加是凭空多算一份。
+        assert_eq!(evolution.total_cpu_millicores(), 2000);
+        assert_eq!(evolution.total_memory_bytes(), 3 * 1024 * 1024 * 1024);
+    }
+
+    /// DaemonSet 每个节点一份：节点数变了，合计要跟着变——不然「换输入值跟着变」
+    /// 这条在这张账上就没有读数撑着。
+    #[test]
+    fn a_daemonset_is_counted_once_per_node() {
+        let files = vec![(
+            "31-daemonset.yaml".to_string(),
+            "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: buildah\nspec:\n  template:\n    spec:\n      containers:\n        - name: buildah\n          resources:\n            requests:\n              cpu: 250m\n              memory: 64Mi\n"
+                .to_string(),
+        )];
+        let one = workload_requests(&files, 1).unwrap();
+        let four = workload_requests(&files, 4).unwrap();
+        assert_eq!(one[0].total_memory_bytes(), 64 * 1024 * 1024);
+        assert_eq!(four[0].total_memory_bytes(), 4 * 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn quantities_are_read_in_the_units_the_manifests_write_them() {
+        assert_eq!(quantity_millicores("500m"), Some(500));
+        assert_eq!(quantity_millicores("4"), Some(4000));
+        assert_eq!(quantity_millicores("0.5"), Some(500));
+        assert_eq!(quantity_bytes("6Gi"), Some(6 * 1024 * 1024 * 1024));
+        assert_eq!(quantity_bytes("512Mi"), Some(512 * 1024 * 1024));
+        assert_eq!(quantity_bytes("100M"), Some(100_000_000));
+        assert_eq!(quantity_bytes("1"), Some(1));
+        // 不认识的单位返回 None：按 0 计会把「装不下」判成「装得下」。
+        assert_eq!(quantity_bytes("6GiB"), None);
     }
 
     /// 没有治理对象时返回空串，不返回一份看似成功的空 apply——调用方靠这个值
