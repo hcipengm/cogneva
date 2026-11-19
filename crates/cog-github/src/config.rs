@@ -165,6 +165,11 @@ fn resolve_token(
     )))
 }
 
+/// GitHub webhook 监听口。转发规则把这一路径指到本服务，落在哪个口由接收方
+/// 自己说；9090 与 Prometheus 抓取口同值，是这套部署里「旁路服务口」的约定。
+// cap: fixed — 本仓部署约定的旁路服务端口 9090
+const GITHUB_WEBHOOK_PORT: u16 = 9090;
+
 /// Webhook 事件入口配置（discovery_mode=events/both 时启用）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -184,7 +189,7 @@ pub struct WebhookConfig {
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
-            port: 9090,
+            port: GITHUB_WEBHOOK_PORT,
             secret_env: cog_core::env::GITHUB_WEBHOOK_SECRET.into(),
             path: "/webhooks/github".into(),
             gateway_verified: false,
@@ -259,7 +264,7 @@ impl Default for GitHubIntegrationConfig {
                 GitHubAccount::Bot(BotAccount::default()),
                 GitHubAccount::Human(HumanAccount::default()),
             ],
-            poll_interval_secs: 300,
+            poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             max_issues_per_scan: 50,
             auto_submit_fixes: true,
             landing_policy: LandingPolicy::default(),
@@ -390,8 +395,8 @@ impl Default for LandingPolicy {
             ],
             revert_on_ci_failure: true,
             redrive_on_ci_failure: true,
-            ci_watch_timeout_secs: 1800,
-            ci_poll_interval_secs: 60,
+            ci_watch_timeout_secs: (30 * cog_core::day::SECONDS_PER_MINUTE) as u64,
+            ci_poll_interval_secs: cog_core::day::SECONDS_PER_MINUTE as u64,
             max_land_attempts: 3,
             // One round per cause. That is the policy the re-drive path always
             // claimed — a change that breaks CI twice is out of the
@@ -402,7 +407,7 @@ impl Default for LandingPolicy {
             // churn over: within a day a cause that keeps failing is the same
             // situation, and a day later the branch has moved enough that it
             // is a new one.
-            redrive_cause_window_secs: 86400,
+            redrive_cause_window_secs: cog_core::day::SECONDS_PER_DAY as u64,
         }
     }
 }
@@ -425,7 +430,7 @@ impl Default for ConversationConfig {
     fn default() -> Self {
         Self {
             max_clarification_rounds: 3,
-            awaiting_reply_timeout_hours: 72,
+            awaiting_reply_timeout_hours: (3 * cog_core::day::HOURS_PER_DAY) as u64,
             auto_reply: true,
             bot_signature: "— Cogneva Bot".into(),
         }
@@ -593,7 +598,7 @@ impl Default for GiteeIntegrationConfig {
             repo: String::new(),
             base_branch: "main".into(),
             api_base: None,
-            poll_interval_secs: 300,
+            poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             max_issues_per_scan: 50,
             token_env: None,
         }
@@ -726,6 +731,30 @@ mod tests {
         assert!(!cfg.enabled);
     }
 
+    /// 模板里写下的每一个键都得是类型里真有的字段。
+    ///
+    /// 反方向（每个字段都得写进模板）已经不成立了，也不再要求：交付模板不再
+    /// 抄一遍代码里已经有的默认值（D1，`620a6905d`／`bde17b142`），没写的那个
+    /// 字段由 serde 默认值回答，读起来与写了同一个数。仍然会红的是另一件事：
+    /// 模板里出现一个类型不认识的键——改字段名时两边只改了一头，serde 静默
+    /// 忽略它，那个开关就悄悄失效了。
+    fn assert_surface_is_known(
+        fields: &[String],
+        template: &[String],
+        file: &std::path::Path,
+        section: &str,
+    ) {
+        let known: std::collections::BTreeSet<&String> = fields.iter().collect();
+        let unknown: Vec<&String> = template.iter().filter(|k| !known.contains(*k)).collect();
+        assert!(
+            unknown.is_empty(),
+            "{} {} 里写着类型不认识的键（改字段名时只改了一头）：{:?}",
+            file.display(),
+            section,
+            unknown
+        );
+    }
+
     /// 随仓库发布的配置模板操作员会照抄。代码里改了字段名、模板没跟上（或反
     /// 过来）在运行时完全无声：serde 忽略未知键、缺的键取默认值，集成照常启
     /// 动，只是那几个开关悄悄失效。只有逐键比对能发现，所以在这里比一次。
@@ -754,12 +783,7 @@ mod tests {
             .collect();
         expected.sort();
         actual.sort();
-        assert_eq!(
-            expected,
-            actual,
-            "{} github_integration drifted from GitHubIntegrationConfig",
-            file.display()
-        );
+        assert_surface_is_known(&expected, &actual, file, "github_integration");
 
         let policy = section
             .get("landing_policy")
@@ -780,12 +804,7 @@ mod tests {
             .collect();
         expected.sort();
         actual.sort();
-        assert_eq!(
-            expected,
-            actual,
-            "{} landing_policy drifted from LandingPolicy",
-            file.display()
-        );
+        assert_surface_is_known(&expected, &actual, file, "landing_policy");
     }
 
     #[test]

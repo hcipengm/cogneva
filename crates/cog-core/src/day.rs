@@ -69,6 +69,19 @@ pub const HOURS_PER_DAY: i64 = 24;
 // cap: fixed — 一秒的毫秒数：定义值
 pub const MILLIS_PER_SECOND: i64 = 1_000;
 
+/// Days in a week.
+///
+/// 保留期按天写时用它，别在调用点写一个 7。
+// cap: fixed — 一周的天数：定义值
+pub const DAYS_PER_WEEK: i64 = 7;
+
+/// Days in a quarter.
+///
+/// 季度是历法档位而不是精确长度（90 或 91 天）：按 90 天取，保留期只需要它的
+/// 量级，不需要它在哪一年都对得上。
+// cap: fixed — 一个季度的天数：历法档位，按 90 天
+pub const DAYS_PER_QUARTER: i64 = 90;
+
 /// How far east of UTC this process's clock is at `now_unix`, in seconds.
 ///
 /// This is the projection: the deployment sets one timezone for every part of

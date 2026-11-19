@@ -185,6 +185,22 @@ pub enum LogFormat {
     Pretty,
 }
 
+/// Prometheus 的约定端口：`/metrics` 被谁抓、抓在哪，是抓取方的约定，不是本仓量的。
+// cap: fixed — Prometheus 抓取约定端口 9090
+const PROMETHEUS_PORT: u16 = 9090;
+
+/// zstd 的默认档：`0` 就是「用库自己的默认压缩级别」，不是本仓挑的。
+// cap: fixed — zstd 语义：0 = 库默认档
+const ZSTD_LEVEL_DEFAULT: i32 = 0;
+
+/// 温存的压缩档：zstd 推荐区间里的「快」端，越大越省盘越费 CPU。
+// cap: fixed — zstd 推荐压缩档（快档）
+const ZSTD_LEVEL_WARM: i32 = 3;
+
+/// 冷存的压缩档：zstd 推荐区间里的「小」端。
+// cap: fixed — zstd 推荐压缩档（高压缩档）
+const ZSTD_LEVEL_COLD: i32 = 9;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PrometheusConfig {
     pub enabled: bool,
@@ -196,7 +212,7 @@ impl Default for PrometheusConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            port: 9090,
+            port: PROMETHEUS_PORT,
             registry_prefix: "cogneva".into(),
         }
     }
@@ -235,11 +251,11 @@ impl Default for SnapshotConfig {
         Self {
             enabled: true,
             storage_directory: cog_core::paths::data_path("snapshots"),
-            hot_retention_days: 7,
-            warm_retention_days: 90,
-            compression_hot: 0,
-            compression_warm: 3,
-            compression_cold: 9,
+            hot_retention_days: cog_core::day::DAYS_PER_WEEK as u32,
+            warm_retention_days: cog_core::day::DAYS_PER_QUARTER as u32,
+            compression_hot: ZSTD_LEVEL_DEFAULT,
+            compression_warm: ZSTD_LEVEL_WARM,
+            compression_cold: ZSTD_LEVEL_COLD,
         }
     }
 }
@@ -262,7 +278,7 @@ impl Default for RawStreamConfig {
             warm_dir: cog_core::paths::data_path("raw-streams/warm"),
             cold_dir: cog_core::paths::data_path("raw-streams/cold"),
             max_hot_file_size_mb: 256,
-            flush_interval_sec: 30,
+            flush_interval_sec: (cog_core::day::SECONDS_PER_MINUTE / 2) as u64,
         }
     }
 }
