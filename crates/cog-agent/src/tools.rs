@@ -335,10 +335,10 @@ pub struct ToolRegistry {
     /// 页大小不是工具自己拍的数：它走
     /// [`crate::context::tool_result_budget_chars`]，与运行时把一条工具结果
     /// 裁进上下文用的是同一个函数。工具这边另存一个页大小，窗口调大时页不跟
-    /// 着变，同一件事就在树里有了两份答案。这里放的是部署配置的那个窗口
-    /// （`agent_loop.context_window_size`），`None` = 没人说过，此时一页的大小按
-    /// 设置页里各型号公布的规格导出（见 [`Self::page_chars`]）。某一轮自己学到
-    /// 更窄的窗口，最终仍由运行时的逐轮裁剪兜住。
+    /// 着变，同一件事就在树里有了两份答案。这里放的是**这一段对话真正在用的
+    /// 那只型号**的窗口：运行时每收到一条响应，就按回报的型号查出规格、叠上实测，
+    /// 把那个决定交下来。`None` = 还没有任何一条读数（型号没回报过，或它没公布），
+    /// 此时一页不设界——不拿池子里别的型号的窗口来顶（见 [`Self::page_chars`]）。
     context_window_size: Option<usize>,
     /// 上一次量出来的页大小是不是「不设界」。
     ///
@@ -358,11 +358,14 @@ pub struct ToolRegistry {
 
 /// 一页多大，以及这个数背后有没有一条读数。
 ///
-/// 第二项是判据面的东西：两边都没说窗口时页大小是「不设界」，但「量不到」与
+/// 第二项是判据面的东西：没人说过窗口时页大小是「不设界」，但「量不到」与
 /// 「量到一个很大的值」必须是两件事——前者没有读数，后者有。把它并进返回值，
 /// 调用点就不必各自再猜一次，报告也才有东西可报。
-fn page_budget(declared: Option<usize>, pooled_min: Option<u64>) -> (usize, bool) {
-    let window = declared.or_else(|| pooled_min.map(|tokens| tokens as usize));
+///
+/// 窗口只认这张表服务的那个窗口（运行时按**这一段对话真正在用的型号**把决定
+/// 交下来），不认池子里别的型号：池里最小的一只说了算，是在替一次可能根本不会
+/// 落到它身上的调用设界，与「没人说过就瞎设」是同一个错。
+fn page_budget(window: Option<usize>) -> (usize, bool) {
     (
         crate::context::tool_result_budget_chars(window),
         window.is_some(),
@@ -377,7 +380,8 @@ impl ToolRegistry {
             guardrail: None,
             plugin_registry: None,
             require_identity: false,
-            context_window_size: crate::AgentLoopConfig::default().context_window_size,
+            // 构造时没有任何读数：窗口由运行时收到响应后按答话的型号交下来。
+            context_window_size: None,
             paging_unbounded: Arc::new(AtomicBool::new(false)),
             calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -394,9 +398,8 @@ impl ToolRegistry {
 
     /// 循环学到本轮的窗口之后交给这张表：一页的大小跟着同一个数走。
     ///
-    /// 启动时给的是部署声明的那一个数（往往是 `None`，= 没人说过）；第一份响应
-    /// 回来之后，窗口是型号公布的规格或实测的界，页大小应当按那个走，而不是停在
-    /// 启动时那一格。
+    /// 构造时这一格是空的（生产里没有任何配置写过它）；第一份响应回来之后，
+    /// 窗口是答话那只型号公布的规格或实测的界，页大小按那个走。
     pub fn set_context_window_size(&mut self, tokens: Option<usize>) {
         self.context_window_size = tokens;
     }
@@ -412,16 +415,12 @@ impl ToolRegistry {
     /// `has_more`），不是一次截断。搜索、glob、diff 不在工具里截，整份答案
     /// 交给运行时——那里会把超出的一页归档成引用再裁。
     ///
-    /// 配置没声明窗口（`None`）时，窗口取自设置页里那些型号公布的规格
-    /// （`cog_core::model_windows`）：池里最小的一只说了算，因为一发可能落到任何
-    /// 一家。两边都没说时返回「不设界」——那个进程里没人说过窗口，替它猜一个
-    /// 页大小就是替上游拍数；那条结果进上下文时仍由运行时的裁剪与归档兜住。
+    /// 没有窗口（`None`）= 这一段对话用的那只型号还没被任何一条读数说出来：
+    /// 返回「不设界」。不拿池子里**别的**型号的规格来顶——一次可能落到哪一家是
+    /// 猜测，用它设界就是替一次没发生过的调用拍数。不设界的那条读数由
+    /// [`Self::page_chars`] 报出来，结果进上下文时仍由运行时的裁剪与归档兜住。
     fn page_chars(&self) -> usize {
-        let pooled_min = cog_core::model_windows::all()
-            .into_iter()
-            .map(|(_, window)| window)
-            .min();
-        let (chars, measured) = page_budget(self.context_window_size, pooled_min);
+        let (chars, measured) = page_budget(self.context_window_size);
         let was_unbounded = self.paging_unbounded.swap(!measured, Ordering::Relaxed);
         match (was_unbounded, measured) {
             (false, false) => tracing::warn!(
@@ -2036,19 +2035,34 @@ mod tests {
     #[test]
     fn a_page_nobody_measured_is_not_a_page_of_max_chars() {
         assert_eq!(
-            page_budget(None, None),
+            page_budget(None),
             (usize::MAX, false),
-            "两边都没说窗口：不设界，并且这个数没有读数"
+            "这一段对话用的型号没有任何一条读数：不设界，并且这个数没有读数"
         );
-        let (chars, measured) = page_budget(None, Some(8_000));
-        assert!(
-            measured && chars == crate::context::tool_result_budget_chars(Some(8_000)),
-            "池里的型号说了窗口：按最小的一只导出，这是量出来的"
-        );
-        let (chars, measured) = page_budget(Some(32_000), None);
+        let (chars, measured) = page_budget(Some(32_000));
         assert!(
             measured && chars < usize::MAX,
-            "部署自己声明了窗口：同样是量出来的"
+            "运行时交下来一个窗口：页大小由它导出，这是量出来的"
+        );
+    }
+
+    /// 池子里别的型号报了窗口，这一段对话的页大小不跟着变。
+    ///
+    /// 以前这里是「取池里最小的一只」：一次调用可能落到任何一家，于是拿最小的
+    /// 那个当界。可是页大小是给**这一段对话**用的，它的型号由运行时按回报的
+    /// 型号查出来交下来；用别的型号的窗口顶，就是给没量过的那只拍一个数。
+    #[test]
+    fn another_models_window_does_not_size_this_page() {
+        // 表是进程级的：写进去的那一行要在断言之后还回去，别的用例不该继承。
+        let before = cog_core::model_windows::all();
+        cog_core::model_windows::replace([("some-other-model".to_string(), 8_000)]);
+        let registry = ToolRegistry::new().with_context_window_size(None);
+        let page = registry.page_chars();
+        cog_core::model_windows::replace(before);
+        assert_eq!(
+            page,
+            usize::MAX,
+            "池里别的型号说了 8k，不等于这一段的型号说了 8k"
         );
     }
 

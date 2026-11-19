@@ -486,11 +486,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 .with_sandbox_backend(sandbox_backend.clone())
                 .with_guardrail(guardrail)
                 .with_plugin_registry(plugin_registry)
-                .with_require_identity(require_tool_identity)
-                // 一页工具结果的大小由这张表服务的窗口导出，与运行时裁进
-                // 上下文的是同一个函数（`context::tool_result_budget_chars`）。
-                .with_context_window_size(agent_loop_config.context_window_size),
+                .with_require_identity(require_tool_identity),
         );
+        // 一页工具结果的大小由这张表服务的窗口导出，与运行时裁进上下文的是同一个
+        // 函数（`context::tool_result_budget_chars`）。窗口不在这里写：构造时它还
+        // 没有读数，运行时收到第一条响应就按答话的型号把决定交下来。
         // Built-in execution tools. Without these the registry advertises zero
         // tool definitions and squads can plan but never act on the
         // environment.
@@ -584,10 +584,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
             agent_id: eval_employee.id.clone(),
             role: cog_core::roles::EVALUATOR.into(),
             max_iterations: agent_loop_config.eval_max_iterations.unwrap_or(u32::MAX),
-            // 与主循环同一个数：窗口是部署配置里说的那一个起点，评测这一份
-            // 没有理由自己再写一个——两个数各写各的，改一处就会有一边静默地
-            // 用旧值裁剪。
-            context_window_size: agent_loop_config.context_window_size,
+            // 与主循环同一条来路：这一格不是配置，是运行时在用的窗口的起点，
+            // 没有读数时就是 `None`，第一次响应之后按答话的型号定下来。
+            context_window_size: None,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             skill_config: None,

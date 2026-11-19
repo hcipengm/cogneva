@@ -45,10 +45,6 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
         "COGNEVA_AGENT_LOOP_EVAL_MAX_ITERATIONS",
         "eval_max_iterations",
     ),
-    (
-        "COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE",
-        "context_window_size",
-    ),
     ("COGNEVA_AGENT_LOOP_ROLE", "role"),
     (
         "COGNEVA_AGENT_LOOP_SKILL_CACHE_TTL_SECS",
@@ -113,15 +109,6 @@ pub struct AgentLoopConfig {
     /// （判一份交上来的结果用不了那么多轮），但同样是一个断言而不是一条度量，
     /// 所以同样交给部署去写。
     pub eval_max_iterations: Option<u32>,
-    /// 上下文窗口的声明值；`None`（文档里写 `null`）= 没人说过
-    /// （见 [`cog_core::RuntimeConfig::context_window_size`]）。起点取自 LLM 配置里
-    /// 那只型号公布的规格（[`cog_core::model_windows`]），实测校正它。
-    ///
-    /// 文档里写 `0` 也读作「没人说过」：那是这个字段还是 `usize` 时的写法，集群里
-    /// 还没滚到的 ConfigMap 与手写部署文件仍然带着它。读成「窗口零个 token」会让
-    /// 第一条消息就被裁到地板，所以两种写法在入口处归一，往后只剩 `Option` 一种状态。
-    #[serde(deserialize_with = "window_from_document")]
-    pub context_window_size: Option<usize>,
     /// TTL for the available_skills cache in AgentRuntime (seconds).
     pub skill_cache_ttl_secs: u64,
     /// Abort a streaming think turn only after no stream event arrives for
@@ -171,19 +158,6 @@ pub struct AgentLoopConfig {
     pub web_fetch_base: Option<String>,
 }
 
-/// 文档里的窗口：`null`（或者整格不写）与旧写法 `0` 都读作「没人说过」。
-///
-/// 旧写法得继续认：字段还是 `usize` 时它在集群的 ConfigMap 与手写部署文件里，
-/// 而新二进制可能先于它们滚上去。两种写法在这里归成同一个状态，往后就没有
-/// 「0 是不是窗口」这个问题了。
-fn window_from_document<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<usize>::deserialize(deserializer)?;
-    Ok(raw.filter(|window| *window > 0))
-}
-
 /// The size at which a fetched response stops being a conversational answer and
 /// starts being a document: comfortably above what an API or a page summary
 /// returns, comfortably below the tool-return budget of the smallest window the
@@ -199,7 +173,6 @@ impl Default for AgentLoopConfig {
             role: cog_core::roles::PLANNER.into(),
             max_iterations: None,
             eval_max_iterations: None,
-            context_window_size: None,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             memory_api_base: None,
@@ -229,7 +202,9 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
             // 没有写下的天花板就是没有天花板：运行面只有一个数表示「不设界」，
             // 不让「没配置」在别处变成一个新的缺省数。
             max_iterations: c.max_iterations.unwrap_or(u32::MAX),
-            context_window_size: c.context_window_size,
+            // 这一格没有配置来源：窗口由运行时从型号公布的规格与实测里定，
+            // 构造时写下的只是「还没量到」。
+            context_window_size: None,
             skill_cache_ttl_secs: c.skill_cache_ttl_secs,
             think_stall_timeout_secs: c.think_stall_timeout_secs,
             skill_config: None,
@@ -340,37 +315,14 @@ mod tests {
         }
     }
 
-    /// 「没人说过窗口」在文档里有两种写法，读进来是同一个状态。
+    /// 文档里没有窗口这一格，写成什么都不认。
     ///
-    /// `null` 是正身；`0` 是这个字段还是 `usize` 时的写法，集群里没滚到的
-    /// ConfigMap 还带着它。它要是读成 `Some(0)`，窗口就成了「零个 token」，
-    /// 第一条消息就会被裁到地板——那是一次诊断不出来的停摆，因为配置读起来
-    /// 一切正常。
+    /// 窗口只能来自读数：设置页里那只型号公布的规格，加上这棵树实测到底收下过
+    /// 多大、被拒时上游自述多大的界。文档里写一个数就是替上游拍一个它没公布过的
+    /// 窗口——写小了裁掉装得下的历史，写大了第一次调用就被拒。所以这一格连同
+    /// 它的环境变量映射一起删掉了，不是改成「写 null」。
     #[test]
-    fn nobody_stated_the_window_in_either_spelling() {
-        let read = |json: &str| -> AgentLoopConfig { serde_json::from_str(json).unwrap() };
-        assert_eq!(
-            read(r#"{"context_window_size": null}"#).context_window_size,
-            None
-        );
-        assert_eq!(
-            read(r#"{"context_window_size": 0}"#).context_window_size,
-            None
-        );
-        assert_eq!(read(r#"{}"#).context_window_size, None);
-        assert_eq!(
-            read(r#"{"context_window_size": 96000}"#).context_window_size,
-            Some(96_000),
-            "写下来的数照原样进来，只有 0 被读作「没人说过」"
-        );
-    }
-
-    /// 随这份仓发布的配置写 `null`，不写一个数。
-    ///
-    /// 写数就是替上游拍一个它没公布过的窗口：写小了裁掉装得下的历史，写大了
-    /// 第一次调用就被拒。起点应当来自 LLM 配置里那只型号公布的规格，实测校正。
-    #[test]
-    fn the_shipped_config_states_no_window() {
+    fn the_document_has_no_window_slot() {
         let rel = "deploy/helm/cogneva/files/cogneva.json";
         let path = crate::checkout::repo_root().join(rel);
         let text = std::fs::read_to_string(&path)
@@ -379,10 +331,21 @@ mod tests {
         let section = root_json
             .pointer("/agent_loop")
             .unwrap_or_else(|| panic!("{rel}: agent_loop section present"));
-        let stated = section.get("context_window_size");
         assert!(
-            matches!(stated, Some(serde_json::Value::Null)),
-            "{rel}: agent_loop.context_window_size 要写 null（没人说过），现在是 {stated:?}"
+            section.get("context_window_size").is_none(),
+            "{rel}: agent_loop 里又出现了 context_window_size——窗口只由型号规格与实测给出"
+        );
+        assert!(
+            !text.contains("COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE"),
+            "{rel}: 环境变量映射里还留着窗口——没有这一格就没有要映射的东西"
+        );
+        // 环境变量那一头也只认 `AGENT_LOOP_ENV` 里的名字：表上没有了，就没有
+        // 一条 env 能把窗口递进来。
+        assert!(
+            !AGENT_LOOP_ENV
+                .iter()
+                .any(|(_, field)| *field == "context_window_size"),
+            "环境变量映射表里还留着窗口：没有这一格，就没有能递进一个数的名字"
         );
     }
 

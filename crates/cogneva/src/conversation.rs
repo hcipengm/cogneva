@@ -694,15 +694,13 @@ fn rewind_report(
     })
 }
 
-/// 这一段对话真跑在多大的窗口里；`None` = 没人说过（不是零个 token）。
+/// 这一段对话真跑在多大的窗口里；`None` = 还没有任何读数（不是零个 token）。
 ///
 /// 读的是进程里那份实测/规格读数——与循环自己裁剪用的是同一个（`AgentRuntime`
-/// 也挂在同一个全局观测面上），而不是部署配置里那个声明值：声明值只是型号查不到
-/// 时的兜底，而这个部署写的就是 0（没人说过）。
+/// 也挂在同一个全局观测面上）。没有部署声明的窗口这一路：那个数只能来自型号
+/// 公布的规格和实测，写进部署文档就是替上游拍一个它没说过的数。
 fn conversation_window_tokens() -> Option<usize> {
-    let declared = cog_core::RuntimeConfig::default().context_window_size;
-    let (window, _) =
-        cog_agent::observable::global_observable().context_window_decision_for(declared);
+    let (window, _) = cog_agent::observable::global_observable().context_window_decision_for(None);
     window
 }
 

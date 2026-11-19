@@ -27,7 +27,7 @@ pub const PROPOSE_SELF_CHANGE: &str = "propose_self_change";
 ///
 /// `literal` 是**逐字节**要被 grep 到的那段文字，不是一段描述。账的判据是
 /// 「这个字面量在这个文件里出现过」，所以申请就得说清它长什么样；说「把上下文
-/// 窗口调大」是一句愿望，说 `"context_window_size": 96000` 才是一条能被量的变更。
+/// 窗口调大」是一句愿望，说 `"skill_cache_ttl_secs": 60` 才是一条能被量的变更。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
     /// 相对这棵树根的一个路径。
@@ -298,7 +298,7 @@ mod tests {
     fn a_proposal_becomes_one_grep_row_and_claims_no_state() {
         let reading = proposal(
             "deploy/helm/cogneva/files/cogneva.json",
-            "\"context_window_size\": 96000",
+            "\"skill_cache_ttl_secs\": 60",
         )
         .reading("employee-7")
         .expect("一条正当的申请");
@@ -308,7 +308,7 @@ mod tests {
             reading.identity.scope,
             "deploy/helm/cogneva/files/cogneva.json"
         );
-        assert_eq!(reading.identity.literal, "\"context_window_size\": 96000");
+        assert_eq!(reading.identity.literal, "\"skill_cache_ttl_secs\": 60");
         assert_eq!(reading.source.doc, "self-change:employee-7");
         assert_eq!(reading.source.priority, ChangePriority::Unstated);
         // 读入里根本没有状态这一栏：这是「提的人没法宣布做完」在类型上就成立，

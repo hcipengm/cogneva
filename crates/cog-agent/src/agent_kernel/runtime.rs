@@ -443,18 +443,22 @@ pub struct AgentRuntime {
     /// signal into a hum, and the reader would stop seeing the first one — which
     /// is the only one that says when it started.
     context_overrun_reported: bool,
-    /// 这个进程从上游调用里量到的窗口：它接受过多大的 prompt、它自述过多大的界。
+    /// 这个进程从上游调用里量到的窗口，**按型号分桶**：每只型号接受过多大的
+    /// prompt、拒收时自述过多大的界。窗口决定只读答话那只型号的那一桶——同一个
+    /// 进程里另一段对话可以用着窗口完全不同的一只。
     ///
-    /// 与 `config.context_window_size` 是「读数」与「起点」的关系：配置值是还没
-    /// 量到任何东西时的起点，量到之后按量到的走。两侧都只读同一次调用顺带回来的
-    /// 数字，不额外花钱。
+    /// 与 `config.context_window_size` 是「读数」与「当前值」的关系：后者是决定
+    /// 写回去的地方，读的人从那里看。两侧都只读同一次调用顺带回来的数字，不额外
+    /// 花钱。
     context_probe: crate::observable::ContextWindowProbe,
-    /// 构造时 `context_window_size` 是多少，作为量不到读数时的起点。
+    /// 构造时交进来的起点（`config.context_window_size`），量不到读数时就是它。
     ///
-    /// 单独存一份而不是每次读 `self.config`：配置里的那个数会被下面换成量到的
-    /// 值，换掉之后就再也回答不了「原本声明的窗口是多大」——而这正是读者要区分
-    /// 「量到的」与「声明的」时唯一能对照的东西。`None` = 没人说过。
-    declared_context_window: Option<usize>,
+    /// 生产里是 `None`：部署文档没有窗口这一格，会话那一层交过来的也是「还没读到」
+    /// 的读数。它只在测试里非空——用例要一个确定的窗口去量裁剪行为，就把起点钉在
+    /// 那里。单独存一份而不是每次读 `self.config`：那一格会被下面换成量到的值，
+    /// 换掉之后就回答不了「原本的起点是多大」，而读者区分「量到的」与
+    /// 「起点」时要有东西可对照。
+    starting_context_window: Option<usize>,
     /// Whether this run's deliverable is the reply text itself.
     ///
     /// A task run answers with a document the downstream steps read fields out
@@ -1163,22 +1167,23 @@ impl AgentRuntime {
         config.max_iterations = ceiling;
 
         // 窗口同一条处置：起点来自上游回报的型号在厂商规格里公布的那个数
-        // （`cog_core::model_windows`：设置页里那只模型公布的窗口），配置里那个数只在没人说过
-        // 型号时兜底（`null` 就是「没人说过」，不是零个 token 的窗口）。量到过
-        // 就按量到的走（见 [`crate::observable::ContextWindowProbe`]），
-        // `config` 里的那个数跟着换，于是 `note_context_overrun`、工具结果预算
-        // 这些读 `config` 的地方看的是同一个窗口，不会一个按声明、一个按实测。
-        let declared_context_window = config.context_window_size;
+        // （`cog_core::model_windows`：设置页里那只模型公布的窗口）。部署文档里
+        // 没有这一格，`config` 里带进来的只可能是调用方已有的读数（会话那一层算过
+        // 的决定，测试用例钉的起点），生产里是 `None`。量到过就按量到的走（见
+        // [`crate::observable::ContextWindowProbe`]），`config` 里的那个数跟着换，
+        // 于是 `note_context_overrun`、工具结果预算这些读 `config` 的地方看的是
+        // 同一个窗口，不会一个按起点、一个按实测。
+        let starting_context_window = config.context_window_size;
         let (window, window_source) =
-            observable.context_window_decision_for(declared_context_window);
+            observable.context_window_decision_for(starting_context_window);
         config.context_window_size = window;
-        if window_source != crate::observable::ContextWindowSource::Declared {
+        if window_source != crate::observable::ContextWindowSource::Unstated {
             tracing::info!(
                 agent_id = %config.agent_id,
                 window,
-                declared = declared_context_window,
+                starting = starting_context_window,
                 source = window_source.as_str(),
-                "上下文窗口用这个进程量到的值，不是配置里声明的那个"
+                "上下文窗口用这个进程量到的值，不是构造时带进来的起点"
             );
         }
         let context = ContextWindow::new(window);
@@ -1223,7 +1228,7 @@ impl AgentRuntime {
             ceiling_source,
             context_overrun_reported: false,
             context_probe: observable.context_probe(),
-            declared_context_window,
+            starting_context_window,
             reply_is_the_result: false,
             actor_label: None,
             call_owner: None,
@@ -4187,21 +4192,22 @@ impl AgentRuntime {
         Ok(serde_json::json!({ "result": thought }))
     }
 
-    /// 报一次「这一问的 prompt 比配置的上下文窗口还大」。
+    /// 报一次「这一问的 prompt 比当前的上下文窗口还大」。
     ///
     /// 上下文在每次调用前都会裁到 `context_window_size` 以内，所以一个超过窗口的
     /// prompt 说明裁剪没有兑现。这件事不报出来就是隐形的：调用照样成功、答案照样
-    /// 回来，只有账单知道这次送出去的比配置允许的多。它也是告警面上唯一有生产者的
+    /// 回来，只有账单知道这次送出去的比模型允许的多。它也是告警面上唯一有生产者的
     /// 那一种读数——没有它，那一面接得再对也永远是空的。
     ///
     /// 一次运行只报一次。每调用一次都报的话，读者很快就会把它当背景噪声，而真正
-    /// 有用的恰恰是第一次：它说明从什么时候开始超的。没人说过窗口时不判。
+    /// 有用的恰恰是第一次：它说明从什么时候开始超的。还没有读数时不判——那时没有
+    /// 「比窗口大」这件事。
     async fn note_context_overrun(&mut self, prompt_tokens: u32) {
         if self.context_overrun_reported {
             return;
         }
         let Some(window) = self.config.context_window_size else {
-            // 没人说过窗口，就没有「比窗口大」这件事可判。
+            // 还没有任何一条读数，就没有「比窗口大」这件事可判。
             return;
         };
         let window = window as u64;
@@ -4235,10 +4241,10 @@ impl AgentRuntime {
     ///
     /// 量到的两件事都不额外花钱：上游自己报了这次 prompt 有多大（`usage.input`），
     /// 或者在拒绝的那句话里报了自己能收多大。前者是下界——它收下了这么多，窗口
-    /// 就不会比这更小；后者是那个数本身。配置里的 `context_window_size` 只是还
-    /// 没量到任何东西时的起点，量到之后按量到的走，来源由
-    /// [`crate::observable::ContextWindowSource`] 分得出来：读者要能区分「量不到，
-    /// 所以还在用声明的那个」与「量到了，就是这个值」。
+    /// 就不会比这更小；后者是那个数本身。起点是这只型号公布的规格（有的话），
+    /// 没有规格、也没有量到过时就没有窗口；来源由
+    /// [`crate::observable::ContextWindowSource`] 分得出来：读者要能区分「还没读到」
+    /// 与「量到了，就是这个值」。
     ///
     /// 被拒的那次只算量到、不算收下：`usage.input` 是它明确拒收的那个大小，把它
     /// 当成窗口的下界正好把方向弄反。所以被拒的那一路传 `None`。
@@ -4256,9 +4262,20 @@ impl AgentRuntime {
         // （`via-security-gateway`），真正在答的型号由上上游回报、网关透传；
         // 拿到型号之后查厂商公布的规格，那才是这一轮的起点。查不到不编数：
         // 留着声明值，由下面的实测补上。
-        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        //
+        // 这一条调用量到的三样东西（规格、收下过多大、自述的界）都记在**这只
+        // 型号**名下：同一个进程里另一段对话可以用着窗口完全不同的一只，把两边的
+        // 数混在一起，小的那只就会一直压着大的那只。响应没报型号时退到上一次
+        // 报出来的那只——这一次调用用的还是它。
+        let answered_by = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.run_usage.model.clone());
+        let answered_by = answered_by.as_deref();
+        if let Some(model) = answered_by {
             if let Some(window) = cog_core::model_windows::configured(model) {
-                if self.context_probe.published() != Some(window) {
+                if self.context_probe.published(Some(model)) != Some(window) {
                     tracing::info!(
                         agent_id = %self.config.agent_id,
                         model,
@@ -4269,12 +4286,13 @@ impl AgentRuntime {
                         source = "llm_model_spec",
                         "按设置页里这只模型公布的窗口定起点"
                     );
-                    self.context_probe.note_published(window);
+                    self.context_probe.note_published(Some(model), window);
                 }
             }
         }
         if let Some(tokens) = accepted_prompt_tokens.filter(|t| *t > 0) {
-            self.context_probe.note_accepted(u64::from(tokens));
+            self.context_probe
+                .note_accepted(answered_by, u64::from(tokens));
         }
         let mut named_limit = None;
         if let Some(text) = refusal {
@@ -4304,12 +4322,12 @@ impl AgentRuntime {
             }
         }
         if let Some(limit) = named_limit {
-            self.context_probe.note_limit(limit);
+            self.context_probe.note_limit(answered_by, limit);
         }
         let before = self.context.max_tokens();
         let (window, source) = self
             .context_probe
-            .decision_for(self.declared_context_window);
+            .decision_for(answered_by, self.starting_context_window);
         if window == before {
             return;
         }
@@ -4329,7 +4347,7 @@ impl AgentRuntime {
                 agent_id = %self.config.agent_id,
                 before,
                 window,
-                declared = self.declared_context_window,
+                starting = self.starting_context_window,
                 source = source.as_str(),
                 "上游拒了这份 prompt；这一轮之后按量到的窗口走"
             );
@@ -4357,7 +4375,7 @@ impl AgentRuntime {
                 agent_id = %self.config.agent_id,
                 before,
                 window,
-                declared = self.declared_context_window,
+                starting = self.starting_context_window,
                 source = source.as_str(),
                 "上下文窗口换了：型号的公布规格或上游收下过的 prompt 给出的大小"
             );

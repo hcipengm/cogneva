@@ -38,10 +38,10 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         .with_guardrail(cog_guardrail::build_default_guardrail(Arc::new(
             cog_guardrail::InMemoryAuditRecorder::new(),
         )))
-        .with_require_identity(system.require_tool_identity)
-        // 一页工具结果的大小由同一个窗口导出：MCP 客户端读文件拿到的页，与
-        // 主进程里的员工拿到的是同一个函数算出来的。
-        .with_context_window_size(agent_loop.context_window_size);
+        .with_require_identity(system.require_tool_identity);
+    // 一页工具结果的大小由这张表服务的窗口导出：「同一个函数算出来的」说的是
+    // `context::tool_result_budget_chars`，不是同一个数。这里没有会话在跑，也就
+    // 没有型号、没有读数，一页因此不设界——与主进程里「还没有读数」那一档一样。
 
     // 内建工具**整批**取自与主应用同一个构造函数（`register_builtins`），不在这里
     // 另列一份。列一份更短的表曾经就写在下面这一行：它看起来完成度更高（少三个

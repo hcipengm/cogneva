@@ -49,17 +49,16 @@ pub struct RuntimeConfig {
     /// decision for this deployment, and it reaches here through the config
     /// surface or the role's skill, never as a default nobody measured.
     pub max_iterations: u32,
-    /// 这一段对话的上下文窗口（token）；`None` = 没人说过，不是零个 token 的窗口。
+    /// 这一段对话**当前在用**的上下文窗口（token）；`None` = 还没有任何一条读数。
     ///
-    /// 起点的正身是上游回报的型号在 LLM 配置里公布的那个数
-    /// （[`crate::model_windows`]：设置页的预设带着厂商规格，随池状态报进来），
-    /// 实测（收下过多大的 prompt、拒收时自述过多大的界）把它往两个方向校正。这里
-    /// 放一个数只用于「型号查不到、也还没量到过」的部署——那种情况宁可不裁，也不
-    /// 拿一个没人量过的数去裁掉本来装得下的历史。
+    /// 这不是一个可以配置的格：部署文档（`agent_loop`）里没有这个键，也没有对应
+    /// 的环境变量。它的来路只有两条读数——上游回报的型号在 LLM 配置里公布的那个数
+    /// （[`crate::model_windows`]：设置页的预设带着厂商规格，随池状态报进来），以及
+    /// 这棵树实测到的界（收下过多大的 prompt、拒收时自述过多大的界），后者按型号
+    /// 分桶、双向校正前者。运行时收到响应后把决定写在这里，读的人从这里看。
     ///
-    /// 它曾经是 `usize`，「0 = 没人说过」只写在注释里：每个读它的地方都得自己把
-    /// 0 翻译成「不设界」，漏一处就是「窗口零个 token」。类型里说清楚之后，
-    /// 「没人说过」不再是一个可以被当成数值参与运算的状态。
+    /// `None` 不是零个 token 的窗口：它是「没有读数」，此时不裁，由第一次拒收把界
+    /// 说出来——宁可不设界，也不拿一个没人量过的数去裁掉本来装得下的历史。
     pub context_window_size: Option<usize>,
     /// TTL for the available_skills cache in seconds.
     pub skill_cache_ttl_secs: u64,
