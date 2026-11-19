@@ -387,10 +387,8 @@
     },
     "workspace_id": "default",
     "consumer_group": "cogneva",
-    "ready_task_poll_interval_secs": 5,
     "batch_persistence_enabled": false,
-    "archive_enabled": true,
-    "_comment_ready_task_poll_interval_secs": "空闲时多久问一次「有没有就绪任务」。读侧把 0 夹到 1 秒（`.max(1)`），那等于常态忙轮询；5 秒是「就绪到被取走」的可接受延迟与空转代价之间的那一档。"
+    "archive_enabled": true
   },
   "gateway": {
     "http_port": 8080,
@@ -400,10 +398,6 @@
     "cors_origins": [
       "*"
     ],
-    "websocket_timeout_secs": 30,
-    "websocket_inactivity_timeout_secs": 90,
-    "notification_limit": 50,
-    "request_timeout_secs": 30,
     "notification_dingtalk": null,
     "notification_feishu": null,
     "notification_wechat_work": null,
@@ -411,11 +405,7 @@
     "_comment_http_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.httpPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
     "_comment_ws_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.wsPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
     "_comment_metrics_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.metricsPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
-    "_comment_internal_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.internalPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
-    "_comment_notification_limit": "通知列表的默认页大小（客户端不传 `limit` 时用它）。0 会让默认页永远是空的，所以这里必须有一个正数。",
-    "_comment_request_timeout_secs": "请求在网关里的等待上界。0 在这里不是「不限」：中间件照样建一个 0 秒超时，每个请求立刻 408，所以这个数必须由部署给出。",
-    "_comment_websocket_inactivity_timeout_secs": "客户端多久没有消息就断开。取心跳周期的三倍：丢一拍心跳不算离线，连丢三拍才断（见 `_comment_websocket_timeout_secs`）。",
-    "_comment_websocket_timeout_secs": "服务端心跳周期：每隔这么久发一次 ping，用来发现死连接。0 会让 tokio 的定时器以零周期启动（构造即 panic），所以这个数必须由部署给出。"
+    "_comment_internal_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.internalPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。"
   },
   "metrics": {
     "enabled": true,

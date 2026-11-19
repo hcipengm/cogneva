@@ -528,6 +528,19 @@ impl Default for DagExecutorConfig {
     }
 }
 
+impl DagExecutorConfig {
+    /// Effective ready-task poll interval; never zero. Zero used to be read as
+    /// "poll without waiting" and got clamped to one second by the read site,
+    /// which is a busy loop wearing a knob's name.
+    pub fn effective_ready_task_poll_interval_secs(&self) -> u64 {
+        if self.ready_task_poll_interval_secs == 0 {
+            DEFAULT_READY_TASK_POLL_INTERVAL_SECS
+        } else {
+            self.ready_task_poll_interval_secs
+        }
+    }
+}
+
 /// Per-platform webhook configuration (DingTalk / Feishu / WeChat Work).
 ///
 /// **只有地址。** 曾经这里还有一个 `secret`，用来自算机器人报文的签名——那条路
@@ -575,14 +588,24 @@ pub struct GatewayConfig {
     /// production uses the bootstrap admin password or a real user store.
     #[serde(default)]
     pub demo_login_enabled: bool,
+    /// WebSocket 心跳间隔。0 ＝ 没写，取
+    /// [`DEFAULT_WEBSOCKET_HEARTBEAT_SECS`]（读侧走
+    /// [`GatewayConfig::effective_websocket_heartbeat_secs`]）。
     #[serde(default = "default_websocket_timeout_secs")]
     pub websocket_timeout_secs: u64,
+    /// 客户端多久不发消息就断开。0 ＝ 没写，取
+    /// [`DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS`]。
     #[serde(default = "default_websocket_inactivity_timeout_secs")]
     pub websocket_inactivity_timeout_secs: u64,
+    /// 没有任何运行期读取；留着只为兼容旧文档里的这个键（`git log` 有它的来历）。
     #[serde(default = "default_websocket_tick_secs")]
     pub websocket_tick_secs: u64,
+    /// 通知列表的默认页大小。0 ＝ 没写，取
+    /// [`DEFAULT_NOTIFICATION_PAGE_LIMIT`]。
     #[serde(default = "default_notification_limit")]
     pub notification_limit: u32,
+    /// 一次 HTTP 请求的应答期限。0 ＝ 没写，取
+    /// [`DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS`]。
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     /// How often the contribution OAuth refresher wakes up. 0 = built-in
@@ -641,6 +664,47 @@ impl GatewayConfig {
             self.contribution_oauth_refresh_threshold_secs
         }
     }
+
+    /// Effective WebSocket heartbeat; never zero. Zero is not "no heartbeat":
+    /// `tokio::time::interval` panics on a zero period, so a connection would
+    /// die on connect instead of staying alive.
+    pub fn effective_websocket_heartbeat_secs(&self) -> u64 {
+        if self.websocket_timeout_secs == 0 {
+            DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        } else {
+            self.websocket_timeout_secs
+        }
+    }
+
+    /// Effective client inactivity timeout; never zero. Zero would disconnect
+    /// every client the moment it connects.
+    pub fn effective_websocket_inactivity_timeout_secs(&self) -> u64 {
+        if self.websocket_inactivity_timeout_secs == 0 {
+            DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS
+        } else {
+            self.websocket_inactivity_timeout_secs
+        }
+    }
+
+    /// Effective notification page size; never zero. Zero would make every
+    /// list response empty, which reads as "you have no notifications".
+    pub fn effective_notification_limit(&self) -> u32 {
+        if self.notification_limit == 0 {
+            DEFAULT_NOTIFICATION_PAGE_LIMIT
+        } else {
+            self.notification_limit
+        }
+    }
+
+    /// Effective per-request answer deadline; never zero. Zero would build a
+    /// zero-second timeout and answer every request with 408 immediately.
+    pub fn effective_request_timeout_secs(&self) -> u64 {
+        if self.request_timeout_secs == 0 {
+            DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS
+        } else {
+            self.request_timeout_secs
+        }
+    }
 }
 
 /// Hourly wake-up. The access token lives 24h, so an hourly check leaves room
@@ -652,23 +716,49 @@ pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS: u64 = 3600;
 // cap: bound — 剩不到 4h 就换：够令牌交换、Secret 改写与网关滚动都在到期前落完
 pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS: u64 = 4 * 3600;
 
+/// 网关一个请求的应答期限。
+///
+/// 它量的是「客户端还愿意等多久」，不是某件活的预算：那件活在期限之后仍会自己走完，
+/// 只是这一头没有人在等它的回应了。「这件活该不该停」由
+/// [`crate::declared_wall`] 按实测的动静判。0 曾是这个字段的默认值，读侧把它当成
+/// 「不限」——而超时中间件照样会建一条 0 秒的期限，于是每个请求立刻 408。
+// cap: bound — 量的是客户端愿意等的时长；再长只会多留一条不会回话的连接
+pub const DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// WebSocket 心跳间隔：半开连接靠自己发现不了，一次 ping 让对端在下一次心跳里
+/// 暴露自己已经走了。
+// cap: bound — 与不活跃期限成 1:3：连续两次心跳缺席，才判这条连接死了
+pub const DEFAULT_WEBSOCKET_HEARTBEAT_SECS: u64 = 30;
+
+/// WebSocket 客户端不活跃期限：这么久没有一条消息就断开。
+// cap: bound — 心跳的 3 倍，允许连续两次心跳缺席再断，避免一次抖动踢掉活人
+pub const DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS: u64 = 90;
+
+/// 通知列表的默认页大小：一屏滚动能读完的量，其余由游标翻页。
+// cap: bound — 一页要能在一屏里读完；更大的页只让每条响应更贵
+pub const DEFAULT_NOTIFICATION_PAGE_LIMIT: u32 = 50;
+
+/// 就绪任务的轮询节拍：任务就绪后最多等一拍被发现。
+// cap: bound — 再密是空转烧 CPU，再疏是让已就绪的任务白等
+pub const DEFAULT_READY_TASK_POLL_INTERVAL_SECS: u64 = 5;
+
 fn default_websocket_timeout_secs() -> u64 {
-    0
+    DEFAULT_WEBSOCKET_HEARTBEAT_SECS
 }
 fn default_websocket_inactivity_timeout_secs() -> u64 {
-    0
+    DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS
 }
 fn default_websocket_tick_secs() -> u64 {
     0
 }
 fn default_notification_limit() -> u32 {
-    0
+    DEFAULT_NOTIFICATION_PAGE_LIMIT
 }
 fn default_request_timeout_secs() -> u64 {
-    0
+    DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS
 }
 fn default_ready_task_poll_interval_secs() -> u64 {
-    0
+    DEFAULT_READY_TASK_POLL_INTERVAL_SECS
 }
 /// 检查点节拍：进度最多丢这么久。
 ///
@@ -2176,6 +2266,95 @@ mod tests {
             cfg.effective_contribution_oauth_refresh_threshold_secs(),
             900
         );
+    }
+
+    /// 「没写」与「写成 0」都不许变成一条坏掉的界。这五个数曾经把 0 当默认值，而 0 在
+    /// 读侧不是「不限」：`request_timeout_secs` 0 建一条 0 秒的超时期限（每个请求立刻
+    /// 408），`websocket_timeout_secs` 0 让零周期的定时器构造即 panic，
+    /// `websocket_inactivity_timeout_secs` 0 一连上就断，`notification_limit` 0 让每页
+    /// 都是空的，`ready_task_poll_interval_secs` 0 被读侧夹到 1 秒成了忙轮询。现在默认
+    /// 值就是内置常量；文档里显式写 0 的那一半由 `effective_*` 换回同一个常量。
+    #[test]
+    fn an_unwritten_or_zero_gateway_bound_reads_the_built_in_value() {
+        let absent: GatewayConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            absent.websocket_timeout_secs,
+            DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        );
+        assert_eq!(
+            absent.websocket_inactivity_timeout_secs,
+            DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS
+        );
+        assert_eq!(absent.notification_limit, DEFAULT_NOTIFICATION_PAGE_LIMIT);
+        assert_eq!(
+            absent.request_timeout_secs,
+            DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS
+        );
+
+        let zeroed: GatewayConfig = serde_json::from_str(
+            r#"{"websocket_timeout_secs": 0, "websocket_inactivity_timeout_secs": 0,
+                "notification_limit": 0, "request_timeout_secs": 0}"#,
+        )
+        .unwrap();
+        // 原始字段照文档说的存 0；读到界的地方拿到的是常量，不是 0。
+        assert_eq!(zeroed.request_timeout_secs, 0);
+        assert_eq!(
+            zeroed.effective_websocket_heartbeat_secs(),
+            DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        );
+        assert_eq!(
+            zeroed.effective_websocket_inactivity_timeout_secs(),
+            DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS
+        );
+        assert_eq!(
+            zeroed.effective_notification_limit(),
+            DEFAULT_NOTIFICATION_PAGE_LIMIT
+        );
+        assert_eq!(
+            zeroed.effective_request_timeout_secs(),
+            DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECS
+        );
+
+        // 写了一个正数就照它来：生效值不是「总是常量」。
+        let set: GatewayConfig = serde_json::from_str(
+            r#"{"websocket_timeout_secs": 7, "websocket_inactivity_timeout_secs": 21,
+                "notification_limit": 9, "request_timeout_secs": 45}"#,
+        )
+        .unwrap();
+        assert_eq!(set.effective_websocket_heartbeat_secs(), 7);
+        assert_eq!(set.effective_websocket_inactivity_timeout_secs(), 21);
+        assert_eq!(set.effective_notification_limit(), 9);
+        assert_eq!(set.effective_request_timeout_secs(), 45);
+    }
+
+    /// 不活跃期限是心跳的三倍——这就是「丢一拍不算离线、连丢三拍才断」那条约定的
+    /// 机器形态。改心跳而不改它，读者会从注释里读到一个不再成立的倍数。
+    #[test]
+    fn the_inactivity_timeout_stays_three_heartbeats() {
+        assert_eq!(
+            DEFAULT_WEBSOCKET_INACTIVITY_TIMEOUT_SECS,
+            3 * DEFAULT_WEBSOCKET_HEARTBEAT_SECS
+        );
+    }
+
+    /// 就绪轮询的 0 同样读作「没写」：读侧曾经把 0 夹到 1 秒，那是把「空转」当成
+    /// 默认节拍。
+    #[test]
+    fn an_unwritten_ready_task_poll_reads_the_built_in_value() {
+        let absent: DagExecutorConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            absent.ready_task_poll_interval_secs,
+            DEFAULT_READY_TASK_POLL_INTERVAL_SECS
+        );
+        let zeroed: DagExecutorConfig =
+            serde_json::from_str(r#"{"ready_task_poll_interval_secs": 0}"#).unwrap();
+        assert_eq!(
+            zeroed.effective_ready_task_poll_interval_secs(),
+            DEFAULT_READY_TASK_POLL_INTERVAL_SECS
+        );
+        let set: DagExecutorConfig =
+            serde_json::from_str(r#"{"ready_task_poll_interval_secs": 12}"#).unwrap();
+        assert_eq!(set.effective_ready_task_poll_interval_secs(), 12);
     }
 
     /// The synthesizer and the startup loader must agree on where hooks live,

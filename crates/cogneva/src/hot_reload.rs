@@ -53,8 +53,9 @@ pub fn apply_gateway_config_update(
         // NOTE: http_port / ws_port / metrics_port / internal_port are intentionally
         // preserved so the already-bound sockets remain valid.
     }
+    // 与启动时同一口径：原子里存生效值，0 在这里等于内置期限。
     request_timeout_secs.store(
-        new_gateway.request_timeout_secs,
+        new_gateway.effective_request_timeout_secs(),
         std::sync::atomic::Ordering::Relaxed,
     );
     applied.push("gateway_timeouts_updated".to_string());
