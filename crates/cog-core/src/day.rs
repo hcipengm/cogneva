@@ -36,6 +36,13 @@
 // cap: fixed — 一日的秒数：日历的定义值，不是这台机器量的
 pub const SECONDS_PER_DAY: i64 = 86_400;
 
+/// Seconds in a minute.
+///
+/// 一分钟是一分钟的秒数。名字里的「MIN」是 minute，不是 minimum——界形的
+/// 判据按 `_` 分隔的整段比，正是为了不把这个单位当成下界。
+// cap: fixed — 一分钟的秒数：定义值
+pub const SECONDS_PER_MINUTE: i64 = 60;
+
 /// Seconds in an hour.
 ///
 /// 一小时是一小时的秒数，不是谁挑的档位：凡是「几小时」的量都乘它，别在调用点
@@ -48,6 +55,19 @@ pub const SECONDS_PER_HOUR: i64 = 3_600;
 /// 同上：七天是一周的秒数。
 // cap: fixed — 一周的秒数：定义值
 pub const SECONDS_PER_WEEK: i64 = SECONDS_PER_DAY * 7;
+
+/// Hours in a day.
+///
+/// 「回看一天」这类量按小时写（`HOURS_PER_DAY`），免得调用点为了说「一天」
+/// 把小时数再算一遍。
+// cap: fixed — 一日的小时数：定义值
+pub const HOURS_PER_DAY: i64 = 24;
+
+/// Milliseconds in a second.
+///
+/// 毫秒配置项（认领门槛、退避基数）乘它换算成秒，别在调用点各写一个 1000。
+// cap: fixed — 一秒的毫秒数：定义值
+pub const MILLIS_PER_SECOND: i64 = 1_000;
 
 /// How far east of UTC this process's clock is at `now_unix`, in seconds.
 ///

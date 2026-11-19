@@ -1728,11 +1728,14 @@ const BOUND_SHAPED_FIXED_AT_CENSUS: &[&str] = &[
     "MAX_CHARS",
 ];
 
-/// 名字里出现这些片段，就算界形。
+/// 名字里出现这些片段，就算界形。按 `_` 分隔的**整段**比，不按裸子串：
+/// `SECONDS_PER_MINUTE` 里的 `MINUTE` 是分钟这个单位，不是「下界」；
+/// `TERMINATION_LOG` 里也没有界。裸子串比会把两个都不是界的名字判成界。
 const BOUND_SHAPED_NAME_PARTS: &[&str] = &[
     "MAX",
     "MIN",
     "CAP",
+    "CAPACITY",
     "LIMIT",
     "RETRY",
     "RETRIES",
@@ -1741,6 +1744,16 @@ const BOUND_SHAPED_NAME_PARTS: &[&str] = &[
     "THRESHOLD",
 ];
 
+/// 一个常量名是不是界形：看它的 `_` 分段里有没有界那个词。
+///
+/// `CAPACITY` 单列，是因为 `FORWARD_CAPACITY` 这种名字把界写成了整段；
+/// 裸子串比时它靠 `CAP` 命中，改成整段比就得把它自己写进词表，否则
+/// 这条界会悄悄从判据下溜走。
+fn is_bound_shaped(name: &str) -> bool {
+    name.split('_')
+        .any(|segment| BOUND_SHAPED_NAME_PARTS.contains(&segment))
+}
+
 #[test]
 fn a_bound_shaped_constant_is_never_fixed() {
     let root = repo_root();
@@ -1748,11 +1761,7 @@ fn a_bound_shaped_constant_is_never_fixed() {
     let flagged: Vec<String> = scanned
         .iter()
         .filter(|row| row.source == "fixed")
-        .filter(|row| {
-            BOUND_SHAPED_NAME_PARTS
-                .iter()
-                .any(|part| row.name.contains(part))
-        })
+        .filter(|row| is_bound_shaped(&row.name))
         .map(|row| format!("{} {} = {}", row.file, row.name, row.value))
         .collect();
     let known: std::collections::BTreeSet<&str> =
@@ -1774,4 +1783,34 @@ fn a_bound_shaped_constant_is_never_fixed() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// 判据按整段比，两个方向都要钉住：真界不许漏，单位与普通词不许误伤。
+///
+/// 改成整段比之前，`SECONDS_PER_MINUTE` 会被 `MIN` 命中——而它是一分钟这个
+/// 单位，于是「十分钟」这种量在仓里根本写不出来，只能退回裸 600。
+/// 反过来，换成整段比不能让 `FORWARD_CAPACITY` 溜掉，所以 `CAPACITY` 单列。
+#[test]
+fn a_bound_shaped_name_is_matched_by_its_segments() {
+    for name in [
+        "MAX_KEY_LEN",
+        "MIN_INTERVAL_SECS",
+        "SUSPECT_BACKOFF_CAP_SECS",
+        "FORWARD_CAPACITY",
+        "PUSH_TIMEOUT_SECS",
+        "MAX_RETRIES",
+        "MIN_REPLICAS",
+        "BATCH_LIMIT",
+    ] {
+        assert!(is_bound_shaped(name), "{name} 是界形，判据放它过去了");
+    }
+    for name in [
+        "SECONDS_PER_MINUTE",
+        "SECONDS_PER_HOUR",
+        "TERMINATION_LOG",
+        "DOMINANT_STRATEGY",
+        "SECONDS_PER_DAY",
+    ] {
+        assert!(!is_bound_shaped(name), "{name} 不是界形，判据误伤了它");
+    }
 }
