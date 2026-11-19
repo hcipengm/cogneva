@@ -58,12 +58,22 @@ pub struct CircuitBreakerConfig {
     pub half_open_max_calls: u32,
 }
 
+// 未分类的任务（四个角色 Planner/Generator/Evaluator/Reviewer 与 `Custom`）
+// 没有专门的档，走这两个 `Default`。它们的失败多是上游抖动而不是活本身坏了，
+// 所以熔断比节点档宽：多两次失败才判死。
+// cap: bound — 连续五次失败才开熔断：角色失败多是上游抖动，三次判死会把它锁在 DLQ
+const UNCLASSIFIED_FAILURE_THRESHOLD: u32 = 5;
+// cap: bound — 半开放三次探测：一次分不清抖动与真坏，三次全失败才判死
+const UNCLASSIFIED_HALF_OPEN_CALLS: u32 = 3;
+// cap: bound — 三次重试，与节点档同一个次数；等待更长（1s 起步、30s 封顶）是因为不知道失败在哪
+const UNCLASSIFIED_RETRIES: u32 = 3;
+
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            failure_threshold: 5,
+            failure_threshold: UNCLASSIFIED_FAILURE_THRESHOLD,
             recovery_timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
-            half_open_max_calls: 3,
+            half_open_max_calls: UNCLASSIFIED_HALF_OPEN_CALLS,
         }
     }
 }
@@ -79,7 +89,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            max_retries: UNCLASSIFIED_RETRIES,
             backoff: BackoffStrategy::Exponential {
                 base_ms: cog_core::day::MILLIS_PER_SECOND as u64,
                 max_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
@@ -395,6 +405,47 @@ mod tests {
         // Planner is not explicitly configured in defaults → falls back
         let cfg = matrix.lookup(&TaskType::Planner);
         assert_eq!(cfg, &RetryConfig::default());
+    }
+
+    /// 未分类任务那一档的三个数各只有一处声明：两个 `Default` 读常量，
+    /// 常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面两个
+    /// `impl Default` 的字段里不再有数字（下一笔把数写回裸字面量就红）。
+    #[test]
+    fn the_unclassified_defaults_read_their_names() {
+        let breaker = CircuitBreakerConfig::default();
+        assert_eq!(breaker.failure_threshold, UNCLASSIFIED_FAILURE_THRESHOLD);
+        assert_eq!(
+            breaker.half_open_max_calls,
+            UNCLASSIFIED_HALF_OPEN_CALLS
+        );
+        assert_eq!(RetryConfig::default().max_retries, UNCLASSIFIED_RETRIES);
+
+        let source = include_str!("retry_matrix.rs");
+        let mut bare: Vec<&str> = Vec::new();
+        for head in [
+            "impl Default for CircuitBreakerConfig",
+            "impl Default for RetryConfig",
+        ] {
+            let body = source
+                .split(head)
+                .nth(1)
+                .expect("the impl is in this file")
+                .split("\n}\n")
+                .next()
+                .unwrap();
+            bare.extend(body.lines().filter(|line| {
+                let line = line.trim();
+                let Some((field, value)) = line.split_once(':') else {
+                    return false;
+                };
+                let named_field = !field.is_empty()
+                    && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                named_field && value.trim().starts_with(|c: char| c.is_ascii_digit())
+            }));
+        }
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
     }
 
     #[test]

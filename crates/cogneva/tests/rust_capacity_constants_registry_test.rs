@@ -724,7 +724,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-gateway/src/usage_landing.rs", 2),
     ("crates/cog-gateway/src/venues.rs", 1),
     ("crates/cog-github/src/ci_refusals.rs", 1),
-    ("crates/cog-github/src/config.rs", 1),
+    ("crates/cog-github/src/config.rs", 4),
     ("crates/cog-github/src/conversation.rs", 1),
     ("crates/cog-github/src/cross_validation.rs", 1),
     ("crates/cog-github/src/discovery_loop.rs", 10),
@@ -769,7 +769,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     // 名字之后它们进册了——不是新增的界，是原先没被数上的界。
     (
         "crates/cog-orchestrator/src/dag_executor/retry_matrix.rs",
-        17,
+        20,
     ),
     (
         "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",

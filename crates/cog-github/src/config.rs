@@ -384,6 +384,16 @@ pub struct LandingPolicy {
     pub redrive_cause_window_secs: u64,
 }
 
+// 一次落地最多重试三趟：推送撞上新基线是竞态，重取、重放即可；三趟还在撞说明
+// 基线在持续前进，再撞只是把这一笔自己的分支拖长。
+// cap: bound — 三趟：撞车是竞态，重取重放；三趟还在撞说明基线在跑，不是运气不好
+const LANDING_MAX_ATTEMPTS: u32 = 3;
+
+// 同一个失败原因只给一轮生成：一轮产出的修复是新的一笔，自带它自己的一轮；
+// 同一原因第二轮还在，说明生成器够不着它，剩下的该由人接手。
+// cap: bound — 一轮：一轮的修复是新的一笔、自带额度；同一原因第二轮还在就是够不着
+const REDRIVE_ROUNDS_PER_CAUSE: u32 = 1;
+
 impl Default for LandingPolicy {
     fn default() -> Self {
         Self {
@@ -406,12 +416,12 @@ impl Default for LandingPolicy {
             redrive_on_ci_failure: true,
             ci_watch_timeout_secs: (30 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             ci_poll_interval_secs: cog_core::day::SECONDS_PER_MINUTE as u64,
-            max_land_attempts: 3,
+            max_land_attempts: LANDING_MAX_ATTEMPTS,
             // One round per cause. That is the policy the re-drive path always
             // claimed — a change that breaks CI twice is out of the
             // generator's reach — stated over the cause instead of over the
             // change, which is what makes it hold along the chain.
-            redrive_max_rounds_per_cause: 1,
+            redrive_max_rounds_per_cause: REDRIVE_ROUNDS_PER_CAUSE,
             // A day. The unit is the one the landing rules already measure
             // churn over: within a day a cause that keeps failing is the same
             // situation, and a day later the branch has moved enough that it
@@ -435,10 +445,15 @@ pub struct ConversationConfig {
     pub bot_signature: String,
 }
 
+// 问三轮还没说清就按已知信息开工：每一轮都要等人回话，第三轮之后「再问一轮」
+// 的成本已经超过「先做、做错了再纠」。
+// cap: bound — 三轮：每轮都等人回话，第三轮之后再问的成本超过先做再纠
+const CLARIFICATION_ROUNDS: u32 = 3;
+
 impl Default for ConversationConfig {
     fn default() -> Self {
         Self {
-            max_clarification_rounds: 3,
+            max_clarification_rounds: CLARIFICATION_ROUNDS,
             awaiting_reply_timeout_hours: (3 * cog_core::day::HOURS_PER_DAY) as u64,
             auto_reply: true,
             bot_signature: "— Cogneva Bot".into(),
@@ -939,5 +954,48 @@ mod tests {
         let missing =
             GiteeIntegrationConfig::load_from(std::path::Path::new("/nonexistent/x.json")).unwrap();
         assert!(!missing.enabled);
+    }
+
+    /// 落地重试、按原因重推、追问轮次这三个数各只有一处声明：默认值读常量，
+    /// 常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面两个
+    /// `impl Default` 的字段里不再有数字（下一笔把数写回裸字面量就红）。
+    #[test]
+    fn the_landing_and_conversation_defaults_read_their_names() {
+        let policy = LandingPolicy::default();
+        assert_eq!(policy.max_land_attempts, LANDING_MAX_ATTEMPTS);
+        assert_eq!(policy.redrive_max_rounds_per_cause, REDRIVE_ROUNDS_PER_CAUSE);
+        assert_eq!(
+            ConversationConfig::default().max_clarification_rounds,
+            CLARIFICATION_ROUNDS
+        );
+
+        let source = include_str!("config.rs");
+        let mut bare: Vec<&str> = Vec::new();
+        for head in [
+            "impl Default for LandingPolicy",
+            "impl Default for ConversationConfig",
+        ] {
+            let body = source
+                .split(head)
+                .nth(1)
+                .expect("the impl is in this file")
+                .split("\n}\n")
+                .next()
+                .unwrap();
+            bare.extend(body.lines().filter(|line| {
+                let line = line.trim();
+                let Some((field, value)) = line.split_once(':') else {
+                    return false;
+                };
+                let named_field = !field.is_empty()
+                    && field
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                named_field && value.trim().starts_with(|c: char| c.is_ascii_digit())
+            }));
+        }
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
     }
 }
