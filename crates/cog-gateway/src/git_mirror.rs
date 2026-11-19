@@ -40,7 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::security_gateway::suspect_backoff_secs;
 
-/// 两条传输时限回路在读数面上的名字：与 tunables 注册表的键一一对应，改一处
+/// 两条传输时限回路在读数面上的名字：与 chart 里该叶子头上的 `# tunable:` 判词一一对应，改一处
 /// 就必须改另一处——这是部署面与读数面唯一共用的字面量。
 pub(crate) const STALL_PACING: &str = "securityGateway.gitMirror.stallSecs";
 pub(crate) const OP_TIMEOUT_PACING: &str = "securityGateway.gitMirror.timeoutSecs";

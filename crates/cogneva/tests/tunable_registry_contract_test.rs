@@ -1,5 +1,4 @@
 // reads: deploy/helm/cogneva/values.yaml subject
-// reads: deploy/helm/cogneva/tunables.yaml subject
 //! principle: feedback_a_whole_tree_census_reads_shapes_so_new_artifacts_must_declare_themselves
 //! principle: feedback_a_chart_value_without_a_registry_row_stops_every_later_rev_not_just_its_own
 //! Every number a deployment ships is one of three things: something a
@@ -8,31 +7,36 @@
 //! other two look exactly like it, because a number a loop computed and a number
 //! somebody typed are the same number on the page.
 //!
-//! The registry (`deploy/helm/cogneva/tunables.yaml`) is where that judgement is
-//! written down, one row per numeric leaf of the chart. This test holds it to the
-//! chart and to the code in four directions:
-//!
-//! - every numeric leaf has exactly one row, and every row names a numeric leaf.
-//!   The set is read from `values.yaml` on every run, so a value that is added
-//!   without a row is a hole this test names rather than an absence nobody
-//!   notices -- "nobody has looked at this yet" has to be a missing row, not a
-//!   silently unjudged number.
-//! - every row says something. For `fixed` that is the reason the value is not
+//! The judgement is written down **on the leaf itself**, as a comment block
+//! directly above it in `values.yaml` -- the same shape the Rust half uses, where
+//! a numeric `const` carries its `// cap:` line in the comment block above it.
+//! There is no second file: a hand-kept table is a list somebody has to remember
+//! to update, and the leaf would then be judged by a file that drifts away from
+//! it. A comment block that is not attached to a leaf is red (a renamed key
+//! leaves its judgement behind), and a leaf with no block is red (a new dial
+//! nobody has judged). This test holds the blocks to the chart and to the code
+//! in four directions:
+//! - every numeric leaf has exactly one block, and every block sits on a numeric
+//!   leaf. The set is read from `values.yaml` on every run, so a value that is
+//!   added without a block is a hole this test names rather than an absence
+//!   nobody notices -- "nobody has looked at this yet" has to be a missing block,
+//!   not a silently unjudged number.
+//! - every block says something. For `fixed` that is the reason the value is not
 //!   derived; for `derived` it is what the value reads.
-//! - a `derived` row names the reading its number lands on and a test that shows
-//!   the number following its input. A comment claiming a value tracks the world
-//!   is not evidence that it does; the test is the part of the claim a machine
-//!   can refuse.
-//! - a row that lands on a reading uses a word the reading can carry, and the
+//! - a `derived` block names the reading its number lands on and a test that
+//!   shows the number following its input. A comment claiming a value tracks the
+//!   world is not evidence that it does; the test is the part of the claim a
+//!   machine can refuse.
+//! - a block that lands on a reading uses a word the reading can carry, and the
 //!   file it names publishes that metric and that label. A value registered as
 //!   derived while its publisher never says so reads as a number that tracks the
 //!   world and is not one -- the failure this is here to catch, since a cap that
 //!   stopped tracking its volume is a steady number either way.
 //!
-//! A key with no row is the same hole as a key with no loop. A numeric leaf of
-//! `values.yaml` with no row is a number nobody has said a measurement should
-//! move; a `derived` row whose proof is missing, or names something that is not
-//! a test, is a number that claims a loop and has none. Both read as the same
+//! A key with no block is the same hole as a key with no loop. A numeric leaf of
+//! `values.yaml` with no block is a number nobody has said a measurement should
+//! move; a `derived` block whose proof is missing, or names something that is
+//! not a test, is a number that claims a loop and has none. Both read as the same
 //! number on the page, and both are refused by the same test below -- a ledger
 //! that answered them in two voices would let a reader believe the half that
 //! happened to be checked.
@@ -41,8 +45,8 @@
 //! production code with no `// cap:` line above it is a number that never went
 //! through the chart, and `rust_capacity_constants_registry_test.rs` is where
 //! that is judged. What "has a loop" means is a fact about one row rather than a
-//! slogan: `evolution.buildGate.maxConcurrent` is the dial the registry carries
-//! with both ends in place -- `derived`, published as `BUILD_GATE_CEILING`
+//! slogan: `evolution.buildGate.maxConcurrent` is the dial whose block carries
+//! both ends in place -- `derived`, published as `BUILD_GATE_CEILING`
 //! under the label `dimension`, proven by `the_ceiling_is_the_tightest_dimension`
 //! in `crates/cog-reflection/src/build_gate/mod.rs`, where the gate takes the
 //! tightest of the host's dimensions and names the one that decided it.
@@ -62,10 +66,7 @@ use cog_core::build_cache_readings::{
 use cog_core::Observable;
 use serde::Deserialize;
 
-/// The registry: one row per numeric leaf of the chart.
-const REGISTRY: &str = "deploy/helm/cogneva/tunables.yaml";
-
-/// The chart whose numeric leaves the registry has to cover.
+/// The chart whose numeric leaves each carry their own judgement.
 const VALUES: &str = "deploy/helm/cogneva/values.yaml";
 
 /// The metric identifier the `source`-labelled cache readings are published
@@ -99,16 +100,19 @@ impl Source {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Registry {
-    version: u32,
+/// Every judgement written on a leaf of the chart, and every comment block that
+/// claims to be one but is not attached to a numeric leaf.
+#[derive(Debug, Default)]
+struct Accounts {
     rows: Vec<Row>,
+    /// Blocks that are not directly above a numeric leaf, with the line they
+    /// start on: a renamed key leaves its judgement behind, and that block must
+    /// not be read as judging whatever leaf moved into its place.
+    stray: Vec<String>,
 }
 
 /// One dial this repository ships.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct Row {
     /// The chart key a deployment sets, spelled as a dotted path into
     /// `values.yaml`.
@@ -118,15 +122,12 @@ struct Row {
     /// Why it is not derived. A derived row says what input it reads instead.
     why: String,
     /// The publisher and the reading, for a value whose number reaches one.
-    #[serde(default)]
     published: Option<Published>,
     /// For a derived row: the test that shows the value following its input.
-    #[serde(default)]
     proof: Option<Proof>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct Published {
     /// The file that builds the value for this key.
     owner: String,
@@ -139,12 +140,10 @@ struct Published {
     /// For a derived row: what makes the loop compute the number again --
     /// `periodic` (a timer) or `event` (a request or a pass that carries it).
     /// Absent on a fixed row, which has no loop to tick.
-    #[serde(default)]
     cadence: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct Proof {
     file: String,
     test: String,
@@ -157,16 +156,197 @@ struct Proof {
     evidence: String,
 }
 
-fn registry() -> Registry {
-    let text = read(&repo_root().join(REGISTRY));
-    let registry: Registry = serde_yaml::from_str(&text)
-        .unwrap_or_else(|e| panic!("{REGISTRY} does not parse as a registry: {e}"));
-    assert_eq!(
-        registry.version, 3,
-        "{REGISTRY}: this test reads version 3, and the version is here so that a \
-         change to the row shape is a version bump rather than a silent reinterpretation"
-    );
-    registry
+/// Read every judgement off the leaves of `values.yaml`.
+///
+/// The block is a run of comment lines whose first line is `# tunable:`, sitting
+/// directly above the leaf it judges. Nothing here knows a list of keys: the
+/// population is whatever the chart ships, and a leaf with no block is reported
+/// by the caller as a hole rather than as an unknown row.
+fn accounts() -> Accounts {
+    let text = read(&repo_root().join(VALUES));
+    let lines: Vec<&str> = text.lines().collect();
+    let leaves = leaf_lines(&lines);
+
+    let mut accounts = Accounts::default();
+    let mut index = 0;
+    while index < lines.len() {
+        let trimmed = lines[index].trim_start();
+        let Some(rest) = trimmed.strip_prefix("# tunable:") else {
+            index += 1;
+            continue;
+        };
+        let start = index;
+        let mut source = None;
+        let mut why = String::new();
+        let mut published = None;
+        let mut proof = None;
+        // The block is contiguous; anything else ends it.
+        while index < lines.len() {
+            let line = lines[index].trim_start();
+            let Some(body) = line.strip_prefix('#') else {
+                break;
+            };
+            let body = body.trim();
+            if index == start {
+                let word = rest.trim();
+                source = Some(word.to_string());
+            } else if let Some(text) = body.strip_prefix("why:") {
+                if !why.is_empty() {
+                    why.push(' ');
+                }
+                why.push_str(text.trim());
+            } else if let Some(text) = body.strip_prefix("published:") {
+                published = Some(published_from(field_map(text, start + 1)));
+            } else if let Some(text) = body.strip_prefix("proof:") {
+                proof = Some(proof_from(field_map(text, start + 1)));
+            }
+            index += 1;
+        }
+
+        let Some(key) = leaves.get(&index) else {
+            accounts.stray.push(format!(
+                "{}:{}: this judgement is not attached to a numeric leaf",
+                VALUES,
+                start + 1
+            ));
+            continue;
+        };
+        let Some(word) = source else { continue };
+        let source = match word.as_str() {
+            "derived" => Source::Derived,
+            "fixed" => Source::Fixed,
+            other => {
+                accounts.stray.push(format!(
+                    "{}:{}: `{other}` is not a word this account carries -- a value \
+                     either has a loop that measures it (`derived`) or is an \
+                     agreement no measurement should move (`fixed`)",
+                    VALUES,
+                    start + 1
+                ));
+                continue;
+            }
+        };
+        accounts.rows.push(Row {
+            key: key.clone(),
+            source,
+            why,
+            published,
+            proof,
+        });
+    }
+    accounts
+}
+
+/// The `key=value` fields of a `# published:` / `# proof:` line.
+fn field_map(text: &str, line: usize) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for field in text.split_whitespace() {
+        let Some((key, value)) = field.split_once('=') else {
+            panic!(
+                "{VALUES}:{line}: `{field}` is not a `key=value` field; the block's \
+                 fields are read positionally and a bare word would be dropped in \
+                 silence"
+            );
+        };
+        map.insert(key.to_string(), value.to_string());
+    }
+    map
+}
+
+fn published_from(mut fields: BTreeMap<String, String>) -> Published {
+    let take = |fields: &mut BTreeMap<String, String>, name: &str| {
+        fields.remove(name).unwrap_or_else(|| {
+            panic!("{VALUES}: a `# published:` line is missing `{name}=`, and a reading nobody can find is not one")
+        })
+    };
+    let cadence = fields.remove("cadence");
+    Published {
+        owner: take(&mut fields, "owner"),
+        file: take(&mut fields, "file"),
+        metric: take(&mut fields, "metric"),
+        label: take(&mut fields, "label"),
+        cadence,
+    }
+}
+
+fn proof_from(mut fields: BTreeMap<String, String>) -> Proof {
+    let take = |fields: &mut BTreeMap<String, String>, name: &str| {
+        fields.remove(name).unwrap_or_else(|| {
+            panic!("{VALUES}: a `# proof:` line is missing `{name}=`, and a proof nobody can find is not one")
+        })
+    };
+    Proof {
+        file: take(&mut fields, "file"),
+        test: take(&mut fields, "test"),
+        beat: take(&mut fields, "beat"),
+        evidence: take(&mut fields, "evidence"),
+    }
+}
+
+/// The dotted path of every numeric leaf, keyed by the line it is written on.
+fn leaf_lines(lines: &[&str]) -> BTreeMap<usize, String> {
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut out = BTreeMap::new();
+    let mut skip_until: Option<usize> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(indent) = skip_until {
+            if line.trim().is_empty() || indent_of(line) > indent {
+                continue;
+            }
+            skip_until = None;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("- ") {
+            continue;
+        }
+        let Some((indent, key, value)) = split_key_line(line) else {
+            continue;
+        };
+        while stack.last().is_some_and(|(higher, _)| *higher >= indent) {
+            stack.pop();
+        }
+        if value == "|" || value == "|-" || value == ">" || value == ">-" {
+            skip_until = Some(indent);
+            stack.push((indent, key));
+            continue;
+        }
+        if value.is_empty() {
+            stack.push((indent, key));
+            continue;
+        }
+        if is_quantity(&value) || value.eq_ignore_ascii_case("auto") {
+            let path = stack
+                .iter()
+                .map(|(_, key)| key.as_str())
+                .chain(std::iter::once(key.as_str()))
+                .collect::<Vec<_>>()
+                .join(".");
+            out.insert(index, path);
+        }
+    }
+    out
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// `(indent, key, value)` for a `key: value` line of the chart.
+fn split_key_line(line: &str) -> Option<(usize, String, String)> {
+    let indent = indent_of(line);
+    let rest = line.trim_start();
+    let (key, value) = rest.split_once(':')?;
+    let key = key.trim();
+    if key.is_empty() || key.contains(' ') || key.contains('"') || key.contains('\'') {
+        return None;
+    }
+    let value = value.trim();
+    let value = match value.split_once(" #") {
+        Some((before, _)) => before.trim(),
+        None => value,
+    };
+    let value = value.trim_matches(|c| c == '"' || c == '\'');
+    Some((indent, key.to_string(), value.to_string()))
 }
 
 /// `text` without its line comments.
@@ -328,9 +508,9 @@ fn a_key_with_no_row_is_the_same_hole_as_a_key_with_no_loop() {
     let mut leaves = BTreeSet::new();
     numeric_leaves(&values, &mut Vec::new(), &mut leaves);
 
-    let registry = registry();
+    let accounts = accounts();
     let mut rows: BTreeMap<&str, usize> = BTreeMap::new();
-    for row in &registry.rows {
+    for row in &accounts.rows {
         *rows.entry(row.key.as_str()).or_default() += 1;
     }
 
@@ -356,12 +536,17 @@ fn a_key_with_no_row_is_the_same_hole_as_a_key_with_no_loop() {
     );
     assert!(
         unknown.is_empty(),
-        "these rows describe something the chart does not ship as a number: \
+        "these judgements describe something the chart does not ship as a number: \
          {unknown:#?}"
+    );
+    assert!(
+        accounts.stray.is_empty(),
+        "these judgements are not attached to a leaf: {}",
+        accounts.stray.join("\n")
     );
 
     let mut wrong = Vec::new();
-    for row in &registry.rows {
+    for row in &accounts.rows {
         if row.source != Source::Derived {
             continue;
         }
@@ -509,14 +694,14 @@ fn container_resource_bounds_in_templates_come_from_values() {
     assert!(
         literals.is_empty(),
         "these container resource bounds are written into the template, so they \
-         are dials with no row in {REGISTRY} and no reading can see them: {literals:#?}"
+         are dials with no judgement on their leaf and no reading can see them: {literals:#?}"
     );
 }
 
 #[test]
 fn every_row_says_why_it_is_not_derived() {
     let mut silent = Vec::new();
-    for row in &registry().rows {
+    for row in &accounts().rows {
         if row.why.trim().is_empty() {
             silent.push(format!("`{}` ({:?})", row.key, row.source));
         }
@@ -531,9 +716,9 @@ fn every_row_says_why_it_is_not_derived() {
 
 #[test]
 fn a_value_that_lands_on_a_reading_has_a_word_the_reading_can_carry() {
-    let registry = registry();
+    let accounts = accounts();
     let mut unnameable = Vec::new();
-    for row in &registry.rows {
+    for row in &accounts.rows {
         if row.published.is_some() && row.source.as_label().is_none() {
             unnameable.push(row.key.as_str());
         }
@@ -550,7 +735,7 @@ fn a_value_that_lands_on_a_reading_has_a_word_the_reading_can_carry() {
 #[test]
 fn a_published_row_names_a_file_that_publishes_its_metric_and_label() {
     let mut wrong = Vec::new();
-    for row in &registry().rows {
+    for row in &accounts().rows {
         let Some(published) = &row.published else {
             continue;
         };
@@ -598,7 +783,7 @@ fn a_cap_rows_owner_does_not_publish_it_as_derived_unless_it_says_so() {
     let values: serde_yaml::Value = serde_yaml::from_str(&read(&repo_root().join(VALUES)))
         .unwrap_or_else(|e| panic!("{VALUES} does not parse: {e}"));
     let mut wrong = Vec::new();
-    for row in &registry().rows {
+    for row in &accounts().rows {
         let Some(published) = &row.published else {
             continue;
         };
@@ -663,7 +848,7 @@ fn the_registrys_words_are_the_labels_words() {
 /// either an agreement (`fixed`) or not a dial. Re-adding the word re-opens the
 /// end state one row at a time, and the row itself looks entirely ordinary on
 /// the page -- so the vocabulary refuses it, and this test names the refusal
-/// instead of letting serde report an unknown variant from inside `registry()`.
+/// instead of letting a block fall through the scanner as an unread word.
 /// 界形的数字，不许标成 `fixed`。
 ///
 /// 词表里只有两个词：`derived`（一条实测让它动）与 `fixed`（一项约定，不是旋钮）。
@@ -713,25 +898,20 @@ const BOUND_SHAPED_SEGMENTS: &[&str] = &[
 
 #[test]
 fn a_bound_shaped_number_is_never_fixed() {
-    let text = read(&repo_root().join(REGISTRY));
     let mut flagged: Vec<String> = Vec::new();
-    let mut key: Option<String> = None;
-    for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("- key: ") {
-            key = Some(rest.trim().to_string());
-            continue;
-        }
-        let Some(source) = line.trim_start().strip_prefix("source: ") else {
-            continue;
-        };
-        let Some(key) = key.take() else { continue };
-        let segment = key.rsplit('.').next().unwrap_or(&key).to_ascii_lowercase();
-        if source.trim() == "fixed"
+    for row in &accounts().rows {
+        let segment = row
+            .key
+            .rsplit('.')
+            .next()
+            .unwrap_or(&row.key)
+            .to_ascii_lowercase();
+        if row.source == Source::Fixed
             && BOUND_SHAPED_SEGMENTS
                 .iter()
                 .any(|bound| segment.ends_with(bound))
         {
-            flagged.push(key);
+            flagged.push(row.key.clone());
         }
     }
     let known: BTreeSet<&str> = BOUND_SHAPED_FIXED_AT_CENSUS.iter().copied().collect();
@@ -781,16 +961,16 @@ fn the_registry_vocabulary_has_no_override() {
          (a measurement sets it) and `fixed` (an agreement, not a dial)"
     );
 
-    let text = read(&repo_root().join(REGISTRY));
+    let text = read(&repo_root().join(VALUES));
     let offenders: Vec<String> = text
         .lines()
         .enumerate()
         .filter(|(_, line)| {
-            let line = line.trim_start();
-            line.strip_prefix("source:")
+            line.trim_start()
+                .strip_prefix("# tunable:")
                 .is_some_and(|rest| rest.trim() == "override")
         })
-        .map(|(index, _)| format!("{REGISTRY}:{}", index + 1))
+        .map(|(index, _)| format!("{VALUES}:{}", index + 1))
         .collect();
     assert!(
         offenders.is_empty(),
@@ -848,7 +1028,7 @@ async fn every_reading_a_tunable_lands_on_says_where_its_value_came_from() {
     // above is what holds those.
     let mut checked = 0;
     let metrics = bounded().collect_metrics("").await.unwrap();
-    for row in &registry().rows {
+    for row in &accounts().rows {
         let Some(published) = &row.published else {
             continue;
         };

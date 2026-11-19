@@ -264,7 +264,7 @@ jobs:
       # 自己的注释里写 writes: <模式> generated 并在正文点到它；只读来验的判词脚本写
       # reads: <模式> subject；文件自己用 debt: <理由>; expires: <日期> 或 carrier:
       # 认领。一张手写的分类表改一格就改判词，而树上没有一句话说那一格该不该在——
-      # tunables.yaml 的每行 derived/fixed 就是这种表。没人读的表不判；量不出来（没有
+      # 叶子头上 `# tunable:` 的每个 derived/fixed 判词就是这种表。没人读的表不判；量不出来（没有
       # 数据文件、没有判词脚本）退 3——不是绿。测试文件钉住它判红的那些格，否则这扇门
       # 自己静默答「没意见」也没人看得出来。
       - name: Check every table a gate reads names its producer

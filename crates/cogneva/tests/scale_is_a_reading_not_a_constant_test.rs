@@ -120,26 +120,42 @@ fn the_sandbox_workload_is_one_the_queue_is_allowed_to_resize() {
 
 /// 种子声明成「跟着读数走」，而不是一个由人挑的数。
 ///
-/// 安装时那个 1 是种子：第一拍读到队之前它生效，之后由队回答。它在登记表里
-/// 只要被写成 `derived`、理由里点名那条读数，读者就能看出它不是一个天花板；
-/// 写成 `fixed` 或 `override`，容量就又成了一次签字。
+/// 安装时那个 1 是种子：第一拍读到队之前它生效，之后由队回答。它在该叶子上头那块
+/// `# tunable:` 里只要被写成 `derived`、理由里点名那条读数，读者就能看出它不是
+/// 一个天花板；写成 `fixed`，容量就又成了一次签字。
 #[test]
 fn the_seed_count_is_declared_as_following_a_reading() {
-    let tunables = repo_root().join("deploy/helm/cogneva/tunables.yaml");
-    let documents: serde_yaml::Value =
-        serde_yaml::from_str(&std::fs::read_to_string(&tunables).unwrap())
-            .expect("the tunables registry parses");
-    let row = documents["rows"]
-        .as_sequence()
-        .expect("the registry holds a list of rows")
-        .iter()
-        .find(|row| row["key"] == serde_yaml::Value::String("sandboxExecutor.replicas".into()))
-        .expect("the executor's replica seed is registered");
-    assert_eq!(row["source"], serde_yaml::Value::String("derived".into()));
-    let why = row["why"].as_str().unwrap_or_default();
+    let values = std::fs::read_to_string(repo_root().join("deploy/helm/cogneva/values.yaml"))
+        .expect("the chart's values are readable");
+    let lines: Vec<&str> = values.lines().collect();
+    let mut found: Option<(&str, &str)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        let Some(word) = line.trim_start().strip_prefix("# tunable:") else {
+            continue;
+        };
+        let mut why = String::new();
+        let mut next = index;
+        while next < lines.len() && lines[next].trim_start().starts_with('#') {
+            if let Some(body) = lines[next].trim_start().strip_prefix('#') {
+                if let Some(text) = body.trim().strip_prefix("why:") {
+                    why.push_str(text.trim());
+                    why.push(' ');
+                }
+            }
+            next += 1;
+        }
+        if why.contains("GET /lane") {
+            found = Some((word.trim(), lines.get(next).copied().unwrap_or_default()));
+        }
+    }
+    let (source, leaf) = found.expect("the executor's replica seed carries a judgement");
+    assert_eq!(
+        source, "derived",
+        "理由点名了 GET /lane，判词却不是 derived：容量又成了一次签字"
+    );
     assert!(
-        why.contains("GET /lane"),
-        "理由里没有点名那条读数，读者无从知道它跟着什么变"
+        leaf.trim_start().starts_with("replicas:"),
+        "点名 GET /lane 的那块判词不在副本数叶子上头：{leaf:?}"
     );
 }
 

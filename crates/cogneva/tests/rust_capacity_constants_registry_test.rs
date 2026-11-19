@@ -3,8 +3,8 @@
 //! Every number written into a Rust constant has to say where it comes from,
 //! and a new one fails this test until it does.
 //!
-//! The chart has had `deploy/helm/cogneva/tunables.yaml` for this: one row per
-//! numeric leaf, answered with `derived`, `override` or `fixed`. A chart leaf is
+//! The chart half answers this with a comment block above each numeric leaf:
+//! one leaf, one judgement, `derived` or `fixed`. A chart leaf is
 //! read at run time, so `derived` is something a leaf can be -- a measurement
 //! moves it. A `const` cannot: its value is fixed when the crate is compiled and
 //! no later reading moves it. The words a constant can carry are therefore

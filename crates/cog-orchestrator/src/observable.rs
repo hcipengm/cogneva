@@ -363,7 +363,7 @@ pub const STALL_GAP_SAMPLES_METRIC: &str = "cogneva_stall_gap_samples";
 /// 同一个数有两种来路：一条读数每窗算出来的界，和部署钉死的一个数。没有这个
 /// 标签时两者在抓取面上完全同形——而「界不再跟着内存走了」这件事，正是它被钉死
 /// 之后唯一看得见的样子。注册表的 `derived` 行要求发布方自己说出这一格（见
-/// `deploy/helm/cogneva/tunables.yaml` 与 `tunable_registry_contract_test.rs`）。
+/// 叶子头上的 `# tunable:` 块与 `tunable_registry_contract_test.rs`）。
 pub const CLAIM_SLOTS_SOURCE_LABEL: &str = crate::outward::LABEL_SOURCE;
 /// 界由读数导出：`lane_memory` 每窗按容器内存重算，普通车道每窗按池子的额度
 /// 窗口重算。
