@@ -58,6 +58,11 @@ pub struct ContentFilterConfig {
     pub custom_blocked_patterns: Vec<String>,
 }
 
+// 0.6 的余弦相似度：同义改写通常落在 0.6 以上，而主题相邻的句子（「怎么保护
+// 自己」对「怎么伤害别人」）在 0.6 以下分开。
+// cap: bound — 0.6：同义改写在它之上，主题相邻的句子在它之下分开
+const SEMANTIC_BLOCK_THRESHOLD: f64 = 0.6;
+
 impl Default for ContentFilterConfig {
     fn default() -> Self {
         Self {
@@ -66,7 +71,7 @@ impl Default for ContentFilterConfig {
             block_hate_speech: true,
             block_self_harm: true,
             block_illegal_acts: true,
-            semantic_threshold: 0.6,
+            semantic_threshold: SEMANTIC_BLOCK_THRESHOLD,
             custom_blocked_patterns: vec![],
         }
     }
@@ -466,5 +471,41 @@ impl cog_core::Guardrail for ContentFilter {
 
     async fn check_tool_call(&self, _tool: &cog_core::ToolCall) -> GuardResult {
         GuardResult::Pass
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 语义判定的阈值只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    #[test]
+    fn the_content_filter_default_reads_its_threshold() {
+        assert_eq!(
+            ContentFilterConfig::default().semantic_threshold,
+            SEMANTIC_BLOCK_THRESHOLD
+        );
+
+        let body = include_str!("content_filter.rs")
+            .split("impl Default for ContentFilterConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
     }
 }

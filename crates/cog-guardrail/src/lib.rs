@@ -328,7 +328,6 @@ mod tests {
             blocked_tools: vec![],
             dangerous_tools: vec![],
             require_approval_tools: vec![],
-            max_file_delete_count: 10,
             allowed_domains: vec!["trusted.com".into()],
         });
         let tool = ToolCall {

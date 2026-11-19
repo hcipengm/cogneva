@@ -29,10 +29,19 @@ pub struct RetryPolicy {
     pub jitter: bool,
 }
 
+// 三次：一次拒绝多是上游的瞬时状态，三次退避（0.5s/1s/2s 起）足够越过它；
+// 再往后每一次都只是把同一个失败拖得更久。
+//
+// 现场：这个模块（`ResilientProvider`／`RetryPolicy`）在仓里没有调用方，只有
+// `lib.rs` 的转出——下面这三个数是给一个没人用的类型命名的，删不删这个类型是
+// 另一个判据（公共 API），先记在账上。
+// cap: bound — 三次：三次退避够越过上游的瞬时状态，再往后只是拖长同一个失败
+const RETRY_MAX_ATTEMPTS: u32 = 3;
+
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            max_retries: RETRY_MAX_ATTEMPTS,
             base_delay_ms: (cog_core::day::MILLIS_PER_SECOND / 2) as u64,
             max_delay_ms: (8 * cog_core::day::MILLIS_PER_SECOND) as u64,
             strategy: BackoffStrategy::Exponential,
@@ -183,6 +192,34 @@ use cog_core::LlmClient as LLMProvider;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 重试次数只有一处声明：默认值读常量，源码面 `impl Default` 的字段里不再有数字。
+    #[test]
+    fn the_retry_policy_default_reads_its_name() {
+        assert_eq!(RetryPolicy::default().max_retries, RETRY_MAX_ATTEMPTS);
+        let body = include_str!("resilience.rs")
+            .split("impl Default for RetryPolicy")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     #[test]
     fn test_circuit_breaker_opens_after_threshold() {
