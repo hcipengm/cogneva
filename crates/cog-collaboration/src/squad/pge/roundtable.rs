@@ -13,6 +13,13 @@ use crate::squad::pge::types::{
 use std::sync::Arc;
 use tracing::info;
 
+/// 一份分支就是不做并行：这是并行度的单位，不是它的一个档。
+///
+/// 并行是要有人显式打开的模式（并且要给出合并策略与合并者）；默认落在
+/// 「一条线跑完」，是因为不并行不需要任何额外的约定。
+// cap: fixed — 并行度的单位：一＝顺序
+pub const SEQUENTIAL_BRANCHES: u32 = 1;
+
 pub struct PgeRoundtableConfig {
     pub max_iterations: u32,
     /// The score a `Pass` must reach for the debate to confirm, as a fraction
@@ -101,7 +108,7 @@ impl Default for PgeRoundtableConfig {
             board_store: None,
             moderator: None,
             knowledge_backend: None,
-            parallel_branches: 1,
+            parallel_branches: SEQUENTIAL_BRANCHES,
             branch_merge_strategy: BranchMergeStrategy::BestScore,
             agent_manager: None,
             llm_provider: None,

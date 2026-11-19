@@ -1180,11 +1180,20 @@ pub struct RateLimitConfig {
     pub per_second: u32,
 }
 
+/// 一秒的额度：令牌桶刚满时手里有这么多，补充速率也是这么多。
+///
+/// 桶深与速率相等，等于说「桶里装的是同一秒的额度」——两份各写一个整数只是
+/// 把这句话抄了两遍，改一处另一处不会红。真要让桶存更久（忍受更长的突发），
+/// 那是一个不同的决定，得写成这条速率的倍数，而不是另一个孤立的整数。
+// cap: bound — 每秒一百次是钩子限流的默认额度；各钩子自己的触发密度还没量过，
+// 量出来之前它只能往下调
+const DEFAULT_HOOK_RATE_PER_SECOND: u32 = 100;
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            burst: 100,
-            per_second: 100,
+            burst: DEFAULT_HOOK_RATE_PER_SECOND,
+            per_second: DEFAULT_HOOK_RATE_PER_SECOND,
         }
     }
 }
