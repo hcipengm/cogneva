@@ -40,6 +40,7 @@ const CURRENT_REF: &str = "refs/main";
 const MAX_LENGTH: usize = 512;
 
 /// BGE-M3 词表里 `<s>`、`<pad>`、`</s>`、`<unk>` 的编号，稀疏权重不计它们。
+// cap: fixed — 模型词表定义的编号：这四个 token 在 BGE-M3 词表里就是前四条
 const SPECIAL_TOKENS: [i64; 4] = [0, 1, 2, 3];
 
 /// 分会词、也会把隐状态变成稀疏向量的那一半。

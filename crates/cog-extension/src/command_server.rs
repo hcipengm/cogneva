@@ -454,6 +454,8 @@ pub struct CommandMetrics {
 /// is a compile, and the last edge is past the longest wall a caller can ask
 /// for, so a command that runs long lands in a bucket instead of leaving every
 /// long request to be counted in `+Inf` with the timeouts.
+// cap: fixed — 桶边界是测量轴的定义：命中分布量在桶里，桶本身不能由它导出（那是循环），
+// 切点就是读这张图的人要分开的那几类等待
 const COMMAND_LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0,
 ];
