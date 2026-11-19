@@ -146,4 +146,21 @@ fi
 printf '%s' "${out}" | grep -q 'update available' \
     || fail "红的时候要带出 rustup 说的那句话：${out}"
 
-echo "toolchain-matches-ci：七支各判一次，干净树绿"
+# 4c) 箭头两边同版：rustup 把同一次发布又列了一遍，本机 stable 就是它。
+#     `rustup check` 在 2026-11-19 的实机输出就是这样（1.100.0 -> 1.100.0），
+#     而本机 rustc 正是 1.100.0。判成「落后」会让人 `rustup update stable`，
+#     装回来的还是同一把编译器；这条门在它不该红的时候红了。
+same="${work}/fakebin-same"
+mkdir -p "${same}"
+cat > "${same}/rustup" <<'FAKE'
+#!/usr/bin/env bash
+echo "stable-x86_64-unknown-linux-gnu - update available: 2.0.0 (bbb 2026-11-09) -> 2.0.0 (bbb 2026-11-09)"
+exit 100
+FAKE
+chmod +x "${same}/rustup"
+d="$(scratch same-version)"
+if ! out="$(PATH_OVERRIDE="${same}:/usr/bin:/bin" run_gate "${d}" 2>&1)"; then
+    fail "箭头两边同版时这条门不该红（本机 stable 就是已发布的那一版）：${out}"
+fi
+
+echo "toolchain-matches-ci：八支各判一次，干净树绿"
