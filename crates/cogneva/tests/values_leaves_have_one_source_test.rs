@@ -42,6 +42,12 @@
 //! 整棵子树交出去（`toYaml`／`join`／`include`／`range`）。没有读者的一格，改它
 //! 渲染出来的清单一个字都不变：那是一条没人执行的部署说明。
 //!
+//! 第五个面：**env 层不许复述交接文档**。裸词（`cogneva`、`main`、`local-fs`）
+//! 按字面量相等判是不成立的——同一个词在别处可能是另一件事。判据换成文档自己的
+//! `env` 表：变量名通向哪条路径，文档正文在那条路径上是不是写着同一个值。写着
+//! 同一个值的，是同一件事的两处声明（文档不带 env 跑就是它，带 env 跑送进去的
+//! 还是它）；值不同的是这份 Pod 与共享文档的差，那正是覆盖层的用处，不在这里判。
+//!
 //! 不判什么，说清楚：模板里写死的数字（不来自 `.Values`）归
 //! `chart_template_literals_contract_test.rs`；`values.yaml` 的数值叶子各带一条
 //! `# tunable:` 判词，归 `tunable_registry_contract_test.rs`；`values` 叶子与代码
@@ -1148,5 +1154,158 @@ fn the_reference_gate_names_a_spelled_copy_and_lets_the_reference_through() {
     assert!(
         taken.is_empty(),
         "指着叶子取的那一行被当成了复述：{taken:#?}"
+    );
+}
+
+/// 文档 `env` 表里每个变量，在文档正文那条路径上的值——写成环境变量行会带的那种字符串。
+///
+/// 非标量（对象、数组、null）不进这张表：环境变量只能送一个标量，那种路径本来就
+/// 不是 env 层能表达的东西，轮不到这道判据说话。
+fn document_env_values(doc: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, path) in doc_env_map(doc) {
+        let Some(value) = value_at(doc, &path) else {
+            continue;
+        };
+        let shown = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => continue,
+        };
+        out.insert(name, shown);
+    }
+    out
+}
+
+/// 一行模板写死的 `COGNEVA_*` 值：变量名与引号里的字面量。
+///
+/// 只认完整引号包住的标量：`{{ … }}` 那一类是投影（谁投影的归各自的门），
+/// `value: "a" # 说明` 这一类的尾巴由 `env_assignment` 之前的形态挡住——引号
+/// 不在结尾就不算字面量，宁可漏判一条也不要拿半行去比。
+fn env_literal(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = env_assignment(line)?;
+    if !name.starts_with("COGNEVA_") {
+        return None;
+    }
+    let value = value.trim();
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.contains(['{', '}']) {
+        return None;
+    }
+    Some((name, inner))
+}
+
+/// 把整行的 YAML 注释抹成空行，**不动行号**：点名要指回文件里那一行。
+///
+/// `comment_free` 会把注释行删掉，后面每一行都往前挪——报出来的行号对不上文件，
+/// 读的人顺着它找不到那一行。
+fn blank_comments(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.trim_start().starts_with('#') {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 一段模板里，哪些 `COGNEVA_*` 行把交接文档已经写着的那句话又写了一遍。
+fn restatements(text: &str, declared: &BTreeMap<String, String>, site: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let Some((name, literal)) = env_literal(line) else {
+            continue;
+        };
+        let Some(want) = declared.get(name) else {
+            continue;
+        };
+        if want == literal {
+            out.push(format!(
+                "{site}:{}  {name}: \"{literal}\"——文档在 env 表指向的那条路径上已经写着它",
+                n + 1
+            ));
+        }
+    }
+    out
+}
+
+/// env 层不许把交接文档已经写着的话再说一遍。
+///
+/// 这一族是裸词——`cogneva`、`main`、`local-fs` 这类既可能是应用名、也可能是命名
+/// 空间、也可能是库名的字面量。按字面量相等判它是不成立的：同一个词在两处完全可能
+/// 是两件事（`COGNEVA_AGENT_GROUP: "main"` 与 `gitops.clusterName: main` 就是）。
+/// 但这道判据不比字面量，它比的是**变量名通向哪条路径**：文档自己的 `env` 表说
+/// `COGNEVA_APP_NAME` 落在 `app.name`，而文档正文在 `app.name` 上写着同一个值——
+/// 于是这两行是同一件事的两处声明。证据来自文档自己的映射表，不是人对词的判断。
+///
+/// 判词只落在「值相等」这一半。值不等的那些是另一个面：覆盖层本来就允许盖掉文档
+/// （进化 Pod 关掉 memory、关掉分层迁移），那是这份 Pod 与共享文档的差，不是复述。
+/// 值相等的那一行什么都决定不了：文档说不带 env 跑就是这个值，而带 env 跑的这一行
+/// 送进去的还是它——两处一起改才生效，只改一处，被盖掉的那处沉默地读不到。
+///
+/// 修法两条，按这一行是谁的来定：共享的那份（`cogneva-config`）从文档取——送进
+/// Pod 的值一字不差，只是不再由模板另写一遍；某一份 Pod 覆盖层里的，删掉——文档
+/// 已经说着它，那份覆盖层没有作出任何差。
+#[test]
+fn the_env_layer_does_not_restate_the_handover_document() {
+    let doc: serde_json::Value = serde_json::from_str(&read_repo(CHART_DOC))
+        .unwrap_or_else(|e| panic!("{CHART_DOC} 不是合法 JSON：{e}"));
+    let declared = document_env_values(&doc);
+    assert!(
+        !declared.is_empty(),
+        "{CHART_DOC} 的 env 表一条标量路径都没解析出来：下面那条判据会在空集上通过"
+    );
+
+    let dir = repo_root().join(TEMPLATES);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a template directory entry").path())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("tpl")
+            )
+        })
+        .collect();
+    files.sort();
+
+    let mut found = Vec::new();
+    for file in &files {
+        let text = blank_comments(&read(file));
+        found.extend(restatements(
+            &text,
+            &declared,
+            &file.display().to_string(),
+        ));
+    }
+    assert!(
+        found.is_empty(),
+        "这些环境变量把交接文档已经写着的那句话又写了一遍：\n{}",
+        found.join("\n")
+    );
+}
+
+/// 这条判据不是空转：复述的那一行会被点名，覆盖与投影都不会。
+#[test]
+fn the_restatement_gate_names_a_copy_and_lets_an_override_through() {
+    let mut declared = BTreeMap::new();
+    declared.insert("COGNEVA_APP_NAME".to_string(), "cogneva".to_string());
+    declared.insert("COGNEVA_MEMORY_ENABLED".to_string(), "true".to_string());
+
+    let probe = "  COGNEVA_APP_NAME: \"cogneva\"\n  COGNEVA_LOG_LEVEL: \"info\"\n  COGNEVA_MEMORY_ENABLED: \"false\"\n  COGNEVA_PG_PROVIDER: {{ $doc.providers.pg.provider | quote }}\n";
+    let found = restatements(probe, &declared, "probe.yaml");
+    assert_eq!(
+        found.len(),
+        1,
+        "只该点名复述的那一行（日志级别不在文档映射里、memory 是这份 Pod 的差、\
+         provider 是投影）：{found:#?}"
+    );
+    assert!(
+        found[0].contains("COGNEVA_APP_NAME") && found[0].contains("probe.yaml:1"),
+        "点名要落在文件与行号上：{found:#?}"
     );
 }

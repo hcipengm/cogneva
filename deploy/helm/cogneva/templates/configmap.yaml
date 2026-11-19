@@ -6,17 +6,23 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: config
+{{- /* 应用名、日志级别、数据与应用目录、三个 provider 名、工作区与消费组这几格，
+       交接文档 `files/cogneva.json` 里已写着同一个值——那份文件是进程真正按它加载
+       的配置，本 ConfigMap 只是把其中几格摆到 env 层。所以这里不另写一遍，而是从
+       那份文件取：写两遍的后果是改一处、另一处沉默地盖回去，而两份值相等的今天，
+       渲染结果一个字节都不变。 */}}
+{{- $doc := .Files.Get "files/cogneva.json" | fromJson }}
 data:
-  COGNEVA_APP_NAME: "cogneva"
+  COGNEVA_APP_NAME: {{ $doc.app.name | quote }}
   COGNEVA_APP_VERSION: {{ .Chart.AppVersion | quote }}
-  COGNEVA_LOG_LEVEL: "info"
-  COGNEVA_DATA_DIR: "/var/lib/cogneva-data"
-  COGNEVA_APP_DIR: "/opt/cogneva"
+  COGNEVA_LOG_LEVEL: {{ $doc.app.log_level | quote }}
+  COGNEVA_DATA_DIR: {{ $doc.app.data_dir | quote }}
+  COGNEVA_APP_DIR: {{ $doc.app.app_dir | quote }}
   # WebUI 静态资源目录（镜像内 web 构建产物位置），不设会回退到构建机源码路径
   COGNEVA_WEB_DIR: "/opt/cogneva/web"
 
-  COGNEVA_DB_PROVIDER: "mysql"
-  COGNEVA_PG_PROVIDER: "postgres"
+  COGNEVA_DB_PROVIDER: {{ $doc.providers.db.provider | quote }}
+  COGNEVA_PG_PROVIDER: {{ $doc.providers.pg.provider | quote }}
   # 同一台 Postgres 上有几个进程各开一套连接池：主应用、进化、安全网关，再加一个
   # 滚动更新时同时活着的新 Pod。每个进程把服务器的连接上限按这个数分摊到自己的池
   # 上，数少了就是把别人的份也算成自己的——实测 2026-10-30 滚动时新 Pod 报
@@ -33,10 +39,10 @@ data:
   COGNEVA_PG_SHARING_PROCESSES: {{ add (max 2 (int .Values.gateway.replicas)) (int .Values.evolution.replicas) (max 2 (int .Values.securityGateway.replicas)) 1 | quote }}
   # 向量后端的地址直接由代码读 QDRANT_URL；没有第二个 provider 开关要同步。
   QDRANT_URL: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.grpcPort) | quote }}
-  COGNEVA_MEDIA_PROVIDER: "local-sfu"
+  COGNEVA_MEDIA_PROVIDER: {{ $doc.providers.media.provider | quote }}
   COGNEVA_STORAGE_PROVIDER: "local-fs"
 
-  COGNEVA_WORKSPACE_ID: "default"
+  COGNEVA_WORKSPACE_ID: {{ $doc.dag_executor.workspace_id | quote }}
   # 每个用户工作区的字节上限。这里**不写默认值**：网关自己有同一条界（它的
   # 默认在建工作区的那段代码里），chart 再抄一份就是同一件事的第二处声明。
   # 但这条 env 必须留着可写——拒绝写入的错误信息点名这个键，运维要能沿正常
@@ -44,7 +50,7 @@ data:
   {{- with .Values.workspace.maxBytes }}
   COGNEVA_WORKSPACE_MAX_BYTES: {{ . | int64 | quote }}
   {{- end }}
-  COGNEVA_CONSUMER_GROUP: "cogneva"
+  COGNEVA_CONSUMER_GROUP: {{ $doc.dag_executor.consumer_group | quote }}
   # 看板列的在制品上限。空串＝没配＝不限，渲染成空串而不是省略：省略会让「清单里
   # 没有这个键」与「运维没配」变成同一件事。发布侧与看板读面都经 envFrom 取这一份，
   # 写在这里的数就是真正拦住派发的那个——两处各配一份，看板会报一个没人拦的数。
