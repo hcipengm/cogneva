@@ -37,7 +37,7 @@ impl Default for JwtConfig {
             issuer: "cogneva".into(),
             audience: "cogneva-api".into(),
             access_token_ttl_minutes: 15,
-            refresh_token_ttl_days: 7,
+            refresh_token_ttl_days: cog_core::day::DAYS_PER_WEEK,
             private_key_pem: None,
             public_key_pem: None,
         }

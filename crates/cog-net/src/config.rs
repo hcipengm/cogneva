@@ -68,7 +68,7 @@ impl HttpClientConfig {
 }
 
 fn default_timeout_secs() -> u64 {
-    30
+    (cog_core::day::SECONDS_PER_MINUTE / 2) as u64
 }
 fn default_connect_timeout_secs() -> u64 {
     10

@@ -55,7 +55,7 @@ impl Default for PolicyEvolutionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_secs: 3600,
+            interval_secs: cog_core::day::SECONDS_PER_HOUR as u64,
             policy_name: crate::META_LEARNING_POLICY.into(),
             min_trials: 40,
             min_samples_grid: vec![2, 3, 5, 8],

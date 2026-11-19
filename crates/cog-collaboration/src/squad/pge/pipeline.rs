@@ -52,7 +52,7 @@ impl Default for PgePipelineConfig {
     fn default() -> Self {
         Self {
             max_retries: 3,
-            timeout_ms: 30_000,
+            timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
             local_repair_max: 0,
             stall_threshold: 2,
             independent_review: true,

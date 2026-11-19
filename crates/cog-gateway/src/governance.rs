@@ -533,7 +533,8 @@ pub struct ChangeFunnelQuery {
 /// A fortnight: long enough to see a week's shape twice, short enough that the
 /// query stays inside the event table's hot window.
 fn default_funnel_days() -> u32 {
-    14
+    // 两周：够看见一次完整的周节律，又还在事件表的热窗口里。
+    (2 * cog_core::day::DAYS_PER_WEEK) as u32
 }
 
 /// The attempt-to-landing ladder, one row per UTC day.

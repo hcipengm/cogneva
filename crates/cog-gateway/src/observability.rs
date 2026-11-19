@@ -344,7 +344,7 @@ pub struct TokenUsageQuery {
 }
 
 fn default_usage_hours() -> i64 {
-    24
+    cog_core::day::HOURS_PER_DAY
 }
 
 /// 投入那一格与花销面读的必须是同一段窗口。

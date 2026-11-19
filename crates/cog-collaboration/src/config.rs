@@ -52,10 +52,13 @@ pub struct SelfReviewSettings {
 
 impl Default for SelfReviewSettings {
     fn default() -> Self {
+        // 这两条判据在 `cog_core::types::self_review::SelfReviewConfig` 里有唯一
+        // 一份声明（生产装配从交付配置读的就是那一份）。
+        let core = cog_core::types::self_review::SelfReviewConfig::default();
         Self {
             enabled: false,
-            max_iterations: 2,
-            quality_threshold: 0.8,
+            max_iterations: core.max_iterations,
+            quality_threshold: core.quality_threshold,
             revise: true,
             spec: None,
             best_practices: Vec::new(),
@@ -169,9 +172,12 @@ pub struct RalphSettings {
 
 impl Default for RalphSettings {
     fn default() -> Self {
+        // 轮数与停滞窗由循环自己声明（`RalphLoopConfig`）：两处各写一份，
+        // 改一处忘一处的那天，配置说五十轮、循环说别的。
+        let loop_defaults = crate::squad::ralph::ralph_loop::RalphLoopConfig::default();
         Self {
-            max_iterations: 50,
-            stagnation_window: 5,
+            max_iterations: loop_defaults.max_iterations,
+            stagnation_window: loop_defaults.stagnation_window,
         }
     }
 }
@@ -486,16 +492,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{file} `{name}` is not an object"));
             let written: Vec<&String> = object.keys().filter(|k| !k.starts_with('_')).collect();
 
-            // Every key the type produces on its own has to be visible in the
-            // template, or the deployment has a value no one can read or set.
-            let defaults = (section.defaults)();
-            for key in defaults.as_object().expect("defaults are an object").keys() {
-                assert!(
-                    written.contains(&key),
-                    "{file} `{name}` does not write `{key}`, which the type always \
-                     produces: the deployment cannot set what the code reads"
-                );
-            }
+            // 反方向（类型产出的每个键都要写进模板）已经不成立，也不再要求：
+            // 交付模板不再抄一遍代码里已有的默认值（D1），没写的那个键由 serde
+            // 默认值回答，操作员照样可以在部署里写它——只是模板不再替他写出来。
+            // 仍然会红的是另一个方向：模板写下的键必须有人读（下面那段）。
 
             // Every key the template writes has to be one the type knows. The
             // round trip answers it for anything with a value in it; a key

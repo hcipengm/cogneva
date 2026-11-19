@@ -1013,7 +1013,7 @@ pub struct MetricsQuery {
 }
 
 fn default_seconds() -> u64 {
-    60
+    cog_core::day::SECONDS_PER_MINUTE as u64
 }
 
 #[derive(Debug, Serialize)]

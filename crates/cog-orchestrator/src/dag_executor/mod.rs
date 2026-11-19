@@ -107,15 +107,19 @@ pub struct DagExecutorConfig {
 
 impl Default for DagExecutorConfig {
     fn default() -> Self {
+        // 每个数都在 `cog_core::DagExecutorConfig` 里有一份声明（生产装配就走那
+        // 一份）。这里再写一遍就是同一件事的第二个说法，改一处忘一处的那天，
+        // 兜底构造与部署读到的会是两个不同的执行器。
+        let core = cog_core::DagExecutorConfig::default();
         Self {
-            redis_url: String::new(),
-            workspace_id: String::new(),
-            consumer_group: String::new(),
-            max_retries: 3,
-            result_claim_idle_secs: 600,
-            result_claim_interval_secs: 60,
-            result_claim_batch: 16,
-            ready_task_poll_interval_secs: 0,
+            redis_url: core.redis_url,
+            workspace_id: core.workspace_id,
+            consumer_group: core.consumer_group,
+            max_retries: core.max_retries,
+            result_claim_idle_secs: core.result_claim_idle_secs,
+            result_claim_interval_secs: core.result_claim_interval_secs,
+            result_claim_batch: core.result_claim_batch,
+            ready_task_poll_interval_secs: core.ready_task_poll_interval_secs,
         }
     }
 }
