@@ -252,11 +252,6 @@ pub struct PodView {
     pub memory_requested_bytes: u64,
     pub cpu_used_millicores: Option<u64>,
     pub memory_used_bytes: Option<u64>,
-    /// 这个 Pod 里跑着几个进程，来自 kubelet 的 summary（`process_stats.process_count`）。
-    /// 只有数，没有名字：Kubernetes 的读接口不报进程名单，要看名字只能 exec 进容器
-    /// 跑 `ps`，那是对运行中的业务容器执行命令，不给读面这个权限。metrics-server
-    /// 那条腿不报这个数，所以 `None` 说的是「这个来源量不到」，不是「没有进程」。
-    pub processes: Option<u64>,
     /// 这个 Pod 所在节点上的进程采集器最后一次报到的时刻。
     ///
     /// 从节点那一层抄到每一个 Pod 上，是因为读它的是「这一格为什么没有进程表」这句话，
@@ -427,22 +422,22 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         }
     }
 
-    // 实际用量的来源按「谁在集群里就有」排，不把任何一个当必需品：
-    // 1. metrics-server —— 装了就有，但它是一个可选组件；
-    // 2. kubelet 自己的 summary 接口，经 apiserver 代理读 —— 每台机器的 kubelet
-    //    都在跑，不需要任何额外组件，只要 SA 对 `nodes/stats` 有 get；
-    // 3. 两个都没有：只显示申报量，并在界面上说明白，不画一条零线。
-    // 读不到不是错误：这一面照样能画申报量，把它当成读失败会让一个没装 metrics-server
-    // 的集群整天亮着一张红条。
+    // 实际用量的唯一来源是 metrics-server。它没装时只显示申报量，并在界面上
+    // 说明白，不画一条零线——读不到不是错误，把它当成读失败会让一个没装
+    // metrics-server 的集群整天亮着一张红条。
+    //
+    // 这里曾经还有一条 kubelet summary 的后备（经 apiserver 代理读
+    // `/api/v1/nodes/<节点>/proxy/stats/summary`），它的授权前提写错了：apiserver
+    // 按子资源授权，`/proxy/*` 要的是 `nodes/proxy`，不是 `nodes/stats`。2026-11-19
+    // 在一台只授了 `nodes/stats` 的 k3s 上实测，这一读每次 403——那条后备在 chart
+    // 自己的授权下永远不可达。`nodes/proxy` 能代理到 kubelet 的每一个端点，chart
+    // 刻意不授，所以删的是读，不是放宽授权。
     // 用量与 Pod 都按整个集群读，与节点那一层同范围：采集器量的是整台宿主上的
     // 每一个容器，这一面若只画自己命名空间里的，差出来的那些容器就只有进程读数、
     // 没有格子（2026-10-27 实测 71 个容器里 22 个在本命名空间）。
     let (usage, usage_source) = match client.get_json("/apis/metrics.k8s.io/v1beta1/pods").await {
         Ok(list) => (usage_by_pod(&list), Some(USAGE_FROM_METRICS.to_string())),
-        Err(_) => match usage_from_kubelets(&client, &view.nodes).await {
-            Some(usage) => (usage, Some(USAGE_FROM_KUBELET.to_string())),
-            None => (std::collections::HashMap::new(), None),
-        },
+        Err(_) => (std::collections::HashMap::new(), None),
     };
     view.usage_source = usage_source;
 
@@ -676,107 +671,6 @@ fn service_view(service: &Value, endpoints: Option<&ServiceEndpoints>) -> Option
 }
 
 pub const USAGE_FROM_METRICS: &str = "metrics-server";
-pub const USAGE_FROM_KUBELET: &str = "kubelet-summary";
-
-/// 用量来源的第二条腿：每台节点的 kubelet 都在服务 summary 接口，经 apiserver 代理
-/// 就能读，不需要集群里装任何额外组件。
-///
-/// 这条腿要的是 `nodes/stats` 的读权限，不是 `nodes/proxy`：apiserver 按路径把代理
-/// 过来的请求映射到子资源，`/stats/*` 落到 `nodes/stats`。两者差着一整个 kubelet
-/// API——`nodes/proxy` 还能 exec 进任何 Pod，那是给这一面读用量用不着的权力。
-///
-/// 一台读不到不影响其它台：只要有一台回了，这一面就有用量；全读不到才退回到「只
-/// 有申报量」。
-async fn usage_from_kubelets(
-    client: &KubeClient,
-    nodes: &[NodeView],
-) -> Option<std::collections::HashMap<String, PodUsage>> {
-    let mut merged = std::collections::HashMap::new();
-    let mut read_any = false;
-    for node in nodes {
-        let path = format!("/api/v1/nodes/{}/proxy/stats/summary", node.name);
-        let Ok(summary) = client.get_json(&path).await else {
-            continue;
-        };
-        read_any = true;
-        for (name, usage) in usage_from_summary(&summary, client.namespace()) {
-            merged.insert(name, usage);
-        }
-    }
-    read_any.then_some(merged)
-}
-
-/// kubelet summary 的形状与 metrics-server 不同，语义也不同：这里只收本命名空间的
-/// Pod（summary 是整台机器的，别的命名空间的 Pod 不该出现在这一面），并且用
-/// `workingSetBytes` 而不是 `rssBytes`——工作集正是内存压力与 OOM 判定看的那一个数。
-fn usage_from_summary(summary: &Value, namespace: &str) -> Vec<(String, PodUsage)> {
-    let mut out = Vec::new();
-    let Some(pods) = summary.get("pods").and_then(Value::as_array) else {
-        return out;
-    };
-    for pod in pods {
-        if pod.pointer("/podRef/namespace").and_then(Value::as_str) != Some(namespace) {
-            continue;
-        }
-        let Some(name) = pod.pointer("/podRef/name").and_then(Value::as_str) else {
-            continue;
-        };
-        let mut usage = PodUsage {
-            cpu: nanocores_millicores(pod.pointer("/cpu/usageNanoCores")),
-            memory: bytes_at(pod.pointer("/memory/workingSetBytes")),
-            // 进程数只在 Pod 这一级有：summary 不给每个容器分进程，给了也没有名字
-            // 可拼成一个说得通的行。读不到就是 `None`，不写 0——0 是一句「没有进程」。
-            processes: pod
-                .pointer("/process_stats/process_count")
-                .and_then(Value::as_u64),
-            containers: std::collections::HashMap::new(),
-        };
-        for container in pod
-            .get("containers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-        {
-            let Some(container_name) = container.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            usage.containers.insert(
-                container_name.to_string(),
-                (
-                    nanocores_millicores(container.pointer("/cpu/usageNanoCores")),
-                    bytes_at(container.pointer("/memory/workingSetBytes")),
-                ),
-            );
-        }
-        out.push((name.to_string(), usage));
-    }
-    out
-}
-
-/// summary 的数分两种写法：nanoCores 是十进制小数串或整数，字节量在 summary 里
-/// 是十进制数字串。读不出来按 0 算——这里已经在「读到了」这条腿里，缺一个容器的
-/// 数不等于整个 Pod 没有用量；缺的那一个会在容器那一层显示为 0，而 Pod 的总数
-/// 仍由加总得到。没有来源的情况（两个接口都读不到）在调用点分成 `None` 处理。
-fn nanocores_millicores(value: Option<&Value>) -> u64 {
-    let Some(value) = value else { return 0 };
-    let nanocores = value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()));
-    match nanocores {
-        Some(nanocores) if nanocores.is_finite() && nanocores > 0.0 => {
-            (nanocores / 1_000_000.0).round() as u64
-        }
-        _ => 0,
-    }
-}
-
-fn bytes_at(value: Option<&Value>) -> u64 {
-    let Some(value) = value else { return 0 };
-    value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
-        .unwrap_or(0)
-}
 
 /// metrics-server 回的每个 Pod：各容器用量，加总成 Pod 的用量。
 ///
@@ -786,8 +680,6 @@ fn bytes_at(value: Option<&Value>) -> u64 {
 struct PodUsage {
     cpu: u64,
     memory: u64,
-    /// kubelet summary 独有：这个 Pod 的进程数。metrics-server 不报，`None` 即读不到。
-    processes: Option<u64>,
     containers: std::collections::HashMap<String, (u64, u64)>,
 }
 
@@ -1527,7 +1419,6 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         conditions,
         cpu_used_millicores: pod_usage.map(|pod| pod.cpu),
         memory_used_bytes: pod_usage.map(|pod| pod.memory),
-        processes: pod_usage.and_then(|pod| pod.processes),
         process_census_at,
         volumes,
         events: pod_events,
@@ -3160,68 +3051,6 @@ mod topology_tests {
             !conditions[0].ok,
             "缺 status 字段按没成立算：读成成立会把卡住的 Pod 画成正常"
         );
-    }
-
-    #[test]
-    fn the_kubelet_summary_is_a_usage_source_of_its_own_without_metrics_server() {
-        // 这是真实的 `stats/summary` 形状（kubelet 自己服务，装在每台机器上）。
-        let summary = json!({
-            "node": { "nodeName": "cogneva-01" },
-            "pods": [
-                {
-                    "podRef": { "name": "api-1", "namespace": "cogneva" },
-                    "process_stats": { "process_count": 3u64 },
-                    "cpu": { "usageNanoCores": 250_000_000u64 },
-                    "memory": { "workingSetBytes": 734_003_200u64, "rssBytes": 700_000_000u64 },
-                    "containers": [
-                        { "name": "api", "cpu": { "usageNanoCores": 200_000_000u64 },
-                          "memory": { "workingSetBytes": 600_000_000u64 } },
-                        { "name": "sidecar", "cpu": { "usageNanoCores": 50_000_000u64 },
-                          "memory": { "workingSetBytes": 134_003_200u64 } }
-                    ]
-                },
-                {
-                    "podRef": { "name": "postgres-0", "namespace": "other" },
-                    "cpu": { "usageNanoCores": 900_000_000u64 },
-                    "memory": { "workingSetBytes": 2_000_000_000u64 },
-                    "containers": []
-                }
-            ]
-        });
-
-        let usage = usage_from_summary(&summary, "cogneva");
-        assert_eq!(usage.len(), 1, "别的命名空间的 Pod 不属于这一面");
-        let (name, pod) = &usage[0];
-        assert_eq!(name, "api-1");
-        assert_eq!(pod.cpu, 250, "nanoCores 换算成毫核");
-        assert_eq!(pod.memory, 734_003_200, "取工作集，不取 RSS");
-        assert_eq!(pod.containers["api"], (200, 600_000_000));
-        assert_eq!(pod.containers["sidecar"], (50, 134_003_200));
-        assert_eq!(
-            pod.processes,
-            Some(3),
-            "进程数在 Pod 这一级，summary 报多少就是多少"
-        );
-    }
-
-    #[test]
-    fn a_summary_that_names_no_namespace_matches_nothing_rather_than_everything() {
-        // 缺 namespace 的条目如果被当成「匹配」，整台机器的 Pod 都会记到这一面。
-        let summary =
-            json!({ "pods": [{ "podRef": { "name": "api-1" }, "cpu": {}, "memory": {} }] });
-        assert!(usage_from_summary(&summary, "cogneva").is_empty());
-    }
-
-    #[test]
-    fn nanocores_and_byte_fields_survive_both_number_and_string_forms() {
-        // 1.5 毫核按最近整数进：用量是读数，不必保留小数位。
-        assert_eq!(nanocores_millicores(Some(&json!(1_500_000u64))), 2);
-        assert_eq!(nanocores_millicores(Some(&json!("2000000"))), 2);
-        assert_eq!(nanocores_millicores(Some(&json!(0))), 0);
-        assert_eq!(nanocores_millicores(None), 0, "缺字段是 0，不是猜测");
-        assert_eq!(bytes_at(Some(&json!(4096))), 4096);
-        assert_eq!(bytes_at(Some(&json!("8192"))), 8192);
-        assert_eq!(bytes_at(None), 0);
     }
 
     #[test]

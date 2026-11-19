@@ -86,23 +86,17 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
-  # 节点实际用量同样来自 metrics-server；没装时这条规则不会被用到。
-  - apiGroups: ["metrics.k8s.io"]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
-  # Pod 与它们的实际用量，与上面同一条理由。
+  # Pod 与它们的实际用量。
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  # 实际用量只来自 metrics-server；没装时这条规则不会被用到。不授 `nodes/proxy`：
+  # 曾经的后备经 apiserver 代理读 kubelet summary，那条路径要的正是它（不是
+  # `nodes/stats`，2026-11-19 实测只授 `nodes/stats` 时每读 403），而它连 exec
+  # 一起授权——所以删掉的是那条后备，不是放宽授权。
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
     verbs: ["get", "list"]
-  # 没有 metrics-server 时的用量来源：kubelet 的 summary 接口经 apiserver 代理读，
-  # apiserver 把 `/stats/*` 映射到 `nodes/stats` 子资源。只读；不给 `nodes/proxy`，
-  # 那一项连 exec 一起授权。
-  - apiGroups: [""]
-    resources: ["nodes/stats"]
-    verbs: ["get"]
   # 资源面：命名空间配额与默认限额，只读。
   - apiGroups: [""]
     resources: ["resourcequotas", "limitranges"]

@@ -429,12 +429,17 @@ struct Command {
 /// A request written as `kubectl get --raw <path>`.
 ///
 /// The command carries no resource word: the API server resolves the right from
-/// the URL. `/api/v1/nodes/<node>/proxy/stats/*` is the kubelet's read-only
-/// summary endpoint, which the API server answers against `nodes/stats` -- not
-/// `nodes`, and not `nodes/proxy` (that one also authorises exec). Each row
-/// names the literal the path is formatted from and the grant the request
-/// needs, so a path that moves to another subresource without its row moving
-/// stops matching and the scan says so instead of vouching for the old answer.
+/// the URL, and it resolves it to a **subresource**. The one path this loop
+/// reads is metrics-server's pod list, which lands on `metrics.k8s.io/pods`.
+///
+/// The path that used to be here, `/api/v1/nodes/<node>/proxy/stats/summary`,
+/// was recorded against `nodes/stats` and that record was wrong: `/proxy/*`
+/// resolves to `nodes/proxy`, so a role holding only `nodes/stats` got 403 on
+/// every read (2026-11-19, one k3s). `nodes/proxy` also proxies to every other
+/// kubelet endpoint, so the chart does not grant it -- the fallback was removed
+/// from the loop instead of widening the grant. Each row names the literal the
+/// path is built from and the grant the request needs, so a path that moves to
+/// another subresource without its row moving stops matching.
 struct RawPath {
     literal: &'static str,
     group: &'static str,
@@ -443,11 +448,18 @@ struct RawPath {
 }
 
 const RAW_PATHS: &[RawPath] = &[RawPath {
-    literal: "/api/v1/nodes/{name}/proxy/stats/summary",
-    group: "",
-    resource: "nodes/stats",
+    literal: "/apis/metrics.k8s.io/v1beta1/pods",
+    group: "metrics.k8s.io",
+    resource: "pods",
     verbs: &["get"],
 }];
+
+/// Whether `body` really issues this request, in either spelling the loop uses:
+/// a formatted path, or the path as an argv literal right after `--raw`.
+fn raw_literal_in(body: &str, literal: &str) -> bool {
+    body.contains(&format!("format!(\"{literal}\")"))
+        || body.contains(&format!("\"--raw\", \"{literal}\""))
+}
 
 /// A quoted string that is the whole element, else `None` (an expression).
 fn literal(element: &str) -> Option<String> {
@@ -1045,7 +1057,7 @@ fn needed_for(
             // apiserver 从 URL 解析。路径的字面量在文件里找得到的那一行才是它。
             let matched: Vec<&RawPath> = RAW_PATHS
                 .iter()
-                .filter(|row| body.contains(&format!("format!(\"{}\")", row.literal)))
+                .filter(|row| raw_literal_in(&body, row.literal))
                 .collect();
             assert_eq!(
                 matched.len(),
@@ -1181,14 +1193,14 @@ fn the_scan_sees_the_commands_it_is_supposed_to() {
 
     // 两个真出过事的资源词必须在解析结果里：一个真的少授过（resourcequotas
     // 报 Forbidden），一个是经 kubectl 自己那一跳读出去的（replicasets）。
-    // `nodes/stats` 只有一种来路——`get --raw` 的路径——所以它在这里就是在
-    // 说那条形态被真的读到了，而不是登记表自己跟自己说话。
+    // `metrics.k8s.io/pods` 只有一种来路——`get --raw` 的路径——所以它在这里
+    // 就是在说那条形态被真的读到了，而不是登记表自己跟自己说话。
     for word in [
         ("", "resourcequotas"),
         ("", "persistentvolumeclaims"),
         ("batch", "jobs"),
         ("apps", "replicasets"),
-        ("", "nodes/stats"),
+        ("metrics.k8s.io", "pods"),
     ] {
         assert!(
             resolved.contains(&word),
