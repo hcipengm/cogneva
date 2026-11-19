@@ -4020,6 +4020,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HierarchyManager for Exhausted {
+        fn default_limits(&self) -> cog_core::QuotaLimits {
+            cog_core::QuotaLimits::new(1_000_000, 1_000_000)
+        }
+
         async fn check(&self, _ctx: &QuotaContext, _tokens: u64) -> cog_core::HierarchyDecision {
             let blocked = cog_core::ScopeStatus {
                 scope: cog_core::QuotaScope::User,

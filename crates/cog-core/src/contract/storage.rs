@@ -585,8 +585,18 @@ pub struct RawLoggerConfig {
     pub flush_interval_secs: u64,
 }
 
+// 一条记录的大小在几百字节量级：一千条留在内存里是几百 KB，是一次刷盘能背得动
+// 的量；再多，进程死掉时丢的那一段就不再是一瞬间的读数。
+// cap: bound — 一千条几百 KB：一次刷盘背得动，死掉时丢的只是一瞬间的读数
+const RAW_LOG_MAX_BUFFER_RECORDS: usize = 1000;
+
+// 一秒：计时器与条数两个触发谁先到谁刷，一秒是「事件驱动的一拍」的下限——再短
+// 就退化成每条记录一次刷盘。
+// cap: bound — 一秒：再短就退化成每条一次刷盘，一拍的下限就是这个节拍
+const RAW_LOG_FLUSH_INTERVAL_SECS: u64 = 1;
+
 fn default_flush_interval_secs() -> u64 {
-    1
+    RAW_LOG_FLUSH_INTERVAL_SECS
 }
 
 impl Default for RawLoggerConfig {
@@ -594,7 +604,7 @@ impl Default for RawLoggerConfig {
         Self {
             enabled: false,
             base_dir: String::new(),
-            max_buffer_size: 1000,
+            max_buffer_size: RAW_LOG_MAX_BUFFER_RECORDS,
             format: RawLoggerFormat::default(),
             zstd_level: None,
             flush_interval_secs: default_flush_interval_secs(),
@@ -1534,4 +1544,41 @@ pub struct RawLogQuery {
 pub trait RawLogIndexStore: Send + Sync {
     async fn upsert(&self, entry: RawLogIndexEntry) -> SFResult<()>;
     async fn query(&self, q: &RawLogQuery) -> SFResult<Vec<RawLogIndexEntry>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 原始日志的缓冲条数与刷盘间隔各只有一处声明：默认值读常量，常量上面写着
+    /// 它由什么钉住。`#[serde(default = …)]` 走的是同一个常量。
+    #[test]
+    fn the_raw_logger_reads_its_buffer_and_flush_interval() {
+        let cfg = RawLoggerConfig::default();
+        assert_eq!(cfg.max_buffer_size, RAW_LOG_MAX_BUFFER_RECORDS);
+        assert_eq!(cfg.flush_interval_secs, RAW_LOG_FLUSH_INTERVAL_SECS);
+        assert_eq!(default_flush_interval_secs(), RAW_LOG_FLUSH_INTERVAL_SECS);
+
+        let body = include_str!("storage.rs")
+            .split("impl Default for RawLoggerConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 }

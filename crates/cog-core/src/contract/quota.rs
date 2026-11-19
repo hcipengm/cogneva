@@ -71,6 +71,12 @@ impl<'de> Deserialize<'de> for QuotaScope {
 }
 
 /// Soft / hard limit pair for a single scope.
+///
+/// 没有 `Default`：一对上限是某一格的声明，不存在「通用的那一对」。谁要给
+/// 未配置的格子一个起点，起点在 `cog-quota` 的 `HierarchyManager::from_store`
+/// 里有唯一一处（`from_hard(PLATFORM_DAILY_TOKENS, …)`）。合同里原先还写着一
+/// 对 80k/100k，与那一处的 40k/50k 差了一倍，而没有任何人量过其中哪一个——
+/// 删掉比让它们继续分叉好。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaLimits {
     pub soft_limit: u64,
@@ -89,15 +95,6 @@ impl QuotaLimits {
         Self {
             soft_limit: ((hard_limit as f64) * soft_ratio) as u64,
             hard_limit,
-        }
-    }
-}
-
-impl Default for QuotaLimits {
-    fn default() -> Self {
-        Self {
-            soft_limit: 80_000,
-            hard_limit: 100_000,
         }
     }
 }
@@ -254,6 +251,13 @@ pub trait HierarchyManager: Send + Sync {
     /// clearing an override only changes anything in the second case's absence.
     async fn limits(&self, scope: QuotaScope, target_id: &str) -> SFResult<Option<QuotaLimits>>;
 
+    /// 一个没人配过的格子读到的那一对上下限。
+    ///
+    /// 与 [`limits`](Self::limits) 的 `None` 成对：那里说「没人配过」，这里说
+    /// 「于是它读到什么」。这一对只有实现方持有（它的起点由部署声明），读的人
+    /// 不该自己再猜一对——两份答案没有任何人量过谁对，却会在读数面上分叉。
+    fn default_limits(&self) -> QuotaLimits;
+
     /// Configure the daily soft/hard ceilings for one `(scope, target)` cell.
     /// Set these to give one person, one workspace, or one team its own
     /// ceiling; the cascade still checks every level above it.
@@ -344,6 +348,20 @@ pub struct TaskBudgetVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一对上限没有「通用的那一对」：合同里不再有 `Default`，起点只有
+    /// `from_hard` 那一条，且它是真算出来的（换输入 ⇒ 值跟着变）。
+    #[test]
+    fn a_limit_pair_has_no_generic_default() {
+        // 针不在这一行里原样出现：否则这条判据读到的就是它自己。
+        let needle = concat!("impl Default for ", "QuotaLimits");
+        assert!(
+            !include_str!("quota.rs").contains(needle),
+            "上限是某一格的声明，合同里不许再给出一对「通用」的"
+        );
+        assert_eq!(QuotaLimits::from_hard(10_000, 0.8).soft_limit, 8_000);
+        assert_eq!(QuotaLimits::from_hard(20_000, 0.8).soft_limit, 16_000);
+    }
 
     /// 一级一个名字：键上写的、序列化写出去的、读回来的都是 `as_str`。
     ///

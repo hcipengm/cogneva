@@ -420,6 +420,10 @@ impl cog_core::HierarchyManager for HierarchyManager {
             .map_err(|e| cog_core::SFError::Internal(e.to_string()))
     }
 
+    fn default_limits(&self) -> QuotaLimits {
+        self.default_limits
+    }
+
     async fn set_limits(
         &self,
         scope: QuotaScope,
