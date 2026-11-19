@@ -160,7 +160,7 @@ data:
   # 走 GitOps 发布（annotated tag + evolution-release 分支推中央 bare 仓库），
   # L2 留审批台。推送只写挂载的 bare 仓库 /host-git，不持任何集群凭证。
   COGNEVA_SELF_EVOLUTION_PROMOTION_ENABLED: "true"
-  COGNEVA_GITOPS_ENABLED: "true"
+  COGNEVA_GITOPS_ENABLED: {{ .Values.gitops.enabled | quote }}
   COGNEVA_GITOPS_REPO_URL: "/host-git"
   # 沙盒只推不拉：拉取端（poll/金丝雀/回滚）跑在主部署 Pod，那里有 kubectl
   # 与 RBAC；本 Pod 起拉取端只会每轮报错。

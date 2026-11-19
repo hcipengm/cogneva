@@ -37,6 +37,11 @@
 //! 和不给就有的，是同一个数，它没有决定任何事。`derived` 的叶子不在其中：它的值
 //! 是一个闭环的种子，种子本来就是部署可以自己定的那一格。
 //!
+//! 第四个面：**每一格都要有人读**。`values.yaml` 的叶子人口现读，读法从模板现读
+//! ——绝对路径、变量别名（`$l.minCpu`）、`with`/`range` 作用域里的裸 `.字段`，以及
+//! 整棵子树交出去（`toYaml`／`join`／`include`／`range`）。没有读者的一格，改它
+//! 渲染出来的清单一个字都不变：那是一条没人执行的部署说明。
+//!
 //! 不判什么，说清楚：模板里写死的数字（不来自 `.Values`）归
 //! `chart_template_literals_contract_test.rs`；`values.yaml` 的数值叶子各带一条
 //! `# tunable:` 判词，归 `tunable_registry_contract_test.rs`；`values` 叶子与代码
@@ -53,7 +58,7 @@ use crate::common;
 
 use common::routes::{read, read_repo, repo_root};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cogneva::config_loader::AppConfig;
 
@@ -627,5 +632,302 @@ fn the_document_does_not_state_a_value_neither_the_chart_nor_the_default_uses() 
         stray.is_empty(),
         "文档与 chart 对同一个字段各说各的：\n{}",
         stray.join("\n")
+    );
+}
+
+/// `values.yaml` 的每个标量叶子：点分路径，列表按下标写（`a.b.0`）。
+///
+/// 树、块、叶子一视同仁——判的是「这一格有没有人读」，不是「它是不是数」。
+fn scalar_leaves(value: &serde_yaml::Value, path: &mut Vec<String>, out: &mut Vec<String>) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for (key, child) in map {
+                if let Some(key) = key.as_str() {
+                    path.push(key.to_string());
+                    scalar_leaves(child, path, out);
+                    path.pop();
+                }
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, child) in items.iter().enumerate() {
+                path.push(index.to_string());
+                scalar_leaves(child, path, out);
+                path.pop();
+            }
+        }
+        serde_yaml::Value::Null if path.is_empty() => {}
+        _ => {
+            if !path.is_empty() {
+                out.push(path.join("."));
+            }
+        }
+    }
+}
+
+/// 模板把一个 values 路径读走的两种形态。
+///
+/// 一种是把路径写出来（`.Values.a.b`、`$l.c`、`with .Values.a` 之后的 `.b`），
+/// 另一种更常见、也更容易漏：整棵子树交出去——`toYaml .Values.healthProbes.startup`
+/// 读走了三个叶子，而它们的名字一个也不在那一行里。只认字面量会把这一类全判成
+/// 没人读。
+#[derive(Debug, Default)]
+struct Reads {
+    exact: BTreeSet<String>,
+    subtrees: BTreeSet<String>,
+}
+
+impl Reads {
+    fn covers(&self, leaf: &str) -> bool {
+        self.exact.contains(leaf)
+            || self.subtrees.iter().any(|prefix| {
+                leaf.len() > prefix.len()
+                    && leaf.starts_with(prefix.as_str())
+                    && leaf.as_bytes()[prefix.len()] == b'.'
+            })
+    }
+}
+
+/// 一个模板文件里的所有动作 `{{ … }}`；模板注释 `{{/* … */}}` 不算动作。
+fn actions(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if chars[i] != '{' || chars[i + 1] != '{' {
+            i += 1;
+            continue;
+        }
+        // 模板注释：跳到 `*/}}`，里面的内容不是模板，注释里点名的叶子不算被读。
+        if i + 3 < chars.len() && chars[i + 2] == '/' && chars[i + 3] == '*' {
+            let mut j = i + 4;
+            while j + 3 < chars.len()
+                && !(chars[j] == '*' && chars[j + 1] == '/' && chars[j + 2] == '}' && chars[j + 3] == '}')
+            {
+                j += 1;
+            }
+            i = (j + 4).min(chars.len());
+            continue;
+        }
+        let mut j = i + 2;
+        while j + 1 < chars.len() && !(chars[j] == '}' && chars[j + 1] == '}') {
+            j += 1;
+        }
+        out.push(chars[i + 2..j.min(chars.len())].iter().collect());
+        i = j + 2;
+    }
+    out
+}
+
+/// 动作里写的 values 路径（`.Values.` 之后连着的标识符与点）。
+fn absolute_refs(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find(".Values.") {
+        let tail = &rest[at + ".Values.".len()..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .unwrap_or(tail.len());
+        let path = tail[..end].trim_matches('.');
+        if !path.is_empty() {
+            out.push(path.to_string());
+        }
+        rest = &tail[end..];
+    }
+    out
+}
+
+/// 一个动作的正文里，当前作用域下的裸 `.字段`（`with`/`range` 把 `.` 换成了
+/// 一棵子树，`{{ .replicas }}` 读的就是 `子树.replicas`）。
+fn bare_refs(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '.' {
+            i += 1;
+            continue;
+        }
+        let previous = if i == 0 { ' ' } else { chars[i - 1] };
+        if previous.is_ascii_alphanumeric() || previous == '_' || previous == '.' || previous == '$' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '.') {
+            j += 1;
+        }
+        let ident: String = chars[i + 1..j].iter().collect();
+        let ident = ident.trim_matches('.');
+        if !ident.is_empty() && ident != "Values" {
+            out.push(ident.to_string());
+        }
+        i = j;
+    }
+    out
+}
+
+/// 被整棵交出去的形态：`toYaml`／`join`／`include`／`range` 的实参。
+fn materializes(body: &str) -> bool {
+    ["toYaml", "join", "include", "range"].iter().any(|word| body.contains(word))
+}
+
+/// 一个 `with`/`range` 的实参解析成 values 路径：绝对路径、某个变量别名，
+/// 或者是别的什么（`.`、函数调用），后两种什么都解析不出来。
+fn operand_path(operand: &str, aliases: &BTreeMap<String, String>) -> Option<String> {
+    let operand = operand.trim().trim_start_matches(|c| c == '(' || c == '-').trim();
+    if operand.starts_with(".Values.") {
+        return absolute_refs(operand).into_iter().next();
+    }
+    if let Some(rest) = operand.strip_prefix('$') {
+        let (name, suffix) = match rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, ""),
+        };
+        let base = aliases.get(&format!("${name}"))?;
+        let suffix = suffix.trim_start_matches('.');
+        return Some(if suffix.is_empty() {
+            base.clone()
+        } else {
+            format!("{base}.{suffix}")
+        });
+    }
+    None
+}
+
+/// 模板读到的东西：绝对引用、变量别名、`with`/`range` 作用域。
+fn reads_of(text: &str) -> Reads {
+    let mut reads = Reads::default();
+    let mut aliases: BTreeMap<String, String> = BTreeMap::new();
+    // 块栈：`with`/`range` 压作用域（实参不是 values 路径时压 `None`），
+    // `if`/`define`/`block` 只占一个位置，好让 `end` 一一对上。
+    let mut blocks: Vec<Option<Option<String>>> = Vec::new();
+    let current = |blocks: &Vec<Option<Option<String>>>| -> Option<String> {
+        for block in blocks.iter().rev() {
+            match block {
+                Some(Some(scope)) => return Some(scope.clone()),
+                Some(None) => return None,
+                None => continue,
+            }
+        }
+        None
+    };
+    for action in actions(text) {
+        let body = action.trim().trim_matches('-').trim();
+        let head = body.trim_start_matches('-').trim();
+        if head == "end" || head.starts_with("end ") {
+            blocks.pop();
+            continue;
+        }
+        if head.starts_with("with ") || head.starts_with("range ") {
+            let rest = head.split_once(' ').map(|(_, rest)| rest).unwrap_or("");
+            let operand = rest.split('|').next().unwrap_or("").trim();
+            let scope = if operand.contains(":=") {
+                // `range $k, $v := X`：`. ` 是元素，不是 X 本身。
+                None
+            } else {
+                operand_path(operand, &aliases)
+            };
+            blocks.push(Some(scope));
+        } else if head.starts_with("if ") || head.starts_with("define ") || head.starts_with("block ") {
+            blocks.push(None);
+        } else if head == "else" || head.starts_with("else ") {
+            // 同一个块的另一支，不压栈。
+        } else if let Some((lhs, rhs)) = body.split_once(":=") {
+            let lhs = lhs.trim();
+            if lhs.starts_with('$') {
+                if let Some(path) = absolute_refs(rhs).into_iter().next() {
+                    aliases.insert(lhs.to_string(), path);
+                }
+            }
+        }
+        let mut found = absolute_refs(body);
+        // 变量别名：`$l.minCpu` → `resourceGovernance.limitRange.minCpu`。
+        for (name, path) in &aliases {
+            let mut rest = body;
+            while let Some(at) = rest.find(name.as_str()) {
+                let tail = &rest[at + name.len()..];
+                let end = tail
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                    .unwrap_or(tail.len());
+                let suffix = tail[..end].trim_matches('.');
+                if end > 0 && suffix.is_empty() {
+                    found.push(path.clone());
+                } else if !suffix.is_empty() {
+                    found.push(format!("{path}.{suffix}"));
+                }
+                rest = &tail[end..];
+            }
+        }
+        if let Some(scope) = current(&blocks) {
+            for bare in bare_refs(body) {
+                found.push(format!("{scope}.{bare}"));
+            }
+        }
+        let whole = materializes(body);
+        for path in found {
+            reads.exact.insert(path.clone());
+            if whole {
+                reads.subtrees.insert(path);
+            }
+        }
+    }
+    reads
+}
+
+/// chart 的模板读过的一切 values 路径：所有 `.yaml` 与 `_helpers.tpl`。
+///
+/// `NOTES.txt` 不算：那是装完后给人看的说明，写一句「这个值现在是 30」不会让
+/// 任何东西读到它。
+fn consumed_values() -> Reads {
+    let dir = repo_root().join(TEMPLATES);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a template directory entry").path())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("tpl")
+            )
+        })
+        .collect();
+    files.sort();
+    let mut reads = Reads::default();
+    for file in &files {
+        let one = reads_of(&read(file));
+        reads.exact.extend(one.exact);
+        reads.subtrees.extend(one.subtrees);
+    }
+    reads
+}
+
+/// `values.yaml` 的每一格都要有一个读者：一个没人读的叶子声明了一件谁都不为它
+/// 改变的部署事实。
+///
+/// 判据只走 chart 与代码：叶子人口从 `values.yaml` 现读，读法从模板现读，没有
+/// 名单。今天是空集，不代表它以后也是——一个过期的档位、一次改名留下的旧键，
+/// 都会以「某个部署以为改它有作用」的样子留在 values 里，而渲染结果一个字都不变。
+#[test]
+fn every_leaf_of_the_values_is_read_by_a_template() {
+    let values: serde_yaml::Value = serde_yaml::from_str(&read_repo(VALUES))
+        .unwrap_or_else(|e| panic!("{VALUES} 不是合法 YAML：{e}"));
+    let mut leaves = Vec::new();
+    scalar_leaves(&values, &mut Vec::new(), &mut leaves);
+    assert!(
+        !leaves.is_empty(),
+        "{VALUES} 里一个叶子都没读到：下面那条判据会在空集上通过"
+    );
+
+    let reads = consumed_values();
+    assert!(
+        !reads.exact.is_empty(),
+        "模板里一个 values 路径都没读到：读法坏了，下面会把每个叶子都判成没人读"
+    );
+
+    let dead: Vec<&String> = leaves.iter().filter(|leaf| !reads.covers(leaf)).collect();
+    assert!(
+        dead.is_empty(),
+        "这些 values 叶子没有任何模板读它：改它渲染出来的清单一个字都不变，\
+         它只是一句没人执行的部署说明（删掉，或者让它真的决定点什么）：\n{dead:#?}"
     );
 }
