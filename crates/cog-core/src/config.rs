@@ -506,6 +506,13 @@ fn default_task_lease_secs() -> u64 {
 // cap: bound — 取的就是那个量：再多一点，发布方会在清扫者送出第一份之前先发布一份重复
 pub const DEFAULT_READY_CLAIM_IDLE_SECS: u64 = 600;
 
+/// 一个任务节点失败后重试几次（重试矩阵里 DagNode 那一行的次数）。
+///
+/// 它是一条退避阶梯的长度：每次等待由矩阵给出，次数由「一条任务的总预算 ÷
+/// 一次等待」定，不是可以单拍的档位。
+// cap: bound — 由一条任务的总预算 ÷ 一次退避等待定：次数多到超预算，等于把失败拖长
+const DAG_NODE_MAX_RETRIES: u32 = 3;
+
 impl Default for DagExecutorConfig {
     fn default() -> Self {
         Self {
@@ -514,7 +521,7 @@ impl Default for DagExecutorConfig {
             nats_url: None,
             workspace_id: String::new(),
             consumer_group: String::new(),
-            max_retries: 3,
+            max_retries: DAG_NODE_MAX_RETRIES,
             ready_task_poll_interval_secs: default_ready_task_poll_interval_secs(),
             task_checkpoint_interval_secs: default_task_checkpoint_interval_secs(),
             scheduled_task_stall_secs: default_scheduled_task_stall_secs(),
@@ -877,6 +884,10 @@ pub struct TierMigratorConfig {
 /// migrator would demote everything to cold. A section omitted from the config
 /// file must behave like the one that ships, so a config typo cannot turn into
 /// an unbounded migration.
+/// trace 层一次冷迁多少行：一拍的搬运量要在一拍的时限内走完。
+// cap: bound — 由一拍搬得动的行数定：批大过一拍搬得动，扫描就积压
+const TRACE_SCAN_BATCH: u64 = 5_000;
+
 impl Default for TierMigratorConfig {
     fn default() -> Self {
         Self {
@@ -889,7 +900,7 @@ impl Default for TierMigratorConfig {
             cold_compression_level: crate::contract::storage::COMPRESSION_LEVEL_COLD,
             scan_interval_secs: crate::day::SECONDS_PER_HOUR as u64,
             cold_key_prefix: "raw".into(),
-            trace_scan_batch: 5_000,
+            trace_scan_batch: TRACE_SCAN_BATCH,
         }
     }
 }
@@ -975,11 +986,15 @@ pub struct MetricsConfig {
     pub scrape_dimensions: Vec<String>,
 }
 
+/// 每次抓取最多返回多少行样本：抓取体的大小上限。
+// cap: bound — 由抓取间隔 × 序列产生速率定：超过它就是一次抓取扛不完的量
+const METRICS_SAMPLE_MAX_ROWS: u64 = 500_000;
+
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            sample_max_rows: 500_000,
+            sample_max_rows: METRICS_SAMPLE_MAX_ROWS,
             scrape_dimensions: Vec::new(),
         }
     }
@@ -1148,11 +1163,19 @@ pub struct TaskRebalancerConfig {
     pub max_assignments_per_pass: usize,
 }
 
+/// 一个代理同时背多少任务算过载（告警线，不是硬闸）。
+// cap: bound — 由实测的任务时延随并发上升的拐点定：过了拐点再加只是排队
+const REBALANCER_MAX_TASKS_PER_AGENT: usize = 4;
+
+/// 一拍最多给出几条建议：建议由人/上层消费，一拍给太多没有消费者接得住。
+// cap: bound — 由一次调度决策的处理速率定：一拍给得比消费得快，建议就是噪音
+const REBALANCER_MAX_ASSIGNMENTS_PER_PASS: usize = 32;
+
 impl Default for TaskRebalancerConfig {
     fn default() -> Self {
         Self {
-            max_tasks_per_agent: 4,
-            max_assignments_per_pass: 32,
+            max_tasks_per_agent: REBALANCER_MAX_TASKS_PER_AGENT,
+            max_assignments_per_pass: REBALANCER_MAX_ASSIGNMENTS_PER_PASS,
         }
     }
 }
@@ -1487,6 +1510,16 @@ pub struct MicroVmConfig {
     pub instance_root: String,
 }
 
+/// 微虚拟机给几个核、多少内存。
+///
+/// 这是 guest 的规格：由「一次进化任务在 guest 里跑得动」这条要求定，同时受宿主
+/// 余量约束——给得比宿主的空闲还大，实例根本起不来。
+// cap: bound — 由一次进化任务的资源需求与宿主余量定：超过宿主的空闲就起不来
+const MICROVM_VCPU_COUNT: u32 = 2;
+
+// cap: bound — 同上：由任务的内存峰值与宿主余量定
+const MICROVM_MEM_SIZE_MIB: u32 = 2048;
+
 impl Default for MicroVmConfig {
     fn default() -> Self {
         Self {
@@ -1495,8 +1528,8 @@ impl Default for MicroVmConfig {
             kernel_image: crate::paths::app_path_str("microvm/vmlinux"),
             rootfs_image: crate::paths::app_path_str("microvm/rootfs.ext4"),
             pv_image: crate::paths::app_path_str("microvm/evolution-pv.ext4"),
-            vcpu_count: 2,
-            mem_size_mib: 2048,
+            vcpu_count: MICROVM_VCPU_COUNT,
+            mem_size_mib: MICROVM_MEM_SIZE_MIB,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/evolution/init".into(),
             instance_root: "/tmp/cogneva-microvm".into(),
         }
