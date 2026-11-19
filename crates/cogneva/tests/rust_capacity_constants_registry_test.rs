@@ -621,6 +621,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-agent/src/agent_kernel/runtime.rs", 5),
     ("crates/cog-agent/src/archive.rs", 1),
     ("crates/cog-agent/src/background.rs", 3),
+    ("crates/cog-agent/src/config.rs", 1),
     ("crates/cog-agent/src/consumer.rs", 3),
     ("crates/cog-agent/src/context.rs", 3),
     ("crates/cog-agent/src/drain.rs", 1),
@@ -647,7 +648,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-core/src/claim_footprint.rs", 2),
     // 13 而不是 12：钩子限流的速率原先只作为 `RateLimitConfig` 的两个字段各写一遍，
     // 两份都不在册。现在它是一条 `bound`，所以这一格多了一。
-    ("crates/cog-core/src/config.rs", 41),
+    ("crates/cog-core/src/config.rs", 43),
     ("crates/cog-core/src/config_sections.rs", 2),
     ("crates/cog-core/src/contract/alerts.rs", 1),
     ("crates/cog-core/src/contract/build_cache_reclaim.rs", 2),
@@ -684,6 +685,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-eval/src/scaffold.rs", 1),
     ("crates/cog-eval/src/scaffolds/gepa.rs", 2),
     ("crates/cog-eval/src/scaffolds/mod.rs", 1),
+    ("crates/cog-eval/src/system_harness.rs", 1),
     ("crates/cog-eval/src/trend.rs", 3),
     ("crates/cog-extension/src/build_cache.rs", 1),
     ("crates/cog-extension/src/checkpoints.rs", 1),
@@ -750,6 +752,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-memory/src/maintenance.rs", 2),
     ("crates/cog-memory/src/pg_summary_pool.rs", 2),
     ("crates/cog-memory/src/vector_summary_backend.rs", 3),
+    ("crates/cog-net/src/config.rs", 2),
     ("crates/cog-observability/src/alert_store.rs", 1),
     ("crates/cog-observability/src/capability.rs", 3),
     ("crates/cog-observability/src/claim_store.rs", 2),

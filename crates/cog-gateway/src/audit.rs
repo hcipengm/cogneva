@@ -16,7 +16,11 @@ use crate::error::ApiError;
 use crate::GatewayState;
 
 /// Query parameters for audit event listing.
-#[derive(Debug, Deserialize, Default)]
+///
+/// 不派生 `Default`：派生出来的 `limit` 是 0，而没写这一格的查询串拿到的是共用
+/// 页长——同一件「没写」的事两处答案，且 0 条比页长更难被察觉（它看起来像
+/// 「没有记录」）。没有人构造它，删掉就只剩一处。
+#[derive(Debug, Deserialize)]
 pub struct AuditQuery {
     pub agent_id: Option<String>,
     pub task_id: Option<String>,
@@ -60,7 +64,7 @@ pub async fn list_audit_events_handler(
 /// 与 `/api/v1/audit/events` 是两本账：那一本记 hook 归档（谁触发、payload 是什么），
 /// 这一本记平台自己做过的事——配额拒绝、授权、变更、以及上游池被谁改成什么样。
 /// 两本混在一个端点下，读的人就分不清一条记录是"某次回调来过"还是"平台做了一件事"。
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct AuditStreamQuery {
     /// 动作前缀，如 `llm.` 或 `quota.`。
     pub action: Option<String>,

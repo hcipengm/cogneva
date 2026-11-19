@@ -148,6 +148,8 @@ mod a_word_written_out_is_the_word_read_back_test;
 mod a_worker_can_ask_to_change_the_system_test;
 #[path = "a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test.rs"]
 mod a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test;
+#[path = "a_written_default_is_named_or_derived_test.rs"]
+mod a_written_default_is_named_or_derived_test;
 #[path = "agent_consumer_test.rs"]
 mod agent_consumer_test;
 #[path = "agent_context_test.rs"]

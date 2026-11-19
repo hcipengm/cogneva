@@ -162,8 +162,11 @@ pub struct AgentLoopConfig {
 /// starts being a document: comfortably above what an API or a page summary
 /// returns, comfortably below the tool-return budget of the smallest window the
 /// loop is configured with.
+// cap: bound — 一头是 API/网页摘要的典型长度，另一头是最小窗口的工具返回预算
+const EXTERNAL_ARCHIVE_THRESHOLD_CHARS: usize = 8192;
+
 fn default_external_archive_threshold_chars() -> usize {
-    8192
+    EXTERNAL_ARCHIVE_THRESHOLD_CHARS
 }
 
 impl Default for AgentLoopConfig {
@@ -361,6 +364,7 @@ mod tests {
         // stores stay disjoint only while the threshold is below the budget of
         // the smallest window the loop runs with.
         let threshold = default_external_archive_threshold_chars();
+        assert_eq!(threshold, EXTERNAL_ARCHIVE_THRESHOLD_CHARS);
         assert!(threshold < crate::context::tool_result_budget_chars(Some(32000)));
     }
 

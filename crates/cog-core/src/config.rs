@@ -829,8 +829,13 @@ fn default_archive_after_secs() -> u64 {
 fn default_archive_poll_interval_secs() -> u64 {
     (5 * crate::day::SECONDS_PER_MINUTE) as u64
 }
+// 两遍：一次拆不出原子任务，可能是提供方在那一刻抽出了一个坏结果；两遍都空，
+// 说明这个目标本身拆不出可执行的任务，再试只是把同一个坏提示词反复送去烧 token。
+// cap: bound — 两遍：一次是抽样，两遍还空是目标真拆不出来
+const DECOMPOSITION_MAX_ATTEMPTS: u32 = 2;
+
 fn default_decomposition_max_attempts() -> u32 {
-    2
+    DECOMPOSITION_MAX_ATTEMPTS
 }
 fn default_decomposition_orphan_watch_enabled() -> bool {
     true
@@ -852,8 +857,13 @@ fn default_result_claim_idle_secs() -> u64 {
 fn default_result_claim_interval_secs() -> u64 {
     crate::day::SECONDS_PER_MINUTE as u64
 }
+// 一拍认领十六条：认领与状态迁移在同一条语句里，这个量既能让一次进程死亡留下的
+// 积压在一两个扫描周期内清掉，又不至于让一次扫描把事务拖成一把长锁。
+// cap: bound — 十六条：一拍清得掉一次进程死亡留下的积压，又不拖成长事务
+const RESULT_CLAIM_BATCH: usize = 16;
+
 fn default_result_claim_batch() -> usize {
-    16
+    RESULT_CLAIM_BATCH
 }
 
 /// Configuration for the Hot/Warm/Cold tier migrator.
@@ -2591,6 +2601,15 @@ mod tests {
 
         let cfg: TierMigratorConfig = serde_json::from_str(r#"{"trace_scan_batch": 123}"#).unwrap();
         assert_eq!(cfg.trace_scan_batch, 123);
+    }
+
+    /// 分解重试次数与结果认领批各只有一处声明：默认值读具名常量，常量上写着
+    /// 它由什么钉住。
+    #[test]
+    fn the_dag_executor_retry_and_claim_defaults_read_their_names() {
+        let cfg = DagExecutorConfig::default();
+        assert_eq!(cfg.decomposition_max_attempts, DECOMPOSITION_MAX_ATTEMPTS);
+        assert_eq!(cfg.result_claim_batch, RESULT_CLAIM_BATCH);
     }
 
     /// The refresher's two knobs default to zero, which means "use the built-in
