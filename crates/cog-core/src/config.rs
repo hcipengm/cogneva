@@ -136,6 +136,18 @@ pub struct NatsConfig {
     pub stream_retention: String,
 }
 
+/// 一条消息最多投几次：投完就进 DLQ。
+///
+/// 它与 [`NatsConfig::consumer_ack_wait_secs`] 一起决定一条消息在总线上的最长
+/// 存续时间（次数 × 一次 ack 等待）；重投次数不是独立的档位，是「一条消息的
+/// 终局要多久」除以「一次重投等多久」。
+// cap: bound — 由一条消息的终局预算 ÷ 一次 ack 等待定：超了就等于没进 DLQ 只是慢
+const NATS_MAX_DELIVER: i64 = 5;
+
+/// 一个消费者同时在途、未 ack 的消息上限。
+// cap: bound — 由一拍处理得完的条数定：在途上限小于吃进来的速率，吞吐就卡在这里
+const NATS_MAX_ACK_PENDING: usize = 1024;
+
 impl Default for NatsConfig {
     fn default() -> Self {
         Self {
@@ -143,8 +155,8 @@ impl Default for NatsConfig {
             auth: NatsAuthConfig::default(),
             tls: NatsTlsConfig::default(),
             consumer_ack_wait_secs: (15 * crate::day::SECONDS_PER_MINUTE) as u64,
-            consumer_max_deliver: 5,
-            consumer_max_ack_pending: 1024,
+            consumer_max_deliver: NATS_MAX_DELIVER,
+            consumer_max_ack_pending: NATS_MAX_ACK_PENDING,
             stream_retention: "workqueue".into(),
         }
     }
@@ -1377,16 +1389,26 @@ pub struct MultiBackendConsumerConfig {
     pub events_stream_retention: String,
 }
 
+/// 总线故障窗里重试写回总线的间隔。
+// cap: bound — 由总线恢复时长定：间隔要短于故障窗，长了缓冲先满
+const BUS_RETRY_INTERVAL_SECS: u64 = 5;
+
+/// 持久总线写不进去时，进程内兜底的缓冲深度。
+///
+/// 它兜的是「总线故障窗」：深度 × 到达速率要盖住那段窗，否则兜底先丢事件。
+// cap: bound — 由事件到达速率 × 总线故障窗定：窗变长或速率变高都要一起抬
+const BUS_PUBLISH_BUFFER_CAPACITY: usize = 256;
+
 impl Default for MultiBackendConsumerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             channel: "cogneva-events".into(),
             group: "cogneva-consumer".into(),
-            retry_interval_secs: 5,
+            retry_interval_secs: BUS_RETRY_INTERVAL_SECS,
             events_on_bus: false,
             nats_urls: Vec::new(),
-            publish_buffer_capacity: 256,
+            publish_buffer_capacity: BUS_PUBLISH_BUFFER_CAPACITY,
             publish_retry_base_delay_ms: crate::day::MILLIS_PER_SECOND as u64,
             events_stream_retention: "limits".into(),
         }
@@ -2936,6 +2958,42 @@ mod system_config_reads_its_names {
             .map(str::trim)
             .filter(|line| {
                 names.iter().any(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "这些默认值要读常量：{bare:?}");
+    }
+
+    /// 总线消费的两个计数与两个兜底参数也读具名常量。
+    #[test]
+    fn the_bus_consumer_reads_its_names() {
+        let nats = NatsConfig::default();
+        assert_eq!(nats.consumer_max_deliver, NATS_MAX_DELIVER);
+        assert_eq!(nats.consumer_max_ack_pending, NATS_MAX_ACK_PENDING);
+        let consumer = MultiBackendConsumerConfig::default();
+        assert_eq!(consumer.retry_interval_secs, BUS_RETRY_INTERVAL_SECS);
+        assert_eq!(
+            consumer.publish_buffer_capacity,
+            BUS_PUBLISH_BUFFER_CAPACITY
+        );
+
+        let source = include_str!("config.rs");
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                [
+                    "consumer_max_deliver",
+                    "consumer_max_ack_pending",
+                    "retry_interval_secs",
+                    "publish_buffer_capacity",
+                ]
+                .iter()
+                .any(|name| {
                     line.strip_prefix(name)
                         .and_then(|rest| rest.strip_prefix(':'))
                         .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))

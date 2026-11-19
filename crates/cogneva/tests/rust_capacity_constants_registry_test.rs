@@ -644,7 +644,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-core/src/claim_footprint.rs", 2),
     // 13 而不是 12：钩子限流的速率原先只作为 `RateLimitConfig` 的两个字段各写一遍，
     // 两份都不在册。现在它是一条 `bound`，所以这一格多了一。
-    ("crates/cog-core/src/config.rs", 22),
+    ("crates/cog-core/src/config.rs", 26),
     ("crates/cog-core/src/config_sections.rs", 2),
     ("crates/cog-core/src/contract/alerts.rs", 1),
     ("crates/cog-core/src/contract/build_cache_reclaim.rs", 2),
