@@ -258,6 +258,11 @@ pub struct RawStreamConfig {
     pub flush_interval_sec: u64,
 }
 
+// 256 MB 一个热文件：轮转的开销与「一个文件能被一次搬走」的粒度之间的取舍；
+// 再大，一次冷热迁移搬的字节就压过了轮转省下来的。
+// cap: bound — 256 MB：一次能搬走的粒度，再大迁移的字节压过轮转省下的
+const RAW_STREAM_MAX_HOT_FILE_MB: u64 = 256;
+
 impl Default for RawStreamConfig {
     fn default() -> Self {
         Self {
@@ -265,7 +270,7 @@ impl Default for RawStreamConfig {
             hot_dir: cog_core::paths::data_path("raw-streams/hot"),
             warm_dir: cog_core::paths::data_path("raw-streams/warm"),
             cold_dir: cog_core::paths::data_path("raw-streams/cold"),
-            max_hot_file_size_mb: 256,
+            max_hot_file_size_mb: RAW_STREAM_MAX_HOT_FILE_MB,
             flush_interval_sec: (cog_core::day::SECONDS_PER_MINUTE / 2) as u64,
         }
     }
@@ -299,11 +304,16 @@ pub struct ExplainabilityConfig {
     pub max_records_memory: usize,
 }
 
+// 一万条理由在内存里是几十 MB：足够覆盖最近一段决策，又不至于让这个进程的
+// 常驻内存跟着它涨；再多就该走独立存储，而那个面还没接（见上面的注释）。
+// cap: bound — 一万条几十 MB：覆盖最近一段决策，再多该走独立存储
+const EXPLAINABILITY_MAX_RECORDS: usize = 10_000;
+
 impl Default for ExplainabilityConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_records_memory: 10_000,
+            max_records_memory: EXPLAINABILITY_MAX_RECORDS,
         }
     }
 }
@@ -557,6 +567,53 @@ mod label_spellings {
                 expected,
                 "label spelling drifted from its identifier"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod default_names {
+    use super::*;
+
+    /// 原始流的热文件上限与内存里保留的理由条数各只有一处声明：默认值读常量，
+    /// 常量上面写着它由什么钉住；源码面 `impl Default` 的字段里不再有数字。
+    #[test]
+    fn the_raw_stream_and_explainability_defaults_read_their_names() {
+        assert_eq!(
+            RawStreamConfig::default().max_hot_file_size_mb,
+            RAW_STREAM_MAX_HOT_FILE_MB
+        );
+        assert_eq!(
+            ExplainabilityConfig::default().max_records_memory,
+            EXPLAINABILITY_MAX_RECORDS
+        );
+
+        let source = include_str!("lib.rs");
+        for (head, struct_name) in [
+            ("impl Default for RawStreamConfig", "RawStreamConfig"),
+            ("impl Default for ExplainabilityConfig", "ExplainabilityConfig"),
+        ] {
+            let body = source
+                .split(head)
+                .nth(1)
+                .expect("the impl is in this file")
+                .split("\n}\n")
+                .next()
+                .unwrap();
+            let bare: Vec<&str> = body
+                .lines()
+                .filter(|line| {
+                    line.split_once(':').is_some_and(|(field, value)| {
+                        let value = value.trim().trim_end_matches(',');
+                        !field.is_empty()
+                            && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && value.starts_with(|c: char| c.is_ascii_digit())
+                            && value != "0"
+                    })
+                })
+                .map(str::trim)
+                .collect();
+            assert!(bare.is_empty(), "{struct_name} 的默认值要读具名常量：{bare:?}");
         }
     }
 }

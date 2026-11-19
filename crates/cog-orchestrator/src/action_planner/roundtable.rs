@@ -22,11 +22,20 @@ pub struct RoundtableConfig {
     pub consensus_threshold: f32,
 }
 
+// 三轮：第一轮各说各的，第二轮回应对方的论据，第三轮之后新的一轮已经不再改变
+// 谁被说服——再辩只是在同一组分歧上换措辞。
+// cap: bound — 三轮：之后新的一轮不再改变谁被说服
+const DEBATE_MAX_ROUNDS: u32 = 3;
+
+// 八成：多数即收口。五五开说明没有形成结论；要求全体一致则被一条少数意见钉死。
+// cap: bound — 0.8：多数即收口；全体一致会被少数意见钉死
+const DEBATE_CONSENSUS: f32 = 0.8;
+
 impl Default for RoundtableConfig {
     fn default() -> Self {
         Self {
-            max_rounds: 3,
-            consensus_threshold: 0.8,
+            max_rounds: DEBATE_MAX_ROUNDS,
+            consensus_threshold: DEBATE_CONSENSUS,
         }
     }
 }
@@ -109,6 +118,37 @@ fn simple_similarity(a: &str, b: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 辩论轮次与共识线各只有一处声明：默认值读常量，源码面 `impl Default` 的
+    /// 字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_debate_default_reads_its_rounds_and_consensus_line() {
+        let cfg = RoundtableConfig::default();
+        assert_eq!(cfg.max_rounds, DEBATE_MAX_ROUNDS);
+        assert_eq!(cfg.consensus_threshold, DEBATE_CONSENSUS);
+
+        let body = include_str!("roundtable.rs")
+            .split("impl Default for RoundtableConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
     use async_trait::async_trait;
 
     struct EchoDebater {
