@@ -105,6 +105,64 @@ impl Default for RetryMatrix {
     }
 }
 
+/// 出厂策略表里的每个数都有名字。
+///
+/// 这张表以前把数字直接写在结构体字面量里，而它既不是 `impl Default` 也不是
+/// `fn default_*`：D5 那道门看不见它，容量登记表只认 `const` 也看不见它。
+/// 形状换了，数还是数——名字给出来之后，每个数至少有一条判词和一个能拦住
+/// 「只能往下调」的簿记。
+// LLM 调用：一次调用里重试三次
+// cap: bound — 退避三档 1s/2s/4s；三次之后每一次都只是把同一个失败拖得更久
+const LLM_CALL_RETRIES: u32 = 3;
+// cap: bound — 连续五次失败才开熔断：三次重试各自失败都算在内，第五次才说明这条路真不通
+const LLM_CALL_FAILURE_THRESHOLD: u32 = 5;
+// cap: bound — 半开时放三次探测：一次分不清抖动与真坏，三次仍全失败才判死
+const LLM_CALL_HALF_OPEN_CALLS: u32 = 3;
+
+// 工具调用：外部服务抖动，等一等再试
+// cap: bound — 工具失败多是抖动：两次重试足够越过一次瞬时故障
+const TOOL_CALL_RETRIES: u32 = 2;
+// cap: bound — 连续三次失败开熔断：比 LLM 调用更早停，因为工具重试本身是等待而不是推理
+const TOOL_CALL_FAILURE_THRESHOLD: u32 = 3;
+// cap: bound — 半开放两次探测
+const TOOL_CALL_HALF_OPEN_CALLS: u32 = 2;
+
+// 文件操作：立刻重试一次
+// cap: bound — 本地文件失败再等也不会变，只给一次不留等待的重试
+const FILE_OP_RETRIES: u32 = 1;
+
+// 数据库事务：线性退避
+// cap: bound — 连接池争用是秒级的事：三次、每次加一百毫秒，等太久只是让锁持有更久
+const DB_RETRIES: u32 = 3;
+// cap: bound — 十次才开熔断：事务失败要区分「这次撞上锁」与「这条 SQL 坏了」，前者会自己好
+const DB_FAILURE_THRESHOLD: u32 = 10;
+// cap: bound — 半开放三次探测
+const DB_HALF_OPEN_CALLS: u32 = 3;
+
+// 网络请求：对端过载时第一次重试就该更慢
+// cap: bound — 三次：0.5s/1s/2s，超过两秒仍被拒就不是过载而是不可达
+const NETWORK_RETRIES: u32 = 3;
+// cap: bound — 连续五次失败开熔断
+const NETWORK_FAILURE_THRESHOLD: u32 = 5;
+// cap: bound — 半开放三次探测
+const NETWORK_HALF_OPEN_CALLS: u32 = 3;
+
+// WASM 技能：沙箱内的失败多是初始化竞态
+// cap: bound — 两次：竞态在一次重试之内就过去，第三次开始只是在等一个坏掉的初始化
+const WASM_SKILL_RETRIES: u32 = 2;
+
+// 技能：立刻重试一次
+// cap: bound — 一次不留等待的重试：技能本身失败再等也不会变
+const SKILL_RETRIES: u32 = 1;
+
+// DAG 节点：同一节点连败到熔断阈值即进 DLQ
+// cap: bound — 三次重试与熔断阈值同一个数：第四次不再重试，而是直接判这条节点不通
+const DAG_NODE_RETRIES: u32 = 3;
+// cap: bound — 连续三次失败即进 DLQ
+const DAG_NODE_FAILURE_THRESHOLD: u32 = 3;
+// cap: bound — 半开只放一次探测：节点一坏往往就是一直坏，多放几次只是多花几次额度
+const DAG_NODE_HALF_OPEN_CALLS: u32 = 1;
+
 impl RetryMatrix {
     /// Build a [`RetryMatrix`] pre-populated with the standard
     pub fn defaults() -> Self {
@@ -114,16 +172,16 @@ impl RetryMatrix {
         by_task_type.insert(
             TaskType::LlmCall,
             RetryConfig {
-                max_retries: 3,
+                max_retries: LLM_CALL_RETRIES,
                 backoff: BackoffStrategy::Exponential {
                     base_ms: cog_core::day::MILLIS_PER_SECOND as u64,
                     max_ms: (8 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     multiplier: DOUBLING,
                 },
                 circuit_breaker: Some(CircuitBreakerConfig {
-                    failure_threshold: 5,
+                    failure_threshold: LLM_CALL_FAILURE_THRESHOLD,
                     recovery_timeout_ms: (60 * cog_core::day::MILLIS_PER_SECOND) as u64,
-                    half_open_max_calls: 3,
+                    half_open_max_calls: LLM_CALL_HALF_OPEN_CALLS,
                 }),
             },
         );
@@ -132,12 +190,14 @@ impl RetryMatrix {
         by_task_type.insert(
             TaskType::ToolCall,
             RetryConfig {
-                max_retries: 2,
-                backoff: BackoffStrategy::Fixed { interval_ms: (3 * cog_core::day::MILLIS_PER_SECOND) as u64 },
+                max_retries: TOOL_CALL_RETRIES,
+                backoff: BackoffStrategy::Fixed {
+                    interval_ms: (3 * cog_core::day::MILLIS_PER_SECOND) as u64,
+                },
                 circuit_breaker: Some(CircuitBreakerConfig {
-                    failure_threshold: 3,
+                    failure_threshold: TOOL_CALL_FAILURE_THRESHOLD,
                     recovery_timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
-                    half_open_max_calls: 2,
+                    half_open_max_calls: TOOL_CALL_HALF_OPEN_CALLS,
                 }),
             },
         );
@@ -146,7 +206,7 @@ impl RetryMatrix {
         by_task_type.insert(
             TaskType::FileOp,
             RetryConfig {
-                max_retries: 1,
+                max_retries: FILE_OP_RETRIES,
                 backoff: BackoffStrategy::Fixed { interval_ms: 0 },
                 circuit_breaker: None,
             },
@@ -156,15 +216,15 @@ impl RetryMatrix {
         by_task_type.insert(
             TaskType::DbTransaction,
             RetryConfig {
-                max_retries: 3,
+                max_retries: DB_RETRIES,
                 backoff: BackoffStrategy::Linear {
                     base_ms: (cog_core::day::MILLIS_PER_SECOND / 10) as u64,
                     increment_ms: (cog_core::day::MILLIS_PER_SECOND / 10) as u64,
                 },
                 circuit_breaker: Some(CircuitBreakerConfig {
-                    failure_threshold: 10,
+                    failure_threshold: DB_FAILURE_THRESHOLD,
                     recovery_timeout_ms: (120 * cog_core::day::MILLIS_PER_SECOND) as u64,
-                    half_open_max_calls: 3,
+                    half_open_max_calls: DB_HALF_OPEN_CALLS,
                 }),
             },
         );
@@ -173,16 +233,16 @@ impl RetryMatrix {
         by_task_type.insert(
             TaskType::NetworkRequest,
             RetryConfig {
-                max_retries: 3,
+                max_retries: NETWORK_RETRIES,
                 backoff: BackoffStrategy::Exponential {
                     base_ms: (cog_core::day::MILLIS_PER_SECOND / 2) as u64,
                     max_ms: (2 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     multiplier: DOUBLING,
                 },
                 circuit_breaker: Some(CircuitBreakerConfig {
-                    failure_threshold: 5,
+                    failure_threshold: NETWORK_FAILURE_THRESHOLD,
                     recovery_timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
-                    half_open_max_calls: 3,
+                    half_open_max_calls: NETWORK_HALF_OPEN_CALLS,
                 }),
             },
         );
@@ -191,8 +251,10 @@ impl RetryMatrix {
         by_task_type.insert(
             TaskType::WasmSkill,
             RetryConfig {
-                max_retries: 2,
-                backoff: BackoffStrategy::Fixed { interval_ms: cog_core::day::MILLIS_PER_SECOND as u64 },
+                max_retries: WASM_SKILL_RETRIES,
+                backoff: BackoffStrategy::Fixed {
+                    interval_ms: cog_core::day::MILLIS_PER_SECOND as u64,
+                },
                 circuit_breaker: None,
             },
         );
@@ -201,7 +263,7 @@ impl RetryMatrix {
         by_task_type.insert(
             TaskType::Skill,
             RetryConfig {
-                max_retries: 1,
+                max_retries: SKILL_RETRIES,
                 backoff: BackoffStrategy::Fixed { interval_ms: 0 },
                 circuit_breaker: None,
             },
@@ -211,16 +273,16 @@ impl RetryMatrix {
         by_task_type.insert(
             TaskType::DagNode,
             RetryConfig {
-                max_retries: 3,
+                max_retries: DAG_NODE_RETRIES,
                 backoff: BackoffStrategy::Exponential {
                     base_ms: (5 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     max_ms: (20 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     multiplier: DOUBLING,
                 },
                 circuit_breaker: Some(CircuitBreakerConfig {
-                    failure_threshold: 3,
+                    failure_threshold: DAG_NODE_FAILURE_THRESHOLD,
                     recovery_timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
-                    half_open_max_calls: 1,
+                    half_open_max_calls: DAG_NODE_HALF_OPEN_CALLS,
                 }),
             },
         );

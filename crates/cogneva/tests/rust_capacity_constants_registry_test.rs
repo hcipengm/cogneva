@@ -205,8 +205,7 @@ fn opens_a_multiline_declaration(line: &str) -> bool {
     let Some(ty) = after.split_once(':').map(|(_, r)| r.trim_start()) else {
         return false;
     };
-    ty.starts_with('[')
-        || (ty.starts_with("&[") && ty.contains('=') && line.contains('['))
+    ty.starts_with('[') || (ty.starts_with("&[") && ty.contains('=') && line.contains('['))
 }
 
 /// Every production line a file holds, paired with the `// cap:` block above it.
@@ -763,6 +762,13 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-orchestrator/src/backup_runs.rs", 1),
     ("crates/cog-orchestrator/src/change_ledger.rs", 25),
     ("crates/cog-orchestrator/src/dag_executor/mod.rs", 5),
+    // 18 而不是 0：出厂策略表里的数原先写在 `fn defaults()` 的结构体字面量里，
+    // 两道门都不认这个形状（D5 只认 `fn default_*`，登记表只认 `const`）。给了
+    // 名字之后它们进册了——不是新增的界，是原先没被数上的界。
+    (
+        "crates/cog-orchestrator/src/dag_executor/retry_matrix.rs",
+        18,
+    ),
     (
         "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
         3,
@@ -1274,9 +1280,7 @@ fn array_constants_carrying_numbers(root: &Path, files: &[PathBuf]) -> Vec<(Stri
 /// `[u64; 4]` 是一张档位表；`[&str; 2]` 是一串词，`[f32; 1024]` 是一份权重。
 /// 三者的类型不同，判词也就不同——登记表只该收前一类和第三类，词不该进来。
 fn array_element_type(ty: &str) -> Option<&str> {
-    let tail = ty
-        .strip_prefix("&[")
-        .or_else(|| ty.strip_prefix('['))?;
+    let tail = ty.strip_prefix("&[").or_else(|| ty.strip_prefix('['))?;
     let element = tail.split([';', ']']).next()?.trim();
     matches!(
         element,
@@ -1352,8 +1356,14 @@ mod tests {
     assert_eq!(
         tables,
         vec![
-            ("crates/probe/src/ladder.rs".to_string(), "RUNGS".to_string()),
-            ("crates/probe/src/ladder.rs".to_string(), "SLICE".to_string())
+            (
+                "crates/probe/src/ladder.rs".to_string(),
+                "RUNGS".to_string()
+            ),
+            (
+                "crates/probe/src/ladder.rs".to_string(),
+                "SLICE".to_string()
+            )
         ]
     );
     // 同一个夹具过一遍登记表：跨行的表成行、判词跟着开头那一行走，词表与字节
