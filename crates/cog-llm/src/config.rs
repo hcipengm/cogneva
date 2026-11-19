@@ -129,6 +129,18 @@ impl TuningConfig {
     pub fn load_from(path: &std::path::Path) -> SFResult<Self> {
         load_section_from(path, "/tuning", TUNING_ENV)
     }
+
+    /// 流式事件的通道容量：`0` 不是一个可用值——事件流是有界通道，容量为 0
+    /// 建不出来——所以 0 在这里读作「没写」，由 [`DEFAULT_STREAM_CAPACITY`] 给。
+    ///
+    /// 这一条同时也是「只声明一次」的落点：容量写进交付文档就会与这个常量变成
+    /// 同一事实的两处声明，改一处不改另一处时，两边都各自绿。文档里不写它。
+    pub fn stream_capacity_or_default(&self) -> usize {
+        match self.stream_capacity {
+            0 => crate::DEFAULT_STREAM_CAPACITY,
+            capacity => capacity,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +152,20 @@ mod tests {
         let p = std::path::Path::new("/nonexistent/x.json");
         assert!(LLMRoutingConfig::load_from(p).unwrap().backends.is_empty());
         assert_eq!(TuningConfig::load_from(p).unwrap().stream_capacity, 0);
+    }
+
+    /// 没写容量时读到的是常量本身；写了就按写的来；常量必须是一个能建通道的数。
+    #[test]
+    fn an_absent_capacity_reads_the_constant_instead_of_zero() {
+        let unset = TuningConfig::default();
+        assert_eq!(unset.stream_capacity, 0, "默认仍是 0：0 是「没写」的哨兵");
+        assert_eq!(unset.stream_capacity_or_default(), crate::DEFAULT_STREAM_CAPACITY);
+        assert!(
+            crate::DEFAULT_STREAM_CAPACITY > 0,
+            "容量 0 建不出有界通道：常量本身必须是正数，否则这条兜底把 panic 藏起来"
+        );
+        let written = TuningConfig { stream_capacity: 64 };
+        assert_eq!(written.stream_capacity_or_default(), 64);
     }
 
     #[test]

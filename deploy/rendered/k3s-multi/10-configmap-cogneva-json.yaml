@@ -186,7 +186,9 @@ data:
         "pg_min_connections": 1,
         "strict_persistence": true,
         "_comment_plugin_filtering": "Plugin loading control. enabled_plugins = whitelist (omit for all). disabled_plugins = blacklist (applied when enabled_plugins is omitted).",
-        "disabled_plugins": []
+        "disabled_plugins": [],
+        "_comment_pg_max_connections": "PG 连接池上限。它与副本数相乘不能超过服务端的 `max_connections`——那个池是集群共用的外部事实，这里写的是一份分给本进程的份额。",
+        "_comment_pg_min_connections": "PG 连接池的空闲下限：保住的常连，省掉每个请求的重连握手。"
       },
       "env": {
         "_comment": "Environment-variable → config-path mappings. Keys are env-var names, values are dot-separated JSON paths inside this file.",
@@ -332,7 +334,8 @@ data:
             "api_style": "anthropic",
             "enabled": true
           }
-        ]
+        ],
+        "_comment_max_failover_attempts": "一条请求最多换几次后端。上界由后端池的规模定：池里还有没试过的面就换，试遍了就报失败。"
       },
       "providers": {
         "db": {
@@ -406,9 +409,8 @@ data:
         "consumer_group": "cogneva",
         "ready_task_poll_interval_secs": 5,
         "batch_persistence_enabled": false,
-        "batch_persistence_max_changes": 10,
-        "batch_persistence_interval_secs": 5,
-        "archive_enabled": true
+        "archive_enabled": true,
+        "_comment_ready_task_poll_interval_secs": "空闲时多久问一次「有没有就绪任务」。读侧把 0 夹到 1 秒（`.max(1)`），那等于常态忙轮询；5 秒是「就绪到被取走」的可接受延迟与空转代价之间的那一档。"
       },
       "gateway": {
         "http_port": 8080,
@@ -420,15 +422,20 @@ data:
         ],
         "websocket_timeout_secs": 30,
         "websocket_inactivity_timeout_secs": 90,
-        "websocket_tick_secs": 5,
         "notification_limit": 50,
         "request_timeout_secs": 30,
-        "contribution_oauth_refresh_interval_secs": 3600,
-        "contribution_oauth_refresh_threshold_secs": 14400,
         "notification_dingtalk": null,
         "notification_feishu": null,
         "notification_wechat_work": null,
-        "notification_sign_base": null
+        "notification_sign_base": null,
+        "_comment_http_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.httpPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
+        "_comment_ws_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.wsPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
+        "_comment_metrics_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.metricsPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
+        "_comment_internal_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.internalPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。",
+        "_comment_notification_limit": "通知列表的默认页大小（客户端不传 `limit` 时用它）。0 会让默认页永远是空的，所以这里必须有一个正数。",
+        "_comment_request_timeout_secs": "请求在网关里的等待上界。0 在这里不是「不限」：中间件照样建一个 0 秒超时，每个请求立刻 408，所以这个数必须由部署给出。",
+        "_comment_websocket_inactivity_timeout_secs": "客户端多久没有消息就断开。取心跳周期的三倍：丢一拍心跳不算离线，连丢三拍才断（见 `_comment_websocket_timeout_secs`）。",
+        "_comment_websocket_timeout_secs": "服务端心跳周期：每隔这么久发一次 ping，用来发现死连接。0 会让 tokio 的定时器以零周期启动（构造即 panic），所以这个数必须由部署给出。"
       },
       "metrics": {
         "enabled": true,
@@ -470,7 +477,8 @@ data:
           "_comment_benchmark": "Evaluation-set isolation: a raw matched by either list is refused before it is archived or extracted, so it reaches no memory layer and is never sent to the extractor. Both lists are deployment and dataset facts and are empty by default, which means that rule is not in effect -- the raw tag rule is the one that is always live (a producer marks a raw with benchmark=true and it is refused regardless of these lists). benchmark_namespaces names the eval-dedicated bucket and covers a writer that puts its data there without a tag; benchmark_canary_markers carries the dataset's own marker strings and is the only rule that still recognises content that arrived through an ordinary task path into the default namespace with its tag lost. Refusals are counted on memory_operations_total, one cell per rule, so a deployment that has configured an empty surface can tell it apart from one that has refused nothing.",
           "benchmark_namespaces": [],
           "benchmark_canary_markers": []
-        }
+        },
+        "_comment_embedding_dimension": "维度由嵌入模型定：BGE-M3 的句子向量是 1024 维，换模型才换这个数（哪几路共用同一组权重见本节的 `_comment_models`）。"
       },
       "tier_migrator": {
         "_comment": "hot→warm 就地 zstd 压缩并删除源文件，warm→cold 上传对象存储再删本地，两步都不可逆——热层保留 hot_duration_secs，warm 保留 warm_duration_secs。",
@@ -488,7 +496,8 @@ data:
             "name": "TokenBudget",
             "rule_type": "hard",
             "threshold": 100000,
-            "enabled": true
+            "enabled": true,
+            "_comment_threshold": "TokenBudget 规则的阈值：单个任务能花掉的 token 上界，越线即判违规（协作执行器按规则名取这个阈）。它随所用模型的上下文窗口定：窗口变，这个数跟着变。"
           },
           {
             "name": "OutputQuality",
@@ -3936,14 +3945,16 @@ data:
               "summary": "A call this process made was refused by an upstream for exceeding its context window. The window belongs to the upstream deployment and no file in this tree carries it, so the loop trims to a configured bootstrap until a call measures the real one -- and a refusal is that measurement, not only a failure. `limit_named` cells are refusals whose text states the limit (\"maximum context length is 128000 tokens\", \"prompt is too long: 214401 tokens > 200000 maximum\"); the loop reads that number and lowers its budget to it in the same turn, so these should arrive in ones and twos and then stop -- a `limit_named` cell that keeps climbing means the number was read and the budget still exceeded it, which is a fault in the decision rather than a missing measurement. `limit_unnamed` cells say the prompt was too long and name no number: the budget is still wrong and nothing was learned, so the repair is to teach `context_limit_from_refusal` that vendor's wording. Either way the spend is real: a refused call was billed for the prompt it carried, and the same oversized prompt is what the loop would send again if the refusal had taught it nothing.",
               "face": "资源管理"
             }
-          ]
+          ],
+          "_comment_poll_interval_secs": "采集周期：连续几拍取不到数才算「断档」（`eval_failure_alert_after` 按拍计），所以改它等于改所有告警的时间分辨率；读侧把 0 夹到 1 秒。"
         },
         "trace_collector": {
           "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。"
         },
         "data_volume_watch": {
           "_comment": "应用数据目录的占用量由写它的进程自己量成 gauge cogneva_data_volume_used_bytes 并带上卷名，规则拿它除以 kube-state-metrics 报的 requests.storage。同一份 cogneva.json 挂给多个 Pod，各自挂的卷不是同一张，所以卷名由各部署用自己的 env 指名（COGNEVA_DATA_VOLUME_CLAIM），不写在这里；claim 为空即整个观测关闭。没有应用数据目录、只有挂载表的进程（独立子命令与边车）用 COGNEVA_DATA_VOLUME_MOUNTS 的 claim=路径 列表声明，卷名就在那一行里；这条序列只能由挂载着该卷的进程走查产出——问得出来的那份是另一个量（引用字节），不是盘上占用。",
-          "interval_secs": 300
+          "interval_secs": 300,
+          "_comment_interval_secs": "数据量扫描周期。扫描要遍历整个数据目录，代价随数据量涨，所以取分钟级；读侧把 0 夹到 `MIN_SCAN_INTERVAL_SECS`。"
         }
       },
       "self_review": {
@@ -3967,11 +3978,11 @@ data:
       "agent": {
         "_comment": "Agent 注册与心跳。registration_ttl_secs 是注册表里一条 agent 记录的存活秒数（cog-storage 写注册时取它），heartbeat_interval_secs 是 worker 向注册表续约的间隔（cog-agent 建 worker 时取它）。两处都在进程启动时读，改一个值要重启工作负载才生效。",
         "registration_ttl_secs": 30,
-        "heartbeat_interval_secs": 10
+        "heartbeat_interval_secs": 10,
+        "_comment_registration_ttl_secs": "注册 TTL 与心跳是一对：TTL 必须是心跳周期的好几倍，否则一次抖动就把活着的员工标成离线。代码里同名字段的注释写的是约三倍，两个数一起改。",
+        "_comment_heartbeat_interval_secs": "心跳周期：注册 TTL 的三分之一（见 `_comment_registration_ttl_secs`）。"
       },
-      "tuning": {
-        "stream_capacity": 256
-      },
+      "tuning": {},
       "prompts": {
         "_comment": "外部 prompt 模板目录，由 cogneva-prompts configmap 挂载；hot_reload 捕捉 configmap 交换（L0 配置晋级热更新通道）。",
         "dir": "/etc/cogneva/prompts",
@@ -4095,7 +4106,8 @@ data:
           "port": 9091,
           "secret_env": "COGNEVA_GITHUB_WEBHOOK_SECRET",
           "path": "/webhooks/github",
-          "gateway_verified": true
+          "gateway_verified": true,
+          "_comment_port": "chart 按 `templates/app-config.yaml` 的替换表改写这个数（源 `values.yaml` 的 `gateway.webhookPort`）：文件里的值是不挂 chart 时的锚点，也是替换要逐字匹配的那一段。（同表中的 `\"port\": 9091` 那一段。）"
         },
         "git_workdir": "",
         "_comment_git_workdir": "Local git working copy the landing channel commits and pushes from. Empty derives one under the data dir (COGNEVA_DATA_DIR/git-workdir); whether changes actually go upstream is the contribution policy's decision, not a path setting. Git transport goes through the security gateway HTTPS proxy (COGNEVA_GIT_PROXY_BASE, set in deployment env); no token or deploy key lives in this pod.",

@@ -49,7 +49,7 @@ spec:
       annotations:
         # 本 Pod 经 envFrom 取 cogneva-config，理由同安全网关：env 只在启动时读一次，
         # 配置变了模板得跟着变，RollingUpdate 才会真的换掉它。
-        checksum/config: ff8abefa9031df38662be565e157b6fd1202366894f5275ca0031e068ec4e6d2
+        checksum/config: 9d69695c17636fb78a27c48c915c4575a89867d1eb74f60756e080c3c7593181
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: sandbox-executor

@@ -35,7 +35,7 @@ impl cog_core::SystemPlugin for LlmPlugin {
 
         let config = ctx.config();
         // tuning / llm_routing 是 cog-llm 自有配置段，自读 cogneva.json。
-        let stream_capacity = crate::TuningConfig::load()?.stream_capacity;
+        let stream_capacity = crate::TuningConfig::load()?.stream_capacity_or_default();
         let anthropic_default_max_tokens = config.system.anthropic_default_max_tokens;
         let llm_routing = crate::LLMRoutingConfig::load()?;
         // Drop config borrow before publishing

@@ -17,10 +17,11 @@
 //! 共用，抄第二份就会有两份对同一节给出不同答案、而两份都各自绿。
 //!
 //! 不判什么，说清楚：
-//! - **既非默认值、又没有约定**的数（「无主」）这一轮不判。它的判据要有「同处约定声明」
-//!   这一面，而那一面今天只有 7 处有（`metrics._comment_sample_max_rows` 这类
-//!   `_comment_<键>` 兄弟键）；先把抄件清零，无主那一半再单独立门，两半混在一个红里
-//!   会让人以为删掉抄件就干净了。
+//! - **既非默认值、又没有来源说明**的数（「无主」）不在下面那条「抄件」判据里清零，
+//!   它在走查里数出来、点名，并在走查里断言为零：一个不是代码默认值、旁边又没人写过
+//!   一句话的数，就是属主口径里的 `override`——人拍的一个数，答不出该由哪条实测导出，
+//!   也点不出是哪条协议约定。它的三种去向：删掉（本来就不决定任何事的，比如功能关着时
+//!   那两个不起作用的批参数）、搬出文档由闭环算（`derived`）、或在值旁边写一句点名约定。
 //! - 删一个叶子会不会改变行为：不会。上面那个往返就是这个断言的机器版本；删掉的叶子
 //!   全部是「删了读到同一个数」的那一类。
 //! - **返回里没有这个叶子**的（动态键、`Value` 块、被 `skip_serializing_if` 省掉的）不判
@@ -212,6 +213,33 @@ fn the_answer_without(doc: &Value, steps: &[Step], reader: &Reader, base: usize)
     }
 }
 
+/// 这个叶子有没有说明它的来源：从它所在的块一路向上，有没有哪个对象带
+/// `_comment_<键>` 兄弟键。
+///
+/// 判的是**存在**，不是散文内容——一句话是不是真的点出了那条约定，机器判不了；
+/// 机器能判的是「有人为这个键写过一句话」。往上找而不是只看紧邻的父对象，是因为
+/// 文档自己的写法就是把一族同名的键在块级说明一次（`infra_watch._comment_for_seconds`
+/// 解释每一条规则的 `for_seconds`）；再往上就出了这一节，那已经是别的键的地盘。
+///
+/// 这条判据只对**不是抄件**的叶子发问：一个既不是代码默认值、又没人写过一句话的
+/// 数，就是属主口径里的 `override`——人拍的一个数，答不出该由哪条实测导出，也点
+/// 不出是哪条协议约定。
+fn same_place_declaration(doc: &Value, steps: &[Step]) -> bool {
+    let Some((last, parents)) = steps.split_last() else {
+        return false;
+    };
+    let Step::Key(key) = last else {
+        return false; // 数组元素不是一句话，也谈不上「旁边有人说明」
+    };
+    let comment = format!("_comment_{key}");
+    (1..=parents.len()).rev().any(|depth| {
+        matches!(
+            value_at(doc, &steps[..depth]),
+            Some(Value::Object(block)) if block.contains_key(&comment)
+        )
+    })
+}
+
 /// 两个 JSON 数说的是不是同一个数（`1` 与 `1.0` 在 JSON 里不同形，在配置里同值）。
 fn same_number(a: &Value, b: &Value) -> bool {
     match (a.as_f64(), b.as_f64()) {
@@ -268,7 +296,10 @@ fn the_walk_reads_the_document_the_app_reads() {
     let mut absent: BTreeMap<String, usize> = BTreeMap::new();
     let mut load_bearing: BTreeMap<String, usize> = BTreeMap::new();
     let mut elements = 0;
-    for (_, steps, _) in &leaves {
+    // 不是抄件的那些叶子，旁边有没有一句话说它的来源。
+    let mut declared = 0;
+    let mut no_declaration: Vec<String> = Vec::new();
+    for (path, steps, _) in &leaves {
         let section_name = match &steps[0] {
             Step::Key(key) => key.clone(),
             Step::Index(_) => "<顶层数组>".to_string(),
@@ -278,7 +309,17 @@ fn the_walk_reads_the_document_the_app_reads() {
             continue;
         };
         match the_answer_without(&doc, steps, reader, base) {
-            Answer::Gives(_) => typed += 1,
+            Answer::Gives(default) => {
+                typed += 1;
+                let shipped = value_at(&doc, steps).unwrap_or(&Value::Null);
+                if same_number(&default, shipped) {
+                    // 抄件：下面那条判据要它清零，这里不重复数。
+                } else if same_place_declaration(&doc, steps) {
+                    declared += 1;
+                } else {
+                    no_declaration.push(path.clone());
+                }
+            }
             Answer::Absent => *absent.entry(section_name).or_default() += 1,
             Answer::LoadBearing => *load_bearing.entry(section_name).or_default() += 1,
             Answer::NotADeclaration => elements += 1,
@@ -311,6 +352,25 @@ fn the_walk_reads_the_document_the_app_reads() {
     println!("返回里没有的：{}", named(&absent));
     println!("删了就读不进来的：{}", named(&load_bearing));
     println!("没有读取器、本门不判的节：{}", named(&unowned));
+    println!(
+        "不是抄件的 {} 个里：旁边有来源说明 {} 个，没有说明（无主）{} 个",
+        typed,
+        declared,
+        no_declaration.len()
+    );
+    assert!(
+        declared >= 1,
+        "一个叶子的来源说明都没认出来：上面那条「数出来、点名」的路整个没走通，\
+         下面那条断言会在空集上通过"
+    );
+    assert!(
+        no_declaration.is_empty(),
+        "这些数既不是应用给的默认值，旁边也没有一句话说它是怎么来的（{} 个）。\
+         它们不是这个部署的决定，是有人拍下的数：删掉它（让默认值生效）、搬出文档\
+         由闭环算出、或者在值旁边写一句点名约定。\n{}",
+        no_declaration.len(),
+        no_declaration.join("\n")
+    );
 }
 
 /// 文档里不许出现一个「删掉它、应用给出的还是同一个数」的叶子。

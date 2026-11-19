@@ -513,7 +513,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 if active_llm_routing != new_llm_routing {
                     let new_stream_capacity = match cog_llm::TuningConfig::load() {
-                        Ok(t) => t.stream_capacity,
+                        Ok(t) => t.stream_capacity_or_default(),
                         Err(e) => {
                             tracing::warn!("tuning reload skipped: {}", e);
                             continue;
