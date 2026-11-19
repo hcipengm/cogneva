@@ -170,10 +170,14 @@ mod tests {
             unset.stream_capacity_or_default(),
             crate::DEFAULT_STREAM_CAPACITY
         );
-        assert!(
-            crate::DEFAULT_STREAM_CAPACITY > 0,
-            "容量 0 建不出有界通道：常量本身必须是正数，否则这条兜底把 panic 藏起来"
-        );
+        // 常量的正负在编译期就判得出：放进 const 块，容量是 0 就变成一次构建失败，
+        // 而不是一条跑到这里才会红的测试（clippy 的 assertions_on_constants 要的也正是这个）。
+        const {
+            assert!(
+                crate::DEFAULT_STREAM_CAPACITY > 0,
+                "容量 0 建不出有界通道：常量本身必须是正数，否则这条兜底把 panic 藏起来"
+            );
+        }
         let written = TuningConfig {
             stream_capacity: 64,
         };
