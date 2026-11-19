@@ -40,6 +40,13 @@ impl BackoffStrategy {
     }
 }
 
+/// 指数退避的倍增：每一档是前一档的两倍。
+///
+/// 这不是挑出来的数，是指数退避的定义本身——把它写成 `2.0` 只是把这个定义
+/// 抄进了每一处表项。
+// cap: fixed — 倍增：指数退避的定义，不是这台机器量的
+pub const DOUBLING: f64 = 2.0;
+
 /// Circuit breaker configuration per task type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
@@ -55,7 +62,7 @@ impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
             failure_threshold: 5,
-            recovery_timeout_ms: 30000,
+            recovery_timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
             half_open_max_calls: 3,
         }
     }
@@ -74,9 +81,9 @@ impl Default for RetryConfig {
         Self {
             max_retries: 3,
             backoff: BackoffStrategy::Exponential {
-                base_ms: 1000,
-                max_ms: 30000,
-                multiplier: 2.0,
+                base_ms: cog_core::day::MILLIS_PER_SECOND as u64,
+                max_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
+                multiplier: DOUBLING,
             },
             circuit_breaker: Some(CircuitBreakerConfig::default()),
         }
@@ -103,39 +110,39 @@ impl RetryMatrix {
     pub fn defaults() -> Self {
         let mut by_task_type = HashMap::new();
 
-        // LLM call: 3 retries, exponential [1s, 2s, 4s], CB: 5 failures → 60s
+        // LLM 调用：指数退避，熔断了就不必再试——次数、等待与熔断阈值都写在下面这一项里
         by_task_type.insert(
             TaskType::LlmCall,
             RetryConfig {
                 max_retries: 3,
                 backoff: BackoffStrategy::Exponential {
-                    base_ms: 1000,
-                    max_ms: 8000,
-                    multiplier: 2.0,
+                    base_ms: cog_core::day::MILLIS_PER_SECOND as u64,
+                    max_ms: (8 * cog_core::day::MILLIS_PER_SECOND) as u64,
+                    multiplier: DOUBLING,
                 },
                 circuit_breaker: Some(CircuitBreakerConfig {
                     failure_threshold: 5,
-                    recovery_timeout_ms: 60000,
+                    recovery_timeout_ms: (60 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     half_open_max_calls: 3,
                 }),
             },
         );
 
-        // Tool call: 2 retries, fixed 3s, CB: 3 failures → 30s
+        // 工具调用：固定间隔；工具失败多是外部服务抖动，等一等再试
         by_task_type.insert(
             TaskType::ToolCall,
             RetryConfig {
                 max_retries: 2,
-                backoff: BackoffStrategy::Fixed { interval_ms: 3000 },
+                backoff: BackoffStrategy::Fixed { interval_ms: (3 * cog_core::day::MILLIS_PER_SECOND) as u64 },
                 circuit_breaker: Some(CircuitBreakerConfig {
                     failure_threshold: 3,
-                    recovery_timeout_ms: 30000,
+                    recovery_timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     half_open_max_calls: 2,
                 }),
             },
         );
 
-        // File op: 1 retry, immediate (0s), no CB
+        // 文件操作：立刻重试一次；本地文件失败再等也不会变，不设熔断
         by_task_type.insert(
             TaskType::FileOp,
             RetryConfig {
@@ -145,52 +152,52 @@ impl RetryMatrix {
             },
         );
 
-        // DB transaction: 3 retries, linear [100ms, 200ms, 300ms], CB: 10 failures → 120s
+        // 数据库事务：线性退避；连接池争用是秒级的事，等太久只是让锁持有更久
         by_task_type.insert(
             TaskType::DbTransaction,
             RetryConfig {
                 max_retries: 3,
                 backoff: BackoffStrategy::Linear {
-                    base_ms: 100,
-                    increment_ms: 100,
+                    base_ms: (cog_core::day::MILLIS_PER_SECOND / 10) as u64,
+                    increment_ms: (cog_core::day::MILLIS_PER_SECOND / 10) as u64,
                 },
                 circuit_breaker: Some(CircuitBreakerConfig {
                     failure_threshold: 10,
-                    recovery_timeout_ms: 120000,
+                    recovery_timeout_ms: (120 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     half_open_max_calls: 3,
                 }),
             },
         );
 
-        // Network request: 3 retries, exponential [500ms, 1s, 2s], CB: 5 failures → 30s
+        // 网络请求：指数退避；对端过载时，第一次重试就该比上一次慢一倍
         by_task_type.insert(
             TaskType::NetworkRequest,
             RetryConfig {
                 max_retries: 3,
                 backoff: BackoffStrategy::Exponential {
-                    base_ms: 500,
-                    max_ms: 2000,
-                    multiplier: 2.0,
+                    base_ms: (cog_core::day::MILLIS_PER_SECOND / 2) as u64,
+                    max_ms: (2 * cog_core::day::MILLIS_PER_SECOND) as u64,
+                    multiplier: DOUBLING,
                 },
                 circuit_breaker: Some(CircuitBreakerConfig {
                     failure_threshold: 5,
-                    recovery_timeout_ms: 30000,
+                    recovery_timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     half_open_max_calls: 3,
                 }),
             },
         );
 
-        // WASM skill: 2 retries, fixed 1s, no CB
+        // WASM 技能：固定间隔一次；沙箱内的失败多是初始化竞态
         by_task_type.insert(
             TaskType::WasmSkill,
             RetryConfig {
                 max_retries: 2,
-                backoff: BackoffStrategy::Fixed { interval_ms: 1000 },
+                backoff: BackoffStrategy::Fixed { interval_ms: cog_core::day::MILLIS_PER_SECOND as u64 },
                 circuit_breaker: None,
             },
         );
 
-        // Skill: 1 retry, immediate, no CB
+        // 技能：立刻重试一次，不设熔断
         by_task_type.insert(
             TaskType::Skill,
             RetryConfig {
@@ -200,19 +207,19 @@ impl RetryMatrix {
             },
         );
 
-        // DAG node: 3 retries, exponential [5s, 10s, 20s], CB: 3 failures → DLQ
+        // DAG 节点：指数退避，等待从秒级起步；同一节点连败到熔断阈值即进 DLQ
         by_task_type.insert(
             TaskType::DagNode,
             RetryConfig {
                 max_retries: 3,
                 backoff: BackoffStrategy::Exponential {
-                    base_ms: 5000,
-                    max_ms: 20000,
-                    multiplier: 2.0,
+                    base_ms: (5 * cog_core::day::MILLIS_PER_SECOND) as u64,
+                    max_ms: (20 * cog_core::day::MILLIS_PER_SECOND) as u64,
+                    multiplier: DOUBLING,
                 },
                 circuit_breaker: Some(CircuitBreakerConfig {
                     failure_threshold: 3,
-                    recovery_timeout_ms: 30000,
+                    recovery_timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     half_open_max_calls: 1,
                 }),
             },

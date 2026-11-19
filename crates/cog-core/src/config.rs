@@ -1155,10 +1155,17 @@ pub struct HookEngineConfig {
     pub hook_timeout_secs: u64,
 }
 
+/// 去重窗口：一秒。
+///
+/// 窗口本身不是档位——它说的是「同一秒内的重复投递是同一次唤醒」，这是去重的
+/// 定义；把窗口调大就变成「相邻两次合法的触发也只跑一次」。
+// cap: fixed — 一秒：同一秒内的重复投递按同一次唤醒算，这是去重的定义
+pub const HOOK_DEDUP_WINDOW_SECS: u64 = 1;
+
 impl Default for HookEngineConfig {
     fn default() -> Self {
         Self {
-            dedup_window_secs: 1,
+            dedup_window_secs: HOOK_DEDUP_WINDOW_SECS,
             default_rate_limit: RateLimitConfig::default(),
             hook_timeout_secs: (crate::day::SECONDS_PER_MINUTE / 2) as u64,
         }
@@ -1253,6 +1260,13 @@ pub struct SystemConfig {
     pub disabled_plugins: Vec<String>,
 }
 
+/// Anthropic 模型的输出长度：模型卡上的 `max_tokens`。
+///
+/// 不是本仓的偏好——同一条事实在模型名册里也写着（`cog_llm` 的
+/// `default_model_for`），两处各写一个 4096 就是同一件事的两次声明。
+// cap: fixed — 模型卡：Claude 一代模型的 `max_tokens` 是 4096
+pub const ANTHROPIC_OUTPUT_TOKEN_DEFAULT: u32 = 4096;
+
 impl Default for SystemConfig {
     fn default() -> Self {
         Self {
@@ -1277,7 +1291,7 @@ impl Default for SystemConfig {
             observability_event_channel_capacity: 256,
             websocket_event_cache_capacity: 1000,
             skill_hot_reload_interval_secs: SKILL_HOT_RELOAD_INTERVAL_SECS,
-            anthropic_default_max_tokens: 4096,
+            anthropic_default_max_tokens: ANTHROPIC_OUTPUT_TOKEN_DEFAULT,
             strict_persistence: true,
             enabled_plugins: None,
             disabled_plugins: Vec::new(),

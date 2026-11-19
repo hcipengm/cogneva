@@ -33,8 +33,8 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_retries: 3,
-            base_delay_ms: 500,
-            max_delay_ms: 8000,
+            base_delay_ms: (cog_core::day::MILLIS_PER_SECOND / 2) as u64,
+            max_delay_ms: (8 * cog_core::day::MILLIS_PER_SECOND) as u64,
             strategy: BackoffStrategy::Exponential,
             jitter: true,
         }

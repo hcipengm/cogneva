@@ -117,7 +117,7 @@ pub fn default_model_for(provider: crate::Provider) -> crate::Model {
             // 少一段就是 `https://api.anthropic.com/messages`——那个地址不存在。
             base_url: "https://api.anthropic.com/v1".into(),
             context_window: 200_000,
-            max_tokens: 4096,
+            max_tokens: cog_core::config::ANTHROPIC_OUTPUT_TOKEN_DEFAULT,
             supports_tools: true,
             supports_streaming: true,
             supports_vision: true,

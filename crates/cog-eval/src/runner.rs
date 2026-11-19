@@ -23,10 +23,20 @@ pub struct RunnerConfig {
     pub judge_enabled: bool,
 }
 
+/// 同时跑几例：这台机器能同时跑几个线程就几例。
+///
+/// 评测例是 CPU 密集的（跑 harness、算指标），并发上限就是核数——写成一个固定
+/// 数字，换一台机器就变成另一个数的猜测。
+fn default_max_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            max_concurrency: 4,
+            max_concurrency: default_max_concurrency(),
             retry_count: 1,
             judge_enabled: false,
         }

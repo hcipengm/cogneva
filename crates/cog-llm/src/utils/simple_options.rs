@@ -42,6 +42,13 @@ pub fn clamp_reasoning(level: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
     }
 }
 
+/// 思考预算的一档：模型扩展思考能分配的最小单位。
+///
+/// 不是本仓挑的数——供应商的 `budget_tokens` 从 1024 起算，其余各档都是它的
+/// 整数倍。写成 1024 的四份拷贝会让「最小一档」这个说法在四处慢慢走散。
+// cap: fixed — 供应商扩展思考 `budget_tokens` 的最小值：1024
+pub const THINKING_BUDGET_UNIT: u32 = 1024;
+
 /// Token budgets for each thinking level.
 #[derive(Debug, Clone)]
 pub struct ThinkingBudgets {
@@ -54,10 +61,10 @@ pub struct ThinkingBudgets {
 impl Default for ThinkingBudgets {
     fn default() -> Self {
         Self {
-            minimal: 1024,
-            low: 2048,
-            medium: 8192,
-            high: 16384,
+            minimal: THINKING_BUDGET_UNIT,
+            low: THINKING_BUDGET_UNIT * 2,
+            medium: THINKING_BUDGET_UNIT * 8,
+            high: THINKING_BUDGET_UNIT * 16,
         }
     }
 }

@@ -861,6 +861,16 @@ pub struct MainlineDeployerConfig {
 // cap: fixed — node exporter 约定端口 9100
 const REGISTRY_WALKER_PORT: u16 = 9100;
 
+/// 构建 Job 起几个 cargo 作业：这台构建机能同时跑几个线程就几个。
+///
+/// 构建是 CPU 密集的，作业数超过核数只会在同一台机器上互相抢；写死成 2 是
+/// 在替这台没量过的机器拍一个数。
+fn default_cargo_build_jobs() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
 impl Default for MainlineDeployerConfig {
     fn default() -> Self {
         Self {
@@ -877,7 +887,7 @@ impl Default for MainlineDeployerConfig {
             kubectl_bin: "kubectl".into(),
             kubectl_host_path: String::new(),
             state_dir: cog_core::paths::app_path_str("sandbox/mainline"),
-            cargo_build_jobs: 2,
+            cargo_build_jobs: default_cargo_build_jobs(),
             soak_secs: (2 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             restart_threshold: 1,
             failure_cooldown_secs: cog_core::day::SECONDS_PER_HOUR as u64,

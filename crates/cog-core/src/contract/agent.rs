@@ -145,7 +145,7 @@ impl Default for RuntimeConfig {
             // 缓存有效期与热加载节拍同源：热加载一扫描就会让缓存失效，缓存
             // 立在两个节拍之间只是兜住「那一拍没扫到」的窗口。
             skill_cache_ttl_secs: crate::config::SKILL_HOT_RELOAD_INTERVAL_SECS,
-            think_stall_timeout_secs: 240,
+            think_stall_timeout_secs: (4 * crate::day::SECONDS_PER_MINUTE) as u64,
             // Measured against the recoveries that kept a run alive: the
             // longest one that produced a deliverable spent 326s, and the one
             // that hung outright ran 600s. 420s clears every recovery that has
