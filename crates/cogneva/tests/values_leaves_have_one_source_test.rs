@@ -693,6 +693,33 @@ impl Reads {
     }
 }
 
+/// 如果 `at` 处开始的是一个模板注释 `{{…/* … */…}}`，返回它之后的偏移。
+///
+/// `{{` 与 `/*` 之间可以有空白与破折号（`{{- /*`、`{{/*` 两种写法都在仓里），
+/// `*/` 与 `}}` 之间同理。只认紧挨着的 `{{/*` 会把带破折号的那一大类漏掉，而那一类
+/// 恰好就是本仓写得最多的写法。
+fn template_comment_end(chars: &[char], at: usize) -> Option<usize> {
+    let mut open = at + 2;
+    while open < chars.len() && (chars[open] == '-' || chars[open].is_whitespace()) {
+        open += 1;
+    }
+    if open + 1 >= chars.len() || chars[open] != '/' || chars[open + 1] != '*' {
+        return None;
+    }
+    let mut close = open + 2;
+    while close + 1 < chars.len() && !(chars[close] == '*' && chars[close + 1] == '/') {
+        close += 1;
+    }
+    let mut after = (close + 2).min(chars.len());
+    while after < chars.len() && (chars[after] == '-' || chars[after].is_whitespace()) {
+        after += 1;
+    }
+    if after + 1 < chars.len() && chars[after] == '}' && chars[after + 1] == '}' {
+        after += 2;
+    }
+    Some(after)
+}
+
 /// 一个模板文件里的所有动作 `{{ … }}`；模板注释 `{{/* … */}}` 不算动作。
 fn actions(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
@@ -704,14 +731,10 @@ fn actions(text: &str) -> Vec<String> {
             continue;
         }
         // 模板注释：跳到 `*/}}`，里面的内容不是模板，注释里点名的叶子不算被读。
-        if i + 3 < chars.len() && chars[i + 2] == '/' && chars[i + 3] == '*' {
-            let mut j = i + 4;
-            while j + 3 < chars.len()
-                && !(chars[j] == '*' && chars[j + 1] == '/' && chars[j + 2] == '}' && chars[j + 3] == '}')
-            {
-                j += 1;
-            }
-            i = (j + 4).min(chars.len());
+        // 写法有两种：`{{/* … */}}` 与带破折号的 `{{- /* … */ -}}`，后者在本仓
+        // 模板里更常见——只认前一种，注释里的路径就会被当成读者。
+        if let Some(after) = template_comment_end(&chars, i) {
+            i = after;
             continue;
         }
         let mut j = i + 2;
@@ -934,5 +957,196 @@ fn every_leaf_of_the_values_is_read_by_a_template() {
         dead.is_empty(),
         "这些 values 叶子没有任何模板读它：改它渲染出来的清单一个字都不变，\
          它只是一句没人执行的部署说明（删掉，或者让它真的决定点什么）：\n{dead:#?}"
+    );
+}
+
+/// 模板里「不成文的那部分」：去掉 Helm 注释与整行的 YAML 注释。
+///
+/// 注释里出现的字面量不是部署事实——`namespace="cogneva"` 那种写法在注释里解释了
+/// 为什么必须渲染，它本身不该被当成本地声明了一次。
+fn comment_free(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' && chars.get(i + 1) == Some(&'{') {
+            if let Some(after) = template_comment_end(&chars, i) {
+                i = after;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out.lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 引用形的字符串叶子：值里带 `:` 或 `/` 的那些——地址、镜像、路径。
+///
+/// 为什么只比这一族：`main`、`info` 这种裸词在两个不相干的地方各写一遍是巧合，
+/// 把它判成「同一件事写了两遍」只会逼人加一张豁免名单；而一个带冒号或斜杠的串
+/// 是某个具体对象的名字，两处相等按构造就是同一个对象被声明了两次。
+fn reference_leaves(
+    value: &serde_yaml::Value,
+    path: &mut Vec<String>,
+    out: &mut Vec<(String, String)>,
+) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for (key, child) in map {
+                if let Some(key) = key.as_str() {
+                    path.push(key.to_string());
+                    reference_leaves(child, path, out);
+                    path.pop();
+                }
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, child) in items.iter().enumerate() {
+                path.push(index.to_string());
+                reference_leaves(child, path, out);
+                path.pop();
+            }
+        }
+        serde_yaml::Value::String(text)
+            if !text.is_empty() && text.contains([':', '/']) && !path.is_empty() =>
+        {
+            out.push((path.join("."), text.clone()));
+        }
+        _ => {}
+    }
+}
+
+/// 一行里的所有引号字面量（`"…"` 与 `'…'`）。
+fn quoted_literals(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '"' && ch != '\'' {
+            continue;
+        }
+        let quote = ch;
+        let mut literal = String::new();
+        for next in chars.by_ref() {
+            if next == quote {
+                break;
+            }
+            literal.push(next);
+        }
+        out.push(literal);
+    }
+    out
+}
+
+/// 一行模板里，哪些引用形叶子被写成了字面量。
+fn spelled_references(
+    line: &str,
+    leaves: &[(String, String)],
+    reads: &Reads,
+    site: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for literal in quoted_literals(line) {
+        for (path, value) in leaves {
+            if &literal != value || !reads.covers(path) {
+                continue;
+            }
+            if line.contains(&format!(".Values.{path}")) {
+                continue;
+            }
+            out.push(format!(
+                "{site} 把 {value} 写成了字面量（.Values.{path} 已经在 values 里声明着它）"
+            ));
+        }
+    }
+    out
+}
+
+/// chart 不许把一个引用形的字符串叶子在模板里再写一遍。
+///
+/// 这一族与布局路径那一条是同一件事的两种写法：布局路径判的是产品自己卷里的位置
+/// （可能不带引号地写在 `workingDir:` 后面），这里判的是带引号的地址、镜像与路径
+/// ——`image: "registry:5000/…"` 这类。同一个引用写两处，改一处另一处不动，而两边
+/// 各自看起来都像唯一的出处。
+///
+/// 只判有读者的叶子：没人读的叶子归「每一格都要有人读」那一条，这里不重复报。
+#[test]
+fn the_chart_does_not_spell_a_reference_a_leaf_declares() {
+    let values: serde_yaml::Value = serde_yaml::from_str(&read_repo(VALUES))
+        .unwrap_or_else(|e| panic!("{VALUES} 不是合法 YAML：{e}"));
+    let mut leaves = Vec::new();
+    reference_leaves(&values, &mut Vec::new(), &mut leaves);
+    assert!(
+        !leaves.is_empty(),
+        "{VALUES} 里一个引用形的字符串叶子都没读到：下面那条判据会在空集上通过"
+    );
+    let reads = consumed_values();
+
+    let dir = repo_root().join(TEMPLATES);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a template directory entry").path())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("tpl")
+            )
+        })
+        .collect();
+    files.sort();
+
+    let mut copies = Vec::new();
+    for file in &files {
+        let text = comment_free(&read(file));
+        for (n, line) in text.lines().enumerate() {
+            copies.extend(spelled_references(
+                line,
+                &leaves,
+                &reads,
+                &format!("{}:{}", file.display(), n + 1),
+            ));
+        }
+    }
+    copies.sort();
+    copies.dedup();
+    assert!(
+        copies.is_empty(),
+        "同一个引用在 values 与模板里各声明了一次：\n{}",
+        copies.join("\n")
+    );
+}
+
+/// 这条判据不是空转：同一条引用写两遍会被点名，指着叶子取的那一行不会。
+#[test]
+fn the_reference_gate_names_a_spelled_copy_and_lets_the_reference_through() {
+    let mut reads = Reads::default();
+    reads.exact.insert("backends.redis.addr".to_string());
+    let leaves = vec![(
+        "backends.redis.addr".to_string(),
+        "redis://redis:6379".to_string(),
+    )];
+    let copies = spelled_references(
+        "              value: \"redis://redis:6379\"",
+        &leaves,
+        &reads,
+        "probe.yaml:9",
+    );
+    assert_eq!(
+        copies.len(),
+        1,
+        "同一条引用在模板里写成字面量没有被点名：{copies:#?}"
+    );
+    let taken = spelled_references(
+        "              value: {{ .Values.backends.redis.addr | quote }}",
+        &leaves,
+        &reads,
+        "probe.yaml:9",
+    );
+    assert!(
+        taken.is_empty(),
+        "指着叶子取的那一行被当成了复述：{taken:#?}"
     );
 }
