@@ -116,12 +116,12 @@ impl Default for SignalWatcherConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_secs: 300,
+            poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
             failure_recurrence_threshold: 3,
-            failure_window_secs: 3600,
+            failure_window_secs: cog_core::day::SECONDS_PER_HOUR,
             backlog_threshold: 100,
-            report_cooldown_secs: 86_400,
-            self_audit_interval_secs: 7 * 86_400,
+            report_cooldown_secs: cog_core::day::SECONDS_PER_DAY,
+            self_audit_interval_secs: cog_core::day::SECONDS_PER_WEEK,
             alert_channel_enabled: true,
             alert_channel_max_per_tick: 5,
             alert_label_max_chars: cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
