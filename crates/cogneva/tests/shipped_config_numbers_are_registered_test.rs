@@ -9,10 +9,12 @@
 //!
 //! 这个文件判的正是这一半：**文档里的数不许等于应用自己对它的答案**。
 //!
-//! 判据从应用自己取，不从名单取。把那个叶子从文档里删掉，按 `AppConfig` 解析一遍再
-//! 序列化回来，读同一个路径——值不变，说明这个叶子什么都没决定。用解析往返而不是
-//! `Default::default()`：`#[serde(default = "…")]` 与 `impl Default` 会给出两个不同的数，
-//! 猜错哪一个都会把「这个叶子有用」判成「没用」。
+//! 判据从读这一节的那个类型取，不从名单取。把那个叶子从文档里删掉，按该节的读取器
+//! 类型解析一遍再序列化回来，读同一个路径——值不变，说明这个叶子什么都没决定。用解析
+//! 往返而不是 `Default::default()`：`#[serde(default = "…")]` 与 `impl Default` 会给出
+//! 两个不同的数，猜错哪一个都会把「这个叶子有用」判成「没用」。读这一节的是哪个类型，
+//! 只有 `common::config_surface::readers` 说了算：那道表与 `config_section_reader_contract_test`
+//! 共用，抄第二份就会有两份对同一节给出不同答案、而两份都各自绿。
 //!
 //! 不判什么，说清楚：
 //! - **既非默认值、又没有约定**的数（「无主」）这一轮不判。它的判据要有「同处约定声明」
@@ -21,26 +23,24 @@
 //!   会让人以为删掉抄件就干净了。
 //! - 删一个叶子会不会改变行为：不会。上面那个往返就是这个断言的机器版本；删掉的叶子
 //!   全部是「删了读到同一个数」的那一类。
+//! - **返回里没有这个叶子**的（动态键、`Value` 块、被 `skip_serializing_if` 省掉的）不判
+//!   抄件：没有默认值可比。它们各自有门——「文档写的键有字段接着」是
+//!   `config_section_reader_contract_test`，「类型能读的键有文档写出来」是
+//!   `every_config_knob_is_named_by_a_delivered_document_test`。这里只把它们数出来、
+//!   按节点名，免得「本门没看这里」被读成「这里看过、没问题」。
+//! - 没有一个读取器的节不判，同样数出来、点名。
 //!
-//! 抄件删掉之后，「这个旋钮没有文档点名」那一半由
-//! `every_config_knob_is_named_by_a_delivered_document_test` 接手：文档自己的 `env`
-//! 表点到它的（27 个）算点名，其余 38 个在那边登记为什么只能由代码给值。两道门咬
-//! 在一起才不互相拆台——只留这一道，删掉抄件就等于让旋钮从交付面消失；只留那一道，
-//! 让文档变绿的唯一办法就是把默认值再抄一遍。
-//!
-//! 走查本身要看得见东西：把整份文档原样解析往返一遍，每个被点名的数值叶子都必须在
-//! 往返结果里以同一个数出现。读不到数说明这个键应用根本不认，走查看到的「数」是一份
-//! 应用看不见的文本；数对不上说明走查的读法与应用对同一个键的理解已经分叉。
+//! 走查本身要看得见东西：每节的读取器必须能把这节的文档读进来（`read_back` 不报错），
+//! 否则这一节里的叶子全部不可判而判据仍然全绿——那不是干净，是失明。
 
 use crate::common;
 
+use common::config_surface::{readers, Reader};
 use common::routes::read_repo;
 
 use serde_json::Value;
 
 use std::collections::BTreeMap;
-
-use cogneva::config_loader::AppConfig;
 
 /// 交付的配置文档：本判据判的那一层。
 const CHART_DOC: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -79,10 +79,6 @@ fn path_text(steps: &[Step]) -> String {
     out
 }
 
-fn is_number(value: &Value) -> bool {
-    value.is_number()
-}
-
 /// 文档里的数值叶子：跳过 `_comment*` 键（它们是散文，不是配置）。
 fn numeric_leaves(doc: &Value) -> Vec<(String, Vec<Step>, Value)> {
     fn walk(value: &Value, at: &mut Vec<Step>, out: &mut Vec<(String, Vec<Step>, Value)>) {
@@ -93,7 +89,7 @@ fn numeric_leaves(doc: &Value) -> Vec<(String, Vec<Step>, Value)> {
                         continue;
                     }
                     at.push(Step::Key(key.clone()));
-                    if is_number(child) {
+                    if child.is_number() {
                         out.push((path_text(at), at.clone(), child.clone()));
                     } else {
                         walk(child, at, out);
@@ -104,7 +100,7 @@ fn numeric_leaves(doc: &Value) -> Vec<(String, Vec<Step>, Value)> {
             Value::Array(items) => {
                 for (index, child) in items.iter().enumerate() {
                     at.push(Step::Index(index));
-                    if is_number(child) {
+                    if child.is_number() {
                         out.push((path_text(at), at.clone(), child.clone()));
                     } else {
                         walk(child, at, out);
@@ -166,19 +162,54 @@ fn remove_at(doc: &mut Value, steps: &[Step]) -> bool {
     }
 }
 
-/// 去掉这个叶子之后，应用自己给同一个字段的答案。
+/// 读这个叶子所在那一节的读取器，以及这条路径上有多少步属于那一节的起点。
 ///
-/// `None` 有四种来源，都读作「这个叶子不是抄件」，但原因要分得开：数组元素（不是一个
-/// 可以删的声明）、删不掉（路径与文档对不上）、删掉之后文档解析不了（这个字段是必填的，
-/// 文档必须写）、往返里没有这个字段（应用不认这个键）。
-fn the_apps_answer_without(doc: &Value, steps: &[Step]) -> Option<Value> {
+/// 一个节的读取器可能在节里再嵌一个（`self_evolution.artifact_evolution` 是另一
+/// 个 crate 按 JSON 指针读的），所以先看第一段是不是某一节，再看第二段是不是它的
+/// 嵌套读取器。
+fn reader_for<'r>(readers: &'r [Reader], steps: &[Step]) -> Option<(&'r Reader, usize)> {
+    let Step::Key(section) = steps.first()? else {
+        return None;
+    };
+    let reader = readers.iter().find(|reader| reader.section == section)?;
+    if let Some(Step::Key(child)) = steps.get(1) {
+        if let Some(nested) = reader.nested.iter().find(|nested| nested.section == child) {
+            return Some((nested, 2));
+        }
+    }
+    Some((reader, 1))
+}
+
+/// 删掉这个叶子再问读这一节的类型：它给同一个路径什么答案。
+enum Answer {
+    /// 往返里有这个路径：值就是类型自己的默认值，可以和文档比。
+    Gives(Value),
+    /// 往返里没有这个路径：动态键、`Value` 块、被 `skip_serializing_if` 省掉的。
+    /// 没有默认值可比。
+    Absent,
+    /// 不是一个可以删的声明：数组元素，或路径与文档对不上。
+    NotADeclaration,
+    /// 删掉之后这一节读不进类型了：这个叶子是那个块里必须有的——单键枚举的一支
+    /// （`condition: {greater_than: 0.9}`）、或类型要求的一块。删它不是「让默认值
+    /// 生效」，是把配置删坏，所以它不在本判据里。
+    LoadBearing,
+}
+
+fn the_answer_without(doc: &Value, steps: &[Step], reader: &Reader, base: usize) -> Answer {
     let mut without = doc.clone();
     if !remove_at(&mut without, steps) {
-        return None;
+        return Answer::NotADeclaration;
     }
-    let parsed: AppConfig = serde_json::from_value(without).ok()?;
-    let round = serde_json::to_value(&parsed).ok()?;
-    value_at(&round, steps).cloned()
+    let Some(section) = value_at(&without, &steps[..base]) else {
+        return Answer::NotADeclaration;
+    };
+    let Ok(round) = reader.read_back(section) else {
+        return Answer::LoadBearing;
+    };
+    match value_at(&round, &steps[base..]) {
+        Some(value) => Answer::Gives(value.clone()),
+        None => Answer::Absent,
+    }
 }
 
 /// 两个 JSON 数说的是不是同一个数（`1` 与 `1.0` 在 JSON 里不同形，在配置里同值）。
@@ -196,13 +227,9 @@ fn shipped_doc() -> Value {
 
 /// 走查看到的那份文档，就是应用读到的那份。
 ///
-/// `AppConfig` 只认十四个顶层节——`agent_loop`、`memory`、`github_integration`、
-/// `boundary` 这些节由各自的插件用各自的配置类型读，`AppConfig` 往返之后整个节都
-/// 不在。这些节里的数本门读不到它们的默认值，**不判**，但必须数出来、点名：不判
-/// 的量与判过的量在读数面上分得开，才不会把「门没看这里」读成「这里看过、没问题」。
-///
-/// 「节不在往返里」与「节在、字段不在」要分开：前者是这个类型不管这一节，后者是
-/// 字段被 `skip_serializing_if` 省掉或改了名——同一个键，走查与应用的理解已经分叉。
+/// 两件事：每节的读取器必须能把这一节的文档读进来；读不进来的节、没有读取器的节、
+/// 返回里没有这个叶子的路径，都必须数出来、点名——不判的量与判过的量在读数面上分得
+/// 开，才不会把「门没看这里」读成「这里看过、没问题」。
 #[test]
 fn the_walk_reads_the_document_the_app_reads() {
     let doc = shipped_doc();
@@ -212,66 +239,78 @@ fn the_walk_reads_the_document_the_app_reads() {
         "数值叶子一个都没走读到：走查读法坏了，下面那条判据会在空集上通过"
     );
 
-    let parsed: AppConfig = serde_json::from_value(doc.clone()).unwrap_or_else(|e| {
-        panic!("{CHART_DOC} 按 AppConfig 解析不了：{e}——判据读不懂它要判的东西")
-    });
-    let round = serde_json::to_value(&parsed).expect("AppConfig 能序列化回 JSON");
-
-    let mut broken = Vec::new();
-    let mut unowned: BTreeMap<String, usize> = BTreeMap::new();
-    let mut owned = 0;
-    for (path, steps, shipped) in &leaves {
-        match value_at(&round, steps) {
-            Some(theirs) if same_number(theirs, shipped) => owned += 1,
-            Some(theirs) => broken.push(format!(
-                "{path}: 文档写 {shipped}，应用解析往返之后是 {theirs}——同一个键，两边理解已经分叉"
-            )),
-            None => {
-                let section = match &steps[0] {
-                    Step::Key(key) => key.clone(),
-                    Step::Index(_) => "<顶层数组>".to_string(),
-                };
-                // 「这一块不归这个类型」与「这一块归、字段却被省掉」要分开：前者是
-                // 另一个 crate 按 JSON 指针读的块（`self_evolution.artifact_evolution`
-                // 就是），后者是同一个键两边理解分叉。判据是叶子**父亲**在不在往返里。
-                let parents = &steps[..steps.len() - 1];
-                if parents.is_empty() || value_at(&round, parents).is_some() {
-                    broken.push(format!(
-                        "{path}: 这一块在往返里有，这个字段却没有——被 `skip_serializing_if` \
-                         省掉或改了名，走查看到的键应用不按这个名字读"
-                    ));
-                } else {
-                    *unowned.entry(section).or_default() += 1;
-                }
+    let readers = readers();
+    // 先问一件不对叶子下手的事：这份文档的这一节，读它的类型读得进来吗。读不进来
+    // 时下面每个叶子都会落进「删了就读不进来」那一堆，而那一堆**看起来**像是叶子
+    // 都是必需项——真正的缺陷（文档与读取器已经分叉）会藏在里面。
+    let mut unreadable = Vec::new();
+    for reader in &readers {
+        if reader.section == "_comment" {
+            continue; // 文档头部那句散文，不是一节
+        }
+        if let Some(section) = doc.get(reader.section) {
+            if let Err(why) = reader.read_back(section) {
+                unreadable.push(format!(
+                    "{}: 读它的类型 {} 读不进来：{why}",
+                    reader.section, reader.type_name
+                ));
             }
         }
     }
     assert!(
-        broken.is_empty(),
-        "走查与应用对这份文档的理解不一致：\n{}",
-        broken.join("\n")
-    );
-    assert!(
-        owned >= 1,
-        "一个叶子都没和应用的往返对上：这条判据在空集上通过了"
+        unreadable.is_empty(),
+        "交付文档里有整节读不进它的读取器，走查没法判这些节里的数：\n{}",
+        unreadable.join("\n")
     );
 
-    let unowned_total: usize = unowned.values().sum();
-    let named: Vec<String> = unowned.iter().map(|(s, n)| format!("{s}({n})")).collect();
+    let mut unowned: BTreeMap<String, usize> = BTreeMap::new();
+    let mut typed = 0;
+    let mut absent: BTreeMap<String, usize> = BTreeMap::new();
+    let mut load_bearing: BTreeMap<String, usize> = BTreeMap::new();
+    let mut elements = 0;
+    for (_, steps, _) in &leaves {
+        let section_name = match &steps[0] {
+            Step::Key(key) => key.clone(),
+            Step::Index(_) => "<顶层数组>".to_string(),
+        };
+        let Some((reader, base)) = reader_for(&readers, steps) else {
+            *unowned.entry(section_name).or_default() += 1;
+            continue;
+        };
+        match the_answer_without(&doc, steps, reader, base) {
+            Answer::Gives(_) => typed += 1,
+            Answer::Absent => *absent.entry(section_name).or_default() += 1,
+            Answer::LoadBearing => *load_bearing.entry(section_name).or_default() += 1,
+            Answer::NotADeclaration => elements += 1,
+        }
+    }
+    assert!(
+        typed >= 1,
+        "一个叶子都没和读取器的往返对上：这条判据在空集上通过了"
+    );
+
+    let total = |m: &BTreeMap<String, usize>| -> usize { m.values().sum() };
+    let named = |m: &BTreeMap<String, usize>| -> String {
+        m.iter()
+            .map(|(s, n)| format!("{s}({n})"))
+            .collect::<Vec<_>>()
+            .join("、")
+    };
     println!(
-        "{}: 数值叶子 {} 个（数组里 {} 个）；本类型认得并逐一比对 {} 个；\
-         其余 {} 个在 {} 个不归本类型的节里，本门不判",
-        CHART_DOC,
+        "{CHART_DOC}: 数值叶子 {} 个；判到类型答案 {} 个；\
+         返回里没有 {} 个（动态键）；删了就读不进来 {} 个（块里必需）；\
+         是数组元素、不是声明 {} 个；没有读取器 {} 个（{} 节）",
         leaves.len(),
-        leaves
-            .iter()
-            .filter(|(_, steps, _)| steps.iter().any(|s| matches!(s, Step::Index(_))))
-            .count(),
-        owned,
-        unowned_total,
+        typed,
+        total(&absent),
+        total(&load_bearing),
+        elements,
+        total(&unowned),
         unowned.len()
     );
-    println!("不归本类型、本门不判的节：{}", named.join("、"));
+    println!("返回里没有的：{}", named(&absent));
+    println!("删了就读不进来的：{}", named(&load_bearing));
+    println!("没有读取器、本门不判的节：{}", named(&unowned));
 }
 
 /// 文档里不许出现一个「删掉它、应用给出的还是同一个数」的叶子。
@@ -279,12 +318,16 @@ fn the_walk_reads_the_document_the_app_reads() {
 fn no_number_restates_the_answer_the_app_already_gives() {
     let doc = shipped_doc();
     let leaves = numeric_leaves(&doc);
+    let readers = readers();
 
     let mut copies = Vec::new();
     let mut judged = 0;
     for (path, steps, shipped) in &leaves {
-        let Some(default) = the_apps_answer_without(&doc, steps) else {
-            continue; // 必填字段、或应用不认这个键：不是抄件，另外两条判据各有归属
+        let Some((reader, base)) = reader_for(&readers, steps) else {
+            continue;
+        };
+        let Answer::Gives(default) = the_answer_without(&doc, steps, reader, base) else {
+            continue; // 数组元素、动态键、块里必需：不是抄件，上面那条判据已把它们数出来
         };
         judged += 1;
         if same_number(&default, shipped) {

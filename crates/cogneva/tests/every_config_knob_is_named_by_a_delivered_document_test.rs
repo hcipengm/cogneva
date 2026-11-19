@@ -67,6 +67,29 @@ const fn code_only(path: &'static str, why: &'static str) -> CodeOnly {
     CodeOnly { path, why }
 }
 
+/// 摄取面的周期与批量：没有环境入口，也没有哪条实测导出过它们（分诊归 D5）。
+/// 代码默认值是这一族今天唯一的声明；样例里那份是同一个数的逐字副本，2026-11-19 删除。
+/// 要改就写配置文件同名键。
+const INGEST_ONLY: &str = "摄取面的周期与批量：没有环境入口，也没有哪条实测导出过它\
+                          （分诊归 D5）。代码默认值是唯一的声明，样例副本 2026-11-19 删除";
+
+/// GitHub 集成面的周期与上限：随部署的仓库规模与落地节奏走。
+const GITHUB_ONLY: &str = "GitHub 集成面的周期与上限：随部署的仓库规模与落地节奏走；\
+                           没有环境入口，代码默认是唯一的声明，样例副本 2026-11-19 删除";
+
+/// Gitee 集成面：与 `GITHUB_ONLY` 同形。
+const GITEE_ONLY: &str = "Gitee 集成面的周期与上限：同 `GITHUB_ONLY`，代码默认是唯一的\
+                          声明，样例副本 2026-11-19 删除";
+
+/// 配置投放判据的两段等待：窗口由「换版时 Pod 被替换」的实际时长定（见该节的
+/// `_comment`，2026-10-22 实测一次滚动 73 秒）。写死秒数会把一次观察钉成常量。
+const DECLARATION_WAIT_ONLY: &str = "两段等待由「换版时 Pod 被替换」的窗口定（见该节\
+                                      `_comment` 的实测）；样例副本 2026-11-19 删除";
+
+/// loki 推送的批与退避：随日志量与导出端走（见该节 `_comment_batching`）。
+const LOKI_BATCH_ONLY: &str = "loki 推送的批与退避：随日志量与导出端走（见\
+                              `_comment_batching`）；代码默认是唯一的声明，样例副本删除";
+
 /// Knobs no delivered document writes.
 ///
 /// An entry is a claim someone looked at. Three kinds are legitimate, and each
@@ -83,6 +106,78 @@ const fn code_only(path: &'static str, why: &'static str) -> CodeOnly {
 /// * the knob names a per-entity default rather than a deployment setting (the
 ///   agent pool's default employee identity, overwritten per employee).
 const CODE_ONLY: &[CodeOnly] = &[
+    code_only("gitee_integration.max_issues_per_scan", GITEE_ONLY),
+    code_only("gitee_integration.poll_interval_secs", GITEE_ONLY),
+    code_only("github_integration.conversation.awaiting_reply_timeout_hours", GITHUB_ONLY),
+    code_only("github_integration.conversation.max_clarification_rounds", GITHUB_ONLY),
+    code_only("github_integration.landing_policy.ci_poll_interval_secs", GITHUB_ONLY),
+    code_only("github_integration.landing_policy.ci_watch_timeout_secs", GITHUB_ONLY),
+    code_only("github_integration.landing_policy.max_land_attempts", GITHUB_ONLY),
+    code_only("github_integration.landing_policy.redrive_cause_window_secs", GITHUB_ONLY),
+    code_only("github_integration.landing_policy.redrive_max_rounds_per_cause", GITHUB_ONLY),
+    code_only("github_integration.max_issues_per_scan", GITHUB_ONLY),
+    code_only("github_integration.poll_interval_secs", GITHUB_ONLY),
+    code_only(
+        "llm_routing.backends[].weight",
+        "每个 backend 的默认权重是 1：样例里每一项 `weight: 1` 都只是把默认值抄了一遍\n         （2026-11-19 删除）。要改某个 backend 的权重就写那一项；不写的那项由类型给 1",
+    ),
+    code_only("memory.ingest.aged_out_redrive_batch", INGEST_ONLY),
+    code_only("memory.ingest.backlog_warn_at", INGEST_ONLY),
+    code_only("memory.ingest.bus_claim_batch", INGEST_ONLY),
+    code_only("memory.ingest.bus_claim_interval_secs", INGEST_ONLY),
+    code_only("memory.ingest.bus_claim_min_idle_ms", INGEST_ONLY),
+    code_only("memory.ingest.extraction_concurrency", INGEST_ONLY),
+    code_only(
+        "memory.ingest.extraction_input_budget_tokens",
+        "摄取抽取的输入预算：随部署的模型上下文与记忆条目长度走；见 `INGEST_ONLY`，样例副本 2026-11-19 删除",
+    ),
+    code_only("memory.ingest.max_retries", INGEST_ONLY),
+    code_only("memory.ingest.pool_check_secs", INGEST_ONLY),
+    code_only("memory.ingest.pull_pause_after_failures", INGEST_ONLY),
+    code_only("memory.ingest.pull_pause_initial_secs", INGEST_ONLY),
+    code_only("memory.ingest.pull_pause_max_secs", INGEST_ONLY),
+    code_only("memory.ingest.pull_resume_observation_secs", INGEST_ONLY),
+    code_only("memory.ingest.reconcile_interval_secs", INGEST_ONLY),
+    code_only("memory.ingest.reconcile_lookback_hours", INGEST_ONLY),
+    code_only("memory.ingest.retry_base_delay_ms", INGEST_ONLY),
+    code_only("observability.config_declaration.hold_secs", DECLARATION_WAIT_ONLY),
+    code_only("observability.config_declaration.settle_secs", DECLARATION_WAIT_ONLY),
+    code_only(
+        "observability.infra_watch.eval_failure_alert_after",
+        "连续几轮求值失败才报：判据是「一条规则坏了多久会被发现」，随求值周期走；\n         样例副本 2026-11-19 删除",
+    ),
+    code_only("observability.loki.flush_interval_sec", LOKI_BATCH_ONLY),
+    code_only("observability.loki.max_batch_size", LOKI_BATCH_ONLY),
+    code_only("observability.loki.max_retries", LOKI_BATCH_ONLY),
+    code_only("observability.loki.timeout_secs", LOKI_BATCH_ONLY),
+    code_only(
+        "observability.trace_collector.buffer_max_bytes",
+        "trace 事件的内存缓冲预算，按部署的内存上限定（见该节 `_comment`）；样例里的数\n         只是默认值的副本",
+    ),
+    code_only(
+        "pge.local_repair_max",
+        "本地修复的每轮上限：随部署的分区规模走；代码默认是唯一的声明，样例副本\n         2026-11-19 删除",
+    ),
+    code_only(
+        "ralph.max_iterations",
+        "Ralph Loop 的迭代上限与停滞窗口由同一条预算决定（见该节 `_comment`）：两条\n         都按次计、不跨执行累计；样例副本 2026-11-19 删除",
+    ),
+    code_only(
+        "ralph.stagnation_window",
+        "同上：停滞窗口与迭代上限是一对，写死一个数会把另一半藏起来",
+    ),
+    code_only(
+        "self_evolution.artifact_evolution.interval_secs",
+        "策略进化的试验节奏：由闭环上一轮的耗时决定（与 `poll_interval_secs` 同形），\n         样例写死一个周期会读成部署的选择",
+    ),
+    code_only(
+        "self_evolution.artifact_evolution.min_trials",
+        "一个候选策略要被判所必需的试验数：统计判据的样本量，随噪声与效应量走；\n         样例副本 2026-11-19 删除",
+    ),
+    code_only(
+        "self_review.max_iterations",
+        "自审的最大轮数：随部署的产出规模走；代码默认是唯一的声明，样例副本\n         2026-11-19 删除",
+    ),
     code_only(
         "agent_loop.agent_id",
         "池子的缺省参数而不是身份：每位员工的名字在它被造出来时由管理器逐位覆盖；\

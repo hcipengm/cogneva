@@ -311,7 +311,6 @@ data:
                 "base_url": "http://cogneva-security-gateway:8081/v1",
                 "model": "via-security-gateway",
                 "api_style": "openai",
-                "weight": 1,
                 "enabled": true
               },
               {
@@ -321,7 +320,6 @@ data:
                 "base_url": "http://cogneva-security-gateway:8081/v1",
                 "model": "via-security-gateway",
                 "api_style": "anthropic",
-                "weight": 1,
                 "enabled": true
               }
             ]
@@ -432,7 +430,7 @@ data:
           "raw_logger": {
             "_comment": "这里写的已是部署的生效值，不再由 cogneva-config 的同名 env 覆盖：同一个设置在两个地方各写一份，读配置文件的人就推不出 runtime 用的是哪份，而 base_dir 还兼着 trace 存储的根（<base_dir>/traces），改错了不报错，只把 trace 写到另一个目录去。env 映射仍留在本文件的 env 段，要按环境改动时走那里。",
             "_comment_format": "proto：记录按长度分隔的 protobuf 落地（<stream>/<YYYY-MM-DD>.proto.bin），比 jsonl 省去字段名开销，也是分层迁移压缩的输入。读取侧同时认 jsonl 与 proto，所以存量 .jsonl 文件不用搬。",
-            "_comment_flush_interval_secs": "落盘由两个条件触发：缓冲满 max_buffer_size 条，或距上次落盘满 flush_interval_secs 秒。低流量 stream 可以长时间够不到条数阈值，那期间写下的记录全在进程内存里，进程一挂即失——所以时间上界不能省。置 0 只留条数阈值。",
+            "_comment_flush_interval_secs": "落盘由两个条件触发：缓冲满 max_buffer_size 条，或距上次落盘满 flush_interval_secs 秒。低流量 stream 可以长时间够不到条数阈值，那期间写下的记录全在进程内存里，进程一挂即失——所以时间上界不能省。置 0 只留条数阈值。后者本文件不声明，取应用的默认值：它不是这个部署的决定。",
             "enabled": true,
             "base_dir": "/var/lib/cogneva-data/raw-logs",
             "max_buffer_size": 1000,
@@ -454,27 +452,11 @@ data:
               "_comment_pull_gate": "The pull gate has two inputs sharing one verdict: the security gateway's published pool snapshot (cross-process, known before an attempt is spent) and this process's own consecutive environment failures (a local fact that still holds when Redis has no key or the gateway restarted). Either one pauses pulling and the wait is the larger of the two. Pausing means not pulling, so messages keep their place in the event plane without spending a delivery attempt.",
               "_comment_reconcile": "Startup reconcile only covers the window between a crash and the restart, so it also re-runs on an interval: an outage longer than the lookback would otherwise push early-archived, never-extracted raws out of the window for good. 0 keeps it startup-only. Inside the window every unextracted raw is re-driven each round; past it they are repaid at aged_out_redrive_batch per round, so an outage longer than the lookback leaves debt that is paid back rather than debt that is abandoned. When the debt is deeper than that batch, a quarter of it goes to the oldest entries: taking only from the newest end lets each round's arrivals push the boundary along, so the oldest debt would never come up and that part of the backlog reading would stop moving. A raw that failed on its own content is neither: it has a dead-letter record, and re-driving it would only reproduce that diagnosis.",
               "_comment_bus": "Bus-mode consumer knobs (active when multi_backend_consumer.events_on_bus=true). bus_claim_min_idle_ms must exceed the worst-case single-event processing time so a live worker's job is never claimed away; JetStream redelivery is governed by ack_wait, the claim sweeper covers Redis-class backends.",
-              "max_retries": 3,
-              "retry_base_delay_ms": 1000,
               "enable_dlq": true,
               "dlq_namespace": "dlq",
-              "extraction_concurrency": 4,
               "_comment_extraction_budget": "The extractor sends one conversation per call, and its length used to be bounded upstream: the raw layer stored the projection the window had already trimmed, so a transcript could not outgrow one window and no bound was needed here. Raw now keeps the whole history of a run, so this is that bound made explicit -- same estimate as the context window (2 per CJK character, otherwise 4 per word), the two ends of the conversation are sent and the middle is elided with a marker naming how many turns and how much of it is missing. 0 sends the whole transcript, which is what a payload below one window costs today.",
-              "extraction_input_budget_tokens": 64000,
               "startup_reconcile": true,
-              "reconcile_lookback_hours": 24,
-              "aged_out_redrive_batch": 32,
-              "reconcile_interval_secs": 600,
-              "pull_pause_after_failures": 3,
-              "pull_pause_initial_secs": 60,
-              "pull_pause_max_secs": 1800,
-              "pool_check_secs": 30,
-              "pull_resume_observation_secs": 300,
-              "backlog_warn_at": 64,
               "bus_group": "memory-ingestor",
-              "bus_claim_interval_secs": 30,
-              "bus_claim_min_idle_ms": 900000,
-              "bus_claim_batch": 32,
               "_comment_benchmark": "Evaluation-set isolation: a raw matched by either list is refused before it is archived or extracted, so it reaches no memory layer and is never sent to the extractor. Both lists are deployment and dataset facts and are empty by default, which means that rule is not in effect -- the raw tag rule is the one that is always live (a producer marks a raw with benchmark=true and it is refused regardless of these lists). benchmark_namespaces names the eval-dedicated bucket and covers a writer that puts its data there without a tag; benchmark_canary_markers carries the dataset's own marker strings and is the only rule that still recognises content that arrived through an ordinary task path into the default namespace with its tag lost. Refusals are counted on memory_operations_total, one cell per rule, so a deployment that has configured an empty surface can tell it apart from one that has refused nothing.",
               "benchmark_namespaces": [],
               "benchmark_canary_markers": []
@@ -510,7 +492,6 @@ data:
             "_comment_agent_id": "这里不写名字：池子里的每一位员工在被造出来时由管理器起名（登记即发工号），这一段只是给它们同一套参数。写一个名字进来，读配置的人会以为平台上真有那一位，而名册上没有它。",
             "role": "planner",
             "_comment_max_iterations": "这里不写轮数，就是不给智能体设轮数天花板：一轮什么时候结束由模型自己不再要工具来定，与交互面板里那个员工跑的是同一条循环。要设就写 `max_iterations`（生产运行）与/或 `eval_max_iterations`（评测运行），那是一个具体的部署决定，不是平台的缺省。止损不靠轮数：单步停滞超时管「不吭声」，上下文窗口管「装不下」，成本记在使用账上，任务由心跳回收。",
-            "skill_cache_ttl_secs": 30,
             "_comment_web": "网页检索与抓取两个端点：`web_search` / `web_fetch` 只问这两处，评测台的 HLE 列也读同一对（`cogneva eval-table` 的工具面里那两件就是这两个工具）。写在文件里而不是只写在各部署的 env 上：挂这份文件的 Pod 不止主应用与进化 worker——评测台与 mcp 服务也挂，只写 env 的那两处会让它们读到「这个部署没接网页能力」，而能力其实在。地址由 chart 按 values 替换，见 templates/app-config.yaml 的替换表。",
             "web_search_base": "http://searxng:8080",
             "web_fetch_base": "http://crawl4ai:11235"
@@ -520,23 +501,16 @@ data:
               "_comment": "应用侧结构化日志的耐久面。主应用与进化进程的 tracing 事件此前只有 stdout 一张脸，随 Pod 消失（raw stream 存的是 LLM/协议原始报文，不是运行日志）；默认端点指向集群内观测栈。网关那一侧另有自己的 pusher，读的是同一份配置段。",
               "enabled": true,
               "endpoint": "http://loki.monitoring.svc.cluster.local:3100",
-              "_comment_batching": "推送的批与退避：max_batch_size 条或 flush_interval_sec 秒先到者触发一次落盘；timeout_secs 是单次推送的等待上界，max_retries 是推送失败后的重试次数。这三条决定 Loki 短时不可达时进程内存里能压多少日志、以及一次故障要重投多久。",
-              "max_retries": 3,
-              "timeout_secs": 10,
-              "flush_interval_sec": 5,
-              "max_batch_size": 100
+              "_comment_batching": "推送的批与退避：max_batch_size 条或 flush_interval_sec 秒先到者触发一次落盘；timeout_secs 是单次推送的等待上界，max_retries 是推送失败后的重试次数。这三条决定 Loki 短时不可达时进程内存里能压多少日志、以及一次故障要重投多久。"
             },
             "config_declaration": {
-              "_comment": "本进程读到的配置文档，与本 rev 声明的那份是否同一份。规则住在文档里，所以没有任何一条规则能报出文档自己没到；这一判在代码里跑，拿进程启动时读的那份，比对本二进制编译进来的那份。三次读取：settle_secs 之后的第二次是为了把「挂载还没跟上」和「文档确实落后」分开——文件在此期间已经前进，说明进程只是被替换的路上，不是卡住。第二次仍然落后时再等 hold_secs 读第三次：换版的 Pod 在这个窗口里被替换掉、判据随之消失，而卡在旧文档上的进程活得比自己的替换更久——2026-10-22 实测，一次改配置的滚动会为此先写一行 73 秒的告警，而那是「我的替换还没发生」，不是故障。",
-              "settle_secs": 60,
-              "hold_secs": 300
+              "_comment": "本进程读到的配置文档，与本 rev 声明的那份是否同一份。规则住在文档里，所以没有任何一条规则能报出文档自己没到；这一判在代码里跑，拿进程启动时读的那份，比对本二进制编译进来的那份。三次读取：settle_secs 之后的第二次是为了把「挂载还没跟上」和「文档确实落后」分开——文件在此期间已经前进，说明进程只是被替换的路上，不是卡住。第二次仍然落后时再等 hold_secs 读第三次：换版的 Pod 在这个窗口里被替换掉、判据随之消失，而卡在旧文档上的进程活得比自己的替换更久——2026-10-22 实测，一次改配置的滚动会为此先写一行 73 秒的告警，而那是「我的替换还没发生」，不是故障。"
             },
             "infra_watch": {
               "_comment": "基础设施告警→持久化→自发现。规则即部署策略：阈值改这里不用重建镜像。series 消失或条件不再成立会自动 resolve；规则查询失败不会误 resolve。",
               "enabled": true,
               "prometheus_url": "http://cog-observability-prometheus.monitoring:9090",
               "poll_interval_secs": 60,
-              "eval_failure_alert_after": 3,
               "_comment_for_seconds": "每条规则可选 `for_seconds`：条件要一直成立这么久才落行。默认不写＝第一拍就落行。只有当「读数会随着产出者重启而消失」时才需要它——比如走卷的扫描器每 5 分钟重发一次、Prometheus 在最后一次抓取 5 分钟后丢掉目标序列，于是 DaemonSet 一滚，「这些 claim 没有读数」这种形状就自己出现了。窗口取「扫描间隔＋序列失效时间」再加余量。语义照抄 Prometheus 规则文件的 `for`：条件断掉或查询失败都让时钟从零再数；已经在响的行照旧每拍刷新，窗口只管新行。",
               "_comment_mirror_alerts": "Prometheus 自己求值的告警里，哪些该抄进同一张告警表。这里给一对标签键值：带这对标签的 firing 告警每拍被抄成一行，Prometheus 里不再 firing 就 resolve。标在规则上而不是列在这里，是为了让规则和它的投递声明同一次改动落地、改名也丢不掉投递。名字已经在本进程 rules 里的跳过：那条由进程内求值记账，两个写者会为同一件事开两行。不配 = 不抄。另外两个键：`include_unmarked` 打开后连**不带标记**的告警也抄——集群自带的规则库（kube-prometheus 的 KubeJobFailed、CPUThrottlingHigh 一类）不带这个标记，不打开它们就永远进不了账本，账本也就不是全集；打开之前先确认读这张表的任务面排得空，因为每一行都会开一个演进任务。`exclude` 里点名的规则无论带不带标记都不抄，默认是 kube-prometheus 的两个哨兵：Watchdog 按构造常亮、InfoInhibitor 在没有任何 info 级告警时亮，两者进账本都只是在描述「没事」。",
               "mirror_alerts": {
@@ -3955,8 +3929,7 @@ data:
               ]
             },
             "trace_collector": {
-              "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。",
-              "buffer_max_bytes": 16777216
+              "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。"
             },
             "data_volume_watch": {
               "_comment": "应用数据目录的占用量由写它的进程自己量成 gauge cogneva_data_volume_used_bytes 并带上卷名，规则拿它除以 kube-state-metrics 报的 requests.storage。同一份 cogneva.json 挂给多个 Pod，各自挂的卷不是同一张，所以卷名由各部署用自己的 env 指名（COGNEVA_DATA_VOLUME_CLAIM），不写在这里；claim 为空即整个观测关闭。没有应用数据目录、只有挂载表的进程（独立子命令与边车）用 COGNEVA_DATA_VOLUME_MOUNTS 的 claim=路径 列表声明，卷名就在那一行里；这条序列只能由挂载着该卷的进程走查产出——问得出来的那份是另一个量（引用字节），不是盘上占用。",
@@ -3968,7 +3941,6 @@ data:
             "_comment_revise": "revise=true 是完整循环：判完再让模型把整篇改写一次，再判改写。false 是只判不写：一次调用，把要求逐条判成 met／unmet／undetermined，判 met 的那条必须引正文原话，由代码逐字核对，查不到的按没满足算；分数由代码按「满足条数÷判过条数」算出来，不是模型报的。判据按角色分：计划按计划判（「没有回答任务」不算它的缺陷），判词按判词判，答案按答案判。正文原样交回调用方，未满足的条目进判词，由它自己的重试路径重做。改写约占一次评审的 64%，且它评判的标准与生产者已经拿到的标准是同一份。不写这一键的旧配置仍是 true。",
             "_comment_quality_threshold": "quality_threshold 只在 revise=true 的循环里起作用：那一路把模型自己报的分与它比。revise=false 的一次调用表判不看这个数——通过的条件是「没有一条 unmet，也没有一条自称 met 却引不出正文原话」，分数由代码按表算出来，是给人读的读数，不参与判定。",
             "enabled": true,
-            "max_iterations": 2,
             "quality_threshold": 0.8,
             "revise": false,
             "spec": null,
@@ -3977,13 +3949,10 @@ data:
           "pge": {
             "_comment": "PGE actor 输出契约。schemas 按 actor 名（planner/generator/evaluator/moderator/merger）配置 JSON Schema；配置后 schema 会注入 prompt 上下文并对 LLM 原始输出做校验，校验失败仅告警并回退宽松解析，不会中断流水线。默认为空 = 使用内置契约。",
             "_comment_local_repair_max": "局部修复预算：Evaluator 判失败后保持当前 Plan 不变、把 feedback 回传给 Generator 再生成的次数，耗尽才做全局重置（重跑 Planner）。0 = 关闭这条路径，于是每次失败都从新 Plan 重来。写在这里是因为 schemas 一旦配置就很难注意到这条键缺了，而缺了的读法是 0。",
-            "schemas": {},
-            "local_repair_max": 2
+            "schemas": {}
           },
           "ralph": {
-            "_comment": "Ralph Loop 的预算与停滞窗口。这两条界决定一条不收敛的链在什么位置停下：max_iterations 是单次执行的迭代硬上限，stagnation_window 是最近多少轮没有进展即终止。两条都按次计、不跨执行累计。",
-            "max_iterations": 50,
-            "stagnation_window": 5
+            "_comment": "Ralph Loop 的预算与停滞窗口。这两条界决定一条不收敛的链在什么位置停下：max_iterations 是单次执行的迭代硬上限，stagnation_window 是最近多少轮没有进展即终止。两条都按次计、不跨执行累计。"
           },
           "agent": {
             "_comment": "Agent 注册与心跳。registration_ttl_secs 是注册表里一条 agent 记录的存活秒数（cog-storage 写注册时取它），heartbeat_interval_secs 是 worker 向注册表续约的间隔（cog-agent 建 worker 时取它）。两处都在进程启动时读，改一个值要重启工作负载才生效。",
@@ -4056,9 +4025,7 @@ data:
             "artifact_evolution": {
               "_comment": "Autonomous search over the meta-learning policy's tuning parameters (min_samples, margin). Each round replays the recorded decision outcomes under every candidate parameter set and adopts one only when a two-proportion z-test says it beats what the recommendation path is currently using; the winner is saved as a new version and hot-swapped. The input is this process's own recorded results, so it runs without LLM or network access. min_trials is the floor — below it the test cannot be significant and the round writes nothing. Ownership: the policy artifact lives under this process's own data dir, so this loop needs no per-deployment owner switch.",
               "enabled": true,
-              "interval_secs": 3600,
               "policy_name": "meta_learning.mode",
-              "min_trials": 40,
               "min_samples_grid": [
                 2,
                 3,
@@ -4113,8 +4080,6 @@ data:
                 "token": null
               }
             ],
-            "poll_interval_secs": 300,
-            "max_issues_per_scan": 50,
             "webhook": {
               "_comment": "Webhook event entry, used when discovery_mode=events/both. gateway_verified=true: platform signatures are verified at the security gateway (8082); this process only verifies the gateway's internal HMAC (COGNEVA_WEBHOOK_INTERNAL_SECRET) and serves GitHub + Gitee events on the same port. Gitee events arrive at the fixed path /webhooks/gitee.",
               "port": 9091,
@@ -4138,12 +4103,7 @@ data:
               ],
               "_comment_forbidden_paths": "deploy/ is deliberately absent: deploy changes are judged by the deploy admission gate (render freshness, parity, rollback, dry-run on the applied tree), so forbidding the path here would refuse them before that gate could run. The entries that stay have no executable judge.",
               "revert_on_ci_failure": true,
-              "redrive_on_ci_failure": true,
-              "ci_watch_timeout_secs": 1800,
-              "ci_poll_interval_secs": 60,
-              "max_land_attempts": 3,
-              "redrive_max_rounds_per_cause": 1,
-              "redrive_cause_window_secs": 86400
+              "redrive_on_ci_failure": true
             },
             "human_required_labels": [
               "security",
@@ -4157,8 +4117,6 @@ data:
               "open"
             ],
             "conversation": {
-              "max_clarification_rounds": 3,
-              "awaiting_reply_timeout_hours": 72,
               "auto_reply": true,
               "bot_signature": "— Cogneva Bot"
             },
@@ -4172,8 +4130,6 @@ data:
             "_comment": "Gitee integration, equal in status to GitHub: issues are external-intent evolution entries. Platform fields only; triage/conversation/auto-merge policies are inherited from github_integration. api_base defaults to the security gateway passthrough (COGNEVA_GITEE_API_BASE env); token lives only in the gateway.",
             "enabled": true,
             "repo": "hcipengm/cogneva",
-            "base_branch": "main",
-            "poll_interval_secs": 300,
-            "max_issues_per_scan": 50
+            "base_branch": "main"
           }
         }
