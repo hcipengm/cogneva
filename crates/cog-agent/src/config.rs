@@ -174,7 +174,9 @@ impl Default for AgentLoopConfig {
             max_iterations: None,
             eval_max_iterations: None,
             skill_cache_ttl_secs: cog_core::config::SKILL_HOT_RELOAD_INTERVAL_SECS,
-            think_stall_timeout_secs: cog_core::config::THINK_STALL_TIMEOUT_SECS,
+            // 停滞窗的声明在运行时契约里（`cog_core::RuntimeConfig`），那边也
+            // 正是读它的地方；这里读那一份，不再抄一个 240。
+            think_stall_timeout_secs: cog_core::RuntimeConfig::default().think_stall_timeout_secs,
             memory_api_base: None,
             external_archive_threshold_chars: default_external_archive_threshold_chars(),
             web_search_base: None,
