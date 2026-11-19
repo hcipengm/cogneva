@@ -73,13 +73,23 @@ pub struct Budget {
     pub temperature: f32,
 }
 
+// 五百步：四个外壳、三个基准共用这一份；公开榜单的求解步数落在几百的量级，
+// 再高就不是「同一份预算下比外壳」了。
+// cap: bound — 五百步：公开榜单的求解步数在几百的量级，再高就不是同一份预算
+const DEFAULT_MAX_STEPS: usize = 500;
+
+// 采样温度 1.0 是提供方的默认值，不是这台机器调的：评测要比的是外壳，不是
+// 采样策略，所以用发布方给出的那一个。
+// cap: fixed — 提供方的采样默认值（温度 1.0），评测不比采样策略
+const DEFAULT_TEMPERATURE: f32 = 1.0;
+
 impl Default for Budget {
     fn default() -> Self {
         // 逐类比照公开值，不额外加工具、不放松上限。
         Self {
-            max_steps: 500,
+            max_steps: DEFAULT_MAX_STEPS,
             max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
-            temperature: 1.0,
+            temperature: DEFAULT_TEMPERATURE,
         }
     }
 }
@@ -306,6 +316,39 @@ pub trait AgentScaffold: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 求解预算的步数上限与采样温度只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_budget_default_reads_its_names() {
+        let budget = Budget::default();
+        assert_eq!(budget.max_steps, DEFAULT_MAX_STEPS);
+        assert_eq!(budget.temperature, DEFAULT_TEMPERATURE);
+        let body = include_str!("scaffold.rs")
+            .split("impl Default for Budget")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
 
     fn native_tool(name: &str) -> Tool {
         Tool {

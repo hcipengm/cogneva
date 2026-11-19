@@ -58,11 +58,16 @@ impl std::fmt::Debug for HarnessConfig {
     }
 }
 
+// 0.85：回归集留一成半的余量给偶发失败（网络、超时这类与改动无关的抖动）；
+// 再低就分不清「这一版退化了」与「这一次运气不好」。
+// cap: bound — 0.85：留一成半给与改动无关的抖动，再低分不清退化与运气
+const HARNESS_MIN_PASS_RATE: f64 = 0.85;
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             dataset_path: PathBuf::from("eval_datasets/regression.jsonl"),
-            min_pass_rate: 0.85,
+            min_pass_rate: HARNESS_MIN_PASS_RATE,
             per_dimension_thresholds: HashMap::new(),
             per_metric_thresholds: HashMap::new(),
             report_format: ReportFormat::Markdown,
@@ -200,6 +205,37 @@ impl RegressionHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归集的最低通过率只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_harness_default_reads_its_pass_rate() {
+        assert_eq!(HarnessConfig::default().min_pass_rate, HARNESS_MIN_PASS_RATE);
+        let body = include_str!("harness.rs")
+            .split("impl Default for HarnessConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
     use crate::metric::{EvalResult, MetricValue, StepRecord};
 
     fn mk_result(case_id: &str, passed: bool, duration_ms: u64) -> EvalResult {

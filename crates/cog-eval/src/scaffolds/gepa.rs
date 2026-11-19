@@ -41,11 +41,18 @@ pub struct GepaConfig {
     pub generations: usize,
 }
 
+// 每代三个候选、跑两代：一次变异要能看出「更好了」还是「只是换了个说法」，
+// 三个候选才有一点点冗余；两代之后最好的那个已经稳定，第三代只是在同一处采样。
+// cap: bound — 三个候选两代：三个才有一点冗余，两代后最好的那个已经稳定
+const GEPA_POPULATION: usize = 3;
+// cap: bound — 两代：第二代已看不出新的抬升，第三代只是在同一处采样
+const GEPA_GENERATIONS: usize = 2;
+
 impl Default for GepaConfig {
     fn default() -> Self {
         Self {
-            population: 3,
-            generations: 2,
+            population: GEPA_POPULATION,
+            generations: GEPA_GENERATIONS,
         }
     }
 }
@@ -276,6 +283,39 @@ impl AgentScaffold for Gepa {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 种群的规模与代数只有一处声明：默认值读常量，常量上面写着它由什么钉住。
+    ///
+    /// 两面一起钉：运行时默认值等于常量（改常量就改默认值），源码面
+    /// `impl Default` 的字段里不再有数字（下一笔写回裸字面量就红）。
+    #[test]
+    fn the_gepa_default_reads_its_names() {
+        let cfg = GepaConfig::default();
+        assert_eq!(cfg.population, GEPA_POPULATION);
+        assert_eq!(cfg.generations, GEPA_GENERATIONS);
+        let body = include_str!("gepa.rs")
+            .split("impl Default for GepaConfig")
+            .nth(1)
+            .expect("the impl is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let bare: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(field, value)| {
+                    let value = value.trim().trim_end_matches(',');
+                    !field.is_empty()
+                        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && value.starts_with(|c: char| c.is_ascii_digit())
+                        // 哨兵 0 与空串不是旋钮，是「没写」。
+                        && value != "0"
+                })
+            })
+            .map(str::trim)
+            .collect();
+        assert!(bare.is_empty(), "默认值要读具名常量：{bare:?}");
+    }
     use crate::scaffold::{Budget, NoEnv};
     use crate::scaffolds::test_support::{code_tool, system_of, ScriptedLlm, ToolRecorder};
     use std::sync::Arc;
