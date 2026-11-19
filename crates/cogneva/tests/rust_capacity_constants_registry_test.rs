@@ -635,7 +635,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-gateway/src/git_mirror.rs", 14),
     ("crates/cog-gateway/src/git_routing.rs", 3),
     ("crates/cog-gateway/src/github_app.rs", 2),
-    ("crates/cog-gateway/src/governance.rs", 5),
+    ("crates/cog-gateway/src/governance.rs", 3),
     ("crates/cog-gateway/src/ide.rs", 10),
     ("crates/cog-gateway/src/knowledge.rs", 1),
     ("crates/cog-gateway/src/lib.rs", 2),
@@ -752,7 +752,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-storage/src/checkpoint_cap.rs", 4),
     ("crates/cog-storage/src/metrics_retirement.rs", 2),
     ("crates/cog-storage/src/metrics_sample_cap.rs", 2),
-    ("crates/cog-storage/src/observability_event_cap.rs", 4),
+    ("crates/cog-storage/src/observability_event_cap.rs", 3),
     ("crates/cog-storage/src/partition_maintainer.rs", 2),
     ("crates/cog-storage/src/plugin.rs", 3),
     (

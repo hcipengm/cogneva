@@ -147,12 +147,8 @@ pub struct BatchIngestError {
 #[derive(Debug, Deserialize)]
 pub struct SchemaSearchQuery {
     pub query: String,
-    #[serde(default = "default_limit")]
+    /// Required: how many rows the caller wants is the caller's decision.
     pub limit: usize,
-}
-
-fn default_limit() -> usize {
-    10
 }
 
 #[derive(Debug, Serialize)]
@@ -172,12 +168,8 @@ pub struct SchemaResult {
 #[derive(Debug, Deserialize)]
 pub struct SummarySearchRequest {
     pub embedding: Vec<f32>,
-    #[serde(default = "default_top_k")]
+    /// Required: how many neighbours the caller wants is the caller's decision.
     pub top_k: usize,
-}
-
-fn default_top_k() -> usize {
-    5
 }
 
 #[derive(Debug, Serialize)]
@@ -190,7 +182,7 @@ pub struct UnifiedSearchRequest {
     pub query: String,
     #[serde(default)]
     pub embedding: Vec<f32>,
-    #[serde(default = "default_top_k")]
+    /// Required: how many neighbours the caller wants is the caller's decision.
     pub top_k: usize,
 }
 

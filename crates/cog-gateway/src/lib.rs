@@ -3627,7 +3627,8 @@ struct SnapshotsListQuery {
 }
 
 fn default_snapshot_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 async fn snapshots_list_handler(
@@ -3673,7 +3674,8 @@ struct TracesListQuery {
 }
 
 fn default_trace_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 async fn traces_list_handler(

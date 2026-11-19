@@ -27,10 +27,6 @@ use std::sync::Arc;
 
 use crate::GatewayState;
 
-fn default_top_k() -> usize {
-    10
-}
-
 /// The widest answer this route will assemble. Same ceiling the wiki search
 /// applies, because both are asking a store to return a page of its contents
 /// over HTTP rather than sizing an internal candidate window.
@@ -41,8 +37,8 @@ const MAX_TOP_K: usize = 100;
 pub struct KnowledgeSearchRequest {
     /// The question, in the same form a caller would ask the layer directly.
     pub query: String,
-    /// How many entries the caller wants back.
-    #[serde(default = "default_top_k")]
+    /// How many entries the caller wants back. Required: how much a caller
+    /// wants is the caller's decision, not a number this route invents for it.
     pub top_k: usize,
 }
 

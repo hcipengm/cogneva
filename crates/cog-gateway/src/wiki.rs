@@ -62,12 +62,8 @@ pub struct CreateDocumentRequest {
 #[derive(Debug, Deserialize)]
 pub struct SearchRequest {
     pub query: String,
-    #[serde(default = "default_top_k")]
+    /// Required: how many results the caller wants is the caller's decision.
     pub top_k: usize,
-}
-
-fn default_top_k() -> usize {
-    10
 }
 
 #[derive(Debug, Deserialize)]

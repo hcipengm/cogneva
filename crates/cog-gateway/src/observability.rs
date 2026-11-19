@@ -36,7 +36,8 @@ pub struct LogsQuery {
 }
 
 fn default_limit() -> usize {
-    100
+    // 一屏：与 A2A 的 `page_size` 默认值同一个数，列表面共用页长。
+    cog_core::config::A2A_LIST_PAGE_SIZE as usize
 }
 
 // ─── Cluster Overview ───
@@ -1543,14 +1544,10 @@ pub fn event_matches_level(event: &cog_core::AgentEvent, level: Option<&str>) ->
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
     pub q: String,
-    #[serde(default = "default_search_limit")]
+    /// Required: how many hits the caller wants is the caller's decision.
     pub limit: usize,
     #[serde(default = "default_search_index")]
     pub index: String,
-}
-
-fn default_search_limit() -> usize {
-    20
 }
 
 fn default_search_index() -> String {
