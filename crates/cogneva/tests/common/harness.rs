@@ -373,7 +373,6 @@ impl TestHarness {
             pge_mode: PgeMode::Pipeline,
             max_retries: 1,
             profile: None,
-            context_window_size: None,
             boundary_config: None,
             is_self_evolution: false,
             deliverable: cog_core::DeliverableDeclaration::Unstated,

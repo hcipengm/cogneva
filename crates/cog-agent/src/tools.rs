@@ -424,9 +424,9 @@ impl ToolRegistry {
         let was_unbounded = self.paging_unbounded.swap(!measured, Ordering::Relaxed);
         match (was_unbounded, measured) {
             (false, false) => tracing::warn!(
-                "no context window is known — neither the deployment nor any pooled model states \
-                 one — so a read_file page is unbounded; the runtime's trimming still bounds what \
-                 reaches the context"
+                "no context window is known — the model in use has neither published a spec nor \
+                 had one measured — so a read_file page is unbounded; the runtime's trimming \
+                 still bounds what reaches the context"
             ),
             (true, true) => tracing::info!(chars, "read_file pages are bounded again"),
             _ => {}

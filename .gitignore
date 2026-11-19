@@ -36,3 +36,6 @@ evolution-patches/
 # Coverage counters dropped by instrumented test runs (machine-local)
 *.profraw
 *.profdata
+
+# Host-side flock file left by whoever serialises a render on this checkout
+deploy/.rendered.lock

@@ -30,8 +30,6 @@ pub struct SquadConfig {
     /// Squad 被 Ralph Loop 判定不可修复后的最大策略升级次数。
     /// 0 = 只做一次尝试（不升级），1 = 允许一次 Pipeline → Roundtable 升级。
     pub max_retries: u32,
-    /// 可选的上下文窗口大小，用于策略升级时动态扩容。
-    pub context_window_size: Option<usize>,
     /// 可选的任务 profile，用于在没有 MetaLearningEngine 时通过静态规则选择 PGE 模式。
     pub profile: Option<crate::profile::TaskProfile>,
     /// Optional BoundaryConfig, carried into the squad run with the task.
@@ -73,7 +71,6 @@ impl Default for SquadConfig {
             context: serde_json::json!({}),
             pge_mode: PgeMode::Pipeline,
             max_retries: 1,
-            context_window_size: None,
             profile: None,
             boundary_config: None,
             is_self_evolution: false,
@@ -1030,9 +1027,6 @@ impl SquadExecutor {
 
         // === 升级策略 ===
         squad.config.pge_mode = PgeMode::Roundtable;
-        if let Some(ref mut size) = squad.config.context_window_size {
-            *size = size.saturating_add(1024);
-        }
         squad.retry_count = 1;
         squad.status = SquadStatus::Retrying;
 

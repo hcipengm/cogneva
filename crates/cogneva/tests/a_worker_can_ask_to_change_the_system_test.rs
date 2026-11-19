@@ -210,8 +210,8 @@ impl ChangeLedgerStore for DeclarationLog {
 fn arguments() -> serde_json::Value {
     serde_json::json!({
         "path": "deploy/helm/cogneva/files/cogneva.json",
-        "literal": "\"context_window_size\": 96000",
-        "why": "上一轮它撞了上下文天花板，而它读的那份配置里这个数比同事小一半",
+        "literal": "\"skill_cache_ttl_secs\": 30",
+        "why": "技能清单几乎不变，而这棵树里的缓存每 30 秒就重读一遍，白白占了每一轮的读预算",
     })
 }
 
