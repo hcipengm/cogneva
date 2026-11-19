@@ -564,6 +564,7 @@ pub fn deployment_name() -> String {
 mod tests {
     use super::*;
 
+// proves: taskEventRetention.keepDays
     /// 保留天数是当拍实测的函数：同一张卷上，日写入量越大保留越短；量不到
     /// （表还空、体积读不出）时 seed 顶着；关掉的部署不会被实测重新打开。
     #[tokio::test]

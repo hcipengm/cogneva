@@ -2376,6 +2376,102 @@ mod tests {
         }
     }
 
+// proves: backup.resources.requests.cpu
+// proves: backup.resources.requests.memory
+// proves: backup.resources.limits.cpu
+// proves: backup.resources.limits.memory
+// proves: backup.drillResources.requests.cpu
+// proves: backup.drillResources.requests.memory
+// proves: backup.drillResources.limits.cpu
+// proves: backup.drillResources.limits.memory
+// proves: gateway.resources.requests.cpu
+// proves: gateway.resources.requests.memory
+// proves: gateway.resources.limits.cpu
+// proves: gateway.resources.limits.memory
+// proves: securityGateway.resources.requests.cpu
+// proves: securityGateway.resources.requests.memory
+// proves: securityGateway.resources.limits.cpu
+// proves: securityGateway.resources.limits.memory
+// proves: evolution.resources.requests.cpu
+// proves: evolution.resources.requests.memory
+// proves: evolution.resources.limits.cpu
+// proves: evolution.resources.limits.memory
+// proves: sandboxExecutor.resources.requests.cpu
+// proves: sandboxExecutor.resources.requests.memory
+// proves: sandboxExecutor.resources.limits.cpu
+// proves: sandboxExecutor.resources.limits.memory
+// proves: buildah.resources.requests.cpu
+// proves: buildah.resources.requests.memory
+// proves: buildah.resources.limits.cpu
+// proves: buildah.resources.limits.memory
+// proves: processCensus.resources.requests.cpu
+// proves: processCensus.resources.requests.memory
+// proves: processCensus.resources.limits.cpu
+// proves: processCensus.resources.limits.memory
+// proves: hostLedger.resources.requests.cpu
+// proves: hostLedger.resources.requests.memory
+// proves: hostLedger.resources.limits.cpu
+// proves: hostLedger.resources.limits.memory
+// proves: claimStore.resources.requests.cpu
+// proves: claimStore.resources.requests.memory
+// proves: claimStore.resources.limits.cpu
+// proves: claimStore.resources.limits.memory
+// proves: clusterRegistry.resources.requests.cpu
+// proves: clusterRegistry.resources.requests.memory
+// proves: clusterRegistry.resources.limits.cpu
+// proves: clusterRegistry.resources.limits.memory
+// proves: clusterRegistry.walkerResources.requests.cpu
+// proves: clusterRegistry.walkerResources.requests.memory
+// proves: clusterRegistry.walkerResources.limits.cpu
+// proves: clusterRegistry.walkerResources.limits.memory
+// proves: backends.postgres.resources.requests.cpu
+// proves: backends.postgres.resources.requests.memory
+// proves: backends.postgres.resources.limits.cpu
+// proves: backends.postgres.resources.limits.memory
+// proves: backends.postgres.exporterResources.requests.cpu
+// proves: backends.postgres.exporterResources.requests.memory
+// proves: backends.postgres.exporterResources.limits.cpu
+// proves: backends.postgres.exporterResources.limits.memory
+// proves: backends.redis.resources.requests.cpu
+// proves: backends.redis.resources.requests.memory
+// proves: backends.redis.resources.limits.cpu
+// proves: backends.redis.resources.limits.memory
+// proves: backends.redis.aofRepair.resources.requests.cpu
+// proves: backends.redis.aofRepair.resources.requests.memory
+// proves: backends.redis.aofRepair.resources.limits.cpu
+// proves: backends.redis.aofRepair.resources.limits.memory
+// proves: backends.redis.aofReportExporter.resources.requests.cpu
+// proves: backends.redis.aofReportExporter.resources.requests.memory
+// proves: backends.redis.aofReportExporter.resources.limits.cpu
+// proves: backends.redis.aofReportExporter.resources.limits.memory
+// proves: backends.redis.infoExporter.resources.requests.cpu
+// proves: backends.redis.infoExporter.resources.requests.memory
+// proves: backends.redis.infoExporter.resources.limits.cpu
+// proves: backends.redis.infoExporter.resources.limits.memory
+// proves: backends.qdrant.resources.requests.cpu
+// proves: backends.qdrant.resources.requests.memory
+// proves: backends.qdrant.resources.limits.cpu
+// proves: backends.qdrant.resources.limits.memory
+// proves: backends.nats.resources.requests.cpu
+// proves: backends.nats.resources.requests.memory
+// proves: backends.nats.resources.limits.cpu
+// proves: backends.nats.resources.limits.memory
+// proves: backends.meilisearch.resources.requests.cpu
+// proves: backends.meilisearch.resources.requests.memory
+// proves: backends.meilisearch.resources.limits.cpu
+// proves: backends.meilisearch.resources.limits.memory
+// proves: backends.seaweedfs.resources.requests.cpu
+// proves: backends.seaweedfs.resources.requests.memory
+// proves: backends.seaweedfs.resources.limits.cpu
+// proves: backends.seaweedfs.resources.limits.memory
+// proves: webSearch.resources.requests.cpu
+// proves: webSearch.resources.requests.memory
+// proves: webSearch.resources.limits.cpu
+// proves: webSearch.resources.limits.memory
+// proves: webFetch.resources.requests.cpu
+// proves: webFetch.resources.requests.memory
+// proves: webFetch.resources.limits.cpu
+// proves: webFetch.resources.limits.memory
     #[test]
     fn a_request_follows_the_measured_draw() {
         // 同一个容器，两段不同的实测：请求与两个上限都必须跟着走。
@@ -2474,6 +2570,8 @@ mod tests {
         assert!(loaded.targets("Deployment/a/c").is_some());
     }
 
+// proves: gateway.replicas
+// proves: securityGateway.replicas
     /// Replicas are a function of the live failure domains: one node cannot
     /// lose a replica and still serve, so it gets one; two or more get two,
     /// because a second copy on a third node buys no new failure domain.
@@ -2519,6 +2617,7 @@ mod tests {
         }
     }
 
+// proves: sandboxExecutor.replicas
     /// 执行器的副本数跟队走：需求是一副副本一条位子，涨是即时的。
     ///
     /// 这是登记表里 `sandboxExecutor.replicas` 那条 `derived` 的判据：把队的输入
@@ -2703,6 +2802,8 @@ mod tests {
         );
     }
 
+// proves: healthProbes.appStartup.failureThreshold
+// proves: healthProbes.claimStoreStartup.failureThreshold
     /// The startup budget covers the longest start that actually reached
     /// Ready, with headroom, and never goes below what the object already
     /// declared: a start too slow for the budget cannot be observed as a
@@ -3019,6 +3120,7 @@ mod tests {
         parse_workloads(&list).remove(0)
     }
 
+// proves: webFetch.shmSize
     #[test]
     fn the_shm_size_follows_the_measured_memory() {
         // 同一份输入、两个不同的实测：写进 `sizeLimit` 的数必须跟着动。
@@ -3080,6 +3182,10 @@ mod tests {
         .is_some());
     }
 
+// proves: resourceGovernance.limitRange.defaultCpu
+// proves: resourceGovernance.limitRange.defaultMemory
+// proves: resourceGovernance.limitRange.defaultRequestCpu
+// proves: resourceGovernance.limitRange.defaultRequestMemory
     /// The namespace default is a function of the same measurement the
     /// per-container law reads, asked what a typical container here looks
     /// like: the median sets the request, the busy edge sets the limit.

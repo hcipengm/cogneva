@@ -770,6 +770,92 @@ fn a_published_row_names_a_file_that_publishes_its_metric_and_label() {
     );
 }
 
+/// The leaves a proof test says it proves: `// proves: <values path>` lines.
+///
+/// The declaration lives in the test rather than only in `values.yaml` because
+/// the two ends then have to agree in both directions: a test that stops
+/// proving a leaf leaves the row claiming a loop nobody runs, and a leaf that
+/// claims a loop has to point at a test that says so when you open the file.
+fn proves_declarations(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("// proves:")?;
+            Some(rest.trim().to_string())
+        })
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
+/// A `derived` row and the test it names have to name each other.
+///
+/// `values.yaml` says "a loop sets this, here is the test"; the test says "I
+/// prove this leaf". One direction alone is the shape that rots quietly: rename
+/// the leaf and the test keeps proving the old string, delete the test and the
+/// row keeps its proof line until somebody happens to read it. Both directions
+/// are read here, and the population is whatever the chart ships.
+#[test]
+fn a_derived_row_and_its_proof_test_name_each_other() {
+    let accounts = accounts();
+    let mut silent = Vec::new();
+    let mut orphans = Vec::new();
+    let mut declared_total = 0;
+    for row in &accounts.rows {
+        if row.source != Source::Derived {
+            continue;
+        }
+        let Some(proof) = &row.proof else {
+            continue;
+        };
+        let text = read(&repo_root().join(&proof.file));
+        let declared = proves_declarations(&text);
+        declared_total += declared.len();
+        if !declared.iter().any(|key| key == &row.key) {
+            silent.push(format!(
+                "`{}` names `{}::{}` as its proof, and that file has no \
+                 `// proves: {}` line",
+                row.key, proof.file, proof.test, row.key
+            ));
+        }
+    }
+    let derived: BTreeSet<&str> = accounts
+        .rows
+        .iter()
+        .filter(|row| row.source == Source::Derived)
+        .map(|row| row.key.as_str())
+        .collect();
+    let mut sources = Vec::new();
+    walk_all(&repo_root().join("crates"), &mut sources);
+    for path in &sources {
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        for key in proves_declarations(&read(path)) {
+            if !derived.contains(key.as_str()) {
+                orphans.push(format!(
+                    "{}: `// proves: {}` 指向的叶子没有一条 `derived` 行",
+                    path.display(),
+                    key
+                ));
+            }
+        }
+    }
+    assert!(
+        declared_total > 0,
+        "一份 `// proves:` 都没读到：读法坏了，下面两条都会在空集上通过"
+    );
+    assert!(
+        silent.is_empty(),
+        "these rows claim a loop and the test they name does not say it proves \
+         them: {silent:#?}"
+    );
+    assert!(
+        orphans.is_empty(),
+        "these proof declarations point at a leaf that is not registered as \
+         derived, so the test proves something the chart does not ship: {orphans:#?}"
+    );
+}
+
 /// The value at a dotted path, if the chart has one.
 fn leaf_at<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
     let mut current = value;

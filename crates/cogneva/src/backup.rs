@@ -6950,6 +6950,7 @@ mod tests {
         assert!(dir.path().join("notes.txt").exists(), "非包文件不许动");
     }
 
+// proves: backup.keepCount
     /// 保留数是卷容量与实测包大小的函数：卷更大或包更小就多留几个；量不到卷
     /// 或一个包都还没有时，部署声明顶着。
     #[test]

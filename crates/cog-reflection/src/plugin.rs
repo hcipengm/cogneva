@@ -4860,6 +4860,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 mod tests {
     use super::*;
 
+// proves: evolution.pollIntervalSecs
     /// 发现循环的等待由上一轮实测决定：同一段代码换一次耗时，下一拍就换一个数，
     /// 并且求值计数在走——回路在跑，不是一次启动时算出来的常量。
     #[test]
