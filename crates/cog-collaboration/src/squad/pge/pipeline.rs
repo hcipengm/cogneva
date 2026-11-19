@@ -16,7 +16,7 @@
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::pge::stall::{
-    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
+    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict, STALL_THRESHOLD,
 };
 use crate::squad::pge::types::{
     EvaluationResult, GeneratorOutput, LocalRepairAttempt, PlannerOutput, Verdict,
@@ -54,7 +54,7 @@ impl Default for PgePipelineConfig {
             max_retries: 3,
             timeout_ms: (30 * cog_core::day::MILLIS_PER_SECOND) as u64,
             local_repair_max: 0,
-            stall_threshold: 2,
+            stall_threshold: STALL_THRESHOLD,
             independent_review: true,
         }
     }

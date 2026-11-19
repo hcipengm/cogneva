@@ -3,7 +3,7 @@ use crate::actors::{
 };
 use crate::squad::pge::context_board::ContextBoard;
 use crate::squad::pge::stall::{
-    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
+    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict, STALL_THRESHOLD,
 };
 use crate::squad::pge::types::{
     best_scored, Artifact, BranchMergeStrategy, ConsensusFloor, Criterion, EvaluationResult,
@@ -113,7 +113,7 @@ impl Default for PgeRoundtableConfig {
             agent_manager: None,
             llm_provider: None,
             merger: None,
-            stall_threshold: 2,
+            stall_threshold: STALL_THRESHOLD,
             independent_review: true,
         }
     }

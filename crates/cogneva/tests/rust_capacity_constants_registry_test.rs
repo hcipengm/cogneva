@@ -637,6 +637,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-collaboration/src/config.rs", 1),
     ("crates/cog-collaboration/src/profile.rs", 5),
     ("crates/cog-collaboration/src/squad/executor.rs", 2),
+    ("crates/cog-collaboration/src/squad/pge/stall.rs", 1),
     ("crates/cog-collaboration/src/squad/ralph/ralph_loop.rs", 1),
     ("crates/cog-core/src/build_cache.rs", 5),
     ("crates/cog-core/src/build_cache_readings.rs", 2),
