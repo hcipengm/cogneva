@@ -292,5 +292,31 @@ run_step "格子乙" true
     fail "改了装置（函数体），装置哈希没变：所有格会沿用一份已经不对的判词"
 note "格戳只对装置失效：改措辞不动哈希，改函数体才动"
 
+# ---- 7. 轨迹有上限：一个格子的轨迹不会把盘写满，而且停下之后仍要判一次 ----
+# 2026-11-19 实测：`host-target-gc.test.sh` 这一格判的是宿主机（回收器按 /proc 枚举
+# 进程），而 `-y` 每解一个 fd 也读 /proc —— 轨迹一边写一边放大；本机实测 2026-11-19
+# 本机五分钟写了 256 MiB，同一台机器盘上用量从 20 GiB 涨到 32 GiB。量作用域的仪器
+# 把「判」变成了「填盘」。
+# 这一节判三件事：超过上限要停下并说出来；停下之后按不带追踪重跑出判词；半份轨迹不记账
+# （半份轨迹解出的作用域会让这一格永不重判，而永不重判与一直绿同形）。
+unit_cap="${work}/unit-cap"
+mkdir -p "${unit_cap}"
+export COGNEVA_CELL_STAMP_DIR="${unit_cap}"
+export COGNEVA_CELL_TRACE_MAX_BYTES=65536
+status_cap=0
+out_cap="$(cell_run "一格把轨迹写爆" bash -c 'for _ in $(seq 1 800); do cat /proc/self/stat >/dev/null; done' 2>&1)" || status_cap=$?
+case "${out_cap}" in
+    *"轨迹超过"*) ;;
+    *) fail "轨迹超过上限时没有停下来说一句 —— ${out_cap}" ;;
+esac
+[ "${status_cap}" -eq 0 ] ||
+    fail "停掉追踪之后没有按不带追踪重跑出判词：退出码 ${status_cap} —— ${out_cap}"
+[ -z "$(find "${unit_cap}" -name verdict -print -quit)" ] ||
+    fail "半份轨迹的那一格记了账：$(find "${unit_cap}" -name verdict -print -quit)"
+[ ! -e "${TMPDIR:-/tmp}/cogneva-cell.$$.trace" ] ||
+    fail "轨迹文件留在了盘上：${TMPDIR:-/tmp}/cogneva-cell.$$.trace"
+note "轨迹超过上限时停下追踪、按不带追踪判一次，且不记半份作用域的账"
+unset COGNEVA_CELL_TRACE_MAX_BYTES
+
 echo "cell-stamps.test: all checks passed"
 
