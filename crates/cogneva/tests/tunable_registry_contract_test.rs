@@ -139,6 +139,31 @@ struct Row {
     published: Option<Published>,
     /// For a derived row: the test that shows the value following its input.
     proof: Option<Proof>,
+    /// For a number taken from one measurement rather than a loop: which
+    /// reading it came from, when it was taken, and what it read.
+    measured_once: Option<MeasuredOnce>,
+}
+
+/// A number whose basis is a reading somebody took once.
+///
+/// This is the shape between the other two: a `proof:` row is one a loop
+/// re-takes, and a row with neither line is a decision that never rested on a
+/// reading at all. A one-off measurement is neither -- the value really did
+/// come off the machine, so calling it a decision hides that, and there is no
+/// loop, so calling it derived would promise a re-take nobody runs. Naming the
+/// series, the day and the number read keeps the debt in a form a reader can
+/// check: the series must exist on the recorded producer surface, so the day
+/// the exporter stops emitting it this line goes red instead of reading as a
+/// measurement forever.
+#[derive(Debug)]
+struct MeasuredOnce {
+    /// The series the measurement was read off.
+    series: String,
+    /// `YYYY-MM-DD`: when it was taken. A bound with no date reads as a fact
+    /// that was always true.
+    date: String,
+    /// What the reading said, which is the observation the number rests on.
+    found: String,
 }
 
 #[derive(Debug)]
@@ -193,6 +218,7 @@ fn accounts() -> Accounts {
         let mut why = String::new();
         let mut published = None;
         let mut proof = None;
+        let mut measured_once = None;
         // The class is not a word on this line: it is whether the block carries
         // the evidence. A word typed here is a judgement nobody reads, which is
         // the shape this registry is here to take away -- so it is reported
@@ -224,6 +250,8 @@ fn accounts() -> Accounts {
                 published = Some(published_from(field_map(text, start + 1)));
             } else if let Some(text) = body.strip_prefix("proof:") {
                 proof = Some(proof_from(field_map(text, start + 1)));
+            } else if let Some(text) = body.strip_prefix("measured-once:") {
+                measured_once = Some(measured_once_from(field_map(text, start + 1)));
             }
             index += 1;
         }
@@ -250,6 +278,7 @@ fn accounts() -> Accounts {
             why,
             published,
             proof,
+            measured_once,
         });
     }
     accounts
@@ -299,6 +328,55 @@ fn proof_from(mut fields: BTreeMap<String, String>) -> Proof {
         beat: take(&mut fields, "beat"),
         evidence: take(&mut fields, "evidence"),
     }
+}
+
+fn measured_once_from(mut fields: BTreeMap<String, String>) -> MeasuredOnce {
+    let take = |fields: &mut BTreeMap<String, String>, name: &str| {
+        fields.remove(name).unwrap_or_else(|| {
+            panic!(
+                "{VALUES}: a `# measured-once:` line is missing `{name}=`; a measurement \
+                 that names neither its reading nor its day cannot be checked later"
+            )
+        })
+    };
+    MeasuredOnce {
+        series: take(&mut fields, "series"),
+        date: take(&mut fields, "date"),
+        found: take(&mut fields, "found"),
+    }
+}
+
+/// The series the postgres exporter was measured emitting, one per line under
+/// `series:` in its inventory. A trailing `*` is a prefix, as the inventory
+/// uses it (`pg_settings_*`).
+fn exporter_series() -> Vec<String> {
+    let path = repo_root().join("deploy/images/postgres-exporter.series.yaml");
+    let text = read(&path);
+    let mut series = Vec::new();
+    let mut in_list = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "series:" {
+            in_list = true;
+            continue;
+        }
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            if in_list {
+                series.push(item.trim().trim_matches('"').to_string());
+            }
+            continue;
+        }
+        in_list = false;
+    }
+    assert!(
+        !series.is_empty(),
+        "{} names no series: the one-off measurements below cannot be checked",
+        path.display()
+    );
+    series
 }
 
 /// The dotted path of every numeric leaf, keyed by the line it is written on.
@@ -968,6 +1046,72 @@ fn the_tunable_line_carries_no_word_of_its_own() {
          分类由证据算出（有 `proof:` 行就是有人在量它），词本身不再是入口——\
          写一个词既不能把一格变成闭环，也不能把它从闭环里放出来",
         offenders.join("\n")
+    );
+}
+
+/// 一次实测支撑的数，要点名读的是哪条序列、哪天量的、量到多少。
+///
+/// 这是三种来源里最容易被读成另一种的一种：块里没有 `proof:`，所以它落在「部署
+/// 自己的决定」那一格；可它的数字**确实是从机器上量下来的**。只写散文（「2026-11-17
+/// 实测到 100」）时，这句话在读数面上与「随手拍的 200」一模一样，而且它永远读作
+/// 「量过」——哪怕那条读数早已没人发。所以它要有自己的一行：序列、日期、读数。
+///
+/// 三条判据：
+/// 1. 序列必须在 `deploy/images/postgres-exporter.series.yaml` 的清单里。那份清单是
+///    从镜像身上量出来的；镜像某天不再发它时，这条线先红，而不是那个数继续读作实测。
+/// 2. 日期是 `YYYY-MM-DD`。没有日期的实测读作一直成立的事实。
+/// 3. 同一块里不许同时有 `proof:`：有闭环就由闭环重取，一次性的读数再挂着，
+///    读者分不清哪个在管这一格。
+#[test]
+fn a_one_off_measurement_names_its_reading_its_day_and_what_it_found() {
+    let series = exporter_series();
+    let emitted = |name: &str| {
+        series.iter().any(|listed| match listed.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => listed == name,
+        })
+    };
+    let mut wrong = Vec::new();
+    for row in &accounts().rows {
+        let Some(once) = &row.measured_once else {
+            continue;
+        };
+        if row.proof.is_some() {
+            wrong.push(format!(
+                "`{}` 同时带着 `proof:` 与 `measured-once:`：有闭环就由闭环重取，\
+                 一次性的读数与它只有一个能管这一格",
+                row.key
+            ));
+        }
+        if !emitted(&once.series) {
+            wrong.push(format!(
+                "`{}` 说它的数来自 `{}`，而 postgres-exporter 的清单里没有这条序列\
+                 ——那条读数要么改了名，要么已经没人发它",
+                row.key, once.series
+            ));
+        }
+        let day = once.date.as_bytes();
+        let dated = day.len() == 10
+            && day[4] == b'-'
+            && day[7] == b'-'
+            && day
+                .iter()
+                .enumerate()
+                .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+        if !dated {
+            wrong.push(format!(
+                "`{}` 的实测日期 `{}` 不是 `YYYY-MM-DD`",
+                row.key, once.date
+            ));
+        }
+        if once.found.trim().is_empty() {
+            wrong.push(format!("`{}` 的实测没有写下量到的数", row.key));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "这些一次性实测说不清自己的来处：\n{}",
+        wrong.join("\n")
     );
 }
 

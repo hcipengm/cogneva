@@ -2246,15 +2246,24 @@ backends:
     # 服务端自己的连接上限。它不是一个可以随便拍的数：存储插件启动时读这一格，把它
     # 按「同时在跑的进程数 × 每个进程的池数」分给每一池，所以它是那个分配式的分母。
     #
-    # 200 的来处：2026-11-17 实测，滚动期间新旧两代 Pod 同时在池里，`pg_stat_activity`
-    # 数到 100 就打满（连超级用户也进不去，新 Pod 连建表都连不上）。服务器上限必须盖住
-    # **两代**，所以取实测峰值的一倍余量。改它之前先读同一格读数：峰值若变了，这个数
-    # 该跟着变；读不到时 `pg_pool_ceiling_unmeasured` 会亮。
+    # 200 的来处是 2026-11-17 的一次事故：滚动期间新旧两代 Pod 同时在池里，
+    # `pg_stat_activity` 数到 100 就打满（连超级用户也进不去，新 Pod 连建表都连不上），
+    # 于是取那次峰值的一倍，盖住两代同时在池里。那条读数今天仍然有生产者（下面
+    # `measured-once:` 点名的序列），但没有闭环重取它：服务端的上限改不改是一个部署
+    # 决定，`ALTER SYSTEM` 改 `max_connections` 还要重启数据库，所以它不是能跟着读数
+    # 走的那种数。运行时也不靠它保持正确——插件启动时读服务端真实的上限，按进程与池数
+    # 分摊并把是哪个界定的值发在池读数上；读不到时 `pg_pool_ceiling_unmeasured` 会亮。
     # tunable:
-    # why: 这一格是 PostgreSQL 服务端自己的上限，不是本平台施加给工作的界：它的唯一作用 是当分母，让存储插件按「同时在跑的进程数 × 每进程池数」分出每一池的额度。 今天的值来自一次实测（滚动期间
-    # why: pg_stat_activity 到 100 就打满，新 Pod 连建表 都连不上），取峰值的一倍以盖住新旧两代同时在池里。它**还没有闭环**：闭环的
-    # why: 输入是「同时在跑的最大进程数」，那是一条进程普查读数，尚未接进这一格的计算， 所以现在标 fixed 而不是 derived——等那条读数接上，这一行改成 derived 并补一条 「换输入 ⇒
-    # why: 值跟着变」的证明。
+    # why: The server's own ceiling, not a bound this platform puts on its work: the storage plugin divides it
+    # why: across the processes and pools sharing the server, so it is the denominator of that division rather
+    # why: than a number anything obeys directly. 200 came from one incident -- a rolling update on 2026-11-17
+    # why: where pg_stat_activity reached 100 and took no one else, so the new pod could not even create its
+    # why: tables -- doubled to cover two generations sharing the server at once. The reading it rests on still
+    # why: has a producer, but no loop re-takes it: raising the server's own limit means restarting the
+    # why: database, which is a deployment decision rather than a value following a reading. The runtime does
+    # why: not lean on it staying right -- the plugin reads the server's real ceiling at start-up, divides it
+    # why: across the processes and pools, and publishes which bound decided.
+    # measured-once: series=pg_stat_activity_count date=2026-11-17 found=100
     maxConnections: 200
     # 读数边车与数据库同 Pod：抓数据库的读数要库口令，独立进程就得再存一份。
     # 这个 tag 是读数的生产者，不是实现细节：最老事务年龄那条读数读的
