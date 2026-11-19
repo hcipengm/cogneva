@@ -156,8 +156,6 @@ const WASM_SKILL_RETRIES: u32 = 2;
 const SKILL_RETRIES: u32 = 1;
 
 // DAG 节点：同一节点连败到熔断阈值即进 DLQ
-// cap: bound — 三次重试与熔断阈值同一个数：第四次不再重试，而是直接判这条节点不通
-const DAG_NODE_RETRIES: u32 = 3;
 // cap: bound — 连续三次失败即进 DLQ
 const DAG_NODE_FAILURE_THRESHOLD: u32 = 3;
 // cap: bound — 半开只放一次探测：节点一坏往往就是一直坏，多放几次只是多花几次额度
@@ -270,10 +268,15 @@ impl RetryMatrix {
         );
 
         // DAG 节点：指数退避，等待从秒级起步；同一节点连败到熔断阈值即进 DLQ
+        //
+        // 次数读执行器自己那份声明（`dag_executor.max_retries`）的出厂值：
+        // 部署声明了这个数，这里再写一个就是同一件事的第二个说法，而且写的
+        // 那个永远不生效——真正跑的执行器用部署的值，这里只补没人声明时的
+        // 兜底。
         by_task_type.insert(
             TaskType::DagNode,
             RetryConfig {
-                max_retries: DAG_NODE_RETRIES,
+                max_retries: cog_core::DagExecutorConfig::default().max_retries,
                 backoff: BackoffStrategy::Exponential {
                     base_ms: (5 * cog_core::day::MILLIS_PER_SECOND) as u64,
                     max_ms: (20 * cog_core::day::MILLIS_PER_SECOND) as u64,

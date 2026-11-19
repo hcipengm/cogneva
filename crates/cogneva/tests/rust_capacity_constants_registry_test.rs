@@ -769,7 +769,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     // 名字之后它们进册了——不是新增的界，是原先没被数上的界。
     (
         "crates/cog-orchestrator/src/dag_executor/retry_matrix.rs",
-        18,
+        17,
     ),
     (
         "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
