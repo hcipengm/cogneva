@@ -31,11 +31,18 @@
 //!   第三种状态——文档写着一个既非默认、又非 chart 的值——是上面那个坏法本身：
 //!   部署实际不会走到它，它只负责让人读错。
 //!
+//! 第三个面：**chart 自己**也不许把一个代码默认值再说一遍。判据同上，方向换成
+//! `values.yaml` 的叶子：这个叶子只由一条 env 转发消费、判词是 `fixed`（没有闭环
+//! 读它）、而它写的值等于「文档里没有这个键时应用自己给的值」——这条 env 送进去的
+//! 和不给就有的，是同一个数，它没有决定任何事。`derived` 的叶子不在其中：它的值
+//! 是一个闭环的种子，种子本来就是部署可以自己定的那一格。
+//!
 //! 不判什么，说清楚：模板里写死的数字（不来自 `.Values`）归
 //! `chart_template_literals_contract_test.rs`；`values.yaml` 的数值叶子各带一条
 //! `# tunable:` 判词，归 `tunable_registry_contract_test.rs`；`values` 叶子与代码
-//! 常量的同值关系（例如端口）是第三种载体，本轮不判——端口在文档里与 chart 同值、
-//! 与代码默认值不同值，它确实是不带 env 跑法的兜底，两半判词都放它过。
+//! 常量的同值关系（例如端口）是另一种载体——端口在文档里与 chart 同值、与代码默认值
+//! 不同值，它确实是不带 env 跑法的兜底，三条判据都放它过。字符串叶子（工作树的
+//! 根目录这类）不在这一块：本文件判的是数值，字符串路径的另一半归模板字面量那条门。
 //!
 //! 文档正文还有一份副本：`deploy/k3s/cogneva-json-configmap.yaml` 里内嵌的那段
 //! JSON。它与 chart 那份的逐字段相等由 `config_loader` 的单测
@@ -196,15 +203,92 @@ fn take_at(doc: &mut serde_json::Value, path: &str) -> Option<serde_json::Value>
 /// 自己：不读这个键、只看剩下的文档，它给这个字段的答案是什么。
 fn what_the_default_states_without(doc: &serde_json::Value, path: &str) -> serde_json::Value {
     let mut without = doc.clone();
-    take_at(&mut without, path)
-        .unwrap_or_else(|| panic!("{path} 不在文档里，删不掉——路径与文档对不上"));
+    // 文档里本来就没有这个键，也是合法的一问：这时「去掉它之后」就是「照现在这样」。
+    take_at(&mut without, path);
     let parsed: AppConfig = serde_json::from_value(without).unwrap_or_else(|e| {
         panic!("去掉 {path} 之后文档不再是一个配置：{e}——判据读不懂它要判的东西")
     });
     let round = serde_json::to_value(&parsed).expect("AppConfig 能序列化回 JSON");
+    // 往返里没有这一格＝这一格的默认就是「没配」（`null`）：带
+    // `skip_serializing_if = "Option::is_none"` 的字段就是这样。
     value_at(&round, path)
         .cloned()
-        .unwrap_or_else(|| panic!("去掉 {path} 之后往返里没有这个字段——它不是配置字段"))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// chart 的模板里引用这个 values 叶子的每一处：`(file:line, 是不是一条 env 转发)`。
+///
+/// 「转发」＝这一行是 `COGNEVA_*: …` 且只引用这一个叶子。别处的引用（容器的
+/// `containerPort`、Service 的端口、拼进地址里的端口）说明这个叶子还要决定清单
+/// 本身，删了它清单就变了——那种叶子不是「默认值的复述」。
+fn template_uses(values_path: &str) -> Vec<(String, bool)> {
+    let dir = repo_root().join(TEMPLATES);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a template directory entry").path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("yaml"))
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for file in &files {
+        let text = read(file);
+        for (n, line) in text.lines().enumerate() {
+            let refs = values_refs(line);
+            if !refs.iter().any(|r| r == values_path) {
+                continue;
+            }
+            let forwards = env_assignment(line).is_some() && refs.len() == 1;
+            out.push((format!("{}:{}", file.display(), n + 1), forwards));
+        }
+    }
+    out
+}
+
+/// 一个叶子在 `values.yaml` 里带的判词：`derived`、`fixed`，或者没有块。
+///
+/// 判词块就是叶子上面那段连续的 `#` 注释里的一行 `# tunable: …`。这一份读法只
+/// 回答「这个词是什么」——块本身写得够不够，归 `tunable_registry_contract_test`。
+fn tunable_word(text: &str, values_path: &str) -> Option<String> {
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut word = None;
+    let mut block = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            block.push(trimmed.trim_start_matches('#').trim().to_string());
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("- ") || trimmed.starts_with("{{") {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        let (key, rest) = match trimmed.split_once(':') {
+            Some(split) => split,
+            None => continue,
+        };
+        if key.is_empty() || key.contains(' ') {
+            continue;
+        }
+        while stack.last().is_some_and(|(depth, _)| *depth >= indent) {
+            stack.pop();
+        }
+        stack.push((indent, key.to_string()));
+        if !rest.trim().is_empty() {
+            let path = stack
+                .iter()
+                .map(|(_, key)| key.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if path == values_path {
+                word = block
+                    .iter()
+                    .find_map(|line| line.strip_prefix("tunable:"))
+                    .map(|line| line.trim().to_string());
+            }
+            block.clear();
+        }
+    }
+    word
 }
 
 /// chart 在 values 里给这个叶子写的值。
@@ -315,6 +399,188 @@ fn the_document_does_not_restate_a_value_the_default_already_states() {
     assert!(
         copies.is_empty(),
         "同一件事在文档与代码默认值里各写了一遍：\n{}",
+        copies.join("\n")
+    );
+}
+
+/// chart 里一个判成 `fixed` 的叶子，不许写一个代码默认值已经说过的值。
+///
+/// 与上一节同一条判据，方向换成 chart：这个叶子只由一条 env 转发消费（没有别处
+/// 拿它去渲染清单），判词是 `fixed`（没有闭环读它），而它写的值与「文档里没有这个
+/// 键时应用自己给的值」一样——那么这条 env 送给进程的和进程不给就有的，是同一个数。
+/// 它没有决定任何事，只让人以为这个部署在这个字段上做过决定。
+///
+/// 为什么 `derived` 的叶子不在这条判据里：它的值是一个闭环的**种子**（首拍之前
+/// 要有个值），种子本来就是部署可以自己定的那一格；代码默认值与它相同只说明种子
+/// 取自同一个数，不说明这一格是复述。真正的复述是 `fixed`——那个词不承诺任何
+/// 闭环，值又与默认值一样，于是它唯一的作用就是占一行。
+///
+/// 不判的：这个叶子还被模板别处引用（端口这类：删了清单就变了），它本来就在文档里
+/// 声明过（那是上一条判据的题目），或者它不是数值叶子（字符串路径另有形状，不在
+/// 这一块的账上）。
+#[test]
+fn the_chart_does_not_restate_a_fixed_value_the_default_already_states() {
+    let (pairs, doc) = handovers();
+    let text = read_repo(VALUES);
+    let values: serde_yaml::Value =
+        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{VALUES} 不是合法 YAML：{e}"));
+    let mut copies = Vec::new();
+    let mut judged = 0;
+    let mut seeds = 0;
+    for pair in &pairs {
+        if value_at(&doc, &pair.config_path).is_some() {
+            continue; // 文档也声明了这个字段：归上一条判据
+        }
+        let Some(chart) = chart_value(&values, &pair.values_path) else {
+            continue;
+        };
+        if !chart.is_number() {
+            continue; // 这一块只判数值叶子
+        }
+        let word = tunable_word(&text, &pair.values_path);
+        let default = what_the_default_states_without(&doc, &pair.config_path);
+        let Some(same) = agrees(&default, &chart) else {
+            continue; // 比不了：报出来只会是猜
+        };
+        judged += 1;
+        if word.as_deref() == Some("derived") {
+            seeds += 1; // 闭环的种子：部署可以自己定，见上面
+            continue;
+        }
+        if !same {
+            continue;
+        }
+        let elsewhere: Vec<String> = template_uses(&pair.values_path)
+            .into_iter()
+            .filter(|(_, forwards)| !*forwards)
+            .map(|(site, _)| site)
+            .collect();
+        if !elsewhere.is_empty() {
+            continue; // 这个叶子还要决定清单本身
+        }
+        copies.push(format!(
+            "{} -> {}: .Values.{}（判词 {}）写 {:?}，而文档里没有这个键时应用自己给的就是 {}。\
+             这条 env 送进去的和不给就有的，是同一个数——既没有闭环读它、又没决定任何事",
+            pair.env,
+            pair.config_path,
+            pair.values_path,
+            word.as_deref().unwrap_or("（没有判词块）"),
+            chart,
+            default
+        ));
+    }
+    // 下限只挡「三跳或默认值往返整个失效」：判到 0 格时下面那条会在空集上报绿。
+    // 不钉「该有几个 fixed 复述」——修好之后那就是 0，钉在「修好之前有几个」等于
+    // 要求永远留一个。
+    assert!(
+        judged >= 1,
+        "一个「叶子 -> env -> 默认值」的格都没判到：这条判据空了（三跳读法坏了）"
+    );
+    // 判词读法本身也要看得见东西：这些格子里必须有 `derived` 的种子，否则上面那个
+    // 「不是 derived 就判」的分支会把每个叶子都当成 `fixed`——读法坏了与全树都是
+    // 复述，在红字上一模一样。
+    assert!(
+        seeds >= 1,
+        "判到的 {judged} 格里没有一个是 `derived` 的种子：判词块的读法坏了，\
+         下面的判据会把种子也当成复述"
+    );
+    assert!(
+        copies.is_empty(),
+        "chart 里 `fixed` 的叶子把代码默认值又说了一遍：\n{}",
+        copies.join("\n")
+    );
+}
+
+/// 产品自己的文件系统布局：这些路径不是谁挑的数，是这套清单的结构。
+const PRODUCT_LAYOUT_ROOTS: [&str; 2] = ["/opt/cogneva", "/var/lib/cogneva"];
+
+/// values 里所有「产品布局路径」叶子：点分路径 → 值。
+///
+/// 只收严格落在 [`PRODUCT_LAYOUT_ROOTS`] 之下的字符串叶子：那一族是产品在自己
+/// 卷里的位置，模板里写死一处、values 里声明一处，两边迟早各说各的（把工作树的根
+/// 挪到别处，`workingDir` 与 `safe.directory` 还指着老路径）。地址、`/metrics`
+/// 这类不是布局：它们是另一件事恰好长成同一个串，比了只会是猜。
+fn layout_leaves(values: &serde_yaml::Value) -> BTreeMap<String, String> {
+    fn walk(value: &serde_yaml::Value, path: &str, out: &mut BTreeMap<String, String>) {
+        match value {
+            serde_yaml::Value::Mapping(map) => {
+                for (key, child) in map {
+                    if let Some(key) = key.as_str() {
+                        let next = if path.is_empty() {
+                            key.to_string()
+                        } else {
+                            format!("{path}.{key}")
+                        };
+                        walk(child, &next, out);
+                    }
+                }
+            }
+            serde_yaml::Value::String(text) => {
+                if PRODUCT_LAYOUT_ROOTS
+                    .iter()
+                    .any(|root| text.len() > root.len() && text.starts_with(&format!("{root}/")))
+                {
+                    out.insert(path.to_string(), text.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(values, "", &mut out);
+    out
+}
+
+/// chart 的模板不许把一个布局路径再写一遍：它已经在 `values.yaml` 里有一处声明。
+///
+/// 判据是同一个串：模板里某一行写着这个叶子的值，而那一行不是从 `.Values.<叶子>`
+/// 取来的。两处今天相等，改一处另一处不动——这正是「叶子 → 模板字面量同义」那一格。
+#[test]
+fn the_chart_does_not_spell_a_layout_path_that_a_leaf_declares() {
+    let values: serde_yaml::Value = serde_yaml::from_str(&read_repo(VALUES))
+        .unwrap_or_else(|e| panic!("{VALUES} 不是合法 YAML：{e}"));
+    let leaves = layout_leaves(&values);
+    assert!(
+        !leaves.is_empty(),
+        "{VALUES} 里一个布局路径叶子都没读到：下面那条判据会在空集上通过"
+    );
+
+    let dir = repo_root().join(TEMPLATES);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a template directory entry").path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("yaml"))
+        .collect();
+    files.sort();
+
+    let mut copies = Vec::new();
+    for file in &files {
+        let text = read(file);
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split('#').next().unwrap_or("");
+            if code.trim().is_empty() || code.trim_start().starts_with("{{- /*") {
+                continue;
+            }
+            for (path, value) in &leaves {
+                if !code.contains(value.as_str()) {
+                    continue;
+                }
+                if code.contains(&format!(".Values.{path}")) {
+                    continue;
+                }
+                copies.push(format!(
+                    "{}:{} 把 {} 写成了字面量（values 里 .Values.{} 也声明着它）",
+                    file.display(),
+                    n + 1,
+                    value,
+                    path
+                ));
+            }
+        }
+    }
+    assert!(
+        copies.is_empty(),
+        "同一个布局路径在模板与 values 里各声明了一次：\n{}",
         copies.join("\n")
     );
 }
