@@ -1467,6 +1467,18 @@ const DEFAULT_HOT_DURATION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 // cap: bound — 一个季度之后的事件属于归档但仍要能查；这是分层策略的取舍，不是测量
 const DEFAULT_WARM_DURATION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
+/// zstd 的三档压缩级别：`0` 是库自己的默认档，`3` 是推荐区间里的快档，`9` 是
+/// 高压缩档。
+///
+/// 三个存储面说的是同一件事——原始日志、冷热分层迁移、可观测快照各写一份，改
+/// 一处忘一处，盘上就会出现「同一天的日志在两个 tier 用两种档压」。
+// cap: fixed — zstd 语义：0 = 库默认档
+pub const COMPRESSION_LEVEL_DEFAULT: i32 = 0;
+// cap: fixed — zstd 推荐压缩档（快档 3）
+pub const COMPRESSION_LEVEL_WARM: i32 = 3;
+// cap: fixed — zstd 推荐压缩档（高压缩档 9）
+pub const COMPRESSION_LEVEL_COLD: i32 = 9;
+
 /// 默认每小时扫一次分层：分层是按时间的判据，密到分钟级只会重复搬同一批对象。
 // cap: bound — 分层是按时间的判据，密到分钟级只会重复搬同一批对象
 const DEFAULT_TIER_SCAN_INTERVAL: Duration = Duration::from_secs(3600);
@@ -1476,8 +1488,8 @@ impl Default for TierPolicy {
         Self {
             hot_duration: DEFAULT_HOT_DURATION,
             warm_duration: DEFAULT_WARM_DURATION,
-            warm_compression_level: 3,
-            cold_compression_level: 9,
+            warm_compression_level: COMPRESSION_LEVEL_WARM,
+            cold_compression_level: COMPRESSION_LEVEL_COLD,
             scan_interval: DEFAULT_TIER_SCAN_INTERVAL,
             cold_key_prefix: "raw".into(),
         }

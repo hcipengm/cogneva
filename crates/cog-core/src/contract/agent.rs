@@ -142,7 +142,9 @@ impl Default for RuntimeConfig {
             // 型号 × 厂商公布规格给出，实测再把它校正到准确值；两个都没有时
             // 不裁，第一次拒收自述的界就是那个准确的数。
             context_window_size: None,
-            skill_cache_ttl_secs: 30,
+            // 缓存有效期与热加载节拍同源：热加载一扫描就会让缓存失效，缓存
+            // 立在两个节拍之间只是兜住「那一拍没扫到」的窗口。
+            skill_cache_ttl_secs: crate::config::SKILL_HOT_RELOAD_INTERVAL_SECS,
             think_stall_timeout_secs: 240,
             // Measured against the recoveries that kept a run alive: the
             // longest one that produced a deliverable spent 326s, and the one

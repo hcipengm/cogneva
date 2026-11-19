@@ -46,7 +46,7 @@ impl Default for SkillConfig {
     fn default() -> Self {
         Self {
             directories: skill_directories(),
-            hot_reload_interval_secs: 30,
+            hot_reload_interval_secs: cog_core::config::SKILL_HOT_RELOAD_INTERVAL_SECS,
         }
     }
 }

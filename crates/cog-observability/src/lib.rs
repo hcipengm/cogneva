@@ -189,18 +189,6 @@ pub enum LogFormat {
 // cap: fixed — Prometheus 抓取约定端口 9090
 const PROMETHEUS_PORT: u16 = 9090;
 
-/// zstd 的默认档：`0` 就是「用库自己的默认压缩级别」，不是本仓挑的。
-// cap: fixed — zstd 语义：0 = 库默认档
-const ZSTD_LEVEL_DEFAULT: i32 = 0;
-
-/// 温存的压缩档：zstd 推荐区间里的「快」端，越大越省盘越费 CPU。
-// cap: fixed — zstd 推荐压缩档（快档）
-const ZSTD_LEVEL_WARM: i32 = 3;
-
-/// 冷存的压缩档：zstd 推荐区间里的「小」端。
-// cap: fixed — zstd 推荐压缩档（高压缩档）
-const ZSTD_LEVEL_COLD: i32 = 9;
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PrometheusConfig {
     pub enabled: bool,
@@ -253,9 +241,9 @@ impl Default for SnapshotConfig {
             storage_directory: cog_core::paths::data_path("snapshots"),
             hot_retention_days: cog_core::day::DAYS_PER_WEEK as u32,
             warm_retention_days: cog_core::day::DAYS_PER_QUARTER as u32,
-            compression_hot: ZSTD_LEVEL_DEFAULT,
-            compression_warm: ZSTD_LEVEL_WARM,
-            compression_cold: ZSTD_LEVEL_COLD,
+            compression_hot: cog_core::storage::COMPRESSION_LEVEL_DEFAULT,
+            compression_warm: cog_core::storage::COMPRESSION_LEVEL_WARM,
+            compression_cold: cog_core::storage::COMPRESSION_LEVEL_COLD,
         }
     }
 }

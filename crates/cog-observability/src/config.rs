@@ -481,16 +481,12 @@ pub struct AlertEmailConfig {
     pub subject_template: String,
 }
 
-/// 邮件提交口：RFC 6409 给提交（而非中继）定的约定端口。
-// cap: fixed — RFC 6409 提交端口 587
-const SMTP_SUBMISSION_PORT: u16 = 587;
-
 impl Default for AlertEmailConfig {
     fn default() -> Self {
         Self {
             recipients: String::new(),
             smtp_host: String::new(),
-            smtp_port: SMTP_SUBMISSION_PORT,
+            smtp_port: cog_core::alerts::SMTP_SUBMISSION_PORT,
             smtp_username: String::new(),
             smtp_password: String::new(),
             from_address: "alerts@cogneva.local".into(),

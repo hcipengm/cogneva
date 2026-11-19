@@ -198,8 +198,7 @@ const REBALANCE_INTERVAL: Duration =
 ///
 /// 告警去重与突发判定都看这个窗口；它要长到能盖住一次真实的故障脉冲，短到
 /// 不会把两次独立故障并成一条。
-const EVENT_WINDOW: Duration =
-    Duration::from_secs(cog_core::config::SUPERVISOR_EVENT_WINDOW_SECS);
+const EVENT_WINDOW: Duration = Duration::from_secs(cog_core::config::SUPERVISOR_EVENT_WINDOW_SECS);
 
 /// 控制面巡检周期：30s。
 ///

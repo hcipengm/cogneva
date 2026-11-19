@@ -873,8 +873,8 @@ impl Default for TierMigratorConfig {
             // 这个说法在几处慢慢走散。
             hot_duration_secs: crate::day::SECONDS_PER_DAY as u64,
             warm_duration_secs: crate::day::SECONDS_PER_WEEK as u64,
-            warm_compression_level: 3,
-            cold_compression_level: 9,
+            warm_compression_level: crate::contract::storage::COMPRESSION_LEVEL_WARM,
+            cold_compression_level: crate::contract::storage::COMPRESSION_LEVEL_COLD,
             scan_interval_secs: crate::day::SECONDS_PER_HOUR as u64,
             cold_key_prefix: "raw".into(),
             trace_scan_batch: 5_000,
@@ -1260,8 +1260,10 @@ impl Default for SystemConfig {
             task_event_channel_capacity: 256,
             shutdown_timeout_ms: (30 * crate::day::MILLIS_PER_SECOND) as u64,
             timeout_checker_interval_secs: (crate::day::SECONDS_PER_MINUTE / 2) as u64,
-            loop_restart_max_consecutive: 3,
-            loop_restart_backoff_floor_secs: 5,
+            loop_restart_max_consecutive: crate::contract::loop_health::RestartSettings::default()
+                .max_consecutive,
+            loop_restart_backoff_floor_secs:
+                crate::contract::loop_health::RestartSettings::default().backoff_floor_secs,
             partition_maintenance_interval_secs: crate::day::SECONDS_PER_HOUR as u64,
             sandbox_executor_url: None,
             require_tool_identity: false,
@@ -1274,7 +1276,7 @@ impl Default for SystemConfig {
             memory_message_broadcast_capacity: 1024,
             observability_event_channel_capacity: 256,
             websocket_event_cache_capacity: 1000,
-            skill_hot_reload_interval_secs: (crate::day::SECONDS_PER_MINUTE / 2) as u64,
+            skill_hot_reload_interval_secs: SKILL_HOT_RELOAD_INTERVAL_SECS,
             anthropic_default_max_tokens: 4096,
             strict_persistence: true,
             enabled_plugins: None,
@@ -1735,6 +1737,26 @@ impl Default for BuildGateConfig {
     }
 }
 
+/// 技能目录多久扫一次改动。
+///
+/// 扫描是读目录、比 mtime，不花模型调用；三十秒是「改完技能到生效」的可接受
+/// 延迟与一次空扫的代价之间的那一档。技能注册表与 core 的运行时配置读同一份。
+// cap: fixed — 热加载节拍：半分钟
+pub const SKILL_HOT_RELOAD_INTERVAL_SECS: u64 = 30;
+
+/// 换版探活的三个数：启动宽限、探测节拍、连败几次判死。
+///
+/// 三者是同一件事的三个量：新二进制从 execve 到能答 `/health` 之间必须先给一段
+/// 宽限，之后按节拍问，连败到底就换回去。判死的总时长是节拍 × 次数（5s × 6 =
+/// 30s），与一次换版的观测窗同量级——宽限比它长、或总时长短到一次慢启动就被判
+/// 死，都会让「换版没起来」和「换版还在起」在读数上同形。
+// cap: fixed — 探活口径：十秒宽限、五秒一探、六次判死
+pub const HEALTH_CHECK_GRACE_SECS: u64 = 10;
+// cap: fixed — 同上：探测节拍五秒
+pub const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
+// cap: fixed — 同上：连败六次判死（合计约三十秒）
+pub const HEALTH_CHECK_FAILURES_BEFORE_DEAD: u32 = 6;
+
 /// Configuration for the self-evolution auto-deploy pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1965,9 +1987,9 @@ impl Default for SelfEvolutionConfig {
             binary_dir: crate::paths::app_path_str("bin"),
             backup_dir: crate::paths::app_path_str("bin/backups"),
             switch_mode: "self_exec".into(),
-            health_check_grace_period_secs: 10,
-            health_check_interval_secs: 5,
-            health_check_max_retries: 6,
+            health_check_grace_period_secs: HEALTH_CHECK_GRACE_SECS,
+            health_check_interval_secs: HEALTH_CHECK_INTERVAL_SECS,
+            health_check_max_retries: HEALTH_CHECK_FAILURES_BEFORE_DEAD,
             test_command: Self::default_test_command(),
             fmt_check_command: None,
             lint_command: None,
