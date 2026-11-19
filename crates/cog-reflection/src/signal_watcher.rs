@@ -3977,15 +3977,21 @@ mod tests {
     /// section is there, the code default when it is not — the resolution
     /// `SignalWatcherConfig::load` performs, reproduced rather than trusted.
     fn retention_and_wait(document: &serde_json::Value) -> (bool, u64, i64) {
-        let enabled = document["dag_executor"]["archive_enabled"]
-            .as_bool()
-            .expect("dag_executor.archive_enabled");
+        // 缺席就是默认：这两个叶子在 `DagExecutorConfig` 上带着 `#[serde(default)]`，
+        // 文档里不写时部署读到的就是代码默认值。把缺席当成错（`expect`）会在这份文档
+        // 不再抄默认值之后把门自己弄红——判据量的是「部署读到的那一对」，不是「文档里
+        // 写了几个数」。
+        let defaults = cog_core::Config::default().dag_executor;
+        let enabled = document
+            .pointer("/dag_executor/archive_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.archive_enabled);
         // 没有写这个叶子就是「按内置值」，和 cooldown 一样：文档不再抄一遍
         // 代码里已经有的数，读的人不能把「没写」当成缺字段。
         let retention = document
             .pointer("/dag_executor/archive_after_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| cog_core::Config::default().dag_executor.archive_after_secs);
+            .unwrap_or(defaults.archive_after_secs);
         let wait = document
             .pointer("/self_evolution/signal_watcher/report_cooldown_secs")
             .and_then(|v| v.as_i64())
