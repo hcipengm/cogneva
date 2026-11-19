@@ -21,8 +21,8 @@
 //! 只有 `common::config_surface::readers` 说了算：那道表与 `config_section_reader_contract_test`
 //! 共用，抄第二份就会有两份对同一节给出不同答案、而两份都各自绿。
 //!
-//! 「有没有人写过一句话」这一问，走查对每一个叶子都问；「是不是抄件」那一问只对其中
-//! 一类叶子问得出来。分清楚：
+//! 判到什么、不判什么，说清楚：「有没有人写过一句话」这一问，走查对每一个叶子都问；
+//! 「是不是抄件」那一问只对其中一类叶子问得出来。
 //! - **判到类型答案**的叶子（类型能把这个路径读回来、又有个默认值可比）才判抄件，也判
 //!   无主。一个不是代码默认值、旁边又没人写过一句话的数，就是属主口径里的 `override`
 //!   ——人拍的一个数，答不出该由哪条实测导出，也点不出是哪条协议约定。它的三种去向：
@@ -466,5 +466,45 @@ fn no_number_restates_the_answer_the_app_already_gives() {
          只让人以为这个部署在它们上面做过决定；代码里那处才是唯一声明。\n{}",
         copies.len(),
         copies.join("\n")
+    );
+}
+
+/// 告警阈值不是豁免。它过不过形状门（`every_alert_condition_has_a_promql_shape_test`
+/// 与那条夹具自证）问的是「会不会按预期响」，与「这条线该在哪、凭什么」是两件事：
+/// 一条永远不响的规则照样过那些格子。把走查判来源的那一步单独喂一份最小的规则文档，
+/// `rules` 那一族带一句 `_comment_greater_than` 时有主，拿走那一句就无主——缺的正是
+/// 形状门看不见的那一半。
+#[test]
+fn an_alert_threshold_is_owned_by_its_family_note() {
+    let steps = [
+        Step::Key("observability".into()),
+        Step::Key("infra_watch".into()),
+        Step::Key("rules".into()),
+        Step::Index(0),
+        Step::Key("condition".into()),
+        Step::Key("greater_than".into()),
+    ];
+    let doc = |note: bool| {
+        let mut infra_watch = serde_json::json!({
+            "poll_interval_secs": 15,
+            "rules": [{
+                "name": "disk_nearly_full",
+                "promql": "node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.25",
+                "condition": { "greater_than": 0.75 },
+            }],
+        });
+        if note {
+            infra_watch["_comment_greater_than"] =
+                Value::String("这条规则要抓的问题定这条线，不是这一族共用一条实测。".into());
+        }
+        serde_json::json!({ "observability": { "infra_watch": infra_watch } })
+    };
+    assert!(
+        same_place_declaration(&doc(true), &steps),
+        "规则的阈值旁边有一句 `_comment_greater_than`，就该算有主"
+    );
+    assert!(
+        !same_place_declaration(&doc(false), &steps),
+        "把那一句拿走，阈值就成了没人说过它从哪来的数；形状门判不到这一层，所以这里必须判"
     );
 }

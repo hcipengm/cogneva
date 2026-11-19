@@ -22,6 +22,11 @@
 #       不是抄进夹具的一份。
 # 另有两格证明它**不会**白红：真文件必须绿；拿不到 promtool 必须退 3（看不了 ≠ 一致）。
 #
+# 这条门判「会不会响」；**不判阈值从哪来**——一条规则的线该由哪条实测导出、或点名哪条
+# 约定，归交付文档的走查（`crates/cogneva/tests/shipped_config_numbers_are_registered_test.rs`，
+# `rules` 那一族要带一句 `_comment_<比较键>`）。把界抬到 1.5 或十亿证明的是夹具会红，
+# 不是这条线定得对；告警阈值不因有形状门就算判过来源。
+#
 # 跑法：bash deploy/scripts/tests/cogneva-json-alert-rules.test.sh
 set -uo pipefail
 

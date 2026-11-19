@@ -33,6 +33,13 @@
 //!   world and is not one -- the failure this is here to catch, since a cap that
 //!   stopped tracking its volume is a steady number either way.
 //!
+//! What this test does not judge: the delivered document. `values.yaml` is the
+//! chart's dials; `deploy/helm/cogneva/files/cogneva.json` is the application
+//! document, and its leaves are asked for a same-place `_comment_<key>` note by
+//! `crates/cogneva/tests/shipped_config_numbers_are_registered_test.rs`. A
+//! number can pass here and be a hand-picked one there: the two surfaces answer
+//! for different documents, and neither exempts the other.
+//!
 //! A key with no block is the same hole as a key with no loop. A numeric leaf of
 //! `values.yaml` with no block is a number nobody has said a measurement should
 //! move; a `derived` block whose proof is missing, or names something that is

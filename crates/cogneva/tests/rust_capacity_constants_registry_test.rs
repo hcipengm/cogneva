@@ -39,6 +39,13 @@
 //! constant that no longer exists is impossible, because the row *is* the
 //! constant. What is left for this test is the census and the word.
 //!
+//! What it does not judge: numeric defaults. A `field: 30` inside an
+//! `impl Default` is not a constant and this test never sees it; the same
+//! question for those numbers belongs to the config face. Nor does it judge the
+//! delivered document — its leaves are asked for a same-place note by
+//! `shipped_config_numbers_are_registered_test`. A `// cap:` word here says
+//! nothing about whether the number in `cogneva.json` came from anywhere.
+//!
 //! **It enumerates every written number, not only the ones whose name reads
 //! like a quantity.** The first version filtered by name -- bytes, sizes, caps,
 //! intervals -- on the argument that a `u64` holding a protocol version is not
