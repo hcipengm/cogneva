@@ -32,9 +32,9 @@
 //!   部署实际不会走到它，它只负责让人读错。
 //!
 //! 第三个面：**chart 自己**也不许把一个代码默认值再说一遍。判据同上，方向换成
-//! `values.yaml` 的叶子：这个叶子只由一条 env 转发消费、判词是 `fixed`（没有闭环
+//! `values.yaml` 的叶子：这个叶子只由一条 env 转发消费、块里没有证明（没有闭环
 //! 读它）、而它写的值等于「文档里没有这个键时应用自己给的值」——这条 env 送进去的
-//! 和不给就有的，是同一个数，它没有决定任何事。`derived` 的叶子不在其中：它的值
+//! 和不给就有的，是同一个数，它没有决定任何事。块里点了证明的叶子不在其中：它的值
 //! 是一个闭环的种子，种子本来就是部署可以自己定的那一格。
 //!
 //! 第四个面：**每一格都要有人读**。`values.yaml` 的叶子人口现读，读法从模板现读
@@ -249,11 +249,11 @@ fn template_uses(values_path: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// 一个叶子在 `values.yaml` 里带的判词：`derived`、`fixed`，或者没有块。
+/// 一个叶子在 `values.yaml` 里的块，逐行（`#` 去掉、去空白）。
 ///
-/// 判词块就是叶子上面那段连续的 `#` 注释里的一行 `# tunable: …`。这一份读法只
-/// 回答「这个词是什么」——块本身写得够不够，归 `tunable_registry_contract_test`。
-fn tunable_word(text: &str, values_path: &str) -> Option<String> {
+/// 判词块就是叶子上面那段连续的注释，以一行 `# tunable:` 开头。这一份读法只把
+/// 块交出来——块写得够不够、分类算得对不对，归 `tunable_registry_contract_test`。
+fn tunable_block(text: &str, values_path: &str) -> Option<Vec<String>> {
     let mut stack: Vec<(usize, String)> = Vec::new();
     let mut word = None;
     let mut block = Vec::new();
@@ -284,16 +284,22 @@ fn tunable_word(text: &str, values_path: &str) -> Option<String> {
                 .map(|(_, key)| key.as_str())
                 .collect::<Vec<_>>()
                 .join(".");
-            if path == values_path {
-                word = block
-                    .iter()
-                    .find_map(|line| line.strip_prefix("tunable:"))
-                    .map(|line| line.trim().to_string());
+            if path == values_path && block.iter().any(|line| line.starts_with("tunable:")) {
+                word = Some(block.clone());
             }
             block.clear();
         }
     }
     word
+}
+
+/// 这个叶子有没有人在量它：块的证据是 `proof:` 那一行。
+///
+/// 分类不读词——`values.yaml` 里已经没有词了。一个叶子只要点了证明测试，它的值
+/// 就是闭环的种子；没有点的，就是部署自己的一个决定。
+fn tunable_is_measured(text: &str, values_path: &str) -> bool {
+    tunable_block(text, values_path)
+        .is_some_and(|block| block.iter().any(|line| line.starts_with("proof:")))
 }
 
 /// chart 在 values 里给这个叶子写的值。
@@ -408,23 +414,23 @@ fn the_document_does_not_restate_a_value_the_default_already_states() {
     );
 }
 
-/// chart 里一个判成 `fixed` 的叶子，不许写一个代码默认值已经说过的值。
+/// chart 里一个没人量着的叶子，不许写一个代码默认值已经说过的值。
 ///
 /// 与上一节同一条判据，方向换成 chart：这个叶子只由一条 env 转发消费（没有别处
-/// 拿它去渲染清单），判词是 `fixed`（没有闭环读它），而它写的值与「文档里没有这个
+/// 拿它去渲染清单），块里没有证明（没有闭环读它），而它写的值与「文档里没有这个
 /// 键时应用自己给的值」一样——那么这条 env 送给进程的和进程不给就有的，是同一个数。
 /// 它没有决定任何事，只让人以为这个部署在这个字段上做过决定。
 ///
-/// 为什么 `derived` 的叶子不在这条判据里：它的值是一个闭环的**种子**（首拍之前
+/// 为什么有人量着的叶子不在这条判据里：它的值是一个闭环的**种子**（首拍之前
 /// 要有个值），种子本来就是部署可以自己定的那一格；代码默认值与它相同只说明种子
-/// 取自同一个数，不说明这一格是复述。真正的复述是 `fixed`——那个词不承诺任何
-/// 闭环，值又与默认值一样，于是它唯一的作用就是占一行。
+/// 取自同一个数，不说明这一格是复述。真正的复述是块里没有证明的叶子——它不承诺
+/// 任何闭环，值又与默认值一样，于是它唯一的作用就是占一行。
 ///
 /// 不判的：这个叶子还被模板别处引用（端口这类：删了清单就变了），它本来就在文档里
 /// 声明过（那是上一条判据的题目），或者它不是数值叶子（字符串路径另有形状，不在
 /// 这一块的账上）。
 #[test]
-fn the_chart_does_not_restate_a_fixed_value_the_default_already_states() {
+fn the_chart_does_not_restate_a_value_the_default_already_states() {
     let (pairs, doc) = handovers();
     let text = read_repo(VALUES);
     let values: serde_yaml::Value =
@@ -442,13 +448,13 @@ fn the_chart_does_not_restate_a_fixed_value_the_default_already_states() {
         if !chart.is_number() {
             continue; // 这一块只判数值叶子
         }
-        let word = tunable_word(&text, &pair.values_path);
+        let measured = tunable_is_measured(&text, &pair.values_path);
         let default = what_the_default_states_without(&doc, &pair.config_path);
         let Some(same) = agrees(&default, &chart) else {
             continue; // 比不了：报出来只会是猜
         };
         judged += 1;
-        if word.as_deref() == Some("derived") {
+        if measured {
             seeds += 1; // 闭环的种子：部署可以自己定，见上面
             continue;
         }
@@ -464,34 +470,33 @@ fn the_chart_does_not_restate_a_fixed_value_the_default_already_states() {
             continue; // 这个叶子还要决定清单本身
         }
         copies.push(format!(
-            "{} -> {}: .Values.{}（判词 {}）写 {:?}，而文档里没有这个键时应用自己给的就是 {}。\
+            "{} -> {}: .Values.{}（块里没有 `proof:`）写 {:?}，而文档里没有这个键时应用自己给的就是 {}。\
              这条 env 送进去的和不给就有的，是同一个数——既没有闭环读它、又没决定任何事",
             pair.env,
             pair.config_path,
             pair.values_path,
-            word.as_deref().unwrap_or("（没有判词块）"),
             chart,
             default
         ));
     }
     // 下限只挡「三跳或默认值往返整个失效」：判到 0 格时下面那条会在空集上报绿。
-    // 不钉「该有几个 fixed 复述」——修好之后那就是 0，钉在「修好之前有几个」等于
+    // 不钉「该有几个复述」——修好之后那就是 0，钉在「修好之前有几个」等于
     // 要求永远留一个。
     assert!(
         judged >= 1,
         "一个「叶子 -> env -> 默认值」的格都没判到：这条判据空了（三跳读法坏了）"
     );
-    // 判词读法本身也要看得见东西：这些格子里必须有 `derived` 的种子，否则上面那个
-    // 「不是 derived 就判」的分支会把每个叶子都当成 `fixed`——读法坏了与全树都是
+    // 读法本身也要看得见东西：这些格子里必须有带证明的种子，否则上面那个
+    // 「没有证明就判」的分支会把每个叶子都当成复述——读法坏了与全树都是
     // 复述，在红字上一模一样。
     assert!(
         seeds >= 1,
-        "判到的 {judged} 格里没有一个是 `derived` 的种子：判词块的读法坏了，\
+        "判到的 {judged} 格里没有一个是带 `proof:` 的种子：块的读法坏了，\
          下面的判据会把种子也当成复述"
     );
     assert!(
         copies.is_empty(),
-        "chart 里 `fixed` 的叶子把代码默认值又说了一遍：\n{}",
+        "chart 里没人量着的叶子把代码默认值又说了一遍：\n{}",
         copies.join("\n")
     );
 }
