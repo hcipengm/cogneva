@@ -112,21 +112,34 @@ pub struct SignalWatcherConfig {
     pub taste_channel_max_per_tick: usize,
 }
 
+/// 一拍最多处理几条信号：告警通道与口味通道问的是同一件事（一拍的处理时长要
+/// 短于下一拍到点），所以两处读同一个数——各写一个 5，改一处另一处不懂。
+// cap: bound — 由一拍的处理时长定：处理完这一批要早于下一拍到点
+const MAX_SIGNALS_PER_TICK: usize = 5;
+
+/// 同一类失败连着出现几次才算「重现」：一次是抖动，连着几次才是判据。
+// cap: bound — 由同类失败的到达率定：抖动会自己消失，真问题会连着来
+const FAILURE_RECURRENCE_THRESHOLD: usize = 3;
+
+/// 积压深到什么程度才值得报：它问的是「几拍排得完」，所以随一拍的吞吐走。
+// cap: bound — 由一拍排得动的条数定：积压超过几拍的量才报
+const BACKLOG_THRESHOLD: usize = 100;
+
 impl Default for SignalWatcherConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             poll_interval_secs: (5 * cog_core::day::SECONDS_PER_MINUTE) as u64,
-            failure_recurrence_threshold: 3,
+            failure_recurrence_threshold: FAILURE_RECURRENCE_THRESHOLD,
             failure_window_secs: cog_core::day::SECONDS_PER_HOUR,
-            backlog_threshold: 100,
+            backlog_threshold: BACKLOG_THRESHOLD,
             report_cooldown_secs: cog_core::day::SECONDS_PER_DAY,
             self_audit_interval_secs: cog_core::day::SECONDS_PER_WEEK,
             alert_channel_enabled: true,
-            alert_channel_max_per_tick: 5,
+            alert_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
             alert_label_max_chars: cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
             taste_channel_enabled: true,
-            taste_channel_max_per_tick: 5,
+            taste_channel_max_per_tick: MAX_SIGNALS_PER_TICK,
         }
     }
 }
@@ -4449,5 +4462,41 @@ mod tests {
             picked.superseded.is_empty(),
             "超上限的那一条不是重复，下一轮还要读它"
         );
+    }
+
+    /// 两条通道的每拍上限是一件事：改常量两处一起动，源码里不再各写一个数。
+    #[test]
+    fn both_channels_share_one_per_tick_cap() {
+        let cfg = SignalWatcherConfig::default();
+        assert_eq!(cfg.alert_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
+        assert_eq!(cfg.taste_channel_max_per_tick, MAX_SIGNALS_PER_TICK);
+
+        let source = include_str!("signal_watcher.rs");
+        let bare: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                (line.starts_with("alert_channel_max_per_tick:")
+                    || line.starts_with("taste_channel_max_per_tick:"))
+                    && line
+                        .split_once(':')
+                        .map(|(_, value)| {
+                            value.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(bare.is_empty(), "每拍上限不该各写一个数：{bare:?}");
+    }
+
+    /// 其余具名常量也要真的被读到。
+    #[test]
+    fn the_watcher_reads_its_named_defaults() {
+        let cfg = SignalWatcherConfig::default();
+        assert_eq!(
+            cfg.failure_recurrence_threshold,
+            FAILURE_RECURRENCE_THRESHOLD
+        );
+        assert_eq!(cfg.backlog_threshold, BACKLOG_THRESHOLD);
     }
 }
