@@ -1782,6 +1782,35 @@ pub struct BuildGateConfig {
     pub reserve_fresh_secs: u64,
 }
 
+// 构建闸门的九个出厂读数：每一个都是这台宿主的测量值，口径写在各字段上
+// （取中位还是峰值、为什么不用 load average、地板为什么不能从 MemAvailable
+// 反读）。写成具名常量是为了让「读数」有一个可被引用的落点——读数变了改这里，
+// 而不是在 `Default` 里改一个谁也叫不出名字的数字。
+
+// cap: bound — 一次构建同时吃几个核（实测取中位）；换机器要重量，读侧只压不抬
+const BUILD_GATE_DEMAND_CORES: f64 = 4.1;
+
+// cap: bound — 一次构建的峰值 RSS（实测取峰值）；换机器要重量，读侧只压不抬
+const BUILD_GATE_PEAK_RSS_MIB: u64 = 4481;
+
+// cap: bound — 开工前要留的空闲内存（宿主读数）；写成 GiB 换算而不是一个孤零零的 MiB 数
+const BUILD_GATE_MEM_FLOOR_MIB: u64 = 24 * 1024;
+
+// cap: bound — IO 停顿占一拍的预算比例（宿主读数）：超过它就是这台机器的盘跟不上
+const BUILD_GATE_IO_STALL_BUDGET_PCT: f64 = 70.0;
+
+// cap: bound — 「安静」的判定线（宿主读数）：CPU 占用低于它算一拍空闲
+const BUILD_GATE_CPU_CALM_PCT: f64 = 5.0;
+
+// cap: bound — 「安静」的判定线（宿主读数）：IO 停顿低于它算一拍空闲
+const BUILD_GATE_IO_CALM_PCT: f64 = 1.0;
+
+// cap: bound — 「安静」的判定线（宿主读数）：内存占用低于它算一拍空闲
+const BUILD_GATE_MEM_CALM_PCT: f64 = 1.0;
+
+// cap: bound — 两次采样之间的最小间隔（宿主读数）：密到采样本身成了负载就没有意义
+const BUILD_GATE_CPU_SAMPLE_GAP_MS: u64 = 200;
+
 impl Default for BuildGateConfig {
     fn default() -> Self {
         Self {
@@ -1807,15 +1836,15 @@ impl Default for BuildGateConfig {
             // 的范围里（核数、MemTotal 减去一个构建的峰值），只压不抬，并在
             // `source` 标签上写 `fitted`。搬到更小的机器上，这两个出厂值不会
             // 变成两条永远清不掉的墙，也不会被当成有人选过的数。
-            build_demand_cores: 4.1,
-            build_peak_rss_mib: 4481,
-            mem_floor_mib: 24 * 1024,
-            io_stall_budget_pct: 70.0,
-            cpu_calm_pct: 5.0,
-            io_calm_pct: 1.0,
-            mem_calm_pct: 1.0,
+            build_demand_cores: BUILD_GATE_DEMAND_CORES,
+            build_peak_rss_mib: BUILD_GATE_PEAK_RSS_MIB,
+            mem_floor_mib: BUILD_GATE_MEM_FLOOR_MIB,
+            io_stall_budget_pct: BUILD_GATE_IO_STALL_BUDGET_PCT,
+            cpu_calm_pct: BUILD_GATE_CPU_CALM_PCT,
+            io_calm_pct: BUILD_GATE_IO_CALM_PCT,
+            mem_calm_pct: BUILD_GATE_MEM_CALM_PCT,
             bound_window_secs: crate::day::SECONDS_PER_MINUTE as u64,
-            cpu_sample_gap_ms: 200,
+            cpu_sample_gap_ms: BUILD_GATE_CPU_SAMPLE_GAP_MS,
             reserve_fresh_secs: (15 * crate::day::SECONDS_PER_MINUTE) as u64,
         }
     }
@@ -2901,8 +2930,51 @@ mod tests {
             std::time::Duration::from_millis(DEFAULT_REDIS_RESPONSE_TIMEOUT_MS)
         );
     }
-}
 
+    /// 构建闸门的九个出厂读数也读具名常量。
+    #[test]
+    fn the_build_gate_reads_its_names() {
+        let cfg = BuildGateConfig::default();
+        assert_eq!(cfg.build_demand_cores, BUILD_GATE_DEMAND_CORES);
+        assert_eq!(cfg.build_peak_rss_mib, BUILD_GATE_PEAK_RSS_MIB);
+        assert_eq!(cfg.mem_floor_mib, BUILD_GATE_MEM_FLOOR_MIB);
+        assert_eq!(cfg.io_stall_budget_pct, BUILD_GATE_IO_STALL_BUDGET_PCT);
+        assert_eq!(cfg.cpu_calm_pct, BUILD_GATE_CPU_CALM_PCT);
+        assert_eq!(cfg.io_calm_pct, BUILD_GATE_IO_CALM_PCT);
+        assert_eq!(cfg.mem_calm_pct, BUILD_GATE_MEM_CALM_PCT);
+        assert_eq!(cfg.cpu_sample_gap_ms, BUILD_GATE_CPU_SAMPLE_GAP_MS);
+
+        let source = include_str!("config.rs");
+        let body = source
+            .split("impl Default for BuildGateConfig")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("BuildGateConfig 的默认值在这份文件里");
+        let names = [
+            "build_demand_cores",
+            "build_peak_rss_mib",
+            "mem_floor_mib",
+            "io_stall_budget_pct",
+            "cpu_calm_pct",
+            "io_calm_pct",
+            "mem_calm_pct",
+            "cpu_sample_gap_ms",
+        ];
+        let bare: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                names.iter().any(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(|value| value.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(bare.is_empty(), "这些出厂读数要读常量：{bare:?}");
+    }
+}
 #[cfg(test)]
 mod system_config_reads_its_names {
     use super::*;
