@@ -159,6 +159,13 @@ const CODE_ONLY: &[CodeOnly] = &[
          演示开关当成部署建议",
     ),
     code_only(
+        "gateway.notification_webhook_url",
+        "由 `COGNEVA_NOTIFICATION_WEBHOOK_URL` 覆盖，值由 chart 的\
+         `notification.webhookUrl` 送出；默认空 = 这个部署没有配通知出口。样例里写\
+         null 是把「没选」写成一个选择，而 chart 已经说了这个部署选的是什么——两处\
+         各说一遍时，样例那句还会被 env 层盖掉（values_leaves_have_one_source_test）",
+    ),
+    code_only(
         "gitee_integration.api_base",
         "由 `GITEE_API_BASE_ENV` 指向的环境变量覆盖；自建 Gitee 的地址随部署走",
     ),
@@ -192,6 +199,30 @@ const CODE_ONLY: &[CodeOnly] = &[
          导出器——写它会读成「这个部署有它」，而部署要启用时直接写这个键",
     ),
     code_only(
+        "self_evolution.build_gate.enabled",
+        "由 `COGNEVA_BUILD_GATE_ENABLED` 覆盖，值由 chart 的 `evolution.buildGate.enabled`\
+         送出；样例再写一遍 true 是同一件事的第二次声明，改 chart 的人不会想到样例里\
+         还压着一份",
+    ),
+    code_only(
+        "self_evolution.build_gate.lock_dir",
+        "由 `COGNEVA_BUILD_GATE_LOCK_DIR` 覆盖，值由 chart 的\
+         `evolution.buildGate.lockDir` 送出；锁目录是宿主上的路径约定（同一 dev:ino\
+         才互相设界），随部署的卷布局走，样例不复制一条宿主路径",
+    ),
+    code_only(
+        "self_evolution.build_gate.max_concurrent",
+        "由 `COGNEVA_BUILD_GATE_MAX_CONCURRENT` 覆盖，值由 chart 的\
+         `evolution.buildGate.maxConcurrent` 送出；`0` = 按宿主实测导出，正数才是\
+         钉死——样例里写 0 会被读成一个数，而它是一条闭环",
+    ),
+    code_only(
+        "self_evolution.build_gate.wait_secs",
+        "由 `COGNEVA_BUILD_GATE_WAIT_SECS` 覆盖，值由 chart 的\
+         `evolution.buildGate.waitSecs` 送出；等构建槽多久算超时随宿主负载走，样例\
+         不替部署定一个等待上限",
+    ),
+    code_only(
         "self_evolution.executor_enabled",
         "由 `COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED` 覆盖；默认关闭是安全方向，\
          样例不替部署开启进化执行",
@@ -212,6 +243,13 @@ const CODE_ONLY: &[CodeOnly] = &[
     code_only(
         "self_evolution.microvm",
         "整块默认关闭；路径与内核镜像随宿主走（见默认值），样例不替部署写宿主路径",
+    ),
+    code_only(
+        "self_evolution.poll_interval_secs",
+        "由 `COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS` 覆盖，值由 chart 的\
+         `evolution.pollIntervalSecs` 送出（300 秒的种子，运行期由上一轮实际耗时\
+         抬上去）。样例里写的那个数会被 env 层整个盖掉，读样例的人却会以为部署每\
+         60 秒扫一次新活——同一件事写两遍的两个数，一个生效、一个只是让人读错",
     ),
     code_only(
         "self_evolution.workspaces",

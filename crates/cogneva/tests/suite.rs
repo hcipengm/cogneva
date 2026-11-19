@@ -600,6 +600,8 @@ mod treatment_is_decided_without_the_label_test;
 mod tunable_registry_contract_test;
 #[path = "unwired_modules_contract_test.rs"]
 mod unwired_modules_contract_test;
+#[path = "values_leaves_have_one_source_test.rs"]
+mod values_leaves_have_one_source_test;
 #[path = "volume_footprint_declaration_test.rs"]
 mod volume_footprint_declaration_test;
 #[path = "wal_event_round_trip_test.rs"]
