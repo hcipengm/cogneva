@@ -806,7 +806,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-reflection/src/firecracker.rs", 1),
     ("crates/cog-reflection/src/gitops_puller.rs", 1),
     ("crates/cog-reflection/src/image_rollout.rs", 1),
-    ("crates/cog-reflection/src/lib.rs", 2),
+    ("crates/cog-reflection/src/lib.rs", 6),
     // 21 而不是 20：`CI_ASK_RETRY_DELAYS_MS` 是一张数组类型的阶梯，原先整行不进册。
     // 表进册之后这一格才算进本文件——不是上限抬了，是漏数的一条被数上了。
     ("crates/cog-reflection/src/mainline_deployer.rs", 21),
