@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
-# Compile ledger and the family gate: one line per cargo invocation, then the real cargo.
+# 编译之前先问一句：这一轮的待办，都改完了吗？
 #
-# Two jobs, both mechanical:
+# 默认是**全量编辑**：这一轮所有未完成的待办，一次改完，再编译一次。所以这个垫片在
+# 脏树上做两件事：
 #
-#   1. Record: time, worktree, arguments, HEAD and a fingerprint of the tree, so
-#      "was this tree compiled as it stands?" is a question git can answer later.
-#   2. Refuse a build on a dirty tree whose table-derived touchpoints are still
-#      untouched. The list comes from `family.py`, which reads the capacities,
-#      the chart projectors, the rule fixtures and the metric help — tables this
-#      repository maintains, not a guess about who calls what.
+#   1. 跑 `family.py --all-todos`：把「未完成待办的触点 ∪ 工作区改动」作为默认批次，
+#      有缺口（待办点名了但还没改的文件、或者没写触点的待办）就**拒绝编译**，
+#      并把缺口打出来——它给的不是禁令，是下一步该改什么。
+#   2. 记一行账：时间、工作树、参数、HEAD、树指纹。推之前那道门用它判两件事——
+#      「编辑晚于最后一次编译」与「一批编译了几次」。
 #
-# A clean tree is never refused: there is nothing to finish editing. That is also
-# why the push gate, which runs after a commit, is unaffected.
+# **要拆**：在编译前声明四条理由之一，例如
+#     COGNEVA_BATCH_SPLIT="1 — cog-gateway 与 cog-storage 的验证面不同" cargo test -p cog-storage
+# 声明会随这一笔进提交历史（推之前的门会再判一次真假），所以它不是免检牌。
 #
-# Bypass: COGNEVA_BATCH_UNCHECKED=1 (recorded in the ledger as unjudged), or
-# COGNEVA_COMPILE_LEDGER=/dev/null to skip recording altogether.
+# 干净树上不拦：没有待办在改，就没有「没改完」这回事。逐字绕过：COGNEVA_BATCH_UNCHECKED=1。
 set -u
 
 real_cargo="${REAL_CARGO:-$HOME/.cargo/bin/cargo}"
 ledger="${COGNEVA_COMPILE_LEDGER:-$HOME/.local/state/cogneva/compile-ledger.tsv}"
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-family="$here/family.py"
+# 这个垫片被装在 PATH 上（/usr/local/bin 或 ~/.local/bin），所以它**不能**从自己的
+# 位置找 `family.py`——那份工具跟着仓库走，位置由当前工作树决定。
+toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+family="${toplevel:+$toplevel/scripts/hooks/family.py}"
 
 sub="${1:-}"
 case "$sub" in
@@ -28,9 +30,38 @@ case "$sub" in
   *) builds=0 ;;
 esac
 
+dirty=0
+if git rev-parse --git-dir >/dev/null 2>&1 && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  dirty=1
+fi
+
+if [ "$builds" = "1" ] && [ "$dirty" = "1" ] && [ "${COGNEVA_BATCH_UNCHECKED:-0}" != "1" ] && [ -f "$family" ]; then
+  if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
+    if ! python3 "$family" --root "$toplevel" --all-todos; then
+      cat >&2 <<'EOF'
+
+cargo: 这一轮还有待办没改完，先别编译。
+
+  上面每一条 TODO 都是「这一轮该改、但还没改」的地方：待办点名的触点、或者从仓库
+  那几张配套表反查出来的缺口。默认的做法是把它们一次改完，再编译一次。
+
+  如果这一轮确实要拆，就在编译前声明四条理由之一（会随提交进历史，推之前还要被判一次）：
+
+      COGNEVA_BATCH_SPLIT="1 — <两侧边界>"   # 验证面不同
+      COGNEVA_BATCH_SPLIT="2 — <会重叠的测试目标>"  # 失败不可归因
+      COGNEVA_BATCH_SPLIT="3 — <哪一处不可逆>"      # 要滚动/迁移/动现场
+      COGNEVA_BATCH_SPLIT="4 — <这一侧为什么读不完>" # 工作集超限
+
+  要跳过整条检查：COGNEVA_BATCH_UNCHECKED=1 cargo ...
+EOF
+      exit 1
+    fi
+  else
+    printf 'cargo: 本批按声明拆分：%s\n' "$COGNEVA_BATCH_SPLIT" >&2
+  fi
+fi
+
 fingerprint() {
-  # The tree as it would be committed: tracked changes, staged changes and
-  # untracked files, in a stable order.
   {
     git rev-parse HEAD 2>/dev/null || echo "no-head"
     git status --porcelain=v2 2>/dev/null
@@ -38,25 +69,6 @@ fingerprint() {
     git ls-files --others --exclude-standard 2>/dev/null
   } | sha256sum | cut -d' ' -f1
 }
-
-if [ "$builds" = "1" ] && [ "${COGNEVA_BATCH_UNCHECKED:-0}" != "1" ] && [ -f "$family" ]; then
-  if git rev-parse --git-dir >/dev/null 2>&1 && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-    if ! python3 "$family" --root "$(git rev-parse --show-toplevel)" --from-git; then
-      cat >&2 <<'EOF'
-
-cargo: 这一族还没改完，先别编译。
-
-  上面每一条 TODO 都是本仓的一张表 + 检查它的门：容量登记表、chart 投影、告警夹具、
-  指标 help。改完它们再编译，编译器就只剩「代码耦合」那一次发现要做——那是唯一
-  需要编译才知道的部分。
-
-  确实不需要改的，在提交信息里写：  Skip: <path> — <为什么这一族不动它>
-  要跳过这次检查：COGNEVA_BATCH_UNCHECKED=1 cargo ...
-EOF
-      exit 1
-    fi
-  fi
-fi
 
 if [ "$ledger" != "/dev/null" ]; then
   {
