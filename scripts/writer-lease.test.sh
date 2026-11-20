@@ -9,10 +9,12 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LEASE="$HERE/writer-lease.sh"
-# 门在 2026-10-17 的目录重整里搬进了 scripts/gates/，而租约本体与这份测试还留在
-# scripts/。三者不同级，所以这里必须点名 gates/——按「同级」找会让整族在任何人提交时
-# 都红（must-green），而红的那句话说的是「门不在」，不是「门不灵」。
-GATE="$HERE/gates/check-writer-lease.sh"
+# 门在 `scripts/git-hooks/gates/`，租约本体与这份测试在 `scripts/`：三者不同级，所以
+# 这里必须点名那条路径——按「同级」找会让整族在任何人提交时都红（must-green），而红的
+# 那句话说的是「门不在」，不是「门不灵」。
+#
+# 2026-11-20 搬到公开仓时，门与租约第一次住在同一棵树里：这条路径跟着搬了一次。
+GATE="$HERE/git-hooks/gates/check-writer-lease.sh"
 
 pass=0; fail=0
 ok()  { printf 'ok    %s\n' "$1"; pass=$((pass + 1)); }
