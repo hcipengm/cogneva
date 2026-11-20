@@ -76,7 +76,11 @@ def _md_items(path: pathlib.Path) -> list[Item]:
         if not status.startswith(OPEN_STATUS):
             bad_status.append(f"{cells[0]}（状态：{status[:20]}）")
             continue
-        found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
+        # **取最后一个** `touches:`：正文里提到这个词（例如描述这条规则本身）不该
+        # 把后面的散文当成路径表。触点永远写在行尾那一格。
+        found = None
+        for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
+            pass
         touches: list[str] = []
         # 没有 `unknown` 这个后门：一行待办要么点得出它要动的文件，要么批次算不出来。
         deferred = False
