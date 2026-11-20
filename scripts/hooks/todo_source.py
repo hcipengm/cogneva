@@ -91,7 +91,10 @@ def _md_items(path: pathlib.Path) -> list[Item]:
         # 一条我刚写下的待办把整批卡死了两次。逗号在这里是分隔符，不是标点。
         #
         # 没有 `unknown` 这个后门：一行待办要么点得出它要动的文件，要么批次算不出来。
-        deferred = False
+        # `touches: unknown — 理由`：明确本轮不排。这一支此前**只写在注释里、没有实现**——
+        # 解析器只是把恰好等于 `unknown` 的那一段丢掉，于是那一行变成「没有触点」，
+        # 每一道读台账的门都报「算不出批次」。2026-11-20 实测：一条待办因此卡了整批三次。
+        deferred = bool(found) and found.group(1).strip().startswith("unknown")
         if found:
             raw = found.group(1).strip()
             # 路径后面常跟着一句注解（`… .py（以及普查文档）`）：注解不是路径的一部分。
