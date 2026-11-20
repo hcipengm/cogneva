@@ -119,6 +119,40 @@ def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, list[str]]], list[
             without.append(name)
             continue
         with_touch.append((name, paths))
+    return with_touch, without, defer
+    for line in ledger.read_text(errors="ignore").splitlines():
+        if not line.startswith("| S"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        name = cells[0]
+        # 状态在第三格（`| 项 | 内容 | 状态 | 判据 |`），但有的行把状态写进内容那一格；
+        # 判据那一格经常引用「未落」这样的词，所以不读它——否则一条已落的行会被当成待办。
+        status_cells = cells[2:3]
+        if not any(word in cell for cell in status_cells for word in OPEN_WORDS):
+            continue
+        # 只认单元格里的那一段：行文里引用 `touches:` 这个写法的地方不算声明。
+        found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
+        if not found:
+            without.append(name)
+            continue
+        raw = found.group(1).strip()
+        # `unknown` 只允许带理由，且它意味着「本轮明确不排」——不排要在推的时候逐条
+        # 点名（`Split: <1-4> — <S 号…> — 理由`），所以它不是走后门，是把话说在前面。
+        if raw.startswith("unknown"):
+            if "—" not in raw and "-" not in raw:
+                without.append(f"{name}（写了 unknown 但没说为什么）")
+                continue
+            defer.append(name)
+            continue
+        paths = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
+        # 每个触点都得长得像一条路径：带反引号、空格、或别的散文，说明这不是一份触点清单。
+        looks_like_path = re.compile(r"^[\w./-]+$")
+        if not paths or any(not looks_like_path.match(p) for p in paths):
+            without.append(name)
+            continue
+        with_touch.append((name, paths))
     # 「没写触点」只对本轮的待办成立：积压里的 `unknown` 是「本轮不排」，不是缺陷。
     without = [w for w in without if "round: current" in next(
         (l for l in ledger.read_text(errors="ignore").splitlines() if l.startswith(f"| {w.split('（')[0]} ")), "round: current")]
