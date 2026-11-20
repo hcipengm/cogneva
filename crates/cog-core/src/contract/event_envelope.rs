@@ -26,11 +26,37 @@ pub struct EnvelopeFields {
     pub attributes: String,
 }
 
+/// 事件流里**全部**的 kind，一处列出。
+///
+/// 每个写入口只知道自己那一种，于是「全集」从来没有出现过——普查问「有哪些 kind」
+/// 时，答案取决于谁碰巧写了一段。这一格把全集收在一处：新 kind 要么加进来，要么
+/// 写入口当场被拒（[`check`] 会拒 `Unknown`）。
+/// 名单按写入方分：轮次（`round_*`）、计划（`batch_planned`）、变更候选四个阶段
+/// （`change_*`）、两类调用事实（`llm_call`／`tool_call`）。
+pub const KINDS: [&str; 9] = [
+    "round_opened",
+    "round_closed",
+    "batch_planned",
+    "change_candidate",
+    "change_measured",
+    "change_accepted",
+    "change_rejected",
+    "llm_call",
+    "tool_call",
+];
+
+/// 这个 kind 在闭集里吗。
+pub fn is_known_kind(kind: &str) -> bool {
+    KINDS.contains(&kind)
+}
+
 /// 写入口拒绝它的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvelopeDefect {
     /// 这一格不许空。
     Empty(&'static str),
+    /// 这个 kind 不在闭集里。
+    UnknownKind(String),
     /// `attributes` 要是 JSON 对象：一个字符串包着 JSON 在读侧解析两遍，而两遍里
     /// 有一遍出错时就只有一半读者读得到。
     AttributesNotAnObject,
@@ -40,6 +66,7 @@ impl EnvelopeDefect {
     pub fn as_str(&self) -> &'static str {
         match self {
             EnvelopeDefect::Empty(column) => column,
+            EnvelopeDefect::UnknownKind(_) => "kind",
             EnvelopeDefect::AttributesNotAnObject => "attributes",
         }
     }
@@ -67,6 +94,9 @@ pub fn check(fields: &EnvelopeFields) -> Result<(), EnvelopeDefect> {
         if value.trim().is_empty() {
             return Err(EnvelopeDefect::Empty(name));
         }
+    }
+    if !is_known_kind(&fields.kind) {
+        return Err(EnvelopeDefect::UnknownKind(fields.kind.clone()));
     }
     let parsed: serde_json::Value = serde_json::from_str(&fields.attributes)
         .map_err(|_| EnvelopeDefect::AttributesNotAnObject)?;
@@ -164,5 +194,51 @@ mod tests {
         assert_eq!(check(&fields), Err(EnvelopeDefect::Empty("scope")));
         fields.scope = "crates/a".into();
         assert_eq!(check(&fields), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod kind_closure_tests {
+    use super::*;
+
+    /// 闭集是唯一的一处：写进去的每一种 kind 都得在 `KINDS` 里。
+    #[test]
+    fn a_kind_outside_the_closed_set_is_refused() {
+        let mut fields = EnvelopeFields {
+            event_id: "01H".into(),
+            kind: "llm_call".into(),
+            subject_kind: "llm_call".into(),
+            subject_id: "c1".into(),
+            unit_of_work: "u1".into(),
+            step: "call".into(),
+            outcome: "ok".into(),
+            idempotency_key: "c1".into(),
+            actor: "a".into(),
+            writer: "w".into(),
+            scope: "".into(),
+            attributes: "{}".into(),
+        };
+        assert_eq!(check(&fields), Ok(()), "闭集里的 kind 应当通过");
+        fields.kind = "something_new".into();
+        assert_eq!(
+            check(&fields),
+            Err(EnvelopeDefect::UnknownKind("something_new".into())),
+            "集外的 kind 必须被拒，否则「有哪些 kind」又要靠谁碰巧写过一段"
+        );
+    }
+
+    /// 每种 kind 只出现一次，且都是写下划线小写：两个拼写就是两族事件。
+    #[test]
+    fn every_kind_is_spelt_once() {
+        let mut seen = KINDS.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), KINDS.len(), "闭集里有拼写重复的 kind");
+        for kind in KINDS {
+            assert!(
+                kind.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{kind} 的拼写与其余几族不一致"
+            );
+        }
     }
 }
