@@ -36,23 +36,12 @@ CLOSED_PREFIXES = ("已落",)
 
 
 class Item:
-    __slots__ = ("id", "title", "touches", "deferred", "check")
+    __slots__ = ("id", "title", "touches", "deferred")
 
-    def __init__(
-        self,
-        id: str,
-        title: str,
-        touches: list[str],
-        deferred: bool = False,
-        check: str = "",
-    ):
+    def __init__(self, id: str, title: str, touches: list[str], deferred: bool = False):
         self.id = id
         self.title = title
         self.touches = touches
-        # 这条待办的**可执行判据**：一条命令，跑绿了才算做完。
-        # 触点只回答「碰过没有」，判据回答「做完了没有」；批次要的是后者，
-        # 因为一个目录级的触点可以让一次编辑同时「满足」好几条待办。
-        self.check = check
         # `touches: unknown — 理由`：明确本轮不排。它不是「忘了写触点」——
         # 两者的修法不同（前者要 Split 点名，后者要先补触点），所以这里分开。
         self.deferred = deferred
@@ -100,9 +89,7 @@ def _md_items(path: pathlib.Path) -> list[Item]:
                 if p.strip() and p.strip() != "unknown"
             ]
             touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
-        found_check = re.search(r"[｜|]\s*check:\s*`([^`]+)`", line)
-        check = found_check.group(1).strip() if found_check else ""
-        out.append(Item(cells[0], cells[1][:80], touches, deferred, check))
+        out.append(Item(cells[0], cells[1][:80], touches, deferred))
     if malformed:
         raise Unreadable(
             "这些行以 `| S` 开头却没有状态列，读不出它做没做：" + "、".join(malformed)
