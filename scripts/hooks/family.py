@@ -83,9 +83,11 @@ def working_tree_changes(root: pathlib.Path) -> list[str]:
             base = current[2]
     except Exception:
         base = ""
+    # `origin/main...HEAD` 是**没有开着一轮时**的退路，不能与「自 code_rev 以来」叠加：
+    # 叠加之后量出来的是「与主线的全部差」，它比这一轮宽得多，于是推之前那道门（只读
+    # `diff <code_rev>`）报 4 条没做、这道门报 0 条——两道门数出两个数，2026-11-20 实测。
     for args in ([a for a in (
-        ["diff", "--name-only", base] if base else None,
-        ["diff", "--name-only", "origin/main...HEAD"],
+        ["diff", "--name-only", base] if base else ["diff", "--name-only", "origin/main...HEAD"],
         ["diff", "--name-only", "HEAD"],
         ["ls-files", "--others", "--exclude-standard"],
     ) if a is not None]):
@@ -215,9 +217,11 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
     for name, paths in todos:
         if not paths:
             continue
-        missing = [p for p in paths if not is_touched(p, every)]
-        if missing:
-            gaps.append((name, missing))
+        # 判据是「**任何一个**触点动了就算这一条被改到」，与推之前那道门同一条：
+        # 一条待办点名三处、动了两处，两边都该读作「做了」。原来这里写成「有一处没动
+        # 就是缺口」，于是同一批在两道门上是 21 与 4 两个数（2026-11-20 实测）。
+        if not any(is_touched(path, every) for path in paths):
+            gaps.append((name, [path for path in paths if not is_touched(path, every)]))
 
     owed: list[tuple[str, str]] = []
     for check in CHECKS:
@@ -323,6 +327,18 @@ def main(argv: list[str]) -> int:
             todos, missing, deferred = [], [], []
         else:
             todos_items, missing, deferred = todo_source.partition(f"md:{ledger_path}")
+        # 只判**这一轮钉住的那一批**：推之前那道门就是这么筛的（`round_ids`），
+        # 这里不筛的话，同一批会被数成两个数——2026-11-20 实测：推前门报 4 条、
+        # 编译前的门报 10 条，差的正是「没被选中本轮批次」的那几条。
+        round_ids: set[str] = set()
+        try:
+            import round as round_mod
+            current = round_mod.current_round()
+            if current and current[3]:
+                round_ids = {str(i) for i in current[3]}
+        except Exception:
+            round_ids = set()
+        todos_items = [i for i in todos_items if not round_ids or i.id in round_ids]
         todos = [(i.id, i.touches) for i in todos_items]
         # 触点必须指得到东西：写错的路径与「凭记忆写的路径」在批次里同形，而后者是
         # 这一整套最初要治的病。指不到就挡住批次，让写的人去核对。
