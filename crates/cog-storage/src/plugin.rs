@@ -1283,6 +1283,32 @@ impl cog_core::SystemPlugin for StoragePlugin {
         );
         ctx.publish_service(object_backend.clone());
 
+        // ── 切换后端时，本地那份对象还在不在 ──
+        // 从 `local-fs` 换到对象存储是一次数据搬迁，不是一次配置改动：新后端
+        // 看不到旧后端写在盘上的对象，而这件事在切换后没有任何报错——读到的
+        // 就是「空库」。启动时数一次、放在日志里，切换当天就能看见搬没搬完；
+        // 「数到 0」与「没数成」分开写，后者不许读成前者。
+        if let Some(base) =
+            crate::backends::object_backends::local_object_base(&storage_provider_config)
+        {
+            match crate::backends::object_backends::objects_on_disk(&base).await {
+                Ok(0) => info!(
+                    path = %base.display(),
+                    "object store is not local-fs and the local object tree is empty; nothing was left behind"
+                ),
+                Ok(objects) => warn!(
+                    path = %base.display(),
+                    objects,
+                    "object store is not local-fs but this path still holds objects written while it was; they are not visible through the active backend until they are copied into it"
+                ),
+                Err(e) => warn!(
+                    path = %base.display(),
+                    error = %e,
+                    "object store is not local-fs; the local object tree could not be read, so how many objects it still holds is unknown — not zero"
+                ),
+            }
+        }
+
         // ── 数据库健康 ──
         // 报健康的进程（网关）不持有连接池：池是这一侧的资产。这里给出一个只回答
         // 「还答不答」的入口，探针按 `cog_core::DatabaseHealth` 问。
