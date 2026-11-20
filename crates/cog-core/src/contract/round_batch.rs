@@ -74,6 +74,14 @@ pub trait RoundEvents: Send + Sync {
     /// `None` 与「读不到」是两件事：读不到必须报错，不能答 `None`——一个读不出来的流
     /// 会把自己读成「这一轮没人开工」，而缺口的判据随后就永远为真。
     async fn current(&self) -> SFResult<Option<RoundOpened>>;
+
+    /// 记一条 `round_closed`：**这一批做完了**。
+    ///
+    /// 没有它，第一轮会永远开着，而「按这一轮钉住的清单下发」会把循环钉死在同一批上
+    /// 直到进程重启——所以关轮与钉批是同一件事的两半，不能只落一半。
+    ///
+    /// 实现必须幂等：同一轮关两次写一条。
+    async fn close(&self, round: &str, actor: &str) -> SFResult<()>;
 }
 
 #[cfg(test)]

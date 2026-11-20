@@ -126,8 +126,8 @@ use cog_core::{
     ChangeSource, ChangeState, DemandClosure, DispatchDecision, DispatchState, LiveRevision,
     LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend, OrchestratorControl,
     OwnerLeaseBroker, PoolReading, PoolWait, PrincipleCheckKind, PrincipleLedgerStore,
-    PrincipleRow, RemeasureBacklog, RetireReason, SFResult, ShutdownSignal, StateBackend, Task,
-    TaskStatus, TaskType, WriteWindow,
+    PrincipleRow, RemeasureBacklog, RetireReason, RoundEvents, RoundOpened, SFResult,
+    ShutdownSignal, StateBackend, Task, TaskStatus, TaskType, WriteWindow,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -2740,6 +2740,9 @@ pub fn spawn_change_ledger_loop(
     // none to read, and a loop that refused to keep the account over that would
     // trade a missing intake for a missing ledger.
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
+    // 定批的写入器：这一轮的批次钉进事件流，下一拍按它下发。可选，与其余协作者同一
+    // 个道理——没有事件流的部署没有可钉住的东西，而「没报出来」在启动那一行里说得清。
+    rounds: Option<Arc<dyn RoundEvents>>,
 ) {
     info!(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
@@ -2811,6 +2814,7 @@ pub fn spawn_change_ledger_loop(
             let live_revision = live_revision.clone();
             let events = events.clone();
             let alert_source = alert_source.clone();
+            let rounds = rounds.clone();
             async move {
                 // The role is renewed on the lease contract's own cadence rather
                 // than once per pass: a pass can be long, and a term that ran out
@@ -3116,6 +3120,7 @@ pub fn spawn_change_ledger_loop(
                             deliveries.as_ref(),
                             commits_read,
                             firing.as_deref(),
+                            rounds.as_deref(),
                         )
                         .await
                         {
@@ -5277,6 +5282,90 @@ fn oldest_landing_age(now_unix: i64, landing_times: impl IntoIterator<Item = i64
 /// sets. A row may be both -- a bad check keeps its `pending` state -- and
 /// splitting them here is what keeps the handover from becoming a claim about
 /// the tree.
+/// 定批：这一拍要下发的，就是**当前那一轮钉住的那几条**。
+///
+/// 没有这一层时，每一拍读一次「欠着哪些」再挑一遍——挑哪些、挑几条，都由这一拍临场
+/// 决定，而事后没有任何一条读数说得清当时的批次是什么。带外那一侧的病是同一个：清单
+/// 不钉住，「做完了没有」就没有固定的主语。
+///
+/// 三条口径：
+///
+/// - **开着一轮时，只发那一轮的**。清单里还欠着、却这一拍不可下发的（正在测量、
+///   被上游暂停），就是这一拍少发的那几条——不是「没有欠着的」。
+/// - **清单里一条都不欠了就关轮**，再按这一刻欠着的开新的一轮。关轮与钉批是同一件
+///   事的两半：只钉不关，第一轮会永远开着，循环被钉死在同一批上。
+/// - **读不到就这一拍不下发**，而不是退回「没有钉住」——退回等于把这道判据静默关掉，
+///   而它关掉的正是「这一轮做了个我挑的子集」这件事唯一的约束。
+async fn pinned_batch(
+    rounds: &dyn RoundEvents,
+    outstanding: &[ChangeLedgerRow],
+    pending: Vec<ChangeLedgerRow>,
+) -> Result<Vec<ChangeLedgerRow>, String> {
+    let owed_now: HashSet<String> = outstanding.iter().map(|r| r.identity.to_string()).collect();
+    let Some(open) = rounds.current().await.map_err(|e| e.to_string())? else {
+        return open_next_round(rounds, pending).await;
+    };
+    let still_owed = open
+        .batch
+        .iter()
+        .filter(|id| owed_now.contains(*id))
+        .count();
+    if still_owed == 0 {
+        rounds
+            .close(&open.round, "change-ledger")
+            .await
+            .map_err(|e| e.to_string())?;
+        info!(
+            round = %open.round,
+            batch = open.batch.len(),
+            "change ledger: 这一轮钉住的批次一条都不欠了，关轮"
+        );
+        return open_next_round(rounds, pending).await;
+    }
+    let allowed: HashSet<String> = open.batch.iter().cloned().collect();
+    let before = pending.len();
+    let pinned: Vec<ChangeLedgerRow> = pending
+        .into_iter()
+        .filter(|row| allowed.contains(&row.identity.to_string()))
+        .collect();
+    info!(
+        round = %open.round,
+        batch = open.batch.len(),
+        owed = still_owed,
+        dispatched = pinned.len(),
+        dispatchable = before,
+        "change ledger: 按这一轮钉住的批次下发"
+    );
+    Ok(pinned)
+}
+
+/// 开一轮，批次＝这一刻可下发的那些。没有可下发的就不开：空批次的一轮下一拍立刻
+/// 「一条都不欠了」，会变成每拍开一轮关一轮的空转。
+async fn open_next_round(
+    rounds: &dyn RoundEvents,
+    pending: Vec<ChangeLedgerRow>,
+) -> Result<Vec<ChangeLedgerRow>, String> {
+    if pending.is_empty() {
+        return Ok(pending);
+    }
+    let round = RoundOpened {
+        round: format!("round-{}", Utc::now().timestamp_millis()),
+        // 平台的账在库里，没有 git rev：空串是「这本台账没有版本坐标」，不是「没有台账」。
+        ledger_rev: String::new(),
+        code_rev: String::new(),
+        batch: pending.iter().map(|r| r.identity.to_string()).collect(),
+        actor: "change-ledger".into(),
+        at: Utc::now(),
+    };
+    rounds.open(&round).await.map_err(|e| e.to_string())?;
+    info!(
+        round = %round.round,
+        batch = round.batch.len(),
+        "change ledger: 开了一轮，批次已钉进事件流"
+    );
+    Ok(pending)
+}
+
 fn dispatchable(
     rows: &[ChangeLedgerRow],
     unsettled: &HashMap<ChangeIdentity, UnsettledCheck>,
@@ -5420,6 +5509,11 @@ async fn dispatch_pass(
     // which is a different finding from "nothing is ringing", and the face
     // lifecycle reads it as a second intake of work nobody has a name on.
     alerts: Option<&[cog_core::PersistedAlert]>,
+    // The round this process pinned its batch in. `None` is a deployment that
+    // publishes no event stream: it hands over whatever is dispatchable, which
+    // is the behaviour from before the pin existed. Which one it is is said at
+    // start-up, not inferred from a pass that dispatched fewer rows.
+    rounds: Option<&dyn RoundEvents>,
 ) -> Option<PoolVerdict> {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
@@ -5502,7 +5596,20 @@ async fn dispatch_pass(
         }
     }
 
-    let pending = dispatchable(&rows, unsettled);
+    // 定批在这里生效：这一拍下发的，就是开着一轮时钉住的那几条。
+    let pending = match rounds {
+        Some(rounds) => match pinned_batch(rounds, &rows, dispatchable(&rows, unsettled)).await {
+            Ok(pinned) => pinned,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "change ledger: 这一拍的批次读不出来，这一拍不下发——读不到不是「没有欠着的」"
+                );
+                return None;
+            }
+        },
+        None => dispatchable(&rows, unsettled),
+    };
 
     // Counted apart from the states because these rows are `pending`: the state
     // line cannot show them, and a pass that quietly stopped handing rows over
@@ -11919,6 +12026,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -11993,6 +12101,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -12042,6 +12151,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -12081,6 +12191,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12195,6 +12306,137 @@ mod tests {
         }
     }
 
+    /// 事件流的替身：记住钉住的批次与被关掉的轮次。
+    #[derive(Default)]
+    struct FakeRounds {
+        open: std::sync::Mutex<Option<RoundOpened>>,
+        opened: std::sync::Mutex<Vec<RoundOpened>>,
+        closed: std::sync::Mutex<Vec<String>>,
+        broken: bool,
+    }
+
+    impl FakeRounds {
+        fn broken() -> Self {
+            Self {
+                broken: true,
+                ..Self::default()
+            }
+        }
+        fn with(round: RoundOpened) -> Self {
+            Self {
+                open: std::sync::Mutex::new(Some(round)),
+                ..Self::default()
+            }
+        }
+        fn opened(&self) -> Vec<RoundOpened> {
+            self.opened.lock().unwrap().clone()
+        }
+        fn closed(&self) -> Vec<String> {
+            self.closed.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RoundEvents for FakeRounds {
+        fn writer(&self) -> &str {
+            "change-ledger"
+        }
+        async fn open(&self, round: &RoundOpened) -> SFResult<()> {
+            if self.broken {
+                return Err(SFError::Database("no stream".into()));
+            }
+            *self.open.lock().unwrap() = Some(round.clone());
+            self.opened.lock().unwrap().push(round.clone());
+            Ok(())
+        }
+        async fn current(&self) -> SFResult<Option<RoundOpened>> {
+            if self.broken {
+                return Err(SFError::Database("no stream".into()));
+            }
+            Ok(self.open.lock().unwrap().clone())
+        }
+        async fn close(&self, round: &str, _actor: &str) -> SFResult<()> {
+            self.closed.lock().unwrap().push(round.to_string());
+            *self.open.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    fn round_with(batch: &[&str]) -> RoundOpened {
+        RoundOpened {
+            round: "round-open".into(),
+            ledger_rev: String::new(),
+            code_rev: String::new(),
+            batch: batch.iter().map(|s| s.to_string()).collect(),
+            actor: "change-ledger".into(),
+            at: Utc::now(),
+        }
+    }
+
+    /// 没有开着的一轮：开一轮，批次就是这一刻可下发的那些。
+    #[tokio::test]
+    async fn a_pass_with_no_round_pins_the_batch_it_is_about_to_dispatch() {
+        let rounds = FakeRounds::default();
+        let pending = vec![pending_row("crates/a"), pending_row("crates/b")];
+        let pinned = pinned_batch(&rounds, &pending, pending.clone())
+            .await
+            .expect("pinning must succeed against a working stream");
+        assert_eq!(pinned.len(), 2, "开轮那一拍下发的就是这一批，不多不少");
+        let opened = rounds.opened();
+        assert_eq!(opened.len(), 1);
+        let ids: Vec<String> = pending.iter().map(|r| r.identity.to_string()).collect();
+        assert_eq!(opened[0].batch, ids, "钉住的清单就是这一拍要发的那些");
+    }
+
+    /// 开着一轮时只发那一轮的：**这一条在没有钉批时是红的**——那版会把两条都发出去。
+    #[tokio::test]
+    async fn an_open_round_narrows_the_dispatch_to_its_own_batch() {
+        let rounds = FakeRounds::with(round_with(&[pending_row("crates/a")
+            .identity
+            .to_string()
+            .as_str()]));
+        let pending = vec![pending_row("crates/a"), pending_row("crates/b")];
+        let pinned = pinned_batch(&rounds, &pending, pending.clone())
+            .await
+            .expect("读得到就得钉得住");
+        assert_eq!(pinned.len(), 1, "这一轮钉住的只有一条，第二条不属于这一批");
+        assert_eq!(pinned[0].identity, pending[0].identity);
+        assert!(rounds.opened().is_empty(), "已经开着的一轮不该再开一条");
+    }
+
+    /// 一条都不欠了：关轮，再按这一刻欠着的开新的一轮。只钉不关会把循环钉死。
+    #[tokio::test]
+    async fn a_round_whose_batch_is_no_longer_owed_is_closed_and_replaced() {
+        let stale = round_with(&["no-such-change"]);
+        let rounds = FakeRounds::with(stale);
+        let pending = vec![pending_row("crates/a")];
+        let pinned = pinned_batch(&rounds, &pending, pending.clone())
+            .await
+            .expect("pinning must succeed");
+        assert_eq!(
+            rounds.closed(),
+            vec!["round-open".to_string()],
+            "旧的一轮该关掉"
+        );
+        assert_eq!(pinned.len(), 1);
+        let opened = rounds.opened();
+        assert_eq!(opened.len(), 1, "关轮之后要开新的一轮");
+        assert_eq!(opened[0].batch, vec![pending[0].identity.to_string()]);
+    }
+
+    /// 读不到批次就这一拍不下发：退回「没有钉住」等于把这道判据静默关掉。
+    #[tokio::test]
+    async fn an_unreadable_round_hands_nothing_over() {
+        let rounds = FakeRounds::broken();
+        let pending = vec![pending_row("crates/a")];
+        assert!(
+            pinned_batch(&rounds, &pending, pending.clone())
+                .await
+                .is_err(),
+            "读不到不是「没有开着一轮」，也不是「没有欠着的」"
+        );
+    }
+
     fn firing(face: Option<&str>) -> cog_core::PersistedAlert {
         let mut labels = serde_json::Map::new();
         if let Some(face) = face {
@@ -12266,6 +12508,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12452,6 +12695,7 @@ mod tests {
             None,
             None,
             Some(&alerts),
+            None,
         )
         .await;
 
@@ -12478,6 +12722,7 @@ mod tests {
             None,
             None,
             Some(&[firing(Some("tasks")), firing(Some("tasks"))]),
+            None,
         )
         .await;
         assert!(graph.submitted().is_empty(), "{:?}", graph.submitted());
@@ -12519,6 +12764,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12584,6 +12830,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -12924,6 +13171,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -12991,6 +13239,7 @@ mod tests {
             Some(&deliveries),
             None,
             None,
+            None,
         )
         .await;
 
@@ -13049,6 +13298,7 @@ mod tests {
             Some(&deliveries),
             None,
             None,
+            None,
         )
         .await;
 
@@ -13089,6 +13339,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13138,6 +13389,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13214,6 +13466,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -13239,6 +13492,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13299,6 +13553,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -13328,6 +13583,7 @@ mod tests {
             Some(&metrics),
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13364,6 +13620,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -13395,6 +13652,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13435,6 +13693,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let state = store.written().pop().expect("the pass wrote its row");
@@ -13456,6 +13715,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13482,6 +13742,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13520,6 +13781,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13571,6 +13833,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -13603,6 +13866,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -13807,6 +14071,7 @@ mod tests {
             None,
             Some(events),
             None,
+            None,
         );
 
         // The first tick is one pass interval away. Paused time makes that a
@@ -13939,6 +14204,7 @@ mod tests {
             Some(&metrics),
             Some(&events),
             &[],
+            None,
             None,
             None,
             None,

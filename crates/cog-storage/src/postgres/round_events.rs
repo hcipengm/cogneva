@@ -36,6 +36,16 @@ VALUES ($1, 'round_opened', 'round', $2, $2, 'open', 'ok', 1, $3, NULL, NULL, $4
         'round', 1, $6, $7) \
 ON CONFLICT (writer, idempotency_key) DO NOTHING";
 
+/// 关一轮。幂等键是「这一轮的身份＋closed」，与开工那条不是同一个键。
+const CLOSE_SQL: &str = "\
+INSERT INTO cogneva_event (\
+    event_id, kind, subject_kind, subject_id, unit_of_work, step, outcome, attempt, \
+    idempotency_key, causation_id, batch_id, actor, writer, scope, payload_version, \
+    attributes, at) \
+VALUES ($1, 'round_closed', 'round', $2, $2, 'close', 'ok', 1, $3, NULL, NULL, $4, $5, \
+        'round', 1, '{}', NOW()) \
+ON CONFLICT (writer, idempotency_key) DO NOTHING";
+
 /// 当前开着的那一轮：最后一条没有配对 `round_closed` 的开工事件。
 const CURRENT_SQL: &str = "\
 SELECT subject_id, attributes::jsonb->>'ledger_rev' AS ledger_rev, \
@@ -101,6 +111,20 @@ impl RoundEvents for RoundEventStore {
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("append round_opened: {e}")))?;
+        Ok(())
+    }
+
+    async fn close(&self, round: &str, actor: &str) -> SFResult<()> {
+        let event_id = event_id_for(&format!("{round}-closed"));
+        sqlx::query(CLOSE_SQL)
+            .bind(&event_id)
+            .bind(round)
+            .bind(format!("{round}:closed"))
+            .bind(actor)
+            .bind(&self.writer)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("append round_closed: {e}")))?;
         Ok(())
     }
 

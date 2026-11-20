@@ -1007,6 +1007,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     // nobody was handed, and the same comparison that nominates
                     // a face for unowned rows nominates one for these.
                     ctx.consume_service::<dyn cog_core::ActiveAlertSource>(),
+                    // 定批：这一轮做哪几条，在开工那一刻钉进事件流，之后这一拍就只发
+                    // 那几条。没有它时每拍临场挑一遍——挑哪些、挑几条都没有读数说得清。
+                    // 可选，理由与其余协作者相同：没有事件流的部署没有可钉住的地方。
+                    ctx.consume_service::<dyn cog_core::RoundEvents>(),
                 );
             }
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),

@@ -1132,6 +1132,20 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; the change ledger is unavailable in this deployment");
         }
 
+        // ── RoundEvents ──
+        // 定批的落点：这一轮做哪几条，钉进事件流。与账本同池、同一条链：账本说
+        // 「欠着什么」，这一族说「这一轮做的是哪几条」。没有池就不发布，循环按
+        // 「没有可钉住的地方」跑——那一句在它启动时说得清，而不是让每一拍悄悄退回
+        // 「没有钉住」。
+        if let Some(pool) = self.pg_pool.clone() {
+            let deployment = std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
+                .unwrap_or_else(|_| "cogneva".to_string());
+            let store: Arc<dyn cog_core::RoundEvents> =
+                Arc::new(crate::RoundEventStore::new(pool, deployment));
+            ctx.publish_service(store);
+            info!("StoragePlugin round events published");
+        }
+
         // ── PrincipleLedgerStore ──
         // The same shape and the same reason as the change ledger above: the
         // account is the table, a process-local one would report its own state

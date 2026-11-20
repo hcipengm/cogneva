@@ -68,21 +68,6 @@ impl Scratch {
         RoundEventStore::new(self.pool.clone(), "probe")
     }
 
-    async fn close(&self, round: &str) {
-        sqlx::query(
-            "INSERT INTO cogneva_event (event_id, kind, subject_kind, subject_id, unit_of_work,
-                step, outcome, idempotency_key, actor, writer, scope, attributes)
-             VALUES ($1, 'round_closed', 'round', $2, $2, 'close', 'ok', $3, 'probe', 'probe',
-                'round', '{}')",
-        )
-        .bind(format!("{round}closed").to_uppercase())
-        .bind(round)
-        .bind(format!("{round}:closed"))
-        .execute(&self.pool)
-        .await
-        .expect("close the round");
-    }
-
     async fn done(self) {
         cog_test_support::drop_schema(&cog_test_support::database_url(), &self.schema).await;
     }
@@ -117,7 +102,14 @@ async fn the_open_round_is_the_one_with_no_close() {
     assert_eq!(current.round, "r1");
     assert_eq!(current.batch, vec!["S1".to_string(), "S2".to_string()]);
 
-    scratch.close("r1").await;
+    store.close("r1", "probe").await.expect("close r1");
+    store.close("r1", "probe").await.expect("replay the close");
+    let closes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cogneva_event WHERE kind = 'round_closed'")
+            .fetch_one(&scratch.pool)
+            .await
+            .expect("count the closes");
+    assert_eq!(closes, 1, "关同一轮两次写了两条：幂等键没起作用");
     assert!(
         store.current().await.expect("read").is_none(),
         "关掉之后就没有开着的一轮了"
@@ -154,7 +146,7 @@ async fn closing_one_round_does_not_touch_another() {
         .open(&round("r2", &["S2", "S3"]))
         .await
         .expect("open r2");
-    scratch.close("r1").await;
+    store.close("r1", "probe").await.expect("close r1");
 
     let current = store.current().await.expect("read").expect("r2 is open");
     assert_eq!(current.round, "r2", "关掉 r1 之后当前那一轮该是 r2");
