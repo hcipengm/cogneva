@@ -69,65 +69,59 @@ impl std::fmt::Display for ChangeIdentity {
 
 /// Where a change is, as of the last time something looked.
 ///
+/// Two states, and only two: the artifact is there (`landed`) or it is not yet
+/// (`pending`). Every word this enum used to carry beside them -- `conflict`,
+/// `partial`, `undecided`, `retired` -- was a way to move a row out of the
+/// outstanding set without anybody doing the work, and each of them could be
+/// written by the side being judged. "The documents disagree" and "nothing
+/// settled it" are readings about one pass, not places a change can be; they
+/// ride on the row as [`ChangeMeasurement::unsettled_reason`] while the state
+/// stays `pending`, so the work is still owed and the reason it has not been
+/// done is beside it rather than instead of it.
+///
+/// `retired` is the case that made the collapse necessary. A row whose identity
+/// should not be held was being written out of the outstanding set by the census
+/// itself -- the judged party marking its own work done. Most of what was retired
+/// had never been done; the account simply stopped asking. Those rows are
+/// `pending` now, and [`RetireReason`] says that the ask is, in the census's
+/// reading, one nobody should carry: a judgement about the row's place in the
+/// account, not a statement that the change is in the tree.
+///
 /// The set is closed: a state outside it is a caller error rather than a new
 /// category, and the storage layer refuses to store one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeState {
-    /// The artifact and the documents disagree about it.
-    Conflict,
-    /// Wanted, not there yet.
+    /// Not in the tree yet, whether because nobody has written it or because
+    /// the last look could not settle the question. `unsettled_reason` tells
+    /// the two apart; the state does not, on purpose -- turning "could not
+    /// measure" into something other than outstanding is how work disappears.
     Pending,
-    /// Partly there: some of what the change asks for exists.
-    Partial,
-    /// Nothing has looked, or what it found does not settle the question.
-    Undecided,
     /// A measurement found the artifact as the change asks for it.
     Landed,
-    /// A look found the identity itself is one the account should not be
-    /// holding, so there is nothing left to ask of the code tree. A second
-    /// terminal state beside [`ChangeState::Landed`], and like it a property of
-    /// the `(identity, criterion revision)` pair rather than of the artifact: a
-    /// later look at a different corpus can move the row back out, which is why
-    /// this is a state and not a deletion.
-    Retired,
 }
 
 impl ChangeState {
     /// Every state, in the order the repository views group them.
     ///
-    /// The two terminal states come last, side by side, because that is how a
-    /// reader asks about them: `landed` and `retired` are the two ways a row
-    /// stops being outstanding, and the four before them are the ways it is not.
-    pub const ALL: [ChangeState; 6] = [
-        ChangeState::Conflict,
-        ChangeState::Pending,
-        ChangeState::Partial,
-        ChangeState::Undecided,
-        ChangeState::Landed,
-        ChangeState::Retired,
-    ];
+    /// Outstanding first: a reader asking "what is owed" reads the leading part
+    /// of this list regardless of how long the rest becomes.
+    pub const ALL: [ChangeState; 2] = [ChangeState::Pending, ChangeState::Landed];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            ChangeState::Conflict => "conflict",
             ChangeState::Pending => "pending",
-            ChangeState::Partial => "partial",
-            ChangeState::Undecided => "undecided",
             ChangeState::Landed => "landed",
-            ChangeState::Retired => "retired",
         }
     }
 
     /// Whether a row in this state is still outstanding work.
     ///
-    /// Both terminal states read false, and both for the same reason: a row
-    /// whose question has been answered -- by the artifact being there, or by the
-    /// identity turning out not to belong -- is not work anybody still owes. A
-    /// reader that asked "is it landed" to answer this would count every retired
-    /// row as outstanding.
+    /// A row that could not be measured is outstanding: the missing reading is
+    /// the row's work, and a state that read otherwise would turn every
+    /// unreadable scope into a silent completion.
     pub fn is_outstanding(self) -> bool {
-        !matches!(self, ChangeState::Landed | ChangeState::Retired)
+        self == ChangeState::Pending
     }
 }
 
@@ -135,10 +129,17 @@ impl std::str::FromStr for ChangeState {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|state| state.as_str() == s)
-            .ok_or_else(|| format!("unknown change state: {s}"))
+        match s {
+            "pending" => Ok(ChangeState::Pending),
+            "landed" => Ok(ChangeState::Landed),
+            // The four words the account no longer has. A stored row was moved to
+            // `pending` by the migration; a projection or a note written before it
+            // still says the old word, and reading that as `pending` is the honest
+            // answer -- none of them was a certificate that the change is in the
+            // tree. Anything else is a caller error, not a new category.
+            "conflict" | "partial" | "undecided" | "retired" => Ok(ChangeState::Pending),
+            other => Err(format!("unknown change state: {other}")),
+        }
     }
 }
 
@@ -676,11 +677,17 @@ impl ChangeLedgerRow {
     /// the account can measure about itself -- the holder is named by the
     /// delivery, and the held are the rows measured at that same revision.
     ///
+    /// A row the census has judged out of the account does not hold it, even
+    /// though the row is still `pending`: the demand it was delivered for has
+    /// been taken back, so a delivered diff on it is not a promise anybody is
+    /// carrying. The judgement rides on the reason, not on the state, which is
+    /// why this asks about the reason rather than the state alone.
+    ///
     /// Deliberately a method over the row's own facts rather than a stored
     /// band: the moment the claim becomes true the state moves and this answers
     /// false, with nothing left behind to go stale.
     pub fn holds_the_line(&self) -> bool {
-        self.delivered_rev.is_some() && self.state.is_outstanding()
+        self.delivered_rev.is_some() && self.state.is_outstanding() && self.retire_reason.is_none()
     }
 }
 
@@ -699,16 +706,17 @@ impl ChangeLedgerRow {
 pub struct ChangeMeasurement {
     pub identity: ChangeIdentity,
     pub state: ChangeState,
-    /// Why, when the state is [`ChangeState::Retired`]. `None` for every other
-    /// state, and required for that one: a retirement that did not say why would
-    /// be a deletion wearing a state's clothes.
+    /// Why the census believes this row's identity is one the account should not
+    /// hold. Carried on a **pending** row: the reason is a judgement about the
+    /// row's place in the account, not a claim that the change is in the tree, so
+    /// it does not end the work -- it says what the ask has become.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retire_reason: Option<RetireReason>,
-    /// Why, when the state is [`ChangeState::Undecided`]. `None` for every other
-    /// state, and required for that one: a row retracted from the outstanding set
-    /// without a reason to argue with would read as answered. A name from the
-    /// judge's closed set, as text for the same reason [`ChangeLedgerRow`] keeps
-    /// it as text.
+    /// Why the last pass could not settle this row, when it could not. The row is
+    /// still `pending`: the missing reading is the row's work, and a row retracted
+    /// from the outstanding set without a reason to argue with would read as
+    /// answered. A name from the judge's closed set, as text for the same reason
+    /// [`ChangeLedgerRow`] keeps it as text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsettled_reason: Option<String>,
     /// What the measurement saw, kept with the row so a state that disagrees
@@ -738,25 +746,10 @@ pub struct ChangeMeasurement {
 }
 
 impl ChangeMeasurement {
-    /// A measurement of a non-retired state.
-    ///
-    /// Panics on [`ChangeState::Retired`] rather than building a retirement with
-    /// no reason: retire through [`ChangeMeasurement::retired`], which cannot be
-    /// called without one. The alternative -- letting this build a reason-less
-    /// retirement and rejecting it later in the store -- would make the invariant
-    /// a property of one storage backend instead of of the value, and the two
-    /// would drift the moment a second backend appeared.
+    /// A measurement that settled the row, with no reason to carry: the two
+    /// states that are arguments about *why* a row is where it is have their own
+    /// constructors, and this one cannot build them without their reason.
     pub fn new(identity: ChangeIdentity, state: ChangeState) -> Self {
-        assert_ne!(
-            state,
-            ChangeState::Retired,
-            "a retirement must be built with ChangeMeasurement::retired so it carries a reason"
-        );
-        assert_ne!(
-            state,
-            ChangeState::Undecided,
-            "an undecided measurement must be built with ChangeMeasurement::undecided so it carries a reason"
-        );
         Self {
             identity,
             state,
@@ -768,18 +761,18 @@ impl ChangeMeasurement {
         }
     }
 
-    /// A measurement that could not settle the row because of a property of the
-    /// row itself, with the reason it could not.
+    /// A measurement that could not settle the row, with the reason it could not.
     ///
-    /// The reason is an argument rather than a field a caller may leave empty, so
-    /// an undecided measurement with no reason is not a value that can be built --
-    /// the same shape [`ChangeMeasurement::retired`] has, and for the same
-    /// reason: a row moved out of the outstanding set with nothing to say why
-    /// would read as answered.
+    /// The state stays [`ChangeState::Pending`]: "could not measure" is a defect
+    /// in the reading, not an answer about the tree, and the work of fixing it is
+    /// what the row is owed. The reason is an argument rather than a field a
+    /// caller may leave empty, so a row left unsettled with nothing to say why
+    /// cannot be built -- a pending row indistinguishable from an unread one
+    /// would read as measured.
     pub fn undecided(identity: ChangeIdentity, reason: impl Into<String>) -> Self {
         Self {
             identity,
-            state: ChangeState::Undecided,
+            state: ChangeState::Pending,
             retire_reason: None,
             unsettled_reason: Some(reason.into()),
             observation: None,
@@ -791,14 +784,17 @@ impl ChangeMeasurement {
     /// A measurement that found the identity is one the account should not hold,
     /// with the reason it should not.
     ///
-    /// The reason is an argument to this constructor rather than a field a caller
-    /// may leave empty, so a retirement without one is not a value that can be
-    /// built -- the closed set of reasons is a required part of the state, not a
-    /// label hung on it afterwards.
+    /// The row stays [`ChangeState::Pending`]: the census declining to ask again
+    /// is not the change being in the tree, and a retired row that read as done
+    /// was the judged party writing its own completion. The reason is an argument
+    /// to this constructor rather than a field a caller may leave empty, so a
+    /// retirement without one is not a value that can be built -- the closed set
+    /// of reasons is a required part of the judgement, not a label hung on it
+    /// afterwards.
     pub fn retired(identity: ChangeIdentity, reason: RetireReason) -> Self {
         Self {
             identity,
-            state: ChangeState::Retired,
+            state: ChangeState::Pending,
             retire_reason: Some(reason),
             unsettled_reason: None,
             observation: None,
@@ -1202,12 +1198,14 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// The rows that are still outstanding, most urgent band first and, within
     /// a band, stalest measurement first.
     ///
-    /// Both terminal states are left out, [`ChangeState::Landed`] and
-    /// [`ChangeState::Retired`]: a row whose question is answered is not work,
-    /// and a reader that took "not landed" for "outstanding" would hand a retired
-    /// row back to the tree and overwrite the retirement with whatever the tree
-    /// says -- which for an identity that is not an artifact is the unsettled
-    /// answer this state exists to stop repeating.
+    /// A landed row is left out: its question is answered, so it is not work. A
+    /// pending row is in, including the ones the census has judged the account
+    /// should not hold ([`ChangeMeasurement::retired`]): the judgement is about
+    /// the row's place in the account, and until somebody acts on it the ask is
+    /// still there to be read. What such a row must not get is another pass at
+    /// the tree -- re-asking a question whose answer cannot change only
+    /// re-stamps the same absent reading over the reason -- and that decision
+    /// stays with the census, which reads `retire_reason` before it measures.
     ///
     /// The band leads because the bound is what makes the order matter. A caller
     /// takes a slice of a set thousands deep, and a slice ordered only by
@@ -2145,80 +2143,92 @@ mod tests {
         );
     }
 
-    /// The two terminal states are the two that are not outstanding.
+    /// The two states and what each says about whether work is owed.
     ///
-    /// A reader that asked "is it landed" to answer "is there work here" would
-    /// count every retired row as outstanding, and hand a fixture identity back
-    /// to the tree. This pins the predicate to the set so the two cannot drift.
+    /// Pinned to the set so a third word appearing here cannot quietly inherit
+    /// "not outstanding" -- that is how a row leaves the batch without anybody
+    /// doing it.
     #[test]
-    fn only_the_terminal_states_are_not_outstanding() {
+    fn only_landed_is_not_outstanding() {
+        assert_eq!(ChangeState::ALL.len(), 2);
         for state in ChangeState::ALL {
-            let terminal = matches!(state, ChangeState::Landed | ChangeState::Retired);
-            assert_eq!(state.is_outstanding(), !terminal, "{}", state.as_str());
+            assert_eq!(
+                state.is_outstanding(),
+                state != ChangeState::Landed,
+                "{}",
+                state.as_str()
+            );
         }
     }
 
-    /// A retirement cannot be built without a reason, and a reason cannot be hung
-    /// on a non-retired measurement.
+    /// A row that could not be measured is still pending, and says what was
+    /// missing.
     ///
-    /// The first half is a panic because the value is unbuildable; the second is
-    /// checked in the store, and this only pins the constructor's side of it.
+    /// "Could not measure" used to be its own state, which made an unreadable
+    /// scope look like an answer. Now the state stays `pending` and the reason
+    /// rides beside it: the row is still owed work, and the work is the missing
+    /// reading.
     #[test]
-    #[should_panic(expected = "must be built with ChangeMeasurement::retired")]
-    fn a_retirement_without_a_reason_cannot_be_built() {
-        let _ = ChangeMeasurement::new(
-            ChangeIdentity::new("grep", "crates/", "x"),
-            ChangeState::Retired,
-        );
-    }
-
-    #[test]
-    fn a_retirement_carries_its_reason_and_a_plain_measurement_carries_none() {
-        let retired = ChangeMeasurement::retired(
-            ChangeIdentity::new("grep", "crates/", "x"),
-            RetireReason::Fixture,
-        );
-        assert_eq!(retired.state, ChangeState::Retired);
-        assert_eq!(retired.retire_reason, Some(RetireReason::Fixture));
-
-        let pending = ChangeMeasurement::new(
-            ChangeIdentity::new("grep", "crates/", "x"),
-            ChangeState::Pending,
-        );
-        assert_eq!(pending.retire_reason, None);
-    }
-
-    /// An undecided row cannot be written without the reason it is undecided,
-    /// the same way a retirement cannot be written without its reason: a row
-    /// retracted from the outstanding set with nothing to say why would read as
-    /// answered.
-    #[test]
-    #[should_panic(expected = "must be built with ChangeMeasurement::undecided")]
-    fn an_undecided_measurement_without_a_reason_cannot_be_built() {
-        let _ = ChangeMeasurement::new(
-            ChangeIdentity::new("grep", "crates/", "x"),
-            ChangeState::Undecided,
-        );
-    }
-
-    #[test]
-    fn an_undecided_measurement_carries_its_reason_and_a_plain_one_carries_none() {
+    fn a_row_that_could_not_be_measured_is_still_outstanding() {
         let undecided = ChangeMeasurement::undecided(
             ChangeIdentity::new("grep", "crates/", "x"),
             "kind_without_predicate",
         );
-        assert_eq!(undecided.state, ChangeState::Undecided);
+        assert_eq!(undecided.state, ChangeState::Pending);
+        assert!(undecided.state.is_outstanding());
         assert_eq!(
             undecided.unsettled_reason.as_deref(),
             Some("kind_without_predicate")
         );
         assert_eq!(undecided.retire_reason, None);
 
-        let pending = ChangeMeasurement::new(
+        let settled = ChangeMeasurement::new(
             ChangeIdentity::new("grep", "crates/", "x"),
             ChangeState::Pending,
         );
-        assert_eq!(pending.unsettled_reason, None);
+        assert_eq!(settled.unsettled_reason, None);
+    }
+
+    /// A retirement is a judgement about the row, not a completion of it: the
+    /// row stays pending and carries the reason it should not be held.
+    ///
+    /// This is the shape that used to be wrong in the direction that costs most
+    /// -- the census writing its own rows out of the outstanding set.
+    #[test]
+    fn a_retired_row_is_still_pending_and_carries_why() {
+        let retired = ChangeMeasurement::retired(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            RetireReason::Fixture,
+        );
+        assert_eq!(retired.state, ChangeState::Pending);
+        assert!(retired.state.is_outstanding());
+        assert_eq!(retired.retire_reason, Some(RetireReason::Fixture));
+        assert_eq!(retired.unsettled_reason, None);
+
+        let plain = ChangeMeasurement::new(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            ChangeState::Pending,
+        );
+        assert_eq!(plain.retire_reason, None);
+    }
+
+    /// The four words the account no longer has read back as `pending`, and
+    /// nothing else sneaks in as a state.
+    ///
+    /// Old projections and notes still spell them; reading one as `landed` would
+    /// retire work that was never done, and reading one as an error would make
+    /// every old row unreadable.
+    #[test]
+    fn the_retired_words_read_as_pending_and_only_two_words_are_states() {
+        for word in ["conflict", "partial", "undecided", "retired"] {
+            assert_eq!(
+                word.parse::<ChangeState>(),
+                Ok(ChangeState::Pending),
+                "{word} should read as owed work"
+            );
+        }
+        assert_eq!("landed".parse::<ChangeState>(), Ok(ChangeState::Landed));
+        assert!("proposed".parse::<ChangeState>().is_err());
     }
 
     /// The band order is the one a reader acts on: `P0` outranks `P1`, and a

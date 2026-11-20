@@ -2611,10 +2611,9 @@ fn dispatch_change_tool(
                                  先用 list_changes 按字面找一遍。",
                     }));
                 };
-                if matches!(
-                    row.state,
-                    cog_core::ChangeState::Landed | cog_core::ChangeState::Retired
-                ) {
+                // 只有 landed 是「了结」。被判出账的行仍然是 pending：它的身份还
+                // 欠着一句话，派出去也不该当成没人管的活。
+                if row.state == cog_core::ChangeState::Landed {
                     return Ok(serde_json::json!({
                         "available": true,
                         "refused": "already_settled",

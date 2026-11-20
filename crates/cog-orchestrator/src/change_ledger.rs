@@ -503,7 +503,8 @@ fn dispatch_project_root_prefix() -> String {
 /// `apply_measurement`, against a revision of the tree the change does not get
 /// to choose -- so the reader that closes this task is the same account that
 /// filed it, and the two cannot drift into different opinions of "done".
-const DISPATCH_ACCEPTANCE: &str = "这条变更在变更账上不再是 outstanding：同一身份的账行落到 landed 或 retired，判据取账上那一行的状态";
+const DISPATCH_ACCEPTANCE: &str =
+    "这条变更在变更账上不再是 outstanding：同一身份的账行落到 landed，判据取账上那一行的状态";
 
 /// The name a pass writes into `sources_unread` when the principle ledger could
 /// not be read.
@@ -2196,7 +2197,6 @@ fn unanswered_under_handover_project(task: &Task) -> bool {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SettledClosures {
     landed: usize,
-    retired: usize,
     /// Rows hanging under a closed one, which the graph cancelled with it.
     cascaded: usize,
     /// Rows hanging under a closed one that the sweep cancelled itself.
@@ -2227,19 +2227,14 @@ struct SettledClosures {
 
 impl SettledClosures {
     fn moved_anything(&self) -> bool {
-        self.landed > 0
-            || self.retired > 0
-            || self.cascaded > 0
-            || self.descendants > 0
-            || self.failed > 0
+        self.landed > 0 || self.cascaded > 0 || self.descendants > 0 || self.failed > 0
     }
 
     fn line(&self) -> String {
         format!(
-            "closed hand-over rows the account had settled: landed={} retired={} cascaded={} \
+            "closed hand-over rows the account had settled: landed={} cascaded={} \
              descendants={} unaccounted={} failed={} remaining={} unanswered={}",
             self.landed,
-            self.retired,
             self.cascaded,
             self.descendants,
             self.unaccounted,
@@ -2412,11 +2407,11 @@ async fn close_settled_dispatch_rows(
                     .await
                 {
                     Ok(cascaded) => {
-                        match row.state {
-                            ChangeState::Landed => closed.landed += 1,
-                            ChangeState::Retired => closed.retired += 1,
-                            // `is_outstanding` let only these two through.
-                            _ => {}
+                        // `is_outstanding` let only `landed` through: a row the
+                        // census judged out of the account is still pending, so
+                        // it still owes its task.
+                        if row.state == ChangeState::Landed {
+                            closed.landed += 1;
                         }
                         closed.cascaded += cascaded.len();
                         closed.descendants +=
@@ -4085,27 +4080,19 @@ async fn measure_pass(
         // over and its reason is dropped: a stale reason left in the map would
         // report a fault the tree no longer has.
         unsettled.remove(&row.identity);
-        match state {
-            ChangeState::Landed => landed += 1,
-            ChangeState::Pending => absent += 1,
-            // A row whose reason is a property of the row rather than of the
-            // look -- no evaluator for its kind, a predicate that is a finding
-            // written out, a path this tree structurally cannot hold -- is
-            // retracted to `undecided` by the evaluator: it carried a state no
-            // later pass could ever reach. Counted separately from the unsettled
-            // kinds below, because this one *did* write its state -- it is the
-            // count of rows that left the outstanding set by being unmeasurable
-            // rather than by being done.
-            ChangeState::Undecided => undecided += 1,
-            // A settled look otherwise answers with one of exactly two states,
-            // both named above. A fourth reaching here would be one the
-            // evaluator grew without this count being told, and counting it as
-            // "not landed" would hide that.
-            other => warn!(
-                change = %row.identity,
-                state = other.as_str(),
-                "change ledger: a settled look named a state this pass does not count"
-            ),
+        // A row whose reason is a property of the row rather than of the look --
+        // no evaluator for its kind, a predicate that is a finding written out, a
+        // path this tree structurally cannot hold -- is counted apart from a row
+        // the tree simply does not have yet. Both are `pending`; the difference is
+        // the reason written beside them, and it is the whole answer to "why will
+        // this never settle by retrying".
+        if outcome.is_unmeasurable() {
+            undecided += 1;
+        } else {
+            match state {
+                ChangeState::Landed => landed += 1,
+                ChangeState::Pending => absent += 1,
+            }
         }
         // No observation travels with the write. What this look saw is the check
         // and the revision, and the revision rides in its own column rather than
@@ -4117,23 +4104,26 @@ async fn measure_pass(
         // *which* rows are stuck for *which* reason instead of only how many are
         // stuck: the reason travels as its name, because the vocabulary is this
         // judge's and the storage contract does not depend on this module.
-        let measurement = match state {
-            ChangeState::Undecided => ChangeMeasurement::undecided(
+        let measurement = if outcome.is_unmeasurable() {
+            ChangeMeasurement::undecided(
                 row.identity.clone(),
                 outcome
                     .reason()
-                    .expect("an undecided state is reached only through a reason")
+                    .expect("an unmeasurable outcome is reached only through a reason")
                     .as_str(),
             )
-            .at_revision(snapshot.rev()),
-            _ if state == ChangeState::Landed => {
-                ChangeMeasurement::new(row.identity.clone(), state)
+            .at_revision(snapshot.rev())
+        } else {
+            match state {
+                ChangeState::Landed => ChangeMeasurement::new(row.identity.clone(), state)
                     .at_revision(snapshot.rev())
                     .with_parent_observation(
                         tree.parent_observation(&snapshot, &row.identity).await,
-                    )
+                    ),
+                ChangeState::Pending => {
+                    ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev())
+                }
             }
-            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
         };
         if let Err(e) = store.apply_measurement(&measurement).await {
             // Counted as measured because it was, not because it was stored: the
@@ -4704,27 +4694,27 @@ async fn reopen_pass(
         // formality: `measured_at` is what this read orders by, so a pass that
         // re-asked and wrote nothing would re-ask the same head of the set
         // forever and never reach the rest of it.
-        let measurement = match state {
-            ChangeState::Undecided => ChangeMeasurement::undecided(
+        let measurement = if outcome.is_unmeasurable() {
+            ChangeMeasurement::undecided(
                 row.identity.clone(),
                 outcome
                     .reason()
-                    .expect("an undecided state is reached only through a reason")
+                    .expect("an unmeasurable outcome is reached only through a reason")
                     .as_str(),
             )
-            .at_revision(snapshot.rev()),
+            .at_revision(snapshot.rev())
+        } else if state == ChangeState::Landed && row.state != ChangeState::Landed {
             // Only on the way in, never on a re-check: this pass also re-asks rows
             // that are already landed, and the parent of *this* revision says
             // nothing about the landing that first satisfied them -- it would
             // answer "already there" for every old row, which is the one reading
             // the column exists to tell apart from a real arrival. A row that was
             // already landed keeps whatever reading it first got.
-            _ if state == ChangeState::Landed && row.state != ChangeState::Landed => {
-                ChangeMeasurement::new(row.identity.clone(), state)
-                    .at_revision(snapshot.rev())
-                    .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
-            }
-            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
+            ChangeMeasurement::new(row.identity.clone(), state)
+                .at_revision(snapshot.rev())
+                .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
+        } else {
+            ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev())
         };
         if let Err(e) = store.apply_measurement(&measurement).await {
             warn!(
@@ -4805,21 +4795,21 @@ async fn restore_retired(
             );
             continue;
         };
-        let measurement = match state {
-            ChangeState::Undecided => ChangeMeasurement::undecided(
+        let measurement = if outcome.is_unmeasurable() {
+            ChangeMeasurement::undecided(
                 row.identity.clone(),
                 outcome
                     .reason()
-                    .expect("an undecided state is reached only through a reason")
+                    .expect("an unmeasurable outcome is reached only through a reason")
                     .as_str(),
             )
-            .at_revision(snapshot.rev()),
-            _ if state == ChangeState::Landed => {
-                ChangeMeasurement::new(row.identity.clone(), state)
-                    .at_revision(snapshot.rev())
-                    .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
-            }
-            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
+            .at_revision(snapshot.rev())
+        } else if state == ChangeState::Landed {
+            ChangeMeasurement::new(row.identity.clone(), state)
+                .at_revision(snapshot.rev())
+                .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
+        } else {
+            ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev())
         };
         match store.apply_measurement(&measurement).await {
             Ok(()) => {
@@ -4898,19 +4888,21 @@ async fn remeasure_queued(
             );
             continue;
         };
-        let measurement = match state {
-            ChangeState::Undecided => ChangeMeasurement::undecided(
+        let measurement = if outcome.is_unmeasurable() {
+            ChangeMeasurement::undecided(
                 identity.clone(),
                 outcome
                     .reason()
-                    .expect("an undecided state is reached only through a reason")
+                    .expect("an unmeasurable outcome is reached only through a reason")
                     .as_str(),
             )
-            .at_revision(snapshot.rev()),
-            _ if state == ChangeState::Landed => ChangeMeasurement::new(identity.clone(), state)
+            .at_revision(snapshot.rev())
+        } else if state == ChangeState::Landed {
+            ChangeMeasurement::new(identity.clone(), state)
                 .at_revision(snapshot.rev())
-                .with_parent_observation(tree.parent_observation(snapshot, &identity).await),
-            _ => ChangeMeasurement::new(identity.clone(), state).at_revision(snapshot.rev()),
+                .with_parent_observation(tree.parent_observation(snapshot, &identity).await)
+        } else {
+            ChangeMeasurement::new(identity.clone(), state).at_revision(snapshot.rev())
         };
         match store.apply_measurement(&measurement).await {
             Ok(()) => {
@@ -6264,26 +6256,21 @@ enum DispatchReadout {
     OwedP2,
     OwedP3,
     OwedUnstated,
-    /// How many owed rows the account holds in each non-terminal state, from
-    /// its own census rather than from this pass's slice.
+    /// How many rows the account holds in each state, from its own census
+    /// rather than from this pass's slice.
     ///
-    /// The four states are here because the pass's own counts cannot answer for
-    /// them. `pending` and `unmeasurable` together are the pending-state rows
-    /// this pass read; a row the account holds as `undecided`, `conflict` or
-    /// `partial` is still owed work, and it appears in none of the pass's
-    /// columns. Without these cells a pass whose owed set had moved entirely
-    /// into `undecided` -- every check unsettleable, which is what a tree that
-    /// lost a directory looks like -- would publish `change_ledger_pending` at
-    /// zero while two thousand rows still asked for something: the one answer a
-    /// reader acts on, and it would be wrong.
-    ///
-    /// The two terminal states are left out because they are the definition of
-    /// not owed; a reader asking for those reads the account, where they are the
-    /// complement of these four.
-    StateConflict,
+    /// Two cells, because the account has two states. `state_pending` is the
+    /// whole owed set as the account holds it -- it has to equal
+    /// `change_ledger_pending`, and that equality is the reading: the pass's own
+    /// split and the account's census counting the same rows. `state_landed` is
+    /// the complement. When the account still had six states these cells were the
+    /// only place a row held as `undecided` showed up at all; that hole is closed
+    /// by there being no such state -- such a row is pending, and it is in the
+    /// pass's columns with the reason it is stuck. What the census still splits
+    /// out -- rows judged out of the account, rows nothing could measure -- rides
+    /// on the face census by reason, not on this cell.
     StatePending,
-    StatePartial,
-    StateUndecided,
+    StateLanded,
     /// The demand side of the same loop: how many of the declarations the
     /// intake holds have been answered by a landing, and how many are still
     /// owed.
@@ -6361,10 +6348,8 @@ impl DispatchReadout {
         DispatchReadout::OwedP2,
         DispatchReadout::OwedP3,
         DispatchReadout::OwedUnstated,
-        DispatchReadout::StateConflict,
         DispatchReadout::StatePending,
-        DispatchReadout::StatePartial,
-        DispatchReadout::StateUndecided,
+        DispatchReadout::StateLanded,
         DispatchReadout::DemandSatisfied,
         DispatchReadout::DemandOwed,
         DispatchReadout::CommitsInWindow,
@@ -6390,18 +6375,16 @@ impl DispatchReadout {
         }
     }
 
-    /// The state a census cell is about, for the four that are about one.
+    /// The state a census cell is about, for the ones that are about one.
     ///
     /// Separate from [`Self::band`] because the two axes cross: the bands
-    /// partition the owed set and the states partition it again, and the point
-    /// of publishing both is that a reader can see the two partitions are of the
-    /// same set.
+    /// partition the owed set and the states partition the whole account, and
+    /// the point of publishing both is that a reader can see the two partitions
+    /// are of the same set.
     fn state(self) -> Option<ChangeState> {
         match self {
-            DispatchReadout::StateConflict => Some(ChangeState::Conflict),
             DispatchReadout::StatePending => Some(ChangeState::Pending),
-            DispatchReadout::StatePartial => Some(ChangeState::Partial),
-            DispatchReadout::StateUndecided => Some(ChangeState::Undecided),
+            DispatchReadout::StateLanded => Some(ChangeState::Landed),
             _ => None,
         }
     }
@@ -6422,10 +6405,8 @@ impl DispatchReadout {
             Self::OwedP2 => "owed_p2",
             Self::OwedP3 => "owed_p3",
             Self::OwedUnstated => "owed_unstated",
-            Self::StateConflict => "state_conflict",
             Self::StatePending => "state_pending",
-            Self::StatePartial => "state_partial",
-            Self::StateUndecided => "state_undecided",
+            Self::StateLanded => "state_landed",
             Self::DemandSatisfied => "demand_satisfied",
             Self::DemandOwed => "demand_owed",
             Self::CommitsInWindow => "commits_in_window",
@@ -7627,15 +7608,24 @@ fn now_unix() -> i64 {
 /// with nothing owed from one whose whole outstanding set sits in a state nothing
 /// can act on.
 fn held_back_summary(rows: &[ChangeLedgerRow]) -> String {
-    ChangeState::ALL
-        .into_iter()
-        .filter(|state| *state != ChangeState::Pending)
-        .filter_map(|state| {
-            let n = rows.iter().filter(|row| row.state == state).count();
-            (n > 0).then(|| format!("{} {}", state.as_str(), n))
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    // What is left out is no longer a state: every owed row is `pending`, and
+    // the ones that were not handed over are the ones carrying a reason for it.
+    let unmeasurable = rows
+        .iter()
+        .filter(|row| row.unsettled_reason.is_some())
+        .count();
+    let judged_out = rows
+        .iter()
+        .filter(|row| row.retire_reason.is_some())
+        .count();
+    let mut parts: Vec<String> = Vec::new();
+    if unmeasurable > 0 {
+        parts.push(format!("unmeasurable {unmeasurable}"));
+    }
+    if judged_out > 0 {
+        parts.push(format!("judged-out {judged_out}"));
+    }
+    parts.join(", ")
 }
 
 /// How many of these rows a pass would have judged.
@@ -7696,50 +7686,98 @@ fn still_unanswered(known: &UnsettledCheck, now: Instant) -> bool {
 /// A `landed` row is not outstanding -- the query excludes it -- so one showing
 /// up here means the storage filter broke, not that the ledger grew a row.
 ///
-/// The undecided rows are broken down by the reason they are stuck, because that
-/// reason is the whole answer to why they will never settle and it is a property
-/// of the row, not of any one pass. The pass's own `unsettled` field cannot give
-/// it: it counts only the rows *that* pass asked, so a row the pass did not reach
-/// -- which, over passes, is most of them -- never appears there. The reason is
-/// rendered in the closed set's order so two readings diff cleanly, and a row
-/// measured before the reason was persisted reads as `unstated` rather than being
-/// dropped, so the breakdown always sums to the undecided count.
+/// The rows are split by what is keeping each one owed: a row nothing could
+/// measure, a row the census judged out of the account, and the rest. The reason
+/// is the whole answer to why a row will not settle, and it is a property of the
+/// row rather than of one pass -- the pass's own `unsettled` field counts only the
+/// rows *that* pass asked, so a row it did not reach, which over passes is most of
+/// them, never appears there. Reasons are rendered in the closed set's order so
+/// two readings diff cleanly, and a row measured before the reason was persisted
+/// reads as `unstated` rather than being dropped, so each breakdown sums to its
+/// row count.
 fn outstanding_summary(rows: &[ChangeLedgerRow]) -> String {
-    let by_state = ChangeState::ALL
-        .into_iter()
-        .filter_map(|state| {
-            let n = rows.iter().filter(|row| row.state == state).count();
-            if n == 0 {
-                return None;
-            }
-            if state != ChangeState::Undecided {
-                return Some(format!("{} {}", state.as_str(), n));
-            }
-            let stuck: Vec<&ChangeLedgerRow> = rows
+    // `pending` covers three shapes now that it is the only owed state, and the
+    // reason columns are what tells them apart.
+    let stuck: Vec<&ChangeLedgerRow> = rows
+        .iter()
+        .filter(|row| row.state == ChangeState::Pending && row.unsettled_reason.is_some())
+        .collect();
+    let mut reasoned: Vec<String> = Vec::new();
+    if !stuck.is_empty() {
+        let mut parts: Vec<String> = UnsettledReason::ALL
+            .iter()
+            .filter_map(|reason| {
+                let m = stuck
+                    .iter()
+                    .filter(|row| row.unsettled_reason.as_deref() == Some(reason.as_str()))
+                    .count();
+                (m > 0).then(|| format!("{} {}", reason.as_str(), m))
+            })
+            .collect();
+        // A reason outside the judge's closed set is a row written before the
+        // reason column existed. Counted rather than dropped so the parts sum to
+        // the row count -- a breakdown that does not add up is a reading nobody
+        // can act on.
+        let unstated = stuck.len()
+            - stuck
                 .iter()
-                .filter(|row| row.state == ChangeState::Undecided)
-                .collect();
-            let mut parts: Vec<String> = UnsettledReason::ALL
-                .iter()
-                .filter_map(|reason| {
-                    let m = stuck
+                .filter_map(|row| row.unsettled_reason.as_deref())
+                .filter(|r| {
+                    UnsettledReason::ALL
                         .iter()
-                        .filter(|row| row.unsettled_reason.as_deref() == Some(reason.as_str()))
-                        .count();
-                    (m > 0).then(|| format!("{} {}", reason.as_str(), m))
+                        .any(|known| known.as_str() == *r)
                 })
-                .collect();
-            let unstated = stuck
-                .iter()
-                .filter(|row| row.unsettled_reason.is_none())
                 .count();
-            if unstated > 0 {
-                parts.push(format!("unstated {unstated}"));
-            }
-            Some(format!("undecided {n} ({})", parts.join(", ")))
+        if unstated > 0 {
+            parts.push(format!("unstated {unstated}"));
+        }
+        reasoned.push(format!(
+            "unmeasurable {} ({})",
+            stuck.len(),
+            parts.join(", ")
+        ));
+    }
+    let retired: Vec<&ChangeLedgerRow> = rows
+        .iter()
+        .filter(|row| row.retire_reason.is_some())
+        .collect();
+    if !retired.is_empty() {
+        let parts: Vec<String> = RetireReason::ALL
+            .iter()
+            .filter_map(|reason| {
+                let m = retired
+                    .iter()
+                    .filter(|row| row.retire_reason == Some(*reason))
+                    .count();
+                (m > 0).then(|| format!("{} {}", reason.as_str(), m))
+            })
+            .collect();
+        reasoned.push(format!(
+            "judged-out {} ({})",
+            retired.len(),
+            parts.join(", ")
+        ));
+    }
+    let plain = rows
+        .iter()
+        .filter(|row| {
+            row.state.is_outstanding()
+                && row.unsettled_reason.is_none()
+                && row.retire_reason.is_none()
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .count();
+    if plain > 0 {
+        reasoned.push(format!("owed {}", plain));
+    }
+    if rows.iter().any(|row| !row.state.is_outstanding()) {
+        reasoned.push(format!(
+            "landed {} (the storage filter broke)",
+            rows.iter()
+                .filter(|row| !row.state.is_outstanding())
+                .count()
+        ));
+    }
+    let by_state = reasoned.join(", ");
     let never_measured = rows.iter().filter(|row| row.measured_at.is_none()).count();
     match rows.iter().filter_map(|row| row.measured_at).min() {
         Some(oldest) => format!(
@@ -7983,36 +8021,47 @@ mod tests {
         }
     }
 
-    /// How many rows, in which states, and how many nobody has looked at -- all
-    /// three have to be readable off the one line.
+    /// How many rows, split by what keeps each one owed, and how many nobody has
+    /// looked at -- all of it readable off the one line.
+    ///
+    /// Every row here is `pending`: that is the only owed state, and the split
+    /// that used to be a state word is now the reason beside the row.
     #[test]
-    fn the_summary_names_every_state_present_and_the_unmeasured_count() {
+    fn the_summary_splits_the_owed_rows_by_what_still_holds_them() {
         let rows = vec![
             row(ChangeState::Pending, None),
-            row(ChangeState::Undecided, Some(1_760_000_000)),
+            ChangeLedgerRow {
+                state: ChangeState::Pending,
+                unsettled_reason: Some(UnsettledReason::KindWithoutPredicate.as_str().to_string()),
+                ..row(ChangeState::Pending, Some(1_760_000_000))
+            },
             row(ChangeState::Pending, Some(1_760_000_100)),
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "3 outstanding: pending 2, undecided 1 (unstated 1); never measured 1; \
-             oldest measurement 2025-10-09T08:53:20+00:00"
+            "3 outstanding: unmeasurable 1 (kind_without_predicate 1), owed 2; \
+             never measured 1; oldest measurement 2025-10-09T08:53:20+00:00"
         );
     }
 
-    /// The undecided rows are split by the reason they are stuck, in the closed
-    /// set's order, and a row with no reason persisted yet reads as unstated
-    /// rather than vanishing -- so the parts always sum to the undecided count.
+    /// The unmeasurable rows are split by the reason they are stuck, in the
+    /// closed set's order -- so the parts sum to the bucket's own count.
     ///
     /// This is the reading the pass's own `unsettled` field cannot give: that
     /// field counts only the rows the pass asked, so a row the pass did not reach
     /// is missing from it entirely, and "why is this stuck" is unanswerable from
     /// the ledger once the log rolls.
+    ///
+    /// A row with no reason is not unmeasurable: no constructor can build one,
+    /// so a row without a reason either was measured and found absent or was
+    /// written before the column existed -- and both are owed work with nothing
+    /// to argue about, which is what the `owed` count says.
     #[test]
-    fn the_summary_splits_the_undecided_rows_by_reason() {
+    fn the_summary_splits_the_unmeasurable_rows_by_reason() {
         let stuck = |reason: Option<&str>| ChangeLedgerRow {
-            state: ChangeState::Undecided,
+            state: ChangeState::Pending,
             unsettled_reason: reason.map(str::to_string),
-            ..row(ChangeState::Undecided, Some(1_760_000_000))
+            ..row(ChangeState::Pending, Some(1_760_000_000))
         };
         let rows = vec![
             stuck(Some("scope_outside_tree")),
@@ -8023,8 +8072,8 @@ mod tests {
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "5 outstanding: pending 1, undecided 4 \
-             (kind_without_predicate 1, scope_outside_tree 2, unstated 1); \
+            "5 outstanding: unmeasurable 3 \
+             (kind_without_predicate 1, scope_outside_tree 2), owed 2; \
              never measured 0; oldest measurement 2025-10-09T08:53:20+00:00"
         );
     }
@@ -8035,26 +8084,32 @@ mod tests {
     fn all_unmeasured_rows_report_no_measurement_time() {
         let rows = vec![
             row(ChangeState::Pending, None),
-            row(ChangeState::Conflict, None),
+            row(ChangeState::Pending, None),
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "2 outstanding: conflict 1, pending 1; never measured 2"
+            "2 outstanding: owed 2; never measured 2"
         );
     }
 
-    /// States are ordered by the closed set, not by row order: the same rows in
+    /// Reasons are ordered by the closed set, not by row order: the same rows in
     /// a different order read out as the same line, or every diff of two readings
     /// would be noise.
     #[test]
-    fn the_state_order_does_not_follow_the_row_order() {
+    fn the_reason_order_does_not_follow_the_row_order() {
+        let stuck = |reason: UnsettledReason| ChangeLedgerRow {
+            state: ChangeState::Pending,
+            unsettled_reason: Some(reason.as_str().to_string()),
+            ..row(ChangeState::Pending, None)
+        };
         let rows = vec![
-            row(ChangeState::Undecided, None),
-            row(ChangeState::Conflict, None),
+            stuck(UnsettledReason::KindWithoutPredicate),
+            stuck(UnsettledReason::ScopeOutsideTree),
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "2 outstanding: conflict 1, undecided 1 (unstated 1); never measured 2"
+            "2 outstanding: unmeasurable 2 (kind_without_predicate 1, scope_outside_tree 1); \
+             never measured 2"
         );
     }
 
@@ -8151,7 +8206,8 @@ mod tests {
         let rows = vec![row(ChangeState::Landed, Some(1_760_000_000))];
         assert_eq!(
             outstanding_summary(&rows),
-            "1 outstanding: landed 1; never measured 0; oldest measurement 2025-10-09T08:53:20+00:00"
+            "1 outstanding: landed 1 (the storage filter broke); never measured 0; \
+             oldest measurement 2025-10-09T08:53:20+00:00"
         );
     }
 
@@ -8480,12 +8536,14 @@ mod tests {
     fn a_dispatched_change_states_what_done_means_in_the_account_s_own_terms() {
         let task = dispatch_one(&row(ChangeState::Pending, Some(1_760_000_000)), 0);
         assert_eq!(task.acceptance, vec![DISPATCH_ACCEPTANCE.to_string()]);
-        for terminal in ["landed", "retired"] {
-            assert!(
-                DISPATCH_ACCEPTANCE.contains(terminal),
-                "验收标准点名的不是账上的终态「{terminal}」：{DISPATCH_ACCEPTANCE}"
-            );
-        }
+        assert!(
+            DISPATCH_ACCEPTANCE.contains(ChangeState::Landed.as_str()),
+            "验收标准点名的不是账上唯一的终态：{DISPATCH_ACCEPTANCE}"
+        );
+        assert!(
+            !DISPATCH_ACCEPTANCE.contains("retired"),
+            "验收标准还点名了账上已经没有的终态，那一行永远等不到：{DISPATCH_ACCEPTANCE}"
+        );
         assert!(
             DISPATCH_ACCEPTANCE.contains("outstanding"),
             "没写清它清掉的正是这一行欠着的那一格：{DISPATCH_ACCEPTANCE}"
@@ -8740,18 +8798,26 @@ mod tests {
         assert_eq!(dispatch_goal(&bare), bare.identity.as_key());
     }
 
-    /// What was left out is on the line, by state. Otherwise a ledger whose whole
-    /// outstanding set sits in a state nothing can act on reads exactly like one
-    /// with nothing owed.
+    /// What was left out is on the line, by the reason it was left out.
+    /// Otherwise a ledger whose whole outstanding set is unmeasurable reads
+    /// exactly like one with nothing owed.
     #[test]
-    fn the_held_back_line_names_every_state_that_was_not_handed_over() {
+    fn the_held_back_line_names_every_row_that_was_not_handed_over() {
+        let stuck = |reason: UnsettledReason| ChangeLedgerRow {
+            unsettled_reason: Some(reason.as_str().to_string()),
+            ..row(ChangeState::Pending, None)
+        };
+        let judged_out = |reason: RetireReason| ChangeLedgerRow {
+            retire_reason: Some(reason),
+            ..row(ChangeState::Pending, None)
+        };
         let rows = vec![
-            row(ChangeState::Conflict, None),
+            judged_out(RetireReason::Fixture),
             row(ChangeState::Pending, None),
-            row(ChangeState::Undecided, None),
-            row(ChangeState::Undecided, None),
+            stuck(UnsettledReason::ScopeOutsideTree),
+            stuck(UnsettledReason::KindWithoutPredicate),
         ];
-        assert_eq!(held_back_summary(&rows), "conflict 1, undecided 2");
+        assert_eq!(held_back_summary(&rows), "unmeasurable 2, judged-out 1");
         assert_eq!(held_back_summary(&[row(ChangeState::Pending, None)]), "");
     }
 
@@ -9173,7 +9239,11 @@ mod tests {
 
         let measurements = store.measurements();
         assert_eq!(measurements.len(), 1, "{measurements:?}");
-        assert_eq!(measurements[0].state, ChangeState::Retired);
+        assert_eq!(
+            measurements[0].state,
+            ChangeState::Pending,
+            "a relocation is a judgement about the row, not a completion of it"
+        );
         assert_eq!(
             measurements[0].retire_reason,
             Some(RetireReason::Superseded),
@@ -9936,7 +10006,12 @@ mod tests {
             let mut blocked = self.blocked.lock().unwrap();
             let mut touched = 0;
             for row in &self.rows {
-                if !row.state.is_outstanding() || settled.contains(&row.identity) {
+                // Handed over means the tree will be asked again, and a row the
+                // census judged out has nothing new to answer.
+                if !row.state.is_outstanding()
+                    || row.retire_reason.is_some()
+                    || settled.contains(&row.identity)
+                {
                     continue;
                 }
                 match blocked.get(&row.identity).map(String::as_str) {
@@ -10092,7 +10167,11 @@ mod tests {
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| row.state.is_outstanding() && !settled.contains(&row.identity))
+                .filter(|row| {
+                    row.state.is_outstanding()
+                        && row.retire_reason.is_none()
+                        && !settled.contains(&row.identity)
+                })
                 .take(limit)
                 .cloned()
                 .collect())
@@ -10111,7 +10190,11 @@ mod tests {
                     let rows = self
                         .rows
                         .iter()
-                        .filter(|row| row.state.is_outstanding() && row.priority() == band)
+                        .filter(|row| {
+                            row.state.is_outstanding()
+                                && row.retire_reason.is_none()
+                                && row.priority() == band
+                        })
                         .count();
                     (band, rows)
                 })
@@ -10206,10 +10289,7 @@ mod tests {
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| {
-                    row.state == ChangeState::Retired
-                        && row.retire_reason == Some(RetireReason::SurfaceMoved)
-                })
+                .filter(|row| row.retire_reason == Some(RetireReason::SurfaceMoved))
                 .take(limit)
                 .cloned()
                 .collect())
@@ -10218,10 +10298,7 @@ mod tests {
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| {
-                    row.state == ChangeState::Retired
-                        && row.retire_reason == Some(RetireReason::AnsweredElsewhere)
-                })
+                .filter(|row| row.retire_reason == Some(RetireReason::AnsweredElsewhere))
                 .take(limit)
                 .cloned()
                 .collect())
@@ -10852,10 +10929,12 @@ mod tests {
         (dir, exited)
     }
 
-    /// A row already settled as retired because its scope left the tree.
+    /// A row the census already judged out because its scope left the tree. It
+    /// is still `pending`: the judgement is about the row's place in the
+    /// account, not a claim that the change is in the tree.
     fn retired_row(scope: &str, measured_rev: Option<&str>) -> ChangeLedgerRow {
         ChangeLedgerRow {
-            state: ChangeState::Retired,
+            state: ChangeState::Pending,
             measured_rev: measured_rev.map(str::to_string),
             retire_reason: Some(RetireReason::SurfaceMoved),
             retired_at: Some(Utc.timestamp_opt(1_760_000_100, 0).unwrap()),
@@ -10981,7 +11060,6 @@ mod tests {
         let snapshot = tree.snapshot().await.expect("the fixture is readable");
         let identity = ChangeIdentity::new("grep", "file", "fn thing");
         let retired = ChangeLedgerRow {
-            state: ChangeState::Retired,
             retire_reason: Some(RetireReason::Fixture),
             ..pending_row("file")
         };
@@ -11033,7 +11111,6 @@ mod tests {
         let identity = ChangeIdentity::new("grep", "file", "fn thing");
         let store = FakeLedger {
             rows: vec![ChangeLedgerRow {
-                state: ChangeState::Retired,
                 retire_reason: Some(RetireReason::Fixture),
                 ..pending_row("file")
             }],
@@ -11255,7 +11332,11 @@ mod tests {
         let measurements = store.measurements();
         assert_eq!(measurements.len(), 1, "the retirement was written back");
         let retirement = &measurements[0];
-        assert_eq!(retirement.state, ChangeState::Retired);
+        assert_eq!(
+            retirement.state,
+            ChangeState::Pending,
+            "the row is judged out, not completed"
+        );
         assert_eq!(
             retirement.retire_reason,
             Some(RetireReason::SurfaceMoved),
@@ -12153,20 +12234,22 @@ mod tests {
             identity: ChangeIdentity::new("grep", "crates/a/src/landed.rs", "fn landed()"),
             ..row(ChangeState::Landed, Some(1_760_000_100))
         };
-        let retired = ChangeLedgerRow {
-            identity: ChangeIdentity::new("grep", "crates/a/src/retired.rs", "fn retired()"),
+        // Judged out of the account, and therefore still owed: the census
+        // stopping asking is not the change being made.
+        let judged_out = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/a/src/judged.rs", "fn judged()"),
             retire_reason: Some(RetireReason::Fixture),
-            ..row(ChangeState::Retired, None)
+            ..row(ChangeState::Pending, None)
         };
         let owed = pending_row("crates/a/src/owed.rs");
         let store = FakeLedger {
-            rows: vec![landed.clone(), retired.clone(), owed.clone()],
+            rows: vec![landed.clone(), judged_out.clone(), owed.clone()],
             ..Default::default()
         };
         let graph = Arc::new(
             FakeGraph::default()
                 .holding_handover(&landed, TaskStatus::Pending)
-                .holding_handover(&retired, TaskStatus::Scheduled)
+                .holding_handover(&judged_out, TaskStatus::Scheduled)
                 .holding_handover(&owed, TaskStatus::Pending)
                 // The planner hangs its decomposition under `parent_task_id`,
                 // which the graph's own cascade does not follow.
@@ -12189,24 +12272,34 @@ mod tests {
         )
         .await;
 
-        for (row, state) in [(&landed, "landed"), (&retired, "retired")] {
-            let id = dispatch_task_id(&row.identity, 0);
+        {
+            let id = dispatch_task_id(&landed.identity, 0);
             let held = graph.held(&id).expect("这一行还该在图里");
             assert_eq!(
                 held.status,
                 TaskStatus::Cancelled,
-                "账上已经是 {state} 的行还开着，它会一直排在未结里"
+                "账上已经 landed 的行还开着，它会一直排在未结里"
             );
             let why = held.error.unwrap_or_default();
             assert!(
-                why.contains(state),
-                "关掉时的理由没有点名账上的终态 {state}：{why}"
+                why.contains(ChangeState::Landed.as_str()),
+                "关掉时的理由没有点名账上的终态：{why}"
             );
             assert!(
                 declares(&why, SETTLED_HANDOVER_PREFIX),
                 "关掉时的理由没有声明「这是账上已结、不是活干完了」，重开时读不回来：{why}"
             );
         }
+        // 被判出账的行仍然是待办：它的身份还欠着一句话，只是普查不再追问。
+        // 把它的活关掉，等于用「不查了」冒充「做完了」。
+        assert_eq!(
+            graph
+                .held(&dispatch_task_id(&judged_out.identity, 0))
+                .expect("这一行还该在图里")
+                .status,
+            TaskStatus::Scheduled,
+            "被判出账的行不是已结，它的活不能跟着关"
+        );
         assert_eq!(
             graph
                 .held(&dispatch_task_id(&owed.identity, 0))
@@ -12774,7 +12867,7 @@ mod tests {
         let tasks = control.get_all_tasks().await;
         let closed = close_settled_dispatch_rows(&control, &tasks, &store, &still_owed).await;
         assert_eq!(
-            closed.landed + closed.retired,
+            closed.landed,
             0,
             "其中一项还欠着，这一笔就不能算结清：{}",
             closed.line()
@@ -14126,12 +14219,12 @@ mod tests {
         let state = DispatchState {
             decision: DispatchDecision::PausedLlmPoolUnavailable,
             pool: PoolReading::Unavailable,
-            pending: 143,
+            pending: 155,
             submitted: 3,
             already: 12,
             failed: 1,
             dead_environment: 7,
-            held_back: 120,
+            held_back: 132,
             rearmed: 2,
             delivered: None,
             unmeasurable: 5,
@@ -14149,10 +14242,9 @@ mod tests {
         let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let metrics: Arc<dyn MetricsBackend> = metrics.clone();
         // The account's own counts, as its census and its band count would
-        // answer them. The two partitions are of the same set, and that set is
-        // larger than the pass's pending column on purpose: twelve rows are
-        // `undecided`, so a reader of the pass's own columns alone would see
-        // 148 owed and miss them.
+        // answer them. Both partitions are of the same owed set, and each cell
+        // carries a non-zero count so a cell that is written from the wrong
+        // index cannot hide by reading zero.
         let owed = [
             (ChangePriority::P0, 4usize),
             (ChangePriority::P1, 2),
@@ -14160,14 +14252,7 @@ mod tests {
             (ChangePriority::P3, 1),
             (ChangePriority::Unstated, 153),
         ];
-        let census = [
-            (ChangeState::Conflict, 0u64),
-            (ChangeState::Pending, 148),
-            (ChangeState::Partial, 0),
-            (ChangeState::Undecided, 12),
-            (ChangeState::Landed, 900),
-            (ChangeState::Retired, 40),
-        ];
+        let census = [(ChangeState::Pending, 160u64), (ChangeState::Landed, 900)];
         // The demand side: what the documents asked for, and how much of it the
         // account holds as done. A pair, and the test carries a non-trivial pair
         // because a cell that only ever reads zero cannot tell a reading from an
@@ -14244,12 +14329,12 @@ mod tests {
                 .map(str::to_string)
                 .collect::<std::collections::BTreeSet<_>>()
         );
-        assert_eq!(published["pending"], 143.0);
+        assert_eq!(published["pending"], 155.0);
         assert_eq!(published["submitted"], 3.0);
         assert_eq!(published["already"], 12.0);
         assert_eq!(published["failed"], 1.0);
         assert_eq!(published["dead_environment"], 7.0);
-        assert_eq!(published["held_back"], 120.0);
+        assert_eq!(published["held_back"], 132.0);
         assert_eq!(published["rearmed"], 2.0);
         assert_eq!(published["unmeasurable"], 5.0);
         // The tree's own window: the count and the part of it that named a
@@ -14286,7 +14371,7 @@ mod tests {
         // could hand over plus the ones it could not settle. Read off the two
         // halves rather than recomputed from the rows, so the face's number and
         // the pass's own split cannot disagree.
-        assert_eq!(published["change_ledger_pending"], 148.0);
+        assert_eq!(published["change_ledger_pending"], 160.0);
         // The demand pair, and the reason both cells are published together:
         // 41 answered against 2085 still owed is a loop that closes slowly, and
         // the satisfied count alone would read exactly like a loop that closed
@@ -14313,25 +14398,19 @@ mod tests {
         );
         assert_eq!(published["owed_p3"], 1.0);
         assert_eq!(published["owed_unstated"], 153.0);
-        // The census, one cell per outstanding state. The two empty states are
-        // published as zeros rather than left out: an absent cell and a state
-        // nobody counted read the same, and this is the face that has to say
-        // which one it is.
-        assert_eq!(published["state_conflict"], 0.0);
-        assert_eq!(published["state_pending"], 148.0);
-        assert_eq!(published["state_partial"], 0.0);
-        assert_eq!(published["state_undecided"], 12.0);
+        // The census, one cell per state the account holds. `state_landed` is
+        // written too: it is the complement of the owed set, and a reader asking
+        // "how much of this account is done" reads it rather than subtracting.
+        assert_eq!(published["state_pending"], 160.0);
+        assert_eq!(published["state_landed"], 900.0);
         assert_eq!(
             published["owed_p0"]
                 + published["owed_p1"]
                 + published["owed_p2"]
                 + published["owed_p3"]
                 + published["owed_unstated"],
-            published["state_conflict"]
-                + published["state_pending"]
-                + published["state_partial"]
-                + published["state_undecided"],
-            "the bands and the states are two partitions of one owed set"
+            published["state_pending"],
+            "the bands and the account's pending state are two partitions of one owed set"
         );
         // The pass's pending cell and the account's `pending` state are the
         // same population read two ways -- the rows this pass could hand over
@@ -14525,7 +14604,7 @@ mod tests {
     /// state cell, rather than publishing zeros.
     ///
     /// A zero is not a neutral placeholder here: `owed_p0 = 0` says the urgent
-    /// work is done, and `state_undecided = 0` says every check can be settled;
+    /// work is done, and `state_pending = 0` says the account owes nothing;
     /// either is an answer a reader will act on. A skipped cell leaves the
     /// previous tick's count standing, and every write carries its own stamp, so
     /// "how old is this number" is readable. The pass says it could not count in

@@ -159,12 +159,17 @@ mod tests {
     fn an_absent_capacity_reads_the_constant_instead_of_zero() {
         let unset = TuningConfig::default();
         assert_eq!(unset.stream_capacity, 0, "默认仍是 0：0 是「没写」的哨兵");
-        assert_eq!(unset.stream_capacity_or_default(), crate::DEFAULT_STREAM_CAPACITY);
+        assert_eq!(
+            unset.stream_capacity_or_default(),
+            crate::DEFAULT_STREAM_CAPACITY
+        );
         assert!(
             crate::DEFAULT_STREAM_CAPACITY > 0,
             "容量 0 建不出有界通道：常量本身必须是正数，否则这条兜底把 panic 藏起来"
         );
-        let written = TuningConfig { stream_capacity: 64 };
+        let written = TuningConfig {
+            stream_capacity: 64,
+        };
         assert_eq!(written.stream_capacity_or_default(), 64);
     }
 

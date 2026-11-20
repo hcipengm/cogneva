@@ -426,24 +426,33 @@ impl CheckOutcome {
     /// One unsettled reason is not about the look, and it does move the row. A
     /// predicate that is a finding written out is a property of the row itself:
     /// no revision will ever make it measurable, so the state the row carries
-    /// cannot have come from measuring it -- an earlier evaluator ran a search
-    /// for the whole rendering, found nothing, and answered `pending`. Leaving
-    /// that answer in place is not caution about the document's word, it is
-    /// freezing an answer from a look that could not have been measuring the
-    /// row: the row goes on reading as work still owed to anything that selects
-    /// by state, while no artifact can ever close it. `Undecided` is what this
-    /// shape is -- "what it found does not settle the question" -- and writing
-    /// it is a retraction of that earlier answer rather than a claim about the
-    /// tree.
+    /// cannot have come from measuring it. The row is still **pending** -- no
+    /// artifact has closed it and the ask is still owed -- and what changes is the
+    /// reason beside it: the caller writes an [`ChangeState::Pending`] measurement
+    /// carrying [`UnsettledReason::as_str`], so "nobody can measure this row" is
+    /// readable as a named defect instead of being mistaken for a pass that has
+    /// not run yet. [`Self::is_unmeasurable`] is the predicate the caller branches
+    /// on; it is not a state, because "could not measure" is not an answer about
+    /// the tree.
     pub fn state(&self) -> Option<ChangeState> {
         match self {
             CheckOutcome::Landed => Some(ChangeState::Landed),
             CheckOutcome::Absent => Some(ChangeState::Pending),
             CheckOutcome::Unsettled { reason, .. } if reason.is_about_the_row() => {
-                Some(ChangeState::Undecided)
+                Some(ChangeState::Pending)
             }
             CheckOutcome::Unsettled { .. } => None,
         }
+    }
+
+    /// Whether this outcome is a look that could not speak to the row at all,
+    /// for a reason that is a property of the row rather than of this revision.
+    ///
+    /// True is the case that writes a reason instead of an observation: the row
+    /// stays owed, and the reason is what the account reads to find out that the
+    /// check itself needs rewriting rather than re-running.
+    pub fn is_unmeasurable(&self) -> bool {
+        matches!(self, CheckOutcome::Unsettled { reason, .. } if reason.is_about_the_row())
     }
 
     /// Why the look could not settle the row, for the one outcome that has one.
@@ -1614,7 +1623,11 @@ mod tests {
             )
             .await;
         assert_eq!(outcome.reason(), Some(UnsettledReason::ScopeOutsideTree));
-        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
+        assert_eq!(outcome.state(), Some(ChangeState::Pending));
+        assert!(
+            outcome.is_unmeasurable(),
+            "the state alone cannot say this row needs its check rewritten: {outcome:?}"
+        );
     }
 
     /// The two absence kinds never settle to a verdict, and say so in their own
@@ -1631,7 +1644,7 @@ mod tests {
                 .await;
             assert_eq!(
                 outcome.state(),
-                Some(ChangeState::Undecided),
+                Some(ChangeState::Pending),
                 "{kind} is unmeasurable and must read as a criterion to rewrite"
             );
             assert_eq!(
@@ -1687,7 +1700,11 @@ mod tests {
         let outcome = tree
             .judge(&snapshot(), &identity("resembles", "crates/x", "y"))
             .await;
-        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
+        assert_eq!(outcome.state(), Some(ChangeState::Pending));
+        assert!(
+            outcome.is_unmeasurable(),
+            "the state alone cannot say this row needs its check rewritten: {outcome:?}"
+        );
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::KindWithoutPredicate)
@@ -1707,7 +1724,11 @@ mod tests {
         let outcome = tree
             .judge(&snapshot(), &identity("grep", "crates/x", ""))
             .await;
-        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
+        assert_eq!(outcome.state(), Some(ChangeState::Pending));
+        assert!(
+            outcome.is_unmeasurable(),
+            "the state alone cannot say this row needs its check rewritten: {outcome:?}"
+        );
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::KindWithoutPredicate)
@@ -1735,7 +1756,7 @@ mod tests {
                 .await;
             assert_eq!(
                 outcome.state(),
-                Some(ChangeState::Undecided),
+                Some(ChangeState::Pending),
                 "{kind} must not answer for another tree"
             );
             assert_eq!(outcome.reason(), Some(UnsettledReason::ScopeOutsideTree));
@@ -1778,10 +1799,12 @@ mod tests {
                 ),
             )
             .await;
-        // `undecided`, not `pending`: the row cannot be owed, because nothing
-        // can ever measure it. The state an earlier evaluator wrote is retracted
-        // rather than kept -- see `CheckOutcome::state`.
-        assert_eq!(outcome.state(), Some(ChangeState::Undecided), "{outcome:?}");
+        // `pending` with a reason, not a state of its own: the row is still owed
+        // -- nothing can measure it, which is the defect the reason names. The
+        // state an earlier evaluator wrote is retracted rather than kept -- see
+        // `CheckOutcome::state`.
+        assert_eq!(outcome.state(), Some(ChangeState::Pending), "{outcome:?}");
+        assert!(outcome.is_unmeasurable(), "{outcome:?}");
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::PredicateIsARendering)
@@ -2357,7 +2380,8 @@ mod tests {
             "{outside:?}"
         );
         assert!(outside.reason().is_some_and(|r| r.is_about_the_row()));
-        assert_eq!(outside.state(), Some(ChangeState::Undecided), "{outside:?}");
+        assert_eq!(outside.state(), Some(ChangeState::Pending), "{outside:?}");
+        assert!(outside.is_unmeasurable(), "{outside:?}");
         // `crates` exists but `crates/gone` does not: a later revision can add it,
         // so this is about the look and the row is not touched.
         let absent = tree

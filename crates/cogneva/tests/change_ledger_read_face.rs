@@ -720,7 +720,7 @@ async fn the_account_is_readable_with_a_token() {
 async fn a_delivered_row_says_which_revision_said_so_and_that_it_holds_the_line() {
     let mut delivered = row(ChangeState::Pending, "doc-c.md", "crates/cog-gateway/src");
     delivered.delivered_rev = Some("def456".into());
-    let mut undecided = row(ChangeState::Undecided, "doc-d.md", "crates/cog-storage/src");
+    let mut undecided = row(ChangeState::Pending, "doc-d.md", "crates/cog-storage/src");
     undecided.unsettled_reason = Some("scope_absent_in_revision".into());
     let ledger = Arc::new(FakeLedger::new(
         vec![
@@ -756,7 +756,12 @@ async fn a_delivered_row_says_which_revision_said_so_and_that_it_holds_the_line(
     assert_eq!(never["delivered_rev"], serde_json::Value::Null, "{body}");
     assert_eq!(never["holds_the_line"], false, "{body}");
 
-    let stuck = by_state("undecided", false);
+    // A row nothing could measure is still `pending`; the reason is what tells
+    // it apart from one that was measured and found absent.
+    let stuck = rows
+        .iter()
+        .find(|r| r["unsettled_reason"] == "scope_absent_in_revision")
+        .unwrap_or_else(|| panic!("no unmeasurable row: {body}"));
     assert_eq!(
         stuck["unsettled_reason"], "scope_absent_in_revision",
         "{body}"
@@ -1013,7 +1018,7 @@ async fn an_empty_state_is_still_a_cell() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     let census = body["census"].as_array().expect("census is a list");
-    assert_eq!(census.len(), 6, "every state is a cell: {body}");
+    assert_eq!(census.len(), 2, "every state is a cell: {body}");
     let pending = census
         .iter()
         .find(|cell| cell["state"] == "pending")

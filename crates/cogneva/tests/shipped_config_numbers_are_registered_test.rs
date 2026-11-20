@@ -408,7 +408,8 @@ fn the_walk_reads_the_document_the_app_reads() {
         named(&load_bearing)
     );
     assert_eq!(
-        elements_declared, elements,
+        elements_declared,
+        elements,
         "有数组元素没有一句话说这一格在搜什么（{} 个）：数组的说明挂在数组自己的键上\
          （`_comment_<键>`）。",
         elements - elements_declared

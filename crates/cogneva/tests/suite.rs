@@ -98,6 +98,8 @@ mod a_crate_is_a_component_not_a_bridge_test;
 mod a_day_is_named_by_one_clock_test;
 #[path = "a_job_inner_wait_budget_widens_the_job_deadline_test.rs"]
 mod a_job_inner_wait_budget_widens_the_job_deadline_test;
+#[path = "a_judged_out_row_stays_owed_and_carries_its_reason_test.rs"]
+mod a_judged_out_row_stays_owed_and_carries_its_reason_test;
 #[path = "a_label_name_is_the_same_wherever_it_is_declared_test.rs"]
 mod a_label_name_is_the_same_wherever_it_is_declared_test;
 #[path = "a_missing_field_is_refused_or_fallen_back_by_what_the_field_reads_test.rs"]
@@ -122,8 +124,6 @@ mod a_relation_reading_is_one_query_test;
 mod a_reopened_conversation_keeps_the_tools_it_ran_test;
 #[path = "a_retention_knob_says_what_zero_means_test.rs"]
 mod a_retention_knob_says_what_zero_means_test;
-#[path = "a_retired_row_carries_the_measurement_that_falsified_it_test.rs"]
-mod a_retired_row_carries_the_measurement_that_falsified_it_test;
 #[path = "a_retry_loop_that_pipes_its_command_judges_the_last_stage_test.rs"]
 mod a_retry_loop_that_pipes_its_command_judges_the_last_stage_test;
 #[path = "a_roster_entry_is_removed_by_identity_and_a_dead_one_is_never_handed_back_test.rs"]

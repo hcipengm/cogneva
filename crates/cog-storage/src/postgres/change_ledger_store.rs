@@ -427,7 +427,7 @@ WITH prior AS (
         $5,
         now(),
         CASE WHEN $4 = '{state:landed}' THEN now() ELSE NULL END,
-        CASE WHEN $4 = '{state:retired}' THEN now() ELSE NULL END
+        CASE WHEN $6 IS NOT NULL THEN now() ELSE NULL END
     )
     ON CONFLICT (kind, scope, literal) DO UPDATE SET
         state = EXCLUDED.state,
@@ -442,7 +442,8 @@ WITH prior AS (
             ELSE NULL
         END,
         retired_at = CASE
-            WHEN EXCLUDED.state = '{state:retired}' THEN COALESCE(change_ledger.retired_at, now())
+            WHEN EXCLUDED.retire_reason IS NOT NULL
+                THEN COALESCE(change_ledger.retired_at, now())
             ELSE NULL
         END,
         -- A wait describes work still owed; see the note above this statement.
@@ -508,7 +509,7 @@ SELECT count(*) FILTER (WHERE l.state = '{state:landed}') AS satisfied, \
 const BLOCKING_SURFACE_SQL_TEMPLATE: &str = "\
 WITH holder AS ( \
     SELECT kind, scope, literal, delivered_rev FROM change_ledger \
-     WHERE delivered_rev IS NOT NULL AND state NOT IN ('{state:landed}', '{state:retired}') \
+     WHERE delivered_rev IS NOT NULL AND state = '{state:pending}' \
 ), held AS ( \
     SELECT DISTINCT l.kind, l.scope, l.literal \
       FROM change_ledger l JOIN holder h ON l.measured_rev = h.delivered_rev \
@@ -517,7 +518,7 @@ WITH holder AS ( \
 SELECT (SELECT count(*) FROM holder) AS holders, \
        (SELECT count(*) FROM held) AS held_landings, \
        (SELECT count(*) FROM change_ledger l \
-         WHERE l.state NOT IN ('{state:landed}', '{state:retired}') \
+         WHERE l.state = '{state:pending}' \
            AND (SELECT count(DISTINCT s.block) \
                   FROM change_ledger_sources s \
                  WHERE s.kind = l.kind AND s.scope = l.scope AND s.literal = l.literal \
@@ -543,7 +544,7 @@ SELECT h.kind, h.scope, h.literal, \
            AND (l.kind, l.scope, l.literal) IS DISTINCT FROM (h.kind, h.scope, h.literal)) \
          AS held \
   FROM change_ledger h \
- WHERE h.delivered_rev IS NOT NULL AND h.state NOT IN ('{state:landed}', '{state:retired}') \
+ WHERE h.delivered_rev IS NOT NULL AND h.state = '{state:pending}' \
  ORDER BY held DESC, h.kind, h.scope, h.literal";
 
 /// `undecided` gets its own arm rather than being folded into `owed`.
@@ -565,13 +566,10 @@ SELECT h.kind, h.scope, h.literal, \
 /// unreachable for the ones it can.
 const BLOCK_CENSUS_SQL_TEMPLATE: &str = "\
 SELECT block, \
-       CASE state WHEN '{state:landed}' THEN '{state:landed}' \
-                  WHEN '{state:retired}' THEN '{state:retired}' \
-                  WHEN '{state:undecided}' THEN '{state:undecided}' \
-                  WHEN '{state:conflict}' THEN 'owed' \
-                  WHEN '{state:pending}' THEN 'owed' \
-                  WHEN '{state:partial}' THEN 'owed' \
-                  ELSE 'owed' END AS state, \
+       CASE WHEN state = '{state:landed}' THEN '{state:landed}' \
+            WHEN retire_reason IS NOT NULL THEN 'retired' \
+            WHEN unsettled_reason IS NOT NULL THEN 'undecided' \
+            ELSE 'owed' END AS state, \
        count(*) AS n, \
        max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at))))::float8 \
          AS oldest_unmeasured_secs, \
@@ -689,47 +687,47 @@ fn check_reading(reading: &ChangeReading) -> Result<(), String> {
     check_fits("source document", &reading.source.doc, DOC_MAX)
 }
 
-/// Refuse a measurement whose state and reason do not agree.
+/// Refuse a measurement whose state and reasons do not agree.
 ///
-/// Two invariants: a row is retired if and only if it carries a `retire_reason`,
-/// and a row is undecided if and only if it carries an `unsettled_reason`.
-/// [`ChangeMeasurement::retired`] and [`ChangeMeasurement::undecided`] make a
-/// reason-less retirement and a reason-less undecided row unbuildable, so the half
-/// this catches is the other direction -- a reason left on a measurement of some
-/// other state, which would write a row that is not in that state while holding a
-/// reason it is not. Checked here as well as constrained in the schema because the
-/// dialects disagree: Postgres can hold the coupling in a CHECK, MySQL 5.7 cannot,
-/// and a rule that only one dialect enforces is a rule the store cannot rely on.
+/// There are two reasons a measurement can carry, and both are about *why the
+/// row is still owed*: `retire_reason` says the census judges the identity one
+/// the account should not hold, `unsettled_reason` says the pass could not read
+/// the row. Neither is a statement that the change is in the tree, so neither may
+/// ride on a `landed` row -- a landed row carrying "could not measure" would make
+/// the two readings indistinguishable at every column. A row carrying both is
+/// refused for the same reason: they are two different claims about the same row,
+/// and the account cannot be making both at once.
+///
+/// [`ChangeMeasurement::retired`] and [`ChangeMeasurement::undecided`] cannot be
+/// built without their reason; the half this catches is the other direction -- a
+/// reason left on a measurement of another state, which the enum no longer has a
+/// state to describe. Checked here as well as constrained in the schema because
+/// the coupling is a rule the store relies on, and a rule that lives only in a
+/// dialect's CHECK is one the other dialect runs without.
 fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
-    match (m.state, m.retire_reason) {
-        (ChangeState::Retired, None) => {
-            return Err(
-                "a retired measurement carries no reason, which would be a deletion \
-                 wearing a state's clothes"
-                    .to_string(),
-            );
-        }
-        (state, Some(reason)) if state != ChangeState::Retired => {
+    if m.state == ChangeState::Landed {
+        if let Some(reason) = m.retire_reason {
             return Err(format!(
-                "a {} measurement carries the retire reason {}, which belongs only to a \
-                 retired row",
-                state.as_str(),
+                "a landed measurement carries the retire reason {}, which says the row is \
+                 still the account's to decide -- not that the change is in the tree",
                 reason.as_str()
             ));
         }
-        _ => {}
+        if let Some(reason) = m.unsettled_reason.as_deref() {
+            return Err(format!(
+                "a landed measurement carries the unsettled reason {reason}, which says the \
+                 row could not be read -- a reading that could not be taken cannot land it"
+            ));
+        }
     }
-    match (m.state, m.unsettled_reason.as_deref()) {
-        (ChangeState::Undecided, None) => Err(
-            "an undecided measurement carries no reason, which would read as answered".to_string(),
-        ),
-        (state, Some(reason)) if state != ChangeState::Undecided => Err(format!(
-            "a {} measurement carries the unsettled reason {reason}, which belongs only to \
-             an undecided row",
-            state.as_str()
-        )),
-        _ => Ok(()),
+    if m.retire_reason.is_some() && m.unsettled_reason.is_some() {
+        return Err(
+            "a measurement carries both a retire reason and an unsettled reason: one row \
+             cannot be both judged out of the account and unread in the same pass"
+                .to_string(),
+        );
     }
+    Ok(())
 }
 
 /// Queue a declaration, or leave the one already queued for this change and
@@ -1249,11 +1247,17 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // band order, because that order decides which of the owed rows this pass
         // pays for.
         //
-        // Both terminal states are excluded together, so the set this answers is
-        // the same one `landed` was excluded to make: the work. A retired row is
-        // not work -- its question is answered -- and leaving it in would hand a
-        // fixture identity back to the tree, whose check would only overwrite the
-        // retirement with the unsettled answer it was retired to stop repeating.
+        // Two exclusions, and they are not the same rule. `landed` rows are out
+        // because the account says their question is answered. Rows the census
+        // judged out of the account are still `pending` -- the work is still
+        // owed, and every census counts them -- but asking the tree again cannot
+        // change anything: the identity is a fixture, or has been superseded, or
+        // names a surface no look can reach. Handing one back to the tree would
+        // overwrite the reason with the same absent reading every pass, which is
+        // the judgement dissolving into noise. The two reads that can falsify a
+        // judgement (`retired_surface_moved` and `retired_answered_elsewhere`)
+        // ask their question directly, and the re-measurement queue is the third
+        // way back, so this exclusion has a door.
         // `landed` is terminal, and this exclusion is where the account says so:
         // a row it stops answering is a row no later pass is handed to measure,
         // so a criterion corrected afterwards never reaches the rows that landed
@@ -1295,7 +1299,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                                                  l.first_seen_at ASC, \
                                                  l.kind ASC, l.scope ASC, l.literal ASC) AS by_band \
                                FROM change_ledger l \
-                              WHERE l.state NOT IN ('{state:landed}', '{state:retired}')\
+                              WHERE l.state = '{state:pending}'\
+                                AND l.retire_reason IS NULL\
                        ) ranked \
                  ) l \
                  WHERE l.by_age <= $2::bigint \
@@ -1385,7 +1390,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // the owed set, and that sum is a reader's only check on the split.
         let owed_by_band_sql = fill_vocabulary(
             "SELECT priority_rank, count(*) FROM change_ledger \
-             WHERE state NOT IN ('{state:landed}', '{state:retired}') \
+             WHERE state = '{state:pending}' \
              GROUP BY priority_rank",
         );
         let counted: Vec<(i16, i64)> = sqlx::query_as(&owed_by_band_sql)
@@ -1612,7 +1617,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         Self::entries(
             sqlx::query(&read_sql(
                 "FROM change_ledger l \
-                 WHERE l.state = '{state:retired}' AND l.retire_reason = '{reason:surface_moved}' \
+                 WHERE l.retire_reason = '{reason:surface_moved}' \
                  ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1",
             ))
@@ -1634,7 +1639,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         Self::entries(
             sqlx::query(&read_sql(
                 "FROM change_ledger l \
-                 WHERE l.state = '{state:retired}' AND l.retire_reason = '{reason:answered_elsewhere}' \
+                 WHERE l.retire_reason = '{reason:answered_elsewhere}' \
                  ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1",
             ))
@@ -2141,9 +2146,13 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // 这三处比的是查询返回的桶名，而桶名就是 `as_str` 写进去的那个词：比作
         // 字面量的话，改一位枚举的名字，写进去的词变了、这里没变，每一行都会被
         // 读成「还没落地」。
+        // 这三个桶名由查询的 CASE 写死，不是状态词：`retired` 与 `undecided` 现在是
+        // `pending` 行上的两条理由（`retire_reason` / `unsettled_reason`），普查把它们
+        // 单独数出来是因为「判过不该持有」与「这一趟没读到」在待办面上都不该和
+        // 「排着队」混成一片。状态本身只有 `landed` 从枚举来。
         let landed_word = ChangeState::Landed.as_str();
-        let retired_word = ChangeState::Retired.as_str();
-        let undecided_word = ChangeState::Undecided.as_str();
+        let retired_word = "retired";
+        let undecided_word = "undecided";
         let mut census = Vec::with_capacity(names.len());
         for name in names {
             let landed = counted
@@ -2409,52 +2418,70 @@ mod templates {
         }
     }
 
-    /// The census reader finds its buckets by name, so a bucket the statement
-    /// never emits reads exactly like an empty one.
+    /// The reader counts three buckets, and the statement has to name each one
+    /// by the word the reader looks up -- otherwise the bucket reads as zero and
+    /// nobody can tell that apart from a face with nothing in it.
     ///
-    /// The reader selects `landed`, `retired` and `undecided` by the words the
-    /// state writes, and takes whatever else comes back as owed. The statement
-    /// folded `undecided` in with the rest: a face whose looks had all come back
-    /// unsettled and a face with nothing unsettled in it both read zero, and the
-    /// one row that could tell them apart -- the one somebody has to go and ask
-    /// about -- was the row not counted. Only a live database caught that, in a
-    /// step that runs after every other test has passed.
+    /// The two reason buckets are decided by the reason columns now, not by a
+    /// state word: `retired` and `undecided` stopped being states, so a statement
+    /// that still branched on `state = 'undecided'` would match nothing at all
+    /// and answer exactly like a face with no unsettled rows.
     #[test]
     fn the_census_emits_every_bucket_the_reader_counts_by_name() {
         let sql = fill_vocabulary(BLOCK_CENSUS_SQL_TEMPLATE);
-        for state in [
-            ChangeState::Landed,
-            ChangeState::Retired,
-            ChangeState::Undecided,
+        let landed = ChangeState::Landed.as_str();
+        assert!(
+            sql.contains(&format!("WHEN state = '{landed}' THEN '{landed}'")),
+            "the landed bucket is read by name but the statement never emits it: {sql}"
+        );
+        for (reason, bucket) in [
+            ("retire_reason IS NOT NULL", "retired"),
+            ("unsettled_reason IS NOT NULL", "undecided"),
         ] {
             assert!(
-                sql.contains(&format!("THEN '{}'", state.as_str())),
-                "the census reads `{}` by name but the statement never emits that word, so the \
-                 bucket always reads as zero: {sql}",
-                state.as_str()
+                sql.contains(&format!("{reason} THEN '{bucket}'")),
+                "the `{bucket}` bucket is read by name but nothing in the statement emits it: \
+                 {sql}"
             );
         }
+        assert!(
+            sql.contains("ELSE 'owed'"),
+            "the remaining pending rows have to land somewhere the reader calls owed: {sql}"
+        );
     }
 
-    /// The `ELSE` arm answers for rows this cannot enumerate, not for states the
-    /// vocabulary knows.
+    /// The statement branches on the two states the vocabulary holds and on
+    /// nothing else.
     ///
-    /// A state with no arm of its own lands in the `ELSE`, which is how
-    /// `undecided` was reported as owed work for as long as it was: the total
-    /// stayed right and only the reader that asks for that bucket by name saw
-    /// the difference. Adding the missing arm fixes that one state; naming every
-    /// state the vocabulary holds is what makes the next one visible the moment
-    /// it is added, rather than one live reading later. The vocabulary is the
-    /// list, so this needs no database and changes when `ChangeState::ALL` does.
+    /// A state word copied into SQL does not fail when the enum changes -- it
+    /// matches no row and reads as an empty bucket. This pins the statement to
+    /// the vocabulary: the landed arm must name the word the enum writes, and no
+    /// arm may test a state this crate no longer has.
     #[test]
-    fn the_census_answers_for_every_state_out_of_its_own_arm() {
+    fn the_census_branches_on_the_states_the_vocabulary_holds() {
         let sql = fill_vocabulary(BLOCK_CENSUS_SQL_TEMPLATE);
+        assert!(
+            !sql.contains("{state:"),
+            "a vocabulary slot was left unfilled, which reads as a literal `{{` in the query: \
+             {sql}"
+        );
         for state in ChangeState::ALL {
+            let word = state.as_str();
+            let tested = format!("state = '{word}'");
+            if state == ChangeState::Landed {
+                assert!(sql.contains(&tested), "the landed arm is missing: {sql}");
+            } else {
+                assert!(
+                    !sql.contains(&tested),
+                    "`{word}` has no bucket of its own: its rows belong in `owed`, and an arm \
+                     for it would count them twice: {sql}"
+                );
+            }
+        }
+        for old in ["conflict", "partial", "undecided", "retired"] {
             assert!(
-                sql.contains(&format!("WHEN '{}' THEN", state.as_str())),
-                "`{}` has no arm of its own, so its rows reach the `ELSE` and are reported as \
-                 whatever that arm says rather than as something somebody decided: {sql}",
-                state.as_str()
+                !sql.contains(&format!("state = '{old}'")),
+                "the statement still tests `{old}`, a state the account no longer has: {sql}"
             );
         }
     }

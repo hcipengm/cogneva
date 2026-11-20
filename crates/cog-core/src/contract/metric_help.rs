@@ -2396,15 +2396,15 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          make the band order visible: the pass hands out the highest band it \
          holds, so a band whose count does not fall while the others move is \
          urgent work that is not getting through, which no per-row reading can \
-         say. state_conflict, state_pending, state_partial and state_undecided \
-         are the same owed set split again, by the state the account holds each \
-         row in, from its census. The two splits have to add up to the same \
-         total, and state_pending has to equal change_ledger_pending: the \
-         pass's own split and the account's census count the same rows, and the \
-         four states are what makes the rest of the owed set readable at all -- \
-         a row held as undecided, conflict or partial is owed work that appears \
-         in none of the pass's columns, so without these cells an account whose \
-         checks had all become unsettleable would read as owing nothing. A pass \
+         say. state_pending and state_landed are the account's own census, by \
+         the state it holds each row in. state_pending has to equal \
+         change_ledger_pending: the pass's own split and the account's census \
+         count the same rows, and the equality is the reading -- a pass that \
+         counted its slice right but the account wrong would otherwise look \
+         sound. The account has two states, so there is no third cell to make \
+         the rest of a six-word vocabulary readable; a row whose check could not \
+         be settled is pending and appears in unmeasurable, with the reason it is \
+         stuck on the face census. A pass \
          that could not count the account writes no band cell and no state cell \
          rather than writing zeros: a zero says the urgent work is done, which \
          is the one wrong answer, and the stamp on the last write is what tells \
@@ -2414,8 +2414,9 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          as landed, and how many are still owed. They are the only cells here \
          that answer whether the work was actually done, as opposed to how much \
          is outstanding; state_pending falling while demand_satisfied does not \
-         move is a ledger emptying itself by retiring rows rather than by \
-         completing them. Both are written or neither, from the intake joined to \
+         move is a ledger whose rows stopped being measured rather than one \
+         whose changes were made, which is why the face census splits the owed \
+         rows by the reason they are stuck. Both are written or neither, from the intake joined to \
          the account, and a store that cannot answer writes no demand cell. \
          blocking_rows and held_landings are what the account is holding in \
          front of itself: a change a commit delivered while the account still \

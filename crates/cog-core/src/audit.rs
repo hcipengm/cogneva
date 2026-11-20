@@ -75,7 +75,7 @@ impl AuditEvent {
         actor: impl Into<String>,
         target: impl Into<String>,
         action: impl Into<String>,
-        mut detail: serde_json::Value,
+        detail: serde_json::Value,
     ) -> Self {
         // 详情原样入库：它是现场，脱敏是**销毁信息**——把密钥替换成 `[redacted]`
         // 之后，审计链的哈希也是对替换后的字节算的，事后连「当时那句里有没有凭证」
