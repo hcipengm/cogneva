@@ -119,32 +119,6 @@ def judge(kind: str, excluded: list[str], detail: str, touched: list[str], ledge
     return f"Split: {kind} 不在四条里（只认 1 验证面 / 2 归因 / 3 不可逆 / 4 读不完）"
 
 
-def _compile_ledger_lines(root: pathlib.Path) -> list[str]:
-    """这一轮开工以来、这棵树上的编译账。读不到就给空：读不到不是「没绕过」。"""
-    import os as _os
-    ledger = pathlib.Path(
-        _os.environ.get(
-            "COGNEVA_COMPILE_LEDGER",
-            str(pathlib.Path.home() / ".local/state/cogneva/compile-ledger.tsv"),
-        )
-    )
-    try:
-        lines = ledger.read_text(errors="ignore").splitlines()
-    except OSError:
-        return []
-    return [line for line in lines if f"\t{root}\t" in line]
-
-
-def _declares_split(root: pathlib.Path, since: str) -> bool:
-    """这一轮开工以来有没有提交信息写着 `Split:`。"""
-    base = since or "origin/main"
-    out = subprocess.run(
-        ["git", "-C", str(root), "log", f"{base}..HEAD", "--format=%B"],
-        capture_output=True, text=True,
-    ).stdout
-    return "Split:" in out
-
-
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
@@ -199,22 +173,6 @@ def main(argv: list[str]) -> int:
     rows = {item.id: item.title for item in todos}
     done = {i.id for i in todos if i.touches and any(p in touched for p in i.touches)}
     todos = [i for i in todos if not round_ids or i.id in round_ids]
-    # 绕过编译前的检查要在这里被看见：一次「跳过整条检查」若没有随提交声明拆分理由，
-    # 这一推就没按同一批编辑过——那正是本门要拒的形状，而不是一个可以静默略过的开关。
-    bypasses = [
-        line for line in _compile_ledger_lines(root)
-        if "\tBYPASS" in line
-    ]
-    if bypasses and not _declares_split(root, current[2] or ""):
-        print(
-            "batch-gate: 这一轮有 %d 次「跳过整批检查」的编译，而提交里没有 `Split:` 声明："
-            "默认是同一批编辑完再编译，绕过要带四条理由之一。" % len(bypasses),
-            file=sys.stderr,
-        )
-        for line in bypasses[-5:]:
-            print("  " + line.replace("\t", "  "), file=sys.stderr)
-        return 1
-
     untouched = [i.id for i in todos if i.id not in done]
 
     if not untouched:

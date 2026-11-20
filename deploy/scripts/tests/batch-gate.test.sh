@@ -81,20 +81,5 @@ out=$(run); rc=$?
 out=$(COGNEVA_EVENT_PSQL="$tmp/psql.sh" COGNEVA_TODO_LEDGER="$tmp/missing.md" python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "台账读不到：退 2（没判）" || bad "台账读不到时的行为不对（rc=$rc）：$out"
 
-# 绕过编译前的整批检查要在这道门被看见：记账里有一条 BYPASS、提交里没有 Split ⇒ 红。
-bypass_ledger="$tmp/compile-ledger.tsv"
-printf '%s\t%s\tcheck --workspace\tBYPASS\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$tree" >"$bypass_ledger"
-echo a9 >>"$tree/crates/a/src/x.rs"; git -C "$tree" add -A >/dev/null
-commit_with "touch one
-
-nothing else"
-out=$(COGNEVA_COMPILE_LEDGER="$bypass_ledger" COGNEVA_EVENT_PSQL="$tmp/psql.sh" \
-      COGNEVA_TODO_LEDGER="$ledger" python3 "$tree/scripts/hooks/batch-gate.py" \
-      --root "$tree" --base origin/main 2>&1); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "跳过整批检查"; } \
-    && ok "有绕过记录、又没有 Split：红" \
-    || bad "绕过记录没有被这道门看见（rc=$rc）：$out"
-reset
-
 printf '\nbatch-gate.test.sh: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

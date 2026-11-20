@@ -96,7 +96,7 @@ def _md_items(path: pathlib.Path) -> list[Item]:
         )
     if bad_status:
         raise Unreadable(
-            "状态词不在闭集里（只认 `未落` / `已落` / `retired`）：" + "、".join(bad_status)
+            "状态词不在闭集里（**只有两个词**：`未落` / `已落`）：" + "、".join(bad_status)
         )
     return out
 
