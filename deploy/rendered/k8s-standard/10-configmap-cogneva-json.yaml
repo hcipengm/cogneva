@@ -2654,16 +2654,6 @@ data:
               "face": "原则管理"
             },
             {
-              "name": "llm_exchange_body_unarchived",
-              "promql": "(sum by (cause) (increase(cogneva_llm_exchange_body_unarchived_total[30m])) > 0)",
-              "condition": {
-                "greater_than": 0.0
-              },
-              "severity": "warning",
-              "summary": "A call's bytes could not be stored in the memory Raw layer, by cause ({value} being the most any one cause lost in the last half hour). The exchange row keeps the hash of each side and how many bytes it was, and names the permanent copy of each; that copy is the only one nothing sweeps, because the row lives under the archive's own retention and inside the table the nightly backup copies. So one increment here is already a loss, not a rate: nothing retries these writes, and the row alone cannot say it happened, since its reference is NULL both for a side that had no bytes and for one that could not be stored. Read the causes as different repairs: unconfigured means no memory API base was handed to this process, so no request was made; unreachable means the API did not answer, so the fix is the route to it; refused means the API answered and rejected the write, so the fix is on the API's own readings; not_text means the bytes were not UTF-8, which a JSON request body and a JSON or SSE response body never are. The row survives the loss long enough to name the call: read gateway_llm_exchange for the actor, task and hash, and the pod's log for the warn line the failed side left. The response side can also be shorter than what the upstream sent -- that is gateway_llm_exchange's response_seen_bytes against response_bytes, a copy this counter does not cover, because it was never written rather than refused.",
-              "face": "原则管理"
-            },
-            {
               "name": "event_bus_losing_run_histories",
               "promql": "(max by (cause) (increase(cogneva_event_bus_dropped_total[30m])) > 0)",
               "condition": {

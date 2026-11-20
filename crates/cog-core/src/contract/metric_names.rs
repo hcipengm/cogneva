@@ -279,8 +279,6 @@ metric_names! {
     // row alone cannot say so to anybody who was not already looking at it: the
     // column is NULL for a call that had no body at all, exactly as it is for
     // one whose body could not be stored. This counter is the difference, and
-    // it carries the cause because each one has a different repair.
-    LLM_EXCHANGE_BODY_UNARCHIVED_TOTAL => "cogneva_llm_exchange_body_unarchived_total",
 
     // cog-observability — the token ledger's retention, and what it may not
     // retire.

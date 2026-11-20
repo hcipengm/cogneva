@@ -225,21 +225,6 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          can see",
     ),
     (
-        crate::metric_names::LLM_EXCHANGE_BODY_UNARCHIVED_TOTAL.as_str(),
-        "Calls whose side of an exchange was not stored in the memory Raw layer, \
-         by cause. The exchange row keeps the hash and the byte counts of both \
-         sides and names their permanent copies; that layer is the only copy \
-         nothing sweeps, since the row lives under the archive's own retention \
-         and inside the table the nightly backup copies. So this counter is the \
-         whole of what says a copy is missing: the row's reference is NULL both \
-         for a side with no bytes at all and for one that could not be stored. \
-         The causes name different repairs -- unconfigured means no memory API \
-         base was handed to this process, unreachable means it did not answer, \
-         refused means it answered and rejected the write, not_text means the \
-         bytes were not UTF-8 and the ingest surface takes text. Nothing retries \
-         these writes",
-    ),
-    (
         crate::metric_names::NOTIFICATION_SIGN_TOTAL.as_str(),
         "Requests to the notification signing face, by outlet and outcome.          `signed` is a signature handed out, `unknown_outlet` a name that is not          one of the outlets the signing rules cover, and `not_configured` an          outlet this deployment holds no key for. The last two are refusals and          they are different people's to fix: a name nothing covers is ours, a          missing key is the operator's. Read it beside the delivery readings --          a signature that is never asked for and one that is always refused both          end with no message sent, and only this series says which happened",
     ),
