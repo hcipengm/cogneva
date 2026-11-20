@@ -76,6 +76,7 @@ pub const WEB_FETCH_BASE_ENV: &str = "COGNEVA_WEB_FETCH_BASE";
 /// How long one rendered fetch may take. A browser has to start, load, run the
 /// page's scripts and settle; the in-process deadline would cut that short.
 // cap: bound — 浏览器要起来、加载、跑完页面脚本并稳定下来；进程内的那个截止时间会把它切短
+// wall: 等=无头浏览器把这一页渲染稳 / 等不到=这次渲染失败，**没有半份页面被当成读到了**；浏览器进程连同它的临时目录一起收掉 / 续跑=能，重来是一次新的渲染，从打开页面开始
 const RENDER_TIMEOUT_SECS: u64 = 60;
 
 /// How long one rendered page stays servable out of the backend's own cache.

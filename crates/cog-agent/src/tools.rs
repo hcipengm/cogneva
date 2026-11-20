@@ -27,6 +27,7 @@ const LANE_PROBE: Duration = Duration::from_millis(500);
 
 /// 这一问自己的上限：执行器不应答时，一句「在等」不能把调用拖住。
 // cap: bound — 一次读数的超时；比它短会让读数常常读不到，比它长会让一个不应答的执行器拖慢这一轮
+// wall: 等=执行器对一次探活的答复 / 等不到=这一条读数这次读作「读不到」，**不是 0**——读不到与量到为 0 是两件事，读数面必须分得开 / 续跑=能，下一拍再问一次
 const LANE_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// 同一个名次最多多久重复说一次。

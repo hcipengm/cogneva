@@ -16,6 +16,7 @@ use cog_core::RuntimeConfig;
 /// an idle consumer always makes it and a busy one is always worth a line — it
 /// is a judgement about the wait, not a percentile of task duration.
 // cap: bound — 是对这段等待的判断，不是任务时长的分位数：空闲的消费者总能赶到，忙的那个总值得记一行
+// wall: 等=忙碌的消费者把手上那条消息处理完 / 等不到=记一行「退役时还有消费者在忙」，然后照常退役——这一格不阻止退役 / 续跑=不适用：退役是一次性的，重来就是第二次退役
 const AGENT_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What one call to [`Agent::retire`] did.

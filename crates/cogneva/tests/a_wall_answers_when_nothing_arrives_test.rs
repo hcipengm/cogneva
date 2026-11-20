@@ -31,12 +31,8 @@ use std::path::{Path, PathBuf};
 const UNANSWERED: &[(&str, u32)] = &[
     ("crates/bootstrap/src/apt.rs", 1),
     ("crates/bootstrap/src/main.rs", 1),
-    ("crates/cog-agent/src/agent.rs", 1),
     ("crates/cog-agent/src/archive.rs", 1),
-    ("crates/cog-agent/src/hooks/types.rs", 1),
     ("crates/cog-agent/src/plugin.rs", 1),
-    ("crates/cog-agent/src/tools.rs", 1),
-    ("crates/cog-agent/src/web.rs", 1),
     ("crates/cog-core/src/contract/hook.rs", 1),
     ("crates/cog-extension/src/hostdocs_assist.rs", 1),
     ("crates/cog-extension/src/runtime/remote.rs", 2),

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 /// Default per-hook execution timeout (30 seconds).
 // cap: bound — 单条钩子的默认执行上限：钩子是同步跑的，超时它就是在拖慢这一回合
+// wall: 等=一条钩子的子进程退出 / 等不到=这条钩子读作失败并被杀掉，它的结论不参与这一次调用；钩子自己写下的东西不在这一格里 / 续跑=能，下一次调用会再跑一次这条钩子，但从头跑
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default deduplication window (1 second).  Identical events fired inside the
