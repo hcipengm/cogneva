@@ -23,6 +23,7 @@ use std::time::Duration;
 /// infrastructure route — see the assertion in the tests below.
 const PROBE_PATH: &str = "/health/ready";
 // cap: bound — read/write timeout on a loopback readiness probe; waiting longer only delays the verdict
+// wall: 等=本机回环上的就绪探针的答复 / 等不到=这次探活读作「未就绪」；读不到不等于「进程死了」，判词只覆盖这一次探测 / 续跑=能，下一次探活重新问
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// A status line longer than this is not a status line; stop reading rather
 /// than block until the timeout.

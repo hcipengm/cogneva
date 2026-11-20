@@ -30,6 +30,7 @@ use crate::eval_toolathlon::{ToolathlonPod, CONTAINER_AGENT_WORKSPACE};
 const PAGE_SIZE: usize = 10_000;
 /// 上游 `python_execute` 自带上界：`timeout = min(int(timeout), 120)`。
 // cap: bound — 上游 python_execute 自带的上界 timeout = min(int(timeout), 120)
+// wall: 等=上游 python_execute 自己的上界，这里是它的副本，不是第二个界 / 等不到=由上游那一条收尾，这一格只保证两边写成同一个数 / 续跑=不适用：这一格不自己收任何东西
 const PYTHON_TIMEOUT_CEILING: u64 = 120;
 
 /// 这道题要的本地工具。`wanted` 是 `needed_local_tools` 里的那几个**声明名**。

@@ -51,13 +51,6 @@ const UNANSWERED: &[(&str, u32)] = &[
     ("crates/cog-reflection/src/workload_resources.rs", 1),
     ("crates/cog-storage/src/backends/object_backends.rs", 1),
     ("crates/cog-storage/src/postgres/metrics_backend.rs", 1),
-    ("crates/cogneva/src/eval_mcp_in_pod.rs", 1),
-    ("crates/cogneva/src/eval_platform.rs", 1),
-    ("crates/cogneva/src/eval_table.rs", 1),
-    ("crates/cogneva/src/eval_toolathlon.rs", 1),
-    ("crates/cogneva/src/eval_toolathlon_local.rs", 1),
-    ("crates/cogneva/src/health_check.rs", 1),
-    ("crates/cogneva/src/work.rs", 1),
 ];
 
 fn repo_root() -> PathBuf {

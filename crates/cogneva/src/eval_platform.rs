@@ -156,6 +156,7 @@ const CASE_CONTRACT: &str = "Answer one benchmark question. The question is in \
 const CASE_ACCEPTANCE: &str =
     "The reply answers the question in `task`, in the form that question asks for.";
 // cap: bound — the expectation the bridge declares for one case; passing it only publishes a
+// wall: 等=桥对单条用例声明的预期时长 / 等不到=过了只发布一行「比预期慢」，用例本身继续跑到它自己的结局 / 续跑=不适用：这一格只发布，不结束
 // line, and a case that must stop is stopped by the platform's lease-and-motion verdict
 const DEFAULT_DEADLINE_SECS: u64 = 3600;
 // cap: bound — polling period for a submitted platform case; the declared wall is DEFAULT_DEADLINE_SECS

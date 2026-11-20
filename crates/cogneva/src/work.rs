@@ -594,6 +594,7 @@ const UNIT_WORK_DECLARED_SECS: u64 = 7 * 24 * 60 * 60;
 /// How long one filing request may take. The door answers as soon as it has
 /// judged the submission; the decomposition it starts runs behind the answer.
 // cap: bound — the answer is a judgement over one submission, not a run: thirty
+// wall: 等=一次提交的答复 / 等不到=这次提交读作「不知道有没有收到」，**对端可能已经收了**：所以判词是一次判断，不是一次重发 / 续跑=能，但重来是先查后发，否则同一次提交会被记两次
 // seconds is the wait past which a door that has not answered is not slow but
 // stuck, and no decomposition timing should move it.
 const SUBMIT_TIMEOUT_SECS: u64 = 30;

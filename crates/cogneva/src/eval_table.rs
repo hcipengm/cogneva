@@ -31,6 +31,7 @@ const HASH_CHUNK_BYTES: usize = 64 * 1024;
 /// 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的
 /// 观测面上。
 // cap: bound — 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的观测面上
+// wall: 等=观测面吐出这几格读数 / 等不到=这几格按「缺读数」处理，**不填 0**——一次评测里读不到与量到为 0 是两件事 / 续跑=能，下一次评测重新抓
 const METRICS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, HttpClient, LlmClient,
