@@ -988,6 +988,15 @@ else
     skip_step "提交引用可达性" "本机没有 python3 或没有 origin/main（CI 的 Check 会跑编译）"
 fi
 
+# 私有仓的名字不许出现在要推的这份字节里。判据只有一份、住在私有仓（名单从它自己的仓名推；
+# 写进公开树就等于把它要防的东西放进被它守的树里），所以这一格只是一个**位置**。CI 那道
+# `.github/scripts/check-private-identifiers.sh` 的裸标识层名单从 secret 注入，本机没有 secret，
+# 它自己印「这一遍没跑」——2026-11-20 实测一次代价：`5a3137db3` 的一行注释点了私有仓的名字与
+# 路径，推到了两个远端，而推之前这一侧没有任何一层在问这个名字。
+# 没配私有仓检出的机器上这一格退 75，记成 UNJUDGED，不是绿。
+run_step "私有标识（公开树里不许出现私有仓的名字）" \
+    bash "${here}/check-private-names.sh" "${here}/.."
+
 # 提交信息不带 AI 署名（`Check commit messages carry no AI attribution`）：这一步不
 # 在这里另写一份。判的字节在提交信息里，一旦推上去能修的只剩历史，而 CI 那一步以前是
 # 多行块、本机回放不了，于是本机从来没判过它、判词里一直写着「这一面没验」。现在范围
