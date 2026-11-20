@@ -235,6 +235,7 @@ fn state_with(
     let orchestrator = control("test-workspace");
 
     Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0,

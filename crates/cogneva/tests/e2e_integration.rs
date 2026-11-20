@@ -105,6 +105,7 @@ async fn spawn_app_full(
     let (task_event_tx, _task_event_rx) = broadcast::channel::<cog_core::TaskEvent>(16);
 
     let gateway_state = Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0, // random

@@ -120,6 +120,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
     let memory_backend: Arc<dyn cog_core::MemoryBackend> = Arc::new(MemoryMemoryBackend::new());
 
     let gateway_state = Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(cog_core::GatewayConfig {
             http_port: 0,

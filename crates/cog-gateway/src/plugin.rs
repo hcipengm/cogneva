@@ -232,6 +232,8 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // The per-row token ledger, published by the same plugin as the rolled
         // read face above. Same reason it is consumed rather than built: the
         // gateway asks "what did this task spend", not "how do rows land".
+        let llm_call_events: Option<Arc<dyn cog_core::LlmCallEvents>> =
+            ctx.consume_service::<dyn cog_core::LlmCallEvents>();
         let llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>> =
             ctx.consume_service::<dyn cog_core::LlmUsageLedger>();
 
@@ -311,6 +313,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &taste_intent_sink,
             &llm_usage_reader,
             &llm_usage,
+            &llm_call_events,
             &ctx.consume_service::<dyn cog_core::GovernanceStore>(),
             // 原则台账由持有共用库的存储插件发布。它写面归演化的常驻租约，
             // 这里只借读面：属主要在同一个界面里看见语料判成了什么、哪几条

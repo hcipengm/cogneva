@@ -540,6 +540,7 @@ fn state_with(
         Arc::new(cog_storage::MemoryStateBackend::new());
 
     Arc::new(GatewayState {
+        llm_call_events: None,
         data_dir: "/tmp".into(),
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0,

@@ -90,6 +90,7 @@ pub async fn build_gateway_state(
     taste_intent_sink: &Option<Arc<dyn cog_core::TasteIntentSink>>,
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
     llm_usage: &Option<Arc<dyn cog_core::LlmUsageLedger>>,
+    llm_call_events: &Option<Arc<dyn cog_core::LlmCallEvents>>,
     governance_store: &Option<Arc<dyn cog_core::GovernanceStore>>,
     principle_ledger: &Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
     change_ledger: &Option<Arc<dyn cog_core::ChangeLedgerStore>>,
@@ -199,6 +200,7 @@ pub async fn build_gateway_state(
         // 逐笔 token 账由拥有它的 crate 装配好交进来；没交进来时读面报
         // 「量不了」而不是零。
         llm_usage: llm_usage.clone(),
+        llm_call_events: llm_call_events.clone(),
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_turns: chat_turns.clone(),
         conversation,

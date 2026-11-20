@@ -332,6 +332,9 @@ pub struct GatewayState {
     /// 缺席时读面显式报「量不了」，不把缺账读成零花销。借的是库里已有的池，
     /// 不为这一次读新开一套连接。
     pub llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>>,
+    /// 调用事实的写入口（`cogneva_event` 的 `llm_call`）。与账本并存：账本是投影，
+    /// 事件是正本；读切换之前两条都写。
+    pub llm_call_events: Option<Arc<dyn cog_core::LlmCallEvents>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
     /// 抓取维度集合的可选收窄项；空 = 不收窄，采每个 observable 自己声明的有界维度。
@@ -512,6 +515,7 @@ impl GatewayState {
         state::OpsState {
             quota_manager: self.quota_manager.clone(),
             llm_usage: self.llm_usage.clone(),
+            llm_call_events: self.llm_call_events.clone(),
             hierarchy_manager: self.hierarchy_manager.clone(),
             supervisor: self.supervisor.clone(),
             agent_registry: self.agent_registry.clone(),
