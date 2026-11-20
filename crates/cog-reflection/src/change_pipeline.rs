@@ -976,7 +976,7 @@ enum LintVerdict {
 }
 
 /// Pipeline that turns validated code changes into tested source changes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChangePipeline {
     project_root: PathBuf,
     change_dir: PathBuf,
@@ -1002,6 +1002,11 @@ pub struct ChangePipeline {
     /// `None` means this workspace's own linter, the only one whose findings
     /// this pipeline can compare against the lines the change wrote.
     lint_command: Option<Vec<String>>,
+    /// 定批的读取器。可选：没有事件流的部署没有可比的批次，判据退成「不判」。
+    ///
+    /// 它在这里的理由只有一个：构建槽是这一整条流水线上最贵的动作，而「这一笔是不是
+    /// 当前那一轮钉住的那批里的一条」这件事，只有在**取槽之前**问才不会白付一次构建。
+    rounds: Option<std::sync::Arc<dyn cog_core::RoundEvents>>,
     /// The executable admission conditions for changes that touch `deploy/**`.
     /// `None` means this deployment declared none, and such a change is
     /// refused by name rather than sent to a person.
@@ -1244,6 +1249,7 @@ impl ChangePipeline {
             test_command: cog_core::SelfEvolutionConfig::default().test_command,
             fmt_check_command: None,
             lint_command: None,
+            rounds: None,
             deploy_admission: None,
             web_admission: None,
             promotion_policy: None,
@@ -1262,6 +1268,13 @@ impl ChangePipeline {
     /// Where the per-artifact fidelity readings go.
     pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
         self.metrics = Some(MetricsSink(metrics));
+        self
+    }
+
+    /// 接上「当前那一轮钉住了哪一批」。接上之后，取构建槽之前会先问这一笔在不在批里；
+    /// 不接就是「没有批次」——没有事件流的部署照样跑，只是不判这一条。
+    pub fn with_rounds(mut self, rounds: Arc<dyn cog_core::RoundEvents>) -> Self {
+        self.rounds = Some(rounds);
         self
     }
 
@@ -4362,6 +4375,35 @@ impl ChangePipeline {
             Some(argv) => Some(argv),
             None => None,
         };
+        // 取槽之前先问：这一笔属不属于当前那一轮钉住的那一批。
+        //
+        // 平台的循环已经按那一批下发（`pinned_batch`），但「下发过」与「这一笔真在批里」
+        // 之间还有一段路：重放、手动提交、上一轮遗留的任务都会走到这里。构建槽是这条
+        // 流水线上最贵的一步，让一个不在批里的变更先付掉它，这一轮就多编译了一次。
+        //
+        // 读不到批次就不判：那是「这台机器答不了」，不是「这一笔不在批里」。
+        if let Some(rounds) = self.rounds.as_ref() {
+            match rounds.current().await {
+                Ok(Some(open)) if !open.batch.is_empty() => {
+                    if !open
+                        .batch
+                        .iter()
+                        .any(|prefix| change_id.starts_with(prefix))
+                    {
+                        return Err(SFError::Config(format!(
+                            "这一笔（{change_id}）不在当前那一轮（{}）钉住的 {} 条里：\
+                             批次外的变更不在这条流水线上取构建槽",
+                            open.round,
+                            open.batch.len()
+                        )));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "读不到当前那一轮，这一笔按「没有批次」放行");
+                }
+            }
+        }
         let _slot = crate::build_gate::acquire("change lint verification").await?;
         let (line, passed, output) = match declared {
             Some(argv) => {
