@@ -4435,10 +4435,15 @@ fn extract_usage(json: &serde_json::Value) -> ReportedUsage {
 /// 透传响应流的旁路扫描器：逐字节转发不变，只从 SSE `data:` 行里抠 usage。
 /// 非 SSE 响应（application/json 整体 body）在行解析失败后由 `finish`
 /// 兜底解析。扫描永不报错——认不出 usage 就是零，不是故障。
-#[derive(Default)]
 struct UsageScanner {
     line_buf: Vec<u8>,
+    /// 整段响应。**只在没有别处承接正文时攒**（`keep_raw`）：接上大对象写者之后，
+    /// 字节在到达的那一拍就写进库，这里再留一份既是第二份正本，也是「无界」的反面
+    /// ——正文多大，进程内存就多大。
     raw: Vec<u8>,
+    /// 是否把正文留在内存里。默认 `true`（测试与没有写者的部署走这条），
+    /// 接上写者时置 `false`。
+    keep_raw: bool,
     /// 这一跳一共看到多少字节，无论有没有留下来。
     ///
     /// 与 `raw.len()` 是两个问题：后者是副本有多长，前者是上游发了多少。两者现在相等
@@ -4479,17 +4484,46 @@ struct UsageScanner {
     saw_done: bool,
 }
 
+impl Default for UsageScanner {
+    fn default() -> Self {
+        // 派生出来的 `keep_raw` 会是 `false`，而那恰好是本字段存在之前的行为的反面：
+        // 不显式写这一格，「没有写者」的部署就会静默丢掉正文。
+        Self {
+            line_buf: Vec::new(),
+            raw: Vec::new(),
+            keep_raw: true,
+            seen: 0,
+            tokens_input: 0,
+            tokens_output: 0,
+            tokens_cached: 0,
+            tokens_cache_created: 0,
+            tokens_reasoning: 0,
+            saw_reasoning: false,
+            saw_cache_created: false,
+            saw_error: false,
+            saw_usage: false,
+            asked: false,
+            saw_done: false,
+        }
+    }
+}
+
 impl UsageScanner {
     fn feed(&mut self, chunk: &[u8]) {
         self.line_buf.extend_from_slice(chunk);
         self.seen += chunk.len() as u64;
+
         // 整条响应原样留下：没有窗口、没有阈值、没有截断。
         //
         // 从前这里有一道写死的字节数做上限（`if raw.len() < 1024 * 1024`），越过的部分没有副本，而落库那一行
         // 看起来是完整的——只有把 `seen` 与副本长度摆在一起才看得出少了一截。正文
         // 是这次调用唯一的现场，现场不许被安静地切掉；大小由上游自己决定（受它自己的
         // 输出上限约束），不由我们拍一个数。
-        self.raw.extend_from_slice(chunk);
+        if self.keep_raw {
+            // 正文另有落点时这里不存：字节在到达那一拍就写进库了，这里再留一份是
+            // 第二份正本，也是「无界」的反面。解析照旧进行——用量帧在下面那段。
+            self.raw.extend_from_slice(chunk);
+        }
         while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
             let text = String::from_utf8_lossy(&line);
@@ -12110,6 +12144,33 @@ mod tests {
     /// 那正是「命中率是不是太低」这个问题被读错的地方：不是低，是没读。
     #[test]
     fn a_tail_frame_reports_the_split_the_head_frame_could_not() {
+        /// 默认必须把正文留在内存里：`bool` 的派生默认是 `false`，显式写这一格是
+        /// 为了让「没有写者的部署」不静默丢正文——这条用例就是那一格的守卫。
+        #[test]
+        fn a_scanner_with_no_writer_keeps_the_body() {
+            let mut s = UsageScanner::default();
+            s.feed(b"data: {\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n");
+            assert_eq!(s.seen, 49, "看见的字节数照旧计");
+            assert!(
+                !s.raw.is_empty(),
+                "没有写者时正文必须留在内存里，否则这一行的正文就是空的"
+            );
+        }
+
+        /// 接上写者时不攒，但**解析照旧**：用量帧不能因为正文另存而消失。
+        #[test]
+        fn a_scanner_with_a_writer_still_reads_the_usage_frames() {
+            let mut s = UsageScanner {
+                keep_raw: false,
+                ..UsageScanner::default()
+            };
+            s.feed(b"data: {\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}\n\n");
+            assert!(s.raw.is_empty(), "有写者时不再留第二份正文");
+            assert_eq!(s.tokens_input, 7);
+            assert_eq!(s.tokens_output, 9);
+            assert!(s.saw_usage);
+        }
+
         let mut s = UsageScanner::default();
         s.feed(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":17266,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n",
