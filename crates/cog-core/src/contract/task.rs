@@ -203,6 +203,31 @@ pub trait ActionPlanner: Send + Sync {
     ) -> SFResult<Vec<String>>;
 }
 
+/// 一批待干的活：一本账上**所有未完成**的条目，连同它们各自的触点。
+///
+/// 这是编排的主入口的输入形状。它刻意不是「一个目标」：从目标往下拆是人类的管理
+/// 动作（执行者上下文有限、必须交接），而智能体装得下整批、成本在验证——拆得越碎，
+/// 一次编译与一次闸门的成本付得越多。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchItem {
+    pub id: String,
+    pub title: String,
+    /// 这一条要动哪些文件。空表示「说不出来」——它进不了批次，要么先被拆细，要么被
+    /// `Split` 逐条点名排除。
+    pub touches: Vec<String>,
+}
+
+/// 给一批活写计划：这一批的「这一类」是什么、必须成立什么、怎么量。
+///
+/// 与 [`ActionPlanner`] 的分工：那个是从目标往下拆（只在目标还没有对应账本条目时用
+/// 一次，用来落条目），这个是把账上已经存在的活汇成一批并写下定义。两者产出的都是
+/// [`crate::types::action_plan::Plan`]，而那份计划由固定程序判合格（`Plan::validate`），
+/// 不由 planner 自己宣布合格。
+#[async_trait]
+pub trait BatchPlanner: Send + Sync {
+    async fn plan_batch(&self, items: &[BatchItem]) -> SFResult<crate::types::action_plan::Plan>;
+}
+
 // ─── Task Execution Callback ───────────────────────────────────────────────
 
 /// Callback invoked by agent-pool workers to execute a single task.
