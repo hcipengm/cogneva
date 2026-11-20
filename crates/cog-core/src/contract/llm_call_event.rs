@@ -42,8 +42,12 @@ pub struct LlmCall {
     pub input_tokens: u64,
     /// 输出 token。
     pub output_tokens: u64,
-    /// 这一次调用花了多久，毫秒。
-    pub latency_ms: u64,
+    /// 这一次调用花了多久，毫秒；`None` 表示落账那一刻它已经不在手里了。
+    ///
+    /// 不用 0 顶替：0 毫秒是一次真实读数（本地拒调用就是 0），把它与「不知道」
+    /// 写成同一个数，正是这一族最忌的形状。拿到答复的那一处才有这个数，落账的那
+    /// 一处未必有。
+    pub latency_ms: Option<u64>,
     /// 这次调用是为哪个任务花的；`None` 表示不是任务发起的。
     pub task_id: Option<String>,
     /// 发起方身份。

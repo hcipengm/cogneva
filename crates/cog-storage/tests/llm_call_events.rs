@@ -88,7 +88,7 @@ fn call(id: &str) -> LlmCall {
         result: "ok".into(),
         input_tokens: 10,
         output_tokens: 20,
-        latency_ms: 30,
+        latency_ms: Some(30),
         task_id: Some("task-1".into()),
         actor: "probe-actor".into(),
         at: Utc::now(),
