@@ -409,6 +409,9 @@ pub struct AgentRuntime {
     /// that fit: with no archiver a truncated output is lost, and the handle is
     /// what carries the reading that says so.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
+    /// 工具调用的事实落点。正文那份（`tool_output_archive`）是**载体**，这只是记录：
+    /// 一次调用落一条 `tool_call` 事件，参数与结果存哈希，正文由载体按哈希取。
+    tool_call_events: Option<Arc<dyn cog_core::ToolCallEvents>>,
     /// 工具执行之前那一问由谁回答，以及这一轮处在哪种模式下。
     ///
     /// 没有配置回答者时不是「不问」，而是「要问的那一步拒绝」：见
@@ -1215,6 +1218,7 @@ impl AgentRuntime {
             observability: None,
             metrics: None,
             tool_output_archive: None,
+            tool_call_events: None,
             permission: None,
             permission_mode: crate::permission::PermissionMode::Bypass,
             run_usage: RunUsage::default(),
@@ -1329,6 +1333,15 @@ impl AgentRuntime {
     /// marker, so the tail the model never saw can still be fetched. Without
     /// the surface the loop still runs and still cuts — it just has nowhere to
     /// put the copy, and the marker says only that bytes were dropped.
+    /// 接上事件流的写入点：一次工具调用落一条事实。
+    pub fn with_tool_call_events(
+        &mut self,
+        events: Arc<dyn cog_core::ToolCallEvents>,
+    ) -> &mut Self {
+        self.tool_call_events = Some(events);
+        self
+    }
+
     pub fn with_tool_output_archive(
         mut self,
         archive: Arc<dyn crate::archive::ToolOutputArchive>,
@@ -2389,6 +2402,30 @@ impl AgentRuntime {
         delivered: &mut DeliveredResults,
     ) -> Message {
         let text = result.to_string();
+        // 事实先落事件流：记录与载体是两件事——没有载体时这份调用仍然发生过，
+        // 而「载体在不在」不该决定「这次调用有没有被记下来」。
+        if let Some(sink) = self.tool_call_events.as_ref() {
+            let arguments_bytes = arguments.to_string().into_bytes();
+            let result_bytes = result.to_string().into_bytes();
+            let call = cog_core::ToolCall::from_bytes(
+                format!("{tool_call_id}:{turn}:{frame}"),
+                task_id.unwrap_or_else(|| self.config.agent_id.as_str()),
+                tool_name,
+                self.config.agent_id.clone(),
+                &arguments_bytes,
+                Some(&result_bytes),
+                if is_error { "error" } else { "ok" },
+                None,
+                chrono::Utc::now(),
+            );
+            if let Err(e) = sink.append(&call).await {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = %e,
+                    "工具调用的那条事实没写进事件流；这一轮的结果仍然给了模型，但账上没有它"
+                );
+            }
+        }
         let reference = self
             .archive_tool_call(
                 task_id,
