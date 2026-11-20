@@ -134,6 +134,7 @@ pub struct Agent {
     /// Where the loop sends a tool output too large to fit the context window,
     /// so the bytes it drops stay reachable by the reference in the marker.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
+    tool_call_events: Option<Arc<dyn cog_core::ToolCallEvents>>,
     /// Broadcast channel capacity for agent events.
     event_channel_capacity: usize,
     /// 持久事件总线投递口。装上之后 AgentEnd 只写总线（broadcast 由
@@ -213,6 +214,7 @@ impl Agent {
             observability: None,
             metrics: None,
             tool_output_archive: None,
+            tool_call_events: None,
             event_channel_capacity,
             event_bus_sink: None,
             cmd_channel_capacity,
@@ -347,6 +349,15 @@ impl Agent {
         self
     }
 
+    /// Hand the loop the event sink a tool call is recorded in.
+    ///
+    /// Separate from the archive on purpose: the record of a call is not the body
+    /// it carried, and a run with no archive still happened.
+    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::ToolCallEvents>) -> Self {
+        self.tool_call_events = Some(events);
+        self
+    }
+
     pub fn with_wal(mut self, wal: Arc<crate::wal::AgentWal>) -> Self {
         self.wal = Some(wal);
         self
@@ -420,6 +431,7 @@ impl Agent {
         let observability = self.observability.clone();
         let metrics = self.metrics.clone();
         let tool_output_archive = self.tool_output_archive.clone();
+        let tool_call_events = self.tool_call_events.clone();
         // 名册交给运行时的循环：它自己的工号与名字从那一行读。登记在下面
         // 发生，晚于这里——运行时每轮开头才问一次，问到之前不编名字。
         let roster = self.registry.clone();
@@ -463,6 +475,9 @@ impl Agent {
             }
             if let Some(ref ar) = tool_output_archive {
                 agent_loop = agent_loop.with_tool_output_archive(ar.clone());
+            }
+            if let Some(ref events) = tool_call_events {
+                agent_loop = agent_loop.with_tool_call_events(events.clone());
             }
 
             // Forward events from AgentRuntime mpsc to Agent broadcast
@@ -1050,6 +1065,7 @@ impl Agent {
         let observability = self.observability.clone();
         let metrics = self.metrics.clone();
         let tool_output_archive = self.tool_output_archive.clone();
+        let tool_call_events = self.tool_call_events.clone();
         // 与 `start` 同一条理由：恢复出来的这个对象也是名册上的同一个人。
         let roster = self.registry.clone();
 
@@ -1089,6 +1105,9 @@ impl Agent {
             }
             if let Some(ref ar) = tool_output_archive {
                 agent_loop = agent_loop.with_tool_output_archive(ar.clone());
+            }
+            if let Some(ref events) = tool_call_events {
+                agent_loop = agent_loop.with_tool_call_events(events.clone());
             }
 
             // Restore state from snapshot before running
