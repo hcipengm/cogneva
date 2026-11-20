@@ -409,6 +409,21 @@ impl cog_core::SystemPlugin for StoragePlugin {
             );
             ctx.publish_service::<dyn cog_core::ChangeCandidateStore>(std::sync::Arc::new(store));
             info!("StoragePlugin change candidate store published");
+
+            // 一次调用 / 一次工具调用的事实落点：写入口只有这一处（`cogneva_event`
+            // 一条 INSERT），所以在这里发布，而不是让每个消费者各造一个。
+            let deployment = std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
+                .unwrap_or_else(|_| "cogneva".to_string());
+            ctx.publish_service::<dyn cog_core::LlmCallEvents>(std::sync::Arc::new(
+                crate::postgres::llm_call_events::LlmCallEventStore::new(
+                    pool.clone(),
+                    deployment.clone(),
+                ),
+            ));
+            ctx.publish_service::<dyn cog_core::ToolCallEvents>(std::sync::Arc::new(
+                crate::postgres::tool_call_events::ToolCallEventStore::new(pool, deployment),
+            ));
+            info!("StoragePlugin call-event sinks published");
         } else {
             info!("no PostgreSQL pool: the change candidate queue has no writer in this process");
         }
