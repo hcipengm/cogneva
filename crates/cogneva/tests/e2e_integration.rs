@@ -667,10 +667,11 @@ async fn e2e_memory_ingest_and_search() {
         ingest_body
     );
 
-    // Search
+    // Search. `limit` is the caller's decision on how many rows to ask for,
+    // and the handler requires it rather than inventing a default.
     let res = client
         .get(format!(
-            "http://{}/api/v1/memory/schema?query=alice",
+            "http://{}/api/v1/memory/schema?query=alice&limit=10",
             app.addr
         ))
         .header("Authorization", &token)
