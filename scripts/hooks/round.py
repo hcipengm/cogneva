@@ -80,8 +80,9 @@ def current_round() -> tuple[str, str, str] | None:
     「开着」＝流里最后一条 `round_opened` 没有配对的 `round_closed`（按 subject_id 配）。
     """
     sql = (
-        "select o.event_id || E'\\t' || (o.attributes::jsonb->>'ledger_rev') "
+        "select o.event_id || E'\\t' || coalesce(o.attributes::jsonb->>'ledger_rev','') "
         "|| E'\\t' || coalesce(o.attributes::jsonb->>'code_rev','') "
+        "|| E'\\t' || coalesce(o.attributes::jsonb->>'batch','[]') "
         "from cogneva_event o where o.kind='round_opened' and not exists ("
         " select 1 from cogneva_event c where c.kind='round_closed'"
         " and c.subject_id=o.subject_id) order by o.at desc, o.event_id desc limit 1"
@@ -90,9 +91,14 @@ def current_round() -> tuple[str, str, str] | None:
     if not out:
         return None
     parts = out.split("\t")
-    event_id, rev = parts[0], parts[1]
+    event_id = parts[0]
+    rev = parts[1] if len(parts) > 1 else ""
     code_rev = parts[2] if len(parts) > 2 else ""
-    return event_id, rev, code_rev
+    try:
+        batch = json.loads(parts[3]) if len(parts) > 3 and parts[3] else []
+    except ValueError:
+        batch = []
+    return event_id, rev, code_rev, [str(b) for b in batch]
 
 
 def ledger_at(rev: str, spec: str) -> pathlib.Path:
@@ -121,16 +127,14 @@ def open_round(spec: str | None, allow_open: bool = False) -> int:
         print("round: 已经有一轮开着。先 `round.py close`。")
         return 1
     source = spec or todo_source.default_spec()
+    # 批次的正本是「这一轮开了哪些条」，不是某个 rev 上的台账：平台自己的变更账本
+    # 在库里，没有 git rev，而 worker 的 markdown 台账有。两个来源共用同一条判据。
     repo = ledger_repo(source)
-    if repo is None:
-        print("round: 这个来源没有 git rev（change-ledger 要按事件流记账），开不了轮。",
-              file=sys.stderr)
-        return 2
-    rev = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                         capture_output=True, text=True).stdout.strip()
-    if not rev:
-        print("round: 台账所在仓没有 HEAD，开不了轮。", file=sys.stderr)
-        return 2
+    if repo is not None:
+        rev = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+    else:
+        rev = ""
     # 打开一轮的时候就把**整批**列出来，并把它记进事件：单位必须在编辑之前
     # 定下来，否则「这一轮要改什么」由动手的人临场挑，默认全量就退成子集。
     import os
@@ -165,13 +169,36 @@ def open_round(spec: str | None, allow_open: bool = False) -> int:
 
 
 def remaining() -> list[str]:
+    """这一轮钉住的那批 id。
+
+    批次的正本是 round 事件里记下的那份 id 清单，不是「某个 rev 上的台账」——
+    后者只对 git 里的台账成立，而平台自己的变更账本在库里，没有 rev。所以任何
+    来源都用同一条判据：这一轮开了哪些条，就做哪些条。
+    """
     current = current_round()
     if current is None:
         return []
-    rev = current[1]
+    return current[3]
+
+
+def batch_touches() -> list[tuple[str, list[str]]]:
+    """这一轮的 (id, 触点)，取自**开工那一刻**的台账。
+
+    触点用来判「动没动到」；它跟着批次一起钉住，台账后续怎么变都不影响这一轮。
+    """
+    current = current_round()
+    if current is None:
+        return []
     source = todo_source.default_spec()
-    path = ledger_at(rev, source)
-    return [i.id for i in todo_source.load(f"md:{path}")]
+    if source.startswith("md:") and current[1]:
+        try:
+            path = ledger_at(current[1], source)
+            items = {i.id: i for i in todo_source.load(f"md:{path}")}
+            return [(i, items[i].touches) for i in current[3] if i in items]
+        except todo_source.Unreadable:
+            pass
+    items = {i.id: i for i in todo_source.load(source)}
+    return [(i, items[i].touches) for i in current[3] if i in items]
 
 
 def status() -> int:
