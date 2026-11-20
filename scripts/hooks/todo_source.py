@@ -25,16 +25,26 @@ import pathlib
 import re
 import subprocess
 
-OPEN_WORDS = ("未落", "部分", "进行中", "待落", "待裁", "未开始")
+# 状态词是**闭集**，而且只有两个：未落 / 已落。没有第三个词——每多一个词就多一种把行挪出
+# 批次的手法。一条待办被写下来的时候就已经判过「它值得做」，所以不存在「退役」这条路：
+# 真发现它不对，改的是这条待办自己，不是给它换一个不进批次的词。
+# 从前这里是一片近义词（部分、进行中、待落、未开始、program、round: current……），每多一个
+# 词就多一种把行挪出批次的手法——子集就是这样一次次被「合规地」造出来的。闭集之后，
+# 想让一行不进批次只有一条路：把它改成已落（或被点名退役），而那要写清理由。
+OPEN_STATUS = "未落"
+CLOSED_PREFIXES = ("已落",)
 
 
 class Item:
-    __slots__ = ("id", "title", "touches")
+    __slots__ = ("id", "title", "touches", "deferred")
 
-    def __init__(self, id: str, title: str, touches: list[str]):
+    def __init__(self, id: str, title: str, touches: list[str], deferred: bool = False):
         self.id = id
         self.title = title
         self.touches = touches
+        # `touches: unknown — 理由`：明确本轮不排。它不是「忘了写触点」——
+        # 两者的修法不同（前者要 Split 点名，后者要先补触点），所以这里分开。
+        self.deferred = deferred
 
     def __repr__(self) -> str:  # pragma: no cover - 只为读数好看
         return f"Item({self.id!r}, {len(self.touches)} touches)"
@@ -48,19 +58,31 @@ def _md_items(path: pathlib.Path) -> list[Item]:
     if not path.exists():
         raise Unreadable(f"{path} 不存在")
     out: list[Item] = []
+    bad_status: list[str] = []
     for line in path.read_text(errors="ignore").splitlines():
         if not line.startswith("| S"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 3 or not any(w in cells[2] for w in OPEN_WORDS):
+        if len(cells) < 3:
+            continue
+        status = cells[2]
+        if status.startswith(CLOSED_PREFIXES):
+            continue
+        if not status.startswith(OPEN_STATUS):
+            bad_status.append(f"{cells[0]}（状态：{status[:20]}）")
             continue
         found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
         touches: list[str] = []
+        # 没有 `unknown` 这个后门：一行待办要么点得出它要动的文件，要么批次算不出来。
+        deferred = False
         if found:
             raw = found.group(1).strip()
-            if not raw.startswith("unknown"):
-                touches = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
-        out.append(Item(cells[0], cells[1][:80], touches))
+            touches = [p.strip() for p in re.split(r"[,，]", raw) if p.strip() and p.strip() != "unknown"]
+        out.append(Item(cells[0], cells[1][:80], touches, deferred))
+    if bad_status:
+        raise Unreadable(
+            "状态词不在闭集里（只认 `未落` / `已落` / `retired`）：" + "、".join(bad_status)
+        )
     return out
 
 
@@ -124,6 +146,9 @@ def partition(spec: str) -> tuple[list[Item], list[str], list[str]]:
     without: list[str] = []
     deferred: list[str] = []
     for item in items:
+        if item.deferred:
+            deferred.append(item.id)
+            continue
         if not item.touches:
             # `unknown` 不带理由的，按「没写触点」算：那是漏，不是明确的推迟。
             without.append(item.id)
