@@ -53,7 +53,10 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
     let mut disputed = Vec::new();
     for table in cog_storage::table_shapes::MUTABLE_TABLES {
         let cog_storage::table_shapes::TableShape::Projection {
-            reader, rebuild, ..
+            reader,
+            rebuild,
+            rebuilt_from,
+            ..
         } = table.shape
         else {
             continue;
@@ -74,6 +77,12 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
                 "{}: 两份声明点名的重建路线不同（{} / {}）",
                 table.table, declaration.rebuild, rebuild
             )),
+            Some(declaration) if declaration.rebuilt_from != rebuilt_from => {
+                disputed.push(format!(
+                    "{}: 两份声明点名的「由什么重算」不同（{} / {}）",
+                    table.table, declaration.rebuilt_from, rebuilt_from
+                ))
+            }
             Some(_) => {}
         }
     }

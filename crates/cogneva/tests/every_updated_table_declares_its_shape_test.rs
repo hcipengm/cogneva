@@ -91,7 +91,13 @@ fn every_declaration_answers_where_the_truth_is() {
                 reader,
                 watermark,
                 rebuild,
+                rebuilt_from,
             } => {
+                // 「由什么重算」写不出空话：一张说不出自己跟谁一致的投影表，与一份
+                // 没人核对过的副本在库里同形。
+                if rebuilt_from.trim().is_empty() {
+                    problems.push(format!("{}: 没写它由哪些事实重算", declaration.table));
+                }
                 for (label, path) in [("读者", reader), ("重建命令", rebuild)] {
                     if !root.join(path).is_file() {
                         problems.push(format!(

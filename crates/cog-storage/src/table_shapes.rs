@@ -26,6 +26,9 @@ pub enum TableShape {
         watermark: &'static str,
         /// 从真源重建它的地方，写成树里的一个路径。
         rebuild: &'static str,
+        /// 它由**哪些事实**重算出来。与 `projection_readers` 里同一张表的那一格
+        /// 说的是同一句话，判据逐字比对——一份表两份声明各说各的，是这一族最老的病。
+        rebuilt_from: &'static str,
     },
     /// 权威文档：行就是那段事实的当前值。
     Document {
@@ -52,6 +55,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             reader: "crates/cog-storage/src/postgres/task_ledger.rs",
             watermark: "as_of_seq",
             rebuild: "crates/cog-storage/src/postgres/task_ledger.rs",
+            rebuilt_from: "task 台账里只追加的转移行（每一条任务的完整历史）",
         },
     },
     DeclaredTable {
@@ -60,6 +64,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
+            rebuilt_from: "Prometheus 里 `<name>_total` 那条序列",
         },
     },
     DeclaredTable {
@@ -68,6 +73,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
+            rebuilt_from: "Prometheus 里 `<name>_bucket` 那条序列的每一档",
         },
     },
     DeclaredTable {
@@ -76,6 +82,7 @@ pub const MUTABLE_TABLES: &[DeclaredTable] = &[
             reader: "crates/cog-storage/src/postgres/metrics_backend.rs",
             watermark: "as_of",
             rebuild: "crates/cog-observability/src/metric_projection.rs",
+            rebuilt_from: "Prometheus 里 `<name>_sum` 那条序列",
         },
     },
     DeclaredTable {
