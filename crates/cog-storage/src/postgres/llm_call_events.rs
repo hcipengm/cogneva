@@ -13,7 +13,9 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use cog_core::{LlmCall, LlmCallEvents, SFError, SFResult};
+use cog_core::{
+    check as check_envelope, EnvelopeFields, LlmCall, LlmCallEvents, SFError, SFResult,
+};
 
 /// 事件流的写入器，只认这一种事实。
 pub struct LlmCallEventStore {
@@ -51,6 +53,27 @@ impl LlmCallEvents for LlmCallEventStore {
 
     async fn append(&self, call: &LlmCall) -> SFResult<()> {
         let event_id = ulid_like_id(&call.call_id);
+        // 信封先过判据再写：空着的那一格与「不适用」在读数上同形，写进去就分不开了。
+        check_envelope(&EnvelopeFields {
+            event_id: event_id.clone(),
+            kind: "llm_call".into(),
+            subject_kind: "llm_call".into(),
+            subject_id: call.call_id.clone(),
+            unit_of_work: call.call_id.clone(),
+            step: "call".into(),
+            outcome: "ok".into(),
+            idempotency_key: call.idempotency_key(),
+            actor: call.actor.clone(),
+            writer: self.writer.clone(),
+            scope: call.model.clone(),
+            attributes: call.attributes().to_string(),
+        })
+        .map_err(|defect| {
+            SFError::Database(format!(
+                "llm_call event refused before it was written: {}",
+                defect.as_str()
+            ))
+        })?;
         sqlx::query(INSERT_SQL)
             .bind(&event_id)
             .bind(&call.call_id)

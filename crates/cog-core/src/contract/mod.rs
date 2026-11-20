@@ -16,6 +16,7 @@ pub mod embedding;
 pub mod env_supersede;
 pub mod eval;
 pub mod event;
+pub mod event_envelope;
 pub mod event_id;
 pub mod event_payload;
 pub mod evolution_admin;
