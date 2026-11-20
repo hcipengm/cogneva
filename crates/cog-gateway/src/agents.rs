@@ -2215,7 +2215,7 @@ fn seats_without_a_person(roster_read: bool, people_rows: &[serde_json::Value]) 
     Some(
         people_rows
             .iter()
-            .find(|row| row.get("person_id").map_or(true, |v| v.is_null()))
+            .find(|row| row.get("person_id").is_none_or(|v| v.is_null()))
             .and_then(|row| row.get("caps").and_then(|caps| caps.as_u64()))
             .unwrap_or(0),
     )
