@@ -19,6 +19,10 @@ pub struct LargeObjectWriter {
 
 #[async_trait]
 impl BodyWriter for LargeObjectWriter {
+    fn oid(&self) -> u32 {
+        self.oid
+    }
+
     async fn write(&self, chunk: &[u8]) -> SFResult<()> {
         large_object::write_block(&self.pool, self.oid, chunk).await
     }

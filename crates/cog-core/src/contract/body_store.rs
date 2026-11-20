@@ -21,6 +21,9 @@ pub trait BodyWriter: Send + Sync {
     /// 写一块。块就是这一拍收到的字节，不合并、不切分。
     async fn write(&self, chunk: &[u8]) -> SFResult<()>;
 
+    /// 这段大对象的 oid：行里存的指针就是它。
+    fn oid(&self) -> u32;
+
     /// 封口：返回 `(sha256, 总字节)`。
     async fn seal(&self) -> SFResult<(String, u64)>;
 }
