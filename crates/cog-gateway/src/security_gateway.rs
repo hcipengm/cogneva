@@ -4028,6 +4028,8 @@ const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 ///
 /// 正文不落在留底表里。那张表按部署的保留期清扫、又被每晚的备份整表拷走，正文放在
 /// 那里能活多久取决于这两件事；Raw 层没有清扫，正文在那里才是永久的，表只做索引。
+#[cfg(test)]
+#[cfg(test)]
 fn exchange_raw_id(side: &str, sha256: &str) -> String {
     format!("llm-{side}-{sha256}")
 }
@@ -4041,87 +4043,6 @@ fn exchange_store_enabled() -> bool {
         Ok(v) => !matches!(v.trim(), "0" | "false" | "off" | "no"),
         Err(_) => true,
     })
-}
-
-/// Write one side of an exchange into the memory Raw layer, and answer the
-/// reference a reader fetches it by.
-///
-/// The id is the hash of the bytes, so the copy is content-addressed: one
-/// prompt sent a thousand times is one object, and the exchange rows that point
-/// at it are still one per call. The bytes go in whole -- nothing here redacts,
-/// cuts or re-encodes them, because the point of the copy is that a later
-/// reader can see exactly what crossed the wire.
-///
-/// Redaction belongs to the read face. Scrubbing this copy would not protect
-/// anything: the same bytes land unchanged in the tool-call records and in the
-/// event stream's tool payloads, so a credential removed here is still readable
-/// one table over -- and the only thing a partial scrub buys is that the copy
-/// no longer says what was sent.
-///
-/// The failures are counted where they are classified, since only this function
-/// knows which one happened: no base configured, the API refused, the API did
-/// not answer, or the bytes are not text (a request body is JSON and a response
-/// body is JSON or SSE, so this last one is the protocol telling us it is not
-/// one of the two shapes this path handles -- counted rather than assumed
-/// away).
-async fn archive_exchange_body(
-    state: &AppState,
-    side: &str,
-    sha256: &str,
-    bytes: &[u8],
-) -> Option<String> {
-    let unarchived = |cause: &'static str| async move {
-        record_counter(
-            state,
-            cog_core::metric_names::LLM_EXCHANGE_BODY_UNARCHIVED_TOTAL,
-            &[("cause", cause)],
-        )
-        .await;
-        None::<String>
-    };
-    let Some(base) = state
-        .config
-        .memory_api_base
-        .as_deref()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-    else {
-        return unarchived("unconfigured").await;
-    };
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return unarchived("not_text").await;
-    };
-    let id = exchange_raw_id(side, sha256);
-    let url = format!(
-        "{}{}",
-        base.trim_end_matches('/'),
-        cog_core::MEMORY_INGEST_PATH
-    );
-    let payload = serde_json::json!({
-        "id": id,
-        "content_type": "application/octet-stream",
-        "text": text,
-        "purpose": "archive",
-    });
-    // 沿用本进程已有的出站客户端：它带着自我标识，墙钟也是这份配置声明的那个。
-    match state.client.post(&url).json(&payload).send().await {
-        Ok(resp) if resp.status().is_success() => Some(cog_core::artifact_uri(
-            cog_core::DEFAULT_MEMORY_NAMESPACE,
-            &id,
-        )),
-        Ok(resp) => {
-            tracing::warn!(
-                side,
-                status = resp.status().as_u16(),
-                "LLM exchange body: the memory API refused the write"
-            );
-            unarchived("refused").await
-        }
-        Err(e) => {
-            tracing::warn!(side, error = %e, "LLM exchange body: the memory API did not answer");
-            unarchived("unreachable").await
-        }
-    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -4311,20 +4232,16 @@ async fn record_exchange(
         .ok()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
         .unwrap_or_else(|| upstream.model.clone());
-    let request_raw = archive_exchange_body(state, "request", &request_sha256, body).await;
-    let response_raw = match (response, response_sha256.as_deref()) {
-        (Some(bytes), Some(sha)) => archive_exchange_body(state, "response", sha, bytes).await,
-        _ => None,
-    };
-    // 归档没成时，正文落在这一行里。少了这一步，「归档没配」就等于「这次调用说了
-    // 什么，从此没人知道」——而这一行的存在意义正是留下它说了什么。
-    let request_inline = request_raw
-        .is_none()
-        .then(|| String::from_utf8_lossy(body).into_owned());
-    let response_inline = match (response, &response_raw) {
-        (Some(bytes), None) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        _ => None,
-    };
+    // 正文**直接落这一行**，对象存储不再当默认落点（属主 2026-11-19）。
+    //
+    // 一个落点同时买到三件事：同一次写（账与正文在一个事务里，不存在「行在、正文不在」）、
+    // 同一次读（取证按调用身份一次查询）、少一处会对不上的地方。PG 会把大值 TOAST 到
+    // 侧表，主表因此不会随正文变大。
+    // 实测 2026-11-19 本部署：请求正文平均 2.7 KB、最大 78 KB，响应正文平均 36 KB、最大 1.05 MB——那一天的读数，不是本软件的规格。
+    let request_raw = None;
+    let response_raw = None;
+    let request_inline = Some(String::from_utf8_lossy(body).into_owned());
+    let response_inline = response.map(|bytes| String::from_utf8_lossy(bytes).into_owned());
     let record = LlmExchangeRecord {
         upstream: LlmHealthTable::key(upstream),
         api_style: upstream.api_style.clone(),

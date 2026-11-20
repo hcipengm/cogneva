@@ -67,6 +67,7 @@ fn log(pool: PgPool, table: &str, budget: u64) -> MetricsSampleLog {
     MetricsSampleLog::new(pool, budget).with_table(table)
 }
 
+#[allow(dead_code)] // 夹具：留着给后面的读数用例
 async fn published(
     metrics: &Arc<MemoryMetricsBackend>,
     name: &str,
