@@ -1,3 +1,4 @@
+//! principle: feedback_a_test_that_goes_in_through_the_trait_object_can_see_a_shadowed_method
 //! Whether an event published **through the trait** reaches the table.
 //!
 //! The gateway had two methods named `publish_event`: an inherent one that sent

@@ -1,3 +1,4 @@
+//! principle: feedback_a_missing_door_is_not_a_reason_to_open_a_second_write_path
 //! 提交口只有一道门：一个手里没有平台令牌的调用方，也走同一条流程。
 //!
 //! 现场：宿主上的会话与集群内的业务 Pod 都是零凭证的（红线），而它们都是这个平

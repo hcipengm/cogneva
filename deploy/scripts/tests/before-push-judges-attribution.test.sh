@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_face_the_gate_cannot_replay_is_fixed_by_making_it_replayable
 # 「推上去的提交不带 AI 署名」在推前门里是**判过的**，不是「本机没验」。
 #
 # 这条判据以前只有 CI 跑（`.github/workflows/ci.yml` 的 `Check commit messages carry

@@ -1,3 +1,4 @@
+//! principle: feedback_a_row_per_commit_turns_the_row_rate_into_a_wal_wait_rate
 //! 一串事件要花掉几次提交，而不是几条事件就几次提交。
 //!
 //! 事件落库一开始是一条一次 INSERT、一条起一个任务，于是「每秒多少条事件」直接
