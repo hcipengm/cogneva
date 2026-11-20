@@ -5,6 +5,7 @@ pub mod background;
 pub mod config;
 pub mod consumer;
 pub mod context;
+pub mod context_budget;
 pub mod event_bus_sink;
 pub mod hooks;
 pub mod identity;
