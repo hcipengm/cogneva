@@ -4870,13 +4870,19 @@ mod tests {
         );
 
         // 同一个窗口，这个尝试已经很久没动了：判停住，并带上是拿什么窗口比的。
+        //
+        // 铺的是 0 间隔，但判停线不取 0：0 是读数自己的采样格，判据把它抬到两拍
+        // （`declared_wall::MIN_DISCERNIBLE_SILENCE`）。所以这里的信标要落在两拍之外，
+        // 30 秒足够表达「很久没动」，也不用真等两秒。
         cog_core::progress::reset_for_tests();
         cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
-        cog_core::progress::beat(&task.id);
+        cog_core::progress::seed_beat_for_tests(&task.id, std::time::Duration::from_secs(30));
         match reclaim_cause(&task, lease, now) {
-            Some(ReclaimCause::Silent { window, .. }) => {
-                assert_eq!(window, std::time::Duration::ZERO)
-            }
+            Some(ReclaimCause::Silent { window, .. }) => assert_eq!(
+                window,
+                cog_core::declared_wall::MIN_DISCERNIBLE_SILENCE,
+                "量到 0 时判停线取两拍；抬到别的数就是把一个挑出来的秒数当成了测量"
+            ),
             other => panic!("停住要判成 Silent，实得 {other:?}"),
         }
 
@@ -7644,7 +7650,9 @@ mod tests {
             t.started_at = Some(chrono::Utc::now() - chrono::Duration::hours(9));
         }
         cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
-        cog_core::progress::beat("t-stall");
+        // 铺 0 间隔量出的窗口是 0，判据把它抬到两拍（读数分辨率）才拿来比；所以信标
+        // 要落在两拍之外，刚打一拍的尝试在这条判据下确实还没停住。
+        cog_core::progress::seed_beat_for_tests("t-stall", std::time::Duration::from_secs(30));
 
         let results = dag.check_timeouts().await;
         assert_eq!(results.len(), 1, "过窗口没动一步就该收");

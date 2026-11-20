@@ -807,6 +807,22 @@ pub fn seed_gaps_for_tests(gap: Duration, count: usize) {
     }
 }
 
+/// Test hook: plant a beat that happened `age` ago.
+///
+/// A judgement needs silence longer than the measured window, and the window is
+/// never narrower than [`crate::declared_wall::MIN_DISCERNIBLE_SILENCE`] — so a
+/// test that beats now and expects a stall would have to sleep two ticks first.
+/// Backdating the beacon says the same thing without the wait: this attempt last
+/// moved `age` ago.
+#[doc(hidden)]
+pub fn seed_beat_for_tests(task_id: &str, age: Duration) {
+    let when = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+    beacons()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(task_id.to_string(), when);
+}
+
 /// The one lock the test hooks below hand out.
 ///
 /// Tokio's rather than std's because some of the tests that need it are async:
