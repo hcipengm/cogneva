@@ -258,9 +258,9 @@ pub struct RawStreamConfig {
     pub flush_interval_sec: u64,
 }
 
-// 256 MB 一个热文件：轮转的开销与「一个文件能被一次搬走」的粒度之间的取舍；
+// 一个热文件默认 256 MB：轮转的开销与「一个文件能被一次搬走」的粒度之间的取舍；
 // 再大，一次冷热迁移搬的字节就压过了轮转省下来的。
-// cap: bound — 256 MB：一次能搬走的粒度，再大迁移的字节压过轮转省下的
+// cap: bound — 默认 256 MB：一次能搬走的粒度，再大迁移的字节压过轮转省下的
 const RAW_STREAM_MAX_HOT_FILE_MB: u64 = 256;
 
 impl Default for RawStreamConfig {
@@ -591,7 +591,10 @@ mod default_names {
         let source = include_str!("lib.rs");
         for (head, struct_name) in [
             ("impl Default for RawStreamConfig", "RawStreamConfig"),
-            ("impl Default for ExplainabilityConfig", "ExplainabilityConfig"),
+            (
+                "impl Default for ExplainabilityConfig",
+                "ExplainabilityConfig",
+            ),
         ] {
             let body = source
                 .split(head)
@@ -613,7 +616,10 @@ mod default_names {
                 })
                 .map(str::trim)
                 .collect();
-            assert!(bare.is_empty(), "{struct_name} 的默认值要读具名常量：{bare:?}");
+            assert!(
+                bare.is_empty(),
+                "{struct_name} 的默认值要读具名常量：{bare:?}"
+            );
         }
     }
 }
