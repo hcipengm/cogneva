@@ -7719,6 +7719,9 @@ mod tests {
             t.started_at = Some(chrono::Utc::now() - chrono::Duration::days(7));
             t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(600));
         }
+        // 信标刚刚动过：这条判据要判的是「行过了自己声明的时长老不算证据」，
+        // 而不是「没有信标所以看不见」——那是另一条用例的事。
+        cog_core::progress::beat("t-budget-reading");
         cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
 
         let now = chrono::Utc::now();
@@ -7755,7 +7758,10 @@ mod tests {
         .await
         .unwrap();
         // 上一轮动过，之后这个尝试就结束了；信标没有人清。
-        cog_core::progress::beat("t-restart");
+        // 那一拍拨到一小时前：若 `start_task` 没清信标，这个静默远超判据窗口，
+        // 新的尝试一开跑就会被判成停住。拨到「刚刚」，静默就只有几纳秒，落在
+        // 窗口下限以内——那条路无论清没清都判 None，用例就什么也没判。
+        cog_core::progress::seed_beat_for_tests("t-restart", std::time::Duration::from_secs(3600));
         cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
 
         dag.schedule_task("t-restart").await.unwrap();

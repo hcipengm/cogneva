@@ -1628,8 +1628,9 @@ mod ready_pipeline_tests {
 
         let mut task = test_task(3600);
         task.id = "t-stopped-moving".into();
-        // 窗口量成零：任何一点静默都超过它。这个执行器一次心跳都不打，所以
-        // 它从第一拍起就被判成停住。
+        // 窗口量成零，判据会把它抬到读数能分辨的下限（两拍，见
+        // `MIN_DISCERNIBLE_SILENCE`）：比一拍还窄的窗口判的是采样格，不是停没停。
+        // 这个执行器一次心跳都不打，所以两拍之后就被判成停住。
         cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
         cog_core::progress::beat(&task.id);
 
