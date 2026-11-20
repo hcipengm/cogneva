@@ -1520,6 +1520,49 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// 同一读数，**从事件流算**：按工作区汇总。
+    ///
+    /// 工作区仍然只能从任务图取——事件里没有租户这一格，而「一次调用属于哪个工作区」
+    /// 的证据本来就在任务行上。取法与账本那条一致：最新一版（`ORDER BY rev DESC`），
+    /// 没有任务身份的调用不出现。
+    pub async fn spend_by_workspace_since_from_stream(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let rows = sqlx::query(&format!(
+            "SELECT workspace_id, SUM(tokens)::BIGINT AS tokens FROM (
+                 SELECT t.workspace_id AS workspace_id,
+                        (COALESCE((e.attributes::jsonb->>'input_tokens')::BIGINT, 0)
+                       + COALESCE((e.attributes::jsonb->>'output_tokens')::BIGINT, 0)) AS tokens
+                   FROM cogneva_event e
+                   JOIN LATERAL (
+                        SELECT d.workspace_id
+                          FROM {TASK_GRAPH_TABLE} d
+                         WHERE d.task_id = (e.attributes::jsonb->>'task_id')
+                         ORDER BY d.rev DESC
+                         LIMIT 1
+                   ) t ON TRUE
+                  WHERE e.kind = 'llm_call'
+                    AND e.at >= to_timestamp($1::DOUBLE PRECISION)
+             ) s
+             WHERE workspace_id IS NOT NULL
+             GROUP BY workspace_id
+             ORDER BY workspace_id"
+        ))
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("workspace_id"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
     /// 今天这个人被自己的上限拒了几发，`(person, refusals)`。
     ///
     /// 只数 `refused_by_owner_budget` 且 `refused_scope = 'user'` 的行：结果词
