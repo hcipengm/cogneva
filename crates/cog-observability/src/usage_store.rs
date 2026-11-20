@@ -1349,6 +1349,49 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// 同一读数，**从事件流算**：按人汇总。
+    ///
+    /// 「算在谁头上」的口径与账本那条一致：行上写了 `owner` 就用它，没写才退到任务
+    /// 图里这条任务的提交人。两处都是**最新一版**的提交人（`ORDER BY rev DESC`），
+    /// 普通 join 会按版本数重复计数，而按人判预算只会表现为更早被拦。
+    pub async fn spend_by_person_since_from_stream(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let rows = sqlx::query(&format!(
+            "SELECT person, SUM(tokens)::BIGINT AS tokens FROM (
+                 SELECT COALESCE(NULLIF(e.attributes::jsonb->>'owner', ''), t.person) AS person,
+                        (COALESCE((e.attributes::jsonb->>'input_tokens')::BIGINT, 0)
+                       + COALESCE((e.attributes::jsonb->>'output_tokens')::BIGINT, 0)) AS tokens
+                   FROM cogneva_event e
+                   LEFT JOIN LATERAL (
+                        SELECT NULLIF(d.submitted_by, '') AS person
+                          FROM {TASK_GRAPH_TABLE} d
+                         WHERE d.task_id = (e.attributes::jsonb->>'task_id')
+                         ORDER BY d.rev DESC
+                         LIMIT 1
+                   ) t ON TRUE
+                  WHERE e.kind = 'llm_call'
+                    AND e.at >= to_timestamp($1::DOUBLE PRECISION)
+             ) s
+             WHERE person IS NOT NULL
+             GROUP BY person
+             ORDER BY person"
+        ))
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("person"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
     /// 从 `since_unix` 起，这些任务各自花掉的 token，`(task_id, tokens)`。
     ///
     /// 与 [`Self::spend_by_task`] 分开而不是加一个可选参数：那一份答的是「这件工作
