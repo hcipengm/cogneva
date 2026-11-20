@@ -58,11 +58,14 @@ if [ -z "$record" ]; then
     esac
 fi
 
-got_sid="$(sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p' "$record" | head -1)"
+# 冒号后的空格必须可选：宿主写的是紧凑 JSON，而任何一次「顺手格式化」都会让原来那条
+# `"sessionId":"…"` 的 sed 读成空串。读成空之后这道门走的是「判不了 → 放行」，也就是
+# 一个格式化差异就能让它静默失效——2026-11-20 实测发生过一次。
+got_sid="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$record" | head -1)"
 [ "$got_sid" = "$sid" ] ||
     not_judged "$record 记的是会话 ${got_sid:-（空）}，不是 $sid"
 
-employee="$(sed -n 's/.*"name":"\([^"]*\)".*/\1/p' "$record" | head -1)"
+employee="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$record" | head -1)"
 [ -n "$employee" ] || not_judged "$record 里没有 name 字段"
 
 repo="$(env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --show-toplevel 2>/dev/null)" ||
