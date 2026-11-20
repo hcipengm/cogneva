@@ -47,6 +47,62 @@ pub struct Compaction {
     pub target_tokens: usize,
 }
 
+/// 被压掉那一段的**结构化摘要**：四样必须能从它读回来。
+///
+/// 压实把一段对话折成一条摘要时，最危险的不是丢内容，是丢了「什么还没定」与「什么
+/// 试过并且失败」——这两样是后面几步要用的，而模型自己不会记得它没见过的东西。所以摘要
+/// 的字段是四样具体的东西，不是一段自由文本：
+///
+/// - `decisions`：已经定下来的事（每条一句）；
+/// - `open`：**还没定**的事（每条一句，带它是谁提的）；
+/// - `files`：这一段里动过哪些文件，以及为什么动；
+/// - `failures`：试过并且失败的做法（每条一句，带失败的形状）。
+///
+/// 一段没有这四样的摘要是「原文的转述」，读者分不清哪句是事实、哪句是模型的复述——
+/// 与「引用里不带摘要」是同一条取舍：能逐条读回来的才写，写不回来的留原文。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionSummary {
+    pub decisions: Vec<String>,
+    pub open: Vec<String>,
+    pub files: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+impl CompactionSummary {
+    /// 一条都不许空着写：空摘要不是「这一段没什么可记」，是「没人从这一段里读出东西」。
+    pub fn is_empty(&self) -> bool {
+        self.decisions.is_empty()
+            && self.open.is_empty()
+            && self.files.is_empty()
+            && self.failures.is_empty()
+    }
+
+    /// 折成一条消息：四段各有标题，标题就是字段名，读者按标题读回来。
+    ///
+    /// 不写「摘要如下」这类开头：一条摘要是不是真读出来了，看的是这四段有没有内容，
+    /// 而一句开场白会让空摘要也长得像有内容。
+    pub fn render(&self) -> String {
+        let section = |title: &str, items: &[String]| {
+            if items.is_empty() {
+                return String::new();
+            }
+            let mut out = format!("{title}:\n");
+            for item in items {
+                out.push_str("- ");
+                out.push_str(item);
+                out.push('\n');
+            }
+            out
+        };
+        let mut out = String::new();
+        out.push_str(&section("决定", &self.decisions));
+        out.push_str(&section("未决", &self.open));
+        out.push_str(&section("动过的文件", &self.files));
+        out.push_str(&section("失败过", &self.failures));
+        out
+    }
+}
+
 /// 一条消息给人看的开头：角色 + 正文第一行，够读者认出是哪一轮。
 ///
 /// 按字符截而不是按字节：正文里通常有中文，按字节切会落在字的中间。
@@ -1485,5 +1541,53 @@ mod tests {
             kept.contains("artifact://default/ref-1"),
             "二次裁剪不得把引用砍掉: {kept}"
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_summary_tests {
+    use super::CompactionSummary;
+
+    /// 四样都得能从折出来的那一条里读回来——这是 S35 的判据里能在这里判的那一半。
+    #[test]
+    fn every_part_survives_the_fold() {
+        let summary = CompactionSummary {
+            decisions: vec!["用事件流当正本".into()],
+            open: vec!["谁来做读切换（属主提的）".into()],
+            files: vec!["crates/cog-storage/src/postgres/llm_call_events.rs：新增写入口".into()],
+            failures: vec!["按目录触点判批次：一次编辑满足十几条".into()],
+        };
+        let rendered = summary.render();
+        for (title, item) in [
+            ("决定", &summary.decisions[0]),
+            ("未决", &summary.open[0]),
+            ("动过的文件", &summary.files[0]),
+            ("失败过", &summary.failures[0]),
+        ] {
+            assert!(
+                rendered.contains(title) && rendered.contains(item.as_str()),
+                "折出来的那一条读不回「{title}」：{rendered}"
+            );
+        }
+    }
+
+    /// 空的一格不印标题：印一个空标题会让「这一段没有失败」与「没人读」长得一样。
+    #[test]
+    fn an_empty_part_prints_no_heading() {
+        let rendered = CompactionSummary {
+            decisions: vec!["a".into()],
+            ..Default::default()
+        }
+        .render();
+        assert!(rendered.contains("决定"));
+        for absent in ["未决", "动过的文件", "失败过"] {
+            assert!(!rendered.contains(absent), "空的一格印了标题：{rendered}");
+        }
+    }
+
+    #[test]
+    fn all_four_empty_reads_as_empty() {
+        assert!(CompactionSummary::default().is_empty());
+        assert!(CompactionSummary::default().render().is_empty());
     }
 }
