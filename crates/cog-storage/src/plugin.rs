@@ -401,7 +401,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             let mut seed = [0u8; 10];
             seed.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..10]);
             let store = crate::postgres::change_candidate_store::PgChangeCandidateStore::new(
-                pool,
+                pool.clone(),
                 "agent:reflection",
                 writer,
                 "",
@@ -421,7 +421,10 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 ),
             ));
             ctx.publish_service::<dyn cog_core::ToolCallEvents>(std::sync::Arc::new(
-                crate::postgres::tool_call_events::ToolCallEventStore::new(pool, deployment),
+                crate::postgres::tool_call_events::ToolCallEventStore::new(
+                    pool.clone(),
+                    deployment,
+                ),
             ));
             info!("StoragePlugin call-event sinks published");
         } else {

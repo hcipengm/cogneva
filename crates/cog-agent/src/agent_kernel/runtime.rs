@@ -1334,10 +1334,7 @@ impl AgentRuntime {
     /// the surface the loop still runs and still cuts — it just has nowhere to
     /// put the copy, and the marker says only that bytes were dropped.
     /// 接上事件流的写入点：一次工具调用落一条事实。
-    pub fn with_tool_call_events(
-        &mut self,
-        events: Arc<dyn cog_core::ToolCallEvents>,
-    ) -> &mut Self {
+    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::ToolCallEvents>) -> Self {
         self.tool_call_events = Some(events);
         self
     }
@@ -2407,7 +2404,7 @@ impl AgentRuntime {
         if let Some(sink) = self.tool_call_events.as_ref() {
             let arguments_bytes = arguments.to_string().into_bytes();
             let result_bytes = result.to_string().into_bytes();
-            let call = cog_core::ToolCall::from_bytes(
+            let call = cog_core::ToolCallEvent::from_bytes(
                 format!("{tool_call_id}:{turn}:{frame}"),
                 task_id.unwrap_or_else(|| self.config.agent_id.as_str()),
                 tool_name,

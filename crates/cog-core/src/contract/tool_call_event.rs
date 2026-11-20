@@ -18,7 +18,7 @@ use crate::SFResult;
 
 /// 一次工具调用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCall {
+pub struct ToolCallEvent {
     /// 调用身份：上游给的 tool call id，或平台自己生成的。
     pub call_id: String,
     /// 这次调用属于哪一条工作（与事件的 `unit_of_work` 同义）。
@@ -43,7 +43,7 @@ pub struct ToolCall {
     pub at: DateTime<Utc>,
 }
 
-impl ToolCall {
+impl ToolCallEvent {
     /// 幂等键：调用身份。重放的是同一次调用，不是第二次。
     pub fn idempotency_key(&self) -> String {
         self.call_id.clone()
@@ -63,7 +63,7 @@ impl ToolCall {
     }
 }
 
-impl ToolCall {
+impl ToolCallEvent {
     /// 从**字节**造一条调用记录：哈希在这里算，所以「哈希与字节一致」不是一条要记着
     /// 维持的不变式，而是一处计算的结果。参数与结果各一个哈希、各一个长度——两个不同的
     /// 结果可以一样长，只给长度分不开，只给哈希看不出大小。
@@ -102,15 +102,15 @@ impl ToolCall {
 pub trait ToolCallEvents: Send + Sync {
     fn writer(&self) -> &str;
 
-    async fn append(&self, call: &ToolCall) -> SFResult<()>;
+    async fn append(&self, call: &ToolCallEvent) -> SFResult<()>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn call() -> ToolCall {
-        ToolCall {
+    fn call() -> ToolCallEvent {
+        ToolCallEvent {
             call_id: "c1".into(),
             unit_of_work: "u1".into(),
             tool: "run_command".into(),
@@ -156,8 +156,8 @@ mod tests {
 mod from_bytes_tests {
     use super::*;
 
-    fn call(args: &[u8], result: Option<&[u8]>) -> ToolCall {
-        ToolCall::from_bytes(
+    fn call(args: &[u8], result: Option<&[u8]>) -> ToolCallEvent {
+        ToolCallEvent::from_bytes(
             "c1",
             "u1",
             "run_command",

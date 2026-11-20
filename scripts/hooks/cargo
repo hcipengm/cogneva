@@ -26,8 +26,14 @@ toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 family="${toplevel:+$toplevel/scripts/hooks/family.py}"
 
 sub="${1:-}"
+# 两类命令分开：**只读类型检查**（`check`）随时可以跑——它不产出可推送的
+# 字节，不破坏「验过的字节＝要推的字节」，而它是把十分钟的编辑变成可确认的唯一手段。
+# 把它也关在批次门后面，等于让一批跨天的待办把树冻在「无法确认能不能编译」里，
+# 那不是严格，是把可验证性关掉了（2026-11-20 现场）。`clippy` 不放行：它在 CI 上跑，
+# 一条 lint 的判词属于那一笔的 CI 结论，不属于本地这一拍。
 case "$sub" in
-  check|build|test|clippy|run|bench|doc|nextest|install|fix) builds=1 ;;
+  check) builds=0 ;;
+  clippy|build|test|run|bench|doc|nextest|install|fix) builds=1 ;;
   *) builds=0 ;;
 esac
 
