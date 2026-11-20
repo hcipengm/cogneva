@@ -77,7 +77,13 @@ def _md_items(path: pathlib.Path) -> list[Item]:
         deferred = False
         if found:
             raw = found.group(1).strip()
-            touches = [p.strip() for p in re.split(r"[,，]", raw) if p.strip() and p.strip() != "unknown"]
+            # 路径后面常跟着一句注解（`… .py（以及普查文档）`）：注解不是路径的一部分。
+            touches = [
+                re.split(r"[（(]", p.strip())[0].strip()
+                for p in re.split(r"[,，]", raw)
+                if p.strip() and p.strip() != "unknown"
+            ]
+            touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
         out.append(Item(cells[0], cells[1][:80], touches, deferred))
     if bad_status:
         raise Unreadable(

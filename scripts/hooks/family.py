@@ -264,8 +264,21 @@ def main(argv: list[str]) -> int:
         # 这一整套最初要治的病。指不到就挡住批次，让写的人去核对。
         bad: list[str] = []
         checked: list[tuple[str, list[str]]] = []
+        # 触点可以落在两棵树上：这棵代码树，或台账所在的那个仓（`specs/`、`scripts/` 等）。
+        # 判存在要两棵都问，否则台账仓里的路径会被读成「写错了」。
+        ledger_repo = None
+        try:
+            import round as round_mod
+            # 台账仓要从**真正的台账路径**算，不能用钉住的临时副本（它在 /tmp，不是任何仓）。
+            ledger_repo = round_mod.ledger_repo(todo_source.default_spec())
+        except Exception:
+            ledger_repo = None
         for name, paths in todos:
-            gone = [p for p in paths if not (root / p).exists()]
+            gone = [
+                p for p in paths
+                if not (root / p).exists()
+                and not (ledger_repo is not None and (ledger_repo / p).exists())
+            ]
             if gone:
                 bad.append(f"{name}: {', '.join(gone)}")
                 continue
