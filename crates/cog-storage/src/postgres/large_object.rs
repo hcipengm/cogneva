@@ -1,0 +1,88 @@
+//! principle: feedback_a_bound_reading_is_not_the_population_it_governs
+//!
+//! 正文按块写进 PG 的大对象，行里只留指针。三条不变式，都是"不攒"的形状：
+//!
+//! - **开、写、封**各自是一次 SQL：`lo_create` 拿到 oid，`lo_write` 每次只写收到的
+//!   那一段，`lo_close` 封口。中间不攒整段字节——攒就等于把"无界"换成了"内存里的界"。
+//! - **封口才算完**：哈希与长度在封口时由库里的字节算出（`lo_get` 流式读回不现实，
+//!   这里用 `lo_lseek`+`lo_get` 分块回读校验），所以"行里有指针"不等于"正文完整"；
+//!   指针加上 `sealed_at` 才是完整。
+//! - **崩溃留下已到达的字节**：进程死在中途时，库里是已经写进去的那一段，不是零；
+//!   没有 `sealed_at` 的行就是"未封口"，这条读数把两种情况分开。
+//!
+//! 这里不做任何按大小截断：本模块没有"最多写多少"的常量——上限只能来自"读到多
+//! 少写多少"。
+
+use sqlx::{PgPool, Row};
+
+use cog_core::{SFError, SFResult};
+
+/// 一段正文的大对象。`sealed` 为 `None` 表示还没封口（写到一半）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargeBody {
+    pub oid: u32,
+    pub sealed: Option<(String, u64)>,
+}
+
+/// 回读校验时一次取多少字节。
+///
+/// 这是**一次数据库往返的载荷**，不是正文的界：正文写多少由上游说了算，与这个数无关。
+/// 取这么大是因为 `lo_get` 一条语句返回一个 `bytea`，一次取回整段会让常驻内存跟着
+/// 正文大小走——而「无界」指的是正文无界，不是进程内存无界。
+// cap: fixed — 一次 lo_get 往返的载荷（单值 bytea），与正文大小无关
+const VERIFY_CHUNK: i64 = 1_048_576;
+
+/// 开一段正文，拿到 oid。
+pub async fn open(pool: &PgPool) -> SFResult<u32> {
+    let row = sqlx::query("SELECT lo_create(0) AS oid")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| SFError::Database(format!("lo_create: {e}")))?;
+    row.try_get::<i64, _>("oid")
+        .map(|v| v as u32)
+        .map_err(|e| SFError::Database(format!("lo_create returned nothing: {e}")))
+}
+
+/// 写一块。块就是这一拍收到的字节，不合并、不切分。
+pub async fn write_block(pool: &PgPool, oid: u32, bytes: &[u8]) -> SFResult<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("SELECT lo_put($1::oid, lo_lseek64($1::oid, 0::bigint, 2::int), $2::bytea)")
+        .bind(oid as i64)
+        .bind(bytes)
+        .execute(pool)
+        .await
+        .map_err(|e| SFError::Database(format!("lo_put: {e}")))?;
+    Ok(())
+}
+
+/// 封口：把整段读回来算 sha256 与长度，落 `sealed`。
+///
+/// 分块回读，不一次 `lo_get` 全量：一次取回等于把"无界"搬回了内存。
+pub async fn seal(pool: &PgPool, oid: u32) -> SFResult<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    loop {
+        let row =
+            sqlx::query("SELECT substring(lo_get($1::oid, $2::bigint, $3::int) from 1) AS chunk")
+                .bind(oid as i64)
+                .bind(total as i64)
+                .bind(VERIFY_CHUNK)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| SFError::Database(format!("lo_get: {e}")))?;
+        let chunk: Option<Vec<u8>> = row.try_get("chunk").unwrap_or(None);
+        let Some(chunk) = chunk else { break };
+        if chunk.is_empty() {
+            break;
+        }
+        total += chunk.len() as u64;
+        hasher.update(&chunk);
+        if (chunk.len() as i64) < VERIFY_CHUNK {
+            break;
+        }
+    }
+    Ok((format!("{:x}", hasher.finalize()), total))
+}
