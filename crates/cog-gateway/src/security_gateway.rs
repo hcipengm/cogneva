@@ -4710,6 +4710,9 @@ struct CapturedBody {
 
 struct UsageRecorder {
     scanner: Arc<Mutex<UsageScanner>>,
+    /// 这一段正文的句柄格。**存格子不存句柄**：构造记录器时第一块可能还没到，
+    /// 句柄那时还不存在；封口发生在流结束，那时格子里才有值。
+    body: Arc<tokio::sync::OnceCell<Option<Arc<dyn cog_core::BodyWriter>>>>,
     state: AppState,
     upstream: LlmUpstream,
     /// 请求侧的三件事实（谁、哪个环境、这份字节值多少），在请求还在手上的那一刻就
@@ -4877,6 +4880,9 @@ fn wrap_usage_scan(
     });
     let mut recorder = UsageRecorder {
         scanner,
+        // 句柄可能还没开（第一块没到）——那时没有正文可封，与「没接落点」同形：
+        // 两者的正文都在扫描器的内存里，落库时走行内列。
+        body: writer.clone(),
         state,
         upstream,
         request,
