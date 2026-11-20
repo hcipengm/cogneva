@@ -98,6 +98,9 @@ mod a_crate_is_a_component_not_a_bridge_test;
 mod a_day_is_named_by_one_clock_test;
 #[path = "a_job_inner_wait_budget_widens_the_job_deadline_test.rs"]
 mod a_job_inner_wait_budget_widens_the_job_deadline_test;
+#[path = "the_event_stream_has_one_write_path_test.rs"]
+mod the_event_stream_has_one_write_path_test;
+
 #[path = "every_envelope_column_has_a_reader_test.rs"]
 mod every_envelope_column_has_a_reader_test;
 
