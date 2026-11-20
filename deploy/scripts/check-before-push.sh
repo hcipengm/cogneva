@@ -452,10 +452,12 @@ if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-claims.sh" ]; then
     bash "$(dirname "${BASH_SOURCE[0]}")/check-claims.sh" || exit 1
 fi
 # 默认做完整批：义务清单没做完又没有 Split 就拒；Split 的四条理由逐条判真假。
-if [ -x "$(dirname "${BASH_SOURCE[0]}")/../scripts/hooks/batch-gate.py" ] &&
-   [ -n "${COGNEVA_OBLIGATIONS:-}" ]; then
-    python3 "$(dirname "${BASH_SOURCE[0]}")/../scripts/hooks/batch-gate.py" \
-        --root "$(dirname "${BASH_SOURCE[0]}")/.." --obligations "$COGNEVA_OBLIGATIONS" || exit 1
+# 仓库根问 git，不数级数：`..` 从 deploy/scripts 往上只到 deploy，这条门自己就是
+# 「往上数几级」普查盯着的那一类。
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+batch_gate="${repo_root:+$repo_root/scripts/hooks/batch-gate.py}"
+if [ -n "$batch_gate" ] && [ -f "$batch_gate" ] && [ -n "${COGNEVA_OBLIGATIONS:-}" ]; then
+    python3 "$batch_gate" --root "$repo_root" --obligations "$COGNEVA_OBLIGATIONS" || exit 1
 fi
 
 # 「没判」与「判红」是两件事，读数上也得是两个：一格没进构建槽就跑，判词写成红是把
