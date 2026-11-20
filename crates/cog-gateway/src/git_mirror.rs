@@ -69,10 +69,12 @@ const HTTPS_PROBE_INTERVAL_SECS: u64 = 60;
 /// pack 计算 + 传输，给足时间。**这两个值判的是"是不是进了黑洞"，不是给正常
 /// 请求设预算**——透传路径原本没有任何总超时，加它就是为了让降级判据存在。
 // cap: bound — 透传路径原本没有总超时，加它是为了让降级判据存在
+// wall: 等=代理出去的那次 GET 回来（清单、单文件） / 等不到=这次读按失败收尾，调用方拿到错误；透传路径上原本没有总超时，这一条存在的理由就是让「降级」有一个判据 / 续跑=能，重来是一次新的请求
 const HTTPS_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// post 的判据与 get 同形，只是量级不同：一次 post 要把整包算完再传出去，
 /// 所以在正常仓库上它本来就以分钟计；这个界判的仍是「是不是进了黑洞」。
 // cap: bound — 推送正常就以分钟计，这个界判的仍是「是不是进了黑洞」
+// wall: 等=一次推送走完 / 等不到=这次推送按失败收尾；**对端可能已经收了一部分**，所以判据是「进了黑洞」而不是「没推成」 / 续跑=能，推是幂等的（同一 ref 再推一次到同一个位置），但要在下一次读清远端之后
 const HTTPS_POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// 镜像单次响应体上限，与透传路径的缓冲约定一致。
 // cap: bound — 镜像单次响应体上限，与透传路径的缓冲约定一致
@@ -110,8 +112,10 @@ const MIRROR_STALL_FLOOR_SECS: u64 = 30;
 /// 的对象，下一次从头再传一遍。真正说得出口的判据是**静默**（[`DEFAULT_MIRROR_STALL_SECS`]）：
 /// 没有新字节才是「没在动」。这个数现在只负责让「慢」在读数面上不隐形。
 // cap: bound — 只决定「超过多久说一声」；过点之后继续等，从不丢弃仍在跑的传输
+// wall: 等=一次镜像操作（clone/fetch）的进度 / 等不到=只发布一行「比预期慢」，**过点之后继续等**，从不丢弃仍在跑的传输 / 续跑=不适用：这一格不结束任何东西
 const DEFAULT_MIRROR_OP_TIMEOUT_SECS: u64 = 1800;
 // cap: bound — lowest the deployment may set the operation timeout to; below it a large legitimate fetch is cut
+// wall: 等=不适用——这是别人被等多久的下限 / 等不到=不适用 / 续跑=不适用：低于它的配置会把一次正常的大 fetch 砍断，所以它挡的是配置，不是一次等待
 const MIRROR_OP_TIMEOUT_FLOOR_SECS: u64 = 60;
 /// 看门狗巡检间隔的上限；实际间隔按静默窗的四分之一取（见
 /// [`GitTransport::watchdog_interval`]），这样测试里把窗口压到秒级仍然判得准。
@@ -927,6 +931,7 @@ impl GitExec {
 /// 超时后等被杀的进程/读取任务收尾的上限。杀的是整个进程组，正常情况下管道
 /// 立刻断开；给个上限只为不让"已判定超时"的路径自己再挂住。
 // cap: bound — 收尾等待的上限，只为不让已判超时的路径自己再挂住
+// wall: 等=看门狗把已经判超时的那个进程收掉 / 等不到=这一条路径不再等它，进程交给运行时的回收；已经发出的那一行判词不变 / 续跑=不适用：收尾只做一次
 const WATCHDOG_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 对进程组发 SIGKILL。`pid` 是组长（调用点用 `process_group(0)` 让子进程自己

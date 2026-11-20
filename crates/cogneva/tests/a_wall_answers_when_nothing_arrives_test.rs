@@ -37,7 +37,6 @@ const UNANSWERED: &[(&str, u32)] = &[
     ("crates/cog-extension/src/hostdocs_assist.rs", 1),
     ("crates/cog-extension/src/runtime/remote.rs", 2),
     ("crates/cog-gateway/src/cluster.rs", 1),
-    ("crates/cog-gateway/src/git_mirror.rs", 5),
     ("crates/cog-gateway/src/git_routing.rs", 2),
     ("crates/cog-gateway/src/llm_admin.rs", 2),
     ("crates/cog-gateway/src/readings.rs", 1),
