@@ -32,6 +32,7 @@ pub mod audit;
 pub mod auth;
 pub mod backend_health;
 pub mod backup_admin;
+pub mod body_store;
 pub mod buildgate;
 pub mod capabilities;
 pub mod chat;
