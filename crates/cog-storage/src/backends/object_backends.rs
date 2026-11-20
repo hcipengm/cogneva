@@ -524,8 +524,184 @@ fn parse_next_token(xml: &str) -> Option<String> {
     xml_text(xml, "NextContinuationToken")
 }
 
+/// 一次分块上传：每段到齐就发出去，内存的上界是**一段**，不是整个对象。
+///
+/// 为什么不是 `UNSIGNED-PAYLOAD`：那只换签名口径，仍然要把整段字节攒在调用方手里再发，
+/// 「大块字节的写必须在内存里攒齐」这条一点没变。分块上传是唯一能把它变成「一段」的
+/// 形态，而 S3 的每一段各自签自己的载荷哈希——签名与校验因此仍然真跑过。
+// cap: fixed — 协议给定的下界：S3 不接受小于协议下限的段（最后一段除外），这里取下限的两倍，与这台机器无关
+const S3_PART_BYTES: usize = 10 * 1024 * 1024;
+
+struct S3Write {
+    /// 后端的副本（它本身是 `Clone`）：句柄活得比调用方的 `&self` 长，所以不能借。
+    backend: S3ObjectBackend,
+    key: String,
+    upload_id: String,
+    buffer: Vec<u8>,
+    etags: Vec<String>,
+}
+
+impl S3Write {
+    /// 把缓冲区前 `n` 字节当作一段发出去，剩下的留在缓冲里。
+    async fn flush_part_of(&mut self, n: usize) -> SFResult<()> {
+        // 前 n 字节作为这一段，剩下的先拿开；`flush_part` 发完会把 buffer 取空。
+        let rest = self.buffer.split_off(n);
+        let outcome = self.flush_part().await;
+        self.buffer = rest;
+        outcome
+    }
+
+    /// 发一段；空段不发（S3 不接受零长度段）。
+    async fn flush_part(&mut self) -> SFResult<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let part_number = self.etags.len() + 1;
+        let data = std::mem::take(&mut self.buffer);
+        let hash = S3ObjectBackend::sha256_hex(&data);
+        let canonical = self.backend.canonical_uri(&self.key);
+        let query = format!(
+            "partNumber={part_number}&uploadId={}",
+            percent_encode(&self.upload_id)
+        );
+        let extra = vec![
+            ("content-length".to_string(), data.len().to_string()),
+            ("x-amz-content-sha256".to_string(), hash.clone()),
+        ];
+        let signed = self
+            .backend
+            .sign_request("PUT", &canonical, &query, &hash, &extra);
+        let url = format!("{}?{}", self.backend.object_url(&self.key), query);
+        let mut req = HttpRequest::new("PUT", &url).body(data);
+        for (k, v) in signed {
+            req = req.header(k, v);
+        }
+        let resp = self.backend.client()?.execute(req).await?;
+        if !resp.is_success() {
+            return Err(SFError::Adapter {
+                provider: "s3".to_string(),
+                message: format!(
+                    "PUT part {part_number} of {} failed: {}",
+                    self.key, resp.status
+                ),
+            });
+        }
+        let etag = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        self.etags.push(etag);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl cog_core::ObjectWrite for S3Write {
+    async fn write(&mut self, chunk: &[u8]) -> SFResult<()> {
+        self.buffer.extend_from_slice(chunk);
+        while self.buffer.len() >= S3_PART_BYTES {
+            self.flush_part_of(S3_PART_BYTES).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self: Box<Self>) -> SFResult<String> {
+        self.flush_part().await?;
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (index, etag) in self.etags.iter().enumerate() {
+            xml.push_str(&format!(
+                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                index + 1,
+                etag
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let body = xml.into_bytes();
+        let hash = S3ObjectBackend::sha256_hex(&body);
+        let canonical = self.backend.canonical_uri(&self.key);
+        let query = format!("uploadId={}", percent_encode(&self.upload_id));
+        let extra = vec![
+            ("content-length".to_string(), body.len().to_string()),
+            ("x-amz-content-sha256".to_string(), hash.clone()),
+        ];
+        let signed = self
+            .backend
+            .sign_request("POST", &canonical, &query, &hash, &extra);
+        let url = format!("{}?{}", self.backend.object_url(&self.key), query);
+        let mut req = HttpRequest::new("POST", &url).body(body);
+        for (k, v) in signed {
+            req = req.header(k, v);
+        }
+        let resp = self.backend.client()?.execute(req).await?;
+        if !resp.is_success() {
+            return Err(SFError::Adapter {
+                provider: "s3".to_string(),
+                message: format!("complete {} failed: {}", self.key, resp.status),
+            });
+        }
+        Ok(format!("s3://{}/{}", self.backend.bucket, self.key))
+    }
+
+    async fn abort(self: Box<Self>) -> SFResult<()> {
+        // 不发 abort，S3 上会留一个永远不会被清理的分块上传，它占的空间在任何读数里
+        // 都看不见。
+        let canonical = self.backend.canonical_uri(&self.key);
+        let query = format!("uploadId={}", percent_encode(&self.upload_id));
+        let empty = S3ObjectBackend::sha256_hex(&[]);
+        let signed = self
+            .backend
+            .sign_request("DELETE", &canonical, &query, &empty, &[]);
+        let url = format!("{}?{}", self.backend.object_url(&self.key), query);
+        let mut req = HttpRequest::new("DELETE", &url);
+        for (k, v) in signed {
+            req = req.header(k, v);
+        }
+        let _ = self.backend.client()?.execute(req).await;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ObjectBackend for S3ObjectBackend {
+    async fn open_write(&self, key: &str) -> SFResult<Box<dyn cog_core::ObjectWrite>> {
+        // initiate：`POST /key?uploads` 换回一个 `UploadId`。
+        let canonical = self.canonical_uri(key);
+        let query = "uploads=".to_string();
+        let empty = Self::sha256_hex(&[]);
+        let signed = self.sign_request("POST", &canonical, &query, &empty, &[]);
+        let url = format!("{}?uploads", self.object_url(key));
+        let mut req = HttpRequest::new("POST", &url);
+        for (k, v) in signed {
+            req = req.header(k, v);
+        }
+        let resp = self.client()?.execute(req).await?;
+        if !resp.is_success() {
+            return Err(SFError::Adapter {
+                provider: "s3".to_string(),
+                message: format!("initiate multipart for {key} failed: {}", resp.status),
+            });
+        }
+        let body = resp.text().unwrap_or_default();
+        let upload_id = body
+            .split("<UploadId>")
+            .nth(1)
+            .and_then(|rest| rest.split("</UploadId>").next())
+            .map(str::to_string)
+            .ok_or_else(|| SFError::Adapter {
+                provider: "s3".to_string(),
+                message: format!("initiate multipart for {key} returned no UploadId: {body}"),
+            })?;
+        Ok(Box::new(S3Write {
+            backend: self.clone(),
+            key: key.to_string(),
+            upload_id,
+            buffer: Vec::new(),
+            etags: Vec::new(),
+        }))
+    }
+
     async fn put(&self, key: &str, data: &[u8]) -> SFResult<String> {
         self.with_retry(|| async {
             let payload_hash = S3ObjectBackend::sha256_hex(data);
