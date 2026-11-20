@@ -40,7 +40,11 @@ OWNER="${COGNEVA_OWNER:-}"
 if [ -z "$OWNER" ] && [ -n "$origin_url" ]; then
     OWNER="$(printf '%s' "$origin_url" | sed -n 's#.*[/:]\([^/]*\)/[^/]*$#\1#p')"
 fi
-if [ -z "$OWNER" ]; then
+if [ -z "$OWNER" ] && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    # 是一个 git 仓却没有远端：所有者读不出来，这一遍判不了。
+    #
+    # 不是 git 仓时**不在这里报**：那是另一句话（「读不出这棵树」），由 main 去说。
+    # 两件事都在这里退 3 的话，判词会把「没有远端」与「根本不是仓」混成一句。
     printf '私有标识门：读不出这个仓的所有者（origin 没有远端地址，也没给 COGNEVA_OWNER）——这一遍没判\n' >&2
     exit 3
 fi

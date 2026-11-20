@@ -35,6 +35,9 @@ trap 'rm -rf "${work}"' EXIT
 
 fixture="${work}/fixture"
 git -C "${work}" init -q fixture
+# 所有者现在从**仓自己的 origin** 读（2026-11-20：原来是一个写死的账号名）。
+# 夹具因此要有一条 origin，否则门判「读不出所有者」并退 3——那不是这条用例要测的东西。
+git -C "${fixture}" remote add origin https://github.com/hcipengm/cogneva.git
 mkdir -p "${fixture}/src"
 printf '%s\n' 'clone: https://github.com/hcipengm/cogneva.git' >"${fixture}/README.md"
 printf '%s\n' 'https://gitee.com/hcipengm/cogneva.git' >"${fixture}/src/notes.txt"
@@ -121,6 +124,7 @@ unset REQUIRE_PRIVATE_IDENTIFIERS
 #   b) 根目录根本不是 git 仓库（git grep 退出 >1，命中同样为空）。
 quiet="${work}/quiet"
 git -C "${work}" init -q quiet
+git -C "${quiet}" remote add origin https://github.com/hcipengm/cogneva.git
 mkdir -p "${quiet}/deploy"
 printf '%s\n' 'nothing points at a repository here' >"${quiet}/deploy/notes.txt"
 git -C "${quiet}" add deploy/notes.txt
