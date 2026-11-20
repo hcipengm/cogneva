@@ -28,21 +28,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// 每文件还欠几条三问。只许降：答掉一条就把数改小，清零就删掉这一行。
-const UNANSWERED: &[(&str, u32)] = &[
-    ("crates/bootstrap/src/apt.rs", 1),
-    ("crates/bootstrap/src/main.rs", 1),
-    ("crates/cog-agent/src/archive.rs", 1),
-    ("crates/cog-agent/src/plugin.rs", 1),
-    ("crates/cog-extension/src/hostdocs_assist.rs", 1),
-    ("crates/cog-gateway/src/readings.rs", 1),
-    ("crates/cog-github/src/discovery_loop.rs", 1),
-    ("crates/cog-memory/src/extractor.rs", 1),
-    ("crates/cog-memory/src/vector_summary_backend.rs", 1),
-    ("crates/cog-reflection/src/mainline_deployer.rs", 1),
-    ("crates/cog-reflection/src/promotion_eval.rs", 1),
-    ("crates/cog-reflection/src/volume_capacity.rs", 1),
-    ("crates/cog-reflection/src/workload_resources.rs", 1),
-];
+///
+/// 2026-11-20 清空：存量都答完了，从这一天起这条规则没有欠账——新写的墙常量要么带一行
+/// `// wall:`，要么当场红。表留着是为了下一次真有存量时接着用，而不是把「零」写成一个常量。
+const UNANSWERED: &[(&str, u32)] = &[];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -109,7 +98,14 @@ fn wall_constant(line: &str) -> Option<&str> {
     if !numeric {
         return None;
     }
-    if !value.chars().any(|c| c.is_ascii_digit()) {
+    // 初值要**以**一个数或一个时长字面量开头。只看「里面有没有数字」是不够的：
+    // `u32::MAX - 1` 里的 32 是类型路径上的数字，而那个常量是一个哨兵值，不是一道墙。
+    let value = value.trim_start();
+    let starts_with_a_number = value.starts_with(|c: char| c.is_ascii_digit());
+    let starts_with_a_duration = value.starts_with("Duration::")
+        || value.starts_with("std::time::Duration::")
+        || value.starts_with("time::Duration::");
+    if !(starts_with_a_number || starts_with_a_duration) {
         return None;
     }
     Some(name)
@@ -212,4 +208,9 @@ fn the_scan_tells_a_wall_from_a_word_that_looks_like_one() {
     );
     // 没有数字的初值不是时长。
     assert_eq!(wall_constant("const WALL_KIND: &str = DEADLINE;"), None);
+    // 类型路径里的数字不是初值里的数字：这是一个哨兵，不是一道墙。
+    assert_eq!(
+        wall_constant("const STALE_DEADLINE_THEN_SETTLES: u32 = u32::MAX - 1;"),
+        None
+    );
 }

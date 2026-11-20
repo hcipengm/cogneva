@@ -1115,6 +1115,7 @@ pub const OCCUPANCY_URL_ENV: &str = "COGNEVA_CLAIM_STORE_METRICS_URL";
 /// round, while a connection that has produced nothing for this long is the
 /// shape a dead endpoint has.
 // cap: bound — 一拍内没有新字节＝这条连接不是慢，是不动了；判据是字节，不是总时长
+// wall: 等=这条连接上的新字节 / 等不到=这一拍读作「不动了」，与「慢」分开——判据是字节，不是总时长 / 续跑=能，下一拍重新连上再读
 pub const OCCUPANCY_SCRAPE_TIMEOUT_SECS: u64 = 10;
 
 /// How long curl may spend before the connection is up.

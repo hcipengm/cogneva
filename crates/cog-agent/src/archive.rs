@@ -306,6 +306,7 @@ fn tool_labels(tool: &str) -> HashMap<String, String> {
 /// oversized payload, short enough that an API that stopped answering delays the
 /// turn instead of wedging it.
 // cap: bound — 长到容得下一份过大的载荷，短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
+// wall: 等=归档 API 收下一次写入 / 等不到=这一回合的归档失败，账上记一条失败；**没有半份载荷被当成已归档** / 续跑=能，重来是一次新的归档请求
 const ARCHIVE_TIMEOUT_SECS: u64 = 20;
 
 #[cfg(test)]

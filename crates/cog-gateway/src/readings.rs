@@ -1568,6 +1568,7 @@ fn query_client() -> Result<std::sync::Arc<dyn cog_core::HttpClient>, String> {
 /// The deadline for one query. A reading that cannot answer in five seconds is
 /// already the answer; a failed query is reported as "no reading", never as 0.
 // cap: bound — 一次查询的等待上限；超时报「没有读数」，绝不报 0
+// wall: 等=一次读数查询返回 / 等不到=这条读数报「没有读数」，**绝不报 0**——0 是一次真实读数，与「没量到」必须分得开 / 续跑=能，下一拍再查
 const QUERY_TIMEOUT_SECS: u64 = 5;
 
 /// Ask Prometheus for one query.

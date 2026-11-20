@@ -397,6 +397,7 @@ const EXTRACT_TASK_DECLARED_SECS: u64 = 180;
 /// stopped waiting" and "the row declared more than the pass will wait" are two
 /// different statements rather than the same one made twice.
 // cap: bound — ten seconds under the row's declared duration (180): the waiter has to give up first, otherwise "we stopped waiting" and "the declaration outlasted the pass" arrive together and the two readings cannot be told apart.
+// wall: 等=抽取任务交出结论 / 等不到=等待的一方先开口说出自己不再等，而任务本身不被杀掉——任务由它自己的租约回收 / 续跑=能，下一拍接着等同一个任务
 const EXTRACT_WAIT_TIMEOUT_SECS: u64 = 170;
 
 /// One work item in, one answer out.

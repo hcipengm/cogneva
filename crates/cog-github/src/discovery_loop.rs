@@ -37,6 +37,7 @@ const ASSESS_TASK_DECLARED_SECS: u64 = 120;
 /// How long the discovery loop blocks waiting for an assess verdict before it
 /// gives up and falls back to the local heuristic this round.
 // cap: bound — 等这么久拿不到判词就落回本地启发式，这一轮不再等下去
+// wall: 等=一次评估给出判词 / 等不到=这一轮落回本地启发式，不再等下去；判词没来不等于判词是「否」 / 续跑=能，下一轮重新等
 const ASSESS_WAIT_TIMEOUT_SECS: u64 = 100;
 /// Poll interval while waiting for the assess task to complete.
 // cap: bound — 等待期间多久问一次

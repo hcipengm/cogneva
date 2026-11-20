@@ -37,6 +37,7 @@ pub const DEFAULT_SUMMARY_COLLECTION: &str = "summaries";
 /// stays well inside the 300s startup probe, so a store that is genuinely
 /// broken still surfaces instead of hanging.
 // cap: bound — 要留在 300s 启动探针之内，真正坏掉的存储才会浮出来而不是挂着
+// wall: 等=向量存储把集合建出来 / 等不到=这次启动读作「存储坏了」并浮出来，而不是一直挂着；建了一半的集合不被当成建好了 / 续跑=能，重启时重试建集合（建集合是幂等的）
 const CREATE_COLLECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Delay before the second attempt; doubled for each attempt after that, up to

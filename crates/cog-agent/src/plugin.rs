@@ -1021,6 +1021,7 @@ async fn event_upload_task(
     // cap: bound — a batching choice; the flush deadline is what bounds the wait
     const BATCH_SIZE: usize = 16;
     // cap: bound — flush deadline for buffered events; the batch size of 16 is the other half of the batching
+    // wall: 等=攒够一批事件或者到点刷一次 / 等不到=不适用：它到点就刷，不结束任何一条事件 / 续跑=不适用
     const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
     let mut buffer: Vec<cog_core::AgentEvent> = Vec::with_capacity(BATCH_SIZE);

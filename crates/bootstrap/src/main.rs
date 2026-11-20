@@ -63,6 +63,7 @@ const REGISTRY_SEED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 ///
 /// 这一步只提示、绝不阻塞命门链路：3s 之后就当官方没有新版本，静默返回。
 // cap: bound — 这一步只提示、绝不阻塞命门链路：3s 之后就当官方没有新版本，静默返回
+// wall: 等=官方版本接口的答复 / 等不到=这一提示整段跳过、静默返回，**绝不阻塞命门链路**——没有版本提示不是装机失败 / 续跑=不适用：这一步只提示
 const OUTDATED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 在 /var/tmp 下创建 0700 随机工作目录。/var/tmp 全局可写，固定文件名会被

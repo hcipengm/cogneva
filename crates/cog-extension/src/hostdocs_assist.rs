@@ -204,6 +204,7 @@ pub fn truncate_to_wire(body: &str, max_wire_bytes: usize) -> (&str, bool) {
 /// An answer to one question. Long enough for a slow upstream, short enough that a run
 /// cannot hang on a channel that accepted the connection and then went quiet.
 // cap: bound — 一次问答的墙：够慢上游，又不至于挂在接了连接不说话的通道上
+// wall: 等=上游对一次问答的答复 / 等不到=这次问答按失败收尾，不产出半份建议；接了连接不说话的通道不会一直挂着 / 续跑=能，重来是一次新的问答
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 
 /// The model name this module sends. **It is a placeholder by contract**: the gateway
