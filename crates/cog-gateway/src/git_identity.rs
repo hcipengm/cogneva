@@ -760,6 +760,7 @@ async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> SshProbe {
 /// SSH 自证握手的硬超时。与选路探测同量级（那是一条 `ls-remote` 的一次往返），
 /// 但要留出"密钥被接受、仓库可读"这一段真实往返的余量。
 // cap: bound — 单次 SSH 探测的上限，要留出「密钥被接受、仓库可读」那段真实往返的余量
+// wall: 等=一次 SSH 自证握手走完 / 等不到=这次探测读作「这条凭证不成立」，而它不改任何已存的凭证——判词是这一次的 / 续跑=能，下一次探测重新握手
 const SSH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 登记部署密钥那次调用（GitHub API）的单次上限：15s。
@@ -767,6 +768,7 @@ const SSH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20
 /// 这一步在交互式向导里同步等待，超过十几秒用户已经在怀疑卡死了；而一次
 /// 创建 deploy key 的请求本身很小，慢到 15s 基本就是网络或上游不可用。
 // cap: bound — 创建 deploy key 的请求本身很小，慢到 15s 基本就是网络或上游不可用
+// wall: 等=代码平台对一次建 key 请求的答复 / 等不到=这次创建失败；**对端可能已经建好了**，所以留下的是「不确定」，下一次要先去读一遍已有的 key 而不是直接再建 / 续跑=能，但先读后建，否则会建出第二把
 const DEPLOY_KEY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// 把私钥写到临时文件（0600）供 git 使用。私钥不进命令行、不进环境变量，

@@ -374,6 +374,7 @@ pub const DEFAULT_REDIS_CONNECT_RETRIES: usize = 2;
 /// minutes (ten minutes of silence on 2026-10-22, with nothing counted as a
 /// refusal because a hung read is not a refused one).
 // cap: bound — 2026-10-22 实测十分钟无声且没被记成一次拒绝，因为挂住的读不是被拒的读
+// wall: 等=Redis 对一条命令的应答 / 等不到=这次读以超时失败并被记成一次失败（不是一次拒绝：挂住的读不是被拒的读），调用方拿到错误 / 续跑=能，重来是一次新的命令
 pub const DEFAULT_REDIS_RESPONSE_TIMEOUT_MS: u64 = 30_000;
 
 /// A budget below this would turn a momentary refusal into a permanent error.
@@ -383,6 +384,7 @@ pub const MIN_REDIS_CONNECT_BUDGET_MS: u64 = 100;
 /// A response timeout below this is not a bound, it is a race against the round
 /// trip.
 // cap: bound — 比它更小的应答超时不是界，是跟一个往返赛跑
+// wall: 等=一次 Redis 往返的下限，用来挡住配成更小的值 / 等不到=不适用：这个数本身不会被等，它是别人被等多久的下限 / 续跑=不适用
 pub const MIN_REDIS_RESPONSE_TIMEOUT_MS: u64 = 100;
 
 /// How long a redis connection attempt may take, how many times it is retried,
