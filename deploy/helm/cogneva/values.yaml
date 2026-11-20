@@ -93,12 +93,12 @@ resourceGovernance:
     # why: could name.
     minCpu: 10m
     # tunable:
-    # why: The admission floor for one container's memory: the same quantum (`MEMORY_QUANTUM_BYTES`) the
+    # why: The admission floor for one container's memory: the same quantum (`MEMORY_QUANTUM_BYTES`, 16Mi by default) the
     # why: resource loop rounds to, for the same reason as the CPU floor.
     minMemory: 16Mi
     # tunable:
     # why: The smallest PVC the namespace admits. It is the volume loop's own grid: `volume_capacity.rs` rounds
-    # why: a grown claim up to whole GiB, so this floor refuses exactly the claims that loop cannot
+    # why: a grown claim up to whole GiB, so a floor at that grid refuses exactly the claims that loop cannot
     # why: express. Nothing measures it, and nothing should: it is the scale at which the only writer of
     # why: storage requests works.
     pvcMinStorage: 1Gi
@@ -252,7 +252,7 @@ backup:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -272,7 +272,7 @@ backup:
       cpu: 1000m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -295,7 +295,7 @@ backup:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The drill CronJob's pods are resolved through the Jobs it creates, so the loop measures and
       # why: patches the Job template. The reading published under this key carries `source=derived` once the
       # why: window has enough samples, and `source=seed` with the declared value before that, so a reader can
@@ -317,7 +317,7 @@ backup:
       cpu: 1000m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The drill CronJob's pods are resolved through the Jobs it creates, so the loop measures and
       # why: patches the Job template. The reading published under this key carries `source=derived` once the
       # why: window has enough samples, and `source=seed` with the declared value before that, so a reader can
@@ -540,7 +540,7 @@ gateway:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -560,7 +560,7 @@ gateway:
       cpu: 4000m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -638,7 +638,7 @@ securityGateway:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -658,7 +658,7 @@ securityGateway:
       cpu: 500m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1006,8 +1006,8 @@ evolution:
   # 一对，缓存可以长到峰值的余量，但不能长到这张卷装不下。
   # tunable:
   # why: Holds the shared CARGO_TARGET_DIR; measured at 149GiB on 2026-11-12 against a 72Gi declaration, and
-  # why: the loop raised it to 179Gi, measured 2026-11-12. The reading is the walk's peak times 120%, rounded
-  # why: up to whole GiB, and it only moves up because the claim cannot shrink.
+  # why: the loop raised it to 179Gi (120% of that measured peak). The reading is the walk's peak times 120%, rounded up to whole GiB, and
+  # why: it only moves up because the claim cannot shrink.
   # published: owner=crates/cog-reflection/src/volume_capacity.rs file=crates/cog-reflection/src/volume_capacity.rs metric=BYTES_METRIC label=state cadence=periodic
   # proof: file=crates/cog-reflection/src/volume_capacity.rs test=a_claim_target_follows_the_measured_used_bytes beat=a_beat_whose_target_does_not_move_still_counts evidence=outcome_count
   sourceStorage: 192Gi
@@ -1147,7 +1147,7 @@ evolution:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1189,7 +1189,7 @@ evolution:
       # 否则 Pod 在准入就被拒。
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1353,10 +1353,9 @@ sandboxExecutor:
   # why: exists to make arrivals cheap, and spending the capacity on trees no task has asked for would make
   # why: the tasks themselves wait. The configured number is the seed, and only applies until both
   # why: measurements exist. What it was measured at: a conversation's first tool call took 6.69 s end to
-  # why: end, 6.5 s of it `git worktree add` (3403 ms on its own for this 49 MB repository, measured 2026-11-07),
-  # why: against 0.128 s for the same command five minutes later in a tree that already existed. About 1.1
-  # why: tasks a minute against a 3.4 s refill is what made 2 the seed. 2026-11-07, one former bound was the
-  # why: other way
+  # why: end, 6.5 s of it `git worktree add` (3403 ms on its own for this repository at its measured 49 MB), against 0.128 s
+  # why: for the same command five minutes later in a tree that already existed. About 1.1 tasks a minute
+  # why: against a 3.4 s refill is what made 2 the seed. 2026-11-07, one former bound was the other way
   # why: round: a refill stood down whenever the ceiling was full, and with the ceiling at 32 and the volume
   # why: holding 32 the pool was drained by two hand-outs and never refilled again. What a slot costs now is
   # why: the directory of one task tree the next arrival would have reclaimed anyway.
@@ -1460,7 +1459,7 @@ sandboxExecutor:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1480,7 +1479,7 @@ sandboxExecutor:
       cpu: 4000m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1627,7 +1626,7 @@ buildah:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1647,7 +1646,7 @@ buildah:
       cpu: 2000m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1692,7 +1691,7 @@ processCensus:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1712,7 +1711,7 @@ processCensus:
       cpu: 100m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1751,7 +1750,7 @@ hostLedger:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1771,7 +1770,7 @@ hostLedger:
       cpu: 100m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1918,7 +1917,7 @@ claimStore:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -1938,7 +1937,7 @@ claimStore:
       cpu: "1"
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -2016,7 +2015,7 @@ clusterRegistry:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -2042,7 +2041,7 @@ clusterRegistry:
       cpu: 500m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -2066,7 +2065,7 @@ clusterRegistry:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. This is the registry-walker sidecar; the loop measures each container in the Pod
       # why: separately. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
@@ -2088,7 +2087,7 @@ clusterRegistry:
       cpu: 200m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. This is the registry-walker sidecar; the loop measures each container in the Pod
       # why: separately. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
@@ -2312,7 +2311,7 @@ backends:
         # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2332,7 +2331,7 @@ backends:
         cpu: 2000m
         # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2359,7 +2358,7 @@ backends:
         # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The metrics sidecar sits in the same Pod and is charged to the namespace ceiling like any
         # why: other container, so its own draw is measured the same way. The reading published under this key
         # why: carries `source=derived` once the window has enough samples, and `source=seed` with the declared
@@ -2381,7 +2380,7 @@ backends:
         cpu: 200m
         # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The metrics sidecar sits in the same Pod and is charged to the namespace ceiling like any
         # why: other container, so its own draw is measured the same way. The reading published under this key
         # why: carries `source=derived` once the window has enough samples, and `source=seed` with the declared
@@ -2434,7 +2433,7 @@ backends:
         # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2454,7 +2453,7 @@ backends:
         cpu: 500m
         # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2479,7 +2478,7 @@ backends:
           # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-          # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+          # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
           # why: quantum. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2499,7 +2498,7 @@ backends:
           cpu: 200m
           # tunable:
           # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
           # why: request. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2530,7 +2529,7 @@ backends:
           # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-          # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+          # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
           # why: quantum. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2550,7 +2549,7 @@ backends:
           cpu: 100m
           # tunable:
           # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
           # why: request. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2593,7 +2592,7 @@ backends:
           # tunable:
           # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
           # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-          # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+          # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
           # why: quantum. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2619,7 +2618,7 @@ backends:
           cpu: 500m
           # tunable:
           # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+          # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
           # why: request. The reading published under this key carries `source=derived` once the window has enough
           # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
           # why: side of the measurement it is looking at.
@@ -2666,7 +2665,7 @@ backends:
         # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2686,7 +2685,7 @@ backends:
         cpu: 2000m
         # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2733,7 +2732,7 @@ backends:
         # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2753,7 +2752,7 @@ backends:
         cpu: 500m
         # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2798,7 +2797,7 @@ backends:
         # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2818,7 +2817,7 @@ backends:
         cpu: 1000m
         # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2878,7 +2877,7 @@ backends:
         # tunable:
         # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
         # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-        # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+        # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
         # why: quantum. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -2898,7 +2897,7 @@ backends:
         cpu: 1000m
         # tunable:
         # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+        # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
         # why: request. The reading published under this key carries `source=derived` once the window has enough
         # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
         # why: side of the measurement it is looking at.
@@ -3275,12 +3274,12 @@ taskRouter:
   # why: in flight over the last hour's samples (measured task life 12.8 minutes, so about five tasks), and
   # why: divides the headroom by that price; the bound falls at once and climbs one step only after the
   # why: current bound was actually run full. A positive number is the override seat and pins it. The two
-  # why: inputs are the reason it cannot be a constant: the reading that pinned it at 1 was a peak,
-  # why: measured 2026-11-07, of 15.96 GiB of a 16 GiB ceiling (mean 8.27 GiB) -- a fact about the container
-  # why: as it was sized that day, and a number typed into the chart cannot see the container grow. What the
-  # why: loop cannot do is raise the ceiling itself: the namespace quota measured the same day holds 78Gi of
-  # why: limits.memory with 59.6Gi in use (measured 2026-11-07) plus a roll's replacement overlap, so the
-  # why: derived bound stays at one until somebody raises the container and the loop reads the new `memory.max`.
+  # why: inputs are the reason it cannot be a constant: the 2026-11-07 reading that pinned it at 1 (peak
+  # why: 15.96 GiB of a 16 GiB ceiling, mean 8.27 GiB, measured) is a fact about the container as it was sized that
+  # why: day, and a number typed into the chart cannot see the container grow. What the loop cannot do is
+  # why: raise the ceiling itself: the namespace quota measured the same day holds 78Gi of limits.memory with
+  # why: 59.6Gi measured in use plus a roll's replacement overlap, so the derived bound stays at one until somebody
+  # why: raises the container and the loop reads the new `memory.max`.
   # published: owner=crates/cog-orchestrator/src/lane_memory.rs file=crates/cog-orchestrator/src/observable.rs metric=TASK_ROUTER_CLAIM_SLOTS_METRIC label=source cadence=periodic
   # proof: file=crates/cog-orchestrator/src/lane_memory.rs test=the_bound_follows_the_container_limit beat=the_bound_beat_counts_even_when_the_container_does_not_move evidence=bound_evaluations
   localClaimConcurrency: 0
@@ -3372,7 +3371,7 @@ webSearch:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -3392,7 +3391,7 @@ webSearch:
       cpu: 1000m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -3427,7 +3426,7 @@ webFetch:
   # tunable:
   # why: The size of the tmpfs mounted at /dev/shm. It is memory, so it follows the renderer's own
   # why: measurement: the size law takes the container's memory peak x 120% from the kubelet summary,
-  # why: quantised to the memory quantum, and that is what the volume's `sizeLimit` is patched to.
+  # why: quantised to the memory quantum (16Mi by default), and that is what the volume's `sizeLimit` is patched to.
   # why: `cogneva_workload_shm_size_bytes{workload,volume,source}` publishes the reading; `source=seed` until
   # why: the seven-day window has enough samples.
   # published: owner=crates/cog-reflection/src/workload_resources.rs file=crates/cog-reflection/src/workload_resources.rs metric=SHM_METRIC label=source cadence=periodic
@@ -3448,7 +3447,7 @@ webFetch:
       # tunable:
       # why: The scheduling claim is not pinned: the workload-resources loop reads this container's
       # why: `memory.workingSetBytes` from the kubelet summary every few minutes, keeps a seven-day window, and
-      # why: patches the request to the window's p95, rounded up to one quantum, whenever the move is at least one
+      # why: patches the request to the window's p95, rounded up to the memory quantum (16Mi by default), whenever the move is at least one
       # why: quantum. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -3468,7 +3467,7 @@ webFetch:
       cpu: 2000m
       # tunable:
       # why: The memory bound follows the measured draw: the loop patches the limit to the window's peak on
-      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to a whole quantum and never below the
+      # why: `memory.workingSetBytes` times the same 120% headroom, rounded up to the memory quantum (16Mi by default) and never below the
       # why: request. The reading published under this key carries `source=derived` once the window has enough
       # why: samples, and `source=seed` with the declared value before that, so a reader can always tell which
       # why: side of the measurement it is looking at.
@@ -3652,7 +3651,7 @@ mainlineDeployer:
     # why: The rollout judgement's own scheduling claim follows what its past runs measured of themselves: each
     # why: finished Job writes its average CPU and peak memory into its termination message, the deployer keeps
     # why: that run history on disk, and sizes the next Job by the same law. The request is the p95 of those
-    # why: runs, rounded up to the memory quantum. The reading on `workload="mainline-rollout"` carries `source=derived` once
+    # why: runs, rounded up to the memory quantum (16Mi by default). The reading on `workload="mainline-rollout"` carries `source=derived` once
     # why: a run history exists and `source=seed` with the chart value until then; the first run therefore
     # why: keeps the seed.
     # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-reflection/src/workload_resources.rs metric=REQUEST_MEMORY_METRIC label=source cadence=periodic
@@ -3670,7 +3669,7 @@ mainlineDeployer:
     cpuLimit: "2"
     # tunable:
     # why: The rollout judgement's own memory bound is the peak of its measured runs times the 120% headroom,
-    # why: rounded up to a whole quantum and never below the request. The reading on `workload="mainline-rollout"` carries
+    # why: rounded up to the memory quantum (16Mi by default) and never below the request. The reading on `workload="mainline-rollout"` carries
     # why: `source=derived` once a run history exists and `source=seed` with the chart value until then; the
     # why: first run therefore keeps the seed.
     # published: owner=crates/cog-reflection/src/mainline_deployer.rs file=crates/cog-reflection/src/workload_resources.rs metric=LIMIT_MEMORY_METRIC label=source cadence=periodic
