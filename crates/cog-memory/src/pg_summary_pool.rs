@@ -27,6 +27,7 @@ pub const SUMMARY_POOL_CONNECTIONS: u32 = 2;
 /// How long a caller waits for one of those two connections before being told
 /// the database is busy.
 // cap: bound — 调用方等这两条连接这么久还拿不到，就被告知库忙
+// wall: 等=池里那两条连接之一 / 等不到=这次调用以「库忙」失败，没有半份摘要被写下去 / 续跑=能，下一次调用重新排队
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Open the pool for the summary and schema layers.

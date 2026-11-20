@@ -13,6 +13,7 @@ use std::time::Duration;
 /// 同机群内本该是毫秒级；30s 留给「apiserver 正在滚动重启」这种短暂不可达，
 /// 再久就说明不是等一会能好的问题。
 // cap: bound — 同机群内本该是毫秒级；30s 留给 apiserver 滚动重启这类短暂不可达
+// wall: 等=一次到集群内 HTTP 端口的连接建立 / 等不到=这一次读失败，调用方拿到错误，没有半份清单被当成读到了 / 续跑=能，下一次调用重新连
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 读的时候最多等多久**一个字节也不来**，不是读完整个响应的总时长。
@@ -21,4 +22,5 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 字节也不再进来」正是死掉的那副样子。总时长的界会把一份慢却正常的响应砍在中间，
 /// 读出来的是一份残缺的清单——那看起来像「这个仓库没有那个镜像」，而不是「没读完」。
 // cap: bound — 60 秒没有任何新字节即判停；判据是字节，不是总时长
+// wall: 等=响应里的下一个字节 / 等不到=这一次读以错误结束，已经读到的字节不会被当成完整清单 / 续跑=能，重来是重新读一遍整份
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(60);

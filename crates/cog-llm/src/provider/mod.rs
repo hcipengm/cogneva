@@ -27,4 +27,5 @@ pub const STREAM_FIRST_EVENT_GAP: Duration = Duration::from_secs(600);
 /// 首事件之前用 [`STREAM_FIRST_EVENT_GAP`]——长推理窗口是正常的，之后收紧，
 /// 是因为「上游在想」与「流卡住了」到这里必须分得开。
 // cap: bound — 首事件之后的事件间隔；量的是没有进展，不是总时长
+// wall: 等=上游流里的下一个事件 / 等不到=这条流按「卡住了」收尾，已收到的事件留在这一跳里，账上记成一次没走完的调用 / 续跑=不能，从断点接着读要新开一次调用
 pub const STREAM_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
