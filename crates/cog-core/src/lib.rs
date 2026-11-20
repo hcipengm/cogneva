@@ -63,6 +63,7 @@ pub use contract::live_revision::*;
 /// Retry judgement for LLM refusals: the typed `UpstreamFailure` here, the
 /// in-band deterministic-failure predicates under `contract::outcome`.
 pub use contract::llm::*;
+pub use contract::llm_call_event::*;
 pub use contract::media::*;
 pub use contract::memory::*;
 pub use contract::metric_help::{documented_metric_names, metric_description, metric_help_text};

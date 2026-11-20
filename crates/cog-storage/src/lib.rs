@@ -74,6 +74,7 @@ pub use mem::{
 };
 
 #[cfg(feature = "postgres")]
+pub use postgres::llm_call_events::LlmCallEventStore;
 pub use postgres::{
     gauge_latest_sql, sha256_of, venue_tasks_sql, AgentMessage, AgentMessageStore, ChatAttachment,
     ChatAttachmentInfo, ChatToolCall, ChatToolCallStatus, ChatTurn, ChatTurnRecord, ChatTurnRole,
