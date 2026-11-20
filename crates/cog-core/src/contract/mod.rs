@@ -71,6 +71,7 @@ pub mod system_plugin;
 pub mod task;
 pub mod taste;
 pub mod tool;
+pub mod tool_call_event;
 pub mod transport;
 pub mod usage_ledger;
 pub mod version;

@@ -33,6 +33,7 @@ pub mod state_backend;
 pub(crate) mod state_reads;
 pub(crate) mod task_ledger;
 pub mod taste_intent_store;
+pub mod tool_call_events;
 pub mod user_store;
 
 pub use agent_message_store::{

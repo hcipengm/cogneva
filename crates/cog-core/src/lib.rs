@@ -102,6 +102,7 @@ pub use contract::system_plugin::*;
 pub use contract::task::*;
 pub use contract::taste::*;
 pub use contract::tool::*;
+pub use contract::tool_call_event::*;
 pub use contract::usage_ledger::*;
 pub use contract::wiki::*;
 pub use day_key::{day_key, DAY_KEY_FORMAT};
