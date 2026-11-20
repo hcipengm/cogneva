@@ -98,6 +98,9 @@ mod a_crate_is_a_component_not_a_bridge_test;
 mod a_day_is_named_by_one_clock_test;
 #[path = "a_job_inner_wait_budget_widens_the_job_deadline_test.rs"]
 mod a_job_inner_wait_budget_widens_the_job_deadline_test;
+#[path = "every_envelope_column_has_a_reader_test.rs"]
+mod every_envelope_column_has_a_reader_test;
+
 #[path = "a_judged_out_row_stays_owed_and_carries_its_reason_test.rs"]
 mod a_judged_out_row_stays_owed_and_carries_its_reason_test;
 #[path = "a_label_name_is_the_same_wherever_it_is_declared_test.rs"]
