@@ -1246,6 +1246,50 @@ mod tests {
         }
     }
 
+    /// 折中间段之后，提示词里不能有孤立的 tool result。
+    ///
+    /// 这条与下面那条「从头裁不切断轮次组」是同一个不变式的两条路径：折中间段是**新**的
+    /// 那条，切点如果落在 assistant 与它的 tool result 之间，就留下了声明了 tool_calls
+    /// 却无响应的 assistant 或一条没有声明的 result，严格校验的上游直接 400。
+    #[test]
+    fn folding_the_middle_never_leaves_an_orphan_tool_result() {
+        let mut ctx = ContextWindow::new(Some(400));
+        // 量到一次很小的往返：尾部只留最后一条，中间段足够长，一定触发折。
+        ctx.note_round_trip(10);
+        ctx.add_message(Message::user("任务：把这一批做完"));
+        for n in 0..6 {
+            ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+                &format!("call_{n}"),
+                "run_command",
+                serde_json::json!({"command": "ls"}),
+            )]));
+            ctx.add_message(Message::tool_result_text(
+                &format!("call_{n}"),
+                "run_command",
+                &"输出 ".repeat(40),
+            ));
+        }
+
+        let msgs = ctx.messages();
+        for (index, message) in msgs.iter().enumerate() {
+            if matches!(message, Message::ToolResult { .. }) {
+                assert!(
+                    index > 0 && matches!(msgs[index - 1], Message::Assistant { .. }),
+                    "第 {index} 条是孤立的 tool result：折的切点切断了轮次组"
+                );
+            }
+            if let Message::Assistant { tool_calls, .. } = message {
+                if tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+                    assert!(
+                        msgs.get(index + 1)
+                            .is_some_and(|next| matches!(next, Message::ToolResult { .. })),
+                        "第 {index} 条声明了 tool_calls 却没有紧随的 result"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn trim_never_evicts_first_user_message() {
         let mut ctx = ContextWindow::new(Some(60));
