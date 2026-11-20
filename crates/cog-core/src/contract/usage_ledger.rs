@@ -437,6 +437,27 @@ pub struct LlmUsageRecord {
     pub pace: Option<PaceEvidence>,
 }
 
+/// 封口读数：把整段读回来算出的哈希与长度。
+///
+/// 哈希与上游字节的哈希相等，才叫「无损」——不相等的那一行不比没有更强。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodySeal {
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// 一段大对象上的正文：指针，加上封口读数（读过一次才有）。
+///
+/// `seal` 为 `None` 不是「没有正文」：指针指向的字节就在库里，只是封口那次回读失败了，
+/// 没人验证过它完整。这与「进程崩在中途、行还没写」是同一族读数（孤儿扫描会把它找出来），
+/// 而不是能靠「这一列空着」糊过去的东西——把一份存在却没验证过的正文写成「没有正文」，
+/// 正是这一族最忌的形状。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyObject {
+    pub oid: u32,
+    pub seal: Option<BodySeal>,
+}
+
 /// One LLM exchange: what was asked, what came back, and where the permanent
 /// copy of each sits.
 ///
@@ -483,6 +504,10 @@ pub struct LlmExchangeRecord {
     /// [`Self::response_seen_bytes`] unless the capture was cut, and `0` when
     /// there was no body at all.
     pub response_bytes: u64,
+    /// 响应正文的大对象落点。**只有响应侧有指针**：请求正文在发出之前整段都在手上，
+    /// 直接写行内那一列；响应是流进来的，逐块写进大对象，行里只留指针。两侧不对称
+    /// 是因为两条路本来就不一样——给请求侧也开一段大对象，只是多三次数据库往返。
+    pub response_body_object: Option<BodyObject>,
     /// The permanent copy of the bytes sent upstream, as the reference a reader
     /// fetches it back by. `None` means no copy was made -- nothing is stored
     /// under a name nobody can name.

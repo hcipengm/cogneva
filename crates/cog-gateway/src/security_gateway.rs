@@ -33,8 +33,9 @@ use cog_core::contract::platform_sign::{
 };
 use cog_core::contract::transport::{Credential, Operation, Transport};
 use cog_core::usage_ledger::{
-    AnalyticsEvent, AnalyticsSink, LlmExchangeRecord, LlmOrigin, LlmUsageLedger, LlmUsageRecord,
-    MeteringOutcome as UsageOutcome, PaceEvidence, PaceUpstreamEvidence,
+    AnalyticsEvent, AnalyticsSink, BodyObject, BodySeal, LlmExchangeRecord, LlmOrigin,
+    LlmUsageLedger, LlmUsageRecord, MeteringOutcome as UsageOutcome, PaceEvidence,
+    PaceUpstreamEvidence,
 };
 use cog_core::{
     AlertTransition, MetricsBackend, PersistentAlertSink, RefusalKind, ScrapableMetrics,
@@ -4206,6 +4207,84 @@ async fn record_llm_tokens(
 /// 正文：重拼要经过一层协议解释，而解释会随上游习惯变；留底的价值正在于它不经解释。
 /// 它可能只是前缀（见 [`UsageScanner`] 的采集上限），所以 `response_seen_bytes` 单独
 /// 记上游到底发了多少：两者不等就说明有一截谁也没有副本，而不是这条正文本身就短。
+/// 把一整段字节写进大对象并封口。
+///
+/// 只给**手上已经有整段**的那两条路用（请求侧，以及响应的非流式/错误路径）。流式响应
+/// 不走这里：它的每一块在到达的那一拍就写进去了，末尾只取封口读数（见
+/// [`seal_stream_body`]）。
+///
+/// 写不进去就返回 `None`，调用方退回行内那一列——**这也是一条落点**，不是「没落成」：
+/// 退回之后正文仍在库里，只是换了一种形状。所以这里不删已经开出来的对象（只有封口
+/// 失败、正文确实已经完整写进去时才保留指针），也绝不把 `None` 读成「没有正文」。
+async fn put_body_object(state: &AppState, bytes: &[u8]) -> Option<BodyObject> {
+    let store = state.body_store.as_ref()?;
+    let writer = match store.open().await {
+        Ok(writer) => writer,
+        Err(e) => {
+            tracing::warn!(error = %e, "正文大对象开户失败，退回行内正文");
+            return None;
+        }
+    };
+    if let Err(e) = writer.write(bytes).await {
+        tracing::warn!(error = %e, "正文大对象写入失败，退回行内正文");
+        // 这一份不完整，而字节在调用方手上还有一份：丢掉，别让它冒充「崩在中途」。
+        let _ = writer.discard().await;
+        return None;
+    }
+    match writer.seal().await {
+        Ok((sha256, bytes_len)) => Some(BodyObject {
+            oid: writer.oid(),
+            seal: Some(BodySeal {
+                sha256,
+                bytes: bytes_len,
+            }),
+        }),
+        Err(e) => {
+            // 正文写进去了，只是没验证过：**保留指针**。删掉就是把库里唯一的一份正文
+            // 删了，而读者要的是「有正文、未验证」，不是「没有正文」。
+            tracing::warn!(error = %e, "正文大对象封口失败，行内留指针而不写封口读数");
+            Some(BodyObject {
+                oid: writer.oid(),
+                seal: None,
+            })
+        }
+    }
+}
+
+/// 流式响应的封口读数。
+///
+/// 只有「每一块都写进去了」时才用大对象那份。任何一块写失败都会把 `keep_raw` 翻回
+/// `true`——那时内存里攒下的那一份才是完整的，库里那段是半截：把半截写成指针，
+/// 读者会拿到一份比上游短、却没有任何一列说它短的正文。
+async fn seal_stream_body(
+    scanner: &Arc<Mutex<UsageScanner>>,
+    body: &Arc<tokio::sync::OnceCell<Option<Arc<dyn cog_core::BodyWriter>>>>,
+) -> Option<BodyObject> {
+    let handle = body.get().cloned().flatten()?;
+    let keep_raw = scanner.lock().map(|s| s.keep_raw).unwrap_or(true);
+    if keep_raw {
+        // 写失败之后退回攒的那条路：这份半截的不完整，而完整的那份在内存里。
+        let _ = handle.discard().await;
+        return None;
+    }
+    match handle.seal().await {
+        Ok((sha256, bytes_len)) => Some(BodyObject {
+            oid: handle.oid(),
+            seal: Some(BodySeal {
+                sha256,
+                bytes: bytes_len,
+            }),
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "流式正文封口失败，行内只留指针");
+            Some(BodyObject {
+                oid: handle.oid(),
+                seal: None,
+            })
+        }
+    }
+}
+
 async fn record_exchange(
     state: &AppState,
     upstream: &LlmUpstream,
@@ -4214,6 +4293,7 @@ async fn record_exchange(
     response: Option<&[u8]>,
     response_seen_bytes: u64,
     latency_ms: u64,
+    response_object: Option<BodyObject>,
 ) {
     if !exchange_store_enabled() {
         return;
@@ -4227,7 +4307,27 @@ async fn record_exchange(
         return;
     };
     let request_sha256 = sha256_hex(body);
-    let response_sha256 = response.map(sha256_hex);
+    // 响应侧的两个「副本有多长 / 副本的哈希」跟着落点走：正文进了大对象时，手上那一份
+    // 是空的（流式路径在字节到达的那一拍就写走了），拿它去算会把「副本有 N 字节」写成 0
+    // ——而 0 是一次真实读数（「没有正文」），不是「量不到」。有指针时这两个数只能是封口
+    // 读数；封口没成（哈希列为 `NULL`）就是没量到，不是 0。
+    let response_sha256 = if response_object.is_some() {
+        response_object
+            .as_ref()
+            .and_then(|o| o.seal.as_ref())
+            .map(|s| s.sha256.clone())
+    } else {
+        response.map(sha256_hex)
+    };
+    let response_bytes = if response_object.is_some() {
+        response_object
+            .as_ref()
+            .and_then(|o| o.seal.as_ref())
+            .map(|s| s.bytes)
+            .unwrap_or(0)
+    } else {
+        response.map(|b| b.len() as u64).unwrap_or(0)
+    };
     // 模型名从请求体里读：上游条目的 `model` 是被改写之后的真相，但调用方声明的
     // 那个名字在改写中丢了；两个都留着才回答得了"哪一边的模型在花钱"。
     let model = serde_json::from_slice::<serde_json::Value>(body)
@@ -4242,8 +4342,24 @@ async fn record_exchange(
     // 实测 2026-11-19 本部署：请求正文平均 2.7 KB、最大 78 KB，响应正文平均 36 KB、最大 1.05 MB——那一天的读数，不是本软件的规格。
     let request_raw = None;
     let response_raw = None;
+    // 请求侧永远走行内：它在发出去之前整段都在手上，另开一段大对象只是多三次往返。
+    // 响应侧有落点就走大对象，没有（或写失败）才退回行内。**一侧一份**：两边都写
+    // 就是两份可能对不上的正本，而这正是这张表存在的理由所反对的形状。
+    let response_object = if response_object.is_some() {
+        // 流式路径已经把每一块写进去了，这里只接它的封口读数。
+        response_object
+    } else {
+        match response {
+            Some(bytes) => put_body_object(state, bytes).await,
+            None => None,
+        }
+    };
     let request_inline = Some(String::from_utf8_lossy(body).into_owned());
-    let response_inline = response.map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    let response_inline = if response_object.is_some() {
+        None
+    } else {
+        response.map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    };
     let record = LlmExchangeRecord {
         upstream: LlmHealthTable::key(upstream),
         api_style: upstream.api_style.clone(),
@@ -4257,11 +4373,12 @@ async fn record_exchange(
         response_sha256,
         request_bytes: body.len() as u64,
         response_seen_bytes,
-        response_bytes: response.map(|b| b.len() as u64).unwrap_or(0),
+        response_bytes,
         request_raw,
         response_raw,
         request_inline,
         response_inline,
+        response_body_object: response_object,
     };
     // **在请求路径上写完再返回**，不 spawn。
     //
@@ -4779,6 +4896,10 @@ impl Drop for UsageRecorder {
         // keep out of the ledger, so `Drop` leaves a whole one behind rather
         // than a hollow that reads like one.
         let request = self.request.clone();
+        // 封口要在能 await 的地方做，而 `Drop` 不能——于是把两样东西交给那个自己的
+        // 任务：句柄格与扫描器（它留着「每一块都写进去了吗」这个读数）。
+        let scanner = self.scanner.clone();
+        let body = self.body.clone();
         let latency_ms = self.start.elapsed().as_millis() as u64;
         // [`Drop`] cannot await and the caller is already on its way out, so
         // the write rides a task of its own. Only a runtime that is itself
@@ -4797,6 +4918,7 @@ impl Drop for UsageRecorder {
                 .await;
                 // 这里也要留底：用量行只留下三个计数，正文才是这次调用真正的现场。
                 // 标签按"流有没有走完"给，而不是"尾巴跑没跑"——后者对每一笔都成立。
+                let response_object = seal_stream_body(&scanner, &body).await;
                 record_exchange(
                     &state,
                     &upstream,
@@ -4805,6 +4927,7 @@ impl Drop for UsageRecorder {
                     Some(&captured.bytes),
                     captured.seen,
                     latency_ms,
+                    response_object,
                 )
                 .await;
             });
@@ -4901,6 +5024,7 @@ fn wrap_usage_scan(
             &recorder.request,
         )
         .await;
+        let response_object = seal_stream_body(&recorder.scanner, &recorder.body).await;
         record_exchange(
             &recorder.state,
             &recorder.upstream,
@@ -4909,6 +5033,7 @@ fn wrap_usage_scan(
             Some(&captured.bytes),
             captured.seen,
             latency_ms,
+            response_object,
         )
         .await;
         Ok(axum::body::Bytes::new())
@@ -7928,6 +8053,7 @@ async fn stream_forward(
                 Some(text.as_bytes()),
                 text.len() as u64,
                 start.elapsed().as_millis() as u64,
+                None,
             )
             .await;
             let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
@@ -12181,39 +12307,39 @@ mod tests {
         assert_eq!(extract_usage(&delta), (None, Some(210), None, None, None));
     }
 
+    /// 默认必须把正文留在内存里：`bool` 的派生默认是 `false`，显式写这一格是
+    /// 为了让「没有写者的部署」不静默丢正文——这条用例就是那一格的守卫。
+    #[test]
+    fn a_scanner_with_no_writer_keeps_the_body() {
+        let mut s = UsageScanner::default();
+        s.feed(b"data: {\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n");
+        assert_eq!(s.seen, 49, "看见的字节数照旧计");
+        assert!(
+            !s.raw.is_empty(),
+            "没有写者时正文必须留在内存里，否则这一行的正文就是空的"
+        );
+    }
+
+    /// 接上写者时不攒，但**解析照旧**：用量帧不能因为正文另存而消失。
+    #[test]
+    fn a_scanner_with_a_writer_still_reads_the_usage_frames() {
+        let mut s = UsageScanner {
+            keep_raw: false,
+            ..UsageScanner::default()
+        };
+        s.feed(b"data: {\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}\n\n");
+        assert!(s.raw.is_empty(), "有写者时不再留第二份正文");
+        assert_eq!(s.tokens_input, 7);
+        assert_eq!(s.tokens_output, 9);
+        assert!(s.saw_usage);
+    }
+
     /// 尾帧报的用量才能改之前读到的读数：一条流上 `message_start` 报的是
     /// 「整段 prompt」，`message_delta` 报的才是「其中没被缓存服务的 + 读回来的」。
     /// 只读首帧，一笔命中 65% 的调用会在账上读作 `input: 17266, cached: 0`——
     /// 那正是「命中率是不是太低」这个问题被读错的地方：不是低，是没读。
     #[test]
     fn a_tail_frame_reports_the_split_the_head_frame_could_not() {
-        /// 默认必须把正文留在内存里：`bool` 的派生默认是 `false`，显式写这一格是
-        /// 为了让「没有写者的部署」不静默丢正文——这条用例就是那一格的守卫。
-        #[test]
-        fn a_scanner_with_no_writer_keeps_the_body() {
-            let mut s = UsageScanner::default();
-            s.feed(b"data: {\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n");
-            assert_eq!(s.seen, 49, "看见的字节数照旧计");
-            assert!(
-                !s.raw.is_empty(),
-                "没有写者时正文必须留在内存里，否则这一行的正文就是空的"
-            );
-        }
-
-        /// 接上写者时不攒，但**解析照旧**：用量帧不能因为正文另存而消失。
-        #[test]
-        fn a_scanner_with_a_writer_still_reads_the_usage_frames() {
-            let mut s = UsageScanner {
-                keep_raw: false,
-                ..UsageScanner::default()
-            };
-            s.feed(b"data: {\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}\n\n");
-            assert!(s.raw.is_empty(), "有写者时不再留第二份正文");
-            assert_eq!(s.tokens_input, 7);
-            assert_eq!(s.tokens_output, 9);
-            assert!(s.saw_usage);
-        }
-
         let mut s = UsageScanner::default();
         s.feed(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":17266,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n",

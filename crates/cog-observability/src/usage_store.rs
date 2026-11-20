@@ -645,6 +645,29 @@ BEGIN
         ALTER TABLE gateway_llm_exchange
             ADD COLUMN response_seen_bytes BIGINT NOT NULL DEFAULT 0;
     END IF;
+    -- The body itself, in one of the two shapes this table allows. Inline first:
+    -- a row whose body sits nowhere is a row that says "a call happened" and
+    -- cannot say what it was, and the writer needs a place to fall back to when
+    -- no large object is available.
+    --
+    -- Every column gets its own guard. A database that already carries some of
+    -- these -- from a release that created them directly -- must keep them, and
+    -- one shared guard would skip the rest on the strength of the first match.
+    ALTER TABLE gateway_llm_exchange ADD COLUMN IF NOT EXISTS request_body TEXT;
+    ALTER TABLE gateway_llm_exchange ADD COLUMN IF NOT EXISTS response_body TEXT;
+    -- The pointer shape: a large object, the hash and length read back at seal
+    -- time. `oid` alone says "there is a body"; the seal pair is what says the
+    -- body was read back whole. They are three columns because a reader has to
+    -- tell "sealed" from "still unverified" -- a NULL hash over a non-NULL oid
+    -- is that second case, not "no body".
+    --
+    -- Only the response side gets one. The request body is whole in memory
+    -- before it is sent, so it goes straight into `request_body`; the response
+    -- arrives in chunks and is written as it arrives. Giving the request a large
+    -- object as well would buy three round trips per call and no new property.
+    ALTER TABLE gateway_llm_exchange ADD COLUMN IF NOT EXISTS response_body_oid OID;
+    ALTER TABLE gateway_llm_exchange ADD COLUMN IF NOT EXISTS response_body_sha256 TEXT;
+    ALTER TABLE gateway_llm_exchange ADD COLUMN IF NOT EXISTS response_body_bytes BIGINT;
 END
 $mig$;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_ts ON gateway_llm_exchange (ts);
@@ -766,6 +789,17 @@ impl LlmUsageStore {
     /// live elsewhere. Nothing writes them today, and no reader may treat
     /// "no reference" as "no bytes" -- that is exactly what the inline columns
     /// are for.
+    ///
+    /// The three `*_body_*` columns per side are the large-object pointer, the
+    /// seal-time hash and the seal-time length. They are written **together or
+    /// not at all**: the row is only inserted after the object was sealed, so
+    /// there is no row whose pointer names a body nobody finished. The crashed
+    /// capture is an object with no row -- found by scanning the object catalog,
+    /// not by looking for a row that stopped halfway.
+    ///
+    /// A side that lands in a large object leaves its inline column `None`:
+    /// one body, one place. Writing both would re-create the very shape this
+    /// record exists to remove -- two copies that can disagree.
     pub async fn record_exchange(&self, r: &LlmExchangeRecord) -> anyhow::Result<()> {
         sqlx::query(
             r#"
@@ -773,9 +807,10 @@ impl LlmUsageStore {
                 (id, upstream, api_style, model, actor, origin, task_id, result,
                  latency_ms, request_sha256, response_sha256, request_bytes,
                  response_seen_bytes, response_bytes, request_raw, response_raw,
-                 request_body, response_body)
+                 request_body, response_body,
+                 response_body_oid, response_body_sha256, response_body_bytes)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                    $17, $18)
+                    $17, $18, $19::oid, $20, $21)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -797,6 +832,19 @@ impl LlmUsageStore {
         // 没有归档副本时的正文：老行用的是同样两列，读者不必分两种形状。
         .bind(r.request_inline.as_deref())
         .bind(r.response_inline.as_deref())
+        .bind(r.response_body_object.as_ref().map(|b| b.oid as i64))
+        .bind(
+            r.response_body_object
+                .as_ref()
+                .and_then(|b| b.seal.as_ref())
+                .map(|s| s.sha256.as_str()),
+        )
+        .bind(
+            r.response_body_object
+                .as_ref()
+                .and_then(|b| b.seal.as_ref())
+                .map(|s| s.bytes as i64),
+        )
         .execute(&self.pool)
         .await?;
         Ok(())

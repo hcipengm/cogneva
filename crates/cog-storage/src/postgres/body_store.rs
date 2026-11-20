@@ -30,6 +30,10 @@ impl BodyWriter for LargeObjectWriter {
     async fn seal(&self) -> SFResult<(String, u64)> {
         large_object::seal(&self.pool, self.oid).await
     }
+
+    async fn discard(&self) -> SFResult<()> {
+        large_object::unlink(&self.pool, self.oid).await
+    }
 }
 
 /// 开一段正文的存储。装配层持有一个，交给网关。
