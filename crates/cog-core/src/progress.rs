@@ -796,6 +796,24 @@ where
     collected
 }
 
+/// Test hook: record a beat that happened `age` ago.
+///
+/// The stall window is never narrower than the reader can resolve, so a test
+/// that wants silence *now* can no longer fake it with a zero-length window —
+/// it has to place the beat in the past instead. Sleeping for real would make
+/// the suite slow and flaky; this puts the clock where the test needs it.
+#[doc(hidden)]
+pub fn beat_ago_for_tests(task_id: &str, age: Duration) {
+    if task_id.is_empty() {
+        return;
+    }
+    let when = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+    beacons()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(task_id.to_string(), when);
+}
+
 /// Test hook: plant `count` gaps of a known length, so a test can fix the
 /// window instead of racing real timing. A window asserted from gaps the test
 /// also produced is the only kind of window a test can compare against.

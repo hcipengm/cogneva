@@ -4871,11 +4871,11 @@ mod tests {
 
         // 同一个窗口，这个尝试已经很久没动了：判停住，并带上是拿什么窗口比的。
         cog_core::progress::reset_for_tests();
-        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
-        cog_core::progress::beat(&task.id);
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::from_millis(2500), 1000);
+        cog_core::progress::beat_ago_for_tests(&task.id, std::time::Duration::from_secs(3));
         match reclaim_cause(&task, lease, now) {
             Some(ReclaimCause::Silent { window, .. }) => {
-                assert_eq!(window, std::time::Duration::ZERO)
+                assert_eq!(window, std::time::Duration::from_millis(2500))
             }
             other => panic!("停住要判成 Silent，实得 {other:?}"),
         }
@@ -7643,8 +7643,10 @@ mod tests {
             // 跑了九个小时也一样判据无关：这条判据不看它。
             t.started_at = Some(chrono::Utc::now() - chrono::Duration::hours(9));
         }
-        cog_core::progress::seed_gaps_for_tests(std::time::Duration::ZERO, 1000);
-        cog_core::progress::beat("t-stall");
+        // 窗口不许窄于读数能分辨的两拍，所以「现在就静默」不能靠把窗口量成零来伪造：
+        // 把那一拍放到三秒前，窗口仍是这一跑量到的 2.5 秒。
+        cog_core::progress::seed_gaps_for_tests(std::time::Duration::from_millis(2500), 1000);
+        cog_core::progress::beat_ago_for_tests("t-stall", std::time::Duration::from_secs(3));
 
         let results = dag.check_timeouts().await;
         assert_eq!(results.len(), 1, "过窗口没动一步就该收");
