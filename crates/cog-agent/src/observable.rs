@@ -281,6 +281,16 @@ pub enum ContextWindowSource {
 }
 
 impl ContextWindowSource {
+    /// 型号声明的窗口是否比当前在用的预算还小。
+    ///
+    /// 这条比较回答的是与「窗口太大」相反的问题：**有人按一个比型号更小的数在裁**。
+    /// 只有 `PublishedSpec` 才会这样——另外三种来源要么是实测抬上去的（那时它就在
+    /// 预算上），要么根本没人说过（没有界可裁）。所以它不是一个阈值，是一次来源判定：
+    /// 型号说了 200K，而这一轮的预算还在 64K，说明那 64K 没有出处。
+    pub fn narrower_than(self, window: Option<usize>, in_use: usize) -> bool {
+        matches!(self, Self::PublishedSpec) && window.is_some_and(|tokens| tokens < in_use)
+    }
+
     /// The word this source is stored and read under. A reader taking its
     /// predicate from here cannot drift from the writer.
     pub const fn as_str(self) -> &'static str {
@@ -2818,5 +2828,35 @@ mod tests {
             (Some(32_000), ContextWindowSource::MeasuredLimit),
             "它自己的界仍然说了算"
         );
+    }
+}
+
+#[cfg(test)]
+mod narrower_than_tests {
+    use super::ContextWindowSource;
+
+    /// 型号说了 200K 而预算还在 64K：这是「按一个更小的数在裁」，要能问出来。
+    #[test]
+    fn a_published_spec_below_the_budget_in_use_is_reported() {
+        assert!(ContextWindowSource::PublishedSpec.narrower_than(Some(200_000), 64_000));
+        assert!(!ContextWindowSource::PublishedSpec.narrower_than(Some(200_000), 200_000));
+        assert!(!ContextWindowSource::PublishedSpec.narrower_than(Some(32_000), 64_000));
+    }
+
+    /// 另外三种来源都不是这条告警：实测过的那个数就是预算，没有人说过就没有界。
+    #[test]
+    fn the_other_sources_never_answer_yes() {
+        for source in [
+            ContextWindowSource::MeasuredAccepted,
+            ContextWindowSource::MeasuredLimit,
+            ContextWindowSource::Unstated,
+        ] {
+            assert!(
+                !source.narrower_than(Some(1), 1_000_000),
+                "{} 不该触发「型号比预算小」",
+                source.as_str()
+            );
+        }
+        assert!(!ContextWindowSource::PublishedSpec.narrower_than(None, 64_000));
     }
 }
