@@ -59,11 +59,16 @@ def _md_items(path: pathlib.Path) -> list[Item]:
         raise Unreadable(f"{path} 不存在")
     out: list[Item] = []
     bad_status: list[str] = []
+    malformed: list[str] = []
     for line in path.read_text(errors="ignore").splitlines():
         if not line.startswith("| S"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) < 3:
+            # 一行以 `| S` 开头却没有状态列，**不能当它不在**：静默跳过会让一条待办
+            # 整族地从批次里消失，而读数照样绿。这与「状态词不在闭集里」是同一类
+            # 毛病——读不到不是没有——所以同样点名拒掉。
+            malformed.append(f"{cells[0] if cells else line[:20]}（只有 {len(cells)} 列，没有状态列）")
             continue
         status = cells[2]
         if status.startswith(CLOSED_PREFIXES):
@@ -85,6 +90,10 @@ def _md_items(path: pathlib.Path) -> list[Item]:
             ]
             touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
         out.append(Item(cells[0], cells[1][:80], touches, deferred))
+    if malformed:
+        raise Unreadable(
+            "这些行以 `| S` 开头却没有状态列，读不出它做没做：" + "、".join(malformed)
+        )
     if bad_status:
         raise Unreadable(
             "状态词不在闭集里（只认 `未落` / `已落` / `retired`）：" + "、".join(bad_status)
