@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Say whether a commit's bytes have passed CI's own criteria here. Never refuse.
 #
-# The rule of 2026-11-07 is about what reaches the repository: every revision
+# The rule is about what reaches the repository: every revision
 # pushed there has passed CI's criteria on this machine first. A commit is not
 # a push -- it is a local, amendable, squashable thing that nobody else can see
 # yet -- and the push hook asks that question and stops the push when the answer

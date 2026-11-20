@@ -17,7 +17,7 @@
 # resolved against the pushed tip's own tree, and shellcheck over the `*.sh`
 # files those commits touch.
 #
-# 2026-11-07: the rest of the suite is no longer left to CI. The owner's
+# The rest of the suite is no longer left to CI. The owner's
 # requirement that day was flat -- every commit, whether a host session wrote it
 # or cogneva landed it, must have passed CI's own criteria on this machine
 # before it reaches the repository -- and the cheap legs above answer only two
@@ -197,7 +197,7 @@ fi
 #
 # 判据只有一份，在 `deploy/scripts/check-before-push.sh` 里，它逐字照抄
 # `.github/workflows/ci.yml` 的命令（整棵工作区，不按改动收窄）。这里是它的调用点：
-# 见文件头的 2026-11-07 一段。
+# 见文件头那一段。
 #
 # 这里问的是「验过没有」，不是「现在替我验一遍」：验证是独立的一步，
 # 一次几十多分钟的整棵编译，挂着构建槽排队，挂在一个推送前面没人受得了。戳按字节记，

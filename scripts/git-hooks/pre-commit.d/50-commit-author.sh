@@ -7,7 +7,7 @@
 # Whichever session wrote that file last renames everyone after it -- on
 # 2026-10-27 six commits went out as `t <t@example.com>`, the fixture identity a
 # branch test had written into the shared config, and the real authors were
-# unrecoverable from history. The owner's rule (2026-11-07): a commit is signed
+# unrecoverable from history. A commit is signed
 # by the person who made it. The name is not a table here; it comes from whoever
 # is making the commit, in the first form that exists:
 #

@@ -29,7 +29,7 @@
 # carries the three citation shapes as Rust fixtures inside shell strings, and
 # read as shell prose they are indistinguishable from a citation, so a commit
 # touching that file could never be made without `--no-verify`. Measured
-# 2026-11-07 on the commit that clears the git environment in the test fixtures.
+# On the commit that clears the git environment in the test fixtures.
 #
 # Escape hatch: "cannot judge" never blocks. No git, no gate script in this
 # checkout (an older clone), nothing staged, a gate that cannot run -- each
