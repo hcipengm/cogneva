@@ -54,7 +54,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: d826b23124feec1fe9a1d4a4b9f74516094cdf1b4730a514a55cd37f8ccc27e1
+        checksum/config: f1118f71d1d850a19ff9b68c523c55d82b713ca43143989dc380126b108a5277
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
