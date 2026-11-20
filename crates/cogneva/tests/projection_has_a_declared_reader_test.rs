@@ -46,6 +46,31 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
             .join("\n")
     );
 
+    // 「由哪些事实重算」与「按什么重算一遍」两句都要写得出，而且后者要点得到树里的东西：
+    // 一张说不出自己跟谁一致的投影表，与一份没人核对过的副本在库里同形。
+    let mut unexplained = Vec::new();
+    for declaration in cog_storage::projection_readers::PROJECTION_READERS {
+        if declaration.rebuilt_from.trim().is_empty() {
+            unexplained.push(format!("{}: 没写「由哪些事实重算」", declaration.table));
+            continue;
+        }
+        if declaration.rebuild.trim().is_empty() {
+            unexplained.push(format!("{}: 没写重写它的是哪处代码", declaration.table));
+            continue;
+        }
+        if !root.join(declaration.rebuild).exists() {
+            unexplained.push(format!(
+                "{}: 点名的重写路线 {} 在树里不存在",
+                declaration.table, declaration.rebuild
+            ));
+        }
+    }
+    assert!(
+        unexplained.is_empty(),
+        "这些投影表的声明答不全「它由什么重算、按什么重算一遍」：\n{}",
+        unexplained.join("\n")
+    );
+
     let stale: Vec<&String> = declared.difference(&found).collect();
     assert!(
         stale.is_empty(),
