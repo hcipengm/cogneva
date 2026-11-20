@@ -180,6 +180,25 @@ pub fn beat(task_id: &str) {
     publish_progress(false);
 }
 
+/// 记一条**实测到的静默**：一段「什么也没动」的时间，而那一段最后**正常结束了**。
+///
+/// 与 [`beat`] 记的是同一个量（两次动之间隔了多久），来源不同：这一条来自一次从头到尾
+/// 没动过的命令——它没有「下一次 beat」把它记成一个间隔，所以样本群里本来只有
+/// 「动过、又停下」的那些。只有那些样本，量出来的界偏向「一动就说明它还活着」，
+/// 而网络等待（`git fetch`、一次远端握手）恰好整段不动：它在两个读数上都看不见，
+/// 于是被判成停住，而它其实在正常干活。这一条就是给那种形态一个进样本群的路。
+///
+/// 只收**正常结束**的那一段：被判停的那一段是异常，不是「干活时能有多安静」的样本。
+pub fn record_measured_silence(silent: Duration) {
+    if silent.is_zero() {
+        return;
+    }
+    gaps()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(silent);
+}
+
 /// When this attempt last did something, or `None` when nothing ever recorded it.
 ///
 /// `None` is a different fact from "a long time ago" and the caller must not
@@ -562,6 +581,10 @@ pub async fn watch_child(
     // 读写字节，动一次记一拍。写在这里而不是 `run_child_watched` 的调用方里，是因为
     // 只有这里握着那个 pid。
     let mut movement = crate::declared_wall::Movement::new();
+    // 最后一次「看见动」的时刻。它只为一件事：这条子进程**正常退出**时，最后那一段
+    // 静默是一次实测——一段什么也没动、最后却跑完了的时间。不收它，样本群就只剩
+    // 被判停的那些，界偏向窄，而窄界会误杀下一次正常的网络等待。
+    let mut last_movement = tokio::time::Instant::now();
     let status = loop {
         tokio::select! {
             status = child.wait() => break status?,
@@ -570,6 +593,7 @@ pub async fn watch_child(
                 // 但计数一直在涨。没有这一读，一份沉默的重活会在它自己最忙的时候被判成停住。
                 if let Some(pid) = child.id() {
                     if movement.sample(pid, id) {
+                        last_movement = tokio::time::Instant::now();
                         if let Some(also) = &also {
                             also();
                         }
@@ -614,6 +638,12 @@ pub async fn watch_child(
 
     if let Some((silent, window)) = stalled {
         return Ok(ChildOutcome::Stalled { silent, window });
+    }
+    // 正常结束：最后那一段静默是这条命令**干活时能有多安静**的一条实测。低于一拍的
+    // 那一段不记——它是采样网格本身，不是关于这段活的读数。
+    let quiet = last_movement.elapsed();
+    if quiet > WATCH_TICK {
+        record_measured_silence(quiet);
     }
     Ok(ChildOutcome::Exited(std::process::Output {
         status,
@@ -1058,6 +1088,41 @@ mod tests {
                  against a {window:?} window: elapsed time came back in as a criterion"
             ),
         }
+    }
+
+    /// 一段「什么也没动、最后却跑完了」的时间，要进样本群。
+    ///
+    /// 这是网络等待的那副形状：`git fetch`、一次远端握手整段不产出、不算 CPU，两个
+    /// 读数上都看不见。只有「动过又被杀」的样本时，量出来的界偏向窄，下一次正常的
+    /// 网络等待就会被判停。这条用例判的就是那一段被收进来了——没有这一收，
+    /// 样本数是 0。
+    #[tokio::test]
+    async fn a_quiet_child_that_ends_normally_becomes_a_sample() {
+        let _serial = async_test_lock().await;
+        reset_for_tests();
+        // 不种窗口：这一套「部署」还没量到任何东西，于是判据不成立（量不到就不判停），
+        // 子进程跑得完。要证的正是它跑完之后那一段静默成了第一份样本。
+        assert_eq!(gap_sample_count(), 0, "开场就没有样本，后面才数得清");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 2.5"]);
+        match run_child_watched(cmd, "quiet-normal").await.expect("spawn") {
+            ChildOutcome::Exited(out) => assert!(out.status.success(), "子进程没跑完：{out:?}"),
+            ChildOutcome::Stalled { silent, window } => {
+                panic!("窗口还没量到就把一个安静的子进程判停了：{silent:?} / {window:?}")
+            }
+        }
+
+        assert!(
+            gap_sample_count() >= 1,
+            "正常结束的那一段静默没有进样本群：样本数还是 {}",
+            gap_sample_count()
+        );
+        let sample = observed_longest_gap().expect("进了样本就该量得到极值");
+        assert!(
+            sample >= Duration::from_secs(2),
+            "样本只有 {sample:?}，比那段 2.5 秒的静默短得多"
+        );
     }
 
     /// 容器外的读者（kubelet 探针）只有这一份读数：进程开工写下的那个文件。
