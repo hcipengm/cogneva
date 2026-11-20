@@ -4827,19 +4827,53 @@ fn wrap_usage_scan(
         asked,
         ..UsageScanner::default()
     }));
+    // 开了正文落点就把扫描器设成「不攒」，每一块在到达的这一拍照写出去；
+    // 写不进去时退回攒——宁可多一份内存，也不要静默丢一块正文。
+    let body_store = state.body_store.clone();
+    if body_store.is_some() {
+        scanner.lock().unwrap().keep_raw = false;
+    }
+    // 第一块到达时才开户：`wrap_usage_scan` 是同步函数，开户要 await。`OnceCell`
+    // 让「只开一次」成为类型上的事实，不是靠一个 `bool` 记着。
+    let writer: Arc<tokio::sync::OnceCell<Option<Arc<dyn cog_core::BodyWriter>>>> =
+        Arc::new(tokio::sync::OnceCell::new());
     let scan = scanner.clone();
-    let scanned = stream.map(move |item| {
-        match &item {
-            Ok(bytes) => {
-                let mut s = scan.lock().unwrap();
-                s.feed(bytes);
+    let store_for_chunks = body_store.clone();
+    let writer_for_chunks = writer.clone();
+    let scanned = stream.then(move |item| {
+        let scan = scan.clone();
+        let body_store = store_for_chunks.clone();
+        let writer = writer_for_chunks.clone();
+        async move {
+            match &item {
+                Ok(bytes) => {
+                    // 先在锁里取块、放锁，再等待写：guard 不许跨 await。
+                    let chunk = {
+                        let mut s = scan.lock().unwrap();
+                        s.feed(bytes);
+                        bytes.to_vec()
+                    };
+                    if let Some(store) = body_store.as_ref() {
+                        let handle = writer
+                            .get_or_init(|| async { store.open().await.ok().map(Arc::from) })
+                            .await;
+                        if let Some(handle) = handle.as_ref() {
+                            // 写不进去就退回攒：宁可多一份内存，也不要静默丢一块正文。
+                            if handle.write(&chunk).await.is_err() {
+                                scan.lock().unwrap().keep_raw = true;
+                            }
+                        } else {
+                            scan.lock().unwrap().keep_raw = true;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let mut s = scan.lock().unwrap();
+                    s.saw_error = true;
+                }
             }
-            Err(_) => {
-                let mut s = scan.lock().unwrap();
-                s.saw_error = true;
-            }
+            item
         }
-        item
     });
     let mut recorder = UsageRecorder {
         scanner,
