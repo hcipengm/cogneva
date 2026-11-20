@@ -78,7 +78,6 @@ const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 /// 落库的错误文本上限。错误本身通常只有一行，这个界是为了让一条失控的长错误
 /// （整段响应体、整张表名清单）不至于把行撑成不可读的东西。
 // cap: bound — 错误本身通常只有一行；这个界让一条失控的长错误（整段响应体、整张表名清单）不至于把行撑成不可读的东西
-const ERROR_TEXT_MAX_CHARS: usize = 2000;
 
 /// 一次运行开出来时记下的期限：只落进账本，不杀任何东西。
 ///
@@ -5899,10 +5898,16 @@ async fn restore_and_compare(
 
 /// 落库前把错误文本洗干净：口令整段换掉，再交给公共脱敏。
 fn scrub_error(text: &str, database_url: &str) -> String {
-    let scrubbed = url_password(database_url)
-        .map(|secret| cog_core::redact_secrets(text).replace(&secret, "[redacted]"))
-        .unwrap_or_else(|| cog_core::redact_secrets(text));
-    scrubbed.chars().take(ERROR_TEXT_MAX_CHARS).collect()
+    // 只做一件事：把**我们自己的**数据库口令从错误文本里拿掉。那不是信息，是我们
+    // 的事故——错误文本里带出连接串口令，等于把凭证写进账。
+    //
+    // 除此之外原样保留：通用模式扫描（`redact_secrets`）会把看起来像密钥的普通内容
+    // 一起换掉，长度截断会把「后面还有一句话」变成「没有那句话」。错误文本是现场，
+    // 现场不许被改写。
+    match url_password(database_url) {
+        Some(secret) => text.replace(&secret, "[redacted]"),
+        None => text.to_string(),
+    }
 }
 
 /// `cogneva backup`：CronJob 与手动共用入口。
