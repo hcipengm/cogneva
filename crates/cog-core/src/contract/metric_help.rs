@@ -1917,6 +1917,13 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          is actually holding",
     ),
     (
+        "gateway_llm_exchange_rows_per_day",
+        "Rows the exchange archive gained per day between the last two passes. \
+         Absent until a second pass has something to compare with: a rate nobody \
+         measured is not a rate of zero, and a zero there would read as a table \
+         that stopped growing",
+    ),
+    (
         "gateway_llm_exchange_oldest_age_seconds",
         "Age of the oldest row in the archive, in seconds; zero for an empty \
          archive. This is the retention seen from the reader's side: whatever \

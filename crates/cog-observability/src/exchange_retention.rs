@@ -84,11 +84,39 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_LLM_EXCHANGE_KEEP_DAYS";
 // cap: bound — 更短就为一门年龄以天变的表反复重述花掉持久行，更长就让发布出去的大小在两次抓取之间过期
 pub const PERIOD: Duration = Duration::from_secs(300);
 
+/// 两次采样之间，这张表每天涨多少行。
+///
+/// 纯函数：速率是这一族里唯一能被穷举测试的部分，把它从 `pass` 里拿出来，判据就不必
+/// 连一个真库才问得出来。
+///
+/// 三条口径：
+/// - **没有上一次采样 ⇒ `None`**：那是一次「量不到」，不是零。
+/// - **两次采样同一时刻 ⇒ `None`**：除数不是正的，速率没有定义。
+/// - **可以是负数**：表变小了（真空或搬走一部分）也要如实报，那是读数不是错误。
+fn rows_per_day(
+    previous: Option<(i64, std::time::Instant)>,
+    now_held: i64,
+    now: std::time::Instant,
+) -> Option<f64> {
+    let (rows_before, at_before) = previous?;
+    let days = now.saturating_duration_since(at_before).as_secs_f64() / 86_400.0;
+    (days > 0.0).then(|| (now_held - rows_before) as f64 / days)
+}
+
 /// What one pass did, so a caller can assert on it rather than infer it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 不含 `Eq`：速率是浮点数，而 `Eq` 要求全序。判等用 `PartialEq`。
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetentionOutcome {
     /// Rows the archive held after the pass.
     pub held: i64,
+    /// Rows the archive gained per day, from the previous pass to this one.
+    ///
+    /// `None` on the first pass and whenever the previous one is too old or too
+    /// close to divide by: a rate nobody measured is not a rate of zero, and a
+    /// zero here would say the table is not growing while nothing had compared
+    /// two readings yet.
+    pub rows_per_day: Option<f64>,
     /// The age of the oldest surviving row, in seconds; zero for an empty
     /// archive.
     pub oldest_age_secs: i64,
@@ -111,6 +139,11 @@ pub struct ExchangeRetention {
     /// of a day's writes, every pass recomputes the retention.
     volume_bytes: Option<u64>,
     table: String,
+    /// 上一次采样：(行数, 时刻)。速率要两次读数才成立，所以它跟着这个对象走。
+    ///
+    /// 用 `Mutex` 是因为 `pass` 拿的是 `&self`：读数是这一趟自己的事，不改变
+    /// 「这个对象是什么」，而速率需要跨趟记忆。
+    last_sample: Arc<std::sync::Mutex<Option<(i64, std::time::Instant)>>>,
     metrics: Option<Arc<dyn MetricsBackend>>,
     readings: Option<Arc<RetentionReadings>>,
     deployment: String,
@@ -126,6 +159,7 @@ impl ExchangeRetention {
             keep,
             volume_bytes: None,
             table: TABLE.to_string(),
+            last_sample: Arc::new(std::sync::Mutex::new(None)),
             metrics: None,
             readings: None,
             deployment: String::new(),
@@ -235,9 +269,23 @@ impl ExchangeRetention {
             .map(|bytes| bytes.max(0) as u64);
         let (keep, keep_derived) = self.keep_for(oldest_before, bytes);
         let held = self.row_count().await?;
+        // 速率：与上一次采样比。第一次没有上一次，所以是「量不到」，不是 0。
+        let now = std::time::Instant::now();
+        let rows_per_day = {
+            let mut slot = self.last_sample.lock().map_err(|_| {
+                SFError::Database("exchange retention: sample lock poisoned".into())
+            })?;
+            let rate = slot.and_then(|(rows_before, at_before)| {
+                let days = now.saturating_duration_since(at_before).as_secs_f64() / 86_400.0;
+                (days > 0.0).then(|| (held - rows_before) as f64 / days)
+            });
+            *slot = Some((held, now));
+            rate
+        };
         let oldest_age_secs = self.oldest_age_secs().await?;
         Ok(RetentionOutcome {
             held,
+            rows_per_day,
             oldest_age_secs,
             keep_secs: keep.as_secs() as i64,
             keep_derived,
@@ -333,6 +381,11 @@ impl ExchangeRetention {
                 outcome.keep_secs as f64,
             ),
         ];
+        // 速率只在量得到的时候发布：量不到就不发，而不是发一个 0——一个 0 会被读成
+        // 「表不再增长」，而那时还没有任何两次读数比过。
+        if let Some(rate) = outcome.rows_per_day {
+            pairs.push((metric_names::LLM_EXCHANGE_ROWS_PER_DAY, rate));
+        }
         if let Ok(bytes) = self.table_bytes().await {
             pairs.push((metric_names::LLM_EXCHANGE_BYTES, bytes as f64));
         }
@@ -458,6 +511,7 @@ mod tests {
         )
         .with_readings(Arc::clone(&readings));
         let outcome = RetentionOutcome {
+            rows_per_day: None,
             held: 100,
             oldest_age_secs: 86_400,
             keep_secs: 7 * 86_400,
@@ -481,5 +535,48 @@ mod tests {
         );
         assert_eq!(sweep.keep(), Duration::from_secs(7 * 86_400));
         assert_eq!(sweep.table, TABLE);
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::rows_per_day;
+    use std::time::{Duration, Instant};
+
+    /// 一天的差：涨了多少行，速率就是多少。
+    #[test]
+    fn a_day_of_growth_is_the_rate() {
+        let t0 = Instant::now();
+        let rate = rows_per_day(Some((100, t0)), 300, t0 + Duration::from_secs(86_400));
+        assert_eq!(rate, Some(200.0));
+    }
+
+    /// 半天涨 100 行：每天 200 行。**换输入值，答案跟着变**——这是「derived」那条判据。
+    #[test]
+    fn halving_the_interval_doubles_the_rate() {
+        let t0 = Instant::now();
+        let rate = rows_per_day(Some((100, t0)), 200, t0 + Duration::from_secs(43_200));
+        assert_eq!(rate, Some(200.0));
+    }
+
+    /// 没有上一次采样：量不到，不是零。
+    #[test]
+    fn a_first_pass_has_no_rate() {
+        assert_eq!(rows_per_day(None, 500, Instant::now()), None);
+    }
+
+    /// 同一时刻两次采样：除数不是正的。
+    #[test]
+    fn two_samples_at_one_instant_have_no_rate() {
+        let t0 = Instant::now();
+        assert_eq!(rows_per_day(Some((10, t0)), 20, t0), None);
+    }
+
+    /// 表变小了也如实报：负数是读数，不是错误。
+    #[test]
+    fn a_shrinking_table_reports_a_negative_rate() {
+        let t0 = Instant::now();
+        let rate = rows_per_day(Some((300, t0)), 100, t0 + Duration::from_secs(86_400));
+        assert_eq!(rate, Some(-200.0));
     }
 }

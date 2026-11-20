@@ -266,6 +266,7 @@ metric_names! {
     // The bytes are what the nightly backup pays for; they are not a bound,
     // because PostgreSQL returns a DELETE's space only when it vacuums.
     LLM_EXCHANGE_ROWS => "gateway_llm_exchange_rows",
+    LLM_EXCHANGE_ROWS_PER_DAY => "gateway_llm_exchange_rows_per_day",
     LLM_EXCHANGE_OLDEST_AGE_SECONDS => "gateway_llm_exchange_oldest_age_seconds",
     LLM_EXCHANGE_KEEP_SECONDS => "gateway_llm_exchange_keep_seconds",
     LLM_EXCHANGE_BYTES => "gateway_llm_exchange_bytes",
