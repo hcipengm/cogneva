@@ -106,14 +106,18 @@ fn event_id_for(call_id: &str) -> String {
 
 /// 一条工作碰过哪些文件：从它自己的 `tool_call` 事件里取，不由模型自报。
 ///
+/// 取的是载荷里那一格 `path`（S37：给文件相关的调用单独一格），所以这条读取不需要
+/// 回源去载体——回源读不到时清单会静默变空，而那正是要防的形状。
+///
 /// 工具调用的 `scope` 列存的是工具名，文件在参数里——而参数只存哈希（正文在载体里）。
 /// 所以这条读取不解析参数正文：它按**工具名 + 时间**列出调用，再由调用方按自己的
 /// 载体取正文。这是有意的：一个要解析正文才能回答的读取，会在正文缺失时变成
 /// 「什么都没碰过」，而那正是要防的形状。
 pub const TOOL_CALLS_FOR_WORK_SQL: &str = "\
-SELECT kind, subject_id, step, outcome, scope, attributes, at \
+SELECT attributes::jsonb->>'path' AS path, at \
   FROM cogneva_event \
  WHERE kind = 'tool_call' AND unit_of_work = $1 \
+   AND attributes::jsonb->>'path' IS NOT NULL \
  ORDER BY at, subject_id";
 
 #[cfg(test)]
