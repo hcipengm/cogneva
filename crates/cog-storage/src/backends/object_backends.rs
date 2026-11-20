@@ -48,8 +48,73 @@ impl FileObjectBackend {
     }
 }
 
+/// 一段正在写进文件的对象。
+///
+/// 先写 `<path>.partial`，封口时才改名成正式的那一个。这个中间名就是契约里那句
+/// 「封口之后才对读者存在」：读者按 key 找不到半段，`abort` 丢掉的就是它。
+struct FileWrite {
+    file: tokio::fs::File,
+    path: std::path::PathBuf,
+    partial: std::path::PathBuf,
+}
+
+#[async_trait]
+impl cog_core::ObjectWrite for FileWrite {
+    async fn write(&mut self, chunk: &[u8]) -> SFResult<()> {
+        use tokio::io::AsyncWriteExt;
+        self.file
+            .write_all(chunk)
+            .await
+            .map_err(|e| SFError::IO(e.to_string()))
+    }
+
+    async fn finish(mut self: Box<Self>) -> SFResult<String> {
+        use tokio::io::AsyncWriteExt;
+        self.file
+            .flush()
+            .await
+            .map_err(|e| SFError::IO(e.to_string()))?;
+        // 改名之前先落盘：改名的语义是「这一份已经完整」，而一个还没落盘的完整名字
+        // 会在掉电之后变成一个空对象。
+        self.file
+            .sync_all()
+            .await
+            .map_err(|e| SFError::IO(e.to_string()))?;
+        tokio::fs::rename(&self.partial, &self.path)
+            .await
+            .map_err(|e| SFError::IO(e.to_string()))?;
+        Ok(format!("file://{}", self.path.display()))
+    }
+
+    async fn abort(self: Box<Self>) -> SFResult<()> {
+        let FileWrite { file, partial, .. } = *self;
+        drop(file);
+        tokio::fs::remove_file(&partial)
+            .await
+            .map_err(|e| SFError::IO(e.to_string()))
+    }
+}
+
 #[async_trait]
 impl ObjectBackend for FileObjectBackend {
+    async fn open_write(&self, key: &str) -> SFResult<Box<dyn cog_core::ObjectWrite>> {
+        let path = self.object_path(key)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| SFError::IO(e.to_string()))?;
+        }
+        let partial = path.with_extension("partial");
+        let file = tokio::fs::File::create(&partial)
+            .await
+            .map_err(|e| SFError::IO(e.to_string()))?;
+        Ok(Box::new(FileWrite {
+            file,
+            path,
+            partial,
+        }))
+    }
+
     async fn put(&self, key: &str, data: &[u8]) -> SFResult<String> {
         let path = self.object_path(key)?;
         if let Some(parent) = path.parent() {
@@ -674,6 +739,48 @@ impl ObjectBackend for S3ObjectBackend {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// 分块写进去的对象，等于把那些块逐字节拼起来；封口之前读者看不到它。
+    ///
+    /// 这条用例判的是契约那两句话：`write` 进来的字节不合并、不切分，`finish` 之后
+    /// 才存在。**先写 `<path>.partial`、封口才改名**是「不存在半段」的落地方式，所以
+    /// 第三句断言看的是那个中间名在封口后消失。
+    #[tokio::test]
+    async fn a_streamed_object_is_the_concatenation_of_its_chunks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let backend = FileObjectBackend::new(dir.path());
+        let mut writer = backend.open_write("a/b.bin").await.expect("open");
+
+        let chunks: [&[u8]; 3] = [b"first ", b"second ", b"third"];
+        for chunk in chunks {
+            writer.write(chunk).await.expect("a chunk must land");
+        }
+        assert!(
+            backend.get("a/b.bin").await.expect("get").is_none(),
+            "封口之前读者不该看到半段"
+        );
+
+        let uri = writer.finish().await.expect("finish");
+        assert!(uri.starts_with("file://"), "{uri}");
+        let got = backend.get("a/b.bin").await.expect("get").expect("exists");
+        assert_eq!(got, b"first second third".to_vec());
+        assert!(
+            !dir.path().join("a/b.partial").exists(),
+            "封口之后中间名要收掉"
+        );
+    }
+
+    /// 放弃的那一段不留痕：`abort` 之后按 key 读不到，中间名也不在。
+    #[tokio::test]
+    async fn an_aborted_write_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let backend = FileObjectBackend::new(dir.path());
+        let mut writer = backend.open_write("c.bin").await.expect("open");
+        writer.write(b"half a body").await.expect("write");
+        writer.abort().await.expect("abort");
+        assert!(backend.get("c.bin").await.expect("get").is_none());
+        assert!(!dir.path().join("c.partial").exists());
+    }
 
     /// Serves a scripted sequence of ListObjectsV2 pages and records the URL of
     /// every request so a test can assert the continuation cursor was forwarded.
