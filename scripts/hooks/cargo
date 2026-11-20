@@ -38,16 +38,29 @@ fi
 
 # 判据是「这一轮开工以来改了什么」，不是「工作树干不干净」：每做完一小块就提交的人，
 # 工作树永远是干净的，按脏树判等于把门整个跳过——而漏下的子集正是这样漏掉的。
-round_open=0
-if [ -f "$toplevel/scripts/hooks/round.py" ] && python3 "$toplevel/scripts/hooks/round.py" status >/dev/null 2>&1; then
-  round_open=0
-elif [ -f "$toplevel/scripts/hooks/round.py" ] && python3 "$toplevel/scripts/hooks/round.py" planned >/dev/null 2>&1; then
-  round_open=0
-else
-  round_open=1
+# 没有开着一轮、或者事件流读不到：**判不了**，不是「没有缺口」。判不了就不许编译——
+# 没有轮的时候 family 会退回「与 origin/main 的差」，那是整段历史，看起来毫无缺口。
+if [ -f "$toplevel/scripts/hooks/round.py" ]; then
+  if ! round_out=$(python3 "$toplevel/scripts/hooks/round.py" status 2>&1); then
+    case "$round_out" in
+      *"还剩"*) : ;;
+      *)
+        printf '%s\n' "$round_out" >&2
+        cat >&2 <<'EOF'
+
+cargo: 这一轮判不了，先别编译。
+
+  要么没有开着一轮（`scripts/hooks/round.py open`），要么事件流读不到。
+  「判不了」与「没有缺口」是两件事：退回「与 origin/main 的差」会把整段历史
+  当成这一轮的改动，缺口一律看不见。
+EOF
+        exit 1
+        ;;
+    esac
+  fi
 fi
 
-if [ "$builds" = "1" ] && [ -f "$family" ] && { [ "$dirty" = "1" ] || [ "$round_open" = "1" ]; }; then
+if [ "$builds" = "1" ] && [ -f "$family" ] && [ -f "$toplevel/scripts/hooks/round.py" ]; then
   if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
     if ! python3 "$family" --root "$toplevel" --all-todos; then
       cat >&2 <<'EOF'
