@@ -1093,6 +1093,43 @@ impl LlmUsageStore {
         Ok((total, by_actor))
     }
 
+    /// 同一个读数，**从事件流算**：读切换的第一条，按 kind 扫 `cogneva_event`。
+    ///
+    /// 与 `spend_by_actor_since` 并排存在一个切换周期：两个数在同一段时间上必须逐行
+    /// 相等，相等之后才停掉写行的那一侧。它不是「另一个方便查的口子」——它是正本那一侧
+    /// 的读数，行长那一侧是投影。
+    ///
+    /// 口径两处必须一致：`ok` 与拒绝的调用都计数（拒绝的 token 是 0），这与账本按行
+    /// 求和是同一条。时间取 `at`（服务端时刻），与账本的 `ts` 同源。
+    pub async fn spend_by_actor_since_from_stream(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<(u64, std::collections::BTreeMap<String, u64>)> {
+        let rows = sqlx::query(
+            "SELECT actor,
+                    COALESCE(SUM(
+                        COALESCE((attributes::jsonb->>'input_tokens')::BIGINT, 0)
+                      + COALESCE((attributes::jsonb->>'output_tokens')::BIGINT, 0)
+                    ), 0)::BIGINT AS tokens
+               FROM cogneva_event
+              WHERE kind = 'llm_call'
+                AND at >= to_timestamp($1::DOUBLE PRECISION)
+              GROUP BY actor
+              ORDER BY actor",
+        )
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_actor = std::collections::BTreeMap::new();
+        let mut total = 0u64;
+        for row in &rows {
+            let tokens = row.get::<i64, _>("tokens").max(0) as u64;
+            total = total.saturating_add(tokens);
+            by_actor.insert(row.get::<String, _>("actor"), tokens);
+        }
+        Ok((total, by_actor))
+    }
+
     /// Tokens spent over the whole folded record, split by `(upstream,
     /// api_style, actor)` and kind.
     ///
