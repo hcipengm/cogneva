@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import shlex
 import subprocess
@@ -207,10 +208,69 @@ def close() -> int:
     return 0
 
 
+
+def plan_defects(batch_ids: list[str], plan: dict) -> list[str]:
+    """计划必须覆盖**整批**，且每条待办至少两种来源形状的验收。
+
+    与 Rust 侧 `Plan::validate` 同一条判据（那边是平台路径的权威，这边是带外
+    worker 的入口）：一份少了几条的计划等于把「同批编辑」悄悄缩回子集。
+    """
+    defects: list[str] = []
+    covered = plan.get("items") if isinstance(plan, dict) else None
+    if not isinstance(covered, list):
+        return ["计划里没有 `items`：它要逐条回答这一批每一条怎么做完"]
+    seen = {item.get("id") for item in covered if isinstance(item, dict)}
+    missing = [i for i in batch_ids if i not in seen]
+    if missing:
+        defects.append("计划漏了这些待办：" + "、".join(missing))
+    for item in covered:
+        if not isinstance(item, dict):
+            continue
+        shapes = item.get("acceptance") or []
+        if len(shapes) < 2 and not item.get("one_shape_because"):
+            defects.append(
+                f"{item.get('id')}：验收只有 {len(shapes)} 种来源形状；要两种，"
+                "或者在 `one_shape_because` 里说清为什么第二种不存在"
+            )
+    for key in ("input_type", "invariants", "counterexamples"):
+        if not plan.get(key):
+            defects.append(f"计划缺 `{key}`：这三样是「这一类」的定义，不是可选项")
+    return defects
+
+
+def record_plan(plan_path: str) -> int:
+    current = current_round()
+    if current is None:
+        print("round: 没有开着的一轮。先 `round.py open`。", file=sys.stderr)
+        return 1
+    import json
+    plan = json.loads(pathlib.Path(plan_path).read_text())
+    batch = remaining()
+    defects = plan_defects(batch, plan)
+    if defects:
+        print("round: 这份计划不能作为这一批的编辑输入：", file=sys.stderr)
+        for d in defects:
+            print("  - " + d, file=sys.stderr)
+        return 2
+    import uuid
+    event_id = uuid.uuid4().hex[:26]
+    attrs = json.dumps(plan, ensure_ascii=False).replace("'", "''")
+    psql(
+        "insert into cogneva_event (event_id, kind, subject_kind, subject_id, unit_of_work, "
+        "step, outcome, idempotency_key, causation_id, actor, writer, attributes) values "
+        f"('{event_id}','batch_planned','round','{current[0]}','{current[0]}','plan','ok',"
+        f"'{event_id}','{current[0]}','{os.environ.get('COGNEVA_ACTOR','worker')}',"
+        f"'{os.environ.get('COGNEVA_WRITER','worker')}', '{attrs}')"
+    )
+    print(f"round: 计划已记进事件（覆盖 {len(batch)} 条）；编辑只认这一份。")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["open", "status", "close", "rebound"])
+    parser.add_argument("action", choices=["open", "status", "close", "rebound", "plan"])
     parser.add_argument("--source", default=None)
+    parser.add_argument("--file", default=None)
     args = parser.parse_args(argv[1:])
     try:
         if args.action == "open":
@@ -219,6 +279,11 @@ def main(argv: list[str]) -> int:
             # 这一轮没变，变的是它钉的那一版台账（例如台账随后才提交）。重钉是一次
             # **计划修订**：追加一条新的 round_opened，读取方取最新的一条。
             return open_round(args.source, allow_open=True)
+        if args.action == "plan":
+            if not args.file:
+                print("round: plan 要一个 --file <plan.json>", file=sys.stderr)
+                return 2
+            return record_plan(args.file)
         if args.action == "status":
             return status()
         return close()
