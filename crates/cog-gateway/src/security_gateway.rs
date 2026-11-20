@@ -2074,6 +2074,8 @@ struct WindowPaceReading {
 #[derive(Clone)]
 struct AppState {
     config: SecurityGatewayConfig,
+    /// 流式正文的落点。`None` 时正文照旧留在扫描器的内存里（今天的行为）。
+    body_store: Option<Arc<dyn cog_core::BodyStore>>,
     client: reqwest::Client,
     /// No total timeout — SSE streams from reasoning models can run for
     /// minutes; only connection establishment is bounded.
@@ -11216,6 +11218,7 @@ pub async fn run(
         volume_footprint,
         provider_compat,
         config: config.clone(),
+        body_store: None,
     };
     // 恢复逐上游证据必须发生在任何一拍探测之前：探测按表里的窗口决定谁该被试，
     // 表是空的时候每一条上游都算"没有记录"，锁存态下一轮就会把池内全部上游各试
@@ -18047,6 +18050,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let identity = "cogneva/test";
         let headers = identity_default_headers(identity);
         AppState {
+            body_store: None,
             provider_compat: Some(std::sync::Arc::new(StubCompatImages)),
             client: reqwest::Client::builder()
                 .default_headers(headers.clone())
