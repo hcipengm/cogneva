@@ -459,7 +459,6 @@
   "supervisor": {
     "control_plane_url": null
   },
-  "hook_engine": {},
   "boundary": {
     "rules": [
       {

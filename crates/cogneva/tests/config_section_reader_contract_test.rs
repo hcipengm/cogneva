@@ -65,12 +65,24 @@ fn every_classified_section_has_a_reader() {
     declared.sort();
     let mut classified = classified_sections();
     classified.sort();
-    assert_eq!(
-        classified, declared,
-        "the sections the document is classified into and the sections this gate \
-         knows a reader for disagree: a section listed here with no reader is \
-         written by every deployment and read by nothing"
+    let unread: Vec<&String> = classified
+        .iter()
+        .filter(|section| !declared.contains(section))
+        .collect();
+    assert!(
+        unread.is_empty(),
+        "these sections are classified for the delivered document and have no reader: \
+         written into every deployment, read by nothing. The missing piece is a reader in \
+         `common::config_surface`: {unread:?}"
     );
+    // The other direction is a superset, not equality. A reader may cover a
+    // section no document carries: the process reads it from code defaults, and
+    // an env map can still land on a leaf inside it. Such a section needs no
+    // reload disposition (nothing in the file can change it), but it still
+    // needs a reader — otherwise its knobs drop out of the census that every
+    // knob is named by a document. `hook_engine` is that section: it used to
+    // appear in the census held up by an empty object in the document, and
+    // deleting the object took it off the books.
 
     // A reader that claims no source spelling has to be a field of the struct
     // the process loads, or the claim stands on nothing.
