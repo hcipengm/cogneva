@@ -1096,4 +1096,106 @@ mod tests {
         assert!(objects.get("files/abc").await.unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// 会说分块上传那套协议的替身：initiate 给一个 UploadId，每段 PUT 收下正文，
+    /// complete 收 XML。断言用它的记录，不用真 S3——**签名仍然是真算的**，因为门
+    /// 走的是 `S3ObjectBackend` 自己的签名路径，只是请求不真的出去。
+    #[derive(Default, Debug)]
+    struct MultipartHttp {
+        parts: Mutex<Vec<(String, Vec<u8>)>>,
+        completed: Mutex<Option<String>>,
+        aborted: Mutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for MultipartHttp {
+        async fn execute(&self, req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            let method = req.method.to_uppercase();
+            if method == "POST" && req.url.contains("uploads") {
+                return Ok(cog_core::HttpResponse {
+                    status: 200,
+                    headers: std::collections::HashMap::new(),
+                    body: b"<InitiateMultipartUploadResult><UploadId>UPLOAD-1</UploadId></InitiateMultipartUploadResult>".to_vec(),
+                });
+            }
+            if method == "PUT" {
+                self.parts
+                    .lock()
+                    .unwrap()
+                    .push((req.url.clone(), req.body.clone().unwrap_or_default()));
+                return Ok(cog_core::HttpResponse {
+                    status: 200,
+                    headers: std::collections::HashMap::from([(
+                        "ETag".to_string(),
+                        "\"etag\"".to_string(),
+                    )]),
+                    body: Vec::new(),
+                });
+            }
+            if method == "POST" && req.url.contains("uploadId") {
+                *self.completed.lock().unwrap() =
+                    Some(String::from_utf8_lossy(&req.body.unwrap_or_default()).into_owned());
+                return Ok(cog_core::HttpResponse {
+                    status: 200,
+                    headers: std::collections::HashMap::new(),
+                    body: Vec::new(),
+                });
+            }
+            if method == "DELETE" {
+                *self.aborted.lock().unwrap() = true;
+                return Ok(cog_core::HttpResponse {
+                    status: 204,
+                    headers: std::collections::HashMap::new(),
+                    body: Vec::new(),
+                });
+            }
+            Ok(cog_core::HttpResponse {
+                status: 404,
+                headers: std::collections::HashMap::new(),
+                body: Vec::new(),
+            })
+        }
+    }
+
+    /// 分块写进去的对象，等于把那些块逐字节拼起来；每一段都真的发出去了。
+    ///
+    /// 这是 S50 那条判据的直接答案：「签名与校验在测试里真的跑过一次」——签名走的是
+    /// 后端自己的 `sign_request`，替身只收请求，不代替签名。
+    #[tokio::test]
+    async fn a_multipart_upload_sends_parts_that_concatenate_to_the_object() {
+        let http = Arc::new(MultipartHttp::default());
+        let backend = S3ObjectBackend::new("http://s3:9000", "us-east-1", "b", "ak", "sk")
+            .with_client(http.clone());
+        let mut writer = backend.open_write("big.bin").await.expect("initiate");
+
+        let chunk = vec![7u8; 1024 * 1024];
+        for _ in 0..3 {
+            writer.write(&chunk).await.expect("write a chunk");
+        }
+        writer.finish().await.expect("complete");
+
+        let parts = http.parts.lock().unwrap().clone();
+        assert!(!parts.is_empty(), "一段都没有发出去");
+        let joined: Vec<u8> = parts.iter().flat_map(|(_, body)| body.clone()).collect();
+        assert_eq!(joined.len(), 3 * 1024 * 1024, "发出去的字节总数不对");
+        assert!(joined.iter().all(|b| *b == 7), "内容与写进去的不是同一份");
+        let xml = http
+            .completed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("没有发 complete");
+        assert!(xml.contains("CompleteMultipartUpload"), "{xml}");
+    }
+
+    /// 放弃的那一段要发 DELETE：不发的话 S3 上留着一个永远不被清理的上传。
+    #[tokio::test]
+    async fn aborting_a_multipart_upload_deletes_it() {
+        let http = Arc::new(MultipartHttp::default());
+        let backend = S3ObjectBackend::new("http://s3:9000", "us-east-1", "b", "ak", "sk")
+            .with_client(http.clone());
+        let mut writer = backend.open_write("half.bin").await.expect("initiate");
+        writer.write(b"half").await.expect("write");
+        writer.abort().await.expect("abort");
+        assert!(*http.aborted.lock().unwrap(), "放弃之后没有发 DELETE");
+    }
 }
