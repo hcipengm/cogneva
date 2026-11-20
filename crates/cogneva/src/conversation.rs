@@ -1095,6 +1095,7 @@ impl ConversationTurn for PlatformConversation {
                     roster: self.roster.clone(),
                     owner: request.owner.clone(),
                     session: request.session_id.clone(),
+                    files_seen: None,
                 },
             ));
             let capabilities = tools.names();

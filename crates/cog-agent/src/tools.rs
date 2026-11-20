@@ -4368,6 +4368,9 @@ pub mod builtins {
         pub owner: String,
         /// 这一段会话的号：子任务的花销按它折叠进会话合计。
         pub session: String,
+        /// 按 `unit_of_work` 取「看过哪些文件」的读口。`None` 时不报清单——
+        /// 不报与报空在读数上要分得开，所以交回值里那一格是 `null` 而不是 `[]`。
+        pub files_seen: Option<Arc<dyn crate::subagent_files::FilesSeen>>,
     }
 
     /// 一个独立上下文的子任务：把一句话交给一条新的循环，拿回它的最终产出。
@@ -4419,6 +4422,7 @@ pub mod builtins {
                 let roster = wiring.roster.clone();
                 let owner = wiring.owner.clone();
                 let session = wiring.session.clone();
+                let files_seen = wiring.files_seen.clone();
                 let mode = wiring.mode;
                 Box::pin(async move {
                     let task = args
@@ -4451,7 +4455,17 @@ pub mod builtins {
                     // 权限跟父这一轮同一个判定者、同一个模式：子任务动手之前问的
                     // 是同一个人、同一段对话的规则。父子不共享的是上下文，不是
                     // 谁有权点头——那两份分开，等于用一次分解绕开了人的决定。
-                    let mut child = crate::AgentRuntime::new(template.clone(), events)
+                    // 子任务有自己的一趟工作身份：文件清单按它取。多个子任务共用一个
+                    // 身份会把彼此的清单混在一起，而那是「谁看过什么」最不该含糊的一格。
+                    // 身份在建循环之前定：工具调用写事件时用的就是这个 agent_id。
+                    let unit = format!(
+                        "{}-sub-{}",
+                        template.agent_id,
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    );
+                    let mut child_template = template.clone();
+                    child_template.agent_id = unit.clone();
+                    let mut child = crate::AgentRuntime::new(child_template, events)
                         .with_tools(tools.fork())
                         .with_permissions(decider, mode)
                         // 这一发的钱记在同一段会话名下：会话合计是按这一列折叠出来
@@ -4473,9 +4487,27 @@ pub mod builtins {
                     // 子任务的交付物与父的一轮同形：`reply` 是它说出口的那一句。
                     // 拿不到 `reply` 时整份交回去——一个有结构的答案比丢掉它好。
                     let answer = value.get("reply").cloned().unwrap_or_else(|| value.clone());
+                    // 「看过哪些文件」从子任务自己的 tool_call 事实里取；没接读口时是
+                    // `null` 而不是 `[]`——「这个部署没接读口」与「这一趟没看过文件」
+                    // 是两件事，用 `[]` 写前者会让后者永远读成零。
+                    let files = match files_seen.as_ref() {
+                        Some(port) => match port.files_for(&unit).await {
+                            Ok(list) => serde_json::json!(list),
+                            Err(e) => {
+                                tracing::warn!(
+                                    unit = %unit,
+                                    error = %e,
+                                    "子任务看过哪些文件读不出来；交回值里这一格留空"
+                                );
+                                serde_json::Value::Null
+                            }
+                        },
+                        None => serde_json::Value::Null,
+                    };
                     Ok(serde_json::json!({
                         "subagent": true,
                         "result": answer,
+                        "files": files,
                         "usage": value.get("usage").cloned().unwrap_or(serde_json::Value::Null),
                     }))
                 })
@@ -6193,6 +6225,7 @@ pub mod builtins {
                     roster: None,
                     owner: "alice".into(),
                     session: "session-42".into(),
+                    files_seen: None,
                 }),
             );
             assert!(
@@ -6248,6 +6281,7 @@ pub mod builtins {
                 roster: None,
                 owner: String::new(),
                 session: "session-42".into(),
+                files_seen: None,
             });
             let ToolImplementation::Native(run) = &tool.implementation else {
                 panic!("spawn_subagent is native");

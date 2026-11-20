@@ -16,6 +16,7 @@ pub mod permission;
 pub mod pool_sizing;
 pub mod principles;
 pub mod runtime;
+pub mod subagent_files;
 pub mod tools;
 pub mod wal;
 pub mod web;
