@@ -121,29 +121,31 @@ author="$(ident_name GIT_AUTHOR_IDENT)"
 committer="$(ident_name GIT_COMMITTER_IDENT)"
 [ -n "$author" ] || not_judged "读不出 GIT_AUTHOR_IDENT"
 
-# 署谁的名字，看这是谁在提交（属主 2026-11-08）：本机上由人驱动、`kind` 记作
-# `interactive` 的 Claude Code 会话，署它自己的账号 `hcipengm`；cogneva 平台自己拉起
-# 的数字员工会话，署会话记录里的员工名。两种都不是的（部署器、定时脚本）根本没有
-# 会话记录，前面已经走「不适用」那一支。
+# 该署谁的名字，是一件**配置事实**，不是这个脚本的知识。
 #
-# 为什么名字不直接取会话记录的 `name`：宿主给交互会话分配的名字（`cogneva-b6` 这类）
-# 与平台员工同名同形，署上去之后历史里看不出这一笔是人让 Claude Code 做的，还是平台
-# 自己做的——2026-11-08 属主点名要这两种分开。
+# 2026-11-20 之前这里写死过一个具体账号：`interactive` 会话署那个账号，其余署会话记录
+# 里的员工名。那是把「这台机器的部署事实」钉进了随代码走的脚本——换一个属主、换一个
+# 账号，这个常量就是错的，而它错的方式是**每一笔提交都按一个不存在的身份判**。
 #
-# 数字员工的写法里有 `#`（`Luna#1822ab0e`）。名字带 `#` 的一律按员工判，不管记录写着
-# 什么 kind：cogneva 自己发布的提交必须署那个员工名，这是属主同一句话的后半截。
+# 现在两种来源都来自外面：
+#   * `COGNEVA_AGENT_NAME`——拉起这个进程的那一侧交进来的名字；
+#   * 会话记录里的 `name`——Claude Code 那一侧的写法，同样由宿主写。
+# 脚本只回答一个问题：**这一笔署的名，和你交进来的那个是不是同一个**。
+#
+# 会话记录里还留着 `kind` 与「名字带 `#`」两条线索，它们只用来把「这一笔是谁」说清楚
+# （判词里那一行），不再决定该署什么名字。
 kind=""
 [ -n "$record" ] &&
     kind="$(sed -n 's/.*"kind":"\([^"]*\)".*/\1/p' "$record" | head -1)"
-if [ "$kind" = interactive ] && [ "${employee#*#}" = "$employee" ]; then
-    expected="hcipengm"
-    email="hcipengm@users.noreply.github.com"
-    signer="Claude Code 会话（属主 2026-11-08：以 hcipengm 署名）"
-else
-    expected="$employee"
-    email="$(printf '%s' "$employee" | tr '[:upper:]' '[:lower:]' | tr -d '#')@cogneva.ai"
+if [ -n "${COGNEVA_AGENT_NAME:-}" ]; then
+    signer="显式交进来的身份（COGNEVA_AGENT_NAME）"
+elif [ "${employee#*#}" != "$employee" ]; then
     signer="本会话的数字员工"
+else
+    signer="本会话声明的署名"
 fi
+expected="$employee"
+email="$(printf '%s' "$employee" | tr '[:upper:]' '[:lower:]' | tr -d '#')@cogneva.ai"
 
 if [ "$author" = "$expected" ] && [ "$committer" = "$expected" ]; then
     exit 0
@@ -154,7 +156,7 @@ printf '作者署名: 这一笔会署成「%s」/「%s」，而%s应该署「%s�
 cat >&2 <<EOF
 
 属主 2026-11-07：提交署提交者自己的名字，不署共享 config 里那个。
-属主 2026-11-08：Claude Code 署 hcipengm，cogneva 的数字员工署各自的员工名。
+要署的名字由拉起这个进程的那一侧给（环境变量 COGNEVA_AGENT_NAME，或会话记录里的 name），这门只判「署的」与「给的」是不是同一个。
 这一笔该署「$expected」，依据是：${record:+会话记录 $record（pid $pid，sessionId $sid，kind ${kind:-（无）}）}${record:-显式环境变量 COGNEVA_AGENT_NAME（平台智能体没有会话记录）}
 
 工作树归你一个人用时，一次设好（只改这棵工作树，不动共享 config）：
