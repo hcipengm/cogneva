@@ -120,7 +120,7 @@ pub use migrate::{
     MigrationStatus, Migrator,
 };
 
-pub use checkpoint_cap::{CheckpointCap, CheckpointSweepOutcome};
+pub use checkpoint_cap::{CheckpointCap, CheckpointReading};
 pub use dlq::MemoryDeadLetterQueue;
 pub use metrics_retirement::{
     MetricsRetirement, RetirementOutcome, RetirementPass, ROSTERED_LABEL_SERIES, ROSTER_FRESH_SECS,

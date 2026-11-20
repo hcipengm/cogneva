@@ -4385,14 +4385,15 @@ rows:
   - key: checkpointStore.maxRows
     source: derived
     why: >-
-      Rows the checkpoint store may hold. The sweep measures the table's held
-      rows and bytes on every pass and divides the table's share of the declared
-      database volume by the measured bytes per row; a wider snapshot buys fewer
-      rows, a larger declared volume buys more, and both follow the next pass
-      without a restart. The declared forty thousand is the seed while the table
-      is empty or the volume is not declared. The published target carries
+      Rows the checkpoint store is DECLARED to hold. Nothing deletes past it:
+      the loop measures held rows, bytes and this target every pass and
+      publishes whether the first exceeds them. The target itself is divided out
+      of the declared database volume by the measured bytes per row; a wider
+      snapshot buys fewer rows, a larger declared volume buys more, and both
+      follow the next pass without a restart. The declared forty thousand is the
+      seed while the volume is not declared. The published target carries
       `source`, and the evaluations counter is what separates "nothing to do"
-      from "the sweep stopped".
+      from "the loop stopped".
     published:
       owner: crates/cog-storage/src/checkpoint_cap.rs
       file: crates/cog-core/src/retention.rs

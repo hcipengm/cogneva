@@ -818,26 +818,28 @@ observability:
     # proof: file=crates/cog-storage/src/observability_event_cap.rs test=the_read_window_follows_the_longest_question_asked beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
     readWindowSeconds: 86400
 
-# 续跑点存储（cog_snapshots）的容量与读窗口。每轮巡检写一份新快照、把任务板指过去，
-# 然后才删被替下的那份——任务板因此是指针的唯一权威，其余都是残物。任务结束后最后
-# 一份没人删（任务板从不退役），于是这张表是「活着的续跑点 ＋ 每个跑完过的任务的最后
-# 一份」。2026-10-27 实测：54452 行 / 924 MB，其中 39610 行（约 580 MB）没有任何任务板
-# 指着，且每一行都进夜间备份、也都在恢复演练要装回去的库里。清理的两条地板都不是旋钮：
-# 任务板指着的那份是续跑点，读窗口内的是快照视图的承诺，任何一条被越过，一个能答的
-# 查询就会静默缺一段。两条地板合起来超过容量时，清理停手并把
-# cogneva_checkpoints_over_capacity 置 1——那是「活着的续跑点比容量还多」这个政策问题，
-# 不是清理坏了。maxRows 置 0 = 本部署不清理。
+# 续跑点存储（cog_snapshots）的容量声明。每轮巡检写一份新快照、把任务板指过去，然后才
+# 删被替下的那份——任务板因此是指针的唯一权威，其余都是残物。任务结束后最后一份没人删
+# （任务板从不退役），于是这张表是「活着的续跑点 ＋ 每个跑完过的任务的最后一份」。
+# 2026-10-27 实测：54452 行 / 924 MB，其中 39610 行（约 580 MB）没有任何任务板指着，
+# 且每一行都进夜间备份、也都在恢复演练要装回去的库里。
+#
+# 这条数**不再驱动任何删除**：循环每拍量一次行数、按卷容量与实测每行字节算出「能放多少」、
+# 量字节、判「超没超」，把这四个数发到面板上，一行都不删。为什么——「哪些行是残留」本来
+# 就不是按年龄能回答的（由任务板决定），而删除不可回读：删掉的字节没有任何地方留痕。
+# 更硬的一条：任务板指向的是续跑点，一个根本不删的循环不可能把它弄丢，这比「删除时加一条
+# 地板」强。超了就是超了（cogneva_checkpoints_over_capacity=1），由人决定抬声明、退役
+# 已结束任务的板、还是不再声明容量。
 checkpointStore:
-  # 行数上限的部署声明。2026-10-27 活着的那部分是 14842 行，四万行给它留了翻几倍
-  # 的空间，同时远低于当时表里的 54452 行，所以眼下这个界卡住的是残物。生效值每拍
-  # 按卷容量与实测每行字节重算，这个数在量到之前顶着。
+  # 容量的部署声明（不是删除阈值）。2026-10-27 活着的那部分是 14842 行，四万行给它留了
+  # 翻几倍的空间。读数里的 target 每拍按卷容量与实测每行字节重算，这个数在卷没声明时顶着。
   # tunable: derived
-  # why: Rows the checkpoint store may hold. The sweep measures the table's held rows and bytes on every pass
-  # why: and divides the table's share of the declared database volume by the measured bytes per row; a wider
-  # why: snapshot buys fewer rows, a larger declared volume buys more, and both follow the next pass without
-  # why: a restart. The declared forty thousand is the seed while the table is empty or the volume is not
-  # why: declared. The published target carries `source`, and the evaluations counter is what separates
-  # why: "nothing to do" from "the sweep stopped".
+  # why: Rows the checkpoint store is DECLARED to hold; nothing deletes past it. The loop measures held rows,
+  # why: bytes and this target on every pass and publishes whether the first exceeds them -- the target itself
+  # why: is divided out of the declared database volume by the measured bytes per row, so a larger volume buys
+  # why: more rows and a wider snapshot buys fewer, without a restart. The declared forty thousand is the seed
+  # why: while the volume is not declared. The evaluations counter is what separates "nothing to do" from "the
+  # why: loop stopped", and the verdict is a decision point rather than a fault.
   # published: owner=crates/cog-storage/src/checkpoint_cap.rs file=crates/cog-core/src/retention.rs metric=TARGET_METRIC label=source cadence=periodic
   # proof: file=crates/cog-storage/src/checkpoint_cap.rs test=a_beat_whose_target_does_not_move_still_counts beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
   maxRows: 40000

@@ -1642,12 +1642,12 @@ impl cog_core::SystemPlugin for StoragePlugin {
             }
             let _handle = Arc::new(cap).spawn(shutdown.clone());
             if checkpoint_max_rows == 0 {
-                info!("Checkpoint capacity disabled (max rows = 0)");
+                info!("Checkpoint store: no capacity declared (max rows = 0)");
             } else {
-                info!(checkpoint_max_rows, "Checkpoint capacity started");
+                info!(checkpoint_max_rows, "Checkpoint store measuring started");
             }
         } else {
-            info!("Checkpoint capacity disabled (no PostgreSQL pool)");
+            info!("Checkpoint store measurement disabled (no PostgreSQL pool)");
         }
 
         // ── Per-task event archive measurement ──
