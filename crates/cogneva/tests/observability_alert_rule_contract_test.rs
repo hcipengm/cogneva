@@ -4774,6 +4774,17 @@ const UNREAD: &[(&str, Unread)] = &[
     // the binary never published it. That turns "the gate is idling" and "the
     // reading was never wired" into different pictures, which is what makes the
     // rule authorable the moment the suite lands.
+    // 这条曾经只有一条读者：`task_event_archive_behind` 拿它和数据发布进程说的保留期
+    // 比。那个保留期连同「到点删」一起被拆掉了（读者从偏移零重放一条流，退掉整条流
+    // 会让读回一个形如「这次运行刚开始」的缺口），所以现在没有任何规则作用在它上面。
+    // 它仍然发布、也仍然被画出来：档案有多深是运维要看的读数。要给它一条规则，先说清
+    // 「多深算坏」——在档案不再被退役之后，这个问句没有答案，所以它留在这里当一笔债。
+    (
+        "cogneva_task_events_oldest_age_seconds",
+        Unread::Gap(
+            "the archive is never retired, so there is no retention to compare its depth against; a rule would have to declare what depth is a fault, and with no deletion there is nothing that makes depth wrong. It stays published and drawn for an operator",
+        ),
+    ),
     (
         "cogneva_eval_gate_outcomes_total",
         Unread::Gap(
@@ -5457,7 +5468,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// owners' call. That sentence is why the census has a reader and no rule, and
 /// it is written here rather than in the entry because the entry's whole value
 /// was the reader it named.
-const GAPS_AT_CENSUS: usize = 33;
+const GAPS_AT_CENSUS: usize = 34;
 
 /// How many closed-set series are drawn with nothing acting on them.
 ///

@@ -237,7 +237,6 @@ metric_names! {
     TASK_EVENTS_ROWS => "cogneva_task_events_rows",
     TASK_EVENTS_TASKS => "cogneva_task_events_tasks",
     TASK_EVENTS_OLDEST_AGE_SECONDS => "cogneva_task_events_oldest_age_seconds",
-    TASK_EVENTS_KEEP_SECONDS => "cogneva_task_events_keep_seconds",
     TASK_EVENTS_SWEEP_FAILED => "cogneva_task_events_sweep_failed",
 
     // cog-observability — the prompt-and-response archive's retention.

@@ -1659,44 +1659,25 @@ impl cog_core::SystemPlugin for StoragePlugin {
             info!("Checkpoint capacity disabled (no PostgreSQL pool)");
         }
 
-        // ── Per-task event archive retention ──
+        // ── Per-task event archive measurement ──
         // `cog_events` files each iteration of a task's agent loop so a run that
-        // did not converge can be read back afterwards, and nothing has ever
-        // removed a row from it: 130,871 rows over 211 MB on 2026-10-27, all of
-        // it in the nightly backup whose restore the drill has to finish inside
-        // a budget.
-        //
-        // The unit of retirement is the whole stream, not the row. Both readers
-        // replay a task's events from offset zero, so a deleted prefix would
-        // answer a well-formed read with a gap that looks exactly like the start
-        // of the run. A stream a checkpoint names is the resume point and is not
-        // deletable at all, for the same reason a board-pointed snapshot is not.
-        let task_event_keep_days = crate::task_event_retention::keep_days_from_env();
+        // did not converge can be read back afterwards. Nothing removes rows
+        // from it: both readers replay a task's events from offset zero, so a
+        // deleted prefix answers a well-formed read with a gap that looks
+        // exactly like the start of the run. The loop publishes how many rows,
+        // how many streams, and how far back the archive reaches; what to do
+        // about its growth is a decision against those readings.
         if let Some(pool) = self.pg_pool.clone() {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
-            let keep = task_event_keep_days
-                .map(|days| std::time::Duration::from_secs(days as u64 * 86_400));
-            let mut sweep = crate::TaskEventRetention::new(pool, keep)
-                .with_database_volume(database_volume)
-                .with_readings(retention_readings.clone())
-                .with_deployment(deployment_name());
+            let mut sweep = crate::TaskEventRetention::new(pool).with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 sweep = sweep.with_metrics(mb);
             }
-            if let Some(broker) = lease_broker.clone() {
-                sweep = sweep.with_role(broker);
-            }
             let _handle = Arc::new(sweep).spawn(shutdown.clone());
-            match task_event_keep_days {
-                Some(days) => info!(keep_days = days, "Task event retention started"),
-                None => info!(
-                    "Task event retention disabled for this deployment (keep days = 0); \
-                     it still publishes what the archive holds"
-                ),
-            }
+            info!("Task event archive measurement started");
         } else {
             info!("Task event retention disabled (no PostgreSQL pool)");
         }

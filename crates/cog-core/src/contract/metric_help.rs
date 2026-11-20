@@ -1877,15 +1877,6 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          archive actually reaches",
     ),
     (
-        "cogneva_task_events_keep_seconds",
-        "The retention the publishing process enforces on the per-task event \
-         archive, in seconds. Published beside the oldest row's age so the rule \
-         compares two readings rather than a constant written into the rules \
-         file. Absent from a deployment that retires nothing: every deployment \
-         sharing the database writes this gauge, and a zero would make the \
-         comparison a verdict about a policy that deployment does not have",
-    ),
-    (
         "cogneva_task_events_sweep_failed",
         "Whether the last task-event retention pass could not be completed, 1 \
          or 0. The row count, the stream count, the oldest age and the retention \

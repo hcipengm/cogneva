@@ -772,7 +772,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ),
     ("crates/cog-storage/src/postgres/resource_event_store.rs", 3),
     ("crates/cog-storage/src/schema_ddl.rs", 4),
-    ("crates/cog-storage/src/task_event_retention.rs", 4),
+    ("crates/cog-storage/src/task_event_retention.rs", 1),
     ("crates/cog-storage/src/wal/mod.rs", 3),
     ("crates/cog-stream/src/redis.rs", 2),
     ("crates/cog-supervisor/src/alert_store.rs", 1),

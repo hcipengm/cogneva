@@ -601,11 +601,14 @@ pub const EVENT_BUS_HANDOFFS: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-supervisor/src/consumer_lag.rs",
 };
 
-/// Rows and tasks the event store is holding.
+/// Rows, streams and the age of the oldest row in the event store.
 ///
-/// The event board reads the last day from this table, and its retention is a
-/// row count: a store that stops being trimmed shows up here first, as a row
-/// count that keeps climbing while every board it feeds still looks normal.
+/// Nothing retires this table any more: a stream is replayed from offset zero by
+/// both readers, so a retired one answers with a gap that looks like the start of
+/// the run. Growth is therefore a reading rather than a policy, and this is where
+/// it is read — rows, distinct streams, and how far back the oldest row reaches.
+/// A store whose growth changed shape shows up here first, as an age that stops
+/// moving while the row count keeps climbing.
 pub const TASK_EVENT_STORE: ReadingSpec = ReadingSpec {
     id: "task_event_store_rows",
     title: "事件表的行数",
@@ -616,6 +619,28 @@ pub const TASK_EVENT_STORE: ReadingSpec = ReadingSpec {
     crit: None,
     higher_is_worse: true,
     series: "cogneva_task_events_rows / cogneva_task_events_tasks",
+    produced_by: "crates/cog-storage/src/task_event_retention.rs",
+};
+
+/// How far back the event archive reaches.
+///
+/// The archive is never retired (a stream replayed from offset zero would answer
+/// with a gap shaped like the start of the run), so its depth is a reading rather
+/// than a policy: an age that keeps climbing says the archive is growing, an age
+/// that stops moving while the row count climbs says the oldest stream is being
+/// appended to and nothing new is starting. Without this panel the depth would
+/// have no reader at all, and a growing archive would only be visible as a disk
+/// number nobody attributes.
+pub const TASK_EVENT_ARCHIVE_AGE: ReadingSpec = ReadingSpec {
+    id: "task_event_archive_age_seconds",
+    title: "事件档案有多深",
+    group: ReadingGroup::Infra,
+    query: "max(cogneva_task_events_oldest_age_seconds)",
+    unit: "秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_task_events_oldest_age_seconds",
     produced_by: "crates/cog-storage/src/task_event_retention.rs",
 };
 
@@ -1276,7 +1301,7 @@ pub const BUILD_GATE_WAIT_MAX: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-core/src/contract/build_gate.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 62] = [
+pub const READINGS: [&ReadingSpec; 63] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -1304,6 +1329,7 @@ pub const READINGS: [&ReadingSpec; 62] = [
     &SHUTDOWN_DRAIN_DURATION,
     &EVENT_BUS_HANDOFFS,
     &TASK_EVENT_STORE,
+    &TASK_EVENT_ARCHIVE_AGE,
     &VERSION_LAG,
     &HTTP_LATENCY,
     &LLM_EXCHANGE_VOLUME,

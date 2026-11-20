@@ -855,7 +855,7 @@ mod readings {
     async fn each_knob_keeps_its_own_reading() {
         let readings = RetentionReadings::new();
         readings.evaluate("checkpointStore.maxRows", 10.0, UNIT_ROWS, true);
-        readings.evaluate("taskEventRetention.keepDays", 30.0, UNIT_DAYS, true);
+        readings.evaluate("llmExchangeRetention.keepDays", 30.0, UNIT_DAYS, true);
         let series = readings.collect_metrics("").await.expect("collect");
         let targets: Vec<_> = series.iter().filter(|m| m.name == TARGET_METRIC).collect();
         assert_eq!(targets.len(), 2);

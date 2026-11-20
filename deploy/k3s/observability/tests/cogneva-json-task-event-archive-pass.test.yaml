@@ -1,0 +1,61 @@
+# 任务事件档案「这一趟没跑完」那条规则的单测夹具。
+#
+# 档案不再按时间退役（读者从偏移零重放一条流，退掉整条流会让读回一个形如「这次运行
+# 刚开始」的缺口），所以它的「超龄」那条规则连同夹具一起撤了。留下的这一条判的不是
+# 深度，是**测量本身有没有跑完**：循环每拍都写一次结果，写不出来时这一格是 1，而
+# 「这一趟没跑完」与「这一趟跑完了、只是档案没变」在读数上必须分得开。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-task-event-archive-pass.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: task_event_archive_pass_failed
+
+evaluation_interval: 1m
+
+tests:
+  # 每一趟都跑完：静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_events_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'cogneva_task_events_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: task_event_archive_pass_failed
+        exp_alerts: []
+
+  # 20 分钟处有一趟没跑完：40 分钟处仍在 30 分钟窗内，响；60 分钟处出了窗，静。
+  # 同一个输入两个时刻，证明窗口真的在滚，而不是把某一次失败永久记住。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_events_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '_x20 1x1 0x39'
+      - series: 'cogneva_task_events_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: task_event_archive_pass_failed
+        exp_alerts:
+          - exp_labels:
+              deployment: cogneva
+              severity: warning
+      - eval_time: 60m
+        alertname: task_event_archive_pass_failed
+        exp_alerts: []
+
+  # 读数冻结（时间戳钉在 0）：pass 的那一格说什么都不能算数——一条冻结的读数与
+  # 一条健康的读数在「最近有没有写」上是同一句话，新鲜度腿就是用来分开它们的。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_events_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1x60'
+      - series: 'cogneva_task_events_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: task_event_archive_pass_failed
+        exp_alerts: []

@@ -53,12 +53,6 @@ const WRAPPERS: &[(&str, &str)] = &[
 /// 一个文件要是有两个只增不减的旋钮，就登记两行。
 const KNOBS: &[(&str, &str, &str)] = &[
     (
-        "crates/cog-storage/src/task_event_retention.rs",
-        DISABLE,
-        "读者从偏移零回放整条流，退休掉前缀就答成一个看起来像「这次运行刚开始」的缺口，\
-         所以 0 必须能明说「不扫」，而不是被读成一个极小的天数",
-    ),
-    (
         "crates/cog-observability/src/exchange_retention.rs",
         FALL_BACK,
         "零天保留每一趟都把归档清空，而一张被清空的表与一张保留策略正常工作的表在读数上\
