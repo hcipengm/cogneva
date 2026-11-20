@@ -352,10 +352,15 @@ impl ExchangeRetention {
         if request_raw.is_none() && response_raw.is_none() {
             return Some(false);
         }
+        // 副本要**读得回来**才叫搬走了。`exists` 只回答「这个名字在」，而一个截断的
+        // 对象、一个写入只落了头的对象都「在」——把它们当成已归档，删掉的那一行就没有
+        // 第二份了。`get` 一直读到尾，读得回来才算数；空对象也不算：一段非空的正文
+        // 归档成零字节，那份副本说不清任何事。读失败（`Err`）与读不到是两件事，前者是
+        // 不知道，所以返回 `None` 让这一行留着。
         for key in [request_raw, response_raw].into_iter().flatten() {
-            match archive.exists(key).await {
-                Ok(true) => {}
-                Ok(false) => return Some(false),
+            match archive.get(key).await {
+                Ok(Some(bytes)) if !bytes.is_empty() => {}
+                Ok(_) => return Some(false),
                 Err(_) => return None,
             }
         }

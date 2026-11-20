@@ -137,6 +137,48 @@ async fn without_an_archive_a_pass_retires_nothing() {
 }
 
 /// 归档里有这几行的副本时，这一遍才删它们。
+/// 副本「在」不等于「读得回来」：一个空对象不算归档，那一行留着。
+///
+/// 这是「搬走并**校验**才删」里「校验」那两个字：`exists` 只回答名字在不在，
+/// 一个截断的、只落了头的对象也是「在」。读回零字节的副本与没有副本，对读者是同一件事。
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_copy_that_reads_back_empty_does_not_count_as_archived() {
+    use cog_core::ObjectBackend;
+    let url = cog_test_support::database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("database must be reachable");
+    let scratch = Scratch::new(pool.clone()).await;
+    let table = format!("\"{}\".gateway_llm_exchange", scratch.schema);
+
+    let archive: Arc<dyn ObjectBackend> = Arc::new(cog_test_support::MemoryObjectBackend::new());
+    archive
+        .put("bodies/empty", b"")
+        .await
+        .expect("seed an empty object");
+    sqlx::query(&format!(
+        "INSERT INTO {table} (ts, request_raw, response_raw) VALUES
+             (NOW() - interval '30 days', 'bodies/empty', NULL)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("fill one expired row");
+
+    let outcome = scratch
+        .cap(Duration::from_secs(86_400))
+        .with_archive(archive)
+        .retire_once(|| {})
+        .await
+        .expect("sweep");
+
+    assert_eq!(
+        outcome.removed, 0,
+        "an object that exists but reads back empty was taken as an archived copy"
+    );
+    assert_eq!(outcome.kept_unarchived, 1);
+}
+
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn rows_whose_copies_are_archived_are_the_only_ones_retired() {
