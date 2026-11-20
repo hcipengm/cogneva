@@ -63,13 +63,6 @@ async fn insert_aged(pool: &PgPool, table: &str, rows: i64, age: &str) {
     .unwrap();
 }
 
-async fn count_all(pool: &PgPool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-        .fetch_one(pool)
-        .await
-        .unwrap()
-}
-
 fn log(pool: PgPool, table: &str, budget: u64) -> MetricsSampleLog {
     MetricsSampleLog::new(pool, budget).with_table(table)
 }
@@ -134,7 +127,7 @@ async fn a_log_past_its_capacity_reads_over_and_keeps_its_rows() {
         "40 rows against a declared 10: {reading:?}"
     );
     assert_eq!(
-        count_all(&pool, table).await,
+        common::count(&pool, table).await,
         40,
         "the pass deleted rows it was only supposed to count"
     );
