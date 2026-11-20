@@ -1181,11 +1181,48 @@ export interface AgentSummary {
   platform?: string | null;
   /** 同一台设备的同一个客户端，同样来自握手。 */
   device_id?: string | null;
+  /**
+   * 这一行背后站着的那个人。`null` 是读数，不是缺字段：它说的正是「这个座位
+   * 背后还没有人」——任务一多，座位能长到几百行，而人没变。
+   */
+  person_id?: string | null;
+}
+
+/** 名册按人收好后的一行：一个人一行，当前戴着的帽子挂在 `agent_ids` 里。 */
+export interface PersonSummary {
+  person_id: string | null;
+  /** 人那一行是「工号 姓名」；没派人的座位那组是「座位，尚未分配给人」。 */
+  display_name: string;
+  number?: string | null;
+  live: boolean;
+  retired: boolean;
+  roles: string[];
+  /** 这个人的帽子，也就是可寻址的 agent id。别丢——丢了这个人在对话页就点不到。 */
+  agent_ids: string[];
+  caps: number;
+}
+
+export interface AgentRosterPage {
+  agents: AgentSummary[];
+  /**
+   * 按人收好的名册。空 `person_id` 的那一行收着全部没派给人的座位，一次只出现
+   * 一行；名册读不到时服务端不编这一份，界面要能说出「没读到」。
+   */
+  people?: PersonSummary[] | null;
+  /**
+   * 读数：还有多少座位背后没有人。`null` 是「名册没读到」，`0` 是「量过了，
+   * 一个都没有」——两种答案不能画成同一个数。
+   */
+  seats_without_a_person?: number | null;
+}
+
+export async function getAgentRoster(): Promise<AgentRosterPage> {
+  const page = await api.get<AgentRosterPage>('/api/v1/agents');
+  return { ...page, agents: page.agents ?? [] };
 }
 
 export async function listAgents(): Promise<AgentSummary[]> {
-  const page = await api.get<{ agents: AgentSummary[] }>('/api/v1/agents');
-  return page.agents ?? [];
+  return (await getAgentRoster()).agents;
 }
 
 /**

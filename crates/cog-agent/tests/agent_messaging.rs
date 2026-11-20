@@ -197,6 +197,7 @@ impl AgentRegistry for Roster {
                 first_seen: now,
                 last_seen: now,
                 retired_at: None,
+                person_id: cog_core::person_id_for(id).map(str::to_string),
             })
             .collect())
     }

@@ -4797,6 +4797,7 @@ mod tests {
                 first_seen: now,
                 last_seen: now,
                 retired_at: None,
+                person_id: cog_core::person_id_for(agent_id).map(str::to_string),
             }))
         }
     }

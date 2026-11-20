@@ -578,6 +578,22 @@ mod tests {
         );
     }
 
+    /// 一个人接两条任务：账上两行，按人汇总是一格两件。
+    ///
+    /// R17 阶段 0 的判据要的是「两条任务行 `owner_unit` 同一人」——按人汇总
+    /// 时，同一个人手上的活不能因为挂在两件活上就被拆成两个人。
+    #[test]
+    fn two_tasks_held_by_one_person_are_counted_under_that_person() {
+        let now = Utc::now();
+        let mut a = row("a", TaskStatus::Running, 20);
+        a.owner_unit = Some("employee:1".into());
+        let mut b = row("b", TaskStatus::Running, 10);
+        b.owner_unit = Some("employee:1".into());
+        let reading = read_task_ledger(&[a, b], now, &LedgerQuery::default());
+        assert_eq!(reading.by_owner.get("employee:1"), Some(&2));
+        assert_eq!(reading.by_owner.len(), 1, "同一个人不该在账上被拆成两行");
+    }
+
     /// 空白场地不是场地：与场地那一面同一条判据，否则「没填」会被读成一个叫
     /// 空字符串的场地。
     #[test]

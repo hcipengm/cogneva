@@ -475,12 +475,32 @@ pub struct EmployeeRecord {
     /// 同一个形状。
     #[serde(default)]
     pub retired_at: Option<DateTime<Utc>>,
+    /// 这一行背后站着的那个人。空是读数：它说的正是「这个座位背后还没有人」。
+    ///
+    /// 人形 id（安装期定下的名字、`employee:<建号>`）背后的人是它自己；座位形
+    /// id（`squad:<任务>-<座位>`）背后的人只有在派活那一刻才存在，形状答不出来
+    /// ——所以这一格是写下来的，不是每次读的时候算出来的。缺省是 `None`：
+    /// 这一格是后加的，早于这列的名册行里没有它。
+    #[serde(default)]
+    pub person_id: Option<String>,
 }
 
 impl EmployeeRecord {
     /// 这个人现在还算不算在职。
     pub fn is_active(&self) -> bool {
         self.retired_at.is_none()
+    }
+
+    /// 这一行背后的人：写下来的那一个优先，没写就按 id 的形状答。
+    ///
+    /// 座位行写下来的那一格才是唯一答案——它在派活那一刻才存在，形状答不出来。
+    /// 人形行的答案只能是它自己，而这一列又比这类行年轻，所以早于它的人形行
+    /// 不必等下一次注册才读得对：形状在这里能唯一答出来。两者之差是一个
+    /// 读数，不是一个错误。
+    pub fn person(&self) -> Option<&str> {
+        self.person_id
+            .as_deref()
+            .or_else(|| crate::types::agent_state::person_id_for(&self.agent_id))
     }
 
     /// 名册、对话、日志里显示的那一行：`E0412 林清和`。

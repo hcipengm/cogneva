@@ -140,9 +140,16 @@ impl RedisAgentRegistry {
 
     /// 名册上记一笔：这个人此刻在。建行只写一次 `first_seen`。
     ///
-    /// 三个事实在一段脚本里合成一次写：是不是第一次见（决定 `first_seen`）、
-    /// 现在的用途标签、以及「上一次服役留下的墓碑要擦掉」。分成三条命令的
-    /// 话，中间那一刻读名册的人会看到一个既退役又在心跳的人。
+    /// 四个事实在一段脚本里合成一次写：是不是第一次见（决定 `first_seen`）、
+    /// 现在的用途标签、「上一次服役留下的墓碑要擦掉」，以及这一行背后站着谁。
+    /// 分成三条命令的话，中间那一刻读名册的人会看到一个既退役又在心跳的人。
+    ///
+    /// 「背后站着谁」只有人形 id 写得出来，而这件事由 Rust 那一侧按名字的形状
+    /// 判（[`cog_core::person_id_for`]），脚本只写它被告知的值，不在脚本里再拼
+    /// 一遍前缀——两侧各拼一次时改名只会改一侧，脚本会安静地把所有座位都写成
+    /// 一个人。座位形 id 传进来的是空串，脚本遇到空串**不写**这一格：座位背后
+    /// 的人要到派活那一刻才存在，在此之前空着就是读数；而写上之后，这条路径
+    /// 也不能把它擦掉——座位重新注册时把已派的人抹了，人就从名册上消失了。
     async fn touch_employee(&self, registration: &AgentRegistration) {
         let mut conn = self.connection.clone();
         let now = Utc::now().to_rfc3339();
@@ -159,6 +166,7 @@ impl RedisAgentRegistry {
              end \
              row.agent_id = ARGV[1] \
              row.role = ARGV[3] \
+             if ARGV[4] ~= '' then row.person_id = ARGV[4] end \
              row.last_seen = ARGV[2] \
              row.retired_at = nil \
              redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(row)) \
@@ -173,6 +181,7 @@ impl RedisAgentRegistry {
             .arg(&registration.agent_id)
             .arg(&now)
             .arg(&registration.role)
+            .arg(cog_core::person_id_for(&registration.agent_id).unwrap_or(""))
             .invoke_async::<i64>(&mut conn)
             .await
         {
@@ -498,6 +507,11 @@ impl AgentRegistry for MemoryAgentRegistry {
             // 回来上班的人不再是离职：墓碑擦掉，`first_seen` 与工号都留着
             // ——工号是发出去的编制，换一次上岗不该换号。
             row.retired_at = None;
+            // 与 Redis 那段脚本同一格语义：人形 id 写它自己，座位形不碰这一格
+            // ——空着是「还没有人」，写上的那一个不能因为重新注册就丢掉。
+            if let Some(person) = cog_core::person_id_for(&registration.agent_id) {
+                row.person_id = Some(person.to_string());
+            }
         } else {
             store.next_number += 1;
             let number = store.next_number;
@@ -510,6 +524,7 @@ impl AgentRegistry for MemoryAgentRegistry {
                     first_seen: now,
                     last_seen: now,
                     retired_at: None,
+                    person_id: cog_core::person_id_for(&registration.agent_id).map(str::to_string),
                 },
             );
         }
@@ -728,6 +743,46 @@ mod tests {
         let again = reg.employee("employee:1").await.unwrap().expect("名册行");
         assert!(again.retired_at.is_none(), "回来上班的人还挂着离职");
         assert_eq!(again.number, before.number, "回来上班换了工号");
+    }
+
+    /// 名册行写下这一行背后站着谁：人形 id 是它自己，座位形是空。
+    ///
+    /// 空是读数，不是缺字段：它说的正是「这个座位背后还没有人」。座位后来派
+    /// 了人之后，重新注册（每段执行都会注册一次）不能把这个答案擦掉——擦掉
+    /// 之后，这个人在名册上就消失了。
+    #[tokio::test]
+    async fn a_roster_row_records_the_person_standing_behind_it() {
+        let reg = MemoryAgentRegistry::new();
+        reg.register(&reg_row("employee:1")).await.unwrap();
+        let seat = cog_core::agent_id_for("task-1", "generator");
+        reg.register(&reg_row(&seat)).await.unwrap();
+
+        // 同一个人的两次注册（两件活、两次上岗）在册上仍是一行。
+        reg.register(&reg_row("employee:1")).await.unwrap();
+        assert_eq!(reg.employees().await.unwrap().len(), 2, "员工册按人增行");
+
+        let person = reg.employee("employee:1").await.unwrap().expect("名册行");
+        assert_eq!(
+            person.person_id.as_deref(),
+            Some("employee:1"),
+            "人形 id 背后的人是它自己"
+        );
+        let seat_row = reg.employee(&seat).await.unwrap().expect("名册行");
+        assert_eq!(seat_row.person_id, None, "座位背后还没有人");
+        assert_eq!(seat_row.person(), None);
+
+        // 派活之后座位有了人。写下来的那一格优先于形状——形状答不出人是谁。
+        {
+            let mut store = reg.store.write().unwrap();
+            store.employees.get_mut(&seat).expect("名册行").person_id = Some("employee:1".into());
+        }
+        reg.register(&reg_row(&seat)).await.unwrap();
+        let assigned = reg.employee(&seat).await.unwrap().expect("名册行");
+        assert_eq!(
+            assigned.person(),
+            Some("employee:1"),
+            "座位重新注册把派给它的人擦掉了"
+        );
     }
 
     /// 同一个 id 反复注册不吃新号：工号是发出去的编制，不是每次注册的计数。

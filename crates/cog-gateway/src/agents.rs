@@ -1920,6 +1920,10 @@ pub fn identity_of(
                 .number
                 .map(|n| format!("{}{n:04}", cog_core::EMPLOYEE_NUMBER_PREFIX)),
             "person_name": row.number.map(cog_core::employee_name),
+            // 这一行背后站着谁。名册行写下来的那一格优先；人形 id 没有那一格
+            // 时按形状答（早于这一列的行都是人形），座位形答出来是 `null`——
+            // 「这个座位背后还没有人」，与「名册上根本没有这一行」是两句话。
+            "person_id": row.person(),
             "retired": !row.is_active(),
             "retired_at": row.retired_at,
         }),
@@ -1927,6 +1931,7 @@ pub fn identity_of(
             "display_name": cog_core::unregistered_label(agent_id),
             "number": serde_json::Value::Null,
             "person_name": serde_json::Value::Null,
+            "person_id": cog_core::person_id_for(agent_id),
             "retired": false,
         }),
     }
@@ -2033,9 +2038,10 @@ fn roster_with_people(
             "platform": row.platform,
             "device_id": row.device_id,
         });
-        if roster.contains_key(&agent_id) {
-            merge_fields(&mut view, identity_of(&agent_id, &roster));
-        }
+        // 名册上没有这一行时也要合并一次：`identity_of` 这时按 id 的形状答
+        // 出这个人是谁，`person_id` 因此每一行都有——少了它，一个还没入册的
+        // 对话员工会被按人收拢时归进「还没派给人的座位」那一组。
+        merge_fields(&mut view, identity_of(&agent_id, &roster));
         views.push(view);
     }
     // 名册上有、另外两份都没有的人：招进来过，这一刻池里没有他。雇佣行不存
@@ -2089,6 +2095,7 @@ fn roster_with_people(
                 .number
                 .map(|n| format!("{}{n:04}", cog_core::EMPLOYEE_NUMBER_PREFIX)),
             "person_name": row.number.map(cog_core::employee_name),
+            "person_id": row.person(),
             "role": row.role,
             "workspace_id": "default",
             "capabilities": Vec::<String>::new(),
@@ -2102,6 +2109,116 @@ fn roster_with_people(
         }));
     }
     views
+}
+
+/// 名册上「一组座位背后没有人」那一行的名字。
+///
+/// 它是一句读数，不是一个人名：这一行收的是所有还没派给人的座位。读的人要
+/// 一眼认出它不是某个叫这个名字的员工，所以它不像一个人名那样带工号。
+const UNASSIGNED_SEATS_LABEL: &str = "座位，尚未分配给人";
+
+/// 按人把名册收成一列：一个人一行，当前戴着的帽子挂在后面。
+///
+/// 座位是地址，人是身份。按座位展开的名册在任务一多时会长出成百上千行「人」，
+/// 读的人分不出哪个是真员工、哪个是某件活临时起的座位——而任务一结束，那个
+/// 「人」就消失了。这里按 `person_id` 收成一行人，帽子（`agent_ids`）一个
+/// 不少地列出来：地址不能丢，丢了这个人在对话页就点不到了。
+///
+/// `person_id` 为空的那一组收成单独一行，名字是
+/// [`UNASSIGNED_SEATS_LABEL`]：它们不是很多人，是一个读数——还有多少座位背后
+/// 没有人。这一行在名册上一次只出现一次，任务再多也一样。
+fn people_of(views: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    // 组的顺序按每组第一次出现的先后定，读面因此每次读回来是同一个次序；
+    // 用哈希表只做「这个人在第几组」的索引，不决定顺序。
+    let mut index: std::collections::HashMap<Option<&str>, usize> =
+        std::collections::HashMap::new();
+    let mut groups: Vec<(Option<&str>, Vec<&serde_json::Value>)> = Vec::new();
+    for view in views {
+        let person = view.get("person_id").and_then(|v| v.as_str());
+        let at = *index.entry(person).or_insert_with(|| {
+            groups.push((person, Vec::new()));
+            groups.len() - 1
+        });
+        groups[at].1.push(view);
+    }
+    groups
+        .into_iter()
+        .map(|(person, rows)| {
+            let mut roles: Vec<&str> = Vec::new();
+            let mut agent_ids: Vec<&str> = Vec::new();
+            for view in &rows {
+                if let Some(role) = view.get("role").and_then(|r| r.as_str()) {
+                    if !roles.contains(&role) {
+                        roles.push(role);
+                    }
+                }
+                if let Some(id) = view.get("agent_id").and_then(|v| v.as_str()) {
+                    agent_ids.push(id);
+                }
+            }
+            let live = rows
+                .iter()
+                .any(|v| v.get("live").and_then(|l| l.as_bool()) == Some(true));
+            // 一个人的全部帽子都退役了，他才算离职；还有一顶在役就不是。
+            let retired = rows
+                .iter()
+                .all(|v| v.get("retired").and_then(|r| r.as_bool()) == Some(true));
+            // 名字与工号只从这个人自己的那一行取：借某个座位的名字，读的人会
+            // 以为这个员工叫那个座位的名字。找不到就是「待编」，不是别人的名。
+            let head = person.and_then(|id| {
+                rows.iter()
+                    .find(|v| v.get("agent_id").and_then(|a| a.as_str()) == Some(id))
+            });
+            let display_name = match person {
+                // 找不到这个人自己的那一行时印「待编 某人」，而不是借某个座位的
+                // 名字——那会让读的人以为这个员工叫那个座位的名字。
+                Some(id) => head
+                    .and_then(|v| v.get("display_name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| cog_core::unregistered_label(id)),
+                None => UNASSIGNED_SEATS_LABEL.to_string(),
+            };
+            let number = match person {
+                Some(_) => head
+                    .and_then(|v| v.get("number"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                None => serde_json::Value::Null,
+            };
+            serde_json::json!({
+                "person_id": person,
+                "display_name": display_name,
+                "number": number,
+                "live": live,
+                "retired": retired,
+                "roles": roles,
+                "agent_ids": agent_ids,
+                "caps": agent_ids.len(),
+            })
+        })
+        .collect()
+}
+
+/// 名册读数 `seats_without_a_person`：还有多少座位背后没有人。
+///
+/// 数的是按人收好的那一列里 `person_id` 为空的那一组——它一次只出现一行，
+/// 一行收着全部没派给人的座位。`roster_read` 是这座名册读没读到：读不到时
+/// 答案是 `None` 而不是 `Some(0)`。座位背后的人只记在名册那一份上，读不到
+/// 时每个座位都会被数成「没有人」；而「数不出来」与「量到零」在读数面上必须
+/// 是两句话——否则这个数停在 0 时，没人看得出是人人都派了人，还是名册根本
+/// 没读到。
+fn seats_without_a_person(roster_read: bool, people_rows: &[serde_json::Value]) -> Option<u64> {
+    if !roster_read {
+        return None;
+    }
+    Some(
+        people_rows
+            .iter()
+            .find(|row| row.get("person_id").map_or(true, |v| v.is_null()))
+            .and_then(|row| row.get("caps").and_then(|caps| caps.as_u64()))
+            .unwrap_or(0),
+    )
 }
 
 pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
@@ -2132,20 +2249,22 @@ pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
             // 「存在过谁」，而注册表那份仍然会把此刻在岗的人一个不少地交出来。
             // 整条读面因此不该变成 503——但也不能装作读过：日志要说得出来这次
             // 名册是空的还是没读到。
-            let employees = match registry.employees().await {
-                Ok(rows) => rows,
+            let (employees, roster_read) = match registry.employees().await {
+                Ok(rows) => (rows, true),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         "the employee roster could not be read; this pass lists only what the live \
                          registry and the two key-value rosters know about"
                     );
-                    Vec::new()
+                    (Vec::new(), false)
                 }
             };
             let agents = roster_with_people(&regs, people, hired, employees);
             let count = agents.len();
             let (workers, squads) = roster_split(&regs);
+            let people_rows = people_of(&agents);
+            let seats_without_a_person = seats_without_a_person(roster_read, &people_rows);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -2154,6 +2273,8 @@ pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
                     "worker_agents": workers,
                     "squad_agents": squads,
                     "people_agents": people_count,
+                    "people": people_rows,
+                    "seats_without_a_person": seats_without_a_person,
                 })),
             )
                 .into_response()
@@ -2315,9 +2436,10 @@ pub async fn checkpoint_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_view, caller_named_reply_stream, clear_caller_named_sender, enroll, read_people,
-        read_roster, restore_roster_from, roster_split, roster_with_people, PersonRow, RosterRow,
-        Summon, SummonFn, PEOPLE_KEY, ROSTER_KEY,
+        agent_view, caller_named_reply_stream, clear_caller_named_sender, enroll, identity_of,
+        people_of, read_people, read_roster, restore_roster_from, roster_split, roster_with_people,
+        seats_without_a_person, PersonRow, RosterRow, Summon, SummonFn, PEOPLE_KEY, ROSTER_KEY,
+        UNASSIGNED_SEATS_LABEL,
     };
     use cog_core::InboxMessage;
     use std::collections::HashMap;
@@ -2643,6 +2765,7 @@ mod tests {
             first_seen: now,
             last_seen: now,
             retired_at: None,
+            person_id: None,
         };
         let views = roster_with_people(
             std::slice::from_ref(&reg),
@@ -2672,11 +2795,124 @@ mod tests {
             first_seen: now,
             last_seen: now,
             retired_at: Some(now),
+            person_id: None,
         };
         let views = roster_with_people(&[], Vec::new(), Vec::new(), vec![row]);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0]["retired"], true);
         assert_eq!(views[0]["display_name"], cog_core::employee_label(41));
+    }
+
+    /// 名册行背后站着谁：人形 id 这一格是它自己，座位形 id 是空。
+    ///
+    /// 空不是「读不到」，是「这个座位背后还没有人」——员工页按这一格收人，
+    /// 两种答案分不开时，没人的座位就会被当成几百个新员工。
+    #[test]
+    fn a_row_says_whether_a_person_stands_behind_it() {
+        let now = chrono::Utc::now();
+        let seat = cog_core::agent_id_for("task-1", "generator");
+        let row = |agent_id: &str, role: &str| cog_core::EmployeeRecord {
+            agent_id: agent_id.into(),
+            number: Some(3),
+            role: role.into(),
+            first_seen: now,
+            last_seen: now,
+            retired_at: None,
+            person_id: None,
+        };
+        let roster: std::collections::HashMap<String, cog_core::EmployeeRecord> = vec![
+            row("employee:0e2ba053", "employee"),
+            row(&seat, "generator"),
+        ]
+        .into_iter()
+        .map(|r| (r.agent_id.clone(), r))
+        .collect();
+        assert_eq!(
+            identity_of("employee:0e2ba053", &roster)["person_id"],
+            "employee:0e2ba053",
+            "这一列比人形行年轻，形状能唯一答出来，旧行不必等下一次注册"
+        );
+        assert!(
+            identity_of(&seat, &roster)["person_id"].is_null(),
+            "座位背后还没有人，这一格是空"
+        );
+        // 名册上根本没有这一行时，形状同样答得出来：空仍然只属于座位。
+        assert_eq!(
+            identity_of("mira-512bfc48", &roster)["person_id"],
+            "mira-512bfc48"
+        );
+    }
+
+    /// 一个人戴两顶帽子，名册上仍是一行；没派给人的座位收成单独一行。
+    ///
+    /// 判据原话：「给一个人派两条任务 ⇒ 名册里是一行」。按座位展开时同一个人
+    /// 会出现两次，读的人以为撞了名；而没派人的座位不是「很多人」，是一个读数。
+    #[test]
+    fn a_person_with_two_caps_is_one_row_and_the_unassigned_seats_are_another() {
+        let view = |agent_id: String, role: &str, person: Option<&str>| {
+            serde_json::json!({
+                "agent_id": agent_id,
+                "display_name": cog_core::unregistered_label(&agent_id),
+                "role": role,
+                "live": true,
+                "retired": false,
+                "person_id": person,
+            })
+        };
+        let first = cog_core::agent_id_for("task-1", "generator");
+        let second = cog_core::agent_id_for("task-2", "evaluator");
+        let loose_a = cog_core::agent_id_for("task-3", "planner");
+        let loose_b = cog_core::agent_id_for("task-4", "planner");
+        let views = vec![
+            view(first.clone(), "generator", Some("employee:1")),
+            view(second.clone(), "evaluator", Some("employee:1")),
+            view(loose_a, "planner", None),
+            view(loose_b, "planner", None),
+        ];
+
+        let people = people_of(&views);
+        assert_eq!(people.len(), 2, "一个人一行，加没派人的座位一组");
+        assert_eq!(people[0]["person_id"], "employee:1");
+        assert_eq!(people[0]["caps"], 2);
+        assert_eq!(
+            people[0]["agent_ids"],
+            serde_json::json!([first, second]),
+            "帽子（地址）一个都不能丢，丢了这个人在对话页就点不到"
+        );
+        assert_eq!(
+            people[0]["roles"],
+            serde_json::json!(["generator", "evaluator"]),
+            "角色随任务变，一个人可以同时戴几顶不同的帽子"
+        );
+        assert_eq!(people[1]["person_id"], serde_json::Value::Null);
+        assert_eq!(people[1]["display_name"], UNASSIGNED_SEATS_LABEL);
+        assert_eq!(people[1]["caps"], 2);
+        assert_eq!(
+            seats_without_a_person(true, &people),
+            Some(2),
+            "读数等于没有人的座位行数"
+        );
+
+        // 换输入，值跟着变：同一个座位派上了人，读数就少一个；全派上就是 0
+        // ——「量到零」与「量不到」是两句话。
+        let assigned = vec![
+            view(
+                cog_core::agent_id_for("task-3", "planner"),
+                "planner",
+                Some("employee:1"),
+            ),
+            view(
+                cog_core::agent_id_for("task-4", "planner"),
+                "planner",
+                Some("employee:2"),
+            ),
+        ];
+        assert_eq!(seats_without_a_person(true, &people_of(&assigned)), Some(0));
+        assert_eq!(
+            seats_without_a_person(false, &people),
+            None,
+            "名册读不到时这一格是 null，不是 0：否则数停在 0 时看不出名册根本没读到"
+        );
     }
 
     /// 说过一句话的人，闭嘴之后还在名单上。
@@ -2721,6 +2957,13 @@ mod tests {
         );
         assert_eq!(views[0]["live"], false);
         assert_eq!(views[0]["session_id"], "conv-1");
+        // 还没入册也是人：按人收拢时这一行必须自成一组，不能落进「还没派给人
+        // 的座位」那一组——那会把人在读数上抹掉。
+        assert_eq!(views[0]["person_id"], "kai-a9ab11fc");
+        let people = people_of(&views);
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0]["person_id"], "kai-a9ab11fc");
+        assert_eq!(seats_without_a_person(true, &people), Some(0));
     }
 
     /// 记来源之前写下的行仍然读得回来。

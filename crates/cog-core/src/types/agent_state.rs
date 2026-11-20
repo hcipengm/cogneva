@@ -71,6 +71,24 @@ pub fn agent_id_for(task_id: &str, role: &str) -> String {
     format!("{}-{role}", squad_id_for(task_id))
 }
 
+/// 一个 id 背后站着的那个人；座位形的 id 背后还没有人。
+///
+/// 人与座位是两件事：人是稳定的身份，座位是 `(task, role)` 的一段执行地址。
+/// 名字是这一刻唯一能把两者分开的东西——座位全都叫 [`SQUAD_ID_PREFIX`] 开头的
+/// `squad:<任务>-<座位>`，其余 id（安装期定下的名字、`employee:<建号>`）都属于
+/// 一个具体的人，那个人就是它自己。
+///
+/// `None` 是读数，不是缺字段：它说的正是「这个座位背后还没有人」。座位什么时候
+/// 有了人，由派活那一侧写进名册行（`EmployeeRecord::person_id`），到那时形状
+/// 答不出来，只有那一格答得出来。
+pub fn person_id_for(agent_id: &str) -> Option<&str> {
+    if agent_id.starts_with(SQUAD_ID_PREFIX) {
+        None
+    } else {
+        Some(agent_id)
+    }
+}
+
 /// The prefix every employee's checkout is named with.
 ///
 /// The prefix is also how the executor tells an employee's tree from a task's:
@@ -306,6 +324,27 @@ pub fn unregistered_label(agent_id: &str) -> String {
 #[cfg(test)]
 mod naming_tests {
     use super::*;
+
+    /// 人形 id 背后的人是它自己，座位形 id 背后是「还没有人」。
+    ///
+    /// 这一格的两个答案必须分得开：`None` 不是「读不到」，是「这个座位背后还
+    /// 没有人」。把座位也算成一个人，名册就会在任务一多时凭空长出几百个「人」，
+    /// 而读的人分不出哪个是真员工。
+    #[test]
+    fn a_seat_has_no_person_and_an_employee_is_their_own_person() {
+        assert_eq!(person_id_for("mira-512bfc48"), Some("mira-512bfc48"));
+        assert_eq!(
+            person_id_for("employee:0e2ba053"),
+            Some("employee:0e2ba053")
+        );
+        assert_eq!(
+            person_id_for(&agent_id_for("task-1", "generator")),
+            None,
+            "座位背后还没有人"
+        );
+        // 前缀是唯一的分界线：名字里带 squad 但不在开头的是一个人，不是座位。
+        assert_eq!(person_id_for("squad-member-kai"), Some("squad-member-kai"));
+    }
 
     /// 车道名只由 id 决定，且落在目录名允许的那一组字节里。
     ///
