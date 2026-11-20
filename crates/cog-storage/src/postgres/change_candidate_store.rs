@@ -94,13 +94,32 @@ fn to_sf(err: sqlx::Error) -> SFError {
 /// `actor` 与 `writer` 在构造时定下来：它们是归属与「值变了还是写者换了」的答案，
 /// 不是每一条事件各自猜一个。`writer` 要能指名一个进程（Pod + 镜像 rev），因为
 /// 幂等键的作用域就是它——两个进程用同一个键写同一条事件，第二条会被当成重复。
-#[derive(Debug)]
 pub struct PgChangeCandidateStore {
     pool: PgPool,
     actor: String,
     writer: String,
     scope: String,
     ids: std::sync::Mutex<cog_core::EventIdFactory>,
+    /// 发布读数的句柄。可选：没有它，读不懂的行照样标 `undecodable`，只是没有那条
+    /// 计数——「读不懂的越来越多了」这件事就得一条一条翻才看得见。
+    ///
+    /// 结构体因此不再 `derive(Debug)`：trait object 没有 `Debug`。一个带发布句柄的
+    /// store 本来就打印不出什么有用的东西，而「打印不出来」不该由句柄决定。
+    metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
+}
+
+/// 手写的 `Debug`：发布句柄是 trait object，没有 `Debug`，而契约要求的正是这一行。
+/// 打印的是这个 store 的身份（池、写者、作用域），不打印它接没接读数面——
+/// 「打印不出来」不该由句柄决定，而「接没接」是一件该由读数回答的事。
+impl std::fmt::Debug for PgChangeCandidateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgChangeCandidateStore")
+            .field("actor", &self.actor)
+            .field("writer", &self.writer)
+            .field("scope", &self.scope)
+            .field("metrics", &self.metrics.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PgChangeCandidateStore {
@@ -118,7 +137,28 @@ impl PgChangeCandidateStore {
             writer: writer.into(),
             scope: scope.into(),
             ids: std::sync::Mutex::new(ids),
+            metrics: None,
         }
+    }
+
+    /// 接上读数面。构造函数不动：一个没有读数面的部署照样能读，只是读不懂的行
+    /// 不会自己报到。
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// 读不懂的行报到读数面：`kind` 与 `version` 决定该补哪个解码器。
+    async fn note_undecodable(&self, kind: &str, version: i32) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("kind".to_string(), kind.to_string());
+        labels.insert("version".to_string(), version.to_string());
+        let _ = metrics
+            .record_counter(cog_core::metric_names::EVENT_UNDECODABLE_TOTAL, 1.0, labels)
+            .await;
     }
 
     fn next_event_id(&self) -> String {
@@ -167,21 +207,26 @@ impl PgChangeCandidateStore {
             .fetch_all(&self.pool)
             .await
             .map_err(to_sf)?;
-        rows.into_iter()
-            .map(
-                |(subject_id, event_id, kind, attributes, version, origin, origin_version)| {
-                    candidate_from_events(&RowInput {
-                        subject_id: &subject_id,
-                        event_id: &event_id,
-                        kind: &kind,
-                        decision_attributes: &attributes,
-                        decision_version: version,
-                        origin_attributes: &origin,
-                        origin_version,
-                    })
-                },
-            )
-            .collect()
+        let mut out = Vec::with_capacity(rows.len());
+        for (subject_id, event_id, kind, attributes, version, origin, origin_version) in rows {
+            let candidate = candidate_from_events(&RowInput {
+                subject_id: &subject_id,
+                event_id: &event_id,
+                kind: &kind,
+                decision_attributes: &attributes,
+                decision_version: version,
+                origin_attributes: &origin,
+                origin_version,
+            })?;
+            // 读不懂的行在这一次读里就报一声：计数是「该补解码器了」的唯一信号，
+            // 而它必须跟着读走——放在写入口只会数到我们写坏的，数不到别人写对的而
+            // 这一版读不懂的。
+            if candidate.recorded_status == "undecodable" {
+                self.note_undecodable(&kind, version).await;
+            }
+            out.push(candidate);
+        }
+        Ok(out)
     }
 }
 
@@ -482,6 +527,39 @@ mod tests {
     /// 载荷读不懂时，这一行仍然读得出来，并标明它读不懂。
     ///
     /// 这正是「不猜不丢」：丢掉整行会让一条被拒绝的变更重新出现在待办里，而把它读成
+    /// 读不懂的行要报到读数面，带 `kind` 与 `version`：补哪个解码器由这两个标签答。
+    #[tokio::test]
+    async fn an_undecodable_row_is_counted_with_the_kind_and_version_it_could_not_read() {
+        use std::sync::Arc;
+        let metrics = Arc::new(crate::mem::MemoryMetricsBackend::new());
+        let store = PgChangeCandidateStore::new(
+            sqlx::PgPool::connect_lazy("postgres://unused/unused").expect("lazy pool"),
+            "actor",
+            "writer",
+            "scope",
+            cog_core::EventIdFactory::seeded(1, [0u8; 10]),
+        )
+        .with_metrics(metrics.clone());
+
+        store.note_undecodable(REJECTED_KIND, 99).await;
+
+        use cog_core::MetricsBackend as _;
+        let series = metrics
+            .query_counter_totals("cogneva_event_undecodable_total")
+            .await
+            .expect("the counter must be readable");
+        assert_eq!(series.len(), 1, "一次读不懂只该有一条序列：{series:?}");
+        assert_eq!(
+            series[0].labels.get("kind").map(String::as_str),
+            Some(REJECTED_KIND)
+        );
+        assert_eq!(
+            series[0].labels.get("version").map(String::as_str),
+            Some("99")
+        );
+        assert!(series[0].value >= 1.0, "计数没有加上去：{series:?}");
+    }
+
     /// 一条空候选会让「这一版代码读不懂」看起来像「这条变更没有内容」。
     #[test]
     fn an_undecodable_payload_keeps_its_row_and_says_so() {

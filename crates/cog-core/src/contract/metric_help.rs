@@ -1892,6 +1892,15 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          and retirement removes whole streams rather than rows",
     ),
     (
+        "cogneva_event_undecodable_total",
+        "Payloads this build could not decode, by kind and version. A row it \
+         cannot decode is kept and marked `undecodable` rather than dropped: \
+         dropping it would put a rejected change back into the queue. The count \
+         is the only signal that the deployment is holding rows a later build \
+         wrote -- a state a reader can otherwise find only by reading every \
+         undecodable row one at a time",
+    ),
+    (
         "cogneva_task_events_tasks",
         "Task event streams currently held, one per task whose events have not \
          been retired. A stream is kept or removed whole, because both readers \

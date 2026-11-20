@@ -241,6 +241,14 @@ metric_names! {
     TASK_EVENTS_OLDEST_AGE_SECONDS => "cogneva_task_events_oldest_age_seconds",
     TASK_EVENTS_SWEEP_FAILED => "cogneva_task_events_sweep_failed",
 
+    // cog-storage — 事件流里这一版读不懂的行。
+    //
+    // 一条读不懂的载荷不是错误：行照样读出来、标 `undecodable`，原文留在库里。
+    // 但如果只有那一个状态词，没有任何计数，「读不懂的越来越多了」这件事要一条一条
+    // 翻才有读数——而它正是「该补解码器了」的唯一信号。标签是 `kind` 与 `version`：
+    // 哪一个种类、哪一版，决定补什么。
+    EVENT_UNDECODABLE_TOTAL => "cogneva_event_undecodable_total",
+
     // cog-observability — the prompt-and-response archive's retention.
     //
     // `gateway_llm_exchange` keeps the bodies of what the platform sent
