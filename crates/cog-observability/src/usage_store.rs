@@ -1471,6 +1471,45 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// 同一读数，**从事件流算**：按上游×协议×人，四列分别求和。
+    ///
+    /// 与账本那条的差别只有一处，而且是它必须保留的：`cache_created` 不包
+    /// `COALESCE`——整组都没量到时它必须是 NULL 而不是 0。0 是一个读数（上游说
+    /// 了零），NULL 是「这一组没人量过」，两种形状在度量面上走不同的路。
+    pub async fn spend_by_upstream_and_actor_from_stream(
+        &self,
+    ) -> anyhow::Result<Vec<cog_core::UpstreamActorSpend>> {
+        let rows = sqlx::query(
+            "SELECT attributes::jsonb->>'upstream'  AS upstream,
+                    attributes::jsonb->>'api_style' AS api_style,
+                    actor,
+                    COALESCE(SUM(COALESCE((attributes::jsonb->>'input_tokens')::BIGINT, 0)), 0)::BIGINT  AS tokens_input,
+                    COALESCE(SUM(COALESCE((attributes::jsonb->>'output_tokens')::BIGINT, 0)), 0)::BIGINT AS tokens_output,
+                    COALESCE(SUM(COALESCE((attributes::jsonb->>'cached_tokens')::BIGINT, 0)), 0)::BIGINT AS tokens_cached,
+                    SUM((attributes::jsonb->>'cache_created_tokens')::BIGINT)::BIGINT AS tokens_cache_created
+               FROM cogneva_event
+              WHERE kind = 'llm_call'
+              GROUP BY 1, 2, actor
+              ORDER BY 1, 2, actor",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| cog_core::UpstreamActorSpend {
+                upstream: row.get::<String, _>("upstream"),
+                api_style: row.get::<String, _>("api_style"),
+                actor: row.get::<String, _>("actor"),
+                input: row.get::<i64, _>("tokens_input").max(0) as u64,
+                output: row.get::<i64, _>("tokens_output").max(0) as u64,
+                cached: row.get::<i64, _>("tokens_cached").max(0) as u64,
+                cache_created: row
+                    .get::<Option<i64>, _>("tokens_cache_created")
+                    .map(|v| v.max(0) as u64),
+            })
+            .collect())
+    }
+
     /// 从 `since_unix` 起按工作区汇总的花销，`(workspace_id, tokens)`。
     ///
     /// 一次调用属于哪个工作区，证据与「属于哪个人」是同一行：任务图里那条任务
