@@ -97,10 +97,21 @@ def _change_ledger_items() -> list[Item]:
     if result.returncode != 0:
         raise Unreadable(f"变更账本查询失败（退出码 {result.returncode}）：{result.stderr.strip()[:200]}")
     out: list[Item] = []
+    bad_state: list[str] = []
     for line in result.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 2:
             continue
+        # 与 worker 台账同一个闭集，而且**就是这两词**：`pending`（未落）/ `landed`（已落）。
+        # 迁移 121 把 retired 并进 landed、undecided 并进 pending，并在库里加了 CHECK——
+        # 第三个词现在写不进去。这里只认这两个，别的一律点名拒掉。
+        if len(parts) > 3:
+            state = parts[3].strip()
+            if state not in ("pending", "landed"):
+                bad_state.append(f"{parts[0]}（state={state}）")
+                continue
+            if state == "landed":
+                continue
         ident, scope = parts[0].strip(), parts[1].strip()
         title = parts[2].strip() if len(parts) > 2 else ""
         # `scope` 是一个路径前缀（例如 `crates/cog-storage` 或一个具体文件）；
@@ -108,6 +119,10 @@ def _change_ledger_items() -> list[Item]:
         # 这种条目只能靠 `Split:` 点名，或者先被拆细。
         touches = [scope] if "/" in scope or scope.endswith(".rs") else []
         out.append(Item(ident, title, touches))
+    if bad_state:
+        raise Unreadable(
+            "变更账本里有不在闭集里的状态（只认 pending / landed）：" + "、".join(bad_state[:10])
+        )
     return out
 
 
