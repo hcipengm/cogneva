@@ -63,6 +63,40 @@ impl ToolCall {
     }
 }
 
+impl ToolCall {
+    /// 从**字节**造一条调用记录：哈希在这里算，所以「哈希与字节一致」不是一条要记着
+    /// 维持的不变式，而是一处计算的结果。参数与结果各一个哈希、各一个长度——两个不同的
+    /// 结果可以一样长，只给长度分不开，只给哈希看不出大小。
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_bytes(
+        call_id: impl Into<String>,
+        unit_of_work: impl Into<String>,
+        tool: impl Into<String>,
+        actor: impl Into<String>,
+        arguments: &[u8],
+        result: Option<&[u8]>,
+        outcome: impl Into<String>,
+        latency_ms: Option<u64>,
+        at: DateTime<Utc>,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        let hex = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        Self {
+            call_id: call_id.into(),
+            unit_of_work: unit_of_work.into(),
+            tool: tool.into(),
+            arguments_sha256: hex(arguments),
+            arguments_bytes: arguments.len() as u64,
+            result_sha256: result.map(hex),
+            result_bytes: result.map_or(0, |b| b.len() as u64),
+            outcome: outcome.into(),
+            latency_ms,
+            actor: actor.into(),
+            at,
+        }
+    }
+}
+
 /// 往事件流里追加一条工具调用。实现必须幂等，写不进去要如实报错。
 #[async_trait]
 pub trait ToolCallEvents: Send + Sync {
@@ -115,5 +149,52 @@ mod tests {
     #[test]
     fn the_idempotency_key_is_the_call_identity() {
         assert_eq!(call().idempotency_key(), "c1");
+    }
+}
+
+#[cfg(test)]
+mod from_bytes_tests {
+    use super::*;
+
+    fn call(args: &[u8], result: Option<&[u8]>) -> ToolCall {
+        ToolCall::from_bytes(
+            "c1",
+            "u1",
+            "run_command",
+            "a",
+            args,
+            result,
+            "ok",
+            Some(3),
+            Utc::now(),
+        )
+    }
+
+    /// 哈希与字节一致：同一段字节算两次一样，改一个字节就变。
+    #[test]
+    fn the_hash_is_a_function_of_the_bytes() {
+        let one = call(b"{\"cmd\":\"ls\"}", Some(b"ok"));
+        let two = call(b"{\"cmd\":\"ls\"}", Some(b"ok"));
+        let other = call(b"{\"cmd\":\"rm\"}", Some(b"ok"));
+        assert_eq!(one.arguments_sha256, two.arguments_sha256);
+        assert_ne!(one.arguments_sha256, other.arguments_sha256);
+        assert_eq!(one.arguments_bytes, 13);
+    }
+
+    /// 没有结果时两个结果字段都空着：哈希 `None`、长度 0——而不是一个空串的哈希。
+    #[test]
+    fn a_call_without_a_result_has_no_result_hash() {
+        let failed = call(b"{}", None);
+        assert_eq!(failed.result_sha256, None);
+        assert_eq!(failed.result_bytes, 0);
+    }
+
+    /// 长度与哈希一起给：两个一样长但内容不同的结果，只靠长度分不开。
+    #[test]
+    fn two_results_of_equal_length_are_distinguished_by_their_hashes() {
+        let a = call(b"{}", Some(b"abcd"));
+        let b = call(b"{}", Some(b"abce"));
+        assert_eq!(a.result_bytes, b.result_bytes);
+        assert_ne!(a.result_sha256, b.result_sha256);
     }
 }
