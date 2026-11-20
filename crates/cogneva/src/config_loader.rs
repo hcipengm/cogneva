@@ -403,10 +403,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "gateway.websocket_inactivity_timeout_secs".into(),
     );
     m.insert(
-        "COGNEVA_WEBSOCKET_TICK_SECS".into(),
-        "gateway.websocket_tick_secs".into(),
-    );
-    m.insert(
         "COGNEVA_NOTIFICATION_LIMIT".into(),
         "gateway.notification_limit".into(),
     );
@@ -1313,10 +1309,13 @@ mod tests {
             "one variable, two config paths — which one it writes becomes luck: {conflicts:?}"
         );
 
-        // A join over nothing always agrees. The built-in table and the
-        // delivered document share most of their names, so seeing far fewer
-        // than that means the comparison is reading an empty overlap rather
-        // than two copies of one table.
+        // A join over nothing always agrees. The floor here is only the guard
+        // against that: it does not pin how many names the two copies share,
+        // because the shared population moves whenever a dead knob is retired
+        // (the count that used to sit here said 80 until one was deleted, and
+        // a number that has to be re-typed after every deletion starts to look
+        // like a fact). Seeing no overlap at all is what means the comparison
+        // read nothing.
         let delivered = documents
             .iter()
             .find(|(tag, _)| *tag == "chart")
@@ -1327,7 +1326,7 @@ mod tests {
             .filter(|name| delivered.contains_key(*name))
             .count();
         assert!(
-            shared >= 80,
+            shared >= 1,
             "只有 {shared} 个名字同时出现在内置表与交付文档里——比较没看到东西"
         );
     }

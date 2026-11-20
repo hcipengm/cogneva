@@ -617,9 +617,6 @@ pub struct GatewayConfig {
     /// [`GatewayConfig::effective_websocket_inactivity_timeout_secs`]）。
     #[serde(default = "default_websocket_inactivity_timeout_secs")]
     pub websocket_inactivity_timeout_secs: u64,
-    /// 没有任何运行期读取；留着只为兼容旧文档里的这个键（`git log` 有它的来历）。
-    #[serde(default = "default_websocket_tick_secs")]
-    pub websocket_tick_secs: u64,
     /// 通知列表的默认页大小。0 ＝ 没写，取列表面共用的
     /// [`A2A_LIST_PAGE_SIZE`]。
     #[serde(default = "default_notification_limit")]
@@ -785,9 +782,6 @@ fn default_websocket_timeout_secs() -> u64 {
     DEFAULT_WEBSOCKET_HEARTBEAT_SECS
 }
 fn default_websocket_inactivity_timeout_secs() -> u64 {
-    0
-}
-fn default_websocket_tick_secs() -> u64 {
     0
 }
 fn default_notification_limit() -> u32 {

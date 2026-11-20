@@ -280,7 +280,6 @@ data:
             "COGNEVA_ANTHROPIC_DEFAULT_MAX_TOKENS": "system.anthropic_default_max_tokens",
             "COGNEVA_WEBSOCKET_TIMEOUT_SECS": "gateway.websocket_timeout_secs",
             "COGNEVA_WEBSOCKET_INACTIVITY_TIMEOUT_SECS": "gateway.websocket_inactivity_timeout_secs",
-            "COGNEVA_WEBSOCKET_TICK_SECS": "gateway.websocket_tick_secs",
             "COGNEVA_NOTIFICATION_LIMIT": "gateway.notification_limit",
             "COGNEVA_REQUEST_TIMEOUT_SECS": "gateway.request_timeout_secs",
             "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS": "gateway.contribution_oauth_refresh_interval_secs",

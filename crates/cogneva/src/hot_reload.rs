@@ -48,7 +48,6 @@ pub fn apply_gateway_config_update(
         let mut cfg = current.write().unwrap_or_else(|e| e.into_inner());
         cfg.websocket_timeout_secs = new_gateway.websocket_timeout_secs;
         cfg.websocket_inactivity_timeout_secs = new_gateway.websocket_inactivity_timeout_secs;
-        cfg.websocket_tick_secs = new_gateway.websocket_tick_secs;
         cfg.request_timeout_secs = new_gateway.request_timeout_secs;
         cfg.notification_limit = new_gateway.notification_limit;
         // NOTE: http_port / ws_port / metrics_port / internal_port are intentionally
@@ -78,7 +77,6 @@ mod tests {
             cors_origins: vec![],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
             request_timeout_secs: 30,
             notification_webhook_url: None,
@@ -91,7 +89,6 @@ mod tests {
             metrics_port: 9092,
             websocket_timeout_secs: 60,
             websocket_inactivity_timeout_secs: 120,
-            websocket_tick_secs: 10,
             notification_limit: 100,
             request_timeout_secs: 45,
             notification_webhook_url: None,
@@ -120,7 +117,6 @@ mod tests {
         // Non-port fields must be updated.
         assert_eq!(cfg.websocket_timeout_secs, 60);
         assert_eq!(cfg.websocket_inactivity_timeout_secs, 120);
-        assert_eq!(cfg.websocket_tick_secs, 10);
         assert_eq!(cfg.notification_limit, 100);
         assert_eq!(cfg.request_timeout_secs, 45);
         assert_eq!(
@@ -138,7 +134,6 @@ mod tests {
             cors_origins: vec![],
             websocket_timeout_secs: 30,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
             request_timeout_secs: 30,
             notification_webhook_url: None,
@@ -151,7 +146,6 @@ mod tests {
             metrics_port: 8082,
             websocket_timeout_secs: 60,
             websocket_inactivity_timeout_secs: 90,
-            websocket_tick_secs: 5,
             notification_limit: 50,
             request_timeout_secs: 30,
             notification_webhook_url: None,
