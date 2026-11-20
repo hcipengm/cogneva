@@ -866,24 +866,30 @@ llmExchangeRetention:
   # proof: file=crates/cog-observability/src/exchange_retention.rs test=the_retention_follows_the_measured_daily_write beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
   keepDays: 30
 
-# token 账（gateway_llm_usage）的逐次调用明细保留期。
+# token 账（gateway_llm_usage）的**查询窗口**声明。
 #
-# 这张表每次上游调用一行；每小时的折叠面（cog_llm_usage_rollup）把窗口汇总一次并
-# 长期保留，所以这里封顶的是「哪次调用花了多少、为哪个任务花的」这层明细，不是账本身。
-# 清理只删折叠面已经覆盖到的行：折叠面是这个账的派生，删掉没被任何窗口汇总过的行，
-# 等于抹掉那份花费的唯一副本——聚合会永远把那个小时报成静默，且没有东西能重算。
-# 折叠面的下界不够老时，清理把删不动的那部分发布成 cogneva_llm_usage_uncovered_rows，
-# 与最老那行的年龄配对，告警按「有行删不动且已过保留期」判。1 以下退回 30。
+# 这张表每次上游调用一行；每小时的折叠面（cog_llm_usage_rollup）把窗口汇总一次并长期
+# 保留。从前这里是一条保留期：超过就按天删明细。那套东西的正确性靠一个两段条件撑着——
+# 行过了保留期，**而且**折叠已经覆盖到它——因为折叠是这个账的派生，删掉没被任何窗口汇总
+# 过的行，删的不是过期拷贝，是那段花费的唯一一份。那条件本身是对的，但它说明的是：
+# 这张表里哪一行可以删，取决于别的表算到哪儿了。那是判断，不是保留期。
+#
+# 所以现在一行都不删：循环每拍发行数、字节、最老一行多老、折叠的最老窗口，以及
+# cogneva_llm_usage_uncovered_rows（折叠没覆盖到的那段还有多少行）与它的最老年龄。
+# 这一对不再是「删不动的原因」，而是「这一段花费只能从明细里回答」这个事实。
+# 下面这个数是**对外承诺的查询窗口**（花费用量读的那一侧用它当上界），按卷大小与每天
+# 实测写入量导出；1 以下退回 30。
 llmUsageRetention:
   # tunable: derived
-  # why: Days the token ledger keeps its per-call rows. The sweep measures the ledger's bytes and its oldest
-  # why: row's age on every pass and divides the table's share of the declared database volume by the
-  # why: measured daily write; the declared 30 days is the seed while the ledger is empty or the volume is
-  # why: not declared. Age is not the only cutoff: a row that no hourly fold window summed is the only copy
-  # why: of that spend, so the sweep deletes only what is both past the derived age and inside the fold's own
-  # why: range, and publishes the rows it cannot touch as cogneva_llm_usage_uncovered_rows. The days in force
-  # why: are published as gateway_llm_usage_keep_seconds, and the read side asks for the same value. The
-  # why: target carries `source`, and the evaluations counter is the beat evidence.
+  # why: Days of per-call detail the spend reads promise to look back over. Nothing deletes past it: the loop
+  # why: measures the ledger's rows, bytes and oldest-row age every pass and publishes them, and a row older
+  # why: than this window is still there afterwards. The number itself is derived -- the ledger's bytes and
+  # why: oldest age give the daily write, the declared volume's share divides out a number of days, and the
+  # why: declared 30 is the seed while the ledger is empty or the volume is not declared. Rows the hourly fold
+  # why: never summed are published as cogneva_llm_usage_uncovered_rows beside the age of their oldest, which
+  # why: says which spans can only be answered from the detail. The days in force are published as
+  # why: gateway_llm_usage_keep_seconds, and the read side asks for the same value. The target carries
+  # why: `source`, and the evaluations counter is the beat evidence.
   # published: owner=crates/cog-observability/src/usage_retention.rs file=crates/cog-core/src/retention.rs metric=TARGET_METRIC label=source cadence=periodic
   # proof: file=crates/cog-observability/src/usage_retention.rs test=the_retention_follows_the_measured_daily_write beat=a_beat_whose_target_does_not_move_still_counts evidence=evaluations
   keepDays: 30

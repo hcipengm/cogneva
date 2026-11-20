@@ -4435,17 +4435,19 @@ rows:
   - key: llmUsageRetention.keepDays
     source: derived
     why: >-
-      Days the token ledger keeps its per-call rows. The sweep measures the
-      ledger's bytes and its oldest row's age on every pass and divides the
-      table's share of the declared database volume by the measured daily write;
-      the declared 30 days is the seed while the ledger is empty or the volume is
-      not declared. Age is not the only cutoff: a row that no hourly fold window
-      summed is the only copy of that spend, so the sweep deletes only what is
-      both past the derived age and inside the fold's own range, and publishes
-      the rows it cannot touch as cogneva_llm_usage_uncovered_rows. The days in
-      force are published as gateway_llm_usage_keep_seconds, and the read side
-      asks for the same value. The target carries `source`, and the evaluations
-      counter is the beat evidence.
+      Days of per-call detail the spend reads promise to look back over.
+      Nothing deletes past it: the loop measures the ledger's rows, bytes and
+      oldest-row age every pass and publishes them, and a row older than this
+      window is still there afterwards. The number itself is derived -- the
+      ledger's bytes and oldest age give the daily write, the declared volume's
+      share divides out a number of days, and the declared 30 is the seed while
+      the ledger is empty or the volume is not declared. Rows the hourly fold
+      never summed are published as cogneva_llm_usage_uncovered_rows beside the
+      age of their oldest, which says which spans can only be answered from the
+      detail. The days in force are published as
+      gateway_llm_usage_keep_seconds, and the read side asks for the same value.
+      The target carries `source`, and the evaluations counter is the beat
+      evidence.
     published:
       owner: crates/cog-observability/src/usage_retention.rs
       file: crates/cog-core/src/retention.rs

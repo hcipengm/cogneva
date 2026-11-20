@@ -1,36 +1,22 @@
-//! Retires per-call rows from the token ledger, but only where the fold already
-//! answered for them.
+//! principle: feedback_a_bound_reading_is_not_the_population_it_governs
+//! 逐调用账本的规模是一条**读数**，不是一条到期就删的保留期。
 //!
-//! `gateway_llm_usage` is the row-per-call account of what the platform spent:
-//! one row per upstream call, carrying its tokens, latency and the task it was
-//! bought for. Nothing has ever removed a row from it. Measured on this
-//! deployment on 2026-10-27 it held 312,803 rows over 32 days — 80 MB — and it
-//! grows with call volume, which is the one quantity here that has no ceiling
-//! of its own.
+//! `gateway_llm_usage` 是平台花了什么的账：一次上游调用一行，带着 token、时延和它是为哪个
+//! 任务买的。实测 2026-10-27：312,803 行、32 天、80 MB，并且跟着调用量涨——这里唯一一个
+//! 自己不会封顶的量。
 //!
-//! Age alone is not a safe cutoff for this table, and the reason is the hourly
-//! fold beside it. `cog_llm_usage_rollup` is a *derivation* of the ledger: every
-//! window it holds was computed by summing ledger rows, and a window it does
-//! not hold has never been summed. Deleting a row that no window covered does
-//! not age it out, it deletes the only copy of that spend — the rollup would
-//! report the hour as quiet forever, with nothing left to recompute it from and
-//! no reading that could notice. So the sweep's question is two-part, and both
-//! halves have to hold: the row is past the retention, *and* the fold reaches
-//! back to it.
+//! 从前这里按天删：超过保留期的行删掉，只留小时折叠。那套东西的正确性靠一个两段条件撑着
+//! （行过了保留期，**而且**折叠覆盖到它），因为折叠是账本的一次推导——删掉一个没被任何窗口
+//! 汇总过的行，删的不是「过期的拷贝」，是那段花费的唯一一份。条件本身是对的，但它说明的
+//! 是另一件事：**这张表里哪一行可以删，取决于别的表算到哪儿了**，那是判断，不是保留期。
 //!
-//! The second half is the reason this loop publishes what it cannot delete. A
-//! ledger that stops shrinking because the fold's older end sits above the
-//! retention looks exactly like a retention that is working, from every reading
-//! the deletion itself can produce. The uncovered rows and their age are
-//! therefore published beside the size, and the rule that reads them fires on
-//! the pair: rows exist *and* they are past the retention, which is the state
-//! where the promise to the reader has stopped being kept.
+//! 所以这一族改成**只测量、不删除**：每拍发行数、字节、最老一行多老、折叠的最老窗口、以及
+//! 「折叠没覆盖到的那段还有多少行、多老」。最后这一对仍然重要，只是含义变了——它不再是
+//! 「删不动的原因」，而是「这一段花费只能从明细里回答」这个事实本身。
 //!
-//! No lease guards the pass. The batches take rows in timestamp order, so two
-//! replicas sweeping at once take them in the same order and cannot deadlock
-//! against each other, and the set that gets deleted is defined by the clock
-//! rather than by who is running.
-
+//! 保留天数这个数还在，含义变了：它是**这个部署对外承诺的查询窗口**（花费用量读的那一侧
+//! 用它当上界），不是删除阈值。它仍然是实测的函数（按卷大小与每天写入量算），量不到时
+//! 部署写的那个数顶着。
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,21 +73,11 @@ pub const KNOB: &str = "llmUsageRetention.keepDays";
 // cap: bound — 这个循环发布的是告警规则读的那些系列，而 Prometheus 五分钟见不到就丢
 pub const PERIOD: Duration = Duration::from_secs(300);
 
-/// How many rows one statement may delete.
-///
-/// Two thousand rows is a few hundred kilobytes and a short lock. The pass
-/// repeats until it finds nothing past the cutoff, so the number of batches
-/// follows the backlog rather than the batch size.
-// cap: bound — 循环重复到切点之外没有行为止，所以批数跟的是积压而不是批量
-const BATCH_ROWS: i64 = 2_000;
-
 /// What one pass did, so a caller can assert on it rather than infer it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionOutcome {
     /// Rows the ledger held after the pass.
     pub held: i64,
-    /// Rows this pass retired.
-    pub removed: u64,
     /// The age of the oldest surviving row, in seconds; zero when empty.
     pub oldest_age_secs: i64,
     /// The retention this pass enforced, in seconds.
@@ -193,14 +169,16 @@ impl UsageRetention {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             beat.beat();
-            match self.retire_once(|| beat.beat()).await {
+            match self.measure_once().await {
                 Ok(outcome) => {
-                    if outcome.removed > 0 {
+                    if outcome.uncovered > 0
+                        && outcome.uncovered_oldest_age_secs > outcome.keep_secs
+                    {
                         info!(
-                            rows = outcome.removed,
                             held = outcome.held,
                             uncovered = outcome.uncovered,
-                            "Retired LLM usage rows past the retention"
+                            uncovered_oldest_age_secs = outcome.uncovered_oldest_age_secs,
+                            "LLM usage rows older than the fold's floor are still here; nothing                              deletes them, and a spend question about that span is answered from                              these rows rather than from the fold"
                         );
                     }
                     self.report(&outcome).await;
@@ -221,17 +199,14 @@ impl UsageRetention {
         }
     }
 
-    /// Retire every row that is past the retention *and* inside what the fold
-    /// covers, calling `progress` before each batch.
+    /// Read the ledger: how many rows, how far back it reaches, what the fold
+    /// covers, and what this deployment promises its readers.
     ///
-    /// The fold's older end is read once per pass rather than per batch: it
-    /// moves only when the backfill lands a window, and a value that changed
-    /// mid-pass would make two batches of one pass answer the same question
-    /// differently.
-    pub async fn retire_once(&self, progress: impl Fn()) -> SFResult<RetentionOutcome> {
-        // The retention is recomputed before the cutoff is chosen: the pass
-        // retires against this beat's measured cost of a day's writes, not
-        // against the number the deployment wrote down at install time.
+    /// Nothing is removed. The fold's floor is still read, because it is the
+    /// boundary between "a spend question about this span is answered by the
+    /// fold" and "it is answered only by these rows" -- a fact a reader needs
+    /// and a retention used to hide by making the second case impossible.
+    pub async fn measure_once(&self) -> SFResult<RetentionOutcome> {
         let oldest_before = self.oldest_age_secs().await?;
         let bytes = self
             .table_bytes()
@@ -239,44 +214,13 @@ impl UsageRetention {
             .ok()
             .map(|bytes| bytes.max(0) as u64);
         let (keep, keep_derived) = self.keep_for(oldest_before, bytes);
-        let cutoff = chrono::Utc::now()
-            - chrono::Duration::from_std(keep).unwrap_or_else(|_| chrono::Duration::days(30));
         let floor = self.fold_floor().await?;
-        let mut removed = 0u64;
-        if let Some(floor) = floor {
-            if cutoff > floor {
-                loop {
-                    progress();
-                    let batch = sqlx::query(&format!(
-                        "DELETE FROM {table} WHERE id IN (
-                             SELECT id FROM {table}
-                              WHERE ts < $2 AND ts >= $3
-                              ORDER BY ts
-                              LIMIT $1
-                         )",
-                        table = LEDGER_TABLE,
-                    ))
-                    .bind(BATCH_ROWS)
-                    .bind(cutoff)
-                    .bind(floor)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| SFError::Database(e.to_string()))?
-                    .rows_affected();
-                    removed += batch;
-                    if batch == 0 {
-                        break;
-                    }
-                }
-            }
-        }
 
         let held = self.row_count().await?;
         let oldest_age_secs = self.oldest_age_secs().await?;
         let (uncovered, uncovered_oldest_age_secs) = self.uncovered(floor).await?;
         Ok(RetentionOutcome {
             held,
-            removed,
             oldest_age_secs,
             keep_secs: keep.as_secs() as i64,
             keep_derived,
@@ -532,6 +476,17 @@ mod tests {
         );
     }
 
+    /// 这个模块里没有删除。保留期是一条读数，不是一个到点执行的语句。
+    #[test]
+    fn the_module_carries_no_delete_statement() {
+        let source = include_str!("usage_retention.rs");
+        let forbidden = ["DE", "LETE FROM"].join("");
+        assert!(
+            !source.to_uppercase().contains(&forbidden),
+            "a delete statement came back into the measuring loop"
+        );
+    }
+
     /// 目标不变的一拍仍然是一拍：求值计数往上走，目标以天为单位登记，
     /// 并且读侧看到的天数跟着这一拍走。
     #[tokio::test]
@@ -544,7 +499,6 @@ mod tests {
         .with_readings(Arc::clone(&readings));
         let outcome = RetentionOutcome {
             held: 100,
-            removed: 0,
             oldest_age_secs: 86_400,
             keep_secs: 7 * 86_400,
             keep_derived: true,
