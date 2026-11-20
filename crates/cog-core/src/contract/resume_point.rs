@@ -91,8 +91,9 @@ mod tests {
     /// 而任何一处「读起来像跑完了」的实现会在其中一个前缀上答错。
     #[test]
     fn every_prefix_resumes_at_the_first_step_without_ok() {
-        const ORDER: [&str; 3] = ["plan", "write", "verify"];
-        for prefix in 0..=3 {
+        // 0 到 7 步，覆盖一步、多步与全空三种边界：判据说的是「0~7 步前缀」。
+        const ORDER: [&str; 7] = ["plan", "write", "verify", "test", "gate", "push", "report"];
+        for prefix in 0..=7 {
             let events: Vec<StepEvent> = ORDER[..prefix]
                 .iter()
                 .map(|step| ev(step, 1, "ok"))
