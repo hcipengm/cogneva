@@ -59,6 +59,19 @@ impl ChangeIdentity {
     pub fn as_key(&self) -> String {
         format!("{}:{}:{}", self.kind, self.scope, self.literal)
     }
+
+    /// 写进「这一轮做哪几条」那一份清单里的身份。
+    ///
+    /// 与 [`Self::as_key`] 的区别只有一条，而这一条正是清单要的：**它是一对一的**。
+    /// `kind:scope:literal` 把三段用冒号粘起来，字面量里带冒号的两条变更会粘出一模
+    /// 一样的两行——于是「这一批里有它」在清单上认得出错的那一条。清单是要拿来判
+    /// 「做完了没有」的，认出错的那一条与没认出来一样坏。
+    ///
+    /// 编码成 JSON 数组：三段各自转义，拼起来必然一对一，而且是稳定的（同一身份每次
+    /// 得到同一串），因为清单要跨进程、跨重启对得上。
+    pub fn batch_id(&self) -> String {
+        serde_json::json!([self.kind, self.scope, self.literal]).to_string()
+    }
 }
 
 impl std::fmt::Display for ChangeIdentity {
@@ -2069,6 +2082,21 @@ mod tests {
     /// Every state and reason round-trips through its name, and the lists hold no
     /// duplicates.
     ///
+    /// 批次清单上的身份必须一对一：`as_key` 把三段用冒号粘起来，字面量里带冒号的
+    /// 两条变更会粘成同一行——清单一旦认错那一条，「这一批做完了没有」就答的是别人。
+    #[test]
+    fn the_batch_id_separates_identities_the_flat_key_merges() {
+        let one = ChangeIdentity::new("grep", "crates/a", "fn x: y");
+        let two = ChangeIdentity::new("grep:crates/a", "fn x", " y");
+        assert_eq!(one.as_key().len(), two.as_key().len());
+        assert_ne!(
+            one.batch_id(),
+            two.batch_id(),
+            "两条不同的变更给出了同一个批次身份"
+        );
+        assert_eq!(one.batch_id(), one.batch_id(), "同一身份每次要给同一串");
+    }
+
     /// This is the gate on the closed sets: the storage writes a state by its
     /// name and reads it back by parsing, and a variant left out of `ALL` is one
     /// no reader enumerates -- the census would count it as absent and the row

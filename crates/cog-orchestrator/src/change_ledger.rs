@@ -5301,7 +5301,10 @@ async fn pinned_batch(
     outstanding: &[ChangeLedgerRow],
     pending: Vec<ChangeLedgerRow>,
 ) -> Result<Vec<ChangeLedgerRow>, String> {
-    let owed_now: HashSet<String> = outstanding.iter().map(|r| r.identity.to_string()).collect();
+    // 清单上的身份用 `batch_id` 而不是 `Display`：后者把三段用冒号粘起来，字面量里
+    // 带冒号的两条变更会粘成同一行，清单就会认错那一条——而这份清单是判「做完了没有」
+    // 的主语。
+    let owed_now: HashSet<String> = outstanding.iter().map(|r| r.identity.batch_id()).collect();
     let Some(open) = rounds.current().await.map_err(|e| e.to_string())? else {
         return open_next_round(rounds, pending).await;
     };
@@ -5326,7 +5329,7 @@ async fn pinned_batch(
     let before = pending.len();
     let pinned: Vec<ChangeLedgerRow> = pending
         .into_iter()
-        .filter(|row| allowed.contains(&row.identity.to_string()))
+        .filter(|row| allowed.contains(&row.identity.batch_id()))
         .collect();
     info!(
         round = %open.round,
@@ -5353,7 +5356,7 @@ async fn open_next_round(
         // 平台的账在库里，没有 git rev：空串是「这本台账没有版本坐标」，不是「没有台账」。
         ledger_rev: String::new(),
         code_rev: String::new(),
-        batch: pending.iter().map(|r| r.identity.to_string()).collect(),
+        batch: pending.iter().map(|r| r.identity.batch_id()).collect(),
         actor: "change-ledger".into(),
         at: Utc::now(),
     };
@@ -12384,7 +12387,7 @@ mod tests {
         assert_eq!(pinned.len(), 2, "开轮那一拍下发的就是这一批，不多不少");
         let opened = rounds.opened();
         assert_eq!(opened.len(), 1);
-        let ids: Vec<String> = pending.iter().map(|r| r.identity.to_string()).collect();
+        let ids: Vec<String> = pending.iter().map(|r| r.identity.batch_id()).collect();
         assert_eq!(opened[0].batch, ids, "钉住的清单就是这一拍要发的那些");
     }
 
@@ -12421,7 +12424,7 @@ mod tests {
         assert_eq!(pinned.len(), 1);
         let opened = rounds.opened();
         assert_eq!(opened.len(), 1, "关轮之后要开新的一轮");
-        assert_eq!(opened[0].batch, vec![pending[0].identity.to_string()]);
+        assert_eq!(opened[0].batch, vec![pending[0].identity.batch_id()]);
     }
 
     /// 读不到批次就这一拍不下发：退回「没有钉住」等于把这道判据静默关掉。
