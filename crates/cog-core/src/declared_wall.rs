@@ -62,7 +62,18 @@
 //!
 //! The samples the bound is made of live in [`cog_core::progress`], because a
 //! beat is recorded from wherever work actually advances; what this module fixes
-//! is the law those samples are read through. A third copy of either clause is
+//! is the law those samples are read through.
+//!
+//! **Two sources feed that reservoir, and the second one is not a beat.** A beat
+//! is a step that completed, so on its own the population is the work that moved
+//! and then stopped. A network wait — a fetch, a remote handshake — produces no
+//! output and no CPU, so it never beats, and a bound measured only from beats is
+//! narrower than the work this deployment really does: the first legitimate wait
+//! shaped like that gets killed by it. So a child that **ends normally** hands
+//! the quiet stretch it ended with to the same reservoir
+//! ([`cog_core::progress::record_measured_silence`]); a stretch that ended in a
+//! kill is not handed over, because that one is the anomaly and not a reading of
+//! ordinary quiet. A third copy of either clause is
 //! the defect this module exists to prevent: before it existed, the backup drill
 //! carried its own "silent for N seconds" watchdog with a number written into
 //! the deployment, which is an expectation wearing the clothes of a judgement.

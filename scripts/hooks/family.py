@@ -207,7 +207,17 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
     # 由 `foreign` 带进来。不带进来，那些行永远报缺口，而它们永远绿不了——这一批也就
     # 永远编不了。
     every = touched | set(foreign)
-    gaps = [p for p in batch if not is_touched(p, every)]
+    # 缺口按**待办**算，不按路径算：一条待办可以点名好几个触点，任何一个动了就算它这一
+    # 轮被改到。按路径算的话，多触点的那几条永远有剩——`touches` 里点名了一个这一轮
+    # 本来就不该动的文件，整批就永远编不了，而推之前那道门（按待办算）会放行：
+    # 两道门数出两个数，正是「同一件事有两份判据」的老毛病。
+    gaps = []
+    for name, paths in todos:
+        if not paths:
+            continue
+        missing = [p for p in paths if not is_touched(p, every)]
+        if missing:
+            gaps.append((name, missing))
 
     owed: list[tuple[str, str]] = []
     for check in CHECKS:
@@ -218,13 +228,14 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
         print(f"  待办 {name}: {len(paths)} 个触点")
     if missing_todos:
         print(f"  ⚠ 这些待办没写 `touches:`，批次算不出它们要动什么：{', '.join(missing_todos)}")
-    for path in gaps:
+    for name, missing in gaps:
+      for path in missing:
         if (root / path).exists():
-            print(f"  TODO {path}  <- 这一轮的待办要点名它，但它还没改")
+            print(f"  TODO {path}  <- 待办 {name} 点名了它，这一轮还没改它")
         elif other is not None and (other / path).exists():
             # 这一条要动的东西在台账所在的那个仓里：那一侧还没改，不是这一侧的事，
             # 但也不能读成「这个树里没有这条路」。
-            print(f"  TODO {path}  <- 台账仓里还没改（这一条的产物不在这个树里）")
+            print(f"  TODO {path}  <- 待办 {name}：台账仓里还没改（这一条的产物不在这个树里）")
         else:
             # 两种缺口的修法不同：改一个错别字，与写一件还没写的活。一条「还没改」
             # 把两者读成同一件事，而点不存在的路径的那条台账，等多久都不会自己变绿。
