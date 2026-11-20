@@ -19,6 +19,7 @@ trap 'rm -rf "$tmp"' EXIT
 tree="$tmp/tree"
 mkdir -p "$tree/scripts/hooks" "$tree/crates/a/src" "$tree/crates/b/src" "$tree/deploy"
 cp "$gate" "$tree/scripts/hooks/batch-gate.py"
+cp "$(dirname "$gate")/todo_source.py" "$tree/scripts/hooks/todo_source.py"
 echo a >"$tree/crates/a/src/x.rs"; echo b >"$tree/crates/b/src/y.rs"; echo d >"$tree/deploy/manifest.yaml"
 git -C "$tree" init -q; git -C "$tree" config user.email t@t; git -C "$tree" config user.name t
 git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm base; git -C "$tree" branch -f origin/main HEAD

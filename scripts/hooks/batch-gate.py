@@ -28,7 +28,8 @@ import re
 import subprocess
 import sys
 
-DEFAULT_LEDGER = pathlib.Path.home() / ".local/state/cogneva/todo-ledger.md"
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import todo_source  # noqa: E402
 def resolve_ledger(explicit: str | None) -> pathlib.Path:
     """台账路径：显式 → 环境变量 → 本机配置文件 → 默认（不存在就是没有台账）。
 
@@ -60,35 +61,9 @@ def estimate_tokens(text: str) -> int:
     return cjk + max(0, len(text) - cjk) // 4
 
 
-def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, str, list[str]]], int]:
-    """(本轮未完成的待办, 积压条数)。
-
-    「这一轮」由行里的 `round: current` 标出；一行都没标时，全部未完成待办都算本轮
-    ——默认全量。积压不是被丢掉：它的条数每次都印出来，而且选它的时候必须把标记写回去。
-    """
-    open_rows: list[tuple[str, str, str, list[str]]] = []
-    for line in ledger.read_text(errors="ignore").splitlines():
-        if not line.startswith("| S"):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 3:
-            continue
-        name = cells[0]
-        if not any(word in cells[2] for word in OPEN_WORDS):
-            continue
-        found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
-        paths: list[str] = []
-        if found:
-            raw = found.group(1).strip()
-            if not raw.startswith("unknown"):
-                paths = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
-        open_rows.append((name, line, cells[2], paths))
-
-    current = [(n, l, p) for n, l, _, p in open_rows if "round: current" in l]
-    if current:
-        backlog = len(open_rows) - len(current)
-        return current, backlog
-    return [(n, l, p) for n, l, _, p in open_rows], 0
+def open_todos(spec: str):
+    """台账 → 未完成条目。来源的形状见 `todo_source.py`；读不到抛 Unreadable。"""
+    return todo_source.load(spec)
 
 
 def changed(root: pathlib.Path, base: str) -> list[str]:
@@ -143,29 +118,29 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
     parser.add_argument("--base", default="origin/main")
-    parser.add_argument("--ledger", default=None)
+    parser.add_argument("--source", default=None)
     parser.add_argument("--window-tokens", type=int,
                         default=int(os.environ.get("COGNEVA_CONTEXT_WINDOW", "0")))
     args = parser.parse_args(argv[1:])
 
     root = pathlib.Path(args.root).resolve()
-    ledger = resolve_ledger(args.ledger)
-    if not ledger.exists():
-        print(f"batch-gate: 台账读不到（{ledger}），这一推没判。", file=sys.stderr)
-        return 2
 
-    todos, backlog = open_todos(ledger)
+    try:
+        todos = open_todos(args.source or todo_source.default_spec())
+    except todo_source.Unreadable as e:
+        print(f"batch-gate: {e} —— 这一推没判。", file=sys.stderr)
+        return 2
     if not todos:
-        print(f"batch-gate: 台账里没有本轮的待办（积压 {backlog} 条）。")
+        print("batch-gate: 台账里没有未完成的待办。")
         return 0
 
     touched = changed(root, args.base)
-    rows = {name: line for name, line, _ in todos}
-    done = {name for name, _, paths in todos if paths and any(p in touched for p in paths)}
-    untouched = [name for name, _, _ in todos if name not in done]
+    rows = {item.id: item.title for item in todos}
+    done = {i.id for i in todos if i.touches and any(p in touched for p in i.touches)}
+    untouched = [i.id for i in todos if i.id not in done]
 
     if not untouched:
-        print(f"batch-gate: 本轮 {len(todos)} 条待办这一推全部动到了（积压 {backlog} 条）。")
+        print(f"batch-gate: 台账上 {len(todos)} 条未完成待办，这一推全部动到了。")
         return 0
 
     msg = messages(root, args.base)
@@ -195,7 +170,7 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: {problem}", file=sys.stderr)
         return 1
 
-    print(f"batch-gate: 做了 {len(done)} 条，按第 {kind} 条排除 {len(declared)} 条（已逐条点名）；积压 {backlog} 条。")
+    print(f"batch-gate: 做了 {len(done)} 条，按第 {kind} 条排除 {len(declared)} 条（已逐条点名）。")
     return 0
 
 

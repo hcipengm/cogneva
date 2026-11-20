@@ -262,6 +262,21 @@ pub(crate) fn ledger_sql(inner: &str, outer: &str) -> String {
     };
     format!(
         r#"
+WITH latest_def AS (
+    SELECT DISTINCT ON (task_id) * FROM task_defined WHERE {inner}
+     ORDER BY task_id, rev DESC
+), blocking AS (
+    -- 「谁被谁挡」对整批算一次。从前它是逐行一个 LATERAL 子查询，每一行都去扫
+    -- 一遍全部定义（`blocked_by @> ARRAY[这一行]`），是任务数的平方：现网一千多个
+    -- 任务时这条读要十秒，而读它的是调度器的主循环——一轮十秒，它就再也挤不出余量
+    -- 干活。一次 unnest + 分组是同一句话，代价是线性的。
+    SELECT unnest(x.blocked_by) AS blocked_task,
+           array_agg(x.task_id ORDER BY x.task_id) AS blocks
+      FROM (SELECT DISTINCT ON (task_id) task_id, blocked_by
+              FROM task_defined
+             ORDER BY task_id, rev DESC) x
+     GROUP BY 1
+)
 SELECT d.workspace_id       AS workspace_id,
        d.task_id            AS task_id,
        d.kind               AS kind,
@@ -300,8 +315,7 @@ SELECT d.workspace_id       AS workspace_id,
        a.agent_id                             AS attempt_agent,
        a.result                               AS attempt_result,
        COALESCE(b.blocks, '{{}}'::text[])     AS blocks
-  FROM (SELECT DISTINCT ON (task_id) * FROM task_defined WHERE {inner}
-         ORDER BY task_id, rev DESC) d
+  FROM latest_def d
   JOIN LATERAL (
         SELECT to_state, at, seq, not_before FROM task_transition
          WHERE task_id = d.task_id ORDER BY seq DESC LIMIT 1
@@ -314,14 +328,7 @@ SELECT d.workspace_id       AS workspace_id,
           FROM task_attempt WHERE task_id = d.task_id
          ORDER BY attempt_no DESC LIMIT 1
        ) a ON TRUE
-  LEFT JOIN LATERAL (
-        SELECT array_agg(x.task_id ORDER BY x.task_id) AS blocks
-          FROM (SELECT DISTINCT ON (task_id) task_id, blocked_by
-                  FROM task_defined
-                 WHERE blocked_by @> ARRAY[d.task_id]
-                 ORDER BY task_id, rev DESC) x
-         WHERE d.task_id = ANY(x.blocked_by)
-       ) b ON TRUE{outer}
+  LEFT JOIN blocking b ON b.blocked_task = d.task_id{outer}
 "#
     )
 }
