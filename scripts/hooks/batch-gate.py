@@ -135,6 +135,10 @@ def main(argv: list[str]) -> int:
     try:
         import round as round_mod
         current = round_mod.current_round()
+    except todo_source.Unreadable as e:
+        # 读不到与「没有开着的一轮」是两件事：前者要修读的路，后者要开一轮。
+        print(f"batch-gate: 事件流读不到 —— {e}；这一推没判。", file=sys.stderr)
+        return 2
     except Exception:
         current = None
     if not current:

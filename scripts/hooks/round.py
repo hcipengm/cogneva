@@ -43,15 +43,29 @@ def ledger_repo(spec: str) -> pathlib.Path | None:
     return pathlib.Path(out) if out else None
 
 
-def psql(sql: str) -> str:
-    """读/写事件流的那条命令。宿主配置给出（默认走集群里的 psql）。"""
+def psql_command() -> str:
+    """读/写事件流的那条命令：环境变量优先，其次是仓库自带的那个入口。
+
+    第二档不是兜底而是正本：`scripts/host/event-psql.sh` 就在同一个仓里，它接收
+    一段 SQL 并把结果行印出来。没有它的时候每一处调用方都得自己把环境变量拼对，
+    而拼错与「流里没有开着的一轮」在读数上是同一句话——一轮开着也读不出来。
+    """
     import os
     cmd = os.environ.get(PSQL_ENV, "")
-    if not cmd:
-        raise todo_source.Unreadable(
-            f"没有配置事件流的读写命令（{PSQL_ENV}）：它要接收一段 SQL 并在 "
-            "`cogneva_event` 上执行"
-        )
+    if cmd:
+        return cmd
+    shipped = pathlib.Path(__file__).resolve().parent.parent / "host" / "event-psql.sh"
+    if shipped.is_file():
+        return str(shipped)
+    raise todo_source.Unreadable(
+        f"没有配置事件流的读写命令：{PSQL_ENV} 没设，仓库里也没有 {shipped}。"
+        "这条命令要接收一段 SQL 并在 `cogneva_event` 上执行"
+    )
+
+
+def psql(sql: str) -> str:
+    """读/写事件流的那条命令。宿主配置给出，或者用仓库自带的那个入口。"""
+    cmd = psql_command()
     result = subprocess.run(f"{cmd} {shlex.quote(sql)}", shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         raise todo_source.Unreadable(f"事件流命令失败：{result.stderr.strip()[:200]}")
@@ -186,15 +200,20 @@ def main(argv: list[str]) -> int:
     parser.add_argument("action", choices=["open", "status", "close", "rebound"])
     parser.add_argument("--source", default=None)
     args = parser.parse_args(argv[1:])
-    if args.action == "open":
-        return open_round(args.source)
-    if args.action == "rebound":
-        # 这一轮没变，变的是它钉的那一版台账（例如台账随后才提交）。重钉是一次
-        # **计划修订**：追加一条新的 round_opened，读取方取最新的一条。
-        return open_round(args.source, allow_open=True)
-    if args.action == "status":
-        return status()
-    return close()
+    try:
+        if args.action == "open":
+            return open_round(args.source)
+        if args.action == "rebound":
+            # 这一轮没变，变的是它钉的那一版台账（例如台账随后才提交）。重钉是一次
+            # **计划修订**：追加一条新的 round_opened，读取方取最新的一条。
+            return open_round(args.source, allow_open=True)
+        if args.action == "status":
+            return status()
+        return close()
+    except todo_source.Unreadable as e:
+        # 读不到不是「没有」：退 3，调用方分得开这两种情况。
+        print(f"round: 事件流读不到 —— {e}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
