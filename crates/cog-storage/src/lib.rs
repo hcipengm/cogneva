@@ -74,6 +74,7 @@ pub use mem::{
 };
 
 #[cfg(feature = "postgres")]
+pub use postgres::body_store::PostgresBodyStore;
 pub use postgres::llm_call_events::LlmCallEventStore;
 pub use postgres::tool_call_events::ToolCallEventStore;
 pub use postgres::{

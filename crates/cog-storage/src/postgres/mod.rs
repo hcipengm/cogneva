@@ -10,6 +10,7 @@ pub mod agent_message_store;
 pub mod attempt_journal_store;
 pub mod audit_recorder;
 pub mod backup_run_store;
+pub mod body_store;
 pub mod change_candidate_store;
 pub mod change_ledger_store;
 pub mod chat_turn_store;
