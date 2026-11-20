@@ -18,6 +18,9 @@ pub struct ContextWindow {
     /// 这一轮从提示词里挤掉了什么。裁剪一次记一次，攒到 [`Self::take_compaction`]
     /// 取走为止；没有裁剪就一直是 `None`。
     compaction: Option<Compaction>,
+    /// 最近观察到的一次正常往返占多少 token。折中间段时，尾部要留够这么多，
+    /// 否则刚发生的事会被折掉。`None` 表示还没量到——那时一条也不折。
+    round_trip_tokens: Option<usize>,
 }
 
 /// 一次（或一轮里几次）提示词裁剪的现场。
@@ -190,6 +193,17 @@ impl ContextWindow {
             max_tokens,
             current_tokens: 0,
             compaction: None,
+            round_trip_tokens: None,
+        }
+    }
+
+    /// 记下一次正常往返占了多少 token。
+    ///
+    /// 这个数是「折中间段时尾部要留多长」的**唯一出处**：没有它就没有依据说哪一段
+    /// 是「刚刚发生」、哪一段是「已经过去」。量不到时保持 `None`，折的动作不发生。
+    pub fn note_round_trip(&mut self, tokens: usize) {
+        if tokens > 0 {
+            self.round_trip_tokens = Some(tokens);
         }
     }
 
@@ -454,7 +468,68 @@ impl ContextWindow {
         self.budget() / TRIM_LOW_WATER_DIVISOR
     }
 
+    /// 折中间段：把头与尾之间那一段换成一条摘要消息。
+    ///
+    /// 只在**量到过一次往返**时做（`plan_fold` 给出分界）：尾留一次往返的量，头部
+    /// 是 system 与首条 user，中间那段是要折的。折的单位按**轮次组**——切点落在
+    /// assistant 与它的 tool result 之间时，把切点往前收，直到不切断一组：切断一组
+    /// 会留下声明了 tool_calls 却无响应的 assistant，严格校验的上游直接 400。
+    ///
+    /// 返回折掉了多少条；0 表示这一拍没有折（没量到、或者中间没有东西可折）。
+    fn fold_middle(&mut self) -> usize {
+        let Some(round_trip) = self.round_trip_tokens else {
+            return 0;
+        };
+        let head = self
+            .messages
+            .iter()
+            .take_while(|m| matches!(m, Message::System { .. }))
+            .count()
+            .max(1); // 首条 user 也是地板
+        let per_message: Vec<usize> = self
+            .messages
+            .iter()
+            .map(|m| estimate_tokens(&m.content()))
+            .collect();
+        let Some(plan) = plan_fold(&per_message, head, round_trip) else {
+            return 0;
+        };
+        // 切点不能落在「assistant 与它的 tool result 之间」：往前收到这一组的开头。
+        let mut start = plan.tail_from;
+        while start > head && matches!(self.messages[start], Message::ToolResult { .. }) {
+            start -= 1;
+        }
+        if start <= head {
+            return 0;
+        }
+        let dropped: Vec<Message> = self.messages.drain(head..start).collect();
+        let freed: usize = dropped.iter().map(|m| estimate_tokens(&m.content())).sum();
+        self.current_tokens = self.current_tokens.saturating_sub(freed);
+        // 折出来的那一条必须是**用户**消息：它描述的是「这一段里发生过什么」，
+        // 不是谁说的一句话；写成 assistant 会让下一轮看起来像模型自己刚说过。
+        let summary = CompactionSummary {
+            open: dropped
+                .iter()
+                .filter(|m| matches!(m, Message::User { .. }))
+                .map(headline)
+                .collect(),
+            ..Default::default()
+        };
+        let folded_tokens = estimate_tokens(&summary.render());
+        if !summary.is_empty() {
+            self.messages.insert(head, Message::user(summary.render()));
+            self.current_tokens += folded_tokens;
+        }
+        dropped.len()
+    }
+
     fn trim_if_needed(&mut self) {
+        // 先折中间段：头与尾都是这一轮要继续的上下文，折中间把它变成一条摘要。
+        // 没量到往返（因此没依据留多长的尾）时 `fold_middle` 返回 0，落到下面
+        // 原来那条「从头按轮次组删」的路径上——两条路都只做一次，不叠加。
+        if self.current_tokens > self.budget() && self.fold_middle() > 0 {
+            return;
+        }
         // 只有真过界才裁；一旦裁就裁到低水位，而不是裁到刚好不超。
         // 判据是「这一次入队把窗口顶过了预算」——没过界就不裁，过界之后
         // 的循环由低水位收尾。
