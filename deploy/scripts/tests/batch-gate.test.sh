@@ -20,19 +20,34 @@ tree="$tmp/tree"
 mkdir -p "$tree/scripts/hooks" "$tree/crates/a/src" "$tree/crates/b/src" "$tree/deploy"
 cp "$gate" "$tree/scripts/hooks/batch-gate.py"
 cp "$(dirname "$gate")/todo_source.py" "$tree/scripts/hooks/todo_source.py"
+cp "$(dirname "$gate")/round.py" "$tree/scripts/hooks/round.py"
 echo a >"$tree/crates/a/src/x.rs"; echo b >"$tree/crates/b/src/y.rs"; echo d >"$tree/deploy/manifest.yaml"
 git -C "$tree" init -q; git -C "$tree" config user.email t@t; git -C "$tree" config user.name t
 git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm base; git -C "$tree" branch -f origin/main HEAD
 
-ledger="$tmp/ledger.md"
+ledger="$tree/ledger.md"
 row() { printf '| %s | 内容 | 未落 | 判据 |｜round: current｜touches: %s\n' "$1" "$2"; }
 { row S1 "crates/a/src/x.rs"; row S2 "crates/b/src/y.rs"; row S3 "deploy/manifest.yaml"; } >"$ledger"
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm ledger
+git -C "$tree" branch -f origin/main HEAD
+LEDGER_REV="$(git -C "$tree" rev-parse HEAD)"
+CODE_REV="$LEDGER_REV"
+
+# 事件流的替身：round 现在住在流里，夹具给一条「开着一轮」的回答就够。
+cat >"$tmp/psql.sh" <<STUB
+#!/bin/sh
+case "\$*" in
+  *round_opened*) printf '%s\t%s\t%s\n' "round-test" "$LEDGER_REV" "$CODE_REV" ;;
+  *) : ;;
+esac
+STUB
+chmod +x "$tmp/psql.sh"
 
 pass=0; fail=0
 ok()  { printf 'ok    - %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf 'FAIL- %s\n' "$1" >&2; fail=$((fail + 1)); }
 reset() { git -C "$tree" reset -q --hard origin/main; }
-run() { COGNEVA_TODO_LEDGER="$ledger" python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main 2>&1; }
+run() { COGNEVA_EVENT_PSQL="$tmp/psql.sh" COGNEVA_TODO_LEDGER="$ledger" python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main 2>&1; }
 commit_with() { git -C "$tree" commit -q --allow-empty -F - < <(printf '%s\n' "$1"); }
 
 echo a2 >>"$tree/crates/a/src/x.rs"; git -C "$tree" add -A >/dev/null
@@ -62,7 +77,7 @@ git -C "$tree" add -A >/dev/null; commit_with "touch both"
 out=$(run); rc=$?
 [ "$rc" -eq 0 ] && ok "本轮待办都动到了：绿，不看 Split" || bad "全做完仍被拒（rc=$rc）：$out"
 
-out=$(COGNEVA_TODO_LEDGER="$tmp/missing.md" python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main 2>&1); rc=$?
+out=$(COGNEVA_EVENT_PSQL="$tmp/psql.sh" COGNEVA_TODO_LEDGER="$tmp/missing.md" python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "台账读不到：退 2（没判）" || bad "台账读不到时的行为不对（rc=$rc）：$out"
 
 printf '\nbatch-gate.test.sh: %d passed, %d failed\n' "$pass" "$fail"

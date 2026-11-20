@@ -141,13 +141,15 @@ def main(argv: list[str]) -> int:
         print("batch-gate: 事件流里没有开着的一轮（先 `scripts/hooks/round.py open`），这一推没判。",
               file=sys.stderr)
         return 2
-    round_ids: set[str] = set()
-    round_ids = {i.id for i in todo_source.load(f'md:{round_mod.ledger_at(current[1], todo_source.default_spec())}')}
+    try:
+        pinned = round_mod.ledger_at(current[1], todo_source.default_spec())
+        round_ids = {i.id for i in todo_source.load(f"md:{pinned}")}
+    except todo_source.Unreadable as e:
+        print(f"batch-gate: 这一轮钉住的那版台账读不到：{e} —— 这一推没判。", file=sys.stderr)
+        return 2
 
     try:
-        items, without, _deferred = todo_source.partition(
-            args.source or f"md:{round_mod.ledger_at(current[1], todo_source.default_spec())}"
-        )
+        items, without, _deferred = todo_source.partition(args.source or f"md:{pinned}")
         if without:
             print(
                 "batch-gate: 这些未完成待办没有 `touches:`，它们既做不了也判不了："
