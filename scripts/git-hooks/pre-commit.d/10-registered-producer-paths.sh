@@ -21,7 +21,7 @@ repo="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 [ -n "$repo" ] || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-gate="$here/../../../gates/check-registered-producer-paths.py"
+gate="$here/../gates/check-registered-producer-paths.py"
 [ -f "$gate" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 

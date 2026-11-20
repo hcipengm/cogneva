@@ -24,7 +24,7 @@
 set -u
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-gate="$here/../../../gates/check-commit-author-is-the-session-employee.sh"
+gate="$here/../gates/check-commit-author-is-the-session-employee.sh"
 [ -f "$gate" ] || {
     printf 'pre-commit（作者署名）: 这一条今天判不了，不拦 —— 判据脚本不在本树里\n' >&2
     exit 0
