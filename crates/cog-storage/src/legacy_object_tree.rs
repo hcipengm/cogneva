@@ -34,10 +34,10 @@ pub const LEGACY_OBJECTS_RULE: &str = "object_store_legacy_objects_left_behind";
 pub const LEGACY_SCAN_UNREADABLE_RULE: &str = "object_store_legacy_tree_unreadable";
 
 /// 哪个后端在跑——决定这棵树里的东西是不是「看不见的」。
-pub const PROVIDER_LABEL: &str = "provider";
+pub const LABEL_PROVIDER: &str = "provider";
 
 /// 要搬的那棵树。标签值就是这个路径：一条告警要能点名人去搬哪个目录。
-pub const PATH_LABEL: &str = "path";
+pub const LABEL_PATH: &str = "path";
 
 /// 启动时那一次清点的结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,8 +74,8 @@ pub fn readings_for(tree: &LegacyObjectTree) -> Vec<RawMetric> {
         None => (LEGACY_SCAN_UNREADABLE_METRIC, 1.0),
     };
     vec![RawMetric::new(name, value)
-        .with_label(PROVIDER_LABEL, tree.provider.as_str())
-        .with_label(PATH_LABEL, tree.path.as_str())]
+        .with_label(LABEL_PROVIDER, tree.provider.as_str())
+        .with_label(LABEL_PATH, tree.path.as_str())]
 }
 
 /// 把那次清点送进本进程的抓取面。
@@ -121,11 +121,11 @@ mod tests {
         assert_eq!(reading.name, LEGACY_OBJECTS_METRIC);
         assert_eq!(reading.value, 12.0);
         assert_eq!(
-            reading.labels.get(PROVIDER_LABEL).map(String::as_str),
+            reading.labels.get(LABEL_PROVIDER).map(String::as_str),
             Some("seaweedfs")
         );
         assert_eq!(
-            reading.labels.get(PATH_LABEL).map(String::as_str),
+            reading.labels.get(LABEL_PATH).map(String::as_str),
             Some("/var/lib/cogneva-data/storage")
         );
     }
