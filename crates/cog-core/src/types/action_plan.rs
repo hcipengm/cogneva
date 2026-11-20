@@ -375,6 +375,89 @@ pub fn validate_dag(
     })
 }
 
+/// 一份计划对「这一类」说了什么。
+///
+/// planner 的产出不是步骤，而是三样东西：这次处理的东西是什么（`input_type`）、
+/// 对它这一类**任意实例**都成立的话（`invariants`）、以及这些性质怎么被量出来
+/// （`acceptance`）。执行者只允许在它们里面实现；把性质缩窄成这次遇到的样例，
+/// 就是「没有计划的实现」。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, schemars::JsonSchema)]
+pub struct Plan {
+    pub input_type: String,
+    pub invariants: Vec<String>,
+    pub acceptance: Vec<PlanAcceptance>,
+    /// 什么情况下这条性质应当被拒。没有反例的判据，实现里会退化成恒真。
+    pub counterexamples: Vec<String>,
+    /// 确实只有一种形状时的说明（例如「删掉一个已废弃的函数」）。
+    ///
+    /// 它是**说明**，不是省略的默认值：写了它才允许只有一种形状，而且它要能回答
+    /// 「为什么第二种来源形状不存在」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_shape_because: Option<String>,
+}
+
+/// 一条验收：说的是哪种来源形状、怎么量。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+pub struct PlanAcceptance {
+    /// 这条验收是在哪种输入来源上量的（换一本台账、换一个 worker、换一种格式）。
+    ///
+    /// 两个几乎一样的样例不算两种形状——形状的区分是**来源类型**的区分。
+    pub shape: String,
+    pub statement: String,
+    /// 从代码树或现网读得出的量法（命令或路径）。人工确认不算。
+    pub check: String,
+}
+
+/// 计划不成立的原因。每一条都点名是哪一处分不合规。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanDefect {
+    /// 一条不变量都没有：这份计划没有说「这一类」是什么。
+    NoInvariants,
+    /// 一条验收都没有：没有任何东西能在事后说它做对了。
+    NoAcceptance,
+    /// 只有一种来源形状，又没有说明为什么第二种不存在。
+    OneShape(String),
+    /// 同一来源形状上的两条验收：那是同一把尺子量两次。
+    RepeatedShape(String),
+    /// 验收的量法不是可执行的（空串）。
+    Unmeasurable(String),
+}
+
+impl Plan {
+    /// 这份计划能不能进 generator。
+    ///
+    /// 判据就是设计里那三条：性质非空、验收至少两种**不同来源形状**（或写明为什么
+    /// 只有一种）、每条验收都带一条可执行的量法。
+    pub fn validate(&self) -> Result<(), PlanDefect> {
+        if self.invariants.is_empty() {
+            return Err(PlanDefect::NoInvariants);
+        }
+        if self.acceptance.is_empty() {
+            return Err(PlanDefect::NoAcceptance);
+        }
+        for a in &self.acceptance {
+            if a.check.trim().is_empty() {
+                return Err(PlanDefect::Unmeasurable(a.shape.clone()));
+            }
+        }
+        let mut shapes: Vec<&str> = self.acceptance.iter().map(|a| a.shape.as_str()).collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        if shapes.len() == 1 && self.one_shape_because.is_none() {
+            return Err(PlanDefect::OneShape(shapes[0].to_string()));
+        }
+        if shapes.len() != self.acceptance.len() {
+            let mut seen = std::collections::BTreeSet::new();
+            for a in &self.acceptance {
+                if !seen.insert(a.shape.as_str()) {
+                    return Err(PlanDefect::RepeatedShape(a.shape.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +578,114 @@ mod tests {
         assert!(report.violations.is_empty());
         assert!(report.suggestions.is_empty());
         assert!(report.passed);
+    }
+
+    /// 两种不同来源形状各自有一条可量的验收：计划成立。
+    #[test]
+    fn two_source_shapes_make_a_plan() {
+        let plan = Plan {
+            input_type: "台账".into(),
+            invariants: vec!["批次＝台账上所有未完成条目".into()],
+            acceptance: vec![
+                PlanAcceptance {
+                    shape: "worker 的 markdown 台账".into(),
+                    statement: "缺口被列出".into(),
+                    check: "scripts/hooks/family.py --all-todos".into(),
+                },
+                PlanAcceptance {
+                    shape: "平台的变更账本".into(),
+                    statement: "pending 条目被逐条点名".into(),
+                    check: "scripts/hooks/batch-gate.py --source change-ledger".into(),
+                },
+            ],
+            counterexamples: vec!["子集被当成默认批次".into()],
+            one_shape_because: None,
+        };
+        assert_eq!(plan.validate(), Ok(()));
+    }
+
+    /// 只有一种形状又没有说明：那是「验了我自己举的例子」，计划不成立。
+    #[test]
+    fn one_shape_without_a_reason_is_refused() {
+        let plan = Plan {
+            input_type: "台账".into(),
+            invariants: vec!["批次＝全部未完成".into()],
+            acceptance: vec![PlanAcceptance {
+                shape: "我的 markdown".into(),
+                statement: "缺口被列出".into(),
+                check: "scripts/hooks/family.py".into(),
+            }],
+            counterexamples: vec![],
+            one_shape_because: None,
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(PlanDefect::OneShape("我的 markdown".into()))
+        );
+    }
+
+    /// 写了说明就允许只有一种形状——但那是说明，不是默认。
+    #[test]
+    fn one_shape_is_allowed_when_the_absence_is_explained() {
+        let plan = Plan {
+            input_type: "已废弃函数".into(),
+            invariants: vec!["没有调用点".into()],
+            acceptance: vec![PlanAcceptance {
+                shape: "代码树".into(),
+                statement: "零命中".into(),
+                check: "grep -r fn_name crates/".into(),
+            }],
+            counterexamples: vec![],
+            one_shape_because: Some("这一类的输入只有代码树一种来源".into()),
+        };
+        assert_eq!(plan.validate(), Ok(()));
+    }
+
+    /// 同一形状上量两次不是两种形状。
+    #[test]
+    fn two_checks_on_one_shape_are_not_two_shapes() {
+        let plan = Plan {
+            input_type: "台账".into(),
+            invariants: vec!["批次＝全部未完成".into()],
+            acceptance: vec![
+                PlanAcceptance {
+                    shape: "我的 markdown".into(),
+                    statement: "a".into(),
+                    check: "x".into(),
+                },
+                PlanAcceptance {
+                    shape: "我的 markdown".into(),
+                    statement: "b".into(),
+                    check: "y".into(),
+                },
+            ],
+            counterexamples: vec![],
+            one_shape_because: None,
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(PlanDefect::OneShape("我的 markdown".into())),
+            "同一来源上的两条验收仍是同一把尺子"
+        );
+    }
+
+    /// 没有量法的验收不算验收。
+    #[test]
+    fn an_acceptance_without_a_check_is_refused() {
+        let plan = Plan {
+            input_type: "台账".into(),
+            invariants: vec!["批次＝全部未完成".into()],
+            acceptance: vec![PlanAcceptance {
+                shape: "我的 markdown".into(),
+                statement: "人工确认".into(),
+                check: "   ".into(),
+            }],
+            counterexamples: vec![],
+            one_shape_because: Some("x".into()),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(PlanDefect::Unmeasurable("我的 markdown".into()))
+        );
     }
 }
