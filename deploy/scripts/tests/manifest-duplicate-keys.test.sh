@@ -27,7 +27,7 @@ ck_has() { if printf '%s\n' "$3" | grep -qF -- "$2"; then ok "$1"; else
   printf 'FAIL- %s\n        期望含：%s\n' "$1" "$2" >&2
   printf '%s\n' "$3" | sed 's/^/        实得: /' | head -20 >&2; fail=$((fail + 1)); fi; }
 
-# 门按 `$(dirname $0)/..` 找仓根，所以夹具必须放在一棵形如 <root>/deploy/scripts 的树里。
+# 门按仓根找自己，所以夹具必须放在一棵形如 <root>/deploy/scripts 的树里。
 tree="$tmp/tree"
 mkdir -p "$tree/deploy/scripts" "$tree/deploy/k3s"
 cp "$gate" "$tree/deploy/scripts/check-manifest-duplicate-keys.py"
