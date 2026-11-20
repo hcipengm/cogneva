@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# 说出口的每一句结论，都要带上它是怎么被量到的。
+#
+# 这不是文风检查，是把这一轮反复犯的三类错变成判据：
+#
+#   1. **说「修好了」，但没给读数。** 2026-11-19 现场：watchdog 我说修好了，
+#      实际只改了单元文件、没重启，提示词照旧每两分钟一次。判据：提交信息里出现
+#      「修好 / 修复 / fixed」就必须有一行
+#          Reading: <哪条读数> <改前> → <改后>
+#      没有就拒。
+#   2. **引一条规则来支持一个结论，但那条规则不适用。** 2026-11-19 现场：我拿
+#      「第 4 条：工作集超出一次能读完」去解释把 1709 条拆成 4 批，而读得完、真正的
+#      限制是编辑量——规则里没有这一条。判据：提交信息里出现 `第 N 条` 或 `原则`
+#      的引用，就必须有一行
+#          Rule: <规则所在的文件或台账行>
+#      点不出出处就拒。
+#   3. **声称普查完备，但没有跑过普查。** 判据：出现「普查 + 完备」就必须有一行
+#          Census: <跑了哪个工具> <四面各多少条>
+#
+# 只判这一推新增的提交（origin/main..HEAD），不翻历史：历史里的旧句子改不动，
+# 一条永久红的门最后会被删掉。
+set -uo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+base="${COGNEVA_PUSH_BASE:-origin/main}"
+
+git -C "$root" rev-parse --verify "$base" >/dev/null 2>&1 || {
+    echo "claims: 找不到基线 $base，这一推不判。"
+    exit 0
+}
+
+fail=0
+for sha in $(git -C "$root" rev-list "$base"..HEAD); do
+    msg="$(git -C "$root" show -s --format=%B "$sha")"
+
+    if printf '%s' "$msg" | grep -qE '修好|已修复|修掉了|\bfixed\b' &&
+        ! printf '%s' "$msg" | grep -qE '^Reading:'; then
+        printf 'FAIL: %s 说「修好了」，但没有一行 `Reading: <哪条读数> <改前> → <改后>`.\n' "${sha:0:9}" >&2
+        fail=1
+    fi
+
+    if printf '%s' "$msg" | grep -qE '第[[:space:]]*[0-9一二三四]+[[:space:]]*条|原则' &&
+        ! printf '%s' "$msg" | grep -qE '^Rule:'; then
+        printf 'FAIL: %s 引了规则，但没有一行 `Rule: <规则出处>`——引错规则的代价比不引更大。\n' "${sha:0:9}" >&2
+        fail=1
+    fi
+
+    if printf '%s' "$msg" | grep -qE '普查' && printf '%s' "$msg" | grep -qE '完备' &&
+        ! printf '%s' "$msg" | grep -qE '^Census:'; then
+        printf 'FAIL: %s 声称普查完备，但没有一行 `Census: <工具> <四面各多少条>`.\n' "${sha:0:9}" >&2
+        fail=1
+    fi
+done
+
+if [ "$fail" -ne 0 ]; then
+    cat >&2 <<'EOF'
+
+这三行不是格式要求，是把「说出口就成立」改成「说出口要先量过」：
+  Reading: cogneva_task_events_rows 4,102,331 → 4,102,331（未删一行）
+  Rule: specs/work-ledger-b6f42e.md S52 第 4 条
+  Census: bounds-census.py markers 791 / consts 592 / config 569 / destroys 334
+EOF
+    exit 1
+fi
+
+echo "claims: 这一推的结论都带上了出处。"

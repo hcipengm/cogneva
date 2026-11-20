@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Compile ledger and the family gate: one line per cargo invocation, then the real cargo.
+#
+# Two jobs, both mechanical:
+#
+#   1. Record: time, worktree, arguments, HEAD and a fingerprint of the tree, so
+#      "was this tree compiled as it stands?" is a question git can answer later.
+#   2. Refuse a build on a dirty tree whose table-derived touchpoints are still
+#      untouched. The list comes from `family.py`, which reads the capacities,
+#      the chart projectors, the rule fixtures and the metric help — tables this
+#      repository maintains, not a guess about who calls what.
+#
+# A clean tree is never refused: there is nothing to finish editing. That is also
+# why the push gate, which runs after a commit, is unaffected.
+#
+# Bypass: COGNEVA_BATCH_UNCHECKED=1 (recorded in the ledger as unjudged), or
+# COGNEVA_COMPILE_LEDGER=/dev/null to skip recording altogether.
+set -u
+
+real_cargo="${REAL_CARGO:-$HOME/.cargo/bin/cargo}"
+ledger="${COGNEVA_COMPILE_LEDGER:-$HOME/.local/state/cogneva/compile-ledger.tsv}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+family="$here/family.py"
+
+sub="${1:-}"
+case "$sub" in
+  check|build|test|clippy|run|bench|doc|nextest|install|fix) builds=1 ;;
+  *) builds=0 ;;
+esac
+
+fingerprint() {
+  # The tree as it would be committed: tracked changes, staged changes and
+  # untracked files, in a stable order.
+  {
+    git rev-parse HEAD 2>/dev/null || echo "no-head"
+    git status --porcelain=v2 2>/dev/null
+    git diff HEAD 2>/dev/null
+    git ls-files --others --exclude-standard 2>/dev/null
+  } | sha256sum | cut -d' ' -f1
+}
+
+if [ "$builds" = "1" ] && [ "${COGNEVA_BATCH_UNCHECKED:-0}" != "1" ] && [ -f "$family" ]; then
+  if git rev-parse --git-dir >/dev/null 2>&1 && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    if ! python3 "$family" --root "$(git rev-parse --show-toplevel)" --from-git; then
+      cat >&2 <<'EOF'
+
+cargo: 这一族还没改完，先别编译。
+
+  上面每一条 TODO 都是本仓的一张表 + 检查它的门：容量登记表、chart 投影、告警夹具、
+  指标 help。改完它们再编译，编译器就只剩「代码耦合」那一次发现要做——那是唯一
+  需要编译才知道的部分。
+
+  确实不需要改的，在提交信息里写：  Skip: <path> — <为什么这一族不动它>
+  要跳过这次检查：COGNEVA_BATCH_UNCHECKED=1 cargo ...
+EOF
+      exit 1
+    fi
+  fi
+fi
+
+if [ "$ledger" != "/dev/null" ]; then
+  {
+    mkdir -p "$(dirname "$ledger")" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$*" \
+      "$(git rev-parse HEAD 2>/dev/null || echo no-head)" "$(fingerprint 2>/dev/null || echo no-tree)" \
+      >>"$ledger"
+  } 2>/dev/null || true
+fi
+
+exec "$real_cargo" "$@"

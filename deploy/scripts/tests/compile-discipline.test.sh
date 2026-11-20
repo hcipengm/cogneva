@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# `check-compile-discipline.sh` 的离线测试：夹具是一本假账本 + 一棵小树。
+#
+# 判的是「一批编辑只付一次编译」这条纪律的两个方向：
+#   1. 编辑在编译之后 ⇒ 红（改了没编译，就想推）。
+#   2. 一批里编译了不止一次、提交信息里没有 `Recompiled:` ⇒ 红。
+#   3. 编辑在编译之前、一批只编译一次 ⇒ 绿。
+#   4. 账本读不到 ⇒ 不判（量不到不是零次），也不假绿成「通过」的措辞。
+set -uo pipefail
+root=$(git rev-parse --show-toplevel)
+gate="$root/deploy/scripts/check-compile-discipline.sh"
+reader="$root/scripts/hooks/compile-ledger.py"
+[ -f "$gate" ] || { echo "FAIL: 门脚本不在：$gate" >&2; exit 1; }
+[ -f "$reader" ] || { echo "FAIL: 读数脚本不在：$reader" >&2; exit 1; }
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+pass=0; fail=0
+ok()  { printf 'ok    - %s\n' "$1"; pass=$((pass + 1)); }
+bad() { printf 'FAIL- %s\n' "$1" >&2; fail=$((fail + 1)); }
+
+tree="$tmp/tree"
+mkdir -p "$tree/deploy/scripts" "$tree/scripts/hooks" "$tree/crates/demo/src"
+cp "$gate" "$tree/deploy/scripts/check-compile-discipline.sh"
+cp "$reader" "$tree/scripts/hooks/compile-ledger.py"
+echo "fn main() {}" >"$tree/crates/demo/src/lib.rs"
+cat >"$tree/Cargo.toml" <<'TOML'
+[workspace]
+members = ["crates/demo"]
+TOML
+git -C "$tree" init -q
+git -C "$tree" config user.email t@t; git -C "$tree" config user.name t
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm base
+git -C "$tree" branch -f main HEAD
+
+ledger="$tmp/ledger.tsv"
+stamp() { date -u -d "$1" +%Y-%m-%dT%H:%M:%SZ; }
+record() { printf '%s\t%s\t%s\t-\t-\n' "$(stamp "$1")" "$tree" "$2" >>"$ledger"; }
+
+run() { COGNEVA_COMPILE_LEDGER="$ledger" COGNEVA_PUSH_BASE=main bash "$tree/deploy/scripts/check-compile-discipline.sh" 2>&1; }
+
+# 1. 没有账本：不判。
+out="$(COGNEVA_COMPILE_LEDGER="$tmp/missing.tsv" COGNEVA_PUSH_BASE=main bash "$tree/deploy/scripts/check-compile-discipline.sh" 2>&1)"; rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "不判"; } && ok "账本读不到：不判，也不假绿" || bad "账本读不到时的行为不对（rc=$rc）：$out"
+
+# 2. 编译之后又改了文件 ⇒ 红。
+echo "// edit after compile" >>"$tree/crates/demo/src/lib.rs"
+git -C "$tree" add -A >/dev/null; git -C "$tree" commit -qm "a change"
+record "2000-01-01T00:00:00Z" "check"
+out="$(run)"; rc=$?
+{ [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "最后一次编译之后"; } && ok "编辑在编译之后：红" || bad "编辑在编译之后没红（rc=$rc）：$out"
+
+# 3. 先编译后编辑（顺序对），一批只编译一次 ⇒ 绿。
+touch -d "2000-01-01T00:00:10Z" "$tree/crates/demo/src/lib.rs"
+record "2030-01-01T00:00:00Z" "check"
+git -C "$tree" commit -q --allow-empty -m "no-op to move base time"
+out="$(run)"; rc=$?
+[ "$rc" -eq 0 ] && ok "编辑在前、编译在后、只编译一次：绿" || bad "正确的批次被拒（rc=$rc）：$out"
+
+# 4. 一批里编译两次，信息里没有 Recompiled ⇒ 红；写了理由 ⇒ 绿。
+record "2030-01-01T00:05:00Z" "test"
+out="$(run)"; rc=$?
+{ [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "Recompiled"; } && ok "一批两次编译且无理由：红" || bad "两次编译没红（rc=$rc）：$out"
+git -C "$tree" commit -q --allow-empty -m "fix after red
+
+Recompiled: the first compile caught a type error"
+touch -d "2000-01-01T00:00:10Z" "$tree/crates/demo/src/lib.rs"
+record "2030-01-01T00:06:00Z" "check"
+out="$(run)"; rc=$?
+[ "$rc" -eq 0 ] && ok "写了 Recompiled 理由：绿" || bad "有理由仍被拒（rc=$rc）：$out"
+
+printf '\ncompile-discipline.test.sh: %d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

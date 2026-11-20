@@ -440,6 +440,24 @@ start_base="$(git merge-base HEAD origin/main 2>/dev/null || true)"
 start_pkey="$(patch_key 2>/dev/null || true)"
 
 failures=0
+
+# 编译纪律：一批编辑一次编译；编辑之后必须编译过。判据读宿主上的编译账本，
+# 账本由 scripts/hooks/install.sh 装的 cargo 垫片写。读不到就不判——量不到不是零次，
+# 也不是绿：它自己印一句，不混进任何一格的判词。
+if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-compile-discipline.sh" ]; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/check-compile-discipline.sh" || exit 1
+fi
+# 说出口的结论要带出处：「修好了」「引第 N 条」「普查完备」各要一行 Reading/Rule/Census。
+if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-claims.sh" ]; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/check-claims.sh" || exit 1
+fi
+# 默认做完整批：义务清单没做完又没有 Split 就拒；Split 的四条理由逐条判真假。
+if [ -x "$(dirname "${BASH_SOURCE[0]}")/../scripts/hooks/batch-gate.py" ] &&
+   [ -n "${COGNEVA_OBLIGATIONS:-}" ]; then
+    python3 "$(dirname "${BASH_SOURCE[0]}")/../scripts/hooks/batch-gate.py" \
+        --root "$(dirname "${BASH_SOURCE[0]}")/.." --obligations "$COGNEVA_OBLIGATIONS" || exit 1
+fi
+
 # 「没判」与「判红」是两件事，读数上也得是两个：一格没进构建槽就跑，判词写成红是把
 # 机器的忙碌栽给这一笔改动；写成绿更糟，那是一份没人问过的字节被记成验过。所以它自己
 # 一格，挡住推送，但说的是它自己的话。
