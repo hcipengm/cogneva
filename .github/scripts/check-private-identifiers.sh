@@ -26,10 +26,24 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ "${1:-}" = "" ] || ROOT="$1"
 
-# 所有者句柄与它上面唯一允许被公开引用的仓。两个都是**结构**，不是名单：换所有者
-# 或换公开仓都是这一行的改动，而不是往清单一类的东西里再加一条。
-OWNER="hcipengm"
+# 所有者句柄与它上面唯一允许被公开引用的仓。
+#
+# 2026-11-20 之前所有者是**写死的**一个账号名。那是把「这个仓属于谁」钉成了常量：
+# 换所有者、或者有人 fork 过去跑同一套门，这一行就成了错的判据，而它错的方式是
+# 「每一处引用都按一个不属于这个仓的所有者去判」。
+#
+# 现在从**这个仓自己的 origin** 读（fork 之后自然跟着变），环境变量可覆盖；
+# 读不出来就是判不了——3，不是 0。
 ALLOWED_REPO="cogneva"
+origin_url="${COGNEVA_ORIGIN_URL:-$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)}"
+OWNER="${COGNEVA_OWNER:-}"
+if [ -z "$OWNER" ] && [ -n "$origin_url" ]; then
+    OWNER="$(printf '%s' "$origin_url" | sed -n 's#.*[/:]\([^/]*\)/[^/]*$#\1#p')"
+fi
+if [ -z "$OWNER" ]; then
+    printf '私有标识门：读不出这个仓的所有者（origin 没有远端地址，也没给 COGNEVA_OWNER）——这一遍没判\n' >&2
+    exit 3
+fi
 
 log() { printf '%s\n' "$*"; }
 

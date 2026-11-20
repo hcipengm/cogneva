@@ -155,8 +155,8 @@ printf '作者署名: 这一笔会署成「%s」/「%s」，而%s应该署「%s�
     "${author:-（空）}" "${committer:-（空）}" "$signer" "$expected" >&2
 cat >&2 <<EOF
 
-属主 2026-11-07：提交署提交者自己的名字，不署共享 config 里那个。
-要署的名字由拉起这个进程的那一侧给（环境变量 COGNEVA_AGENT_NAME，或会话记录里的 name），这门只判「署的」与「给的」是不是同一个。
+提交要署提交者自己的名字。
+署谁由拉起这个进程的那一侧决定；这门只查「署的」和「给的」是不是同一个。
 这一笔该署「$expected」，依据是：${record:+会话记录 $record（pid $pid，sessionId $sid，kind ${kind:-（无）}）}${record:-显式环境变量 COGNEVA_AGENT_NAME（平台智能体没有会话记录）}
 
 工作树归你一个人用时，一次设好（只改这棵工作树，不动共享 config）：
