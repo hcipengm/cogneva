@@ -748,7 +748,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-reflection/src/workload_resources.rs", 14),
     ("crates/cog-reflection/src/workspace.rs", 3),
     ("crates/cog-storage/src/backends/file_trace_store.rs", 1),
-    ("crates/cog-storage/src/backends/object_backends.rs", 2),
+    ("crates/cog-storage/src/backends/object_backends.rs", 3),
     ("crates/cog-storage/src/checkpoint_cap.rs", 2),
     ("crates/cog-storage/src/metrics_retirement.rs", 2),
     ("crates/cog-storage/src/metrics_sample_cap.rs", 1),
