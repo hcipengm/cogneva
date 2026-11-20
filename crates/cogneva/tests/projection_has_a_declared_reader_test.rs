@@ -46,6 +46,43 @@ fn every_projection_table_declares_its_reader_and_why_the_source_would_not_do() 
             .join("\n")
     );
 
+    // 投影这件事在同一 crate 里说了两遍：`PROJECTION_READERS` 说「谁读它、为什么不用
+    // 真源、由什么重算」，`table_shapes::MUTABLE_TABLES` 说「它是投影还是权威文档」。
+    // 两份名单说的是同一批表，而其中一份改了名、另一份没跟上时，两边都读得通——直到
+    // 有人按错的那一份去找重建路线。判据：投影那一侧的两份必须逐字一致。
+    let mut disputed = Vec::new();
+    for table in cog_storage::table_shapes::MUTABLE_TABLES {
+        let cog_storage::table_shapes::TableShape::Projection {
+            reader, rebuild, ..
+        } = table.shape
+        else {
+            continue;
+        };
+        match cog_storage::projection_readers::PROJECTION_READERS
+            .iter()
+            .find(|declaration| declaration.table == table.table)
+        {
+            None => disputed.push(format!(
+                "{}: 形状声明说它是投影，读者声明里没有这一条",
+                table.table
+            )),
+            Some(declaration) if declaration.reader != reader => disputed.push(format!(
+                "{}: 两份声明点名的读者不同（{} / {}）",
+                table.table, declaration.reader, reader
+            )),
+            Some(declaration) if declaration.rebuild != rebuild => disputed.push(format!(
+                "{}: 两份声明点名的重建路线不同（{} / {}）",
+                table.table, declaration.rebuild, rebuild
+            )),
+            Some(_) => {}
+        }
+    }
+    assert!(
+        disputed.is_empty(),
+        "同一批投影表在同一 crate 里有两份声明，而它们对不上：\n{}",
+        disputed.join("\n")
+    );
+
     // 「由哪些事实重算」与「按什么重算一遍」两句都要写得出，而且后者要点得到树里的东西：
     // 一张说不出自己跟谁一致的投影表，与一份没人核对过的副本在库里同形。
     let mut unexplained = Vec::new();
