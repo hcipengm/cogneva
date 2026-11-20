@@ -31,6 +31,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import todo_source  # noqa: E402
+
 DEFAULT_LEDGER = pathlib.Path.home() / ".local/state/cogneva/todo-ledger.md"
 def resolve_ledger(explicit: str | None) -> pathlib.Path:
     """台账路径：显式 → 环境变量 → 本机配置文件 → 默认（不存在就是没有台账）。
@@ -39,7 +42,8 @@ def resolve_ledger(explicit: str | None) -> pathlib.Path:
     事实，写进公开仓就成了「谁的机器」的猜测。
     """
     if explicit:
-        return pathlib.Path(explicit)
+        text = str(explicit)
+        return pathlib.Path(text[3:] if text.startswith("md:") else text)
     env = os.environ.get("COGNEVA_TODO_LEDGER")
     if env:
         return pathlib.Path(env)
@@ -69,23 +73,34 @@ def run(*args: str, cwd: pathlib.Path | None = None) -> str:
 def working_tree_changes(root: pathlib.Path) -> list[str]:
     files: list[str] = []
     # 这一轮已经提交的部分也算「做了」：拿工作区去比，会把刚提交的改动读成没做。
-    for args in (
+    # 基准是**这一轮开工时的那个代码 rev**（round 事件里记着）：两道门（编译前、推之前）
+    # 因此量的是同一个「自开工以来改了什么」，数字不会再对不上。
+    base = ""
+    try:
+        import round as round_mod
+        current = round_mod.current_round()
+        if current and current[2]:
+            base = current[2]
+    except Exception:
+        base = ""
+    for args in ([a for a in (
+        ["diff", "--name-only", base] if base else None,
         ["diff", "--name-only", "origin/main...HEAD"],
         ["diff", "--name-only", "HEAD"],
         ["ls-files", "--others", "--exclude-standard"],
-    ):
+    ) if a is not None]):
         files += [line.strip() for line in run("git", "-C", str(root), *args).splitlines() if line.strip()]
     return sorted(set(files))
 
 
-def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, list[str]]], list[str]]:
-    """(带触点的未完成待办, 没有触点的未完成待办名)。"""
+def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, list[str]]], list[str], list[str]]:
+    """(带触点的未完成待办, 没有触点的未完成待办名, 明确不排的待办名)。"""
     with_touch: list[tuple[str, list[str]]] = []
     without: list[str] = []
     defer: list[str] = []
-    rows: list[tuple[str, list[str], str, str]] = []  # (名字, 触点, 状态, 整行)
     if not ledger.exists():
         return with_touch, without, defer
+    looks_like_path = re.compile(r"^[\w./-]+$")
     for line in ledger.read_text(errors="ignore").splitlines():
         if not line.startswith("| S"):
             continue
@@ -93,83 +108,24 @@ def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, list[str]]], list[
         if len(cells) < 3:
             continue
         name = cells[0]
-        # 状态在第三格（`| 项 | 内容 | 状态 | 判据 |`），但有的行把状态写进内容那一格；
-        # 判据那一格经常引用「未落」这样的词，所以不读它——否则一条已落的行会被当成待办。
-        status_cells = cells[2:3]
-        if not any(word in cell for cell in status_cells for word in OPEN_WORDS):
+        if not any(word in cells[2] for word in OPEN_WORDS):
             continue
-        # 只认单元格里的那一段：行文里引用 `touches:` 这个写法的地方不算声明。
         found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
         if not found:
             without.append(name)
             continue
         raw = found.group(1).strip()
-        # `unknown` 只允许带理由，且它意味着「本轮明确不排」——不排要在推的时候逐条
-        # 点名（`Split: <1-4> — <S 号…> — 理由`），所以它不是走后门，是把话说在前面。
         if raw.startswith("unknown"):
             if "—" not in raw and "-" not in raw:
                 without.append(f"{name}（写了 unknown 但没说为什么）")
-                continue
-            defer.append(name)
+            else:
+                defer.append(name)
             continue
         paths = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
-        # 每个触点都得长得像一条路径：带反引号、空格、或别的散文，说明这不是一份触点清单。
-        looks_like_path = re.compile(r"^[\w./-]+$")
         if not paths or any(not looks_like_path.match(p) for p in paths):
             without.append(name)
             continue
         with_touch.append((name, paths))
-    return with_touch, without, defer
-    for line in ledger.read_text(errors="ignore").splitlines():
-        if not line.startswith("| S"):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 3:
-            continue
-        name = cells[0]
-        # 状态在第三格（`| 项 | 内容 | 状态 | 判据 |`），但有的行把状态写进内容那一格；
-        # 判据那一格经常引用「未落」这样的词，所以不读它——否则一条已落的行会被当成待办。
-        status_cells = cells[2:3]
-        if not any(word in cell for cell in status_cells for word in OPEN_WORDS):
-            continue
-        # 只认单元格里的那一段：行文里引用 `touches:` 这个写法的地方不算声明。
-        found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
-        if not found:
-            without.append(name)
-            continue
-        raw = found.group(1).strip()
-        # `unknown` 只允许带理由，且它意味着「本轮明确不排」——不排要在推的时候逐条
-        # 点名（`Split: <1-4> — <S 号…> — 理由`），所以它不是走后门，是把话说在前面。
-        if raw.startswith("unknown"):
-            if "—" not in raw and "-" not in raw:
-                without.append(f"{name}（写了 unknown 但没说为什么）")
-                continue
-            defer.append(name)
-            continue
-        paths = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
-        # 每个触点都得长得像一条路径：带反引号、空格、或别的散文，说明这不是一份触点清单。
-        looks_like_path = re.compile(r"^[\w./-]+$")
-        if not paths or any(not looks_like_path.match(p) for p in paths):
-            without.append(name)
-            continue
-        with_touch.append((name, paths))
-    # 「没写触点」只对本轮的待办成立：积压里的 `unknown` 是「本轮不排」，不是缺陷。
-    without = [w for w in without if "round: current" in next(
-        (l for l in ledger.read_text(errors="ignore").splitlines() if l.startswith(f"| {w.split('（')[0]} ")), "round: current")]
-    # 本轮：行里标 `round: current` 的算这一轮；一行都没标时全部未完成待办都算本轮。
-    rows = {name for name, _ in with_touch}
-    if rows:
-        all_lines = ledger.read_text(errors="ignore")
-        if "round: current" in all_lines:
-            current: list[tuple[str, list[str]]] = []
-            for name, paths in with_touch:
-                line = next((l for l in all_lines.splitlines() if l.startswith(f"| {name} ")), "")
-                if "round: current" in line:
-                    current.append((name, paths))
-            backlog = len(with_touch) - len(current)
-            with_touch = current
-            if backlog:
-                print(f"family: 积压 {backlog} 条未完成待办不在本轮（台账里标 `round: current` 的才进批次）")
     return with_touch, without, defer
 
 
@@ -240,7 +196,7 @@ def metrics_owed(root: pathlib.Path, changed: set[str]) -> list[tuple[str, str]]
 CHECKS = (capacity_owed, static_owed, rules_owed, metrics_owed)
 
 
-def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, missing_todos) -> int:
+def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, missing_todos, deferred=()) -> int:
     touched = set(changed)
     gaps = [p for p in batch if p not in touched and not (root / p).exists() is False and p not in touched]
     gaps = [p for p in batch if p not in touched]
@@ -267,6 +223,16 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
             f"{', '.join(missing_todos)}\n"
             "每条待办在自己的行里写 `touches: <路径>[, <路径>…]`，路径从树里推导（引用它的"
             "装配点、测试、注册表、chart、夹具），推不出来就写 `touches: unknown` 并挡住批次。"
+        )
+        return 1
+
+    # `touches: unknown` 的待办不在批次里，但它必须被 `Split:` 逐条点名——所以它也
+    # 让这一批「没清空」。两个门（编译前、推之前）因此数出同一个数。
+    if deferred:
+        print(
+            f"\n有 {len(deferred)} 条待办写了 `touches: unknown`（本轮不排）："
+            f"{', '.join(deferred)}\n"
+            "推之前要在提交信息里用 `Split: <1-4> — <S 号…> — <理由>` 逐条点名，否则推不出去。"
         )
         return 1
 
@@ -302,6 +268,15 @@ def main(argv: list[str]) -> int:
     deferred: list[str] = []
     batch = list(changed)
     if args.all_todos:
+        # 有开着的一轮：批次＝那一轮钉住的 rev 上的台账，不是此刻的台账。
+        try:
+            import round as round_mod
+            current = round_mod.current_round()
+            if current:
+                pinned = round_mod.ledger_at(current[1], args.ledger or todo_source.default_spec())
+                args.ledger = str(pinned)
+        except Exception:  # 读不到事件流就退回此刻的台账，并在下面说清楚
+            pass
         ledger_path = resolve_ledger(args.ledger)
         if not ledger_path.exists():
             # 「没有台账」与「台账里没有待办」不是同一件事。前者是这台 worker 本来就不
@@ -313,7 +288,8 @@ def main(argv: list[str]) -> int:
             )
             todos, missing, deferred = [], [], []
         else:
-            todos, missing, deferred = open_todos(ledger_path)
+            todos_items, missing, deferred = todo_source.partition(f"md:{ledger_path}")
+        todos = [(i.id, i.touches) for i in todos_items]
         # 触点必须指得到东西：写错的路径与「凭记忆写的路径」在批次里同形，而后者是
         # 这一整套最初要治的病。指不到就挡住批次，让写的人去核对。
         bad: list[str] = []
@@ -338,7 +314,7 @@ def main(argv: list[str]) -> int:
 
     if not changed and not todos:
         return 0
-    return report(root, changed, batch, todos, missing)
+    return report(root, changed, batch, todos, missing, deferred)
 
 
 if __name__ == "__main__":

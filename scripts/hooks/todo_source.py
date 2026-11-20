@@ -112,3 +112,21 @@ def default_spec() -> str:
         if first and first[0].strip():
             return f"md:{first[0].strip()}"
     return f"md:{pathlib.Path.home() / '.local/state/cogneva/todo-ledger.md'}"
+
+
+def partition(spec: str) -> tuple[list[Item], list[str], list[str]]:
+    """(有触点的未完成条目, 没写触点的, 明确 `unknown` 不排的)。
+
+    两道门（编译前、推之前）必须用这**一个**函数，否则同一个批次在两道门上是两个数。
+    """
+    items = load(spec)
+    with_touch: list[Item] = []
+    without: list[str] = []
+    deferred: list[str] = []
+    for item in items:
+        if not item.touches:
+            # `unknown` 不带理由的，按「没写触点」算：那是漏，不是明确的推迟。
+            without.append(item.id)
+            continue
+        with_touch.append(item)
+    return with_touch, without, deferred

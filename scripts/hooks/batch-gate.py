@@ -67,11 +67,16 @@ def open_todos(spec: str):
 
 
 def changed(root: pathlib.Path, base: str) -> list[str]:
+    """自开工以来改过的文件：基准是 round 事件里记的 code_rev，不是「与主线的差」。
+
+    两道门（编译前、推之前）必须量同一件事，否则同一个批次在两道门上是两个数。
+    """
     out = subprocess.run(
-        ["git", "-C", str(root), "diff", "--name-only", f"{base}...HEAD"],
+        ["git", "-C", str(root), "diff", "--name-only", base or "origin/main...HEAD"],
         capture_output=True, text=True,
     ).stdout
-    return [l.strip() for l in out.splitlines() if l.strip()]
+    files = [l.strip() for l in out.splitlines() if l.strip()]
+    return files
 
 
 def messages(root: pathlib.Path, base: str) -> str:
@@ -125,8 +130,32 @@ def main(argv: list[str]) -> int:
 
     root = pathlib.Path(args.root).resolve()
 
+    # 推之前先问「这一轮开过没有」：没有 round 记录的一推，等于没人说过这一批
+    # 是什么，判不了「做完了没有」。
     try:
-        todos = open_todos(args.source or todo_source.default_spec())
+        import round as round_mod
+        current = round_mod.current_round()
+    except Exception:
+        current = None
+    if not current:
+        print("batch-gate: 事件流里没有开着的一轮（先 `scripts/hooks/round.py open`），这一推没判。",
+              file=sys.stderr)
+        return 2
+    round_ids: set[str] = set()
+    round_ids = {i.id for i in todo_source.load(f'md:{round_mod.ledger_at(current[1], todo_source.default_spec())}')}
+
+    try:
+        items, without, _deferred = todo_source.partition(
+            args.source or f"md:{round_mod.ledger_at(current[1], todo_source.default_spec())}"
+        )
+        if without:
+            print(
+                "batch-gate: 这些未完成待办没有 `touches:`，它们既做不了也判不了："
+                + "、".join(without),
+                file=sys.stderr,
+            )
+            return 2
+        todos = items
     except todo_source.Unreadable as e:
         print(f"batch-gate: {e} —— 这一推没判。", file=sys.stderr)
         return 2
@@ -134,9 +163,10 @@ def main(argv: list[str]) -> int:
         print("batch-gate: 台账里没有未完成的待办。")
         return 0
 
-    touched = changed(root, args.base)
+    touched = changed(root, current[2] or "")
     rows = {item.id: item.title for item in todos}
     done = {i.id for i in todos if i.touches and any(p in touched for p in i.touches)}
+    todos = [i for i in todos if not round_ids or i.id in round_ids]
     untouched = [i.id for i in todos if i.id not in done]
 
     if not untouched:

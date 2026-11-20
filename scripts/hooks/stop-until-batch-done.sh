@@ -24,6 +24,13 @@ marker="$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/cogneva-stop-
 recent=$(find crates deploy scripts .github -type f -mmin -15 2>/dev/null | head -1)
 [ -z "$recent" ] && exit 0
 
+round="$root/scripts/hooks/round.py"
+if [ -f "$round" ] && ! python3 "$round" status >/dev/null 2>&1; then
+  printf '这一轮还没关，别停：\n' >&2
+  python3 "$round" status >&2 || true
+  exit 2
+fi
+
 family="$root/scripts/hooks/family.py"
 [ -f "$family" ] || exit 0
 
