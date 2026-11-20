@@ -68,7 +68,7 @@ def current_round() -> tuple[str, str, str] | None:
         "|| E'\\t' || coalesce(o.attributes::jsonb->>'code_rev','') "
         "from cogneva_event o where o.kind='round_opened' and not exists ("
         " select 1 from cogneva_event c where c.kind='round_closed'"
-        " and c.subject_id=o.subject_id) order by o.event_id desc limit 1"
+        " and c.subject_id=o.subject_id) order by o.at desc, o.event_id desc limit 1"
     )
     out = psql(sql).strip()
     if not out:
@@ -100,8 +100,8 @@ def ledger_at(rev: str, spec: str) -> pathlib.Path:
     return tmp
 
 
-def open_round(spec: str | None) -> int:
-    if current_round():
+def open_round(spec: str | None, allow_open: bool = False) -> int:
+    if current_round() and not allow_open:
         print("round: 已经有一轮开着。先 `round.py close`。")
         return 1
     source = spec or todo_source.default_spec()
@@ -183,11 +183,15 @@ def close() -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["open", "status", "close"])
+    parser.add_argument("action", choices=["open", "status", "close", "rebound"])
     parser.add_argument("--source", default=None)
     args = parser.parse_args(argv[1:])
     if args.action == "open":
         return open_round(args.source)
+    if args.action == "rebound":
+        # 这一轮没变，变的是它钉的那一版台账（例如台账随后才提交）。重钉是一次
+        # **计划修订**：追加一条新的 round_opened，读取方取最新的一条。
+        return open_round(args.source, allow_open=True)
     if args.action == "status":
         return status()
     return close()

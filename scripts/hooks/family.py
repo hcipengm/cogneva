@@ -93,40 +93,10 @@ def working_tree_changes(root: pathlib.Path) -> list[str]:
     return sorted(set(files))
 
 
-def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, list[str]]], list[str], list[str]]:
-    """(带触点的未完成待办, 没有触点的未完成待办名, 明确不排的待办名)。"""
-    with_touch: list[tuple[str, list[str]]] = []
-    without: list[str] = []
-    defer: list[str] = []
-    if not ledger.exists():
-        return with_touch, without, defer
-    looks_like_path = re.compile(r"^[\w./-]+$")
-    for line in ledger.read_text(errors="ignore").splitlines():
-        if not line.startswith("| S"):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 3:
-            continue
-        name = cells[0]
-        if not any(word in cells[2] for word in OPEN_WORDS):
-            continue
-        found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
-        if not found:
-            without.append(name)
-            continue
-        raw = found.group(1).strip()
-        if raw.startswith("unknown"):
-            if "—" not in raw and "-" not in raw:
-                without.append(f"{name}（写了 unknown 但没说为什么）")
-            else:
-                defer.append(name)
-            continue
-        paths = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
-        if not paths or any(not looks_like_path.match(p) for p in paths):
-            without.append(name)
-            continue
-        with_touch.append((name, paths))
-    return with_touch, without, defer
+def open_todos(ledger: pathlib.Path):
+    """(带触点的未完成待办, 没写触点的, 明确 unknown 不排的)——与推之前那道门同一段代码。"""
+    items, without, deferred = todo_source.partition(f"md:{ledger}")
+    return [(i.id, i.touches) for i in items], without, deferred
 
 
 def show(root: pathlib.Path, path: str) -> str:
