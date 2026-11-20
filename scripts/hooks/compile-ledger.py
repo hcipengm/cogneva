@@ -120,7 +120,10 @@ def check(root: pathlib.Path, base: str, ledger: pathlib.Path) -> int:
             text=True,
         ).stdout.split()
         if stamp:
-            first = dt.datetime.fromtimestamp(min(int(s) for s in stamp), tz=dt.timezone.utc)
+            # 这一批的边界是**最近一笔提交**，不是最早那一笔：一堆提交常常来自几轮
+            # 各自独立的编辑，把它们的编译全算进「这一批」，会把「最后一版编译了几次」
+            # 问成一个几千分钟的历史问题。判的是最后一次提交之后、这一推之前的那一轮。
+            first = dt.datetime.fromtimestamp(max(int(s) for s in stamp), tz=dt.timezone.utc)
     in_batch = [t for t in times if t >= first]
     if len(in_batch) > 1:
         messages = subprocess.run(
