@@ -11,8 +11,8 @@
 #   4. `volumeMounts` 里同名 ⇒ 红（这一族不止 env 一种列表）。
 #   5. 目录不存在 ⇒ 绿（没有清单不是坏清单）。
 set -uo pipefail
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-gate="$(cd "$here/.." && pwd)/check-manifest-duplicate-keys.py"
+root=$(git rev-parse --show-toplevel)
+gate="$root/deploy/scripts/check-manifest-duplicate-keys.py"
 [ -f "$gate" ] || { echo "FAIL: 门脚本不在：$gate" >&2; exit 1; }
 
 tmp="$(mktemp -d)" || exit 1
