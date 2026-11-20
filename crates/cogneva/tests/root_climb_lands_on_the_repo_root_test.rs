@@ -69,12 +69,6 @@ const NOT_ROOT: &[(&str, usize, &str, &str)] = &[
         "deploy/scripts",
         "夹具要的是同级的门脚本所在的目录（deploy/scripts），不是仓库根",
     ),
-    (
-        "deploy/scripts/tests/manifest-duplicate-keys.test.sh",
-        1,
-        "deploy/scripts",
-        "夹具要的是同级的门脚本所在的目录（deploy/scripts），不是仓库根",
-    ),
 ];
 
 /// 一处上溯：哪个文件第几行、数了几级、算出来的落点。
