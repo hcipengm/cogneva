@@ -471,6 +471,26 @@ async fn connect_usage_ledger(url: &str) -> Result<Arc<dyn cog_core::LlmUsageLed
         .init_schema(&runner)
         .await
         .map_err(|e| format!("gateway_llm_usage 建表失败: {e}"))?;
+    // 读切换之前，先把已有的行回填成事件：流只从切换那一刻开始，而「这周花了多少」
+    // 不区分切换前后——不回填就切读，等于把切换之前的花销从读数里抹掉。
+    // 幂等（键是行 id），所以每次启动都跑一遍是安全的；接不上就只记一行，
+    // 回填没做完之前读侧仍读行。
+    // 回填要一条自己的连接：账本 store 的连接不对外暴露，而回填是**独立的作业**，
+    // 不该借账本的池子——它的批大小与节奏都与请求路径无关。
+    match sqlx::PgPool::connect(url).await {
+        Ok(pool) => {
+            match cog_storage::postgres::usage_backfill::backfill_all(&pool, "gateway").await {
+                Ok(written) if written > 0 => {
+                    tracing::info!(written, "把账本里的调用回填成事件：读切换前的准备");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "调用回填没跑完；读侧在此之前仍读行，不会读到一个更小的数");
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "回填的连接建不出来；读侧仍读行"),
+    }
     Ok(Arc::new(store))
 }
 
