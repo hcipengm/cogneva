@@ -959,7 +959,21 @@ impl AgentObservable {
         &self,
         starting: Option<usize>,
     ) -> (Option<usize>, ContextWindowSource) {
-        self.context_probe().decision_for(None, starting)
+        let (window, source) = self.context_probe().decision_for(None, starting);
+        // 起点比型号公布的窗口还小：这一轮之前，有人按一个更小的数在裁，
+        // 而那个数没有出处。现在预算跟着型号走了，所以这是一条**已经改正**的读数，
+        // 不是一条当下的故障——它回答的是「那个种子错得多离谱」。
+        if let Some(starting) = starting {
+            if source.narrower_than(window, starting) {
+                tracing::warn!(
+                    starting,
+                    window = window.unwrap_or_default(),
+                    source = source.as_str(),
+                    "上下文窗口的起点比型号公布的还小：预算已按型号走，这个种子没有出处"
+                );
+            }
+        }
+        (window, source)
     }
 }
 
