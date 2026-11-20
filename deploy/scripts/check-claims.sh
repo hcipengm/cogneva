@@ -55,7 +55,12 @@ for sha in $shas; do
     # `a fixed batch`、`no fixed subject`、`the fixed validator`、`rules are fixed here`、
     # `the shape the gate was fixed for`——2026-11-20 实测，五笔功能提交因此被拒。
     # 判据要按**出现形式**判，不是按裸子串判：`fixed` 作形容词时前面总有一个限定词或系动词。
-    if printf '%s' "$msg" | grep -qE '修好|已修复|修掉了|(^|[.!?;:][[:space:]]+)[Ff]ix(ed|es)\b' &&
+    # 英文那一条要在**接起来的整段**上判：提交信息的换行是排版，不是句子边界。
+    # 不接起来的话，`...while "no` 换行后 `fixed subject" and ...` 会让行首的 `fixed`
+    # 命中原句中间的形容词——2026-11-20 实测被自己的门咬了一口。
+    flat="$(printf '%s' "$msg" | tr '\n' ' ')"
+    if { printf '%s' "$msg" | grep -qE '修好|已修复|修掉了' ||
+        printf '%s' "$flat" | grep -qE '(^|[.!?;:][[:space:]]+)[Ff]ix(ed|es)\b'; } &&
         ! printf '%s' "$msg" | grep -qE '^Reading:'; then
         printf 'FAIL: %s 说「修好了」，但没有一行 `Reading: <哪条读数> <改前> → <改后>`.\n' "${sha:0:9}" >&2
         fail=1
