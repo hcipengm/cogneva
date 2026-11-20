@@ -294,7 +294,6 @@ data:
           },
           "app": {
             "name": "cogneva",
-            "version": "0.1.0",
             "log_level": "info",
             "data_dir": "/var/lib/cogneva-data",
             "app_dir": "/opt/cogneva"

@@ -48,6 +48,14 @@
 //! 同一个值的，是同一件事的两处声明（文档不带 env 跑就是它，带 env 跑送进去的
 //! 还是它）；值不同的是这份 Pod 与共享文档的差，那正是覆盖层的用处，不在这里判。
 //!
+//! 第六个面：**共享的 env 层不许让文档那一份变成没人跑的值**。第五面只判「值相同」
+//! 那一半；对偶的坏法是值不同——跑起来的是 env 送进去的那个，文档在同一条路径上写
+//! 的那一份没有任何进程会读到，可它读起来仍像这个部署的决定。两种 env 层要分开看：
+//! `app-config.yaml` 是每份 Pod 的覆盖层，它盖掉文档正是它的用处（进化关 memory、
+//! 关分层迁移，那是这份 Pod 与共享文档的差）；`configmap.yaml` 与 `deploy/k3s/` 的
+//! 载体是共享层，它整份的身份就是「把文档投影进环境变量」，在那里写出一个不同的值，
+//! 等于第二份决定。判据的人口就是共享层的字面量，与文档自己的 `env` 表对账。
+//!
 //! 不判什么，说清楚：模板里写死的数字（不来自 `.Values`）归
 //! `chart_template_literals_contract_test.rs`；`values.yaml` 的数值叶子各带一条
 //! `# tunable:` 判词，归 `tunable_registry_contract_test.rs`；`values` 叶子与代码
@@ -1307,5 +1315,104 @@ fn the_restatement_gate_names_a_copy_and_lets_an_override_through() {
     assert!(
         found[0].contains("COGNEVA_APP_NAME") && found[0].contains("probe.yaml:1"),
         "点名要落在文件与行号上：{found:#?}"
+    );
+}
+
+/// 共享的 env 层：整份的身份是把交接文档投影进环境变量，不是作出第二个决定。
+///
+/// `app-config.yaml` 不在这里——它是每份 Pod 的覆盖层，盖掉文档正是它的用处。
+const SHARED_ENV_LAYERS: [&str; 2] = [
+    "deploy/helm/cogneva/templates/configmap.yaml",
+    "deploy/k3s/configmap.yaml",
+];
+
+/// 共享层写进去的字面量与文档在同一条路径上写的值不一样的地方。
+///
+/// 返回比过几行，以及 `(变量名, 文档的值, env 的值)` 与一处落点。投影（`{{ … }}`）
+/// 不进来：它送进去的就是文档的值，这一类由第五面按「复述或投影」各自判。
+fn dead_document_values(
+    declared: &BTreeMap<String, String>,
+    text: &str,
+    site: &str,
+) -> (usize, Vec<((String, String, String), String)>) {
+    let mut compared = 0;
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let Some((name, literal)) = env_literal(line) else {
+            continue;
+        };
+        let Some(want) = declared.get(name) else {
+            continue;
+        };
+        compared += 1;
+        if want != literal {
+            out.push((
+                (name.to_string(), want.clone(), literal.to_string()),
+                format!("{site}:{}", n + 1),
+            ));
+        }
+    }
+    (compared, out)
+}
+
+/// 共享层与文档对同一条路径给了两个值：跑的是 env 那个，文档那个没人读。
+///
+/// 这不是「覆盖层允许的差」——覆盖层是 `app-config.yaml`，它给每份 Pod 写自己的差；
+/// 共享层整份就是从文档投影出来的，在那里再写一个不同的值，同一件事就有了第二个
+/// 决定，而读文档的人以为那就是部署的取值。
+///
+/// 今天全树只有一处，且是一笔**还没定**的部署决定：`COGNEVA_STORAGE_PROVIDER` 写
+/// `local-fs`，交接文档 `providers.storage.provider` 写 `seaweedfs`（连同一整套
+/// endpoint / bucket / 凭据，在这个部署上谁都走不到）。哪边是对的不从树里判——要看
+/// 活着的集群上 seaweedfs 的卷里有没有对象，见 brain 仓
+/// `specs/findings-tracking-cc-b8114285.md` 的 D7。判据把这一处钉住，是为了让它
+/// **不能悄悄变化**：这一对值任何一边动了，都说明部署换了存储后端，那件事要按 D7
+/// 量过再定，不是一次渲染改动。
+///
+/// D7 收口之后这条断言要收紧成空集：两处声明同值（于是这一对消失），或者文档那一份
+/// 删掉（路径只剩 env 一层声明）。
+#[test]
+fn the_shared_env_layer_does_not_leave_the_document_stating_a_dead_value() {
+    let doc: serde_json::Value = serde_json::from_str(&read_repo(CHART_DOC))
+        .unwrap_or_else(|e| panic!("{CHART_DOC} 不是合法 JSON：{e}"));
+    let declared = document_env_values(&doc);
+    assert!(
+        !declared.is_empty(),
+        "{CHART_DOC} 的 env 表一条路径都没解析出来：下面那条判据会在空集上通过"
+    );
+
+    let mut compared = 0;
+    let mut found = Vec::new();
+    for layer in SHARED_ENV_LAYERS {
+        let text = blank_comments(&read(&repo_root().join(layer)));
+        let (n, hits) = dead_document_values(&declared, &text, layer);
+        compared += n;
+        found.extend(hits);
+    }
+    // 下限只挡「走查整个失效」：两张共享层上落在文档映射里的字面量今天 14 条（7 + 7，
+    // 两张是同一份的两次投影）。它只挡读法坏掉，不是要把这个数钉住。
+    assert!(
+        compared >= 10,
+        "共享层只比了 {compared} 条落在文档映射里的字面量，floor 10——疑读法坏了，\
+         下面的对账会在空集上通过"
+    );
+
+    let mut differing: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for (key, _) in &found {
+        differing.insert(key.clone());
+    }
+    let known: BTreeSet<(String, String, String)> = BTreeSet::from([(
+        "COGNEVA_STORAGE_PROVIDER".to_string(),
+        "seaweedfs".to_string(),
+        "local-fs".to_string(),
+    )]);
+    assert_eq!(
+        differing, known,
+        "共享层与交接文档对同一条路径给了两个值，或已知那一处变了。已知的那一处是\n\
+         `providers.storage.provider`：文档写 seaweedfs、两张载体都写 local-fs，跑的是\n\
+         后者，文档那段 S3 配置谁都走不到——这是 D7，要在活着的集群上量过才知道哪边对，\n\
+         不能顺手改。落点：{:#?}。新出现的条目不是覆盖，是同一件事的第二个决定：要么\n\
+         删掉文档那一份（它什么都没决定），要么让两边同值。",
+        found
     );
 }
