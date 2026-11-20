@@ -1370,13 +1370,12 @@ fn dead_document_values(
 /// 今天全树只有一处，且是一笔**还没定**的部署决定：`COGNEVA_STORAGE_PROVIDER` 写
 /// `local-fs`，交接文档 `providers.storage.provider` 写 `seaweedfs`（连同一整套
 /// endpoint / bucket / 凭据，在这个部署上谁都走不到）。哪边是对的不从树里判——要看
-/// 活着的集群上 seaweedfs 的卷里有没有对象，见 brain 仓
-/// `specs/findings-tracking-cc-b8114285.md` 的 D7。判据把这一处钉住，是为了让它
-/// **不能悄悄变化**：这一对值任何一边动了，都说明部署换了存储后端，那件事要按 D7
-/// 量过再定，不是一次渲染改动。
+/// 活着的集群上 seaweedfs 的卷里有没有对象，这份读数的现场不在本仓。判据把这一处
+/// 钉住，是为了让它**不能悄悄变化**：这一对值任何一边动了，都说明部署换了存储后端，
+/// 那件事要按实测重新定，不是一次渲染改动。
 ///
-/// D7 收口之后这条断言要收紧成空集：两处声明同值（于是这一对消失），或者文档那一份
-/// 删掉（路径只剩 env 一层声明）。
+/// 那条部署决定收口之后这条断言要收紧成空集：两处声明同值（于是这一对消失），或者
+/// 文档那一份删掉（路径只剩 env 一层声明）。
 #[test]
 fn the_shared_env_layer_does_not_leave_the_document_stating_a_dead_value() {
     let doc: serde_json::Value = serde_json::from_str(&read_repo(CHART_DOC))
