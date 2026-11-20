@@ -36,7 +36,18 @@ if git rev-parse --git-dir >/dev/null 2>&1 && [ -n "$(git status --porcelain 2>/
   dirty=1
 fi
 
-if [ "$builds" = "1" ] && [ "$dirty" = "1" ] && [ -f "$family" ]; then
+# 判据是「这一轮开工以来改了什么」，不是「工作树干不干净」：每做完一小块就提交的人，
+# 工作树永远是干净的，按脏树判等于把门整个跳过——而漏下的子集正是这样漏掉的。
+round_open=0
+if [ -f "$toplevel/scripts/hooks/round.py" ] && python3 "$toplevel/scripts/hooks/round.py" status >/dev/null 2>&1; then
+  round_open=0
+elif [ -f "$toplevel/scripts/hooks/round.py" ] && python3 "$toplevel/scripts/hooks/round.py" planned >/dev/null 2>&1; then
+  round_open=0
+else
+  round_open=1
+fi
+
+if [ "$builds" = "1" ] && [ -f "$family" ] && { [ "$dirty" = "1" ] || [ "$round_open" = "1" ]; }; then
   if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
     if ! python3 "$family" --root "$toplevel" --all-todos; then
       cat >&2 <<'EOF'
