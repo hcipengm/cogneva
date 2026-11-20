@@ -28,6 +28,7 @@ pub const DISTILL_SOURCE_CHARS: usize = 8_000;
 // cap: bound — 一件活声明自己会花多久；没有东西按这个数结束行，回收读的是租约与实测步间隔
 const DISTILL_TASK_DECLARED_SECS: u64 = 180;
 // cap: bound — 这里等答案的上界，比行声明的时长短，让等待的一方先说出自己为什么不再等
+// wall: 等=蒸馏任务交出结论 / 等不到=等待的一方先开口说出自己不再等，而任务本身不被杀掉（它的租约与实测步间隔才是回收它的东西） / 续跑=能，下一拍接着等同一个任务
 const DISTILL_WAIT_TIMEOUT_SECS: u64 = 170;
 
 /// 把一件活交给名册、把答复拿回来的那一格。

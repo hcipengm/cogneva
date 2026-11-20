@@ -10,6 +10,7 @@ use crate::pools::{ConfigPool, ExplainPool, MessagesPool, RedisClient, UsersPool
 /// 这条探针用的是单连接池，只跑一句 SHOW；池被占满说明数据库已经吃紧，
 /// 5s 拿不到就按「读不到」处理，而不是跟着一起排队。
 // cap: bound — 探针用的是单连接池、只跑一句 SHOW；池满说明数据库已吃紧，拿不到就按「读不到」处理而不是跟着排队
+// wall: 等=单连接池里那条连接 / 等不到=这次探活读作「读不到」，不跟着一起排队——池满本身就是读数 / 续跑=能，下一拍再探
 const CONNECTION_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Storage plugin that creates and publishes PostgreSQL pools and Redis client.

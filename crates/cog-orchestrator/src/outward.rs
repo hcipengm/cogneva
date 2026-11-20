@@ -79,6 +79,7 @@ const DEFAULT_MAX_ITEMS: usize = 3;
 /// request that needs longer than this is not going to be answered usefully,
 /// and holding the tick open costs every other source its turn.
 // cap: bound — SearXNG 就在集群里，三十秒还没答就是没在答
+// wall: 等=SearXNG 的回包 / 等不到=这一源这次没有结果，而整拍不停在它身上——别的源照常轮到自己 / 续跑=能，下一拍重新问
 const FETCH_TIMEOUT_SECS: u64 = 30;
 /// How much of a result's excerpt travels in the goal text. Enough to tell the
 /// taker whether it is worth opening; the URL is what they read when it is.

@@ -490,6 +490,7 @@ pub async fn keep_pushing(endpoint: GrafanaEndpoint) {
 /// already failed; the retry loop is what carries the next attempt.
 // cap: fixed — 一次推送的等待上限：超时当作失败重试，等更久只是让下一次尝试更晚，
 // 面板晚一分钟出现不影响任何判词
+// wall: 等=Grafana 对一次推送的答复 / 等不到=这一次推送按失败收尾，重试循环带着下一次尝试上来；已经推过去的样本不会因此被重发一遍 / 续跑=能，下一次尝试是一次新的推送
 const PUSH_TIMEOUT_SECS: u64 = 30;
 
 pub async fn push_once(
