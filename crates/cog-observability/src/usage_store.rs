@@ -1388,6 +1388,46 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// 同一读数，**从事件流算**：按任务汇总。
+    ///
+    /// 任务身份在载荷的 `task_id` 里（S39 的载荷就为这件事带上了它）。口径与账本
+    /// 那条一致：两向 token 相加、拒绝的调用计 0、时间取服务端 `at`。
+    pub async fn spend_by_task_since_from_stream(
+        &self,
+        task_ids: &[String],
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT attributes::jsonb->>'task_id' AS task_id,
+                    COALESCE(SUM(
+                        COALESCE((attributes::jsonb->>'input_tokens')::BIGINT, 0)
+                      + COALESCE((attributes::jsonb->>'output_tokens')::BIGINT, 0)
+                    ), 0)::BIGINT AS tokens
+               FROM cogneva_event
+              WHERE kind = 'llm_call'
+                AND attributes::jsonb->>'task_id' = ANY($1)
+                AND at >= to_timestamp($2::DOUBLE PRECISION)
+              GROUP BY 1
+              ORDER BY 1",
+        )
+        .bind(task_ids)
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("task_id"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
     /// 从 `since_unix` 起按工作区汇总的花销，`(workspace_id, tokens)`。
     ///
     /// 一次调用属于哪个工作区，证据与「属于哪个人」是同一行：任务图里那条任务
