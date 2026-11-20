@@ -456,8 +456,8 @@ fi
 # 「往上数几级」普查盯着的那一类。
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 batch_gate="${repo_root:+$repo_root/scripts/hooks/batch-gate.py}"
-if [ -n "$batch_gate" ] && [ -f "$batch_gate" ] && [ -n "${COGNEVA_OBLIGATIONS:-}" ]; then
-    python3 "$batch_gate" --root "$repo_root" --obligations "$COGNEVA_OBLIGATIONS" || exit 1
+if [ -n "$batch_gate" ] && [ -f "$batch_gate" ]; then
+    python3 "$batch_gate" --root "$repo_root" || exit 1
 fi
 
 # 「没判」与「判红」是两件事，读数上也得是两个：一格没进构建槽就跑，判词写成红是把

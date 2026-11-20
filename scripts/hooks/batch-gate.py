@@ -1,65 +1,97 @@
 #!/usr/bin/env python3
-"""默认全批：做子集要举证，而举证本身要被判真假。
+"""默认做完整批：没做的待办必须逐条点名，并给出四条理由之一。
 
-规则：**默认把这一轮的全部待办一次做完**；拆分是例外，
-必须在提交信息里点名四类理由之一并给出边界。这个程序判两件事：
+这一推里，台账上**所有未完成的待办**要么做了（它的触点在改动里），要么被
+`Split:` 逐条点名排除。两句判据：
 
-  1. 你做的够不够：义务清单里还有没做而这一推也没声明的 ⇒ 拒。
-  2. 声明的理由成不成立：
-     - `Split: 1` 验证面不同   两侧映射到的 cargo 包集合必须不同，相同即假。
-     - `Split: 2` 失败不可归因 机器判不了真假；要求点名会重叠的测试目标，记进历史。
-     - `Split: 3` 不可逆/不对称 必须一侧碰 deploy/、migrations/、scripts/host/，另一侧不碰。
-     - `Split: 4` 一次读不完   这一侧义务正文的估算 token 必须超过窗口里它能占的份额；
-                              窗口由模型声明导出（`--window-tokens`），不是人拍的数。
+  1. **没点名的排除 = 拒**。`Split:` 必须列出它排除的 S 号：
+         Split: 1 — S48, S63 — <为什么这两条这一批做不了>
+     没有被点名的未完成待办出现在「没做」的集合里 ⇒ 拒，并把它们列出来。
+  2. **理由要过真假判定**（四条里三条可机检）：
+     - 1 验证面不同   两侧映射到的 cargo 包集合必须不同，相同即假；
+     - 2 失败不可归因 机器判不了真假，但必须点名会重叠的测试目标，记进历史；
+     - 3 不可逆/不对称 必须这一批里有一处碰 deploy/、migrations/、scripts/host/；
+     - 4 一次读不完   被排除那几行的正文估算 token 必须超过窗口里它能占的份额
+                      （窗口由模型声明导出，`--window-tokens` 或 `COGNEVA_CONTEXT_WINDOW`）。
 
-义务清单的来源是变更账本（`change_ledger` 里 `kind=grep, literal=principle:*` 且
-状态未落地）。离线跑时用 `--obligations <文件>`（一行一个 `principle: <name>`）。
+台账由 `COGNEVA_TODO_LEDGER` 指定（或 `--ledger`）。读不到 ⇒ 退 2「没判」，不是绿。
 
-退出码：0 允许；1 拒；2 读不到（清单/仓库）——读不到不判，也不假绿。
+退出码：0 允许；1 拒；2 读不到。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import re
 import subprocess
 import sys
 
-# 粗略的 token 估算：中文一字一 token，英文按 4 字节一 token 计。它只用来判
-# 「这一侧读得完读不完」，不用于计费，所以不追求精确；比例写在估算函数里，
-# 换估算器时只改这一处。
+DEFAULT_LEDGER = pathlib.Path.home() / ".local/state/cogneva/todo-ledger.md"
+def resolve_ledger(explicit: str | None) -> pathlib.Path:
+    """台账路径：显式 → 环境变量 → 本机配置文件 → 默认（不存在就是没有台账）。
+
+    本机那一格是 `~/.config/cogneva/todo-ledger`，一行路径。台账在哪里是这台机器的
+    事实，写进公开仓就成了「谁的机器」的猜测。
+    """
+    if explicit:
+        return pathlib.Path(explicit)
+    env = os.environ.get("COGNEVA_TODO_LEDGER")
+    if env:
+        return pathlib.Path(env)
+    host = pathlib.Path.home() / ".config/cogneva/todo-ledger"
+    if host.exists():
+        line = host.read_text(errors="ignore").strip().splitlines()
+        if line and line[0].strip():
+            return pathlib.Path(line[0].strip()).expanduser()
+    return pathlib.Path.home() / ".local/state/cogneva/todo-ledger.md"
+
+
+OPEN_WORDS = ("未落", "部分", "进行中", "待落", "待裁", "未开始")
+# 台账上的「这一轮」：行里写 `round: current` 的算本轮批次，其余是积压。积压不会被
+# 悄悄丢掉——工具每次运行都把它的条数印出来，而且它一旦被选中就必须写回 `round:`。
+# 没有一行标 `round:` 时，全部未完成待办都算本轮（默认全量）。
+IRREVERSIBLE = ("deploy/", "migrations/", "scripts/host/")
+
+
 def estimate_tokens(text: str) -> int:
     cjk = len(re.findall(r"[一-鿿]", text))
-    other = max(0, len(text) - cjk)
-    return cjk + other // 4
+    return cjk + max(0, len(text) - cjk) // 4
 
 
-def obligations_from_file(path: pathlib.Path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(errors="ignore").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, str, list[str]]], int]:
+    """(本轮未完成的待办, 积压条数)。
+
+    「这一轮」由行里的 `round: current` 标出；一行都没标时，全部未完成待办都算本轮
+    ——默认全量。积压不是被丢掉：它的条数每次都印出来，而且选它的时候必须把标记写回去。
+    """
+    open_rows: list[tuple[str, str, str, list[str]]] = []
+    for line in ledger.read_text(errors="ignore").splitlines():
+        if not line.startswith("| S"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        name = cells[0]
+        if not any(word in cells[2] for word in OPEN_WORDS):
+            continue
+        found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
+        paths: list[str] = []
+        if found:
+            raw = found.group(1).strip()
+            if not raw.startswith("unknown"):
+                paths = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
+        open_rows.append((name, line, cells[2], paths))
+
+    current = [(n, l, p) for n, l, _, p in open_rows if "round: current" in l]
+    if current:
+        backlog = len(open_rows) - len(current)
+        return current, backlog
+    return [(n, l, p) for n, l, _, p in open_rows], 0
 
 
-def markers_in_tree(root: pathlib.Path) -> set[str]:
-    out = subprocess.run(
-        ["grep", "-rhoE", r"principle: [A-Za-z0-9_]+", "--include=*.rs", "--include=*.sh",
-         "--include=*.py", "crates", "deploy", "scripts"],
-        cwd=root, capture_output=True, text=True,
-    ).stdout
-    return {m.group(1) for m in re.finditer(r"principle: ([A-Za-z0-9_]+)", out)}
-
-
-def message_of(root: pathlib.Path, base: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(root), "log", "--format=%B", f"{base}..HEAD"],
-        capture_output=True, text=True,
-    ).stdout
-
-
-def changed_paths(root: pathlib.Path, base: str) -> list[str]:
+def changed(root: pathlib.Path, base: str) -> list[str]:
     out = subprocess.run(
         ["git", "-C", str(root), "diff", "--name-only", f"{base}...HEAD"],
         capture_output=True, text=True,
@@ -67,49 +99,42 @@ def changed_paths(root: pathlib.Path, base: str) -> list[str]:
     return [l.strip() for l in out.splitlines() if l.strip()]
 
 
+def messages(root: pathlib.Path, base: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), "log", "--format=%B", f"{base}..HEAD"],
+        capture_output=True, text=True,
+    ).stdout
+
+
 def packages(paths: list[str]) -> set[str]:
-    out: set[str] = set()
-    for p in paths:
-        parts = p.split("/")
-        out.add("/".join(parts[:2]) if len(parts) > 1 else parts[0])
-    return out
+    return {"/".join(p.split("/")[:2]) for p in paths if "/" in p}
 
 
-IRREVERSIBLE = ("deploy/", "migrations/", "scripts/host/")
-
-
-def judge_split(kind: str, detail: str, paths: list[str], owed: list[str], window: int) -> str | None:
-    """返回拒绝理由；None 表示这条理由成立（或无法判真假但已点名）。"""
+def judge(kind: str, excluded: list[str], detail: str, touched: list[str], ledger_rows: dict[str, str], window: int) -> str | None:
     if kind == "1":
-        # 两侧：`Split: 1 — A | B`，A/B 是路径前缀。
         sides = [s.strip() for s in re.split(r"[|｜]", detail)]
         if len(sides) != 2:
-            return "Split: 1 要写两侧边界（`Split: 1 — <一侧路径> | <另一侧路径>`）"
-        left = {p for p in paths if p.startswith(sides[0])}
-        right = {p for p in paths if p.startswith(sides[1])}
-        if packages(left) == packages(right):
-            return (
-                "Split: 1 说验证面不同，但两侧映射到同一批 cargo 包"
-                f"（{sorted(packages(left))}）——验证面其实相同"
-            )
+            return "Split: 1 要写两侧边界（`Split: 1 — <S 号…> — <一侧路径> | <另一侧路径>`）"
+        left = [p for p in touched if p.startswith(sides[0])]
+        right = [p for p in touched if p.startswith(sides[1])]
+        if not left or not right or packages(left) == packages(right):
+            return f"Split: 1 说验证面不同，但两侧落在同一批 cargo 包（{sorted(packages(left))}）"
         return None
     if kind == "3":
-        touched = [p for p in paths if p.startswith(IRREVERSIBLE)]
-        if not touched:
+        if not any(p.startswith(IRREVERSIBLE) for p in touched):
             return "Split: 3 说不可逆或代价不对称，但这一批没有一处碰 deploy/、migrations/、scripts/host/"
         return None
     if kind == "4":
         if window <= 0:
             return "Split: 4 要拿窗口份额比，但没给窗口（--window-tokens 或 COGNEVA_CONTEXT_WINDOW）"
-        real = [o for o in owed if o in paths or True]  # 义务本身不带路径，这里按整侧计数
-        cost = sum(estimate_tokens(o) for o in real)
-        share = window // 2  # 与工具结果预算同一条份额约定
+        cost = sum(estimate_tokens(ledger_rows.get(name, "")) for name in excluded)
+        share = window // 2
         if cost <= share:
-            return f"Split: 4 说读不完，但这一侧义务估算 {cost} token ≤ 窗口份额 {share}"
+            return f"Split: 4 说这些读不完，但它们估算只有 {cost} token ≤ 窗口份额 {share}"
         return None
     if kind == "2":
         if not re.search(r"[a-z0-9_]+\.rs|tests?/", detail):
-            return "Split: 2 要点名会重叠的测试目标（文件或测试名），机器判不了真假但要点得出来"
+            return "Split: 2 要点名会重叠的测试目标（文件或测试名）"
         return None
     return f"Split: {kind} 不在四条里（只认 1 验证面 / 2 归因 / 3 不可逆 / 4 读不完）"
 
@@ -118,46 +143,59 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
     parser.add_argument("--base", default="origin/main")
-    parser.add_argument("--obligations", required=True)
+    parser.add_argument("--ledger", default=None)
     parser.add_argument("--window-tokens", type=int,
-                        default=int(__import__("os").environ.get("COGNEVA_CONTEXT_WINDOW", "0")))
+                        default=int(os.environ.get("COGNEVA_CONTEXT_WINDOW", "0")))
     args = parser.parse_args(argv[1:])
 
     root = pathlib.Path(args.root).resolve()
-    owed = obligations_from_file(pathlib.Path(args.obligations))
-    if not owed:
-        print("batch-gate: 义务清单是空的，这一推不判。")
+    ledger = resolve_ledger(args.ledger)
+    if not ledger.exists():
+        print(f"batch-gate: 台账读不到（{ledger}），这一推没判。", file=sys.stderr)
+        return 2
+
+    todos, backlog = open_todos(ledger)
+    if not todos:
+        print(f"batch-gate: 台账里没有本轮的待办（积压 {backlog} 条）。")
         return 0
 
-    done = markers_in_tree(root)
-    remaining = [o for o in owed if o.split("principle: ")[-1] not in done]
-    msg = message_of(root, args.base)
-    paths = changed_paths(root, args.base)
+    touched = changed(root, args.base)
+    rows = {name: line for name, line, _ in todos}
+    done = {name for name, _, paths in todos if paths and any(p in touched for p in paths)}
+    untouched = [name for name, _, _ in todos if name not in done]
 
-    if not remaining:
-        print(f"batch-gate: {len(owed)} 条义务全部有证据，允许。")
+    if not untouched:
+        print(f"batch-gate: 本轮 {len(todos)} 条待办这一推全部动到了（积压 {backlog} 条）。")
         return 0
 
-    splits = re.findall(r"^Split:\s*(\S)[^\n]*", msg, re.M)
-    if not splits:
+    msg = messages(root, args.base)
+    split = re.search(r"^Split:\s*([1-4])\s*—\s*([^—\n]*)—\s*(.*)$", msg, re.M)
+    if not split:
         print(
-            f"FAIL: 这批义务还有 {len(remaining)} 条没有证据（共 {len(owed)} 条），"
-            "而提交信息里没有 `Split:`。默认是做完整批；要拆必须点出四条之一。",
+            f"FAIL: 台账上还有 {len(untouched)} 条未完成待办没动，提交信息里也没有 "
+            "`Split: <1-4> — <S 号…> — <理由>`。\n      "
+            + "、".join(untouched),
             file=sys.stderr,
         )
         return 1
 
-    for kind in splits:
-        detail = ""
-        for line in msg.splitlines():
-            if line.startswith("Split:") and line.strip().startswith(f"Split: {kind}"):
-                detail = line.split("—", 1)[-1] if "—" in line else line.split("-", 1)[-1]
-        problem = judge_split(kind, detail, paths, remaining, args.window_tokens)
-        if problem:
-            print(f"FAIL: {problem}", file=sys.stderr)
-            return 1
+    kind, declared_raw, detail = split.group(1), split.group(2), split.group(3).strip()
+    declared = [s.strip() for s in re.split(r"[,，\s]+", declared_raw) if s.strip()]
+    unaccounted = [name for name in untouched if name not in declared]
+    if unaccounted:
+        print(
+            "FAIL: 这些未完成待办既没做也没被 `Split:` 点名："
+            + "、".join(unaccounted),
+            file=sys.stderr,
+        )
+        return 1
 
-    print(f"batch-gate: 声明了 {len(splits)} 条拆分理由，均已判过；剩余 {len(remaining)} 条在下一批。")
+    problem = judge(kind, declared, detail, touched, rows, args.window_tokens)
+    if problem:
+        print(f"FAIL: {problem}", file=sys.stderr)
+        return 1
+
+    print(f"batch-gate: 做了 {len(done)} 条，按第 {kind} 条排除 {len(declared)} 条（已逐条点名）；积压 {backlog} 条。")
     return 0
 
 

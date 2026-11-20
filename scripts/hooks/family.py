@@ -32,6 +32,25 @@ import subprocess
 import sys
 
 DEFAULT_LEDGER = pathlib.Path.home() / ".local/state/cogneva/todo-ledger.md"
+def resolve_ledger(explicit: str | None) -> pathlib.Path:
+    """台账路径：显式 → 环境变量 → 本机配置文件 → 默认（不存在就是没有台账）。
+
+    本机那一格是 `~/.config/cogneva/todo-ledger`，一行路径。台账在哪里是这台机器的
+    事实，写进公开仓就成了「谁的机器」的猜测。
+    """
+    if explicit:
+        return pathlib.Path(explicit)
+    env = os.environ.get("COGNEVA_TODO_LEDGER")
+    if env:
+        return pathlib.Path(env)
+    host = pathlib.Path.home() / ".config/cogneva/todo-ledger"
+    if host.exists():
+        line = host.read_text(errors="ignore").strip().splitlines()
+        if line and line[0].strip():
+            return pathlib.Path(line[0].strip()).expanduser()
+    return pathlib.Path.home() / ".local/state/cogneva/todo-ledger.md"
+
+
 OPEN_WORDS = ("未落", "部分", "进行中", "待落", "待裁")
 
 # 四张配套表：改了一处，另一处必须跟着改，否则那道门会红。
@@ -49,7 +68,12 @@ def run(*args: str, cwd: pathlib.Path | None = None) -> str:
 
 def working_tree_changes(root: pathlib.Path) -> list[str]:
     files: list[str] = []
-    for args in (["diff", "--name-only", "HEAD"], ["ls-files", "--others", "--exclude-standard"]):
+    # 这一轮已经提交的部分也算「做了」：拿工作区去比，会把刚提交的改动读成没做。
+    for args in (
+        ["diff", "--name-only", "origin/main...HEAD"],
+        ["diff", "--name-only", "HEAD"],
+        ["ls-files", "--others", "--exclude-standard"],
+    ):
         files += [line.strip() for line in run("git", "-C", str(root), *args).splitlines() if line.strip()]
     return sorted(set(files))
 
@@ -59,6 +83,7 @@ def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, list[str]]], list[
     with_touch: list[tuple[str, list[str]]] = []
     without: list[str] = []
     defer: list[str] = []
+    rows: list[tuple[str, list[str], str, str]] = []  # (名字, 触点, 状态, 整行)
     if not ledger.exists():
         return with_touch, without, defer
     for line in ledger.read_text(errors="ignore").splitlines():
@@ -73,18 +98,44 @@ def open_todos(ledger: pathlib.Path) -> tuple[list[tuple[str, list[str]]], list[
         status_cells = cells[2:3]
         if not any(word in cell for cell in status_cells for word in OPEN_WORDS):
             continue
-        found = re.search(r"touches:\s*([^|]+)", line)
+        # 只认单元格里的那一段：行文里引用 `touches:` 这个写法的地方不算声明。
+        found = re.search(r"[｜|]\s*touches:\s*([^|｜\n]+)", line)
         if not found:
             without.append(name)
             continue
-        paths = [p.strip() for p in re.split(r"[,，]", found.group(1)) if p.strip()]
-        # `unknown` 是「这一轮不排它」的显式记号：它不进批次，但一直出现在报告里，
-        # 所以「没排」与「忘了排」分得开。
-        if paths == ["unknown"]:
+        raw = found.group(1).strip()
+        # `unknown` 只允许带理由，且它意味着「本轮明确不排」——不排要在推的时候逐条
+        # 点名（`Split: <1-4> — <S 号…> — 理由`），所以它不是走后门，是把话说在前面。
+        if raw.startswith("unknown"):
+            if "—" not in raw and "-" not in raw:
+                without.append(f"{name}（写了 unknown 但没说为什么）")
+                continue
             defer.append(name)
             continue
+        paths = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
+        # 每个触点都得长得像一条路径：带反引号、空格、或别的散文，说明这不是一份触点清单。
+        looks_like_path = re.compile(r"^[\w./-]+$")
+        if not paths or any(not looks_like_path.match(p) for p in paths):
+            without.append(name)
+            continue
         with_touch.append((name, paths))
-    without.extend([])
+    # 「没写触点」只对本轮的待办成立：积压里的 `unknown` 是「本轮不排」，不是缺陷。
+    without = [w for w in without if "round: current" in next(
+        (l for l in ledger.read_text(errors="ignore").splitlines() if l.startswith(f"| {w.split('（')[0]} ")), "round: current")]
+    # 本轮：行里标 `round: current` 的算这一轮；一行都没标时全部未完成待办都算本轮。
+    rows = {name for name, _ in with_touch}
+    if rows:
+        all_lines = ledger.read_text(errors="ignore")
+        if "round: current" in all_lines:
+            current: list[tuple[str, list[str]]] = []
+            for name, paths in with_touch:
+                line = next((l for l in all_lines.splitlines() if l.startswith(f"| {name} ")), "")
+                if "round: current" in line:
+                    current.append((name, paths))
+            backlog = len(with_touch) - len(current)
+            with_touch = current
+            if backlog:
+                print(f"family: 积压 {backlog} 条未完成待办不在本轮（台账里标 `round: current` 的才进批次）")
     return with_touch, without, defer
 
 
@@ -200,7 +251,7 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
-    parser.add_argument("--ledger", default=os.environ.get("COGNEVA_TODO_LEDGER", str(DEFAULT_LEDGER)))
+    parser.add_argument("--ledger", default=None)
     parser.add_argument("--changed", nargs="*", default=None)
     parser.add_argument("--from-git", action="store_true")
     parser.add_argument("--all-todos", action="store_true")
@@ -217,7 +268,34 @@ def main(argv: list[str]) -> int:
     deferred: list[str] = []
     batch = list(changed)
     if args.all_todos:
-        todos, missing, deferred = open_todos(pathlib.Path(args.ledger))
+        ledger_path = resolve_ledger(args.ledger)
+        if not ledger_path.exists():
+            # 「没有台账」与「台账里没有待办」不是同一件事。前者是这台 worker 本来就不
+            # 记待办（批次只按工作区算），后者是「全做完了」。说清楚是哪一种，别让
+            # 沉默替它们回答。
+            print(
+                f"family: 没有配置 worker 台账（{ledger_path} 不存在）——"
+                "本轮批次只按工作区改动算，不假装台账是空的"
+            )
+            todos, missing, deferred = [], [], []
+        else:
+            todos, missing, deferred = open_todos(ledger_path)
+        # 触点必须指得到东西：写错的路径与「凭记忆写的路径」在批次里同形，而后者是
+        # 这一整套最初要治的病。指不到就挡住批次，让写的人去核对。
+        bad: list[str] = []
+        checked: list[tuple[str, list[str]]] = []
+        for name, paths in todos:
+            gone = [p for p in paths if not (root / p).exists()]
+            if gone:
+                bad.append(f"{name}: {', '.join(gone)}")
+                continue
+            checked.append((name, paths))
+        if bad:
+            print("family: 这些待办的触点在树里不存在，批次算不出来：")
+            for line in bad:
+                print(f"  {line}")
+            return 2
+        todos = checked
         if deferred:
             print(f"family: 本轮不排的待办（touches: unknown）{len(deferred)} 项：{', '.join(deferred)}")
         for _, paths in todos:
