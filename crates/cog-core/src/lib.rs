@@ -91,6 +91,7 @@ pub use contract::reranker::*;
 pub use contract::resilience::*;
 pub use contract::resource_ledger::*;
 pub use contract::resume_point::*;
+pub use contract::round_batch::*;
 pub use contract::runtime_principle::*;
 pub use contract::sandbox::*;
 pub use contract::shutdown::*;
