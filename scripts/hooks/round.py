@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -117,7 +118,11 @@ def ledger_at(rev: str, spec: str) -> pathlib.Path:
     )
     if blob.returncode != 0:
         raise todo_source.Unreadable(f"{rev[:12]} 上没有那份台账：{blob.stderr.strip()[:160]}")
-    tmp = pathlib.Path("/tmp") / f"cogneva-ledger-{rev[:12]}.md"
+    # 文件名带台账路径的短哈希：同一台机器上两个 worker 各有一本台账，而两本台账
+    # 常常停在同一个 rev 上——只按 rev 命名，后写的那个会把前一个的字节盖掉，读的人
+    # 于是拿到「另一个 worker 的待办」，而它长得完全正常。
+    digest = hashlib.sha1(str(path).encode()).hexdigest()[:8]
+    tmp = pathlib.Path("/tmp") / f"cogneva-ledger-{digest}-{rev[:12]}.md"
     tmp.write_text(blob.stdout)
     return tmp
 

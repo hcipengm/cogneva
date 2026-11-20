@@ -36,11 +36,14 @@ CLOSED_PREFIXES = ("已落",)
 
 
 class Item:
-    __slots__ = ("id", "title", "touches", "deferred")
+    __slots__ = ("id", "title", "text", "touches", "deferred")
 
-    def __init__(self, id: str, title: str, touches: list[str], deferred: bool = False):
+    def __init__(self, id: str, title: str, text: str, touches: list[str], deferred: bool = False):
         self.id = id
         self.title = title
+        # 整行原文（不截断）。`title` 是给人看的前 80 字，用来估「这一条读起来要多少
+        # token」会把最长的几条估成同一个数——一条待办的正文都在标题之外。
+        self.text = text
         self.touches = touches
         # `touches: unknown — 理由`：明确本轮不排。它不是「忘了写触点」——
         # 两者的修法不同（前者要 Split 点名，后者要先补触点），所以这里分开。
@@ -93,7 +96,7 @@ def _md_items(path: pathlib.Path) -> list[Item]:
                 if p.strip() and p.strip() != "unknown"
             ]
             touches = [p.strip(" ）)") for p in touches if p.strip(" ）)")]
-        out.append(Item(cells[0], cells[1][:80], touches, deferred))
+        out.append(Item(cells[0], cells[1][:80], line.strip(), touches, deferred))
     if malformed:
         raise Unreadable(
             "这些行以 `| S` 开头却没有状态列，读不出它做没做：" + "、".join(malformed)
@@ -137,7 +140,7 @@ def _change_ledger_items() -> list[Item]:
         # 不是路径的（`crates` 这种整棵树的）就不当触点——它指不到具体文件，
         # 这种条目只能靠 `Split:` 点名，或者先被拆细。
         touches = [scope] if "/" in scope or scope.endswith(".rs") else []
-        out.append(Item(ident, title, touches))
+        out.append(Item(ident, title, title, touches))
     if bad_state:
         raise Unreadable(
             "变更账本里有不在闭集里的状态（只认 pending / landed）：" + "、".join(bad_state[:10])

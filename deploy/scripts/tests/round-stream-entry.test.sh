@@ -34,10 +34,13 @@ ok()  { printf 'ok    - %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf 'FAIL- %s\n' "$1" >&2; fail=$((fail + 1)); }
 
 # 事件流的替身：round 住在一行 `round_opened` 里，载荷是台账 rev。
+#
+# 第四列是**这一轮的 id 清单**——批次的正本在事件里，不在某个 rev 的台账上。
+# 少了它，「还剩几条」永远是 0，而 0 条正是「这一轮做完了」的读数。
 cat >"$tree/scripts/host/event-psql.sh" <<STUB
 #!/bin/sh
 case "\$*" in
-  *round_opened*) printf '%s\t%s\t%s\n' "round-test" "$REV" "" ;;
+  *round_opened*) printf '%s\t%s\t%s\t%s\n' "round-test" "$REV" "" '["S1"]' ;;
   *) : ;;
 esac
 STUB

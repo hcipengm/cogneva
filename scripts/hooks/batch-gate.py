@@ -10,7 +10,9 @@
   2. **理由要过真假判定**（四条里三条可机检）：
      - 1 验证面不同   两侧映射到的 cargo 包集合必须不同，相同即假；
      - 2 失败不可归因 机器判不了真假，但必须点名会重叠的测试目标，记进历史；
-     - 3 不可逆/不对称 必须这一批里有一处碰 deploy/、migrations/、scripts/host/；
+     - 3 不可逆/不对称 被排除的那几条与这一批之间，**恰有一侧**碰
+                      deploy/、migrations/、scripts/host/（回滚一次提交回不到原状
+                      的那一侧必须单独落地）；两侧都碰或都不碰 ⇒ 假；
      - 4 一次读不完   被排除那几行的正文估算 token 必须超过窗口里它能占的份额
                       （窗口由模型声明导出，`--window-tokens` 或 `COGNEVA_CONTEXT_WINDOW`）。
 
@@ -53,7 +55,22 @@ OPEN_WORDS = ("未落", "部分", "进行中", "待落", "待裁", "未开始")
 # 台账上的「这一轮」：行里写 `round: current` 的算本轮批次，其余是积压。积压不会被
 # 悄悄丢掉——工具每次运行都把它的条数印出来，而且它一旦被选中就必须写回 `round:`。
 # 没有一行标 `round:` 时，全部未完成待办都算本轮（默认全量）。
-IRREVERSIBLE = ("deploy/", "migrations/", "scripts/host/")
+
+
+def irreversible(path: str) -> bool:
+    """这个路径动的是**不可回退**的面：回滚一次提交回不到原状。
+
+    三种：`deploy/`（推下去就滚动）、`scripts/host/`（现场的工具）、迁移目录。
+    迁移目录按**目录段**判而不是按前缀：迁移住在 `crates/<crate>/migrations/` 里，
+    按前缀判的话这条理由永远匹配不到任何迁移。
+    """
+    p = path.lstrip("./")
+    return (
+        p.startswith("deploy/")
+        or p.startswith("scripts/host/")
+        or p.startswith("migrations/")
+        or "/migrations/" in p
+    )
 
 
 def estimate_tokens(text: str) -> int:
@@ -90,7 +107,7 @@ def packages(paths: list[str]) -> set[str]:
     return {"/".join(p.split("/")[:2]) for p in paths if "/" in p}
 
 
-def judge(kind: str, excluded: list[str], detail: str, touched: list[str], ledger_rows: dict[str, str], window: int) -> str | None:
+def judge(kind: str, excluded: list[str], detail: str, touched: list[str], items: dict, window: int) -> str | None:
     if kind == "1":
         sides = [s.strip() for s in re.split(r"[|｜]", detail)]
         if len(sides) != 2:
@@ -101,13 +118,35 @@ def judge(kind: str, excluded: list[str], detail: str, touched: list[str], ledge
             return f"Split: 1 说验证面不同，但两侧落在同一批 cargo 包（{sorted(packages(left))}）"
         return None
     if kind == "3":
-        if not any(p.startswith(IRREVERSIBLE) for p in touched):
-            return "Split: 3 说不可逆或代价不对称，但这一批没有一处碰 deploy/、migrations/、scripts/host/"
+        # 这条理由的全部内容是「被拆开的两侧里，恰有一侧动的是回不去的东西」：
+        # 那一侧必须单独落地，因为回滚一次提交回不到原状，混在别人里面会让别人
+        # 也没法单独回滚。所以判的是**两侧的不对称**，不是「这批里有没有 deploy/」：
+        # 两侧都碰 ⇒ 拆开没有把不可回退的那一侧拎出来，理由不成立；
+        # 两侧都不碰 ⇒ 没有回不去的东西，理由更不成立。
+        batch_irr = sorted(p for p in touched if irreversible(p))
+        excl_irr = sorted(
+            p for name in excluded for p in getattr(items.get(name), "touches", []) if irreversible(p)
+        )
+        if batch_irr and excl_irr:
+            return (
+                "Split: 3 说不可逆或不对称，但两侧都碰了不可回退的面：这一批动了 "
+                + "、".join(batch_irr[:3])
+                + "，被排除的那几条也要动 "
+                + "、".join(excl_irr[:3])
+                + "。两侧都回不去，拆开并没有把不可回退的那一侧单独拎出来"
+            )
+        if not batch_irr and not excl_irr:
+            return (
+                "Split: 3 说不可逆或不对称，但两侧都没碰 deploy/、migrations/、scripts/host/——"
+                "没有「回滚一次提交回不到原状」的东西，这条理由不成立"
+            )
         return None
     if kind == "4":
         if window <= 0:
             return "Split: 4 要拿窗口份额比，但没给窗口（--window-tokens 或 COGNEVA_CONTEXT_WINDOW）"
-        cost = sum(estimate_tokens(ledger_rows.get(name, "")) for name in excluded)
+        cost = sum(
+            estimate_tokens(getattr(items.get(name), "text", "")) for name in excluded
+        )
         share = window // 2
         if cost <= share:
             return f"Split: 4 说这些读不完，但它们估算只有 {cost} token ≤ 窗口份额 {share}"
@@ -170,7 +209,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     touched = changed(root, current[2] or "")
-    rows = {item.id: item.title for item in todos}
+    items = {item.id: item for item in todos}
     done = {i.id for i in todos if i.touches and any(p in touched for p in i.touches)}
     todos = [i for i in todos if not round_ids or i.id in round_ids]
     untouched = [i.id for i in todos if i.id not in done]
@@ -201,7 +240,7 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    problem = judge(kind, declared, detail, touched, rows, args.window_tokens)
+    problem = judge(kind, declared, detail, touched, items, args.window_tokens)
     if problem:
         print(f"FAIL: {problem}", file=sys.stderr)
         return 1
