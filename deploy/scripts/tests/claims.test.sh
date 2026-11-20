@@ -48,6 +48,16 @@ Reading: cogneva_task_events_rows 41 → 41" 0 "说修好了并给出读数：�
 check "Justify the split
 
 按第 4 条拆" 1 "引规则不给出处：红"
+# 形容词不是声明。2026-11-20 实测：五笔功能提交因为 `a fixed batch`、`no fixed subject`
+# 这类用法被拒，而它们一笔也没在说「修好了」。判据要按出现形式判，不按裸子串判。
+check "Pin the batch at a fixed point
+
+the batch had no fixed subject to ask about" 0 "fixed 作形容词：不是声明，绿"
+check "Hand the loop a fixed batch" 0 "标题里的 fixed batch：不是声明，绿"
+check "Fixed the resume point
+
+steps are read in order" 1 "行首的动词 fixed：是声明，没读数就红"
+
 check "Justify the split
 
 按第 4 条拆

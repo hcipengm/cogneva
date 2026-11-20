@@ -50,7 +50,12 @@ for sha in $shas; do
     raw="$(git -C "$root" show -s --format=%B "$sha")"
     msg="$(strip_mentions "$raw")"
 
-    if printf '%s' "$msg" | grep -qE '修好|已修复|修掉了|\bfixed\b' &&
+    # 英文那一条只认**动词位置的声明**：行首（或句号／冒号之后）的 `fix(ed|es)`。
+    # 原来写的是 `\bfixed\b`，那是**裸单词**，于是把这五类形容词用法全算成了声明：
+    # `a fixed batch`、`no fixed subject`、`the fixed validator`、`rules are fixed here`、
+    # `the shape the gate was fixed for`——2026-11-20 实测，五笔功能提交因此被拒。
+    # 判据要按**出现形式**判，不是按裸子串判：`fixed` 作形容词时前面总有一个限定词或系动词。
+    if printf '%s' "$msg" | grep -qE '修好|已修复|修掉了|(^|[.!?;:][[:space:]]+)[Ff]ix(ed|es)\b' &&
         ! printf '%s' "$msg" | grep -qE '^Reading:'; then
         printf 'FAIL: %s 说「修好了」，但没有一行 `Reading: <哪条读数> <改前> → <改后>`.\n' "${sha:0:9}" >&2
         fail=1
