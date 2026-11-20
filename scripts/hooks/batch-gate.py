@@ -145,6 +145,23 @@ def _declares_split(root: pathlib.Path, since: str) -> bool:
     return "Split:" in out
 
 
+def _round_is_planned(round_event_id: str) -> bool:
+    """这一轮有没有一份被接受的计划（`batch_planned` 事件挂在同一个 subject 上）。"""
+    import os as _os
+    if not _os.environ.get("COGNEVA_EVENT_PSQL"):
+        return True  # 读不到事件流时本门另有「没有开着的一轮」那一支，不在这里重复拦
+    sql = (
+        "select count(*) from cogneva_event where kind='batch_planned' "
+        f"and subject_id='{round_event_id}'"
+    )
+    try:
+        import round as round_mod
+
+        return round_mod.psql(sql).strip() not in ("", "0")
+    except Exception:
+        return True
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
@@ -214,6 +231,15 @@ def main(argv: list[str]) -> int:
         for line in bypasses[-5:]:
             print("  " + line.replace("\t", "  "), file=sys.stderr)
         return 1
+
+    # 推之前再问一次「这一轮有没有计划」：没有计划的一轮，编辑时范围就是临场定的，
+    # 那么「全都动到了」与「只动了计划里那几条」在读数上分不开。
+    if not _round_is_planned(current[0]):
+        print(
+            "batch-gate: 这一轮没有计划（`round.py plan --file`），所以这一推没按整批编辑，判不了。",
+            file=sys.stderr,
+        )
+        return 2
 
     untouched = [i.id for i in todos if i.id not in done]
 

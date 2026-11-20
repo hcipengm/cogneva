@@ -41,6 +41,26 @@ if [ "$builds" = "1" ] && [ "${COGNEVA_BATCH_UNCHECKED:-0}" = "1" ]; then
   printf '%s\t%s\t%s\tBYPASS\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(pwd -P)" "${*:-}" >>"$ledger"
 fi
 
+# 编辑之前就要有「整批作为输入」的那份计划。没有计划就编译，等于又回到
+# 「边改边定范围」：垫片能看出触点到没点到，看不出这一轮到底打算做哪些。
+if [ "$builds" = "1" ] && [ "$dirty" = "1" ] && [ "${COGNEVA_BATCH_UNCHECKED:-0}" != "1" ] && [ -f "$toplevel/scripts/hooks/round.py" ]; then
+  if ! python3 "$toplevel/scripts/hooks/round.py" planned >/dev/null 2>&1; then
+    python3 "$toplevel/scripts/hooks/round.py" planned >&2 || true
+    cat >&2 <<'EOF'
+
+cargo: 这一轮还没有计划，先别编译。
+
+  整批待办要先变成**编辑的输入**：一份覆盖全部待办的计划（每条至少两种来源形状，
+  或者点名为什么只有一种）。计划写进这一轮的事件之后，编辑只认它。
+
+      python3 scripts/hooks/round.py plan --file <plan.json>
+
+  确实要绕：COGNEVA_BATCH_UNCHECKED=1 cargo ...（会在编译账里留一行 BYPASS）
+EOF
+    exit 1
+  fi
+fi
+
 if [ "$builds" = "1" ] && [ "$dirty" = "1" ] && [ "${COGNEVA_BATCH_UNCHECKED:-0}" != "1" ] && [ -f "$family" ]; then
   if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
     if ! python3 "$family" --root "$toplevel" --all-todos; then

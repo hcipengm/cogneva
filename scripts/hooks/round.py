@@ -266,9 +266,32 @@ def record_plan(plan_path: str) -> int:
     return 0
 
 
+
+def planned() -> int:
+    """这一轮有没有一份被接受的计划。0＝有，1＝没有（还没到能编辑的时候）。"""
+    current = current_round()
+    if current is None:
+        print("round: 没有开着的一轮。", file=sys.stderr)
+        return 1
+    out = psql(
+        "select count(*) from cogneva_event where kind='batch_planned' "
+        f"and subject_id='{current[0]}'"
+    ).strip()
+    if out.isdigit() and int(out) > 0:
+        return 0
+    print(
+        "round: 这一轮还没有计划。整批必须先变成编辑的输入："
+        "`round.py plan --file <plan.json>`（覆盖全部待办、每条至少两种来源形状）。",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["open", "status", "close", "rebound", "plan"])
+    parser.add_argument(
+        "action", choices=["open", "status", "close", "rebound", "plan", "planned"]
+    )
     parser.add_argument("--source", default=None)
     parser.add_argument("--file", default=None)
     args = parser.parse_args(argv[1:])
@@ -284,6 +307,8 @@ def main(argv: list[str]) -> int:
                 print("round: plan 要一个 --file <plan.json>", file=sys.stderr)
                 return 2
             return record_plan(args.file)
+        if args.action == "planned":
+            return planned()
         if args.action == "status":
             return status()
         return close()

@@ -37,6 +37,7 @@ CODE_REV="$LEDGER_REV"
 cat >"$tmp/psql.sh" <<STUB
 #!/bin/sh
 case "\$*" in
+  *batch_planned*) printf '1\n' ;;
   *round_opened*) printf '%s\t%s\t%s\n' "round-test" "$LEDGER_REV" "$CODE_REV" ;;
   *) : ;;
 esac
@@ -93,6 +94,23 @@ out=$(COGNEVA_COMPILE_LEDGER="$bypass_ledger" COGNEVA_EVENT_PSQL="$tmp/psql.sh" 
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "跳过整批检查"; } \
     && ok "有绕过记录、又没有 Split：红" \
     || bad "绕过记录没有被这道门看见（rc=$rc）：$out"
+reset
+
+# 没有计划的一轮：判不了「整批有没有动到」，退 2。
+cat >"$tmp/psql-noplan.sh" <<STUB
+#!/bin/sh
+case "\$*" in
+  *batch_planned*) printf '0\n' ;;
+  *round_opened*) printf '%s\t%s\t%s\n' "round-test" "$LEDGER_REV" "$CODE_REV" ;;
+  *) : ;;
+esac
+STUB
+chmod +x "$tmp/psql-noplan.sh"
+out=$(COGNEVA_EVENT_PSQL="$tmp/psql-noplan.sh" COGNEVA_TODO_LEDGER="$ledger" \
+      python3 "$tree/scripts/hooks/batch-gate.py" --root "$tree" --base origin/main 2>&1); rc=$?
+{ [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "没有计划"; } \
+    && ok "这一轮没有计划：退 2（判不了）" \
+    || bad "没有计划时没退 2（rc=$rc）：$out"
 reset
 
 printf '\nbatch-gate.test.sh: %d passed, %d failed\n' "$pass" "$fail"
