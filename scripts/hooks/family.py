@@ -273,6 +273,14 @@ def main(argv: list[str]) -> int:
             ledger_repo = round_mod.ledger_repo(todo_source.default_spec())
         except Exception:
             ledger_repo = None
+        # 触点必须是**文件**，不能是目录：目录级的触点让一次编辑「碰到」好几条待办，
+        # 于是「整批都动到了」在读数上成立，而工作远没有做。
+        dirs = [p for _, paths in todos for p in paths if (root / p).is_dir()]
+        if dirs:
+            print("family: 这些触点是目录，批次算不出来（要写到文件）：")
+            for d in sorted(set(dirs)):
+                print(f"  {d}")
+            return 2
         for name, paths in todos:
             gone = [
                 p for p in paths
