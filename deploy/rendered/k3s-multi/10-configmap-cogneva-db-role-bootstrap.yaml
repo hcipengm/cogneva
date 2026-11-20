@@ -131,7 +131,23 @@ data:
     -- 而演练的比对恰好会读每一张表——漏一张，那一张的行数就不在比对里，读起来像一致。
     GRANT pg_read_all_data TO cog_backup;
     
-    GRANT INSERT ON public.backup_drills TO cog_backup;
+    -- 演练自己写的那几张表。`backup_drills` 只在有结论时写得出来；开工那一行
+    -- （`backup_drill_attempts`）与它测到的界（`progress_bounds`）也归它写，否则
+    -- 「开过工、结局没人看见」与「根本没跑」在账上分不开。
+    -- 2026-11-19 现场：`backup_drill_attempts` 这一格漏了，整趟演练以
+    -- `permission denied for table backup_drill_attempts` 收尾，账本上那一夜读起来像没跑过。
+    -- 表可能还没被这一版的迁移建出来（升级路上各版本的迁移顺序不同），所以逐张按
+    -- `to_regclass` 判断：表不在就跳过这一张，而不是让整个 Job 因为一句 GRANT 失败——
+    -- 那会把「少一个权限」放大成「装不上去」。
+    DO $do$
+    DECLARE t text;
+    BEGIN
+      FOREACH t IN ARRAY ARRAY['backup_drills', 'backup_drill_attempts', 'progress_bounds'] LOOP
+        IF to_regclass('public.' || t) IS NOT NULL THEN
+          EXECUTE format('GRANT SELECT, INSERT, UPDATE ON public.%I TO cog_backup', t);
+        END IF;
+      END LOOP;
+    END $do$;
     
     -- 测试库的那个角色。两项特权都是被用例的题目逼出来的，不是顺手给的：
     --   CREATEDB    —— `backup_pg` 把包恢复进一台现建的库；
