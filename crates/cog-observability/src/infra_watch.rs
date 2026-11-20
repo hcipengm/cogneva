@@ -2873,7 +2873,7 @@ mod tests {
     /// 会逼人删掉新鲜度判据，把阈值漏掉就等于这条判据不存在。
     #[test]
     fn the_query_threshold_scanner_reads_the_returned_value_only() {
-        let one = |promql: &str| threshold_in_query(promql).map(|(op, v)| (op, v));
+        let one = |promql: &str| threshold_in_query(promql);
         assert_eq!(
             one("sum by (namespace) (increase(failures_total[6h])) > 6"),
             Some((">".to_string(), 6.0))

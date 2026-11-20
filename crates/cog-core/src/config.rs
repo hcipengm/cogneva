@@ -2442,7 +2442,9 @@ mod tests {
             AGENT_HEARTBEAT_INTERVAL_SECS,
             AGENT_REGISTRATION_TTL_SECS / BEATS_PER_REGISTRATION_TTL
         );
-        assert!(AGENT_HEARTBEAT_INTERVAL_SECS > 0);
+        // 两者都是常量，所以这是编译期就该成立的事：放在 const 块里，编译不过
+        // 比这条测试红更早。`clippy::assertions_on_constants` 要的也正是这个形状。
+        const { assert!(AGENT_HEARTBEAT_INTERVAL_SECS > 0) };
     }
 
     /// 没配就是没配：每一列都读成 `None`，不是 0。0 在调用点是一个具体的

@@ -266,9 +266,6 @@ mod tests {
         /// written here, so a field added to the type joins the check without
         /// anyone remembering to write it down twice.
         read_back: fn(&serde_json::Value) -> serde_json::Value,
-        /// What the type produces when nothing sets anything. Every key here is
-        /// one a deployment has to be able to see and change.
-        defaults: fn() -> serde_json::Value,
     }
 
     impl Section {
@@ -283,7 +280,6 @@ mod tests {
                         .unwrap_or_else(|e| panic!("a section does not fit its type: {e}"));
                     serde_json::to_value(typed).expect("a section read back serializes")
                 },
-                defaults: || serde_json::to_value(T::default()).expect("a default serializes"),
             }
         }
 

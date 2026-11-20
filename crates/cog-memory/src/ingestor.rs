@@ -351,10 +351,15 @@ impl Default for MemoryIngestorConfig {
         // 事的第二个说法，改一处忘一处的那天，两处会各自以为是对方在管。
         // 唯一例外是读侧命名空间：兜底构造不设闸（它只出现在单测里，测的是
         // 抽取本身），装配路径一律走 `From<&IngestConfig>` 并把读侧声明带上。
-        Self {
-            read_namespaces: Vec::new(),
-            ..Self::from(&IngestConfig::default())
-        }
+        //
+        // 写成「先取一份再清掉那一格」而不是结构体更新语法：`IngestConfig` 的
+        // 默认值大多不是零（重试次数、DLQ 开关、各种间隔），`#[derive(Default)]`
+        // 给出的是全零，两者不是同一个东西；更新语法又把那个非零的基准藏在
+        // `..` 后面，`clippy::derivable_impls` 读不到它，会把这个 impl 当成
+        // 可以派生的。清掉那一格写成一行，基准是什么在字面上就看得见。
+        let mut config = Self::from(&IngestConfig::default());
+        config.read_namespaces = Vec::new();
+        config
     }
 }
 

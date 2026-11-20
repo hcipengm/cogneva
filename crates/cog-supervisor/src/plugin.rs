@@ -163,7 +163,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
         // ── Build supervisor ──
         let (supervisor_config_tx, supervisor_config_rx) =
-            tokio::sync::watch::channel(supervisor_config.clone().into());
+            tokio::sync::watch::channel(supervisor_config.clone());
 
         let scheduler_gate = Arc::new(crate::SchedulerGate::new());
 
@@ -175,7 +175,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
 
         let mut supervisor = crate::Supervisor::new(
-            supervisor_config.into(),
+            supervisor_config,
             supervisor_registry.clone(),
             state_backend.clone(),
             supervisor_orchestrator,

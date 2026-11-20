@@ -539,13 +539,12 @@ fn layout_leaves(values: &serde_yaml::Value) -> BTreeMap<String, String> {
                     }
                 }
             }
-            serde_yaml::Value::String(text) => {
-                if PRODUCT_LAYOUT_ROOTS
-                    .iter()
-                    .any(|root| text.len() > root.len() && text.starts_with(&format!("{root}/")))
-                {
-                    out.insert(path.to_string(), text.clone());
-                }
+            serde_yaml::Value::String(text)
+                if PRODUCT_LAYOUT_ROOTS.iter().any(|root| {
+                    text.len() > root.len() && text.starts_with(&format!("{root}/"))
+                }) =>
+            {
+                out.insert(path.to_string(), text.clone());
             }
             _ => {}
         }
@@ -822,10 +821,7 @@ fn materializes(body: &str) -> bool {
 /// 一个 `with`/`range` 的实参解析成 values 路径：绝对路径、某个变量别名，
 /// 或者是别的什么（`.`、函数调用），后两种什么都解析不出来。
 fn operand_path(operand: &str, aliases: &BTreeMap<String, String>) -> Option<String> {
-    let operand = operand
-        .trim()
-        .trim_start_matches(|c| c == '(' || c == '-')
-        .trim();
+    let operand = operand.trim().trim_start_matches(['(', '-']).trim();
     if operand.starts_with(".Values.") {
         return absolute_refs(operand).into_iter().next();
     }
@@ -1337,11 +1333,14 @@ const SHARED_ENV_LAYERS: [&str; 2] = [
 ///
 /// 返回比过几行，以及 `(变量名, 文档的值, env 的值)` 与一处落点。投影（`{{ … }}`）
 /// 不进来：它送进去的就是文档的值，这一类由第五面按「复述或投影」各自判。
+/// 一处 `(变量名, 文档的值, env 的值)`，以及它落在哪一行。
+type DeadDocumentValue = ((String, String, String), String);
+
 fn dead_document_values(
     declared: &BTreeMap<String, String>,
     text: &str,
     site: &str,
-) -> (usize, Vec<((String, String, String), String)>) {
+) -> (usize, Vec<DeadDocumentValue>) {
     let mut compared = 0;
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
