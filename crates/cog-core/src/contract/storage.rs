@@ -400,6 +400,41 @@ pub trait ObjectBackend: Send + Sync {
 
     /// List object keys matching an optional prefix.
     async fn list(&self, prefix: Option<&str>) -> SFResult<Vec<String>>;
+
+    /// 边来边写：开一段写、一块块交、最后封口。
+    ///
+    /// 与 [`Self::put`] 的差别是**谁攒**：`put` 要求调用方先把整段字节交进来，于是
+    /// 任何「大块字节」的写都必须在内存里攒齐——工具结果、归档、备份包都一样。
+    /// 这一条让攒这件事落在后端：块到了就写，进程的内存不随对象大小走。
+    ///
+    /// **默认是不支持，而不是一个缓冲式的默认实现。** 后者会让 `put` 换一个名字继续
+    /// 活着，而调用方无法分辨它拿到的是真流式还是一段在内存里攒齐的字节——那正是这
+    /// 条契约要拆掉的东西，包成新名字只会让它更难找。没实现的后端如实报错，调用方
+    /// 据此知道这一处还不能边写边落。
+    async fn open_write(&self, _key: &str) -> SFResult<Box<dyn ObjectWrite>> {
+        Err(SFError::Config(
+            "this object backend has no streaming write: it still needs the whole \
+             object in memory before it lands"
+                .to_string(),
+        ))
+    }
+}
+
+/// 一段正在写的对象。
+///
+/// 三条形状：块到了就写（[`Self::write`]）、封口之后才算存在（[`Self::finish`]）、
+/// 中途不要了就丢掉（[`Self::abort`]）。**写进去的字节在封口之前不属于这个对象**：
+/// 一个读到一半的读者要么看不到它，要么看到完整的那一份，不存在「看到半段」。
+#[async_trait::async_trait]
+pub trait ObjectWrite: Send {
+    /// 写一块。块就是这一拍手上的字节，不合并、不切分。
+    async fn write(&mut self, chunk: &[u8]) -> SFResult<()>;
+
+    /// 封口：把这一段收尾，返回它的 URI。封口之后它才对读者存在。
+    async fn finish(self: Box<Self>) -> SFResult<String>;
+
+    /// 放弃这一段：已经写下去的部分要收掉，不能留成一个没人引用的半段。
+    async fn abort(self: Box<Self>) -> SFResult<()>;
 }
 
 /// Unified raw data envelope.
@@ -1522,4 +1557,56 @@ pub struct RawLogQuery {
 pub trait RawLogIndexStore: Send + Sync {
     async fn upsert(&self, entry: RawLogIndexEntry) -> SFResult<()>;
     async fn query(&self, q: &RawLogQuery) -> SFResult<Vec<RawLogIndexEntry>>;
+}
+
+#[cfg(test)]
+mod streaming_write_tests {
+    use super::*;
+
+    /// 一个只实现了整段写的后端：它没有流式入口，于是第一次开写就必须**如实报错**。
+    ///
+    /// 这条用例钉的是那个默认实现：`put` 换一个名字继续活着（在内存里攒齐再落）会让
+    /// 调用方分辨不出自己拿到的是真流式还是一段攒出来的字节，而整条契约要拆的正是
+    /// 那件事。报错是「这里还不能边写边落」，是读数；悄悄缓冲是同一个行为换了名字。
+    struct WholeObjectOnly;
+
+    #[async_trait::async_trait]
+    impl ObjectBackend for WholeObjectOnly {
+        async fn put(&self, _key: &str, _data: &[u8]) -> SFResult<String> {
+            Ok("uri".into())
+        }
+        async fn get(&self, _key: &str) -> SFResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn presign_url(&self, _key: &str, _expiry: u64) -> SFResult<String> {
+            Ok("uri".into())
+        }
+        async fn exists(&self, _key: &str) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self, _prefix: Option<&str>) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backend_without_a_streaming_write_says_so() {
+        let error = WholeObjectOnly
+            .open_write("k")
+            .await
+            .err()
+            .expect("没有流式入口的后端必须报错，而不是悄悄返回一个攒着写的句柄");
+        let text = error.to_string();
+        assert!(
+            text.contains("no streaming write"),
+            "判词要说出缺的是什么：{text}"
+        );
+        assert!(
+            text.contains("whole object in memory"),
+            "判词要说出它现在是哪一种写：{text}"
+        );
+    }
 }
