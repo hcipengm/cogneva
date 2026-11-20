@@ -64,6 +64,27 @@ impl Scratch {
         .execute(&pool)
         .await
         .expect("the event table must be creatable");
+        // 回填读的是账本那张表：它要与真表同形状的那些列。
+        sqlx::query(
+            "CREATE TABLE gateway_llm_usage (
+                 id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 ts             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 actor          TEXT NOT NULL DEFAULT 'unknown',
+                 upstream       TEXT NOT NULL,
+                 api_style      TEXT NOT NULL,
+                 model          TEXT NOT NULL,
+                 result         TEXT NOT NULL,
+                 origin         TEXT NOT NULL DEFAULT 'unknown',
+                 tokens_input   BIGINT NOT NULL DEFAULT 0,
+                 tokens_output  BIGINT NOT NULL DEFAULT 0,
+                 tokens_cached  BIGINT NOT NULL DEFAULT 0,
+                 task_id        TEXT,
+                 owner_id       TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("the usage table must be creatable");
         Self { pool, schema }
     }
 
@@ -140,6 +161,44 @@ async fn replaying_the_same_call_writes_nothing_the_second_time() {
         scratch.rows().await,
         1,
         "a retried call is the same spend, not a second one"
+    );
+    scratch.done().await;
+}
+
+/// 回填是幂等的：同一批行跑两遍，流里仍然只有那一批。
+///
+/// 这条判据保护的是「回填可以中断、可以从头再来」：不幂等的话，跑到一半断了就得先
+/// 记住跑到哪儿，而「记住跑到哪儿」正是回填要避免的那份额外状态。
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn backfilling_the_same_rows_twice_writes_each_call_once() {
+    let scratch = Scratch::new("backfill").await;
+    sqlx::query(
+        "INSERT INTO gateway_llm_usage (id, ts, actor, upstream, api_style, model, result, origin,
+                                        tokens_input, tokens_output, tokens_cached)
+         VALUES (gen_random_uuid(), NOW() - interval '1 day', 'a', 'u', 'openai', 'm', 'ok',
+                 'gateway_pool', 10, 20, 0),
+                (gen_random_uuid(), NOW() - interval '2 day', 'b', 'u', 'openai', 'm', 'ok',
+                 'gateway_pool', 1, 2, 0)",
+    )
+    .execute(&scratch.pool)
+    .await
+    .expect("seed two rows");
+
+    let (first, _) =
+        cog_storage::postgres::usage_backfill::backfill_page(&scratch.pool, "probe", None, 100)
+            .await
+            .expect("first page");
+    assert_eq!(first, 2);
+    let (second, _) =
+        cog_storage::postgres::usage_backfill::backfill_page(&scratch.pool, "probe", None, 100)
+            .await
+            .expect("second page");
+    assert_eq!(second, 2, "第二遍照样读得到两行");
+    assert_eq!(
+        scratch.rows().await,
+        2,
+        "两遍回填之后流里仍然是两条：键由行 id 派生，重跑是同一次"
     );
     scratch.done().await;
 }
