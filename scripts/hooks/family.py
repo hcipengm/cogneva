@@ -182,9 +182,32 @@ def is_touched(path: str, touched: set[str]) -> bool:
     return any(f.startswith(prefix) for f in touched)
 
 
-def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, missing_todos, deferred=()) -> int:
+
+def other_repo_changes(repo: pathlib.Path, base: str | None) -> list[str]:
+    """另一个仓改了哪些文件：从 `base` 算起（含工作区）；没有基准就只看工作区。
+
+    台账仓里的那一半工作（那一族自己的门、这本台账本身）由同一个人在同一轮里写，
+    但它不在这个仓的 diff 里。不读那一侧，那些行永远读作「还没做」——而它们已经在
+    另一个仓里做完了。
+    """
+    rev = base or "HEAD"
+    out = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--name-only", rev],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        return []
+    return [l.strip() for l in out.stdout.splitlines() if l.strip()]
+
+
+def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, missing_todos,
+           deferred=(), foreign=(), other: pathlib.Path | None = None) -> int:
     touched = set(changed)
-    gaps = [p for p in batch if not is_touched(p, touched)]
+    # 触点可以落在台账所在的那个仓里（这一族的产物本来就写在那儿）：那一侧的改动面
+    # 由 `foreign` 带进来。不带进来，那些行永远报缺口，而它们永远绿不了——这一批也就
+    # 永远编不了。
+    every = touched | set(foreign)
+    gaps = [p for p in batch if not is_touched(p, every)]
 
     owed: list[tuple[str, str]] = []
     for check in CHECKS:
@@ -198,6 +221,10 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
     for path in gaps:
         if (root / path).exists():
             print(f"  TODO {path}  <- 这一轮的待办要点名它，但它还没改")
+        elif other is not None and (other / path).exists():
+            # 这一条要动的东西在台账所在的那个仓里：那一侧还没改，不是这一侧的事，
+            # 但也不能读成「这个树里没有这条路」。
+            print(f"  TODO {path}  <- 台账仓里还没改（这一条的产物不在这个树里）")
         else:
             # 两种缺口的修法不同：改一个错别字，与写一件还没写的活。一条「还没改」
             # 把两者读成同一件事，而点不存在的路径的那条台账，等多久都不会自己变绿。
@@ -256,16 +283,19 @@ def main(argv: list[str]) -> int:
         return 2
 
     changed = args.changed or working_tree_changes(root)
+    foreign: list[str] = []
     todos: list[tuple[str, list[str]]] = []
     missing: list[str] = []
     deferred: list[str] = []
     batch = list(changed)
+    pinned_rev = None
     if args.all_todos:
         # 有开着的一轮：批次＝那一轮钉住的 rev 上的台账，不是此刻的台账。
         try:
             import round as round_mod
             current = round_mod.current_round()
             if current:
+                pinned_rev = current[1]
                 pinned = round_mod.ledger_at(current[1], args.ledger or todo_source.default_spec())
                 args.ledger = str(pinned)
         except Exception:  # 读不到事件流就退回此刻的台账，并在下面说清楚
@@ -316,11 +346,15 @@ def main(argv: list[str]) -> int:
             print(f"family: 本轮不排的待办（touches: unknown）{len(deferred)} 项：{', '.join(deferred)}")
         for _, paths in todos:
             batch += paths
+        # 台账仓那一侧的改动面：从这一轮钉住的那个 rev 算起，含工作区。没有开着一轮
+        # 时只看工作区——那正是「这一轮还没开始记」的形状，不能替它编一段历史。
+        if ledger_repo is not None:
+            foreign = other_repo_changes(ledger_repo, pinned_rev)
     batch = sorted(set(batch))
 
     if not changed and not todos:
         return 0
-    return report(root, changed, batch, todos, missing, deferred)
+    return report(root, changed, batch, todos, missing, deferred, foreign, ledger_repo)
 
 
 if __name__ == "__main__":

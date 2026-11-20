@@ -228,6 +228,20 @@ def main(argv: list[str]) -> int:
         return 0
 
     touched = changed(root, current[2] or "")
+    # 台账仓那一侧的改动面：这一族有一部分产物写在另一个仓里（那一侧自己的门、这本
+    # 台账本身），由同一个人在同一轮里写。不读那一侧，那几条永远读作「没做」，而这一推
+    # 永远发不出去——判据看不到的东西，不能按「没做」处理。
+    try:
+        ledger_repo = round_mod.ledger_repo(todo_source.default_spec())
+    except Exception:
+        ledger_repo = None
+    if ledger_repo is not None:
+        out = subprocess.run(
+            ["git", "-C", str(ledger_repo), "diff", "--name-only", current[1] or "HEAD"],
+            capture_output=True, text=True,
+        )
+        if out.returncode == 0:
+            touched = touched + [l.strip() for l in out.stdout.splitlines() if l.strip()]
     items = {item.id: item for item in todos}
     done = {i.id for i in todos if i.touches and any(is_touched(p, touched) for p in i.touches)}
     todos = [i for i in todos if not round_ids or i.id in round_ids]
