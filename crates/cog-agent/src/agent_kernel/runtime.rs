@@ -2413,6 +2413,7 @@ impl AgentRuntime {
                 Some(&result_bytes),
                 if is_error { "error" } else { "ok" },
                 None,
+                Self::file_path_of(tool_name, arguments),
                 chrono::Utc::now(),
             );
             if let Err(e) = sink.append(&call).await {
@@ -2480,6 +2481,32 @@ impl AgentRuntime {
     /// failed. Either way the run continues and the failure is already counted
     /// where the cause is known.
     #[allow(clippy::too_many_arguments)]
+    /// 这次调用点名的文件路径，当它与文件有关时。
+    ///
+    /// 只有读/写/编辑这类工具的参数里带路径，且键名各家不同（`path`／`file_path`／
+    /// `target_file`）。取不到就答 `None`——**猜一个路径比没有更糟**：一条错的路径会
+    /// 让「看过哪些文件」的清单指到别处，而读者无从分辨。
+    fn file_path_of(tool: &str, arguments: &serde_json::Value) -> Option<String> {
+        const FILE_TOOLS: [&str; 5] = [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "multi_edit",
+        ];
+        if !FILE_TOOLS.contains(&tool) {
+            return None;
+        }
+        for key in ["path", "file_path", "target_file"] {
+            if let Some(value) = arguments.get(key).and_then(|v| v.as_str()) {
+                if !value.trim().is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
+    }
+
     async fn archive_tool_call(
         &self,
         task_id: Option<&str>,

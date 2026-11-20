@@ -37,6 +37,12 @@ pub struct ToolCallEvent {
     pub outcome: String,
     /// 这次调用花了多久；拿不到时为 `None`（不写 0：0 毫秒是一次真实读数）。
     pub latency_ms: Option<u64>,
+    /// 这次调用点名的**文件路径**，当它与文件有关时。
+    ///
+    /// 参数在载荷里只有哈希，所以「看过哪些文件」不在事件里，除非这里单独给一格。
+    /// 不给它，就得按哈希去载体取正文再解析——那是把一次读数变成一次回源，而回源
+    /// 读不到时整份清单会静默变空。给一格之后，清单是事件自己回答的。
+    pub path: Option<String>,
     /// 发起方身份。
     pub actor: String,
     /// 服务端时刻，由写入口取自己的钟。
@@ -59,6 +65,7 @@ impl ToolCallEvent {
             "result_bytes": self.result_bytes,
             "outcome": self.outcome,
             "latency_ms": self.latency_ms,
+            "path": self.path,
         })
     }
 }
@@ -77,6 +84,7 @@ impl ToolCallEvent {
         result: Option<&[u8]>,
         outcome: impl Into<String>,
         latency_ms: Option<u64>,
+        path: Option<String>,
         at: DateTime<Utc>,
     ) -> Self {
         use sha2::{Digest, Sha256};
@@ -91,6 +99,7 @@ impl ToolCallEvent {
             result_bytes: result.map_or(0, |b| b.len() as u64),
             outcome: outcome.into(),
             latency_ms,
+            path,
             actor: actor.into(),
             at,
         }
@@ -120,6 +129,7 @@ mod tests {
             result_bytes: 20,
             outcome: "ok".into(),
             latency_ms: Some(5),
+            path: None,
             actor: "a".into(),
             at: Utc::now(),
         }
@@ -166,6 +176,7 @@ mod from_bytes_tests {
             result,
             "ok",
             Some(3),
+            None,
             Utc::now(),
         )
     }
@@ -196,5 +207,33 @@ mod from_bytes_tests {
         let b = call(b"{}", Some(b"abce"));
         assert_eq!(a.result_bytes, b.result_bytes);
         assert_ne!(a.result_sha256, b.result_sha256);
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// 路径单独一格：参数只有哈希，不给这一格，「看过哪些文件」就答不出来，
+    /// 只能回源去载体取正文——回源读不到时整份清单会静默变空。
+    #[test]
+    fn the_path_travels_in_the_payload_when_the_call_names_a_file() {
+        let mut c = ToolCallEvent {
+            call_id: "c1".into(),
+            unit_of_work: "u1".into(),
+            tool: "read_file".into(),
+            arguments_sha256: "aa".into(),
+            arguments_bytes: 1,
+            result_sha256: None,
+            result_bytes: 0,
+            outcome: "ok".into(),
+            latency_ms: None,
+            path: Some("crates/cog-core/src/lib.rs".into()),
+            actor: "a".into(),
+            at: Utc::now(),
+        };
+        assert_eq!(c.attributes()["path"], "crates/cog-core/src/lib.rs");
+        c.path = None;
+        assert!(c.attributes()["path"].is_null(), "与文件无关的调用不带路径");
     }
 }
