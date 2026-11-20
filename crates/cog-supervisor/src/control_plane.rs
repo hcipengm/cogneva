@@ -2,6 +2,18 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// The wall on one status report to the control plane.
+///
+/// 等：控制平面对一次状态上报的答复。
+/// 等不到：这一次上报以错误结束，调用方知道它没送出去；**没有「已上报」的本地记录**
+/// 被写下来。
+/// 续跑：能，而且应该——状态是当前值，不是增量：下一次上报送的是那一刻的完整状态，
+/// 丢掉一次不会留下缺口。
+// cap: bound — 一次控制平面的应答；状态是当前值，所以晚到一次不产生缺口
+// wall: wait=one control-plane ack; on-timeout=error, nothing recorded as reported; resume=yes, the next report carries the whole state
+const CONTROL_PLANE_REPORT_TIMEOUT_SECS: u64 = 30;
+
 use tracing::{info, warn};
 
 /// Structured status snapshot sent to the control plane.
@@ -61,7 +73,7 @@ impl ControlPlaneClient for HttpControlPlaneClient {
         let req = cog_core::HttpRequest::post(&self.endpoint)
             .json(&status)
             .map_err(|e| format!("JSON serialization failed: {}", e))?
-            .timeout(30);
+            .timeout(CONTROL_PLANE_REPORT_TIMEOUT_SECS);
         let resp = self
             .client()?
             .execute(req)

@@ -568,7 +568,7 @@ const BOUND_AT_CENSUS: &[(&str, u64)] = &[
     ("crates/cog-agent/src/plugin.rs", 4),
     ("crates/cog-agent/src/tools.rs", 8),
     ("crates/cog-agent/src/web.rs", 2),
-    ("crates/cog-auth/src/keycloak.rs", 2),
+    ("crates/cog-auth/src/keycloak.rs", 3),
     ("crates/cog-auth/src/session.rs", 1),
     ("crates/cog-collaboration/src/collaboration_executor.rs", 2),
     ("crates/cog-collaboration/src/config.rs", 1),

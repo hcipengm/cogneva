@@ -11,6 +11,26 @@ use crate::{
     model::Model, AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
+/// The wall on one request to this provider.
+///
+/// 等：上游对这一次请求的答复开始（首字节）。本地推理的排队加首字节；这一格挡的是连不上，不是慢生成。
+/// 等不到：这一次调用以错误结束，**不记账、不留半份正文**——上游没开始回，就没有
+/// 可以丢的已生成内容。
+/// 续跑：能。调用方重发是一次新的调用（账上是第二条）；这一格不假装能从中途接着读。
+// cap: bound — 本地推理的排队加首字节；这一格挡的是连不上，不是慢生成。没有更小的实测值可用，等一条真实的「首字节耗时」读数落地后由它导出
+// wall: wait=the local runtime's first byte; on-timeout=the call fails and nothing is kept; resume=yes, the caller makes a new call
+const OLLAMA_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// The wall on the liveness probe.
+///
+/// 等：本地运行时对一次 `/api/tags` 的答复。
+/// 等不到：这次探活读作「不健康」；**不产出读到数**——探活没有值可以缓存，所以也不会
+/// 留下一个过期的「健康」。
+/// 续跑：能，而且本来就该重试：探活是周期性的，下一次探活重新问一遍。
+// cap: bound — 探活是本地进程；这个界挡的是它挂起，不是它忙
+// wall: wait=the local runtime's tag list; on-timeout=unhealthy, no reading is produced; resume=yes, the next probe asks again
+const OLLAMA_PROBE_TIMEOUT_SECS: u64 = 10;
+
 pub struct OllamaProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
     model: Model,
@@ -155,7 +175,7 @@ impl LLMProvider for OllamaProvider {
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
                 .unwrap()
-                .timeout(120);
+                .timeout(OLLAMA_REQUEST_TIMEOUT_SECS);
 
             let http_response = match client.execute_stream(req).await {
                 Ok(r) => r,
@@ -498,8 +518,8 @@ impl LLMProvider for OllamaProvider {
             Some(c) => c,
             None => return false,
         };
-        let req =
-            cog_core::HttpRequest::get(format!("{}/api/tags", self.model.base_url)).timeout(10);
+        let req = cog_core::HttpRequest::get(format!("{}/api/tags", self.model.base_url))
+            .timeout(OLLAMA_PROBE_TIMEOUT_SECS);
         match client.execute(req).await {
             Ok(r) => r.is_success(),
             Err(e) => {

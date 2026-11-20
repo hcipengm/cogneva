@@ -20,6 +20,17 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AuthError, AuthResult};
 use cog_core::Role;
 
+/// The wall on one request to Keycloak.
+///
+/// 等：一次身份提供方的 HTTP 往返（发现端点、JWKS 拉取、令牌交换、introspect）。
+/// 等不到：这次调用以错误结束，**不产出、也不缓存任何凭据**——没有半份凭据留在
+/// 缓存里等下一次被当成真的。
+/// 续跑：能。下一次请求重新走一遍完整的往返，没有中间状态要清理；本次拿到结论的那
+/// 一侧（例如已经拉到的新 JWKS）也不会因为超时而留在缓存里。
+// cap: bound — 一次身份提供方的往返；远短于令牌有效期，所以超时总发生在令牌过期之前
+// wall: wait=one IdP round trip; on-timeout=error, nothing cached; resume=yes, next call starts over
+const KEYCLOAK_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 // ---------------------------------------------------------------------------
 // JWKS caching
 // ---------------------------------------------------------------------------
@@ -338,7 +349,7 @@ impl KeycloakClient {
         let req = HttpRequest::post(self.config.token_url())
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
-            .timeout(30);
+            .timeout(KEYCLOAK_REQUEST_TIMEOUT_SECS);
 
         let response = self.client()?.execute(req).await.map_err(|e| {
             crate::error::AuthError::Internal(format!("Keycloak token exchange network error: {e}"))
@@ -373,7 +384,7 @@ impl KeycloakClient {
         let req = HttpRequest::post(self.config.introspect_url())
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
-            .timeout(30);
+            .timeout(KEYCLOAK_REQUEST_TIMEOUT_SECS);
 
         let response = self.client()?.execute(req).await.map_err(|e| {
             crate::error::AuthError::Internal(format!("Keycloak introspection network error: {e}"))
@@ -401,7 +412,7 @@ impl KeycloakClient {
     pub async fn userinfo(&self, access_token: &str) -> crate::error::AuthResult<KeycloakUserInfo> {
         let req = HttpRequest::get(self.config.userinfo_url())
             .header("Authorization", format!("Bearer {access_token}"))
-            .timeout(30);
+            .timeout(KEYCLOAK_REQUEST_TIMEOUT_SECS);
 
         let response = self.client()?.execute(req).await.map_err(|e| {
             crate::error::AuthError::Internal(format!("Keycloak userinfo network error: {e}"))
@@ -707,7 +718,7 @@ impl KeycloakAuthProvider {
     async fn fetch_jwks(&self) -> AuthResult<JwkSet> {
         let well_known_url = self.client.config().well_known_url();
 
-        let req = HttpRequest::get(&well_known_url).timeout(30);
+        let req = HttpRequest::get(&well_known_url).timeout(KEYCLOAK_REQUEST_TIMEOUT_SECS);
         let response = self.client.client()?.execute(req).await.map_err(|e| {
             AuthError::Internal(format!("Keycloak well-known config network error: {e}"))
         })?;
@@ -728,7 +739,7 @@ impl KeycloakAuthProvider {
             .as_str()
             .ok_or_else(|| AuthError::Internal("Missing jwks_uri in well-known config".into()))?;
 
-        let req = HttpRequest::get(jwks_uri).timeout(30);
+        let req = HttpRequest::get(jwks_uri).timeout(KEYCLOAK_REQUEST_TIMEOUT_SECS);
         let response = self
             .client
             .client()?

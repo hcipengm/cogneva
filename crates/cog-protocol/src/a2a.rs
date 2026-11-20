@@ -39,6 +39,17 @@ pub use cog_core::{A2aTask, A2aVersion, MessagePart, TaskArtifact, TaskMessage};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// The wall on one A2A message sent to a peer agent.
+///
+/// 等：对端 agents 的答复（一次请求-响应）。
+/// 等不到：这次发送以错误结束，调用方拿到 `anyhow` 错误；对端没有确认收到，所以不会
+/// 出现「两边都以为对方收到了」。
+/// 续跑：能，但要由调用方决定——A2A 的一次消息不是幂等重放能自动补的，重发是第二次
+/// 发送，账上会有两条。这条不确定性落在调用方，不在这一格里。
+// cap: bound — 一次对端答复的等待；比一次任务的生命周期短得多
+// wall: wait=one peer agent's reply; on-timeout=the send fails, the peer never acknowledged; resume=by the caller, a resend is a second message
+const A2A_PEER_REPLY_TIMEOUT_SECS: u64 = 30;
+
 use serde_json::Value;
 
 /// JSON-RPC 的请求 id。对端原样回填，本客户端不靠它匹配回包（一次调用一次
@@ -255,7 +266,7 @@ impl A2aClient {
             cog_core::HttpRequest::post(agent_url)
                 .json(&body)
                 .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
-                .timeout(30),
+                .timeout(A2A_PEER_REPLY_TIMEOUT_SECS),
             version,
         );
         let resp = self

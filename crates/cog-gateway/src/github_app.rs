@@ -361,7 +361,7 @@ mod tests {
             .build()
             .unwrap();
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5)) // wall: test
             .build()
             .unwrap();
         let cache = AppTokenCache::default();

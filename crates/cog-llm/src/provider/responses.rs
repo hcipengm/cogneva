@@ -98,6 +98,16 @@ fn input_content(blocks: &[ContentBlock], model: &Model) -> serde_json::Value {
     json!(content)
 }
 
+/// The wall on one request to this provider.
+///
+/// 等：上游对这一次请求的答复开始（首字节）。与 chat 面同一条：长文生成可以到几分钟才出首字节。
+/// 等不到：这一次调用以错误结束，**不记账、不留半份正文**——上游没开始回，就没有
+/// 可以丢的已生成内容。
+/// 续跑：能。调用方重发是一次新的调用（账上是第二条）；这一格不假装能从中途接着读。
+// cap: bound — 与 chat 面同一条：长文生成可以到几分钟才出首字节。没有更小的实测值可用，等一条真实的「首字节耗时」读数落地后由它导出
+// wall: wait=the upstream's first byte for a long generation; on-timeout=the call fails, nothing is billed, no partial text is kept; resume=yes, the caller makes a new call
+const RESPONSES_REQUEST_TIMEOUT_SECS: u64 = 600;
+
 pub struct OpenAIResponsesProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
     model: Model,
@@ -360,7 +370,7 @@ impl LLMProvider for OpenAIResponsesProvider {
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
                 .unwrap()
-                .timeout(600);
+                .timeout(RESPONSES_REQUEST_TIMEOUT_SECS);
             for (key, value) in &headers {
                 req = req.header(key, value);
             }
