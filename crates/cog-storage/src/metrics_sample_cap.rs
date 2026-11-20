@@ -35,9 +35,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::warn;
 
-use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
+use cog_core::{MetricsBackend, SFResult, ShutdownSignal};
 
 /// The append-only sample log written by [`crate::PostgresMetricsBackend`].
 pub const SAMPLES_TABLE: &str = "cog_metrics_samples";

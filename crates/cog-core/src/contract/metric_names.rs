@@ -187,6 +187,8 @@ metric_names! {
     METRICS_SAMPLES_BUDGET_ROWS => "metrics_samples_budget_rows",
     METRICS_SAMPLES_ROWS => "metrics_samples_rows",
     METRICS_SAMPLE_SWEEP_FAILED => "metrics_sample_sweep_failed",
+    DB_SETTING_SECONDS => "cogneva_db_setting_seconds",
+    DB_VACUUM_BEHIND_TABLES => "cogneva_db_vacuum_behind_tables",
     TIER_MIGRATION_TOTAL => "tier_migration_total",
 
     // cog-storage — the observability event log's own readings.

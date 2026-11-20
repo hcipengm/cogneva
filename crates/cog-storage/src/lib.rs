@@ -47,6 +47,7 @@ pub mod tier;
 pub mod wal;
 
 pub mod checkpoint_cap;
+pub mod db_surface;
 #[cfg(feature = "livekit")]
 pub mod media;
 #[cfg(feature = "meilisearch")]
@@ -121,6 +122,7 @@ pub use migrate::{
 };
 
 pub use checkpoint_cap::{CheckpointCap, CheckpointReading};
+pub use db_surface::{DatabaseSurface, DbSurfaceReading};
 pub use dlq::MemoryDeadLetterQueue;
 pub use metrics_retirement::{
     MetricsRetirement, RetirementOutcome, RetirementPass, ROSTERED_LABEL_SERIES, ROSTER_FRESH_SECS,

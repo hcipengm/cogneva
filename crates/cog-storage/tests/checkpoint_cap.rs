@@ -26,8 +26,6 @@
 //! loop is never pointed at a renamed table and the shared database's own
 //! `cog_snapshots` is never in reach.
 
-use std::sync::Arc;
-
 use chrono::{Duration as ChronoDuration, Utc};
 use cog_storage::CheckpointCap;
 use sqlx::{PgPool, Row};

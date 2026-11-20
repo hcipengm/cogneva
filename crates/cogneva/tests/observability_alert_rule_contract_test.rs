@@ -5477,7 +5477,18 @@ const GAPS_AT_CENSUS: usize = 34;
 /// them into names no rule and no reading consumes. The ceiling only falls; a
 /// change that raises it has to say, in the same commit, why the new series
 /// can only be drawn.
-const DRAWN_ONLY_AT_CENSUS: usize = 27;
+///
+/// Raised by two on 2026-11-20 for the database surface, and the reason is the
+/// same for both: a bound the database carries is a *property of the workload*,
+/// not of this tree. `cogneva_db_setting_seconds` publishes what the three time
+/// bounds are set to; whether any of them is too short depends on what the
+/// deployment runs and how long its queries take, so a rule would be a threshold
+/// somebody picked. `cogneva_db_vacuum_behind_tables` counts tables past
+/// autovacuum's own trigger: the count is defined by the server, but whether one
+/// such table at this hour is a page is the same kind of judgement, and the
+/// series is drawn beside the per-table numbers a face owner reads. Both have a
+/// reading on the panel; neither has a decided bound.
+const DRAWN_ONLY_AT_CENSUS: usize = 29;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

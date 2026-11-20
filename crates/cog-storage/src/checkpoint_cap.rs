@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::warn;
 
 use cog_core::retention::{
     row_budget_against_volume, RetentionReadings, SOURCE_DERIVED, UNIT_ROWS,

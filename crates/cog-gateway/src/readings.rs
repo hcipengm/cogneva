@@ -1301,9 +1301,46 @@ pub const BUILD_GATE_WAIT_MAX: ReadingSpec = ReadingSpec {
     produced_by: "crates/cog-core/src/contract/build_gate.rs",
 };
 
-pub const READINGS: [&ReadingSpec; 63] = [
+/// 库自己带的那三条时间界里最紧的一条：任何一条开了，就有一条活会在半路被杀。
+///
+/// 这三个数是部署改出来的，不是这份仓库写下的常量，所以扫常量的门看不见它们；
+/// 一条被库杀在半路的语句，与一条被代码里的界杀在半路的语句，损失是同一件事。
+/// 取三者最大值：读的是「这里有没有一条界会动手」，不是「哪一条最常触发」。
+pub const DB_TIMEOUT_BOUND_SECONDS: ReadingSpec = ReadingSpec {
+    id: "db_timeout_bound_seconds",
+    title: "数据库自带的时间界（三条里最紧的一条）",
+    group: ReadingGroup::Infra,
+    query: r#"max(cogneva_db_setting_seconds)"#,
+    unit: "秒",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_db_setting_seconds",
+    produced_by: "crates/cog-storage/src/db_surface.rs",
+};
+
+/// autovacuum 已经追不上的表有多少张。
+///
+/// 越过触发线的那一刻，就是 vacuum 本该来过而没来的那一刻；死元组是「删了却还占着」
+/// 的空间，它让备份变慢、让规划器把表读得比活数据大。
+pub const DB_VACUUM_BEHIND_TABLES: ReadingSpec = ReadingSpec {
+    id: "db_vacuum_behind_tables",
+    title: "autovacuum 追不上的表",
+    group: ReadingGroup::Infra,
+    query: r#"max(cogneva_db_vacuum_behind_tables)"#,
+    unit: "张",
+    warn: Some(1.0),
+    crit: Some(5.0),
+    higher_is_worse: true,
+    series: "cogneva_db_vacuum_behind_tables",
+    produced_by: "crates/cog-storage/src/db_surface.rs",
+};
+
+pub const READINGS: [&ReadingSpec; 65] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
+    &DB_TIMEOUT_BOUND_SECONDS,
+    &DB_VACUUM_BEHIND_TABLES,
     &PG_OLDEST_TX,
     &QDRANT_VECTORS,
     &INGRESS_5XX,

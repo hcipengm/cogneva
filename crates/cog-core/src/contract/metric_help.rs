@@ -1734,6 +1734,29 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          memory_unextracted_scan_failed, which is written on every attempt",
     ),
     (
+        "cogneva_db_setting_seconds",
+        "One PostgreSQL time bound that ends work in flight, in seconds, \
+         labelled by the setting it is about: statement_timeout, \
+         idle_in_transaction_session_timeout and lock_timeout. These are bounds \
+         the database carries rather than bounds this repository writes, so no \
+         scan of the tree can see them -- and a statement the database kills \
+         halfway is the same loss as one a hard-coded bound kills halfway. Zero \
+         means that setting is off, which is the state to check first: a \
+         deployment that deleted every time bound in code and left one in the \
+         database has moved the bound rather than removed it",
+    ),
+    (
+        "cogneva_db_vacuum_behind_tables",
+        "Tables whose dead tuples have passed autovacuum's own trigger -- \
+         `autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor x live \
+         tuples`, both read from pg_settings. Past that line is the moment \
+         autovacuum should already have come and has not, which is a reading the \
+         database itself defines rather than a top-N somebody picked. Dead tuples \
+         are space that is deleted and still occupied: they make backups slower \
+         and the planner read a table larger than its live data. Read the \
+         per-table counts beside this one to see which tables are carrying it",
+    ),
+    (
         "metrics_samples_rows",
         "Rows currently held in the metrics sample log",
     ),

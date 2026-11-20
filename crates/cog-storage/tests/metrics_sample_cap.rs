@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
-use cog_core::{MetricsBackend, Observable};
+use cog_core::MetricsBackend;
 use cog_storage::{MemoryMetricsBackend, MetricsSampleLog};
 
 use cog_test_support::database_url;

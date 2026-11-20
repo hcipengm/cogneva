@@ -1650,6 +1650,25 @@ impl cog_core::SystemPlugin for StoragePlugin {
             info!("Checkpoint store measurement disabled (no PostgreSQL pool)");
         }
 
+        // ── Database surface: the bounds the database itself carries ──
+        //
+        // The tree can be scanned for written constants and for deploy values,
+        // and both of those scans are green on a database that still kills a
+        // statement halfway. These are the server's own time bounds and the
+        // tables autovacuum has fallen behind on; read-only, nothing adjusted.
+        if let Some(pool) = self.pg_pool.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            let mut surface = crate::DatabaseSurface::new(pool).with_deployment(deployment_name());
+            if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                surface = surface.with_metrics(mb);
+            }
+            let _handle = Arc::new(surface).spawn(shutdown);
+            info!("Database surface measurement started");
+        }
+
         // ── Per-task event archive measurement ──
         // `cog_events` files each iteration of a task's agent loop so a run that
         // did not converge can be read back afterwards. Nothing removes rows
