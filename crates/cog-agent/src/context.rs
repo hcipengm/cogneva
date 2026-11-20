@@ -47,6 +47,55 @@ pub struct Compaction {
     pub target_tokens: usize,
 }
 
+/// 压实的三段划分：头（system 与目标）、要折掉的中间段、尾（最近几轮）。
+///
+/// 为什么是「折中间」而不是「从头删」：头部是这一轮的目标与系统提示，删掉它模型就不知道
+/// 自己在干什么；尾部是刚刚发生的事，删掉它模块就不知道接着做什么。中间那一段是**已经
+/// 发生、且不再驱动下一步**的历史——它该以摘要的形式留下，而不是整段消失。
+///
+/// 尾留多长**不是一个拍出来的轮数**：留「一次正常往返」那么多。那个量是实测的（最近
+/// 若干次往返里最大的一次占了多少 token），它随着这一轮怎么用而变；量不到时（还没有
+/// 任何一次往返的记录）就**什么都不折**——没有读数支撑的尾长，折出来的摘要必然切掉
+/// 刚刚发生的事。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldPlan {
+    /// 尾部从第几条开始（索引）。
+    pub tail_from: usize,
+    /// 中间段有多少条会被折掉。
+    pub folded: usize,
+}
+
+/// 算出三段的分界。`messages` 按时间顺序；`tail_tokens` 是「一次正常往返」的量。
+///
+/// 头部边界由调用方给：`head` 是 system 与目标那几条的条数（运行时会保证它们在最前）。
+/// 尾部从后往前攒到 `tail_tokens` 为止，攒不够就一条都不折。
+pub fn plan_fold(message_tokens: &[usize], head: usize, tail_tokens: usize) -> Option<FoldPlan> {
+    if message_tokens.len() <= head {
+        return None;
+    }
+    let mut tail = 0usize;
+    let mut tail_from = message_tokens.len();
+    for (index, tokens) in message_tokens.iter().enumerate().rev() {
+        if index < head {
+            break;
+        }
+        tail += *tokens;
+        tail_from = index;
+        if tail >= tail_tokens {
+            break;
+        }
+    }
+    if tail_from <= head {
+        // 整段都装得进那次往返：中间没有可折的东西。
+        return None;
+    }
+    let folded = tail_from - head;
+    if folded == 0 {
+        return None;
+    }
+    Some(FoldPlan { tail_from, folded })
+}
+
 /// 被压掉那一段的**结构化摘要**：四样必须能从它读回来。
 ///
 /// 压实把一段对话折成一条摘要时，最危险的不是丢内容，是丢了「什么还没定」与「什么
@@ -1589,5 +1638,42 @@ mod compaction_summary_tests {
     fn all_four_empty_reads_as_empty() {
         assert!(CompactionSummary::default().is_empty());
         assert!(CompactionSummary::default().render().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plan_fold_tests {
+    use super::plan_fold;
+
+    /// 头部与尾部都保留，中间那一段就是被折掉的。
+    #[test]
+    fn the_middle_is_what_gets_folded() {
+        // 头 2 条；中间 4 条；尾 3 条，各 10 token。
+        let tokens = [5, 5, 10, 10, 10, 10, 10, 10, 10];
+        let plan = plan_fold(&tokens, 2, 30).expect("中间有东西可折");
+        assert_eq!(plan.tail_from, 6, "尾从第 6 条起");
+        assert_eq!(plan.folded, 4, "中间 4 条被折");
+    }
+
+    /// 一次往返的量覆盖了全部消息：没有可折的东西，返回 `None` 而不是折掉一条。
+    #[test]
+    fn nothing_is_folded_when_the_tail_already_reaches_the_head() {
+        let tokens = [5, 5, 10, 10];
+        assert_eq!(plan_fold(&tokens, 2, 1_000), None);
+    }
+
+    /// 量不到「一次往返」时（`tail_tokens` 为 0）什么都不折：没有读数支撑的尾长会切掉刚刚发生的事。
+    #[test]
+    fn without_a_measured_round_trip_nothing_is_folded() {
+        let tokens = [5, 5, 10, 10, 10];
+        assert_eq!(plan_fold(&tokens, 2, 0), None);
+    }
+
+    /// 只有头部、或者比头部还少：没有中间段。
+    #[test]
+    fn a_conversation_that_is_only_head_has_nothing_to_fold() {
+        assert_eq!(plan_fold(&[5, 5], 2, 10), None);
+        assert_eq!(plan_fold(&[5], 2, 10), None);
+        assert_eq!(plan_fold(&[], 0, 10), None);
     }
 }
