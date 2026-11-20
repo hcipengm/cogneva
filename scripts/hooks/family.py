@@ -166,10 +166,25 @@ def metrics_owed(root: pathlib.Path, changed: set[str]) -> list[tuple[str, str]]
 CHECKS = (capacity_owed, static_owed, rules_owed, metrics_owed)
 
 
+
+def is_touched(path: str, touched: set[str]) -> bool:
+    """这一条待办的触点，这一轮动过没有。
+
+    触点**可以是一个目录**（「这一族要动 `crates/cog-storage/src/postgres`」）：台账里
+    写成目录的那些条目，按文件逐条相等去比永远对不上，于是缺口永远为真、这一批永远
+    做不完——一条不可能被满足的判据与一条永远为真的判据一样没用。目录的读法是
+    「它下面的任何一个文件动了」。
+    """
+    p = path.rstrip("/")
+    if p in touched:
+        return True
+    prefix = p + "/"
+    return any(f.startswith(prefix) for f in touched)
+
+
 def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, missing_todos, deferred=()) -> int:
     touched = set(changed)
-    gaps = [p for p in batch if p not in touched and not (root / p).exists() is False and p not in touched]
-    gaps = [p for p in batch if p not in touched]
+    gaps = [p for p in batch if not is_touched(p, touched)]
 
     owed: list[tuple[str, str]] = []
     for check in CHECKS:
@@ -181,7 +196,15 @@ def report(root: pathlib.Path, changed: list[str], batch: list[str], todos, miss
     if missing_todos:
         print(f"  ⚠ 这些待办没写 `touches:`，批次算不出它们要动什么：{', '.join(missing_todos)}")
     for path in gaps:
-        print(f"  TODO {path}  <- 这一轮的待办要点名它，但它还没改")
+        if (root / path).exists():
+            print(f"  TODO {path}  <- 这一轮的待办要点名它，但它还没改")
+        else:
+            # 两种缺口的修法不同：改一个错别字，与写一件还没写的活。一条「还没改」
+            # 把两者读成同一件事，而点不存在的路径的那条台账，等多久都不会自己变绿。
+            print(
+                f"  TODO {path}  <- 这个树里没有这条路：台账那一行要点名的触点写错了，"
+                "或者它指的是另一个仓的产物（那就不该由这道门判）"
+            )
     for path, why in owed:
         print(f"  TODO {path}  <- {why}")
 

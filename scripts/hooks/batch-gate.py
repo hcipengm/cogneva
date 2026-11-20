@@ -88,6 +88,20 @@ def open_todos(spec: str):
     return todo_source.load(spec)
 
 
+
+def is_touched(path: str, touched: list[str]) -> bool:
+    """触点动过没有。目录触点读作「它下面的任何一个文件动了」。
+
+    按文件逐条相等去比，目录触点永远对不上——一条不可能被满足的判据与一条永远为真的
+    判据一样没用，而这一条卡住的是整批（缺口不空就不许编译）。
+    """
+    p = path.rstrip("/")
+    if p in touched:
+        return True
+    prefix = p + "/"
+    return any(f.startswith(prefix) for f in touched)
+
+
 def changed(root: pathlib.Path, base: str) -> list[str]:
     """自开工以来改过的文件：基准是 round 事件里记的 code_rev，不是「与主线的差」。
 
@@ -215,7 +229,7 @@ def main(argv: list[str]) -> int:
 
     touched = changed(root, current[2] or "")
     items = {item.id: item for item in todos}
-    done = {i.id for i in todos if i.touches and any(p in touched for p in i.touches)}
+    done = {i.id for i in todos if i.touches and any(is_touched(p, touched) for p in i.touches)}
     todos = [i for i in todos if not round_ids or i.id in round_ids]
     untouched = [i.id for i in todos if i.id not in done]
 
