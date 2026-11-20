@@ -756,12 +756,16 @@ impl LlmUsageStore {
     /// bytes that came back.
     ///
     /// The two hashes are over the **raw** bytes, so a duplicate is a
-    /// duplicate of what was actually sent. The bytes themselves are in the
-    /// memory Raw layer under the names in `request_raw`/`response_raw`; this
-    /// row is what outlives nothing but its own retention, and it is enough to
-    /// find the copy, to tell the two sides apart, and to see when a copy is
-    /// shorter than what came back (`response_seen_bytes` against
-    /// `response_bytes`).
+    /// duplicate of what was actually sent. The bytes themselves land in
+    /// `request_body`/`response_body` on this same row (2026-11-19): one
+    /// landing point means there is never a row whose body is somewhere this
+    /// account cannot read.
+    ///
+    /// `request_raw`/`response_raw` are kept as the **overflow** position: a
+    /// reference is written there only if a reading ever says one side has to
+    /// live elsewhere. Nothing writes them today, and no reader may treat
+    /// "no reference" as "no bytes" -- that is exactly what the inline columns
+    /// are for.
     pub async fn record_exchange(&self, r: &LlmExchangeRecord) -> anyhow::Result<()> {
         sqlx::query(
             r#"
