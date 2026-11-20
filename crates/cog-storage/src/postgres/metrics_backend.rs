@@ -242,6 +242,7 @@ const METRIC_WRITE_QUEUE: usize = 8192;
 /// 写者不在了，读继续走——读到的是还没落库的观测缺席，那是对的答案，而不是
 /// 一次永远不返回的读。
 // cap: bound — 屏障正常在毫秒级返回，这个界只用来结束一个已经不存在的写者
+// wall: 等=写屏障放行（正常在毫秒级）/ 等不到=这个屏障按「写者已经不在了」结束，指标不会被当成已落库 / 续跑=能，下一拍重新攒批
 const METRIC_FLUSH_ACK_TIMEOUT_SECS: u64 = 5;
 
 pub struct PostgresMetricsBackend {

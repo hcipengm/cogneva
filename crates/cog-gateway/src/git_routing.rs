@@ -46,9 +46,11 @@ const MEASURE_FRESHNESS_SECS: u64 = 600;
 /// 单通道握手上限。**这是探测预算，不是通道预算**：超时即判该通道此刻不可用，
 /// 正常请求的等待上限仍由 `GitTransport::https_timeout` 决定。
 // cap: bound — 单通道握手的探测预算，超时即判该通道此刻不可用（判的是通不通）
+// wall: 等=一次单通道握手走完 / 等不到=这个通道这一轮读作「此刻不可用」；判的是通不通，不是快慢 / 续跑=能，下一轮量测重新握手
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// 单条信号探针的上限。与引导链的短探针同量级：判的是"通不通"，不是"多快"。
 // cap: bound — 单条信号探针的上限，与引导链的短探针同量级（判通不通，不判快慢）
+// wall: 等=一条信号探针的回话 / 等不到=这条信号这一拍读作「没答」，不把它算成「信号为假」——没答与否是两件事 / 续跑=能，下一拍再探
 const SIGNAL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 选路状态：探针结论 + 实测次序，都锁存在进程内。

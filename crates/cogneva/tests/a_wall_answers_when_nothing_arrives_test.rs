@@ -33,12 +33,7 @@ const UNANSWERED: &[(&str, u32)] = &[
     ("crates/bootstrap/src/main.rs", 1),
     ("crates/cog-agent/src/archive.rs", 1),
     ("crates/cog-agent/src/plugin.rs", 1),
-    ("crates/cog-core/src/contract/hook.rs", 1),
     ("crates/cog-extension/src/hostdocs_assist.rs", 1),
-    ("crates/cog-extension/src/runtime/remote.rs", 2),
-    ("crates/cog-gateway/src/cluster.rs", 1),
-    ("crates/cog-gateway/src/git_routing.rs", 2),
-    ("crates/cog-gateway/src/llm_admin.rs", 2),
     ("crates/cog-gateway/src/readings.rs", 1),
     ("crates/cog-github/src/discovery_loop.rs", 1),
     ("crates/cog-memory/src/extractor.rs", 1),
@@ -47,8 +42,6 @@ const UNANSWERED: &[(&str, u32)] = &[
     ("crates/cog-reflection/src/promotion_eval.rs", 1),
     ("crates/cog-reflection/src/volume_capacity.rs", 1),
     ("crates/cog-reflection/src/workload_resources.rs", 1),
-    ("crates/cog-storage/src/backends/object_backends.rs", 1),
-    ("crates/cog-storage/src/postgres/metrics_backend.rs", 1),
 ];
 
 fn repo_root() -> PathBuf {

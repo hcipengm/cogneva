@@ -13,6 +13,7 @@ use async_trait::async_trait;
 /// 连不上通常是被网络策略挡住或对端没起，这两种都不靠等解决；10s 让调用方
 /// 快速失败，而不是卡在 SYN 重传里。
 // cap: bound — 连沙盒执行器的墙
+// wall: 等=到沙盒执行器的连接建立 / 等不到=这一次调用记成「连不上执行器」，与「执行器慢」分得开 / 续跑=能，换一次连接重来
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 执行器换一次版要多久没有后端：它是 StatefulSet，按序号替换，同一序号的两份 Pod
@@ -49,6 +50,7 @@ const RETRY_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
 /// 后的第一条命令挂在一次读目录上；而问错一次的代价只是那条命令落在一棵新树上，
 /// 那副副本的第一帧会如实说出树是从哪来的。
 // cap: bound — 这一问是一次读目录，正常在毫秒级；2s 分的是「答得慢」与「答不上」，再长只是让重启后的第一条命令陪着等
+// wall: 等=执行器把一次目录读回来 / 等不到=这一问读作「答不上」，**不是空目录**——空目录是一个真实读数，两者不能同形 / 续跑=能，下一次问再读一遍
 const TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The lane a request belongs to: the working tree it will run in.
