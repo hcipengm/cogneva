@@ -34,6 +34,17 @@ fail() { echo "FAIL: $*"; exit 1; }
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
+# 私有标识那一格（2026-11-20 起在推前门里）：按 `cogneva.privateRoot` 找私有仓的判据，没配
+# 就退 75（没验）。夹具里每一棵树都是临时仓，本机装没装私有仓检出不该决定它们的判词——
+# 不钉住的话，同一份字节在一台配了私有仓的机器上会让下面每个「整门绿」的夹具变成红。
+# 那一格自己的行为由它自己的测试判；这里只给一份退 0 的桩，让「整门绿」这一侧可复现。
+private_stub="${work}/private-stub"
+mkdir -p "${private_stub}/scripts/gates"
+printf '#!/usr/bin/env bash\nexit 0\n' \
+    >"${private_stub}/scripts/gates/check-private-references.sh"
+chmod +x "${private_stub}/scripts/gates/check-private-references.sh"
+export COGNEVA_PRIVATE_ROOT="${private_stub}"
+
 tree="${work}/tree"
 mkdir -p "${tree}/deploy/scripts/tests" "${tree}/.github/workflows"
 stage_gate "${repo}" "${tree}"

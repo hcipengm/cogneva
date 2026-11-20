@@ -5,6 +5,9 @@
 # 为什么这一格要有自己的反例：这条门的三条出口（干净 / 命中 / 没验）里，后两条塌成前一条在
 # 判词上一个字节都不显示——一台没配私有仓的机器会把「没人问过」印成一次干净的推送。
 set -euo pipefail
+# 推前门自己就是在 git 钩子里跑的：外层带着绝对 GIT_DIR / GIT_WORK_TREE。不清掉，下面
+# `git init` 的夹具仓会把 config 写进调用方的仓（`test-git-env.test.sh` 判的就是这一条）。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR COGNEVA_COMMIT_INDEX
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
