@@ -19,22 +19,38 @@ real_cargo="${REAL_CARGO:-$HOME/.cargo/bin/cargo}"
 [ -x "$real_cargo" ] || { echo "install-hooks: 找不到 cargo：$real_cargo（可用 REAL_CARGO= 指定）" >&2; exit 1; }
 mkdir -p "$HOME/.local/state/cogneva"
 
+# 装的是**转发器**，不是副本。
+#
+# 副本是第二个正本：仓库里那份改了，机器上那份不会动，于是「门改了」与「门在跑」在
+# 读数上同形——2026-11-20 实测，机器上跑的是 11-19 14:33 的副本，一整天改的门一次都
+# 没执行过。转发器只回答一个问题：「当前工作树里有没有这份垫片」，有就 exec 它。
 install_shim() {
   local target="$1"
+  local real="$2"
   mkdir -p "$(dirname "$target")"
-  sed "s#^real_cargo=\${REAL_CARGO:-\$HOME/.cargo/bin/cargo}#real_cargo=\"$real_cargo\"#" \
-    "$here/cargo" >"$target"
+  cat >"$target" <<SHIM
+#!/usr/bin/env bash
+# 转发器：真正的垫片在仓库里（\`scripts/hooks/cargo\`），这里只找它并 exec。
+# 不在任何工作树里时直接交给真的 cargo。机器上不留第二份逻辑。
+real_cargo="$real"
+toplevel="\$(git rev-parse --show-toplevel 2>/dev/null || true)"
+shim="\${toplevel:+\$toplevel/scripts/hooks/cargo}"
+if [ -n "\$shim" ] && [ -f "\$shim" ] && [ "\$shim" != "\$0" ]; then
+  REAL_CARGO="\$real_cargo" exec bash "\$shim" "\$@"
+fi
+exec "\$real_cargo" "\$@"
+SHIM
   chmod 755 "$target"
-  echo "install-hooks: $target"
+  echo "install-hooks: $target（转发到工作树里的 scripts/hooks/cargo）"
 }
 
-install_shim "$HOME/.local/bin/cargo"
+install_shim "$HOME/.local/bin/cargo" "$real_cargo"
 if [ -w /usr/local/bin ]; then
-  install_shim /usr/local/bin/cargo
+  install_shim /usr/local/bin/cargo "$real_cargo"
 elif sudo -n true 2>/dev/null; then
   tmp="$(mktemp)"
-  sed "s#^real_cargo=\${REAL_CARGO:-\$HOME/.cargo/bin/cargo}#real_cargo=\"$real_cargo\"#" "$here/cargo" >"$tmp"
-  sudo -n install -m 755 "$tmp" /usr/local/bin/cargo && echo "install-hooks: /usr/local/bin/cargo"
+  install_shim "$tmp" "$real_cargo" >/dev/null
+  sudo -n install -m 755 "$tmp" /usr/local/bin/cargo && echo "install-hooks: /usr/local/bin/cargo（转发）"
   rm -f "$tmp"
 else
   echo "install-hooks: 跳过 /usr/local/bin（没有写权限）；此时 ~/.local/bin 必须在 PATH 上" >&2

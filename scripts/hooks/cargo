@@ -60,6 +60,19 @@ EOF
   fi
 fi
 
+# 第 3 步：编译之前工作树必须是干净的——没提交的改动不会被推上去，编出来的字节与推的
+# 不是同一份，门的「已验」就对不上。提交是独立的一步，它有自己的判据，不是顺手做的。
+if [ "$builds" = "1" ] && [ "$dirty" = "1" ]; then
+  cat >&2 <<'EOF'
+cargo: 工作树不干净，先提交再编译。
+
+  没提交的改动不会被推上去：脏树上编出来的字节与最终推的不是同一份，门的「已验」
+  记账就对不上那一次推送。先把这一批的编辑提交完（提交多少笔都行），再编译一次。
+EOF
+  git status --porcelain >&2 || true
+  exit 1
+fi
+
 if [ "$builds" = "1" ] && [ -f "$family" ] && [ -f "$toplevel/scripts/hooks/round.py" ]; then
   if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
     if ! python3 "$family" --root "$toplevel" --all-todos; then
