@@ -233,17 +233,6 @@ def main(argv: list[str]) -> int:
         return 2
 
     changed = args.changed or working_tree_changes(root)
-    # 有开着的一轮时，批次是**轮钉住的那一批**，不是「待办 ∪ 我改了什么」：
-    # 后者把编辑本身当成范围，上界就敞开了——我改到哪，范围就长到哪。
-    round_batch: list[str] | None = None
-    if args.all_todos:
-        try:
-            import round as round_mod
-            current = round_mod.current_round()
-            if current and current[3]:
-                round_batch = list(current[3])
-        except Exception:
-            round_batch = None
     todos: list[tuple[str, list[str]]] = []
     missing: list[str] = []
     deferred: list[str] = []
@@ -302,23 +291,8 @@ def main(argv: list[str]) -> int:
         todos = checked
         if deferred:
             print(f"family: 本轮不排的待办（touches: unknown）{len(deferred)} 项：{', '.join(deferred)}")
-        # 有轮的时候：这一轮的范围就是它钉住的那批待办的触点。工作区里**多出来**的
-        # 改动不在范围里——它们是这一轮没说要做的，报出来，别默默并进批次（并进去
-        # 就等于「我改了什么，范围就长到哪」）。没开轮时维持旧行为。
-        if round_batch is not None:
-            batch = [p for _, paths in todos for p in paths]
-            in_scope = set(batch)
-            stray = [p for p in changed if p not in in_scope]
-            if stray:
-                print("family: 这些改动不在这一轮钉住的批次里（要么它是某条待办的触点，要么先开/补轮）：")
-                for p in stray[:20]:
-                    print(f"  {p}")
-                if len(stray) > 20:
-                    print(f"  …另有 {len(stray) - 20} 个")
-                return 2
-        else:
-            for _, paths in todos:
-                batch += paths
+        for _, paths in todos:
+            batch += paths
     batch = sorted(set(batch))
 
     if not changed and not todos:
