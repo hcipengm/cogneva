@@ -126,7 +126,7 @@ pub use metrics_retirement::{
     MetricsRetirement, RetirementOutcome, RetirementPass, ROSTERED_LABEL_SERIES, ROSTER_FRESH_SECS,
     ROSTER_LABEL, ROSTER_SERIES, SUPERSEDED_QUIET_SECS, SUPERSEDED_SHAPES,
 };
-pub use metrics_sample_cap::{delete_surplus_sql, SampleLogCap, SweepOutcome};
+pub use metrics_sample_cap::{MetricsSampleLog, SampleReading};
 pub use observability_event_cap::{EventLogCap, EventSweepOutcome};
 pub use owner_lease::{lease_holder, LeaseRow, PgOwnerLeaseBroker, LEASE_TABLE};
 pub use partition_maintainer::PartitionMaintainer;

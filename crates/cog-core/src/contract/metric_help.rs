@@ -1739,32 +1739,38 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     ),
     (
         "metrics_sample_sweep_failed",
-        "Whether the last sample-log pass could not be completed, 1 or 0 \
-         (a pass is the sweep when the log is over budget, otherwise the \
-         measure). The row count, the budget, the floor verdict and the bytes \
-         are all stamped only once a pass returns, so a pass that fails leaves \
-         every one of them at its last value, and the two capacity rules then \
-         trust a frozen log until their age bound closes them -- a sweep that \
-         cannot run and a log that is not growing look the same. This reading \
-         says the pass itself did not answer; it is written on every pass, so a \
-         pass that completes keeps it at 0",
+        "Whether the last sample-log pass could not be completed, 1 or 0. The \
+         row count, the declared capacity, the over-capacity verdict and the \
+         bytes are all stamped only once a pass returns, so a pass that fails \
+         leaves every one of them at its last value, and the capacity rules \
+         then trust a frozen log until their age bound closes them -- a loop \
+         that cannot run and a log that is not growing look the same. This \
+         reading says the pass itself did not answer; it is written on every \
+         pass, so a pass that completes keeps it at 0",
     ),
     (
         "metrics_samples_budget_rows",
-        "Rows the metrics sample log is allowed to hold; the sweep deletes \
-         oldest-first past this, stopping at each gauge series' newest row. \
-         Every reading here names the deployment that published it, because \
-         this is one deployment's own declaration and the log they land in is \
-         shared, so without the name a deployment that declares no cap at all \
-         is served the one the deployment beside it declared",
+        "Rows the metrics sample log is **declared** allowed to hold. Nothing \
+         deletes past this: the loop measures the log and publishes the \
+         declaration beside the count, and a log above it stays above it until \
+         somebody decides what to do -- raise the declaration, change how the \
+         series that grew it is recorded, or stop declaring one. Every reading \
+         here names the deployment that published it, because this is one \
+         deployment's own declaration and the log they land in is shared, so \
+         without the name a deployment that declares no capacity at all is \
+         served the one the deployment beside it declared. Absent rather than \
+         0 for a deployment that declares none",
     ),
     (
         "metrics_samples_over_capacity",
-        "1 when the sample log is over its row budget and cannot be pruned \
-         further without deleting a gauge series' current value, 0 otherwise. \
-         Carries the same deployment label as the budget it is read beside, \
-         and is absent rather than 0 for a deployment that ran no pass to \
-         report on",
+        "1 when the sample log holds more rows than the capacity its \
+         deployment declares, 0 otherwise. It is a comparison of the two \
+         readings beside it, published so a reader cannot get the inequality \
+         backwards without anything noticing -- and it is not a fault report: \
+         nothing deletes the log, so a 1 stays a 1 until a person decides what \
+         the capacity ought to be. Carries the same deployment label as the \
+         capacity it is read beside, and is absent rather than 0 for a \
+         deployment that declares no capacity",
     ),
     (
         "metrics_samples_bytes",

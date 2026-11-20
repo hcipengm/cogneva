@@ -1548,20 +1548,17 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 retirement = retirement.with_metrics(mb);
             }
 
-            let mut cap = crate::SampleLogCap::new(pool, sample_max_rows)
+            let mut cap = crate::MetricsSampleLog::new(pool, sample_max_rows)
                 .with_retirement(std::sync::Arc::new(retirement))
                 .with_deployment(deployment);
             if let Some(mb) = metrics {
                 cap = cap.with_metrics(mb);
             }
-            if let Some(broker) = lease_broker.clone() {
-                cap = cap.with_role(broker);
-            }
             let _handle = Arc::new(cap).spawn(shutdown.clone());
             if sample_max_rows == 0 {
-                info!("Metrics sample capacity disabled (sample_max_rows=0)");
+                info!("Metrics sample log: no capacity declared (sample_max_rows=0)");
             } else {
-                info!(sample_max_rows, "Metrics sample capacity started");
+                info!(sample_max_rows, "Metrics sample log measuring started");
             }
         } else {
             info!("Metrics sample capacity disabled (no PostgreSQL pool)");
@@ -1601,9 +1598,6 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 .with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 cap = cap.with_metrics(mb);
-            }
-            if let Some(broker) = lease_broker.clone() {
-                cap = cap.with_role(broker);
             }
             let _handle = Arc::new(cap).spawn(shutdown.clone());
             if event_max_rows == 0 {
@@ -1645,9 +1639,6 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 .with_deployment(deployment_name());
             if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                 cap = cap.with_metrics(mb);
-            }
-            if let Some(broker) = lease_broker.clone() {
-                cap = cap.with_role(broker);
             }
             let _handle = Arc::new(cap).spawn(shutdown.clone());
             if checkpoint_max_rows == 0 {

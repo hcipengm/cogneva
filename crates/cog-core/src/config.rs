@@ -792,20 +792,25 @@ pub struct AgentConfig {
 #[serde(default)]
 pub struct MetricsConfig {
     pub enabled: bool,
-    /// Ceiling on rows held in the metrics sample log. `0` prunes nothing.
+    /// The capacity this deployment **declares** for the metrics sample log,
+    /// in rows. `0` declares none.
     ///
-    /// The sample log is append-only: one row per observation. What bounds it
-    /// is how much it holds, not how old its rows are — a time window answers
-    /// neither question, since traffic can put any number of rows inside any
-    /// window. The sweep deletes oldest-first until the log is under this, and
-    /// stops at the newest row of each series, which every reader reaches the
-    /// log through and which therefore may never be deleted.
+    /// It is a statement, not a mechanism: the log is measured every minute and
+    /// the measurement is published (`rows`, this capacity, the bytes on disk,
+    /// and whether the first exceeds the second), but nothing deletes from the
+    /// table on account of it. A reading that deletes what it measures cannot
+    /// be read as a reading — by the time anybody sees the number it has
+    /// already been acted on, and the rows behind it are gone with nothing but
+    /// an inference to say they were there.
     ///
-    /// The default covers a full day at the observed observation rate with
-    /// room to spare. There is no matching "keep for N seconds" knob on
-    /// purpose: how a busy deployment and a quiet one spend the same budget is
-    /// exactly what should differ between them, and a duration would force
-    /// them to trim at the same rate instead.
+    /// So "over capacity" is a decision point rather than a fault: raise the
+    /// declaration if the log is doing its job, change how the series that
+    /// grew it is recorded, or stop declaring a capacity at all. Declaring
+    /// nothing (`0`) is different from declaring zero and the readings keep
+    /// them apart — the first publishes no capacity and no verdict, the second
+    /// would claim every row is over a limit nobody asked for.
+    ///
+    /// The default covers about ten days at the observed observation rate.
     pub sample_max_rows: u64,
     /// An optional narrowing of what the `/metrics` scrape asks for.
     ///

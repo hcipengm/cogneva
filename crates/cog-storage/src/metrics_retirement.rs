@@ -11,7 +11,8 @@
 //! - `cog_metric_histogram_buckets` and `cog_metric_histogram_sums`, the
 //!   accumulation of a histogram.
 //!
-//! The sweep in [`crate::SampleLogCap`] cannot reach the last three: they have
+//! The measuring loop in [`crate::MetricsSampleLog`] never deletes and cannot
+//! reach the last three: they have
 //! no rows to rank and no overshoot to trim, because they hold current state
 //! rather than history. An unreachable store is a series that is not merely held
 //! but never deleted at all — a retired counter keeps being listed and served at
