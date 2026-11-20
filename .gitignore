@@ -39,3 +39,5 @@ evolution-patches/
 
 # Host-side flock file left by whoever serialises a render on this checkout
 deploy/.rendered.lock
+
+__pycache__/
