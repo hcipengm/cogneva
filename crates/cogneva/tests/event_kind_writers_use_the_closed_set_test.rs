@@ -78,7 +78,7 @@ fn every_kind_constant_writes_a_word_the_closed_set_holds() {
         "扫到的 kind 常量太少（{}），要么扫描坏了，要么常量改了形状：{found:?}",
         found.len()
     );
-    let known: Vec<&str> = cog_core::event_envelope::KINDS.to_vec();
+    let known: Vec<&str> = cog_core::contract::event_envelope::KINDS.to_vec();
     let mut unknown: Vec<String> = Vec::new();
     for (file, kind) in &found {
         if !known.contains(&kind.as_str()) {
