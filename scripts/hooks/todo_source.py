@@ -85,6 +85,11 @@ def _md_items(path: pathlib.Path) -> list[Item]:
         for found in re.finditer(r"[｜|]\s*touches:\s*([^|｜\n]+)", line):
             pass
         touches: list[str] = []
+        # `touches: unknown — 理由` 是「这一条不进批次」的正式写法，但**理由里不能有逗号**：
+        # 下面先按逗号切触点，切完第一段就不是 `unknown` 了，整句又被当成一个路径，于是
+        # 每一道读台账的门都报「这个路径不在树里」，而且报的是理由那半句——2026-11-20 实测，
+        # 一条我刚写下的待办把整批卡死了两次。逗号在这里是分隔符，不是标点。
+        #
         # 没有 `unknown` 这个后门：一行待办要么点得出它要动的文件，要么批次算不出来。
         deferred = False
         if found:
