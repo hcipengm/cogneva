@@ -42,6 +42,12 @@ pub struct LlmCall {
     pub input_tokens: u64,
     /// 输出 token。
     pub output_tokens: u64,
+    /// 命中前缀缓存的 token。读侧按人/按工作区判花销时要它（缓存便宜得多）。
+    pub cached_tokens: u64,
+    /// 调用来源（`interactive`／`gateway_pool`／…）。读侧按来源分桶时要它。
+    pub origin: String,
+    /// 这次调用记在谁头上；`None` 是这条连接没有身份。按人判预算要它。
+    pub owner: Option<String>,
     /// 这一次调用花了多久，毫秒；`None` 表示落账那一刻它已经不在手里了。
     ///
     /// 不用 0 顶替：0 毫秒是一次真实读数（本地拒调用就是 0），把它与「不知道」
@@ -74,6 +80,9 @@ impl LlmCall {
             "result": self.result,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cached_tokens": self.cached_tokens,
+            "origin": self.origin,
+            "owner": self.owner,
             "latency_ms": self.latency_ms,
             "task_id": self.task_id,
         })
