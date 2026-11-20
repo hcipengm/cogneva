@@ -35,6 +35,12 @@ if git rev-parse --git-dir >/dev/null 2>&1 && [ -n "$(git status --porcelain 2>/
   dirty=1
 fi
 
+# 绕过要留痕：一次「跳过整条检查」是这一轮的一次判断，必须能被后面的门读到，
+# 否则它就是一张免检牌——而这一层存在的全部理由，是让「挑了子集」这件事有读数。
+if [ "$builds" = "1" ] && [ "${COGNEVA_BATCH_UNCHECKED:-0}" = "1" ]; then
+  printf '%s\t%s\t%s\tBYPASS\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(pwd -P)" "${*:-}" >>"$ledger"
+fi
+
 if [ "$builds" = "1" ] && [ "$dirty" = "1" ] && [ "${COGNEVA_BATCH_UNCHECKED:-0}" != "1" ] && [ -f "$family" ]; then
   if [ -z "${COGNEVA_BATCH_SPLIT:-}" ]; then
     if ! python3 "$family" --root "$toplevel" --all-todos; then

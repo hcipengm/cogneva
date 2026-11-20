@@ -129,15 +129,27 @@ def open_round(spec: str | None, allow_open: bool = False) -> int:
     if not rev:
         print("round: 台账所在仓没有 HEAD，开不了轮。", file=sys.stderr)
         return 2
-    import json
+    # 打开一轮的时候就把**整批**列出来，并把它记进事件：单位必须在编辑之前
+    # 定下来，否则「这一轮要改什么」由动手的人临场挑，默认全量就退成子集。
     import os
     import uuid
+    batch = todo_source.load(f"md:{source[3:]}") if source.startswith("md:") else []
+    if batch:
+        print(f"round: 本批 {len(batch)} 条（同一批编辑，不挑子集）：")
+        for item in batch:
+            where = "、".join(item.touches[:3]) + ("…" if len(item.touches) > 3 else "")
+            print(f"  {item.id}  {where}")
+    else:
+        print("round: 台账里没有未完成的待办。")
     event_id = uuid.uuid4().hex[:26]
     subject = f"round-{event_id}"
     code_rev = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    # `batch` 把这一批的身份写进事件：后面那道门按**这个**清单判「同批」，
+    # 而不是每次自己重算一份——重算出来的东西读起来一样，却不是同一件事。
+    ids = json.dumps([i.id for i in batch])
     attrs_sql = (
         f"jsonb_build_object('ledger_rev', '{rev}', 'ledger_path', '{source[3:]}', "
-        f"'code_rev', '{code_rev}')::text"
+        f"'code_rev', '{code_rev}', 'batch', '{ids}')::text"
     )
     psql(
         "insert into cogneva_event (event_id, kind, subject_kind, subject_id, unit_of_work, "
