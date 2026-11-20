@@ -280,8 +280,10 @@ tests:
         values: '2x26'
       - series: 'cogneva_change_funnel_observed_timestamp_seconds{intent="unattributed",stage="parse"}'
         values: '91800x26'
+      # 窗口是 6 小时、左端开区间：跳变落在 t=22h，窗口 (20h, 26h] 里先留一个 0 的样本，
+      # 压在 20h 上 increase 读出来是 0，这一格就不会响。
       - series: 'cogneva_landing_failures_total{category="rejected"}'
-        values: '0x20 2x6'
+        values: '0x22 2x4'
       - series: 'cogneva_landing_failures_total{category="other"}'
         values: '0x20 9x6'
       - series: 'cogneva_change_tier_total{tier="fast"}'

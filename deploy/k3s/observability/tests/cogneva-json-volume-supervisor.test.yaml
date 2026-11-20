@@ -372,18 +372,20 @@ tests:
 
   # 五类巡检都在失败、而且没有一次成功（成功那半根本没出现）：五条全亮。
   # 反事实那一半为空时 `unless` 不挡——这是对的：没读数不等于有成功。
-  - interval: 5m
+  # 这两格的采样间隔是 1 分钟而不是本文件默认的 5 分钟：规则窗口就是 5 分钟、左端开区间，
+  # 5 分钟一采时求值窗口里只剩一个样本，increase 要两个样本才算得出来，跳变怎么摆都读不出增量。
+  - interval: 1m
     input_series:
       - series: 'cogneva_supervisor_pass_total{pass="health",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="quota",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="rebalance",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="event",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="control_plane",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
     alert_rule_test:
       - eval_time: 13h
         alertname: supervisor_health_pass_failing
@@ -422,28 +424,28 @@ tests:
               outcome: failed
 
   # 同样的失败，但每一类也都成功过：五条全静。删掉任一条 `unless`，这一格会先响。
-  - interval: 5m
+  - interval: 1m
     input_series:
       - series: 'cogneva_supervisor_pass_total{pass="health",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="health",outcome="ok"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="quota",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="quota",outcome="ok"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="rebalance",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="rebalance",outcome="ok"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="event",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="event",outcome="ok"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="control_plane",outcome="failed"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
       - series: 'cogneva_supervisor_pass_total{pass="control_plane",outcome="ok"}'
-        values: '0x155 1x1'
+        values: '0x778 1x2'
     alert_rule_test:
       - eval_time: 13h
         alertname: supervisor_health_pass_failing

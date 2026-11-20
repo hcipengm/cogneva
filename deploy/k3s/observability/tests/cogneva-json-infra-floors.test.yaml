@@ -296,14 +296,16 @@ tests:
         alertname: workload_no_available_replica
         exp_alerts: []
 
-  # 同样的零可用副本，但这条读数半小时前才开始报：还不知道它是不是一直这样。
+  # 同样的零可用副本，但这条读数只有 25 分钟的历史：还不知道它是不是一直这样。
   # 删掉「读数的历史比半小时长」那半，这一格会响。
+  # 起点不能正好压在 t=30 上：30m 子查询左端开区间，那一格样本只落进 1h 那边，
+  # count 差 1 就被读成「比半小时老」，读的是分辨率而不是历史。
   - interval: 1m
     input_series:
       - series: 'kube_deployment_status_replicas_available{namespace="cogneva",deployment="app"}'
-        values: '_x30 0x30'
+        values: '_x35 0x25'
       - series: 'kube_deployment_spec_replicas{namespace="cogneva",deployment="app"}'
-        values: '_x30 1x30'
+        values: '_x35 1x25'
     alert_rule_test:
       - eval_time: 60m
         alertname: workload_no_available_replica

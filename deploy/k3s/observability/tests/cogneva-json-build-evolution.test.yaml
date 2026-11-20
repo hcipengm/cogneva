@@ -221,7 +221,7 @@ tests:
       - series: 'cogneva_build_gate_slots{dir="/work",role="builder"}'
         values: '0x5'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 4m
         alertname: build_gate_not_in_force
         exp_alerts: []
 

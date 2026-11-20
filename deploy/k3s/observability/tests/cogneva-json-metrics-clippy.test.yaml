@@ -301,12 +301,14 @@ tests:
         alertname: metrics_retired_rows_still_arriving
         exp_alerts: []
 
-  # 表还在删，但这条读数一小时前才开始报：先攒够两小时窗口。
+  # 表还在删，但这条读数只有五十五分钟的历史：先攒够两小时窗口。
   # 删掉「两小时里的点比一小时里的多」那条腿，这一格会响。
+  # 起点不能正好压在 t=60 上：1h 子查询左端开区间，那一格样本只落进 2h 那边，
+  # count 差 1 就被读成「比一小时老」，读的是分辨率而不是历史。
   - interval: 1m
     input_series:
       - series: 'metrics_retired_rows_removed{table="events"}'
-        values: '_x60 5x60'
+        values: '_x65 5x55'
       - series: 'metrics_retired_rows_removed_observed_timestamp_seconds{table="events"}'
         values: '7000x120'
     alert_rule_test:
