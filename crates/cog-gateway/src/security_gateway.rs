@@ -1874,6 +1874,7 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
 /// 池判定就不再续期，所以等一个不响应的 PG 必须有上限。
 // cap: bound — 池状态发布循环里等一次共享写的上限；循环一停池判定就不续期，等不响应的 PG 必须有界
+// wall: 等=一次池状态写进耐久面 / 等不到=这一拍不写，循环继续下一拍；池判定靠下一拍续期，不由这一次写决定 / 续跑=能，下一拍重写一次当前值（它是当前值，不是增量）
 const DURABLE_GAUGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 池读数的耐久面：把同一个 gauge 再往共享 metrics store 写一份，让读数活得比
@@ -4019,12 +4020,14 @@ const MAX_GIT_PACK_BYTES: usize = 256 * 1024 * 1024;
 /// Wall for one outbound call to an upstream. Sized for a non-streaming
 /// completion, which is the slowest non-stream thing this process asks for.
 // cap: bound — 对上游一次调用的墙钟；按最慢的非流式补全定，那是这个进程最慢的非流请求
+// wall: 等=上游对这次请求的答复 / 等不到=这一次尝试按失败收尾并换池内下一个上游；**没有半份答复被当成读到了** / 续跑=能，换一家重问是一次新的调用
 const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Wall for the connection alone. Kept well under the request wall so an
 /// unreachable upstream is reported as "cannot connect" quickly instead of
 /// being indistinguishable from a slow one.
 // cap: bound — 连不上的上游要快报「连不上」，不能跟「上游慢」混成同一个现象
+// wall: 等=到上游的连接建立 / 等不到=这一次尝试记成「连不上」，与「上游慢」分开——两者在池判定里不是同一种失败 / 续跑=能，换一家重连
 const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 留底正文的存放面：内存 Raw 层的写入端点（见 [`archive_exchange_body`]）。
@@ -5620,6 +5623,7 @@ async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReadin
 /// 一次账本求和的等待上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
 /// 池状态就不再续期，所以等一个不响应的 PG 必须有上限。
 // cap: bound — 池状态发布循环里等一次账本求和的上限；循环一停池状态就不续期，必须有界
+// wall: 等=账本给出这一窗口的求和 / 等不到=这一拍读作「账本读不到」，**不是花掉 0**——配速不能拿一个没读到的 0 当依据 / 续跑=能，下一拍再求和
 const SPEND_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 重算"今天为止花了多少"，以及这一拍到底量到没有。
@@ -8349,6 +8353,7 @@ const PRICE_WATCH_PERIOD: std::time::Duration = std::time::Duration::from_secs(2
 
 /// 抓一次价目页的墙。页面很小，10 秒足够；超时读作「读不到」，与解析失败分开报。
 // cap: bound — 一页很小的正文，10 秒是「读不到」与「慢」的分界，不是吞吐旋钮
+// wall: 等=价格页那一小段正文回来 / 等不到=这一格读作「价格读不到」，不是「免费」 / 续跑=能，下一次重新取整页
 const PRICE_PAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 配置价目与官方页对不上时开的那一行。
@@ -9429,6 +9434,7 @@ async fn code_platform_forward(
 /// 池是按顺序问的，一次超过这里就会让「还有第二、第三家可问」在调用方眼里变成
 /// 一次超时——那时换上游这件事根本没有发生，而读起来像「后备全挂了」。
 // cap: bound — 一次尝试的上限；池是按顺序问的，超了会让「还有第二三家可问」在调用方眼里变成一次超时
+// wall: 等=池里这一家搜索源的答复 / 等不到=换下一家；**整次检索不停在它身上**，超时只花掉这一家那一份预算 / 续跑=能，下一次检索从头问
 const SEARCH_FALLBACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// 后备出口的两个动作。路由决定问哪一个，不由请求体决定——请求体是调用方给的，
