@@ -140,6 +140,8 @@ pub struct GlobalAgentManager {
     /// Where a spawned worker's loop archives a tool output too large for the
     /// context window. Shared by every worker, like the observability gateway.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
+    /// 工具调用的事实落点。与归档并存：一个是记录，一个是正文载体。
+    tool_call_events: Option<Arc<dyn cog_core::ToolCallEvents>>,
     /// How often every worker renews its registration.
     ///
     /// Read from the `agent` section at startup and handed to each spawned
@@ -195,6 +197,7 @@ impl GlobalAgentManager {
             wal_backend: None,
             wal_missing_reported: AtomicBool::new(false),
             tool_output_archive: None,
+            tool_call_events: None,
             heartbeat_interval_secs: None,
             roster_observer: None,
         }
@@ -385,6 +388,12 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Give every spawned worker the sink a tool call is recorded in.
+    pub fn with_tool_call_events(mut self, events: Arc<dyn cog_core::ToolCallEvents>) -> Self {
+        self.tool_call_events = Some(events);
+        self
+    }
+
     /// Spawn a new worker agent, register it globally, and start its inbox consumer.
     /// # Arguments
     /// * `agent_id` — unique worker identifier
@@ -445,6 +454,9 @@ impl GlobalAgentManager {
             }
             if let Some(ref cp) = self.checkpoint_store {
                 a = a.with_checkpoint_store(cp.clone());
+            }
+            if let Some(ref events) = self.tool_call_events {
+                a = a.with_tool_call_events(events.clone());
             }
             if let Some(ref ar) = self.tool_output_archive {
                 a = a.with_tool_output_archive(ar.clone());

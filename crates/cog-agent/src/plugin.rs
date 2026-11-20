@@ -547,6 +547,13 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // handle would be absent exactly here. One archive handle serves the
         // eval runtime and the whole worker pool: the reading it carries is
         // keyed by tool, and a second copy would only split the count.
+        // 工具调用的事实落点：只要装配层给了就接上，与归档分开（记录 vs 载体）。
+        let tool_call_events = ctx.consume_service::<dyn cog_core::ToolCallEvents>();
+        if tool_call_events.is_none() {
+            warn!(
+                "ToolCallEvents unavailable; a tool call leaves no row in the event \n                 stream, so replaying a run from the stream alone cannot see it"
+            );
+        }
         let tool_output_archive: Option<Arc<dyn crate::ToolOutputArchive>> = ctx
             .consume_service::<dyn cog_core::HttpClient>()
             .map(|client| {
@@ -609,6 +616,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
         if let Some(ref archive) = tool_output_archive {
             eval_runtime = eval_runtime.with_tool_output_archive(archive.clone());
         }
+        if let Some(ref events) = tool_call_events {
+            eval_runtime = eval_runtime.with_tool_call_events(events.clone());
+        }
         if let Some(ref metrics) = self.metrics {
             eval_runtime = eval_runtime.with_metrics(metrics.clone());
         }
@@ -670,6 +680,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
         .with_roster_observer(crate::observable::global_observable());
         if let Some(ref archive) = tool_output_archive {
             pool_builder = pool_builder.with_tool_output_archive(archive.clone());
+        }
+        if let Some(ref events) = tool_call_events {
+            pool_builder = pool_builder.with_tool_call_events(events.clone());
         }
         // Workers publish onto the cluster-wide bus (stream plugin) so live
         // observers see every turn/tool call in real time. Without the stream
