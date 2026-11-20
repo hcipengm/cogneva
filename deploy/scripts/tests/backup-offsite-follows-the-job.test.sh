@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# principle: feedback_a_unit_that_fires_before_its_producer_produces_pushes_yesterday_s_artifact
 # 异地推的时刻必须落在「备份最晚可能跑完」之后——判的是**算出来的那一刻**，不是某个字面值。
 #
 # 为什么要有这一条：2026-10-19 写下的 OnCalendar 是 02:17，注释说「比备份 CronJob 晚一小时」，

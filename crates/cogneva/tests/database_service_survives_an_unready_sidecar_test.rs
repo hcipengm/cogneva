@@ -1,6 +1,5 @@
 //! The database's Service must keep publishing endpoints while the pod is not
 //! Ready.
-//! principle: feedback_an_observer_dying_must_not_take_the_observed_away
 //!
 //! The metrics sidecar shares its pod with the database. On 2026-10-25 that
 //! sidecar exited at startup over a flag its image does not know, so the pod

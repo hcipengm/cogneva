@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# principle: feedback_a_gate_whose_subject_moved_keeps_grading_the_old_path
 #
 # 「有没有一条续跑循环在跑」这个问题，三份脚本各写了一份 `pgrep -f` 模式：值守用它决定
 # 起不起一轮，探针与定点起跑用它决定要不要让位。模式里带一段目录路径，而这三个脚本随

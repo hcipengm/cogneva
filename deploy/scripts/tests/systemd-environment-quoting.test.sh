@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# principle: feedback_a_gate_must_name_the_defect_it_stops
 # 单元里的 `Environment=` 赋值：值里带空格就必须加引号。判的是这一条形状，不是某个
 # 具体变量的名字——名单从树里来（静态单元 ＋ 每个安装脚本的只渲染产物）。
 #
