@@ -820,3 +820,68 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
             .expect("clean up the probe rows");
     }
 }
+
+/// 两条读数在同一段时间上必须逐行相等——切换的判据就是这一条。
+///
+/// 账本那一侧是今天的正本（行），事件流那一侧是明天的正本（事件）。同一批写入之后，
+/// 按人那条读数必须一模一样；差一行就说明两边的口径已经分叉，那时停掉写行的一侧，
+/// 等于把一个已经错开的数变成唯一答案。
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn the_stream_reader_and_the_row_reader_agree_row_by_row() {
+    let url = cog_test_support::database_url();
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("connect to the test database");
+    let store = LlmUsageStore::connect(&url)
+        .await
+        .expect("connect the store");
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+    store
+        .init_schema(&schema_runner)
+        .await
+        .expect("init the schema");
+
+    let since = chrono::Utc::now().timestamp() - 60;
+    let marker = format!("usage-ledger-equality:{}", uuid::Uuid::new_v4());
+
+    for (actor, input, output) in [("eq-a", 10u64, 20u64), ("eq-b", 5, 7), ("eq-a", 1, 2)] {
+        let record = LlmUsageRecord {
+            refused_scope: None,
+            upstream: "equality-upstream".to_string(),
+            api_style: "openai".to_string(),
+            model: "equality-model".to_string(),
+            result: "ok".to_string(),
+            actor: actor.to_string(),
+            origin: "gateway_pool".to_string(),
+            tokens_input: input,
+            tokens_output: output,
+            tokens_cached: 0,
+            tokens_cache_created: None,
+            tokens_reasoning: None,
+            estimated_input: None,
+            cost_micros: None,
+            price_book: None,
+            refusal_kind: None,
+            retry_after_secs: None,
+            task: Some(marker.clone()),
+            owner: None,
+            session: None,
+            latency_ms: 12,
+            pace: None,
+            usage_outcome: None,
+        };
+        store.record(&record).await.expect("row");
+    }
+
+    let (row_total, row_by_actor) = store.spend_by_actor_since(since).await.expect("row read");
+    let (stream_total, stream_by_actor) = store
+        .spend_by_actor_since_from_stream(since)
+        .await
+        .expect("stream read");
+    assert_eq!(
+        stream_by_actor, row_by_actor,
+        "按人的两条读数分叉了：停掉写行之前必须相等"
+    );
+    assert_eq!(stream_total, row_total);
+}
