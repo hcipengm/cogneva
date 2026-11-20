@@ -65,6 +65,11 @@ def irreversible(path: str) -> bool:
     按前缀判的话这条理由永远匹配不到任何迁移。
     """
     p = path.lstrip("./")
+    # 测试文件不算：它们不改任何已部署的东西，回滚一次提交就回到原状。按目录前缀
+    # 一刀切会把「改了 deploy/ 下的一个夹具」读成一次滚动，于是这条理由又能被借。
+    segments = p.split("/")
+    if "tests" in segments or p.endswith(".test.sh"):
+        return False
     return (
         p.startswith("deploy/")
         or p.startswith("scripts/host/")

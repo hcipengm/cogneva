@@ -130,6 +130,18 @@ out=$(run_on "$tree" "$ledger_irr"); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "两侧都碰"; } && ok "两侧都碰不可回退的面：红" || bad "两侧都碰却没红（rc=$rc）：$out"
 reset
 
+# 改的是 deploy/ 下的一个**测试夹具**：它不改任何已部署的东西，回滚一次提交就回到
+# 原状。按目录前缀一刀切会把它读成一次滚动，于是这条理由又能被借去排除别人。
+echo a75 >>"$tree/crates/a/src/x.rs"; mkdir -p "$tree/deploy/scripts/tests"
+printf '#!/bin/sh\n' >"$tree/deploy/scripts/tests/x.test.sh"
+git -C "$tree" add -A >/dev/null
+commit_with "a test fixture under deploy is not a rollout
+
+Split: 3 — S2, S3 — 这一批只是改了 deploy/ 下的夹具"
+out=$(run_on "$tree" "$ledger_code"); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "两侧都没碰"; } && ok "deploy/ 下的夹具不算不可逆：理由不成立" || bad "夹具被当成滚动（rc=$rc）：$out"
+reset
+
 # 两侧都不碰：没有「回滚一次提交回不到原状」的东西，理由不成立。
 echo a8 >>"$tree/crates/a/src/x.rs"; git -C "$tree" add -A >/dev/null
 commit_with "neither side irreversible
